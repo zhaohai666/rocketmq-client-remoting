@@ -82,7 +82,7 @@ final class SendMessageTraceHook implements SendMessageHook
 }
 
 /**
- * 消费侧轨迹钩子（SubBefore / SubAfter 两条记录共用同一个 requestId）。
+ * Consume-side trace hook (SubBefore / SubAfter share the same requestId).
  */
 final class ConsumeMessageTraceHook implements ConsumeMessageHook
 {
@@ -166,7 +166,7 @@ final class ConsumeMessageTraceHook implements ConsumeMessageHook
         $this->localDispatcher->append($subAfter);
     }
 
-    /** 按名查 ConsumeReturnType 的 ordinal（值）；未定义枚举或缺名返回 null。 */
+    /** Look up ConsumeReturnType's ordinal (value) by name; returns null if the enum is undefined or the name is missing. */
     private static function consumeReturnTypeCode(string $name): ?int
     {
         if (!enum_exists(ConsumeReturnType::class)) {
@@ -182,10 +182,10 @@ final class ConsumeMessageTraceHook implements ConsumeMessageHook
 }
 
 /**
- * 事务收尾轨迹钩子（对应 EndTransactionTraceHookImpl）。
+ * Transaction finalization trace hook (corresponds to EndTransactionTraceHookImpl).
  *
- * broker 的事务回查（fromTransactionCheck=true）也会走这里，
- * 所以「客户端主动提交」和「回查后提交」两种情况都能在轨迹里看到。
+ * The broker's transaction check-back (fromTransactionCheck=true) also goes through here,
+ * so both "client-initiated commit" and "commit after check-back" are visible in traces.
  */
 final class EndTransactionTraceHook implements EndTransactionHook
 {

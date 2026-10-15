@@ -1,33 +1,43 @@
-//! 重平衡 / 消费线程池 / 消息轨迹三个模块对**真实 5.5.1 broker** 的联调验证。
+//! Integration verification of three modules —— rebalance / consume thread pool / message trace
+//! —— against a **real 5.5.1 broker**.
 //!
-//! 与 `live_client_modules.rs`（T1~T8 打的是取址、容错、统计、钩子骨架、编码格式等
-//! 「单点」能力）互补：这里验证的是**只有配上真实收发才成立**的三件事 ——
-//! 队列分配结果能不能真的把消息切开、消费线程池能不能把真实消息跑完、
-//! 轨迹钩子产出的记录能不能真的落到 broker 并被控制台（这里用解码器）读回来。
+//! This complements `live_client_modules.rs` (T1~T8 exercise "single-point" capabilities such as
+//! address lookup, fault tolerance, statistics, the hook skeleton and the encoding format): what
+//! is verified here are the three things that **only hold once real sending and receiving are
+//! involved** ——
+//! whether the queue assignment really splits the messages, whether the consume thread pool can
+//! finish real messages, and whether the records produced by the trace hook really land on the
+//! broker and can be read back by the console (here the decoder).
 //!
-//! 场景：
-//! - R1 `allocate_strategy`：用**真实路由**的可写队列跑 AVG / AVG_BY_CIRCLE / CONFIG，
-//!   核对分区算术、确定性、守卫，最后做端到端证明：按两个客户端的分配结果各发各的、
-//!   各拉各的，A 只能看到自己队列里的消息。
-//! - R2 `consume_executor`：真实拉回的消息交给 core/max 两档线程池，用「卡住的
-//!   任务」确定性地观察 `worker_count` / `queued_count`，验证每条消息恰好被
-//!   listener 消费一次、listener 看到的是真字段（storeHost / storeTimestamp /
-//!   queueOffset / reconsumeTimes），以及 `Clone` 与原池共享关停状态。
-//! - R3 `trace_hook`：把 `SendMessageTraceHook` / `ConsumeMessageTraceHook` 挂上
-//!   真实发送链路（`SendResult` 完全按 broker 响应的解析口径构造），
-//!   轨迹通道**真的把编码结果发到独立轨迹 topic**，再从 broker 拉回来解码，
-//!   核对 Pub / SubBefore / SubAfter 三类记录与 SubBefore↔SubAfter 共享的 requestId。
-//! - R4 清理：删掉业务 topic 与轨迹 topic 的 broker 配置和 namesrv 路由。
+//! Scenarios:
+//! - R1 `allocate_strategy`: runs AVG / AVG_BY_CIRCLE / CONFIG over the writable queues of a
+//!   **real route**, checking the partition arithmetic, the determinism and the guards, and finally
+//!   proving it end to end: each side sends and pulls according to the two clients' assignments, and
+//!   A only sees the messages in its own queues.
+//! - R2 `consume_executor`: hands the really-pulled messages to the core/max grade thread pools and
+//!   uses "stuck tasks" to deterministically observe `worker_count` / `queued_count`, verifying
+//!   that every message is consumed by the listener exactly once, that the listener sees real
+//!   fields (storeHost / storeTimestamp / queueOffset / reconsumeTimes), and that `Clone` shares
+//!   the shutdown state with the original pool.
+//! - R3 `trace_hook`: attaches `SendMessageTraceHook` / `ConsumeMessageTraceHook` to a real send
+//!   path (with `SendResult` constructed strictly according to the parsing rules for the broker
+//!   response); the trace channel **really sends the encoded result to a separate trace topic**,
+//!   which is then pulled back from the broker and decoded, checking the three record kinds Pub /
+//!   SubBefore / SubAfter and the requestId shared between SubBefore↔SubAfter.
+//! - R4 cleanup: deletes the broker configs and namesrv routes of both the business topic and the
+//!   trace topic.
 //!
-//! ⚠ 唯一的非真实数据：R2 里「任务卡住」用的门闩（`AtomicBool` + 轮询）与
-//! `RECONSUME_LATER` 的哨兵 body 前缀是测试脚手架；消息本身、队列、offset、耗时、
-//! `MSG_REGION` / `TRACE_ON` 属性全部来自 broker 的真实返回。
+//! ⚠ The only non-real data: the latch (`AtomicBool` + polling) used for "stuck tasks" in R2 and
+//! the sentinel body prefix of `RECONSUME_LATER` are test scaffolding; the messages themselves,
+//! the queues, the offsets, the elapsed times and the `MSG_REGION` / `TRACE_ON` properties all
+//! come from the broker's real replies.
 //!
-//! 未覆盖：`EndTransactionTraceHook` 需要事务半消息（`SEND_MESSAGE_V2` +
-//! `END_TRANSACTION(37)`），等 `producer.rs` 落地事务链路后一并验证；该钩子自身的
-//! 字段口径已由 `trace_hook.rs` 的对拍单测覆盖。
+//! Not covered: `EndTransactionTraceHook` needs transactional half messages (`SEND_MESSAGE_V2` +
+//! `END_TRANSACTION(37)`), so it will be verified together once the transaction path lands in
+//! `producer.rs`; the field semantics of that hook itself are already covered by the differential
+//! unit tests in `trace_hook.rs`.
 //!
-//! 用法（先按项目 README 起本地集群）：
+//! Usage (start a local cluster first, following the project README):
 //! ```text
 //! cargo run --example live_rebalance_and_trace -- 127.0.0.1:9876
 //! ```
@@ -82,16 +92,18 @@ use rocketmq_client_remoting::remoting::protocol::remoting_command::RemotingComm
 use rocketmq_client_remoting::remoting::protocol::route::TopicRouteData;
 use rocketmq_client_remoting::remoting::protocol::serialize::RemotingSerializable;
 
-/// 建出来的 topic 队列数（默认 4）。
+/// Number of queues for the created topic (4 by default).
 const QUEUE_NUMS: i32 = 4;
-/// body 以 `later-` 开头的那一批返回 RECONSUME_LATER，用来证明状态真的回传给调用方。
+/// The batch whose body starts with `later-` returns RECONSUME_LATER, proving that the status is
+/// really handed back to the caller.
 const LATER_PREFIX: &str = "later-";
-/// R2 的消息条数（4 批 × 2 条）。
+/// Number of messages for R2 (4 batches × 2 messages).
 const MSG_TOTAL: i32 = 8;
-/// R3 的三条被追踪消息都发到这个队列，便于按 offset 精确拉回。
+/// All three traced messages of R3 are sent to this queue, which makes it easy to pull them back
+/// precisely by offset.
 const TRACE_QUEUE: i32 = 3;
 
-// ------------------------------------------------------------------ 骨架
+// ------------------------------------------------------------------ skeleton
 
 fn stamp() -> String {
     let secs = match SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -101,7 +113,8 @@ fn stamp() -> String {
     format!("{secs}")
 }
 
-/// 断言累积器：一次跑完所有场景再汇总，首个失败不提前退出。
+/// Assertion accumulator: run all scenarios once and then summarize; the first failure does not
+/// exit early.
 struct Checker {
     passed: u32,
     failed: Vec<String>,
@@ -130,12 +143,14 @@ impl Checker {
 
 type Live = Result<(), String>;
 
-/// 锁中毒时照常取内值（轨迹/消费路径不许因为别处的 panic 连锁崩）。
+/// Read the inner value even when the lock is poisoned (the trace/consume paths must not collapse
+/// because of a panic elsewhere).
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 轮询等到条件成立（后台任务落库用），超时返回 `false` 让调用方打出现场。
+/// Poll until the condition holds (used for background tasks landing in the store); on timeout
+/// return `false` so the caller can dump the scene.
 async fn wait_until(cond: impl FnMut() -> bool) -> bool {
     wait_within(cond, Duration::from_secs(20)).await
 }
@@ -165,7 +180,7 @@ async fn rpc(
         .map_err(|e| format!("invoke {addr} failed: {e}"))
 }
 
-/// 带实测耗时的 RPC。
+/// An RPC with its measured elapsed time.
 async fn rpc_timed(
     client: &RemotingClient,
     addr: &str,
@@ -197,13 +212,15 @@ fn decode_route(resp: &RemotingCommand, what: &str) -> Result<TopicRouteData, St
         Some(b) => b.to_vec(),
         None => return Err(format!("{what} response has empty body")),
     };
-    // namesrv 的 route 是 fastjson 风格（数字 map 键不带引号），必须走兼容解码器。
+    // The route from the namesrv is in fastjson style (numeric map keys are unquoted), so it has to
+    // go through the compatible decoder.
     let value = RemotingSerializable::decode(&raw)
         .map_err(|e| format!("{what} body is not parsable: {e}"))?;
     TopicRouteData::from_json_value(&value).map_err(|e| format!("{what} route invalid: {e}"))
 }
 
-/// 建 topic（走 TBW102 路由找 broker），与另两个 live 示例同一套做法。
+/// Create a topic (find the broker via the TBW102 route), the same approach as the other two live
+/// examples.
 async fn bootstrap_topic(client: &RemotingClient, namesrv: &str, topic: &str) -> Live {
     let resp = get_route(client, namesrv, MixAll::DEFAULT_TOPIC).await?;
     if resp.code != response_code::SUCCESS {
@@ -249,7 +266,7 @@ async fn bootstrap_topic(client: &RemotingClient, namesrv: &str, topic: &str) ->
     Ok(())
 }
 
-// ------------------------------------------------------ 真实收发（共用）
+// ------------------------------------------------------ real send/receive (shared)
 
 fn build_message(topic: &str, body: &[u8], tags: &str, keys: &str) -> Message {
     let mut msg = Message::new(topic, Some(body));
@@ -264,7 +281,7 @@ fn build_message(topic: &str, body: &[u8], tags: &str, keys: &str) -> Message {
     msg
 }
 
-/// 发送响应的 status_map（响应码 → SendStatus）。
+/// The status_map of the send response (response code → SendStatus).
 fn send_status_from_code(code: i32) -> Option<SendStatus> {
     match code {
         response_code::SUCCESS => Some(SendStatus::SendOk),
@@ -275,12 +292,14 @@ fn send_status_from_code(code: i32) -> Option<SendStatus> {
     }
 }
 
-/// 一次真实发送的结果。`result` 逐字段按 broker 响应的解析口径构造
-/// —— R3 的轨迹钩子只认这个口径（`regionId` 或 `traceOn` 缺一个就不落库）。
+/// The result of one real send. `result` is constructed field by field strictly according to the
+/// parsing rules for the broker response
+/// —— R3's trace hook only accepts this shape (without either `regionId` or `traceOn` it does not
+/// store anything).
 struct Sent {
-    /// 客户端 UNIQ_KEY（= `result.msg_id`）。
+    /// The client-side UNIQ_KEY (= `result.msg_id`).
     msg_id: String,
-    /// broker 侧的 offsetMsgId（= `result.offset_msg_id` = 响应头 msgId）。
+    /// The broker-side offsetMsgId (= `result.offset_msg_id` = the msgId in the response header).
     offset_msg_id: String,
     queue_id: i32,
     queue_offset: i64,
@@ -336,7 +355,7 @@ async fn send_full(
     let trace_switch = resp.get_ext_field(message_const::PROPERTY_TRACE_SWITCH);
     let result = SendResult {
         status,
-        // uniq 非空用 uniq，否则回落到响应头 msg_id
+        // use uniq when it is non-empty, otherwise fall back to the msgId in the response header
         msg_id: Some(if uniq.is_empty() { broker_msg_id.clone() } else { uniq.clone() }),
         message_queue: Some(MessageQueue::new(
             &topic,
@@ -345,16 +364,16 @@ async fn send_full(
         )),
         queue_offset: resp_header.queue_offset.unwrap_or(0),
         transaction_id: resp_header.transaction_id.clone(),
-        // 响应头的 msgId 是 broker 侧的 offsetMsgId
+        // the msgId in the response header is the broker-side offsetMsgId
         offset_msg_id: Some(broker_msg_id.clone()),
-        // 定时消息才有；普通消息恒为 None
+        // only timer messages have this; for a normal message it is always None
         recall_handle: resp_header.recall_handle.clone(),
         region_id: Some(if region.is_empty() {
             MixAll::DEFAULT_TRACE_REGION_ID.to_string()
         } else {
             region.to_string()
         }),
-        // 只有显式 "false" 才算关，字段缺失 ⇒ true
+        // only an explicit "false" means off; a missing field ⇒ true
         trace_on: trace_switch.map(|v| v != "false").unwrap_or(true),
     };
     Ok(Sent {
@@ -367,7 +386,8 @@ async fn send_full(
     })
 }
 
-/// `PULL_MESSAGE(11)`：返回解出的消息 + 实测耗时；`PULL_NOT_FOUND` 当空批。
+/// `PULL_MESSAGE(11)`: returns the decoded messages + the measured elapsed time; `PULL_NOT_FOUND`
+/// is treated as an empty batch.
 async fn pull_messages(
     client: &RemotingClient,
     broker_addr: &str,
@@ -416,7 +436,7 @@ async fn pull_messages(
     Ok((message_decoder::decode_messages(&raw), rt))
 }
 
-/// 轮询直到拉够 `want` 条。
+/// Poll until `want` messages have been pulled.
 async fn pull_until(
     client: &RemotingClient,
     broker_addr: &str,
@@ -448,7 +468,7 @@ fn queue_ids(mqs: &[MessageQueue]) -> Vec<i32> {
     mqs.iter().map(|q| q.queue_id).collect()
 }
 
-/// 分区性：`parts` 拼起来正好是 `0..n` 且不重不漏。
+/// Partition property: concatenating `parts` yields exactly `0..n` with no overlap and no gap.
 fn is_partition(parts: &[Vec<i32>], n: i32) -> bool {
     let mut flat: Vec<i32> = parts.iter().flatten().copied().collect();
     flat.sort_unstable();
@@ -470,7 +490,8 @@ async fn r1_allocate_strategy(
 ) -> Live {
     let resp = get_route(client, namesrv, topic).await?;
     let route = decode_route(&resp, "route")?;
-    // 真实路由的可写队列（`get_all_message_queue` 已按 PERM_WRITE 过滤）。
+    // The writable queues of the real route (`get_all_message_queue` already filters by
+    // PERM_WRITE).
     let mut mq_all: Vec<MessageQueue> = route
         .get_all_message_queue(topic)
         .into_iter()
@@ -508,7 +529,8 @@ async fn r1_allocate_strategy(
         (0..n).map(|i| format!("{consumer_group}@127.0.0.1#{i}")).collect()
     };
 
-    // 2 个消费者：4 个队列正好切两刀，前一半归 A、后一半归 B（连续区间）。
+    // 2 consumers: the 4 queues are cut in two exactly, the first half goes to A and the second to
+    // B (a contiguous range).
     let two = cids(2);
     let a_two = alloc(&avg, &two[0], &two)?;
     let b_two = alloc(&avg, &two[1], &two)?;
@@ -560,7 +582,7 @@ async fn r1_allocate_strategy(
         &format!("avg {:?} -> {again:?}, circle {:?} -> {again_circle:?}", avg3[0], circle3[0]),
     );
 
-    // 守卫：客户端 id 不在组内 / 没有队列 / 没有同伴 ⇒ 空结果（不报错）。
+    // Guards: a client id not in the group / no queues / no peer ⇒ empty result (no error).
     let outsider = alloc(&avg, &format!("{consumer_group}@10.0.0.9#9"), &three)?;
     let no_queues = avg
         .allocate(consumer_group, &three[0], &[], &three)
@@ -574,7 +596,8 @@ async fn r1_allocate_strategy(
         &format!("outsider={outsider:?} noQueues={no_queues:?} noPeers={no_peers:?}"),
     );
 
-    // CONFIG：完全无视 cidAll，只返回运维配好的那张表（连顺序都不改）。
+    // CONFIG: it ignores cidAll completely and only returns the table the operator configured (not
+    // even the order is changed).
     let by_config = AllocateMessageQueueByConfig::new(vec![
         MessageQueue::new(topic, broker_name, 3),
         MessageQueue::new(topic, broker_name, 1),
@@ -588,7 +611,8 @@ async fn r1_allocate_strategy(
         &format!("got={:?}", queue_ids(&got)),
     );
 
-    // ---- 端到端证明：按分配结果各发各的、各拉各的，两个消费者互不打扰 ----
+    // ---- End-to-end proof: each side sends and pulls according to the assignment, and the two
+    //      consumers do not disturb each other ----
     let mut per_queue: HashMap<i32, Vec<String>> = HashMap::new();
     for i in 0..MSG_TOTAL {
         let q = i % QUEUE_NUMS;
@@ -626,11 +650,13 @@ async fn r1_allocate_strategy(
 
 // ------------------------------------------------------------------ R2
 
-/// 真实 listener：记录每批的状态 + body，并核对消息带回来的真字段。
+/// A real listener: records the status + body of every batch and verifies the real fields carried
+/// back by the messages.
 struct LiveListener {
     outcomes: Mutex<Vec<(String, Vec<String>)>>,
     ctx_queue_ids: Mutex<Vec<i32>>,
-    /// 看到「broker 填过的字段」（storeHost / storeTimestamp / 真实 offset）的条数。
+    /// How many messages showed "fields filled in by the broker" (storeHost / storeTimestamp / the
+    /// real offset).
     real_field_msgs: AtomicUsize,
 }
 
@@ -708,7 +734,8 @@ async fn r2_consume_executor(
     consumer_group: &str,
     ck: &mut Checker,
 ) -> Live {
-    // 8 条真实消息 → 4 批，每批 2 条；最后一批带 later- 哨兵。全部发到队列 0。
+    // 8 real messages → 4 batches of 2 each; the last batch carries the later- sentinel. All of them
+    // go to queue 0.
     let mut sent_bodies: Vec<String> = Vec::new();
     let mut prev_offset: Option<i64> = None;
     for i in 0..MSG_TOTAL {
@@ -716,7 +743,8 @@ async fn r2_consume_executor(
         let body = format!("{prefix}consume-{topic}-{i}").into_bytes();
         let msg = build_message(topic, &body, "TagConsume", "consumeKey");
         let sent = send_full(client, broker_addr, broker_name, 0, producer_group, &msg).await?;
-        // R1 已经往队列 0 写过消息，所以这里只能断言「严格递增 1」。
+        // R1 has already written messages into queue 0, so here we can only assert "strictly
+        // increasing by 1".
         ck.check(
             "R2 queue offsets advance by exactly one per send",
             prev_offset.map(|p| sent.queue_offset == p + 1).unwrap_or(true),
@@ -762,7 +790,7 @@ async fn r2_consume_executor(
         &format!("{executor:?}"),
     );
 
-    // 入参夹取：core 不为负、max 不小于 core。
+    // Clamping of the arguments: core is not negative, max is not smaller than core.
     let clamped = ConsumeExecutor::with_params(-1, 3, Duration::ZERO, "rmq-clamp");
     let raised = ConsumeExecutor::with_params(5, 2, Duration::from_secs(1), "rmq-raise");
     ck.check(
@@ -780,7 +808,8 @@ async fn r2_consume_executor(
         &format!("err={rejected:?}"),
     );
 
-    // 3 个「卡住」的任务：core=2 ⇒ 只有 2 个能跑，第 3 个必须排队（确定性观测点）。
+    // 3 "stuck" tasks: with core=2 ⇒ only 2 can run and the 3rd must queue up (a deterministic
+    // observation point).
     let gate = Arc::new(AtomicBool::new(false));
     let started: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
     for (idx, batch) in batches.iter().take(3).enumerate() {
@@ -819,7 +848,7 @@ async fn r2_consume_executor(
         &format!("queued={} workers={}", executor.queued_count(), executor.worker_count()),
     );
 
-    // 第 4 批走 clone：`Clone` 共享同一个池。
+    // The 4th batch goes through clone: `Clone` shares the same pool.
     let shared = executor.clone();
     let task = make_consume_task(
         3,
@@ -840,7 +869,7 @@ async fn r2_consume_executor(
         &format!("started={batch_ids:?} cloneWorkers={}", shared.worker_count()),
     );
 
-    // 每条真实消息恰好被消费一次，且 listener 看到的是真字段。
+    // Every real message is consumed exactly once and the listener sees real fields.
     let outcomes = lock(&listener.outcomes).clone();
     let mut consumed: Vec<String> = outcomes.iter().flat_map(|(_, b)| b.clone()).collect();
     consumed.sort();
@@ -880,7 +909,8 @@ async fn r2_consume_executor(
         &format!("{named:?}"),
     );
 
-    // core 抬到 3：只补「队列里真等着的那点」，不是补到跟队列一样长。
+    // Raising core to 3 only adds "the few tasks actually waiting in the queue", not enough to make
+    // it as long as the queue.
     executor.set_core_pool_size(3).map_err(|e| format!("resize failed: {e}"))?;
     ck.check(
         "R2 raising core is recorded immediately and clamps max upward",
@@ -895,7 +925,8 @@ async fn r2_consume_executor(
         ),
     );
 
-    // 关停：先 shutdown（不再接单、跑完手上的活），再等 worker 全部退出。
+    // Shutdown: first shutdown (it takes no more work and finishes what it already has), then wait
+    // for all workers to exit.
     executor.shutdown();
     let refused = shared.submit(Box::pin(async {})).err().map(|e| e.to_string());
     ck.check(
@@ -921,8 +952,8 @@ async fn r2_consume_executor(
 
 // ------------------------------------------------------------------ R3
 
-/// 真实轨迹通道：钩子交出的每条 `TraceContext` 编码后**真的发到轨迹 topic**
-/// （body = trans_data，KEYS = 排序后的 trans_key，不带 tags）。
+/// The real trace channel: every `TraceContext` the hook hands over is encoded and **really sent
+/// to the trace topic** (body = trans_data, KEYS = the sorted trans_key, without tags).
 struct LiveTraceSink {
     handle: Handle,
     client: RemotingClient,
@@ -932,7 +963,8 @@ struct LiveTraceSink {
     producer_group: String,
     client_id: String,
     reported: Mutex<Vec<TraceContext>>,
-    /// 后台发送的完成数与失败原因（失败只记账，绝不能影响业务链路）。
+    /// The completion count and failure reasons of the background send (failures are only recorded,
+    /// they must never affect the business path).
     accepted: AtomicUsize,
     sent: Arc<AtomicUsize>,
     failures: Arc<Mutex<Vec<String>>>,
@@ -997,8 +1029,8 @@ impl TraceReportSink for LiveTraceSink {
         };
         self.accepted.fetch_add(1, Ordering::SeqCst);
         lock(&self.reported).push(context);
-        // trans_key 用 `KEY_SEPARATOR` 连接，它是 BTreeSet，
-        // 迭代序即排序序，join 出来的结果天然有序。
+        // The trans_key is joined with `KEY_SEPARATOR`; since it is a BTreeSet its iteration order
+        // is the sorted order, so the joined result is naturally ordered.
         let keys = bean
             .trans_key
             .iter()
@@ -1033,7 +1065,7 @@ impl TraceReportSink for LiveTraceSink {
     }
 }
 
-/// 组一个发送上下文（R3 的两个负例与正例共用）。
+/// Assemble a send context (shared by R3's two negative cases and the positive case).
 fn send_context(
     msg: &Message,
     producer_group: &str,
@@ -1078,7 +1110,7 @@ async fn r3_trace_hook(
     consume_hooks.register(Arc::new(ConsumeMessageTraceHook::new(dyn_sink))
         as Arc<dyn ConsumeMessageHook>);
 
-    // ---- 发送侧：3 条真实消息，每条跑一次 before/after ----
+    // ---- Send side: 3 real messages, each running before/after once ----
     let mut uniq_keys: Vec<String> = Vec::new();
     let mut broker_ids: Vec<String> = Vec::new();
     let mut results: Vec<SendResult> = Vec::new();
@@ -1190,8 +1222,9 @@ async fn r3_trace_hook(
         &format!("accepted={before_off}->{}", sink.accepted()),
     );
 
-    // ---- 消费侧：把这 3 条真实消息作为一批投出去 ----
-    // R1 的轮询发送也落在 queue 3，所以必须从第一条 R3 消息自己的 offset 开始拉。
+    // ---- Consume side: hand those 3 real messages over as one batch ----
+    // R1's poll send also lands on queue 3, so we have to start pulling from the offset of R3's very
+    // own first message.
     let consumed = pull_until(
         client,
         broker_addr,
@@ -1264,7 +1297,7 @@ async fn r3_trace_hook(
         &format!("after={sub_after:?}"),
     );
 
-    // 空批次：before/after 都不该产出任何记录。
+    // Empty batch: neither before nor after should produce any record.
     let before_empty = sink.accepted();
     let mut empty_ctx = ConsumeMessageContext::new(consumer_group, None, None);
     execute_consume_hook_before(&consume_hooks, &mut empty_ctx);
@@ -1275,9 +1308,9 @@ async fn r3_trace_hook(
         &format!("accepted={before_empty}->{} holder={}", sink.accepted(), empty_ctx.mq_trace_context.is_some()),
     );
 
-    // ---- 关键一跳：轨迹记录真的落到 broker，再拉回来解码 ----
+    // ---- The key hop: the trace records really land on the broker and are pulled back for decoding ----
     let expected = sink.accepted();
-    let want_msgs = 3 + 1 + 1; // 3 条 Pub + 1 条 SubBefore + 1 条 SubAfter
+    let want_msgs = 3 + 1 + 1; // 3 Pub + 1 SubBefore + 1 SubAfter
     ck.check(
         "R3 the hook chain reported exactly the records we expect",
         expected == want_msgs,
@@ -1460,7 +1493,8 @@ async fn r4_cleanup(
             resp.code == response_code::SUCCESS,
             &format!("code={} remark={:?}", resp.code, resp.remark),
         );
-        // 5.x 默认 deleteTopicWithBrokerRegistration=false ⇒ 还得显式删 namesrv 路由。
+        // In 5.x deleteTopicWithBrokerRegistration=false is the default ⇒ the namesrv route still has
+        // to be deleted explicitly.
         let mut del =
             RemotingCommand::create_request_command(request_code::DELETE_TOPIC_IN_NAMESRV, None);
         del.add_ext_field("topic", topic);

@@ -1,4 +1,5 @@
-// 发布地址侧的离线单测：「只认 master」与「退让到从节点」两条口径分别锁死。
+// Offline unit tests on the publish address side: the two rules "master only" and "fall
+// back to a slave" are pinned down separately.
 using System.Buffers.Binary;
 using System.Globalization;
 using System.Net;
@@ -9,7 +10,7 @@ using RocketMQ.Common;
 using RocketMQ.Remoting;
 using RocketMQ.Remoting.Protocol;
 using Xunit;
-// PropertyMap 是 src 侧的 global using 别名（SortedDictionary<string,string>），测试项目要显式声明。
+// PropertyMap is a global using alias on the src side (SortedDictionary<string,string>), so the test project has to declare it explicitly.
 using PropertyMap = System.Collections.Generic.SortedDictionary<string, string>;
 
 namespace RocketMQ.Client.Tests;
@@ -20,15 +21,17 @@ public class PublishRouteMasterTests
     private const string Topic = "PublishRouteMasterUnitTopic";
     private const long SlaveId = MixAll.MasterId + 1;
 
-    // ---------------------------------------------------------------- 假端点
+    // ---------------------------------------------------------------- Fake endpoints
 
     /// <summary>
-    /// 进程内假端点：既能当 namesrv 回路由，也能当 broker 回 offset 查询。
-    /// master 与 slave 各起一个，「请求落在谁身上」直接从 socket 上取证。
+    /// An in-process fake endpoint: it can serve as the namesrv returning routes as well
+    /// as the broker answering offset queries.
+    /// One master and one slave are started, so "which one the request landed on" is
+    /// evidenced straight off the socket.
     /// </summary>
     private sealed class RouteEndpoint : IDisposable
     {
-        /// <summary>四个查询各自的应答值（互不相同，证明取回的是这一路的数据）。</summary>
+        /// <summary>The response value of each of the four queries (all different, proving that this path's data is what came back).</summary>
         public const long MaxOffsetReply = 7;
         public const long MinOffsetReply = 3;
         public const long SearchOffsetReply = 5;
@@ -41,7 +44,7 @@ public class PublishRouteMasterTests
 
         public string Addr { get; }
 
-        /// <summary>QUERY_CONSUMER_OFFSET(14) 的应答位点（主/从各设一个互不相同的值）。</summary>
+        /// <summary>The response offset of QUERY_CONSUMER_OFFSET(14) (one value on the master, a different one on the slave).</summary>
         public long OffsetReply { get; set; }
 
         private RouteEndpoint(Socket listener)
@@ -75,7 +78,7 @@ public class PublishRouteMasterTests
             }
         }
 
-        /// <summary>四个 offset 查询（29/30/31/32）一共收到多少笔 —— 「有没有 wire 打到这台」。</summary>
+        /// <summary>How many of the four offset queries (29/30/31/32) this endpoint received in total -- "did any wire reach this one".</summary>
         public int CountOffsetQueries()
         {
             lock (_gate)
@@ -110,7 +113,7 @@ public class PublishRouteMasterTests
             }
             catch (Exception)
             {
-                // 关监听端口不需要处理异常
+                // Closing the listening port needs no exception handling
             }
         }
 
@@ -125,7 +128,7 @@ public class PublishRouteMasterTests
                 }
                 catch (Exception)
                 {
-                    return;  // Dispose 之后 Accept 必抛，正常收工
+                    return;  // after Dispose, Accept necessarily throws, this is a normal shutdown
                 }
 
                 new Thread(() =>
@@ -138,7 +141,7 @@ public class PublishRouteMasterTests
                         }
                         catch (Exception)
                         {
-                            // 半路断连 / 解码失败：丢掉这条连接即可
+                            // A mid-stream disconnect / decode failure: just drop this connection
                         }
                     }
                 })
@@ -183,7 +186,7 @@ public class PublishRouteMasterTests
                 RemotingCommand? resp = Respond(req);
                 if (resp is null)
                 {
-                    continue;  // oneway 没有应答可写
+                    continue;  // oneway has no response to write
                 }
 
                 byte[] wire = resp.Encode();
@@ -244,7 +247,7 @@ public class PublishRouteMasterTests
 
             if (req.Code == RequestCode.LockBatchMq)
             {
-                // 把请求体的 mqSet 原样回成 lockOKMQSet：返回的锁集非空即证明「这一发真的落地了」
+                // Echo the request body's mqSet back as lockOKMQSet: a non-empty returned lock set proves "this send really landed"
                 var okSet = JsonValue.MakeArray();
                 if (req.Body is { Length: > 0 }
                     && Json.TryParse(Encoding.UTF8.GetString(req.Body), out JsonValue body, out _)
@@ -267,18 +270,18 @@ public class PublishRouteMasterTests
 
             if (req.Code == RequestCode.PopMessage)
             {
-                // 长轮询空手而归是常态：回 210 POLLING_TIMEOUT，客户端按 PollingNotFound 收
+                // A long poll coming back empty-handed is normal: reply 210 POLLING_TIMEOUT and the client treats it as PollingNotFound
                 return Echo(req, ResponseCode.PollingTimeout, "mock: no message");
             }
 
-            // 心跳之类一律成功，别让后台线程卡在错误上
+            // Heartbeats and the like always succeed, do not let the background thread get stuck on an error
             return req.IsOnewayRpc() ? null : Echo(req, ResponseCode.Success, null);
         }
 
         private static RemotingCommand Echo(RemotingCommand req, int code, string? remark)
         {
             var resp = RemotingCommand.CreateResponseCommand(code, remark);
-            // 客户端按 opaque 配对，串了的响应会被当噪声丢掉
+            // The client pairs by opaque, a cross-wired response is dropped as noise
             resp.Opaque = req.Opaque;
             resp.SerializeTypeCurrentRpc = req.SerializeTypeCurrentRpc;
             return resp;
@@ -311,7 +314,7 @@ public class PublishRouteMasterTests
         }
     }
 
-    // ---------------------------------------------------------------- 夹具
+    // ---------------------------------------------------------------- Fixtures
 
     private static TopicRouteData RouteOf(string brokerName, params (long BrokerId, string Addr)[] addrs)
     {
@@ -328,11 +331,12 @@ public class PublishRouteMasterTests
         return route;
     }
 
-    /// <summary>建实例并把 Topic 路由塞进缓存（真 RPC 走一趟假 namesrv）。</summary>
+    /// <summary>Builds the instance and stuffs the Topic route into the cache (a real RPC
+    /// round trip through the fake namesrv).</summary>
     private static MQClientInstance NewInstanceWithRoute(RouteEndpoint namesrv, string clientId)
     {
         var instance = new MQClientInstance(clientId, new List<string> { namesrv.Addr });
-        Assert.True(instance.UpdateTopicRouteInfoFromNameServer(Topic), "路由要真的进缓存");
+        Assert.True(instance.UpdateTopicRouteInfoFromNameServer(Topic), "the route must really enter the cache");
         return instance;
     }
 
@@ -342,11 +346,13 @@ public class PublishRouteMasterTests
         Assert.Equal(-1, e.ResponseCode);
     }
 
-    // ---------------------------------------------------------------- 地址解析
+    // ---------------------------------------------------------------- Address resolution
 
     /// <summary>
-    /// <c>FindBrokerAddressInPublish</c> 只认 brokerId=0；同一张路由上「主优先、没主退一台」
-    /// 的口径（<c>BrokerAddrOf</c>，给心跳/拉取用）必须拿得到从节点 —— 两条口径不能合成一条。
+    /// <c>FindBrokerAddressInPublish</c> only accepts brokerId=0; on the same route the
+    /// "prefer the master, fall back to another one when there is none" rule
+    /// (<c>BrokerAddrOf</c>, used by heartbeat/pull) must be able to reach a slave -- the
+    /// two rules must not be merged into one.
     /// </summary>
     [Fact]
     public void PublishLookupTakesOnlyTheMasterWhileBrokerAddrOfFallsBack()
@@ -359,12 +365,12 @@ public class PublishRouteMasterTests
         MQClientInstance instance = NewInstanceWithRoute(namesrv, "prm-master-only@1");
         try
         {
-            // 停后形状：平表里 broker-a 只剩 brokerId=1
+            // after the shutdown shape: in the flat table broker-a only has brokerId=1 left
             Assert.Equal(string.Empty, instance.FindBrokerAddressInPublish(Broker));
-            // 负控：退让口径（心跳/拉取/位点查询用）在**同一张路由**上必须拿得到从节点地址
+            // Negative control: the fallback rule (used by heartbeat/pull/offset query) must be able to reach the slave address on **the same route**
             Assert.Equal(slave.Addr, instance.BrokerAddrOf(Broker));
 
-            // master 重新注册：发布口径立刻解析得出（跳的是「没有 master」，不是 broker-a 这个名字）
+            // The master registers again: the publish rule resolves it immediately (it skips "there is no master", not the name broker-a)
             namesrv.AddRoute(Topic, RouteOf(Broker, (MixAll.MasterId, master.Addr), (SlaveId, slave.Addr)));
             Assert.True(instance.UpdateTopicRouteInfoFromNameServer(Topic));
             Assert.Equal(master.Addr, instance.FindBrokerAddressInPublish(Broker));
@@ -383,7 +389,7 @@ public class PublishRouteMasterTests
         var instance = new MQClientInstance("prm-refresh@1", new List<string> { namesrv.Addr });
         try
         {
-            // 还没见过这个 topic：那次「查不到 → 刷路由 → 重查」必须真的发生
+            // This topic has not been seen before: that "not found -> refresh the route -> look again" really has to happen
             namesrv.AddRoute(Topic, RouteOf(Broker, (MixAll.MasterId, master.Addr)));
             Assert.Equal(master.Addr, instance.PublishAddrFor(Broker, Topic));
             Assert.Equal(1, namesrv.CountRequests(RequestCode.GetRouteinfoByTopic));
@@ -394,7 +400,8 @@ public class PublishRouteMasterTests
         }
     }
 
-    /// <summary>主掉线（路由里只剩 brokerId=1）：本端报「broker 不存在」，一次 broker 请求都不发。</summary>
+    /// <summary>The master is down (only brokerId=1 left in the route): we report "broker
+    /// does not exist" locally and not a single broker request is sent.</summary>
     [Fact]
     public void PublishAddrForReportsNotExistWhenTheMasterIsGone()
     {
@@ -410,10 +417,10 @@ public class PublishRouteMasterTests
             AssertNotExist(Assert.Throws<MQClientException>(
                 () => instance.PublishAddrFor(Broker, Topic)));
             Assert.Equal(before + 1, namesrv.CountRequests(RequestCode.GetRouteinfoByTopic));
-            // 一次 broker wire 都没发：从节点上是「发过去再被拒」，这里压根不发
+            // Not one broker wire was sent: on a slave that would be "send it and get rejected", here nothing is sent at all
             Assert.Equal(0, slave.CountOffsetQueries());
 
-            // 负控：跳的是「没有 master」，不是 broker-a 这个名字 —— master 一注册立刻解析得出
+            // Negative control: what is skipped is "there is no master", not the name broker-a -- it resolves as soon as a master registers
             namesrv.AddRoute(Topic, RouteOf(Broker, (MixAll.MasterId, master.Addr), (SlaveId, slave.Addr)));
             Assert.Equal(master.Addr, instance.PublishAddrFor(Broker, Topic));
         }
@@ -423,7 +430,8 @@ public class PublishRouteMasterTests
         }
     }
 
-    /// <summary>路由里压根没有这个 brokerName（拼错/已下线）：同样报 not exist，不退到别的 broker。</summary>
+    /// <summary>This brokerName is not in the route at all (typo / decommissioned): also
+    /// reports not exist, it does not fall back to another broker.</summary>
     [Fact]
     public void PublishAddrForReportsNotExistForAnUnknownBroker()
     {
@@ -436,7 +444,7 @@ public class PublishRouteMasterTests
         {
             AssertNotExist(Assert.Throws<MQClientException>(
                 () => instance.PublishAddrFor(Broker, Topic)));
-            // 负控：平表确实写进去了（broker-b 查得到），缺的只是 broker-a 这一条
+            // Negative control: the flat table really does have it (broker-b is found); only the broker-a entry is missing
             Assert.Equal(other.Addr, instance.FindBrokerAddressInPublish("broker-b"));
         }
         finally
@@ -445,11 +453,13 @@ public class PublishRouteMasterTests
         }
     }
 
-    // ---------------------------------------------------------------- 管理端 offset 查询
+    // ---------------------------------------------------------------- Admin-side offset queries
 
     /// <summary>
-    /// <c>MQAdminImpl:195/214/232/250</c> 的四个 offset 查询同一口径：只打主，主没了就报
-    /// not exist、一条 wire 都不发（旧行为是退到从节点上把查询做完，静默给出「主的数据」）。
+    /// The four offset queries of <c>MQAdminImpl:195/214/232/250</c> follow one rule: only
+    /// the master is contacted, and with no master it reports not exist and sends not a
+    /// single wire (the old behaviour was to fall back to a slave and finish the query
+    /// there, silently handing back "the master's data").
     /// </summary>
     [Fact]
     public void AdminOffsetQueriesAreMasterOnlyToo()
@@ -473,7 +483,7 @@ public class PublishRouteMasterTests
             AssertNotExist(Assert.Throws<MQClientException>(() => admin.EarliestMsgStoreTime(mq)));
             Assert.Equal(0, slave.CountOffsetQueries());
 
-            // 负控：主回来之后四路都查得到，且请求落在**主**地址上（不是路由里那台从节点）
+            // Negative control: once the master is back all four are found, and the requests land on the **master** address (not on that slave from the route)
             namesrv.AddRoute(Topic, RouteOf(Broker, (MixAll.MasterId, master.Addr), (SlaveId, slave.Addr)));
             admin.Client().UpdateTopicRouteInfoFromNameServer(Topic);
             Assert.Equal(RouteEndpoint.MaxOffsetReply, admin.MaxOffset(mq));
@@ -490,7 +500,7 @@ public class PublishRouteMasterTests
         }
     }
 
-    // ---------------------------------------------------------------- 订阅口径（#104）
+    // ---------------------------------------------------------------- Subscribe rule (#104)
 
     [Fact]
     public void OrderlyLocksSkipTheBrokerWhenTheMasterIsGone()
@@ -512,7 +522,7 @@ public class PublishRouteMasterTests
             Assert.Equal(0, slave.CountRequests(RequestCode.UnlockBatchMq));
             Assert.Equal(before, namesrv.CountRequests(RequestCode.GetRouteinfoByTopic));
 
-            // 负控：主回来之后锁/解锁都落在主地址上、返回的锁集就是请求的那两个队列
+            // Negative control: once the master is back both the lock and the unlock land on the master address, and the returned lock set is exactly the two requested queues
             namesrv.AddRoute(Topic, RouteOf(Broker, (MixAll.MasterId, master.Addr), (SlaveId, slave.Addr)));
             instance.UpdateTopicRouteInfoFromNameServer(Topic);
             Assert.Equal(2, instance.LockBatchMq("GID_prm_lock", "prm-lock@1", mqs).Count);
@@ -542,11 +552,11 @@ public class PublishRouteMasterTests
             int before = namesrv.CountRequests(RequestCode.GetRouteinfoByTopic);
             AssertNotExist(Assert.Throws<MQClientException>(() => instance.PopMessage(
                 "GID_prm_pop", Topic, 0, 1, 30000L, 1000L, 0, brokerNameIn: Broker)));
-            // 报错前必须刷过一次路由（popAsync 的 findBrokerAddressInSubscribe + 重查）
+            // The route must have been refreshed once before the error (popAsync's findBrokerAddressInSubscribe + look again)
             Assert.Equal(before + 1, namesrv.CountRequests(RequestCode.GetRouteinfoByTopic));
             Assert.Equal(0, slave.CountRequests(RequestCode.PopMessage));
 
-            // 负控：主注册后（这一发会顺带触发一次路由刷新）请求落在主地址上，从节点一条没有
+            // Negative control: after the master registers (this send incidentally triggers one route refresh) the request lands on the master address and not one reaches the slave
             namesrv.AddRoute(Topic, RouteOf(Broker, (MixAll.MasterId, master.Addr), (SlaveId, slave.Addr)));
             PopResult result = instance.PopMessage(
                 "GID_prm_pop", Topic, 0, 1, 30000L, 1000L, 0, brokerNameIn: Broker);
@@ -576,13 +586,13 @@ public class PublishRouteMasterTests
             var mq = new MessageQueue(Topic, Broker, 0);
             int before = namesrv.CountRequests(RequestCode.GetRouteinfoByTopic);
 
-            // 主没了：退到从节点上把查询做完，取回的是**从节点**那份值
+            // No master: fall back to a slave to finish the query, and the value that comes back is the **slave's**
             Assert.True(instance.QueryConsumerOffset("GID_prm_offset", mq, out long offset));
             Assert.Equal(424242L, offset);
             Assert.Equal(1, slave.CountRequests(RequestCode.QueryConsumerOffset));
             Assert.Equal(before + 1, namesrv.CountRequests(RequestCode.GetRouteinfoByTopic));
 
-            // 负控：主回来之后只打主（从节点计数不再增长）
+            // Negative control: once the master is back only the master is contacted (the slave's counter stops growing)
             namesrv.AddRoute(Topic, RouteOf(Broker, (MixAll.MasterId, master.Addr), (SlaveId, slave.Addr)));
             instance.UpdateTopicRouteInfoFromNameServer(Topic);
             Assert.True(instance.QueryConsumerOffset("GID_prm_offset", mq, out offset));
@@ -595,7 +605,7 @@ public class PublishRouteMasterTests
             instance.Shutdown();
         }
 
-        // 路由里压根没有 broker-a（连从节点都没有）：刷一次路由后仍查不到 ⇒ 本端报 not exist
+        // broker-a is not in the route at all (not even a slave): still not found after one refresh => we report not exist locally
         using RouteEndpoint namesrv2 = RouteEndpoint.Start();
         using RouteEndpoint other = RouteEndpoint.Start();
         namesrv2.AddRoute(Topic, RouteOf("broker-b", (MixAll.MasterId, other.Addr)));

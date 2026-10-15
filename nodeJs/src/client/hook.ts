@@ -1,11 +1,13 @@
 // -*- coding: utf-8 -*-
-// Hook 接口 + 默认空实现 + 共享注册表。
+// Hook interfaces + default no-op implementations + shared registry.
 //
-// 调用次序约定：
-//   * CheckForbiddenHook 在 sendKernelImpl 内部、压缩/sysflag 之后紧接着跑，抛出的
-//     异常**不会**被吞——它会中止本次发送。
-//   * SendMessageHook 环绕真正的网络发送（before/after）。
-//   * FilterMessageHook 吞异常：任何异常都回落到原始 msg 列表。
+// Call-order convention:
+//   * CheckForbiddenHook runs inside sendKernelImpl, immediately after
+//     compression/sysflag; exceptions it throws are NOT swallowed — they abort
+//     this send.
+//   * SendMessageHook wraps the real network send (before/after).
+//   * FilterMessageHook swallows exceptions: any exception falls back to the
+//     original msg list.
 import { Message } from '../common/message.ts';
 import { MessageQueue } from '../common/message.ts';
 import { SendResult } from './send_result.ts';

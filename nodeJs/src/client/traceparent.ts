@@ -1,15 +1,19 @@
-// W3C Trace Context（traceparent）在消息上的传播，供 OpenTelemetry 一类集成使用。
+// W3C Trace Context (traceparent) propagation on messages, for integrations such
+// as OpenTelemetry.
 //
 //	traceparent: 00-<trace-id 32hex>-<parent-id 16hex>-<flags 2hex>
 //
-// 关键规则：
+// Key rules:
 //
-//   - trace-id 与 parent-id 不能全零；flags "00"（未采样）合法；
-//   - producer 只有在消息**尚未携带 traceparent** 时才注入根 span——上游传播
-//     过来的 context 永远优先；
-//   - consumer 侧执行 EXTRACT，让业务代码能挂自己的子 span。
+//   - trace-id and parent-id must not be all zeros; flags "00" (not sampled) is
+//     legal;
+//   - the producer injects a root span only while the message **does not yet
+//     carry a traceparent** — a context propagated from upstream always wins;
+//   - the consumer side performs EXTRACT so application code can attach its own
+//     child span.
 //
-// 通过 setEnableTraceContext 或 ROCKETMQ_TRACE_CONTEXT_ENABLE 环境变量启用。
+// Enabled via setEnableTraceContext or the ROCKETMQ_TRACE_CONTEXT_ENABLE
+// environment variable.
 import { randomBytes } from 'node:crypto';
 import { Message } from '../common/message.ts';
 import { MessageConst } from '../common/messageConst.ts';
@@ -33,8 +37,9 @@ function isHex(s: string): boolean {
   return /^[0-9a-fA-F]+$/.test(s);
 }
 
-// isValidTraceparent 检查 W3C 语法加上"非全零"规则。大写 hex 也接受（转发过来的
-// 值不做改写）。
+// isValidTraceparent checks the W3C syntax plus the "not all zeros" rule.
+// Uppercase hex is accepted too (values forwarded from elsewhere are passed
+// through unchanged).
 export function isValidTraceparent(value: string): boolean {
   const parts = String(value).trim().split('-');
   if (parts.length !== 4) return false;
@@ -75,7 +80,8 @@ export function extractTraceparent(msg: Message): string | null {
   return v ? v : null;
 }
 
-// traceContextEnabledFromEnv 读取 ROCKETMQ_TRACE_CONTEXT_ENABLE 环境变量。
+// traceContextEnabledFromEnv reads the ROCKETMQ_TRACE_CONTEXT_ENABLE
+// environment variable.
 export function traceContextEnabledFromEnv(): boolean {
   const v = (process.env[TRACE_CONTEXT_ENABLE_ENV] || '').trim().toLowerCase();
   return v === '1' || v === 'true' || v === 'yes';

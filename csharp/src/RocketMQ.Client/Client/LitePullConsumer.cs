@@ -11,7 +11,7 @@ namespace RocketMQ.Client;
 
 public interface ILiteMessageQueueListener
 {
-    // mqAll=当前订阅的全部队列；mqDivided=本次新分配给本实例的队列。
+    // mqAll=all queues currently subscribed; mqDivided=the queues newly assigned to this instance.
     void MessageQueueChanged(IReadOnlyList<MessageQueue> mqAll, IReadOnlyList<MessageQueue> mqDivided);
 }
 
@@ -39,11 +39,12 @@ public sealed class DefaultLitePullConsumer
     private bool _enableStreamRequestType = true;
     private int _pollNameServerIntervalMillis = 30000;
 
-    // subscribe 模式的订阅表（topic -> sub_expression，已套命名空间）
+    // subscribe-mode subscription table (topic -> sub_expression, namespace already applied)
     private readonly Dictionary<string, string> _subscription = new(StringComparer.Ordinal);
-    // 订阅对应的 SubscriptionData（带 tagsSet），用于发给 broker 的心跳做 tag 过滤注册
+    // SubscriptionData for each subscription (with tagsSet), used in the heartbeat sent to
+    // the broker for tag-filter registration
     private readonly Dictionary<string, SubscriptionData> _subscriptionData = new(StringComparer.Ordinal);
-    // assign 模式：topic -> tag 过滤表达式（透传给 pull）
+    // assign mode: topic -> tag filter expression (passed through to pull)
     private readonly Dictionary<string, string> _assignSubExpr = new(StringComparer.Ordinal);
     private bool _assignMode;
     private readonly HashSet<MessageQueue> _assigned = new();
@@ -88,7 +89,7 @@ public sealed class DefaultLitePullConsumer
         _consumerGroup = consumerGroup;
     }
 
-    // ---------------- 配置 ----------------
+    // ---------------- configuration ----------------
     public void SetNamesrvAddr(string addr) => SetNameServerAddresses(SplitSemicolon(addr));
 
     public void SetNameServerAddresses(IEnumerable<string> addrs)
@@ -197,7 +198,7 @@ public sealed class DefaultLitePullConsumer
 
     public int TopicMetadataCheckIntervalMillis => _topicMetadataCheckIntervalMillis;
 
-    // ---------------- 订阅 / 分配 ----------------
+    // ---------------- subscription / allocation ----------------
     public void Subscribe(string topic, string subExpression = "*")
     {
         _assignMode = false;
@@ -265,7 +266,7 @@ public sealed class DefaultLitePullConsumer
         }
     }
 
-    // ---------------- 生命周期 ----------------
+    // ---------------- lifecycle ----------------
     public void Start()
     {
         lock (_lock)
@@ -332,7 +333,8 @@ public sealed class DefaultLitePullConsumer
             }
             catch
             {
-                // 起不来就把引用还回去：否则计数漏减，共享实例永远等不到归零收尾
+                // If startup fails, hand the reference back: otherwise the refcount
+            // misses a decrement and the shared instance never reaches zero.
                 MQClientManager.Instance.UnregisterMQClient(_clientId, _mqClient);
                 _mqClient = null;
                 throw;
@@ -418,7 +420,7 @@ public sealed class DefaultLitePullConsumer
         }
     }
 
-    // ---------------- 拉取服务 ----------------
+    // ---------------- pull service ----------------
     private void PullServiceLoop()
     {
         DateTime lastRebalance = DateTime.MinValue;
@@ -519,8 +521,9 @@ public sealed class DefaultLitePullConsumer
         FilterTags(mq.Topic, msgs, sub);
         if (msgs.Count == 0)
         {
-            // 全被 tag 过滤掉：窗口在 broker 眼里已经读过（游标上面推过了），
-            // 只是没有可交付的——不能像旧实现那样原地重拉同一窗口。
+            // All filtered out by tags: the window is already read as far as the broker
+            // is concerned (the cursor advanced past it), there is just nothing
+            // deliverable — unlike the old implementation, do not re-pull the same window.
             return false;
         }
 
@@ -605,7 +608,8 @@ public sealed class DefaultLitePullConsumer
         }
     }
 
-    /// <summary>拉取游标（观测点：真机对拍要看的正是"拉了多少"与"交了多少"这两格的差）。</summary>
+    /// <summary>The pull cursor (observation point: what real-machine parity checks want is
+    /// exactly the gap between "how much was pulled" and "how much was consumed").</summary>
     public long PullCursorOf(MessageQueue mq)
     {
         lock (_lock)
@@ -614,7 +618,7 @@ public sealed class DefaultLitePullConsumer
         }
     }
 
-    /// <summary>已消费游标（Poll() 交出去的那一格）。</summary>
+    /// <summary>The consume cursor (what Poll() has handed out).</summary>
     public long ConsumeCursorOf(MessageQueue mq)
     {
         lock (_lock)
@@ -623,7 +627,7 @@ public sealed class DefaultLitePullConsumer
         }
     }
 
-    /// <summary>内存位点表里那一格（persist=false 提交但还没落盘的值就在这）。</summary>
+    /// <summary>The in-memory offset table entry (where persist=false commits live until flushed).</summary>
     public long PendingCommitOf(MessageQueue mq)
     {
         lock (_lock)
@@ -740,9 +744,9 @@ public sealed class DefaultLitePullConsumer
                     if (newSet.Contains(mq)) continue;
                     if (_offsetTable.ContainsKey(mq)) revoked.Add(mq);
                     _nextOffset.Remove(mq);
-                    // 撤队列丢掉的是**整份 MessageQueueState**（pullOffset / consumeOffset /
-                    // seekOffset）：留着 seekOffset 就是让这条队列哪天回到本实例时静默跳回
-                    // 用户很久以前手动钉过的位置。
+                    // Revoking a queue drops the **entire MessageQueueState** (pullOffset / consumeOffset /
+                    // seekOffset): keeping seekOffset would silently jump back to a position the
+                    // user pinned long ago whenever this queue returns to this instance.
                     _consumeOffset.Remove(mq);
                     _seekOffset.Remove(mq);
                 }
@@ -782,14 +786,14 @@ public sealed class DefaultLitePullConsumer
 
         foreach (string topic in topics)
         {
-            // 与 rebalance 同口径：订阅信息。
+            // Same basis as rebalance: subscription info.
             all.AddRange(RequireClient().GetTopicSubscribeInfo(topic));
         }
 
         return all;
     }
 
-    // ---------------- Poll / 位点 ----------------
+    // ---------------- Poll / offsets ----------------
     public List<MessageExt> Poll(int timeoutMillis = -1)
     {
         if (_autoCommit) MaybeAutoCommit();
@@ -872,8 +876,9 @@ public sealed class DefaultLitePullConsumer
         return off;
     }
 
-    /// 提交源绝不能是拉取游标：本地缓冲里压着没交出去的消息不算已消费，提前提交会让那段
-    /// 消息在重启后永远不再投递（静默丢消息）。
+    /// The commit source must never be the pull cursor: messages still sitting in the local
+    /// buffer are not consumed, and committing early would make them never delivered again
+    /// after a restart (silent message loss).
     /// </summary>
     public void Commit()
     {
@@ -921,7 +926,8 @@ public sealed class DefaultLitePullConsumer
     }
 
     /// <summary>
-    /// 三个入口的共同部分：写内存位点表（两道守卫），<c>persist</c> 再把这一批刷给 broker。
+    /// The shared part of the three entry points: writes the in-memory offset table (two
+    /// guards), and <c>persist</c> flushes this batch to the broker.
     private void CommitTargets(Dictionary<MessageQueue, long> targets, List<MessageQueue> scope,
         bool persist)
     {
@@ -1013,7 +1019,8 @@ public sealed class DefaultLitePullConsumer
         }
         catch (Exception e)
         {
-            // nameserver 抖动时退回当下缓存再判一次：缓存里还有队列就不该报成"没队列"。
+            // On nameserver hiccups, fall back to the current cache and check once more:
+            // if the cache still has queues, it should not be reported as "no queues".
             ClientLog.Debug("fetch queues: route refresh for " + fullTopic + " failed: " + e.Message);
         }
 
@@ -1095,10 +1102,12 @@ public sealed class DefaultLitePullConsumer
         }
     }
 
-    /// <summary>逐个 topic 把当前订阅队列集合与上次快照做集合比对，只有真的变了才回调
-    /// OnChanged 并推进快照。某个 topic 查询失败只 log、跳过它自己，**不影响本轮其余
-    /// topic**：一个长期查不到路由的 topic 不该把排在它后面的监听器永久饿死。
-    /// 返回本轮回调了几个监听器。</summary>
+    /// <summary>For each topic, set-compare the current subscribed queue set against the last
+    /// snapshot; only when it really changed fire OnChanged and advance the snapshot. A
+    /// failing topic query is only logged and that topic skipped, **not affecting the rest
+    /// of this round**: a topic whose route cannot be found for a long time must not
+    /// starve listeners queued behind it.
+    /// Returns how many listeners were fired this round.</summary>
     public int FetchTopicMessageQueuesAndCompare()
     {
         List<KeyValuePair<string, ITopicMessageQueueChangeListener>> entries;
@@ -1198,7 +1207,7 @@ public sealed class DefaultLitePullConsumer
     private void MetadataLoop() =>
         MetadataLoop(10000, _topicMetadataCheckIntervalMillis);
 
-    // ---------------- 心跳（把 tag 订阅注册给 broker）----------------
+    // ---------------- heartbeat (registers tag subscriptions with the broker) ----------------
     private HeartbeatData BuildHeartbeat()
     {
         var hb = new HeartbeatData(_clientId);
@@ -1219,9 +1228,10 @@ public sealed class DefaultLitePullConsumer
     }
 
     /// <summary>
-    /// 为心跳准备 broker 地址：把本实例关注的 topic（订阅的 + assign 到的）路由拉一遍
-    /// 并登记为在用。
-    /// 心跳只发给路由表里已知的 broker，所以这一步必须在首轮心跳之前。
+    /// Prepares broker addresses for the heartbeat: pull the route of every topic this
+    /// instance cares about (subscribed + assigned) and register them as in use.
+    /// The heartbeat is only sent to brokers known in the route table, so this step must
+    /// run before the first heartbeat round.
     /// </summary>
     private void RefreshRouteForHeartbeat()
     {
@@ -1287,7 +1297,7 @@ public sealed class DefaultLitePullConsumer
                 ClientLog.Debug("lite heartbeat loop error");
             }
 
-            // 5s 心跳间隔（与 push 消费者一致）
+            // 5s heartbeat interval (same as push consumers)
             for (int i = 0; i < 50; ++i)
             {
                 if (!_running) break;
@@ -1296,7 +1306,7 @@ public sealed class DefaultLitePullConsumer
         }
     }
 
-    // ---------------- 内部工具 ----------------
+    // ---------------- internal helpers ----------------
     private string WithNamespace(string topic)
     {
         return _namespace.Length == 0 ? topic : NamespaceUtil.WrapNamespace(_namespace, topic);

@@ -83,10 +83,10 @@ class PopResult:
 
 
 class ChangeInvisibleTimeResult:
-    """``change_invisible_time`` 的结果。
+    """Result of ``change_invisible_time``.
 
-    ``extra_info`` 是用响应里**新的** popTime/invisibleTime/reviveQid 重建的 8 段 CK 串，
-    后续 ACK 要用它（不是请求时传进去的那个旧串）。
+    ``extra_info`` is the 8-segment CK string rebuilt from the **new** popTime/invisibleTime/reviveQid
+    in the response; subsequent ACKs must use it (not the old string passed in the request).
     """
 
     def __init__(self, response_code: int, pop_time: int = 0, invisible_time: int = 0,
@@ -146,7 +146,7 @@ class MessageListenerOrderly:
 
 
 class MessageListener:
-    """兼容别名：先按并发监听器对待。"""
+    """Compatibility alias: treated as a concurrent listener for now."""
 
     def consume_message(self, msgs: List[MessageExt], context) -> ConsumeConcurrentlyStatus:
         raise NotImplementedError

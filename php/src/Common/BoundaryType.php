@@ -5,32 +5,33 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * 时间戳查位点的边界语义：LOWER 取右边界，UPPER 取左边界。
+ * Boundary semantics for querying offsets by timestamp: LOWER takes the right boundary, UPPER takes the left boundary.
  *
- * 报文侧的关键事实（别按字面直觉改）：
+ * Key facts on the wire side (do not change based on literal intuition):
  *
- *   * 入网的是**大写枚举名** ``LOWER`` / ``UPPER``——header 序列化输出的是枚举名，
- *     不是那个小写的显示名；小写名只用于本地比对与日志，从不上报文。
- *   * broker 侧解 header 时的转换是**宽松**的：只有忽略大小写等于 ``"upper"`` 才认
- *     UPPER，其余（null / 空串 / 未知值 / 小写 "lower"）一律落到 LOWER。
- *     所以发什么大小写都能被认出来，但本端口固定发大写枚举名。
+ *   * What goes on the wire is the **upper-case enum name** ``LOWER`` / ``UPPER`` — header serialization outputs the
+ *     enum name, not the lower-case display name; the lower-case name is only used for local comparison and logging,
+ *     and never goes on the wire.
+ *   * The broker side's parsing of the header is **lenient**: only a case-insensitive match of ``"upper"`` is
+ *     recognized as UPPER; everything else (null / empty string / unknown value / lower-case "lower") falls back to
+ *     LOWER. So any casing sent can be recognized, but this port always sends the upper-case enum name.
  *
- * broker 侧语义（按 storeTime 在 ConsumeQueue 里二分）：
+ * Broker side semantics (binary search in ConsumeQueue by storeTime):
  *
- *   * 时间戳大于队列里最后一条的 storeTime ⇒ LOWER = maxOffset（下一个可写位点），
- *     UPPER = maxOffset - 1（最后一条自己的位点）；
- *   * 时间戳小于最老一条 ⇒ LOWER = 0，UPPER = 0；
- *   * 命中 ⇒ LOWER = 共享该 storeTime 的第一条，UPPER = 最后一条；
- *   * 落在空档 ⇒ LOWER = 下一条（右边界），UPPER = 上一条（左边界）。
+ *   * Timestamp greater than the storeTime of the last message in the queue ⇒ LOWER = maxOffset (next writable offset),
+ *     UPPER = maxOffset - 1 (the offset of the last message itself);
+ *   * Timestamp less than the oldest message ⇒ LOWER = 0, UPPER = 0;
+ *   * Exact match ⇒ LOWER = the first message sharing that storeTime, UPPER = the last one;
+ *   * Falls in a gap ⇒ LOWER = the next message (right boundary), UPPER = the previous message (left boundary).
  */
 enum BoundaryType: string
 {
-    /** backed value 就是入网文本：大写枚举名。 */
+    /** The backed value is the wire text: upper-case enum name. */
     case LOWER = 'LOWER';
     case UPPER = 'UPPER';
 
     /**
-     * 小写显示名（"lower"/"upper"），只用于本地比对与日志，不上报文。
+     * Lower-case display name ("lower"/"upper"), only used for local comparison and logging, never on the wire.
      */
     public function lowercaseName(): string
     {
@@ -38,7 +39,7 @@ enum BoundaryType: string
     }
 
     /**
-     * 宽松解析：非 "upper"（大小写不敏感）一律落到 LOWER。
+     * Lenient parsing: anything other than "upper" (case-insensitive) falls back to LOWER.
      */
     public static function getType(?string $name): self
     {

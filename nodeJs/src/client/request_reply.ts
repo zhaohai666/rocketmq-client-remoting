@@ -1,9 +1,10 @@
 // -*- coding: utf-8 -*-
-// 请求-响应支持。
+// Request-response support.
 //
-// 请求 producer 发出的消息带一个关联 id 和 reply-to topic；应答端据此生成一条
-// 应答消息、把对应 future 兑现。本模块只维护在途 future 表和消息辅助函数，真正的
-// 网络往返由 producer 完成。
+// A request producer's message carries a correlation id and a reply-to topic;
+// the responder generates a reply message from them and settles the
+// corresponding future. This module only maintains the in-flight future table
+// and message helpers; the actual network round trip is done by the producer.
 import { Message } from '../common/message.ts';
 import { MessageConst } from '../common/messageConst.ts';
 import { MessageAccessor } from '../common/message_accessor.ts';
@@ -13,8 +14,8 @@ import { getLogger } from '../logging.ts';
 
 const logger = getLogger('client.request_reply');
 
-// 请求回调：既可以是 RequestCallback 对象（onSuccess/onException），
-// 也可以是 node 风格的 (replyMsg, err) => void 函数。
+// Request callback: either a RequestCallback object (onSuccess/onException)
+// or a node-style (replyMsg, err) => void function.
 export type RequestCallbackLike = RequestCallback |
   ((replyMsg: Message | null, err: Error | null) => void);
 
@@ -30,8 +31,9 @@ export class RequestResponseFuture {
   timeoutMillis: number;
   beginTimestamp: number;
   done: boolean;
-  // 异步回调（同步形态下为 null）、应答消息、请求是否已发出、失败原因，
-  // 以及"回调只跑一次"闩。
+  // The async callback (null in the synchronous form), the reply message,
+  // whether the request was sent, the failure cause, and the "callback runs
+  // exactly once" latch.
   requestCallback: RequestCallbackLike | null;
   responseMsg: Message | null;
   sendRequestOk: boolean;
@@ -63,7 +65,7 @@ export class RequestResponseFuture {
 
   promise(): Promise<Message> { return this._promise; }
 
-  // 存放应答消息；闩在这里由 promise 兑现来承担，由 complete() 触发。
+  // Stores the reply message; the latch here is carried by the promise settling, triggered by complete().
   putResponseMessage(responseMsg: Message | null): void {
     this.responseMsg = responseMsg;
   }
@@ -71,8 +73,10 @@ export class RequestResponseFuture {
   setSendRequestOk(sendRequestOk: boolean): void { this.sendRequestOk = sendRequestOk; }
   setCause(cause: Error | null): void { this.cause = cause; }
 
-  // 触发异步回调**恰好一次**：由 _callbackExecuted 闩保证——应答到达路径与超时扫描
-  // 路径不会都投递。请求已发出且没记录 cause 时才走 onSuccess，否则走 onException。
+  // Fires the async callback EXACTLY ONCE: guaranteed by the _callbackExecuted
+  // latch — the reply-arrival path and the timeout-scan path cannot both
+  // deliver. onSuccess runs only when the request was sent and no cause is
+  // recorded; otherwise onException runs.
   executeRequestCallback(): void {
     const cb: any = this.requestCallback;
     if (cb == null) return;
@@ -114,7 +118,7 @@ export class RequestResponseFuture {
 export class RequestFutureHolder {
   private static _instance: RequestFutureHolder | null = null;
   private table: Map<string, RequestResponseFuture> = new Map();
-  // TTL 扫描：只要至少还有一个 producer 在跑就定时清理超时请求（首次延迟 3s，间隔 1s）。
+  // TTL scan: periodically clean up timed-out requests as long as at least one producer is running (3s initial delay, 1s interval).
   private producerSet: Set<any> = new Set();
   private _sweepTimer: NodeJS.Timeout | null = null;
 
@@ -133,16 +137,18 @@ export class RequestFutureHolder {
     return this.table.get(correlationId) != null ? this.table.get(correlationId)! : null;
   }
 
-  // 取出并把 future 从表里移除（应答到达即不再需要跟踪）。
+  // Take the future out and remove it from the table (once the reply arrives, tracking is no longer needed).
   removeRequest(correlationId: string): RequestResponseFuture | null {
     const f = this.table.get(correlationId);
     if (f != null) this.table.delete(correlationId);
     return f != null ? f : null;
   }
 
-  // scanExpiredRequest：把 TTL 到期的 future 全部先摘表，再统一以超时 cause 触发回调。
-  // **先摘表再回调**——应答到达路径也会摘表，先摘能避免已经把请求标失败之后又被
-  // 迟到应答二次投递。
+  // scanExpiredRequest: remove every TTL-expired future from the table first,
+  // then fire their callbacks uniformly with a timeout cause. REMOVE FROM
+  // TABLE BEFORE CALLBACK — the reply-arrival path also removes from the
+  // table, so removing first avoids a late reply re-delivering after the
+  // request was already marked failed.
   scanExpiredRequest(): void {
     const expired: RequestResponseFuture[] = [];
     for (const [key, rep] of this.table.entries()) {
@@ -162,7 +168,7 @@ export class RequestFutureHolder {
     }
   }
 
-  // 引用计数的 TTL 扫描：首个 producer 启动后 3s 跑第一轮，之后每 1s 一轮。
+  // Reference-counted TTL scan: the first round runs 3s after the first producer starts, then every 1s.
   startScheduledTask(producer: any): void {
     this.producerSet.add(producer);
     if (this._sweepTimer == null) {
@@ -176,7 +182,7 @@ export class RequestFutureHolder {
     }
   }
 
-  // 少一个 producer 引用；只有最后一个 producer 走掉才停 TTL 扫描。
+  // Drop one producer reference; the TTL scan stops only when the last producer goes away.
   shutdown(producer: any): void {
     this.producerSet.delete(producer);
     if (this.producerSet.size <= 0 && this._sweepTimer != null) {
@@ -190,10 +196,12 @@ export class RequestFutureHolder {
 
 export const REQUEST_FUTURE_HOLDER = RequestFutureHolder.getInstance();
 
-// 依据请求消息构造应答消息：应答的 TOPIC 是 5.x 的 REPLY topic
-// （`<cluster>_REPLY_TOPIC`，cluster 取自请求的 CLUSTER 属性，由 broker 在收到请求
-// 时盖章写入）；请求方的 clientId 通过 REPLY_TO_CLIENT 属性带过去，broker 用它
-// 找到请求者所在的 channel 直接推回 326。请求缺少 CLUSTER 属性时抛错。
+// Build a reply message from the request message: the reply's TOPIC is 5.x's
+// REPLY topic (`<cluster>_REPLY_TOPIC`, where cluster comes from the request's
+// CLUSTER property, stamped in by the broker when the request arrives); the
+// requester's clientId rides along via the REPLY_TO_CLIENT property, and the
+// broker uses it to find the requester's channel and push 326 straight back.
+// Throws when the request lacks the CLUSTER property.
 export function createReplyMessage(requestMessage: Message, body: Buffer | string): Message {
   const cluster = MessageAccessor.getProperty(requestMessage, MessageConst.PROPERTY_CLUSTER);
   if (cluster == null || cluster === '') {

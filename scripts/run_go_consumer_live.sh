@@ -1,17 +1,24 @@
 #!/bin/bash
-# Go push 消费者的真机验证：**Python 生产 → Go 消费 → Python 回读 broker 位点**。
+# Live verification of the Go push consumer: **Python produces -> Go consumes
+# -> Python reads the broker-side offsets back**.
 #
-# 用法: bash scripts/run_go_consumer_live.sh [namesrv]      （默认 127.0.0.1:9876）
+# Usage: bash scripts/run_go_consumer_live.sh [namesrv]      (default 127.0.0.1:9876)
 #
-# 为什么必须两个语言一起跑：Go 侧只能证明「Go 自己把消息收下了」。ack 只写本地内存、
-# 位点没真的提交到 broker、停机没发 UNREGISTER_CLIENT —— 这些在 Go 侧看起来全绿，
-# 只有从 broker 侧（另一个语言的 admin 口径）回读才能证伪。所以判定标准是
-# 「Python 写的消息 Go 能正确读回并 ack，且 Python 能在 broker 上看到位点」。
+# Why two languages must run together: the Go side can only prove "Go itself
+# received the messages". The ack only lives in local memory, the offset was
+# never really committed to the broker, shutdown never sent UNREGISTER_CLIENT
+# -- all of these look green from the Go side and can only be falsified by
+# reading back from the broker (via another language's admin API). So the
+# criterion is "Go can correctly read back and ack the messages Python wrote,
+# and Python can see the offsets on the broker".
 #
-# 集群：默认假定已经在跑（scripts/rmq_test_broker.sh 那套）。端口探测失败会自动
-# `rmq_test_broker.sh start`，并在收工时只停自己起来的那一次；已经在跑的不碰。
+# Cluster: assumed to be already running by default (the scripts/rmq_test_broker.sh
+# setup). If the port probe fails, `rmq_test_broker.sh start` is run automatically,
+# and only the instance started here is stopped at cleanup; anything already
+# running is left untouched.
 #
-# ⚠ 集群 start + 等端口 + 跑验证 + kill 必须都在本脚本内串完：前台返回会回收后台 JVM。
+# Note: cluster start + port wait + verification + kill must all be completed
+# serially inside this script: returning to the foreground reaps background JVMs.
 set -u
 
 NS=${1:-${ROCKETMQ_NAMESRV:-127.0.0.1:9876}}
@@ -33,24 +40,26 @@ port_open() {
 STARTED_BROKER=0
 cleanup() {
     if [ "$STARTED_BROKER" = "1" ]; then
-        echo "--- 收工：停掉本脚本起的 broker ---"
+        echo "--- cleanup: stopping the broker started by this script ---"
         sh "$ROOT/scripts/rmq_test_broker.sh" stop || true
     fi
 }
 trap cleanup EXIT
 
 if ! port_open "$BROKER_PORT"; then
-    echo "=== broker 未监听 $BROKER_PORT，拉起本地测试集群 ==="
-    sh "$ROOT/scripts/rmq_test_broker.sh" start || { echo "broker 起不来"; exit 1; }
+    echo "=== broker not listening on $BROKER_PORT, starting local test cluster ==="
+    sh "$ROOT/scripts/rmq_test_broker.sh" start || { echo "failed to start broker"; exit 1; }
     STARTED_BROKER=1
-    # 端口先于「向 namesrv 注册路由」就绪，不等就会拿不到 TBW102 路由而假失败。
+    # The port is ready before the broker registers its route with the
+    # namesrv; not waiting means the TBW102 route is missing and the run
+    # false-fails.
     sleep 12
 fi
-port_open 9876 || { echo "nameserver 9876 没监听，先起 namesrv"; exit 1; }
+port_open 9876 || { echo "nameserver 9876 not listening, start namesrv first"; exit 1; }
 
 echo ""
-echo "=== [1/3] Python 建 topic + 生产 $COUNT 条主 / $ORDERLY_COUNT 条顺序 ==="
-echo "    主 topic=${TOPIC}（4 队列）  顺序 topic=${ORDERLY_TOPIC}（1 队列）"
+echo "=== [1/3] Python creates topic + produces $COUNT main / $ORDERLY_COUNT orderly ==="
+echo "    main topic=${TOPIC} (4 queues)   orderly topic=${ORDERLY_TOPIC} (1 queue)"
 cd "$ROOT/python" || exit 1
 ROCKETMQ_NAMESRV="$NS" "$PY" go_consumer_feed_check.py \
     produce "$TOPIC" "$COUNT" "$ORDERLY_TOPIC" "$ORDERLY_COUNT" 2>&1 | tail -8
@@ -67,7 +76,7 @@ GO_RC=${PIPESTATUS[0]}
 echo "--- go exit=$GO_RC ---"
 
 echo ""
-echo "=== [3/3] Python 从 broker 侧回读位点 + 注销状态 ==="
+echo "=== [3/3] Python reads back offsets + unregistration state from the broker side ==="
 cd "$ROOT/python" || exit 1
 ROCKETMQ_NAMESRV="$NS" "$PY" go_consumer_feed_check.py \
     verify "$TOPIC" "$GROUP" "$COUNT" "${GROUP}_unreg" 2>&1 | tail -10
@@ -76,8 +85,8 @@ echo "--- verify exit=$VERIFY_RC ---"
 
 echo ""
 if [ "$FEED_RC" -eq 0 ] && [ "$GO_RC" -eq 0 ] && [ "$VERIFY_RC" -eq 0 ]; then
-    echo "结果: 全部通过 (topic=$TOPIC group=$GROUP)"
+    echo "RESULT: all passed (topic=$TOPIC group=$GROUP)"
     exit 0
 fi
-echo "结果: 有失败 (feed=$FEED_RC go=$GO_RC verify=$VERIFY_RC topic=$TOPIC)"
+echo "RESULT: failures present (feed=$FEED_RC go=$GO_RC verify=$VERIFY_RC topic=$TOPIC)"
 exit 1

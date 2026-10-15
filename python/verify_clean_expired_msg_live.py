@@ -63,7 +63,7 @@ def wait_until(pred, timeout: float, interval: float = 1.0) -> bool:
 
 
 class HungListener(MessageListenerConcurrently):
-    """第一次投递就挂住不返回；放行后恢复正常返回 CONSUME_SUCCESS。"""
+    """Hang on the first delivery without returning; after release, return CONSUME_SUCCESS normally."""
 
     def __init__(self):
         self.lock = threading.Lock()
@@ -80,7 +80,7 @@ class HungListener(MessageListenerConcurrently):
                 self.arrivals.append((bytes(m.body), m.get_reconsume_times(), time.time()))
         if first:
             self.first_seen.set()
-            self.release.wait(300)   # 挂起窗口：等清扫动手 + 验证脚本放行
+            self.release.wait(300)   # hang window: wait for the sweeper to act + this script to release
         return ConsumeConcurrentlyStatus.CONSUME_SUCCESS
 
     def times(self, body: bytes):
@@ -89,12 +89,12 @@ class HungListener(MessageListenerConcurrently):
 
 
 def business_queue(c: DefaultMQPushConsumer, topic: str):
-    """分配结果里挑出业务队列（排除自动订阅的 %RETRY%<group>）。"""
+    """Pick the business queue out of the assignment (exclude the auto-subscribed %RETRY%<group>)."""
     return next((q for q in c._assigned_queues() if q.topic == topic), None)
 
 
 def retry_buffered(c: DefaultMQPushConsumer, body: bytes) -> bool:
-    """%RETRY% 队列的本地缓冲里有没有这条 body（拉取循环独立于挂住的消费线程）。"""
+    """Whether this body sits in the %RETRY% queue's local buffer (the pull loop is independent of the hung consume thread)."""
     for key, dq in list(c._pending.items()):
         if not key.startswith("%RETRY%"):
             continue
@@ -129,55 +129,55 @@ def main() -> int:
     try:
         mq = business_queue(c, topic) if wait_until(
             lambda: business_queue(c, topic) is not None, 30) else None
-        check("A0-业务队列已分配（%RETRY% 队列不算）", mq is not None, "mq=%s" % mq)
+        check("A0-business queue assigned (%RETRY% queue excluded)", mq is not None, "mq=%s" % mq)
         if mq is None:
             return 1
         key = c._mq_key(mq)
 
-        # ---------- A1 基线：第一投挂住 ----------
+        # ---------- A1 baseline: the first delivery hangs ----------
         producer.send(Message(topic, body))
-        check("A1-首投在 30s 内到达并挂住", listener.first_seen.wait(30),
+        check("A1-first delivery arrived and hung within 30s", listener.first_seen.wait(30),
               "calls=%d" % listener.calls)
         first = listener.times(body)
-        check("A1-首投 reconsumeTimes=0", first and first[0][0] == 0,
+        check("A1-first delivery reconsumeTimes=0", first and first[0][0] == 0,
               "times=%s" % first)
         first_at = first[0][1] if first else time.time()
-        check("A1-挂住期间消息登记在途（在 listener 手里）",
+        check("A1-message registered as in-flight while hung (in the listener's hands)",
               any(bytes(m.body) == body for m in c._inflight_msgs.get(key) or []),
               "inflight=%s" % [bytes(m.body) for m in c._inflight_msgs.get(key) or []])
 
-        # ---------- A2 清扫命中：listener 还挂着，登记里已经没了 ----------
+        # ---------- A2 sweep hit: the listener is still hung, the entry is already gone from the registry ----------
         t0 = time.time()
         swept = wait_until(
             lambda: not [m for m in c._inflight_msgs.get(key) or []], 210, 1.0)
         elapsed = time.time() - t0
-        check("A2-清扫在 listener 仍挂起时收走了这条消息（约 start+120s）",
+        check("A2-sweep took this message while the listener was still hung (~start+120s)",
               swept and not listener.release.is_set(),
               "elapsed=%.1fs calls=%d" % (elapsed, listener.calls))
-        check("A2-收走时间晚于一个清扫阈值（>60s，排除别的路径动手）", elapsed > 60,
+        check("A2-taken later than one sweep threshold (>60s, rules out other paths acting)", elapsed > 60,
               "elapsed=%.1fs" % elapsed)
 
-        # ---------- A3 回投真的到了 broker：%RETRY% 缓冲里出现 ----------
-        check("A3-回投消息出现在 %RETRY% 队列的本地缓冲（broker 真收到了 sendMessageBack）",
+        # ---------- A3 the send-back really reached the broker: it appears in the %RETRY% buffer ----------
+        check("A3-send-back message appears in the %RETRY% queue's local buffer (the broker really received sendMessageBack)",
               wait_until(lambda: retry_buffered(c, body), 40),
               "retry_keys=%s" % [k for k in c._pending if k.startswith("%RETRY%")])
 
-        # ---------- A4 放行：重投被重新消费 ----------
+        # ---------- A4 release: the redelivery is consumed again ----------
         listener.release.set()
-        check("A4-放行后重新消费到（reconsumeTimes=1）",
+        check("A4-reconsumed after release (reconsumeTimes=1)",
               wait_until(lambda: len(listener.times(body)) >= 2, 60),
               "times=%s" % [t for t, _ in listener.times(body)])
         times = listener.times(body)
-        check("A4-第二次投递 reconsumeTimes=1（broker 侧重投计数）",
+        check("A4-second delivery reconsumeTimes=1 (broker-side redelivery count)",
               len(times) >= 2 and times[1][0] == 1, "times=%s" % [t for t, _ in times])
-        check("A4-同一条 body 全程只到两次（清算一次回投，无重复投递）",
+        check("A4-the same body arrived exactly twice overall (one send-back, no duplicate delivery)",
               len(times) == 2, "times=%s" % [t for t, _ in times])
-        check("A4-第二次投递与首投相隔 >60s（不是 listener 自己造成的重投）",
+        check("A4-second delivery >60s after the first (not a redelivery caused by the listener itself)",
               len(times) >= 2 and times[1][1] - first_at > 60,
               "gap=%.1fs" % ((times[1][1] - first_at) if len(times) >= 2 else -1))
 
-        # ---------- A5 位点收尾 ----------
-        check("A5-挂住的 listener 返回后业务队列位点走到 1（removeMessage 含已清扫条目）",
+        # ---------- A5 offset wrap-up ----------
+        check("A5-after the hung listener returns, the business queue offset reaches 1 (removeMessage includes swept entries)",
               wait_until(lambda: committed_offset(group, topic) == 1, 30),
               "offset=%d" % committed_offset(group, topic))
     finally:

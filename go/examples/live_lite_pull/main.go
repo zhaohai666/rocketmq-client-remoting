@@ -138,9 +138,9 @@ func main() {
 		os.Exit(1)
 	}
 	if err := admin.CreateTopic(common.DefaultTopic, topicName, 1, 0); err != nil {
-		check("建 Topic", false, err.Error())
+		check("create Topic", false, err.Error())
 	} else {
-		check("建 Topic 成功（1 个读写队列）", true, "")
+		check("create Topic succeeded (1 read/write queue)", true, "")
 	}
 	var q0 common.MessageQueue
 	deadline := time.Now().Add(15 * time.Second)
@@ -151,24 +151,24 @@ func main() {
 			break
 		}
 		if time.Now().After(deadline) {
-			check("路由可见（1 个队列）", false, fmt.Sprintf("err=%v", ferr))
+			check("route visible (1 queue)", false, fmt.Sprintf("err=%v", ferr))
 			fmt.Printf("\nPASS=%d FAIL=%d TOTAL=%d\n", passCount, failCount, totalCount())
 			os.Exit(1)
 		}
 		time.Sleep(300 * time.Millisecond)
 	}
 	admin.Shutdown()
-	check("路由可见（1 个队列）", q0.QueueID == 0, fmt.Sprintf("queue=%v", q0))
+	check("route visible (1 queue)", q0.QueueID == 0, fmt.Sprintf("queue=%v", q0))
 
 	send := func(body string) {
 		m := common.NewMessage(topicName, []byte(body))
 		m.SetTags("TagA")
 		if _, err := p.Send(m); err != nil {
-			check("消息写入 "+body, false, err.Error())
+			check("message written "+body, false, err.Error())
 			return
 		}
 		bump(1)
-		check("消息写入 "+body, true, "")
+		check("message written "+body, true, "")
 	}
 
 	// ---- 1. assign mode, fresh group, FIRST_OFFSET: 5 seeds, delivered in order ----
@@ -186,33 +186,33 @@ func main() {
 		fmt.Fprintf(os.Stderr, "lite consumer start: %v\n", err)
 		os.Exit(1)
 	}
-	check("assign 模式启动且 clientId 带 @STREAM",
+	check("assign mode started and clientId carries @STREAM",
 		l1.IsStarted() && strings.Contains(l1.ClientID(), "@STREAM"),
 		"clientId="+l1.ClientID())
-	check("Assign 之后是 assign 模式", l1.IsAssignMode(), "")
+	check("assign mode after Assign", l1.IsAssignMode(), "")
 
 	first := pollBodies(l1, 5, 10*time.Second)
 	want := []string{"lite-live-0", "lite-live-1", "lite-live-2", "lite-live-3", "lite-live-4"}
-	check("assign 模式按队列顺序交付 5 条", len(first) == 5 && strings.Join(first, ",") == strings.Join(want, ","),
+	check("assign mode delivers 5 messages in queue order", len(first) == 5 && strings.Join(first, ",") == strings.Join(want, ","),
 		fmt.Sprintf("got=%v", first))
-	check("拉取游标推进到 5（nextBeginOffset）", l1.PullCursorOf(q0) == 5,
+	check("pull cursor advanced to 5 (nextBeginOffset)", l1.PullCursorOf(q0) == 5,
 		fmt.Sprintf("pull=%d", l1.PullCursorOf(q0)))
-	check("消费游标推进到 5（只有 Poll 交付会推进）", l1.ConsumeCursorOf(q0) == 5,
+	check("consume cursor advanced to 5 (only Poll delivery advances it)", l1.ConsumeCursorOf(q0) == 5,
 		fmt.Sprintf("consume=%d", l1.ConsumeCursorOf(q0)))
 
 	// ---- 2. the commit round trip: the broker really stored the consume cursor ----
 	if err := l1.Commit(); err != nil {
-		check("Commit 提交消费游标", false, err.Error())
+		check("Commit submits the consume cursor", false, err.Error())
 	} else {
-		check("Commit 提交消费游标", true, "")
+		check("Commit submits the consume cursor", true, "")
 	}
 	if got, err := l1.Committed(q0); err != nil || got != 5 {
-		check("本地读回已提交位点", false, fmt.Sprintf("got=%d err=%v", got, err))
+		check("committed offset read back locally", false, fmt.Sprintf("got=%d err=%v", got, err))
 	} else {
-		check("本地读回已提交位点", true, "offset=5")
+		check("committed offset read back locally", true, "offset=5")
 	}
 	l1.Shutdown()
-	check("assign 消费者关闭", !l1.IsStarted(), "")
+	check("assign consumer shut down", !l1.IsStarted(), "")
 
 	// ---- 3. restart continuity: a NEW consumer in the SAME group resumes at 5 -----
 	l2 := client.MustNewDefaultLitePullConsumer(assignGroup)
@@ -227,14 +227,14 @@ func main() {
 	}
 	defer l2.Shutdown()
 	if got, err := l2.Committed(q0); err != nil || got != 5 {
-		check("新实例从 broker 读回位点 5", false, fmt.Sprintf("got=%d err=%v", got, err))
+		check("new instance reads offset 5 back from the broker", false, fmt.Sprintf("got=%d err=%v", got, err))
 	} else {
-		check("新实例从 broker 读回位点 5", true, "offset=5")
+		check("new instance reads offset 5 back from the broker", true, "offset=5")
 	}
 	if got := l2.PullCursorOf(q0); got != 5 {
-		check("新实例的拉取游标从已提交位点继续", false, fmt.Sprintf("pull=%d want=5", got))
+		check("new instance's pull cursor continues from the committed offset", false, fmt.Sprintf("pull=%d want=5", got))
 	} else {
-		check("新实例的拉取游标从已提交位点继续", true, "pull=5")
+		check("new instance's pull cursor continues from the committed offset", true, "pull=5")
 	}
 
 	// ---- 4. no replay, no loss: 2 new messages deliver exactly, then Seek replays --
@@ -242,19 +242,19 @@ func main() {
 	send("lite-live-5")
 	send("lite-live-6")
 	fresh := pollBodies(l2, 2, 10*time.Second)
-	check("重启后不重放旧消息，只交付新增 2 条",
+	check("no replay of old messages after restart, only the 2 new ones delivered",
 		len(fresh) == 2 && fresh[0] == "lite-live-5" && fresh[1] == "lite-live-6",
 		fmt.Sprintf("got=%v", fresh))
 
 	l2.Seek(q0, 3)
 	replayed := pollBodies(l2, 4, 10*time.Second)
-	check("Seek(3) 之后从位点 3 重放 4 条",
+	check("Seek(3) replays 4 messages from offset 3",
 		len(replayed) == 4 && replayed[0] == "lite-live-3" && replayed[3] == "lite-live-6",
 		fmt.Sprintf("got=%v", replayed))
 	if err := l2.Commit(); err != nil {
-		check("Seek 重放后的最终 Commit", false, err.Error())
+		check("final Commit after Seek replay", false, err.Error())
 	} else {
-		check("Seek 重放后的最终 Commit", true, "offset=7")
+		check("final Commit after Seek replay", true, "offset=7")
 	}
 
 	// ---- 5. subscribe mode: rebalance assigns, FIRST_OFFSET reads from 0 ----------
@@ -285,16 +285,16 @@ func main() {
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	check("subscribe 模式重平衡分到 1 个队列", rebalanced,
+	check("subscribe mode rebalance assigned 1 queue", rebalanced,
 		fmt.Sprintf("assignment=%d", len(l3.Assignment())))
 
 	all := pollBodies(l3, 7, 15*time.Second)
-	check("subscribe 模式从头消费全部 7 条", len(all) == 7, fmt.Sprintf("got=%d", len(all)))
+	check("subscribe mode consumes all 7 messages from the head", len(all) == 7, fmt.Sprintf("got=%d", len(all)))
 	if calls, mqAll, got := listener.snapshot(); calls == 0 || mqAll != 1 || got != 1 {
-		check("MessageQueueListener 收到重平衡通知", false,
+		check("MessageQueueListener received the rebalance notification", false,
 			fmt.Sprintf("calls=%d mqAll=%d divided=%d", calls, mqAll, got))
 	} else {
-		check("MessageQueueListener 收到重平衡通知", true, "")
+		check("MessageQueueListener received the rebalance notification", true, "")
 	}
 
 	// ---- 6. auto-commit: the interval commit reaches the broker without a manual
@@ -315,14 +315,14 @@ func main() {
 		os.Exit(1)
 	}
 	if got, err := l4.Committed(q0); err != nil || got != 7 {
-		check("自动提交的位点被 broker 记录", false, fmt.Sprintf("got=%d err=%v", got, err))
+		check("auto-committed offset recorded by the broker", false, fmt.Sprintf("got=%d err=%v", got, err))
 	} else {
-		check("自动提交的位点被 broker 记录", true, "offset=7")
+		check("auto-committed offset recorded by the broker", true, "offset=7")
 	}
 	l4.Shutdown()
 
 	l3.Shutdown()
-	check("subscribe 消费者关闭（关机位点是幂等的）", !l3.IsStarted(), "")
+	check("subscribe consumer shut down (the shutdown offset is idempotent)", !l3.IsStarted(), "")
 
 	fmt.Printf("\nPASS=%d FAIL=%d TOTAL=%d\n", passCount, failCount, totalCount())
 	if failCount > 0 {

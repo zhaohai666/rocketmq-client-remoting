@@ -49,12 +49,12 @@ def creds(sk: str = SK) -> AclClientRPCHook:
 
 
 def response_code_of(exc: BaseException) -> Optional[int]:
-    """沿 cause 链找 broker 响应码。
+    """Find the broker response code by walking the cause chain.
 
-    broker 侧**所有**鉴权失败都收敛成 AbortProcessException(NO_PERMISSION=16)，
-    所以 16 就是「被拒绝」。
-    不能只看最外层：admin 的 create_topic_in_route 会把底层 MQBrokerException
-    包进 MQClientException(cause=...)，最外层根本没有 response_code。
+    On the broker side all auth failures converge into AbortProcessException(NO_PERMISSION=16),
+    so 16 means "rejected".
+    You cannot only look at the outermost layer: admin's create_topic_in_route wraps the underlying MQBrokerException
+    inside MQClientException(cause=...), and the outermost layer has no response_code at all.
     """
     seen = set()
     cur: Optional[BaseException] = exc
@@ -69,7 +69,7 @@ def response_code_of(exc: BaseException) -> Optional[int]:
 
 
 def deepest_message(exc: BaseException) -> str:
-    """取异常链里最内层的可读消息（通常就是 broker 的 remark）。"""
+    """Take the innermost readable message in the exception chain (usually the broker's remark)."""
     msg = str(exc)
     seen = set()
     cur: Optional[BaseException] = exc
@@ -84,16 +84,16 @@ def deepest_message(exc: BaseException) -> str:
 
 
 def is_no_permission(code: Optional[int]) -> bool:
-    """broker 鉴权失败的响应码（NO_PERMISSION=16）。"""
+    """The response code for a broker auth failure (NO_PERMISSION=16)."""
     return code == ResponseCode.NO_PERMISSION
 
 
 def try_call(fn):
-    """执行 fn，返回 (ok, detail)；失败时 detail 里一定带上找到的响应码。"""
+    """Run fn and return (ok, detail); on failure the detail always includes the response code found."""
     try:
         fn()
         return True, ""
-    except BaseException as e:  # noqa: BLE001 - 真机验证需要看到所有失败形态
+    except BaseException as e:  # noqa: BLE001 - a live verification needs to see every failure shape
         code = response_code_of(e)
         detail = "%s %s: %s" % (
             type(e).__name__,
@@ -104,25 +104,25 @@ def try_call(fn):
 
 
 def scenario_admin_create() -> None:
-    print("\nS1/S2 admin 建 topic：带凭据 vs 不带凭据")
-    # S1 正向
+    print("\nS1/S2 admin creates a topic: with credentials vs without")
+    # S1 positive
     admin = DefaultMQAdminExt(rpc_hook=creds())
     admin.set_namesrv_addr(NAMESRV)
     admin.start()
     try:
         ok, detail = try_call(lambda: admin.create_topic("TBW102", TOPIC, 4))
-        check("S1 带凭据 admin 建 topic 成功", ok, detail)
+        check("S1 admin with credentials created the topic successfully", ok, detail)
     finally:
         admin.shutdown()
 
-    # S2 反向：不带凭据
-    print("\nS2 不带凭据的 admin 建 topic 必须被拒")
-    admin2 = DefaultMQAdminExt()  # 不传 rpc_hook
+    # S2 negative: without credentials
+    print("\nS2 an admin without credentials creating a topic must be rejected")
+    admin2 = DefaultMQAdminExt()  # no rpc_hook passed
     admin2.set_namesrv_addr(NAMESRV)
     admin2.start()
     try:
         ok, detail = try_call(lambda: admin2.create_topic("TBW102", TOPIC + "_DENIED", 4))
-        check("S2 无凭据 admin 被 broker 拒绝", (not ok) and is_no_permission_detail(detail), detail)
+        check("S2 an admin without credentials is rejected by the broker", (not ok) and is_no_permission_detail(detail), detail)
     finally:
         admin2.shutdown()
 
@@ -132,8 +132,8 @@ def is_no_permission_detail(detail: str) -> bool:
 
 
 def scenario_bad_producer() -> None:
-    """S3 反向：secretKey 错误的生产者必须被 broker 拒绝。"""
-    print("\nS3 错误 secretKey 的生产者必须被拒")
+    """S3 negative: a producer with a wrong secretKey must be rejected by the broker."""
+    print("\nS3 a producer with a wrong secretKey must be rejected")
     bad = DefaultMQProducer("PG_AclLiveBad_%d" % STAMP, rpc_hook=creds("WRONG_SECRET_KEY"))
     bad.set_namesrv_addr(NAMESRV)
     bad.start()
@@ -141,14 +141,14 @@ def scenario_bad_producer() -> None:
         msg = Message(TOPIC, b"should-not-send")
         msg.set_keys("acl-wrong")
         ok, detail = try_call(lambda: bad.send(msg))
-        check("S3 错误 secretKey 被 broker 拒绝", (not ok) and is_no_permission_detail(detail), detail)
+        check("S3 the wrong secretKey is rejected by the broker", (not ok) and is_no_permission_detail(detail), detail)
     finally:
         bad.shutdown()
 
 
 def scenario_consumer_then_producer() -> None:
     pass
-    print("\nS4/S5 带正确凭据的生产者/消费者（先起消费者再发送）")
+    print("\nS4/S5 producer/consumer with correct credentials (start the consumer before sending)")
     consumer = DefaultMQPushConsumer(GROUP, rpc_hook=creds())
     consumer.set_namesrv_addr(NAMESRV)
     consumer.subscribe(TOPIC, "*")
@@ -165,7 +165,7 @@ def scenario_consumer_then_producer() -> None:
     consumer.set_message_listener(SimpleMessageListener(on_msg))
     consumer.start()
     try:
-        # 等 rebalance 把队列分下来：初始位点必须在"topic 还空着"的时候解析
+        # Wait for rebalance to hand out the queues: the initial offset must be resolved while the topic is still empty
         time.sleep(5)
 
         sent = 0
@@ -179,45 +179,45 @@ def scenario_consumer_then_producer() -> None:
                 msg.set_keys("acl-ok")
                 try:
                     result = prod.send(msg)
-                    # SendStatus 是 Enum：str(SendStatus.SEND_OK) == "SendStatus.SEND_OK"，
-                    # 必须按枚举比较，不能拿字符串比（曾因此把成功的发送误判成 sent=0）。
+                    # SendStatus is an Enum: str(SendStatus.SEND_OK) == "SendStatus.SEND_OK",
+                    # so it must be compared as an enum, not as a string (comparing as a string once misjudged a successful send as sent=0).
                     evidence.append("%s/%s" % (result.send_status, result.msg_id))
                     if result.send_status == SendStatus.SEND_OK:
                         sent += 1
                     else:
-                        check("S4 第 %d 条发送状态" % i, False, str(result.send_status))
+                        check("S4 send status of message %d" % i, False, str(result.send_status))
                 except BaseException as e:  # noqa: BLE001
                     evidence.append("EXC:%s" % e)
-                    check("S4 第 %d 条发送" % i, False, "%s: %s" % (type(e).__name__, e))
+                    check("S4 send of message %d" % i, False, "%s: %s" % (type(e).__name__, e))
         finally:
             prod.shutdown()
-        # msgId 由 broker 生成：非空即证明 broker 真的接受了这条签名请求
-        check("S4 带凭据生产者发送 3 条", sent == 3, "sent=%d %s" % (sent, evidence))
+        # msgId is generated by the broker: non-empty proves the broker really accepted this signed request
+        check("S4 the credentialed producer sent 3 messages", sent == 3, "sent=%d %s" % (sent, evidence))
 
-        # S5：心跳 / 长轮询拉取 / 位点提交全程带签名，收满才算消费链路鉴权通过
+        # S5: heartbeat / long-polling pull / offset commit are all signed throughout; only receiving everything counts as the consume path passing auth
         deadline = time.time() + 30
         while time.time() < deadline and len(got) < sent:
             time.sleep(0.3)
-        check("S5 带凭据消费者收满 %d 条" % sent, len(got) == sent,
+        check("S5 the credentialed consumer received all %d messages" % sent, len(got) == sent,
               "got=%d bodies=%s" % (len(got), sorted(got)))
     finally:
         consumer.shutdown()
 
 
 def scenario_negative_rpc() -> None:
-    """直连 broker 发一个原始 RPC，自己看 response.code。
+    """Fire a raw RPC straight at the broker and read response.code yourself.
 
-    不能用 client.get_consumer_id_list_by_group：它内部把异常吞掉、失败返回 None，
-    于是「被拒绝」和「成功」在调用方看来一模一样（曾因此误判成 PASS）。
+    Do not use client.get_consumer_id_list_by_group: it swallows exceptions internally and returns None on failure,
+    so "rejected" and "success" look identical to the caller (this once caused a false PASS).
     """
-    print("\nS6 不带凭据的直接 broker RPC 必须被拒")
+    print("\nS6 a direct broker RPC without credentials must be rejected")
     client = MQClientInstance("AclProbe_%d" % STAMP, [NAMESRV])
     client.start()
     try:
         try:
             addr = client._broker_addr_for_topic(TOPIC)
         except BaseException as e:  # noqa: BLE001
-            check("S6 拿到 broker 地址", False, "%s: %s" % (type(e).__name__, e))
+            check("S6 got the broker address", False, "%s: %s" % (type(e).__name__, e))
             return
         request = RemotingCommand.create_request_command(
             RequestCode.GET_CONSUMER_LIST_BY_GROUP, None)
@@ -229,7 +229,7 @@ def scenario_negative_rpc() -> None:
                 raise MQBrokerException(response.code, response.remark or "")
 
         ok, detail = try_call(call)
-        check("S6 无凭据 broker RPC 被拒绝",
+        check("S6 the uncredentialed broker RPC is rejected",
               (not ok) and is_no_permission_detail(detail),
               "addr=%s %s" % (addr, detail))
     finally:
@@ -237,12 +237,12 @@ def scenario_negative_rpc() -> None:
 
 
 def scenario_namesrv_without_creds() -> None:
-    print("\nS7 不带凭据走 NameServer 路由查询仍应成功（钩子不影响 namesrv 路径）")
+    print("\nS7 a NameServer route query without credentials should still succeed (the hook does not affect the namesrv path)")
     client = MQClientInstance("AclNs_%d" % STAMP, [NAMESRV])
     client.start()
     try:
         ok, detail = try_call(lambda: client.update_topic_route_info_from_name_server(TOPIC))
-        check("S7 无凭据 namesrv 路由查询成功", ok, detail)
+        check("S7 the uncredentialed namesrv route query succeeds", ok, detail)
     finally:
         client.shutdown()
 
@@ -261,9 +261,9 @@ def main() -> int:
     print("\n===== ACL live summary =====")
     print("  PASS=%d FAIL=%d" % (PASS, FAIL))
     if FAIL == 0:
-        print("  result: ACL 鉴权（签名 / 拒绝 / namesrv 兼容）真机通过")
+        print("  result: ACL auth (signing / rejection / namesrv compatibility) passed live")
         return 0
-    print("  result: %d 项失败" % FAIL)
+    print("  result: %d item(s) failed" % FAIL)
     return 1
 
 

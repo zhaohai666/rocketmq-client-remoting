@@ -5,7 +5,7 @@ const logger = getLogger('mqclient.manager');
 
 type MQClientFactory = () => MQClient;
 
-// 缓存条目：实例 + 在用门面数（引用计数）。
+// Cache entry: instance + in-use facade count (reference count).
 class FactoryEntry {
   instance: MQClient;
   refcount: number;
@@ -41,8 +41,9 @@ export class MQClientManager {
       return { instance: entry.instance, created: false };
     }
     const instance = factory();
-    // 同步事件循环保底不会有人插队，但仍按「只有赢家生效」重查一遍表，
-    // 防御未来可能的 await 化改造。
+    // A synchronous event loop guarantees nobody can slip in, but re-check the
+    // table with a "only the winner takes effect" rule anyway, to guard
+    // against a possible future await-ification refactor.
     const existing = this._factoryTable.get(clientId);
     if (existing != null) {
       return { instance: existing.instance, created: false };
@@ -52,10 +53,11 @@ export class MQClientManager {
     return { instance, created: true };
   }
 
-  // ---------------- 引用计数 ----------------
-  // 门面 start() 时调用：在用计数 +1。
-  // 未经 getOrCreateMQClientInstance 的实例（测试替身 / 旧调用方直接构造）也照常
-  // 登记，保证 unregister 的计数平衡。
+  // ---------------- reference counting ----------------
+  // Called on facade start(): in-use count +1.
+  // Instances that never went through getOrCreateMQClientInstance (test
+  // doubles / legacy callers constructing directly) are registered the same
+  // way, keeping unregister's count balanced.
   registerClient(clientId: string, instance: MQClient): void {
     const entry = this._factoryTable.get(clientId);
     if (entry == null || entry.instance !== instance) {
@@ -67,17 +69,22 @@ export class MQClientManager {
     entry.refcount += 1;
   }
 
-  // 门面 shutdown() 时调用：计数 -1；**归零才真正关闭**。
-  // 归零时先摘表再 shutdown()——摘表后其他门面的 getOrCreate 只会建新实例。
-  // 实例不在表中（测试替身 / 已被顶替或摘除的旧实例）时保持门面旧的 shutdown
-  // 语义：直接关它（若它有关闭方法），调用方无需分辨。
-  // 返回 true 表示本次调用真的关闭了实例。
+  // Called on facade shutdown(): count -1; the real close happens ONLY when it
+  // hits ZERO.
+  // On zero, remove from the table first, then shutdown() — after removal,
+  // other facades' getOrCreate can only create a new instance.
+  // When the instance is not in the table (test double / an old instance
+  // already displaced or removed), keep the facade's old shutdown semantics:
+  // close it directly (if it has a close method); the caller needs no
+  // distinction.
+  // Returns true when this call actually shut the instance down.
   unregisterClient(clientId: string, instance: MQClient | null): boolean {
     if (instance == null) return false;
     const entry = this._factoryTable.get(clientId);
     if (entry == null || entry.instance !== instance) {
-      // 不是本 manager 缓存里的那份实例：不动缓存里可能存在的其他条目，
-      // 只按旧语义直接关调用方手里的实例。
+      // Not the instance in this manager's cache: leave any other entry in the
+      // cache alone, and just close the instance the caller holds, per the old
+      // semantics.
       this._shutdownQuietly(instance);
       return true;
     }
@@ -109,25 +116,26 @@ export class MQClientManager {
     this._factoryTable.delete(clientId);
   }
 
-  // ---------------- 观测 / 测试 ----------------
+  // ---------------- observability / tests ----------------
   getClientFactory(clientId: string): MQClient | null {
     const entry = this._factoryTable.get(clientId);
     return entry != null ? entry.instance : null;
   }
 
-  // 该 clientId 当前的在用计数（观测 / 单测用）。
+  // The current in-use count for this clientId (observability / unit tests).
   refcountOf(clientId: string): number {
     const entry = this._factoryTable.get(clientId);
     return entry != null ? entry.refcount : 0;
   }
 
-  // 当前存活的实例数。
+  // The number of currently live instances.
   instanceCount(): number {
     return this._factoryTable.size;
   }
 
-  // 清空缓存（测试隔离用）。只摘表、不 shutdown——与旧行为一致，
-  // 泄漏的实例交由进程退出回收，不引入新的关闭副作用。
+  // Clear the cache (for test isolation). Only removes table entries, no
+  // shutdown — matching the old behavior; leaked instances are reclaimed at
+  // process exit without introducing new close side effects.
   reset(): void {
     this._factoryTable.clear();
   }

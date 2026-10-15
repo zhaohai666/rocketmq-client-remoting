@@ -1,25 +1,37 @@
-// 220 是 broker 推给**消费端**的重置指令；管理端那笔 INVOKE_BROKER_TO_RESET_OFFSET(222) 的
-// 响应只是一张「每个队列重置到哪」的表，真正让消费端改位点的是 broker 随后 oneway 推的
-// 220（Broker2Client.resetOffset:181-238）。broker 只在 useServerSideResetOffset=false 时才
-// 走这条推送路径（默认 true 在 AdminBrokerProcessor:2255-2263 直接服务端改位点、一台消费端
-// 都不通知），所以本验证先把该开关热改成 false（回读确认），跑完还原。
+// 220 is the reset instruction the broker pushes to the **consumer side**; the response of
+// the admin-side INVOKE_BROKER_TO_RESET_OFFSET(222) call is only a table of "which offset
+// each queue was reset to", and what really makes the consumer change its offset is the
+// oneway 220 the broker pushes afterwards (Broker2Client.resetOffset:181-238). The broker
+// only takes this push path when useServerSideResetOffset=false (with the default true,
+// AdminBrokerProcessor:2255-2263 changes the offset server side and notifies not a single
+// consumer), so this verification hot-changes that switch to false first (confirming the
+// read-back) and restores it when done.
 //
-// 离线单测（tests/RocketMQ.Client.Tests/ResetOffsetTests.cs）锁死了请求体两种形状与「撤队列 +
-// 代号 +1 + 新位点经撤销尾巴落盘」的本地状态；下面这些事只有真集群能证明：
+// The offline unit tests (tests/RocketMQ.Client.Tests/ResetOffsetTests.cs) pin down both
+// shapes of the request body and the local state of "withdraw the queue + generation + 1 +
+// the new offset flushed via the withdrawal tail"; the following things only a real cluster
+// can prove:
 //
-//   S1 「回退重置立刻生效 + 在途批次作废」——位点从 10 往回重置到 3，三段判据：
-//      a) broker 上的已提交位点在 ~2s 内变成 3：窗口内**只有**重置路径那次 persist 会写它
-//         （周期落盘已拉长到 60s），只写内存表的实现在这里原地不动（broker 停在 10）；
-//      b) listener 里卡着的旧批次（重置前取回的 offset 10）放行后，它的 ack 必须整批作废
-//         —— 采样点：放行旧批次、新队列的**第一批**已进 listener 且还没 ack 时，本地已消费
-//         位点必须还是"没有记录 / ≤3"；没有代号闸门的实现这时会跳到 11；
-//      c) 队列被真正重建：3..14 每一批都**重投一次**（旧缓冲里没 ack 的 11..14 也随之作废，
-//         只能作为重投的一部分出现），放行一轮断言一轮。
+//   S1 "a backward reset takes effect at once + in-flight batches are invalidated" -- the
+//      offset is reset from 10 back to 3, in three legs of criteria:
+//      a) the broker-side committed offset becomes 3 within ~2s: **only** the persist that
+//         the reset path brings itself writes it inside the window (the periodic flush has
+//         been stretched to 60s), while an implementation that only writes the in-memory
+//         table stays put (the broker remains at 10);
+//      b) the old batch stuck in the listener (offset 10, fetched before the reset) has its
+//         ack invalidated as a whole once released -- the sampling point: after releasing
+//         the old batch and while the **first batch** of the new queue is in the listener
+//         and not yet acked, the local consumed offset must still be "no record / <=3"; an
+//         implementation without the generation gate jumps to 11 here;
+//      c) the queue really is rebuilt: every batch of 3..14 is **redelivered exactly
+//         once** (the un-acked 11..14 in the old buffer are invalidated too and can only
+//         appear as part of the redelivery); one round is asserted per release.
 //
-//   S2 「前跳 + 恢复」——timestamp=-1 重置到 maxOffset：位点直接跳到 10，中间 4..9 一条都不投；
-//      随后新消息照常消费、位点继续前进。
+//   S2 "forward jump + recovery" -- timestamp=-1 resets to maxOffset: the offset jumps
+// straight to 10 and none of 4..9 in between is delivered; afterwards new messages are
+// consumed as usual and the offset keeps advancing.
 //
-// 用法：rmq reset-offset [namesrv]（需本地 5.5.1 集群，autoCreateTopicEnable=true）
+// Usage: rmq reset-offset [namesrv] (needs a local 5.5.1 cluster, autoCreateTopicEnable=true)
 using System.Globalization;
 using System.Text;
 
@@ -31,10 +43,12 @@ namespace RocketMQ.Examples;
 
 public static class LiveResetOffset
 {
-    /// <summary>单队列 topic 上的消息条数：S1 要 10 条（回退到 3 后重投 3..14），S2 要 10 条。</summary>
+    /// <summary>The message count on the single-queue topic: S1 needs 10 (3..14 redelivered
+   /// after the reset back to 3), S2 needs 10.</summary>
     private const int Msgs = 10;
 
-    /// <summary>S1 的回退目标：第 3 条与第 4 条之间按时间戳重置 ⇒ 命中 offset 3。</summary>
+    /// <summary>S1's backward target: reset by timestamp between the 3rd and the 4th message
+   /// => it hits offset 3.</summary>
     private const long BackTarget = 3;
 
     private const string SwitchKey = "useServerSideResetOffset";
@@ -78,15 +92,18 @@ public static class LiveResetOffset
         return pred();
     }
 
-    /// <summary>用于"很快就要发生"的断言：采样比 <see cref="WaitUntil"/> 密。</summary>
+  /// <summary>For criteria on "something is about to happen": it samples more densely than
+   /// <see cref="WaitUntil"/>.</summary>
     private static bool WaitBefore(Func<bool> pred, int windowMs) => WaitUntil(pred, windowMs, 50);
 
-    /// <summary>队列 key（与消费者内部 OffsetKey 一致）：topic + brokerName + queueId。</summary>
+   /// <summary>The queue key (identical to the consumer's internal OffsetKey): topic +
+    /// brokerName + queueId.</summary>
     private static string Key(MessageQueue mq) =>
         mq.Topic + mq.BrokerName + mq.QueueId.ToString(CultureInfo.InvariantCulture);
 
-    /// <summary>回读 broker 上的 (已提交位点, maxOffset)；Committed = -1 表示查无记录
-    /// （QUERY_NOT_FOUND），0 是合法位点，两者不能混同。</summary>
+ /// <summary>Reads back the broker-side (committed offset, maxOffset); Committed = -1 means
+ /// no record was found (QUERY_NOT_FOUND), 0 is a legal offset and the two must not be
+    /// conflated.</summary>
     private static (long Committed, long Max) Probe(DefaultMQAdminExt admin, string group,
         MessageQueue mq)
     {
@@ -113,12 +130,15 @@ public static class LiveResetOffset
         return (off, max);
     }
 
-    /// <summary>逐批设闸：每一批都停在闸门上，由测试逐批放行 —— 批与批之间的本地状态因此可以被
-    /// 采样。
+   /// <summary>Gates batch by batch: every batch stops at the gate and the test releases them
+  /// one at a time -- so the local state between batches can be sampled.</summary>
     ///
-    /// S1 的关键采样点（旧批次已放行、新队列第一批还没 ack）只有在"逐批可控"时才存在；一次性
-    /// 放行的 listener 会把 11（旧批次 ack）与随后的重投混在一个瞬间里。
-    /// 上限只防死锁：正常路径由 <see cref="Release"/> 逐批放行。</summary>
+    /// S1's key sampling point (the old batch released, the new queue's first batch not yet
+    /// acked) only exists when the batches are "controllable one at a time"; a listener that
+    /// releases everything at once mixes 11 (the old batch's ack) with the following
+    /// redelivery in a single instant.
+   /// The cap only guards against deadlock: the normal path is released batch by batch via
+   /// <see cref="Release"/>.</summary>
     private sealed class SteppingListener : IMessageListenerConcurrently
     {
         private readonly object _lk = new();
@@ -138,7 +158,7 @@ public static class LiveResetOffset
             }
 
             _release.Wait(TimeSpan.FromSeconds(90));
-            _release.Reset(); // 一批一放：等本轮放行后立刻复位闸门
+       _release.Reset(); // released one batch at a time: reset the gate as soon as this round is released
             return ConsumeConcurrentlyStatus.ConsumeSuccess;
         }
 
@@ -243,7 +263,7 @@ public static class LiveResetOffset
             List<string> addrs = cluster.GetBrokerAddrs();
             if (addrs.Count == 0)
             {
-                Check("集群探活", false, "nameServer 上无 broker 注册");
+         Check("the cluster liveness probe", false, "the nameServer has no broker registered");
                 admin.Shutdown();
                 return Report();
             }
@@ -252,12 +272,12 @@ public static class LiveResetOffset
         }
         catch (Exception e)
         {
-            Check("集群探活", false, "fetchBrokerClusterInfo: " + e.Message);
+    Check("the cluster liveness probe", false, "fetchBrokerClusterInfo: " + e.Message);
             admin.Shutdown();
             return Report();
         }
 
-        Check("集群探活", true, "broker=" + brokerAddr);
+        Check("the cluster liveness probe", true, "broker=" + brokerAddr);
 
         var setup = new MQClientInstance("rosetup-" + stamp, new List<string> { _namesrv });
         setup.Start();
@@ -269,12 +289,14 @@ public static class LiveResetOffset
 
         try
         {
-            // 开关热改：useServerSideResetOffset=false（220 推送路径的前提）
-            Check("开关热改：useServerSideResetOffset=false（220 推送路径的前提）",
+      // Hot-changing the switch: useServerSideResetOffset=false (the precondition of the
+    // 220 push path)
+         Check("hot-changing the switch: useServerSideResetOffset=false (the precondition of the 220 push path)",
                 SetServerSideReset(admin, brokerAddr, "false"),
-                "回读 " + SwitchKey + "=" + ReadFlag(admin, brokerAddr, SwitchKey));
+      "read-back " + SwitchKey + "=" + ReadFlag(admin, brokerAddr, SwitchKey));
 
-            // 显式 1 队列建 topic：S1 的重投序列（3..14）与 S2 的前跳都要可数的队列数
+       // Explicitly creating the topic with 1 queue: S1's redelivery sequence (3..14) and
+    // S2's forward jump both need a countable queue count
             setup.CreateTopicInRoute(backTopic, 1, 1);
             setup.CreateTopicInRoute(skipTopic, 1, 1);
             producer.Start();
@@ -285,7 +307,7 @@ public static class LiveResetOffset
         }
         catch (Exception e)
         {
-            Check("联调过程中出现未预期异常", false, e.ToString());
+    Check("an unexpected exception occurred during the integration", false, e.ToString());
         }
         finally
         {
@@ -295,7 +317,7 @@ public static class LiveResetOffset
             }
             catch (Exception)
             {
-                // 收尾失败不掩盖主断言
+           // a cleanup failure does not mask the main assertion
             }
 
             foreach (string t in new[] { backTopic, skipTopic })
@@ -324,13 +346,13 @@ public static class LiveResetOffset
 
             try
             {
-                Check("还原 useServerSideResetOffset=true",
+       Check("restoring useServerSideResetOffset=true",
                     SetServerSideReset(admin, brokerAddr, "true"),
-                    "回读 " + SwitchKey + "=" + ReadFlag(admin, brokerAddr, SwitchKey));
+ "read-back " + SwitchKey + "=" + ReadFlag(admin, brokerAddr, SwitchKey));
             }
             catch (Exception e)
             {
-                Check("还原 useServerSideResetOffset=true", false, e.Message);
+           Check("restoring useServerSideResetOffset=true", false, e.Message);
             }
 
             try
@@ -339,7 +361,7 @@ public static class LiveResetOffset
             }
             catch (Exception)
             {
-                // 收尾失败不掩盖主断言
+     // a cleanup failure does not mask the main assertion
             }
 
             try
@@ -348,7 +370,7 @@ public static class LiveResetOffset
             }
             catch (Exception)
             {
-                // 收尾失败不掩盖主断言
+   // a cleanup failure does not mask the main assertion
             }
         }
 
@@ -358,9 +380,10 @@ public static class LiveResetOffset
     private static void ScenarioBackwardReset(DefaultMQProducer producer, DefaultMQAdminExt admin,
         string brokerAddr, string topic, string group, string stamp)
     {
-        Console.WriteLine("=== S1 回退重置（10 → 3）：立刻落盘 + 在途批次整批作废 ===");
+        Console.WriteLine("=== S1 the backward reset (10 -> 3): flushed at once + the in-flight batch invalidated as a whole ===");
 
-        // 前置：先用普通 listener 把 broker 上的位点做成 10（reset 要求该组在 broker 上有记录）
+   // Precondition: first use an ordinary listener to make the broker-side offset 10 (the
+  // reset requires the group to have a record on the broker)
         var seed = new RecordingListener();
         var c0 = new DefaultMQPushConsumer(group)
         {
@@ -387,22 +410,24 @@ public static class LiveResetOffset
                 if (i == 2)
                 {
                     mid = NowMs();
-                    // 让第 3 条（offset 3）与前面三条拉开存储时间，后面按时间戳重置才能稳定命中 3
+      // Push message 3 (offset 3) apart in storage time from the first three, so that the
+      // later timestamp-based reset reliably hits 3
                     Thread.Sleep(2000);
                 }
             }
 
             bool seeded = WaitUntil(() => seed.Offsets().Count == Msgs, 30000, 200);
-            Check("S1-前置：消费者消费掉 " + N(Msgs) + " 条", seeded,
+   Check("S1-precondition: the consumer consumed " + N(Msgs) + " messages", seeded,
                 "arrivals=" + Join(seed.Offsets()));
 
             bool primed = WaitUntil(() => AllBack(admin, group, mq, Msgs), 20000, 500);
-            Check("S1-前置：broker 位点周期落盘到 " + N(Msgs) + "（reset 要求组在 broker 上有记录）",
+     Check("S1-precondition: the broker-side offset was flushed periodically to " + N(Msgs) + " (the reset requires the group to have a record on the broker)",
                 primed, "committed=" + N(Probe(admin, group, mq).Committed));
             c0.Shutdown();
             Thread.Sleep(1000);
 
-            // 主力消费者：逐批闸住 + 周期落盘 60s ⇒ 窗口内唯一能改 broker 位点的路径是重置自带的那次
+        // The main consumer: gated batch by batch + a 60s periodic flush => the only path
+        // that can change the broker-side offset inside the window is the reset's own persist
             var listener = new SteppingListener();
             var c = new DefaultMQPushConsumer(group)
             {
@@ -434,47 +459,49 @@ public static class LiveResetOffset
                     return listener.BatchCount() >= 1 && pending == 4;
                 }, 30000, 50);
                 List<long> arr = listener.Offsets();
-                Check("S1-窗口就绪：1 条在途（offset 10 卡在 listener）+ 4 条留在缓冲",
+            Check("S1-window ready: 1 in flight (offset 10 stuck in the listener) + 4 left in the buffer",
                     arranged && arr.Count > 0 && arr[0] == Msgs,
                     "arrivals=" + Join(arr) + " pending=" + N(pending));
                 if (!arranged) return;
 
                 WaitUntil(() => NowMs() - tStart > 12000, 15000, 200);
-                Check("S1-首跳周期落盘已过（此后 60s 内不再有周期写）",
+     Check("S1-the first periodic flush has passed (no more periodic writes for the next 60s)",
                     NowMs() - tStart > 12000 && AllBack(admin, group, mq, Msgs),
                     "committed=" + N(Probe(admin, group, mq).Committed));
 
-                // 按时间戳重置到 3：mid 落在第 3 条与第 4 条之间 ⇒ getOffsetInQueueByTime 命中 3，
-                // 3 < consumerOffset(10) 且 isForce=true ⇒ broker 推 {mq: 3}
+          // Reset by timestamp to 3: the mid lands between the 3rd and the 4th message =>
+          // getOffsetInQueueByTime hits 3, and 3 < consumerOffset(10) with isForce=true =>
+          // the broker pushes {mq: 3}
                 long resetTs = mid + 500;
                 long t0 = NowMs();
                 SortedDictionary<MessageQueue, long> table =
                     admin.ResetOffsetByTimestamp(topic, group, resetTs, true);
-                Check("S1-222 响应里的目标位点就是 3",
+  Check("S1-the target offset in the 222 response is exactly 3",
                     table.Count == 1 && table.Values.First() == BackTarget,
                     "table={" + string.Join(", ", table.Select(kv => "q" + N(kv.Key.QueueId)
                         + ":" + N(kv.Value))) + "}");
 
                 bool in2s = WaitBefore(() => AllBack(admin, group, mq, BackTarget), 2000);
-                Check("S1-broker 位点 ~2s 内变成 3（重置路径自带的那次 persist，周期落盘=60s）", in2s,
+     Check("S1-the broker-side offset becomes 3 within ~2s (the persist the reset path brings itself, periodic flush = 60s)", in2s,
                     "elapsed=" + ((NowMs() - t0) / 1000.0).ToString("F1", CultureInfo.InvariantCulture)
                     + "s committed=" + N(Probe(admin, group, mq).Committed));
 
                 long? off = c.ConsumeOffsetForTest(key);
-                Check("S1-重置后本地表里没有旧位点（旧位点被移除；新位点经撤销尾巴出去）",
+         Check("S1-after the reset there is no old offset in the local table (the old offset is removed; the new one goes out via the withdrawal tail)",
                     off == null, "local_offset=" + (off.HasValue ? N(off.Value) : "None")
                     + " epoch=" + N(c.QueueEpochForTest(key)));
 
-                // 放行旧批次：它的 ack 属于已被撤销的 ProcessQueue，必须作废
+        // Release the old batch: its ack belongs to a withdrawn ProcessQueue and must be invalidated
                 listener.Release();
                 bool second = WaitBatches(listener, 2, 20000);
                 off = c.ConsumeOffsetForTest(key);
-                Check("S1-旧批次 ack 作废（放行后新队列第一批 offset 3 已在途时，本地位点仍未越过 3）",
+         Check("S1-the old batch's ack is invalidated (after releasing, while the new queue's first batch at offset 3 is in flight, the local offset has still not passed 3)",
                     second && (off == null || off.Value <= BackTarget),
                     "local_offset=" + (off.HasValue ? N(off.Value) : "None")
                     + " arrivals=" + Join(listener.Offsets()));
 
-                // 逐批放行走完重投：3..14 每条重投一次（旧缓冲里 11..14 也已作废，只能作为重投出现）
+        // Release batch by batch to walk the redelivery: each of 3..14 exactly once (11..14
+        // in the old buffer were invalidated too and can only appear as redeliveries)
                 var expected = new List<long> { Msgs };
                 for (long i = BackTarget; i < Msgs + 5; ++i) expected.Add(i);
                 for (int n = 2; n <= expected.Count; ++n)
@@ -484,18 +511,19 @@ public static class LiveResetOffset
                 }
 
                 arr = listener.Offsets();
-                Check("S1-队列被真正重建：重投序列是 " + Join(expected), arr.SequenceEqual(expected),
+        Check("S1-the queue really is rebuilt: the redelivery sequence is " + Join(expected), arr.SequenceEqual(expected),
                     "arrivals=" + Join(arr));
                 WaitUntil(() => c.ConsumeOffsetForTest(key) == Msgs + 5, 10000, 50);
 
-                Check("S1-窗口内只有重置那次写 broker（位点仍停在 3，周期落盘=60s）",
+      Check("S1-only the reset wrote to the broker inside the window (the offset is still 3, periodic flush = 60s)",
                     AllBack(admin, group, mq, BackTarget),
                     "committed=" + N(Probe(admin, group, mq).Committed));
 
-                // 关停会同步落盘一次：重投的 ack 才是最终值（15 = 最后一条 14 的 +1）
+         // Shutdown flushes synchronously once: the redelivered ack is the final value
+        // (15 = the last message 14 plus 1)
                 c.Shutdown();
                 bool advanced = WaitUntil(() => AllBack(admin, group, mq, Msgs + 5), 15000, 500);
-                Check("S1-关停落盘把重投的 ack 写回 broker（位点前进到 15）", advanced,
+       Check("S1-the shutdown flush writes the redelivered ack back to the broker (the offset advances to 15)", advanced,
                     "committed=" + N(Probe(admin, group, mq).Committed));
             }
             finally
@@ -507,7 +535,7 @@ public static class LiveResetOffset
                 }
                 catch (Exception)
                 {
-                    // 收尾失败不掩盖主断言
+      // a cleanup failure does not mask the main assertion
                 }
             }
         }
@@ -519,7 +547,7 @@ public static class LiveResetOffset
             }
             catch (Exception)
             {
-                // 收尾失败不掩盖主断言
+        // a cleanup failure does not mask the main assertion
             }
         }
     }
@@ -527,12 +555,15 @@ public static class LiveResetOffset
     private static void ScenarioForwardSkip(DefaultMQProducer producer, DefaultMQAdminExt admin,
         string brokerAddr, string topic, string group, string stamp)
     {
-        Console.WriteLine("=== S2 前跳重置（timestamp=-1 → maxOffset）不重投 + 新消息照常消费 ===");
+        Console.WriteLine("=== S2 the forward reset (timestamp=-1 -> maxOffset) does not redeliver + new messages are consumed as usual ===");
 
         var listener = new SteppingListener();
-        // 周期落盘用默认值：本场景要先靠首跳（start 后 10s）在 broker 上给这个组建记录
-        //（Broker2Client.resetOffset 对 queryOffset==-1 的组直接回 SYSTEM_ERROR），
-        // 再等一个 >5s 的窗口做重置 —— 重置那笔 persist 与周期写不同刻，判据仍然干净。
+        // The periodic flush uses the default here: this scenario first relies on the first
+        // hop (10s after start) to give the group a record on the broker
+        // (Broker2Client.resetOffset replies SYSTEM_ERROR straight away for a group whose
+        // queryOffset==-1), and then waits out a >5s window to do the reset -- the reset's
+        // own persist and the periodic write are not at the same instant, so the criteria
+        // stay clean.
         var c = new DefaultMQPushConsumer(group)
         {
             InstanceName = "reset-offset-skip-" + stamp,
@@ -557,7 +588,8 @@ public static class LiveResetOffset
                 producer.Send(new Message(topic, Str2Bytes("rs-" + N(i))));
             }
 
-            // 逐批放行前 3 条：第 4 条（offset 3）留在 listener 里当"在途批次"
+      // Release the first 3 messages batch by batch: the 4th (offset 3) stays in the
+    // listener as the "in-flight batch"
             for (int n = 1; n <= 4; ++n)
             {
                 if (!WaitBatches(listener, n, 30000)) break;
@@ -567,33 +599,34 @@ public static class LiveResetOffset
             List<long> arr = listener.Offsets();
             var seedArrivals = new List<long> { 0, 1, 2, 3 };
             bool arranged = listener.BatchCount() >= 4 && arr.SequenceEqual(seedArrivals);
-            Check("S2-窗口就绪：前 3 条已 ack、第 4 条卡在 listener", arranged,
+            Check("S2-window ready: the first 3 are acked and the 4th is stuck in the listener", arranged,
                 "arrivals=" + Join(arr));
             if (!arranged) return;
 
-            // 等首跳落盘把组建出来（本地已消费位点 3 = 前三条的 ack），并留出 >5s 的静默窗口
+   // Wait for the first-hop flush to create the group's record (the local consumed offset 3
+    // = the acks of the first three) and leave a >5s quiet window
             bool primed = WaitUntil(
                 () => NowMs() - tStart > 12000 && AllBack(admin, group, mq, BackTarget), 20000, 500);
-            Check("S2-前置：broker 上该组有记录（q0:3），且下一笔周期写还在 5s 之外", primed,
+   Check("S2-precondition: the group has a record on the broker (q0:3) and the next periodic write is still beyond 5s", primed,
                 "committed=" + N(Probe(admin, group, mq).Committed));
 
             long t0 = NowMs();
             SortedDictionary<MessageQueue, long> table =
                 admin.ResetOffsetByTimestamp(topic, group, -1, true);
-            Check("S2-222 响应里的目标位点就是 maxOffset(10)",
+            Check("S2-the target offset in the 222 response is maxOffset(10)",
                 table.Count == 1 && table.Values.First() == Msgs,
                 "table={" + string.Join(", ", table.Select(kv => "q" + N(kv.Key.QueueId) + ":"
                     + N(kv.Value))) + "}");
 
             bool in2s = WaitBefore(() => AllBack(admin, group, mq, Msgs), 2000);
-            Check("S2-broker 位点 ~2s 内前跳到 10（重置路径自带的那次 persist）", in2s,
+    Check("S2-the broker-side offset jumps forward to 10 within ~2s (the persist the reset path brings itself)", in2s,
                 "elapsed=" + ((NowMs() - t0) / 1000.0).ToString("F1", CultureInfo.InvariantCulture)
                 + "s committed=" + N(Probe(admin, group, mq).Committed));
 
             listener.Release();
             Thread.Sleep(3000);
             arr = listener.Offsets();
-            Check("S2-被跳过的 4..9 一条都不投（在途那条的 ack 也作废）",
+      Check("S2-none of the skipped 4..9 is delivered (the in-flight one's ack is invalidated too)",
                 arr.SequenceEqual(seedArrivals), "arrivals=" + Join(arr));
 
             producer.Send(new Message(topic, Str2Bytes("rs-new")));
@@ -601,16 +634,18 @@ public static class LiveResetOffset
             listener.Release();
             arr = listener.Offsets();
             var wantArrivals = new List<long> { 0, 1, 2, 3, Msgs };
-            Check("S2-重建后的队列从队尾续跑（新消息 offset 10 正常投递）",
+      Check("S2-the rebuilt queue resumes from the tail (the new message at offset 10 is delivered normally)",
                 gotNew && arr.SequenceEqual(wantArrivals), "arrivals=" + Join(arr));
 
-            // Release() 只让 listener 返回；ack 是消费线程随后落的。不等本地位点真的推到 11 就
-            // 关停，关停那次 persist 可能跑在 ack 之前（写回的还是 10）——这是断言竞态，不是语义问题。
+        // Release() only lets the listener return; the ack is committed by the consume thread
+    // afterwards. Shutting down without waiting for the local offset to really reach 11
+        // means the shutdown persist can run before the ack (writing back 10 still) -- that
+    // is an assertion race, not a semantic problem.
             string key = Key(mq);
             WaitUntil(() => c.ConsumeOffsetForTest(key) == Msgs + 1, 10000, 50);
             c.Shutdown();
             bool advanced = WaitUntil(() => AllBack(admin, group, mq, Msgs + 1), 15000, 500);
-            Check("S2-关停落盘把新消息的 ack 写回 broker（位点前进到 11）", advanced,
+    Check("S2-the shutdown flush writes the new message's ack back to the broker (the offset advances to 11)", advanced,
                 "committed=" + N(Probe(admin, group, mq).Committed));
         }
         finally
@@ -622,7 +657,7 @@ public static class LiveResetOffset
             }
             catch (Exception)
             {
-                // 收尾失败不掩盖主断言
+     // a cleanup failure does not mask the main assertion
             }
         }
     }
@@ -644,14 +679,14 @@ public static class LiveResetOffset
 
             return queues.Count == 1;
         }, 20000);
-        Check(tag + "-topic 恰好 1 个队列", one, "queues=" + N(queues.Count));
+ Check(tag + "-the topic has exactly 1 queue", one, "queues=" + N(queues.Count));
         return queues;
     }
 
     private static int Report()
     {
         Console.WriteLine();
-        Console.WriteLine("=== 结果：" + N(_pass) + " PASS / " + N(_fail) + " FAIL ===");
+     Console.WriteLine("=== result: " + N(_pass) + " PASS / " + N(_fail) + " FAIL ===");
         return _fail == 0 ? 0 : 1;
     }
 }

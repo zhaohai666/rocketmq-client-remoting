@@ -63,7 +63,7 @@ def _route_cached(producer, topic):
 
 
 def _broker_offset(admin, group, mq):
-    """broker 上该 group 这条队列的已提交位点（``set_zero_if_not_found=True`` ⇒ 没提交过回 0）。"""
+    """The committed offset for this group on this queue on the broker (``set_zero_if_not_found=True`` ⇒ returns 0 if never committed)."""
     off = admin._require_client().query_consumer_offset(
         group, mq, timeout_millis=5000, set_zero_if_not_found=True)
     return int(off or 0)
@@ -87,16 +87,16 @@ def main():
     admin.start()
     cluster = admin.fetch_broker_cluster_info()
     if not cluster or not cluster.get_broker_addrs():
-        check("集群探活", False, "nameServer 无 broker 注册")
+        check("cluster probe", False, "no broker registered with nameServer")
         admin.shutdown()
         return 1
     broker_addr = cluster.get_broker_addrs()[0]
-    check("集群探活", True, "broker=%s" % broker_addr)
+    check("cluster probe", True, "broker=%s" % broker_addr)
 
     producer = None
     consumers = []
     try:
-        # ---------------- I1 路由刷新周期 ----------------
+        # ---------------- I1 route refresh cycle ----------------
         fast = DefaultMQProducer(g_poll_fast)
         fast.set_namesrv_addr(NAMESRV)
         fast.set_instance_name("interval-poll-fast-%d" % STAMP)
@@ -107,44 +107,44 @@ def main():
         slow.set_instance_name("interval-poll-slow-%d" % STAMP)
         slow.start()
 
-        check("I3 生产者实例拿到配置的刷新周期（1s 组）",
+        check("I3 the producer instance picks up the configured refresh cycle (1s group)",
               fast._mq_client.poll_name_server_interval == FAST_POLL_MS,
               "client.poll_name_server_interval=%s" % fast._mq_client.poll_name_server_interval)
-        check("I3 生产者实例默认 30s（对照组）",
+        check("I3 the producer instance defaults to 30s (control group)",
               slow._mq_client.poll_name_server_interval == SLOW_POLL_MS,
               "client.poll_name_server_interval=%s" % slow._mq_client.poll_name_server_interval)
 
-        # 把一个还没创建的 topic 登记进周期刷新集合：两个生产者都不会给它发消息，
-        # 所以缓存里何时出现它，只由各自的刷新周期决定。
+        # Register a not-yet-created topic into the periodic refresh set: neither producer will send messages to it,
+        # so when it appears in the cache is decided only by each one's refresh cycle.
         for p in (fast, slow):
             p._mq_client.register_topic_in_use(t_poll)
-            check("I1 %s 已把 %s 登记进在用 topic 集合" % (p.instance_name, t_poll),
+            check("I1 %s has registered %s into the in-use topic set" % (p.instance_name, t_poll),
                   t_poll in p._mq_client._topics_in_use)
-        check("I1 topic 创建前两边缓存都为空",
+        check("I1 both caches are empty before the topic is created",
               not _route_cached(fast, t_poll) and not _route_cached(slow, t_poll))
 
         t0 = time.time()
         admin.create_topic(MixAll.DEFAULT_TOPIC, t_poll, 1)
-        check("I1 admin 建 topic 成功", True, "%s 1 队列" % t_poll)
+        check("I1 admin created the topic successfully", True, "%s 1 queue" % t_poll)
 
         fast_ok = _wait_until(lambda: _route_cached(fast, t_poll), 6.0, 0.1)
         dt_fast = time.time() - t0
-        check("I1 1s 周期组 ≤6s 从 NameServer 拉到新 topic 路由", fast_ok,
-              "dt=%.2fs 周期=%dms" % (dt_fast, FAST_POLL_MS))
-        check("I1 此刻 30s 周期组**还**没拉到（对照：周期决定时机）",
+        check("I1 the 1s-cycle group pulls the new topic's route from NameServer within ≤6s", fast_ok,
+              "dt=%.2fs cycle=%dms" % (dt_fast, FAST_POLL_MS))
+        check("I1 at this moment the 30s-cycle group has not yet pulled it (control: the cycle decides timing)",
               not _route_cached(slow, t_poll),
-              "dt=%.2fs 周期=%dms" % (dt_fast, SLOW_POLL_MS))
+              "dt=%.2fs cycle=%dms" % (dt_fast, SLOW_POLL_MS))
 
         slow_ok = _wait_until(lambda: _route_cached(slow, t_poll), 40.0, 0.5)
         dt_slow = time.time() - t0
-        check("I1 30s 周期组最终也拉到（默认值只是慢，不是坏）",
-              slow_ok, "dt=%.2fs 周期=%dms" % (dt_slow, SLOW_POLL_MS))
-        check("I1 两组间隔与配置同量级（30s 组至少晚 20s）", dt_slow - dt_fast >= 20.0,
+        check("I1 the 30s-cycle group eventually pulls it too (the default is only slow, not broken)",
+              slow_ok, "dt=%.2fs cycle=%dms" % (dt_slow, SLOW_POLL_MS))
+        check("I1 the gap between the two groups is the same order of magnitude as the config (the 30s group is at least 20s later)", dt_slow - dt_fast >= 20.0,
               "fast=%.2fs slow=%.2fs" % (dt_fast, dt_slow))
         fast.shutdown()
         slow.shutdown()
 
-        # ---------------- I2 位点落盘周期 ----------------
+        # ---------------- I2 offset persistence cycle ----------------
         admin.create_topic(MixAll.DEFAULT_TOPIC, t_persist, 1)
         mq = _first_queue(admin, t_persist)
         producer = DefaultMQProducer("G_persist_producer_%d" % STAMP)
@@ -176,16 +176,16 @@ def main():
         t_start = time.time()
         fast_c.start()
         consumers.append(fast_c)
-        check("I3 消费者实例拿到配置的刷新周期",
+        check("I3 the consumer instance picks up the configured refresh cycle",
               fast_c._mq_client.poll_name_server_interval == 2000,
               "client.poll_name_server_interval=%s" % fast_c._mq_client.poll_name_server_interval)
         slow_c.start()
         consumers.append(slow_c)
 
-        check("I2 两个消费者都消费到 3 条（尚未 commit / shutdown）",
+        check("I2 both consumers have consumed all 3 (not yet committed / shut down)",
               _wait_until(lambda: listener_fast.count() >= 3 and listener_slow.count() >= 3, 30.0),
               "fast=%d slow=%d" % (listener_fast.count(), listener_slow.count()))
-        check("I2 消费后 broker 位点还没有立刻被推上去",
+        check("I2 the broker offset is not pushed up immediately after consuming",
               _broker_offset(admin, g_fast, mq) < 3 and _broker_offset(admin, g_slow, mq) < 3,
               "fast=%d slow=%d" % (_broker_offset(admin, g_fast, mq),
                                    _broker_offset(admin, g_slow, mq)))
@@ -194,76 +194,76 @@ def main():
         dt_fast_first = time.time() - t_start
         slow_first = _wait_until(lambda: _broker_offset(admin, g_slow, mq) == 3, 20.0, 0.3)
         dt_slow_first = time.time() - t_start
-        check("I2 1s 组首次落盘发生在 initialDelay(~10s) 之后", fast_first,
-              "dt=%.2fs 周期=%dms" % (dt_fast_first, FAST_PERSIST_MS))
-        check("I2 首笔落盘不早于 initialDelay 10s",
+        check("I2 the 1s group's first persistence happens after initialDelay(~10s)", fast_first,
+              "dt=%.2fs cycle=%dms" % (dt_fast_first, FAST_PERSIST_MS))
+        check("I2 the first persistence is not earlier than initialDelay 10s",
               fast_first and dt_fast_first >= PERSIST_INITIAL_DELAY - 0.5,
               "dt=%.2fs" % dt_fast_first)
-        check("I2 60s 组同样在 ~10s 完成首笔落盘（周期未到，先走 initialDelay）", slow_first,
-              "dt=%.2fs 周期=%dms" % (dt_slow_first, SLOW_PERSIST_MS))
+        check("I2 the 60s group also completes its first persistence at ~10s (the cycle has not arrived yet, initialDelay runs first)", slow_first,
+              "dt=%.2fs cycle=%dms" % (dt_slow_first, SLOW_PERSIST_MS))
 
-        # 第二批：两组都会消费到，但 broker 侧位点只由各自的周期任务推上去。
+        # Second batch: both groups will consume it, but the broker-side offset is only pushed up by each one's periodic task.
         t2 = time.time()
         for i in range(3):
             producer.send(Message(t_persist, ("batch2-%d" % i).encode()))
-        check("I2 两个消费者都消费到第二批（6 条）",
+        check("I2 both consumers have consumed the second batch (6 messages)",
               _wait_until(lambda: listener_fast.count() >= 6 and listener_slow.count() >= 6, 20.0),
               "fast=%d slow=%d" % (listener_fast.count(), listener_slow.count()))
         fast_second = _wait_until(lambda: _broker_offset(admin, g_fast, mq) == 6, 5.0, 0.2)
         dt_second = time.time() - t2
-        check("I2 1s 组一个周期内把第二批位点推上去", fast_second,
-              "dt=%.2fs 周期=%dms" % (dt_second, FAST_PERSIST_MS))
-        check("I2 此刻 60s 组仍是 3（周期 60s 远未到，且它确实消费到了 6）",
+        check("I2 the 1s group pushes the second batch's offset up within one cycle", fast_second,
+              "dt=%.2fs cycle=%dms" % (dt_second, FAST_PERSIST_MS))
+        check("I2 at this moment the 60s group is still at 3 (its 60s cycle is far from arrived, yet it really did consume 6)",
               _broker_offset(admin, g_slow, mq) == 3 and listener_slow.count() >= 6,
-              "broker=%d 已消费=%d 周期=%dms" % (_broker_offset(admin, g_slow, mq),
+              "broker=%d consumed=%d cycle=%dms" % (_broker_offset(admin, g_slow, mq),
                                                 listener_slow.count(), SLOW_PERSIST_MS))
         dt_slow_first_abs = t2 + dt_second - t_start
-        check("I2 60s 组的下一次周期还没到（距首笔落盘 < 周期 60s）",
+        check("I2 the 60s group's next cycle has not arrived yet (less than the 60s cycle since the first persistence)",
               dt_slow_first_abs - dt_slow_first < SLOW_PERSIST_MS / 1000.0,
               "elapsed=%.2fs" % (dt_slow_first_abs - dt_slow_first))
 
         slow_c.shutdown()
         consumers.remove(slow_c)
         slow_final = _wait_until(lambda: _broker_offset(admin, g_slow, mq) == 6, 10.0, 0.3)
-        check("I2 60s 组 shutdown() 时把 6 落盘（persistConsumerOffset 收尾）",
+        check("I2 the 60s group persists 6 at shutdown() (persistConsumerOffset wrap-up)",
               slow_final, "broker=%d" % _broker_offset(admin, g_slow, mq))
     except Exception as exc:  # noqa: BLE001
         import traceback
         traceback.print_exc()
-        check("验证过程抛出异常", False, "%s: %s" % (type(exc).__name__, exc))
+        check("the verification threw an exception", False, "%s: %s" % (type(exc).__name__, exc))
     finally:
-        # ---------------- 清理 ----------------
+        # ---------------- cleanup ----------------
         for c in consumers:
             try:
                 c.shutdown()
             except Exception as e:  # noqa: BLE001
-                print("    (consumer shutdown 失败: %s)" % e)
+                print("    (consumer shutdown failed: %s)" % e)
         if producer is not None:
             try:
                 producer.shutdown()
             except Exception as e:  # noqa: BLE001
-                print("    (producer shutdown 失败: %s)" % e)
+                print("    (producer shutdown failed: %s)" % e)
         for t in topics:
             try:
                 admin.delete_topic(t)
                 print("    (delete_topic(%s) OK)" % t)
             except Exception as e:  # noqa: BLE001
-                print("    (delete_topic(%s) 失败: %s)" % (t, e))
+                print("    (delete_topic(%s) failed: %s)" % (t, e))
         for g in groups:
             try:
                 admin.delete_subscription_group(broker_addr, g, remove_offset=True)
             except Exception as e:  # noqa: BLE001
-                print("    (delete_subscription_group(%s) 失败: %s)" % (g, e))
+                print("    (delete_subscription_group(%s) failed: %s)" % (g, e))
         admin.shutdown()
 
     failed = [r for r in results if not r[1]]
-    print("\n================ 汇总 ================")
+    print("\n================ summary ================")
     for name, ok, detail in results:
         print("  [%s] %s  %s" % ("PASS" if ok else "FAIL", name, detail))
     for name, detail in skips:
         print("  [SKIP] %s  %s" % (name, detail))
     print("======================================")
-    print("总计 %d 项，失败 %d 项，跳过 %d 项" % (len(results), len(failed), len(skips)))
+    print("%d checks total, %d failed, %d skipped" % (len(results), len(failed), len(skips)))
     return 1 if failed else 0
 
 

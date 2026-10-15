@@ -7,26 +7,30 @@ namespace RocketMQ\Remoting\Protocol;
 use RocketMQ\Common\MixAll;
 
 /**
- * POP 模式的 extraInfo（俗称 CK 串）编解码。
+ * Encoding and decoding of the extraInfo of POP mode (commonly called the CK string).
  *
- * 串的段序、分隔符与兼容规则都由 broker 侧的解析代码定死，本类逐条实现它认的形状。
+ * The segment order, the separators and the compatibility rules of the string are all fixed by the
+ * broker-side parsing code, and this class implements exactly the shape it accepts.
  *
- * CK 串是 POP 模式的核心凭据：broker 在 POP 响应里**不**给普通 topic 的消息写
- * ``POP_CK`` 属性（只在 retry topic 重编码路径写），客户端必须自己用响应头的
- * ``startOffsetInfo`` / ``msgOffsetInfo`` 反构出这个串，再作为 ACK /
- * CHANGE_MESSAGE_INVISIBLETIME 的 ``extraInfo`` 回传。格式是 8 段、**空格**分隔：
+ * The CK string is the core credential of POP mode: the broker **does not** write the ``POP_CK`` property
+ * for messages of ordinary topics in the POP response (it only does so on the retry-topic re-encoding
+ * path), so the client has to reconstruct the string itself from the ``startOffsetInfo`` /
+ * ``msgOffsetInfo`` of the response header and send it back as the ``extraInfo`` of ACK /
+ * CHANGE_MESSAGE_INVISIBLETIME. The format is 8 segments separated by **spaces**:
  *
  * ``ckQueueOffset popTime invisibleTime reviveQid retryFlag brokerName queueId [msgQueueOffset]``
  *
- * 注意分隔符是空格而不是逗号 —— 用错会导致 broker 静默解析失败。
+ * Note that the separator is a space and not a comma — getting it wrong makes the broker fail to parse
+ * it silently.
  */
 final class ExtraInfoUtil
 {
-    /** 段内分隔符；**必须**是空格——broker 按空格切，换任何字符整串都解不开 */
+    /** The in-segment separator; it **must** be a space — the broker splits on spaces, and with any
+     * other character the whole string cannot be decoded */
     public const KEY_SEPARATOR = ' ';
-    /** 队列之间的分隔符 */
+    /** The separator between queues */
     public const QUEUE_SEPARATOR = ';';
-    /** ``msgOffsetInfo`` 里同一队列多条 offset 的分隔符 */
+    /** The separator between multiple offsets of the same queue in ``msgOffsetInfo`` */
     public const OFFSET_SEPARATOR = ',';
 
     public const NORMAL_TOPIC = '0';
@@ -34,31 +38,31 @@ final class ExtraInfoUtil
     public const RETRY_TOPIC_V2 = '2';
     public const QUEUE_OFFSET = 'qo';
 
-    /** 顺序消费用的固定 revive 队列号：999 是协议里的哨兵值 */
+    /** The fixed revive queue id used for orderly consumption: 999 is the sentinel value in the protocol */
     public const POP_ORDER_REVIVE_QUEUE = 999;
 
     private const POP_RETRY_SEPARATOR_V1 = '_';
     private const POP_RETRY_SEPARATOR_V2 = '+';
 
-    /** V1 形状的 POP 重试 topic 名：``%RETRY%<cid>_<topic>``。 */
+    /** The V1-shaped POP retry topic name: ``%RETRY%<cid>_<topic>``. */
     public static function buildPopRetryTopicV1(string $topic, string $cid): string
     {
         return MixAll::RETRY_GROUP_TOPIC_PREFIX . $cid . self::POP_RETRY_SEPARATOR_V1 . $topic;
     }
 
-    /** V2 形状的 POP 重试 topic 名：``%RETRY%<cid>+<topic>``。 */
+    /** The V2-shaped POP retry topic name: ``%RETRY%<cid>+<topic>``. */
     public static function buildPopRetryTopicV2(string $topic, string $cid): string
     {
         return MixAll::RETRY_GROUP_TOPIC_PREFIX . $cid . self::POP_RETRY_SEPARATOR_V2 . $topic;
     }
 
-    /** 按开关选形状：``enableRetryTopicV2`` 关（默认）走 V1。 */
+    /** Picks the shape by the switch: with ``enableRetryTopicV2`` off (the default) it goes V1. */
     public static function buildPopRetryTopic(string $topic, string $cid, bool $enableRetryV2 = false): string
     {
         return $enableRetryV2 ? self::buildPopRetryTopicV2($topic, $cid) : self::buildPopRetryTopicV1($topic, $cid);
     }
 
-    /** ``%RETRY%`` 前缀且含 ``+`` 即 V2 重试 topic。 */
+    /** The ``%RETRY%`` prefix plus a ``+`` means a V2 retry topic. */
     public static function isPopRetryTopicV2(?string $retryTopic): bool
     {
         if ($retryTopic === null || $retryTopic === '') {
@@ -69,8 +73,10 @@ final class ExtraInfoUtil
     }
 
     /**
-     * 按 broker 侧的切分语义拆段：**丢弃末尾空串**。
-     * 这不是吹毛求疵：``"a b "`` 切出来是 ``["a","b"]`` 两段，段数校验依赖它。
+     * Splits the segments following the broker-side splitting semantics: **the trailing empty strings are
+     * dropped**.
+     * This is not nitpicking: ``"a b "`` splits into the two segments ``["a","b"]``, and the segment count
+     * check depends on it.
      *
      * @return list<string>
      */
@@ -83,7 +89,7 @@ final class ExtraInfoUtil
         return $parts;
     }
 
-    /** 按空格切分 CK 串。 */
+    /** Splits the CK string by spaces. */
     public static function split(?string $extraInfo): array
     {
         if ($extraInfo === null) {
@@ -148,8 +154,8 @@ final class ExtraInfoUtil
     }
 
     /**
-     * 由 topic 形状判定 retryFlag。
-     * 顺序很重要：先判 V2（含 ``+``），再判 ``%RETRY%`` 前缀（V1）。
+     * Determines retryFlag from the shape of the topic.
+     * The order matters: check V2 (containing ``+``) first, then the ``%RETRY%`` prefix (V1).
      */
     public static function retryOfTopic(string $topic): string
     {
@@ -163,8 +169,9 @@ final class ExtraInfoUtil
     }
 
     /**
-     * 拼 CK 串。传 ``$msgQueueOffset`` 得到 8 段，不传得到 7 段。
-     * broker 两种长度都收：ACK 场景必须用 8 段版本，少一段就丢队列位点。
+     * Builds the CK string. Passing ``$msgQueueOffset`` yields 8 segments, not passing it yields 7.
+     * The broker accepts both lengths: the ACK scenario must use the 8-segment version, one segment
+     * short loses the queue offset.
      */
     public static function buildExtraInfo(int $ckQueueOffset, int $popTime, int $invisibleTime, int $reviveQid, string $topic, string $brokerName, int $queueId, ?int $msgQueueOffset = null): string
     {
@@ -184,8 +191,8 @@ final class ExtraInfoUtil
     }
 
     /**
-     * 解析 ``startOffsetInfo``，形如 ``"0 3 0;0 2 0"``。
-     * key 是 ``"<retryFlag>@<queueId>"``，value 是该队列本次弹出的起始 offset。
+     * Parses ``startOffsetInfo``, whose shape is ``"0 3 0;0 2 0"``.
+     * The key is ``"<retryFlag>@<queueId>"``, the value is the start offset of this pop for that queue.
      *
      * @return array<string, int>|null
      */
@@ -213,8 +220,9 @@ final class ExtraInfoUtil
     }
 
     /**
-     * 解析 ``msgOffsetInfo``，形如 ``"0 3 0,1,2;0 2 0"``。
-     * key 同 parseStartOffsetInfo，value 是该队列本次弹出的各条消息 offset 列表。
+     * Parses ``msgOffsetInfo``, whose shape is ``"0 3 0,1,2;0 2 0"``.
+     * The key is the same as in parseStartOffsetInfo, the value is the list of offsets of the messages
+     * popped this time for that queue.
      *
      * @return array<string, list<int>>|null
      */
@@ -242,7 +250,7 @@ final class ExtraInfoUtil
     }
 
     /**
-     * 解析 ``orderCountInfo``（顺序消费用），第三段是计数。
+     * Parses ``orderCountInfo`` (used for orderly consumption), the third segment is the count.
      *
      * @return array<string, int>|null
      */
@@ -284,13 +292,13 @@ final class ExtraInfoUtil
         return self::retryOfTopic($topic) . '@' . self::getQueueOffsetKeyValueKey($queueId, $queueOffset);
     }
 
-    /** reviveQid 是 999 表示顺序消费。 */
+    /** A reviveQid of 999 means orderly consumption. */
     public static function isOrder(array $segments): bool
     {
         return self::getReviveQid($segments) === self::POP_ORDER_REVIVE_QUEUE;
     }
 
-    /** 由 retryFlag 还原真实 topic（剥掉 %RETRY% 前缀和 cid 段）。 */
+    /** Restores the real topic from retryFlag (strips the %RETRY% prefix and the cid segment). */
     public static function getRealTopic(string $topic, string $cid, string $retry): string
     {
         if ($retry === self::NORMAL_TOPIC) {

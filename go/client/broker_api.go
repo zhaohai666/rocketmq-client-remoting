@@ -12,7 +12,7 @@
 //     working;
 //   - CONSUMER_SEND_MSG_BACK(36): MASTER ONLY (a slave does not accept it);
 //   - offset queries (max/min/timestamp): master first, one route refresh,
-//     then master again (MQAdminImpl口径).
+//     then master again (consistent with MQAdminImpl).
 package client
 
 import (

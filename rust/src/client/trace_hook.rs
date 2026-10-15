@@ -3,12 +3,12 @@
 //! * [`EndTransactionTraceHook`] ← `trace.hook.EndTransactionTraceHookImpl`
 //!
 //!
-//! # 分发器依赖：[`TraceReportSink`]
+//! # Dispatcher dependency: [`TraceReportSink`]
 //!
-//! 三个钩子对分发器的依赖**只有三个方法**
-//! （`get_trace_topic_name()` / `append(ctx)` / `client_id()`）。攒批、发送、
-//! 生命周期都在 `client::trace_dispatcher`（另有人移植），所以这里只打一个依赖倒置的缝：
-//! 本模块声明 [`TraceReportSink`]，**不** stub 分发器、也不碰 topic 选择与攒批。
+//! The three hooks depend on the dispatcher through **only three methods**
+//! (`get_trace_topic_name()` / `append(ctx)` / `client_id()`). Batching, sending, and the
+//! lifecycle all live in `client::trace_dispatcher` (ported as its own module), so this module only cuts a dependency-inversion seam:
+//! this module declares [`TraceReportSink`] and does **not** stub the dispatcher, nor touch topic selection or batching.
 
 use std::sync::Arc;
 #[cfg(test)]
@@ -29,27 +29,27 @@ use super::hook::{
 };
 use super::trace::{AccessChannel, TraceBean, TraceContext, TraceType};
 
-/// 消费者投递完成后把它写进 [`ConsumeMessageContext::props`]，值取
-/// [`ConsumeReturnType`](crate::client::result::ConsumeReturnType) 的**枚举名**。
+/// Written into [`ConsumeMessageContext::props`] after the consumer delivers, with the value taken from
+/// the **enum name** of [`ConsumeReturnType`](crate::client::result::ConsumeReturnType).
 pub const CONSUME_CONTEXT_TYPE: &str = "ConsumeContextType";
 
-/// 轨迹落地通道 —— 本模块唯一的对外依赖缝。
+/// Trace reporting channel -- the only outward dependency seam of this module.
 ///
-/// **由 `mq_client.rs` / `trace_dispatcher.rs` 实现**（那两个文件里才真正握有轨迹
-/// topic、内部 trace producer 与 clientId）；本模块只声明、不实现，也不对攒批/发送
-/// 做任何假设 —— 钩子只管把一条 [`TraceContext`] 交出去。
+/// **Implemented by `mq_client.rs` / `trace_dispatcher.rs`** (those two files actually hold the trace
+/// topic, the internal trace producer, and the clientId); this module only declares it without implementing, and makes no assumptions about batching/sending
+/// either -- the hooks just hand over one [`TraceContext`].
 pub trait TraceReportSink: Send + Sync {
-    /// 当前生效的轨迹 topic：[`MixAll::TRACE_TOPIC`](MixAll::TRACE_TOPIC)，或
-    /// `AccessChannel::Cloud` 下的
+    /// The currently effective trace topic: [`MixAll::TRACE_TOPIC`](MixAll::TRACE_TOPIC), or,
+    /// under `AccessChannel::Cloud`,
     /// [`TraceConstants::TRACE_TOPIC_PREFIX`](super::trace::TraceConstants::TRACE_TOPIC_PREFIX)
-    /// `+ regionId`。
+    /// `+ regionId`.
     fn trace_topic_name(&self) -> String;
 
-    /// 交出一条追踪记录。返回 `false` 表示分发器没收（停止中 / 队列满）。
+    /// Hands over one trace record. Returning `false` means the dispatcher refused it (shutting down / queue full).
     fn report(&self, context: TraceContext) -> bool;
 
-    /// 进程内 clientId（`<ip>@<instanceName>`），写进 EndTransaction 轨迹的
-    /// `clientHost` 字段。
+    /// The in-process clientId (`<ip>@<instanceName>`), written into the `clientHost` field of
+    /// the EndTransaction trace record.
     fn client_id(&self) -> String;
 }
 
@@ -63,7 +63,7 @@ impl SendMessageTraceHook {
         SendMessageTraceHook { sink }
     }
 
-    /// 交出钩子持有的通道。
+    /// Hands over the channel the hook holds.
     pub fn sink(&self) -> &Arc<dyn TraceReportSink> {
         &self.sink
     }
@@ -74,12 +74,12 @@ impl SendMessageHook for SendMessageTraceHook {
         "SendMessageTraceHook"
     }
 
-    /// 建一个 [`TraceType::Pub`] 的 [`TraceContext`] 挂到
-    /// [`SendMessageContext::mq_trace_context`]，`after` 再取出来补 msgId 等字段。
-    /// 此处只填「发送前就知道的」字段（topic / tags / keys / storeHost / bodyLength /
-    /// msgType），`msgId` 留空等 `after` 用 SendResult 覆盖。
+    /// Builds a [`TraceType::Pub`] [`TraceContext`] and hangs it on
+    /// [`SendMessageContext::mq_trace_context`]; `after` picks it back up to fill in msgId and the rest.
+    /// Only the fields "known before sending" are filled here (topic / tags / keys / storeHost / bodyLength /
+    /// msgType); `msgId` is left empty for `after` to overwrite from the SendResult.
     fn send_message_before(&self, context: &mut SendMessageContext) -> Result<()> {
-        // context 或 message 缺失时直接返回
+        // Return directly when context or message is missing
         let Some(message) = context.message.as_ref() else {
             return Ok(());
         };
@@ -102,9 +102,9 @@ impl SendMessageHook for SendMessageTraceHook {
         Ok(())
     }
 
-    /// 跳过条件逐条锁定（连顺序一致）：无 message / 是轨迹 topic /
-    /// before 没建过 context / 没有 sendResult / broker 侧 `TRACE_ON=false` 或没回
-    /// `MSG_REGION` / beans 为空。
+    /// Skip conditions are pinned one by one (order included): no message / is the trace topic /
+    /// before never built a context / no sendResult / broker side `TRACE_ON=false` or no `MSG_REGION` returned /
+    /// empty beans.
     fn send_message_after(&self, context: &mut SendMessageContext) -> Result<()> {
         let Some(message) = context.message.as_ref() else {
             return Ok(());
@@ -144,8 +144,8 @@ impl SendMessageHook for SendMessageTraceHook {
     }
 }
 
-/// SubBefore / SubAfter 两条记录**共用同一个 `request_id`**（`after` 从 `before` 挂的
-/// context 里抄），这是控制台把一次消费的前后串起来的唯一线索。
+/// The SubBefore / SubAfter pair **shares one `request_id`** (`after` copies it from the context
+/// hung by `before`); it is the only clue the console has for linking the two halves of one consumption.
 #[derive(Clone)]
 pub struct ConsumeMessageTraceHook {
     sink: Arc<dyn TraceReportSink>,
@@ -156,7 +156,7 @@ impl ConsumeMessageTraceHook {
         ConsumeMessageTraceHook { sink }
     }
 
-    /// 交出钩子持有的通道。
+    /// Hands over the channel the hook holds.
     pub fn sink(&self) -> &Arc<dyn TraceReportSink> {
         &self.sink
     }
@@ -174,8 +174,8 @@ impl ConsumeMessageHook for ConsumeMessageTraceHook {
         let mut trace_context = TraceContext::new();
         trace_context.trace_type = Some(TraceType::SubBefore);
         trace_context.group_name = strip_namespace(&context.consumer_group);
-        // 在建好 beans 之前就把（此时还是空壳的）context 挂上去：
-        // 一条都没记上时 `consume_message_after` 仍能拿到它并因 beans 为空而跳过。
+        // Hang the (still empty-shell) context before the beans are built:
+        // when not a single message was recorded, `consume_message_after` still finds it and skips because beans is empty.
         context.mq_trace_context = Some(Arc::new(trace_context.clone()));
         let mut beans: Vec<TraceBean> = Vec::with_capacity(context.msg_list.len());
         for msg in &context.msg_list {
@@ -192,7 +192,7 @@ impl ConsumeMessageHook for ConsumeMessageTraceHook {
             bean.store_time = msg.store_timestamp;
             bean.body_length = msg.store_size;
             bean.retry_times = msg.reconsume_times;
-            // region 属性缺失/空串都写空串，且会覆盖前一条的值
+            // A missing or empty region property is written as an empty string, and overwrites the previous message's value
             trace_context.region_id = region_id.unwrap_or("").to_string();
             beans.push(bean);
         }
@@ -226,8 +226,8 @@ impl ConsumeMessageHook for ConsumeMessageTraceHook {
             sub_before.time_stamp,
             context.msg_list.len(),
         );
-        // sub_after 与 sub_before 共享同一批 beans（原本就是同一个对象）；
-        // append 之后再没人改它，克隆等价。
+        // sub_after shares the same beans with sub_before (they were the same object to begin with);
+        // nobody mutates them after append, so cloning is equivalent.
         sub_after.trace_beans = sub_before.trace_beans.clone();
         if let Some(props) = context.props.as_ref() {
             if let Some(context_type) = props.get(CONSUME_CONTEXT_TYPE) {
@@ -244,8 +244,8 @@ impl ConsumeMessageHook for ConsumeMessageTraceHook {
     }
 }
 
-/// broker 的事务回查（`fromTransactionCheck=true`）也会走这里，所以「客户端主动提交」
-/// 和「回查后提交」两种情况都能在轨迹里看到。
+/// The broker's transaction check-back (`fromTransactionCheck=true`) also goes through here, so both "client-initiated commit"
+/// and "commit after check-back" show up in the trace.
 #[derive(Clone)]
 pub struct EndTransactionTraceHook {
     sink: Arc<dyn TraceReportSink>,
@@ -256,7 +256,7 @@ impl EndTransactionTraceHook {
         EndTransactionTraceHook { sink }
     }
 
-    /// 交出钩子持有的通道。
+    /// Hands over the channel the hook holds.
     pub fn sink(&self) -> &Arc<dyn TraceReportSink> {
         &self.sink
     }
@@ -294,7 +294,7 @@ impl EndTransactionHook for EndTransactionTraceHook {
         let region_id = message.get_property(PROPERTY_MSG_REGION);
         trace_context.region_id = match region_id {
             Some(region) if !region.is_empty() => region.to_string(),
-            // region 为空时回落默认 region
+            // Fall back to the default region when region is empty
             _ => MixAll::DEFAULT_TRACE_REGION_ID.to_string(),
         };
         trace_context.trace_beans = vec![bean];
@@ -304,17 +304,17 @@ impl EndTransactionHook for EndTransactionTraceHook {
     }
 }
 
-// ------------------------------------------------------------------ 内部工具
+// ------------------------------------------------------------------ internal utilities
 
-/// 剥掉命名空间前缀（命名空间按空串处理）。
+/// Strips the namespace prefix (namespace treated as an empty string).
 ///
-/// `NS1%TopicTest` → `TopicTest`；`%RETRY%NS1%GID_test` → `%RETRY%GID_test`；
-/// 系统资源（`rmq_sys_` / `CID_RMQ_SYS_` 前缀）原样返回。
+/// `NS1%TopicTest` → `TopicTest`; `%RETRY%NS1%GID_test` → `%RETRY%GID_test`;
+/// system resources (`rmq_sys_` / `CID_RMQ_SYS_` prefixes) are returned as-is.
 fn strip_namespace(resource: &str) -> String {
     NamespaceUtil::without_namespace(resource, "")
 }
 
-/// 从 [`crate::client::hook`] 的 `Object` 槽里取回本模块写下的 [`TraceContext`]。
+/// Retrieves the [`TraceContext`] this module stored from the `Object` slot of [`crate::client::hook`].
 fn held_trace_context(holder: &Option<AnyHolder>) -> Option<TraceContext> {
     match any_downcast::<TraceContext>(holder) {
         Some(ctx) => Some(ctx.clone()),
@@ -327,8 +327,8 @@ fn held_trace_context(holder: &Option<AnyHolder>) -> Option<TraceContext> {
     }
 }
 
-/// 交出一条记录，并把它同步回 `mq_trace_context`（调用方读的就是挂在上面的那个对象，
-/// 所以钩子跑完后调用方看到的状态必须是「已填好」的那一份）。
+/// Hands over one record and syncs it back into `mq_trace_context` (the caller reads the object hung there,
+/// so after the hooks run the caller must see the "filled-in" copy).
 fn publish(
     sink: &Arc<dyn TraceReportSink>,
     holder: &mut Option<AnyHolder>,
@@ -338,7 +338,7 @@ fn publish(
     report(sink, context);
 }
 
-/// 交出一条记录（不需要回挂到上下文上时用）。
+/// Hands over one record (for when it does not need to be hung back onto the context).
 fn report(sink: &Arc<dyn TraceReportSink>, context: TraceContext) {
     let type_name = context.trace_type.map(TraceType::name).unwrap_or_default();
     if !sink.report(context) {
@@ -346,7 +346,7 @@ fn report(sink: &Arc<dyn TraceReportSink>, context: TraceContext) {
     }
 }
 
-/// `count` 为 0 在调用方都先判过空，这里再兜一次底，避免除零 panic。
+/// Callers already check for `count` == 0; this is one more fallback so a division by zero cannot panic.
 fn elapsed_per(now: i64, start: i64, count: usize) -> i32 {
     let divisor = i64::try_from(count).unwrap_or(1).max(1);
     ((now - start) / divisor) as i32
@@ -356,12 +356,12 @@ fn half_floor(cost_time: i32) -> i64 {
     i64::from(cost_time.div_euclid(2))
 }
 
-/// [`ConsumeMessageContext::access_channel`] 存的是名字串（见该模块头差异说明 3），
-/// 这里换回 [`AccessChannel`] 交给编码器判断。
+/// [`ConsumeMessageContext::access_channel`] stores a name string (see difference note 3 in that module's header),
+/// converted back to [`AccessChannel`] here for the encoder to judge.
 ///
-/// 该字段本身就是可选的：`None` → 编码器按 LOCAL 处理；
-/// `"CLOUD"` → CLOUD；其它值都不等于 CLOUD，编码效果与 LOCAL 相同 ——
-/// 所以无法识别的名字映射成 `None`，字节输出与线上基准一致。
+/// The field itself is optional: `None` → the encoder treats it as LOCAL;
+/// `"CLOUD"` → CLOUD; every other value differs from CLOUD and encodes the same as LOCAL --
+/// so unrecognized names map to `None`, keeping the byte output identical to the wire baseline.
 fn access_channel_of(name: Option<&str>) -> Option<AccessChannel> {
     match name? {
         "CLOUD" => Some(AccessChannel::Cloud),
@@ -370,9 +370,9 @@ fn access_channel_of(name: Option<&str>) -> Option<AccessChannel> {
     }
 }
 
-/// [`crate::client::result::ConsumeReturnType`] 没有 `from_name`（调用方都持强类型枚举），
-/// 故在本模块内做名字 → 既有枚举的映射，不重复定义枚举；
-/// 未知名返回 `None`，调用方据此保持 `contextCode = 0`。
+/// [`crate::client::result::ConsumeReturnType`] has no `from_name` (callers all hold the strongly typed enum),
+/// so the name → existing-enum mapping is done inside this module instead of redefining the enum;
+/// unknown names return `None`, and the caller keeps `contextCode = 0` accordingly.
 fn consume_return_code(name: &str) -> Option<i32> {
     use crate::client::result::ConsumeReturnType as T;
     let code = match name {
@@ -386,7 +386,7 @@ fn consume_return_code(name: &str) -> Option<i32> {
     Some(code.code())
 }
 
-/// 测试用的记录通道：原样存下钩子交出的 [`TraceContext`]，topic / clientId 可配。
+/// Recording sink for tests: stores the [`TraceContext`] handed over by the hooks as-is; topic / clientId are configurable.
 #[cfg(test)]
 struct RecordingSink {
     trace_topic: String,
@@ -406,7 +406,7 @@ impl RecordingSink {
         }
     }
 
-    /// 总是「拒收」（分发器已停止 / 队列满）的记录通道。
+    /// A recording sink that always "refuses" (dispatcher stopped / queue full).
     fn refusing(trace_topic: &str) -> Self {
         RecordingSink { accept: false, ..Self::new(trace_topic, "10.0.0.9@inst-1#0") }
     }
@@ -463,11 +463,11 @@ mod tests {
     const OFFSET_MSG_ID: &str = "AC1400A1000027100000000000000001";
     const BROKER: &str = "127.0.0.1:10911";
 
-    /// 把 golden 模板里的占位符换成实际值。
+    /// Substitutes the placeholders in the golden template with actual values.
     ///
-    /// 时钟相关的三个数（time_stamp / cost_time / store_time）与 `request_id` 在两侧
-    /// 不可能相同（Rust 用真实时钟 + 随机 uniqId），所以模板里留占位；它们的**取值规则**
-    /// 由 `pub_cost_and_store_time_follows_golden_rules` 等用例单独钉住。
+    /// The three clock-derived numbers (time_stamp / cost_time / store_time) and `request_id` cannot
+    /// possibly match across the two sides (Rust uses the real clock + a random uniqId), so the template keeps placeholders; their **value rules**
+    /// are pinned separately by tests such as `pub_cost_and_store_time_follows_golden_rules`.
     fn render(template: &str, ctx: &TraceContext) -> String {
         let store_time = ctx
             .trace_beans
@@ -492,7 +492,7 @@ mod tests {
         (tb.trans_data.clone(), tb.trans_key.iter().cloned().collect())
     }
 
-    /// 一条 `trans_data` 拆成「记录 -> 字段」。
+    /// Splits one `trans_data` into "records -> fields".
     fn records(encoded: &str) -> Vec<Vec<String>> {
         java_split(encoded, STX)
             .into_iter()
@@ -536,9 +536,9 @@ mod tests {
         }
     }
 
-    /// 一条拉取到的消息。
+    /// One pulled message.
     ///
-    /// 参数表与 golden 用例逐字段一一对应，合并参数会破坏可读性。
+    /// The parameter list mirrors the golden test case field by field; collapsing parameters would hurt readability.
     #[allow(clippy::too_many_arguments)]
     fn ext(
         topic: &str,
@@ -572,7 +572,7 @@ mod tests {
         msg
     }
 
-    /// 固定的一批消费消息（第三条被 `TRACE_ON=false` 挡掉）。
+    /// A fixed batch of consumed messages (the third one is blocked by `TRACE_ON=false`).
     fn scenario_msgs_for_reference_vector() -> Vec<MessageExt> {
         vec![
             ext(
@@ -619,9 +619,9 @@ mod tests {
         )
     }
 
-    // ------------------------------------------------ 发送钩子
+    // ------------------------------------------------ send hooks
 
-    /// Pub 记录金标准（时钟两段留占位）。
+    /// Golden Pub record (the two clock segments left as placeholders).
     const GOLDEN_PUB: &str = "Pub\u{1}{TS}\u{1}DefaultRegion\u{1}GID_test\u{1}TopicTest\
          \u{1}AC1400A1F0A018B4AAC2A1B2C3D4E5F6\u{1}TagA\u{1}KeyA KeyB\u{1}127.0.0.1:10911\
          \u{1}42\u{1}{COST}\u{1}0\u{1}AC1400A1000027100000000000000001\u{1}true\u{2}";
@@ -635,7 +635,7 @@ mod tests {
         assert_eq!(send.hook_name(), "SendMessageTraceHook");
         assert_eq!(consume.hook_name(), "ConsumeMessageTraceHook");
         assert_eq!(end.hook_name(), "EndTransactionTraceHook");
-        // 钩子持有的通道可取回
+        // the channel held by the hook can be retrieved
         assert_eq!(send.sink().trace_topic_name(), TRACE_TOPIC.to_string());
         assert_eq!(consume.sink().client_id(), CLIENT_ID.to_string());
         assert_eq!(end.sink().trace_topic_name(), TRACE_TOPIC.to_string());
@@ -669,7 +669,7 @@ mod tests {
         let (data, keys) = transfer(&emitted);
         assert_eq!(data, render(GOLDEN_PUB, &emitted));
         assert_eq!(keys, vec![MSG_ID.to_string(), "KeyA".to_string(), "KeyB".to_string()]);
-        // 挂在上下文里的那份必须与交出去的那份一致（同一个对象）
+        // the copy hung on the context must equal the one handed over (the same object)
         assert_eq!(held_trace_context(&context.mq_trace_context), Some(emitted));
     }
 
@@ -681,11 +681,11 @@ mod tests {
         hook.send_message_before(&mut context).unwrap();
 
         let held = held_trace_context(&context.mq_trace_context).expect("test-only");
-        assert_eq!(sink.count(), 0, "before 不落库");
+        assert_eq!(sink.count(), 0, "before does not report");
         assert_eq!(held.trace_type, Some(TraceType::Pub));
-        assert_eq!(held.group_name, "GID_test", "producerGroup 剥掉 NS1%");
-        assert_eq!(held.region_id, "", "region 要等 SendResult 回填");
-        assert!(held.is_success, "isSuccess 默认 true");
+        assert_eq!(held.group_name, "GID_test", "producerGroup has NS1% stripped");
+        assert_eq!(held.region_id, "", "region waits for the SendResult to fill it in");
+        assert!(held.is_success, "isSuccess defaults to true");
         assert_eq!(held.cost_time, 0);
         let bean = &held.trace_beans[0];
         assert_eq!(bean.topic, "TopicTest");
@@ -694,10 +694,10 @@ mod tests {
         assert_eq!(bean.store_host, BROKER);
         assert_eq!(bean.body_length, 42);
         assert_eq!(bean.msg_type, MessageType::NormalMsg);
-        assert_eq!(bean.msg_id, "", "msgId 要等 after");
+        assert_eq!(bean.msg_id, "", "msgId waits for after");
         assert_eq!(bean.offset_msg_id, "");
 
-        // 无 tags / keys / body 的裸消息：属性缺失 => 空串
+        // A bare message without tags / keys / body: missing property => empty string
         let mut bare = SendMessageContext {
             message: Some(Message::new("TopicTest", None)),
             ..Default::default()
@@ -713,7 +713,7 @@ mod tests {
 
     #[test]
     fn send_hooks_never_trace_the_trace_topic() {
-        // 普通集群：RMQ_SYS_TRACE_TOPIC
+        // Regular cluster: RMQ_SYS_TRACE_TOPIC
         let sink = Arc::new(RecordingSink::new(TRACE_TOPIC, CLIENT_ID));
         let hook = SendMessageTraceHook::new(sink.clone());
         let mut context = send_context(TRACE_TOPIC);
@@ -723,7 +723,7 @@ mod tests {
         assert!(context.mq_trace_context.is_none());
         assert_eq!(sink.count(), 0);
 
-        // 云集群：rmq_sys_TRACE_DATA_<region>
+        // Cloud cluster: rmq_sys_TRACE_DATA_<region>
         let cloud = Arc::new(RecordingSink::new(CLOUD_TRACE_TOPIC, CLIENT_ID));
         let hook = SendMessageTraceHook::new(cloud.clone());
         let mut context = send_context(CLOUD_TRACE_TOPIC);
@@ -732,8 +732,8 @@ mod tests {
         assert!(context.mq_trace_context.is_none());
         assert_eq!(cloud.count(), 0);
 
-        // 分发器没配 topic（空前缀）时轨迹 topic 前缀判断恒真 =>
-        // 整条轨迹链路关掉
+        // When the dispatcher has no topic configured (empty prefix) the trace-topic prefix check is always true =>
+        // the whole trace path is switched off
         let empty = Arc::new(RecordingSink::new("", CLIENT_ID));
         let hook = SendMessageTraceHook::new(empty.clone());
         let mut context = send_context("TopicTest");
@@ -765,25 +765,25 @@ mod tests {
         result.set_trace_on(false);
         context.send_result = Some(result);
         hook.send_message_after(&mut context).unwrap();
-        assert_eq!(sink.count(), 0, "TRACE_ON=false 不落库");
-        assert!(context.mq_trace_context.is_some(), "上下文里的壳还在");
+        assert_eq!(sink.count(), 0, "TRACE_ON=false does not report");
+        assert!(context.mq_trace_context.is_some(), "the shell on the context is still there");
 
-        // MSG_REGION 缺失
+        // MSG_REGION missing
         let mut context = send_context("TopicTest");
         hook.send_message_before(&mut context).unwrap();
         let mut result = ok_result();
         result.set_region_id(None);
         context.send_result = Some(result);
         hook.send_message_after(&mut context).unwrap();
-        assert_eq!(sink.count(), 0, "MSG_REGION 缺失不落库");
+        assert_eq!(sink.count(), 0, "missing MSG_REGION does not report");
 
-        // 完全没有 sendResult（ONEWAY / 异常路径）
+        // No sendResult at all (ONEWAY / exception path)
         let mut context = send_context("TopicTest");
         hook.send_message_before(&mut context).unwrap();
         hook.send_message_after(&mut context).unwrap();
         assert_eq!(sink.count(), 0);
 
-        // after 之前没跑 before
+        // after without before having run
         let mut context = send_context("TopicTest");
         context.send_result = Some(ok_result());
         hook.send_message_after(&mut context).unwrap();
@@ -816,7 +816,7 @@ mod tests {
         hook.send_message_after(&mut context).unwrap();
 
         let emitted = sink.last().expect("test-only");
-        assert!(!emitted.is_success, "非 SEND_OK => success=false");
+        assert!(!emitted.is_success, "not SEND_OK => success=false");
         let fields = records(&encode(&emitted)).remove(0);
         assert_eq!(fields.len(), 14);
         assert_eq!(fields[0], "Pub");
@@ -828,20 +828,20 @@ mod tests {
 
     #[test]
     fn pub_cost_and_store_time_follows_golden_rules() {
-        // 均摊耗时 (now*1000 - ts) / len(beans) 向零取整；storeTime = ts + cost/2 向下取整
+        // Amortized cost (now*1000 - ts) / len(beans) rounds toward zero; storeTime = ts + cost/2 rounds down
         assert_eq!(elapsed_per(1_700_000_000_042, 1_700_000_000_000, 1), 42);
         assert_eq!(elapsed_per(1_700_000_000_042, 1_700_000_000_000, 2), 21);
         assert_eq!(elapsed_per(1_700_000_000_000, 1_700_000_000_000, 3), 0);
-        // 时钟回拨：向零取整是 -3，向下取整是 -2
+        // Clock skew backwards: rounding toward zero gives -3, rounding down gives -2
         assert_eq!(elapsed_per(1_699_999_999_997, 1_700_000_000_000, 1), -3);
-        assert_eq!(half_floor(-3), -2, "half_floor 向下取整：-3/2 == -2");
+        assert_eq!(half_floor(-3), -2, "half_floor rounds down: -3/2 == -2");
         assert_eq!(half_floor(-4), -2);
         assert_eq!(half_floor(3), 1);
         assert_eq!(half_floor(42000), 21000);
-        // 时钟回拨场景下预期的 storeTime
+        // the expected storeTime under the clock-skew scenario
         assert_eq!(1_700_000_000_000 + half_floor(-3), 1_699_999_999_998);
 
-        // 真实钩子跑完也必须满足同一关系
+        // running the real hook must satisfy the same relation
         let sink = Arc::new(RecordingSink::new(TRACE_TOPIC, CLIENT_ID));
         let hook = SendMessageTraceHook::new(sink.clone());
         let mut context = send_context("TopicTest");
@@ -871,7 +871,7 @@ mod tests {
         assert!(back.trace_beans[0].store_time <= back.time_stamp - 2);
     }
 
-    /// 用同样的取整规则独立重算一遍 storeTime（不依赖钩子内部变量）。
+    /// Recomputes storeTime independently with the same rounding rules (no dependence on hook internals).
     fn render_store(ctx: &TraceContext) -> i64 {
         let cost = ctx.cost_time;
         ctx.time_stamp + if cost >= 0 { (cost / 2) as i64 } else { -(((-cost + 1) / 2) as i64) }
@@ -889,15 +889,15 @@ mod tests {
         assert!(context.mq_trace_context.is_some());
     }
 
-    // ------------------------------------------------ 消费钩子
+    // ------------------------------------------------ consume hooks
 
-    /// SubBefore 两段金标准（时钟 / uniqId 段留占位）。
+    /// Golden SubBefore, two segments (clock / uniqId segments left as placeholders).
     const GOLDEN_SUB_BEFORE: &str = "SubBefore\u{1}{TS}\u{1}cn-shanghai\u{1}GID_test\
          \u{1}{REQ}\u{1}MSGID-1\u{1}0\u{1}KeyA KeyB\
          \u{2}SubBefore\u{1}{TS}\u{1}cn-shanghai\u{1}GID_test\
          \u{1}{REQ}\u{1}MSGID-2\u{1}3\u{1}KeyC\u{2}";
 
-    /// SubAfter 两段金标准（LOCAL 通道，9 字段）。
+    /// Golden SubAfter, two segments (LOCAL channel, 9 fields).
     const GOLDEN_SUB_AFTER: &str = "SubAfter\u{1}{REQ}\u{1}MSGID-1\u{1}{COST}\u{1}false\
          \u{1}KeyA KeyB\u{1}3\u{1}{TS}\u{1}GID_test\
          \u{2}SubAfter\u{1}{REQ}\u{1}MSGID-2\u{1}{COST}\u{1}false\
@@ -935,19 +935,19 @@ mod tests {
         );
         assert_eq!(before.trace_type, Some(TraceType::SubBefore));
         assert_eq!(before.group_name, "GID_test");
-        assert_eq!(before.region_id, "cn-shanghai", "最后一条未跳过的消息说了算");
+        assert_eq!(before.region_id, "cn-shanghai", "the last non-skipped message wins");
         assert!(before.time_stamp > 0);
-        assert_eq!(before.trace_beans.len(), 2, "TRACE_ON=false 的那条不记");
+        assert_eq!(before.trace_beans.len(), 2, "the TRACE_ON=false message is not recorded");
         assert_eq!(before.trace_beans[0].topic, "TopicTest");
         assert_eq!(before.trace_beans[0].store_time, 1_700_000_000_111);
         assert_eq!(before.trace_beans[0].body_length, 100);
-        assert_eq!(before.trace_beans[1].topic, "%RETRY%GID_test", "%RETRY% 前缀保留");
+        assert_eq!(before.trace_beans[1].topic, "%RETRY%GID_test", "the %RETRY% prefix is kept");
         assert_eq!(before.trace_beans[1].retry_times, 3);
         assert_eq!(before.trace_beans[1].body_length, 200);
 
         hook.consume_message_after(&mut context).unwrap();
         let after = sink.last().expect("test-only");
-        assert_eq!(sink.count(), 2, "before / after 各一条");
+        assert_eq!(sink.count(), 2, "one record each for before / after");
         assert_eq!(
             encode(&after),
             render(GOLDEN_SUB_AFTER, &after),
@@ -955,14 +955,14 @@ mod tests {
             encode(&after)
         );
         assert_eq!(after.trace_type, Some(TraceType::SubAfter));
-        assert_eq!(after.request_id, before.request_id, "两条记录共用 request_id");
+        assert_eq!(after.request_id, before.request_id, "the two records share request_id");
         assert_eq!(after.region_id, before.region_id);
         assert_eq!(after.context_code, ConsumeReturnType::ReturnNull.code());
         assert!(!after.is_success);
         assert_eq!(after.access_channel, Some(AccessChannel::Local));
-        assert_eq!(after.trace_beans, before.trace_beans, "beans 与 SubBefore 同源");
+        assert_eq!(after.trace_beans, before.trace_beans, "beans come from the same source as SubBefore");
         assert_eq!(records(&encode(&after)).len(), 2);
-        // 上下文里挂的还是 SubBefore 那一份（after 只新建了 SubAfter）
+        // the context still holds the SubBefore copy (after only created a new SubAfter)
         assert_eq!(
             held_trace_context(&context.mq_trace_context).map(|ctx| ctx.trace_type),
             Some(Some(TraceType::SubBefore))
@@ -976,9 +976,9 @@ mod tests {
         let mut context = consume_context(scenario_msgs_for_reference_vector());
         hook.consume_message_before(&mut context).unwrap();
         let before = sink.last().expect("test-only");
-        assert_eq!(before.trace_beans.len(), 2, "第三条被 TRACE_ON 挡掉");
-        // 把 SubBefore 的时间戳往前拨 3 秒（钩子自己的私有槽，等价于「这批消息
-        // 3 秒前开始消费」），再看 costTime 除的是 3 还是 2
+        assert_eq!(before.trace_beans.len(), 2, "the third message is blocked by TRACE_ON");
+        // Wind the SubBefore timestamp back by 3 seconds (the hook's own private slot; equivalent to "this batch started
+        // consuming 3 seconds ago"), then check whether costTime divides by 3 or by 2
         let mut stale = before.clone();
         stale.time_stamp -= 3000;
         context.mq_trace_context = Some(Arc::new(stale));
@@ -986,7 +986,7 @@ mod tests {
         let after = sink.last().expect("test-only");
         assert!(
             (1000..1200).contains(&after.cost_time),
-            "cost = {} 应是 3000/3，不是 3000/2=1500",
+            "cost = {} should be 3000/3, not 3000/2=1500",
             after.cost_time
         );
     }
@@ -1011,7 +1011,7 @@ mod tests {
             None,
         );
         hook.consume_message_before(&mut context).unwrap();
-        // 云端通道 + 无法识别返回类型的场景，SubBefore 单段
+        // Cloud channel + unrecognized return type; SubBefore is one segment
         assert_eq!(
             encode(&sink.last().expect("test-only")),
             render(
@@ -1028,19 +1028,19 @@ mod tests {
 
         let after = sink.last().expect("test-only");
         assert_eq!(after.access_channel, Some(AccessChannel::Cloud));
-        assert_eq!(after.context_code, 0, "认不出的 ConsumeContextType 保持 0");
+        assert_eq!(after.context_code, 0, "an unrecognized ConsumeContextType keeps 0");
         assert_eq!(
             encode(&after),
             render(
                 "SubAfter\u{1}{REQ}\u{1}MSGID-C\u{1}{COST}\u{1}true\u{1}KeyA\u{1}0\u{2}",
                 &after
             ),
-            "CLOUD 通道不追加 timestamp / groupName 两段"
+            "the CLOUD channel appends no timestamp / groupName segments"
         );
         let fields = records(&encode(&after)).remove(0);
         assert_eq!(fields.len(), 7, "{fields:?}");
 
-        // 名字串无法识别 => 编码效果与 LOCAL 相同（不等于 CLOUD 即是）
+        // unrecognized name string => encodes the same as LOCAL (anything not equal to CLOUD)
         let mut context = ConsumeMessageContext::new(
             "G",
             Some(vec![ext("T", "M", None, None, Some("r"), None, 1, 1, 0)]),
@@ -1053,7 +1053,7 @@ mod tests {
         assert_eq!(after.access_channel, None);
         assert_eq!(records(&encode(&after))[0].len(), 9);
 
-        // props 为 None / 空 map / 没带这个键，contextCode 都是 0
+        // props None / empty map / key absent: contextCode is 0 in all cases
         for props in [None, Some(HashMap::new())] {
             let mut context = ConsumeMessageContext::new(
                 "G",
@@ -1072,14 +1072,14 @@ mod tests {
         let sink = Arc::new(RecordingSink::new(TRACE_TOPIC, CLIENT_ID));
         let hook = ConsumeMessageTraceHook::new(sink.clone());
 
-        // 空 msg_list：before 连壳都不建
+        // empty msg_list: before does not even build the shell
         let mut context = ConsumeMessageContext::new("GID_test", None, None);
         hook.consume_message_before(&mut context).unwrap();
         hook.consume_message_after(&mut context).unwrap();
         assert!(context.mq_trace_context.is_none());
         assert_eq!(sink.count(), 0);
 
-        // 整批都被 TRACE_ON=false 挡掉：壳建了但 beans 为空，两条记录都不落
+        // the whole batch blocked by TRACE_ON=false: the shell is built but beans is empty, neither record reports
         let mut context = ConsumeMessageContext::new(
             "GID_test",
             Some(vec![ext("T", "M", None, None, Some("r"), Some("false"), 1, 1, 0)]),
@@ -1091,9 +1091,9 @@ mod tests {
         assert!(held.trace_beans.is_empty());
         assert_eq!(sink.count(), 0);
         hook.consume_message_after(&mut context).unwrap();
-        assert_eq!(sink.count(), 0, "没有 SubBefore bean 就不该有 SubAfter");
+        assert_eq!(sink.count(), 0, "no SubAfter without a SubBefore bean");
 
-        // after 之前没跑 before
+        // after without before having run
         let mut context = ConsumeMessageContext::new(
             "G",
             Some(vec![ext("T", "M", None, None, Some("r"), None, 1, 1, 0)]),
@@ -1102,8 +1102,8 @@ mod tests {
         hook.consume_message_after(&mut context).unwrap();
         assert_eq!(sink.count(), 0);
 
-        // 消息没有 MSG_REGION 属性 => region 为空串；
-        // 没有 tags / keys => 空串，SubBefore 只剩 7 段（java_split 丢掉末尾空段）
+        // message without the MSG_REGION property => region is an empty string;
+        // no tags / keys => empty strings, SubBefore is left with 7 fields (java_split drops the trailing empty one)
         let mut context = ConsumeMessageContext::new(
             "G",
             Some(vec![ext("T", "M", None, None, None, None, 1, 1, 0)]),
@@ -1125,7 +1125,7 @@ mod tests {
             ("%DLQ%NS1%GID_test", "%DLQ%GID_test"),
             ("NS1%TopicTest", "TopicTest"),
             ("TopicTest", "TopicTest"),
-            // 系统资源不剥（rmq_sys_ 前缀），轨迹 topic 也一样被记录
+            // system resources are not stripped (rmq_sys_ prefix), and the trace topic is recorded like any other
             (CLOUD_TRACE_TOPIC, CLOUD_TRACE_TOPIC),
         ] {
             let mut context = ConsumeMessageContext::new(
@@ -1141,14 +1141,14 @@ mod tests {
         assert_eq!(sink.count(), 5);
     }
 
-    // ------------------------------------------------ 事务收尾钩子
+    // ------------------------------------------------ end-transaction hooks
 
-    /// EndTransaction 记录金标准（时钟段留占位）。
+    /// Golden EndTransaction record (the clock segment left as a placeholder).
     const GOLDEN_END_TX: &str = "EndTransaction\u{1}{TS}\u{1}NS1%cn-hangzhou\u{1}GID_test\
          \u{1}TopicTest\u{1}AC1400A1F0A018B4AAC2A1B2C3D4E5F6\u{1}TagA\u{1}KeyA KeyB\
          \u{1}127.0.0.1:10911\u{1}2\u{1}TRAN-001\u{1}COMMIT_MESSAGE\u{1}true\u{2}";
 
-    /// 第二组 EndTransaction 金标准（region 空 => DefaultRegion、状态 UNKNOW）。
+    /// Second EndTransaction golden record (empty region => DefaultRegion, state UNKNOW).
     const GOLDEN_END_TX_DEFAULT_REGION: &str =
         "EndTransaction\u{1}{TS}\u{1}DefaultRegion\u{1}GID_test\u{1}TopicTest\
          \u{1}AC1400A1F0A018B4AAC2A1B2C3D4E5F6\u{1}TagA\u{1}KeyA KeyB\u{1}127.0.0.1:10911\
@@ -1190,15 +1190,15 @@ mod tests {
         );
         assert_eq!(emitted.trace_type, Some(TraceType::EndTransaction));
         let bean = &emitted.trace_beans[0];
-        assert_eq!(bean.client_host, CLIENT_ID, "clientHost 取分发器的 clientId");
-        assert_eq!(bean.msg_type, MessageType::TransMsgCommit, "msgType 硬编码为 2");
+        assert_eq!(bean.client_host, CLIENT_ID, "clientHost takes the dispatcher's clientId");
+        assert_eq!(bean.msg_type, MessageType::TransMsgCommit, "msgType is hardcoded to 2");
         assert_eq!(bean.transaction_state.as_deref(), Some("COMMIT_MESSAGE"));
         assert_eq!(bean.transaction_id.as_deref(), Some("TRAN-001"));
-        assert!(bean.from_transaction_check, "broker 回查也要记");
+        assert!(bean.from_transaction_check, "broker check-backs are recorded too");
         assert_eq!(bean.store_host, BROKER);
-        assert_eq!(bean.body_length, 0, "EndTransaction 不填 bodyLength");
+        assert_eq!(bean.body_length, 0, "EndTransaction leaves bodyLength empty");
         assert_eq!(bean.store_time, 0);
-        assert_eq!(emitted.region_id, "NS1%cn-hangzhou", "regionId 不剥命名空间");
+        assert_eq!(emitted.region_id, "NS1%cn-hangzhou", "regionId keeps its namespace");
         assert_eq!(emitted.group_name, "GID_test");
     }
 
@@ -1263,7 +1263,7 @@ mod tests {
             ..Default::default()
         };
         hook.end_transaction(&mut context).unwrap();
-        // 云集群下换掉的 topic 同理
+        // same for the swapped topic on a cloud cluster
         let cloud = Arc::new(RecordingSink::new(CLOUD_TRACE_TOPIC, CLIENT_ID));
         let cloud_hook = EndTransactionTraceHook::new(cloud.clone());
         let mut context = EndTransactionContext {
@@ -1271,18 +1271,18 @@ mod tests {
             ..Default::default()
         };
         cloud_hook.end_transaction(&mut context).unwrap();
-        // 没有 message
+        // no message
         let mut context = EndTransactionContext::default();
         hook.end_transaction(&mut context).unwrap();
-        assert_eq!(sink.count(), 0, "轨迹 topic 与无 message 都不记");
+        assert_eq!(sink.count(), 0, "neither the trace topic nor a missing message records anything");
         assert_eq!(cloud.count(), 0);
     }
 
-    // ------------------------------------------------ 通道 / 工具
+    // ------------------------------------------------ channel / utilities
 
     #[test]
     fn hooks_are_shareable_and_records_keep_order() {
-        // 三个钩子都要能塞进 HookList（`Arc<dyn ...Hook>` 要求 Send + Sync）
+        // all three hooks must fit into the HookList (`Arc<dyn ...Hook>` requires Send + Sync)
         let sink = Arc::new(RecordingSink::new(TRACE_TOPIC, CLIENT_ID));
         let send: Arc<dyn SendMessageHook> = Arc::new(SendMessageTraceHook::new(sink.clone()));
         let consume: Arc<dyn ConsumeMessageHook> =
@@ -1351,7 +1351,7 @@ mod tests {
         assert_eq!(access_channel_of(Some("LOCAL")), Some(AccessChannel::Local));
         assert_eq!(access_channel_of(Some("CLOUD")), Some(AccessChannel::Cloud));
         assert_eq!(access_channel_of(Some("cloud")), None);
-        assert_eq!(elapsed_per(1_000, 1_000, 0), 0, "count=0 兜底不 panic");
+        assert_eq!(elapsed_per(1_000, 1_000, 0), 0, "count=0 fallback must not panic");
         assert_eq!(elapsed_per(1_100, 1_000, 0), 100);
     }
 }

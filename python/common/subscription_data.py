@@ -87,10 +87,10 @@ class SubscriptionData:
         return True
 
     def __hash__(self) -> int:
-        # 必须与 __eq__ 配套：Python 定义 __eq__ 后默认 __hash__ 变 None，
-        # SubscriptionData 一旦不可哈希，ConsumerData.subscription_data_set.add()
-        # 会直接抛 TypeError —— 心跳就发不出去（broker 端也就看不到消费者，
-        # rebalance 查不到消费者列表 → 队列分不下来）。
+        # Must be consistent with __eq__: once Python defines __eq__, the default __hash__ becomes None.
+        # If SubscriptionData is unhashable, ConsumerData.subscription_data_set.add() raises TypeError
+        # directly -- then the heartbeat cannot be sent (the broker won't see the consumer, and rebalance
+        # can't find the consumer list -> queues won't be assigned).
         return hash((self.class_filter_mode, self.topic, self.sub_string,
                      self.expression_type,
                      frozenset(self.tags_set or ()),
@@ -137,7 +137,7 @@ class FilterAPI:
 
     @staticmethod
     def build(topic: str, selector):
-        """根据 MessageSelector/expression 构建 SubscriptionData（简化）。"""
+        """Build SubscriptionData from MessageSelector/expression (simplified)."""
         sub_string = None
         expression_type = ExpressionType.TAG
         if selector is not None:

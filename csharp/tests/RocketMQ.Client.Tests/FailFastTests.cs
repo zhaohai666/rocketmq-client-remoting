@@ -1,4 +1,5 @@
-// 用真 socket，不用 MockCluster：要被测的就是"读线程看见 EOF 之后做了什么"。
+// Real sockets, not MockCluster: what is being tested is precisely "what the reader thread
+// does after it sees EOF".
 using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Net;
@@ -12,16 +13,19 @@ namespace RocketMQ.Client.Tests;
 public class FailFastTests
 {
     /// <summary>
-    /// 故意把超时设得比测试本身长一个量级：任何"等到超时才算失败"的实现都会被
-    /// 断言里的耗时上限抓住，而正确的 failFast 路径是毫秒级。
+    /// The timeout is deliberately set an order of magnitude longer than the test itself:
+    /// any implementation that only "fails once the timeout is reached" gets caught by the
+    /// duration bound in the assertion, while the correct failFast path is milliseconds.
     /// </summary>
     private const int LongTimeoutMillis = 30000;
 
     /// <summary>
-    /// 本机假对端：按 totalLength 收完整请求帧，然后按连接序号决定处置方式。
-    /// 前 <c>dropConns</c> 条连接读完一帧就关掉（制造 EOF，且**永不回复**）；之后的连接
-    /// 回 SUCCESS，<c>gated</c> 时等到 <see cref="Release"/> 才回——用于把一条请求
-    /// 精确地停在"已写出、尚在途"的状态。
+    /// A local fake peer: reads a whole request frame by totalLength, then decides what to
+    /// do based on the connection sequence number.
+    /// The first <c>dropConns</c> connections close right after reading a frame (creating
+    /// EOF, and **never replying**); later connections reply SUCCESS, and when
+    /// <c>gated</c> they wait for <see cref="Release"/> before replying -- used to stop a
+    /// request precisely in the "already written, still in flight" state.
     /// </summary>
     private sealed class Peer : IDisposable
     {
@@ -51,7 +55,8 @@ public class FailFastTests
 
         public string Address { get; }
 
-        /// <summary>已完整收到的请求帧数：测试用它等"对端确实收到了"。</summary>
+        /// <summary>The number of request frames fully received: the test uses it to wait
+        /// for "the peer really received it".</summary>
         public int Frames => Volatile.Read(ref _frames);
 
         public int Connections => Volatile.Read(ref _connections);
@@ -75,7 +80,8 @@ public class FailFastTests
             }
         }
 
-        /// <summary>放行 gate 上攒着的回复：请求此刻已经在客户端在途表里。</summary>
+        /// <summary>Releases the replies held at the gate: the request is by now in the
+        /// client's in-flight table.</summary>
         public void Release() => _gate.Set();
 
         private async Task Serve(Socket client, int connIndex)
@@ -103,13 +109,13 @@ public class FailFastTests
 
                     if (drop)
                     {
-                        // 读完就断，绝不回复：读线程只能靠 EOF 判定这条请求永远不会有心跳。
+                        // Closes right after reading, never replies: the reader thread can only conclude from EOF that this request will never get a heartbeat.
                         return;
                     }
 
                     if (_holdForever)
                     {
-                        // 不回复也不关：这条请求只能等调用方自己收口（超时清理或 Shutdown）。
+                        // Neither replies nor closes: this request can only be finalised by the caller itself (timeout cleanup or Shutdown).
                         while (!_disposed)
                         {
                             await Task.Delay(20);
@@ -128,7 +134,7 @@ public class FailFastTests
             }
             catch
             {
-                // 对端先断了，正是要测的形状
+                // The peer disconnected first, which is exactly the shape being tested
             }
             finally
             {
@@ -144,7 +150,7 @@ public class FailFastTests
             }
             catch
             {
-                // 已经断了
+                // already disconnected
             }
 
             client.Dispose();
@@ -188,7 +194,8 @@ public class FailFastTests
         }
     }
 
-    /// <summary>同步调用：连接在响应之前断开，必须**立刻**抛发送失败，而不是等满 30s 超时。</summary>
+    /// <summary>A synchronous call: the connection drops before the response, so it must
+    /// **immediately** throw a send failure instead of waiting out the 30s timeout.</summary>
     [Fact]
     public void InvokeSync_FailsFast_InsteadOfWaitingForTimeout()
     {
@@ -207,7 +214,8 @@ public class FailFastTests
             "failFast must not wait for the invoke timeout, took " + sw.ElapsedMilliseconds + "ms");
     }
 
-    /// <summary>异步回调：同样立刻拿到发送失败，而不是超时。</summary>
+    /// <summary>An async callback: likewise gets the send failure immediately, not a
+    /// timeout.</summary>
     [Fact]
     public void InvokeAsync_ReportsSendFailure_Immediately()
     {
@@ -234,8 +242,9 @@ public class FailFastTests
     }
 
     /// <summary>
-    /// failFast 与清理线程抢同一条 opaque：回调只能投递**一次**。
-    /// 这里刻意把超时设成 200ms，让两条路径真的撞上。
+    /// failFast and the cleanup thread race for the same opaque: the callback may only be
+    /// delivered **once**. The timeout is deliberately set to 200ms so that the two paths
+    /// really collide.
     /// </summary>
     [Fact]
     public void FailFast_CallbackFires_ExactlyOnce()
@@ -246,19 +255,20 @@ public class FailFastTests
         int fired = 0;
         client.InvokeAsync(peer.Address, MakeRequest(), (_, _) => Interlocked.Increment(ref fired), 200);
 
-        // 超时 + 1s 宽限都过去之后，仍然只有一次投递。
+        // Even after the timeout plus 1s of grace, there is still exactly one delivery.
         Thread.Sleep(2500);
         Assert.Equal(1, Volatile.Read(ref fired));
     }
 
     /// <summary>
-    /// 判死一条连接不能牵连别人家的在途请求：另一条连接上尚未应答的请求必须继续等，
-    /// 并且最终拿到它自己的成功响应。
+    /// Killing one connection must not drag down another party's in-flight requests: a
+    /// not-yet-answered request on the other connection must keep waiting and eventually
+    /// receive its own success response.
     /// </summary>
     [Fact]
     public void FailFast_DoesNotTouch_OtherConnections()
     {
-        // 地址 A：收下请求但按住不回复；地址 B：读完就关。两条连接互不相干。
+        // Address A: takes the request but holds the reply; address B: closes right after reading. The two connections are independent.
         using var alive = new Peer(dropConns: 0, gatedReplies: true);
         using var doomed = new Peer();
         using var client = new RemotingClient();
@@ -280,7 +290,7 @@ public class FailFastTests
         WaitUntil(() => Volatile.Read(ref doomedFired) > 0);
         Assert.Equal(1, Volatile.Read(ref doomedFired));
 
-        // 死连接收口的那一刻，活连接上那条请求必须还好好待在途表里。
+        // At the moment the dead connection is finalised, the request on the live connection must still be sitting in the in-flight table.
         Assert.Equal(0, Volatile.Read(ref aliveFired));
         Assert.Null(aliveError);
 
@@ -293,13 +303,15 @@ public class FailFastTests
     }
 
     /// <summary>
-    /// 判死之后**同一个地址**还能建新连接、跑完新请求：连接表必须已经把死连接摘干净，
-    /// 旧读线程的收尾也不能误伤新连接上的在途请求（按 Connection 对象引用认领的意义）。
+    /// After being killed, the **same address** can still open a new connection and finish
+    /// a new request: the connection table must already have the dead one removed, and the
+    /// old reader thread's cleanup must not hurt the new connection's in-flight requests
+    /// (which is the point of claiming by Connection object reference).
     /// </summary>
     [Fact]
     public void AfterFailFast_SameAddress_KeepsWorking()
     {
-        // 第一条连接读完就关，第二条起正常回复 —— 两次请求打到同一个地址。
+        // The first connection closes right after reading, the second onwards replies normally -- both requests hit the same address.
         using var peer = new Peer(dropConns: 1);
         using var client = new RemotingClient();
 
@@ -328,7 +340,8 @@ public class FailFastTests
     }
 
     /// <summary>
-    /// Shutdown 时把在途请求收口：读线程退出前投递回调，调用方不能留下永不结算的回调。
+    /// Shutdown finalises the in-flight requests: the callbacks are delivered before the
+    /// reader thread exits, so the caller is not left with a callback that never settles.
     /// </summary>
     [Fact]
     public void Shutdown_Drains_InFlightRequests()
@@ -355,7 +368,7 @@ public class FailFastTests
         Assert.True(sw.ElapsedMilliseconds < 5000,
             "shutdown must settle in-flight callbacks, took " + sw.ElapsedMilliseconds + "ms");
 
-        // Shutdown 可重复调用，不会补投第二次。
+        // Shutdown can be called repeatedly, it does not deliver a second time.
         client.Shutdown();
         Assert.Equal(1, Volatile.Read(ref fired));
         client.Dispose();

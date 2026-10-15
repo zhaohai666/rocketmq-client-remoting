@@ -1,8 +1,10 @@
-// 拉取过期（expired）处理的离线单测。真机恢复场景见 examples 的 LiveRedelivery（H 段）。
+// Offline unit tests for pull expiry (expired) handling. The real-machine recovery
+// scenario is in the examples' LiveRedelivery (section H).
 //
-// C# 侧的实现差异（不是漏掉，是刻意为之，详见 Consumer.cs 注释）：没有 per-queue 的
-// classic ProcessQueue 对象，所以"这条循环还是不是这把队列的属主"用登记线程的引用相等来判，
-// 停摆 = 盖章超阈值 ∥ 登记的线程已经不在了。
+// The implementation differences on the C# side (not an omission but deliberate, see the
+// comments in Consumer.cs): there is no per-queue classic ProcessQueue object, so "is this
+// loop still the owner of this queue" is decided by reference equality of the registered
+// thread, and stalled = stamped past the threshold OR the registered thread is gone.
 using RocketMQ.Client;
 using RocketMQ.Common;
 using Xunit;
@@ -14,7 +16,8 @@ public class PullExpiredTests
     private const string Group = "GID_pull_expired";
     private const string Topic = "PullExpiredTopic";
 
-    /// <summary>一个"已经跑起来"的消费者的最小替身：只置 _started，不碰网络。</summary>
+    /// <summary>The minimal stand-in for an "already running" consumer: only sets
+    /// _started and does not touch the network.</summary>
     private static DefaultMQPushConsumer NewConsumer()
     {
         var consumer = new DefaultMQPushConsumer(Group);
@@ -27,14 +30,14 @@ public class PullExpiredTests
     [Fact]
     public void PullMaxIdleTime_MatchesLegacyDefault()
     {
-        // 阈值写错方向很安静：调小了会误撤健康队列（白白重投），调大了等于没有自愈。
+        // A threshold in the wrong direction is very quiet: too small withdraws healthy queues (resending for nothing), too large means there is no self-healing at all.
         Assert.Equal(120000L, DefaultMQPushConsumer.PullMaxIdleTimeMillis);
     }
 
     [Fact]
     public void NeverStampedQueue_IsNotStalled()
     {
-        // 线程刚建、还没跑到盖章处（表里没时刻）：不能判停摆，否则队列一分配到就被撤，永远起不来。
+        // The thread was just created and has not reached the stamping point yet (no instant in the table): it must not be judged stalled, otherwise the queue is withdrawn as soon as it is assigned and never gets going.
         var consumer = NewConsumer();
         string key = DefaultMQPushConsumer.OffsetKeyForTest(Mq(0));
         consumer.RegisterLoopForTest(key, alive: true);
@@ -88,7 +91,7 @@ public class PullExpiredTests
     [Fact]
     public void StallJudgementIsPerQueue()
     {
-        // 判据必须逐队列：一把停摆不能把同实例其它队列一起带走。
+        // The criterion must be per queue: one stalled queue must not take the instance's other queues with it.
         var consumer = NewConsumer();
         string stale = DefaultMQPushConsumer.OffsetKeyForTest(Mq(0));
         string healthy = DefaultMQPushConsumer.OffsetKeyForTest(Mq(1));
@@ -106,7 +109,7 @@ public class PullExpiredTests
         var record = Assert.Single(consumer.RetiredQueuesForTest());
         Assert.Equal(stale, record.Key);
         Assert.Equal(0, record.Mq.QueueId);
-        // 健康队列原样留着：换线程等于把在途消息丢弃重投。
+        // A healthy queue stays as is: swapping the thread means discarding in-flight messages and resending them.
         Assert.True(consumer.HasPullLoop(healthy));
         Assert.True(consumer.LastPullAt(healthy) > 0);
 
@@ -116,9 +119,10 @@ public class PullExpiredTests
     [Fact]
     public void SweepRetiresStalledQueueAndClearsEveryTrace()
     {
-        // 撤走的收尾：盖章、线程登记、缓冲、两张位点表全摘掉，
-        // 而已消费位点必须**带着走**（交给调用方持久化）——重建的新循环要从 broker 的位点续拉，
-        // 本地留着旧值会让下一轮把它写回去，位点回退 = 整把队列重投。
+        // The cleanup of a withdrawn queue: the stamp, the thread registration, the buffer and both offset tables are all removed,
+        // while the consumed offset must **be carried along** (handed to the caller for persistence) -- the rebuilt new loop
+        // resumes from the broker's offset, and keeping the old value locally would make
+        // the next round write it back, and an offset rollback means the whole queue is resent.
         var consumer = NewConsumer();
         MessageQueue mq = Mq(0);
         string key = DefaultMQPushConsumer.OffsetKeyForTest(mq);
@@ -144,7 +148,7 @@ public class PullExpiredTests
     [Fact]
     public void RetiringAQueueWithoutAConsumedOffsetDoesNotInventOne()
     {
-        // 从没消费过（表里没位点）就不能持久化 0：写 0 会把 broker 上别的实例推进的位点抹掉。
+        // Never consumed (no offset in the table) must not persist 0: writing 0 would wipe out the offset another instance advanced on the broker.
         var consumer = NewConsumer();
         MessageQueue mq = Mq(3);
         string key = DefaultMQPushConsumer.OffsetKeyForTest(mq);
@@ -174,8 +178,8 @@ public class PullExpiredTests
     [Fact]
     public void SweepIsNoopBeforeStartAndDuringShutdown()
     {
-        // 停机过程中循环本来就陆续退出：这时判停摆会撤掉正常队列、刷一堆假的 [BUG] 日志，
-        // 还会在 Shutdown 已经清表之后再持久化一次位点。
+        // During shutdown the loops exit one by one anyway: judging "stalled" then would withdraw healthy queues, flood the log with false [BUG] entries,
+        // and persist the offsets once more after Shutdown has already cleared the tables.
         var consumer = NewConsumer();
         consumer.SetStartedForTest(false);
         MessageQueue mq = Mq(0);
@@ -213,7 +217,7 @@ public class PullExpiredTests
     [Fact]
     public void ClearRetiredForTestResetsTheRecorder()
     {
-        // 记录表是实例级的；用例之间靠它互不干扰，得能清零。
+        // The registry is instance-level; the cases must not disturb each other, so it has to be resettable.
         var consumer = NewConsumer();
         MessageQueue mq = Mq(0);
         string key = DefaultMQPushConsumer.OffsetKeyForTest(mq);

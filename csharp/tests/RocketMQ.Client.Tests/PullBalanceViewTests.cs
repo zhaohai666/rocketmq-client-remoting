@@ -28,7 +28,8 @@ public class PullBalanceViewTests
         return Encoding.UTF8.GetBytes(sb.ToString());
     }
 
-    /// <summary>已启动的拉模式消费者 + 3 台 broker（路由里每台一个读队列）。</summary>
+    /// <summary>A started pull-mode consumer plus 3 brokers (one read queue each in the
+    /// route).</summary>
     private static DefaultMQPullConsumer Started(MockCluster cluster, string instance,
         string ns = "")
     {
@@ -39,7 +40,7 @@ public class PullBalanceViewTests
         return consumer;
     }
 
-    // ---------------------------------------------------------------- 1. 未启动 / 空 topic
+    // ---------------------------------------------------------------- 1. Not started / empty topic
 
     [Fact]
     public void NotStarted_IsRejectedAsNotRunning()
@@ -65,7 +66,7 @@ public class PullBalanceViewTests
         }
     }
 
-    // ---------------------------------------------------------------- 2. 只拿本实例那一份
+    // ---------------------------------------------------------------- 2. Only this instance's share
 
     [Fact]
     public void Clustering_ReturnsOnlyThisInstancesShare()
@@ -79,10 +80,10 @@ public class PullBalanceViewTests
                 _ => CidBody("peer-cid", self));
 
             List<MessageQueue> mine = consumer.FetchMessageQueuesInBalance(Topic);
-            // 3 队列 / 2 实例：AVG 给排在后面的 self 一份半（broker-2 起）；
-            // 判据只锁「不是全部」+「不含对端的队列」。
+            // 3 queues / 2 instances: AVG gives the self that is sorted later one and a half (from broker-2 on);
+            // the criterion only locks "not all of them" + "contains none of the peer's queues".
             Assert.True(mine.Count > 0 && mine.Count < 3,
-                "本实例只拿到自己那一份，count=" + mine.Count);
+                "this instance only gets its own share, count=" + mine.Count);
             foreach (MessageQueue mq in mine)
             {
                 Assert.Equal(Topic, mq.Topic);
@@ -135,7 +136,7 @@ public class PullBalanceViewTests
         }
     }
 
-    // ---------------------------------------------------------------- 3. 算不动就保留现有分配
+    // ---------------------------------------------------------------- 3. Keep the existing assignment when it cannot be computed
 
     [Fact]
     public void UnknownGroup_KeepsPulledQueuesInsteadOfTakingAll()
@@ -144,8 +145,10 @@ public class PullBalanceViewTests
         DefaultMQPullConsumer consumer = Started(cluster, "bal-keep");
         try
         {
-            // broker 说这个组没人（等价于查不到列表）→ 不能回退成"独占全部队列"，
-            // 否则同组多实例互相重复消费。此时唯一可信的分配状态就是本地记账的那几张。
+            // the broker says nobody is in this group (equivalent to not finding the list) -> it must not fall back to "owning all
+            // the queues", otherwise several instances of the same group consume each other's
+            // messages repeatedly. The only trustworthy assignment state at that point is
+            // the one the local bookkeeping holds.
             cluster.SetReplyBody(RequestCode.GetConsumerListByGroup, _ => CidBody());
             List<MessageQueue> all = consumer.FetchSubscribeMessageQueues(Topic);
             MessageQueue mine = all[2];

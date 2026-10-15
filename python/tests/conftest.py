@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
-"""pytest 公共 fixture：把 python/ 根目录加入 sys.path，
-保证 ``import client`` / ``import common`` / ``import remoting`` 可用。
+"""Shared pytest fixture: adds the python/ root to sys.path so that
+``import client`` / ``import common`` / ``import remoting`` work.
 
-同时把客户端日志钉到临时目录：rocketmq_logging 默认按**当前工作目录**落盘
-（见 python/rocketmq_logging.py 的取舍说明），不钉住的话跑一次测试就会在
-python/logs/rocketmqlogs 里长出日志文件。
+It also pins the client logs to a temporary directory: rocketmq_logging writes to the
+**current working directory** by default (see the trade-off notes in
+python/rocketmq_logging.py); without pinning them, a single test run would grow log
+files under python/logs/rocketmqlogs.
 """
 import os
 import sys

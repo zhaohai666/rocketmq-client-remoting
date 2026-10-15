@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""strip_port_citations.py — 清理七端注释里的跨端出处引用（语言名 / 其他端口路径 / 上游源码行号）。
+"""strip_port_citations.py — - Remove cross-port source citations from comments in all seven ports (language names / other port paths / upstream source line numbers).
 
-只动注释与文档字符串，绝不动代码与普通字符串字面量：
-- 行注释（// 或 #）整段命中 → 行级删除；行尾注释命中 → 只去注释保留代码；
-- /* */ 块注释与三引号文档字符串 → **段落级**处理：段落内任一行命中
-  跨端出处引用就整段删除（避免留下孤儿续行碎片）；无命中的段落原样保留；
-- shebang 安全；删除后整行只剩空白则删行。
+Only touches comments and docstrings; never code or ordinary string literals:
+- A whole-line comment (// or #) that matches -> deleted at line granularity; a trailing comment that matches -> only the comment is removed, keeping the code.
+- /* */ block comments and triple-quoted docstrings -> **paragraph-level** handling: if any line in a
+  paragraph matches a cross-port source citation, the whole paragraph is deleted (to avoid leaving
+  orphaned continuation fragments); paragraphs with no match are kept as-is.
+- shebang-safe; if a line is left with only whitespace after deletion, the line is removed.
 
-命中模式：上游服务端源码包名，加上编译期常量 `TRIGGER_WORDS_RE` 里的触发词
-（一律用 \\b 词边界匹配，天然不误伤形近词）。本端口自己的类名
-（如 cpp 里的 MQClientInstance）不作为触发条件。
+Match pattern: the upstream server source package name, plus trigger words from the compile-time
+constant `TRIGGER_WORDS_RE`
+(all matched with \b word boundaries, so near-identical words are never
+accidentally hit). Class names belonging to this port (e.g. MQClientInstance in cpp) are not triggers.
+(e.g. MQClientInstance in cpp) does not count as a trigger.
 
-用法：python3 scripts/strip_port_citations.py [--dry-run] [paths...]
+Usage: python3 scripts/strip_port_citations.py [--dry-run] [paths...]
 """
 
 from __future__ import annotations
@@ -48,7 +51,7 @@ SKIP_DIR_PARTS = {"__pycache__", "node_modules", "target", "build", "bin", "obj"
 
 
 def scan_line_regions(line: str) -> tuple[int | None, int | None, int | None]:
-    """返回 (line_comment_start, block_open, block_close) —— 不被字符串字面量包住的位置。"""
+    """Return (line_comment_start, block_open, block_close) -- positions not wrapped in a string literal."""
     quote = ""
     i, n = 0, len(line)
     line_comment = None
@@ -79,9 +82,10 @@ def scan_line_regions(line: str) -> tuple[int | None, int | None, int | None]:
 
 
 def clean_line_comment_run(run: list[str], marker: str) -> list[str]:
-    """连续纯行注释按段落分组：命中段整段删除；「夹心」空注释分隔行保留。
+    """Group consecutive pure line comments into paragraphs: a matching paragraph is deleted
+    entirely; "sandwich" separator (blank) comment lines are kept.
 
-    marker="//" 时兼容 `///`、`//!` 等文档注释变体；marker="#" 兼容 `##`。
+    marker="//" also handles doc-comment variants like `///`, `//!`; marker="#" also handles `##`.
     """
     def is_sep(s: str) -> bool:
         body = s.strip()[len(marker):]
@@ -100,14 +104,14 @@ def clean_line_comment_run(run: list[str], marker: str) -> list[str]:
     if para:
         items.append(("para", para))
 
-    # 命中段置空
+    # null out matched paragraphs
     seq: list[tuple[str, object]] = []
     for kind, val in items:
         if kind == "para" and any(TRIGGER_WORDS_RE.search(x) for x in val):
             seq.append((kind, None))
         else:
             seq.append((kind, val))
-    # 分隔行仅在前后都有保留段落时保留
+    # keep separators only when both neighbors are kept paragraphs
     for idx, (kind, val) in enumerate(seq):
         if kind == "sep":
             before = any(k == "para" and v is not None for k, v in seq[:idx])
@@ -131,12 +135,12 @@ def process_c_like(lines: list[str]) -> tuple[list[str], int]:
         line = lines[i]
         line_comment, block_open, block_close = scan_line_regions(line)
 
-        # 1) 块注释开启
+        # 1) block comment opens
         if block_open is not None and (line_comment is None or block_open < line_comment):
-            # 块注释从本行开始；收集到 */ 为止
+            # block comment starts on this line; collect until */
             block_lines: list[str] = []
             if block_close is not None:
-                # 单行块注释：注释整体命中才删
+                # single-line block comment: delete only if the whole comment matches
                 comment_text = line[block_open : block_close + 2]
                 if TRIGGER_WORDS_RE.search(comment_text):
                     changed += 1
@@ -146,13 +150,13 @@ def process_c_like(lines: list[str]) -> tuple[list[str], int]:
                         out.append(head + " " + tail + ("\n" if line.endswith("\n") else ""))
                     elif head or tail:
                         out.append(head + tail + ("\n" if line.endswith("\n") else ""))
-                    # 双空则整行丢弃
+                    # both empty -> drop the whole line
                 else:
                     out.append(line)
                 i += 1
                 continue
-            # 多行块注释 → 收集到 */ 为止；任一行命中则整块删除
-            # （旧版段落级保留定界行，导致 /** 开行上的触发词永远删不掉）
+            # multi-line block comment -> collect until */; delete the whole block if any line matches
+            # (the old paragraph-level kept the delimiter line, so trigger words on the /** opening line could never be deleted)
             j = i + 1
             closed = False
             block_lines.append(line)
@@ -181,7 +185,7 @@ def process_c_like(lines: list[str]) -> tuple[list[str], int]:
             i = j
             continue
 
-        # 2) 行注释 —— 连续的纯注释行先做段落级处理（避免触发行删除后留下孤儿续行）
+        # 2) line comments -- process consecutive pure comment lines at paragraph level first (avoid leaving orphaned continuation lines after line deletion)
         if line_comment is not None and line.strip().startswith("//"):
             k = i
             run: list[str] = []
@@ -198,7 +202,7 @@ def process_c_like(lines: list[str]) -> tuple[list[str], int]:
             i = k
             continue
 
-        # 3) 行尾注释
+        # 3) trailing comment
         if line_comment is not None:
             code, comment = line[:line_comment], line[line_comment:]
             if TRIGGER_WORDS_RE.search(comment):
@@ -206,7 +210,7 @@ def process_c_like(lines: list[str]) -> tuple[list[str], int]:
                 code_r = code.rstrip()
                 if not code_r:
                     i += 1
-                    continue  # 整行丢弃
+                    continue  # drop the whole line
                 out.append(code_r + ("\n" if line.endswith("\n") else ""))
                 i += 1
                 continue
@@ -214,15 +218,15 @@ def process_c_like(lines: list[str]) -> tuple[list[str], int]:
             i += 1
             continue
 
-        # 3) 纯代码行
+        # 3) plain code line
         out.append(line)
         i += 1
     return out, changed
 
 
 def clean_block_paragraphs(block_lines: list[str]) -> list[str]:
-    """多行块注释按段落（连续非装饰空行）分组；命中段落整段删除。"""
-    # 分解每行为 (lead, star, text, raw)
+    """Group multi-line block comments into paragraphs (separated by consecutive non-decorative blank lines); delete a whole paragraph if it matches."""
+    # decompose each line into (lead, star, text, raw)
     def decorate(idx: int, raw: str, keep: bool) -> str:
         if keep:
             return raw
@@ -239,7 +243,7 @@ def clean_block_paragraphs(block_lines: list[str]) -> list[str]:
         core = core.lstrip("*").strip()
         entries.append((raw, core == ""))
 
-    # 段落分组：装饰空行分隔
+    # paragraph grouping: separated by decorative blank lines
     paragraphs: list[list[int]] = []
     cur: list[int] = []
     for idx, (_, blank) in enumerate(entries):
@@ -247,7 +251,7 @@ def clean_block_paragraphs(block_lines: list[str]) -> list[str]:
             if cur:
                 paragraphs.append(cur)
                 cur = []
-            paragraphs.append([idx])  # 空行自成一段
+            paragraphs.append([idx])  # a blank line forms its own paragraph
         else:
             cur.append(idx)
     if cur:
@@ -256,12 +260,12 @@ def clean_block_paragraphs(block_lines: list[str]) -> list[str]:
     keep_lines: list[str] = []
     for para in paragraphs:
         text = "".join(entries[k][0] for k in para)
-        # 空行原样保留
+        # keep blank lines as-is
         if all(entries[k][1] for k in para):
             keep_lines.extend(entries[k][0] for k in para)
             continue
         if TRIGGER_WORDS_RE.search(text):
-            # 整段删除；若段落含块定界符则保留定界符结构
+            # delete the whole paragraph; if it contains block delimiters, keep the delimiter structure
             for k in para:
                 raw = entries[k][0]
                 if "/*" in raw or "*/" in raw:
@@ -272,9 +276,10 @@ def clean_block_paragraphs(block_lines: list[str]) -> list[str]:
 
 
 def _block_becomes_empty(lines: list[str], start: int, end: int, indent_len: int) -> bool:
-    """删除 (start, end) 区间的语句后，其所在块是否会变成空体。
+    """After removing the statement in range (start, end), check whether its enclosing block becomes empty.
 
-    查看 end 之后第一个非空行：缩进比该语句更深 → 块里还有内容；否则块空了。
+    Look at the first non-empty line after end: if its indentation is deeper than the statement, the block
+    still has content; otherwise the block is empty.
     """
     for k in range(end, len(lines)):
         s = lines[k].strip()
@@ -285,7 +290,7 @@ def _block_becomes_empty(lines: list[str], start: int, end: int, indent_len: int
 
 
 def find_py_hash(line: str) -> int | None:
-    """返回行内第一个不被字符串字面量包住的 # 的位置（无则 None）。"""
+    """Return the position of the first # in the line not wrapped in a string literal (None if none)."""
     quote = ""
     i, n = 0, len(line)
     while i < n:
@@ -317,13 +322,13 @@ def process_python(lines: list[str]) -> tuple[list[str], int]:
         line = lines[i]
         stripped = line.strip()
 
-        # 文档字符串
+        # docstring
         if not stripped.startswith("#"):
             triple = line.count('"""') + line.count("'''")
             if triple:
                 delim = '"""' if '"""' in line else "'''"
                 if triple % 2 == 1:
-                    # 多行文档字符串开启：收集到闭合
+                    # multi-line docstring opens: collect until closing
                     j = i + 1
                     block = [line]
                     closed = False
@@ -334,7 +339,7 @@ def process_python(lines: list[str]) -> tuple[list[str], int]:
                             j += 1
                             break
                         j += 1
-                    # 任一行命中 → 整个 docstring 删除（保留定界符或段落会让触发词幸存）
+                    # any line matches -> delete the whole docstring (keeping delimiter or paragraph would let trigger words survive)
                     if any(TRIGGER_WORDS_RE.search(b) for b in block):
                         changed += len(block)
                         lead = line[: line.find(delim)]
@@ -351,7 +356,7 @@ def process_python(lines: list[str]) -> tuple[list[str], int]:
                     out.extend(cleaned)
                     i = j
                     continue
-                # 单行文档字符串：命中 → 整行删除；若它是块唯一内容需补 pass
+                # single-line docstring: on match -> delete the whole line; if it is the block's only content, add pass
                 if TRIGGER_WORDS_RE.search(line):
                     changed += 1
                     lead = line[: line.find(delim)]
@@ -367,7 +372,7 @@ def process_python(lines: list[str]) -> tuple[list[str], int]:
                     i += 1
                     continue
 
-        # 连续纯 # 注释行 → 段落级处理（避免孤儿续行）
+        # consecutive pure # comment lines -> paragraph-level handling (avoid orphaned continuation lines)
         if stripped.startswith("#"):
             k = i
             run: list[str] = []
@@ -383,7 +388,7 @@ def process_python(lines: list[str]) -> tuple[list[str], int]:
             i = k
             continue
 
-        # 行注释（整行 # 或行尾 #）
+        # line comment (whole-line # or trailing #)
         hash_pos = find_py_hash(line)
         if hash_pos is not None:
             code, comment = line[:hash_pos], line[hash_pos:]
@@ -402,10 +407,10 @@ def process_python(lines: list[str]) -> tuple[list[str], int]:
 
 
 def clean_docstring_block(block: list[str], delim: str) -> list[str]:
-    """三引号块按段落分组删除；保留定界符行。"""
+    """Group triple-quoted blocks by paragraph for deletion; keep the delimiter lines."""
     open_line, close_line = block[0], block[-1]
     body = block[1:-1] if len(block) > 2 else []
-    # 单体块："""...""" 同一行重复出现等复杂场景保守跳过
+    # single block: conservatively skip complex cases like """...""" repeated on the same line
     if block[0] is block[-1] or len(block) < 2:
         return block
     kept: list[str] = [open_line]
@@ -414,7 +419,7 @@ def clean_docstring_block(block: list[str], delim: str) -> list[str]:
         if raw.strip() == "":
             if para:
                 if TRIGGER_WORDS_RE.search("".join(para)):
-                    pass  # 整段丢弃
+                    pass  # discard the whole paragraph
                 else:
                     kept.extend(para)
                 para = []

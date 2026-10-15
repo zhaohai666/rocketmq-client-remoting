@@ -6,21 +6,21 @@ import (
 	"testing"
 )
 
-// 参考帧：139 字节 17 段（buildExt 的字段值见下），字节级真值。
+// Reference frame: 139 bytes, 17 segments (field values from buildExt below), byte-level truth.
 const ext139Hex = "0000008BDAA320A7F3307B09000000030000000200000000000000580000000000000400" +
 	"000000000000018BCFE568007F0000010000D4310000018BCFE5687B7F00000100002A9F" +
 	"0000000100000000000000000000000E68656C6C6F20726F636B65746D7109546F706963" +
 	"546573740019544147530154616741024B455953016B657931206B65793202"
 
-// 同一消息去掉 body 后的 100 字节帧（bodyLen=0，属性为空）。
+// The same message with the body stripped: a 100-byte frame (bodyLen=0, empty properties).
 const emptyBodyHex = "00000064DAA320A700000000000000030000000200000000000000580000000000000400" +
 	"000000000000018BCFE568007F0000010000D4310000018BCFE5687B7F00000100002A9F" +
 	"0000000100000000000000000000000009546F706963546573740000"
 
-// msgId = storeHost(ip+port) + commitLogOffset，storeHost=127.0.0.1:10911，offset=1024
+// msgId = storeHost(ip+port) + commitLogOffset; storeHost=127.0.0.1:10911, offset=1024
 const extMsgID = "7F00000100002A9F0000000000000400"
 
-// storeHost=2001:db8::2:10911，offset=64 的 IPv6 msgId。
+// The IPv6 msgId with storeHost=2001:db8::2:10911, offset=64.
 const extMsgIDV6 = "20010DB800000000000000000000000200002A9F0000000000000040"
 
 func unhex(t *testing.T, hex string) []byte {
@@ -110,7 +110,7 @@ func TestDecodeRoundTripAllFields(t *testing.T) {
 	if ext.MsgID != extMsgID {
 		t.Fatalf("msgId %q, want %q", ext.MsgID, extMsgID)
 	}
-	// 默认 IsClient=true：OffsetMsgID 复制 MsgID
+	// Default IsClient=true: OffsetMsgID copies MsgID
 	if ext.OffsetMsgID != extMsgID {
 		t.Fatalf("offsetMsgId %q", ext.OffsetMsgID)
 	}
@@ -148,7 +148,7 @@ func TestFieldOffsets(t *testing.T) {
 
 func TestStoreSizeRespected(t *testing.T) {
 	ext := buildExt()
-	ext.StoreSize = 1 // 小于计算值：按计算值分配
+	ext.StoreSize = 1 // Smaller than the computed value: allocate per the computed value
 	raw, err := EncodeMessageExt(ext, false)
 	if err != nil {
 		t.Fatal(err)
@@ -224,7 +224,7 @@ func TestReadBodyFalseKeepsBodyNil(t *testing.T) {
 	if ext.Body != nil {
 		t.Fatalf("body must stay nil, got %d bytes", len(ext.Body))
 	}
-	// topic 与属性照常解出
+	// topic and properties decode as usual
 	if ext.Topic != "TopicTest" {
 		t.Fatalf("topic %q", ext.Topic)
 	}
@@ -253,7 +253,7 @@ func TestCheckCRCDetectsCorruption(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 固定头 68 + 两个 IPv4 地址 16 = 84，body 再往后 4 字节长度前缀
+	// Fixed header 68 + two IPv4 addresses 16 = 84; the body follows a 4-byte length prefix
 	if headerWithoutBodyLen != 68 {
 		t.Fatalf("header const %d", headerWithoutBodyLen)
 	}
@@ -264,7 +264,7 @@ func TestCheckCRCDetectsCorruption(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "crc") {
 		t.Fatalf("expected crc error, got %v", err)
 	}
-	// 不校验 CRC 时照样能解开（body 已是坏数据）
+	// Decodes fine without CRC checking (the body is already corrupt)
 	if _, err := DecodeMessage(raw); err != nil {
 		t.Fatal(err)
 	}
@@ -290,7 +290,7 @@ func TestEmptyBodyFrameDecodes(t *testing.T) {
 	if ext.MsgID != extMsgID {
 		t.Fatalf("msgId %q", ext.MsgID)
 	}
-	// 该帧也能由 encode 产出（body=nil 走空 body）
+	// This frame can also be produced by encode (body=nil yields empty body)
 	ext2 := buildExt()
 	ext2.Body = nil
 	ext2.BodyCRC = 0
@@ -371,7 +371,7 @@ func buildV2Frame(t *testing.T, body []byte, topic, props string, sysFlag int32)
 }
 
 func TestV2FrameDecodes(t *testing.T) {
-	topic := strings.Repeat("T", 200) // v1 的 1 字节 topic 长度放不下，必须走 v2
+	topic := strings.Repeat("T", 200) // v1's 1-byte topic length cannot hold this, must use v2
 	body := []byte("batch-body")
 	props := "TAGS\x01TagB\x02"
 	frame := buildV2Frame(t, body, topic, props, 0)
@@ -417,7 +417,7 @@ func TestV2FrameDecompressesBody(t *testing.T) {
 	if string(ext.GetBody()) != string(payload) {
 		t.Fatalf("body not decompressed: %d bytes", len(ext.GetBody()))
 	}
-	// 解压后 COMPRESSED 位清除，类型位保留
+	// After decompression the COMPRESSED bit is cleared, the type bit is kept
 	if IsCompressed(ext.SysFlag) {
 		t.Fatal("compressed flag must be cleared")
 	}
@@ -455,7 +455,7 @@ func TestIPv6HostsRoundTrip(t *testing.T) {
 	if got.BornHost != "2001:db8::1" || got.StoreHost != "2001:db8::2" {
 		t.Fatalf("hosts: %s / %s", got.BornHost, got.StoreHost)
 	}
-	// 该帧自己的 offset=1024：v6 msgId 与 v4 同构
+	// This frame's own offset=1024: the v6 msgId has the same shape as v4
 	want := CreateMessageID(mustAddr(t, "2001:db8::2", 10911, true), 1024)
 	if got.MsgID != want || !strings.HasSuffix(want, "0000000000000400") {
 		t.Fatalf("msgId %q, want %q", got.MsgID, want)
@@ -467,7 +467,7 @@ func TestIPHelpers(t *testing.T) {
 	if err != nil || len(v4) != 4 || v4[0] != 127 {
 		t.Fatalf("v4: %v %v", v4, err)
 	}
-	// v4 地址带 v6=true：v4-mapped
+	// v4 address with v6=true: v4-mapped
 	mapped, err := IPToBytes("127.0.0.1", true)
 	if err != nil || len(mapped) != 16 {
 		t.Fatalf("mapped: %v %v", mapped, err)
@@ -531,7 +531,7 @@ func TestMessageBytesSizeMatchesEncode(t *testing.T) {
 	if size != len(raw) || size != 139 {
 		t.Fatalf("size %d, encoded %d", size, len(raw))
 	}
-	// v6 主机地址：每侧 20 字节，共 +24
+	// v6 host addresses: 20 bytes each side, +24 total
 	ext.SysFlag = MessageSysFlagBornhostV6 | MessageSysFlagStorehostV6
 	raw, err = EncodeMessageExt(ext, false)
 	if err != nil {
@@ -571,7 +571,7 @@ func TestPropertiesStringRoundTripAndDrops(t *testing.T) {
 	if v, ok := one.Get("k"); !ok || v != "v" {
 		t.Fatalf("k = %q %v", v, ok)
 	}
-	// WAIT 空值是「非法片段」，会被丢掉
+	// WAIT with an empty value is an "illegal segment" and gets dropped
 	wait := NewStringMap()
 	wait.Put(PropertyWaitStoreMsgOK, "")
 	rawWait := MessageProperties2String(wait)
@@ -581,7 +581,9 @@ func TestPropertiesStringRoundTripAndDrops(t *testing.T) {
 	if String2MessageProperties(rawWait).Len() != 0 {
 		t.Fatal("empty WAIT value must be dropped")
 	}
-	// unicode 往返
+	// unicode round trip (non-ASCII key/value with an embedded space: FIXTURE,
+	// kept as-is on purpose — the test proves arbitrary UTF-8 survives the
+	// properties serialization byte-for-byte)
 	cjk := NewStringMap()
 	cjk.Put("中文键", "中文值 带空格")
 	if !String2MessageProperties(MessageProperties2String(cjk)).Equal(cjk) {

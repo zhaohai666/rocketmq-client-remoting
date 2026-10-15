@@ -1,15 +1,18 @@
 # -*- coding: utf-8 -*-
-"""命名空间工具（资源名的 namespace 前缀处理）。
+"""Namespace utilities (handling the namespace prefix of resource names).
 
-命名空间用于多租户隔离：客户端把 ``namespace`` 以 ``namespace%`` 前缀拼到
-topic / group 上再发给 broker，从 broker 拿到的资源名在交给上层（listener、
-admin 结果）之前再剥掉前缀。
+A namespace is used for multi-tenant isolation: the client prefixes topic / group with
+``namespace%`` before sending them to the broker, and strips the prefix off the
+resource names coming back from the broker before handing them to the upper layers
+(listeners, admin results).
 
-线上契约（勿凭直觉改）：
-- 分隔符是 ``%``（不是 ``/`` 也不是 ``:``）。
-- ``%RETRY%`` / ``%DLQ%`` 前缀**在**命名空间之外：``%RETRY%NS%GID``。
-  因此剥/拼都要先把 retry/DLQ 前缀摘下来处理，再拼回去。
-- 系统资源（``rmq_sys_`` 前缀 topic、``CID_RMQ_SYS_`` 前缀 group）**不**加命名空间。
+The on-the-wire contract (do not change it on intuition):
+- The separator is ``%`` (neither ``/`` nor ``:``).
+- The ``%RETRY%`` / ``%DLQ%`` prefixes sit **outside** the namespace:
+  ``%RETRY%NS%GID``. So both stripping and prepending must first take the retry/DLQ
+  prefix off, handle it, and then put it back.
+- System resources (topics prefixed with ``rmq_sys_``, groups prefixed with
+  ``CID_RMQ_SYS_``) get **no** namespace.
 """
 from __future__ import annotations
 
@@ -19,11 +22,11 @@ NAMESPACE_SEPARATOR = "%"
 
 
 class NamespaceUtil:
-    """命名空间资源名工具（仅客户端用到的部分）。"""
+    """Utilities for namespaced resource names (only the parts used by the client)."""
 
     @staticmethod
     def with_out_retry_and_dlq(resource: str) -> str:
-        """摘掉 retry/DLQ 前缀。"""
+        """Strip the retry/DLQ prefix."""
         return MixAll.reset_retry_and_dlq_topic(resource)
 
     @staticmethod
@@ -49,10 +52,11 @@ class NamespaceUtil:
 
     @staticmethod
     def without_namespace(resource_with_namespace: str, namespace: str = "") -> str:
-        """剥掉命名空间前缀（显式指定 namespace 与自动探测两种用法）。
+        """Strip the namespace prefix (supports both an explicitly given namespace and
+        automatic detection).
 
-        ``MQ_INST_XX%Topic`` → ``Topic``；``%RETRY%MQ_INST_XX%GID`` → ``%RETRY%GID``。
-        未带该命名空间时原样返回。
+        ``MQ_INST_XX%Topic`` -> ``Topic``; ``%RETRY%MQ_INST_XX%GID`` -> ``%RETRY%GID``.
+        The value is returned unchanged when it does not carry that namespace.
         """
         if not resource_with_namespace:
             return resource_with_namespace
@@ -75,7 +79,7 @@ class NamespaceUtil:
 
     @staticmethod
     def wrap_namespace(namespace: str, resource_without_namespace: str) -> str:
-        """拼上命名空间前缀。"""
+        """Prepend the namespace prefix."""
         if not namespace or not resource_without_namespace:
             return resource_without_namespace
         if NamespaceUtil.is_system_resource(resource_without_namespace):
@@ -100,7 +104,7 @@ class NamespaceUtil:
 
     @staticmethod
     def get_namespace_from_resource(resource: str) -> str:
-        """从资源名里取出命名空间。"""
+        """Extract the namespace out of a resource name."""
         if not resource or NamespaceUtil.is_system_resource(resource):
             return ""
         plain = NamespaceUtil.with_out_retry_and_dlq(resource)

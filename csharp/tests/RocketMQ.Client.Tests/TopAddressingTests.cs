@@ -1,4 +1,5 @@
-// 动态 name server（DefaultTopAddressing）单测 —— 本地 HttpListener mock，不依赖外网。
+// Unit tests for the dynamic name server (DefaultTopAddressing) -- a local HttpListener
+// mock, no dependency on the public internet.
 using System;
 using System.Collections.Generic;
 using System.Threading;
@@ -16,7 +17,7 @@ public class TopAddressingTests : IDisposable
 
     public TopAddressingTests()
     {
-        // MQClientInstance 内部自建 TopAddressing（构造时读 env），用环境变量注入 mock 地址服务器
+        // MQClientInstance builds a TopAddressing internally (it reads env at construction), so the mock address server is injected via an environment variable
         Environment.SetEnvironmentVariable("ROCKETMQ_NAMESRV_DOMAIN", "127.0.0.1:" + _server.Port);
     }
 
@@ -26,7 +27,7 @@ public class TopAddressingTests : IDisposable
         Environment.SetEnvironmentVariable("ROCKETMQ_NAMESRV_DOMAIN", null);
     }
 
-    // ------------------------------------------------ URL 构造
+    // ------------------------------------------------ URL construction
 
     [Fact]
     public void GetWsAddrAppendsDefaultPort()
@@ -74,7 +75,7 @@ public class TopAddressingTests : IDisposable
     public void ClearNewLineTrimsOnly()
         => Assert.Equal("a:9876", DefaultTopAddressing.ClearNewLine("  a:9876  "));
 
-    // ------------------------------------------------ 取址行为
+    // ------------------------------------------------ Address fetching behaviour
 
     [Fact]
     public void FetchReturnsClearedBodyOn200()
@@ -103,7 +104,7 @@ public class TopAddressingTests : IDisposable
     [Fact]
     public void NoDomainMeansDisabled()
     {
-        // 显式传空串 domain（"?? env" 只在 null 时回退）→ 动态取址关闭
+        // explicitly passing an empty string domain ("?? env" only falls back on null) -> dynamic fetching is off
         var ta = new DefaultTopAddressing(domain: string.Empty);
         Assert.Equal(string.Empty, ta.WsAddr);
         Assert.Null(ta.FetchNsAddr());
@@ -115,13 +116,13 @@ public class TopAddressingTests : IDisposable
         _server.Status = 200;
         _server.Body = "127.0.0.1:9876";
         var ta = Top();
-        Assert.Equal("127.0.0.1:9876", ta.FetchAndApply());   // 第一次：变化 → 应用
-        Assert.Null(ta.FetchAndApply());                      // 相同 → 不应用
+        Assert.Equal("127.0.0.1:9876", ta.FetchAndApply());   // first time: changed -> applied
+        Assert.Null(ta.FetchAndApply());                      // same -> not applied
         _server.Body = "10.0.0.9:9876";
-        Assert.Equal("10.0.0.9:9876", ta.FetchAndApply());    // 变了 → 应用
+        Assert.Equal("10.0.0.9:9876", ta.FetchAndApply());    // changed -> applied
     }
 
-    // ------------------------------------------------ 实例集成
+    // ------------------------------------------------ Instance integration
 
     [Fact]
     public void StartWithStaticAddrsNeverFetches()
@@ -129,10 +130,10 @@ public class TopAddressingTests : IDisposable
         _server.Status = 200;
         _server.Body = "127.0.0.1:9876";
         using var mqc = new MQClientInstance("c@dotnetdyn", new[] { "127.0.0.1:9876" });
-        mqc.TopAddressing.GetType();   // no-op 引用
+        mqc.TopAddressing.GetType();   // a no-op reference
         mqc.Start();
         mqc.Shutdown();
-        Assert.Equal(0, _server.HitCount);   // 配了静态地址就不该问地址服务器
+        Assert.Equal(0, _server.HitCount);   // with a static address configured it must not ask the address server
     }
 
     [Fact]
@@ -170,8 +171,9 @@ public class TopAddressingTests : IDisposable
 
     // ------------------------------------------------ mock server
 
-    /// <summary>极简地址服务器：TcpListener 手写 HTTP/1.0 应答。
-    /// （HttpListener 在 macOS 上启停一次要 ~10s，单元测试里不可用。）</summary>
+    /// <summary>A minimal address server: a hand-written HTTP/1.0 response over
+    /// TcpListener. (HttpListener needs ~10s to start and stop on macOS, which is
+    /// unusable in a unit test.)</summary>
     private sealed class HttpListenerMock : IDisposable
     {
         private readonly System.Net.Sockets.TcpListener _listener;
@@ -208,12 +210,12 @@ public class TopAddressingTests : IDisposable
                 }
                 catch
                 {
-                    return;   // listener 已关
+                    return;   // the listener is already closed
                 }
                 using (client)
                 using (var stream = client.GetStream())
                 {
-                    // 读请求头（到空行为止），取请求行里的 path
+                    // read the request headers (up to the blank line), take the path from the request line
                     var buf = new byte[4096];
                     int total = 0, n;
                     while ((n = stream.Read(buf, total, buf.Length - total)) > 0)

@@ -1,6 +1,7 @@
-// 这两个偏差在真机上都只表现为「慢」：没有异常、没有缺字段，只有「新 topic 的路由要等
-// 半分钟才刷新」这种没人会去计时的现象。所以这里用 MockCluster 记录
-// GET_ROUTEINFO_BY_TOPIC 的**到达时刻**（WireRecord.ArrivalMs），把节奏钉死。
+// Both of these deviations only show up as "slowness" on a real machine: no exception, no
+// missing field, only phenomena like "the route of a new topic takes half a minute to
+// refresh" that nobody is going to time. So MockCluster is used here to record the
+// **arrival instant** of GET_ROUTEINFO_BY_TOPIC (WireRecord.ArrivalMs) and pin the cadence.
 using RocketMQ.Client;
 using RocketMQ.Common;
 using RocketMQ.Remoting.Protocol;
@@ -28,7 +29,7 @@ public class ScheduledIntervalsTests
         var admin = new DefaultMQAdminExt("sched_admin_default");
         Assert.Equal(30000, admin.PollNameServerIntervalMillis);
 
-        // setter 生效（不是只读的装饰）
+        // the setter takes effect (it is not a read-only decoration)
         producer.PollNameServerIntervalMillis = 700;
         consumer.PollNameServerIntervalMillis = 1500;
         consumer.PersistConsumerOffsetIntervalMillis = 250;
@@ -86,10 +87,12 @@ public class ScheduledIntervalsTests
     }
 
     /// <summary>
-    /// 路由刷新的节奏：首跳落在 10ms 的 initialDelay（旧写法是 initialDelay + 一个周期），
-    /// 之后按构造时传入的 pollNameServerInterval 重复。
+    /// The cadence of route refresh: the first hop lands on a 10ms initialDelay (the old
+    /// form was initialDelay plus one period), after which it repeats at the
+    /// pollNameServerInterval passed to the constructor.
     ///
-    /// 阈值取 period/2：理想首跳是 10ms 加一次本机建连，只有顺序错了才会翻倍到一个周期。
+    /// The threshold takes period/2: the ideal first hop is 10ms plus one local connect,
+    /// and only a wrong order doubles it to a whole period.
     /// </summary>
     [Fact]
     public void RouteRefreshFirstTickLandsAtInitialDelayThenFollowsThePeriod()
@@ -122,8 +125,10 @@ public class ScheduledIntervalsTests
             $"third tick must follow the configured period {periodMillis}ms, gap={gap2}ms");
     }
 
-    /// 这条只能在真集群上验「位点真的写到了 broker 且节奏正确」（examples/LiveScheduledIntervals），
-    /// 离线这一层只能锁「周期字段被读到」——循环体本身要先把位点表喂上数据才会发请求。
+    /// This one can only verify on a real cluster that "the offset really reached the broker
+    /// with the right cadence" (examples/LiveScheduledIntervals); offline this layer can
+    /// only lock "the period field was read" -- the loop body itself has to be fed offset
+    /// table data before it sends a request.
     /// </summary>
     [Fact]
     public void PersistIntervalIsReadableAndConfigurable()

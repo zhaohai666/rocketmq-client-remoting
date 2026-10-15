@@ -1,15 +1,16 @@
-// 跨语言互操作工具：与 Python 侧进程互换帧字节、逐字节交叉验证。
+// Cross-language interop tool: exchanges frame bytes with the Python-side process and cross-verifies them byte by byte.
 //
-// 用法（由 Program 以 "interop <mode> [args...]" 形式调用）：
-//   rmq interop --emit                 打印规范命令的 JSON / ROCKETMQ 两种编码（十六进制）
-//   rmq interop --decode <hex>         解码给定十六进制帧并打印字段（供 Python -> C# 验证）
-//   rmq interop --emit-route           打印规范 TopicRouteData 的 JSON
-//   rmq interop --emit-heartbeat       打印规范 HeartbeatData 的 JSON
-//   rmq interop --decode-route <hex>   按 TopicRouteData 解码 hex(body)，回吐重序列化 JSON
-//   rmq interop --decode-heartbeat <hex>  按 HeartbeatData 解码 hex(body)，回吐重序列化 JSON
+// Usage (called by Program in the form "interop <mode> [args...]"):
+//   rmq interop --emit    prints the JSON / ROCKETMQ encodings of a canonical command (hex)
+//   rmq interop --decode <hex>  decodes a given hex frame and prints the fields (for Python -> C# verification)
+//   rmq interop --emit-route    prints the JSON of a canonical TopicRouteData
+//   rmq interop --emit-heartbeat  prints the JSON of a canonical HeartbeatData
+//   rmq interop --decode-route <hex> decodes hex(body) as TopicRouteData and prints the re-serialised JSON
+//   rmq interop --decode-heartbeat <hex> decodes hex(body) as HeartbeatData and prints the re-serialised JSON
 //
-// "解码后重新序列化再交给 Python 用 json.loads 比对"这种形式，
-// 能把"字段名不一致"暴露成缺失键，而不是靠字符串相等这种脆弱断言。
+// The form "decode, re-serialise and hand it to Python to compare with json.loads" turns
+// "a field name that does not match" into a missing key, instead of relying on string
+// equality which is a brittle assertion.
 using System;
 using System.Text;
 using RocketMQ.Client;
@@ -18,10 +19,10 @@ using RocketMQ.Remoting.Protocol;
 
 namespace RocketMQ.Examples;
 
-/// <summary>跨语言协议字节互操作（与 Python 侧进程互换规范帧字节）。</summary>
+/// <summary>Cross-language protocol byte interop (exchanging canonical frame bytes with the Python-side process).</summary>
 internal static class InteropTool
 {
-    // 规范命令（两侧必须一致）：
+    // The canonical command (both sides must agree):
     //   code=10, language=1(CPP), opaque=7, version=0, flag=0,
     //   remark="hello", extFields{topic=T_TEST, queueId=2}, body="payload"
     private const int CanonicalCode = 10;
@@ -89,7 +90,7 @@ internal static class InteropTool
         return cmd;
     }
 
-    // ---------------- --emit-* 规范数据 ----------------
+    // ---------------- the --emit-* canonical data ----------------
 
     private static TopicRouteData CanonicalRoute()
     {

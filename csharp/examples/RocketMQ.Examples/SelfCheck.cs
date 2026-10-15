@@ -1,4 +1,4 @@
-// 协议编解码自检：不依赖集群，验证「编码 → 解码」闭环与关键常量。
+// Protocol codec self-check: no cluster dependency, verifying the "encode -> decode" loop and the key constants.
 using System;
 using System.Text;
 using RocketMQ.Client;
@@ -7,7 +7,8 @@ using RocketMQ.Remoting.Protocol;
 
 namespace RocketMQ.Examples;
 
-/// <summary>本地自检：HEART_BEAT / GET_MAX_OFFSET 命令头 + MessageExt 存储格式三方编解码闭环。</summary>
+/// <summary>A local self-check: a three-way codec loop over the HEART_BEAT / GET_MAX_OFFSET
+/// command headers plus the MessageExt storage format.</summary>
 internal static class SelfCheck
 {
     public static int Run()
@@ -22,7 +23,7 @@ internal static class SelfCheck
             Console.WriteLine("[" + (ok ? "PASS" : "FAIL") + "] " + name);
         }
 
-        // 1) HEART_BEAT 命令头（JSON 序列化）编码 → 解码闭环
+        // 1) HEART_BEAT command header (JSON serialisation) encode -> decode loop
         RemotingCommand hb = RemotingCommand.CreateRequestCommand(RequestCode.HeartBeat);
         hb.AddExtField("clientID", "127.0.0.1@10911");
         byte[] wire = hb.Encode();
@@ -34,7 +35,7 @@ internal static class SelfCheck
         Console.WriteLine("decoded  : " + dec.ToString());
         Check("HEART_BEAT json round-trip", ok1);
 
-        // 2) GET_MAX_OFFSET 命令头（ROCKETMQ 二进制序列化）编码 → 解码闭环
+        // 2) GET_MAX_OFFSET command header (ROCKETMQ binary serialisation) encode -> decode loop
         RemotingCommand req2 = RemotingCommand.CreateRequestCommand(RequestCode.GetMaxOffset);
         req2.SerializeTypeCurrentRpc = SerializeType.Rocketmq;
         req2.AddExtField("topic", "TBW102");
@@ -44,7 +45,7 @@ internal static class SelfCheck
                    && dec2.GetExtField("topic") == "TBW102";
         Check("GET_MAX_OFFSET rocketmq-binary round-trip", ok2);
 
-        // 3) MessageExt 17 段存储格式：编码 → 解码闭环
+        // 3) The 17-field MessageExt storage format: encode -> decode loop
         var m = new MessageExt
         {
             Topic = "SELF_CHECK",

@@ -136,9 +136,9 @@ export class MQClient {
   // adjustThreadPool task: every 1 minute every
   // consumer of this instance is offered a pool-size adjustment decision.
   _adjustThreadPoolTimer: NodeJS.Timeout | null;
-  // 名字服务粘性/轮换语义：上次应答过的 NS 粘住
-  // 优先复用；失效才从它后面一台轮换。没有这个粘性 + 轮换，多 NS 挂一台时
-  // 每次路由拉取都纯随机单挑 —— 撞上死的那台整个调用直接失败。
+  // Nameserver sticky/round-robin semantics: reuse the last NS that answered.
+  // Prefer it; only fall back to the next one when it fails. Without this stickiness + rotation,
+  // when one of several NS is down every route fetch would pick randomly and fail on the dead one.
   _namesrvChosen: string | null;
   _running: boolean;
   private _facadeProcessors: Map<number, FacadeProcessor[]>;
@@ -212,11 +212,12 @@ export class MQClient {
     return list[Math.floor(Math.random() * list.length)];
   }
 
-  // Nameserver 调用的粘性/轮换：上次应答过的 NS（_namesrvChosen）粘住优先；
-  // 它没被配置过/失效了，就从随机位
-  // 开始把**整张列表轮一遍**，谁先应答谁当选并粘住。多 NS 挂一台时，旧实现
-  // （纯随机单挑一次）撞上死的那台整个路由拉取直接失败 —— 3 台挂 1 台就是
-  // ~33% 的调用死，新进程首拉路由撞死即表现为 "no route info"/消费 0 超时。
+  // Nameserver call stickiness/rotation: the last NS that answered (_namesrvChosen) is preferred;
+  // if it was never configured or has failed, start from a random position and
+  // walk the **entire list**, electing the first one to answer and sticking to it. When one of several
+  // NS is down, the old implementation (a single random pick) hit the dead one and the whole route
+  // fetch failed — with 3 up and 1 down that was ~33% of calls dead, and a fresh process hitting the dead
+  // one on its first route fetch showed up as "no route info" / zero-consumption timeouts.
   private async _invokeSyncNameServer(request: RemotingCommand, timeoutMillis: number): Promise<RemotingCommand> {
     const list = this.nameServerAddrList;
     if (list.length === 0) throw new MQClientException('No name server address, please set it first.');
@@ -231,7 +232,7 @@ export class MQClient {
         return resp;
       } catch (e) {
         lastErr = e instanceof Error ? e : new Error(String(e));
-        // 当选的那台死了：摘掉粘性，下一轮从列表下一台重新开始
+        // The elected one died: drop stickiness so the next round restarts from the next server in the list.
         if (this._namesrvChosen === ns) this._namesrvChosen = null;
         logger.warn('name server %s unreachable (%s), trying next', ns, lastErr.message);
       }
@@ -290,11 +291,14 @@ export class MQClient {
     const realTopic = isDefault ? MixAll.DEFAULT_TOPIC : topic;
     const request = RemotingCommand.createRequestCommand(RequestCode.GET_ROUTEINFO_BY_TOPIC, null);
     request.addExtField('topic', realTopic);
-    // NS 故障切换在 _invokeSyncNameServer 内做（轮换全部 NS，见其注释）；
-    // 这里只区分「可达的 NS 明确说 topic 不存在」与「全部 NS 不可达」：
-    // 前者返回 false（不自动兜底 TBW102），后者把异常抛给调用方 ——
-    // 抛出去的异常带着最后一个 NS 的失败原因（连接拒绝/TLS 握手失败…），
-    // 生产者/消费者把它挂在自己的路由错误上，不再黑盒成 "No route info"。
+    // NS failover happens inside _invokeSyncNameServer (it rotates through all
+    // NS, see its comment); here we only distinguish "a reachable NS explicitly
+    // says the topic does not exist" from "no NS is reachable": the former
+    // returns false (no automatic TBW102 fallback), the latter rethrows to the
+    // caller — the thrown exception carries the last NS's failure reason
+    // (connection refused / TLS handshake failure...), and producers/consumers
+    // attach it to their own route error instead of black-boxing it as
+    // "No route info".
     const response = await this._invokeSyncNameServer(request, 3000);
     const code = response.code;
     if (code === ResponseCode.SUCCESS) {
@@ -911,10 +915,12 @@ export class MQClient {
   getRegisteredConsumers(): Map<string, any> { return this.consumerTable; }
   getRegisteredProducers(): Map<string, any> { return this.producerTable; }
 
-  // ---- 门面级反向请求处理器（共享实例的多播） ----
-  // 门面把反向请求处理器登记到实例（共享实例下按登记人数扇出，不互相覆盖）。
-  // 注意：同一个 code 不要混用 remotingClient.registerProcessor 直连槽 —— 直连
-  // 会顶掉这里的分发器。实例自带的 39/326 处理器同样经由这里登记。
+  // ---- facade-level reverse-request processors (shared-instance multicast) ----
+  // Facades register reverse-request processors on the instance (under a shared
+  // instance they fan out by registration count and never overwrite each other).
+  // Note: do NOT mix remotingClient.registerProcessor direct slots under the
+  // same code — a direct slot would displace the dispatcher here. The
+  // instance's built-in 39/326 processors are registered through here as well.
   registerFacadeProcessor(requestCode: number, handler: FacadeProcessor): void {
     let list = this._facadeProcessors.get(requestCode);
     if (list == null) {
@@ -926,7 +932,7 @@ export class MQClient {
     list.push(handler);
   }
 
-  // 门面退出时摘除自己的处理器；最后一个摘除者负责卸掉传输层的槽。
+  // Remove your own processors when a facade exits; the last remover unloads the transport-layer slot.
   unregisterFacadeProcessor(requestCode: number, handler: FacadeProcessor): void {
     const list = this._facadeProcessors.get(requestCode);
     if (list == null) return;
@@ -953,7 +959,7 @@ export class MQClient {
     return first;
   }
 
-  // 某 code 当前登记了几个门面处理器（测试观测面：共享实例下互不覆盖的落点）。
+  // How many facade processors a given code currently has (test observability: the non-overwriting landing spots under a shared instance).
   facadeProcessorCount(requestCode: number): number {
     const list = this._facadeProcessors.get(requestCode);
     return list != null ? list.length : 0;
@@ -1057,7 +1063,7 @@ export class MQClient {
     if (typeof (this._heartbeatTimer as any).unref === 'function') this._heartbeatTimer.unref();
   }
 
-  // 公开：门面的 start()（pull / lite-pull consumer）与路由刷新都直接用它。
+  // Public: facade start() (pull / lite-pull consumer) and route refresh both call this directly.
   async sendHeartbeatToAllBrokers(): Promise<void> {
     const entries = this.getAllBrokerAddrEntries();
     logger.debug('heartbeat beat to %d broker(s)', entries.length);

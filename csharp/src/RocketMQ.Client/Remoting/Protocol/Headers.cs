@@ -1,10 +1,10 @@
-// 请求/响应自定义头（按协议各请求/响应码的字段定义）。
+// Request/response custom headers (field definitions per protocol request/response code).
 using System.Globalization;
 using RocketMQ.Common;
 
 namespace RocketMQ.Remoting.Protocol;
 
-/// <summary>对应 CommandCustomHeader 接口。</summary>
+/// <summary>Corresponds to the CommandCustomHeader interface.</summary>
 public interface ICommandCustomHeader
 {
     PropertyMap ToExtFields();
@@ -12,7 +12,7 @@ public interface ICommandCustomHeader
     void FromExtFields(PropertyMap ext);
 }
 
-/// <summary>optional &lt;-&gt; 字符串 的编解码助手（PutOpt*/GetOpt* 系列）。</summary>
+/// <summary>Codec helper for optional &lt;-&gt; string (the PutOpt*/GetOpt* family).</summary>
 public static class HeaderCodec
 {
     public static void PutOptStr(PropertyMap outMap, string key, string? v)
@@ -68,7 +68,7 @@ public static class HeaderCodec
         return v.HasValue ? unchecked((int)v.Value) : null;
     }
 
-    /// <summary>大小写不敏感地识别 "true"，另外接受 "1"；其余（含 "false"）一律返回 null。</summary>
+    /// <summary>Recognizes "true" case-insensitively and also accepts "1"; anything else (including "false") returns null.</summary>
     public static bool? GetOptBool(PropertyMap ext, string key)
     {
         if (!ext.TryGetValue(key, out string? s))
@@ -85,9 +85,9 @@ public static class HeaderCodec
     }
 }
 
-// ------------------------------------------------ 发送消息
+// ------------------------------------------------ send message
 
-/// <summary>SendMessageRequestHeader：长字段名（V1）。</summary>
+/// <summary>SendMessageRequestHeader: long field names (V1).</summary>
 public sealed class SendMessageRequestHeader : ICommandCustomHeader
 {
     public string? ProducerGroup { get; set; }
@@ -145,7 +145,7 @@ public sealed class SendMessageRequestHeader : ICommandCustomHeader
 }
 
 /// <summary>
-/// SendMessageRequestHeaderV2：短字段名 a..n，减少每条消息的头部体积。
+/// SendMessageRequestHeaderV2: short field names a..n, reducing the per-message header size.
 /// </summary>
 public sealed class SendMessageRequestHeaderV2 : ICommandCustomHeader
 {
@@ -202,7 +202,7 @@ public sealed class SendMessageRequestHeaderV2 : ICommandCustomHeader
         BrokerName = HeaderCodec.GetOptStr(ext, "n");
     }
 
-    /// <summary>V1 -&gt; V2（对应 DefaultMQProducerImpl.sendKernelImpl 里的 implicitly 逻辑）。</summary>
+    /// <summary>V1 -&gt; V2 (corresponds to the implicitly logic in DefaultMQProducerImpl.sendKernelImpl).</summary>
     public static SendMessageRequestHeaderV2 FromV1(SendMessageRequestHeader v1) => new()
     {
         ProducerGroup = v1.ProducerGroup,
@@ -221,7 +221,7 @@ public sealed class SendMessageRequestHeaderV2 : ICommandCustomHeader
         BrokerName = v1.BrokerName,
     };
 
-    /// <summary>V2 -&gt; V1。</summary>
+    /// <summary>V2 -&gt; V1.</summary>
     public SendMessageRequestHeader ToV1() => new()
     {
         ProducerGroup = ProducerGroup,
@@ -248,11 +248,11 @@ public sealed class SendMessageResponseHeader : ICommandCustomHeader
     public long? QueueOffset { get; set; }
     public string? TransactionId { get; set; }
     public long? MsgRegion { get; set; }
-    // 只有 inner-batch（消息落到 batch CQ）时 broker 才回：
-    // SendMessageProcessor:630 把批量消息自身的 UNIQ_KEY 原样填进来。
+    // Only inner-batch (messages land in a batch CQ) gets this from the broker:
+    // SendMessageProcessor:630 fills in the batch message's own UNIQ_KEY verbatim.
     public string? BatchUniqId { get; set; }
-    // 只给定时/延迟消息：broker 的 SendMessageProcessor#attachRecallHandle 看到
-    // TIMER_OUT_MS + REAL_TOPIC 才挂上，普通消息恒为 null。
+    // Only for scheduled/delay messages: the broker's SendMessageProcessor#attachRecallHandle
+    // attaches it only when it sees TIMER_OUT_MS + REAL_TOPIC; always null for normal messages.
     public string? RecallHandle { get; set; }
 
     public PropertyMap ToExtFields()
@@ -323,7 +323,7 @@ public sealed class RecallMessageResponseHeader : ICommandCustomHeader
     }
 }
 
-// ------------------------------------------------ 拉取消息
+// ------------------------------------------------ pull message
 
 public sealed class PullMessageRequestHeader : ICommandCustomHeader
 {
@@ -413,7 +413,7 @@ public sealed class PullMessageResponseHeader : ICommandCustomHeader
     }
 }
 
-// ------------------------------------------------ 消费位点
+// ------------------------------------------------ consume offsets
 
 public sealed class QueryConsumerOffsetRequestHeader : ICommandCustomHeader
 {
@@ -484,11 +484,11 @@ public sealed class UpdateConsumerOffsetResponseHeader : ICommandCustomHeader
 
     public void FromExtFields(PropertyMap ext)
     {
-        // 空头
+        // empty header
     }
 }
 
-// ------------------------------------------------ offset 查询
+// ------------------------------------------------ offset queries
 
 public sealed class GetMaxOffsetRequestHeader : ICommandCustomHeader
 {
@@ -605,7 +605,7 @@ public sealed class SearchOffsetResponseHeader : ICommandCustomHeader
     public void FromExtFields(PropertyMap ext) => Offset = HeaderCodec.GetOptLong(ext, "offset");
 }
 
-// ------------------------------------------------ 其它常用头部
+// ------------------------------------------------ other common headers
 
 public sealed class ViewMessageRequestHeader : ICommandCustomHeader
 {
@@ -629,10 +629,10 @@ public sealed class QueryMessageRequestHeader : ICommandCustomHeader
     public long? BeginTimestamp { get; set; }
     public long? EndTimestamp { get; set; }
 
-    /// <summary>索引类型："K"=普通 KEYS 索引，"U"=uniqKey（需 RocksDB 索引），"T"=tag。空值时 broker 按 "K" 处理。</summary>
+    /// <summary>Index type: "K"=normal KEYS index, "U"=uniqKey (needs the RocksDB index), "T"=tag. When empty the broker treats it as "K".</summary>
     public string? IndexType { get; set; }
 
-    /// <summary>分页游标：broker 每页最多返回 maxNum 条，翻页时带上上一页最后一条的 key。</summary>
+    /// <summary>Pagination cursor: the broker returns at most maxNum per page; when paging, pass the key of the last item of the previous page.</summary>
     public string? LastKey { get; set; }
 
     public PropertyMap ToExtFields()
@@ -662,7 +662,7 @@ public sealed class QueryMessageRequestHeader : ICommandCustomHeader
 
 public sealed class EndTransactionRequestHeader : ICommandCustomHeader
 {
-    /// <summary>对应 setTopic(msg.getTopic())。</summary>
+    /// <summary>Corresponds to setTopic(msg.getTopic()).</summary>
     public string? Topic { get; set; }
 
     public string? ProducerGroup { get; set; }
@@ -806,7 +806,7 @@ public sealed class GetConsumerListByGroupResponseHeader : ICommandCustomHeader
 
     public void FromExtFields(PropertyMap ext)
     {
-        // 空头
+        // empty header
     }
 }
 
@@ -841,7 +841,7 @@ public sealed class GetRouteInfoRequestHeader : ICommandCustomHeader
 
 public sealed class CheckTransactionStateRequestHeader : ICommandCustomHeader
 {
-    /// <summary>对应 RpcRequestHeader 基类的 topic 字段（CHECK 请求里 broker 也带了 topic）。</summary>
+    /// <summary>Corresponds to the topic field of the RpcRequestHeader base class (the broker also carries topic in CHECK requests).</summary>
     public string? Topic { get; set; }
 
     public long? TranStateTableOffset { get; set; }
@@ -851,7 +851,7 @@ public sealed class CheckTransactionStateRequestHeader : ICommandCustomHeader
 
     public string? OffsetMsgId { get; set; }
 
-    // ⚠ 键名必须是 "bname"（同 EndTransactionRequestHeader）。
+    // WARNING: the key name must be "bname" (same as EndTransactionRequestHeader).
     public string? Bname { get; set; }
 
     public PropertyMap ToExtFields()
@@ -886,11 +886,11 @@ public sealed class CreateTopicRequestHeader : ICommandCustomHeader
     public int? ReadQueueNums { get; set; }
     public int? WriteQueueNums { get; set; }
     public int? Perm { get; set; }
-    public string? TopicFilterType { get; set; }   // 默认 SINGLE_TAG
+    public string? TopicFilterType { get; set; }   // default SINGLE_TAG
     public int? TopicSysFlag { get; set; }
-    public bool? Order { get; set; }               // 默认 false
+    public bool? Order { get; set; }               // default false
     public string? Attributes { get; set; }
-    public bool? Force { get; set; }               // 默认 false
+    public bool? Force { get; set; }               // default false
 
     public PropertyMap ToExtFields()
     {
@@ -923,9 +923,10 @@ public sealed class CreateTopicRequestHeader : ICommandCustomHeader
     }
 }
 
-/// 字段与 SendMessageRequestHeaderV2 高度重合，但多了 bornHost / storeHost /
-/// storeTimestamp（broker 的 ReplyMessageProcessor#pushReplyMessage 据此拼出头）。
-/// 请求方收到后结合 body 还原出真正的应答 MessageExt。
+/// The fields overlap heavily with SendMessageRequestHeaderV2 but add bornHost / storeHost /
+/// storeTimestamp (the broker's ReplyMessageProcessor#pushReplyMessage builds the header from
+/// them). On receiving it, the requester combines it with the body to reconstruct the real
+/// reply MessageExt.
 /// </summary>
 public sealed class ReplyMessageRequestHeader : ICommandCustomHeader
 {
@@ -983,7 +984,7 @@ public sealed class ReplyMessageRequestHeader : ICommandCustomHeader
     }
 }
 
-// ------------------------------------------------ POP（5.x 轻量消费）
+// ------------------------------------------------ POP (5.x lightweight consumption)
 
 public sealed class PopMessageRequestHeader : ICommandCustomHeader
 {
@@ -993,16 +994,17 @@ public sealed class PopMessageRequestHeader : ICommandCustomHeader
     public int? MaxMsgNums { get; set; }
     public long? InvisibleTime { get; set; }
 
-    /// <summary>长轮询挂起时长；本客户端只做短轮询，恒为 0。</summary>
+    /// <summary>Long-poll suspend duration; this client only does short polling, so it is always 0.</summary>
     public long? PollTime { get; set; }
 
     /// <summary>
-    /// ⚠ 必须填**当前毫秒时间戳**。broker 校验 now - bornTime - pollTime > 500 直接回
-    /// POLLING_TIMEOUT(210)（PopMessageRequestHeader.isTimeoutTooMuch）。
+    /// WARNING: must be filled with the **current millisecond timestamp**. The broker checks
+    /// now - bornTime - pollTime > 500 and replies POLLING_TIMEOUT(210) directly
+    /// (PopMessageRequestHeader.isTimeoutTooMuch).
     /// </summary>
     public long? BornTime { get; set; }
 
-    /// <summary>ConsumeInitMode：0=MIN（从最小位点消费历史），1=MAX（只取新消息）。</summary>
+    /// <summary>ConsumeInitMode: 0=MIN (consume history from the smallest offset), 1=MAX (only new messages).</summary>
     public int? InitMode { get; set; }
 
     public string? ExpType { get; set; }

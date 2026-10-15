@@ -1,17 +1,22 @@
-// 过期消息清理真机验证（场景段 A0–A5）。
+// Real-machine verification of expired message cleanup (scenario sections A0-A5).
 //
-// 离线单测（tests/RocketMQ.Client.Tests/CleanExpiredMsgTests.cs）锁的是**判据**
-//（选条/阈值/上限/摘除闸门/跳过回投）；这里锁真机上两件离线锁不住的事：
-//   A. **清扫真的会开火**：需要一个 listener 挂着不返回超过 ConsumeTimeout 分钟，清扫线程
-//      把这条消息 sendMessageBack（delayLevel 3）——整条链路上客户端不能丢它、也不能投两次。
-//   B. **重投真的回到 broker**：%RETRY%<group> 的拉取循环独立于挂住的消费线程，消息必须
-//      重新出现在本地缓冲、被第二次投递且 ReconsumeTimes=1（broker 侧计数）。
+// The offline unit tests (tests/RocketMQ.Client.Tests/CleanExpiredMsgTests.cs) pin the
+// **criteria** (entry selection / threshold / cap / the removal gate / skipping the resend);
+// what is pinned here are the two things offline cannot pin:
+//   A. **the sweep really fires**: it takes a listener that hangs for more than
+//      ConsumeTimeout minutes, and the sweep thread sendMessageBack's that message
+//      (delayLevel 3) -- along the whole chain the client must neither lose it nor send it
+//      twice.
+//   B. **the resend really gets back to the broker**: the pull loop of %RETRY%<group> is
+//      independent of the hung consume thread, so the message must reappear in the local
+//      buffer, be delivered a second time and have ReconsumeTimes=1 (the broker's count).
 //
-// 这条路径坏掉的样子是**静默**的：卡住的消息把该队列位点与分发循环一起钉死，没有任何异常
-// 或超时可见，只能从「消息发了却永远不来第二次」反推。
+// The way this path breaks is **silent**: the hung message pins the queue's offset and the
+// dispatch loop together, with no exception or timeout visible, and it can only be deduced
+// backwards from "the message was sent but never arrives a second time".
 //
 //
-// 用法：rmq clean-expired-msg [namesrv]   （约 4 分钟，等两个清扫周期）
+// Usage: rmq clean-expired-msg [namesrv]   (about 4 minutes, waiting for two sweep periods)
 using System.Globalization;
 using System.Text;
 
@@ -64,7 +69,8 @@ public static class LiveCleanExpiredMsg
     private static bool ContainsBody(IEnumerable<MessageExt> msgs, string body)
         => msgs.Any(m => BodyOf(m) == body);
 
-    /// <summary>第一次投递就挂住不返回；放行后恢复正常返回 CONSUME_SUCCESS。</summary>
+    /// <summary>Returns CONSUME_SUCCESS normally once released; hangs on the first
+    /// delivery without returning.</summary>
     private sealed class HungListener : IMessageListenerConcurrently
     {
         private readonly object _lk = new();
@@ -89,7 +95,7 @@ public static class LiveCleanExpiredMsg
             if (first)
             {
                 _firstEntered.Set();
-                // 挂起窗口：等清扫动手 + 脚本放行（300s 上限兜底，防止脚本崩了卡死线程）
+                // the hang window: wait for the sweep to act + the script to release (a 300s cap as a backstop so a script crash cannot wedge the thread)
                 _released.Wait(TimeSpan.FromSeconds(300));
             }
 
@@ -105,7 +111,7 @@ public static class LiveCleanExpiredMsg
             lock (_lk) return _calls;
         }
 
-        /// <summary>某 body 的到达记录 [(ReconsumeTimes, 时刻)]。</summary>
+        /// <summary>The arrival records [(ReconsumeTimes, instant)] of a given body.</summary>
         public List<(int Times, long At)> Times(string body)
         {
             lock (_lk)
@@ -136,7 +142,7 @@ public static class LiveCleanExpiredMsg
             List<string> addrs = cluster.GetBrokerAddrs();
             if (addrs.Count == 0)
             {
-                Check("集群探活", false, "nameServer 上无 broker 注册");
+                Check("the cluster liveness probe", false, "the nameServer has no broker registered");
                 admin.Shutdown();
                 return Report();
             }
@@ -145,12 +151,12 @@ public static class LiveCleanExpiredMsg
         }
         catch (Exception e)
         {
-            Check("集群探活", false, "fetchBrokerClusterInfo: " + e.Message);
+            Check("the cluster liveness probe", false, "fetchBrokerClusterInfo: " + e.Message);
             admin.Shutdown();
             return Report();
         }
 
-        Check("集群探活", true, "broker=" + brokerAddr);
+        Check("the cluster liveness probe", true, "broker=" + brokerAddr);
 
         var setup = new MQClientInstance("celive-setup-" + stamp, new List<string> { _namesrv });
         setup.Start();
@@ -164,7 +170,7 @@ public static class LiveCleanExpiredMsg
 
         try
         {
-            // 显式 1 队列：A5 的位点口径（== 1）与 A3 的「同一条消息回到 %RETRY%」都要求可数
+            // explicitly 1 queue: A5's offset rule (== 1) and A3's "the very same message comes back to %RETRY%" both require it to be countable
             setup.CreateTopicInRoute(topic, 1, 1);
             producer.Start();
             Thread.Sleep(3000);
@@ -182,7 +188,7 @@ public static class LiveCleanExpiredMsg
             consumer.Subscribe(topic, "*");
             consumer.Start();
 
-            // ---------- A0 业务队列（排除 %RETRY%） ----------
+            // ---------- A0 the business queue (excluding %RETRY%) ----------
             string bizKey = string.Empty;
             bool assigned = WaitUntil(() =>
             {
@@ -197,41 +203,42 @@ public static class LiveCleanExpiredMsg
 
                 return false;
             }, 30000, 200);
-            Check("A0-业务队列已分配（%RETRY% 队列不算）", assigned, "key=" + bizKey);
+            Check("A0-the business queue is assigned (a %RETRY% queue does not count)", assigned, "key=" + bizKey);
             if (!assigned) return Report();
 
-            // ---------- A1 基线：第一投挂住 ----------
+            // ---------- A1 baseline: the first delivery hangs ----------
             string body = "ce-dotnet-" + stamp;
             producer.Send(new Message(topic, Str2Bytes(body)));
             bool firstOk = listener.WaitFirst(30000);
-            Check("A1-首投在 30s 内到达并挂住", firstOk, "calls=" + N(listener.Calls()));
+            Check("A1-the first delivery arrives within 30s and hangs", firstOk, "calls=" + N(listener.Calls()));
             List<(int Times, long At)> first = listener.Times(body);
-            Check("A1-首投 ReconsumeTimes=0", first.Count > 0 && first[0].Times == 0,
+            Check("A1-the first delivery has ReconsumeTimes=0", first.Count > 0 && first[0].Times == 0,
                 "times=" + N(first.Count > 0 ? first[0].Times : -1));
 
             List<MessageExt> entries = consumer.ProcessQueueEntriesForTest(bizKey);
-            Check("A1-挂住期间消息登记在册（在 listener 手里）", ContainsBody(entries, body),
+            Check("A1-while hanging, the message is registered on the books (in the listener's hand)", ContainsBody(entries, body),
                 "entries=" + N(entries.Count));
             string stampSeen = entries.Where(m => BodyOf(m) == body)
                 .Select(m => m.GetProperty(MessageConst.PropertyConsumeStartTimestamp))
                 .FirstOrDefault() ?? string.Empty;
-            Check("A1-在册副本带本轮 CONSUME_START_TIME（清扫靠它判过期）",
+            Check("A1-the registered copy carries this round's CONSUME_START_TIME (the sweep judges expiry by it)",
                 stampSeen.Length > 0, "stamp=" + stampSeen);
 
-            // ---------- A2 清扫命中：listener 还挂着，在册视图里已经没了 ----------
+            // ---------- A2 the sweep hits: the listener is still hung, it is already gone from the view ----------
             long t0 = NowMs();
             bool swept = WaitUntil(
                 () => !ContainsBody(consumer.ProcessQueueEntriesForTest(bizKey), body),
                 210000, 1000);
             double elapsed = (NowMs() - t0) / 1000.0;
-            Check("A2-清扫在 listener 仍挂起时收走了这条消息（约 start+120s）", swept,
+            Check("A2-the sweep took the message away while the listener was still hung (about start+120s)", swept,
                 "elapsed=" + elapsed.ToString("F3", CultureInfo.InvariantCulture) + "s calls="
                 + N(listener.Calls()));
-            Check("A2-收走时间晚于一个清扫阈值（>60s，排除别的路径动手）", elapsed > 60.0,
+            Check("A2-the time it was taken away is later than one sweep threshold (>60s, ruling out another path acting)", elapsed > 60.0,
                 "elapsed=" + elapsed.ToString("F3", CultureInfo.InvariantCulture) + "s");
 
-            // ---------- A3 回投真的到了 broker：%RETRY% 缓冲里出现 ----------
-            // 挂起的 listener 把分发线程占住，重投消息只能停在 %RETRY% 队列的本地缓冲里。
+            // ---------- A3 the resend really reached the broker: it shows up in %RETRY% ----------
+            // The hung listener occupies the dispatch thread, so the resent message can only
+            // sit in the local buffer of the %RETRY% queue.
             string retryKeyFound = string.Empty;
             bool back = WaitUntil(() =>
             {
@@ -244,24 +251,24 @@ public static class LiveCleanExpiredMsg
 
                 return false;
             }, 40000, 1000);
-            Check("A3-回投消息出现在 " + retryTopic + " 的本地缓冲（broker 真收到了 sendMessageBack）",
+            Check("A3-the resent message appears in the local buffer of " + retryTopic + " (the broker really received the sendMessageBack)",
                 back, "retryKey=" + retryKeyFound);
 
-            // ---------- A4 放行：重投被重新消费 ----------
+            // ---------- A4 release: the resend is consumed again ----------
             listener.Release();
             bool second = WaitUntil(() => listener.Times(body).Count >= 2, 60000, 1000);
             List<(int Times, long At)> times = listener.Times(body);
-            Check("A4-放行后重新消费到（ReconsumeTimes=1）", second, "times=" + N(times.Count));
-            Check("A4-第二次投递 ReconsumeTimes=1（broker 侧重投计数）",
+            Check("A4-after the release it is consumed again (ReconsumeTimes=1)", second, "times=" + N(times.Count));
+            Check("A4-the second delivery has ReconsumeTimes=1 (the broker's resend count)",
                 times.Count >= 2 && times[1].Times == 1,
                 "times=" + N(times.Count >= 2 ? times[1].Times : -1));
-            Check("A4-同一条 body 全程只到两次（清算一次回投，无重复投递）", times.Count == 2,
+            Check("A4-the same body arrives exactly twice in total (one resend settled, no duplicate delivery)", times.Count == 2,
                 "times=" + N(times.Count));
             long gapSecs = times.Count >= 2 ? (times[1].At - times[0].At) / 1000 : -1;
-            Check("A4-第二次投递与首投相隔 >60s（不是 listener 自己造成的重投）", gapSecs > 60,
+            Check("A4-the second delivery is >60s after the first (not a resend caused by the listener itself)", gapSecs > 60,
                 "gap=" + N(gapSecs) + "s");
 
-            // ---------- A5 位点收尾 ----------
+            // ---------- A5 the offset winds up ----------
             List<MessageQueue> queues = consumer.FetchSubscribeMessageQueues(topic);
             MessageQueue mq = queues[0];
             long committed = -2;
@@ -278,16 +285,16 @@ public static class LiveCleanExpiredMsg
 
                 return committed == 1;
             }, 30000, 1000);
-            Check("A5-挂住的 listener 返回后业务队列位点走到 1（removeMessage 含已清扫条目）",
+            Check("A5-after the hung listener returns, the business queue's offset reaches 1 (removeMessage includes the swept entry)",
                 offsetOk, "offset=" + N(committed));
         }
         catch (Exception e)
         {
-            Check("联调过程中出现未预期异常", false, e.ToString());
+            Check("an unexpected exception occurred during the integration", false, e.ToString());
         }
         finally
         {
-            // ---------------- 清理 ----------------
+            // ---------------- cleanup ----------------
             listener.Release();
             if (consumer is not null)
             {
@@ -297,7 +304,7 @@ public static class LiveCleanExpiredMsg
                 }
                 catch (Exception e)
                 {
-                    Console.WriteLine("    (consumer shutdown 失败: " + e.Message + ")");
+                    Console.WriteLine("    (consumer shutdown failed: " + e.Message + ")");
                 }
             }
 
@@ -308,7 +315,7 @@ public static class LiveCleanExpiredMsg
             }
             catch (Exception e)
             {
-                Console.WriteLine("    (deleteTopic(" + topic + ") 失败: " + e.Message + ")");
+                Console.WriteLine("    (deleteTopic(" + topic + ") failed: " + e.Message + ")");
             }
 
             try
@@ -317,7 +324,7 @@ public static class LiveCleanExpiredMsg
             }
             catch (Exception e)
             {
-                Console.WriteLine("    (deleteSubscriptionGroup(" + group + ") 失败: " + e.Message + ")");
+                Console.WriteLine("    (deleteSubscriptionGroup(" + group + ") failed: " + e.Message + ")");
             }
 
             try
@@ -326,7 +333,7 @@ public static class LiveCleanExpiredMsg
             }
             catch (Exception)
             {
-                // 收尾失败不掩盖主断言
+                // a cleanup failure does not mask the main assertion
             }
 
             try
@@ -335,7 +342,7 @@ public static class LiveCleanExpiredMsg
             }
             catch (Exception)
             {
-                // 收尾失败不掩盖主断言
+                // a cleanup failure does not mask the main assertion
             }
 
             try
@@ -344,7 +351,7 @@ public static class LiveCleanExpiredMsg
             }
             catch (Exception)
             {
-                // 收尾失败不掩盖主断言
+                // a cleanup failure does not mask the main assertion
             }
         }
 

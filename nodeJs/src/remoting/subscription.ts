@@ -1,6 +1,6 @@
 // -*- coding: utf-8 -*-
-// 订阅组模型（订阅相关的 subscription 结构）。
-// 字段名与默认值以服务端对 SubscriptionGroupConfig 的 JSON 序列化实测结果为准。
+// Subscription group model (subscription-related subscription structures).
+// Field names and defaults are derived from the server's actual JSON serialization of SubscriptionGroupConfig.
 import { RemotingSerializable } from './serialize.ts';
 
 const MASTER_ID = 0;

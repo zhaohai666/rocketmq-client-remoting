@@ -3,13 +3,13 @@ using RocketMQ.Common;
 
 namespace RocketMQ.Remoting.Protocol;
 
-/// <summary>MessageQueue 作为 map 键的序列化/还原工具。</summary>
+/// <summary>Serialization/restore helper for MessageQueue as a map key.</summary>
 public static class MessageQueueKeys
 {
-    /// <summary>把 MessageQueue 序列化成 fastjson2 风格的内联对象键（键按字母序，与 fastjson2 一致）。</summary>
+    /// <summary>Serializes a MessageQueue into a fastjson2-style inline object key (keys in alphabetical order, matching fastjson2).</summary>
     public static string MessageQueueKey(MessageQueue mq)
     {
-        // 键按字母序（fastjson2 行为）：brokerName, queueId, topic
+        // Keys in alphabetical order (fastjson2 behavior): brokerName, queueId, topic
         var v = JsonValue.MakeObject();
         v.Set("brokerName", JsonValue.MakeString(mq.BrokerName));
         v.Set("queueId", JsonValue.MakeInt(mq.QueueId));
@@ -18,13 +18,14 @@ public static class MessageQueueKeys
     }
 
     /// <summary>
-    /// 把 fastjson2 写出的 MessageQueue 内联对象键还原成 MessageQueue。
-    /// 返回 false 表示这个键不是内联对象（例如 "0"、"G1" 这类普通字符串键）。
+    /// Restores the fastjson2-written MessageQueue inline object key back into a MessageQueue.
+    /// Returns false when the key is not an inline object (e.g. a plain string key like "0" or "G1").
     /// </summary>
     public static bool ParseMessageQueueKey(string key, out MessageQueue @out)
     {
         @out = new MessageQueue();
-        // 先看是不是内联对象键（以 '{' 起头）；否则是普通字符串键，直接不接受
+        // First check whether it is an inline object key (starts with '{'); otherwise it is a
+        // plain string key and is rejected outright
         int b = 0;
         while (b < key.Length && (key[b] == ' ' || key[b] == '\t'))
         {
@@ -47,7 +48,7 @@ public static class MessageQueueKeys
         return true;
     }
 
-    /// <summary>通用：解析以 MessageQueue 为键的 map，值为原始 JsonValue。</summary>
+    /// <summary>Generic: parses a MessageQueue-keyed map with raw JsonValue values.</summary>
     public static SortedDictionary<MessageQueue, JsonValue> DecodeMessageQueueMap(JsonValue raw)
     {
         var result = new SortedDictionary<MessageQueue, JsonValue>();
@@ -97,7 +98,7 @@ public sealed class TopicStatsTable
     public SortedDictionary<MessageQueue, TopicOffset> OffsetTable { get; } = new();
     public double TopicPutTps { get; set; }
 
-    /// <summary>各队列 maxOffset 之和（管理端最常用的收敛判断）。</summary>
+    /// <summary>Sum of every queue's maxOffset (the most common convergence check on the admin side).</summary>
     public long TotalMaxOffset() => OffsetTable.Values.Aggregate(0L, (sum, o) => sum + o.MaxOffset);
 
     public JsonValue ToJson() => AdminJson.EncodeMqKeyedMap(OffsetTable, o => o.ToJson(), "topicPutTps", JsonValue.MakeDouble(TopicPutTps));
@@ -198,7 +199,7 @@ public sealed class TopicConfigSerializeWrapper
 {
     public SortedDictionary<string, TopicConfig> TopicConfigTable { get; } = new();
 
-    // 透传
+    // pass-through
     public JsonValue DataVersion { get; set; } = JsonValue.Null;
 
     public JsonValue ToJson()
@@ -321,7 +322,7 @@ public sealed class ConsumeQueueData
 
 public sealed class QueryConsumeQueueResponseBody
 {
-    // 透传（null 表示不出现）
+    // pass-through (null means it does not appear)
     public JsonValue SubscriptionData { get; set; } = JsonValue.Null;
 
     public string FilterData { get; set; } = string.Empty;
@@ -402,10 +403,10 @@ public sealed class QueryConsumeQueueResponseBody
     }
 }
 
-/// <summary>admin/body 层共享的 JSON 编码辅助。</summary>
+/// <summary>Shared JSON encoding helper for the admin/body layer.</summary>
 internal static class AdminJson
 {
-    /// <summary>把 MessageQueue 键的 map 编码成 fastjson2 风格的对象，附带一个标量字段。</summary>
+    /// <summary>Encodes a MessageQueue-keyed map into a fastjson2-style object with one extra scalar field.</summary>
     public static JsonValue EncodeMqKeyedMap<T>(
         SortedDictionary<MessageQueue, T> m, Func<T, JsonValue> toJson, string scalarKey, JsonValue scalarValue)
     {

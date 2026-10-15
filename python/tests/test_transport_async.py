@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""invoke_async 的真实 socket 用例（loopback 上的真连接，非 mock）。
+"""Real-socket cases for invoke_async (a real connection on loopback, not a mock).
 
-覆盖的是同一条链路：异步请求登记进在途表之后，必须**恰好一次**地拿到结果——
-正常响应带 response，收不到响应带 error，且条目要从表里摘掉。
-修复前 timeout_millis 参数被直接丢弃：对端不回包时回调永不触发、条目永久泄漏。
+What is covered is one chain: after an async request is registered in the in-flight table, it must get the result **exactly once** --
+a normal response carries response, no response carries error, and the entry must be removed from the table.
+Before the fix the timeout_millis parameter was discarded outright: when the peer did not reply the callback never fired and the entry leaked permanently.
 """
 from __future__ import annotations
 
@@ -45,7 +45,7 @@ def _read_frame(sock):
 
 
 class FrameServer:
-    """本机回环帧服务端。reply=False 时收到请求但永不回复（用来测超时）。"""
+    """A local loopback frame server. When reply=False it receives requests but never replies (used to test timeouts)."""
 
     def __init__(self, reply=True):
         self.reply = reply
@@ -90,7 +90,7 @@ class FrameServer:
                     return
                 self.served += 1
                 if not self.reply:
-                    # 拖过用例的超时窗口，确保客户端只能靠自己的清理线程判失败
+                    # drag past the test's timeout window, ensuring the client can only fail via its own sweeper thread
                     self._stop.wait(3.0)
                     return
                 cmd = rc_mod.RemotingCommand.decode(frame)
@@ -123,24 +123,24 @@ def test_invoke_async_success_fires_once_with_response():
         req = rc_mod.RemotingCommand.create_request_command(RequestCode.HEART_BEAT)
         calls = []
         client.invoke_async(server.addr, req, lambda resp, err: calls.append((resp, err)))
-        assert _wait_until(lambda: len(calls) == 1), "回调未触发: %r" % (calls,)
+        assert _wait_until(lambda: len(calls) == 1), "callback not fired: %r" % (calls,)
         resp, err = calls[0]
         assert err is None
         assert resp is not None
         assert resp.code == ResponseCode.SUCCESS
-        # 响应必须回填同一个 opaque，否则说明在途表关联错了
+        # the response must fill back the same opaque, otherwise the in-flight table association is wrong
         assert resp.opaque == req.opaque
-        # 投递完成后条目必须已不在表里（pop 由读线程完成）
+        # after delivery the entry must already be out of the table (the pop is done by the read thread)
         assert req.opaque not in client._response_table
         client.shutdown()
-        # 迟到的重复投递不允许发生
+        # late duplicate delivery must not happen
         assert len(calls) == 1
     finally:
         server.stop()
 
 
 def test_invoke_async_timeout_fires_once_with_error():
-    """对端收下请求但永不回复：timeout_millis 必须生效且条目不得泄漏。"""
+    """The peer accepts the request but never replies: timeout_millis must take effect and the entry must not leak."""
     server = FrameServer(reply=False)
     client = RemotingClient()
     try:
@@ -148,20 +148,20 @@ def test_invoke_async_timeout_fires_once_with_error():
         calls = []
         client.invoke_async(server.addr, req,
                             lambda resp, err: calls.append((resp, err)), 300)
-        assert _wait_until(lambda: len(calls) == 1), "超时后回调没有触发"
+        assert _wait_until(lambda: len(calls) == 1), "callback did not fire after the timeout"
         resp, err = calls[0]
         assert resp is None
         assert isinstance(err, RemotingTimeoutException)
-        assert req.opaque not in client._response_table, "超时条目未摘除 -> 在途表泄漏"
+        assert req.opaque not in client._response_table, "timeout entry not removed -> in-flight table leak"
         time.sleep(0.5)
-        assert len(calls) == 1, "回调被重复投递"
+        assert len(calls) == 1, "callback was delivered more than once"
         client.shutdown()
     finally:
         server.stop()
 
 
 def test_sweeper_thread_does_not_outlive_shutdown():
-    """shutdown 必须收掉清理线程：否则进程里会留一个常驻线程。"""
+    """shutdown must reap the sweeper thread: otherwise a resident thread remains in the process."""
     server = FrameServer(reply=True)
     client = RemotingClient()
     try:
@@ -170,6 +170,6 @@ def test_sweeper_thread_does_not_outlive_shutdown():
         thread = client._sweeper_thread
         assert thread is not None and thread.is_alive()
         client.shutdown()
-        assert _wait_until(lambda: not thread.is_alive(), timeout=3.0), "清理线程未随 shutdown 退出"
+        assert _wait_until(lambda: not thread.is_alive(), timeout=3.0), "the sweeper thread did not exit with shutdown"
     finally:
         server.stop()

@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-"""RemotingCommand：RocketMQ 远程命令（协议 remoting 包的命令对象）。
+"""RemotingCommand: a RocketMQ remoting command (the command object of the protocol's
+remoting package).
 
-线格式：totalLength(4) | headerLength(带序列化类型高8位, 4) | header | body
-header（JSON）：RemotingSerializable JSON 编码
-header（ROCKETMQ）：code(2) language(1) version(2) opaque(4) flag(4) remark(int+utf8) extFields(int + key(short+utf8) value(int+utf8))
+Wire format: totalLength(4) | headerLength(with the serialization type in the high 8 bits, 4) | header | body
+header (JSON): RemotingSerializable JSON encoding
+header (ROCKETMQ): code(2) language(1) version(2) opaque(4) flag(4) remark(int+utf8) extFields(int + key(short+utf8) value(int+utf8))
 """
 from __future__ import annotations
 
@@ -21,12 +22,15 @@ SERIALIZE_TYPE_PROPERTY = "rocketmq.serialize.type"
 SERIALIZE_TYPE_ENV = "ROCKETMQ_SERIALIZE_TYPE"
 REMOTING_VERSION_KEY = "rocketmq.remoting.version"
 
-# 上报的协议版本号，对齐 5.5.1 集群（= `Version.V5_5_1.ordinal()`，本机 5.5.1 集群）。
-# broker 按心跳/请求里记录的客户端版本决定能否把管理请求回调到客户端：
-# `AdminBrokerProcessor#callConsumer`（307）低于 `V3_1_8_SNAPSHOT`（ordinal 62）时
-# 直接回 "The Consumer <x> Version <0> too low to finish"；`Broker2Client#getConsumeStatus`
-# （223→221）低于 `V3_0_7_SNAPSHOT`（ordinal 28）时回 "the client does not support this
-# feature. version=..."，`resetOffset` 的在线分支同样按 28 跳过。发 0 等于自降为不可回调。
+# The protocol version reported to the server, aligned with a 5.5.1 cluster
+# (= `Version.V5_5_1.ordinal()`, the local 5.5.1 cluster).
+# The broker decides whether it may call administrative requests back to the client
+# based on the client version recorded in heartbeats/requests:
+# `AdminBrokerProcessor#callConsumer` (307) replies "The Consumer <x> Version <0> too low
+# to finish" when it is below `V3_1_8_SNAPSHOT` (ordinal 62); `Broker2Client#getConsumeStatus`
+# (223->221) replies "the client does not support this feature. version=..." when it is
+# below `V3_0_7_SNAPSHOT` (ordinal 28), and the online branch of `resetOffset` is skipped
+# by the same 28 rule. Sending 0 amounts to downgrading oneself to not callable.
 CURRENT_VERSION = 515
 
 RPC_TYPE = 0
@@ -66,14 +70,15 @@ class RemotingCommand:
         self.serialize_type_current_rpc = _serialize_type_config_in_this_server
         self.cached_header = None
 
-    # ---------------- 工厂方法 ----------------
+    # ---------------- factory methods ----------------
     @staticmethod
     def create_new_request_id() -> int:
-        """生成新的请求 opaque（自增序号）。
+        """Generate a new request opaque (a monotonically increasing counter).
 
-        异步发送换 broker 重试时必须给**同一个请求对象**换一个新 opaque：
-        旧请求还挂在 responseTable 里等超时，
-        复用 opaque 会让两次尝试的应答串台。
+        When an asynchronous send retries against another broker it must give the
+        **same request object** a new opaque: the old request is still sitting in the
+        responseTable waiting for its timeout, and reusing the opaque would let the
+        replies of the two attempts cross over.
         """
         return next(_request_id)
 
@@ -93,7 +98,7 @@ class RemotingCommand:
     @staticmethod
     def create_response_command(code: int = 0, remark: str = "not set any response code",
                                 class_header: Optional[Type] = None) -> Optional["RemotingCommand"]:
-        """按 code/remark/classHeader 造一个响应命令。"""
+        """Build a response command from code/remark/classHeader."""
         cmd = RemotingCommand(code=code, remark=remark)
         cmd.mark_response_type()
         _set_cmd_version(cmd)
@@ -110,7 +115,8 @@ class RemotingCommand:
 
     @staticmethod
     def get_protocol_type(source: int) -> int:
-        """返回序列化类型数值（协议 getProtocolType 的高 8 位语义），供与 SerializeType 常量比较。"""
+        """Return the serialization type value (the high-8-bit semantics of the protocol's
+        getProtocolType), for comparison against the SerializeType constants."""
         return (source >> 24) & 0xFF
 
     @staticmethod
@@ -121,7 +127,7 @@ class RemotingCommand:
     def mark_protocol_type(source: int, stype: int) -> int:
         return ((stype & 0xFF) << 24) | (source & 0x00FFFFFF)
 
-    # ---------------- 编解码 ----------------
+    # ---------------- encode/decode ----------------
     def mark_response_type(self) -> None:
         self.flag |= 1 << RPC_TYPE
 
@@ -138,7 +144,8 @@ class RemotingCommand:
         return RemotingCommandType.RESPONSE_COMMAND if self.is_response_type() else RemotingCommandType.REQUEST_COMMAND
 
     def make_custom_header_to_net(self) -> None:
-        """把 custom_header 的非 None 字段写入 ext_fields（协议侧按反射落字段）。"""
+        """Write the non-None fields of custom_header into ext_fields (the protocol side fills
+        the fields by reflection)."""
         if self.custom_header is not None:
             for name, value in self.custom_header.to_ext_fields().items():
                 if value is not None:
@@ -202,8 +209,8 @@ class RemotingCommand:
         else:
             obj = json.loads(header_data.decode("utf-8"))
             cmd = RemotingCommand(code=int(obj.get("code", 0)), remark=obj.get("remark"), flag=int(obj.get("flag", 0)))
-            # 5.x NameServer 把 language 序列化为枚举名字符串（如 "JAVA"），4.x 用 int；
-            # 这里兼容两种形态，统一成 int 码。
+            # A 5.x NameServer serializes language as the enum name string (e.g. "JAVA"), 4.x uses
+            # an int; both forms are handled here and unified into the int code.
             _lang = obj.get("language", LanguageCode.PYTHON)
             if isinstance(_lang, str):
                 _lang = LanguageCode.name_to_code(_lang)
@@ -217,10 +224,11 @@ class RemotingCommand:
         return cmd
 
     def decode_command_custom_header(self, header_cls: Type, use_fast_encode: bool = True):
-        """把 ext_fields 映射到 header 对象（协议 decodeCommandCustomHeader）。
+        """Map ext_fields onto the header object (the protocol's decodeCommandCustomHeader).
 
-        优先走 header 自带的 from_ext_fields（短字段名等特殊映射），
-        否则按属性名逐字段赋值并做基础类型转换。
+        The header's own from_ext_fields is preferred (it handles special mappings such
+        as short field names); otherwise each field is assigned by attribute name with
+        basic type conversion.
         """
         h = header_cls()
         if hasattr(h, "from_ext_fields"):
@@ -273,7 +281,7 @@ def _set_cmd_version(cmd: RemotingCommand) -> None:
 
 
 def _convert_value(field_type, value: str):
-    """按字段类型转换 ext_fields 字符串值。"""
+    """Convert an ext_fields string value according to the field type."""
     if field_type in (int, "int"):
         return int(value)
     if field_type in (float, "float"):

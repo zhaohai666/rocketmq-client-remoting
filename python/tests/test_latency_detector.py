@@ -32,12 +32,12 @@ def _recording_detector(calls, result=True):
     return detector
 
 
-# ---------------------------------------------------------------- 容错器：探测轮
+# ---------------------------------------------------------------- Fault tolerance: probe rounds
 
 
 class TestDetectByOneRound:
     def test_probe_success_restores_reachable(self):
-        """探测成功 → reachableFlag False→True（从隔离窗口放回）。"""
+        """Probe success → reachableFlag False→True (released from the isolation window)."""
         t = LatencyFaultToleranceImpl(resolver=lambda name: "10.0.0.1:10911",
                                       service_detector=_recording_detector([], True))
         t.update_fault_item(BROKER, 10.0, 60000, False)
@@ -63,7 +63,7 @@ class TestDetectByOneRound:
     def test_resolver_none_drops_fault_item(self):
         pass
         def _boom(addr, timeout):
-            raise AssertionError("resolver 返回 None 后不应再探测")
+            raise AssertionError("no more probing after the resolver returns None")
         t = LatencyFaultToleranceImpl(resolver=lambda name: None, service_detector=_boom)
         t.update_fault_item(BROKER, 10.0, 60000, False)
         t.detect_by_one_round()
@@ -76,17 +76,17 @@ class TestDetectByOneRound:
         t.set_detect_timeout(333)
         t.update_fault_item(BROKER, 10.0, 0, True)
         item = t.get_fault_item(BROKER)
-        item.check_stamp = time.time() * 1000.0 + 60_000.0   # 下次探测时间未到
+        item.check_stamp = time.time() * 1000.0 + 60_000.0   # the next probe time has not arrived yet
         t.detect_by_one_round()
         assert calls == []
         item.check_stamp = 0.0
         t.detect_by_one_round()
         assert calls == [("10.0.0.1:10911", 333)]
-        # 探完顺手把 checkStamp 推到 now + detectInterval
+        # After probing, checkStamp is pushed to now + detectInterval
         assert item.check_stamp > time.time() * 1000.0
 
 
-# ---------------------------------------------------------------- 容错器：候补集合
+# ---------------------------------------------------------------- Fault tolerance: candidate set
 
 
 class TestPickOneAtLeast:
@@ -106,7 +106,7 @@ class TestPickOneAtLeast:
         assert t.pick_one_at_least() is None
 
 
-# ---------------------------------------------------------------- 探测线程
+# ---------------------------------------------------------------- Detector thread
 
 
 class TestDetectorThread:
@@ -164,7 +164,7 @@ class TestDetectorThread:
         s.shutdown()
 
 
-# ---------------------------------------------------------------- 假 broker（socket）
+# ---------------------------------------------------------------- Fake broker (socket)
 
 
 def _recv_exact(sock, n):
@@ -192,7 +192,7 @@ def _read_frame(sock):
 
 
 class FakeBrokerServer:
-    """对每个 remoting 请求回 SUCCESS + extFields(offset) —— GET_MAX_OFFSET 探活能过。"""
+    """Replies SUCCESS + extFields(offset) to every remoting request — the GET_MAX_OFFSET liveness probe can pass."""
 
     def __init__(self):
         self.codes = []
@@ -251,7 +251,7 @@ class FakeBrokerServer:
 
 
 class SilentBroker:
-    """只收不回：探活请求挂到超时，用来钉「探测超时 → 失败」这条路径。"""
+    """Receives only, never replies: liveness probes hang until timeout, pinning the "probe timeout → failure" path."""
 
     def __init__(self):
         self._listen = socket.socket()
@@ -284,7 +284,7 @@ class SilentBroker:
                 continue
             except OSError:
                 return
-            # 收下连接但什么都不回，探活端只能等超时
+            # Accept the connection but reply nothing; the prober can only wait for the timeout
             threading.Thread(target=self._hold, args=(conn,), daemon=True).start()
 
     def _hold(self, conn):
@@ -304,7 +304,7 @@ def _producer_with_client(client_id: str):
 
 
 class TestServiceDetectorOverSocket:
-    """ServiceDetector 等价物：GET_MAX_OFFSET(30) 走真实 remoting 协议打本地假 broker。"""
+    """ServiceDetector equivalent: GET_MAX_OFFSET(30) hits the local fake broker over the real remoting protocol."""
 
     def test_probe_sends_get_max_offset_and_succeeds(self):
         server = FakeBrokerServer()
@@ -323,13 +323,13 @@ class TestServiceDetectorOverSocket:
         try:
             began = time.time()
             assert producer._detector_probe(silent.addr, 300) is False
-            assert time.time() - began < 10.0, "探测失败必须受超时约束，不能挂死"
+            assert time.time() - began < 10.0, "probe failure must be bounded by the timeout, never hang forever"
         finally:
             client.remoting_client.shutdown()
             silent.stop()
 
     def test_full_detect_cycle_recovers_isolated_broker(self):
-        """发送失败隔离 → 探测成功 → 放回候选集合（pickOneAtLeast 能选到）。"""
+        """Send-failure isolation → probe success → back in the candidate set (pickOneAtLeast can select it)."""
         server = FakeBrokerServer()
         producer, client = _producer_with_client("cid_detector_cycle")
         try:
@@ -340,7 +340,7 @@ class TestServiceDetectorOverSocket:
             tolerance.resolver = lambda name: server.addr
             tolerance.service_detector = producer._detector_probe
             strategy.set_start_detector_enable(True)
-            # 对齐 sendDefaultImpl 的异常路径：探测开着时记 reachable=False
+            # Aligned with the exception path of sendDefaultImpl: record reachable=False when detection is enabled
             strategy.update_fault_item(BROKER, 10.0, True, False)
             assert not tolerance.is_reachable(BROKER)
             assert tolerance.pick_one_at_least() is None
@@ -353,9 +353,9 @@ class TestServiceDetectorOverSocket:
             server.stop()
 
     def test_detect_failure_on_dead_port_keeps_unreachable(self):
-        """探活打不通（端口已关）：broker 仍不可达，不因探测翻回可达。
+        """The liveness probe cannot connect (port closed): the broker stays unreachable and must not flip back to reachable due to probing.
 
-        loopback 怪癖：刚关闭的端口约 2s 内才拒绝，这里探活超时给 5000ms 覆盖掉。
+        A loopback quirk: a just-closed port only refuses connections for about 2s; the probe timeout here is set to 5000ms to cover it.
         """
         sock = socket.socket()
         sock.bind(("127.0.0.1", 0))
@@ -377,7 +377,7 @@ class TestServiceDetectorOverSocket:
             client.remoting_client.shutdown()
 
     def test_resolver_uses_publish_address_of_master(self):
-        """Resolver 等价物：find_broker_address_in_publish —— 只取 brokerId=0。"""
+        """Resolver equivalent: find_broker_address_in_publish — only takes brokerId=0."""
         producer, client = _producer_with_client("cid_detector_resolver")
         try:
             client.broker_addr_table[BROKER] = {0: "10.0.0.1:10911", 1: "10.0.0.2:10911"}
@@ -389,7 +389,7 @@ class TestServiceDetectorOverSocket:
             client.remoting_client.shutdown()
 
 
-# ---------------------------------------------------------------- 配置 API
+# ---------------------------------------------------------------- Configuration API
 
 
 class TestProducerDetectorConfig:
@@ -409,7 +409,7 @@ class TestProducerDetectorConfig:
         assert producer.get_detect_interval() == 8888
         assert producer.is_start_detector_enable() is True
 
-        # start() 里就是这一步快照（_mq_client 为 None 时 resolver 只会解析失败，不联网）
+        # start() takes exactly this snapshot (when _mq_client is None the resolver only fails to resolve, no networking)
         producer._setup_reachability_detector()
         try:
             tolerance = producer._mq_fault_strategy.latency_fault_tolerance

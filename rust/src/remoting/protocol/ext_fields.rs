@@ -1,7 +1,7 @@
-//! `RocketMQSerializable` 用到的 extFields 容器。
+//! extFields container used by the remoting codec.
 //!
-//! 必须保序：`map_serialize` 按插入顺序写二进制，ACL 签名按 key 字典序拼接，两条路径
-//! 都依赖同一份内容，用 `HashMap` 会让逐字节比对失效。
+//! Order must be preserved: binary serialization writes extFields in insertion order, while ACL signing concatenates them in key-sorted order; both paths
+//! rely on the same content, and a `HashMap` would break byte-for-byte comparisons.
 
 use std::any::Any;
 
@@ -71,7 +71,7 @@ impl ExtFields {
         }
     }
 
-    /// 按 key 字典序排列的 (key, value) 列表，ACL 签名用。
+    /// (key, value) list sorted by key, used for ACL signing.
     pub fn sorted(&self) -> Vec<(&str, &str)> {
         let mut out: Vec<(&str, &str)> = self
             .entries
@@ -140,7 +140,7 @@ impl ExtFields {
     }
 }
 
-/// 消息属性等「字符串 -> 字符串」容器与 extFields 结构相同，共用一个保序实现。
+/// String-to-string containers such as message properties share the same shape as extFields and reuse this order-preserving implementation.
 pub type StringMap = ExtFields;
 
 pub trait CustomHeader: Send + Sync + Any {

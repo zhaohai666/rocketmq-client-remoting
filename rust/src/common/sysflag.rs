@@ -1,15 +1,15 @@
 
-/// 位含义（低 -> 高）：
+/// Bit meanings (low -> high):
 /// ```text
 /// bit0   COMPRESSED
 /// bit1   MULTI_TAGS
 /// bit2   TRANSACTION_PREPARED
-/// bit3   TRANSACTION_COMMIT(0x2<<2) / TRANSACTION_ROLLBACK(0x3<<2) 共用掩码
+/// bit3   TRANSACTION_COMMIT(0x2<<2) / TRANSACTION_ROLLBACK(0x3<<2) share one mask
 /// bit4   BORNHOST_V6
 /// bit5   STOREHOSTADDRESS_V6
 /// bit6   NEED_UNWRAP
 /// bit7   INNER_BATCH
-/// bit8~10 COMPRESSION_TYPE（掩码 0x7<<8）
+/// bit8~10 COMPRESSION_TYPE (mask 0x7<<8)
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MessageSysFlag;
@@ -23,9 +23,9 @@ impl MessageSysFlag {
     pub const TRANSACTION_ROLLBACK_TYPE: i32 = 0x3 << 2;
     pub const BORNHOST_V6_FLAG: i32 = 0x1 << 4;
     pub const STOREHOSTADDRESS_V6_FLAG: i32 = 0x1 << 5;
-    /// 批量消息解包标记（避免与其它位冲突）。
+    /// Unwrap flag for batch messages (kept clear of the other bits).
     pub const NEED_UNWRAP_FLAG: i32 = 0x1 << 6;
-    /// 内部批量标记。
+    /// Inner-batch flag.
     pub const INNER_BATCH_FLAG: i32 = 0x1 << 7;
 
     pub const COMPRESSION_LZ4_TYPE: i32 = 0x1 << 8;
@@ -34,7 +34,7 @@ impl MessageSysFlag {
     pub const COMPRESSION_TYPE_COMPARATOR: i32 = 0x7 << 8;
     pub const COMPRESSION_TYPE_SHIFT: i32 = 8;
 
-    /// 兼容历史命名：压缩类型**数值**（未左移），即 sysFlag 位移前的原始取值。
+    /// Legacy naming kept for compatibility: compression type **value** (not shifted), i.e. the raw value before it is shifted into sysFlag.
     pub const LZ4_TYPE: i32 = 1;
     pub const ZSTD_TYPE: i32 = 2;
     pub const ZLIB_TYPE: i32 = 3;
@@ -44,7 +44,7 @@ impl MessageSysFlag {
         (sys_flag & Self::COMPRESSION_TYPE_COMPARATOR) >> Self::COMPRESSION_TYPE_SHIFT
     }
 
-    /// 覆盖写压缩类型位（其余位保持不变）。
+    /// Overwrites the compression type bits (all other bits are left unchanged).
     pub fn set_compression_type(sys_flag: i32, compression_type: i32) -> i32 {
         (sys_flag & !Self::COMPRESSION_TYPE_COMPARATOR)
             | ((compression_type << Self::COMPRESSION_TYPE_SHIFT) & Self::COMPRESSION_TYPE_COMPARATOR)
@@ -84,9 +84,9 @@ impl CommitLogFlag {
 pub struct ConsumeInitMode;
 
 impl ConsumeInitMode {
-    /// 从最小位点开始消费（新订阅组首次上线）。
+    /// Start consuming from the minimum offset (first time a new consumer group comes online).
     pub const MIN: i32 = 0;
-    /// 从最大位点开始消费。
+    /// Start consuming from the maximum offset.
     pub const MAX: i32 = 1;
 }
 
@@ -141,7 +141,7 @@ impl PullSysFlag {
         Self::build_sys_flag(commit_offset, suspend, subscription, class_filter, false)
     }
 
-    /// 在已有 sysFlag 上按需补 `supportsFilterAndComputeHashing` 位。
+    /// Sets the `supportsFilterAndComputeHashing` bit on an existing sysFlag when requested.
     pub fn build_sys_flag_with_hashing(sys_flag: i32, support: bool) -> i32 {
         if support {
             sys_flag | Self::FLAG_SUPPORT_FILTER_AND_COMPUTE_HASHING

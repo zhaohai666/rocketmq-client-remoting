@@ -5,13 +5,13 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * broker 侧内部消息包装：在 MessageExt 之外再带上存储层自己维护的
- * propertiesString / tagsCode / 编码缓冲 / 编码版本。
+ * Broker-side internal message wrapper: on top of MessageExt it carries the storage layer's own
+ * propertiesString / tagsCode / encode buffer / encode version.
  *
- * 本端口只在解析 broker 回包时用到它的字段，不参与发送路径。
+ * This port only uses its fields when parsing broker responses, and does not participate in the send path.
  *
- * msgId 语义：继承 MessageExt——线上 msgId = storeHost(ip+port) + commitLogOffset
- * 的十六进制串（见 MessageDecoder::createMessageId），offsetMsgId 与之相等。
+ * msgId semantics: inherited from MessageExt — the wire msgId = storeHost(ip+port) + commitLogOffset
+ * as a hex string (see MessageDecoder::createMessageId), and offsetMsgId equals it.
  */
 class MessageExtBrokerInner extends MessageExt
 {
@@ -19,12 +19,12 @@ class MessageExtBrokerInner extends MessageExt
 
     public int $tagsCode = 0;
 
-    /** 整条消息的一次性编码缓冲；本端口用原始字节串承载，null 表示尚未编码 */
+    /** One-shot encode buffer for the whole message; this port carries it as a raw byte string, null means not yet encoded */
     public ?string $encodedBuff = null;
 
     public bool $encodeCompleted = false;
 
-    /** 消息体编码版本：1 = V1，2 = V2；决定 decode 时如何解释魔数与 topic 长度 */
+    /** Message body encode version: 1 = V1, 2 = V2; determines how the magic number and topic length are interpreted on decode */
     public int $version = 1;
 
     public function getPropertiesString(): ?string
@@ -58,9 +58,9 @@ class MessageExtBrokerInner extends MessageExt
     }
 
     /**
-     * tag 文本 -> tagsCode：空串得 0，否则取协议侧字符串哈希
-     * （32 位有符号回绕，见 UtilAll::wireStringHash）。broker 的 tag 过滤
-     * 就按这个数值比对，哈希算法不同会静默漏投。
+     * tag text -> tagsCode: empty string yields 0, otherwise take the protocol-side string hash
+     * (32-bit signed wraparound, see UtilAll::wireStringHash). The broker's tag filtering
+     * compares against this number; a different hash algorithm would silently miss deliveries.
      */
     public static function tagsString2tagsCode(?string $tags): int
     {
@@ -71,15 +71,15 @@ class MessageExtBrokerInner extends MessageExt
     }
 
     /**
-     * 删除属性：properties 表与 propertiesString 两份表示都要删，
-     * 否则后续直接序列化 propertiesString 的路径仍会带上旧值。
+     * Delete a property: both the properties table and propertiesString representations must be deleted,
+     * otherwise a later path that serializes propertiesString directly would still carry the old value.
      */
     public function deleteProperty(string $name): void
     {
         $this->removeProperty($name);
         if ($this->propertiesString !== null) {
-            // 从 k\x01v\x02 串里摘掉该键（等价实现：解析回 map、删除、重序列化，
-            // 编码格式与 MessageDecoder 完全一致）
+            // Remove the key from the k\x01v\x02 string (equivalent implementation: parse back to map, delete, re-serialize;
+            // the encoding format is fully consistent with MessageDecoder)
             $props = MessageDecoder::string2MessageProperties($this->propertiesString);
             unset($props[$name]);
             $this->propertiesString = MessageDecoder::messageProperties2String($props);
@@ -87,8 +87,8 @@ class MessageExtBrokerInner extends MessageExt
     }
 
     /**
-     * propertiesString 里不落 "WAIT=true"（省 9 字节/条）；properties 表回填，
-     * 因为 isWaitStoreMsgOK() 在序列化之后还要被调用。
+     * Do not write "WAIT=true" into propertiesString (saves 9 bytes/message); refill the properties table instead,
+     * because isWaitStoreMsgOK() is still called after serialization.
      */
     public function removeWaitStorePropertyString(): void
     {
@@ -96,7 +96,7 @@ class MessageExtBrokerInner extends MessageExt
             $waitStoreMsgOkValue = $this->properties[MessageConst::PROPERTY_WAIT_STORE_MSG_OK];
             unset($this->properties[MessageConst::PROPERTY_WAIT_STORE_MSG_OK]);
             $this->setPropertiesString(MessageDecoder::messageProperties2String($this->properties));
-            // 值只是从串里省掉，属性表必须留一份供 isWaitStoreMsgOK() 读取
+            // The value is only omitted from the string; the properties table must keep a copy for isWaitStoreMsgOK() to read
             $this->properties[MessageConst::PROPERTY_WAIT_STORE_MSG_OK] = $waitStoreMsgOkValue;
         } else {
             $this->setPropertiesString(MessageDecoder::messageProperties2String($this->properties));

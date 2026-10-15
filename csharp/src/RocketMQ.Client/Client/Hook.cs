@@ -83,8 +83,8 @@ public enum CommunicationMode
     Oneway = 2,
 }
 
-/// 与 SendMessageContext 的关键差别：<b>没有 SendResult</b>（此刻还没发），带上 Arg
-/// （send(msg, selector, arg) 里的业务参数）。
+/// The key difference from SendMessageContext: <b>no SendResult</b> (not sent yet), it carries Arg
+/// (the business parameter in send(msg, selector, arg)).
 /// </summary>
 public sealed class CheckForbiddenContext
 {
@@ -108,8 +108,8 @@ public interface ICheckForbiddenHook
     void CheckForbidden(CheckForbiddenContext context);
 }
 
-/// MsgList 是<b>可变的</b>：钩子把它替换/裁剪掉的消息会被客户端直接丢弃
-/// （拉取路径 = 静默跳过、位点照常推进；POP 路径 = 立刻 ack）。
+    /// MsgList is <b>mutable</b>: messages the hook replaces/drops are directly discarded by the client
+    /// (pull path = silently skipped, offset still advances; POP path = ack immediately).
 /// </summary>
 public sealed class FilterMessageContext
 {
@@ -126,7 +126,7 @@ public sealed class FilterMessageContext
     public MessageQueue? Mq { get; set; }
     public object? Arg { get; set; }
 
-    /// <summary>本项目无 unit mode。</summary>
+    /// <summary>This project has no unit mode.</summary>
     public bool UnitMode { get; set; }
 }
 

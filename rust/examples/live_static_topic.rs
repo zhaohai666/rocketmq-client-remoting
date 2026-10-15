@@ -1,11 +1,11 @@
-//! 真机静态主题腿（逐条真机断言）：
+//! Live static-topic leg (assertion by assertion on a real cluster):
 //!
-//! S1 createStaticTopic(513)：单 broker，totalQueues=8，物理 4 队列；
-//! S2 路由回读 TopicQueueMappingByBroker；
-//! S3 topicRouteData2EndpointsForStaticTopic：8 条端点（0-3 → broker，
-//!    4-7 → `__syslo__none__`）；
-//! S4 消费者实例把 mock 队列名重写到真实 broker（表外 id 透传）；
-//! S5 端到端：生产者发 4 条、PUSH 消费者收齐 4 条。
+//! S1 createStaticTopic(513): single broker, totalQueues=8, 4 physical queues;
+//! S2 read the route back with TopicQueueMappingByBroker;
+//! S3 topicRouteData2EndpointsForStaticTopic: 8 endpoints (0-3 → broker,
+//!    4-7 → `__syslo__none__`);
+//! S4 the consumer instance rewrites mock queue names to the real broker (out-of-table ids pass through);
+//! S5 end to end: the producer sends 4, the PUSH consumer receives all 4.
 //!
 //! ```text
 //! cargo run --example live_static_topic -- 127.0.0.1:9876
@@ -130,7 +130,7 @@ async fn main() -> ExitCode {
     let group = format!("rust-static-pg-{stamp}");
     let tally = Tally::new();
 
-    println!("\nS1 起管理端，createStaticTopic(513)");
+    println!("\nS1 start the admin, createStaticTopic(513)");
     let admin = DefaultMQAdminExt::with_config(AdminConfig {
         instance_name: format!("STADMIN-{stamp}"),
         name_server_addrs: vec![ns.clone()],
@@ -160,10 +160,10 @@ async fn main() -> ExitCode {
         }
     }
     if broker_addr.is_empty() {
-        println!("  [FATAL] broker 未注册");
+        println!("  [FATAL] broker not registered");
         return ExitCode::FAILURE;
     }
-    tally.check("S1 broker 地址解析", true, &format!("{broker_name}({broker_addr})"));
+    tally.check("S1 broker address resolved", true, &format!("{broker_name}({broker_addr})"));
 
     let detail = mapping_detail(&topic, &broker_name);
     let config = TopicConfig {
@@ -176,15 +176,15 @@ async fn main() -> ExitCode {
         .create_static_topic(&broker_addr, "TBW102", &config, &detail, true)
         .await
     {
-        Ok(()) => tally.check("S1 createStaticTopic(513) 被接受", true,
+        Ok(()) => tally.check("S1 createStaticTopic(513) accepted", true,
             &format!("totalQueues={TOTAL_QUEUES}")),
         Err(e) => {
-            tally.check("S1 createStaticTopic(513) 被接受", false, &e.to_string());
+            tally.check("S1 createStaticTopic(513) accepted", false, &e.to_string());
             return ExitCode::FAILURE;
         }
     }
 
-    println!("\nS2/S3 路由回读 + 端点集推导");
+    println!("\nS2/S3 route read-back + endpoint set derivation");
     let mut route = None;
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
@@ -202,25 +202,25 @@ async fn main() -> ExitCode {
         }
     }
     match route {
-        Some(_) => tally.check("S2 路由携带 TopicQueueMappingByBroker", true, ""),
+        Some(_) => tally.check("S2 route carries TopicQueueMappingByBroker", true, ""),
         None => {
-            tally.check("S2 路由携带 TopicQueueMappingByBroker", false, "30s 超时");
+            tally.check("S2 route carries TopicQueueMappingByBroker", false, "30s timeout");
             return ExitCode::FAILURE;
         }
     }
     let route = route.unwrap();
     let endpoints = topic_route_data_2_endpoints_for_static_topic(&topic, &route);
     match &endpoints {
-        Some(_) => tally.check("S3 端点集非空", true, ""),
+        Some(_) => tally.check("S3 endpoint set is not empty", true, ""),
         None => {
-            tally.check("S3 端点集非空", false, "端点集为 None");
+            tally.check("S3 endpoint set is not empty", false, "endpoint set is None");
             return ExitCode::FAILURE;
         }
     }
     let endpoints = endpoints.unwrap();
     let mock_name = get_mock_broker_name("__global__");
     tally.check(
-        "S3 端点总数 = totalQueues",
+        "S3 total endpoints = totalQueues",
         endpoints.len() == TOTAL_QUEUES as usize,
         &format!("got {} want {TOTAL_QUEUES}", endpoints.len()),
     );
@@ -231,7 +231,7 @@ async fn main() -> ExitCode {
             .unwrap_or(false)
     });
     tally.check(
-        &format!("S3 承载 id 0-{} → broker", PHYSICAL_QUEUES - 1),
+        &format!("S3 hosted ids 0-{} → broker", PHYSICAL_QUEUES - 1),
         hosted_ok,
         "",
     );
@@ -242,12 +242,12 @@ async fn main() -> ExitCode {
             .unwrap_or(false)
     });
     tally.check(
-        &format!("S3 无承载 id {PHYSICAL_QUEUES}-{} → __syslo__none__", TOTAL_QUEUES - 1),
+        &format!("S3 unhosted ids {PHYSICAL_QUEUES}-{} → __syslo__none__", TOTAL_QUEUES - 1),
         unhosted_ok,
         "",
     );
 
-    println!("\nS4/S5 实例重写 + 端到端收发");
+    println!("\nS4/S5 instance rewrite + end-to-end send and receive");
     let inbox = Arc::new(Inbox::default());
     let consumer = match DefaultMQPushConsumer::with_config(ConsumerConfig {
         consumer_group: group.clone(),
@@ -257,7 +257,7 @@ async fn main() -> ExitCode {
     }) {
         Ok(c) => c,
         Err(e) => {
-            println!("  [FATAL] 消费者构造: {e}");
+            println!("  [FATAL] consumer build: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -279,35 +279,35 @@ async fn main() -> ExitCode {
                     &topic, &mock_name, gid,
                 )) == broker_name
             });
-            tally.check("S4 实例把 mock 队列重写到真实 broker", rewrite_ok, "");
+            tally.check("S4 the instance rewrites mock queues to the real broker", rewrite_ok, "");
             let sentinel = inst.get_broker_name_from_message_queue(&MessageQueue::new(
                 &topic,
                 &mock_name,
                 TOTAL_QUEUES - 1,
             ));
             tally.check(
-                "S4 无承载 id 返回哨兵值",
+                "S4 unhosted ids return the sentinel value",
                 sentinel == LOGICAL_QUEUE_MOCK_NOT_EXIST,
                 &sentinel,
             );
             let outside = inst.get_broker_name_from_message_queue(&MessageQueue::new(
                 &topic, &mock_name, 99,
             ));
-            tally.check("S4 表外 id 透传 mock 名", outside == mock_name, &outside);
+            tally.check("S4 out-of-table ids pass the mock name through", outside == mock_name, &outside);
             let plain = inst.get_broker_name_from_message_queue(&MessageQueue::new(
                 &format!("Plain{stamp}"),
                 &broker_name,
                 0,
             ));
-            tally.check("S4 非静态主题原样透传", plain == broker_name, &plain);
+            tally.check("S4 non-static topics pass through unchanged", plain == broker_name, &plain);
         }
-        Err(e) => tally.check("S4 实例访问", false, &e.to_string()),
+        Err(e) => tally.check("S4 instance access", false, &e.to_string()),
     }
 
     let producer = match DefaultMQProducer::new(&format!("rust-static-prod-{stamp}")) {
         Ok(p) => p,
         Err(e) => {
-            println!("  [FATAL] producer 构造: {e}");
+            println!("  [FATAL] producer build: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -327,7 +327,7 @@ async fn main() -> ExitCode {
         }
     }
     producer.shutdown();
-    tally.check(&format!("S5 发送 {PHYSICAL_QUEUES} 条"), sent == PHYSICAL_QUEUES as usize,
+    tally.check(&format!("S5 sent {PHYSICAL_QUEUES} messages"), sent == PHYSICAL_QUEUES as usize,
         &format!("sent={sent}"));
 
     let deadline = Instant::now() + Duration::from_secs(40);
@@ -336,7 +336,7 @@ async fn main() -> ExitCode {
     }
     let got = inbox.count();
     tally.check(
-        &format!("S5 消费收齐 {PHYSICAL_QUEUES} 条"),
+        &format!("S5 received all {PHYSICAL_QUEUES} messages"),
         got >= PHYSICAL_QUEUES as usize,
         &format!("got={got}"),
     );

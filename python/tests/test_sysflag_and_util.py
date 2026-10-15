@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""系统标志位与通用工具测试（sysflag / UtilAll / MixAll）。"""
+"""Tests for system flags and common utilities (sysflag / UtilAll / MixAll)."""
 from __future__ import annotations
 
 import pytest
@@ -97,7 +97,7 @@ class TestUtilAll:
 
     def test_string_2_bytes_roundtrip(self):
         assert UtilAll.string_2_bytes("0AFF") == b"\x0a\xff"
-        assert UtilAll.string_2_bytes("0aff") == b"\x0a\xff", "解析时先统一转大写"
+        assert UtilAll.string_2_bytes("0aff") == b"\x0a\xff", "uppercased first when parsing"
         assert UtilAll.string_2_bytes("") is None
         assert UtilAll.string_2_bytes(None) is None
 

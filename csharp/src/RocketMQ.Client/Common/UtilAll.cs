@@ -23,10 +23,10 @@ public static class UtilAll
     public static long ComputeElapseTimeMillis(long lastTime) => CurrentTimeMillis() - lastTime;
 
     /// <summary>
-    /// 单调高精度时钟起点（基于 Stopwatch 的单调时基，不受墙钟回拨影响）。
+    /// Monotonic high-precision clock origin (based on Stopwatch's monotonic time base, unaffected by wall-clock stepping back).
     ///
-    /// 只用于量**耗时**：墙钟（`CurrentTimeMillis`）粒度是毫秒且会被 NTP 往回拨，
-    /// 本地环回亚毫秒往返会量成 0，发送延迟故障容错的阈值就永远不会生效。
+    /// Only used to measure **elapsed time**: the wall clock (`CurrentTimeMillis`) has millisecond granularity and can be stepped back by NTP,
+    /// so a local-loopback sub-millisecond round trip would measure as 0, and the send-latency fault-tolerance threshold would never take effect.
     /// </summary>
     public static double MonotonicMillis() =>
         Stopwatch.GetElapsedTime(_stopwatchStart).TotalMilliseconds;
@@ -40,7 +40,7 @@ public static class UtilAll
             return "-";
         }
 
-        // 先拆出毫秒占位符（模式里的 "%03d" 特判为毫秒）
+        // First extract the millisecond placeholder ("%03d" in the pattern is specially treated as milliseconds)
         string suffix = string.Empty;
         bool hasMillis = false;
         int msPos = pattern.IndexOf("%03d", StringComparison.Ordinal);
@@ -68,7 +68,7 @@ public static class UtilAll
         return head + ms.ToString("D3", CultureInfo.InvariantCulture) + suffix;
     }
 
-    /// <summary>把用到的 strftime 说明符映射成 C# 自定义格式串（逐字符处理，避免 %m/%M 混淆）。</summary>
+    /// <summary>Maps the used strftime specifiers to C# custom format strings (processed character by character to avoid %m/%M confusion).</summary>
     private static string StrftimeToDotNet(string pattern)
     {
         var sb = new StringBuilder();
@@ -127,11 +127,11 @@ public static class UtilAll
 
     public static int Pid() => Environment.ProcessId;
 
-    /// <summary>严格 IPv4 校验。⚠ 不能只用 IPAddress.TryParse——它会把 "1" 解析成 0.0.0.1。</summary>
+    /// <summary>Strict IPv4 validation. WARNING: do not rely only on IPAddress.TryParse—it would parse "1" as 0.0.0.1.</summary>
     public static bool IsIpv4(string addr) =>
         IpParse.TryParseStrict(addr, IpParse.IpFamily.V4, out _);
 
-    /// <summary>IP 字符串 -> 4B(v4) / 16B(v6) 网络序字节。</summary>
+    /// <summary>IP string -> 4B(v4) / 16B(v6) network-order bytes.</summary>
     public static bool IpToBytes(string ip, bool v6, out byte[] outBuf)
     {
         outBuf = Array.Empty<byte>();
@@ -144,7 +144,7 @@ public static class UtilAll
         return outBuf.Length == (v6 ? 16 : 4);
     }
 
-    /// <summary>网络序字节 -> IP 字符串（v4: 4B, v6: 16B）。</summary>
+    /// <summary>Network-order bytes -> IP string (v4: 4B, v6: 16B).</summary>
     public static bool BytesToIp(byte[] raw, out string ip)
     {
         ip = string.Empty;
@@ -195,7 +195,7 @@ public static class UtilAll
             return idx;
         }
 
-        // 兼容小写输入
+        // Accept lowercase input
         if (c >= 'a' && c <= 'f')
         {
             return c - 'a' + 10;
@@ -214,7 +214,7 @@ public static class UtilAll
         return -1;
     }
 
-    /// <summary>逐字节转**大写**十六进制（msgId 依赖大小写）。</summary>
+    /// <summary>Convert byte-by-byte to **uppercase** hex (msgId depends on case).</summary>
     public static string Bytes2String(byte[] bs)
     {
         var sb = new StringBuilder(bs.Length * 2);
@@ -227,7 +227,7 @@ public static class UtilAll
         return sb.ToString();
     }
 
-    /// <summary>十六进制字符串 -> 字节串；非法字符/奇数长度返回空数组。</summary>
+    /// <summary>Hex string -> byte string; returns empty array for illegal characters/odd length.</summary>
     public static byte[] String2Bytes(string hexString)
     {
         if (string.IsNullOrEmpty(hexString))
@@ -238,7 +238,7 @@ public static class UtilAll
         int len = hexString.Length;
         if (len % 2 != 0)
         {
-            return Array.Empty<byte>(); // 非法长度
+            return Array.Empty<byte>(); // illegal length
         }
 
         var outBuf = new byte[len / 2];
@@ -248,7 +248,7 @@ public static class UtilAll
             int lo = CharToByte(hexString[(i * 2) + 1]);
             if (hi < 0 || lo < 0)
             {
-                return Array.Empty<byte>(); // 非法字符 -> 空数组
+                return Array.Empty<byte>(); // illegal character -> empty array
             }
 
             outBuf[i] = (byte)((hi << 4) | lo);
@@ -270,7 +270,7 @@ public static class UtilAll
         }
         catch (Exception)
         {
-            // 网络不可用时走回落路径
+            // fall back to the fallback path when the network is unavailable
         }
 
         try
@@ -309,7 +309,7 @@ public static class UtilAll
     public static string CreateUniqId() => InnerIdGenerator.CreateUniqId();
 }
 
-/// <summary>IP 解析辅助：提供比 IPAddress.TryParse 更严格的族校验。</summary>
+/// <summary>IP parsing helper: provides stricter family validation than IPAddress.TryParse.</summary>
 internal static class IpParse
 {
     internal enum IpFamily
@@ -319,8 +319,8 @@ internal static class IpParse
     }
 
     /// <summary>
-    /// 严格解析：TryParse 之外还要**回环比对**规范化字符串。
-    /// 否则 "1" 会被 TryParse 接受为 0.0.0.1，严格口径必须拒绝这类缩写形式。
+    /// Strict parsing: beyond TryParse, also **round-trip compare** the normalized string.
+    /// Otherwise "1" would be accepted by TryParse as 0.0.0.1, but the strict criterion must reject such abbreviated forms.
     /// </summary>
     internal static bool TryParseStrict(string text, IpFamily family, out IPAddress? parsed) =>
         TryParseStrict(text, family, out parsed, out _);
@@ -350,14 +350,14 @@ internal static class IpParse
 
         canonical = candidate.ToString();
         parsed = candidate;
-        // 回环校验：拒绝 "01.02.03.04" / "1" 这类非常规写法
+        // Round-trip check: reject non-canonical forms like "01.02.03.04" / "1"
         return string.Equals(canonical, text, StringComparison.Ordinal);
     }
 }
 
 /// <summary>
-/// MessageClientIDSetter 的 C# 对应：
-/// IP(4|16B) + PID(2B) + hash(4B) + 当日毫秒(4B) + 自增(2B)。
+/// The C# counterpart of MessageClientIDSetter:
+/// IP(4|16B) + PID(2B) + hash(4B) + millis-of-day(4B) + auto-increment(2B).
 /// </summary>
 public static class InnerIdGenerator
 {

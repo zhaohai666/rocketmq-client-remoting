@@ -1,4 +1,4 @@
-// 编解码往返单测：JSON / RocketMQ 二进制 / RemotingCommand / 消息格式 / 工具函数。
+// Codec round-trip unit tests: JSON / RocketMQ binary / RemotingCommand / message format / utility functions.
 using System.Buffers.Binary;
 using System.Text;
 using RocketMQ.Common;
@@ -31,7 +31,7 @@ public class CodecTests
     [Fact]
     public void Json_TolerantNumericKey()
     {
-        // FastJSON 无引号数字键兼容（fastjson2 输出裸数字键）
+        // FastJSON compatibility with bare numeric keys (fastjson2 emits bare numeric keys)
         Assert.True(Json.TryParse("{\"brokerAddrs\":{0:\"127.0.0.1:10911\"}}", out JsonValue v2, out _));
         JsonValue? ba = v2.Find("brokerAddrs");
         Assert.NotNull(ba);
@@ -55,7 +55,7 @@ public class CodecTests
         Assert.Equal(3, v4.Get("c").Size());
     }
 
-    // ------------------------------------------------- RocketMQ 二进制序列化
+    // ------------------------------------------------- RocketMQ binary serialisation
 
     [Fact]
     public void WriteDecimalLong_Format()
@@ -71,7 +71,7 @@ public class CodecTests
     [Fact]
     public void WriteStr_ReadStr_RoundTrip()
     {
-        // writeStr 短/长长度
+        // writeStr short/long length
         var s = new ByteWriter();
         RocketMQSerializable.WriteStr(s, true, "abc");
         byte[] bytes = s.ToArray();
@@ -102,7 +102,7 @@ public class CodecTests
         cmd.Body = Encoding.UTF8.GetBytes("payload");
 
         byte[] wire = cmd.Encode();
-        // totalLength = 4(headerLen 字段) + header + body
+        // totalLength = 4(headerLen field) + header + body
         int total = GetInt32At(wire, 0);
         Assert.Equal(wire.Length, total + 4);
 
@@ -115,7 +115,7 @@ public class CodecTests
         Assert.Equal("1699999999000", dec.GetExtField("bornTimestamp"));
         Assert.Equal(SerializeType.Json, dec.SerializeTypeCurrentRpc);
 
-        // 从 extFields 还原自定义头
+        // restore the custom header from extFields
         var back = new SendMessageRequestHeader();
         dec.DecodeCommandCustomHeader(back);
         Assert.Equal("T_TEST", back.Topic);
@@ -151,7 +151,7 @@ public class CodecTests
         Assert.Equal("cg", dec.GetExtField("consumerGroup"));
     }
 
-    // ---------------------------------------------------------------- V1/V2 头
+    // ---------------------------------------------------------------- V1/V2 headers
 
     [Fact]
     public void SendMessageHeader_V1V2()
@@ -179,7 +179,7 @@ public class CodecTests
         Assert.False(back.Batch ?? true);
     }
 
-    // ---------------------------------------------------------------- 消息编解码
+    // ---------------------------------------------------------------- Message codec
 
     [Fact]
     public void MessageExt_EncodeDecode()
@@ -221,7 +221,7 @@ public class CodecTests
         Assert.Equal("Hangzhou", d.GetUserProperty("city"));
         Assert.NotEmpty(d.MsgId);
 
-        // 多消息流
+        // a multi-message stream
         var stream = new byte[raw.Length * 2];
         Buffer.BlockCopy(raw, 0, stream, 0, raw.Length);
         Buffer.BlockCopy(raw, 0, stream, raw.Length, raw.Length);
@@ -229,7 +229,7 @@ public class CodecTests
         Assert.Equal(2, list.Count);
     }
 
-    // ---------------------------------------------------------------- 批量编解码
+    // ---------------------------------------------------------------- Batch codec
 
     [Fact]
     public void BatchCodec_RoundTrip()
@@ -265,7 +265,7 @@ public class CodecTests
         Assert.Equal("true", batch.WaitStoreMsgOkStr);
         Assert.True(batch.WaitStoreMsgOk);
 
-        // 显式 false 要原样传下去
+        // an explicit false must be carried through as is
         var c = new Message("T_W", Encoding.UTF8.GetBytes("c")) { WaitStoreMsgOk = false };
         var d = new Message("T_W", Encoding.UTF8.GetBytes("d")) { WaitStoreMsgOk = false };
         MessageBatch off = MessageBatch.GenerateFromList(new List<Message> { c, d });
@@ -277,14 +277,14 @@ public class CodecTests
     public void WaitStoreMsgOkFollowsLegacyParseBoolean()
     {
         var msg = new Message("T_W", Encoding.UTF8.GetBytes("x"));
-        Assert.True(msg.WaitStoreMsgOk);                                  // 缺省
+        Assert.True(msg.WaitStoreMsgOk);                                  // the default
         msg.WaitStoreMsgOk = true;
         Assert.True(msg.WaitStoreMsgOk);
         msg.WaitStoreMsgOk = false;
         Assert.False(msg.WaitStoreMsgOk);
         msg.Properties[MessageConst.PropertyWaitStoreMsgOk] = "TRUE";
         Assert.True(msg.WaitStoreMsgOk);
-        // 其它值一律 false（不是"非 false 即真"）
+        // every other value is false (not "anything that is not false is true")
         foreach (string raw in new[] { "1", "", "yes", "tru" })
         {
             msg.Properties[MessageConst.PropertyWaitStoreMsgOk] = raw;
@@ -292,7 +292,7 @@ public class CodecTests
         }
     }
 
-    // ---------------------------------------------------------------- 工具与哈希
+    // ---------------------------------------------------------------- Utilities and hashing
 
     [Fact]
     public void MessageQueue_HashCode_LegacySemantics()

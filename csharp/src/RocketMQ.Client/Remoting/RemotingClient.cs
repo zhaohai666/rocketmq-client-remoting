@@ -1,15 +1,19 @@
-// 提供：连接管理（惰性建连 + 复用 + TCP_NODELAY）、invokeSync / invokeAsync /
-// invokeOneway、opaque 到响应回调的分发、超时控制、连接状态探活。
+// Provides: connection management (lazy connect + reuse + TCP_NODELAY), invokeSync /
+// invokeAsync / invokeOneway, opaque-to-response callback dispatch, timeout control, and
+// connection liveness probing.
 //
-// 线程模型（读线程每连接一个）：
-//   - 调用线程：encode -> 锁写 -> Socket.Send 全量；随后在 invokeSync 里等事件
-//   - 读线程：阻塞 Receive -> 按 totalLength(4) 分帧 -> decode ->
-//             按 opaque 从响应表取出 future -> 唤醒调用线程 / 触发回调
-//   - 阻塞 Receive 在 socket 被另一线程 Close 时立即抛异常退出，
-//     因此不需要 select(300ms) 式轮询，关连接即可及时回收读线程。
+// Threading model (one reader thread per connection):
+//   - Calling thread: encode -> lock the write -> Socket.Send everything; then waits on an
+//     event inside invokeSync
+//   - Reader thread: blocking Receive -> frame by totalLength(4) -> decode ->
+//     look up the future in the response table by opaque -> wake the calling thread /
+//     fire the callback
+//   - A blocking Receive throws and exits immediately when the socket is closed by another
+//     thread, so no select(300ms)-style polling is needed; closing the connection reaps the
+//     reader thread promptly.
 //
-// 线格式：totalLength(4) | headerLength(4) | header | body
-//   totalLength = 4 + headerLength + bodyLength（即首 4 字节之后的所有字节数）
+// Wire format: totalLength(4) | headerLength(4) | header | body
+//   totalLength = 4 + headerLength + bodyLength (i.e. all bytes after the first 4 bytes)
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Globalization;
@@ -22,7 +26,7 @@ using RocketMQ.Remoting.Protocol;
 
 namespace RocketMQ.Remoting;
 
-/// <summary>带超时控制的 TCP 传输客户端。</summary>
+/// <summary>TCP transport client with timeout control.</summary>
 public sealed class RemotingClient : IDisposable
 {
     public delegate void InvokeCallback(RemotingCommand? response, Exception? error);
@@ -35,15 +39,18 @@ public sealed class RemotingClient : IDisposable
     {
         public required string Addr;
         public Socket Sock = null!;
-        // 写侧互斥。⚠ 它的存在不只是"别把两个请求的字节 interleleave"，还钉住了
-        // SslStream 的并发口径：运行时的 SslStream 用 _nestedRead / _nestedWrite 两个
-        // **互相独立**的标记位放行 I/O（见 System.Net.Security/SslStream.IO.cs），
-        // 也就是只支持"一路读 + 一路写"，同侧重入直接抛 invalidnestedcall。
-        // 本类每条连接只有一个读线程，加上这把写锁，正好落在被支持的形状里 ——
-        // 去掉它或再起第二个读线程，就会把 TLS 连接推到未定义行为上。
+        // Write-side mutex. WARNING: its purpose is not only preventing the bytes of two
+        // requests from interleaving; it also pins down the concurrency contract of
+        // SslStream: the runtime's SslStream uses the _nestedRead / _nestedWrite flags, which
+        // are **mutually independent**, to admit I/O (see System.Net.Security/SslStream.IO.cs),
+        // i.e. it only supports one read lane plus one write lane; same-lane reentrancy throws
+        // invalidnestedcall directly.
+        // This class has only one reader thread per connection, and with this write lock it
+        // lands exactly in the supported shape — removing it or starting a second reader
+        // thread would push the TLS connection into undefined behavior.
         public readonly object WriteLock = new();
         public volatile bool ReaderDone;
-        // TLS 会话（TLS 启用时非空；读写走 SslStream）
+        // TLS session (non-null when TLS is enabled; reads/writes go through SslStream)
         public SslStream? Tls;
     }
 
@@ -82,17 +89,20 @@ public sealed class RemotingClient : IDisposable
     private readonly object _sweepLock = new();
     private Timer? _sweeper;
 
-    // broker 主动请求处理器表：requestCode -> handler。仅用于事务回查
-    // (CHECK_TRANSACTION_STATE=39) 这类「服务端反过来找我」的命令。
+    // Broker-initiated request processor table: requestCode -> handler. Only used for
+    // commands like transaction check-back (CHECK_TRANSACTION_STATE=39), i.e. "the server
+    // comes back to me".
     private readonly Dictionary<int, RequestProcessor> _processors = new();
     private readonly object _procLock = new();
 
-    // 读线程账本：读线程自行结束后置 ReaderDone，由 PruneThreads 回收，避免句柄无限堆积。
+    // Reader-thread ledger: reader threads set ReaderDone on exit and are reclaimed by
+    // PruneThreads, avoiding unbounded handle accumulation.
     private readonly object _threadMutex = new();
     private readonly List<(Connection conn, Thread thread)> _threads = new();
 
-    // RPC 钩子（ACL 等）。注册发生在 start 阶段；发送路径只在锁内取一次引用，
-    // **绝不持锁调用钩子**（钩子内部要做签名计算）。
+    // RPC hook (ACL etc.). Registration happens at the start phase; the send path only
+    // takes one reference under the lock and **never calls the hook while holding the
+    // lock** (the hook needs to do signature computation).
     private readonly object _hookLock = new();
     private IRpcHook? _rpcHook;
 
@@ -118,9 +128,11 @@ public sealed class RemotingClient : IDisposable
         }
     }
 
-    /// <summary>当前已注册的请求钩子（未注册返回 null）。供 trace 启动这类「往已有链上
-    /// 追加一段」的场景读取 —— 单槽传输层换钩子要拿着旧值才能组合（先 Unregister 再
-    /// Register 链，中间不留空窗的责任在调用方）。</summary>
+    /// <summary>The currently registered request hook (null when none is registered). For
+    /// scenarios like trace startup that need to read it in order to "append a segment to an
+    /// existing chain" — swapping hooks on the single-slot transport requires the old value to
+    /// compose (the caller is responsible for leaving no gap when unregistering then
+    /// registering the chain).</summary>
     public IRpcHook? CurrentHook() => CurrentRpcHook();
 
     private IRpcHook? CurrentRpcHook()
@@ -148,9 +160,10 @@ public sealed class RemotingClient : IDisposable
     }
 
     /// <summary>
-    /// 严格校验的主机名/SAN 匹配：host 是 IP 时比对 IP SAN，否则比对 DNS SAN
-    /// （精确或 <c>*.example</c> 单层通配）。CustomRootTrust 链不查名字，所以
-    /// RemoteCertificateValidationCallback 里必须自己补这一步。
+    /// Strictly validated hostname/SAN matching: when host is an IP, compare against IP SANs,
+    /// otherwise compare against DNS SANs (exact or the single-level wildcard
+    /// <c>*.example</c>). The CustomRootTrust chain does not check names, so this step must be
+    /// added inside RemoteCertificateValidationCallback.
     /// </summary>
     internal static bool CertMatchesHostname(X509Certificate2 cert, string hostname)
     {
@@ -161,8 +174,8 @@ public sealed class RemotingClient : IDisposable
             if (ext is not X509SubjectAlternativeNameExtension san) continue;
             if (hostIsIp)
             {
-                // EnumerateIPAddresses() 返回 IEnumerable<IPAddress>（.NET 10）。
-                // 归一比较：顺带处理 ::ffff:127.0.0.1 这类 IPv4-mapped 形态。
+                // EnumerateIPAddresses() returns IEnumerable<IPAddress> (.NET 10).
+                // Normalized comparison: also handles IPv4-mapped forms like ::ffff:127.0.0.1.
                 foreach (IPAddress ip in san.EnumerateIPAddresses())
                 {
                     if (ip.Equals(hostIp)) return true;
@@ -174,7 +187,8 @@ public sealed class RemotingClient : IDisposable
                 foreach (var dns in san.EnumerateDnsNames())
                 {
                     if (dns.Equals(hostname, StringComparison.OrdinalIgnoreCase)) return true;
-                    // 单层通配：*.example.com 匹配 a.example.com，不匹配 a.b.example.com
+                    // single-level wildcard: *.example.com matches a.example.com but not
+                    // a.b.example.com
                     if (dns.StartsWith("*.", StringComparison.Ordinal))
                     {
                         var suffix = dns[1..]; // ".example.com"
@@ -188,7 +202,8 @@ public sealed class RemotingClient : IDisposable
                 }
             }
         }
-        // 兜底：无 SAN 段时退回 CN（RFC 6125 已废弃，但对老证书仍有用）
+        // Fallback: when there is no SAN extension, fall back to CN (deprecated by RFC 6125
+        // but still useful for old certificates)
         if (!cert.Extensions.OfType<X509SubjectAlternativeNameExtension>().Any())
         {
             var cn = cert.GetNameInfo(X509NameType.DnsName, false);
@@ -208,7 +223,7 @@ public sealed class RemotingClient : IDisposable
 
     public int InvokeTimeoutMillis => _invokeTimeoutMillis;
 
-    /// <summary>当前活跃连接数（测试/诊断用）。</summary>
+    /// <summary>Current number of active connections (for tests/diagnostics).</summary>
     public int ConnectionCount
     {
         get
@@ -222,12 +237,12 @@ public sealed class RemotingClient : IDisposable
 
     public int PendingRequestCount => _respTable.Count;
 
-    // ---------------------------------------------------------------- 建连
+    // ---------------------------------------------------------------- connecting
 
     private static Socket ConnectWithTimeout(string host, int port, int timeoutMillis, out string error)
     {
         error = string.Empty;
-        // IPv6 字面量直接交给 IPAddress.Parse；主机名走 DNS
+        // IPv6 literals go straight to IPAddress.Parse; hostnames go through DNS
         IPAddress[] addresses;
         try
         {
@@ -251,7 +266,7 @@ public sealed class RemotingClient : IDisposable
             var sock = new Socket(ip.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
             try
             {
-                // ConnectAsync + 超时：非阻塞建连、限时拿结果
+                // ConnectAsync + timeout: non-blocking connect, take the result within a limit
                 using var cts = new CancellationTokenSource(timeoutMillis);
                 Task connectTask = sock.ConnectAsync(ip, port, cts.Token).AsTask();
                 try
@@ -260,14 +275,14 @@ public sealed class RemotingClient : IDisposable
                 }
                 catch (AggregateException) when (cts.IsCancellationRequested)
                 {
-                    // 连接超时
+                    // connection timeout
                     try
                     {
                         sock.Dispose();
                     }
                     catch
                     {
-                        // dispose 失败忽略
+                        // dispose failure ignored
                     }
 
                     continue;
@@ -284,7 +299,7 @@ public sealed class RemotingClient : IDisposable
                 }
                 catch
                 {
-                    // dispose 失败忽略
+                    // dispose failure ignored
                 }
             }
         }
@@ -297,11 +312,11 @@ public sealed class RemotingClient : IDisposable
     {
         try
         {
-            sock.NoDelay = true; // TCP_NODELAY：请求需低延迟
+            sock.NoDelay = true; // TCP_NODELAY: requests need low latency
         }
         catch
         {
-            // 个别平台不支持，忽略
+            // not supported on some platforms; ignore
         }
     }
 
@@ -335,7 +350,7 @@ public sealed class RemotingClient : IDisposable
         }
     }
 
-    /// <summary>"host:port" 拆分，支持 IPv6 的 [::1]:10911 形式。</summary>
+    /// <summary>Splits "host:port", supporting the IPv6 [::1]:10911 form.</summary>
     public static void ParseAddress(string addr, out string host, out string port)
     {
         host = string.Empty;
@@ -352,7 +367,7 @@ public sealed class RemotingClient : IDisposable
             }
         }
 
-        // IPv4 / 主机名：最后一个 ':' 之后是端口
+        // IPv4 / hostname: the port is after the last ':'
         int lastColon = addr.LastIndexOf(':');
         if (lastColon < 0)
         {
@@ -366,8 +381,9 @@ public sealed class RemotingClient : IDisposable
 
     private Connection GetOrCreateConnection(string addr)
     {
-        // shutdown 之后不再建连：读线程退出时会投递回调（FailFast / 正常响应），回调里
-        // 若重进传输层，就会在 Shutdown 正持有 _threadMutex 等 Join 的当口往账本里塞新线程。
+        // No more connections after shutdown: the reader thread fires callbacks when it exits,
+        // and if a callback re-enters the transport layer it would add new threads to the
+        // ledger while Shutdown holds _threadMutex waiting to Join.
         if (!_running)
         {
             throw new RemotingConnectException("remoting client is shut down, " + addr);
@@ -381,7 +397,7 @@ public sealed class RemotingClient : IDisposable
             }
         }
 
-        // 建连放到锁外，避免慢 connect 阻塞其它地址
+        // Connecting is done outside the lock so a slow connect does not block other addresses
         ParseAddress(addr, out string host, out string portStr);
         int port = int.TryParse(portStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out int p) ? p : 0;
 
@@ -415,9 +431,11 @@ public sealed class RemotingClient : IDisposable
                     var clientCerts = new X509CertificateCollection();
                     if (tlsOpts!.ClientCert is not null)
                     {
-                        // PEM(证书+私钥) → X509Certificate2。⚠ macOS 的 SslStream 不认
-                        // CreateFromPemFile 产出的**临时**私钥，必须先导出成 PFX 再用
-                        // X509CertificateLoader 加载（PKCS#12 容器），否则客户端证书无法出示。
+                        // PEM(cert+key) -> X509Certificate2. WARNING: macOS's SslStream does
+                        // not recognize the **ephemeral** private key produced by
+                        // CreateFromPemFile; it must first be exported to PFX and loaded with
+                        // X509CertificateLoader (a PKCS#12 container), otherwise the client
+                        // certificate cannot be presented.
                         var withKey = string.IsNullOrEmpty(tlsOpts.ClientKey)
                             ? X509CertificateLoader.LoadCertificateFromFile(tlsOpts.ClientCert)
                             : X509Certificate2.CreateFromPemFile(tlsOpts.ClientCert, tlsOpts.ClientKey);
@@ -445,15 +463,18 @@ public sealed class RemotingClient : IDisposable
                             };
                             if (!custom.Build(peer))
                             {
-                                // 失败原因落到日志：链状态逐条打出来，否则只看到一句
-                                // "rejected by callback" 无法区分链败还是名字败。
+                                // Failure reasons go to the log: chain statuses are printed one
+                                // by one, otherwise all you see is a single
+                                // "rejected by callback" and cannot tell a chain failure from
+                                // a name failure.
                                 var statuses = string.Join(",", custom.ChainStatus.Select(s => s.Status));
                                 ClientLog.Warn("tls strict: chain build failed for " + peer.Subject
                                                + " (SAN=" + CertHasSan(peer) + "), status=[" + statuses + "]");
                                 return false;
                             }
-                            // 主机名/SAN 校验（CustomRootTrust 链不含名字检查）：
-                            // host 是 IP 时比 IP SAN，否则比 DNS SAN（支持 *.example 通配）。
+                            // Hostname/SAN validation (the CustomRootTrust chain includes no
+                            // name check): when host is an IP, compare IP SANs, otherwise
+                            // compare DNS SANs (supports the *.example wildcard).
                             if (!CertMatchesHostname(peer, targetName))
                             {
                                 ClientLog.Warn("tls strict: hostname mismatch, target=" + targetName
@@ -469,7 +490,7 @@ public sealed class RemotingClient : IDisposable
                 else
                 {
                     ssl = new SslStream(ns, false,
-                        (sender, cert, chain, errors) => true);   // test mode：信任一切
+                        (sender, cert, chain, errors) => true);   // test mode: trust everything
                     ssl.AuthenticateAsClient(host);
                 }
                 conn.Tls = ssl;
@@ -485,7 +506,7 @@ public sealed class RemotingClient : IDisposable
 
         lock (_connMutex)
         {
-            // 并发建连：若已有别人先建成，放弃自己的 socket
+            // Concurrent connects: if someone else already won, discard our own socket
             if (_conns.TryGetValue(addr, out Connection? winner) && winner.Sock is { Connected: true })
             {
                 try
@@ -494,7 +515,7 @@ public sealed class RemotingClient : IDisposable
                 }
                 catch
                 {
-                    // dispose 失败忽略
+                    // dispose failure ignored
                 }
 
                 return winner;
@@ -520,7 +541,7 @@ public sealed class RemotingClient : IDisposable
         return conn;
     }
 
-    // ---------------------------------------------------------------- 读循环
+    // ---------------------------------------------------------------- read loop
 
     private void ReadLoop(Connection conn)
     {
@@ -538,8 +559,9 @@ public sealed class RemotingClient : IDisposable
             }
             catch (Exception)
             {
-                // shutdown()/closeChannel() 关闭 socket 会让 Receive 立即抛异常退出，
-                // 属正常退出路径，记 DEBUG（默认 INFO 下不可见，不会出现"退出时的假异常"噪声）。
+                // shutdown()/closeChannel() closing the socket makes Receive throw and exit
+                // immediately; this is a normal exit path, so log it at DEBUG (invisible under
+                // the default INFO level, avoiding "spurious exception on exit" noise).
                 if (_running)
                 {
                     ClientLog.Debug("remoting reader: connection " + conn.Addr + " closed, reader exiting");
@@ -561,7 +583,8 @@ public sealed class RemotingClient : IDisposable
             buf.Write(chunk, 0, n);
             buf.Flush();
 
-            // 按 totalLength 前缀切帧；粘包/半包都由这里处理
+            // Split frames by the totalLength prefix; sticky packets / partial packets are
+            // both handled here
             byte[] data = buf.GetBuffer();
             int consumed = 0;
             while (true)
@@ -585,7 +608,7 @@ public sealed class RemotingClient : IDisposable
 
                 if (available < 4 + totalLen)
                 {
-                    break; // 半包，继续收
+                    break; // partial packet, keep receiving
                 }
 
                 byte[] frame = new byte[4 + totalLen];
@@ -594,7 +617,7 @@ public sealed class RemotingClient : IDisposable
                 Dispatch(frame, conn.Addr);
             }
 
-            // 把已消费的字节移出缓冲
+            // move the consumed bytes out of the buffer
             if (consumed > 0)
             {
                 int rest = (int)buf.Length - consumed;
@@ -630,7 +653,8 @@ public sealed class RemotingClient : IDisposable
                 continue;
             }
 
-            // TryRemove 决定归属：与读线程/清理线程抢同一 opaque 时只有一方拿到非空值
+            // TryRemove decides ownership: when racing the reader/sweeper thread for the
+            // same opaque, only one side gets a non-null value
             if (!_respTable.TryRemove(kv.Key, out Future? removed) || removed is null)
             {
                 continue;
@@ -662,7 +686,7 @@ public sealed class RemotingClient : IDisposable
                 }
             }
 
-            // 与 SweepExpired 同理：回调必须脱离在途表执行
+            // Same as SweepExpired: callbacks must run outside the in-flight table
             cb?.Invoke(null, error);
         }
 
@@ -678,13 +702,14 @@ public sealed class RemotingClient : IDisposable
         {
             ClientLog.Warn("remoting reader: drop undecodable frame ("
                 + frame.Length.ToString(CultureInfo.InvariantCulture) + " bytes) from " + from);
-            return; // 解不出的帧直接丢，不影响其它请求
+            return; // undecodable frames are dropped directly, not affecting other requests
         }
 
         if (!_respTable.TryRemove(cmd.Opaque, out Future? future))
         {
-            // 在途表里查不到：要么是迟到的响应，要么是 **broker 主动发来的请求**。
-            // 后者交给已注册的处理器（典型：事务回查 CHECK_TRANSACTION_STATE=39）。
+            // Not found in the in-flight table: either a late response or a **broker-initiated
+            // request**. The latter goes to the registered processor (typically the
+            // transaction check-back CHECK_TRANSACTION_STATE=39).
             if (!cmd.IsResponseType())
             {
                 RequestProcessor? proc = null;
@@ -695,13 +720,16 @@ public sealed class RemotingClient : IDisposable
 
                 if (proc is not null)
                 {
-                    // 处理器在读线程里执行：异常必须兜住，否则读线程会死掉，
-                    // 该连接上其余响应会全部丢失（比丢一条回查严重得多）。
+                    // The processor runs in the reader thread: exceptions must be caught,
+                    // otherwise the reader thread dies and all other responses on that
+                    // connection are lost (far worse than losing one check-back).
                     try
                     {
                         RemotingCommand? resp = proc(cmd, from);
-                        // 处理器产出了响应（典型 326 必须回 SUCCESS/SYSTEM_ERROR，broker 侧是
-                        // invokeSync，不回响应它那边会超时）；按请求 opaque 原样回填并标记响应位。
+                        // The processor produced a response (typically 326 must reply
+                        // SUCCESS/SYSTEM_ERROR; on the broker side it is invokeSync, and it
+                        // times out if no response is sent); echo back the request's opaque
+                        // verbatim and set the response bit.
                         if (resp is not null)
                         {
                             resp.Opaque = cmd.Opaque;
@@ -726,13 +754,14 @@ public sealed class RemotingClient : IDisposable
                 }
                 else
                 {
-                    // 未开启事务时 broker 不会发这类请求，属于预期情况，不用 Warn
+                    // When transactions are not enabled the broker never sends such requests,
+                    // so this is expected; no Warn needed
                     ClientLog.Debug("remoting: no processor for broker request code "
                         + cmd.Code.ToString(CultureInfo.InvariantCulture) + " from " + from);
                 }
             }
 
-            return; // 迟到的响应 / 已处理完的 broker 请求
+            return; // late response / already-handled broker request
         }
 
         InvokeCallback? cb = null;
@@ -759,7 +788,7 @@ public sealed class RemotingClient : IDisposable
         }
     }
 
-    /// <summary>注销按 requestCode 索引的请求处理器。</summary>
+    /// <summary>Unregisters the request processor indexed by requestCode.</summary>
     public void UnregisterProcessor(int requestCode)
     {
         lock (_procLock)
@@ -768,14 +797,16 @@ public sealed class RemotingClient : IDisposable
         }
     }
 
-    // ---------------------------------------------------------------- 发送
+    // ---------------------------------------------------------------- sending
 
-    // 把请求写出去，返回**实际使用的那条连接**：调用方把它记在在途表项上，
-    // 连接断开时靠对象引用判断该失败哪些请求（见 FailFast）。
+    // Writes the request out, returning **the connection actually used**: the caller records
+    // it on the in-flight table entry, and when the connection drops that object reference
+    // determines which requests should fail (see FailFast).
     private Connection SendRequest(string addr, RemotingCommand request)
     {
-        // RPC 钩子必须在 Encode() **之前**执行：ACL 钩子把 AccessKey/Signature 写进
-        // ExtFields，而签名覆盖的正是「即将上线的这份 ExtFields + Body」。
+        // The RPC hook must run **before** Encode(): the ACL hook writes AccessKey/Signature
+        // into ExtFields, and the signature covers exactly "this ExtFields + Body about to go
+        // on the wire".
         CurrentRpcHook()?.DoBeforeRequest(addr, request);
         Connection conn = GetOrCreateConnection(addr);
         byte[] data = request.Encode();
@@ -807,7 +838,7 @@ public sealed class RemotingClient : IDisposable
     {
         if (conn.Tls is not null)
         {
-            // SslStream.Write 语义 = 写完全部字节
+            // SslStream.Write semantics = write all bytes
             conn.Tls.Write(data, 0, data.Length);
             return;
         }
@@ -852,9 +883,10 @@ public sealed class RemotingClient : IDisposable
         }
     }
 
-    // ---------------------------------------------------------------- opaque 登记
+    // ---------------------------------------------------------------- opaque registration
 
-    // 取得一个**在途请求中唯一**的 opaque，并在同一把锁内登记 future。
+    // Acquires an opaque that is **unique among in-flight requests** and registers the future
+    // under the same lock.
     private Future RegisterFutureAcquiringOpaque(RemotingCommand request, InvokeCallback? cb,
         string addr = "", long timeoutMillis = 0)
     {
@@ -863,7 +895,8 @@ public sealed class RemotingClient : IDisposable
             Callback = cb,
             Addr = addr,
             TimeoutMs = timeoutMillis,
-            // timeoutMillis == 0 表示不交给清理线程（同步路径自己等、自己摘）
+            // timeoutMillis == 0 means "do not hand to the sweeper" (the sync path waits and
+            // removes it itself)
             DeadlineMs = timeoutMillis > 0 ? Future.MonoNowMs() + timeoutMillis : 0,
         };
         lock (_respTable)
@@ -887,7 +920,7 @@ public sealed class RemotingClient : IDisposable
 
     private void UnregisterFuture(int opaque) => _respTable.TryRemove(opaque, out _);
 
-    /// <summary>启动超时清理线程（幂等；只有异步调用才需要）。</summary>
+    /// <summary>Starts the timeout sweeper thread (idempotent; only async calls need it).</summary>
     private void EnsureSweeper()
     {
         lock (_sweepLock)
@@ -915,7 +948,8 @@ public sealed class RemotingClient : IDisposable
             return;
         }
 
-        // Dispose(waitHandle) 等到正在执行的那一轮结束，效果相当于 join 清理线程。
+        // Dispose(waitHandle) waits for the in-flight round to finish, equivalent to joining
+        // the sweeper thread.
         using var done = new ManualResetEvent(false);
         timer.Dispose(done);
         try
@@ -924,7 +958,7 @@ public sealed class RemotingClient : IDisposable
         }
         catch (ObjectDisposedException)
         {
-            // 已完成，忽略
+            // already finished; ignore
         }
     }
 
@@ -941,7 +975,8 @@ public sealed class RemotingClient : IDisposable
                 continue;
             }
 
-            // TryRemove 决定归属：与读线程同时摘同一 opaque 时只有一方拿到非空值
+            // TryRemove decides ownership: when removing the same opaque concurrently with the
+        // reader thread, only one side gets a non-null value
             if (!_respTable.TryRemove(kv.Key, out Future? removed) || removed is null)
             {
                 continue;
@@ -968,22 +1003,24 @@ public sealed class RemotingClient : IDisposable
                 f.Done.Set();
                 if (f.CallbackFired)
                 {
-                    continue;  // 读线程已经抢先投递（响应正好赶在宽限期内到）
+                    continue;  // the reader thread already delivered first (the response
+                              // arrived just within the grace period)
                 }
 
                 f.CallbackFired = true;
                 cb = f.Callback;
             }
 
-            // 回调必须**脱离在途表**执行：回调里常常还要回到传输层或业务层，
-            // 持表回调会和 shutdown 抢同一把锁，也可能自锁。
+            // Callbacks must run **outside the in-flight table**: callbacks often go back to
+            // the transport or business layer, and invoking while holding the table would
+            // race with shutdown for the same lock and may self-deadlock.
             cb?.Invoke(null, new RemotingTimeoutException(f.Addr + " async invoke timeout "
                 + f.TimeoutMs.ToString(CultureInfo.InvariantCulture) + " ms, opaque="
                 + opaque.ToString(CultureInfo.InvariantCulture)));
         }
     }
 
-    // ---------------------------------------------------------------- 公开调用
+    // ---------------------------------------------------------------- public calls
 
     public RemotingCommand InvokeSync(string addr, RemotingCommand request, int timeoutMillis = -1)
     {
@@ -999,13 +1036,15 @@ public sealed class RemotingClient : IDisposable
     }
 
     /// <summary>
-    /// 单次请求-应答：登记 opaque、写出、等响应或超时。不含 GO_AWAY 判定。
-    /// 对端在响应之前断开连接时立刻抛 RemotingSendRequestException（读线程的 FailFast
-    /// 把等待方叫醒），不会等满 timeout 再报一个语义错误的超时。
+    /// Single request-answer: register opaque, write out, wait for a response or timeout. No
+    /// GO_AWAY judgment. When the peer closes the connection before responding, it throws
+    /// RemotingSendRequestException immediately (the reader thread's FailFast wakes the
+    /// waiter); it does not wait for the full timeout to report a semantically wrong timeout.
     /// </summary>
     private RemotingCommand InvokeOnce(string addr, RemotingCommand request, int timeout)
     {
-        // timeoutMillis 传 0：同步路径自己等、自己摘，不交给清理线程重复判超时。
+        // timeoutMillis of 0: the sync path waits and removes the future itself, not handing
+        // duplicate timeout judgment to the sweeper.
         Future future = RegisterFutureAcquiringOpaque(request, null, addr, 0);
         int opaque = request.Opaque;
         try
@@ -1117,7 +1156,8 @@ public sealed class RemotingClient : IDisposable
                 }
                 catch (Exception retryError)
                 {
-                    // 回调契约：失败也只能通过 error 表达，不能把异常抛回读线程
+                    // Callback contract: failures may only be expressed through error;
+                    // exceptions must not be thrown back into the reader thread
                     callback(null, retryError);
                 }
             });
@@ -1140,7 +1180,7 @@ public sealed class RemotingClient : IDisposable
         SendRequest(addr, request);
     }
 
-    /// <summary>连接是否存活（探活）。</summary>
+    /// <summary>Whether the connection is alive (liveness probe).</summary>
     public bool IsChannelWritable(string addr)
     {
         lock (_connMutex)
@@ -1151,9 +1191,11 @@ public sealed class RemotingClient : IDisposable
 
     private static void CloseQuietly(Connection conn)
     {
-        // WriteLock 同时也是 socket 生命周期的锁：写路径失败时持锁关掉它，读线程退出时也走
-        // 这里，于是既不会重复 Dispose（SslStream/Socket 二次 dispose 只是没意义，把已归还
-        // 的句柄再关一次才真危险），也不会出现"一路在 Send、另一路把 socket 抽走"的窗口。
+        // WriteLock is also the lock for the socket lifetime: the write path closes it under
+        // the lock on failure, and the reader thread's exit path comes through here too, so
+        // there is neither a duplicate Dispose (a second dispose of SslStream/Socket is merely
+        // pointless; closing an already-returned handle again is the truly dangerous part) nor
+        // a window where "one lane is Sending while another yanks the socket away".
         lock (conn.WriteLock)
         {
             if (conn.Sock is null)
@@ -1167,7 +1209,7 @@ public sealed class RemotingClient : IDisposable
             }
             catch
             {
-                // dispose 失败忽略
+                // dispose failure ignored
             }
 
             try
@@ -1176,14 +1218,14 @@ public sealed class RemotingClient : IDisposable
             }
             catch
             {
-                // dispose 失败忽略
+                // dispose failure ignored
             }
 
             conn.Sock = null!;
         }
     }
 
-    /// <summary>主动关闭单条连接；读线程会自行退出并清理。</summary>
+    /// <summary>Actively closes a single connection; the reader thread exits and cleans up on its own.</summary>
     public void CloseChannel(string addr)
     {
         Connection? conn;
@@ -1195,14 +1237,15 @@ public sealed class RemotingClient : IDisposable
             }
         }
 
-        // 关闭 socket 会让读线程的 Receive 立即抛异常并自行退出
+        // Closing the socket makes the reader thread's Receive throw immediately and exit on its own
         CloseQuietly(conn);
     }
 
-    /// <summary>预留：NameServer 地址列表由上层（MQClientInstance）维护。</summary>
+    /// <summary>Reserved: the NameServer address list is maintained by the upper layer (MQClientInstance).</summary>
     public void UpdateNameServerAddressList(IReadOnlyList<string> addrs)
     {
-        // 由上层 MQClientInstance 维护 NameServer 列表；传输层不持有
+        // The NameServer list is maintained by the upper-layer MQClientInstance; the transport
+        // layer does not hold it
     }
 
     private void PruneThreads()
@@ -1219,17 +1262,17 @@ public sealed class RemotingClient : IDisposable
         }
     }
 
-    /// <summary>关闭全部连接并回收读线程；可重复调用。</summary>
+    /// <summary>Closes all connections and reaps reader threads; safe to call repeatedly.</summary>
     public void Shutdown()
     {
         if (!_running)
         {
-            return; // 已关闭
+            return; // already closed
         }
 
         _running = false;
-        // 先停清理线程：它会在别的线程上触发回调，必须早于关连接退出，
-        // 否则 shutdown 之后还可能冒出一个超时回调。
+        // Stop the sweeper first: it fires callbacks on other threads and must exit before
+        // closing connections, otherwise a timeout callback could still pop up after shutdown.
         StopSweeper();
         List<Connection> all;
         lock (_connMutex)
@@ -1238,7 +1281,7 @@ public sealed class RemotingClient : IDisposable
             _conns.Clear();
         }
 
-        // 关闭 socket 让阻塞中的 reader 立刻退出
+        // Closing the socket makes blocked readers exit immediately
         foreach (Connection c in all)
         {
             CloseQuietly(c);

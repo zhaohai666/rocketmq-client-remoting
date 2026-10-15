@@ -49,7 +49,7 @@ def wait_for(cond, timeout: float = 20.0, interval: float = 0.3) -> bool:
 
 
 class CheckConfigProbe(RPCHook):
-    """钩在 transport 上，抓启动期真正发出去的 46 号请求（含 body）。"""
+    """A hook on the transport that captures the code-46 requests really sent during startup (with the body)."""
 
     def __init__(self):
         self.requests: List[tuple] = []        # (addr, code)
@@ -70,7 +70,7 @@ class CheckConfigProbe(RPCHook):
 
 
 class Collector:
-    """攒下消费到的消息。SimpleMessageListener 只吃一个纯函数，所以包一层给出 listener。"""
+    """Collects the consumed messages. SimpleMessageListener only takes a plain function, so this wraps one to expose a listener."""
 
     def __init__(self):
         self.msgs = []
@@ -90,7 +90,7 @@ def new_consumer(group: str, selector: Optional[MessageSelector] = None,
                  expression: Optional[str] = None,
                  probe: Optional[CheckConfigProbe] = None
                  ) -> Tuple[DefaultMQPushConsumer, Collector]:
-    """建一个订阅本 topic 的 push 消费者（probe 非空时把 RPC 钩子装上取证）。"""
+    """Build a push consumer subscribing to this topic (when probe is non-None the RPC hook is installed to gather evidence)."""
     c = DefaultMQPushConsumer(group)
     c.set_namesrv_addr(NAMESRV)
     if probe is not None:
@@ -111,21 +111,21 @@ def main() -> int:
     prod.start()
     try:
         prod.create_topic("TBW102", TOPIC, 4)
-        check("T0 topic 路由就绪（4 队列）",
+        check("T0 the topic route is ready (4 queues)",
               wait_for(lambda: len(
                   prod._mq_client.get_topic_publish_info(TOPIC).msg_queue_list) >= 4, 20.0))
 
-        # ---------- S1 线上取证：46 号请求的形状 ----------
-        print("\n---------- S1 启动期的 46 号请求 ----------")
+        # ---------- S1 live evidence: the shape of the code-46 request ----------
+        print("\n---------- S1 the code-46 request during startup ----------")
         probe = CheckConfigProbe()
         c1, _ = new_consumer(GROUP + "_SQL", MessageSelector.by_sql("color = 'red'"),
                              probe=probe)
         c1.start()
-        check("SQL92 订阅触发恰好一笔 CHECK_CLIENT_CONFIG(46)", probe.check_count == 1,
+        check("the SQL92 subscription triggers exactly one CHECK_CLIENT_CONFIG(46)", probe.check_count == 1,
               "codes=%s" % probe.codes)
         body = probe.bodies[0] if probe.bodies else {}
         sd = body.get("subscriptionData") or {}
-        check("body 是 CheckClientRequestBody（clientId / group / subscriptionData）",
+        check("the body is a CheckClientRequestBody (clientId / group / subscriptionData)",
               body.get("group") == GROUP + "_SQL" and body.get("clientId") == c1.client_id
               and sd.get("expressionType") == "SQL92"
               and sd.get("subString") == "color = 'red'" and sd.get("topic") == TOPIC,
@@ -135,12 +135,12 @@ def main() -> int:
         tag_probe = CheckConfigProbe()
         c2, _ = new_consumer(GROUP + "_TAG", probe=tag_probe, expression="tagA || tagB")
         c2.start()
-        check("纯 TAG 订阅一笔 46 都不发（isTagType 短路）",
+        check("a pure TAG subscription does not send a single code-46 (isTagType short-circuits)",
               tag_probe.check_count == 0, str(tag_probe.codes))
         c2.shutdown()
 
-        # ---------- S2 / S3：消费者先起来，再发消息 ----------
-        print("\n---------- S2 broker 按属性过滤 / S3 永不匹配的表达式 ----------")
+        # ---------- S2 / S3: bring the consumers up first, then send the messages ----------
+        print("\n---------- S2 the broker filters by property / S3 an expression that never matches ----------")
         red_c, red_col = new_consumer(GROUP + "_FILTER",
                                       MessageSelector.by_sql("color = 'red'"))
         green_c, green_col = new_consumer(GROUP + "_NONE",
@@ -155,28 +155,28 @@ def main() -> int:
                 m = Message(TOPIC, text.encode("utf-8"), keys="%s-%s-%d" % (STAMP, color, i))
                 m.put_property("color", color)
                 r = prod.send(m)
-                check("发送 %s 成功" % text, r.send_status == SendStatus.SEND_OK,
+                check("sending %s succeeded" % text, r.send_status == SendStatus.SEND_OK,
                       str(r.send_status))
                 sent[color].append(text)
 
         wait_for(lambda: len(all_col.msgs) >= 6, 25.0)
-        time.sleep(4.0)                        # 再等一会，确认 green 不是"来得晚"
+        time.sleep(4.0)                        # wait a bit longer to confirm green did not simply "arrive late"
         red_bodies, all_bodies = red_col.bodies(), all_col.bodies()
-        check("SQL92(color=red) 收到 3 条，且正好是发出去的那 3 条",
+        check("SQL92(color=red) received 3 messages, exactly the 3 that were sent",
               red_bodies == sorted(sent["red"]), str(red_bodies))
-        check("TAG '*' 对照组收到 6 条（红+蓝全在）",
+        check("the TAG '*' control group received all 6 messages (red + blue)",
               all_bodies == sorted(sent["red"] + sent["blue"]), str(all_bodies))
-        check("blue 的 3 条没漏进 SQL92 消费者（证明 broker 真在过滤）",
+        check("none of the 3 blue messages leaked into the SQL92 consumer (proving the broker really filters)",
               all(b not in red_bodies for b in sent["blue"]), str(red_bodies))
         props = {m.properties.get("color") for m in red_col.msgs}
-        check("收到的消息属性 color 可读且都是 red", props == {"red"}, str(props))
-        check("订阅永不匹配的 color='green' ⇒ 一条都没收到",
+        check("the color property of the received messages is readable and all red", props == {"red"}, str(props))
+        check("subscribing to the never-matching color='green' => not a single message received",
               len(green_col.msgs) == 0, green_col.bodies())
         for c in (red_c, green_c, all_c):
             c.shutdown()
 
-        # ---------- S4 反证：非法表达式让启动失败 ----------
-        print("\n---------- S4 非法表达式在启动期失败 ----------")
+        # ---------- S4 counter-proof: an illegal expression makes startup fail ----------
+        print("\n---------- S4 an illegal expression fails during startup ----------")
         c4, _ = new_consumer(GROUP + "_BAD", MessageSelector.by_sql("color =="))
         err: Optional[MQClientException] = None
         t0 = time.time()
@@ -185,21 +185,21 @@ def main() -> int:
         except MQClientException as e:
             err = e
         cost = time.time() - t0
-        check("start() 抛出 MQClientException", err is not None, repr(err))
-        check("错误码是 broker 的 SUBSCRIPTION_PARSE_FAILED(23)",
+        check("start() raised an MQClientException", err is not None, repr(err))
+        check("the error code is the broker's SUBSCRIPTION_PARSE_FAILED(23)",
               err is not None
               and err.response_code == ResponseCode.SUBSCRIPTION_PARSE_FAILED,
               "code=%s remark=%s" % (getattr(err, "response_code", None), err))
-        check("失败后消费者没留在已启动状态", c4._started is False)
-        check("非法表达式立刻失败（<5s，不是等超时兜底）", cost < 5.0, "%.2fs" % cost)
-        # 回滚干净了？同一个对象换个合法表达式应当能重新 start
+        check("after the failure the consumer did not stay in the started state", c4._started is False)
+        check("the illegal expression fails immediately (<5s, not waiting for a timeout fallback)", cost < 5.0, "%.2fs" % cost)
+        # Was the rollback clean? The same object with a legal expression should be startable again
         retry_err: Optional[Exception] = None
         try:
             c4.subscribe_with_selector(TOPIC, MessageSelector.by_sql("color = 'blue'"))
             c4.start()
         except Exception as e:                  # noqa: BLE001
             retry_err = e
-        check("失败后修正表达式可重新 start（启动已就地回滚）", retry_err is None,
+        check("after fixing the expression it can be started again (the startup rolled back in place)", retry_err is None,
               repr(retry_err))
         if retry_err is None:
             c4.shutdown()

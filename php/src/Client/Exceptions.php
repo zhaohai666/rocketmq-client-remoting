@@ -17,7 +17,8 @@ final class ClientErrorCode
 }
 
 /**
- * 对应 MQException 基类（RuntimeException）。response_code 非 0 时为 broker 侧错误码。
+ * Corresponds to the MQException base class (RuntimeException). A non-zero response_code
+ * is a broker-side error code.
  */
 class MQException extends \RuntimeException
 {
@@ -30,12 +31,12 @@ class MQException extends \RuntimeException
     }
 }
 
-/** 对应 MQClientException。response_code 非 0 时为 broker 侧错误码。 */
+/** Corresponds to MQClientException. A non-zero response_code is a broker-side error code. */
 class MQClientException extends MQException
 {
 }
 
-/** 对应 MQBrokerException：broker 返回非 SUCCESS 码。 */
+/** Corresponds to MQBrokerException: the broker returned a non-SUCCESS code. */
 class MQBrokerException extends MQException
 {
     public function __construct(int $responseCode, string $errorMessage = '', ?\Throwable $previous = null)

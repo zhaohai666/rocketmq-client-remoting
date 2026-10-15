@@ -1,11 +1,11 @@
 // -*- coding: utf-8 -*-
-// POP 协议 wire body：SetMessageRequestModeRequestBody / BatchAck /
-// BatchAckMessageRequestBody。
+// POP protocol wire bodies: SetMessageRequestModeRequestBody / BatchAck /
+// BatchAckMessageRequestBody.
 //
-// 注意：经典 remoting 协议的消费者从不发送 BATCH_ACK_MESSAGE（200151），
-// 其 POP 路径通过 ackAsync 逐条确认。这里导出批量确认只是因为该 wire 能力
-// 真实存在（broker 实现了它，新一代/proxy 客户端在使用）。不要把 POP 消费者的
-// 确认改走这里——那等于凭空发明客户端行为。
+// Note: consumers of the classic remoting protocol never send BATCH_ACK_MESSAGE (200151);
+// their POP path acknowledges messages one by one via ackAsync. We still export batch ack only
+// because that wire capability genuinely exists (the broker implements it, and newer/proxy clients
+// use it). Do NOT route POP consumer acks here — that would invent client behavior out of thin air.
 import { RemotingSerializable } from './serialize.ts';
 
 export const MESSAGE_REQUEST_MODE_PULL = 'PULL';
@@ -16,7 +16,7 @@ export const MESSAGE_REQUEST_MODE_POP = 'POP';
 export class SetMessageRequestModeRequestBody {
   topic = '';
   consumerGroup = '';
-  mode = MESSAGE_REQUEST_MODE_PULL; // 字段默认值：未显式设置 mode 的 body 请求 PULL。
+  mode = MESSAGE_REQUEST_MODE_PULL; // Field default: a body without an explicit mode requests PULL.
   popShareQueueNum = 0;
 
   toDict(): Record<string, any> {
@@ -30,12 +30,12 @@ export class SetMessageRequestModeRequestBody {
   encode(): Buffer { return RemotingSerializable.encode(this.toDict()); }
 }
 
-// java.util.BitSet 的 wire 形式：toByteArray() -> Base64。只发送最高置位
-// 所需的字节（toByteArray 会丢弃尾部零字节）。
+// Wire form of java.util.BitSet: toByteArray() -> Base64. Only the bytes required by the highest set
+// bit are sent (toByteArray drops trailing zero bytes).
 export class BitSet {
   bytes: Uint8Array | null = null;
 
-  // set(bitIndex)：bit 0 是 byte 0 的最低位（协议的位序约定）。
+  // set(bitIndex): bit 0 is the least significant bit of byte 0 (the protocol's bit ordering convention).
   set(bitIndex: number): void {
     if (bitIndex < 0) throw new Error('bitIndex < 0: ' + bitIndex);
     const byteIndex = bitIndex >> 3;
@@ -73,9 +73,9 @@ function trimZeroTail(bytes: Uint8Array): Uint8Array {
   return bytes.subarray(0, end);
 }
 
-// BatchAck：一条记录覆盖所有共享同一
-// (retry, queueId, startOffset, popTime) 分组的已确认消息。短键名（"c","t",
-// "r","so","q","rq","pt","it","b"）就是 wire 上的协议字段名。
+// BatchAck: one record covers all acknowledged messages sharing the same
+// (retry, queueId, startOffset, popTime) group. The short key names ("c","t",
+// "r","so","q","rq","pt","it","b") are the protocol field names on the wire.
 export class BatchAck {
   consumerGroup = '';
   topic = '';
@@ -107,11 +107,11 @@ export class BatchAckMessageRequestBody {
   encode(): Buffer { return RemotingSerializable.encode(this.toDict()); }
 }
 
-// buildBatchAckMessageRequestBody 执行批量确认要求的分组+位图步骤：共享
-// (retry, queueId, ckQueueOffset, popTime) 的 checkpoint 折叠为一条 BatchAck，
-// 位索引为 (msgQueueOffset - ckQueueOffset)。
+// buildBatchAckMessageRequestBody performs the grouping + bitmap steps required for batch ack:
+// checkpoints sharing (retry, queueId, ckQueueOffset, popTime) collapse into one BatchAck,
+// with the bit index (msgQueueOffset - ckQueueOffset).
 //
-// topic/consumerGroup 由调用方给出；其余值全部从 checkpoint 读回，不做猜测。
+// topic/consumerGroup are supplied by the caller; all other values are read back from the checkpoint, never guessed.
 export function buildBatchAckMessageRequestBody(
   topic: string, consumerGroup: string, extraInfos: string[],
 ): BatchAckMessageRequestBody {
@@ -158,8 +158,8 @@ function splitCk(extraInfo: string): string[] {
 }
 
 // ---------------------------------------------------------------------------
-// QUERY_ASSIGNMENT(400) 的 body：QueryAssignmentRequestBody /
-// QueryAssignmentResponseBody + MessageQueueAssignment。双向纯 JSON。
+// QUERY_ASSIGNMENT(400) body: QueryAssignmentRequestBody /
+// QueryAssignmentResponseBody + MessageQueueAssignment. Pure JSON in both directions.
 // ---------------------------------------------------------------------------
 
 export class QueryAssignmentRequestBody {
@@ -168,7 +168,7 @@ export class QueryAssignmentRequestBody {
   clientId = '';
   messageModel = 'CLUSTERING';
   strategyName = '';
-  // 协议还携带 extraInfo（POP 上下文）——总是发送，可以为空。
+  // The protocol also carries extraInfo (POP context) — always sent, may be empty.
   extraInfo = '';
 
   toDict(): Record<string, any> {
@@ -195,8 +195,8 @@ export class MessageQueueAssignment {
 }
 
 export class QueryAssignmentResponseBody {
-  // assignments 为 null 表示"结果无效，跳过本次更新"。空集合
-  // （broker 明确没分配任何队列）则是一次真实应答。
+  // assignments === null means "the result is invalid, skip this update". An empty set
+  // (the broker explicitly assigned no queues) is a genuine response.
   static decode(body: Buffer | null): Array<MessageQueueAssignment> | null {
     if (body == null || body.length === 0) return null;
     let obj: any;

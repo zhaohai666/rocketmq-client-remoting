@@ -1,5 +1,5 @@
-//! 提供：惰性建连 + 复用、同步 / 异步 / oneway 调用、opaque 匹配、半包重组、
-//! broker 主动请求派发、超时控制、TLS、RPC 钩子。
+//! Provides: lazy connect + reuse, sync / async / oneway invocation, opaque matching,
+//! partial / coalesced frame reassembly, broker-initiated request dispatch, timeout control, TLS, RPC hooks.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -21,28 +21,28 @@ use crate::{rmq_debug, rmq_warn};
 
 pub const MAX_FRAME_LENGTH: i32 = 16 * 1024 * 1024;
 
-/// 连接身份：单调递增，用来把在途请求绑到"真正写出去的那条连接"上。
-/// 地址不能当身份用——同地址换连接（GO_AWAY 重发、EOF 后重连）是常见形状，
-/// 按地址收口会误伤新连接上的请求，见 [`fail_pending_for`]。
+/// Connection identity: monotonically increasing, binds in-flight requests to "the connection that actually wrote them out".
+/// An address cannot serve as identity -- switching connections at the same address (GO_AWAY resend, reconnect after EOF) is a common shape,
+/// so closing by address would wrongly fail requests on the new connection, see [`fail_pending_for`].
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_conn_id() -> u64 {
     NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// TLS 读写单次尝试拿不到数据时的退避：socket 为非阻塞，靠这个小睡避免空转，
-/// 同时保证 [`TlsStream`] 那把双向锁的持有时长只有一次 syscall 量级。
+/// Backoff when a single TLS read/write attempt gets no data: the socket is non-blocking, this short sleep avoids busy-spinning,
+/// while keeping the hold time of [`TlsStream`]'s shared bidirectional lock at a single-syscall order.
 const TLS_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
 pub type InvokeCallback = Box<dyn FnOnce(Result<RemotingCommand>) + Send + 'static>;
 
-/// 需要回包时调用 [`ResponseSink::respond`]（opaque 由框架回填）；oneway 请求直接返回。
-/// 实现内部可自行 spawn，不要长时间阻塞。
+/// Call [`ResponseSink::respond`] when a reply is needed (the framework fills in the opaque); oneway requests return directly.
+/// Implementations may spawn internally; do not block for long.
 pub trait RequestProcessor: Send + Sync + 'static {
     fn process(&self, request: RemotingCommand, addr: String, sink: ResponseSink);
 }
 
-/// 把响应写回对端。该路径**不执行 RPC 钩子**：响应报文不需要也不能带签名。
+/// Writes the response back to the peer. This path does **not** run RPC hooks: response messages neither need nor may carry a signature.
 #[derive(Clone)]
 pub struct ResponseSink {
     inner: Arc<Inner>,
@@ -148,7 +148,7 @@ enum TaskHandle {
 }
 
 struct Connection {
-    /// 本进程内唯一的连接身份，见 [`next_conn_id`]。
+    /// Connection identity unique within this process, see [`next_conn_id`].
     id: u64,
     addr: String,
     writer: WriterHandle,
@@ -178,18 +178,18 @@ impl Connection {
 struct Inner {
     config: RemotingClientConfig,
     state: Mutex<State>,
-    /// 每个地址一把异步锁：并发请求只允许一个任务去建连，其余等它建完复用。
+    /// One async lock per address: among concurrent requests only one task connects, the others wait for it and reuse the connection.
     connect_gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     hooks: RwLock<Vec<Arc<dyn RPCHook>>>,
     processors: RwLock<HashMap<i32, Arc<dyn RequestProcessor>>>,
     running: AtomicBool,
-    /// 首次需要 spawn 时才绑定的 tokio 句柄（`None` 表示还没绑定）。
-    /// 构造 `RemotingClient` 可能在 tokio 运行时之外，
-    /// 所以这里不能急切 `Handle::current()`；所有 spawn 点都在运行时内部。
+    /// tokio handle bound only when a spawn is first needed (`None` means not bound yet).
+    /// `RemotingClient` may be constructed outside a tokio runtime,
+    /// so an eager `Handle::current()` is impossible here; every spawn point is inside a runtime.
     handle: OnceLock<tokio::runtime::Handle>,
 }
 
-/// 长连接 remoting 客户端，可跨任务克隆。
+/// Long-connection remoting client, clonable across tasks.
 #[derive(Clone)]
 pub struct RemotingClient {
     inner: Arc<Inner>,
@@ -224,13 +224,13 @@ impl RemotingClient {
         &self.inner.config
     }
 
-    /// 当前 tokio 句柄；不在运行时上下文里时返回 `None`
-    /// （构造点不假设一定有运行时，句柄延迟到首次 spawn 时绑定）。
+    /// The current tokio handle; returns `None` outside a runtime context
+    /// (the construction point does not assume a runtime exists, the handle is bound at the first spawn).
     pub fn runtime_handle(&self) -> Option<tokio::runtime::Handle> {
         self.inner.runtime_handle()
     }
 
-    // ---------------- 钩子 / 处理器 ----------------
+    // ---------------- Hooks / processors ----------------
     pub fn register_rpc_hook(&self, hook: Arc<dyn RPCHook>) {
         self.inner
             .hooks
@@ -256,9 +256,9 @@ impl RemotingClient {
             .len()
     }
 
-    /// 已注册钩子的**快照**（注册顺序 = 执行顺序）。
-    /// 供单测/诊断验证钩子链的顺序（Namespace → Stream → 用户钩子，见
-    /// `crate::remoting::rpchook`），发送路径本身不读它。
+    /// A **snapshot** of the registered hooks (registration order = execution order).
+    /// Lets unit tests / diagnostics verify the hook chain order (Namespace → Stream → user hooks, see
+    /// `crate::remoting::rpchook`); the send path itself does not read it.
     pub fn rpc_hooks(&self) -> Vec<Arc<dyn RPCHook>> {
         self.inner
             .hooks
@@ -292,7 +292,7 @@ impl RemotingClient {
         invoke_impl(&self.inner, addr, request, timeout_millis).await
     }
 
-    /// 走的是与同步调用同一条 `invokeImpl`，所以异步路径同样有 GO_AWAY 重连语义。
+    /// Goes through the same invoke path as the synchronous call, so the async path has the same GO_AWAY reconnect semantics.
     pub fn invoke_async(
         &self,
         addr: &str,
@@ -313,7 +313,7 @@ impl RemotingClient {
         send_request(&self.inner, addr, request).await.map(|_| ())
     }
 
-    // ---------------- 连接状态 ----------------
+    // ---------------- Connection state ----------------
     pub fn is_channel_writable(&self, addr: &str) -> bool {
         let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         state.conns.get(addr).map(|c| c.is_alive()).unwrap_or(false)
@@ -365,12 +365,12 @@ impl Inner {
             return Some(handle.clone());
         }
         let handle = tokio::runtime::Handle::try_current().ok()?;
-        // 并发下可能两个任务同时 try_current，set 失败无害，句柄等价。
+        // Under concurrency two tasks may call try_current at once; a failed set is harmless because the handles are equivalent.
         let _ = self.handle.set(handle.clone());
         Some(handle)
     }
 
-    /// 在当前运行时上派后台任务；没有可用运行时时只记日志，不 panic。
+    /// Spawns a background task on the current runtime; when no runtime is available it only logs, it does not panic.
     fn spawn<F>(&self, what: &str, task: F)
     where
         F: std::future::Future<Output = ()> + Send + 'static,
@@ -438,7 +438,7 @@ async fn invoke_impl(
     let spent = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
     let retry_timeout = (timeout - spent).max(1);
     let mut retry = request.clone();
-    // 重发必须是**新** opaque：旧请求已经拿到应答，复用会让下一次响应错配。
+    // The resend must use a **new** opaque: the old request already got its answer, reusing it would misroute the next response.
     retry.opaque = next_opaque();
     let response = invoke_with_timeout(inner, addr, &mut retry, retry_timeout).await?;
     if response.code == response_code::GO_AWAY {
@@ -514,8 +514,8 @@ async fn write_frame(inner: &Arc<Inner>, addr: &str, request: &mut RemotingComma
     }
 }
 
-/// 按**地址**收口：调用方手上只有地址（GO_AWAY 重发、显式 `close_channel`、`shutdown`、
-/// 写失败），所以摘掉该地址当前的连接，并只判死**这条连接**名下的在途请求。
+/// Closes by **address**: callers only hold an address (GO_AWAY resend, explicit `close_channel`, `shutdown`,
+/// write failure), so this unpublishes the current connection of that address and fails only the in-flight requests owned by **that connection**.
 fn close_channel(inner: &Arc<Inner>, addr: &str) {
     let conn = {
         let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -528,9 +528,9 @@ fn close_channel(inner: &Arc<Inner>, addr: &str) {
     }
 }
 
-/// 认领按 `conn_id` 而不是地址：同地址换连接是常见形状（EOF 后重连、GO_AWAY 重发），
-/// 旧连接的读任务收尾时若按地址收口，会把**新**连接上刚登记的请求一起判死。
-/// 还没写出去的请求 `conn_id` 为 `None`，同样不该被牵连。
+/// Claiming is keyed by `conn_id`, not by address: switching connections at the same address is a common shape (reconnect after EOF, GO_AWAY resend),
+/// so if the old connection's reader closed by address on its way out it would also fail the requests just registered on the **new** connection.
+/// Requests not written out yet have `conn_id` = `None` and must not be dragged in either.
 fn fail_pending_for(inner: &Arc<Inner>, conn_id: u64) {
     let dropped: Vec<Pending> = {
         let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -547,7 +547,7 @@ fn fail_pending_for(inner: &Arc<Inner>, conn_id: u64) {
     if dropped.is_empty() {
         return;
     }
-    // 日志带上地址：同一时刻可能有几条连接各自收口，只有 addr 能区分是谁断了。
+    // Log the address: several connections may close at the same moment, only addr tells which one broke.
     let addr = &dropped[0].addr;
     rmq_warn!(
         "remoting: connection to {addr} (id={conn_id}) closed, {} in-flight request(s) failed fast",
@@ -558,9 +558,9 @@ fn fail_pending_for(inner: &Arc<Inner>, conn_id: u64) {
     }
 }
 
-/// 读/写任务退出时调用：`conn_id` 是**自己**这条连接的身份。
-/// 只有表里那条连接还是自己的时候才摘掉它——已经换成新连接时不能动它，
-/// 但自己名下的请求无论如何都要立刻收口，不能让调用方等到超时。
+/// Called when a read/write task exits: `conn_id` is the identity of **this own** connection.
+/// The table entry is removed only while it is still this connection -- once a new connection replaced it, it must not be touched,
+/// but the requests owned by this connection are always closed immediately so callers do not wait for the timeout.
 fn on_connection_lost(inner: &Arc<Inner>, addr: &str, conn_id: u64) {
     let mine = {
         let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -577,7 +577,7 @@ fn on_connection_lost(inner: &Arc<Inner>, addr: &str, conn_id: u64) {
     fail_pending_for(inner, conn_id);
 }
 
-/// 读线程解出的每一帧走这里：响应交给在途表，请求交给处理器表。
+/// Every frame the reader decodes comes through here: responses go to the in-flight table, requests to the processor table.
 fn dispatch(inner: &Arc<Inner>, addr: &str, frame: Vec<u8>) {
     let cmd = match RemotingCommand::decode(&frame) {
         Ok(cmd) => cmd,
@@ -589,8 +589,8 @@ fn dispatch(inner: &Arc<Inner>, addr: &str, frame: Vec<u8>) {
     let opaque = cmd.opaque;
     let pending = {
         let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        // 响应按 opaque pop；带不上响应标志但 opaque 撞上在途请求
-        // 的那条「异常兜底」分支做的是同一个 pop。两条分支动作一致，故只查一次。
+        // Responses pop by opaque; the "abnormal fallback" branch for a frame without the response flag
+        // whose opaque collides with an in-flight request performs the same pop. Both branches act alike, so one lookup suffices.
         state.pending.remove(&opaque)
     };
     if let Some(pending) = pending {
@@ -624,7 +624,7 @@ fn dispatch(inner: &Arc<Inner>, addr: &str, frame: Vec<u8>) {
         opaque,
         wants_reply: !cmd.is_oneway_rpc(),
     };
-    // 处理器 panic 不能带走读线程：捕获后回一条 SYSTEM_ERROR。
+    // A processor panic must not take the reader thread down with it: catch it and answer with SYSTEM_ERROR.
     let panic_sink = sink.clone();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         processor.process(cmd, addr.to_string(), sink)
@@ -794,12 +794,12 @@ async fn connect_plain(
     Ok(conn)
 }
 
-/// TLS 走独立线程：`native-tls` 没有 async 接口，一条 [`TlsStream`] 双向共用一把锁。
+/// TLS runs on dedicated threads: `native-tls` has no async interface, one [`TlsStream`] shares a single lock for both directions.
 ///
-/// ⚠  socket 握手后置为**非阻塞**，读写都按 [`TLS_POLL_INTERVAL`] 小睡重试。
-/// 用「阻塞读 + 读超时」的老做法会在半包时抱着锁等满一个超时周期，写线程被饿死：
-/// 实测（真机 TLS broker）表现为 namesrv 请求 5s 全超时、超时后响应成批回来
-/// （`remoting: response for unknown opaque N`）。非阻塞 + 短睡把持锁时间压到一次 syscall。
+/// ⚠  After the handshake the socket is set to **non-blocking**, reads and writes retry with a short sleep of [`TLS_POLL_INTERVAL`].
+/// The old "blocking read + read timeout" approach would sit on the lock for a whole timeout period on a partial frame and starve the writer:
+/// measured against a real TLS broker this showed up as every name server request timing out at 5s with the responses then arriving in batches
+/// (`remoting: response for unknown opaque N`). Non-blocking + short sleep presses the lock hold time down to one syscall.
 async fn connect_tls(
     inner: &Arc<Inner>,
     addr: &str,
@@ -829,7 +829,7 @@ async fn connect_tls(
             .map_err(|e| Error::Connect {
                 addr: format!("{handshake_addr} (tls handshake: {e})"),
             })?;
-        // 非阻塞设在握手之后：握手期间必须允许完整阻塞。
+        // Non-blocking is set after the handshake: during the handshake full blocking must be allowed.
         let _ = tls.get_mut().set_nonblocking(true);
         Ok::<_, Error>(tls)
     })
@@ -852,9 +852,9 @@ async fn connect_tls(
     });
     let conn_id = conn.id;
 
-    // 读线程是普通 std 线程，本身没有 tokio 上下文；而 broker 主动推来的请求（事务回查、
-    // 心跳应答）都在那条线程上同步处理，处理器要靠运行时派后台任务。本函数是 async，
-    // 一定跑在运行时里，就在这里把句柄取出来（同时缓存进 Inner 供其它线程用）。
+    // The reader is a plain std thread with no tokio context of its own, while broker-pushed requests (transaction check-back,
+    // heartbeat response) are processed synchronously on that thread and processors rely on the runtime to spawn background tasks. This function is async,
+    // so it certainly runs inside a runtime: take the handle here (also caching it in Inner for other threads).
     let runtime = inner.runtime_handle();
     spawn_tls_writer(
         inner.clone(),
@@ -878,8 +878,8 @@ fn spawn_tls_reader(
 ) {
     let addr = addr.to_string();
     std::thread::spawn(move || {
-        // enter() 让读线程上的 `Handle::try_current()` 与明文 tokio 读任务表现一致，
-        // 否则纯 TLS 会话里 broker 的回查请求会到得了处理器、却派不出去。
+        // enter() makes `Handle::try_current()` on the reader behave like the plaintext tokio read task,
+        // otherwise in a pure TLS session broker check-back requests reach the processor but cannot be spawned.
         let _guard = runtime.as_ref().map(|handle| handle.enter());
         tls_read_loop(inner, addr, shared, alive, conn_id);
     });
@@ -913,9 +913,9 @@ fn spawn_tls_writer(
 
 type SharedTls = Arc<Mutex<native_tls::TlsStream<std::net::TcpStream>>>;
 
-/// 取放一次锁写一段，`WouldBlock` 时先睡 [`TLS_POLL_INTERVAL`] 再续写。
+/// Takes and releases the lock once per chunk written, sleeping [`TLS_POLL_INTERVAL`] before resuming on `WouldBlock`.
 ///
-/// 锁必须一次一取：读线程也在等这把锁，长时间持有会把对端的请求堵死。
+/// The lock must be taken once per attempt: the reader waits on the same lock, holding it for long blocks the peer's requests.
 fn tls_write_all(shared: &SharedTls, data: &[u8]) -> std::io::Result<()> {
     let mut off = 0usize;
     while off < data.len() {
@@ -987,11 +987,11 @@ fn tls_read_loop(
     on_connection_lost(&inner, &addr, conn_id);
 }
 
-/// `Ok(true)` 读满，`Ok(false)` 暂无数据（调用方重试），`Err` 连接不可用。
+/// `Ok(true)` buffer filled, `Ok(false)` no data for now (caller retries), `Err` connection unusable.
 ///
-/// ⚠ 每次 `read` **单独取放锁**，不能整帧持锁：`TlsStream` 双向共用一把锁，读线程抱着
-/// 锁等半包会让写线程发不出下一个请求（真机表现为请求成批 5s 超时、响应成批回来）。
-/// 半包的进度记在 `filled` 里，让出锁不丢数据。
+/// ⚠ Every `read` **takes and releases the lock separately**; the lock must not be held for a whole frame: `TlsStream` shares one lock both ways, a reader
+/// holding it while waiting for a partial frame stops the writer from sending the next request (on a real broker this shows up as requests timing out
+/// at 5s in batches and responses arriving in batches). Partial-frame progress lives in `filled`, so yielding the lock loses no data.
 fn tls_read_exact(shared: &SharedTls, buf: &mut [u8]) -> std::result::Result<bool, std::io::Error> {
     let mut filled = 0usize;
     while filled < buf.len() {
@@ -1061,7 +1061,7 @@ pub(crate) async fn resolve(host: &str, port: u16) -> Result<SocketAddr> {
 mod tests {
     use std::sync::atomic::AtomicUsize;
 
-    // `AsyncReadExt` / `AsyncWriteExt` 已由模块顶部的 `use` 经 `use super::*` 带进来。
+    // `AsyncReadExt` / `AsyncWriteExt` already arrive through the module-level `use` via `use super::*`.
     use tokio::net::TcpListener;
 
     use super::*;
@@ -1099,7 +1099,7 @@ mod tests {
         cmd
     }
 
-    /// 最简 broker：读一帧、原 opaque 回一帧。
+    /// Minimal broker: read one frame, answer one frame with the same opaque.
     async fn echo_server() -> (String, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -1133,7 +1133,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.code, response_code::SUCCESS);
-        assert_eq!(response.opaque, cmd.opaque, "响应必须带回请求的 opaque");
+        assert_eq!(response.opaque, cmd.opaque, "the response must carry back the request opaque");
         assert_eq!(response.remark.as_deref(), Some("pong:hi"));
         assert!(response.is_response_type());
         assert_eq!(client.connection_addrs(), vec![addr.clone()]);
@@ -1149,7 +1149,7 @@ mod tests {
             let frame = read_frame(&mut stream).await.unwrap();
             let cmd = RemotingCommand::decode(&frame).unwrap();
             let bytes = response_for(&cmd, response_code::SUCCESS).encode();
-            // 拆成 1 字节 + 余下，验证半包 / 粘包重组
+            // Split into 1 byte + the rest to verify partial / coalesced frame reassembly
             for chunk in bytes.chunks(1) {
                 stream.write_all(chunk).await.unwrap();
                 stream.flush().await.unwrap();
@@ -1201,7 +1201,7 @@ mod tests {
         let mut cmd = request(request_code::HEART_BEAT, "once");
         client.invoke_oneway(&addr, &mut cmd).await.unwrap();
         assert!(cmd.is_oneway_rpc());
-        assert_eq!(client.in_flight_count(), 0, "oneway 不登记在途表");
+        assert_eq!(client.in_flight_count(), 0, "oneway does not register in the in-flight table");
         client.shutdown();
     }
 
@@ -1222,12 +1222,12 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::Timeout { .. }), "got {err}");
         assert!(err.to_string().contains("200ms"));
-        assert_eq!(client.in_flight_count(), 0, "超时后必须清掉在途表");
+        assert_eq!(client.in_flight_count(), 0, "the in-flight table must be cleared after a timeout");
         client.shutdown();
     }
 
-    /// GO_AWAY 专用 server：前 `go_away_conns` 条连接一律回 GO_AWAY，其余回 SUCCESS。
-    /// 返回连接序号计数器，供断言"重发确实换了新连接"。
+    /// GO_AWAY server: the first `go_away_conns` connections always answer GO_AWAY, the rest answer SUCCESS.
+    /// Returns the connection-index counter so assertions can check "the resend really switched to a new connection".
     async fn go_away_server(go_away_conns: usize) -> (String, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -1263,8 +1263,8 @@ mod tests {
             .invoke_sync(&addr, &mut cmd, Some(3000))
             .await
             .unwrap();
-        assert_eq!(response.code, response_code::SUCCESS, "重发必须拿到真应答");
-        assert_eq!(conns.load(Ordering::SeqCst), 2, "GO_AWAY 后必须换新连接");
+        assert_eq!(response.code, response_code::SUCCESS, "the resend must get a real answer");
+        assert_eq!(conns.load(Ordering::SeqCst), 2, "after GO_AWAY a new connection must be used");
         assert_eq!(client.in_flight_count(), 0);
         client.shutdown();
     }
@@ -1281,9 +1281,9 @@ mod tests {
         assert!(matches!(err, Error::SendRequest { .. }), "got {err}");
         assert!(
             err.to_string().contains("GO_AWAY twice"),
-            "文案对齐 RemotingSendRequestException 的口径: {err}"
+            "the wording aligns with the send-request error text: {err}"
         );
-        assert_eq!(conns.load(Ordering::SeqCst), 2, "只重发一次，不能无限重连");
+        assert_eq!(conns.load(Ordering::SeqCst), 2, "retry only once, no infinite reconnect loop");
         assert_eq!(client.in_flight_count(), 0);
         client.shutdown();
     }
@@ -1302,7 +1302,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::SendRequest { .. }), "got {err}");
         assert!(err.to_string().contains("Receive GO_AWAY from channel"));
-        assert_eq!(conns.load(Ordering::SeqCst), 1, "关掉开关就不该重连");
+        assert_eq!(conns.load(Ordering::SeqCst), 1, "with the flag off it must not reconnect");
         client.shutdown();
     }
 
@@ -1353,7 +1353,7 @@ mod tests {
     }
 
 
-    /// 轮询等到条件成立，最多 5s；超时直接 panic（测试里可以 panic）。
+    /// Polls until the condition holds, at most 5s; panics on timeout (panicking is acceptable in tests).
     async fn wait_until(cond: impl Fn() -> bool, what: &str) {
         for _ in 0..500 {
             if cond() {
@@ -1361,10 +1361,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        panic!("等不到{what}");
+        panic!("timed out waiting for: {what}");
     }
 
-    /// 前 `drop_conns` 条连接读完一帧就关掉、永不回复；之后的连接照常回 SUCCESS。
+    /// The first `drop_conns` connections close right after reading one frame and never reply; later connections answer SUCCESS as usual.
     async fn eof_server(drop_conns: usize) -> (String, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -1375,9 +1375,9 @@ mod tests {
                 let idx = counter.fetch_add(1, Ordering::SeqCst);
                 if idx < drop_conns {
                     tokio::spawn(async move {
-                        // 收到请求再关：制造"请求已写出、对端永不回复"的 EOF。
+                        // Close only after receiving the request: creates the EOF shape of "request written out, peer never replies".
                         let frame = read_frame(&mut stream).await;
-                        assert!(frame.is_some(), "断开前应当收到请求");
+                        assert!(frame.is_some(), "a request should have arrived before the close");
                         drop(stream);
                     });
                     continue;
@@ -1394,8 +1394,8 @@ mod tests {
         (addr, conns)
     }
 
-    /// 只 accept、读完请求既不回复也不关连接：请求会一直停在途，
-    /// 除非客户端自己收口（超时、failFast、shutdown）。
+    /// Only accepts, reads the request, then neither replies nor closes: the request stays in-flight,
+    /// until the client itself winds it up (timeout, failFast, shutdown).
     async fn silent_server() -> (String, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -1428,17 +1428,17 @@ mod tests {
 
         assert!(
             matches!(err, Error::SendRequest { .. }),
-            "必须是发送失败，got {err}"
+            "must be a send failure, got {err}"
         );
         assert!(
             err.to_string().contains("connection closed"),
-            "文案对齐 requestFail 的口径: {err}"
+            "wording must match the requestFail phrasing: {err}"
         );
         assert!(
             cost < Duration::from_secs(5),
-            "毫秒级判死，不能等满 30s 超时: {cost:?}"
+            "must fail fast within milliseconds, not wait out the full 30s timeout: {cost:?}"
         );
-        assert_eq!(client.in_flight_count(), 0, "判死之后在途表要清空");
+        assert_eq!(client.in_flight_count(), 0, "the in-flight table must be cleared after fail-fast");
         assert_eq!(conns.load(Ordering::SeqCst), 1);
         client.shutdown();
     }
@@ -1462,15 +1462,15 @@ mod tests {
 
         let result = tokio::time::timeout(Duration::from_secs(5), rx)
             .await
-            .expect("回调没触发")
+            .expect("callback never fired")
             .unwrap();
         let err = result.unwrap_err();
         assert!(matches!(err, Error::SendRequest { .. }), "got {err}");
-        assert_eq!(hits.load(Ordering::SeqCst), 1, "回调只能投递一次");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "the callback must be delivered exactly once");
         client.shutdown();
     }
 
-    /// 死连接的收口不能牵连别的连接：另一条连接上的在途请求要原样留着。
+    /// Winding up a dead connection must not drag in other connections: in-flight requests on another connection stay untouched.
     #[tokio::test]
     async fn fail_fast_leaves_other_connections_alone() {
         let (alive_addr, frames) = silent_server().await;
@@ -1485,7 +1485,7 @@ mod tests {
                 client.invoke_sync(&addr, &mut cmd, Some(30_000)).await
             })
         };
-        wait_until(|| frames.load(Ordering::SeqCst) >= 1, "活连接收到请求").await;
+        wait_until(|| frames.load(Ordering::SeqCst) >= 1, "alive connection received the request").await;
 
         let mut cmd = request(request_code::SEND_MESSAGE_V2, "eof");
         let err = client
@@ -1494,13 +1494,13 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::SendRequest { .. }), "got {err}");
 
-        assert_eq!(client.in_flight_count(), 1, "只该判死自己那条连接上的请求");
-        assert!(!slow.is_finished(), "活连接上的请求不该被误伤");
+        assert_eq!(client.in_flight_count(), 1, "only the requests on the failed connection itself should be failed");
+        assert!(!slow.is_finished(), "requests on the alive connection must not be caught in the blast");
         slow.abort();
         client.shutdown();
     }
 
-    /// 判死之后同一个地址还能建新连接、跑完新请求：死连接必须已经摘出连接表。
+    /// After fail-fast the same address can still build a new connection and complete a new request: the dead connection must already be unpublished from the connection table.
     #[tokio::test]
     async fn same_address_works_after_fail_fast() {
         let (addr, conns) = eof_server(1).await;
@@ -1512,7 +1512,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::SendRequest { .. }), "got {err}");
-        assert!(!client.is_channel_writable(&addr), "死连接要摘出连接表");
+        assert!(!client.is_channel_writable(&addr), "the dead connection must be unpublished from the connection table");
 
         let mut second = request(request_code::SEND_MESSAGE_V2, "ok");
         let response = client
@@ -1523,12 +1523,12 @@ mod tests {
         assert_eq!(
             conns.load(Ordering::SeqCst),
             2,
-            "第二次请求走的是新建的连接"
+            "the second request must go over the newly created connection"
         );
         client.shutdown();
     }
 
-    /// Shutdown 也要给在途请求一个交代：调用方等到的是发送失败，而不是永久悬挂。
+    /// Shutdown must also settle in-flight requests: the caller gets a send failure instead of hanging forever.
     #[tokio::test]
     async fn shutdown_drains_in_flight_requests() {
         let (addr, frames) = silent_server().await;
@@ -1541,22 +1541,22 @@ mod tests {
                 client.invoke_sync(&addr, &mut cmd, Some(30_000)).await
             })
         };
-        wait_until(|| frames.load(Ordering::SeqCst) >= 1, "请求写出").await;
+        wait_until(|| frames.load(Ordering::SeqCst) >= 1, "request written out").await;
 
         client.shutdown();
         let result = tokio::time::timeout(Duration::from_secs(5), waiter)
             .await
-            .expect("调用方被挂住")
+            .expect("caller was left hanging")
             .unwrap();
         let err = result.unwrap_err();
         assert!(
             matches!(err, Error::SendRequest { .. }),
-            "shutdown 要立刻收口，got {err}"
+            "shutdown must drain immediately, got {err}"
         );
         assert_eq!(client.in_flight_count(), 0);
     }
 
-    /// broker 主动推请求（PUSH_REPLY_MESSAGE_TO_CLIENT），客户端处理器必须回响应。
+    /// The broker actively pushes a request (PUSH_REPLY_MESSAGE_TO_CLIENT); the client processor must answer with a response.
     #[tokio::test]
     async fn broker_pushed_request_reaches_processor() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1573,7 +1573,7 @@ mod tests {
             let bytes = push.encode();
             stream.write_all(&bytes).await.unwrap();
             stream.flush().await.unwrap();
-            // 上面那条 oneway 不应有响应；再发一条请求型的，要求回包
+            // The oneway above must not get a response; then send a request-type one that expects a reply
             let mut need_reply = RemotingCommand::create_request_command(
                 request_code::CHECK_TRANSACTION_STATE,
                 None,
@@ -1583,7 +1583,7 @@ mod tests {
             stream.write_all(&bytes).await.unwrap();
             stream.flush().await.unwrap();
             loop {
-                let frame = read_frame(&mut stream).await.expect("客户端应回包");
+                let frame = read_frame(&mut stream).await.expect("the client should reply");
                 let cmd = RemotingCommand::decode(&frame).unwrap();
                 if cmd.is_response_type() {
                     let _ = push_tx.send(cmd);
@@ -1605,7 +1605,7 @@ mod tests {
             let client = RemotingClient::new();
             client.register_processor(request_code::PUSH_REPLY_MESSAGE_TO_CLIENT, Arc::new(Echo));
             client.register_processor(request_code::CHECK_TRANSACTION_STATE, Arc::new(Echo));
-            // 先建连（服务端 accept 后才会推请求）
+            // Connect first (the server pushes only after accepting)
             let mut warm = request(request_code::HEART_BEAT, "warm");
             warm.mark_oneway_rpc();
             client.invoke_oneway(&client_addr, &mut warm).await.unwrap();
@@ -1616,7 +1616,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(response.code, response_code::SUCCESS);
-        assert_eq!(response.opaque, 5_555, "响应必须回填 broker 请求的 opaque");
+        assert_eq!(response.opaque, 5_555, "the response must carry back the broker request's opaque");
         assert!(response.is_response_type());
         server.await.unwrap();
         connect.shutdown();
@@ -1653,7 +1653,7 @@ mod tests {
         assert_eq!(
             on_wire.get_ext_field("Hooked"),
             Some("yes"),
-            "钩子必须作用于上线报文"
+            "the hook must apply to the on-wire message"
         );
         client.shutdown();
     }
@@ -1671,7 +1671,7 @@ mod tests {
         assert_eq!(
             response.serialize_type_current_rpc,
             serialize_type::ROCKETMQ,
-            "私有二进制协议位必须在高 8 位往返"
+            "the private binary protocol bits must round-trip in the high 8 bits"
         );
         client.shutdown();
     }
@@ -1692,29 +1692,29 @@ mod tests {
         assert_eq!(MAX_FRAME_LENGTH, 16 * 1024 * 1024);
     }
 
-    // ------------------------------------------------------------- TLS 回归网
+    // ------------------------------------------------------------- TLS regression net
     //
-    // 为什么要有这组离线用例：TLS 分支（`connect_tls` 及其读写循环）是整套传输里唯一
-    // 「一个改动就静默死锁」的地方，而它的所有已知 bug 都只需要一台机器就能复现：
-    //   * `TlsStream` 双向共用一把锁，读线程抱着锁等半包 → 写线程饿死，表现为请求
-    //     成批超时、响应成批回来（真机 TLS broker 实测过，见 connect_tls 的注释）；
-    //   * socket 握手后置非阻塞，`tls_read_exact` / `tls_write_all` 必须自己续读续写，
-    //     少写一次进度就把帧读废了。
-    // 这两条靠真机 TLS broker 验代价高（要起带证书的 broker），且 CI 上根本没那台机器；
-    // 本地用 openssl 现造一张自签证书 + 进程内 TLS 服务端就能把这两条钉死，
-    // 不依赖真机 broker。
+    // Why this offline test group exists: the TLS branch (`connect_tls` and its read/write loops) is the only
+    // place in the whole transport where a single change can deadlock silently, and every one of its known bugs reproduce on a single machine:
+    //   * `TlsStream` shares one lock between both directions: the read thread holds the lock while waiting for a partial frame → the write thread starves, showing up as
+    //     requests timing out in batches while responses come back in batches (observed against a real TLS broker; see the connect_tls comment);
+    //   * the socket is set non-blocking after the handshake, so `tls_read_exact` / `tls_write_all` must keep continuing the reads and writes themselves;
+    //     missing one progress step corrupts the frame.
+    // Verifying these two against a real TLS broker is expensive (needs a broker with certificates) and CI has no such machine at all;
+    // forging a self-signed certificate with openssl locally plus an in-process TLS server pins both down,
+    // without depending on a real broker.
 
     const TLS_P12_PASSWORD: &str = "rmq-rust-test";
 
-    /// 用 openssl CLI 现造一张自签证书，导出成 PKCS#12（`Identity::from_pkcs12` 三个
-    /// 后端都支持，绕开 PKCS#1/PKCS#8  PEM 头的平台差异）。
-    /// 找不到 openssl 就返回 `None`，用例自己跳过——守的是 TLS 读写循环，缺工具不该
-    /// 把整个 gate 变红。
+    /// Forge a self-signed certificate with the openssl CLI and export it as PKCS#12 (all three
+    /// `Identity::from_pkcs12` backends support it, sidestepping the PKCS#1/PKCS#8 PEM header platform differences).
+    /// Returns `None` when openssl is missing and the tests skip themselves -- what is under test is the
+    /// TLS read/write loop; a missing tool must not turn the whole gate red.
     fn tls_identity_pkcs12() -> Option<Vec<u8>> {
         let openssl = match std::env::var("OPENSSL_BIN") {
             Ok(v) => v,
             Err(_) => {
-                // 没设环境变量就按 PATH 探一次：探不到直接跳过（Windows CI 上常没有）
+                // When the env var is unset, probe PATH once: skip directly if not found (often absent on Windows CI)
                 std::process::Command::new("openssl")
                     .arg("-version")
                     .output()
@@ -1754,9 +1754,9 @@ mod tests {
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
-        // 显式指定旧式 PBE：OpenSSL 3 默认导出 PKCS#12 v2.0（AES-256 + SHA-256 KDF），
-        // macOS 的 SecPKCS12Import 解不开，会报 "MAC verification failed"。
-        // SHA1-3DES + SHA1 MAC 在 OpenSSL 1.x/3.x 和三个 TLS 后端上都能导入。
+        // Pin the legacy PBE explicitly: OpenSSL 3 defaults to exporting PKCS#12 v2.0 (AES-256 + SHA-256 KDF),
+        // which macOS SecPKCS12Import cannot parse and fails with "MAC verification failed".
+        // SHA1-3DES + SHA1 MAC imports on OpenSSL 1.x/3.x and on all three TLS backends.
         let exported = ok
             && std::process::Command::new(&openssl)
                 .args([
@@ -1791,10 +1791,10 @@ mod tests {
         }
     }
 
-    /// 进程内 TLS 帧服务端：收一帧 → 回一帧（同 opaque）。
-    /// `write_chunk` 为 `Some(n)` 时响应按 n 字节分片写出，用来逼出客户端
-    /// `tls_read_exact` 的半包分支；请求体非空时响应 remark 回填 `len:<字节数>`，
-    /// 用来证明 `tls_write_all` 把大 body 完整写出去了。
+    /// In-process TLS frame server: reads one frame → replies one frame (same opaque).
+    /// When `write_chunk` is `Some(n)` the response is written out in n-byte chunks, to force the client's
+    /// `tls_read_exact` partial-frame branch; when the request body is non-empty the response remark echoes back `len:<byte count>`,
+    /// proving that `tls_write_all` sent the large body intact.
     struct TlsFrameServer {
         addr: String,
         stop: Arc<AtomicBool>,
@@ -1831,12 +1831,12 @@ mod tests {
                             let conn_stop = accept_stop.clone();
                             let acceptor = acceptor.clone();
                             std::thread::spawn(move || {
-                                // macOS/BSD 下 accept 出来的套接字继承监听口的非阻塞标志，
-                                // 而 OpenSSL/SecureTransport 的握手都要求阻塞语义，
-                                // 留着非阻塞会立刻 WouldBlock ⇒ 表现为「对端关闭握手」。
+                                // On macOS/BSD the accepted socket inherits the listener's non-blocking flag,
+                                // while the OpenSSL/SecureTransport handshakes both require blocking semantics;
+                                // leaving it non-blocking fails at once with WouldBlock ⇒ seen as "peer closed during handshake".
                                 let _ = stream.set_nonblocking(false);
-                                // 握手放在连接线程里：卡在 accept 线程上会让整个服务端
-                                // 对后续连接装死（半开连接会把握手堵在内核队列里）。
+                                // The handshake runs on the connection thread: getting stuck on the accept thread
+                                // makes the whole server play dead for later connections (a half-open connection clogs the handshake in the kernel queue).
                                 let Ok(mut tls) = acceptor.accept(stream) else {
                                     return;
                                 };
@@ -1864,8 +1864,8 @@ mod tests {
             if !read_block(tls, &mut head) {
                 return;
             }
-            // totalLength 覆盖的是「4 字节 headerLength 位 + header + body」，
-            // 所以还要再读 total 字节，和 read_frame / tls_read_loop 同一口径。
+            // totalLength covers "the 4-byte headerLength slot + header + body",
+            // so another total bytes must be read — the same accounting as read_frame / tls_read_loop.
             let total = i32::from_be_bytes(head);
             if total <= 0 || total > MAX_FRAME_LENGTH {
                 return;
@@ -1898,7 +1898,7 @@ mod tests {
                         if tls.write_all(chunk).is_err() || tls.flush().is_err() {
                             return;
                         }
-                        // 让半包真的停留在线上：分片之间不合并，客户端必须自己续读
+                        // Keep the partial frame genuinely on the wire: chunks are not coalesced, the client must continue reading on its own
                         std::thread::sleep(Duration::from_millis(1));
                     }
                 }
@@ -1924,8 +1924,8 @@ mod tests {
         true
     }
 
-    /// TLS 客户端：`tls_enable` 打开、`tls_test_mode` 显式置真（自签证书不校验主机名），
-    /// 其余走默认值。
+    /// TLS client: `tls_enable` on, `tls_test_mode` explicitly true (a self-signed certificate skips hostname checks),
+    /// everything else at defaults.
     fn tls_client() -> RemotingClient {
         RemotingClient::with_config(RemotingClientConfig {
             tls_enable: true,
@@ -1937,19 +1937,19 @@ mod tests {
     #[tokio::test]
     async fn tls_round_trips_and_reassembles_half_packets() {
         let Some(pkcs12) = tls_identity_pkcs12() else {
-            eprintln!("skip: openssl 不可用，无法现造 TLS 证书");
+            eprintln!("skip: openssl unavailable, cannot forge a TLS certificate");
             return;
         };
-        // 3 字节一片：4 字节帧头都要跨两次 read，正是 tls_read_exact 的续读路径
-        let server = TlsFrameServer::start(&pkcs12, Some(3)).expect("TLS 服务端起不来");
+        // 3 bytes per chunk: even the 4-byte frame header spans two reads, exactly tls_read_exact's continuation path
+        let server = TlsFrameServer::start(&pkcs12, Some(3)).expect("TLS server failed to start");
         let client = tls_client();
         let mut cmd = request(request_code::GET_ROUTEINFO_BY_TOPIC, "tls");
         let response = client
             .invoke_sync(&server.addr, &mut cmd, Some(10_000))
             .await
-            .expect("TLS 往返失败");
+            .expect("TLS round trip failed");
         assert_eq!(response.code, response_code::SUCCESS);
-        assert_eq!(response.opaque, cmd.opaque, "TLS 响应必须带回请求的 opaque");
+        assert_eq!(response.opaque, cmd.opaque, "the TLS response must carry back the request's opaque");
         assert_eq!(response.remark.as_deref(), Some("pong:tls"));
         client.shutdown();
     }
@@ -1957,23 +1957,23 @@ mod tests {
     #[tokio::test]
     async fn tls_write_all_sends_a_large_body_intact() {
         let Some(pkcs12) = tls_identity_pkcs12() else {
-            eprintln!("skip: openssl 不可用，无法现造 TLS 证书");
+            eprintln!("skip: openssl unavailable, cannot forge a TLS certificate");
             return;
         };
-        let server = TlsFrameServer::start(&pkcs12, None).expect("TLS 服务端起不来");
+        let server = TlsFrameServer::start(&pkcs12, None).expect("TLS server failed to start");
         let client = tls_client();
-        // 1MB body：非阻塞 socket 上单次 write 必然写不完，tls_write_all 要自己续写
+        // 1MB body: a single write can never finish on a non-blocking socket; tls_write_all must keep writing itself
         let body = vec![0xA5u8; 1024 * 1024];
         let mut cmd = request(request_code::SEND_MESSAGE, "big");
         cmd.body = Some(body);
         let response = client
             .invoke_sync(&server.addr, &mut cmd, Some(15_000))
             .await
-            .expect("大 body 的 TLS 往返失败");
+            .expect("TLS round trip with a large body failed");
         assert_eq!(
             response.remark.as_deref(),
             Some("big:len:1048576"),
-            "服务端收到的 body 长度必须与发出的一致"
+            "the body length received by the server must match what was sent"
         );
         client.shutdown();
     }
@@ -1981,10 +1981,10 @@ mod tests {
     #[tokio::test]
     async fn tls_concurrent_requests_share_one_connection_without_starving() {
         let Some(pkcs12) = tls_identity_pkcs12() else {
-            eprintln!("skip: openssl 不可用，无法现造 TLS 证书");
+            eprintln!("skip: openssl unavailable, cannot forge a TLS certificate");
             return;
         };
-        let server = TlsFrameServer::start(&pkcs12, Some(7)).expect("TLS 服务端起不来");
+        let server = TlsFrameServer::start(&pkcs12, Some(7)).expect("TLS server failed to start");
         let client = tls_client();
         let mut handles = Vec::new();
         for i in 0..8 {
@@ -1996,14 +1996,14 @@ mod tests {
                 let response = client
                     .invoke_sync(&addr, &mut cmd, Some(10_000))
                     .await
-                    .expect("并发 TLS 请求超时/失败：读写抢锁把对方饿死了");
+                    .expect("concurrent TLS request timed out/failed: read/write lock contention starved one side");
                 assert_eq!(response.opaque, cmd.opaque);
                 response.remark.unwrap_or_default()
             }));
         }
         let mut remarks = Vec::new();
         for handle in handles {
-            remarks.push(handle.await.expect("并发任务 panic"));
+            remarks.push(handle.await.expect("concurrent task panicked"));
         }
         remarks.sort();
         let expected: Vec<String> = (0..8).map(|i| format!("t{i}:len:4096")).collect();
@@ -2011,13 +2011,13 @@ mod tests {
         assert_eq!(
             client.connection_addrs().len(),
             1,
-            "8 个请求应复用同一条 TLS 连接"
+            "the 8 requests should reuse one and the same TLS connection"
         );
         client.shutdown();
     }
 
-    /// 单向 TLS 服务端：应答第一条请求（把连接建起来），随后**主动推**一条要回包的
-    /// 请求，读到客户端的响应后翻 `responded`。服务端线程最多活到读超时（10s）。
+    /// One-way TLS server: answers the first request (establishing the connection), then **actively pushes** a
+    /// reply-expected request and flips `responded` once the client's response arrives. The server thread lives at most until the read timeout (10s).
     fn start_tls_push_server(
         identity_pkcs12: &[u8],
         responded: Arc<AtomicBool>,
@@ -2037,13 +2037,13 @@ mod tests {
             let Ok((stream, _)) = listener.accept() else {
                 return;
             };
-            // macOS/BSD 下 accept 出来的套接字继承监听口的非阻塞标志，握手要求阻塞语义
+            // On macOS/BSD the accepted socket inherits the listener's non-blocking flag; the handshake requires blocking semantics
             let _ = stream.set_nonblocking(false);
             let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
             let Ok(mut tls) = acceptor.accept(stream) else {
                 return;
             };
-            // 1) 热身请求原样回一帧，客户端这才算连上
+            // 1) Echo the warm-up request back as one frame; only then is the client considered connected
             let Some(warm) = read_tls_frame(&mut tls) else {
                 return;
             };
@@ -2055,7 +2055,7 @@ mod tests {
             if tls.write_all(&ack_bytes).is_err() || tls.flush().is_err() {
                 return;
             }
-            // 2) broker 视角推一条事务回查（非 oneway，必须回包）
+            // 2) From the broker's perspective, push a transaction check-back (not oneway, a reply is mandatory)
             let mut push = RemotingCommand::create_request_command(
                 request_code::CHECK_TRANSACTION_STATE,
                 None,
@@ -2064,7 +2064,7 @@ mod tests {
             if tls.write_all(&push.encode()).is_err() || tls.flush().is_err() {
                 return;
             }
-            // 3) 等客户端把响应写回来
+            // 3) Wait for the client to write the response back
             while let Some(cmd) = read_tls_frame(&mut tls) {
                 if cmd.opaque == TLS_PUSH_OPAQUE && cmd.is_response_type() {
                     responded.store(true, Ordering::SeqCst);
@@ -2075,7 +2075,7 @@ mod tests {
         Ok(addr)
     }
 
-    /// 读一整帧并解出命令；对端关掉或超长都返回 `None`。
+    /// Reads one whole frame and decodes the command; returns `None` on peer close or oversized frames.
     fn read_tls_frame(
         tls: &mut native_tls::TlsStream<std::net::TcpStream>,
     ) -> Option<RemotingCommand> {
@@ -2095,21 +2095,21 @@ mod tests {
         RemotingCommand::decode(&frame).ok()
     }
 
-    /// TLS 读线程上必须有 tokio 运行时上下文。
+    /// The TLS read thread must carry a tokio runtime context.
     ///
-    /// 明文路径天然满足（读循环就是 tokio 任务），TLS 却是一条普通 std 线程：broker
-    /// 主动推来的请求（事务回查、心跳应答）在这条线程上同步处理，处理器要靠运行时派
-    /// 后台任务，派不出去就只剩一句 warn，请求到了、活没干。真机 TLS 上实测过：
-    /// broker 每 30s 回查一次，三次全被静默丢掉。
+    /// The plaintext path satisfies this naturally (the read loop is a tokio task), but TLS is a plain std thread: requests
+    /// pushed by the broker (transaction check-backs, heartbeat replies) are processed synchronously on that thread, and the
+    /// processor needs the runtime to spawn background tasks; when it cannot, all that is left is a warn — the request arrived, no work was done. Observed on a real TLS broker:
+    /// the broker check-backed once every 30s and all three were silently dropped.
     #[tokio::test]
     async fn tls_inbound_request_is_processed_with_a_runtime_context() {
         let Some(pkcs12) = tls_identity_pkcs12() else {
-            eprintln!("skip: openssl 不可用，无法现造 TLS 证书");
+            eprintln!("skip: openssl unavailable, cannot forge a TLS certificate");
             return;
         };
         let responded = Arc::new(AtomicBool::new(false));
         let saw_runtime = Arc::new(AtomicBool::new(false));
-        let addr = start_tls_push_server(&pkcs12, responded.clone()).expect("TLS 服务端起不来");
+        let addr = start_tls_push_server(&pkcs12, responded.clone()).expect("TLS server failed to start");
         struct Probe {
             saw_runtime: Arc<AtomicBool>,
         }
@@ -2132,12 +2132,12 @@ mod tests {
             }),
         );
 
-        // 先做一次正常往返：连接建起来，服务端才会推请求
+        // Do one normal round trip first: the server pushes a request only once the connection is up
         let mut warm = request(request_code::HEART_BEAT, "warm");
         client
             .invoke_sync(&addr, &mut warm, Some(10_000))
             .await
-            .expect("TLS 热身请求失败");
+            .expect("TLS warm-up request failed");
         for _ in 0..200 {
             if responded.load(Ordering::Acquire) {
                 break;
@@ -2148,9 +2148,9 @@ mod tests {
         client.shutdown();
         assert!(
             saw_runtime.load(Ordering::Acquire),
-            "TLS 读线程必须带运行时上下文，否则处理器派不出后台任务"
+            "the TLS read thread must carry a runtime context, otherwise the processor cannot spawn background tasks"
         );
-        assert!(got_response, "broker 推来的请求要回包，响应必须写回对端");
+        assert!(got_response, "the broker-pushed request must be answered and the response written back to the peer");
     }
 
     #[tokio::test]
@@ -2158,7 +2158,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         tokio::spawn(async move {
-            // 明文 echo：收下 ClientHello 后原样关掉，握手必然失败
+            // Plaintext echo: close as-is right after receiving the ClientHello, so the handshake is bound to fail
             while let Ok((mut stream, _)) = listener.accept().await {
                 let _ = stream.shutdown().await;
             }
@@ -2171,7 +2171,7 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(err, Error::Connect { .. }),
-            "明文端口上的 TLS 握手应报 Connect，got {err}"
+            "a TLS handshake on a plaintext port must report Connect, got {err}"
         );
         client.shutdown();
     }

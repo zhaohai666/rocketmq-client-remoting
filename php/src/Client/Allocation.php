@@ -10,37 +10,39 @@ use RocketMQ\Common\MessageQueue;
 use RocketMQ\Common\SubscriptionData;
 
 /**
- * 队列分配策略 + 消费前过滤。
+ * Queue allocation strategies + pre-consume filtering.
  *
- * 文件内含：
- *  - AllocationHelper：模块级辅助（队列排序键、钩子取名、客户端二次 tag 过滤、过滤钩子执行、
- *    投递前过滤、策略取名、环上队列 key 字符串、broker 名切分）
- *  - MessageSelector / MessageQueueListener / AllocateMessageQueueStrategy 接口族
+ * This file contains:
+ *  - AllocationHelper: module-level helpers (queue sort key, hook naming, client-side
+ *    secondary tag filtering, filter hook execution, pre-delivery filtering, strategy
+ *    naming, on-ring queue key string, broker name splitting)
+ *  - MessageSelector / MessageQueueListener / AllocateMessageQueueStrategy interface family
  *  - AVG / AVG_BY_CIRCLE / CONFIG / CONSISTENT_HASH / MACHINE_ROOM / MACHINE_ROOM_NEARBY
- *  - 一致性哈希环（HashFunction / MD5Hash / Node / ClientNode / VirtualNode /
- *    ConsistentHashRouter）
+ *  - Consistent hash ring (HashFunction / MD5Hash / Node / ClientNode / VirtualNode /
+ *    ConsistentHashRouter)
  */
 
 /**
- * 分配与过滤共用的一组模块级辅助函数。
+ * A set of module-level helper functions shared by allocation and filtering.
  *
- * 分工：
- *  - mqSortKey()                 队列排序键
- *  - safeHookName()              钩子取名（取不到退化成类名）
- *  - clientSideTagFilter()       客户端二次 tag 过滤
- *  - executeFilterHooks()        依次执行过滤钩子
- *  - filterMessagesForDelivery() 投递前过滤（tag 复核 + 钩子）
- *  - strategyName()              策略取名（日志用）
- *  - wireQueueKeyString()        一致性哈希环上代表队列的字符串
- *  - wireSplit()                 按分隔符切分（裁掉末尾空段）
+ * Division of labor:
+ *  - mqSortKey()                 queue sort key
+ *  - safeHookName()              hook naming (falls back to the class name)
+ *  - clientSideTagFilter()       client-side secondary tag filtering
+ *  - executeFilterHooks()        execute filter hooks in order
+ *  - filterMessagesForDelivery() pre-delivery filtering (tag re-check + hooks)
+ *  - strategyName()              strategy naming (for logs)
+ *  - wireQueueKeyString()        the string representing a queue on the consistent hash ring
+ *  - wireSplit()                 split by separator (trailing empty segments trimmed)
  */
 final class AllocationHelper
 {
     /**
-     * 队列排序键：topic → brokerName → queueId 逐段比较。
+     * Queue sort key: topic -> brokerName -> queueId, compared segment by segment.
      *
-     * rebalance 必须先把 mqAll/cidAll 排序再做分配；顺序不一致会让同组实例算出
-     * 不同的分配结果（同一队列被两个实例同时消费）。
+     * rebalance must sort mqAll/cidAll before allocating; inconsistent ordering makes
+     * instances in the same group compute different allocation results (the same queue
+     * consumed by two instances at once).
      *
      * @return array{0: string, 1: string, 2: int}
      */
@@ -50,7 +52,7 @@ final class AllocationHelper
     }
 
     /**
-     * 取钩子名；hookName() 抛异常时退化成类名（取名绝不影响过滤本身）。
+     * Take the hook name; degrade to the class name when hookName() throws (naming must never affect filtering itself).
      */
     public static function safeHookName(FilterMessageHook $hook): string
     {
@@ -62,12 +64,14 @@ final class AllocationHelper
     }
 
     /**
-     * 客户端二次 tag 过滤。
+     * Client-side secondary tag filtering.
      *
-     * broker 侧只按 tag 的**哈希（codeSet）**过滤，存在哈希碰撞误放，所以经典 remoting
-     * 协议的消费端要再按 tag 原文核一遍。守卫「tagsSet 非空 && !classFilterMode」意味着：
-     * 订阅 `"*"`（SUB_ALL）时不过滤 —— 所以 FilterAPI::buildSubscriptionData
-     * 对 SUB_ALL 必须保持 tagsSet 为空（那里有详细注释）。
+     * The broker side only filters by the tag **hash (codeSet)**, which allows false
+     * positives from hash collisions, so the classic remoting protocol's consume side
+     * must check the tag text again. The guard "tagsSet non-empty && !classFilterMode"
+     * means: no filtering when subscribed to `"*"` (SUB_ALL) -- so
+     * FilterAPI::buildSubscriptionData must keep tagsSet empty for SUB_ALL
+     * (detailed comments there).
      *
      * @param list<MessageExt>|null $msgs
      * @return list<MessageExt>
@@ -88,9 +92,10 @@ final class AllocationHelper
     }
 
     /**
-     * 依次执行过滤钩子，**单个钩子的异常只记 error、一律吞掉**。
+     * Execute the filter hooks in order; **a single hook's exception is only logged as error and always swallowed**.
      *
-     * 与 send/consume 钩子不同：过滤钩子失败不能影响消费，只是该次过滤不生效。
+     * Unlike send/consume hooks: a filter hook failure must not affect consumption, it just
+     * means that filtering pass does not take effect.
      *
      * @param list<FilterMessageHook> $hookList
      */
@@ -106,11 +111,12 @@ final class AllocationHelper
     }
 
     /**
-     * 投递前过滤 = 客户端二次 tag 过滤 + FilterMessageHook（拉取/POP/pull 三处共用）。
+     * Pre-delivery filtering = client-side secondary tag filtering + FilterMessageHook (shared by the pull/POP/pull three call sites).
      *
-     * 钩子拿到的是**可变的** msgList；被摘掉的消息由调用方决定处置方式：
-     * 拉取路径 = 静默跳过（位点照常推进，不 ack）；
-     * POP 路径 = 必须立刻 ack，否则 invisibleTime 到期后会复活重投。
+     * The hooks receive a **mutable** msgList; removed messages are disposed of by the
+     * caller: the pull path = silently skip (offset advances as usual, no ack);
+     * the POP path = must ack immediately, otherwise the message revives and is redelivered
+     * after invisibleTime expires.
      *
      * @param list<FilterMessageHook> $hookList
      * @param list<MessageExt> $msgs
@@ -127,7 +133,7 @@ final class AllocationHelper
         $out = self::clientSideTagFilter($sub, $msgs);
         if ($out !== [] && $hookList !== []) {
             $context = new FilterMessageContext($consumerGroup, $out, $mq);
-            $context->unitMode = $unitMode;    // 钩子上下文要带上单元化标记
+            $context->unitMode = $unitMode;    // the hook context must carry the unitized marker
             self::executeFilterHooks($hookList, $context);
             $out = $context->msgList;
         }
@@ -135,10 +141,11 @@ final class AllocationHelper
     }
 
     /**
-     * 取策略名用于日志。
+     * Take the strategy name for logs.
      *
-     * 策略既可以传接口实现（一定有 getName()），也可以传只实现了 allocate 的鸭子类型对象，
-     * 所以缺 getName 或它抛异常时退化成类名，绝不因为取名字而打断 rebalance。
+     * A strategy can be passed either as an interface implementation (always has getName())
+     * or as a duck-typed object that only implements allocate, so when getName is missing
+     * or it throws, degrade to the class name; never interrupt rebalance just to get a name.
      */
     public static function strategyName(object $strategy): string
     {
@@ -146,18 +153,19 @@ final class AllocationHelper
             try {
                 return (string) $strategy->getName();
             } catch (\Throwable) {
-                // 日志取值不该影响 rebalance
+                // taking a log value should not affect rebalance
             }
         }
         return get_class($strategy);
     }
 
     /**
-     * 一致性哈希环上代表一条队列的 key（哈希的是这个字符串，不是 MessageQueue::__toString）。
+     * The key representing a queue on the consistent hash ring (this string is hashed, not MessageQueue::__toString).
      *
-     * ⚠ 必须逐字符是 "MessageQueue [topic=.., brokerName=.., queueId=..]"：
-     * 本端口 MessageQueue::__toString 是另一种写法，拿它去哈希会得到完全不同的环，
-     * 同组实例之间也就算不出同一条环。
+     * WARNING: it must be exactly "MessageQueue [topic=.., brokerName=.., queueId=..]"
+     * character for character: this port's MessageQueue::__toString is a different
+     * wording; hashing it yields a completely different ring, and instances in the same
+     * group would not compute the same ring.
      */
     public static function wireQueueKeyString(MessageQueue $mq): string
     {
@@ -165,21 +173,23 @@ final class AllocationHelper
     }
 
     /**
-     * 按「裁掉末尾空段」的语义切分字符串（等价于 limit=0 的 split）。
+     * Split a string with "trailing empty segments trimmed" semantics (equivalent to a limit=0 split).
      *
-     * PHP 原生 explode 保留尾空段，两者对 broker 名的切分结果因此不同，而
-     * AllocateMessageQueueByMachineRoom 恰好按「段数 == 2」判合法，差异会直接改变
-     * 一条队列参不参与分配：
+     * PHP's native explode keeps trailing empty segments, so the two differ when splitting
+     * a broker name, and AllocateMessageQueueByMachineRoom judges validity exactly by
+     * "segment count == 2", so the difference directly changes whether a queue
+     * participates in allocation:
      *
-     * | 输入 | wireSplit | 原生 explode |
+     * | input | wireSplit | native explode |
      * |---|---|---|
-     * | `"room1@"` | `["room1"]`（1 段，剔除） | `["room1", ""]`（2 段，误收） |
-     * | `"room1@b@"` | `["room1", "b"]`（2 段，收） | `["room1", "b", ""]`（3 段，误剔） |
+     * | `"room1@"` | `["room1"]` (1 segment, excluded) | `["room1", ""]` (2 segments, wrongly included) |
+     * | `"room1@b@"` | `["room1", "b"]` (2 segments, included) | `["room1", "b", ""]` (3 segments, wrongly excluded) |
      * | `"@"` | `[]` | `["", ""]` |
-     * | `""` / `"broker-a"` | 无分隔符命中时**整串原样返回**，哪怕是空串 | 同 |
+     * | `""` / `"broker-a"` | when no separator matches, **the whole string is returned as-is**, even if empty | same |
      *
-     * 最后一行的早返回不能省：没命中分隔符时必须原样返回，所以不能无条件裁尾
-     * （否则 `""` 会变成 `[]`）。
+     * The last row's early return cannot be omitted: when no separator matches the whole
+     * string must be returned as-is, so trailing segments cannot be trimmed unconditionally
+     * (otherwise `""` would become `[]`).
      *
      * @return list<string>
      */
@@ -187,7 +197,7 @@ final class AllocationHelper
     {
         $parts = explode($sep, $text);
         if (count($parts) === 1) {
-            return $parts; // 没命中分隔符：整串原样返回
+            return $parts; // no separator match: return the whole string as-is
         }
         while ($parts !== [] && end($parts) === '') {
             array_pop($parts);
@@ -340,7 +350,7 @@ final class MD5Hash implements HashFunction
         for ($i = 0; $i < 4; $i++) {
             $value = ($value << 8) | ord($digest[$i]);
         }
-        return $value; // 32bit 无符号，PHP int 64bit 不会溢出
+        return $value; // 32bit unsigned; PHP's 64bit int does not overflow
     }
 }
 
@@ -391,7 +401,7 @@ final class ConsistentHashRouter
 
     private array $ring = [];
 
-    /** @var list<int> 升序 hash key 列表（对应 TreeMap 的 keySet） */
+    /** @var list<int> ascending hash key list (corresponding to TreeMap's keySet) */
     private array $keys = [];
 
     /** @param list<Node>|null $pNodes */
@@ -465,7 +475,7 @@ final class ConsistentHashRouter
     }
 
     /**
-     * 二分查找：返回 keys 中第一个 >= target 的下标（升序数组）。
+     * Binary search: returns the index of the first element >= target in keys (ascending array).
      *
      * @param list<int> $keys
      */
@@ -537,7 +547,7 @@ final class AllocateMessageQueueConsistentHash implements AllocateMessageQueueSt
 
 final class AllocateMessageQueueByMachineRoom implements AllocateMessageQueueStrategy
 {
-    /** set 语义：key = 机房名，value 同名占位。 @var array<string, string> */
+    /** set semantics: key = machine room name, value = same-name placeholder. @var array<string, string> */
     private array $consumeridcs = [];
 
     /** @param list<string>|null $consumeridcs */
@@ -660,7 +670,7 @@ final class AllocateMachineRoomNearby implements AllocateMessageQueueStrategy
 
         /** @var list<MessageQueue> $allocateResults */
         $allocateResults = [];
-        // 1. 本消费者所在机房的队列：只在同机房消费者之间分
+        // 1. Queues in the machine room where this consumer resides: distributed only among consumers in the same machine room
         $currentMachineRoom = $this->machineRoomResolver->consumerDeployIn($currentCID);
         $mqInThisMachineRoom = $mr2Mq[$currentMachineRoom] ?? null;
         unset($mr2Mq[$currentMachineRoom]);
@@ -676,7 +686,7 @@ final class AllocateMachineRoomNearby implements AllocateMessageQueueStrategy
                 )
             );
         }
-        // 2. 没有活消费者的机房：队列不能没人消费，交给全部消费者
+        // 2. Machine rooms with no live consumers: queues cannot be left unconsumed, hand them to all consumers
         $rooms = array_keys($mr2Mq);
         sort($rooms, SORT_STRING);
         foreach ($rooms as $room) {

@@ -1,16 +1,18 @@
-// 两条硬性约定：
-//   1. 轨迹消息本身不再被追踪：before/after 都先看 topic 是否以轨迹 topic 开头，是则直接
-//      return（否则轨迹会自我复制）。
-//   2. 是否落轨迹由 broker 说了算：发送侧看 SendResult 的 RegionId / TraceOn（由 SEND 响应头
-//      的 MSG_REGION / TRACE_ON 解析而来，broker 默认 traceOn=true）；消费侧看消息属性
-//      TRACE_ON 是否为 "false"。
+// Two hard rules:
+//   1. Trace messages themselves are not traced again: both before/after first check whether
+//      the topic starts with the trace topic prefix, and return immediately if so (otherwise
+//      traces would self-replicate).
+//   2. Whether a trace is emitted is decided by the broker: on the send side it looks at the
+//      RegionId / TraceOn of SendResult (parsed from MSG_REGION / TRACE_ON in the SEND response
+//      header; the broker defaults to traceOn=true); on the consume side it checks whether the
+//      message property TRACE_ON is "false".
 using RocketMQ.Common;
 using RocketMQ.Remoting;
 using RocketMQ.Remoting.Protocol;
 
 namespace RocketMQ.Client;
 
-/// <summary>发送侧轨迹钩子（对应 SendMessageTraceHookImpl）。</summary>
+/// <summary>Send-side trace hook (corresponds to SendMessageTraceHookImpl).</summary>
 public sealed class SendMessageTraceHook : ISendMessageHook
 {
     private readonly AsyncTraceDispatcher _localDispatcher;
@@ -86,7 +88,7 @@ public sealed class SendMessageTraceHook : ISendMessageHook
     }
 }
 
-/// <summary>消费侧轨迹钩子（对应 ConsumeMessageTraceHookImpl，SubBefore / SubAfter 共用 request_id）。</summary>
+/// <summary>Consume-side trace hook (corresponds to ConsumeMessageTraceHookImpl; SubBefore / SubAfter share request_id).</summary>
 public sealed class ConsumeMessageTraceHook : IConsumeMessageHook
 {
     private readonly AsyncTraceDispatcher _localDispatcher;
@@ -169,7 +171,7 @@ public sealed class ConsumeMessageTraceHook : IConsumeMessageHook
         };
         subAfter.CostTime = (int)((UtilAll.CurrentTimeMillis() - subBefore.TimeStamp) / context.MsgList.Count);
 
-        // ConsumeContextType 是 ConsumeReturnType 的**名字**，其 ordinal 即轨迹里的 contextCode。
+        // ConsumeContextType is the **name** of ConsumeReturnType; its ordinal is the contextCode in the trace.
         if (context.Props is not null && context.Props.TryGetValue("ConsumeContextType", out string? ct) && ct is not null)
         {
             subAfter.ContextCode = ReturnTypeOrdinal(ct);
@@ -189,7 +191,7 @@ public sealed class ConsumeMessageTraceHook : IConsumeMessageHook
     };
 }
 
-/// <summary>事务收尾轨迹钩子（对应 EndTransactionTraceHookImpl）。</summary>
+/// <summary>Transaction-finish trace hook (corresponds to EndTransactionTraceHookImpl).</summary>
 public sealed class EndTransactionTraceHook : IEndTransactionHook
 {
     private readonly AsyncTraceDispatcher _localDispatcher;
@@ -265,7 +267,7 @@ public sealed class DefaultRecallMessageTraceHook : IRpcHook
         _traceDispatcher = traceDispatcher;
     }
 
-    /// <summary>默认取环境变量（"true"/"1"，忽略大小写），实例上可显式覆盖。</summary>
+    /// <summary>Defaults to the environment variable ("true"/"1", case-insensitive); can be explicitly overridden on the instance.</summary>
     public bool EnableDefaultTrace { get; set; } =
         string.Equals(EnvEnabled, "true", StringComparison.OrdinalIgnoreCase)
         || string.Equals(EnvEnabled, "1", StringComparison.OrdinalIgnoreCase);

@@ -1,18 +1,21 @@
-// LitePull 消费者的 topic 队列集合变更监听真机验证。
-// 用法：rmq lite-queue-change [namesrv]
+// Real-machine verification of the LitePull consumer's topic queue set change listener.
+// Usage: rmq lite-queue-change [namesrv]
 //
-// 为什么必须真机：比对趟次每趟都现问 nameserver 取订阅队列集合，而普通路由缓存是 30s
-// 才刷一次。假 nameserver 能证比对逻辑，只有真集群能证「现查」。这里把检查周期压到 1s
-// 下限、路由轮询保持默认 30s，再把 topic 真的扩容：过了首查延迟的稳定期里，从 nameserver
-// 报出新队列数到监听器收到回调只该隔一两趟检查（≤5s）；读 30s 缓存的话这个窗口会拖到半
-// 分钟以上。
+// Why it must be a real machine: the comparison round asks the nameserver for the
+// subscription queue set afresh every round, while the ordinary route cache is only refreshed
+// every 30s. A fake nameserver can prove the comparison logic; only a real cluster can prove
+// "asking afresh". Here the check interval is pushed down to its 1s floor while the route
+// poll stays at the 30s default, and then the topic really is scaled up: within the steady
+// state after the first-lookup delay, only one or two check rounds (<=5s) may separate the
+// nameserver reporting the new queue count from the listener receiving the callback; reading
+// the 30s cache would stretch that window to over half a minute.
 //
-//   L1  队列没动 ⇒ 监听器不被打扰
-//   L1b 首查那趟真的跑过 ⇒ 依旧静默（运行中注册的快照不算变化）
-//   L2  扩容 2→4：nameserver 认了之后回调紧跟几趟检查
-//   L3  回调后快照推进 ⇒ 同一套队列不重复回调
-//   L4  缩容 4→2：同样靠现查看到
-//   L5  没建过的 topic：取不到队列算「查不到」，不伪装成缩到 0 队列
+//   L1  the queues did not move => the listener is not pestered
+//   L1b the first-lookup round really ran => still silent (a snapshot taken while running does not count as a change)
+//   L2  scale up 2->4: the callback follows a few check rounds after the nameserver accepts it
+//   L3  after the callback the snapshot advances => the same queue set does not fire again
+//   L4  scale down 4->2: also seen by asking afresh
+//   L5  a topic that was never created: failing to get the queues counts as "not found", it does not pretend to be a scale-down to 0 queues
 using System.Globalization;
 
 using RocketMQ.Client;
@@ -24,11 +27,11 @@ public static class LiveLiteTopicQueueChange
 {
     private const int BaseQueues = 2;
     private const int ScaledQueues = 4;
-    // 检查周期压到下限，好把「每趟现查」和「吃 30s 缓存」在时间上分开。
+    // The check interval is pushed to its floor, to separate "asking afresh every round" from "eating the 30s cache" in time.
     private const int CheckIntervalMillis = 1000;
-    // 后台比对的首查延迟 10s + 余量：此后只剩 1s 一趟的稳定期。
+    // The background comparison's first-lookup delay of 10s plus slack: after that only the steady state of one round per 1s remains.
     private const int FirstDelayBudgetMillis = 12000;
-    // nameserver 见到变化后允许的最大回调间隔。
+    // The maximum callback interval allowed after the nameserver sees the change.
     private const int FreshWindowMillis = 5000;
 
     private static readonly string Stamp =
@@ -54,7 +57,8 @@ public static class LiveLiteTopicQueueChange
         }
     }
 
-    /// <summary>只记回调，不改状态；后台线程也会调它，所以自带锁。</summary>
+    /// <summary>Only records callbacks and does not change state; the background thread
+    /// calls it too, so it brings its own lock.</summary>
     private sealed class Recorder : ITopicMessageQueueChangeListener
     {
         private readonly object _gate = new();
@@ -105,7 +109,8 @@ public static class LiveLiteTopicQueueChange
         prod.Shutdown();
     }
 
-    /// <summary>现查队列集合，直到报出 want 个为止；返回等待毫秒数，超时返回 -1。</summary>
+    /// <summary>Asks for the queue set afresh until it reports want; returns how many
+    /// milliseconds it waited, or -1 on timeout.</summary>
     private static long WaitQueueNum(DefaultLitePullConsumer c, string topic, int want,
         int timeoutMillis)
     {
@@ -118,7 +123,7 @@ public static class LiveLiteTopicQueueChange
             }
             catch (Exception)
             {
-                // 路由还没更新，继续等
+     // the route is not updated yet, keep waiting
             }
             Thread.Sleep(250);
             waited += 250;
@@ -126,7 +131,8 @@ public static class LiveLiteTopicQueueChange
         return -1;
     }
 
-    /// <summary>等监听器记到 want 条回调；返回等待毫秒数，超时返回 -1。</summary>
+    /// <summary>Waits until the listener records want callbacks; returns how many
+    /// milliseconds it waited, or -1 on timeout.</summary>
     private static long WaitEvents(Recorder rec, int want, int timeoutMillis)
     {
         long waited = 0;
@@ -153,7 +159,7 @@ public static class LiveLiteTopicQueueChange
         c.SetNamesrvAddr(namesrv);
         c.SetInstanceName("lite-qc-live");
         c.SetTopicMetadataCheckIntervalMillis(CheckIntervalMillis);
-        Check("L0 检查周期压到 1s 下限",
+  Check("L0 the check interval is pushed to the 1s floor",
             c.TopicMetadataCheckIntervalMillis == CheckIntervalMillis,
             c.TopicMetadataCheckIntervalMillis.ToString(CultureInfo.InvariantCulture));
         c.Subscribe(Topic, "*");
@@ -161,14 +167,14 @@ public static class LiveLiteTopicQueueChange
         DateTime loopStart = DateTime.UtcNow;
 
         long visible = WaitQueueNum(c, Topic, BaseQueues, 30000);
-        Check("L0 路由可见（2 个队列）", visible >= 0,
+     Check("L0 the route is visible (2 queues)", visible >= 0,
             visible.ToString(CultureInfo.InvariantCulture) + "ms");
 
-        // 运行中注册 ⇒ 立刻记快照 ⇒ 首轮不该回调
+        // registering while running => a snapshot is taken at once => the first round must not fire
         var rec = new Recorder();
         c.RegisterTopicMessageQueueChangeListener(Topic, rec);
         Thread.Sleep(3000);
-        Check("L1 队列没动 ⇒ 静默", rec.Count == 0,
+        Check("L1 the queues did not move => silence", rec.Count == 0,
             "events=" + rec.Count.ToString(CultureInfo.InvariantCulture));
 
         int elapsed = (int)(DateTime.UtcNow - loopStart).TotalMilliseconds;
@@ -176,43 +182,43 @@ public static class LiveLiteTopicQueueChange
         {
             Thread.Sleep(FirstDelayBudgetMillis - elapsed);
         }
-        Check("L1b 首查那趟真的跑过 ⇒ 依旧静默", rec.Count == 0,
+        Check("L1b the first-lookup round really ran => still silent", rec.Count == 0,
             "events=" + rec.Count.ToString(CultureInfo.InvariantCulture));
 
-        // ---- L2 扩容 2→4
+    // ---- L2 scale up 2->4
         Scale(namesrv, ScaledQueues);
         long nsMs = WaitQueueNum(c, Topic, ScaledQueues, 45000);
-        Check("L2a nameserver 报出 4 个队列", nsMs >= 0,
+     Check("L2a the nameserver reports 4 queues", nsMs >= 0,
             nsMs.ToString(CultureInfo.InvariantCulture) + "ms");
         if (nsMs >= 0)
         {
             long cb = WaitEvents(rec, 1, FreshWindowMillis);
-            Check("L2b 比对趟次现查路由（回调紧跟 nameserver，不等 30s 缓存）",
+       Check("L2b the comparison round asks for the route afresh (the callback follows the nameserver, it does not wait out the 30s cache)",
                 cb >= 0 && string.Join(",", rec.IdsAt(0)) == Text(ScaledQueues),
                 cb.ToString(CultureInfo.InvariantCulture) + "ms, ids="
                 + string.Join(",", rec.IdsAt(0)));
         }
 
-        // ---- L3 快照推进
+        // ---- L3 the snapshot advances
         Thread.Sleep(3000);
-        Check("L3 回调后快照推进 ⇒ 不重复回调", rec.Count == 1,
+     Check("L3 after the callback the snapshot advances => no repeat callback", rec.Count == 1,
             "events=" + rec.Count.ToString(CultureInfo.InvariantCulture));
 
-        // ---- L4 缩容 4→2
+      // ---- L4 scale down 4->2
         Scale(namesrv, BaseQueues);
         nsMs = WaitQueueNum(c, Topic, BaseQueues, 45000);
-        Check("L4a nameserver 报回 2 个队列", nsMs >= 0,
+       Check("L4a the nameserver reports 2 queues again", nsMs >= 0,
             nsMs.ToString(CultureInfo.InvariantCulture) + "ms");
         if (nsMs >= 0)
         {
             long cb = WaitEvents(rec, 2, FreshWindowMillis);
-            Check("L4b 缩容同样靠现查路由看到",
+       Check("L4b the scale-down is also seen by asking for the route afresh",
                 cb >= 0 && string.Join(",", rec.IdsAt(1)) == Text(BaseQueues),
                 cb.ToString(CultureInfo.InvariantCulture) + "ms, ids="
                 + string.Join(",", rec.IdsAt(1)));
         }
 
-        // ---- L5 未知 topic：空队列集算「查不到」
+     // ---- L5 an unknown topic: an empty queue set counts as "not found"
         string raised = "";
         try
         {
@@ -223,7 +229,7 @@ public static class LiveLiteTopicQueueChange
         {
             raised = e.Message;
         }
-        Check("L5 未知 topic 取队列抛「查不到」而不是返回空",
+        Check("L5 asking for the queues of an unknown topic throws 'not found' rather than returning empty",
             raised.Contains("Namesrv return empty") || raised.Contains("Can not find"), raised);
 
         c.Shutdown();

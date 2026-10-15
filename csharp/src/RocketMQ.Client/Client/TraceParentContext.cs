@@ -1,4 +1,4 @@
-// W3C Trace Context（traceparent）透传 —— OpenTracing/OTel 场景的消息级上下文。
+// W3C Trace Context (traceparent) propagation —— message-level context for OpenTracing/OTel scenarios.
 using System;
 using System.Security.Cryptography;
 using RocketMQ.Common;
@@ -13,13 +13,13 @@ public static class TraceParentContext
 
     private const string HexDigits = "0123456789abcdef";
 
-    /// <summary>生成合法的根 traceparent：`00-&lt;32hex&gt;-&lt;16hex&gt;-01`（记录采样）。</summary>
+    /// <summary>Generate a valid root traceparent: `00-&lt;32hex&gt;-&lt;16hex&gt;-01` (records sampling).</summary>
     public static string Generate()
     {
         return "00-" + RandomHex(32) + "-" + RandomHex(16) + "-01";
     }
 
-    /// <summary>按 W3C 语法与"不全 0"规则校验。宽松接受大写 hex（转发不重写）。</summary>
+    /// <summary>Validate by W3C syntax and the "not all zeros" rule. Case-insensitive hex is accepted leniently (forwarding does not rewrite).</summary>
     public static bool IsValid(string? value)
     {
         if (string.IsNullOrWhiteSpace(value))
@@ -61,7 +61,7 @@ public static class TraceParentContext
         return flags.Length == 2 && AllHex(flags);
     }
 
-    /// <summary>同一 trace-id 下生成子 span（换 parent-id）；parent 非法返回 null。</summary>
+    /// <summary>Generate a child span under the same trace-id (changes parent-id); returns null if parent is invalid.</summary>
     public static string? Child(string? parent)
     {
         if (!IsValid(parent))
@@ -73,13 +73,13 @@ public static class TraceParentContext
         return "00-" + parts[1].ToLowerInvariant() + "-" + RandomHex(16) + "-01";
     }
 
-    /// <summary>消息没有 traceparent 属性时注入根上下文；返回（注入后的）值。</summary>
+    /// <summary>Inject the root context when the message has no traceparent property; returns the (injected) value.</summary>
     public static string Inject(Message msg)
     {
         string existing = msg.GetProperty(TraceContextProperty);
         if (!string.IsNullOrEmpty(existing))
         {
-            return existing;   // 上游传播优先，不覆盖
+            return existing;   // upstream propagation takes priority, do not overwrite
         }
 
         string tp = Generate();
@@ -87,14 +87,14 @@ public static class TraceParentContext
         return tp;
     }
 
-    /// <summary>从消息属性里取出 traceparent（未注入/为空返回 null）。</summary>
+    /// <summary>Read the traceparent from the message properties (returns null if not injected / empty).</summary>
     public static string? Extract(MessageExt msg)
     {
         string v = msg.GetProperty(TraceContextProperty);
         return string.IsNullOrEmpty(v) ? null : v;
     }
 
-    /// <summary>env `ROCKETMQ_TRACE_CONTEXT_ENABLE`。</summary>
+    /// <summary>env `ROCKETMQ_TRACE_CONTEXT_ENABLE`.</summary>
     public static bool EnabledFromEnv()
     {
         string? v = Environment.GetEnvironmentVariable("ROCKETMQ_TRACE_CONTEXT_ENABLE");

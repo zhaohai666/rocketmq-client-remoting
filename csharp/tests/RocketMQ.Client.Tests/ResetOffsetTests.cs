@@ -1,13 +1,18 @@
-// 为什么必须离线锁死：这条路径错了全是**静默**的三种表现 ——
+// Why it must be pinned offline: getting this path wrong shows up in exactly three
+// **silent** ways --
 //
 //
-// 真机短期窗口里前两条最多表现为"重置后消息又冒出来一批"或"崩一次才暴露"，第三条根本
-// 看不出来，所以判据全部放离线；真机另有链路证明（examples 的 live-reset-offset 子命令）。
+// In a short real-machine window the first two at most show up as "after the reset a
+// batch of messages reappears" or "it only surfaces after one crash", and the third is
+// not visible at all, so every criterion is placed offline; the real machine has a
+// separate line of proof (the examples' live-reset-offset subcommand).
 //
-// C# 侧的实现差异（见 Consumer.cs 注释）：网络段（persist 发给 broker）离线不可观测，
-// 此处断言"新位点确实交给了持久化路径"（RetiredQueuesForTest 里那条记录的
-// ConsumeOffset/HadOffset 就是会走 UpdateConsumerOffset 的材料）。222 的**报文字段**
-// 另由 MockCluster 抓包锁死（isForce 键名，见 Admin.cs）。
+// The implementation differences on the C# side (see the comments in Consumer.cs): the
+// network leg (persist sends to the broker) is not observable offline, so what is
+// asserted here is "the new offset really was handed to the persistence path" (the
+// ConsumeOffset/HadOffset of that record in RetiredQueuesForTest is exactly the material
+// that goes to UpdateConsumerOffset). The **wire fields** of 222 are pinned separately by
+// MockCluster packet capture (the isForce key name, see Admin.cs).
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -38,7 +43,8 @@ public class ResetOffsetTests
     private static List<MessageExt> Batch(params int[] offsets)
         => offsets.Select(o => Ext(o)).ToList();
 
-    /// <summary>不碰网络的 push consumer：分配、缓冲、位点、代号都手动搭。</summary>
+    /// <summary>A push consumer that touches no network: allocation, buffering, offsets
+    /// and generation are all set up by hand.</summary>
     private sealed class Harness
     {
         public DefaultMQPushConsumer C { get; }
@@ -61,7 +67,8 @@ public class ResetOffsetTests
         public MessageQueue Mq => Mqs[0];
         public string Key => Keys[0];
 
-        /// <summary>模拟 220 下发的队列表：topic 内、在表里的队列才被重置。</summary>
+        /// <summary>Simulates the queue table pushed by 220: only the queues of the topic
+        /// that are in the table get reset.</summary>
         public void Reset(params long[] offsets)
         {
             var table = new Dictionary<MessageQueue, long>();
@@ -81,7 +88,8 @@ public class ResetOffsetTests
             => C.AdvanceConsumeOffsetForTest(Keys[index],
                 offsets.Select(o => Ext(o, Mqs[index].QueueId)).ToList(), null, epoch);
 
-        /// <summary>重置之后的下一趟 rebalance（真实路径：DoRebalance → RebalancePullThreads）。</summary>
+        /// <summary>The next rebalance after a reset (the real path: DoRebalance ->
+        /// RebalancePullThreads).</summary>
         public void Rebuild()
         {
             C.SetStartedForTest(true);
@@ -89,7 +97,7 @@ public class ResetOffsetTests
         }
     }
 
-    // ------------------------------------------------- 撤队列：在途/缓冲一起作废
+    // ------------------------------------------------- Withdrawing a queue: in-flight and buffer are invalidated together
 
     [Fact]
     public void Reset_DropsEverythingForTheQueue()
@@ -133,8 +141,10 @@ public class ResetOffsetTests
         Assert.Equal(h.Mq, record.Mq);
     }
 
-    /// <summary>在途批次拿的是重置前的代号（0）：它的 ack 必须整批作废。修好之前这里会写回 8——
-    /// 位点被判"重置过又退回旧位置"，重置只活到下一个周期落盘。</summary>
+    /// <summary>An in-flight batch got the pre-reset generation (0): its ack must be
+    /// invalidated as a whole. Before the fix this wrote back 8 -- the offset was judged
+    /// "reset and then rolled back to the old position", so the reset only survived until
+    /// the next cycle hit the disk.</summary>
     [Fact]
     public void StaleEpochAck_CannotUndoTheReset()
     {
@@ -146,7 +156,8 @@ public class ResetOffsetTests
         Assert.Null(h.Offset());
     }
 
-    /// <summary>负向对照：不是把这条队列永久冻死 —— 重建后的队列拿新代号，ack 恢复正常。</summary>
+    /// <summary>Negative control: this does not permanently freeze the queue -- the
+    /// rebuilt queue gets a new generation and acking works normally again.</summary>
     [Fact]
     public void AckAfterRebuild_StillWorks()
     {
@@ -161,23 +172,24 @@ public class ResetOffsetTests
         Assert.Equal(5L, h.Offset());
     }
 
-    /// <summary>负向对照：不在 220 队列表里的队列（同 topic 也）一根手指都不许碰。</summary>
+    /// <summary>Negative control: a queue that is not in the 220 queue table (even under
+    /// the same topic) must not be touched at all.</summary>
     [Fact]
     public void Reset_OnlyTouchesQueuesInTheTable()
     {
         var h = new Harness(queues: 2);
         h.C.SetPendingForTest(h.Keys[1], Batch(1));
 
-        h.Reset(3);   // 只带 queue-0
+        h.Reset(3);   // only queue-0
 
-        // queue-0：撤走（位点随撤销交给持久化路径，不再留在表里）
+        // queue-0: withdrawn (the offset goes to the persistence path on withdrawal and no longer stays in the table)
         Assert.False(h.C.MqMapContainsForTest(h.Keys[0]));
         Assert.Null(h.Offset(0));
         DefaultMQPushConsumer.RetiredForTest record = Assert.Single(h.C.RetiredQueuesForTest());
         Assert.Equal(h.Mqs[0], record.Mq);
         Assert.Equal(3L, record.ConsumeOffset);
 
-        // queue-1：一根手指都没碰
+        // queue-1: not touched at all
         Assert.True(h.C.MqMapContainsForTest(h.Keys[1]));
         Assert.Equal(7L, h.Offset(1));
         Assert.Single(h.C.PendingForTest(h.Keys[1]));
@@ -209,7 +221,7 @@ public class ResetOffsetTests
         Assert.Equal(0L, h.Epoch());
     }
 
-    // ------------------------------------------------- 入站 220：形状、组、oneway
+    // ------------------------------------------------- Inbound 220: shape, group, oneway
 
     private static RemotingCommand ResetCmd(string group, string topic, byte[]? body)
     {
@@ -227,7 +239,8 @@ public class ResetOffsetTests
         return cmd;
     }
 
-    /// <summary>等一个后台线程跑完（220 是 oneway，重置逻辑离线跑在 ResetOffsetThread 上）。</summary>
+    /// <summary>Waits for a background thread to finish (220 is oneway, and the reset
+    /// logic runs offline on ResetOffsetThread).</summary>
     private static bool WaitFor(Func<bool> done, int timeoutMs = 3000)
     {
         var sw = Stopwatch.StartNew();
@@ -256,13 +269,14 @@ public class ResetOffsetTests
 
         Assert.Null(resp);
         Assert.True(WaitFor(() => h.C.RetiredQueuesForTest().Count == 1),
-            "map 形状的 220 没落到重置路径");
+            "a map-shaped 220 did not reach the reset path");
         DefaultMQPushConsumer.RetiredForTest record = Assert.Single(h.C.RetiredQueuesForTest());
         Assert.Equal(5L, record.ConsumeOffset);
     }
 
     /// <summary>
-    /// 发起方 language=CPP 时 broker 推**数组**形状（ResetOffsetBodyForC）：必须解析出来。
+    /// When the originator's language=CPP the broker pushes the **array** shape
+    /// (ResetOffsetBodyForC): it must be parsed.
     [Fact]
     public void ProcessReset_ArrayBodyForCIsNotDropped()
     {
@@ -279,13 +293,14 @@ public class ResetOffsetTests
         Assert.Null(h.C.ProcessResetConsumerOffset(ResetCmd(Group, Topic, body.Encode())));
 
         Assert.True(WaitFor(() => h.C.RetiredQueuesForTest().Count == 1),
-            "数组形状的 220 被静默丢弃了");
+            "the array-shaped 220 was silently dropped");
         DefaultMQPushConsumer.RetiredForTest record = Assert.Single(h.C.RetiredQueuesForTest());
         Assert.Equal(9L, record.ConsumeOffset);
         Assert.Equal(h.Mq, record.Mq);
     }
 
-    /// <summary>组不匹配（同进程里有别的消费组）不许动本消费者的位点。</summary>
+    /// <summary>A group mismatch (another consumer group in the same process) must not
+    /// touch this consumer's offsets.</summary>
     [Fact]
     public void ProcessReset_WrongGroupIsIgnored()
     {
@@ -315,7 +330,7 @@ public class ResetOffsetTests
         Assert.Equal(0L, h.Epoch());
     }
 
-    // ------------------------------------------------- 222 报文：isForce 键名 + 默认 language
+    // ------------------------------------------------- The 222 wire: the isForce key name + the default language
 
     private static DefaultMQAdminExt StartedAdmin(MockCluster cluster)
     {
@@ -326,7 +341,7 @@ public class ResetOffsetTests
     }
 
     /// <summary>
-    /// 222 的 force 标志在 extFields 里叫 **isForce**，不是 force。
+    /// 222's force flag is called **isForce** in extFields, not force.
     [Fact]
     public void AdminReset_SendsTheLegacyIsForceKey()
     {
@@ -347,11 +362,11 @@ public class ResetOffsetTests
             WireRecord hit = Assert.Single(cluster.Records().FindAll(
                 r => r.Code == RequestCode.InvokeBrokerToResetOffset));
             Assert.Equal("true", hit.Ext["isForce"]);
-            Assert.False(hit.Ext.ContainsKey("force"));   // 键名写错就是 broker 侧恒 false
-            Assert.Equal("-1", hit.Ext["timestamp"]);     // 前重语义靠 timestamp=-1
+            Assert.False(hit.Ext.ContainsKey("force"));   // a wrong key name means constantly false on the broker side
+            Assert.Equal("-1", hit.Ext["timestamp"]);     // the "move everything" semantics rely on timestamp=-1
             Assert.Equal("T_Reset222", hit.Ext["topic"]);
             Assert.Equal("GID_222", hit.Ext["group"]);
-            Assert.False(hit.Ext.ContainsKey("queueId")); // 按 timestamp 的重载不带 queueId
+            Assert.False(hit.Ext.ContainsKey("queueId")); // the timestamp-based overload carries no queueId
             Assert.Equal(10L, offsets.Values.Single());
         }
         finally

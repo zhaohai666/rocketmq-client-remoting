@@ -1,5 +1,6 @@
-// 零依赖手写握手：SOCKS5 走 RFC 1928（无认证 0x00 / 用户名密码 0x02，子协商 RFC
-// 1929），SOCKS4 走原协议、域名目标走 SOCKS4a 扩展（DSTIP = 0.0.0.x）。
+// Zero-dependency hand-rolled handshake: SOCKS5 follows RFC 1928 (no auth 0x00 / username
+// password 0x02, sub-negotiation RFC 1929), SOCKS4 follows the original protocol, and
+// domain-name targets use the SOCKS4a extension (DSTIP = 0.0.0.x).
 using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
@@ -7,28 +8,28 @@ using System.Text;
 
 namespace RocketMQ.Remoting;
 
-/// <summary>SOCKS 协议版本。</summary>
+/// <summary>SOCKS protocol version.</summary>
 public enum SocksProxyVersion
 {
-    /// <summary>SOCKS4；目标为主机名时自动走 SOCKS4a 扩展，Username 作 USERID。</summary>
+    /// <summary>SOCKS4; when the target is a hostname, automatically uses the SOCKS4a extension, with Username as USERID.</summary>
     V4,
 
-    /// <summary>SOCKS5（默认）。支持无认证与用户名密码（RFC 1929）两种子协商。</summary>
+    /// <summary>SOCKS5 (default). Supports both no-auth and username/password (RFC 1929) sub-negotiations.</summary>
     V5,
 }
 
 public sealed class SocksProxyConfig
 {
-    /// <summary>代理地址 "host:port"（IPv6 字面量用 "[::1]:1080" 形式）。</summary>
+    /// <summary>Proxy address "host:port" (IPv6 literals use the "[::1]:1080" form).</summary>
     public string Addr { get; set; } = string.Empty;
 
     /// <summary>
-    /// 认证用户名：SOCKS5 的用户名密码子协商 / SOCKS4 的 USERID。
-    /// 为空表示无认证（SOCKS5 握手只提供 0x00 方法）。
+    /// Auth username: SOCKS5's username/password sub-negotiation / SOCKS4's USERID.
+    /// Empty means no auth (the SOCKS5 handshake only offers the 0x00 method).
     /// </summary>
     public string? Username { get; set; }
 
-    /// <summary>认证密码（仅 SOCKS5 用户名密码子协商使用；SOCKS4 没有密码概念）。</summary>
+    /// <summary>Auth password (only used by SOCKS5's username/password sub-negotiation; SOCKS4 has no password concept).</summary>
     public string? Password { get; set; }
 
     public SocksProxyVersion Version { get; set; } = SocksProxyVersion.V5;
@@ -41,9 +42,10 @@ public sealed class SocksProxyConfig
 }
 
 /// <summary>
-/// SOCKS 握手（阻塞式，在调用方的建连线程上执行；超时按 <c>deadline</c> 统一扣减，
-/// 覆盖 greeting / 子协商 / CONNECT 全程）。失败一律抛异常，由调用方翻译成
-/// <see cref="RemotingConnectException"/>。
+/// SOCKS handshake (blocking, runs on the caller's connect thread; the timeout is deducted
+/// uniformly per <c>deadline</c>, covering greeting / sub-negotiation / CONNECT). Failures
+/// always throw, and the caller translates them into
+/// <see cref="RemotingConnectException"/>.
 /// </summary>
 internal static class SocksProxy
 {
@@ -84,8 +86,8 @@ internal static class SocksProxy
         long deadline)
     {
         bool withAuth = !string.IsNullOrEmpty(proxy.Username);
-        // 方法选择：带凭证时同时报 0x00 与 0x02，交给代理挑（对齐 Netty
-        // Socks5ProxyHandler 有凭证时的方法集）
+        // Method selection: with credentials, offer both 0x00 and 0x02 and let the proxy
+        // choose (matches Netty Socks5ProxyHandler's method set when credentials are present)
         byte[] greeting = withAuth
             ? new byte[] { Ver5, 2, MethodNoAuth, MethodUserPass }
             : new byte[] { Ver5, 1, MethodNoAuth };
@@ -136,8 +138,9 @@ internal static class SocksProxy
                 + head[1].ToString(CultureInfo.InvariantCulture));
         }
 
-        // BND.ADDR 长度随 ATYP 变化：1=4 字节 IPv4；3=1 字节长度前缀的域名；4=16 字节 IPv6。
-        // 后面统一还有 2 字节 BND.PORT，全部读净，否则残留字节会污染其后的 RocketMQ 帧。
+        // BND.ADDR length varies with ATYP: 1=4-byte IPv4; 3=1-byte length-prefixed domain;
+        // 4=16-byte IPv6. There is also a 2-byte BND.PORT after it; read it all out, otherwise
+        // leftover bytes pollute the subsequent RocketMQ frames.
         int addrLen = head[3] switch
         {
             AddrTypeIpv4 => 4,
@@ -171,7 +174,7 @@ internal static class SocksProxy
             throw new IOException("socks5: password longer than 255 bytes");
         }
 
-        // RFC 1929：VER(1) ULEN(1) UNAME PLEN(1) PASSWD
+        // RFC 1929: VER(1) ULEN(1) UNAME PLEN(1) PASSWD
         var req = new byte[3 + uname.Length + passwd.Length];
         req[0] = VerUserPass;
         req[1] = (byte)uname.Length;
@@ -249,8 +252,9 @@ internal static class SocksProxy
             throw new IOException("socks4: USERID longer than 255 bytes");
         }
 
-        // 目标是 IPv4 字面量走原生 SOCKS4；否则走 4a 扩展：DSTIP = 0.0.0.x（x 非零），
-        // USERID 之后跟 NUL 结尾的域名，由代理负责解析。
+        // Target is an IPv4 literal -> native SOCKS4; otherwise the 4a extension: DSTIP =
+        // 0.0.0.x (x non-zero), with a NUL-terminated domain name after USERID, which the
+        // proxy resolves.
         byte[] dstIp = { 0, 0, 0, 1 };
         byte[]? domain = null;
         if (IPAddress.TryParse(destHost, out IPAddress? ip))
@@ -296,7 +300,7 @@ internal static class SocksProxy
 
         SendAll(sock, req, deadline);
 
-        // 响应固定 8 字节：VN(1) CD(1) DSTPORT(2) DSTIP(4)，CD = 0x5A(90) 表示同意
+        // Fixed 8-byte response: VN(1) CD(1) DSTPORT(2) DSTIP(4); CD = 0x5A(90) means granted
         var rep = new byte[8];
         ReadExact(sock, rep, 0, 8, deadline);
         if (rep[1] != 0x5A)
@@ -312,7 +316,8 @@ internal static class SocksProxy
     private static int RemainingMs(long deadline)
     {
         long left = deadline - Environment.TickCount64;
-        // 永远给 Socket 的超时字段一个正值（0 = 无限等待，会退化成挂死）
+        // Always give the Socket's timeout field a positive value (0 = wait forever, which
+        // degenerates into a hang)
         return (int)Math.Max(1, left);
     }
 

@@ -62,7 +62,7 @@ check('admin kvNamespaceToDeleteList = [ORDER_TOPIC_CONFIG]',
 check('string2Properties comments+whitespace',
   JSON.stringify(string2Properties('a=1\n# c\nb = x y\nc:z\n')) === '{"a":"1","b":"x y","c":"z"}');
 
-// 307 statusTable 形态（start 之前 -> 各桶为零）
+// The shape of the 307 statusTable (before start -> every bucket zero)
 const st = (consumer as any)._buildStatusTable();
 console.log('  statusTable(pre-start) =', JSON.stringify(st));
 

@@ -1,13 +1,13 @@
-//! `ProduceAccumulator`（自动攒批）单测 —— 协议对齐用例。
+//! `ProduceAccumulator` (auto batching) unit tests -- protocol-alignment cases.
 //!
 //!
-//! * 参数三档校验，与「累加器未建时 producer 的 getter 返回 0」的语义；
-//! * `try_add_message` 全局字节闸门（放行即记账、归还、拒绝后调用方直发）；
-//! * 批量应答**拆条**（逗号分隔 msgId/offsetMsgId → 每条各自的结果、queueOffset 递增）；
-//! * `AggregateKey` 的四维分区（topic / mq / waitStoreMsgOK / tag）；
-//! * 守卫线程把「已发完的空批次」置 closed 并摘表；
-//! * 同步 / 异步失败路径（异常上抛 + 额度归还；回调各拿到一份）；
-//! * `start → shutdown → start`（累加器按 clientId 复用，生产者重启会再 start 一次）。
+//! * Three-tier parameter validation, plus the semantics of "producer getters return 0 while no accumulator exists";
+//! * `try_add_message` global byte gate (admission books the bytes, sending returns them, rejection means the caller sends directly);
+//! * Batch response **splitting** (comma-separated msgId/offsetMsgId → each message gets its own result, queueOffset incrementing);
+//! * The four dimensions of `AggregateKey` (topic / mq / waitStoreMsgOK / tag);
+//! * The guard thread marks an "empty batch that was already sent" closed and removes it from the table;
+//! * Sync / async failure paths (error propagated + quota returned; each callback gets its own copy);
+//! * `start → shutdown → start` (the accumulator is reused by clientId; a producer restart starts it once more).
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,9 +27,9 @@ use crate::error::{Error, Result};
 
 const TOPIC: &str = "AccumTestTopic";
 
-// ================================================================ 夹具
+// ================================================================ fixtures
 
-/// 累加器发出去的一批：批量对象 + 目标队列 + 有没有回调。
+/// One batch sent by the accumulator: the batch object + target queue + whether there was a callback.
 struct SentBatch {
     batch: MessageBatch,
     mq: Option<MessageQueue>,
@@ -41,7 +41,7 @@ struct FakeSender {
     result: Mutex<Option<SendResult>>,
     error: Mutex<Option<String>>,
     auto_complete: AtomicBool,
-    /// 两个 send 入口一共被调了几次。
+    /// How many times the two send entry points were called in total.
     calls: Mutex<usize>,
 }
 
@@ -74,7 +74,7 @@ impl FakeSender {
         sender.into()
     }
 
-    /// 未指定结果时的兜底：`SEND_OK` + `123`。
+    /// Fallback when no result was set: `SEND_OK` + `123`.
     fn resolve(&self, mq: Option<&MessageQueue>) -> SendResult {
         if let Some(result) = self.result.lock().unwrap().clone() {
             return result;
@@ -108,7 +108,7 @@ impl FakeSender {
         *self.calls.lock().unwrap()
     }
 
-    /// 第 `i` 批发出去时的目标队列。
+    /// The target queue the `i`-th batch was sent to.
     fn mq_at(&self, i: usize) -> Option<MessageQueue> {
         self.sent.lock().unwrap()[i].mq.clone()
     }
@@ -157,7 +157,7 @@ impl AccumulatorSender for FakeSender {
     }
 }
 
-/// 收集回调。
+/// Collecting callback.
 #[derive(Default)]
 struct CollectingCallback {
     results: Mutex<Vec<SendResult>>,
@@ -246,7 +246,7 @@ fn accumulator(name: &str, sender: &Arc<FakeSender>) -> ProduceAccumulator {
     ProduceAccumulator::new(name, sender)
 }
 
-/// 起一个线程走一次同步 `send`（真实调用链里调用方线程就是这样阻塞在 `add` 里的）。
+/// Spawns a thread that performs one synchronous `send` (in the real call chain the caller thread blocks inside `add` just like this).
 fn spawn_send(
     acc: &ProduceAccumulator,
     msg: Message,
@@ -256,7 +256,7 @@ fn spawn_send(
     std::thread::spawn(move || acc.send(msg, mq.as_ref()))
 }
 
-/// 等某个同步批次攒够 `count` 条（`filter` 用来在表里挑出指定的那一批）。
+/// Waits until some synchronous batch accumulates `count` messages (`filter` picks out the specific batch in the table).
 fn wait_for_batch(
     acc: &ProduceAccumulator,
     count: i64,
@@ -278,7 +278,7 @@ fn wait_for_batch(
         .find(|b| b.count() == count && filter(b))
 }
 
-// ================================================================ 参数
+// ================================================================ parameters
 
 #[test]
 fn default_params_match_contract() {
@@ -333,13 +333,13 @@ fn registry_reuses_accumulator_by_client_id() {
     assert_eq!(b.get_batch_max_delay_ms(), DEFAULT_HOLD_MS);
 }
 
-// ================================================================ 全局字节闸门
+// ================================================================ global byte gate
 
 #[test]
 fn try_add_message_gate_and_release() {
     let acc = accumulator("gate", &FakeSender::new());
     acc.total_batch_max_bytes(10).unwrap();
-    let msg = Message::new(TOPIC, Some(b"1234567890")); // 10 字节
+    let msg = Message::new(TOPIC, Some(b"1234567890")); // 10 bytes
     assert!(acc.try_add_message(&msg));
     assert_eq!(acc.currently_hold_size(), 10);
     assert!(!acc.try_add_message(&Message::new(TOPIC, Some(b"x"))));
@@ -347,18 +347,18 @@ fn try_add_message_gate_and_release() {
     acc.release_hold(10);
     assert_eq!(acc.currently_hold_size(), 0);
     assert!(acc.try_add_message(&Message::new(TOPIC, Some(b"x"))));
-    // 空 body 不记账但仍然放行
+    // an empty body books nothing but is still admitted
     acc.release_hold(1);
     acc.total_batch_max_bytes(5).unwrap();
     assert!(acc.try_add_message(&Message::new(TOPIC, Some(b""))));
     assert_eq!(acc.currently_hold_size(), 0);
 }
 
-// ================================================================ 归并
+// ================================================================ merging
 
 #[test]
 fn sync_batch_merges_messages_and_returns_per_message_results() {
-    // 5 条同键消息攒成 1 个 MessageBatch，各自拿到自己的拆条 SendResult
+    // 5 same-key messages accumulate into 1 MessageBatch, each getting its own split SendResult
     let sender = FakeSender::with_result(SendResult {
         status: SendStatus::SendOk,
         msg_id: Some("id-0,id-1,id-2,id-3,id-4".to_string()),
@@ -368,10 +368,10 @@ fn sync_batch_merges_messages_and_returns_per_message_results() {
         ..SendResult::default()
     });
     let acc = accumulator("sync-batch", &sender);
-    // holdMs 拉长到 3s：保证 5 条都进同一批（用例手动触发发送，不等这 3s）
+    // holdMs stretched to 3s: guarantees all 5 land in the same batch (the test triggers the send manually, never waiting out the 3s)
     acc.batch_max_delay_ms(3000).unwrap();
     let messages = make_messages(5);
-    // 真实调用链里是 `can_batch` 先 `try_add_message` 记账，累加器发完再归还
+    // in the real call chain `can_batch` books via `try_add_message` first, and the accumulator returns the quota after sending
     for m in &messages {
         assert!(acc.try_add_message(m));
     }
@@ -393,15 +393,15 @@ fn sync_batch_merges_messages_and_returns_per_message_results() {
     assert_eq!(the_batch.send_callbacks().len(), 0);
     assert!(the_batch.keys().is_empty());
 
-    // 手动触发（等价于守卫线程在 holdMs 到点后叫醒某一个等待者去发）
+    // manual trigger (equivalent to the guard thread waking one waiter to send once holdMs elapses)
     the_batch.force_sync_send().expect("forced sync send ok");
     for t in threads {
         t.join().expect("sender thread joined");
     }
 
     assert_eq!(sender.sent_count(), 1);
-    assert!(sender.mq_at(0).is_none()); // 没指定 mq → 由生产者轮询选
-    assert!(!sender.callback_at(0)); // 同步路径没有回调
+    assert!(sender.mq_at(0).is_none()); // no mq given → chosen by producer round-robin
+    assert!(!sender.callback_at(0)); // the sync path has no callback
     assert_eq!(
         sender.batch_at(0).body().len(),
         reference_batch_body(&make_messages(5)).len()
@@ -428,13 +428,13 @@ fn sync_batch_merges_messages_and_returns_per_message_results() {
         );
         assert_eq!(result.queue_offset, 100 + position as i64);
     }
-    // 发完归还全局额度
+    // the global quota is returned after sending
     assert_eq!(acc.currently_hold_size(), 0);
 }
 
 #[test]
 fn async_batch_merges_and_fires_every_callback() {
-    // 异步：5 条同键消息由一个守卫线程攒成 1 批，回调各自拿到拆条结果
+    // async: 5 same-key messages accumulate into 1 batch by one guard thread, and the callbacks each get their split results
     let sender = FakeSender::with_result(SendResult {
         status: SendStatus::SendOk,
         msg_id: Some("a,b,c,d,e".to_string()),
@@ -455,7 +455,7 @@ fn async_batch_merges_and_fires_every_callback() {
         acc.send_async(msg, None, as_callback(cb));
     }
 
-    // 异步批次靠**守卫线程**唤醒：每 max(1, holdMs/2) ms 扫一遍，readyToSend 就发
+    // async batches are woken by the **guard thread**: a sweep every max(1, holdMs/2) ms, sending once readyToSend
     let done = wait_until(|| callbacks.iter().all(|cb| cb.total() == 1), deadline());
     acc.shutdown();
     assert!(done, "guard thread must flush the async batch");
@@ -467,8 +467,8 @@ fn async_batch_merges_and_fires_every_callback() {
     assert_eq!(offsets, vec![7, 8, 9, 10, 11]);
 
     assert_eq!(sender.sent_count(), 1);
-    assert!(sender.callback_at(0)); // 异步路径回调不为 None
-    // 单线程依次 add → 批内顺序确定，可以逐字节比
+    assert!(sender.callback_at(0)); // the async path callback is not None
+    // single thread adds in turn → in-batch order is deterministic, so a byte-for-byte comparison is possible
     assert_eq!(
         sender.batch_at(0).encode(),
         reference_batch_body(&make_messages(5))
@@ -479,7 +479,7 @@ fn async_batch_merges_and_fires_every_callback() {
 
 #[test]
 fn split_results_are_shared_when_msg_id_has_no_comma() {
-    // 老 broker / 单条应答：msgId 不含逗号时所有下标指向同一份内容
+    // old broker / single response: when msgId has no comma every index points at the same content
     let sender = FakeSender::with_result(SendResult {
         status: SendStatus::SendOk,
         msg_id: Some("single-id".to_string()),
@@ -541,7 +541,7 @@ fn send_with_message_queue_pins_the_batch() {
     assert_eq!(sender.sent_count(), 1);
     assert_eq!(sender.mq_at(0), Some(mq.clone()));
 
-    // 异步 + 指定 mq
+    // async + explicit mq
     let sender2 = FakeSender::new();
     let acc2 = accumulator("pinned-async", &sender2);
     acc2.start();
@@ -559,7 +559,7 @@ fn send_with_message_queue_pins_the_batch() {
 
 #[test]
 fn batch_merges_keys_with_space_separator() {
-    // 同步批次的 KEYS = 全体子消息 keys 的并集，空格 join（MessageConst.KEY_SEPARATOR）
+    // the sync batch's KEYS = the union of all sub-message keys, joined by spaces (MessageConst.KEY_SEPARATOR)
     let sender = FakeSender::new();
     let acc = accumulator("keys", &sender);
     acc.batch_max_delay_ms(3000).unwrap();
@@ -567,7 +567,7 @@ fn batch_merges_keys_with_space_separator() {
     let m2 = Message::with_tags_and_keys(TOPIC, Some(b"bbb"), None, Some("k2 k3"), 0);
     let threads: Vec<_> = [m1, m2].into_iter().map(|msg| spawn_send(&acc, msg, None)).collect();
     let the_batch = wait_for_batch(&acc, 2, |_| true).expect("2 messages land in one batch");
-    // 批里的 keys 是**并集**（去重）
+    // the batch's keys are the **union** (deduplicated)
     let mut keys: Vec<String> = the_batch.keys().into_iter().collect();
     keys.sort();
     assert_eq!(keys, vec!["k1", "k2", "k3"]);
@@ -590,7 +590,7 @@ fn batch_merges_keys_with_space_separator() {
 fn aggregate_key_partitions_by_topic_mq_wait_and_tag() {
     let msg = Message::new(TOPIC, Some(b"x"));
     let base = AggregateKey::of_message(&msg);
-    // tag 缺省 → None（不是空串）
+    // missing tag → None (not an empty string)
     assert_eq!(base.tag, None);
     assert!(base.wait_store_msg_ok);
     assert!(base.mq.is_none());
@@ -616,7 +616,7 @@ fn aggregate_key_partitions_by_topic_mq_wait_and_tag() {
     assert_eq!(pinned.mq, Some(mq));
     assert_ne!(base, pinned);
 
-    // HashSet 语义：四维任一不同就是不同的键
+    // HashSet semantics: differing in any of the four dimensions makes a different key
     let keys: HashSet<AggregateKey> =
         [base.clone(), tagged_key, no_wait_key, other_topic, pinned].into_iter().collect();
     assert_eq!(keys.len(), 5);
@@ -624,11 +624,11 @@ fn aggregate_key_partitions_by_topic_mq_wait_and_tag() {
 
 #[test]
 fn different_tags_do_not_merge() {
-    // tag 不同的两条消息必须落进**两个**批次（一个 MessageBatch 只有一个 TAGS 属性），
-    // 而且各自独立发出去
+    // two messages with different tags must land in **two** batches (one MessageBatch has a single TAGS property),
+    // and each must be sent independently
     let sender = FakeSender::new();
     let acc = accumulator("tags", &sender);
-    acc.start(); // 用默认 holdMs(10ms)，让守卫线程把两个批次分别推出去
+    acc.start(); // with the default holdMs(10ms), the guard thread pushes the two batches out separately
     let threads: Vec<_> = ["TagA", "TagB"]
         .into_iter()
         .map(|tag| {
@@ -655,7 +655,7 @@ fn different_tags_do_not_merge() {
     assert_eq!(sender.sent_count(), 2);
 }
 
-// ================================================================ 守卫线程
+// ================================================================ guard thread
 
 #[test]
 fn guard_keeps_closed_batch_until_next_send() {
@@ -671,12 +671,12 @@ fn guard_keeps_closed_batch_until_next_send() {
     first_thread.join().expect("sender thread joined").expect("sync send ok");
 
     assert!(first.is_closed());
-    assert_eq!(first.messages_size(), 1); // 只置 closed，不重置 size
-    // 守卫线程看到 size > 0 → 不摘表
+    assert_eq!(first.messages_size(), 1); // only sets closed, does not reset size
+    // the guard thread sees size > 0 → does not remove it from the table
     acc.run_guard_once(true);
     assert_eq!(acc.sync_batch_count(), 1);
 
-    // 同键再来一条 → 拿到的是那个已关闭的批次 → add 返回 -1 → 摘表重取（新批次）
+    // another same-key message → gets the closed batch → add returns -1 → the table entry is replaced with a fresh batch
     assert!(acc.try_add_message(&msg));
     let second_thread = spawn_send(&acc, msg.clone(), None);
     let second = wait_for_batch(&acc, 1, |b| !Arc::ptr_eq(b, &first))
@@ -691,7 +691,7 @@ fn guard_keeps_closed_batch_until_next_send() {
 
 #[test]
 fn guard_removes_empty_batch_without_sending() {
-    // 空批次（还没人 add）由守卫线程置 closed 并摘表，且**不发**任何请求
+    // an empty batch (nobody has added) is marked closed and removed by the guard thread, and **no** request is sent
     let sender = FakeSender::new();
     let acc = accumulator("empty-batch", &sender);
     acc.batch_max_delay_ms(3000).unwrap();
@@ -725,7 +725,7 @@ fn accumulator_can_restart_after_shutdown() {
     assert_eq!(sender.sent_count(), 1);
 }
 
-// ================================================================ 失败路径
+// ================================================================ failure paths
 
 #[test]
 fn sync_send_failure_surfaces_and_returns_hold_size() {
@@ -764,7 +764,7 @@ fn async_send_failure_reaches_every_callback() {
         let errors = cb.errors();
         assert!(errors.iter().all(|e| e.contains("async boom")), "{errors:?}");
     }
-    // 异步路径：回调交付时才归还额度
+    // async path: the quota is returned only when the callbacks are delivered
     assert_eq!(acc.currently_hold_size(), 0);
     assert_eq!(sender.sent_count(), 1);
 }

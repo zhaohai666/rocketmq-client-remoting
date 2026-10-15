@@ -1,9 +1,10 @@
-// 签名内容：先 MakeCustomHeaderToNet()，再按 key 序取 ExtFields 的**全部** value
-// （排除 Signature 键自身；拼接时只有 value，不带 key、不带 `=`/`&` 等分隔符），
-// 最后拼上 Body 原始字节。
-// 签名值：标准 Base64( HMAC-SHA1(key = secretKey, data = 上述内容) )。
+// Signature content: first MakeCustomHeaderToNet(), then take the **all** values of
+// ExtFields in key order (excluding the Signature key itself; only values are concatenated,
+// without keys, without `=`/`&` or other separators), and finally append the raw Body bytes.
+// Signature value: standard Base64( HMAC-SHA1(key = secretKey, data = the above content) ).
 //
-// 加密原语直接用 BCL（System.Security.Cryptography.HMACSHA1），**不引入任何 NuGet**。
+// The crypto primitive comes straight from the BCL (System.Security.Cryptography.HMACSHA1),
+// **with no NuGet dependency**.
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
@@ -14,7 +15,7 @@ namespace RocketMQ.Remoting;
 
 public interface IRpcHook
 {
-    /// <summary>发送前调用。实现必须自行保证线程安全；传输层不持锁调用本方法。</summary>
+    /// <summary>Called before sending. Implementations must ensure their own thread safety; the transport layer does not hold a lock when calling this method.</summary>
     void DoBeforeRequest(string remoteAddr, RemotingCommand request);
 
     void DoAfterResponse(string remoteAddr, RemotingCommand request, RemotingCommand? response);
@@ -53,7 +54,8 @@ public sealed class AclClientRPCHook : IRpcHook
     public SessionCredentials Credentials => _credentials;
 
     /// <summary>
-    /// AccessKey / SecurityToken 先写入（它们参与签名），再算签名，最后写 Signature。
+    /// AccessKey / SecurityToken are written first (they participate in the signature), then
+    /// the signature is computed, and finally Signature is written.
     /// </summary>
     public void DoBeforeRequest(string remoteAddr, RemotingCommand request)
     {
@@ -87,7 +89,7 @@ public sealed class AclClientRPCHook : IRpcHook
         {
             if (key == SessionCredentials.SignatureField)
             {
-                continue; // Signature 自身不参与签名（与 broker 侧一致）
+                continue; // Signature itself does not participate in the signature (matches the broker side)
             }
 
             byte[] value = Encoding.UTF8.GetBytes(request.ExtFields[key]);
@@ -135,7 +137,7 @@ public sealed class StreamTypeRPCHook : IRpcHook
 }
 
 /// <summary>
-/// 按注册顺序依次执行的组合钩子。
+/// Composite hook that runs its hooks in registration order.
 public sealed class ChainedRpcHook : IRpcHook
 {
     private readonly IReadOnlyList<IRpcHook> _hooks;
@@ -185,7 +187,8 @@ public sealed class NamespaceRpcHook : IRpcHook
     }
 }
 
-/// 各 facade 在 Start() 里统一走这里，顺序就不会写反。
+/// Each facade goes through here uniformly in Start(), so the order cannot be written
+/// backwards.
 /// </summary>
 public static class RequestHooks
 {

@@ -2,18 +2,19 @@
 
 declare(strict_types=1);
 
-// DefaultMQAdminExt 真机冒烟（精简版场景面）。
+// DefaultMQAdminExt live smoke test (a reduced scenario surface).
 //
 //   php examples/live_admin.php [namesrv]
 //
-// 覆盖：集群探活、topic CRUD + 路由、topic 列表、topicConfig、集群归属、
-// broker 配置/运行时 stats、KV 配置 CRUD、订阅组 CRUD、发消息 + topic 统计、
-// 位点/时间戳查询、KEYS 索引查询 + viewMessage、deleteTopic 收尾。
+// Covers: cluster liveness, topic CRUD + route, topic list, topicConfig, cluster membership,
+// broker config/runtime stats, KV config CRUD, subscription group CRUD, send message + topic
+// stats, offset/timestamp queries, KEYS index query + viewMessage, deleteTopic teardown.
 //
-// 本工具自己造 topic + 订阅组 + KV namespace，跑完自己删（名字带时间戳），
-// 可以反复跑；中途失败残留的只是垃圾 topic，不影响下次。
+// The tool creates its own topic + subscription group + KV namespace and deletes them when done
+// (names carry a timestamp), so it is rerunnable; leftovers from mid-run failures are just junk
+// topics and do not affect the next run.
 //
-// 收口行 `PASS=<n> FAIL=<n> TOPIC=<topic>`；任一 FAIL 非 0 退出。
+// Closing line `PASS=<n> FAIL=<n> TOPIC=<topic>`; exits non-zero on any FAIL.
 require __DIR__ . '/../bootstrap.php';
 
 use RocketMQ\Client\DefaultMQAdminExt;
@@ -25,7 +26,7 @@ use RocketMQ\Remoting\Protocol\SubscriptionGroupConfig;
 
 $pass = 0;
 $fail = 0;
-/** 统一签名：check(bool $ok, string $name, string $detail = '')。 */
+/** Uniform signature: check(bool $ok, string $name, string $detail = ''). */
 $check = function (bool $ok, string $name, string $detail = '') use (&$pass, &$fail): void {
     echo ($ok ? 'PASS' : 'FAIL') . ' ' . $name . ($detail !== '' ? ' | ' . $detail : '') . PHP_EOL;
     if ($ok) {
@@ -49,7 +50,7 @@ $admin->start();
 
 $created = false;
 try {
-    // ---------- 1) 集群探活 ----------
+    // ---------- 1) cluster liveness ----------
     $masterAddr = null;
     $clusterName = null;
     $ci = null;
@@ -64,17 +65,17 @@ try {
             $clusterName = array_key_first($ci->clusterAddrTable);
         }
     } catch (Throwable $e) {
-        $check(false, '集群探活 fetchBrokerClusterInfo', $e->getMessage());
+        $check(false, 'cluster liveness fetchBrokerClusterInfo', $e->getMessage());
     }
-    $check($masterAddr !== null, '集群探活 fetchBrokerClusterInfo',
-        'master=' . ($masterAddr ?? '无') . ' cluster=' . ($clusterName ?? '?'));
+    $check($masterAddr !== null, 'cluster liveness fetchBrokerClusterInfo',
+        'master=' . ($masterAddr ?? 'none') . ' cluster=' . ($clusterName ?? '?'));
     if ($masterAddr === null) {
-        echo 'FAIL 集群里没有任何 broker，中止' . PHP_EOL;
+        echo 'FAIL no broker in the cluster, aborting' . PHP_EOL;
         exit(1);
     }
     $brokerName = array_key_first($ci->brokerAddrTable);
 
-    // ---------- 2) topic CRUD + 路由 ----------
+    // ---------- 2) topic CRUD + route ----------
     try {
         $admin->createTopic($brokerName, $topic, 4);
         $created = true;
@@ -90,72 +91,72 @@ try {
             $qnums[] = $qd->readQueueNums;
         }
         $all4 = $qnums !== [] && count(array_unique($qnums)) === 1 && $qnums[0] === 4;
-        $check($all4 && count($route->brokerDatas ?? []) > 0, '路由 readQueueNums==4',
+        $check($all4 && count($route->brokerDatas ?? []) > 0, 'route readQueueNums==4',
             'queueDatas=' . json_encode($qnums) . ' brokerDatas=' . count($route->brokerDatas ?? []));
     } catch (Throwable $e) {
-        $check(false, '路由 readQueueNums==4', $e->getMessage());
+        $check(false, 'route readQueueNums==4', $e->getMessage());
     }
 
     try {
         $tl = $admin->fetchAllTopicList();
         $hit = in_array($topic, $tl->topicList ?? [], true);
-        $check($hit, '新 topic 出现在 FetchAllTopicList', 'topics=' . count($tl->topicList ?? []));
+        $check($hit, 'new topic appears in FetchAllTopicList', 'topics=' . count($tl->topicList ?? []));
     } catch (Throwable $e) {
-        $check(false, '新 topic 出现在 FetchAllTopicList', $e->getMessage());
+        $check(false, 'new topic appears in FetchAllTopicList', $e->getMessage());
     }
 
     try {
         $tc = $admin->examineTopicConfig($masterAddr, $topic);
-        $check($tc->readQueueNums === 4 && $tc->writeQueueNums === 4, 'TopicConfig 队列数与创建一致',
+        $check($tc->readQueueNums === 4 && $tc->writeQueueNums === 4, 'TopicConfig queue counts match creation',
             "read={$tc->readQueueNums} write={$tc->writeQueueNums}");
     } catch (Throwable $e) {
-        $check(false, 'TopicConfig 队列数与创建一致', $e->getMessage());
+        $check(false, 'TopicConfig queue counts match creation', $e->getMessage());
     }
 
     try {
         $cl = $admin->getTopicClusterList($topic);
-        // 返回的是 list<string>（不是按集群名键控的 map），用 in_array 判定
-        $check(in_array($clusterName, $cl, true), 'GetTopicClusterList 含本集群',
+        // Returns a list<string> (not a map keyed by cluster name); use in_array to decide
+        $check(in_array($clusterName, $cl, true), 'GetTopicClusterList contains this cluster',
             'clusters=' . implode(',', $cl));
     } catch (Throwable $e) {
-        $check(false, 'GetTopicClusterList 含本集群', $e->getMessage());
+        $check(false, 'GetTopicClusterList contains this cluster', $e->getMessage());
     }
 
-    // ---------- 3) broker 配置 / 运行时 stats ----------
+    // ---------- 3) broker config / runtime stats ----------
     try {
         $cfg = $admin->getBrokerConfig($masterAddr);
-        $check($cfg !== [] && ($cfg['brokerName'] ?? '') !== '', 'getBrokerConfig 解析出非空 k=v',
+        $check($cfg !== [] && ($cfg['brokerName'] ?? '') !== '', 'getBrokerConfig parses non-empty k=v',
             'keys=' . count($cfg));
     } catch (Throwable $e) {
-        $check(false, 'getBrokerConfig 解析出非空 k=v', $e->getMessage());
+        $check(false, 'getBrokerConfig parses non-empty k=v', $e->getMessage());
     }
 
     try {
         $rt = $admin->fetchBrokerRuntimeStats($masterAddr);
-        $check(count($rt->table ?? []) > 0, 'FetchBrokerRuntimeStats 非空',
+        $check(count($rt->table ?? []) > 0, 'FetchBrokerRuntimeStats non-empty',
             'entries=' . count($rt->table ?? []));
     } catch (Throwable $e) {
-        $check(false, 'FetchBrokerRuntimeStats 非空', $e->getMessage());
+        $check(false, 'FetchBrokerRuntimeStats non-empty', $e->getMessage());
     }
 
-    // ---------- 4) KV 配置 CRUD ----------
+    // ---------- 4) KV config CRUD ----------
     try {
         $admin->putKvConfig($kvns, 'k1', 'v1');
         $v = $admin->getKvConfig($kvns, 'k1');
-        $check($v === 'v1', 'KV 值往返一致', 'v=' . var_export($v, true));
+        $check($v === 'v1', 'KV value round-trips unchanged', 'v=' . var_export($v, true));
 
         $kvt = $admin->getKvListByNamespace($kvns);
-        $check(($kvt->table['k1'] ?? null) === 'v1', 'GetKVListByNamespace 含 k1',
+        $check(($kvt->table['k1'] ?? null) === 'v1', 'GetKVListByNamespace contains k1',
             'table=' . json_encode($kvt->table ?? []));
 
         $admin->deleteKvConfig($kvns, 'k1');
         $gone = $admin->getKvConfig($kvns, 'k1');
-        $check($gone === null, 'KV 删除后不再存在', 'after=' . var_export($gone, true));
+        $check($gone === null, 'KV no longer exists after deletion', 'after=' . var_export($gone, true));
     } catch (Throwable $e) {
-        $check(false, 'KV 配置 CRUD', $e->getMessage());
+        $check(false, 'KV config CRUD', $e->getMessage());
     }
 
-    // ---------- 5) 订阅组 CRUD ----------
+    // ---------- 5) subscription group CRUD ----------
     try {
         $sgc = new SubscriptionGroupConfig();
         $sgc->groupName = $group;
@@ -163,13 +164,13 @@ try {
         $sgc->retryQueueNums = 1;
         $admin->createAndUpdateSubscriptionGroupConfig($masterAddr, $sgc);
         $got = $admin->getSubscriptionGroupConfig($masterAddr, $group);
-        $check($got !== null && $got->retryMaxTimes === 5, '订阅组 retryMaxTimes 往返一致',
+        $check($got !== null && $got->retryMaxTimes === 5, 'subscription group retryMaxTimes round-trips unchanged',
             'got=' . ($got !== null ? 'retryMaxTimes=' . $got->retryMaxTimes : 'null'));
     } catch (Throwable $e) {
-        $check(false, '订阅组 retryMaxTimes 往返一致', $e->getMessage());
+        $check(false, 'subscription group retryMaxTimes round-trips unchanged', $e->getMessage());
     }
 
-    // ---------- 6) 发消息 + topic 统计 + 位点/时间戳查询 ----------
+    // ---------- 6) send message + topic stats + offset/timestamp queries ----------
     $sentMsg = null;
     try {
         $p = new DefaultMQProducer('PID_PhpAdmin_' . $stamp);
@@ -188,17 +189,17 @@ try {
         $p->shutdown();
 
         $stats = $admin->examineTopicStats($topic);
-        // 3 条消息轮询散到多条队列：按 SUM 断言（取 MAX 会在分散时恒为 1）
+        // 3 messages round-robin across multiple queues: assert on SUM (MAX would always be 1 when spread)
         $totalSum = 0;
         $totalMax = 0;
         foreach ($stats->offsetTable ?? [] as $e) {
             $totalSum += $e['value']->maxOffset;
             $totalMax = max($totalMax, $e['value']->maxOffset);
         }
-        $check($totalSum >= 3, 'ExamineTopicStats 汇总 maxOffset 总和>=3',
+        $check($totalSum >= 3, 'ExamineTopicStats aggregated maxOffset sum>=3',
             'queues=' . count($stats->offsetTable ?? []) . " sum=$totalSum max=$totalMax putTps={$stats->topicPutTps}");
 
-        // 选一条非空队列做位点/时间戳查询
+        // Pick a non-empty queue for the offset/timestamp queries
         $q = null;
         foreach ($stats->offsetTable ?? [] as $e) {
             if ($e['value']->maxOffset > 0) {
@@ -206,38 +207,38 @@ try {
                 break;
             }
         }
-        $check($q !== null, '选出一条非空队列',
+        $check($q !== null, 'picked a non-empty queue',
             $q === null ? '' : (($q->topic ?? '?') . '#' . ($q->queueId ?? '?') . '@' . ($q->brokerName ?? '?')));
         if ($q instanceof MessageQueue) {
             $maxOff = $admin->maxOffset($q);
             $minOff = $admin->minOffset($q);
-            $check($maxOff >= $minOff && $maxOff >= 1, 'MaxOffset >= MinOffset 且队列非空',
+            $check($maxOff >= $minOff && $maxOff >= 1, 'MaxOffset >= MinOffset and the queue is non-empty',
                 "max=$maxOff min=$minOff");
 
             $now = (int) (microtime(true) * 1000);
             $up = $admin->searchOffset($q, $now);
-            $check($up === $maxOff, '时间戳=now 时边界塌到 maxOffset（队尾之后的下一个位点）',
+            $check($up === $maxOff, 'timestamp=now collapses to maxOffset (next offset past the tail)',
                 "up=$up max=$maxOff");
             $early = $admin->searchOffset($q, 0);
-            $check($early === $minOff, '时间戳早于全部消息时塌到 minOffset', "early=$early min=$minOff");
-            $check($up !== $early, '两个时间戳边界确实不同', "up=$up early=$early");
+            $check($early === $minOff, 'timestamp earlier than all messages collapses to minOffset', "early=$early min=$minOff");
+            $check($up !== $early, 'the two timestamp boundaries truly differ', "up=$up early=$early");
 
             $est = $admin->earliestMsgStoreTime($q);
-            $check($est > 0, 'EarliestMsgStoreTime 非零', "est=$est");
+            $check($est > 0, 'EarliestMsgStoreTime non-zero', "est=$est");
 
-            // 全新组、无消费者：broker 侧没有已提交位点
+            // Brand-new group, no consumers: the broker side has no committed offset
             $off = $admin->examineConsumerOffset($group, $q);
-            $check($off === null, '无消费时位点未提交（null）', 'off=' . var_export($off, true));
+            $check($off === null, 'no consumption yet, offset uncommitted (null)', 'off=' . var_export($off, true));
         }
     } catch (Throwable $e) {
-        $check(false, '发消息 + 统计/位点查询', get_class($e) . ': ' . $e->getMessage());
+        $check(false, 'send message + stats/offset queries', get_class($e) . ': ' . $e->getMessage());
     }
 
-    // ---------- 7) KEYS 索引查询 + viewMessage ----------
+    // ---------- 7) KEYS index query + viewMessage ----------
     try {
         $key = 'PHPADMIN' . $stamp . '0';
         $msgs = [];
-        // 索引文件异步构建，轮询回读
+        // The index file builds asynchronously; poll for the read-back
         for ($try = 0; $try < 8; $try++) {
             $msgs = $admin->queryMessageByKey($topic, $key, 32);
             if (count($msgs) >= 1) {
@@ -245,17 +246,17 @@ try {
             }
             sleep(1);
         }
-        $check(count($msgs) >= 1, 'QueryMessageByKey 命中', count($msgs) . ' 条');
+        $check(count($msgs) >= 1, 'QueryMessageByKey hits', count($msgs) . ' message(s)');
         if (count($msgs) >= 1 && $sentMsg !== null) {
             $view = $admin->viewMessage($topic, $msgs[0]->msgId);
-            $check($view->getBody() === $sentMsg->getBody(), 'viewMessage body 与索引一致',
+            $check($view->getBody() === $sentMsg->getBody(), 'viewMessage body matches the index',
                 'body=' . substr((string) $view->getBody(), 0, 32));
         }
     } catch (Throwable $e) {
         $check(false, 'QueryMessageByKey/viewMessage', $e->getMessage());
     }
 
-    // ---------- 8) 收尾：deleteTopic ----------
+    // ---------- 8) teardown: deleteTopic ----------
     if ($created) {
         try {
             $admin->deleteTopic($topic);
@@ -268,9 +269,9 @@ try {
                 }
                 sleep(1);
             }
-            $check($gone, 'deleteTopic 后 topic 消失', 'topic=' . $topic);
+            $check($gone, 'topic disappears after deleteTopic', 'topic=' . $topic);
         } catch (Throwable $e) {
-            $check(false, 'deleteTopic 后 topic 消失', $e->getMessage());
+            $check(false, 'topic disappears after deleteTopic', $e->getMessage());
         }
     }
 } finally {

@@ -80,7 +80,7 @@ public sealed class TraceBean
     public int RetryTimes { get; set; }
     public int BodyLength { get; set; }
     public TraceMessageType MsgType { get; set; } = TraceMessageType.Normal;
-    public string? TransactionState { get; set; }   // LocalTransactionState 的名字
+    public string? TransactionState { get; set; }   // the name of LocalTransactionState
     public string? TransactionId { get; set; }
     public bool FromTransactionCheck { get; set; }
 }
@@ -145,7 +145,7 @@ public static class TraceDataEncoder
         return res;
     }
 
-    /// <summary>解一条轨迹记录（一段 FIELD_SPLITOR 之内）。无法识别时返回 null。</summary>
+    /// <summary>Decodes one trace record (within a single FIELD_SPLITOR segment). Returns null when unrecognizable.</summary>
     private static TraceContext? DecodeContext(string context)
     {
         List<string> line = LegacySplit.Split(context, TraceConstants.ContentSplitor);

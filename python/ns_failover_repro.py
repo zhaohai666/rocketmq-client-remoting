@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-"""多 NameServer 故障切换复现：杀掉 namesrv[0] 后，生产者应能切到存活节点，
-消费者 start() 不应抛 RemotingConnectException。"""
+"""Multi-NameServer failover reproduction: after namesrv[0] is killed the producer should be able to
+switch to the surviving node, and consumer start() should not raise RemotingConnectException."""
 import os
 import sys
 import time
@@ -14,7 +14,7 @@ from common.message import Message
 from remoting.exception import RemotingException
 from remoting.protocol.heartbeat import ConsumeFromWhere
 
-# ns[0] 是一个没有监听的端口（等价"杀掉 nameServ[0]"），ns[1] 是真实在跑的 9876
+# ns[0] is a port with nothing listening on it (equivalent to "killing nameServ[0]"), ns[1] is the real running 9876
 NS = "127.0.0.1:19876;127.0.0.1:9876"
 STAMP = int(time.time())
 TOPIC = "NsFailover_%d" % STAMP

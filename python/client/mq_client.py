@@ -153,8 +153,8 @@ class MQClientInstance:
             RequestCode.CONSUME_MESSAGE_DIRECTLY, self._process_consume_message_directly)
         self.remoting_client.register_processor(
             RequestCode.NOTIFY_CONSUMER_IDS_CHANGED, self._process_notify_consumer_ids_changed)
-        # 40 只能由 broker 发出，用例无法注入反向请求，所以计数是唯一能断言
-        # 「本端确实收到并处理过」的落点（见 python/tests/test_broker_requests.py）。
+        # 40 can only be sent by the broker; test cases cannot inject a reverse request, so the count is the
+        # only place that proves "this side actually received and processed it" (see python/tests/test_broker_requests.py).
         self._consumer_ids_changed_count = 0
         self.remoting_client.register_processor(
             RequestCode.CHECK_TRANSACTION_STATE, self._dispatch_check_transaction_state)
@@ -189,7 +189,7 @@ class MQClientInstance:
             except Exception as e:
                 logger.debug("adjustThreadPool failed for group %s: %s", group, e)
 
-    # ---------------- 消费者注册（broker 主动请求按 group 分派） ----------------
+    # ---------------- consumer registration (broker proactively dispatches requests by group) ----------------
     def register_consumer(self, group: str, consumer: "DefaultMQPushConsumer") -> None:
         pass
         self._consumer_table[group] = consumer
@@ -200,7 +200,7 @@ class MQClientInstance:
     def find_consumer(self, group: str) -> Optional["DefaultMQPushConsumer"]:
         return self._consumer_table.get(group)
 
-    # ---------------- 事务回查处理器登记（39 分派的门面侧） ----------------
+    # ---------------- transaction check-back handler registration (facade side dispatched by 39) ----------------
     def register_transaction_check_handler(self, handler: Callable) -> None:
         pass
         with self._lifecycle_lock:
@@ -216,16 +216,16 @@ class MQClientInstance:
 
     def _dispatch_check_transaction_state(self, cmd: RemotingCommand,
                                           addr: str) -> Optional[RemotingCommand]:
-        """39 是 oneway，不回响应；把请求交给每个登记的生产者处理器。"""
+        """39 is oneway, no response; hand the request to each registered producer handler."""
         for handler in list(self._transaction_check_handlers):
             try:
                 handler(cmd, addr)
-            except Exception as e:  # noqa: BLE001 —— 单个生产者的异常不影响其他门面
+            except Exception as e:  # noqa: BLE001 -- one producer's exception does not affect other facades
                 logger.warning("checkTransactionState dispatch failed: %s", e)
         return None
 
 
-    # ---------------- CHECK_CLIENT_CONFIG(46)：订阅表达式向 broker 求证 ----------------
+    # ---------------- CHECK_CLIENT_CONFIG(46): verify subscription expression with the broker ----------------
     def check_client_in_broker(self) -> None:
         pass
         for group, consumer in list(self._consumer_table.items()):
@@ -258,7 +258,7 @@ class MQClientInstance:
     # ---------------- 40 NOTIFY_CONSUMER_IDS_CHANGED ----------------
     @property
     def consumer_ids_changed_count(self) -> int:
-        """本实例收到过多少次 broker 的 ``NOTIFY_CONSUMER_IDS_CHANGED(40)``。"""
+        """How many times this instance has received the broker's ``NOTIFY_CONSUMER_IDS_CHANGED(40)``."""
         return self._consumer_ids_changed_count
 
     def rebalance_immediately(self) -> None:
@@ -285,12 +285,12 @@ class MQClientInstance:
         self.rebalance_immediately()
         return None
 
-    # ---------------- broker 主动请求处理（ClientRemotingProcessor） ----------------
+    # ---------------- broker proactive request handling (ClientRemotingProcessor) ----------------
     def _process_reset_offset(self, cmd: RemotingCommand, addr: str) -> Optional[RemotingCommand]:
-        """RESET_CONSUMER_CLIENT_OFFSET(220)：broker 用 invokeOneway 发的，无需应答。
+        """RESET_CONSUMER_CLIENT_OFFSET(220): sent by the broker via invokeOneway, no reply needed.
 
-        但重置逻辑里会触发 rebalance（lock/unlock/batch 等 invokeSync），不能在读线程上同步
-        跑——丢到后台线程，立即返回 None（oneway）。
+        But the reset logic triggers rebalance (lock/unlock/batch etc. via invokeSync), which cannot run
+        synchronously on the read thread -- hand it to a background thread and return None immediately (oneway).
         """
         header = ResetOffsetRequestHeader()
         header.from_ext_fields(cmd.ext_fields)
@@ -327,7 +327,7 @@ class MQClientInstance:
         return None
 
     def _process_get_consumer_status(self, cmd: RemotingCommand, addr: str) -> Optional[RemotingCommand]:
-        """GET_CONSUMER_STATUS_FROM_CLIENT(221)：返回已消费位点表（Map<MessageQueue,Long>）。"""
+        """GET_CONSUMER_STATUS_FROM_CLIENT(221): return the consumed-offset table (Map<MessageQueue,Long>)."""
         header = GetConsumerStatusRequestHeader()
         header.from_ext_fields(cmd.ext_fields)
         group = header.group
@@ -343,7 +343,7 @@ class MQClientInstance:
         return resp
 
     def _process_get_consumer_running_info(self, cmd: RemotingCommand, addr: str) -> Optional[RemotingCommand]:
-        """GET_CONSUMER_RUNNING_INFO(307)：返回本消费者运行信息。"""
+        """GET_CONSUMER_RUNNING_INFO(307): return this consumer's running info."""
         header = GetConsumerRunningInfoRequestHeader()
         header.from_ext_fields(cmd.ext_fields)
         group = header.consumer_group
@@ -357,7 +357,7 @@ class MQClientInstance:
         return resp
 
     def _process_consume_message_directly(self, cmd: RemotingCommand, addr: str) -> Optional[RemotingCommand]:
-        """CONSUME_MESSAGE_DIRECTLY(309)：broker 把一条消息推下来，要求本地真实消费一次。"""
+        """CONSUME_MESSAGE_DIRECTLY(309): the broker pushes a message down, requiring one real local consumption."""
         header = ConsumeMessageDirectlyResultRequestHeader()
         header.from_ext_fields(cmd.ext_fields)
         group = header.consumer_group
@@ -377,7 +377,7 @@ class MQClientInstance:
         resp.body = result.encode()
         return resp
 
-    # ---------------- 生命周期 ----------------
+    # ---------------- lifecycle ----------------
     def start(self) -> None:
         pass
         with self._lifecycle_lock:
@@ -422,8 +422,8 @@ class MQClientInstance:
             self._adjust_pool_thread = t
 
     def shutdown(self) -> None:
-        # 真正的关闭由 MQClientManager 在引用计数归零时触发（unregister_client）；
-        # 这里与 start() 共用一把锁，避免复用场景下与并发的 start 交错。
+        # the real shutdown is triggered by MQClientManager when the reference count hits zero (unregister_client);
+        # this shares a lock with start() to avoid interleaving with a concurrent start() under reuse.
         with self._lifecycle_lock:
             self._started = False
             self._route_refresh_stop.set()
@@ -482,7 +482,7 @@ class MQClientInstance:
         if addrs:
             self.name_server_addrs = list(addrs)
 
-    # ---------------- 底层 invoke ----------------
+    # ---------------- low-level invoke ----------------
     def _invoke_sync(self, addr: str, request: RemotingCommand,
                      timeout_millis: Optional[int] = None) -> RemotingCommand:
         return self.remoting_client.invoke_sync(addr, request, timeout_millis)
@@ -492,7 +492,7 @@ class MQClientInstance:
             return response
         raise MQBrokerException(response.code, response.remark or "")
 
-    # ---------------- 路由管理 ----------------
+    # ---------------- route management ----------------
     def update_topic_route_info_from_name_server(self, topic: str, timeout_millis: int = 5000,
                                                  is_default: bool = False) -> bool:
         pass
@@ -521,8 +521,9 @@ class MQClientInstance:
         if route is None and is_default and topic != MixAll.DEFAULT_TOPIC:
             route = _fetch(MixAll.DEFAULT_TOPIC)
             if route is not None:
-                # 新 topic 由 broker 用 default_topic_queue_nums 创建队列，而默认 topic 自身
-                # 可能配置了更多队列，这里按 broker 实际创建数裁剪，避免选中非法 queueId。
+                # a new topic is created by the broker with default_topic_queue_nums queues, while the default
+                # topic itself may have more queues configured; trim here to the broker's actual count to avoid
+                # selecting an illegal queueId.
                 cap = MixAll.DEFAULT_TOPIC_QUEUE_NUMS
                 for qd in route.queue_datas:
                     qd.write_queue_nums = min(qd.write_queue_nums, cap)
@@ -592,7 +593,7 @@ class MQClientInstance:
             return None
         return random.choice(brokers).select_broker_addr()
 
-    # ---------------- 消息发送 ----------------
+    # ---------------- message send ----------------
     def publish_addr_for(self, broker_name: str, topic: str) -> str:
         pass
         addr = self.find_broker_address_in_publish(broker_name)
@@ -683,7 +684,7 @@ class MQClientInstance:
                 return
             try:
                 on_complete(self._parse_send_response(response, msg, mq), None)
-            except Exception as parse_error:  # noqa: BLE001 — 解析失败也要交给调用方
+            except Exception as parse_error:  # noqa: BLE001 -- on parse failure, still hand it to the caller
                 on_complete(None, parse_error)
 
         self.remoting_client.invoke_async(addr, request, _callback, timeout_millis)
@@ -764,7 +765,7 @@ class MQClientInstance:
             return result
         raise MQBrokerException(response.code, response.remark or "")
 
-    # ---------------- 定时消息撤回 ----------------
+    # ---------------- scheduled message recall ----------------
     def recall_message(self, addr: str, header: RecallMessageRequestHeader,
                        timeout_millis: int) -> str:
         pass
@@ -779,7 +780,7 @@ class MQClientInstance:
             return resp_header.msg_id
         raise MQBrokerException(response.code, response.remark or "")
 
-    # ---------------- Request-Reply：接收 broker 推回的应答 ----------------
+    # ---------------- Request-Reply: receive the reply pushed back by the broker ----------------
     def _process_reply_message(self, cmd: RemotingCommand, addr: str) -> Optional[RemotingCommand]:
         pass
         header = ReplyMessageRequestHeader()
@@ -812,7 +813,7 @@ class MQClientInstance:
             return RemotingCommand.create_response_command(
                 ResponseCode.SYSTEM_ERROR, "process reply message fail: %s" % e, None)
 
-    # ---------------- 消息拉取 ----------------
+    # ---------------- message pull ----------------
     def pull_message(self, consumer_group: str, mq: MessageQueue, queue_offset: int,
                      max_msg_nums: int, sys_flag: int, commit_offset: int,
                      subscription: str, sub_version: int, expression_type: str,
@@ -903,7 +904,7 @@ class MQClientInstance:
             return broker_addrs[first_id], first_id != MixAll.MASTER_ID
         return None, False
 
-    # ---------------- POP 模式（5.x 轻量消费） ----------------
+    # ---------------- POP mode (5.x lightweight consumption) ----------------
 
     def pop_message(self, consumer_group: str, topic: str, queue_id: int = -1,
                     max_msg_nums: int = 32, invisible_time: int = 60000,
@@ -911,17 +912,17 @@ class MQClientInstance:
                     exp: Optional[str] = None, exp_type: Optional[str] = None,
                     order: bool = False, broker_name: Optional[str] = None,
                     timeout_millis: int = 10000, addr: Optional[str] = None) -> "PopResult":
-        """POP 弹取消息（``RequestCode.POP_MESSAGE = 200050``）。
+        """POP a message (``RequestCode.POP_MESSAGE = 200050``).
 
-        与 pull 的语义差别：
-        - **不需要提交位点**，消费完成后用 ``ack_message`` 确认；
-        - 不 ack 的消息在 ``invisible_time`` 之后被 broker 复活并重投到
-          ``%RETRY%<group>_<topic>``（V1），下次 POP 会再弹回来 —— 至少一次语义；
-        - ``queue_id = -1`` 表示弹该 topic 的所有队列。
+        Semantic differences from pull:
+        - **no offset commit needed**; after consumption, confirm via ``ack_message``;
+        - un-acked messages are revived by the broker after ``invisible_time`` and redelivered to
+          ``%RETRY%<group>_<topic>`` (V1), so the next POP pops them again -- at-least-once semantics;
+        - ``queue_id = -1`` means pop all queues of the topic.
 
-        ``born_time`` 必须是当前毫秒时间戳：broker 用
-        ``now - bornTime - pollTime > 500`` 判定"超时太久"并直接回
-        ``POLLING_TIMEOUT(210)``，填 0 会必然失败。
+        ``born_time`` must be the current millisecond timestamp: the broker uses
+        ``now - bornTime - pollTime > 500`` to decide "timed out too long" and directly returns
+        ``POLLING_TIMEOUT(210)``; passing 0 would always fail.
         """
         from .consumer_result import PopResult, PopStatus
         from remoting.protocol import extra_info as ei
@@ -935,8 +936,8 @@ class MQClientInstance:
             brokers = route.get_broker_datas()
             if not brokers:
                 raise MQClientException("No broker in route of topic: %s" % topic)
-            # 调用方连 brokerName 都没给（「弹该 topic 的任意队列」）：先按路由挑一台，
-            # 挑完照样只认它的 master。
+            # the caller didn't even give a brokerName ("pop any queue of the topic"): first pick one by
+            # route, then still only its master is accepted.
             broker_name = brokers[0].broker_name
         if addr is None:
             addr = self.publish_addr_for(broker_name, topic)
@@ -1026,7 +1027,7 @@ class MQClientInstance:
                 offsets.sort()
 
             for m in found:
-                # retry topic 弹回来的消息 broker 已经写好 POP_CK，不能覆盖。
+                # messages popped back from the retry topic already have POP_CK written by the broker; do not overwrite.
                 if m.properties.get(MessageConst.PROPERTY_POP_CK) is not None:
                     continue
                 queue_key = self._pop_queue_map_key(extra, m)
@@ -1048,7 +1049,7 @@ class MQClientInstance:
             m.properties.setdefault(MessageConst.PROPERTY_FIRST_POP_TIME, str(pop_time))
 
     def _addr_for(self, topic: str, broker_name: Optional[str] = None) -> str:
-        """按 topic（可选再按 brokerName）解析 broker 地址。"""
+        """Resolve the broker address by topic (optionally also by brokerName)."""
         route = self.get_topic_route_data(topic)
         if route is None:
             raise MQClientException("No route info of this topic: %s" % topic)
@@ -1069,13 +1070,13 @@ class MQClientInstance:
     def ack_message(self, consumer_group: str, topic: str, queue_id: int,
                     extra_info: str, offset: int, broker_name: Optional[str] = None,
                     timeout_millis: int = 3000, addr: Optional[str] = None) -> int:
-        """确认一条 POP 消息（``RequestCode.ACK_MESSAGE = 200051``）。
+        """Acknowledge a POP message (``RequestCode.ACK_MESSAGE = 200051``).
 
-        ``extra_info`` 用消息上的 ``POP_CK`` 属性；``offset`` 必须是
-        **consumeQueue offset**（即 CK 串第 8 段 / msgQueueOffset），不是 commitlog
-        offset —— 传错 broker 会回 ``NO_MESSAGE``。
+        ``extra_info`` uses the message's ``POP_CK`` property; ``offset`` must be the
+        **consumeQueue offset** (i.e. the 8th segment of the CK string / msgQueueOffset), not the commitlog
+        offset -- passing the wrong one makes the broker return ``NO_MESSAGE``.
 
-        返回 broker 响应码，``ResponseCode.SUCCESS`` 即确认成功。
+        Returns the broker response code; ``ResponseCode.SUCCESS`` means acknowledgment succeeded.
         """
         from remoting.protocol import extra_info as extra
         from remoting.protocol.headers import AckMessageRequestHeader
@@ -1100,11 +1101,12 @@ class MQClientInstance:
                               broker_name: Optional[str] = None,
                               timeout_millis: int = 3000,
                               addr: Optional[str] = None) -> "ChangeInvisibleTimeResult":
-        """延长 POP 消息的不可见时间（``CHANGE_MESSAGE_INVISIBLETIME = 200053``）。
+        """Extend a POP message's invisible time (``CHANGE_MESSAGE_INVISIBLETIME = 200053``).
 
-        用于"还在处理、别让 broker 复活重投"的场景。响应返回的是**新的**
-        popTime / invisibleTime / reviveQid，客户端据此重建 8 段 extraInfo
-        （返回在结果的 ``extra_info`` 字段里）供后续 ACK 使用 —— 不是原来那个旧串。
+        Used for the "still processing, don't let the broker revive and redeliver" scenario. The response
+        returns the **new** popTime / invisibleTime / reviveQid, and the client rebuilds the 8-segment
+        extraInfo from them (returned in the result's ``extra_info`` field) for subsequent ACKs -- not the
+        original old string.
         """
         from .consumer_result import ChangeInvisibleTimeResult
         from remoting.protocol import extra_info as extra
@@ -1292,7 +1294,7 @@ class MQClientInstance:
         messages.sort(key=lambda x: (x.queue_offset or 0))
         return messages[:max_num] if max_num > 0 else messages
 
-    # ---------------- 队列锁（顺序消费） ----------------
+    # ---------------- queue lock (orderly consumption) ----------------
 
     def lock_batch_mq(self, consumer_group: str, client_id: str, mqs: List[MessageQueue],
                       timeout_millis: int = 1000) -> List[MessageQueue]:
@@ -1351,7 +1353,7 @@ class MQClientInstance:
             except Exception as e:  # noqa: BLE001
                 logger.warning("unlock_batch_mq failed for broker %s: %s", broker_name, e)
 
-    # ---------------- 心跳 / 注销 ----------------
+    # ---------------- heartbeat / unregister ----------------
     def send_heartbeat(self, addr: str, heartbeat_data: HeartbeatData, timeout_millis: int = 5000) -> None:
         request = RemotingCommand.create_request_command(RequestCode.HEART_BEAT, None)
         request.body = heartbeat_data.encode()
@@ -1386,7 +1388,7 @@ class MQClientInstance:
         if response.code != ResponseCode.SUCCESS:
             raise MQClientException(response.remark or "", response.code)
 
-    # ---------------- 管理类 API ----------------
+    # ---------------- admin APIs ----------------
     def get_broker_cluster_info(self, timeout_millis: int = 10000) -> ClusterInfo:
         request = RemotingCommand.create_request_command(RequestCode.GET_BROKER_CLUSTER_INFO, None)
         for ns_addr in self.name_server_addrs:
@@ -1501,7 +1503,7 @@ class MQClientInstance:
             return GetConsumerListByGroupResponseBody.decode(response.body)
         return GetConsumerListByGroupResponseBody()
 
-    # ---------------- 工具 ----------------
+    # ---------------- utilities ----------------
     def _consumer_offset_addr(self, mq: MessageQueue) -> str:
         pass
         addr = self.find_broker_address_in_publish(mq.broker_name)

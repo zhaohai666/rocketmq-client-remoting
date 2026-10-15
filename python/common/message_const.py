@@ -20,9 +20,9 @@ class MessageConst:
     PROPERTY_CHECK_IMMUNITY_TIME_IN_SECONDS = "CHECK_IMMUNITY_TIME_IN_SECONDS"
     PROPERTY_RECONSUME_TIME = "RECONSUME_TIME"
     PROPERTY_MSG_REGION = "MSG_REGION"
-    # 消息轨迹开关：broker 在 SEND 响应头里带回（SendMessageProcessor 写
-    # String.valueOf(brokerConfig.isTraceOn())，默认 true），客户端据此决定是否落轨迹；
-    # 消费侧则从消息属性里读同一个 key（ConsumeMessageTraceHookImpl）。
+    # Message trace switch: the broker returns this in the SEND response header (SendMessageProcessor writes
+    # String.valueOf(brokerConfig.isTraceOn()), default true); the client uses it to decide whether to record
+    # trace; the consumer side reads the same key from the message property (ConsumeMessageTraceHookImpl).
     PROPERTY_TRACE_SWITCH = "TRACE_ON"
     PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX = "UNIQ_KEY"
     PROPERTY_MAX_RECONSUME_TIMES = "MAX_RECONSUME_TIMES"
@@ -40,9 +40,9 @@ class MessageConst:
     PROPERTY_INSTANCE_ID = "INSTANCE_ID"
     PROPERTY_CLUSTER = "CLUSTER"
     PROPERTY_MESSAGE_TYPE = "MSG_TYPE"
-    # Request-Reply（5.x）：请求消息带 CORRELATION_ID/REPLY_TO_CLIENT/TTL，
-    # 应答方（消费者）回一条 MSG_TYPE="reply" 的消息，broker 按 REPLY_TO_CLIENT
-    # 把应答推回请求方的 PUSH_REPLY_MESSAGE_TO_CLIENT(326) 通道。
+    # Request-Reply (5.x): the request message carries CORRELATION_ID/REPLY_TO_CLIENT/TTL;
+    # the responder (consumer) sends back a message with MSG_TYPE="reply", and the broker pushes the reply to
+    # the requester's PUSH_REPLY_MESSAGE_TO_CLIENT(326) channel based on REPLY_TO_CLIENT.
     PROPERTY_CORRELATION_ID = "CORRELATION_ID"
     PROPERTY_MESSAGE_REPLY_TO_CLIENT = "REPLY_TO_CLIENT"
     PROPERTY_MESSAGE_TTL = "TTL"
@@ -74,8 +74,8 @@ class MessageConst:
     CHARACTER_MAX_LENGTH = 255
     MESSAGE_ID_PREFIX = "MSGID-"
 
-    # 索引查询类型（对应 MessageConst.INDEX_KEY_TYPE / INDEX_UNIQUE_TYPE / INDEX_TAG_TYPE）
-    # broker 的 QueryMessageRequestHeader.indexType 取这些值；为空时 broker 按 "K" 处理。
+    # Index query types (corresponding to MessageConst.INDEX_KEY_TYPE / INDEX_UNIQUE_TYPE / INDEX_TAG_TYPE).
+    # The broker's QueryMessageRequestHeader.indexType takes these values; when empty, the broker treats it as "K".
     INDEX_KEY_TYPE = "K"
     INDEX_UNIQUE_TYPE = "U"
     INDEX_TAG_TYPE = "T"

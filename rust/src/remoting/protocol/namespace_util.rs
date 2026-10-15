@@ -1,11 +1,11 @@
-//! 命名空间用于多租户隔离：客户端把 `namespace` 以 `namespace%` 前缀拼到
-//! topic / group 上再发给 broker，从 broker 拿到的资源名在交给上层之前再剥掉前缀。
+//! Namespaces provide multi-tenant isolation: the client prefixes `namespace` as `namespace%` onto
+//! the topic / group before sending to the broker, and strips the prefix off resource names received from the broker before handing them upstream.
 //!
-//! 对齐要点（勿凭直觉改）：
-//! - 分隔符是 `%`（不是 `/` 也不是 `:`）。
-//! - `%RETRY%` / `%DLQ%` 前缀**在**命名空间之外：`%RETRY%NS%GID`。
-//!   因此剥/拼都要先把 retry/DLQ 前缀摘下来处理，再拼回去。
-//! - 系统资源（`rmq_sys_` 前缀 topic、`CID_RMQ_SYS_` 前缀 group）**不**加命名空间。
+//! Alignment points (do not change on intuition):
+//! - The separator is `%` (not `/` and not `:`).
+//! - The `%RETRY%` / `%DLQ%` prefixes sit **outside** the namespace: `%RETRY%NS%GID`.
+//!   So both stripping and wrapping must first remove the retry/DLQ prefix, process, then put it back.
+//! - System resources (`rmq_sys_` prefixed topics, `CID_RMQ_SYS_` prefixed groups) are **never** namespaced.
 
 use crate::common::mix_all::MixAll;
 
@@ -44,8 +44,8 @@ impl NamespaceUtil {
         Self::with_out_retry_and_dlq(resource).starts_with(&format!("{namespace}{NAMESPACE_SEPARATOR}"))
     }
 
-    /// `MQ_INST_XX%Topic` → `Topic`；`%RETRY%MQ_INST_XX%GID` → `%RETRY%GID`。
-    /// 未带该命名空间时原样返回。
+    /// `MQ_INST_XX%Topic` → `Topic`; `%RETRY%MQ_INST_XX%GID` → `%RETRY%GID`.
+    /// Returns the input unchanged when the namespace is absent.
     pub fn without_namespace(resource_with_namespace: &str, namespace: &str) -> String {
         if resource_with_namespace.is_empty() {
             return resource_with_namespace.to_string();
@@ -169,15 +169,15 @@ mod tests {
             NamespaceUtil::wrap_namespace("MQ_INST_XX", "%DLQ%GID"),
             "%DLQ%MQ_INST_XX%GID"
         );
-        // 已带命名空间时幂等
+        // Idempotent when the namespace is already present
         assert_eq!(
             NamespaceUtil::wrap_namespace("MQ_INST_XX", "MQ_INST_XX%Topic"),
             "MQ_INST_XX%Topic"
         );
-        // namespace / resource 为空则原样返回
+        // Empty namespace / resource returns the input unchanged
         assert_eq!(NamespaceUtil::wrap_namespace("", "Topic"), "Topic");
         assert_eq!(NamespaceUtil::wrap_namespace("NS", ""), "");
-        // 别的命名空间不算「已带」
+        // A different namespace does not count as "already namespaced"
         assert_eq!(NamespaceUtil::wrap_namespace("NS2", "NS1%Topic"), "NS2%NS1%Topic");
     }
 
@@ -192,9 +192,9 @@ mod tests {
             NamespaceUtil::without_namespace("%DLQ%MQ_INST_XX%GID", ""),
             "%DLQ%GID"
         );
-        // 没有命名空间时原样返回
+        // Returns unchanged when there is no namespace
         assert_eq!(NamespaceUtil::without_namespace("Topic", ""), "Topic");
-        // 显式命名空间：命中才剥
+        // Explicit namespace: strip only on a match
         assert_eq!(NamespaceUtil::without_namespace("MQ_INST_XX1%Topic1", "MQ_INST_XX1"), "Topic1");
         assert_eq!(
             NamespaceUtil::without_namespace("MQ_INST_XX2%Topic2", "MQ_INST_XX1"),
@@ -208,7 +208,7 @@ mod tests {
             NamespaceUtil::without_namespace("%RETRY%MQ_INST_XX2%GID2", "MQ_INST_XX3"),
             "%RETRY%MQ_INST_XX2%GID2"
         );
-        // namespace 传空 + 无 '%' ：原样
+        // Empty namespace + no '%': unchanged
         assert_eq!(NamespaceUtil::without_namespace("", ""), "");
         assert_eq!(NamespaceUtil::without_namespace("%RETRY%GID", ""), "%RETRY%GID");
     }
@@ -221,8 +221,8 @@ mod tests {
         );
         assert_eq!(NamespaceUtil::wrap_namespace_and_retry("", "GID"), "%RETRY%GID");
         assert_eq!(NamespaceUtil::wrap_namespace_and_retry("NS", ""), "");
-        // 传进来的 group 已带 %RETRY%：会拼出双前缀（调用方应传裸 group），
-        // 这里把这个行为钉住，别让人「顺手优化」成去重。
+        // A group passed in that already carries %RETRY%: a double prefix is produced (callers should pass a bare group);
+        // this behavior is pinned here so nobody "helpfully" deduplicates it.
         assert_eq!(
             NamespaceUtil::wrap_namespace_and_retry("NS", "%RETRY%GID"),
             "%RETRY%%RETRY%NS%GID"

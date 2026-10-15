@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * 订阅表达式的类型：broker 按它选择 tag 过滤还是 SQL92 过滤。
+ * Type of the subscription expression: the broker uses it to choose tag filtering or SQL92 filtering.
  */
 final class ExpressionType
 {

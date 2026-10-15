@@ -6,7 +6,7 @@ namespace RocketMQ\Client;
 
 final class ClientMetrics
 {
-    // 发送
+    // Sending
     private int $sendCount = 0;
     private int $sendFailureCount = 0;
     private float $sendRtSum = 0.0;
@@ -14,7 +14,7 @@ final class ClientMetrics
     private float $sendRtMin = 0.0;
     private bool $sendStarted = false;
 
-    // 消费
+    // Consuming
     private int $consumeCount = 0;
     private int $consumeFailureCount = 0;
     private float $consumeRtSum = 0.0;
@@ -22,7 +22,7 @@ final class ClientMetrics
     private float $consumeRtMin = 0.0;
     private bool $consumeStarted = false;
 
-    // ---------------- 发送 ----------------
+    // ---------------- Sending ----------------
     public function recordSendStart(): float
     {
         return microtime(true) * 1000.0;
@@ -56,7 +56,7 @@ final class ClientMetrics
         $this->sendStarted = true;
     }
 
-    // ---------------- 消费 ----------------
+    // ---------------- Consuming ----------------
     public function recordConsumeStart(): float
     {
         return microtime(true) * 1000.0;
@@ -90,7 +90,7 @@ final class ClientMetrics
         $this->consumeStarted = true;
     }
 
-    // ---------------- 快照 ----------------
+    // ---------------- Snapshot ----------------
 
     /** @return array<string, float|int> */
     public function snapshot(): array

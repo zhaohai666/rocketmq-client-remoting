@@ -93,9 +93,9 @@ func main() {
 	topicConfigs[1].WriteQueueNums = 6
 
 	if err := admin.CreateAndUpdateTopicConfigList(masterAddr, topicConfigs); err != nil {
-		check("批量建 topic(18) 请求", false, err.Error())
+		check("batch create topic(18) request", false, err.Error())
 	} else {
-		check("批量建 topic(18) 请求", true, "")
+		check("batch create topic(18) request", true, "")
 	}
 	// The proof that the body was actually understood: both topics exist and
 	// each kept the queue count the batch asked for.
@@ -113,7 +113,7 @@ func main() {
 			break
 		}
 	}
-	check("批量建 topic(18) 生效且队列数正确", batchOK, detail)
+	check("batch create topic(18) took effect with correct queue counts", batchOK, detail)
 
 	// ---- 2. UPDATE_AND_CREATE_SUBSCRIPTIONGROUP_LIST(225) --------------------
 	// Same shape, but the body key is `groupConfigList`.
@@ -125,9 +125,9 @@ func main() {
 	groupConfigs[1].RetryMaxTimes = 5
 
 	if err := admin.CreateAndUpdateSubscriptionGroupConfigList(masterAddr, groupConfigs); err != nil {
-		check("批量建订阅组(225) 请求", false, err.Error())
+		check("batch create subscription group(225) request", false, err.Error())
 	} else {
-		check("批量建订阅组(225) 请求", true, "")
+		check("batch create subscription group(225) request", true, "")
 	}
 	subOK, detail := true, ""
 	for i, name := range []string{*groupA, *groupB} {
@@ -147,15 +147,15 @@ func main() {
 			break
 		}
 	}
-	check("批量建订阅组(225) 生效且字段正确", subOK, detail)
+	check("batch create subscription group(225) took effect with correct fields", subOK, detail)
 
 	// ---- 3. UPDATE_AND_GET_GROUP_FORBIDDEN(353) ------------------------------
 	// Setting readable=false must come back as readable=false in the body.
 	forbidden, err := admin.UpdateAndGetGroupReadForbidden(masterAddr, *groupA, *topicA, boolPtr(false))
 	if err != nil {
-		check("消费组读禁配(353) 设置禁读", false, err.Error())
+		check("group read-forbidden(353) set not-readable", false, err.Error())
 	} else {
-		check("消费组读禁配(353) 设置禁读",
+		check("group read-forbidden(353) set not-readable",
 			forbidden != nil && !forbidden.Readable,
 			fmt.Sprintf("got=%+v", forbidden))
 	}
@@ -163,36 +163,36 @@ func main() {
 	// A query-only call (nil) must not flip the flag back.
 	forbidden, err = admin.UpdateAndGetGroupReadForbidden(masterAddr, *groupA, *topicA, nil)
 	if err != nil {
-		check("消费组读禁配(353) 仅查询不改动", false, err.Error())
+		check("group read-forbidden(353) query-only leaves it unchanged", false, err.Error())
 	} else {
-		check("消费组读禁配(353) 仅查询不改动",
+		check("group read-forbidden(353) query-only leaves it unchanged",
 			forbidden != nil && !forbidden.Readable,
-			fmt.Sprintf("禁读状态被查询调用改掉了: %+v", forbidden))
+			fmt.Sprintf("not-readable flag was changed by a query call: %+v", forbidden))
 	}
 
 	forbidden, err = admin.UpdateAndGetGroupReadForbidden(masterAddr, *groupA, *topicA, boolPtr(true))
 	if err != nil {
-		check("消费组读禁配(353) 恢复可读", false, err.Error())
+		check("group read-forbidden(353) restore readable", false, err.Error())
 	} else {
-		check("消费组读禁配(353) 恢复可读",
+		check("group read-forbidden(353) restore readable",
 			forbidden != nil && forbidden.Readable,
 			fmt.Sprintf("got=%+v", forbidden))
 	}
-	check("消费组读禁配(353) 回包含 group/topic",
+	check("group read-forbidden(353) reply carries group/topic",
 		forbidden != nil && forbidden.Group == *groupA && forbidden.Topic == *topicA,
 		fmt.Sprintf("got=%+v", forbidden))
 
 	resumed, err := admin.ResumeCheckHalfMessage(masterAddr, *topicA, "0A0F0000000000000000000000000000000000")
 	if err != nil {
-		check("恢复半消息(323) 非半消息返回 false 而非报错", false, err.Error())
+		check("resume half message(323) non-half message returns false instead of an error", false, err.Error())
 	} else {
-		check("恢复半消息(323) 非半消息返回 false 而非报错", !resumed,
-			fmt.Sprintf("resumed=%v，对非半消息消息竟返回 true", resumed))
+		check("resume half message(323) non-half message returns false instead of an error", !resumed,
+			fmt.Sprintf("resumed=%v returned true for a non-half message", resumed))
 	}
 	if _, err := admin.ResumeCheckHalfMessage(masterAddr, "", "x"); err != nil {
-		check("恢复半消息(323) 缺 topic 被本地拒绝", true, "")
+		check("resume half message(323) missing topic rejected locally", true, "")
 	} else {
-		check("恢复半消息(323) 缺 topic 被本地拒绝", false, "空 topic 竟被放行发出")
+		check("resume half message(323) missing topic rejected locally", false, "empty topic was allowed through")
 	}
 
 	// ---- 5. createOrUpdateOrderConf (nameserver KV) ---------------------------
@@ -201,68 +201,68 @@ func main() {
 	orderNSKey := fmt.Sprintf("GoOrder_%d", stamp)
 	if err := admin.CreateOrUpdateOrderConf(orderNSKey,
 		fmt.Sprintf("%s:5", *topicA), false); err != nil {
-		check("顺序 topic 配置 首次写入", false, err.Error())
+		check("order topic config first write", false, err.Error())
 	} else {
-		check("顺序 topic 配置 首次写入", true, "")
+		check("order topic config first write", true, "")
 	}
 	if err := admin.CreateOrUpdateOrderConf(orderNSKey,
 		fmt.Sprintf("%s:8", *topicB), false); err != nil {
-		check("顺序 topic 配置 第二次写入", false, err.Error())
+		check("order topic config second write", false, err.Error())
 	} else {
-		check("顺序 topic 配置 第二次写入", true, "")
+		check("order topic config second write", true, "")
 	}
 	stored, found, err := admin.GetKVConfig(client.NamespaceOrderTopicConfig, orderNSKey)
 	switch {
 	case err != nil:
-		check("顺序 topic 配置 合并两条而非覆盖", false, err.Error())
+		check("order topic config merges both entries instead of overwriting", false, err.Error())
 	case !found:
-		check("顺序 topic 配置 合并两条而非覆盖", false, "nameserver 未回读到该 key")
+		check("order topic config merges both entries instead of overwriting", false, "nameserver did not read the key back")
 	default:
 		hasA := contains(stored, *topicA+":5")
 		hasB := contains(stored, *topicB+":8")
-		check("顺序 topic 配置 合并两条而非覆盖", hasA && hasB,
+		check("order topic config merges both entries instead of overwriting", hasA && hasB,
 			fmt.Sprintf("stored=%q hasA=%v hasB=%v", stored, hasA, hasB))
 	}
 
 	// Re-writing the same topic must REPLACE its entry, not duplicate it.
 	if err := admin.CreateOrUpdateOrderConf(orderNSKey,
 		fmt.Sprintf("%s:6", *topicA), false); err != nil {
-		check("顺序 topic 配置 同 key 覆盖旧值", false, err.Error())
+		check("order topic config same key replaces the old value", false, err.Error())
 	} else {
 		stored, _, _ = admin.GetKVConfig(client.NamespaceOrderTopicConfig, orderNSKey)
 		replaced := contains(stored, *topicA+":6") && !contains(stored, *topicA+":5")
-		check("顺序 topic 配置 同 key 覆盖旧值", replaced, fmt.Sprintf("stored=%q", stored))
+		check("order topic config same key replaces the old value", replaced, fmt.Sprintf("stored=%q", stored))
 	}
 
 	// ---- 6. CLEAN_EXPIRED_CONSUMEQUEUE(306) / DELETE_EXPIRED_COMMITLOG(329) --
 	// These wipe data older than `time` hours, so the safe live check is a
 	// large window: the call must be accepted and change nothing.
 	if err := admin.CleanExpiredConsumerQueue(masterAddr, 24*365); err != nil {
-		check("清理过期消费队列(306)", false, err.Error())
+		check("clean expired consume queue(306)", false, err.Error())
 	} else {
-		check("清理过期消费队列(306)", true, "")
+		check("clean expired consume queue(306)", true, "")
 	}
 	if failed := admin.CleanExpiredConsumerQueueByAddr([]string{masterAddr}, 24*365); len(failed) != 0 {
-		check("清理过期消费队列(306) ByAddr", false, fmt.Sprintf("failed=%v", failed))
+		check("clean expired consume queue(306) ByAddr", false, fmt.Sprintf("failed=%v", failed))
 	} else {
-		check("清理过期消费队列(306) ByAddr", true, "")
+		check("clean expired consume queue(306) ByAddr", true, "")
 	}
 	if err := admin.DeleteExpiredCommitLog(masterAddr, 24*365); err != nil {
-		check("删除过期 commitlog(329)", false, err.Error())
+		check("delete expired commitlog(329)", false, err.Error())
 	} else {
-		check("删除过期 commitlog(329)", true, "")
+		check("delete expired commitlog(329)", true, "")
 	}
 	if failed := admin.DeleteExpiredCommitLogByAddr([]string{masterAddr}, 24*365); len(failed) != 0 {
-		check("删除过期 commitlog(329) ByAddr", false, fmt.Sprintf("failed=%v", failed))
+		check("delete expired commitlog(329) ByAddr", false, fmt.Sprintf("failed=%v", failed))
 	} else {
-		check("删除过期 commitlog(329) ByAddr", true, "")
+		check("delete expired commitlog(329) ByAddr", true, "")
 	}
 	// A dead address must be reported, not silently swallowed.
 	if failed := admin.DeleteExpiredCommitLogByAddr([]string{"127.0.0.1:1"}, 1); len(failed) != 1 {
-		check("清理类 ByAddr 报告失败地址", len(failed) == 1,
+		check("cleanup ByAddr reports failed addresses", len(failed) == 1,
 			fmt.Sprintf("dead addr should be reported, got %v", failed))
 	} else {
-		check("清理类 ByAddr 报告失败地址", true, "")
+		check("cleanup ByAddr reports failed addresses", true, "")
 	}
 
 	// ---- 7. CLEAN_UNUSED_TOPIC(316) ------------------------------------------
@@ -270,9 +270,9 @@ func main() {
 	// unused is broker policy (it keeps BenchmarkTest and friends), so the
 	// only client-side invariant is that the broker accepts the request.
 	if err := admin.CleanUnusedTopicByAddr(masterAddr); err != nil {
-		check("清理未使用 topic(316)", false, err.Error())
+		check("clean unused topic(316)", false, err.Error())
 	} else {
-		check("清理未使用 topic(316)", true, "")
+		check("clean unused topic(316)", true, "")
 	}
 
 	// ---- cleanup -------------------------------------------------------------

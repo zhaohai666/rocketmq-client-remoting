@@ -2,19 +2,20 @@
 
 declare(strict_types=1);
 
-// 静态主题（513 createStaticTopic + 端点重写）真机联调，覆盖 S1-S5 全套场景：
+// Live integration of static topics (513 createStaticTopic + endpoint rewriting), covering the
+// full S1-S5 scenario set:
 //
 //   php examples/live_static_topic.php [namesrv]
 //
-// S1 createStaticTopic(513)：单 broker，totalQueues=8，物理 4 队列。
-// S2 路由回读：TopicQueueMappingByBroker 非空。
-// S3 topicRouteData2EndpointsForStaticTopic：8 条端点（0-3 → broker-a，
-//    4-7 → __syslo__none__）。
-// S4 实例重写：getBrokerNameFromMessageQueue 对 mock 队列名解析到真实
-//    broker；表外 id 与非静态主题透传。
-// S5 端到端：普通生产者发 4 条、PUSH 消费者收齐 4 条。
+// S1 createStaticTopic(513): single broker, totalQueues=8, 4 physical queues.
+// S2 Route read-back: TopicQueueMappingByBroker non-empty.
+// S3 topicRouteData2EndpointsForStaticTopic: 8 endpoints (0-3 -> broker-a,
+//    4-7 -> __syslo__none__).
+// S4 Instance rewriting: getBrokerNameFromMessageQueue resolves mock queue names to the real
+//    broker; out-of-table ids and non-static topics pass through.
+// S5 End to end: a plain producer sends 4, a PUSH consumer receives all 4.
 //
-// 收口行 `PASS=<n> FAIL=<n>`；任一 FAIL 非 0 退出。
+// Closing line `PASS=<n> FAIL=<n>`; exits non-zero on any FAIL.
 require __DIR__ . '/../bootstrap.php';
 
 use RocketMQ\Client\ConsumeConcurrentlyContext;
@@ -51,10 +52,11 @@ $brokerName = '';
 
 echo "=== PHP static topic live: ns=$ns topic=$topic ===" . PHP_EOL;
 
-/** 单 broker 的 TopicQueueMappingDetail 文档（513 body，字段名按服务端
- * fastjson2 的序列化约定，逐字段固定）。
- * 注意 currIdMap/hostedQueues 的键是 gid 字符串——PHP 连续整数键数组会被
- * json_encode 编成 JSON 数组，broker 的 fastjson2 会拒收，必须用 stdClass。 */
+/** The TopicQueueMappingDetail document for a single broker (513 body; field names follow the
+ * server-side fastjson2 serialization convention, fixed field by field).
+ * Note the keys of currIdMap/hostedQueues are gid strings — a PHP array of consecutive integer
+ * keys would be json_encode'd into a JSON array and rejected by the broker's fastjson2, so
+ * stdClass is required. */
 $mappingDetail = static function (string $bname) use ($topic, $physicalQueues, $totalQueues): array {
     $currIdMap = new stdClass();
     $hosted = new stdClass();
@@ -85,7 +87,7 @@ $mappingDetail = static function (string $bname) use ($topic, $physicalQueues, $
 };
 
 // ---------------- S1 createStaticTopic(513) ----------------
-echo 'S1 起管理端，createStaticTopic(513)' . PHP_EOL;
+echo 'S1 starting the admin client, createStaticTopic(513)' . PHP_EOL;
 $admin = new DefaultMQAdminExt();
 $admin->setNamesrvAddr($ns);
 $admin->start();
@@ -100,25 +102,25 @@ try {
         ksort($ids);
         $masterAddr = $ids[0] ?? null;
     }
-    $check($masterAddr !== null, 'S1 broker 地址解析',
-        $brokerName . '(' . ($masterAddr ?? '无') . ')');
+    $check($masterAddr !== null, 'S1 broker address resolved',
+        $brokerName . '(' . ($masterAddr ?? 'none') . ')');
     if ($masterAddr === null) {
-        echo 'FAIL 集群里没有任何 broker，中止' . PHP_EOL;
+        echo 'FAIL no broker in the cluster, aborting' . PHP_EOL;
         exit(1);
     }
 
     $config = new TopicConfig($topic, $physicalQueues, $physicalQueues);
     $admin->createStaticTopic($masterAddr, 'TBW102', $config,
         $mappingDetail($brokerName), true);
-    $check(true, 'S1 createStaticTopic(513) 被接受', 'totalQueues=' . $totalQueues);
+    $check(true, 'S1 createStaticTopic(513) accepted', 'totalQueues=' . $totalQueues);
 } catch (Throwable $e) {
     $check(false, 'S1 createStaticTopic(513)', get_class($e) . ': ' . $e->getMessage());
 } finally {
     $admin->shutdown();
 }
 
-// ---------------- S2/S3 路由回读 + 端点集推导 ----------------
-echo 'S2/S3 路由回读 + 端点集推导' . PHP_EOL;
+// ---------------- S2/S3 route read-back + endpoint-set derivation ----------------
+echo 'S2/S3 route read-back + endpoint-set derivation' . PHP_EOL;
 $endpoints = null;
 $deadline = microtime(true) + 30;
 while (microtime(true) < $deadline) {
@@ -133,20 +135,20 @@ while (microtime(true) < $deadline) {
             break;
         }
     } catch (Throwable) {
-        // 路由还没带上 mapping 信息，继续等
+        // The route does not carry mapping info yet; keep waiting
     } finally {
         $probe->shutdown();
     }
     sleep(2);
 }
-$check($endpoints !== null, 'S2 路由携带 TopicQueueMappingByBroker');
+$check($endpoints !== null, 'S2 the route carries TopicQueueMappingByBroker');
 if ($endpoints === null) {
     echo "PASS=$pass FAIL=$fail" . PHP_EOL;
     exit(1);
 }
 
 $mockName = StaticTopic::getMockBrokerName('__global__');
-$check(count($endpoints) === $totalQueues, 'S3 端点总数 = totalQueues',
+$check(count($endpoints) === $totalQueues, 'S3 total endpoints = totalQueues',
     'got=' . count($endpoints) . " want=$totalQueues");
 
 $hostedOk = true;
@@ -154,7 +156,7 @@ for ($gid = 0; $gid < $physicalQueues; $gid++) {
     $key = StaticTopic::queueKey(new MessageQueue($topic, $mockName, $gid));
     $hostedOk = $hostedOk && ($endpoints[$key] ?? null) === $brokerName;
 }
-$check($hostedOk, 'S3 承载 id 0-' . ($physicalQueues - 1) . ' → broker');
+$check($hostedOk, 'S3 hosted ids 0-' . ($physicalQueues - 1) . ' -> broker');
 
 $unhostedOk = true;
 for ($gid = $physicalQueues; $gid < $totalQueues; $gid++) {
@@ -162,16 +164,16 @@ for ($gid = $physicalQueues; $gid < $totalQueues; $gid++) {
     $unhostedOk = $unhostedOk
         && ($endpoints[$key] ?? null) === StaticTopic::LOGICAL_QUEUE_MOCK_NOT_EXIST;
 }
-$check($unhostedOk, 'S3 无承载 id ' . $physicalQueues . '-' . ($totalQueues - 1)
-    . ' → __syslo__none__');
+$check($unhostedOk, 'S3 unhosted ids ' . $physicalQueues . '-' . ($totalQueues - 1)
+    . ' -> __syslo__none__');
 
-// ---------------- S4/S5 实例重写 + 端到端收发 ----------------
-echo 'S4/S5 实例重写 + 端到端收发' . PHP_EOL;
+// ---------------- S4/S5 instance rewriting + end-to-end send/receive ----------------
+echo 'S4/S5 instance rewriting + end-to-end send/receive' . PHP_EOL;
 
 $bodies = [];
 
 $listener = new class($bodies) implements MessageListenerConcurrently {
-    /** @param array<string> $bodies 引用共享（单进程 PHP 无并发竞争窗口） */
+    /** @param array<string> $bodies shared by reference (single-process PHP has no concurrent race window) */
     public function __construct(private array &$bodies)
     {
     }
@@ -192,7 +194,8 @@ $consumer->setConsumeFromWhere(ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET);
 $consumer->setMessageListener($listener);
 $consumer->subscribe($topic, '*');
 $consumer->start();
-// PHP 无后台线程：push 消费者要主动 tick 才会拉消息/刷路由，裸 sleep = 冻住。
+// PHP has no background threads: the push consumer only pulls messages / refreshes routes when
+// actively ticked; a bare sleep = frozen.
 $until = microtime(true) + 4;
 while (microtime(true) < $until) {
     $consumer->tick();
@@ -210,22 +213,23 @@ if ($inst !== null) {
         }
     }
 }
-$check($rewriteOk, 'S4 实例把 mock 队列重写到真实 broker');
+$check($rewriteOk, 'S4 the instance rewrites mock queues to the real broker');
 
-// id totalQueues-1 在端点表内，值就是 __syslo__none__（协议语义：返回端点值）；
-// 透传用例要用表外 id（本端单测用 99）。
+// id totalQueues-1 is inside the endpoint table whose value is __syslo__none__ (protocol
+// semantics: return the endpoint value); the pass-through case needs an out-of-table id
+// (the unit tests here use 99).
 $unhostedRewrite = $inst?->getBrokerNameFromMessageQueue(
     new MessageQueue($topic, $mockName, $totalQueues - 1));
 $check($unhostedRewrite === StaticTopic::LOGICAL_QUEUE_MOCK_NOT_EXIST,
-    'S4 无承载 id 返回哨兵值', (string) $unhostedRewrite);
+    'S4 unhosted id returns the sentinel value', (string) $unhostedRewrite);
 
 $outsideRewrite = $inst?->getBrokerNameFromMessageQueue(
     new MessageQueue($topic, $mockName, 99));
-$check($outsideRewrite === $mockName, 'S4 表外 id 透传 mock 名', (string) $outsideRewrite);
+$check($outsideRewrite === $mockName, 'S4 out-of-table id passes the mock name through', (string) $outsideRewrite);
 
 $plainRewrite = $inst?->getBrokerNameFromMessageQueue(
     new MessageQueue('Plain_' . $stamp, $brokerName, 0));
-$check($plainRewrite === $brokerName, 'S4 非静态主题原样透传', (string) $plainRewrite);
+$check($plainRewrite === $brokerName, 'S4 non-static topic passes through unchanged', (string) $plainRewrite);
 
 $prod = new DefaultMQProducer('StaticProd_' . $stamp);
 $prod->setNamesrvAddr($ns);
@@ -241,7 +245,7 @@ try {
 } finally {
     $prod->shutdown();
 }
-$check($sent === $physicalQueues, 'S5 发送 ' . $physicalQueues . ' 条', 'sent=' . $sent);
+$check($sent === $physicalQueues, 'S5 sent ' . $physicalQueues . ' messages', 'sent=' . $sent);
 
 $ok = false;
 $deadline = microtime(true) + 40;
@@ -253,7 +257,7 @@ while (microtime(true) < $deadline) {
     }
     usleep(100_000);
 }
-$check($ok, 'S5 消费收齐 ' . $physicalQueues . ' 条', 'got=' . count($bodies));
+$check($ok, 'S5 consumed all ' . $physicalQueues . ' messages', 'got=' . count($bodies));
 $consumer->shutdown();
 
 echo "PASS=$pass FAIL=$fail" . PHP_EOL;

@@ -1,20 +1,21 @@
 // -*- coding: utf-8 -*-
-// 延迟故障容忍（latency fault tolerance）。
+// Latency fault tolerance.
 //
-// MQFaultStrategy 决定下一次挑选哪个 broker 队列，避开最近高延迟或发送失败后被
-// 隔离的 broker（前提是 sendLatencyFaultEnable 打开）。
+// MQFaultStrategy decides which broker queue to pick next, avoiding brokers
+// that were isolated after recent high latency or send failures (provided
+// sendLatencyFaultEnable is on).
 import { connect as netConnect } from 'node:net';
 import { MessageQueue } from '../common/message.ts';
 import { getLogger } from '../logging.ts';
 
 const logger = getLogger('client.latency');
 
-// 可插拔的可达性探测。可以直接返回布尔值，也可以返回 Promise<boolean>（node 默认探测器就是 promise 版本）。
+// Pluggable reachability probe. May return a boolean directly or a Promise<boolean> (node's default detector is the promise version).
 export type ServiceDetector = (addr: string, timeoutMillis: number) => boolean | Promise<boolean>;
-// broker 名 -> 一个可探测地址的解析器。
+// Resolves a broker name to a probeable address.
 export type BrokerResolver = (brokerName: string) => string | null;
 
-// node 默认探测器：一次纯 TCP 连接探测。只在 detector 定时器上跑，绝对不进数据面。
+// node's default detector: a single pure TCP connect probe. It runs only on the detector timer and never on the data path.
 export function tcpDetect(addr: string, timeoutMillis: number): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
     const sep = addr.lastIndexOf(':');
@@ -42,7 +43,7 @@ export class FaultItem {
   currentLatency: number;
   startTimestamp: number;
   reachableFlag: boolean;
-  // 探测器下一次允许重新探测该项的时刻。
+  // The next moment the detector may re-probe this item.
   checkStamp: number;
 
   constructor(name: string) {
@@ -53,8 +54,9 @@ export class FaultItem {
     this.checkStamp = 0;
   }
 
-  // 把 broker 标为不可用直到 (now + duration)。**只会延长**已有的隔离窗口，
-  // 不会缩短（`duration > 0 && now + duration > start` 才更新）。
+  // Mark the broker unavailable until (now + duration). Only EXTENDS an
+  // existing isolation window, never shortens it (updates only when
+  // `duration > 0 && now + duration > start`).
   updateNotAvailableDuration(duration: number): void {
     if (duration > 0 && Date.now() + duration > this.startTimestamp) {
       this.startTimestamp = Date.now() + duration;
@@ -73,7 +75,7 @@ export class FaultItem {
 
 export class LatencyFaultToleranceImpl {
   faultItemTable: Record<string, FaultItem> = {};
-  // 默认值：探测超时 200ms，单项探测间隔 2s，探测开关关。
+  // Defaults: probe timeout 200ms, per-item probe interval 2s, detector switch off.
   detectTimeout = 200;
   detectInterval = 2000;
   startDetectorEnable = false;
@@ -119,9 +121,11 @@ export class LatencyFaultToleranceImpl {
   setResolver(resolver: BrokerResolver | null): void { this.resolver = resolver; }
   setServiceDetector(detector: ServiceDetector | null): void { this.serviceDetector = detector; }
 
-  // detectByOneRound：遍历每个 checkStamp 到点的项，**先把 stamp 往后推**再发起探测，
-  // 这样一次慢探测不会在同一项上反复触发。node 默认探测器基于 promise，可达性翻转
-  // 落在 promise 回调里；同步 detector 会当场翻转。
+  // detectByOneRound: walk every item whose checkStamp is due, pushing the
+  // stamp forward FIRST before probing, so one slow probe cannot re-trigger on
+  // the same item. node's default detector is promise-based, so reachability
+  // flips land in the promise callback; a synchronous detector flips
+  // immediately.
   detectByOneRound(): void {
     for (const key of Object.keys(this.faultItemTable)) {
       const brokerItem = this.faultItemTable[key];
@@ -145,7 +149,7 @@ export class LatencyFaultToleranceImpl {
     }
   }
 
-  // 启动 detector：固定 3s 首轮、3s 周期；每次 tick 只在 startDetectorEnable 为 true 时干活。
+  // Start the detector: a fixed 3s first round and 3s period; each tick does work only when startDetectorEnable is true.
   startDetector(): void {
     if (this._detectorTimer != null) return;
     const tick = () => {
@@ -202,9 +206,10 @@ export class MQFaultStrategy {
     return tpInfo.selectOneMessageQueue(null, resetIndex);
   }
 
-  // updateFaultItem：仅在 sendLatencyFaultEnable 打开时生效；隔离时长取自延迟表，
-  // 隔离态下把 currentLatency 视为**固定的 10000ms**（并非 30s 的下限）：
-  // `computeNotAvailableDuration(isolation ? 10000 : currentLatency)`。
+  // updateFaultItem: takes effect only when sendLatencyFaultEnable is on; the
+  // isolation duration comes from the latency table, and in the isolation
+  // state currentLatency is treated as a FIXED 10000ms (not the 30s lower
+  // bound): `computeNotAvailableDuration(isolation ? 10000 : currentLatency)`.
   updateFaultItem(brokerName: string, currentLatency: number, isolation: boolean, reachable: boolean = true): void {
     if (!this.sendLatencyFaultEnable) return;
     const duration = this._computeNotAvailableDuration(isolation ? 10000 : currentLatency);
@@ -220,7 +225,7 @@ export class MQFaultStrategy {
     return 0;
   }
 
-  // ---- startDetector 相关的开关与注入 ----
+  // ---- startDetector-related switches and injection ----
   isStartDetectorEnable(): boolean {
     return this.latencyFaultTolerance.startDetectorEnable;
   }

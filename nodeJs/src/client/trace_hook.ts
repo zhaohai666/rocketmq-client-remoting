@@ -1,11 +1,12 @@
-// 消息轨迹 hook（发送/消费/事务结束/回收消息）。
+// Message trace hooks (send / consume / transaction end / recall message).
 //
-// 契约要点：
-//  - 同一次事件的 BEFORE 和 AFTER 必须**共用同一个 TraceContext 对象**（内部
-//    requestId 是控制台把两端拼起来的钥匙）—— hook 把它塞进上下文的 hookState。
-//  - 消费侧的 msg_id 用 OFFSET 形式的 ID（与 SendResult.offsetMsgId 同一口径）；
-//    生产侧 Pub 轨迹用 UNIQ_KEY。
-//  - Hook 内部异常绝不能拖垮投递：全部 catch 吞掉。
+// Contract highlights:
+//  - The BEFORE and AFTER halves of one event **must share the same TraceContext
+//    object** (its internal requestId is what the console uses to stitch the two
+//    halves together) — the hook stores it in the context's hookState.
+//  - On the consume side msg_id uses the OFFSET form of the id (same convention as
+//    SendResult.offsetMsgId); the producer-side Pub trace uses UNIQ_KEY.
+//  - Exceptions inside a hook must never bring delivery down: swallow them all.
 import {
   ConsumeMessageHook, SendMessageHook, SendMessageContext, ConsumeMessageContext,
 } from './hook.ts';
@@ -23,9 +24,10 @@ import { getLogger } from '../logging.ts';
 
 const logger = getLogger('client.trace_hook');
 
-// SendMessageTraceHookImpl 记录 Pub 事件。方法名严格沿用 SendMessageHook 的
-// sendMessageBefore/sendMessageAfter 契约——producer 发送路径就是遍历
-// hookRegistry.sendMessageHooks 并按这两个名字直接调用的。
+// SendMessageTraceHookImpl records Pub events. The method names follow the
+// SendMessageHook sendMessageBefore/sendMessageAfter contract strictly — the
+// producer send path iterates hookRegistry.sendMessageHooks and invokes exactly
+// these two names directly.
 export class SendMessageTraceHookImpl extends SendMessageHook {
   private dispatcher: AsyncTraceDispatcher;
 
@@ -117,8 +119,9 @@ export class ConsumeMessageTraceHookImpl extends ConsumeMessageHook {
         return bean;
       });
       (ctx as any).mqTraceContext = context;
-      // SubBefore 上下文在这里 append 出去（consumeMessageAfter 只补 SubAfter
-      // 那一半）。少了这一句，SubBefore 记录就永远不会上线。
+      // The SubBefore context is appended here (consumeMessageAfter only adds the
+      // SubAfter half). Without this line the SubBefore records would never
+      // reach the wire.
       if (context.traceBeans.length > 0) this.dispatcher.append(context);
     } catch (e) {
       logger.debug('trace consumeBefore error: %s', (e as Error).message);
@@ -153,8 +156,8 @@ export class ConsumeMessageTraceHookImpl extends ConsumeMessageHook {
   }
 }
 
-// consumeReturnTypeCode 把 ConsumeContextType 名字映射回 SubAfter contextCode 里存的
-// 序号。
+// consumeReturnTypeCode maps a ConsumeContextType name back to the ordinal
+// stored in the SubAfter contextCode.
 function consumeReturnTypeCode(name?: string): number {
   switch (name) {
     case 'TIME_OUT': return 1;
@@ -165,12 +168,14 @@ function consumeReturnTypeCode(name?: string): number {
   }
 }
 
-// DefaultRecallMessageTraceHook 是跟 trace dispatcher 一起挂在 remoting client 上的
-// RPCHook（在 producer 打开 trace 的分支里注册）。它盯住 RECALL_MESSAGE rpc，
-// 每个已应答的都补一条 Recall 轨迹。
+// DefaultRecallMessageTraceHook is the RPCHook attached to the remoting client
+// together with the trace dispatcher (registered in the producer branch where
+// trace is enabled). It watches the RECALL_MESSAGE rpc and appends a Recall
+// trace entry for every answered request.
 //
-// 由系统属性 com.rocketmq.recall.default.trace.enable 门控（**默认关闭**，需要
-// 显式打开）；node 端从同名环境变量读取。
+// Gated by the system property com.rocketmq.recall.default.trace.enable
+// (**off by default**, must be turned on explicitly); the node side reads it from
+// the environment variable of the same name.
 export class DefaultRecallMessageTraceHook {
   private dispatcher: AsyncTraceDispatcher | null;
   private enableDefaultTrace: boolean;
@@ -181,7 +186,7 @@ export class DefaultRecallMessageTraceHook {
     this.enableDefaultTrace = raw != null && (raw === 'true' || raw === '1' || raw === 'True');
   }
 
-  // doBeforeRequest 保持空实现。
+  // doBeforeRequest stays a no-op.
   doBeforeRequest(_remoteAddr: string, _request: any): void { /* no-op */ }
 
   doAfterResponse(remoteAddr: string, request: any, response: any): void {
@@ -211,7 +216,7 @@ export class DefaultRecallMessageTraceHook {
       context.isSuccess = response.code === ResponseCode.SUCCESS;
       this.dispatcher.append(context);
     } catch (e) {
-      // 这里同样吞掉一切异常——轨迹绝不能反过来打断 rpc 通路。
+      // Everything is swallowed here too — a trace must never break the rpc path.
     }
   }
 }

@@ -85,13 +85,13 @@ async function main(): Promise<void> {
       const master = ids[0];
       if (master) { brokerName = name; brokerAddr = master; break; }
     }
-    check('S1 broker 地址解析', brokerAddr !== '', `${brokerName}(${brokerAddr})`);
+    check('S1 broker address resolved', brokerAddr !== '', `${brokerName}(${brokerAddr})`);
     if (brokerAddr === '') throw new Error('no master broker registered');
 
     await admin.createStaticTopic(brokerAddr, 'TBW102',
       new TopicConfig(TOPIC, PHYSICAL_QUEUES, PHYSICAL_QUEUES),
       mappingDetail(brokerName), true);
-    check('S1 createStaticTopic(513) 被接受', true, `totalQueues=${TOTAL_QUEUES}`);
+    check('S1 createStaticTopic(513) accepted', true, `totalQueues=${TOTAL_QUEUES}`);
   } catch (e) {
     check('S1 createStaticTopic(513)', false, (e as Error).message);
     console.log(`PASS=${passCount} FAIL=${failCount}`);
@@ -129,7 +129,7 @@ async function main(): Promise<void> {
     }
     await sleep(2000);
   }
-  check('S2 路由携带 TopicQueueMappingByBroker',
+  check('S2 route carries TopicQueueMappingByBroker',
     endpoints != null && endpoints.size > 0, lastDetail);
   if (endpoints == null || endpoints.size === 0) {
     console.log(`PASS=${passCount} FAIL=${failCount}`);
@@ -139,13 +139,13 @@ async function main(): Promise<void> {
   // JS Map keys are MessageQueue REFERENCES (no value hashing) — look up via
   // the string view, same convention as the offline tests.
   const byKey = endpointsToKeyStrings(endpoints);
-  check('S3 端点总数 = totalQueues', byKey.size === TOTAL_QUEUES,
+  check('S3 endpoint count = totalQueues', byKey.size === TOTAL_QUEUES,
     `got=${byKey.size} want=${TOTAL_QUEUES}`);
   let hostedOk = true;
   for (let gid = 0; gid < PHYSICAL_QUEUES; gid++) {
     if (byKey.get(`${TOPIC}@${MOCK_NAME}@${gid}`) !== brokerName) hostedOk = false;
   }
-  check('S3 承载 id 0-3 → broker', hostedOk);
+  check('S3 hosted ids 0-3 -> broker', hostedOk);
   let unhostedOk = true;
   for (let gid = PHYSICAL_QUEUES; gid < TOTAL_QUEUES; gid++) {
     if (byKey.get(`${TOPIC}@${MOCK_NAME}@${gid}`)
@@ -153,16 +153,18 @@ async function main(): Promise<void> {
       unhostedOk = false;
     }
   }
-  check('S3 无承载 id 4-7 → __syslo__none__', unhostedOk);
+  check('S3 unhosted ids 4-7 -> __syslo__none__', unhostedOk);
 
   // ---------------- S4/S5 instance rewrite + end-to-end ----------------
   console.log('\nS4/S5 instance rewrite + end-to-end');
   const bodies: string[] = [];
   const consumer = new DefaultMQPushConsumer(GROUP);
   consumer.setNamesrvAddr(NS);
-  // 新组必须 FIRST_OFFSET：node 首次拿到 consumer id 列表（心跳登记）可能晚于
-  // 发送，LAST_OFFSET 会把发送完成前落库的消息整个跳过（C 系知识：先起消费者
-  // 再发消息在这里不可靠，起点语义兜底）。
+  // A new group must use FIRST_OFFSET: node's first fetch of the consumer id
+  // list (heartbeat registration) may happen after sending, and LAST_OFFSET
+  // would skip every message persisted before the send completes (C-family
+  // knowledge: starting the consumer before sending is unreliable here, so the
+  // start-offset semantics are the fallback).
   consumer.setConsumeFromWhere('CONSUME_FROM_FIRST_OFFSET');
   consumer.subscribe(TOPIC, '*');
   consumer.registerMessageListenerConcurrently((msgs) => {
@@ -185,7 +187,7 @@ async function main(): Promise<void> {
       }
     }
   }
-  check('S4 实例把 mock 队列重写到真实 broker', rewriteOk);
+  check('S4 instance rewrites mock queues to the real broker', rewriteOk);
 
   // id TOTAL_QUEUES-1 IS in the table, and the protocol semantics return the
   // endpoint value, i.e. the sentinel itself; the passthrough case must use
@@ -193,19 +195,20 @@ async function main(): Promise<void> {
   const unhostedRewrite = inst != null
     ? inst.getBrokerNameFromMessageQueue(new MessageQueue(TOPIC, MOCK_NAME, TOTAL_QUEUES - 1))
     : null;
-  check('S4 无承载 id 返回哨兵值',
+  check('S4 unhosted id returns the sentinel value',
     unhostedRewrite === LOGICAL_QUEUE_MOCK_BROKER_NAME_NOT_EXIST,
     String(unhostedRewrite));
   const outsideRewrite = inst != null
     ? inst.getBrokerNameFromMessageQueue(new MessageQueue(TOPIC, MOCK_NAME, 99))
     : null;
-  check('S4 表外 id 透传 mock 名', outsideRewrite === MOCK_NAME, String(outsideRewrite));
+  check('S4 out-of-table id passes the mock name through', outsideRewrite === MOCK_NAME, String(outsideRewrite));
   const plainRewrite = inst != null
     ? inst.getBrokerNameFromMessageQueue(new MessageQueue(`Plain_${STAMP}`, brokerName, 0))
     : null;
-  check('S4 非静态主题原样透传', plainRewrite === brokerName, String(plainRewrite));
+  check('S4 non-static topic passes through unchanged', plainRewrite === brokerName, String(plainRewrite));
 
-  // 必须先起消费者再发：新组 CONSUME_FROM_LAST_OFFSET 会跳过启动前的消息。
+  // Start the consumer before sending: a new group with
+  // CONSUME_FROM_LAST_OFFSET skips messages from before startup.
   const prod = new DefaultMQProducer(`StaticProd_${STAMP}`);
   prod.setNamesrvAddr(NS);
   prod.start();
@@ -223,7 +226,7 @@ async function main(): Promise<void> {
   } finally {
     prod.shutdown();
   }
-  check('S5 发送 4 条', sent === PHYSICAL_QUEUES, `sent=${sent} lastErr=${lastErr}`);
+  check('S5 sent 4', sent === PHYSICAL_QUEUES, `sent=${sent} lastErr=${lastErr}`);
 
   let consumed = false;
   const consumeDeadline = Date.now() + 40_000;
@@ -231,7 +234,7 @@ async function main(): Promise<void> {
     if (bodies.length >= PHYSICAL_QUEUES) { consumed = true; break; }
     await sleep(1000);
   }
-  check('S5 消费收齐 4 条', consumed, `got=${bodies.length}`);
+  check('S5 consumed all 4', consumed, `got=${bodies.length}`);
   await consumer.shutdown();
 
   console.log(`PASS=${passCount} FAIL=${failCount}`);

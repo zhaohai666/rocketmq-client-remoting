@@ -1,16 +1,16 @@
-//! W3C Trace Context（traceparent）透传（OpenTracing/OTel 场景的消息级上下文）。
+//! W3C Trace Context (traceparent) pass-through (message-level context for OpenTracing/OTel scenarios).
 //!
-//! 格式（W3C Trace Context，<https://www.w3.org/TR/trace-context/>）：
+//! Format (W3C Trace Context, <https://www.w3.org/TR/trace-context/>):
 //!
 //! ```text
 //! traceparent: 00-<trace-id 32hex>-<parent-id 16hex>-<flags 2hex>
 //! ```
 //!
 //!
-//! **有意差异**：id 生成不引第三方 CSPRNG 依赖，改用「纳秒时间 + PID + 进程内自增
-//! 经 splitmix64 打散」——与 [`crate::common::mix_all::MixAll::create_uniq_name`]
-//! 同一口径。对 traceparent 而言要求的只是「唯一且不可预测性足够低的 32/16 hex」，
-//! 线上语义（长度、字符集、非全 0）不变。
+//! **Intentional difference**: id generation pulls in no third-party CSPRNG dependency; instead "nanosecond time + PID + in-process counter
+//! dispersed through splitmix64" is used -- the same approach as [`crate::common::mix_all::MixAll::create_uniq_name`].
+//! For traceparent the requirement is only "unique 32/16 hex with low-enough unpredictability";
+//! the wire semantics (length, charset, not all-zero) are unchanged.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -18,22 +18,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::common::message::{Message, MessageExt};
 use crate::common::mix_all::MixAll;
 
-/// W3C 键名（小写，与 OTel / HTTP 头一致）。
+/// W3C key name (lowercase, consistent with OTel / HTTP headers).
 pub const TRACE_CONTEXT_PROPERTY: &str = "traceparent";
-/// W3C `tracestate` 键名（透传第三方 vendor 状态用，本模块只定义键名）。
+/// W3C `tracestate` key name (for passing through third-party vendor state; this module only defines the key name).
 pub const TRACE_STATE_PROPERTY: &str = "tracestate";
-/// 开关环境变量（对齐本仓库其它 `ROCKETMQ_*` 开关惯例）。
+/// Switch env var (aligned with this repo's other `ROCKETMQ_*` switch conventions).
 pub const TRACE_CONTEXT_ENABLE_ENV: &str = "ROCKETMQ_TRACE_CONTEXT_ENABLE";
 
 const HEX_ARRAY: &[u8; 16] = b"0123456789abcdef";
-/// trace-id 长度（hex 字符数）。
+/// trace-id length (hex character count).
 const TRACE_ID_HEX_LEN: usize = 32;
-/// parent-id / span-id 长度（hex 字符数）。
+/// parent-id / span-id length (hex character count).
 const PARENT_ID_HEX_LEN: usize = 16;
-/// version 00 下固定的采样标记（`01` = sampled）。
+/// Fixed sampling marker under version 00 (`01` = sampled).
 const SAMPLED_FLAGS: &str = "01";
 
-/// 生成合法的根 traceparent：`00-<32hex>-<16hex>-01`（记录采样）。
+/// Generates a valid root traceparent: `00-<32hex>-<16hex>-01` (recorded as sampled).
 pub fn generate_traceparent() -> String {
     format!(
         "00-{}-{}-{SAMPLED_FLAGS}",
@@ -42,7 +42,7 @@ pub fn generate_traceparent() -> String {
     )
 }
 
-/// 按 W3C 语法与「不全 0」规则校验。宽松接受大写 hex（转发时不重写）。
+/// Validates against the W3C grammar and the "not all-zero" rules. Uppercase hex is leniently accepted (not rewritten when forwarding).
 pub fn is_valid_traceparent(value: Option<&str>) -> bool {
     let Some(raw) = value else {
         return false;
@@ -55,8 +55,8 @@ pub fn is_valid_traceparent(value: Option<&str>) -> bool {
     if version != "00" && !(version.len() == 2 && is_hex(version)) {
         return false;
     }
-    // ⚠ 大小写敏感：只拦字面量 "ff"，"FF" 会放过。
-    // 保留该行为，勿「顺手修正」成大小写不敏感。
+    // ⚠ Case sensitive: only the literal "ff" is blocked; "FF" passes.
+    // Keep this behavior; do not "fix" it into case insensitivity.
     if version == "ff" {
         return false;
     }
@@ -77,7 +77,7 @@ pub fn is_valid_traceparent(value: Option<&str>) -> bool {
     true
 }
 
-/// 同一 trace-id 下生成子 span（换 parent-id）；`parent` 非法返回 `None`。
+/// Generates a child span under the same trace-id (swaps the parent-id); returns `None` when `parent` is invalid.
 pub fn child_traceparent(parent: Option<&str>) -> Option<String> {
     if !is_valid_traceparent(parent) {
         return None;
@@ -90,9 +90,9 @@ pub fn child_traceparent(parent: Option<&str>) -> Option<String> {
     ))
 }
 
-/// 消息没有 `traceparent` 属性时注入根上下文，返回（注入后的）值。
+/// Injects a root context when the message has no `traceparent` property, returning the (injected) value.
 ///
-/// 已有值**不覆盖**——上游传播进来的上下文优先（对齐链路追踪的通用约定）。
+/// An existing value is **not overwritten** -- context propagated from upstream wins (aligning with the common distributed-tracing convention).
 pub fn inject_trace_context(message: &mut Message) -> String {
     if let Some(existing) = message.get_property(TRACE_CONTEXT_PROPERTY) {
         if !existing.is_empty() {
@@ -104,19 +104,19 @@ pub fn inject_trace_context(message: &mut Message) -> String {
     traceparent
 }
 
-/// 从消息属性里取出 traceparent（未注入 / 为空返回 `None`）。
+/// Takes the traceparent out of the message properties (returns `None` when not injected / empty).
 pub fn extract_traceparent(msg: &MessageExt) -> Option<String> {
     msg.get_property(TRACE_CONTEXT_PROPERTY)
         .filter(|value| !value.is_empty())
         .map(|value| value.to_string())
 }
 
-/// 环境变量 `ROCKETMQ_TRACE_CONTEXT_ENABLE` 是否打开了 traceparent 注入。
+/// Whether the env var `ROCKETMQ_TRACE_CONTEXT_ENABLE` turned on traceparent injection.
 pub fn trace_context_enabled_from_env() -> bool {
     env_value_means_on(&std::env::var(TRACE_CONTEXT_ENABLE_ENV).unwrap_or_default())
 }
 
-/// 开关取值判定：去空白 + 转小写后落在 `1` / `true` / `yes` 才算开（其它一律关）。
+/// Switch value judgment: after trimming whitespace and lowercasing, only `1` / `true` / `yes` count as on (everything else is off).
 fn env_value_means_on(raw: &str) -> bool {
     matches!(
         raw.trim().to_ascii_lowercase().as_str(),
@@ -124,12 +124,12 @@ fn env_value_means_on(raw: &str) -> bool {
     )
 }
 
-/// 十六进制字符集校验（大小写均可，先转小写再查表）。
+/// Hex charset check (either case; lowercased before the table lookup).
 fn is_hex(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// 生成 `len` 位小写 hex，且**保证不全为 0**（trace-id / span-id 的硬约束）。
+/// Generates `len` lowercase hex digits, **guaranteed not all zero** (hard constraint for trace-id / span-id).
 fn random_id_hex(len: usize) -> String {
     let mut hex = random_hex(len);
     if hex.bytes().all(|b| b == b'0') {
@@ -152,8 +152,8 @@ fn random_hex(len: usize) -> String {
     out
 }
 
-/// 无第三方依赖的伪随机源：纳秒时间 ^ PID ^ 进程内自增，再过 splitmix64 终化，
-/// 使相邻两次调用的高低位在统计上也相互独立。
+/// Pseudo-random source with no third-party dependency: nanosecond time ^ PID ^ in-process counter, finalized through splitmix64,
+/// so the high and low bits of adjacent calls are statistically independent of each other.
 fn random_u64() -> u64 {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
@@ -195,7 +195,7 @@ mod tests {
     fn validate_traceparent_accepts_and_rejects() {
         let good = generate_traceparent();
         assert!(is_valid_traceparent(Some(&good)));
-        // 宽松：大写也认（转发时不重写）
+        // Lenient: uppercase also accepted (not rewritten when forwarding)
         assert!(is_valid_traceparent(Some(&good.to_ascii_uppercase())));
         assert!(is_valid_traceparent(Some(
             "00-1234567890abcdef1234567890abcdef-1234567890abcdef-00"
@@ -207,7 +207,7 @@ mod tests {
         assert!(!is_valid_traceparent(Some(
             "00-1234567890abcdef1234567890abcdef12-1234567890abcdef-01"
         )));
-        // trace-id 全 0 / parent-id 全 0 都非法
+        // All-zero trace-id / all-zero parent-id are both invalid
         assert!(!is_valid_traceparent(Some(&format!(
             "00-{}-{}-01",
             "0".repeat(32),
@@ -218,7 +218,7 @@ mod tests {
             "1".repeat(32),
             "0".repeat(16)
         ))));
-        // version：ff 非法、非 hex 非法、其它两位 hex 放行
+        // version: ff invalid, non-hex invalid, other two-char hex passes
         assert!(!is_valid_traceparent(Some(&format!(
             "ff-{}-{}-01",
             "1".repeat(32),
@@ -234,7 +234,7 @@ mod tests {
             "1".repeat(32),
             "1".repeat(16)
         ))));
-        // flags 可以全 0（不采样），但必须是两位 hex
+        // flags may be all zeros (not sampled), but must be two hex digits
         assert!(is_valid_traceparent(Some(&format!(
             "00-{}-{}-00",
             "1".repeat(32),
@@ -264,7 +264,7 @@ mod tests {
         let child = child_traceparent(Some(&upper)).expect("valid");
         let parts: Vec<&str> = child.split('-').collect();
         assert_eq!(parts[1], "a".repeat(32));
-        // span-id 是新造的，不会照抄 parent 的
+        // The span-id is newly generated, never copied from the parent's
         assert_ne!(parts[2], "b".repeat(16));
         assert!(is_valid_traceparent(Some(&child)));
     }
@@ -275,7 +275,7 @@ mod tests {
         let tp1 = inject_trace_context(&mut msg);
         assert!(is_valid_traceparent(Some(&tp1)));
         assert_eq!(msg.get_property(TRACE_CONTEXT_PROPERTY), Some(tp1.as_str()));
-        // 已有值不覆盖
+        // An existing value is not overwritten
         let tp2 = inject_trace_context(&mut msg);
         assert_eq!(tp1, tp2);
 
@@ -307,7 +307,7 @@ mod tests {
         for falsy in ["", "  ", "0", "false", "off", "no", "y", "true1"] {
             assert!(!env_value_means_on(falsy), "{falsy:?}");
         }
-        // 未设置该环境变量时默认关闭；设置了则以上面的判定为准
+        // Defaults to off when the env var is unset; when set, the judgment above applies
         assert_eq!(
             trace_context_enabled_from_env(),
             env_value_means_on(&std::env::var(TRACE_CONTEXT_ENABLE_ENV).unwrap_or_default())

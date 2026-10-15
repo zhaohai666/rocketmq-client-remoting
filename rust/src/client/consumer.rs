@@ -1,44 +1,44 @@
-//! 推/拉消费者层：经典 remoting 协议下的消费端实现。
+//! Push/pull consumer layer: the consumer-side implementation of the classic remoting protocol.
 //!
-//! 本模块收三件事：投递前的过滤工具、`MessageSelector`、`PopProcessQueue`，
-//! 以及 [`DefaultMQPushConsumer`] —— 注册监听器 + 重平衡 +
-//! 拉取/POP 消费循环 + 位点持久化 + broker 主动请求的四条接缝。
-//! `DefaultMQPullConsumer` 与 `DefaultLitePullConsumer` 在
-//! [`crate::client::pull_consumer`]（见下「模块划分」）。
+//! This module holds three things: the pre-delivery filter tools, `MessageSelector`, `PopProcessQueue`,
+//! plus [`DefaultMQPushConsumer`] -- the four seams of listener registration + rebalance +
+//! the pull/POP consume loop + offset persistence + broker-initiated requests.
+//! `DefaultMQPullConsumer` and `DefaultLitePullConsumer` live in
+//! [`crate::client::pull_consumer`] (see "Module layout" below).
 //!
-//! # 并发模型的实现手段
+//! # How the concurrency model is realized
 //!
-//! 重平衡、每队列拉取、POP、消费分发、位点持久化、队列锁这六类循环全部落在
-//! tokio 上，用 `tokio::sync::mpsc` + 定时轮询做任务间通信与唤醒。
+//! The six loop kinds -- rebalance, per-queue pull, POP, consume dispatch, offset persistence, queue locking -- all run
+//! on tokio, using `tokio::sync::mpsc` + timed polling for inter-task communication and wake-ups.
 //!
-//! # 若干有意的结构取舍
+//! # A few deliberate structural trade-offs
 //!
-//! 1. **一个消费者一个 `ProcessQueue`**：有序消费的红黑树与 `msgTreeMap` 锁语义
-//!    只在顺序消费场景才有价值，而顺序消费还额外依赖 broker 侧队列锁；本模块只
-//!    保留并发消费的缓冲（拉到的消息直接进 `deque`），不引入树结构。
-//! 2. **`Clone` 句柄 + `Arc<Inner>`**：与 [`crate::client::producer`] 同样的手法 ——
-//!    消费者要同时被心跳任务、拉取任务与 broker 请求处理器持有，故句柄可复制、
-//!    状态集中在 `Inner` 里用 `RwLock`/`Mutex` 保护。
-//! 3. **监听器/策略/钩子用 trait 对象**：消费者要在运行时接受用户提供的实现，
-//!    统一以 `Arc<dyn ...>` 持有（`MessageListenerConcurrently`、
+//! 1. **One `ProcessQueue` per consumer**: the ordered-consumption red-black tree and the `msgTreeMap` lock semantics
+//!    only pay off in sequential consumption, which additionally depends on broker-side queue locks; this module
+//!    keeps only the concurrent-consumption buffer (pulled messages go straight into `deque`) and introduces no tree.
+//! 2. **`Clone` handles + `Arc<Inner>`**: the same technique as [`crate::client::producer`] --
+//!    the consumer is held at the same time by the heartbeat task, the pull tasks and the broker request handler, so the handle is copyable and
+//!    the state is centralized in `Inner`, guarded by `RwLock`/`Mutex`.
+//! 3. **Listeners/strategies/hooks as trait objects**: the consumer must accept user-supplied implementations at runtime,
+//!    all held as `Arc<dyn ...>` (`MessageListenerConcurrently`,
 //!    [`AllocateMessageQueueStrategy`](crate::client::allocate_strategy::AllocateMessageQueueStrategy)
-//!    等）。
-//! 4. **后台任务持 `Weak<Inner>`**：与生产者一致，避免 实例 → 传输 → 任务 → 消费者
-//!    的强引用环；`Drop for Inner` 负责发停止信号并 abort 任务。
-//! 5. **轨迹分发器：注入或自动桥接**：见
-//!    [`set_trace_dispatcher`](Self::set_trace_dispatcher)（与生产者同一套约定，
-//!    见 [`crate::client::producer`] 模块头 4）。`enable_trace=true` 且未注入时，
-//!    `start()` 会自动建 `AsyncTraceDispatcher`（Type=CONSUME）+ 真实内部生产者，
-//!    轨迹按 CONSUME 类型上报到 trace 主题。
+//!    and so on).
+//! 4. **Background tasks hold `Weak<Inner>`**: as with the producer, to avoid the strong-reference cycle
+//!    instance -> transport -> task -> consumer; `Drop for Inner` sends the stop signal and aborts the tasks.
+//! 5. **Trace dispatcher: injected or auto-bridged**: see
+//!    [`set_trace_dispatcher`](Self::set_trace_dispatcher) (the same convention as the producer,
+//!    see [`crate::client::producer`] module header 4). With `enable_trace=true` and nothing injected,
+//!    `start()` builds an `AsyncTraceDispatcher` (Type=CONSUME) plus a real internal producer automatically,
+//!    and traces are reported to the trace topic under the CONSUME type.
 //!
-//! # 模块划分
+//! # Module layout
 //!
-//! 消费侧的四个消费者类分成两个模块：
-//! `consumer.rs`（过滤工具 + `MessageSelector` + `PopProcessQueue` +
-//! push 消费者）与 `pull_consumer.rs`（`DefaultMQPullConsumer` +
-//! `DefaultLitePullConsumer`），因为后两者只是 RPC 的门面组合，与 push 消费者的
-//! 循环/重平衡状态机没有共享代码；两模块共用的只有本文件导出的
-//! [`filter_messages_for_delivery`] 等工具。
+//! The four consumer classes on the consume side split into two modules:
+//! `consumer.rs` (filter tools + `MessageSelector` + `PopProcessQueue` +
+//! the push consumer) and `pull_consumer.rs` (`DefaultMQPullConsumer` +
+//! `DefaultLitePullConsumer`), because the latter two are only facade compositions over RPC and share no
+//! code with the push consumer's loop/rebalance state machine; the only thing the two modules share is the
+//! tools this file exports, such as [`filter_messages_for_delivery`].
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicUsize, Ordering};
@@ -99,54 +99,54 @@ use crate::remoting::rpchook::RPCHook;
 use crate::remoting::socks::SocksProxyConfig;
 use crate::{bail, rmq_debug, rmq_error, rmq_info, rmq_warn};
 
-/// POP 消费失败的延迟梯度（**秒**），逐项对应经典 remoting 协议约定的
-/// `popDelayLevel` 默认序列。
+/// Delay gradient for POP consumption failures (**seconds**), each entry matching the
+/// default `popDelayLevel` sequence promised by the classic remoting protocol.
 pub const POP_DELAY_LEVEL: [i32; 16] = [
     10, 30, 60, 120, 180, 240, 300, 360, 420, 480, 540, 600, 1200, 1800, 3600, 7200,
 ];
 
-/// POP 不可见时间的允许下界：超出 `[MIN, MAX]` 一律回落到 60000。
+/// Lower bound of the allowed invisible time: anything outside `[MIN, MAX]` falls back to 60000.
 pub const MIN_POP_INVISIBLE_TIME: i64 = 5000;
-/// 见 [`MIN_POP_INVISIBLE_TIME`]。
+/// See [`MIN_POP_INVISIBLE_TIME`].
 pub const MAX_POP_INVISIBLE_TIME: i64 = 300000;
-/// 不可见时间越界时的回落值（协议默认 60000ms）。
+/// The fallback value when the invisible time is out of range (protocol default 60000ms).
 pub const DEFAULT_POP_INVISIBLE_TIME: i64 = 60_000;
 
-/// 拉取空闲上限（系统属性 `rocketmq.client.pull.pullMaxIdleTime`，
-/// 默认 120000ms）：一条拉取/POP 循环超过这个时长没**发起**过拉取，rebalance 就认定它停摆，
-/// 主动撤掉并重建（停摆判定用严格 `>`）。
+/// Pull idle ceiling (system property `rocketmq.client.pull.pullMaxIdleTime`,
+/// default 120000ms): if one pull/POP loop has not **initiated** a pull for longer than this, rebalance deems it stalled
+/// and drops and rebuilds it on its own (the stall check uses a strict `>`).
 pub const PULL_MAX_IDLE_TIME: i64 = 120_000;
 
 pub const QUERY_ASSIGNMENT_TIMEOUT_MILLIS: i64 = 3000;
 
-/// 停机收尾给「在途批次收完（含回投 RPC）」的预算。
+/// The shutdown finalize budget for "draining the in-flight batches (including send-back RPC)".
 ///
-/// 覆盖一个批次的 listener + 逐条回投（每次 3000ms 超时）绰绰有余；顺序消费的
-/// 挂起重试最多钳到 30s，超了就放弃等待 —— 位点持久化按下限钳制（按「剩余最小
-/// offset」口径），不会把没落定的消息跳过去。
+/// It comfortably covers one batch of listener work plus per-message send-back (3000ms timeout each); for orderly
+/// consumption the pending retry is clamped to at most 30s, and beyond that the wait is abandoned -- offset persistence clamps to the lower bound
+/// (using the "remaining minimum offset" measure), so unsettled messages are never skipped.
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
-// ================================================================ 队列与过滤工具
+// ================================================================ Queues and filter tools
 
-/// 队列排序键：topic → brokerName → queueId。
+/// Queue sort key: topic -> brokerName -> queueId.
 ///
-/// rebalance 会先把候选队列与消费组成员排序再分配；顺序不一致会让不同实例算出
-/// 不同的分配结果（同一队列被两个实例同时消费）。
+/// rebalance sorts the candidate queues and the consumer group members first, then assigns; a different
+/// order makes different instances compute different assignment results (the same queue consumed by two instances at once).
 pub fn mq_sort_key(mq: &MessageQueue) -> (String, String, i32) {
     (mq.topic.clone(), mq.broker_name.clone(), mq.queue_id)
 }
 
-/// 把队列按 [`mq_sort_key`] 排序。
+/// Sort the queues by [`mq_sort_key`].
 pub fn sort_mqs(mqs: &mut [MessageQueue]) {
     mqs.sort_by_key(mq_sort_key);
 }
 
-/// 客户端二次 tag 过滤。
+/// Client-side second pass tag filter.
 ///
-/// broker 侧是按 tag 的**哈希（codeSet）**过滤的，存在哈希碰撞误放；因此客户端
-/// 再按字符串核一遍。约束是「订阅集非空且不是 classFilterMode」才做二次过滤：
-/// 订阅 `"*"`（SUB_ALL）时不过滤 —— 所以 `SubscriptionData::new` 对 SUB_ALL
-/// 必须保持 `tags_set` 为空。
+/// The broker side filters by the tag **hash (codeSet)**, so hash collisions can let foreign messages through; the client therefore
+/// re-checks by string. The constraint is that the second filter runs only when "the subscription set is non-empty and this is not classFilterMode":
+/// subscribing `"*"` (SUB_ALL) means no filtering -- so `SubscriptionData::new` must
+/// keep `tags_set` empty for SUB_ALL.
 pub fn client_side_tag_filter(
     sub: Option<&SubscriptionData>,
     msgs: Vec<MessageExt>,
@@ -165,11 +165,11 @@ pub fn client_side_tag_filter(
         .collect()
 }
 
-/// 投递前过滤 = 客户端二次 tag 过滤 + FilterMessageHook（拉取/POP/pull 三处共用）。
+/// Pre-delivery filter = client-side second pass tag filter + FilterMessageHook (shared by the pull/POP/pull-consumer paths).
 ///
-/// 钩子拿到的是**可变的** `msg_list`；被摘掉的消息由调用方决定处置方式：
-/// 拉取路径 = 静默跳过（位点照常推进，不 ack）；
-/// POP 路径 = 必须立刻 ack，否则 `invisibleTime` 到期后会复活重投。
+/// The hook receives a **mutable** `msg_list`; how the dropped messages are handled is up to the caller:
+/// pull path = skip silently (the offset still advances, no ack);
+/// POP path = must ack immediately, otherwise the messages come back for redelivery once `invisibleTime` expires.
 pub fn filter_messages_for_delivery(
     consumer_group: &str,
     hooks: &FilterMessageHookList,
@@ -181,7 +181,7 @@ pub fn filter_messages_for_delivery(
     let mut out = client_side_tag_filter(sub, msgs);
     if !out.is_empty() && hooks.has_hooks() {
         let mut context = FilterMessageContext::new(consumer_group, Some(out), Some(mq.clone()));
-        // FilterMessageContext 的 `unitMode` 取消费者的 `ClientConfig#unitMode`。
+        // The `unitMode` of FilterMessageContext comes from the consumer's `ClientConfig#unitMode`.
         context.unit_mode = unit_mode;
         crate::client::hook::execute_filter_hooks(hooks, &mut context);
         out = context.msg_list;
@@ -189,8 +189,8 @@ pub fn filter_messages_for_delivery(
     out
 }
 
-/// 把位点表按「队列排序键」稳定地投进 `BTreeMap`（这里显式排序，
-/// 保证 `get_consumer_status`/221 响应在跨语言比对时可预测）。
+/// Project the offset table into a `BTreeMap` stably by "queue sort key" (sorting explicitly here,
+/// which keeps the `get_consumer_status`/221 response byte-predictable when it is diffed).
 pub fn offset_table_to_sorted(
     table: impl IntoIterator<Item = (MessageQueue, i64)>,
 ) -> BTreeMap<(String, String, i32), i64> {
@@ -203,23 +203,23 @@ pub fn offset_table_to_sorted(
 
 // ================================================================ MessageSelector
 
-/// 表达式类型常量的来源（`TAG` / `SQL92` / `CLASS_FILTER`）。
+/// Where the expression type constants come from (`TAG` / `SQL92` / `CLASS_FILTER`).
 ///
-/// 与 [`SubscriptionData::expression_type`] 同口径：存的是**字符串**，不是枚举
-/// —— 经典 remoting 协议里 `expressionType` 就是一个字符串字段。
+/// Same convention as [`SubscriptionData::expression_type`]: it stores a **string**, not an enum
+/// -- in the classic remoting protocol `expressionType` is simply a string field.
 pub use crate::remoting::protocol::heartbeat::ExpressionType;
 
-/// 消息选择器：订阅表达式的类型 + 内容。
+/// Message selector: the type + content of a subscription expression.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageSelector {
-    /// 表达式类型（`ExpressionType::TAG` / `SQL92`）。
+    /// Expression type (`ExpressionType::TAG` / `SQL92`).
     pub selector_type: String,
-    /// 表达式内容。
+    /// Expression content.
     pub expression: String,
 }
 
 impl MessageSelector {
-    /// 用「类型 + 表达式」构造选择器。
+    /// Build a selector from "type + expression".
     pub fn new(selector_type: &str, expression: &str) -> MessageSelector {
         MessageSelector {
             selector_type: selector_type.to_string(),
@@ -227,17 +227,17 @@ impl MessageSelector {
         }
     }
 
-    /// 按 tag 选择。
+    /// Select by tag.
     pub fn by_tag(tag: &str) -> MessageSelector {
         MessageSelector::new(ExpressionType::TAG, tag)
     }
 
-    /// 按 SQL92 表达式选择。
+    /// Select by a SQL92 expression.
     pub fn by_sql(sql: &str) -> MessageSelector {
         MessageSelector::new(ExpressionType::SQL92, sql)
     }
 
-    /// 订阅表达式：直接作为 `subscribe` 的表达式参数上送。
+    /// Subscription expression: sent up directly as the expression argument of `subscribe`.
     pub fn sub_expression(&self) -> &str {
         &self.expression
     }
@@ -245,14 +245,14 @@ impl MessageSelector {
 
 // ================================================================ MessageQueueListener
 
-/// 队列变更监听器。
+/// Queue-change listener.
 ///
-/// 只有 `DefaultMQPullConsumer` / `DefaultLitePullConsumer` 持有该监听器字段，
-/// 且只有 LitePull 真的会回调；push 消费者没有这个接缝。
-/// 接缝实现见 [`crate::client::pull_consumer`]。
+/// Only `DefaultMQPullConsumer` / `DefaultLitePullConsumer` hold this listener field,
+/// and only LitePull actually invokes the callback; the push consumer has no such seam.
+/// The seam implementation lives in [`crate::client::pull_consumer`].
 pub trait MessageQueueListener: Send + Sync {
-    /// 队列分配发生变化时回调。`mq_all` 是该 topic 的全部队列，
-    /// `mq_divided` 是分给本实例的队列。
+    /// Called when the queue assignment changes. `mq_all` is every queue of the topic,
+    /// `mq_divided` is the queues assigned to this instance.
     fn message_queue_changed(
         &self,
         topic: &str,
@@ -263,26 +263,26 @@ pub trait MessageQueueListener: Send + Sync {
 
 // ================================================================ PopProcessQueue
 
-/// POP 模式的队列状态。
+/// Queue state for POP mode.
 ///
-/// 与 pull 模式的过程队列不同，POP **没有「已拉未消费」缓冲**：消息一弹出就交给
-/// 消费线程，确认靠 ack。这里只跟踪两件事：
+/// Unlike the pull-mode process queue, POP has **no "pulled but unconsumed" buffer**: a message goes straight to
+/// a consume thread as soon as it pops, and confirmation happens through ack. Only two things are tracked here:
 ///
-/// - `wait_ack_counter`：已弹出但还没 ack / 还没延长不可见时间的条数，用于流控；
-/// - `dropped`：队列是否已被 rebalance 撤走（撤走后本批消息不再消费、也不 ack，
-///   交给 `invisibleTime` 到期后 broker 自动复活重投）。
+/// - `wait_ack_counter`: how many messages are popped but not acked / not yet had their invisible time extended, used for flow control;
+/// - `dropped`: whether the queue has already been taken away by rebalance (once taken away, this batch is neither consumed nor acked,
+///   and the broker revives and redelivers it automatically after `invisibleTime` expires).
 #[derive(Debug, Default)]
 pub struct PopProcessQueue {
     wait_ack_counter: AtomicI32,
     dropped: AtomicBool,
-    /// 最近一次**发起**弹出的时刻（毫秒）。
-    /// 这个字段有两处读：停摆判定（超过 `PULL_MAX_IDLE_TIME` 判停摆，
-    /// 由 [`State::last_pull_at`] 承担）和 `ConsumerRunningInfo` 的运维视图。
+    /// When the last pop was **initiated** (milliseconds).
+    /// This field has two readers: the stall check (beyond `PULL_MAX_IDLE_TIME` counts as stalled,
+    /// handled by [`State::last_pull_at`]) and the operational view of `ConsumerRunningInfo`.
     pub last_pop_timestamp: AtomicI64,
 }
 
 impl PopProcessQueue {
-    /// 新建一个 POP 队列状态，弹出时间戳初始化为当前时刻。
+    /// Create a fresh POP queue state, with the pop timestamp initialized to the current time.
     pub fn new() -> Arc<PopProcessQueue> {
         Arc::new(PopProcessQueue {
             last_pop_timestamp: AtomicI64::new(crate::common::util_all::current_time_millis()),
@@ -290,57 +290,57 @@ impl PopProcessQueue {
         })
     }
 
-    /// 累加「等待 ack」的条数（本批弹出的消息数）。
+    /// Increase the "waiting for ack" count (by the number of messages popped in this batch).
     pub fn inc_found_msg(&self, count: i32) {
         self.wait_ack_counter.fetch_add(count, Ordering::SeqCst);
     }
 
-    /// 递减「等待 ack」的条数：传**正数**即减少等待 ack 的条数。
+    /// Decrease the "waiting for ack" count: pass a **positive** number to reduce how many messages await ack.
     pub fn dec_found_msg(&self, count: i32) {
         self.wait_ack_counter.fetch_add(-count, Ordering::SeqCst);
     }
 
-    /// ack 一条：递减并返回递减后的值。
+    /// Ack one message: decrement and return the value after the decrement.
     pub fn ack(&self) -> i32 {
         self.wait_ack_counter.fetch_add(-1, Ordering::SeqCst) - 1
     }
 
-    /// 当前等待 ack 的条数。
+    /// How many messages currently await ack.
     pub fn wait_ack_count(&self) -> i32 {
         self.wait_ack_counter.load(Ordering::SeqCst)
     }
 
-    /// 队列是否已被 rebalance 撤走。
+    /// Whether the queue has already been taken away by rebalance.
     pub fn is_dropped(&self) -> bool {
         self.dropped.load(Ordering::SeqCst)
     }
 
-    /// 标记队列被撤走 / 恢复。
+    /// Mark the queue dropped / restore it.
     pub fn set_dropped(&self, dropped: bool) {
         self.dropped.store(dropped, Ordering::SeqCst);
     }
 
-    /// 记一次弹出时间（毫秒）。
+    /// Record one pop timestamp (milliseconds).
     pub fn touch(&self, timestamp_millis: i64) {
         self.last_pop_timestamp
             .store(timestamp_millis, Ordering::SeqCst);
     }
 }
 
-/// 消息监听器：并发与顺序两种。
+/// Message listener: concurrently and orderly.
 ///
-/// 顺序/并发的判定必须在运行时可查（拉取循环要按它选消费路径），而 Rust 没有
-/// 运行时类型探测，这里用枚举标签表达 —— 判定口径就是「监听器实现的是哪个 trait」。
+/// The orderly/concurrent decision must be queryable at runtime (the pull loop picks the consume path from it), and Rust has no
+/// runtime type introspection, so an enum tag expresses it -- the criterion is "which trait the listener implements".
 #[derive(Clone)]
 pub enum MessageListener {
-    /// 并发监听器。
+    /// Concurrent listener.
     Concurrently(Arc<dyn MessageListenerConcurrently>),
-    /// 顺序监听器。
+    /// Orderly listener.
     Orderly(Arc<dyn MessageListenerOrderly>),
 }
 
 impl MessageListener {
-    /// 是否顺序监听器。
+    /// Whether this is an orderly listener.
     pub fn is_orderly(&self) -> bool {
         matches!(self, MessageListener::Orderly(_))
     }
@@ -356,116 +356,116 @@ impl std::fmt::Debug for MessageListener {
     }
 }
 
-/// 消费者配置：所有可调参数的平铺集合。
+/// Consumer configuration: a flat collection of every tunable parameter.
 ///
-/// 聚成一个 `pub` 字段的结构体，由 [`DefaultMQPushConsumer::config`] /
-/// [`DefaultMQPushConsumer::update_config`] 整体读写，可以随时替换（生产者侧同一手法）。
+/// Grouped into one struct of `pub` fields, read and written as a whole by [`DefaultMQPushConsumer::config`] /
+/// [`DefaultMQPushConsumer::update_config`], and replaceable at any time (the same technique on the producer side).
 #[derive(Debug, Clone)]
 pub struct ConsumerConfig {
-    /// 消费组名。
+    /// Consumer group name.
     pub consumer_group: String,
-    /// 客户端命名空间（v1 机制：给 topic/组拼 `%` 前缀）。
+    /// Client namespace (the v1 mechanism: prefixes topic/group with `%`).
     pub namespace: String,
-    /// 实例名，默认 `"DEFAULT"`。
+    /// Instance name, default `"DEFAULT"`.
     pub instance_name: String,
-    /// 显式指定的 clientId；`None` 时 `start()` 里现造。
+    /// Explicitly specified clientId; when `None` it is built on the fly inside `start()`.
     pub client_id: Option<String>,
-    /// 单元化名 `unitName`（默认无）：非空时进 clientId 后缀，
-    /// 并作为地址服务器 URL 的 `-<unitName>` 段。
+    /// Unit name `unitName` (none by default): when non-empty it goes into the clientId suffix
+    /// and becomes the `-<unitName>` segment of the address server URL.
     pub unit_name: Option<String>,
-    /// 服务端命名空间 `namespaceV2`（默认无）：5.x **服务端**命名空间，
-    /// 非空时每个请求带 `nsd=true` / `ns=<namespaceV2>` 扩展头（`NamespaceRpcHook`），
-    /// 与 v1 `namespace` 的客户端 `%` 前缀机制是两套东西。
+    /// Server-side namespace `namespaceV2` (none by default): the 5.x **server-side** namespace;
+    /// when non-empty every request carries the `nsd=true` / `ns=<namespaceV2>` extension header (`NamespaceRpcHook`),
+    /// a mechanism entirely separate from the v1 `namespace` client-side `%` prefix.
     pub namespace_v2: Option<String>,
-    /// 单元化模式 `unitMode`（默认 false）：随发送/回投/鉴权/消息过滤
-    /// 一起上线，broker 据此给自动创建的 topic 打 UNIT / UNIT_SUB 位。
+    /// Unit mode `unitMode` (default false): comes into play together with send / send-back / auth / message filtering,
+    /// and the broker stamps the UNIT / UNIT_SUB bit on auto-created topics accordingly.
     pub unit_mode: bool,
-    /// 流式请求类型开关：true 时每个请求带 `ReqT=0`，
-    /// clientId 末尾多一段 `@STREAM`。
+    /// Streaming request type switch: when true every request carries `ReqT=0`
+    /// and the clientId gains a trailing `@STREAM` segment.
     ///
-    /// 推模式消费者不碰这个开关，默认 false。
+    /// The push consumer never touches this switch; default false.
     pub enable_stream_request_type: bool,
-    /// 路由周期刷新间隔（默认 30000ms）：在用 topic 的路由按这个周期刷新，
-    /// `start()` 时透传给 `MQClientInstance`。
+    /// Route refresh interval (default 30000ms): routes of in-use topics refresh on this interval,
+    /// passed through to `MQClientInstance` at `start()`.
     pub poll_name_server_interval_millis: u64,
-    /// 位点落盘周期（默认 5000ms）：后台位点落盘周期；`shutdown()` 的收尾落盘
-    /// 与该值无关。同样只在 `start()` 时读一次。
+    /// Offset flush interval (default 5000ms): the background offset flush period; the finalize flush in `shutdown()`
+    /// is unrelated to it. Also read only once, at `start()`.
     pub persist_consumer_offset_interval_millis: u64,
-    /// 名字服务地址列表。
+    /// Name server address list.
     pub name_server_addrs: Vec<String>,
-    /// TLS 开关；`None` = 交给环境变量 `ROCKETMQ_TLS_ENABLE`。
+    /// TLS switch; `None` = defer to the environment variable `ROCKETMQ_TLS_ENABLE`.
     pub tls_enable: Option<bool>,
     pub socks_proxy: Option<SocksProxyConfig>,
-    /// 消费模式（[`MessageModel`] 里的常量）。
+    /// Message model (a constant from [`MessageModel`]).
     pub message_model: String,
-    /// 起始位点策略（[`ConsumeFromWhere`] 里的常量）。
+    /// Where to start consuming (a constant from [`ConsumeFromWhere`]).
     pub consume_from_where: String,
-    /// 起始位点时间戳：`yyyyMMddHHmmss`，默认 30 分钟前。
+    /// Start-position timestamp: `yyyyMMddHHmmss`, default 30 minutes ago.
     pub consume_timestamp: String,
-    /// 并发消费线程池下界，默认 20。
+    /// Lower bound of the concurrent consume thread pool, default 20.
     pub consume_thread_min: i32,
-    /// 并发消费线程池上界，默认 20 —— 与 min 同为 20 是刻意取值。
-    /// 它同时是 `update_core_pool_size` 的上界（守卫 `core < max`），
-    /// 于是默认配置下只能把并发度往**下**调。
+    /// Upper bound of the concurrent consume thread pool, default 20 -- equal to min is a deliberate value.
+    /// It is also the upper bound of `update_core_pool_size` (the guard is `core < max`),
+    /// so with the default configuration concurrency can only be adjusted **downward**.
     pub consume_thread_max: i32,
-    /// 线程池动态扩容的堆积阈值，默认 100000。
+    /// Backlog threshold for dynamic thread pool growth, default 100000.
     pub adjust_thread_pool_nums_threshold: i64,
-    /// 并发消费允许的位点跨度上限（**条**），默认 2000。
+    /// Maximum allowed offset span in concurrent consumption (**messages**), default 2000.
     pub consume_concurrently_max_span: i64,
-    /// 单队列缓存条数阈值，默认 1000（**条数**）。
+    /// Per-queue cache message-count threshold, default 1000 (**count**).
     pub pull_threshold_for_queue: i32,
-    /// 单队列缓存体积阈值，默认 100（**MiB**）。
+    /// Per-queue cache size threshold, default 100 (**MiB**).
     pub pull_threshold_size_for_queue: i32,
-    /// topic 级缓存条数阈值，默认 -1（关闭）。
+    /// Topic-level cache message-count threshold, default -1 (disabled).
     pub pull_threshold_for_topic: i32,
-    /// topic 级缓存体积阈值，默认 -1（关闭）。
+    /// Topic-level cache size threshold, default -1 (disabled).
     pub pull_threshold_size_for_topic: i32,
-    /// 两次拉取之间的间隔（默认 0，本项目拉取循环未使用，仅保留字段）。
+    /// Interval between two pulls (default 0; unused by the pull loop here, the field is only kept).
     pub pull_interval: i64,
-    /// 拉取 RPC 超时（默认 30000ms）。
+    /// Pull RPC timeout (default 30000ms).
     pub pull_timeout_millis: i64,
-    /// 长轮询挂起时长（默认 20000ms）。
+    /// Long-polling suspend duration (default 20000ms).
     pub pull_suspend_timeout_millis: i64,
-    /// 单次交给 listener 的最大条数，默认 1。
+    /// Maximum messages handed to the listener at once, default 1.
     pub consume_message_batch_max_size: i32,
-    /// 单次拉取的最大条数，默认 32。
+    /// Maximum messages per pull, default 32.
     pub pull_batch_size: i32,
-    /// 单次拉取的最大字节数，默认 256 KiB（对应请求里的 `maxMsgBytes`）。
+    /// Maximum bytes per pull, default 256 KiB (the `maxMsgBytes` of the request).
     pub pull_batch_size_in_bytes: i32,
-    /// 最大重试次数，默认 -1（交给 broker，默认 16 次后转 `%DLQ%`）。
+    /// Maximum reconsume times, default -1 (deferred to the broker, which by default moves the message to `%DLQ%` after 16 attempts).
     pub max_reconsume_times: i32,
-    /// 顺序消费挂起时长（默认 1000ms）。
+    /// Suspend duration for the current queue in orderly consumption (default 1000ms).
     pub suspend_current_queue_time_millis: i64,
-    /// 消费超时（**分钟**，默认 15），只用于 `ConsumeReturnType::TimeOut` 判定。
+    /// Consume timeout (**minutes**, default 15), used only for the `ConsumeReturnType::TimeOut` decision.
     pub consume_timeout: i64,
     pub client_rebalance: bool,
-    /// broker 心跳周期（默认 30000ms）。
+    /// Broker heartbeat period (default 30000ms).
     pub heartbeat_interval_millis: i64,
-    /// 是否发心跳。
+    /// Whether to send heartbeats.
     pub heartbeat_enabled: bool,
-    /// true 走 POP + ack（且队列分配改走 broker 侧 QUERY_ASSIGNMENT），
-    /// false 走长轮询 + 位点（本地 rebalance 不变）。
+    /// true uses POP + ack (and queue assignment switches to broker-side QUERY_ASSIGNMENT),
+    /// false uses long polling + offsets (local rebalance unchanged).
     pub pop_mode: bool,
-    /// POP 不可见时间（默认 60000ms）。
+    /// POP invisible time (default 60000ms).
     pub pop_invisible_time: i64,
-    /// 单次弹出条数，默认 32（broker 侧 >32 会拒）。
+    /// Messages per pop, default 32 (the broker rejects values >32).
     pub pop_batch_nums: i32,
-    /// 单队列待 ack 条数阈值，默认 96。
+    /// Per-queue waiting-for-ack threshold, default 96.
     pub pop_threshold_for_queue: i32,
-    /// POP 失败重试的延迟梯度（**秒**），见 [`POP_DELAY_LEVEL`]。
+    /// Delay gradient for POP failure retries (**seconds**), see [`POP_DELAY_LEVEL`].
     pub pop_delay_level: Vec<i32>,
-    /// POP 长轮询挂起时长；0 = 短轮询。⚠ 非 0 时请求超时必须大于它。
+    /// POP long-polling suspend duration; 0 = short polling. ⚠ When non-zero the request timeout must exceed it.
     pub pop_poll_time_millis: i64,
-    /// POP 请求超时。
+    /// POP request timeout.
     pub pop_timeout_millis: i64,
-    /// 是否上报消费轨迹。
+    /// Whether to report consume traces.
     pub enable_trace: bool,
-    /// 自定义轨迹主题；未设置 → `RMQ_SYS_TRACE_TOPIC`。
+    /// Custom trace topic; unset -> `RMQ_SYS_TRACE_TOPIC`.
     pub trace_topic: Option<String>,
-    /// 轨迹批量上报条数，默认 10。
+    /// Trace batch upload size, default 10.
     pub trace_msg_batch_num: i32,
-    /// 是否把订阅表达式随 PULL_MESSAGE 上送（SUBSCRIPTION 位），默认 false：
-    /// 仅类过滤模式的服务端场景需要。
+    /// Whether to send the subscription expression along with PULL_MESSAGE (the SUBSCRIPTION bit), default false:
+    /// only needed by server-side scenarios using class filter mode.
     pub post_subscription_when_pull: bool,
 }
 
@@ -479,7 +479,7 @@ impl Default for ConsumerConfig {
             namespace_v2: None,
             unit_mode: false,
             enable_stream_request_type: false,
-            // 路由刷新 1000 * 30，位点落盘 1000 * 5
+            // route refresh 1000 * 30, offset flush 1000 * 5
             poll_name_server_interval_millis: 30_000,
             persist_consumer_offset_interval_millis: 5_000,
             client_id: None,
@@ -524,23 +524,23 @@ impl Default for ConsumerConfig {
     }
 }
 
-/// `instance_name` 的默认值（与生产者同名常量，但两处各自持有，避免跨模块耦合）。
+/// Default value of `instance_name` (a same-named constant exists on the producer, but each side keeps its own copy to avoid cross-module coupling).
 pub const DEFAULT_INSTANCE_NAME: &str = "DEFAULT";
-/// 16 位有符号整数的上限（32767）：`update_core_pool_size` 的第二道守卫。
+/// The upper bound of a 16-bit signed integer (32767): the second guard of `update_core_pool_size`.
 pub const SHORT_MAX_VALUE: i32 = 32767;
 
-/// 默认的起始位点时间：本地时区「当前时刻 - 30 分钟」，格式 `%Y%m%d%H%M%S`。
+/// Default start-consume timestamp: "now - 30 minutes" in the local timezone, formatted `%Y%m%d%H%M%S`.
 pub(crate) fn default_consume_timestamp() -> String {
     let now = chrono::Local::now();
     let past = now - chrono::Duration::minutes(30);
     past.format("%Y%m%d%H%M%S").to_string()
 }
 
-/// 把 `consumeTimestamp` 解析成毫秒时间戳：该字段**只**是 14 位本地墙钟日期。
+/// Parse `consumeTimestamp` into a millisecond timestamp: the field is **only** a 14-digit local wall-clock date.
 ///
-/// 必须按**本地时区**解析，否则 `CONSUME_FROM_TIMESTAMP` 的起点会差一个时区。
-/// 解析不了必须硬失败（服务端在启动时就会以 `consumeTimestamp is invalid` 拒绝）——
-/// 静默回落到「现在 - 30 分钟」会让起点错位无人察觉。
+/// It must be parsed in the **local timezone**, otherwise the start point of `CONSUME_FROM_TIMESTAMP` is off by a timezone.
+/// A failed parse must fail hard (the server itself rejects startup with `consumeTimestamp is invalid`) --
+/// silently falling back to "now - 30 minutes" would shift the start point with nothing to notice.
 pub(crate) fn consume_timestamp_millis(text: &str) -> Result<i64> {
     use chrono::TimeZone;
     chrono::NaiveDateTime::parse_from_str(text, "%Y%m%d%H%M%S")
@@ -554,21 +554,21 @@ pub(crate) fn consume_timestamp_millis(text: &str) -> Result<i64> {
         })
 }
 
-// ================================================================ 配置数值闸门
+// ================================================================ Configuration numeric gates
 
-/// 启动期配置校验的数值段：十三道区间/大小闸门，**顺序与区间都是判据**
-/// （每条错误文案按约定不带 FAQUrl 后缀）。
+/// The numeric part of start-up configuration validation: thirteen range/size gates, where **both the order and the bounds are the criterion**
+/// (by convention no error text carries a FAQUrl suffix).
 ///
-/// 为什么要在 `start()` 拦而不是各字段自己夹：这些值直接决定缓冲水位与线程池规模，
-/// 错法的方向都是**静默**的 —— `pull_threshold_*=0` 在运行期被 `max(1,n)` 兜底成
-/// "1 条就停"，队列永久停拉而消费者不报任何错；`pop_batch_nums>32` broker 直接回
-/// `INVALID_PARAMETER`，POP 循环退化成错误重试；巨值绕开流控判断直到 OOM。把
-/// 闸门放在启动期，就是要在**没建实例、没起任务**的时候一次性拒绝。
+/// Why reject in `start()` instead of clamping each field itself: these values directly decide the buffer watermark and the thread pool size,
+/// and every wrong direction is **silent** -- `pull_threshold_*=0` is clamped by `max(1,n)` at runtime into
+/// "stop after 1 message", so the queue stops pulling forever while the consumer reports no error; `pop_batch_nums>32` makes the broker answer
+/// `INVALID_PARAMETER` and the POP loop degenerates into error retries; huge values bypass the flow-control checks until OOM. Putting
+/// the gates at start-up means rejecting everything at once, **before any instance is created or any task started**.
 ///
-/// 两处容易写错的"不对称"必须注意，否则会把合法配置拒了：
-/// * `pull_threshold_for_topic` / `pull_threshold_size_for_topic` 的 `-1` 是
-///   "未设置，用队列级阈值"的哨兵，`!= -1` 才进区间判断（`-2` 仍然要拒）；
-/// * `pull_interval` 的下界是 **0**（不是 1），`pop_batch_nums` 的判据是 `<= 0`。
+/// Two easy-to-get-wrong "asymmetries" must be respected, otherwise valid configurations get rejected:
+/// * for `pull_threshold_for_topic` / `pull_threshold_size_for_topic`, `-1` is the
+///   "unset, use the queue-level threshold" sentinel, and only `!= -1` enters the range check (`-2` must still be rejected);
+/// * the lower bound of `pull_interval` is **0** (not 1), and the `pop_batch_nums` criterion is `<= 0`.
 fn check_config_ranges(cfg: &ConsumerConfig) -> Result<()> {
     // consumeThreadMin
     if cfg.consume_thread_min < 1 || cfg.consume_thread_min > 1000 {
@@ -634,74 +634,74 @@ fn check_config_ranges(cfg: &ConsumerConfig) -> Result<()> {
     Ok(())
 }
 
-// ================================================================ 内部可变状态
+// ================================================================ Mutable internal state
 
-/// 消费者内部那批需要互斥保护的表（位点、缓冲、队列归属 …）。
+/// The batch of mutex-protected tables inside the consumer (offsets, buffers, queue ownership ...).
 ///
-/// 键一律是 [`DefaultMQPushConsumer::mq_key`] 那串 `topic+brokerName+queueId`；
-/// 用 `BTreeMap` 只为让遍历顺序确定 —— `consumerRunningInfo` 的报文顺序依赖它。
+/// The keys are always the `topic+brokerName+queueId` string built by [`DefaultMQPushConsumer::mq_key`];
+/// `BTreeMap` is only for deterministic iteration order -- the message order of `consumerRunningInfo` depends on it.
 #[derive(Default)]
 struct State {
-    /// 订阅表：topic -> SubscriptionData。
+    /// Subscription table: topic -> SubscriptionData.
     subscription_data: Vec<(String, SubscriptionData)>,
-    /// 本实例当前被分配到的队列集合。
+    /// The queue set currently assigned to this instance.
     assigned: Vec<MessageQueue>,
-    /// **拉取游标**（nextBeginOffset）。
+    /// **Pull cursor** (nextBeginOffset).
     offset_table: BTreeMap<String, i64>,
-    /// **已消费位点**，周期持久化到 broker 的是这张。
+    /// **Consumed offsets**; this is the table persisted periodically to the broker.
     consume_offsets: BTreeMap<String, i64>,
-    /// 已拉未消费的缓冲（待分发消息）。
+    /// Pulled-but-unconsumed buffer (messages awaiting dispatch).
     pending: BTreeMap<String, VecDeque<MessageExt>>,
-    /// 在途批次计数：`pending` 里已被取走、正在被 listener 消费的那部分。
-    /// `dispatch_loop` 取走批次时 +1、消费收尾（含异常回塞）时 -1。
-    /// `pending` 与它合起来才是队列的完整消息数，
-    /// [`correct_tags_offset_locked`] 的闸门两个都要看。
+    /// In-flight batch counter: the part of `pending` that has been taken out and is being consumed by a listener.
+    /// `dispatch_loop` adds 1 when it takes a batch and subtracts 1 when consumption finishes (including re-queueing after an error).
+    /// `pending` plus this counter together are the queue's complete message count, and
+    /// the gate in [`correct_tags_offset_locked`] checks both.
     inflight: BTreeMap<String, usize>,
-    /// 已分发给 listener、还没落定的消息本体。
+    /// The message bodies dispatched to a listener but not yet settled.
     ///
-    /// `pending`（已拉未分发）∪ 它 = 队列在册消息的完整视图，cleanExpiredMsg 的
-    /// 「队首清扫」与 [`process_queue_contains_locked`] 都看这个并集。
-    /// **只登记并发批次**：顺序消费的消息会被挪进单独的「消费中」集合，
-    /// 而清扫对顺序直接早退。
-    /// 身份用 `queue_offset`（同一队列内位点唯一；本端的批次是值拷贝，
-    /// 拿引用身份对不上）。
+    /// `pending` (pulled, undispatched) ∪ this = the complete view of the messages on the queue's books; both the
+    /// "head-of-queue sweep" of cleanExpiredMsg and [`process_queue_contains_locked`] look at this union.
+    /// **Only concurrent batches are registered here**: orderly-consume messages move into a separate
+    /// "consuming" set, and the sweep returns early for orderly consumption.
+    /// Identity uses `queue_offset` (the offset is unique within one queue; batches on this side are value copies,
+    /// so reference identity would not match).
     inflight_msgs: BTreeMap<String, Vec<MessageExt>>,
-    /// 被 `OFFSET_ILLEGAL` 纠错冻结的位点。冻结期间在途 ack 与空应答修正都不许改它，
-    /// 直到这条队列按修正位点重建（`rebalance_pull_threads` 的建分支解冻）。
+    /// Offsets frozen by an `OFFSET_ILLEGAL` correction. While frozen, neither in-flight acks nor empty-response fixes may change it,
+    /// until the queue is rebuilt with the corrected offset (unfrozen in the create branch of `rebalance_pull_threads`).
     frozen_offsets: BTreeSet<String>,
-    /// 每条队列「ProcessQueue 的代号」，撤销时 +1。
+    /// Per queue, the "generation of the ProcessQueue", incremented on revocation.
     ///
-    /// `dispatch_loop` 取批次时连同代号一起取走，消费/ack 前比对 —— 不一致说明这批消息
-    /// 属于已被丢弃的旧 ProcessQueue，必须整批作废；少了它，旧批次的 ack 会把刚被
-    /// broker 纠正的位点又推回非法值，两边来回弹跳。
+    /// `dispatch_loop` takes the generation together with the batch and compares it before consuming/acking -- a mismatch means this batch
+    /// belongs to an already-dropped ProcessQueue and the whole batch must be voided; without it, the ack of an old batch would push
+    /// the offset just corrected by the broker back to an illegal value, and the two sides would bounce back and forth.
     queue_epoch: BTreeMap<String, u64>,
-    /// 队列 key -> MessageQueue。
+    /// Queue key -> MessageQueue.
     mq_map: BTreeMap<String, MessageQueue>,
-    /// 顺序消费下 broker 已确认锁定的队列。
+    /// Queues the broker has confirmed as locked in orderly consumption.
     lock_ok: BTreeSet<String>,
-    /// 每队列本批的堆积增量（用于 topic 级流控的水位估算）。
+    /// Per-queue backlog delta for this batch (watermark estimation for topic-level flow control).
     msg_acc_cnt: BTreeMap<String, i64>,
-    /// 每队列拉取/POP 循环的**归属令牌**。
+    /// The **ownership token** of each queue's pull/POP loop.
     ///
-    /// tokio 任务可能在线程间迁移，无法用线程对象判归属，故换成单调递增令牌。
+    /// tokio tasks may migrate between threads, so a thread object cannot express ownership, hence a monotonically increasing token.
     queue_owners: BTreeMap<String, u64>,
-    /// 队列 key -> [`PopProcessQueue`]。
+    /// Queue key -> [`PopProcessQueue`].
     pop_queues: BTreeMap<String, Arc<PopProcessQueue>>,
-    /// POP 顺序消费的去重集：同一个 (弹出队列, 队列) 只挂一个消费请求。
-    /// 相等性由「弹出队列的引用 + 队列 key」决定，
-    /// 这里用 Arc 指针地址表达引用、[`mq_key`] 表达队列。
+    /// Dedup set for POP orderly consumption: one (popping queue, queue) pair registers only one consume request.
+    /// Equality is decided by "the reference of the popping queue + the queue key",
+    /// expressed here as the Arc pointer address for the reference and [`mq_key`] for the queue.
     pop_orderly_requests: BTreeSet<(usize, String)>,
-    /// 每队列**最近一次发起**拉取/弹出的时刻（毫秒）。
+    /// Per queue, when the last pull/pop was **initiated** (milliseconds).
     ///
-    /// 盖章发生在循环**发起**网络请求之前，所以长轮询挂起和流控等待都不会把还在跑的
-    /// 循环判成停摆。循环已退出但仍占着归属时写 `0`（Rust 任务没有 `is_alive()`，
-    /// 用这个哨兵表达「死了」）。
+    /// The stamp happens before the loop **initiates** the network request, so neither long-polling suspension nor flow-control waiting
+    /// can make a still-running loop look stalled. It is written as `0` when the loop has exited but still holds ownership (Rust tasks have no `is_alive()`,
+    /// so this sentinel expresses "dead").
     last_pull_at: BTreeMap<String, i64>,
-    /// 队列 → 下一轮拉取该选的 brokerId。
+    /// Queue -> the brokerId to pick for the next pull.
     ///
-    /// 由拉取应答头里的 `suggestWhichBrokerId` 驱动，缺省按 master(=0) 记账；
-    /// 下次拉取据此选主/从节点。用 `HashMap` 而不是 `BTreeMap`：`MessageQueue`
-    /// 已实现 `Hash + Eq`，且这张表不参与任何报文序列化，遍历顺序无影响。
+    /// Driven by the `suggestWhichBrokerId` header of the pull response, accounted as master(=0) by default;
+    /// the next pull picks master/slave accordingly. `HashMap` rather than `BTreeMap`: `MessageQueue`
+    /// already implements `Hash + Eq`, and this table is never serialized, so iteration order has no effect.
     pull_from_which_node: HashMap<MessageQueue, i64>,
 }
 
@@ -722,9 +722,9 @@ struct Inner {
     runtime: OnceLock<tokio::runtime::Handle>,
     stop: watch::Sender<bool>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
-    /// 分发循环的句柄，**不在** [`Inner::tasks` 里]：停机时它可能正带着一批消息做
-    /// 回投 RPC，abort 会把在途回投从中间掐断。停机改走「有界等它跑完当前批次」
-    /// （见 [`DefaultMQPushConsumer::shutdown`] 的收尾任务）。
+    /// Handle of the dispatch loop, **not kept** in [`Inner::tasks`]: at shutdown it may be doing a
+    /// send-back RPC with a batch of messages, and abort would cut the in-flight send-back in half. Shutdown therefore
+    /// takes the "wait a bounded time for it to finish the current batch" route (see the finalize task of [`DefaultMQPushConsumer::shutdown`]).
     dispatch_task: Mutex<Option<JoinHandle<()>>>,
     listener: Mutex<Option<MessageListener>>,
     strategy: RwLock<Arc<dyn AllocateMessageQueueStrategy>>,
@@ -734,47 +734,47 @@ struct Inner {
     pop_executor: Mutex<Option<ConsumeExecutor>>,
     trace: Mutex<Option<Arc<dyn TraceDispatcherChannel>>>,
     rpc_hook: RwLock<Option<Arc<dyn RPCHook>>>,
-    /// 已发心跳次数（观测/单测用）。
+    /// Heartbeats sent so far (for observation / unit tests).
     heartbeat_count: AtomicUsize,
-    /// 本地流控触发次数（无锁自增）。
+    /// Local flow-control trigger count (lock-free increment).
     flow_control_triggered: AtomicUsize,
-    /// 线程池核心数的声明值。
+    /// The declared value of the thread pool core size.
     core_pool_size: AtomicI32,
-    /// 本实现不支持外部注入执行器，恒 true；
-    /// 保留字段是为了让 `update_core_pool_size` 的守卫形状完整。
+    /// This implementation does not support an injected executor, so this is always true;
+    /// the field is kept so that the guard shape of `update_core_pool_size` stays complete.
     owns_consume_executor: AtomicBool,
-    /// 启动时刻（毫秒）。
+    /// Start-up time (milliseconds).
     start_time_millis: AtomicI64,
-    /// 「立刻重平衡」的请求标志。
+    /// The "rebalance right now" request flag.
     ///
-    /// ⚠ 用「标志位 + `Notify`」而不是裸 `Notify::notify_waiters()`：后者只叫醒
-    /// **当下**在等的任务，通知落在两轮之间就会丢；标志位是持久的，
-    /// 补上这个语义。
+    /// ⚠ Uses "a flag + `Notify`" rather than a bare `Notify::notify_waiters()`: the latter wakes only
+    /// the tasks waiting **at that moment**, so a notification landing between two rounds is lost; the flag is persistent,
+    /// which closes that semantic gap.
     rebalance_now: AtomicBool,
     rebalance_signal: Notify,
-    /// [`State::queue_owners`] 的令牌发号器。
+    /// Token issuer for [`State::queue_owners`].
     next_token: AtomicU64,
-    /// 暂停标志：[`suspend`](DefaultMQPushConsumer::suspend) 置 true，
-    /// [`resume`](DefaultMQPushConsumer::resume) 置 false。
-    /// 拉取/弹出循环看到 true 时不发请求，按
-    /// [`PULL_TIME_DELAY_MILLS_WHEN_SUSPEND`] 挂起后重试。
+    /// Pause flag: [`suspend`](DefaultMQPushConsumer::suspend) sets it true,
+    /// [`resume`](DefaultMQPushConsumer::resume) sets it false.
+    /// Seeing true, the pull/pop loop sends no request and retries after suspending for
+    /// [`PULL_TIME_DELAY_MILLS_WHEN_SUSPEND`].
     pause: AtomicBool,
 }
 
-// ================================================================ 流控常量
+// ================================================================ Flow control constants
 
-/// 拉取/弹出 RPC 出错后的退避。
+/// Backoff after a pull/pop RPC error.
 pub const PULL_TIME_DELAY_MILLS_WHEN_EXCEPTION: u64 = 3000;
-/// 本地缓存（待消费/待 ack）打满流控时的退避。
+/// Backoff when the local cache (to consume / to ack) saturates flow control.
 pub const PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL: u64 = 50;
-/// broker 回 `FLOW_CONTROL(215)` 时的退避
-/// （远短于普通异常：broker 只是让客户端慢一点）。
+/// Backoff when the broker answers `FLOW_CONTROL(215)`
+/// (much shorter than a normal exception: the broker only asks the client to slow down).
 pub const PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL: u64 = 20;
-/// `suspend()` 后的轮询间隔。
+/// Polling interval after `suspend()`.
 pub const PULL_TIME_DELAY_MILLS_WHEN_SUSPEND: u64 = 1000;
 
 impl Drop for Inner {
-    /// 忘记 `shutdown()` 也不能留下还在跑的循环（见生产者模块头同名差异）。
+    /// Forgetting `shutdown()` must not leave loops still running (see the same-named note in the producer module header).
     fn drop(&mut self) {
         let _ = self.stop.send(true);
         for task in self
@@ -788,7 +788,7 @@ impl Drop for Inner {
     }
 }
 
-/// 取锁；中毒时照用，理由同 `consume_executor::lock`。
+/// Acquire the lock; on poisoning keep using it, for the same reason as `consume_executor::lock`.
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -806,32 +806,32 @@ fn require_client(inner: &Inner) -> Result<MQClientInstance> {
         .ok_or_else(|| Error::client("consumer not started, call start() first"))
 }
 
-/// 停机排空窗口内的**内部回投**专用取实例：只看实例在不在，不看 `started`。
+/// Getting the client instance for **internal send-back** inside the shutdown drain window: it only checks that the instance exists, not `started`.
 ///
-/// `shutdown()` 的第一步就把 `started` 置 false，然后才排空在途批次（等回投 RPC 跑到
-/// 应答）。回投若沿用 [`require_client`] 的 started 门，排空等到的全是
-/// 「consumer not started」快速失败 —— 回投一条也发不出去，消息只能靠位点下限从原
-/// topic 重投，`%RETRY%`/`%DLQ%` 永远进不去（真机立即退进程测试抓到，见
-/// `examples/live_shutdown_race.rs`）。回投 RPC 本身只依赖客户端实例，与消费者自身的
-/// serviceState 无关；实例本体到 shutdown 收尾的最后一步才被摘掉，
-/// 这里也只要求它在。
+/// The first step of `shutdown()` sets `started` to false, and only then drains the in-flight batches (waiting for send-back RPCs to
+/// get their response). If send-back reused the started gate of [`require_client`], the drain would get nothing but
+/// "consumer not started" fast failures -- not one send-back could go out, and messages could only be redelivered from the original
+/// topic via the offset lower bound, never entering `%RETRY%`/`%DLQ%` (caught by the real-broker exit-immediately test, see
+/// `examples/live_shutdown_race.rs`). The send-back RPC itself depends only on the client instance, not on the consumer's own
+/// serviceState; the instance itself is removed only in the very last step of the shutdown finalize,
+/// so requiring it to exist here is all that is needed.
 fn require_client_for_send_back(inner: &Inner) -> Result<MQClientInstance> {
     lock(&inner.client)
         .clone()
         .ok_or_else(|| Error::client("consumer not started, call start() first"))
 }
 
-/// topic + brokerName + queueId 拼成的队列 key（无分隔符）。
+/// The queue key built from topic + brokerName + queueId (no separator).
 pub fn mq_key(mq: &MessageQueue) -> String {
     format!("{}{}{}", mq.topic, mq.broker_name, mq.queue_id)
 }
 
 // ================================================================ DefaultMQPushConsumer
 
-/// 推模式消费者：订阅 + 重平衡 + 拉取/POP 消费循环的门面句柄。
+/// Push-mode consumer: the facade handle over subscription + rebalance + the pull/POP consume loop.
 ///
-/// 生命周期：`subscribe(..)` → [`start`](Self::start) → 后台重平衡 + 消费 →
-/// [`shutdown`](Self::shutdown)。克隆得到的副本共享同一份状态（结构取舍 2）。
+/// Lifecycle: `subscribe(..)` -> [`start`](Self::start) -> background rebalance + consumption ->
+/// [`shutdown`](Self::shutdown). Clones share one and the same state (structural trade-off 2).
 #[derive(Clone)]
 pub struct DefaultMQPushConsumer {
     inner: Arc<Inner>,
@@ -858,8 +858,8 @@ impl std::fmt::Debug for DefaultMQPushConsumer {
 }
 
 impl DefaultMQPushConsumer {
-    /// 只给消费组构造；组名空白则报错
-    /// （`MQClientException("consumerGroup is empty")`）。
+    /// Construct for a consumer group only; a blank group name is an error
+    /// (`MQClientException("consumerGroup is empty")`).
     pub fn new(consumer_group: &str) -> Result<DefaultMQPushConsumer> {
         let cfg = ConsumerConfig {
             consumer_group: consumer_group.to_string(),
@@ -868,7 +868,7 @@ impl DefaultMQPushConsumer {
         DefaultMQPushConsumer::with_config(cfg)
     }
 
-    /// 附带 RPC 钩子（请求签名）构造。
+    /// Construct with an RPC hook (request signing).
     pub fn with_rpc_hook(
         consumer_group: &str,
         rpc_hook: Option<Arc<dyn RPCHook>>,
@@ -878,7 +878,7 @@ impl DefaultMQPushConsumer {
         Ok(consumer)
     }
 
-    /// 直接以一份完整配置构造（逐个赋属性再启动的等价写法）。
+    /// Construct directly from a complete configuration (equivalent to setting the properties one by one and then starting).
     pub fn with_config(cfg: ConsumerConfig) -> Result<DefaultMQPushConsumer> {
         if cfg.consumer_group.trim().is_empty() {
             bail!("consumerGroup is empty");
@@ -911,7 +911,7 @@ impl DefaultMQPushConsumer {
             pause: AtomicBool::new(false),
         });
         let consumer = DefaultMQPushConsumer { inner };
-        // 声明的核心池容量初始等于 consume_thread_min
+        // The declared core pool capacity starts equal to consume_thread_min
         let min = consumer.config().consume_thread_min;
         consumer
             .inner
@@ -920,18 +920,18 @@ impl DefaultMQPushConsumer {
         Ok(consumer)
     }
 
-    /// 当前配置快照。
+    /// Snapshot of the current configuration.
     pub fn config(&self) -> ConsumerConfig {
         read_cfg(&self.inner)
     }
 
-    /// 改配置。`start()` 之后除少数运行期可调项外应拒绝。
+    /// Change the configuration. After `start()` this should be rejected except for the few runtime-tunable items.
     pub fn update_config(&self, f: impl FnOnce(&mut ConsumerConfig)) {
         {
             let mut w = self.inner.cfg.write().unwrap_or_else(|e| e.into_inner());
             f(&mut w);
         }
-        // 改线程上下限时顺带同步声明的核心池容量
+        // When the thread bounds change, also sync the declared core pool capacity
         let cfg = self.config();
         let cur = self.inner.core_pool_size.load(Ordering::SeqCst);
         if cur < cfg.consume_thread_min {
@@ -954,7 +954,7 @@ impl DefaultMQPushConsumer {
         self.inner.started.load(Ordering::Acquire)
     }
 
-    /// 共享的 [`MQClientInstance`] 句柄，未启动时 `None`。
+    /// The shared [`MQClientInstance`] handle; `None` before start-up.
     pub fn client(&self) -> Option<MQClientInstance> {
         lock(&self.inner.client).clone()
     }
@@ -979,21 +979,21 @@ impl DefaultMQPushConsumer {
         self.update_config(|c| c.instance_name = name);
     }
 
-    /// 设置单元化名：`None`/空白等价于不设（拼 clientId 时按空白判）。
+    /// Set the unit name: `None`/blank is equivalent to not setting it (blank is judged when building the clientId).
     pub fn set_unit_name(&self, unit_name: Option<&str>) {
         let unit_name = unit_name.map(str::to_string);
         self.update_config(|c| c.unit_name = unit_name);
     }
 
-    /// 设置 5.x **服务端**命名空间（`ns`/`nsd`
-    /// 扩展头，见 `NamespaceRpcHook`）。`None`/空串 = 不设，钩子退化为 no-op。
-    /// `start()` 时透传给 `MQClientInstance`，晚于 start 修改不影响已建实例。
+    /// Set the 5.x **server-side** namespace (the `ns`/`nsd`
+    /// extension headers, see `NamespaceRpcHook`). `None`/empty string = not set, and the hook degenerates to a no-op.
+    /// Passed through to `MQClientInstance` at `start()`; changing it after start does not affect an instance already built.
     pub fn set_namespace_v2(&self, namespace_v2: Option<&str>) {
         let namespace_v2 = namespace_v2.map(str::to_string);
         self.update_config(|c| c.namespace_v2 = namespace_v2);
     }
 
-    /// 读当前服务端命名空间。
+    /// Read the current server-side namespace.
     pub fn get_namespace_v2(&self) -> Option<String> {
         self.config().namespace_v2
     }
@@ -1010,43 +1010,43 @@ impl DefaultMQPushConsumer {
         self.update_config(|c| c.unit_mode = unit_mode);
     }
 
-    /// 设置流式请求类型开关（true 时请求带 `ReqT=0`，clientId 末尾多 `@STREAM`）。
+    /// Set the streaming request type switch (when true requests carry `ReqT=0` and the clientId gains a trailing `@STREAM`).
     pub fn set_enable_stream_request_type(&self, enable: bool) {
         self.update_config(|c| c.enable_stream_request_type = enable);
     }
 
-    /// 设置是否把订阅表达式随 PULL_MESSAGE 上送（默认 false）。
+    /// Set whether the subscription expression is sent up with PULL_MESSAGE (default false).
     ///
-    /// 打开后每次 PULL_MESSAGE 会把订阅表达式随请求上送（SUBSCRIPTION 位置位），
-    /// 让 broker 侧做过滤；默认关闭 —— 过滤由客户端 `filter_messages_for_delivery`
-    /// 兜底，只有 broker 侧需要订阅表达式做类过滤时才该打开。
+    /// Once on, every PULL_MESSAGE posts the subscription expression along with the request (the SUBSCRIPTION bit is set),
+    /// letting the broker side do the filtering; off by default -- filtering is
+    /// covered by the client-side `filter_messages_for_delivery` fallback, so this should be on only when the broker needs the subscription expression for class filter.
     pub fn set_post_subscription_when_pull(&self, enable: bool) {
         self.update_config(|c| c.post_subscription_when_pull = enable);
     }
 
-    /// 设置起始位点策略（取 [`ConsumeFromWhere`] 里的常量）。
+    /// Set the start-position strategy (a constant from [`ConsumeFromWhere`]).
     pub fn set_consume_from_where(&self, where_: &str) {
         let where_ = where_.to_string();
         self.update_config(|c| c.consume_from_where = where_);
     }
 
-    /// 设置 `CONSUME_FROM_TIMESTAMP` 的起点，格式 `yyyyMMddHHmmss`。
+    /// Set the start point used by `CONSUME_FROM_TIMESTAMP`, formatted `yyyyMMddHHmmss`.
     pub fn set_consume_timestamp(&self, timestamp: &str) {
         let timestamp = timestamp.to_string();
         self.update_config(|c| c.consume_timestamp = timestamp);
     }
 
-    /// 设置在用 topic 的路由刷新周期。
+    /// Set the route refresh period for in-use topics.
     pub fn set_poll_name_server_interval_millis(&self, millis: u64) {
         self.update_config(|c| c.poll_name_server_interval_millis = millis);
     }
 
-    /// 设置后台位点落盘周期。
+    /// Set the background offset flush period.
     pub fn set_persist_consumer_offset_interval_millis(&self, millis: u64) {
         self.update_config(|c| c.persist_consumer_offset_interval_millis = millis);
     }
 
-    /// 只读访问共享的 [`MQClientInstance`]：静态主题腿用它读端点重写结果；未启动报错。
+    /// Read-only access to the shared [`MQClientInstance`]: the static-topic leg uses it to read endpoint rewrite results; errors when not started.
     pub fn mq_client(&self) -> Result<MQClientInstance> {
         if !self.inner.started.load(Ordering::Acquire) {
             return Err(Error::client("consumer not started, call start() first"));
@@ -1056,12 +1056,12 @@ impl DefaultMQPushConsumer {
             .ok_or_else(|| Error::client("consumer not started, call start() first"))
     }
 
-    /// 注册并发消费监听器。
+    /// Register a message listener (concurrent or orderly).
     pub fn set_message_listener(&self, listener: MessageListener) {
         *lock(&self.inner.listener) = Some(listener);
     }
 
-    /// 注册并发消费监听器。
+    /// Register a concurrent consume listener.
     pub fn set_message_listener_concurrently(
         &self,
         listener: Arc<dyn MessageListenerConcurrently>,
@@ -1069,7 +1069,7 @@ impl DefaultMQPushConsumer {
         self.set_message_listener(MessageListener::Concurrently(listener));
     }
 
-    /// 注册顺序消费监听器。
+    /// Register an orderly consume listener.
     pub fn set_message_listener_orderly(&self, listener: Arc<dyn MessageListenerOrderly>) {
         self.set_message_listener(MessageListener::Orderly(listener));
     }
@@ -1085,7 +1085,7 @@ impl DefaultMQPushConsumer {
             .unwrap_or_else(|e| e.into_inner()) = strategy;
     }
 
-    /// 当前队列分配策略。
+    /// The current queue allocation strategy.
     pub fn allocate_message_queue_strategy(&self) -> Arc<dyn AllocateMessageQueueStrategy> {
         self.inner
             .strategy
@@ -1102,7 +1102,7 @@ impl DefaultMQPushConsumer {
             .unwrap_or_else(|e| e.into_inner()) = hook;
     }
 
-    /// 当前注册的 rpc 钩子（自动桥接轨迹分发器时透传给内部生产者）。
+    /// The currently registered rpc hook (passed through to the internal producer when auto-bridging the trace dispatcher).
     pub(crate) fn rpc_hook(&self) -> Option<Arc<dyn RPCHook>> {
         self.inner
             .rpc_hook
@@ -1111,7 +1111,7 @@ impl DefaultMQPushConsumer {
             .clone()
     }
 
-    /// 注入轨迹分发器（结构取舍 5）。
+    /// Inject the trace dispatcher (structural trade-off 5).
     pub fn set_trace_dispatcher(&self, dispatcher: Option<Arc<dyn TraceDispatcherChannel>>) {
         *lock(&self.inner.trace) = dispatcher;
     }
@@ -1139,12 +1139,12 @@ impl DefaultMQPushConsumer {
         self.inner.filter_hooks.has_hooks()
     }
 
-    // ---------------- 订阅 ----------------
+    // ---------------- Subscription ----------------
 
-    /// 订阅一个 topic，表达式默认 `"*"`。
+    /// Subscribe to a topic; the expression defaults to `"*"`.
     ///
-    /// `start()` 之后**仍可**调用：订阅表是活的（心跳与重平衡每轮都重读它），
-    /// put 进去之后立即推一轮心跳（见 [`Self::notify_subscription_changed`]）。
+    /// This **may still** be called after `start()`: the subscription table is live (the heartbeat and every rebalance round re-read it),
+    /// and right after the put a heartbeat round is pushed (see [`Self::notify_subscription_changed`]).
     pub fn subscribe(&self, topic: &str, sub_expression: &str) -> Result<()> {
         let topic = self.with_namespace(topic);
         let sub = FilterAPI::build_subscription_data(&topic, Some(sub_expression))?;
@@ -1153,17 +1153,17 @@ impl DefaultMQPushConsumer {
         Ok(())
     }
 
-    /// 订阅一个 topic 的全部消息（等价 `subscribe(topic, "*")`）。
+    /// Subscribe to all messages of a topic (equivalent to `subscribe(topic, "*")`).
     pub fn subscribe_all(&self, topic: &str) -> Result<()> {
         self.subscribe(topic, "*")
     }
 
-    /// 用 [`MessageSelector`] 订阅。
+    /// Subscribe using a [`MessageSelector`].
     ///
-    /// 按表达式类型分流：
-    /// TAG（或 type 为空）走 `buildSubscriptionData` 填 `tagsSet`/`codeSet`；
-    /// SQL92 / CLASS_FILTER 只设 topic/subString/expressionType，两个集合留空。
-    /// 与 `subscribe` 相同：start() 之后可调用，并立即推一轮心跳。
+    /// Dispatched by expression type:
+    /// TAG (or an empty type) goes through `buildSubscriptionData`, filling `tagsSet`/`codeSet`;
+    /// SQL92 / CLASS_FILTER set only topic/subString/expressionType and leave both collections empty.
+    /// Same as `subscribe`: callable after start(), and it pushes a heartbeat round immediately.
     pub fn subscribe_with_selector(&self, topic: &str, selector: &MessageSelector) -> Result<()> {
         let topic = self.with_namespace(topic);
         let sub = if selector.selector_type == ExpressionType::TAG {
@@ -1186,30 +1186,30 @@ impl DefaultMQPushConsumer {
         Ok(())
     }
 
-    /// 取消订阅一个 topic。
+    /// Unsubscribe from a topic.
     ///
-    /// 这里**只删表项、不发心跳**（后一轮心跳自然带出新订阅集），所以刻意不调
-    /// `notify_subscription_changed`。
+    /// This **only removes the table entry and sends no heartbeat** (the next heartbeat round naturally carries the new subscription set),
+    /// so it deliberately does not call `notify_subscription_changed`.
     pub fn unsubscribe(&self, topic: &str) {
         let topic = self.with_namespace(topic);
         let mut state = lock(&self.inner.state);
         state.subscription_data.retain(|(k, _)| *k != topic);
     }
 
-    /// 订阅表新增/更新后的立即动作：同步推一轮心跳 + 把 topic 登记为「在用」。
+    /// Immediate actions after an insert/update of the subscription table: push a heartbeat round synchronously + register the topic as "in use".
     ///
-    /// 为什么必须立即：
-    /// broker 的 `ConsumerManager` 只在收到心跳时才把 topic→group 记进它自己那张
-    /// topicGroupTable（ClientManageProcessor → registerConsumer），而
-    /// `QUERY_TOPIC_CONSUME_BY_WHO(300)` 读的正是这张表；晚一轮就是默认 30s 的空窗。
+    /// Why it must be immediate:
+    /// the broker's `ConsumerManager` records topic->group into its own
+    /// topicGroupTable only when it receives a heartbeat (ClientManageProcessor -> registerConsumer), and
+    /// `QUERY_TOPIC_CONSUME_BY_WHO(300)` reads exactly that table; being one round late is a 30s window by default.
     ///
-    /// 另外把新 topic 登记为「在用」，让后台路由刷新任务覆盖到它 ——
-    /// 刷新任务收集「要刷哪些 topic」时读的是消费者的**当前**订阅表，
-    /// 新订阅必须当场可见才能被覆盖到。
-    /// 未启动时没有 client，只落订阅表。
+    /// It also registers the new topic as "in use" so the background route refresh task covers it --
+    /// when the refresh task collects "which topics to refresh" it reads the consumer's **current** subscription table,
+    /// so a new subscription must be visible on the spot to be covered.
+    /// Before start-up there is no client, so only the subscription table is written.
     ///
-    /// `subscribe` 是同步签名而心跳是异步 RPC：放到 runtime 上 fire-and-forget
-    /// （与 `rebalance` 起每队列拉取循环同一套 `runtime_handle()` 手法）。
+    /// `subscribe` has a synchronous signature while the heartbeat is an async RPC: it is queued on the runtime as fire-and-forget
+    /// (the same `runtime_handle()` technique the `rebalance` step uses to start each per-queue pull loop).
     fn notify_subscription_changed(&self, topic: &str) {
         let Ok(client) = require_client(&self.inner) else {
             return;
@@ -1239,7 +1239,7 @@ impl DefaultMQPushConsumer {
         }
     }
 
-    /// 当前订阅表快照。
+    /// Snapshot of the current subscription table.
     pub fn subscriptions(&self) -> Vec<SubscriptionData> {
         lock(&self.inner.state)
             .subscription_data
@@ -1248,7 +1248,7 @@ impl DefaultMQPushConsumer {
             .collect()
     }
 
-    /// 给 topic 拼上客户端命名空间的 `%` 前缀（订阅入口统一先过这一步）。
+    /// Prefix the topic with the client namespace `%` (every subscription entry point passes through this step first).
     fn with_namespace(&self, topic: &str) -> String {
         let namespace = read_cfg(&self.inner).namespace;
         if namespace.is_empty() {
@@ -1258,19 +1258,19 @@ impl DefaultMQPushConsumer {
         }
     }
 
-    // ---------------- 生命周期 ----------------
+    // ---------------- Lifecycle ----------------
 
-    /// 启动消费者：建实例、注册、拉路由、首轮心跳与重平衡，再起后台循环。
+    /// Start the consumer: create the instance, register, fetch routes, first heartbeat and rebalance, then launch the background loops.
     ///
-    /// 顺序是判据：校验 → 拼命名空间 → 建并启动实例 → 注册消费者 →
-    /// 自动订阅 `%RETRY%` → 注册 NOTIFY_CONSUMER_IDS_CHANGED(40) → 建 POP 执行器 →
-    /// 拉路由 → **同步**首轮心跳 → **同步**首轮重平衡 → 起各循环 → 轨迹分发器。
+    /// The order is the criterion: validate -> build namespaces -> create and start the instance -> register the consumer ->
+    /// auto-subscribe `%RETRY%` -> register NOTIFY_CONSUMER_IDS_CHANGED(40) -> build the POP executor ->
+    /// fetch routes -> **synchronous** first heartbeat -> **synchronous** first rebalance -> start each loop -> trace dispatcher.
     ///
-    /// 两处刻意的实现选择（行为不变）：
-    /// 1. 心跳报文由 [`MQClientInstance::send_heartbeat_to_all_broker`] 从注册表拼
-    ///    全量 `ConsumerData`，而不是消费者自己拼一份。因为 `register_consumer` 在它
-    ///    之前，本消费者一定在报文里。
-    /// 2. 后台循环是 tokio 任务，句柄缺失时（无运行时）只告警不报错，与生产者一致。
+    /// Two deliberate implementation choices (behaviour unchanged):
+    /// 1. The heartbeat message is assembled by [`MQClientInstance::send_heartbeat_to_all_broker`] from the registry into a
+    ///    full `ConsumerData`, instead of the consumer building one itself. Because `register_consumer` runs before it,
+    ///    this consumer is certainly present in the message.
+    /// 2. The background loops are tokio tasks; a missing runtime handle (no runtime) only warns and does not error, as on the producer side.
     pub async fn start(&self) -> Result<()> {
         if self
             .inner
@@ -1366,7 +1366,7 @@ impl DefaultMQPushConsumer {
             return Err(e);
         }
         *lock(&self.inner.client) = Some(client.clone());
-        // 动态 name server：实例可能已从地址服务器拿到地址，回填。
+        // Dynamic name server: the instance may already have obtained addresses from the address server, so backfill them.
         if cfg.name_server_addrs.is_empty() {
             let addrs = client.name_server_addrs();
             if !addrs.is_empty() {
@@ -1387,10 +1387,10 @@ impl DefaultMQPushConsumer {
             }
         }
 
-        // broker 的 NOTIFY_CONSUMER_IDS_CHANGED(40) 由 **实例** 统一处理并扇出回来
-        // （`RegisteredConsumer::rebalance_immediately`，见 mq_client.rs），本消费者
-        // 不自己注册处理器 —— 下面 register_consumer 之前必须先置好信号位，
-        // 否则首轮 `do_rebalance` 会被自己的唤醒重复触发一次。
+        // Broker-side NOTIFY_CONSUMER_IDS_CHANGED(40) is handled centrally by the **instance** and fanned back out
+        // (`RegisteredConsumer::rebalance_immediately`, see mq_client.rs); this consumer
+        // does not register its own handler -- the signal flag below must be set before register_consumer,
+        // otherwise the first `do_rebalance` would be triggered one extra time by its own wake-up.
         self.inner
             .start_time_millis
             .store(current_time_millis(), Ordering::SeqCst);
@@ -1414,7 +1414,7 @@ impl DefaultMQPushConsumer {
             }
         }
 
-        // 拉一次路由 → 同步首轮心跳 → 同步首轮重平衡 → 起循环（顺序固定）
+        // Fetch routes once -> synchronous first heartbeat -> synchronous first rebalance -> start the loops (fixed order)
         self.refresh_routes().await;
         if let Err(e) = client.check_client_in_broker().await {
             self.shutdown();
@@ -1432,14 +1432,14 @@ impl DefaultMQPushConsumer {
         Ok(())
     }
 
-    /// 停机：清退在途批次、刷位点、解锁队列、注销实例。
+    /// Shutdown: drain the in-flight batches, flush offsets, unlock the queues, unregister from the instance.
     ///
-    /// ⚠ 与「spawn 后立即返回」的旧形态不同：清退（等在途批次 → 刷位点/解锁 →
-    /// 35 号注销 → 拆实例）挂在运行时上跑，但本方法**阻塞等它落地**（上限
-    /// [`SHUTDOWN_FINALIZE_BUDGET`]）。「shutdown() 返回后立刻退进程」不会再丢
-    /// 在途回投 —— 该进 `%DLQ%` 的消息在返回前已经发出。current_thread 运行时里
-    /// 无法阻塞（会 panic / 死锁），此时收尾仍是游离任务并告警（见
-    /// [`run_finalize_blocking`] 的情形 2/3）。
+    /// ⚠ Unlike the old "spawn and return immediately" shape: the cleanup (wait for in-flight batches -> flush offsets/unlock ->
+    /// unregister via code 35 -> tear down the instance) runs on the runtime, but this method **blocks waiting for it to land** (bounded by
+    /// [`SHUTDOWN_FINALIZE_BUDGET`]). "Exit the process right after shutdown() returns" no longer loses
+    /// in-flight send-backs -- messages bound for `%DLQ%` have already been sent before the return. Inside a
+    /// current_thread runtime it cannot block (that would panic / deadlock), so the finalize stays a detached task and warns (see
+    /// cases 2/3 of [`run_finalize_blocking`]).
     pub fn shutdown(&self) {
         if self
             .inner
@@ -1451,7 +1451,7 @@ impl DefaultMQPushConsumer {
         }
         let _ = self.inner.stop.send(true);
         {
-            // POP：把所有队列标成 dropped，在途批次不再 ack（交给 broker 复活重投）
+            // POP: mark every queue dropped so in-flight batches no longer ack (leave redelivery to the broker's revival)
             let mut state = lock(&self.inner.state);
             if self.config().pop_mode {
                 for pq in state.pop_queues.values() {
@@ -1460,8 +1460,8 @@ impl DefaultMQPushConsumer {
                 state.pop_queues.clear();
             }
             state.queue_owners.clear();
-            // 停机后残留的时刻会让下次
-            // start() 的自愈判定读到旧实例的盖章。
+            // Offsets left behind after shutdown would make the next
+            // start()'s self-healing check read the stamp of the old instance.
             state.last_pull_at.clear();
         }
         for task in self
@@ -1473,11 +1473,11 @@ impl DefaultMQPushConsumer {
         {
             task.abort();
         }
-        // 分发循环不在 tasks 里（见字段注释）：它可能正带着一批消息做回投 RPC，
-        // abort 会把在途回投从中间掐断。由下面的收尾等待（`run_finalize_blocking`）
-        // 有界等它跑完当前批次。
+        // The dispatch loop is not in tasks (see the field comment): it may be mid send-back RPC with a batch of messages,
+        // and abort would cut the in-flight send-back off in the middle. The finalize wait below (`run_finalize_blocking`)
+        // waits a bounded time for it to finish the current batch.
         let dispatch_task = lock(&self.inner.dispatch_task).take();
-        // POP 执行器同样挪进收尾任务：先停接收，再有界等已提交任务跑完。
+        // The POP executor moves into the finalize task the same way: stop accepting first, then wait a bounded time for submitted tasks.
         let pop_executor = lock(&self.inner.pop_executor).take();
         let client = lock(&self.inner.client).clone();
         if let Some(client) = client {
@@ -1498,16 +1498,16 @@ impl DefaultMQPushConsumer {
                 }
             }
             client.unregister_consumer(&group);
-            // 同生产者：注销 35 在 spawn 的任务里，登记表不能等任务 —— 立刻重启会
-            // 复用回这份正要被拆的实例（见 `MQClientInstance` 上那段注释）。
+            // As on the producer: the code-35 unregister happens inside the spawned task, and the registry must not wait for that task -- restarting
+            // immediately would reuse this very instance that is about to be torn down (see the comment on `MQClientInstance`).
             client.detach_from_registry_if_last_tenant();
             if let Some(handle) = self.runtime_handle() {
                 let client_id = self.client_id();
                 let inner = Arc::clone(&self.inner);
                 let finalize = async move {
-                    // ① 有界排空在途批次：等分发循环把手里的这批消费/回投完（回投 RPC
-                    //    完整跑到应答），POP 执行器把已提交的消费任务跑完。超时则放弃
-                    //    —— 下面 ② 的位点下限钳制保证没落定的消息仍会被 broker 重投。
+                    // (1) Bounded drain of in-flight batches: wait for the dispatch loop to consume/send-back the batch in hand (send-back RPC
+                    //    running to a full response), and for the POP executor to finish the submitted consume tasks. On timeout, give up
+                    //    -- the offset floor clamp in (2) below still makes the broker redeliver the unsettled messages.
                     if let Some(task) = dispatch_task {
                         if tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, task)
                             .await
@@ -1534,8 +1534,8 @@ impl DefaultMQPushConsumer {
                             );
                         }
                     }
-                    // ② 清退三步必须**串行**（刷位点 → 解锁 → 注销）：并发送的话注销可能
-                    // 插在解锁之前，broker 已按 clientId 丢掉记录，位点和锁白刷。
+                    // (2) The three cleanup steps must run **serially** (flush offsets -> unlock -> unregister): running them concurrently lets the
+                    // unregister slip before the unlock, at which point the broker has already dropped the records by clientId and the offset and lock flushes are wasted.
                     if !broadcast {
                         let items = shutdown_persist_items(&inner);
                         for (mq, off) in &items {
@@ -1580,8 +1580,8 @@ impl DefaultMQPushConsumer {
                     finalize,
                 );
             } else {
-                // 无运行时：末次持久化与注销都发不出去，
-                // 但至少把该还的还掉。
+                // No runtime: neither the last persist nor the unregister can be sent,
+                // but at least hand back what is owed.
                 rmq_warn!(
                     "push shutdown: no tokio runtime, skip final offset persist and \
                            consumer unregister"
@@ -1605,11 +1605,11 @@ impl DefaultMQPushConsumer {
         Some(handle)
     }
 
-    /// `enable_trace` 时注册消费轨迹钩子并启动通道。
+    /// With `enable_trace`, register the consume trace hook and start the channel.
     ///
-    /// 注入优先（[`set_trace_dispatcher`](Self::set_trace_dispatcher)，结构取舍 5）；
-    /// `enable_trace=true` 且未注入时经 [`auto_bridged_dispatcher`] 自动建一套
-    /// （Type=CONSUME + 真实内部生产者）。
+    /// Injection takes priority ([`set_trace_dispatcher`](Self::set_trace_dispatcher), structural trade-off 5);
+    /// with `enable_trace=true` and nothing injected, [`auto_bridged_dispatcher`] builds a whole set
+    /// automatically (Type=CONSUME + a real internal producer).
     fn start_trace_dispatcher(&self) {
         let cfg = self.config();
         let dispatcher: Arc<dyn TraceDispatcherChannel> = match self.trace_dispatcher() {
@@ -1623,14 +1623,14 @@ impl DefaultMQPushConsumer {
                     cfg.trace_topic.clone(),
                 ) {
                     Ok(d) => {
-                        // 建桥成功后把本消费者登记为轨迹通道的宿主
+                        // After the bridge is built, register this consumer as the host of the trace channel
                         d.set_host_consumer(Arc::new(self.clone()));
                         let channel: Arc<dyn TraceDispatcherChannel> = d;
                         self.set_trace_dispatcher(Some(channel.clone()));
                         channel
                     }
                     Err(e) => {
-                        // 该报错文案与线上基准逐字一致
+                        // This error text matches the production baseline verbatim
                         rmq_error!(
                             "system mqtrace hook init failed ,maybe can't send msg trace data: {e}"
                         );
@@ -1660,9 +1660,9 @@ impl DefaultMQPushConsumer {
         self.config().name_server_addrs.join(";")
     }
 
-    // ---------------- 心跳 ----------------
+    // ---------------- Heartbeat ----------------
 
-    /// 把订阅 topic 登记为「在用」并各拉一次路由。
+    /// Register the subscribed topics as "in use" and fetch the route once for each.
     async fn refresh_routes(&self) {
         let Ok(client) = require_client(&self.inner) else {
             return;
@@ -1680,27 +1680,27 @@ impl DefaultMQPushConsumer {
         }
     }
 
-    /// 返回成功的 broker 台数。
+    /// Return the number of brokers that succeeded.
     pub async fn send_heartbeat_to_all_broker(&self) -> usize {
         heartbeat_once(&self.inner).await
     }
 
-    /// 累计成功心跳次数（真机验证用）。
+    /// Cumulative successful heartbeats (for real-cluster verification).
     pub fn heartbeat_count(&self) -> usize {
         self.inner.heartbeat_count.load(Ordering::SeqCst)
     }
 
-    /// 累计触发流控的次数（真机验证流控是否生效）。
+    /// Cumulative flow-control triggers (for real-cluster verification that flow control works).
     pub fn flow_control_triggered(&self) -> usize {
         self.inner.flow_control_triggered.load(Ordering::SeqCst)
     }
 
-    /// 当前分配到的队列数。
+    /// How many queues are currently assigned.
     pub fn assigned_queue_count(&self) -> usize {
         lock(&self.inner.state).assigned.len()
     }
 
-    /// 当前分配到的队列 key（多实例分配「不重不漏」验证用）。
+    /// Keys of the currently assigned queues (for verifying multi-instance allocation covers "no overlap, no gap").
     pub fn assigned_queue_keys(&self) -> Vec<String> {
         let mut keys: Vec<String> = lock(&self.inner.state)
             .assigned
@@ -1711,7 +1711,7 @@ impl DefaultMQPushConsumer {
         keys
     }
 
-    /// 已持锁队列集合：`LOCK_BATCH_MQ` 真正拿到锁的队列（顺序消费才会填）。
+    /// Set of locked queues: the queues `LOCK_BATCH_MQ` actually acquired (only filled by orderly consumption).
     pub fn locked_queue_keys(&self) -> Vec<String> {
         let mut keys: Vec<String> = lock(&self.inner.state).lock_ok.iter().cloned().collect();
         keys.sort();
@@ -1722,34 +1722,34 @@ impl DefaultMQPushConsumer {
         lock(&self.inner.state).pop_orderly_requests.len()
     }
 
-    // ---------------- 拉取停摆自愈的可观测接缝 ----------------
+    // ---------------- Observability seams for pull-stall self-healing ----------------
     //
-    // 一并公开这些接缝：真机验证脚本要能把时钟倒拨、触发一次
-    // rebalance，再确认「停摆的队列被撤掉重建、消息一条不重不丢」。这些判据本身
-    // 是内部状态，没有接缝就只能靠 sleep 120s 猜。
+    // These seams are public together: the real-cluster verification script needs to move the clock back, trigger one
+    // rebalance, and then confirm "the stalled queue is dropped and rebuilt, with no duplicate and no lost message". The criteria themselves
+    // are internal state, and without seams one could only guess by sleeping 120s.
 
     pub fn pull_stalled(&self, key: &str) -> bool {
         let state = lock(&self.inner.state);
         pull_stalled_locked(&state, key, current_time_millis())
     }
 
-    /// 最近一次发起拉取/弹出的时刻（毫秒）；`None` 表示这把队列没盖过章。
+    /// When the last pull/pop was initiated (milliseconds); `None` means this queue was never stamped.
     pub fn last_pull_at(&self, key: &str) -> Option<i64> {
         lock(&self.inner.state).last_pull_at.get(key).copied()
     }
 
-    /// 把盖章强行拨到某个时刻（验证用：等价于「这条循环已经 X 毫秒没动静了」）。
+    /// Force the stamp to a given time (for verification: equivalent to "this loop has been silent for X milliseconds").
     pub fn set_last_pull_at(&self, key: &str, millis: i64) {
         lock(&self.inner.state)
             .last_pull_at
             .insert(key.to_string(), millis);
     }
 
-    // ---------------- OFFSET_ILLEGAL 纠错的可观测接缝 ----------------
+    // ---------------- Observability seams for OFFSET_ILLEGAL correction ----------------
     //
-    // 一并公开这些接缝：真机验证脚本要能断言「队列被丢弃（代号 +1）、
-    // 位点被冻结、缓冲里的旧消息整批作废」，这些都是内部状态，没有接缝就只能靠
-    // 「消息有没有投过来」间接猜。
+    // These seams are public together: the real-cluster verification script needs to assert "the queue was dropped (epoch +1),
+    // the offset was frozen, and the stale messages in the buffer were voided as a batch"; all of these are internal state, and without
+    // seams one could only guess indirectly from "whether the message got delivered".
 
     pub fn queue_epoch(&self, key: &str) -> u64 {
         lock(&self.inner.state)
@@ -1770,11 +1770,11 @@ impl DefaultMQPushConsumer {
             .map_or(0, VecDeque::len)
     }
 
-    // ---------------- cleanExpiredMsg 的可观测接缝 ----------------
+    // ---------------- Observability seams for cleanExpiredMsg ----------------
     //
-    // 一并公开这些接缝：真机验证要能断言「挂住的批次登记在册（带
-    // CONSUME_START_TIME）、清扫把它从视图里收走、回投消息停在哪条队列的缓冲里」，
-    // 判据全是内部状态，没有接缝就只能靠「消息有没有来第二次」间接猜。
+    // These seams are public together: real-cluster verification needs to assert "the stuck batch is on the books (with
+    // CONSUME_START_TIME), the sweep removes it from the view, and the send-back message lands in which queue's buffer"; the
+    // criteria are all internal state, and without seams one could only guess indirectly from "whether a second copy arrives".
 
     pub fn process_queue_entries(&self, key: &str) -> Vec<MessageExt> {
         let state = lock(&self.inner.state);
@@ -1789,15 +1789,15 @@ impl DefaultMQPushConsumer {
             .unwrap_or_default()
     }
 
-    /// 立刻执行一次循环集合同步（等价于 rebalance 的那一步，验证用）。
+    /// Run one loop-set synchronization immediately (equivalent to the rebalance step; for verification).
     ///
-    /// 刻意做成 `async`：收尾要发 RPC，在已经是 async 上下文的调用方里再 `block_on`
-    /// 会直接 panic。
+    /// Deliberately `async`: the finalize sends RPCs, and calling `block_on` again from a caller that is already in an async
+    /// context would panic outright.
     pub async fn sync_pull_threads(&self) {
         self.rebalance_pull_threads().await;
     }
 
-    // ---------------- 重平衡 ----------------
+    // ---------------- Rebalance ----------------
 
     async fn all_queues_of_topic(&self, topic: &str) -> Vec<MessageQueue> {
         let Ok(client) = require_client(&self.inner) else {
@@ -1810,9 +1810,9 @@ impl DefaultMQPushConsumer {
         queues
     }
 
-    /// BROADCASTING 全部队列归自己；CLUSTERING 查 broker 上的消费者列表 → 排序 →
-    /// 分配策略。**查不到消费者列表时保留现有分配**（绝不回退成「独占全部队列」，
-    /// 否则同组多实例互相重复消费）。
+    /// BROADCASTING keeps every queue for itself; CLUSTERING queries the consumer list on the broker -> sorts ->
+    /// applies the allocation strategy. **When the consumer list cannot be fetched, the current assignment is kept** (never
+    /// falling back to "monopolize all queues", otherwise multiple instances of one group would consume the same messages).
     pub async fn do_rebalance(&self) -> Result<()> {
         let client = require_client(&self.inner)?;
         let group = self.consumer_group();
@@ -1894,8 +1894,8 @@ impl DefaultMQPushConsumer {
                 ) {
                     Ok(got) => assigned.extend(got),
                     Err(e) => {
-                        // 这里直接放弃本轮：分配结果整个作废，
-                        // 连已算好的 topic 都不写入（下一轮 20s 后再试）。照抄。
+                        // Abandon this round outright: the whole allocation result is voided and
+                        // not even the already-computed topics are written (retry in the next round, 20s later). Verbatim behaviour.
                         rmq_error!(
                             "allocate message queue exception. strategy name: {}, ex: {}",
                             strategy.get_name(),
@@ -1937,9 +1937,9 @@ impl DefaultMQPushConsumer {
         Ok(())
     }
 
-    /// 分配项自带的 mode（POP / PULL）只**观察不服从**：本消费者的消费模式是启动前
-    /// 定死的（`pop_mode`），rebalance 消费的是队列**集合**；混合应答只告警不拆分
-    /// —— 那几乎总是 `SET_MESSAGE_REQUEST_MODE` 没有全量生效的形状。
+    /// The mode (POP / PULL) carried by an assignment item is only **observed, never obeyed**: this consumer's consume mode is fixed
+    /// before start-up (`pop_mode`), and rebalance consumes the queue **set**; a mixed response only warns and is not split
+    /// -- that shape almost always means `SET_MESSAGE_REQUEST_MODE` did not take effect fully.
     async fn assigned_from_broker(
         &self,
         group: &str,
@@ -2020,11 +2020,11 @@ impl DefaultMQPushConsumer {
         Some(out)
     }
 
-    /// 按当前分配同步循环任务集，并清理被撤销队列。
+    /// Sync the loop task set to the current assignment and clean up revoked queues.
     ///
-    /// 队列被撤走时必须 ①持久化已消费位点 ②丢弃缓冲（在途消息不再消费）
-    /// ③顺序消费还要 UNLOCK_BATCH_MQ —— 少任何一步，被撤销队列里的在途消息会被
-    /// 旧实例继续消费，与新属主重复。
+    /// When a queue is revoked it must (1) persist the consumed offset (2) drop the buffer (in-flight messages stop being consumed)
+    /// (3) for orderly consumption also UNLOCK_BATCH_MQ -- missing any step lets the old instance keep consuming the in-flight
+    /// messages of the revoked queue, duplicating the new owner.
     async fn rebalance_pull_threads(&self) {
         let pop = self.config().pop_mode;
         let current: BTreeMap<String, MessageQueue> = lock(&self.inner.state)
@@ -2038,7 +2038,7 @@ impl DefaultMQPushConsumer {
         let now = current_time_millis();
         {
             let mut state = lock(&self.inner.state);
-            // ①撤：先收集，再统一摘干净（含停摆自愈）
+            // (1) Revoke: collect first, then remove everything at once (including stall self-healing)
             let doomed: Vec<(String, Option<MessageQueue>)> = state
                 .queue_owners
                 .keys()
@@ -2061,8 +2061,8 @@ impl DefaultMQPushConsumer {
             for (key, fallback) in doomed {
                 Self::retire_queue_locked(&mut state, &key, fallback.as_ref(), &mut revoked, pop);
             }
-            // ②建（只登记归属与 token，真正把任务 spawn 出去要等 ③收尾之后）：
-            // 本轮不再拥有归属的队列（新分配 + 刚被自愈撤走的）都在这里重新接手
+            // (2) Create (only register ownership and the token here; actually spawning the task waits until after (3) finishes):
+            // queues without ownership in this round (newly assigned + just revoked by self-healing) take over again here
             for (key, mq) in &current {
                 if state.queue_owners.contains_key(key) {
                     continue;
@@ -2073,11 +2073,11 @@ impl DefaultMQPushConsumer {
                 state.frozen_offsets.remove(key);
                 let token = self.inner.next_token.fetch_add(1, Ordering::SeqCst);
                 state.queue_owners.insert(key.clone(), token);
-                // 分配那一刻就把 `_mq_map[key] = mq` 登记好：队列即使一条消息都没
-                // 拉到，也要能在 307/220 里看到、位点也能持久化。
+                // Register `_mq_map[key] = mq` at the moment of assignment: even if the queue never pulled a single
+                // message, it must still show up in 307/220 and its offset must still be persistable.
                 state.mq_map.insert(key.clone(), mq.clone());
-                // 新循环的第一次盖章由它自己在发起拉取时打；这里先给个起点，
-                // 免得刚建好就被下一轮 rebalance 误判成「从没盖过章 = 停摆」。
+                // The new loop stamps its first pull itself when it initiates it; give a starting point here so
+                // a freshly built loop is not misjudged by the next rebalance as "never stamped = stalled".
                 state.last_pull_at.insert(key.clone(), now);
                 to_spawn.push((mq.clone(), token));
             }
@@ -2107,11 +2107,11 @@ impl DefaultMQPushConsumer {
         }
     }
 
-    /// 把一把队列的所有痕迹摘干净，并把它要持久化的
-    /// 已消费位点交给 `revoked` 列表。
+    /// Remove every trace of a queue and hand the consumed offset it must persist
+    /// to the `revoked` list.
     ///
-    /// `fallback_mq` 是停摆自愈用的：队列仍在分配里（`mq_map` 不能留成脏），
-    /// 而真正被撤销的队列走 `mq_map` 反查即可。
+    /// `fallback_mq` is for stall self-healing: the queue is still in the assignment (so `mq_map` must not stay stale),
+    /// while a genuinely revoked queue only needs the `mq_map` lookup.
     fn retire_queue_locked(
         state: &mut State,
         key: &str,
@@ -2119,11 +2119,11 @@ impl DefaultMQPushConsumer {
         revoked: &mut Vec<(MessageQueue, Option<i64>)>,
         pop: bool,
     ) {
-        state.queue_owners.remove(key); // 循环内下一轮 owns_queue 失效
+        state.queue_owners.remove(key); // the next round inside the loop sees owns_queue as invalid
         state.pending.remove(key);
         state.inflight_msgs.remove(key);
         state.lock_ok.remove(key);
-        state.last_pull_at.remove(key); // 同名队列复用时不能继承旧时刻
+        state.last_pull_at.remove(key); // a reused queue name must not inherit the old timestamp
         *state.queue_epoch.entry(key.to_string()).or_insert(0) += 1;
         let off = state.consume_offsets.remove(key);
         state.offset_table.remove(key);
@@ -2142,16 +2142,16 @@ impl DefaultMQPushConsumer {
         revoke_queues(&self.inner, revoked).await;
     }
 
-    /// broker 通知消费组实例变化（响应码 40）→ 请求立刻重平衡。
+    /// The broker signals that the consumer group's instances changed (response code 40) -> request an immediate rebalance.
     fn request_rebalance(&self) {
         self.inner.rebalance_now.store(true, Ordering::SeqCst);
         self.inner.rebalance_signal.notify_waiters();
     }
 }
 
-// ---------------- 位点解析 ----------------
+// ---------------- Offset resolution ----------------
 
-/// 自由函数：拉取循环只持有 `Arc<Inner>`（结构取舍 4），拿不到消费者句柄。
+/// Free function: the pull loop only holds `Arc<Inner>` (structural trade-off 4) and cannot reach the consumer handle.
 async fn resolve_initial_offset(
     inner: &Inner,
     client: &MQClientInstance,
@@ -2160,7 +2160,7 @@ async fn resolve_initial_offset(
 ) -> Result<i64> {
     let cfg = read_cfg(inner);
     if sub.expression_type == ExpressionType::SQL92 {
-        // SQL 过滤无 offset 语义，默认最新
+        // SQL filtering has no offset semantics, so default to the latest
         return client.get_max_offset(mq, 5000, None).await;
     }
     let key = mq_key(mq);
@@ -2195,9 +2195,9 @@ async fn resolve_initial_offset(
     client.get_max_offset(mq, 5000, None).await
 }
 
-// ---------------- 队列撤销与位点纠错 ----------------
+// ---------------- Queue revocation and offset correction ----------------
 
-/// 自由函数（与下面的 `handle_offset_illegal` 同一理由）：拉取循环只持有 `Arc<Inner>`。
+/// Free function (same reason as `handle_offset_illegal` below): the pull loop only holds `Arc<Inner>`.
 async fn revoke_queues(inner: &Arc<Inner>, revoked: &[(MessageQueue, Option<i64>)]) {
     if revoked.is_empty() {
         return;
@@ -2235,14 +2235,14 @@ async fn revoke_queues(inner: &Arc<Inner>, revoked: &[(MessageQueue, Option<i64>
     rmq_info!("queues revoked, group={group} count={}", revoked.len());
 }
 
-/// broker 说"你请求的位点非法"（队列被截断、commitlog 过期或被服务端重置，见
-/// `PullMessageProcessor` 对 OFFSET_OVERFLOW_BADLY / NO_MESSAGE_IN_QUEUE / OFFSET_RESET
-/// 一律回 `PULL_OFFSET_MOVED`），并把修正值放在 `nextBeginOffset` 里。纠错不只是把游标
-/// 拨过去：这条队列上**已经取回、还没消费/没 ack 的消息全部作废**（它们落在被跳过的区间
-/// 里，ack 它们会把位点推回非法值），然后按修正位点把队列重建。
+/// The broker says "the offset you requested is illegal" (the queue was truncated, the commitlog expired, or the server reset it; see
+/// `PullMessageProcessor`, which answers `PULL_OFFSET_MOVED` for OFFSET_OVERFLOW_BADLY / NO_MESSAGE_IN_QUEUE / OFFSET_RESET alike)
+/// and puts the corrected value in `nextBeginOffset`. Correcting is not just moving the cursor:
+/// **every message already fetched on this queue but not yet consumed/acked is voided** (they fall inside the skipped
+/// range, and acking them would push the offset back to an illegal value), then the queue is rebuilt at the corrected offset.
 ///
 ///
-/// 须在锁外调用：里面要做网络 RPC。调用点在拉取回调持锁块之后。
+/// Must be called without the lock: it performs network RPCs. The call sites sit after the locked block of the pull callback.
 async fn handle_offset_illegal(inner: &Arc<Inner>, key: &str) {
     let mut revoked: Vec<(MessageQueue, Option<i64>)> = Vec::new();
     {
@@ -2261,27 +2261,27 @@ async fn handle_offset_illegal(inner: &Arc<Inner>, key: &str) {
     rmq_warn!("the pull request offset illegal, fix it, queue={key}");
 }
 
-// ================================================================ 后台循环
+// ================================================================ Background loops
 //
-// 拆成自由函数而不是 `&self` 方法：任务只持 `Weak<Inner>`（结构取舍 4），
-// 否则 `实例 → 传输 → 任务 → 消费者` 成环，消费者永不释放。
+// Written as free functions instead of `&self` methods: tasks hold only `Weak<Inner>` (structural trade-off 4),
+// otherwise `instance -> transport -> task -> consumer` forms a cycle and the consumer is never released.
 
-/// `stop` 通道是否已置位（含发送端已释放）。
+/// Whether the `stop` channel is already set (including the sender having been released).
 fn stopped(rx: &watch::Receiver<bool>) -> bool {
     *rx.borrow() || rx.has_changed().is_err()
 }
 
-/// 等一个超时窗口：到点返回 false，收到停止信号返回 true。
+/// Wait for a timeout window: returns false when it elapses, returns true when a stop signal arrives.
 async fn wait_or_stop(rx: &mut watch::Receiver<bool>, millis: u64) -> bool {
     match tokio::time::timeout(Duration::from_millis(millis), rx.changed()).await {
         Ok(Ok(())) => stopped(rx),
-        // 发送端已释放（Inner 正在析构）= 立刻退出
+        // The sender was released (Inner is being dropped) = exit immediately
         Ok(Err(_)) => true,
         Err(_) => false,
     }
 }
 
-/// 本循环是否仍持有该队列。
+/// Whether this loop still owns the queue.
 fn owns_queue(inner: &Inner, key: &str, token: u64) -> bool {
     lock(&inner.state)
         .queue_owners
@@ -2289,11 +2289,11 @@ fn owns_queue(inner: &Inner, key: &str, token: u64) -> bool {
         .is_some_and(|t| *t == token)
 }
 
-/// 循环入口的两处盖章：`last_pull_table[key]` +
-/// `pq.last_pop_timestamp = now`：在**发起**本轮拉取/弹出前盖章。
+/// The two stamps at loop entry: `last_pull_table[key]` +
+/// `pq.last_pop_timestamp = now`, written **before** this round's pull/pop is initiated.
 ///
-/// POP 模式下两处时间一起写：`_last_pull_table` 供 rebalance 判停摆，
-/// [`PopProcessQueue::last_pop_timestamp`] 供 `ConsumerRunningInfo` 的运维视图。
+/// In POP mode both timestamps are written together: `_last_pull_table` lets rebalance judge stalls,
+/// [`PopProcessQueue::last_pop_timestamp`] feeds the operational view of `ConsumerRunningInfo`.
 fn stamp_pull_at(inner: &Inner, key: &str, pop: bool) {
     let now = current_time_millis();
     let pq = if pop {
@@ -2307,7 +2307,7 @@ fn stamp_pull_at(inner: &Inner, key: &str, pop: bool) {
     }
 }
 
-/// 拉取停摆判据：仍归本实例、但拉取循环已经停摆的队列。
+/// Pull-stall criterion: a queue that still belongs to this instance but whose pull loop has stalled.
 fn pull_stalled_locked(state: &State, key: &str, now: i64) -> bool {
     match state.last_pull_at.get(key) {
         None => false,
@@ -2316,9 +2316,9 @@ fn pull_stalled_locked(state: &State, key: &str, now: i64) -> bool {
     }
 }
 
-/// 拉取循环退出标记：循环**自己**退出时留下哨兵，
-/// 让下一轮 rebalance 把它当成停摆重建。仍在归属表里才写，否则说明已被撤走、
-/// 新属主已经接管，写 `0` 反而会误伤它。
+/// Pull loop exit marker: the loop leaves a sentinel when **it** exits,
+/// so the next rebalance round treats it as stalled and rebuilds it. It is written only while the queue is still in the ownership table;
+/// otherwise the queue was revoked and a new owner took over, and writing `0` would wrongly harm that owner.
 fn mark_pull_loop_exited(inner: &Inner, key: &str, token: u64) {
     let mut state = lock(&inner.state);
     if state.queue_owners.get(key).is_some_and(|t| *t == token) {
@@ -2348,13 +2348,13 @@ fn update_pull_from_which_node(state: &mut State, mq: &MessageQueue, suggest: Op
         .insert(mq.clone(), suggest.unwrap_or(MixAll::MASTER_ID as i64));
 }
 
-/// 单队列长轮询拉取 → 推入待消费缓冲。
+/// One queue's long-polling pull -> push into the to-consume buffer.
 ///
-/// 每队列一个循环（不是共享线程池），因为 broker 为每个队列各挂起一个长轮询；
-/// 共用一个循环会让空队列的 ~15s 挂起阻塞其余队列的投递。
+/// One loop per queue (not a shared thread pool), because the broker suspends a separate long poll per queue;
+/// sharing one loop would let an empty queue's ~15s suspension block delivery for all the other queues.
 ///
-/// 这层壳只负责收尾：任务体无论从哪里 `return`，只要还占着归属就留下停摆哨兵，
-/// 下一轮 rebalance 会重建它（tokio 任务没有 `thread.is_alive()` 这种问法）。
+/// This shell only handles the wrap-up: wherever the task body `return`s, it leaves a stall sentinel as long as it still
+/// owns the queue, and the next rebalance round rebuilds it (tokio tasks have no equivalent of `thread.is_alive()`).
 async fn queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
     let key = mq_key(&mq);
     run_queue_pull_loop(inner.clone(), mq, token).await;
@@ -2384,7 +2384,7 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
         let orderly = lock(&inner.listener)
             .as_ref()
             .is_some_and(MessageListener::is_orderly);
-        // 顺序消费：broker 未确认锁定（LOCK_BATCH_MQ）的队列不拉取
+        // Orderly consumption: do not pull a queue the broker has not confirmed as locked (LOCK_BATCH_MQ)
         if orderly && !lock(&inner.state).lock_ok.contains(&key) {
             if wait_or_stop(&mut rx, 200).await {
                 return;
@@ -2444,8 +2444,8 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
         {
             Ok(r) => r,
             Err(e) => {
-                // 长轮询在 suspend 期间无新消息触发客户端超时属**正常行为**：broker 把
-                // 挂起时长钳制到自己的 brokerSuspendMaxTimeMillis，空闲队列会周期性超时。
+                // A client-side timeout while long polling in suspend with no new message is **normal behaviour**: the broker clamps the
+                // suspend duration to its own brokerSuspendMaxTimeMillis, so an idle queue times out periodically.
                 let benign = matches!(e, Error::Timeout { .. } | Error::TooMuchRequest(_));
                 if benign {
                     rmq_debug!("pull long-poll timeout for {mq:?} (benign, will retry): {e}");
@@ -2462,7 +2462,7 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
                     } => PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL,
                     _ => PULL_TIME_DELAY_MILLS_WHEN_EXCEPTION,
                 };
-                // 其余多为 topic 尚未创建等预期路径：debug + 短暂退避，避免热循环
+                // Most of the rest are expected paths such as the topic not existing yet: debug plus a short backoff keeps the loop from spinning hot
                 rmq_debug!("pull error for {mq:?}: {e}");
                 if wait_or_stop(&mut rx, delay).await {
                     return;
@@ -2537,7 +2537,7 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
                 );
             }
         }
-        // update_msg_acc_cnt 自己取同一把锁，必须在上面释放之后调用。
+        // update_msg_acc_cnt takes the same lock itself, so it must be called after the block above releases it.
         update_msg_acc_cnt(&inner, &key, &msgs);
         if illegal {
             handle_offset_illegal(&inner, &key).await;
@@ -2633,8 +2633,8 @@ fn flow_control_hit(inner: &Inner, mq: &MessageQueue, key: &str) -> bool {
 
 static EMPTY_DEQUE: VecDeque<MessageExt> = VecDeque::new();
 
-/// 启动 60s 内且当前没有任何分配时缩短为 2s：消费者可能先于 topic 创建而启动
-/// （`autoCreateTopicEnable` 下 topic 由生产者首次发送时建），死等 20s 会长时间不消费。
+/// Within 60s of start-up and with no assignment at all, this shortens to 2s: the consumer may start before the topic is created
+/// (under `autoCreateTopicEnable` the topic is created by the producer's first send), and waiting out 20s would mean not consuming for a long time.
 async fn rebalance_loop(consumer: DefaultMQPushConsumer, rx: watch::Receiver<bool>) {
     let mut ticker = tokio::time::interval(Duration::from_millis(500));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -2663,8 +2663,8 @@ async fn rebalance_loop(consumer: DefaultMQPushConsumer, rx: watch::Receiver<boo
     }
 }
 
-/// 发一轮心跳（`heartbeat_loop` 的周期心跳、`send_heartbeat_to_all_broker` 的显式调用、
-/// 以及 `subscribe` 之后的立即心跳共用），返回成功的 broker 台数。
+/// Send one heartbeat round (shared by the periodic heartbeat of `heartbeat_loop`, the explicit
+/// `send_heartbeat_to_all_broker` call, and the immediate heartbeat after `subscribe`), returning the number of brokers that succeeded.
 async fn heartbeat_once(inner: &Arc<Inner>) -> usize {
     let Ok(client) = require_client(inner) else {
         return 0;
@@ -2676,8 +2676,8 @@ async fn heartbeat_once(inner: &Arc<Inner>) -> usize {
     ok
 }
 
-/// 心跳循环：消费者**必须**注册到 broker，否则重平衡的
-/// GET_CONSUMER_LIST_BY_GROUP 拿不到列表）。
+/// Heartbeat loop: the consumer **must** be registered on the broker, otherwise rebalance's
+/// GET_CONSUMER_LIST_BY_GROUP cannot get the list.
 async fn heartbeat_loop(inner: Arc<Inner>, mut rx: watch::Receiver<bool>) {
     loop {
         let interval = read_cfg(&inner).heartbeat_interval_millis.max(1000) as u64;
@@ -2723,7 +2723,7 @@ async fn lock_loop(inner: Arc<Inner>, mut rx: watch::Receiver<bool>) {
     }
 }
 
-/// 串行地把各队列缓冲里的批次交给监听器消费。
+/// Hand the batches in each queue buffer to the listener sequentially.
 async fn dispatch_loop(inner: Arc<Inner>, mut rx: watch::Receiver<bool>) {
     loop {
         if stopped(&rx) || !inner.started.load(Ordering::Acquire) {
@@ -2754,8 +2754,8 @@ async fn dispatch_loop(inner: Arc<Inner>, mut rx: watch::Receiver<bool>) {
                     let batch: Vec<MessageExt> = dq.drain(..n).collect();
                     batch
                 };
-                // 与"取走批次"同一临界区登记在途：correct_tags_offset_locked 的闸门靠它
-                // 区分"消息还在缓冲里"和"消息在 listener 手里"——两个都不算空。
+                // Registered as in-flight in the same critical section as "taking the batch": the gate in correct_tags_offset_locked relies on it
+                // to tell "messages still in the buffer" from "messages in the listener's hands" -- neither counts as empty.
                 *state.inflight.entry(key.clone()).or_insert(0) += 1;
                 let epoch = state.queue_epoch.get(&key).copied().unwrap_or(0);
                 (mq, batch, epoch)
@@ -2780,7 +2780,7 @@ async fn dispatch_loop(inner: Arc<Inner>, mut rx: watch::Receiver<bool>) {
             match outcome {
                 Ok(done) => progressed = progressed || done,
                 Err(e) => {
-                    // 分发路径意外异常：批次塞回队首，稍后重试（不能杀死分发任务）
+                    // Unexpected exception on the dispatch path: push the batch back to the head of the queue and retry later (it must not kill the dispatch task)
                     rmq_error!("dispatch batch error (will retry): {e}");
                     {
                         let mut state = lock(&inner.state);
@@ -2803,7 +2803,7 @@ async fn dispatch_loop(inner: Arc<Inner>, mut rx: watch::Receiver<bool>) {
 }
 
 impl DefaultMQPushConsumer {
-    /// 起全部后台循环。
+    /// Start all background loops.
     fn spawn_loops(&self) {
         let Some(handle) = self.runtime_handle() else {
             rmq_warn!("consumer: no tokio runtime, background loops disabled");
@@ -2824,9 +2824,9 @@ impl DefaultMQPushConsumer {
         let tasks = &mut *lock(&self.inner.tasks);
         tasks.push(spawn_loop!(heartbeat_loop));
         tasks.push(spawn_loop!(lock_loop));
-        // 分发与重平衡：重平衡需要句柄（要起每队列循环），单独用消费者克隆体。
-        // 分发循环不进 tasks（停机不能 abort 它 —— 它可能正带着在途回投 RPC），
-        // 单独登记进 dispatch_task，停机时由收尾任务有界等待。
+        // Dispatch and rebalance: rebalance needs the handle (it starts the per-queue loops), so it uses a clone of the consumer.
+        // The dispatch loop does not go into tasks (shutdown must not abort it -- it may be holding an in-flight send-back RPC),
+        // and is registered separately in dispatch_task so the finalize task waits for it within a bound.
         let consumer = self.clone();
         let rx = self.inner.stop.subscribe();
         tasks.push(handle.spawn(async move { rebalance_loop(consumer, rx).await }));
@@ -2840,7 +2840,7 @@ impl DefaultMQPushConsumer {
     }
 }
 
-/// 停机位点持久化清单：`consume_offsets` 与「仍未落定消息的最小 queueOffset」取小。
+/// Offset persistence list for shutdown: the smaller of `consume_offsets` and "the minimum queueOffset among messages still unsettled".
 fn shutdown_persist_items(inner: &Inner) -> Vec<(MessageQueue, i64)> {
     let state = lock(&inner.state);
     state
@@ -2861,7 +2861,7 @@ fn shutdown_persist_items(inner: &Inner) -> Vec<(MessageQueue, i64)> {
         .collect()
 }
 
-/// 位点持久化一轮（集群模式刷 broker / 广播模式刷本地）。
+/// One round of offset persistence (cluster mode flushes to the broker / broadcasting mode flushes locally).
 async fn persist_offsets_once(inner: &Arc<Inner>, client: &MQClientInstance) {
     let cfg = read_cfg(inner);
     if cfg.message_model == MessageModel::BROADCASTING {
@@ -2944,8 +2944,8 @@ fn parse_local_offsets_text(text: &str) -> Option<BTreeMap<String, i64>> {
     )
 }
 
-/// 无 regex crate，手写扫描器：`{"offsetTable":{{...}:9,...}}`（容忍 fastjson2
-/// pretty 版的换行缩进）。返回 `(topic, brokerName, queueId, offset)` 列表。
+/// No regex crate, so a hand-written scanner: `{"offsetTable":{{...}:9,...}}` (tolerant of the newline/indent
+/// of the fastjson2 pretty version). Returns a list of `(topic, brokerName, queueId, offset)`.
 fn scan_offset_store_entries(text: &str) -> Option<Vec<(String, String, i32, i64)>> {
     struct Scanner<'a> {
         b: &'a [u8],
@@ -3096,7 +3096,7 @@ fn scan_offset_store_entries(text: &str) -> Option<Vec<(String, String, i32, i64
         }
         return None;
     }
-    // 表收尾后还有 wrapper 本身的 `}`（{"offsetTable":{...}} 两层括号）
+    // After the table ends there is still the wrapper's own `}` ({"offsetTable":{...}} has two brace levels)
     if !s.eat(b'}') {
         return None;
     }
@@ -3111,7 +3111,7 @@ fn save_local_offsets(inner: &Inner) -> Result<()> {
     save_local_offsets_with(inner, &[])
 }
 
-/// `save_local_offsets` 加"刚被撤下来、已不在 `consume_offsets`/`mq_map` 里的队列位点"。
+/// `save_local_offsets` plus "the offsets of queues just revoked, no longer present in `consume_offsets`/`mq_map`".
 fn save_local_offsets_with(inner: &Inner, extra: &[(MessageQueue, Option<i64>)]) -> Result<()> {
     let Some(path) = local_offset_path(inner) else {
         return Err(Error::client("HOME is not set, cannot store local offsets"));
@@ -3124,10 +3124,10 @@ fn save_local_offsets_with(inner: &Inner, extra: &[(MessageQueue, Option<i64>)])
     save_local_offsets_at(&path, &items, &mq_map)
 }
 
-/// 把刚撤下来（已不在 `consume_offsets`/`mq_map` 里）的队列位点并进要落盘的快照。
+/// Merge the offsets of just-revoked queues (no longer in `consume_offsets`/`mq_map`) into the snapshot being flushed.
 ///
-/// 队列信息也要补进 `mq_map`：`build_local_offsets_json` 查不到队列就跳过该条目，
-/// 只并位点等于没并。
+/// The queue info must be added to `mq_map` too: `build_local_offsets_json` skips an entry whose queue it cannot find,
+/// so merging only the offsets would be the same as merging nothing.
 fn merge_retired_offsets(
     items: &mut BTreeMap<String, i64>,
     mq_map: &mut BTreeMap<String, MessageQueue>,
@@ -3160,8 +3160,8 @@ fn save_local_offsets_at(
     Ok(())
 }
 
-/// 主文件缺失/损坏时回退 `.bak`，都失败当「没有
-/// 本地位点」。
+/// When the main file is missing or corrupt, fall back to `.bak`; if both fail, treat it as "there are
+/// no local offsets".
 fn load_local_offsets(inner: &Inner) -> BTreeMap<String, i64> {
     let Some(path) = local_offset_path(inner) else {
         return BTreeMap::new();
@@ -3181,10 +3181,10 @@ fn load_local_offsets_at(path: &std::path::Path) -> BTreeMap<String, i64> {
     BTreeMap::new()
 }
 
-// ================================================================ POP 消费
+// ================================================================ POP consumption
 
-/// 独立成函数是因为漏记是**静默**故障：消息照弹照 ack、消费完全正常，只有 307
-/// 状态表（运维看板）上一片 0 —— 而"这个消费者没在拉取"和"压根没起来"是两种处置。
+/// Split into its own function because a missed record is a **silent** failure: messages keep popping and acking, consumption looks perfectly
+/// normal, and only the 307 status table (the operations dashboard) shows a field of zeros -- while "this consumer is not pulling" and "it never started at all" call for different responses.
 fn record_pop_pull_stats(
     stats: &ConsumerStatsManager,
     group: &str,
@@ -3205,8 +3205,8 @@ fn record_pop_pull_stats(
     }
 }
 
-/// 与拉取路径的关键差别：**不查也不提交消费位点**（进度由 broker 侧 checkpoint
-/// 跟踪，确认只靠 ack）；弹出即投递给消费线程；`POLLING_NOT_FOUND` 是正常态。
+/// The key difference from the pull path: **neither query nor commit a consume offset** (progress is tracked by the
+/// broker-side checkpoint and confirmation relies only on ack); a pop delivers straight to the consume thread; `POLLING_NOT_FOUND` is a normal state.
 async fn queue_pop_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
     let key = mq_key(&mq);
     run_queue_pop_loop(inner.clone(), mq, token).await;
@@ -3314,8 +3314,8 @@ async fn run_queue_pop_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
             return;
         }
         pq.touch(current_time_millis());
-        // 拉取统计：与 pull 路径同一份状态表，POP 模式才有；放在撤队列早退之后，
-        // 已丢弃的那一批不进统计（那批消息压根没投递）。
+        // Pull statistics: the same status table as the pull path, POP mode only; placed after the queue-revoked early exit so
+        // the discarded batch is not counted (those messages were never delivered).
         if let Some(stats) = lock(&inner.stats).clone() {
             let group = read_cfg(&inner).consumer_group;
             record_pop_pull_stats(&stats, &group, &mq.topic, &result, began);
@@ -3353,7 +3353,7 @@ async fn run_queue_pop_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
                 submit_pop_consume_request(&inner, kept, pq.clone(), mq.clone()).await;
             }
         } else if current_time_millis() - began < 200 {
-            // 空结果：broker 没按 poll_time 挂起（立即返回）会变成热循环，兜底退避
+            // Empty result: if the broker did not suspend for poll_time (returning immediately) this would become a hot loop, so fall back to a backoff
             if wait_or_stop(&mut rx, 200).await {
                 return;
             }
@@ -3399,7 +3399,7 @@ async fn submit_pop_consume_request(
                     rmq_debug!("pop executor submit failed: {e}");
                 }
             }
-            // 未起执行器（单测或未 start）：就地同步执行，不丢批次
+            // No executor started (unit tests or not started): run the batch synchronously in place, never dropping it
             None => consume_pop_batch(inner.clone(), batch, pq, mq).await,
         }
     }
@@ -3433,7 +3433,7 @@ async fn submit_pop_orderly_request(
                 rmq_error!("error submit pop orderly request: {e}, mq: {mq:?}");
             }
         }
-        // 未起执行器（单测或未 start）：同步执行，与并发路径一致
+        // No executor started (unit tests or not started): run synchronously, as on the concurrent path
         None => run_pop_orderly_request(inner.clone(), pq, mq).await,
     }
 }
@@ -3467,7 +3467,7 @@ async fn consume_pop_batch(
         None => rmq_debug!("message without POP_CK, treat as timed out"),
     }
     if is_pop_timeout(&msgs, pop_time, invisible) {
-        // 已经超过 invisibleTime：ack 也不会被承认，直接放弃本批（等 broker 复活重投）
+        // Already past invisibleTime: an ack would not be accepted either, so abandon this batch outright (wait for the broker to revive and redeliver)
         rmq_debug!(
             "pop timeout, abort consume for {mq:?}: popTime={pop_time} invisible={invisible}"
         );
@@ -3520,7 +3520,7 @@ async fn consume_pop_batch(
             succeeded,
         );
     }
-    // 消费期间队列被撤走或已超时：结果不再处理
+    // The queue was revoked or the batch already timed out while consuming: the result is no longer processed
     if pq.is_dropped() || is_pop_timeout(&msgs, pop_time, invisible) {
         pq.dec_found_msg(i32::try_from(msgs.len()).unwrap_or(i32::MAX));
         return;
@@ -3549,12 +3549,12 @@ async fn process_pop_consume_result(
             ack_index = len - 1;
         }
     } else {
-        // RECONSUME_LATER：一条都不 ack
+        // RECONSUME_LATER: ack nothing
         ack_index = -1;
     }
-    // `acked` 既是「前 acked 条成功、逐条 ack」的边界，也是第二批逐条 ack
-    // 的起点：ack_index == -1 时它是 0，
-    // 剩下的每一条仍要 pq.ack() 并延长不可见时间。
+    // `acked` is both the "the first `acked` messages succeeded, ack them one by one" boundary and the
+    // start point of the second pass of per-message acks: when ack_index == -1 it is 0,
+    // and every remaining message still needs pq.ack() plus an invisible-time extension.
     let acked = if ack_index >= 0 {
         usize::try_from(ack_index).unwrap_or(0) + 1
     } else {
@@ -3575,7 +3575,7 @@ async fn process_pop_consume_result(
     }
 }
 
-/// 重试次数用尽后的兜底。
+/// The fallback once the retry budget is exhausted.
 fn check_need_ack_or_delay(inner: &Inner, msg: &MessageExt, cfg: &ConsumerConfig) {
     let table = &cfg.pop_delay_level;
     let Some((last_second,)) = table.last().map(|v| (*v,)) else {
@@ -3601,11 +3601,11 @@ fn check_need_ack_or_delay(inner: &Inner, msg: &MessageExt, cfg: &ConsumerConfig
     change_pop_invisible_time(inner, msg, level, cfg);
 }
 
-/// 从 POP_CK 解出 ack/延长不可见时间需要的五元组。
+/// Decode the five-tuple needed for ack / invisible-time extension out of POP_CK.
 ///
-/// 两处都不能想当然：① topic 要按 CK 的 retryFlag 用 `getRealTopic` 还原（复活消息的
-/// 真实 topic 是 `%RETRY%<group>_<topic>`，不是消息上的 topic）；② 地址要按 CK 里的
-/// brokerName 反查，不能按 topic 查路由（retry topic 通常没有独立路由表项）。
+/// Neither place may be assumed: (1) the topic must be restored with `getRealTopic` using the CK's retryFlag (the real
+/// topic of a revived message is `%RETRY%<group>_<topic>`, not the topic on the message); (2) the address must be looked up by the
+/// brokerName inside the CK, not by asking for the topic's route (a retry topic usually has no route entry of its own).
 fn pop_ck_target(inner: &Inner, msg: &MessageExt) -> Option<(String, String, i32, i64, String)> {
     let ck = msg.get_property(PROPERTY_POP_CK)?;
     if ck.is_empty() {
@@ -3628,9 +3628,9 @@ fn pop_ck_target(inner: &Inner, msg: &MessageExt) -> Option<(String, String, i32
     Some((topic, broker_name, queue_id, offset, ck.to_string()))
 }
 
-/// ⚠ ack 是 RPC，这里刻意保持**同步语义**的调用点（过滤摘除路径）由调用方在
-/// async 上下文里 `let _ =` 掉：ack 失败不致命，消息会在 invisibleTime 到期后复活重投。
-/// 为了让上层三种调用形状都能用，这里提供阻塞无关的「发任务」实现。
+/// ⚠ ack is an RPC, and the call sites that deliberately keep **synchronous semantics** (the filter-removal path) simply `let _ =` it
+/// in an async context: an ack failure is not fatal, since the message revives for redelivery when invisibleTime expires.
+/// To serve all three caller shapes, this provides a blocking-agnostic "queue the task" implementation.
 fn ack_pop_msg(inner: &Inner, msg: &MessageExt) {
     let Some((topic, broker_name, queue_id, offset, ck)) = pop_ck_target(inner, msg) else {
         return;
@@ -3675,8 +3675,8 @@ fn ack_pop_msg(inner: &Inner, msg: &MessageExt) {
     });
 }
 
-/// `delay_level == 0` 时用消息已重试次数当档位；
-/// 档位表单位是**秒**，接口要毫秒。
+/// With `delay_level == 0` the message's already-retried count is used as the level;
+/// the level table is in **seconds** while the interface wants milliseconds.
 fn change_pop_invisible_time(
     inner: &Inner,
     msg: &MessageExt,
@@ -3741,10 +3741,10 @@ fn change_pop_invisible_time(
     });
 }
 
-// ================================================================ 消费与钩子
+// ================================================================ Consume and hooks
 
-/// 重投消息实际存在 `%RETRY%<group>` 下，broker 把原始 topic 写进 `RETRY_TOPIC` 属性；
-/// 不还原的话用户按 topic 分支的代码会走错。
+/// Redelivered messages actually live under `%RETRY%<group>`, and the broker writes the original topic into the `RETRY_TOPIC` property;
+/// without restoring it, user code branching on the topic goes down the wrong path.
 fn reset_retry_topic_and_namespace(inner: &Inner, msgs: &mut [MessageExt]) {
     let cfg = read_cfg(inner);
     let group_topic = MixAll::get_retry_topic(&cfg.consumer_group);
@@ -3774,10 +3774,10 @@ fn build_consume_hook_context(
     context
 }
 
-/// 消费返回类型（决定轨迹的 contextCode）。
+/// Consume return type (decides the trace's contextCode).
 ///
-/// 「是否成功」这个入参在这里用不到 —— 非 failed 的两种情况都返回 SUCCESS，
-/// 故本函数不收这个参数。
+/// The "whether successful" input is not needed here -- both non-failed cases return SUCCESS,
+/// so this function does not take that parameter.
 fn consume_return_type(
     status: Option<&str>,
     has_exception: bool,
@@ -3798,7 +3798,7 @@ fn consume_return_type(
     if failed {
         ConsumeReturnType::Failed
     } else {
-        // 两条分支同值，故合并
+        // Both branches yield the same value, so they are merged
         ConsumeReturnType::Success
     }
 }
@@ -3838,7 +3838,7 @@ fn record_consume_rt(inner: &Inner, topic: &str, begin_ms: i64) {
     stats.inc_consume_rt(&read_cfg(inner).consumer_group, topic, rt);
 }
 
-/// 把 returnType/status/success 写回上下文并触发 after 钩子。
+/// Write returnType/status/success back into the context and trigger the after hooks.
 #[allow(clippy::too_many_arguments)]
 fn finish_consume_hook(
     inner: &Inner,
@@ -3867,16 +3867,16 @@ fn finish_consume_hook(
     execute_consume_hook_after(&inner.consume_hooks, ctx);
 }
 
-/// 调并发监听器。返回 `(status, has_exception)`。
+/// Call the concurrent listener. Returns `(status, has_exception)`.
 ///
-/// 并发监听器调用的两处口径说明：
-/// 1. trait 的返回类型是非 Optional 的枚举，「监听器自己不返回状态」这种情况
-///    不可能出现；**没有设置监听器**时按「异常 → RECONSUME_LATER」处理，
-///    `status=None` 就是这条路径。
-/// 2. 监听器是用户代码，可能阻塞。这里放进
-///    `spawn_blocking`：分发循环仍然是「等这一批消费完才继续」的串行语义，
-///    但不会占住 tokio 的 worker 线程。监听器 panic 会被
-///    `JoinError` 捕获，语义正好等于「抛异常 → RECONSUME_LATER」。
+/// Two conventions of the concurrent listener call:
+/// 1. The trait's return type is a non-Optional enum, so "the listener itself returns no status"
+///    cannot happen; when **no listener is set** it is handled as "exception -> RECONSUME_LATER",
+///    and `status=None` is exactly that path.
+/// 2. The listener is user code and may block. It is put into
+///    `spawn_blocking` here: the dispatch loop keeps the sequential "wait for this batch to finish before continuing" semantics,
+///    but does not occupy a tokio worker thread. A listener panic is captured as a
+///    `JoinError`, which is precisely "threw an exception -> RECONSUME_LATER".
 async fn call_concurrently_listener(
     inner: &Arc<Inner>,
     msgs: &[MessageExt],
@@ -3885,7 +3885,7 @@ async fn call_concurrently_listener(
     let listener = match lock(&inner.listener).as_ref().cloned() {
         Some(MessageListener::Concurrently(l)) => l,
         Some(MessageListener::Orderly(_)) => {
-            // 顺序监听器 + 并发调用：调用方已按监听器类型分流，不会走到这里
+            // Orderly listener called on the concurrent path: callers dispatch by listener type, so this is unreachable
             return (None, true);
         }
         None => return (None, true),
@@ -3909,7 +3909,7 @@ async fn call_concurrently_listener(
     }
 }
 
-/// 调顺序监听器（同上，返回 `(status, has_exception)`）。
+/// Call the orderly listener (same as above, returning `(status, has_exception)`).
 async fn call_orderly_listener(
     inner: &Arc<Inner>,
     msgs: &[MessageExt],
@@ -3938,7 +3938,7 @@ async fn call_orderly_listener(
     }
 }
 
-/// 消费一个批次并处理回投/挂起，返回位点是否前进。
+/// Consume one batch and handle send-back/suspension, returning whether the offset advanced.
 async fn consume_batch(
     inner: &Arc<Inner>,
     key: &str,
@@ -3978,7 +3978,7 @@ async fn consume_batch(
             execute_consume_hook_before(&inner.consume_hooks, ctx);
         }
         let begin_ms = current_time_millis();
-        // `raw_status` 为 None 只可能是 listener 抛异常（call_orderly_listener 的 join 失败）
+        // `raw_status` being None can only mean the listener threw (the join of call_orderly_listener failed)
         let (raw_status, has_exception) = call_orderly_listener(inner, &batch, &mut ocontext).await;
         if matches!(
             raw_status,
@@ -4083,16 +4083,16 @@ async fn consume_batch(
         inner, key, mq, &batch, epoch, &cfg, broadcast, hook_ctx, begin_ms,
     )
     .await;
-    // 正常收尾（含回投失败回塞、被清扫摘除）后这批不再「在 listener 手里」；
-    // 被清扫/回塞提前摘过的条目在这里是幂等的。
+    // Normal wrap-up (including re-queueing after send-back failure and removal by the sweep) leaves this batch no longer "in the listener's hands";
+    // entries already removed early by the sweep / re-queue are handled idempotently here.
     deregister_inflight_msgs(inner, key, &batch);
     result
 }
 
-/// 从 [`consume_batch`] 拆出来只为把「登记在途 → 消费 → 注销在途」围成一段：
-/// 并发分支有一堆提前返回（整批认可、广播丢弃、回投失败……），登记表摘不干净的话
-/// 位点会被 `correct_tags_offset_locked` 的在途闸门永久挡停。before 钩子与
-/// `begin_ms` 由调用方做（要在盖章/登记之前），这里只负责 listener 与其后的收尾。
+/// Split out of [`consume_batch`] only to wrap "register in-flight -> consume -> deregister in-flight" in one span:
+/// the concurrent branch has a pile of early returns (whole batch acknowledged, broadcasting drop, send-back failure, ...), and if the
+/// registration table is not cleaned, the offset is blocked forever by the in-flight gate of `correct_tags_offset_locked`. The before hooks and
+/// `begin_ms` are done by the caller (they must precede the stamping/registration), so only the listener and what follows live here.
 #[allow(clippy::too_many_arguments)]
 async fn consume_concurrent_batch(
     inner: &Arc<Inner>,
@@ -4117,7 +4117,7 @@ async fn consume_concurrent_batch(
     let failed = matches!(raw_status, Some(ConsumeConcurrentlyStatus::ReconsumeLater))
         || raw_status.is_none();
     let succeeded = matches!(raw_status, Some(ConsumeConcurrentlyStatus::ConsumeSuccess));
-    // 钩子/统计仍看**原始**返回值（None 要记 RETURNNULL），ackIndex 判定才归一化。
+    // Hooks and statistics still see the **raw** return value (None must record RETURNNULL); only the ackIndex decision is normalized.
     let status = raw_status.unwrap_or(ConsumeConcurrentlyStatus::ReconsumeLater);
     let batch_len = i32::try_from(batch.len()).unwrap_or(i32::MAX);
     let mut ack_index = context.ack_index;
@@ -4157,12 +4157,12 @@ async fn consume_concurrent_batch(
         return Ok(true);
     }
     if acked >= batch.len() {
-        // 整批认可（默认路径）：什么都不用回投，位点直接前进
+        // Whole batch acknowledged (the default path): nothing to send back, the offset advances directly
         advance_consume_offset(inner, key, batch, None, epoch);
         return Ok(true);
     }
-    // 集群模式：未认可的 [acked..) 逐条回投 %RETRY%topic（延迟档位 3+reconsumeTimes；
-    // 超限由 broker 转 %DLQ%）
+    // Cluster mode: the unacknowledged [acked..) are sent back one by one to %RETRY%topic (delay level 3+reconsumeTimes;
+    // beyond the limit the broker moves them to %DLQ%)
     let msg_back_failed = send_back_batch(
         inner,
         key,
@@ -4230,8 +4230,8 @@ async fn send_back_batch(
     failed
 }
 
-/// 取本批最大 queueOffset + 1，且**不回退**。
-/// `floor` 是「不能越过的位点」（回投失败被塞回队首的那几条里最小的 offset）。
+/// Take this batch's maximum queueOffset + 1, and **never move backwards**.
+/// `floor` is "the offset that must not be crossed" (the smallest offset among the messages pushed back to the head of the queue after send-back failed).
 fn advance_consume_offset(
     inner: &Inner,
     key: &str,
@@ -4248,7 +4248,7 @@ fn advance_consume_offset(
         return;
     }
     if batch.is_empty() {
-        // 整批回投都失败时没有任何条目被认可，位点原地不动
+        // When every message of the batch failed to send back, no entry was acknowledged, so the offset stays put
         return;
     }
     let mut next_off = batch.iter().map(|m| m.queue_offset).max().unwrap_or(0) + 1;
@@ -4271,7 +4271,7 @@ fn requeue_pending(inner: &Inner, key: &str, batch: &[MessageExt]) {
 }
 
 
-/// 把这一批登记进「在 listener 手里」的视图（须与 [`deregister_inflight_msgs`] 成对）。
+/// Register this batch into the "in the listener's hands" view (must pair with [`deregister_inflight_msgs`]).
 fn register_inflight_msgs(inner: &Inner, key: &str, batch: &[MessageExt]) {
     if batch.is_empty() {
         return;
@@ -4284,7 +4284,7 @@ fn register_inflight_msgs(inner: &Inner, key: &str, batch: &[MessageExt]) {
         .extend(batch.iter().cloned());
 }
 
-/// 把这批消息从「在 listener 手里」的视图摘除（按位点，幂等）。
+/// Remove this batch of messages from the "in the listener's hands" view (by offset, idempotent).
 fn deregister_inflight_msgs(inner: &Inner, key: &str, batch: &[MessageExt]) {
     if batch.is_empty() {
         return;
@@ -4300,8 +4300,8 @@ fn deregister_inflight_msgs(inner: &Inner, key: &str, batch: &[MessageExt]) {
     }
 }
 
-/// 配对操作（登记/摘除、塞回缓冲）都在 `state` 锁内成对完成，一条消息在同一瞬间只会
-/// 出现在一边；这里按位点再去一次重只为防御未来新调用点写出重叠。
+/// The paired operations (register/remove, push back into the buffer) both complete inside the `state` lock, so at any instant a message
+/// appears on only one side; the extra dedup by offset here is purely defensive against future call sites producing overlap.
 fn process_queue_entries_locked(state: &State, key: &str) -> Vec<MessageExt> {
     let mut seen: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
     let mut out: Vec<MessageExt> = Vec::new();
@@ -4325,7 +4325,7 @@ fn process_queue_first_entry_locked(state: &State, key: &str) -> Option<MessageE
         .min_by_key(|m| m.queue_offset)
 }
 
-/// 被 cleanExpiredMsg 清扫掉的不算（它已经在回 broker 的路上）。
+/// Anything swept by cleanExpiredMsg does not count (it is already on its way back to the broker).
 fn process_queue_contains_locked(state: &State, key: &str, queue_offset: i64) -> bool {
     state
         .inflight_msgs
@@ -4336,11 +4336,11 @@ fn process_queue_contains_locked(state: &State, key: &str, queue_offset: i64) ->
         .any(|m| m.queue_offset == queue_offset)
 }
 
-/// 摘除刚清扫过的那条（调用方已确认它就是队首）。须持 `state` 锁。
+/// Remove the entry just swept (the caller has confirmed it is the queue head). `state` lock held.
 ///
-/// 两边都摘：正常情况下它只在一边；并发路径「回投失败塞回缓冲」与「收尾摘除登记」
-/// 之间有一瞬两边都在，从两处一起摘掉才能保证下轮清扫不会再看见它。缓冲侧按位点扫，
-/// 不是只看队首 —— 回投失败的条目是 `push_front` 进去的，缓冲不一定严格按位点排序。
+/// Removed from both sides: normally the entry sits on only one of them; between the concurrent
+/// "failed redelivery requeued into the buffer" and "finish-time deregistration" paths there is a
+/// moment when it is on both, so dropping it from both places is what keeps the next sweep from seeing it again. The buffer side is scanned by offset, not head-only -- entries requeued after a failed redelivery arrive via `push_front`, so the buffer is not necessarily ordered strictly by offset.
 fn remove_process_queue_entry_locked(state: &mut State, key: &str, queue_offset: i64) {
     if let Some(bucket) = state.inflight_msgs.get_mut(key) {
         bucket.retain(|m| m.queue_offset != queue_offset);
@@ -4353,9 +4353,9 @@ fn remove_process_queue_entry_locked(state: &mut State, key: &str, queue_offset:
     }
 }
 
-/// 「仍是队首」这一问不能省：listener 恰好在此期间正常收尾（消息已被
-/// `deregister_inflight_msgs` 摘掉），或前面冒出了更小的位点（回投失败塞回的条目），
-/// 都该让位给正常路径 —— 抢摘会把不该动的那条从视图里抹掉。须持 `state` 锁。
+/// The "is still the head" question cannot be skipped: if the listener happens to finish normally
+/// during this window (the message already removed by `deregister_inflight_msgs`), or a smaller
+/// offset surfaces ahead (an entry requeued after a failed redelivery), both must yield to the normal path -- a preemptive removal would erase from the view an entry that should not have been touched. `state` lock held.
 fn remove_expired_entry_if_still_head(state: &mut State, key: &str, queue_offset: i64) -> bool {
     let still_head = process_queue_first_entry_locked(state, key)
         .is_some_and(|m| m.queue_offset == queue_offset);
@@ -4385,7 +4385,7 @@ fn clean_expire_period_millis(consume_timeout_minutes: i64) -> u64 {
     u64::try_from(minutes).unwrap_or(u64::MAX / 60_000) * 60_000
 }
 
-/// 语义三件套：只看队首（最小位点）、单条判定严格大于 consumeTimeout、每轮最多 16 条。
+/// The semantic trio: inspect only the head (smallest offset), judge one message strictly greater than consumeTimeout, at most 16 messages per round.
 async fn clean_expired_queue(inner: &Arc<Inner>, key: &str) -> usize {
     if lock(&inner.listener)
         .as_ref()
@@ -4443,8 +4443,8 @@ async fn clean_expired_msg_once(inner: &Arc<Inner>) -> usize {
 }
 
 async fn clean_expire_loop(inner: Arc<Inner>, mut rx: watch::Receiver<bool>) {
-    // initialDelay 与 period 同值（都是 consumeTimeout 分钟），所以首轮清扫也要等满
-    // 一个周期 —— 立刻扫会把刚开始消费、还没超时的消息全看一遍（虽不会误伤，但没必要）。
+    // initialDelay equals the period (both are consumeTimeout minutes), so the first sweep also waits
+    // out a full cycle -- sweeping immediately would walk over every message that just started consuming and has not expired yet (harmless, but unnecessary).
     let period = clean_expire_period_millis(read_cfg(&inner).consume_timeout);
     if wait_or_stop(&mut rx, period).await {
         return;
@@ -4460,11 +4460,11 @@ async fn clean_expire_loop(inner: Arc<Inner>, mut rx: watch::Receiver<bool>) {
     }
 }
 
-/// 拉取应答是 `NO_NEW_MSG`（队列里真没消息）或 `NO_MATCHED_MSG`（broker 侧按订阅表达式
-/// 过完一轮、一条都没匹配上，见 `MQClientAPIImpl:1095-1097` 把 `PULL_RETRY_IMMEDIATELY`
-/// 映射成它）时，这条队列的「已消费位点」必须跟着拉取游标走，否则会**永久卡死**：
-/// 没人 ack 的消息不属于任何人（broker 侧被过滤掉的不在应答里，客户端二次 tag 过滤摘掉的
-/// 又明确不 ack），位点不动就永远停在原地，重投/重启后再把这批没人要的消息从头扫一遍。
+/// When the pull response is `NO_NEW_MSG` (the queue truly holds no messages) or `NO_MATCHED_MSG`
+/// (the broker ran one pass over the subscription expression and matched nothing; this crate maps
+/// the `PULL_RETRY_IMMEDIATELY` response code to that status in `client/mq_client.rs`), this queue's
+/// consumed offset must follow the pull cursor, otherwise it **stalls forever**: messages nobody acked
+/// belong to nobody (those filtered out broker-side are absent from the response, and those the client's second tag filter dropped are explicitly not acked), so an unmoved offset never advances and redelivery/restart scans this unwanted batch from its beginning.
 fn correct_tags_offset_locked(state: &mut State, key: &str, status: PullStatus, next_off: i64) {
     if !matches!(status, PullStatus::NoNewMsg | PullStatus::NoMatchedMsg) {
         return;
@@ -4497,7 +4497,7 @@ fn orderly_suspend_millis(cfg: &ConsumerConfig, ctx: &ConsumeOrderlyContext) -> 
     ms.clamp(10, 30000) as u64
 }
 
-/// 回投重试队列（CONSUMER_SEND_MSG_BACK=36）。
+/// Return the message to the broker's retry queue (CONSUMER_SEND_MSG_BACK=36).
 async fn send_message_back(
     inner: &Arc<Inner>,
     msg: &MessageExt,
@@ -4531,10 +4531,10 @@ async fn send_message_back(
         .await
 }
 
-/// 顺序消费的消息一直停在本地队列里原地重试，broker 侧压根没有重投计数，所以默认就该
-/// 重试到成功为止 —— `-1` 在这里读成 `i32::MAX`。**不是**并发回投那条链路的 16
-///（[`send_message_back`]，那边每轮都过一遍 broker，16 是 broker 默认的 retryMaxTimes）：
-/// 把两套并成一个常量，等于要么给顺序消费凭空造出死信，要么让并发消息无限重投。
+/// Orderly-consumed messages keep retrying in place in the local queue and the broker never counts redeliveries,
+/// so the default must retry until success -- `-1` reads as `i32::MAX` here. **Not** the 16 of the concurrent
+/// send-back chain ([`send_message_back`], which passes the broker every round; 16 is the broker default retryMaxTimes):
+/// merging the two into one constant would either invent dead letters for orderly consumption or let concurrent messages redeliver forever.
 fn orderly_max_reconsume_times(cfg: &ConsumerConfig) -> i32 {
     if cfg.max_reconsume_times == -1 {
         i32::MAX
@@ -4561,7 +4561,7 @@ async fn check_orderly_reconsume_times(inner: &Arc<Inner>, batch: &mut [MessageE
     suspend
 }
 
-/// 失败只返回 false、绝不抛：见 [`check_orderly_reconsume_times`]。
+/// On failure only returns false and never panics: see [`check_orderly_reconsume_times`].
 async fn orderly_send_message_back(
     inner: &Arc<Inner>,
     msg: &MessageExt,
@@ -4624,27 +4624,27 @@ fn build_retry_message(cfg: &ConsumerConfig, msg: &MessageExt, max_times: i32) -
         &(msg.reconsume_times + 1).to_string(),
     );
     new_msg.put_property(PROPERTY_MAX_RECONSUME_TIMES, &max_times.to_string());
-    // 半消息标记必须清掉，否则 broker 会把它再当事务回查消息处理
+    // The half-message flag must be removed, or the broker would treat it as a transaction check-back message again
     new_msg.properties.remove(PROPERTY_TRANSACTION_PREPARED);
     new_msg.set_delay_time_level(3 + msg.reconsume_times);
     new_msg
 }
 
-// ================================================================ broker 主动请求
+// ================================================================ broker-initiated requests
 //
-// 220/221/307/309 的处理入口注册在 MQClientInstance 上（它按 consumerGroup 找
-// **对应的**消费者），这里只实现被回调的那一侧。40 是唯一由消费者自己注册的，
-// 因为它的动作就是「叫醒本消费者的 rebalance 循环」。
+// The handlers for 220/221/307/309 are registered on MQClientInstance (which looks up the
+// **matching** consumer by consumerGroup); only the callback side is implemented here. 40 is the only one
+// the consumer registers itself, because its action is just "wake this consumer's rebalance loop".
 
-/// 轨迹分发器的宿主端：
-/// 分发器取的 `client_id` 就是宿主这里持有实例的 `client_id`，未启动时是空串。
+/// Host side of the trace dispatcher:
+/// the `client_id` the dispatcher reads is the host's held instance `client_id`, an empty string when not started.
 impl TraceHost for DefaultMQPushConsumer {
     fn client_id(&self) -> String {
         DefaultMQPushConsumer::client_id(self)
     }
 }
 
-/// broker 通知消费组实例变化 → 立即重算。
+/// Broker notifies that the consumer group's instances changed -> recompute immediately.
 impl RegisteredConsumer for DefaultMQPushConsumer {
     fn client_id(&self) -> String {
         self.client_id()
@@ -4713,7 +4713,7 @@ impl RegisteredConsumer for DefaultMQPushConsumer {
             let pop = self.config().pop_mode;
             let mut revoked: Vec<(MessageQueue, Option<i64>)> = Vec::new();
             {
-                // 先收 key 再逐个撤：`retire_queue_locked` 会擦 `mq_map` 的条目
+                // Collect keys first, then revoke one by one: `retire_queue_locked` erases `mq_map` entries
                 let mut state = lock(&self.inner.state);
                 let hits: Vec<(String, MessageQueue, i64)> = state
                     .mq_map
@@ -4881,9 +4881,9 @@ impl RegisteredConsumer for DefaultMQPushConsumer {
         reset_retry_topic_and_namespace(&self.inner, &mut msgs);
         let mut context = ConsumeConcurrentlyContext::new(Some(mq.clone()));
         let begin = current_time_millis();
-        // ⚠ 这里是**同步**接口（`RegisteredConsumer::consume_message_directly` 不是
-        // async），不能像正常消费路径那样 `spawn_blocking`，只能在 remoting
-        // 读线程上直接调 listener。代价是这一条路径上用户代码会占住读线程。
+        // ⚠ This is a **synchronous** interface (`RegisteredConsumer::consume_message_directly` is not
+        // async), so unlike the normal consume path there is no `spawn_blocking`; the listener can only be
+        // called directly on the remoting read thread. The cost: user code on this path occupies the read thread.
         let status = match lock(&self.inner.listener).as_ref().cloned() {
             Some(MessageListener::Concurrently(listener)) => {
                 result.order = false;
@@ -4904,7 +4904,7 @@ impl RegisteredConsumer for DefaultMQPushConsumer {
                     ConsumeOrderlyStatus::Rollback => CMResult::CR_ROLLBACK,
                 }
             }
-            // 没有监听器 → 状态为 None → CR_RETURN_NULL
+            // No listener -> status None -> CR_RETURN_NULL
             None => CMResult::CR_RETURN_NULL,
         };
         result.consume_result = Some(status.to_string());
@@ -4923,21 +4923,21 @@ impl RegisteredConsumer for DefaultMQPushConsumer {
     }
 }
 
-// ================================================================ 对外能力与弹性
+// ================================================================ public capabilities and resilience
 
 impl DefaultMQPushConsumer {
-    /// 消费组名（保留历史命名的别名）。
+    /// Consumer group name (alias kept under the historical naming).
     pub fn get_consumer_group(&self) -> String {
         self.consumer_group()
     }
 
-    /// 取订阅 topic 当前的队列列表。
+    /// Fetch the current queue list of a subscribed topic.
     pub async fn fetch_subscribe_message_queues(&self, topic: &str) -> Result<Vec<MessageQueue>> {
         let client = require_client(&self.inner)?;
         Ok(client.get_topic_subscribe_info(topic).await)
     }
 
-    /// 给 key 读单队列，不给则求和。
+    /// With a key, read the single-queue value; without, sum all queues.
     pub fn msg_acc_cnt(&self, key: Option<&str>) -> i64 {
         let state = lock(&self.inner.state);
         match key {
@@ -4946,7 +4946,7 @@ impl DefaultMQPushConsumer {
         }
     }
 
-    /// 所有 ProcessQueue 的 `msgAccCnt` 之和。
+    /// Sum of `msgAccCnt` over all ProcessQueues.
     pub fn compute_accumulation_total(&self) -> i64 {
         self.msg_acc_cnt(None)
     }
@@ -4998,7 +4998,7 @@ impl DefaultMQPushConsumer {
         true
     }
 
-    /// 非自建执行器时返回 -1。
+    /// Returns -1 when the executor is not owned by this consumer.
     pub fn get_core_pool_size(&self) -> i32 {
         if !self.inner.owns_consume_executor.load(Ordering::SeqCst) {
             return -1;
@@ -5009,7 +5009,7 @@ impl DefaultMQPushConsumer {
         }
     }
 
-    /// 把声明值落到真实执行器（没有就只记声明值）。
+    /// Applies the declared value to the real executor (records the declared value only when there is none).
     fn apply_core_pool_size(&self) {
         let core = self.inner.core_pool_size.load(Ordering::SeqCst);
         if let Some(executor) = lock(&self.inner.pop_executor).as_ref() {
@@ -5019,7 +5019,7 @@ impl DefaultMQPushConsumer {
         }
     }
 
-    /// 已拉未消费缓冲的总条数（真机验证流控/背压用）。
+    /// Total count buffered, pulled but not yet consumed (for live-cluster flow-control/backpressure verification).
     pub fn buffered_message_count(&self) -> usize {
         lock(&self.inner.state)
             .pending
@@ -5028,7 +5028,7 @@ impl DefaultMQPushConsumer {
             .sum()
     }
 
-    /// 已弹未 ack 的总条数（POP 模式，真机验证用）。
+    /// Total count popped but not yet acked (POP mode, for live-cluster verification).
     pub fn wait_ack_count(&self) -> i32 {
         lock(&self.inner.state)
             .pop_queues
@@ -5037,7 +5037,7 @@ impl DefaultMQPushConsumer {
             .sum()
     }
 
-    /// 触发一次立即重平衡（等价 broker 的 40 通知；测试与运维手动触发用）。
+    /// Triggers one immediate rebalance (equivalent to the broker's 40 notification; for tests and manual ops triggers).
     pub fn rebalance_immediately(&self) {
         self.request_rebalance();
     }
@@ -5071,8 +5071,8 @@ mod tests {
 
     #[test]
     fn namespace_v2_setter_getter_round_trip() {
-        let c = DefaultMQPushConsumer::new("GID_nsv2").expect("合法组名不该构造失败");
-        assert_eq!(c.get_namespace_v2(), None, "默认不设");
+        let c = DefaultMQPushConsumer::new("GID_nsv2").expect("a legal group name must not fail to construct");
+        assert_eq!(c.get_namespace_v2(), None, "not set by default");
         c.set_namespace_v2(Some("NS_V2"));
         assert_eq!(c.get_namespace_v2(), Some("NS_V2".to_string()));
         assert_eq!(c.config().namespace_v2, Some("NS_V2".to_string()));
@@ -5080,7 +5080,7 @@ mod tests {
         assert_eq!(
             c.get_namespace_v2(),
             None,
-            "None = 清除"
+            "None = clears"
         );
     }
 
@@ -5116,7 +5116,7 @@ mod tests {
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].get_tags(), Some("TagA"));
 
-        // 订阅 "*"：tags_set 为空 ⇒ 不过滤（连无 tag 的消息也留着）。
+        // Subscribe "*": empty tags_set => no filtering (even tag-less messages are kept).
         assert_eq!(
             client_side_tag_filter(Some(&sub("T", "*")), msgs.clone()).len(),
             3
@@ -5129,7 +5129,7 @@ mod tests {
             3
         );
 
-        // 没有订阅信息时原样返回。
+        // With no subscription info, return the input as-is.
         assert_eq!(client_side_tag_filter(None, msgs.clone()).len(), 3);
         assert!(client_side_tag_filter(Some(&sub("T", "TagA")), Vec::new()).is_empty());
     }
@@ -5164,13 +5164,13 @@ mod tests {
         assert_eq!(sql.sub_expression(), "a > 1");
     }
 
-    /// 离线只能证明「不再拒绝 + 都落进活订阅表 + unsubscribe 不发心跳」：立即心跳是异步 RPC
-    /// （`notify_subscription_changed` fire-and-forget 到 runtime），零 broker 时不发包。
-    /// 真机报文与 broker 侧 topicGroupTable 的对照见 `examples/live_subscribe.rs`。
+    /// Offline we can only prove "no longer rejected + all land in the live subscription table + unsubscribe sends no
+    /// heartbeat": the immediate heartbeat is an async RPC (`notify_subscription_changed` fire-and-forget to the
+    /// runtime) and sends no packets with zero brokers. For live wire comparison against the broker-side topicGroupTable see `examples/live_subscribe.rs`.
     #[tokio::test]
     async fn subscribe_is_allowed_after_start_and_lands_in_the_live_table() {
         let consumer = DefaultMQPushConsumer::new("GID_SubAfterStartUnit").unwrap();
-        // 造一个「已启动 + 有 client」的状态；client 指向零路由实例，不发任何包。
+        // Build a "started + has client" state; the client points at a zero-route instance and sends no packets.
         *lock(&consumer.inner.client) = Some(MQClientInstance::new("unit-sub-after-start", vec![]));
         consumer.inner.started.store(true, Ordering::Release);
 
@@ -5187,7 +5187,7 @@ mod tests {
             .collect();
         assert!(
             topics.contains(&"T_A".to_string()),
-            "后置 subscribe 要落进活订阅表"
+            "a post-start subscribe must land in the live subscription table"
         );
         assert!(topics.contains(&"T_B".to_string()));
         assert!(topics.contains(&"T_C".to_string()));
@@ -5205,7 +5205,7 @@ mod tests {
         assert_eq!(pq.wait_ack_count(), 3);
         assert_eq!(pq.ack(), 2);
         assert_eq!(pq.ack(), 1);
-        // 口径：dec_found_msg(正数) = 减少那么多条。
+        // Semantics: dec_found_msg(positive) = decrease by that many messages.
         pq.dec_found_msg(1);
         assert_eq!(pq.wait_ack_count(), 0);
 
@@ -5238,12 +5238,12 @@ mod tests {
         assert_eq!(PULL_TIME_DELAY_MILLS_WHEN_SUSPEND, 1000);
     }
 
-    /// 公开回投的参数接线：未启动时报错、broker 名来自消息 / 显式实参。
+    /// Parameter wiring of the public send-back: errors when not started; broker name comes from the message / explicit argument.
     #[tokio::test]
     async fn public_send_message_back_requires_started_client() {
         let c = DefaultMQPushConsumer::new("G_send_back_pub").unwrap();
         let msg = MessageExt::from_message(&Message::new("T", Some(b"x")));
-        // 未 start：require_client_for_send_back 拿不到实例
+        // Not started: require_client_for_send_back cannot get an instance
         let err = c.send_message_back(&msg, 3).await.unwrap_err();
         assert!(err.to_string().contains("not started"), "{err}");
         let err = c
@@ -5266,9 +5266,9 @@ mod tests {
         assert_eq!(pairs[2].1, 5);
     }
 
-    // ---------------- 配置与启动校验 ----------------
+    // ---------------- config and startup validation ----------------
 
-    /// 默认值逐项对照 `python/client/consumer.py`（`DefaultMQPushConsumer.__init__`）。
+    /// Each default checked item by item against the `DefaultMQPushConsumer` construction contract.
     #[test]
     fn config_defaults_match_the_golden_reference() {
         let cfg = ConsumerConfig::default();
@@ -5309,12 +5309,12 @@ mod tests {
         assert_eq!(cfg.pull_batch_size_in_bytes, 256 * 1024);
         assert_eq!(cfg.max_reconsume_times, -1);
         assert_eq!(cfg.suspend_current_queue_time_millis, 1000);
-        // consumeTimeout 的单位是**分钟**（只用于 ConsumeReturnType::TimeOut）
+        // consumeTimeout's unit is **minutes** (only used for ConsumeReturnType::TimeOut)
         assert_eq!(cfg.consume_timeout, 15);
         assert!(cfg.client_rebalance);
         assert_eq!(cfg.heartbeat_interval_millis, 30_000);
         assert!(cfg.heartbeat_enabled);
-        // 默认走长轮询 + 位点，而不是 POP + ack
+        // Default is long-polling + offsets, not POP + ack
         assert!(!cfg.pop_mode);
         assert_eq!(cfg.pop_invisible_time, 60_000);
         assert_eq!((cfg.pop_batch_nums, cfg.pop_threshold_for_queue), (32, 96));
@@ -5323,16 +5323,16 @@ mod tests {
             (cfg.pop_poll_time_millis, cfg.pop_timeout_millis),
             (15_000, 25_000)
         );
-        // POP 长轮询挂起时长必须短于请求超时，否则每次拉取都必然客户端超时
+        // POP long-polling suspend time must be shorter than the request timeout, otherwise every pull hits a client timeout
         assert!(cfg.pop_poll_time_millis < cfg.pop_timeout_millis);
         assert!(!cfg.enable_trace);
         assert_eq!(cfg.trace_topic, None);
         assert_eq!(cfg.trace_msg_batch_num, 10);
-        // CONSUME_FROM_TIMESTAMP 的起点：默认「30 分钟前」，格式 yyyyMMddHHmmss
+        // CONSUME_FROM_TIMESTAMP start point: default "30 minutes ago", format yyyyMMddHHmmss
         assert_eq!(cfg.consume_timestamp.len(), 14);
         let past = consume_timestamp_millis(&cfg.consume_timestamp).unwrap();
         assert!((past..current_time_millis()).contains(&(current_time_millis() - 1000)));
-        // 回归守卫：14 位纯数字是**本地墙钟日期**，不能被当成 epoch（否则是公元 2611 年）
+        // Regression guard: 14 plain digits are a **local wall-clock date**, not an epoch (otherwise it would be year 2611)
         let expected = {
             use chrono::TimeZone;
             chrono::Local
@@ -5353,7 +5353,7 @@ mod tests {
 
     #[test]
     fn blank_consumer_group_is_rejected() {
-        // 拒绝文案逐字校验："consumerGroup is empty"
+        // Rejection text verified verbatim: "consumerGroup is empty"
         for group in ["", "   ", "\t\n"] {
             assert!(
                 DefaultMQPushConsumer::new(group).is_err(),
@@ -5369,23 +5369,23 @@ mod tests {
         assert_eq!(
             c.config().consume_thread_max,
             20,
-            "默认两侧同为 20"
+            "both sides default to 20"
         );
-        // 无界队列 ⇒ 真实并发度 == core；默认 max=20，故只能往**下**调
+        // Unbounded queue => real concurrency == core; default max=20, so it can only be adjusted **down**
         assert!(c.update_core_pool_size(15));
         assert_eq!(c.get_core_pool_size(), 15);
         assert!(!c.update_core_pool_size(0));
         assert!(!c.update_core_pool_size(-1));
-        assert!(!c.update_core_pool_size(20), "== consume_thread_max 也不行");
+        assert!(!c.update_core_pool_size(20), "== consume_thread_max is also rejected");
         assert!(
             !c.update_core_pool_size(30),
-            "回归：默认 max 不能是 4.x 的 64"
+            "regression: the default max must not be 4.x's 64"
         );
-        assert!(c.update_core_pool_size(19), "刚好低于 max");
+        assert!(c.update_core_pool_size(19), "just below max");
         assert_eq!(c.get_core_pool_size(), 19);
         c.update_config(|x| x.consume_thread_max = 40_000);
         assert!(!c.update_core_pool_size(32768), "above Short.MAX_VALUE");
-        assert!(c.update_core_pool_size(32767), "上界本身合法");
+        assert!(c.update_core_pool_size(32767), "the upper bound itself is legal");
         assert_eq!(c.get_core_pool_size(), 32767);
     }
 
@@ -5399,7 +5399,7 @@ mod tests {
         assert_eq!(
             consumer.allocate_message_queue_strategy().get_name(),
             "AVG",
-            "默认策略必须是 AVG"
+            "the default strategy must be AVG"
         );
 
         consumer
@@ -5407,7 +5407,7 @@ mod tests {
         assert_eq!(
             consumer.allocate_message_queue_strategy().get_name(),
             "AVG_BY_CIRCLE",
-            "策略可替换，getter 读回同一个"
+            "the strategy is replaceable, the getter reads back the same one"
         );
 
         let by_config = Arc::new(AllocateMessageQueueByConfig::new(vec![MessageQueue::new(
@@ -5429,7 +5429,7 @@ mod tests {
         );
     }
 
-    /// 三段**直接拼接**，无分隔符。
+    /// Three segments **directly concatenated**, no separator.
     #[test]
     fn mq_key_concatenates_topic_broker_and_queue_id() {
         assert_eq!(
@@ -5462,8 +5462,8 @@ mod tests {
         }
     }
 
-    /// listener 是**存**在 `Inner` 里而不是取走：投递、重平衡、运维接口都要反复读它，
-    /// 而 `is_orderly` 决定拉取循环是否要求 broker 锁（`LOCK_BATCH_MQ`）。
+    /// The listener is **stored** in `Inner` rather than taken out: delivery, rebalance and ops APIs all read it
+    /// repeatedly, and `is_orderly` decides whether the pull loop asks for the broker lock (`LOCK_BATCH_MQ`).
     #[test]
     fn listener_kind_is_recorded_and_not_consumed() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
@@ -5478,7 +5478,7 @@ mod tests {
             );
         }
 
-        // 换成分区顺序 listener：覆盖而不是追加
+        // Switch to an orderly listener: overwrite, not append
         consumer.set_message_listener_orderly(Arc::new(NoopOrderlyListener));
         let listener = lock(&consumer.inner.listener).clone();
         assert_eq!(
@@ -5487,29 +5487,29 @@ mod tests {
         );
     }
 
-    /// `start()` 的三道校验必须在任何网络动作之前（`start()` 开头即先校验）。
+    /// The three `start()` gates must run before any network action (validation happens at the top of `start()`).
     ///
-    /// 名字服务地址用 `127.0.0.1:1`：万一校验顺序被改坏，测试会失败而不是连到真集群
-    /// 消费别人的消息。
+    /// The name server address is `127.0.0.1:1`: if the gate order ever breaks, the test fails instead of
+    /// connecting to a real cluster and consuming someone else's messages.
     #[tokio::test]
     async fn start_validates_configuration_before_any_network_io() {
         if DefaultTopAddressing::is_configured() {
-            // 环境里配了域名寻址，会绕过 name_server_addrs 校验，跳过第一轮断言
+            // Domain addressing is configured in the environment, bypassing the name_server_addrs gate; skip the first round of asserts
             return;
         }
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
         assert!(
             consumer.start().await.is_err(),
-            "既无名字服务地址又无域名寻址"
+            "neither name server addresses nor domain addressing"
         );
-        assert!(!consumer.is_started(), "失败的 start 必须回滚 started 标志");
+        assert!(!consumer.is_started(), "a failed start must roll back the started flag");
 
         consumer.set_namesrv_addr("127.0.0.1:1");
-        assert!(consumer.start().await.is_err(), "未订阅");
+        assert!(consumer.start().await.is_err(), "no subscription");
         assert!(!consumer.is_started());
 
         consumer.subscribe("T", "TagA").unwrap();
-        assert!(consumer.start().await.is_err(), "未设置 listener");
+        assert!(consumer.start().await.is_err(), "no listener set");
         assert!(!consumer.is_started());
     }
 
@@ -5622,9 +5622,9 @@ mod tests {
         },
     ];
 
-    /// 只改一道闸门，其余保持默认；线程数先摊开成整条合法域，否则单独抬
-    /// `consume_thread_min` 会先撞上「min > max」那条相对检查，拿到的是另一句文案，
-    /// 范围分支就没测到。
+    /// Change only one gate, keeping the rest at defaults; spread the thread counts across the whole legal domain
+    /// first, otherwise raising only `consume_thread_min` trips the relative "min > max" check first and yields a
+    /// different message, so the range branch under test is never reached.
     fn gate_cfg(gate: &RangeGate, value: i64) -> ConsumerConfig {
         let mut cfg = ConsumerConfig {
             consume_thread_min: 1,
@@ -5657,7 +5657,7 @@ mod tests {
         assert_eq!(
             gate_error(&gate_cfg(gate, value)),
             "<accepted>",
-            "{}={} 必须合法",
+            "{}={} must be legal",
             gate.field,
             value
         );
@@ -5665,7 +5665,7 @@ mod tests {
 
     #[test]
     fn defaults_pass_check_config_ranges() {
-        check_config_ranges(&ConsumerConfig::default()).expect("默认配置必须通过 checkConfig");
+        check_config_ranges(&ConsumerConfig::default()).expect("default config must pass checkConfig");
     }
 
     #[test]
@@ -5722,9 +5722,9 @@ mod tests {
             consume_thread_max: 8,
             ..Default::default()
         })
-        .expect("min == max 必须合法");
+        .expect("min == max must be legal");
 
-        // 相对检查排在两条范围检查**之后**：min=0 时先报范围，不报 min>max
+        // The relative check ranks **after** the two range checks: with min=0 the range error is reported, not min>max
         assert_eq!(
             gate_error(&ConsumerConfig {
                 consume_thread_min: 0,
@@ -5744,7 +5744,7 @@ mod tests {
                 ..Default::default()
             }),
             "MQClientException: consumeConcurrentlyMaxSpan Out of range [1, 65535]",
-            "跨度排在条数之前，先报跨度"
+            "the span gate comes before the count gate, the span error is reported first"
         );
         assert_eq!(
             gate_error(&ConsumerConfig {
@@ -5753,7 +5753,7 @@ mod tests {
                 ..Default::default()
             }),
             "MQClientException: pullThresholdForQueue Out of range [1, 65535]",
-            "条数排在 pullBatchSize 之前"
+            "the count gate comes before pullBatchSize"
         );
         assert_eq!(
             gate_error(&ConsumerConfig {
@@ -5761,12 +5761,12 @@ mod tests {
                 ..Default::default()
             }),
             "MQClientException: pullBatchSize Out of range [1, 1024]",
-            "前面几道修好之后才轮到 pullBatchSize"
+            "pullBatchSize is only reached once the earlier gates are fixed"
         );
     }
 
-    /// 坏配置必须在**建实例之前**被拒：起了后台任务再抛错就泄漏任务，而且
-    /// `started` 会留在 true 上，`shutdown()` 之后再 start() 会静默返回。
+    /// A bad config must be rejected **before the instance is built**: raising background tasks and then erroring
+    /// leaks those tasks, and `started` stays true, so start() after `shutdown()` silently returns.
     #[tokio::test]
     async fn start_rejects_out_of_range_config_before_any_network_io() {
         let consumer = DefaultMQPushConsumer::new("CID_check_config_ranges_rust").unwrap();
@@ -5778,23 +5778,23 @@ mod tests {
         let e = consumer
             .start()
             .await
-            .expect_err("pullBatchSize=1025 必须在启动时被拒");
+            .expect_err("pullBatchSize=1025 must be rejected at startup");
         assert_eq!(
             e.to_string(),
             "MQClientException: pullBatchSize Out of range [1, 1024]"
         );
         assert!(
             !consumer.is_started(),
-            "被拒的 start() 必须回滚 started 标志"
+            "a rejected start() must roll back the started flag"
         );
         assert!(
             lock(&consumer.inner.client).is_none(),
-            "数值闸门必须排在建 MQClientInstance 之前，否则后台任务泄漏"
+            "the numeric gates must rank before building MQClientInstance, otherwise background tasks leak"
         );
 
-        // 改对之后同一个对象还能起来（校验不留脏状态）
+        // After fixing the value the same object still starts (validation leaves no dirty state)
         consumer.update_config(|c| c.pull_batch_size = 1024);
-        consumer.start().await.expect("修好数值后必须能启动");
+        consumer.start().await.expect("must start once the value is fixed");
         consumer.shutdown();
     }
 
@@ -5815,7 +5815,7 @@ mod tests {
             });
             if let Err(e) = consumer.start().await {
                 consumer.shutdown();
-                panic!("边界配置 {label} 被误拒：{e}");
+                panic!("boundary config {label} wrongly rejected: {e}");
             }
             consumer.shutdown();
         }
@@ -5840,10 +5840,10 @@ mod tests {
         consumer.set_poll_name_server_interval_millis(2_000);
         consumer.set_persist_consumer_offset_interval_millis(700);
 
-        consumer.start().await.expect("静态地址下 start 不该失败");
+        consumer.start().await.expect("start must not fail with a static address");
         let client = lock(&consumer.inner.client)
             .clone()
-            .expect("start 之后必须已有实例");
+            .expect("an instance must already exist after start");
         assert_eq!(client.config().route_refresh_interval_millis, 2_000);
         assert_eq!(client.config().persist_offset_interval_millis, 700);
         consumer.shutdown();
@@ -5862,7 +5862,7 @@ mod tests {
         let e = consumer
             .start()
             .await
-            .expect_err("非 yyyyMMddHHmmss 必须被拒");
+            .expect_err("non-yyyyMMddHHmmss must be rejected");
         assert!(
             e.to_string().contains("consumeTimestamp is invalid"),
             "unexpected error: {e}"
@@ -5879,12 +5879,12 @@ mod tests {
         clustering
             .start()
             .await
-            .expect("CLUSTERING 消费者应该能启动");
+            .expect("the CLUSTERING consumer should start");
 
         let id = clustering.client_id();
         let (ip, instance) = id
             .split_once('@')
-            .unwrap_or_else(|| panic!("clientId 少了 IP@instanceName 的分隔符: {id}"));
+            .unwrap_or_else(|| panic!("clientId missing the IP@instanceName separator: {id}"));
         assert_eq!(ip, MixAll::cached_ip_str(), "{id}");
         assert!(
             instance.starts_with(&format!("{}#", MixAll::cached_pid())),
@@ -5893,11 +5893,11 @@ mod tests {
         assert_eq!(
             clustering.config().instance_name,
             instance,
-            "instanceName 要就地写回配置，否则重启会换一个 clientId"
+            "instanceName must be written back into the config in place, otherwise a restart would mint a new clientId"
         );
         clustering.shutdown();
-        clustering.start().await.expect("重启");
-        assert_eq!(clustering.client_id(), id, "重启换了 clientId");
+        clustering.start().await.expect("restart");
+        assert_eq!(clustering.client_id(), id, "the restart changed the clientId");
         let clustering_id = clustering.client_id();
         clustering.shutdown();
 
@@ -5914,19 +5914,19 @@ mod tests {
             c
         };
         let first = broadcast("CID-clientid-parity-broadcast-a");
-        first.start().await.expect("广播消费者应该能启动");
+        first.start().await.expect("the broadcasting consumer should start");
         assert_eq!(
             first.client_id(),
             format!("{}@DEFAULT", MixAll::cached_ip_str()),
-            "广播模式不许改写 instanceName"
+            "broadcast mode must not rewrite instanceName"
         );
         assert_eq!(first.config().instance_name, "DEFAULT");
         assert_ne!(first.client_id(), clustering_id);
 
         let second = broadcast("CID-clientid-parity-broadcast-b");
-        second.start().await.expect("第二个广播消费者应该能启动");
+        second.start().await.expect("the second broadcasting consumer should start");
         assert_eq!(second.client_id(), first.client_id());
-        let shared = MQClientInstance::find_instance(&first.client_id()).expect("实例必须已登记");
+        let shared = MQClientInstance::find_instance(&first.client_id()).expect("the instance must be registered");
         assert!(
             shared
                 .find_consumer(&first.config().consumer_group)
@@ -5934,12 +5934,12 @@ mod tests {
                 && shared
                     .find_consumer(&second.config().consumer_group)
                     .is_some(),
-            "两个广播消费者没落在同一份实例上"
+            "the two broadcasting consumers did not land on the same instance"
         );
         second.shutdown();
         first.shutdown();
-        // 推送消费者的 `client.shutdown()` 排在清退任务最后（刷位点 → 解锁 → 注销 →
-        // 关实例，见 `shutdown`），所以要轮询等它跑完，不能同步断言。
+        // The push consumer's `client.shutdown()` ranks last in the teardown chain (persist offsets -> unlock ->
+        // unregister -> close instance, see `shutdown`), so poll until it finishes instead of asserting synchronously.
         let mut torn_down = false;
         for _ in 0..100 {
             if MQClientInstance::find_instance(&first.client_id()).is_none() {
@@ -5948,11 +5948,11 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        assert!(torn_down, "最后一个租户退场后实例没被拆掉");
+        assert!(torn_down, "the instance was not torn down after the last tenant left");
     }
 
-    /// 组名校验是这三道校验里的第一道：地址、订阅、listener 全都不缺，照样因为组名失败，
-    /// 报的也只是组名的错。用 `127.0.0.1:1` 兜底，顺序被改坏时会连不上而不是打到真集群。
+    /// Group-name validation is the first of the three gates: with address, subscription and listener all present it
+    /// still fails on the group name alone. Falls back to `127.0.0.1:1`, so a broken order fails to connect instead of hitting a real cluster.
     #[tokio::test]
     async fn start_rejects_bad_consumer_group_before_the_other_gates() {
         let long_group = std::iter::repeat_n('g', 121).collect::<String>();
@@ -5964,20 +5964,20 @@ mod tests {
             ("bad group", "contains illegal characters"),
             (long_group.as_str(), "is longer than group max length"),
         ] {
-            let consumer = DefaultMQPushConsumer::new(group).expect("构造不该提前拒绝");
+            let consumer = DefaultMQPushConsumer::new(group).expect("construction must not reject early");
             consumer.set_namesrv_addr("127.0.0.1:1");
             consumer.subscribe("T", "TagA").unwrap();
             consumer.set_message_listener_concurrently(Arc::new(NoopListener));
-            let err = consumer.start().await.expect_err("非法组名必须本地失败");
+            let err = consumer.start().await.expect_err("an illegal group name must fail locally");
             assert!(err.to_string().contains(needle), "{group}: {err}");
             assert!(
                 !consumer.is_started(),
-                "{group}: 失败的 start 必须回滚 started"
+                "{group}: a failed start must roll back started"
             );
         }
     }
 
-    /// 订阅表：表达式经 `FilterAPI` 解析，重复订阅覆盖，`unsubscribe` 删除。
+    /// Subscription table: expressions parsed via `FilterAPI`, re-subscribing overwrites, `unsubscribe` removes.
     #[test]
     fn subscriptions_are_namespaced_and_overwritable() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
@@ -5988,7 +5988,7 @@ mod tests {
         assert_eq!(subs[0].sub_string, "TagA||TagB");
         assert_eq!(subs[0].expression_type, ExpressionType::TAG);
 
-        // 同 topic 再订阅是**替换**，不是追加
+        // Re-subscribing the same topic **replaces**, it does not append
         consumer
             .subscribe_with_selector("T", &MessageSelector::by_sql("a > 1"))
             .unwrap();
@@ -5998,7 +5998,7 @@ mod tests {
         assert_eq!(subs[0].expression_type, ExpressionType::SQL92);
         assert!(lock(&consumer.inner.state).subscription("T").is_some());
 
-        // 命名空间在订阅时就拼进 topic
+        // The namespace is joined into the topic at subscribe time
         consumer.update_config(|c| c.namespace = "Ns".to_string());
         consumer.subscribe("Other", "*").unwrap();
         assert!(lock(&consumer.inner.state)
@@ -6011,7 +6011,7 @@ mod tests {
             .is_none());
     }
 
-    // ---------------- 流控与统计 ----------------
+    // ---------------- flow control and stats ----------------
 
     fn queue(topic: &str, broker: &str, id: i32) -> MessageQueue {
         MessageQueue::new(topic, broker, id)
@@ -6031,7 +6031,7 @@ mod tests {
         state.pending.insert(key, msgs.into_iter().collect());
     }
 
-    /// 关掉除待测阈值以外的所有闸门，否则先命中的那条会掩盖被测分支。
+    /// Turn off every gate except the threshold under test, otherwise the first hit masks the branch being tested.
     fn only(consumer: &DefaultMQPushConsumer, f: impl FnOnce(&mut ConsumerConfig)) {
         consumer.update_config(|c| {
             c.pull_threshold_for_queue = i32::MAX;
@@ -6050,7 +6050,7 @@ mod tests {
         let key = mq_key(&mq);
         let triggered = || consumer.inner.flow_control_triggered.load(Ordering::SeqCst);
 
-        // 缓冲为空：任何阈值都不触发
+        // Empty buffer: no threshold triggers
         assert!(!flow_control_hit(&consumer.inner, &mq, &key));
         assert_eq!(triggered(), 0);
 
@@ -6063,7 +6063,7 @@ mod tests {
         assert!(flow_control_hit(&consumer.inner, &mq, &key), "count >= 3");
         assert_eq!(triggered(), 1);
 
-        // 大小：pullThresholdSizeForQueue 单位是 MiB
+        // Size: pullThresholdSizeForQueue's unit is MiB
         only(&consumer, |c| c.pull_threshold_size_for_queue = 1);
         assert!(!flow_control_hit(&consumer.inner, &mq, &key), "300B < 1MiB");
         stage(
@@ -6082,18 +6082,18 @@ mod tests {
         only(&consumer, |c| c.consume_concurrently_max_span = 100);
         assert!(
             !flow_control_hit(&consumer.inner, &mq, &key),
-            "span 100 不严格大于 100"
+            "span 100 is not strictly greater than 100"
         );
 
-        // 主题级条数：按 topic 汇总**所有**队列的缓冲（不是单队列）
+        // Topic-level counts: sum the buffer of **all** queues of the topic (not a single queue)
         only(&consumer, |c| c.pull_threshold_for_topic = 2);
         stage(&consumer, &mq, vec![sized_msg(1, 0)]);
         assert!(!flow_control_hit(&consumer.inner, &mq, &key), "1 < 2");
         stage(&consumer, &mq, vec![sized_msg(1, 0), sized_msg(1, 1)]);
         assert!(flow_control_hit(&consumer.inner, &mq, &key), "2 >= 2");
 
-        // 主题级大小：闸门只看 pullThresholdSizeForTopic，
-        // 队列级那道关掉（0）时主题级那道必须照常生效 —— 复用队列级开关会让它静默失效
+        // Topic-level size: the gate only looks at pullThresholdSizeForTopic; when the queue-level gate is
+        // off (0) the topic-level gate must still fire -- reusing the queue-level switch would silently disable it
         only(&consumer, |c| {
             c.pull_threshold_size_for_queue = 100;
             c.pull_threshold_size_for_topic = 1;
@@ -6111,10 +6111,10 @@ mod tests {
         });
         assert!(
             flow_control_hit(&consumer.inner, &mq, &key),
-            "队列级 size 闸门关掉时主题级 size 仍要生效"
+            "the topic-level size gate must still fire when the queue-level size gate is off"
         );
 
-        // 默认配置：主题级阈值关闭，只看队列级
+        // Default config: topic-level thresholds are off, only the queue-level ones apply
         let plain = DefaultMQPushConsumer::new("G").unwrap();
         stage(&plain, &mq, vec![sized_msg(1, 0)]);
         assert!(!flow_control_hit(&plain.inner, &mq, &key));
@@ -6127,7 +6127,7 @@ mod tests {
         let key = key.as_str();
         let table = || lock(&consumer.inner.state).msg_acc_cnt.clone();
 
-        // 空批次 / 缺 MAX_OFFSET 属性：不写表
+        // Empty batch / missing MAX_OFFSET property: table left untouched
         update_msg_acc_cnt(&consumer.inner, key, &[]);
         assert!(table().is_empty());
         update_msg_acc_cnt(&consumer.inner, key, &[ext("T", None)]);
@@ -6139,7 +6139,7 @@ mod tests {
             m.put_property(PROPERTY_MAX_OFFSET, max);
             m
         };
-        // 取最后一条：100 - 90 = 10（而不是第一条的 100 - 10 = 90）
+        // Take the last message: 100 - 90 = 10 (not the first message's 100 - 10 = 90)
         update_msg_acc_cnt(
             &consumer.inner,
             key,
@@ -6147,7 +6147,7 @@ mod tests {
         );
         assert_eq!(table().get(key), Some(&10));
 
-        // 差值 <= 0 不更新（保留上一次的值）；非数字 MAX_OFFSET 忽略
+        // Delta <= 0 does not update (keeps the previous value); a non-numeric MAX_OFFSET is ignored
         update_msg_acc_cnt(&consumer.inner, key, &[with_max(100, "100")]);
         assert_eq!(table().get(key), Some(&10));
         update_msg_acc_cnt(&consumer.inner, key, &[with_max(100, "abc")]);
@@ -6156,13 +6156,13 @@ mod tests {
         assert_eq!(table().get(key), Some(&990));
     }
 
-    // ---------------- 并发消费（classic 路径）的 ackIndex ----------------
+    // ---------------- ackIndex of concurrent consumption (classic path) ----------------
 
-    /// 这些断言**只能**离线做：这个端口在没有 `start()` 过的实例上回投必然失败
-    /// （`require_client` 直接 Err），于是「回投失败」那条分支的可见结果 ——
-    /// 尾巴塞回队首、`reconsumeTimes+1`、位点不越过它 —— 恰好是最容易被写错的部分。
-    /// 回投**成功**时的语义（尾巴交给 broker、位点整批前进）由真机
-    /// `examples/live_ack_index.rs` 取证。
+    /// These asserts can **only** run offline: here a send-back on an instance that never `start()`ed always fails
+    /// (`require_client` returns Err directly), so the visible outcome of the "send-back failed" branch --
+    /// tail pushed back to the queue head, `reconsumeTimes+1`, offset not passing it -- is exactly the part easiest to write wrong.
+    /// The semantics when send-back **succeeds** (tail handed to the broker, offset advances by the whole batch) is
+    /// evidenced on a live cluster by `examples/live_ack_index.rs`.
     struct AckListener {
         ack_index: Option<i32>,
         status: ConsumeConcurrentlyStatus,
@@ -6181,7 +6181,7 @@ mod tests {
         }
     }
 
-    /// 同一个队列上 queueOffset = 0..n 的一批。
+    /// A batch with queueOffset = 0..n on the same queue.
     fn offset_batch(n: i64) -> Vec<MessageExt> {
         (0..n)
             .map(|i| {
@@ -6253,7 +6253,7 @@ mod tests {
 
     #[tokio::test]
     async fn success_with_default_ack_index_never_send_backs() {
-        // 默认 Integer.MAX_VALUE 钳到 size-1：整批认可，一条都不回投
+        // Default Integer.MAX_VALUE clamps to size-1: the whole batch acked, none sent back
         let h = AckHarness::new(false, None, ConsumeConcurrentlyStatus::ConsumeSuccess);
         assert!(h.run(3).await);
         assert_eq!(h.offset(), 3);
@@ -6263,14 +6263,14 @@ mod tests {
     #[tokio::test]
     async fn success_acks_prefix_and_holds_the_offset_at_the_first_unacked() {
         let h = AckHarness::new(false, Some(0), ConsumeConcurrentlyStatus::ConsumeSuccess);
-        // 本端口未 start()，尾巴的回投必然失败 → 走「塞回队首 + 位点不越过」这条分支
+        // Without start() here, the tail's send-back always fails -> the "push back to queue head + offset does not pass" branch
         assert!(!h.run(3).await);
         assert_eq!(
             h.pending(),
             vec![(1, 1), (2, 1)],
-            "未认可的尾巴要先把 reconsumeTimes 补上再重投"
+            "the unacked tail must have reconsumeTimes bumped before redelivery"
         );
-        assert_eq!(h.offset(), 1, "位点只能停在第一条未被认可的消息上");
+        assert_eq!(h.offset(), 1, "the offset may only stop at the first unacked message");
     }
 
     #[tokio::test]
@@ -6278,7 +6278,7 @@ mod tests {
         let h = AckHarness::new(false, Some(2), ConsumeConcurrentlyStatus::ReconsumeLater);
         assert!(!h.run(3).await);
         assert_eq!(h.pending(), vec![(0, 1), (1, 1), (2, 1)]);
-        assert_eq!(h.offset(), 0, "整批都没被认可，位点原地不动");
+        assert_eq!(h.offset(), 0, "the whole batch went unacked, the offset stays put");
     }
 
     #[tokio::test]
@@ -6297,12 +6297,12 @@ mod tests {
         assert_eq!(h.pending(), vec![]);
     }
 
-    // ---------------- 顺序消费的 checkReconsumeTimes ----------------
+    // ---------------- orderly consumption's checkReconsumeTimes ----------------
 
-    /// 三处坏掉都是**静默**的：少 +1 永远到不了阈值（毒消息原地转到天荒地老）；`-1` 读成
-    /// 16 会给顺序消费凭空造死信；回投成功后还挂起，则一条毒消息永久占住那条队列 ——
-    /// 真机上看起来跟「消费者挂了」一模一样。所以判据全部离线锁死，只有「回投成功 →
-    /// 位点前进」那一支（未 `start()` 时必然走不到）交给真机 `examples/live_consumer.rs`。
+    /// All three breakages are **silent**: missing +1 never reaches the threshold (a poison message spins in place
+    /// forever); reading `-1` as 16 invents dead letters for orderly consumption; still suspending after a successful
+    /// send-back lets one poison message hold the queue forever -- on a live cluster indistinguishable from "consumer down".
+    /// So the criteria are pinned offline; only the "send-back succeeds -> offset advances" branch (unreachable without `start()`) goes to `examples/live_consumer.rs`.
     struct OrderlyListener {
         status: ConsumeOrderlyStatus,
         auto_commit: Option<bool>,
@@ -6321,7 +6321,7 @@ mod tests {
         }
     }
 
-    /// 记录 after 钩子看到的 `(status, success, ConsumeContextType)`。
+    /// Records the `(status, success, ConsumeContextType)` seen by the after hook.
     struct RecordingHook {
         after: Mutex<Vec<(String, bool, String)>>,
     }
@@ -6417,13 +6417,13 @@ mod tests {
         }
     }
 
-    /// queueOffset = `start`..`start+n`，每条自带 reconsumeTimes。
+    /// queueOffset = `start`..`start+n`, each carrying its own reconsumeTimes.
     fn orderly_batch(start: i64, reconsume_times: &[i32]) -> Vec<MessageExt> {
         reconsume_times
             .iter()
             .enumerate()
             .map(|(i, rt)| {
-                let i = i64::try_from(i).expect("批次长度不会超过 i64");
+                let i = i64::try_from(i).expect("batch length never exceeds i64");
                 let mut m = ext("T", None);
                 m.broker_name = Some("broker-a".to_string());
                 m.queue_offset = start + i;
@@ -6450,8 +6450,8 @@ mod tests {
 
     #[tokio::test]
     async fn default_cap_never_judges_the_poison_message_exhausted() {
-        // 默认配置（-1）下即便 reconsumeTimes 已到 i32::MAX-1，也只是本地 +1 继续挂起
-        // 重试，不回投（更不会被 broker 投进 %DLQ%）。
+        // With the default config (-1), even reconsumeTimes at i32::MAX-1 only bumps locally by +1 and keeps
+        // suspending to retry, never sending back (let alone the broker routing it into %DLQ%).
         let h = OrderlyHarness::new(-1, ConsumeOrderlyStatus::SuspendCurrentQueueAMoment);
         let inner = h.c.inner.clone();
         let mut batch = orderly_batch(0, &[i32::MAX - 1]);
@@ -6461,7 +6461,7 @@ mod tests {
 
     #[tokio::test]
     async fn below_cap_counts_locally_and_suspends() {
-        // 没用尽时压根不回投（未 start 也回投不了，所以这条判据必须自己走判据函数）
+        // Below the cap it never sends back (it cannot without start either, so this criterion must call the check function itself)
         let h = OrderlyHarness::new(3, ConsumeOrderlyStatus::SuspendCurrentQueueAMoment);
         let inner = h.c.inner.clone();
         let mut batch = orderly_batch(0, &[0, 2]);
@@ -6469,7 +6469,7 @@ mod tests {
         assert_eq!(
             batch.iter().map(|m| m.reconsume_times).collect::<Vec<_>>(),
             vec![1, 3],
-            "broker 侧没记这次失败，客户端不就地 +1 就永远到不了阈值"
+            "the broker did not record this failure, so without a local +1 the client never reaches the threshold"
         );
     }
 
@@ -6500,7 +6500,7 @@ mod tests {
             m
         };
         let new_msg = build_retry_message(&cfg, &poison, orderly_max_reconsume_times(&cfg));
-        assert_eq!(new_msg.topic, "%RETRY%G", "顺序回投走 %RETRY%<group>");
+        assert_eq!(new_msg.topic, "%RETRY%G", "orderly send-back goes to %RETRY%<group>");
         assert_eq!(new_msg.body, poison.body);
         assert_eq!(new_msg.get_property(PROPERTY_KEYS), Some("k7"));
         assert_eq!(new_msg.get_property(PROPERTY_RETRY_TOPIC), Some("T"));
@@ -6517,19 +6517,19 @@ mod tests {
         assert_eq!(
             new_msg.get_property(PROPERTY_ORIGIN_MESSAGE_ID),
             Some("mid-7"),
-            "轨迹要靠 ORIGIN_MESSAGE_ID 把重投串回原消息"
+            "the trace needs ORIGIN_MESSAGE_ID to link the redelivery back to the original message"
         );
         assert_eq!(
             new_msg.get_property(PROPERTY_TRANSACTION_PREPARED),
             None,
-            "半消息标记必须清掉，否则 broker 会把它当回查消息"
+            "the half-message flag must be removed, or the broker treats it as a check-back message"
         );
     }
 
     #[tokio::test]
     async fn suspend_requeues_batch_while_below_cap() {
         let h = OrderlyHarness::new(3, ConsumeOrderlyStatus::SuspendCurrentQueueAMoment);
-        // 队尾还有下一条（offset 2），本批要按原顺序插到它前面
+        // The queue tail still holds the next message (offset 2); this batch must be inserted before it in original order
         let mut tail: VecDeque<MessageExt> = orderly_batch(2, &[0]).into_iter().collect();
         lock(&h.c.inner.state)
             .pending
@@ -6537,25 +6537,25 @@ mod tests {
             .expect("pending")
             .append(&mut tail);
         assert!(!h.run(orderly_batch(0, &[0, 1])).await);
-        assert_eq!(h.offset(), 0, "还在原地重试，位点不能越过它");
+        assert_eq!(h.offset(), 0, "still retrying in place, the offset must not pass it");
         assert_eq!(
             h.pending(),
             vec![(0, 1), (1, 2), (2, 0)],
-            "整批按原顺序塞回队首（顺序消费不许乱序）"
+            "the whole batch is pushed back to the queue head in original order (orderly consumption forbids reordering)"
         );
     }
 
     #[tokio::test]
     async fn success_path_skips_the_reconsume_gate() {
-        // 阈值 0：一旦走到判据就会尝试回投（离线必败 → 挂起），所以「位点前进」
-        // 本身就证明了 SUCCESS 没碰判据。
+        // Threshold 0: merely reaching the gate would attempt a send-back (always fails offline -> suspend), so
+        // "the offset advances" by itself proves SUCCESS never touched the gate.
         let h = OrderlyHarness::new(0, ConsumeOrderlyStatus::Success);
         assert!(h.run(orderly_batch(0, &[0])).await);
         assert_eq!(h.offset(), 1);
         assert_eq!(h.pending(), vec![]);
     }
 
-    // ---------------- 挂起时长：context 优先 + 钳到 [10, 30000] ----------------
+    // ---------------- suspend duration: context wins + clamped to [10, 30000] ----------------
 
     #[test]
     fn orderly_suspend_millis_resolves_then_clamps() {
@@ -6571,19 +6571,19 @@ mod tests {
         assert_eq!(
             orderly_suspend_millis(&cfg(1000), &ctx(-1)),
             1000,
-            "-1 = 用配置"
+            "-1 = use the config"
         );
         assert_eq!(orderly_suspend_millis(&cfg(250), &ctx(-1)), 250);
         assert_eq!(
             orderly_suspend_millis(&cfg(0), &ctx(-1)),
             10,
-            "配置侧也要过钳位"
+            "the config side goes through the clamp too"
         );
         assert_eq!(orderly_suspend_millis(&cfg(60_000), &ctx(-1)), 30_000);
         assert_eq!(
             orderly_suspend_millis(&cfg(900), &ctx(70)),
             70,
-            "给了值就忽略配置"
+            "a given value overrides the config"
         );
         for (asked, expect) in [
             (0i64, 10u64),
@@ -6602,7 +6602,7 @@ mod tests {
         }
     }
 
-    // ---------------- autoCommit=true：COMMIT/ROLLBACK 是非法用法 ----------------
+    // ---------------- autoCommit=true: COMMIT/ROLLBACK are illegal usages ----------------
 
     #[tokio::test]
     async fn illegal_commit_and_rollback_under_auto_commit_are_acked() {
@@ -6610,10 +6610,10 @@ mod tests {
             let h = OrderlyHarness::new(0, status);
             assert!(
                 h.run(orderly_batch(0, &[0])).await,
-                "{status:?} 应按整批认可处理"
+                "{status:?} must be treated as a whole-batch ack"
             );
-            assert_eq!(h.offset(), 1, "{status:?} 位点必须前进");
-            assert_eq!(h.pending(), vec![], "{status:?} 不该回投");
+            assert_eq!(h.offset(), 1, "{status:?} the offset must advance");
+            assert_eq!(h.pending(), vec![], "{status:?} must not send back");
         }
     }
 
@@ -6622,7 +6622,7 @@ mod tests {
     async fn manual_commit_advances_without_requeueing() {
         let h = OrderlyHarness::new_manual(0, ConsumeOrderlyStatus::Commit);
         assert!(h.run(orderly_batch(0, &[0])).await);
-        assert_eq!(h.offset(), 1, "COMMIT 就是要提交位点");
+        assert_eq!(h.offset(), 1, "COMMIT means committing the offset");
         assert_eq!(h.pending(), vec![]);
     }
 
@@ -6630,24 +6630,24 @@ mod tests {
     async fn manual_rollback_requeues_and_holds_the_offset() {
         let h = OrderlyHarness::new_manual(0, ConsumeOrderlyStatus::Rollback);
         assert!(!h.run(orderly_batch(0, &[0])).await);
-        assert_eq!(h.offset(), 0, "回滚不能提交位点");
-        assert_eq!(h.pending(), vec![(0, 0)], "消息退回队首重试");
+        assert_eq!(h.offset(), 0, "rollback must not commit the offset");
+        assert_eq!(h.pending(), vec![(0, 0)], "the message returns to the queue head for retry");
     }
 
     #[tokio::test]
     async fn manual_success_holds_the_batch_without_committing() {
         let h = OrderlyHarness::new_manual(0, ConsumeOrderlyStatus::Success);
-        // 两条都是 reconsumeTimes=0：手动模式下 SUCCESS 连本地计数都不该动
+        // Both are reconsumeTimes=0: in manual mode SUCCESS must not touch even the local counter
         assert!(!h.run(orderly_batch(0, &[0, 0])).await);
-        assert_eq!(h.offset(), 0, "手动模式下 SUCCESS 不提交");
-        assert_eq!(h.pending(), vec![(0, 0), (1, 0)], "整批按原顺序退回");
+        assert_eq!(h.offset(), 0, "in manual mode SUCCESS does not commit");
+        assert_eq!(h.pending(), vec![(0, 0), (1, 0)], "the whole batch is returned in original order");
     }
 
     #[tokio::test]
     async fn manual_suspend_never_commits_the_offset() {
         let h = OrderlyHarness::new_manual(2, ConsumeOrderlyStatus::SuspendCurrentQueueAMoment);
         assert!(!h.run(orderly_batch(7, &[2])).await);
-        assert_eq!(h.offset(), 0, "手动模式挂了也不提交位点");
+        assert_eq!(h.offset(), 0, "manual mode suspends without committing the offset");
     }
 
     #[tokio::test]
@@ -6669,9 +6669,9 @@ mod tests {
             let h = OrderlyHarness::new(0, status).with_hook(hook.clone());
             let _ = h.run(orderly_batch(0, &[0])).await;
             let seen = lock(&hook.after);
-            assert_eq!(seen.len(), 1, "{status:?}: after 钩子必须触发一次");
-            assert_eq!(seen[0].0, expect_status, "{status:?} 的钩子 status");
-            assert_eq!(seen[0].1, expect_success, "{status:?} 的钩子 success");
+            assert_eq!(seen.len(), 1, "{status:?}: the after hook must fire once");
+            assert_eq!(seen[0].0, expect_status, "{status:?} hook status");
+            assert_eq!(seen[0].1, expect_success, "{status:?} hook success");
         }
     }
 
@@ -6699,12 +6699,12 @@ mod tests {
             assert_eq!(
                 r.consume_result.as_deref(),
                 Some(expect),
-                "{status:?} 的映射"
+                "{status:?} mapping"
             );
-            assert!(r.order, "{status:?}: 顺序 listener 必须报 order=true");
+            assert!(r.order, "{status:?}: an orderly listener must report order=true");
             assert!(
                 !r.auto_commit,
-                "{status:?}: listener 设的 autoCommit=false 要原样回给 broker"
+                "{status:?}: the listener-set autoCommit=false must go back to the broker as-is"
             );
         }
     }
@@ -6720,8 +6720,8 @@ mod tests {
             .consume_message_directly(ext("T", None), Some("broker-a".to_string()))
             .expect("direct consume must not error");
         assert_eq!(r.consume_result.as_deref(), Some(CMResult::CR_SUCCESS));
-        assert!(!r.order, "并发 listener 必须报 order=false");
-        assert!(r.auto_commit, "并发侧沿用初值 autoCommit=true");
+        assert!(!r.order, "a concurrent listener must report order=false");
+        assert!(r.auto_commit, "the concurrent side keeps the initial autoCommit=true");
     }
 
     // ---------------- POP ----------------
@@ -6732,23 +6732,23 @@ mod tests {
         let topic = "PopStatsTopic";
         let key = ConsumerStatsManager::key(topic, group);
         let stats = ConsumerStatsManager::new();
-        // 倒退 30ms：RT 是 `now - began`，正向断言 >0 不依赖调度精度
+        // Roll back 30ms: RT is `now - began`, so a forward-facing >0 assert does not depend on scheduling precision
         let began = current_time_millis() - 30;
 
         let rt = || {
             stats
                 .topic_and_group_pull_rt()
                 .find(&key)
-                .unwrap_or_else(|| panic!("PULL_RT 应该被记进 {key}"))
+                .unwrap_or_else(|| panic!("PULL_RT should have been recorded under {key}"))
         };
         let tps = || {
             stats
                 .topic_and_group_pull_tps()
                 .find(&key)
-                .unwrap_or_else(|| panic!("PULL_TPS 应该被记进 {key}"))
+                .unwrap_or_else(|| panic!("PULL_TPS should have been recorded under {key}"))
         };
 
-        // ① FOUND + 2 条：RT 记一次、TPS 按条数记一次
+        // (1) FOUND + 2 messages: RT recorded once, TPS recorded once per message
         record_pop_pull_stats(
             &stats,
             group,
@@ -6761,7 +6761,7 @@ mod tests {
             began,
         );
         assert_eq!(rt().times(), 1);
-        assert!(rt().value() >= 30, "RT 应是本轮弹出耗时: {}", rt().value());
+        assert!(rt().value() >= 30, "RT should be this pop round's elapsed time: {}", rt().value());
         assert_eq!(tps().times(), 1);
         assert_eq!(tps().value(), 2);
 
@@ -6775,11 +6775,11 @@ mod tests {
             },
             began,
         );
-        assert_eq!(rt().times(), 2, "FOUND 的空手而归也要记 RT");
-        assert_eq!(tps().times(), 1, "空列表不能记 TPS");
+        assert_eq!(rt().times(), 2, "an empty-handed FOUND round still records RT");
+        assert_eq!(tps().times(), 1, "an empty list must not record TPS");
 
-        // ③ POLLING_NOT_FOUND：两格都不记。POP 的空轮询是常态，把挂起时长算进平均
-        //    拉取耗时会让看板上的 pullRT 完全失去意义。
+        // (3) POLLING_NOT_FOUND: neither cell records. Empty POP polls are the norm; counting the suspend
+        //     duration into the average pull time would render the dashboard's pullRT meaningless.
         record_pop_pull_stats(
             &stats,
             group,
@@ -6794,8 +6794,8 @@ mod tests {
         assert_eq!(tps().times(), 1);
     }
 
-    /// 拿不到 popTime/invisibleTime 时**一律算超时**，
-    /// 于是走「重新计算可见性」而不是「原样重投」。
+    /// Whenever popTime/invisibleTime is unavailable, **always treat it as a timeout**,
+    /// so the "recompute visibility" path runs instead of "redeliver as-is".
     #[test]
     fn pop_timeout_compares_the_invisible_window() {
         let now = current_time_millis();
@@ -6803,22 +6803,22 @@ mod tests {
         assert!(is_pop_timeout(&[], now, 60_000));
         assert!(is_pop_timeout(&one(), 0, 60_000));
         assert!(is_pop_timeout(&one(), now - 1000, 0));
-        assert!(!is_pop_timeout(&one(), now, 60_000), "仍在不可见窗口内");
-        assert!(is_pop_timeout(&one(), now - 60_000, 60_000), "窗口已过");
+        assert!(!is_pop_timeout(&one(), now, 60_000), "still inside the invisible window");
+        assert!(is_pop_timeout(&one(), now - 60_000, 60_000), "the window has passed");
     }
 
-    /// POP 消费结果处理的两段遍历：无论消费结果如何，
-    /// 每条消息都必须**恰好** `pq.ack()` 一次 —— 漏一条，`waitAckCounter` 就永久
-    /// 泄漏，攒到 `popThresholdForQueue` 后该队列再也不弹新消息。
+    /// The two-pass traversal of POP consume-result handling: whatever the consume result is,
+    /// every message must call `pq.ack()` **exactly** once -- miss one and `waitAckCounter`
+    /// leaks forever; once it accumulates to `popThresholdForQueue` that queue never pops new messages again.
     #[tokio::test]
     async fn every_pop_message_is_acked_whatever_the_result() {
         for (status, ack_index, len) in [
             (ConsumeConcurrentlyStatus::ConsumeSuccess, 1, 3),
-            // ack_index 越界：钳到 len-1
+            // ack_index out of bounds: clamped to len-1
             (ConsumeConcurrentlyStatus::ConsumeSuccess, 99, 3),
-            // 默认 -1：一条都不算「成功 ack」，但其余每条仍要延长不可见时间
+            // Default -1: none counts as a "successful ack", but every other message still gets its invisible time extended
             (ConsumeConcurrentlyStatus::ConsumeSuccess, -1, 3),
-            // RECONSUME_LATER 依然遍历每一条
+            // RECONSUME_LATER still traverses every message
             (ConsumeConcurrentlyStatus::ReconsumeLater, -1, 3),
             (ConsumeConcurrentlyStatus::ReconsumeLater, 0, 1),
         ] {
@@ -6829,7 +6829,7 @@ mod tests {
             let msgs: Vec<MessageExt> = (0..len).map(|_| ext("T", None)).collect();
             let mut context = ConsumeConcurrentlyContext::new(Some(queue("T", "broker-a", 0)));
             context.ack_index = ack_index;
-            // 未 start()：ack / 改可见时间的 RPC 都退化成空操作，只验证计数清零
+            // Without start(): the ack / visibility-extension RPCs degrade to no-ops; only the counter clearing is verified
             process_pop_consume_result(&inner, status, &context, &msgs, &pq).await;
             assert_eq!(
                 pq.wait_ack_count(),
@@ -6839,7 +6839,7 @@ mod tests {
         }
     }
 
-    /// POP_CK 缺失/畸形都当「无法 ack」，不 panic。
+    /// Missing/malformed POP_CK both count as "cannot ack", no panic.
     #[test]
     fn pop_ck_target_rejects_missing_or_malformed_ck() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
@@ -6855,8 +6855,8 @@ mod tests {
         junk.put_property(PROPERTY_POP_CK, "only-three-segments");
         assert!(pop_ck_target(inner, &junk).is_none());
 
-        // 真实 CK 是 **8 段**：broker 重编 CK 时会把 msgQueueOffset 追加为第 8 段
-        // （`PopMessageProcessor:847`），而 `getQueueOffset` 正是取这一段。
+        // A real CK has **8 segments**: when the broker re-encodes the CK it appends msgQueueOffset as the 8th
+        // segment, and `getQueueOffset` reads exactly that segment.
         let mut ok = ext("T", None);
         ok.put_property(
             PROPERTY_POP_CK,
@@ -6872,7 +6872,7 @@ mod tests {
                 "1234 1700000000000 60000 0 0 broker-a 3 99".to_string()
             ))
         );
-        // retryFlag=1：真实主题是 %RETRY%<group>_<topic>，不是消息上的 topic
+        // retryFlag=1: the real topic is %RETRY%<group>_<topic>, not the message's topic
         let mut retry = ok.clone();
         retry.put_property(
             PROPERTY_POP_CK,
@@ -6880,7 +6880,7 @@ mod tests {
         );
         let (topic, ..) = pop_ck_target(inner, &retry).unwrap();
         assert_eq!(topic, "%RETRY%G_T");
-        // retryFlag=2：v2 格式 %RETRY%<group>+<topic>
+        // retryFlag=2: v2 format %RETRY%<group>+<topic>
         let mut retry_v2 = ok.clone();
         retry_v2.put_property(
             PROPERTY_POP_CK,
@@ -6891,7 +6891,7 @@ mod tests {
         let mut seven = ok.clone();
         seven.put_property(PROPERTY_POP_CK, "1234 1700000000000 60000 0 0 broker-a 3");
         assert!(pop_ck_target(inner, &seven).is_none());
-        // 未知 retryFlag 同样拒绝（getRetry 只认 0/1/2）
+        // Unknown retryFlag is rejected too (getRetry only accepts 0/1/2)
         let mut bad_flag = ok.clone();
         bad_flag.put_property(
             PROPERTY_POP_CK,
@@ -6965,17 +6965,17 @@ mod tests {
         assert_eq!(
             calls.load(Ordering::SeqCst),
             0,
-            "顺序 POP 停摆"
+            "orderly POP stalled"
         );
         assert_eq!(
             pq.wait_ack_count(),
             2,
-            "未 ack：等 invisibleTime 到期 broker 复活重投"
+            "not acked: wait for invisibleTime to expire and the broker to revive and redeliver"
         );
         assert_eq!(consumer.pop_orderly_request_count(), 1);
     }
 
-    /// 同一入口、并发监听器：走 ConsumeMessagePopConcurrentlyService，照常消费 + ack。
+    /// Same entry point, concurrent listener: goes through ConsumeMessagePopConcurrentlyService, consuming + acking as usual.
     #[tokio::test]
     async fn pop_concurrent_dispatch_still_consumes() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
@@ -7002,17 +7002,17 @@ mod tests {
         let q1 = queue("T", "broker-a", 1);
         submit_pop_orderly_request(&inner, pq.clone(), q0.clone(), false).await;
         submit_pop_orderly_request(&inner, pq.clone(), q0.clone(), false).await;
-        assert_eq!(consumer.pop_orderly_request_count(), 1, "同 (pq, mq) 去重");
+        assert_eq!(consumer.pop_orderly_request_count(), 1, "dedup by (pq, mq)");
         submit_pop_orderly_request(&inner, pq.clone(), q1.clone(), false).await;
-        assert_eq!(consumer.pop_orderly_request_count(), 2, "mq 不同算新请求");
+        assert_eq!(consumer.pop_orderly_request_count(), 2, "a different mq counts as a new request");
         let pq2 = PopProcessQueue::new();
         submit_pop_orderly_request(&inner, pq2.clone(), q0.clone(), false).await;
-        assert_eq!(consumer.pop_orderly_request_count(), 3, "pq 不同算新请求");
+        assert_eq!(consumer.pop_orderly_request_count(), 3, "a different pq counts as a new request");
         submit_pop_orderly_request(&inner, pq.clone(), q0.clone(), true).await;
         assert_eq!(
             consumer.pop_orderly_request_count(),
             3,
-            "force 只放行投递，不加集合条目"
+            "force only lets the delivery through, it adds no set entry"
         );
     }
 
@@ -7029,10 +7029,10 @@ mod tests {
         assert_eq!(
             consumer.pop_orderly_request_count(),
             0,
-            "已撤队列：出集，不滞留"
+            "revoked queue: out of the set, no lingering"
         );
 
-        // 先撤再提交：进得了集合，run 立刻又把它摘掉
+        // Dropped first, submitted after: it can enter the set, and run removes it right away
         let pq2 = PopProcessQueue::new();
         pq2.set_dropped(true);
         submit_pop_orderly_request(&inner, pq2, mq.clone(), false).await;
@@ -7051,12 +7051,12 @@ mod tests {
         assert_eq!(consumer.pop_orderly_request_count(), 1);
     }
 
-    // ---------------- 消费结果与投递前还原 ----------------
+    // ---------------- consume result and pre-delivery restoration ----------------
 
-    /// 消费返回类型（决定轨迹 contextCode）。
+    /// Consume return type (decides the trace contextCode).
     #[test]
     fn consume_return_type_follows_the_recorded_branches() {
-        // status 为 None：有异常 → EXCEPTION，无异常 → RETURNNULL
+        // status None: with an exception -> EXCEPTION, without -> RETURNNULL
         assert_eq!(
             consume_return_type(None, true, 0, 15, true),
             ConsumeReturnType::Exception
@@ -7089,14 +7089,14 @@ mod tests {
         assert_eq!(ConsumeReturnType::Failed.code(), 4);
     }
 
-    /// 交给 listener 之前还原 topic。
+    /// Restores the topic before handing to the listener.
     #[test]
     fn retry_topic_and_namespace_are_reset_before_delivery() {
         let consumer = DefaultMQPushConsumer::new("MyGroup").unwrap();
         let group_topic = MixAll::get_retry_topic("MyGroup");
         assert_eq!(group_topic, "%RETRY%MyGroup");
 
-        // 只有「topic 确实是本组的重试主题」时才用 RETRY_TOPIC 属性还原
+        // Only when "the topic really is this group's retry topic" is the original restored via the RETRY_TOPIC property
         let mut retried = ext(&group_topic, None);
         retried.put_property(PROPERTY_RETRY_TOPIC, "OrderTopic");
         let mut unrelated = ext("T", None);
@@ -7104,9 +7104,9 @@ mod tests {
         let mut msgs = vec![retried.clone(), unrelated.clone()];
         reset_retry_topic_and_namespace(&consumer.inner, &mut msgs);
         assert_eq!(msgs[0].topic, "OrderTopic");
-        assert_eq!(msgs[1].topic, "T", "非本组重试主题不动");
+        assert_eq!(msgs[1].topic, "T", "a non-group retry topic is left alone");
 
-        // 带命名空间：还原原始 topic 之后再剥前缀，两步复合
+        // With a namespace: strip the prefix after restoring the original topic, a two-step composite
         consumer.update_config(|c| c.namespace = "Ns".to_string());
         let mut namespaced_retry = ext(&group_topic, None);
         namespaced_retry.put_property(PROPERTY_RETRY_TOPIC, "Ns%Order");
@@ -7116,24 +7116,24 @@ mod tests {
         assert_eq!(msgs[0].topic, "Order");
         assert_eq!(msgs[1].topic, "T");
 
-        // 空批次不报错
+        // An empty batch does not error
         reset_retry_topic_and_namespace(&consumer.inner, &mut []);
     }
 
-    // ---------------- 本地（BROADCASTING）位点 ----------------
+    // ---------------- local (BROADCASTING) offsets ----------------
 
-    /// 位点文件是「队列 key -> offset」的扁平 JSON 对象。
+    /// The offset file is a flat JSON object of "queue key -> offset".
     #[test]
     fn local_offsets_are_a_flat_json_object_of_queue_key() {
         let consumer = DefaultMQPushConsumer::new("RustTestNeverWrittenGroup").unwrap();
         let Some(path) = local_offset_path(&consumer.inner) else {
-            // 没有 HOME 环境变量时无本地路径，读取退化成空表
+            // Without a HOME env var there is no local path and loading degrades to an empty table
             assert!(load_local_offsets(&consumer.inner).is_empty());
             return;
         };
         assert!(path.ends_with("RustTestNeverWrittenGroup/offsets.json"));
-        assert!(!path.exists(), "本测试不写文件");
-        // 文件不存在 → 空表（任何读失败都当「没有位点」，不抛异常）
+        assert!(!path.exists(), "this test writes no file");
+        // File missing -> empty table (any read failure counts as "no offsets", no exception)
         assert!(load_local_offsets(&consumer.inner).is_empty());
 
         let items: BTreeMap<String, i64> =
@@ -7142,11 +7142,11 @@ mod tests {
         assert_eq!(text, r#"{"Tbroker-a0":42}"#);
         let back: BTreeMap<String, i64> = serde_json::from_str(&text).unwrap();
         assert_eq!(back.get("Tbroker-a0"), Some(&42));
-        // 坏 JSON 会让读取失败 → 退化成空表
+        // Bad JSON makes the load fail -> degrades to an empty table
         assert!(serde_json::from_str::<BTreeMap<String, i64>>("[not, an, object]").is_err());
     }
 
-    // ---------------- runningInfo 的 pop 视图 ----------------
+    // ---------------- the pop view of runningInfo ----------------
 
     #[test]
     fn pop_running_info_reports_every_popped_queue() {
@@ -7157,7 +7157,7 @@ mod tests {
         let (k0, k1) = (mq_key(&q0), mq_key(&q1));
         {
             let mut state = lock(&consumer.inner.state);
-            // 故意逆序塞，验证输出按 key 排序（broker 回包给运维时要稳定）
+            // Deliberately inserted out of order to verify the output is sorted by key (stable when the broker replies to ops)
             state.assigned = vec![q1.clone(), q0.clone()];
             state.pop_queues.insert(k1.clone(), PopProcessQueue::new());
             let pq0 = PopProcessQueue::new();
@@ -7176,9 +7176,9 @@ mod tests {
         );
         assert!(
             info.mq_table.is_empty(),
-            "pop 模式没有拉取队列，mqTable 必须为空"
+            "pop mode has no pull queues, mqTable must be empty"
         );
-        // 在途未 ack 的条数走 cachedMsgCount
+        // The in-flight unacked count goes through cachedMsgCount
         assert_eq!(
             info.mq_pop_table[0].1.get("cachedMsgCount"),
             Some(&serde_json::Value::from(3))
@@ -7189,8 +7189,8 @@ mod tests {
         );
     }
 
-    /// `locked_queue_keys` 是顺序消费锁状态的唯一观测点：四个移植版的
-    /// `ProcessQueueInfo.locked` 都不回填。
+    /// `locked_queue_keys` is the only observable of the orderly-consumption lock state: `ProcessQueueInfo.locked`
+    /// here is never backfilled.
     #[test]
     fn locked_queue_keys_are_sorted_and_start_empty() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
@@ -7207,7 +7207,7 @@ mod tests {
     }
 
 
-    /// 直接种盖章，绕开真循环（本模块没有 `MQClientInstance`，循环一上来就会退出）。
+    /// Stamps the clock directly, bypassing the real loop (this module has no `MQClientInstance`; the loop would exit immediately).
     fn stamp_at(consumer: &DefaultMQPushConsumer, key: &str, at: i64) {
         lock(&consumer.inner.state)
             .last_pull_at
@@ -7219,8 +7219,8 @@ mod tests {
         pull_stalled_locked(&state, key, now)
     }
 
-    /// 让 consumer 看起来"已启动"，这样自愈判定才会参与 rebalance；
-    /// 但不注入 `MQClientInstance`，被撤队列的位点持久化会在这条路径上直接短路。
+    /// Makes the consumer look "started" so the self-healing checks take part in rebalance;
+    /// but no `MQClientInstance` is injected, so persisting a revoked queue's offsets short-circuits on this path.
     fn mark_started(consumer: &DefaultMQPushConsumer) {
         consumer.inner.started.store(true, Ordering::SeqCst);
     }
@@ -7232,16 +7232,16 @@ mod tests {
         let key = mq_key(&queue("T", "broker-a", 0));
         let began = 1_700_000_000_000;
 
-        // 从没盖过章 = 刚分配、第一轮还没发起，不能被判停摆
+        // Never stamped = just assigned, the first round has not started yet; must not be judged stalled
         assert!(!stalled(&consumer, &key, began + 10 * 60_000));
         stamp_at(&consumer, &key, began);
         assert!(!stalled(&consumer, &key, began + PULL_MAX_IDLE_TIME - 1));
         assert!(!stalled(&consumer, &key, began + PULL_MAX_IDLE_TIME));
         assert!(stalled(&consumer, &key, began + PULL_MAX_IDLE_TIME + 1));
-        // 哨兵 0 = 循环已退出（tokio 任务没有 `Thread.is_alive()` 可问）
+        // Sentinel 0 = the loop has exited (a tokio task has no `Thread.is_alive()` to ask)
         stamp_at(&consumer, &key, 0);
         assert!(stalled(&consumer, &key, 0));
-        // 逐队列独立：一把停摆不牵连另一把
+        // Per-queue independence: one stalled queue does not drag in another
         let other = mq_key(&queue("T", "broker-a", 1));
         stamp_at(&consumer, &other, began);
         assert!(!stalled(&consumer, &other, began + 1000));
@@ -7253,7 +7253,7 @@ mod tests {
         let mq = queue("T", "broker-a", 0);
         let key = mq_key(&mq);
         let pq = PopProcessQueue::new();
-        pq.set_dropped(true); // 撤走过一次的队列，盖章不该把它复活
+        pq.set_dropped(true); // a once-revoked queue must not be revived by stamping
         lock(&consumer.inner.state)
             .pop_queues
             .insert(key.clone(), pq.clone());
@@ -7268,7 +7268,7 @@ mod tests {
         };
         assert!(current_time_millis() - popped < 5000);
 
-        // 循环退出留下哨兵，下一轮 rebalance 就能看见
+        // Loop exit leaves the sentinel behind, so the next rebalance round can see it
         lock(&consumer.inner.state)
             .queue_owners
             .insert(key.clone(), 42);
@@ -7277,13 +7277,13 @@ mod tests {
             lock(&consumer.inner.state).last_pull_at.get(&key).copied(),
             Some(0)
         );
-        // 归属已经换人时不能再写哨兵，否则会误伤新属主
+        // When ownership has moved on, the sentinel must not be written again, or it would hurt the new owner
         let other = mq_key(&queue("T", "broker-a", 1));
         stamp_at(&consumer, &other, 555);
         lock(&consumer.inner.state)
             .queue_owners
             .insert(other.clone(), 7);
-        mark_pull_loop_exited(&consumer.inner, &other, 999); // 令牌对不上
+        mark_pull_loop_exited(&consumer.inner, &other, 999); // token mismatch
         assert_eq!(
             lock(&consumer.inner.state)
                 .last_pull_at
@@ -7293,7 +7293,7 @@ mod tests {
         );
     }
 
-    /// `retire_queue_locked`：撤一把队列要把所有痕迹摘干净，并把已消费位点交给收尾路径。
+    /// `retire_queue_locked`: revoking a queue must strip every trace and hand the consumed offset to the persist path.
     #[test]
     fn retiring_clears_every_trace_and_reports_the_offset_to_persist() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
@@ -7322,17 +7322,17 @@ mod tests {
         assert!(state.pending.is_empty());
         assert!(
             state.inflight_msgs.is_empty(),
-            "撤销后旧批次的引用不能留在清扫视图里"
+            "after revocation the old batch's references must not linger in the sweep view"
         );
         assert!(state.offset_table.is_empty());
         assert!(state.consume_offsets.is_empty());
         assert!(state.lock_ok.is_empty());
         assert!(state.pop_queues.is_empty());
         assert!(pq.is_dropped());
-        // 盖章必须一起清掉：同名队列复用时继承旧时刻会立刻被误判停摆
+        // The stamp must be cleared with everything else: a reused queue key inheriting the old moment would be misjudged stalled at once
         assert!(state.last_pull_at.is_empty());
 
-        // 队列不在 `mq_map` 里（停摆自愈：还归本实例，只是循环死了）走 fallback
+        // Queue not in `mq_map` (stall self-healing: still owned by this instance, only the loop died) takes the fallback
         let mut revoked = Vec::new();
         state.mq_map.insert("gone".to_string(), mq.clone());
         state.queue_owners.insert("gone".to_string(), 3);
@@ -7343,15 +7343,15 @@ mod tests {
             &mut revoked,
             false,
         );
-        // 没有已消费位点就没什么可持久化，但队列仍要进收尾列表
+        // With no consumed offset there is nothing to persist, but the queue still enters the teardown list
         assert_eq!(revoked, vec![(mq, None)]);
-        // 非 POP 模式不去碰 pop_queues（也不该凭空造一把）
+        // Non-POP mode must not touch pop_queues (nor conjure one out of thin air)
         assert!(state.pop_queues.is_empty());
     }
 
-    /// 停机位点下限钳制（[`shutdown_persist_items`]）：已推进位点若越过了仍未落定
-    /// 消息（回投失败压在 pending / 还在 listener 手里）的最小 offset，持久化清单
-    /// 必须钳回去 —— 否则 broker 永远不会重投这几条（立即关闭时的真丢失）。
+    /// Shutdown offset floor clamp ([`shutdown_persist_items`]): if the advanced offset has passed the minimum
+    /// offset of messages not yet settled (send-back failures parked in pending / still held by the listener),
+    /// the persist list must be clamped back -- otherwise the broker will never redeliver these (real loss on immediate shutdown).
     #[test]
     fn shutdown_persist_items_floors_offsets_below_unsettled_messages() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
@@ -7364,9 +7364,9 @@ mod tests {
         {
             let mut state = lock(&consumer.inner.state);
             state.mq_map.insert(key.clone(), mq.clone());
-            // 位点已被推进到 10（例如同一批里回投成功的那几条先落定）
+            // The offset has already advanced to 10 (e.g. the send-back successes of the same batch settled first)
             state.consume_offsets.insert(key.clone(), 10);
-            // 一条回投失败压在 pending，一条还在 listener 手里
+            // One send-back failure parked in pending, one still held by the listener
             state
                 .pending
                 .insert(key.clone(), VecDeque::from(vec![m_low]));
@@ -7375,7 +7375,7 @@ mod tests {
         let items = shutdown_persist_items(&consumer.inner);
         assert_eq!(items, vec![(mq, 5)]);
 
-        // 没有未落定消息的队列按已推进位点原样持久化
+        // A queue without unsettled messages persists at the advanced offset as-is
         let other = queue("T", "broker-a", 1);
         let okey = mq_key(&other);
         {
@@ -7397,7 +7397,7 @@ mod tests {
         {
             let mut state = lock(&consumer.inner.state);
             state.assigned = vec![mq.clone()];
-            // 旧令牌故意用一个不会被重新发出的值，才能看出"归属确实换了"
+            // The old token deliberately uses a value that will never be reissued, so "ownership really changed" is observable
             state.queue_owners.insert(key.clone(), 999);
             state.mq_map.insert(key.clone(), mq.clone());
             state.consume_offsets.insert(key.clone(), 42);
@@ -7411,16 +7411,16 @@ mod tests {
         }
         consumer.rebalance_pull_threads().await;
         let state = lock(&consumer.inner.state);
-        // 换了归属令牌 = 旧循环失效、新循环接管
+        // Ownership token changed = the old loop is dead and a new loop took over
         assert_ne!(state.queue_owners.get(&key).copied(), Some(999));
-        // 缓冲与游标全清：在途消息不再由旧循环消费
+        // Buffer and cursor fully cleared: in-flight messages are no longer consumed by the old loop
         assert!(state.pending.is_empty());
         assert!(state.offset_table.is_empty());
-        // 已消费位点交给收尾路径持久化（这里没有 client，只验它被摘了出来）
+        // The consumed offset is handed to the persist path (no client here; only its removal is verified)
         assert!(!state.consume_offsets.contains_key(&key));
-        // 队列对象仍登记着：自愈不该让订阅变得不可见
+        // The queue object stays registered: self-healing must not make the subscription invisible
         assert_eq!(state.mq_map.get(&key), Some(&mq));
-        // 新循环从"现在"重新计时，不会被下一轮立刻再判停摆
+        // The new loop re-times from "now", so the next round will not immediately re-judge it stalled
         let seeded = *state.last_pull_at.get(&key).unwrap_or(&0);
         assert!(
             seeded >= before || seeded == 0,
@@ -7428,7 +7428,7 @@ mod tests {
         );
     }
 
-    /// 健康的队列必须**原封不动**：换令牌等于把在途消息丢掉。
+    /// A healthy queue must stay **untouched**: swapping the token equals dropping the in-flight messages.
     #[tokio::test]
     async fn a_healthy_queue_keeps_its_loop_and_offset() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
@@ -7455,8 +7455,8 @@ mod tests {
         assert_eq!(state.consume_offsets.get(&key).copied(), Some(42));
     }
 
-    /// 未启动（含正在停机）时不做自愈：那会把清退过程变成 `[BUG]` 日志风暴，
-    /// 而且停摆判据本身在 `started=false` 下没有意义。
+    /// No self-healing while not started (including mid-shutdown): that would turn the teardown into a `[BUG]` log
+    /// storm, and the stall criterion itself is meaningless with `started=false`.
     #[tokio::test]
     async fn stalled_sweep_only_runs_while_started() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
@@ -7468,7 +7468,7 @@ mod tests {
             state.queue_owners.insert(key.clone(), 1);
             state.mq_map.insert(key.clone(), mq.clone());
         }
-        stamp_at(&consumer, &key, 1); // 老得不能再老
+        stamp_at(&consumer, &key, 1); // as old as it gets
         consumer.rebalance_pull_threads().await;
         assert_eq!(
             lock(&consumer.inner.state).queue_owners.get(&key).copied(),
@@ -7521,7 +7521,7 @@ mod tests {
             pqi.get("lastPullTimestamp"),
             Some(&serde_json::Value::from(1_700_000_000_456_i64))
         );
-        // 没盖过章的队列报 0，而不是拿当前时间冒充"还在拉"
+        // An unstamped queue reports 0 instead of passing the current time off as "still pulling"
         let other = queue("T", "broker-a", 1);
         lock(&consumer.inner.state)
             .mq_map
@@ -7555,7 +7555,7 @@ mod tests {
         );
     }
 
-    /// 停机要把盖章表清空：下次 start() 不能继承旧实例的时刻。
+    /// Shutdown must clear the stamp table: the next start() must not inherit the old instance's moments.
     #[test]
     fn shutdown_clears_the_pull_clock() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
@@ -7568,7 +7568,7 @@ mod tests {
     }
 
 
-    // 真实 fastjson2 2.0.59 + rocketmq-client 5.5.0 的输出（含 pretty 版）
+    // Contract fixture: output of real fastjson2 2.0.59 + rocketmq-client 5.5.0 (pretty variant included)
     const CONTRACT_OFFSETS_COMPACT: &str = concat!(
         r#"{"offsetTable":{{"brokerName":"broker-a","queueId":1,"topic":"Tt"}:9,"#,
         r#"{"brokerName":"broker-a","queueId":0,"topic":"Tt"}:7}}"#,
@@ -7595,7 +7595,7 @@ mod tests {
             &test_mq_map(),
         );
         assert!(text.starts_with("{\"offsetTable\":{"));
-        // 字段序 brokerName/queueId/topic（fastjson2 字母序），每个 key 是内嵌对象
+        // Field order brokerName/queueId/topic (fastjson2 alphabetical), each key is a nested object
         assert!(text.contains(r#""brokerName":"broker-a","queueId":0,"topic":"Tt"}:7"#));
         assert!(text.contains(r#""brokerName":"broker-a","queueId":1,"topic":"Tt"}:9"#));
     }
@@ -7681,14 +7681,14 @@ mod tests {
             raw
         );
 
-        // 主文件在 → 读主文件；主文件缺失 → .bak（上一代）
+        // main file present -> read it; main file missing -> .bak (the previous generation)
         let loaded = load_local_offsets_at(&path);
         assert_eq!(loaded.get("Ttbroker-a0"), Some(&99));
         std::fs::remove_file(&path).unwrap();
         let loaded = load_local_offsets_at(&path);
         assert_eq!(loaded.get("Ttbroker-a0"), Some(&7));
 
-        // .bak 也缺失 → 空（按首次启动处理）
+        // .bak missing too -> empty (handled as a first startup)
         std::fs::remove_file(path.with_file_name("offsets.json.bak")).unwrap();
         assert!(load_local_offsets_at(&path).is_empty());
         let _ = std::fs::remove_dir_all(dir);
@@ -7715,21 +7715,21 @@ mod tests {
 
     // ---------------- P5: postSubscriptionWhenPull / pullFromWhichNode ----------------
     //
-    // 覆盖 push 侧这两节的判据。这层是纯函数，
-    // 真报文形状（SUBSCRIPTION 位与 `subscription` 键是否上线、slave 地址选择、从节点
-    // COMMIT_OFFSET 清位、suggestWhichBrokerId 透传）在 `mq_client.rs` 的假 broker 用例里锁死。
+    // Covers the criteria for these two push-side knobs. This layer is pure functions;
+    // the real wire shape (whether the SUBSCRIPTION flag and the `subscription` key go online, slave address selection, slave
+    // COMMIT_OFFSET clearing, suggestWhichBrokerId passthrough) is pinned down by the fake-broker cases in `mq_client.rs`.
 
     const P5_TOPIC: &str = "P5PostSubscriptionTopic";
 
     #[test]
     fn pull_subscription_expression_follows_contract_default() {
         let s = sub(P5_TOPIC, "TagA");
-        // 默认关闭
+        // default off
         assert_eq!(
             pull_subscription_expression(&ConsumerConfig::default(), &s),
             None
         );
-        // 打开
+        // enabled
         let cfg = ConsumerConfig {
             post_subscription_when_pull: true,
             ..ConsumerConfig::default()
@@ -7738,7 +7738,7 @@ mod tests {
             pull_subscription_expression(&cfg, &s).as_deref(),
             Some("TagA")
         );
-        // 类过滤模式：即使打开也不上送（表达式是过滤类名，broker 侧 TAG 过滤会误判）
+        // class-filter mode: not sent even when enabled (the expression is a filter class name; broker-side TAG filtering would misjudge it)
         let mut class_mode = sub(P5_TOPIC, "com.example.MyFilter");
         class_mode.class_filter_mode = true;
         assert_eq!(pull_subscription_expression(&cfg, &class_mode), None);
@@ -7754,16 +7754,16 @@ mod tests {
         assert_eq!(
             recalc_pull_from_which_node(&state, &mq),
             master,
-            "首轮打主节点"
+            "first round hits the master"
         );
 
-        // 老 broker 不带 suggest：按 master 记账，而不是保留旧值
+        // an old broker sends no suggest: bookkeep as master instead of keeping the old value
         update_pull_from_which_node(&mut state, &mq, Some(master + 1));
         assert_eq!(recalc_pull_from_which_node(&state, &mq), master + 1);
         update_pull_from_which_node(&mut state, &mq, None);
         assert_eq!(recalc_pull_from_which_node(&state, &mq), master);
 
-        // 按队列隔离
+        // isolated per queue
         update_pull_from_which_node(&mut state, &mq, Some(2));
         assert_eq!(recalc_pull_from_which_node(&state, &mq), 2);
         assert_eq!(recalc_pull_from_which_node(&state, &other), master);
@@ -7776,8 +7776,8 @@ mod tests {
         queue(CTO_TOPIC, "broker-a", 0)
     }
 
-    /// 直接种状态、直接调[`correct_tags_offset_locked`]：状态判据也收在函数里，
-    /// 于是一次调用就能同时锁死"哪些状态要修正"和"何时允许修正"。
+    /// Drives state directly and calls [`correct_tags_offset_locked`] directly: the state criteria are folded into the function too,
+    /// so one call pins down both "which statuses get corrected" and "when correction is allowed".
     struct CtoHarness {
         state: State,
         key: String,
@@ -7800,24 +7800,24 @@ mod tests {
         }
     }
 
-    /// 空应答的两个状态（NO_NEW_MSG / NO_MATCHED_MSG）都推进；其余状态一律不碰位点。
+    /// Both empty-pull statuses (NO_NEW_MSG / NO_MATCHED_MSG) advance; all other statuses leave the offset untouched.
     ///
-    /// NO_MATCHED_MSG 在本端口来自 broker 的 `PULL_RETRY_IMMEDIATELY`
-    /// （`MQClientAPIImpl:1095-1097` 的映射）：这一段的每一条都被 tags/表达式滤掉时，
-    /// 客户端既收不到消息、`msgCount` 又恒为 0 —— 不修正就永远不会前进。
+    /// NO_MATCHED_MSG in this crate comes from the broker's `PULL_RETRY_IMMEDIATELY`
+    /// (mapped during pull-response decoding): when every message in a stretch is filtered out by tags/expression,
+    /// the client receives no messages and `msgCount` stays 0 -- without a correction it would never advance.
     #[test]
     fn correct_tags_offset_advances_only_on_empty_pull_statuses() {
         for status in [PullStatus::NoNewMsg, PullStatus::NoMatchedMsg] {
             let mut h = CtoHarness::new();
             h.correct(status, 42);
-            assert_eq!(h.offset(), Some(42), "{status:?} 要从 0 抬到应答位点");
+            assert_eq!(h.offset(), Some(42), "{status:?} must lift the offset from 0 to the replied offset");
             h.correct(status, 43);
-            assert_eq!(h.offset(), Some(43), "已有记录时继续按应答前进");
+            assert_eq!(h.offset(), Some(43), "keeps advancing by the replied offset once a record exists");
         }
         for status in [PullStatus::Found, PullStatus::OffsetIllegal] {
             let mut h = CtoHarness::new();
             h.correct(status, 42);
-            assert_eq!(h.offset(), None, "{status:?} 不是空应答，不许碰位点");
+            assert_eq!(h.offset(), None, "{status:?} is not an empty pull; the offset must not be touched");
         }
     }
 
@@ -7825,28 +7825,28 @@ mod tests {
     fn correct_tags_offset_creates_the_record_even_for_a_zero_offset() {
         let mut h = CtoHarness::new();
         h.correct(PullStatus::NoNewMsg, 0);
-        assert_eq!(h.offset(), Some(0), "空队列的 0 也要建记录");
+        assert_eq!(h.offset(), Some(0), "even a 0 for an empty queue must create the record");
         h.correct(PullStatus::NoNewMsg, 0);
-        assert_eq!(h.offset(), Some(0), "建完再修正：不前进也不回退");
+        assert_eq!(h.offset(), Some(0), "correcting again after creation: neither advances nor regresses");
     }
 
-    /// `increaseOnly=true`：只前进不回退。
+    /// `increaseOnly=true`: advance only, never regress.
     #[test]
     fn correct_tags_offset_never_regresses() {
         let mut h = CtoHarness::new();
         h.state.consume_offsets.insert(h.key.clone(), 100);
         h.correct(PullStatus::NoNewMsg, 50);
-        assert_eq!(h.offset(), Some(100), "应答位点更小：原地不动");
+        assert_eq!(h.offset(), Some(100), "replied offset is smaller: stay in place");
         h.correct(PullStatus::NoNewMsg, 100);
-        assert_eq!(h.offset(), Some(100), "相等：不动");
+        assert_eq!(h.offset(), Some(100), "equal: no change");
         h.correct(PullStatus::NoNewMsg, 101);
         assert_eq!(h.offset(), Some(101));
     }
 
-    /// 闸门：`ProcessQueue` 里还有消息（缓冲里的 + listener 手里的）就一律不动位点。
+    /// Gate: while `ProcessQueue` still holds messages (buffered plus in the listener's hands), the offset is never touched.
     #[test]
     fn correct_tags_offset_respects_the_process_queue_guard() {
-        // 缓冲里还有一条没消费
+        // one message still buffered and unconsumed
         let mut h = CtoHarness::new();
         h.state
             .pending
@@ -7854,20 +7854,20 @@ mod tests {
             .unwrap()
             .push_back(ext(CTO_TOPIC, None));
         h.correct(PullStatus::NoNewMsg, 42);
-        assert_eq!(h.offset(), None, "pending 非空");
+        assert_eq!(h.offset(), None, "pending is not empty");
 
-        // 缓冲空了，但有一条在 listener 手里
+        // buffer is empty, but one message is in the listener's hands
         let mut h = CtoHarness::new();
         h.state.inflight.insert(h.key.clone(), 1);
         h.correct(PullStatus::NoMatchedMsg, 42);
-        assert_eq!(h.offset(), None, "在途也算 msgCount != 0");
+        assert_eq!(h.offset(), None, "in-flight also counts as msgCount != 0");
 
-        // 显式的 0（收尾时短暂可能出现）不挡路
+        // an explicit 0 (briefly possible while wrapping up) does not block
         h.state.inflight.insert(h.key.clone(), 0);
         h.correct(PullStatus::NoNewMsg, 42);
-        assert_eq!(h.offset(), Some(42), "inflight 归零后可以修正");
+        assert_eq!(h.offset(), Some(42), "correction is allowed once inflight drops to zero");
 
-        // 连 pending 表项都没有（从未拉过该队列）按空处理，不能因为缺项就漏掉修正
+        // no pending entry at all (queue never pulled) counts as empty; a missing entry must not skip the correction
         let mut fresh = CtoHarness {
             state: State::default(),
             key: mq_key(&cto_mq()),
@@ -7876,14 +7876,14 @@ mod tests {
         assert_eq!(fresh.offset(), Some(7));
     }
 
-    /// listener 侧的门闩：
-    /// - 进来先记下"在途期间调一次修正"的结果（**不能**在这里断言：listener 跑在
-    ///   `spawn_blocking` 线程上，panic 会被 `call_concurrently_listener` 吞成
-    ///   `RECONSUME_LATER`，测试反而"通过"了）；
-    /// - 然后一直阻塞到主线程放开 —— 正好把"批次在途"那一瞬定住。
+    /// The latch on the listener side:
+    /// - on entry, first record the result of "one correction call while the batch is in flight" (do **not** assert here: the listener runs on
+    ///   a `spawn_blocking` thread, where a panic is swallowed by `call_concurrently_listener` into
+    ///   `RECONSUME_LATER`, and the test would "pass" after all);
+    /// - then block until the main thread releases it -- freezing exactly the instant when the batch is in flight.
     ///
-    /// 门闩用 tokio 通道而不是 `std::sync::mpsc`：后者的 `Sender` 不是 `Sync`，
-    /// 进不了 `Send + Sync` 的监听器 trait。
+    /// The latch uses tokio channels rather than `std::sync::mpsc`: the latter's `Sender` is not `Sync`,
+    /// so it cannot enter the `Send + Sync` listener trait.
     struct GatedListener {
         inner: Arc<Inner>,
         key: String,
@@ -7908,8 +7908,8 @@ mod tests {
         }
     }
 
-    /// 真机链路（broker 过滤 → NO_MATCHED_MSG → broker 侧位点前移）见
-    /// `examples/live_correct_tags_offset.rs`。
+    /// For the live-cluster path (broker filtering -> NO_MATCHED_MSG -> broker-side offset advance), see
+    /// `examples/live_correct_tags_offset.rs`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dispatch_loop_keeps_the_correction_out_until_the_listener_returns() {
         let cfg = ConsumerConfig {
@@ -7944,19 +7944,19 @@ mod tests {
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(dispatch_loop(c.inner.clone(), stop_rx));
 
-        // listener 已进入：批次在途
+        // listener has entered: batch in flight
         let observed = tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
             .await
-            .expect("listener 未被调用（5s）")
-            .expect("entered 通道意外关闭");
-        assert_eq!(observed, None, "在途期间位点必须原地不动");
+            .expect("listener was not called (5s)")
+            .expect("entered channel closed unexpectedly");
+        assert_eq!(observed, None, "the offset must not move while the batch is in flight");
         assert_eq!(
             lock(&c.inner.state).inflight.get(&key).copied(),
             Some(1),
-            "批次在途时 inflight 必须是 1"
+            "inflight must be 1 while the batch is in flight"
         );
 
-        release_tx.send(()).expect("release 通道已关闭");
+        release_tx.send(()).expect("release channel already closed");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             if lock(&c.inner.state)
@@ -7968,10 +7968,10 @@ mod tests {
             {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "批次未在 5s 内结清");
+            assert!(tokio::time::Instant::now() < deadline, "batch not settled within 5s");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        // 成功消费已把位点推到 max(queueOffset)+1；此时空应答的修正才允许生效
+        // successful consumption has already pushed the offset to max(queueOffset)+1; only now may the empty-pull correction take effect
         assert_eq!(
             lock(&c.inner.state).consume_offsets.get(&key).copied(),
             Some(2)
@@ -7981,23 +7981,23 @@ mod tests {
             correct_tags_offset_locked(&mut state, &key, PullStatus::NoMatchedMsg, 110);
             assert_eq!(state.consume_offsets.get(&key).copied(), Some(110));
         }
-        // 计数归零后表项就该删掉，别堆无主的 key
+        // once the counter reaches zero the entry should be removed; do not pile up orphaned keys
         assert!(!lock(&c.inner.state).inflight.contains_key(&key));
 
         drop(stop_tx);
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
     }
 
-    // ---------------- cleanExpiredMsg（挂起 listener 的逃生口） ----------------
+    // ---------------- cleanExpiredMsg (escape hatch for a hung listener) ----------------
 
     #[test]
     fn clean_expire_period_equals_consume_timeout_minutes() {
-        assert_eq!(clean_expire_period_millis(15), 900_000, "默认 15 分钟");
+        assert_eq!(clean_expire_period_millis(15), 900_000, "default 15 minutes");
         assert_eq!(clean_expire_period_millis(1), 60_000);
         assert_eq!(
             clean_expire_period_millis(0),
             60_000,
-            "0 钳到 1 分钟，别忙等"
+            "0 clamps to 1 minute; avoids busy-waiting"
         );
         assert_eq!(clean_expire_period_millis(-3), 60_000);
     }
@@ -8005,30 +8005,30 @@ mod tests {
     #[test]
     fn consume_start_timestamp_reads_only_well_formed_stamps() {
         let mut m = ext("T", None);
-        assert_eq!(consume_start_timestamp(&m), None, "没盖章");
+        assert_eq!(consume_start_timestamp(&m), None, "no stamp");
         m.put_property(PROPERTY_CONSUME_START_TIMESTAMP, "");
-        assert_eq!(consume_start_timestamp(&m), None, "空串");
+        assert_eq!(consume_start_timestamp(&m), None, "empty string");
         m.put_property(PROPERTY_CONSUME_START_TIMESTAMP, "not-a-number");
-        assert_eq!(consume_start_timestamp(&m), None, "坏值");
+        assert_eq!(consume_start_timestamp(&m), None, "malformed value");
         m.put_property(PROPERTY_CONSUME_START_TIMESTAMP, "1700000000000");
         assert_eq!(consume_start_timestamp(&m), Some(1_700_000_000_000));
     }
 
-    /// 过期判据是**严格**大于（等于阈值不动手），没盖章不当过期。
+    /// Expiry uses a **strictly** greater comparison (equal to the threshold does nothing); a missing stamp is not treated as expired.
     #[test]
     fn is_consume_expired_is_strict_and_ignores_missing_stamps() {
         let now = 10_000_000i64;
         assert!(
             is_consume_expired(Some(now - 60_001), now, 1),
-            "刚过阈值 1ms"
+            "1ms past the threshold"
         );
         assert!(
             !is_consume_expired(Some(now - 60_000), now, 1),
-            "恰好等于阈值：严格大于才动手"
+            "exactly at the threshold: only strictly greater acts"
         );
         assert!(!is_consume_expired(Some(now), now, 1));
-        assert!(!is_consume_expired(None, now, 1), "没盖章不当过期");
-        // 默认 15 分钟：14 分 59.999 秒不动手，15 分零 1 毫秒动手
+        assert!(!is_consume_expired(None, now, 1), "a missing stamp is not treated as expired");
+        // default 15 minutes: 14m59.999s does nothing, 15m plus 1ms acts
         assert!(!is_consume_expired(Some(now - 899_999), now, 15));
         assert!(is_consume_expired(Some(now - 900_001), now, 15));
     }
@@ -8041,9 +8041,9 @@ mod tests {
         let now = current_time_millis();
         {
             let mut state = lock(&consumer.inner.state);
-            let mut head = ext("T", None); // 头没盖章
+            let mut head = ext("T", None); // head carries no stamp
             head.queue_offset = 0;
-            let mut tail = ext("T", None); // 尾巴过期了也不该动
+            let mut tail = ext("T", None); // the tail is expired but must still not be touched
             tail.queue_offset = 1;
             tail.put_property(
                 PROPERTY_CONSUME_START_TIMESTAMP,
@@ -8056,10 +8056,10 @@ mod tests {
         assert_eq!(
             clean_expired_queue(&consumer.inner, &key).await,
             0,
-            "队首没过期：后面的更不可能过期（命中即停）"
+            "head not expired: later entries cannot be either (stop at the first hit)"
         );
         let state = lock(&consumer.inner.state);
-        assert_eq!(state.pending.get(&key).unwrap().len(), 2, "一条都不许动");
+        assert_eq!(state.pending.get(&key).unwrap().len(), 2, "not a single entry may be touched");
     }
 
     #[tokio::test]
@@ -8104,15 +8104,15 @@ mod tests {
         assert_eq!(
             clean_expired_queue(&consumer.inner, &key).await,
             2,
-            "loop=min(2,16)=2：回投失败后本轮仍会对同一条队首再试一次"
+            "loop=min(2,16)=2: after a failed send-back this round still retries the same head once more"
         );
         let state = lock(&consumer.inner.state);
         assert_eq!(
             state.pending.get(&key).unwrap().len(),
             2,
-            "回投失败绝不摘除（摘了就真丢了）"
+            "a failed send-back never removes the entry (removing it would truly lose the message)"
         );
-        assert!(!state.consume_offsets.contains_key(&key), "位点不许动");
+        assert!(!state.consume_offsets.contains_key(&key), "the offset must not be touched");
     }
 
     #[tokio::test]
@@ -8138,11 +8138,11 @@ mod tests {
         assert_eq!(
             clean_expired_queue(&consumer.inner, &key).await,
             16,
-            "loop 在循环之前算一次：上限 16"
+            "loop is computed once before the loop: cap 16"
         );
     }
 
-    /// 顺序消费没有这条路径（`ProcessQueue:76-78` 直接早退）。
+    /// Orderly consumption has no such path (the orderly `ProcessQueue` early-returns right away).
     #[tokio::test]
     async fn clean_expired_queue_skips_orderly_consumers() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
@@ -8161,7 +8161,7 @@ mod tests {
         assert_eq!(clean_expired_queue(&consumer.inner, &key).await, 0);
     }
 
-    /// 「仍是队首才摘」的两种让位：正常收尾（条目已摘/已前进）与更小位点冒头。
+    /// The two ways "remove only while still head" yields: normal wrap-up (entry already removed/advanced) and a smaller offset appearing.
     #[test]
     fn remove_expired_entry_only_when_still_head() {
         let key = mq_key(&queue("T", "broker-a", 0));
@@ -8171,7 +8171,7 @@ mod tests {
             m
         };
 
-        // 仍是队首：两边一起摘
+        // still the head: remove from both sides together
         let mut state = State::default();
         state
             .inflight_msgs
@@ -8183,11 +8183,11 @@ mod tests {
         assert_eq!(
             state.inflight_msgs.get(&key).unwrap().len(),
             1,
-            "登记侧摘掉"
+            "removed from the registry side"
         );
-        assert!(state.pending.get(&key).unwrap().is_empty(), "缓冲侧也摘");
+        assert!(state.pending.get(&key).unwrap().is_empty(), "removed from the buffer side too");
 
-        // 前面冒出了更小的位点：让位，不许抢摘
+        // a smaller offset appeared ahead: yield; must not race to remove it
         let mut state = State::default();
         state.inflight_msgs.insert(key.clone(), vec![msg(5)]);
         state
@@ -8196,12 +8196,12 @@ mod tests {
         assert!(!remove_expired_entry_if_still_head(&mut state, &key, 5));
         assert_eq!(state.inflight_msgs.get(&key).unwrap().len(), 1);
 
-        // 已经不在视图里（listener 正常收尾先摘了）：同样为 false，且不 panic
+        // already gone from the view (the listener removed it during normal wrap-up): still false, and no panic
         let mut state = State::default();
         assert!(!remove_expired_entry_if_still_head(&mut state, &key, 0));
     }
 
-    /// 并集视图与 containsMessage：被清扫摘掉的条目对回投判据立刻不可见。
+    /// The union view and containsMessage: entries removed by the sweep become invisible to the send-back criteria immediately.
     #[test]
     fn process_queue_view_unions_inflight_and_pending_by_offset() {
         let key = mq_key(&queue("T", "broker-a", 0));
@@ -8220,7 +8220,7 @@ mod tests {
             assert_eq!(
                 process_queue_entries_locked(&state, &key).len(),
                 2,
-                "按位点去重（登记的与缓冲的重叠只算一条）"
+                "deduplicated by offset (registry and buffer overlap counts as one)"
             );
             assert_eq!(
                 process_queue_first_entry_locked(&state, &key)
@@ -8237,7 +8237,7 @@ mod tests {
             remove_process_queue_entry_locked(&mut state, &key, 1);
             assert!(!process_queue_contains_locked(&state, &key, 1));
             assert!(process_queue_contains_locked(&state, &key, 2));
-            assert!(!state.inflight_msgs.contains_key(&key), "空桶要删掉");
+            assert!(!state.inflight_msgs.contains_key(&key), "empty buckets must be dropped");
         }
     }
 
@@ -8252,9 +8252,9 @@ mod tests {
             b.queue_offset = 1;
             vec![a, b]
         };
-        // 两条都在清扫视图里（正常在途态）
+        // both entries are in the sweep view (normal in-flight state)
         register_inflight_msgs(&consumer.inner, &key, &batch);
-        // 清扫把 o1 摘走（模拟挂起超时后被打回 broker）：视图里从此没有它
+        // the sweep removed o1 (simulating a send-back to the broker after the hang timeout): it is gone from the view from then on
         {
             let mut state = lock(&consumer.inner.state);
             remove_process_queue_entry_locked(&mut state, &key, 1);
@@ -8265,10 +8265,10 @@ mod tests {
         assert_eq!(
             failed.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
             vec![0],
-            "o0 尝试回投但失败（未 start）；o1 已被清扫，直接跳过"
+            "o0 attempts a send-back but fails (not started); o1 was swept away and is skipped outright"
         );
-        assert_eq!(failed[0].1.reconsume_times, 1, "失败就地 +1");
-        assert_eq!(batch[1].reconsume_times, 0, "被跳过的条目不许加次数");
+        assert_eq!(failed[0].1.reconsume_times, 1, "failure increments in place");
+        assert_eq!(batch[1].reconsume_times, 0, "skipped entries must not get their count bumped");
     }
 
     #[test]
@@ -8276,30 +8276,30 @@ mod tests {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
         assert!(
             require_client(&consumer.inner).is_err(),
-            "公开路径仍要 started 门"
+            "the public path still requires the started gate"
         );
         assert!(
             require_client_for_send_back(&consumer.inner).is_err(),
-            "没有实例谁都不放行"
+            "with no instance, nobody gets through"
         );
 
         *lock(&consumer.inner.client) =
             Some(MQClientInstance::new("gid-shutdown-sendback", vec![]));
-        // shutdown() 的第一步：先置 false 再排空在途批次。
+        // first step of shutdown(): set the flag false before draining in-flight batches.
         consumer.inner.started.store(false, Ordering::Release);
         assert!(require_client(&consumer.inner).is_err());
         assert!(
             require_client_for_send_back(&consumer.inner).is_ok(),
-            "排空窗口内回投必须还能取到实例"
+            "during the drain window a send-back must still be able to fetch the instance"
         );
 
         lock(&consumer.inner.client).take();
         assert!(require_client_for_send_back(&consumer.inner).is_err());
     }
 
-    /// 接线取证：`dispatch_loop` 走并发路径时必须把**盖过章**的这批登记进清扫视图，
-    /// 并在收尾后注销。登记早了（盖章之前）表里就是未盖章副本，清扫永远看不见它们；
-    /// 漏注销则位点被 correctTagsOffset 的在途闸门永久挡停。
+    /// Wiring evidence: when `dispatch_loop` takes the concurrent path it must register this batch **after stamping** into the sweep view,
+    /// and unregister it after wrap-up. Registering too early (before the stamp) would put unstamped copies in the table and the sweep would never see them;
+    /// skipping the unregister leaves the offset permanently stuck behind the correctTagsOffset in-flight gate.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dispatch_registers_a_stamped_inflight_view() {
         let cfg = ConsumerConfig {
@@ -8330,15 +8330,15 @@ mod tests {
 
         let _ = tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
             .await
-            .expect("listener 未被调用（5s）")
-            .expect("entered 通道意外关闭");
+            .expect("listener was not called (5s)")
+            .expect("entered channel closed unexpectedly");
         {
             let state = lock(&c.inner.state);
             let entries = process_queue_entries_locked(&state, &key);
-            assert_eq!(entries.len(), 2, "在途批次要出现在清扫视图里");
+            assert_eq!(entries.len(), 2, "the in-flight batch must appear in the sweep view");
             assert!(
                 entries.iter().all(|m| consume_start_timestamp(m).is_some()),
-                "登记进视图的副本必须已盖 CONSUME_START_TIME"
+                "the copies registered into the view must already carry the CONSUME_START_TIME stamp"
             );
             assert!(
                 !is_consume_expired(
@@ -8346,20 +8346,20 @@ mod tests {
                     current_time_millis(),
                     1
                 ),
-                "刚登记的消息不该立刻判成过期"
+                "a freshly registered message must not be judged expired right away"
             );
         }
 
-        release_tx.send(()).expect("release 通道已关闭");
+        release_tx.send(()).expect("release channel already closed");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             if !lock(&c.inner.state).inflight_msgs.contains_key(&key) {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "登记未在 5s 内注销");
+            assert!(tokio::time::Instant::now() < deadline, "registration not unregistered within 5s");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        // 清扫视图随之回到「只剩缓冲消息」的状态
+        // the sweep view thereby returns to the "only buffered messages" state
         assert!(process_queue_entries_locked(&lock(&c.inner.state), &key).is_empty());
 
         drop(stop_tx);
@@ -8388,7 +8388,7 @@ mod tests {
             state
                 .pending
                 .insert(held.clone(), VecDeque::from(vec![expired.clone()]));
-            // 另一个队列不在 mq_map 里（已撤）：即便缓冲里还残留也不该被扫到
+            // the other queue is not in mq_map (already revoked): even a leftover buffer entry must not be swept
             state
                 .pending
                 .insert(other.clone(), VecDeque::from(vec![expired]));
@@ -8396,7 +8396,7 @@ mod tests {
         assert_eq!(
             clean_expired_msg_once(&consumer.inner).await,
             1,
-            "只有仍持有的那条队列被扫"
+            "only the still-held queue gets scanned"
         );
     }
 
@@ -8415,11 +8415,11 @@ mod tests {
         assert_eq!(stamps.len(), 1);
         assert!(
             stamps[0].is_some(),
-            "POP 批次在 listener 之前必须盖 CONSUME_START_TIME"
+            "a POP batch must be stamped with CONSUME_START_TIME before the listener"
         );
     }
 
-    /// 记录 listener 看到的 CONSUME_START_TIME（POP 盖章取证用）。
+    /// Records the CONSUME_START_TIME the listener sees (POP stamping evidence).
     struct StampRecordingListener(Arc<Mutex<Vec<Option<i64>>>>);
 
     impl MessageListenerConcurrently for StampRecordingListener {
@@ -8436,18 +8436,18 @@ mod tests {
         }
     }
 
-    // 这条路径错了是**静默**的两种极端 ——
+    // Getting this path wrong fails **silently** in two opposite ways --
     //
-    //   * 只把拉取游标拨到 `nextBeginOffset` 而不丢队列/不冻结：broker 刚把位点纠正到合法
-    //     区间，这条队列上**已经取回还没 ack** 的旧批次一 ack 又把位点推回非法值，下一轮
-    //     拉取再被 broker 拒一次 —— 客户端与 broker 之间来回弹跳，永不停歇；
-    //   * 纠错后的位点没立刻落盘：进程在下一轮周期落盘（默认 5s）之前崩掉，broker 上留着的
-    //     还是非法位点，重启后从非法位点起拉 —— 这条纠错等于没做。
+    //   * moving only the pull cursor to `nextBeginOffset` without dropping the queue/freezing it: the broker just corrected the offset into the legal
+    //     range, but the old batches on this queue that were **already fetched but not acked** push the offset back to the illegal value the moment they ack,
+    //     and the next pull gets rejected by the broker again -- the client and the broker bounce back and forth, forever;
+    //   * the corrected offset is not persisted right away: if the process crashes before the next periodic persist (default 5s), what remains on the
+    //     broker is still the illegal offset, and pulls after a restart resume from it -- the correction might as well never have happened.
     //
-    // 两个方向在真机短期窗口里都看不出差别（消息照消费、只是一直在弹/一次崩溃才暴露），
-    // 所以断言全部放离线；真机另有一条链路证明（见 `examples/live_offset_illegal.rs`）。
+    // Neither direction is distinguishable in a short live window (messages still get consumed; only constant bouncing or a single crash exposes it),
+    // so the assertions are all offline; a separate live path proves it (see `examples/live_offset_illegal.rs`).
 
-    /// 模拟 listener 返回后的位点推进（`consume_batch` 收尾调的就是它）。
+    /// Simulates the offset advance after the listener returns (exactly what `consume_batch` calls at wrap-up).
     fn ack_batch(c: &DefaultMQPushConsumer, key: &str, offsets: &[i64], epoch: u64) {
         let batch: Vec<MessageExt> = offsets
             .iter()
@@ -8468,7 +8468,7 @@ mod tests {
     }
 
     impl IllegalHarness {
-        /// `assigned=false` 模拟「队列已经不在本实例名下」；`epoch` 非 0 时预置代号。
+        /// `assigned=false` simulates "the queue is no longer owned by this instance"; a non-zero `epoch` presets the epoch.
         fn new(assigned: bool, epoch: u64) -> IllegalHarness {
             let cfg = ConsumerConfig {
                 consumer_group: "G".to_string(),
@@ -8492,7 +8492,7 @@ mod tests {
             IllegalHarness { c, key, mq }
         }
 
-        /// 模拟拉取回调里 `OFFSET_ILLEGAL` 的锁内动作（游标 + 冻结 + 修正值）。
+        /// Simulates the in-lock actions for `OFFSET_ILLEGAL` in the pull callback (cursor + freeze + corrected value).
         fn freeze(&self, off: i64) {
             let mut state = lock(&self.c.inner.state);
             state.offset_table.insert(self.key.clone(), off);
@@ -8500,7 +8500,7 @@ mod tests {
             state.consume_offsets.insert(self.key.clone(), off);
         }
 
-        /// `handle_offset_illegal` 里的撤队列那一半（锁内），返回要落盘的对象。
+        /// The queue-retiring half of `handle_offset_illegal` (in-lock); returns the objects to persist.
         fn retire(&self) -> Vec<(MessageQueue, Option<i64>)> {
             let mut revoked = Vec::new();
             let mut state = lock(&self.c.inner.state);
@@ -8538,7 +8538,7 @@ mod tests {
         }
     }
 
-    /// 数 listener 被调了几次（被丢弃的批次连 listener 都不该进）。
+    /// Counts how many times the listener was called (dropped batches must not even reach the listener).
     struct CountingListener {
         calls: Arc<std::sync::atomic::AtomicUsize>,
     }
@@ -8563,38 +8563,38 @@ mod tests {
         h.freeze(0);
         let revoked = h.retire();
 
-        // 已消费位点交给调用方去落盘（`handle_offset_illegal` 里就是 `revoke_queues`）
+        // the consumed offset is handed to the caller to persist (in `handle_offset_illegal` this is `revoke_queues`)
         assert_eq!(revoked.len(), 1);
         assert_eq!(revoked[0].0, h.mq);
-        assert_eq!(revoked[0].1, Some(0), "落盘的是纠错后的冻结位点");
+        assert_eq!(revoked[0].1, Some(0), "what gets persisted is the corrected frozen offset");
 
         let state = lock(&h.c.inner.state);
-        assert!(!state.pending.contains_key(&h.key), "缓冲整批作废");
+        assert!(!state.pending.contains_key(&h.key), "the buffered batch is invalidated wholesale");
         assert!(!state.offset_table.contains_key(&h.key));
         assert!(!state.consume_offsets.contains_key(&h.key));
         assert!(!state.mq_map.contains_key(&h.key));
         assert!(!state.queue_owners.contains_key(&h.key));
         assert!(
             !state.last_pull_at.contains_key(&h.key),
-            "同名队列复用时不能继承旧时刻"
+            "a queue reused under the same name must not inherit the old timestamp"
         );
         assert_eq!(
             state.queue_epoch.get(&h.key).copied(),
             Some(1),
-            "代号 +1（setDropped）"
+            "epoch +1 (setDropped)"
         );
-        assert!(state.frozen_offsets.contains(&h.key), "冻结要留到队列重建");
+        assert!(state.frozen_offsets.contains(&h.key), "the freeze must survive until the queue is rebuilt");
     }
 
     #[test]
     fn retire_without_a_queue_is_a_noop() {
-        // 队列已经不在本实例名下（并发撤销）：没有 mq 就没有可落盘的对象，不能凭空造一条
+        // the queue is no longer owned by this instance (concurrent revoke): no mq means nothing to persist, and none may be fabricated
         let h = IllegalHarness::new(false, 0);
         assert!(h.retire().is_empty());
         assert_eq!(
             h.epoch(),
             1,
-            "撤队列照样清状态 + 代号前进（重建是调用方的下一步）"
+            "retiring still clears state and advances the epoch (rebuilding is the caller's next step)"
         );
     }
 
@@ -8607,7 +8607,7 @@ mod tests {
         assert_eq!(
             h.epoch(),
             2,
-            "重建前又出一次非法：代号继续前进，旧批次依旧作废"
+            "another illegal event before the rebuild: the epoch keeps advancing and old batches stay invalidated"
         );
     }
 
@@ -8621,7 +8621,7 @@ mod tests {
         assert!(!lock(&h.c.inner.state).mq_map.contains_key(&h.key));
         assert!(
             h.c.inner.rebalance_now.load(Ordering::SeqCst),
-            "removeProcessQueue 之后要靠 rebalanceImmediately 重建这条队列"
+            "after removeProcessQueue the queue must be rebuilt via rebalanceImmediately"
         );
     }
 
@@ -8657,23 +8657,23 @@ mod tests {
         let h = IllegalHarness::new(true, 0);
         h.freeze(0);
         h.retire();
-        // 重建：把队列重新划给自己（`rebalance_pull_threads` 的建分支）
+        // rebuild: assign the queue to self again (the build branch of `rebalance_pull_threads`)
         lock(&h.c.inner.state).assigned = vec![h.mq.clone()];
         h.c.rebalance_pull_threads().await;
         assert!(
             !h.frozen(),
-            "新 ProcessQueue 就位就该解冻，否则队列从此只拉不 ack"
+            "the new ProcessQueue must unfreeze as soon as it is in place, or the queue would from then on only pull and never ack"
         );
-        // 重建后 ack 恢复正常：只有**新代号**的批次算数，旧代号的依旧作废
+        // after the rebuild acks work again: only batches with the **new epoch** count; old-epoch ones stay invalidated
         h.ack(&[0, 1], 0);
-        assert_eq!(h.offset(), None, "旧代号的 ack 还是不许动位点");
+        assert_eq!(h.offset(), None, "an old-epoch ack still must not move the offset");
         h.ack(&[0, 1], h.epoch());
         assert_eq!(h.offset(), Some(2));
     }
 
     #[tokio::test]
     async fn stale_epoch_batch_is_not_consumed() {
-        // 队列被撤销/重建（代号 0 → 1）后，排队期间被丢弃的批次不能再消费
+        // after the queue is revoked/rebuilt (epoch 0 -> 1), batches dropped while queued up must not be consumed
         let h = IllegalHarness::new(true, 1);
         let listener = Arc::new(CountingListener {
             calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -8686,9 +8686,9 @@ mod tests {
         assert_eq!(
             listener.calls.load(Ordering::SeqCst),
             0,
-            "连 listener 都不该进"
+            "the listener must not even be entered"
         );
-        assert_eq!(h.offset(), Some(3), "旧批次不动位点");
+        assert_eq!(h.offset(), Some(3), "the old batch leaves the offset alone");
     }
 
     #[tokio::test]
@@ -8716,14 +8716,14 @@ mod tests {
             .consume_offsets
             .insert(h.key.clone(), 0);
         h.ack(&[0, 1, 2], 0);
-        assert_eq!(h.offset(), Some(0), "旧代号的 ack 不能动位点");
+        assert_eq!(h.offset(), Some(0), "an old-epoch ack must not move the offset");
         h.ack(&[0, 1, 2], 1);
         assert_eq!(h.offset(), Some(3));
     }
 
     #[test]
     fn illegal_recovery_does_not_touch_sibling_queues() {
-        // 同实例的另一条队列不受牵连：撤队列/冻结必须按 key 隔离
+        // another queue of the same instance stays unaffected: retiring/freezing must be isolated by key
         let h = IllegalHarness::new(true, 0);
         let other = queue("T", "broker-a", 1);
         let other_key = mq_key(&other);
@@ -8750,13 +8750,13 @@ mod tests {
         assert!(!state.frozen_offsets.contains(&other_key));
     }
 
-    // ---------------- 220 RESET_CONSUMER_CLIENT_OFFSET 的处理 ----------------
+    // ---------------- handling of 220 RESET_CONSUMER_CLIENT_OFFSET ----------------
     //
     //
-    // 只把新位点写进内存表的做法是**静默**失效的：重置前取回、重置后才返回的批次一 ack
-    // 就把位点推回原处，broker 上刚写下的新位点被盖掉，消费从重置前的位置继续 —— 而
-    // 222 的响应里那一组 offsetTable 看着完全正常。撤销 + 代号（setDropped）才是判据。
-    // 真机链路见 `examples/live_reset_offset.rs`（含 broker 端位点的回读）。
+    // Writing the new offset only into the in-memory table fails **silently**: a batch fetched before the reset but returned after it pushes
+    // the offset back to its old place the moment it acks, the freshly written broker-side offset gets overwritten, and consumption
+    // continues from the pre-reset position -- while the offsetTable group in the 222 response looks perfectly normal. Revocation + epoch (setDropped) is the real criterion.
+    // For the live path see `examples/live_reset_offset.rs` (including reading the broker-side offset back).
 
     struct ResetHarness {
         c: Arc<DefaultMQPushConsumer>,
@@ -8812,26 +8812,26 @@ mod tests {
         }
     }
 
-    /// 未 start() 的实例上，落盘与 rebalance 都没有 client 可发（与
-    /// `handle_offset_illegal` 的离线测试同一约束），所以这里锁的是**状态迁移**：
-    /// 队列被撤（代号 +1）、表项清空、旧代号的 ack 不再生效。
+    /// On an instance that has not start()ed, neither persist nor rebalance has a client to send with (the same
+    /// constraint as the offline `handle_offset_illegal` tests), so what is pinned here is the **state transition**:
+    /// the queue is retired (epoch +1), table entries cleared, and old-epoch acks no longer take effect.
     #[tokio::test]
     async fn reset_offset_retires_the_queue_and_drops_the_pre_reset_batch() {
         let h = ResetHarness::new(MessageModel::CLUSTERING);
         h.reset(0).await;
-        assert_eq!(h.epoch(), 1, "队列被撤，代号 +1");
-        assert_eq!(h.offset(), None, "位点交给落盘");
+        assert_eq!(h.epoch(), 1, "the queue was retired, epoch +1");
+        assert_eq!(h.offset(), None, "the offset is handed over for persistence");
         {
             let state = lock(&h.c.inner.state);
             assert!(!state.mq_map.contains_key(&h.key));
-            assert!(!state.pending.contains_key(&h.key), "缓冲整批作废");
+            assert!(!state.pending.contains_key(&h.key), "the buffered batch is invalidated wholesale");
             assert!(!state.offset_table.contains_key(&h.key));
             assert!(!state.queue_owners.contains_key(&h.key));
         }
-        // 重置前取回、重置后才返回的批次（代号 0）：ack 必须被丢弃，位点不能复活
+        // a batch fetched before the reset but returned after it (epoch 0): its ack must be dropped; the offset must not come back to life
         ack_batch(&h.c, &h.key, &[0, 1], 0);
-        assert_eq!(h.offset(), None, "旧批次的 ack 已被代号挡住");
-        // 重建后的队列（代号 1）ack 照常
+        assert_eq!(h.offset(), None, "the old batch's ack is blocked by the epoch");
+        // the rebuilt queue (epoch 1) acks as usual
         ack_batch(&h.c, &h.key, &[4, 5], 1);
         assert_eq!(h.offset(), Some(6));
     }
@@ -8851,25 +8851,25 @@ mod tests {
                 .last_pull_at
                 .insert(other_key.clone(), 1_700_000_000_000);
         }
-        // offsetTable 只含 0 号队列：同 topic 的 1 号队列不受牵连
+        // the offsetTable contains only queue 0: queue 1 of the same topic stays unaffected
         h.reset(0).await;
         {
             let state = lock(&h.c.inner.state);
             assert!(state.mq_map.contains_key(&other_key));
             assert!(
                 !state.pending.contains_key(&other_key),
-                "1 号队列本来就没有缓冲"
+                "queue 1 has no buffer to begin with"
             );
             assert_eq!(state.consume_offsets.get(&other_key).copied(), Some(9));
             assert_eq!(state.queue_epoch.get(&other_key).copied().unwrap_or(0), 0);
             assert_eq!(state.queue_owners.get(&other_key).copied(), Some(2));
         }
-        // 表里没有本实例持有的队列（别的实例/别的 broker）：不动任何状态
+        // the table holds no queue owned by this instance (another instance/another broker): no state is touched
         h.c.clone()
             .reset_offset("T".to_string(), vec![(queue("T", "broker-b", 0), 0)])
             .await
             .expect("reset_offset must not error");
-        assert_eq!(h.epoch(), 1, "上一笔的代号不回退");
+        assert_eq!(h.epoch(), 1, "the previous entry's epoch does not regress");
         assert_eq!(h.offset(), None);
         assert_eq!(
             lock(&h.c.inner.state)
@@ -8880,8 +8880,8 @@ mod tests {
         );
     }
 
-    /// 广播撤销要把撤下来的位点连同队列一起并进本地点位文件：只并位点不够，
-    /// `build_local_offsets_json` 在 `mq_map` 里查不到队列会**静默跳过**该条目。
+    /// Broadcast revocation must merge the revoked offsets into the local offset file together with their queues: merging offsets alone is not enough,
+    /// `build_local_offsets_json` **silently skips** any entry whose queue it cannot find in `mq_map`.
     #[test]
     fn retired_offsets_are_merged_into_the_local_snapshot() {
         let mq = queue("T", "broker-a", 0);
@@ -8892,34 +8892,34 @@ mod tests {
         merge_retired_offsets(&mut items, &mut mq_map, &[(mq.clone(), Some(3))]);
         assert_eq!(items.get(&key), Some(&3));
         assert_eq!(mq_map.get(&key), Some(&mq));
-        // 真的能读回来（对照：只并 items 不并 mq_map，构建器会把这条跳过）
+        // it must really read back (contrast: merging only items without mq_map would make the builder skip this entry)
         let text = build_local_offsets_json(&items, &mq_map);
         assert_eq!(parse_local_offsets_text(&text).unwrap().get(&key), Some(&3));
 
-        // 从未消费过（撤销时位点是 None）的队列不能凭空造条目
+        // a queue never consumed (offset None at revoke time) must not get a fabricated entry
         let mut items = BTreeMap::new();
         let mut mq_map = BTreeMap::new();
         merge_retired_offsets(&mut items, &mut mq_map, &[(mq.clone(), None)]);
         assert!(items.is_empty() && mq_map.is_empty());
 
-        // 快照里已有该队列（同一批撤多把/残留）时按撤销值覆盖
+        // when the snapshot already holds this queue (revoked several times in one batch / leftovers), the revoked value overwrites
         let mut items = BTreeMap::from([(key.clone(), 1)]);
         let mut mq_map = BTreeMap::from([(key.clone(), mq.clone())]);
         merge_retired_offsets(&mut items, &mut mq_map, &[(mq.clone(), Some(9))]);
         assert_eq!(items.get(&key), Some(&9));
     }
 
-    // ---------------- 轨迹自动桥接 ----------------
+    // ---------------- trace auto-bridging ----------------
 
     #[test]
     fn trace_host_reports_empty_client_id_before_start() {
-        let c = DefaultMQPushConsumer::new("GID_trace_host").expect("合法组名不该构造失败");
-        // 宿主没有 _mq_client 时返回空串
+        let c = DefaultMQPushConsumer::new("GID_trace_host").expect("a legal group name must not fail to construct");
+        // returns an empty string when the host has no _mq_client
         assert_eq!(TraceHost::client_id(&c), "");
     }
 
     // ================================================================
-    // POP 模式 broker 侧分配（QUERY_ASSIGNMENT(400)）—— 进程内假集群
+    // POP-mode broker-side assignment (QUERY_ASSIGNMENT(400)) -- in-process fake cluster
     // ================================================================
 
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -8930,19 +8930,19 @@ mod tests {
     use crate::remoting::protocol::remoting_command::RemotingCommand;
     use crate::remoting::protocol::route::{BrokerData, QueueData, TopicRouteData};
 
-    /// 400 应答的脚本：`(code, body)` 二值组合加一个「不答直接断连」档。
+    /// Script for the 400 response: the `(code, body)` pair combinations plus a "no reply, close the connection" mode.
     #[derive(Clone)]
     struct AssignFixture {
-        /// 响应码（`response_code::SUCCESS` / `SYSTEM_ERROR` / `TOPIC_NOT_EXIST`…）。
+        /// The response code (`response_code::SUCCESS` / `SYSTEM_ERROR` / `TOPIC_NOT_EXIST`...).
         code: i32,
         body: Option<Vec<u8>>,
-        /// true = 收到请求后**不回话直接关闭连接**：客户端拿到传输层错误
-        /// （response_code 为 None 的 Err），走「保留上一次分配」分支。
+        /// true = after receiving the request, **close the connection without replying**: the client gets a transport-layer
+        /// error (an Err with response_code None) and takes the "keep the previous assignment" branch.
         silent_close: bool,
     }
 
     impl AssignFixture {
-        /// SUCCESS + 指定分配数组（空 Vec 编出显式 `[]` = 「清除全部分配」）。
+        /// SUCCESS plus the given assignment array (an empty Vec encodes an explicit `[]` = "clear all assignments").
         fn with_assignments(items: &[(&str, i32, &str)]) -> AssignFixture {
             AssignFixture {
                 code: response_code::SUCCESS,
@@ -8973,7 +8973,7 @@ mod tests {
         }
     }
 
-    /// 编 400 响应 body（走真实编码器，保证测试与线上报文同一形状）。
+    /// Encodes the 400 response body (through the real encoder, so the test frames have the same shape as production ones).
     fn assignment_body(items: &[(&str, i32, &str)]) -> Vec<u8> {
         use crate::remoting::protocol::query_assignment_body::MessageQueueAssignment;
         let list: Vec<MessageQueueAssignment> = items
@@ -8988,14 +8988,14 @@ mod tests {
     }
 
     struct AssignState {
-        /// None = 默认剧本：SUCCESS，broker-a 的 0/1 两条 POP 队列。
+        /// None = the default script: SUCCESS with the two POP queues 0/1 on broker-a.
         fixture: Mutex<Option<AssignFixture>>,
-        /// 捕获到的 QUERY_ASSIGNMENT 请求体（断言 400 的 body 字段就看这里）。
+        /// The captured QUERY_ASSIGNMENT request bodies (the place to assert on the 400 body fields).
         bodies: Mutex<Vec<Vec<u8>>>,
     }
 
-    /// 1 namesrv（任何 topic 都回同一份路由：broker-a，4 条读队列）
-    /// + 1 broker（QUERY_ASSIGNMENT 按脚本答，POP 回 POLLING 空转，其余 SUCCESS）。
+    /// 1 name server (any topic gets the same route back: broker-a with 4 read queues)
+    /// + 1 broker (QUERY_ASSIGNMENT answered per the script, POP gets POLLING no-ops, everything else SUCCESS).
     struct AssignCluster {
         namesrv_addr: String,
         state: Arc<AssignState>,
@@ -9025,13 +9025,13 @@ mod tests {
             *lock(&self.state.fixture) = fixture;
         }
 
-        /// 假 broker 收到过的全部 400 请求体（解码后）。
+        /// All 400 request bodies the fake broker has received (decoded).
         fn requests(&self) -> Vec<crate::remoting::protocol::query_assignment_body::QueryAssignmentRequestBody> {
             let raw = lock(&self.state.bodies).clone();
             raw.iter()
                 .map(|b| {
                     crate::remoting::protocol::query_assignment_body::QueryAssignmentRequestBody::decode(b)
-                        .expect("请求体必须是合法 JSON")
+                        .expect("request body must be valid JSON")
                 })
                 .collect()
         }
@@ -9063,8 +9063,8 @@ mod tests {
         response
     }
 
-    /// 路由：broker-a（假 broker 地址）上 4 条读队列 —— 分配只给其中 2 条时，
-    /// 「退化成全要」会立刻在断言里露出来。
+    /// Route: 4 read queues on broker-a (the fake broker address) -- when the assignment grants only 2 of them,
+    /// a "degenerate into wanting everything" regression shows up in the assertions immediately.
     fn assign_route_json(broker_addr: &str) -> Vec<u8> {
         let route = TopicRouteData {
             queue_datas: vec![QueueData::new(
@@ -9082,7 +9082,7 @@ mod tests {
             )],
             ..Default::default()
         };
-        serde_json::to_vec(&route.to_json_value()).expect("路由可序列化")
+        serde_json::to_vec(&route.to_json_value()).expect("route must be serializable")
     }
 
     fn spawn_assign_namesrv(listener: TcpListener, broker_addr: String) -> JoinHandle<()> {
@@ -9122,7 +9122,7 @@ mod tests {
                             );
                             let fixture = lock(&state.fixture).clone();
                             match fixture {
-                                Some(f) if f.silent_close => return, // 不回话，直接拆连接
+                                Some(f) if f.silent_close => return, // no reply; tear down the connection directly
                                 Some(f) => {
                                     let mut response = assign_response_for(&request, f.code);
                                     if let Some(body) = f.body {
@@ -9131,7 +9131,7 @@ mod tests {
                                     write_assign_frame(&mut stream, &mut response).await;
                                 }
                                 None => {
-                                    // 默认剧本：broker-a 的 0/1 两条 POP 队列
+                                    // default script: the two POP queues 0/1 on broker-a
                                     let mut response = assign_response_for(
                                         &request,
                                         response_code::SUCCESS,
@@ -9146,8 +9146,8 @@ mod tests {
                             continue;
                         }
                         if request.code == request_code::POP_MESSAGE {
-                            // 起环的 POP 循环在这里空转（started=false 时循环其实会立刻
-                            // 退出，这层延迟只是给「误起环」的形态兜底，不让它打满 CPU）。
+                            // a started POP loop would spin here (with started=false the loop would in fact exit
+                            // immediately; this delay is only a fallback for the "loop started by mistake" shape, keeping it from pinning the CPU).
                             tokio::time::sleep(Duration::from_millis(150)).await;
                             let mut response =
                                 assign_response_for(&request, response_code::PULL_NOT_FOUND);
@@ -9167,11 +9167,11 @@ mod tests {
         })
     }
 
-    /// 造一个「POP 模式 + 已挂上指向假集群的实例」的消费者（不起 start，
-    /// 不 spawn 后台循环，分配完全由手动 do_rebalance 驱动）。
+    /// Builds a consumer in the "POP mode + instance attached and pointing at the fake cluster" shape (no start call,
+    /// no background loops spawned; the assignment is driven entirely by manual do_rebalance calls).
     fn pop_consumer_on_cluster(instance: &str, cluster: &AssignCluster) -> DefaultMQPushConsumer {
-        let c = DefaultMQPushConsumer::new("GID_pop_assign").expect("合法组名");
-        c.subscribe("T", "*").expect("订阅");
+        let c = DefaultMQPushConsumer::new("GID_pop_assign").expect("legal group name");
+        c.subscribe("T", "*").expect("subscribe");
         c.set_message_listener_concurrently(Arc::new(NoopListener));
         c.update_config(|cfg| {
             cfg.pop_mode = true;
@@ -9182,8 +9182,8 @@ mod tests {
             vec![cluster.namesrv_addr.clone()],
         );
         *lock(&c.inner.client) = Some(client);
-        // require_client 认这个标志；后台循环任务（rebalance/heartbeat/lock/persist）
-        // 只有 start() 才 spawn，所以这里不会打乱手动驱动的节拍。
+        // require_client honors this flag; the background loop tasks (rebalance/heartbeat/lock/persist)
+        // are spawned only by start(), so manual pacing is not disturbed here.
         c.inner.started.store(true, Ordering::Release);
         c
     }
@@ -9199,42 +9199,42 @@ mod tests {
         let cluster = AssignCluster::start().await;
         let c = pop_consumer_on_cluster("pop-qa-ok", &cluster);
 
-        c.do_rebalance().await.expect("rebalance 不报错");
+        c.do_rebalance().await.expect("rebalance must not error");
 
         assert_eq!(
             sorted_keys(&c),
             vec!["Tbroker-a0".to_string(), "Tbroker-a1".to_string()],
-            "分配 = broker 给的 0/1，而不是路由里的全部 0..3"
+            "assignment = the broker-granted 0/1, not every queue 0..3 from the route"
         );
         let reqs = cluster.requests();
-        assert_eq!(reqs.len(), 1, "每 topic 一笔 400");
+        assert_eq!(reqs.len(), 1, "one 400 per topic");
         assert_eq!(reqs[0].topic, "T");
         assert_eq!(reqs[0].consumer_group, "GID_pop_assign");
-        assert_eq!(reqs[0].client_id, "cid-pop-qa-ok", "clientId 用实例的");
-        assert_eq!(reqs[0].strategy_name, "AVG", "策略名随 body 上送，broker 按它选策略");
+        assert_eq!(reqs[0].client_id, "cid-pop-qa-ok", "clientId comes from the instance");
+        assert_eq!(reqs[0].strategy_name, "AVG", "the strategy name rides in the body; the broker picks the strategy by it");
         assert_eq!(reqs[0].message_model, "CLUSTERING");
-        // POP 模式不再发 GET_CONSUMER_LIST_BY_GROUP：队列集完全由 400 决定
+        // POP mode no longer sends GET_CONSUMER_LIST_BY_GROUP: the queue set is decided entirely by the 400
     }
 
-    /// 显式空数组 = broker 说「把你之前的负载全收走」：旧分配必须被清掉。
+    /// An explicit empty array = the broker says "hand back all your previous load": the old assignment must be cleared.
     #[tokio::test]
     async fn pop_empty_assignment_clears_previous_queues() {
         let cluster = AssignCluster::start().await;
         let c = pop_consumer_on_cluster("pop-qa-empty", &cluster);
 
         c.do_rebalance().await.unwrap();
-        assert_eq!(sorted_keys(&c).len(), 2, "先拿到默认分配");
+        assert_eq!(sorted_keys(&c).len(), 2, "the default assignment arrives first");
 
         cluster.set(Some(AssignFixture::with_assignments(&[])));
         c.do_rebalance().await.unwrap();
         assert!(
             sorted_keys(&c).is_empty(),
-            "空集是明确的清除指令，不是「保留」"
+            "an empty set is an explicit clear instruction, not a keep"
         );
     }
 
-    /// TOPIC_NOT_EXIST(17)：topic 在 broker 侧已消失 → 回空集收敛（本端口硬规则），
-    /// 不能让 POP 循环抱着注定撞墙的队列。
+    /// TOPIC_NOT_EXIST(17): the topic is gone on the broker side -> converge on an empty set (a hard rule of this crate),
+    /// never letting the POP loop cling to queues destined to hit a wall.
     #[tokio::test]
     async fn pop_topic_not_exist_clears_assignment() {
         let cluster = AssignCluster::start().await;
@@ -9249,7 +9249,7 @@ mod tests {
         c.do_rebalance().await.unwrap();
         assert!(
             sorted_keys(&c).is_empty(),
-            "17 = topic 没了，分配必须清空而不是抱着旧队列"
+            "17 = the topic is gone; the assignment must be cleared, not left clinging to the old queues"
         );
     }
 
@@ -9262,28 +9262,28 @@ mod tests {
         let before = sorted_keys(&c);
         assert_eq!(before, vec!["Tbroker-a0".to_string(), "Tbroker-a1".to_string()]);
 
-        // ① broker 错误码
+        // (1) broker error code
         cluster.set(Some(AssignFixture::with_code(response_code::SYSTEM_ERROR)));
         c.do_rebalance().await.unwrap();
         assert_eq!(
             sorted_keys(&c),
             before,
-            "非 SUCCESS（除 17）= 保留上一次分配；路由里有 0..3，退化成全要即为回归"
+            "non-SUCCESS (except 17) = keep the previous assignment; the route has 0..3, so degenerating into wanting everything is a regression"
         );
 
-        // ② SUCCESS + null 集
+        // (2) SUCCESS + null set
         cluster.set(Some(AssignFixture::null_set()));
         c.do_rebalance().await.unwrap();
         assert_eq!(sorted_keys(&c), before, "null means invalid result, skip the update");
 
-        // ③ 传输层失败：400 收到请求后直接断连（3s RPC 超时预算内必然返回错误）
+        // (3) transport-layer failure: the 400 closes the connection right after receiving the request (the error necessarily returns within the 3s RPC timeout budget)
         cluster.set(Some(AssignFixture::drop_connection()));
         c.do_rebalance().await.unwrap();
-        assert_eq!(sorted_keys(&c), before, "RPC 打不出去同样只能保留");
+        assert_eq!(sorted_keys(&c), before, "when the RPC cannot get out, keeping the previous assignment is likewise the only option");
     }
 
-    /// 分配变更感知：下一轮 rebalance（周期循环每 tick 调的就是它）拿到不同的集就
-    /// 立即切换 —— 旧的撤、新的上。
+    /// Assignment change detection: the next rebalance round (what the periodic loop calls each tick) switches immediately
+    /// upon a different set -- the old ones retired, the new ones installed.
     #[tokio::test]
     async fn pop_assignment_change_is_applied_on_next_rebalance_round() {
         let cluster = AssignCluster::start().await;
@@ -9292,7 +9292,7 @@ mod tests {
         c.do_rebalance().await.unwrap();
         assert_eq!(sorted_keys(&c), vec!["Tbroker-a0", "Tbroker-a1"]);
 
-        // broker 侧把这条队列挪走/换掉（POP 重平衡的真实形态）
+        // the broker side moved/replaced these queues (the real shape of POP rebalancing)
         cluster.set(Some(AssignFixture::with_assignments(&[
             ("broker-a", 2, "POP"),
             ("broker-a", 3, "POP"),
@@ -9301,9 +9301,9 @@ mod tests {
         assert_eq!(
             sorted_keys(&c),
             vec!["Tbroker-a2", "Tbroker-a3"],
-            "第二轮 rebalance 必须感知到集合并切换"
+            "the second rebalance round must notice the new set and switch over"
         );
-        assert_eq!(cluster.requests().len(), 2, "每轮 topic 各一笔 400");
+        assert_eq!(cluster.requests().len(), 2, "one 400 per topic per round");
     }
 
     #[tokio::test]
@@ -9313,14 +9313,14 @@ mod tests {
         let body = crate::remoting::protocol::query_assignment_body::QueryAssignmentResponseBody::encode(
             Some(&{
                 let mut items = assignment_items(&[("broker-a", 0, "POP")]);
-                items.extend(assignment_items(&[("broker-a", 0, "POP")])); // 重复项
+                items.extend(assignment_items(&[("broker-a", 0, "POP")])); // duplicate entry
                 items.push(crate::remoting::protocol::query_assignment_body::MessageQueueAssignment {
                     message_queue: None,
                     mode: "POP".to_string(),
                 });
                 items.push(crate::remoting::protocol::query_assignment_body::MessageQueueAssignment {
                     message_queue: Some(MessageQueueKey::new("T", "broker-a", 1)),
-                    mode: "PULL".to_string(), // 混合模式：只观察
+                    mode: "PULL".to_string(), // mixed mode: observe only
                 });
                 items
             }),
@@ -9335,7 +9335,7 @@ mod tests {
         assert_eq!(
             sorted_keys(&c),
             vec!["Tbroker-a0", "Tbroker-a1"],
-            "重复的 (broker-a,0) 去重、null 队列被跳过、PULL 项照常进集合"
+            "duplicate (broker-a,0) entries deduplicate, null queues are skipped, and PULL entries join the set as usual"
         );
     }
 

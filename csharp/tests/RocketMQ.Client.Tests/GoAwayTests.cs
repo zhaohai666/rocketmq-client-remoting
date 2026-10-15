@@ -1,8 +1,9 @@
-// GO_AWAY(1500) 的传输层处理。
+// Transport layer handling of GO_AWAY(1500).
 //
 //
-// 修之前这条码被当成普通业务响应交给上层：同步调用拿到 GO_AWAY 就当"发送成功"，
-// 消息其实没落到 broker。
+// Before the fix this code was handed up as an ordinary business response: a synchronous
+// call that got GO_AWAY treated it as "the send succeeded", while the message had in fact
+// never reached the broker.
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Net;
@@ -15,7 +16,8 @@ namespace RocketMQ.Client.Tests;
 
 public class GoAwayTests
 {
-    /// <summary>前 goAwayConns 条连接一律回 GO_AWAY，之后的连接回 SUCCESS。</summary>
+    /// <summary>The first goAwayConns connections always reply GO_AWAY, the ones after
+    /// them reply SUCCESS.</summary>
     private sealed class GoAwayBroker : IDisposable
     {
         private readonly Socket _server;
@@ -100,7 +102,7 @@ public class GoAwayTests
             }
             catch
             {
-                // 客户端重连时会先关掉旧连接，这里静默退出即可
+                // the client closes the old connection when it reconnects, exiting silently here is enough
             }
             finally
             {
@@ -110,7 +112,7 @@ public class GoAwayTests
                 }
                 catch
                 {
-                    // 忽略
+                    // ignored
                 }
             }
         }
@@ -140,7 +142,7 @@ public class GoAwayTests
         int[] seen = broker.Opaques.ToArray();
         Assert.Equal(2, seen.Length);
         Assert.Equal(firstOpaque, seen[0]);
-        Assert.True(seen[1] != firstOpaque, "重发必须用新 opaque，否则响应会错配");
+        Assert.True(seen[1] != firstOpaque, "a resend must use a new opaque, otherwise the responses get mismatched");
     }
 
     [Fact]
@@ -181,7 +183,7 @@ public class GoAwayTests
             (resp, err) => done.TrySetResult((resp, err)));
 
         await Task.WhenAny(done.Task, Task.Delay(8000));
-        Assert.True(done.Task.IsCompleted, "async GO_AWAY 重发后回调必须触发");
+        Assert.True(done.Task.IsCompleted, "after an async GO_AWAY resend the callback must fire");
         (RemotingCommand? Resp, Exception? Err) result = await done.Task;
         Assert.Null(result.Err);
         Assert.Equal(ResponseCode.Success, result.Resp!.Code);
@@ -200,7 +202,7 @@ public class GoAwayTests
             (resp, err) => done.TrySetResult((resp, err)));
 
         await Task.WhenAny(done.Task, Task.Delay(8000));
-        Assert.True(done.Task.IsCompleted, "async GO_AWAY 两次后回调必须触发");
+        Assert.True(done.Task.IsCompleted, "after two async GO_AWAYs the callback must fire");
         (RemotingCommand? Resp, Exception? Err) result = await done.Task;
         Assert.Null(result.Resp);
         Assert.Contains("GO_AWAY twice", result.Err!.Message);

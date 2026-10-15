@@ -27,7 +27,7 @@ REQUEST_GROUP = "PG_RRReq_%d" % STAMP
 CONSUMER_GROUP = "CG_RRReply_%d" % STAMP
 WATCH_GROUP = "CG_RRWatch_%d" % STAMP
 QUEUE_NUM = 4
-# broker.conf 里写的是 brokerClusterName=DefaultCluster（见 /tmp/run_*_live.sh）
+# broker.conf states brokerClusterName=DefaultCluster (see /tmp/run_*_live.sh)
 CLUSTER = "DefaultCluster"
 REPLY_TOPIC = MixAll.get_reply_topic(CLUSTER)
 REQUEST_TIMEOUT = 8000
@@ -47,11 +47,12 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 
 def broker_error(exc: BaseException):
-    """从包装异常里取出 broker 的原始错误（``MQBrokerException``）。
+    """Extract the original broker error (``MQBrokerException``) out of a wrapping exception.
 
-    ``create_topic_in_route`` 会把「逐个 broker 都失败」包成
-    ``MQClientException("create new topic failed", cause=...)``，而 ``str()`` **看不到**
-    broker 的 code/remark —— 必须顺着 ``cause`` 链取，否则真机排障只能靠猜。
+    ``create_topic_in_route`` wraps "every broker failed" into
+    ``MQClientException("create new topic failed", cause=...)``, and ``str()`` **cannot see** the
+    broker's code/remark -- they have to be fetched along the ``cause`` chain, otherwise debugging
+    on a real machine is nothing but guesswork.
     """
     seen = set()
     cur = exc
@@ -76,8 +77,9 @@ def new_consumer(group: str, topic: str, instance: str, on_msgs) -> DefaultMQPus
     c = DefaultMQPushConsumer(group)
     c.set_namesrv_addr(NAMESRV)
     c.set_instance_name(instance)
-    # 从最早开始消费：本脚本的主题都是全新且消息在消费者启动前后不长的时间里产生，
-    # 用 LAST 会让"谁先解析位点"决定结果（项目 MEMORY 第 8 条）。
+    # Consume from the earliest: every topic of this script is brand new and its messages are produced
+    # within a short time around the consumer startup, so using LAST would let "who resolves the
+    # offset first" decide the outcome (point 8 of the project MEMORY).
     c.set_consume_from_where(ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET)
     c.subscribe(topic, "*")
     c.set_message_listener(SimpleMessageListener(on_msgs))
@@ -99,7 +101,7 @@ class Replier:
 
     def __init__(self) -> None:
         self.received: list = []          # (body, correlation_id, reply_to, ttl)
-        self.delivered: list = []         # broker 投递的原始消息（S8 要用它验 CLUSTER）
+        self.delivered: list = []         # the raw messages delivered by the broker (S8 uses it to verify CLUSTER)
         self.replied: list = []
         self.reply_errors: list = []
         self.lock = threading.Lock()
@@ -135,25 +137,26 @@ class Replier:
 
 
 def main() -> int:
-    print("== Request-Reply 真机验证  namesrv=%s  topic=%s ==" % (NAMESRV, TOPIC))
-    print("   应答 topic = %s" % REPLY_TOPIC)
+    print("== Request-Reply verification against a real machine  namesrv=%s  topic=%s ==" % (NAMESRV, TOPIC))
+    print("   reply topic = %s" % REPLY_TOPIC)
 
-    print("\nS1 建请求 topic；应答 topic 由 broker 预注册（客户端不能建）")
+    print("\nS1 creating the request topic; the reply topic is pre-registered by the broker (the client cannot create it)")
     prep = new_producer("PG_RRPrep_%d" % STAMP, "RRPrep")
     try:
         prep.create_topic("TBW102", TOPIC, QUEUE_NUM)
-        # <cluster>_REPLY_TOPIC **不该也不能由客户端创建**：broker 启动时
-        # TopicConfigManager.init() 已把它注册成系统 topic
-        # （clusterName + "_" + MixAll.REPLY_TOPIC_POSTFIX，并 addSystemTopic），
-        # validateSystemTopicWhenUpdateTopic 默认 true ⇒ 客户端 createTopic 会拿到
-        # INVALID_PARAMETER(29)「conflict with system topic」。该分支在 broker 侧
-        # **没有日志**，只能从客户端异常看出来，所以顺手把「错误传播是准的」也验了。
+        # <cluster>_REPLY_TOPIC **should not and cannot be created by the client**: when the broker
+        # starts, TopicConfigManager.init() has already registered it as a system topic
+        # (clusterName + "_" + MixAll.REPLY_TOPIC_POSTFIX, plus addSystemTopic), and
+        # validateSystemTopicWhenUpdateTopic defaults to true => a client-side createTopic gets
+        # INVALID_PARAMETER(29) "conflict with system topic". That branch has **no log** on the broker
+        # side and can only be seen from the client exception, so this also verifies that "the error
+        # propagation is accurate" along the way.
         try:
             prep.create_topic("TBW102", REPLY_TOPIC, QUEUE_NUM)
-            check("S1 客户端 create_topic(应答 topic) 被 broker 拒绝", False, "竟然建成功了")
+            check("S1 the client-side create_topic(reply topic) was rejected by the broker", False, "it actually succeeded")
         except BaseException as e:  # noqa: BLE001
             be = broker_error(e)
-            check("S1 客户端 create_topic(应答 topic) 被拒（broker 系统 topic）",
+            check("S1 the client-side create_topic(reply topic) is rejected (a broker system topic)",
                   be is not None and be.response_code == ResponseCode.INVALID_PARAMETER
                   and "system topic" in (be.error_message or ""),
                   "code=%s remark=%s" % (getattr(be, "response_code", None),
@@ -162,58 +165,60 @@ def main() -> int:
         prep.shutdown()
 
     requester = new_producer(REQUEST_GROUP, "RRReq")
-    # 请求方必须**先被 broker 登记**（心跳）才能被 REPLY_TO_CLIENT 反查到 channel，
-    # 否则 broker 的 ReplyMessageProcessor 找不到 channel，回给应答方 SYSTEM_ERROR。
-    # 注意 _send_heartbeat_to_all_broker 遍历的是**本地路由表**，路由表空时它必然返回 0，
-    # 所以要先取一次路由（request() 内部也是这个顺序）。
+    # The requester must **already be registered with the broker** (heartbeat) before it can be looked
+    # up by channel via REPLY_TO_CLIENT, otherwise the broker's ReplyMessageProcessor finds no channel
+    # and replies SYSTEM_ERROR to the replier.
+    # Note that _send_heartbeat_to_all_broker iterates over the **local route table**; when it is empty
+    # it necessarily returns 0, so the route has to be fetched first (request() does the same thing
+    # internally).
     requester._require_client().update_topic_route_info_from_name_server(TOPIC)
-    check("S1 请求方已注册到 broker（心跳送达）",
+    check("S1 the requester registered with the broker (the heartbeat got through)",
           wait_for(lambda: requester._send_heartbeat_to_all_broker() > 0, 20), "")
 
     replier = Replier()
-    # watcher：独立订阅 <cluster>_REPLY_TOPIC，是 S4 的硬证据
+    # watcher: an independent subscription to <cluster>_REPLY_TOPIC, the hard evidence for S4
     watched: list = []
     watcher = new_consumer(WATCH_GROUP, REPLY_TOPIC, "RRWatch",
                            lambda msgs: _collect(watched, msgs))
-    check("S1 应答消费者已启动", replier.consumer is not None)
+    check("S1 the reply consumer started", replier.consumer is not None)
     try:
-        # ---------------- S2/S3 一次完整往返 ----------------
-        print("\nS2/S3 一次完整 request → reply 往返")
+        # ---------------- S2/S3 one complete round trip ----------------
+        print("\nS2/S3 one complete request -> reply round trip")
         msg = Message(TOPIC, b"ping-1")
         msg.set_keys("rr")
         reply = requester.request(msg, REQUEST_TIMEOUT)
 
         want = b"reply:ping-1"
-        check("S3 request() 拿到应答且 body 正确", bytes(reply.body) == want,
+        check("S3 request() got a reply with the correct body", bytes(reply.body) == want,
               "got=%r want=%r" % (bytes(reply.body), want))
-        check("S3 应答 topic 是 <cluster>_REPLY_TOPIC", reply.topic == REPLY_TOPIC,
+        check("S3 the topic of the reply is <cluster>_REPLY_TOPIC", reply.topic == REPLY_TOPIC,
               "topic=%s" % reply.topic)
         arrive = reply.get_property(MessageConst.PROPERTY_REPLY_MESSAGE_ARRIVE_TIME)
-        check("S3 应答带 REPLY_MESSAGE_ARRIVE_TIME（客户端收到时打的戳）",
+        check("S3 the reply carries REPLY_MESSAGE_ARRIVE_TIME (stamped when the client received it)",
               arrive is not None and arrive.isdigit(), "value=%s" % arrive)
 
         ok = wait_for(lambda: len(replier.received) >= 1, 15)
-        check("S2 应答方收到请求消息", ok, "received=%d" % len(replier.received))
+        check("S2 the replier received the request message", ok, "received=%d" % len(replier.received))
         if ok:
             _, corr, reply_to, ttl = replier.received[0]
-            check("S2 请求消息带 CORRELATION_ID（uuid 字符串）",
+            check("S2 the request message carries CORRELATION_ID (a uuid string)",
                   bool(corr) and len(corr) == 36, "corr=%s" % corr)
-            check("S2 请求消息带 REPLY_TO_CLIENT=请求方 clientId",
+            check("S2 the request message carries REPLY_TO_CLIENT = the clientId of the requester",
                   reply_to == requester._require_client().client_id,
                   "reply_to=%s want=%s" % (reply_to, requester._require_client().client_id))
-            check("S2 请求消息带 TTL=timeout", ttl == str(REQUEST_TIMEOUT), "ttl=%s" % ttl)
+            check("S2 the request message carries TTL = timeout", ttl == str(REQUEST_TIMEOUT), "ttl=%s" % ttl)
 
-        # ---------------- S4 应答确实走了 325 且落到了 REPLY_TOPIC ----------------
-        print("\nS4 应答走 SEND_REPLY_MESSAGE_V2(325) 且落到 <cluster>_REPLY_TOPIC")
-        check("S4 应答方成功发出了应答消息",
+        # ---------------- S4 the reply really goes through 325 and lands in REPLY_TOPIC ----------------
+        print("\nS4 the reply goes through SEND_REPLY_MESSAGE_V2(325) and lands in <cluster>_REPLY_TOPIC")
+        check("S4 the replier successfully sent the reply message",
               wait_for(lambda: len(replier.replied) >= 1, 15),
               "replied=%s errors=%s" % (replier.replied, replier.reply_errors))
         seen = wait_for(lambda: b"reply:ping-1" in watched, 15)
-        check("S4 订阅 %s 的独立消费者能看到该应答" % REPLY_TOPIC, seen,
+        check("S4 the independent consumer of %s can see that reply" % REPLY_TOPIC, seen,
               "watched=%s" % watched)
 
-        # ---------------- S5 无应答方 → RequestTimeoutException ----------------
-        print("\nS5 无应答方时 request() 抛 RequestTimeoutException")
+        # ---------------- S5 no replier -> RequestTimeoutException ----------------
+        print("\nS5 with no replier request() throws RequestTimeoutException")
         silent_topic = TOPIC + "_NoReplier"
         prep2 = new_producer("PG_RRPrep2_%d" % STAMP, "RRPrep2")
         try:
@@ -229,17 +234,17 @@ def main() -> int:
         except BaseException as e:  # noqa: BLE001
             raised = e
         elapsed = time.time() - t0
-        check("S5 抛的是 RequestTimeoutException（不是静默返回/别的异常）",
+        check("S5 what is thrown is a RequestTimeoutException (not a silent return / another exception)",
               isinstance(raised, RequestTimeoutException),
               "raised=%s: %s" % (type(raised).__name__, raised))
-        check("S5 异常带上 10006 REQUEST_TIMEOUT_EXCEPTION",
+        check("S5 the exception carries 10006 REQUEST_TIMEOUT_EXCEPTION",
               getattr(raised, "response_code", None) == ClientErrorCode.REQUEST_TIMEOUT_EXCEPTION,
               "code=%s" % getattr(raised, "response_code", None))
-        check("S5 超时时长接近设定值（2s ~ 12s，说明真的等了而不是立即失败）",
+        check("S5 the timeout duration is close to the configured value (2s ~ 12s, showing that it really waited instead of failing immediately)",
               2.0 <= elapsed <= 12.0, "elapsed=%.2fs" % elapsed)
 
-        # ---------------- S6 并发请求不串台 ----------------
-        print("\nS6 并发 3 个 request，各自拿到自己的应答")
+        # ---------------- S6 concurrent requests do not cross-talk ----------------
+        print("\nS6 3 concurrent requests, each getting its own reply")
         results: dict = {}
         errors: list = []
 
@@ -258,47 +263,47 @@ def main() -> int:
         for t in threads:
             t.join(REQUEST_TIMEOUT + 5000)
         expect = {i: ("reply:ping-conc-%d" % i).encode() for i in range(3)}
-        check("S6 3 个并发 request 全部拿到应答且一一对应",
+        check("S6 all 3 concurrent requests got replies and they match one to one",
               results == expect and not errors,
               "results=%s errors=%s" % (results, errors))
 
-        # ---------------- S7 消费者未被 Reply 流量破坏 ----------------
-        print("\nS7 应答方的消费者仍然完好（普通 push 消费不受 Reply 影响）")
+        # ---------------- S7 the consumer is not damaged by the Reply traffic ----------------
+        print("\nS7 the consumer of the replier is still intact (ordinary push consumption is unaffected by Reply)")
         plain = Message(TOPIC, b"plain-after-replies")
         plain.set_keys("rr-plain")
         requester.send(plain)
         ok = wait_for(lambda: any(b == b"plain-after-replies" for b, _, _, _ in replier.received),
                       15)
-        check("S7 后续普通消息仍被消费", ok,
+        check("S7 the ordinary messages afterwards are still consumed", ok,
               "received=%s" % [b for b, _, _, _ in replier.received])
 
-        print("\nS8 CLUSTER 由 broker 写入；造不出应答时报 10007 而不是别的错")
+        print("\nS8 CLUSTER is written by the broker; when no reply can be built it reports 10007 rather than another error")
         delivered = None
         with replier.lock:
             for m in replier.delivered:
                 if bytes(m.body) == b"ping-1":
                     delivered = m
                     break
-        check("S8 投递到的请求消息带 broker 写入的 CLUSTER=%s" % CLUSTER,
+        check("S8 the delivered request message carries the broker-written CLUSTER=%s" % CLUSTER,
               delivered is not None
               and delivered.get_property(MessageConst.PROPERTY_CLUSTER) == CLUSTER,
               "cluster=%s" % (delivered.get_property(MessageConst.PROPERTY_CLUSTER)
                               if delivered else None))
-        check("S8 客户端手里那份请求消息**没有** CLUSTER（属性确实是 broker 补的）",
+        check("S8 the copy of the request message on the client has **no** CLUSTER (the property really is filled in by the broker)",
               msg.get_property(MessageConst.PROPERTY_CLUSTER) is None,
               "value=%s" % msg.get_property(MessageConst.PROPERTY_CLUSTER))
-        # 用错对象（拿本地那份发请求）→ 必须撞 10007，且文案指到 CLUSTER
+        # Using the wrong object (sending the request with the local copy) -> it must hit 10007, and the wording points at CLUSTER
         raised8 = None
         try:
             create_reply_message(msg, b"pong")
         except BaseException as e:  # noqa: BLE001
             raised8 = e
-        check("S8 拿本地那份请求消息造应答 → MQClientException 带 10007",
+        check("S8 building a reply from the local copy of the request message -> an MQClientException carrying 10007",
               isinstance(raised8, MQClientException)
               and raised8.response_code == ClientErrorCode.CREATE_REPLY_MESSAGE_EXCEPTION,
               "raised=%s code=%s" % (type(raised8).__name__ if raised8 else None,
                                      getattr(raised8, "response_code", None)))
-        check("S8 10007 的文案点到缺失的 CLUSTER 属性（协议原文）",
+        check("S8 the wording of the 10007 points at the missing CLUSTER property (the protocol text)",
               raised8 is not None
               and "property[%s] is null." % MessageConst.PROPERTY_CLUSTER in str(raised8),
               "msg=%s" % raised8)
@@ -307,7 +312,7 @@ def main() -> int:
             create_reply_message(None, b"pong")
         except BaseException as e:  # noqa: BLE001
             raised8b = e
-        check("S8 请求消息为 None → 同样是 10007（不是裸 ValueError）",
+        check("S8 a request message of None -> also 10007 (not a bare ValueError)",
               isinstance(raised8b, MQClientException)
               and raised8b.response_code == ClientErrorCode.CREATE_REPLY_MESSAGE_EXCEPTION
               and "requestMessage cannot be null." in str(raised8b),
@@ -318,7 +323,7 @@ def main() -> int:
         replier.shutdown()
         watcher.shutdown()
 
-    print("\n== 结果: PASS=%d FAIL=%d ==" % (PASS, FAIL))
+    print("\n== Result: PASS=%d FAIL=%d ==" % (PASS, FAIL))
     return 0 if FAIL == 0 else 1
 
 

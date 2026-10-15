@@ -47,9 +47,10 @@ import {
   createCorrelationId, createReplyMessage, isReplyMessage,
   REQUEST_FUTURE_HOLDER, getReplyTopic, RequestResponseFuture,
 } from './request_reply.ts';
-// 类型必须单独 import：--experimental-strip-types 会把非 `import type` 的导入原样
-// 留在运行时代码里，而 request_reply.ts 只导出类型，值导入会在加载期报
-// "does not provide an export named ..."。
+// Types must be imported separately: --experimental-strip-types leaves
+// non-`import type` imports in the runtime code as-is, and request_reply.ts
+// exports types only, so a value import fails at load time with
+// "does not provide an export named ...".
 import type { RequestCallbackLike } from './request_reply.ts';
 
 const logger = getLogger('producer');
@@ -124,7 +125,7 @@ export class DefaultMQProducer {
   namespaceV2: string | null;
   namesrvAddr: string | null;
   tlsEnable: boolean;
-  // TLS 细项（见 setTlsOptions）；null = test-mode（信任自签）。
+  // TLS details (see setTlsOptions); null = test-mode (trust the self-signed cert).
   tlsOptions: { caCert?: string; clientCert?: string; clientKey?: string; serverName?: string } | null;
   socksProxyConfig: SocksProxyConfig | null;
   rpcHook: AclRPCHook | null;
@@ -254,8 +255,8 @@ export class DefaultMQProducer {
   setInstanceName(name: string): this { this.instanceName = name; return this; }
   getInstanceName(): string { return this.instanceName; }
   setTlsEnable(enable: boolean): this { this.tlsEnable = enable; return this; }
-  // TLS 细项（caCert=严格 CA 校验；clientCert/clientKey=mTLS；serverName=主机名覆盖）。
-  // 不设 caCert = test-mode（信任自签）。
+  // TLS details (caCert=strict CA verification; clientCert/clientKey=mTLS; serverName=hostname override).
+  // Omitting caCert = test-mode (trust the self-signed cert).
   setTlsOptions(opts: { caCert?: string; clientCert?: string; clientKey?: string; serverName?: string } | null): this {
     this.tlsOptions = opts; return this;
   }
@@ -430,8 +431,9 @@ export class DefaultMQProducer {
     }
     if (this.client != null) {
       this.client.unregisterProducer(this.producerGroup);
-      // 归还给 manager：引用计数 -1，**归零才真正 shutdown**（停心跳/路由定时器、
-      // 断连接）。同 clientId 还有其他门面在用时时例继续存活。
+      // Hand back to the manager: reference count -1; the REAL shutdown (stop
+      // heartbeat/route timers, drop connections) happens only when it hits
+      // ZERO. Other facades sharing the same clientId keep the instance alive.
       MQClientManager.getInstance().unregisterClient(this.client.clientId, this.client);
     }
     this.client = null;
@@ -474,9 +476,12 @@ export class DefaultMQProducer {
     try {
       await this.client.updateTopicRouteInfoFromNameServer(topic, false);
     } catch (e) {
-      // 路由拉不到的原因要留着：TLS 握手 CA 校验失败这类错误若在这里被吞，
-      // 上层只会看到 "No route info of this topic"，黑盒（用户往"建 topic"方向查，
-      // 真正坏的是证书/CA）。挂到 _lastRouteError，由 No-route 抛出点带出。
+      // Keep the reason the route could not be fetched: if an error like a TLS
+      // handshake CA verification failure were swallowed here, the layer above
+      // would only see "No route info of this topic" — a black box (the user
+      // hunts toward "create topic" while the real culprit is the
+      // certificate/CA). Stash it in _lastRouteError and let the No-route
+      // throw site carry it out.
       this._lastRouteError = e instanceof Error ? e : new Error(String(e));
       logger.warn(`find topic publish info for ${topic} failed: ${(e as Error).message}`);
     }
@@ -496,8 +501,9 @@ export class DefaultMQProducer {
     return info;
   }
 
-  // 上面两步路由尝试中最后一次失败的原因（成功即清空）。用于把 TLS/CA、
-  // 连接拒绝这类真实根因带进 "No route info" 报错，而不是黑盒。
+  // The cause of the last failure across the two route attempts above (cleared
+  // on success). Used to bring the real root cause — TLS/CA, connection
+  // refused, etc. — into the "No route info" error instead of black-boxing it.
   private _lastRouteError: Error | null = null;
 
   private _routeFailureSuffix(): string {
@@ -712,8 +718,9 @@ export class DefaultMQProducer {
     this._checkLegalTopic(msg.getTopic());
     let tpInfo = await this._tryToFindTopicPublishInfo(msg.getTopic());
     if (tpInfo == null || !tpInfo.ok()) {
-      // 带上路由拉取的真实失败原因（TLS/CA、连接拒绝…），没有失败记录时
-      // 保持原文案（topic 真不存在的语义）。
+      // Carry the real route-fetch failure reason (TLS/CA, connection
+      // refused...); with no failure recorded, keep the original wording (the
+      // topic genuinely does not exist).
       throw new MQClientException(
         `No route info of this topic: ${msg.getTopic()}${this._routeFailureSuffix()}`,
         this._lastRouteError ?? undefined,

@@ -1,12 +1,12 @@
-//! 路由刷新周期 / 位点落盘周期 真机验证（覆盖 I1–I3 三项场景）。
+//! Live verification of the route-refresh interval / offset-persist interval (covers the three scenarios I1-I3).
 //!
-//! 离线单测（`src/client/mq_client.rs` 的 `mod tests`）只能证明**首跳**落在 initialDelay；
-//! 周期本身必须用**真集群**才量得出来：路由刷新要用一个"先不存在、后由 admin 建出来"的
-//! topic 当探针 —— 只有周期到了才会去 NameServer 拉，缓存里何时出现它就等于周期。
-//! 位点落盘同理，用 `QUERY_CONSUMER_OFFSET` 读 broker 侧的位点当探针。
+//! The offline unit tests (`mod tests` in `src/client/mq_client.rs`) can only prove that the **first hop** lands on the
+//! initialDelay; the interval itself can only be measured against a **real cluster**: route refreshing uses a topic that
+//! "does not exist at first and is created later by the admin" as the probe -- it is fetched from the NameServer only when the interval
+//! elapses, so the moment it appears in the cache equals the interval. Offset persisting likewise uses `QUERY_CONSUMER_OFFSET` to read the broker-side offset as the probe.
 //!
 //!
-//! 用法（先按项目记忆里记的 runbook 起本地集群）：
+//! Usage (start the local cluster per the runbook recorded in project memory first):
 //! ```text
 //! cargo run --example live_scheduled_intervals -- 127.0.0.1:9876
 //! ```
@@ -76,7 +76,7 @@ where
     }
 }
 
-// ------------------------------------------------------------------ 计分板
+// ------------------------------------------------------------------ scoreboard
 
 struct Check {
     passed: usize,
@@ -100,7 +100,7 @@ impl Check {
     }
 }
 
-// ------------------------------------------------------------------ 消费监听
+// ------------------------------------------------------------------ consume listener
 
 struct BodySink {
     items: Mutex<Vec<String>>,
@@ -134,13 +134,13 @@ impl MessageListenerConcurrently for CollectListener {
     }
 }
 
-// ------------------------------------------------------------------ 夹具
+// ------------------------------------------------------------------ fixture
 
 struct Fixture {
     namesrv: String,
     stamp: String,
     admin: DefaultMQAdminExt,
-    /// 集群探活拿到的 broker 地址（删订阅组、拼 MessageQueue 都用它）。
+    /// The broker address obtained from the cluster probe (used for deleting subscription groups and building MessageQueues).
     broker_addr: String,
 }
 
@@ -148,7 +148,7 @@ impl Fixture {
     async fn read_offset(&self, group: &str, mq: &MessageQueue) -> Result<i64, String> {
         match self.admin.examine_consumer_offset(group, mq).await {
             Ok(Some(v)) => Ok(v),
-            Ok(None) => Ok(0), // 没提交过 = 0（QUERY_NOT_FOUND）
+            Ok(None) => Ok(0), // never committed = 0 (QUERY_NOT_FOUND)
             Err(e) => Err(e.to_string()),
         }
     }
@@ -156,12 +156,12 @@ impl Fixture {
 
 async fn topic_route(admin: &DefaultMQAdminExt, topic: &str) -> Result<(String, String), String> {
     let route = admin.examine_topic_route(topic).await.map_err(|e| e.to_string())?;
-    let bd = route.broker_datas.first().ok_or_else(|| format!("{topic} 路由里没有 broker"))?;
-    let addr = bd.select_broker_addr().ok_or_else(|| format!("{topic} 的 broker 没有地址"))?;
+    let bd = route.broker_datas.first().ok_or_else(|| format!("{topic} has no broker in its route"))?;
+    let addr = bd.select_broker_addr().ok_or_else(|| format!("{topic}'s broker has no address"))?;
     Ok((bd.broker_name.clone(), addr))
 }
 
-/// 轮询 broker 侧位点，直到 `>= want` 或超时（`true` = 等到了）。
+/// Polls the broker-side offset until it is `>= want` or the timeout elapses (`true` = it got there).
 async fn wait_offset_at_least(
     fx: &Fixture,
     group: &str,
@@ -185,7 +185,7 @@ fn main() -> ExitCode {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
         Err(e) => {
-            eprintln!("fixture 失败: {e}");
+            eprintln!("fixture failed: {e}");
             ExitCode::FAILURE
         }
     }
@@ -212,15 +212,15 @@ async fn run(namesrv: &str) -> Result<bool, String> {
     let mut ck = Check::new();
     println!("namesrv = {namesrv}  stamp = {stamp}");
 
-    // 集群探活（后面删订阅组要用这个 broker 地址）
+    // Cluster probe (the broker address is needed later to delete subscription groups)
     let broker_addr = match topic_route(&admin, MixAll::DEFAULT_TOPIC).await {
         Ok((_, addr)) => addr,
         Err(e) => {
             admin.shutdown();
-            return Err(format!("集群探活失败: {e}"));
+            return Err(format!("cluster probe failed: {e}"));
         }
     };
-    ck.check("集群探活", true, &format!("broker={broker_addr}"));
+    ck.check("cluster probe", true, &format!("broker={broker_addr}"));
 
     let fx = Fixture {
         namesrv: namesrv.to_string(),
@@ -233,17 +233,17 @@ async fn run(namesrv: &str) -> Result<bool, String> {
     let outcome =
         run_all(&mut ck, &fx, &t_poll, &t_persist, &groups).await;
 
-    // 收尾（失败也要走到）：topic 与订阅组都删干净，避免污染下一轮
+    // Wrap-up (runs even on failure): delete the topics and subscription groups cleanly to avoid polluting the next run
     for topic in [&t_poll, &t_persist] {
         match fx.admin.delete_topic(topic, None).await {
             Ok(()) => println!("    (deleteTopic({topic}) OK)"),
-            Err(e) => println!("    (deleteTopic({topic}) 失败: {e})"),
+            Err(e) => println!("    (deleteTopic({topic}) failed: {e})"),
         }
     }
     for g in groups {
         match fx.admin.delete_subscription_group(&fx.broker_addr, g, true).await {
             Ok(()) => println!("    (deleteSubscriptionGroup({g}) OK)"),
-            Err(e) => println!("    (deleteSubscriptionGroup({g}) 失败: {e})"),
+            Err(e) => println!("    (deleteSubscriptionGroup({g}) failed: {e})"),
         }
     }
     fx.admin.shutdown();
@@ -276,7 +276,7 @@ async fn run_all(
     let g_persist_slow = groups[3].as_str();
     let g_producer = groups[4].as_str();
 
-    // ---------------- I1 路由刷新周期 ----------------
+    // ---------------- I1 route-refresh interval ----------------
     let fast = DefaultMQProducer::new(g_poll_fast).map_err(|e| e.to_string())?;
     fast.set_namesrv_addr(&fx.namesrv);
     fast.set_instance_name(&format!("interval-poll-fast-{}", fx.stamp));
@@ -288,30 +288,30 @@ async fn run_all(
     slow.set_instance_name(&format!("interval-poll-slow-{}", fx.stamp));
     slow.start().await.map_err(|e| format!("slow producer start: {e}"))?;
 
-    let fast_client: MQClientInstance = fast.client().ok_or("fast producer 没有实例")?;
-    let slow_client: MQClientInstance = slow.client().ok_or("slow producer 没有实例")?;
+    let fast_client: MQClientInstance = fast.client().ok_or("fast producer has no instance")?;
+    let slow_client: MQClientInstance = slow.client().ok_or("slow producer has no instance")?;
     let fast_route_ms = fast_client.config().route_refresh_interval_millis;
     let slow_route_ms = slow_client.config().route_refresh_interval_millis;
     ck.check(
-        "I3 生产者实例拿到配置的刷新周期（1s 组）",
+        "I3 the producer instance picked up the configured refresh interval (1s group)",
         fast_route_ms == FAST_POLL_MS,
         &format!("instance.route_refresh_interval_millis={fast_route_ms}"),
     );
     ck.check(
-        "I3 生产者实例默认 30s（对照组）",
+        "I3 the producer instance defaults to 30s (control group)",
         slow_route_ms == SLOW_POLL_MS,
         &format!("instance.route_refresh_interval_millis={slow_route_ms}"),
     );
 
-    // 把一个还没创建的 topic 登记进周期刷新集合：两个生产者都不会给它发消息，
-    // 所以缓存里何时出现它，只由各自的刷新周期决定。
+    // A not-yet-created topic is registered into the periodic refresh set: neither producer sends messages to it,
+    // so when it appears in each cache is decided only by that producer's refresh interval.
     fast_client.register_topic_in_use(t_poll);
     slow_client.register_topic_in_use(t_poll);
     ck.check(
-        "I1 两个生产者都把 tPoll 登记进在用 topic 集合（登记本身不拉取）",
+        "I1 both producers registered tPoll into the in-use topic set (registering itself pulls nothing)",
         fast_client.find_broker_addr_by_topic(t_poll).is_none()
             && slow_client.find_broker_addr_by_topic(t_poll).is_none(),
-        "登记后两边缓存都为空",
+        "both caches empty after registering",
     );
 
     tokio::time::sleep(Duration::from_millis(1_500)).await;
@@ -320,8 +320,8 @@ async fn run_all(
     fx.admin
         .create_topic(MixAll::DEFAULT_TOPIC, t_poll, 1, 0)
         .await
-        .map_err(|e| format!("createTopic({t_poll}) 失败: {e}"))?;
-    ck.check("I1 admin 建 topic 成功", true, &format!("{t_poll} 1 队列"));
+        .map_err(|e| format!("createTopic({t_poll}) failed: {e}"))?;
+    ck.check("I1 admin created the topic", true, &format!("{t_poll} 1 queue"));
 
     let fast_client_1 = fast_client.clone();
     let t_poll_1 = t_poll.to_string();
@@ -333,14 +333,14 @@ async fn run_all(
     .await;
     let dt_fast = t0.elapsed();
     ck.check(
-        "I1 1s 周期组 ≤6s 从 NameServer 拉到新 topic 路由",
+        "I1 the 1s group pulls the new topic route from the NameServer within 6s",
         fast_ok,
-        &format!("dt={} 周期={FAST_POLL_MS}ms", secs(dt_fast)),
+        &format!("dt={} interval={FAST_POLL_MS}ms", secs(dt_fast)),
     );
     ck.check(
-        "I1 此刻 30s 周期组**还**没拉到（对照：周期决定时机）",
+        "I1 at this moment the 30s group has **not** pulled it yet (control: the interval decides the timing)",
         slow_client.find_broker_addr_by_topic(t_poll).is_none(),
-        &format!("dt={} 周期={SLOW_POLL_MS}ms", secs(t0.elapsed())),
+        &format!("dt={} interval={SLOW_POLL_MS}ms", secs(t0.elapsed())),
     );
 
     let slow_client_1 = slow_client.clone();
@@ -353,23 +353,23 @@ async fn run_all(
     .await;
     let dt_slow = t0.elapsed();
     ck.check(
-        "I1 30s 周期组最终也拉到（默认值只是慢，不是坏）",
+        "I1 the 30s group eventually pulls it too (a default value is only slow, not broken)",
         slow_ok,
-        &format!("dt={} 周期={SLOW_POLL_MS}ms", secs(dt_slow)),
+        &format!("dt={} interval={SLOW_POLL_MS}ms", secs(dt_slow)),
     );
     ck.check(
-        "I1 两组间隔与配置同量级（30s 组至少晚 20s）",
+        "I1 the two groups' gaps are of the same magnitude as the configs (the 30s group lags by at least 20s)",
         dt_slow.saturating_sub(dt_fast) >= Duration::from_secs(20),
         &format!("fast={} slow={}", secs(dt_fast), secs(dt_slow)),
     );
     fast.shutdown();
     slow.shutdown();
 
-    // ---------------- I2 位点落盘周期 ----------------
+    // ---------------- I2 offset-persist interval ----------------
     fx.admin
         .create_topic(MixAll::DEFAULT_TOPIC, t_persist, 1, 0)
         .await
-        .map_err(|e| format!("createTopic({t_persist}) 失败: {e}"))?;
+        .map_err(|e| format!("createTopic({t_persist}) failed: {e}"))?;
     let (persist_broker_name, _) = topic_route(&fx.admin, t_persist).await?;
     let mq = MessageQueue::new(t_persist, &persist_broker_name, 0);
 
@@ -404,12 +404,12 @@ async fn run_all(
         .map(|c| c.config().persist_offset_interval_millis == FAST_PERSIST_MS)
         .unwrap_or(false);
     ck.check(
-        "I3 消费者实例拿到配置的落盘周期",
+        "I3 the consumer instance picked up the configured persist interval",
         fast_persist_ok && persist_ms == FAST_PERSIST_MS,
         &format!("config={persist_ms}ms(facade)"),
     );
 
-    // 第一批 3 条
+    // First batch of 3
     for i in 1..=3 {
         send_body(&prod, t_persist, &format!("persist-batch1-{i}")).await?;
     }
@@ -420,7 +420,7 @@ async fn run_all(
     )
     .await;
     ck.check(
-        "I2 两个消费者都消费到 3 条（尚未 commit / shutdown）",
+        "I2 both consumers consumed the 3 messages (no commit / shutdown yet)",
         got3,
         &format!("fast={} slow={}", fast_sink.count(), slow_sink.count()),
     );
@@ -435,7 +435,7 @@ async fn run_all(
     let off_fast = fx.read_offset(g_persist_fast, &mq).await?;
     let off_slow = fx.read_offset(g_persist_slow, &mq).await?;
     ck.check(
-        "I2 消费后 broker 位点还没有立刻被推上去",
+        "I2 after consuming, the broker offset has not been pushed up immediately",
         off_fast < 3 && off_slow < 3,
         &format!("fast={off_fast} slow={off_slow} elapsed={}", secs(t_first.elapsed())),
     );
@@ -443,12 +443,12 @@ async fn run_all(
     let fast_first = wait_offset_at_least(fx, g_persist_fast, &mq, 3, 20_000).await;
     let dt_first = t_first.elapsed();
     ck.check(
-        "I2 1s 组首次落盘发生在 initialDelay(~10s) 之后",
+        "I2 the 1s group's first persist happens after the initialDelay(~10s)",
         fast_first && dt_first >= Duration::from_millis(9_500),
-        &format!("dt={} 周期={FAST_PERSIST_MS}ms", secs(dt_first)),
+        &format!("dt={} interval={FAST_PERSIST_MS}ms", secs(dt_first)),
     );
     ck.check(
-        "I2 首笔落盘不早于 initialDelay 10s",
+        "I2 the first persist is no earlier than the initialDelay 10s",
         dt_first >= Duration::from_millis(9_500),
         &format!("dt={} initialDelay={PERSIST_INITIAL_DELAY_MS}ms", secs(dt_first)),
     );
@@ -456,12 +456,12 @@ async fn run_all(
     let slow_first = wait_offset_at_least(fx, g_persist_slow, &mq, 3, 20_000).await;
     let dt_slow_first = t_first.elapsed();
     ck.check(
-        "I2 60s 组同样在 ~10s 完成首笔落盘（周期未到，先走 initialDelay）",
+        "I2 the 60s group also completes its first persist at ~10s (its interval has not arrived, the initialDelay runs first)",
         slow_first && dt_slow_first < Duration::from_millis(20_000),
-        &format!("dt={} 周期={SLOW_PERSIST_MS}ms", secs(dt_slow_first)),
+        &format!("dt={} interval={SLOW_PERSIST_MS}ms", secs(dt_slow_first)),
     );
 
-    // 第二批 3 条：1s 组会在一个周期内把 6 推上去，60s 组离自己的周期还远
+    // Second batch of 3: the 1s group pushes 6 up within one interval; the 60s group is still far from its own interval
     for i in 1..=3 {
         send_body(&prod, t_persist, &format!("persist-batch2-{i}")).await?;
     }
@@ -472,7 +472,7 @@ async fn run_all(
     )
     .await;
     ck.check(
-        "I2 两个消费者都消费到第二批（6 条）",
+        "I2 both consumers consumed the second batch (6 messages)",
         got6,
         &format!("fast={} slow={}", fast_sink.count(), slow_sink.count()),
     );
@@ -480,19 +480,19 @@ async fn run_all(
     let t_second = Instant::now();
     let fast_six = wait_offset_at_least(fx, g_persist_fast, &mq, 6, 8_000).await;
     ck.check(
-        "I2 1s 组一个周期内把第二批位点推上去",
+        "I2 the 1s group pushes the second batch's offset up within one interval",
         fast_six,
-        &format!("dt={} 周期={FAST_PERSIST_MS}ms", secs(t_second.elapsed())),
+        &format!("dt={} interval={FAST_PERSIST_MS}ms", secs(t_second.elapsed())),
     );
 
     let off_slow_now = fx.read_offset(g_persist_slow, &mq).await?;
     ck.check(
-        "I2 此刻 60s 组仍是 3（周期 60s 远未到，且它确实消费到了 6）",
+        "I2 at this moment the 60s group is still 3 (its 60s interval is far off, and it did consume all 6)",
         slow_sink.count() >= 6 && off_slow_now == 3,
-        &format!("broker={off_slow_now} 已消费={} 周期={SLOW_PERSIST_MS}ms", slow_sink.count()),
+        &format!("broker={off_slow_now} consumed={} interval={SLOW_PERSIST_MS}ms", slow_sink.count()),
     );
     ck.check(
-        "I2 60s 组的下一次周期还没到（距首笔落盘 < 周期 60s）",
+        "I2 the 60s group's next interval has not arrived yet (time since the first persist < the 60s interval)",
         dt_slow_first + t_second.elapsed() < Duration::from_secs(60),
         &format!("elapsed={}", secs(dt_slow_first + t_second.elapsed())),
     );
@@ -500,7 +500,7 @@ async fn run_all(
     slow_c.shutdown();
     let slow_flushed = wait_offset_at_least(fx, g_persist_slow, &mq, 6, 10_000).await;
     ck.check(
-        "I2 60s 组 shutdown() 时把 6 落盘（persistConsumerOffset 收尾）",
+        "I2 the 60s group persists 6 on shutdown() (the persistConsumerOffset wrap-up)",
         slow_flushed,
         &format!("broker={}", fx.read_offset(g_persist_slow, &mq).await?),
     );
@@ -512,6 +512,6 @@ async fn run_all(
 
 async fn send_body(prod: &DefaultMQProducer, topic: &str, body: &str) -> Result<(), String> {
     let mut msg = Message::new(topic, Some(body.as_bytes()));
-    prod.send(&mut msg, None, None).await.map_err(|e| format!("send({body}) 失败: {e}"))?;
+    prod.send(&mut msg, None, None).await.map_err(|e| format!("send({body}) failed: {e}"))?;
     Ok(())
 }

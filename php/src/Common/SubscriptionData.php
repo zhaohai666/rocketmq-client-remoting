@@ -5,8 +5,8 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * 订阅数据：一次订阅解析出的 topic / subString / tagsSet / codeSet / 表达式类型，
- * 心跳与拉取都按这份结构上报 broker。
+ * Subscription data: the topic / subString / tagsSet / codeSet / expression type parsed from one
+ * subscription; both the heartbeat and the pull report the broker using this structure.
  */
 class SubscriptionData
 {
@@ -16,10 +16,10 @@ class SubscriptionData
 
     public ?string $subString;
 
-    /** @var list<string> 唯一 tag 集合（数组当 set 用，addTag 负责去重） */
+    /** @var list<string> the set of distinct tags (the array is used as a set, addTag handles dedup) */
     public array $tagsSet = [];
 
-    /** @var list<int> 唯一 tag 哈希集合，与 tagsSet 一一对应 */
+    /** @var list<int> the set of distinct tag hashes, in one-to-one correspondence with tagsSet */
     public array $codeSet = [];
 
     public int $subVersion;
@@ -113,7 +113,7 @@ class SubscriptionData
         $this->classFilterMode = $mode;
     }
 
-    /** 集合语义：去重添加 tag。 */
+    /** Set semantics: add a tag with dedup. */
     public function addTag(string $tag): void
     {
         if (!in_array($tag, $this->tagsSet, true)) {
@@ -121,7 +121,7 @@ class SubscriptionData
         }
     }
 
-    /** 集合语义：去重添加 tag 哈希。 */
+    /** Set semantics: add a tag hash with dedup. */
     public function addCode(int $code): void
     {
         if (!in_array($code, $this->codeSet, true)) {
@@ -158,11 +158,11 @@ class SubscriptionData
     }
 
     /**
-     * 输出上报用的字段表：键名用协议字段名（camelCase），
-     * tagsSet/codeSet 要以 JSON 数组形式出现。
+     * Emits the field table used for reporting: the keys use the protocol field names (camelCase),
+     * tagsSet/codeSet have to appear as JSON arrays.
      *
-     * 注意 filterClassSource **不参与序列化**——协议里它是客户端内部字段，
-     * 带上会把整包心跳撑大。
+     * Note that filterClassSource **does not take part in serialization** — in the protocol it is an
+     * internal client-side field, and including it would bloat the whole heartbeat packet.
      *
      * @return array<string, mixed>
      */

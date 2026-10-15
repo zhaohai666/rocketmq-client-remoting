@@ -2,17 +2,18 @@
 
 declare(strict_types=1);
 
-// 真机 TLS/mTLS 验证：三腿覆盖 plain_tls / ca_verify / mtls。
+// Live TLS/mTLS verification: three legs covering plain_tls / ca_verify / mtls.
 //
 //   php examples/live_tls.php <ns> <leg> <caCert> <serverName> [clientCert] [clientKey]
 //
 //
-// broker 由 scripts/run_php_live.sh tls 分支启动：
+// The broker is started by the scripts/run_php_live.sh tls branch:
 //   leg1+2: -Dtls.enable=true -Dtls.server.certPath=... -Dtls.server.keyPath=...
-//   leg3  : 追加 -Dtls.client.authServer=true（要求客户端证书，缺证书即握手失败）
+//   leg3  : additionally -Dtls.client.authServer=true (requires a client certificate; a missing
+//           certificate fails the handshake outright)
 //
-// 每条腿：先起消费者等分配（B5）→ 发 3 条 → 收满。握手失败会在 start/首次请求时抛
-// RemotingConnectException，直接 FAIL。
+// Each leg: start the consumer and wait for assignment (B5) -> send 3 -> receive all. A handshake
+// failure throws RemotingConnectException at start/first request and FAILs directly.
 require __DIR__ . '/../bootstrap.php';
 
 use RocketMQ\Client\ConsumeConcurrentlyContext;
@@ -54,14 +55,14 @@ $check = function (bool $ok, string $name, string $detail = '') use (&$pass, &$f
 
 echo "=== PHP TLS live: ns=$ns leg=$leg topic=$topic ===" . PHP_EOL;
 
-// TLS 选项按腿装配（语义见 RemotingClient::$tlsOptions）
+// TLS options assembled per leg (semantics see RemotingClient::$tlsOptions)
 $tlsOptions = match ($leg) {
-    'plain_tls' => null, // test-mode：信任自签（缺省行为）
+    'plain_tls' => null, // test-mode: trust self-signed (default behavior)
     'ca_verify' => ['caCert' => $caCert, 'serverName' => $serverName],
     'mtls' => ['caCert' => $caCert, 'serverName' => $serverName, 'clientCert' => $clientCert, 'clientKey' => $clientKey],
 };
 
-/** 按 body 记账的投递收集器（对象引用语义，listener 直接改内部表）。 */
+/** Delivery collector accounting by body (object reference semantics; the listener mutates the inner table directly). */
 final class TlsCollector
 {
     /** @var array<string,int> */
@@ -103,7 +104,7 @@ try {
         $a->shutdown();
     }
 
-    // 先起消费者（B5：先起消费者再发消息）
+    // Start the consumer first (B5: consumer up before sending)
     $consumer = new DefaultMQPushConsumer($group);
     $consumer->setNamesrvAddr($ns);
     $consumer->setConsumeFromWhere(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
@@ -124,10 +125,10 @@ try {
         }
         usleep(200_000);
     }
-    $check($consumer->assignedQueueCountForTopic($topic) >= 1, "[$leg] 消费者分配到位（TLS 握手已过）",
+    $check($consumer->assignedQueueCountForTopic($topic) >= 1, "[$leg] consumer assigned (TLS handshake passed)",
         'assigned=' . $consumer->assignedQueueCountForTopic($topic));
 
-    // 发 3 条
+    // Send 3 messages
     $p = new DefaultMQProducer('PID_PhpTls_' . $leg . '_' . $stamp);
     $p->setNamesrvAddr($ns);
     $p->tlsEnable = true;
@@ -150,7 +151,7 @@ try {
             break;
         }
     }
-    $check($sendErr === '', "[$leg] TLS 通道发送 3 条", $sendErr);
+    $check($sendErr === '', "[$leg] 3 messages sent over the TLS channel", $sendErr);
 
     $deadline = microtime(true) + 40.0;
     while (microtime(true) < $deadline) {
@@ -172,9 +173,9 @@ try {
             $gotAll = false;
         }
     }
-    $check($gotAll, "[$leg] TLS 通道收满 3 条", 'got=' . json_encode($collector->recs, JSON_UNESCAPED_UNICODE));
+    $check($gotAll, "[$leg] 3 messages received over the TLS channel", 'got=' . json_encode($collector->recs, JSON_UNESCAPED_UNICODE));
 } catch (Throwable $e) {
-    $check(false, "[$leg] 异常中止", get_class($e) . ': ' . $e->getMessage());
+    $check(false, "[$leg] aborted by exception", get_class($e) . ': ' . $e->getMessage());
 } finally {
     foreach ($shutdowns as $fn) {
         $fn();

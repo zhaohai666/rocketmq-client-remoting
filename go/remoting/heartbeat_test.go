@@ -16,8 +16,9 @@ func TestBuildSubscriptionDataSubAll(t *testing.T) {
 		if sd.SubString != "*" {
 			t.Errorf("%q: subString = %q, want *", sub, sd.SubString)
 		}
-		// 空订阅的 tagsSet/codeSet 必须留空：tagsSet 非空是客户端二次过滤的开关，
-		// 塞 "*" 会把全量订阅自己过滤掉。
+		// An empty subscription's tagsSet/codeSet must stay empty: a non-empty
+		// tagsSet is the switch for the client-side second-stage filter, so
+		// filling it with "*" would filter out the whole subscription.
 		if len(sd.TagsSet) != 0 || len(sd.CodeSet) != 0 {
 			t.Errorf("%q: sets must stay empty, got %v/%v", sub, sd.TagsSet, sd.CodeSet)
 		}
@@ -29,7 +30,7 @@ func TestBuildSubscriptionDataTags(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// subString 保留原始空格，tag trim + 去重 + 升序。
+	// subString keeps the raw spacing; tags are trimmed, deduplicated and sorted ascending.
 	if sd.SubString != " TagB || TagA || TagB " {
 		t.Errorf("subString must keep raw spacing, got %q", sd.SubString)
 	}
@@ -46,14 +47,14 @@ func TestBuildSubscriptionDataWhitespaceOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 纯空白走切分分支：两个集合空，但 subString 仍是原样（服务端只认 null/""）。
+	// Pure whitespace takes the split branch: both sets are empty, but subString stays as-is (the broker only accepts null/"").
 	if sd.SubString != "   " || len(sd.TagsSet) != 0 || len(sd.CodeSet) != 0 {
 		t.Errorf("whitespace-only: got %q %v %v", sd.SubString, sd.TagsSet, sd.CodeSet)
 	}
 }
 
 func TestBuildSubscriptionDataEdgeSplits(t *testing.T) {
-	// "|||"：切分只丢末尾空串，中间的 "|" 留下。
+	// "|||": the split only drops trailing empty strings, keeping the middle "|".
 	sd, err := FilterAPI{}.BuildSubscriptionData("Tt", "|||")
 	if err != nil {
 		t.Fatal(err)
@@ -86,7 +87,7 @@ func TestSubscriptionDataJSONRoundTrip(t *testing.T) {
 }
 
 func TestSubscriptionDataDecodeTolerantItems(t *testing.T) {
-	// tagsSet 里的数字/布尔按文本收；codeSet 的数字字符串也能读成整数。
+	// Numbers/booleans in tagsSet are taken as text; numeric strings in codeSet are also read as integers.
 	text := `{"topic":"Tt","subString":"*","tagsSet":["TagA",7,true],"codeSet":["11",22],"subVersion":1234567890,"expressionType":"TAG"}`
 	back := &SubscriptionData{}
 	if err := back.FromJSONValue(mustDecode(t, []byte(text))); err != nil {
@@ -110,7 +111,7 @@ func TestHeartbeatDataGoldenShape(t *testing.T) {
 	cd.AddSubscriptionData(sub)
 	hb.AddConsumerData(cd)
 	hb.AddProducerData(NewProducerData("pid"))
-	// 重复添加要被折叠。
+	// Duplicate additions must be folded.
 	hb.AddConsumerData(cd)
 
 	text := string(hb.Encode())

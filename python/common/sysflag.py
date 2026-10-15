@@ -12,9 +12,9 @@ class MessageSysFlag:
     TRANSACTION_ROLLBACK_TYPE = 0x3 << 2
     BORNHOST_V6_FLAG = 0x1 << 4
     STOREHOSTADDRESS_V6_FLAG = 0x1 << 5
-    # 批量消息解包标记（避免与其它位冲突）
+    # batch message unwrap flag (to avoid conflicting with other bits)
     NEED_UNWRAP_FLAG = 0x1 << 6
-    # 内部批量标记
+    # internal batch flag
     INNER_BATCH_FLAG = 0x1 << 7
 
     COMPRESSION_LZ4_TYPE = 0x1 << 8
@@ -23,7 +23,7 @@ class MessageSysFlag:
     COMPRESSION_TYPE_COMPARATOR = 0x7 << 8
     COMPRESSION_TYPE_SHIFT = 8
 
-    # 兼容历史命名（供 compression_type 数值 -> flag 位）
+    # kept for backward-compatible naming (maps compression_type value -> flag bit)
     LZ4_TYPE = 1
     ZSTD_TYPE = 2
     ZLIB_TYPE = 3

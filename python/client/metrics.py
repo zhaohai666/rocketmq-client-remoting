@@ -7,18 +7,18 @@ from typing import Optional
 
 
 class ClientMetrics:
-    """线程安全的发送/消费基本指标计数器。"""
+    """Thread-safe basic send/consume metric counters."""
 
     def __init__(self):
         self._lock = threading.Lock()
-        # 发送
+        # send
         self._send_count = 0
         self._send_failure_count = 0
         self._send_rt_sum = 0.0
         self._send_rt_max = 0.0
         self._send_rt_min = 0.0
         self._send_started = False
-        # 消费
+        # consume
         self._consume_count = 0
         self._consume_failure_count = 0
         self._consume_rt_sum = 0.0
@@ -26,7 +26,7 @@ class ClientMetrics:
         self._consume_rt_min = 0.0
         self._consume_started = False
 
-    # ---------------- 发送 ----------------
+    # ---------------- send ----------------
     def record_send_start(self) -> float:
         return time.time() * 1000.0
 
@@ -52,7 +52,7 @@ class ClientMetrics:
                 self._send_rt_min = rt
             self._send_started = True
 
-    # ---------------- 消费 ----------------
+    # ---------------- consume ----------------
     def record_consume_start(self) -> float:
         return time.time() * 1000.0
 
@@ -78,7 +78,7 @@ class ClientMetrics:
                 self._consume_rt_min = rt
             self._consume_started = True
 
-    # ---------------- 快照 ----------------
+    # ---------------- snapshot ----------------
     def snapshot(self) -> dict:
         with self._lock:
             return {

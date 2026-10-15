@@ -21,7 +21,7 @@ FILE_SEPARATOR = os.sep
 
 
 def check_group(group: Optional[str]) -> None:
-    """对应 ``Validators.checkGroup``。"""
+    """Corresponds to ``Validators.checkGroup``."""
     if group is None or not group.strip():
         raise MQClientException("the specified group is blank")
     if len(group) > GROUP_MAX_LENGTH:
@@ -34,7 +34,7 @@ def check_group(group: Optional[str]) -> None:
 
 
 def check_topic(topic: Optional[str]) -> None:
-    """对应 ``Validators.checkTopic``。"""
+    """Corresponds to ``Validators.checkTopic``."""
     if topic is None or not topic.strip():
         raise MQClientException("The specified topic is blank")
     if len(topic) > TOPIC_MAX_LENGTH:
@@ -47,7 +47,7 @@ def check_topic(topic: Optional[str]) -> None:
 
 
 def is_system_topic(topic: str) -> None:
-    """对应 ``Validators.isSystemTopic``：命中系统 topic 直接抛，正常时返回 None。"""
+    """Corresponds to ``Validators.isSystemTopic``: raise immediately on a system topic, return None normally."""
     if _is_system_topic(topic):
         raise MQClientException("The topic[%s] is conflict with system topic." % topic)
 
@@ -59,7 +59,7 @@ def is_not_allowed_send_topic(topic: str) -> None:
 
 
 def check_message(msg: Optional[Message], max_message_size: int) -> None:
-    """对应 ``Validators.checkMessage(msg, producer)``（顺序与文案逐条照抄）。"""
+    """Corresponds to ``Validators.checkMessage(msg, producer)`` (order and wording copied verbatim)."""
     if msg is None:
         raise MQClientException("the message is null", ResponseCode.MESSAGE_ILLEGAL)
     check_topic(msg.topic)
@@ -73,7 +73,7 @@ def check_message(msg: Optional[Message], max_message_size: int) -> None:
         raise MQClientException(
             "the message body size over max value, MAX: %d" % max_message_size,
             ResponseCode.MESSAGE_ILLEGAL)
-    # 多队列分发（LMQ）的路径里带文件系统分隔符会让 broker 侧建队列时拼出越界路径
+    # the multi-queue dispatch (LMQ) path carries a filesystem separator, which would make the broker build an out-of-range path when creating the queue
     lmq_path = msg.get_property(MessageConst.PROPERTY_INNER_MULTI_DISPATCH)
     if lmq_path and FILE_SEPARATOR in lmq_path:
         raise MQClientException(

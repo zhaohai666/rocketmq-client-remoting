@@ -1,5 +1,5 @@
-// 用途：Consumer 注册到 broker 的心跳里携带 SubscriptionData，broker 依据
-// tagsSet / codeSet 做 TAG 过滤；subString 为 "||" 分隔的 tag 表达式。
+// Purpose: the heartbeat a Consumer registers with the broker carries SubscriptionData; the broker uses
+// tagsSet / codeSet to do TAG filtering; subString is a "||"-separated tag expression.
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -27,7 +27,7 @@ public sealed class SubscriptionData : IComparable<SubscriptionData>
 
     public SubscriptionData()
     {
-        // 默认取当前毫秒时间戳
+        // default to the current millisecond timestamp
         SubVersion = UtilAll.CurrentTimeMillis();
     }
 
@@ -39,7 +39,7 @@ public sealed class SubscriptionData : IComparable<SubscriptionData>
     }
 
     // ---- JSON ----
-    // 键按字母序，与 fastjson2 输出一致
+    // Keys in alphabetical order, consistent with fastjson2 output
     public JsonValue ToJson()
     {
         JsonValue o = JsonValue.MakeObject();

@@ -1,20 +1,20 @@
 # -*- coding: utf-8 -*-
-"""SOCKS 代理传输层离线单测。
+"""Offline unit tests for the SOCKS proxy transport layer.
 
-进程内起一个假 SOCKS 代理（socketserver 线程，最小握手 + CONNECT + 字节中继）
-和一个明文 RocketMQ 帧回显服务端，验证：
+A fake SOCKS proxy (socketserver thread, minimal handshake + CONNECT + byte relay)
+and a plaintext RocketMQ frame echo server are started in-process to verify:
 
-- RemotingClient 配置 SocksProxyConfig 后经代理建连，请求正常往返（SOCKS5 无认证）；
-- SOCKS5 用户名密码子协商：凭据正确通过、凭据错误被代理解拒、代理要认证但客户端
-  没带凭据三种形状；
-- 代理对 CONNECT 回失败应答（rep != 0）时客户端报 RemotingConnectException；
-- SOCKS4（含 4a 域名目标）握手；
-- enable 语义：enable=False 时留着配置但不走代理（直连可达）；
-- SocksProxyConfig 自身的字段解析（host:port 合写 / enable 缺省 / 非法类型）。
+- RemotingClient connects through the proxy once SocksProxyConfig is configured, and requests round-trip normally (SOCKS5 no auth);
+- SOCKS5 username/password sub-negotiation: correct credentials pass, wrong credentials are rejected by the proxy, and the proxy
+  requires auth but the client carries no credentials -- three shapes;
+- when the proxy replies with a failure answer (rep != 0) to CONNECT the client reports RemotingConnectException;
+- SOCKS4 (including the 4a domain-name target) handshake;
+- enable semantics: with enable=False the config is kept but the proxy is bypassed (direct connection works);
+- SocksProxyConfig's own field parsing (host:port combined / enable defaulted / illegal types).
 
-关于本机 loopback 怪癖（Windows：刚关闭的端口约 2s 内拒绝连接）：涉及连接失败的
-断言全部走**协议层拒绝**（代理先收下 TCP 再在 SOCKS 层拒绝），不依赖任何"连不上的
-端口"；同时这类用例的建连超时给到 35s 预算，即使碰上瞬时怪癖也不会误判。
+About the local loopback quirk (Windows: a just-closed port refuses connections for about 2s): all assertions involving
+connection failures go through **protocol-layer rejection** (the proxy accepts the TCP first, then rejects at the SOCKS layer), relying on no "unconnectable
+port"; at the same time such test cases are given a 35s connect budget, so even a transient quirk would not cause a false failure.
 """
 import select
 import socket
@@ -31,7 +31,7 @@ from remoting.protocol import headers as headers_mod
 from remoting.protocol.codes import RequestCode, ResponseCode
 from remoting.socks_proxy import (SOCKS4, SOCKS5, SocksProxyConfig, SocksProxyError)
 
-# 建连预算：失败类断言也不许因为本机 loopback 的瞬时怪癖而假失败（预算 ≥30s）
+# Connect budget: failure-class assertions must not falsely fail due to the local loopback's transient quirks (budget >= 30s)
 _CONNECT_TIMEOUT_MILLIS = 35000
 
 
@@ -42,7 +42,7 @@ def _route_request():
 
 
 class FrameServer:
-    """明文 RocketMQ 帧回显服务端：收请求帧 → 回 SUCCESS 响应（同 opaque）。"""
+    """A plaintext RocketMQ frame echo server: receives request frames -> replies with a SUCCESS response (same opaque)."""
 
     def __init__(self):
         self._listen = socket.socket()
@@ -58,7 +58,7 @@ class FrameServer:
                 conn, _ = self._listen.accept()
                 threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
         except OSError:
-            pass  # stop() 关掉监听套接字
+            pass  # stop() closes the listening socket
 
     def _serve(self, conn):
         try:
@@ -104,7 +104,7 @@ class FrameServer:
 
 
 class _SocksHandler(socketserver.BaseRequestHandler):
-    """单连接处理器：最小 SOCKS 握手 + CONNECT + 双向字节中继。"""
+    """A single-connection handler: minimal SOCKS handshake + CONNECT + bidirectional byte relay."""
 
     def handle(self):
         proxy = self.server
@@ -131,7 +131,7 @@ class _SocksHandler(socketserver.BaseRequestHandler):
         methods = self._recv_exact(nmethods) if nmethods else b""
         proxy.greetings.append(list(methods))
         if proxy.username is not None:
-            # 代理要求认证：客户端声明了 0x02 就走子协商，否则回 0xFF（不可接受）
+            # the proxy requires auth: if the client declared 0x02 go to sub-negotiation, otherwise reply 0xFF (unacceptable)
             if 0x02 not in methods:
                 self.request.sendall(b"\x05\xff")
                 return
@@ -190,7 +190,7 @@ class _SocksHandler(socketserver.BaseRequestHandler):
             return
         (port,) = struct.unpack(">H", head[2:4])
         ip = head[4:8]
-        # userid 到 NUL 为止
+        # userid up to NUL
         user = bytearray()
         while True:
             c = self._recv_exact(1)
@@ -199,7 +199,7 @@ class _SocksHandler(socketserver.BaseRequestHandler):
             user += c
         host = socket.inet_ntoa(ip)
         if ip[:3] == b"\x00\x00\x00" and ip[3] != 0:
-            # SOCKS4a：域名跟在 userid 的 NUL 之后
+            # SOCKS4a: the domain follows the userid's NUL
             domain = bytearray()
             while True:
                 c = self._recv_exact(1)
@@ -218,13 +218,13 @@ class _SocksHandler(socketserver.BaseRequestHandler):
 
         self._relay(host, port, grant)
 
-    # ---------------- 公共 ----------------
+    # ---------------- Common ----------------
     def _relay(self, host, port, send_grant):
-        """CONNECT 成功后在客户端与真实目标之间双向搬字节。"""
+        """Move bytes in both directions between the client and the real target after CONNECT succeeds."""
         try:
             target = socket.create_connection((host, port), timeout=5)
         except OSError:
-            # 连不上目标：SOCKS5 回 host unreachable，SOCKS4 回 0x5B
+            # cannot reach the target: SOCKS5 replies host unreachable, SOCKS4 replies 0x5B
             rep = 0x04 if self.server.proxy_type != SOCKS4 else 0x5B
             try:
                 if self.server.proxy_type == SOCKS4:
@@ -272,10 +272,10 @@ class _SocksHandler(socketserver.BaseRequestHandler):
 
 
 class FakeSocksProxy(socketserver.ThreadingTCPServer):
-    """假 SOCKS 代理：只实现握手与 CONNECT 转发，足够单测用。
+    """A fake SOCKS proxy: implements only the handshake and CONNECT forwarding, enough for unit tests.
 
-    ``username``/``password`` 非 None 表示代理要求用户名密码认证（SOCKS5）；
-    ``connect_reply`` 非 0x00 时对 CONNECT 回该失败码（SOCKS5 rep / SOCKS4 CD）。
+    ``username``/``password`` being non-None means the proxy requires username/password auth (SOCKS5);
+    ``connect_reply`` being non-0x00 means that failure code is replied to CONNECT (SOCKS5 rep / SOCKS4 CD).
     """
 
     allow_reuse_address = True
@@ -287,9 +287,9 @@ class FakeSocksProxy(socketserver.ThreadingTCPServer):
         self.username = username
         self.password = password
         self.connect_reply = connect_reply
-        # 观测点：客户端发了什么、代理怎么答的
+        # observation points: what the client sent and how the proxy answered
         self.greetings = []
-        self.auth_results = []       # True/False，走一次子协商记一条
+        self.auth_results = []       # True/False, one entry per sub-negotiation
         self.connect_requests = []   # (host, port[, userid])
         socketserver.ThreadingTCPServer.__init__(
             self, ("127.0.0.1", 0), _SocksHandler)
@@ -303,7 +303,7 @@ class FakeSocksProxy(socketserver.ThreadingTCPServer):
         self._thread.join(timeout=5)
 
 
-# ---------------------------------------------------------------- SOCKS5 无认证
+# ---------------------------------------------------------------- SOCKS5 no auth
 
 def test_invoke_sync_over_socks5_no_auth():
     target = FrameServer()
@@ -318,7 +318,7 @@ def test_invoke_sync_over_socks5_no_auth():
             assert resp.opaque == req.opaque
         finally:
             client.shutdown()
-        # 代理确实被用上了：一次无认证握手，CONNECT 的目标就是帧服务端
+        # the proxy was really used: one no-auth handshake, and the CONNECT target is the frame server
         assert proxy.greetings == [[0x00]]
         assert proxy.auth_results == []
         assert proxy.connect_requests == [("127.0.0.1", target.port)]
@@ -345,7 +345,7 @@ def test_socks5_domain_target_reaches_proxy_unresolved():
         proxy.stop()
 
 
-# ---------------------------------------------------------------- SOCKS5 认证
+# ---------------------------------------------------------------- SOCKS5 auth
 
 def test_socks5_username_password_auth_ok():
     target = FrameServer()
@@ -368,7 +368,7 @@ def test_socks5_username_password_auth_ok():
 
 
 def test_socks5_username_password_auth_rejected():
-    """凭据错误：代理在子协商里拒绝，客户端收口成 RemotingConnectException。"""
+    """Wrong credentials: the proxy rejects them in the sub-negotiation, and the client closes it out into a RemotingConnectException."""
     proxy = FakeSocksProxy(username="rmq", password="secret")
     try:
         cfg = SocksProxyConfig(addr="127.0.0.1", port=proxy.port,
@@ -382,13 +382,13 @@ def test_socks5_username_password_auth_rejected():
         finally:
             client.shutdown()
         assert proxy.auth_results == [False]
-        assert proxy.connect_requests == []   # 认证没过，CONNECT 根本没发
+        assert proxy.connect_requests == []   # auth did not pass, CONNECT was never sent at all
     finally:
         proxy.stop()
 
 
 def test_socks5_client_without_credentials_when_required():
-    """代理要认证但客户端没配凭据：方法协商即被拒（0xFF），同样收口成连接异常。"""
+    """The proxy requires auth but the client has no credentials: the method negotiation is rejected (0xFF), likewise closed out into a connection exception."""
     proxy = FakeSocksProxy(username="rmq", password="secret")
     try:
         client = RemotingClient(
@@ -404,12 +404,12 @@ def test_socks5_client_without_credentials_when_required():
         proxy.stop()
 
 
-# ---------------------------------------------------------------- CONNECT 拒绝
+# ---------------------------------------------------------------- CONNECT rejected
 
 def test_socks5_connect_rejected_by_proxy():
-    """代理对 CONNECT 回失败应答（rep=0x05 connection refused）：
-    客户端必须立刻拿到 RemotingConnectException（协议层拒绝，不走本机 loopback
-    的 connect 拒绝路径，但仍给 35s 建连预算防瞬时怪癖）。"""
+    """The proxy replies with a failure answer (rep=0x05 connection refused) to CONNECT:
+    the client must get a RemotingConnectException immediately (a protocol-layer rejection, not taking the local loopback
+    connect-rejection path, but still given a 35s connect budget against transient quirks)."""
     proxy = FakeSocksProxy(connect_reply=0x05)
     try:
         client = RemotingClient(
@@ -465,10 +465,10 @@ def test_socks4_rejected_by_proxy():
         proxy.stop()
 
 
-# ---------------------------------------------------------------- enable 语义
+# ---------------------------------------------------------------- enable semantics
 
 def test_socks_proxy_disabled_falls_back_to_direct():
-    """enable=False：配置留着但不走代理，直连照常工作，代理零接触。"""
+    """enable=False: the config is kept but the proxy is bypassed, direct connections work as usual, and the proxy is never touched."""
     target = FrameServer()
     proxy = FakeSocksProxy()
     try:
@@ -486,32 +486,32 @@ def test_socks_proxy_disabled_falls_back_to_direct():
         target.stop()
 
 
-# ---------------------------------------------------------------- 配置载体
+# ---------------------------------------------------------------- Config carrier
 
 def test_socks_proxy_config_parsing_and_semantics():
     cfg = SocksProxyConfig("127.0.0.1:1080")
     assert cfg.addr == "127.0.0.1" and cfg.port == 1080
     assert cfg.proxy_type == SOCKS5
-    assert cfg.is_enabled() is True            # enable 缺省 = addr 非空即开
-    # 显式 enable 优先
+    assert cfg.is_enabled() is True            # enable defaults to on when addr is non-empty
+    # explicit enable takes priority
     assert SocksProxyConfig("127.0.0.1:1080", enable=False).is_enabled() is False
     assert SocksProxyConfig("", enable=True).is_enabled() is True
     assert SocksProxyConfig("").is_enabled() is False
-    # 显式 port 覆盖 addr 里带的端口
+    # an explicit port overrides the port carried in addr
     assert SocksProxyConfig("127.0.0.1:1080", port=2099).port == 2099
-    # IPv6 合写
+    # IPv6 combined form
     v6 = SocksProxyConfig("[::1]:1080")
     assert v6.addr == "::1" and v6.port == 1080
-    # 非法代理类型当场抛，不等建连
+    # an illegal proxy type throws immediately, without waiting for a connection
     with pytest.raises(SocksProxyError):
         SocksProxyConfig("127.0.0.1", proxy_type="HTTP")
-    # repr 不泄漏密码明文
+    # repr does not leak the password in plaintext
     r = repr(SocksProxyConfig("127.0.0.1", 1080, username="u", password="p"))
     assert "password=****" in r and "password=p" not in r
 
 
 def test_socks_proxy_config_flows_to_remoting_client():
-    """门面 setter → MQClientInstance → RemotingClient 的传递链不丢字段。"""
+    """The facade setter -> MQClientInstance -> RemotingClient propagation chain loses no fields."""
     from client.mq_client import MQClientInstance
     cfg = SocksProxyConfig("127.0.0.1", 1080, SOCKS5, "u", "secret", enable=True)
     instance = MQClientInstance("socks-plumb-cid", ["127.0.0.1:9876"],
@@ -530,7 +530,7 @@ def test_socks_proxy_config_flows_to_remoting_client():
 
 
 class DefaultMQProducerLike:
-    """门面 setter 冒烟：五个门面同名字段的存取（不起后台线程）。"""
+    """A facade setter smoke test: the same-named fields across five facades are stored/retrieved (no background threads started)."""
 
     def __init__(self):
         from client.producer import DefaultMQProducer

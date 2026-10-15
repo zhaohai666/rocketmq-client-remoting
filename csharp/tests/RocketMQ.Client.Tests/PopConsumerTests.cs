@@ -1,9 +1,12 @@
-// POP **消费侧**（DefaultMQPushConsumer.PopMode = true）本地单测，不需要集群。
+// Local unit tests for the POP **consumer side** (DefaultMQPushConsumer.PopMode = true),
+// no cluster needed.
 //
-// 为什么单独一个文件：协议管道（PopTests）过了 ≠ 消费循环对。消费侧有自己一套容易错的
-// 语义，而且错得**很安静** —— 比如 ackIndex 默认值不对，CONSUME_SUCCESS 会一条都不 ack，
-// 消息在 invisibleTime 到期后被 broker 复活重投；如果观测窗口比 invisibleTime 短，
-// 真机看起来还是"全过"。所以能离线锁的必须先锁死。
+// Why a separate file: the protocol pipe passing (PopTests) does not mean the consume loop
+// is right. The consumer side has its own set of easy-to-get-wrong semantics, and it gets
+// them wrong **very quietly** -- for example a wrong ackIndex default makes CONSUME_SUCCESS
+// ack nothing, and the broker revives and redelivers the message once invisibleTime
+// expires; if the observation window is shorter than invisibleTime, a real machine still
+// looks like "everything passed". So whatever can be pinned offline must be pinned first.
 
 using RocketMQ.Client;
 using RocketMQ.Common;
@@ -19,7 +22,7 @@ public class PopConsumerTests
     private const string Topic = "PopNetUnitTopic";
     private const string Broker = "broker-a";
 
-    // 手工拼 8 段 CK：BuildExtraInfo 的 retryFlag 由 topic 推出，而这里要显式指定 retry 段
+    // Hand-assemble an 8-segment CK: BuildExtraInfo derives retryFlag from the topic, while here the retry segment has to be given explicitly
     private static string Ck(int queueId = 0, long offset = 0, string retry = "0",
                             long popTime = 1000, long invisible = 60000)
         => string.Format(System.Globalization.CultureInfo.InvariantCulture,
@@ -63,12 +66,12 @@ public class PopConsumerTests
         Assert.True(pq.IsDropped());
     }
 
-    // ---------------------------------------------------------------- 默认值
+    // ---------------------------------------------------------------- Defaults
 
     [Fact]
     public void PopModeOffByDefault()
     {
-        // 关掉时必须完全走原来的 pull 路径，行为与改动前一致
+        // When off it must go entirely through the original pull path, behaving exactly as before the change
         Assert.False(new DefaultMQPushConsumer(Group).PopMode);
     }
 
@@ -79,16 +82,16 @@ public class PopConsumerTests
         Assert.Equal(60000, c.PopInvisibleTime);
         Assert.Equal(32, c.PopBatchNums);
         Assert.Equal(96, c.PopThresholdForQueue);
-        // broker 侧 maxMsgNums > 32 会回 INVALID_PARAMETER
+        // A broker-side maxMsgNums > 32 replies INVALID_PARAMETER
         Assert.True(c.PopBatchNums <= 32);
-        // 长轮询挂起时长必须 < 请求超时，否则客户端先超时、每次都空转
+        // The long-poll suspend duration must be < the request timeout, otherwise the client times out first and every round spins on nothing
         Assert.True(c.PopPollTimeMillis < c.PopTimeoutMillis);
     }
 
     [Fact]
     public void DelayLevelTableIsSecondsAndAscending()
     {
-        // 档位表单位秒，首档 10s（send 的延迟档位首档是 1s，别混）
+        // The tier table is in seconds, the first tier is 10s (the send delay tiers start at 1s, do not mix them up)
         Assert.Equal(10, PopDelayLevelDefaults.Table[0]);
         Assert.Equal(7200, PopDelayLevelDefaults.Table[^1]);
         for (int i = 1; i < PopDelayLevelDefaults.Table.Length; i++)
@@ -100,7 +103,7 @@ public class PopConsumerTests
         Assert.Equal(300000, DefaultMQPushConsumer.MaxPopInvisibleTime);
     }
 
-    // ---------------------------------------------------------------- POP_CK 还原
+    // ---------------------------------------------------------------- POP_CK reconstruction
 
     [Fact]
     public void CkTargetNormalTopicRoundtrip()
@@ -118,9 +121,9 @@ public class PopConsumerTests
     [Fact]
     public void CkTargetRetryFlagOneRebuildsRetryTopic()
     {
-        // retryFlag=1 → 真实 topic 是 %RETRY%<group>_<topic>（V1 下划线）。
-        // 即使消息上的 topic 已经被 resetRetryAndNamespace 还原过，只要 CK 里是 1，
-        // ack 的目标 topic 也必须是带 %RETRY% 前缀的那个。
+        // retryFlag=1 => the real topic is %RETRY%<group>_<topic> (V1 uses an underscore).
+        // Even when the topic on the message has already been restored by resetRetryAndNamespace,
+        // as long as the CK says 1 the ack target topic must be the one with the %RETRY% prefix.
         var c = new DefaultMQPushConsumer(Group);
         MessageExt m = Msg(Topic, 1, 2, Ck(1, 2, "1"));
         PopCkTarget? t = c.PopCkTarget(m);
@@ -132,7 +135,7 @@ public class PopConsumerTests
     [Fact]
     public void CkTargetRetryFlagTwoUsesPlusSeparator()
     {
-        // V2 用 '+' 分隔（enableRetryTopicV2=true 时）
+        // V2 uses '+' as the separator (when enableRetryTopicV2=true)
         var c = new DefaultMQPushConsumer(Group);
         MessageExt m = Msg(Topic, 0, 0, Ck(0, 0, "2"));
         PopCkTarget? t = c.PopCkTarget(m);
@@ -143,7 +146,7 @@ public class PopConsumerTests
     [Fact]
     public void CkTargetMissingReturnsNull()
     {
-        // 没有 CK → 放弃 ack，交给 broker 复活（不能抛）
+        // No CK -> give up on the ack and let the broker revive it (it must not throw)
         var c = new DefaultMQPushConsumer(Group);
         Assert.Null(c.PopCkTarget(Msg()));
     }
@@ -151,7 +154,7 @@ public class PopConsumerTests
     [Fact]
     public void CkTargetShortSegmentsReturnsNull()
     {
-        // 段数不足（7 段）→ 放弃 ack，不能抛
+        // Not enough segments (7) -> give up on the ack, it must not throw
         var c = new DefaultMQPushConsumer(Group);
         string seven = ExtraInfoUtil.BuildExtraInfo(0, 1, 2, 3, Topic, Broker, 4);
         Assert.Null(c.PopCkTarget(Msg(Topic, 4, 0, seven)));
@@ -164,7 +167,7 @@ public class PopConsumerTests
         Assert.Null(c.PopCkTarget(Msg(Topic, 0, 0, "only two")));
     }
 
-    // ---------------------------------------------------------------- 超时判定
+    // ---------------------------------------------------------------- Timeout decision
 
     [Fact]
     public void UnparsableCkCountsAsTimeout()
@@ -182,7 +185,7 @@ public class PopConsumerTests
         Assert.True(DefaultMQPushConsumer.IsPopTimeout(now - 60001, 60000));
     }
 
-    // ------------------------------------------------- POP 循环的 pullRT/pullTPS
+    // ------------------------------------------------- pullRT/pullTPS of the POP loop
 
     private static PopResult Popped(int n)
     {
@@ -200,7 +203,7 @@ public class PopConsumerTests
     {
         var stats = new ConsumerStatsManager();
         string key = Topic + "@" + Group;
-        // 倒退 30ms：RT = now - began，正向断言 >0 不依赖调度精度
+        // rewound 30ms: RT = now - began, so the positive assertion of >0 does not depend on scheduling precision
         long began = UtilAll.CurrentTimeMillis() - 30;
 
         DefaultMQPushConsumer.RecordPopPullStats(stats, Group, Topic, Popped(2), began);
@@ -208,7 +211,7 @@ public class PopConsumerTests
         (long rtValue, long rtTimes) = stats.TopicAndGroupPullRT.Find(key)!.Snapshot();
         (long tpsValue, long tpsTimes) = stats.TopicAndGroupPullTPS.Find(key)!.Snapshot();
         Assert.Equal(1, rtTimes);
-        Assert.True(rtValue >= 30, $"RT 应是本轮弹出耗时，实得 {rtValue}");
+        Assert.True(rtValue >= 30, $"RT should be the elapsed time of this round's pop, actually got {rtValue}");
         Assert.Equal(1, tpsTimes);
         Assert.Equal(2, tpsValue);
     }
@@ -223,15 +226,15 @@ public class PopConsumerTests
         DefaultMQPushConsumer.RecordPopPullStats(stats, Group, Topic, Popped(0), began);
 
         Assert.Equal(1, stats.TopicAndGroupPullRT.Find(key)!.Snapshot().times);
-        // TPS 一格都不该动：0 条消息记进分子只会把平均值拉低
+        // TPS must not move at all: counting 0 messages in the numerator only drags the average down
         Assert.Null(stats.TopicAndGroupPullTPS.Find(key));
     }
 
     [Fact]
     public void RecordPopPullStats_PollingNotFoundRecordsNothing()
     {
-        // POP 的空轮询是常态（长轮询挂满 pollTime 后返回），算进 RT 等于用挂起时长
-        // 稀释平均拉取耗时 —— 看板上的 pullRT 会完全失去意义。
+        // An empty POP poll is normal (the long poll returns after being suspended for pollTime), and counting it in RT means diluting
+        // the average pull time with the suspend duration -- pullRT on the dashboard becomes completely meaningless.
         var stats = new ConsumerStatsManager();
         string key = Topic + "@" + Group;
 

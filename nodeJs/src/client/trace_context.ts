@@ -1,18 +1,21 @@
-// 消息轨迹类型与编解码。
+// Message trace types and codecs.
 //
-// 编码文本就是 broker 落盘到 RMQ_SYS_TRACE_TOPIC、控制台原样读回的内容，字段顺序
-// 属于经典 remoting 协议规定的线上格式，不是实现细节。
+// The encoded text is exactly what the broker persists to RMQ_SYS_TRACE_TOPIC
+// and the console reads back verbatim; the field order is the wire format
+// mandated by the classic remoting protocol, not an implementation detail.
 //
-// 分隔规则容易踩坑，两处关键点必须遵守：
+// The splitting rules are easy to get wrong; two key points must be followed:
 //
-//  - CONTENT_SPLITOR（\x01）分隔单条记录内的字段，FIELD_SPLITOR（\x02）分隔记录，
-//    并且**每条记录末尾都补一个 FIELD_SPLITOR**。解码时必须丢弃末尾空段，尾部
-//    补的分隔符才无害；线上记录条数等于 "\x02" 的出现次数。
-//  - JS 原生 split 会保留末尾空串，直接切会多出一个空段并把字段整体错位。统一走
-//    下面的 splitTrimmingTrailingEmpty。
+//  - CONTENT_SPLITOR (\x01) separates fields within a record, FIELD_SPLITOR (\x02) separates records,
+//    and EVERY record ends with an extra FIELD_SPLITOR. Decoding must drop the
+//    trailing empty segment so the appended separator is harmless; the on-wire
+//    record count equals the number of "\x02" occurrences.
+//  - JS's native split keeps the trailing empty string; splitting directly
+//    would add an extra empty segment and shift every field. Always go through
+//    splitTrimmingTrailingEmpty below.
 import { MessageConst } from '../common/messageConst.ts';
 
-// 轨迹相关常量，最后两个 accessChannel 同样属于线上字面量。
+// Trace-related constants; the last two accessChannel values are wire literals too.
 export const TraceGroupNamePrefix = '_INNER_TRACE_PRODUCER';
 export const TraceContentSplitor = '\u0001';
 export const TraceFieldSplitor = '\u0002';
@@ -21,7 +24,7 @@ export const TraceTopicPrefix = 'rmq_sys_TRACE_DATA_';
 export const AccessChannelLocal = 'LOCAL';
 export const AccessChannelCloud = 'CLOUD';
 
-// 轨迹事件类型。类型字符串就是每条编码记录的首字段，属于线上字面量。
+// Trace event types. The type string is the first field of every encoded record, a wire literal.
 export const TraceType = {
   PUB: 'Pub',
   RECALL: 'Recall',
@@ -31,10 +34,10 @@ export const TraceType = {
 } as const;
 export type TraceType = string;
 
-// 消息类型序号 —— 编码到线上的字段值。
+// Message type ordinals — field values encoded onto the wire.
 export const TraceMsgType = { NORMAL: 0, ORDER: 1, TRANSACTION: 2, DELAY: 3, BATCH: 4, REPLY: 5 } as const;
 
-// TraceBean：一条轨迹记录背后被追踪的消息。
+// TraceBean: the message being tracked behind one trace record.
 export class TraceBean {
   topic = '';
   msgId = '';
@@ -54,7 +57,7 @@ export class TraceBean {
   fromTransactionCheck = false;
 }
 
-// TraceContext：一次轨迹事件。
+// TraceContext: one trace event.
 export class TraceContext {
   traceType: TraceType = TraceType.PUB;
   timeStamp = 0;
@@ -69,23 +72,27 @@ export class TraceContext {
   traceBeans: TraceBean[] = [];
 }
 
-// TraceTransferBean：一段编码后的载荷，加上供下游按 key 检索的键集合。
+// TraceTransferBean: one encoded payload, plus the key set for downstream lookup by key.
 export class TraceTransferBean {
   transData = '';
   transKey = new Set<string>();
 }
 
-// traceField 读取一段，缺失时按空串处理。
+// traceField reads one segment, treating a missing one as an empty string.
 //
-// 这里刻意做健壮性处理：SubBefore 记录若来自一条**未带 keys 的消息**，其 keys 段
-// 会被"丢弃末尾空段"的规则吃掉，直接按下标 7 硬取就会越界抛错，进而让整批轨迹消息丢光。
-// 读侧不应因合法记录缺段而崩溃，所以缺段读作空串。
+// Deliberate robustness handling here: if a SubBefore record comes from a
+// message WITHOUT keys, its keys segment is eaten by the "drop the trailing
+// empty segment" rule, and blindly taking index 7 would go out of bounds and
+// throw, losing the whole batch of trace messages.
+// The read side must not crash on a legal record missing a segment, so a
+// missing segment reads as an empty string.
 function traceField(line: string[], index: number): string {
   return index < line.length ? line[index] : '';
 }
 
-// splitTrimmingTrailingEmpty：按分隔符切分，**丢弃末尾空段**（协议规定每条记录末尾都补
-// FIELD_SPLITOR）；没有分隔符的字符串原样返回。
+// splitTrimmingTrailingEmpty: splits by the separator, DROPPING the trailing
+// empty segment (the protocol appends a FIELD_SPLITOR to every record); a
+// string with no separator is returned as-is.
 export function splitTrimmingTrailingEmpty(text: string, sep: string): string[] {
   const parts = text.split(sep);
   if (parts.length === 1) return parts;
@@ -99,7 +106,7 @@ function traceMsgType(text: string): number | null {
   return n;
 }
 
-// EncodeTraceContext 把一次轨迹事件编码为传输块；上下文为 null 时返回 null。
+// EncodeTraceContext encodes one trace event into a transfer block; returns null when the context is null.
 export function EncodeTraceContext(ctx: TraceContext | null): TraceTransferBean | null {
   if (ctx == null) return null;
   const tb = new TraceTransferBean();
@@ -175,9 +182,11 @@ export function EncodeTraceContext(ctx: TraceContext | null): TraceTransferBean 
   return tb;
 }
 
-// DecodeTraceDataString 解一批轨迹记录。
+// DecodeTraceDataString decodes a batch of trace records.
 //
-// 健壮性策略：单条解码失败时跳过，不中断整段解析——否则一条坏记录会让整批轨迹全部丢光。
+// Robustness policy: skip a single record that fails to decode without
+// aborting the whole parse — otherwise one bad record loses the entire batch
+// of traces.
 export function DecodeTraceDataString(traceData: string): TraceContext[] {
   if (!traceData) return [];
   const out: TraceContext[] = [];
@@ -245,7 +254,7 @@ function decodeTraceContext(record: string): TraceContext | null {
       const bean = newBean();
       bean.msgId = line[5];
       bean.retryTimes = retry;
-      // 段 7 是无 keys 的消息会被切掉的段，用 traceField 兜底。
+      // Segment 7 is the segment cut away for a message without keys; use traceField as the fallback.
       bean.keys = traceField(line, 7);
       ctx.traceBeans = [bean];
       return ctx;
@@ -321,8 +330,9 @@ function decodeTraceContext(record: string): TraceContext | null {
   }
 }
 
-// 从 MessageExt 构造 TraceBean（消费侧）：msgId 取 OFFSET 形式的 ID，与
-// SendResult.offsetMsgId 同一路；生产侧 Pub 轨迹则使用 UNIQ_KEY。
+// Build a TraceBean from a MessageExt (consumer side): msgId takes the
+// OFFSET-form id, the same as SendResult.offsetMsgId; the producer-side Pub
+// trace uses UNIQ_KEY.
 export function traceBeanFromMessageExt(msg: any, offsetBasedId: boolean): TraceBean {
   const bean = new TraceBean();
   bean.topic = msg.getTopic();

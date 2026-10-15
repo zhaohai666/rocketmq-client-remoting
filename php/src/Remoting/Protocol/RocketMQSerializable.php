@@ -5,16 +5,19 @@ declare(strict_types=1);
 namespace RocketMQ\Remoting\Protocol;
 
 /**
- * ROCKETMQ 紧凑二进制命令头（header 序列化类型 1，与 JSON 头二选一）。
+ * The compact ROCKETMQ binary command header (header serialize type 1, chosen alternatively with the
+ * JSON header).
  *
- * 格式：code(2) + language(1) + version(2) + opaque(4) + flag(4)
- *       + remark(int+utf8) + extFields(int + key(short+utf8) / value(int+utf8))。
- * 端序一律大端；**字节级必须与 broker 侧解析器逐字节对齐**，差一个字节对端就报解析失败。
+ * Format: code(2) + language(1) + version(2) + opaque(4) + flag(4)
+ *       + remark(int+utf8) + extFields(int + key(short+utf8) / value(int+utf8)).
+ * The endianness is always big-endian; **at the byte level it has to be aligned with the broker-side
+ * parser byte for byte**, one byte off makes the peer report a parsing failure.
  */
 final class RocketMQSerializable
 {
     /**
-     * 带 4 字节大端长度前缀的十进制数字写出：先占位写长度，再回填真实字节数。
+     * Writes a decimal number with a 4-byte big-endian length prefix: writes a placeholder length first,
+     * then backfills the real byte count.
      */
     public static function writeDecimalLong(string &$buf, int $value): void
     {
@@ -43,7 +46,7 @@ final class RocketMQSerializable
         self::writeDecimalLong($buf, $value);
     }
 
-    /** 写一个带长度前缀的 UTF-8 字符串（useShortLength：2 字节 vs 4 字节长度）。 */
+    /** Writes a length-prefixed UTF-8 string (useShortLength: 2-byte vs 4-byte length). */
     public static function writeStr(string &$buf, bool $useShortLength, ?string $s): void
     {
         $bs = $s === null ? '' : $s;
@@ -57,7 +60,7 @@ final class RocketMQSerializable
     }
 
     /**
-     * 读一个带长度前缀的 UTF-8 字符串；长度 0 → null。
+     * Reads a length-prefixed UTF-8 string; length 0 -> null.
      *
      * @return array{0: ?string, 1: int} [value, newOffset]
      */
@@ -102,8 +105,8 @@ final class RocketMQSerializable
     }
 
     /**
-     * 编码命令头。
-     * 顺序：code(2) language(1) version(2) opaque(4) flag(4) remark(int+utf8) extFields(int + map)。
+     * Encodes a command header.
+     * Order: code(2) language(1) version(2) opaque(4) flag(4) remark(int+utf8) extFields(int + map).
      */
     public static function rocketMqProtocolEncode(RemotingCommand $cmd): string
     {
@@ -133,7 +136,7 @@ final class RocketMQSerializable
     }
 
     /**
-     * 解码 extFields map（key 用 short 长度、value 用 int 长度）。
+     * Decodes the extFields map (key uses a short length, value uses an int length).
      *
      * @return array{0: array<string, string>, 1: int} [map, newOffset]
      */
@@ -152,14 +155,14 @@ final class RocketMQSerializable
     }
 
     /**
-     * 解码 ROCKETMQ 二进制命令头（字段顺序与编码一致）。
+     * Decodes a ROCKETMQ binary command header (field order matches the encoder).
      *
      * @return array{code: int, language: int, version: int, opaque: int, flag: int, remark: ?string, extFields: ?array<string, string>}
      */
     public static function rocketMqProtocolDecode(string $headerBytes): array
     {
         $offset = 0;
-        // ">h" 是有符号 short；这里按无符号读再截 16 位，保证 code 恒为 0..65535
+        // ">h" is a signed short; read it as unsigned and truncate to 16 bits so code is always 0..65535
         $code = unpack('n', substr($headerBytes, $offset, 2))[1];
         $offset += 2;
         $language = ord($headerBytes[$offset]);
@@ -188,7 +191,7 @@ final class RocketMQSerializable
         ];
     }
 
-    /** 4 字节大端 → 有符号 int：超过 0x7FFFFFFF 折回负数。 */
+    /** 4-byte big-endian -> signed int: values above 0x7FFFFFFF wrap back to negative. */
     public static function unpackSignedInt(string $bytes): int
     {
         $v = unpack('N', $bytes)[1];

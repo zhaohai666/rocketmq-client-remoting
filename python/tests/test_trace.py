@@ -148,7 +148,7 @@ def test_trace_split_drops_trailing_empty():
     assert split_dropping_trailing_empty(STX, STX) == []
     assert split_dropping_trailing_empty("a" + STX + "b" + STX, STX) == ["a", "b"]
     assert split_dropping_trailing_empty("a" + SOH + SOH + "b", SOH) == ["a", "", "b"]
-    # Python 原生 split 会保留末尾空串 —— 这正是不能直接用的原因
+    # Python's native split keeps the trailing empty string -- exactly why it cannot be used directly
     assert "a" + STX.split()[0] is not None
     assert ("a" + STX).split(STX) == ["a", ""]
 
@@ -215,11 +215,11 @@ def test_decode_sub_after_context_code_and_legacy_branch():
     assert decoded.is_success is False
     assert decoded.time_stamp == 1700000000000
     assert decoded.group_name == "CID_test"
-    # 老版本只有 7 段时不应读到 timestamp/group
+    # the old version with only 7 segments must not read timestamp/group
     legacy = SOH.join(["SubAfter", "REQ", MSG_ID_1, "5", "true", "KeyA", "0"])
     got = TraceDataEncoder.decoder_from_trace_data_string(legacy)[0]
     assert got.context_code == 0
-    assert got.time_stamp > 1700000000000   # 落到「当前时间」的默认值
+    assert got.time_stamp > 1700000000000   # falls back to the "current time" default
     assert got.group_name == ""
 
 
@@ -246,7 +246,7 @@ def test_decode_end_transaction_fields():
     assert bean.msg_type == MessageType.NORMAL_MSG
 
 
-# ---------------- 常量 ----------------
+# ---------------- Constants ----------------
 def test_constants_match_the_trace_wire_format():
     assert TraceConstants.CONTENT_SPLITOR == "\u0001"
     assert TraceConstants.FIELD_SPLITOR == "\u0002"
@@ -265,9 +265,9 @@ def test_constants_match_the_trace_wire_format():
     assert MessageType.ORDER_MSG.short_name == "Order"
 
 
-# ---------------- 分发器 ----------------
+# ---------------- Dispatcher ----------------
 class _FakeTraceProducer:
-    """只记录 send 调用，不发网络（避免单测依赖集群）。"""
+    """Only records send calls, sending no network traffic (so unit tests do not depend on a cluster)."""
 
     def __init__(self):
         self.sent = []
@@ -316,8 +316,8 @@ def test_dispatcher_group_name_and_defaults():
     d2 = AsyncTraceDispatcher("GID_test", TraceDispatcherType.PRODUCE, 50, None, None)
     d2.trace_producer = _FakeTraceProducer()
     assert d2.batch_num == 20
-    # 内部生产者组名：_INNER_TRACE_PRODUCER-<group>-<PRODUCE|CONSUME>-<N>
-    group = d.trace_producer.__class__  # noqa: F841 (仅确保可序列化)
+    # internal producer group name: _INNER_TRACE_PRODUCER-<group>-<PRODUCE|CONSUME>-<N>
+    group = d.trace_producer.__class__  # noqa: F841 (only ensures serializability)
     assert TraceConstants.GROUP_NAME_PREFIX in d._gen_group_name_for_trace()
     assert "-PRODUCE-" in d._gen_group_name_for_trace()
     assert "-CONSUME-" in AsyncTraceDispatcher(
@@ -334,10 +334,10 @@ def test_dispatcher_append_and_flush_sends_encoded_payload():
     d = _make_dispatcher()
     ctx = _pub_context()
     assert d.append(ctx) is True
-    d._send_trace_data([_pub_context()])       # 直接走发送逻辑（不起线程）
+    d._send_trace_data([_pub_context()])       # go through the send logic directly (no thread started)
     assert d.trace_producer.sent[0][0] == "RMQ_SYS_TRACE_TOPIC"
     assert d.trace_producer.sent[0][1].decode("utf-8") == EXPECTED_PUB
-    # keys 是「原始消息 msgId + 业务 keys」，控制台靠它反查轨迹
+    # keys is "original message msgId + business keys"; the console uses it to look up traces
     assert set(d.trace_producer.sent[0][2].split(" ")) == {MSG_ID_1, "KeyA", "KeyB"}
 
 
@@ -365,7 +365,7 @@ def test_dispatcher_groups_by_business_topic():
     d = _make_dispatcher()
     d._send_trace_data([_pub_context(topic="TopicA"), _pub_context(topic="TopicB"),
                         _pub_context(topic="TopicA")])
-    # 按 (业务 topic, 轨迹 topic) 分组 → 2 组；TopicA 那组有 2 条记录（2 个 STX 结尾）
+    # grouped by (business topic, trace topic) -> 2 groups; the TopicA group has 2 records (2 STX endings)
     assert len(d.trace_producer.sent) == 2
     counts = sorted(body.decode("utf-8").count(STX) for _, body, _ in d.trace_producer.sent)
     assert counts == [1, 2]
@@ -373,7 +373,7 @@ def test_dispatcher_groups_by_business_topic():
 
 def test_dispatcher_splits_payload_over_max_size():
     d = _make_dispatcher()
-    d.max_msg_size = len(EXPECTED_PUB)     # 每条记录都到达阈值 → 逐条切块发送
+    d.max_msg_size = len(EXPECTED_PUB)     # every record reaches the threshold -> sent one chunk at a time
     d._flush_data([TraceDataEncoder.encoder_from_context_bean(_pub_context())
                    for _ in range(3)], "TopicTest", "RMQ_SYS_TRACE_TOPIC")
     assert len(d.trace_producer.sent) == 3
@@ -398,7 +398,7 @@ def test_dispatcher_shutdown_flushes_queue():
     assert d.stopped is True
 
 
-# ---------------- 发送钩子 ----------------
+# ---------------- Send hooks ----------------
 class _CapturingDispatcher:
     def __init__(self):
         self.appended = []
@@ -452,7 +452,7 @@ def test_send_hook_pub_round_trip():
 
 
 def test_send_hook_skips_trace_topic_itself():
-    """轨迹消息不能被再次追踪（否则无限递归）。"""
+    """Trace messages must not be traced again (otherwise infinite recursion)."""
     d = _CapturingDispatcher()
     hook = SendMessageTraceHook(d)
     ctx = _send_context(topic="RMQ_SYS_TRACE_TOPIC")
@@ -489,12 +489,12 @@ def test_send_hook_marks_failure_status():
 def test_send_hook_requires_before_to_have_run():
     d = _CapturingDispatcher()
     hook = SendMessageTraceHook(d)
-    ctx = _send_context()          # 不调 before → mq_trace_context 为 None
+    ctx = _send_context()          # without calling before -> mq_trace_context is None
     hook.send_message_after(ctx)
     assert d.appended == []
 
 
-# ---------------- 消费钩子 ----------------
+# ---------------- Consume hooks ----------------
 def _consume_context(topic="TopicTest", trace_on=None, region="DefaultRegion"):
     msg = MessageExt(topic, BODY, "TagA", "KeyA")
     msg.msg_id = MSG_ID_1
@@ -531,7 +531,7 @@ def test_consume_hook_sub_before_and_after_share_request_id():
     assert after.request_id == before.request_id
     assert after.is_success is True
     assert after.cost_time >= 0
-    # SUCCESS 的 ordinal = 0
+    # SUCCESS's ordinal = 0
     assert after.context_code == 0
 
 
@@ -553,7 +553,7 @@ def test_consume_hook_skips_message_with_trace_off():
     ctx = _consume_context(trace_on="false")
     hook.consume_message_before(ctx)
     assert d.appended == []
-    hook.consume_message_after(ctx)      # before 没落轨迹 → after 也不能落
+    hook.consume_message_after(ctx)      # before landed no trace -> after must not land one either
     assert d.appended == []
 
 
@@ -565,7 +565,7 @@ def test_consume_hook_after_without_before_appends_nothing():
     assert d.appended == []
 
 
-# ---------------- SendResult 的轨迹字段（MQClientAPIImpl.processSendResponse）----------------
+# ---------------- SendResult's trace fields (MQClientAPIImpl.processSendResponse) ----------------
 def _send_response(ext):
     cmd = RemotingCommand.create_response_command(0)   # ResponseCode.SUCCESS
     cmd.ext_fields = dict(ext)
@@ -579,8 +579,8 @@ def test_parse_send_response_reads_region_and_trace_on():
     resp = _send_response({"msgId": OFFSET_MSG_ID, "queueId": "1", "queueOffset": "9",
                            "MSG_REGION": "RegionA", "TRACE_ON": "true"})
     result = MQClientInstance._parse_send_response(None, resp, msg, mq)
-    assert result.msg_id == get_uniq_id(msg)      # 客户端 UNIQ_KEY
-    assert result.offset_msg_id == OFFSET_MSG_ID  # broker 的 offset 消息 ID
+    assert result.msg_id == get_uniq_id(msg)      # client-side UNIQ_KEY
+    assert result.offset_msg_id == OFFSET_MSG_ID  # broker's offset message ID
     assert result.region_id == "RegionA"
     assert result.trace_on is True
     assert result.queue_offset == 9
@@ -603,7 +603,7 @@ def test_set_uniq_id_is_idempotent_and_32_hex():
     set_uniq_id(msg)
     first = get_uniq_id(msg)
     assert first is not None and len(first) == 32
-    int(first, 16)          # 必须是合法十六进制
+    int(first, 16)          # must be valid hexadecimal
     set_uniq_id(msg)
     assert get_uniq_id(msg) == first
     assert len(create_uniq_id()) == 32
@@ -643,7 +643,7 @@ def test_consume_concurrently_status_names_used_by_hook():
 
 
 # ---------------------------------------------------------------------------
-# 解码健壮性回归（真机踩到的两个坑，勿删）
+# Decoding robustness regressions (two pitfalls hit on real machines, do not delete)
 # ---------------------------------------------------------------------------
 def test_decode_sub_before_without_keys():
     pass
@@ -659,9 +659,9 @@ def test_decode_sub_before_without_keys():
 
 
 def test_decode_one_bad_record_does_not_drop_the_batch():
-    """一条坏记录不能毁掉整条轨迹消息（真机表现：2 条消息只解出 1 条）。"""
+    """One bad record must not destroy the whole trace message (real-machine behavior: 2 messages, only 1 decoded)."""
     good_pub = EXPECTED_PUB
-    broken = SOH.join(["SubAfter", "REQ-9", MSG_ID_2]) + STX        # 段数不足
+    broken = SOH.join(["SubAfter", "REQ-9", MSG_ID_2]) + STX        # not enough segments
     good_sub = SOH.join(["SubBefore", "1700000000000", "R", "G", "REQ-1", MSG_ID_1, "0", "K"]) + STX
     records = TraceDataEncoder.decoder_from_trace_data_string(good_pub + broken + good_sub)
     assert [c.trace_type for c in records] == [TraceType.PUB, TraceType.SUB_BEFORE]
@@ -680,7 +680,7 @@ def test_decode_empty_and_none_input():
 
 
 def test_decode_round_trip_keeps_bean_msg_id_and_offset_msg_id():
-    """Pub 的 msgId（UNIQ_KEY）与 offsetMsgId（broker 侧 ID）解码后必须各归各位。"""
+    """Pub's msgId (UNIQ_KEY) and offsetMsgId (broker-side ID) must each decode back to their own slot."""
     ctx = TraceContext()
     ctx.trace_type = TraceType.PUB
     ctx.time_stamp = 1700000000000

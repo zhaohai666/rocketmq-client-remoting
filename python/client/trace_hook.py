@@ -16,7 +16,7 @@ logger = get_logger()
 
 
 class SendMessageTraceHook(SendMessageHook):
-    """发送侧轨迹钩子。"""
+    """Send-side trace hook."""
 
     def __init__(self, local_dispatcher) -> None:
         self.local_dispatcher = local_dispatcher
@@ -73,7 +73,7 @@ class SendMessageTraceHook(SendMessageHook):
 
 
 class ConsumeMessageTraceHook(ConsumeMessageHook):
-    """消费侧轨迹钩子（SubBefore / SubAfter 两条记录共用同一个 request_id）。"""
+    """Consume-side trace hook (SubBefore / SubAfter records share the same request_id)."""
 
     def __init__(self, local_dispatcher) -> None:
         self.local_dispatcher = local_dispatcher
@@ -140,10 +140,10 @@ class ConsumeMessageTraceHook(ConsumeMessageHook):
 
 
 class EndTransactionTraceHook:
-    """事务收尾轨迹钩子（对应 EndTransactionTraceHookImpl）。
+    """Transaction-finalize trace hook (corresponds to EndTransactionTraceHookImpl).
 
-    broker 的事务回查（fromTransactionCheck=true）也会走这里，
-    所以「客户端主动提交」和「回查后提交」两种情况都能在轨迹里看到。
+    The broker's transaction check-back (fromTransactionCheck=true) also goes through here,
+    so both "client actively commits" and "commits after check-back" are visible in the trace.
     """
 
     def __init__(self, local_dispatcher) -> None:

@@ -1,8 +1,8 @@
-//! 路由报文模型：`QueueData` / `BrokerData` /
-//! `TopicRouteData`。这三个类是 nameserver `GET_ROUTE_INFO_BY_TOPIC(105)` 应答的 body，
-//! 也是客户端路由表的全部数据结构。
+//! Route payload models: `QueueData` / `BrokerData` /
+//! `TopicRouteData`. These three types are the body of the nameserver `GET_ROUTE_INFO_BY_TOPIC(105)` response,
+//! and they are the entire data structure of the client route table.
 //!
-//! ## 三处必须照抄的线上行为
+//! ## Three wire behaviors that must be copied exactly
 
 use std::cmp::Ordering;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -47,7 +47,7 @@ impl QueueData {
         }
     }
 
-    /// 排序比较器：只比 brokerName。
+    /// Sort comparator: compares only brokerName.
     pub fn compare_to(&self, other: &QueueData) -> Ordering {
         self.broker_name.cmp(&other.broker_name)
     }
@@ -76,8 +76,8 @@ impl QueueData {
 
 // ---------------------------------------------------------------- BrokerData
 
-/// `broker_addrs` 用 `Vec<(i64, String)>` 而不是 `HashMap`：要保住报文里的 brokerId
-/// 顺序，否则「随机挑一个从节点」的候选次序和编码字节都会漂。
+/// `broker_addrs` uses `Vec<(i64, String)>` instead of `HashMap`: the brokerId order in the
+/// payload must be preserved, otherwise both the candidate order of "randomly pick a slave" and the encoded bytes would drift.
 #[derive(Debug, Clone, Default)]
 pub struct BrokerData {
     pub cluster: String,
@@ -113,7 +113,7 @@ impl BrokerData {
             .map(|(_, addr)| addr.clone())
     }
 
-    /// 排序比较器：只比 brokerName。
+    /// Sort comparator: compares only brokerName.
     pub fn compare_to(&self, other: &BrokerData) -> Ordering {
         self.broker_name.cmp(&other.broker_name)
     }
@@ -136,8 +136,8 @@ impl BrokerData {
         expect_object(value, "BrokerData")?;
         let mut addrs = Vec::new();
         for (k, v) in jentries(value, "brokerAddrs")? {
-            // 报文里是 `"0"`（或 fastjson2 的裸 `0`，解析后同样是字符串）。
-            // 脏键（解析不出数字）跳过而不是抛错，不让一份可用路由整个作废。
+            // The payload has `"0"` (or fastjson2's bare `0`, which also parses back as a string).
+            // Dirty keys (no number parses out) are skipped instead of raising, so one usable route is not invalidated wholesale.
             let id = match k.trim().parse::<i64>() {
                 Ok(id) => id,
                 Err(_) => continue,
@@ -153,7 +153,7 @@ impl BrokerData {
             broker_name: jstring_or(value, "brokerName", ""),
             broker_addrs: addrs,
             zone_name: jstring_or(value, "zoneName", ""),
-            // enableActingMaster 缺键 / 假值都按 false 读
+            // enableActingMaster reads as false for both missing key and false value
             enable_acting_master: jboolean(value, "enableActingMaster", false),
         })
     }
@@ -177,8 +177,8 @@ impl PartialEq for BrokerData {
 
 impl Eq for BrokerData {}
 
-/// 不引入 `rand` 依赖：纳秒时钟 + 进程级计数器做 xorshift64，只需保证「不是每次取同一
-/// 个」，负载均衡不要求密码学质量。
+/// No `rand` dependency: nanosecond clock + process-level counter fed into xorshift64; the only
+/// requirement is "not the same pick every time", load balancing does not need cryptographic quality.
 pub(crate) fn pseudo_random_index(bound: usize) -> usize {
     if bound <= 1 {
         return 0;
@@ -202,10 +202,10 @@ pub struct TopicRouteData {
     pub order_topic_conf: Option<String>,
     pub queue_datas: Vec<QueueData>,
     pub broker_datas: Vec<BrokerData>,
-    /// brokerAddr -> filterServer 列表，保持报文顺序。
+    /// brokerAddr -> filterServer list, preserving payload order.
     pub filter_server_table: Vec<(String, Vec<String>)>,
-    /// brokerName -> `TopicQueueMappingInfo`；协议层不建模该结构，原样透传 JSON。
-    /// `None`（键不出现）与 `Some(空表)`（`{}`）在 wire 上不同，不能合并。
+    /// brokerName -> `TopicQueueMappingInfo`; the protocol layer does not model that structure, the JSON passes through as is.
+    /// `None` (key absent) and `Some(empty)` (`{}`) differ on the wire and must not be merged.
     pub topic_queue_mapping_by_broker: Option<Vec<(String, Value)>>,
 }
 
@@ -265,8 +265,8 @@ impl TopicRouteData {
                     .collect(),
             ));
         }
-        // `topicQueueMappingByBroker`：缺键 / null 都是 None，
-        // 显式 `{}` 是 Some(空表)，重新编码时要把键写回去。
+        // `topicQueueMappingByBroker`: missing key / null are both None,
+        // an explicit `{}` is Some(empty), and the key must be written back when re-encoding.
         let topic_queue_mapping_by_broker = match jfield(value, "topicQueueMappingByBroker") {
             None => None,
             Some(Value::Object(map)) => Some(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
@@ -297,8 +297,8 @@ impl TopicRouteData {
         &self.broker_datas
     }
 
-    /// `topic` 必须传真实 topic：send/pull 之后拿 `mq.topic` 回查路由表，
-    /// 回填错了会出现「有路由却查不到」。
+    /// `topic` must be the real topic: after send/pull the route table is looked up again with `mq.topic`,
+    /// and a wrong backfill produces "route exists but lookup finds nothing".
     pub fn get_all_message_queue(&self, topic: &str) -> Vec<MessageQueueKey> {
         let mut mqs = Vec::new();
         for qd in &self.queue_datas {
@@ -353,15 +353,15 @@ impl TopicRouteData {
         }
     }
 
-    /// 路由是否变化（`updateTopicRouteInfoFromNameServer` 的短路条件）。
+    /// Whether the route changed (the short-circuit condition of `updateTopicRouteInfoFromNameServer`).
     pub fn topic_route_data_changed(&self, old: Option<&TopicRouteData>) -> bool {
         let Some(old) = old else {
             return true;
         };
         let sort_queues = |list: &[QueueData]| {
             let mut sorted: Vec<QueueData> = list.to_vec();
-            // 排序键逐项是 `(broker_name, read, write, perm)`；
-            // topicSysFlag 不参与，避免 broker 只改 sysFlag 就误判成路由变化。
+            // The sort key item by item is `(broker_name, read, write, perm)`;
+            // topicSysFlag is excluded so a broker that only changes sysFlag is not misjudged as a route change.
             sorted.sort_by(|a, b| {
                 (
                     &a.broker_name,
@@ -404,7 +404,7 @@ mod tests {
     use super::*;
     use super::super::serialize::fastjson;
 
-    // 以下字面量是线上记录的紧凑 JSON（无空格分隔符）真值。
+    // The literals below are compact-JSON (no space separators) ground truths captured from the wire.
 
     const WIRE_QUEUE_DATA: &str =
         r#"{"brokerName":"broker-a","readQueueNums":8,"writeQueueNums":8,"perm":6,"topicSysFlag":0}"#;
@@ -416,10 +416,10 @@ mod tests {
 
     const TOPIC_ROUTE: &str = r#"{"orderTopicConf":null,"queueDatas":[{"brokerName":"broker-a","readQueueNums":8,"writeQueueNums":8,"perm":6,"topicSysFlag":0},{"brokerName":"broker-b","readQueueNums":4,"writeQueueNums":4,"perm":6,"topicSysFlag":1}],"brokerDatas":[{"cluster":"DefaultCluster","brokerName":"broker-a","brokerAddrs":{"0":"127.0.0.1:10911","1":"127.0.0.1:10912"},"zoneName":"zone-1","enableActingMaster":false}],"filterServerTable":{"127.0.0.1:10911":["127.0.0.1:9876"]}}"#;
 
-    /// nameserver 真实回包形状：`brokerAddrs` 的键是 fastjson2 裸数字。
+    /// Real nameserver response shape: the keys of `brokerAddrs` are fastjson2 bare numbers.
     const NS_ROUTE: &str = r#"{"brokerDatas":[{"brokerAddrs":{0:"127.0.0.1:10911"},"brokerName":"broker-a","cluster":"DefaultCluster","enableActingMaster":false,"zoneName":""}],"filterServerTable":{},"queueDatas":[{"brokerName":"broker-a","perm":6,"readQueueNums":8,"topicSysFlag":0,"writeQueueNums":8}],"orderTopicConf":null}"#;
 
-    /// `NS_ROUTE` 解码后按本端键序重新编码的结果（与线上记录一致）。
+    /// Result of decoding `NS_ROUTE` and re-encoding with this client's key order (matches the wire capture).
     const NS_ROUTE_REWRITTEN: &str = r#"{"orderTopicConf":null,"queueDatas":[{"brokerName":"broker-a","readQueueNums":8,"writeQueueNums":8,"perm":6,"topicSysFlag":0}],"brokerDatas":[{"cluster":"DefaultCluster","brokerName":"broker-a","brokerAddrs":{"0":"127.0.0.1:10911"},"zoneName":"","enableActingMaster":false}],"filterServerTable":{}}"#;
 
     const ROUTE_WITH_MAPPING: &str = r#"{"orderTopicConf":"1 2 3","queueDatas":[],"brokerDatas":[],"filterServerTable":{},"topicQueueMappingByBroker":{"broker-a":{"epoch":3,"queueId":0}}}"#;
@@ -461,7 +461,7 @@ mod tests {
         assert_eq!(
             bd.select_broker_addr().as_deref(),
             Some("127.0.0.1:10911"),
-            "brokerId=0 在表里时必须优先 master"
+            "when brokerId=0 is in the table, master must be preferred"
         );
         assert_eq!(BrokerData::from_json_value(&value(WIRE_BROKER_DATA)).unwrap(), bd);
         let decoded = BrokerData::decode(WIRE_BROKER_DATA.as_bytes()).unwrap();
@@ -485,7 +485,7 @@ mod tests {
             ],
             "",
         );
-        // 随机只能保证「落在候选集内」，不保证具体挑中哪个。
+        // Randomness only guarantees "within the candidate set", not which one is picked.
         for _ in 0..32 {
             let picked = bd.select_broker_addr().unwrap();
             assert!(picked == "slave-1" || picked == "slave-2" || picked == "slave-3");
@@ -533,7 +533,7 @@ mod tests {
 
     #[test]
     fn topic_route_mapping_key_is_absent_not_empty() {
-        // 报文里 None 时整个键不出现；`{}` 时写出 `"topicQueueMappingByBroker":{}`。
+        // When None in the payload the whole key is absent; with `{}` it writes `"topicQueueMappingByBroker":{}`.
         let with = TopicRouteData {
             topic_queue_mapping_by_broker: Some(Vec::new()),
             ..Default::default()
@@ -572,7 +572,7 @@ mod tests {
     #[test]
     fn get_all_message_queue_skips_non_writable_and_unknown_broker() {
         let trd = TopicRouteData::from_json_value(&value(TOPIC_ROUTE)).unwrap();
-        // queueDatas: broker-a 8 队列(perm 6) + broker-b 4 队列，但路由里没有 broker-b。
+        // queueDatas: broker-a 8 queues (perm 6) + broker-b 4 queues, but broker-b is not in the route.
         let mqs = trd.get_all_message_queue("MyTopic");
         assert_eq!(mqs.len(), 8);
         assert_eq!(mqs[0], MessageQueueKey::new("MyTopic", "broker-a", 0));
@@ -589,7 +589,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        // 只读队列过滤的期望结果：同 topic / brokerName，brokerId 0 与 1 都保留
+        // Expected result of the read-only queue filtering: same topic / brokerName, both brokerId 0 and 1 kept
         assert_eq!(
             ro.get_all_message_queue("T"),
             vec![
@@ -607,7 +607,7 @@ mod tests {
                 QueueData::new("broker-b", 4, 4, 6, 0),
             ],
             broker_datas: vec![
-                // master 掉线后的形状：同一个 brokerName 只剩 brokerId=1
+                // Shape after the master drops offline: the same brokerName has only brokerId=1 left
                 BrokerData::new("c", "broker-a", vec![(1, "slave".into())], ""),
                 BrokerData::new(
                     "c",
@@ -625,8 +625,8 @@ mod tests {
                 .collect::<Vec<_>>()
         );
 
-        // 负控：把 master 放回去，broker-a 的 4 条立刻回来 —— 被跳过的是「没有 master」，
-        // 不是 broker-a 这个名字。
+        // Negative control: put the master back and broker-a's 4 queues return immediately -- what gets skipped is "no master",
+        // not the broker-a name.
         let mut with_master = ro.clone_topic_route_data();
         with_master.broker_datas[0].broker_addrs =
             vec![(0, "master".into()), (1, "slave".into())];
@@ -638,18 +638,18 @@ mod tests {
         let ro = TopicRouteData {
             queue_datas: vec![
                 QueueData::new("broker-a", 4, 4, 6, 0),
-                // 只读 topic：perm=4（PERM_READ），readQueueNums=3、writeQueueNums=1
+                // Read-only topic: perm=4 (PERM_READ), readQueueNums=3, writeQueueNums=1
                 QueueData::new("broker-ro", 3, 1, 4, 0),
             ],
             broker_datas: vec![
-                // master 掉线后的形状：只剩 brokerId=1 —— 订阅信息照样保留它的队列
+                // Shape after the master drops offline: only brokerId=1 left -- subscription info still keeps its queues
                 BrokerData::new("c", "broker-a", vec![(1, "slave".into())], ""),
             ],
             ..Default::default()
         };
-        // 发布侧：perm=6 但有 master 才进；broker-a 没有 master ⇒ 空
+        // Publish side: perm=6 but only enters with a master; broker-a has no master ⇒ empty
         assert!(ro.get_all_message_queue("T").is_empty());
-        // 订阅侧：broker-a 的 4 条 + broker-ro 的 3 条（即使 broker-ro 不在 brokerDatas 里）
+        // Subscribe side: broker-a's 4 + broker-ro's 3 (even though broker-ro is not in brokerDatas)
         assert_eq!(
             ro.get_all_subscribe_message_queue("T"),
             (0..4)
@@ -658,7 +658,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
 
-        // 负控：perm 抹掉读位（2 = 只写）后 broker-ro 消失，broker-a 不受影响。
+        // Negative control: with perm clearing the read bit (2 = write-only), broker-ro disappears and broker-a is unaffected.
         let mut write_only = ro.clone_topic_route_data();
         write_only.queue_datas[1].perm = 2;
         assert_eq!(write_only.get_all_subscribe_message_queue("T").len(), 4);
@@ -670,18 +670,18 @@ mod tests {
         assert!(!trd.topic_route_data_changed(Some(&trd.clone_topic_route_data())));
         assert!(trd.topic_route_data_changed(None));
 
-        // 顺序打乱但内容相同 -> 排序后比较，仍视为未变化。
+        // Order shuffled but content identical -> compare after sorting, still treated as unchanged.
         let mut shuffled = trd.clone_topic_route_data();
         shuffled.queue_datas.reverse();
         shuffled.broker_datas.reverse();
         assert!(!shuffled.topic_route_data_changed(Some(&trd)));
 
-        // 只动 zoneName：BrokerData 相等口径不含该字段，故不算变化。
+        // Only zoneName changes: BrokerData's equality does not cover that field, so it does not count as a change.
         let mut zone_only = trd.clone_topic_route_data();
         zone_only.broker_datas[0].zone_name = "zone-2".to_string();
         assert!(!zone_only.topic_route_data_changed(Some(&trd)));
 
-        // 写队列数变化必须算变化（排序键里有 writeQueueNums）。
+        // A write-queue-count change must count as a change (writeQueueNums is in the sort key).
         let mut write_only = trd.clone_topic_route_data();
         write_only.queue_datas[0].write_queue_nums = 4;
         assert!(write_only.topic_route_data_changed(Some(&trd)));

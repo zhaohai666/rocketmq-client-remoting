@@ -1,16 +1,21 @@
 #!/bin/bash
-# Go 批量 admin（go/client/admin_batch.go）的真机验证：18/225 批量配置、
-# 513 静态主题、353 读禁配、323 half 恢复、ORDER_TOPIC_CONFIG KV、306/329 收尾。
+# Live verification of the Go batch admin (go/client/admin_batch.go): 18/225
+# batch config, 513 static topics, 353 read-banned config, 323 half-message
+# resume, ORDER_TOPIC_CONFIG KV, 306/329 cleanup.
 #
-# 用法: bash scripts/run_go_admin_batch_live.sh [namesrv]   （默认 127.0.0.1:9876）
+# Usage: bash scripts/run_go_admin_batch_live.sh [namesrv]   (default 127.0.0.1:9876)
 #
-# 判定口径：全部是「绕 broker 一圈回来」的自断言（建了再读、写了再读、禁了再查），
-# 单侧跑即可，不需要另一语言对拍。
+# Criterion: everything is a loop-back-through-the-broker self-assertion
+# (create then read, write then read, ban then query), so a single-sided run
+# is enough; no cross-language read-back needed.
 #
-# 集群：默认假定已经在跑（scripts/rmq_test_broker.sh 那套）。端口探测失败会自动
-# `rmq_test_broker.sh start`，并在收工时只停自己起来的那一次；已经在跑的不碰。
+# Cluster: assumed to be already running by default (the scripts/rmq_test_broker.sh
+# setup). If the port probe fails, `rmq_test_broker.sh start` is run automatically,
+# and only the instance started here is stopped at cleanup; anything already
+# running is left untouched.
 #
-# ⚠ 集群 start + 等端口 + 跑验证 + kill 必须都在本脚本内串完：前台返回会回收后台 JVM。
+# Note: cluster start + port wait + verification + kill must all be completed
+# serially inside this script: returning to the foreground reaps background JVMs.
 set -u
 
 NS=${1:-${ROCKETMQ_NAMESRV:-127.0.0.1:9876}}
@@ -31,22 +36,22 @@ port_open() {
 STARTED_BROKER=0
 cleanup() {
     if [ "$STARTED_BROKER" = "1" ]; then
-        echo "--- 收工：停掉本脚本起的 broker ---"
+        echo "--- cleanup: stopping the broker started by this script ---"
         sh "$ROOT/scripts/rmq_test_broker.sh" stop || true
     fi
 }
 trap cleanup EXIT
 
 if ! port_open "$BROKER_PORT"; then
-    echo "=== broker 未监听 ${BROKER_PORT}，拉起本地测试集群 ==="
-    sh "$ROOT/scripts/rmq_test_broker.sh" start || { echo "broker 起不来"; exit 1; }
+    echo "=== broker not listening on ${BROKER_PORT}, starting local test cluster ==="
+    sh "$ROOT/scripts/rmq_test_broker.sh" start || { echo "failed to start broker"; exit 1; }
     STARTED_BROKER=1
     sleep 12
 fi
-port_open 9876 || { echo "nameserver 9876 没监听，先起 namesrv"; exit 1; }
+port_open 9876 || { echo "nameserver 9876 not listening, start namesrv first"; exit 1; }
 
 echo ""
-echo "=== admin_batch 真机验证 (topics=${TOPIC_A},${TOPIC_B}) ==="
+echo "=== admin_batch live verification (topics=${TOPIC_A},${TOPIC_B}) ==="
 cd "$ROOT/go" || exit 1
 "$GO" run ./examples/live_admin_batch -ns "$NS" -topic-a "$TOPIC_A" -topic-b "$TOPIC_B" \
     -group-a "$GROUP_A" -group-b "$GROUP_B"
@@ -54,8 +59,8 @@ GO_RC=$?
 
 echo ""
 if [ "$GO_RC" -eq 0 ]; then
-    echo "结果: 全部通过 (topics=${TOPIC_A},${TOPIC_B})"
+    echo "RESULT: all passed (topics=${TOPIC_A},${TOPIC_B})"
     exit 0
 fi
-echo "结果: 有失败 (go=${GO_RC})"
+echo "RESULT: failures present (go=${GO_RC})"
 exit 1

@@ -1,7 +1,9 @@
-// 校验的价值在于「不打网络就失败」，所以除了规则表本身，这里还断言四个入口
-// （Producer.Start / PushConsumer.Start / PullConsumer.Start / LitePullConsumer.Start）
-// 会在任何 I/O 之前拒绝非法组名——测试全程没有可用的 name server，能抛出**组名**
-// 错误而不是「name server address is not set」，本身就证明了顺序正确。
+// The value of validation lies in "failing without touching the network", so besides the
+// rule table itself this file also asserts that the four entry points
+// (Producer.Start / PushConsumer.Start / PullConsumer.Start / LitePullConsumer.Start)
+// reject an illegal group name before any I/O -- there is no usable name server during
+// the test at all, so throwing the **group name** error rather than "name server address
+// is not set" already proves the ordering is right.
 using RocketMQ.Common;
 using RocketMQ.Remoting.Protocol;
 using Xunit;
@@ -10,7 +12,7 @@ namespace RocketMQ.Client.Tests;
 
 public class ValidatorsTests
 {
-    // ---------------------------------------------------------------- 字符表
+    // ---------------------------------------------------------------- Character table
 
     [Theory]
     [InlineData("order-topic")]
@@ -20,7 +22,7 @@ public class ValidatorsTests
     [InlineData("%DLQ%myGroup")]
     [InlineData("Topic|With|Pipe")]
     [InlineData("TOPIC_with_9_digits")]
-    // 边界码点：'~'(126) 不在表里，同样非法
+    // Boundary code point: '~' (126) is not in the table either, so it is illegal too
     [InlineData("topic~1")]
     [InlineData("topic.name")]
     [InlineData("topic/name")]
@@ -100,7 +102,7 @@ public class ValidatorsTests
     [Fact]
     public void CheckGroupAllows120AndRejects121()
     {
-        // group 比 topic 短：它要参与拼 %RETRY%group_topic / %DLQ%group_topic
+        // group is shorter than topic: it has to take part in building %RETRY%group_topic / %DLQ%group_topic
         Validators.CheckGroup(new string('g', TopicValidator.GroupMaxLength));
         MQClientException e = Assert.Throws<MQClientException>(
             () => Validators.CheckGroup(new string('g', TopicValidator.GroupMaxLength + 1)));
@@ -176,7 +178,7 @@ public class ValidatorsTests
             Assert.NotEqual(ResponseCode.MessageIllegal, e.ResponseCode);
         }
 
-        // %RETRY%group 是 sendMessageBack 的正常目标，绝不能被禁
+        // %RETRY%group is the normal target of sendMessageBack, it must never be banned
         Validators.CheckMessage(Msg("%RETRY%myGroup", new byte[] { 1 }), MaxBody);
         Validators.CheckMessage(Msg("%DLQ%myGroup", new byte[] { 1 }), MaxBody);
     }
@@ -192,13 +194,13 @@ public class ValidatorsTests
                      + "extra can not contains " + sep + " character", e.Message);
         Assert.Equal(ResponseCode.MessageIllegal, e.ResponseCode);
 
-        // 正常 LMQ 路径（逗号分隔多个队列）放行
+        // The normal LMQ path (several queues separated by commas) is let through
         Message ok = Msg("T1", new byte[] { 1 });
         ok.PutProperty(MessageConst.PropertyInnerMultiDispatch, "queueA,queueB");
         Validators.CheckMessage(ok, MaxBody);
     }
 
-    // ---------------------------------------------------------------- 系统 topic
+    // ---------------------------------------------------------------- System topics
 
     [Fact]
     public void SystemTopicMatchesLegacyRuleSet()
@@ -207,7 +209,7 @@ public class ValidatorsTests
         Assert.True(TopicValidator.IsSystemTopic("SCHEDULE_TOPIC_XXXX"));
         Assert.True(TopicValidator.IsSystemTopic("BenchmarkTest"));
         Assert.True(TopicValidator.IsSystemTopic("CHECKPOINT_TOPIC"));
-        // 前缀 rmq_sys_ 命中即算系统 topic
+        // matching the rmq_sys_ prefix already counts as a system topic
         Assert.True(TopicValidator.IsSystemTopic("rmq_sys_anything"));
         Assert.False(TopicValidator.IsSystemTopic("RMQ_SYS_TRACE_TOPIC_X"));
         Assert.False(TopicValidator.IsSystemTopic("MyBusinessTopic"));
@@ -217,12 +219,12 @@ public class ValidatorsTests
         Assert.Equal("The topic[rmq_sys_watermark] is conflict with system topic.", e.Message);
     }
 
-    // ---------------------------------------------------------------- 入口接线
+    // ---------------------------------------------------------------- Entry point wiring
 
     [Fact]
     public void ProducerStartRejectsIllegalGroupBeforeAnyIo()
     {
-        // 没有配 name server：若校验排在地址检查之后，这里会抛 "name server address is not set"
+        // No name server configured: if validation came after the address check, this would throw "name server address is not set"
         var prod = new DefaultMQProducer("bad group");
         MQClientException e = Assert.Throws<MQClientException>(prod.Start);
         Assert.Contains("contains illegal characters", e.Message);
@@ -272,7 +274,7 @@ public class ValidatorsTests
     [Fact]
     public void LegalNamesSurviveTheWholeStartupGateOrder()
     {
-        // 合法组名 + 没配地址：必须走到地址检查，说明组名那一步确实放行了
+        // A legal group name plus no address: it must reach the address check, which shows the group name step really let it through
         var prod = new DefaultMQProducer("NormalProducer");
         MQClientException e = Assert.Throws<MQClientException>(prod.Start);
         Assert.Equal("name server address is not set", e.Message);

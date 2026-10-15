@@ -1,9 +1,9 @@
-//! `Validators` / `TopicValidator` 对**真实 5.5.1 集群**的联调验证。
+//! `Validators` / `TopicValidator` live verification against a **real 5.5.1 cluster**.
 //!
-//! 逐项验证命名与消息体大小等校验的边界判定。
+//! Item-by-item verification of the boundary decisions of the naming and message-size validators.
 //!
 //!
-//! 用法（先按项目记忆里记的 runbook 起本地集群）：
+//! Usage (start the local cluster per the runbook recorded in project memory first):
 //! ```text
 //! cargo run --example live_validators -- 127.0.0.1:9876
 //! ```
@@ -25,7 +25,7 @@ use rocketmq_client_remoting::common::message_const::PROPERTY_INNER_MULTI_DISPAT
 use rocketmq_client_remoting::common::mix_all::MixAll;
 use rocketmq_client_remoting::error::{client_error_code, Error};
 
-/// 本地反腿的耗时上界（毫秒）：纯本地计算，真机给 50ms 已经留了两个数量级的余量。
+/// Upper bound for local counter-leg elapsed time (milliseconds): pure local computation, so 50ms on a live machine already leaves two orders of magnitude of headroom.
 const LOCAL_BUDGET_MS: f64 = 50.0;
 const QUEUE_NUMS: i32 = 4;
 const N_MSG: usize = 3;
@@ -65,7 +65,7 @@ fn elapsed_ms(began: Instant) -> f64 {
     began.elapsed().as_secs_f64() * 1000.0
 }
 
-/// `Error::Client` 的 response_code；其它变体返回 None（表示"不是客户端校验错"）。
+/// The response_code of `Error::Client`; other variants return None (meaning "not a client validation error").
 fn client_code(e: &Error) -> Option<i32> {
     match e {
         Error::Client { response_code, .. } => *response_code,
@@ -75,7 +75,7 @@ fn client_code(e: &Error) -> Option<i32> {
 
 fn message(topic: &str, body: &[u8]) -> Message {
     let mut m = Message::new(topic, Some(body));
-    // keys 用来做收发对齐；只在正文本身就是可打印 key 时设置
+    // keys are used to align sends with consumes; set only when the body itself is a printable key
     if let Ok(key) = std::str::from_utf8(body) {
         if key.starts_with("validators-live-") {
             m.set_keys(key);
@@ -94,7 +94,7 @@ fn needle_for(group: &str, reserved: &str, reserved_msg: &'static str) -> &'stat
     }
 }
 
-/// 反腿：发一条必然非法的消息，断言「本地文案 + 码值 + 亚毫秒」，返回耗时毫秒。
+/// Counter-leg: send a message that is certain to be illegal, assert "local message text + code value + sub-millisecond", and return the elapsed milliseconds.
 async fn expect_local_reject(
     ck: &mut Checker,
     name: &str,
@@ -107,7 +107,7 @@ async fn expect_local_reject(
     let began = Instant::now();
     let err = match p.send(&mut m, Some(3000), None).await {
         Ok(_) => {
-            ck.check(name, false, "没有抛异常");
+            ck.check(name, false, "no exception was thrown");
             return 0.0;
         }
         Err(e) => e,
@@ -126,7 +126,7 @@ async fn expect_local_reject(
     ms
 }
 
-/// 反腿：`start()` 必须本地失败、亚毫秒、且不留在 started。
+/// Counter-leg: `start()` must fail locally, sub-millisecond, and not remain in the started state.
 fn expect_start_reject(
     ck: &mut Checker,
     name: &str,
@@ -137,7 +137,7 @@ fn expect_start_reject(
 ) {
     let ms = elapsed_ms(began);
     match err {
-        None => ck.check(name, false, &format!("没有抛异常 started={started}")),
+        None => ck.check(name, false, &format!("no exception was thrown started={started}")),
         Some(e) => {
             let text = e.to_string();
             ck.check(
@@ -150,10 +150,10 @@ fn expect_start_reject(
 }
 
 async fn v1_producer_negatives(ck: &mut Checker, p: &DefaultMQProducer) -> f64 {
-    println!("== V1 非法输入必须本地亚毫秒失败 ==");
+    println!("== V1 illegal input must fail locally in sub-millisecond time ==");
     let local_ms = expect_local_reject(
         ck,
-        "V1a 非法字符 topic",
+        "V1a illegal-character topic",
         p,
         message("bad topic", b"x"),
         "contains illegal characters",
@@ -162,7 +162,7 @@ async fn v1_producer_negatives(ck: &mut Checker, p: &DefaultMQProducer) -> f64 {
     .await;
     expect_local_reject(
         ck,
-        "V1b 空 topic",
+        "V1b blank topic",
         p,
         message("", b"x"),
         "The specified topic is blank",
@@ -171,7 +171,7 @@ async fn v1_producer_negatives(ck: &mut Checker, p: &DefaultMQProducer) -> f64 {
     .await;
     expect_local_reject(
         ck,
-        "V1c 超长 topic",
+        "V1c overlong topic",
         p,
         message(&"t".repeat(128), b"x"),
         "is longer than topic max length",
@@ -180,7 +180,7 @@ async fn v1_producer_negatives(ck: &mut Checker, p: &DefaultMQProducer) -> f64 {
     .await;
     expect_local_reject(
         ck,
-        "V1d 禁发 topic（无 broker 码，不是 MESSAGE_ILLEGAL）",
+        "V1d forbidden topic (no broker code, not MESSAGE_ILLEGAL)",
         p,
         message("SCHEDULE_TOPIC_XXXX", b"x"),
         "is forbidden",
@@ -190,7 +190,7 @@ async fn v1_producer_negatives(ck: &mut Checker, p: &DefaultMQProducer) -> f64 {
     p.set_max_message_size(8);
     expect_local_reject(
         ck,
-        "V1e 超长 body（MESSAGE_ILLEGAL）",
+        "V1e overlong body (MESSAGE_ILLEGAL)",
         p,
         message("V1eBody", b"123456789"),
         "the message body size over max value",
@@ -199,7 +199,7 @@ async fn v1_producer_negatives(ck: &mut Checker, p: &DefaultMQProducer) -> f64 {
     .await;
     expect_local_reject(
         ck,
-        "V1f 空 body（MESSAGE_ILLEGAL）",
+        "V1f empty body (MESSAGE_ILLEGAL)",
         p,
         message("V1fBody", b""),
         "the message body length is zero",
@@ -209,9 +209,9 @@ async fn v1_producer_negatives(ck: &mut Checker, p: &DefaultMQProducer) -> f64 {
     local_ms
 }
 
-/// V2：等于上限必须**不被本地 body 校验拦下**（后面会因 topic 不存在而慢失败，那不是重点）。
+/// V2: a size exactly at the limit must **not be intercepted by the local body validation** (it later fails slowly because the topic does not exist; that is not the point).
 async fn v2_boundary(ck: &mut Checker, p: &DefaultMQProducer) {
-    println!("== V2 恰好等于 maxMessageSize 放行 ==");
+    println!("== V2 a body exactly equal to maxMessageSize is allowed ==");
     p.set_max_message_size(8);
     let mut m = message("V2Edge", b"12345678");
     let began = Instant::now();
@@ -219,7 +219,7 @@ async fn v2_boundary(ck: &mut Checker, p: &DefaultMQProducer) {
     let ms = elapsed_ms(began);
     let text = err.map(|e| e.to_string()).unwrap_or_default();
     ck.check(
-        "V2 等于上限不报 oversize（> 判定）",
+        "V2 exactly at the limit does not report oversize (> comparison)",
         !text.contains("over max value"),
         &format!("{text} in {ms:.1}ms"),
     );
@@ -227,7 +227,7 @@ async fn v2_boundary(ck: &mut Checker, p: &DefaultMQProducer) {
 }
 
 async fn v3_batch_negatives(ck: &mut Checker, p: &DefaultMQProducer) {
-    println!("== V3 批量发送不绕过本地校验 ==");
+    println!("== V3 batch sending does not bypass local validation ==");
     let began = Instant::now();
     let err = p
         .send_batch(
@@ -239,12 +239,12 @@ async fn v3_batch_negatives(ck: &mut Checker, p: &DefaultMQProducer) {
         .err();
     match err {
         Some(e) => ck.check(
-            "V3a 批内非法子消息 ⇒ 整批本地失败",
+            "V3a an illegal sub-message in the batch => the whole batch fails locally",
             e.to_string().contains("contains illegal characters")
                 && elapsed_ms(began) < LOCAL_BUDGET_MS,
             &format!("{e} in {:.2}ms", elapsed_ms(began)),
         ),
-        None => ck.check("V3a 批内非法子消息 ⇒ 整批本地失败", false, "没有抛异常"),
+        None => ck.check("V3a an illegal sub-message in the batch => the whole batch fails locally", false, "no exception was thrown"),
     }
 
     let mut lmq = message("V3Lmq", b"x");
@@ -253,24 +253,24 @@ async fn v3_batch_negatives(ck: &mut Checker, p: &DefaultMQProducer) {
     let err = p.send(&mut lmq, Some(3000), None).await.err();
     match err {
         Some(e) => ck.check(
-            "V3b INNER_MULTI_DISPATCH 带路径分隔符被本地拦下（MESSAGE_ILLEGAL）",
+            "V3b INNER_MULTI_DISPATCH with a path separator is intercepted locally (MESSAGE_ILLEGAL)",
             e.to_string().contains("INNER_MULTI_DISPATCH")
                 && client_code(&e) == Some(13)
                 && elapsed_ms(began) < LOCAL_BUDGET_MS,
             &format!("{e} in {:.2}ms code={:?}", elapsed_ms(began), client_code(&e)),
         ),
-        None => ck.check("V3b INNER_MULTI_DISPATCH 带路径分隔符被本地拦下", false, "没有抛异常"),
+        None => ck.check("V3b INNER_MULTI_DISPATCH with a path separator is intercepted locally", false, "no exception was thrown"),
     }
 }
 
 async fn v4_group_negatives(ck: &mut Checker, namesrv: &str) {
-    println!("== V4 组名校验排在任何网络动作之前 ==");
+    println!("== V4 group-name validation runs before any network action ==");
     let long_group = "g".repeat(121);
     for group in [MixAll::DEFAULT_PRODUCER_GROUP, "bad group", &long_group] {
         let p = match DefaultMQProducer::new(group) {
             Ok(p) => p,
             Err(e) => {
-                ck.check("V4a producer 构造", false, &e.to_string());
+                ck.check("V4a producer construction", false, &e.to_string());
                 continue;
             }
         };
@@ -279,7 +279,7 @@ async fn v4_group_negatives(ck: &mut Checker, namesrv: &str) {
         let err = p.start().await.err();
         expect_start_reject(
             ck,
-            &format!("V4a producer 拒绝组名 {group:?}"),
+            &format!("V4a producer rejects group name {group:?}"),
             err,
             p.is_started(),
             began,
@@ -307,7 +307,7 @@ async fn v4_group_negatives(ck: &mut Checker, namesrv: &str) {
             let err = push.start().await.err();
             expect_start_reject(
                 ck,
-                &format!("V4b push 拒绝组名 {group:?}"),
+                &format!("V4b push rejects group name {group:?}"),
                 err,
                 push.is_started(),
                 began,
@@ -320,7 +320,7 @@ async fn v4_group_negatives(ck: &mut Checker, namesrv: &str) {
             let err = pull.start().await.err();
             expect_start_reject(
                 ck,
-                &format!("V4c pull 拒绝组名 {group:?}"),
+                &format!("V4c pull rejects group name {group:?}"),
                 err,
                 pull.is_started(),
                 began,
@@ -334,7 +334,7 @@ async fn v4_group_negatives(ck: &mut Checker, namesrv: &str) {
             let err = lite.start().await.err();
             expect_start_reject(
                 ck,
-                &format!("V4d lite 拒绝组名 {group:?}"),
+                &format!("V4d lite rejects group name {group:?}"),
                 err,
                 lite.is_started(),
                 began,
@@ -345,7 +345,7 @@ async fn v4_group_negatives(ck: &mut Checker, namesrv: &str) {
 }
 
 async fn v5_admin_negatives(ck: &mut Checker, p: &DefaultMQProducer) {
-    println!("== V5 管理端 create_topic 也先把关 ==");
+    println!("== V5 admin create_topic also gates first ==");
     for (topic, needle) in [
         ("bad topic", "contains illegal characters"),
         ("RMQ_SYS_TRACE_TOPIC", "is conflict with system topic"),
@@ -355,22 +355,22 @@ async fn v5_admin_negatives(ck: &mut Checker, p: &DefaultMQProducer) {
         let err = p.create_topic(topic, QUEUE_NUMS, 0).await.err();
         match err {
             Some(e) => ck.check(
-                &format!("V5 拒绝建 topic {topic:?}"),
+                &format!("V5 refuses to create topic {topic:?}"),
                 e.to_string().contains(needle) && elapsed_ms(began) < LOCAL_BUDGET_MS,
                 &format!("{e} in {:.2}ms", elapsed_ms(began)),
             ),
-            None => ck.check(&format!("V5 拒绝建 topic {topic:?}"), false, "没有抛异常"),
+            None => ck.check(&format!("V5 refuses to create topic {topic:?}"), false, "no exception was thrown"),
         }
     }
 }
 
-/// 正腿：合法名字照常收发（建 topic、lite 收全、pull 查到位点）。
+/// Positive leg: legal names still send and consume as usual (create topic, lite consumes all, pull queries offsets).
 async fn v6_positive(ck: &mut Checker, p: &DefaultMQProducer, namesrv: &str, stamp: &str) {
-    println!("== V6 合法名字照常在集群收发 ==");
+    println!("== V6 legal names send and receive on the cluster as usual ==");
     let topic = format!("RustLiveValidators{stamp}");
     let group = format!("rust-live-validators-{stamp}");
     if let Err(e) = p.create_topic(&topic, QUEUE_NUMS, 0).await {
-        ck.check("V6a 建合法 topic", false, &e.to_string());
+        ck.check("V6a create legal topic", false, &e.to_string());
         return;
     }
     let began = Instant::now();
@@ -386,17 +386,17 @@ async fn v6_positive(ck: &mut Checker, p: &DefaultMQProducer, namesrv: &str, sta
         }
     };
     ck.check(
-        "V6a 合法 topic 路由可用",
+        "V6a route of the legal topic is available",
         mqs.len() >= QUEUE_NUMS as usize,
         &format!("queues={}", mqs.len()),
     );
 
-    // 先起消费者再发消息：新消费组的 CONSUME_FROM_LAST_OFFSET 取的是"启动那一刻"的
-    // max 位点，先发消息就再也收不到了（真机踩过）。
+    // The consumer starts before the messages are sent: a new consumer group's CONSUME_FROM_LAST_OFFSET
+    // takes the max offset "at start-up", so messages sent earlier would never be received (hit on a live cluster).
     let lite = match DefaultLitePullConsumer::new(&group) {
         Ok(c) => c,
         Err(e) => {
-            ck.check("V6b lite 构造", false, &e.to_string());
+            ck.check("V6b lite construction", false, &e.to_string());
             return;
         }
     };
@@ -404,11 +404,11 @@ async fn v6_positive(ck: &mut Checker, p: &DefaultMQProducer, namesrv: &str, sta
     lite.set_instance_name(&format!("lite-{stamp}"));
     lite.subscribe(&topic, "*");
     if let Err(e) = lite.start().await {
-        ck.check("V6b lite 启动", false, &e.to_string());
+        ck.check("V6b lite start", false, &e.to_string());
     }
     lite.rebalance().await;
     ck.check(
-        "V6b lite 消费者分到队列",
+        "V6b lite consumer gets queues assigned",
         !lite.assignment().is_empty(),
         &format!("assigned={}", lite.assignment().len()),
     );
@@ -422,14 +422,14 @@ async fn v6_positive(ck: &mut Checker, p: &DefaultMQProducer, namesrv: &str, sta
             Ok(r) => {
                 if i == 0 {
                     ck.check(
-                        "V6c 合法消息发送成功",
+                        "V6c legal message sent successfully",
                         r.status == SendStatus::SendOk && r.msg_id.is_some(),
                         &format!("{:?}", r.status),
                     );
                 }
             }
             Err(e) => {
-                ck.check("V6c 合法消息发送成功", false, &e.to_string());
+                ck.check("V6c legal message sent successfully", false, &e.to_string());
                 break;
             }
         }
@@ -448,13 +448,13 @@ async fn v6_positive(ck: &mut Checker, p: &DefaultMQProducer, namesrv: &str, sta
     }
     let missing: Vec<&String> = keys.iter().filter(|k| !got.contains(k)).collect();
     ck.check(
-        "V6d lite 消费者收全合法消息",
+        "V6d lite consumer receives all legal messages",
         missing.is_empty(),
         &format!("got={} missing={missing:?}", got.len()),
     );
     lite.shutdown();
 
-    // pull 的合法组名：不光能启动，还能真查到位点（这条走的是 broker RPC）
+    // Legal group name for pull: it must not only start but also really query an offset (this one goes through a broker RPC)
     let pull_group = format!("{group}-pull");
     if let Ok(pull) = DefaultMQPullConsumer::new(&pull_group) {
         pull.set_namesrv_addr(namesrv);
@@ -469,7 +469,7 @@ async fn v6_positive(ck: &mut Checker, p: &DefaultMQProducer, namesrv: &str, sta
             None => -1,
         };
         ck.check(
-            "V6e 合法组名的 pull 消费者可启动并查到位点",
+            "V6e a pull consumer with a legal group name starts and queries offsets",
             started && queues.len() >= QUEUE_NUMS as usize && max_off >= 0,
             &format!("queues={} maxOffset={max_off}", queues.len()),
         );
@@ -478,7 +478,7 @@ async fn v6_positive(ck: &mut Checker, p: &DefaultMQProducer, namesrv: &str, sta
 }
 
 async fn v7_control_leg(ck: &mut Checker, p: &DefaultMQProducer, stamp: &str, local_ms: f64) {
-    println!("== V7 对照腿：本地校验省掉的是什么 ==");
+    println!("== V7 control leg: what local validation saves ==");
     let mut m = message(&format!("RustLiveValidatorsMissing{stamp}"), b"x");
     let began = Instant::now();
     let r = p.send(&mut m, Some(5000), None).await;
@@ -486,12 +486,12 @@ async fn v7_control_leg(ck: &mut Checker, p: &DefaultMQProducer, stamp: &str, lo
     let sent_ok = r.is_ok();
     let text = r.err().map(|e| e.to_string()).unwrap_or_default();
     ck.check(
-        "V7a 合法但不存在的 topic 不被本地误伤（broker 自动建出来）",
+        "V7a a legal but nonexistent topic is not falsely rejected locally (the broker auto-creates it)",
         sent_ok || !text.contains("contains illegal characters"),
         &format!("{text} in {ms:.1}ms"),
     );
     ck.check(
-        "V7b 集群腿比本地反腿慢两个数量级以上",
+        "V7b the cluster leg is more than two orders of magnitude slower than the local counter-leg",
         ms > 10.0 * local_ms.max(0.05),
         &format!("cluster={ms:.1}ms local={local_ms:.2}ms"),
     );
@@ -499,17 +499,17 @@ async fn v7_control_leg(ck: &mut Checker, p: &DefaultMQProducer, stamp: &str, lo
 
 // ---------------------------------------------------------------------- V8
 
-/// 寻址故障（10004）与「topic 没路由」（10005）的分界。
+/// The boundary between an addressing failure (10004) and "topic has no route" (10005).
 async fn v8_name_server_addressing(ck: &mut Checker, p: &DefaultMQProducer, stamp: &str) {
-    println!("== V8 寻址故障（10004）与「topic 没路由」（10005）的分界 ==");
+    println!("== V8 the boundary between an addressing failure (10004) and \"topic has no route\" (10005) ==");
 
     if DefaultTopAddressing::is_configured() {
-        println!("   (skip V8a：ROCKETMQ_NAMESRV_DOMAIN 已配，start() 允许静态地址为空)");
+        println!("   (skip V8a: ROCKETMQ_NAMESRV_DOMAIN is configured, start() allows a static address to be empty)");
     } else {
         let bare = match DefaultMQProducer::new(&format!("rust-live-validators-noaddr-{stamp}")) {
             Ok(p) => p,
             Err(e) => {
-                ck.check("V8a producer 构造", false, &e.to_string());
+                ck.check("V8a producer construction", false, &e.to_string());
                 return;
             }
         };
@@ -518,7 +518,7 @@ async fn v8_name_server_addressing(ck: &mut Checker, p: &DefaultMQProducer, stam
         let ms = elapsed_ms(began);
         let code = err.as_ref().and_then(|e| e.response_code());
         ck.check(
-            "V8a 没配 name server 时 start() 报 10004，且不留 started 态",
+            "V8a with no name server configured, start() reports 10004 and does not remain started",
             code == Some(client_error_code::NO_NAME_SERVER_EXCEPTION)
                 && !bare.is_started()
                 && ms < LOCAL_BUDGET_MS,
@@ -530,20 +530,20 @@ async fn v8_name_server_addressing(ck: &mut Checker, p: &DefaultMQProducer, stam
         );
     }
 
-    // V8b：实例级：一个地址都没有时，路由接口给的是 10004，而不是「找不到这个 topic 的队列」
-    // （10005 的文案）。这是漏斗里 `validate_name_server_setting` 读的那份配置。
+    // V8b: instance level: when no address exists at all, the route API returns 10004, not
+    // "no queue for this topic" (the 10005 wording). This is the config that `validate_name_server_setting` in the funnel reads.
     let no_addr_client = MQClientInstance::new(&format!("rust-live-validators-noaddr-c-{stamp}"), Vec::new());
     let err = no_addr_client.get_topic_publish_info("V8NoAddrTopic", false).await.err();
     let code = err.as_ref().and_then(|e| e.response_code());
     ck.check(
-        "V8b 零地址实例查路由报 10004（不是「topic 没队列」）",
+        "V8b a zero-address instance querying the route reports 10004 (not \"topic has no queue\")",
         code == Some(client_error_code::NO_NAME_SERVER_EXCEPTION),
         &format!("code={code:?} err={:?}", err.map(|e| e.to_string())),
     );
     no_addr_client.shutdown();
 
-    // V8c：地址配了、只是连不上（本机一个刚释放的端口）⇒ 10004 那道闸必须闭嘴：
-    // 判的是「配置里有没有地址」，不是「地址能不能连通」。
+    // V8c: the address is configured but unreachable (a just-released local port) => the 10004 gate must stay silent:
+    // it judges "does the config have an address", not "is the address reachable".
     let dead = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
         Ok(l) => l.local_addr().map(|a| a.to_string()).unwrap_or_default(),
         Err(e) => {
@@ -555,13 +555,13 @@ async fn v8_name_server_addressing(ck: &mut Checker, p: &DefaultMQProducer, stam
         let mis = match DefaultMQProducer::new(&format!("rust-live-validators-deadns-{stamp}")) {
             Ok(p) => p,
             Err(e) => {
-                ck.check("V8c producer 构造", false, &e.to_string());
+                ck.check("V8c producer construction", false, &e.to_string());
                 return;
             }
         };
         mis.set_namesrv_addr(&dead);
         match mis.start().await {
-            Err(e) => ck.check("V8c start 不查可达性，不该失败", false, &e.to_string()),
+            Err(e) => ck.check("V8c start does not probe reachability and must not fail", false, &e.to_string()),
             Ok(()) => {
                 let began = Instant::now();
                 let mut m = message("V8DeadNamesrvTopic", b"x");
@@ -569,7 +569,7 @@ async fn v8_name_server_addressing(ck: &mut Checker, p: &DefaultMQProducer, stam
                 let ms = elapsed_ms(began);
                 let code = err.as_ref().and_then(|e| e.response_code());
                 ck.check(
-                    "V8c 地址连不上时不冒充 10004（判的是配置，不是可达性）",
+                    "V8c an unreachable address is not disguised as 10004 (it judges config, not reachability)",
                     code != Some(client_error_code::NO_NAME_SERVER_EXCEPTION),
                     &format!("code={code:?} {ms:.1}ms err={:?}", err.map(|e| e.to_string())),
                 );
@@ -578,8 +578,8 @@ async fn v8_name_server_addressing(ck: &mut Checker, p: &DefaultMQProducer, stam
         }
     }
 
-    // V8d：对照腿（真集群）——寻址正常时照常 SEND_OK，说明上面挡的是寻址，
-    // 而不是顺手把 topic 判死了。
+    // V8d: control leg (real cluster) -- with addressing working, the same send path returns SEND_OK as usual, showing that
+    // what was blocked above is addressing, not a blanket condemnation of the topic.
     let mut m = message(&format!("RustLiveValidatorsAddr{stamp}"), b"addressing-ok");
     let began = Instant::now();
     let r = p.send(&mut m, Some(5000), None).await;
@@ -587,7 +587,7 @@ async fn v8_name_server_addressing(ck: &mut Checker, p: &DefaultMQProducer, stam
     let ok = r.is_ok();
     let text = r.err().map(|e| e.to_string()).unwrap_or_default();
     ck.check(
-        "V8d 对照：真集群上同一条发送链路照常 SEND_OK",
+        "V8d control: on the real cluster the same send path returns SEND_OK as usual",
         ok,
         &format!("{text} in {ms:.1}ms"),
     );
@@ -600,13 +600,13 @@ async fn run(namesrv: &str) -> Checker {
     let p = match DefaultMQProducer::new(&format!("rust-live-validators-pg-{stamp}")) {
         Ok(p) => p,
         Err(e) => {
-            ck.check("producer 构造", false, &e.to_string());
+            ck.check("producer construction", false, &e.to_string());
             return ck;
         }
     };
     p.set_namesrv_addr(namesrv);
     if let Err(e) = p.start().await {
-        ck.check("producer 启动", false, &e.to_string());
+        ck.check("producer start", false, &e.to_string());
         return ck;
     }
     let local_ms = v1_producer_negatives(&mut ck, &p).await;

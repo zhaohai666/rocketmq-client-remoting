@@ -41,34 +41,39 @@ use RocketMQ\Remoting\RPCHook;
 use RocketMQ\Remoting\SocksProxyConfig;
 
 /**
- * 生产者：经典 remoting 协议下的生产者实现。
+ * Producer: a producer implementation under the classic remoting protocol.
  *
- * 提供：DefaultMQProducer（同步/异步/单向/批量/选择器发送、事务消息）、
- * TransactionMQProducer、MessageQueueSelector 系列选择器、SendCallback 回调、
- * LocalTransactionState / TransactionListener 等。
+ * Provides: DefaultMQProducer (sync/async/oneway/batch/selector sending, transactional
+ * messages), TransactionMQProducer, the MessageQueueSelector family, the SendCallback
+ * callback, LocalTransactionState / TransactionListener, etc.
  *
- * ## PHP 单线程适配（见 php/PORTING.md「异步模型」）
+ * ## PHP single-threaded adaptation (see php/PORTING.md "async model")
  *
- * sendAsync 注册回调后**在内部泵到完成**（``pumpAsyncSend``：驱动 AsyncSenderExecutor 队列、
- * remoting 层 ``waitResponses``、回调执行器，直到回调链走完），对调用方呈现「注册回调后
- * 由回调通知结果」的时序，没有后台线程。所有周期性/异步的后台工作一律改为调用方驱动的显式泵：
+ * sendAsync **pumps to completion internally** after registering the callback
+ * (``pumpAsyncSend``: drives the AsyncSenderExecutor queue, the remoting layer's
+ * ``waitResponses``, and the callback executor until the callback chain finishes),
+ * presenting callers the "result notified by the callback after registration" timing
+ * with no background threads. All periodic/async background work becomes caller-driven
+ * explicit pumping:
  *
- *   * 心跳：``heartbeatOnce()`` 由调用方按周期驱动；
- *   * 事务回查 CHECK_TRANSACTION_STATE(39)：处理器内联执行。
+ *   * Heartbeat: ``heartbeatOnce()`` is driven periodically by the caller;
+ *   * Transaction check-back CHECK_TRANSACTION_STATE(39): executed inline in the processor.
  *
- * 允许注入时钟（``monoClock`` / ``wallClock``）便于单测。
+ * Clock injection (``monoClock`` / ``wallClock``) is allowed for unit tests.
  */
 
-// 定点发送守卫的两处错误文案（同步入口与异步入口各一处），
-// 逐字保留：两处文案本就不同，按调用入口取对应的那条。
-// （以 DefaultMQProducer::PINNED_TOPIC_MISMATCH_SYNC / _ASYNC 常量落地。）
+// The two error texts of the pinned-send guard (one at the sync entry, one at the async
+// entry), kept verbatim: the two texts are inherently different; take the one
+// corresponding to the call entry.
+// (Landed as the DefaultMQProducer::PINNED_TOPIC_MISMATCH_SYNC / _ASYNC constants.)
 
 /**
- * request() 专用的空发送回调（同步请求-应答走异步发送链时，需要一个占位回调，
- * 它不消费发送结果，只负责把状态写回 future）。
+ * The empty send callback dedicated to request() (a synchronous request-reply going
+ * through the async send chain needs a placeholder callback; it does not consume the
+ * send result, it only writes the status back to the future).
  *
- * 它只负责把「发送成功/失败」写回 RequestResponseFuture，应答本身由 broker 的
- * 326 推送投递，与这个回调无关。
+ * It only writes "send success/failure" back to the RequestResponseFuture; the reply
+ * itself is delivered by the broker's 326 push, unrelated to this callback.
  */
 final class NullSendCallback implements SendCallback
 {
@@ -86,8 +91,8 @@ final class NullSendCallback implements SendCallback
     public function onException(\Throwable $e): void
     {
         if ($this->future !== null) {
-            // 失败时必须同时做满三件事。少了 putResponseMessage(null)
-            // 的话，等待方会一直阻塞到超时才抛错（明明是发送失败，却要等满 timeout）。
+            // On failure, all three things must be done at once. Without putResponseMessage(null),
+            // the waiter would block until timeout before throwing (a send failure, yet waiting the full timeout).
             $this->future->sendRequestOk = false;
             $this->future->putResponseMessage(null);
             $this->future->cause = $e;
@@ -96,25 +101,28 @@ final class NullSendCallback implements SendCallback
 }
 
 /**
- * 异步链内部**唯一**被调用的回调（背压版发送回调，包在用户回调外面）。
+ * The **only** callback invoked inside the async chain (the backpressure send callback,
+ * wrapped around the user callback).
  *
- * 它是异步链内部**唯一**被调用的回调：链的终点 ``complete()`` 先跑 ``SendMessageHook.after``，
- * 再进这里的 ``onSuccess``/``onException`` —— after 钩子必须早于归还许可（它在
- * ``sendKernelImpl`` 的包装回调里、信号量在外层）。归还之后才把
- * 结果交给用户回调。
+ * It is the **only** callback invoked inside the async chain: the chain's terminus
+ * ``complete()`` first runs ``SendMessageHook.after``, then enters this
+ * ``onSuccess``/``onException`` here -- the after hook must precede permit return (it is
+ * in ``sendKernelImpl``'s wrapper callback, with the semaphore outside). Only after the
+ * return is the result handed to the user callback.
  *
- * 只归还**本次真正拿到**的许可（``numAcquired``/``sizeAcquired``）：字节信号量超时而
- * 条数信号量已到手时，必须把那条还回去，否则关一次背压就把容量永久吃掉一格。
+ * Only return the permits **actually acquired this time** (``numAcquired``/``sizeAcquired``):
+ * when the byte semaphore times out but the count semaphore was already acquired, that one
+ * must be returned, otherwise closing backpressure once permanently eats one slot of capacity.
  */
 final class BackPressureSendCallback implements SendCallback
 {
-    /** PHP 单线程泵需要知道回调链是否已走完。 */
+    /** PHP's single-threaded pump needs to know whether the callback chain has finished. */
     public bool $done = false;
     public bool $numAcquired = false;
     public bool $sizeAcquired = false;
 
     public function __construct(
-        private readonly object $delegate, // SendCallback|InternalSendCallback（鸭子类型同形）
+        private readonly object $delegate, // SendCallback|InternalSendCallback (duck-typed, same shape)
         private readonly FairSemaphore $numSemaphore,
         private readonly FairSemaphore $sizeSemaphore,
         public readonly int $msgLen,
@@ -138,10 +146,11 @@ final class BackPressureSendCallback implements SendCallback
     }
 
     /**
-     * 归还顺序：先还字节、再还条数。
+     * Return order: bytes first, then count.
      *
-     * 用 ``$released`` 保证只还一次。直接归还的话，链上任何一条走到终点之后的
-     * 重复回调都会把容量虚增出去；本端的异步重试链较长，还一次更稳妥。
+     * Use ``$released`` to guarantee only one return. Returning directly would let any
+     * duplicate callback after the chain's terminus inflate the capacity; this port's
+     * async retry chain is long, so returning once is safer.
      */
     private function releasePermits(): void
     {
@@ -159,7 +168,8 @@ final class BackPressureSendCallback implements SendCallback
 }
 
 /**
- * 异步发送重试计数（PHP 数组是值类型，用一个小对象代替「跨重试共享的自增下标」）。
+ * Async send retry count (PHP arrays are value types; use a small object instead of an
+ * "incrementing index shared across retries").
  */
 final class AsyncSendAttempt
 {
@@ -167,7 +177,7 @@ final class AsyncSendAttempt
 }
 
 /**
- * 消息队列选择器。
+ * Message queue selector.
  */
 interface MessageQueueSelector
 {
@@ -178,7 +188,7 @@ interface MessageQueueSelector
 }
 
 /**
- * 按 arg 的 hash 选择队列。
+ * Select a queue by the hash of arg.
  */
 final class SelectMessageQueueByHash implements MessageQueueSelector
 {
@@ -188,13 +198,14 @@ final class SelectMessageQueueByHash implements MessageQueueSelector
             throw new MQClientException('no message queue');
         }
         $value = $arg ?? 0;
-        // 这里取确定性的 32 位字符串哈希：
-        // 只保证「同值同队列」与均匀分布语义，不追求和别的语言实现逐位相同。
+        // A deterministic 32-bit string hash is used here:
+        // it only guarantees "same value -> same queue" and even-distribution semantics,
+        // not bit-for-bit equality with other language implementations.
         $idx = abs(self::valueHash($value)) % count($mqs);
         return $mqs[$idx];
     }
 
-    /** 确定性字符串哈希（``h = s[0]*31^(n-1) + ...``，32 位有环绕）+ 其它类型的兜底。 */
+    /** Deterministic string hash (``h = s[0]*31^(n-1) + ...``, 32-bit with wraparound) + a fallback for other types. */
     public static function valueHash(mixed $value): int
     {
         if (is_int($value)) {
@@ -216,7 +227,7 @@ final class SelectMessageQueueByHash implements MessageQueueSelector
 }
 
 /**
- * 随机选择一个可用队列。
+ * Randomly select an available queue.
  */
 final class SelectMessageQueueByRandom implements MessageQueueSelector
 {
@@ -230,7 +241,7 @@ final class SelectMessageQueueByRandom implements MessageQueueSelector
 }
 
 /**
- * 按机房（brokerName 前缀）选择队列。
+ * Select a queue by machine room (brokerName prefix).
  */
 final class SelectMessageQueueByMachineRoom implements MessageQueueSelector
 {
@@ -245,13 +256,13 @@ final class SelectMessageQueueByMachineRoom implements MessageQueueSelector
                 return $mq;
             }
         }
-        // 无匹配则回退首个
+        // Fall back to the first if no match
         return $mqs[0];
     }
 }
 
 /**
- * 异步发送回调。
+ * Async send callback.
  */
 interface SendCallback
 {
@@ -261,7 +272,7 @@ interface SendCallback
 }
 
 /**
- * 本地事务状态。整型取值就是回查应答里上报给 broker 的 localState。
+ * Local transaction state. The integer values are the localState reported to the broker in the check-back reply.
  */
 enum LocalTransactionState: int
 {
@@ -271,7 +282,7 @@ enum LocalTransactionState: int
 }
 
 /**
- * 事务监听器：执行本地事务、以及响应 broker 的事务回查。
+ * Transaction listener: executes the local transaction and responds to the broker's transaction check-back.
  */
 interface TransactionListener
 {
@@ -281,11 +292,13 @@ interface TransactionListener
 }
 
 /**
- * 事务消息发送结果：半消息的发送结果加上本地事务状态。
+ * Transactional message send result: the half message's send result plus the local transaction state.
  *
- * ⚠ 既有的 ``SendResult`` 已被声明为 ``final``，PHP 无法 ``extends``。这里用组合替代
- * 继承——构造时拷贝基础结果的字段，并对全部读取口径做同形委托。
- * 若未来 SendResult 放开 final，可无感切回继承（本文件不改对外 API）。
+ * WARNING: the existing ``SendResult`` is already declared ``final`` and PHP cannot
+ * ``extends`` it. Composition is used here instead of inheritance -- the base result's
+ * fields are copied at construction, with same-shape delegation for all read paths.
+ * If SendResult ever drops final, switching back to inheritance is seamless (this file's
+ * public API does not change).
  */
 final class TransactionSendResult
 {
@@ -305,13 +318,13 @@ final class TransactionSendResult
         $this->localTransactionState = $state;
     }
 
-    /** 底层那条 SendResult（组合替代继承的取回入口）。 */
+    /** The underlying SendResult (the retrieval entry point for composition-over-inheritance). */
     public function getSendResult(): SendResult
     {
         return $this->sendResult;
     }
 
-    // ---- 与 SendResult 同形委托 ----
+    // ---- Same-shape delegation with SendResult ----
 
     public function getSendStatus(): SendStatus
     {
@@ -365,61 +378,67 @@ final class TransactionSendResult
 }
 
 /**
- * 默认生产者：同步 / 异步 / 单向发送、事务消息、Request-Reply 与消息查询的入口。
+ * Default producer: the entry point for sync / async / oneway sending, transactional
+ * messages, Request-Reply and message queries.
  */
 class DefaultMQProducer
 {
-    /** 定点发送守卫的两处文案：同步入口与异步入口各自一处。 */
+    /** The two texts of the pinned-send guard: one each at the sync and async entries. */
     public const PINNED_TOPIC_MISMATCH_SYNC = "message's topic not equal mq's topic";
     public const PINNED_TOPIC_MISMATCH_ASYNC = 'Topic of the message does not match its target message queue';
 
-    /** 攒批排除项检查的四个 broker 延时属性（缺省 0）。 */
+    /** The four broker delay properties checked for batch exclusion (default 0). */
     private const TIMER_DELAY_PROPERTIES = ['DELAY', 'TIMER_DELAY_MS', 'TIMER_DELAY_SEC', 'TIMER_DELIVER_MS'];
 
     public string $producerGroup;
-    /** TLS（null = 交给 env ROCKETMQ_TLS_ENABLE 决定） */
+    /** TLS (null = let env ROCKETMQ_TLS_ENABLE decide) */
     public ?bool $tlsEnable;
-    /** TLS 细项（caCert/clientCert/clientKey/serverName），语义见 RemotingClient::$tlsOptions。 */
+    /** TLS details (caCert/clientCert/clientKey/serverName); semantics see RemotingClient::$tlsOptions. */
     public ?array $tlsOptions = null;
     public ?SocksProxyConfig $socksProxy = null;
-    /** W3C traceparent 透传（opt-in） */
+    /** W3C traceparent pass-through (opt-in) */
     public bool $enableTraceContext;
     public string $namespace = '';
     public string $instanceName = MixAll::DEFAULT_INSTANCE_NAME;
     public ?string $clientId = null;
 
-    // ---- unit / stream 配置 ----
-    // unitName 会拼进 clientId 与动态取址 URL；unitMode 会透传给 broker
-    // （发消息头、心跳 ConsumerData、拦截钩子上下文）；enableStreamRequestType
-    // 既给 clientId 加 @STREAM 后缀（防止客户端实例被意外复用），
-    // 也给每个请求加 ReqT=0 扩展字段。三者默认都是「关/空」。
+    // ---- unit / stream config ----
+    // unitName is appended into the clientId and the dynamic address-lookup URL; unitMode
+    // is passed through to the broker (send headers, heartbeat ConsumerData, interceptor
+    // hook context); enableStreamRequestType both adds the @STREAM suffix to the clientId
+    // (preventing accidental reuse of client instances) and adds a ReqT=0 extension field
+    // to every request. All three default to "off/empty".
     public ?string $unitName = null;
     public bool $unitMode = false;
     public bool $enableStreamRequestType = false;
     /**
-     * 5.x 新命名空间（namespaceV2）：非空时**每笔**请求都带
-     * `nsd=true` / `ns=<该值>` 两个扩展头，broker 据此把请求解析到对应的 serverless 实例。
-     * 与 {@see $namespace}（客户端把 `namespace%` 拼进 topic/group 名）是两套机制：
-     * namespaceV2 **不改**任何资源名，只改请求头。见 NamespaceRpcHook。
+     * 5.x new namespace (namespaceV2): when non-empty, **every** request carries the two
+     * extension headers `nsd=true` / `ns=<value>`, by which the broker resolves the
+     * request to the corresponding serverless instance. This is a separate mechanism from
+     * {@see $namespace} (the client prefixes `namespace%` into topic/group names):
+     * namespaceV2 **does not change** any resource name, only request headers.
+     * See NamespaceRpcHook.
      */
     public string $namespaceV2 = '';
 
     public string $createTopicKey = MixAll::DEFAULT_TOPIC;
     public int $defaultTopicQueueNums = MixAll::DEFAULT_TOPIC_QUEUE_NUMS;
     public int $sendMsgTimeout = 3000;
-    // 压缩配置：body 超过 compressMsgBodyOverHowmuch 才压缩，默认 ZLIB
+    // Compression config: compress only when the body exceeds compressMsgBodyOverHowmuch; ZLIB by default
     public int $compressMsgBodyOverHowmuch = 1024 * 4;
     public int $compressLevel = 5;
     public int $compressType = MessageSysFlag::ZLIB_TYPE;
     public int $retryTimesWhenSendFailed = 2;
     public int $retryTimesWhenSendAsyncFailed = 2;
     public bool $retryAnotherBrokerWhenNotStoreOk = false;
-    // 默认 -1 = 不限制单次请求超时；设成正值后每次重试的单请求
-    // 超时被压到该值，慢 broker 才会被换掉而不是把总预算吃光。
+    // Default -1 = no per-request timeout limit; when set to a positive value, each retry's
+    // single-request timeout is clamped to that value, so a slow broker gets swapped out
+    // instead of eating the whole budget.
     public int $sendMsgMaxTimeoutPerRequest = -1;
     /**
-     * 可重试的 broker 响应码：明确回了这些码才值得换一台重试，
-     * 其余码（如 MESSAGE_ILLEGAL）重试也是白试，必须原样抛出。
+     * Retryable broker response codes: only an explicit one of these codes is worth
+     * retrying on another broker; other codes (e.g. MESSAGE_ILLEGAL) make retrying futile
+     * and must be rethrown as-is.
      * @var array<int, true>
      */
     public array $retryResponseCodes;
@@ -432,16 +451,18 @@ class DefaultMQProducer
     /** @var MQClientInstance|null */
     public $mqClient = null;
     public bool $started = false;
-    /** 当前事务监听器（sendMessageInTransaction 时记录，供 broker 回查调用） */
+    /** The current transaction listener (recorded during sendMessageInTransaction, for broker check-back calls) */
     private ?TransactionListener $transactionListener = null;
     /**
-     * PHP 无线程：心跳不启后台循环，改由调用方显式泵（``heartbeatOnce()``）。
-     * 字段保留只是为了表达「心跳是否还在跑」这个状态（shutdown 后置 false）。
+     * PHP has no threads: the heartbeat starts no background loop; it is explicitly pumped
+     * by the caller (``heartbeatOnce()``). The field is kept only to express the "is the
+     * heartbeat still running" state (set to false after shutdown).
      */
     public bool $heartbeatRunning = false;
     public int $heartbeatIntervalMillis = 30000;
-    // 路由刷新周期（默认 30000ms）。
-    // 只在 start() 建 MQClientInstance 时透传一次，之后修改不生效：排期按启动时的周期定下。
+    // Route refresh period (default 30000ms).
+    // Passed through only once when start() builds the MQClientInstance; later changes take
+    // no effect: scheduling is fixed by the period at startup.
     public int $pollNameServerInterval = 30000;
     public bool $sendLatencyFaultEnable = false;
     public MQFaultStrategy $mqFaultStrategy;
@@ -456,35 +477,36 @@ class DefaultMQProducer
     public int $totalBatchMaxBytes = -1;
     public ?ProduceAccumulator $produceAccumulator = null;
 
-    // ---- 消息轨迹（enableTrace / traceTopic / traceMsgBatchNum）----
+    // ---- Message tracing (enableTrace / traceTopic / traceMsgBatchNum) ----
     public bool $enableTrace = false;
-    public ?string $traceTopic = null; // null → 用 RMQ_SYS_TRACE_TOPIC
+    public ?string $traceTopic = null; // null -> use RMQ_SYS_TRACE_TOPIC
     public int $traceMsgBatchNum = 10;
     /** @var list<SendMessageHook> */
     public array $sendMessageHookList = [];
     /** @var list<EndTransactionHook> */
     public array $endTransactionHookList = [];
-    /** 发送前拦截钩子 */
+    /** Pre-send interceptor hook */
     /** @var list<CheckForbiddenHook> */
     public array $checkForbiddenHookList = [];
     public ?AsyncTraceDispatcher $traceDispatcher = null;
-    /** 基础客户端指标（send/consume RT 与计数） */
+    /** Basic client metrics (send/consume RT and counts) */
     public ClientMetrics $metrics;
 
-    /** Request-Reply 的默认超时（不传 timeout 给 request() 时用它）。 */
+    /** Request-Reply's default timeout (used when no timeout is passed to request()). */
     public int $requestTimeout = RequestResponseFuture::DEFAULT_REQUEST_TIMEOUT_MILLIS;
 
-    // ---- 异步发送（待发送队列 + 发送执行器 + 回调执行器）----
-    // 待发送队列容量默认 50000，发送池大小 = CPU 核数。
+    // ---- Async send (pending-send queue + send executor + callback executor) ----
+    // The pending-send queue capacity defaults to 50000, and the send pool size = CPU cores.
     public int $asyncSenderQueueCapacity = 50000;
-    // 回调执行器线程数默认取可用 CPU 核数，<=0 时兜到 4；这里 0 表示"按 CPU 核数"
+    // The callback executor thread count defaults to available CPU cores, falling back to 4
+    // when <=0; here 0 means "by CPU cores"
     public int $clientCallbackExecutorThreads = 0;
     private ?ConsumeExecutor $asyncSenderExecutor = null;
     private ?ConsumeExecutor $callbackExecutor = null;
 
-    // ---- 异步发送背压（在途条数与在途字节数两个公平信号量）----
-    // 默认关闭，且开关本身**不是**启动期配置：允许跑到一半再打开/关掉，
-    // 三个字段都是普通属性，改容量走 setter。
+    // ---- Async send backpressure (two fair semaphores: in-flight count and in-flight bytes) ----
+    // Off by default, and the switch itself is **not** startup config: it may be turned
+    // on/off mid-run; all three fields are plain properties, with capacity changed via setter.
     public bool $enableBackpressureForAsyncMode = false;
     public int $backPressureForAsyncSendNum = 1024;
     public int $backPressureForAsyncSendSize = 100 * 1024 * 1024;
@@ -492,15 +514,15 @@ class DefaultMQProducer
     private FairSemaphore $semaphoreAsyncSendSize;
 
     /**
-     * 注入时钟（毫秒，单调口径）。null = microtime(true)*1000。
-     * 仅供单测推进超时/重试预算。
+     * Injected clock (milliseconds, monotonic). null = microtime(true)*1000.
+     * For unit tests to advance timeout/retry budget only.
      *
      * @var \Closure(): float|null
      */
     public ?\Closure $monoClock = null;
 
     /**
-     * 注入墙钟（毫秒，Request-Reply 用）。
+     * Injected wall clock (milliseconds, for Request-Reply).
      *
      * @var \Closure(): int|null
      */
@@ -519,7 +541,7 @@ class DefaultMQProducer
         }
         $this->producerGroup = $producerGroup;
         $this->tlsEnable = $tlsEnable;
-        // W3C traceparent 透传（opt-in；null = 交给 env ROCKETMQ_TRACE_CONTEXT_ENABLE）
+        // W3C traceparent pass-through (opt-in; null = let env ROCKETMQ_TRACE_CONTEXT_ENABLE decide)
         if ($enableTraceContext === null) {
             $enableTraceContext = TraceContextPropagator::traceContextEnabledFromEnv();
         }
@@ -558,12 +580,14 @@ class DefaultMQProducer
         );
     }
 
-    // ================================================================ 模块级 helper
+    // ================================================================ Module-level helpers
 
     /**
-     * 背压许可容量：配置不高于地板值时用地板值并记一条日志。
+     * Backpressure permit capacity: use the floor value and log a line when the config is
+     * not above the floor.
      *
-     * 分支条件是严格大于：也就是**恰好等于**地板值时照样打那条日志。
+     * The branch condition is strictly greater: that is, when it is **exactly equal** to
+     * the floor value, the log line is still printed.
      */
     public static function backPressurePermits(int $configured, int $floor, string $name): int
     {
@@ -575,10 +599,12 @@ class DefaultMQProducer
     }
 
     /**
-     * 扣多少个「字节」许可：按 body 长度，空 body 也算 1。
+     * How many "byte" permits to deduct: by body length; an empty body also counts as 1.
      *
-     * 批量发送没有单条那样的现成公式，这里按每条累加、整批为空时算 1 —— 不给它一个值就等于
-     * 一批消息整体只占 1 份容量，字节闸对批量形同虚设。
+     * Batch sending has no ready-made formula like the single-message case; here each
+     * message is accumulated and an empty whole batch counts as 1 -- not giving it a value
+     * would mean a whole batch of messages occupies only 1 unit of capacity, making the
+     * byte gate a no-op for batches.
      */
     public static function backPressureMsgLen(Message|array $msg): int
     {
@@ -595,10 +621,11 @@ class DefaultMQProducer
     }
 
     /**
-     * 攒批排除项检查用的四个 broker 延时属性的最大值（缺省 0）。
+     * The maximum of the four broker delay properties used for the batch exclusion check (default 0).
      *
-     * 属性名为服务端定义的投递延时属性：``DELAY``（延时等级）、``TIMER_DELAY_MS``、
-     * ``TIMER_DELAY_SEC``、``TIMER_DELIVER_MS``。值非法时**直接抛**，不静默当 0。
+     * The property names are server-defined delivery delay properties: ``DELAY`` (delay
+     * level), ``TIMER_DELAY_MS``, ``TIMER_DELAY_SEC``, ``TIMER_DELIVER_MS``. An illegal
+     * value **throws** directly, not silently treated as 0.
      */
     public static function maxDelayValue(Message $msg): int
     {
@@ -623,14 +650,16 @@ class DefaultMQProducer
     }
 
     /**
-     * 异步发送失败的三分支包装：按 remoting 层异常类型判定能否重试。
+     * The three-branch wrapping of async send failures: decide retryability by the remoting layer's exception type.
      *
-     * ⚠ 只有 remoting 层抛回来的异常走这里。**已经收到响应**、但 ``parseSendResponse``
-     * 判定为失败的错误（``MQBrokerException``）不走这里 —— 那条路径的 ``needRetry`` 恒为
-     * false 且**原样**抛出。也就是说异步发送**不看** ``retryResponseCodes``：
-     * broker 明确回了错就不会换 broker 重试。别和同步发送的语义混为一谈。
+     * WARNING: only exceptions thrown by the remoting layer go through here. Errors where a
+     * **response was already received** but ``parseSendResponse`` judged as failed
+     * (``MQBrokerException``) do not go through here -- that path's ``needRetry`` is always
+     * false and is **rethrown** as-is. That is, async sending does **not** consult
+     * ``retryResponseCodes``: once the broker explicitly returns an error, no broker swap
+     * retry happens. Do not confuse this with sync sending's semantics.
      *
-     * @return array{0: \Throwable, 1: bool} [包装后的异常, 是否可重试]
+     * @return array{0: \Throwable, 1: bool} [the wrapped exception, whether retryable]
      */
     public static function classifyAsyncFailure(\Throwable $error, int $cost): array
     {
@@ -648,18 +677,21 @@ class DefaultMQProducer
     }
 
     /**
-     * 发送结束后还原**调用方**那条 Message（用显式 try/finally 保证三条出口都走到）。
+     * Restore the **caller's** Message after sending finishes (using an explicit try/finally to guarantee all three exits are covered).
      *
-     * body 换回压缩前那一份、topic 剥掉命名空间。不还原会坏在哪：压缩是就地
-     * ``msg->setBody(...)``，调用方拿着同一个对象再发一次，第二次就把压缩流当原文又压
-     * 一遍（zlib(zlib(x))），消费端只解一层、拿到的是压缩流；带 namespace 时调用方还会
-     * 一直盯着被改写的 ``ns%topic``。成功、失败、拦截钩子抛异常三条路上都要还原，
-     * 所以必须在 ``finally`` 而不是正常返回路径。
+     * The body is swapped back to the pre-compression copy and the topic has the namespace
+     * stripped. What breaks without restoring: compression is in-place
+     * ``msg->setBody(...)``, so when the caller sends the same object again, the second
+     * send compresses the compressed stream as raw input again (zlib(zlib(x))), and the
+     * consumer only decompresses one layer, getting the compressed stream; with a
+     * namespace, the caller would also keep staring at the rewritten ``ns%topic``.
+     * All three paths -- success, failure, and interceptor hook throwing -- must restore,
+     * so it must be in ``finally`` rather than the normal return path.
      *
-     * topic 是 ``withoutNamespace`` 而不是"恢复进入时的字符串"：调用方自己传进来、
-     * 本来就带前缀的 topic 同样会被剥掉。
+     * The topic is ``withoutNamespace`` rather than "restore the string on entry": a topic
+     * the caller passed in already carrying the prefix is likewise stripped.
      *
-     * 只对单条消息生效（批量路径由调用方在进入前分流，不做还原）。
+     * Only effective for single messages (the batch path is split off by the caller before entering, no restore).
      */
     private function restoreCallerMessage(Message $msg, string $prevBody): void
     {
@@ -679,9 +711,9 @@ class DefaultMQProducer
         return $clock !== null ? $clock() : (int) (microtime(true) * 1000.0);
     }
 
-    // ================================================================ 配置
+    // ================================================================ Config
 
-    /** 按 ";" 拆分并去空白。 */
+    /** Split by ";" and strip whitespace. */
     public function setNamesrvAddr(string $addr): void
     {
         $addrs = [];
@@ -816,7 +848,7 @@ class DefaultMQProducer
         return $this->backPressureForAsyncSendNum;
     }
 
-    /** 运行时改「在途字节数」上限，语义与 ``setBackPressureForAsyncSendNum`` 相同。 */
+    /** Change the "in-flight bytes" cap at runtime; same semantics as ``setBackPressureForAsyncSendNum``. */
     public function setBackPressureForAsyncSendSize(int $size): void
     {
         $size = max($size, FairSemaphore::MIN_ASYNC_SEND_SIZE);
@@ -927,7 +959,7 @@ class DefaultMQProducer
         return $this->detectInterval;
     }
 
-    /** 设置 Request-Reply 的默认超时（不传 timeout 给 request() 时用它）。 */
+    /** Set Request-Reply's default timeout (used when no timeout is passed to request()). */
     public function setRequestTimeout(int $timeoutMillis): void
     {
         $this->requestTimeout = $timeoutMillis;
@@ -1000,7 +1032,7 @@ class DefaultMQProducer
         return $this->produceAccumulator->getTotalBatchMaxBytes();
     }
 
-    /** 返回本生产者的基础指标计数器（send/consume RT 与计数）。 */
+    /** Return this producer's basic metrics counters (send/consume RT and counts). */
     public function getMetrics(): ClientMetrics
     {
         return $this->metrics;
@@ -1130,7 +1162,7 @@ class DefaultMQProducer
     }
 
     /**
-     * 构造 CheckForbiddenContext 并执行（异常**不吞**，见 executeCheckForbiddenHook）。
+     * Build a CheckForbiddenContext and execute it (exceptions are **not swallowed**, see executeCheckForbiddenHook).
      */
     private function executeCheckForbidden(
         Message $msg,
@@ -1173,7 +1205,7 @@ class DefaultMQProducer
         if ($this->hasCheckForbiddenHook()) {
             $this->executeCheckForbidden($msg, $mqSel, $brokerAddr, $arg, $communicationMode);
         }
-        // W3C traceparent 透传（opt-in）：没有就注入根上下文，已有值不覆盖
+        // W3C traceparent pass-through (opt-in): inject the root context if absent; do not overwrite an existing value
         if ($this->enableTraceContext) {
             TraceContextPropagator::injectTraceContext($msg);
         }
@@ -1208,7 +1240,7 @@ class DefaultMQProducer
         return $result;
     }
 
-    // ================================================================ 生命周期
+    // ================================================================ Lifecycle
 
     public function start(): void
     {
@@ -1247,13 +1279,13 @@ class DefaultMQProducer
             $this->mqClient->remotingClient->registerRpcHook($this->rpcHook);
         }
         $this->mqClient->start();
-        // 动态 name server：实例启动时可能已从地址服务器拿到地址，回填到本生产者
+        // Dynamic name server: the instance may already have obtained an address from the address server at startup; backfill it to this producer
         if ($this->nameServerAddrs === [] && $this->mqClient->nameServerAddrs !== []) {
             $this->nameServerAddrs = array_values($this->mqClient->nameServerAddrs);
         }
-        // 注册 broker 主动请求处理器：事务回查 CHECK_TRANSACTION_STATE(39)。
-        // 按 message_ext 的 PGROUP 属性匹配本生产者，不匹配则丢弃。
-        // PHP 单线程：回查处理内联执行。
+        // Register the broker-initiated request processor: transaction check-back CHECK_TRANSACTION_STATE(39).
+        // Match this producer by message_ext's PGROUP property; drop if not matched.
+        // PHP single-threaded: check-back handling is executed inline.
         $this->mqClient->remotingClient->registerProcessor(
             RequestCode::CHECK_TRANSACTION_STATE,
             $this->handleCheckTransactionState(...)
@@ -1366,9 +1398,10 @@ class DefaultMQProducer
         }
         $hb = new HeartbeatData($this->clientId ?? '');
         $pd = new ProducerData($this->producerGroup);
-        // ⚠ HeartbeatData 没有 heartbeatFingerprint / withoutSub 字段
-        // （已知缺陷，见项目记忆）。缺失时 broker 反序列化为 0，等价于走 V1 注册路径，
-        // 与显式置 0 的效果一致，这里保持现状不引入新差异。
+        // WARNING: HeartbeatData has no heartbeatFingerprint / withoutSub fields
+        // (a known defect, see project memory). When absent the broker deserializes them
+        // as 0, equivalent to the V1 registration path, with the same effect as an
+        // explicit 0; keep the status quo here and introduce no new difference.
         $hb->producerDataSet[] = $pd;
         $okCount = 0;
         foreach ($addrs as $addr) {
@@ -1390,7 +1423,7 @@ class DefaultMQProducer
         return $this->mqClient;
     }
 
-    // ================================================================ 压缩
+    // ================================================================ Compression
 
     public function tryToCompressMessage(Message $msg): int
     {
@@ -1416,9 +1449,9 @@ class DefaultMQProducer
     }
 
     /**
-     * 消息压缩：ZLIB 走 gzcompress，LZ4（Frame）/ZSTD
-     * （CLI 优先、Raw/RLE 兜底）由 CompressionCodec 承担，与 MessageDecoder 的
-     * 口径一致；未知类型抛出 → tryToCompressMessage 降级不压缩。
+     * Message compression: ZLIB goes through gzcompress; LZ4 (Frame) / ZSTD
+     * (CLI preferred, Raw/RLE fallback) are handled by CompressionCodec, consistent with
+     * MessageDecoder's convention; unknown types throw -> tryToCompressMessage degrades to no compression.
      */
     private function compressBody(string $data, int $compressionType, int $level): string
     {
@@ -1482,8 +1515,10 @@ class DefaultMQProducer
     }
 
     /**
-     * 容错表记一次尝试的延迟。延迟必须用单调钟量：本地亚毫秒往返用毫秒墙钟差
-     * 会记成 0，那样延迟阈值永远不会生效。
+     * Record one attempt's latency in the fault-tolerance table. Latency must be measured
+     * with the monotonic clock: a local sub-millisecond round trip measured with the
+     * millisecond wall-clock difference would record 0, so the latency threshold would
+     * never take effect.
      */
     private function updateFaultItem(?MessageQueue $selected, float $began, bool $isolation, bool $reachable): void
     {
@@ -1493,15 +1528,15 @@ class DefaultMQProducer
         $this->mqFaultStrategy->updateFaultItem($selected->brokerName, $this->monoMillis() - $began, $isolation, $reachable);
     }
 
-    // ================================================================ 正常发送
+    // ================================================================ Normal send
 
     /**
-     * 同步发送：msg 或 array；指定 mq 走定点发送，否则轮询选择。
-     * （还原语义见 ``restoreCallerMessage``，批量路径不还原。）
+     * Sync send: msg or array; a specified mq goes through pinned send, otherwise round-robin selection.
+     * (Restore semantics see ``restoreCallerMessage``; the batch path does not restore.)
      */
     public function send(Message|array $msg, ?int $timeoutMillis = null, ?MessageQueue $mq = null): SendResult
     {
-        // 批量直入 _sendBatch（批量分支不还原）
+        // Batches go straight into _sendBatch (the batch branch does not restore)
         if (is_array($msg)) {
             return $this->sendBatch($msg, $mq, $timeoutMillis ?? $this->sendMsgTimeout);
         }
@@ -1518,7 +1553,7 @@ class DefaultMQProducer
         }
     }
 
-    /** ``send()`` 的单条主体。 */
+    /** The single-message body of ``send()``. */
     private function sendSingle(Message $msg, ?int $timeoutMillis, ?MessageQueue $mq): SendResult
     {
         $client = $this->requireClient();
@@ -1586,12 +1621,12 @@ class DefaultMQProducer
                 try {
                     $result = $this->sendWithHooks($client, $msg, $mqSel, $curTimeout, $sysFlag);
                 } catch (\Throwable $e) {
-                    // 指标记账后按原异常分类处理
+                    // Metrics accounting, then classify by the original exception
                     $this->metrics->recordSendFailure($sendStart);
                     throw $e;
                 }
                 $this->metrics->recordSendSuccess($sendStart);
-                // 记录发送延迟；超出阈值会把该 broker 隔离一段时间
+                // Record send latency; exceeding the threshold isolates that broker for a while
                 $this->updateFaultItem($selected, $began, false, true);
                 if ($result !== null && $result->sendStatus !== SendStatus::SEND_OK
                     && $this->retryAnotherBrokerWhenNotStoreOk) {
@@ -1599,7 +1634,7 @@ class DefaultMQProducer
                 }
                 return $result;
             } catch (MQBrokerException $e) {
-                // broker 明确回了错误码：隔离该 broker（可达性不动），只有可重试码才换一台
+                // The broker explicitly returned an error code: isolate that broker (reachability untouched); only retryable codes swap to another broker
                 $this->updateFaultItem($selected, $began, true, false);
                 $lastExc = $e;
                 if ($this->isRetryResponseCode($e->responseCode)) {
@@ -1662,7 +1697,7 @@ class DefaultMQProducer
             $this->topicPublishInfo($msg->getTopic());
             $this->sendHeartbeatToAllBroker();
         } catch (\Throwable) {
-            // 拿不到路由就让下面的发送路径自己报错
+            // If the route cannot be obtained, let the send path below report the error itself
             Logger::debug('request: prepare route/heartbeat failed');
         }
 
@@ -1679,8 +1714,9 @@ class DefaultMQProducer
 
     private function waitRequestResponse(Message $msg, int $timeout, RequestResponseFuture $future, int $cost): Message
     {
-        // PHP 单线程：future 的 waitResponseMessage 不阻塞（返回当前已到达的应答），
-        // 真实的等待由这里泵 remoting 层（应答经 326 推回）直到到期。
+        // PHP single-threaded: the future's waitResponseMessage does not block (returns the
+        // currently arrived reply); the real waiting pumps the remoting layer here (the
+        // reply is pushed back via 326) until expiry.
         $deadline = $this->wallMillis() + max(0, $timeout - $cost);
         while (true) {
             $response = $future->waitResponseMessage(0);
@@ -1688,8 +1724,8 @@ class DefaultMQProducer
                 return $response;
             }
             if (!$future->sendRequestOk || $future->cause !== null) {
-                // 发送已判失败（onException 会 countDown latch 立刻唤醒等待方），
-                // 这里等价地立刻跳出，否则明明发送失败还要傻等满 timeout。
+                // The send has been judged failed (onException would countDown the latch and wake the waiter immediately);
+                // equivalently break out here at once, otherwise a send failure would still wait the full timeout.
                 break;
             }
             $now = $this->wallMillis();
@@ -1698,10 +1734,11 @@ class DefaultMQProducer
             }
             $client = $this->mqClient;
             if ($client !== null) {
-                // 必须用 pumpIncoming 而不是 waitResponses：等待期发送早已完成、
-                // pending 已清空，waitResponses 只盯有在途请求的连接会直接返回，
-                // 326 推回的应答压在内核缓冲区里永远读不到（真机实锤，见
-                // RemotingClient::pumpIncoming 注释）。
+                // pumpIncoming must be used instead of waitResponses: during the wait the send
+                // has long finished and pending is cleared, so waitResponses -- which only
+                // watches connections with in-flight requests -- would return directly, and
+                // the reply pushed back via 326 would sit in the kernel buffer forever
+                // (confirmed live, see the RemotingClient::pumpIncoming comment).
                 $client->remotingClient->pumpIncoming(min(20, $deadline - $now));
             }
             if ($this->wallMillis() < $deadline) {
@@ -1762,8 +1799,9 @@ class DefaultMQProducer
     }
 
     /**
-     * os.cpu_count() 的 PHP 替身：PHP 没有暴露核数，默认按 4 兜（可用环境变量
-     * RMQ_CPU_CORES 覆盖）。只影响并发逻辑 worker 的容量观感，不影响语义。
+     * The PHP stand-in for os.cpu_count(): PHP does not expose the core count, defaulting to
+     * 4 (overridable via the RMQ_CPU_CORES environment variable). Only affects the capacity
+     * perception of concurrent logical workers, not semantics.
      */
     private static function cpuCount(): int
     {
@@ -1822,8 +1860,10 @@ class DefaultMQProducer
         };
 
         $this->executeAsyncMessageSend($run, $gated, $timeout, $begin, $executor);
-        // PHP 单线程适配（PORTING.md）：注册回调后由后台线程收响应是常规部署形态；
-        // 这里在内部泵到回调链走完（对调用方呈现相同的回调时序）。
+        // PHP single-threaded adaptation (PORTING.md): receiving responses via a background
+        // thread after callback registration is the conventional deployment form; here we
+        // pump internally until the callback chain finishes (presenting callers the same
+        // callback timing).
         $this->pumpAsyncSend($gated, $timeout);
     }
 
@@ -1868,17 +1908,18 @@ class DefaultMQProducer
     }
 
     /**
-     * 泵异步发送链到回调走完（PHP 单线程下主动收响应）：
-     * 每轮依次执行 AsyncSenderExecutor 的排队任务、remoting 层 waitResponses、
-     * 回调执行器的排队任务，直到 ``gated`` 标记完成或超出兜底期限
-     * （timeout + 10s；正常情况下底层超时早就把回调打完）。
+     * Pump the async send chain until the callback finishes (actively collecting responses under PHP's single thread):
+     * each round runs the AsyncSenderExecutor's queued tasks, the remoting layer's
+     * waitResponses, and the callback executor's queued tasks in turn, until ``gated`` is
+     * marked done or the fallback deadline is exceeded (timeout + 10s; normally the
+     * underlying timeout would have fired the callback long before).
      */
     private function pumpAsyncSend(BackPressureSendCallback $gated, int $timeout): void
     {
         $deadline = $this->monoMillis() + $timeout + 10000;
         while (!$gated->done) {
             if ($this->monoMillis() >= $deadline) {
-                break; // 兜底：底层超时理应已经触发回调
+                break; // fallback: the underlying timeout should already have fired the callback
             }
             if ($this->asyncSenderExecutor !== null) {
                 $this->asyncSenderExecutor->pumpAll();
@@ -1932,7 +1973,7 @@ class DefaultMQProducer
         if ($mq !== null) {
             $this->checkPinnedTopic($msg->getTopic(), $mq, self::PINNED_TOPIC_MISMATCH_ASYNC);
         }
-        // 与同步发送同理：压缩在重试链之外做一次，避免重试时把已压缩的 body 再压一遍
+        // Same as sync send: compression is done once outside the retry chain, avoiding re-compressing the already-compressed body on retries
         $sysFlag = $this->tryToCompressMessage($msg);
         if ($mq !== null) {
             $this->sendKernelAsync($client, $msg, $mq, $callback, $timeout, $sysFlag, null);
@@ -1941,7 +1982,7 @@ class DefaultMQProducer
         try {
             $publish = $this->topicPublishInfo($msg->getTopic());
         } catch (MQClientException $e) {
-            // 同同步发送：10004 原样透传，其余按 10005 定性
+            // Same as sync send: 10004 is passed through as-is, others are classified as 10005
             throw new MQClientException(
                 $e->getMessage(),
                 $e->responseCode ?: ClientErrorCode::NOT_FOUND_TOPIC_EXCEPTION,
@@ -2079,9 +2120,9 @@ class DefaultMQProducer
         } catch (\Throwable $e) {
             $cost = (int) ($this->monoMillis() - $began);
             $this->updateFaultItem($mq, $began, true, false);
-            // 同步抛出（如连接被拒）也要过分类：connect 失败会被包成
-            // MQClientException('unknown reason') 再进重试链；PHP 阻塞式 connect
-            // 在这里同步抛，不分类的话最终回调拿到的是裸 RemotingConnectException。
+            // A synchronous throw (e.g. connection refused) must also go through classification: a connect failure gets wrapped
+            // as MQClientException('unknown reason') before entering the retry chain; PHP's blocking connect
+            // throws synchronously here, and without classification the final callback would get a bare RemotingConnectException.
             [$wrapped, $needRetry] = self::classifyAsyncFailure($e, $cost);
             $this->onSendException(
                 $client,
@@ -2144,7 +2185,7 @@ class DefaultMQProducer
                 $retryBroker,
                 $error->getMessage()
             ));
-            // 换新 opaque：旧请求还挂在 responseTable 里等超时，复用会把两次尝试的应答串台
+            // New opaque swap: the old request is still hanging in responseTable awaiting timeout; reusing it would cross the two attempts' replies
             $request->opaque = RemotingCommand::createNewRequestId();
             $this->sendMessageAsync(
                 $client,
@@ -2292,7 +2333,7 @@ class DefaultMQProducer
         $publish = $this->topicPublishInfo($msg->getTopic());
         $selected = $selector->select($publish->msgQueueList, $msg, $arg);
         $mqSel = new MessageQueue($msg->getTopic(), $selected->brokerName, $selected->queueId);
-        // 选择器用的是原始消息（topic/业务字段），压缩只影响 body
+        // The selector uses the original message (topic/business fields); compression only affects the body
         $this->checkMessage($msg);
         $sysFlag = $this->tryToCompressMessage($msg);
         if ($this->hasSendInterceptors()) {
@@ -2375,9 +2416,9 @@ class DefaultMQProducer
 
     public function sendDirect(Message $msg, ?MessageQueue $mq, SendCallback|InternalSendCallback|null $sendCallback): ?SendResult
     {
-        // 显式传 sendMsgTimeout：send()/sendAsync() 只在 timeout===null 且 autoBatch 开启时
-        // 才分流进 sendByAccumulator —— 这里若不传，非攒批消息（延时/带组属性）会
-        // sendDirect → send() → sendByAccumulator → sendDirect 无限递归直到 OOM。
+        // Explicitly passing sendMsgTimeout: send()/sendAsync() only divert into sendByAccumulator
+        // when timeout===null and autoBatch is on -- without passing it here, non-batched messages
+        // (delay/group properties) would recurse sendDirect -> send() -> sendByAccumulator -> sendDirect until OOM.
         if ($sendCallback === null) {
             if ($mq === null) {
                 return $this->send($msg, $this->sendMsgTimeout);
@@ -2426,7 +2467,7 @@ class DefaultMQProducer
         return null;
     }
 
-    // ---------------- 批量发送 ----------------
+    // ---------------- Batch send ----------------
 
     private function sendBatch(
         array $msgs,
@@ -2450,7 +2491,7 @@ class DefaultMQProducer
         if ($mq !== null) {
             $this->checkPinnedTopic($batch->getTopic(), $mq, $pinnedGuardMessage);
         }
-        // MessageBatch 会被 tryToCompressMessage 直接跳过（返回 0），批量消息永不压缩
+        // MessageBatch is skipped directly by tryToCompressMessage (returns 0); batch messages are never compressed
         $sysFlag = $this->tryToCompressMessage($batch);
         if ($mq !== null) {
             if ($this->hasSendInterceptors()) {
@@ -2508,10 +2549,10 @@ class DefaultMQProducer
         $client = $this->requireClient();
         $this->checkMessage($msg);
 
-        // 半消息标记（broker 侧据此把消息写入 RMQ_SYS_TRANS_HALF_TOPIC）
+        // Half-message marker (the broker side writes the message into RMQ_SYS_TRANS_HALF_TOPIC accordingly)
         $msg->putProperty(MessageConst::PROPERTY_TRANSACTION_PREPARED, 'true');
         $msg->putProperty(MessageConst::PROPERTY_PRODUCER_GROUP, $this->producerGroup);
-        // 回查时按此 listener 回调（broker 通过 PGROUP 属性定位到本生产者）
+        // Callback via this listener on check-back (the broker locates this producer via the PGROUP property)
         $this->transactionListener = $listener;
 
         $publish = $this->topicPublishInfo($msg->getTopic());
@@ -2522,8 +2563,8 @@ class DefaultMQProducer
         $sysFlag = MessageSysFlag::resetTransactionValue($sysFlag, MessageSysFlag::TRANSACTION_PREPARED_TYPE);
 
         try {
-            // 事务发送同样走 sendKernelImpl（→ 同样触发发送钩子），
-            // 所以开启轨迹后事务消息会先落一条 Pub（Trans_Msg_Half）轨迹
+            // Transactional sending also goes through sendKernelImpl (-> likewise triggers send hooks),
+            // so with tracing enabled a transactional message first lands a Pub (Trans_Msg_Half) trace
             $sendResult = $this->sendWithHooks($client, $msg, $mqSel, $this->sendMsgTimeout, $sysFlag);
         } catch (\Throwable $e) {
             throw new MQClientException('send message Exception', null, $e);
@@ -2584,7 +2625,7 @@ class DefaultMQProducer
         $header = new EndTransactionRequestHeader();
 
         if ($fromTransactionCheck) {
-            // 回收时 broker 会把 COMPRESSED/事务相关信息放在回查请求里
+            // On recycling, the broker puts COMPRESSED/transaction-related info in the check-back request
             $header->commitLogOffset = $checkHeader->commitLogOffset ?? null;
             $header->tranStateTableOffset = $checkHeader->tranStateTableOffset ?? null;
             $header->transactionId = $checkHeader->transactionId ?? null;
@@ -2685,10 +2726,10 @@ class DefaultMQProducer
         } catch (\Throwable $e) {
             Logger::warning('checkTransactionState: end transaction failed: ' . $e->getMessage());
         }
-        return null; // broker 的回查是 oneway，不回响应
+        return null; // the broker's check-back is oneway and returns no response
     }
 
-    // ================================================================ 管理能力
+    // ================================================================ Admin capabilities
 
     /** @return list<MessageQueue> */
     public function fetchPublishMessageQueues(string $topic): array
@@ -2759,7 +2800,7 @@ class DefaultMQProducer
         throw new MQClientException('viewMessage by msgId is not supported in this edition');
     }
 
-    // ================================================================ 辅助
+    // ================================================================ Helpers
 
     private function checkMessage(Message $msg): void
     {
@@ -2800,7 +2841,7 @@ final class TransactionMQProducer extends DefaultMQProducer
 }
 
 /**
- * 便捷回调包装：把 onSuccess / onException 转成普通函数。
+ * Convenience callback wrapper: turns onSuccess / onException into plain functions.
  */
 final class SendCallbackImpl implements SendCallback
 {

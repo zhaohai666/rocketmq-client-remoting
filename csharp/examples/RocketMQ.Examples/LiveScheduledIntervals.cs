@@ -1,13 +1,14 @@
-// 路由刷新周期 / 位点落盘周期 真机验证（用例编号 I1–I3）。
+// Real-machine verification of the route refresh interval / the offset flush interval
+// (case ids I1-I3).
 //
 //
 //
 //
-//   I3 透传：生产者/消费者 Start 之后，真机实例上的 `PollNameServerIntervalMillis` 就是调用方
-//      设的值（不是只在门面上存着）。
+//   I3 pass-through: after a producer/consumer Start, `PollNameServerIntervalMillis` on the
+//   real instance is the value the caller set (not merely stored on the facade).
 //
-// 前置：NameServer + Broker 已起（本仓库 /tmp/rmq_rust_live/broker.conf）。
-// 用法：rmq scheduled-intervals [namesrv]
+// Prerequisite: a NameServer + Broker are up (/tmp/rmq_rust_live/broker.conf in this repo).
+// Usage: rmq scheduled-intervals [namesrv]
 using System.Globalization;
 using System.Text;
 
@@ -49,8 +50,9 @@ public static class LiveScheduledIntervals
 
     private static long NowMs() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
-    /// <summary>真机投递受 broker 长轮询/流控与同机负载影响，固定 sleep 会把「实现没问题」
-    /// 测成假失败。</summary>
+   /// <summary>Real-machine delivery is affected by the broker's long polling / flow
+    /// control and by load on the same machine, so a fixed sleep turns "the implementation is
+    /// fine" into a false failure.</summary>
     private static bool WaitUntil(Func<bool> pred, int timeoutMs, int intervalMs = 200)
     {
         long deadline = NowMs() + timeoutMs;
@@ -66,8 +68,9 @@ public static class LiveScheduledIntervals
     private static string Secs(long fromMs, long toMs) =>
         ((toMs - fromMs) / 1000.0).ToString("F2", CultureInfo.InvariantCulture) + "s";
 
-    /// <summary>broker 上该 group 这条队列的已提交位点（setZeroIfNotFound ⇒ 没提交过回 0）。
-    /// 判据是「broker 侧真的收到了位点」。</summary>
+   /// <summary>The committed offset of that queue for that group on the broker
+   /// (setZeroIfNotFound => 0 when it was never committed). The criterion is "the broker side
+    /// really received the offset".</summary>
     private static long BrokerOffset(DefaultMQAdminExt admin, string group, MessageQueue mq)
     {
         admin.Client().QueryConsumerOffset(group, mq, out long off, 5000, null,
@@ -131,7 +134,7 @@ public static class LiveScheduledIntervals
         }
         catch (Exception e)
         {
-            Check("集群探活", false, "fetchBrokerClusterInfo: " + e.Message);
+  Check("the cluster liveness probe", false, "fetchBrokerClusterInfo: " + e.Message);
             admin.Shutdown();
             return Report();
         }
@@ -139,20 +142,20 @@ public static class LiveScheduledIntervals
         List<string> addrs = cluster.GetBrokerAddrs();
         if (addrs.Count == 0)
         {
-            Check("集群探活", false, "nameServer 无 broker 注册");
+        Check("the cluster liveness probe", false, "the nameServer has no broker registered");
             admin.Shutdown();
             return Report();
         }
 
         string brokerAddr = addrs[0];
-        Check("集群探活", true, "broker=" + brokerAddr);
+   Check("the cluster liveness probe", true, "broker=" + brokerAddr);
 
         DefaultMQProducer? producer = null;
         var pollProducers = new List<DefaultMQProducer>();
         var consumers = new List<DefaultMQPushConsumer>();
         try
         {
-            // ---------------- I1 路由刷新周期 ----------------
+      // ---------------- I1 the route refresh interval ----------------
             var fastPoll = new DefaultMQProducer(gPollFast);
             fastPoll.NamesrvAddr = _namesrv;
             fastPoll.InstanceName = "interval-poll-fast-" + stamp;
@@ -166,56 +169,56 @@ public static class LiveScheduledIntervals
             slowPoll.Start();
             pollProducers.Add(slowPoll);
 
-            Check("I3 生产者实例拿到配置的刷新周期（1s 组）",
+    Check("I3 the producer instance got the configured refresh interval (the 1s group)",
                 fastPoll.Client().PollNameServerIntervalMillis == fastPollMs,
                 "client.pollNameServerIntervalMillis="
                 + fastPoll.Client().PollNameServerIntervalMillis.ToString(CultureInfo.InvariantCulture));
-            Check("I3 生产者实例默认 30s（对照组）",
+      Check("I3 the producer instance defaults to 30s (the control group)",
                 slowPoll.Client().PollNameServerIntervalMillis == slowPollMs,
                 "client.pollNameServerIntervalMillis="
                 + slowPoll.Client().PollNameServerIntervalMillis.ToString(CultureInfo.InvariantCulture));
 
-            // 把一个还没创建的 topic 登记进周期刷新集合：两个生产者都不会给它发消息，
-            // 所以缓存里何时出现它，只由各自的刷新周期决定。
+  // Register a not-yet-created topic into the periodic refresh set: neither producer sends it
+  // a message, so when it appears in the cache is decided only by their own refresh intervals.
             fastPoll.Client().RegisterTopicInUse(tPoll);
             slowPoll.Client().RegisterTopicInUse(tPoll);
-            Check("I1 两个生产者都把 " + tPoll + " 登记进在用 topic 集合（登记本身不拉取）",
+   Check("I1 both producers registered " + tPoll + " into the in-use topic set (registering itself does not fetch)",
                 fastPoll.Client().FindBrokerAddrByTopic(tPoll) is null
                 && slowPoll.Client().FindBrokerAddrByTopic(tPoll) is null,
-                "登记后两边缓存都为空");
+   "both caches are empty after registering");
 
             Thread.Sleep(1500);
 
             long t0 = NowMs();
             admin.CreateTopic(MixAll.DefaultTopic, tPoll, 1);
-            Check("I1 admin 建 topic 成功", true, tPoll + " 1 队列");
+      Check("I1 admin created the topic successfully", true, tPoll + " 1 queue");
 
             bool fastOk = WaitUntil(() => fastPoll.Client().FindBrokerAddrByTopic(tPoll) is not null,
                 6000, 100);
             long dtFast = NowMs() - t0;
-            Check("I1 1s 周期组 ≤6s 从 NameServer 拉到新 topic 路由", fastOk,
-                "dt=" + Secs(t0, NowMs()) + " 周期=" + fastPollMs.ToString(CultureInfo.InvariantCulture) + "ms");
-            Check("I1 此刻 30s 周期组**还**没拉到（对照：周期决定时机）",
+      Check("I1 the 1s group pulled the new topic's route from the NameServer within 6s", fastOk,
+     "dt=" + Secs(t0, NowMs()) + " interval=" + fastPollMs.ToString(CultureInfo.InvariantCulture) + "ms");
+      Check("I1 the 30s group has **not** pulled it yet at this point (the control: the interval decides the timing)",
                 slowPoll.Client().FindBrokerAddrByTopic(tPoll) is null,
-                "dt=" + Secs(t0, NowMs()) + " 周期=" + slowPollMs.ToString(CultureInfo.InvariantCulture) + "ms");
+       "dt=" + Secs(t0, NowMs()) + " interval=" + slowPollMs.ToString(CultureInfo.InvariantCulture) + "ms");
 
             bool slowOk = WaitUntil(() => slowPoll.Client().FindBrokerAddrByTopic(tPoll) is not null,
                 40000, 500);
             long dtSlow = NowMs() - t0;
-            Check("I1 30s 周期组最终也拉到（默认值只是慢，不是坏）", slowOk,
-                "dt=" + Secs(t0, NowMs()) + " 周期=" + slowPollMs.ToString(CultureInfo.InvariantCulture) + "ms");
-            Check("I1 两组间隔与配置同量级（30s 组至少晚 20s）", dtSlow - dtFast >= 20000,
+     Check("I1 the 30s group eventually pulls it too (the default is only slower, not broken)", slowOk,
+            "dt=" + Secs(t0, NowMs()) + " interval=" + slowPollMs.ToString(CultureInfo.InvariantCulture) + "ms");
+            Check("I1 the two groups are an order of magnitude apart (the 30s group is at least 20s later)", dtSlow - dtFast >= 20000,
                 "fast=" + Secs(0, dtFast) + " slow=" + Secs(0, dtSlow));
             fastPoll.Shutdown();
             slowPoll.Shutdown();
 
-            // ---------------- I2 位点落盘周期 ----------------
+      // ---------------- I2 the offset flush interval ----------------
             admin.CreateTopic(MixAll.DefaultTopic, tPersist, 1);
             TopicRouteData persistRoute = admin.ExamineTopicRoute(tPersist);
             List<MessageQueue> persistQueues = persistRoute.GetAllMessageQueue(tPersist);
             if (persistQueues.Count == 0)
             {
-                Check("I2 拿到 1 队列 topic 的队列表", false, "examineTopicRoute 没返回队列");
+      Check("I2 got the queue list of the 1-queue topic", false, "examineTopicRoute returned no queues");
                 throw new InvalidOperationException("no queue for " + tPersist);
             }
 
@@ -253,7 +256,7 @@ public static class LiveScheduledIntervals
             long tStart = NowMs();
             fastC.Start();
             consumers.Add(fastC);
-            Check("I3 消费者实例拿到配置的刷新周期",
+        Check("I3 the consumer instance got the configured refresh interval",
                 fastC.Client().PollNameServerIntervalMillis == 2000,
                 "client.pollNameServerIntervalMillis="
                 + fastC.Client().PollNameServerIntervalMillis.ToString(CultureInfo.InvariantCulture));
@@ -261,40 +264,43 @@ public static class LiveScheduledIntervals
             consumers.Add(slowC);
 
             bool consumed = WaitUntil(() => sinkFast.Count() >= 3 && sinkSlow.Count() >= 3, 30000);
-            Check("I2 两个消费者都消费到 3 条（尚未 commit / shutdown）", consumed,
+          Check("I2 both consumers consumed 3 (not yet committed / shut down)", consumed,
                 "fast=" + sinkFast.Count().ToString(CultureInfo.InvariantCulture)
                 + " slow=" + sinkSlow.Count().ToString(CultureInfo.InvariantCulture));
 
-            // 首笔落盘在 Start 后 ~10s：消费若在 10s 内完成，此刻两边都还没推上去。
-            // 消费本身慢过 10s 时这一格不再有判别力，记为 SKIP 而不是硬报。
+            // The first flush lands about 10s after Start: if the consumption finished within
+            // 10s, neither side has pushed anything up at this point. When the consumption
+  // itself takes longer than 10s this slot loses its discriminating power, so it is
+       // recorded as SKIP rather than reported as a hard failure.
             if (NowMs() - tStart < 9000)
             {
                 long offFastNow = BrokerOffset(admin, gFast, mq);
                 long offSlowNow = BrokerOffset(admin, gSlow, mq);
-                Check("I2 消费后 broker 位点还没有立刻被推上去", offFastNow < 3 && offSlowNow < 3,
+        Check("I2 after the consumption the broker offset was not pushed up immediately", offFastNow < 3 && offSlowNow < 3,
                     "fast=" + offFastNow.ToString(CultureInfo.InvariantCulture)
                     + " slow=" + offSlowNow.ToString(CultureInfo.InvariantCulture)
                     + " elapsed=" + Secs(tStart, NowMs()));
             }
             else
             {
-                Skip("I2 消费后 broker 位点还没有立刻被推上去",
-                    "消费耗时 " + Secs(tStart, NowMs()) + " ≥ 10s，已越过首笔落盘窗口");
+       Skip("I2 after the consumption the broker offset was not pushed up immediately",
+  "the consumption took " + Secs(tStart, NowMs()) + " >= 10s, it has passed the first flush window");
             }
 
             bool fastFirst = WaitUntil(() => BrokerOffset(admin, gFast, mq) == 3, 20000, 300);
             long dtFastFirst = NowMs() - tStart;
             bool slowFirst = WaitUntil(() => BrokerOffset(admin, gSlow, mq) == 3, 20000, 300);
             long dtSlowFirst = NowMs() - tStart;
-            Check("I2 1s 组首次落盘发生在 initialDelay(~10s) 之后", fastFirst,
-                "dt=" + Secs(0, dtFastFirst) + " 周期=" + fastPersistMs.ToString(CultureInfo.InvariantCulture) + "ms");
-            Check("I2 首笔落盘不早于 initialDelay 10s",
+        Check("I2 the 1s group's first flush happens after the initialDelay (~10s)", fastFirst,
+      "dt=" + Secs(0, dtFastFirst) + " interval=" + fastPersistMs.ToString(CultureInfo.InvariantCulture) + "ms");
+  Check("I2 the first flush is not earlier than the initialDelay of 10s",
                 fastFirst && dtFastFirst / 1000.0 >= persistInitialDelaySec - 0.5,
                 "dt=" + Secs(0, dtFastFirst));
-            Check("I2 60s 组同样在 ~10s 完成首笔落盘（周期未到，先走 initialDelay）", slowFirst,
-                "dt=" + Secs(0, dtSlowFirst) + " 周期=" + slowPersistMs.ToString(CultureInfo.InvariantCulture) + "ms");
+   Check("I2 the 60s group also completes its first flush at ~10s (the interval has not arrived, so the initialDelay comes first)", slowFirst,
+       "dt=" + Secs(0, dtSlowFirst) + " interval=" + slowPersistMs.ToString(CultureInfo.InvariantCulture) + "ms");
 
-            // 第二批：两组都会消费到，但 broker 侧位点只由各自的周期任务推上去。
+            // Second batch: both groups consume it, but the broker-side offset is only pushed
+     // up by their own periodic tasks.
             long t2 = NowMs();
             for (int i = 0; i < 3; ++i)
             {
@@ -302,35 +308,35 @@ public static class LiveScheduledIntervals
                     Str2Bytes("batch2-" + i.ToString(CultureInfo.InvariantCulture))));
             }
 
-            Check("I2 两个消费者都消费到第二批（6 条）",
+       Check("I2 both consumers consumed the second batch (6 in total)",
                 WaitUntil(() => sinkFast.Count() >= 6 && sinkSlow.Count() >= 6, 20000),
                 "fast=" + sinkFast.Count().ToString(CultureInfo.InvariantCulture)
                 + " slow=" + sinkSlow.Count().ToString(CultureInfo.InvariantCulture));
             bool fastSecond = WaitUntil(() => BrokerOffset(admin, gFast, mq) == 6, 5000, 200);
-            Check("I2 1s 组一个周期内把第二批位点推上去", fastSecond,
-                "dt=" + Secs(t2, NowMs()) + " 周期=" + fastPersistMs.ToString(CultureInfo.InvariantCulture) + "ms");
+  Check("I2 the 1s group pushes the second batch's offset up within one interval", fastSecond,
+     "dt=" + Secs(t2, NowMs()) + " interval=" + fastPersistMs.ToString(CultureInfo.InvariantCulture) + "ms");
             long offSlowBatch2 = BrokerOffset(admin, gSlow, mq);
-            Check("I2 此刻 60s 组仍是 3（周期 60s 远未到，且它确实消费到了 6）",
+    Check("I2 the 60s group is still at 3 at this point (the 60s interval is far from due and it really consumed 6)",
                 offSlowBatch2 == 3 && sinkSlow.Count() >= 6,
                 "broker=" + offSlowBatch2.ToString(CultureInfo.InvariantCulture)
-                + " 已消费=" + sinkSlow.Count().ToString(CultureInfo.InvariantCulture)
-                + " 周期=" + slowPersistMs.ToString(CultureInfo.InvariantCulture) + "ms");
+     + " consumed=" + sinkSlow.Count().ToString(CultureInfo.InvariantCulture)
+             + " interval=" + slowPersistMs.ToString(CultureInfo.InvariantCulture) + "ms");
             long sinceSlowFirst = NowMs() - (tStart + dtSlowFirst);
-            Check("I2 60s 组的下一次周期还没到（距首笔落盘 < 周期 60s）",
+      Check("I2 the 60s group's next interval has not arrived yet (less than the 60s interval since the first flush)",
                 sinceSlowFirst < slowPersistMs, "elapsed=" + Secs(0, sinceSlowFirst));
 
             slowC.Shutdown();
             consumers.Remove(slowC);
             bool slowSecond = WaitUntil(() => BrokerOffset(admin, gSlow, mq) == 6, 10000, 300);
-            Check("I2 60s 组 Shutdown() 时把 6 落盘（persistConsumerOffset 收尾）", slowSecond,
+          Check("I2 the 60s group persists 6 on Shutdown() (the persistConsumerOffset wrap-up)", slowSecond,
                 "broker=" + BrokerOffset(admin, gSlow, mq).ToString(CultureInfo.InvariantCulture));
         }
         catch (Exception e)
         {
-            Check("验证过程抛出异常", false, e.ToString());
+            Check("the verification threw", false, e.ToString());
         }
 
-        // ---------------- 清理 ----------------
+        // ---------------- cleanup ----------------
         foreach (DefaultMQPushConsumer c in consumers)
         {
             try
@@ -339,7 +345,7 @@ public static class LiveScheduledIntervals
             }
             catch (Exception e)
             {
-                Console.WriteLine("    (consumer shutdown 失败: " + e.Message + ")");
+          Console.WriteLine("    (consumer shutdown failed: " + e.Message + ")");
             }
         }
 
@@ -351,7 +357,7 @@ public static class LiveScheduledIntervals
             }
             catch (Exception e)
             {
-                Console.WriteLine("    (producer shutdown 失败: " + e.Message + ")");
+      Console.WriteLine("    (producer shutdown failed: " + e.Message + ")");
             }
         }
 
@@ -363,7 +369,7 @@ public static class LiveScheduledIntervals
             }
             catch (Exception e)
             {
-                Console.WriteLine("    (producer shutdown 失败: " + e.Message + ")");
+            Console.WriteLine("    (producer shutdown failed: " + e.Message + ")");
             }
         }
 
@@ -376,7 +382,7 @@ public static class LiveScheduledIntervals
             }
             catch (Exception e)
             {
-                Console.WriteLine("    (deleteTopic(" + t + ") 失败: " + e.Message + ")");
+    Console.WriteLine("    (deleteTopic(" + t + ") failed: " + e.Message + ")");
             }
         }
 
@@ -388,7 +394,7 @@ public static class LiveScheduledIntervals
             }
             catch (Exception e)
             {
-                Console.WriteLine("    (deleteSubscriptionGroup(" + g + ") 失败: " + e.Message + ")");
+  Console.WriteLine("    (deleteSubscriptionGroup(" + g + ") failed: " + e.Message + ")");
             }
         }
 

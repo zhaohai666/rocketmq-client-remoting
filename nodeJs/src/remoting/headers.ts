@@ -1,9 +1,9 @@
 // -*- coding: utf-8 -*-
-// 经典 remoting 协议的请求/响应头。
+// Request/response headers for the classic remoting protocol.
 //
-// 每个 header 实现 toExtFields()（返回一个可转成字符串的字段普通对象，null
-// 会被跳过）和 fromExtFields(fields)（从 Record<string,string> 读取）。
-// 布尔值统一规范化为小写的 "true"/"false"，字段名与 wire 上的协议键完全一致。
+// Each header implements toExtFields() (returns a plain object whose fields can be
+// converted to strings; null is skipped) and fromExtFields(fields) (reads from Record<string,string>).
+// Boolean values are normalized to lowercase "true"/"false"; field names match the wire protocol keys exactly.
 
 function _ext(fields: Record<string, any>): Record<string, any> {
   const out: Record<string, any> = {};
@@ -92,8 +92,8 @@ export class SendMessageRequestHeader extends CommandCustomHeader {
   }
 }
 
-// 短字段名 V2 编码（producerGroup->a ... brokerName->n）。
-// 注意：SendMessageRequestHeaderV2 的短键是 14 个（a..n），不是 17 个。
+// Short-field-name V2 encoding (producerGroup->a ... brokerName->n).
+// Note: SendMessageRequestHeaderV2 uses 14 short keys (a..n), not 17.
 export class SendMessageRequestHeaderV2 extends CommandCustomHeader {
   producerGroup: string | null = null;
   topic: string | null = null;
@@ -1119,8 +1119,8 @@ export class QueryDataVersionResponseHeader extends CommandCustomHeader {
 }
 
 export class PopMessageRequestHeader extends CommandCustomHeader {
-  // bname 继承自 RpcRequestHeader.bname，POP 请求时用消息队列的 broker 名填充。
-  // broker 在 POP 处理中会忽略它，但协议要求照常发送。
+  // bname is inherited from RpcRequestHeader.bname and is filled with the queue's broker name on POP requests.
+  // The broker ignores it during POP handling, but the protocol still requires sending it.
   bname: string | null = null;
   consumerGroup: string | null = null;
   topic: string | null = null;

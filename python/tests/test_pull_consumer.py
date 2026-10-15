@@ -36,7 +36,7 @@ class TestLifecycle:
         c = DefaultMQPullConsumer("PG_UnitTest")
         c.set_namesrv_addr("127.0.0.1:9876")
         mq = MessageQueue("TopicUnitTest", "broker-a", 0)
-        # 没 start() 时任何需要 client 的操作都要抛，而不是 NPE / AttributeError
+        # without start() any operation needing the client must throw, not NPE / AttributeError
         with pytest.raises(MQClientException):
             c.fetch_subscribe_message_queues("TopicUnitTest")
         with pytest.raises(MQClientException):
@@ -46,7 +46,7 @@ class TestLifecycle:
 
     def test_shutdown_before_start_is_noop(self):
         c = DefaultMQPullConsumer("PG_UnitTest")
-        c.shutdown()  # 不应抛
+        c.shutdown()  # must not throw
 
     def test_set_namesrv_addr_splits_semicolon(self):
         c = DefaultMQPullConsumer("PG_UnitTest")
@@ -70,12 +70,12 @@ class TestPullSysFlagParity:
 
     def test_pull_is_short_poll_without_commit_offset(self):
         src = inspect.getsource(DefaultMQPullConsumer.pull)
-        assert "suspend=False" in src, "pull() 必须是短轮询（suspend=False）"
-        assert "commit_offset=False" in src, "pull() 不自带 commitOffset 位"
+        assert "suspend=False" in src, "pull() must be a short poll (suspend=False)"
+        assert "commit_offset=False" in src, "pull() does not carry the commitOffset bit itself"
 
     def test_pull_block_if_not_found_is_long_poll(self):
         src = inspect.getsource(DefaultMQPullConsumer.pull_block_if_not_found)
-        assert "suspend=True" in src, "pull_block_if_not_found() 才是长轮询"
+        assert "suspend=True" in src, "pull_block_if_not_found() is the long poll"
 
     def test_flag_bits(self):
         short = PullSysFlag.build_sys_flag(commit_offset=False, suspend=False,
@@ -100,7 +100,7 @@ class TestPullSysFlagParity:
 
 
 class _RecordingClient:
-    """只覆盖心跳路径要用的方法的替身 client（记录每一次收发）。"""
+    """A stand-in client overriding only the methods needed by the heartbeat path (recording every send/receive)."""
 
     def __init__(self, addrs=("127.0.0.1:10911", "127.0.0.1:10912")):
         self._addrs = list(addrs)
@@ -137,7 +137,7 @@ class _RecordingClient:
 
 
 def _started_pull(topics=("TopicHbA", "TopicHbB")):
-    """造一个「已启动」的拉模式消费者，client 是替身，心跳报文可截获。"""
+    """Build a "started" pull-mode consumer whose client is a stand-in and whose heartbeat reports can be intercepted."""
     c = DefaultMQPullConsumer("PG_HbUnit")
     c.client_id = "cid@fixed"
     c.register_topics.update(topics)
@@ -152,7 +152,7 @@ class TestConsumerHeartbeat:
 
     def test_heartbeat_is_actively_typed_and_carries_register_topics(self):
         c, fake = _started_pull()
-        assert c._send_heartbeat_to_all_broker() == 2, "主 + 从各一发"
+        assert c._send_heartbeat_to_all_broker() == 2, "one each to master + slave"
         assert [a for a, _ in fake.heartbeats] == ["127.0.0.1:10911", "127.0.0.1:10912"]
         hb = fake.heartbeats[0][1]
         assert hb.client_id == "cid@fixed"
@@ -168,8 +168,8 @@ class TestConsumerHeartbeat:
         assert c.heartbeat_count() == 1
 
     def test_heartbeat_still_announces_the_group_without_register_topics(self):
-        # registerTopics 为空时订阅集是空的，但 ConsumerData 本身照发 —— 否则
-        # 调用方"只拉一两个 topic 不预先登记"时 broker 侧永远看不见这个组。
+        # when registerTopics is empty the subscription set is empty, but the ConsumerData itself is still sent -- otherwise
+        # when a caller "pulls only one or two topics without pre-registering", the broker side would never see this group.
         c, fake = _started_pull(topics=())
         assert c._send_heartbeat_to_all_broker() == 2
         cd = list(fake.heartbeats[0][1].consumer_data_set)[0]
@@ -189,7 +189,7 @@ class TestConsumerHeartbeat:
         c = DefaultMQPullConsumer("PG_HbStart")
         c.set_namesrv_addr("127.0.0.1:9876")
         c.register_topics.add("TopicHbStart")
-        c.heartbeat_interval_millis = 3600_000  # 只测启动那一轮，别让循环插进来
+        c.heartbeat_interval_millis = 3600_000  # only test the startup round, do not let the loop interfere
         c.start()
         try:
             fake = holder["client"]
@@ -220,16 +220,16 @@ class TestConsumerHeartbeat:
         assert fake.unregistered == [(c.client_id, "", "PG_HbStop")]
         assert fake.shutdown_called == 1
         assert c._heartbeat_stop.is_set()
-        # 幂等：再 shutdown 一次不再发报文
+        # idempotent: one more shutdown sends no more reports
         c.shutdown()
         assert fake.shutdown_called == 1
 
 
 class _BalanceClient:
-    """替身 client：只提供 fetchMessageQueuesInBalance 需要的两个查询口。
+    """A stand-in client: provides only the two query mouths fetchMessageQueuesInBalance needs.
 
-    subscribe / cidList 都可以设成 None 来模拟「路由拿不到」「broker 没答」，
-    这时方法必须退回本地记账（保留现有分配），绝不能独占全部队列。
+    subscribe / cidList can both be set to None to simulate "route unavailable" / "broker did not answer",
+    at which point the method must fall back to local bookkeeping (keeping the current assignment) and must never monopolize all queues.
     """
 
     def __init__(self, subscribe=None, cid_list=None, raise_on_route=False):
@@ -279,7 +279,7 @@ class TestFetchMessageQueuesInBalance:
     def test_returns_only_this_instance_share(self):
         got = _balance_consumer(self._queues(4), ["cid-A", "cid-B"]) \
             .fetch_message_queues_in_balance(self._TOPIC)
-        assert [q.queue_id for q in got] == [0, 1], "averagely 策略下 A 只拿前一半"
+        assert [q.queue_id for q in got] == [0, 1], "under the averagely strategy A only takes the first half"
 
     def test_single_instance_takes_all(self):
         got = _balance_consumer(self._queues(3), ["cid-A"]) \
@@ -308,7 +308,7 @@ class TestFetchMessageQueuesInBalance:
         assert [q.queue_id for q in got] == [0, 1, 2]
 
     def test_no_consumer_list_keeps_current_assignment(self):
-        # broker 没答消费者列表 → 保留本实例正在拉的队列，不独占全部（同组会重复消费）。
+        # the broker did not answer the consumer list -> keep the queues this instance is pulling, do not monopolize all (the same group would double-consume).
         pulled = [MessageQueue(self._TOPIC, "broker-a", 2)]
         got = _balance_consumer(self._queues(4), None, pulled=pulled) \
             .fetch_message_queues_in_balance(self._TOPIC)
@@ -328,7 +328,7 @@ _WAIT_TIMEOUT = 30.0
 
 
 class _ScriptedPullClient:
-    """替身 client：pull_message 按脚本回放（值 / 异常），记录线程名与入参。"""
+    """A stand-in client: pull_message replays per the script (values / exceptions), recording thread names and inputs."""
 
     def __init__(self):
         self.remoting_client = SimpleNamespace(register_rpc_hook=lambda *a, **k: None)
@@ -389,7 +389,7 @@ class TestPullAsync:
     def test_before_start_raises_synchronously(self):
         c = DefaultMQPullConsumer("PG_AsyncUnit")
         cb = _CollectingCallback()
-        # 与本端 send_async 的有意差别一致：没 start 直接同步抛，不走回调。
+        # consistent with the intentional difference from the local send_async: not started -> throw synchronously, no callback.
         with pytest.raises(MQClientException):
             c.pull_async(MQ, "*", 0, 32, cb, 1000)
         assert cb.done.is_set() is False
@@ -412,16 +412,16 @@ class TestPullAsync:
         try:
             begun = time.monotonic()
             c.pull_async(MQ, "TagA", 4, 16, cb, 3000)
-            # 立即返回：调用方线程不被 RPC 阻塞。
+            # returns immediately: the caller's thread is not blocked by the RPC.
             assert time.monotonic() - begun < 1.0
             assert cb.done.wait(_WAIT_TIMEOUT)
             assert cb.errors == []
             assert cb.success[0] is expected
             assert cb.success[0].msg_found_list == [m]
-            # RPC 在 AsyncPullExecutor_、回调在 PullCallbackExecutor_（分工同 producer 双池）。
+            # RPC runs on AsyncPullExecutor_, callbacks on PullCallbackExecutor_ (same split as the producer's two pools).
             assert client.calls[0][3].startswith("AsyncPullExecutor_"), client.calls
             assert cb.thread_names[0].startswith("PullCallbackExecutor_"), cb.thread_names
-            # 入参透传 + 预算不放大（timeout-cost ≤ 3000）
+            # inputs passed through + budget not inflated (timeout-cost <= 3000)
             assert client.calls[0][1] == 4
             assert client.calls[0][2] <= 3000
         finally:
@@ -441,7 +441,7 @@ class TestPullAsync:
             c.shutdown()
 
     def test_offset_illegal_status_is_a_success_callback(self):
-        # 四个 PullStatus 都是「RPC 成功」；OFFSET_ILLEGAL 不是异常（纠偏交给调用方）。
+        # all four PullStatus values mean "RPC succeeded"; OFFSET_ILLEGAL is not an exception (correction is left to the caller).
         expected = PullResult(PullStatus.OFFSET_ILLEGAL, 42, 40, 90, [])
         client = _ScriptedPullClient()
         client.script.append(expected)
@@ -456,12 +456,11 @@ class TestPullAsync:
             c.shutdown()
 
     def test_queue_wait_timeout_skips_rpc(self):
-        """排队吃光预算 → 不发请求，直接 on_exception(RemotingTooMuchRequestException)。
+        """Queueing eats the budget -> no request is sent, going straight to on_exception(RemotingTooMuchRequestException).
 
-        Windows 回环端口有 ~2s 拒连延迟、线程排程也有抖动，所以这里不真等网络超时：
-        预置一个**单线程**拉取池并先塞一个占位任务堵死 worker，再投 timeout=50ms 的
-        pull_async；等待 0.2s 后放行占位任务 —— 出队时 cost 必然 > 预算（只会更大不会
-        更小），走排队超时分支且 **client 没收到任何 RPC**，全程确定性的。
+        Windows loopback ports have a ~2s connection-refused delay and thread scheduling jitters, so this does not really wait for a network timeout:
+        a **single-threaded** pull pool is preset and a placeholder task is stuffed in first to block the worker, then pull_async with timeout=50ms is submitted; after waiting 0.2s the placeholder task is released -- at dequeue the cost is necessarily > the budget (it can only be larger, not
+        smaller), taking the queue-timeout branch with **the client receiving no RPC at all**, fully deterministic throughout.
         """
         client = _ScriptedPullClient()
         c = _started_async_pull(client)
@@ -480,12 +479,12 @@ class TestPullAsync:
         cb = _CollectingCallback()
         try:
             c.pull_async(MQ, "*", 1, 32, cb, 50)
-            time.sleep(0.2)  # 预算在队列里被吃光
+            time.sleep(0.2)  # the budget is eaten up in the queue
             hold.set()
             assert cb.done.wait(_WAIT_TIMEOUT)
             assert cb.success == []
             assert isinstance(cb.errors[0], RemotingTooMuchRequestException), cb.errors
-            assert client.calls == [], "排队超时不得发出请求"
+            assert client.calls == [], "a queue timeout must not send any request"
         finally:
             hold.set()
             c.shutdown()
@@ -498,7 +497,7 @@ class TestPullAsync:
         cb = _CollectingCallback()
         pool.shutdown()
         try:
-            # 队列满/池关 → 同步抛（与 send_async 的 "executor rejected" 同口径）。
+            # queue full / pool closed -> throw synchronously (same criterion as send_async's "executor rejected").
             with pytest.raises(MQClientException):
                 c.pull_async(MQ, "*", 0, 32, cb, 3000)
             assert cb.done.is_set() is False
@@ -522,7 +521,7 @@ class TestPullAsync:
             boom = _Boom()
             c.pull_async(MQ, "*", 0, 32, boom, 3000)
             assert boom.done.wait(_WAIT_TIMEOUT)
-            # 回调线程里的用户异常只被记日志，池保持存活：下一笔照常投递。
+            # a user exception in the callback thread is only logged, the pool stays alive: the next one is delivered as usual.
             third = _CollectingCallback()
             c.pull_async(MQ, "*", 0, 32, third, 3000)
             assert third.done.wait(_WAIT_TIMEOUT)
@@ -539,6 +538,6 @@ class TestPullAsync:
         assert c._async_pull_executor is not None
         c.shutdown()
         assert c._async_pull_executor is None and c._pull_callback_executor is None
-        # 已 shutdown：_require_client 先拦下（消费者未启动），同步抛。
+        # already shutdown: _require_client intercepts first (consumer not started), throwing synchronously.
         with pytest.raises(MQClientException):
             c.pull_async(MQ, "*", 0, 32, _CollectingCallback(), 3000)

@@ -1,9 +1,11 @@
-// broker 反向推送 NOTIFY_CONSUMER_IDS_CHANGED(40) 的离线单测（不需要集群）。
+// Offline unit tests for the broker reverse-pushing NOTIFY_CONSUMER_IDS_CHANGED(40) (no cluster needed).
 //
-// 为什么单独一个文件：这组请求是 broker 沿**已建立的长连接反向**打进客户端的，
-// 真机用例注入不了（live 工具只能正向往 broker 发请求），所以能离线锁死的部分必须
-// 先锁死。否则「处理器根本没注册」这种错只会在生产上表现为「成员变了却要等 20s
-// 定时重平衡」，安静得几乎不可见。
+// Why a separate file: these requests are pushed by the broker into the client in the
+// **reverse direction over an already established long connection**, and a real-machine
+// case cannot inject them (the live tool can only send requests to the broker), so
+// whatever can be pinned offline must be pinned first. Otherwise a mistake like "the
+// handler was never registered" only shows up in production as "the membership changed
+// but it waits 20s for the periodic rebalance", which is almost invisible.
 using System;
 using System.Collections.Generic;
 using RocketMQ.Remoting.Protocol;
@@ -34,19 +36,19 @@ public class BrokerRequestTests
         Assert.Equal(1, wakeA);
         Assert.Equal(1, wakeB);
 
-        // 缺 consumerGroup 也只用于日志，通知本身照样处理完
+        // A missing consumerGroup is only used for logging, the notification is still fully processed
         Assert.Null(instance.ProcessNotifyConsumerIdsChanged(NotifyCmd(null), "127.0.0.1:10911"));
         Assert.Equal(2, instance.ConsumerIdsChangedCount);
         Assert.Equal(2, wakeA);
 
-        // 注销的那一组不再被叫醒，但计数继续走
+        // A group that has unregistered is no longer woken, but the counter keeps running
         instance.UnregisterRebalanceWakeup("GID_B");
         instance.ProcessNotifyConsumerIdsChanged(NotifyCmd("GID_A"), "127.0.0.1:10911");
         Assert.Equal(3, instance.ConsumerIdsChangedCount);
         Assert.Equal(3, wakeA);
         Assert.Equal(2, wakeB);
 
-        // 空表不炸：一个消费者都没注册时通知仍要吃完
+        // An empty table must not blow up: the notification must still be consumed when not a single consumer registered
         instance.UnregisterRebalanceWakeup("GID_A");
         instance.RebalanceImmediately();
         Assert.Equal(3, instance.ConsumerIdsChangedCount);
@@ -62,7 +64,7 @@ public class BrokerRequestTests
         instance.Shutdown();
         instance.RebalanceImmediately();
         Assert.Equal(0, woken);
-        // shutdown 之后再收到通知（读线程可能还在收尾）也不能抛
+        // Getting a notification after shutdown (the reader thread may still be winding up) must not throw
         instance.ProcessNotifyConsumerIdsChanged(NotifyCmd("GID_A"), "127.0.0.1:10911");
         Assert.Equal(1, instance.ConsumerIdsChangedCount);
     }

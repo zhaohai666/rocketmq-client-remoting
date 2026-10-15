@@ -5,10 +5,11 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * 批量消息：一组 Message 拼成一个 body 一次发送。
+ * Batch message: a group of Message objects concatenated into one body and sent in a single request.
  *
- * 没有自己的序列化字段，body 由 ``encode()`` 生成：
- * ``MessageDecoder::encodeMessages($messages)`` 的拼接结果（每条为 6 段轻量格式）。
+ * It has no serialization fields of its own; the body is produced by ``encode()``:
+ * the concatenation result of ``MessageDecoder::encodeMessages($messages)`` (each entry in a 6-segment
+ * lightweight format).
  */
 final class MessageBatch extends Message
 {
@@ -22,7 +23,7 @@ final class MessageBatch extends Message
         $this->messages = array_values($messages);
     }
 
-    /** 生成批量 body：逐条 6 段轻量格式串接。 */
+    /** Generates the batch body: 6-segment lightweight format per entry, concatenated. */
     public function encode(): string
     {
         return MessageDecoder::encodeMessages($this->messages);
@@ -35,10 +36,11 @@ final class MessageBatch extends Message
     }
 
     /**
-     * 从列表构造批量消息并校验约束。
+     * Builds a batch message from a list and validates the constraints.
      *
-     * 约束：非空；同一 topic；同一 waitStoreMsgOK；不允许延时消息；不允许重试 topic。
-     * 任一条不满足就整批抛 InvalidArgumentException——不能只丢掉几条再发剩下的。
+     * Constraints: not empty; the same topic; the same waitStoreMsgOK; delayed messages are not allowed;
+     * retry topics are not allowed. If any entry violates them the whole batch throws
+     * InvalidArgumentException — it is not acceptable to just drop a few and send the rest.
      *
      * @param list<Message> $messages
      */
@@ -73,10 +75,11 @@ final class MessageBatch extends Message
 
         $batch = new self($messageList);
         $batch->setTopic($first->getTopic());
-        // 批级 WAIT 跟随第一条消息的判定结果，且**属性缺省即 true**。曾经写成
-        // ``first.getWaitStoreMsgOk() == "true"`` —— 缺省（null）被判成 false，
-        // 于是普通消息（构造器不写 WAIT）组成的批量会以 ``WAIT=false`` 下发：
-        // broker 不等刷盘就回 SEND_OK，持久性静默降级。
+        // The batch-level WAIT follows the verdict for the first message, and **an absent property means
+        // true**. It used to be written as ``first.getWaitStoreMsgOk() == "true"`` — an absent value
+        // (null) was then judged as false, so a batch made of ordinary messages (whose constructor does
+        // not set WAIT) would be sent with ``WAIT=false``: the broker would answer SEND_OK without waiting
+        // for the flush to disk, silently downgrading durability.
         $batch->setWaitStoreMsgOk(self::isWaitStoreMsgOk($first));
         $batch->setBody($batch->encode());
         return $batch;

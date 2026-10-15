@@ -1,7 +1,7 @@
-//! 协议序列化：JSON（`RemotingSerializable`）与 RocketMQ 私有二进制（`RocketMQSerializable`）。
+//! Protocol serialization: JSON (`RemotingSerializable`) and the RocketMQ private binary format (`RocketMQSerializable`).
 //!
-//! JSON 侧必须容忍 fastjson2 的非标准输出：Map 的裸数字键、以对象为键（`offsetTable`
-//! 以 MessageQueue 为键）、`NaN` / `Infinity`、尾随逗号。
+//! The JSON side must tolerate the server's non-standard output: bare numeric map keys, object keys (the
+//! `offsetTable` keyed by MessageQueue), `NaN` / `Infinity`, trailing commas.
 
 use serde_json::{Map, Number, Value};
 
@@ -31,7 +31,7 @@ impl RemotingSerializable {
         serde_json::to_string_pretty(value).unwrap_or_else(|_| "null".into())
     }
 
-    /// 严格 JSON 优先，失败后走 fastjson2 容忍解析。
+    /// Strict JSON first; on failure falls back to the tolerant parser.
     pub fn decode(data: &[u8]) -> Result<Value> {
         if data.is_empty() {
             return Ok(Value::Null);
@@ -47,7 +47,7 @@ pub struct FastJsonError {
     pub offset: usize,
 }
 
-/// fastjson2 兼容子集解析器（允许非字符串 map 键）。
+/// Tolerant subset parser for the server's JSON dialect (allows non-string map keys).
 pub mod fastjson {
     use super::*;
 
@@ -70,7 +70,7 @@ pub mod fastjson {
         from_str(text)
     }
 
-    /// 把 fastjson2 写出的内联对象键（`{"brokerName":"b","queueId":3}`）还原成 `Value`。
+    /// Parses the inline object keys the server emits (e.g. `{"brokerName":"b","queueId":3}`) back into a `Value`.
     pub fn decode_map_key(key: &str) -> Option<Value> {
         let text = key.trim();
         if !text.starts_with('{') {
@@ -209,7 +209,7 @@ pub mod fastjson {
             match self.peek() {
                 Some(b'"') => self.string(),
                 Some(b'{') | Some(b'[') => {
-                    // 非字符串键保留原始文本，调用方用 decode_map_key 再解析。
+                    // Non-string keys keep their raw text; callers re-parse with decode_map_key.
                     let start = self.pos;
                     self.value()?;
                     Ok(self.text[start..self.pos].to_string())
@@ -254,7 +254,7 @@ pub mod fastjson {
                                     .map_err(|_| Error::Decode("bad \\u escape".into()))?;
                                 let code = u32::from_str_radix(digits, 16)
                                     .map_err(|_| Error::Decode("bad \\u escape".into()))?;
-                                // 代理对：fastjson2 输出的是标准 \uXXXX\uXXXX
+                                // Surrogate pairs: the server emits the standard \uXXXX\uXXXX form
                                 let mut scalar = code;
                                 if (0xD800..0xDC00).contains(&code)
                                     && self.bytes.get(self.pos + 5) == Some(&b'\\')
@@ -290,7 +290,7 @@ pub mod fastjson {
                             b'r' => out.push('\r'),
                             b't' => out.push('\t'),
                             other => {
-                                // \x 后跟 ASCII 之外的字节时按 UTF-8 原样搬运，避免撕裂多字节字符
+                                // When \x is followed by a non-ASCII byte, copy it through as raw UTF-8 to avoid tearing multi-byte characters
                                 if other < 0x80 {
                                     out.push(other as char);
                                 } else {
@@ -303,7 +303,7 @@ pub mod fastjson {
                         self.pos += 1;
                     }
                     _ => {
-                        // 非 ASCII 字节按整个 UTF-8 序列搬运
+                        // Non-ASCII bytes are copied through as whole UTF-8 sequences
                         let len = utf8_len(c);
                         let end = (self.pos + len).min(self.bytes.len());
                         match std::str::from_utf8(&self.bytes[self.pos..end]) {
@@ -331,7 +331,7 @@ pub mod fastjson {
                     return Ok(match token {
                         "true" => Value::Bool(true),
                         "false" => Value::Bool(false),
-                        // serde_json 的 Number 装不下 NaN / Infinity
+                        // serde_json's Number cannot represent NaN / Infinity
                         "NaN" | "Infinity" | "-Infinity" => Value::Null,
                         _ => Value::Null,
                     });
@@ -369,7 +369,7 @@ pub mod fastjson {
         }
     }
 
-    /// 返回数字字面量的结束偏移（0 表示不是数字）。
+    /// Returns the end offset of the numeric literal (0 means not a number).
     fn number_end(rest: &str) -> usize {
         let b = rest.as_bytes();
         let mut i = 0usize;
@@ -431,7 +431,7 @@ pub mod fastjson {
     }
 }
 
-/// `RocketMQSerializable`：4.x 私有二进制 header。
+/// `RocketMQSerializable`: the 4.x private binary header.
 pub struct RocketMqHeader {
     pub code: i32,
     pub language: i32,
@@ -478,7 +478,7 @@ impl RocketMQSerializable {
         Ok((map, offset))
     }
 
-    /// 对应 `calTotalLen`。
+    /// Total byte length of the private binary header (see the field order in `rocket_mq_protocol_encode`).
     pub fn cal_total_len(remark: Option<&str>, ext: Option<&[u8]>) -> usize {
         let remark_len = remark.map(str::as_bytes).unwrap_or(&[][..]).len();
         let ext_len = ext.unwrap_or(&[][..]).len();

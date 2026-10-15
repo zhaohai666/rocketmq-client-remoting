@@ -1,4 +1,4 @@
-// 线格式：totalLength(4) | headerLength(高 8 位放序列化类型, 4) | header | body
+// Wire format: totalLength(4) | headerLength (top 8 bits hold the serialize type, 4) | header | body
 //
 //   header(JSON)      : {"code":..,"language":..,"version":..,"opaque":..,"flag":..,
 //                        "remark":"..","extFields":{..}}
@@ -24,14 +24,15 @@ public sealed class RemotingCommand
 
     public int Code { get; set; }
 
-    /// <summary>上线的语言标识用 DOTNET(2)，不要和线格式里的 CPP(1) 混淆。</summary>
+    /// <summary>The online language identifier uses DOTNET(2); do not confuse it with the CPP(1) in the wire format.</summary>
     public byte Language { get; set; } = LanguageCode.Dotnet;
 
     public int Version { get; set; }
 
     /// <summary>
-    /// ⚠ opaque 从 0 起算，第一个请求的合法值就是 0——**不能用 0 当「未设置」哨兵**。
-    /// 传输层只在真的与在途请求冲突时才重分配（见 RemotingClient）。
+    /// WARNING: opaque starts counting at 0, so the first request's legal value is 0 —
+    /// **0 cannot be used as an "unset" sentinel**. The transport layer only reassigns it when
+    /// it truly conflicts with an in-flight request (see RemotingClient).
     /// </summary>
     public int Opaque { get; set; }
 
@@ -70,7 +71,7 @@ public sealed class RemotingCommand
         SerializeTypeCurrentRpc = GetSerializeTypeConfig();
     }
 
-    // ---------------- 工厂方法 ----------------
+    // ---------------- factory methods ----------------
 
     public static RemotingCommand CreateRequestCommand(
         int code, ICommandCustomHeader? header = null)
@@ -117,7 +118,7 @@ public sealed class RemotingCommand
     public static RemotingCommand BuildErrorResponse(int code, string remark) =>
         CreateResponseCommand(code, remark);
 
-    /// <summary>全局是否为本次 RPC 使用 ROCKETMQ 二进制序列化。</summary>
+    /// <summary>Whether ROCKETMQ binary serialization is globally used for this RPC.</summary>
     public static void SetSerializeTypeConfig(byte type)
     {
         lock (SerializeTypeLock)
@@ -134,7 +135,7 @@ public sealed class RemotingCommand
         }
     }
 
-    // ---------------- 帧工具 ----------------
+    // ---------------- frame utilities ----------------
 
     public static byte GetProtocolType(int source) =>
         (byte)((unchecked((uint)source) >> 24) & 0xFF);
@@ -156,7 +157,7 @@ public sealed class RemotingCommand
         ? RemotingCommandType.ResponseCommand
         : RemotingCommandType.RequestCommand;
 
-    // ---------------- 编解码 ----------------
+    // ---------------- codec ----------------
 
     public void MakeCustomHeaderToNet()
     {
@@ -243,7 +244,7 @@ public sealed class RemotingCommand
         return writer.ToArray();
     }
 
-    /// <summary>只编码头部（body 长度另算），用于分帧发送。</summary>
+    /// <summary>Encodes only the header (body length counted separately), for framed sending.</summary>
     public byte[] EncodeHeader(int bodyLength = 0)
     {
         int length = 4;
@@ -256,7 +257,7 @@ public sealed class RemotingCommand
         return writer.ToArray();
     }
 
-    /// <summary>解析失败返回 false（err 为失败原因），不抛异常。</summary>
+    /// <summary>Returns false on parse failure (err is the failure reason); does not throw.</summary>
     public static bool TryDecode(byte[] data, out RemotingCommand outCmd, out string? error)
     {
         outCmd = new RemotingCommand();
@@ -322,7 +323,7 @@ public sealed class RemotingCommand
             JsonValue lang = obj.Get("language");
             if (lang.IsString)
             {
-                // 5.x 会把 language 序列化成**枚举名字符串**（4.x 是 int），两者都收
+                // 5.x serializes language as an **enum-name string** (4.x used an int); accept both
                 cmd.Language = LanguageNameToCode(lang.StringValue());
             }
             else
@@ -359,7 +360,7 @@ public sealed class RemotingCommand
         return true;
     }
 
-    /// <summary>解析失败抛 <see cref="RemotingCommandException"/>。</summary>
+    /// <summary>Throws <see cref="RemotingCommandException"/> on parse failure.</summary>
     public static RemotingCommand Decode(byte[] data)
     {
         if (!TryDecode(data, out RemotingCommand cmd, out string? err))
@@ -370,7 +371,7 @@ public sealed class RemotingCommand
         return cmd;
     }
 
-    /// <summary>把 extFields 映射回自定义头部对象。</summary>
+    /// <summary>Maps extFields back onto a custom header object.</summary>
     public void DecodeCommandCustomHeader(ICommandCustomHeader header) =>
         header.FromExtFields(ExtFields);
 
@@ -405,7 +406,7 @@ public sealed class RemotingCommand
 
     public static int NextOpaque() => Interlocked.Increment(ref _opaqueCounter) - 1;
 
-    // ---------------- 私有配置 ----------------
+    // ---------------- private config ----------------
 
     private static byte LoadSerializeTypeConfig()
     {
@@ -434,7 +435,7 @@ public sealed class RemotingCommand
             : CurrentVersion;
     }
 
-    /// <summary>language 名称 -> 码（兼容 5.x 把 language 序列化为枚举名字符串）。未知回落 JAVA。</summary>
+    /// <summary>language name -> code (compat: 5.x serializes language as an enum-name string). Falls back to JAVA when unknown.</summary>
     private static byte LanguageNameToCode(string name) =>
         LanguageCode.FromName(name.Trim().ToUpperInvariant()) ?? LanguageCode.Java;
 }

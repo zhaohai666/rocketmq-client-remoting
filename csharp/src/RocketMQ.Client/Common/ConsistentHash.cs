@@ -1,8 +1,8 @@
-// 移植 `ConsistentHashRouter` / `Node` / `VirtualNode` / `HashFunction` 四个类型加
-// `ConsistentHashRouter.MD5Hash` 这个私有实现；目前唯一的用户是队列分配策略
-// `AllocateMessageQueueConsistentHash`。
+// Ported `ConsistentHashRouter` / `Node` / `VirtualNode` / `HashFunction` four types plus
+// the private `ConsistentHashRouter.MD5Hash` implementation; the only current user is the queue allocation strategy
+// `AllocateMessageQueueConsistentHash`.
 //
-// ## 为什么整套照搬而不是"等价改写"
+// ## Why port the whole thing verbatim instead of "equivalent rewriting"
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;

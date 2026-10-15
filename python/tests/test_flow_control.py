@@ -1,12 +1,12 @@
-# 为什么必须离线锁死：五条闸门里只有**条数**那条会在"消息小、拉得快"的场景先命中，
-# 其余四条判错方向是**静默**的：
-#   - 队列级字节闸门失效 ⇒ 大消息把已拉未消费的堆撑爆（真机表现为 OOM/RT 飙升，无异常）；
-#   - 位点跨度闸门失效 ⇒ 队首一条一直消费失败、后面无限堆着，位点跨度失控；
-#   - topic 级闸门失效 ⇒ 同 topic 多队列各自为政，单队列都"没超"但实例总量爆掉。
-# 单位也只有一个坑：size 阈值是 **MiB** 不是字节；跨度是**严格大于**而条数/字节是 **>=**。
+# Why this must be locked offline: of the five gates, only the **count** one fires first in "small messages, fast pulls" scenarios;
+# the other four fail in a **silent** direction when judged wrong:
+#   - Queue-level byte gate failing ⇒ large messages blow up the pulled-but-unconsumed pile (real-world symptom: OOM / RT spike, no exception);
+#   - Offset span gate failing ⇒ the head message keeps failing to consume while the rest piles up endlessly, and the offset span runs away;
+#   - Topic-level gate failing ⇒ multiple queues of the same topic act independently; no single queue is "over" but the instance total explodes.
+# The units have exactly one pitfall: the size threshold is **MiB**, not bytes; the span is **strictly greater** while count/bytes are **>=**.
 #
-# 本文件锁的是流控判定的离线语义：五条闸门的命中方向与单位逐条钉死。
-# 真机侧"闸门命中之后消息一条都不丢"见 ../verify_flow_control_live.py。
+# This file locks the offline semantics of flow-control judgment: the hit direction and units of the five gates are pinned one by one.
+# For the real-machine side, "no message is lost after a gate hits", see ../verify_flow_control_live.py.
 from client.consumer import DefaultMQPushConsumer
 from common.message import MessageExt, MessageQueue
 
@@ -33,12 +33,12 @@ def _n_sized(topic, store_size, n):
 
 
 def _consumer(group):
-    """未 Start 的消费者：_pending/_mq_map 由测试自己预置，不碰网络。"""
+    """A not-yet-started consumer: _pending/_mq_map are pre-set by the test itself, no network touched."""
     return DefaultMQPushConsumer(group)
 
 
 def _gates_off(c):
-    """关掉除待测阈值以外的所有闸门：先命中的那条会掩盖被测分支。"""
+    """Turn off all gates except the threshold under test: an earlier hit would mask the branch under test."""
     c.pull_threshold_for_queue = 2 ** 31 - 1
     c.pull_threshold_size_for_queue = 0
     c.consume_concurrently_max_span = 0
@@ -47,7 +47,7 @@ def _gates_off(c):
 
 
 def _stage(c, mq, msgs):
-    """预置某队列的缓冲 + 登记为已分配（topic 级阈值靠 _mq_map 聚合兄弟队列）。"""
+    """Pre-set a queue's buffer + register it as assigned (topic-level thresholds aggregate sibling queues via _mq_map)."""
     key = c._mq_key(mq)
     c._mq_map[key] = mq
     c._pending[key] = list(msgs)
@@ -61,11 +61,11 @@ def _hit(c, mq, key=None):
 def test_defaults_only_the_count_gate_is_live():
     c = _consumer("G_fc_defaults")
     mq = _queue()
-    # 默认 1000 条 / 100MiB / 跨度 2000，topic 级关闭：小缓冲一律不命中
+    # Defaults 1000 msgs / 100MiB / span 2000, topic level off: small buffers never hit
     _stage(c, mq, _n_sized(TOPIC, 100, 1))
     assert not _hit(c, mq)
     assert c._flow_control_triggered == 0
-    # 缓冲为空（还没拉过任何消息）同样不命中，且跨度不能被算成负数
+    # An empty buffer (nothing pulled yet) also does not hit, and the span must not be computed as negative
     _stage(c, mq, [])
     assert not _hit(c, mq)
 
@@ -82,7 +82,7 @@ def test_count_gate_fires_at_threshold_and_treats_zero_as_one():
     assert c._flow_control_triggered == 1
     c.pull_threshold_for_queue = 0
     _stage(c, mq, _n_sized(TOPIC, 100, 1))
-    assert _hit(c, mq), "pull_threshold_for_queue=0 要按 1 条算（max(1,n) 守卫）"
+    assert _hit(c, mq), "pull_threshold_for_queue=0 must count as 1 message (the max(1,n) guard)"
 
 
 def test_size_gate_is_in_mib_and_disabled_by_zero():
@@ -92,12 +92,12 @@ def test_size_gate_is_in_mib_and_disabled_by_zero():
     c.pull_threshold_size_for_queue = 1          # 1 MiB
     _stage(c, mq, _n_sized(TOPIC, 300, 3))       # 900 B
     assert not _hit(c, mq)
-    # 单位是 MiB 而不是字节：正好 1 MiB 就算命中（>=）
+    # The unit is MiB, not bytes: exactly 1 MiB counts as a hit (>=)
     _stage(c, mq, [_sized(TOPIC, MIB, 0)])
-    assert _hit(c, mq), "正好 1MiB 要命中（>=，不是 >）"
+    assert _hit(c, mq), "exactly 1MiB must hit (>=, not >)"
     _stage(c, mq, _n_sized(TOPIC, 2 * MIB, 4))
     assert _hit(c, mq)
-    # 0 = 关闭这条闸门，再大的缓冲也不管
+    # 0 = disable this gate; even a huge buffer is ignored
     c.pull_threshold_size_for_queue = 0
     assert not _hit(c, mq)
 
@@ -110,11 +110,11 @@ def test_span_gate_is_strictly_greater_and_measures_real_span():
     _stage(c, mq, [_sized(TOPIC, 1, 0), _sized(TOPIC, 1, 100)])
     assert _hit(c, mq)
     c.consume_concurrently_max_span = 100
-    assert not _hit(c, mq), "跨度 100 不严格大于 100，不该命中"
-    # 乱序缓冲也要量出真实跨度（min/max 而不是首尾差）
+    assert not _hit(c, mq), "span 100 is not strictly greater than 100, so it must not hit"
+    # An out-of-order buffer must also measure the real span (min/max, not the first-last difference)
     c.consume_concurrently_max_span = 10
     _stage(c, mq, [_sized(TOPIC, 1, 50), _sized(TOPIC, 1, 5), _sized(TOPIC, 1, 7)])
-    assert _hit(c, mq), "乱序缓冲要按 max-min 量跨度，不是首尾差"
+    assert _hit(c, mq), "an out-of-order buffer must measure the span as max-min, not the first-last difference"
     c.consume_concurrently_max_span = 0
     assert not _hit(c, mq)
 
@@ -125,41 +125,41 @@ def test_topic_count_gate_aggregates_siblings_but_not_other_topics():
     other = _queue(topic=OTHER_TOPIC)
     _gates_off(c)
     c.pull_threshold_for_topic = 2
-    # 单队列 1 条：topic 级也只看到 1 条
+    # 1 message in a single queue: the topic level also sees only 1
     _stage(c, q0, _n_sized(TOPIC, 1, 1))
     assert not _hit(c, q0)
-    # 同 topic 的兄弟队列各 1 条 ⇒ 累计 2 条，两条队列都必须停
+    # Sibling queues of the same topic with 1 message each => 2 cumulative, both queues must stop
     k1 = _stage(c, q1, _n_sized(TOPIC, 1, 1))
     assert _hit(c, q0)
     assert _hit(c, q1, k1)
-    # 别的 topic 不许掺进来：把本 topic 降到 1 条，另一 topic 堆 5 条
+    # Other topics must not mix in: drop this topic to 1 message and pile 5 onto the other topic
     _stage(c, q1, [])
     _stage(c, other, _n_sized(OTHER_TOPIC, 1, 5))
-    assert not _hit(c, q0), "别的 topic 的缓冲不能算进本 topic 的累计"
+    assert not _hit(c, q0), "another topic's buffer must not count toward this topic's cumulative total"
 
 
 def test_topic_size_gate_has_its_own_switch_and_runs_last():
     c = _consumer("G_fc_topic_size")
     q0, q1 = _queue(queue_id=0), _queue(queue_id=1)
     _gates_off(c)
-    # 队列级字节闸门**关掉**（0），只留 topic 级：误用队列级开关当闸门会让这条静默失效
+    # The queue-level byte gate is **off** (0), leaving only the topic level: misusing the queue-level switch as the gate would silently disable this
     c.pull_threshold_size_for_topic = 1
     _stage(c, q0, [_sized(TOPIC, MIB // 2, 0)])
     assert not _hit(c, q0)
     _stage(c, q1, [_sized(TOPIC, 3 * MIB // 2, 0)])
-    assert _hit(c, q0), "队列级 size 闸门关掉时主题级 size 仍要生效"
+    assert _hit(c, q0), "when the queue-level size gate is off, the topic-level size gate must still take effect"
     assert _hit(c, q1)
-    # 队列级那道还开着时先命中队列级（判定顺序：条数 → 字节 → 跨度 → topic 条数 → topic 字节）
+    # While the queue-level gate is still on, the queue level hits first (judgment order: count → bytes → span → topic count → topic bytes)
     c.pull_threshold_size_for_queue = 1
     _stage(c, q0, [_sized(TOPIC, 2 * MIB, 0)])
     before = c._flow_control_triggered
     assert _hit(c, q0)
-    # 一次判定只记一格，即使多条闸门同时命中
+    # One judgment records only one tick, even when multiple gates hit simultaneously
     assert c._flow_control_triggered == before + 1
 
 
 def test_one_hit_counts_one_tick_even_when_every_gate_matches():
-    """计数器是"因流控停了几次"的观测面：五条闸门同时命中也只能加一格。"""
+    """The counter is an observability surface for "how many times flow control stopped things": even when all five gates hit at once, only one tick is added."""
     c = _consumer("G_fc_counter")
     q0, q1 = _queue(queue_id=0), _queue(queue_id=1)
     _gates_off(c)
@@ -168,7 +168,7 @@ def test_one_hit_counts_one_tick_even_when_every_gate_matches():
     c.consume_concurrently_max_span = 1
     c.pull_threshold_for_topic = 1
     c.pull_threshold_size_for_topic = 1
-    # 2 条 2MiB、位点跨到 100 的缓冲：五条闸门同时命中
+    # A buffer of 2 messages at 2MiB each with offsets spanning to 100: all five gates hit at once
     _stage(c, q0, [_sized(TOPIC, 2 * MIB, 0), _sized(TOPIC, 2 * MIB, 100)])
     _stage(c, q1, [_sized(TOPIC, 2 * MIB, 0)])
     assert _hit(c, q0)

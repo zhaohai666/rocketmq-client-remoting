@@ -1,23 +1,23 @@
-//! 过期消息清扫与回投真机验证（A0–A5）。
+//! Live verification of expired-message sweeping and send-back (A0-A5).
 //!
-//! 离线单测（`src/client/consumer.rs` 的 `clean_expired_queue_*` 与
-//! `send_back_batch_skips_entries_swept_away`）锁的是**判据**（选条/阈值/上限/摘除闸门/
-//! 跳过回投）；这里锁真机上两件离线锁不住的事：
-//!   A. **清扫真的会开火**：需要一个 listener 挂着不返回超过 consumeTimeout 分钟，清扫线程
-//!      把这条消息 sendMessageBack（delayLevel 3）——整条链路上客户端不能丢它、也不能投两次。
-//!   B. **重投真的回到 broker**：%RETRY%<group> 的拉取循环独立于挂住的消费线程，消息必须
-//!      重新出现在本地缓冲、被第二次投递且 reconsumeTimes=1（broker 侧计数）。
+//! Offline unit tests (`clean_expired_queue_*` and
+//! `send_back_batch_skips_entries_swept_away` in `src/client/consumer.rs`) pin the **criteria** (entry selection / thresholds / caps / the sweep gate /
+//! skipping send-back); here we pin two things only a real cluster can show:
+//!   A. **the sweep really fires**: a listener must hang without returning past the consumeTimeout minutes, and the sweep thread
+//!      sends that message back with sendMessageBack (delayLevel 3) -- along the whole chain the client must neither drop it nor deliver it twice.
+//!   B. **the redelivery really reaches the broker**: the pull loop of %RETRY%<group> is independent of the hung consume thread, so the message must
+//!      reappear in the local buffer, be delivered a second time, and carry reconsumeTimes=1 (broker-side count).
 //!
-//! 这条路径坏掉的样子是**静默**的：卡住的消息把该队列位点与分发循环一起钉死，没有任何异常
-//! 或超时可见，只能从「消息发了却永远不来第二次」反推。所以必须真机跑出「挂起 → 清扫 →
-//! 重投到达」的完整证据链，光靠「客户端不报错」什么都证明不了。
+//! When this path breaks it fails **silently**: the hung message pins the queue offset and the dispatch loop together, with no exception
+//! or timeout visible; it can only be inferred from "the message was sent but never arrives a second time". So the full evidence chain
+//! of "hang → sweep → redelivery arrives" must be produced on a real cluster; "the client reports no error" proves nothing.
 //!
 //!
-//! 用法：
+//! Usage:
 //! ```text
 //! cargo run --example live_clean_expired_msg -- 127.0.0.1:9876
 //! ```
-//! （约 4 分钟，等两个清扫周期）
+//! (about 4 minutes, waiting out two sweep cycles)
 
 use std::env;
 use std::process::ExitCode;
@@ -93,10 +93,10 @@ async fn poll_until(mut pred: impl FnMut() -> bool, secs: u64) -> bool {
     }
 }
 
-/// 第一次投递就挂住不返回；放行后恢复正常返回 CONSUME_SUCCESS。
+/// Hangs without returning on the first delivery; after release, returns CONSUME_SUCCESS normally.
 ///
-/// listener 在 `spawn_blocking` 线程上执行，这里用纯 std 的 Condvar 阻塞，
-/// 不会占用 tokio 运行时线程。
+/// The listener runs on a `spawn_blocking` thread; this blocks with a pure std Condvar,
+/// so no tokio runtime thread is occupied.
 struct HungListener {
     state: Mutex<HungState>,
     first_entered: Condvar,
@@ -106,7 +106,7 @@ struct HungListener {
 struct HungState {
     calls: usize,
     released: bool,
-    /// [(body, reconsumeTimes, 到达时刻)]
+    /// [(body, reconsumeTimes, arrival time)]
     arrivals: Vec<(String, i32, i64)>,
 }
 
@@ -149,7 +149,7 @@ impl HungListener {
         lock(&self.state).calls
     }
 
-    /// 某 body 的到达记录 [(reconsumeTimes, 时刻)]。
+    /// Arrival records of a given body [(reconsumeTimes, time)].
     fn times(&self, body: &str) -> Vec<(i32, i64)> {
         lock(&self.state)
             .arrivals
@@ -178,7 +178,7 @@ impl MessageListenerConcurrently for HungListener {
         if first {
             let mut s = lock(&self.state);
             self.first_entered.notify_all();
-            // 挂起窗口：等清扫动手 + 脚本放行（300s 上限兜底，防止脚本崩了卡死线程）
+            // Hang window: wait for the sweep to act + the script's release (300s cap as a fallback, in case the script crashes and would deadlock the thread)
             let deadline = Instant::now() + Duration::from_secs(300);
             while !s.released {
                 let now = Instant::now();
@@ -287,7 +287,7 @@ impl Fixture {
         Ok(())
     }
 
-    /// 已提交位点之和（本用例业务 topic 只有 1 个队列）；broker 查无记录按 -1 计。
+    /// Sum of committed offsets (in this case the business topic has only 1 queue); a missing broker record counts as -1.
     async fn committed_offset(&self, group: &str, topic: &str) -> Result<i64, String> {
         let queues = self.queues(topic).await;
         if queues.is_empty() {
@@ -316,11 +316,11 @@ async fn run(namesrv: &str) -> Checker {
     let fx = match Fixture::new(namesrv).await {
         Ok(fx) => fx,
         Err(e) => {
-            ck.check("集群探活", false, &e);
+            ck.check("cluster probe", false, &e);
             return ck;
         }
     };
-    ck.check("集群探活", true, &format!("broker={}", fx.broker_addr));
+    ck.check("cluster probe", true, &format!("broker={}", fx.broker_addr));
 
     let topic = fx.topic();
     let group = format!("GID_rust_live_ce_{}", fx.stamp);
@@ -363,7 +363,7 @@ async fn run(namesrv: &str) -> Checker {
 
     let body = format!("ce-rust-{}", fx.stamp);
 
-    // ---------- A0 业务队列（排除 %RETRY%） ----------
+    // ---------- A0 business queue (excluding %RETRY%) ----------
     let mut biz_key = String::new();
     let assigned = poll_until(
         || {
@@ -379,7 +379,7 @@ async fn run(namesrv: &str) -> Checker {
     )
     .await;
     ck.check(
-        "A0-业务队列已分配（%RETRY% 队列不算）",
+        "A0-business queue assigned (the %RETRY% queue does not count)",
         assigned,
         &format!("key={biz_key}"),
     );
@@ -390,7 +390,7 @@ async fn run(namesrv: &str) -> Checker {
         return ck;
     }
 
-    // ---------- A1 基线：第一投挂住 ----------
+    // ---------- A1 baseline: the first delivery hangs ----------
     let mut msg = Message::new(&topic, Some(body.as_bytes()));
     if let Err(e) = fx.producer.send(&mut msg, Some(20000), None).await {
         ck.check("A1 send", false, &format!("{e}"));
@@ -401,13 +401,13 @@ async fn run(namesrv: &str) -> Checker {
     }
     let first_ok = listener.wait_first(30);
     ck.check(
-        "A1-首投在 30s 内到达并挂住",
+        "A1-the first delivery arrives and hangs within 30s",
         first_ok,
         &format!("calls={}", listener.calls()),
     );
     let first = listener.times(&body);
     ck.check(
-        "A1-首投 reconsumeTimes=0",
+        "A1-first delivery has reconsumeTimes=0",
         first.first().is_some_and(|(n, _)| *n == 0),
         &format!(
             "times={}",
@@ -416,7 +416,7 @@ async fn run(namesrv: &str) -> Checker {
     );
     let entries = consumer.process_queue_entries(&biz_key);
     ck.check(
-        "A1-挂住期间消息登记在册（在 listener 手里）",
+        "A1-while hung the message stays registered (held by the listener)",
         contains_body(&entries, &body),
         &format!("entries={}", entries.len()),
     );
@@ -426,12 +426,12 @@ async fn run(namesrv: &str) -> Checker {
         .and_then(|m| m.get_property(PROPERTY_CONSUME_START_TIMESTAMP))
         .unwrap_or_default();
     ck.check(
-        "A1-在册副本带本轮 CONSUME_START_TIME（清扫靠它判过期）",
+        "A1-the registered copy carries this round's CONSUME_START_TIME (the sweep uses it to judge expiry)",
         !stamp_seen.is_empty(),
         &format!("stamp={stamp_seen}"),
     );
 
-    // ---------- A2 清扫命中：listener 还挂着，在册视图里已经没了 ----------
+    // ---------- A2 sweep hits: the listener is still hung and the registered view no longer has it ----------
     let t0 = Instant::now();
     let swept = poll_until(
         || !contains_body(&consumer.process_queue_entries(&biz_key), &body),
@@ -440,18 +440,18 @@ async fn run(namesrv: &str) -> Checker {
     .await;
     let elapsed = t0.elapsed().as_secs_f64();
     ck.check(
-        "A2-清扫在 listener 仍挂起时收走了这条消息（约 start+120s）",
+        "A2-the sweep takes the message away while the listener is still hung (around start+120s)",
         swept,
         &format!("elapsed={elapsed:.3}s calls={}", listener.calls()),
     );
     ck.check(
-        "A2-收走时间晚于一个清扫阈值（>60s，排除别的路径动手）",
+        "A2-the sweep time is later than one sweep threshold (>60s, ruling out another path acting)",
         elapsed > 60.0,
         &format!("elapsed={elapsed:.3}s"),
     );
 
-    // ---------- A3 回投真的到了 broker：%RETRY% 缓冲里出现 ----------
-    // 挂起的 listener 把分发循环占住，重投消息只能停在 %RETRY% 队列的本地缓冲里。
+    // ---------- A3 the send-back really reached the broker: it shows up in the %RETRY% buffer ----------
+    // The hung listener occupies the dispatch loop, so the redelivered message can only sit in the local buffer of the %RETRY% queue.
     let mut retry_key_found = String::new();
     let back = poll_until(
         || {
@@ -470,27 +470,27 @@ async fn run(namesrv: &str) -> Checker {
     )
     .await;
     ck.check(
-        &format!("A3-回投消息出现在 {retry_topic} 的本地缓冲（broker 真收到了 sendMessageBack）"),
+        &format!("A3-the sent-back message shows up in the local buffer of {retry_topic} (the broker really received sendMessageBack)"),
         back,
         &format!("retryKey={retry_key_found}"),
     );
 
-    // ---------- A4 放行：重投被重新消费 ----------
+    // ---------- A4 release: the redelivery is consumed again ----------
     listener.release();
     let second = poll_until(|| listener.times(&body).len() >= 2, 60).await;
     let times = listener.times(&body);
     ck.check(
-        "A4-放行后重新消费到（reconsumeTimes=1）",
+        "A4-after release it is consumed again (reconsumeTimes=1)",
         second,
         &format!("times={}", times.len()),
     );
     ck.check(
-        "A4-第二次投递 reconsumeTimes=1（broker 侧重投计数）",
+        "A4-the second delivery has reconsumeTimes=1 (broker-side redelivery count)",
         times.len() >= 2 && times[1].0 == 1,
         &format!("times={}", times.get(1).map(|(n, _)| *n).unwrap_or(-1)),
     );
     ck.check(
-        "A4-同一条 body 全程只到两次（清算一次回投，无重复投递）",
+        "A4-the same body arrives exactly twice in total (one settled send-back, no duplicate delivery)",
         times.len() == 2,
         &format!("times={}", times.len()),
     );
@@ -500,12 +500,12 @@ async fn run(namesrv: &str) -> Checker {
         -1
     };
     ck.check(
-        "A4-第二次投递与首投相隔 >60s（不是 listener 自己造成的重投）",
+        "A4-the second delivery is >60s after the first (not a redelivery caused by the listener itself)",
         gap_secs > 60,
         &format!("gap={gap_secs}s"),
     );
 
-    // ---------- A5 位点收尾 ----------
+    // ---------- A5 offset wrap-up ----------
     let mut committed = -2i64;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -521,16 +521,16 @@ async fn run(namesrv: &str) -> Checker {
         tokio::time::sleep(Duration::from_millis(1000)).await;
     }
     ck.check(
-        "A5-挂住的 listener 返回后业务队列位点走到 1（removeMessage 含已清扫条目）",
+        "A5-after the hung listener returns the business queue offset advances to 1 (removeMessage includes the swept entry)",
         committed == 1,
         &format!("offset={committed}"),
     );
 
-    // ---------------- 清理 ----------------
+    // ---------------- Cleanup ----------------
     listener.release();
     consumer.shutdown();
     if let Err(e) = fx.admin.delete_topic_in_broker(&fx.broker_addr, &topic, 5000).await {
-        println!("    (deleteTopic({topic}) 失败: {e})");
+        println!("    (deleteTopic({topic}) failed: {e})");
     } else {
         println!("    (deleteTopic({topic}) OK)");
     }

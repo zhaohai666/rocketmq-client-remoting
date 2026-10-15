@@ -15,7 +15,7 @@ FIELD = re.compile(r"public\s+static\s+final\s+int\s+([A-Z0-9_]+)\s*=\s*(-?\d+)\
 ENUM_ENTRY = re.compile(r"\s*([A-Z][A-Z0-9_]*)\(\s*\(?byte\)?\s*(-?\d+)\s*\)")
 
 pytestmark = pytest.mark.skipif(
-    not SERVER_SRC, reason="未设置 ROCKETMQ_SERVER_SRC，跳过与服务端协议源码的常量比对")
+    not SERVER_SRC, reason="ROCKETMQ_SERVER_SRC is not set, skipping the constant comparison against the server protocol source")
 
 
 def _reference_src_dir() -> Path:
@@ -33,26 +33,26 @@ def _reference_int_constants(filename: str) -> dict:
 
 def test_request_code_matches_the_reference_source():
     if not (Path(_reference_src_dir()) / "RequestCode.java").exists():
-        pytest.skip("未找到服务端协议的 RequestCode 定义")
+        pytest.skip("the server protocol's RequestCode definition was not found")
     reference = _reference_int_constants("RequestCode.java")
     bad = {k: (v, getattr(RequestCode, k, None)) for k, v in reference.items()
            if getattr(RequestCode, k, None) != v}
-    assert not bad, "RequestCode 与服务端协议源码不一致：%s" % bad
+    assert not bad, "RequestCode does not match the server protocol source: %s" % bad
 
 
 def test_response_code_matches_the_reference_source():
     if not (Path(_reference_src_dir()) / "ResponseCode.java").exists():
-        pytest.skip("未找到服务端协议的 ResponseCode 定义")
+        pytest.skip("the server protocol's ResponseCode definition was not found")
     reference = _reference_int_constants("ResponseCode.java")
     bad = {k: (v, getattr(ResponseCode, k, None)) for k, v in reference.items()
            if getattr(ResponseCode, k, None) != v}
-    assert not bad, "ResponseCode 与服务端协议源码不一致：%s" % bad
+    assert not bad, "ResponseCode does not match the server protocol source: %s" % bad
 
 
 def test_language_code_matches_the_reference_source():
     path = Path(_reference_src_dir()) / "LanguageCode.java"
     if not path.exists():
-        pytest.skip("未找到服务端协议的 LanguageCode 定义")
+        pytest.skip("the server protocol's LanguageCode definition was not found")
     bad = []
     for line in path.read_text(encoding="utf-8").splitlines():
         m = ENUM_ENTRY.match(line)
@@ -61,7 +61,7 @@ def test_language_code_matches_the_reference_source():
         name, value = m.group(1), int(m.group(2))
         if getattr(LanguageCode, name, None) != value:
             bad.append((name, value, getattr(LanguageCode, name, None)))
-    assert not bad, "LanguageCode 与服务端协议源码不一致：%s" % bad
+    assert not bad, "LanguageCode does not match the server protocol source: %s" % bad
 
 
 def test_serialize_type_values():

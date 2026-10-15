@@ -168,7 +168,7 @@ pub mod request_code {
     pub const DELETE_TOPIC_IN_BROKER_LIST: i32 = 5002;
     pub const DELETE_SUBSCRIPTION_GROUP_LIST: i32 = 5003;
 
-    /// 可读名字，日志与 `codes.h` 常量守卫测试用。
+    /// Readable names, for logging and for the constant guard tests.
     pub fn name_of(code: i32) -> Option<&'static str> {
         Some(match code {
             SEND_MESSAGE => "SEND_MESSAGE",
@@ -283,7 +283,7 @@ pub mod response_code {
     pub const USER_NOT_EXIST: i32 = 3001;
     pub const POLICY_NOT_EXIST: i32 = 3002;
 
-    // 客户端侧伪响应码
+    // Client-side pseudo response codes
     pub const RPC_UNKNOWN: i32 = -1000;
     pub const RPC_ADDR_IS_NULL: i32 = -1002;
     pub const RPC_SEND_TO_CHANNEL_FAILED: i32 = -1004;
@@ -326,7 +326,7 @@ pub mod language_code {
         })
     }
 
-    /// 5.x NameServer 会把 language 序列化成枚举名字符串。
+    /// 5.x NameServer serializes the language as the enum name string.
     pub fn name_to_code(name: &str) -> i32 {
         match name.to_ascii_uppercase().as_str() {
             "JAVA" => JAVA,

@@ -62,7 +62,7 @@ def _read_flag(admin: DefaultMQAdminExt, addr: str):
 
 
 class Collector(MessageListenerConcurrently):
-    """把消费到的 body 收进列表；撤回的语义要靠「到点没收到」判断，所以不能丢消息。"""
+    """Collect the consumed bodies into a list; the semantics of a recall have to be judged by "it never arrived when it should have", so no message may be dropped."""
 
     def __init__(self):
         self.bodies = []
@@ -88,14 +88,14 @@ def main() -> int:
     try:
         addr = _broker_addr(producer._require_client(), "127.0.0.1:10911")
         original = _read_flag(admin, addr)
-        check("R0 能读到 broker 的 %s" % CONFIG_KEY, original is not None, "value=%s" % original)
+        check("R0 the broker's %s is readable" % CONFIG_KEY, original is not None, "value=%s" % original)
         if original != "true":
-            check("R0 已临时打开 recallMessageEnable", _set_flag(admin, addr, "true"))
+            check("R0 recallMessageEnable was temporarily turned on", _set_flag(admin, addr, "true"))
         if _read_flag(admin, addr) != "true":
-            check("R0 recall 未在 broker 上开启，后续检查无意义", False)
+            check("R0 recall was not enabled on the broker, the remaining checks would be meaningless", False)
             return 1
 
-        # ---- R1/R2：定时消息才带句柄，且句柄内容与发送结果一致 ----
+        # ---- R1/R2 only a timer message carries a handle, and its content matches the send result ----
         to_recall = Message(TOPIC, b"to-recall")
         to_recall.put_property("TIMER_DELAY_SEC", str(DELAY_SEC))
         control = Message(TOPIC, b"control")
@@ -106,53 +106,53 @@ def main() -> int:
         r_control = producer.send(control)
         r_plain = producer.send(plain)
         handle = r_recall.recall_handle
-        check("R1 定时消息带回 recallHandle", bool(handle), "handle=%s" % handle)
-        check("R1 普通消息不带 recallHandle", r_plain.recall_handle is None)
-        check("R1 两条定时消息的句柄不同", handle is not None and r_control.recall_handle != handle)
+        check("R1 the timer message came back with a recallHandle", bool(handle), "handle=%s" % handle)
+        check("R1 the ordinary message carries no recallHandle", r_plain.recall_handle is None)
+        check("R1 the two timer messages have different handles", handle is not None and r_control.recall_handle != handle)
 
         parsed = None
         try:
             parsed = recall_message_handle.decode_handle(handle or "")
         except MQClientException as e:
-            check("R2 broker 的句柄能被我们的编解码器解开", False, str(e))
+            check("R2 the broker's handle can be decoded by our codec", False, str(e))
         if parsed is not None:
-            check("R2 broker 的句柄能被我们的编解码器解开", True)
-            check("R2 句柄里的 topic/brokerName 与发送目标一致",
+            check("R2 the broker's handle can be decoded by our codec", True)
+            check("R2 the topic/brokerName inside the handle match the send target",
                   parsed.topic == TOPIC and parsed.broker_name == BROKER,
                   "topic=%s broker=%s" % (parsed.topic, parsed.broker_name))
-            check("R2 句柄里的 uniqKey 就是这条消息的 UNIQ_KEY",
+            check("R2 the uniqKey inside the handle is exactly this message's UNIQ_KEY",
                   parsed.message_id == r_recall.msg_id,
                   "handle=%s send=%s" % (parsed.message_id, r_recall.msg_id))
 
-        # ---- R4/R5：本地校验必须在打网络之前跑完 ----
+        # ---- R4/R5 the local validation must complete before touching the network ----
         try:
             producer.recall_message("%%RETRY%%%s" % GROUP, handle or "")
-            check("R4 %RETRY% topic 被拒", False, "没有抛异常")
+            check("R4 a %RETRY% topic is rejected", False, "no exception was raised")
         except MQClientException as e:
-            check("R4 %RETRY% topic 被拒", str(e) == "topic is not supported", str(e))
+            check("R4 a %RETRY% topic is rejected", str(e) == "topic is not supported", str(e))
         began = time.monotonic()
         try:
             producer.recall_message(TOPIC, "not-a-handle")
-            check("R5 非法句柄本地即拒", False, "没有抛异常")
+            check("R5 an illegal handle is rejected locally", False, "no exception was raised")
         except MQClientException as e:
             cost = time.monotonic() - began
-            check("R5 非法句柄本地即拒",
+            check("R5 an illegal handle is rejected locally",
                   str(e) == "recall handle is invalid" and cost < 0.2,
                   "%s (%.3fs)" % (e, cost))
 
-        # ---- R3/R6：真的撤掉了，且没牵连对照消息 ----
+        # ---- R3/R6 it really got recalled, and the control messages were not dragged along ----
         try:
             recalled_id = producer.recall_message(TOPIC, handle)
-            check("R3 recall_message 返回被撤回消息的 uniqKey",
+            check("R3 recall_message returns the uniqKey of the recalled message",
                   recalled_id == r_recall.msg_id, "resp=%s send=%s" % (recalled_id, r_recall.msg_id))
         except Exception as e:  # noqa: BLE001
-            check("R3 recall_message 返回被撤回消息的 uniqKey", False, repr(e))
+            check("R3 recall_message returns the uniqKey of the recalled message", False, repr(e))
 
         got = _consume_for(DELAY_SEC + 20)
         bodies = set(got)
-        check("R6 对照定时消息按时投递", b"control" in bodies, "got=%s" % sorted(bodies))
-        check("R6 普通消息已投递", b"plain" in bodies)
-        check("R6 被撤回的定时消息永远没投递", b"to-recall" not in bodies,
+        check("R6 the control timer message was delivered on time", b"control" in bodies, "got=%s" % sorted(bodies))
+        check("R6 the ordinary message was delivered", b"plain" in bodies)
+        check("R6 the recalled timer message was never delivered", b"to-recall" not in bodies,
               "got=%s" % sorted(bodies))
     finally:
         restored = False
@@ -163,7 +163,7 @@ def main() -> int:
                 restored = _read_flag(admin, addr) == original
             except Exception as e:  # noqa: BLE001
                 print("  [diag] restore failed: %s" % e)
-        check("R7 broker 的 recallMessageEnable 已还原为 %s" % original, restored)
+        check("R7 the broker's recallMessageEnable was restored to %s" % original, restored)
         admin.shutdown()
         producer.shutdown()
 
@@ -172,10 +172,11 @@ def main() -> int:
 
 
 def _consume_for(window_sec: int):
-    """从 0 位点收满一个时间窗，返回收到的 body 列表。
+    """Consume from offset 0 for one full time window and return the list of received bodies.
 
-    窗口必须 > 延迟：对照消息要等到点才出现，被撤回的那条则要「整个窗口都不出现」
-    才算撤回成功。
+    The window must be longer than the delay: the control message only shows up once its time
+    comes, while the recalled one has to be "absent for the whole window" for the recall to
+    count as successful.
     """
     received = Collector()
     consumer = DefaultMQPushConsumer(GROUP + "_c")

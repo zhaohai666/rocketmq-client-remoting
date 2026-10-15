@@ -14,16 +14,19 @@ use RocketMQ\Remoting\Protocol\ResponseCode;
 use RocketMQ\Remoting\Protocol\RocketMQSerializable;
 
 /**
- * socket 长连接客户端：与 NameServer / broker 之间的 remoting 帧收发。
+ * Persistent-socket client: remoting frame send/receive with the NameServer / broker.
  *
- * 提供：连接管理（惰性建连 + 复用 + 关闭回收）、invokeSync/invokeAsync/invokeOneway、
- * opaque 映射回调分发、超时控制、GO_AWAY 换连接重发、
- * 连接断开时立刻失败该连接上的在途请求（failFast）。
+ * Provides: connection management (lazy connect + reuse + close recycling), invokeSync /
+ * invokeAsync / invokeOneway, opaque-mapped callback dispatch, timeout control, GO_AWAY
+ * reconnect-and-resend, and immediate failure of in-flight requests on a broken connection
+ * (failFast).
  *
- * PHP 无线程（见 php/PORTING.md 异步模型）：
- *  - ``invokeAsync`` = 注册 pending 表（opaque → PendingResponse）+ 非阻塞写，立即返回；
- *  - ``waitResponses(timeout)`` 用 ``stream_select`` 泵响应并分发回调、清理超时；
- *  - ``invokeSync`` 内部泵到完成（同一套收帧路径）。
+ * PHP has no threads (see php/PORTING.md for the async model):
+ *  - ``invokeAsync`` = register the pending table (opaque -> PendingResponse) + non-blocking
+ *    write, returning immediately;
+ *  - ``waitResponses(timeout)`` pumps responses with ``stream_select``, dispatches callbacks and
+ *    sweeps timeouts;
+ *  - ``invokeSync`` pumps internally until done (same frame-receive path).
  */
 final class RemotingClient
 {
@@ -32,21 +35,23 @@ final class RemotingClient
     private int $connectTimeoutMillis;
     private int $invokeTimeoutMillis;
 
-    /** 默认 **true**：收到 broker 的 ResponseCode.GO_AWAY(1500) 时换一条连接重发一次；
-     * 关掉则直接把 GO_AWAY 当发送失败报错。 */
+    /** Defaults to **true**: on broker ResponseCode.GO_AWAY(1500), resend once over a new
+     * connection; when disabled, GO_AWAY is reported directly as a send failure. */
     private bool $enableReconnectForGoAway;
 
-    /** 是否用 TLS 连 broker。显式构造参数优先，否则读环境变量
-     * ROCKETMQ_TLS_ENABLE（本端没有运行时系统属性，env 是唯一的开关入口）。 */
+    /** Whether to connect to the broker over TLS. The explicit constructor argument wins,
+     * otherwise the ROCKETMQ_TLS_ENABLE environment variable is read (this port has no runtime
+     * system properties; env is the only switch entry). */
     private bool $tlsEnable;
 
     /**
-     * TLS 细项（键均可选，取值都是本机文件路径）：
-     *   - caCert:     CA 证书路径。给了就**真校验** broker 证书链 + 主机名
-     *                 （严格模式）；不给则信任自签（宽松模式，默认）。
-     *   - clientCert: 客户端证书路径（broker 开双向认证时必须提供）。
-     *   - clientKey:  客户端私钥路径（cert 内含私钥时可省）。
-     *   - serverName: SNI/主机名校验覆盖（默认用连接地址的 host）。
+     * TLS details (all keys optional; values are local file paths):
+     *   - caCert:     CA certificate path. When given, the broker certificate chain and hostname
+     *                 are **truly verified** (strict mode); when absent, self-signed certs are
+     *                 trusted (permissive mode, the default).
+     *   - clientCert: client certificate path (required when the broker enables mutual TLS).
+     *   - clientKey:  client private key path (may be omitted when the cert embeds the key).
+     *   - serverName: SNI/hostname verification override (defaults to the host of the connect address).
      *
      * @var array{caCert?:string, clientCert?:string, clientKey?:string, serverName?:string}
      */
@@ -56,27 +61,27 @@ final class RemotingClient
 
     private bool $closed = false;
 
-    /** @var array<string, resource> addr → 连接 */
+    /** @var array<string, resource> addr -> connection */
     private array $conns = [];
 
-    /** @var array<string, string> addr → 未凑满整帧的接收缓冲 */
+    /** @var array<string, string> addr -> receive buffer holding an incomplete frame */
     private array $inBuffers = [];
 
-    /** @var array<int, PendingResponse> opaque → 在途请求 */
+    /** @var array<int, PendingResponse> opaque -> in-flight request */
     private array $pending = [];
 
-    /** @var array<int, callable(RemotingCommand, string): ?RemotingCommand> broker 主动请求处理器 */
+    /** @var array<int, callable(RemotingCommand, string): ?RemotingCommand> broker-initiated request handlers */
     private array $processors = [];
 
     /** @var list<RPCHook> */
     private array $rpcHooks = [];
 
-    /** @var list<string> namesrv 地址表（轮询/故障切换） */
+    /** @var list<string> namesrv address list (round-robin / failover) */
     private array $nameServerList = [];
     private int $nameServerIndex = 0;
 
     /**
-     * @param list<string>|null $nameServers 初始 namesrv 地址（也可后置 updateNameServerAddressList）
+     * @param list<string>|null $nameServers initial namesrv addresses (may also be set later via updateNameServerAddressList)
      */
     public function __construct(
         int $connectTimeoutMillis = 3000,
@@ -101,15 +106,17 @@ final class RemotingClient
         }
     }
 
-    /** 超时判定专用单调时钟毫秒：不受系统时间回拨影响，比 wall clock 稳。 */
+    /** Monotonic clock in milliseconds, dedicated to timeout decisions: immune to system clock
+     * steps, steadier than wall clock. */
     public static function monoMillis(): float
     {
         return hrtime(true) / 1e6;
     }
 
-    // ---------- 连接管理 ----------
+    // ---------- Connection management ----------
 
-    /** 设置/清除 SOCKS 代理（null 清除）。只在**下一次建连**时生效，已建连接不受影响。 */
+    /** Sets/clears the SOCKS proxy (null clears). Takes effect only on the **next connect**;
+     * existing connections are unaffected. */
     public function setSocksProxy(?SocksProxyConfig $proxy): void
     {
         $this->socksProxy = $proxy;
@@ -143,8 +150,9 @@ final class RemotingClient
         [$host, $port] = self::parseAddr($addr);
         $ctx = stream_context_create([
             'ssl' => [
-                // 建连阶段的默认口径（宽松模式）：信任 broker 的自签证书、
-                // 不校验主机名、不带客户端证书（PERMISSIVE broker 即配即通）。
+                // Defaults for the connect phase (permissive mode): trust the broker's
+                // self-signed certificate, skip hostname verification, present no client
+                // certificate (works out of the box against a PERMISSIVE broker).
                 'verify_peer' => false,
                 'verify_peer_name' => false,
                 'allow_self_signed' => true,
@@ -187,11 +195,12 @@ final class RemotingClient
             }
         }
         if ($this->tlsEnable) {
-            // TLS 必须包住整个流、在任何 RocketMQ 帧之前完成握手（broker 侧也是
-            // 这个层次）。这里先建 plain socket 再 enable_crypto，握手后帧格式不变。
+            // TLS must wrap the entire stream and complete its handshake before any RocketMQ
+            // frame (the broker side lives at the same layer). We build the plain socket first,
+            // then enable_crypto; the frame format is unchanged after the handshake.
             $caCert = $this->tlsOptions['caCert'] ?? null;
             if ($caCert !== null && $caCert !== '') {
-                // 有 CA ⇒ 严格模式，真校验：证书链 + 主机名。
+                // With a CA => strict mode, real verification: certificate chain + hostname.
                 stream_context_set_option($conn, 'ssl', 'verify_peer', true);
                 stream_context_set_option($conn, 'ssl', 'verify_peer_name', true);
                 stream_context_set_option($conn, 'ssl', 'allow_self_signed', false);
@@ -201,16 +210,17 @@ final class RemotingClient
                     stream_context_set_option($conn, 'ssl', 'peer_name', $serverName);
                 }
             } else {
-                // 宽松模式（默认口径）：信任 broker 的自签证书、
-                // 不校验主机名、不带客户端证书（PERMISSIVE broker 即配即通）。
+                // Permissive mode (the default): trust the broker's self-signed certificate,
+                // skip hostname verification, present no client certificate (works out of the
+                // box against a PERMISSIVE broker).
                 stream_context_set_option($conn, 'ssl', 'verify_peer', false);
                 stream_context_set_option($conn, 'ssl', 'verify_peer_name', false);
                 stream_context_set_option($conn, 'ssl', 'allow_self_signed', true);
             }
             $clientCert = $this->tlsOptions['clientCert'] ?? null;
             if ($clientCert !== null && $clientCert !== '') {
-                // mTLS：broker 开启双向认证时会在握手阶段要求客户端出示证书，
-                // 缺证书直接握手失败。
+                // mTLS: a broker with mutual authentication enabled demands a client certificate
+                // during the handshake; missing it fails the handshake outright.
                 stream_context_set_option($conn, 'ssl', 'local_cert', $clientCert);
                 $clientKey = $this->tlsOptions['clientKey'] ?? null;
                 if ($clientKey !== null && $clientKey !== '') {
@@ -225,14 +235,14 @@ final class RemotingClient
             }
         }
         stream_set_blocking($conn, false);
-        // TCP_NODELAY（尽力而为：ext-sockets 可用才设置）
+        // TCP_NODELAY (best effort: set only when ext-sockets is available)
         if (function_exists('socket_set_option') && defined('IPPROTO_TCP') && defined('TCP_NODELAY')) {
             @socket_set_option($conn, IPPROTO_TCP, TCP_NODELAY, 1);
         }
         return $conn;
     }
 
-    /** @return array{0: string, 1: string} [host, port]（IPv6 字面量 ``[::1]:9876`` 兼容） */
+    /** @return array{0: string, 1: string} [host, port] (compatible with IPv6 literals ``[::1]:9876``) */
     public static function parseAddr(string $addr): array
     {
         if (str_starts_with($addr, '[')) {
@@ -252,8 +262,9 @@ final class RemotingClient
     }
 
     /**
-     * 摘掉到 addr 的连接：先从连接表里去掉，再关闭套接字。
-     * 在途请求立即按发送失败处理（PHP 没有独立读线程，failFast 就挂在关闭点上做）。
+     * Tears down the connection to addr: remove it from the connection table first, then close
+     * the socket. In-flight requests fail immediately as send failures (PHP has no dedicated read
+     * thread, so failFast hangs off the close point).
      */
     public function closeChannel(string $addr): void
     {
@@ -274,14 +285,14 @@ final class RemotingClient
         return $conn !== null && is_resource($conn);
     }
 
-    // ---------- RPC 钩子 ----------
+    // ---------- RPC hooks ----------
 
     /**
-     * 发送前依次执行 RPC 钩子。
+     * Runs the RPC hooks in order before sending.
      *
-     * **必须在 cmd.encode() 之前调用**：ACL 钩子要把 AccessKey/Signature 写进
-     * ext_fields，而 Signature 覆盖的是 makeCustomHeaderToNet() 之后的完整
-     * ext_fields + body —— 即真正会上线的那份内容。encode() 之后再注入就晚了。
+     * **Must be called before cmd.encode()**: the ACL hook writes AccessKey/Signature into
+     * ext_fields, and Signature covers the full ext_fields + body after makeCustomHeaderToNet()
+     * — i.e. the exact content that goes on the wire. Injecting after encode() is too late.
      */
     private function applyBeforeRequestHooks(string $addr, RemotingCommand $cmd): void
     {
@@ -299,7 +310,7 @@ final class RemotingClient
             try {
                 $hook->doAfterResponse($addr, $request, $response);
             } catch (\Throwable) {
-                // 忽略钩子异常，不影响响应分发
+                // Ignore hook exceptions; they must not affect response dispatch
             }
         }
     }
@@ -319,11 +330,12 @@ final class RemotingClient
         $this->rpcHooks = array_values($this->rpcHooks);
     }
 
-    // ---------- 请求发送 ----------
+    // ---------- Request sending ----------
 
     /**
-     * 把命令写到连接上（钩子 → encode → 全量写出）。
-     * 返回所用的连接资源（记账用：failFast 按资源身份认领在途请求）。
+     * Writes the command onto the connection (hooks -> encode -> full write).
+     * Returns the connection resource used (for bookkeeping: failFast claims in-flight requests
+     * by resource identity).
      *
      * @return resource
      */
@@ -364,7 +376,7 @@ final class RemotingClient
             }
             $chunk = @fwrite($conn, substr($data, $written));
             if ($chunk === false || $chunk === 0) {
-                // 非阻塞下 0 字节可能是缓冲瞬时满，靠 deadline 兜底
+                // On non-blocking sockets 0 bytes may be a momentarily full buffer; the deadline is the backstop
                 if (feof($conn)) {
                     throw new \RuntimeException('connection closed on write');
                 }
@@ -375,11 +387,12 @@ final class RemotingClient
     }
 
     /**
-     * 把响应写回 broker。
+     * Writes a response back to the broker.
      *
-     * **不能**走 send()：send() 会执行 RPC 钩子（ACL 会给请求加签），而响应报文
-     * 不需要也不能带签名。写失败只记日志：这条响应对应 broker 侧
-     * ``Broker2Client.callClient`` 超时，不该让收帧路径因此中断。
+     * Must **not** go through send(): send() runs the RPC hooks (ACL signs requests), and a
+     * response must not and does not carry a signature. Write failures are only logged: this
+     * response corresponds to a broker-side ``Broker2Client.callClient`` timeout, and the frame
+     * receive path must not be broken because of it.
      */
     private function writeResponse(string $addr, RemotingCommand $cmd): void
     {
@@ -391,9 +404,9 @@ final class RemotingClient
         }
     }
 
-    // ---------- 同步 RPC ----------
+    // ---------- Synchronous RPC ----------
 
-    /** 同步 RPC：等响应、判超时，含 GO_AWAY 换连接重发。 */
+    /** Synchronous RPC: wait for the response, judge timeout, including GO_AWAY reconnect-and-resend. */
     public function invokeSync(string $addr, RemotingCommand $request, ?int $timeoutMillis = null): RemotingCommand
     {
         $timeout = $timeoutMillis ?? $this->invokeTimeoutMillis;
@@ -406,8 +419,9 @@ final class RemotingClient
     }
 
     /**
-     * GO_AWAY 的收口：开关关掉直接报错；否则换连接重发一次，第二次还是 GO_AWAY 就抛。
-     * 同步与异步两条路共用同一套判定，重发次数也必须一样（一次）。
+     * The GO_AWAY settlement: with the switch off, error out directly; otherwise reconnect and
+     * resend once — a second GO_AWAY throws. The sync and async paths share the same rule, and
+     * the resend count must match too (once).
      */
     private function handleGoAway(string $addr, RemotingCommand $request, int $timeout, float $started, RemotingCommand $response): RemotingCommand
     {
@@ -416,7 +430,8 @@ final class RemotingClient
         }
         Logger::info("remoting: receive GO_AWAY from {$addr}, reconnect and retry once");
         $this->closeChannel($addr);
-        // 重发只花剩余预算：总超时从首次发出前起算，一次重发不能让预算翻倍。
+        // The resend only spends the remaining budget: the total timeout is counted from before
+        // the first send, and one resend must not double the budget.
         $spent = (int)(self::monoMillis() - $started);
         $retryTimeout = max(1, $timeout - $spent);
         $retry = self::retryRequest($request);
@@ -428,11 +443,13 @@ final class RemotingClient
     }
 
     /**
-     * GO_AWAY 重发用的请求副本：照抄 code / 头部 / body，只换 opaque。
+     * A copy of the request for GO_AWAY resend: same code / header / body, only the opaque changes.
      *
-     * 必须是**新** opaque：旧的那条已经在途表里摘掉了，复用会让响应错配到别的请求。
-     * ext_fields 按值复制——ACL 签名（AccessKey/Signature）就存在这里，重发要带原签名，
-     * 所以副本不能从 custom_header 重新推导（推导会丢掉签名那两项）。
+     * The opaque must be **new**: the old entry was already removed from the in-flight table, and
+     * reusing it would misroute the response to another request.
+     * ext_fields is copied by value — the ACL signature (AccessKey/Signature) lives there, and
+     * the resend must carry the original signature, so the copy must not be re-derived from
+     * custom_header (deriving loses those two entries).
      */
     private static function retryRequest(RemotingCommand $request): RemotingCommand
     {
@@ -463,25 +480,28 @@ final class RemotingClient
             return $future->response;
         }
         unset($this->pending[$request->opaque]);
-        // 连接断掉时 failFast 已经置好 cause 并唤醒了我：这里按"发送失败"收口，
-        // 而不是等满 timeout 再报超时。两条路的可重试性不一样（见 producer 的重试分类）。
+        // When the connection dropped, failFast already set the cause and woke me: settle here
+        // as a "send failure" instead of waiting out the full timeout and reporting a timeout.
+        // The two paths differ in retryability (see the producer's retry classification).
         if ($future->cause !== null) {
             throw $future->cause;
         }
         throw new RemotingTimeoutException($addr, $timeout);
     }
 
-    // ---------- 异步 RPC ----------
+    // ---------- Asynchronous RPC ----------
 
     /**
-     * 异步调用：注册 pending 表 + 非阻塞写后**立即返回**（见 php/PORTING.md 异步模型）。
-     * 调用方随后用 waitResponses() 泵；Producer 的 asyncSend 会在回调注册后内部泵到完成。
+     * Asynchronous invocation: register the pending table + non-blocking write, then **return
+     * immediately** (see php/PORTING.md for the async model). The caller pumps with
+     * waitResponses() afterwards; Producer's asyncSend pumps internally to completion after the
+     * callbacks are registered.
      *
-     * 回调契约（成功 / 失败二分，二者互斥）：
-     *  - 正常收到响应 → ``onSuccess(response)``
-     *  - 超过 timeout 仍无响应 → ``onFailure(RemotingTimeoutException)``
-     *  - 连接在响应之前断开 → ``onFailure(RemotingSendRequestException)``（failFast）
-     * 回调**恰好触发一次**（done 标志定胜负）。
+     * Callback contract (success / failure dichotomy, mutually exclusive):
+     *  - response received normally -> ``onSuccess(response)``
+     *  - no response past timeout -> ``onFailure(RemotingTimeoutException)``
+     *  - connection broken before the response -> ``onFailure(RemotingSendRequestException)`` (failFast)
+     * Each callback fires **exactly once** (the done flag decides).
      */
     public function invokeAsync(string $addr, RemotingCommand $request, ?\Closure $onSuccess, ?\Closure $onFailure, ?int $timeoutMillis = null): void
     {
@@ -497,8 +517,9 @@ final class RemotingClient
     }
 
     /**
-     * 泵所有在途请求直到 pending 表空或超时。
-     * 本端没有 IO 线程：收帧、回调分发与超时清理都由这次调用驱动。
+     * Pumps all in-flight requests until the pending table empties or the timeout hits.
+     * This port has no IO thread: frame reception, callback dispatch and timeout sweeping are all
+     * driven by this call.
      */
     public function waitResponses(int $timeoutMillis): void
     {
@@ -514,7 +535,7 @@ final class RemotingClient
             }
             $watch = $this->watchableConns();
             if ($watch === []) {
-                // 没有可等连接（连接已被 failFast 关闭等）：短暂让路，等超时清理收口
+                // No waitable connection (already closed by failFast etc.): yield briefly and let timeout sweeping settle
                 usleep(5000);
                 continue;
             }
@@ -540,7 +561,7 @@ final class RemotingClient
         $this->sweepExpired();
     }
 
-    /** @return array<string, resource> addr → conn（只收在途请求绑定的连接） */
+    /** @return array<string, resource> addr -> conn (only connections bound to in-flight requests) */
     private function watchableConns(): array
     {
         $watch = [];
@@ -553,14 +574,16 @@ final class RemotingClient
     }
 
     /**
-     * 泵**所有**连接上的入站帧 —— 与 waitResponses 的区别：不要求连接上有在途请求。
+     * Pumps inbound frames on **all** connections — the difference from waitResponses: it does
+     * not require the connection to carry in-flight requests.
      *
-     * Request-Reply 的等待期正是这种场景：发送早已完成（pending 已清空），
-     * 但 broker 会经 PUSH_REPLY_MESSAGE_TO_CLIENT(326) 把应答**主动推**回来。
-     * 只盯 pending 连接的 waitResponses 在 pending 清空后立即返回，推回的应答
-     * 一直压在内核缓冲区里读不到 —— 实测 broker 侧 callClient 因此超时报
-     * "push reply message to ... fail"，请求方则要到下一次发送才顺带读出，
-     * 那时 future 早已超时摘槽（"not matched any request"）。
+     * The Request-Reply waiting period is exactly this scenario: the send long since completed
+     * (pending emptied), but the broker **pushes** the reply back via
+     * PUSH_REPLY_MESSAGE_TO_CLIENT(326). waitResponses, which only watches pending connections,
+     * returns right after pending empties, and the pushed reply keeps sitting in the kernel
+     * buffer unread — measured on a live cluster, the broker-side callClient then times out with
+     * "push reply message to ... fail", while the requester only reads it on the next send, by
+     * which time the future has long been swept for timeout ("not matched any request").
      */
     public function pumpIncoming(int $timeoutMillis): void
     {
@@ -610,7 +633,7 @@ final class RemotingClient
         return null;
     }
 
-    /** 同步路径专用：泵到该 future 收到响应 / 失败 / 超时。 */
+    /** Sync path only: pump until this future gets a response / fails / times out. */
     private function pumpForFuture(PendingResponse $future, int $timeoutMillis): void
     {
         $deadline = self::monoMillis() + $timeoutMillis;
@@ -638,32 +661,36 @@ final class RemotingClient
         }
     }
 
-    // ---------- 收帧 ----------
+    // ---------- Frame reception ----------
 
     /**
-     * 从连接读一段数据并尽量凑帧分发。
-     * 返回 false 表示连接已 EOF/损坏（future 已被 failFast 标记）。
+     * Reads one chunk from the connection and dispatches frames as far as they assemble.
+     * Returning false means the connection is EOF/broken (the future has been marked by failFast).
      */
     private function readFrom(string $addr, $conn): bool
     {
         $chunk = @fread($conn, 65536);
         if ($chunk === false || $chunk === '') {
-            // ⚠ Windows 上实测：对端 close 后 stream_select 会一直报 readable，而 fread 返回
-            // **false**（不是空串），此时 feof() 为 true。早先只把空串当 EOF，false 被当成
-            // "暂时无数据"，结果收帧循环空转到超时才收口（本该立刻 failFast）。
-            // 反过来，非阻塞读的瞬时失败（TLS 握手/解密抖动）也不能当死连接，故以 feof 定夺。
+            // WARNING, measured on Windows: after the peer closes, stream_select keeps reporting
+            // readable while fread returns **false** (not an empty string), with feof() true.
+            // Earlier code treated only an empty string as EOF and false as "no data for now",
+            // so the receive loop spun until timeout before settling (it should have failFasted
+            // immediately). Conversely, a transient failure of a non-blocking read (TLS
+            // handshake/decryption jitter) must not be treated as a dead connection either —
+            // hence feof decides.
             if (feof($conn)) {
-                // 对端关了：立刻 failFast，判死这条连接上的在途请求
+                // The peer closed: failFast immediately, dooming the in-flight requests on this connection
                 $this->closeChannel($addr);
                 return false;
             }
-            return true; // 非阻塞下暂时无数据
+            return true; // no data for now on a non-blocking socket
         }
         $buf = ($this->inBuffers[$addr] ?? '') . $chunk;
         while (strlen($buf) >= 4) {
             $totalLen = RocketMQSerializable::unpackSignedInt(substr($buf, 0, 4));
             if ($totalLen <= 0 || $totalLen > self::MAX_FRAME_LENGTH) {
-                // 长度字段不可信说明流已坏：丢弃整个缓冲，不试图重新对齐帧边界
+                // An untrustworthy length field means the stream is corrupt: drop the whole buffer,
+                // do not try to realign frame boundaries
                 $buf = '';
                 break;
             }
@@ -672,7 +699,7 @@ final class RemotingClient
             }
             $frame = substr($buf, 0, 4 + $totalLen);
             $buf = substr($buf, 4 + $totalLen);
-            // dispatch 可能 closeChannel（GO_AWAY / 写响应失败），先确认连接还活着
+            // dispatch may closeChannel (GO_AWAY / failed response write); confirm the connection is still alive first
             if (!is_resource($conn) || ($this->conns[$addr] ?? null) !== $conn) {
                 break;
             }
@@ -684,7 +711,7 @@ final class RemotingClient
         return true;
     }
 
-    /** 收帧分发（public 供测试/上层注入帧使用）。 */
+    /** Frame dispatch (public so tests/upper layers can inject frames). */
     public function dispatchFrame(string $frame, string $addr): void
     {
         try {
@@ -696,7 +723,8 @@ final class RemotingClient
             $this->deliverResponse($cmd, $addr);
             return;
         }
-        // 非响应命令：先按「本应是对端响应却没带响应标志」兜底，再按 broker 主动请求处理。
+        // Non-response command: fall back to "should have been the peer's response but lacks the
+        // response flag" first, then handle as a broker-initiated request.
         if (isset($this->pending[$cmd->opaque])) {
             $this->deliverResponse($cmd, $addr);
             return;
@@ -706,8 +734,10 @@ final class RemotingClient
             Logger::debug(sprintf('no processor registered for request code %s (opaque=%s) from %s', $cmd->code, $cmd->opaque, $addr));
             return;
         }
-        // 处理器**可以**返回一个响应命令，返回的会按请求 opaque 写回对端。
-        // 需要返回的典型是 PUSH_REPLY_MESSAGE_TO_CLIENT(326)。事务回查 39 是 oneway，返回 null 即可。
+        // The handler **may** return a response command; whatever it returns is written back to
+        // the peer under the request's opaque.
+        // The typical responder is PUSH_REPLY_MESSAGE_TO_CLIENT(326). Transaction check 39 is
+        // oneway; returning null suffices.
         try {
             $response = $handler($cmd, $addr);
         } catch (\Throwable $e) {
@@ -729,7 +759,8 @@ final class RemotingClient
         unset($this->pending[$cmd->opaque]);
         $this->applyAfterResponseHooks($addr, $future->request, $cmd);
 
-        // GO_AWAY 与同步路径同口径：换连接重发一次，第二次仍是 GO_AWAY 则回调报错。
+        // GO_AWAY follows the same rule as the sync path: reconnect and resend once; a second
+        // GO_AWAY reports the error via callback.
         if ($cmd->code === ResponseCode::GO_AWAY
             && !$future->goAwayRetried
             && $this->enableReconnectForGoAway) {
@@ -756,18 +787,20 @@ final class RemotingClient
             try {
                 ($future->onSuccess)($cmd);
             } catch (\Throwable $e) {
-                // 回调里抛出的异常不能带走收帧路径：只记日志，其余在途请求照常收
+                // An exception thrown inside a callback must not take down the frame receive
+                // path: log it and keep receiving the remaining in-flight requests.
                 Logger::warning('remoting: invoke callback raised: ' . $e->getMessage());
             }
         }
     }
 
-    // ---------- 在途请求超时清理 ----------
+    // ---------- In-flight request timeout sweep ----------
 
     private function sweepExpired(): void
     {
-        // 判定式：beginAt + timeoutMillis + 1000 <= now。这 1s 宽限是给
-        // "响应已经在路上"留的余量——超时后 1s 内到达的响应仍按成功投递。
+        // Predicate: beginAt + timeoutMillis + 1000 <= now. The 1s grace is headroom for
+        // "the response is already on its way" — a response arriving within 1s after timeout is
+        // still delivered as success.
         $graceMillis = 1000.0;
         $now = self::monoMillis();
         foreach ($this->pending as $opaque => $f) {
@@ -779,14 +812,17 @@ final class RemotingClient
         }
     }
 
-    // ---------- 连接断开时立刻失败在途请求（failFast） ----------
+    // ---------- Fail in-flight requests immediately on disconnect (failFast) ----------
 
     /**
-     * ``conn`` 这条连接已经关了：把它名下还没响应的在途请求全部判为发送失败。
+     * The connection ``conn`` is already closed: doom all of its in-flight requests that have no
+     * response yet as send failures.
      *
-     * 这里报 RemotingSendRequestException（不是超时），异步发送的重试分类按异常类型分流，
-     * 错类型等于错语义。按连接**资源身份**认领，不按地址：同地址可能已经换了新连接
-     * （GO_AWAY 换连接重发、写失败后的 closeChannel），旧收尾不能误伤新连接。
+     * RemotingSendRequestException is raised here (not a timeout) — the async send retry
+     * classification branches on the exception type, and a wrong type means wrong semantics.
+     * Requests are claimed by connection **resource identity**, not by address: the same address
+     * may already have a new connection (GO_AWAY reconnect-and-resend, closeChannel after a write
+     * failure), and the old settlement must not hurt the new connection.
      */
     private function failFast(string $addr, $conn): int
     {
@@ -828,14 +864,15 @@ final class RemotingClient
         $this->send($addr, $request);
     }
 
-    // ---------- broker 主动请求处理器 ----------
+    // ---------- Broker-initiated request handlers ----------
 
     /**
-     * 注册 broker 主动请求处理器：按 requestCode 建一张分发表。
+     * Registers a broker-initiated request handler: a dispatch table keyed by requestCode.
      *
-     * handler 签名 ``handler(cmd, addr) -> ?RemotingCommand``：**返回非 null 就会把该命令
-     * 作为响应写回**（opaque 由框架填成请求的 opaque），返回 null 表示不需要响应
-     * （oneway 请求，如事务回查 CHECK_TRANSACTION_STATE(39)）。
+     * The handler signature is ``handler(cmd, addr) -> ?RemotingCommand``: returning non-null
+     * writes that command back as the response (the framework fills opaque with the request's
+     * opaque); returning null means no response is needed (oneway requests, such as the
+     * transaction check CHECK_TRANSACTION_STATE(39)).
      */
     public function registerProcessor(int $requestCode, callable $handler): void
     {
@@ -847,7 +884,7 @@ final class RemotingClient
         unset($this->processors[$requestCode]);
     }
 
-    // ---------- namesrv 地址管理（轮询/故障切换） ----------
+    // ---------- namesrv address management (round-robin / failover) ----------
 
     public function updateNameServerAddressList(array $addrs): void
     {
@@ -863,7 +900,7 @@ final class RemotingClient
         return $this->nameServerList;
     }
 
-    /** 轮询取一个 namesrv，每次往后移一位；列表为空返回 null，由调用方决定如何报错。 */
+    /** Round-robins one namesrv, advancing the cursor each call; returns null on an empty list, leaving error reporting to the caller. */
     public function chooseNameServer(): ?string
     {
         if ($this->nameServerList === []) {
@@ -874,7 +911,7 @@ final class RemotingClient
         return $addr;
     }
 
-    // ---------- 收尾 ----------
+    // ---------- Shutdown ----------
 
     public function shutdown(): void
     {
@@ -895,14 +932,14 @@ final class RemotingClient
 }
 
 /**
- * 一次在途请求的等待槽。
+ * The wait slot of one in-flight request.
  *
- * 同步等待方读 ``response`` / ``cause``；异步方通过 ``onSuccess`` / ``onFailure``
- * 回调（恰好触发一次，``done`` 标志定胜负）。
+ * A synchronous waiter reads ``response`` / ``cause``; an async waiter relies on the
+ * ``onSuccess`` / ``onFailure`` callbacks (fired exactly once; the ``done`` flag decides).
  */
 final class PendingResponse
 {
-    /** @var resource|null 请求真正写出去时所用的连接（failFast 按资源身份认领） */
+    /** @var resource|null the connection the request was actually written on (failFast claims by resource identity) */
     public $conn = null;
     public ?RemotingCommand $response = null;
     public ?\Throwable $cause = null;

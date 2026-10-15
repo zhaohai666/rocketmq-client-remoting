@@ -1,4 +1,4 @@
-//! 用法（先按项目记忆里记的 runbook 起本地集群）：
+//! Usage (start the local cluster per the recorded runbook first):
 //! ```text
 //! cargo run --example live_subscribe -- 127.0.0.1:9876
 //! ```
@@ -100,21 +100,21 @@ impl MessageListenerConcurrently for CollectListener {
     }
 }
 
-/// 集群探活：拿默认 topic 路由里的 broker 地址（300 查询要按地址下发）。
+/// Cluster probe: take the broker address from the default topic route (request 300 must be sent to an address).
 async fn probe_broker(admin: &DefaultMQAdminExt) -> Result<String, String> {
     let route = admin
         .examine_topic_route(MixAll::DEFAULT_TOPIC)
         .await
         .map_err(|e| e.to_string())?;
-    let bd = route.broker_datas.first().ok_or("TBW102 路由里没有 broker")?;
-    bd.select_broker_addr().ok_or_else(|| "TBW102 的 broker 没有地址".to_string())
+    let bd = route.broker_datas.first().ok_or("no broker in the TBW102 route")?;
+    bd.select_broker_addr().ok_or_else(|| "the TBW102 broker has no address".to_string())
 }
 
 async fn who(admin: &DefaultMQAdminExt, broker: &str, topic: &str) -> Vec<String> {
     match admin.query_topic_consume_by_who(broker, topic).await {
         Ok(list) => list,
         Err(e) => {
-            println!("    (queryTopicConsumeByWho({topic}) 失败: {e})");
+            println!("    (queryTopicConsumeByWho({topic}) failed: {e})");
             Vec::new()
         }
     }
@@ -128,7 +128,7 @@ fn main() -> ExitCode {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
         Err(e) => {
-            eprintln!("fixture 失败: {e}");
+            eprintln!("fixture failed: {e}");
             ExitCode::FAILURE
         }
     }
@@ -156,16 +156,16 @@ async fn run(namesrv: &str) -> Result<bool, String> {
         Ok(addr) => addr,
         Err(e) => {
             admin.shutdown();
-            return Err(format!("集群探活失败: {e}"));
+            return Err(format!("cluster probe failed: {e}"));
         }
     };
-    ck.check("集群探活", true, &format!("broker={broker_addr}"));
+    ck.check("cluster probe", true, &format!("broker={broker_addr}"));
 
     for topic in [&t_base, &t_late] {
         admin
             .create_topic(MixAll::DEFAULT_TOPIC, topic, QUEUES, 0)
             .await
-            .map_err(|e| format!("createTopic({topic}) 失败: {e}"))?;
+            .map_err(|e| format!("createTopic({topic}) failed: {e}"))?;
     }
 
     let outcome =
@@ -175,12 +175,12 @@ async fn run(namesrv: &str) -> Result<bool, String> {
     for topic in [&t_base, &t_late] {
         match admin.delete_topic(topic, None).await {
             Ok(()) => println!("    (deleteTopic({topic}) OK)"),
-            Err(e) => println!("    (deleteTopic({topic}) 失败: {e})"),
+            Err(e) => println!("    (deleteTopic({topic}) failed: {e})"),
         }
     }
     match admin.delete_subscription_group(&broker_addr, &group, true).await {
         Ok(()) => println!("    (deleteSubscriptionGroup({group}) OK)"),
-        Err(e) => println!("    (deleteSubscriptionGroup({group}) 失败: {e})"),
+        Err(e) => println!("    (deleteSubscriptionGroup({group}) failed: {e})"),
     }
     admin.shutdown();
 
@@ -213,12 +213,12 @@ async fn run_scenarios(
         consume_from_where: ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET.to_string(),
         ..Default::default()
     })
-    .map_err(|e| format!("消费者构造失败: {e}"))?;
-    consumer.subscribe(t_base, "*").map_err(|e| format!("subscribe({t_base}) 失败: {e}"))?;
+    .map_err(|e| format!("consumer build failed: {e}"))?;
+    consumer.subscribe(t_base, "*").map_err(|e| format!("subscribe({t_base}) failed: {e}"))?;
     consumer.set_message_listener_concurrently(Arc::new(CollectListener { sink: sink.clone() }));
-    consumer.start().await.map_err(|e| format!("消费者 start 失败: {e}"))?;
+    consumer.start().await.map_err(|e| format!("consumer start failed: {e}"))?;
 
-    // ---------------- S0 正对照 ----------------
+    // ---------------- S0 positive control ----------------
     let t0 = Instant::now();
     let ok = wait_until_async(
         || async { who(admin, broker_addr, t_base).await.iter().any(|g| g == group) },
@@ -228,25 +228,25 @@ async fn run_scenarios(
     .await;
     let got_b = who(admin, broker_addr, t_base).await;
     ck.check(
-        "S0-基础 topic B 已登记本组（300 查得到）",
+        "S0-the base topic B has this group registered (request 300 finds it)",
         ok,
         &format!("groupList={got_b:?} elapsed={:.2}s", t0.elapsed().as_secs_f64()),
     );
 
-    // ---------------- S1 负对照 ----------------
+    // ---------------- S1 negative control ----------------
     let got_l = who(admin, broker_addr, t_late).await;
     ck.check(
-        "S1-负对照：未订阅的 L 查不到本组",
+        "S1-negative control: the unsubscribed L does not show this group",
         !got_l.iter().any(|g| g == group),
         &format!("groupList={got_l:?}"),
     );
 
-    // ---------------- S2 后置订阅立即生效 ----------------
+    // ---------------- S2 late subscription takes effect immediately ----------------
     let t1 = Instant::now();
-    consumer.subscribe(t_late, "*").map_err(|e| format!("后置 subscribe({t_late}) 失败: {e}"))?;
+    consumer.subscribe(t_late, "*").map_err(|e| format!("late subscribe({t_late}) failed: {e}"))?;
     let subscribe_elapsed = t1.elapsed();
-    // Rust 这一跳是 fire-and-forget（`subscribe` 同步签名 + 异步 RPC，见
-    // `notify_subscription_changed` 的注释），所以给一个远小于心跳周期的窗口等它落地。
+    // This hop is fire-and-forget (`subscribe` has a sync signature + async RPC, see the comment
+    // on `notify_subscription_changed`), so a window far smaller than the heartbeat period is given for it to land.
     let registered = wait_until_async(
         || async { who(admin, broker_addr, t_late).await.iter().any(|g| g == group) },
         Duration::from_secs(5),
@@ -256,22 +256,22 @@ async fn run_scenarios(
     let got_l = who(admin, broker_addr, t_late).await;
     let elapsed = t1.elapsed();
     ck.check(
-        "S2-后置订阅后 broker 立刻登记本组（300 查得到）",
+        "S2-after the late subscription the broker registers this group immediately (request 300 finds it)",
         registered,
         &format!("groupList={got_l:?}"),
     );
-    // 心跳周期默认 30s：只有订阅路径那一轮心跳才能让登记这么快出现。
+    // The heartbeat period defaults to 30s: only the subscription-path heartbeat round could make the registration appear this fast.
     ck.check(
-        "S2-登记耗时远小于 30s 心跳周期（只可能是订阅路径推的）",
+        "S2-the registration takes far less than the 30s heartbeat period (it can only have been pushed by the subscription path)",
         registered && elapsed.as_millis() < HEARTBEAT_PERIOD_MS / 3,
         &format!(
-            "subscribe 返回耗时={}ms，登记耗时={}ms",
+            "subscribe return took={}ms, registration took={}ms",
             subscribe_elapsed.as_millis(),
             elapsed.as_millis()
         ),
     );
 
-    // ---------------- S3 后置订阅真会被消费 ----------------
+    // ---------------- S3 the late subscription really gets consumed ----------------
     let t2 = Instant::now();
     let assigned = wait_until_async(
         || async {
@@ -287,17 +287,17 @@ async fn run_scenarios(
         .filter(|k| k.starts_with(t_late))
         .collect();
     ck.check(
-        "S3-新 topic L 进入本实例分配集（rebalance 生效）",
+        "S3-the new topic L enters this instance's assignment set (rebalance took effect)",
         assigned,
         &format!("assigned={keys:?} elapsed={:.2}s", t2.elapsed().as_secs_f64()),
     );
 
     let producer = DefaultMQProducer::new(p_group).map_err(|e| e.to_string())?;
     producer.set_namesrv_addr(namesrv);
-    producer.start().await.map_err(|e| format!("producer start 失败: {e}"))?;
+    producer.start().await.map_err(|e| format!("producer start failed: {e}"))?;
     tokio::time::sleep(Duration::from_millis(500)).await;
     let mut msg = Message::new(t_late, Some(b"late-subscribe-me"));
-    producer.send(&mut msg, None, None).await.map_err(|e| format!("send 失败: {e}"))?;
+    producer.send(&mut msg, None, None).await.map_err(|e| format!("send failed: {e}"))?;
 
     let consumed = wait_until_async(
         || async { sink.snapshot().iter().any(|b| b == "late-subscribe-me") },
@@ -306,16 +306,16 @@ async fn run_scenarios(
     )
     .await;
     ck.check(
-        "S3-后置订阅的 topic 上的消息真的被消费",
+        "S3-the message on the late-subscribed topic really gets consumed",
         consumed,
         &format!("seen={:?}", sink.snapshot()),
     );
 
-    // ---------------- S4 活订阅表 ----------------
+    // ---------------- S4 live subscription table ----------------
     consumer.unsubscribe(t_late);
     let live: Vec<String> = consumer.subscriptions().into_iter().map(|s| s.topic).collect();
     ck.check(
-        "S4-unsubscribe 后本组订阅集立刻少掉 L（只删表项，不发心跳）",
+        "S4-after unsubscribe this group's subscription set immediately loses L (only the table entry is removed, no heartbeat sent)",
         !live.iter().any(|t| t == t_late) && live.iter().any(|t| t == t_base),
         &format!("live={live:?}"),
     );

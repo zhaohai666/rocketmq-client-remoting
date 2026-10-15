@@ -18,7 +18,7 @@ _KEYS = (
 
 
 def _reload(monkeypatch, env=None):
-    """在干净的环境变量下重新加载 rocketmq_logging（其配置是 import 期求值的）。"""
+    """Reload rocketmq_logging under clean environment variables (its config is evaluated at import time)."""
     for k in _KEYS:
         monkeypatch.delenv(k, raising=False)
     for k, v in (env or {}).items():
@@ -45,10 +45,10 @@ def test_default_dir_is_rocketmqlogs(monkeypatch):
 
 
 def test_default_dir_follows_cwd_not_home(monkeypatch, tmp_path):
-    """默认目录是 <cwd>/logs/rocketmqlogs，**刻意不写用户 HOME**。
+    """The default directory is <cwd>/logs/rocketmqlogs, **deliberately not the user's HOME**.
 
-    Python 客户端常被当脚本嵌进别人的进程里跑，在 $HOME 下悄悄建目录写文件是越界
-    副作用；这里用 chdir 把两者分开验证。
+    Python clients are often embedded as scripts into other people's processes; quietly creating directories and writing files under $HOME is an out-of-bounds
+    side effect; chdir is used here to verify the two separately.
     """
     home = tmp_path / "fakehome"
     home.mkdir()
@@ -58,13 +58,13 @@ def test_default_dir_follows_cwd_not_home(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.chdir(cwd)
-    rl = _reload(monkeypatch)  # _reload 会先删掉 LOG_DIR，正是在测默认推导
+    rl = _reload(monkeypatch)  # _reload first deletes LOG_DIR, which is exactly the default derivation under test
     assert rl._LOG_DIR == str(cwd / "logs" / "rocketmqlogs")
     assert not (home / "logs").exists()
 
 
 def test_level_aliases(monkeypatch):
-    """WARN/TRACE 这类缩写级别也要认（logging 原生级别名是 WARNING）。"""
+    """Abbreviated levels like WARN/TRACE must also be recognized (logging's native level name is WARNING)."""
     rl = _reload(monkeypatch)
     assert rl._level_from_name("WARN") == rl._logging.WARNING
     assert rl._level_from_name("WARNING") == rl._logging.WARNING
@@ -74,7 +74,7 @@ def test_level_aliases(monkeypatch):
 
 
 def test_env_level_reaches_logger(monkeypatch, tmp_path):
-    """ROCKETMQ_CLIENT_LOG_LEVEL=WARN 要真的作用到 logger 级别上，而不只是存进变量。"""
+    """ROCKETMQ_CLIENT_LOG_LEVEL=WARN must really take effect on the logger level, not just be stored in a variable."""
     rl = _reload(monkeypatch, {
         "ROCKETMQ_CLIENT_LOG_DIR": str(tmp_path),
         "ROCKETMQ_CLIENT_LOG_LEVEL": "WARN",
@@ -92,8 +92,8 @@ def test_env_level_reaches_logger(monkeypatch, tmp_path):
         lg = rl.get_logger()
         assert lg.level == rl._logging.WARNING
     finally:
-        # get_logger() 会挂自己的 handler 并把 propagate 关掉（caplog 依赖向 root 冒泡），
-        # 用例必须原样退回，否则污染后面的套件。
+        # get_logger() attaches its own handler and turns propagate off (caplog relies on bubbling to root),
+        # the test must restore everything as-is, otherwise it pollutes the rest of the suite.
         for h in list(lg.handlers):
             h.close()
         ours.handlers = saved
@@ -109,7 +109,7 @@ def test_build_handlers_writes_py_client_log(monkeypatch, tmp_path):
         assert len(file_handlers) == 1
         fh = file_handlers[0]
         assert fh.baseFilename == str(tmp_path / PY_CLIENT_LOG)
-        # 备份名后缀形如 rocketmq_py_client.log.2026-09-14
+        # The backup name suffix looks like rocketmq_py_client.log.2026-09-14
         assert fh.suffix == "%Y-%m-%d"
         assert fh.backupCount == 10
 
@@ -122,7 +122,7 @@ def test_build_handlers_writes_py_client_log(monkeypatch, tmp_path):
 
 
 def test_unwritable_dir_degrades_to_stderr(monkeypatch, tmp_path, capsys):
-    """目录不可写时必须优雅降级（仅告警），不能抛异常阻断客户端启动。"""
+    """An unwritable directory must degrade gracefully (warning only), not throw and block client startup."""
     blocker = tmp_path / "blocked"
     blocker.write_text("not a directory", encoding="utf-8")
     rl = _reload(monkeypatch, {"ROCKETMQ_CLIENT_LOG_DIR": str(blocker / "sub")})

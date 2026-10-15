@@ -1,26 +1,26 @@
-//! [`DefaultMQPullConsumer`] 对**真实 5.5.1 broker** 的联调验证。
+//! Integration verification of [`DefaultMQPullConsumer`] against a **real 5.5.1 broker**.
 //!
 //!
-//! 拉模式的核心是「调用方自己拉、自己管位点」，所以断言都围绕这一点：
-//! - P1 生命周期：未配 name server 时 `start()` 失败；未 start 就拉取报错；
-//!   `start()` 幂等、`shutdown()` 幂等；`shutdown()` 后再拉取又报错。
-//! - P2 `fetch_subscribe_message_queues` → 显式建的 4 队列 topic 拿到 4 个队列、队列号不重不漏。
-//! - P2b `fetch_message_queues_in_balance` → **没拉过任何队列**的实例靠「真实路由 +
-//!   GET_CONSUMER_LIST_BY_GROUP(38)」算出份额（前提是 `registerTopic` 过，心跳才带订阅集）。
-//! - P3 定向发 12 条（每队列 3 条）→ 逐队列 `max_offset - min_offset == 3`、总量 12。
-//! - P4 手动 `pull`：逐队列从 min 拉到 max → 12 条不重不漏、body 与发送集合一致，
-//!   且 `MessageExt.broker_name` 已回填（`send_message_back` 要靠它反查路由）。
-//! - P5 手动提交位点：`update_consume_offset` → `fetch_consume_offset` 逐队列回读一致。
-//! - P6 位点由调用方掌控：从已提交位点再拉 → NO_NEW_MSG；退回队首再拉 → FOUND
-//!   （push 模式做不到，这正是 pull 模式的存在意义）；换 TagB 拉 → NO_MATCHED_MSG。
-//! - P7 长轮询 `pull_block_if_not_found`：从队尾起拉，1.5s 后另一任务发消息 → FOUND，
-//!   实测往返耗时明显大于 1s 且远小于 30s 请求超时（证明挂起发生在 broker 侧）。
-//! - P8 `search_offset`（now / 1）与 `earliest_msg_store_time`。
-//! - P9 `send_message_back` → 消息出现在 `%RETRY%<group>` 并可被拉取。
-//! - P10 消费者自带的 `create_topic` 运维接口 → 新 topic 路由可见、offset 可查。
-//! - P11 清理：删掉本次建的 topic。
+//! The core of pull mode is "the caller pulls by itself and manages its own offsets", so every assertion circles that:
+//! - P1 lifecycle: `start()` fails when no name server is configured; pulling before start errors;
+//!   `start()` idempotent, `shutdown()` idempotent; pulling after `shutdown()` errors again.
+//! - P2 `fetch_subscribe_message_queues` → the explicitly created 4-queue topic yields 4 queues, ids neither duplicated nor missing.
+//! - P2b `fetch_message_queues_in_balance` → an instance that has **never pulled any queue** works out its share from
+//!   "the real route + GET_CONSUMER_LIST_BY_GROUP(38)" (which requires `registerTopic` to have run, so the heartbeat carries the subscription set).
+//! - P3 sends 12 messages to fixed queues (3 per queue) → per queue `max_offset - min_offset == 3`, total 12.
+//! - P4 manual `pull`: per queue from min to max → all 12, no duplicates or gaps, bodies match the sent set,
+//!   and `MessageExt.broker_name` is filled back in (`send_message_back` needs it to look the route up).
+//! - P5 manual offset commit: `update_consume_offset` → `fetch_consume_offset` reads back consistently per queue.
+//! - P6 offsets owned by the caller: pull again from the committed offset → NO_NEW_MSG; rewind to the queue head → FOUND
+//!   (push mode cannot do this, which is exactly why pull mode exists); pull with TagB → NO_MATCHED_MSG.
+//! - P7 long polling `pull_block_if_not_found`: start from the queue tail, another task sends after 1.5s → FOUND,
+//!   and the measured round-trip is clearly above 1s and far below the 30s request timeout (proving the hang happens broker-side).
+//! - P8 `search_offset` (now / 1) and `earliest_msg_store_time`.
+//! - P9 `send_message_back` → the message shows up in `%RETRY%<group>` and is pullable.
+//! - P10 the consumer's own `create_topic` admin API → the new topic's route is visible and its offsets queryable.
+//! - P11 cleanup: delete the topics this run created.
 //!
-//! 用法（先按项目记忆里记的 runbook 起本地集群）：
+//! Usage (first start a local cluster per the runbook recorded in project knowledge):
 //! ```text
 //! cargo run --example live_pull_consumer -- 127.0.0.1:9876
 //! ```
@@ -42,14 +42,14 @@ use rocketmq_client_remoting::common::mix_all::MixAll;
 use rocketmq_client_remoting::common::topic_config::{TopicFilterType, DEFAULT_PERM};
 use rocketmq_client_remoting::remoting::protocol::route::TopicRouteData;
 
-/// 测试 topic 的队列数，与发送条数配套（12 / 4 = 每队列 3 条）。
+/// Queue count of the test topic, paired with the send count (12 / 4 = 3 per queue).
 const QUEUE_NUMS: i32 = 4;
 const N_MSG: usize = 12;
 const PER_QUEUE: usize = N_MSG / QUEUE_NUMS as usize;
-/// 定向发送时用的 tag；P6 用另一个 tag 验证 broker 侧过滤。
+/// Tag used for the fixed-queue sends; P6 uses another tag to verify broker-side filtering.
 const TAG: &str = "TagA";
 
-// ------------------------------------------------------------------ 骨架
+// ------------------------------------------------------------------ skeleton
 
 fn stamp() -> String {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -58,7 +58,7 @@ fn stamp() -> String {
     }
 }
 
-/// 断言累积器：一次跑完所有场景再汇总，首个失败不提前退出。
+/// Assertion accumulator: all scenarios run once before the summary; the first failure does not exit early.
 struct Checker {
     passed: u32,
     failed: Vec<String>,
@@ -88,7 +88,7 @@ impl Checker {
     }
 }
 
-/// 锁中毒时照常取内值（一次 panic 不该让整轮验证连锁崩）。
+/// Takes the inner value even when the lock is poisoned (one panic must not cascade through the whole run).
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -99,7 +99,7 @@ fn bodies(msgs: &[MessageExt]) -> BTreeSet<String> {
         .collect()
 }
 
-/// 队列 → 该队列已拉到的最大 queue_offset + 1（即下一条该拉的位点）。
+/// Queue → that queue's max pulled queue_offset + 1 (i.e. the offset to pull next).
 fn next_offsets(msgs: &[MessageExt]) -> BTreeMap<i32, i64> {
     let mut out: BTreeMap<i32, i64> = BTreeMap::new();
     for m in msgs {
@@ -120,17 +120,17 @@ fn describe(result: &PullResult) -> String {
     )
 }
 
-// ------------------------------------------------------------------ 夹具
+// ------------------------------------------------------------------ fixture
 
 struct Fixture {
     namesrv: String,
     stamp: String,
     producer: DefaultMQProducer,
-    /// 建/删 topic 用的运维实例。
+    /// Admin instance used to create/delete topics.
     admin: MQClientInstance,
     broker_name: String,
     broker_addr: String,
-    /// 本次建过的 topic，P11 统一删掉。
+    /// Topics created during this run, all deleted in P11.
     topics: Mutex<Vec<String>>,
 }
 
@@ -163,7 +163,7 @@ impl Fixture {
             .start()
             .await
             .map_err(|e| format!("producer start failed: {e}"))?;
-        // 用 TBW102 的路由找一台可建 topic 的 broker（与 live_consumer.rs 同一做法）。
+        // Use the TBW102 route to find a broker that can create topics (same approach as live_consumer.rs).
         let route = self
             .admin
             .get_topic_route_data(MixAll::DEFAULT_TOPIC)
@@ -183,7 +183,7 @@ impl Fixture {
         format!("rust-live-pull-{kind}-{}", self.stamp)
     }
 
-    /// 显式建 topic（不靠 `autoCreateTopicEnable`，队列数才确定）。
+    /// Creates the topic explicitly (not relying on `autoCreateTopicEnable`, so the queue count is deterministic).
     async fn create_topic(&self, topic: &str, queues: i32) -> Result<(), String> {
         self.admin
             .create_topic_in_broker(
@@ -206,7 +206,7 @@ impl Fixture {
         Ok(())
     }
 
-    /// 按组名建消费者（已配 name server 与实例名，未 start）。
+    /// Builds a consumer for the group (name server and instance name configured, not started).
     fn consumer(&self, kind: &str) -> Result<DefaultMQPullConsumer, String> {
         let group = self.group_name(kind);
         let cfg = PullConsumerConfig {
@@ -218,12 +218,12 @@ impl Fixture {
         DefaultMQPullConsumer::with_config(cfg).map_err(|e| format!("{kind} build failed: {e}"))
     }
 
-    /// 起一个已 start 的消费者；失败时把错误写进 Checker。
+    /// Returns a started consumer; on failure the error goes into the Checker.
     async fn started(&self, ck: &mut Checker, kind: &str) -> Option<DefaultMQPullConsumer> {
         let c = match self.consumer(kind) {
             Ok(c) => c,
             Err(e) => {
-                ck.abort(&format!("{kind} 构造"), &e);
+                ck.abort(&format!("{kind} build"), &e);
                 return None;
             }
         };
@@ -234,7 +234,7 @@ impl Fixture {
         Some(c)
     }
 
-    /// 定向发到某个队列，body = `<topic>-<queueId>-<i>`。
+    /// Sends to a fixed queue, body = `<topic>-<queueId>-<i>`.
     async fn produce_to(&self, topic: &str, queue_id: i32, n: usize) -> usize {
         let mut ok = 0;
         for i in 0..n {
@@ -262,84 +262,84 @@ fn broker_of(route: &TopicRouteData) -> Result<(String, String), String> {
     Ok((bd.broker_name.clone(), addr))
 }
 
-// ------------------------------------------------------------------ P1 生命周期
+// ------------------------------------------------------------------ P1 lifecycle
 
 async fn p1_lifecycle(ck: &mut Checker, fx: &Fixture) {
-    // 未配 name server（且没配地址服务器环境变量）→ start 必须硬失败。
+    // No name server configured (and no address-server env var either) → start must fail hard.
     let bare = match DefaultMQPullConsumer::with_config(PullConsumerConfig {
         consumer_group: fx.group_name("bare"),
         ..Default::default()
     }) {
         Ok(c) => c,
         Err(e) => {
-            ck.abort("P1 构造", &e.to_string());
+            ck.abort("P1 build", &e.to_string());
             return;
         }
     };
     match bare.start().await {
-        Ok(()) => ck.check("P1 未配 name server 时 start 失败", false, "start 竟然成功了"),
+        Ok(()) => ck.check("P1 start fails when no name server is configured", false, "start unexpectedly succeeded"),
         Err(e) => ck.check(
-            "P1 未配 name server 时 start 失败",
+            "P1 start fails when no name server is configured",
             e.to_string().contains("name server address is not set"),
             &e.to_string(),
         ),
     }
-    ck.check("P1 失败后不残留 started 状态", !bare.is_started(), "");
+    ck.check("P1 no started state left over after the failure", !bare.is_started(), "");
 
     let c = match fx.consumer("life") {
         Ok(c) => c,
         Err(e) => {
-            ck.abort("P1 构造", &e);
+            ck.abort("P1 build", &e);
             return;
         }
     };
     let mq = MessageQueue::new(MixAll::DEFAULT_TOPIC, &fx.broker_name, 0);
     match c.pull(&mq, "*", 0, 1, Some(100)).await {
         Ok(r) => ck.check(
-            "P1 未 start 就拉取报错",
+            "P1 pulling before start errors",
             false,
-            &format!("竟然成功了 {}", describe(&r)),
+            &format!("unexpectedly succeeded {}", describe(&r)),
         ),
         Err(e) => ck.check(
-            "P1 未 start 就拉取报错",
+            "P1 pulling before start errors",
             e.to_string().contains("consumer not started"),
             &e.to_string(),
         ),
     }
-    ck.check("P1 start 前 is_started 为 false", !c.is_started(), "");
+    ck.check("P1 is_started is false before start", !c.is_started(), "");
     if let Err(e) = c.start().await {
         ck.abort("P1 start", &e.to_string());
         return;
     }
-    ck.check("P1 start 后 is_started", c.is_started(), "");
-    ck.check("P1 重复 start 幂等", c.start().await.is_ok(), "");
+    ck.check("P1 is_started after start", c.is_started(), "");
+    ck.check("P1 a repeated start is idempotent", c.start().await.is_ok(), "");
     let client_id = c.client_id();
     ck.check(
-        "P1 start 时现造 client_id（本机IP@instanceName，buildMQClientId 语义）",
+        "P1 start mints the client_id on the spot (localIP@instanceName, buildMQClientId semantics)",
         client_id
             .split_once('@')
             .is_some_and(|(ip, instance)| !ip.is_empty() && instance.starts_with("live-pull-life")),
         &client_id,
     );
     ck.check(
-        "P1 start 后可查默认 topic 路由",
+        "P1 the default topic route is fetchable after start",
         c.fetch_subscribe_message_queues(MixAll::DEFAULT_TOPIC).await.is_ok(),
         "",
     );
     c.shutdown();
     c.shutdown();
-    ck.check("P1 shutdown 幂等且不 panic", !c.is_started(), "");
+    ck.check("P1 shutdown is idempotent and does not panic", !c.is_started(), "");
     match c.pull(&mq, "*", 0, 1, Some(100)).await {
-        Ok(r) => ck.check("P1 shutdown 后拉取又报错", false, &describe(&r)),
+        Ok(r) => ck.check("P1 pulling after shutdown errors again", false, &describe(&r)),
         Err(e) => ck.check(
-            "P1 shutdown 后拉取又报错",
+            "P1 pulling after shutdown errors again",
             e.to_string().contains("consumer not started"),
             &e.to_string(),
         ),
     }
 }
 
-// ------------------------------------------------- P2 队列 / P3 每队列存量
+// ------------------------------------------------- P2 queues / P3 per-queue stock
 
 async fn p2_queues(ck: &mut Checker, fx: &Fixture, topic: &str) -> Vec<MessageQueue> {
     let c = match fx.started(ck, "queue").await {
@@ -355,26 +355,26 @@ async fn p2_queues(ck: &mut Checker, fx: &Fixture, topic: &str) -> Vec<MessageQu
         }
     };
     ck.check(
-        &format!("P2 拿到 {QUEUE_NUMS} 个队列"),
+        &format!("P2 got {QUEUE_NUMS} queues"),
         mqs.len() == QUEUE_NUMS as usize,
         &format!("got {}", mqs.len()),
     );
     ck.check(
-        "P2 队列 topic/broker 与建 topic 时一致",
+        "P2 queue topic/broker match the created topic",
         mqs.iter().all(|m| m.topic == topic)
             && mqs.iter().all(|m| m.broker_name == fx.broker_name),
         &format!("{mqs:?}"),
     );
     let ids: BTreeSet<i32> = mqs.iter().map(|m| m.queue_id).collect();
     ck.check(
-        "P2 队列号 0..3 不重不漏",
+        "P2 queue ids 0..3 with no duplicates or gaps",
         ids == (0..QUEUE_NUMS).collect::<BTreeSet<i32>>(),
         &format!("{ids:?}"),
     );
 
     c.register_topic(topic);
     let hb_ok = c.send_heartbeat_to_all_broker().await;
-    ck.check("P2b 登记 topic 后心跳发出去了（38 可见的前提）", hb_ok > 0, &format!("heartbeat_ok={hb_ok}"));
+    ck.check("P2b the heartbeat went out after registering the topic (the precondition for 38's visibility)", hb_ok > 0, &format!("heartbeat_ok={hb_ok}"));
     let mut mine: Vec<MessageQueue> = Vec::new();
     let balance_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
@@ -389,17 +389,17 @@ async fn p2_queues(ck: &mut Checker, fx: &Fixture, topic: &str) -> Vec<MessageQu
         if std::time::Instant::now() >= balance_deadline {
             break;
         }
-        // 38 的可见性依赖 broker 侧的注册，重试时把心跳再补一发。
+        // 38's visibility depends on the broker-side registration, so re-send the heartbeat on each retry.
         c.send_heartbeat_to_all_broker().await;
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
     ck.check(
-        &format!("P2b 平衡视图：独占分组拿到全部 {QUEUE_NUMS} 个队列（未拉取过⇒只可能是路由+38 算出来的）"),
+        &format!("P2b balance view: the exclusive group gets all {QUEUE_NUMS} queues (never pulled ⇒ it can only be computed from route+38)"),
         mine.len() == QUEUE_NUMS as usize,
         &format!("got {} of {}", mine.len(), QUEUE_NUMS),
     );
     ck.check(
-        "P2b 平衡视图是本 topic 订阅视图的子集",
+        "P2b the balance view is a subset of this topic's subscription view",
         mine
             .iter()
             .all(|m| m.topic == topic && m.broker_name == fx.broker_name),
@@ -432,7 +432,7 @@ async fn p3_offsets(ck: &mut Checker, fx: &Fixture, mqs: &[MessageQueue]) {
         return;
     }
     ck.check(
-        &format!("P3 每队列 max-min == {PER_QUEUE}"),
+        &format!("P3 per-queue max-min == {PER_QUEUE}"),
         spans
             .iter()
             .all(|(_, min, max)| max - min == PER_QUEUE as i64),
@@ -440,14 +440,14 @@ async fn p3_offsets(ck: &mut Checker, fx: &Fixture, mqs: &[MessageQueue]) {
     );
     let total: i64 = spans.iter().map(|(_, min, max)| max - min).sum();
     ck.check(
-        &format!("P3 topic 总存量 == {N_MSG}"),
+        &format!("P3 total stock on the topic == {N_MSG}"),
         total == N_MSG as i64,
         &format!("total={total} spans={spans:?}"),
     );
     c.shutdown();
 }
 
-// ------------------------------------------------------ P4/P5/P6 手动拉取
+// ------------------------------------------------------ P4/P5/P6 manual pulling
 
 async fn p4_pull_all(ck: &mut Checker, fx: &Fixture, topic: &str, mqs: &[MessageQueue]) {
     let c = match fx.started(ck, "pull").await {
@@ -469,12 +469,12 @@ async fn p4_pull_all(ck: &mut Checker, fx: &Fixture, topic: &str, mqs: &[Message
         match c.pull(mq, TAG, min, 32, Some(5000)).await {
             Ok(r) => {
                 ck.check(
-                    &format!("P4 队列 {} 首拉 FOUND", mq.queue_id),
+                    &format!("P4 queue {} first pull FOUND", mq.queue_id),
                     r.status == PullStatus::Found && r.msg_found_list.len() == PER_QUEUE,
                     &describe(&r),
                 );
                 ck.check(
-                    &format!("P4 队列 {} next_begin_offset == max", mq.queue_id),
+                    &format!("P4 queue {} next_begin_offset == max", mq.queue_id),
                     r.next_begin_offset == r.max_offset,
                     &describe(&r),
                 );
@@ -488,7 +488,7 @@ async fn p4_pull_all(ck: &mut Checker, fx: &Fixture, topic: &str, mqs: &[Message
         }
     }
     if !err.is_empty() {
-        ck.abort("P4 拉取", &err);
+        ck.abort("P4 pull", &err);
         c.shutdown();
         return;
     }
@@ -496,30 +496,30 @@ async fn p4_pull_all(ck: &mut Checker, fx: &Fixture, topic: &str, mqs: &[Message
         .flat_map(|q| (0..PER_QUEUE).map(move |i| format!("{topic}-{q}-{i}")))
         .collect();
     ck.check(
-        &format!("P4 手动拉取收全 {N_MSG} 条"),
+        &format!("P4 the manual pull gathered all {N_MSG} messages"),
         got.len() == N_MSG,
         &format!("got {}", got.len()),
     );
     ck.check(
-        "P4 body 与发送集合一致（不重不漏）",
+        "P4 bodies match the sent set (no duplicates, no gaps)",
         bodies(&got) == want,
         &format!("{:?}", bodies(&got)),
     );
     ck.check(
-        "P4 broker_name 已回填（send_message_back 靠它反查路由）",
+        "P4 broker_name is filled back in (send_message_back needs it to look the route up)",
         got.iter()
             .all(|m| m.broker_name.as_deref() == Some(fx.broker_name.as_str())),
         &format!("{:?}", got.first().map(|m| m.broker_name.clone())),
     );
     ck.check(
-        "P4 tag/queueId/reconsumeTimes 等字段来自 broker",
+        "P4 tag/queueId/reconsumeTimes and friends come from the broker",
         got.iter().all(|m| m.get_tags() == Some(TAG))
             && got.iter().all(|m| m.reconsume_times == 0)
             && got.iter().all(|m| m.queue_offset >= 0),
         &format!("{:?}", got.first().map(|m| (m.get_tags(), m.reconsume_times))),
     );
 
-    // ---------------- P5 提交位点并回读
+    // ---------------- P5 commit offsets and read them back
     let next = next_offsets(&got);
     let mut readback: Vec<(i32, Option<i64>)> = Vec::new();
     for mq in mqs {
@@ -538,68 +538,68 @@ async fn p4_pull_all(ck: &mut Checker, fx: &Fixture, topic: &str, mqs: &[Message
             .any(|(q, got)| *q == mq.queue_id && *got == Some(want))
     });
     ck.check(
-        "P5 提交位点能被 broker 读回（逐队列往返一致）",
+        "P5 committed offsets are readable back from the broker (per-queue round-trip consistent)",
         consistent,
         &format!("{readback:?} next={next:?}"),
     );
     c.shutdown();
 
-    // 全新组从没提交过 → None（不是 0）。
+    // A brand-new group never committed → None (not 0).
     let fresh = match fx.started(ck, "fresh").await {
         Some(c) => c,
         None => return,
     };
     match fresh.fetch_consume_offset(&mqs[0]).await {
         Ok(v) => ck.check(
-            "P5 未提交的消费组位点读回 None（不退化成 0）",
+            "P5 a never-committed group's offset reads back None (it does not degrade to 0)",
             v.is_none(),
             &format!("{v:?}"),
         ),
-        Err(e) => ck.abort("P5 读空位点", &e.to_string()),
+        Err(e) => ck.abort("P5 read empty offset", &e.to_string()),
     }
 
-    // ---------------- P6 位点由调用方掌控
+    // ---------------- P6 offsets owned by the caller
     let mq = &mqs[0];
     let min = fresh.min_offset(mq).await.unwrap_or(0);
     let committed = next.get(&mq.queue_id).copied().unwrap_or(0);
     match fresh.pull(mq, TAG, committed, 32, Some(5000)).await {
         Ok(r) => ck.check(
-            "P6 从已提交位点再拉 → NO_NEW_MSG",
+            "P6 pull from the committed offset → NO_NEW_MSG",
             r.status == PullStatus::NoNewMsg && r.msg_found_list.is_empty(),
             &describe(&r),
         ),
-        Err(e) => ck.abort("P6 已提交位点拉取", &e.to_string()),
+        Err(e) => ck.abort("P6 pull at committed offset", &e.to_string()),
     }
     match fresh.pull(mq, TAG, min, 32, Some(5000)).await {
         Ok(r) => ck.check(
-            &format!("P6 位点退回队首再拉 → FOUND {PER_QUEUE} 条"),
+            &format!("P6 rewind to the queue head and pull → FOUND {PER_QUEUE} messages"),
             r.status == PullStatus::Found && r.msg_found_list.len() == PER_QUEUE,
             &describe(&r),
         ),
-        Err(e) => ck.abort("P6 退回位点拉取", &e.to_string()),
+        Err(e) => ck.abort("P6 pull at rewound offset", &e.to_string()),
     }
-    // 位点非法（超过 max）→ OFFSET_ILLEGAL，并且 next_begin_offset 被 broker 纠正。
+    // An illegal offset (beyond max) → OFFSET_ILLEGAL, and next_begin_offset is corrected by the broker.
     match fresh.pull(mq, TAG, min + 10_000, 32, Some(5000)).await {
         Ok(r) => ck.check(
-            "P6 越界位点 → OFFSET_ILLEGAL 且回带 min/max",
+            "P6 out-of-range offset → OFFSET_ILLEGAL, with min/max carried back",
             r.status == PullStatus::OffsetIllegal && r.max_offset >= r.min_offset,
             &describe(&r),
         ),
-        Err(e) => ck.abort("P6 越界位点拉取", &e.to_string()),
+        Err(e) => ck.abort("P6 out-of-range pull", &e.to_string()),
     }
     match fresh.pull(mq, "TagB", min, 32, Some(5000)).await {
         Ok(r) => ck.check(
-            "P6 不匹配的 tag → 没有消息（NO_MATCHED_MSG 或 NO_NEW_MSG）",
+            "P6 a non-matching tag → no messages (NO_MATCHED_MSG or NO_NEW_MSG)",
             r.msg_found_list.is_empty()
                 && matches!(r.status, PullStatus::NoMatchedMsg | PullStatus::NoNewMsg),
             &describe(&r),
         ),
-        Err(e) => ck.abort("P6 tag 过滤拉取", &e.to_string()),
+        Err(e) => ck.abort("P6 tag-filtered pull", &e.to_string()),
     }
     fresh.shutdown();
 }
 
-// ------------------------------------------------------------------ P7 长轮询
+// ------------------------------------------------------------------ P7 long polling
 
 async fn p7_long_polling(ck: &mut Checker, fx: &Fixture, topic: &str, mqs: &[MessageQueue]) {
     let c = match fx.started(ck, "block").await {
@@ -620,7 +620,7 @@ async fn p7_long_polling(ck: &mut Checker, fx: &Fixture, topic: &str, mqs: &[Mes
     let producer = fx.producer.clone();
     let send_topic = topic.to_string();
     let broker = fx.broker_name.clone();
-    // 1.5s 后发一条 —— 期间这次长轮询必须一直挂在 broker 上。
+    // Send one message after 1.5s -- the long poll must stay hung on the broker until then.
     let sender = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(1500)).await;
         let mut msg = Message::new(&send_topic, Some(sent_body.as_bytes()));
@@ -635,24 +635,24 @@ async fn p7_long_polling(ck: &mut Checker, fx: &Fixture, topic: &str, mqs: &[Mes
     match result {
         Ok(r) => {
             ck.check(
-                "P7 队尾起拉 → 挂起后消息到达返回 FOUND",
+                "P7 pull from the tail → the message arrives during the hang and returns FOUND",
                 sent && r.status == PullStatus::Found && bodies(&r.msg_found_list).contains(&body),
                 &format!("sent={sent} {}", describe(&r)),
             );
-            // broker 挂起上限 20s、请求超时 30s：1.5s 后到达 → 往返必然明显大于 1.5s，
-            // 也远小于 30s（若退化成短轮询会立刻返回 NO_NEW_MSG 且耗时 ~0）。
+            // broker hang cap 20s, request timeout 30s: arriving after 1.5s → the round-trip is necessarily well above 1.5s,
+            // and far below 30s (a degraded short poll would return NO_NEW_MSG immediately at ~0 cost).
             ck.check(
-                "P7 真的挂起过（耗时 > 1s 且 < 25s）",
+                "P7 it really hung (cost > 1s and < 25s)",
                 cost > Duration::from_millis(1000) && cost < Duration::from_secs(25),
                 &format!("cost={cost:?}"),
             );
         }
-        Err(e) => ck.abort("P7 长轮询", &e.to_string()),
+        Err(e) => ck.abort("P7 long polling", &e.to_string()),
     }
     c.shutdown();
 }
 
-// ---------------------------------------------------------- P8 时间位点接口
+// ---------------------------------------------------------- P8 time-based offset APIs
 
 async fn p8_time_apis(ck: &mut Checker, fx: &Fixture, mqs: &[MessageQueue]) {
     let c = match fx.started(ck, "time").await {
@@ -666,10 +666,10 @@ async fn p8_time_apis(ck: &mut Checker, fx: &Fixture, mqs: &[MessageQueue]) {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    // 未来时间戳 → 越过全部消息（等于 max）；极早时间戳 → 队首。
+    // A future timestamp → past all messages (equals max); a very early timestamp → the queue head.
     match c.search_offset(mq, now_ms).await {
         Ok(off) => ck.check(
-            "P8 search_offset(now) 落在 [min, max]",
+            "P8 search_offset(now) lands in [min, max]",
             (min..=max).contains(&off),
             &format!("off={off} min={min} max={max}"),
         ),
@@ -685,7 +685,7 @@ async fn p8_time_apis(ck: &mut Checker, fx: &Fixture, mqs: &[MessageQueue]) {
     }
     match c.earliest_msg_store_time(mq).await {
         Ok(t) => ck.check(
-            "P8 earliest_msg_store_time 是合理毫秒时间戳",
+            "P8 earliest_msg_store_time is a plausible millisecond timestamp",
             t > 1_600_000_000_000 && t <= now_ms,
             &format!("{t} vs now={now_ms}"),
         ),
@@ -694,7 +694,7 @@ async fn p8_time_apis(ck: &mut Checker, fx: &Fixture, mqs: &[MessageQueue]) {
     c.shutdown();
 }
 
-// -------------------------------------------------------------- P9 消息回投
+// -------------------------------------------------------------- P9 send message back
 
 async fn p9_send_back(ck: &mut Checker, fx: &Fixture, mqs: &[MessageQueue]) {
     let group = fx.group_name("back");
@@ -708,13 +708,13 @@ async fn p9_send_back(ck: &mut Checker, fx: &Fixture, mqs: &[MessageQueue]) {
         Ok(r) => match r.msg_found_list.into_iter().next() {
             Some(m) => m,
             None => {
-                ck.abort("P9 取一条消息", "拉到了空结果");
+                ck.abort("P9 take one message", "the pull came back empty");
                 c.shutdown();
                 return;
             }
         },
         Err(e) => {
-            ck.abort("P9 拉取", &e.to_string());
+            ck.abort("P9 pull", &e.to_string());
             c.shutdown();
             return;
         }
@@ -725,8 +725,8 @@ async fn p9_send_back(ck: &mut Checker, fx: &Fixture, mqs: &[MessageQueue]) {
         c.shutdown();
         return;
     }
-    // delayLevel=0 → 立即可见；%RETRY%<group> 由 broker 在首次回投时自动建，
-    // 路由要等 topic 建好，所以轮询而不是拉一次就下结论。
+    // delayLevel=0 → visible immediately; the broker auto-creates %RETRY%<group> on the first send-back,
+    // and the route needs the topic to exist, so poll instead of concluding from one pull.
     let retry_topic = format!("{}{}", MixAll::RETRY_GROUP_TOPIC_PREFIX, group);
     let mut got: Vec<MessageExt> = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -746,14 +746,14 @@ async fn p9_send_back(ck: &mut Checker, fx: &Fixture, mqs: &[MessageQueue]) {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     ck.check(
-        "P9 回投的消息出现在 %RETRY%<group> 且可被拉取",
+        "P9 the sent-back message shows up in %RETRY%<group> and is pullable",
         bodies(&got).contains(&body),
         &format!("retry_topic={retry_topic} got={:?}", bodies(&got)),
     );
     c.shutdown();
 }
 
-// ------------------------------------------------------- P10 消费者建 topic
+// ------------------------------------------------------- P10 consumer creates a topic
 
 async fn p10_consumer_create_topic(ck: &mut Checker, fx: &Fixture) {
     let topic = fx.topic_name("Admin");
@@ -769,25 +769,25 @@ async fn p10_consumer_create_topic(ck: &mut Checker, fx: &Fixture) {
     lock(&fx.topics).push(topic.clone());
     match c.fetch_subscribe_message_queues(&topic).await {
         Ok(mqs) => ck.check(
-            "P10 消费者自带 create_topic 后路由可见（3 队列）",
+            "P10 after the consumer's own create_topic the route is visible (3 queues)",
             mqs.len() == 3,
             &format!("got {}", mqs.len()),
         ),
-        Err(e) => ck.abort("P10 查路由", &e.to_string()),
+        Err(e) => ck.abort("P10 fetch route", &e.to_string()),
     }
     let mq = MessageQueue::new(&topic, &fx.broker_name, 0);
     match (c.min_offset(&mq).await, c.max_offset(&mq).await) {
         (Ok(min), Ok(max)) => ck.check(
-            "P10 新 topic 队列可查 min/max offset",
+            "P10 the new topic's queues answer min/max offset queries",
             min == 0 && max == 0,
             &format!("min={min} max={max}"),
         ),
-        _ => ck.check("P10 新 topic 队列可查 min/max offset", false, "RPC 失败"),
+        _ => ck.check("P10 the new topic's queues answer min/max offset queries", false, "the RPC failed"),
     }
     c.shutdown();
 }
 
-// ------------------------------------------------------------------ P11 清理
+// ------------------------------------------------------------------ P11 cleanup
 
 async fn p11_cleanup(ck: &mut Checker, fx: &Fixture) {
     let topics: Vec<String> = lock(&fx.topics).clone();
@@ -802,13 +802,13 @@ async fn p11_cleanup(ck: &mut Checker, fx: &Fixture) {
         }
     }
     ck.check(
-        "P11 删除本次建的 topic",
+        "P11 delete the topics created this run",
         failed.is_empty(),
         &format!("{failed:?}"),
     );
 }
 
-// ------------------------------------------------------------------ 驱动
+// ------------------------------------------------------------------ driver
 
 async fn run(namesrv: &str) -> Checker {
     let mut ck = Checker::new();
@@ -816,12 +816,12 @@ async fn run(namesrv: &str) -> Checker {
     let mut fx = match Fixture::new(namesrv, &stamp) {
         Ok(fx) => fx,
         Err(e) => {
-            ck.abort("夹具构造", &e);
+            ck.abort("fixture build", &e);
             return ck;
         }
     };
     if let Err(e) = fx.start().await {
-        ck.abort("夹具启动", &e);
+        ck.abort("fixture start", &e);
         return ck;
     }
     println!("== live pull-consumer check, namesrv={namesrv} stamp={stamp} ==");
@@ -830,7 +830,7 @@ async fn run(namesrv: &str) -> Checker {
 
     let topic = fx.topic_name("Main");
     if let Err(e) = fx.create_topic(&topic, QUEUE_NUMS).await {
-        ck.abort("建 topic", &e);
+        ck.abort("create topic", &e);
         return ck;
     }
     let mut sent = 0;
@@ -838,13 +838,13 @@ async fn run(namesrv: &str) -> Checker {
         sent += fx.produce_to(&topic, q, PER_QUEUE).await;
     }
     ck.check(
-        &format!("发送 {N_MSG} 条全部 SEND_OK"),
+        &format!("all {N_MSG} sends are SEND_OK"),
         sent == N_MSG,
         &format!("sent={sent}"),
     );
     let mqs = p2_queues(&mut ck, &fx, &topic).await;
     if mqs.len() != QUEUE_NUMS as usize {
-        ck.abort("队列不足", "后续场景跳过");
+        ck.abort("not enough queues", "skipping the later scenarios");
     } else {
         p3_offsets(&mut ck, &fx, &mqs).await;
         p4_pull_all(&mut ck, &fx, &topic, &mqs).await;

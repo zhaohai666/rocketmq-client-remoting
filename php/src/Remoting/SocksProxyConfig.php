@@ -11,9 +11,9 @@ final class SocksProxyConfig
 
     public function __construct(
         private ?string $addr = null,
-        /** 认证用户名（SOCKS5 用户名/密码子协商；SOCKS4 作为 userid）。 */
+        /** Auth username (SOCKS5 username/password sub-negotiation; used as userid for SOCKS4). */
         private ?string $username = null,
-        /** 认证密码（仅 SOCKS5 子协商使用）。 */
+        /** Auth password (used only in the SOCKS5 sub-negotiation). */
         private ?string $password = null,
         private string $version = self::VERSION_SOCKS5,
     ) {
@@ -59,15 +59,16 @@ final class SocksProxyConfig
         $this->version = $version;
     }
 
-    /** 是否已配置到可用状态（addr 非空）。 */
+    /** Whether configured to a usable state (addr non-empty). */
     public function isConfigured(): bool
     {
         return $this->addr !== null && $this->addr !== '';
     }
 
     /**
-     * 归一化版本字段：'4'/'socks4' → socks4，'5'/'socks5' → socks5；其余抛
-     * InvalidArgumentException（配置写错在启动期暴露，而不是连接期静默降级）。
+     * Normalizes the version field: '4'/'socks4' -> socks4, '5'/'socks5' -> socks5; anything else
+     * throws InvalidArgumentException (misconfigurations surface at startup instead of degrading
+     * silently at connect time).
      */
     public function normalizedVersion(): string
     {

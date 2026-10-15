@@ -17,7 +17,7 @@ from common.message import Message, MessageBatch, MessageQueue
 TOPIC = "AccumTestTopic"
 
 
-# ---------------------------------------------------------------- 夹具
+# ---------------------------------------------------------------- Fixtures
 
 class FakeProducer:
     pass
@@ -75,18 +75,18 @@ def wait_until(predicate, timeout: float = 5.0) -> bool:
 
 
 def start_daemon(target) -> threading.Thread:
-    """起一个 **daemon** 线程。
+    """Start a **daemon** thread.
 
-    ⚠ 必须 daemon：不少用例是"多条消息并发 add、攒在同一批里、由主线程手动触发发送"，
-    一旦断言提前失败，还阻塞在 ``Condition.wait()`` 里的工作线程就会吊住 pytest 进程
-    （非 daemon 线程会挡住解释器退出）。
+    ⚠ Must be daemon: many tests are "multiple messages added concurrently, gathered in the same batch, with the send manually triggered by the main thread";
+    if an assertion fails early, worker threads still blocked in ``Condition.wait()`` would hang the pytest process
+    (non-daemon threads block interpreter exit).
     """
     thread = threading.Thread(target=target, daemon=True)
     thread.start()
     return thread
 
 
-# ---------------------------------------------------------------- 参数
+# ---------------------------------------------------------------- Parameters
 
 def test_default_params_match_the_producer_contract():
     acc = ProduceAccumulator("params")
@@ -139,13 +139,13 @@ def test_init_produce_accumulator_syncs_thresholds_and_reuses_by_client_id():
     producer.init_produce_accumulator()
 
     acc = producer.produce_accumulator
-    assert acc is get_or_create_produce_accumulator(client_id)   # 按 clientId 复用
+    assert acc is get_or_create_produce_accumulator(client_id)   # reused by clientId
     assert acc.get_batch_max_delay_ms() == 50
     assert acc.get_batch_max_bytes() == 1024
     assert acc.total_hold_size == 4096
     producer.set_batch_max_delay_ms(80)
     assert acc.get_batch_max_delay_ms() == 80
-    # 再来一个同 clientId 的 producer → 复用同一个累加器
+    # Another producer with the same clientId → reuses the same accumulator
     second = DefaultMQProducer("PG_AccumInit2")
     second.client_id = client_id
     second.init_produce_accumulator()
@@ -155,7 +155,7 @@ def test_init_produce_accumulator_syncs_thresholds_and_reuses_by_client_id():
 def test_try_add_message_gate_and_release():
     acc = ProduceAccumulator("gate")
     acc.total_batch_max_bytes(10)
-    msg = Message(TOPIC, b"1234567890")          # 10 字节
+    msg = Message(TOPIC, b"1234567890")          # 10 bytes
     assert acc.try_add_message(msg) is True
     assert acc.currently_hold_size == 10
     assert acc.try_add_message(Message(TOPIC, b"x")) is False
@@ -163,28 +163,28 @@ def test_try_add_message_gate_and_release():
     acc.release_hold(10)
     assert acc.currently_hold_size == 0
     assert acc.try_add_message(Message(TOPIC, b"x")) is True
-    # 空 body 不记账但仍然放行
+    # An empty body is not accounted for but is still let through
     acc.release_hold(1)
     acc.total_batch_max_bytes(5)
     assert acc.try_add_message(Message(TOPIC, b"")) is True
     assert acc.currently_hold_size == 0
 
 
-# ---------------------------------------------------------------- 归并
+# ---------------------------------------------------------------- Merging
 
 def test_sync_batch_merges_messages_and_returns_per_message_results():
-    """同步：5 条同键消息攒成 1 个 MessageBatch，各自拿到自己的拆条 SendResult。"""
+    """Sync: 5 same-key messages gather into 1 MessageBatch, each getting its own split SendResult."""
     producer = FakeProducer(SendResult(
         SendStatus.SEND_OK, "id-0,id-1,id-2,id-3,id-4", MessageQueue(TOPIC, "broker-a", 0),
         100, None, "off-0,off-1,off-2,off-3,off-4"))
     acc = ProduceAccumulator("sync-batch")
-    # holdMs 拉长到 3s：保证 5 条都进同一批（测试里手动触发发送，不等这 3s）
+    # holdMs stretched to 3s: ensures all 5 enter the same batch (the test triggers the send manually, without waiting the 3s)
     acc.batch_max_delay_ms(3000)
 
     messages = make_messages(5)
-    # 真实调用链里是 ``producer._can_batch`` 先 ``try_add_message`` 记下字节额度，
-    # 累加器在批次发完后再归还；这里直接调累加器，就得自己补上记账，否则
-    # ``release_hold`` 会把额度减成负数。
+    # In the real call chain, ``producer._can_batch`` first calls ``try_add_message`` to record the byte quota,
+    # and the accumulator returns it after the batch is sent; calling the accumulator directly here means the accounting must be done manually, otherwise
+    # ``release_hold`` would drive the quota negative.
     for m in messages:
         assert acc.try_add_message(m) is True
     collected: List[SendResult] = []
@@ -196,7 +196,7 @@ def test_sync_batch_merges_messages_and_returns_per_message_results():
             collected.append(result)
 
     threads = [start_daemon(lambda m=m: sender(m)) for m in messages]
-    # 等 5 条都进批（它们此时都阻塞在 add 里等阈值）
+    # Wait for all 5 to enter the batch (they are all blocked in add waiting for the threshold)
     batch = wait_until(lambda: len(acc.sync_send_batches_snapshot()) == 1 and
                        acc.sync_send_batches_snapshot()[0].count == 5, timeout=3.0)
     assert batch is True
@@ -204,7 +204,7 @@ def test_sync_batch_merges_messages_and_returns_per_message_results():
     assert the_batch.send_callbacks == []
     assert the_batch.keys == set()
 
-    # 手动触发（等价于守卫线程在 holdMs 到点后叫醒某一个等待者去发）
+    # Manually trigger (equivalent to the guard thread waking one waiter to send after holdMs elapses)
     with the_batch.cond:
         the_batch._send_sync()
     for t in threads:
@@ -214,8 +214,8 @@ def test_sync_batch_merges_messages_and_returns_per_message_results():
     assert len(producer.sent) == 1
     sent_msg, sent_mq, sent_cb = producer.sent[0]
     assert isinstance(sent_msg, MessageBatch)
-    assert sent_mq is None                      # 没指定 mq → 由 producer 轮询选
-    assert sent_cb is None                      # 同步路径没有回调
+    assert sent_mq is None                      # no mq specified → selected by the producer's round-robin
+    assert sent_cb is None                      # the sync path has no callback
     assert len(sent_msg.body) == len(reference_batch_body(messages))
 
     assert len(collected) == 5
@@ -224,12 +224,12 @@ def test_sync_batch_merges_messages_and_returns_per_message_results():
         position = int(result.msg_id.split("-")[1])
         assert result.offset_msg_id == "off-%d" % position
         assert result.queue_offset == 100 + position
-    # 发完归还全局额度
+    # return the global quota after sending
     assert acc.currently_hold_size == 0
 
 
 def test_async_batch_merges_and_fires_every_callback():
-    """异步：5 条同键消息由一个守卫线程攒成 1 批，回调各自拿到拆条结果。"""
+    """Async: 5 same-key messages are gathered into 1 batch by a guard thread, and each callback gets its own split result."""
     producer = FakeProducer(SendResult(
         SendStatus.SEND_OK, "a,b,c,d,e", MessageQueue(TOPIC, "broker-a", 0), 7, None, "p,q,r,s,t"))
     acc = ProduceAccumulator("async-batch")
@@ -242,7 +242,7 @@ def test_async_batch_merges_and_fires_every_callback():
         for msg, cb in zip(messages, callbacks):
             acc.send_async(msg, cb, producer)
 
-        # 异步批次靠**守卫线程**唤醒：每 max(1, holdMs/2) ms 扫一遍，readyToSend 就发
+        # Async batches are woken by the **guard thread**: it scans every max(1, holdMs/2) ms and sends when readyToSend
         assert wait_until(lambda: all(cb.total() == 1 for cb in callbacks), timeout=5.0)
     finally:
         acc.shutdown()
@@ -254,15 +254,15 @@ def test_async_batch_merges_and_fires_every_callback():
     assert len(producer.sent) == 1
     sent_msg, _, sent_cb = producer.sent[0]
     assert isinstance(sent_msg, MessageBatch)
-    assert sent_cb is not None                  # 异步路径回调不为 None
-    # 单线程依次 add → 批内顺序确定，可以逐字节比
+    assert sent_cb is not None                  # the async path's callback is not None
+    # Single-threaded sequential add -> the in-batch order is deterministic, so a byte-by-byte comparison is possible
     assert sent_msg.body == reference_batch_body(messages)
     assert sent_msg.get_keys() == ""
     assert acc.currently_hold_size == 0
 
 
 def test_skip_results_are_shared_when_msg_id_has_no_comma():
-    """老 broker / 单条应答：msgId 不含逗号时所有下标共享同一个 SendResult 对象。"""
+    """Old broker / single-message reply: when msgId contains no comma, all indexes share the same SendResult object."""
     shared = SendResult(SendStatus.SEND_OK, "single-id", MessageQueue(TOPIC, "b", 0), 3)
     producer = FakeProducer(shared)
     acc = ProduceAccumulator("shared-result")
@@ -310,7 +310,7 @@ def test_send_with_message_queue_pins_the_batch():
     assert len(producer.sent) == 1
     assert producer.sent[0][1] == mq
 
-    # 异步 + 指定 mq
+    # async + specified mq
     producer2 = FakeProducer()
     acc2 = ProduceAccumulator("pinned-async")
     acc2.start()
@@ -328,7 +328,7 @@ def test_send_with_message_queue_pins_the_batch():
 
 
 def test_batch_merges_keys_with_space_separator():
-    """同步批次的 KEYS = 全体子消息 keys 的并集，空格 join（MessageConst.KEY_SEPARATOR）。"""
+    """The sync batch's KEYS = the union of all sub-message keys, space-joined (MessageConst.KEY_SEPARATOR)."""
     producer = FakeProducer()
     acc = ProduceAccumulator("keys")
     acc.batch_max_delay_ms(3000)
@@ -345,11 +345,11 @@ def test_batch_merges_keys_with_space_separator():
 
     keys = producer.sent[0][0].get_keys()
     assert set(keys.split(" ")) == {"k1", "k2", "k3"}
-    # 同样只比长度（两条消息是两个线程并发 add 的，批内顺序不定）
+    # Only the length is compared here too (the two messages are added concurrently by two threads, so the in-batch order is indeterminate)
     assert len(producer.sent[0][0].body) == len(reference_batch_body([m1, m2]))
 
 
-# ---------------------------------------------------------------- 分区键
+# ---------------------------------------------------------------- Partition key
 
 def test_aggregate_key_partitions_by_topic_mq_wait_and_tag():
     mq = MessageQueue(TOPIC, "b", 0)
@@ -360,7 +360,7 @@ def test_aggregate_key_partitions_by_topic_mq_wait_and_tag():
     assert AggregateKey.of_message(base) != AggregateKey.of_message_with_mq(base, mq)
     assert AggregateKey.of_message_with_mq(base, mq) == AggregateKey.of_message_with_mq(
         Message(TOPIC, b"z", tags="TagA"), mq)
-    # waitStoreMsgOK 参与分区
+    # waitStoreMsgOK participates in partitioning
     other_wait = Message(TOPIC, b"y", tags="TagA")
     other_wait.set_wait_store_msg_ok(False)
     assert AggregateKey.of_message(base) != AggregateKey.of_message(other_wait)
@@ -391,7 +391,7 @@ def test_different_tags_do_not_merge():
     assert tags == ["TagA", "TagB"]
 
 
-# ---------------------------------------------------------------- 守卫线程
+# ---------------------------------------------------------------- Guard thread
 
 def test_guard_keeps_closed_batch_until_next_send():
     pass
@@ -406,10 +406,10 @@ def test_guard_keeps_closed_batch_until_next_send():
         assert len(snapshot) == 1
         assert snapshot[0].closed is True
         assert snapshot[0].messages_size > 0
-        # 全局额度已归还（finally 里 currentlyHoldSize -= messagesSize）
+        # the global quota has been returned (currentlyHoldSize -= messagesSize in finally)
         assert acc.currently_hold_size == 0
 
-        # 下一次同键发送：摘掉 closed 批次 → 新建 → 再发一批
+        # The next same-key send: drop the closed batch -> create a new one -> send another batch
         second = make_messages(1)[0]
         assert acc.try_add_message(second) is True
         acc.send(second, producer)
@@ -429,14 +429,14 @@ def test_accumulator_can_restart_after_shutdown():
         producer = FakeProducer()
         msg = make_messages(1)[0]
         assert acc.try_add_message(msg) is True
-        acc.send(msg, producer)     # 靠重启后的守卫线程叫醒并发送
+        acc.send(msg, producer)     # woken and sent by the restarted guard thread
         assert len(producer.sent) == 1
     finally:
         acc.shutdown()
 
 
 def test_guard_removes_empty_batch_without_sending():
-    """没人真的加消息的空批次：守卫线程直接置 closed + 摘表，不发任何东西。"""
+    """An empty batch that nobody actually adds messages to: the guard thread directly sets closed + removes it from the table, sending nothing."""
     producer = FakeProducer()
     acc = ProduceAccumulator("guard-empty")
     from client.produce_accumulator import MessageAccumulation
@@ -483,8 +483,8 @@ def test_can_batch_rejects_delay_retry_and_pgroup():
 
 
 class StubProducer(DefaultMQProducer):
-    """覆写 ``send_direct`` 的真 producer：既能走 ``send_by_accumulator`` 的本地校验，
-    又不真的发网络请求。"""
+    """A real producer overriding ``send_direct``: it goes through ``send_by_accumulator``'s local validation
+    without actually sending a network request."""
 
     def __init__(self, group: str):
         super().__init__(group)
@@ -510,7 +510,7 @@ def test_send_by_accumulator_stamps_uniq_id_then_accumulates():
     thread = start_daemon(lambda: stub.send_by_accumulator(msg, None, None))
     assert wait_until(lambda: acc.sync_send_batches_snapshot() and
                       acc.sync_send_batches_snapshot()[0].count == 1, timeout=3.0)
-    # 攒批路径已经给这条消息打上 UNIQ_KEY（否则批量体的每条子消息都没有客户端 ID）
+    # The batching path has already stamped UNIQ_KEY on this message (otherwise every sub-message of the batch body would lack a client ID)
     assert get_uniq_id(msg)
 
     batch = acc.sync_send_batches_snapshot()[0]
@@ -531,8 +531,8 @@ def test_message_batch_never_enters_accumulator():
     assert producer.get_auto_batch() is True
 
     batch = MessageBatch.generate_from_list([Message(TOPIC, b"a")])
-    # 没 start 过 → 直发路径第一件事就是 _require_client()，抛"not started"；
-    # 若它进了累加器，异常会变成累加器内部的行为（且不会是这个文案）。
+    # Not started -> the direct-send path's first act is _require_client(), throwing "not started";
+    # if it entered the accumulator, the exception would become the accumulator's internal behavior (and would not be this wording).
     with pytest.raises(MQClientException) as exc:
         producer.send(batch)
     assert "not started" in str(exc.value)

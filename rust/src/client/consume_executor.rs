@@ -1,20 +1,20 @@
-//! * 队列**无界**，于是 `execute` 里「线程数超过 core」这条路径永远不会走
-//!   （只有 `poolSize < corePoolSize` 才新建线程，否则入队），**真实并发度 == corePoolSize**；
+//! * The queue is **unbounded**, so the "threads beyond core" path in `execute` can never trigger
+//!   (only `poolSize < corePoolSize` spawns a thread, otherwise the task is queued), **the real concurrency == corePoolSize**;
 //! * `AbstractConsumeMessageService#updateCorePoolSize` → `ThreadPoolExecutor#setCorePoolSize`
-//!   —— 运行时改的就是这个并发度，`getCorePoolSize()` 能读回来，所以
-//!   `update_core_pool_size` / `get_core_pool_size`（在 `consumer.rs` 一侧）有真实语义。
+//!   -- what changes at runtime is exactly this concurrency, and `getCorePoolSize()` reads it back, so
+//!   `update_core_pool_size` / `get_core_pool_size` (on the `consumer.rs` side) carry real semantics.
 //!
 //!
 //!
-//! # 给后续 `consumer.rs` 留的接缝（seam）
-//! 本模块**不认识**消息、listener、`MQClientInstance`，也就无需任何消费者侧 trait：
-//! 唯一接缝是 [`ConsumeTask`]（= `Pin<Box<dyn Future<Output = ()> + Send>>`，
-//! 一个自包含的异步闭包）。消费回调的接缝
-//! 已在 [`super::result`] 里定义好 ——
-//! [`MessageListenerConcurrently`](super::result::MessageListenerConcurrently) 与
-//! [`MessageListenerOrderly`](super::result::MessageListenerOrderly)，都是 `Send + Sync`
-//! 的对象安全 trait，本模块刻意不重复定义（复用规则）。`consumer.rs` 要写的就是
-//! POP 批任务的提交（把 `batch/pq/mq` 装进任务再 `submit`）：
+//! # The seam left for `consumer.rs`
+//! This module **knows nothing** about messages, listeners, or `MQClientInstance`, so it needs no consumer-side trait:
+//! the only seam is [`ConsumeTask`] (= `Pin<Box<dyn Future<Output = ()> + Send>>`,
+//! a self-contained async closure). The seam for consume callbacks
+//! is already defined in [`super::result`] --
+//! [`MessageListenerConcurrently`](super::result::MessageListenerConcurrently) and
+//! [`MessageListenerOrderly`](super::result::MessageListenerOrderly), both `Send + Sync`
+//! object-safe traits that this module deliberately does not redefine (reuse rule). What `consumer.rs` writes is
+//! the submission of POP batch tasks (pack `batch/pq/mq` into a task and `submit`):
 //!
 //! ```text
 //! executor.submit(Box::pin(async move { consume_pop_batch(listener, client, batch, pq, mq).await }))
@@ -40,27 +40,27 @@ pub const DEFAULT_THREAD_NAME_PREFIX: &str = "rmq-consume";
 
 pub const SHORT_MAX_VALUE: i32 = 32767;
 
-/// 投递给执行器的一个任务。
+/// One task handed to the executor.
 ///
-/// 这是本模块对外的**唯一接缝**：future 天生惰性，「构造」（求实参）与
-/// 「执行」（worker 领到任务）两个时点天然分开。用法：`executor.submit(Box::pin(async move { .. }))`。
+/// This is the module's **only outward seam**: futures are inherently lazy, so "construction" (evaluating the arguments) and
+/// "execution" (a worker picks up the task) are naturally separate points in time. Usage: `executor.submit(Box::pin(async move { .. }))`.
 pub type ConsumeTask = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
-/// 取锁。
+/// Takes the lock.
 ///
-/// 中毒时照用：池子状态只有计数和队列，panic 过的持有者不会留下半致的不变量，
-/// 而让整个消费池彻底失联才是更大的问题。
+/// Used as-is when poisoned: the pool state is only counters and a queue, a panicked holder cannot leave half-consistent invariants,
+/// and losing the whole consume pool outright is the bigger problem.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 池子状态：核心/最大并发、任务队列、在编 worker 数等。
+/// Pool state: core/max concurrency, task queue, live worker count, and so on.
 struct State {
     core: i32,
     max: i32,
     queue: VecDeque<ConsumeTask>,
     workers: i32,
-    /// 线程名序号，名字格式 `<prefix>-<seq>`，每次 spawn 递增
+    /// Thread-name sequence number, name format `<prefix>-<seq>`, incremented on every spawn
     seq: u64,
     /// `self._shutdown`
     shutdown: bool,
@@ -74,10 +74,10 @@ impl State {
         name
     }
 
-    /// worker 离场扣账（名册摘除的口径见差异 #6）。
+    /// Accounts for a worker leaving (the roster-removal accounting; see difference #6).
     ///
-    /// **调用方必须已持锁，且「是否该退出」的判断与本次扣账在同一临界区内**：
-    /// 否则两个超编 worker 同时超时会让 core 内的 worker 也被扣掉。
+    /// **The caller must already hold the lock, and the "should this worker exit" check and this accounting must sit in the same critical section**:
+    /// otherwise two over-core workers timing out at once would also deduct a core worker.
     fn retire_locked(&mut self, name: &str) {
         self.workers -= 1;
         rmq_debug!(
@@ -88,7 +88,7 @@ impl State {
     }
 }
 
-/// 手工实现：队列里的 [`ConsumeTask`] 是 `dyn Future`，没有 `Debug`，所以只报可观测计数。
+/// Hand-written: the queued [`ConsumeTask`] is a `dyn Future` without `Debug`, so only observable counters are reported.
 impl fmt::Debug for State {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("State")
@@ -104,20 +104,20 @@ impl fmt::Debug for State {
 
 struct Inner {
     state: Mutex<State>,
-    /// 条件变量：有新任务 / 已关闭时叫醒空闲 worker。
+    /// Condition variable: wakes idle workers on new tasks / shutdown.
     work_available: Notify,
-    /// worker 走光时叫醒 [`ConsumeExecutor::await_termination`]。
+    /// Wakes [`ConsumeExecutor::await_termination`] when the last worker leaves.
     retired: Notify,
-    /// `self._handler_exceptions`：被吞掉的任务异常计数。
+    /// `self._handler_exceptions`: count of swallowed task exceptions.
     handler_exceptions: AtomicUsize,
     keep_alive: Duration,
     prefix: String,
-    /// [`ConsumeExecutor::with_handle`] 注入的句柄；`None` 表示每次现取 `Handle::try_current()`。
+    /// The handle injected via [`ConsumeExecutor::with_handle`]; `None` means `Handle::try_current()` is fetched each time.
     pinned: Mutex<Option<Handle>>,
 }
 
-/// `Clone` 共享同一个池（内部 `Arc`）：`consumer.rs`
-/// 直接 clone 给各 POP 循环即可，不要再套一层 `Arc<ConsumeExecutor>`。
+/// `Clone` shares the same pool (internally an `Arc`): `consumer.rs`
+/// can simply clone it into each POP loop instead of wrapping it in another `Arc<ConsumeExecutor>`.
 #[derive(Clone)]
 pub struct ConsumeExecutor {
     inner: Arc<Inner>,
@@ -138,7 +138,7 @@ impl fmt::Debug for ConsumeExecutor {
 }
 
 impl ConsumeExecutor {
-    /// keep_alive 60s、线程名前缀 `rmq-consume`（默认参数）。
+    /// keep_alive 60s, thread name prefix `rmq-consume` (default parameters).
     pub fn new(core_pool_size: i32, maximum_pool_size: i32) -> ConsumeExecutor {
         ConsumeExecutor::with_params(
             core_pool_size,
@@ -148,7 +148,7 @@ impl ConsumeExecutor {
         )
     }
 
-    /// 显式给全参数的构造（POP 路径实际用的形态）。
+    /// Constructor with all parameters given explicitly (the shape actually used by the POP path).
     pub fn with_params(
         core_pool_size: i32,
         maximum_pool_size: i32,
@@ -176,31 +176,31 @@ impl ConsumeExecutor {
         }
     }
 
-    /// 固定用某个运行时建 worker（对齐 `ConsumerStatsManager::start_with_handle` 的口径）。
+    /// Always builds workers on a fixed runtime (same accounting as `ConsumerStatsManager::start_with_handle`).
     ///
-    /// 不设置时每次现取 `Handle::try_current()`；`MQClientInstance` 自带专用运行时时，
-    /// 注入进来才能保证消费 worker 与传输层在同一个池里。
+    /// When unset, `Handle::try_current()` is fetched each time; when `MQClientInstance` carries its own dedicated runtime,
+    /// injecting it is what guarantees the consume workers share a pool with the transport layer.
     #[must_use]
     pub fn with_handle(self, handle: &Handle) -> ConsumeExecutor {
         *lock(&self.inner.pinned) = Some(handle.clone());
         self
     }
 
-    // ---------------- 对外 API ----------------
+    // ---------------- public API ----------------
 
-    /// 失败只有两种：池已关闭（错误文案逐字校验）、拿不到 tokio
-    /// 运行时（差异 #1）。任务本身没有结果，所以 `Ok(())` 只表示「入队了」。
+    /// There are only two failures: the pool is shut down (the error text is verified verbatim) and no tokio
+    /// runtime available (difference #1). The task itself has no result, so `Ok(())` only means "enqueued".
     pub fn submit(&self, task: ConsumeTask) -> Result<()> {
         let handle = self.resolve_handle()?;
         self.submit_with(&handle, task)
     }
 
-    /// [`ConsumeExecutor::submit`] 的显式句柄版本，供非异步上下文（独立 std 线程等）调用。
+    /// Explicit-handle variant of [`ConsumeExecutor::submit`], for callers outside async contexts (standalone std threads and the like).
     pub fn submit_with(&self, handle: &Handle, task: ConsumeTask) -> Result<()> {
         let spawn = {
             let mut state = lock(&self.inner.state);
             if state.shutdown {
-                // 错误文案逐字校验
+                // error text verified verbatim
                 bail!("ConsumeExecutor has been shut down");
             }
             state.queue.push_back(task);
@@ -213,7 +213,7 @@ impl ConsumeExecutor {
         if let Some(name) = spawn {
             spawn_worker(&self.inner, handle, name);
         }
-        // 这里是全员唤醒（见差异 #4）
+        // this is the wake-everyone path (see difference #4)
         self.inner.work_available.notify_waiters();
         Ok(())
     }
@@ -228,20 +228,20 @@ impl ConsumeExecutor {
     /// }
     /// ```
     ///
-    /// 即：core 变大时按 `min(delta, 队列长度)` **补齐** worker（不是「补到跟队列一样多」），
-    /// core 变小时只让超编的空闲 worker 走 keep_alive 退出逻辑（不打断在跑的任务）。
-    /// 记账（`workers` 抬升）在返回前就完成，所以 `worker_count()` 立刻可读。
+    /// That is: when core grows, **top up** workers by `min(delta, queue length)` (not "match the queue length"),
+    /// and when core shrinks, only over-core idle workers go through the keep_alive exit path (running tasks are not interrupted).
+    /// The accounting (`workers` raised) completes before returning, so `worker_count()` is readable at once.
     ///
-    /// `n < 0` 返回 `Err`（错误文案逐字校验）。
+    /// `n < 0` returns `Err` (the error text is verified verbatim).
     pub fn set_core_pool_size(&self, n: i32) -> Result<()> {
         let handle = self.resolve_handle()?;
         self.set_core_pool_size_with(&handle, n)
     }
 
-    /// [`ConsumeExecutor::set_core_pool_size`] 的显式句柄版本。
+    /// Explicit-handle variant of [`ConsumeExecutor::set_core_pool_size`].
     pub fn set_core_pool_size_with(&self, handle: &Handle, n: i32) -> Result<()> {
         if n < 0 {
-            // 错误文案逐字校验
+            // error text verified verbatim
             bail!("core pool size must be >= 0");
         }
         let spawned = {
@@ -267,8 +267,8 @@ impl ConsumeExecutor {
         for name in spawned {
             spawn_worker(&self.inner, handle, name);
         }
-        // setCorePoolSize 本身不 notify（新起的线程自己会看队列）；这里补一次唤醒，
-        // 让「core 抬高但被 max 卡住没起新线程」时的空闲 worker 也能立刻来领任务。
+        // setCorePoolSize itself does not notify (fresh threads look at the queue themselves); this extra wake-up
+        // lets idle workers pick up tasks at once even when "core rose but max blocked any new thread".
         self.inner.work_available.notify_waiters();
         Ok(())
     }
@@ -277,7 +277,7 @@ impl ConsumeExecutor {
         lock(&self.inner.state).core
     }
 
-    /// 无界队列下它只是「补线程」路径的上界，正常情况下够不到。
+    /// Under an unbounded queue it is only the upper bound of the top-up path; normally unreachable.
     pub fn get_max_pool_size(&self) -> i32 {
         lock(&self.inner.state).max
     }
@@ -290,7 +290,7 @@ impl ConsumeExecutor {
         lock(&self.inner.state).queue.len()
     }
 
-    /// 被吞掉的任务异常计数（仅供观测/单测）。
+    /// Count of swallowed task exceptions (for observation/tests only).
     pub fn handler_exception_count(&self) -> usize {
         self.inner.handler_exceptions.load(Ordering::Acquire)
     }
@@ -302,17 +302,17 @@ impl ConsumeExecutor {
             state.shutdown = true;
             first_time
         };
-        // 全员唤醒
+        // wake everyone
         self.inner.work_available.notify_waiters();
         if !first_time {
             rmq_debug!("consume executor already shut down, nothing to do");
         }
     }
 
-    /// 等所有 worker 退出。
+    /// Waits for all workers to exit.
     pub async fn await_termination(&self) {
         loop {
-            // 先登记唤醒凭据再看计数：「最后一个 worker 刚好在此刻退出」不会丢通知
+            // Register the wake-up ticket before reading the count: "the last worker exits right now" cannot lose the notification
             let notified = self.inner.retired.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
@@ -328,7 +328,7 @@ impl ConsumeExecutor {
         self.await_termination().await;
     }
 
-    // ---------------- 内部 ----------------
+    // ---------------- internals ----------------
 
     fn resolve_handle(&self) -> Result<Handle> {
         let pinned = lock(&self.inner.pinned).clone();
@@ -344,35 +344,35 @@ impl ConsumeExecutor {
     }
 }
 
-/// 起一个 worker 任务。
+/// Spawns one worker task.
 fn spawn_worker(inner: &Arc<Inner>, handle: &Handle, name: String) {
     rmq_debug!("consume executor spawn worker {name}");
     handle.spawn(worker_loop(Arc::clone(inner), handle.clone(), name));
 }
 
-/// worker 主循环：领任务 → 跑 → 再领，直到该退出。
+/// Worker main loop: take a task → run it → take the next, until it should exit.
 async fn worker_loop(inner: Arc<Inner>, handle: Handle, name: String) {
     rmq_debug!("consume executor worker {name} started");
     loop {
         let task = match take_task(&inner, &name).await {
             Some(task) => task,
-            None => return, // 退出记账已在 `take_task` 内做完
+            None => return, // the exit accounting is already done inside `take_task`
         };
         run_task(&inner, &handle, task, &name).await;
     }
 }
 
-/// 持锁等待 + 队首领取那一步。
+/// The hold-lock-wait + pop-from-queue-front step.
 ///
-/// 返回 `None` 表示本 worker 该退出了（等价 `workers -= 1` + 名册摘除）。
+/// Returning `None` means this worker should exit (equivalent to `workers -= 1` + roster removal).
 async fn take_task(inner: &Arc<Inner>, name: &str) -> Option<ConsumeTask> {
     loop {
-        // 先登记唤醒凭据、再看队列：`notify_waiters` 只叫醒当时已在等的人
+        // Register the wake-up ticket before looking at the queue: `notify_waiters` only wakes those already waiting at that moment
         let notified = inner.work_available.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
 
-        // ---- 该退出则退出，否则领取队首任务 ----
+        // ---- exit if due, otherwise take the task at the queue front ----
         {
             let mut state = lock(&inner.state);
             if state.shutdown && state.queue.is_empty() {
@@ -389,14 +389,14 @@ async fn take_task(inner: &Arc<Inner>, name: &str) -> Option<ConsumeTask> {
             }
         }
 
-        // ---- 带超时地等待叫醒（新任务 / 关闭） ----
+        // ---- wait with a timeout to be woken (new task / shutdown) ----
         let keep_alive = inner.keep_alive;
         if tokio::time::timeout(keep_alive, notified).await.is_ok() {
-            // 被新任务 / shutdown 叫醒：回到循环顶重看队列
+            // woken by a new task / shutdown: back to the loop top to re-check the queue
             continue;
         }
 
-        // ---- 空闲超时，只有超编线程（> core）才退出 ----
+        // ---- idle timeout: only over-core threads (> core) exit ----
         let mut state = lock(&inner.state);
         if state.queue.is_empty() && !state.shutdown && state.workers > state.core {
             state.retire_locked(name);
@@ -414,7 +414,7 @@ async fn take_task(inner: &Arc<Inner>, name: &str) -> Option<ConsumeTask> {
     }
 }
 
-/// 跑一个任务：吞掉任何异常并计数。
+/// Runs one task: swallows any exception and counts it.
 async fn run_task(inner: &Arc<Inner>, handle: &Handle, task: ConsumeTask, name: &str) {
     match handle.spawn(task).await {
         Ok(()) => {}
@@ -423,7 +423,7 @@ async fn run_task(inner: &Arc<Inner>, handle: &Handle, task: ConsumeTask, name: 
             rmq_error!("consume executor task raised, worker kept alive: {name} -> {err}");
         }
         Err(err) => {
-            // 任务没跑完就被运行时回收（例如整个 runtime 正在退出），不算任务异常
+            // the task was reclaimed by the runtime before finishing (e.g. the whole runtime is shutting down), not counted as a task exception
             rmq_warn!("consume executor task dropped before completion: {name} -> {err}");
         }
     }
@@ -435,7 +435,7 @@ mod tests {
     use std::sync::atomic::AtomicI32;
     use tokio::sync::oneshot;
 
-    /// 把任意异步块变成 [`ConsumeTask`]。
+    /// Turns any async block into a [`ConsumeTask`].
     fn task<F>(future: F) -> ConsumeTask
     where
         F: Future<Output = ()> + Send + 'static,
@@ -443,7 +443,7 @@ mod tests {
         Box::pin(future)
     }
 
-    /// 只让出调度权、不睡时间窗地等条件成立（失败即断言，结果确定）。
+    /// Waits for a condition by only yielding the scheduler, never sleeping a time window (asserts on failure, deterministic result).
     async fn until(label: &str, actual: impl FnMut() -> bool) {
         let mut actual = actual;
         for _ in 0..200 {
@@ -455,11 +455,11 @@ mod tests {
         assert!(actual(), "{label} never happened");
     }
 
-    /// 「占住 worker 直到闸门放开」的任务 + 报到通道。
+    /// A task that "holds a worker until the gate opens" plus its check-in channel.
     ///
-    /// 闸门用 [`tokio::sync::Mutex`]：测试持有时任务全部阻塞在里面，
-    /// **报到发生在阻塞之前**，所以测试观察到
-    /// `started` 就能确定该 worker 已被占住。
+    /// The gate is a [`tokio::sync::Mutex`]: while the test holds it, tasks all block inside,
+    /// and **check-in happens before blocking**, so once the test observes
+    /// `started` it can be sure the worker is held.
     fn blocked_task(gate: &Arc<tokio::sync::Mutex<()>>) -> (ConsumeTask, oneshot::Receiver<()>) {
         let (started_tx, started_rx) = oneshot::channel();
         let gate = Arc::clone(gate);
@@ -472,11 +472,11 @@ mod tests {
         )
     }
 
-    // ---------------------------------------------------- 执行器行为（7 项）
+    // ---------------------------------------------------- executor behaviour (7 items)
 
     #[tokio::test]
     async fn spawns_up_to_core_then_queues() {
-        // core=2：前两个任务各起一个 worker；第 3 个任务只入队，不再建 worker
+        // core=2: the first two tasks each spawn a worker; the 3rd task only queues, no more workers
         let ex = ConsumeExecutor::with_params(2, 8, Duration::from_secs(30), "rmq-test");
         let gate = Arc::new(tokio::sync::Mutex::new(()));
         let _hold = gate.lock().await;
@@ -488,7 +488,7 @@ mod tests {
         ex.submit(b).expect("submit b");
         b_started.await.expect("worker b running");
 
-        // 两个 worker 都被占住，第 3 个任务只能在队列里等
+        // both workers are held, so the 3rd task can only wait in the queue
         ex.submit(task(async {})).expect("submit c");
         assert_eq!(ex.worker_count(), 2);
         assert_eq!(ex.queued_count(), 1);
@@ -514,7 +514,7 @@ mod tests {
         assert_eq!(ex.worker_count(), 1);
         assert_eq!(ex.queued_count(), 3);
 
-        // delta=3、队列长度=3 → min 之后补 3 个；记账在调用返回前就完成
+        // delta=3, queue length=3 → min yields a top-up of 3; the accounting completes before the call returns
         ex.set_core_pool_size(4).expect("valid core");
         assert_eq!(ex.worker_count(), 4);
         assert_eq!(ex.get_core_pool_size(), 4);
@@ -531,7 +531,7 @@ mod tests {
         ex.set_core_pool_size(6).expect("valid core");
         assert_eq!(ex.get_core_pool_size(), 6);
         assert_eq!(ex.worker_count(), 0);
-        // 之后第一个任务把 workers 抬到 1（仍 <= core），不会一次建满
+        // the first task afterwards raises workers to 1 (still <= core), so it never builds them all at once
         ex.submit(task(async {})).expect("submit");
         assert_eq!(ex.worker_count(), 1);
         ex.shutdown_gracefully().await;
@@ -539,24 +539,24 @@ mod tests {
 
     #[tokio::test]
     async fn extra_worker_retires_after_keep_alive_core_worker_does_not() {
-        // > core 的 worker 空闲到 keep_alive 就退出；<= core 的永不退出
-        // 时钟暂停 + 手动 advance：不靠 sleep 抢时间窗
+        // a worker above core exits after idling out keep_alive; one at or below core never exits
+        // paused clock + manual advance: no racing a time window with sleep
         tokio::time::pause();
         let ex = ConsumeExecutor::with_params(1, 4, Duration::from_millis(200), "rmq-test");
 
         ex.submit(task(async {})).expect("submit 1");
         until("task 1 drained", || ex.queued_count() == 0).await;
-        ex.set_core_pool_size(2).expect("raise core"); // 队列空 → 不补 worker，core 现在是 2
+        ex.set_core_pool_size(2).expect("raise core"); // empty queue → no top-up, core is now 2
         assert_eq!(ex.get_core_pool_size(), 2);
         assert_eq!(ex.worker_count(), 1);
 
-        // 再提交一个任务把 worker 抬到 2（仍 <= core，超时后应当存活）
+        // submit one more task to raise workers to 2 (still <= core, must survive the timeout)
         ex.submit(task(async {})).expect("submit 2");
         until("task 2 drained", || ex.queued_count() == 0).await;
         assert_eq!(ex.worker_count(), 2);
 
-        // 多出的那个现在属于「超编」；逐步推进时钟：谁先 park 谁先超时，
-        // 但结果确定 —— 只会剩 core 那一个
+        // the extra one is now "over core"; advance the clock step by step: whoever parks first times out first,
+        // but the outcome is deterministic -- only the core one remains
         ex.set_core_pool_size(1).expect("lower core");
         for _ in 0..5 {
             if ex.worker_count() == 1 {
@@ -565,15 +565,15 @@ mod tests {
             tokio::time::advance(Duration::from_millis(300)).await;
             tokio::task::yield_now().await;
         }
-        assert_eq!(ex.worker_count(), 1, "超编 worker 应在 keep_alive 后退出");
+        assert_eq!(ex.worker_count(), 1, "the over-core worker should exit after keep_alive");
 
         for _ in 0..10 {
             tokio::time::advance(Duration::from_millis(300)).await;
             tokio::task::yield_now().await;
-            assert_eq!(ex.worker_count(), 1, "core 内的 worker 不能退出");
+            assert_eq!(ex.worker_count(), 1, "the core worker must not exit");
         }
 
-        // 活下来的那个 worker 确实还能干活
+        // the surviving worker can still do work
         let (done_tx, done_rx) = oneshot::channel();
         ex.submit(task(async move {
             let _ = done_tx.send(());
@@ -600,8 +600,8 @@ mod tests {
         }))
         .expect("submit next");
 
-        // 同一个 worker（core=1，不可能有第二个）领到了下一个任务，说明它没被 panic 杀死；
-        // 而它是先跑完/吞掉 boom 才来领任务的，所以计数已可读。
+        // the same worker (core=1, there cannot be a second) picked up the next task, so the panic did not kill it;
+        // and it ran through/swallowed boom before taking the task, so the counter is already readable.
         done_rx.await.expect("worker survived the panic");
         assert_eq!(ex.handler_exception_count(), 1);
         assert_eq!(ex.worker_count(), 1);
@@ -620,7 +620,7 @@ mod tests {
             err.to_string(),
             "MQClientException: ConsumeExecutor has been shut down"
         );
-        // 重复 shutdown 是 no-op
+        // a repeated shutdown is a no-op
         ex.shutdown();
         ex.await_termination().await;
     }
@@ -640,13 +640,13 @@ mod tests {
         assert_eq!(counter.load(Ordering::Acquire), 5);
         assert_eq!(ex.worker_count(), 0);
         assert_eq!(ex.queued_count(), 0);
-        // 跑完之后的提交依旧被拒
+        // submissions after the drain are still rejected
         assert!(ex.submit(task(async {})).is_err());
     }
 
     #[tokio::test]
     async fn zero_core_still_runs_tasks() {
-        // core=0（不建常驻 worker）时任务仍然会被执行（提交时按需起一个）
+        // with core=0 (no resident workers) tasks still execute (one is spawned on demand at submit time)
         let ex = ConsumeExecutor::with_params(0, 2, Duration::from_millis(50), "rmq-test");
         let (done_tx, done_rx) = oneshot::channel();
         ex.submit(task(async move {
@@ -659,18 +659,18 @@ mod tests {
         assert_eq!(ex.worker_count(), 0);
     }
 
-    // ---------------------------------------------------- 参数夹取 / 守卫 / 边界
+    // ---------------------------------------------------- parameter clamping / guards / boundaries
 
     #[test]
     fn sizes_are_clamped_like_golden() {
-        // core = max(0, core)；max = max(core, max)
+        // core = max(0, core); max = max(core, max)
         let ex = ConsumeExecutor::new(-3, -7);
         assert_eq!(ex.get_core_pool_size(), 0);
         assert_eq!(ex.get_max_pool_size(), 0);
 
         let ex = ConsumeExecutor::new(4, 2);
         assert_eq!(ex.get_core_pool_size(), 4);
-        assert_eq!(ex.get_max_pool_size(), 4, "max 不能低于 core");
+        assert_eq!(ex.get_max_pool_size(), 4, "max must not go below core");
 
         let ex = ConsumeExecutor::new(2, 8);
         assert_eq!(ex.worker_count(), 0);
@@ -699,14 +699,14 @@ mod tests {
         assert_eq!(
             ex.get_max_pool_size(),
             SHORT_MAX_VALUE,
-            "max 一并被抬到 core"
+            "max is lifted to core along with it"
         );
-        assert_eq!(ex.worker_count(), 0, "队列空 → 一个 worker 都不建");
+        assert_eq!(ex.worker_count(), 0, "empty queue → not a single worker is built");
     }
 
     #[tokio::test]
     async fn set_core_pool_size_after_shutdown_only_records_core() {
-        // 关闭后不再补线程（只在 delta > 0 且未关闭时 spawn）
+        // no top-up after shutdown (spawning only when delta > 0 and not shut down)
         let ex = ConsumeExecutor::with_params(1, 8, Duration::from_secs(30), "rmq-test");
         ex.submit(task(async {})).expect("submit");
         ex.shutdown();
@@ -718,7 +718,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_wakes_idle_workers_without_waiting_for_keep_alive() {
-        // keep_alive 长到不可能自然超时：worker 只能被 shutdown 叫醒后退出
+        // keep_alive so long that a natural timeout is impossible: workers can only exit after being woken by shutdown
         let ex = ConsumeExecutor::with_params(2, 4, Duration::from_secs(3600), "rmq-test");
         ex.submit(task(async {})).expect("submit 1");
         ex.submit(task(async {})).expect("submit 2");
@@ -730,7 +730,7 @@ mod tests {
 
     #[test]
     fn submit_needs_a_tokio_runtime() {
-        // 差异 #1：worker 是 tokio 任务，需要宿主运行时
+        // difference #1: workers are tokio tasks and need a host runtime
         let ex = ConsumeExecutor::new(1, 2);
         let outsider = ex.clone();
         let result = std::thread::spawn(move || outsider.submit(task(async {})))
@@ -741,12 +741,12 @@ mod tests {
             err.to_string().contains("needs a tokio runtime"),
             "unexpected message: {err}"
         );
-        assert_eq!(ex.queued_count(), 0, "被拒的提交不入队");
+        assert_eq!(ex.queued_count(), 0, "a rejected submit never enqueues");
     }
 
     #[test]
     fn pinned_handle_lets_plain_threads_submit() {
-        // 差异 #1 的另一半：注入句柄后，同步上下文（独立 std 线程）也能投递
+        // the other half of difference #1: with a handle injected, sync contexts (standalone std threads) can submit too
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
@@ -763,7 +763,7 @@ mod tests {
             .expect("submit from a plain thread with a pinned handle");
         }
         assert_eq!(ex.worker_count(), 1);
-        // worker 跑在注入的运行时上，所以「优雅关闭」也得在那个运行时里等
+        // the worker runs on the injected runtime, so the graceful shutdown must also wait inside that runtime
         runtime.block_on(ex.shutdown_gracefully());
         assert_eq!(counter.load(Ordering::Acquire), 3);
         assert_eq!(ex.worker_count(), 0);
@@ -785,7 +785,7 @@ mod tests {
         assert_eq!(
             *lock(&order),
             (0..6).collect::<Vec<_>>(),
-            "单 worker 必须按投递顺序执行"
+            "a single worker must execute in submission order"
         );
     }
 
@@ -802,6 +802,6 @@ mod tests {
         done_rx.await.expect("clone shares the same workers");
         assert_eq!(ex.worker_count(), 1);
         ex.shutdown_gracefully().await;
-        assert!(other.submit(task(async {})).is_err(), "关闭对两侧都生效");
+        assert!(other.submit(task(async {})).is_err(), "the shutdown applies to both sides");
     }
 }

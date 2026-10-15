@@ -45,7 +45,7 @@ class ConsumeExecutor
         $this->seq = $threadIndexFrom;
     }
 
-    // ---------------- 对外 API ----------------
+    // ---------------- Public API ----------------
 
     public function submit(callable $fn, mixed ...$args): void
     {
@@ -105,7 +105,7 @@ class ConsumeExecutor
         return count($this->queue);
     }
 
-    /** 被吞掉的任务异常计数（仅供观测/单测）。 */
+    /** Count of swallowed task exceptions (for observation/unit tests only). */
     public function handlerExceptionCount(): int
     {
         return $this->handlerExceptions;
@@ -124,14 +124,14 @@ class ConsumeExecutor
             }
             return true;
         }
-        // 空闲：单线程下把超编（> core）的 logical worker 退掉（对应 keep-alive 退出）
+        // Idle: under a single thread, retire the over-core (> core) logical worker (keep-alive exit)
         if (!$this->shutdown && $this->workers > $this->core) {
             $this->workers = $this->core;
         }
         return false;
     }
 
-    /** 排空并执行队列里的全部任务。 */
+    /** Drain and execute all tasks in the queue. */
     public function pumpAll(): void
     {
         while ($this->pumpOnce()) {
@@ -150,7 +150,7 @@ class ConsumeExecutor
         }
     }
 
-    // ---------------- 内部 ----------------
+    // ---------------- Internal ----------------
 
     private function spawnLocked(): void
     {

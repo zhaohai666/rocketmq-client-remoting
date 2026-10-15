@@ -1,7 +1,7 @@
-//! 1) 17 段存储格式 `MessageDecoder#encode(MessageExt, needCompress)` /
-//!    `decode(ByteBuffer)`，用于 broker 写入与 pull/get 返回的消息体：
+//! 1) 17-field storage format `MessageDecoder#encode(MessageExt, needCompress)` /
+//!    `decode(ByteBuffer)`, used for the message body the broker writes and pull/get returns:
 //!
-//!    | 序号 | 字段 | 编码 |
+//!    | No. | Field | Encoding |
 //!    | --- | --- | --- |
 //!    | 1 | TOTALSIZE | int(4) |
 //!    | 2 | MAGICCODE | int(4) `-626843481`(v1) / `-626843477`(v2) |
@@ -19,11 +19,11 @@
 //!    | 14 | PREPAREDTRANSACTIONOFFSET | long(8) |
 //!    | 15 | BODY | int(4) len + body |
 //!    | 16 | TOPIC | 1B(v1)\|2B(v2) len + topic |
-//!    | 17 | PROPERTIES | short(2) len + `k\x01v\x02` 串 |
+//!    | 17 | PROPERTIES | short(2) len + `k\x01v\x02` string |
 //!
-//! 2) 6 段轻量格式 `MessageDecoder#encodeMessage(Message)` / `decodeMessage(ByteBuffer)`，
-//!    仅用于**批量消息**（`MessageBatch` 的 body），不含 topic / crc：
-//!    `TOTALSIZE(4) | MAGICCODE(4, 固定 0) | BODYCRC(4, 固定 0) | FLAG(4) | BODY(4+len) |
+//! 2) 6-field lightweight format `MessageDecoder#encodeMessage(Message)` / `decodeMessage(ByteBuffer)`,
+//!    used only for **batch messages** (the body of `MessageBatch`), without topic / crc:
+//!    `TOTALSIZE(4) | MAGICCODE(4, fixed 0) | BODYCRC(4, fixed 0) | FLAG(4) | BODY(4+len) |
 //!    PROPERTIES(2+len)`
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -39,9 +39,9 @@ pub const NAME_VALUE_SEPARATOR: char = '\u{1}';
 pub const PROPERTY_SEPARATOR: char = '\u{2}';
 
 pub const MESSAGE_MAGIC_CODE: i32 = -626_843_481;
-/// v2 魔数：topic 长度域从 1 字节变 2 字节。
+/// v2 magic code: the topic length field grows from 1 byte to 2 bytes.
 pub const MESSAGE_MAGIC_CODE_V2: i32 = -626_843_477;
-/// commitlog 里「空白记录」的魔数，不是合法消息帧。
+/// Magic code of a "blank record" in the commitlog, not a valid message frame.
 pub const BLANK_MAGIC_CODE: i32 = -875_286_124;
 
 pub const MESSAGE_MAGIC_CODE_POSITION: usize = 4;
@@ -51,12 +51,12 @@ pub const QUEUE_OFFSET_POSITION: usize = 4 + 4 + 4 + 4 + 4;
 pub const SYSFLAG_POSITION: usize = 4 + 4 + 4 + 4 + 4 + 8 + 8;
 pub const MESSAGE_STORE_TIMESTAMP_POSITION: usize = 56;
 
-/// v1/v2 帧里 topic 长度域的字节数差异之外的固定头部（含 BODY 长度域）。
+/// Fixed header (including the BODY length field) shared by v1/v2 frames apart from the differing topic length width.
 const HEADER_WITHOUT_BODY_LEN: usize = 4 + 4 + 4 + 4 + 4 + 8 + 8 + 4 + 8 + 8 + 4 + 8;
 
 pub use crate::common::util_all::crc32;
 
-/// 字符串按 UTF-8 直接转字节（协议属性区、topic 域都用这种编码）。
+/// Converts a string straight to bytes as UTF-8 (both the protocol properties section and the topic field use this encoding).
 pub fn string2bytes(s: &str) -> Vec<u8> {
     s.as_bytes().to_vec()
 }
@@ -69,14 +69,14 @@ pub fn string2bytes_hex(hex_string: &str) -> Option<Vec<u8>> {
     util_all::string_2_bytes(hex_string)
 }
 
-/// 帧内 host 域：ip 字节 + 4 字节大端端口。
+/// In-frame host field: ip bytes + 4-byte big-endian port.
 pub fn ip_and_port_to_bytes(ip: &str, port: u32, v6: bool) -> Result<Vec<u8>> {
     let mut out = ip_to_bytes(ip, v6)?;
     out.extend_from_slice(&port.to_be_bytes());
     Ok(out)
 }
 
-/// ip 按 inet_pton 语义解析成 4 或 16 字节。
+/// Parses an ip into 4 or 16 bytes with inet_pton semantics.
 pub fn ip_to_bytes(ip: &str, v6: bool) -> Result<Vec<u8>> {
     let addr: IpAddr = ip
         .parse()
@@ -100,7 +100,7 @@ fn to_v6_compatible(v4: &Ipv4Addr) -> Ipv6Addr {
         u16::from_be_bytes([octets[2], octets[3]]))
 }
 
-/// 帧内 host 域的反向解析：8 字节 = ipv4+port，20 字节 = ipv6+port。
+/// Reverse parse of the in-frame host field: 8 bytes = ipv4+port, 20 bytes = ipv6+port.
 pub fn bytes_to_ip_and_port(raw: &[u8]) -> Result<(String, u32)> {
     let (ip_len, family_v6) = match raw.len() {
         8 => (4, false),
@@ -128,7 +128,7 @@ fn bytes_to_ip(bytes: &[u8], v6: bool) -> Result<String> {
     }
 }
 
-/// 消息 ID：`addr(8|20B) + commitLogOffset(8B)` 拼成字节后转大写十六进制。
+/// Message ID: `addr(8|20B) + commitLogOffset(8B)` concatenated into bytes, then rendered as uppercase hex.
 pub fn create_message_id(addr_bytes: &[u8], offset: i64) -> String {
     let mut raw = addr_bytes.to_vec();
     raw.extend_from_slice(&offset.to_be_bytes());
@@ -196,15 +196,15 @@ fn find_char(chars: &[char], from: usize, length: usize, target: char) -> Option
     (from..length).find(|&i| chars[i] == target)
 }
 
-/// 解码 17 段帧时的四个开关。
+/// The four switches used when decoding a 17-field frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodeOptions {
     pub read_body: bool,
-    /// 带 `COMPRESSED_FLAG` 时是否解压。
+    /// Whether to decompress when `COMPRESSED_FLAG` is set.
     pub decompress_body: bool,
-    /// true 时 `msgId` 同时写进 `offset_msg_id`（客户端视角）。
+    /// When true, `msgId` is also written into `offset_msg_id` (client view).
     pub is_client: bool,
-    /// 校验 BODYCRC。
+    /// Validates BODYCRC.
     pub check_crc: bool,
 }
 
@@ -237,7 +237,7 @@ pub fn message_bytes_size(
         + message_string_size(&message_properties_2_string(properties))
 }
 
-/// 字符串在线上格式里占的字节数：UTF-8 字节数 + 2 字节长度前缀。
+/// Byte size a string occupies in the wire format: UTF-8 byte count + 2-byte length prefix.
 pub fn message_string_size(s: &str) -> usize {
     2 + s.len()
 }
@@ -428,7 +428,7 @@ pub fn decode_messages(raw: &[u8]) -> Vec<MessageExt> {
     decode_messages_with(raw, &DecodeOptions::default())
 }
 
-/// [`decode_messages`] 的带选项版本。
+/// Option-taking variant of [`decode_messages`].
 pub fn decode_messages_with(raw: &[u8], options: &DecodeOptions) -> Vec<MessageExt> {
     let mut result = Vec::new();
     let mut pos = 0usize;
@@ -456,7 +456,7 @@ pub fn decode_messages_with(raw: &[u8], options: &DecodeOptions) -> Vec<MessageE
     result
 }
 
-/// 只写 TOTALSIZE / MAGICCODE(0) / BODYCRC(0) / FLAG / BODY / PROPERTIES。
+/// Writes only TOTALSIZE / MAGICCODE(0) / BODYCRC(0) / FLAG / BODY / PROPERTIES.
 pub fn encode_message(message: &Message) -> Vec<u8> {
     let body: &[u8] = message.body.as_deref().unwrap_or(&[]);
     let properties_bytes = string2bytes(&message_properties_2_string(&message.properties));
@@ -465,7 +465,7 @@ pub fn encode_message(message: &Message) -> Vec<u8> {
 
     let mut writer = Writer::with_capacity(store_size);
     writer.i32(store_size as i32); // 1 TOTALSIZE
-    writer.i32(0); // 2 MAGICCODE（批量场景固定 0）
+    writer.i32(0); // 2 MAGICCODE (fixed 0 in the batch scenario)
     writer.i32(0); // 3 BODYCRC
     writer.i32(message.flag); // 4 FLAG
     writer.i32(body.len() as i32); // 5 BODY
@@ -595,7 +595,7 @@ mod tests {
         ext
     }
 
-    /// 线上记录的 139 字节扩展消息帧（v1 十七段编码的真值）。
+    /// A 139-byte extended-message frame captured from the wire (ground truth of the v1 17-field encoding).
     const EXT_HEX: &str = "0000008bdaa320a7f3307b09000000030000000200000000000000580000000000000400\
                            000000000000018bcfe568007f0000010000d4310000018bcfe5687b7f00000100002a9f\
                            0000000100000000000000000000000e68656c6c6f20726f636b65746d7109546f706963\
@@ -606,7 +606,7 @@ mod tests {
         util_all::string_2_bytes(&hex.replace(['\n', ' '], "")).unwrap()
     }
 
-    // ---------------------------------------------------------- 属性串
+    // ---------------------------------------------------------- property string
 
     #[test]
     fn properties_round_trip() {
@@ -629,7 +629,7 @@ mod tests {
         assert!(string_2_message_properties("no-separator\u{2}").is_empty());
         let one = string_2_message_properties("k\u{1}v\u{2}");
         assert_eq!(one.get("k"), Some("v"));
-        // 空值 k\x01\x02 是「非法片段」，会被丢掉 —— 锁住该行为
+        // An empty value k\x01\x02 is an "illegal segment" and gets dropped -- locks in that behavior
         let mut wait = StringMap::new();
         wait.insert(PROPERTY_WAIT_STORE_MSG_OK, "");
         let raw = message_properties_2_string(&wait);
@@ -649,12 +649,12 @@ mod tests {
 
     #[test]
     fn properties_none_value_never_encoded() {
-        // StringMap 存 String，「null 值」等价于「键不存在」
+        // StringMap stores String, so a "null value" is equivalent to "key absent"
         let empty = StringMap::new();
         assert_eq!(message_properties_2_string(&empty), "");
     }
 
-    // ------------------------------------------------------ 17 段编解码
+    // ------------------------------------------------------ 17-field codec
 
     #[test]
     fn encode_matches_golden_bytes() {
@@ -711,7 +711,7 @@ mod tests {
     fn store_size_respects_existing_value() {
         let mut raw = encode_message_ext(&build_ext(&[("store_size", "1")]), false).unwrap();
         let declared = i32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
-        assert_eq!(declared as usize, raw.len(), "storeSize=1 应被 max 兜底");
+        assert_eq!(declared as usize, raw.len(), "storeSize=1 should be floored by the max fallback");
         raw = encode_message_ext(&build_ext(&[("store_size", "200")]), false).unwrap();
         assert_eq!(raw.len(), 200);
         assert!(raw[139..].iter().all(|b| *b == 0));
@@ -762,7 +762,7 @@ mod tests {
     #[test]
     fn check_crc_detects_corruption() {
         let mut raw = encode_message_ext(&build_ext(&[]), false).unwrap();
-        // 固定头 68 字节，再加两个 IPv4 地址各 8 字节 = 84，body 再往后 4 字节长度前缀
+        // Fixed header is 68 bytes, plus two IPv4 addresses at 8 bytes each = 84, with the 4-byte body length prefix after that
         assert_eq!(HEADER_WITHOUT_BODY_LEN, 68);
         assert_eq!(HEADER_WITHOUT_BODY_LEN + 8 + 8, 84);
         raw[88] ^= 0xFF;
@@ -772,7 +772,7 @@ mod tests {
         };
         let err = decode_message_with(&raw, &options).unwrap_err();
         assert!(matches!(err, Error::Decode(m) if m.contains("crc")));
-        // 不校验 CRC 时照样能解开（body 已是坏数据）
+        // Without the CRC check the frame still decodes (the body is already corrupt data)
         assert!(decode_message(&raw).is_ok());
     }
 
@@ -799,7 +799,7 @@ mod tests {
 
     #[test]
     fn empty_body_decodes_to_none_body() {
-        // 线上记录的真值：body 长度为 0 的 100 字节帧
+        // Ground truth captured from the wire: a 100-byte frame with a 0-length body
         let hex = "00000064DAA320A700000000000000030000000200000000000000580000000000000400\
                    000000000000018BCFE568007F0000010000D4310000018BCFE5687B7F00000100002A9F\
                    0000000100000000000000000000000009546F706963546573740000";
@@ -842,7 +842,7 @@ mod tests {
                 64
             ).as_str())
         );
-        // 线上记录的真值（156 字节）
+        // Ground truth captured from the wire (156 bytes)
         assert_eq!(
             got.get_msg_id(),
             Some("20010DB800000000000000000000000200002A9F0000000000000040")
@@ -963,13 +963,13 @@ mod tests {
             Some(create_message_id(&ip_and_port_to_bytes("127.0.0.1", 10911, false).unwrap(), 2048)
                 .as_str())
         );
-        // V2 帧用 u16 长度字段，长 topic 也能表达；totalLength 必须与解码出的 storeSize 一致。
+        // V2 frames use a u16 length field, so long topics can also be expressed; totalLength must match the decoded storeSize.
         let expected = build_v2_frame(&topic, b"batch-body", b"TAGS\x01TagB\x02");
         assert_eq!(expected.len(), 84 + 4 + 10 + 2 + 200 + 2 + 10);
         assert_eq!(
             i32::from_be_bytes(expected[..4].try_into().unwrap()) as usize,
             expected.len(),
-            "totalLength 与实际字节数一致"
+            "totalLength matches the actual byte count"
         );
         let reparsed = decode_message(&expected).unwrap();
         assert_eq!(reparsed.get_store_size(), expected.len() as i32);
@@ -987,7 +987,7 @@ mod tests {
         ));
     }
 
-    // -------------------------------------------------------- 批量格式
+    // -------------------------------------------------------- batch format
 
     #[test]
     fn batch_encode_layout() {
@@ -996,8 +996,8 @@ mod tests {
         let raw = encode_message(&msg);
         let int_at = |p: usize| i32::from_be_bytes(raw[p..p + 4].try_into().unwrap());
         assert_eq!(int_at(0) as usize, raw.len());
-        assert_eq!(int_at(4), 0, "MAGICCODE 固定 0");
-        assert_eq!(int_at(8), 0, "BODYCRC 固定 0");
+        assert_eq!(int_at(4), 0, "MAGICCODE fixed 0");
+        assert_eq!(int_at(8), 0, "BODYCRC fixed 0");
         assert_eq!(int_at(12), 7, "FLAG");
         assert_eq!(int_at(16), 4, "BODY LEN");
     }
@@ -1009,7 +1009,7 @@ mod tests {
         assert_eq!(got.get_body(), b"body");
         assert_eq!(got.get_flag(), msg.get_flag());
         assert_eq!(got.get_properties(), msg.get_properties());
-        // 线上记录的字节串
+        // Byte string captured from the wire
         assert_eq!(
             bytes2string(&encode_message(&msg)),
             "0000002C00000000000000000000000700000004626F64790012544147530154616741024B455953016B\
@@ -1038,7 +1038,7 @@ mod tests {
             Message::new("T", Some(b"m1")),
             Message::with_tags_and_keys("T", Some(b"m2"), Some("TagA"), None, 0),
         ];
-        // 线上记录的批量帧字节串：无属性的 m1 + 带 TagA 的 m2
+        // Batch frame byte string captured from the wire: m1 without properties + m2 with TagA
         assert_eq!(
             bytes2string(&encode_messages(&msgs)),
             "00000018000000000000000000000000000000026D310000000000220000000000000000000000000000\
@@ -1073,11 +1073,11 @@ mod tests {
         assert_eq!(
             message_bytes_size(&ext.topic, body_len, &ext.properties, v6),
             size + 24,
-            "两个 v6 地址各多 12 字节"
+            "each of the two v6 addresses adds 12 bytes"
         );
     }
 
-    // --------------------------------------------------------- 压缩路径
+    // --------------------------------------------------------- compression path
 
     #[test]
     fn compressed_message_round_trip() {
@@ -1099,7 +1099,7 @@ mod tests {
             MessageSysFlag::set_compression_type(0, MessageSysFlag::ZLIB_TYPE)
         );
 
-        // 不解压路径：body 仍是压缩字节，标志位保留
+        // No-decompression path: the body stays as compressed bytes and the flag bits are preserved
         let options = DecodeOptions {
             decompress_body: false,
             ..DecodeOptions::default()
@@ -1118,7 +1118,7 @@ mod tests {
         let plain = b"legacy-body".repeat(20);
         let mut ext = build_ext(&[]);
         ext.body_crc = crc32(&plain);
-        ext.sys_flag = MessageSysFlag::COMPRESSED_FLAG; // 类型位为 0：老客户端
+        ext.sys_flag = MessageSysFlag::COMPRESSED_FLAG; // type bits are 0: legacy client
         ext.set_body(Some(&compression::compress(&plain, 0, 5).unwrap()));
         let raw = encode_message_ext(&ext, false).unwrap();
         let got = decode_message(&raw).unwrap();
@@ -1137,7 +1137,7 @@ mod tests {
         ext.set_body(Some(&compression::compress(&plain, 3, 5).unwrap()));
         let raw = encode_message_ext(&ext, false).unwrap();
         assert!(matches!(decode_message(&raw), Err(Error::Decode(_))));
-        // 反向确认：同一帧只把类型位改成 ZLIB 就能正常解
+        // Cross-check: the same frame decodes normally once only the type bits are switched to ZLIB
         let mut ok = raw.clone();
         let ok_flag = MessageSysFlag::COMPRESSED_FLAG
             | MessageSysFlag::set_compression_type(0, MessageSysFlag::ZLIB_TYPE);

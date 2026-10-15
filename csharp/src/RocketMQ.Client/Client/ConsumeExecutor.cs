@@ -18,8 +18,10 @@ public sealed class ConsumeExecutor : IDisposable
 {
     private readonly object _gate = new();
     private readonly Queue<Action> _queue = new();
-    // 所有**曾经**创建过的线程都留在这里（只增不减）：已退出的线程 join 立即返回，
-    // 而留着句柄才能在 Dispose 时确保没有线程还在跑（否则会 use-after-free / 后台线程泄漏）。
+    // All threads that were **ever** created stay here (append-only): a thread that
+    // already exited returns from Join immediately, but keeping the handles lets
+    // Dispose make sure no thread is still running (otherwise use-after-free /
+    // background thread leaks).
     private readonly List<Thread> _threads = new();
 
     private int _core;
@@ -110,14 +112,15 @@ public sealed class ConsumeExecutor : IDisposable
         if (!wait) return;
         foreach (Thread t in pending)
         {
-            // 不能 Join 自己（工作线程不会走到这里，只有外部调用者会）
+            // Never Join the current thread (worker threads never reach this
+            // point; only external callers do)
             if (t.IsAlive && t != Thread.CurrentThread) t.Join();
         }
     }
 
     public void Dispose() => Shutdown(true);
 
-    // ---------------------------------------------------------------- 内部
+    // ---------------------------------------------------------------- internals
 
     private void SpawnLocked()
     {

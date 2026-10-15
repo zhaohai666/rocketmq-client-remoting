@@ -31,7 +31,7 @@ def msg(queue_offset: int, with_ck: bool = False) -> MessageExt:
     m.queue_offset = queue_offset
     m.msg_id = "pop-orderly-%d" % queue_offset
     if with_ck:
-        # pop_time 必须是"刚弹出"（当前时刻），否则 isPopTimeout 会把本批按超时丢弃
+        # pop_time must be "just popped" (the current moment), otherwise isPopTimeout will drop this batch as timed out
         m.properties[MessageConst.PROPERTY_POP_CK] = build_extra_info(
             queue_offset, int(time.time() * 1000), 60000, 0, TOPIC, BROKER, 0, queue_offset)
     return m

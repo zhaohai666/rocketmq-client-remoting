@@ -33,17 +33,19 @@ def check(name, ok, detail=""):
 
 
 def skip(name, detail=""):
-    """记录"因 broker 侧配置差异无法在本机验证"的项，不计入失败。
+    """Record the items that "cannot be verified locally because of a broker-side configuration
+    difference"; they do not count as failures.
 
-    与 check() 严格区分：skip 不是"我偷懒"，而是明确说明这条断言依赖的
-    环境前提在本地不成立（例如默认文件索引没有 uniqKey 倒排索引）。
+    This is strictly separated from check(): a skip is not "I took a shortcut", it explicitly states
+    that the environmental precondition this assertion depends on does not hold locally (for example
+    the default file index has no uniqKey inverted index).
     """
     skips.append((name, detail))
     print("[SKIP] %s %s" % (name, detail))
 
 
 def safe(name, fn, detail_fn=None):
-    """执行 fn，异常转 FAIL 而不是中断整个脚本。"""
+    """Run fn, turning an exception into a FAIL instead of aborting the whole script."""
     try:
         value = fn()
         check(name, True, detail_fn(value) if detail_fn else str(value))
@@ -59,7 +61,7 @@ def main():
     admin.set_timeout_millis(10000)
     admin.start()
 
-    # ---------- 1. 集群探活（broker 注册竞态：端口开 != 已注册）----------
+    # ---------- 1. cluster liveness (broker registration race: an open port != being registered) ----------
     cluster = None
     last_err = None
     for _ in range(40):
@@ -72,7 +74,7 @@ def main():
             last_err = e
         time.sleep(1)
     if cluster is None:
-        check("集群探活", False, "nameServer 无 broker 注册 last_err=%s" % last_err)
+        check("cluster liveness", False, "no broker registered on the nameServer last_err=%s" % last_err)
         admin.shutdown()
         return 1
     check("fetchBrokerClusterInfo", True,
@@ -80,7 +82,7 @@ def main():
                                       sorted(cluster.cluster_addr_table.keys())))
     broker_addr = cluster.get_broker_addrs()[0]
 
-    # ---------- 2. Topic 管理 ----------
+    # ---------- 2. topic management ----------
     safe("createTopic(%s)" % TOPIC, lambda: admin.create_topic(
         MixAll.DEFAULT_TOPIC, TOPIC, 4), lambda _: "queueNum=4")
 
@@ -88,14 +90,14 @@ def main():
     all_topics = safe("fetchAllTopicList", lambda: admin.fetch_all_topic_list(),
                       lambda t: "topicCount=%d" % len(t.get_topic_list()))
     if all_topics is not None:
-        check("新 topic 出现在 topicList", TOPIC in set(all_topics.get_topic_list()), TOPIC)
+        check("the new topic shows up in topicList", TOPIC in set(all_topics.get_topic_list()), TOPIC)
 
     route = safe("examineTopicRoute", lambda: admin.examine_topic_route(TOPIC),
                  lambda r: "brokers=%d queues=%d" % (len(r.get_broker_datas()),
                                                      len(r.queue_datas)))
     if route is not None:
         qnums = {qd.broker_name: qd.read_queue_nums for qd in route.queue_datas}
-        check("路由 readQueueNums==4", all(n == 4 for n in qnums.values()), str(qnums))
+        check("the route readQueueNums==4", all(n == 4 for n in qnums.values()), str(qnums))
 
     safe("getClusterList", lambda: admin.get_cluster_list(TOPIC), lambda c: str(sorted(c)))
 
@@ -104,24 +106,24 @@ def main():
                    c.read_queue_nums, c.write_queue_nums, c.perm, c.topic_filter_type,
                    dict(c.attributes)))
     if cfg is not None:
-        check("TopicConfig 队列数与创建一致", cfg.read_queue_nums == 4 and cfg.write_queue_nums == 4,
+        check("the TopicConfig queue count matches what was created", cfg.read_queue_nums == 4 and cfg.write_queue_nums == 4,
               "read=%d write=%d" % (cfg.read_queue_nums, cfg.write_queue_nums))
-        check("TopicConfig.attributes 被序列化", isinstance(cfg.attributes, dict),
+        check("TopicConfig.attributes was serialized", isinstance(cfg.attributes, dict),
               str(dict(cfg.attributes)))
 
     safe("getAllTopicConfig", lambda: admin.get_all_topic_config(broker_addr),
          lambda w: "topicConfigs=%d" % len(w.topic_config_table))
 
-    # ---------- 3. Broker 配置：properties 文本（历史 bug 点）----------
-    broker_cfg = safe("getBrokerConfig(properties 文本)",
+    # ---------- 3. broker configuration: the properties text (a historical bug spot) ----------
+    broker_cfg = safe("getBrokerConfig(properties text)",
                       lambda: admin.get_broker_config(broker_addr),
                       lambda d: "keys=%d sample=%s" % (
                           len(d), dict(list(d.items())[:2])))
     if broker_cfg is not None:
-        check("getBrokerConfig 解析出非空 k=v", len(broker_cfg) > 0,
+        check("getBrokerConfig parsed a non-empty k=v", len(broker_cfg) > 0,
               "brokerName=%s" % broker_cfg.get("brokerName"))
 
-    # 可逆修改：写一个无害配置再还原
+    # A reversible change: write a harmless configuration and then restore it
     original = broker_cfg.get("sendMessageThreadPoolNums") if broker_cfg else None
     probe_value = "11"
     updated = safe("updateBrokerConfig(sendMessageThreadPoolNums=11)",
@@ -130,33 +132,33 @@ def main():
                    lambda _: "OK")
     if updated is not None:
         time.sleep(1)
-        after = safe("回读 updateBrokerConfig 生效",
+        after = safe("reading back that updateBrokerConfig took effect",
                      lambda: admin.get_broker_config(broker_addr),
                      lambda d: "sendMessageThreadPoolNums=%s" % d.get("sendMessageThreadPoolNums"))
         if after is not None:
-            check("updateBrokerConfig 生效",
+            check("updateBrokerConfig took effect",
                   after.get("sendMessageThreadPoolNums") == probe_value,
-                  "期望 %s，实际 %s" % (probe_value, after.get("sendMessageThreadPoolNums")))
-        # 还原
+                  "expected %s, actual %s" % (probe_value, after.get("sendMessageThreadPoolNums")))
+        # Restore
         if original is not None:
             admin.update_broker_config(
                 broker_addr, {"sendMessageThreadPoolNums": original})
 
-    # ---------- 4. NameServer KV 配置 ----------
+    # ---------- 4. NameServer KV configuration ----------
     safe("createAndUpdateKvConfig", lambda: admin.create_and_update_kv_config(
         KV_NS, "k1", "v1"), lambda _: "OK")
     kv = safe("getKVConfig", lambda: admin.get_kv_config(KV_NS, "k1"), lambda v: str(v))
-    check("KV 值往返一致", kv == "v1", "期望 v1 实际 %s" % kv)
+    check("the KV value round-trips unchanged", kv == "v1", "expected v1, actual %s" % kv)
     kvt = safe("getKVListByNamespace", lambda: admin.get_kv_list_by_namespace(KV_NS),
                lambda t: "table=%s" % t.table)
     if kvt is not None:
-        check("KVList 含 k1", kvt.table.get("k1") == "v1", str(kvt.table))
+        check("KVList contains k1", kvt.table.get("k1") == "v1", str(kvt.table))
     safe("deleteKVConfig", lambda: admin.delete_kv_config(KV_NS, "k1"), lambda _: "OK")
-    gone = safe("删除后 getKVConfig 返回 None",
+    gone = safe("after the delete getKVConfig returns None",
                 lambda: admin.get_kv_config(KV_NS, "k1"), lambda v: "value=%s" % v)
-    check("KV 删除后不再存在", gone in (None, ""), "实际 %r" % (gone,))
+    check("the KV no longer exists after the delete", gone in (None, ""), "actual %r" % (gone,))
 
-    # ---------- 5. 订阅组管理 ----------
+    # ---------- 5. subscription group management ----------
     sgc = SubscriptionGroupConfig(GROUP)
     sgc.consume_enable = True
     sgc.retry_max_times = 5
@@ -164,25 +166,25 @@ def main():
          lambda: admin.create_and_update_subscription_group_config(broker_addr, sgc),
          lambda _: "group=%s retryMax=%d" % (GROUP, sgc.retry_max_times))
 
-    single = safe("getSubscriptionGroupConfig(单查)",
+    single = safe("getSubscriptionGroupConfig(single lookup)",
                   lambda: admin.get_subscription_group_config(broker_addr, GROUP),
                   lambda c: "group=%s retryMax=%s" % (c.group_name, c.retry_max_times) if c else "None")
     if single is not None:
-        check("订阅组 retryMaxTimes 往返一致", single.retry_max_times == 5,
-              "实际 %s" % single.retry_max_times)
+        check("the retryMaxTimes of the subscription group round-trips unchanged", single.retry_max_times == 5,
+              "actual %s" % single.retry_max_times)
 
-    wrapper = safe("getAllSubscriptionGroup(分页)",
+    wrapper = safe("getAllSubscriptionGroup(paged)",
                    lambda: admin.get_all_subscription_group(broker_addr),
                    lambda w: "groups=%d dataVersion=%s" % (
                        len(w.subscription_group_table), bool(w.data_version)))
     if wrapper is not None:
-        check("分页结果含新订阅组", GROUP in wrapper.subscription_group_table,
+        check("the paged result contains the new subscription group", GROUP in wrapper.subscription_group_table,
               "count=%d" % len(wrapper.subscription_group_table))
     examined = safe("examineSubscriptionGroupConfig",
                     lambda: admin.examine_subscription_group_config(broker_addr, GROUP),
                     lambda c: c.group_name if c else "None")
 
-    # ---------- 6. 生产 + 统计 + 查询 ----------
+    # ---------- 6. produce + statistics + queries ----------
     prod = DefaultMQProducer(producer_group="AdminVerifyProducer_%d" % STAMP)
     prod.set_namesrv_addr(NAMESRV)
     prod.set_send_msg_timeout(5000)
@@ -199,7 +201,7 @@ def main():
                 offset_ids.append(sr.offset_msg_id)
         except Exception as e:  # noqa: BLE001
             print("send %d error: %s" % (i, e))
-    check("同步发送 %d 条" % N_MSG, len(sent) == N_MSG, "ok=%d/%d" % (len(sent), N_MSG))
+    check("sent %d messages synchronously" % N_MSG, len(sent) == N_MSG, "ok=%d/%d" % (len(sent), N_MSG))
     if not sent:
         prod.shutdown()
         admin.shutdown()
@@ -211,7 +213,7 @@ def main():
                  lambda s: "queues=%d tps=%s" % (len(s.offset_table), s.topic_put_tps))
     if stats is not None:
         total_max = sum(o.max_offset for o in stats.offset_table.values())
-        check("TopicStatsTable maxOffset 总和 >= 发送数", total_max >= N_MSG,
+        check("the sum of the TopicStatsTable maxOffsets >= the number sent", total_max >= N_MSG,
               "maxOffsetSum=%d sent=%d" % (total_max, N_MSG))
 
     cs = safe("examineConsumeStats", lambda: admin.examine_consume_stats(
@@ -222,10 +224,12 @@ def main():
               lambda: admin.query_consume_queue(broker_addr, TOPIC, 0, 0, 10, GROUP),
               lambda r: "min=%d max=%d" % (r.min_queue_index, r.max_queue_index))
 
-    # queryMessage：只断言"请求可达、broker 正常应答、返回值类型正确"。
-    # 之所以不断言"一定查得到"：msgId 属于 uniqKey，broker 侧 uniqKey 倒排索引
-    # 只有 RocksDB 索引实现（IndexRocksDBStore）才支持；本机 broker 用默认的
-    # 文件索引 + 消息未显式设 KEYS，因此查不到是**broker 配置差异**，不是客户端 bug。
+    # queryMessage: only assert that "the request is reachable, the broker replies normally and the
+    # return type is correct". It deliberately does not assert "it must be found": msgId belongs to
+    # uniqKey, and on the broker side the uniqKey inverted index is only supported by the RocksDB
+    # index implementation (IndexRocksDBStore); the local broker uses the default file index and
+    # the messages do not set KEYS explicitly, so finding nothing is a **broker configuration
+    # difference**, not a client bug.
     body0, msg_id0, mq0 = sent[0]
     now_ms = int(time.time() * 1000)
     qm_ok, qm_detail = True, ""
@@ -233,36 +237,36 @@ def main():
         res_by_key = admin.query_message(TOPIC, msg_id0, 32, 0, now_ms + 60000)
         res_uniq = admin.query_message_by_uniq_key(TOPIC, msg_id0)
         res_norm = admin.query_message_by_key(TOPIC, msg_id0, 32)
-        qm_detail = "key=%d uniq=%s normal=%d（均正常返回）" % (
+        qm_detail = "key=%d uniq=%s normal=%d (all returned normally)" % (
             len(res_by_key), res_uniq is not None, len(res_norm))
         assert isinstance(res_by_key, list) and isinstance(res_norm, list)
     except Exception as e:  # noqa: BLE001
         qm_ok = False
         qm_detail = "%s: %s" % (type(e).__name__, e)
-    check("queryMessage 请求可达且正常应答", qm_ok, qm_detail)
-    skip("queryMessage 命中结果（需 broker 开 RocksDB/KEYS 索引）",
-         "本机为默认文件索引且消息未设 KEYS，uniqKey 查询返回空属预期")
+    check("the queryMessage request is reachable and replies normally", qm_ok, qm_detail)
+    skip("queryMessage hit results (requires the broker to enable the RocksDB/KEYS index)",
+         "the local broker uses the default file index and the messages have no KEYS, so an empty uniqKey query result is expected")
 
-    # viewMessage by offsetMsgId（只有它编码了 broker 地址 + commitLog offset）
+    # viewMessage by offsetMsgId (only this one encodes the broker address + commitLog offset)
     vm = safe("viewMessage(byOffsetMsgId)",
               lambda: admin.view_message(TOPIC, offset_ids[0]),
               lambda m: "topic=%s offset=%s body=%s" % (m.topic, m.queue_offset,
                                                         m.body[:32]))
     if vm is not None:
-        check("viewMessage body 与发送一致", vm.body == body0,
-              "期望 %r 实际 %r" % (body0, vm.body))
+        check("the viewMessage body matches what was sent", vm.body == body0,
+              "expected %r, actual %r" % (body0, vm.body))
 
     try:
         admin.view_message(TOPIC, msg_id0)
-        check("viewMessage(uniqKey) 走兜底并给出干净异常", False, "没有抛异常")
+        check("viewMessage(uniqKey) falls back and gives a clean exception", False, "no exception was raised")
     except MQClientException as e:
-        check("viewMessage(uniqKey) 走兜底并给出干净异常", True,
+        check("viewMessage(uniqKey) falls back and gives a clean exception", True,
               "code=%s" % e.response_code)
     except Exception as e:  # noqa: BLE001
-        check("viewMessage(uniqKey) 走兜底并给出干净异常", False,
+        check("viewMessage(uniqKey) falls back and gives a clean exception", False,
               "%s: %s" % (type(e).__name__, e))
 
-    # ---------- 7. Offset 管理（只读查询）----------
+    # ---------- 7. offset management (read-only queries) ----------
     mq = mq0 if isinstance(mq0, MessageQueue) else MessageQueue(TOPIC, route.get_broker_datas()[0].broker_name, 0)
     max_off = safe("maxOffset", lambda: admin.max_offset(mq), lambda v: str(v))
     min_off = safe("minOffset", lambda: admin.min_offset(mq), lambda v: str(v))
@@ -277,7 +281,7 @@ def main():
               "min=%d max=%d" % (min_off, max_off))
 
     bnd_topic = "AdminBoundaryTopic_%d" % STAMP
-    safe("createTopic(%s, 1 队列)" % bnd_topic,
+    safe("createTopic(%s, 1 queue)" % bnd_topic,
          lambda: admin.create_topic(MixAll.DEFAULT_TOPIC, bnd_topic, 1),
          lambda _: "queueNum=1")
     bnd_mq = MessageQueue(bnd_topic, mq.broker_name, 0)
@@ -288,30 +292,33 @@ def main():
                    lambda v: str(v))
     future = int(time.time() * 1000) + 600000
     if bnd_max == 3:
-        lo = safe("searchLowerBoundaryOffset(未来时间戳)",
+        lo = safe("searchLowerBoundaryOffset(a future timestamp)",
                   lambda: admin.search_lower_boundary_offset(bnd_mq, future),
                   lambda v: str(v))
-        up = safe("searchUpperBoundaryOffset(未来时间戳)",
+        up = safe("searchUpperBoundaryOffset(a future timestamp)",
                   lambda: admin.search_upper_boundary_offset(bnd_mq, future),
                   lambda v: str(v))
-        check("LOWER 边界 = maxOffset（队尾之后的下一个位点）", lo == bnd_max,
+        check("the LOWER boundary = maxOffset (the offset right after the tail)", lo == bnd_max,
               "lower=%s maxOffset=%s" % (lo, bnd_max))
-        check("UPPER 边界 = maxOffset-1（最后一条自身位点）", up == bnd_max - 1,
+        check("the UPPER boundary = maxOffset-1 (the offset of the last entry itself)", up == bnd_max - 1,
               "upper=%s maxOffset-1=%s" % (up, bnd_max - 1))
-        check("两个边界确实不同（证明 boundaryType 生效）", lo != up,
+        check("the two boundaries really differ (proving boundaryType takes effect)", lo != up,
               "lower=%s upper=%s" % (lo, up))
         past = 1
-        check("时间戳早于全部消息时 LOWER/UPPER 都塌到 minOffset",
+        check("when the timestamp precedes all the messages both LOWER/UPPER collapse to minOffset",
               admin.search_lower_boundary_offset(bnd_mq, past) == min_off
               and admin.search_upper_boundary_offset(bnd_mq, past) == min_off,
               "minOffset=%s" % min_off)
     else:
-        check("boundary topic 恰好 3 条消息（前置）", False, "maxOffset=%s" % bnd_max)
+        check("the boundary topic holds exactly 3 messages (precondition)", False, "maxOffset=%s" % bnd_max)
 
-    # ---------- 8. 消费 + sendMessageBack 重投 ----------
-    # 顺序很关键：必须**先消费**再重投。若先把位点重置到 max，消费者就再也
-    # 拉不到历史消息，sendMessageBack 路径根本没机会执行（前一版的假失败）。
-    # 本组是新建的、无已提交位点，故 FIRST_OFFSET 会真正从最小位点开始读。
+    # ---------- 8. consume + sendMessageBack redelivery ----------
+    # The order matters: it must **consume first** and only then send back. If the offset were
+    # reset to max first, the consumer could never pull the historical messages any more and the
+    # sendMessageBack path would get no chance to run at all (the false failure of an earlier
+    # version).
+    # This group is newly created and has no committed offset, so FIRST_OFFSET really does start
+    # reading from the smallest offset.
     retry_topic = MixAll.get_retry_topic(GROUP)
     consumed = []
     lock = threading.Lock()
@@ -333,7 +340,7 @@ def main():
     while time.time() < deadline and len(consumed) < 1:
         time.sleep(0.5)
 
-    check("消费到消息（sendMessageBack 前置）", len(consumed) >= 1,
+    check("messages were consumed (a precondition of sendMessageBack)", len(consumed) >= 1,
           "consumed=%d" % len(consumed))
 
     backsent = False
@@ -346,14 +353,17 @@ def main():
             return "origin_topic=%s commitLogOffset=%d" % (
                 first.topic, first.commit_log_offset)
 
-        ok = safe("consumer.sendMessageBack(重投到 %s)" % retry_topic, _do_back)
+        ok = safe("consumer.sendMessageBack(sending back to %s)" % retry_topic, _do_back)
         backsent = ok is not None
     cons.shutdown()
 
-    # 校验 %RETRY% 里出现该消息（用 admin 轮询重试 topic 的统计）。
-    # 必须轮询而不是立即断言：broker 的 SendMessageProcessor.consumerSendMsgBack 在
-    # delayLevel == 0 时会改写成 `3 + reconsumeTimes`（默认 3 → 10s），消息先进
-    # SCHEDULE_TOPIC_XXXX，到点才投递到 %RETRY%<group>。旧版只等 2s 必然假失败。
+    # Verify that the message shows up in %RETRY% (by polling the statistics of the retry topic with
+    # admin).
+    # Polling rather than asserting immediately is mandatory: the broker's
+    # SendMessageProcessor.consumerSendMsgBack rewrites delayLevel == 0 into `3 + reconsumeTimes`
+    # (the default 3 -> 10s), so the message first goes into SCHEDULE_TOPIC_XXXX and is only
+    # delivered to %RETRY%<group> when its time comes. The old version only waited 2s, which
+    # inevitably produced a false failure.
     if backsent:
         retry_max = -1
         waited = 0
@@ -368,8 +378,8 @@ def main():
                 retry_max = -1
             time.sleep(1)
             waited += 1
-        check("sendMessageBack 落到 %s（maxOffsetSum>0）" % retry_topic, retry_max > 0,
-              "maxOffsetSum=%s（轮询 %ds；broker 把 delayLevel=0 改写为 3，约 10s 后可见）"
+        check("sendMessageBack landed in %s (maxOffsetSum>0)" % retry_topic, retry_max > 0,
+              "maxOffsetSum=%s (polled %ds; the broker rewrites delayLevel=0 to 3, so it becomes visible after about 10s)"
               % (retry_max, waited))
 
     def _group_has_offset_table(rows):
@@ -392,34 +402,34 @@ def main():
             break
         time.sleep(1)
         waited_stats += 1
-    check("fetchConsumeStatsInBroker 按订阅组出行", len(rows) > 0,
-          "groups=%d（轮询 %ds）" % (len(rows), waited_stats))
-    check("fetchConsumeStatsInBroker 本组统计带 offsetTable", hit_group,
-          "本组行里有 ConsumeStats（轮询 %ds）" % waited_stats)
+    check("fetchConsumeStatsInBroker produces a row per subscription group", len(rows) > 0,
+          "groups=%d (polled %ds)" % (len(rows), waited_stats))
+    check("the statistics of this group from fetchConsumeStatsInBroker carry an offsetTable", hit_group,
+          "there is a ConsumeStats in this group's row (polled %ds)" % waited_stats)
 
-    # ---------- 9. 真实 broker 端位点重置（放最后，避免干扰上面的消费）----------
-    ts = int(time.time() * 1000) + 60000  # 未来时间 → 位点应被推到 max
+    # ---------- 9. offset reset on a real broker (done last so as not to disturb the consumption above) ----------
+    ts = int(time.time() * 1000) + 60000  # a future time -> the offset should be pushed to max
     reset = safe("resetOffsetByTimestamp(INVOKE_BROKER_TO_RESET_OFFSET)",
                  lambda: admin.reset_offset_by_timestamp(TOPIC, GROUP, ts, True),
                  lambda d: "queues=%d sample=%s" % (
                      len(d), list(d.items())[:1]))
     if reset is not None:
-        check("resetOffset 返回非空 offsetTable", len(reset) > 0, "%d 个队列" % len(reset))
-        # 回读：重置到未来时间后，消费者位点应等于该队列 maxOffset
+        check("resetOffset returned a non-empty offsetTable", len(reset) > 0, "%d queues" % len(reset))
+        # Reading back: after resetting to a future time, the consumer offset should equal the maxOffset of that queue
         time.sleep(1)
         off_after = admin.examine_consumer_offset(GROUP, mq)
         max_now = admin.max_offset(mq)
-        check("reset 后消费者位点被推到 maxOffset", off_after >= max_now - 1,
+        check("after the reset the consumer offset was pushed to maxOffset", off_after >= max_now - 1,
               "consumerOffset=%s maxOffset=%s" % (off_after, max_now))
 
     min_reset = admin.min_offset(mq)
-    rqi = safe("resetOffsetByQueueId(回到 minOffset)",
+    rqi = safe("resetOffsetByQueueId(back to minOffset)",
                lambda: admin.reset_offset_by_queue_id(
                    broker_addr, GROUP, TOPIC, mq.queue_id, min_reset),
-               lambda d: "returnedTable=%d（该 RPC 无返回体，可为空）" % len(d))
+               lambda d: "returnedTable=%d (this RPC has no response body, it may be empty)" % len(d))
     if rqi is not None:
         off_rqi = admin.examine_consumer_offset(GROUP, mq)
-        check("resetOffsetByQueueId 后位点==目标 offset", off_rqi == min_reset,
+        check("after resetOffsetByQueueId the offset == the target offset", off_rqi == min_reset,
               "consumerOffset=%s target=%s" % (off_rqi, min_reset))
 
     again = []
@@ -439,19 +449,19 @@ def main():
     while time.time() < deadline_again and len(again) < 1:
         time.sleep(0.5)
     cons2.shutdown()
-    check("resetOffsetByQueueId 后重新消费到历史消息", len(again) >= 1,
-          "reConsumed=%d（队列 %d 位点已回到 minOffset=%s）" % (len(again), mq.queue_id, min_reset))
+    check("after resetOffsetByQueueId the historical messages can be consumed again", len(again) >= 1,
+          "reConsumed=%d (the offset of queue %d is back at minOffset=%s)" % (len(again), mq.queue_id, min_reset))
 
     max_for_range = admin.max_offset(mq)
     bad_target = max_for_range + 100
     try:
         admin.reset_offset_by_queue_id(broker_addr, GROUP, TOPIC, mq.queue_id, bad_target)
-        check("resetOffsetByQueueId 越界目标被 broker 拒绝", False, "没有抛异常")
+        check("the broker rejected the out-of-range target of resetOffsetByQueueId", False, "no exception was raised")
     except Exception as e:  # noqa: BLE001
-        check("resetOffsetByQueueId 越界目标被 broker 拒绝", True,
+        check("the broker rejected the out-of-range target of resetOffsetByQueueId", True,
               "%s: %s" % (type(e).__name__, str(e)[:160]))
     off_after_bad = admin.examine_consumer_offset(GROUP, mq)
-    check("越界 reset 停留在第 1 笔写入的非法位点（两笔 RPC 非原子）",
+    check("the out-of-range reset stays at the illegal offset written by the first call (the two RPCs are not atomic)",
           off_after_bad == bad_target,
           "consumerOffset=%s badTarget=%s" % (off_after_bad, bad_target))
 
@@ -459,28 +469,28 @@ def main():
                      lambda: admin.query_topics_by_consumer_to_broker(broker_addr, GROUP),
                      lambda t: "topics=%d" % len(t.get_topic_list()))
     if by_broker is not None:
-        check("queryTopicsByConsumerToBroker 读出本组消费过的 topic",
+        check("queryTopicsByConsumerToBroker reads out the topics this group consumed from",
               TOPIC in set(by_broker.get_topic_list()), str(by_broker.get_topic_list()))
-    by_group = safe("queryTopicsByConsumer(group)（按 %RETRY% 路由扇出）",
+    by_group = safe("queryTopicsByConsumer(group) (fanned out over the %RETRY% route)",
                     lambda: admin.query_topics_by_consumer(GROUP),
                     lambda t: "topics=%d" % len(t.get_topic_list()))
     if by_group is not None:
-        check("queryTopicsByConsumer(group) 合并后含本组消费过的 topic",
+        check("after merging, queryTopicsByConsumer(group) contains the topics this group consumed from",
               TOPIC in set(by_group.get_topic_list()), str(by_group.get_topic_list()))
 
     prod.shutdown()
 
-    # ---------- 9. 清理 ----------
+    # ---------- 9. cleanup ----------
     safe("deleteSubscriptionGroup", lambda: admin.delete_subscription_group(
         broker_addr, GROUP, True), lambda _: "OK")
     safe("deleteTopic", lambda: admin.delete_topic(TOPIC), lambda _: "OK")
     safe("deleteTopic(boundary)", lambda: admin.delete_topic(bnd_topic), lambda _: "OK")
     time.sleep(1)
-    topics_after = safe("删除后 fetchAllTopicList",
+    topics_after = safe("fetchAllTopicList after the delete",
                         lambda: admin.fetch_all_topic_list(),
                         lambda t: "topicCount=%d" % len(t.get_topic_list()))
     if topics_after is not None:
-        check("deleteTopic 后 topic 消失",
+        check("the topic disappeared after deleteTopic",
               TOPIC not in set(topics_after.get_topic_list()), TOPIC)
 
     admin.shutdown()
@@ -489,13 +499,13 @@ def main():
 
 def report():
     failed = [r for r in results if not r[1]]
-    print("\n================ 汇总 ================")
+    print("\n================ summary ================")
     for name, ok, detail in results:
         print("  [%s] %s  %s" % ("PASS" if ok else "FAIL", name, detail))
     for name, detail in skips:
         print("  [SKIP] %s  %s" % (name, detail))
     print("======================================")
-    print("总计 %d 项，失败 %d 项，跳过 %d 项" % (len(results), len(failed), len(skips)))
+    print("total %d checks, %d failed, %d skipped" % (len(results), len(failed), len(skips)))
     return 1 if failed else 0
 
 

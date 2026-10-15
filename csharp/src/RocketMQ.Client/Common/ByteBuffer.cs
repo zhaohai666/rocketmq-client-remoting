@@ -3,7 +3,7 @@ using System.Globalization;
 
 namespace RocketMQ.Common;
 
-/// <summary>越界/截断异常：上层统一按「解码失败」处理。</summary>
+/// <summary>Out-of-bounds/truncation exception: the upper layer uniformly treats it as "decode failure".</summary>
 public sealed class ByteBufferException : Exception
 {
     public ByteBufferException(string message) : base(message)
@@ -12,8 +12,8 @@ public sealed class ByteBufferException : Exception
 }
 
 /// <summary>
-/// 可增长的二进制写出器（PutInt*/Write* 系列 API）。
-/// 全部大端序。
+/// A growable binary writer (PutInt*/Write* family of APIs).
+/// All big-endian.
 /// </summary>
 public sealed class ByteWriter
 {
@@ -79,13 +79,13 @@ public sealed class ByteWriter
         _len += data.Length;
     }
 
-    /// <summary>取走当前内容（拷贝）。</summary>
+    /// <summary>Take the current content (copy).</summary>
     public byte[] ToArray() => _buf.AsSpan(0, _len).ToArray();
 
-    /// <summary>当前内容的只读视图（不拷贝，随后追加会使旧视图失效）。</summary>
+    /// <summary>A read-only view of the current content (no copy; subsequent appends invalidate the old view).</summary>
     public ReadOnlySpan<byte> AsSpan() => _buf.AsSpan(0, _len);
 
-    /// <summary>回写已写区域内某个位置的 int32（用于「先占位、写完回补长度」的编码手法）。</summary>
+    /// <summary>Write back an int32 at a position already in the written region (for the "reserve first, backfill length after writing" encoding technique).</summary>
     public void PatchInt32At(int pos, int v)
     {
         if (pos < 0 || pos + 4 > _len)
@@ -111,7 +111,7 @@ public sealed class ByteWriter
     }
 }
 
-/// <summary>只读游标。越界抛 <see cref="ByteBufferException"/>，由上层按「解码失败」处理。</summary>
+/// <summary>Read-only cursor. Out-of-bounds throws <see cref="ByteBufferException"/>, treated by the upper layer as "decode failure".</summary>
 public sealed class ByteReader
 {
     private readonly byte[] _data;
@@ -215,7 +215,7 @@ public sealed class ByteReader
         return outBuf;
     }
 
-    /// <summary>静态版本：从任意偏移读取，不持有游标。</summary>
+    /// <summary>Static version: reads from an arbitrary offset without holding a cursor.</summary>
     public static int GetInt32At(byte[] b, int offset)
     {
         if (b.Length < offset + 4)

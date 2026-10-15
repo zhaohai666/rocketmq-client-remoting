@@ -1,7 +1,10 @@
-// 一致性哈希环单测：MD5 摘要 → 前 4 字节大端拼接、含端点的 tailMap、回绕、replica 续编号。
+// Unit tests for the consistent hash ring: MD5 digest -> big-endian concatenation of the
+// first 4 bytes, a tailMap holding the endpoints, wrap-around, and replica continuation
+// numbering.
 //
-// 期望值是摘要规则下确定的黄金值，逐值写死；策略侧的落点表见 AllocateStrategyTests
-// 的 CONSISTENT_HASH 用例。
+// The expected values are golden values fixed under the digest rule, written out value by
+// value; the strategy-side landing table is in the CONSISTENT_HASH case of
+// AllocateStrategyTests.
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -38,7 +41,8 @@ public class ConsistentHashTests
         }
     }
 
-    /// 同一个 key 永远落在同一个节点上（策略稳定性的前提）+ 两个节点都要被路由到。
+    /// The same key always lands on the same node (the precondition for strategy
+    /// stability) + both nodes must be routed to.
     [Fact]
     public void Ring_routes_to_the_clockwise_neighbour_and_wraps_around()
     {
@@ -57,7 +61,7 @@ public class ConsistentHashTests
 
         List<string> seen = Enumerable.Range(0, 64)
             .Select(i => RoutedKey(router, "queue-" + i)).Distinct().ToList();
-        Assert.Equal(2, seen.Count);  // 两个物理节点都得被路由到
+        Assert.Equal(2, seen.Count);  // both physical nodes must be routed to
     }
 
     [Fact]
@@ -72,7 +76,7 @@ public class ConsistentHashTests
     public void Negative_virtual_node_count_is_rejected_by_add_node()
     {
         var router = new ConsistentHashRouter(new List<INode>(), 0);
-        Assert.Empty(router.RingHashes());  // 空节点集 + 负数也不触发检查
+        Assert.Empty(router.RingHashes());  // an empty node set plus a negative number does not trigger the check either
         ArgumentException e = Assert.Throws<ArgumentException>(() => router.AddNode(new ClientNode("a"), -1));
         Assert.Contains("illegal virtual node counts :-1", e.Message);
     }
@@ -117,11 +121,11 @@ public class ConsistentHashTests
     {
         var injected = new FirstByte();
         var router = new ConsistentHashRouter(NodesOf("aaa", "bbb"), 1, injected);
-        // "a"(97) 与 "b"(98) 各占一个位置；"c"(99) 越过末尾 → 回绕到最小 hash 的节点
+        // "a"(97) and "b"(98) each occupy one position; "c"(99) passes the end -> wraps around to the node with the smallest hash
         Assert.Equal("aaa", RoutedKey(router, "a!"));
         Assert.Equal("bbb", RoutedKey(router, "b!"));
         Assert.Equal("aaa", RoutedKey(router, "c!"));
-        Assert.True(injected.Calls > 0, "自定义哈希没被调用");
+        Assert.True(injected.Calls > 0, "the custom hash was never called");
     }
 
     [Fact]
@@ -136,7 +140,7 @@ public class ConsistentHashTests
     public void Ring_hashes_are_ascending()
     {
         List<long> hashes = new ConsistentHashRouter(NodesOf("CID-0", "CID-1", "CID-2"), 3).RingHashes();
-        Assert.Equal(9, hashes.Count);  // 3 节点 × 3 虚拟，且没有互相覆盖
+        Assert.Equal(9, hashes.Count);  // 3 nodes x 3 virtual, with no overwriting of each other
         Assert.Equal(hashes.OrderBy(x => x).ToList(), hashes);
     }
 }

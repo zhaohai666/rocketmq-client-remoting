@@ -8,11 +8,12 @@ use RocketMQ\Client\Exceptions\RemotingCommandException;
 use RocketMQ\Client\Logger;
 
 /**
- * RemotingCommand：一条远程命令——opaque 配对的请求/应答，含线格式编解码。
+ * RemotingCommand: one remote command — a request/response pair matched by opaque, including the wire
+ * format encoding and decoding.
  *
- * 线格式：totalLength(4) | headerLength(带序列化类型高8位, 4) | header | body
- * header（JSON）：RemotingSerializable JSON 编码
- * header（ROCKETMQ）：code(2) language(1) version(2) opaque(4) flag(4) remark(int+utf8) extFields(int + key(short+utf8) value(int+utf8))
+ * Wire format: totalLength(4) | headerLength(the serialize type in the high 8 bits, 4) | header | body
+ * header (JSON): the RemotingSerializable JSON encoding
+ * header (ROCKETMQ): code(2) language(1) version(2) opaque(4) flag(4) remark(int+utf8) extFields(int + key(short+utf8) value(int+utf8))
  */
 final class RemotingCommand
 {
@@ -21,12 +22,14 @@ final class RemotingCommand
     public const REMOTING_VERSION_KEY = 'rocketmq.remoting.version';
 
     /**
-     * 上报的协议版本号（Version 枚举的序号，本机那套 5.5.1 集群对应 515）。
-     * broker 按心跳/请求里记录的客户端版本决定能不能把管理请求回调到客户端：
-     * 低于 62（3.1.8 那一档）时，307 直接回
-     * "The Consumer <x> Version <0> too low to finish"；低于 28（3.0.7 那一档）时，
-     * 223→221 回 "the client does not support this feature. version=..."，
-     * resetOffset 的在线分支同样按 28 跳过。上报 0 等于自降为不可回调。
+     * The protocol version number that is reported (the ordinal of the Version enum, which is 515 for the
+     * 5.5.1 cluster running on this machine).
+     * The broker decides from the client version recorded in the heartbeat/request whether it may call
+     * admin requests back to the client: below 62 (the 3.1.8 tier) 307 answers directly with
+     * "The Consumer <x> Version <0> too low to finish"; below 28 (the 3.0.7 tier) the 223→221 path
+     * answers "the client does not support this feature. version=...", and the online branch of
+     * resetOffset is skipped by the same 28 threshold. Reporting 0 amounts to voluntarily downgrading
+     * oneself to non-callable.
      */
     public const CURRENT_VERSION = 515;
 
@@ -37,7 +40,7 @@ final class RemotingCommand
     private static int $requestId = 0;
 
     public int $code;
-    /** @var int LanguageCode 的 int 码（线上统一按 int 传输） */
+    /** @var int the int code of LanguageCode (always carried as an int on the wire) */
     public int $language;
     public int $version = 0;
     public int $opaque;
@@ -47,7 +50,7 @@ final class RemotingCommand
     public array $extFields = [];
     public ?object $customHeader;
     public ?string $body;
-    /** @var int SerializeType 的 int 码 */
+    /** @var int the int code of SerializeType */
     public int $serializeTypeCurrentRpc;
     public ?object $cachedHeader = null;
 
@@ -74,13 +77,14 @@ final class RemotingCommand
         $this->serializeTypeCurrentRpc = self::$serializeTypeConfigInThisServer;
     }
 
-    // ---------------- 工厂方法 ----------------
+    // ---------------- factory methods ----------------
 
     /**
-     * 分配新的 opaque（请求 ID）。
+     * Allocates a new opaque (request id).
      *
-     * 异步发送换 broker 重试时必须给**同一个请求对象**换一个新 opaque：
-     * 旧请求还挂在 responseTable 里等超时，复用 opaque 会让两次尝试的应答串台。
+     * When retrying an asynchronous send against another broker, a new opaque **must** be given to the
+     * **same request object**: the old request is still hanging in responseTable waiting for its timeout,
+     * and reusing the opaque makes the responses of the two attempts cross-talk.
      */
     public static function createNewRequestId(): int
     {
@@ -102,7 +106,7 @@ final class RemotingCommand
         return $cmd;
     }
 
-    /** 造应答命令：置应答位、带上版本，可选地挂上 header 类。 */
+    /** Builds a response command: sets the response bit, carries the version and optionally attaches a header class. */
     public static function createResponseCommand(int $code = 0, string $remark = 'not set any response code', ?string $classHeader = null): ?self
     {
         $cmd = new self(code: $code, remark: $remark);
@@ -123,7 +127,7 @@ final class RemotingCommand
         return self::createResponseCommand($code, $remark, null);
     }
 
-    /** 从 headerLength 的高 8 位取出序列化类型码，供与 SerializeType 常量比较。 */
+    /** Extracts the serialize type code from the high 8 bits of headerLength, for comparison against the SerializeType constants. */
     public static function getProtocolType(int $source): int
     {
         return ($source >> 24) & 0xFF;
@@ -139,7 +143,7 @@ final class RemotingCommand
         return (($stype & 0xFF) << 24) | ($source & 0x00FFFFFF);
     }
 
-    // ---------------- 编解码 ----------------
+    // ---------------- encoding and decoding ----------------
 
     public function markResponseType(): void
     {
@@ -168,7 +172,7 @@ final class RemotingCommand
             : RemotingCommandType::REQUEST_COMMAND->value;
     }
 
-    /** 把 custom_header 的非 null 字段写入 ext_fields（null 字段不落键）。 */
+    /** Writes the non-null fields of custom_header into ext_fields (null fields do not get a key). */
     public function makeCustomHeaderToNet(): void
     {
         if ($this->customHeader !== null) {
@@ -218,7 +222,7 @@ final class RemotingCommand
     }
 
     /**
-     * 解码一帧（含 4 字节 totalLength 前缀）。
+     * Decodes one frame (including the 4-byte totalLength prefix).
      */
     public static function decode(string $data): self
     {
@@ -255,8 +259,8 @@ final class RemotingCommand
                 remark: isset($obj['remark']) ? (string)$obj['remark'] : null,
                 flag: (int)($obj['flag'] ?? 0),
             );
-            // 5.x NameServer 把 language 序列化为枚举名字符串（如 "JAVA"），4.x 用 int；
-            // 这里兼容两种形态，统一成 int 码。
+            // The 5.x NameServer serializes language as an enum name string (such as "JAVA"), 4.x uses an
+            // int; both shapes are handled here and unified into an int code.
             $lang = $obj['language'] ?? LanguageCode::PYTHON->value;
             if (is_string($lang)) {
                 $lang = LanguageCode::nameToCode($lang);
@@ -273,10 +277,10 @@ final class RemotingCommand
     }
 
     /**
-     * 把 ext_fields 映射回 header 对象。
+     * Maps ext_fields back onto the header object.
      *
-     * 优先走 header 自带的 fromExtFields（短字段名等特殊映射），
-     * 否则按属性名逐字段赋值并做基础类型转换。
+     * The header's own fromExtFields is preferred (for special mappings such as the short field names),
+     * otherwise the fields are assigned one by one by property name with basic type conversion.
      *
      * @param class-string $headerClass
      */

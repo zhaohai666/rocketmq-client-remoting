@@ -12,10 +12,11 @@ PERSIST_DEFAULT = 5000
 
 
 class _RecordingStop:
-    """假的 ``threading.Event``：记下每次 ``wait()`` 请求的超时，按剧本返回。
+    """A fake ``threading.Event``: records the timeout of each ``wait()`` request and returns per the script.
 
-    ``results`` 给出前几次 wait 的返回值（``True`` = 立刻退出循环）；剧本用尽后
-    一律返回 ``True``，保证循环一定收敛、测试不会挂着。
+    ``results`` gives the return values of the first few waits (``True`` = exit the loop
+    immediately); once the script is exhausted it always returns ``True``, guaranteeing the
+    loop converges and the test does not hang.
     """
 
     def __init__(self, results=()):
@@ -33,7 +34,7 @@ def _drop(inst: MQClientInstance) -> None:
     MQClientInstance.INSTANCE_MAP.pop(inst.client_id, None)
 
 
-# ---------------------------------------------------------------- 默认值（对齐 ClientConfig）
+# ---------------------------------------------------------------- Defaults (aligned with ClientConfig)
 def test_facade_defaults_match_the_client_config():
     producer = DefaultMQProducer("PG_interval_defaults")
     assert producer.poll_name_server_interval == POLL_DEFAULT
@@ -57,7 +58,7 @@ def test_client_instance_defaults_match_the_client_config():
         _drop(inst)
 
 
-# ---------------------------------------------------------------- 路由刷新循环
+# ---------------------------------------------------------------- Route refresh loop
 def test_route_refresh_loop_uses_initial_delay_then_configured_period():
     pass
     inst = MQClientInstance("interval_route", ["127.0.0.1:9876"])
@@ -68,7 +69,7 @@ def test_route_refresh_loop_uses_initial_delay_then_configured_period():
         inst._route_refresh_stop = stop  # type: ignore[assignment]
         inst._route_refresh_loop()
         assert stop.timeouts[0] == 0.01
-        assert stop.timeouts[1:] == [1.5, 1.5]   # 配置值换算成秒
+        assert stop.timeouts[1:] == [1.5, 1.5]   # the configured value converted to seconds
     finally:
         _drop(inst)
 
@@ -83,7 +84,7 @@ def test_route_refresh_loop_refreshes_every_topic_in_use():
         inst.register_topic_in_use("T_IntervalA")
         inst.register_topic_in_use("T_IntervalB")
         inst._started = True
-        # initialDelay（10ms）之后立刻跑首轮循环体，之后才按周期等待。
+        # after initialDelay (10ms) the first loop body runs immediately, only then does it wait per period.
         stop = _RecordingStop([False])
         inst._route_refresh_stop = stop  # type: ignore[assignment]
         inst._route_refresh_loop()
@@ -94,7 +95,7 @@ def test_route_refresh_loop_refreshes_every_topic_in_use():
 
 
 def test_route_refresh_loop_stops_on_the_wait_before_the_first_tick():
-    """start 后立刻 shutdown（stop 已置位）时首轮就退出，不再拉路由。"""
+    """When shutdown happens right after start (stop already set), the first round exits without pulling routes."""
     inst = MQClientInstance("interval_route_stop", ["127.0.0.1:9876"])
     try:
         calls = []
@@ -111,7 +112,7 @@ def test_route_refresh_loop_stops_on_the_wait_before_the_first_tick():
         _drop(inst)
 
 
-# ---------------------------------------------------------------- 另外两条定时任务
+# ---------------------------------------------------------------- The other two scheduled tasks
 def test_namesrv_refresh_loop_first_fetch_is_after_ten_seconds():
     pass
     inst = MQClientInstance("interval_namesrv", ["127.0.0.1:9876"])
@@ -144,7 +145,7 @@ def test_adjust_thread_pool_loop_first_run_is_after_one_minute():
         _drop(inst)
 
 
-# ---------------------------------------------------------------- 位点落盘循环
+# ---------------------------------------------------------------- Offset persist loop
 def test_offset_persist_loop_uses_the_default_initial_delay_and_period():
     pass
     consumer = DefaultMQPushConsumer("CG_interval_persist_default")
@@ -181,7 +182,7 @@ def test_offset_persist_loop_exits_when_stopped_before_first_tick():
     assert persisted == []
 
 
-# ---------------------------------------------------------------- 透传
+# ---------------------------------------------------------------- Pass-through
 def test_lite_pull_forwards_the_interval_to_the_client_instance():
     lite = DefaultLitePullConsumer("CG_interval_lite")
     lite.client_id = "interval_lite_client"
@@ -194,7 +195,7 @@ def test_lite_pull_forwards_the_interval_to_the_client_instance():
 
 
 def test_admin_forwards_the_interval_to_the_client_instance(monkeypatch):
-    """admin.start() 里的构造点也要把可配置周期带上（其余 facade 走同一条路径）。"""
+    """The construction point inside admin.start() must also carry the configurable period (the other facades take the same path)."""
     captured = {}
 
     class _FakeClient:

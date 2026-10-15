@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""rocketmq remoting protocol 包。"""
+"""The rocketmq remoting protocol package."""
 from .codes import (LanguageCode, RemotingCommandType, RemotingSysResponseCode,
                     RequestCode, ResponseCode, SerializeType)
 from .remoting_command import RemotingCommand

@@ -17,7 +17,7 @@ public sealed class StatsSnapshot
 public static class StatsItems
 {
     public const double SamplingIntervalSeconds = 10.0;
-    public const int MinuteListMax = 60;   // ≈ 10 分钟窗口
+    public const int MinuteListMax = 60;   // ~10-minute window
     public const int HourListMax = 60;
 
     public static StatsSnapshot Compute(IReadOnlyList<(long ts, long value, long times)> csList)
@@ -48,7 +48,7 @@ public static class StatsItems
     }
 }
 
-/// <summary>单项统计：累计 value/times + 分钟/小时两级采样链。</summary>
+/// <summary>Single stats item: cumulative value/times plus minute/hour two-level sampling chains.</summary>
 public sealed class StatsItem
 {
     private readonly object _lock = new();
@@ -115,7 +115,8 @@ public sealed class StatsItem
         }
     }
 
-    // 仅供测试：注入自定义时间戳的采样点（真实时钟两次 Sample 间隔≈0，tps 无从测起）。
+    // Test-only: sample points with an injected timestamp (two real-clock Sample
+    // calls are ~0 apart, so tps cannot be measured).
     public void AppendSampleForTest(long tsMs, long value, long times)
     {
         lock (_lock)
@@ -272,7 +273,7 @@ public sealed class ConsumerStatsManager : IDisposable
         _stop = true;
         lock (_lock)
         {
-            Monitor.PulseAll(_lock);   // 唤醒采样线程（不等完一个 10s 周期）
+            Monitor.PulseAll(_lock);   // wake the sampler (don't wait for a full 10s period)
         }
 
         _sampleThread?.Join(3000);
@@ -290,7 +291,7 @@ public sealed class ConsumerStatsManager : IDisposable
             bool pulsed;
             lock (_lock)
             {
-                // 到点或被 Shutdown 的 Pulse 唤醒；返回 true = 唤醒（去检查 _stop）
+                // Woken when due or by Shutdown's Pulse; true = woken (go check _stop)
                 pulsed = Monitor.Wait(_lock, interval);
             }
 
@@ -305,7 +306,7 @@ public sealed class ConsumerStatsManager : IDisposable
                 s.SampleAll();
             }
 
-            if (rounds % 60 == 0)   // 60 × 10s = 10 分钟
+            if (rounds % 60 == 0)   // 60 x 10s = 10 minutes
             {
                 foreach (StatsItemSet s in _sets)
                 {

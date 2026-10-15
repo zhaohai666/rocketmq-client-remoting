@@ -1,20 +1,22 @@
-// 协议序列化：JSON（RemotingSerializable）与 RocketMQ 私有二进制（RocketMQSerializable）。
+// Protocol serialization: JSON (RemotingSerializable) and RocketMQ private binary
+// (RocketMQSerializable).
 //
 //
-// RocketMQ 二进制 header 线格式：
+// RocketMQ binary header wire format:
 //   code(2) | language(1) | version(2) | opaque(4) | flag(4)
 //   | remark(int + utf8) | extFields(int + [key(short + utf8) value(int + utf8)]...)
 //
-// ⚠ 线格式里的字符串是 UTF-8 字节串；C# 的 string 是 UTF-16，所以
-//   writeStr/readStr 必须**显式 UTF-8 编解码**，且长度字段是 **UTF-8 字节数**（不是字符数）——
-//   含中文的 remark 若用字符数算长度，broker 侧必然解析错位。
+// WARNING: strings in the wire format are UTF-8 byte strings; C#'s string is UTF-16, so
+//   writeStr/readStr must **explicitly encode/decode UTF-8**, and the length field is the
+//   **UTF-8 byte count** (not the character count) — if a remark containing Chinese used the
+//   character count as its length, the broker side would necessarily misparse.
 using System.Globalization;
 using System.Text;
 using RocketMQ.Common;
 
 namespace RocketMQ.Remoting.Protocol;
 
-/// <summary>RocketMQ 二进制 header 的字段集合。刻意不依赖 RemotingCommand，避免循环依赖。</summary>
+/// <summary>Field collection for the RocketMQ binary header. Deliberately independent of RemotingCommand to avoid a circular dependency.</summary>
 public sealed class ProtocolHeaderFields
 {
     public int Code { get; set; }
@@ -29,12 +31,12 @@ public sealed class ProtocolHeaderFields
 
 public static class RemotingSerializable
 {
-    /// <summary>JsonValue -> UTF-8 字节串。</summary>
+    /// <summary>JsonValue -> UTF-8 byte string.</summary>
     public static byte[] Encode(JsonValue v) => Encoding.UTF8.GetBytes(v.Dump());
 
     public static string Dump(JsonValue v) => v.Dump();
 
-    /// <summary>UTF-8 字节串 -> JsonValue；空串或解析失败返回 false。</summary>
+    /// <summary>UTF-8 byte string -> JsonValue; returns false on an empty string or parse failure.</summary>
     public static bool Decode(byte[] data, out JsonValue value) =>
         Json.TryParse(Encoding.UTF8.GetString(data), out value, out _);
 }
@@ -45,7 +47,7 @@ public static class RocketMQSerializable
 
     public static void WriteDecimalLong(ByteWriter buf, long value)
     {
-        // 先占位 4 字节长度
+        // reserve 4 bytes for the length first
         int lenPos = buf.Length;
         buf.WriteInt32(0);
         int start = buf.Length;
@@ -61,7 +63,7 @@ public static class RocketMQSerializable
                 buf.WriteUInt8((byte)'-');
                 if (value == long.MinValue)
                 {
-                    // -(INT64_MIN) 溢出，直接写字符串常量
+                    // -(INT64_MIN) overflows; write the string constant directly
                     byte[] digits = Utf8.GetBytes("9223372036854775808");
                     buf.WriteBytes(digits);
                     PatchLength(buf, lenPos, start);
@@ -81,14 +83,14 @@ public static class RocketMQSerializable
     private static void PatchLength(ByteWriter buf, int lenPos, int start)
     {
         int n = buf.Length - start;
-        // 直接改写占位的那 4 个字节（大端）
+        // directly rewrite the 4 reserved placeholder bytes (big-endian)
         buf.PatchInt32At(lenPos, n);
     }
 
     public static void WriteDecimalInt(ByteWriter buf, int value) => WriteDecimalLong(buf, value);
 
     /// <summary>
-    /// useShortLength=true 用 2 字节长度（extFields 的 key），false 用 4 字节（value / remark）。
+    /// useShortLength=true uses a 2-byte length (extFields keys); false uses 4 bytes (values / remark).
     /// </summary>
     public static void WriteStr(ByteWriter buf, bool useShortLength, string s)
     {
@@ -106,7 +108,7 @@ public static class RocketMQSerializable
         buf.WriteBytes(bytes);
     }
 
-    /// <summary>读取返回 false 表示越界（由上层按「解码失败」处理）。</summary>
+    /// <summary>Reading returning false means out of bounds (the upper layer treats it as "decode failed").</summary>
     public static bool ReadStr(
         byte[] buf, int offset, bool useShortLength, out string value, out int newOffset)
     {

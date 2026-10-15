@@ -1,10 +1,10 @@
-//! * 枚举声明 `LOWER("lower")` / `UPPER("upper")`，
-//!   但入网的值是 `Enum.toString()`（`RemotingCommand.makeCustomHeaderToNet:430`
-//!   的 `value.toString()`）—— **大写枚举名** `LOWER` / `UPPER`；`getName()` 的小写名
-//!   只喂给 `getType`，从不上报文。
-//! * `getType(String)`:41 是**宽松**解析：只有 `"upper".equalsIgnoreCase(name)`
-//!   才回 UPPER，其余（null / 空串 / 未知值 / 小写 "lower"）一律 LOWER。broker 解析
-//!   `SearchOffsetRequestHeader.boundaryType` 走的就是它。
+//! * The enum declares `LOWER("lower")` / `UPPER("upper")`,
+//!   but the value that goes on the wire is the default string form of the variant -- the
+//!   **uppercase enum names** `LOWER` / `UPPER`; the lowercase names
+//!   from `lowercase_name()` only feed `get_type` and never go on the wire.
+//! * `get_type` is **lenient** parsing: only `"upper"` compared case-insensitively
+//!   yields Upper; everything else (null / empty string / unknown values / lowercase "lower") yields Lower. The broker parses
+//!   `SearchOffsetRequestHeader.boundaryType` with this same rule.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum BoundaryType {

@@ -264,14 +264,14 @@ func runS1(ns, topic, group string, expect int) {
 		c.SetConsumeFromWhere(client.ConsumeFromWhereFirstOffset)
 	})
 	if err != nil {
-		check("S1 构造/订阅/启动", false, err.Error())
+		check("S1 construct/subscribe/start", false, err.Error())
 		return
 	}
 	defer c.Shutdown()
 	fmt.Printf("      S1 subscribed topics: %s\n", allTopics(c))
 
 	ok := waitFor(90*time.Second, func() bool { return coll.count(topic) >= expect })
-	check(fmt.Sprintf("S1 收全 %d 条（Python 生产）", expect), ok,
+	check(fmt.Sprintf("S1 received all %d messages (produced by Python)", expect), ok,
 		fmt.Sprintf("got=%d route=%s assigned=%s", coll.count(topic),
 			queueIDs(c.SubscribeQueuesOf(topic)), queueIDs(ownedOf(c, topic))))
 
@@ -296,7 +296,7 @@ func runS1(ns, topic, group string, expect int) {
 			break
 		}
 	}
-	check("S1 每个队列内 queueOffset 连续无缺无重（0..n-1）", gapless, detail)
+	check("S1 queueOffset continuous and deduplicated within each queue (0..n-1)", gapless, detail)
 
 	// Exactly once: no duplicates by body.
 	seen := map[string]int{}
@@ -309,16 +309,16 @@ func runS1(ns, topic, group string, expect int) {
 			dupes++
 		}
 	}
-	check("S1 无重复投递", dupes == 0, fmt.Sprintf("distinct=%d duplicate bodies=%d", len(seen), dupes))
+	check("S1 no duplicate delivery", dupes == 0, fmt.Sprintf("distinct=%d duplicate bodies=%d", len(seen), dupes))
 
 	// Nothing may arrive on the retry topic.
-	check("S1 重投 topic 上无消息", coll.count(common.GetRetryTopic(group)) == 0,
+	check("S1 no messages on retry topic", coll.count(common.GetRetryTopic(group)) == 0,
 		fmt.Sprintf("retry=%d", coll.count(common.GetRetryTopic(group))))
 
 	if err := c.PersistConsumerOffset(); err != nil {
-		check("S1 位点落盘 (UPDATE_CONSUMER_OFFSET)", false, err.Error())
+		check("S1 offset persisted (UPDATE_CONSUMER_OFFSET)", false, err.Error())
 	} else {
-		check("S1 位点落盘 (UPDATE_CONSUMER_OFFSET)", true)
+		check("S1 offset persisted (UPDATE_CONSUMER_OFFSET)", true)
 	}
 }
 
@@ -330,15 +330,15 @@ func runS2(ns, topic, group string, expect int) {
 		c.SetConsumeFromWhere(client.ConsumeFromWhereFirstOffset)
 	})
 	if err != nil {
-		check("S2 构造/订阅/启动", false, err.Error())
+		check("S2 construct/subscribe/start", false, err.Error())
 		return
 	}
 	defer c.Shutdown()
 
 	// Nothing to receive: the group already consumed all `expect` messages.
 	time.Sleep(8 * time.Second)
-	check("S2 同组第二个消费者不再收到已消费的消息", coll.count(topic) == 0,
-		fmt.Sprintf("got=%d (组已消费 %d 条)", coll.count(topic), expect))
+	check("S2 second consumer in same group receives no already-consumed messages", coll.count(topic) == 0,
+		fmt.Sprintf("got=%d (group already consumed %d messages)", coll.count(topic), expect))
 }
 
 // S3: tag filtering. The broker does not filter (postSubscriptionWhenPull is off
@@ -352,7 +352,7 @@ func runS3(ns, topic, group string, expect int) {
 		c.SetConsumeFromWhere(client.ConsumeFromWhereFirstOffset)
 	})
 	if err != nil {
-		check("S3 构造/订阅/启动", false, err.Error())
+		check("S3 construct/subscribe/start", false, err.Error())
 		return
 	}
 	defer c.Shutdown()
@@ -368,7 +368,7 @@ func runS3(ns, topic, group string, expect int) {
 	}
 	// Every scanned offset (TagA and TagB) advances the cursor, so the client
 	// must have skipped exactly the TagB half rather than stalling on it.
-	check("S3 客户端二次 tag 过滤：只收到 TagA", ok && bad == 0,
+	check("S3 client-side second-stage tag filter: only TagA received", ok && bad == 0,
 		fmt.Sprintf("got=%d want=%d non-TagA=%d", len(got), want, bad))
 }
 
@@ -377,7 +377,7 @@ func runS3(ns, topic, group string, expect int) {
 // 0 per queue and would look "unordered".
 func runS4(ns, topic, group string, expect int) {
 	if topic == "" || expect <= 0 {
-		check("S4 顺序消费（需要 -orderly-topic/-orderly-expect）", true, "skipped")
+		check("S4 orderly consumption (requires -orderly-topic/-orderly-expect)", true, "skipped")
 		return
 	}
 	coll := &orderlyCollector{}
@@ -385,7 +385,7 @@ func runS4(ns, topic, group string, expect int) {
 		c.SetConsumeFromWhere(client.ConsumeFromWhereFirstOffset)
 	})
 	if err != nil {
-		check("S4 构造/订阅/启动", false, err.Error())
+		check("S4 construct/subscribe/start", false, err.Error())
 		return
 	}
 	defer c.Shutdown()
@@ -399,7 +399,7 @@ func runS4(ns, topic, group string, expect int) {
 			ascending = false
 		}
 	}
-	check(fmt.Sprintf("S4 顺序消费：%d 条 queueOffset 严格递增", expect),
+	check(fmt.Sprintf("S4 orderly consumption: %d messages with strictly increasing queueOffset", expect),
 		ascending && len(off) > 0, fmt.Sprintf("got=%d", len(off)))
 }
 
@@ -453,22 +453,22 @@ func runS5(ns, topic, group string) {
 		c.SetConsumeFromWhere(client.ConsumeFromWhereFirstOffset)
 	})
 	if err1 != nil || err2 != nil {
-		check("S5 构造两个消费者", false, fmt.Sprintf("%v %v", err1, err2))
+		check("S5 construct two consumers", false, fmt.Sprintf("%v %v", err1, err2))
 		return
 	}
 	for _, c := range []*client.DefaultMQPushConsumer{first, second} {
 		if err := c.Subscribe(topic, "*"); err != nil {
-			check("S5 订阅", false, err.Error())
+			check("S5 subscribe", false, err.Error())
 			return
 		}
 	}
 	if err := first.Start(); err != nil {
-		check("S5 first 启动", false, err.Error())
+		check("S5 first start", false, err.Error())
 		return
 	}
 	defer first.Shutdown()
 	if err := second.Start(); err != nil {
-		check("S5 second 启动", false, err.Error())
+		check("S5 second start", false, err.Error())
 		return
 	}
 	defer second.Shutdown()
@@ -503,7 +503,7 @@ func runS5(ns, topic, group string) {
 		time.Sleep(time.Second)
 		settled = split()
 	}
-	check(fmt.Sprintf("S5 两个实例把 %d 条队列各分 %d 条", len(route), want), settled,
+	check(fmt.Sprintf("S5 two instances split %d queues, %d each", len(route), want), settled,
 		fmt.Sprintf("first=%s second=%s", queueIDs(ownedOf(first, topic)), queueIDs(ownedOf(second, topic))))
 
 	// Same key space as the split check: (broker, queueId), NOT queueId alone.
@@ -520,8 +520,8 @@ func runS5(ns, topic, group string) {
 			clashes++
 		}
 	}
-	check("S5 分配不重叠", clashes == 0, fmt.Sprintf("clashing queues=%d", clashes))
-	check(fmt.Sprintf("S5 %d 条队列全覆盖", len(route)), len(owned) == len(route),
+	check("S5 assignment non-overlapping", clashes == 0, fmt.Sprintf("clashing queues=%d", clashes))
+	check(fmt.Sprintf("S5 all %d queues covered", len(route)), len(owned) == len(route),
 		fmt.Sprintf("covered=%d", len(owned)))
 }
 
@@ -538,17 +538,17 @@ func runS6(ns, topic, group string) {
 		c.SetConsumeFromWhere(client.ConsumeFromWhereFirstOffset)
 	})
 	if err != nil {
-		check("S6 构造/订阅/启动", false, err.Error())
+		check("S6 construct/subscribe/start", false, err.Error())
 		return
 	}
 	// Registered at the broker = the group list came back with our clientId,
 	// which is the precondition for an assignment at all.
 	registered := waitFor(45*time.Second, func() bool { return c.AssignedQueueCount() > 0 })
-	check("S6 已向 broker 注册（拿到队列分配）", registered,
+	check("S6 registered with broker (got queue assignment)", registered,
 		fmt.Sprintf("assigned=%d", c.AssignedQueueCount()))
 
 	started := c.IsStarted()
 	c.Shutdown()
-	check("S6 优雅停机后 IsStarted=false", started && !c.IsStarted(),
+	check("S6 IsStarted=false after graceful shutdown", started && !c.IsStarted(),
 		fmt.Sprintf("started=%v after=%v", started, c.IsStarted()))
 }

@@ -1,20 +1,20 @@
-//! 离线单测（`src/client/pull_consumer.rs` 的 `lite_cursor_*` 三条）只能证明「脚本回的
-//! `nextBeginOffset` 被跟了」；真 broker 才能让下面两件事同时成立：那个 `nextBeginOffset`
-//! 是 **broker 自己算的**，而且跟过去以后**真的能收到消息**。
+//! Offline unit tests (the three `lite_cursor_*` tests in `src/client/pull_consumer.rs`) can only prove that "the
+//! `nextBeginOffset` returned by the script is followed"; only a real broker can make both of the following true at once: that `nextBeginOffset`
+//! is **computed by the broker itself**, and that after following it **messages really arrive**.
 //!
-//! 场景：
-//! - S1 对照组：每条队列钉 1 条 → assign + `seek(0)` + `*` → 4 条全收（链路要通，
-//!   `maxOffset == 1` 这个标尺也要立住）。
-//! - S2 NO_MATCHED_MSG：把 assign 表达式换成永不匹配的 Tag 再 `seek(0)`。broker 按表达式把
-//!   整段滤掉后回的 `nextBeginOffset` **已经越过整段**（= maxOffset）。断言每条队列的拉取
-//!   游标都到 maxOffset（旧实现只在 FOUND 时推游标，这里会永远停在 0，每轮重扫同一段）。
-//!   零投递。
-//! - S3 OFFSET_ILLEGAL 自愈（决定性一条）：每条队列 `seek(maxOffset + 1000)`。broker 回纠正值
-//!   → 游标必须回到 maxOffset；随后每条队列再钉 1 条，4 条必须**全部收到**。旧实现的游标
-//!   永远卡在越界值上：每轮收到同一个「越界纠正」，新消息一条也看不到 —— 越界之后消费者
-//!   会**静默**地永远收不到消息。
+//! Scenarios:
+//! - S1 control group: pin 1 message per queue → assign + `seek(0)` + `*` → all 4 received (the chain must work,
+//!   and the `maxOffset == 1` yardstick must also hold).
+//! - S2 NO_MATCHED_MSG: switch the assign expression to a never-matching tag and `seek(0)` again. The `nextBeginOffset` the broker
+//!   returns after filtering out the whole span by the expression **already skips past the entire span** (= maxOffset). Assert that every
+//!   queue's pull cursor reaches maxOffset (the previous implementation only advanced the cursor on FOUND, so it would stay at 0 forever,
+//!   rescanning the same span every round). Zero deliveries.
+//! - S3 OFFSET_ILLEGAL self-healing (the decisive one): `seek(maxOffset + 1000)` on every queue. The broker returns the corrected value
+//!   → the cursor must come back to maxOffset; then pin 1 more message per queue, and all 4 must **arrive**. In the previous implementation the cursor
+//!   stayed stuck at the out-of-range value forever: every round received the same "out-of-range correction", and not a single new message was seen --
+//!   after an out-of-range seek the consumer would **silently** never receive messages again.
 //!
-//! 用法：
+//! Usage:
 //! ```text
 //! cargo run --example live_lite_pull_cursor -- 127.0.0.1:9876
 //! ```
@@ -75,7 +75,7 @@ async fn poll_until(mut pred: impl FnMut() -> bool, secs: u64) -> bool {
     }
 }
 
-/// 反复 poll 直到收齐 `expect` 条（或超时），返回收到的 body。
+/// Polls repeatedly until `expect` messages are collected (or timeout), returning the received bodies.
 async fn drain(c: &DefaultLitePullConsumer, expect: usize, secs: u64) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(secs);
@@ -90,7 +90,7 @@ async fn drain(c: &DefaultLitePullConsumer, expect: usize, secs: u64) -> Vec<Str
     out
 }
 
-/// 给定窗口里盯住缓冲（断言「不该有交付」时用）。
+/// Watches the buffer over a given window (used when asserting "no delivery should happen").
 async fn poll_quiet(c: &DefaultLitePullConsumer, secs: u64) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(secs);
@@ -187,7 +187,7 @@ async fn run(namesrv: &str) -> Checker {
         Err(_) => Vec::new(),
     };
     ck.check(
-        "路由可见：4 条队列",
+        "route visible: 4 queues",
         mqs.len() == QUEUES as usize,
         &format!("got={}", mqs.len()),
     );
@@ -197,7 +197,7 @@ async fn run(namesrv: &str) -> Checker {
         return ck;
     }
 
-    // ---------- S1 对照组：* 订阅 + seek(0)，每条队列一条消息全收 ----------
+    // ---------- S1 control group: * subscription + seek(0), one pinned message per queue, all received ----------
     for (i, mq) in mqs.iter().enumerate() {
         let mut msg = Message::new(&topic, Some(format!("lc-s1-{i}").as_bytes()));
         msg.set_tags("TagA");
@@ -211,7 +211,7 @@ async fn run(namesrv: &str) -> Checker {
         name_server_addrs: vec![namesrv.to_string()],
         instance_name: format!("rust-lite-cursor-{stamp}"),
         poll_timeout_millis: 1000,
-        // 位点越界那一腿绝不能把越界值提交上去：关掉自动提交，只看两条游标。
+        // The out-of-range offset leg must never commit the out-of-range value: auto-commit is off, we only watch the two cursor legs.
         auto_commit: false,
         pull_interval_millis: 200,
         consume_from_where: ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET.to_string(),
@@ -236,7 +236,7 @@ async fn run(namesrv: &str) -> Checker {
 
     let got1 = drain(&c, QUEUES as usize, 30).await;
     ck.check(
-        "S1-对照组：* 订阅下 4 条钉到队列的消息全收",
+        "S1-control group: all 4 pinned messages received under the * subscription",
         got1.len() == QUEUES as usize,
         &format!("got={} bodies={:?}", got1.len(), got1),
     );
@@ -252,27 +252,27 @@ async fn run(namesrv: &str) -> Checker {
         }
         let ok = poll_until(|| maxes.iter().all(|m| *m == 1), 10).await;
         ck.check(
-            "S1-每条队列 maxOffset == 1（后面两条腿的标尺）",
+            "S1-every queue has maxOffset == 1 (the yardstick for the next two legs)",
             ok,
             &format!("{:?}", maxes),
         );
     }
 
-    // ---------- S2 NO_MATCHED_MSG：整段被表达式滤掉，游标要跟过整段 ----------
+    // ---------- S2 NO_MATCHED_MSG: the whole span is filtered out by the expression, the cursor must follow past it ----------
     c.set_sub_expression_for_assign(&topic, NEVER_MATCH);
     for mq in &mqs {
         c.seek(mq, 0);
     }
     let ok2 = poll_until(|| mqs.iter().all(|mq| c.pull_cursor_of(mq) == 1), 20).await;
     ck.check(
-        "S2-NO_MATCHED_MSG 后拉取游标越过整段不匹配区间（== maxOffset=1）",
+        "S2-after NO_MATCHED_MSG the pull cursor skips past the whole unmatched span (== maxOffset=1)",
         ok2,
         &cursor_row(&c, &mqs),
     );
     let quiet = poll_quiet(&c, 1).await;
-    ck.check("S2-空应答期间零投递", quiet.is_empty(), &format!("{quiet:?}"));
+    ck.check("S2-zero deliveries during the empty replies", quiet.is_empty(), &format!("{quiet:?}"));
 
-    // ---------- S3 OFFSET_ILLEGAL：越界位点被 broker 纠正 + 消息真的回来 ----------
+    // ---------- S3 OFFSET_ILLEGAL: the out-of-range offset is corrected by the broker + messages really come back ----------
     let mut ahead = Vec::new();
     for mq in &mqs {
         let max_off = admin
@@ -284,12 +284,12 @@ async fn run(namesrv: &str) -> Checker {
     }
     let ok3 = poll_until(|| mqs.iter().all(|mq| c.pull_cursor_of(mq) == 1), 20).await;
     ck.check(
-        "S3-越界位点被 broker 纠正后游标回到 maxOffset（越界自愈）",
+        "S3-after the broker corrects the out-of-range offset the cursor returns to maxOffset (out-of-range self-healing)",
         ok3,
         &format!("{} seekedTo={ahead:?}", cursor_row(&c, &mqs)),
     );
 
-    // S2 换上的永不匹配表达式要换回来，否则下面 4 条 TagA 会被 broker 原样滤掉。
+    // The never-matching expression set in S2 must be switched back, otherwise the 4 TagA messages below are filtered out by the broker as-is.
     c.set_sub_expression_for_assign(&topic, "*");
     for (i, mq) in mqs.iter().enumerate() {
         let mut msg = Message::new(&topic, Some(format!("lc-s3-{i}").as_bytes()));
@@ -301,7 +301,7 @@ async fn run(namesrv: &str) -> Checker {
 
     let got3 = drain(&c, QUEUES as usize, 40).await;
     ck.check(
-        "S3-自愈后新消息全部送达（旧实现：游标卡在 +1000，一条都看不到）",
+        "S3-after self-healing all new messages arrive (previous implementation: cursor stuck at +1000, none seen)",
         got3.len() == QUEUES as usize,
         &format!("got={} bodies={:?}", got3.len(), got3),
     );
@@ -310,7 +310,7 @@ async fn run(namesrv: &str) -> Checker {
     let mut have = got3.clone();
     have.sort();
     ck.check(
-        "S3-收到的正是越界之后钉进去的那 4 条",
+        "S3-exactly the 4 messages pinned after the out-of-range seek are received",
         have == want,
         &format!("bodies={have:?}"),
     );

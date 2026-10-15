@@ -13,10 +13,10 @@ public sealed class GroupRetryPolicy
 {
     public string Type { get; set; } = GroupRetryPolicyType.Customized;
 
-    // IsNull 表示不输出
+    // IsNull means it is not output
     public JsonValue ExponentialRetryPolicy { get; set; } = JsonValue.Null;
 
-    // IsNull 表示不输出
+    // IsNull means it is not output
     public JsonValue CustomizedRetryPolicy { get; set; } = JsonValue.Null;
 
     public JsonValue ToJson()
@@ -51,7 +51,7 @@ public sealed class GroupRetryPolicy
     }
 }
 
-/// <summary>对应 SimpleSubscriptionData。</summary>
+/// <summary>Corresponds to SimpleSubscriptionData.</summary>
 public sealed class SimpleSubscriptionData
 {
     public string Topic { get; set; } = string.Empty;
@@ -79,7 +79,7 @@ public sealed class SimpleSubscriptionData
         };
 }
 
-/// <summary>对应 SubscriptionGroupConfig。</summary>
+/// <summary>Corresponds to SubscriptionGroupConfig.</summary>
 public sealed class SubscriptionGroupConfig
 {
     // MixAll.MASTER_ID
@@ -126,7 +126,7 @@ public sealed class SubscriptionGroupConfig
         v.Set("groupSysFlag", JsonValue.MakeInt(GroupSysFlag));
         v.Set("consumeTimeoutMinute", JsonValue.MakeInt(ConsumeTimeoutMinute));
         v.Set("attributes", AdminJsonStrings.MakeStringMap(Attributes));
-        // fastjson2 默认跳过 null：只有显式设置过才输出该键
+        // fastjson2 skips null by default: the key is output only when explicitly set
         if (HasSubscriptionDataSet)
         {
             var arr = JsonValue.MakeArray();
@@ -227,10 +227,11 @@ public sealed class SubscriptionGroupWrapper
 {
     public SortedDictionary<string, SubscriptionGroupConfig> SubscriptionGroupTable { get; } = new();
 
-    // 透传（本实现不解释其内容）
+    // pass-through (this implementation does not interpret its content)
     public JsonValue ForbiddenTable { get; set; } = JsonValue.Null;
 
-    // 透传：翻页请求要原样回传，避免重排/丢精度
+    // pass-through: the paging request must echo it back verbatim to avoid reordering /
+    // precision loss
     public JsonValue DataVersion { get; set; } = JsonValue.Null;
 
     public JsonValue ToJson()
@@ -279,7 +280,7 @@ public sealed class SubscriptionGroupWrapper
         return true;
     }
 
-    /// <summary>合并另一页（getAllSubscriptionGroup 分页累积用）。</summary>
+    /// <summary>Merges another page (for getAllSubscriptionGroup paging accumulation).</summary>
     public void MergeFrom(SubscriptionGroupWrapper other)
     {
         foreach (var kv in other.SubscriptionGroupTable)

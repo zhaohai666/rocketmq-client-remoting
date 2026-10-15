@@ -5,13 +5,14 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * 通用工具：时间格式化、十六进制串互转、本机 IP 探测、协议侧字符串哈希。
+ * Common utilities: time formatting, hex string conversion in both directions, local IP probing and the
+ * protocol-side string hash.
  */
 final class UtilAll
 {
-    /** 日志/轨迹用的时间戳格式：年-月-日 时:分:秒 */
+    /** The timestamp format used by logs / traces: year-month-day hour:minute:second */
     public const DATE_FORMAT = 'Y-m-d H:i:s';
-    /** 带毫秒的时间戳格式：秒后用 'v' 占位输出 3 位毫秒 */
+    /** The timestamp format carrying milliseconds: 3-digit milliseconds after the seconds via the 'v' placeholder */
     public const DATE_FORMAT_SSS = 'Y-m-d H:i:s.v';
 
     public const HEX_ARRAY = '0123456789ABCDEF';
@@ -41,7 +42,7 @@ final class UtilAll
         if ($ts <= 0) {
             return '-';
         }
-        // 毫秒先截掉再格式化：默认格式本就不含秒以下部分。
+        // Truncate the milliseconds before formatting: the default format does not include sub-second parts anyway.
         return date($pattern, intdiv($ts, 1000));
     }
 
@@ -66,7 +67,8 @@ final class UtilAll
     }
 
     /**
-     * 协议侧这个索引不需要混淆，原样返回（保留接口是为了调用方不改）。
+     * The protocol-side index does not need obfuscation, so it is returned as-is (the interface is kept
+     * so that callers do not have to change).
      */
     public static function string2UnicodeShift(?string $index, int $offset): ?string
     {
@@ -79,7 +81,7 @@ final class UtilAll
     }
 
     /**
-     * 逐字节转**大写**十六进制。
+     * Converts byte by byte to **upper-case** hex.
      */
     public static function bytes2String(string $bs): string
     {
@@ -87,8 +89,9 @@ final class UtilAll
     }
 
     /**
-     * 十六进制字符串 -> 字节（不是 UTF-8 解码）。
-     * 按 len//2 成对解析（奇数位尾字符丢弃），非法字符抛 ValueError。
+     * Hex string -> bytes (not a UTF-8 decode).
+     * Parses in pairs by len//2 (a trailing odd character is dropped), an illegal character throws
+     * ValueError.
      */
     public static function string2Bytes(?string $hexString): ?string
     {
@@ -130,7 +133,7 @@ final class UtilAll
         if ($ip !== '127.0.0.1') {
             return $ip;
         }
-        // UDP 探测失败时退回 gethostbyname(gethostname())，再失败给 127.0.0.1
+        // Fall back to gethostbyname(gethostname()) when the UDP probe fails, and to 127.0.0.1 when that fails too
         $host = gethostname();
         if ($host !== false) {
             $resolved = gethostbyname($host);
@@ -142,15 +145,18 @@ final class UtilAll
     }
 
     /**
-     * 协议侧字符串哈希：h = 31*h + ch 逐码元累加，结果按 32 位有符号回绕。
+     * The protocol-side string hash: h = 31*h + ch accumulated per code unit, the result wrapping as a
+     * signed 32-bit value.
      *
-     * 必须显式实现：PHP 内置 hash 算出的数值与协议要求的完全不同，用错会让
-     * broker 的 tag 过滤永远不命中——消息照发照存，消费端静默收不到。
-     * 用途：`SubscriptionData.codeSet`（订阅 tag 的哈希集合）。
+     * It must be implemented explicitly: the values computed by the PHP built-in hash differ completely
+     * from what the protocol requires, and using the wrong one makes the broker's tag filtering never
+     * match — the message is still sent and stored, and the consumer silently never receives it.
+     * Used for `SubscriptionData.codeSet` (the hash set of subscribed tags).
      *
-     * 按 UTF-16 码元遍历（mb_convert_encoding 到 UTF-16BE 后逐 2 字节取值）；
-     * BMP 内字符（含全部 ASCII tag）与逐码点遍历结果相同。
-     * 对拍向量：TagA=2598919、TagB=2598920、P=80、PA=2545、"*"=42。
+     * Iterates UTF-16 code units (mb_convert_encoding to UTF-16BE then reads 2 bytes at a time);
+     * characters inside the BMP (including all ASCII tags) give the same result as iterating by code
+     * point.
+     * Cross-check vectors: TagA=2598919, TagB=2598920, P=80, PA=2545, "*"=42.
      */
     public static function wireStringHash(string $s): int
     {

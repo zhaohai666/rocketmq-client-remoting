@@ -7,37 +7,37 @@ namespace RocketMQ\Common;
 use Throwable;
 
 /**
- * 消息二进制编解码。
+ * Binary encoding and decoding of messages.
  *
- * broker 侧定义了两条编码路径，本类两条都实现，切勿混用：
+ * The broker side defines two encoding paths, and this class implements both — never mix them up:
  *
- * 1) 17 段存储格式 ``MessageDecoder::encodeMessageExt($msgExt, $needCompress)`` /
+ * 1) The 17-segment storage format ``MessageDecoder::encodeMessageExt($msgExt, $needCompress)`` /
  *    ``decode($raw)``
- *    用于 broker 写入与 pull/get 返回的消息体：
+ *    Used for the message body written by the broker and returned by pull/get:
  *
- *    序号  字段                             编码
- *    1     TOTALSIZE                        int(4)
- *    2     MAGICCODE                        int(4)  -626843481 (v1) / -626843477 (v2)
- *    3     BODYCRC                          int(4)
- *    4     QUEUEID                          int(4)
- *    5     FLAG                             int(4)
- *    6     QUEUEOFFSET                      long(8)
- *    7     PHYSICALOFFSET                   long(8)
- *    8     SYSFLAG                          int(4)
- *    9     BORNTIMESTAMP                    long(8)
- *    10    BORNHOST                         4|16B ip + 4B port
- *    11    STORETIMESTAMP                   long(8)
- *    12    STOREHOST                        4|16B ip + 4B port
- *    13    RECONSUMETIMES                   int(4)
- *    14    PREPAREDTRANSACTIONOFFSET        long(8)
- *    15    BODY                             int(4) len + body
- *    16    TOPIC                            1B(v1)|2B(v2) len + topic
- *    17    PROPERTIES                       short(2) len + k\x01v\x02 串
+ *    index  field                             encoding
+ *    1      TOTALSIZE                         int(4)
+ *    2      MAGICCODE                         int(4)  -626843481 (v1) / -626843477 (v2)
+ *    3      BODYCRC                           int(4)
+ *    4      QUEUEID                           int(4)
+ *    5      FLAG                              int(4)
+ *    6      QUEUEOFFSET                       long(8)
+ *    7      PHYSICALOFFSET                    long(8)
+ *    8      SYSFLAG                           int(4)
+ *    9      BORNTIMESTAMP                     long(8)
+ *    10     BORNHOST                          4|16B ip + 4B port
+ *    11     STORETIMESTAMP                    long(8)
+ *    12     STOREHOST                         4|16B ip + 4B port
+ *    13     RECONSUMETIMES                    int(4)
+ *    14     PREPAREDTRANSACTIONOFFSET         long(8)
+ *    15     BODY                              int(4) len + body
+ *    16     TOPIC                             1B(v1)|2B(v2) len + topic
+ *    17     PROPERTIES                        short(2) len + k\x01v\x02 string
  *
- * 2) 6 段轻量格式 ``encodeMessage(Message)`` / ``decodeBatchMessage($raw)``
- *    仅用于**批量消息**（MessageBatch 的 body），不含 topic / crc：
+ * 2) The 6-segment lightweight format ``encodeMessage(Message)`` / ``decodeBatchMessage($raw)``
+ *    Used **only for batch messages** (the body of MessageBatch), without topic / crc:
  *
- *    TOTALSIZE(4) | MAGICCODE(4, 固定 0) | BODYCRC(4, 固定 0) | FLAG(4)
+ *    TOTALSIZE(4) | MAGICCODE(4, fixed 0) | BODYCRC(4, fixed 0) | FLAG(4)
  *    | BODY(4+len) | PROPERTIES(2+len)
  */
 final class MessageDecoder
@@ -50,7 +50,7 @@ final class MessageDecoder
     public const MESSAGE_MAGIC_CODE_V2 = -626843477;
     public const BLANK_MAGIC_CODE = -875286124;
 
-    // 字段固定偏移（17 段存储格式里的字节位置）
+    // Fixed field offsets (the byte positions in the 17-segment storage format)
     public const MESSAGE_MAGIC_CODE_POSITION = 4;
     public const MESSAGE_FLAG_POSITION = 16;
     public const MESSAGE_PHYSIC_OFFSET_POSITION = 28;
@@ -61,11 +61,12 @@ final class MessageDecoder
 
     private const HEX_TABLE = '0123456789ABCDEF';
 
-    // ---------------------------------------------------------------- 基础工具
+    // ---------------------------------------------------------------- basic utilities
 
     /**
-     * 协议里的文本字段一律 UTF-8。
-     * PHP 字符串本就是字节串，此处仅作语义标注（入参须为 UTF-8 文本）。
+     * Text fields in the protocol are always UTF-8.
+     * A PHP string is a byte string anyway, so this is only a semantic annotation (the argument must be
+     * UTF-8 text).
      */
     public static function string2bytes(string $s): string
     {
@@ -73,7 +74,8 @@ final class MessageDecoder
     }
 
     /**
-     * 逐字节转**大写**十六进制：msgId 的大小写是硬要求，小写串解不出 host/port。
+     * Converts byte by byte to **upper-case** hex: the case of a msgId is a hard requirement, a
+     * lower-case string cannot be decoded into host/port.
      */
     public static function bytes2string(string $bs): string
     {
@@ -81,7 +83,7 @@ final class MessageDecoder
     }
 
     /**
-     * 十六进制字符串 -> 字节（bytes2string 的逆运算）。
+     * Hex string -> bytes (the inverse of bytes2string).
      */
     public static function string2bytesHex(?string $hexString): ?string
     {
@@ -125,18 +127,18 @@ final class MessageDecoder
     }
 
     /**
-     * BODYCRC 用标准 CRC32（poly 0xEDB88320），PHP 内置 crc32() 同参数，
-     * 可直接和 broker 写入的值比对。
+     * BODYCRC uses the standard CRC32 (poly 0xEDB88320); the PHP built-in crc32() takes the same
+     * parameter, so the value can be compared directly against what the broker wrote.
      */
     public static function crc32(string $data): int
     {
         return crc32($data) & 0xFFFFFFFF;
     }
 
-    // ------------------------------------------------------- 属性串 <-> Map
+    // ------------------------------------------------------- property string <-> Map
 
     /**
-     * 属性 map -> 协议串：逐项 `name\x01value\x02` 拼接。
+     * Property map -> protocol string: concatenated item by item as `name\x01value\x02`.
      *
      * @param array<string, string|null>|null $properties
      */
@@ -156,7 +158,7 @@ final class MessageDecoder
     }
 
     /**
-     * 协议串 -> 属性 map（messageProperties2String 的逆运算）。
+     * Protocol string -> property map (the inverse of messageProperties2String).
      *
      * @return array<string, string>
      */
@@ -188,7 +190,7 @@ final class MessageDecoder
     // ---------------------------------------------------------------- msgId
 
     /**
-     * ip+port(8 或 20B) + 8B commitLogOffset -> 十六进制 msgId。
+     * ip+port(8 or 20B) + 8B commitLogOffset -> hex msgId.
      */
     public static function createMessageId(string $addrBytes, int $offset): string
     {
@@ -196,7 +198,7 @@ final class MessageDecoder
     }
 
     /**
-     * 十六进制 msgId -> [ip, port, offset]（createMessageId 的逆运算）。
+     * Hex msgId -> [ip, port, offset] (the inverse of createMessageId).
      *
      * @return array{0: string, 1: int, 2: int}
      */
@@ -220,22 +222,23 @@ final class MessageDecoder
         return [$ip, $port, $offset];
     }
 
-    // ------------------------------------------------- 压缩 / 解压（可选依赖）
+    // ------------------------------------------------- compression / decompression (optional dependency)
 
     /**
-     * 把 sysFlag 里解出的压缩类型归一化到"真实算法"。
+     * Normalizes the compression type decoded from sysFlag to the "real algorithm".
      *
-     * 压缩类型编号的向后兼容映射（协议里只有这几个取值）::
+     * The backward-compatible mapping of compression type numbers (the protocol only has these values)::
      *
      *     1 -> LZ4
      *     2 -> ZSTD
-     *     0 -> ZLIB   （没有类型位能力的老格式消息，类型位就是 0）
+     *     0 -> ZLIB   (the old message format without type-bit capability, its type bits are simply 0)
      *     3 -> ZLIB
      *
-     * 即**类型位为 0 的老版本压缩消息按 ZLIB 处理**。这是必需的：老版本客户端
-     * （无类型位能力）产出的压缩消息类型位就是 0，若不映射到 ZLIB，解压会失败，
-     * 而外层又会照样清掉 COMPRESSED_FLAG，结果是**静默返回压缩字节流**——数据损坏
-     * 且事后无法识别。
+     * That is, **compressed messages from old versions whose type bits are 0 are handled as ZLIB**. This
+     * is required: compressed messages produced by old clients (without type-bit capability) have type
+     * bits of 0, and without mapping them to ZLIB the decompression fails, while the outer layer still
+     * clears COMPRESSED_FLAG as usual, resulting in **silently returning the compressed byte stream** —
+     * data corruption that cannot be recognized afterwards.
      */
     public static function normalizeCompressionType(int $compressionType): int
     {
@@ -256,12 +259,12 @@ final class MessageDecoder
             return $out;
         }
         if ($ctype === MessageSysFlag::LZ4_TYPE) {
-            // LZ4 Frame 格式（魔数 0x184D2204 的自描述帧），纯 PHP 实现
+            // The LZ4 Frame format (the self-describing frame with magic 0x184D2204), pure PHP implementation
             return CompressionCodec::lz4CompressFrame($data);
         }
         if ($ctype === MessageSysFlag::ZSTD_TYPE) {
-            // 合法 ZSTD 帧（CLI 优先真压缩；无 CLI 时 Raw/RLE 块），
-            // broker 按标准 ZSTD 帧解析，两种都能解。
+            // A legal ZSTD frame (the CLI gives real compression when present; Raw/RLE blocks without
+            // it); the broker parses it as a standard ZSTD frame, so both variants can be decoded.
             return CompressionCodec::zstdCompress($data);
         }
         throw self::unsupported($compressionType);
@@ -271,8 +274,9 @@ final class MessageDecoder
     {
         $ctype = self::normalizeCompressionType($compressionType);
         if ($ctype === MessageSysFlag::ZLIB_TYPE) {
-            // gzcompress 产出 zlib 格式（RFC1950），还原只能用 gzuncompress；
-            // gzinflate 只吃裸 deflate，gzdecode 只吃 gzip 格式（RFC1952），都不能用
+            // gzcompress produces the zlib format (RFC1950), so restoring it can only use gzuncompress;
+            // gzinflate only reads bare deflate and gzdecode only reads the gzip format (RFC1952), so
+            // neither of them can be used
             $out = @gzuncompress($data);
             if ($out === false) {
                 throw new \RuntimeException('zlib decompress failed');
@@ -289,12 +293,13 @@ final class MessageDecoder
     }
 
     /**
-     * 未知压缩类型必须抛错。
+     * An unknown compression type must throw.
      *
-     * 类型位只有 0/3(ZLIB)、1(LZ4)、2(ZSTD) 四个合法取值，其余都是脏数据。
-     * **绝不能原样透传**：调用方（``decodeMessage``）在解压后会清掉
-     * ``COMPRESSED_FLAG``，透传等于把压缩字节流当正文交出去且事后无法识别，
-     * 属于静默数据损坏。
+     * The type bits have only four legal values, 0/3(ZLIB), 1(LZ4), 2(ZSTD); anything else is dirty
+     * data. **It must never be passed through as-is**: the caller (``decodeMessage``) clears
+     * ``COMPRESSED_FLAG`` after decompression, so passing it through amounts to handing out the
+     * compressed byte stream as payload with no way to recognize it afterwards, which is silent data
+     * corruption.
      */
     private static function unsupported(int $compressionType): \RuntimeException
     {
@@ -302,18 +307,19 @@ final class MessageDecoder
     }
 
     /**
-     * 按压缩类型解压（``decompressInternal`` 的公开入口）。
+     * Decompresses according to the compression type (the public entry point of
+     * ``decompressInternal``).
      *
-     * 除 ``decodeMessage`` 之外还有第二个调用方：Request-Reply 的应答是从
-     * ``PUSH_REPLY_MESSAGE_TO_CLIENT(326)`` 直接推过来的裸包，不走消息解码路径，
-     * 需要自己按 ``sysFlag`` 判断并在这里解压。
+     * Besides ``decodeMessage`` there is a second caller: the Request-Reply answer is pushed straight
+     * over as a bare packet from ``PUSH_REPLY_MESSAGE_TO_CLIENT(326)`` without going through the message
+     * decoding path, so it has to inspect ``sysFlag`` itself and decompress here.
      */
     public static function decompressBody(string $data, int $compressionType): string
     {
         return self::decompressInternal($data, $compressionType);
     }
 
-    // ------------------------------------------- 1) 17 段存储格式：MessageExt
+    // ------------------------------------------- 1) 17-segment storage format: MessageExt
 
     private static function topicLengthSize(int $magicCode): int
     {
@@ -323,10 +329,12 @@ final class MessageDecoder
     public static function encodeMessageExt(MessageExt $messageExt, bool $needCompress = false): string
     {
         /**
-         * 17 段存储格式编码：needCompress 为真且 sysFlag 标了 COMPRESSED 时先压 body。
+         * 17-segment storage format encoding: when needCompress is true and sysFlag has COMPRESSED set,
+         * the body is compressed first.
          *
-         * 注意：topic 长度固定写 1 字节、魔数固定写 v1（-626843481），
-         * storeSize > 0 时直接按其分配缓冲（尾部不足会按需补齐）。
+         * Note: the topic length is always written as 1 byte and the magic code is always written as v1
+         * (-626843481); when storeSize > 0 the buffer is allocated according to it (and extended on
+         * demand when the tail is short).
          */
         $body = $messageExt->getBody() ?? '';
         if ($needCompress && ($messageExt->getSysFlag() & MessageSysFlag::COMPRESSED_FLAG) !== 0) {
@@ -390,7 +398,7 @@ final class MessageDecoder
     }
 
     /**
-     * 把 17 段消息解码为 MessageExt（对应 ``MessageDecoder.decode``）。
+     * Decodes a 17-segment message into a MessageExt (corresponds to ``MessageDecoder.decode``).
      */
     public static function decodeMessage(
         string $raw,
@@ -405,7 +413,8 @@ final class MessageDecoder
             $storeSize = self::i32($raw, $offset);
             $magicCode = self::i32($raw, $offset);
             if ($magicCode !== self::MESSAGE_MAGIC_CODE && $magicCode !== self::MESSAGE_MAGIC_CODE_V2) {
-                // 未知魔数说明版本判定失败 -> decode 返回 null，不当成消息解
+                // An unknown magic code means version detection failed -> decode returns null, it is not
+                // decoded as a message
                 return null;
             }
             $useV2 = $magicCode === self::MESSAGE_MAGIC_CODE_V2;
@@ -456,7 +465,8 @@ final class MessageDecoder
                     }
                     $msgExt->setBody($body);
                 } else {
-                    // readBody=false：跳过 body 且不赋值 -> null（调用方靠 null 区分「没读」与「空 body」）
+                    // readBody=false: the body is skipped and not assigned -> null (the caller relies on
+                    // null to tell "not read" apart from "empty body")
                     self::need($raw, $offset, $bodyLen);
                     $offset += $bodyLen;
                     $msgExt->setBody(null);
@@ -493,7 +503,8 @@ final class MessageDecoder
     }
 
     /**
-     * 把 17 段消息流解码为 MessageExt 列表（对应 ``MessageDecoder.decodes``，用于 pull 结果）。
+     * Decodes a stream of 17-segment messages into a list of MessageExt (corresponds to
+     * ``MessageDecoder.decodes``, used for pull results).
      *
      * @return list<MessageExt>
      */
@@ -520,12 +531,12 @@ final class MessageDecoder
         return $result;
     }
 
-    // --------------------------------------- 2) 6 段轻量格式：批量消息 body
+    // --------------------------------------- 2) 6-segment lightweight format: batch message body
 
     /**
-     * 批量消息的单条编码（6 段轻量格式）。
+     * The single-message encoding of a batch message (6-segment lightweight format).
      *
-     * 只写 TOTALSIZE / MAGICCODE(0) / BODYCRC(0) / FLAG / BODY / PROPERTIES。
+     * Only TOTALSIZE / MAGICCODE(0) / BODYCRC(0) / FLAG / BODY / PROPERTIES are written.
      */
     public static function encodeMessage(Message $message): string
     {
@@ -536,7 +547,7 @@ final class MessageDecoder
 
         $buf = '';
         $buf .= pack('N', $storeSize & 0xFFFFFFFF);                 // 1 TOTALSIZE
-        $buf .= pack('N', 0);                                       // 2 MAGICCODE（批量场景固定 0）
+        $buf .= pack('N', 0);                                       // 2 MAGICCODE (fixed 0 in the batch scenario)
         $buf .= pack('N', 0);                                       // 3 BODYCRC
         $buf .= pack('N', $message->getFlag() & 0xFFFFFFFF);        // 4 FLAG
         $buf .= pack('N', strlen($body) & 0xFFFFFFFF);              // 5 BODY
@@ -547,7 +558,7 @@ final class MessageDecoder
     }
 
     /**
-     * 多条消息逐条编码后串成一个批量消息 body。
+     * Encodes several messages one by one and concatenates them into a single batch message body.
      *
      * @param list<Message> $messages
      */
@@ -561,7 +572,7 @@ final class MessageDecoder
     }
 
     /**
-     * 单条批量单元 -> Message（6 段轻量格式的逆解析）。
+     * A single batch unit -> Message (the inverse parsing of the 6-segment lightweight format).
      */
     public static function decodeBatchMessage(string $raw): Message
     {
@@ -582,7 +593,7 @@ final class MessageDecoder
     }
 
     /**
-     * 批量消息 body -> Message 列表（按每段 TOTALSIZE 前进）。
+     * Batch message body -> list<Message> (advancing by the TOTALSIZE of each segment).
      *
      * @return list<Message>
      */
@@ -606,7 +617,8 @@ final class MessageDecoder
     }
 
     /**
-     * 数一个批量 body 里内嵌了几条消息（按每段 TOTALSIZE 前进，长度非法即停）。
+     * Counts how many messages are embedded in a batch body (advancing by the TOTALSIZE of each
+     * segment, stopping as soon as a length is illegal).
      */
     public static function countInnerMsgNum(string $raw): int
     {
@@ -624,7 +636,7 @@ final class MessageDecoder
         return $count;
     }
 
-    // ------------------------------------------------------------ 读取原语
+    // ------------------------------------------------------------ read primitives
 
     private static function need(string $raw, int $offset, int $len): void
     {
@@ -641,36 +653,37 @@ final class MessageDecoder
         return $chunk;
     }
 
-    /** 大端有符号 int32（struct ">i"）。 */
+    /** Big-endian signed int32 (struct ">i"). */
     private static function i32(string $raw, int &$offset): int
     {
         $v = (int) unpack('N', self::take($raw, $offset, 4))[1];
         return $v >= 0x80000000 ? $v - 0x100000000 : $v;
     }
 
-    /** 大端无符号 int32（struct ">I"）。 */
+    /** Big-endian unsigned int32 (struct ">I"). */
     private static function u32(string $raw, int &$offset): int
     {
         return (int) unpack('N', self::take($raw, $offset, 4))[1];
     }
 
-    /** 大端无符号 int16（struct ">H"）。 */
+    /** Big-endian unsigned int16 (struct ">H"). */
     private static function u16(string $raw, int &$offset): int
     {
         return (int) unpack('n', self::take($raw, $offset, 2))[1];
     }
 
-    /** 大端单字节（struct ">B"）。 */
+    /** Big-endian single byte (struct ">B"). */
     private static function u8(string $raw, int &$offset): int
     {
         return ord(self::take($raw, $offset, 1));
     }
 
     /**
-     * 大端有符号 int64（struct ">q"）。
+     * Big-endian signed int64 (struct ">q").
      *
-     * PHP unpack('J') 在 64 位构建上返回的就是补码位模式（高位为 1 时已是负数），
-     * 与 ">q" 的有符号语义天然一致，无需再转换。
+     * On a 64-bit build PHP's unpack('J') already returns the two's-complement bit pattern (when the
+     * high bit is 1 it is already negative), which naturally matches the signed semantics of ">q", so no
+     * further conversion is needed.
      */
     private static function i64(string $raw, int &$offset): int
     {

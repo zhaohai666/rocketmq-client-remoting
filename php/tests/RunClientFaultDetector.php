@@ -5,7 +5,7 @@ declare(strict_types=1);
 
 require_once __DIR__ . '/../bootstrap.php';
 
-// 清掉动态取址环境变量；客户端日志吞掉（本套件断言不依赖日志内容）
+// Clear dynamic address-discovery env vars; swallow client logs (assertions in this suite do not depend on log content)
 putenv('ROCKETMQ_NAMESRV_DOMAIN');
 \RocketMQ\Client\Logger::setHandler(static function (string $line): void {
 });
@@ -25,7 +25,7 @@ use RocketMQ\Remoting\Protocol\RocketMQSerializable;
 use RocketMQ\Remoting\Protocol\TopicRouteData;
 
 // ======================================================================
-// 子进程假 broker：`php RunClientFaultDetector.php --broker <logfile> <modefile>`
+// Child-process fake broker: `php RunClientFaultDetector.php --broker <logfile> <modefile>`
 // ======================================================================
 
 if (($argv[1] ?? '') === '--broker') {
@@ -80,8 +80,8 @@ function detectorBrokerLog(string $logFile, RemotingCommand $cmd): void
 }
 
 /**
- * 模式文件当前值：'ok' = GET_MAX_OFFSET 正常应答；'silent' = 收下但不应答
- * （客户端侧表现为单次探测超时）。
+ * Mode file's current values: 'ok' = GET_MAX_OFFSET answered normally; 'silent' = accepted but
+ * not answered (appears client-side as a single probe timeout).
  */
 function detectorBrokerMode(string $modeFile): string
 {
@@ -104,7 +104,7 @@ function detectorBrokerHandleFrame($conn, RemotingCommand $cmd, string $logFile,
             $resp = RemotingCommand::createResponseCommand(ResponseCode::SUCCESS);
             break;
         case RequestCode::GET_MAX_OFFSET:
-            // ServiceDetector 的探针：ok 模式回 SUCCESS，silent 模式吞掉（客户端超时）
+            // ServiceDetector's probe: 'ok' mode answers SUCCESS, 'silent' mode swallows it (client times out)
             if (detectorBrokerMode($modeFile) !== 'silent') {
                 $resp = RemotingCommand::createResponseCommand(ResponseCode::SUCCESS);
                 $resp->extFields['offset'] = '777';
@@ -151,8 +151,8 @@ function detectorBrokerMain(string $logFile, string $modeFile): void
     fflush(STDOUT);
 
     /**
-     * 多连接事件循环（同 RunClientProducer 的假 broker：单连接阻塞式在 Windows 上
-     * 会拒新连接）。@var array<int, resource> $conns
+     * Multi-connection event loop (same as RunClientProducer's fake broker: a single
+     * blocking connection rejects new connections on Windows). @var array<int, resource> $conns
      */
     $conns = [];
     $bufs = [];
@@ -196,7 +196,7 @@ function detectorBrokerMain(string $logFile, string $modeFile): void
 }
 
 // ======================================================================
-// 子进程假 broker 句柄
+// Child-process fake broker handle
 // ======================================================================
 
 final class DetectorFakeBroker
@@ -259,7 +259,7 @@ final class DetectorFakeBroker
         return $out;
     }
 
-    /** 某个请求码的日志条数（可选按 topic 过滤）。 */
+    /** Log entry count for a request code (optionally filtered by topic). */
     public function logCount(int $code, ?string $topic = null): int
     {
         $n = 0;
@@ -293,10 +293,10 @@ final class DetectorFakeBroker
 }
 
 // ======================================================================
-// 纯逻辑探测器替身
+// Pure-logic detector stand-in
 // ======================================================================
 
-/** ServiceDetector 替身：按脚本逐次应答，并记下收到的参数。 */
+/** ServiceDetector stand-in: answers per script entry by entry, and records the arguments it received. */
 final class DetectorScript
 {
     /** @var list<bool> */
@@ -315,7 +315,7 @@ final class DetectorScript
 }
 
 // ======================================================================
-// 测试 runner
+// Test runner
 // ======================================================================
 
 final class RunClientFaultDetector
@@ -356,41 +356,41 @@ final class RunClientFaultDetector
         return 0;
     }
 
-    // ================================================================ 1. 配置与默认值
+    // ================================================================ 1. Configuration and defaults
 
     private function testConfigDefaults(): void
     {
         $p = new DefaultMQProducer('GID-det-cfg');
-        $this->check(false === $p->isStartDetectorEnable(), 'producer 默认 startDetectorEnable=false');
-        $this->checkSame(200, $p->getDetectTimeout(), 'producer 默认 detectTimeout=200');
-        $this->checkSame(2000, $p->getDetectInterval(), 'producer 默认 detectInterval=2000');
+        $this->check(false === $p->isStartDetectorEnable(), 'producer defaults startDetectorEnable=false');
+        $this->checkSame(200, $p->getDetectTimeout(), 'producer defaults detectTimeout=200');
+        $this->checkSame(2000, $p->getDetectInterval(), 'producer defaults detectInterval=2000');
 
         $st = $p->mqFaultStrategy;
-        $this->check(false === $st->isStartDetectorEnable(), 'strategy 默认 startDetectorEnable=false');
-        $this->checkSame(200, $st->getDetectTimeout(), 'strategy 默认 detectTimeout=200');
-        $this->checkSame(2000, $st->getDetectInterval(), 'strategy 默认 detectInterval=2000');
+        $this->check(false === $st->isStartDetectorEnable(), 'strategy defaults startDetectorEnable=false');
+        $this->checkSame(200, $st->getDetectTimeout(), 'strategy defaults detectTimeout=200');
+        $this->checkSame(2000, $st->getDetectInterval(), 'strategy defaults detectInterval=2000');
         $tol = $st->getLatencyFaultTolerance();
-        $this->checkSame(200, $tol->detectTimeout, 'tolerance 默认 detectTimeout=200');
-        $this->checkSame(2000, $tol->detectInterval, 'tolerance 默认 detectInterval=2000');
-        $this->check(false === $tol->isStartDetectorEnable(), 'tolerance 默认 startDetectorEnable=false');
+        $this->checkSame(200, $tol->detectTimeout, 'tolerance defaults detectTimeout=200');
+        $this->checkSame(2000, $tol->detectInterval, 'tolerance defaults detectInterval=2000');
+        $this->check(false === $tol->isStartDetectorEnable(), 'tolerance defaults startDetectorEnable=false');
 
         $p->setStartDetectorEnable(true);
         $p->setDetectTimeout(500);
         $p->setDetectInterval(1500);
-        $this->check(true === $p->isStartDetectorEnable(), 'setStartDetectorEnable(true) 生效');
-        $this->checkSame(500, $p->getDetectTimeout(), 'setDetectTimeout 生效');
-        $this->checkSame(1500, $p->getDetectInterval(), 'setDetectInterval 生效');
-        $this->check(true === $st->isStartDetectorEnable(), 'setStartDetectorEnable 传导到 strategy');
-        $this->checkSame(500, $st->getDetectTimeout(), 'setDetectTimeout 传导到 strategy');
-        $this->checkSame(1500, $st->getDetectInterval(), 'setDetectInterval 传导到 strategy');
-        $this->checkSame(500, $tol->detectTimeout, 'setDetectTimeout 传导到 tolerance');
-        $this->checkSame(1500, $tol->detectInterval, 'setDetectInterval 传导到 tolerance');
-        $this->check(true === $tol->isStartDetectorEnable(), 'setStartDetectorEnable 传导到 tolerance');
+        $this->check(true === $p->isStartDetectorEnable(), 'setStartDetectorEnable(true) takes effect');
+        $this->checkSame(500, $p->getDetectTimeout(), 'setDetectTimeout takes effect');
+        $this->checkSame(1500, $p->getDetectInterval(), 'setDetectInterval takes effect');
+        $this->check(true === $st->isStartDetectorEnable(), 'setStartDetectorEnable propagates to strategy');
+        $this->checkSame(500, $st->getDetectTimeout(), 'setDetectTimeout propagates to strategy');
+        $this->checkSame(1500, $st->getDetectInterval(), 'setDetectInterval propagates to strategy');
+        $this->checkSame(500, $tol->detectTimeout, 'setDetectTimeout propagates to tolerance');
+        $this->checkSame(1500, $tol->detectInterval, 'setDetectInterval propagates to tolerance');
+        $this->check(true === $tol->isStartDetectorEnable(), 'setStartDetectorEnable propagates to tolerance');
         $p->setStartDetectorEnable(false);
-        $this->check(false === $st->isStartDetectorEnable(), '开关可翻回 false');
+        $this->check(false === $st->isStartDetectorEnable(), 'switch can be flipped back to false');
     }
 
-    // ================================================================ 2. detectByOneRound 纯逻辑
+    // ================================================================ 2. detectByOneRound pure logic
 
     private function testDetectRoundPure(): void
     {
@@ -398,41 +398,41 @@ final class RunClientFaultDetector
         $tol->detectTimeout = 50;
         $tol->detectInterval = 100;
         $script = new DetectorScript();
-        $script->script = [false, true]; // 第一轮探测失败，第二轮成功
+        $script->script = [false, true]; // first probe round fails, second succeeds
         $resolver = static fn (string $name): ?string => $name === 'gone' ? null : "addr-{$name}";
 
-        // 故障表里放一个不可达 broker（checkStamp 初始 0 → 任意时刻都到期）
+        // Put an unreachable broker in the fault table (initial checkStamp 0 => due at any time)
         $tol->updateFaultItem('b1', 1000.0, 0.0, false);
-        $this->check(false === $tol->isReachable('b1'), '预备：b1 不可达');
+        $this->check(false === $tol->isReachable('b1'), 'setup: b1 unreachable');
 
-        // 第一轮：到期 → 探测（失败）→ flag 不动；checkStamp 推到 now+100
+        // Round one: due => probe (fails) => flag untouched; checkStamp pushed to now+100
         $tol->detectByOneRound(1000, $resolver, $script->detect(...));
-        $this->checkSame(1, $script->calls, '第一轮到期触发探测');
-        $this->checkSame(['addr-b1', 50], $script->args[0] ?? null, '探测参数 = 解析地址 + detectTimeout');
-        $this->check(false === $tol->isReachable('b1'), '探测失败 flag 不动（置不可达是发送路径的职责）');
-        $this->checkSame(1100.0, $tol->getFaultItem('b1')->checkStamp, 'checkStamp 推到 now+detectInterval');
+        $this->checkSame(1, $script->calls, 'round one due triggers a probe');
+        $this->checkSame(['addr-b1', 50], $script->args[0] ?? null, 'probe args = resolved address + detectTimeout');
+        $this->check(false === $tol->isReachable('b1'), 'failed probe leaves flag untouched (marking unreachable is the send path\'s job)');
+        $this->checkSame(1100.0, $tol->getFaultItem('b1')->checkStamp, 'checkStamp pushed to now+detectInterval');
 
-        // 未到期：零探测开销
+        // Not due yet: zero probe overhead
         $tol->detectByOneRound(1050, $resolver, $script->detect(...));
-        $this->checkSame(1, $script->calls, '未到期不再探测');
+        $this->checkSame(1, $script->calls, 'no probe while not due');
 
         $tol->detectByOneRound(1100, $resolver, $script->detect(...));
-        $this->checkSame(2, $script->calls, '到期后第二轮探测');
-        $this->check(true === $tol->isReachable('b1'), '探测成功 → reachable 翻回 true');
+        $this->checkSame(2, $script->calls, 'second round probes once due');
+        $this->check(true === $tol->isReachable('b1'), 'successful probe => reachable flips back to true');
 
-        // resolver 解析不到（broker 已离开路由）→ 故障记录摘除
+        // resolver cannot resolve (broker left the route) => fault entry removed
         $tol->updateFaultItem('gone', 0.0, 0.0, false);
         $tol->detectByOneRound(2000, $resolver, $script->detect(...));
-        $this->checkSame(null, $tol->getFaultItem('gone'), 'resolver=null → 摘除故障记录');
-        $this->check($tol->getFaultItem('b1') !== null, '其余记录不受影响');
+        $this->checkSame(null, $tol->getFaultItem('gone'), 'resolver=null => fault entry removed');
+        $this->check($tol->getFaultItem('b1') !== null, 'other entries unaffected');
 
         $tol->updateFaultItem('b3', 0.0, 0.0, false);
         $tol->detectByOneRound(3000, $resolver, null);
-        $this->check(false === $tol->isReachable('b3'), '无探测器 → flag 不动');
-        $this->check($tol->getFaultItem('b3') !== null, '无探测器 → 记录保留');
+        $this->check(false === $tol->isReachable('b3'), 'no detector => flag untouched');
+        $this->check($tol->getFaultItem('b3') !== null, 'no detector => entry kept');
     }
 
-    // ================================================================ 3. tick 驱动：到期触发 / 未到期零开销
+    // ================================================================ 3. tick driven: due triggers / not-due zero overhead
 
     private function testTickDueTrigger(DetectorFakeBroker $broker): void
     {
@@ -447,70 +447,71 @@ final class RunClientFaultDetector
             $tol = $strategy->getLatencyFaultTolerance();
             $strategy->updateFaultItem('broker-a', 1000.0, true, false);
             $item = $tol->getFaultItem('broker-a');
-            $this->check($item !== null, '故障表建项');
-            $this->check(false === $tol->isReachable('broker-a'), '预备：broker-a 不可达');
+            $this->check($item !== null, 'fault table entry created');
+            $this->check(false === $tol->isReachable('broker-a'), 'setup: broker-a unreachable');
 
             $now = (int) FaultItem::nowMillis();
 
-            // 未到期（checkStamp 推到未来）：tick 零探测开销
+            // Not due (checkStamp pushed into the future): tick has zero probe overhead
             $item->checkStamp = $now + 5000;
             $p->mqClient->tick($now);
-            $this->checkSame(0, $broker->logCount(RequestCode::GET_MAX_OFFSET), '未到期 → 不发探测');
+            $this->checkSame(0, $broker->logCount(RequestCode::GET_MAX_OFFSET), 'not due => no probe sent');
 
-            // 到期：tick 内同步探测，tick 返回时探测已完成
+            // Due: probe happens synchronously inside tick, complete by the time tick returns
             $item->checkStamp = FaultItem::nowMillis() - 1;
             $p->mqClient->tick((int) FaultItem::nowMillis());
-            $this->checkSame(1, $broker->logCount(RequestCode::GET_MAX_OFFSET), '到期 → tick 内发出探测');
-            $this->check(true === $tol->isReachable('broker-a'), '探测成功 → broker-a 翻回可达');
+            $this->checkSame(1, $broker->logCount(RequestCode::GET_MAX_OFFSET), 'due => probe sent within tick');
+            $this->check(true === $tol->isReachable('broker-a'), 'successful probe => broker-a flips back to reachable');
 
-            // 探测参数：ServiceDetector = 探测 topic 的 queue 0
+            // Probe parameters: ServiceDetector = queue 0 of the probe topic
             $probes = array_values(array_filter(
                 $broker->logEntries(),
                 static fn (array $e): bool => ($e['code'] ?? null) === RequestCode::GET_MAX_OFFSET
             ));
-            $this->checkSame('DetectTopic', $probes[0]['ext']['topic'] ?? null, '探测 topic 取在用 topic');
-            $this->checkSame('0', (string) ($probes[0]['ext']['queueId'] ?? ''), '探测 queueId=0');
+            $this->checkSame('DetectTopic', $probes[0]['ext']['topic'] ?? null, 'probe topic uses the in-use topic');
+            $this->checkSame('0', (string) ($probes[0]['ext']['queueId'] ?? ''), 'probe queueId=0');
 
-            // 周期重排：刚探测完立刻再 tick 不重复探测（detectInterval 未到期）
+            // Period rescheduling: tick again right after a probe does not probe again (detectInterval not yet due)
             $p->mqClient->tick((int) FaultItem::nowMillis());
-            $this->checkSame(1, $broker->logCount(RequestCode::GET_MAX_OFFSET), '探测后 checkStamp 重排 → 不重复探测');
+            $this->checkSame(1, $broker->logCount(RequestCode::GET_MAX_OFFSET), 'checkStamp rescheduled after probe => no duplicate probe');
         } finally {
             $p->shutdown();
         }
     }
 
-    // ================================================================ 4. tick 驱动：开关关闭时不探测
+    // ================================================================ 4. tick driven: no probe when the switch is off
 
     private function testTickGateDisabled(DetectorFakeBroker $broker): void
     {
         $p = $this->makeProducer($broker, 'GID-det-off', 'DetectTopic', 'det-inst-off');
-        // startDetectorEnable 保持默认 false（sendLatencyFaultEnable 也关——探测轮与
-        // 发送开关独立：容错表直接喂一条不可达记录，验证 tick 的开关判定）
+        // startDetectorEnable stays default false (sendLatencyFaultEnable also off -- the
+        // probe round and the send switch are independent: feed an unreachable entry
+        // straight into the fault table to verify tick's switch gate)
         $p->start();
         try {
             $tol = $p->mqFaultStrategy->getLatencyFaultTolerance();
             $tol->updateFaultItem('broker-a', 1000.0, 0.0, false);
             $item = $tol->getFaultItem('broker-a');
-            $this->check($item !== null, '预备：故障表建项（tolerance 层直写）');
-            $item->checkStamp = FaultItem::nowMillis() - 1; // 已到期
+            $this->check($item !== null, 'setup: fault table entry created (written at the tolerance layer)');
+            $item->checkStamp = FaultItem::nowMillis() - 1; // already due
             $p->mqClient->tick((int) FaultItem::nowMillis());
-            $this->checkSame(0, $broker->logCount(RequestCode::GET_MAX_OFFSET), '开关关闭 → 到期也不探测');
-            $this->check(false === $tol->isReachable('broker-a'), '开关关闭 → flag 不动');
+            $this->checkSame(0, $broker->logCount(RequestCode::GET_MAX_OFFSET), 'switch off => no probe even when due');
+            $this->check(false === $tol->isReachable('broker-a'), 'switch off => flag untouched');
 
             $p->setStartDetectorEnable(true);
             $p->mqClient->tick((int) FaultItem::nowMillis());
-            $this->checkSame(1, $broker->logCount(RequestCode::GET_MAX_OFFSET), '运行中打开开关 → 下一轮探测');
-            $this->check(true === $tol->isReachable('broker-a'), '运行中打开 → 恢复可达');
+            $this->checkSame(1, $broker->logCount(RequestCode::GET_MAX_OFFSET), 'switch turned on mid-run => probe next round');
+            $this->check(true === $tol->isReachable('broker-a'), 'switch turned on mid-run => reachable again');
         } finally {
             $p->shutdown();
         }
     }
 
-    // ================================================================ 5. tick 驱动：探测超时 → 恢复放行
+    // ================================================================ 5. tick driven: probe timeout => recovery lets traffic through
 
     private function testTimeoutThenRecover(DetectorFakeBroker $broker): void
     {
-        // broker 以 silent 模式起步：GET_MAX_OFFSET 收下不回 → 单次探测只能超时
+        // Broker starts in silent mode: GET_MAX_OFFSET accepted but unanswered => a single probe can only time out
         $p = $this->makeProducer($broker, 'GID-det-to', 'DetectTopic', 'det-inst-to');
         $p->setSendLatencyFaultEnable(true);
         $p->setStartDetectorEnable(true);
@@ -522,20 +523,20 @@ final class RunClientFaultDetector
             $tol = $strategy->getLatencyFaultTolerance();
             $strategy->updateFaultItem('broker-a', 1000.0, true, false);
             $item = $tol->getFaultItem('broker-a');
-            $this->check(false === $tol->isReachable('broker-a'), '预备：broker-a 不可达');
+            $this->check(false === $tol->isReachable('broker-a'), 'setup: broker-a unreachable');
 
-            // 探测超时（broker 活着但不回 → invokeSync 按 detectTimeout 超时，无连接拒绝怪癖）
+            // Probe timeout (broker alive but silent => invokeSync times out per detectTimeout, no connection-refused quirk)
             $item->checkStamp = FaultItem::nowMillis() - 1;
             $p->mqClient->tick((int) FaultItem::nowMillis());
-            $this->checkSame(1, $broker->logCount(RequestCode::GET_MAX_OFFSET), '超时场景探测已发出');
-            $this->check(false === $tol->isReachable('broker-a'), '探测超时 → 仍不可达（record 保留等下一轮）');
+            $this->checkSame(1, $broker->logCount(RequestCode::GET_MAX_OFFSET), 'probe was sent in the timeout scenario');
+            $this->check(false === $tol->isReachable('broker-a'), 'probe timeout => still unreachable (record kept for the next round)');
 
-            // broker 恢复应答 → 下一轮探测成功 → 放行
+            // Broker recovers its answers => next round probes successfully => traffic let through
             $broker->setMode('ok');
             $item->checkStamp = FaultItem::nowMillis() - 1;
             $p->mqClient->tick((int) FaultItem::nowMillis());
-            $this->checkSame(2, $broker->logCount(RequestCode::GET_MAX_OFFSET), '恢复后第二轮探测');
-            $this->check(true === $tol->isReachable('broker-a'), '探测成功 → 恢复可达（从不可达窗口放回）');
+            $this->checkSame(2, $broker->logCount(RequestCode::GET_MAX_OFFSET), 'second probe after recovery');
+            $this->check(true === $tol->isReachable('broker-a'), 'successful probe => reachable again (admitted back from the unreachable window)');
         } finally {
             $p->shutdown();
         }
@@ -557,7 +558,7 @@ final class RunClientFaultDetector
         $this->testConfigDefaults();
         $this->testDetectRoundPure();
 
-        // 每个网络用例各起一个假 broker（JSON 行日志按进程累计，不能跨用例共享）
+        // Each network case starts its own fake broker (JSON line logs accumulate per process, cannot be shared across cases)
         $broker = DetectorFakeBroker::start();
         try {
             $this->testTickDueTrigger($broker);

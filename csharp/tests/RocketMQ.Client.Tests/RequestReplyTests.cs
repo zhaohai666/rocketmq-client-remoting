@@ -1,12 +1,14 @@
-// Request-Reply（5.x）客户端侧单测（发起端与回推入口的核心断言）。
+// Client-side unit tests for Request-Reply (5.x) (the core assertions of the originating side and the push-back entry).
 //
-// 覆盖三层：
-// 1. 纯数据/等待槽逻辑（RequestResponseFuture / RequestFutureHolder /
-//    create_reply_message）—— 不需要网络；
-// 2. 线上编码：应答消息必须选 SEND_REPLY_MESSAGE_V2(325) 而不是
-//    SEND_MESSAGE_V2(310)，否则 broker 不会走 ReplyMessageProcessor；
-// 3. broker 回推入口 MQClientInstance.ProcessReplyMessage(326) —— 必须把应答
-//    投进等待槽，并且**回一个响应**（broker 侧是 invokeSync，不回响应它那边会超时）。
+// Three layers are covered:
+// 1. Pure data / waiting slot logic (RequestResponseFuture / RequestFutureHolder /
+//    create_reply_message) -- no network needed;
+// 2. Wire encoding: a reply message must choose SEND_REPLY_MESSAGE_V2(325) rather than
+//    SEND_MESSAGE_V2(310), otherwise the broker will not go through
+//    ReplyMessageProcessor;
+// 3. The broker push-back entry MQClientInstance.ProcessReplyMessage(326) -- it must
+//    deliver the response into the waiting slot and **send a response back** (the broker
+//    side is invokeSync, and it would time out there if none were returned).
 using System;
 using System.Collections.Generic;
 using System.Threading;
@@ -16,7 +18,7 @@ using RocketMQ.Common;
 using RocketMQ.Remoting.Protocol;
 using Xunit;
 
-// PropertyMap 是 src 项目的 global using 别名（SortedDictionary<string,string>），测试项目需显式声明。
+// PropertyMap is a global using alias in the src project (SortedDictionary<string,string>), the test project must declare it explicitly.
 using PropertyMap = System.Collections.Generic.SortedDictionary<string, string>;
 
 namespace RocketMQ.Client.Tests;
@@ -27,7 +29,7 @@ public class RequestReplyTests
 
     private static Message RequestMsg()
     {
-        // 构造一条「broker 已投递给消费者」的请求消息（带 broker 写入的 CLUSTER）。
+        // Builds a request message of "the broker has delivered it to a consumer" (carrying the CLUSTER the broker wrote)
         var m = new Message(BaseTopic, System.Text.Encoding.UTF8.GetBytes("ping"));
         m.PutProperty(MessageConst.PropertyCluster, "DefaultCluster");
         m.PutProperty(MessageConst.PropertyCorrelationId, "corr-1");
@@ -36,7 +38,7 @@ public class RequestReplyTests
         return m;
     }
 
-    // ---------------------------------------------------------------- 应答消息构造
+    // ---------------------------------------------------------------- Reply message construction
 
     [Fact]
     public void CreateReplyMessageMatchesLegacyShape()
@@ -44,7 +46,7 @@ public class RequestReplyTests
         Message reply = RequestReply.CreateReplyMessage(RequestMsg(), System.Text.Encoding.UTF8.GetBytes("pong"));
         Assert.Equal("DefaultCluster_REPLY_TOPIC", reply.Topic);
         Assert.Equal("pong", System.Text.Encoding.UTF8.GetString(reply.Body));
-        // 四个属性一个都不能少，且 CORRELATION_ID/REPLY_TO_CLIENT/TTL 是原样带回
+        // not one of the four properties may be missing, and CORRELATION_ID/REPLY_TO_CLIENT/TTL are carried back as is
         Assert.Equal("reply", reply.GetProperty(MessageConst.PropertyMessageType));
         Assert.Equal("corr-1", reply.GetProperty(MessageConst.PropertyCorrelationId));
         Assert.Equal("10.0.0.1@pg#123", reply.GetProperty(MessageConst.PropertyReplyToClient));
@@ -80,13 +82,13 @@ public class RequestReplyTests
     [Fact]
     public void ReplyTopicConstantIsPostfixNotPrefix()
     {
-        // 别把 Request-Reply 的 <cluster>_REPLY_TOPIC 与老的控制台前缀 %REPLY% 搞混
+        // Do not confuse Request-Reply's <cluster>_REPLY_TOPIC with the old console prefix %REPLY%
         Assert.Equal("REPLY_TOPIC", MixAll.REPLY_TOPIC_POSTFIX);
         Assert.Equal("reply", MixAll.REPLY_MESSAGE_FLAG);
         Assert.Equal("DefaultCluster_REPLY_TOPIC", MixAll.GetReplyTopic("DefaultCluster"));
     }
 
-    // ---------------------------------------------------------------- 等待槽
+    // ---------------------------------------------------------------- Waiting slots
 
     [Fact]
     public void CorrelationIdIsRandom()
@@ -100,7 +102,7 @@ public class RequestReplyTests
         Assert.Equal(50, ids.Count);
         foreach (string id in ids)
         {
-            Assert.Equal(36, id.Length); // UUID 字符串
+            Assert.Equal(36, id.Length); // a UUID string
         }
     }
 
@@ -135,7 +137,7 @@ public class RequestReplyTests
         Assert.Same(f, holder.GetRequest("c1"));
 
         Assert.Same(f, holder.PutResponse("c1", new Message(BaseTopic, System.Text.Encoding.UTF8.GetBytes("pong"))));
-        // 已经被摘走 → 再投一次（重复应答）必须返回 null，且不会二次唤醒
+        // Already taken away -> delivering again (a duplicate response) must return null, and must not wake it a second time
         Assert.Null(holder.GetRequest("c1"));
         Assert.Null(holder.PutResponse("c1", new Message(BaseTopic, System.Text.Encoding.UTF8.GetBytes("pong2"))));
     }
@@ -163,10 +165,10 @@ public class RequestReplyTests
         Assert.Equal(ClientErrorCode.RequestTimeoutException, e.ResponseCode);
     }
 
-    // ---------------------------------------------------------------- 线上编码
+    // ---------------------------------------------------------------- Wire encoding
 
     private static MQClientInstance MakeInstance() =>
-        // 只构造，不 start() → 不建连、不发心跳，纯离线断言
+        // only built, no start() -> no connection, no heartbeat, purely offline assertions
         new MQClientInstance("RRUnitClient_" + Environment.CurrentManagedThreadId.ToString(System.Globalization.CultureInfo.InvariantCulture),
             new List<string> { "127.0.0.1:9876" });
 
@@ -189,11 +191,11 @@ public class RequestReplyTests
         Assert.NotEqual(RequestCode.SendReplyMessageV2, req.Code);
     }
 
-    // ---------------------------------------------------------------- broker 回推入口 326
+    // ---------------------------------------------------------------- The broker push-back entry 326
 
     private static RemotingCommand PushReplyCommand(string correlationId, byte[] body)
     {
-        // 按 broker ReplyMessageProcessor#pushReplyMessage 的字段造一条 326 请求。
+        // Builds a 326 request following the fields of broker ReplyMessageProcessor#pushReplyMessage.
         var h = new ReplyMessageRequestHeader
         {
             ProducerGroup = "PG_RR",
@@ -217,7 +219,7 @@ public class RequestReplyTests
         h.Properties = MessageDecoder.MessagePropertiesToString(props.Properties);
 
         var cmd = RemotingCommand.CreateRequestCommand(RequestCode.PushReplyMessageToClient, null);
-        // 真实链路上 ext_fields 由 decode() 从报文填好；这里直接放进去（等价于过了一遍网络）。
+        // On the real path ext_fields is filled by decode() from the message; here it is put in directly (equivalent to having gone through the network once).
         cmd.ExtFields = h.ToExtFields();
         cmd.Body = body;
         cmd.HasBody = true;
@@ -234,10 +236,10 @@ public class RequestReplyTests
         {
             RemotingCommand req = PushReplyCommand("corr-326", System.Text.Encoding.UTF8.GetBytes("pong"));
             RemotingCommand? resp = inst.ProcessReplyMessage(req, "127.0.0.1:10911");
-            // 必须回响应：broker 的 Broker2Client.callClient 是 invokeSync(10s)
+            // A response must be sent back: the broker's Broker2Client.callClient is invokeSync(10s)
             Assert.NotNull(resp);
             Assert.Equal(ResponseCode.Success, resp!.Code);
-            // 应答被投进等待槽，body 与属性都在
+            // The response is delivered into the waiting slot, with both body and properties
             Message? got = future.WaitResponseMessage(1000);
             Assert.NotNull(got);
             Assert.Equal("pong", System.Text.Encoding.UTF8.GetString(got!.Body));
@@ -254,9 +256,9 @@ public class RequestReplyTests
     [Fact]
     public void ProcessReplyMessageUnknownCorrelationStillRespondsSuccess()
     {
-        // 迟到/重复的应答：查不到等待槽只记 warn，仍然要回 SUCCESS。
-        // 回非 SUCCESS 会让 broker 把它当成 push 失败记进日志 —— 实际上应答没丢，
-        // 只是对应的请求已经超时或已处理过了。
+        // A late/duplicate response: not finding a waiting slot is only logged as a warn and SUCCESS must still be returned.
+        // Returning non-SUCCESS would make the broker record it as a push failure in its log -- in reality the response was
+        // not lost, the corresponding request had simply already timed out or been handled.
         MQClientInstance inst = MakeInstance();
         RemotingCommand? resp = inst.ProcessReplyMessage(
             PushReplyCommand("no-such-id", System.Text.Encoding.UTF8.GetBytes("late")), "127.0.0.1:10911");
@@ -269,7 +271,7 @@ public class RequestReplyTests
     {
         MQClientInstance inst = MakeInstance();
         RemotingCommand cmd = RemotingCommand.CreateRequestCommand(RequestCode.PushReplyMessageToClient, null);
-        // properties 是非法格式 → 解析抛错 → 必须回 SYSTEM_ERROR 而不是让读线程崩掉
+        // properties is malformed -> parsing throws -> SYSTEM_ERROR must be returned instead of letting the reader thread crash
         cmd.ExtFields = new PropertyMap { ["properties"] = "\x00\xff broken" };
         cmd.Body = System.Text.Encoding.UTF8.GetBytes("x");
         cmd.HasBody = true;

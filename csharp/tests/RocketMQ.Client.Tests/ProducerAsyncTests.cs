@@ -1,6 +1,8 @@
-// 这里按 C# 能观察到的证据取样：假集群（MockCluster.cs）能看见**上线的报文**，
-// 日志能看见**重试链**，两者合起来足够钉死「调用方立刻返回 / 回调恰好一次 /
-// 异步不看 retryResponseCodes / 预算共享 / 闸门与队满怎么拒绝」这几条不变式。
+// Sampling here is based on the evidence C# can observe: the fake cluster
+// (MockCluster.cs) sees the **request that goes on the wire**, and the log sees the
+// **retry chain**; together they are enough to pin down the invariants "the caller
+// returns immediately / the callback fires exactly once / async ignores
+// retryResponseCodes / the budget is shared / how the gates and a full queue reject".
 using System.Diagnostics;
 using System.Globalization;
 using System.Text;
@@ -27,7 +29,7 @@ public class ProducerAsyncTests : IDisposable
 
     public void Dispose()
     {
-        // ClientLog 全程持有写句柄，先把日志指向别处再删临时目录
+        // ClientLog holds the write handle throughout, so redirect the log elsewhere before deleting the temp directory
         ClientLog.SetLogFile(Path.Combine(_dir, "detached.log"));
         try
         {
@@ -35,11 +37,11 @@ public class ProducerAsyncTests : IDisposable
         }
         catch (Exception)
         {
-            // 清理失败不影响测试
+            // A cleanup failure does not affect the test
         }
     }
 
-    // ---------------------------------------------------------------- 夹具
+    // ---------------------------------------------------------------- Fixtures
 
     private static DefaultMQProducer Started(MockCluster cluster, string group,
         ConsumeExecutor? senderPool = null)
@@ -57,7 +59,7 @@ public class ProducerAsyncTests : IDisposable
     private static Message Msg(int bodyLen = 10) =>
         new(Topic, new byte[Math.Max(0, bodyLen)]);
 
-    /// <summary>轮询等待条件成立（回调是跨线程的，不能假设它已经跑完）。</summary>
+    /// <summary>Polls until the condition holds (the callback is cross-thread, so it cannot be assumed to have run yet).</summary>
     private static bool WaitUntil(Func<bool> cond, int millis)
     {
         var watch = Stopwatch.StartNew();
@@ -150,8 +152,9 @@ public class ProducerAsyncTests : IDisposable
         }
     }
 
-    /// <summary>数 before/after 各跑了几次，并记下 after 有没有看到结果/异常。
-    /// 可选「在 before 里park 一段时间」，用来把池的 worker 占住（真集群造不出这段时长）。</summary>
+    /// <summary>Counts how often before/after each ran, and records whether after saw a
+    /// result or an exception. Optionally "parks for a while inside before" to occupy a
+    /// pool worker (a real cluster cannot produce a stretch that long).</summary>
     private sealed class CountingSendHook : ISendMessageHook
     {
         private readonly int _parkMillis;
@@ -200,8 +203,9 @@ public class ProducerAsyncTests : IDisposable
         }
     }
 
-    /// <summary>拦截钩子：记录它看到的 CommunicationMode，可顺带睡一段时间（把准备段的
-    /// 预算花光，用来验 sendKernelImpl 自己的那道闸），也可以直接拒绝某个标签。</summary>
+    /// <summary>An interceptor hook: records the CommunicationMode it saw, may optionally
+    /// sleep for a while (spending the prologue's budget, to verify sendKernelImpl's own
+    /// gate), and may outright reject a given tag.</summary>
     private sealed class ForbiddenHook : ICheckForbiddenHook
     {
         private readonly int _sleepMillis;
@@ -241,7 +245,8 @@ public class ProducerAsyncTests : IDisposable
         return path;
     }
 
-    /// <summary>ClientLog 握着写句柄，必须像 tail -f 那样以 ReadWrite 共享打开。</summary>
+    /// <summary>ClientLog holds the write handle, so it must be opened shared for
+    /// ReadWrite, the way <c>tail -f</c> does it.</summary>
     private static List<string> RetryLines(string path, string topic)
     {
         ClientLog.FlushLogFile();
@@ -263,7 +268,8 @@ public class ProducerAsyncTests : IDisposable
         return lines;
     }
 
-    /// <summary>数日志里含某个片段的行数（ClientLog 握着写句柄，按 ReadWrite 共享打开）。</summary>
+    /// <summary>Counts the log lines containing a given fragment (ClientLog holds the
+    /// write handle, so it is opened shared for ReadWrite).</summary>
     private static int CountLines(string path, string needle)
     {
         ClientLog.FlushLogFile();
@@ -281,7 +287,8 @@ public class ProducerAsyncTests : IDisposable
         return n;
     }
 
-    /// <summary>从重试日志行里抠出 brokerName=（判「换没换 broker」）。</summary>
+    /// <summary>Extracts brokerName= from a retry log line (decides "did it switch
+    /// broker").</summary>
     private static string FieldOf(string line, string marker)
     {
         int from = line.IndexOf(marker, StringComparison.Ordinal);
@@ -295,11 +302,12 @@ public class ProducerAsyncTests : IDisposable
         return end < 0 ? line[start..] : line[start..end];
     }
 
-    // ---------------------------------------------------------------- 调用方不被阻塞
+    // ---------------------------------------------------------------- The caller is not blocked
 
     /// <summary>
-    /// 异步发送的**第一不变式**：调用方立刻返回，准备段跑在 AsyncSenderExecutor_N 上，
-    /// 用户回调跑在 NettyClientPublicExecutor_N 上，且**恰好一次**。
+    /// The **first invariant of async send**: the caller returns immediately, the
+    /// prologue runs on AsyncSenderExecutor_N, the user callback runs on
+    /// NettyClientPublicExecutor_N, and it fires **exactly once**.
     /// </summary>
     [Fact]
     public void SendAsync_ReturnsBeforeTheRequestIsIssued()
@@ -315,14 +323,14 @@ public class ProducerAsyncTests : IDisposable
         var watch = Stopwatch.StartNew();
         producer.SendAsync(Msg(), cb, 5000);
         watch.Stop();
-        // 钩子还要睡 600ms：调用方若被拖住，这里就不会远小于它
+        // The hook also sleeps 600ms: if the caller were held up, this would not be far smaller than it
         Assert.True(watch.ElapsedMilliseconds < 500,
-            "调用方必须立刻返回，elapsed=" + watch.ElapsedMilliseconds);
+            "the caller must return immediately, elapsed=" + watch.ElapsedMilliseconds);
         Assert.Equal(0, cb.Count);
         Assert.Equal(0, cluster.Requests(0));
-        Assert.True(WaitUntil(() => hooks.Before() >= 1, 3000), "准备段要跑起来");
+        Assert.True(WaitUntil(() => hooks.Before() >= 1, 3000), "the prologue must run");
         Assert.True(hooks.BeforeThreadName().StartsWith("AsyncSenderExecutor_", StringComparison.Ordinal),
-            "准备段要在自己的池里跑，实际线程名=" + hooks.BeforeThreadName());
+            "the prologue must run in its own pool, actual thread name=" + hooks.BeforeThreadName());
         Assert.True(cb.WaitDone(1, 5000));
         Assert.Equal(1, cb.Count);
         Assert.Empty(cb.Errors());
@@ -330,12 +338,13 @@ public class ProducerAsyncTests : IDisposable
         (int threadId, string threadName) = cb.LastThread();
         Assert.NotEqual(callerThread, threadId);
         Assert.True(threadName.StartsWith("NettyClientPublicExecutor_", StringComparison.Ordinal),
-            "用户回调不能在发送池或读线程上跑，实际=" + threadName);
+            "the user callback must not run on the send pool or the reader thread, actual=" + threadName);
         Assert.Equal(1, cluster.Requests(0));
         producer.Shutdown();
     }
 
-    /// <summary>每笔异步发送只跑**一次** before/after，且 after 看得到 SendResult。</summary>
+    /// <summary>Each async send runs before/after **once** only, and after sees the
+    /// SendResult.</summary>
     [Fact]
     public void AsyncSuccess_RunsEachHookOnce_AndSeesTheResult()
     {
@@ -350,18 +359,19 @@ public class ProducerAsyncTests : IDisposable
         Assert.True(cb.WaitDone(1, 3000));
         Assert.Single(cb.Results());
         SendResult result = cb.Results()[0]!;
-        // MsgId 取客户端自己补的 UNIQ_KEY（32 位十六进制），OffsetMsgId 才是 broker 回的那份
+        // MsgId is the UNIQ_KEY the client filled in itself (32 hex digits); OffsetMsgId is the one the broker returned
         Assert.Equal(32, result.MsgId.Length);
         Assert.NotEqual(result.MsgId, result.OffsetMsgId);
         Assert.Equal("MOCK-0-1", result.OffsetMsgId);
         Assert.Equal(1, hooks.Before());
         Assert.Equal(1, hooks.After());
-        Assert.True(hooks.SawResult(), "after 钩子要看到 sendResult");
+        Assert.True(hooks.SawResult(), "the after hook must see the sendResult");
         Assert.False(hooks.SawException());
         producer.Shutdown();
     }
 
-    /// <summary>timeout=0：排队还没结束预算就没了 —— 一笔都不许上线。</summary>
+    /// <summary>timeout=0: the budget is gone before queueing even finishes -- not one
+    /// message may go on the wire.</summary>
     [Fact]
     public void ZeroTimeout_FailsWithoutSendingAnything()
     {
@@ -415,7 +425,7 @@ public class ProducerAsyncTests : IDisposable
 
         var cb = new Recorder();
         producer.SendAsync(Msg(), cb, 3000);
-        Assert.True(cb.WaitDone(1, 3000), "池子还活着才能收到第二笔的回调");
+        Assert.True(cb.WaitDone(1, 3000), "the pool must still be alive to receive the second callback");
         Assert.Single(cb.Results());
         producer.Shutdown();
     }
@@ -437,11 +447,12 @@ public class ProducerAsyncTests : IDisposable
         }
     }
 
-    // ---------------------------------------------------------------- 重试链
+    // ---------------------------------------------------------------- Retry chain
 
     /// <summary>
-    /// **异步发送不看 RetryResponseCodes**：broker 明确回了错就原样交给回调，一次尝试结束
-    /// （同一个码在同步路径里会重试满 3 次，见 SendRetryTests）。
+    /// **Async send does not consult RetryResponseCodes**: an explicit broker error is
+    /// handed to the callback as is and the attempt ends there (the same code would be
+    /// retried three times on the synchronous path, see SendRetryTests).
     /// </summary>
     [Fact]
     public void BrokerRejectedCode_EndsTheChainAfterOneAttempt()
@@ -452,7 +463,7 @@ public class ProducerAsyncTests : IDisposable
         DefaultMQProducer producer = Started(cluster, "GID_async_broker_code");
         producer.SendLatencyFaultEnable = true;
         Assert.True(producer.IsRetryResponseCode(ResponseCode.SystemError),
-            "这个码在同步路径里是可重试的");
+            "this code is retryable on the synchronous path");
 
         var cb = new Recorder();
         producer.SendAsync(Msg(), cb, 3000);
@@ -460,11 +471,11 @@ public class ProducerAsyncTests : IDisposable
         Assert.Single(cb.Errors());
         Assert.Contains("CODE:", cb.Errors()[0]);
         Assert.Equal(1, cluster.Requests(0));
-        Assert.True(cluster.Requests(1) == 0, "异步链不换 broker（needRetry=false 的语义）");
+        Assert.True(cluster.Requests(1) == 0, "the async chain does not switch broker (the needRetry=false semantics)");
         FaultItem? item = producer.MqFaultStrategy.LatencyFaultTolerance
             .GetFaultItem(MockCluster.BrokerName(0));
         Assert.NotNull(item);
-        Assert.False(item!.IsAvailable(), "回了错误的 broker 要被隔离");
+        Assert.False(item!.IsAvailable(), "the broker that returned an error must be isolated");
         Assert.True(item.IsReachable());
         producer.Shutdown();
     }
@@ -486,8 +497,8 @@ public class ProducerAsyncTests : IDisposable
         Assert.Single(cb.Errors());
         Assert.Contains("wait response timeout, cost=", cb.Errors()[0]);
         Assert.Equal(1, cluster.Requests(0));
-        Assert.True(cluster.Requests(1) == 0, "预算没了就不该有第二次尝试");
-        Assert.True(elapsed >= 700, "等满了一次请求超时，elapsed=" + elapsed);
+        Assert.True(cluster.Requests(1) == 0, "with the budget gone there must be no second attempt");
+        Assert.True(elapsed >= 700, "a full request timeout was waited out, elapsed=" + elapsed);
         producer.Shutdown();
     }
 
@@ -502,18 +513,21 @@ public class ProducerAsyncTests : IDisposable
 
         var watch = Stopwatch.StartNew();
         var cb = new Recorder();
-        // 本机回环对"刚关闭端口"的拒绝可能被压到 ~2s（加上 1s 粒度的连接轮询即 ~3s/次）：
-        // 默认 8s 预算撑不满 3 次重试，会被判 callTimeout。放宽让重试链自然跑完。
+        // A local loopback rejection of a "just closed port" can be stretched to ~2s (plus
+        // the 1s-granularity connection poll, i.e. ~3s each time): the default 8s budget
+        // cannot cover 3 retries and would be judged callTimeout. Relax it so the retry chain
+        // can run to completion naturally.
         producer.SendAsync(new Message(topic, new byte[10]), cb, 30000);
         Assert.True(cb.WaitDone(1, 40000));
         long elapsed = watch.ElapsedMilliseconds;
         Assert.Single(cb.Errors());
-        // 外层 catch 的口径：建连失败**原样**抛出，不包装成 "unknown reason"
+        // The outer catch's rule: a connect failure is thrown **as is**, not wrapped as "unknown reason"
         Assert.Contains("connect failed to", cb.Errors()[0]);
         Assert.DoesNotContain("last error", cb.Errors()[0]);
-        // 三次建连失败后链路自然收尾（上面的 connect failed to 已排除 callTimeout 截断）：
-        // 在拒绝是毫秒级的机器上 elapsed 是毫秒级，在 ~2s 拒绝的机器上约 9s
-        Assert.True(elapsed < 30000, "建连级失败不该吃掉预算，elapsed=" + elapsed);
+        // After three connect failures the chain wraps up naturally (the connect failed to
+        // above already rules out a callTimeout cut short): elapsed is milliseconds on a
+        // machine where the rejection is immediate, around 9s on one where it takes ~2s
+        Assert.True(elapsed < 30000, "a connect-level failure must not eat the budget, elapsed=" + elapsed);
 
         List<string> lines = RetryLines(log, topic);
         Assert.Equal(2, lines.Count);
@@ -526,7 +540,8 @@ public class ProducerAsyncTests : IDisposable
         producer.Shutdown();
     }
 
-    /// <summary>换到的那台是真 broker：链路恢复，回调拿到 SEND_OK，只重试了一次。</summary>
+    /// <summary>The one it switched to is a real broker: the chain recovers, the callback
+    /// gets SEND_OK, and only one retry happened.</summary>
     [Fact]
     public void ConnectFailure_RecoversOnAnotherBroker()
     {
@@ -543,17 +558,17 @@ public class ProducerAsyncTests : IDisposable
         Assert.True(cb.WaitDone(1, 5000));
         Assert.Single(cb.Results());
         Assert.Equal(SendStatus.SendOk, cb.Results()[0]!.SendStatus);
-        Assert.True(cluster.Requests(1) == 1, "只有活着的那台收到了消息");
+        Assert.True(cluster.Requests(1) == 1, "only the one that is alive received the message");
         Assert.Single(RetryLines(log, topic));
         FaultItem? dead = producer.MqFaultStrategy.LatencyFaultTolerance
             .GetFaultItem(MockCluster.BrokerName(0));
         Assert.NotNull(dead);
         Assert.False(dead!.IsAvailable());
-        Assert.False(dead.IsReachable(), "建连失败既隔离也不可达");
+        Assert.False(dead.IsReachable(), "a connect failure both isolates and is unreachable");
         producer.Shutdown();
     }
 
-    /// <summary>RetryTimesWhenSendAsyncFailed=0 ⇒ 一笔都不重试。</summary>
+    /// <summary>RetryTimesWhenSendAsyncFailed=0 => not a single retry.</summary>
     [Fact]
     public void RetryCapZeroMeansOneAttempt()
     {
@@ -584,11 +599,11 @@ public class ProducerAsyncTests : IDisposable
 
         var pinned = new MessageQueue(topic, MockCluster.BrokerName(0), 0);
         var cb = new Recorder();
-        // 同 ConnectFailure_RetriesOntoAnotherBroker：~2s 的建连拒绝需要 30s 预算
+        // Same as ConnectFailure_RetriesOntoAnotherBroker: a ~2s connect rejection needs a 30s budget
         producer.SendAsync(new Message(topic, new byte[10]), cb, 30000, pinned);
         Assert.True(cb.WaitDone(1, 40000));
         Assert.Single(cb.Errors());
-        Assert.True(cluster.Requests(1) == 0, "定点发送不许挪到另一台 broker");
+        Assert.True(cluster.Requests(1) == 0, "a pinned send must not move to another broker");
         List<string> lines = RetryLines(log, topic);
         Assert.Equal(2, lines.Count);
         Assert.All(lines, line => Assert.Equal(pinned.BrokerName, FieldOf(line, "brokerName=")));
@@ -609,12 +624,13 @@ public class ProducerAsyncTests : IDisposable
         Assert.True(cb.WaitDone(1, 3000), string.Join(" / ", cb.Errors()));
         Assert.Single(cb.Results());
         Assert.True(cluster.CountRequests(RequestCode.GetRouteinfoByTopic) > 0,
-            "定点发送要自己刷一次路由才解析得出地址");
+            "a pinned send has to refresh the route once itself before it can resolve the address");
         Assert.Equal(1, cluster.Requests(0));
         producer.Shutdown();
     }
 
-    /// <summary>地址表里查不到的 broker：就地报「The broker[x] not exist」，回调不绕道回调池。</summary>
+    /// <summary>A broker that is not in the address table: reports "The broker[x] not
+    /// exist" right here, and the callback is not routed via the callback pool.</summary>
     [Fact]
     public void UnresolvableBroker_ReportsNotExistThroughTheCallback()
     {
@@ -629,14 +645,17 @@ public class ProducerAsyncTests : IDisposable
         Assert.Single(cb.Errors());
         Assert.Contains("The broker[no-such-broker] not exist", cb.Errors()[0]);
         Assert.Equal(0, cluster.Requests(0));
-        // 请求还没建就失败了 ⇒ 没进传输层 ⇒ 不绕道回调池，在准备段那根线程上就地转交
+        // It failed before the request was even built => it never entered the transport layer
+        // => it is not routed via the callback pool but handed over in place on the
+        // prologue's own thread
         (int threadId, string threadName) = cb.LastThread();
         Assert.NotEqual(callerThread, threadId);
         Assert.StartsWith("AsyncSenderExecutor_", threadName);
         producer.Shutdown();
     }
 
-    /// <summary>路由完全取不到：定性成「找不到 topic」并交给回调，一笔都不发。</summary>
+    /// <summary>The route cannot be obtained at all: classified as "topic not found" and
+    /// handed to the callback, with nothing sent.</summary>
     [Fact]
     public void MissingRoute_ReportsNotFoundTopicThroughTheCallback()
     {
@@ -668,7 +687,8 @@ public class ProducerAsyncTests : IDisposable
         producer.Shutdown();
     }
 
-    /// <summary>并发的一批异步发送彼此不串台：每笔一个终态回调，且上线的 opaque 互不相同。</summary>
+    /// <summary>A concurrent batch of async sends does not cross wires: one terminal
+    /// callback each, and the opaques that go on the wire are all different.</summary>
     [Fact]
     public void ConcurrentAsyncSends_NeverCrossTalk()
     {
@@ -683,7 +703,7 @@ public class ProducerAsyncTests : IDisposable
             producer.SendAsync(Msg(), cb, 5000);
         }
 
-        Assert.True(cb.WaitDone(sends, 10000), "每笔都要拿到恰好一次终态");
+        Assert.True(cb.WaitDone(sends, 10000), "every send must get exactly one terminal callback");
         Assert.True(WaitUntil(() => cluster.Requests(0) >= sends, 3000));
         Assert.Equal(sends, cb.Count);
         Assert.Equal(sends, cluster.Requests(0));
@@ -692,15 +712,16 @@ public class ProducerAsyncTests : IDisposable
         {
             int opaque = cluster.SendOpaque(0, i);
             Assert.NotEqual(int.MinValue, opaque);
-            Assert.True(opaques.Add(opaque), "在途请求的 opaque 必须互不相同");
+            Assert.True(opaques.Add(opaque), "the opaques of in-flight requests must all differ");
         }
 
         producer.Shutdown();
     }
 
-    // ---------------------------------------------------------------- 准备段的闸门与钩子
+    // ---------------------------------------------------------------- Prologue gates and hooks
 
-    /// <summary>拦截钩子拒绝：异常原样到回调，且**一次请求都不上线**；钩子看到的是 ASYNC。</summary>
+    /// <summary>An interceptor hook rejects: the exception reaches the callback as is
+    /// and **not one request goes on the wire**; the hook sees ASYNC.</summary>
     [Fact]
     public void CheckForbiddenRejection_ReachesTheCallback_AndRunsInAsyncMode()
     {
@@ -720,7 +741,7 @@ public class ProducerAsyncTests : IDisposable
         Assert.Equal(1, forbidden.Calls());
         Assert.Equal(CommunicationMode.Async, forbidden.Mode());
 
-        // 同一个生产者换个标签照常发出去（拒绝不是把池子弄坏了）
+        // The same producer still sends another tag normally (a rejection does not break the pool)
         producer.SendAsync(Msg(), cb, 3000);
         Assert.True(cb.WaitDone(2, 3000));
         Assert.Equal(1, cluster.Requests(0));
@@ -742,14 +763,16 @@ public class ProducerAsyncTests : IDisposable
         Assert.True(cb.WaitDone(1, 3000));
         Assert.Single(cb.Errors());
         Assert.Contains("sendKernelImpl call timeout", cb.Errors()[0]);
-        Assert.True(cluster.Requests(0) == 0, "预算没了就不该建请求");
+        Assert.True(cluster.Requests(0) == 0, "with the budget gone no request must be built");
         Assert.Equal(1, hooks.Before());
-        Assert.True(hooks.After() == 1, "RemotingTooMuchRequest 也跑 after 钩子");
+        Assert.True(hooks.After() == 1, "RemotingTooMuchRequest runs the after hook too");
         Assert.True(hooks.SawException());
         producer.Shutdown();
     }
 
-    /// <summary>批量没有异步内核（本端口只有同步批量内核）：在池线程里发一批，回调照样转交。</summary>
+    /// <summary>Batch has no async kernel (this port only has the synchronous batch
+    /// kernel): a batch is sent on a pool thread and the callback is still handed
+    /// over.</summary>
     [Fact]
     public void BatchAsync_FallsBackToTheSyncBatchKernel()
     {
@@ -770,7 +793,7 @@ public class ProducerAsyncTests : IDisposable
         producer.Shutdown();
     }
 
-    // ---------------------------------------------------------------- 背压闸门
+    // ---------------------------------------------------------------- Backpressure gates
 
     [Fact]
     public void BackpressureDefaultsMatchLegacy()
@@ -826,17 +849,18 @@ public class ProducerAsyncTests : IDisposable
         Assert.True(rejected.WaitDone(1, 5000));
         Assert.Single(rejected.Errors());
         Assert.Contains("send message tryAcquire semaphoreAsyncNum timeout", rejected.Errors()[0]);
-        // 扣不到许可就连池子都没进 ⇒ 回调就地转交
+        // With no permit obtainable it never even entered the pool => the callback is handed over in place
         Assert.Equal(callerThread, rejected.LastThread().ThreadId);
         Assert.True(WaitUntil(() => cluster.Requests(0) == 10, 3000),
-            "前 10 笔都要上线，被拒的第 11 笔一笔都不许发");
-        Assert.True(held.WaitDone(10, 8000), "前 10 笔要在自己的超时里收尾");
+            "the first 10 must go on the wire, the rejected 11th must not send anything");
+        Assert.True(held.WaitDone(10, 8000), "the first 10 must finish within their own timeouts");
         Assert.True(WaitUntil(
-            () => producer.SemaphoreAsyncSendNumAvailablePermits == 10, 5000), "许可必须还得回来");
+            () => producer.SemaphoreAsyncSendNumAvailablePermits == 10, 5000), "the permits must come back");
         producer.Shutdown();
     }
 
-    /// <summary>字节闸打满：报自己的文案，并且**把已经拿到的条数许可还回去**。</summary>
+    /// <summary>The byte gate is saturated: reports its own message and **returns the
+    /// count permit it already took</summary>.
     [Fact]
     public void SizeGate_RejectsAndGivesTheNumPermitBack()
     {
@@ -858,7 +882,8 @@ public class ProducerAsyncTests : IDisposable
         Assert.True(rejected.WaitDone(1, 5000));
         Assert.Single(rejected.Errors());
         Assert.Contains("send message tryAcquire semaphoreAsyncSize timeout", rejected.Errors()[0]);
-        // 条数许可是这笔自己拿的，失败必须还回去 —— 只剩第一笔占着的那一格
+        // The count permit was taken by this send itself, so a failure must return it --
+        // only the single slot held by the first send remains
         Assert.Equal(9, producer.SemaphoreAsyncSendNumAvailablePermits);
         Assert.Equal(1024 * 1024 - big, producer.SemaphoreAsyncSendSizeAvailablePermits);
 
@@ -869,7 +894,8 @@ public class ProducerAsyncTests : IDisposable
         producer.Shutdown();
     }
 
-    /// <summary>成功与失败都要归还许可：链路上每条终点都只归还一次。</summary>
+    /// <summary>Both success and failure must return the permits: every terminus on the
+    /// chain returns them exactly once.</summary>
     [Fact]
     public void Permits_AreGivenBackOnBothOutcomes()
     {
@@ -900,11 +926,11 @@ public class ProducerAsyncTests : IDisposable
         Assert.True(WaitUntil(
             () => producer.SemaphoreAsyncSendNumAvailablePermits == 10
                   && producer.SemaphoreAsyncSendSizeAvailablePermits == 1024 * 1024, 5000),
-            "两笔终点都得把许可还得干净");
+            "both sends must return the permits cleanly");
         producer.Shutdown();
     }
 
-    // ---------------------------------------------------------------- 有界发送队列
+    // ---------------------------------------------------------------- Bounded send queue
 
     [Fact]
     public void QueueFull_RejectsTheCallerWithoutSending()
@@ -912,7 +938,8 @@ public class ProducerAsyncTests : IDisposable
         using var cluster = MockCluster.Start(1);
         cluster.Script(0, new List<(int, int)>(), (ResponseCode.Success, 0));
         var parked = new CountingSendHook(parkMillis: 1200);
-        // 1 根 worker + 1 格队列：第一笔占住 worker，第二笔排上队，第三笔就被退回
+        // 1 worker + a queue of 1: the first send occupies the worker, the second queues
+        // up and the third is rejected
         using var pool = new ConsumeExecutor(1, 1, 60.0, "AsyncSenderExecutor",
             maxQueueSize: 1, threadNameSep: "_", threadIndexFrom: 1);
         DefaultMQProducer producer = Started(cluster, "GID_async_queue_full", pool);
@@ -920,17 +947,19 @@ public class ProducerAsyncTests : IDisposable
 
         var cb = new Recorder();
         producer.SendAsync(Msg(), cb, 5000);
-        // 等第一笔真的被 worker 取走（钩子已开跑）再投后两笔，否则「队列已满」会提前
-        // 落在第二笔上，测的就不是同一格位置了。
-        Assert.True(WaitUntil(() => parked.Before() >= 1, 3000), "准备段要跑起来");
+        // Wait until the first send has really been taken by the worker (the hook has
+        // started) before submitting the other two, otherwise "the queue is full" would
+        // land on the second send early and the test would no longer be about the same
+        // queue position.
+        Assert.True(WaitUntil(() => parked.Before() >= 1, 3000), "the prologue must run");
         producer.SendAsync(Msg(), cb, 5000);
         MQClientException rejected = Assert.Throws<MQClientException>(
             () => producer.SendAsync(Msg(), cb, 5000));
         Assert.Contains("executor rejected", rejected.Message);
-        Assert.True(cb.Count == 0, "被拒的一笔不该有回调");
-        Assert.True(cluster.Requests(0) == 0, "被拒之前一次请求都不该发出去");
+        Assert.True(cb.Count == 0, "a rejected send must not get a callback");
+        Assert.True(cluster.Requests(0) == 0, "no request at all may go out before a rejection");
 
-        Assert.True(cb.WaitDone(2, 10000), "排队的两笔要在池子空出来之后跑完");
+        Assert.True(cb.WaitDone(2, 10000), "the two queued sends must finish once the pool frees up");
         Assert.Equal(2, cluster.Requests(0));
         producer.Shutdown();
     }
@@ -951,14 +980,14 @@ public class ProducerAsyncTests : IDisposable
 
         var cb = new Recorder();
         producer.SendAsync(Msg(), cb, 8000);
-        Assert.True(WaitUntil(() => parked.Before() >= 1, 3000), "准备段要跑起来");
+        Assert.True(WaitUntil(() => parked.Before() >= 1, 3000), "the prologue must run");
         producer.SendAsync(Msg(), cb, 8000);
         var watch = Stopwatch.StartNew();
         producer.SendAsync(Msg(), cb, 8000);
         watch.Stop();
-        // 就地跑：这一笔的耗时落在调用方线程上（等前面排队的跑完 + 自己发完）
+        // Runs in place: this send's elapsed time lands on the caller's thread (waiting for the queued ones plus its own send)
         Assert.True(watch.ElapsedMilliseconds >= 300,
-            "开了背压时队满要就地跑完，elapsed=" + watch.ElapsedMilliseconds);
+            "with backpressure on, a full queue must run in place, elapsed=" + watch.ElapsedMilliseconds);
         Assert.True(cb.WaitDone(3, 12000), string.Join(" / ", cb.Errors()));
         Assert.Equal(3, cb.Results().Count(r => r is not null));
         Assert.Equal(3, cluster.Requests(0));
@@ -980,31 +1009,32 @@ public class ProducerAsyncTests : IDisposable
         var first = new Recorder();
         var stale = new Recorder();
         producer.SendAsync(Msg(), first, 8000);
-        // 先确认真的只有一根 worker 被占住，再投后面三笔：否则某笔可能在第一笔之前
-        // 就被取走，它的 80ms 预算还够，测试意图就没了。
-        Assert.True(WaitUntil(() => parked.Before() >= 1, 3000), "准备段要跑起来");
+        // First confirm that really only one worker is occupied, then submit the next
+        // three: otherwise one of them might be taken before the first send, its 80ms
+        // budget would still suffice and the intent of the test would be lost.
+        Assert.True(WaitUntil(() => parked.Before() >= 1, 3000), "the prologue must run");
         for (int i = 0; i < 3; ++i)
         {
-            // 排在第一笔后面：等轮到自己时，80ms 的预算早就被排队花光了
+            // Queued behind the first send: by the time it is its turn the 80ms budget has long since been eaten by queueing
             producer.SendAsync(Msg(), stale, 80);
         }
 
         Assert.True(stale.WaitDone(3, 12000), string.Join(" / ", stale.Errors()));
         Assert.All(stale.Errors(), e => Assert.Contains("DEFAULT ASYNC send call timeout", e));
         Assert.True(first.WaitDone(1, 12000));
-        Assert.True(cluster.Requests(0) == 1, "预算没了的三笔不该上线");
+        Assert.True(cluster.Requests(0) == 1, "the three sends without budget must not go on the wire");
         producer.Shutdown();
     }
 
     [Fact]
     public void Shutdown_DrainsTheHandedOffSends()
     {
-        // 比池子的核数多一截：Shutdown 那一刻一定还有任务排在队列里
+        // Well over the pool's core count: at Shutdown there are certainly still tasks queued
         int sends = Math.Max(1, Environment.ProcessorCount) * 3;
         using var cluster = MockCluster.Start(1);
         cluster.Script(0, new List<(int, int)>(), (ResponseCode.Success, 0));
         var parked = new CountingSendHook(parkMillis: 80);
-        // 日志要在动作**之前**切到新文件，否则「池任务异常」那几行落在上一轮的日志里
+        // The log must be switched to the new file **before** the action, otherwise the "pool task raised" lines land in the previous round's log
         string drainLog = CaptureLog("drain");
         DefaultMQProducer producer = Started(cluster, "GID_async_shutdown_drain");
         producer.RegisterSendMessageHook(parked);
@@ -1016,29 +1046,32 @@ public class ProducerAsyncTests : IDisposable
         }
 
         producer.Shutdown();
-        // 排空的**定义**：队列里的准备段每一个都跑过（不是随池子一起丢掉）
+        // Definition of **drained**: every prologue in the queue has run (not discarded together with the pool)
         Assert.True(parked.Before() == sends,
-            "每个准备段都要跑到，实际=" + parked.Before() + " 发送=" + sends);
-        // 跑完准备段的一笔就把报文交给了传输层；关掉客户端时被打断的只是 broker 还没
-        // 读走的尾部（见方法注释），所以这里只要求「至少一半上线」
+            "every prologue must run, actual=" + parked.Before() + " sends=" + sends);
+        // A send whose prologue finished has already handed the request to the transport
+        // layer; what the client shutdown interrupts is only the tail the broker has not
+        // read yet (see the method comment), so "at least half on the wire" is all that
+        // is required here
         Assert.True(WaitUntil(() => cluster.Requests(0) * 2 >= sends, 5000),
-            "至少一半要上线，上线=" + cluster.Requests(0)
-            + " 发送=" + sends
-            + " 报错=" + each.Count(r => r.Errors().Count > 0)
-            + " 成功=" + each.Count(r => r.Results().Count > 0)
-            + " after钩子=" + parked.After()
-            + " 池任务异常=" + CountLines(drainLog, "consume executor task raised"));
+            "at least half must go on the wire, on wire=" + cluster.Requests(0)
+            + " sends=" + sends
+            + " errors=" + each.Count(r => r.Errors().Count > 0)
+            + " successes=" + each.Count(r => r.Results().Count > 0)
+            + " after hooks=" + parked.After()
+            + " pool task exceptions=" + CountLines(drainLog, "consume executor task raised"));
         Thread.Sleep(500);
         int terminal = 0;
         foreach (Recorder r in each)
         {
-            Assert.True(r.Count <= 1, "一笔发送最多一个终态回调，实际=" + r.Count);
+            Assert.True(r.Count <= 1, "a send gets at most one terminal callback, actual=" + r.Count);
             terminal += r.Count;
             Assert.All(r.Results(), s => Assert.Equal(SendStatus.SendOk, s!.SendStatus));
         }
 
-        // 至少有一笔在关客户端之前就走完了整条链（否则这个断言就只是在证「回调都没跑」）
-        Assert.True(terminal >= 1, "排空之后总该有几笔拿到了终态");
+        // At least one send completed the whole chain before the client was closed
+        // (otherwise this assertion would only be proving "no callback ran at all")
+        Assert.True(terminal >= 1, "after draining, some sends must have reached a terminal state");
     }
 
     [Fact]
@@ -1054,18 +1087,19 @@ public class ProducerAsyncTests : IDisposable
         Assert.True(cb.WaitDone(1, 5000));
         producer.Shutdown();
 
-        // 池没被生产者关掉：换个生产者接着用同一个池
+        // The pool was not closed by the producer: another producer keeps using the same pool
         DefaultMQProducer next = Started(cluster, "GID_async_custom_pool_next", pool);
         var again = new Recorder();
         next.SendAsync(Msg(), again, 5000);
         Assert.True(again.WaitDone(1, 5000), string.Join(" / ", again.Errors()));
         next.Shutdown();
-        Assert.True(WaitUntil(() => pool.WorkerCount() >= 1, 1000), "池子还归调用方");
+        Assert.True(WaitUntil(() => pool.WorkerCount() >= 1, 1000), "the pool still belongs to the caller");
     }
 
-    /// 后半段锁的是「每条子消息都要过 Validators.CheckMessage」：直接把 MessageBatch 丢给
-    /// SendAsync 会漏掉这步，等于批量路径绕过本地校验；而且这类失败必须<b>进回调</b>，
-    /// 不能砸回调用方的栈。
+    /// The second half locks down "every sub-message must pass
+    /// Validators.CheckMessage": handing the MessageBatch straight to SendAsync skips
+    /// that step, which means the batch path bypasses local validation; and such
+    /// failures must go <b>into the callback</b>, not back onto the caller's stack.
     /// </summary>
     [Fact]
     public void SendBatchAsync_SendsOneRequestPerBatch()
@@ -1085,20 +1119,20 @@ public class ProducerAsyncTests : IDisposable
         WireRecord? wire = cluster.FirstSendRequest();
         Assert.NotNull(wire);
         Assert.True(wire!.HasBody);
-        // 一批三条：编码后的 body 必须比单条大得多，否则就是只发了其中一条
+        // A batch of three: the encoded body must be far bigger than a single message, otherwise only one of them was sent
         Assert.True(wire.Body.Length > 3 * 10, "batch body carries all sub-messages: " + wire.Body.Length);
 
-        // 超长子消息：整批就地拒掉，一条都不上线，且失败进回调
+        // An oversized sub-message: the whole batch is rejected in place, nothing goes on the wire, and the failure goes to the callback
         var bad = new Recorder();
         producer.SendBatchAsync(new List<Message> { Msg(10), Msg(4096) }, bad, 5000);
-        Assert.True(bad.WaitDone(1, 5000), "校验失败也要有终态回调");
+        Assert.True(bad.WaitDone(1, 5000), "a validation failure must also get a terminal callback");
         Assert.Contains("over max value", string.Join(" / ", bad.Errors()));
         Assert.Equal(1, cluster.CountRequests(RequestCode.SendBatchMessage));
 
-        // 空列表：与同步内核同一句文案，同样进回调
+        // An empty list: the same message text as the synchronous kernel, likewise into the callback
         var empty = new Recorder();
         producer.SendBatchAsync(new List<Message>(), empty, 5000);
-        Assert.True(empty.WaitDone(1, 5000), "空批也要有终态回调");
+        Assert.True(empty.WaitDone(1, 5000), "an empty batch must also get a terminal callback");
         Assert.Contains("message list is empty", string.Join(" / ", empty.Errors()));
         Assert.Equal(1, cluster.CountRequests(RequestCode.SendBatchMessage));
         producer.Shutdown();
@@ -1112,25 +1146,25 @@ public class ProducerAsyncTests : IDisposable
         DefaultMQProducer producer = Started(cluster, "GID_pinned_guard_async");
         var pinned = new MessageQueue("T2", MockCluster.BrokerName(0), 0);
 
-        // ① 单条异步 topic 不符：异步文案，零请求
+        // (1) A single async send with a mismatched topic: the async message text, zero requests
         var cb = new Recorder();
         producer.SendAsync(Msg(), cb, 5000, pinned);
-        Assert.True(cb.WaitDone(1, 5000), "拒绝也要有终态回调");
+        Assert.True(cb.WaitDone(1, 5000), "a rejection must also get a terminal callback");
         Assert.Contains("Topic of the message does not match its target message queue",
             string.Join(" / ", cb.Errors()));
         Assert.Null(cluster.FirstSendRequest());
 
-        // ② 同 topic 照发（守卫不能宽到误伤）
+        // (2) The same topic still sends normally (the guard must not be so wide it hits valid sends)
         var ok = new Recorder();
         producer.SendAsync(Msg(), ok, 5000, new MessageQueue(Topic, MockCluster.BrokerName(0), 0));
         Assert.True(ok.WaitDone(1, 5000), string.Join(" / ", ok.Errors()));
         Assert.Equal(SendStatus.SendOk, ok.Results()[0]!.SendStatus);
         Assert.Equal(1, cluster.CountRequests(RequestCode.SendMessageV2));
 
-        // ③ 批量异步共用同一处守卫与同一句文案
+        // (3) Batch async shares the same guard and the same message text
         var batch = new Recorder();
         producer.SendBatchAsync(new List<Message> { Msg(), Msg() }, batch, 5000, pinned);
-        Assert.True(batch.WaitDone(1, 5000), "批量拒绝也要有终态回调");
+        Assert.True(batch.WaitDone(1, 5000), "a rejected batch must also get a terminal callback");
         Assert.Contains("Topic of the message does not match its target message queue",
             string.Join(" / ", batch.Errors()));
         Assert.Equal(1, cluster.CountRequests(RequestCode.SendMessageV2));
@@ -1185,7 +1219,7 @@ public class ProducerAsyncTests : IDisposable
             Assert.NotNull(wire);
             SendResult r = n == 0 ? sync : asyncResult;
 
-            // ① body 里每条子消息都带着互不相同的 32 位十六进制客户端 ID
+            // (1) Every sub-message in the body carries a distinct 32 hex digit client ID
             List<Message> subs = MessageDecoder.DecodeBatchMessages(wire!.Body);
             Assert.Equal(3, subs.Count);
             var seen = new HashSet<string>();
@@ -1193,12 +1227,12 @@ public class ProducerAsyncTests : IDisposable
             {
                 string id = MessageClientIDSetter.GetUniqId(m);
                 Assert.Equal(32, id.Length);
-                Assert.True(seen.Add(id), "每条子消息的 UNIQ_KEY 必须各不相同");
-                // 整批的 ID 不能和某条子消息撞，否则等于没把两者区分开
+                Assert.True(seen.Add(id), "the UNIQ_KEY of every sub-message must be distinct");
+                // The batch's own ID must not collide with a sub-message's, otherwise the two were not distinguished at all
                 Assert.NotEqual(r.MsgId, id);
             }
 
-            // ② MsgId = 批量自身的客户端 ID（就在报文属性里），OffsetMsgId 才是 broker 那份
+            // (2) MsgId = the client's own ID for the batch (it is in the request properties); OffsetMsgId is the broker's one
             Assert.Equal(32, r.MsgId.Length);
             Assert.DoesNotContain(",", r.MsgId);
             Assert.Contains(r.MsgId, wire.Ext["i"]);
@@ -1210,8 +1244,11 @@ public class ProducerAsyncTests : IDisposable
     }
 
     /// <summary>
-    /// 批量消息过字节闸时按<b>整批</b>扣（批量长度逐条累加、空 body 也算 1）。写成「一条」不会让任何一笔发送失败，只会让一批 100 条只占
-    /// 1 格容量 —— 字节闸对批量形同虚设，要等长跑把队列打爆才暴露。
+    /// When a batch passes the byte gate it is charged for the <b>whole batch</b> (the
+    /// batch length accumulates per message, an empty body counts as 1). Writing "one"
+    /// makes no send fail, it just lets a batch of 100 occupy a single slot of capacity --
+    /// the byte gate becomes useless for batches, and it only shows up once a long run
+    /// blows up the queue.
     /// </summary>
     [Fact]
     public void SendBatchAsync_ChargesWholeBatchToSizeGate()
@@ -1230,7 +1267,7 @@ public class ProducerAsyncTests : IDisposable
         long whole = 2L * each;
         Assert.True(WaitUntil(
             () => producer.SemaphoreAsyncSendSizeAvailablePermits == 1024 * 1024 - whole, 2000),
-            "字节闸要按整批扣，空闲=" + producer.SemaphoreAsyncSendSizeAvailablePermits);
+            "the byte gate must charge the whole batch, free=" + producer.SemaphoreAsyncSendSizeAvailablePermits);
         Assert.Equal(9, producer.SemaphoreAsyncSendNumAvailablePermits);
 
         var rejected = new Recorder();
@@ -1240,7 +1277,7 @@ public class ProducerAsyncTests : IDisposable
         Assert.Equal(9, producer.SemaphoreAsyncSendNumAvailablePermits);
         Assert.Equal(1024 * 1024 - whole, producer.SemaphoreAsyncSendSizeAvailablePermits);
 
-        Assert.True(held.WaitDone(1, 8000), "第一笔照样要有终态");
+        Assert.True(held.WaitDone(1, 8000), "the first send must still get a terminal state");
         Assert.Equal(1, cluster.CountRequests(RequestCode.SendBatchMessage));
         Assert.True(WaitUntil(
             () => producer.SemaphoreAsyncSendSizeAvailablePermits == 1024 * 1024, 5000));
@@ -1248,7 +1285,8 @@ public class ProducerAsyncTests : IDisposable
         producer.Shutdown();
     }
 
-    /// <summary>未启动时批量异步与单条异步同一口径：就地抛，一个回调都不交付。</summary>
+    /// <summary>When not started, batch async follows the same rule as single async:
+    /// throws in place and not a single callback is delivered.</summary>
     [Fact]
     public void SendBatchAsync_BeforeStartThrowsSynchronously()
     {

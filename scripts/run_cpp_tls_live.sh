@@ -1,11 +1,11 @@
 #!/bin/bash
-# C++ 端 TLS 严格校验真机验证（对标 run_php_live.sh tls / run_node_live.sh tls）：
-# 自管证书（CA/server/client）+ 自起 TLS 集群，跑三腿：
-#   leg1 plain_tls  setTlsEnable(true)，信任自签（test-mode）
-#   leg2 ca_verify  TlsOptions.caCert —— 严格校验证书链 + 主机名 SAN
-#   leg3 mtls       重启 broker（-Dtls.server.authClient=true）+ 客户端证书双向认证
+# C++ client TLS strict-verification live test (counterpart of run_php_live.sh tls / run_node_live.sh tls):
+# self-managed certificates (CA/server/client) + self-started TLS cluster, running three legs:
+#   leg1 plain_tls  setTlsEnable(true), trusting self-signed (test-mode)
+#   leg2 ca_verify  TlsOptions.caCert —— strict certificate chain + hostname SAN verification
+#   leg3 mtls       restart broker (-Dtls.server.authClient=true) + client-certificate mutual authentication
 #
-# 用法: bash scripts/run_cpp_tls_live.sh [namesrv]
+# Usage: bash scripts/run_cpp_tls_live.sh [namesrv]
 set -u
 
 NS=${1:-${ROCKETMQ_NAMESRV:-127.0.0.1:9876}}
@@ -32,7 +32,7 @@ PYEOF
 STARTED=0
 cleanup() {
     if [ "$STARTED" = "1" ]; then
-        echo "--- 收工：停掉本脚本起的集群（jps 找 pid） ---"
+        echo "--- Done: stopping the cluster started by this script (finding pids via jps) ---"
         local pids
         pids=$(jps -l 2>/dev/null | awk '/NamesrvStartup|BrokerStartup/ {print $1}')
         if [ -n "$pids" ]; then
@@ -48,19 +48,19 @@ cleanup() {
 trap cleanup EXIT
 
 if port_open "$NS_PORT" || port_open "$BROKER_PORT"; then
-    echo "=== tls 分支需要独占集群，但 ${NS_PORT}/${BROKER_PORT} 已有集群在跑。请先停掉它。 ===" >&2
+    echo "=== the tls run needs an exclusive cluster, but a cluster is already running on ${NS_PORT}/${BROKER_PORT}. Stop it first. ===" >&2
     exit 2
 fi
-[ -d "$DIST" ] || { echo "找不到 RocketMQ 分发目录: ${DIST}（用 ROCKETMQ_DIST 覆盖）" >&2; exit 2; }
-command -v openssl >/dev/null 2>&1 || { echo "openssl 不可用" >&2; exit 2; }
+[ -d "$DIST" ] || { echo "RocketMQ distribution directory not found: ${DIST} (override with ROCKETMQ_DIST)" >&2; exit 2; }
+command -v openssl >/dev/null 2>&1 || { echo "openssl is not available" >&2; exit 2; }
 
-echo "=== 构建 C++ examples（rmq_live_tls） ==="
+echo "=== building C++ examples (rmq_live_tls) ==="
 cmake --build "$CPP_DIR/build" --target rmq_live_tls -j8 >/dev/null 2>&1 \
-    || { echo "cmake build 失败" >&2; exit 2; }
-[ -x "$PROG" ] || { echo "找不到构建产物: ${PROG}" >&2; exit 2; }
+    || { echo "cmake build failed" >&2; exit 2; }
+[ -x "$PROG" ] || { echo "build output not found: ${PROG}" >&2; exit 2; }
 
 mkdir -p "$WORK/store"
-echo "=== 生成测试证书（CA / server(SAN: IP:127.0.0.1,DNS:localhost) / client） ==="
+echo "=== generating test certificates (CA / server(SAN: IP:127.0.0.1,DNS:localhost) / client) ==="
 (cd "$WORK" \
     && openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 2 -subj "/CN=rmq-cpp-test-ca" >/dev/null 2>&1 \
     && openssl req -newkey rsa:2048 -nodes -keyout server.key -out server.csr -subj "/CN=127.0.0.1" >/dev/null 2>&1 \
@@ -68,7 +68,7 @@ echo "=== 生成测试证书（CA / server(SAN: IP:127.0.0.1,DNS:localhost) / cl
     && openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 2 -extfile server.ext >/dev/null 2>&1 \
     && openssl req -newkey rsa:2048 -nodes -keyout client.key -out client.csr -subj "/CN=rmq-cpp-test-client" >/dev/null 2>&1 \
     && openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out client.crt -days 2 >/dev/null 2>&1) \
-    || { echo "证书生成失败" >&2; exit 2; }
+    || { echo "certificate generation failed" >&2; exit 2; }
 srv_hdr=$(head -1 "$WORK/server.key")
 case "$srv_hdr" in
     *"BEGIN PRIVATE KEY"*) : ;;
@@ -90,7 +90,7 @@ autoCreateTopicEnable = true
 EOF
 export ROCKETMQ_HOME="$DIST"
 export JAVA_OPT_EXT="-Xms1g -Xmx2g -Xmn768m -Dtls.enable=true -Dtls.test.mode.enable=false -Dtls.server.certPath=$WORK/server.crt -Dtls.server.keyPath=$WORK/server.key"
-echo "=== 起集群（namesrv+broker 双 permissive TLS） ==="
+echo "=== starting cluster (namesrv+broker both permissive TLS) ==="
 nohup "$DIST/bin/mqnamesrv" > "$WORK/ns.log" 2>&1 &
 nohup "$DIST/bin/mqbroker" -c "$WORK/broker.conf" > "$WORK/broker.log" 2>&1 &
 STARTED=1
@@ -98,36 +98,38 @@ for i in $(seq 1 60); do
     if port_open "$NS_PORT" && port_open "$BROKER_PORT"; then sleep 2; break; fi
     sleep 1
     if [ "$i" = "60" ]; then
-        echo "=== TLS 集群 60s 未就绪（见 $WORK/ns.log / $WORK/broker.log） ===" >&2
+        echo "=== TLS cluster not ready within 60s (see $WORK/ns.log / $WORK/broker.log) ===" >&2
         exit 2
     fi
 done
 
-# 端口通了 ≠ TBW102 已注册：路由没进 nameserver 之前 createTopic 会死于
-# "No route info of default topic TBW102"，消费者先起时还会错过整个消费窗口。
-# 等一个真正的 route 查询成功（node 版 run_node_live.sh 的 route-wait 同款）。
+# Port open ≠ TBW102 registered: before the route reaches the nameserver, createTopic dies
+# with "No route info of default topic TBW102", and a consumer started early would also miss
+# the whole consumption window. Wait for a real route query to succeed (same route-wait as the
+# node version in run_node_live.sh).
 wait_tbw102() {
     for i in $(seq 1 30); do
         if "$DIST/bin/mqadmin" topicRoute -n "$NS" -t TBW102 2>/dev/null | /usr/bin/grep -qF 'broker-a'; then
-            echo "=== TBW102 路由已注册 ==="
+            echo "=== TBW102 route registered ==="
             return 0
         fi
         sleep 2
     done
-    echo "=== TBW102 30 轮未注册进 nameserver ===" >&2
+    echo "=== TBW102 not registered into nameserver after 30 rounds ===" >&2
     return 1
 }
 
 RC=0
 wait_tbw102 || exit 2
-echo "=== [leg 1/3] plain_tls（test-mode：信任自签） ==="
+echo "=== [leg 1/3] plain_tls (test-mode: trust self-signed) ==="
 "$PROG" "$NS" "CppTls_plain_$STAMP" "GID_CppTls_plain_$STAMP" plain_tls || RC=1
-echo "=== [leg 2/3] ca_verify（真校验证书链 + 主机名 SAN） ==="
+echo "=== [leg 2/3] ca_verify (verify certificate chain + hostname SAN) ==="
 "$PROG" "$NS" "CppTls_ca_$STAMP" "GID_CppTls_ca_$STAMP" ca_verify "$WORK/ca.crt" 127.0.0.1 || RC=1
 
-echo "=== 重启 broker（追加 -Dtls.server.authClient=true → mTLS） ==="
-# 端口关了 ≠ 进程退了 ≠ store 文件锁释放了。等 jps 里 BrokerStartup 彻底消失
-# 再多给 3s；拉起失败（Lock failed）时整段重试，最多 3 次。
+echo "=== restarting broker (adding -Dtls.server.authClient=true → mTLS) ==="
+# Port closed ≠ process exited ≠ store file lock released. Wait until BrokerStartup is fully
+# gone from jps, then allow 3s more; if startup fails (Lock failed), retry the whole block up
+# to 3 times.
 for attempt in 1 2 3; do
     pids=$(jps -l 2>/dev/null | awk '/BrokerStartup/ {print $1}')
     # shellcheck disable=SC2086
@@ -147,8 +149,9 @@ for attempt in 1 2 3; do
     ok=0
     dead=0
     for i in $(seq 1 60); do
-        # jps 看不到 ≠ 进程死了：JVM 启动后 hsperfdata 要几秒才出现，
-        # 必须连续 3 秒看不到才判死（否则会把刚拉起的 broker 误杀）。
+        # Not visible in jps ≠ process dead: hsperfdata takes a few seconds to appear after JVM
+        # startup, so it must be invisible for 3 consecutive seconds before declaring death
+        # (otherwise a just-started broker could be misjudged and killed).
         if jps -l 2>/dev/null | /usr/bin/grep -qF 'BrokerStartup'; then
             dead=0
         else
@@ -159,16 +162,16 @@ for attempt in 1 2 3; do
         sleep 1
     done
     if [ "$ok" = "1" ]; then
-        echo "=== mTLS broker 已就绪（第 ${attempt} 次尝试） ==="
+        echo "=== mTLS broker ready (attempt ${attempt}) ==="
         break
     fi
     if [ "$attempt" = "3" ]; then
-        echo "=== mTLS broker 3 次尝试均未就绪（见 $WORK/broker2.log） ===" >&2
+        echo "=== mTLS broker not ready after 3 attempts (see $WORK/broker2.log) ===" >&2
         exit 2
     fi
-    echo "=== mTLS broker 第 ${attempt} 次尝试失败，重试 ==="
+    echo "=== mTLS broker attempt ${attempt} failed, retrying ==="
 done
-echo "=== [leg 3/3] mtls（客户端证书双向认证） ==="
+echo "=== [leg 3/3] mtls (client certificates, mutual authentication) ==="
 wait_tbw102 || exit 2
 "$PROG" "$NS" "CppTls_mtls_$STAMP" "GID_CppTls_mtls_$STAMP" mtls "$WORK/ca.crt" 127.0.0.1 "$WORK/client.crt" "$WORK/client.key" || RC=1
 echo "=== exit=$RC ==="

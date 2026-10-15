@@ -198,12 +198,12 @@ class TestMessageBatch:
     def test_batch_defaults_wait_store_msg_ok_to_true(self):
         pass
         messages = [Message(topic="T", body=b"a"), Message(topic="T", body=b"b")]
-        # 前提：Message.__init__ 不预写 WAIT 属性
+        # Precondition: Message.__init__ does not pre-write the WAIT property
         assert messages[0].get_wait_store_msg_ok() is None
         batch = MessageBatch.generate_from_list(messages)
         assert batch.get_wait_store_msg_ok() == "true"
 
-        # 显式 false 要原样传下去
+        # An explicit false must be passed through as-is
         for m in messages:
             m.set_wait_store_msg_ok(False)
         assert MessageBatch.generate_from_list(messages).get_wait_store_msg_ok() == "false"
@@ -211,15 +211,15 @@ class TestMessageBatch:
     def test_is_wait_store_msg_ok_follows_the_strict_boolean_parse_rule(self):
         pass
         msg = Message(topic="T", body=b"a")
-        assert is_wait_store_msg_ok(msg)                      # 缺省
+        assert is_wait_store_msg_ok(msg)                      # default
         msg.set_wait_store_msg_ok(True)
         assert is_wait_store_msg_ok(msg)
         msg.set_wait_store_msg_ok(False)
         assert not is_wait_store_msg_ok(msg)
-        # 大小写不敏感
+        # Case-insensitive
         msg.properties["WAIT"] = "TRUE"
         assert is_wait_store_msg_ok(msg)
-        # 其它值一律 false（不是"非 false 即真"）
+        # All other values are false (not "anything but false is true")
         for raw in ("1", "", "yes", "tru"):
             msg.properties["WAIT"] = raw
             assert not is_wait_store_msg_ok(msg), raw

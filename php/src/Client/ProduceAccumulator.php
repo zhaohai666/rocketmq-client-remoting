@@ -25,9 +25,9 @@ final class ProduceAccumulator
     private int $totalHoldSize = self::DEFAULT_TOTAL_HOLD_SIZE;
     private int $currentlyHoldSize = 0;
 
-    /** @var array<string,MessageAccumulation> 同步表，键为 AggregateKey::keyString() */
+    /** @var array<string,MessageAccumulation> sync table, keyed by AggregateKey::keyString() */
     private array $syncSendBatches = [];
-    /** @var array<string,MessageAccumulation> 异步表，键为 AggregateKey::keyString() */
+    /** @var array<string,MessageAccumulation> async table, keyed by AggregateKey::keyString() */
     private array $asyncSendBatches = [];
 
     /** @var (\Closure(MessageBatch, ?MessageQueue, ?InternalSendCallback): ?SendResult)|null */
@@ -53,9 +53,9 @@ final class ProduceAccumulator
         $this->guardAsync = new GuardForAsyncSend($this);
     }
 
-    // ================================================================ 生命周期
+    // ================================================================ Lifecycle
 
-    /** 幂等且可重复：`start → shutdown → start`（生产者重启）不会被线程"只能启动一次"卡住。 */
+    /** Idempotent and repeatable: `start -> shutdown -> start` (producer restart) is not blocked by a "can only start once" thread. */
     public function start(): void
     {
         $this->guardSync->start();
@@ -141,13 +141,13 @@ final class ProduceAccumulator
         return $this->currentlyHoldSize;
     }
 
-    /** 注入时钟的当前值（毫秒）。 */
+    /** Current value of the injected clock (milliseconds). */
     public function nowMs(): int
     {
         return ($this->clock)();
     }
 
-    // ================================================================ 全局字节闸门
+    // ================================================================ Global byte gate
 
     public function tryAddMessage(Message $message): bool
     {
@@ -167,7 +167,7 @@ final class ProduceAccumulator
         $this->currentlyHoldSize -= $size;
     }
 
-    // ================================================================ 表操作
+    // ================================================================ Table operations
 
     /** @return list<MessageAccumulation> */
     public function syncSendBatchesSnapshot(): array
@@ -209,7 +209,7 @@ final class ProduceAccumulator
         }
     }
 
-    // ================================================================ 发送落点
+    // ================================================================ Send target
 
     public function sendDirect(MessageBatch $batch, ?MessageQueue $mq, ?InternalSendCallback $callback): ?SendResult
     {
@@ -219,12 +219,13 @@ final class ProduceAccumulator
         return ($this->sender)($batch, $mq, $callback);
     }
 
-    // ================================================================ 显式 pump
+    // ================================================================ Explicit pump
 
     /**
-     * 复刻守卫线程的一轮 `doWork`：同步 + 异步两张表各跑一遍。
+     * Replicates one round of the guard thread's `doWork`: runs both the sync and async
+     * tables once each.
      *
-     * @param int|null $nowMs 注入的"当前时间"（毫秒），null 用注入时钟
+     * @param int|null $nowMs injected "current time" (milliseconds); null uses the injected clock
      */
     public function tick(?int $nowMs = null): void
     {
@@ -232,7 +233,7 @@ final class ProduceAccumulator
         $this->guardAsync->doWork($nowMs);
     }
 
-    /** 立刻 flush 某一个 key（同步 + 异步两张表都试）。 */
+    /** Flush one key immediately (tries both the sync and async tables). */
     public function flush(AggregateKey|string $key): void
     {
         $ks = $key instanceof AggregateKey ? $key->keyString() : $key;
@@ -244,7 +245,7 @@ final class ProduceAccumulator
         }
     }
 
-    /** 立刻 flush 两张表里的全部批次。 */
+    /** Flush all batches in both tables immediately. */
     public function flushAll(): void
     {
         foreach ($this->syncSendBatchesSnapshot() as $batch) {
@@ -255,13 +256,13 @@ final class ProduceAccumulator
         }
     }
 
-    /** pump 里对单个批次的发送：包住异常（守卫线程同样靠外层 catch 吞掉并继续）。 */
+    /** Sending of a single batch inside pump: wrap exceptions (the guard thread likewise relies on the outer catch to swallow and continue). */
     private function pumpOne(MessageAccumulation $batch, bool $sync): void
     {
         $guard = $sync ? $this->guardSync : $this->guardAsync;
         $ks = $batch->aggregateKey->keyString();
         if (!$guard->tryEnter($ks)) {
-            return; // 同一 key 正在发送，不重复触发
+            return; // the same key is being sent, do not trigger again
         }
         try {
             if ($batch->closed) {
@@ -279,7 +280,7 @@ final class ProduceAccumulator
         }
     }
 
-    // ================================================================ 对外发送入口
+    // ================================================================ External send entry points
 
     public function send(Message $msg): SendResult
     {
@@ -297,11 +298,11 @@ final class ProduceAccumulator
             $batch = $this->getOrCreateSyncBatch($key);
             $index = $batch->add($msg);
             if ($index === -1) {
-                // 本批在本次 add 之前就被关掉了：摘掉它，重取/新建一个再试
+                // This batch was closed before this add: detach it, re-fetch/create a new one and retry
                 $this->removeSyncBatch($key, $batch);
                 continue;
             }
-            // 单线程适配：没有阻塞的 add 等待者，入队后立即泵本 key 才能取到结果（异常照常抛出）。
+            // Single-threaded adaptation: there is no blocking add waiter, so this key must be pumped immediately after enqueueing to get the result (exceptions propagate as usual).
             $guardKey = $key->keyString();
             if ($this->guardSync->tryEnter($guardKey)) {
                 try {
@@ -342,7 +343,7 @@ final class ProduceAccumulator
         }
     }
 
-    // ================================================================ 进程级复用
+    // ================================================================ Process-level reuse
 
     public static function getOrCreateProduceAccumulator(
         string $clientId,
@@ -352,7 +353,7 @@ final class ProduceAccumulator
         return self::$sharedInstances[$clientId] ??= new self($clientId, $sender, $clock);
     }
 
-    /** 清空进程级复用表（单测隔离用）。 */
+    /** Clear the process-level reuse table (for unit test isolation). */
     public static function clearSharedInstances(): void
     {
         self::$sharedInstances = [];
@@ -439,7 +440,7 @@ final class MessageAccumulation
 {
     /** @var list<Message> */
     public array $messages = [];
-    /** @var list<callable(?SendResult, ?\Throwable): void> 每条消息各自的异步回调 */
+    /** @var list<callable(?SendResult, ?\Throwable): void> per-message async callback */
     public array $sendCallbacks = [];
     public array $keys = [];
     public bool $closed = false;
@@ -456,7 +457,7 @@ final class MessageAccumulation
         $this->createTime = $owner->nowMs();
     }
 
-    // ---------------- 阈值 ----------------
+    // ---------------- Threshold ----------------
 
     public function readyToSend(?int $nowMs = null): bool
     {
@@ -467,10 +468,11 @@ final class MessageAccumulation
         return $now >= $this->createTime + $this->owner->getHoldMs();
     }
 
-    // ---------------- 加入 ----------------
+    // ---------------- Join ----------------
 
     /**
-     * 同步加入；返回本条消息在本批里的下标，`-1` 表示本批已关闭（调用方需重取/新建）。
+     * Join synchronously; returns this message's index in the batch, `-1` means the batch
+     * is already closed (the caller must re-fetch/create).
      */
     public function add(Message $msg): int
     {
@@ -494,7 +496,7 @@ final class MessageAccumulation
         return $ret;
     }
 
-    /** 异步加入；`false` 表示本批已关闭（调用方需重取/新建）。 */
+    /** Join asynchronously; `false` means the batch is already closed (the caller must re-fetch/create). */
     public function addAsync(Message $msg, callable $sendCallback): bool
     {
         if ($this->closed) {
@@ -516,17 +518,17 @@ final class MessageAccumulation
 
     public function wakeup(): void
     {
-        // no-op：单线程下不存在阻塞在 add 里等待的调用方。
+        // no-op: under a single thread there is no caller blocked inside add waiting.
     }
 
-    // ---------------- 组装 / 拆分 ----------------
+    // ---------------- Assembly / splitting ----------------
 
     public function batch(): MessageBatch
     {
         $batch = new MessageBatch($this->messages);
         $batch->setTopic($this->aggregateKey->topic);
         $batch->setWaitStoreMsgOk($this->aggregateKey->waitStoreMsgOk);
-        // 无条件写（空集合即 KEYS=""）
+        // Write unconditionally (an empty collection means KEYS="")
         $batch->setKeys(implode(MessageConst::KEY_SEPARATOR, array_keys($this->keys)));
         if ($this->aggregateKey->tag !== null) {
             $batch->setTags($this->aggregateKey->tag);
@@ -572,7 +574,7 @@ final class MessageAccumulation
         return $this->sendResults[$index] ?? null;
     }
 
-    // ---------------- 发送 ----------------
+    // ---------------- Send ----------------
 
     public function sendSync(): void
     {
@@ -648,7 +650,7 @@ final class MessageAccumulation
 
 class GuardService
 {
-    /** @var array<string,true> 正在发送的 key 集合（防重入） */
+    /** @var array<string,true> set of keys currently being sent (re-entrancy guard) */
     private array $inFlight = [];
     private bool $stopped = false;
 
@@ -679,7 +681,7 @@ class GuardService
         return max(1, intdiv($this->owner->getHoldMs(), 2));
     }
 
-    /** 进入某 key 的发送临界区；已在途则返回 false（不重复触发）。 */
+    /** Enter a key's send critical section; returns false if already in flight (do not trigger again). */
     public function tryEnter(string $keyString): bool
     {
         if (isset($this->inFlight[$keyString])) {
@@ -699,7 +701,7 @@ class GuardService
         return isset($this->inFlight[$keyString]);
     }
 
-    /** 一轮守卫主体（子类实现）。 */
+    /** The main body of one guard round (implemented by subclasses). */
     public function doWork(?int $nowMs = null): void
     {
         throw new \LogicException('doWork() must be implemented by a concrete guard');
@@ -727,7 +729,7 @@ final class GuardForSyncSend extends GuardService
                     $this->leave($ks);
                 }
             }
-            // 摘表：只清理 messagesSize == 0 的空批次（发过的批次 size 仍 > 0，留在表里）。
+            // Table pruning: only clean up empty batches with messagesSize == 0 (sent batches still have size > 0 and stay in the table).
             if ($v->messagesSize === 0) {
                 $v->closed = true;
                 $this->owner->removeSyncBatch($v->aggregateKey, $v);

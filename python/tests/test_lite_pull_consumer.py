@@ -23,33 +23,39 @@ def _make_msg(topic: str, broker: str, qid: int, offset: int, body: str) -> Mess
     m.broker_name = broker
     m.queue_id = qid
     m.queue_offset = offset
-    # 既设属性也走 set_tags（写 properties），与真实 decode 出来的 MessageExt 行为一致：
-    # 真实消息 tag 在 properties["TAGS"]，由 get_tags() 读取，.tags 属性为 None。
+    # Both setting the attribute and going through set_tags (which writes properties), so that it
+    # behaves like a MessageExt really decoded from the wire:
+    # the tag of a real message lives in properties["TAGS"], is read through get_tags(), and the
+    # .tags attribute is None.
     m.tags = "TagA" if "A" in body else "TagB"
     m.set_tags(m.tags)
     return m
 
 
 class MockClient:
-    """内存版 MQClientInstance：按 (broker,queue_id) 持有消息列表，模拟 pull。"""
+    """An in-memory MQClientInstance: it holds the message lists per (broker,queue_id) and simulates pull."""
 
     def __init__(self, client_id: str, store: Dict[Tuple[str, int], List[str]]):
         self.client_id = client_id
         self.remoting_client = SimpleNamespace(register_rpc_hook=lambda *a, **k: None)
         self._store = store
         self.committed: Dict[Tuple[str, int], int] = {}
-        # 提交流水：位点契约要看的不是"最后等于几"，而是"发没发、按什么顺序发、
-        # 发了哪几条队列"，所以逐笔记下来。
+        # The commit stream: what the offset contract cares about is not "what does it end up equal
+        # to" but "was anything sent, in what order, and for which queues", so every entry is
+        # recorded.
         self.updates: List[Tuple[str, int, int]] = []
         self.queries: List[Tuple[str, int]] = []
-        # start() 必须先把 topic 登记为「在用」并拉一次路由，再发首轮心跳（心跳目标
-        # 只来自路由表）。顺序用事件流水记录，便于断言而不是只断言发生过。
+        # start() must first register the topic as "in use" and fetch the route once, and only then
+        # send the first heartbeat (the heartbeat targets come solely from the route table). The
+        # order is recorded in an event stream so that it can be asserted rather than merely observed
+        # to have happened.
         self.events: List[str] = []
-        # #105：脚本化的应答（pull_message 先弹脚本，弹空了才走内存 store），以及
-        # 每次拉取请求的 queue_offset —— 「游标跟没跟上」这事只有请求偏移能证明。
+        # #105: the scripted replies (pull_message pops the script first and only falls back to the
+        # in-memory store once it is empty), plus the queue_offset of every pull request -- whether
+        # "the cursor kept up" can only be proven by the requested offsets.
         self.scripted: List = []
         self.pull_requests: List[int] = []
-        # #107：每次拉取的 sysFlag —— lite 位（0x10）在不在只有请求本身能证明。
+        # #107: the sysFlag of every pull -- only the request itself can prove whether the lite bit (0x10) is set.
         self.pull_sys_flags: List[int] = []
 
     def start(self) -> None:
@@ -60,11 +66,11 @@ class MockClient:
 
     def get_route_of_all_brokers(self):
         self.events.append("brokers")
-        return []  # 无真实 broker，心跳发往空集合（no-op）
+        return []  # there is no real broker, so the heartbeat goes to an empty set (a no-op)
 
     def get_all_broker_addrs(self):
-        # 心跳（含消费者心跳）走的是「每个 brokerId 一台」的那份地址表；
-        # 本 Mock 没有真实 broker，两份都返回空。
+        # The heartbeat (including the consumer heartbeat) uses the "one machine per brokerId"
+        # address table; this Mock has no real broker, so both return empty.
         self.events.append("brokers")
         return []
 
@@ -92,9 +98,10 @@ class MockClient:
         return 0
 
     def query_consumer_offset(self, consumer_group, mq):
-        # 像 broker 一样记账：位点表里有什么就回什么，没有就是 QUERY_NOT_FOUND（None）。
-        # 这样 committed() 的"先看内存表"才测得出来——全部回 None 的话，
-        # 内存命中与回落 broker 两种实现给出同一个答案。
+        # It does the bookkeeping just like a broker: whatever is in the offset table is returned,
+        # and when there is nothing it is QUERY_NOT_FOUND (None). Only like this can the "look in
+        # the in-memory table first" behaviour of committed() be tested -- if everything returned None,
+        # the in-memory hit and the fallback-to-broker implementation would give the same answer.
         self.queries.append((mq.broker_name, mq.queue_id))
         return self.committed.get((mq.broker_name, mq.queue_id))
 
@@ -113,7 +120,7 @@ class MockClient:
         self.pull_sys_flags.append(sys_flag)
         if self.scripted:
             entry = self.scripted.pop(0)
-            # 可调用项在「请求途中」执行：模拟并发 seek / 撤队列这类中途改动
+            # The callable runs "in the middle of a request": it simulates a concurrent seek / queue withdrawal
             return entry() if callable(entry) else entry
         msgs = self._store.get((mq.broker_name, mq.queue_id), [])
         window = msgs[queue_offset:queue_offset + max_msg_nums]
@@ -128,7 +135,7 @@ class MockClient:
 
 
 class _Lite(DefaultLitePullConsumer):
-    """把底层 client 替换成内存 Mock，便于无集群测试。"""
+    """Replace the underlying client with an in-memory Mock so that tests need no cluster."""
 
     def __init__(self, *args, **kwargs):
         store = kwargs.pop("_store", {})
@@ -164,10 +171,11 @@ class TestLifecycle:
 
     def test_shutdown_before_start_is_noop(self):
         c = _Lite("LitePG_UT", _store=STORE)
-        c.shutdown()  # 不应抛
+        c.shutdown()  # must not throw
 
     def test_config_defaults(self):
-        # 用真实类（不经由 _Lite 夹具覆写 consume_from_where）检查默认配置
+        # Use the real class (not going through the _Lite fixture that overrides consume_from_where) to check
+        # the default configuration
         c = DefaultLitePullConsumer("LitePG_UT")
         assert c.auto_commit is True
         assert c.pull_batch_size == 32
@@ -180,11 +188,12 @@ class TestLifecycle:
         c = _Lite("LitePG_UT", _store=STORE)
         c.set_namesrv_addr("127.0.0.1:9876")
         c.assign([MessageQueue("T", "broker-a", 0)])
-        # 纯数字的 epoch 毫秒必须被拒（旧实现按 epoch 解释，静默算出错位起点）
+        # A plain numeric epoch in milliseconds must be rejected (the old implementation interpreted it as an
+        # epoch and silently computed a misaligned start)
         c.set_consume_timestamp("1700000000000")
         with pytest.raises(MQClientException, match="consumeTimestamp is invalid"):
             c.start()
-        # 合法值不能被这条启动守卫误杀
+        # A legal value must not be killed by this startup guard
         c.set_consume_timestamp("20230101000000")
         c.start()
         try:
@@ -198,9 +207,11 @@ class TestLifecycle:
         assert cd.consume_type == ConsumeType.CONSUME_ACTIVELY
 
     def test_start_pulls_route_before_the_first_heartbeat(self):
-        # 心跳只发给「路由表里已知的 broker」，所以刷路由必须排在那次同步心跳之前；
-        # 反了的话首轮心跳没有目标，broker 侧看不到本实例，多实例 rebalance 会
-        # 各自独占全部队列（真实集群上表现为重复消费）。
+        # The heartbeat only goes to "the brokers already known in the route table", so refreshing
+        # the route has to be ordered before that synchronous heartbeat; otherwise the first heartbeat
+        # has no target, the broker side does not see this instance, and a multi-instance rebalance
+        # lets each of them exclusively own all the queues (which shows up as duplicate consumption
+        # on a real cluster).
         c = _Lite("LitePG_UT", _store=STORE)
         c.set_namesrv_addr("127.0.0.1:9876")
         c.subscribe("T", "*")
@@ -217,7 +228,7 @@ class TestLifecycle:
         assigned.assign([MessageQueue("T", "broker-a", 0)])
         assigned.start()
         try:
-            # assign 模式下 subscription 是空的，路由得从已指派队列反推出来
+            # In assign mode the subscription is empty, so the route has to be derived from the assigned queues
             assert "register:T" in assigned._mock.events, assigned._mock.events
         finally:
             assigned.shutdown()
@@ -232,11 +243,11 @@ class TestAssignMode:
         c.start()
         try:
             collected = []
-            # 5 条消息，批 2 → 2+2+1 三次 poll
+            # 5 messages with a batch of 2 -> 2+2+1, three polls
             for _ in range(3):
                 collected.extend(c.poll(timeout=2000))
             assert [m.body.decode() for m in collected] == ["A0", "B1", "A2", "B3", "A4"]
-            # 缓冲已空，下一次 poll 超时返回空列表（不永久阻塞）
+            # The buffer is already empty, so the next poll times out and returns an empty list (it does not block forever)
             assert c.poll(timeout=200) == []
         finally:
             c.shutdown()
@@ -254,17 +265,19 @@ class TestAssignMode:
         mq = MessageQueue("T", "broker-a", 0)
         c.assign([mq])
         assert mq not in c._next_offset
-        assert c._mock.queries == []                     # 没启动，一个 RPC 都不发
+        assert c._mock.queries == []                     # not started, not a single RPC is sent
         with pytest.raises(MQClientException, match="not running"):
             c._resolve_initial_offset(mq)
-        # start() 里补解析，起点是 broker 上已提交的位点（不是 0）
+        # The resolution is filled in inside start(); the start point is the offset already committed on the
+        # broker (not 0)
         c._mock.committed[(mq.broker_name, mq.queue_id)] = 3
         c.set_namesrv_addr("127.0.0.1:9876")
         c.start()
         try:
-            assert ("broker-a", 0) in c._mock.queries      # 真的问了 broker
-            # 交出来的第一条是 B3：起点 3。若起点被钉死成 0（未问 broker 的 FIRST_OFFSET
-            # 字面量）这里会是 A0；若回落成 max offset（5）则一条都没有。
+            assert ("broker-a", 0) in c._mock.queries      # it really asked the broker
+            # The first one handed out is B3: the start point is 3. If the start point were pinned to 0
+            # (the FIRST_OFFSET literal without asking the broker) this would be A0; if it fell back to
+            # the max offset (5) there would be nothing at all.
             got = c.poll(timeout=2000)
             assert [m.body.decode() for m in got] == ["B3", "A4"]
         finally:
@@ -279,7 +292,7 @@ class TestAssignMode:
         try:
             first = c.poll(timeout=2000)
             assert [m.body.decode() for m in first] == ["A0", "B1"]
-            # 回到队首重新消费
+            # Go back to the head of the queue and consume again
             c.seek(MessageQueue("T", "broker-a", 0), 0)
             again = c.poll(timeout=2000)
             assert [m.body.decode() for m in again][:2] == ["A0", "B1"]
@@ -290,11 +303,11 @@ class TestAssignMode:
         c = _Lite("LitePG_UT", _store=STORE)
         c.set_namesrv_addr("127.0.0.1:9876")
         c.set_pull_batch_size(2)
-        c.set_auto_commit(False)  # 关掉自动提交，验证显式 commit
+        c.set_auto_commit(False)  # turn auto-commit off to verify the explicit commit
         c.assign([MessageQueue("T", "broker-a", 0)])
         c.start()
         try:
-            c.poll(timeout=2000)  # 拉到 A0,B1 → next_offset=2
+            c.poll(timeout=2000)  # pulled A0,B1 -> next_offset=2
             c.commit()
             assert c._mock.committed[("broker-a", 0)] == 2
         finally:
@@ -303,7 +316,7 @@ class TestAssignMode:
 
 class TestSubscribeMode:
     def test_single_consumer_gets_all_queues(self):
-        # subscribe 模式：单实例组里只有自己 → rebalance 把全部队列分给它
+        # subscribe mode: in a single-instance group it is the only one -> the rebalance assigns all the queues to it
         c = _Lite("LitePG_UT", _store=STORE)
         c.set_namesrv_addr("127.0.0.1:9876")
         c.set_pull_batch_size(2)
@@ -314,7 +327,7 @@ class TestSubscribeMode:
             for _ in range(3):
                 collected.extend(c.poll(timeout=2000))
             assert [m.body.decode() for m in collected] == ["A0", "B1", "A2", "B3", "A4"]
-            # subscribe 模式自动 rebalance，assignment 非空
+            # subscribe mode rebalances automatically, so the assignment is non-empty
             assert len(c.assignment()) == 1
         finally:
             c.shutdown()
@@ -323,13 +336,13 @@ class TestSubscribeMode:
         c = _Lite("LitePG_UT", _store=STORE)
         c.set_namesrv_addr("127.0.0.1:9876")
         c.set_pull_batch_size(5)
-        c.subscribe("T", "TagA")  # 只消费 TagA 的消息
+        c.subscribe("T", "TagA")  # only consume the TagA messages
         c.start()
         try:
             collected = []
             for _ in range(3):
                 collected.extend(c.poll(timeout=2000))
-            # A0 A2 A4 命中 TagA
+            # A0 A2 A4 match TagA
             assert [m.body.decode() for m in collected] == ["A0", "A2", "A4"]
         finally:
             c.shutdown()
@@ -345,7 +358,7 @@ class TestPauseResume:
         c.pause([mq])
         c.start()
         try:
-            # 暂停期间后台不拉取，poll 超时返回空
+            # While paused the background does not pull and poll times out returning nothing
             assert c.poll(timeout=300) == []
             c.resume([mq])
             got = c.poll(timeout=2000)
@@ -363,7 +376,7 @@ class TestCommitOffsetTable:
     def _consumer(self, store=None):
         c = _Lite("LitePG_UT", _store=store or self._two_queue_store())
         c.set_namesrv_addr("127.0.0.1:9876")
-        c.set_auto_commit(False)          # 提交时机由用例自己控制
+        c.set_auto_commit(False)          # the commit timing is controlled by the test case
         return c
 
     def test_commit_map_persists_only_the_given_queues(self):
@@ -374,7 +387,7 @@ class TestCommitOffsetTable:
         c.start()
         try:
             c.commit({q0: 2, q1: 7}, persist=False)
-            # persist=False：内存表两处都有，broker 一条都没收到
+            # persist=False: both in-memory places have it, the broker received not a single one
             assert c._offset_table == {q0: 2, q1: 7}
             assert c._mock.updates == []
             c.commit({q0: 9}, persist=True)
@@ -393,8 +406,8 @@ class TestCommitOffsetTable:
             assert c.committed(q0) == 4
             queries = len(c._mock.queries)
             assert c.committed(q0) == 4
-            assert len(c._mock.queries) == queries, "回填之后不该再问 broker"
-            # persist=False 的提交还没落 broker，committed() 也必须看得见
+            assert len(c._mock.queries) == queries, "the broker must not be asked again after the backfill"
+            # A commit with persist=False has not reached the broker yet, and committed() must still see it
             c.commit({q0: 6}, persist=False)
             assert c.committed(q0) == 6
             assert c._mock.committed[("broker-a", 0)] == 4
@@ -412,7 +425,8 @@ class TestCommitOffsetTable:
             assert [m.body.decode() for m in first] == ["A0", "B1"]
             assert c._next_offset[q0] == 2
             c.commit({q0: 0})
-            # 提交位点是"别人看的账本"，不是"我下次从哪拉"：游标不动，缓冲照旧
+            # The committed offset is "the ledger others read", not "where I pull from next time": the cursor
+    # does not move and the buffer stays as it is
             assert c._next_offset[q0] == 2
             again = c.poll(timeout=2000)
             assert [m.body.decode() for m in again] == ["A2"]
@@ -420,7 +434,8 @@ class TestCommitOffsetTable:
             c.shutdown()
 
     def test_commit_uses_the_polled_cursor_not_the_pull_cursor(self):
-        # 缓冲里还压着没交付的消息时，提交只能停在 poll 交出去的那一格
+        # While messages that have not been handed out are still sitting in the buffer, the commit can only stop
+        # at the cell that poll handed out
         c = self._consumer({("broker-a", 0): ["A0", "B1", "A2", "B3", "A4"]})
         c.set_pull_batch_size(5)
         q0 = MessageQueue("T", "broker-a", 0)
@@ -445,13 +460,14 @@ class TestCommitOffsetTable:
         c.assign([q0])
         c.start()
         try:
-            # 先确认后台确实拉过（否则 updates == [] 只是"还没来得及"的假阴性）
+            # First confirm that the background really pulled (otherwise updates == [] is just a false negative of
+            # "it did not get around to it yet")
             for _ in range(200):
                 if c._next_offset.get(q0, -1) >= 2:
                     break
                 time.sleep(0.01)
-            assert c._next_offset.get(q0, -1) >= 2, "后台没拉过，这条用例失去意义"
-            assert c._mock.updates == [], "一条都没交付 ⇒ 没有位点可提交"
+            assert c._next_offset.get(q0, -1) >= 2, "the background never pulled, so this test case loses its meaning"
+            assert c._mock.updates == [], "nothing was handed out => there is no offset to commit"
 
             handed = 0
             for _ in range(5):
@@ -460,13 +476,14 @@ class TestCommitOffsetTable:
                     handed = max(handed, max(m.queue_offset + 1 for m in got))
                 for _, _, off in c._mock.updates:
                     assert off <= handed, \
-                        "提交了 poll 还没交出去的消息: %d > %d" % (off, handed)
+                        "it committed messages that poll has not handed out yet: %d > %d" % (off, handed)
             assert handed == 5, handed
-            # 手动把截止时刻拨到过去，逼那道闸门走一次：落点就是已交付的那一格
+            # Manually move the deadline into the past to force that gate once: the landing point is the cell
+            # that has already been handed out
             c._next_auto_commit_deadline = -1
             c._maybe_auto_commit()
             assert c._mock.updates[-1] == ("broker-a", 0, 5)
-            assert c._next_auto_commit_deadline > 0, "提交完要把截止时刻推到下一个周期"
+            assert c._next_auto_commit_deadline > 0, "after committing the deadline must be pushed to the next period"
         finally:
             c.shutdown()
 
@@ -509,7 +526,7 @@ class TestCommitOffsetTable:
             c.commit({q0: 2}, persist=False)
             c.commit({})
             c.commit([])
-            # 空集合直接 return：既不发消息，也不触发 persistAll 的清表
+            # An empty set returns right away: no message is sent and the table clearing of persistAll is not triggered
             assert c._offset_table == {q0: 2}
             assert c._mock.updates == []
         finally:
@@ -545,14 +562,14 @@ class TestCommitOffsetTable:
             c.commit({q1: 1})
             assert c._mock.updates == [("broker-a", 1, 1)]
             c._mock.updates.clear()
-            # broker 侧撤走 q1（本机模拟 rebalance 少了一条队列）
+            # The broker side withdraws q1 (locally simulating a rebalance with one queue fewer)
             del store[("broker-a", 1)]
             c._rebalance()
             assert c._mock.updates == [("broker-a", 1, 1)], \
-                "撤队列之前要把最后那次提交补发出去"
+                "before withdrawing a queue the last commit must be sent out"
             assert q1 not in c._offset_table and q1 not in c._consume_offset
             assert q1 not in c._next_offset and q1 not in set(c.assignment())
-            # 留下的那条队列不能顺手被清掉
+            # The remaining queue must not be cleared as a side effect
             assert q0 in c._next_offset or q0 in c._offset_table
         finally:
             c.shutdown()
@@ -568,52 +585,56 @@ class TestCommitOffsetTable:
             assert c._offset_table[q1] == 1
             c._mock.updates.clear()
             c.assign([q0])
-            assert c._mock.updates == [], "assign 模式不替调用方补发提交"
-            # 两条游标都跟着状态一起消失，offsetTable 的条目留给 persistAll 去清
+            assert c._mock.updates == [], "assign mode does not send commits on behalf of the caller"
+            # Both cursors disappear together with the state; the entry in offsetTable is left for persistAll to clear
             assert q1 not in c._next_offset and q1 not in c._consume_offset
             assert c._offset_table[q1] == 1
         finally:
             c.shutdown()
 
     def test_three_cursors_stay_three_separate_numbers(self):
-        # 真机 S8 的离线版：一条队列灌 1200 条，poll 单次上限 1024 ⇒
-        # 「拉了多少」「交了多少」「提交到哪」三个数字必须各不相同。
-        # 把拉取游标当提交源（#68 修掉的那条）在这里就红：一次提交把 1200 全推给 broker，
-        # 调用方崩在那 176 条之前 ⇒ 静默丢消息。
+        # The offline version of the live S8: one queue is filled with 1200 messages and the per-poll
+        # limit is 1024 => the three numbers "how much was pulled", "how much was handed out" and
+        # "where it was committed to" must all differ.
+        # Using the pull cursor as the commit source (the bug fixed in #68) turns red here: one commit
+        # pushes all 1200 to the broker and the caller dies before those 176 => messages are silently
+        # lost.
         c = self._consumer({("broker-a", 0): ["A%d" % i for i in range(1200)]})
         c.set_pull_batch_size(1200)
         q0 = MessageQueue("T", "broker-a", 0)
         stranger = MessageQueue("T", "broker-a", 9)
-        # 三个观测点：队列还没进表时一律 -1，不是 0（0 是"队首之前没有消息"的有效位点）
+        # Three observation points: as long as the queue is not in the table it is always -1, not 0 (0 is the
+        # valid offset for "no messages before the head of the queue")
         assert (c.pull_cursor_of(q0), c.consume_cursor_of(q0), c.pending_commit_of(q0)) \
             == (-1, -1, -1)
         c.assign([q0])
         c.start()
         try:
-            # 后台拉取线程与这条用例抢的是同一次拉取，所以只等结果、不_ASSERT_谁拉的
+            # The background pull thread races this test case for the very same pull, so it only waits for the
+            # result and does not assert who pulled it
             pull_deadline = time.time() + 10
             while c.pull_cursor_of(q0) < 1200 and time.time() < pull_deadline:
                 c._pull_one(q0)
             assert c.pull_cursor_of(q0) == 1200, c.pull_cursor_of(q0)
-            assert c.consume_cursor_of(q0) == -1, "一条都没交付"
+            assert c.consume_cursor_of(q0) == -1, "nothing was handed out"
             c.commit()
-            assert c._mock.updates == [], "没交付过就没有位点可提交"
+            assert c._mock.updates == [], "nothing was ever handed out so there is no offset to commit"
 
             first = c.poll(timeout=2000)
             assert len(first) == 1024, len(first)
             assert c.consume_cursor_of(q0) == 1024
-            assert c.pull_cursor_of(q0) == 1200, "尾巴那 176 条还压在缓冲里"
+            assert c.pull_cursor_of(q0) == 1200, "the last 176 messages are still sitting in the buffer"
             c.commit()
             assert c._mock.updates == [("broker-a", 0, 1024)], \
-                "提交的是已消费游标，不是拉取游标"
-            # persist=False 只进内存表：committed() 看得见，broker 侧还是 1024
+                "what is committed is the consumed cursor, not the pull cursor"
+            # persist=False only goes into the in-memory table: committed() sees it while the broker side is still 1024
             c.commit({q0: 777}, persist=False)
             assert c.pending_commit_of(q0) == 777
             assert c.committed(q0) == 777
             assert c._mock.committed[("broker-a", 0)] == 1024
             updates_before = len(c._mock.updates)
             c.commit([stranger], persist=True)
-            assert len(c._mock.updates) == updates_before, "没点名的队列不该被发出去"
+            assert len(c._mock.updates) == updates_before, "a queue that was not named must not be sent out"
             assert c.pending_commit_of(q0) == -1
             assert c.committed(q0) == 1024
         finally:
@@ -624,7 +645,8 @@ class TestPullCursorFollowsNextBeginOffset:
     pass
 
     def _paused_consumer(self, store=None, batch=2):
-        """start() 之后把队列 pause 住：后台循环不碰它，游标只由用例自己驱动。"""
+        """After start() the queue is paused: the background loop does not touch it and the cursor is driven
+        only by the test case itself."""
         c = _Lite("LitePG_UT", _store=store if store is not None else STORE)
         c.set_namesrv_addr("127.0.0.1:9876")
         c.set_pull_batch_size(batch)
@@ -636,30 +658,34 @@ class TestPullCursorFollowsNextBeginOffset:
         return c, q0
 
     def test_no_matched_msg_jumps_the_cursor_past_the_scanned_window(self):
-        # 真实 broker 对「整段都不匹配 tag」的回包是 NO_MATCHED_MSG（PULL_RETRY_IMMEDIATELY），
-        # nextBeginOffset 已越过本轮扫过的全部消息。旧实现只在 FOUND 时推游标，这条路上会
-        # 一轮一轮把同一段重扫（长区间上每轮 O(n)，且永远推不动）。
+        # A real broker replies NO_MATCHED_MSG (PULL_RETRY_IMMEDIATELY) when "nothing in the
+        # whole range matches the tag", and its nextBeginOffset has already moved past every message
+        # scanned in this round. The old implementation only advanced the cursor on FOUND, so on
+        # this path it rescanned the same stretch round after round (O(n) per round over a long range,
+        # and never able to advance).
         c, q0 = self._paused_consumer()
         try:
             c._mock.scripted.append(PullResult(PullStatus.NO_MATCHED_MSG, 5, 0, 5, []))
-            assert c._pull_one(q0) is False, "一条都没交付"
-            assert c.pull_cursor_of(q0) == 5, "游标必须跟 nextBeginOffset 跳过整段"
+            assert c._pull_one(q0) is False, "nothing was handed out"
+            assert c.pull_cursor_of(q0) == 5, "the cursor must follow nextBeginOffset and skip the whole stretch"
             assert c._pull_one(q0) is False
             assert c._mock.pull_requests[-1] == 5, \
-                "下一轮从 5 起拉，不再重扫 0..4：%s" % c._mock.pull_requests
+                "the next round pulls from 5 and no longer rescans 0..4: %s" % c._mock.pull_requests
         finally:
             c.shutdown()
 
     def test_offset_illegal_adopts_the_brokers_correction(self):
-        # 越界（位点表里存着比 maxOffset 还大/比 minOffset 还小的值）时 broker 回
-        # OFFSET_ILLEGAL，nextBeginOffset 就是它给的纠正位点（PullMessageProcessor
-        # composeResponseHeader:631 + :664-676 的三条 OFFSET_* 分支）。跟上游标即自愈；
-        # 旧实现在这条路上不动游标，下一轮拿同一个越界值再撞一次。
+        # When the offset is out of range (the offset table holds a value larger than
+        # maxOffset or smaller than minOffset) the broker replies OFFSET_ILLEGAL and its
+        # nextBeginOffset is exactly the corrected offset it gives (the three OFFSET_* branches at
+        # PullMessageProcessor composeResponseHeader:631 + :664-676). Following the upstream cursor
+        # is therefore self-healing; the old implementation did not move the cursor on this path and
+        # the next round hit the same out-of-range value again.
         c, q0 = self._paused_consumer()
         try:
             c._mock.scripted.append(PullResult(PullStatus.OFFSET_ILLEGAL, 5, 0, 5, []))
             assert c._pull_one(q0) is False
-            assert c.pull_cursor_of(q0) == 5, "自愈到 broker 纠正后的位点"
+            assert c.pull_cursor_of(q0) == 5, "it self-heals to the offset corrected by the broker"
             assert c._pull_one(q0) is False
             assert c._mock.pull_requests[-1] == 5
         finally:
@@ -676,9 +702,9 @@ class TestPullCursorFollowsNextBeginOffset:
                 ])
 
             c._mock.scripted.append(seek_mid_flight)
-            assert c._pull_one(q0) is False, "seek 已把窗口作废，不许交付"
-            assert c.pull_cursor_of(q0) == 99, "游标停在 seek 钉的值上"
-            assert c.poll(timeout=100) == [], "缓冲里不许有 seek 前窗口的消息"
+            assert c._pull_one(q0) is False, "the seek invalidated the window, nothing may be handed out"
+            assert c.pull_cursor_of(q0) == 99, "the cursor stays on the value the seek pinned"
+            assert c.poll(timeout=100) == [], "the buffer must not hold messages from before the seek window"
         finally:
             c.shutdown()
 
@@ -697,7 +723,7 @@ class TestLitePullWireContract:
             c._pull_one(q0)
             flag = c._mock.pull_sys_flags[-1]
             assert PullSysFlag.has_lite_pull_flag(flag) is True, \
-                "lite pull 必须置 FLAG_LITE_PULL_MESSAGE(0x10)：flag=%#x" % flag
+                "lite pull must set FLAG_LITE_PULL_MESSAGE(0x10): flag=%#x" % flag
             assert PullSysFlag.has_commit_offset_flag(flag) is False
             assert PullSysFlag.has_suspend_flag(flag) is False
             assert PullSysFlag.has_subscription_flag(flag) is True
@@ -706,14 +732,15 @@ class TestLitePullWireContract:
             c.shutdown()
 
     def test_classic_pull_flag_has_no_lite_bit(self):
-        # 反向对照：经典拉取（DefaultMQPullConsumerImpl.pullSyncImpl:248）用 4 参
-        # buildSysFlag，lite 位必须为 0 —— 否则普通消费者也会被 361 的开关误伤。
+        # The reverse control: the classic pull (DefaultMQPullConsumerImpl.pullSyncImpl:248)
+        # uses the 4-argument buildSysFlag, so the lite bit must be 0 -- otherwise ordinary consumers
+        # would be hit by the 361 switch as well.
         classic = PullSysFlag.build_sys_flag(commit_offset=False, suspend=False,
                                              subscription=True, class_filter=False)
         assert PullSysFlag.has_lite_pull_flag(classic) is False
 
     def _wire_pull(self, sys_flag, response=None):
-        """直接驱动 MQClient.pull_message（给出 addr 省掉路由查询），捕获出站请求。"""
+        """Drive MQClient.pull_message directly (passing addr saves the route lookup) and capture the outgoing requests."""
         client = MQClientInstance("DEFAULT@wiretest", ["127.0.0.1:9876"])
         captured = {}
 
@@ -738,7 +765,8 @@ class TestLitePullWireContract:
                                           lite_pull=True)
         captured = self._wire_pull(lite)
         assert captured["code"] == RequestCode.LITE_PULL_MESSAGE == 361
-        # 位必须真的上到线上（header.sysFlag），broker 侧还有一道 hasLitePullFlag 判位
+        # The bit really has to reach the wire (header.sysFlag); the broker side has yet another check in
+        # hasLitePullFlag
         assert PullSysFlag.has_lite_pull_flag(captured["sys_flag"]) is True
 
     def test_client_api_keeps_11_without_the_lite_bit(self):
@@ -749,8 +777,10 @@ class TestLitePullWireContract:
         assert PullSysFlag.has_lite_pull_flag(captured["sys_flag"]) is False
 
     def test_lite_361_no_permission_surfaces_as_broker_exception(self):
-        # 开关关闭时 broker 回 NO_PERMISSION + 固定 remark（PullMessageProcessor:325-331）。
-        # 真机判别器靠这条 remark 断言"确实是被 lite 开关拦的"，别把它吞成通用错误。
+        # When the switch is off the broker replies NO_PERMISSION with a fixed remark
+        # (PullMessageProcessor:325-331).
+        # The live discriminator relies on that remark to assert that it really was "the lite switch
+        # that blocked it"; do not swallow it into a generic error.
         lite = PullSysFlag.build_sys_flag(commit_offset=False, suspend=False,
                                           subscription=True, class_filter=False,
                                           lite_pull=True)

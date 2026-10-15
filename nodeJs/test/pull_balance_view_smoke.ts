@@ -1,13 +1,17 @@
 // DefaultMQPullConsumer.fetchMessageQueuesInBalance — offline wire test.
 //
-// 行为基线：
-//   * 该视图 = 按 topic 过滤消费者自己持有的 processQueueTable，再剥掉
-//     namespace 前缀；官方的拉取用法只消费自己那一份队列，所以"返回全部
-//     队列"就是重复消费的 bug。
-//   * 本实现不跑拉取侧 rebalance 线程，视图按需按 rebalanceByTopic 的公式
-//     计算；因此测试钉住的是公式、"算不出"时的回退和 isRunning() 守卫。
-//   ⚠ 回退刻意不是"全部队列"：N 个实例的分组绝不能因为一次查询没有应答
-//     就都去读同一批消息。
+// Behaviour baseline:
+//   * This view = the consumer's own processQueueTable filtered by topic, with
+//     the namespace prefix then stripped; the official pull usage consumes only
+//     one's own set of queues, so "returning all queues" is a
+//     duplicate-consumption bug.
+//   * This implementation runs no pull-side rebalance thread; the view is
+//     computed on demand with the rebalanceByTopic formula, so what the test
+//     pins is the formula, the fallback when it cannot be computed, and the
+//     isRunning() guard.
+//   ⚠ The fallback is deliberately not "all queues": the grouping of N
+//     instances must never have them all read the same batch of messages just
+//     because one query went unanswered.
 //
 // Run: node --experimental-strip-types test/pull_balance_view_smoke.ts
 import net from 'node:net';
@@ -245,8 +249,8 @@ async function main() {
   }
 
   // -------------------------------------------- 6. fetchPublish vs fetchSubscribe
-  // fetchPublish 与 fetchSubscribe 是两个不同的队列视图；把二者混为一谈，
-  // 会在 readQueueNums != writeQueueNums 时悄悄改变队列集合。
+  // fetchPublish and fetchSubscribe are two different queue views; conflating them
+  // silently changes the queue set whenever readQueueNums != writeQueueNums.
   {
     const cluster = new FakeCluster();
     await cluster.listen();

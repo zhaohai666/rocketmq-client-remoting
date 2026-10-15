@@ -1,11 +1,12 @@
-// CHECK_CLIENT_CONFIG(46) 的离线报文单测：逐条锁死请求与响应的形状。
+// Offline wire unit tests for CHECK_CLIENT_CONFIG(46): the shape of the request and the
+// response is pinned down item by item.
 using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
 using RocketMQ.Common;
 using RocketMQ.Remoting.Protocol;
 using Xunit;
-// PropertyMap 是 src 侧的 global using 别名（SortedDictionary<string,string>），测试项目要显式声明。
+// PropertyMap is a global using alias on the src side (SortedDictionary<string,string>), so the test project has to declare it explicitly.
 using PropertyMap = System.Collections.Generic.SortedDictionary<string, string>;
 
 namespace RocketMQ.Client.Tests;
@@ -25,7 +26,7 @@ public class CheckClientConfigTests
 
     // ---------------------------------------------------------------- mock broker
 
-    /// <summary>一笔 46 请求的取证：extFields 与原始 body。</summary>
+    /// <summary>The evidence of one 46 request: the extFields and the raw body.</summary>
     private sealed class CheckRecord
     {
         public PropertyMap Ext { get; init; } = new();
@@ -33,8 +34,10 @@ public class CheckClientConfigTests
     }
 
     /// <summary>
-    /// 进程内假端点：同时扮演 namesrv（回路由）与 broker（按脚本回 46 的响应码）。
-    /// 只认这两种请求，其余一律应答 SUCCESS（心跳之类别来烦测试）。
+    /// An in-process fake endpoint: it plays the namesrv (returning routes) as well as the
+    /// broker (replying with the scripted response code for 46). It only recognises those
+    /// two requests and answers SUCCESS to everything else (heartbeats and the like must
+    /// not bother the test).
     /// </summary>
     private sealed class MockBroker : IDisposable
     {
@@ -72,7 +75,8 @@ public class CheckClientConfigTests
             }
         }
 
-        /// <summary>脚本化前 N 笔 46 的应答码；耗尽后一直用 tail。</summary>
+        /// <summary>Scripted response codes for the first N requests of 46; once
+        /// exhausted it keeps using tail.</summary>
         public void ScriptChecks((int Code, string Remark)[] steps,
             (int Code, string Remark)? tail = null)
         {
@@ -112,7 +116,7 @@ public class CheckClientConfigTests
         public JsonValue BodyJson(int i)
         {
             CheckRecord r = RecordAt(i);
-            Assert.True(RemotingSerializable.Decode(r.Body, out JsonValue v), "46 的 body 是 JSON");
+            Assert.True(RemotingSerializable.Decode(r.Body, out JsonValue v), "the body of 46 is JSON");
             return v;
         }
 
@@ -124,7 +128,7 @@ public class CheckClientConfigTests
             }
             catch (Exception)
             {
-                // 关掉监听端口不需要处理任何异常
+                // Closing the listening port does not need any exception handling
             }
         }
 
@@ -139,7 +143,7 @@ public class CheckClientConfigTests
                 }
                 catch (Exception)
                 {
-                    return;  // Dispose 之后 Accept 必然抛，正常收工
+                    return;  // after Dispose, Accept necessarily throws, this is a normal shutdown
                 }
 
                 new Thread(() =>
@@ -152,7 +156,7 @@ public class CheckClientConfigTests
                         }
                         catch (Exception)
                         {
-                            // 半路断连、解码失败：丢掉这条连接即可
+                            // A mid-stream disconnect / decode failure: just drop this connection
                         }
                     }
                 })
@@ -192,7 +196,7 @@ public class CheckClientConfigTests
                 RemotingCommand? resp = Respond(req);
                 if (resp is null)
                 {
-                    continue;  // oneway 请求没有应答可写
+                    continue;  // a oneway request has no response to write
                 }
 
                 byte[] wire = resp.Encode();
@@ -240,14 +244,14 @@ public class CheckClientConfigTests
                 return Echo(req, code, remark);
             }
 
-            // 心跳等非 46 请求一律应答成功，别让后台线程卡在错误上
+            // Non-46 requests such as heartbeats are always answered successfully, do not let the background thread get stuck on an error
             return req.IsOnewayRpc() ? null : Echo(req, ResponseCode.Success, null);
         }
 
         private static RemotingCommand Echo(RemotingCommand req, int code, string? remark)
         {
             var resp = RemotingCommand.CreateResponseCommand(code, remark);
-            // 客户端按 opaque 配对，串了的响应会被当噪声丢掉
+            // The client pairs by opaque, a cross-wired response is dropped as noise
             resp.Opaque = req.Opaque;
             resp.SerializeTypeCurrentRpc = req.SerializeTypeCurrentRpc;
             return resp;
@@ -280,7 +284,8 @@ public class CheckClientConfigTests
         }
     }
 
-    /// <summary>一个已经关掉、必然拒连的回环端口（比固定端口可靠）。</summary>
+    /// <summary>An already-closed loopback port that is guaranteed to refuse connections
+    /// (more reliable than a fixed port).</summary>
     private static string DeadAddr()
     {
         var s = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
@@ -291,7 +296,8 @@ public class CheckClientConfigTests
         return addr;
     }
 
-    /// <summary>起一个实例并把 Topic 的路由塞进缓存（broker 指向 mock 自己）。</summary>
+    /// <summary>Starts an instance and stuffs the Topic route into the cache (the broker
+    /// points at the mock itself).</summary>
     private static MQClientInstance Seeded(MockBroker mock, string? brokerAddr = null) =>
         SeededWithRoute(mock, route => route.BrokerDatas.Add(new BrokerData("DefaultCluster",
             "broker-a", new SortedDictionary<long, string>
@@ -299,18 +305,20 @@ public class CheckClientConfigTests
                 { MixAll.MasterId, brokerAddr ?? mock.Addr },
             })));
 
-    /// <summary>自定义路由形状的版本：由调用方往 route 里塞 broker。</summary>
+    /// <summary>The version with a custom route shape: the caller stuffs brokers into the
+    /// route.</summary>
     private static MQClientInstance SeededWithRoute(MockBroker mock, Action<TopicRouteData> fill)
     {
         var instance = new MQClientInstance(ClientId, new List<string> { mock.Addr });
         var route = new TopicRouteData();
         fill(route);
         mock.AddRoute(Topic, route);
-        Assert.True(instance.UpdateTopicRouteInfoFromNameServer(Topic), "路由要真的进缓存");
+        Assert.True(instance.UpdateTopicRouteInfoFromNameServer(Topic), "the route must really enter the cache");
         return instance;
     }
 
-    /// <summary>跑一段逻辑并回收实例（定时器线程不关会串到下一个用例）。</summary>
+    /// <summary>Runs a piece of logic and recycles the instance (a timer thread that is
+    /// not shut down would bleed into the next case).</summary>
     private static void Using(MockBroker mock, string? brokerAddr, Action<MQClientInstance> body)
     {
         MQClientInstance instance = Seeded(mock, brokerAddr);
@@ -327,7 +335,7 @@ public class CheckClientConfigTests
     private static void Using(MockBroker mock, Action<MQClientInstance> body) =>
         Using(mock, null, body);
 
-    // ---------------------------------------------------------------- 用例
+    // ---------------------------------------------------------------- Cases
 
     [Fact]
     public void TagOnlySubscriptionsSendNothing()
@@ -342,7 +350,8 @@ public class CheckClientConfigTests
         Assert.Equal(0, mock.CheckCount);
     }
 
-    /// <summary>SQL92 那一笔的形状：无 extFields、body 三段、SubscriptionData 只有 7 个键。</summary>
+    /// <summary>The shape of the SQL92 request: no extFields, a three-part body and a
+    /// SubscriptionData with only 7 keys.</summary>
     [Fact]
     public void Sql92RequestShapeMatchesLegacy()
     {
@@ -353,7 +362,7 @@ public class CheckClientConfigTests
         Assert.Equal(1, mock.CheckCount);
 
         CheckRecord record = mock.RecordAt(0);
-        // 请求头 null ⇒ 线上没有 extFields
+        // A null request header => no extFields on the wire
         Assert.Empty(record.Ext);
 
         JsonValue body = mock.BodyJson(0);
@@ -374,7 +383,8 @@ public class CheckClientConfigTests
         Assert.Null(sd.Find("filterClassSource"));
     }
 
-    /// <summary>SUBSCRIPTION_PARSE_FAILED(23) 原样带上响应码 —— 这是启动失败的判据。</summary>
+    /// <summary>SUBSCRIPTION_PARSE_FAILED(23) carries the response code as is -- that is
+    /// the criterion for a startup failure.</summary>
     [Fact]
     public void BrokerRejectCodeBecomesClientException()
     {
@@ -408,13 +418,13 @@ public class CheckClientConfigTests
     {
         using MockBroker mock = MockBroker.Start();
         mock.ScriptChecks(Array.Empty<(int, string)>());
-        // 刻意不塞路由：只读缓存，拿不到就跳过
+        // Deliberately no route seeded: cache only, skip it when it cannot be obtained
         var instance = new MQClientInstance(ClientId, new List<string> { mock.Addr });
         try
         {
             instance.CheckSubscriptionsInBroker(Group, new List<SubscriptionData> { Sql92Sub() });
             Assert.Equal(0, mock.CheckCount);
-            // 只读缓存：路由没进表就不会被顺手补拉
+            // cache only: a route that did not enter the table must not be pulled in as a side effect
             Assert.Null(instance.FindBrokerAddrByTopic(Topic));
         }
         finally
@@ -437,7 +447,7 @@ public class CheckClientConfigTests
         Assert.Equal(0, mock.CheckCount);
     }
 
-    /// <summary>空订阅集合什么都不发。</summary>
+    /// <summary>An empty subscription set sends nothing at all.</summary>
     [Fact]
     public void EmptySubscriptionsSendNothing()
     {
@@ -448,7 +458,8 @@ public class CheckClientConfigTests
         Assert.Equal(0, mock.CheckCount);
     }
 
-    /// <summary>master 优先：master + 一个拒连从节点，五笔全部落在 master。</summary>
+    /// <summary>Master first: a master plus a slave that refuses connections, all five
+    /// requests land on the master.</summary>
     [Fact]
     public void MasterBrokerIsPreferred()
     {
@@ -477,7 +488,8 @@ public class CheckClientConfigTests
         Assert.Equal(5, mock.CheckCount);
     }
 
-    /// <summary>CheckClientRequestBody 往返；namespace 只在置位时参与序列化。</summary>
+    /// <summary>A CheckClientRequestBody round trip; the namespace only takes part in
+    /// serialisation when it is set.</summary>
     [Fact]
     public void BodyRoundTripAndNamespace()
     {

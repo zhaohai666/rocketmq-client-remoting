@@ -1,16 +1,16 @@
-//! 客户端层（`src/client/`）对**真实 5.5.1 broker** 的联调验证。
+//! Live verification of the client layer (`src/client/`) against a **real 5.5.1 broker**.
 //!
-//! 与 `live_protocol.rs`（S0~S8 只打协议层）互补：这里跑的是纯客户端层的
-//! 取址 / 容错选队列 / 统计 / 钩子 / 轨迹 / 指标 / 请求应答七个模块，
-//! 而喂给它们的数据全部来自真实 broker 的往返（真实的 msgId、storeHost、
-//! commitlog offset、实测 RPC 耗时），不是手搓的假数据。
+//! Complements `live_protocol.rs` (S0~S8 covers the protocol layer only): this file runs the pure
+//! client layer's seven modules -- address fetching / fault-tolerant queue selection / stats /
+//! hooks / trace / metrics / request-reply -- and every input fed to them comes from real
+//! broker round trips (real msgId, storeHost, commitlog offset, measured RPC latency), not hand-made fakes.
 //!
 //!
-//! ⚠ 唯一非真实的数据：本地集群只有一个 broker，T2 需要一个「第二个 broker」
-//! 才能观察绕开效果，所以按真实 topic 手工补了一组 `broker-b-sim` 队列，
-//! 只用于选队列过滤（不发网络请求）。
+//! ⚠ The only non-real data: the local cluster has a single broker, and T2 needs a "second
+//! broker" to observe the avoidance effect, so one group of `broker-b-sim` queues is added by
+//! hand under the real topic, used only for queue-selection filtering (no network requests).
 //!
-//! 用法（先按项目 README 起本地集群）：
+//! Usage (start the local cluster per the project README first):
 //! ```text
 //! cargo run --example live_client_modules -- 127.0.0.1:9876
 //! ```
@@ -68,14 +68,14 @@ use rocketmq_client_remoting::remoting::protocol::remoting_command::RemotingComm
 use rocketmq_client_remoting::remoting::protocol::route::TopicRouteData;
 use rocketmq_client_remoting::remoting::protocol::serialize::RemotingSerializable;
 
-/// 建出来的 topic 队列数（默认 4）。
+/// Number of queues created for the topic (default 4).
 const QUEUE_NUMS: i32 = 4;
-/// T2 里假时钟的起点（毫秒）；用固定值让隔离窗口断言可复现。
+/// Starting point of the fake clock in T2 (milliseconds); a fixed value keeps the isolation-window assertions reproducible.
 const FAKE_NOW_BASE: i64 = 1_700_000_000_000;
-/// 这台机器上确定没人监听的端口，用来造真实的「连不上」。
+/// A port on this machine that certainly has no listener, used to produce a real "connection refused".
 const DEAD_ADDR: &str = "127.0.0.1:1";
 
-// ------------------------------------------------------------------ 骨架
+// ------------------------------------------------------------------ skeleton
 
 fn stamp() -> String {
     let secs = match SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -85,7 +85,7 @@ fn stamp() -> String {
     format!("{secs}")
 }
 
-/// 断言累积器：一次跑完所有场景再汇总，首个失败不提前退出。
+/// Assertion accumulator: all scenarios run in one pass before the summary; the first failure does not exit early.
 struct Checker {
     passed: u32,
     failed: Vec<String>,
@@ -114,7 +114,7 @@ impl Checker {
 
 type Live = Result<(), String>;
 
-/// 锁中毒时照常取内值（统计/钩子路径不许因为别处的 panic 连锁崩）。
+/// Returns the inner value even when the lock is poisoned (the stats/hook paths must not cascade-fail because of a panic elsewhere).
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -131,7 +131,7 @@ async fn rpc(
         .map_err(|e| format!("invoke {addr} failed: {e}"))
 }
 
-/// 带实测耗时的 RPC（T2/T3/T6 都要用真实延迟喂各个模块）。
+/// RPC that also returns the measured elapsed time (T2/T3/T6 all feed real latencies into their modules).
 async fn rpc_timed(
     client: &RemotingClient,
     addr: &str,
@@ -163,14 +163,14 @@ fn decode_route(resp: &RemotingCommand, what: &str) -> Result<TopicRouteData, St
         Some(b) => b.to_vec(),
         None => return Err(format!("{what} response has empty body")),
     };
-    // namesrv 的 clusterInfo/route 是 fastjson 风格（数字 map 键不带引号），
-    // 必须走 crate 里那个兼容解码器，见 live_protocol.rs S2 的实测记录。
+    // The namesrv clusterInfo/route payload is fastjson-style (numeric map keys are unquoted),
+    // so it must go through the crate's compatibility decoder; see the measured notes in live_protocol.rs S2.
     let value = RemotingSerializable::decode(&raw)
         .map_err(|e| format!("{what} body is not parsable: {e}"))?;
     TopicRouteData::from_json_value(&value).map_err(|e| format!("{what} route invalid: {e}"))
 }
 
-/// 建 topic（走 TBW102 路由找 broker），与 live_protocol.rs S0 同一套做法。
+/// Creates a topic (walks the TBW102 route to find a broker), the same approach as live_protocol.rs S0.
 async fn bootstrap_topic(client: &RemotingClient, namesrv: &str, topic: &str) -> Live {
     let resp = get_route(client, namesrv, MixAll::DEFAULT_TOPIC).await?;
     if resp.code != response_code::SUCCESS {
@@ -216,12 +216,12 @@ async fn bootstrap_topic(client: &RemotingClient, namesrv: &str, topic: &str) ->
     Ok(())
 }
 
-// ------------------------------------------------------ 真实收发（共用）
+// ------------------------------------------------------ real send/pull (shared)
 
-/// 一条已发送消息的结果 + 实测耗时。
+/// Result of one sent message + measured elapsed time.
 ///
-/// `SEND_MESSAGE_V2` 的响应头只有 msgId/queueId/queueOffset，offsetMsgId 与
-/// storeHost 要等拉取侧，所以这里不收（见 live_protocol.rs S3 的实测记录）。
+/// The `SEND_MESSAGE_V2` response header carries only msgId/queueId/queueOffset; offsetMsgId and
+/// storeHost must wait for the pull side, so they are not captured here (see the measured notes in live_protocol.rs S3).
 struct Sent {
     msg_id: String,
     queue_id: i32,
@@ -231,7 +231,7 @@ struct Sent {
     broker_name: String,
 }
 
-/// `SEND_MESSAGE_V2(310)`：与 live_protocol.rs S3 同一份 header 拼法。
+/// `SEND_MESSAGE_V2(310)`: same header layout as live_protocol.rs S3.
 async fn send_message(
     client: &RemotingClient,
     broker_addr: &str,
@@ -288,7 +288,7 @@ async fn send_message(
     })
 }
 
-/// `PULL_MESSAGE(11)`：返回解出的消息 + 实测耗时。
+/// `PULL_MESSAGE(11)`: returns the decoded messages + measured elapsed time.
 async fn pull_messages(
     client: &RemotingClient,
     broker_addr: &str,
@@ -337,7 +337,7 @@ async fn pull_messages(
     Ok((message_decoder::decode_messages(&raw), rt))
 }
 
-/// 轮询直到拉够 `want` 条（broker 的 group/commit 是异步落盘的，offset 立刻可读）。
+/// Polls until at least `want` messages have been pulled (the broker's group/commit bookkeeping is asynchronously persisted; the offset is readable immediately).
 async fn pull_until(
     client: &RemotingClient,
     broker_addr: &str,
@@ -371,7 +371,7 @@ async fn t1_top_addressing(
         .local_addr()
         .map_err(|e| format!("stub local_addr unavailable: {e}"))?
         .port();
-    // (status, body) 每次连接现读，便于场景中途改响应。
+    // (status, body) is re-read on every connection so a scenario can change the response mid-run.
     let served = Arc::new(Mutex::new((200_u16, format!("{namesrv}\n10.255.255.1:9876"))));
     let paths: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let task = {
@@ -405,7 +405,7 @@ async fn t1_top_addressing(
         })
     };
 
-    // domain 自带端口 ⇒ MixAll.getWSAddr 不能再追加 :8080，桩收到的路径可反证。
+    // The domain carries its own port => MixAll.getWSAddr must not append :8080; the path received by the stub is the counter-evidence.
     let ta = DefaultTopAddressing::from_domain(format!("127.0.0.1:{port}"));
     ck.check(
         "T1 ws_addr keeps the explicit port",
@@ -431,7 +431,7 @@ async fn t1_top_addressing(
         &format!("got line={first_get:?}"),
     );
 
-    // unitName + para 的拼串规则：由桩实际收到的请求行来证明，而不是只看字符串。
+    // The unitName + para concatenation rules: proven by the request line the stub actually receives, not just by inspecting the string.
     let unit_ta = ta
         .clone()
         .with_unit_name("unitA")
@@ -477,7 +477,7 @@ async fn t1_top_addressing(
         &format!("ns_addr={:?}", applying.ns_addr()),
     );
 
-    // 非 200 / 空白 body / 连不上：三条失败路径都必须是 None 且不 panic。
+    // Non-200 / blank body / unreachable: all three failure paths must yield None and must not panic.
     *lock(&served) = (500, "boom".to_string());
     ck.check(
         "T1 non-200 yields None",
@@ -505,7 +505,7 @@ async fn t1_top_addressing(
         &format!("elapsed={:?}", started.elapsed()),
     );
 
-    // 收尾：把真实 namesrv 地址重新端出去，并用**取到的地址**真查一次路由。
+    // Wrap-up: serve the real namesrv address again and do one real route lookup through the **fetched** address.
     *lock(&served) = (200, namesrv.to_string());
     let mut live_ta = ta.clone();
     let applied = match live_ta.fetch_and_apply().await {
@@ -530,17 +530,17 @@ async fn t1_top_addressing(
 
 // ------------------------------------------------------------------ T2
 
-/// 假时钟：T2 全程手动推 `CLOCK`，隔离窗口的断言才与真实耗时无关。
+/// Fake clock: T2 advances `CLOCK` manually throughout, so the isolation-window assertions are independent of real elapsed time.
 static CLOCK: AtomicI64 = AtomicI64::new(FAKE_NOW_BASE);
 
 fn fake_now() -> i64 {
     CLOCK.load(Ordering::Relaxed)
 }
 
-/// [`PublishInfo`] 的最小实现：真实路由里的队列 + 一组模拟的第二 broker 队列。
+/// Minimal [`PublishInfo`] implementation: queues from the real route + one group of simulated second-broker queues.
 ///
-/// 轮询语义：
-/// 无过滤器恒定前进；有过滤器最多试 `n` 个、每次试探都推进游标。
+/// Round-robin semantics:
+/// with no filter it always advances; with filters it tries at most `n` entries and the cursor advances on every probe.
 struct LivePublishInfo {
     queues: Vec<MessageQueue>,
     next: AtomicUsize,
@@ -590,7 +590,7 @@ async fn t2_latency(
     sent: &Sent,
     ck: &mut Checker,
 ) -> Live {
-    // 真实延迟：一条成功发送（sent）+ 一条必然连不上的请求（下面现测）。
+    // Real latencies: one successful send (sent) + one request that certainly cannot connect (measured just below).
     let (dead_resp, dead_rt) = rpc_timed(
         client,
         DEAD_ADDR,
@@ -614,7 +614,7 @@ async fn t2_latency(
         sent.rt_millis
     );
 
-    // 路由侧给的是 MessageQueueKey（可哈希的键类型），producer 侧才是 MessageQueue。
+    // The route side hands out MessageQueueKey (a hashable key type); only the producer side uses MessageQueue.
     let route = match get_route(client, namesrv, topic)
         .await
         .and_then(|r| decode_route(&r, "T2 route"))
@@ -633,7 +633,7 @@ async fn t2_latency(
         real_len > 0 && queues.iter().all(|q| q.get_broker_name() == broker_name),
         &format!("real queues={} broker={broker_name}", real_len),
     );
-    // 单 broker 集群造不出「绕开」效果，按同一 topic 手工补一个模拟 broker。
+    // A single-broker cluster cannot produce the "avoid" effect, so one simulated broker is added by hand under the same topic.
     for q in 0..QUEUE_NUMS {
         queues.push(MessageQueue::new(topic, "broker-b-sim", q));
     }
@@ -647,7 +647,7 @@ async fn t2_latency(
     CLOCK.store(FAKE_NOW_BASE, Ordering::Relaxed);
     let strategy = MQFaultStrategy::with_clock(true, fake_now);
 
-    // 1) 真实成功延迟入库：本地 RT 通常 < 50ms ⇒ 第一档，隔离窗口 0。
+    // 1) The real successful latency is recorded: a local RT is usually < 50ms => the lowest tier, isolation window 0.
     strategy.update_fault_item(broker_name, sent.rt_millis, false, true);
     let item = strategy.latency_fault_tolerance().get_fault_item(broker_name);
     ck.check(
@@ -661,7 +661,7 @@ async fn t2_latency(
         "a healthy real send must not be isolated",
     );
 
-    // 2) 真实连接失败 ⇒ isolation：档位查 ISOLATION_LATENCY(10s)，且记不可达。
+    // 2) A real connection failure => isolation: the tier looks up ISOLATION_LATENCY(10s) and the item is marked unreachable.
     let dead_broker = "broker-dead-sim";
     strategy.update_fault_item(dead_broker, dead_rt, true, false);
     let dead_item = strategy
@@ -687,7 +687,7 @@ async fn t2_latency(
         &format!("names={known:?}"),
     );
 
-    // 3) 隔离掉真实 broker ⇒ 选队列必须绕开它，落到模拟 broker。
+    // 3) With the real broker isolated => queue selection must avoid it and land on the simulated broker.
     strategy.update_fault_item(broker_name, sent.rt_millis, true, false);
     let picked = strategy
         .select_one_message_queue(&info, None, true)
@@ -703,7 +703,7 @@ async fn t2_latency(
         &format!("picked={picked:?}"),
     );
 
-    // 4) 假时钟推过 10s 窗口 ⇒ 真实 broker 恢复可用，reset_index 后又轮到它。
+    // 4) Advancing the fake clock past the 10s window => the real broker becomes available again and gets its turn after reset_index.
     CLOCK.store(FAKE_NOW_BASE + ISOLATION_LATENCY + 1, Ordering::Relaxed);
     let recovered = strategy
         .select_one_message_queue(&info, None, true)
@@ -714,7 +714,7 @@ async fn t2_latency(
         &format!("picked={}", recovered.get_broker_name()),
     );
 
-    // 5) lastBrokerName 排除：发送重试时不会挑到上一次那台。
+    // 5) lastBrokerName exclusion: a send retry never picks the broker used last time.
     let mut all_other = true;
     for _ in 0..8 {
         let mq = strategy
@@ -728,7 +728,7 @@ async fn t2_latency(
         "some selection returned the previous broker",
     );
 
-    // 6) 开关关着：既不记账，也不会因为没有过滤器而选不出队列。
+    // 6) With the switch off: nothing is recorded, and selection still succeeds even with no filter.
     CLOCK.store(FAKE_NOW_BASE, Ordering::Relaxed);
     let off = MQFaultStrategy::with_clock(false, fake_now);
     off.update_fault_item(broker_name, sent.rt_millis, true, false);
@@ -760,7 +760,7 @@ async fn t3_consumer_stats(
     send_rt: i64,
     ck: &mut Checker,
 ) -> Live {
-    // 真拉一次，拿到真实 RT 与消息数。
+    // One real pull to obtain the real RT and message count.
     let from = match pulled.first() {
         Some(m) => m.queue_offset,
         None => return Err("no pulled message to build stats from".to_string()),
@@ -785,7 +785,7 @@ async fn t3_consumer_stats(
     for m in &msgs {
         mgr.inc_pull_rt(group, topic, pull_rt);
         mgr.inc_pull_tps(group, topic, 1);
-        // 消费侧：body 非空即算成功，用真实 body 长度记账。
+        // Consume side: a non-empty body counts as success; bookkeeping uses the real body length.
         let len = m.get_body().len() as i64;
         mgr.inc_consume_rt(group, topic, m.store_timestamp.max(1));
         mgr.inc_consume_ok_tps(group, topic, len);
@@ -800,11 +800,11 @@ async fn t3_consumer_stats(
         mgr.is_running(),
         "start_with_handle did not spawn the sampler",
     );
-    // 重复 start 必须是 no-op（见到已有线程直接 return）。
+    // A repeated start must be a no-op (it returns directly when an existing thread is found).
     mgr.start_with_handle(&handle);
     ck.check("T3 start is idempotent", mgr.is_running(), "second start killed the sampler");
 
-    // 用固定时间戳采样，StatsSnapshot 的算术才能精确对拍。
+    // Sampling with fixed timestamps is what makes the StatsSnapshot arithmetic exactly comparable.
     let key = ConsumerStatsManager::key(topic, group);
     let tps_item: Arc<StatsItem> = mgr.topic_and_group_pull_tps().get_and_create(&key);
     let rt_item: Arc<StatsItem> = mgr.topic_and_group_pull_rt().get_and_create(&key);
@@ -852,7 +852,7 @@ async fn t3_consumer_stats(
             && (rt_snap.avgpt - want_avg).abs() < 1e-9,
         &format!("snap={rt_snap} wantAvg={want_avg}"),
     );
-    // 直接喂 compute_stats_data 与 item 口径一致（同一个 first/last 差分算法）。
+    // Feeding compute_stats_data directly matches the item's accounting (the same first/last differencing algorithm).
     let direct: StatsSnapshot = compute_stats_data(&[(1_000, 0, 0), (3_000, 4, 2)]);
     ck.check(
         "T3 compute_stats_data matches the first/last diff",
@@ -871,7 +871,7 @@ async fn t3_consumer_stats(
         &format!("hourLen={} snap={}", rt_item.hour_len(), rt_item.get_stats_data_in_hour()),
     );
 
-    // 巡采一轮：分钟链变长，小时链仍为空（未到小时点）。
+    // One sampling sweep: the minute chain grows, the hour chain is still empty (the hour boundary has not arrived).
     let minute_before = rt_item.minute_len();
     mgr.sample_all();
     ck.check(
@@ -892,7 +892,7 @@ async fn t3_consumer_stats(
         !mgr.is_running(),
         "sampler still running after shutdown",
     );
-    // shutdown 之后可以重新 start（线程句柄被置 None）。
+    // After shutdown a restart is possible (the thread handle is reset to None).
     mgr.start_with_handle(&handle);
     ck.check("T3 restart after shutdown works", mgr.is_running(), "restart failed");
     mgr.shutdown();
@@ -901,7 +901,7 @@ async fn t3_consumer_stats(
 
 // ------------------------------------------------------------------ T4
 
-/// 记录调用顺序的钩子；`poison=true` 时 before 抛错，用来验证「吞异常」。
+/// Hook that records the call order; with `poison=true` the before hook errors out, to verify that the error is swallowed.
 struct Recorder {
     events: Arc<Mutex<Vec<String>>>,
     poison: bool,
@@ -977,7 +977,7 @@ impl rocketmq_client_remoting::client::hook::FilterMessageHook for Recorder {
 
     fn filter_message(&self, context: &mut FilterMessageContext) -> Result<(), Error> {
         lock(&self.events).push(format!("filter:{}", context.msg_list.len()));
-        // 真实语义：钩子改写的 msg_list 会被客户端直接丢弃。
+        // Real semantics: the msg_list rewritten by the hook is discarded outright by the client.
         context.msg_list.clear();
         Ok(())
     }
@@ -1058,7 +1058,7 @@ async fn t4_hooks(
         &format!("mode={}", CommunicationMode::Sync),
     );
 
-    // 消费钩子：真实拉回来的消息 + 真实队列。
+    // Consume hooks: the messages really pulled back + the real queue.
     let consume_events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let consume_hooks: ConsumeMessageHookList = HookList::new();
     consume_hooks.register(Arc::new(Recorder {
@@ -1084,7 +1084,7 @@ async fn t4_hooks(
         &format!("events={ce:?}"),
     );
 
-    // CheckForbidden 与上面相反：Err 必须向上传播，且后面的钩子不再执行。
+    // CheckForbidden is the opposite of the above: the Err must propagate up and later hooks must not run.
     let forbidden_events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let deny: CheckForbiddenHookList = HookList::new();
     deny.register(Arc::new(Recorder { events: Arc::clone(&forbidden_events), poison: true })
@@ -1116,7 +1116,7 @@ async fn t4_hooks(
         "allowing hook returned Err",
     );
 
-    // FilterMessage：钩子改写后的列表就是客户端看到的列表。
+    // FilterMessage: the list after the hook rewrites it is exactly the list the client sees.
     let filter_events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let filters: FilterMessageHookList = HookList::new();
     filters.register(Arc::new(Recorder { events: Arc::clone(&filter_events), poison: false })
@@ -1212,7 +1212,7 @@ async fn t5_trace(
         &format!("keys={:?}", transfer.trans_key),
     );
 
-    // 解码往返（同一进程内）。
+    // Decode round trip (within the same process).
     let decoded = TraceDataEncoder::decoder_from_trace_data_string(Some(&transfer.trans_data));
     if decoded.len() != 1 {
         return Err(format!("expected 1 decoded context, got {}", decoded.len()));
@@ -1254,7 +1254,7 @@ async fn t5_trace(
         got == &comparable,
         &format!("original={comparable:?}\n           decoded={got:?}"),
     );
-    // 第 15 段起才有 clientHost：手工补一段验证老版本兼容分支。
+    // clientHost only exists from the 15th field on: append one segment by hand to verify the old-version compatibility branch.
     let mut fifteen = transfer
         .trans_data
         .trim_end_matches(TraceConstants::FIELD_SPLITOR)
@@ -1278,9 +1278,9 @@ async fn t5_trace(
     );
     println!("        trace text: {:?}", transfer.trans_data);
 
-    // 关键一跳到真实 broker：把轨迹文本当成消息体发出去再拉回来。
-    // 生产环境里轨迹就是这样发到 RT_TOPIC 的，SOH/STX 是控制字符，
-    // 必须能原样穿过 broker 的 commitlog。
+    // The critical hop over a real broker: send the trace text as a message body and pull it back.
+    // In production the trace is sent to RT_TOPIC exactly like this; SOH/STX are control characters
+    // and must pass through the broker's commitlog unchanged.
     let body = transfer.trans_data.clone().into_bytes();
     let trace_sent = match send_message(
         client,
@@ -1341,7 +1341,7 @@ async fn t6_metrics(
         &format!("{snap}"),
     );
 
-    // ① 真实发送到 broker：一次成功记账。
+    // (1) A real send to the broker: one successful bookkeeping entry.
     let a_start = metrics.record_send_start();
     let live = send_message(
         client,
@@ -1354,11 +1354,11 @@ async fn t6_metrics(
     )
     .await?;
     metrics.record_send_success(a_start);
-    // ② 第二次成功刻意慢一点（60ms），让 min/max 有可判定的次序。
+    // (2) The second success is deliberately slower (60ms) so min/max have a decidable order.
     let b_start = metrics.record_send_start();
     tokio::time::sleep(Duration::from_millis(60)).await;
     metrics.record_send_success(b_start);
-    // ③ 一次真实失败：连不上的地址。
+    // (3) One real failure: an address that cannot be connected to.
     let c_start = metrics.record_send_start();
     let _ = rpc_timed(
         client,
@@ -1398,7 +1398,7 @@ async fn t6_metrics(
         &format!("min={} max={}", snap.send_rt_min, snap.send_rt_max),
     );
 
-    // 消费侧：用真实消息数记账。
+    // Consume side: bookkeeping with the real message count.
     let c_start = metrics.record_consume_start();
     metrics.record_consume_success(c_start);
     let c_fail = metrics.record_consume_start();
@@ -1428,7 +1428,7 @@ async fn t6_metrics(
         round3(1.23456) == 1.235 && round3(2.0) == 2.0,
         &format!("round3(1.23456)={}", round3(1.23456)),
     );
-    // metrics 与真实发送耗时同量级（本地 loopback 必然 < 1s）。
+    // The recorded metrics are of the same magnitude as the real send latency (local loopback is necessarily < 1s).
     ck.check(
         "T6 the recorded real RT is plausible",
         sent.rt_millis >= 0 && sent.rt_millis < 1000 && live.rt_millis >= 0,
@@ -1500,7 +1500,7 @@ async fn t7_request_reply(
         "second put_response should return None",
     );
 
-    // 超时：没有应答时 wait 必须按时返回 None，且不 panic。
+    // Timeout: with no reply, wait must return None on schedule and must not panic.
     let cid2 = create_correlation_id();
     let pending = Arc::new(RequestResponseFuture::new(&cid2, 30));
     holder.put_request(&cid2, Arc::clone(&pending));
@@ -1528,7 +1528,7 @@ async fn t7_request_reply(
         "set_failed did not mark the future",
     );
 
-    // 真实 reply topic 只能来自 broker 写的 CLUSTER 属性。
+    // The real reply topic can only come from the CLUSTER property written by the broker.
     let request_msg = response.to_message();
     let cluster = request_msg
         .get_property(message_const::PROPERTY_CLUSTER)
@@ -1600,7 +1600,7 @@ async fn t8_cleanup(
         resp.code == response_code::SUCCESS,
         &format!("code={} remark={:?}", resp.code, resp.remark),
     );
-    // 5.x 默认 deleteTopicWithBrokerRegistration=false ⇒ 还得显式删 namesrv 路由。
+    // 5.x defaults deleteTopicWithBrokerRegistration=false => the namesrv route must also be deleted explicitly.
     let mut del = RemotingCommand::create_request_command(request_code::DELETE_TOPIC_IN_NAMESRV, None);
     del.add_ext_field("topic", topic);
     let resp = rpc(client, namesrv, del, 5000).await?;
@@ -1679,7 +1679,7 @@ async fn main() -> ExitCode {
     };
     println!("   broker    = {broker_name} @ {broker_addr}");
 
-    // 三条真实消息：T3 的 TPS、T4 的批量、T5/T7 的字段来源。
+    // Three real messages: the TPS for T3, the batch for T4, and the field source for T5/T7.
     let mut sent = Vec::new();
     for i in 0..3 {
         let body = format!("rust-live-client-{topic}-{i}").into_bytes();

@@ -138,7 +138,7 @@ func main() {
 			break
 		}
 	}
-	check("S1 broker 地址解析", brokerAddr != "", brokerName+"("+brokerAddr+")")
+	check("S1 broker address resolved", brokerAddr != "", brokerName+"("+brokerAddr+")")
 	if brokerAddr == "" {
 		fatal("no master broker registered")
 	}
@@ -153,7 +153,7 @@ func main() {
 			// topic and the producer would see zero publish queues.
 			Perm: common.PermRead | common.PermWrite,
 		}, mappingDetail(*topic, brokerName), true)
-	check("S1 CreateStaticTopic(513) 被接受", err == nil,
+	check("S1 CreateStaticTopic(513) accepted", err == nil,
 		fmt.Sprintf("totalQueues=%d err=%v", totalQueues, err))
 
 	// A pull consumer is just a route-carrier here: its Instance() exposes
@@ -201,13 +201,13 @@ func main() {
 		}
 		time.Sleep(2 * time.Second)
 	}
-	check("S2 路由携带 TopicQueueMappingByBroker", len(endpoints) > 0, lastDetail)
+	check("S2 route carries TopicQueueMappingByBroker", len(endpoints) > 0, lastDetail)
 	if len(endpoints) == 0 {
 		fmt.Printf("PASS=%d FAIL=%d\n", passCount, failCount)
 		os.Exit(1)
 	}
 
-	check("S3 端点总数 = totalQueues", len(endpoints) == totalQueues,
+	check("S3 endpoint count = totalQueues", len(endpoints) == totalQueues,
 		fmt.Sprintf("got=%d want=%d", len(endpoints), totalQueues))
 
 	hostedOk := true
@@ -217,7 +217,7 @@ func main() {
 			hostedOk = false
 		}
 	}
-	check("S3 承载 id 0-3 → broker", hostedOk, "")
+	check("S3 hosted id 0-3 → broker", hostedOk, "")
 
 	unhostedOk := true
 	for gid := physicalQueues; gid < totalQueues; gid++ {
@@ -226,7 +226,7 @@ func main() {
 			unhostedOk = false
 		}
 	}
-	check("S3 无承载 id 4-7 → __syslo__none__", unhostedOk, "")
+	check("S3 unhosted id 4-7 → __syslo__none__", unhostedOk, "")
 
 	// ---------------- S4/S5 instance rewrite + end-to-end ----------------
 	fmt.Println("\nS4/S5 instance rewrite + end-to-end")
@@ -241,22 +241,22 @@ func main() {
 			}
 		}
 	}
-	check("S4 实例把 mock 队列重写到真实 broker", rewriteOk, "")
+	check("S4 instance rewrites mock queue to real broker", rewriteOk, "")
 
 	// id totalQueues-1 IS in the table, and the expected rewrite semantics
 	// return the endpoint value, i.e. the sentinel itself; the passthrough
 	// case must use an out-of-table id (the Go unit test uses 99).
 	unhostedRewrite := inst.GetBrokerNameFromMessageQueue(
 		common.NewMessageQueue(*topic, mockName, totalQueues-1))
-	check("S4 无承载 id 返回哨兵值", unhostedRewrite == mockAbsent, unhostedRewrite)
+	check("S4 unhosted id returns sentinel value", unhostedRewrite == mockAbsent, unhostedRewrite)
 
 	outsideRewrite := inst.GetBrokerNameFromMessageQueue(
 		common.NewMessageQueue(*topic, mockName, 99))
-	check("S4 表外 id 透传 mock 名", outsideRewrite == mockName, outsideRewrite)
+	check("S4 out-of-table id passes through mock name", outsideRewrite == mockName, outsideRewrite)
 
 	plainRewrite := inst.GetBrokerNameFromMessageQueue(
 		common.NewMessageQueue("Plain_"+fmt.Sprint(stamp), brokerName, 0))
-	check("S4 非静态主题原样透传", plainRewrite == brokerName, plainRewrite)
+	check("S4 non-static topic passes through unchanged", plainRewrite == brokerName, plainRewrite)
 
 	coll := &collector{}
 	push, err := client.NewDefaultMQPushConsumer(group)
@@ -276,7 +276,7 @@ func main() {
 	}
 	defer push.Shutdown()
 
-	// 必须先起消费者再发：新组 CONSUME_FROM_LAST_OFFSET 会跳过启动前的消息。
+	// Must start the consumer before sending: a new group with CONSUME_FROM_LAST_OFFSET skips messages produced before startup.
 	time.Sleep(4 * time.Second)
 
 	prod := client.MustNewDefaultMQProducer("StaticProd_" + fmt.Sprint(stamp))
@@ -296,14 +296,14 @@ func main() {
 		}
 	}
 	prod.Shutdown()
-	check("S5 发送 4 条", sent == physicalQueues,
+	check("S5 sent 4 messages", sent == physicalQueues,
 		fmt.Sprintf("sent=%d lastErr=%s", sent, lastSendErr))
 
 	deadline = time.Now().Add(40 * time.Second)
 	for len(coll.bodies) < physicalQueues && time.Now().Before(deadline) {
 		time.Sleep(1 * time.Second)
 	}
-	check("S5 消费收齐 4 条", len(coll.bodies) >= physicalQueues,
+	check("S5 consumed all 4 messages", len(coll.bodies) >= physicalQueues,
 		fmt.Sprintf("got=%d", len(coll.bodies)))
 
 	fmt.Printf("PASS=%d FAIL=%d\n", passCount, failCount)

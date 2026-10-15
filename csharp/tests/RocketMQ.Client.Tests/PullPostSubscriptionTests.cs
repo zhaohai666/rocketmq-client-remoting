@@ -1,9 +1,11 @@
-// P5：postSubscriptionWhenPull + updatePullFromWhichNode（PullAPIWrapper 移植）的离线单测。
+// P5: offline unit tests for postSubscriptionWhenPull + updatePullFromWhichNode (the
+// PullAPIWrapper port).
 //
 //
-// 报文形状（SUBSCRIPTION 位、
-// `subscription` 键是否上线、打给 master 还是 slave、COMMIT_OFFSET 清位）在这里用
-// 进程内假端点从 socket 上取证，不靠调用方自说自话。
+// The wire shape (the SUBSCRIPTION bit, whether the `subscription` key goes out, whether
+// it is sent to the master or a slave, the COMMIT_OFFSET bit being cleared) is evidenced
+// here off the socket with an in-process fake endpoint, rather than taken from the caller's
+// own word.
 using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
@@ -12,7 +14,7 @@ using RocketMQ.Common;
 using RocketMQ.Remoting;
 using RocketMQ.Remoting.Protocol;
 using Xunit;
-// PropertyMap 是 src 侧的 global using 别名（SortedDictionary<string,string>），测试项目要显式声明。
+// PropertyMap is a global using alias on the src side (SortedDictionary<string,string>), so the test project has to declare it explicitly.
 using PropertyMap = System.Collections.Generic.SortedDictionary<string, string>;
 
 namespace RocketMQ.Client.Tests;
@@ -25,11 +27,13 @@ public class PullPostSubscriptionTests
     private const string ClientId = "127.0.0.1@5555#1";
     private const int MaxFrame = 20 * 1024 * 1024;
 
-    // ---------------------------------------------------------------- 假端点
+    // ---------------------------------------------------------------- Fake endpoint
 
     /// <summary>
-    /// 进程内假端点：既能当 namesrv 回路由，也能当 broker 回 PULL_MESSAGE。
-    /// master 与 slave 各起一个，于是「打给了谁」直接从 socket 上取证。
+    /// An in-process fake endpoint: it can serve as the namesrv returning routes as well as
+    /// the broker answering PULL_MESSAGE.
+    /// One master and one slave are started, so "who it was sent to" is evidenced straight
+    /// off the socket.
     /// </summary>
     private sealed class PullEndpoint : IDisposable
     {
@@ -64,7 +68,7 @@ public class PullPostSubscriptionTests
             }
         }
 
-        /// <summary>脚本化 PULL_MESSAGE 应答头（nextBeginOffset / maxOffset / suggestWhichBrokerId…）。</summary>
+        /// <summary>Scripted PULL_MESSAGE response header (nextBeginOffset / maxOffset / suggestWhichBrokerId...).</summary>
         public void ScriptPullResponse(PropertyMap ext)
         {
             lock (_gate)
@@ -74,7 +78,8 @@ public class PullPostSubscriptionTests
             }
         }
 
-        /// <summary>收到的 PULL_MESSAGE 的请求头快照（上线原样）。</summary>
+        /// <summary>A snapshot of the request header of a received PULL_MESSAGE (exactly as
+        /// it went on the wire).</summary>
         public List<PropertyMap> Pulls()
         {
             lock (_gate)
@@ -91,7 +96,7 @@ public class PullPostSubscriptionTests
             }
             catch (Exception)
             {
-                // 关监听端口不需要处理异常
+                // Closing the listening port needs no exception handling
             }
         }
 
@@ -106,7 +111,7 @@ public class PullPostSubscriptionTests
                 }
                 catch (Exception)
                 {
-                    return;  // Dispose 之后 Accept 必抛，正常收工
+                    return;  // after Dispose, Accept necessarily throws, this is a normal shutdown
                 }
 
                 new Thread(() =>
@@ -119,7 +124,7 @@ public class PullPostSubscriptionTests
                         }
                         catch (Exception)
                         {
-                            // 半路断连 / 解码失败：丢掉这条连接即可
+                            // A mid-stream disconnect / decode failure: just drop this connection
                         }
                     }
                 })
@@ -159,7 +164,7 @@ public class PullPostSubscriptionTests
                 RemotingCommand? resp = Respond(req);
                 if (resp is null)
                 {
-                    continue;  // oneway 没有应答可写
+                    continue;  // oneway has no response to write
                 }
 
                 byte[] wire = resp.Encode();
@@ -207,14 +212,14 @@ public class PullPostSubscriptionTests
                 return pullResp;
             }
 
-            // 心跳之类一律成功，别让后台线程卡在错误上
+            // Heartbeats and the like always succeed, do not let the background thread get stuck on an error
             return req.IsOnewayRpc() ? null : Echo(req, ResponseCode.Success, null);
         }
 
         private static RemotingCommand Echo(RemotingCommand req, int code, string? remark)
         {
             var resp = RemotingCommand.CreateResponseCommand(code, remark);
-            // 客户端按 opaque 配对，串了的响应会被当噪声丢掉
+            // The client pairs by opaque, a cross-wired response is dropped as noise
             resp.Opaque = req.Opaque;
             resp.SerializeTypeCurrentRpc = req.SerializeTypeCurrentRpc;
             return resp;
@@ -247,7 +252,8 @@ public class PullPostSubscriptionTests
         }
     }
 
-    /// <summary>一个已关掉、必然拒连的回环端口（构造「从节点不存在」用）。</summary>
+    /// <summary>An already-closed loopback port that is guaranteed to refuse connections
+    /// (used to construct "the slave does not exist").</summary>
     private static string DeadAddr()
     {
         var s = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
@@ -305,7 +311,7 @@ public class PullPostSubscriptionTests
             MQClientInstance.FindBrokerAddressInSubscribe(
                 new SortedDictionary<long, string> { [1] = "127.0.0.1:10921" }, 3));
 
-        // onlyThisBroker：宁缺毋滥
+        // onlyThisBroker: better to come up short than to over-deliver
         Assert.Equal((string.Empty, false),
             MQClientInstance.FindBrokerAddressInSubscribe(addrs, 9, onlyThisBroker: true));
         Assert.Equal((string.Empty, false),
@@ -313,7 +319,7 @@ public class PullPostSubscriptionTests
                 new SortedDictionary<long, string>(), 0));
     }
 
-    // ---------------------------------------------------------------- 线上报文
+    // ---------------------------------------------------------------- The wire
 
     [Fact]
     public void PullToSlaveClearsCommitOffsetAndOmitsSubscription()
@@ -341,11 +347,11 @@ public class PullPostSubscriptionTests
             Assert.Empty(master.Pulls());
             PropertyMap sent = slave.Pulls()[0];
             int sentFlag = int.Parse(sent["sysFlag"], System.Globalization.CultureInfo.InvariantCulture);
-            Assert.False(PullSysFlag.HasCommitOffsetFlag(sentFlag), "slave 上一次 COMMIT_OFFSET 都没有意义");
-            Assert.True(PullSysFlag.HasSuspendFlag(sentFlag), "suspend 位保持");
+            Assert.False(PullSysFlag.HasCommitOffsetFlag(sentFlag), "a single COMMIT_OFFSET on a slave is meaningless");
+            Assert.True(PullSysFlag.HasSuspendFlag(sentFlag), "the suspend bit stays");
             Assert.False(sent.ContainsKey("subscription"),
-                "SUBSCRIPTION 位关闭时该字段根本不进 extFields（null → 丢字段）");
-            // 应答头 suggestWhichBrokerId 透传给调用方，供回写 pullFromWhichNodeTable
+                "when the SUBSCRIPTION bit is off that field never enters extFields (null -> the field is dropped)");
+            // the response header's suggestWhichBrokerId is passed through to the caller, for writing back pullFromWhichNodeTable
             Assert.Equal(0L, result.SuggestWhichBrokerId);
         }
         finally
@@ -355,9 +361,10 @@ public class PullPostSubscriptionTests
     }
 
     /// <summary>
-    /// brokerId=0（主节点）：请求打到 master、COMMIT_OFFSET 位保留；SUBSCRIPTION 位置位时
-    /// `subscription` 才上线，内容是调用方给的表达式；老 broker 不带 suggestWhichBrokerId
-    /// 时透传 null（调用方按 master=0 记账）。
+    /// brokerId=0 (the master): the request goes to the master and the COMMIT_OFFSET bit is
+    /// kept; only when the SUBSCRIPTION bit is set does `subscription` go out, carrying the
+    /// expression the caller gave; when an old broker sends no suggestWhichBrokerId, null
+    /// is passed through (the caller books it as master=0).
     /// </summary>
     [Fact]
     public void PullToMasterKeepsCommitOffsetAndPostsSubscription()
@@ -383,7 +390,7 @@ public class PullPostSubscriptionTests
             Assert.Empty(slave.Pulls());
             PropertyMap sent = master.Pulls()[0];
             int sentFlag = int.Parse(sent["sysFlag"], System.Globalization.CultureInfo.InvariantCulture);
-            Assert.True(PullSysFlag.HasCommitOffsetFlag(sentFlag), "master 上位点照提交");
+            Assert.True(PullSysFlag.HasCommitOffsetFlag(sentFlag), "on the master the offset is committed as usual");
             Assert.True(PullSysFlag.HasSubscriptionFlag(sentFlag));
             Assert.Equal("TagA||TagB", sent["subscription"]);
             Assert.Equal("3", sent["queueOffset"]);
@@ -418,7 +425,7 @@ public class PullPostSubscriptionTests
             PropertyMap sent = Assert.Single(master.Pulls());
             int sentFlag = int.Parse(sent["sysFlag"], System.Globalization.CultureInfo.InvariantCulture);
             Assert.True(PullSysFlag.HasCommitOffsetFlag(sentFlag),
-                "回退到的是 master，位点照提交（IsSlave 按命中的 id 判，不是请求的 brokerId）");
+                "the fallback landed on the master, so the offset is committed as usual (IsSlave judges by the id that was matched, not the request's brokerId)");
         }
         finally
         {
@@ -426,7 +433,7 @@ public class PullPostSubscriptionTests
         }
     }
 
-    // ---------------------------------------------------------------- 消费者配置与记账
+    // ---------------------------------------------------------------- Consumer configuration and bookkeeping
 
     [Fact]
     public void ConsumerSubscriptionGatingFollowsLegacyDefault()
@@ -442,7 +449,7 @@ public class PullPostSubscriptionTests
         var blank = new SubscriptionData(Topic, "");
         Assert.Equal("*", consumer.PullSubscriptionExpressionForTest(blank));
 
-        // 类过滤模式：表达式是过滤类名，broker 侧 TAG 过滤会误判，所以即使打开也不上送
+        // Class filtering mode: the expression is a filter class name and TAG filtering on the broker side would misjudge it, so it is not sent even when the switch is on
         var classMode = new SubscriptionData(Topic, "com.example.MyFilter") { ClassFilterMode = true };
         Assert.Null(consumer.PullSubscriptionExpressionForTest(classMode));
     }
@@ -468,7 +475,7 @@ public class PullPostSubscriptionTests
         Assert.Equal(MixAll.MasterId, consumer.PullFromWhichNodeForTest(otherKey));
     }
 
-    // ---------------------------------------------------------------- 夹具
+    // ---------------------------------------------------------------- Fixtures
 
     private static TopicRouteData RouteWithMasterAndSlave(string masterAddr, string slaveAddr)
     {
@@ -492,15 +499,17 @@ public class PullPostSubscriptionTests
         return route;
     }
 
-    /// <summary>建实例并把 Topic 路由塞进缓存（真 RPC 走一趟 namesrv）。</summary>
+    /// <summary>Builds the instance and stuffs the Topic route into the cache (a real RPC
+    /// round trip through the namesrv).</summary>
     private static MQClientInstance NewInstanceWithRoute(PullEndpoint namesrv)
     {
         var instance = new MQClientInstance(ClientId, new List<string> { namesrv.Addr });
-        Assert.True(instance.UpdateTopicRouteInfoFromNameServer(Topic), "路由要真的进缓存");
+        Assert.True(instance.UpdateTopicRouteInfoFromNameServer(Topic), "the route must really enter the cache");
         return instance;
     }
 
-    /// <summary>死端口那条路径的守卫（`FindBrokerAddressInSubscribe` 不该把死地址当命中）。</summary>
+    /// <summary>The guard on the dead-port path
+    /// (<c>FindBrokerAddressInSubscribe</c> must not treat a dead address as a hit).</summary>
     [Fact]
     public void DeadPortIsStillReturnedAsTheHit()
     {

@@ -1,23 +1,23 @@
-//! 前置：NameServer + Broker 已起，`autoCreateTopicEnable=true`。
+//! Precondition: NameServer + Broker are up, with `autoCreateTopicEnable=true`.
 //!
 //!
 //!
-//! ⚠ 四条脚本纪律（都是真机联调踩出来的）：
-//!   ① topic 一律带 stamp —— 多轮**依次**跑在同一个 broker 上，固定名会继承上一轮的条数；
-//!   ② 「被拒的发送连请求都没发出去」只能看 broker 侧落库条数（各队列 maxOffset-minOffset 之和），
-//!      光看客户端回调会被「回调报错但请求照样发出去」的实现蒙过去；
-//!   ③ 新建 topic 要等 broker 把 topicConfig 增量注册到 namesrv（秒级到十秒级），所以所有
-//!      broker 侧对账都是**轮询到超时**，读一次路由失败不算失败；
-//!   ④ 占住在途靠的是钩子里的 `std::thread::sleep`，它会把一条 tokio 工作线程按住在
-//!      同步调用里 —— 本机实测：**只要有任何任务阻塞，整个运行时的时间驱动就不推进**
-//!      （一个任务睡 1500ms 期间，另一个任务里的 `sleep(100ms)` 一次都没醒）。所以
-//!        · 「在途笔」与「等不到许可的笔」必须连着发完，中间不能 await 去观察在途；
-//!        · 在途扣费与「占满那一刻才补发超限的那几笔」都交给 [`GateWatch`]（普通 OS 线程），
-//!          「进过发送内核没有」用钩子自己记的时间戳 —— 两者都不受运行时调度影响；
-//!          而且这类断言只能在链路彻底跑完之后再读，钩子可能还堵在新 topic 的路由上；
-//!        · 需要在「还在睡」这段时间里动手脚（B3 的运行时扩容）也只能交给普通线程。
+//! ⚠ Four script disciplines (all learned from real-machine runs):
+//!   (1) topics always carry a stamp -- multiple rounds run **sequentially** on the same broker, and a fixed name would inherit the previous round's counts;
+//!   (2) "a rejected send never even emitted the request" can only be judged from broker-side stored counts (the sum of maxOffset-minOffset over queues),
+//!      client callbacks alone can be fooled by an implementation that "reports an error in the callback yet still sends the request";
+//!   (3) a newly created topic needs time for the broker to register the topicConfig delta to the namesrv (seconds to tens of seconds), so every
+//!      broker-side reconciliation polls **until timeout**; one failed route read is not a failure;
+//!   (4) holding in-flight slots works via `std::thread::sleep` inside the hook, which pins a tokio worker thread inside a
+//!      synchronous call -- measured locally: **as long as any task blocks, the whole runtime's time driver stops advancing**
+//!      (while one task slept 1500ms, a `sleep(100ms)` in another task never woke once). Therefore
+//!        · the "in-flight sends" and the "sends that cannot get a permit" must be fired back-to-back, with no await in between to observe in-flight state;
+//!        · in-flight charging and "topping up the over-limit sends at the moment the gate fills" are both delegated to [`GateWatch`] (a plain OS thread),
+//!          and "did it enter the send kernel" uses the hook's own recorded timestamps -- neither is affected by runtime scheduling;
+//!          moreover such assertions can only be read after the whole chain has finished, since the hook may still be stuck on the new topic's route;
+//!        · anything that must act while the hook "is still sleeping" (B3's runtime resize) also has to run on a plain thread.
 //!
-//! 用法：
+//! Usage:
 //! ```text
 //! cargo run --example live_backpressure -- 127.0.0.1:9876
 //! ```
@@ -41,24 +41,24 @@ use rocketmq_client_remoting::client::result::SendResult;
 use rocketmq_client_remoting::common::message::{Message, MessageQueue};
 use rocketmq_client_remoting::error::Result;
 
-/// 集群探活与「等 broker 侧结果落地」的默认预算（秒）。
+/// Default budget (seconds) for cluster liveness and "waiting for broker-side results to land".
 const WAIT_SECONDS: u64 = 30;
 const GATE_NUM: i64 = MIN_ASYNC_SEND_NUM;
-/// B4 一笔 600KB body：1M 的字节闸下在途只能容 1 笔。
+/// B4's single 600KB body: under the 1M byte gate only 1 send can be in flight.
 const BIG_BODY: usize = 600 * 1024;
-/// B3 在途钩子的睡眠时长（ms）：留出「扩容发生在 10 笔归还之前」的判断窗口。
+/// B3's in-flight hook sleep duration (ms): leaves a judgement window for "the resize happens before the 10 held sends return".
 const HOLD_MS: i64 = 2_500;
-/// 运行时工作线程数。
+/// Runtime worker thread count.
 ///
-/// 必须明显大于并发在途笔数：占住在途靠的是 `send_message_before` 里的**阻塞**睡眠
-/// （钩子是同步接口，没法 await），一个在途发送就吃掉一条工作线程。
+/// Must be clearly larger than the concurrent in-flight count: holding in-flight slots relies on the **blocking** sleep
+/// inside `send_message_before` (the hook is a synchronous interface, it cannot await), so one in-flight send eats one worker thread.
 const WORKER_THREADS: usize = 32;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 断言累积器：跑完全部场景再汇总，首个失败不提前退出。
+/// Assertion accumulator: all scenarios run before the summary; the first failure does not exit early.
 struct Checker {
     passed: u32,
     failed: Vec<String>,
@@ -88,7 +88,7 @@ impl Checker {
     }
 }
 
-/// 线程安全的回调记录。
+/// Thread-safe callback recorder.
 #[derive(Default)]
 struct Recorder {
     done: AtomicUsize,
@@ -140,19 +140,19 @@ impl SendCallback for Recorder {
     }
 }
 
-/// 在 `send_message_before` 里睡一会儿，把「在途」占住，并记下每笔进入钩子的时刻。
+/// Sleeps a while inside `send_message_before` to hold the in-flight slot, and records when each send entered the hook.
 ///
-/// 许可是**过闸时**拿的、**链终点**还的，所以占住在途最干净的办法是让链本身变慢：
-/// 堵用户回调占不住许可（归还就在把结果交给用户之前一步）。
+/// Permits are taken **at the gate** and returned **at the end of the chain**, so the cleanest way to hold in-flight state
+/// is to make the chain itself slow: blocking in the user callback does not hold the permit (the return happens one step
+/// before handing the result to the user).
 ///
-/// 时间戳用钩子自己记（相对 [`SlowHook::begin`]），不用主任务的 `Instant`：钩子的
-/// `std::thread::sleep` 会占住一条 tokio 工作线程，而本机实测**只要有任何任务阻塞，
-/// 整个运行时的时间驱动就不推进**，主任务的所有 `sleep` 都会一觉睡到钩子结束。
-/// 于是「谁在什么时候过了闸」只能从链路上取，不能从观察方取。
+/// Timestamps are recorded by the hook itself (relative to [`SlowHook::begin`]), not the main task's `Instant`: the hook's
+/// `std::thread::sleep` pins a tokio worker thread, and measured locally **as long as any task blocks, the whole runtime's time driver stops advancing**,
+/// so every `sleep` in the main task oversleeps until the hook finishes. Hence "who passed the gate and when" can only be taken from the chain, not from the observer.
 struct SlowHook {
     millis: AtomicI64,
     clock: Mutex<Option<Instant>>,
-    /// `(标签, 进入钩子时距 begin 的毫秒数)`；标签即 [`message`] 写进 keys 的那个标签。
+    /// `(label, ms since begin when the send entered the hook)`; the label is the one [`message`] writes into keys.
     entries: Mutex<Vec<(String, u128)>>,
 }
 
@@ -169,18 +169,18 @@ impl SlowHook {
         self.millis.store(millis, Ordering::SeqCst);
     }
 
-    /// 重新计时并清空记录，让一段场景的观测点互相独立。
+    /// Resets the clock and clears the records so each scenario's observations are independent.
     fn begin(&self) {
         *lock(&self.clock) = Some(Instant::now());
         lock(&self.entries).clear();
     }
 
-    /// 标签为 `label` 的发送进入过钩子的次数。
+    /// How many sends labelled `label` entered the hook.
     fn count_of(&self, label: &str) -> usize {
         lock(&self.entries).iter().filter(|(l, _)| l == label).count()
     }
 
-    /// 标签为 `label` 的发送最早一次进入钩子的时刻（没进过返回 `None`）。
+    /// Earliest moment a send labelled `label` entered the hook (`None` if it never did).
     fn first_entry_of(&self, label: &str) -> Option<u128> {
         lock(&self.entries)
             .iter()
@@ -189,7 +189,7 @@ impl SlowHook {
             .min()
     }
 
-    /// 全部记录，失败时用来排查标签本身。
+    /// All records, for debugging the labels themselves on failure.
     fn dump(&self) -> String {
         lock(&self.entries)
             .iter()
@@ -198,10 +198,10 @@ impl SlowHook {
             .join(",")
     }
 
-    /// 距 [`begin`] 的毫秒数；还没开始计时时返回 0。
+    /// Milliseconds since [`begin`]; returns 0 if the clock has not started.
     ///
-    /// 给「动手脚的那个普通线程也要报时刻」用 —— 高负载机器上 `sleep(1s)` 自己就会晚，
-    /// 「脚晚了」和「叫不醒」是两种病因，混在一起就会误诊。
+    /// Lets the plain thread that acts also report its moment -- on a loaded machine `sleep(1s)` is late by itself, and
+    /// "the actor was late" vs "the waker never woke" are two different causes that misdiagnose when mixed.
     fn elapsed_of_clock(&self) -> u128 {
         match *lock(&self.clock) {
             Some(began) => began.elapsed().as_millis(),
@@ -231,13 +231,13 @@ impl SendMessageHook for SlowHook {
     }
 }
 
-/// 用**普通 OS 线程**盯一个闸门的空闲许可：等到它第一次被占到 `target` 为止，就在那一
-/// 刻跑 `then`（＝补发那几笔「等不到许可」的发送），同时记下窗口里看到的最小值。
+/// Uses a **plain OS thread** to watch a gate's free permits: as soon as it is first filled down to `target`, run `then`
+/// at that instant (= top up the sends that "cannot get a permit"), while recording the minimum seen in the window.
 ///
-/// 为什么不能在主任务里做（模块头纪律 ④）：钩子的阻塞 sleep 会冻住整个运行时的时间驱动，
-/// 「在途占满」到「钩子睡完」这段时间主任务一次都不会被调度 —— 由它来观察在途、再补发
-/// 超限的那几笔，实际会变成「等人家把许可全还光了才发」，只会得到全都成功的假结果。
-/// 独立线程不受运行时调度影响，既看得见扣费，也能恰好在扣费期间把请求塞进去。
+/// Why this cannot be done in the main task (module-header discipline (4)): the hook's blocking sleep freezes the whole
+/// runtime's time driver, and from "gate filled" to "hook done sleeping" the main task is never scheduled -- if it did
+/// the observing and the topping-up, it would in practice become "send only after every permit was returned", yielding
+/// a fake all-success result. An independent thread is unaffected by runtime scheduling: it sees the charging happen and can slip its requests in exactly while the charge is held.
 struct GateWatch {
     stop: Arc<AtomicBool>,
     min: Arc<AtomicI64>,
@@ -274,7 +274,7 @@ impl GateWatch {
         GateWatch { stop, min, hit, task: Some(task) }
     }
 
-    /// 停线程，取回 `(窗口内最小空闲许可, 是否命中过 target)`。
+    /// Stops the thread and returns `(minimum free permits in the window, whether target was ever hit)`.
     fn finish(mut self) -> (i64, bool) {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(task) = self.task.take() {
@@ -318,7 +318,7 @@ impl Env {
         t
     }
 
-    /// 集群探活：端口开着 != broker 已注册到 namesrv，所以轮询。
+    /// Cluster liveness: an open port != the broker registered to the namesrv, so poll.
     async fn start(&self, ck: &mut Checker) -> bool {
         if let Err(e) = self.admin.start().await {
             ck.abort("admin start", &e.to_string());
@@ -329,19 +329,19 @@ impl Env {
             if let Ok(info) = self.admin.fetch_broker_cluster_info().await {
                 if let Some(first) = info.get_broker_addrs().first() {
                     *lock(&self.broker_addr) = first.clone();
-                    ck.check("集群探活", true, &format!("broker={first}"));
+                    ck.check("cluster liveness", true, &format!("broker={first}"));
                     return true;
                 }
             }
             if Instant::now() >= deadline {
-                ck.abort("集群探活", "nameServer 在预算内没有返回任何 broker");
+                ck.abort("cluster liveness", "the nameServer returned no broker within the budget");
                 return false;
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
 
-    /// 起一个只配了背压旋钮的生产者。钩子必须在 `start()` 之前挂上。
+    /// Starts a producer configured only with the backpressure knobs. The hook must be attached before `start()`.
     async fn producer(
         &self,
         kind: &str,
@@ -372,16 +372,16 @@ impl Env {
     }
 }
 
-// ---------------------------------------------------------- 通用助手
+// ---------------------------------------------------------- common helpers
 
-/// 打标签发送：标签写在 keys 属性上，钩子按它归类（见 [`SlowHook`]）。
+/// Sends with a label: the label goes on the keys property and the hook classifies by it (see [`SlowHook`]).
 fn message(topic: &str, label: &str, body: &[u8]) -> Message {
     let mut msg = Message::new(topic, Some(body));
     msg.set_keys(label);
     msg
 }
 
-/// 轮询等待条件成立（最多 `secs` 秒）。
+/// Polls until the condition holds (at most `secs` seconds).
 async fn wait_until<F: Fn() -> bool>(cond: F, secs: u64) -> bool {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
@@ -395,11 +395,11 @@ async fn wait_until<F: Fn() -> bool>(cond: F, secs: u64) -> bool {
     }
 }
 
-/// broker 上这个 topic 一共落了多少条（各队列 maxOffset-minOffset 之和）；读不到返回 -1。
-/// 这是「被拒的发送连请求都没发出去」的唯一硬证据。
+/// How many messages landed on the broker for this topic in total (sum of maxOffset-minOffset over queues); -1 if unreadable.
+/// This is the only hard evidence for "a rejected send never even emitted the request".
 async fn landed_count(env: &Env, topic: &str) -> i64 {
     let Ok(route) = env.admin.examine_topic_route(topic).await else {
-        return -1; // 路由还没注册上
+        return -1; // route not registered yet
     };
     let mut addrs: BTreeMap<String, String> = BTreeMap::new();
     for broker in &route.broker_datas {
@@ -414,7 +414,7 @@ async fn landed_count(env: &Env, topic: &str) -> i64 {
         }
         for queue_id in 0..queue.read_queue_nums {
             let mq = MessageQueue::new(topic, &queue.broker_name, queue_id);
-            // 队列刚建出来时两次读数都可能失败，按「还没就绪」处理而不是当 0
+            // Both reads can fail right after the queue is created; treat as "not ready yet" instead of 0
             let (max, min) =
                 match (env.admin.max_offset(&mq).await, env.admin.min_offset(&mq).await) {
                     (Ok(max), Ok(min)) => (max, min),
@@ -426,7 +426,7 @@ async fn landed_count(env: &Env, topic: &str) -> i64 {
     total
 }
 
-/// 等 broker 上至少出现 `expected` 条，返回最后一次读数。
+/// Waits until at least `expected` messages appear on the broker; returns the last reading.
 async fn wait_landed(env: &Env, topic: &str, expected: i64) -> i64 {
     let mut landed = landed_count(env, topic).await;
     let mut reads = 0;
@@ -438,7 +438,7 @@ async fn wait_landed(env: &Env, topic: &str, expected: i64) -> i64 {
     landed
 }
 
-// ------------------------------------------------------- B1 默认容量不漏配额
+// ------------------------------------------------------- B1 default capacity does not leak quota
 
 async fn b1_default_capacity_no_leak(ck: &mut Checker, env: &Env) {
     let topic = env.topic("B1");
@@ -450,7 +450,7 @@ async fn b1_default_capacity_no_leak(ck: &mut Checker, env: &Env) {
         }
     };
     ck.check(
-        "B1 默认容量 1024 条 / 100M 字节",
+        "B1 default capacity is 1024 messages / 100M bytes",
         producer.semaphore_async_send_num_available_permits() == 1024
             && producer.semaphore_async_send_size_available_permits() == 100 * 1024 * 1024,
         &format!(
@@ -476,21 +476,21 @@ async fn b1_default_capacity_no_leak(ck: &mut Checker, env: &Env) {
             rejected += 1;
         }
     }
-    ck.check("B1 40 笔 send_async 都没被入队拒绝", rejected == 0, "rejected={rejected}");
+    ck.check("B1 none of the 40 send_async calls were rejected at enqueue", rejected == 0, "rejected={rejected}");
     ck.check(
-        "B1 40 笔异步都走完回调",
+        "B1 all 40 async sends completed their callbacks",
         wait_until(|| rec.done() >= 40, 20).await,
         &rec.summary(),
     );
     ck.check(
-        "B1 全部 SEND_OK",
+        "B1 all SEND_OK",
         rec.ok() == 40 && rec.errors().is_empty(),
         &rec.summary(),
     );
     let landed = wait_landed(env, &topic, 40).await;
-    ck.check("B1 broker 上正好落了 40 条", landed == 40, &format!("landed={landed}"));
+    ck.check("B1 exactly 40 messages landed on the broker", landed == 40, &format!("landed={landed}"));
     ck.check(
-        "B1 条数许可满额归还",
+        "B1 count permits fully returned",
         producer.semaphore_async_send_num_available_permits() == 1024,
         &format!(
             "available={}",
@@ -498,7 +498,7 @@ async fn b1_default_capacity_no_leak(ck: &mut Checker, env: &Env) {
         ),
     );
     ck.check(
-        "B1 字节许可满额归还",
+        "B1 byte permits fully returned",
         producer.semaphore_async_send_size_available_permits() == 100 * 1024 * 1024,
         &format!(
             "available={}",
@@ -508,7 +508,7 @@ async fn b1_default_capacity_no_leak(ck: &mut Checker, env: &Env) {
     producer.shutdown();
 }
 
-// ------------------------------------- B2/B3 条数闸：拒绝、对账、运行时扩容
+// ------------------------------------- B2/B3 count gate: rejection, reconciliation, runtime resize
 
 async fn b2_and_b3_num_gate(ck: &mut Checker, env: &Env) {
     let topic = env.topic("B2");
@@ -524,7 +524,7 @@ async fn b2_and_b3_num_gate(ck: &mut Checker, env: &Env) {
         }
     };
 
-    // ---- B2：10 笔把在途占满，另外两笔由看门线程在「占满」那一刻补发、等不到许可
+    // ---- B2: 10 sends fill the in-flight slots; two more are fired by the watcher thread at the "filled" instant and cannot get a permit
     slow.begin();
     let held = Arc::new(Recorder::default());
     let rejected = Arc::new(Recorder::default());
@@ -563,42 +563,42 @@ async fn b2_and_b3_num_gate(ck: &mut Checker, env: &Env) {
     let victims_done = wait_until(|| rejected.done() >= 2, 15).await;
     let (min_free, drained) = watch.finish();
     ck.check(
-        "B2 在途占满后空闲条数为 0",
+        "B2 free count is 0 once the in-flight slots are filled",
         drained && min_free == 0,
-        &format!("命中过占满={drained} 采样窗口内最小空闲={min_free}"),
+        &format!("filled-hit={drained} min free in sampling window={min_free}"),
     );
     let both_failed = victims_done
         && rejected
             .all_errors_contain("send message tryAcquire semaphoreAsyncNum timeout", 2);
     ck.check(
-        "B2 超限的两笔回调 TooMuchRequest，文案逐字匹配",
+        "B2 the two over-limit sends callback with TooMuchRequest, wording matched verbatim",
         both_failed,
         &rejected.summary(),
     );
     let waited = began.elapsed();
     ck.check(
-        "B2 闸等到预算耗尽才报错（不是看一眼就拒）",
+        "B2 the gate waits until the budget is exhausted before erroring (not a glance-and-reject)",
         waited >= Duration::from_millis(130),
-        &format!("等了 {}ms（钩子阻塞期间时间驱动停摆，这是下限）", waited.as_millis()),
+        &format!("waited {}ms (the time driver stalls while the hook blocks; this is a lower bound)", waited.as_millis()),
     );
     let landed = wait_landed(env, &topic, GATE_NUM).await;
     ck.check(
-        "B2 broker 上只落了那 10 条（被拒的一条都没进去）",
+        "B2 only those 10 landed on the broker (not one rejected send got in)",
         holders_done && landed == GATE_NUM,
         &format!("landed={landed} {}", held.summary()),
     );
-    // 被拒的笔应当**根本没进发送内核**：钩子在闸门之后、网络之前，进过没进过一查便知。
+    // The rejected sends should **never have entered the send kernel**: the hook sits after the gate and before the network, so a single query tells.
     ck.check(
-        "B2 在途的 10 笔都进了发送内核、被拒的 2 笔一笔都没进",
+        "B2 all 10 held sends entered the send kernel and none of the 2 rejected did",
         slow.count_of("b2-held") == GATE_NUM as usize && slow.count_of("b2-rejected") == 0,
         &format!(
-            "held 进钩子 {} 次、rejected 进钩子 {} 次",
+            "held entered the hook {} times, rejected entered the hook {} times",
             slow.count_of("b2-held"),
             slow.count_of("b2-rejected")
         ),
     );
     ck.check(
-        "B2 全部落地后条数许可满额归还",
+        "B2 count permits fully returned after everything landed",
         producer.semaphore_async_send_num_available_permits() == GATE_NUM,
         &format!(
             "available={}",
@@ -606,17 +606,17 @@ async fn b2_and_b3_num_gate(ck: &mut Checker, env: &Env) {
         ),
     );
 
-    // ---- B3：睡 2.5s，第 11 笔卡在闸上，由**另一个线程**在睡眠中途把它扩容叫醒
+    // ---- B3: sleep 2.5s; the 11th send sticks at the gate and is woken by a **resize from another thread** mid-sleep
     //
-    // 扩容必须发生在钩子还在睡的那段时间里，才能区分「是容量变了放它过去」和
-    // 「是前面 10 笔归还许可放它过去」；而那段时间运行时的任务全被冻住，只能交给普通线程。
+    // The resize must land while the hook is still asleep, to distinguish "capacity changed and let it through" from
+    // "the earlier 10 sends returned permits and let it through"; in that window runtime tasks are all frozen, so only a plain thread can do it.
     const RESIZE_AT: u128 = 1_000;
     slow.set(HOLD_MS);
     slow.begin();
     let held2 = Arc::new(Recorder::default());
-    // 第 11 笔必须**等闸门真的被占满**再交出去：池子的派发与主任务的循环并发，
-    // 谁先到闸口不一定 —— 先过闸的是它的话，卡住的就变成第 10 笔 held，
-    // 「它是被扩容放行的」这句判断就不成立了。观察与补发都交给看门线程（纪律 ④）。
+    // The 11th send must be handed over only **after the gate is really filled**: the pool's dispatch races with the
+    // main task's loop and whoever reaches the gate first is not deterministic -- if it passed first, the stuck one becomes the 10th held send,
+    // and "it was let through by the resize" no longer holds. Observing and topping up are both left to the watcher thread (discipline (4)).
     let woken = Arc::new(Recorder::default());
     let woken_sent_at = Arc::new(AtomicI64::new(-1));
     let watch = GateWatch::spawn(
@@ -649,8 +649,8 @@ async fn b2_and_b3_num_gate(ck: &mut Checker, env: &Env) {
             None,
         );
     }
-    // 扩容线程**真正跑起来**的时刻：这台机器负载高时 `sleep(1s)` 本身就会晚，
-    // 而「扩容晚了」与「扩容叫不醒等待者」是两种完全不同的病因，必须分得开。
+    // The moment the resize thread **actually runs**: on a loaded machine `sleep(1s)` is late by itself, and
+    // "the resize was late" vs "the resize failed to wake the waiter" are two entirely different causes that must be kept apart.
     let resize_fired_at = Arc::new(AtomicI64::new(-1));
     let _ = std::thread::spawn({
         let producer = producer.clone();
@@ -666,46 +666,46 @@ async fn b2_and_b3_num_gate(ck: &mut Checker, env: &Env) {
     .join();
     let (_min_free, sent_while_gated) = watch.finish();
     let sent_at = woken_sent_at.load(Ordering::SeqCst);
-    // 这一条是上一切的前提：第 11 笔必须是在闸门已经空了**之后**、扩容**之前**交出去的，
-    // 否则它可能只是顺着新容量走了过去，什么都没测到。
+    // This is the premise of everything above: the 11th send must be handed over **after** the gate has emptied and
+    // **before** the resize, otherwise it may simply walk through on the new capacity and nothing gets tested.
     ck.check(
-        "B3 第 11 笔在闸门口就被扣住（扩容前才交出去）",
+        "B3 the 11th send is held at the gate (handed over before the resize)",
         sent_while_gated && sent_at >= 0 && (sent_at as u128) < RESIZE_AT,
-        &format!("闸门曾空={sent_while_gated} 交出时刻={sent_at}ms 扩容在 {RESIZE_AT}ms"),
+        &format!("gate-emptied={sent_while_gated} handed-over-at={sent_at}ms resize at {RESIZE_AT}ms"),
     );
     ck.check(
-        "B3 被叫醒的那笔真的发出去了",
+        "B3 the woken send really went out",
         wait_until(|| woken.done() > 0, 20).await
             && woken.ok() == 1
             && woken.errors().is_empty(),
-        &format!("{} 扩容实际发生在 {}ms", woken.summary(), resize_fired_at.load(Ordering::SeqCst)),
+        &format!("{} resize actually happened at {}ms", woken.summary(), resize_fired_at.load(Ordering::SeqCst)),
     );
-    // 时刻由钩子自己记：它进内核那一刻既晚于扩容、又早于 10 笔在途归还，
-    // 所以放行它的只可能是扩容这件事本身。
+    // The moment is recorded by the hook itself: its kernel entry is both after the resize and before the 10 in-flight
+    // returns, so the only thing that could have let it through is the resize itself.
     let woken_entry = slow.first_entry_of("b3-woken");
     ck.check(
-        "B3 第 11 笔卡在闸上，直到扩容那一刻才进发送内核",
+        "B3 the 11th send sticks at the gate and enters the send kernel only at the resize moment",
         woken_entry.is_some_and(|at| at >= RESIZE_AT && at < HOLD_MS as u128)
             && slow.count_of("b3-held") == GATE_NUM as usize,
         &format!(
-            "它进内核于 {woken_entry:?}ms（扩容在 {RESIZE_AT}ms、10 笔在途要到 ≈{}ms 之后才归还）",
+            "it entered the kernel at {woken_entry:?}ms (resize at {RESIZE_AT}ms; the 10 in-flight only return after ≈{}ms)",
             HOLD_MS
         ),
     );
     let all_done = wait_until(|| held2.done() >= GATE_NUM as usize, 30).await;
-    // B2 落了 10 条，B3 又落 10 + 1 条
+    // B2 landed 10 messages, B3 lands another 10 + 1
     let landed = wait_landed(env, &topic, GATE_NUM * 2 + 1).await;
     ck.check(
-        "B3 broker 上一共落了 21 条",
+        "B3 a total of 21 messages landed on the broker",
         all_done && landed == GATE_NUM * 2 + 1,
         &format!(
-            "landed={landed} 钩子记录=[{}] {}",
+            "landed={landed} hook-records=[{}] {}",
             slow.dump(),
             held2.summary()
         ),
     );
     ck.check(
-        "B3 全部落地后空闲许可 = 新容量 12",
+        "B3 free permits after everything landed = the new capacity 12",
         producer.semaphore_async_send_num_available_permits() == GATE_NUM + 2,
         &format!(
             "available={}",
@@ -715,7 +715,7 @@ async fn b2_and_b3_num_gate(ck: &mut Checker, env: &Env) {
     producer.shutdown();
 }
 
-// ------------------------------------------------------------- B4 字节闸
+// ------------------------------------------------------------- B4 byte gate
 
 async fn b4_size_gate(ck: &mut Checker, env: &Env) {
     let topic = env.topic("B4");
@@ -739,7 +739,7 @@ async fn b4_size_gate(ck: &mut Checker, env: &Env) {
     let body = vec![b'x'; BIG_BODY];
     let expected_free = MIN_ASYNC_SEND_SIZE - BIG_BODY as i64;
 
-    // 一笔 600KB 在途；看门线程一等到「字节闸被它占满」就补发两笔等不到许可的（同 B2）。
+    // One 600KB send in flight; as soon as the watcher thread sees "the byte gate filled by it" it tops up two sends that cannot get a permit (same as B2).
     slow.begin();
     let first = Arc::new(Recorder::default());
     let second = Arc::new(Recorder::default());
@@ -776,10 +776,10 @@ async fn b4_size_gate(ck: &mut Checker, env: &Env) {
     let victims_done = wait_until(|| second.done() >= 2, 15).await;
     let (min_free, drained) = watch.finish();
     ck.check(
-        "B4 一笔 600KB 在途恰好扣掉 600K 个字节许可",
+        "B4 one 600KB send in flight charges exactly 600K byte permits",
         drained && min_free == expected_free,
         &format!(
-            "命中过扣费={drained} 采样窗口内最小空闲={min_free}（期望 {expected_free}）"
+            "charge-hit={drained} min free in sampling window={min_free} (expected {expected_free})"
         ),
     );
     let rejected_ok = victims_done
@@ -788,30 +788,30 @@ async fn b4_size_gate(ck: &mut Checker, env: &Env) {
             2,
         );
     ck.check(
-        "B4 超限的两笔回调 semaphoreAsyncSize timeout，文案逐字匹配",
+        "B4 the two over-limit sends callback with semaphoreAsyncSize timeout, wording matched verbatim",
         rejected_ok,
         &second.summary(),
     );
     let landed = wait_landed(env, &topic, 1).await;
     ck.check(
-        "B4 broker 上只落了那 1 条",
+        "B4 only that 1 message landed on the broker",
         first_done && landed == 1,
         &format!("landed={landed} {}", first.summary()),
     );
-    // 字节闸拦下的那两笔**根本没进发送内核**（钩子在闸门之后），所以真机上一共只有一笔
-    // 走过链路；这里顺便证明「过不了字节闸时，已经拿到的条数许可不会漏还」——
-    // 漏了的话下面那条满额归还的检查会永远差着那两个许可。
+    // The two sends blocked by the byte gate **never entered the send kernel** (the hook sits after the gate), so on the
+    // real cluster only one send ever crossed the chain; this also proves "when the byte gate blocks, count permits already
+    // taken are not leaked" -- a leak would make the full-return check below permanently short those two permits.
     ck.check(
-        "B4 只有一笔进过发送内核（被拒的两笔一笔都没进）",
+        "B4 only one send entered the send kernel (neither of the rejected two did)",
         slow.count_of("b4-big") == 1,
         &format!(
-            "进钩子 {} 次，全部记录=[{}]",
+            "entered the hook {} times, all records=[{}]",
             slow.count_of("b4-big"),
             slow.dump()
         ),
     );
     ck.check(
-        "B4 全部落地后条数许可满额归还（被拒那两笔把自己那份还回去了）",
+        "B4 count permits fully returned after everything landed (the two rejected sends returned their own share)",
         producer.semaphore_async_send_num_available_permits() == GATE_NUM,
         &format!(
             "available={}",
@@ -819,7 +819,7 @@ async fn b4_size_gate(ck: &mut Checker, env: &Env) {
         ),
     );
     ck.check(
-        "B4 全部落地后字节许可满额归还",
+        "B4 byte permits fully returned after everything landed",
         producer.semaphore_async_send_size_available_permits() == MIN_ASYNC_SEND_SIZE,
         &format!(
             "available={}",
@@ -829,11 +829,11 @@ async fn b4_size_gate(ck: &mut Checker, env: &Env) {
     producer.shutdown();
 }
 
-// ------------------------------------------------------- B5 开关关掉就不限流
+// ------------------------------------------------------- B5 switch off means no limiting
 
 async fn b5_disabled_never_limits(ck: &mut Checker, env: &Env) {
     let topic = env.topic("B5");
-    // 配置故意给到 1 笔 / 1KB —— 会被夹到地板值 10 / 1M，但开关是关的，所以完全不限流
+    // Config deliberately set to 1 message / 1KB -- it gets clamped to the floor values 10 / 1M, but the switch is off, so nothing is limited at all
     let producer = match env.producer("b5", false, Some(1), Some(1024), None).await {
         Ok(p) => p,
         Err(e) => {
@@ -842,7 +842,7 @@ async fn b5_disabled_never_limits(ck: &mut Checker, env: &Env) {
         }
     };
     ck.check(
-        "B5 越界配置被夹到地板值",
+        "B5 out-of-range config is clamped to the floor values",
         producer.semaphore_async_send_num_available_permits() == GATE_NUM
             && producer.semaphore_async_send_size_available_permits() == MIN_ASYNC_SEND_SIZE,
         &format!(
@@ -865,18 +865,18 @@ async fn b5_disabled_never_limits(ck: &mut Checker, env: &Env) {
     }
     let done = wait_until(|| rec.done() >= 30, 30).await;
     ck.check(
-        "B5 关掉背压后 30 笔并发（含 3 笔 300KB）全部落地",
+        "B5 with backpressure off, all 30 concurrent sends (including 3 x 300KB) land",
         done && rec.ok() == 30 && rec.errors().is_empty(),
         &rec.summary(),
     );
     let landed = wait_landed(env, &topic, 30).await;
     ck.check(
-        "B5 broker 上落了 30 条",
+        "B5 30 messages landed on the broker",
         landed == 30,
         &format!("landed={landed}"),
     );
     ck.check(
-        "B5 关着的时候两个闸一分未动",
+        "B5 with the switch off, neither gate moved at all",
         producer.semaphore_async_send_num_available_permits() == GATE_NUM
             && producer.semaphore_async_send_size_available_permits() == MIN_ASYNC_SEND_SIZE,
         &format!(
@@ -888,7 +888,7 @@ async fn b5_disabled_never_limits(ck: &mut Checker, env: &Env) {
     producer.shutdown();
 }
 
-// ------------------------------------------------------------------ 清理
+// ------------------------------------------------------------------ cleanup
 
 async fn cleanup(ck: &mut Checker, env: &Env) {
     let topics = lock(&env.topics).clone();
@@ -897,10 +897,10 @@ async fn cleanup(ck: &mut Checker, env: &Env) {
             println!("  [WARN] delete_topic({topic}) failed: {e}");
         }
     }
-    ck.check("清理本次的 topic", true, "");
+    ck.check("cleanup of this run's topics", true, "");
 }
 
-// ------------------------------------------------------------------ 驱动
+// ------------------------------------------------------------------ driver
 
 async fn run(namesrv: &str) -> Checker {
     let mut ck = Checker::new();
@@ -926,8 +926,8 @@ fn stamp() -> String {
     }
 }
 
-/// 阻塞式钩子会占住工作线程，所以这里**不能**用 `#[tokio::main]`（它的默认线程数
-/// 可能只有几核），显式建一个大一点的多样本运行时。
+/// A blocking hook pins worker threads, so `#[tokio::main]` must **not** be used here (its default thread count may be
+/// only a few cores); build a larger multi-thread runtime explicitly instead.
 fn main() -> ExitCode {
     let argv: Vec<String> = env::args().collect();
     let namesrv = argv
@@ -942,7 +942,7 @@ fn main() -> ExitCode {
     {
         Ok(runtime) => runtime,
         Err(e) => {
-            eprintln!("建运行时失败: {e}");
+            eprintln!("failed to build the runtime: {e}");
             return ExitCode::FAILURE;
         }
     };

@@ -270,7 +270,7 @@ public static class LanguageCode
     public const byte Rust = 12;
     public const byte NodeJs = 13;
 
-    /// <summary>按码值反查名字；未知返回 null。</summary>
+    /// <summary>Reverse-lookup the name by code value; returns null when unknown.</summary>
     public static string? ValueOf(int code) => code switch
     {
         0 => "JAVA",
@@ -290,7 +290,7 @@ public static class LanguageCode
         _ => null,
     };
 
-    /// <summary>按名字反查码值；未知返回 null（5.x 服务端会把 language 序列化成**枚举名**）。</summary>
+    /// <summary>Reverse-lookup the code value by name; returns null when unknown (the 5.x server serializes language as the **enum name**).</summary>
     public static byte? FromName(string name) => name switch
     {
         "JAVA" => Java,

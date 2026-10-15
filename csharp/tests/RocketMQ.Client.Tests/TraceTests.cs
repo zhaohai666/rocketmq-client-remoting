@@ -194,7 +194,7 @@ public class TraceTests
     [Fact]
     public void EncoderReturnsNullForNullContext() => Assert.Null(TraceDataEncoder.EncoderFromContextBean(null));
 
-    // ---------------------------------------------------------------- 解码
+    // ---------------------------------------------------------------- Decoding
 
     [Fact]
     public void DecodePubKeepsMsgIdAndOffsetMsgId()
@@ -284,7 +284,7 @@ public class TraceTests
     [Fact]
     public void DecodeSubBeforeWithoutKeysDoesNotThrow()
     {
-        // 真实线上形态：keys 为空 → java_split 丢掉末尾空串 → 只剩 7 段
+        // The real on-wire shape: an empty keys -> java_split drops the trailing empty string -> only 7 segments left
         string raw = string.Join(Soh, new[]
         {
             "SubBefore", "1700000000000", "DefaultRegion", "GID_trace_live", "REQ-001",
@@ -302,7 +302,7 @@ public class TraceTests
     [Fact]
     public void DecodeOneBadRecordDoesNotDropTheBatch()
     {
-        string bad = string.Join(Soh, new[] { "SubAfter", "REQ-9", "M9" }) + Stx; // 段数不足
+        string bad = string.Join(Soh, new[] { "SubAfter", "REQ-9", "M9" }) + Stx; // not enough segments
         string batch = ExpectedPub + bad + ExpectedSubBefore;
 
         List<TraceContext> res = TraceDataEncoder.DecoderFromTraceDataString(batch);
@@ -327,7 +327,7 @@ public class TraceTests
     public void DecodeEmptyOrNullReturnsEmpty(string? input) =>
         Assert.Empty(TraceDataEncoder.DecoderFromTraceDataString(input));
 
-    // ---------------------------------------------------------------- LegacySplit 语义
+    // ---------------------------------------------------------------- LegacySplit semantics
 
     [Fact]
     public void LegacySplitDropsTrailingEmptyFields()
@@ -337,7 +337,7 @@ public class TraceTests
         Assert.Empty(LegacySplit.Split("\u0001\u0001", Soh));
     }
 
-    // ---------------------------------------------------------------- 常量
+    // ---------------------------------------------------------------- Constants
 
     [Fact]
     public void ConstantsMatchLegacy()
@@ -374,7 +374,7 @@ public class TraceTests
         Assert.Equal(32, a.RequestId.Length);
     }
 
-    // ---------------------------------------------------------------- 分发器
+    // ---------------------------------------------------------------- Dispatcher
 
     [Fact]
     public void DispatcherDefaultsToSystemTraceTopic()
@@ -420,12 +420,12 @@ public class TraceTests
         }
 
         Assert.Equal(5, d.QueueSize);
-        // 未 Start 时发送必然失败，但 Flush 仍要把队列取空（不能因为发不出去就堆在队列里）
+        // Sending is bound to fail while not Started, but Flush must still empty the queue (it must not pile up in there just because it cannot be sent)
         d.Flush();
         Assert.Equal(0, d.QueueSize);
     }
 
-    // ---------------------------------------------------------------- 发送侧钩子
+    // ---------------------------------------------------------------- Send-side hooks
 
     [Fact]
     public void SendHookBuildsPubContextAndAppends()
@@ -442,7 +442,7 @@ public class TraceTests
         Assert.Equal("TagA", trace.TraceBeans[0].Tags);
         Assert.Equal("KeyA KeyB", trace.TraceBeans[0].Keys);
         Assert.Equal(42, trace.TraceBeans[0].BodyLength);
-        Assert.Equal(0, d.QueueSize);            // before 不入队，after 才发
+        Assert.Equal(0, d.QueueSize);            // before does not enqueue, only after sends
         Assert.Equal("SendMessageTraceHook", hook.HookName());
 
         context.SendResult = new SendResult
@@ -480,7 +480,7 @@ public class TraceTests
         hook.SendMessageAfter(context);
 
         Assert.Null(context.MqTraceContext);
-        Assert.Equal(0, d.QueueSize);            // 防递归：轨迹消息自己不再产生轨迹
+        Assert.Equal(0, d.QueueSize);            // recursion guard: a trace message produces no trace of its own
     }
 
     [Fact]
@@ -514,7 +514,7 @@ public class TraceTests
         var d = new AsyncTraceDispatcher("GID_test", TraceDispatcherType.Produce);
         var hook = new SendMessageTraceHook(d);
 
-        // before 未跑过 → after 什么都不做
+        // before never ran -> after does nothing
         SendMessageContext orphan = SendContext();
         orphan.SendResult = new SendResult
         {
@@ -538,7 +538,7 @@ public class TraceTests
         Assert.False(((TraceContext)context.MqTraceContext!).IsSuccess);
     }
 
-    // ---------------------------------------------------------------- 消费侧钩子
+    // ---------------------------------------------------------------- Consume-side hooks
 
     [Fact]
     public void ConsumeHookSubBeforeAndAfterShareRequestId()
@@ -558,7 +558,7 @@ public class TraceTests
         context.Success = true;
         hook.ConsumeMessageAfter(context);
 
-        // SubBefore / SubAfter 必须共用一个 request_id，控制台才能把一次消费前后串起来
+        // SubBefore / SubAfter must share one request_id, otherwise the console cannot string the before and after of one consumption together
         List<TraceContext> queued = DrainQueue(d);
         Assert.Equal(2, queued.Count);
         Assert.Equal(queued[0].RequestId, queued[1].RequestId);
@@ -593,11 +593,11 @@ public class TraceTests
         TraceContext subAfter = queued[1];
         Assert.Equal(RocketMQ.Client.TraceType.SubBefore, subBefore.TraceType);
         Assert.Equal(RocketMQ.Client.TraceType.SubAfter, subAfter.TraceType);
-        // SubBefore / SubAfter 共用一个 request_id —— 控制台靠它把一次消费前后串起来
+        // SubBefore / SubAfter share one request_id -- the console relies on it to string the before and after of one consumption together
         Assert.Equal(subBefore.RequestId, subAfter.RequestId);
         Assert.Equal(expected, subAfter.ContextCode);
 
-        // 顺带锁住编码：contextCode 落在第 7 段（0-based 索引 6）
+        // Locking the encoding as well: contextCode lands in segment 7 (index 6, 0-based)
         string text = TraceDataEncoder.EncoderFromContextBean(subAfter)!.TransData;
         string[] seg = LegacySplit.Split(text, Soh).ToArray();
         Assert.Equal(expected.ToString(CultureInfo.InvariantCulture), seg[6]);
@@ -629,7 +629,7 @@ public class TraceTests
         Assert.Equal("ConsumeMessageTraceHook", hook.HookName());
     }
 
-    // ---------------------------------------------------------------- 事务收尾钩子
+    // ---------------------------------------------------------------- Transaction closing hooks
 
     [Fact]
     public void EndTransactionHookWritesLegacyStateName()
@@ -700,7 +700,7 @@ public class TraceTests
     private static ConsumeMessageContext ConsumeContext(List<MessageExt> msgs) => new("CID_test", msgs,
         new MessageQueue("TopicTest", "broker-a", 0))
     {
-        // PropertyMap 是客户端项目内部的 global using（SortedDictionary），测试里写全名
+        // PropertyMap is a global using inside the client project (SortedDictionary), the test spells out the full name
         Props = new System.Collections.Generic.SortedDictionary<string, string>(),
         AccessChannel = RocketMQ.Client.AccessChannel.Local,
     };
@@ -720,7 +720,8 @@ public class TraceTests
         return m;
     }
 
-    /// <summary>把 dispatcher 内部队列取空（未 Start 时发不出去，只能直接读队列来验证 Append）。</summary>
+    /// <summary>Empties the dispatcher's internal queue (while not Started it cannot be
+    /// sent out, so Append has to be verified by reading the queue directly).</summary>
     private static List<TraceContext> DrainQueue(AsyncTraceDispatcher d)
     {
         FieldInfo field = typeof(AsyncTraceDispatcher).GetField("_queue",

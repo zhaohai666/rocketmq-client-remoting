@@ -12,9 +12,11 @@ public static class ClientErrorCode
 }
 
 /// <summary>
-/// MQClientException(message, responseCode) 语义；默认 1（UNKNOWN）。
-/// 管理端靠它把 broker 响应码透传出来——例如 resetOffsetNew 需要区分
-/// CONSUMER_NOT_ONLINE 才能退化到 resetOffsetByTimestampOld。
+/// <summary>
+/// MQClientException(message, responseCode) semantics; defaults to 1 (UNKNOWN).
+/// The admin side relies on it to pass broker response codes through — e.g.
+/// resetOffsetNew needs to distinguish CONSUMER_NOT_ONLINE before it can fall
+/// back to resetOffsetByTimestampOld.
 /// </summary>
 public class MQClientException : Exception
 {

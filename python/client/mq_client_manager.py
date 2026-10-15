@@ -13,7 +13,7 @@ logger = get_logger()
 
 
 class _FactoryEntry:
-    """缓存条目：实例 + 在用门面数（引用计数）。"""
+    """Cache entry: instance + number of facades in use (reference count)."""
 
     __slots__ = ("instance", "refcount")
 
@@ -40,7 +40,7 @@ class MQClientManager:
         self._lock = threading.Lock()
         self._factory_table: Dict[str, _FactoryEntry] = {}
 
-    # ---------------- 查询 / 创建 ----------------
+    # ---------------- query / create ----------------
     def get_or_create_mq_client_instance(
             self, client_id: str,
             factory: Callable[[], "MQClientInstance"]) -> Tuple["MQClientInstance", bool]:
@@ -59,12 +59,13 @@ class MQClientManager:
             logger.info("Created new MQClientInstance for clientId: %s", client_id)
             return instance, True
 
-    # ---------------- 引用计数 ----------------
+    # ---------------- reference counting ----------------
     def register_client(self, client_id: str, instance: "MQClientInstance") -> None:
-        """门面 start() 时调用：在用计数 +1。
+        """Called when a facade's start() runs: increments the in-use count by 1.
 
-        未经 ``get_or_create_mq_client_instance`` 的实例（测试替身 / 旧调用方直接
-        构造）也照常登记，保证 unregister 的计数平衡。
+        Instances not created via ``get_or_create_mq_client_instance`` (test doubles / instances
+        directly constructed by old callers) are still registered normally, keeping the unregister
+        count balanced.
         """
         with self._lock:
             entry = self._factory_table.get(client_id)
@@ -74,18 +75,20 @@ class MQClientManager:
             entry.refcount += 1
 
     def unregister_client(self, client_id: str, instance: "MQClientInstance") -> None:
-        """门面 shutdown() 时调用：计数 -1；归零才真正关闭。
+        """Called when a facade's shutdown() runs: decrements the count by 1; only a zero count truly closes it.
 
-        归零时先摘表再在锁外 ``shutdown()``——摘表后其他门面的
-        ``get_or_create_mq_client_instance`` 自然会建新实例，不会拿到半死的旧实例。
-        实例不在表中（测试替身 / 已被摘除的旧实例）时保持门面旧的 shutdown 语义：
-        直接关它，调用方无需分辨。
+        On zeroing, the entry is removed from the table first, then ``shutdown()`` runs outside the
+        lock -- after removal, other facades' ``get_or_create_mq_client_instance`` naturally build a
+        fresh instance and won't pick up a half-dead old one. When the instance is not in the table
+        (test double / already-removed old instance), keep the facade's old shutdown semantics: just
+        close it; the caller need not distinguish.
         """
         with self._lock:
             entry = self._factory_table.get(client_id)
             if entry is None or entry.instance is not instance:
-                # 不是本 manager 缓存里的那份实例（测试替身 / 已被顶替或摘除的旧实例）：
-                # 不动缓存里可能存在的其他条目，只按旧语义直接关调用方手里的实例。
+                # not the instance held in this manager's cache (test double / already-replaced or
+                # removed old instance): do not touch other entries that may exist in the cache; just
+                # close the instance the caller holds, following the old semantics.
                 do_shutdown = True
             else:
                 entry.refcount -= 1
@@ -109,21 +112,22 @@ class MQClientManager:
                 return
             del self._factory_table[client_id]
 
-    # ---------------- 观测 / 测试 ----------------
+    # ---------------- observation / testing ----------------
     def get_client_factory(self, client_id: str) -> Optional["MQClientInstance"]:
         with self._lock:
             entry = self._factory_table.get(client_id)
             return entry.instance if entry is not None else None
 
     def refcount_of(self, client_id: str) -> int:
-        """该 clientId 当前的在用计数（观测 / 单测用）。"""
+        """Current in-use count for this clientId (for observation / unit tests)."""
         with self._lock:
             entry = self._factory_table.get(client_id)
             return entry.refcount if entry is not None else 0
 
     def reset(self) -> None:
-        """清空缓存（测试隔离用）。只摘表、不 shutdown——与旧行为一致，
-        泄漏的实例交由 GC / 进程退出回收，不引入新的关闭副作用。"""
+        """Clear the cache (for test isolation). Only remove from the table, don't shutdown -- consistent
+        with the old behavior; leaked instances are reclaimed by GC / process exit, introducing no new
+        shutdown side effects."""
         with self._lock:
             self._factory_table.clear()
 

@@ -9,17 +9,21 @@ use RocketMQ\Remoting\Protocol\RemotingCommand;
 use RocketMQ\Remoting\Protocol\RequestType;
 
 /**
- * 请求/响应钩子：doBeforeRequest 在发包前改请求，doAfterResponse 在收包后看结果。
+ * Request/response hooks: doBeforeRequest mutates the request before it is sent, doAfterResponse
+ * inspects the result after the reply arrives.
  *
- * AclClientRPCHook：基于 accessKey/secretKey 计算签名并注入 extFields
- * （AccessKey / Signature / SecurityToken）。签名算法必须与 broker 验签逐字节相同：
+ * AclClientRPCHook: computes the signature from accessKey/secretKey and injects extFields
+ * (AccessKey / Signature / SecurityToken). The signature algorithm must be byte-for-byte
+ * identical to the broker's verification:
  *
- * 签名内容：按 key 字典序取 extFields 的**全部** value（排除 Signature 键自身；
- * 只有 value，不带 key、不带 `=`/`&` 之类分隔符）按 UTF-8 拼接，再拼上 body 原始字节。
- * 签名值：标准 Base64( HMAC-SHA1(key = secretKey, data = 上述内容) )。
+ * Signed content: take the **full** set of extFields values in key lexicographic order
+ * (excluding the Signature key itself; values only — no key, no separators like `=`/`&`),
+ * concatenate them as UTF-8, then append the raw body bytes.
+ * Signature value: standard Base64( HMAC-SHA1(key = secretKey, data = the content above) ).
  *
- * 注意两处顺序：AccessKey / SecurityToken 必须在算 content **之前**写入 extFields
- * （它们参与签名）；Signature 最后写入（它自己不参与签名）。
+ * Note two ordering points: AccessKey / SecurityToken must be written into extFields **before**
+ * computing the content (they take part in the signature); Signature is written last (it does
+ * not sign itself).
  */
 class RPCHook
 {
@@ -32,7 +36,7 @@ class RPCHook
     }
 }
 
-/** ACL 会话凭证；三个常量就是线上 extFields 的键名，broker 按字面取。 */
+/** ACL session credentials; the three constants are the literal extFields key names the broker reads. */
 final class SessionCredentials
 {
     public const CHARSET = 'utf-8';
@@ -61,8 +65,9 @@ class AclClientRPCHook extends RPCHook
 
     public function doBeforeRequest(string $remoteAddr, RemotingCommand $request): void
     {
-        // 写入顺序不可调换：先写 AccessKey/SecurityToken（它们参与签名），
-        // 再算签名，最后写 Signature（自身不参与签名）。
+        // The write order cannot be swapped: write AccessKey/SecurityToken first (they take part
+        // in the signature), then compute the signature, and write Signature last (it does not
+        // sign itself).
         $request->addExtField(self::ACCESS_KEY, $this->credentials->accessKey);
         if ($this->credentials->securityToken !== '') {
             $request->addExtField(self::SECURITY_TOKEN, $this->credentials->securityToken);
@@ -72,10 +77,11 @@ class AclClientRPCHook extends RPCHook
     }
 
     /**
-     * 拼出待签名内容。
+     * Builds the content to be signed.
      *
-     * broker 验签时先把 custom header 的字段摊进 extFields，再按 key 字典序取全部
-     * value，所以这里也必须先 makeCustomHeaderToNet() 再排序，少摊或多摊都会算出不同签名。
+     * When the broker verifies the signature it first spreads the custom header fields into
+     * extFields, then takes all values in key lexicographic order, so here makeCustomHeaderToNet()
+     * must run before sorting too; spreading fewer or more fields yields a different signature.
      */
     public static function buildRequestContent(RemotingCommand $request): string
     {
@@ -83,7 +89,7 @@ class AclClientRPCHook extends RPCHook
         $fields = $request->extFields;
         $buf = '';
         $keys = array_keys($fields);
-        // 按字节序（codepoint）比较，与 broker 侧的 key 字典序一致
+        // Compare by byte order (codepoint), matching the broker-side key lexicographic order
         sort($keys, SORT_STRING);
         foreach ($keys as $key) {
             if ($key === SessionCredentials::SIGNATURE) {
@@ -102,7 +108,7 @@ class AclClientRPCHook extends RPCHook
         return $buf;
     }
 
-    /** HmacSHA1 + 标准 Base64（带 `=` 填充）；这两步的形状 broker 是按字面比的。 */
+    /** HmacSHA1 + standard Base64 (with `=` padding); the broker compares the shape of these two steps literally. */
     public static function calcSignature(string $secretKey, RemotingCommand $request): string
     {
         $data = self::buildRequestContent($request);
@@ -111,18 +117,20 @@ class AclClientRPCHook extends RPCHook
     }
 }
 
-/** 兼容旧名（最初写作 AclRPCHook）。 */
+/** Compatibility alias for the old name (originally written as AclRPCHook). */
 class AclRpcHook extends AclClientRPCHook
 {
 }
 
 /**
- * 给每个请求打上请求类型标记（extFields 键 `ReqT`，见 `MixAll::REQ_T`）。
+ * Stamps every request with a request-type marker (extFields key `ReqT`, see `MixAll::REQ_T`).
  *
- * 值固定为 `ReqT = "0"`（`RequestType` 目前只有 STREAM 一项，code 是 `(byte) 0`）。
+ * The value is always `ReqT = "0"` (`RequestType` currently has STREAM as its only entry, with
+ * code `(byte) 0`).
  *
- * ⚠ 注册顺序有意义：本钩子必须注册在用户钩子（通常是 ACL 签名钩子）**之前**，
- * 这样 ReqT 才会被算进签名内容；装反了 broker 验签时会多出一个未签名的字段，直接拒签。
+ * WARNING: registration order matters. This hook must be registered **before** user hooks
+ * (usually the ACL signing hook) so that ReqT is included in the signed content; installed the
+ * other way around, the broker verification sees one extra unsigned field and rejects outright.
  */
 final class StreamTypeRPCHook extends RPCHook
 {
@@ -133,45 +141,54 @@ final class StreamTypeRPCHook extends RPCHook
 }
 
 /**
- * 5.x 服务端命名空间钩子：`namespaceV2` 非空时给请求加**两个**扩展头
+ * 5.x server-side namespace hook: when `namespaceV2` is non-empty, adds **two** extension
+ * headers to the request
  *
  *     nsd = "true"、ns = <namespaceV2>
  *
- * （键名常量见 `MixAll::RPC_REQUEST_HEADER_NAMESPACED_FIELD` / `..._NAMESPACE_FIELD`）。
- * `doAfterResponse` 不覆写——基类已是空实现。
+ * (key constants see `MixAll::RPC_REQUEST_HEADER_NAMESPACED_FIELD` / `..._NAMESPACE_FIELD`).
+ * `doAfterResponse` does not override — the base class is already an empty implementation.
  *
- * 这是**服务端**命名空间机制：broker 按 `ns` 把请求解析到对应实例（serverless 实例 ID），
- * 客户端**不**改 topic/group 名；它和 `namespace` 字段（客户端自己拼 `namespace%` 前缀，
- * 见 `NamespaceUtil`）是两套互不相干的机制。
+ * This is the **server-side** namespace mechanism: the broker resolves the request to the
+ * corresponding instance (the serverless instance ID) by `ns`, and the client does **not**
+ * rewrite topic/group names; it is unrelated to the `namespace` field (where the client itself
+ * prepends the `namespace%` prefix, see `NamespaceUtil`) — two independent mechanisms.
  *
- * ⚠ 注册顺序是语义而不是风格：本端口把它排在钩子链**最前**
- * （Namespace → Stream → 用户钩子(ACL 签名) → DynamicalExtField，装链处见
- * `MQClientInstance`），所以 `nsd`/`ns` 必然在算签名**之前**写进 extFields、被签名覆盖。
- * 装反了签名照样「看着合法」，但开鉴权的 broker 验签时会多出两个没签过的字段直接拒掉请求。
+ * WARNING: registration order is semantics, not style. This port puts it at the **front** of the
+ * hook chain (Namespace -> Stream -> user hook (ACL signing) -> DynamicalExtField; chain
+ * assembly in `MQClientInstance`), so `nsd`/`ns` are necessarily written into extFields and
+ * covered by the signature **before** signing.
+ * Reversed, the signature still "looks valid", but a broker with authentication enabled sees
+ * two extra unsigned fields and rejects the request outright.
  *
- * 取值用「闭包」而不是「构造时快照」：每笔请求实时读 namespaceV2，配置改了要能跟着走，
- * 故这里接受 `string`（固定值）或 `callable`（每笔请求调一次）。
- * 另外**空值也要注册**本钩子（注册无门槛），空判在钩子内部：
- * `namespaceV2` 为空时一个字段都不写——尤其**不能**把 extFields 初始化成空 map，
- * 「没配命名空间时 extFields 保持没被碰过」是测试钉住的行为。
+ * The value uses a "closure" instead of a constructor-time snapshot: namespaceV2 is read live
+ * per request so config changes are followed; hence this accepts a `string` (fixed value) or a
+ * `callable` (invoked once per request).
+ * Also, this hook must be registered even for **empty values** (registration is unconditional);
+ * the emptiness check lives inside the hook:
+ * when `namespaceV2` is empty, no field is written at all — in particular extFields must
+ * **not** be initialized to an empty map; "extFields stays untouched when no namespace is
+ * configured" is behavior pinned by tests.
  */
 final class NamespaceRpcHook extends RPCHook
 {
-    /** @var \Closure(): string 每笔请求实时取 namespaceV2，不存快照 */
+    /** @var \Closure(): string reads namespaceV2 live per request, no snapshot kept */
     private \Closure $namespaceV2;
 
     public function __construct(string|callable|null $namespaceV2 = '')
     {
-        // ⚠ 判序：字符串先于 callable。PHP 里 `is_callable('trim')` 为真，若先判 callable，
-        // 一个恰好与函数同名的命名空间值会被当成取值函数（每笔请求去 trim 一遍命名空间）。
+        // WARNING: check order — string before callable. In PHP `is_callable('trim')` is true;
+        // checking callable first would misread a namespace value that happens to share a name
+        // with a function as a getter (trimming the namespace on every request).
         if (is_string($namespaceV2)) {
             $fixed = $namespaceV2;
             $this->namespaceV2 = static function () use ($fixed): string {
                 return $fixed;
             };
         } elseif ($namespaceV2 === null) {
-            // null 表示未配置命名空间。
-            // 不能把 null 交给 Closure::fromCallable（'' 会被当函数名，直接 fatal）。
+            // null means no namespace is configured.
+            // Do not hand null to Closure::fromCallable ('' would be treated as a function name
+            // and fatal outright).
             $this->namespaceV2 = static function (): string {
                 return '';
             };
@@ -180,7 +197,7 @@ final class NamespaceRpcHook extends RPCHook
         }
     }
 
-    /** 本次请求实际生效的 namespaceV2（空串 = 未配命名空间）。 */
+    /** The namespaceV2 actually in effect for this request (empty string = no namespace configured). */
     public function namespaceV2Value(): string
     {
         return (string) ($this->namespaceV2)();
@@ -188,7 +205,8 @@ final class NamespaceRpcHook extends RPCHook
 
     public function doBeforeRequest(string $remoteAddr, RemotingCommand $request): void
     {
-        // 判空只认空串，不 trim：全空格的命名空间值仍按有效值上报。
+        // The emptiness check only accepts an empty string, no trimming: a whitespace-only
+        // namespace value is still reported as a valid value.
         $namespaceV2 = (string) ($this->namespaceV2)();
         if ($namespaceV2 === '') {
             return;

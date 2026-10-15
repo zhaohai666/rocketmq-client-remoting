@@ -1,8 +1,8 @@
-// 两个关键点（错了真机就不通）：
-// 1. 应答消息必须带 MSG_TYPE == "reply"，发送时据此把请求码从 SEND_MESSAGE_V2(310)
-//    换成 SEND_REPLY_MESSAGE_V2(325)；broker 的 ReplyMessageProcessor 只在 324/325 注册。
-// 2. REPLY_TO_CLIENT 是请求方的 clientId，broker 靠它在 producerManager 里反查 channel
-//    才能把应答推回——所以请求方必须先发过心跳（已注册为 producer）。
+// Two key points (get them wrong and it won't work on a real cluster):
+// 1. The reply message must carry MSG_TYPE == "reply"; at send time this switches the request code from SEND_MESSAGE_V2(310)
+//    to SEND_REPLY_MESSAGE_V2(325); the broker's ReplyMessageProcessor only registers on 324/325.
+// 2. REPLY_TO_CLIENT is the requester's clientId; the broker uses it to look up the channel in producerManager
+//    to push the reply back — so the requester must have sent a heartbeat first (already registered as a producer).
 using System.Globalization;
 using RocketMQ.Common;
 
@@ -35,10 +35,10 @@ public sealed class RequestResponseFuture
 
     public Message? ResponseMsg { get; private set; }
 
-    /// <summary>发送是否成功（失败路径置 false，用于区分超时 vs 发送失败）。</summary>
+    /// <summary>Whether the send succeeded (the failure path sets it to false, to distinguish timeout vs send failure).</summary>
     public bool SendRequestOk { get; set; } = true;
 
-    /// <summary>发送失败时的底层异常（SendRequestOk==false 时由调用方设置）。</summary>
+    /// <summary>The underlying exception on send failure (set by the caller when SendRequestOk==false).</summary>
     public Exception? Cause { get; set; }
 
     private readonly ManualResetEventSlim _event = new(false);
@@ -55,7 +55,7 @@ public sealed class RequestResponseFuture
         BeginTimestamp = UtilAll.CurrentTimeMillis();
     }
 
-    // ---------- 等待 / 投递 ----------
+    // ---------- Wait / deliver ----------
 
     public Message? WaitResponseMessage(int timeoutMillis)
     {
@@ -137,7 +137,7 @@ public sealed class RequestFutureHolder
         }
     }
 
-    /// 返回被填充的 future；查不到（已超时/已移除）时返回 null，调用方据此只记日志。
+    /// Returns the filled future; when not found (already timed out / removed) returns null, and the caller only logs based on that.
     /// </summary>
     public RequestResponseFuture? PutResponse(string correlationId, Message? responseMsg)
     {
@@ -259,7 +259,7 @@ public sealed class RequestFutureHolder
     }
 }
 
-/// <summary>Request-Reply 模块级工具函数。</summary>
+/// <summary>Request-Reply module-level helper functions.</summary>
 public static class RequestReply
 {
     public static string CreateCorrelationId() => Guid.NewGuid().ToString();
@@ -295,7 +295,7 @@ public static class RequestReply
         return reply;
     }
 
-    /// <summary>MSG_TYPE == "reply" 的发送要走 SEND_REPLY_MESSAGE_V2(325)。大小写敏感。</summary>
+    /// <summary>Sends with MSG_TYPE == "reply" must go through SEND_REPLY_MESSAGE_V2(325). Case-sensitive.</summary>
     public static bool IsReplyMessage(Message msg) =>
         msg.GetProperty(MessageConst.PropertyMessageType) == MixAll.REPLY_MESSAGE_FLAG;
 }

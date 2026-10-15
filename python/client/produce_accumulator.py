@@ -9,7 +9,7 @@ from common.message import Message, MessageBatch, MessageQueue, is_wait_store_ms
 from common.message_client_id_setter import set_uniq_id
 from .send_result import SendResult
 
-if TYPE_CHECKING:  # pragma: no cover - 只为类型标注，避免循环导入
+if TYPE_CHECKING:  # pragma: no cover - only for type annotations, avoids circular import
     from .producer import DefaultMQProducer, SendCallback
 
 
@@ -71,7 +71,7 @@ class MessageAccumulation:
         self.aggregate_key = aggregate_key
         self.messages: List[Message] = []
         self.send_callbacks: List["SendCallback"] = []
-        # 同步 add 收集、异步 add 不收集（见模块头第 4 条）
+        # synchronous add collects, asynchronous add does not (see rule 4 in the module header)
         self.keys: Set[str] = set()
         self.closed = False
         self.closed_lock = threading.Lock()
@@ -81,18 +81,20 @@ class MessageAccumulation:
         self.count = 0
         self.create_time = _now_ms()
 
-    # ---------------- 阈值 ----------------
+    # ---------------- thresholds ----------------
     def ready_to_send(self) -> bool:
         pass
         if self.messages_size > self._owner.hold_size:
             return True
         return _now_ms() >= self.create_time + self._owner.hold_ms
 
-    # ---------------- 加入 ----------------
+    # ---------------- add ----------------
     def add(self, msg: Message) -> int:
-        """同步加入；返回本条消息在本批里的下标，``-1`` 表示本批已关闭（调用方需重取）。
+        """Synchronous add; returns this message's index in the batch, ``-1`` means the batch is already
+        closed (caller must re-fetch).
 
-        返回前保证本批**已经发出去**（阻塞等待），因此 ``send_results[index]`` 一定可用。
+        Before returning, guarantees the batch has **already been sent** (blocks and waits), so
+        ``send_results[index]`` is guaranteed to be available.
         """
         with self.closed_lock:
             if self.closed:
@@ -116,7 +118,7 @@ class MessageAccumulation:
             return ret
 
     def add_async(self, msg: Message, send_callback: "SendCallback") -> bool:
-        """异步加入；``False`` 表示本批已关闭（调用方需重取）。"""
+        """Asynchronous add; ``False`` means the batch is already closed (caller must re-fetch)."""
         with self.closed_lock:
             if self.closed:
                 return False
@@ -137,13 +139,13 @@ class MessageAccumulation:
                 return
             self.cond.notify_all()
 
-    # ---------------- 组装 / 拆分 ----------------
+    # ---------------- assemble / split ----------------
     def _batch(self) -> MessageBatch:
         pass
         batch = MessageBatch(list(self.messages))
         batch.set_topic(self.aggregate_key.topic)
         batch.set_wait_store_msg_ok(self.aggregate_key.wait_store_msg_ok)
-        # 无条件写（空集合即 KEYS=""，见模块头第 5 条）
+        # write unconditionally (an empty set means KEYS="", see rule 5 in the module header)
         batch.set_keys(" ".join(self.keys))
         if self.aggregate_key.tag is not None:
             batch.set_tags(self.aggregate_key.tag)
@@ -171,7 +173,7 @@ class MessageAccumulation:
             for i in range(self.count):
                 self.send_results[i] = send_result
 
-    # ---------------- 发送 ----------------
+    # ---------------- send ----------------
     def _send_sync(self) -> None:
         pass
         with self.closed_lock:
@@ -257,7 +259,7 @@ class _GuardService:
         if thread is not None and thread.is_alive():
             thread.join(timeout=5.0)
 
-    def _run(self) -> None:  # pragma: no cover - 线程体，靠测试间接覆盖
+    def _run(self) -> None:  # pragma: no cover - thread body, indirectly covered by tests
         while not self._stopped.is_set():
             try:
                 self.do_work()
@@ -327,9 +329,9 @@ class ProduceAccumulator:
         self._guard_sync = _GuardForSyncSend(self)
         self._guard_async = _GuardForAsyncSend(self)
 
-    # ---------------- 生命周期 ----------------
-    # 幂等且可重复：两个守卫各自管自己的线程（见 _GuardService 的说明），
-    # 所以 start→shutdown→start（生产者重启）不会撞 "threads can only be started once"。
+    # ---------------- lifecycle ----------------
+    # idempotent and repeatable: the two guards each manage their own thread (see _GuardService's note),
+    # so start->shutdown->start (producer restart) won't hit "threads can only be started once".
     def start(self) -> None:
         self._guard_sync.start()
         self._guard_async.start()
@@ -370,7 +372,7 @@ class ProduceAccumulator:
                 "totalBatchMaxBytes must bigger then 0, but get %d!" % total_hold_size)
         self.total_hold_size = total_hold_size
 
-    # ---------------- 全局字节闸门 ----------------
+    # ---------------- global byte gate ----------------
     def try_add_message(self, message: Message) -> bool:
         pass
         with self._hold_lock:
@@ -387,7 +389,7 @@ class ProduceAccumulator:
         with self._hold_lock:
             self._currently_hold_size -= size
 
-    # ---------------- 表操作 ----------------
+    # ---------------- table operations ----------------
     def sync_send_batches_snapshot(self) -> List[MessageAccumulation]:
         with self._table_lock:
             return list(self._sync_send_batches.values())
@@ -425,7 +427,7 @@ class ProduceAccumulator:
             batch = MessageAccumulation(key, producer, self)
             return self._async_send_batches.setdefault(key, batch)
 
-    # ---------------- 对外发送入口 ----------------
+    # ---------------- public send entry ----------------
     def send(self, msg: Message, producer: "DefaultMQProducer") -> SendResult:
         pass
         key = AggregateKey.of_message(msg)
@@ -433,7 +435,7 @@ class ProduceAccumulator:
             batch = self._get_or_create_sync_batch(key, producer)
             index = batch.add(msg)
             if index == -1:
-                # 本批在本次 add 之前就被别的线程关掉了：摘掉它，重取/新建一个再试
+                # the batch was closed by another thread before this add: drop it, re-fetch or create a new one and retry
                 self.remove_sync_batch(batch)
                 continue
             return batch.send_results[index]

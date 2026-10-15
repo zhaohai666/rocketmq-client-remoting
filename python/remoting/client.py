@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
-"""socket 长连接客户端。
+"""Long-lived socket client.
 
-提供：连接管理（惰性建连 + 复用）、invokeSync/invokeAsync/invokeOneway、
-opaque 映射回调分发、超时控制、连接状态探活、GO_AWAY 换连接重发、
-连接断开时立刻失败该连接上的在途请求（fail-fast）。
+Provides: connection management (lazy connect + reuse), invokeSync/invokeAsync/invokeOneway,
+opaque-keyed callback dispatch, timeout control, connection liveness probing, GO_AWAY
+reconnect-and-resend, and immediate failure of in-flight requests on a connection when that
+connection drops (fail-fast).
 
-不做空闲 name-server 连接的周期性回收（channelNotActiveInterval=60s 式扫描）：
-对端真断开时读线程立刻见到 EOF，惰性清理已覆盖真实场景。
+Idle name-server connections are not periodically swept (no channelNotActiveInterval=60s-style scan):
+when the peer really disconnects the reader thread sees EOF immediately, and lazy cleanup already
+covers the real scenario.
 """
 from __future__ import annotations
 
@@ -30,26 +32,29 @@ logger = get_logger()
 
 MAX_FRAME_LENGTH = 16 * 1024 * 1024
 
-# 读线程等待数据的轮询间隔。连接一直安静时，也要在这一秒内察觉到"要关我了"。
+# Poll interval for the reader thread waiting on data. Even when a connection stays quiet, "I should close" must be noticed within this second.
 _READ_POLL_SECONDS = 1.0
-# TLS close_notify 的等待上限：对端不回 close_notify 也不能把关闭路径挂死。
+# Upper bound for waiting on the TLS close_notify: a peer that never sends close_notify must not hang the close path.
 _TLS_SHUTDOWN_TIMEOUT_SECONDS = 2.0
-# shutdown() 等读线程退出的总预算（不是每个线程各等这么久）。
+# Total budget for shutdown() to wait for reader threads to exit (not this long per thread).
 _SHUTDOWN_JOIN_SECONDS = 5.0
 
 
-# 超时判定专用单调时钟：改系统时间（前进或回拨）都不应让在途请求提前超时或永不超时，
-# 因此超时账目一律走单调时钟而非墙上时钟。
+# Dedicated monotonic clock for timeout decisions: changing the system time (forward or back) must not
+# make in-flight requests time out early or never, so timeout accounting always uses the monotonic clock
+# rather than the wall clock.
 def _mono_millis() -> float:
     return time.monotonic() * 1000.0
 
 
 def _retry_request(request: RemotingCommand) -> RemotingCommand:
-    """GO_AWAY 重发用的请求副本（复制 code/自定义头/body/ext_fields，只换 opaque）。
+    """Request copy used for a GO_AWAY resend (copies code/custom header/body/ext_fields, only opaque changes).
 
-    必须是**新** opaque：旧的那条已经在途表里摘掉了，复用会让响应错配到别的请求。
-    ext_fields 按值复制——ACL 签名（AccessKey/Signature）就存在这里，重发要带原签名，
-    所以副本不能从 custom_header 重新推导（推导会丢掉签名那两项）。
+    It must be a **new** opaque: the old one has already been removed from the in-flight table, and
+    reusing it would mismatch the response to the wrong request.
+    ext_fields is copied by value — the ACL signature (AccessKey/Signature) lives there and the
+    resend must carry the original signature, so the copy must not be re-derived from custom_header
+    (re-deriving would drop those two signature fields).
     """
     retry = RemotingCommand(code=request.code, custom_header=request.custom_header)
     retry.language = request.language
@@ -64,19 +69,23 @@ def _retry_request(request: RemotingCommand) -> RemotingCommand:
 
 
 def _close_socket(sock: socket.socket) -> None:
-    """干净地关掉一条连接：TLS 先做握手级关闭（close_notify），再关底层套接字。
+    """Close a connection cleanly: for TLS do the handshake-level close (close_notify) first, then close the underlying socket.
 
-    少了 close_notify 会有两个在本机实测到的后果：
+    Omitting close_notify has two consequences observed locally:
 
-    1. 内核接收缓冲里还留着对端 TLS 1.3 的 NewSessionTicket 没被 SSL 层读走，
-       ``closesocket()`` 于是发 RST 而不是 FIN。这条 RST 会打到下一条复用同一
-       4 元组的新连接上——loopback 上"每轮新建 TLS 连接"实测约 25~30% 把第一个请求
-       静默吞掉，调用方只能等满 invoke 超时（明文与非 TLS 路径 0%）。补上 close_notify
-       后这个成因归零，但当时还残留约 3~5%，那一份是读线程起得太早，见 _write。
-    2. broker 侧只看到异常断连，正常下线与真掉线分不出来。
+    1. The kernel receive buffer still holds the peer's TLS 1.3 NewSessionTicket that the SSL layer
+       never read, so ``closesocket()`` sends RST instead of FIN. That RST hits the next new
+       connection reusing the same 4-tuple — on loopback, "a new TLS connection per round" was
+       measured to silently swallow the first request about 25~30% of the time, leaving callers to
+       wait out the full invoke timeout (plaintext and non-TLS paths: 0%). With close_notify added
+       this cause went to zero, though about 3~5% remained at the time, caused by the reader thread
+       starting too early; see _write.
+    2. On the broker side only an abnormal disconnect is visible; a normal shutdown is indistinguishable
+       from a real drop.
 
-    只对**已经不再被别的线程 recv/send** 的套接字调用：两个线程同时进 OpenSSL
-    会踩坏它的内部状态（实测直接段错误），所以关闭一律由该连接的读线程来做。
+    Only call it on a socket that is **no longer recv/send by another thread**: two threads entering
+    OpenSSL simultaneously corrupt its internal state (measured: outright segfault), so closing is
+    always done by that connection's reader thread.
     """
     if isinstance(sock, ssl.SSLSocket):
         try:
@@ -84,7 +93,7 @@ def _close_socket(sock: socket.socket) -> None:
         except (OSError, ValueError):
             pass
         try:
-            sock.unwrap()  # 发出 close_notify，并把对端那份读干净
+            sock.unwrap()  # send close_notify and drain the peer's copy
         except (OSError, ssl.SSLError, ValueError):
             pass
     try:
@@ -98,12 +107,12 @@ def _close_socket(sock: socket.socket) -> None:
 
 
 class _ResponseFuture:
-    """一次在途请求，记录回调、超时账目与实际写出的套接字。
+    """One in-flight request: records the callback, timeout accounting, and the socket actually written to.
 
-    回调契约（成功/失败二分）：
-    ``callback(response, error)`` —— 成功时 error 为 None，超时/失败时 response 为 None。
-    回调**恰好触发一次**：读线程与超时清理线程抢同一个 future，由 ``execute_invoke_callback``
-    里的 once 标志定胜负。
+    Callback contract (success/failure dichotomy):
+    ``callback(response, error)`` — on success error is None; on timeout/failure response is None.
+    The callback fires **exactly once**: the reader thread and the timeout sweeper race for the same
+    future, decided by the once flag in ``execute_invoke_callback``.
     """
 
     def __init__(self, opaque: int, timeout_millis: int, invoke_callback=None,
@@ -111,21 +120,23 @@ class _ResponseFuture:
         self.opaque = opaque
         self.timeout_millis = timeout_millis
         self.invoke_callback = invoke_callback
-        # 保留请求命令，供 do_after_response 钩子使用
+        # Keep the request command for the do_after_response hook
         self.request = request
-        # 超时账目（开始时间戳 + 超时预算）：单调时钟，不受改系统时间影响
+        # Timeout accounting (start timestamp + timeout budget): monotonic clock, unaffected by system time changes
         self.addr = addr
         self.begin_timestamp = _mono_millis()
         self.response: Optional[RemotingCommand] = None
         self.send_request_ok = False
-        # 请求真正写出去时所用的套接字。
-        # 连接断开时按**对象身份**认领在途请求：只比地址串会误伤——同地址可能已经换了一条
-        # 新连接（close_channel/GO_AWAY 重发就是这个形状），旧连接的读线程收尾时不能把
-        # 新连接上的请求一起判死。None 表示还没写出去，这条连接的 failFast 不该牵连它。
+        # The socket the request was actually written on.
+        # When a connection drops, in-flight requests are claimed by **object identity**: comparing only
+        # the address string would cause collateral damage — the same address may already have a new
+        # connection (exactly the shape of close_channel/GO_AWAY resend), and the old connection's reader
+        # thread must not kill requests on the new one too. None means not written out yet, so this
+        # connection's failFast must not implicate it.
         self.conn: Optional[socket.socket] = None
-        # 失败原因。同步等待方靠它区分"发送失败"与"超时"：
-        # 连接断开（请求已确定发不出去或写失败）报 RemotingSendRequestException，
-        # 只有等满预算仍无响应才报 RemotingTimeoutException。
+        # Failure cause. Synchronous waiters use it to tell "send failed" from "timeout":
+        # a dropped connection (request definitely not sent or write failed) reports RemotingSendRequestException;
+        # only waiting out the full budget with no response reports RemotingTimeoutException.
         self.cause: Optional[BaseException] = None
         self._done = threading.Event()
         self._lock = threading.Lock()
@@ -143,11 +154,11 @@ class _ResponseFuture:
         return self.response
 
     def is_timeout(self) -> bool:
-        # 严格大于才算超时：等于 deadline 那一刻还不算
+        # Strictly greater counts as timeout: the exact deadline moment does not
         return _mono_millis() - self.begin_timestamp > self.timeout_millis
 
     def execute_invoke_callback(self, error: Optional[BaseException] = None) -> bool:
-        """投递异步回调，最多一次。返回是否由本次调用真正投递。"""
+        """Deliver the async callback, at most once. Returns whether this call actually delivered it."""
         if self.invoke_callback is None:
             return False
         with self._callback_once:
@@ -158,20 +169,21 @@ class _ResponseFuture:
         try:
             self.invoke_callback(response, error)
         except Exception as e:
-            # 回调里抛出的异常不能带走读线程/清理线程，只记日志
+            # An exception raised inside the callback must not take down the reader/sweeper thread; just log it
             logger.warning("remoting: invoke callback raised: %s" % e)
         return True
 
     def fail_fast(self) -> bool:
-        """连接已断：把这条在途请求判为发送失败。
+        """Connection is dead: mark this in-flight request as a send failure.
 
-        四步缺一不可：置 ``send_request_ok=false``、``put_response(None)``、
-        ``execute_invoke_callback``、归还资源。第一步是**语义**关键——按
-        ``send_request_ok=false`` 报 ``RemotingSendRequestException``（而不是超时），
-        异步发送的重试分类就吃这个区别。
-        ``put_response(None)`` 唤醒的是同步等待方：没有它，发送明明已经失败调用方还要等满
-        invoke 超时。资源归还不存在于传输层（反压许可由 producer 的回调链归还，
-        见 ``client/producer.py`` 的 ``_release``），投递回调即触发归还。
+        All four steps are required: set ``send_request_ok=false``, ``put_response(None)``,
+        ``execute_invoke_callback``, and return resources. The first step is the **semantic** key —
+        with ``send_request_ok=false`` it reports ``RemotingSendRequestException`` (not a timeout),
+        and the async send's retry classification relies on that difference.
+        ``put_response(None)`` is what wakes the synchronous waiter: without it, a caller whose send
+        already failed would still wait out the full invoke timeout. Resource return does not exist at
+        the transport layer (back-pressure permits are returned by the producer's callback chain,
+        see ``_release`` in ``client/producer.py``); delivering the callback triggers the return.
         """
         self.send_request_ok = False
         self.cause = RemotingSendRequestException(self.addr, "connection closed")
@@ -187,19 +199,23 @@ class RemotingClient:
                  socks_proxy_config: Optional[SocksProxyConfig] = None):
         self.connect_timeout_millis = connect_timeout_millis
         self.invoke_timeout_millis = invoke_timeout_millis
-        # 收到 ResponseCode.GO_AWAY(1500) 时是否换一条连接重发一次（默认 **true**）。
+        # Whether to switch to another connection and resend once when
+        # ResponseCode.GO_AWAY(1500) arrives (default **true**).
         self.enable_reconnect_for_go_away = enable_reconnect_for_go_away
-        # TLS 开关。显式参数优先，否则读环境变量 ROCKETMQ_TLS_ENABLE（等价于服务端的
-        # tls.enable 系统属性）。
+        # TLS switch. An explicit argument wins, otherwise the ROCKETMQ_TLS_ENABLE
+        # environment variable is read (equivalent to the broker-side
+        # tls.enable system property).
         if tls_enable is None:
             tls_enable = os.environ.get("ROCKETMQ_TLS_ENABLE", "").strip().lower() in ("1", "true", "yes")
         self.tls_enable = bool(tls_enable)
-        # TLS 细项（证书路径族：caCert / clientCert / clientKey / serverName）。
-        #   caCert: CA 证书路径 —— 给出即**严格校验**（tls.test.mode.enable=false 口径）：
-        #           broker 证书必须链到该 CA 且主机名/SAN 匹配（默认用连接 host）；
-        #           不给 = test-mode（信任自签，CERT_NONE，历史行为）。
-        #   clientCert/clientKey: mTLS 客户端证书与私钥路径。
-        #   serverName: 主机名/SNI 覆盖（缺省用连接 host）。
+        # TLS details (certificate path family: caCert / clientCert / clientKey / serverName).
+        #   caCert: CA certificate path -- when given, **strict verification** is used
+        #           (the tls.test.mode.enable=false flavour): the broker certificate must
+        #           chain up to that CA and the hostname/SAN must match (the connect host
+        #           is used by default); when absent = test-mode (trust self-signed,
+        #           CERT_NONE, historical behaviour).
+        #   clientCert/clientKey: mTLS client certificate and private key paths.
+        #   serverName: hostname/SNI override (defaults to the connect host).
         self.tls_options: Dict[str, str] = dict(tls_options or {})
         self.socks_proxy_config = socks_proxy_config
         self._lock = threading.RLock()
@@ -207,23 +223,27 @@ class RemotingClient:
         self._sock_locks: Dict[str, threading.Lock] = {}
         self._response_table: Dict[int, _ResponseFuture] = {}
         self._response_lock = threading.Lock()
-        # 在途请求超时清理：定时扫描在途表，回收已过期的请求并投递失败回调。
-        # 缺了它，异步请求一旦收不到响应就永久悬挂：条目泄漏在表里，回调永不触发。
-        # 首次 invoke_async 才起线程，纯同步用法不留线程。
+        # In-flight request timeout sweeping: periodically scan the in-flight table,
+        # reclaim expired requests and deliver their failure callbacks.
+        # Without it an asynchronous request that never gets a response hangs forever:
+        # the entry leaks in the table and the callback never fires.
+        # The thread only starts on the first invoke_async, so purely synchronous
+        # usage leaves no thread behind.
         self._sweeper_lock = threading.Lock()
         self._sweeper_stop = threading.Event()
         self._sweeper_thread: Optional[threading.Thread] = None
         self._running = True
         self._closed = False
         self.rpc_hooks = []
-        # 每连接读线程
+        # Per-connection reader thread
         self._reader_threads: Dict[str, threading.Thread] = {}
-        # 每连接"该退了"标志：读线程靠它在不把自己阻塞死的前提下收尾并关掉套接字
+        # Per-connection "should exit" flag: the reader thread uses it to wind down and
+        # close the socket without blocking itself forever
         self._conn_stops: Dict[str, threading.Event] = {}
-        # broker 主动请求处理器：request_code -> handler(cmd, addr) -> None
+        # Broker-initiated request processors: request_code -> handler(cmd, addr) -> None
         self._processors: Dict[int, Callable] = {}
 
-    # ---------- 连接管理 ----------
+    # ---------- connection management ----------
     def _get_or_create_conn(self, addr: str) -> socket.socket:
         with self._lock:
             conn = self._conns.get(addr)
@@ -234,25 +254,27 @@ class RemotingClient:
             self._sock_locks[addr] = threading.Lock()
             stop = threading.Event()
             self._conn_stops[addr] = stop
-            # 明文连接立刻起读线程；TLS 连接等第一个请求写出去再起，
-            # 原因见 _write 里的说明。
+            # Plaintext connections spawn the reader thread right away; TLS connections
+            # wait until the first request has been written, see the notes in _write.
             if not isinstance(sock, ssl.SSLSocket):
                 self._spawn_reader(addr, sock, stop)
             return sock
 
     def _spawn_reader(self, addr: str, sock: socket.socket,
                       stop: threading.Event) -> None:
-        """起读线程。调用方必须持有 ``self._lock``。"""
+        """Start the reader thread. The caller must hold ``self._lock``."""
         t = threading.Thread(target=self._read_loop, args=(addr, sock, stop), daemon=True,
                              name="rmq-read-%s" % addr)
         t.start()
         self._reader_threads[addr] = t
 
     def _start_reader(self, addr: str) -> None:
-        """补起被延后的读线程；已经起了就是空操作。
+        """Start a deferred reader thread; a no-op if it is already running.
 
-        关连接和 shutdown 也走这里：套接字一律由该连接的读线程关（见 _close_socket），
-        所以「还没起读线程」的连接在被关闭前必须先把它起起来，否则没人关这条 fd。
+        Closing a connection and shutdown also go through here: the socket is always
+        closed by that connection's own reader thread (see _close_socket), so a
+        connection whose reader thread "has not started yet" must have it started
+        first, otherwise nobody closes that file descriptor.
         """
         with self._lock:
             if addr in self._reader_threads:
@@ -283,17 +305,21 @@ class RemotingClient:
             sock.close()
             raise RemotingConnectException("%s (socks proxy: %s)" % (addr, e))
         if self.tls_enable:
-            # TLS 包住整个流，在任何 RocketMQ 帧之前完成握手。test-mode（broker 侧
-            # tls.test.mode.enable 默认 true）= 信任
-            # broker 的自签证书、不校验主机名、不带客户端证书（PERMISSIVE broker 即配即通）。
-            # tls_options['caCert'] 给出则走**严格校验**：证书链必须到该 CA、主机名/SAN
-            # 必须匹配（PROTOCOL_TLS_CLIENT 默认 check_hostname=True）。
+            # TLS wraps the whole stream and completes the handshake before any RocketMQ
+            # frame. test-mode (broker-side tls.test.mode.enable defaults to
+            # true) = trust the broker's self-signed certificate, do not verify the
+            # hostname and present no client certificate (a PERMISSIVE broker works
+            # out of the box).
+            # When tls_options['caCert'] is given, **strict verification** is used:
+            # the certificate chain must reach that CA and the hostname/SAN must
+            # match (PROTOCOL_TLS_CLIENT defaults to check_hostname=True).
             try:
                 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
                 ca_cert = self.tls_options.get("caCert")
                 client_cert = self.tls_options.get("clientCert")
                 if client_cert:
-                    # mTLS：test-mode 也允许带客户端证书（服务端要求时必须能出示）
+                    # mTLS: test-mode also allows a client certificate (it must be presentable
+                    # whenever the server demands one)
                     ctx.load_cert_chain(certfile=client_cert,
                                         keyfile=self.tls_options.get("clientKey"))
                 if ca_cert:
@@ -328,7 +354,7 @@ class RemotingClient:
         try:
             r, _, _ = select.select([sock], [], [], 0)
             if r:
-                # 有可读数据可能是响应也可能是对端关闭；尝试 peername 判断
+                # Readable data may be a response or a peer close; try peername to tell
                 try:
                     sock.getpeername()
                     return True
@@ -339,12 +365,16 @@ class RemotingClient:
             return False
 
     def close_channel(self, addr: str) -> None:
-        """摘掉到 addr 的连接：先从连接表移除，再关闭。
+        """Drop the connection to addr: remove it from the connection table first, then
+        close it.
 
-        真正关套接字的是该连接的读线程：这里只置停止标志并等它退出。
-        在调用方线程上直接关 SSLSocket 不安全——读线程可能正阻塞在同一条 socket 的
-        recv 里，两个线程同时进 OpenSSL 会踩坏它的内部状态（实测段错误）。
-        读线程还没起的 TLS 连接（见 _write）先把它补起来，否则这条 fd 没人关。
+        The socket itself is closed by that connection's reader thread: here we only
+        set the stop flag and wait for the thread to exit. Closing an SSLSocket
+        directly on the calling thread is unsafe -- the reader thread may be blocked
+        in recv on the very same socket, and two threads entering OpenSSL at once
+        corrupt its internal state (observed segfault). A TLS connection whose reader
+        thread has not started yet (see _write) gets its reader started first,
+        otherwise nobody closes that file descriptor.
         """
         self._start_reader(addr)
         with self._lock:
@@ -353,8 +383,9 @@ class RemotingClient:
             thread = self._reader_threads.pop(addr, None)
         if stop is not None:
             stop.set()
-        # 写响应失败时 close_channel 可能跑在读线程自己身上（broker 主动请求的回应路径），
-        # 这时不能 join 自己，交给它自己的循环收尾。
+        # When writing the response fails, close_channel may run on the reader thread
+        # itself (the reply path for broker-initiated requests); in that case we must
+        # not join ourselves, so let its own loop wind down.
         if (thread is not None and thread.is_alive()
                 and thread is not threading.current_thread()):
             thread.join(timeout=2 * _READ_POLL_SECONDS + _TLS_SHUTDOWN_TIMEOUT_SECONDS)
@@ -369,14 +400,16 @@ class RemotingClient:
         except OSError:
             return False
 
-    # ---------- 读循环 ----------
+    # ---------- read loop ----------
     @staticmethod
     def _wait_readable(sock: socket.socket, stop: threading.Event) -> bool:
-        """等有可读数据，最多等 _READ_POLL_SECONDS；stop 置位或超时就返回 False。
+        """Wait for readable data, at most _READ_POLL_SECONDS; returns False when stop is
+        set or the wait times out.
 
-        TLS 还要先看 ``pending()``：OpenSSL 已经解出来、应用还没读走的记录不会让 fd
-        变可读，只看 select 就会把这些字节晾在那里——它们正是 closesocket 时发 RST
-        的诱因。
+        For TLS, ``pending()`` is checked first: records that OpenSSL has already
+        decrypted but the application has not read yet do not make the file
+        descriptor readable, so relying on select alone would leave those bytes
+        sitting there -- and they are exactly what triggers an RST on closesocket.
         """
         pending = getattr(sock, "pending", None)
         if callable(pending):
@@ -395,17 +428,19 @@ class RemotingClient:
             try:
                 readable, _, _ = select.select([sock], [], [], remaining)
             except (OSError, ValueError):
-                # select 出问题（fd 已被关掉等）交给 recv 去报，口径与不轮询时一致
+                # If select fails (the fd was already closed, etc.) let recv report it, the same
+                # behaviour as when no polling is used
                 return True
             if readable:
                 return True
 
     def _read_loop(self, addr: str, sock: socket.socket,
                    stop: Optional[threading.Event] = None) -> None:
-        """一条连接的读线程。
+        """The reader thread of one connection.
 
-        退出时由**本线程**关套接字：绕开读线程去关 SSLSocket，等于两个线程同时进
-        OpenSSL，会踩坏它的内部状态（实测直接把整个进程搞段错误）。
+        On exit **this thread** closes the socket: closing an SSLSocket behind the
+        reader thread's back means two threads entering OpenSSL at once, which
+        corrupts its internal state (observed to segfault the whole process).
         """
         stop = stop if stop is not None else threading.Event()
         buf = bytearray()
@@ -442,7 +477,8 @@ class RemotingClient:
                     self._reader_threads.pop(addr, None)
                     self._conn_stops.pop(addr, None)
             _close_socket(sock)
-            # 对端再也不会回这些请求了：立刻判死，别让调用方等满超时（fail-fast）
+            # The peer will never answer these requests again: declare them dead right away
+            # instead of making the caller wait out the full timeout (fail-fast)
             self._fail_fast(addr, sock)
 
     def _dispatch(self, frame: bytes, addr: str) -> None:
@@ -459,22 +495,27 @@ class RemotingClient:
                 self._apply_after_response_hooks(addr, future.request, cmd)
                 future.execute_invoke_callback()
             return
-        # 非响应命令：broker 主动发起的请求（如 CHECK_TRANSACTION_STATE=39）。
-        # 这类请求的 opaque 由 broker 生成，不会出现在本地在途表里，按主动请求处理。
+        # Non-response command: a request initiated by the broker (such as
+        # CHECK_TRANSACTION_STATE=39). The opaque of such a request is generated by
+        # the broker and never appears in the local in-flight table, so treat it as
+        # a broker-initiated request.
         future = None
         with self._response_lock:
             future = self._response_table.pop(cmd.opaque, None)
         if future is not None:
-            # 异常兜底：本应是对端响应却没带响应标志
+            # Fallback for the odd case: it should have been a response from the peer
+            # but carried no response flag
             future.put_response(cmd)
             self._apply_after_response_hooks(addr, future.request, cmd)
             future.execute_invoke_callback()
             return
         handler = self._processors.get(cmd.code)
         if handler is not None:
-            # 处理器**可以**返回一个响应命令。需要返回的典型是 PUSH_REPLY_MESSAGE_TO_CLIENT(326)：
-            # broker 用 invokeSync 推应答，客户端不回响应它那边就会等到超时。
-            # 事务回查 39 由 broker 用 oneway 发出，处理器返回 None 即可。
+            # The handler **may** return a response command. The typical case that needs one
+            # is PUSH_REPLY_MESSAGE_TO_CLIENT(326): the broker pushes its reply with
+            # invokeSync, and without a response the client side would wait until it
+            # times out. Transaction check 39 is sent by the broker as oneway, so the
+            # handler may just return None.
             response = None
             try:
                 response = handler(cmd, addr)
@@ -491,37 +532,44 @@ class RemotingClient:
 
     def register_processor(self, request_code: int,
                            handler: Callable[["RemotingCommand", str], Optional[RemotingCommand]]) -> None:
-        """注册 broker 主动请求处理器（按 RequestCode 分发表）。
+        """Register a processor for broker-initiated requests (a dispatch table keyed by
+        RequestCode).
 
-        handler 签名 ``handler(cmd, addr) -> Optional[RemotingCommand]``：``cmd`` 是解码后的
-        RemotingCommand（含 ext_fields / body），``addr`` 是对端（broker）地址；
-        **返回非 None 就会把该命令作为响应写回**（opaque 由框架填成请求的 opaque），
-        返回 None 表示不需要响应（oneway 请求，如事务回查 CHECK_TRANSACTION_STATE(39)）。
+        The handler signature is ``handler(cmd, addr) -> Optional[RemotingCommand]``:
+        ``cmd`` is the decoded RemotingCommand (with ext_fields / body), ``addr`` is
+        the peer (broker) address. **Returning a non-None value writes that command
+        back as the response** (the framework fills in the request's opaque); returning
+        None means no response is needed (a oneway request such as the transaction
+        check CHECK_TRANSACTION_STATE(39)).
 
-        注意：仅当命令是「请求类型」且不在本地在途响应表里时才派发到这里，
-        不会破坏现有 invokeSync/invokeAsync 的响应分发。
+        Note: it is dispatched here only when the command is of "request type" and is
+        not present in the local in-flight response table, so it does not interfere
+        with the existing invokeSync/invokeAsync response dispatch.
         """
         self._processors[request_code] = handler
 
     def unregister_processor(self, request_code: int) -> None:
         self._processors.pop(request_code, None)
 
-    # ---------- RPC 钩子 ----------
+    # ---------- RPC hooks ----------
     def _apply_before_request_hooks(self, addr: str, cmd: RemotingCommand) -> None:
-        """发送前依次执行 RPC 钩子。
+        """Run the RPC hooks in order before sending.
 
-        **必须在 cmd.encode() 之前调用**：ACL 钩子要把 AccessKey/Signature 写进
-        ext_fields，而 Signature 覆盖的是 makeCustomHeaderToNet() 之后的完整
-        ext_fields + body —— 即真正会上线的那份内容。encode() 之后再注入就晚了。
+        **Must be called before cmd.encode()**: the ACL hook writes
+        AccessKey/Signature into ext_fields, and the Signature covers the complete
+        ext_fields + body content produced after makeCustomHeaderToNet() -- that is,
+        exactly the bytes that will go on the wire. Injecting after encode() is too
+        late.
         """
         for hook in tuple(self.rpc_hooks):
             hook.do_before_request(addr, cmd)
 
     def _apply_after_response_hooks(self, addr: str, request: Optional[RemotingCommand],
                                     response: Optional[RemotingCommand]) -> None:
-        """收到响应后依次执行 RPC 钩子。
+        """Run the RPC hooks in order after a response arrives.
 
-        无钩子时零开销；request 缺失（理论上不会）则跳过，不影响响应分发。
+        Zero overhead when no hook is registered; if the request is missing (theoretically
+        impossible) the hooks are skipped and response dispatch is unaffected.
         """
         if not self.rpc_hooks or request is None:
             return
@@ -531,19 +579,21 @@ class RemotingClient:
             except Exception:
                 pass
 
-    # ---------- 请求发送 ----------
+    # ---------- request sending ----------
     def _send(self, addr: str, cmd: RemotingCommand) -> socket.socket:
         self._apply_before_request_hooks(addr, cmd)
         return self._write(addr, cmd)
 
     def _write_response(self, addr: str, cmd: RemotingCommand) -> None:
-        """把响应写回 broker。
+        """Write a response back to the broker.
 
-        **不能**走 ``_send``：``_send`` 会执行 RPC 钩子（ACL 会给请求加签），
-        而响应报文不需要也不能带签名（RPC 钩子只在
-        invokeSync/invokeAsync/invokeOneway 三条主动发起路径上调用）。
-        写失败只记日志：这条响应对应 broker 侧的 ``Broker2Client.callClient`` 超时，
-        不该让读线程因为这个异常退出（读线程一死，同连接上所有在途请求全丢）。
+        It **must not** go through ``_send``: ``_send`` runs the RPC hooks (ACL signs
+        requests), while a response message neither needs nor may carry a signature
+        (the RPC hooks only run on the three caller-initiated paths
+        invokeSync/invokeAsync/invokeOneway). A failed write is only logged: this
+        response corresponds to a ``Broker2Client.callClient`` timeout on the broker
+        side, and it must not kill the reader thread with that exception (one dead
+        reader thread loses every in-flight request on the same connection).
         """
         try:
             self._write(addr, cmd)
@@ -552,19 +602,28 @@ class RemotingClient:
                            cmd.code, addr, exc_info=True)
 
     def _write(self, addr: str, cmd: RemotingCommand) -> socket.socket:
-        """把命令写到连接上，并保证这条连接的读线程已经起起来；返回所用的套接字。
+        """Write the command to the connection and make sure that connection's reader thread
+        has been started; returns the socket used.
 
-        返回值给在途请求记账用（``_ResponseFuture.conn``）：连接断开时只有真正写到这条
-        连接上的请求才该被它牵连。
+        The return value is for in-flight request bookkeeping
+        (``_ResponseFuture.conn``): when a connection breaks, only the requests that
+        were really written to that connection should be dragged down with it.
 
-        TLS 连接的读线程推迟到这里、第一个记录写出去之后才起：实测（macOS loopback，
-        对端是 CPython ``ssl``，每轮新建 TLS 连接）握手刚完成就读线程已经进过 OpenSSL 的
-        情况下，紧跟着的第一个请求记录有约 3~5% 根本没到对端 —— 对端的 TLS 读一直等到
-        超时，调用方只能等满 invoke 超时（明文连接 0%）。改成「先写第一个记录、再起读
-        线程」后同一场景 270 条新建 TLS 连接 0 次复现。对真集群（5.5.1 nameServer 与
-        broker 的 TLS 嗅探端口）各 60 轮两种时序都是 0 丢 —— broker 的 TLS 栈不把这个竞争
-        暴露出来，所以这条只能在本地 TLS 对端上守（``tests/test_tls_trace.py``），
-        真机侧由 ``verify_tls_live.py`` 守整链路。明文连接没有这个问题，仍然立刻起读线程。
+        For TLS connections the reader thread is deferred to here and started only
+        after the first record has been written: measurements (macOS loopback, peer is
+        CPython ``ssl``, a fresh TLS connection per round) showed that when the reader
+        thread enters OpenSSL right after the handshake completes, the immediately
+        following first request record is lost about 3~5% of the time -- the peer's TLS
+        read waits until it times out and the caller can only wait out the invoke
+        timeout (0% for plaintext connections). After switching to "write the first
+        record first, then start the reader thread", 270 freshly created TLS
+        connections in the same scenario reproduced it 0 times. Against a real cluster
+        (5.5.1 nameServer and the broker's TLS sniffing port) both orderings lost 0
+        messages over 60 rounds each -- the broker's TLS stack does not expose this
+        race, so it can only be guarded on a local TLS peer
+        (``tests/test_tls_trace.py``); on real machines ``verify_tls_live.py`` guards
+        the whole chain. Plaintext connections do not have this problem and still start
+        their reader thread immediately.
         """
         sock = self._get_or_create_conn(addr)
         data = cmd.encode()
@@ -582,7 +641,7 @@ class RemotingClient:
         return sock
 
     def invoke_sync(self, addr: str, request: RemotingCommand, timeout_millis: Optional[int] = None) -> RemotingCommand:
-        """同步 RPC，含 GO_AWAY 换连接重发。"""
+        """Synchronous RPC, including the GO_AWAY reconnect-and-resend path."""
         timeout = timeout_millis if timeout_millis is not None else self.invoke_timeout_millis
         started = _mono_millis()
         response = self._invoke_once(addr, request, timeout)
@@ -593,15 +652,19 @@ class RemotingClient:
 
     def _handle_go_away(self, addr: str, request: RemotingCommand, timeout: int,
                         started: float, response: RemotingCommand) -> RemotingCommand:
-        """GO_AWAY 的收口：开关关掉直接报错；否则换连接重发一次，第二次还是 GO_AWAY 就抛。
+        """The GO_AWAY decision point: when the switch is off it raises immediately;
+        otherwise it reconnects and resends once, and a second GO_AWAY raises.
 
-        单独抽出来是因为同步与异步两条路都要同一套判定，重发次数也必须一样（一次）。
+        Extracted on its own because both the synchronous and the asynchronous paths
+        need exactly the same decision, and the resend count must be identical too
+        (once).
         """
         if not self.enable_reconnect_for_go_away:
             raise RemotingSendRequestException(addr, "Receive GO_AWAY from channel %s" % addr)
         logger.info("remoting: receive GO_AWAY from %s, reconnect and retry once", addr)
         self.close_channel(addr)
-        # 重发只花剩余预算：从总 timeoutMillis 里扣掉已经耗用的时间。
+        # The resend only spends the remaining budget: the elapsed time is subtracted from
+        # the total timeoutMillis.
         spent = int(_mono_millis() - started)
         retry_timeout = max(1, timeout - spent)
         retry = _retry_request(request)
@@ -626,8 +689,10 @@ class RemotingClient:
         if response is None:
             with self._response_lock:
                 self._response_table.pop(request.opaque, None)
-            # 连接断掉时 _fail_fast 已经置好 cause 并唤醒了我：报"发送失败"，
-            # 而不是等满 timeout 再报超时。两条路的可重试性不一样（见 producer 的重试分类）。
+            # When the connection breaks, _fail_fast has already set the cause and woken us up:
+            # report "send failure" instead of waiting out the timeout and then
+            # reporting a timeout. The two paths differ in retriability (see the
+            # producer's failure classification).
             if future.cause is not None:
                 raise future.cause
             raise RemotingTimeoutException(addr, timeout)
@@ -636,19 +701,21 @@ class RemotingClient:
     def invoke_async(self, addr: str, request: RemotingCommand,
                      callback: Callable[[Optional[RemotingCommand], Optional[BaseException]], None],
                      timeout_millis: Optional[int] = None) -> None:
-        """异步调用：立即返回。回调**恰好触发一次**：
+        """Asynchronous call: returns immediately. The callback fires **exactly once**:
 
-        - 正常收到响应 -> ``callback(response, None)``
-        - 超过 timeout_millis 仍无响应 -> ``callback(None, RemotingTimeoutException)``
-          （由超时清理线程投递）
-        - 连接在响应之前断开 -> ``callback(None, RemotingSendRequestException)``
-          （由读线程收尾时投递；
-          不等超时清理线程，因为那一刻已经确定不会有任何响应了）
+        - a normal response arrives -> ``callback(response, None)``
+        - no response after timeout_millis -> ``callback(None, RemotingTimeoutException)``
+          (delivered by the timeout sweeping thread)
+        - the connection breaks before the response -> ``callback(None, RemotingSendRequestException)``
+          (delivered when the reader thread winds down; it does not wait for the
+          timeout sweeper, because at that point no response can possibly arrive any
+          more)
 
-        timeout_millis 为 None 时使用 invoke_timeout_millis。
+        invoke_timeout_millis is used when timeout_millis is None.
 
-        GO_AWAY 与同步路径同口径：换连接重发一次，第二次仍是 GO_AWAY 则回调报错
-        （同步与异步共用这段重发逻辑）。
+        GO_AWAY follows the same rule as the synchronous path: reconnect and resend
+        once, and if the second attempt is GO_AWAY too the callback reports the error
+        (the synchronous and asynchronous paths share this resend logic).
         """
         timeout = timeout_millis if timeout_millis is not None else self.invoke_timeout_millis
         self._invoke_async_once(addr, request, callback, timeout, _mono_millis())
@@ -660,8 +727,10 @@ class RemotingClient:
             if response is None or error is not None or response.code != ResponseCode.GO_AWAY:
                 callback(response, error)
                 return
-            # 重发要等一次完整的往返，而这里跑在该连接的读线程上：就地阻塞会把
-            # 同连接其它在途请求的投递一起拖住。GO_AWAY 是稀有事件，交给短命线程做。
+            # The resend needs a full round trip, and this code runs on that connection's
+            # reader thread: blocking here would also hold up delivery of every other
+            # in-flight request on the same connection. GO_AWAY is rare, so hand it to
+            # a short-lived thread.
             threading.Thread(
                 target=self._retry_after_go_away,
                 args=(addr, request, callback, timeout, started, response),
@@ -686,10 +755,10 @@ class RemotingClient:
                              response: RemotingCommand) -> None:
         try:
             callback(self._handle_go_away(addr, request, timeout, started, response), None)
-        except BaseException as retry_error:  # noqa: BLE001 - 回调契约：错误也只能走 error 参数
+        except BaseException as retry_error:  # noqa: BLE001 - callback contract: errors must also go through the error argument
             callback(None, retry_error)
 
-    # ---------- 在途请求超时清理 ----------
+    # ---------- in-flight request timeout sweeping ----------
     def _ensure_sweeper(self) -> None:
         with self._sweeper_lock:
             if self._sweeper_thread is not None and self._sweeper_thread.is_alive():
@@ -715,8 +784,9 @@ class RemotingClient:
                 logger.warning("remoting: response sweep failed: %s" % e)
 
     def _sweep_expired(self) -> None:
-        # 判定式：beginTimestamp + timeoutMillis + 1000 <= now。这 1s 宽限是给
-        # "响应已经在路上"留的余量——超时后 1s 内到达的响应仍按成功投递。
+        # Decision rule: beginTimestamp + timeoutMillis + 1000 <= now. That 1s grace is the
+        # margin left for "the response is already on its way" -- a response that
+        # arrives within 1s after the timeout is still delivered as a success.
         grace_millis = 1000.0
         now = _mono_millis()
         expired = []
@@ -727,32 +797,43 @@ class RemotingClient:
                     continue
                 if now - f.begin_timestamp <= f.timeout_millis + grace_millis:
                     continue
-                # pop 决定归属：与读线程同时摘同一个 opaque 时只有一方拿到非空值
+                # pop decides ownership: when the reader thread pops the same opaque at the same
+                # time only one side gets the non-None value
                 removed = self._response_table.pop(opaque, None)
                 if removed is not None:
                     expired.append((removed, opaque))
         for f, opaque in expired:
             error = RemotingTimeoutException(f.addr, f.timeout_millis)
-            # 回调必须在 _response_lock **之外**执行：回调里常常还要回到传输层或业务层，
-            # 持锁回调会和 shutdown 抢同一把锁，甚至自锁。
+            # The callback must run **outside** _response_lock: callbacks often reach
+            # back into the transport or business layers, and calling them while
+            # holding the lock races with shutdown for the same lock, or even
+            # self-deadlocks.
             f.execute_invoke_callback(error=error)
 
-    # ---------- 连接断开时立刻失败在途请求（fail-fast） ----------
+    # ---------- fail in-flight requests immediately when a connection breaks (fail-fast) ----------
     def _fail_fast(self, addr: str, sock: socket.socket) -> int:
-        """``sock`` 这条连接已经关了：把它名下还没响应的在途请求全部判为发送失败。
+        """The connection on ``sock`` is closed: declare every still-unanswered in-flight
+        request it owns as a send failure.
 
-        关连接的收尾必须紧接着做一次 fail-fast 扫描，因为这条连接上的请求
-        永远等不到响应了。少了这一步会错两件事，都不只是"慢一点"：
+        The teardown of a closed connection must be followed immediately by one
+        fail-fast scan, because requests on that connection will never get a response
+        any more. Without this step two things go wrong, and neither of them is merely
+        "a bit slower":
 
-        1. 同步调用方要等满 invoke 超时才发现连接早断了；异步回调更糟，要等
-           ``timeout + 1s``（那是清理线程的宽限口径）。
-        2. 报出来的是 ``RemotingTimeoutException``，而正确的应是
-           ``RemotingSendRequestException``。异步发送的重试分类按这两个类型分流
-           （``client/producer.py`` 的 ``_classify_async_failure``），错类型等于错语义。
+        1. A synchronous caller only notices the long-dead connection after waiting
+           out the full invoke timeout; an asynchronous callback is worse, it waits
+           ``timeout + 1s`` (that is the sweeper thread's grace rule).
+        2. What gets reported is ``RemotingTimeoutException``, whereas the correct one
+           is ``RemotingSendRequestException``. The retry classification of an
+           asynchronous send branches on these two types
+           (``_classify_async_failure`` in ``client/producer.py``), so the wrong type
+           means the wrong semantics.
 
-        按套接字**对象身份**认领，不按地址：地址相同但连接已经换新是常见形状
-        （GO_AWAY 换连接重发、写失败后的 close_channel），旧读线程收尾时不能误伤新连接。
-        返回被判死的请求数，只为日志和测试断言服务。
+        Requests are claimed by **object identity** of the socket, not by address: the
+        same address with a freshly replaced connection is a common shape (resending
+        after GO_AWAY, close_channel after a failed write), and the old reader thread
+        must not damage the new connection while winding down. Returns the number of
+        requests declared dead, which serves logging and test assertions only.
         """
         doomed = []
         with self._response_lock:
@@ -760,12 +841,14 @@ class RemotingClient:
                 f = self._response_table.get(opaque)
                 if f is None or f.conn is not sock:
                     continue
-                # pop 决定归属：与读线程/清理线程抢同一个 opaque 时只有一方拿到非空值
+                # pop decides ownership: when the reader thread / sweeper thread races for the same
+                # opaque only one side gets the non-None value
                 removed = self._response_table.pop(opaque, None)
                 if removed is not None:
                     doomed.append(removed)
         for f in doomed:
-            # 同样在 _response_lock 之外投递，理由见 _sweep_expired
+            # Also delivered outside _response_lock, for the same reason as in
+            # _sweep_expired
             f.fail_fast()
         if doomed:
             logger.warning("remoting: connection to %s closed, %d in-flight request(s) failed fast",
@@ -789,9 +872,11 @@ class RemotingClient:
     def shutdown(self) -> None:
         self._running = False
         self._closed = True
-        # 先停清理线程：它在别的线程上触发回调，必须早于关连接退出
+        # Stop the sweeper thread first: it fires callbacks on other threads, so it must
+        # exit before the connections are closed
         self._stop_sweeper()
-        # 读线程还没起的 TLS 连接（见 _write）补一个读线程来关它的套接字
+        # Give TLS connections whose reader thread has not started yet (see _write)
+        # a reader thread so that it can close their socket
         for addr in list(self._conn_stops):
             self._start_reader(addr)
         with self._lock:
@@ -801,7 +886,8 @@ class RemotingClient:
             self._conns.clear()
             self._conn_stops.clear()
             self._reader_threads.clear()
-        # 套接字由各连接自己的读线程关（TLS 要先送 close_notify），这里只等它们退完
+        # Each socket is closed by its own reader thread (TLS must send close_notify
+        # first), so here we only wait for them to exit
         for stop in stops:
             stop.set()
         deadline = time.monotonic() + _SHUTDOWN_JOIN_SECONDS

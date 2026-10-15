@@ -240,7 +240,8 @@ export class DefaultMQAdminExt {
     if (!this._started) return;
     this._started = false;
     if (this.client != null) {
-      // 归还给 manager：计数 -1，归零才真正 shutdown（停定时器、断连接）。
+      // Hand back to the manager: decrement the count; the real shutdown
+      // (stop timers, close connections) happens only when it hits zero.
       MQClientManager.getInstance().unregisterClient(this.client.clientId, this.client);
     }
     this.client = null;
@@ -415,9 +416,10 @@ export class DefaultMQAdminExt {
 
   // createAndUpdateTopicConfig sends UPDATE_AND_CREATE_TOPIC(17) to one addr.
   async createAndUpdateTopicConfig(addr: string, config: TopicConfig): Promise<void> {
-    // TopicConfig 的字段名是 topic（topicName 只是 toDict 的 JSON 键）——
-    // 读错字段 header 里 topic=undefined，broker 会回 "specified topic is
-    // blank"（真机静态主题腿抓出来的）。
+    // TopicConfig's field name is `topic` (topicName is only the JSON key of
+    // toDict) — reading the wrong field leaves topic=undefined in the header,
+    // and the broker answers "specified topic is blank" (caught on the
+    // real-machine static-topic leg).
     await this._createTopicInBroker(addr, this.createTopicKey, config.topic,
       config.readQueueNums, config.writeQueueNums, config.perm,
       config.topicSysFlag, config.topicFilterType || TopicFilterType.SINGLE_TAG,

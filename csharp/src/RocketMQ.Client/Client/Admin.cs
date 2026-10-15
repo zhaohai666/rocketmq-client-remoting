@@ -1,6 +1,7 @@
-// 覆盖：Topic 增删查/配置、Broker 集群信息与运行时信息/配置、NameServer KV 配置、
-// 订阅组管理、消费者/生产者连接、消费统计、offset 管理（含真实 broker 位点重置）、
-// 消息查询（key / uniqKey / msgId / ConsumeQueue）。
+// Coverage: topic CRUD/config, broker cluster info and runtime info/config, NameServer KV
+// config, subscription group management, consumer/producer connections, consume stats,
+// offset management (including real broker offset reset), and message queries
+// (key / uniqKey / msgId / ConsumeQueue).
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -40,7 +41,7 @@ public sealed class GroupForbidden
     public string Group { get; set; } = string.Empty;
     public bool Readable { get; set; }
 
-    /// <summary>解析失败返回 false（不抛异常）。</summary>
+    /// <summary>Returns false when decoding fails (does not throw).</summary>
     public static bool Decode(byte[] data, out GroupForbidden outValue)
     {
         outValue = new GroupForbidden();
@@ -54,7 +55,7 @@ public sealed class GroupForbidden
 
 public sealed class DefaultMQAdminExt
 {
-    // 对应 DefaultMQAdminExt.DEFAULT_TIMEOUT = 5000 * 3
+    // Corresponds to DefaultMQAdminExt.DEFAULT_TIMEOUT = 5000 * 3
     public const int DefaultTimeout = 5000 * 3;
 
     private string _instanceName;
@@ -71,7 +72,7 @@ public sealed class DefaultMQAdminExt
         _instanceName = instanceName;
     }
 
-    // ---------------------------------------------------------------- 配置与生命周期
+    // ---------------------------------------------------------------- Config and lifecycle
 
     public void SetNamesrvAddr(string addr)
     {
@@ -81,7 +82,7 @@ public sealed class DefaultMQAdminExt
         {
             int semi = addr.IndexOf(';', start);
             string piece = semi < 0 ? addr[start..] : addr[start..semi];
-            // 去首尾空白（Trim 覆盖空格、制表符等各类空白，从严处理）
+            // Trim leading/trailing whitespace (Trim covers spaces, tabs, etc. — strict)
             piece = piece.Trim();
             if (piece.Length > 0) _nameServerAddrs.Add(piece);
             if (semi < 0) break;
@@ -92,13 +93,13 @@ public sealed class DefaultMQAdminExt
     public void SetNameServerAddresses(IReadOnlyList<string> addrs) =>
         _nameServerAddrs = new List<string>(addrs);
 
-    /// <summary>运行期改 instanceName（不会重建 client）。</summary>
+    /// <summary>Change instanceName at runtime (does not rebuild the client).</summary>
     public void SetInstanceName(string name) => _instanceName = name;
 
-    /// <summary>instanceName 会被 Start() 就地改写，所以这里读的是启动后的实际值。</summary>
+    /// <summary>instanceName is rewritten in place by Start(), so this reads the actual post-start value.</summary>
     public string GetInstanceName() => _instanceName;
 
-    /// <summary>Start() 之后才有值（对应其他 facade 的 ClientId）。</summary>
+    /// <summary>Only available after Start() (corresponds to the other facades' ClientId).</summary>
     public string ClientId => _clientId;
 
     public string GetNamesrvAddr()
@@ -121,7 +122,7 @@ public sealed class DefaultMQAdminExt
         set => _unitName = value ?? string.Empty;
     }
 
-    /// <summary>true 时每笔请求带 <c>ReqT=0</c>、clientId 末尾多一段 <c>@STREAM</c>。</summary>
+    /// <summary>When true, every request carries <c>ReqT=0</c> and the clientId gets an extra <c>@STREAM</c> suffix.</summary>
     public bool EnableStreamRequestType
     {
         get => _enableStreamRequestType;
@@ -150,11 +151,11 @@ public sealed class DefaultMQAdminExt
 
     public void SetRpcHook(IRpcHook hook) => _rpcHook = hook;
 
-    /// <summary>便捷入口：用 accessKey/secretKey（可选 securityToken）构造 AclClientRPCHook。</summary>
+    /// <summary>Convenience entry: builds an AclClientRPCHook from accessKey/secretKey (optional securityToken).</summary>
     public void SetCredentials(string accessKey, string secretKey, string securityToken = "")
         => _rpcHook = new AclClientRPCHook(new SessionCredentials(accessKey, secretKey, securityToken));
 
-    // ACL 钩子，Start() 时绑定到 MQClientInstance 的传输层
+    // ACL hook, bound to the transport layer of the MQClientInstance on Start()
     private IRpcHook? _rpcHook;
     private string _unitName = string.Empty;
     private bool _enableStreamRequestType;
@@ -196,7 +197,8 @@ public sealed class DefaultMQAdminExt
         }
         catch
         {
-            // 起不来就把引用还回去：否则计数漏减，共享实例永远等不到归零收尾
+            // If startup fails, hand the reference back: otherwise the refcount
+            // misses a decrement and the shared instance never reaches zero.
             MQClientManager.Instance.UnregisterMQClient(_clientId, _mqClient);
             _mqClient = null;
             throw;
@@ -228,16 +230,16 @@ public sealed class DefaultMQAdminExt
         return _mqClient;
     }
 
-    /// <summary>VIP 通道开关（VipChannelEnabled）开启时把 broker 地址改写到 VIP 端口。
-    /// NameServer 调用不走这里——VIP 端口只在 broker 侧存在。</summary>
+    /// <summary>When the VIP channel switch (VipChannelEnabled) is on, rewrites broker addresses to the VIP port.
+    /// NameServer calls do not go through here — VIP ports only exist on the broker side.</summary>
     private string AddrForRpc(string addr) => MixAll.BrokerVipChannel(_vipChannelEnabled, addr);
 
     public MQClientInstance GetMQClientInstance() => RequireClient();
 
-    /// <summary>获取底层客户端实例（GetMQClientInstance 的别名）。</summary>
+    /// <summary>Gets the underlying client instance (alias of GetMQClientInstance).</summary>
     public MQClientInstance Client() => GetMQClientInstance();
 
-    // ---------------------------------------------------------------- 内部工具
+    // ---------------------------------------------------------------- Internal utilities
 
     private static string FirstBrokerAddr(MQClientInstance client)
     {
@@ -263,7 +265,7 @@ public sealed class DefaultMQAdminExt
 
     private static string I64Str(long v) => v.ToString(CultureInfo.InvariantCulture);
 
-    /// <summary>取响应 extFields 中的整数（缺失/空/非法返回 fallback）。</summary>
+    /// <summary>Reads an integer from the response extFields (missing/empty/invalid returns fallback).</summary>
     private static long ExtInt(RemotingCommand r, string key, long fallback)
     {
         if (r.ExtFields.TryGetValue(key, out string? v) && !string.IsNullOrEmpty(v))
@@ -276,13 +278,13 @@ public sealed class DefaultMQAdminExt
         return fallback;
     }
 
-    /// <summary>JsonValue 的等价文本（用于比较 DataVersion 是否变化）。</summary>
+    /// <summary>Equivalent text of a JsonValue (used to compare whether DataVersion changed).</summary>
     private static string DvText(JsonValue v) => v.IsNull ? "null" : v.Dump();
 
-    // ---------------------------------------------------------------- Topic 管理
+    // ---------------------------------------------------------------- Topic management
 
-    // 对应 DefaultMQAdminExt.createTopic：key / topicSysFlag 是忽略形参，
-    // 直接走 createTopicInRoute（默认 TopicConfig defaultTopic=TBW102，perm=READ|WRITE）。
+    // Corresponds to DefaultMQAdminExt.createTopic: key / topicSysFlag are ignored parameters;
+    // it goes straight to createTopicInRoute (default TopicConfig defaultTopic=TBW102, perm=READ|WRITE).
     public void CreateTopic(string key, string newTopic, int queueNum = 4, int topicSysFlag = 0)
     {
         Validators.CheckTopic(newTopic);
@@ -541,7 +543,7 @@ public sealed class DefaultMQAdminExt
         return t;
     }
 
-    // ---------------------------------------------------------------- 集群 / Broker
+    // ---------------------------------------------------------------- Cluster / Broker
 
     public ClusterInfo FetchBrokerClusterInfo() => RequireClient().GetBrokerClusterInfo();
 
@@ -560,8 +562,9 @@ public sealed class DefaultMQAdminExt
         FetchBrokerRuntimeStats(brokerAddr, timeoutMillis);
 
     /// <summary>
-    /// GET_BROKER_CONFIG 的响应体是 **properties 文本**（"k=v\n"），不是 JSON/KvTable。
-    /// 早期实现把它当 KvTable JSON 解析，真实 broker 上必然失败。
+    /// The GET_BROKER_CONFIG response body is a **properties text** ("k=v\n"), not JSON/KvTable.
+    /// The early implementation parsed it as KvTable JSON, which necessarily failed against a
+    /// real broker.
     /// </summary>
     public PropertyMap GetBrokerConfig(string brokerAddr, int timeoutMillis = -1)
     {
@@ -661,7 +664,7 @@ public sealed class DefaultMQAdminExt
 
     public void PutKvConfig(string ns, string key, string value) => CreateAndUpdateKvConfig(ns, key, value);
 
-    /// <summary>返回 false 表示该 key 不存在。</summary>
+    /// <summary>Returns false when the key does not exist.</summary>
     public bool GetKvConfig(string ns, string key, out string outValue)
     {
         MQClientInstance client = RequireClient();
@@ -685,7 +688,7 @@ public sealed class DefaultMQAdminExt
                     return false;
                 }
 
-                // 该 NS 明确返回"没有"，直接返回 false（不再试下一个）
+                // This NS explicitly said "not found": return false directly (don't try the next one)
                 outValue = string.Empty;
                 return false;
             }
@@ -741,7 +744,7 @@ public sealed class DefaultMQAdminExt
         throw new MQClientException("all name servers unreachable: " + lastError);
     }
 
-    // ---------------------------------------------------------------- 订阅组管理
+    // ---------------------------------------------------------------- Subscription group management
 
     public void CreateAndUpdateSubscriptionGroupConfig(string addr, SubscriptionGroupConfig config)
     {
@@ -750,7 +753,7 @@ public sealed class DefaultMQAdminExt
             new PropertyMap(), body, true, _timeoutMillis);
     }
 
-    /// <summary>返回 false 表示该订阅组不存在。</summary>
+    /// <summary>Returns false when the subscription group does not exist.</summary>
     public bool ExamineSubscriptionGroupConfig(string addr, string group, out SubscriptionGroupConfig outCfg)
     {
         SubscriptionGroupWrapper wrapper = GetAllSubscriptionGroup(addr);
@@ -764,7 +767,7 @@ public sealed class DefaultMQAdminExt
         return false;
     }
 
-    /// <summary>返回 false 表示响应体为空（配置不存在）。</summary>
+    /// <summary>Returns false when the response body is empty (the config does not exist).</summary>
     public bool GetSubscriptionGroupConfig(string addr, string group, out SubscriptionGroupConfig outCfg)
     {
         PropertyMap ext = new() { ["group"] = group };
@@ -834,7 +837,7 @@ public sealed class DefaultMQAdminExt
             if (!response.ExtFields.TryGetValue("totalGroupNum", out string? totalStr) ||
                 string.IsNullOrEmpty(totalStr))
             {
-                // 老 broker：一次返回全部
+                // Old broker: returns everything in one shot
                 break;
             }
 
@@ -889,7 +892,7 @@ public sealed class DefaultMQAdminExt
         RequireClient().InvokeSync(AddrForRpc(addr), RequestCode.DeleteSubscriptiongroup, ext, null, false, _timeoutMillis);
     }
 
-    // ---------------------------------------------------------------- 消费者 / 生产者连接
+    // ---------------------------------------------------------------- Consumer / producer connections
 
     public ConsumerConnection ExamineConsumerConnectionInfo(string consumerGroup, string brokerAddr = "")
     {
@@ -949,7 +952,7 @@ public sealed class DefaultMQAdminExt
         return client.GetConsumerListByGroup(consumerGroup, addr);
     }
 
-    // ---------------------------------------------------------------- 消费统计
+    // ---------------------------------------------------------------- Consumption statistics
 
     public ConsumeStats ExamineConsumeStats(string brokerAddr, string consumerGroup,
         string topic = "", List<string>? topicList = null)
@@ -1243,7 +1246,7 @@ public sealed class DefaultMQAdminExt
         RequireClient().InvokeSync(AddrForRpc(brokerAddr), RequestCode.CloneGroupOffset, ext, null, false, _timeoutMillis);
     }
 
-    // ---------------------------------------------------------------- Offset 管理
+    // ---------------------------------------------------------------- Offset management
 
     public long MaxOffset(MessageQueue mq) => RequireClient().GetMaxOffset(mq);
 
@@ -1272,7 +1275,7 @@ public sealed class DefaultMQAdminExt
         return ExtInt(response, "timestamp", 0);
     }
 
-    /// <summary>返回 false 表示该消费组在该队列上尚无位点（broker 回 QUERY_NOT_FOUND）。</summary>
+    /// <summary>Returns false when the group has no offset on this queue yet (broker replies QUERY_NOT_FOUND).</summary>
     public bool ExamineConsumerOffset(string consumerGroup, MessageQueue mq, out long outOffset) =>
         RequireClient().QueryConsumerOffset(consumerGroup, mq, out outOffset);
 
@@ -1283,8 +1286,9 @@ public sealed class DefaultMQAdminExt
         MessageQueue mq, long offset) =>
         RequireClient().UpdateConsumerOffset(consumerGroup, mq, offset, 5000, brokerAddr);
 
-    /// 注意：这里**不再**走"逐队列 searchOffset + updateConsumerOffset"的旧本地实现——
-    /// 那不会同步在线消费者，也不会做 broker 端一致性校验。
+    /// Note: this no longer uses the old local implementation of "per-queue searchOffset +
+    /// updateConsumerOffset" — that does not sync online consumers and performs no
+    /// broker-side consistency check.
     public SortedDictionary<MessageQueue, long> ResetOffsetByTimestamp(string topic, string group,
         long timestamp, bool isForce = true, string clusterName = "", bool isCpp = false)
     {
@@ -1319,7 +1323,8 @@ public sealed class DefaultMQAdminExt
     }
 
     /// <summary>
-    /// 一笔 INVOKE_BROKER_TO_RESET_OFFSET(222)，回 broker 实际重置的队列表。
+    /// A single INVOKE_BROKER_TO_RESET_OFFSET(222), returning the queue offset table the broker
+    /// actually reset.
     private SortedDictionary<MessageQueue, long> InvokeBrokerToResetOffset(string brokerAddr,
         string topic, string group, long timestamp, bool isForce, bool isCpp, int queueId,
         long offset)
@@ -1428,14 +1433,15 @@ public sealed class DefaultMQAdminExt
         return result;
     }
 
-    // ---------------------------------------------------------------- 消息查询
+    // ---------------------------------------------------------------- Message query
 
     public List<MessageExt> QueryMessage(string topic, string key, int maxNum, long begin, long end) =>
         RequireClient().QueryMessageAllBrokers(
             topic, key, maxNum, begin, end, MessageConst.IndexKeyType, false);
 
     /// <summary>
-    /// 返回 false 表示未命中（注意：默认文件索引下 uniqKey 查询需要 RocksDB 索引）。
+    /// Returns false when not hit (note: with the default file index, uniqKey queries need the
+    /// RocksDB index).
     /// </summary>
     public bool QueryMessageByUniqKey(string topic, string uniqKey, out MessageExt outMsg)
     {
@@ -1697,8 +1703,7 @@ public sealed class DefaultMQAdminExt
     }
 
 
-    /// <summary>CLEAN_EXPIRED_CONSUMEQUEUE(306)：broker 丢弃 <c>timeHours</c> 小时前的
-    /// consume-queue 条目。</summary>
+    /// <summary>CLEAN_EXPIRED_CONSUMEQUEUE(306): the broker drops consume-queue entries older than <c>timeHours</c> hours.</summary>
     public void CleanExpiredConsumerQueue(string brokerAddr, int timeHours)
     {
         PropertyMap ext = new() { ["time"] = I64Str(timeHours) };
@@ -1724,8 +1729,7 @@ public sealed class DefaultMQAdminExt
         return failed;
     }
 
-    /// <summary>DELETE_EXPIRED_COMMITLOG(329)：broker 删除 <c>timeHours</c> 小时前的
-    /// commit-log 文件。</summary>
+    /// <summary>DELETE_EXPIRED_COMMITLOG(329): the broker deletes commit-log files older than <c>timeHours</c> hours.</summary>
     public void DeleteExpiredCommitLog(string brokerAddr, int timeHours)
     {
         PropertyMap ext = new() { ["time"] = I64Str(timeHours) };
@@ -1733,7 +1737,7 @@ public sealed class DefaultMQAdminExt
             ext, null, false, _timeoutMillis);
     }
 
-    /// <summary>同 DeleteExpiredCommitLog 的多地址形态。</summary>
+    /// <summary>Multi-address form of DeleteExpiredCommitLog.</summary>
     public List<string> DeleteExpiredCommitLogByAddr(List<string> addrs, int timeHours)
     {
         var failed = new List<string>();

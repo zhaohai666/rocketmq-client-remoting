@@ -1,6 +1,6 @@
 {
     "name": "zhaohai666/rocketmq-client-remoting-php",
-    "description": "RocketMQ 5.x remoting 协议客户端的 PHP 实现",
+    "description": "PHP implementation of the RocketMQ 5.x remoting protocol client",
     "type": "library",
     "license": "Apache-2.0",
     "require": {

@@ -1,6 +1,7 @@
 // -*- coding: utf-8 -*-
-// 攒批累加器：把小消息在真正发送之前按聚合 key 攒成一批。node 端以异步守护代替线程。
-// 具体的 sender 由 producer 侧接进来。
+// Batch accumulator: groups small messages into one batch by aggregation key
+// before the real send. On the node side an async daemon replaces the thread.
+// The concrete sender is wired in from the producer side.
 import { Message } from '../common/message.ts';
 import { MessageQueue } from '../common/message.ts';
 import { isWaitStoreMsgOK } from '../common/message.ts';
@@ -139,8 +140,9 @@ export function getOrCreateProduceAccumulator(clientId: string): ProduceAccumula
   return acc;
 }
 
-// 把一条批量 SendResult 拆成 per-message 的 SendResult：批内每条消息共享同一个
-// queue/offset，msgId 可用时各自切一段。
+// Split one batch SendResult into per-message SendResults: each message in the
+// batch shares the same queue/offset, and slices its own segment of the msgId
+// when available.
 export function splitSendResults(batchResult: SendResult, msgs: Message[]): SendResult[] {
   const out: SendResult[] = [];
   for (let i = 0; i < msgs.length; i++) {

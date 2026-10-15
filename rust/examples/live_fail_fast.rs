@@ -1,23 +1,23 @@
-//! 快速失败（failFast）传输层真机验证。
+//! Live verification of the failFast transport layer on a real cluster.
 //!
-//! 前置：NameServer + Broker 已起（脚本会**停一次 broker 再拉起**，不删 store）。
+//! Prerequisite: NameServer + Broker are running (the script **stops the broker once and starts it again**, without deleting the store).
 //!
-//! 离线用例（`src/remoting/client.rs` 的 failFast 组）锁的是传输层契约：本机假对端读完就关，
-//! 断言"毫秒级判死 + 报 Error::SendRequest 而不是 Timeout + 回调只投一次"。但这条路径存在的
-//! 意义正是**真机上的 broker 重启 / 主备切换 / 网络抖动**，只有真集群能回答：
-//! - L1 基线：真 broker 上发送与长轮询都正常（先确认后面的失败不是环境造成的）。
-//! - L2 挂起：把三条**真的挂在 broker 上**的长轮询（suspend 20s、客户端超时 30s）钉在在途表里。
-//! - L3 收口：杀掉 broker（读任务见到 EOF）→ 长轮询必须立刻拿到 `Error::SendRequest`，
-//!   而不是等满 30s 报一个 `Error::Timeout`。类型不能错：异步发送的重试分类按异常**种类**
-//!   分流（`client/producer.rs`），报成超时等于换了一整套重试决策。
-//! - L4 范围：判死只牵连死掉那条连接；同一个传输实例上的 namesrv 连接照常服务。
-//! - L5 恢复：broker 拉起后同一个 producer 实例重新建连照常发送；已拿到 SEND_OK 的消息
-//!   一条都不能少。
+//! The offline cases (the failFast group in `src/remoting/client.rs`) lock the transport-layer contract: a local fake peer closes right after
+//! reading, asserting "millisecond-level kill + an Error::SendRequest instead of Timeout + the callback delivered exactly once". But the reason this
+//! path exists is precisely **broker restarts / primary-secondary failover / network jitter on a real machine**; only a real cluster can answer:
+//! - L1 baseline: sending and long polling both work on a real broker (confirms the failures below are not environmental).
+//! - L2 parking: three long polls **really parked on the broker** (suspend 20s, client timeout 30s) pinned in the in-flight table.
+//! - L3 kill: kill the broker (the read task sees EOF) => the long polls must immediately get `Error::SendRequest`,
+//!   instead of waiting the full 30s and reporting `Error::Timeout`. The type cannot be wrong: the retry classification of async sends branches on the exception
+//!   **kind** (`client/producer.rs`); reporting a timeout means swapping in a whole different retry policy.
+//! - L4 scope: the kill must only implicate the dead connection; the namesrv connection on the same transport instance keeps serving.
+//! - L5 recovery: after the broker is restarted the same producer instance reconnects and sends as usual; every message that already got SEND_OK
+//!   must still be there, not one missing.
 //!
-//! L3 的阈值（8s）远小于客户端超时（30s），也小于 broker 的 suspend 上限（20s）：缺了
-//! failFast 这条断言必然失败，不是碰运气。
+//! L3's threshold (8s) is far below the client timeout (30s) and also below the broker's suspend cap (20s): without
+//! failFast this assertion is guaranteed to fail, it is not luck.
 //!
-//! 用法：
+//! Usage:
 //! ```text
 //! cargo run --example live_fail_fast -- 127.0.0.1:9876
 //! ```
@@ -42,11 +42,11 @@ use rocketmq_client_remoting::remoting::protocol::codes::{request_code, response
 use rocketmq_client_remoting::remoting::protocol::headers::PullMessageRequestHeader;
 use rocketmq_client_remoting::remoting::protocol::remoting_command::RemotingCommand;
 
-/// 客户端侧超时故意放到 30s：判死若走的是超时路径，至少要等这么久。
+/// The client-side timeout is deliberately set to 30s: if the kill took the timeout path, it would have to wait at least this long.
 const CLIENT_TIMEOUT_MILLIS: i64 = 30_000;
-/// broker 侧挂起上限，故意小于客户端超时。
+/// The broker-side suspend cap, deliberately smaller than the client timeout.
 const BROKER_SUSPEND_MILLIS: i64 = 20_000;
-/// failFast 应当是毫秒级；留 8s 给真机调度（EOF 到达 + 回调投递）。
+/// failFast should be millisecond-level; 8s is left for real-machine scheduling (EOF arrival + callback delivery).
 const FAIL_FAST_LIMIT: Duration = Duration::from_secs(8);
 const BASELINE_MSGS: usize = 5;
 const PARKED: usize = 3;
@@ -75,7 +75,7 @@ impl Checker {
     }
 }
 
-/// broker 开关：`scripts/rmq_test_broker.sh`，四个语言的 live 用例共用同一份口径。
+/// Broker switch: `scripts/rmq_test_broker.sh`; this crate's live cases all share this one contract.
 fn broker_ctl(script: &PathBuf, action: &str) -> (bool, String) {
     let out_path = format!("/tmp/rmq_fail_fast_rs_broker_ctl.{action}.log");
     let file = match fs::File::create(&out_path) {
@@ -86,8 +86,8 @@ fn broker_ctl(script: &PathBuf, action: &str) -> (bool, String) {
         Ok(f) => f,
         Err(e) => return (false, format!("dup {out_path} failed: {e}")),
     };
-    // 输出走**文件**而不是管道：start 会把 broker 拉成常驻进程，谁继承它的写端
-    // 谁就等不到 EOF。
+    // Output goes to **files** rather than pipes: start turns the broker into a resident process, and whoever inherits its
+    // write end never sees EOF.
     let status = std::process::Command::new("sh")
         .arg(script)
         .arg(action)
@@ -124,13 +124,13 @@ fn parked_pull_request(group: &str, mq: &MessageQueue, queue_offset: i64) -> Rem
         request_source: Some(0),
         proxy_froward_client_id: None,
     };
-    // 手工构造：不经 pull consumer 的钳制，30s 客户端超时与 20s broker suspend
-    // 都由本用例说了算。
+    // Built by hand: without the pull consumer's clamping, so the 30s client timeout and the 20s broker suspend
+    // are both decided by this case.
     RemotingCommand::create_request_command(request_code::PULL_MESSAGE, Some(Box::new(header)))
 }
 
-/// 收尾保险：无论用例走到哪一步（含提前 return），都不能把测试集群留在停机状态
-/// 交给下一个用例——脚本的 start 本来就是幂等的（已在跑就直接返回）。
+/// Cleanup safety net: no matter where the case stops (including an early return), the test cluster must never be left
+/// powered off for the next case -- the script's start is idempotent by design (it returns directly if already running).
 struct BrokerGuard {
     script: PathBuf,
 }
@@ -141,15 +141,15 @@ impl Drop for BrokerGuard {
         if ok {
             return;
         }
-        println!("  [cleanup] 用例结束时 broker 是 DOWN（{out}），补一次 start");
+        println!("  [cleanup] the broker is DOWN when the case ends ({out}); running one extra start");
         let (ok, out) = broker_ctl(&self.script, "start");
         if !ok {
-            println!("  [cleanup] broker 仍没起来：{out}");
+            println!("  [cleanup] the broker still did not come up: {out}");
         }
     }
 }
 
-/// 一条挂起的长轮询的结局：`(异常种类, 文案, 耗时)`；成功回响应则 kind 是 `response:<code>`。
+/// The outcome of one parked long poll: `(exception kind, message text, elapsed)`; on a successful response the kind is `response:<code>`.
 async fn park_one(
     remoting: RemotingClient,
     addr: String,
@@ -188,8 +188,8 @@ async fn run(namesrv: &str, broker_script: PathBuf) -> Checker {
 
     let (ok, out) = broker_ctl(&broker_script, "status");
     if !ok {
-        println!("broker 没在跑：先按本地集群 runbook 起 namesrv + broker（{out}）");
-        ck.check("前置 broker UP", false, &out);
+        println!("broker is not running: start namesrv + broker per the local cluster runbook first ({out})");
+        ck.check("prerequisite broker UP", false, &out);
         return ck;
     }
 
@@ -201,7 +201,7 @@ async fn run(namesrv: &str, broker_script: PathBuf) -> Checker {
     }) {
         Ok(p) => p,
         Err(e) => {
-            ck.check("producer 构造", false, &e.to_string());
+            ck.check("producer construction", false, &e.to_string());
             return ck;
         }
     };
@@ -213,7 +213,7 @@ async fn run(namesrv: &str, broker_script: PathBuf) -> Checker {
     }) {
         Ok(c) => c,
         Err(e) => {
-            ck.check("pull consumer 构造", false, &e.to_string());
+            ck.check("pull consumer construction", false, &e.to_string());
             return ck;
         }
     };
@@ -238,7 +238,7 @@ async fn run(namesrv: &str, broker_script: PathBuf) -> Checker {
         }
     }
     ck.check(
-        "L1 基线：5 条同步发送 SEND_OK",
+        "L1 baseline: 5 sync sends all SEND_OK",
         landed == BASELINE_MSGS,
         &format!("landed={landed}"),
     );
@@ -253,12 +253,12 @@ async fn run(namesrv: &str, broker_script: PathBuf) -> Checker {
         .await
         .unwrap_or_default();
     ck.check(
-        "L1 取到队列",
+        "L1 queues fetched",
         !queues.is_empty(),
         &format!("queues={}", queues.len()),
     );
     let Some(mq) = queues.first().cloned() else {
-        ck.check("L1 取到队列", false, "没有队列，后续无法进行");
+        ck.check("L1 queues fetched", false, "no queue, the rest cannot proceed");
         consumer.shutdown();
         producer.shutdown();
         return ck;
@@ -267,7 +267,7 @@ async fn run(namesrv: &str, broker_script: PathBuf) -> Checker {
     let client = match producer.client() {
         Some(c) => c,
         None => {
-            ck.check("L1 拿到 MQClientInstance", false, "producer 未启动");
+            ck.check("L1 MQClientInstance obtained", false, "producer not started");
             consumer.shutdown();
             producer.shutdown();
             return ck;
@@ -278,24 +278,24 @@ async fn run(namesrv: &str, broker_script: PathBuf) -> Checker {
         .as_ref()
         .and_then(|r| MQClientInstance::find_broker_addr_in_route(r, &mq.broker_name));
     let Some(addr) = addr else {
-        ck.check("L1 拿到 broker 地址", false, "路由里没有这台 broker");
+        ck.check("L1 broker address obtained", false, "the route does not contain this broker");
         consumer.shutdown();
         producer.shutdown();
         return ck;
     };
-    ck.check("L1 拿到 broker 地址", true, &format!("addr={addr}"));
+    ck.check("L1 broker address obtained", true, &format!("addr={addr}"));
 
     let max_offset = match consumer.max_offset(&mq).await {
         Ok(o) => o,
         Err(e) => {
-            ck.check("L1 待挂长轮询的队列有位点可用", false, &e.to_string());
+            ck.check("L1 the queue to park long polls on has an offset available", false, &e.to_string());
             consumer.shutdown();
             producer.shutdown();
             return ck;
         }
     };
-    // 发送是跨队列轮转的，单条队列的队尾只覆盖落在它上面的那部分，
-    // 所以"真的落盘"要看全部队列的合计。
+    // Sends rotate across queues, so a single queue's tail offset only covers the messages that landed on it;
+    // "really persisted" therefore means the sum over all queues.
     let mut total_max = max_offset;
     for q in queues.iter().skip(1) {
         if let Ok(o) = consumer.max_offset(q).await {
@@ -303,9 +303,9 @@ async fn run(namesrv: &str, broker_script: PathBuf) -> Checker {
         }
     }
     ck.check(
-        "L1 各队列队尾位点合计覆盖刚发的 5 条（真的落盘）",
+        "L1 the sum of all queues' tail offsets covers the 5 just-sent messages (really persisted)",
         total_max >= BASELINE_MSGS as i64,
-        &format!("max_offset 合计={total_max}"),
+        &format!("max_offset sum={total_max}"),
     );
 
     // -------------------------------------------------------------- L2
@@ -328,12 +328,12 @@ async fn run(namesrv: &str, broker_script: PathBuf) -> Checker {
     }
     tokio::time::sleep(Duration::from_secs(2)).await;
     ck.check(
-        "L2 三条长轮询真的挂在 broker 上（2s 后仍未返回）",
+        "L2 the three long polls are really parked on the broker (still unreturned after 2s)",
         returned.load(Ordering::SeqCst) == 0,
         &format!("returned={}", returned.load(Ordering::SeqCst)),
     );
     ck.check(
-        "L2 在途表里有它们",
+        "L2 they sit in the in-flight table",
         remoting.in_flight_count() >= baseline_in_flight + PARKED,
         &format!(
             "in_flight={} baseline={baseline_in_flight}",
@@ -344,18 +344,18 @@ async fn run(namesrv: &str, broker_script: PathBuf) -> Checker {
     // -------------------------------------------------------------- L3
     let script = broker_script.clone();
     let stopped = tokio::task::spawn_blocking(move || broker_ctl(&script, "stop")).await;
-    let (ok, out) = stopped.unwrap_or_else(|e| (false, format!("stop 任务 panic: {e}")));
-    ck.check("L3 停掉 broker", ok, &out);
+    let (ok, out) = stopped.unwrap_or_else(|e| (false, format!("stop task panicked: {e}")));
+    ck.check("L3 broker stopped", ok, &out);
 
     let mut parked = Vec::new();
     for handle in handles {
         match handle.await {
             Ok(r) => parked.push(r),
-            Err(e) => ck.check("L3 挂起的长轮询全部返回（没有卡死）", false, &e.to_string()),
+            Err(e) => ck.check("L3 all parked long polls returned (none stuck)", false, &e.to_string()),
         }
     }
     ck.check(
-        "L3 挂起的长轮询全部返回（没有卡死）",
+        "L3 all parked long polls returned (none stuck)",
         parked.len() == PARKED,
         &format!("got={}", parked.len()),
     );
@@ -378,26 +378,26 @@ async fn run(namesrv: &str, broker_script: PathBuf) -> Checker {
         .map(|p| p.2.clone())
         .unwrap_or_default();
     ck.check(
-        "L3 报的是 RemotingSendRequestException（failFast 的口径）",
+        "L3 the error is RemotingSendRequestException (the failFast contract)",
         send_request == PARKED,
         &format!("kinds={kinds}"),
     );
     ck.check(
-        "L3 一条都没被报成超时（类型错 = 重试决策错）",
+        "L3 not a single one reported as a timeout (wrong type = wrong retry policy)",
         timeouts == 0,
         &format!("timeout={timeouts}"),
     );
     ck.check(
-        "L3 判死耗时远小于 30s 客户端超时",
+        "L3 the kill takes far less than the 30s client timeout",
         worst < FAIL_FAST_LIMIT,
         &format!("worst={:.2}s limit={}s", worst.as_secs_f64(), FAIL_FAST_LIMIT.as_secs()),
     );
     ck.check(
-        "L3 异常文案带着断连原因",
+        "L3 the error text carries the disconnect reason",
         first_msg.contains("connection closed"),
         &first_msg,
     );
-    // 在途表被 failFast 排空（不是等超时自己扫）
+    // The in-flight table is drained by failFast (not left to the timeout sweeper)
     let mut drained = false;
     for _ in 0..40 {
         if remoting.in_flight_count() == 0 {
@@ -407,13 +407,13 @@ async fn run(namesrv: &str, broker_script: PathBuf) -> Checker {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     ck.check(
-        "L3 判死之后在途表排空",
+        "L3 the in-flight table is drained after the kill",
         drained,
         &format!("in_flight={}", remoting.in_flight_count()),
     );
 
     // -------------------------------------------------------------- L4
-    // 判死必须只牵连死掉那条连接：namesrv 走的是同一个传输实例的另一条连接。
+    // The kill must implicate only the dead connection: namesrv runs on another connection of the same transport instance.
     let mut probe = RemotingCommand::create_request_command(
         request_code::GET_ALL_TOPIC_LIST_FROM_NAMESERVER,
         None,
@@ -423,7 +423,7 @@ async fn run(namesrv: &str, broker_script: PathBuf) -> Checker {
         Err(e) => (e.to_string(), -1),
     };
     ck.check(
-        "L4 namesrv 连接没被牵连（broker 死了它还在服务）",
+        "L4 the namesrv connection is untouched (it keeps serving while the broker is dead)",
         ns_kind == "response" && ns_code == response_code::SUCCESS,
         &format!("{ns_kind} code={ns_code}"),
     );
@@ -431,8 +431,8 @@ async fn run(namesrv: &str, broker_script: PathBuf) -> Checker {
     // -------------------------------------------------------------- L5
     let script = broker_script.clone();
     let started = tokio::task::spawn_blocking(move || broker_ctl(&script, "start")).await;
-    let (ok, out) = started.unwrap_or_else(|e| (false, format!("start 任务 panic: {e}")));
-    ck.check("L5 broker 重新拉起", ok, &out);
+    let (ok, out) = started.unwrap_or_else(|e| (false, format!("start task panicked: {e}")));
+    ck.check("L5 broker restarted", ok, &out);
 
     let mut recovered = false;
     let mut attempts = 0usize;
@@ -453,7 +453,7 @@ async fn run(namesrv: &str, broker_script: PathBuf) -> Checker {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     ck.check(
-        "L5 同一个 producer 实例重新建连后照常发送",
+        "L5 the same producer instance reconnects and sends as usual",
         recovered,
         &format!("attempts={attempts} {rec_err}"),
     );
@@ -474,9 +474,9 @@ async fn run(namesrv: &str, broker_script: PathBuf) -> Checker {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     ck.check(
-        "L5 重启后 broker 上仍有那 5 条 SEND_OK 的消息",
+        "L5 the broker still holds those 5 SEND_OK messages after the restart",
         after >= BASELINE_MSGS as i64,
-        &format!("max_offset 合计={after}"),
+        &format!("max_offset sum={after}"),
     );
 
     consumer.shutdown();
@@ -486,7 +486,7 @@ async fn run(namesrv: &str, broker_script: PathBuf) -> Checker {
 
 fn report(ck: &Checker) {
     println!(
-        "== 结果: {}/{} 通过 ==",
+        "== result: {}/{} passed ==",
         ck.passed,
         ck.passed as usize + ck.failed.len()
     );

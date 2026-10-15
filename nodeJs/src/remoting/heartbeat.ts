@@ -103,8 +103,8 @@ export class HeartbeatData {
     this.withoutSub = false;
   }
   toDict(): Record<string, any> {
-    // heartbeatFingerprint 固定为 0（broker 因此走 V1 注册路径）；
-    // withoutSub 是 wire 上的协议字段名。
+    // heartbeatFingerprint is pinned to 0 (which makes the broker take the V1
+    // registration path); withoutSub is the protocol field name on the wire.
     return {
       clientID: this.clientID,
       producerDataSet: this.producerDataSet.map((p) => p.toDict()),

@@ -1,16 +1,20 @@
-// unitName / unitMode / enableStreamRequestType 真机联调（U1–U5）。
+// Real-machine integration of unitName / unitMode / enableStreamRequestType (U1-U5).
 //
-// 为什么必须真机：这三个开关在离线单测里只能证明「字段被填了」，证明不了 broker 认不认。
-// broker 侧可见的证据只有这几处：
-//   * 发送带 unitMode → 自动建出来的 topic 的 topicSysFlag 带 UNIT 位；
-//   * 心跳带 ConsumerData.unitMode → %RETRY%group 建出来带 UNIT_SUB 位；
-//   * clientId 的 @unitName/@STREAM 后缀会出现在 broker 记录的连接信息里
-//     （examineConsumerConnectionInfo）—— 这是唯一能证明「上线的确实是拼好的那个
-//     clientId」的观测点。
-// ReqT 本身对普通 broker 是惰性的（只有 proxy/stream 链路读它），所以 stream 在这里只验
-// clientId；钩子顺序（ReqT 必须落在 ACL 签名之内）由 tests/AclTests.cs 锁死。
+// Why it must be a real machine: these three switches can only be shown offline to "have the
+// field filled in"; they cannot show whether the broker accepts them. The broker-side
+// evidence is only these:
+//   * a send carrying unitMode -> the topicSysFlag of the auto-created topic carries the
+//     UNIT bit;
+//   * a heartbeat carrying ConsumerData.unitMode -> the %RETRY%group that gets created
+//     carries the UNIT_SUB bit;
+//   * the @unitName/@STREAM suffix of the clientId shows up in the connection info the
+//     broker records (examineConsumerConnectionInfo) -- this is the only observation point
+//     that can prove "the one that went on the wire really is the assembled clientId".
+// ReqT itself is inert for an ordinary broker (only the proxy / stream link reads it), so
+// stream is only verified via the clientId here; the hook ordering (ReqT must land inside
+// the ACL signature) is pinned by tests/AclTests.cs.
 //
-// 用法：rmq unit-config [namesrv]（需本地 5.5.1 集群，autoCreateTopicEnable=true）
+// Usage: rmq unit-config [namesrv] (needs a local 5.5.1 cluster, autoCreateTopicEnable=true)
 using System.Text;
 
 using RocketMQ.Client;
@@ -56,7 +60,7 @@ public static class LiveUnitConfig
 
     private static void Sleep(int ms) => Thread.Sleep(ms);
 
-    /// <summary>按 stamp 隔离的一套 topic/group；跑完 Cleanup 扫干净。</summary>
+    /// <summary>A topic/group set isolated by stamp; Cleanup sweeps it afterwards.</summary>
     private static readonly List<string> Topics = new();
 
     private static readonly List<string> Groups = new();
@@ -114,8 +118,9 @@ public static class LiveUnitConfig
     }
 
     /// <summary>
-    /// 配好并启动一个生产者。instanceName 显式给定，clientId 才可预测
-    ///（默认名 DEFAULT 会被就地改写成 &lt;pid&gt;#&lt;nanoTime&gt;）。
+    /// Configures and starts a producer. instanceName is given explicitly so that the
+    /// clientId is predictable (the default name DEFAULT is rewritten in place to
+    /// &lt;pid&gt;#&lt;nanoTime&gt;).
     /// </summary>
     private sealed class ScopedProducer : IDisposable
     {
@@ -155,8 +160,10 @@ public static class LiveUnitConfig
     }
 
     /// <summary>
-    /// 自动建出来的 topic 要先经 broker→namesrv 注册才查得到路由；wantBit 非 0 时等到该位
-    /// 出现为止，为 0 时只等路由可见（用于「不该带单元位」的对照）。
+    /// An auto-created topic is only queryable for its route after the broker registers it
+    /// with the namesrv; when wantBit is non-zero this waits for that bit to appear, and
+    /// when it is 0 it only waits for the route to become visible (used for the "must not
+    /// carry the unit bit" control).
     /// </summary>
     private static int WaitSysFlag(string topic, int wantBit, int seconds)
     {
@@ -171,7 +178,7 @@ public static class LiveUnitConfig
             }
             catch (Exception)
             {
-                // 还没建出来，继续等
+                // not created yet, keep waiting
             }
             if (queues.Count > 0)
             {
@@ -193,24 +200,24 @@ public static class LiveUnitConfig
         Check("U1 clientId = ip@instanceName@unitName", p.ClientId == want,
             "actual=" + p.ClientId + " want=" + want);
         SendResult r = p.Send(Topic("U1"), "u1");
-        Check("U1 带 unitName 仍能正常发送", r.SendStatus == SendStatus.SendOk, r.MsgId);
+        Check("U1 sending still works with a unitName", r.SendStatus == SendStatus.SendOk, r.MsgId);
 
         using ScopedProducer ctl = new("u1ctl");
-        Check("U1 不设 unitName 时 clientId 不多出段",
+        Check("U1 with no unitName set the clientId gains no segment",
             ctl.ClientId == MixAll.CachedIpStr() + "@uc-dotnet-u1ctl-" + _stamp,
             "actual=" + ctl.ClientId);
     }
 
-    // ---------------------------------------------------------------- U2 stream 消费者的 clientId
+    // ---------------------------------------------------------------- U2 the clientId of a stream consumer
     private static void U2StreamConsumerIsVisibleOnBroker()
     {
         string t = Topic("U2");
         string g = Group("u2");
-        // 先暖一条：topic 建出来 + 路由可见，消费者首 pull 才不会撞 TOPIC_NOT_EXIST
+        // warm one up first: the topic gets created and the route becomes visible, so the consumer's first pull does not hit TOPIC_NOT_EXIST
         using (ScopedProducer warm = new("u2warm"))
         {
             warm.Send(t, "warm");
-            Check("U2 预热消息的路由已可见", RouteVisible(t, 20));
+            Check("U2 the warm-up message's route is visible", RouteVisible(t, 20));
         }
 
         Collector collector = new();
@@ -227,7 +234,7 @@ public static class LiveUnitConfig
         c.Start();
 
         string wantSuffix = "@unitA" + StreamSuffix;
-        Check("U2 消费者 clientId 以 @unitA@STREAM 收尾", c.ClientId.EndsWith(wantSuffix),
+        Check("U2 the consumer's clientId ends with @unitA@STREAM", c.ClientId.EndsWith(wantSuffix),
             "actual=" + c.ClientId);
 
         using (ScopedProducer p = new("u2send"))
@@ -240,10 +247,10 @@ public static class LiveUnitConfig
         {
             Sleep(500);
         }
-        Check("U2 stream 消费者收到消息", HasBody(collector.Snapshot(), "hello-stream"),
+        Check("U2 the stream consumer received the message", HasBody(collector.Snapshot(), "hello-stream"),
             Join(collector.Snapshot()));
 
-        // broker 侧连接信息是唯一能证明「上线 clientId 就是拼好的那个」的观测点
+        // the broker-side connection info is the only observation point that can prove "the clientId that went on the wire is the assembled one"
         bool seenOnBroker = false;
         string observed = string.Empty;
         for (int i = 0; i < 20 && !seenOnBroker; ++i)
@@ -264,11 +271,11 @@ public static class LiveUnitConfig
             }
             if (!seenOnBroker) Sleep(500);
         }
-        Check("U2 broker 记录的 clientId 也带 @unitA@STREAM", seenOnBroker, observed);
+        Check("U2 the clientId the broker recorded also carries @unitA@STREAM", seenOnBroker, observed);
         c.Shutdown();
     }
 
-    // ---------------------------------------------------------------- U3 unitMode 发送 → UNIT 位
+    // ---------------------------------------------------------------- U3 a unitMode send -> the UNIT bit
     private static void U3UnitModeSendMarksTopic()
     {
         string on = Topic("U3On");
@@ -276,23 +283,23 @@ public static class LiveUnitConfig
         using (ScopedProducer p = new("u3on", unitMode: true))
         {
             SendResult r = p.Send(on, "unit-on");
-            Check("U3 unitMode 发送成功", r.SendStatus == SendStatus.SendOk, r.MsgId);
+            Check("U3 the unitMode send succeeded", r.SendStatus == SendStatus.SendOk, r.MsgId);
         }
         using (ScopedProducer p = new("u3off"))
         {
             SendResult r = p.Send(off, "unit-off");
-            Check("U3 对照发送成功", r.SendStatus == SendStatus.SendOk, r.MsgId);
+            Check("U3 the control send succeeded", r.SendStatus == SendStatus.SendOk, r.MsgId);
         }
 
         int onFlag = WaitSysFlag(on, FlagUnit, 30);
-        Check("U3 unitMode=true 建出的 topic 带 UNIT 位", (onFlag & FlagUnit) != 0,
+        Check("U3 a topic created with unitMode=true carries the UNIT bit", (onFlag & FlagUnit) != 0,
             "sysFlag=" + onFlag);
         int offFlag = WaitSysFlag(off, 0, 30);
-        Check("U3 unitMode=false 建出的 topic 不带单元位", (offFlag & FlagUnit) == 0,
+        Check("U3 a topic created with unitMode=false carries no unit bit", (offFlag & FlagUnit) == 0,
             "sysFlag=" + offFlag);
     }
 
-    // ---------------------------------------------------------------- U4 心跳 unitMode → %RETRY% UNIT_SUB
+    // ---------------------------------------------------------------- U4 heartbeat unitMode -> %RETRY% UNIT_SUB
     private static void U4UnitModeConsumerMarksRetryTopic()
     {
         string t = Topic("U4");
@@ -300,7 +307,7 @@ public static class LiveUnitConfig
         using (ScopedProducer warm = new("u4warm"))
         {
             warm.Send(t, "warm");
-            Check("U4 预热消息的路由已可见", RouteVisible(t, 20));
+            Check("U4 the warm-up message's route is visible", RouteVisible(t, 20));
         }
 
         var c = new DefaultMQPushConsumer(g)
@@ -314,14 +321,14 @@ public static class LiveUnitConfig
         c.Subscribe(t, "*");
         c.Start();
 
-        // %RETRY%<group> 由 broker 处理心跳时按 ConsumerData.unitMode 建出来
+        // %RETRY%<group> is created by the broker while handling the heartbeat, based on ConsumerData.unitMode
         int flag = WaitSysFlag(MixAll.GetRetryTopic(g), FlagUnitSub, 40);
-        Check("U4 心跳 unitMode=true 让 %RETRY% 带 UNIT_SUB 位", (flag & FlagUnitSub) != 0,
+        Check("U4 a heartbeat with unitMode=true makes %RETRY% carry the UNIT_SUB bit", (flag & FlagUnitSub) != 0,
             "sysFlag=" + flag);
         c.Shutdown();
     }
 
-    // ---------------------------------------------------------------- U5 stream 生产者 + lite 消费者
+    // ---------------------------------------------------------------- U5 a stream producer + a lite consumer
     private static void U5StreamProducerAndLiteConsumer()
     {
         string t = Topic("U5");
@@ -334,35 +341,36 @@ public static class LiveUnitConfig
         lite.SetPollTimeoutMillis(1000);
         lite.Subscribe(t, "*");
         lite.Start();
-        Check("U5 lite 消费者默认 clientId 带 @STREAM", lite.ClientId.EndsWith(StreamSuffix),
+        Check("U5 a lite consumer's default clientId carries @STREAM", lite.ClientId.EndsWith(StreamSuffix),
             "actual=" + lite.ClientId);
 
         using ScopedProducer p = new("u5", stream: true);
-        Check("U5 显式开 stream 的生产者 clientId 带 @STREAM",
+        Check("U5 a producer with stream explicitly enabled has a clientId carrying @STREAM",
             p.ClientId.EndsWith(StreamSuffix), "actual=" + p.ClientId);
         for (int i = 0; i < 3; ++i)
         {
             SendResult r = p.Send(t, "m" + i);
-            Check("U5 第 " + i + " 条发送成功", r.SendStatus == SendStatus.SendOk, r.MsgId);
+            Check("U5 message number " + i + " was sent successfully", r.SendStatus == SendStatus.SendOk, r.MsgId);
         }
 
-        // 分配必须在**首条消息之后**才等：topic 由第一次发送自动建出来，之前 namesrv 没有
-        // 路由，rebalance 拿到空队列是正确行为（不是客户端 bug）。
+        // The assignment must only be waited for **after the first message**: the topic is
+        // auto-created by the first send and the namesrv had no route before that, so a
+        // rebalance getting no queues is correct behaviour (not a client bug).
         for (int i = 0; i < 40 && lite.Assignment().Count == 0; ++i)
         {
             Sleep(500);
         }
-        Check("U5 lite 消费者拿到队列分配", lite.Assignment().Count > 0,
+        Check("U5 the lite consumer got a queue assignment", lite.Assignment().Count > 0,
             Num(lite.Assignment().Count));
 
         List<string> got = new();
         DateTime deadline = DateTime.UtcNow.AddSeconds(30);
         while (got.Count < 3 && DateTime.UtcNow < deadline)
         {
-            // poll 会掏空本地缓冲，必须跨多次 poll 累加才凑得齐 3 条
+            // poll drains the local buffer, so it has to be accumulated across several polls to collect all 3
             foreach (MessageExt m in lite.Poll(1000)) got.Add(Str(m.Body));
         }
-        Check("U5 lite 消费者收到全部 3 条",
+        Check("U5 the lite consumer received all 3",
             HasBody(got, "m0") && HasBody(got, "m1") && HasBody(got, "m2"), Join(got));
         lite.Shutdown();
     }
@@ -385,7 +393,7 @@ public static class LiveUnitConfig
         }
         foreach (string g in Groups)
         {
-            // %RETRY%/%DLQ% 随订阅组一起删（只有走删组接口 broker 才会真删 retry topic）
+            // %RETRY%/%DLQ% go away together with the subscription group (the broker really deletes the retry topic only when the delete-group endpoint is used)
             try
             {
                 _admin.DeleteSubscriptionGroup(addr, g, true);
@@ -400,7 +408,7 @@ public static class LiveUnitConfig
             }
             catch (Exception)
             {
-                // 组删掉时 retry topic 已随之消失
+                // the retry topic is already gone when the group is deleted
             }
         }
     }
@@ -426,7 +434,7 @@ public static class LiveUnitConfig
         }
         catch (Exception e)
         {
-            Check("联调异常", false, e.Message);
+            Check("the integration threw", false, e.Message);
         }
 
         Cleanup();

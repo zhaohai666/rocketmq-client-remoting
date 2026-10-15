@@ -46,10 +46,10 @@ def sub(topic: str = TOPIC) -> SubscriptionData:
 
 
 def consumer_with_state() -> DefaultMQPushConsumer:
-    """构造一个已分配队列、已消费到某位点的消费者（不调 start，避免联网）。"""
+    """Build a consumer with assigned queues and a consumed offset (without calling start, to avoid networking)."""
     c = DefaultMQPushConsumer(GROUP)
     c.name_server_addrs = ["127.0.0.1:9876"]
-    c._start_time = time.time()                       # start() 里才会设，这里补上
+    c._start_time = time.time()                       # normally set inside start(); filled in here
     c.namespace = None
     c.subscription_data = {TOPIC: sub()}
     q = mq()
@@ -68,7 +68,7 @@ def listener_returning(status: ConsumeConcurrentlyStatus):
     return L()
 
 
-# ---------------------------------------------------------------- body 往返
+# ---------------------------------------------------------------- body round trip
 
 
 class TestBodyRoundTrip:
@@ -121,7 +121,7 @@ class TestBodyRoundTrip:
         assert d.spent_time_mills == 5 and d.auto_commit is True
 
 
-# ---------------------------------------------------------------- 消费者方法
+# ---------------------------------------------------------------- consumer methods
 
 
 class TestConsumerHandlers:
@@ -142,7 +142,7 @@ class TestConsumerHandlers:
         assert info.properties[ConsumerRunningInfo.PROP_NAMESERVER_ADDR] == "127.0.0.1:9876;"
         assert info.properties[ConsumerRunningInfo.PROP_CONSUME_ORDERLY] == "false"
         assert len(info.mq_table) == 1
-        assert info.subscription_set  # 非空
+        assert info.subscription_set  # non-empty
 
     def test_consume_message_directly_success(self):
         c = consumer_with_state()
@@ -215,11 +215,11 @@ class TestConsumerHandlers:
         assert key not in c._consume_offsets
         assert key not in c._mq_map
         assert c._queue_epoch[key] == 1
-        assert ("revoked", [(mq(), 100)]) in events   # persist 带上的是新位点
+        assert ("revoked", [(mq(), 100)]) in events   # persist carries the new offset
         assert "rebalance" in events
 
 
-# ---------------------------------------------------------------- MQClientInstance 分派
+# ---------------------------------------------------------------- MQClientInstance dispatch
 
 
 def fake_cmd(code: int, ext: dict, body: bytes = None) -> RemotingCommand:
@@ -270,7 +270,7 @@ class TestMqClientDispatch:
         assert r.consume_result == CMResult.CR_SUCCESS
 
     def test_220_dispatch_is_oneway_and_async(self):
-        """220 是 oneway（返回 None），且重置逻辑丢到后台线程，不阻塞读线程。"""
+        """220 is oneway (returns None), and the reset logic is dispatched to a background thread without blocking the read thread."""
         recorded = {"called": False, "event": threading.Event()}
         c = consumer_with_state()
 
@@ -286,8 +286,8 @@ class TestMqClientDispatch:
                        {"topic": TOPIC, "group": GROUP, "timestamp": 0, "isForce": True},
                        body=body.encode())
         resp = mqc._process_reset_offset(cmd, "127.0.0.1:10911")
-        assert resp is None, "220 是 oneway，必须返回 None"
-        # 后台线程应已（或即将）调用到 reset_offset
+        assert resp is None, "220 is oneway and must return None"
+        # The background thread should have (or be about to) call reset_offset
         recorded["event"].wait(timeout=2.0)
         assert recorded["called"] is True
 
@@ -310,12 +310,12 @@ class TestMqClientDispatch:
                        {"topic": TOPIC, "group": GROUP, "timestamp": 0, "isForce": True},
                        body=raw)
         assert mqc._process_reset_offset(cmd, "127.0.0.1:10911") is None
-        assert done.wait(timeout=2.0), "数组形状的 220 被静默丢弃了"
+        assert done.wait(timeout=2.0), "the array-shaped 220 was silently dropped"
         assert seen["topic"] == TOPIC
         assert seen["table"] == {mq(queue_id=1): 9}
 
     def test_220_map_body_is_not_double_counted(self):
-        """负向对照：map 形状仍按原样解析（不能被兜底路径改写/翻倍）。"""
+        """Negative control: the map shape is still parsed as-is (must not be rewritten/doubled by the fallback path)."""
         seen = {}
         done = threading.Event()
         c = consumer_with_state()
@@ -370,16 +370,16 @@ class TestMqClientDispatch:
         mqc = MQClientInstance("client@40", ["127.0.0.1:9876"])
         mqc.register_consumer(GROUP, c1)
         mqc.register_consumer("GID_Other", c2)
-        # 处理器必须是实例自己那份，而不是某个消费者的方法
+        # The processor must be the instance's own, not some consumer's method
         assert mqc.remoting_client._processors[NOTIFY_CONSUMER_IDS_CHANGED] \
             == mqc._process_notify_consumer_ids_changed
 
         cmd = fake_cmd(NOTIFY_CONSUMER_IDS_CHANGED, {"consumerGroup": GROUP})
         resp = mqc._process_notify_consumer_ids_changed(cmd, "127.0.0.1:10911")
-        assert resp is None, "40 是 broker 的 oneway 通知，不该回包"
+        assert resp is None, "40 is a broker oneway notification and must not reply"
         assert mqc.consumer_ids_changed_count == 1
         assert c1._rebalance_now.is_set() and c2._rebalance_now.is_set(), \
-            "整组一起唤醒（rebalanceImmediately 不读 consumerGroup）"
+            "the whole group is woken together (rebalanceImmediately does not read consumerGroup)"
 
     def test_40_with_no_group_or_consumer_is_silent(self):
         mqc = MQClientInstance("client@40-empty", ["127.0.0.1:9876"])
@@ -388,7 +388,7 @@ class TestMqClientDispatch:
         assert mqc.consumer_ids_changed_count == 1
 
         class NoRebalance:
-            """没注册过的对象不该被叫醒，也不能让通知处理抛出去。"""
+            """An unregistered object must not be woken, and must not make the notification handler throw."""
 
         mqc.register_consumer(GROUP, None)
         mqc._consumer_table["GID_None"] = NoRebalance()

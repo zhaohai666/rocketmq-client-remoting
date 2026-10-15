@@ -1,37 +1,48 @@
 #!/bin/bash
-# Go 客户端的「POP 消费」真机验证。
+# Live verification of "POP consumption" for the Go client.
 #
-# 用法: bash scripts/run_go_pop_live.sh [namesrv] [legs]   # legs: s1,s2，缺省全跑
+# Usage: bash scripts/run_go_pop_live.sh [namesrv] [legs]   # legs: s1,s2, all legs by default
 #
-# 为什么必须真集群：POP 是**唯一一条失败全静默**的消费路径。
-#   * 客户端没有位点可回读，没有 send-back 可观察，也没有错误码可断言 —— broker 交出一批
-#     「不可见」消息，客户端要么 ACK 要么申请延长不可见时间。POP_CK 差一段（比如把批次起始
-#     段 0 当成消息自身段 7），每个 ACK 在 broker 侧都是空操作，而客户端一路报成功；
-#     唯一症状是**消息在 popInvisibleTime 之后又回来**。所以判据只能是「计时观察窗口」+
-#     「broker 侧可见状态」，不是返回码。
-#   * 「ACK 真的落到 broker」只能这样证：消费完 6 条后继续盯着 2.5 倍不可见窗口，断言
-#     **没有任何 body 被投第二次**。ACK 若是空操作，broker 会在窗口关闭后 revive 整批，
-#     重投必然落在这个窗口内。
-#   * 「POP 不提交位点」（与 pull 的本质区别）只能问 broker：ExamineConsumerOffset 必须查不到。
-#   * S2 的重投判据有一半在 broker 里：失败消息由 changePopInvisibleTime 延长窗口、由
-#     PopReviveService 搬进 %RETRY%<group>_<topic>，再被 pop 回来时 POP_CK 的 retry marker
-#     必须是 "1" —— 这既是「它来自重试 topic」的证据，也是「后续 ACK 必须发回重试 topic」
-#     的原因（broker 把 checkpoint 记在重试 topic 下）。marker 错成 "0" 就是 S2 要抓的 bug。
+# Why a real cluster is mandatory: POP is the **only consumption path whose failures are fully
+# silent**.
+#   * The client has no offset to read back, no send-back to observe, and no error code to
+#     assert on — the broker hands out a batch of "invisible" messages, and the client either
+#     ACKs them or asks to extend the invisibility time. If POP_CK is off by one segment (e.g.
+#     treating the batch start segment 0 as the message's own segment 7), every ACK is a no-op
+#     on the broker side while the client keeps reporting success; the only symptom is
+#     **messages coming back after popInvisibleTime**. So the criteria can only be a "timed
+#     observation window" + "broker-side visibility state", not return codes.
+#   * "The ACK really landed on the broker" can only be proven this way: after consuming the 6
+#     messages, keep watching for 2.5x the invisibility window and assert that **no body is
+#     delivered a second time**. If ACK were a no-op, the broker would revive the whole batch
+#     once the window closes, and the redelivery would necessarily land inside that window.
+#   * "POP does not commit offsets" (the essential difference from pull) can only be asked of
+#     the broker: ExamineConsumerOffset must find nothing.
+#   * Half of S2's redelivery criteria live in the broker: the failed message's window is
+#     extended by changePopInvisibleTime, the message is moved into %RETRY%<group>_<topic> by
+#     PopReviveService, and when popped back its POP_CK retry marker must be "1" — this is both
+#     the evidence that "it came from the retry topic" and the reason "subsequent ACKs must be
+#     sent back to the retry topic" (the broker records the checkpoint under the retry topic).
+#     A marker wrongly "0" is exactly the bug S2 is designed to catch.
 #
-# 该集群配置里与 POP 相关的硬前提（本地测试 broker.conf 都有，脚本不重复设置）：
-#   timerWheelEnable=true                     —— 关掉的话 POP_MESSAGE 直接报错，S1 会硬失败
-#   defaultMessageRequestMode=PULL            —— 所以 Start 里的 SET_MESSAGE_REQUEST_MODE(401)
-#                                                才是「别再用 PULL 应答这个组」的那一步
-#   popResponseReturnActualRetryTopic=false   —— 默认重试路径：broker 自己盖 POP_CK 并把
-#                                                msg.Topic 改回业务 topic，S2 正是钉这条
-#   enablePopBatchAck=false                   —— 所以本工具**不**跑 BATCH_ACK_MESSAGE(200151)；
-#                                                正常链路本来就是逐条 ackAsync，从不发它
+# POP-related hard prerequisites in this cluster config (all present in the local test
+# broker.conf; the script does not set them again):
+#   timerWheelEnable=true                     —— without it POP_MESSAGE errors outright, S1 hard-fails
+#   defaultMessageRequestMode=PULL            —— which is why SET_MESSAGE_REQUEST_MODE(401) in Start
+#                                                is the "stop answering this group with PULL" step
+#   popResponseReturnActualRetryTopic=false   —— default retry path: the broker itself stamps POP_CK and
+#                                                rewrites msg.Topic back to the business topic; S2 pins exactly this
+#   enablePopBatchAck=false                   —— so this tool does **not** run BATCH_ACK_MESSAGE(200151);
+#                                                the normal path is per-message ackAsync anyway, it never sends it
 #
-# 集群：默认假定已经在跑（scripts/rmq_test_broker.sh 那套）。端口探测失败会自动
-# `rmq_test_broker.sh start`，收工时只停自己起来的那一次；已经在跑的不碰。
+# Cluster: assumes one is already running by default (the scripts/rmq_test_broker.sh setup). If
+# the port probe fails, it automatically runs `rmq_test_broker.sh start`, and on cleanup stops
+# only the instance it started; anything already running is left untouched.
 #
-# ⚠ 集群 start + 等端口 + 跑验证 + kill 必须都在本脚本内串完：前台返回会回收后台 JVM。
-# ⚠ 全跑约 1 分钟左右（S1 要静观 13s，S2 要等一次 revive 往返 + 路由刷新）。
+# ⚠ Cluster start + waiting for ports + running verification + kill must all be chained inside
+# this script: when a foreground command returns, the background JVMs are reaped.
+# ⚠ A full run takes about 1 minute (S1 observes silently for 13s; S2 waits for one revive
+# round trip + route refresh).
 set -u
 
 NS=${1:-${ROCKETMQ_NAMESRV:-127.0.0.1:9876}}
@@ -48,24 +59,25 @@ port_open() {
 STARTED_BROKER=0
 cleanup() {
     if [ "$STARTED_BROKER" = "1" ]; then
-        echo "--- 收工：停掉本脚本起的 broker ---"
+        echo "--- Done: stopping the broker started by this script ---"
         sh "$ROOT/scripts/rmq_test_broker.sh" stop || true
     fi
 }
 trap cleanup EXIT
 
 if ! port_open "$BROKER_PORT"; then
-    echo "=== broker 未监听 ${BROKER_PORT}，拉起本地测试集群 ==="
-    sh "$ROOT/scripts/rmq_test_broker.sh" start || { echo "broker 起不来"; exit 1; }
+    echo "=== broker not listening on ${BROKER_PORT}, starting a local test cluster ==="
+    sh "$ROOT/scripts/rmq_test_broker.sh" start || { echo "broker failed to start"; exit 1; }
     STARTED_BROKER=1
-    # 端口先于「向 namesrv 注册路由」就绪，不等就会拿不到 TBW102 路由而假失败。
+    # The port opens before "routes are registered into the namesrv"; without waiting, TBW102
+    # routes are missing and the run fails spuriously.
     sleep 12
 fi
-port_open 9876 || { echo "nameserver 9876 没监听，先起 namesrv"; exit 1; }
+port_open 9876 || { echo "nameserver 9876 not listening; start namesrv first"; exit 1; }
 
 echo ""
-echo "=== Go POP live（ns=${NS} legs=${LEGS:-all}）==="
-echo "    POP_CK 重建 / ACK 生效窗口 / 不提交位点 / 改不可见时间 / POP 重试 topic"
+echo "=== Go POP live (ns=${NS} legs=${LEGS:-all}) ==="
+echo "    POP_CK reconstruction / ACK effectiveness window / no offset commit / invisibility change / POP retry topic"
 cd "$ROOT/go" || exit 1
 if [ -n "$LEGS" ]; then
     "$GO" run ./examples/live_pop -ns "$NS" -legs "$LEGS"
@@ -77,8 +89,8 @@ echo "--- go exit=${RC} ---"
 
 echo ""
 if [ "$RC" -eq 0 ]; then
-    echo "结果: 全部通过（ns=${NS}）"
+    echo "Result: all passed (ns=${NS})"
     exit 0
 fi
-echo "结果: 有失败（ns=${NS}）"
+echo "Result: failures detected (ns=${NS})"
 exit 1

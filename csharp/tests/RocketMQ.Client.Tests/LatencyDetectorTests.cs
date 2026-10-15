@@ -1,6 +1,9 @@
-// 为什么必须单测而不是只靠真机：探测线程只在「broker 被隔离 + 之后恢复」这条罕见路径上生效，
-// 真机矩阵里几乎不会命中；而它的失败模式是静默的——探测永远失败就是把坏 broker 一直隔离
-// （发送延迟飙升但没有报错），探测永远成功就是把不可达的 broker 放回轮询。
+// Why this needs unit tests rather than relying on a real machine only: the detection
+// thread only takes effect on the rare path "the broker was isolated and later recovered",
+// which a real-machine matrix will almost never hit; and its failure mode is silent --
+// detection always failing means a bad broker stays isolated forever (send latency
+// skyrockets with no error), detection always succeeding means an unreachable broker goes
+// back into rotation.
 using System.Net;
 using System.Net.Sockets;
 using RocketMQ.Client;
@@ -11,7 +14,8 @@ namespace RocketMQ.Client.Tests;
 
 public class LatencyDetectorTests
 {
-    /// <summary>可编程的假探测器：记录每次探测的地址/超时，并按脚本返回可达与否。</summary>
+    /// <summary>A programmable fake detector: records the address/timeout of every probe
+    /// and returns reachable or not following a script.</summary>
     private sealed class FakeDetector : IServiceDetector
     {
         private readonly Queue<bool> _script = new();
@@ -84,11 +88,11 @@ public class LatencyDetectorTests
         tol.DetectByOneRound();
 
         Assert.Equal(new[] { "127.0.0.1:10911" }, detector.Probed);
-        // 探测用的超时就是 detectTimeout（200ms），不是发送超时
+        // the timeout used for probing is detectTimeout (200ms), not the send timeout
         Assert.Equal(new[] { 200L }, detector.Timeouts);
         Assert.True(tol.IsReachable("broker-a"));
 
-        // checkStamp 已推到未来：本轮之后不该再探
+        // checkStamp has already been pushed into the future: it must not be probed again this round
         FaultItem item = tol.GetFaultItem("broker-a")!;
         Assert.True(item.CheckStamp >= UtilAll.CurrentTimeMillis());
     }
@@ -100,12 +104,12 @@ public class LatencyDetectorTests
         LatencyFaultToleranceImpl tol = MakeTolerance(detector, _ => "127.0.0.1:10911");
         tol.UpdateFaultItem("broker-a", 1.0, 10000, false);
 
-        // 手动把下一跳推到未来（等价于上一轮刚探过）
+        // manually push the next hop into the future (equivalent to having just probed)
         tol.GetFaultItem("broker-a")!.CheckStamp = UtilAll.CurrentTimeMillis() + 5000;
         tol.DetectByOneRound();
 
         Assert.Empty(detector.Probed);
-        // 未到期就不该被翻回可达
+        // it must not be flipped back to reachable before it is due
         Assert.False(tol.IsReachable("broker-a"));
     }
 
@@ -119,7 +123,7 @@ public class LatencyDetectorTests
 
         tol.DetectByOneRound();
 
-        // broker 已经不在路由里：条目摘掉，探测器一次都不该被调用
+        // the broker is no longer in the route: the entry is removed and the detector must not be called even once
         Assert.Null(tol.GetFaultItem("broker-gone"));
         Assert.True(tol.IsAvailable("broker-gone"));
         Assert.Empty(detector.Probed);
@@ -142,7 +146,7 @@ public class LatencyDetectorTests
     [Fact]
     public void DetectByOneRound_WithoutDetectorOnlyResolvesAddresses()
     {
-        // resolver 有地址但探测器未配置：既不崩溃也不该改可达性
+        // the resolver has an address but no detector is configured: it must neither crash nor change reachability
         LatencyFaultToleranceImpl tol = new(new BrokerAddrResolver(_ => "127.0.0.1:10911"), null);
         tol.UpdateFaultItem("broker-a", 1.0, 10000, false);
         tol.DetectByOneRound();
@@ -157,17 +161,17 @@ public class LatencyDetectorTests
         var detector = new FakeDetector();
         LatencyFaultToleranceImpl tol = MakeTolerance(detector, _ => "127.0.0.1:1", detectInterval: 7000);
         tol.UpdateFaultItem("broker-a", 1.0, 10000, false);
-        tol.GetFaultItem("broker-a")!.CheckStamp = 0; // 初始 0 ⇒ 首轮必探
+        tol.GetFaultItem("broker-a")!.CheckStamp = 0; // initially 0 => the first round must probe
 
         long before = UtilAll.CurrentTimeMillis();
         tol.DetectByOneRound();
         long stamp = tol.GetFaultItem("broker-a")!.CheckStamp;
 
-        // 到期判定用的是「探测之前」就写好的下一跳，所以落在 [before+7000, now+7000] 之间
+        // the due decision uses the next hop written **before** the probe, so it lands between [before+7000, now+7000]
         Assert.InRange(stamp, before + 7000, UtilAll.CurrentTimeMillis() + 7000);
     }
 
-    // ---------------------------------------------------------------- 探测线程生命周期
+    // ---------------------------------------------------------------- The detection thread lifecycle
 
     [Fact]
     public void StartDetector_IsIdempotentAndShutdownStopsIt()
@@ -176,20 +180,20 @@ public class LatencyDetectorTests
         tol.StartDetector();
         tol.StartDetector();
         tol.ShutdownDetector();
-        tol.ShutdownDetector(); // 已停再停也应无害
+        tol.ShutdownDetector(); // stopping an already stopped one must be harmless too
     }
 
     // ---------------------------------------------------------------- TcpServiceDetector
 
     [Theory]
-    [InlineData("127.0.0.1", 200)]          // 没有端口分隔符
-    [InlineData("127.0.0.1:", 200)]          // 端口为空
-    [InlineData("127.0.0.1:abc", 200)]       // 端口非数字
-    [InlineData("127.0.0.1:0", 200)]         // 端口越界（下）
-    [InlineData("127.0.0.1:70000", 200)]     // 端口越界（上）
+    [InlineData("127.0.0.1", 200)]          // no port separator
+    [InlineData("127.0.0.1:", 200)]          // the port is empty
+    [InlineData("127.0.0.1:abc", 200)]       // the port is not a number
+    [InlineData("127.0.0.1:0", 200)]         // the port is out of range (below)
+    [InlineData("127.0.0.1:70000", 200)]     // the port is out of range (above)
     public void TcpServiceDetector_RejectsMalformedEndpoint(string endpoint, int timeout)
     {
-        // 坏地址一律判不可达，且不能抛（探测线程里抛出来就是整轮其他 broker 都不探了）
+        // a bad address is judged unreachable in every case, and it must not throw (throwing inside the detection thread means none of the other brokers get probed that round either)
         Assert.False(new TcpServiceDetector().Detect(endpoint, timeout));
     }
 
@@ -208,7 +212,7 @@ public class LatencyDetectorTests
             listener.Stop();
         }
 
-        // 端口已关闭：立刻判不可达（超时兜底之外还要能吃到 connection refused）
+        // the port is closed: judged unreachable immediately (beyond the timeout backstop it must also be able to get connection refused)
         Assert.False(new TcpServiceDetector().Detect($"127.0.0.1:{port}", 1000));
     }
 }

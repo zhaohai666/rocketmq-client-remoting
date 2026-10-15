@@ -1,5 +1,5 @@
-# 离线锁死停摆队列的摘除与重建；真机恢复场景见 ../verify_pull_expired_live.py
-#（注入停摆 → 走生产 rebalance 路径重建 → 同一队列继续消费、位点不回退）。
+# Offline locking of stalled-queue removal and rebuild; real-machine recovery scenarios are in ../verify_pull_expired_live.py
+# (inject a stall -> go through the production rebalance path to rebuild -> the same queue keeps consuming, offsets do not regress).
 import threading
 import time
 
@@ -27,11 +27,11 @@ def _msgs(n):
 
 
 def _consumer(pop_mode=False):
-    """一个"已经跑起来、分到 1 个队列"的消费者：拉取循环换成一具可控的空壳。
+    """A "already running, assigned 1 queue" consumer: the pull loop is swapped for a controllable empty shell.
 
-    把 target 换成 park（只是 wait），线程保持 alive 但**不碰网络**，这样
-    _rebalance_pull_threads 的撤/建分支可以单独验证；盖章由测试自己写
-    _last_pull_table，等价于真循环在每轮入口做的事。
+    Swapping target to park (just wait), the thread stays alive but **never touches the network**, so
+    _rebalance_pull_threads's revoke/build branches can be verified separately; stamping is written by the test itself via
+    _last_pull_table, equivalent to what the real loop does at each round's entry.
     """
     c = DefaultMQPushConsumer(GROUP)
     c._started = True
@@ -39,7 +39,7 @@ def _consumer(pop_mode=False):
     mq = MessageQueue("TopicTest", "broker-a", 0)
     c._assigned = [mq]
     key = c._mq_key(mq)
-    c._queue_pull_loop = lambda m: c._stop.wait(30)      # 不触网，只占住线程
+    c._queue_pull_loop = lambda m: c._stop.wait(30)      # no network access, just occupies the thread
     c._queue_pop_loop = lambda m: c._stop.wait(30)
     return c, mq, key
 
@@ -58,13 +58,13 @@ def _dead_thread():
 
 
 def _retire_log(c):
-    """把 _on_queues_revoked 换成记录器：撤走时的收尾动作是断言的重点，但不能真发 RPC。"""
+    """Swap _on_queues_revoked for a recorder: the wrap-up actions at revocation are the point of the assertions, but no real RPC may be sent."""
     seen = []
     c._on_queues_revoked = lambda revoked: seen.extend(revoked)
     return seen
 
 
-# ---------------- 常量与判据 ----------------
+# ---------------- Constants and criteria ----------------
 
 def test_pull_max_idle_time_matches_the_long_polling_default():
     pass
@@ -72,27 +72,27 @@ def test_pull_max_idle_time_matches_the_long_polling_default():
 
 
 def test_stall_predicate_needs_both_signals():
-    """判据：线程死了算停摆；线程活着但超过阈值没盖章也算；没盖过章的新循环不算。"""
+    """The criterion: a dead thread counts as stalled; a live thread that has not stamped past the threshold also counts; a new loop that has never stamped does not."""
     c, mq, key = _consumer()
     try:
         c._queue_threads[key] = _parked_thread(c)
-        assert c._pull_stalled_locked(key) is False, "刚起的循环不该被判停摆"
+        assert c._pull_stalled_locked(key) is False, "a just-started loop must not be judged stalled"
 
         c._last_pull_table[key] = time.time() - (PULL_MAX_IDLE_TIME - 10)
-        assert c._pull_stalled_locked(key) is False, "阈值内不该撤"
+        assert c._pull_stalled_locked(key) is False, "within the threshold it must not be revoked"
 
         c._last_pull_table[key] = time.time() - STALE
-        assert c._pull_stalled_locked(key) is True, "超阈值必须判停摆"
+        assert c._pull_stalled_locked(key) is True, "past the threshold it must be judged stalled"
 
         c._queue_threads[key] = _dead_thread()
         c._last_pull_table[key] = time.time()
-        assert c._pull_stalled_locked(key) is True, "线程已退出即刻判停摆，不必等满阈值"
+        assert c._pull_stalled_locked(key) is True, "a thread that has exited is immediately judged stalled, no need to wait out the threshold"
     finally:
         c._stop.set()
 
 
 def test_stall_predicate_ignores_threads_not_yet_stampable():
-    """线程已建、还没跑到盖章处（表里没有时刻）：不算停摆，否则刚分配就被撤。"""
+    """The thread is built but has not yet reached the stamping point (no timestamp in the table): not stalled, otherwise it would be revoked right after assignment."""
     c, mq, key = _consumer()
     try:
         c._queue_threads[key] = _parked_thread(c)
@@ -102,10 +102,10 @@ def test_stall_predicate_ignores_threads_not_yet_stampable():
         c._stop.set()
 
 
-# ---------------- 撤 + 建：同一趟里复原 ----------------
+# ---------------- Revoke + build: recovery in the same pass ----------------
 
 def test_stalled_queue_is_retired_and_rebuilt_in_one_pass():
-    """核心场景：停摆队列被撤（位点持久化、缓冲丢弃），同一趟立刻换新线程重建。"""
+    """The core scenario: the stalled queue is revoked (offsets persisted, buffer dropped), and a new thread rebuilds it in the same pass."""
     c, mq, key = _consumer()
     retired = _retire_log(c)
     try:
@@ -113,19 +113,19 @@ def test_stalled_queue_is_retired_and_rebuilt_in_one_pass():
         c._queue_threads[key] = old
         c._last_pull_table[key] = time.time() - STALE
         c._mq_map[key] = mq
-        c._pending[key] = _msgs(2)              # 已拉未消费的一批
-        c._offset_table[key] = 77                 # 拉取游标
-        c._consume_offsets[key] = 42              # 已消费位点，必须被持久化
+        c._pending[key] = _msgs(2)              # a batch pulled but not consumed
+        c._offset_table[key] = 77                 # pull cursor
+        c._consume_offsets[key] = 42              # consumed offset, must be persisted
 
         c._rebalance_pull_threads()
 
-        assert retired == [(mq, 42)], "停摆队列必须按撤走收尾：持久化它的已消费位点"
+        assert retired == [(mq, 42)], "a stalled queue must be wrapped up per the revocation: persist its consumed offset"
         new = c._queue_threads[key]
-        assert new is not old, "必须换掉那条停摆线程，否则还是死的"
-        assert c._pending.get(key) is None, "已拉未消费的缓冲要丢弃，由新循环重投"
-        assert c._offset_table.get(key) is None, "拉取游标要丢弃（新循环从 broker 位点重算）"
-        assert c._consume_offsets.get(key) is None, "已消费位点交给 broker，本地不留"
-        assert 0 <= time.time() - c._last_pull_table[key] < 5, "重建时重新占位，别继承旧时刻"
+        assert new is not old, "the stalled thread must be swapped out, otherwise it is still dead"
+        assert c._pending.get(key) is None, "the pulled-but-unconsumed buffer must be dropped and redelivered by the new loop"
+        assert c._offset_table.get(key) is None, "the pull cursor must be dropped (the new loop recomputes from the broker offset)"
+        assert c._consume_offsets.get(key) is None, "the consumed offset is handed to the broker, not kept locally"
+        assert 0 <= time.time() - c._last_pull_table[key] < 5, "re-claim the slot at rebuild time, do not inherit the old timestamp"
     finally:
         c._stop.set()
 
@@ -137,7 +137,7 @@ def test_thread_death_is_enough_to_rebuild():
     try:
         old = _dead_thread()
         c._queue_threads[key] = old
-        c._last_pull_table[key] = time.time()     # 盖章还新鲜，只有线程死了
+        c._last_pull_table[key] = time.time()     # the stamp is still fresh, only the thread died
         c._mq_map[key] = mq
 
         c._rebalance_pull_threads()
@@ -149,7 +149,7 @@ def test_thread_death_is_enough_to_rebuild():
 
 
 def test_healthy_queue_is_left_alone():
-    """没停摆就不许动：换线程等于把在途消息丢弃重投，白增重复消费。"""
+    """If it is not stalled it must not be touched: swapping threads means dropping and redelivering in-flight messages, adding duplicate consumption for nothing."""
     c, mq, key = _consumer()
     retired = _retire_log(c)
     try:
@@ -180,7 +180,7 @@ def test_assignment_registers_in_mq_map_before_first_message():
 
 
 def test_pop_expired_uses_last_pop_timestamp_and_drops_pq():
-    """POP 分支：判据读 lastPopTimestamp（PopProcessQueue:74-76），撤走时 set_dropped。"""
+    """POP branch: the criterion reads lastPopTimestamp (PopProcessQueue:74-76), and set_dropped at revocation."""
     c, mq, key = _consumer(pop_mode=True)
     retired = _retire_log(c)
     try:
@@ -193,15 +193,15 @@ def test_pop_expired_uses_last_pop_timestamp_and_drops_pq():
 
         c._rebalance_pull_threads()
 
-        assert pq.is_dropped() is True, "在途批次必须停：既不消费也不 ack，等 broker 复活"
-        assert c._pop_queues[key] is not pq, "重建要换一具干净的 PopProcessQueue"
+        assert pq.is_dropped() is True, "in-flight batches must stop: neither consume nor ack, waiting for the broker to come back"
+        assert c._pop_queues[key] is not pq, "the rebuild must swap in a clean PopProcessQueue"
         assert len(retired) == 1 and retired[0][0] == mq
     finally:
         c._stop.set()
 
 
 def test_stopped_consumer_is_not_swept():
-    """shutdown 期间线程本来就陆续退出：这时不判停摆，否则会刷一堆假的 [BUG] 日志。"""
+    """During shutdown threads exit one after another anyway: no stall is judged at this point, otherwise it would spam a bunch of fake [BUG] logs."""
     c, mq, key = _consumer()
     retired = _retire_log(c)
     try:
@@ -214,13 +214,13 @@ def test_stopped_consumer_is_not_swept():
         c._rebalance_pull_threads()
 
         assert c._queue_threads[key] is old
-        assert retired == [], "停机不该被当成停摆自愈"
+        assert retired == [], "a shutdown must not be treated as stall self-healing"
         assert c._consume_offsets[key] == 7
     finally:
         c._stop.set()
 
 
-# ---------------- 盖章时机：发起即盖章 ----------------
+# ---------------- Stamping timing: stamp on initiation ----------------
 
 def test_pull_loop_stamps_before_lock_and_flow_control():
     pass
@@ -234,28 +234,28 @@ def test_pull_loop_stamps_before_lock_and_flow_control():
 
     c._mq_client = _Client()
     c.subscription_data = {mq.topic: _sub()}
-    del c._queue_pull_loop                      # 用真循环，别用 _consumer() 的空壳
+    del c._queue_pull_loop                      # use the real loop, not _consumer()'s empty shell
     c.pull_threshold_for_queue = 1
-    c._pending[key] = _msgs(3)                  # 已拉 3 条 >= 阈值 1 → 每轮都触发流控
+    c._pending[key] = _msgs(3)                  # 3 pulled >= threshold 1 -> flow control triggers every round
     c._offset_table[key] = 0
     try:
         th = threading.Thread(target=c._queue_pull_loop, args=(mq,), daemon=True)
-        c._queue_threads[key] = th              # 循环靠 _owns_queue 认主，先登记再起
+        c._queue_threads[key] = th              # the loop recognizes the owner via _owns_queue, so register first, then start
         th.start()
         deadline = time.time() + 3
         while time.time() < deadline and key not in c._last_pull_table:
             time.sleep(0.05)
         c._stop.set()
         th.join(timeout=3)
-        assert key in c._last_pull_table, "流控期间也必须盖章"
-        assert pulls == [], "触发流控就不该打网络"
-        assert len(c._pending[key]) == 3, "流控只暂停拉取，不动缓冲"
+        assert key in c._last_pull_table, "stamping must happen even during flow control"
+        assert pulls == [], "when flow control triggers, no network access"
+        assert len(c._pending[key]) == 3, "flow control only pauses pulling, leaving the buffer alone"
     finally:
         c._stop.set()
 
 
 def test_pop_loop_stamps_before_flow_control():
-    """POP 同理：入口同时更新 _last_pull_table 和 PopProcessQueue.lastPopTimestamp。"""
+    """POP is the same: the entry updates both _last_pull_table and PopProcessQueue.lastPopTimestamp."""
     c, mq, key = _consumer(pop_mode=True)
     pops = []
 
@@ -270,7 +270,7 @@ def test_pop_loop_stamps_before_flow_control():
     pq = PopProcessQueue()
     pq.inc_found_msg(5)
     c._pop_queues[key] = pq
-    c.pop_threshold_for_queue = 1               # waitAck 5 > 1 → 每轮都触发流控
+    c.pop_threshold_for_queue = 1               # waitAck 5 > 1 -> flow control triggers every round
     c.pop_invisible_time = MIN_POP_INVISIBLE_TIME
     old_stamp = pq.last_pop_timestamp
     try:
@@ -282,14 +282,14 @@ def test_pop_loop_stamps_before_flow_control():
             time.sleep(0.05)
         c._stop.set()
         th.join(timeout=3)
-        assert pq.last_pop_timestamp > old_stamp, "弹不出去也要更新 lastPopTimestamp"
+        assert pq.last_pop_timestamp > old_stamp, "lastPopTimestamp must be updated even when pops cannot go out"
         assert key in c._last_pull_table
         assert pops == []
     finally:
         c._stop.set()
 
 
-# ---------------- 运行信息：307 要能看见时刻 ----------------
+# ---------------- Running info: 307 must be able to see the timestamps ----------------
 
 def test_running_info_reports_real_last_pull_timestamp():
     pass

@@ -66,7 +66,7 @@ func TestNotAllowedSendTopicSet(t *testing.T) {
 	if !IsNotAllowedSendTopic(RmqSysTransHalfTopic) {
 		t.Fatal("RMQ_SYS_TRANS_HALF_TOPIC must be forbidden")
 	}
-	// TBW102 是系统 topic 但允许发送；%RETRY% 是 sendMessageBack 的正常目标
+	// TBW102 is a system topic but sending is allowed; %RETRY% is the normal target of sendMessageBack
 	if IsNotAllowedSendTopic(AutoCreateTopicKeyTopic) {
 		t.Fatal("TBW102 must stay sendable")
 	}

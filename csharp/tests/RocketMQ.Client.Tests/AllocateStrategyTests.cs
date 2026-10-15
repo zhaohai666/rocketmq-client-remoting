@@ -1,5 +1,6 @@
-// 队列分配策略单测：AVERAGELY / CIRCLE 各用一张用例表逐格校验，
-// 另覆盖一致性哈希落点、ByMachineRoom、ByConfig 与参数守卫分支。
+// Queue allocation strategy unit tests: AVERAGELY / CIRCLE are each verified cell by
+// cell with a case table, plus the consistent-hash landing points, ByMachineRoom,
+// ByConfig and the argument guard branches.
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -24,11 +25,11 @@ public class AllocateStrategyTests
         yield return new object[] { 8, 3, new[] { new[] { 0, 1, 2 }, new[] { 3, 4, 5 }, new[] { 6, 7 } } };
         yield return new object[] { 9, 3, new[] { new[] { 0, 1, 2 }, new[] { 3, 4, 5 }, new[] { 6, 7, 8 } } };
         yield return new object[] { 4, 4, new[] { new[] { 0 }, new[] { 1 }, new[] { 2 }, new[] { 3 } } };
-        // 队列比消费者少：只有前 modulo 个各 1 条，其余空
+        // Fewer queues than consumers: only the first modulo ones get 1 each, the rest are empty
         yield return new object[] { 2, 4, new[] { new[] { 0 }, new[] { 1 }, Array.Empty<int>(), Array.Empty<int>() } };
         yield return new object[] { 1, 3, new[] { new[] { 0 }, Array.Empty<int>(), Array.Empty<int>() } };
         yield return new object[] { 3, 1, new[] { new[] { 0, 1, 2 } } };
-        // 空 mqAll（守卫）
+        // An empty mqAll (guard)
         yield return new object[] { 0, 2, new[] { Array.Empty<int>(), Array.Empty<int>() } };
     }
 
@@ -90,9 +91,9 @@ public class AllocateStrategyTests
     }
 
     [Theory]
-    [InlineData("", 4, 2)]              // 空 currentCid
-    [InlineData("CID_PREFIX0", 0, 2)]   // 空 mqAll
-    [InlineData("CID_PREFIX0", 4, 0)]   // 空 cidAll
+    [InlineData("", 4, 2)]              // an empty currentCid
+    [InlineData("CID_PREFIX0", 0, 2)]   // an empty mqAll
+    [InlineData("CID_PREFIX0", 4, 0)]   // an empty cidAll
     [InlineData("CID_NOT_IN_LIST", 4, 2)]
     public void Guards_return_empty_result(string currentCid, int mqSize, int cidSize)
     {
@@ -126,7 +127,7 @@ public class AllocateStrategyTests
         Assert.Equal(new[] { 0, 1 }, Ids(strategy.Allocate("G", "anyCID", QueuesOf(5), empty)));
     }
 
-    /// 未配置 = 空列表（缺省就是空），且 allocate 给的是副本。
+    /// Not configured = an empty list (empty by default), and allocate hands out a copy.
     [Fact]
     public void ByConfig_defaults_empty_and_returns_copy()
     {
@@ -156,7 +157,7 @@ public class AllocateStrategyTests
             strategies.Select(s => s.GetName()).ToArray());
     }
 
-    /// 全覆盖 + 不重叠：任意 (队列数, 消费者数) 组合下，所有消费者的并集恰为 mqAll。
+    /// Full coverage + no overlap: for any (queue count, consumer count) combination, the union over all consumers is exactly mqAll.
     [Fact]
     public void Partition_covers_every_queue_exactly_once()
     {
@@ -183,8 +184,9 @@ public class AllocateStrategyTests
         }
     }
 
-    /// 差分测试：averagely 与 bycircle 两种策略的算式逐值比对，
-    /// 本地参考实现与策略实现必须逐值一致。
+    /// Differential testing: the formulas of the averagely and bycircle strategies are
+    /// compared value by value, and the local reference implementation must agree with
+    /// the strategy implementation value by value.
     [Fact]
     public void Matches_golden_arithmetic()
     {
@@ -207,7 +209,7 @@ public class AllocateStrategyTests
         }
     }
 
-    // averagely 策略的参考算式，不参与实现，只用于差分测试
+    // The reference formula for the averagely strategy; it takes no part in the implementation and is only used for the differential test
     private static List<int> ReferenceAveragely(List<int> mqAll, List<string> cidAll, string currentCid)
     {
         if (mqAll.Count == 0) return new List<int>();
@@ -233,7 +235,7 @@ public class AllocateStrategyTests
         return mqAll.GetRange(startIndex, endIndex - startIndex);
     }
 
-    // bycircle 策略的参考算式
+    // The reference formula for the bycircle strategy
     private static List<int> ReferenceCircle(List<int> mqAll, List<string> cidAll, string currentCid)
     {
         var result = new List<int>();
@@ -244,7 +246,7 @@ public class AllocateStrategyTests
         return result;
     }
 
-    /// 真实队列（同 topic 挂多个 brokerName）也一律按下标切分。
+    /// Real queues (several brokerNames under the same topic) are split by index as well.
     [Fact]
     public void Allocate_real_queues_from_multiple_brokers()
     {
@@ -274,7 +276,7 @@ public class AllocateStrategyTests
         Assert.Equal("AVG_BY_CIRCLE", push.AllocateMessageQueueStrategy.GetName());
         push.AllocateMessageQueueStrategy = null;
         Assert.Null(push.AllocateMessageQueueStrategy);
-        // 地址给一个不可达的假值即可：checkConfig 全部是本地校验，排在建连之前。
+        // An unreachable fake value is fine for the address: checkConfig is all local validation and comes before connecting.
         push.SetNamesrvAddr("127.0.0.1:1");
         MQClientException pushException = Assert.Throws<MQClientException>(() => push.Start());
         Assert.Contains("allocateMessageQueueStrategy is null", pushException.Message);
@@ -357,7 +359,7 @@ public class AllocateStrategyTests
     private static void RunConsistentHashTable(IAllocateMessageQueueStrategy strategy, int mqSize,
         int cidSize, int[][] expect)
     {
-        List<MessageQueue> mqAll = QueuesOf(mqSize);  // ("topic","brokerName",i)，toString 参与哈希
+        List<MessageQueue> mqAll = QueuesOf(mqSize);  // ("topic","brokerName",i), toString takes part in the hash
         List<string> cidAll = ChCids(cidSize);
         Assert.Equal(cidSize, expect.Length);
         for (int i = 0; i < cidSize; i++)
@@ -392,7 +394,7 @@ public class AllocateStrategyTests
         }
     }
 
-    /// 一致性哈希的全部意义：成员变化只动涉及的那段弧，其它消费者的队列不换主。
+    /// The entire point of consistent hashing: when the membership changes only the arc segment involved moves, and the queues of the other consumers do not change owner.
     [Fact]
     public void Consistent_hash_is_stable_when_membership_changes()
     {
@@ -417,26 +419,25 @@ public class AllocateStrategyTests
         string[] before = OwnerOf(cidAll);
         Assert.All(before, o => Assert.NotNull(o));
 
-        // 摘掉 CID-0：它原来的队列会被别人接走（那是必须发生的），
-        // 但**原本就在别人手里**的队列必须还在那个人手里。
+        // Removing CID-0: the queues it used to own are taken over by others (that has to happen), but the queues that were **already** in someone else's hands must still be in that person's hands.
         List<string> remaining = cidAll.GetRange(1, cidAll.Count - 1);
         string[] afterRemove = OwnerOf(remaining);
         for (int qid = 0; qid < before.Length; qid++)
         {
             if (before[qid] != "CID-0")
             {
-                Assert.Equal(before[qid], afterRemove[qid]);  // 摘队时不该换主
+                Assert.Equal(before[qid], afterRemove[qid]);  // no owner change when a member is removed
             }
         }
 
-        // 加一个新消费者：同理，只有分给 CID-NEW 的队列是新增的。
+        // Adding a new consumer: likewise, only the queues assigned to CID-NEW are new.
         List<string> joined = new(remaining) { "CID-NEW" };
         string[] afterAdd = OwnerOf(joined);
         for (int qid = 0; qid < before.Length; qid++)
         {
             if (afterAdd[qid] != "CID-NEW")
             {
-                Assert.Equal(before[qid], afterAdd[qid]);  // 加人时不该换主
+                Assert.Equal(before[qid], afterAdd[qid]);  // no owner change when a member is added
             }
         }
     }
@@ -471,7 +472,7 @@ public class AllocateStrategyTests
         List<string> cidAll = ChCids(2);
         Assert.Empty(ChAllocateIds(strategy, "CID-0", mqAll, cidAll));
         Assert.Equal(new[] { 0, 1, 2, 3 }, ChAllocateIds(strategy, "CID-1", mqAll, cidAll));
-        Assert.True(injected.Calls > 0, "自定义哈希没被调用");
+        Assert.True(injected.Calls > 0, "the custom hash was never called");
     }
 
     [Fact]
@@ -508,8 +509,8 @@ public class AllocateStrategyTests
     {
         yield return new object[] { "room1@broker-a", 2, true };
         yield return new object[] { "room1@", 1, false };
-        yield return new object[] { "room1@b@", 2, true };     // 裁尾后仍是 2 段
-        yield return new object[] { "@room1", 2, false };       // 2 段，但机房是空串、不在白名单
+        yield return new object[] { "room1@b@", 2, true };     // still 2 segments after tail stripping
+        yield return new object[] { "@room1", 2, false };       // 2 segments, but the room is an empty string and not on the allow list
         yield return new object[] { "room1@broker@a", 3, false };
         yield return new object[] { "@", 0, false };
         yield return new object[] { "broker-a", 1, false };
@@ -564,7 +565,7 @@ public class AllocateStrategyTests
         public string ConsumerDeployIn(string clientId) => clientId.Split('-')[0];
     }
 
-    /// 拿一个机房前缀，用于断言"队列有没有外流到别的机房"。
+    /// Takes a machine room prefix, used to assert "did any queue leak into another room".
     private static string RoomOf(string nameOrId) => nameOrId.Split('-')[0];
 
     private static List<MessageQueue> NearbyMq(int idcSize, int queueSize) =>
@@ -594,7 +595,7 @@ public class AllocateStrategyTests
         {
             foreach (MessageQueue mq in strategy.Allocate("Test-C-G", cid, mqAll, cidAll))
             {
-                Assert.Equal(RoomOf(cid), RoomOf(mq.BrokerName));  // 不该拿到别的机房的队列
+                Assert.Equal(RoomOf(cid), RoomOf(mq.BrokerName));  // it must not get a queue from another room
                 flat.Add(mq.BrokerName + "#" + mq.QueueId);
             }
         }
@@ -621,7 +622,7 @@ public class AllocateStrategyTests
         Assert.Equal(new[] { "IDC1-brokerName#1", "IDC2-brokerName#2", "IDC2-brokerName#3" },
             Describe(strategy.Allocate("G", "IDC1-CID-1", mqAll, cidAll)));
 
-        // 5 个机房、只有前 2 个有消费者：每条队列都得有人消费，健康机房不外流。
+        // 5 rooms, only the first 2 have consumers: every queue must be consumed and a healthy room must not leak
         List<MessageQueue> manyMq = NearbyMq(5, 4);
         List<string> manyCids = NearbyCids(2, 3);
         int claimed = 0;
@@ -632,7 +633,7 @@ public class AllocateStrategyTests
                 string room = RoomOf(mq.BrokerName);
                 if (room is "IDC1" or "IDC2")
                 {
-                    Assert.Equal(room, RoomOf(cid));  // 有消费者的机房队列不该外流
+                    Assert.Equal(room, RoomOf(cid));  // a queue in a room that has consumers must not leak
                 }
 
                 claimed++;
@@ -684,7 +685,7 @@ public class AllocateStrategyTests
                 .Allocate("G", "CID-0", mqAll, cidAll));
         Assert.Contains("Machine room is null for consumer id CID-0", e.Message);
 
-        // 守卫仍然优先：cidAll 为空时先返回空，不碰 resolver
+        // The guard still comes first: when cidAll is empty it returns empty without touching the resolver
         Assert.Empty(new AllocateMachineRoomNearby(new AllocateMessageQueueAveragely(), new BlankBrokerRoom())
             .Allocate("G", "CID-0", mqAll, new List<string>()));
     }
@@ -700,7 +701,7 @@ public class AllocateStrategyTests
         Assert.Contains("machineRoomResolver is null", resolver.Message);
     }
 
-    /// javaSplit 的早返回分支（没命中分隔符时不裁尾）单独钉一遍。
+    /// The early-return branch of javaSplit (no tail stripping when the separator is not hit) is pinned separately.
     [Theory]
     [InlineData("", 1)]
     [InlineData("@", 0)]
@@ -714,7 +715,7 @@ public class AllocateStrategyTests
         Assert.Equal(parts, AllocateMessageQueueStrategyUtil.Split(text, '@').Length);
     }
 
-    /// 三个新策略在 push / lite / pull 消费者上都能换上并读回（暴露面与旧策略一致）。
+    /// All three new strategies can be swapped in on push / lite / pull consumers and read back (the same exposure surface as the old strategies).
     [Fact]
     public void New_strategies_plug_into_the_consumers()
     {
@@ -723,7 +724,6 @@ public class AllocateStrategyTests
         var push = new DefaultMQPushConsumer("G_test");
         push.AllocateMessageQueueStrategy = new AllocateMessageQueueConsistentHash(3);
         Assert.Equal("CONSISTENT_HASH", push.AllocateMessageQueueStrategy.GetName());
-        // 单消费者 + 哈希环：4 条队列全落在自己身上
         Assert.Equal(new[] { 0, 1, 2, 3 }, Ids(push.AllocateMessageQueueStrategy
             .Allocate("g", "CID-0", QueuesOf(4), cidAll)));
 

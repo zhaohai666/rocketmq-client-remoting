@@ -420,8 +420,8 @@ func TestSocks5WrongPasswordRejected(t *testing.T) {
 	proxy := newFakeSocks5Server(t, true, "rmqUser", "rmqPass")
 	cfg := NewSocksProxyConfigWithAuth(proxy.addr(), "rmqUser", "WRONG")
 	// Failure-class assertions get a generous budget: the handshake itself is
-	// bounded by this timeout, not by any retry loop (本机 loopback 上刚关闭的
-	// 端口约 2s 内会拒绝，失败用例一律给足预算).
+	// bounded by this timeout, not by any retry loop (a port just closed on the
+	// local loopback is refused within ~2s, so failure cases are given a full budget).
 	_, err := dialSocksProxy(cfg, hostOf(target), portOf(target), 35*time.Second)
 	if err == nil {
 		t.Fatal("expected auth failure, got nil error")

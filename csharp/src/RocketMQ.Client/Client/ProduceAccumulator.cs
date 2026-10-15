@@ -1,7 +1,9 @@
-// 生产者打开 AutoBatch 之后，Send(Message) 不再一条一条直发，而是先按
-// AggregateKey(topic, mq, waitStoreMsgOK, tag) 归并进 MessageAccumulation，攒够
-// holdMs/holdSize（或被守卫线程唤醒）再合成**一个** MessageBatch 发出去，最后把 broker
-// 回的**批量** SendResult 拆回每条消息各自的 SendResult —— 调用方看到的东西与直发一致。
+// Once the producer turns AutoBatch on, Send(Message) no longer sends one by one
+// directly: messages are first merged into a MessageAccumulation keyed by
+// AggregateKey(topic, mq, waitStoreMsgOK, tag), and once holdMs/holdSize is reached
+// (or the guard thread wakes it up) they are combined into **one** MessageBatch that is
+// sent out; finally the **batch** SendResult returned by the broker is split back into
+// a per-message SendResult -- what the caller sees is the same as with a direct send.
 
 using System.Collections.Concurrent;
 using RocketMQ.Common;
@@ -56,7 +58,8 @@ public sealed class MessageAccumulation
     public AggregateKey AggregateKey { get; }
     public List<Message> Messages { get; } = new();
     public List<ISendCallback> SendCallbacks { get; } = new();
-    /// <summary>同步 Add 收集、异步 Add 不收集（见文件头第 4 条）。</summary>
+    /// <summary>A synchronous Add accumulates, an asynchronous Add does not (see item 4 in
+    /// the file header).</summary>
     public HashSet<string> Keys { get; } = new();
     public SendResult[] SendResults { get; private set; } = Array.Empty<SendResult>();
     public int Count { get; private set; }
@@ -74,8 +77,9 @@ public sealed class MessageAccumulation
 
     internal object ClosedLock => _closedLock;
 
-    /// <summary>本批是否已被关掉（关掉即"不再接受新消息"，且已经发过/正在发）。
-    /// public 只为测试断言用。</summary>
+    /// <summary>Whether this batch has already been closed (closed means "no longer
+    /// accepting new messages", and it has already been sent or is being sent).
+    /// public only so tests can assert on it.</summary>
     public bool IsClosed
     {
         get
@@ -113,8 +117,9 @@ public sealed class MessageAccumulation
     }
 
     /// <summary>
-    /// 同步加入；返回本条消息在本批里的下标，-1 表示本批已关闭（调用方需重取）。
-    /// 返回前保证本批**已经发出去**，因此 SendResults[index] 一定可用。
+    /// Synchronous add; returns the index of this message inside the batch, -1 meaning the
+    /// batch was closed (the caller has to fetch a new one). Before returning, the batch is
+    /// guaranteed to have **already been sent**, so SendResults[index] is always usable.
     /// </summary>
     public int Add(Message msg)
     {
@@ -158,7 +163,8 @@ public sealed class MessageAccumulation
         return ret;
     }
 
-    /// <summary>异步加入；false 表示本批已关闭（调用方需重取）。</summary>
+    /// <summary>Asynchronous add; false means the batch was closed (the caller has to fetch
+    /// a new one).</summary>
     public bool Add(Message msg, ISendCallback sendCallback)
     {
         lock (_closedLock)
@@ -210,7 +216,7 @@ public sealed class MessageAccumulation
         {
             Topic = AggregateKey.Topic,
             WaitStoreMsgOk = AggregateKey.WaitStoreMsgOk,
-            // 无条件写（空集合即 KEYS=""，见文件头第 5 条）
+            // Unconditional write (an empty collection means KEYS="", see item 5 in the file header)
             Keys = string.Join(MessageConst.KeySeparator, Keys),
         };
         if (AggregateKey.Tag != null)
@@ -220,7 +226,7 @@ public sealed class MessageAccumulation
 
         MessageClientIDSetter.SetUniqId(batch);
         batch.Body = batch.Encode();
-        batch.IsBatch = true; // 见文件头第 7 条
+        batch.IsBatch = true; // see item 7 in the file header
         return batch;
     }
 
@@ -408,33 +414,36 @@ public sealed class ProduceAccumulator
         }
     }
 
-    // ---------------- 取证 / 测试接缝 ----------------
-    // 测试工程与本程序集没有 InternalsVisibleTo 关系，这几个用 public，勿用于业务代码。
+    // ---------------- Evidence gathering / test seams ----------------
+    // The test project has no InternalsVisibleTo relationship with this assembly, so these
+    // are public; do not use them from business code.
 
-    /// <summary>同步表里当前的批次数。</summary>
+    /// <summary>The current number of batches in the synchronous table.</summary>
     public int SyncBatchCount => _syncSendBatchs.Count;
 
-    /// <summary>异步表里当前的批次数。</summary>
+    /// <summary>The current number of batches in the asynchronous table.</summary>
     public int AsyncBatchCount => _asyncSendBatchs.Count;
 
-    /// <summary>同步表快照（顺序不定）。</summary>
+    /// <summary>A snapshot of the synchronous table (order unspecified).</summary>
     public MessageAccumulation[] SyncBatchesSnapshot() =>
         _syncSendBatchs.Values.ToArray();
 
-    /// <summary>异步表快照（顺序不定）。</summary>
+    /// <summary>A snapshot of the asynchronous table (order unspecified).</summary>
     public MessageAccumulation[] AsyncBatchesSnapshot() =>
         _asyncSendBatchs.Values.ToArray();
 
-    /// <summary>测试用：往同步表里放一个（尚无人 add 的）批次 —— 用来验证守卫线程对
-    /// <c>MessagesSize == 0</c> 的清理口径，正常调用链里这个窗口只有一两行代码那么宽。</summary>
+    /// <summary>For tests: puts a (not yet added to) batch into the synchronous table --
+    /// used to verify the guard thread's cleanup rule for <c>MessagesSize == 0</c>, a window
+    /// that is only a line or two wide in the normal call chain.</summary>
     public MessageAccumulation PutEmptySyncBatch(AggregateKey key, DefaultMQProducer producer) =>
         GetOrCreateSyncSendBatch(key, producer);
 
-    /// <summary>测试用：手工跑一轮守卫（等价于守卫线程某个 <c>DoWork</c> 周期）。</summary>
+    /// <summary>For tests: manually runs one guard round (equivalent to one
+    /// <c>DoWork</c> cycle of the guard thread).</summary>
     public void RunGuardOnce(bool sync) =>
         (sync ? _guardThreadForSyncSend : _guardThreadForAsyncSend).DoOneRound();
 
-    // ---------------- 生命周期 ----------------
+    // ---------------- Lifecycle ----------------
     public void Start()
     {
         _guardThreadForSyncSend.Start();
@@ -513,7 +522,7 @@ public sealed class ProduceAccumulator
         }
     }
 
-    // ---------------- 表操作 ----------------
+    // ---------------- Table operations ----------------
     private MessageAccumulation GetOrCreateSyncSendBatch(AggregateKey key,
         DefaultMQProducer producer) =>
         _syncSendBatchs.GetOrAdd(key, k => new MessageAccumulation(k, producer, this));
@@ -537,7 +546,8 @@ public sealed class ProduceAccumulator
             int index = batch.Add(msg);
             if (index == -1)
             {
-                // 本批在本次 Add 之前就被别的线程关掉了：摘掉它，重取/新建一个再试
+                // This batch was closed by another thread before this Add: remove it,
+                // fetch/create a new one and try again
                 RemoveSyncBatch(key, batch);
                 continue;
             }
@@ -638,7 +648,8 @@ public sealed class ProduceAccumulator
             }
         }
 
-        /// <summary>一个守卫周期。<see cref="Run"/> 循环调它，测试也手工调它（不必等真实周期）。</summary>
+        /// <summary>One guard cycle. <see cref="Run"/> calls it in a loop, and tests
+        /// call it manually (no need to wait for a real cycle).</summary>
         public void DoOneRound()
         {
             try

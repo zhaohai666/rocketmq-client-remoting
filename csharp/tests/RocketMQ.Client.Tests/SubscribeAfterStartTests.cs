@@ -1,16 +1,20 @@
-// 订阅后置 + 立即心跳（#73）离线单测 —— 不需要集群。
+// Offline unit tests for subscribe-after-start plus the immediate heartbeat (#73) -- no cluster needed.
 //
 //
-// 为什么必须锁死：真机上「新订阅没推给 broker」是静默的 —— 只表现为
-// QUERY_TOPIC_CONSUME_BY_WHO(300) 查不到本组、新 topic 分不到队列，客户端一声不响。
+// Why it must be pinned: on a real machine "the new subscription is not pushed to the
+// broker" is silent -- it only shows up as QUERY_TOPIC_CONSUME_BY_WHO(300) not finding the
+// group and a new topic getting no queues, while the client says nothing at all.
 //
-// 离线能测到哪一步：消费者对着连不上的 name server 启动（路由拉不到 ⇒ KnownBrokerAddrs
-// 为空 ⇒ 心跳一台都发不出去），因此只能证明
-//   ① Start() 之后 Subscribe 不再抛 already started；
-//   ② 新订阅立刻进活订阅表（SubscribedTopics()，即心跳与 rebalance 读的那张表）；
-//   ③ Unsubscribe 照旧只删表项。
-// 报文层面「broker 真收到带新订阅的心跳」由 examples 的 live-subscribe 场景在真机验证
-// （broker 侧 topicGroupTable 的 300 号查询是唯一可信观测）。
+// How far offline can reach: the consumer starts against an unreachable name server (no
+// route can be fetched => KnownBrokerAddrs is empty => not a single heartbeat can go out),
+// so all that can be proven is
+//   (1) Subscribe after Start() no longer throws "already started";
+//   (2) the new subscription enters the live subscription table right away (SubscribedTopics(),
+//       the table the heartbeat and the rebalance read);
+//   (3) Unsubscribe still only removes the entry.
+// At the wire level, "the broker really received a heartbeat carrying the new subscription"
+// is verified on a real machine by the examples' live-subscribe scenario (the code-300 query
+// on the broker's topicGroupTable is the only trustworthy observation).
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -25,7 +29,8 @@ namespace RocketMQ.Client.Tests;
 
 public class SubscribeAfterStartTests
 {
-    /// <summary>永远连不上的地址：路由拉取当场被拒（只记 debug 日志），零 broker ⇒ 不发包。</summary>
+    /// <summary>An address that never connects: the route fetch is refused outright (only
+    /// a debug log), zero brokers => no packets sent.</summary>
     private const string DeadNamesrv = "127.0.0.1:1";
 
     private sealed class NoopListener : IMessageListenerConcurrently
@@ -54,14 +59,14 @@ public class SubscribeAfterStartTests
         {
             Assert.True(c.IsStarted);
 
-            // 旧实现在这里抛 MQClientException("consumer already started...")。
+            // the old implementation threw MQClientException("consumer already started...") here.
             c.Subscribe("LateTopic", "TagA||TagB");
             Assert.Contains("LateTopic", c.SubscribedTopics());
 
             c.Subscribe("LateSqlTopic", MessageSelector.BySql("a > 1"));
             Assert.Contains("LateSqlTopic", c.SubscribedTopics());
 
-            // 零 broker：心跳一台都发不出去，计数器不动（同时反证上面没偷偷发包）。
+            // zero brokers: not one heartbeat can go out and the counter does not move (which also proves nothing was sent behind the scenes above).
             Assert.Equal(0, c.HeartbeatCount);
         }
         finally

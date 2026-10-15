@@ -73,7 +73,7 @@ func checkJSONFrame() {
 
 	cmd := remoting.CreateRequestCommand(remoting.ReqGetRouteInfoByTopic, nil)
 	cmd.SerializeTypeCurrentRPC = remoting.SerializeTypeJSON
-	cmd.Remark = "hello 中文"
+	cmd.Remark = "hello chinese"
 	cmd.AddExtField("topic", "TopicTest")
 	cmd.AddExtField("namesrv", "127.0.0.1:9876")
 	cmd.AddExtField("html", "a<b>&c")
@@ -104,7 +104,7 @@ func checkBinaryFrame() {
 
 	cmd := remoting.CreateRequestCommand(remoting.ReqPullMessage, nil)
 	cmd.SerializeTypeCurrentRPC = remoting.SerializeTypeRocketMQ
-	cmd.Remark = "binary 字段"
+	cmd.Remark = "binary field"
 	cmd.AddExtField("consumerGroup", "G")
 	cmd.AddExtField("topic", "T")
 	cmd.AddExtField("queueId", "3")
@@ -204,7 +204,7 @@ func checkMessage17Seg() {
 
 	ext := common.NewMessageExt()
 	ext.Topic = "SelfCheck"
-	ext.Body = []byte("hello rocketmq 中文")
+	ext.Body = []byte("hello rocketmq chinese")
 	ext.Flag = 2
 	ext.BodyCRC = common.Crc32(ext.Body)
 	ext.QueueID = 3

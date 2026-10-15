@@ -2,16 +2,19 @@
 
 declare(strict_types=1);
 
-// LZ4 Frame codec + ZSTD frame codec — 纯 PHP 主体，零第三方扩展（repo rule）。
+// LZ4 Frame codec + ZSTD frame codec — pure PHP core, zero third-party extensions (repo rule).
 //
-// LZ4: **LZ4 Frame 格式**（magic 0x184D2204 的自描述帧，任何合规 LZ4 解码器可解）。
-// Frame 的内部块就是 LZ4 block-format —— 纯 PHP 编解码，见下方 block 层。
+// LZ4: the **LZ4 Frame format** (the self-describing frame with magic 0x184D2204, which any compliant
+// LZ4 decoder can decode). The internal blocks of a frame are plain LZ4 block-format — pure PHP
+// encode/decode, see the block layer below.
 //
-// ZSTD: 压缩/解压**优先走 zstd CLI**（proc_open，stdin→stdout，真压缩率 +
-// 能解标准 Compressed 块，与 broker 侧的真 zstd 互通）；CLI 不可用时退回纯实现——
-// 压缩 = 只用 RAW 块（长串跑 RLE）拼出的合法 zstd 帧（无压缩率但 wire 兼容），
-// 解压只认 Raw/RLE 块，遇到 Compressed 块显式报错而不是把压缩字节当正文交回
-// —— wire 兼容规则「unsupported = throw, never passthrough」。
+// ZSTD: compression/decompression **prefers the zstd CLI** (proc_open, stdin→stdout, real compression
+// ratio + able to decode standard Compressed blocks, interoperable with the real zstd on the broker
+// side); when the CLI is unavailable it falls back to the pure implementation —
+// compression = a legal zstd frame assembled from RAW blocks only (long runs encoded as RLE) (no
+// compression ratio but wire compatible), decompression only accepts Raw/RLE blocks and raises an
+// explicit error on a Compressed block instead of handing the compressed bytes back as payload
+// — the wire-compatibility rule: "unsupported = throw, never passthrough".
 namespace RocketMQ\Common;
 
 final class CompressionCodec
@@ -19,16 +22,16 @@ final class CompressionCodec
     // ---------------------------------------------------------------- LZ4 block
 
     private const LZ4_MIN_MATCH = 4;
-    // block 末 5 字节必须是字面量（LZ4 block-format 规则）；编码器按
-    // 「最后一个 match 必须距末尾 ≥12B」的保守规则停止匹配。
+    // The last 5 bytes of a block must be literals (LZ4 block-format rule); the encoder stops matching
+    // by the conservative rule "the last match must stay >= 12B away from the end".
     private const LZ4_MF_LIMIT = 12;
     private const LZ4_HASH_LOG = 16;
     private const LZ4_HASH_SIZE = 1 << 16;
 
-    /** u32 * 2654435761 的低 32 位再右移 16 位（纯 int 运算，不吃 float 溢出）。 */
+    /** The low 32 bits of u32 * 2654435761, then shifted right by 16 bits (pure int arithmetic, no float overflow). */
     private static function lz4Hash(int $u32): int
     {
-        // 64 位 int 直接乘会超 PHP_INT_MAX，拆 16 位半字取低 32 位。
+        // A direct 64-bit int multiply would exceed PHP_INT_MAX, so split into 16-bit halves to keep the low 32 bits.
         $lo = $u32 & 0xFFFF;
         $hi = $u32 >> 16;
         $kLo = 2654435761 & 0xFFFF;
@@ -43,7 +46,7 @@ final class CompressionCodec
     }
 
     /**
-     * 把 $data 编成一个 LZ4 block（无帧头；Frame 层的每个内部块就是这一层）。
+     * Encodes $data into one LZ4 block (no frame header; every internal block of the Frame layer is this layer).
      */
     public static function lz4CompressBlock(string $data): string
     {
@@ -56,8 +59,8 @@ final class CompressionCodec
         $anchor = 0;
         $i = 0;
 
-        // emitSequence: token -> literals -> offset -> match-length 扩展（wire 顺序）。
-        // matchLen < 4 表示「只有字面量」（无 match）。
+        // emitSequence: token -> literals -> offset -> match-length extension (wire order).
+        // matchLen < 4 means "literals only" (no match).
         $emitSequence = function (int $litFrom, int $litTo, int $off = 0, int $matchLen = 0) use (&$out, $data): void {
             $litLen = $litTo - $litFrom;
             $token = 0;
@@ -69,7 +72,7 @@ final class CompressionCodec
                 $token |= $ll << 4;
                 $ll = -1;
             }
-            $ml = $matchLen - self::LZ4_MIN_MATCH; // <0 = 只有字面量
+            $ml = $matchLen - self::LZ4_MIN_MATCH; // <0 = literals only
             if ($ml >= 0) {
                 if ($ml >= 15) {
                     $token |= 0x0F;
@@ -111,8 +114,9 @@ final class CompressionCodec
                 $i++;
                 continue;
             }
-            // match 向前扩展。block 末 5 字节必须留成字面量（LZ4 block-format
-            // 规则 —— 参考编/解码器都依赖它），match 不能越过 n-5。
+            // Extend the match forward. The last 5 bytes of a block must stay literals (LZ4
+            // block-format rule — both reference encoders and decoders depend on it), and the match
+            // must not cross n-5.
             $matchLen = self::LZ4_MIN_MATCH;
             while ($i + $matchLen < $n - 5 && $data[$ref + $matchLen] === $data[$i + $matchLen]) {
                 $matchLen++;
@@ -121,12 +125,12 @@ final class CompressionCodec
             $i += $matchLen;
             $anchor = $i;
         }
-        // 收尾字面量（后面不再有 match）。
+        // Trailing literals (no more matches afterwards).
         $emitSequence($anchor, $n);
         return $out;
     }
 
-    /** 解一个 LZ4 block；坏输入直接抛异常。 */
+    /** Decodes one LZ4 block; bad input throws immediately. */
     public static function lz4DecompressBlock(string $data): string
     {
         $n = strlen($data);
@@ -159,7 +163,7 @@ final class CompressionCodec
                 $src += $litLen;
             }
             if ($src >= $n) {
-                break; // 末段只有字面量，block 到此结束
+                break; // the trailing segment is literals only, the block ends here
             }
             if ($src + 2 > $n) {
                 throw new \RuntimeException('lz4 decompress: truncated match offset');
@@ -175,8 +179,9 @@ final class CompressionCodec
             if ($ref < 0) {
                 throw new \RuntimeException('lz4 decompress: match offset before start');
             }
-            // 逐字节追加（格式允许重叠 match；ref 落在已输出区间内，
-            // 边读边 append 是安全的）。PHP 字符串追加 O(1) 摊销。
+            // Append byte by byte (the format allows overlapping matches; the ref lands inside the
+            // already emitted range, so reading and appending at the same time is safe).
+            // PHP string append is O(1) amortized.
             for ($k = 0; $k < $matchLen; $k++) {
                 $out .= $out[$ref + $k];
             }
@@ -189,7 +194,7 @@ final class CompressionCodec
     private const ZSTD_MAGIC = 0xFD2FB528;
     private const ZSTD_BLOCK_MAX = 128 * 1024;
 
-    /** zstd CLI 探测（进程内缓存）。有 → 真 zstd 通道；无 → null（Raw/RLE 兜底）。 */
+    /** zstd CLI detection (cached per process). Present → the real zstd channel; absent → null (Raw/RLE fallback). */
     private static ?string $zstdCli = null;
     private static bool $zstdCliProbed = false;
 
@@ -206,8 +211,9 @@ final class CompressionCodec
     }
 
     /**
-     * 经 zstd CLI 处理一段字节（stdin→stdout，参数固定、路径 escapeshellarg，
-     * 不落盘、无注入面）。CLI 缺失或执行失败返回 null，由调用方走兜底路径。
+     * Runs a chunk of bytes through the zstd CLI (stdin→stdout, fixed arguments, path escaped with
+     * escapeshellarg, nothing hits disk, no injection surface). Returns null when the CLI is missing or
+     * execution fails, so the caller takes the fallback path.
      */
     private static function zstdCliRun(string $args, string $input): ?string
     {
@@ -224,7 +230,7 @@ final class CompressionCodec
         fclose($pipes[0]);
         $out = stream_get_contents($pipes[1]);
         fclose($pipes[1]);
-        fclose($pipes[2]); // stderr：-q 下只有出错才有内容， Pipe 缓冲不会满
+        fclose($pipes[2]); // stderr: with -q it only has content on error, so the pipe buffer never fills
         $rc = proc_close($proc);
         if ($rc !== 0 || $out === false) {
             return null;
@@ -233,8 +239,9 @@ final class CompressionCodec
     }
 
     /**
-     * ZSTD 压缩统一入口：CLI 可用 → 真 zstd（压缩率 + 全互通）；
-     * 否则退回纯实现的 Raw/RLE 帧（无压缩率但 wire 兼容）。
+     * Single entry point for ZSTD compression: CLI available → real zstd (compression ratio + full
+     * interoperability); otherwise fall back to the pure-implementation Raw/RLE frame (no compression
+     * ratio but wire compatible).
      */
     public static function zstdCompress(string $data): string
     {
@@ -243,9 +250,10 @@ final class CompressionCodec
     }
 
     /**
-     * ZSTD 解压统一入口：CLI 可用 → 全帧型解压（含标准 zstd 压出的
-     * Compressed 块）；CLI 缺失 → 纯实现（只认 Raw/RLE，Compressed 块仍显式抛，
-     * 绝不把压缩字节当正文交回）。
+     * Single entry point for ZSTD decompression: CLI available → full-frame decompression (including
+     * Compressed blocks produced by standard zstd); CLI missing → the pure implementation (Raw/RLE
+     * only, Compressed blocks still throw explicitly, the compressed bytes are never handed back as
+     * payload).
      */
     public static function zstdDecompress(string $data): string
     {
@@ -254,13 +262,14 @@ final class CompressionCodec
     }
 
     /**
-     * 拼一个最小合法 ZSTD 帧：header（single-segment + 8 字节 content size）
-     * + RAW/RLE 块。broker 的 zstd 解码器原样接收；无压缩率，只保证 wire 兼容。
+     * Assembles a minimal legal ZSTD frame: header (single-segment + 8-byte content size)
+     * + RAW/RLE blocks. The broker's zstd decoder accepts it as-is; no compression ratio, only wire
+     * compatibility is guaranteed.
      */
     public static function zstdCompressRaw(string $data): string
     {
         $out = pack('V', self::ZSTD_MAGIC);
-        // 帧头描述符：FCS_Field_Size=8（flag 3）+ Single_Segment=1。
+        // Frame header descriptor: FCS_Field_Size=8 (flag 3) + Single_Segment=1.
         $out .= chr(0xE0 | 0x20);
         $out .= pack('P', strlen($data));
         $n = strlen($data);
@@ -269,8 +278,8 @@ final class CompressionCodec
             $chunk = min(self::ZSTD_BLOCK_MAX, $n - $pos);
             $last = ($pos + $chunk >= $n) ? 1 : 0;
             if ($n > 0 && $chunk > 1 && self::isRunOfOneByte($data, $pos, $chunk)) {
-                // RLE 块：1 个载荷字节重复 chunk 次。
-                // 块头：bit0=Last_Block，bits1-2=Block_Type(RLE=1)，bits3-23=size。
+                // RLE block: 1 payload byte repeated chunk times.
+                // Block header: bit0=Last_Block, bits1-2=Block_Type(RLE=1), bits3-23=size.
                 $sizeBits = $chunk << 3;
                 $h0 = ($sizeBits & 0xFF) | 0x02 | $last;
                 $out .= chr($h0) . chr(($sizeBits >> 8) & 0xFF) . chr(($sizeBits >> 16) & 0xFF);
@@ -300,8 +309,9 @@ final class CompressionCodec
     }
 
     /**
-     * 解一个只含 Raw/RLE 块的 ZSTD 帧（本端与 raw-frame 兼容模式产出的形状）。
-     * Compressed 块直接抛 —— 调用方把异常变成「解码失败」，绝不交回压缩字节。
+     * Decodes a ZSTD frame that contains only Raw/RLE blocks (the shape produced by our own side and by
+     * raw-frame compatible modes). Compressed blocks throw immediately — the caller turns the exception
+     * into a "decode failure" and never hands the compressed bytes back.
      */
     public static function zstdDecompressFrame(string $data): string
     {
@@ -320,7 +330,7 @@ final class CompressionCodec
         $singleSegment = ($desc & 0x20) !== 0;
         $dictIdFlag = $desc & 0x3;
         if (!$singleSegment) {
-            $p += 1; // window descriptor（忽略）
+            $p += 1; // window descriptor (ignored)
         }
         $dictSizes = [0, 1, 2, 4];
         $p += $dictSizes[$dictIdFlag];
@@ -363,16 +373,17 @@ final class CompressionCodec
 
     // ---------------------------------------------------------------- LZ4 frame
 
-    // ⚠ 协议里的 LZ4 是 **LZ4 Frame 格式**（带 magic/FLG/BD/HC 的自描述帧），
-    // 不是裸 block —— 裸 block 只能自环自解，broker 与标准 LZ4 实现全部解不开；
-    // 而解压失败一旦被吞掉，交出去的就是压缩字节，等于静默丢数据。
+    // ⚠ The LZ4 in the protocol is the **LZ4 Frame format** (the self-describing frame carrying
+    // magic/FLG/BD/HC), not a bare block — a bare block can only be decoded by itself, so neither the
+    // broker nor a standard LZ4 implementation can decode it; and once a decompression failure is
+    // swallowed, what gets handed back is the compressed bytes, which means silent data loss.
     // Frame = magic + FLG + BD + [C.Size(8B)] + HC + {BlockSize(4B) + block}*
-    //          + EndMark(4B) + [C.Checksum(4B)]；block 就是上面的裸 block 层。
+    //          + EndMark(4B) + [C.Checksum(4B)]; the block is the bare block layer above.
 
     private const LZ4_MAGIC = 0x184D2204;
-    private const LZ4_BLOCK_SIZE = 65536; // BD=0x40 → 64KB，LZ4 frame 的惯例默认值
+    private const LZ4_BLOCK_SIZE = 65536; // BD=0x40 → 64KB, the conventional LZ4 frame default
 
-    // xxhash32（LZ4 frame 的 HC 与 C.Checksum 用；纯 int 拆半乘法 mod 2^32）
+    // xxhash32 (used for the HC and C.Checksum of the LZ4 frame; pure int half-split multiplication mod 2^32)
     private const XXH_P1 = 2654435761;
     private const XXH_P2 = 2246822519;
     private const XXH_P3 = 3266489917;
@@ -381,7 +392,8 @@ final class CompressionCodec
 
     private static function imul32(int $a, int $b): int
     {
-        // (a*b) mod 2^32：PHP int 64 位，直接乘会溢出 float，拆 16 位半字。
+        // (a*b) mod 2^32: PHP int is 64-bit, a direct multiply would overflow into float, so split into
+        // 16-bit halves.
         $alo = $a & 0xFFFF;
         $ahi = $a >> 16;
         $blo = $b & 0xFFFF;
@@ -396,7 +408,7 @@ final class CompressionCodec
         return (($x << $r) | ($x >> (32 - $r))) & 0xFFFFFFFF;
     }
 
-    /** xxhash32（官方算法；向量 0x02CC5D05('') / 0x32D153FF('abc') 在离线测试里锚定）。 */
+    /** xxhash32 (official algorithm; the vectors 0x02CC5D05('') / 0x32D153FF('abc') are anchored in the offline tests). */
     public static function xxh32(string $data, int $seed = 0): int
     {
         $M = 0xFFFFFFFF;
@@ -420,7 +432,7 @@ final class CompressionCodec
             $h = ($seed + self::XXH_P5) & $M;
         }
         $h = ($h + $n) & $M;
-        // 尾部 4 字节轮用 P3/P4（不是 P5/P1）—— XXH32_finalize 的官方口径
+        // The trailing 4-byte loop uses P3/P4 (not P5/P1) — the official behaviour of XXH32_finalize
         while ($i + 4 <= $n) {
             $h = self::rotl32(($h + self::imul32(self::readU32($data, $i), self::XXH_P3)) & $M, 17);
             $h = self::imul32($h, self::XXH_P4);
@@ -440,9 +452,11 @@ final class CompressionCodec
     }
 
     /**
-     * 压成 LZ4 Frame（标准帧，合规解码器都能解）。
-     * FLG = version01 | B.Indep | C.Size（无块校验、无内容校验 —— 帧格式允许的最简组合）；
-     * HC = xxh32(FLG+BD+C.Size, 0) 的第二字节；块压不动时存 raw 块（bit31）。
+     * Compresses into an LZ4 Frame (a standard frame, decodable by any compliant decoder).
+     * FLG = version01 | B.Indep | C.Size (no block checksum, no content checksum — the simplest
+     * combination the frame format allows);
+     * HC = the second byte of xxh32(FLG+BD+C.Size, 0); when a block does not compress, it is stored as a
+     * raw block (bit31).
      */
     public static function lz4CompressFrame(string $data): string
     {
@@ -457,7 +471,7 @@ final class CompressionCodec
             $pos += strlen($chunk);
             $block = self::lz4CompressBlock($chunk);
             if ($block === '' || strlen($block) >= strlen($chunk)) {
-                // 压不动：存 raw 块（bit31 置位）
+                // Not compressible: store a raw block (bit31 set)
                 $out .= pack('V', 0x80000000 | strlen($chunk)) . $chunk;
             } else {
                 $out .= pack('V', strlen($block)) . $block;
@@ -467,7 +481,7 @@ final class CompressionCodec
         return $out;
     }
 
-    /** 解 LZ4 Frame；坏 magic/坏 HC/坏块一律抛异常，绝不把压缩字节当正文交回。 */
+    /** Decodes an LZ4 Frame; bad magic / bad HC / bad blocks all throw, the compressed bytes are never handed back as payload. */
     public static function lz4DecompressFrame(string $data): string
     {
         $n = strlen($data);
@@ -486,7 +500,7 @@ final class CompressionCodec
         $blockChecksum = ($flg & 0x10) !== 0;
         $contentSizeFlag = ($flg & 0x08) !== 0;
         $contentChecksum = ($flg & 0x04) !== 0;
-        $bd = ord($data[$p++]); // BlockMaxSize（解码端按块头 size 解，不需要它）
+        $bd = ord($data[$p++]); // BlockMaxSize (the decoder works from the size in the block header, it does not need this)
         $contentSize = 0;
         if ($contentSizeFlag) {
             if ($p + 8 > $n) {
@@ -495,8 +509,8 @@ final class CompressionCodec
             $contentSize = unpack('P', substr($data, $p, 8))[1];
             $p += 8;
         }
-        // HC = xxh32(FLG+BD+[C.Size]) 的第二字节（header checksum 存在于标准帧）
-        $headerLen = $p; // FLG+BD+C.Size 已消耗的字节数
+        // HC = the second byte of xxh32(FLG+BD+[C.Size]) (the header checksum exists in standard frames)
+        $headerLen = $p; // number of bytes already consumed by FLG+BD+C.Size
         if ($p >= $n) {
             throw new \RuntimeException('lz4 frame decompress: truncated header checksum');
         }
@@ -523,7 +537,7 @@ final class CompressionCodec
             $p += $blockLen;
             $out .= $isRaw ? $block : self::lz4DecompressBlock($block);
             if ($blockChecksum) {
-                $p += 4; // 块校验和（B.Checksum=1 时）
+                $p += 4; // block checksum (when B.Checksum=1)
             }
         }
         if ($contentChecksum) {
@@ -544,8 +558,9 @@ final class CompressionCodec
     // ---------------------------------------------------------------- dispatch
 
     /**
-     * 按 MessageSysFlag 的压缩类型压缩（sysFlag bit8-10：1=LZ4、2=ZSTD、3=ZLIB）。
-     * ZLIB 走 gzcompress（带 level，容器格式 RFC1950，broker 侧按 zlib 解压）。
+     * Compresses according to the compression type in MessageSysFlag (sysFlag bit8-10: 1=LZ4, 2=ZSTD,
+     * 3=ZLIB). ZLIB goes through gzcompress (with level, container format RFC1950, decompressed as zlib
+     * on the broker side).
      */
     public static function compressFor(string $data, int $compressionType, int $level = 5): string
     {
@@ -557,12 +572,12 @@ final class CompressionCodec
         };
     }
 
-    /** compressFor 的逆运算。 */
+    /** The inverse operation of compressFor. */
     public static function decompressFor(string $data, int $compressionType): string
     {
         return match ($compressionType) {
-            // gzcompress 产出 zlib 容器（RFC1950），gzuncompress 是唯一对的解法
-            // （gzinflate 只吃裸 deflate，gzdecode 只吃 gzip RFC1952）。
+            // gzcompress produces a zlib container (RFC1950), gzuncompress is the only correct decoder
+            // (gzinflate only reads bare deflate, gzdecode only reads gzip RFC1952).
             MessageSysFlag::ZLIB_TYPE => self::zlibDecompress($data),
             MessageSysFlag::LZ4_TYPE => self::lz4DecompressFrame($data),
             MessageSysFlag::ZSTD_TYPE => self::zstdDecompress($data),

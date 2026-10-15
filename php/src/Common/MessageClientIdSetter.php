@@ -5,17 +5,17 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * 客户端消息唯一 ID（UNIQ_KEY）的生成与读写。
+ * Generation and read/write of the client-side unique message ID (UNIQ_KEY).
  *
- * 用途：
- *   * ``createUniqId()`` 生成 32 位十六进制唯一 ID（IP + PID + 类哈希 + 当月毫秒 + 自增）；
- *   * ``setUniqId($msg)``  发送前把 UNIQ_KEY 写到消息属性上：**非批量**消息在发送
- *     内核里写一次；批量消息既逐条写、再给批量整体写一个；
- *   * ``getUniqId($msg)``  取 UNIQ_KEY —— SendResult.msgId、消息轨迹的 msgId、
- *     事务消息的 transactionId 都用它。
+ * Usage:
+ *   * ``createUniqId()`` generates a 32-char hex unique ID (IP + PID + class hash + current-month millis + auto-increment);
+ *   * ``setUniqId($msg)``  writes UNIQ_KEY into the message properties before sending: **non-batch** messages are written
+ *     once inside the send kernel; batch messages are written per-message and once for the whole batch;
+ *   * ``getUniqId($msg)``  reads UNIQ_KEY — used by SendResult.msgId, the message trace's msgId, and the transaction
+ *     message's transactionId.
  *
- * ⚠ 没有它的话 SendResult.msgId 只能退化成 broker 的 offsetMsgId（含 commitlog 偏移），
- * 那既不是按 key 查询用的 ID，轨迹里的 msgId 也和消费侧对不上。
+ * WARNING: Without it, SendResult.msgId can only fall back to the broker's offsetMsgId (which includes the commitlog
+ * offset) — that is neither the ID used for key-based queries, nor does it match the consumer-side msgId in traces.
  */
 final class MessageClientIdSetter
 {
@@ -25,7 +25,7 @@ final class MessageClientIdSetter
     }
 
     /**
-     * UNIQ_KEY 缺失时才写入：已有值绝不覆盖，否则重试会换掉 msgId。
+     * Only write UNIQ_KEY when it is missing: never overwrite an existing value, otherwise a retry would change the msgId.
      */
     public static function setUniqId(?Message $msg): void
     {

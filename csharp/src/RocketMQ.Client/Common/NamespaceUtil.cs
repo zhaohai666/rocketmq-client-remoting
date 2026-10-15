@@ -1,11 +1,13 @@
-// 命名空间用于多租户隔离：客户端把 namespace 以 "namespace%" 前缀拼到 topic / group
-// 上再发给 broker，从 broker 拿到的资源名在交给上层（listener / admin 结果）之前再剥掉。
+// Namespaces provide multi-tenant isolation: the client prefixes the namespace as
+// "namespace%" onto topic / group before sending to the broker, and strips it off
+// resource names received from the broker before handing them to upper layers
+// (listeners / admin results).
 //
-// 对齐要点（勿凭直觉改）：
-// - 分隔符是 '%'（不是 '/' 也不是 ':'）。
-// - "%RETRY%" / "%DLQ%" 前缀**在**命名空间之外：%RETRY%NS%GID。
-//   因此剥/拼都要先把 retry/DLQ 前缀摘下来处理，再拼回去。
-// - 系统资源（rmq_sys_ 前缀 topic、CID_RMQ_SYS_ 前缀 group）**不**加命名空间。
+// Alignment notes (do not change by intuition):
+// - The separator is '%' (not '/' and not ':').
+// - The "%RETRY%" / "%DLQ%" prefixes are **outside** the namespace: %RETRY%NS%GID.
+//   So strip/wrap must first detach the retry/DLQ prefix, then re-attach it.
+// - System resources (rmq_sys_-prefixed topics, CID_RMQ_SYS_-prefixed groups) get **no** namespace.
 using System.Globalization;
 
 namespace RocketMQ.Common;
@@ -20,7 +22,7 @@ public static class NamespaceUtil
 
     public static bool IsDlqTopic(string resource) => MixAll.IsDlqTopic(resource);
 
-    /// <summary>系统资源（rmq_sys_ 前缀 topic 或 CID_RMQ_SYS_ 前缀 group）不加命名空间。</summary>
+    /// <summary>System resources (rmq_sys_-prefixed topics or CID_RMQ_SYS_-prefixed groups) get no namespace.</summary>
     public static bool IsSystemResource(string resource)
     {
         if (string.IsNullOrEmpty(resource))

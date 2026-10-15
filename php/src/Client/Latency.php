@@ -46,7 +46,7 @@ final class FaultItem
         );
     }
 
-    /** 当前毫秒时间戳（浮点，微秒精度）。 */
+    /** Current timestamp in milliseconds (float, microsecond precision). */
     public static function nowMillis(): float
     {
         return microtime(true) * 1000.0;
@@ -169,7 +169,7 @@ final class MQFaultStrategy
         $this->notAvailableDuration = self::NOT_AVAILABLE_DURATION;
     }
 
-    // ---- 配置 ----
+    // ---- Configuration ----
     public function isSendLatencyFaultEnable(): bool
     {
         return $this->sendLatencyFaultEnable;
@@ -216,7 +216,7 @@ final class MQFaultStrategy
         $this->latencyFaultTolerance->detectByOneRound($nowMillis, $resolver, $serviceDetector);
     }
 
-    // ---- 队列选择 ----
+    // ---- Queue selection ----
 
     private function availableFilter(MessageQueue $mq): bool
     {
@@ -253,7 +253,7 @@ final class MQFaultStrategy
         return $tpInfo->selectOneMessageQueue();
     }
 
-    // ---- 故障记录 ----
+    // ---- Fault recording ----
 
     public function updateFaultItem(string $brokerName, float $currentLatency, bool $isolation, bool $reachable): void
     {

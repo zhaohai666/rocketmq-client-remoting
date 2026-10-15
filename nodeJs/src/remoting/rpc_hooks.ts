@@ -1,16 +1,18 @@
 // -*- coding: utf-8 -*-
-// 基础设施 RPC 钩子与注册顺序。
+// Infrastructure RPC hooks and their registration order.
 //
-// 注册顺序是承重约束（经典 remoting 协议客户端侧约定）：
+// The registration order is a load-bearing constraint (the classic remoting
+// protocol's client-side convention):
 //
-//   1. Namespace 钩子（写入 nsd/ns 字段）
-//   2. StreamType 钩子（仅在启用 stream 请求类型时注册）
-//   3. 用户钩子（例如 ACL 签名）
-//   4. 动态扩展字段钩子
+//   1. Namespace hook (writes the nsd/ns fields)
+//   2. StreamType hook (registered only when the stream request type is enabled)
+//   3. User hooks (for example ACL signing)
+//   4. Dynamic extended-field hooks
 //
-// 钩子按注册顺序执行，ACL 签名只覆盖其执行时已存在的 extField，因此
-// namespace（和 ReqT）字段必须在 ACL 钩子之前写入——否则 broker 会看到
-// 未签名的字段并拒绝请求（"reserve field signature"）。
+// Hooks run in registration order, and ACL signing only covers the extFields
+// that already exist when it executes, so the namespace (and ReqT) fields must be
+// written before the ACL hook — otherwise the broker sees unsigned fields and
+// rejects the request ("reserve field signature").
 import { MixAll } from '../common/mixAll.ts';
 import { RemotingCommand } from './remotingCommand.ts';
 
@@ -21,16 +23,17 @@ export interface RpcHook {
   doAfterResponse(addr: string, request: RemotingCommand | null, response: RemotingCommand | null): void;
 }
 
-// NamespaceRpcHook：当配置了 namespace-v2（阿里云风格的 serverless 实例 id）时，
-// 每个请求携带
+// NamespaceRpcHook: when namespace-v2 is configured (an Alibaba-Cloud-style
+// serverless instance id), every request carries
 //
 //	nsd = "true", ns = <namespaceV2>
 //
-// 这是服务端侧的 namespace 机制（broker 从请求头解析真实 topic）——与经典
-// `namespace` 字段（在客户端侧改写资源名）是不同的机制。
+// This is the server-side namespace mechanism (the broker parses the real topic
+// from the request header) — a different mechanism from the classic `namespace`
+// field (which rewrites resource names on the client side).
 export class NamespaceRpcHook implements RpcHook {
-  // 每次请求都重新读取 namespaceV2；provider 函数保持这种实时性
-  // （也接受普通字符串，表现为快照）。
+  // namespaceV2 is re-read on every request; the provider function keeps that
+  // freshness (plain strings are also accepted and behave as a snapshot).
   private readonly namespaceV2Provider: () => string | null | undefined;
 
   constructor(namespaceV2: string | null | undefined | (() => string | null | undefined)) {
@@ -39,19 +42,20 @@ export class NamespaceRpcHook implements RpcHook {
 
   doBeforeRequest(_addr: string, cmd: RemotingCommand): void {
     const ns = this.namespaceV2Provider();
-    // 空值守卫：未配置 namespace 时，请求的 extFields 必须保持原样——
-    // 钩子不添加任何字段。
+    // Empty-value guard: with no namespace configured the request's extFields must
+    // stay untouched — the hook adds nothing.
     if (ns == null || ns === '') return;
     cmd.addExtField(MixAll.RPC_REQUEST_HEADER_NAMESPACED_FIELD, 'true');
     cmd.addExtField(MixAll.RPC_REQUEST_HEADER_NAMESPACE_FIELD, ns);
   }
 
-  // doAfterResponse 为空实现。
+  // doAfterResponse is a no-op.
   doAfterResponse(_addr: string, _request: RemotingCommand | null, _response: RemotingCommand | null): void {}
 }
 
-// StreamTypeRPCHook：盖 ReqT = RequestType.STREAM 的枚举码（为 0），
-// 所以该字段落在 ACL 签名覆盖范围内（此钩子注册用户钩子之前）。
+// StreamTypeRPCHook: stamps ReqT = RequestType.STREAM, whose enum code is 0, so
+// the field falls inside the ACL signing coverage (this hook registers before
+// the user hooks).
 export class StreamTypeRPCHook implements RpcHook {
   doBeforeRequest(_addr: string, cmd: RemotingCommand): void {
     cmd.addExtField(MixAll.REQ_T, '0');
@@ -61,16 +65,17 @@ export class StreamTypeRPCHook implements RpcHook {
 }
 
 export interface RpcHookChainOptions {
-  // 字符串快照或实时 getter（namespaceV2）。
+  // Either a string snapshot or a live getter (namespaceV2).
   namespaceV2?: string | null | (() => string | null | undefined);
-  // 是否启用 stream 请求类型。
+  // Whether the stream request type is enabled.
   enableStreamRequestType?: boolean;
-  // 用户自己的钩子——例如 ACL 签名器。
+  // The user's own hook — for example an ACL signer.
   userHook?: RpcHook | null;
 }
 
-// buildRpcHooks 按约定顺序返回钩子链：Namespace -> Stream（仅启用时）-> 用户钩子。
-// Namespace 钩子总是安装，namespaceV2 为空时它是 no-op。
+// buildRpcHooks returns the hook chain in the conventional order:
+// Namespace -> Stream (only when enabled) -> user hooks.
+// The Namespace hook is always installed and is a no-op when namespaceV2 is empty.
 export function buildRpcHooks(opts: RpcHookChainOptions = {}): RpcHook[] {
   const hooks: RpcHook[] = [];
   hooks.push(new NamespaceRpcHook(opts.namespaceV2 != null ? opts.namespaceV2 : null));
@@ -79,8 +84,8 @@ export function buildRpcHooks(opts: RpcHookChainOptions = {}): RpcHook[] {
   return hooks;
 }
 
-// registerRpcHooks 按上述顺序把钩子链安装到 RemotingClient 上并返回它
-// （测试断言该顺序）。
+// registerRpcHooks installs the hook chain on the RemotingClient in the above
+// order and returns it (tests assert that order).
 export function registerRpcHooks(
   rc: { registerRpcHook(hook: any): void },
   opts: RpcHookChainOptions = {},

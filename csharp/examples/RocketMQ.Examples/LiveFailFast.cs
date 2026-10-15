@@ -1,19 +1,26 @@
-// 离线用例（tests/FailFastTests.cs）锁的是传输层契约：本机假对端读完就关，断言
-// "毫秒级判死 + 报 RemotingSendRequestException 而不是超时 + 回调只投一次"。但这条路径
-// 存在的意义正是**真机上的 broker 重启 / 主备切换 / 网络抖动**，只有真集群能回答：
-//   L1 基线：真 broker 上发送与长轮询都正常（先确认后面的失败不是环境造成的）。
-//   L2 挂起：把三条**真的挂在 broker 上**的长轮询（suspend 20s、客户端超时 30s）钉在在途表里。
-//   L3 收口：杀掉 broker（读线程见到 EOF）→ 长轮询必须立刻拿到
-//       RemotingSendRequestException，而不是等满 30s 报一个 RemotingTimeoutException。
-//       类型不能错：异步发送的重试分类按异常**类型**分流，报成超时等于换了一整套重试决策。
-//   L4 范围：判死只牵连死掉那条连接；同一个传输实例上的 namesrv 连接照常服务。
-//   L5 恢复：broker 拉起后同一个 producer 实例重新建连照常发送；已拿到 SEND_OK 的消息
-//       一条都不能少。
+// The offline case (tests/FailFastTests.cs) pins the transport layer contract: a local fake
+// peer closes right after reading, asserting "millisecond-scale death detection + it
+// reports RemotingSendRequestException rather than a timeout + the callback is delivered
+// only once". But the whole point of this path is the **real machine** case of a broker
+// restart / master-slave switch / network jitter, which only a real cluster can answer:
+//   L1 baseline: sending and long polling both work against the real broker (confirm first
+//      that the later failure is not caused by the environment).
+//   L2 park: pin three long polls that really **hang on the broker** (suspend 20s, client
+//      timeout 30s) in the in-flight table.
+//   L3 converge: kill the broker (the reader thread sees EOF) -> the long polls must get
+//       RemotingSendRequestException immediately instead of waiting out the 30s for a
+//       RemotingTimeoutException. The type must not be wrong: the retry classification of an
+//       async send branches on the exception **type**, so reporting a timeout means a whole
+//       different set of retry decisions.
+//   L4 scope: death detection must only involve the connection that died; the namesrv
+//      connection on the same transport instance keeps serving as usual.
+//   L5 recovery: once the broker is back up, the same producer instance reconnects and
+//       sends as usual; not one of the messages that already got SEND_OK may be missing.
 //
-// L3 的阈值（8s）远小于客户端超时（30s），也小于 broker 的 suspend 上限（20s）：缺了
-// failFast 这条断言必然失败，不是碰运气。
+// L3's threshold (8s) is far below the client timeout (30s) and also below the broker's
+// suspend cap (20s): without the failFast assertion this necessarily fails, it is not luck.
 //
-// 用法：rmq fail-fast [namesrv]（会停一次本地 broker 再拉起，不删 store）
+// Usage: rmq fail-fast [namesrv] (stops the local broker once and starts it back up, does not delete the store)
 using System.Diagnostics;
 using System.Text;
 
@@ -26,13 +33,15 @@ namespace RocketMQ.Examples;
 
 public static class LiveFailFast
 {
-    /// <summary>客户端侧超时故意放到 30s：判死若走的是超时路径，至少要等这么久。</summary>
+    /// <summary>The client-side timeout is deliberately set to 30s: if death detection went
+    /// down the timeout path it would have to wait at least that long.</summary>
     private const int ClientTimeoutMillis = 30000;
 
-    /// <summary>broker 侧挂起上限，故意小于客户端超时。</summary>
+   /// <summary>The broker-side suspend cap, deliberately below the client timeout.</summary>
     private const int BrokerSuspendMillis = 20000;
 
-    /// <summary>failFast 应当是毫秒级；留 8s 给真机调度（EOF 到达 + 回调投递）。</summary>
+    /// <summary>failFast should be millisecond-scale; 8s is left for real-machine scheduling
+   /// (EOF arrival + callback delivery).</summary>
     private const int FailFastLimitMs = 8000;
 
     private const int BaselineMsgs = 5;
@@ -64,8 +73,9 @@ public static class LiveFailFast
     }
 
     /// <summary>
-    /// 跑 scripts/rmq_test_broker.sh。输出走**文件**而不是管道：start 会把 broker 拉成
-    /// 常驻进程，谁继承它的写端谁就等不到 EOF。
+   /// Runs scripts/rmq_test_broker.sh. The output goes to a **file** rather than a pipe:
+   /// start turns the broker into a resident process, and whoever inherits its write end
+   /// never sees EOF.
     /// </summary>
     private static (bool Ok, string Out) BrokerCtl(string script, string action)
     {
@@ -90,8 +100,8 @@ public static class LiveFailFast
     }
 
     /// <summary>
-    /// 手工构造一条 suspend=true 的长轮询：不经 pull consumer 的钳制，30s 客户端超时与
-    /// 20s broker suspend 都由本用例说了算。
+   /// Hand-builds a long poll with suspend=true: it bypasses the pull consumer's clamping, so
+   /// the 30s client timeout and the 20s broker suspend are both this case's own choice.
     /// </summary>
     private static RemotingCommand ParkedPullRequest(string group, MessageQueue mq, long queueOffset)
     {
@@ -115,7 +125,7 @@ public static class LiveFailFast
         return RemotingCommand.CreateRequestCommand(RequestCode.PullMessage, header);
     }
 
-    /// <summary>一条挂起的长轮询的结局。</summary>
+   /// <summary>The outcome of one hung long poll.</summary>
     private sealed class ParkedResult
     {
         public string Kind = string.Empty;   // response / send_request / timeout / connect / other
@@ -135,7 +145,7 @@ public static class LiveFailFast
         (bool up, string upOut) = BrokerCtl(script, "status");
         if (!up)
         {
-            Console.WriteLine("broker 没在跑：先按本地集群 runbook 起 namesrv + broker（" + upOut + "）");
+            Console.WriteLine("the broker is not running: start namesrv + broker first following the local cluster runbook (" + upOut + ")");
             return 2;
         }
 
@@ -163,12 +173,12 @@ public static class LiveFailFast
                     landed++;
                 }
             }
-            Check("L1 基线：" + BaselineMsgs + " 条同步发送 SEND_OK", landed == BaselineMsgs,
+            Check("L1 baseline: " + BaselineMsgs + " synchronous sends got SEND_OK", landed == BaselineMsgs,
                 "landed=" + landed);
 
             consumer.Start();
             List<MessageQueue> queues = consumer.FetchSubscribeMessageQueues(topic);
-            Check("L1 取到队列", queues.Count > 0, "queues=" + queues.Count);
+           Check("L1 got the queues", queues.Count > 0, "queues=" + queues.Count);
             if (queues.Count == 0)
             {
                 return Finish(producer, consumer, script, brokerStopped);
@@ -179,23 +189,24 @@ public static class LiveFailFast
             string addr = route is null
                 ? string.Empty
                 : MQClientInstance.FindBrokerAddrInRoute(route, queues[0].BrokerName);
-            Check("L1 拿到 broker 地址", addr.Length > 0, "addr=" + addr);
+           Check("L1 got the broker address", addr.Length > 0, "addr=" + addr);
             if (addr.Length == 0)
             {
                 return Finish(producer, consumer, script, brokerStopped);
             }
 
             long maxOffset = consumer.MaxOffset(queues[0]);
-            Check("L1 待挂长轮询的队列有位点可用", maxOffset >= 0, "max_offset=" + maxOffset);
-            // 发送是跨队列轮转的，单条队列的队尾只覆盖落在它上面的那部分，
-            // 所以"真的落盘"要看全部队列的合计。
+           Check("L1 the queue the long polls will park on has a usable offset", maxOffset >= 0, "max_offset=" + maxOffset);
+           // Sending round-robins across the queues, so a single queue's tail only covers
+     // the part that landed on it, which is why "really persisted" has to look at the
+   // total across all queues.
             long totalMax = 0;
             foreach (MessageQueue q in queues)
             {
                 totalMax += consumer.MaxOffset(q);
             }
-            Check("L1 各队列队尾位点合计覆盖刚发的 " + BaselineMsgs + " 条（真的落盘）",
-                totalMax >= BaselineMsgs, "max_offset 合计=" + totalMax);
+           Check("L1 the tails of all queues together cover the " + BaselineMsgs + " just sent (really persisted)",
+               totalMax >= BaselineMsgs, "max_offset total=" + totalMax);
 
             // ------------------------------------------------------------ L2
             RemotingClient remoting = client.RemotingClient;
@@ -250,23 +261,23 @@ public static class LiveFailFast
             {
                 returnedNow = returned;
             }
-            Check("L2 三条长轮询真的挂在 broker 上（2s 后仍未返回）", returnedNow == 0,
+           Check("L2 the three long polls really hang on the broker (still not returned after 2s)", returnedNow == 0,
                 "returned=" + returnedNow);
-            Check("L2 在途表里有它们",
+           Check("L2 they are in the in-flight table",
                 remoting.PendingRequestCount >= baselineInFlight + Parked,
                 "in_flight=" + remoting.PendingRequestCount + " baseline=" + baselineInFlight);
 
             // ------------------------------------------------------------ L3
             brokerStopped = true;
             (bool stopped, string stopOut) = BrokerCtl(script, "stop");
-            Check("L3 停掉 broker", stopped, stopOut);
+           Check("L3 the broker was stopped", stopped, stopOut);
             Task.WaitAll(tasks, TimeSpan.FromSeconds(60));
             List<ParkedResult> snapshot;
             lock (parkedLock)
             {
                 snapshot = new List<ParkedResult>(parked);
             }
-            Check("L3 挂起的长轮询全部返回（没有卡死）", snapshot.Count == Parked,
+  Check("L3 every hung long poll returned (nothing wedged)", snapshot.Count == Parked,
                 "got=" + snapshot.Count);
 
             int sendRequest = snapshot.Count(r => r.Kind == "send_request");
@@ -274,13 +285,13 @@ public static class LiveFailFast
             int worstMs = snapshot.Count == 0 ? 0 : snapshot.Max(r => r.ElapsedMs);
             string kinds = string.Join(",", snapshot.Select(r => r.Kind));
             string firstMsg = snapshot.FirstOrDefault(r => r.Kind == "send_request")?.Message ?? string.Empty;
-            Check("L3 报的是 RemotingSendRequestException（failFast 的口径）",
+          Check("L3 what is reported is RemotingSendRequestException (the failFast rule)",
                 sendRequest == Parked, "kinds=" + kinds);
-            Check("L3 一条都没被报成超时（类型错 = 重试决策错）", timeouts == 0,
+         Check("L3 not one was reported as a timeout (a wrong type means wrong retry decisions)", timeouts == 0,
                 "timeout=" + timeouts);
-            Check("L3 判死耗时远小于 30s 客户端超时", worstMs < FailFastLimitMs,
+            Check("L3 the death detection took far less than the 30s client timeout", worstMs < FailFastLimitMs,
                 "worst=" + worstMs + "ms limit=" + FailFastLimitMs + "ms");
-            Check("L3 异常文案带着断连原因", firstMsg.Contains("connection closed", StringComparison.Ordinal),
+       Check("L3 the exception text carries the disconnect reason", firstMsg.Contains("connection closed", StringComparison.Ordinal),
                 firstMsg);
             bool drained = false;
             for (int i = 0; i < 40 && !drained; i++)
@@ -291,10 +302,11 @@ public static class LiveFailFast
                     Thread.Sleep(250);
                 }
             }
-            Check("L3 判死之后在途表排空", drained, "in_flight=" + remoting.PendingRequestCount);
+        Check("L3 the in-flight table is drained after death detection", drained, "in_flight=" + remoting.PendingRequestCount);
 
             // ------------------------------------------------------------ L4
-            // 判死必须只牵连死掉那条连接：namesrv 走的是同一个传输实例的另一条连接。
+            // Death detection must only involve the connection that died: the namesrv uses
+            // another connection of the same transport instance.
             RemotingCommand probe = RemotingCommand.CreateRequestCommand(
                 RequestCode.GetAllTopicListFromNameserver, null);
             string nsKind;
@@ -308,13 +320,13 @@ public static class LiveFailFast
             {
                 nsKind = ex.GetType().Name + ": " + ex.Message;
             }
-            Check("L4 namesrv 连接没被牵连（broker 死了它还在服务）",
+  Check("L4 the namesrv connection was not involved (it keeps serving though the broker died)",
                 nsKind == "response" && nsCode == ResponseCode.Success,
                 nsKind + " code=" + nsCode);
 
             // ------------------------------------------------------------ L5
             (bool started, string startOut) = BrokerCtl(script, "start");
-            Check("L5 broker 重新拉起", started, startOut);
+          Check("L5 the broker was started back up", started, startOut);
             brokerStopped = false;
 
             bool recovered = false;
@@ -339,7 +351,7 @@ public static class LiveFailFast
                     Thread.Sleep(1000);
                 }
             }
-            Check("L5 同一个 producer 实例重新建连后照常发送", recovered,
+            Check("L5 the same producer instance sends as usual after reconnecting", recovered,
                 "attempts=" + attempts + " " + recErr);
 
             long after = 0;
@@ -364,18 +376,19 @@ public static class LiveFailFast
                 }
                 Thread.Sleep(500);
             }
-            Check("L5 重启后 broker 上仍有那 " + BaselineMsgs + " 条 SEND_OK 的消息",
-                after >= BaselineMsgs, "max_offset 合计=" + after);
+        Check("L5 after the restart the broker still holds those " + BaselineMsgs + " SEND_OK messages",
+      after >= BaselineMsgs, "max_offset total=" + after);
         }
         catch (Exception ex)
         {
-            Check("用例整体", false, ex.GetType().Name + ": " + ex.Message);
+        Check("the case as a whole", false, ex.GetType().Name + ": " + ex.Message);
         }
 
         return Finish(producer, consumer, script, brokerStopped);
     }
 
-    /// <summary>收尾：关客户端，并保证不把测试集群留在停机状态交给下一个用例。</summary>
+  /// <summary>Cleanup: close the client, and make sure the test cluster is not left in a
+  /// stopped state for the next case.</summary>
     private static int Finish(DefaultMQProducer producer, DefaultMQPullConsumer consumer,
         string script, bool brokerStopped)
     {
@@ -385,7 +398,7 @@ public static class LiveFailFast
         }
         catch
         {
-            // 收尾失败不该掩盖用例结论
+        // a cleanup failure must not mask the conclusion of the case
         }
         try
         {
@@ -393,14 +406,14 @@ public static class LiveFailFast
         }
         catch
         {
-            // 同上
+          // same
         }
         if (brokerStopped)
         {
             (bool ok, string outText) = BrokerCtl(script, "start");
             if (!ok)
             {
-                Console.WriteLine("  [cleanup] broker 仍没起来：" + outText);
+        Console.WriteLine("  [cleanup] the broker still did not come up: " + outText);
             }
         }
         Console.WriteLine("############ PASS=" + _pass + " FAIL=" + _fail + " ############");

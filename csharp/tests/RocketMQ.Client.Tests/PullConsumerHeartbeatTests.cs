@@ -1,8 +1,9 @@
-// 拉模式 / 轻量拉取消费者的**心跳**离线单测 —— 不需要集群。
+// Offline unit tests for the **heartbeat** of pull mode / lite pull consumers -- no cluster needed.
 //
 //
-// 为什么自带假集群：心跳要「打到主从两台」，而 MockCluster 的路由是「一台 broker 一个
-// 名字、只有 master」，这条判据在它上面造不出来（与 ProducerUnregisterTests 同一理由）。
+// Why it brings its own fake cluster: the heartbeat has to "reach both the master and the
+// slave", while MockCluster's route is "one name per broker, master only", so that
+// criterion cannot be constructed on it (the same reason as in ProducerUnregisterTests).
 using System.Buffers.Binary;
 using System.Globalization;
 using System.Net;
@@ -25,7 +26,8 @@ public class PullConsumerHeartbeatTests
     private const string Group = "GID_pullhb_net_unit";
     private const string BrokerName = "broker-hb";
 
-    /// <summary>一笔上线报文的取证：落在哪台 broker、什么码、extFields / body。</summary>
+    /// <summary>The evidence of one request on the wire: which broker it landed on, which
+    /// code, extFields / body.</summary>
     private sealed record Frame(string Addr, int Code, PropertyMap Ext, byte[] Body);
 
     private sealed class NoopListener : IMessageQueueListener
@@ -37,8 +39,10 @@ public class PullConsumerHeartbeatTests
     }
 
     /// <summary>
-    /// 一个只说 remoting 协议的假集群：1 个 namesrv + 同一 brokerName 下的 master(0) 与
-    /// slave(1) 两台真监听的 broker。broker 对一切请求回 SUCCESS 空体，全部帧按到达顺序记账。
+    /// A fake cluster speaking only the remoting protocol: 1 namesrv plus two really
+    /// listening brokers under the same brokerName, a master(0) and a slave(1). The broker
+    /// replies SUCCESS with an empty body to every request and records all frames in arrival
+    /// order.
     /// </summary>
     private sealed class MasterSlaveCluster : IDisposable
     {
@@ -84,7 +88,7 @@ public class PullConsumerHeartbeatTests
             if (req.Code == RequestCode.GetRouteinfoByTopic)
             {
                 RemotingCommand resp = Respond(req, ResponseCode.Success, null);
-                // 主从地址是运行时才知道的，路由体在这里现拼
+                // the master and slave addresses are only known at runtime, so the route body is assembled here
                 routeBody ??= BuildRouteBody();
                 resp.Body = routeBody;
                 resp.HasBody = true;
@@ -98,7 +102,7 @@ public class PullConsumerHeartbeatTests
 
         private byte[] BuildRouteBody()
         {
-            // 用真实地址替换 TopicRoute 里的占位名
+            // replace the placeholder name in the TopicRoute with the real address
             var route = new TopicRouteData();
             route.QueueDatas.Add(new QueueData(BrokerName, 2, 2,
                 PermName.PermRead | PermName.PermWrite, 0));
@@ -277,7 +281,7 @@ public class PullConsumerHeartbeatTests
         return hb.ConsumerDataSet[0];
     }
 
-    // ---------------------------------------------------------------- 1. 启动即注册
+    // ---------------------------------------------------------------- 1. Registered on start
 
     [Fact]
     public void Start_AnnouncesTheGroupWithTheLegacyShape()
@@ -292,7 +296,7 @@ public class PullConsumerHeartbeatTests
         try
         {
             Assert.True(WaitFor(() => cluster.CountAt(cluster.MasterAddr, RequestCode.HeartBeat) >= 1),
-                "Start() 后 master 收到 HEART_BEAT");
+                "the master receives HEART_BEAT after Start()");
             Assert.Equal(1, consumer.HeartbeatCount);
 
             Frame hb = cluster.Frames(RequestCode.HeartBeat).First(f => f.Addr == cluster.MasterAddr);
@@ -302,9 +306,9 @@ public class PullConsumerHeartbeatTests
             Assert.Equal(ConsumeType.ConsumeActively, cd.ConsumeType);
             Assert.Equal(ConsumeFromWhere.ConsumeFromLastOffset, cd.ConsumeFromWhere);
             Assert.Equal(MessageModel.Clustering, cd.MessageModel);
-            Assert.True(cd.UnitMode, "unitMode 如实上报（MQClientInstance:1039）");
+            Assert.True(cd.UnitMode, "unitMode is reported faithfully (MQClientInstance:1039)");
 
-            // 订阅集来自 registerTopics（subscriptions():357-385）
+            // the subscription set comes from registerTopics (subscriptions():357-385)
             SubscriptionData sub = Assert.Single(cd.SubscriptionDataSet);
             Assert.Equal(Topic, sub.Topic);
             Assert.Equal("*", sub.SubString);
@@ -316,7 +320,7 @@ public class PullConsumerHeartbeatTests
         }
     }
 
-    // ---------------------------------------------------------------- 2. 扇出到每一台
+    // ---------------------------------------------------------------- 2. Fanned out to each one
 
     [Fact]
     public void Heartbeat_FansOutToMasterAndSlave()
@@ -331,7 +335,7 @@ public class PullConsumerHeartbeatTests
         {
             Assert.True(WaitFor(() => cluster.CountAt(cluster.MasterAddr, RequestCode.HeartBeat) >= 1
                                       && cluster.CountAt(cluster.SlaveAddr, RequestCode.HeartBeat) >= 1),
-                "主从两台都收到心跳");
+                "both the master and the slave receive the heartbeat");
             Assert.Equal(1, consumer.HeartbeatCount);
         }
         finally
@@ -340,7 +344,7 @@ public class PullConsumerHeartbeatTests
         }
     }
 
-    // ---------------------------------------------------------------- 3. 没有订阅也要注册本组
+    // ---------------------------------------------------------------- 3. Registers the group even without a subscription
 
     [Fact]
     public void Heartbeat_StillAnnouncesTheGroupWithoutRegisterTopics()
@@ -352,10 +356,10 @@ public class PullConsumerHeartbeatTests
         consumer.Start();
         try
         {
-            // 无 registerTopics → Start() 时路由表空、那一轮发 0 份；取一次队列把路由灌进来
+            // no registerTopics -> at Start() the route table is empty and that round sends 0 copies; fetch the queues once to fill the route in
             List<MessageQueue> mqs = consumer.FetchSubscribeMessageQueues(Topic);
             Assert.NotEmpty(mqs);
-            // 主从两台都在路由里 → 一轮发两台（消费者心跳不跳从节点）
+            // both the master and the slave are in the route => one round sends to two (a consumer heartbeat does not skip the slave)
             Assert.Equal(2, consumer.SendHeartbeatToAllBroker());
 
             Frame hb = cluster.Frames(RequestCode.HeartBeat).First(f => f.Addr == cluster.MasterAddr);
@@ -369,7 +373,7 @@ public class PullConsumerHeartbeatTests
         }
     }
 
-    // ---------------------------------------------------------------- 4. 周期循环
+    // ---------------------------------------------------------------- 4. The periodic loop
 
     [Fact]
     public void HeartbeatLoop_Repeats()
@@ -384,7 +388,7 @@ public class PullConsumerHeartbeatTests
         try
         {
             Assert.True(WaitFor(() => consumer.HeartbeatCount >= 3, 6000),
-                "心跳循环按周期重复发送，count=" + consumer.HeartbeatCount);
+                "the heartbeat loop repeats on the interval, count=" + consumer.HeartbeatCount);
 
             consumer.HeartbeatEnabled = false;
             long before = consumer.HeartbeatCount;
@@ -397,7 +401,7 @@ public class PullConsumerHeartbeatTests
         }
     }
 
-    // ---------------------------------------------------------------- 5. shutdown 注销
+    // ---------------------------------------------------------------- 5. Unregister on shutdown
 
     [Fact]
     public void Shutdown_UnregistersTheGroupOnEveryBroker()
@@ -415,16 +419,16 @@ public class PullConsumerHeartbeatTests
         Assert.Equal(1, cluster.CountAt(cluster.SlaveAddr, RequestCode.UnregisterClient));
         Frame unreg = cluster.Frames(RequestCode.UnregisterClient).First();
         Assert.True(unreg.Ext.TryGetValue("consumerGroup", out string? g) && g == Group,
-            "35 带 consumerGroup");
-        // 空着的那个槽位不上线（broker ClientManageProcessor:228/237 判的是 group != null）
-        Assert.False(unreg.Ext.ContainsKey("producerGroup"), "35 不带 producerGroup 槽位");
+            "35 carries the consumerGroup");
+        // the slot that is left empty does not go on the wire (what broker ClientManageProcessor:228/237 checks is group != null)
+        Assert.False(unreg.Ext.ContainsKey("producerGroup"), "35 carries no producerGroup slot");
 
-        // 幂等：重复 Shutdown 不再发
+        // idempotent: a repeated Shutdown does not send again
         consumer.Shutdown();
         Assert.Equal(1, cluster.CountAt(cluster.MasterAddr, RequestCode.UnregisterClient));
     }
 
-    // ---------------------------------------------------------------- 6. 轻量拉取也是 ACTIVELY
+    // ---------------------------------------------------------------- 6. Lite pull is ACTIVELY too
 
     [Fact]
     public void LitePull_HeartbeatIsActivelyTyped()
@@ -438,7 +442,7 @@ public class PullConsumerHeartbeatTests
         try
         {
             Assert.True(WaitFor(() => cluster.CountAt(cluster.MasterAddr, RequestCode.HeartBeat) >= 1),
-                "lite Start() 后 master 收到 HEART_BEAT");
+                "the master receives HEART_BEAT after a lite Start()");
             Frame hb = cluster.Frames(RequestCode.HeartBeat).First(f => f.Addr == cluster.MasterAddr);
             ConsumerData cd = DecodeFirstConsumerData(hb.Body);
             Assert.Equal(Group, cd.GroupName);

@@ -5,19 +5,20 @@ declare(strict_types=1);
 namespace RocketMQ\Remoting\Protocol;
 
 /**
- * 协议序列化：JSON 命令头 / body 的编解码，外加对 broker 侧非标准 JSON 的容错解析。
+ * Protocol serialization: JSON command header / body encode-decode, plus tolerant parsing of the
+ * broker's non-standard JSON.
  *
- * ROCKETMQ 私有二进制部分见 RocketMQSerializable.php。
+ * See RocketMQSerializable.php for the ROCKETMQ private binary part.
  */
 
-/** 容错解析仍失败：输入连非标准 JSON 的形状都凑不齐。 */
+/** Tolerant parsing still failed: the input does not even match the shape of non-standard JSON. */
 class FastJsonDecodeError extends \InvalidArgumentException
 {
 }
 
 /**
- * FastJSON（RocketMQ 5.x 默认 JSON 实现）会把 Map 的数字键写成不带引号的形式，
- * 例如 {"brokerAddrs":{0:"127.0.0.1:10911"}}，这不是标准 JSON。
+ * FastJSON (RocketMQ 5.x's default JSON implementation) writes the numeric keys of a Map without
+ * quotes, e.g. {"brokerAddrs":{0:"127.0.0.1:10911"}}, which is not standard JSON.
  */
 final class FastJsonParser
 {
@@ -37,7 +38,7 @@ final class FastJsonParser
         $this->size = strlen($text);
     }
 
-    // ---------------- 基础设施 ----------------
+    // ---------------- Infrastructure ----------------
 
     private function skipWs(): void
     {
@@ -54,7 +55,7 @@ final class FastJsonParser
         return $this->text[$this->pos];
     }
 
-    // ---------------- 各类型 ----------------
+    // ---------------- Value types ----------------
 
     public function parse(): mixed
     {
@@ -85,7 +86,7 @@ final class FastJsonParser
     /** @return array<string, mixed> */
     private function object(): array
     {
-        $this->pos++; // 吃掉 '{'
+        $this->pos++; // consume '{'
         $result = [];
         $this->skipWs();
         if ($this->peek() === '}') {
@@ -105,7 +106,7 @@ final class FastJsonParser
             if ($c === ',') {
                 $this->pos++;
                 $this->skipWs();
-                if ($this->peek() === '}') { // 容忍尾随逗号
+                if ($this->peek() === '}') { // tolerate a trailing comma
                     $this->pos++;
                     return $result;
                 }
@@ -122,7 +123,7 @@ final class FastJsonParser
     /** @return list<mixed> */
     private function array(): array
     {
-        $this->pos++; // 吃掉 '['
+        $this->pos++; // consume '['
         $items = [];
         $this->skipWs();
         if ($this->peek() === ']') {
@@ -152,15 +153,15 @@ final class FastJsonParser
 
     private function key(): string
     {
-        // 键：字符串 / 内联对象 / 内联数组 / 裸字面量（数字、true、false、null）。
+        // Key: string / inline object / inline array / bare literal (number, true, false, null).
         $this->skipWs();
         $c = $this->peek();
         if ($c === '"') {
             return $this->string();
         }
         if ($c === '{' || $c === '[') {
-            // fastjson2 把非字符串 map 键（如 MessageQueue）原样写成 JSON。
-            // 保留原始文本，调用方可用 decodeMessageQueueKey() 再解析。
+            // fastjson2 writes non-string map keys (e.g. MessageQueue) verbatim as JSON.
+            // Keep the raw text; callers can re-parse it with decodeMessageQueueKey().
             $start = $this->pos;
             $this->value();
             return substr($this->text, $start, $this->pos - $start);
@@ -174,7 +175,7 @@ final class FastJsonParser
 
     private function string(): string
     {
-        $this->pos++; // 吃掉开引号
+        $this->pos++; // consume the opening quote
         $out = [];
         while (true) {
             if ($this->pos >= $this->size) {
@@ -216,7 +217,7 @@ final class FastJsonParser
                   'NaN' => NAN, 'Infinity' => INF, '-Infinity' => -INF] as $token => $value) {
             if (str_starts_with($rest, $token)) {
                 $tail = substr($rest, strlen($token), 1);
-                // 不能把 "nullish" 之类误判成 null
+                // Do not mistake something like "nullish" for null
                 if ($tail === '' || $tail === ',' || $tail === '}' || $tail === ']' || strpos(self::WS, $tail) !== false) {
                     $this->pos += strlen($token);
                     return $value;
@@ -238,12 +239,14 @@ final class FastJsonParser
 
 final class RemotingSerializable
 {
-    /** fastjson2（RocketMQ 5.x 默认 JSON 实现）的输出**不是**严格 JSON，仅靠 json_decode 无法解析：
-     *  1) Map 的数字键不带引号：{"brokerAddrs":{0:"127.0.0.1:10911"}}
-     *  2) Map 的对象键直接内联成 JSON 对象（这是**非法 JSON**），管理端必然遇到：
-     *     TopicStatsTable / ConsumeStats 的 offsetTable 以 MessageQueue 为键
-     *  3) 特殊浮点：NaN / Infinity / -Infinity
-     *  因此需要一个容忍「非字符串键」的小型解析器，而不是事后补引号。
+    /** fastjson2 (RocketMQ 5.x's default JSON implementation) output is **not** strict JSON and
+     *  json_decode alone cannot parse it:
+     *  1) Map numeric keys are unquoted: {"brokerAddrs":{0:"127.0.0.1:10911"}}
+     *  2) Map object keys are inlined directly as JSON objects (**illegal JSON**); the admin path
+     *     always hits this: the offsetTable of TopicStatsTable / ConsumeStats is keyed by MessageQueue
+     *  3) Special floats: NaN / Infinity / -Infinity
+     *  Hence a small parser that tolerates "non-string keys" is needed instead of patching quotes
+     *  after the fact.
      */
     public static function fastjsonLoads(string $text): mixed
     {
@@ -251,8 +254,8 @@ final class RemotingSerializable
     }
 
     /**
-     * 把 fastjson2 写出的 MessageQueue 内联对象键还原成 array。
-     * 返回 null 表示这个键不是内联对象（例如普通字符串键）。
+     * Restores the inline-object MessageQueue keys written by fastjson2 into an array.
+     * Returning null means the key is not an inline object (e.g. an ordinary string key).
      *
      * @return array<string, mixed>|null
      */
@@ -283,7 +286,8 @@ final class RemotingSerializable
         try {
             return self::fastjsonLoads($text);
         } catch (FastJsonDecodeError) {
-            // 兜底：老路径（只补数字键引号）。再失败则让异常冒泡，避免静默返回错数据。
+            // Last resort: the old path (quote numeric keys only). If that also fails, let the
+            // exception bubble up rather than silently returning wrong data.
             $fixed = preg_replace(
                 '/([{,]\s*)(-?\d+(?:\.\d+)?)\s*(:)/',
                 '${1}"${2}"${3}',
@@ -293,11 +297,12 @@ final class RemotingSerializable
         }
     }
 
-    // ---------------- 编码（PHP 端 → 线上字节）----------------
+    // ---------------- Encode (PHP side -> wire bytes) ----------------
 
     /**
-     * null → 空串，字符串原样，其余按 UTF-8 JSON 输出。
-     * JSON 侧不转义非 ASCII、不转义斜杠，保持与 broker 读到的字面量一致。
+     * null -> empty string, strings pass through as-is, everything else is output as UTF-8 JSON.
+     * The JSON side does not escape non-ASCII or slashes, staying consistent with the literals
+     * the broker reads.
      */
     public static function encode(mixed $obj): string
     {
@@ -319,7 +324,7 @@ final class RemotingSerializable
         return json_encode($obj, $flags);
     }
 
-    // ---------------- 解码（线上字节 → PHP）----------------
+    // ---------------- Decode (wire bytes -> PHP) ----------------
 
     public static function decode(?string $data): mixed
     {
@@ -329,7 +334,7 @@ final class RemotingSerializable
         return self::fromJson($data);
     }
 
-    /** @param class-string|null $expectClass 带 fromDict() 的目标类；构造失败退回原始数组 */
+    /** @param class-string|null $expectClass target class with fromDict(); falls back to the raw array if construction fails */
     public static function fromJson(string $jsonStr, ?string $expectClass = null): mixed
     {
         $obj = json_decode($jsonStr, true, 512, JSON_THROW_ON_ERROR);
@@ -343,7 +348,7 @@ final class RemotingSerializable
         return $obj;
     }
 
-    /** 容忍 broker 侧 fastjson 的非标准 JSON 输出（数字键不带引号等）。 */
+    /** Tolerates the broker-side fastjson non-standard JSON output (unquoted numeric keys etc.). */
     public static function decodeJson(string $data): mixed
     {
         return self::tolerantJsonLoads($data);

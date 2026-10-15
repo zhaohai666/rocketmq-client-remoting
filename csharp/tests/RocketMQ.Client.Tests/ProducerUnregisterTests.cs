@@ -1,11 +1,14 @@
-// 生产者/消费者退出时发 UNREGISTER_CLIENT(35) 的离线单测 —— 不需要集群。
+// Offline unit tests for UNREGISTER_CLIENT(35) being sent when a producer/consumer exits
+// -- no cluster needed.
 //
 //
-// 为什么这里要自带一个假集群：`MockCluster` 的路由是「一台 broker 一个名字、只有 master」，
-// 本机真集群也只有一台 master，**从节点收不收得到 35 这一条判据根本造不出来**。
-// 下面 [`MasterSlaveCluster`] 刻意在同一 brokerName 下挂 master(0) + slave(1)。
-// 与 examples 的 `unreg-live`（真机 204 前后对照）互补：真机证明「broker 确实摘了」，
-// 这里证明「线上走了什么形状、打给了哪几台」。
+// Why a fake cluster is brought along here: MockCluster's route is "one name per broker,
+// master only" and a real local cluster only has one master, so the criterion "does a
+// slave receive the 35 or not" simply cannot be constructed. The
+// [`MasterSlaveCluster`] below deliberately hangs a master(0) plus a slave(1) under the
+// same brokerName. This complements the examples' `unreg-live` (a before/after
+// comparison on a real machine, 204): the real machine proves "the broker really removed
+// it", while this proves "what shape went on the wire and which machines it reached".
 using System.Buffers.Binary;
 using System.Globalization;
 using System.Net;
@@ -15,7 +18,7 @@ using RocketMQ.Client;
 using RocketMQ.Common;
 using RocketMQ.Remoting;
 using RocketMQ.Remoting.Protocol;
-// PropertyMap 是 src 侧的 global using 别名（SortedDictionary<string,string>），测试项目要显式声明。
+// PropertyMap is a global using alias on the src side (SortedDictionary<string,string>), so the test project has to declare it explicitly.
 using PropertyMap = System.Collections.Generic.SortedDictionary<string, string>;
 
 using Xunit;
@@ -30,15 +33,18 @@ public class ProducerUnregisterTests
 
     private const int DefaultApiTimeout = 3000;
 
-    // ---------------- master + slave 假集群 ----------------
+    // ---------------- A master + slave fake cluster ----------------
 
-    /// <summary>一笔请求的取证：落在哪台 broker、什么码、extFields / body 长什么样。</summary>
+    /// <summary>The evidence of one request: which broker it landed on, which code, and
+    /// what extFields / body look like.</summary>
     private sealed record Frame(string Addr, int Code, PropertyMap Ext, byte[] Body);
 
     /// <summary>
-    /// 一个只说 remoting 协议的假集群：1 个 namesrv + 同一 brokerName 下的 master(0) 与
-    /// slave(1) 两台真监听的 broker。路由由 <see cref="TopicRoute"/> 手工拼出来，
-    /// 因为「注销必须打到从节点」这条判据在真机和 MockCluster 上都不可达。
+    /// A fake cluster speaking only the remoting protocol: 1 namesrv plus two really
+    /// listening brokers under the same brokerName, a master(0) and a slave(1). The
+    /// route is assembled by hand from <see cref="TopicRoute"/>, because the criterion
+    /// "the unregister must reach the slave" is unreachable both on a real machine and
+    /// with MockCluster.
     /// </summary>
     private sealed class MasterSlaveCluster : IDisposable
     {
@@ -82,7 +88,8 @@ public class ProducerUnregisterTests
             return route;
         }
 
-        /// <summary>让某台 broker 从此把（任何）请求都回成指定应答码，用来造单台失败。</summary>
+        /// <summary>Makes a broker reply to (any) request with the given response code from
+        /// now on, used to construct a single-machine failure.</summary>
         public void FailFrom(string addr, int responseCode)
         {
             lock (_gate)
@@ -159,13 +166,13 @@ public class ProducerUnregisterTests
                 }
                 catch (Exception)
                 {
-                    // 关监听端口时不需要处理任何异常
+                    // Closing the listening port does not need any exception handling
                 }
             }
         }
     }
 
-    // ---------------- 帧收发（与 MockCluster 同一套最小实现） ----------------
+    // ---------------- Frame send/receive (the same minimal implementation as MockCluster) ----------------
 
     private static RemotingCommand Respond(RemotingCommand req, int code, string? remark)
     {
@@ -188,7 +195,7 @@ public class ProducerUnregisterTests
                 }
                 catch (Exception)
                 {
-                    return; // Dispose 之后 Accept 必然抛，正常收工
+                    return; // after Dispose, Accept necessarily throws, this is a normal shutdown
                 }
 
                 new Thread(() =>
@@ -201,7 +208,7 @@ public class ProducerUnregisterTests
                         }
                         catch (Exception)
                         {
-                            // 半路断连、解码失败：丢掉这条连接即可
+                            // A mid-stream disconnect or a decode failure: just drop this connection
                         }
                     }
                 })
@@ -290,7 +297,8 @@ public class ProducerUnregisterTests
     private static string EndPointOf(Socket server) =>
         ((IPEndPoint)server.LocalEndPoint!).ToString();
 
-    /// <summary>指向假集群、路由已缓存好的实例（用例结束顺手关掉连接）。</summary>
+    /// <summary>An instance pointing at the fake cluster with the route already cached
+    /// (the connections are closed on the way out).</summary>
     private static MQClientInstance StartedInstance(MasterSlaveCluster cluster)
     {
         var inst = new MQClientInstance(ClientId, new[] { cluster.NamesrvAddr });
@@ -298,7 +306,7 @@ public class ProducerUnregisterTests
         return inst;
     }
 
-    // ---------------- 1~3：头的形状 ----------------
+    // ---------------- 1~3: the shape of the header ----------------
     [Fact]
     public void ProducerSideCarriesOnlyClientIdAndProducerGroup()
     {
@@ -340,7 +348,7 @@ public class ProducerUnregisterTests
         inst.UnregisterClient(cluster.MasterAddr, ClientId, "PID_a", "GID_b", DefaultApiTimeout);
 
         PropertyMap ext = Assert.Single(cluster.Frames(RequestCode.UnregisterClient)).Ext;
-        // PropertyMap 是 SortedDictionary ⇒ 这里锁的是「三个键都在」，顺序按字典序
+        // PropertyMap is a SortedDictionary => what is locked in here is "all three keys are present", ordered lexicographically
         Assert.Equal(3, ext.Count);
         Assert.Equal("PID_a", ext["producerGroup"]);
         Assert.Equal("GID_b", ext["consumerGroup"]);
@@ -352,8 +360,10 @@ public class ProducerUnregisterTests
         using MasterSlaveCluster cluster = MasterSlaveCluster.Start();
         using MQClientInstance inst = StartedInstance(cluster);
 
-        // 纯空白与空串同处理：合法组名不可能全是空白（Validators 那一关过不去），
-        // 传进来只可能是调用方漏了值。broker 判的是 `group != null`，所以必须整个不上线。
+        // Pure whitespace is treated like an empty string: a legal group name can never be
+        // all whitespace (Validators would have rejected it), so getting one here can only
+        // mean the caller left the value out. The broker checks `group != null`, so it must
+        // not go on the wire at all.
         inst.UnregisterClient(cluster.MasterAddr, ClientId, "   ", Group, DefaultApiTimeout);
 
         PropertyMap ext = Assert.Single(cluster.Frames(RequestCode.UnregisterClient)).Ext;
@@ -362,7 +372,7 @@ public class ProducerUnregisterTests
         Assert.Equal(2, ext.Count);
     }
 
-    // ---------------- 4：扇出含从节点 ----------------
+    // ---------------- 4: the fan-out includes the slave ----------------
 
     [Fact]
     public void FanOutReachesSlaveToo_WhileHeartbeatHelperStaysMasterOnly()
@@ -370,7 +380,7 @@ public class ProducerUnregisterTests
         using MasterSlaveCluster cluster = MasterSlaveCluster.Start();
         using MQClientInstance inst = StartedInstance(cluster);
 
-        // 分工：心跳/「问到一台就行」的路径只打 master 优先的那台……
+        // Division of labour: the paths that are "a heartbeat / ask one machine and be done" only hit the preferred master...
         Assert.Equal(new[] { cluster.MasterAddr }, inst.GetRouteOfAllBrokers());
         Assert.Equal(new[] { cluster.MasterAddr, cluster.SlaveAddr }.OrderBy(a => a, StringComparer.Ordinal)
                      .ToList(),
@@ -390,7 +400,7 @@ public class ProducerUnregisterTests
         }
     }
 
-    // ---------------- 4b：消费者心跳也覆盖从节点 ----------------
+    // ---------------- 4b: the consumer heartbeat also covers the slave ----------------
     [Fact]
     public void ConsumerHeartbeatReachesSlaveToo()
     {
@@ -405,11 +415,11 @@ public class ProducerUnregisterTests
         try
         {
             Assert.Equal(1, cluster.CountAt(cluster.MasterAddr, RequestCode.HeartBeat));
-            // 本用例的存在意义：扇出只打 master 的实现这里必然 0
+            // The point of this case: a fan-out implementation that only hits the master necessarily scores 0 here
             Assert.Equal(1, cluster.CountAt(cluster.SlaveAddr, RequestCode.HeartBeat));
             Frame onSlave = Assert.Single(cluster.Frames(RequestCode.HeartBeat),
                 f => f.Addr == cluster.SlaveAddr);
-            // 从节点拿到的必须是**带消费组**的那份报文（它据此建自己的 ConsumerGroupInfo）
+            // What the slave gets must be the report **carrying the consumer group** (it builds its own ConsumerGroupInfo from that)
             Assert.True(HeartbeatData.Decode(onSlave.Body, out HeartbeatData hb));
             Assert.Contains(Group, hb.ConsumerDataSet.Select(cd => cd.GroupName));
         }
@@ -419,7 +429,8 @@ public class ProducerUnregisterTests
         }
     }
 
-    /// <summary>什么都不做的监听器：本用例只关心 start() 那几发心跳。</summary>
+    /// <summary>A listener that does nothing: this case only cares about the few heartbeats
+    /// that start() sends.</summary>
     private sealed class NoopListener : IMessageListenerConcurrently
     {
         public bool Orderly() => false;
@@ -434,7 +445,7 @@ public class ProducerUnregisterTests
         using MQClientInstance inst = StartedInstance(cluster);
         cluster.FailFrom(cluster.SlaveAddr, ResponseCode.SystemError);
 
-        // 底层那一发**要**抛（带上 broker 的响应码），否则下面的「吞」就成了「什么都没发」
+        // The lower-level one **must** throw (carrying the broker's response code), otherwise the "swallow" below would degenerate into "nothing was sent"
         MQBrokerException ex = Assert.Throws<MQBrokerException>(() =>
             inst.UnregisterClient(cluster.SlaveAddr, ClientId, Group, "", DefaultApiTimeout));
         Assert.Equal(ResponseCode.SystemError, ex.ResponseCode);
@@ -452,7 +463,7 @@ public class ProducerUnregisterTests
         Assert.Equal(3000, MQClientInstance.MqClientApiTimeoutMillis);
     }
 
-    // ---------------- 6：生产者 shutdown 真的发出这一发，且排在发送之后 ----------------
+    // ---------------- 6: a producer's shutdown really sends this one, and it comes after the send ----------------
 
     [Fact]
     public void ProducerShutdownUnregistersOnEveryKnownBrokerAfterSending()
@@ -466,13 +477,13 @@ public class ProducerUnregisterTests
 
         p.Shutdown();
 
-        // 两台 broker（路由里各自的 master）各一发
+        // One each to the two brokers (each is its own master in the route)
         Assert.Equal(2, cluster.CountRequests(RequestCode.UnregisterClient));
         Assert.Equal(2, cluster.CountRequestsWith(RequestCode.UnregisterClient,
             "producerGroup", p.ProducerGroup));
         Assert.False(cluster.AnyRequestHas(RequestCode.UnregisterClient, "consumerGroup"));
 
-        // 35 必须排在业务发送之后：它走的是**还没关的那条长连接**。
+        // The 35 must come after the business send: it goes over the **long connection that is not closed yet**.
         List<WireRecord> records = cluster.Records();
         int lastSend = records.FindLastIndex(x =>
             x.Code is RequestCode.SendMessage or RequestCode.SendMessageV2);
@@ -481,7 +492,7 @@ public class ProducerUnregisterTests
             "last_send=" + lastSend.ToString(CultureInfo.InvariantCulture)
             + " first_unreg=" + firstUnreg.ToString(CultureInfo.InvariantCulture)
             + " records=" + records.Count.ToString(CultureInfo.InvariantCulture));
-        // 注销的是**本 clientId**（不是别的组冒名），值必须与生产者算出来的一模一样
+        // What is unregistered is **this clientId** (not some other group passing itself off), and the value must be exactly what the producer computed
         Assert.Equal(p.ClientId, records[firstUnreg].Ext.GetValueOrDefault("clientID"));
     }
 
@@ -492,7 +503,7 @@ public class ProducerUnregisterTests
             new List<string?> { null, MockCluster.DeadAddr() });
         var p = new DefaultMQProducer(Group + "_dead") { NamesrvAddr = cluster.NamesrvAddr };
         p.Start();
-        // 只往活着的 broker-0 发，避免发送本身撞死地址
+        // Only send to the live broker-0, so the send itself does not run into a dead address
         p.Send(new Message(Topic, System.Text.Encoding.UTF8.GetBytes("hi")),
             new MessageQueue(Topic, MockCluster.BrokerName(0), 0), 5000);
 

@@ -1,20 +1,24 @@
-//! 前置：NameServer + Broker 已起，`autoCreateTopicEnable=true`。
+//! Prerequisites: NameServer + Broker are up, `autoCreateTopicEnable=true`.
 //!
 //!
 //!
 //!
+//! ⚠ Four scripting rules of discipline (following `live_backpressure.rs`):
+//!   ① every topic carries a stamp —— multiple rounds run **sequentially** on the same broker, and
+//!   a fixed name would inherit the previous round's message counts;
+//!   ② "a rejected send never even put the request on the wire" can only be observed from the
+//!      broker-side stored count (the sum of maxOffset-minOffset over all queues); looking only at
+//!      the client callback would be fooled by an implementation where "the callback reports an
+//!      error but the request still went out";
+//!   ③ a newly created topic has to wait for the broker to incrementally register its topicConfig
+//!      with the namesrv (seconds to tens of seconds), so every broker-side reconciliation is a
+//!      **poll until timeout**; a single failed route read does not count as a failure;
+//!   ④ a `std::thread::sleep` inside a hook occupies one tokio worker thread, and on this machine
+//!      it was measured that "as soon as any task blocks, the whole runtime's time driver stops
+//!      advancing", so the observed values are only read after the hook has finished sleeping, and
+//!      the caller-side measurement in A1 itself contains no `await`.
 //!
-//! ⚠ 四条脚本纪律（沿用 `live_backpressure.rs`）：
-//!   ① topic 一律带 stamp —— 多轮**依次**跑在同一个 broker 上，固定名会继承上一轮的条数；
-//!   ② 「被拒的发送连请求都没发出去」只能看 broker 侧落库条数（各队列 maxOffset-minOffset 之和），
-//!      光看客户端回调会被「回调报错但请求照样发出去」的实现蒙过去；
-//!   ③ 新建 topic 要等 broker 把 topicConfig 增量注册到 namesrv（秒级到十秒级），所以所有
-//!      broker 侧对账都是**轮询到超时**，读一次路由失败不算失败；
-//!   ④ 钩子里的 `std::thread::sleep` 会占住一条 tokio 工作线程，本机实测「只要有任何任务
-//!      阻塞，整个运行时的时间驱动就不推进」，所以只在钩子睡完之后再读观测值，
-//!      且 A1 那段调用方测量本身不含任何 `await`。
-//!
-//! 用法：
+//! Usage:
 //! ```text
 //! cargo run --example live_async_send -- 127.0.0.1:9876
 //! ```
@@ -39,18 +43,21 @@ use rocketmq_client_remoting::common::message::{Message, MessageQueue};
 use rocketmq_client_remoting::common::message_decoder::decode_message_id;
 use rocketmq_client_remoting::error::{Error, Result};
 
-/// 集群探活与「等 broker 侧结果落地」的默认预算（秒）。
+/// Default budget (seconds) for the cluster liveness probe and for "wait until the broker-side
+/// result lands".
 const WAIT_SECONDS: u64 = 30;
-/// A2 的并发笔数。
+/// A2's concurrency count.
 const BURST: usize = 30;
-/// 运行时工作线程数：必须明显大于并发笔数（占住在途的钩子是同步接口，会按住房一条线程）。
+/// Number of runtime worker threads: it must be clearly larger than the concurrency count (the
+/// hook that occupies an in-flight send is a synchronous interface and pins one thread).
 const WORKER_THREADS: usize = 32;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 断言累积器：跑完全部场景再汇总，首个失败不提前退出。
+/// Assertion accumulator: run all scenarios first and then summarize; the first failure does not
+/// exit early.
 struct Checker {
     passed: u32,
     failed: Vec<String>,
@@ -80,10 +87,11 @@ impl Checker {
     }
 }
 
-/// 线程安全的回调记录。
+/// Thread-safe callback recording.
 ///
-/// 除了结果本身还记两样东西：终态回调跑在**哪条线程**上（A1 的线程口径）、以及**什么
-/// 时刻**（A6 的「`shutdown()` 不等在途」）。
+/// Besides the result itself it records two more things: **which thread** the terminal callback
+/// ran on (A1's thread criterion), and at **what moment** (A6's "`shutdown()` does not wait for
+/// in-flight sends").
 #[derive(Default)]
 struct Recorder {
     done: AtomicUsize,
@@ -111,12 +119,13 @@ impl Recorder {
         lock(&self.errors).clone()
     }
 
-    /// 第 `i` 个终态回调跑在哪条线程上（没有则 `None`）。
+    /// Which thread the `i`-th terminal callback ran on (`None` if there is none).
     fn thread_at(&self, i: usize) -> Option<ThreadId> {
         lock(&self.threads).get(i).copied()
     }
 
-    /// `moment` 之后落到终态的回调条数（`Instant` 跨线程可比，刻度是单调时钟）。
+    /// How many callbacks reached their terminal state after `moment` (`Instant` is comparable
+    /// across threads and its scale is the monotonic clock).
     fn after(&self, moment: Instant) -> usize {
         lock(&self.at).iter().filter(|at| **at > moment).count()
     }
@@ -149,7 +158,8 @@ impl SendCallback for Recorder {
 }
 
 impl Recorder {
-    /// 记下终态的时刻与线程名（调用方必须已持有各自的锁，这里只加自己这两把锁）。
+    /// Record the moment and the thread name of the terminal state (the caller must already hold
+    /// the respective locks; here we only take our own two).
     fn note(&self) {
         lock(&self.threads).push(std::thread::current().id());
         lock(&self.at).push(Instant::now());
@@ -157,9 +167,11 @@ impl Recorder {
     }
 }
 
-/// 在 `send_message_before` 里睡一会儿，并记下每条链跑过的线程与 before/after 次数。
+/// Sleeps a while inside `send_message_before` and records the thread each chain ran on plus the
+/// before/after counts.
 ///
-/// 睡在 before 钩子里＝把「准备段 + 上线」整条链拖慢，正好用来测「调用方不必等准备段」。
+/// Sleeping in the before hook ＝ slowing down the whole "preparation + going live" chain, which
+/// is exactly what we need to measure "the caller does not have to wait for the preparation".
 struct TracingHook {
     millis: AtomicUsize,
     before: AtomicUsize,
@@ -289,7 +301,8 @@ impl Env {
         t
     }
 
-    /// 集群探活：端口开着 != broker 已注册到 namesrv，所以轮询。
+    /// Cluster liveness probe: an open port != the broker has registered with the namesrv, so we
+    /// poll.
     async fn start(&self, ck: &mut Checker) -> bool {
         if let Err(e) = self.admin.start().await {
             ck.abort("admin start", &e.to_string());
@@ -299,19 +312,20 @@ impl Env {
         loop {
             if let Ok(info) = self.admin.fetch_broker_cluster_info().await {
                 if let Some(first) = info.get_broker_addrs().first() {
-                    ck.check("集群探活", true, &format!("broker={first}"));
+                    ck.check("cluster liveness probe", true, &format!("broker={first}"));
                     return true;
                 }
             }
             if Instant::now() >= deadline {
-                ck.abort("集群探活", "nameServer 在预算内没有返回任何 broker");
+                ck.abort("cluster liveness probe", "the nameServer returned no broker within the budget");
                 return false;
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
 
-    /// 起一个只配了发送旋钮的生产者。钩子必须在 `start()` 之前挂上。
+    /// Start a producer with only the send knobs configured. The hook must be attached before
+    /// `start()`.
     async fn producer(
         &self,
         kind: &str,
@@ -336,7 +350,7 @@ impl Env {
     }
 }
 
-// ---------------------------------------------------------- 通用助手
+// ---------------------------------------------------------- common helpers
 
 fn message(topic: &str, body: &[u8], tags: &str) -> Message {
     let mut msg = Message::new(topic, Some(body));
@@ -346,7 +360,7 @@ fn message(topic: &str, body: &[u8], tags: &str) -> Message {
     msg
 }
 
-/// 轮询等待条件成立（最多 `secs` 秒）。
+/// Poll until the condition holds (at most `secs` seconds).
 async fn wait_until<F: Fn() -> bool>(cond: F, secs: u64) -> bool {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
@@ -360,10 +374,11 @@ async fn wait_until<F: Fn() -> bool>(cond: F, secs: u64) -> bool {
     }
 }
 
-/// broker 上这个 topic 一共落了多少条（各队列 maxOffset-minOffset 之和）；读不到返回 -1。
+/// How many messages of this topic are stored on the broker in total (the sum of
+/// maxOffset-minOffset over all queues); returns -1 when it cannot be read.
 async fn landed_count(env: &Env, topic: &str) -> i64 {
     let Ok(route) = env.admin.examine_topic_route(topic).await else {
-        return -1; // 路由还没注册上
+        return -1; // the route has not been registered yet
     };
     let mut addrs: BTreeMap<String, String> = BTreeMap::new();
     for broker in &route.broker_datas {
@@ -387,14 +402,15 @@ async fn landed_count(env: &Env, topic: &str) -> i64 {
     total
 }
 
-/// 一条队列上落了多少条（刚建队列读数会失败，交给调用方判「还没就绪」）。
+/// How many messages are stored on one queue (reading a just-created queue fails; leave it to the
+/// caller to decide "not ready yet").
 async fn queue_landed(env: &Env, mq: &MessageQueue) -> Result<i64> {
     let max = env.admin.max_offset(mq).await?;
     let min = env.admin.min_offset(mq).await?;
     Ok(max - min)
 }
 
-/// 等 broker 上至少出现 `expected` 条，返回最后一次读数。
+/// Wait until at least `expected` messages show up on the broker; returns the last reading.
 async fn wait_landed(env: &Env, topic: &str, expected: i64) -> i64 {
     let mut landed = landed_count(env, topic).await;
     let mut reads = 0;
@@ -406,7 +422,7 @@ async fn wait_landed(env: &Env, topic: &str, expected: i64) -> i64 {
     landed
 }
 
-// ------------------------------------------------- A1 立刻返回 + 线程口径 + 读回
+// ------------------------------------------------- A1 returns immediately + thread criterion + read-back
 
 async fn a1_non_blocking_and_read_back(ck: &mut Checker, env: &Env) {
     let topic = env.topic("ReadBack");
@@ -418,8 +434,9 @@ async fn a1_non_blocking_and_read_back(ck: &mut Checker, env: &Env) {
     let rec = Arc::new(Recorder::default());
     let body = b"async-a1-readback".to_vec();
 
-    // 调用方那一段跑在阻塞线程池上（模块头差异 ①）：那里的线程不属于 tokio 工作线程集合，
-    // 「准备段与回调都不在调用方线程上」才是硬结论。这一段里没有任何 `await`。
+    // The caller-side section runs on the blocking thread pool (deviation ① in the module header):
+    // threads there do not belong to the tokio worker set, so "neither the preparation nor the
+    // callback runs on the caller thread" is the hard conclusion. This section contains no `await`.
     let caller = {
         let (p, r, topic) = (producer.clone(), rec.clone(), topic.clone());
         let h = hook.clone();
@@ -442,40 +459,40 @@ async fn a1_non_blocking_and_read_back(ck: &mut Checker, env: &Env) {
     .await;
     let (caller_thread, took, rejected, before_at_return) = match caller {
         Ok(v) => v,
-        Err(e) => return ck.abort("A1 调用方那一段", &e.to_string()),
+        Err(e) => return ck.abort("A1 the caller-side section", &e.to_string()),
     };
     ck.check(
-        "A1 调用方在准备段（钩子睡 400ms）之前就已返回",
+        "A1 the caller returned before the preparation stage (the hook sleeps 400ms)",
         rejected.is_none() && took < Duration::from_millis(200),
         &format!(
-            "调用方耗时={}µs 入队被拒={rejected:?} before 已跑={before_at_return}",
+            "caller took={}µs enqueue rejected={rejected:?} before already ran={before_at_return}",
             took.as_micros()
         ),
     );
     ck.check(
-        "A1 回调恰好一次且 SEND_OK",
+        "A1 the callback fired exactly once and was SEND_OK",
         wait_until(|| rec.done() >= 1, 20).await && rec.done() == 1 && rec.ok() == 1
             && rec.errors().is_empty(),
         &rec.summary(),
     );
     ck.check(
-        "A1 before 钩子不在调用方线程上跑（异步发送线程池）",
+        "A1 the before hook does not run on the caller thread (async send thread pool)",
         hook.first_before_thread().is_some_and(|t| t != caller_thread),
         &format!(
-            "钩子线程={:?} 调用方线程={caller_thread:?}",
+            "hook thread={:?} caller thread={caller_thread:?}",
             hook.first_before_thread()
         ),
     );
     ck.check(
-        "A1 用户回调不在调用方线程上跑（公共回调线程池）",
+        "A1 the user callback does not run on the caller thread (shared callback thread pool)",
         rec.thread_at(0).is_some_and(|t| t != caller_thread),
         &format!(
-            "回调线程={:?} 调用方线程={caller_thread:?}",
+            "callback thread={:?} caller thread={caller_thread:?}",
             rec.thread_at(0)
         ),
     );
     ck.check(
-        "A1 before/after 各跑一次",
+        "A1 before/after each ran exactly once",
         hook.before_count() == 1 && hook.after_count() == 1,
         &format!(
             "before={} after={}",
@@ -486,10 +503,10 @@ async fn a1_non_blocking_and_read_back(ck: &mut Checker, env: &Env) {
     let results = rec.results();
     let Some(first) = results.first() else {
         producer.shutdown();
-        return ck.abort("A1 读回", &rec.summary());
+        return ck.abort("A1 read-back", &rec.summary());
     };
     ck.check(
-        "A1 msgId 是客户端 UNIQ_KEY、与 broker 的 offsetMsgId 不同",
+        "A1 msgId is the client-side UNIQ_KEY and differs from the broker-side offsetMsgId",
         first
             .msg_id
             .as_deref()
@@ -501,10 +518,11 @@ async fn a1_non_blocking_and_read_back(ck: &mut Checker, env: &Env) {
             first.msg_id, first.offset_msg_id
         ),
     );
-    // offsetMsgId 是 broker 给的，只有它能解出 commitLog 偏移 ⇒ 读回来对 body。
+    // The offsetMsgId is given by the broker, and only it can be decoded into a commitLog offset
+    // ⇒ read the body back with it.
     let Some(offset_msg_id) = first.offset_msg_id.clone() else {
         producer.shutdown();
-        return ck.abort("A1 读回", "回调没带 offsetMsgId");
+        return ck.abort("A1 read-back", "the callback carried no offsetMsgId");
     };
     let mut back = None;
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -514,7 +532,7 @@ async fn a1_non_blocking_and_read_back(ck: &mut Checker, env: &Env) {
                 back = Some(msg);
                 break;
             }
-            // commitLog 还没刷出去
+            // the commitLog has not been flushed yet
             Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
         }
     }
@@ -522,7 +540,7 @@ async fn a1_non_blocking_and_read_back(ck: &mut Checker, env: &Env) {
         m.body.as_deref() == Some(body.as_slice()) && m.topic == topic
     });
     ck.check(
-        "A1 用回调里的 offsetMsgId 能读回这条消息",
+        "A1 the offsetMsgId from the callback can read this message back",
         read_back,
         &format!(
             "offsetMsgId={offset_msg_id} body={:?}",
@@ -532,22 +550,22 @@ async fn a1_non_blocking_and_read_back(ck: &mut Checker, env: &Env) {
     if let Some(mq) = first.message_queue.clone() {
         let max = env.admin.max_offset(&mq).await.unwrap_or(-1);
         ck.check(
-            "A1 回调里的 queueOffset 就是它落在的位置",
+            "A1 the queueOffset in the callback is exactly where it landed",
             first.queue_offset == max - 1,
             &format!("queueOffset={} maxOffset={}", first.queue_offset, max),
         );
     } else {
-        ck.abort("A1 回调里的 queueOffset 就是它落在的位置", "回调没带 MessageQueue");
+        ck.abort("A1 the queueOffset in the callback is exactly where it landed", "the callback carried no MessageQueue");
     }
     ck.check(
-        "A1 broker 落了这一条",
+        "A1 the broker stored this one message",
         wait_landed(env, &topic, 1).await == 1,
         &format!("landed={}", landed_count(env, &topic).await),
     );
     producer.shutdown();
 }
 
-// ------------------------------------------------- A2 并发不串台
+// ------------------------------------------------- A2 no cross-talk under concurrency
 
 async fn a2_burst_exactly_once_each(ck: &mut Checker, env: &Env) {
     let topic = env.topic("Burst");
@@ -564,15 +582,15 @@ async fn a2_burst_exactly_once_each(ck: &mut Checker, env: &Env) {
             Some(8_000),
             None,
         ) {
-            return ck.abort("A2 30 笔并发都收了回调", &format!("第 {i} 笔入队被拒: {e}"));
+            return ck.abort("A2 all 30 concurrent sends got their callbacks", &format!("send #{i} was rejected at enqueue: {e}"));
         }
     }
     let all_back = wait_until(|| each.iter().all(|r| r.done() >= 1), 20).await;
     let total_done: usize = each.iter().map(|r| r.done()).sum();
     ck.check(
-        "A2 30 笔并发异步发送每笔都拿到终态",
+        "A2 every one of the 30 concurrent async sends reached a terminal state",
         all_back && total_done == BURST,
-        &format!("总回调={total_done} 发送={BURST}"),
+        &format!("total callbacks={total_done} sent={BURST}"),
     );
     let mut multi = 0usize;
     let mut not_ok = 0usize;
@@ -600,34 +618,34 @@ async fn a2_burst_exactly_once_each(ck: &mut Checker, env: &Env) {
         }
     }
     ck.check(
-        "A2 每笔**恰好一个**终态（不多不少）",
+        "A2 each send has **exactly one** terminal state (no more, no less)",
         multi == 0,
-        &format!("多拿回调的笔数={multi}"),
+        &format!("sends with extra callbacks={multi}"),
     );
     ck.check(
-        "A2 全部 SEND_OK",
+        "A2 everything is SEND_OK",
         not_ok == 0,
-        &format!("{not_ok} 笔非 OK，例如：{first_errors}"),
+        &format!("{not_ok} sends were not OK, e.g.: {first_errors}"),
     );
     ck.check(
-        "A2 broker 上正好落 30 条",
+        "A2 exactly 30 messages are stored on the broker",
         wait_landed(env, &topic, BURST as i64).await == BURST as i64,
         &format!("landed={}", landed_count(env, &topic).await),
     );
     ck.check(
-        "A2 各笔的 (broker, queueId, queueOffset) 互不重叠",
+        "A2 the (broker, queueId, queueOffset) of each send do not overlap",
         slots.len() == BURST,
-        &format!("去重后={}", slots.len()),
+        &format!("after dedup={}", slots.len()),
     );
     ck.check(
-        "A2 每笔的 UNIQ_KEY 都不一样",
+        "A2 every send has a distinct UNIQ_KEY",
         uniq.len() == BURST,
-        &format!("去重后={}", uniq.len()),
+        &format!("after dedup={}", uniq.len()),
     );
     producer.shutdown();
 }
 
-// ------------------------------------------------- A3 定点发送
+// ------------------------------------------------- A3 aimed send
 
 async fn a3_pinned_queue(ck: &mut Checker, env: &Env) {
     let topic = env.topic("Pinned");
@@ -635,26 +653,28 @@ async fn a3_pinned_queue(ck: &mut Checker, env: &Env) {
         Ok(p) => p,
         Err(e) => return ck.abort("A3 producer", &e),
     };
-    // 先把 topic 撑出来（同步发一笔，让 broker 把队列建全），再挑一条定点打。
-    // ⚠ 取基线之前必须等预热那一笔在 broker 侧**已经可读**：刚 ack 的报文落到
-    // consumeQueue 有延迟，基线读成 0、对账时它变成 1，会凭空多出 1 条。
+    // First grow the topic into shape (send one message synchronously so the broker creates all
+    // the queues), then pick one queue to aim at.
+    // ⚠ Before taking the baseline we must wait until the warm-up send is **already readable** on
+    // the broker side: a just-acked message lands in the consumeQueue with a delay, so a baseline
+    // read as 0 turns into 1 at reconciliation time and conjures one extra message out of thin air.
     let mut warmup = message(&topic, b"async-a3-warmup", "TagA3");
     match producer.send(&mut warmup, Some(5_000), None).await {
         Ok(_) => {}
-        Err(e) => return ck.abort("A3 预热那一笔", &e.to_string()),
+        Err(e) => return ck.abort("A3 the warm-up send", &e.to_string()),
     }
     let warmed = wait_landed(env, &topic, 1).await;
     ck.check(
-        "A3 预热那一笔已经在 broker 上可读",
+        "A3 the warm-up send is already readable on the broker",
         warmed >= 1,
         &format!("landed={warmed}"),
     );
     let queues = match producer.fetch_publish_message_queues(&topic).await {
         Ok(q) => q,
-        Err(e) => return ck.abort("A3 取到了发布队列", &e.to_string()),
+        Err(e) => return ck.abort("A3 got the publish queue", &e.to_string()),
     };
     ck.check(
-        "A3 取到了发布队列",
+        "A3 got the publish queue",
         !queues.is_empty(),
         &format!("queues={}", queues.len()),
     );
@@ -675,19 +695,19 @@ async fn a3_pinned_queue(ck: &mut Checker, env: &Env) {
         Some(5_000),
         Some(aimed.clone()),
     ) {
-        return ck.abort("A3 定点异步发送", &e.to_string());
+        return ck.abort("A3 aimed async send", &e.to_string());
     }
     ck.check(
-        "A3 定点异步发送拿到终态且 SEND_OK",
+        "A3 the aimed async send reached a terminal state and is SEND_OK",
         wait_until(|| rec.done() >= 1, 20).await && rec.done() == 1 && rec.ok() == 1,
         &rec.summary(),
     );
     let Some(r) = rec.results().first().cloned() else {
         producer.shutdown();
-        return ck.abort("A3 定点落位对账", &rec.summary());
+        return ck.abort("A3 aimed landing reconciliation", &rec.summary());
     };
     ck.check(
-        "A3 结果落在指定的那条队列上",
+        "A3 the result landed on the designated queue",
         r.message_queue.as_ref() == Some(&aimed),
         &format!("{:?}", r.message_queue),
     );
@@ -698,23 +718,23 @@ async fn a3_pinned_queue(ck: &mut Checker, env: &Env) {
         after_aimed = queue_landed(env, &aimed).await.unwrap_or(-1);
     }
     ck.check(
-        "A3 那条队列正好多 1 条",
+        "A3 that queue has exactly one more message",
         after_aimed == before + 1,
-        &format!("landed={after_aimed} 之前={before}"),
+        &format!("landed={after_aimed} before={before}"),
     );
     let mut others_after = 0_i64;
     for mq in queues.iter().skip(1) {
         others_after += queue_landed(env, mq).await.unwrap_or(0).max(0);
     }
     ck.check(
-        "A3 别的队列一条都没多",
+        "A3 no other queue gained a single message",
         others_after == others_before,
-        &format!("其它队列 {others_before} -> {others_after}"),
+        &format!("other queues {others_before} -> {others_after}"),
     );
     producer.shutdown();
 }
 
-// ------------------------------------------------- A4 拦截钩子
+// ------------------------------------------------- A4 intercepting hook
 
 async fn a4_forbidden_hook(ck: &mut Checker, env: &Env) {
     let topic = env.topic("Forbidden");
@@ -727,10 +747,10 @@ async fn a4_forbidden_hook(ck: &mut Checker, env: &Env) {
     let rejected = Arc::new(Recorder::default());
     let bad = message(&topic, b"async-a4-rejected", "forbidden");
     if let Err(e) = producer.send_async(bad, rejected.clone(), Some(5_000), None) {
-        return ck.abort("A4 钩子拒绝的异常原样到了回调", &e.to_string());
+        return ck.abort("A4 the exception rejected by the hook reached the callback verbatim", &e.to_string());
     }
     ck.check(
-        "A4 钩子拒绝的异常原样到了回调",
+        "A4 the exception rejected by the hook reached the callback verbatim",
         wait_until(|| rejected.done() >= 1, 10).await
             && rejected
                 .errors()
@@ -739,45 +759,47 @@ async fn a4_forbidden_hook(ck: &mut Checker, env: &Env) {
         &rejected.summary(),
     );
     ck.check(
-        "A4 拦截钩子看到的是 ASYNC",
+        "A4 the intercepting hook sees ASYNC",
         forbidden.calls() >= 1 && forbidden.saw_mode("ASYNC"),
         &format!("modes={}", forbidden.dump_modes()),
     );
-    // 这个 topic 除了被拒的这一笔什么都没有 ⇒ 要么读到 0 条，要么连路由都还没
-    // 注册上（-1）。路由是**第一条消息落到 broker** 才会被 autoCreate 建出来的，
-    // 所以「读不到路由」本身就是「broker 没收到过请求」的证据。
+    // This topic has nothing but the rejected send in it ⇒ either we read 0 messages, or even the
+    // route is not registered yet (-1). The route is only created by autoCreate **once the first
+    // message lands on the broker**, so "the route cannot be read" is itself evidence that "the
+    // broker never received a request".
     let after_reject = landed_count(env, &topic).await;
     ck.check(
-        "A4 被拒的这笔在 broker 上没留痕",
+        "A4 the rejected send left no trace on the broker",
         after_reject <= 0,
-        &format!("landed={after_reject}（-1 = 路由还没建出来，即 broker 一条都没收到）"),
+        &format!("landed={after_reject} (-1 = the route has not been created, i.e. the broker received nothing at all)"),
     );
 
     let passed = Arc::new(Recorder::default());
     let ok = message(&topic, b"async-a4-ok", "TagA4");
     if let Err(e) = producer.send_async(ok, passed.clone(), Some(5_000), None) {
-        return ck.abort("A4 同一个生产者换个标签照常落地", &e.to_string());
+        return ck.abort("A4 the same producer with a different tag lands normally", &e.to_string());
     }
     ck.check(
-        "A4 同一个生产者换个标签照常落地（拒绝没把池子弄坏）",
+        "A4 the same producer with a different tag lands normally (the rejection did not break the pool)",
         wait_until(|| passed.done() >= 1, 20).await && passed.ok() == 1,
         &passed.summary(),
     );
     let landed = wait_landed(env, &topic, 1).await;
     ck.check(
-        "A4 broker 上正好落 1 条",
+        "A4 exactly 1 message is stored on the broker",
         landed == 1,
         &format!("landed={landed}"),
     );
     ck.check(
-        "A4 钩子一共被调 2 次（一笔被拒、一笔放行）",
+        "A4 the hook was called twice in total (one send rejected, one let through)",
         forbidden.calls() == 2,
         &format!("calls={}", forbidden.calls()),
     );
     producer.shutdown();
 }
 
-/// 一组队列上已落条数的总和（`.await` 不能待在 `map(...).sum()` 里，只能摊开写）。
+/// The sum of the messages already stored on a set of queues (`.await` cannot live inside
+/// `map(...).sum()`, so it has to be spelled out).
 async fn queues_landed(env: &Env, queues: &[MessageQueue]) -> i64 {
     let mut total = 0_i64;
     for mq in queues {
@@ -786,10 +808,11 @@ async fn queues_landed(env: &Env, queues: &[MessageQueue]) -> i64 {
     total
 }
 
-// ------------------------------------------------- A5 批量异步（send_batch_async）
+// ------------------------------------------------- A5 batch async (send_batch_async)
 
-/// 每条断言都刻意选在「只跑离线单测看不出来」的那一侧：回调有没有交付、批量内核的本地
-/// 校验有没有被异步路径绕过、错误有没有被静默吞掉、许可有没有漏。
+/// Every assertion is deliberately placed on the side that "running only the offline unit tests
+/// cannot reveal": whether the callback is delivered, whether the batch core's local validation was
+/// bypassed by the async path, whether errors are silently swallowed, and whether a permit leaks.
 async fn a5_batch_async(ck: &mut Checker, env: &Env) {
     let topic = env.topic("BatchAsync");
     let producer = match env.producer("a5", None, None).await {
@@ -797,17 +820,19 @@ async fn a5_batch_async(ck: &mut Checker, env: &Env) {
         Err(e) => return ck.abort("A5 producer", &e),
     };
 
-    // ① 一批 5 条：回调恰好一次、SEND_OK，并且 broker 上真的落了 5 条。
-    //    只看回调会被「回调报了 OK 但请求压根没发出去」蒙过去 —— 那条必须靠 broker 侧对账。
+    // ① One batch of 5 messages: the callback fires exactly once, SEND_OK, and really 5 messages
+    //    land on the broker.
+    //    Looking only at the callback would be fooled by "the callback reported OK but the request
+    //    never went out" —— that one has to be reconciled on the broker side.
     let rec = Arc::new(Recorder::default());
     let batch: Vec<Message> = (0..5)
         .map(|i| message(&topic, format!("async-a5-{i}").as_bytes(), "TagA5"))
         .collect();
     if let Err(e) = producer.send_batch_async(batch, rec.clone(), Some(10_000), None) {
-        return ck.abort("A5 批量异步提交", &e.to_string());
+        return ck.abort("A5 batch async submit", &e.to_string());
     }
     ck.check(
-        "A5 一批 5 条：回调恰好一次且 SEND_OK",
+        "A5 one batch of 5 messages: the callback fired exactly once and is SEND_OK",
         wait_until(|| rec.done() >= 1, 20).await
             && rec.done() == 1
             && rec.ok() == 1
@@ -819,20 +844,21 @@ async fn a5_batch_async(ck: &mut Checker, env: &Env) {
     );
     let landed = wait_landed(env, &topic, 5).await;
     ck.check(
-        "A5 broker 上真落了 5 条（不是回调自己说成功）",
+        "A5 really 5 messages landed on the broker (not just what the callback claimed)",
         landed == 5,
-        &format!("landed={landed}（-1 = 路由还没建出来）"),
+        &format!("landed={landed} (-1 = the route has not been created yet)"),
     );
 
     let batch_offset = rec.results().first().and_then(|r| r.offset_msg_id.clone());
-    // 批量应答的 offsetMsgId 是 broker **逐条**回的一串（逗号分隔，一条子消息一个 commitLog
-    // 偏移），所以它自己就是「这一批真被拆开存成 5 条」的证据；读回时取第一条的偏移。
+    // The offsetMsgId of a batch reply is a string the broker returns **per message** (comma
+    // separated, one commitLog offset per sub-message), so it is itself evidence that "this batch
+    // really was split and stored as 5 messages"; when reading back we take the first offset.
     let sub_offsets: Vec<&str> = batch_offset
         .as_deref()
         .map(|s| s.split(',').filter(|o| !o.is_empty()).collect())
         .unwrap_or_default();
     ck.check(
-        "A5 broker 逐条回了 5 个 commitLog 偏移（批量确实被拆开落地）",
+        "A5 the broker returned 5 commitLog offsets one by one (the batch really was split and landed)",
         sub_offsets.len() == 5 && sub_offsets.iter().all(|o| decode_message_id(o).is_ok()),
         &format!("offsetMsgId={batch_offset:?}"),
     );
@@ -852,12 +878,12 @@ async fn a5_batch_async(ck: &mut Checker, env: &Env) {
         }
     }
     ck.check(
-        "A5 broker 上存的子消息带客户端 UNIQ_KEY（逐条 ID 编在 body 里）",
+        "A5 the sub-messages stored on the broker carry the client-side UNIQ_KEY (the per-message id is encoded in the body)",
         stored_uniq.as_deref().is_some_and(|u| u.len() == 32),
         &format!("stored UNIQ_KEY={stored_uniq:?} offsetMsgId={batch_offset:?}"),
     );
     ck.check(
-        "A5 批量的 SendResult.msgId 是批量自身的 32 位 ID、不是 offsetMsgId",
+        "A5 the batch SendResult.msgId is the batch's own 32-hex id, not the offsetMsgId",
         rec.results().first().is_some_and(|r| {
             r.msg_id.as_deref().is_some_and(|id| id.len() == 32 && !id.contains(','))
                 && r.msg_id != r.offset_msg_id
@@ -869,11 +895,12 @@ async fn a5_batch_async(ck: &mut Checker, env: &Env) {
             .unwrap_or_default(),
     );
 
-    // ② 定点批量：`mq` 参数真的传到了批量内核，而不是被丢掉后自己挑一条。
+    // ② Aimed batch: the `mq` argument really reaches the batch core instead of being dropped and
+    //    having a queue picked on its own.
     let queues = match producer.fetch_publish_message_queues(&topic).await {
         Ok(q) if !q.is_empty() => q,
-        Ok(_) => return ck.abort("A5 定点批量", "topic 没有可用队列"),
-        Err(e) => return ck.abort("A5 定点批量取队列", &e.to_string()),
+        Ok(_) => return ck.abort("A5 aimed batch", "the topic has no usable queue"),
+        Err(e) => return ck.abort("A5 aimed batch fetch queues", &e.to_string()),
     };
     let aimed = queues[0].clone();
     let aimed_before = queue_landed(env, &aimed).await.unwrap_or(-1);
@@ -885,7 +912,7 @@ async fn a5_batch_async(ck: &mut Checker, env: &Env) {
     if let Err(e) =
         producer.send_batch_async(pin_batch, pinned.clone(), Some(10_000), Some(aimed.clone()))
     {
-        return ck.abort("A5 定点批量提交", &e.to_string());
+        return ck.abort("A5 aimed batch submit", &e.to_string());
     }
     let pinned_ok = wait_until(|| pinned.done() >= 1, 20).await
         && pinned.done() == 1
@@ -902,13 +929,13 @@ async fn a5_batch_async(ck: &mut Checker, env: &Env) {
     }
     let others_after = queues_landed(env, &queues[1..]).await;
     ck.check(
-        "A5 定点批量落在指定队列、别的队列一条都没多",
+        "A5 the aimed batch lands on the designated queue and no other queue gained a single message",
         pinned_ok
             && landed_on_aimed
             && aimed_after == aimed_before + 3
             && others_after == others_before,
         &format!(
-            "ok={} 落位={landed_on_aimed} 该队列 {aimed_before}->{aimed_after} 其它 {others_before}->{others_after}",
+            "ok={} landed_on_aimed={landed_on_aimed} that queue {aimed_before}->{aimed_after} others {others_before}->{others_after}",
             pinned.ok()
         ),
     );
@@ -919,10 +946,10 @@ async fn a5_batch_async(ck: &mut Checker, env: &Env) {
         message(&env.topic("BatchOther"), b"async-a5-mixed-2", "TagA5"),
     ];
     if let Err(e) = producer.send_batch_async(mixed_batch, mixed.clone(), Some(5_000), None) {
-        return ck.abort("A5 混 topic 批次提交", &e.to_string());
+        return ck.abort("A5 mixed-topic batch submit", &e.to_string());
     }
     ck.check(
-        "A5 混 topic 的一批在回调里报错（本地校验没被异步路径绕过）",
+        "A5 a batch mixing topics reports an error in the callback (local validation was not bypassed by the async path)",
         wait_until(|| mixed.done() >= 1, 10).await
             && mixed.done() == 1
             && mixed.ok() == 0
@@ -933,13 +960,14 @@ async fn a5_batch_async(ck: &mut Checker, env: &Env) {
         &mixed.summary(),
     );
 
-    // ④ 空批次：同一口径 —— 错误进回调，一次回调都不欠。
+    // ④ Empty batch: the same criterion —— the error goes to the callback and not a single callback
+    //    is owed.
     let empty = Arc::new(Recorder::default());
     if let Err(e) = producer.send_batch_async(Vec::new(), empty.clone(), Some(5_000), None) {
-        return ck.abort("A5 空批次提交", &e.to_string());
+        return ck.abort("A5 empty batch submit", &e.to_string());
     }
     ck.check(
-        "A5 空批次也是「恰好一次失败回调」，不静默吞掉",
+        "A5 an empty batch also yields exactly one failure callback and is not silently swallowed",
         wait_until(|| empty.done() >= 1, 10).await
             && empty.done() == 1
             && empty.ok() == 0
@@ -950,9 +978,11 @@ async fn a5_batch_async(ck: &mut Checker, env: &Env) {
         &empty.summary(),
     );
 
-    // ⑤ 背压扣的是**整批**字节，不是「一条」：把字节闸压到地板（1 MiB），
-    //    一批 2×600 KiB 就必须被闸拦下（整批 1.2 MiB > 1 MiB）；换一批 2×100 KiB 又必须过。
-    //    只按第一条算（600 KiB）或者干脆不扣，这两条就会同时反向。
+    // ⑤ The backpressure charges the bytes of the **whole batch**, not of "one message": push the
+    //    byte gate down to the floor (1 MiB), and a batch of 2×600 KiB must be blocked by the gate
+    //    (the whole batch is 1.2 MiB > 1 MiB); a batch of 2×100 KiB must instead get through.
+    //    If it only counted the first message (600 KiB) or did not charge at all, these two cases
+    //    would both invert.
     producer.set_enable_backpressure_for_async_mode(true);
     producer.set_back_pressure_for_async_send_num(1);
     producer.set_back_pressure_for_async_send_size(1024 * 1024);
@@ -963,10 +993,10 @@ async fn a5_batch_async(ck: &mut Checker, env: &Env) {
         message(&topic, &big_body, "TagA5"),
     ];
     if let Err(e) = producer.send_batch_async(big_batch, gated.clone(), Some(2_000), None) {
-        return ck.abort("A5 超闸批量提交", &e.to_string());
+        return ck.abort("A5 over-gate batch submit", &e.to_string());
     }
     ck.check(
-        "A5 整批 1.2MiB 被 1MiB 字节闸拦下（回调拿到 TooMuchRequest，一次请求都没发）",
+        "A5 the whole 1.2MiB batch is blocked by the 1MiB byte gate (the callback gets TooMuchRequest and not a single request went out)",
         wait_until(|| gated.done() >= 1, 15).await
             && gated.done() == 1
             && gated.ok() == 0
@@ -976,7 +1006,8 @@ async fn a5_batch_async(ck: &mut Checker, env: &Env) {
                 .is_some_and(|e| e.contains("semaphoreAsyncSize timeout")),
         &gated.summary(),
     );
-    // 同一道闸下的小批次必须照常落地：证明「拦住」是因为整批量，不是因为批量被一概论处
+    // A small batch under the very same gate must still land normally, proving that "being blocked"
+    //    is because of the whole-batch size and not because batches are rejected outright
     let small_body = vec![b'y'; 100 * 1024];
     let passed = Arc::new(Recorder::default());
     let small_batch = vec![
@@ -984,19 +1015,20 @@ async fn a5_batch_async(ck: &mut Checker, env: &Env) {
         message(&topic, &small_body, "TagA5"),
     ];
     if let Err(e) = producer.send_batch_async(small_batch, passed.clone(), Some(10_000), None) {
-        return ck.abort("A5 小批量提交", &e.to_string());
+        return ck.abort("A5 small batch submit", &e.to_string());
     }
     ck.check(
-        "A5 同一道闸下 200KiB 的一批照常拿到 SEND_OK",
+        "A5 a 200KiB batch under the very same gate still gets SEND_OK",
         wait_until(|| passed.done() >= 1, 20).await && passed.done() == 1 && passed.ok() == 1,
         &passed.summary(),
     );
-    // 许可必须原样归还：漏一份就是长跑之后「所有异步发送集体超时」，
-    // 而单次发送看不出来（条数闸只放过 1 份，被拦那笔必须把已拿到的条数许可还回去）。
+    // The permits must be returned as they were: leaking even one means that "after a long run all
+    // async sends time out together", which a single send cannot reveal (the count gate only let 1
+    // through, so the blocked send has to give back the count permit it already took).
     let num_total = producer.get_back_pressure_for_async_send_num();
     let size_total = producer.get_back_pressure_for_async_send_size();
     ck.check(
-        "A5 批量路径把两份许可原样归还（空闲量回到总量，含被闸拦下那一笔）",
+        "A5 the batch path returns both permits unchanged (the idle amounts are back to the totals, including the send blocked by the gate)",
         wait_until(
             || producer.semaphore_async_send_num_available_permits() == num_total
                 && producer.semaphore_async_send_size_available_permits() == size_total,
@@ -1004,7 +1036,7 @@ async fn a5_batch_async(ck: &mut Checker, env: &Env) {
         )
         .await,
         &format!(
-            "空闲条数={} 总量={num_total} 空闲字节={} 总量={size_total}",
+            "idle counts={} total={num_total} idle bytes={} total={size_total}",
             producer.semaphore_async_send_num_available_permits(),
             producer.semaphore_async_send_size_available_permits()
         ),
@@ -1012,7 +1044,7 @@ async fn a5_batch_async(ck: &mut Checker, env: &Env) {
     producer.shutdown();
 }
 
-// ------------------------------------------------- A6 Shutdown 不等在途
+// ------------------------------------------------- A6 shutdown does not wait for in-flight sends
 
 async fn a6_shutdown_does_not_wait(ck: &mut Checker, env: &Env) {
     let topic = env.topic("Drain");
@@ -1031,7 +1063,7 @@ async fn a6_shutdown_does_not_wait(ck: &mut Checker, env: &Env) {
         let body = format!("async-a6-{i}");
         let msg = message(&topic, body.as_bytes(), "TagA6");
         if let Err(e) = producer.send_async(msg, rec.clone(), Some(8_000), None) {
-            return ck.abort("A6 每一笔都被接下了", &format!("第 {i} 笔: {e}"));
+            return ck.abort("A6 every send was accepted", &format!("send #{i}: {e}"));
         }
     }
     let began = Instant::now();
@@ -1039,44 +1071,46 @@ async fn a6_shutdown_does_not_wait(ck: &mut Checker, env: &Env) {
     let shut_took = began.elapsed();
     let returned_at = Instant::now();
     ck.check(
-        "A6 每一笔都拿到终态回调（不等待 ≠ 回调凭空消失）",
+        "A6 every send got a terminal callback (not waiting does not mean callbacks vanish into thin air)",
         wait_until(|| rec.done() >= sends, 30).await && rec.done() == sends,
-        &format!("done={} 发送={sends} {}", rec.done(), rec.summary()),
+        &format!("done={} sent={sends} {}", rec.done(), rec.summary()),
     );
     let after_return = rec.after(returned_at);
-    // 真正的证据是「返回耗时远小于一笔的准备段」：每笔 before 钩子睡 100ms，池子只有
-    // cores*2 根线程，等在途的 shutdown 至少要几百 ms。上一版还要求「只有 1 笔在返回前
-    // 就交付」，那是拿调度赌运气：36 笔的提交循环本身就要几十 ms，先跑完的那几笔完全
-    // 可能赶在 shutdown 返回之前落终态。
+    // The real evidence is "the return took far less than one preparation stage": each before hook
+    // sleeps 100ms and the pool only has cores*2 threads, so a shutdown that waited for in-flight
+    // sends would take at least a few hundred ms. A previous version also required "only 1 send is
+    // delivered before the return", which was gambling on scheduling: the submit loop of 36 sends
+    // itself takes tens of ms, so the first few to finish could easily reach their terminal state
+    // before shutdown returns.
     ck.check(
-        "A6 Shutdown 返回得比一笔的准备段还快（它没有等在途）",
+        "A6 shutdown returns faster than a single preparation stage (it did not wait for in-flight sends)",
         shut_took < Duration::from_millis(100),
-        &format!("返回耗时={}ms，单笔准备段=100ms", shut_took.as_millis()),
+        &format!("return took={}ms, one preparation stage=100ms", shut_took.as_millis()),
     );
     ck.check(
-        "A6 Shutdown 不等在途：返回之后大部分回调才落地",
+        "A6 shutdown does not wait for in-flight sends: most callbacks land only after it returns",
         after_return * 2 >= sends,
         &format!(
-            "Shutdown 返回后才有 {after_return}/{sends} 笔落到终态，返回耗时={}ms",
+            "only {after_return}/{sends} sends reached their terminal state after shutdown returned, which took={}ms",
             shut_took.as_millis()
         ),
     );
     let errors = rec.errors().len();
     ck.check(
-        "A6 不等待的代价：客户端先关，在途发送基本全部报错",
+        "A6 the price of not waiting: the client shuts down first and virtually every in-flight send errors out",
         errors * 2 >= sends,
-        &format!("报错={errors}/{sends}，例如：{:?}", rec.errors().first()),
+        &format!("errors={errors}/{sends}, e.g.: {:?}", rec.errors().first()),
     );
     tokio::time::sleep(Duration::from_secs(2)).await;
     let landed = landed_count(env, &topic).await;
     ck.check(
-        "A6 broker 上落地的远少于发送条数（不等待真的会丢消息）",
+        "A6 far fewer messages landed on the broker than were sent (not waiting really does lose messages)",
         sent > landed.max(0) * 2,
-        &format!("landed={landed} 发送={sends}"),
+        &format!("landed={landed} sent={sends}"),
     );
     println!(
-        "     A6 明细: landed={landed}/{sends} ok={} 报错={errors} shutdown 返回耗时={}ms，\
-         返回之后才落到终态的回调={after_return} 笔，首笔错误={:?}",
+        "     A6 detail: landed={landed}/{sends} ok={} errors={errors} shutdown returned in={}ms,\
+         callbacks reaching a terminal state only after the return={after_return}, first error={:?}",
         rec.ok(),
         shut_took.as_millis(),
         rec.errors().first()
@@ -1093,41 +1127,41 @@ async fn a6_shutdown_does_not_wait(ck: &mut Checker, env: &Env) {
         .map(|e| e.to_string())
         .unwrap_or_default();
     ck.check(
-        "A6 关掉的池子不会再收新任务（同步被拒且不追加回调）",
+        "A6 the pool that was shut down accepts no new task (the sync send is rejected and no callback is appended)",
         after_shutdown.contains("not started") && rec.done() == sends,
         &format!("{after_shutdown} / done={}", rec.done()),
     );
 
     let p2 = match env.producer("a6-after", None, None).await {
         Ok(p) => p,
-        Err(e) => return ck.abort("A6 新生产者", &e),
+        Err(e) => return ck.abort("A6 the new producer", &e),
     };
     let fresh = Arc::new(Recorder::default());
     let again = message(&topic, b"async-a6-new-producer", "TagA6");
     if let Err(e) = p2.send_async(again, fresh.clone(), Some(8_000), None) {
-        return ck.abort("A6 关掉的池子不会被别的生产者复用", &e.to_string());
+        return ck.abort("A6 the pool that was shut down is not reused by another producer", &e.to_string());
     }
     ck.check(
-        "A6 关掉的池子不会被别的生产者复用（新生产者接着能发）",
+        "A6 the pool that was shut down is not reused by another producer (the new producer can go on sending)",
         wait_until(|| fresh.done() >= 1, 20).await && fresh.ok() == 1,
         &fresh.summary(),
     );
     p2.shutdown();
 }
 
-// ---------------------------------------------------------- 清理
+// ---------------------------------------------------------- cleanup
 
 async fn cleanup(ck: &mut Checker, env: &Env) {
     let topics = lock(&env.topics).clone();
     for topic in topics {
         if let Err(e) = env.admin.delete_topic(&topic, None).await {
-            println!("  [WARN] delete_topic({topic}) 失败: {e}");
+            println!("  [WARN] delete_topic({topic}) failed: {e}");
         }
     }
-    ck.check("清理本次的 topic", true, "");
+    ck.check("clean up this round's topic", true, "");
 }
 
-// ------------------------------------------------------- 驱动
+// ------------------------------------------------------- driver
 
 async fn run(namesrv: &str) -> Checker {
     let mut ck = Checker::new();
@@ -1168,7 +1202,7 @@ fn main() -> ExitCode {
     {
         Ok(runtime) => runtime,
         Err(e) => {
-            eprintln!("建运行时失败: {e}");
+            eprintln!("failed to build the runtime: {e}");
             return ExitCode::FAILURE;
         }
     };

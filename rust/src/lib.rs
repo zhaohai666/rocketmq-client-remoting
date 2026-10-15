@@ -1,4 +1,4 @@
-//! Apache RocketMQ 经典 remoting 协议客户端（Rust）。
+//! Apache RocketMQ classic remoting protocol client (Rust).
 
 pub mod client;
 pub mod common;

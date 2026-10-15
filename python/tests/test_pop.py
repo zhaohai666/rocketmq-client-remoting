@@ -23,7 +23,7 @@ GROUP = "PopUnitTestGroup"
 TOPIC = "PopUnitTestTopic"
 
 
-# ---------------------------------------------------------------- 工具
+# ---------------------------------------------------------------- Utilities
 
 def _resp(code: int, ext: dict = None, body: bytes = None, remark: str = "") -> RemotingCommand:
     r = RemotingCommand(code=code, remark=remark)
@@ -33,15 +33,15 @@ def _resp(code: int, ext: dict = None, body: bytes = None, remark: str = "") -> 
 
 
 class _FakeClient:
-    """记录最后一次请求并返回预置响应的假 client。"""
+    """A fake client that records the last request and returns a preset response."""
 
     def __init__(self, responses):
         self.responses = list(responses)
         self.requests = []
 
     def __call__(self, addr, request, timeout_millis=0):
-        # 真实链路上 ext_fields 是在 encode 时从 custom_header 落下去的，
-        # 这里显式触发一次，才能断言"线上报文里到底有哪些 key"。
+        # On the real wire, ext_fields is written down from custom_header at encode time;
+        # it is explicitly triggered here so "which keys are actually in the wire message" can be asserted.
         request.make_custom_header_to_net()
         self.requests.append((addr, request, timeout_millis))
         if len(self.responses) == 1:
@@ -117,9 +117,9 @@ class TestExtraInfoGetters:
     def test_length_guards(self):
         seg7 = ei.split("0 1 2 3 0 broker-a 4")
         with pytest.raises(ValueError):
-            ei.get_queue_offset(seg7)          # 需要第 8 段
+            ei.get_queue_offset(seg7)          # requires the 8th segment
         with pytest.raises(ValueError):
-            ei.get_queue_id(["0", "1", "2", "3", "0", "b"])   # 需要 7 段
+            ei.get_queue_id(["0", "1", "2", "3", "0", "b"])   # requires 7 segments
         with pytest.raises(ValueError):
             ei.get_ck_queue_offset([])
 
@@ -135,7 +135,7 @@ class TestExtraInfoRetryTopic:
         assert ei.retry_of_topic("%%RETRY%%%s+%s" % (GROUP, TOPIC)) == ei.RETRY_TOPIC_V2
 
     def test_v2_checked_before_v1_prefix(self):
-        # V2 也带 %RETRY% 前缀，顺序判错就会被误判成 V1
+        # V2 also carries the %RETRY% prefix; a wrong order would misjudge it as V1
         v2 = ei.build_pop_retry_topic_v2(TOPIC, GROUP)
         assert ei.is_pop_retry_topic_v2(v2)
         assert ei.retry_of_topic(v2) == ei.RETRY_TOPIC_V2
@@ -143,7 +143,7 @@ class TestExtraInfoRetryTopic:
     def test_build_pop_retry_topics(self):
         assert ei.build_pop_retry_topic_v1(TOPIC, GROUP) == "%%RETRY%%%s_%s" % (GROUP, TOPIC)
         assert ei.build_pop_retry_topic_v2(TOPIC, GROUP) == "%%RETRY%%%s+%s" % (GROUP, TOPIC)
-        # 默认（enableRetryTopicV2 关）走 V1
+        # By default (enableRetryTopicV2 off) V1 is used
         assert ei.build_pop_retry_topic(TOPIC, GROUP) == ei.build_pop_retry_topic_v1(TOPIC, GROUP)
 
     def test_build_extra_info_marks_retry_messages(self):
@@ -160,7 +160,7 @@ class TestExtraInfoRetryTopic:
 
 class TestExtraInfoParse:
     def test_parse_start_offset_info(self):
-        # 真机实测就是这种形状（空格分段、分号分队列）
+        # Real-machine measurements look exactly like this (space-separated segments, semicolon-separated queues)
         got = ei.parse_start_offset_info("0 0 0;0 3 0;0 2 0")
         assert got == {"0@0": 0, "0@3": 0, "0@2": 0}
 
@@ -196,11 +196,11 @@ class TestExtraInfoParse:
         assert ei.get_start_offset_info_map_key(TOPIC, 3) == "0@3"
         assert ei.get_queue_offset_key_value_key(3, 7) == "qo3%7"
         assert ei.get_queue_offset_map_key(TOPIC, 3, 7) == "0@qo3%7"
-        # retry topic 的 key 带对应的 retryFlag
+        # A retry topic's key carries the corresponding retryFlag
         assert ei.get_start_offset_info_map_key(ei.build_pop_retry_topic_v1(TOPIC, GROUP), 3) == "1@3"
 
 
-# ---------------------------------------------------------------- 2. 请求/响应头
+# ---------------------------------------------------------------- 2. Request/response headers
 
 class TestPopRequestHeader:
     def test_ext_keys_are_the_documented_wire_keys(self):
@@ -305,7 +305,7 @@ class TestPopMessageRequest:
         assert isinstance(res, PopResult) and res.status == PopStatus.FOUND
         _, req, _ = fake.requests[0]
         ext = req.ext_fields
-        # bornTime 填 0 会让 broker 直接回 POLLING_TIMEOUT(210)，必须非 0
+        # A bornTime of 0 makes the broker reply POLLING_TIMEOUT(210) directly; it must be non-zero
         assert int(ext["bornTime"]) > 0
         assert ext["pollTime"] == "0"
         assert ext["initMode"] == "0"
@@ -345,7 +345,7 @@ class TestPopMessageRequest:
 
 
 class TestStampPopCk:
-    """POP_CK 反构 —— 普通 topic 直连 POP 时 broker 不写这个属性，必须客户端拼。"""
+    """POP_CK reverse construction — for direct POP on a normal topic the broker does not write this property; the client must assemble it."""
 
     def _header(self, start_info="0 0 0;0 3 0;0 2 0", msg_info="0 0 5;0 3 6;0 2 7"):
         h = PopMessageResponseHeader()
@@ -362,10 +362,10 @@ class TestStampPopCk:
         for m in msgs:
             ck = m.properties[MessageConst.PROPERTY_POP_CK]
             seg = ei.split(ck)
-            assert len(seg) == 8, "CK 必须是 8 段：%r" % ck
+            assert len(seg) == 8, "the CK must be 8 segments: %r" % ck
             assert ei.get_broker_name(seg) == BROKER
             assert ei.get_queue_id(seg) == m.queue_id
-            # 第 7 段（msgQueueOffset）来自 msgOffsetInfo，不是消息自己的 queueOffset
+            # The 7th segment (msgQueueOffset) comes from msgOffsetInfo, not the message's own queueOffset
             assert ei.get_queue_offset(seg) == {0: 5, 3: 6, 2: 7}[m.queue_id]
 
     def test_start_offset_from_start_offset_info(self):
@@ -376,7 +376,7 @@ class TestStampPopCk:
         assert ei.get_ck_queue_offset(seg) == 99
 
     def test_does_not_override_existing_pop_ck(self):
-        # retry topic 弹回来的消息 broker 已经写好 POP_CK，绝不能覆盖
+        # For messages bounced back from a retry topic, the broker has already written POP_CK; it must never be overwritten
         existing = "1 1 2 0 1 broker-a 0 0"
         msgs = [_msg(queue_id=3, queue_offset=0,
                      props={MessageConst.PROPERTY_POP_CK: existing})]
@@ -384,7 +384,7 @@ class TestStampPopCk:
         assert msgs[0].properties[MessageConst.PROPERTY_POP_CK] == existing
 
     def test_index_selects_right_offset_within_queue(self):
-        # 同一队列多条：msgOffsetInfo 的列表按 queueOffset 排序后的下标取
+        # Multiple messages in the same queue: the msgOffsetInfo list is indexed by the sorted queueOffset
         msgs = [_msg(queue_id=3, queue_offset=10),
                 _msg(queue_id=3, queue_offset=11),
                 _msg(queue_id=3, queue_offset=12)]
@@ -436,7 +436,7 @@ class TestAckMessage:
         _, req, _ = fake.requests[0]
         ext = req.ext_fields
         assert ext["extraInfo"] == ck
-        # offset 必须是 consumeQueue offset（第 8 段），不是 commitlog offset
+        # offset must be the consumeQueue offset (the 8th segment), not the commitlog offset
         assert ext["offset"] == "7"
         assert ext["queueId"] == "3"
         assert ext["consumerGroup"] == GROUP
@@ -465,7 +465,7 @@ class TestChangeInvisibleTime:
         assert res.pop_time == 222
         assert res.invisible_time == 30000
         assert res.revive_qid == 5
-        # 新串要用**响应里的**新值重建，而不是旧串
+        # The new string must be rebuilt with the **response's** new values, not the old string
         seg = ei.split(res.extra_info)
         assert len(seg) == 8
         assert ei.get_pop_time(seg) == 222

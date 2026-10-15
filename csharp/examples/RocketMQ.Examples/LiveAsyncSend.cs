@@ -1,11 +1,11 @@
-// 前置：NameServer + Broker 已起，autoCreateTopicEnable=true。
+// Prerequisites: NameServer + Broker running, autoCreateTopicEnable=true.
 //
 //
-// ⚠ 三条脚本纪律（沿用 LiveBackPressure 那一轮真机联调踩出来的口径）：
-//   ① topic 一律带 stamp，避免继承上一轮的条数；
-//   ② 「有没有落地」只看 broker 侧各队列 maxOffset-minOffset 之和，不看客户端回调；
-//   ③ 新建 topic 要等 broker 把 topicConfig 注册到 namesrv（秒级到十秒级），所以所有
-//      broker 侧对账都是**轮询到超时**，读一次路由失败不算失败。
+// ⚠ Three script disciplines (conventions established during the LiveBackPressure live-verification round):
+//   ① Topics always carry a stamp, to avoid inheriting the message count from the previous round;
+//   ② "Whether it landed" is judged only by the sum of maxOffset-minOffset across queues on the broker side, not by client callbacks;
+//   ③ A newly created topic must wait for the broker to register its topicConfig with the namesrv (seconds up to tens of seconds), so all
+//      broker-side reconciliations poll until timeout; one failed route read does not count as a failure.
 using System.Globalization;
 using System.Text;
 
@@ -92,8 +92,8 @@ public static class LiveAsyncSend
             lock (_lk) return _errors.Count == 0 ? string.Empty : _errors[0].Message;
         }
 
-        /// <summary>首个失败的异常类型名 —— #78 之后回调收的是 Exception 本身，
-        /// 「哪一类失败」可以断言，不必对着文案做正则。</summary>
+        /// <summary>Type name of the first failure - after #78 the callback receives the Exception itself,
+        /// so "which kind of failure" can be asserted without regexing against message text.</summary>
         public string FirstErrorType()
         {
             lock (_lk) return _errors.Count == 0 ? string.Empty : _errors[0].GetType().Name;
@@ -129,8 +129,8 @@ public static class LiveAsyncSend
         }
     }
 
-    /// <summary>before 钩子睡一段时间：把「准备段」拖慢，才能证明调用方没等它。
-    /// 顺便记下两件事：钩子跑在哪根线程上、before/after 各跑了几次。</summary>
+    /// <summary>The before hook sleeps for a while: slowing down the "prepare phase" is the only way to prove the caller did not wait for it.
+    /// It also records two things: which thread the hook runs on, and how many times before/after each ran.</summary>
     private sealed class TracingHook : ISendMessageHook
     {
         private readonly int _parkMillis;
@@ -161,7 +161,7 @@ public static class LiveAsyncSend
         }
     }
 
-    /// <summary>只拒绝带 forbidden 标签的消息，并记下它看到的 CommunicationMode。</summary>
+    /// <summary>Rejects only messages carrying the forbidden tag, and records the CommunicationMode it observed.</summary>
     private sealed class ForbiddenTagHook : ICheckForbiddenHook
     {
         private int _calls;
@@ -220,8 +220,8 @@ public static class LiveAsyncSend
     private static Message Msg(string topic, string body) =>
         new(topic, Encoding.UTF8.GetBytes(body));
 
-    /// <summary>broker 上这个 topic 一共落了多少条（各队列 maxOffset-minOffset 之和）；
-    /// 读不到路由返回 -1（新 topic 注册到 namesrv 是秒级的）。</summary>
+    /// <summary>How many messages landed on the broker for this topic in total (sum of maxOffset-minOffset across queues);
+    /// returns -1 when the route cannot be read (a new topic registers with the namesrv within seconds).</summary>
     private static long Landed(Env env, string topic)
     {
         List<MessageQueue> queues;
@@ -243,7 +243,7 @@ public static class LiveAsyncSend
             }
             catch (Exception)
             {
-                // 该队列刚建出来还没写过
+                // Queue just created, nothing written yet
             }
         }
 
@@ -275,7 +275,7 @@ public static class LiveAsyncSend
         }
     }
 
-    // ------------------------------------------------- A1 立刻返回 + 线程口径 + 读回
+    // ------------------------------------------------- A1 immediate return + thread accounting + read-back
     private static void A1NonBlockingAndReadBack(Env env, string t)
     {
         var hook = new TracingHook(parkMillis: 400);
@@ -287,22 +287,22 @@ public static class LiveAsyncSend
             long began = NowMs();
             p.SendAsync(Msg(t, body), rec, 5000);
             long callerTook = NowMs() - began;
-            Check("A1 调用方在准备段（钩子睡 400ms）之前就已返回",
+            Check("A1 caller returned before the prepare phase (hook sleeps 400ms)",
                 callerTook < 200 && hook.Before() <= 1,
-                "调用方耗时=" + N(callerTook) + "ms before 已跑=" + N(hook.Before()));
-            Check("A1 回调恰好一次且 SEND_OK",
+                "caller took=" + N(callerTook) + "ms, before ran=" + N(hook.Before()));
+            Check("A1 callback fired exactly once with SEND_OK",
                 rec.WaitDone(1, 20000) && rec.Ok == 1 && rec.ErrorCount == 0, rec.Summary());
             SendResult r = rec.Results()[0];
-            Check("A1 before 钩子在 AsyncSenderExecutor_N 上跑",
+            Check("A1 before hook ran on AsyncSenderExecutor_N",
                 hook.BeforeThread().StartsWith("AsyncSenderExecutor_", StringComparison.Ordinal),
-                "线程名=" + hook.BeforeThread());
-            Check("A1 用户回调在 NettyClientPublicExecutor_N 上跑",
+                "thread name=" + hook.BeforeThread());
+            Check("A1 user callback ran on NettyClientPublicExecutor_N",
                 rec.LastThreadName.StartsWith("NettyClientPublicExecutor_", StringComparison.Ordinal),
-                "线程名=" + rec.LastThreadName);
-            Check("A1 before/after 各跑一次", hook.Before() == 1 && hook.After() == 1,
+                "thread name=" + rec.LastThreadName);
+            Check("A1 before/after each ran once", hook.Before() == 1 && hook.After() == 1,
                 "before=" + N(hook.Before()) + " after=" + N(hook.After()));
-            Check("A1 broker 落了这一条", WaitLanded(env, t, 1) == 1);
-            // offsetMsgId 是 broker 给的，只有它能解出 commitLog 偏移 ⇒ 读回来对 body
+            Check("A1 broker landed this message", WaitLanded(env, t, 1) == 1);
+            // offsetMsgId is broker-assigned; only it can decode the commitLog offset => read back and compare body
             MessageExt? back = null;
             bool read = WaitUntil(() =>
             {
@@ -313,19 +313,19 @@ public static class LiveAsyncSend
                 }
                 catch (Exception)
                 {
-                    return false;  // commitLog 还没刷出去
+                    return false;  // commitLog not flushed yet
                 }
             }, 15000);
-            Check("A1 用回调里的 offsetMsgId 能读回这条消息",
+            Check("A1 can read this message back via the offsetMsgId from the callback",
                 read && back is not null
                 && Encoding.UTF8.GetString(back!.Body) == body,
                 "body=" + (back is null ? "<null>" : Encoding.UTF8.GetString(back.Body)));
-            Check("A1 回调里的 queueOffset 就是它落在的位置",
+            Check("A1 queueOffset in the callback matches where it landed",
                 r.QueueOffset == env.Admin.MaxOffset(r.MessageQueue) - 1,
                 "queueOffset=" + N(r.QueueOffset)
                 + " maxOffset=" + N(env.Admin.MaxOffset(r.MessageQueue)));
-            // MsgId 是客户端补的 UNIQ_KEY（32 位十六进制），不是 broker 的那份
-            Check("A1 MsgId 是客户端 UNIQ_KEY、与 broker 的 offsetMsgId 不同",
+            // MsgId is the client-supplied UNIQ_KEY (32 hex chars), not the broker's copy
+            Check("A1 MsgId is the client UNIQ_KEY and differs from the broker offsetMsgId",
                 r.MsgId.Length == 32 && r.MsgId != r.OffsetMsgId,
                 "msgId=" + r.MsgId + " offsetMsgId=" + r.OffsetMsgId);
         }
@@ -335,7 +335,7 @@ public static class LiveAsyncSend
         }
     }
 
-    // ------------------------------------------------- A2 并发不串台
+    // ------------------------------------------------- A2 concurrency without cross-talk
     private static void A2BurstExactlyOnceEach(Env env, string t)
     {
         const int burst = 30;
@@ -359,23 +359,23 @@ public static class LiveAsyncSend
 
             foreach (Thread th in threads) th.Join(30000);
             bool allBack = WaitUntil(() => each.All(r => r.Done >= 1), 20000);
-            Check("A2 30 笔并发异步发送每笔都拿到终态", allBack,
+            Check("A2 all 30 concurrent async sends reached a terminal state", allBack,
                 "done=" + N(each.Sum(r => r.Done)));
-            Check("A2 每笔**恰好一个**终态（不多不少）",
+            Check("A2 each send got **exactly one** terminal state (no more, no fewer)",
                 each.All(r => r.Done == 1),
-                "多拿回调的笔数=" + N(each.Count(r => r.Done > 1)));
-            Check("A2 全部 SEND_OK",
+                "sends with extra callbacks=" + N(each.Count(r => r.Done > 1)));
+            Check("A2 all SEND_OK",
                 each.All(r => r.Ok == 1 && r.ErrorCount == 0),
                 each[0].Summary());
-            Check("A2 broker 上正好落 30 条", WaitLanded(env, t, burst) == burst);
+            Check("A2 exactly 30 messages landed on the broker", WaitLanded(env, t, burst) == burst);
             List<SendResult> rs = each.SelectMany(r => r.Results()).ToList();
             HashSet<string> slots = rs
                 .Select(r => r.MessageQueue.BrokerName + "#" + N(r.MessageQueue.QueueId)
                                       + "@" + N(r.QueueOffset))
                 .ToHashSet(StringComparer.Ordinal);
-            Check("A2 各笔的 (broker, queueId, queueOffset) 互不重叠",
-                slots.Count == burst, "去重后=" + N(slots.Count));
-            Check("A2 每笔的 UNIQ_KEY 都不一样",
+            Check("A2 (broker, queueId, queueOffset) slots do not overlap across sends",
+                slots.Count == burst, "after dedup=" + N(slots.Count));
+            Check("A2 UNIQ_KEY differs for every send",
                 rs.Select(r => r.MsgId).Distinct(StringComparer.Ordinal).Count() == burst);
         }
         finally
@@ -384,39 +384,39 @@ public static class LiveAsyncSend
         }
     }
 
-    // ------------------------------------------------- A3 定点发送
+    // ------------------------------------------------- A3 pinned send
     private static void A3PinnedQueue(Env env, string t)
     {
         DefaultMQProducer p = MakeProducer(env, "a3");
         var rec = new Recorder();
         try
         {
-            // 先把 topic 撑出来（同步发一笔，让 broker 把队列建全），再挑一条定点打。
-            // ⚠ 取基线之前必须等预热那一笔在 broker 侧**已经可读**：刚 ack 的报文落到
-            // consumeQueue 有延迟，基线读成 0、对账时它变成 1，会凭空多出 1 条。
+            // First grow the topic (send one sync message so the broker creates all queues), then pick a queue for a pinned send.
+            // ⚠ Before taking the baseline, the warm-up message must already be **readable** on the broker: a just-acked message
+            // reaches the consumeQueue with delay; a baseline of 0 turning into 1 at reconciliation would phantom-in one extra message.
             p.Send(Msg(t, "async-a3-warmup"), 5000);
-            Check("A3 预热那一笔已经在 broker 上可读", WaitLanded(env, t, 1) >= 1,
+            Check("A3 warm-up message already readable on the broker", WaitLanded(env, t, 1) >= 1,
                 "landed=" + N(Landed(env, t)));
             List<MessageQueue> queues = p.FetchPublishMessageQueues(t);
-            Check("A3 取到了发布队列", queues.Count > 0,
+            Check("A3 obtained publish queues", queues.Count > 0,
                 "queues=" + N(queues.Count));
             MessageQueue aimed = queues[0];
             long before = QueueLanded(env, aimed);
             long othersBefore = queues.Skip(1).Sum(q => Math.Max(0, QueueLanded(env, q)));
             p.SendAsync(Msg(t, "async-a3-pinned"), rec, 5000, aimed);
-            Check("A3 定点异步发送拿到终态且 SEND_OK",
+            Check("A3 pinned async send reached a terminal state with SEND_OK",
                 rec.WaitDone(1, 20000) && rec.Ok == 1, rec.Summary());
             SendResult r = rec.Results()[0];
-            Check("A3 结果落在指定的那条队列上",
+            Check("A3 result landed on the specified queue",
                 r.MessageQueue.BrokerName == aimed.BrokerName
                 && r.MessageQueue.QueueId == aimed.QueueId,
                 "broker=" + r.MessageQueue.BrokerName + " queueId=" + N(r.MessageQueue.QueueId));
-            Check("A3 那条队列正好多 1 条",
+            Check("A3 that queue gained exactly 1 message",
                 WaitUntil(() => QueueLanded(env, aimed) == before + 1, 20000),
-                "landed=" + N(QueueLanded(env, aimed)) + " 之前=" + N(before));
+                "landed=" + N(QueueLanded(env, aimed)) + " before=" + N(before));
             long othersAfter = queues.Skip(1).Sum(q => Math.Max(0, QueueLanded(env, q)));
-            Check("A3 别的队列一条都没多", othersAfter == othersBefore,
-                "其它队列 " + N(othersBefore) + " -> " + N(othersAfter));
+            Check("A3 no other queue gained any message", othersAfter == othersBefore,
+                "other queues " + N(othersBefore) + " -> " + N(othersAfter));
         }
         finally
         {
@@ -424,7 +424,7 @@ public static class LiveAsyncSend
         }
     }
 
-    // ------------------------------------------------- A4 拦截钩子
+    // ------------------------------------------------- A4 interception hook
     private static void A4ForbiddenHook(Env env, string t)
     {
         var forbidden = new ForbiddenTagHook();
@@ -436,27 +436,27 @@ public static class LiveAsyncSend
             Message bad = Msg(t, "async-a4-rejected");
             bad.Tags = "forbidden";
             p.SendAsync(bad, rejected, 5000);
-            Check("A4 钩子拒绝的异常原样到了回调（类型 + 文案原样传递）",
+            Check("A4 exception rejected by the hook reached the callback verbatim (type + message preserved)",
                 rejected.WaitDone(1, 10000)
                 && rejected.FirstError().Contains("tag forbidden is not allowed",
                     StringComparison.Ordinal)
                 && rejected.FirstErrorType() == nameof(MQClientException),
                 rejected.Summary() + " type=" + rejected.FirstErrorType());
-            Check("A4 拦截钩子看到的是 ASYNC", forbidden.Mode() == CommunicationMode.Async,
+            Check("A4 interception hook observed ASYNC", forbidden.Mode() == CommunicationMode.Async,
                 "mode=" + forbidden.Mode());
-            // 这个 topic 除了被拒的这一笔什么都没有 ⇒ 要么读到 0 条，要么连路由都还没
-            // 注册上（-1）。路由是**第一条消息落到 broker** 才会被 autoCreate 建出来的，
-            // 所以「读不到路由」本身就是「broker 没收到过请求」的证据。
+            // This topic contains nothing except the rejected message => either we read 0 messages, or the route
+            // is not registered yet (-1). The route is only auto-created **when the first message lands on the broker**,
+            // so "route not readable" is itself evidence that "the broker never received a request".
             long afterReject = Landed(env, t);
-            Check("A4 被拒的这笔在 broker 上没留痕", afterReject <= 0,
-                "landed=" + N(afterReject) + "（-1 = 路由还没建出来，即 broker 一条都没收到）");
+            Check("A4 rejected message left no trace on the broker", afterReject <= 0,
+                "landed=" + N(afterReject) + " (-1 = route not created yet, i.e. broker received nothing)");
 
             p.SendAsync(Msg(t, "async-a4-ok"), passed, 5000);
-            Check("A4 同一个生产者换个标签照常落地（拒绝没把池子弄坏）",
+            Check("A4 same producer with a different tag lands normally (rejection did not break the pool)",
                 passed.WaitDone(1, 20000) && passed.Ok == 1, passed.Summary());
-            Check("A4 broker 上正好落 1 条", WaitLanded(env, t, 1) == 1,
+            Check("A4 exactly 1 message landed on the broker", WaitLanded(env, t, 1) == 1,
                 "landed=" + N(Landed(env, t)));
-            Check("A4 钩子一共被调 2 次（一笔被拒、一笔放行）", forbidden.Calls() == 2,
+            Check("A4 hook called exactly 2 times (one rejected, one passed)", forbidden.Calls() == 2,
                 "calls=" + N(forbidden.Calls()));
         }
         finally
@@ -465,7 +465,7 @@ public static class LiveAsyncSend
         }
     }
 
-    // ------------------------------------------------- A5 批量走同步批量内核
+    // ------------------------------------------------- A5 batch goes through the sync batch kernel
     private static long OthersLanded(Env env, List<MessageQueue> queues)
     {
         long total = 0;
@@ -481,39 +481,39 @@ public static class LiveAsyncSend
     {
         DefaultMQProducer p = MakeProducer(env, "a5");
 
-        // ① 一批 3 条：回调恰好一次、SEND_OK，而且 broker 上真的落了 3 条。
-        //    只看回调会被「回调报了 OK 但请求压根没发出去」蒙过去 —— 那条必须靠 broker 侧对账。
+        // ① A batch of 3: callback fires exactly once with SEND_OK, and 3 messages really landed on the broker.
+        //    Trusting the callback alone can be fooled by "callback reports OK but the request never went out" - broker-side reconciliation is mandatory.
         var rec = new Recorder();
         var list = new List<Message>
         {
             Msg(t, "async-a5-0"), Msg(t, "async-a5-1"), Msg(t, "async-a5-2"),
         };
         p.SendBatchAsync(list, rec, 10000);
-        Check("A5 一批 3 条：回调恰好一次且 SEND_OK",
+        Check("A5 batch of 3: callback fired exactly once with SEND_OK",
             rec.WaitDone(1, 20000) && rec.Done == 1 && rec.Ok == 1
                 && rec.Results().Count == 1 && rec.Results()[0].MsgId.Length == 32, rec.Summary());
         long landed = WaitLanded(env, t, 3);
-        Check("A5 broker 上真落了 3 条（不是回调自己说成功）", landed == 3,
-            "landed=" + N(landed) + "（-1 = 路由还没建出来）");
-        Skip("A5 请求码 = SEND_BATCH_MESSAGE(320)",
-            "真机看不到上线报文，这一条由 ProducerAsyncTests.BatchAsync 在进程内取证");
+        Check("A5 3 messages really landed on the broker (not just the callback saying so)", landed == 3,
+            "landed=" + N(landed) + " (-1 = route not created yet)");
+        Skip("A5 request code = SEND_BATCH_MESSAGE(320)",
+            "live cluster cannot observe outgoing packets; ProducerAsyncTests.BatchAsync proves this in-process");
 
         SendResult batchResult = rec.Results().Count > 0 ? rec.Results()[0] : new SendResult();
-        Check("A5 批量的 MsgId 是客户端 32 位 ID、不是 broker 的 OffsetMsgId",
+        Check("A5 batch MsgId is the client 32-hex ID, not the broker OffsetMsgId",
             batchResult.MsgId.Length == 32 && !batchResult.MsgId.Contains(',')
                 && batchResult.MsgId != batchResult.OffsetMsgId,
             "MsgId=" + batchResult.MsgId + " OffsetMsgId=" + batchResult.OffsetMsgId);
-        // 批量应答的 OffsetMsgId 是 broker **逐条**回的一串（逗号分隔，一条子消息一个
-        // commitLog 偏移），它本身就是「这一批被拆开存成 3 条」的证据
+        // The batch response's OffsetMsgId is a comma-separated list returned **per message** (one
+        // commitLog offset per sub-message); it is itself evidence that "the batch was split and stored as 3 messages"
         string[] subOffsets = Array.FindAll(
             batchResult.OffsetMsgId.Split(','), s => s.Length > 0);
-        Check("A5 broker 逐条回了 3 个 commitLog 偏移（批量确实被拆开落地）",
+        Check("A5 broker returned 3 commitLog offsets, one per message (batch really split on landing)",
             subOffsets.Length == 3, "OffsetMsgId=" + batchResult.OffsetMsgId);
         string storedUniq = string.Empty;
         if (subOffsets.Length > 0)
         {
             MessageExt? storedSub = null;
-            Check("A5 能读回 broker 上存下来的那条子消息",
+            Check("A5 can read back the sub-message stored on the broker",
                 WaitUntil(() =>
                 {
                     try
@@ -523,17 +523,17 @@ public static class LiveAsyncSend
                     }
                     catch (Exception)
                     {
-                        return false; // commitLog 还没刷出去
+                        return false; // commitLog not flushed yet
                     }
                 }, 15000), "offset=" + subOffsets[0]);
             // MessageConst.PropertyUniqClientMessageIdKeyidx == "UNIQ_KEY"
             storedUniq = storedSub?.GetProperty("UNIQ_KEY") ?? string.Empty;
         }
 
-        Check("A5 broker 上存的子消息带客户端 UNIQ_KEY（逐条 ID 编在 body 里）",
+        Check("A5 sub-message stored on the broker carries the client UNIQ_KEY (per-message ID encoded in body)",
             storedUniq.Length == 32, "stored UNIQ_KEY=" + storedUniq);
 
-        // ② 定点批量：mq 参数真的传到了批量内核，而不是被丢掉后自己挑一条。
+        // ② Pinned batch: the mq parameter really reached the batch kernel instead of being dropped with a self-chosen queue.
         List<MessageQueue> queues;
         try
         {
@@ -541,14 +541,14 @@ public static class LiveAsyncSend
         }
         catch (Exception e)
         {
-            Check("A5 定点批量取到了发布队列", false, e.Message);
+            Check("A5 pinned batch obtained publish queues", false, e.Message);
             p.Shutdown();
             return;
         }
 
         if (queues.Count == 0)
         {
-            Check("A5 定点批量取到了发布队列", false, "queues=0");
+            Check("A5 pinned batch obtained publish queues", false, "queues=0");
             p.Shutdown();
             return;
         }
@@ -565,34 +565,34 @@ public static class LiveAsyncSend
         bool landedOnAimed = pr.Count > 0 && pr[0].MessageQueue.BrokerName == aimed.BrokerName
             && pr[0].MessageQueue.QueueId == aimed.QueueId;
         long aimedAfter = QueueLanded(env, aimed);
-        Check("A5 定点批量那条队列正好多 3 条",
+        Check("A5 pinned batch added exactly 3 messages to that queue",
             WaitUntil(() => (aimedAfter = QueueLanded(env, aimed)) == aimedBefore + 3, 20000),
-            "该队列 " + N(aimedBefore) + " -> " + N(aimedAfter));
+            "that queue " + N(aimedBefore) + " -> " + N(aimedAfter));
         long othersAfter = OthersLanded(env, queues);
-        Check("A5 定点批量落在指定队列、别的队列一条都没多",
+        Check("A5 pinned batch landed on the specified queue; no other queue gained messages",
             pinnedOk && landedOnAimed && aimedAfter == aimedBefore + 3 && othersAfter == othersBefore,
-            "ok=" + N(pinned.Ok) + " 落位=" + (landedOnAimed ? "1" : "0")
-                + " 该队列 " + N(aimedBefore) + "->" + N(aimedAfter)
-                + " 其它 " + N(othersBefore) + "->" + N(othersAfter));
+            "ok=" + N(pinned.Ok) + " landedOnAimed=" + (landedOnAimed ? "1" : "0")
+                + " that queue " + N(aimedBefore) + "->" + N(aimedAfter)
+                + " others " + N(othersBefore) + "->" + N(othersAfter));
 
         var mixed = new Recorder();
         p.SendBatchAsync(
             new List<Message> { Msg(t, "async-a5-mixed-0"), Msg(env.Topic("BatchOther"), "async-a5-mixed-1") },
             mixed, 5000);
-        Check("A5 混 topic 的一批在回调里报错（本地校验没被异步路径绕过）",
+        Check("A5 mixed-topic batch reports an error in the callback (local validation not bypassed by the async path)",
             mixed.WaitDone(1, 10000) && mixed.Done == 1 && mixed.Ok == 0
                 && mixed.FirstError().Contains("should be the same"), mixed.Summary());
 
-        // ④ 空批次：同一口径 —— 错误进回调，一次回调都不欠。
+        // ③ Empty batch: same rule - the error goes to the callback; not a single callback is owed.
         var empty = new Recorder();
         p.SendBatchAsync(new List<Message>(), empty, 5000);
-        Check("A5 空批次也是「恰好一次失败回调」，不静默吞掉",
+        Check("A5 empty batch also gets 'exactly one failure callback', never silently swallowed",
             empty.WaitDone(1, 10000) && empty.Done == 1 && empty.Ok == 0
                 && empty.FirstError().Contains("message list is empty"), empty.Summary());
 
-        // ⑤ 背压扣的是**整批**字节，不是「一条」：字节闸压到地板（1 MiB），一批 2×600 KiB
-        //    必须被拦下（整批 1.2 MiB > 1 MiB）；换一批 2×100 KiB 又必须过。只按第一条算
-        //    （600 KiB）或者干脆不扣，这两条就会同时反向。
+        // ④ Backpressure reserves bytes for the **whole batch**, not "one message": with the byte gate set to the floor (1 MiB), a batch of 2x600 KiB
+        //    must be rejected (whole batch 1.2 MiB > 1 MiB); a batch of 2x100 KiB must pass. Counting only the first message
+        //    (600 KiB), or not reserving at all, would make both assertions fail in opposite directions.
         p.EnableBackpressureForAsyncMode = true;
         p.BackPressureForAsyncSendNum = 1;
         p.BackPressureForAsyncSendSize = 1024 * 1024;
@@ -600,28 +600,28 @@ public static class LiveAsyncSend
         p.SendBatchAsync(
             new List<Message> { Msg(t, new string('x', 600 * 1024)), Msg(t, new string('x', 600 * 1024)) },
             gated, 2000);
-        Check("A5 整批 1.2MiB 被 1MiB 字节闸拦下（回调拿到 TOO_MUCH_REQUEST）",
+        Check("A5 whole-batch 1.2MiB rejected by the 1MiB byte gate (callback got TOO_MUCH_REQUEST)",
             gated.WaitDone(1, 15000) && gated.Done == 1 && gated.Ok == 0
                 && gated.FirstError().Contains("semaphoreAsyncSize timeout"), gated.Summary());
-        // 同一道闸下的小批次必须照常落地：证明「拦住」是因为整批量，不是因为批量被一概论处
+        // A small batch under the same gate must land normally: proves the rejection is due to whole-batch size, not a blanket batch policy
         var passed = new Recorder();
         p.SendBatchAsync(
             new List<Message> { Msg(t, new string('y', 100 * 1024)), Msg(t, new string('y', 100 * 1024)) },
             passed, 10000);
-        Check("A5 同一道闸下 200KiB 的一批照常拿到 SEND_OK",
+        Check("A5 a 200KiB batch under the same gate still gets SEND_OK",
             passed.WaitDone(1, 20000) && passed.Done == 1 && passed.Ok == 1, passed.Summary());
-        // 许可必须原样归还：漏一份就是长跑之后「所有异步发送集体超时」，而单次发送看不出来。
+        // Permits must be returned intact: missing one means "all async sends time out collectively" after a long run, invisible in single sends.
         int numTotal = p.GetBackPressureForAsyncSendNum();
         int sizeTotal = p.GetBackPressureForAsyncSendSize();
-        Check("A5 批量路径把两份许可原样归还（空闲量回到总量，含被闸拦下那一笔）",
+        Check("A5 batch path returned both permits intact (available returns to total, including the gated send)",
             WaitUntil(() => p.SemaphoreAsyncSendNumAvailablePermits == numTotal
                 && p.SemaphoreAsyncSendSizeAvailablePermits == sizeTotal, 10000),
-            "空闲条数=" + N(p.SemaphoreAsyncSendNumAvailablePermits) + " 总量=" + N(numTotal)
-                + " 空闲字节=" + N(p.SemaphoreAsyncSendSizeAvailablePermits) + " 总量=" + N(sizeTotal));
+            "available count=" + N(p.SemaphoreAsyncSendNumAvailablePermits) + " total=" + N(numTotal)
+                + " available bytes=" + N(p.SemaphoreAsyncSendSizeAvailablePermits) + " total=" + N(sizeTotal));
         p.Shutdown();
     }
 
-    // ------------------------------------------------- A6 关池排空在途准备段
+    // ------------------------------------------------- A6 shutdown drains the in-flight prepare phase
     private static void A6ShutdownDrains(Env env, string t)
     {
         int sends = Math.Max(1, Environment.ProcessorCount) * 3;
@@ -637,21 +637,21 @@ public static class LiveAsyncSend
 
             p.Shutdown();
             long landed = WaitLanded(env, t, sends, 40);
-            Check("A6 Shutdown 排空了队列：交进来的每一笔都上线了",
-                landed == sends, "landed=" + N(landed) + " 发送=" + N(sends));
-            Check("A6 一笔至多一个终态回调", rec.Done <= sends,
-                "done=" + N(rec.Done) + " 发送=" + N(sends));
+            Check("A6 Shutdown drained the queue: every submitted send went out",
+                landed == sends, "landed=" + N(landed) + " sends=" + N(sends));
+            Check("A6 at most one terminal callback per send", rec.Done <= sends,
+                "done=" + N(rec.Done) + " sends=" + N(sends));
         }
         catch (Exception e)
         {
-            // Shutdown 已经被调过，finally 里不能再关一次
-            Check("A6 Shutdown 排空在途准备段", false, e.Message);
+            // Shutdown already called; do not close again in finally
+            Check("A6 Shutdown drains the in-flight prepare phase", false, e.Message);
         }
 
         p = MakeProducer(env, "a6-after");
         var after = new Recorder();
         p.SendAsync(Msg(t, "async-a6-after"), after, 8000);
-        Check("A6 关掉的池子不会被别的生产者复用（新生产者接着能发）",
+        Check("A6 closed pool is not reused by another producer (a new producer can still send)",
             after.WaitDone(1, 20000) && after.Ok == 1, after.Summary());
         p.Shutdown();
     }
@@ -699,7 +699,7 @@ public static class LiveAsyncSend
         }
         catch (Exception e)
         {
-            Check("脚本整体执行", false, e.Message);
+            Check("script overall execution", false, e.Message);
         }
 
         foreach (string addr in BrokerAddrs(env))
@@ -712,7 +712,7 @@ public static class LiveAsyncSend
                 }
                 catch (Exception)
                 {
-                    // 清理失败不影响结论
+                    // cleanup failure does not affect the verdict
                 }
             }
         }

@@ -1,17 +1,17 @@
-//! `MQClientInstance` 对**真实 5.5.1 broker** 的联调验证。
+//! Integration verification of `MQClientInstance` against a **real 5.5.1 broker**.
 //!
-//! 与另两个 live 示例的分工：`live_protocol.rs` 打协议编解码，
-//! `live_client_modules.rs` 打取址/容错/统计/钩子骨架，
-//! `live_rebalance_and_trace.rs` 打重平衡/线程池/轨迹链路。这里打**实例本身** ——
-//! 它是 producer / consumer / admin 三层唯一的出口，所以「请求发出去了、响应回来了」
-//! 这两件事不足以判合格。本示例锁死的是只有真集群能证明的性质：
+//! Division of labor with the other two live examples: `live_protocol.rs` covers protocol codec,
+//! `live_client_modules.rs` covers addressing / fault tolerance / stats / hook skeletons,
+//! `live_rebalance_and_trace.rs` covers rebalance / thread pools / trace. This one targets **the instance itself** --
+//! it is the single exit for the producer / consumer / admin layers, so "the request went out and
+//! the response came back" is not enough to call it good. What this example pins down are the properties only a real cluster can prove:
 //!
 //!
-//! ⚠ 未覆盖：broker 主动请求（220/221/307/309/326）无法从外部注入 —— 它们走 broker
-//! 已建立的那条连接。协议与分派由 `mq_client.rs` 的离线单测覆盖，这里只验
-//! `RegisteredConsumer` seam 在实例侧的调用面。
+//! ⚠ Not covered: broker-initiated requests (220/221/307/309/326) cannot be injected from outside -- they travel on
+//! the connection the broker established. Protocol and dispatch are covered by the offline unit tests of `mq_client.rs`; here we only verify
+//! the `RegisteredConsumer` seam's call surface on the instance side.
 //!
-//! 用法（先按项目 README 起本地集群）：
+//! Usage (start the local cluster per the project README first):
 //! ```text
 //! cargo run --example live_mq_client -- 127.0.0.1:9876
 //! ```
@@ -60,19 +60,19 @@ use rocketmq_client_remoting::remoting::protocol::remoting_command::RemotingComm
 use rocketmq_client_remoting::remoting::protocol::route::TopicRouteData;
 use rocketmq_client_remoting::remoting::protocol::serialize::RemotingSerializable;
 
-/// 建出来的 topic 队列数（默认 4）。
+/// Number of queues of the created topic (default 4).
 const QUEUE_NUMS: i32 = 4;
-/// M3 走轮询发送的消息条数（正好覆盖 4 个队列两轮）。
+/// Number of messages M3 sends round-robin (exactly two passes over the 4 queues).
 const MSG_TOTAL: i32 = 8;
-/// M6 POP 一次弹多少条 / broker 挂起等待时间 / 不可见时间。
+/// How many messages M6 POP pops at once / the broker's suspend-wait time / the invisible time.
 const POP_MAX_MSGS: i32 = 32;
 const POP_POLL_TIME: i64 = 1_000;
-/// 不可见时间给足，保证「不 ack 就重投」不会在测试中途发生。
+/// Give the invisible time plenty of room so "no ack means redeliver" cannot happen mid-test.
 const POP_INVISIBLE_TIME: i64 = 60_000;
-/// `change_invisible_time` 的续期时长。
+/// Renewal duration for `change_invisible_time`.
 const RENEW_INVISIBLE_TIME: i64 = 30_000;
 
-// ------------------------------------------------------------------ 骨架
+// ------------------------------------------------------------------ skeleton
 
 fn stamp() -> String {
     let secs = match SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -82,7 +82,7 @@ fn stamp() -> String {
     format!("{secs}")
 }
 
-/// 断言累积器：一次跑完所有场景再汇总，首个失败不提前退出。
+/// Assertion accumulator: runs all scenarios once before summing up; the first failure does not exit early.
 struct Checker {
     passed: u32,
     failed: Vec<String>,
@@ -111,12 +111,12 @@ impl Checker {
 
 type Live = Result<(), String>;
 
-/// 锁中毒时照常取内值：别处的 panic 不该让联调现场一起丢。
+/// Take the inner value even when the lock is poisoned: a panic elsewhere must not lose the live-run evidence too.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 轮询异步条件直到成立，超时返回 `false` 让调用方打出现场。
+/// Poll an async condition until it holds; on timeout return `false` so the caller can print the scene.
 async fn wait_async<F, Fut>(mut cond: F, budget: Duration) -> bool
 where
     F: FnMut() -> Fut,
@@ -166,13 +166,13 @@ fn decode_route(resp: &RemotingCommand, what: &str) -> Result<TopicRouteData, St
         Some(b) => b.to_vec(),
         None => return Err(format!("{what} response has empty body")),
     };
-    // namesrv 的 route 是 fastjson 风格（数字 map 键不带引号），必须走兼容解码器。
+    // The namesrv's route is fastjson-style (numeric map keys without quotes); it must go through the compatible decoder.
     let value = RemotingSerializable::decode(&raw)
         .map_err(|e| format!("{what} body is not parsable: {e}"))?;
     TopicRouteData::from_json_value(&value).map_err(|e| format!("{what} route invalid: {e}"))
 }
 
-/// 建 topic（走 TBW102 路由找 broker），与另两个 live 示例同一套做法。
+/// Create the topic (find the broker via the TBW102 route), the same approach as the other live examples.
 async fn bootstrap_topic(client: &RemotingClient, namesrv: &str, topic: &str) -> Live {
     let resp = get_route(client, namesrv, MixAll::DEFAULT_TOPIC).await?;
     if resp.code != response_code::SUCCESS {
@@ -218,7 +218,7 @@ async fn bootstrap_topic(client: &RemotingClient, namesrv: &str, topic: &str) ->
     Ok(())
 }
 
-/// 一条待发消息。UNIQ_KEY 故意**不**预先设置：M3 要验实例会补。
+/// A message to send. UNIQ_KEY is deliberately **not** pre-set: M3 verifies that the instance stamps it.
 fn build_message(topic: &str, body: &[u8], tags: &str, keys: &str) -> Message {
     let mut msg = Message::new(topic, Some(body));
     if !tags.is_empty() {
@@ -230,7 +230,7 @@ fn build_message(topic: &str, body: &[u8], tags: &str, keys: &str) -> Message {
     msg
 }
 
-/// 一次普通发送（实例侧），返回 `SendResult`。
+/// One plain send (instance side), returning `SendResult`.
 async fn send_one(
     instance: &MQClientInstance,
     producer_group: &str,
@@ -239,7 +239,7 @@ async fn send_one(
 ) -> Result<rocketmq_client_remoting::client::result::SendResult, String> {
     let mut pm = PublishMessage::Single(msg);
     instance
-        // unitMode=false：本例是实例级裸发送，不模拟 unit mode
+        // unitMode=false: this example is bare instance-level sending, not unit mode
         .send_message(
             producer_group,
             &mut pm,
@@ -254,7 +254,7 @@ async fn send_one(
         .map_err(|e| format!("send to {} queue {} failed: {e}", mq.topic, mq.queue_id))
 }
 
-/// 实例侧 `pull_message` 的常用形状：订阅表达式 `*`、不带悬挂等待。
+/// The common shape of the instance-side `pull_message`: subscription expression `*`, no suspend wait.
 async fn pull_from(
     instance: &MQClientInstance,
     consumer_group: &str,
@@ -278,7 +278,7 @@ async fn pull_from(
             0,
             Some(broker_addr),
             0,
-            // 显式给了 addr：不走 pullFromWhichNodeTable 选路（P5 前的老路径）
+            // addr given explicitly: do not route via pullFromWhichNodeTable (the pre-P5 legacy path)
             None,
         )
         .await
@@ -295,7 +295,7 @@ fn queue_ids(mqs: &[MessageQueue]) -> Vec<i32> {
     mqs.iter().map(|q| q.queue_id).collect()
 }
 
-/// 直接问 broker 某个 group 的成员（不经实例：证明「注册成功」是 broker 侧的事实）。
+/// Ask the broker directly for a group's members (not through the instance: proves "registered" is a broker-side fact).
 async fn listed_consumer_ids(
     client: &RemotingClient,
     broker_addr: &str,
@@ -327,21 +327,21 @@ async fn listed_consumer_ids(
         .unwrap_or_default()
 }
 
-// ------------------------------------------------- 注入给实例的消费者替身
+// ------------------------------------------------- consumer stub injected into the instance
 
-/// 只实现 [`RegisteredConsumer`] 契约的最小消费者（真实消费者还没移植）。
-/// 作用是让实例侧的调用面（心跳数据、位点持久化、线程巡检、按 group 分派）
-/// 在真集群上走通，并让 broker 能反查到这个客户端 ID。
+/// A minimal consumer implementing only the [`RegisteredConsumer`] contract (the real consumer has not been ported).
+/// Its job is to walk the instance-side call surface (heartbeat data, offset persistence, thread sweep, per-group dispatch)
+/// through a real cluster, and to let the broker look this client ID up.
 struct StubConsumer {
     client_id: String,
     group: String,
     topic: String,
     broker_name: String,
-    /// `persist_consumer_offset` 被调了几次（M5 断言）。
+    /// How many times `persist_consumer_offset` was called (asserted in M5).
     persisted: AtomicUsize,
-    /// `adjust_thread_pool` 被调了几次。
+    /// How many times `adjust_thread_pool` was called.
     adjusted: AtomicUsize,
-    /// 220 落下来的 (topic, 队列数)；离线单测用得上，这里只保证可实现。
+    /// (topic, queue count) delivered by 220; useful for offline unit tests, here we only guarantee it is implementable.
     resets: Mutex<Vec<(String, usize)>>,
 }
 
@@ -449,7 +449,7 @@ impl RegisteredConsumer for StubConsumer {
 
 // ---------------------------------------------------------------------- M1
 
-/// 实例身份与生命周期。
+/// Instance identity and lifecycle.
 async fn m1_identity(namesrv: &str, ck: &mut Checker) -> Live {
     let run = stamp();
     let client_id = format!("rust-live-mqclient-{run}@m1");
@@ -508,7 +508,7 @@ async fn m1_identity(namesrv: &str, ck: &mut Checker) -> Live {
     );
     rebuilt.shutdown();
 
-    // 动态取址：没配地址服务器时 fetch_name_server_addr 直接返回 None。
+    // Dynamic addressing: with no address server configured, fetch_name_server_addr returns None directly.
     let fresh = MQClientInstance::new(&format!("{client_id}-fresh"), vec![namesrv.to_string()]);
     let fetched = fresh
         .fetch_name_server_addr()
@@ -519,7 +519,7 @@ async fn m1_identity(namesrv: &str, ck: &mut Checker) -> Live {
         fetched.is_none() && fresh.name_server_addrs() == vec![namesrv.to_string()],
         &format!("{fetched:?} {:?}", fresh.name_server_addrs()),
     );
-    // update_name_server_address_list：空列表一律不改。
+    // update_name_server_address_list: an empty list never changes anything.
     fresh.update_name_server_address_list(&[]);
     ck.check(
         "M1 an empty namesrv update is a no-op",
@@ -532,7 +532,7 @@ async fn m1_identity(namesrv: &str, ck: &mut Checker) -> Live {
         fresh.name_server_addrs().len() == 2,
         &format!("{:?}", fresh.name_server_addrs()),
     );
-    // 注入与默认构造要在 Debug 上分得开（配置对象会被上层复用）。
+    // Injected and default construction must be distinguishable via Debug (the config object gets reused by upper layers).
     let cfg = MQClientInstanceConfig {
         consumer_stats_manager: Some(Arc::new(ConsumerStatsManager::new())),
         ..MQClientInstanceConfig::default()
@@ -544,7 +544,7 @@ async fn m1_identity(namesrv: &str, ck: &mut Checker) -> Live {
             && debug.contains("trace_dispatcher: \"default\""),
         &debug,
     );
-    // 关掉后台任务不该影响别的实例（各实例持有独立的 RemotingClient）。
+    // Shutting down background tasks must not affect other instances (each instance owns its own RemotingClient).
     let second = MQClientInstance::new(&other_id, vec![namesrv.to_string()]);
     let fresh_started = fresh.start().await.is_ok();
     ck.check(
@@ -564,7 +564,7 @@ async fn m1_identity(namesrv: &str, ck: &mut Checker) -> Live {
 
 // ---------------------------------------------------------------------- M2
 
-/// 路由缓存 + 发布信息的队列视图与轮询游标。
+/// Route cache plus the publish info's queue view and round-robin cursor.
 #[allow(clippy::too_many_arguments)]
 async fn m2_route_and_publish(
     instance: &MQClientInstance,
@@ -589,8 +589,8 @@ async fn m2_route_and_publish(
         Some(r) => r,
         None => return Err("route cache miss after a successful refresh".to_string()),
     };
-    // 真实路由里 QueueData 是**每台 broker 一条**（带 read/write 队列数），
-    // 由客户端展开成 queueId 0..n-1；不是一队列一条。
+    // In the real route, QueueData is **one entry per broker** (with read/write queue counts),
+    // and the client expands it into queueId 0..n-1; not one entry per queue.
     ck.check(
         "M2 the cached route is the broker's own answer, not a synthesized one",
         route.queue_datas.len() == 1
@@ -643,7 +643,7 @@ async fn m2_route_and_publish(
         &format!("{:?}", publish.to_dict()),
     );
 
-    // 轮询游标：两轮 4 个队列 ⇒ 0,1,2,3,0,1,2,3；reset 后从头开始。
+    // Round-robin cursor: two passes over 4 queues ⇒ 0,1,2,3,0,1,2,3; after reset it starts from the head.
     let no_filters: &[&QueueFilter<'_>] = &[];
     let mut cursor: Vec<i32> = Vec::new();
     for _ in 0..MSG_TOTAL {
@@ -669,7 +669,7 @@ async fn m2_route_and_publish(
         &format!("queueId={}", after_reset.queue_id),
     );
 
-    // 过滤器：只放行 queueId=2，且必须每次都落在 2 上。
+    // Filter: admit only queueId=2, and selection must land on 2 every time.
     let only_two = |mq: &MessageQueue| mq.queue_id == 2;
     let filters: &[&QueueFilter<'_>] = &[&only_two];
     let mut picked = Vec::new();
@@ -687,7 +687,7 @@ async fn m2_route_and_publish(
         picked == vec![2, 2, 2, 2],
         &format!("{picked:?}"),
     );
-    // 全部被拒 ⇒ 也是「试完一圈返回 None」，不是抛错。
+    // Everything rejected ⇒ also "one full circle then None", not an error.
     let reject_all = |_mq: &MessageQueue| false;
     let all_rejected: &[&QueueFilter<'_>] = &[&reject_all];
     let rejected = publish.select_one_message_queue(all_rejected);
@@ -697,7 +697,7 @@ async fn m2_route_and_publish(
         &format!("{:?}", rejected.as_ref().err().map(|e| e.to_string())),
     );
 
-    // 未知 topic + is_default=false ⇒ 拉不到路由（消费者路径禁止兜底）。
+    // Unknown topic + is_default=false ⇒ no route can be pulled (the consumer path forbids fallback).
     let missing = fallback_topic.replace("Fallback", "Missing");
     let none = instance
         .update_topic_route_info_from_name_server(&missing, 5000, false)
@@ -754,7 +754,7 @@ async fn m2_route_and_publish(
 
 // ---------------------------------------------------------------------- M3
 
-/// 发送与拉取：`SendResult` 逐字段、UNIQ_KEY 补齐、批量、oneway、按队列读回。
+/// Send and pull: `SendResult` field by field, UNIQ_KEY stamping, batch, oneway, per-queue read-back.
 async fn m3_send_and_pull(
     instance: &MQClientInstance,
     broker_addr: &str,
@@ -771,7 +771,7 @@ async fn m3_send_and_pull(
     let no_filters: &[&QueueFilter<'_>] = &[];
     let mut per_queue: HashMap<i32, Vec<String>> = HashMap::new();
 
-    // ---- 8 条走实例的 send_message（路由解析也在实例里）
+    // ---- 8 messages through the instance's send_message (route resolution also lives in the instance)
     for i in 0..MSG_TOTAL {
         let mq = publish
             .select_one_message_queue(no_filters)
@@ -820,7 +820,7 @@ async fn m3_send_and_pull(
     );
     per_queue.entry(0).or_default().push("needs-uniq-key".to_string());
 
-    // ---- 批量消息：一次写入，broker 的 batchCQ 给每条子消息连续的逻辑位点
+    // ---- Batch message: one write; the broker's batchCQ gives each sub-message contiguous logical offsets
     let batch_bodies: Vec<String> = (0..3).map(|i| format!("batch-{i}")).collect();
     let mut batch = MessageBatch::generate_from_list(
         batch_bodies
@@ -849,8 +849,8 @@ async fn m3_send_and_pull(
             let mut pulled =
                 pull_from(instance, consumer_group, &batch_mq, result.queue_offset, broker_addr)
                     .await?;
-            // batchCQ 的 N 条子消息是 broker 分发线程异步写进 consumeQueue 的，
-            // 刚发完立刻拉可能为空 —— 拉到为止（最多 ~4s）。
+            // The batchCQ's N sub-messages are written into the consumeQueue asynchronously by the broker's distribute thread,
+            // so a pull right after the send may come back empty -- keep pulling until something lands (up to ~4s).
             for _ in 0..20 {
                 if !pulled.msg_found_list.is_empty() {
                     break;
@@ -889,7 +889,7 @@ async fn m3_send_and_pull(
         ),
     }
 
-    // ---- oneway：不等响应，但消息必须在 broker 上看得见
+    // ---- Oneway: no response awaited, but the message must be visible on the broker
     let oneway_body = "sent-oneway".to_string();
     let mut oneway_msg = build_message(topic, oneway_body.as_bytes(), "", "mqKeyOneway");
     let oneway_mq = MessageQueue::new(topic, broker_name, 2);
@@ -925,7 +925,7 @@ async fn m3_send_and_pull(
         "the oneway body never showed up on queue 2",
     );
 
-    // ---- 按队列拉回：每个队列只看见自己那批
+    // ---- Pull back per queue: each queue sees only its own batch
     let mut all_ok = true;
     let mut detail = String::new();
     for (queue_id, expected) in &per_queue {
@@ -938,7 +938,7 @@ async fn m3_send_and_pull(
             detail = format!("queue {queue_id}: status={:?} missing={missing:?}", pulled.status);
             break;
         }
-        // broker 侧的 min/max 与消息条数必须自洽（M4 也依赖它）。
+        // The broker-side min/max must be consistent with the message count (M4 depends on it too).
         if pulled.min_offset != 0
             || pulled.max_offset - pulled.min_offset < got.len() as i64
             || pulled.next_begin_offset != pulled.max_offset
@@ -972,7 +972,7 @@ async fn m3_send_and_pull(
         "stamping missing",
     );
 
-    // ---- 追上末尾再拉：broker 直接回 PULL_NOT_FOUND ⇒ NO_NEW_MSG
+    // ---- Pull past the tail: the broker answers PULL_NOT_FOUND directly ⇒ NO_NEW_MSG
     let tail = MessageQueue::new(topic, broker_name, 0);
     let max_offset = instance
         .get_max_offset(&tail, 5000, Some(broker_addr))
@@ -1003,7 +1003,7 @@ async fn m3_send_and_pull(
             0,
             Some(broker_addr),
             0,
-            // 显式给了 addr：不走 pullFromWhichNodeTable 选路（P5 前的老路径）
+            // addr given explicitly: do not route via pullFromWhichNodeTable (the pre-P5 legacy path)
             None,
         )
         .await;
@@ -1028,7 +1028,7 @@ async fn m3_send_and_pull(
 
 // ---------------------------------------------------------------------- M4
 
-/// 五个 offset RPC 对真实队列成立。
+/// The five offset RPCs hold against a real queue.
 async fn m4_offsets(
     instance: &MQClientInstance,
     broker_addr: &str,
@@ -1065,7 +1065,7 @@ async fn m4_offsets(
         &format!("past={past} future={future} min={min_offset} max={max_offset}"),
     );
 
-    // 未知 group：setZeroIfNotFound=true ⇒ broker 回 0；false ⇒ QUERY_NOT_FOUND 透传成 None。
+    // Unknown group: setZeroIfNotFound=true ⇒ the broker answers 0; false ⇒ QUERY_NOT_FOUND passes through as None.
     let stray = "CID_rust_live_missing";
     let zero = instance
         .query_consumer_offset(stray, &mq, 5000, Some(broker_addr), true)
@@ -1080,7 +1080,7 @@ async fn m4_offsets(
         zero == Some(0) && absent.is_none(),
         &format!("zero={zero:?} absent={absent:?}"),
     );
-    // 提交位点必须能被读回来（rebalance 之后第一个被读到的就是它）。
+    // A committed offset must be readable back (it is the first thing read after a rebalance).
     let committed = (max_offset - 1).max(0);
     instance
         .update_consumer_offset(consumer_group, &mq, committed, 5000, Some(broker_addr))
@@ -1100,7 +1100,7 @@ async fn m4_offsets(
 
 // ---------------------------------------------------------------------- M5
 
-/// 消费者注册表 → 心跳 → broker 侧反查，闭环证明心跳真的被 broker 采纳。
+/// Consumer registry → heartbeat → broker-side lookup: a closed loop proving the heartbeat was really adopted by the broker.
 async fn m5_heartbeat(
     instance: &MQClientInstance,
     client: &RemotingClient,
@@ -1161,7 +1161,7 @@ async fn m5_heartbeat(
         &format!("ok={ok_count}"),
     );
 
-    // 反查：broker 只有真收了心跳才会把这个 client_id 挂到 group 上。
+    // Look-up: only after really receiving the heartbeat does the broker attach this client_id to the group.
     let expected = instance.client_id().to_string();
     let registered = wait_async(
         move || {
@@ -1183,7 +1183,7 @@ async fn m5_heartbeat(
         &format!("consumerIdList={listed:?}"),
     );
 
-    // 实例管理的两条同类 RPC 走的是同一份 broker 状态。
+    // The two instance-managed RPCs of the same kind read the same broker state.
     let via_instance = instance
         .get_consumer_list_by_group(consumer_group, 5000, Some(broker_addr))
         .await
@@ -1229,7 +1229,7 @@ async fn m5_heartbeat(
 
 // ---------------------------------------------------------------------- M6
 
-/// POP / ACK / changeInvisibleTime 全链路：客户端反构的 POP_CK 必须真的能用。
+/// POP / ACK / changeInvisibleTime full chain: the client-reconstructed POP_CK must really be usable.
 async fn m6_pop(
     instance: &MQClientInstance,
     broker_addr: &str,
@@ -1315,7 +1315,7 @@ async fn m6_pop(
         &format!("popped={popped_bodies:?}"),
     );
 
-    // 映射键口径：带 POP_CK 的用 retry 段，不带的用 topic+queueId。
+    // Map-key rule: messages with a POP_CK use the retry segment, those without use topic+queueId.
     let key_ok = pop.msg_found_list.iter().all(|m| {
         let got = MQClientInstance::pop_queue_map_key(m).unwrap_or_default();
         match m.properties.get(PROPERTY_POP_CK) {
@@ -1334,7 +1334,7 @@ async fn m6_pop(
         "map key mismatch",
     );
 
-    // 先给第一条续期，再用**新的** extraInfo 去 ACK。
+    // Renew the first message first, then ACK with the **new** extraInfo.
     let first = &pop.msg_found_list[0];
     let first_ck = ck_strings[0].clone();
     let first_offset = extra_info::split(&first_ck)
@@ -1383,7 +1383,7 @@ async fn m6_pop(
         &format!("code={ack_renewed}"),
     );
 
-    // 其余消息按原 POP_CK 确认；brokerName / addr 省略 ⇒ 实例自己从 extraInfo + 路由解。
+    // The remaining messages are ACKed with their original POP_CK; brokerName / addr omitted ⇒ the instance resolves them itself from extraInfo + route.
     let mut all_acked = true;
     let mut ack_detail = String::new();
     for (index, msg) in pop.msg_found_list.iter().enumerate().skip(1) {
@@ -1419,7 +1419,7 @@ async fn m6_pop(
         &ack_detail,
     );
 
-    // 全部确认后再弹一次：同一组已弹过的位点不会重来，已 ack 的更不会再出现。
+    // After acking everything, pop again: an already-popped offset of the same group never comes back, and acked ones even less so.
     let again = instance
         .pop_message(
             &pop_group,
@@ -1453,7 +1453,7 @@ async fn m6_pop(
 
 // ---------------------------------------------------------------------- M8
 
-/// 排在 M7 之前跑：M7 会删掉本示例的 topic，这里要用它真发消息。
+/// Runs before M7: M7 deletes this example's topic, and this one needs to really send on it.
 async fn m8_shared_factory(
     namesrv: &str,
     topic: &str,
@@ -1479,7 +1479,7 @@ async fn m8_shared_factory(
         &format!("clientId={}", shared.client_id()),
     );
 
-    // 同 clientId 的第二个生产者：复用实例，不能再起第二份心跳/路由循环。
+    // A second producer with the same clientId: reuse the instance; a second heartbeat/route loop must not start.
     let b = DefaultMQProducer::new(group_b).map_err(|e| format!("B build failed: {e}"))?;
     b.set_namesrv_addr(namesrv);
     b.set_client_id(Some(&client_id));
@@ -1497,7 +1497,7 @@ async fn m8_shared_factory(
         "B's send failed",
     );
 
-    // A 先退：B 还在用 ⇒ 守卫让 `shutdown()` 变成 no-op，B 的发送照常走同一条连接。
+    // A leaves first: B is still using it ⇒ the guard turns `shutdown()` into a no-op, and B keeps sending over the same connection.
     a.shutdown();
     ck.check(
         "M8 the first producer leaving keeps the shared factory running",
@@ -1535,7 +1535,7 @@ async fn m8_shared_factory(
         &format!("started={} groupRegistered={}", shared.is_started(), shared.has_consumer_group(lite_group)),
     );
 
-    // B 再退：lite 还在用，实例仍不许拆。
+    // B leaves next: the lite consumer is still using it, so the instance still must not be torn down.
     b.shutdown();
     ck.check(
         "M8 the factory survives while the lite consumer still uses it",
@@ -1543,8 +1543,8 @@ async fn m8_shared_factory(
         "shutdown tore down an instance that still had a consumer",
     );
 
-    // 最后一个租户退出（lite 的末次提交与关实例是串在同一个后台任务里的）：
-    // 这次要真拆，并且把 INSTANCE_MAP 的登记摘掉。
+    // The last tenant leaves (the lite consumer's final commit and the instance shutdown are serialized into the same background task):
+    // this time the teardown must be real, and the INSTANCE_MAP registration must come off.
     lite.shutdown();
     let gone = wait_async(
         || async {
@@ -1562,7 +1562,7 @@ async fn m8_shared_factory(
             MQClientInstance::find_instance(&client_id).is_some()
         ),
     );
-    // 摘掉登记之后同 clientId 必须拿到可用的新实例，而不是一个已关掉的死实例。
+    // After the registration is removed, the same clientId must get a usable fresh instance, not an already-shut-down dead one.
     let rebuilt = MQClientInstance::create_mq_client_instance(
         &client_id,
         vec![namesrv.to_string()],
@@ -1580,7 +1580,7 @@ async fn m8_shared_factory(
 
 // ---------------------------------------------------------------------- M7
 
-/// 集群信息 / topic 列表 / 队列锁（含互斥反证）/ 注销，然后删掉本次建的 topic。
+/// Cluster info / topic list / queue locks (including the mutual-exclusion counter-proof) / unregistering, then delete the topic created by this run.
 #[allow(clippy::too_many_arguments)]
 async fn m7_admin_and_cleanup(
     instance: &MQClientInstance,
@@ -1620,7 +1620,7 @@ async fn m7_admin_and_cleanup(
         &format!("{} topics, looking for {topic}", topics.topic_list.len()),
     );
 
-    // 批量锁：A 锁住之后 B 锁不到，A 解锁之后 B 才锁得到 —— 这才叫锁。
+    // Batch lock: while A holds it B cannot lock; only after A unlocks can B lock -- that is what a lock means.
     let mqs: Vec<MessageQueue> = (0..QUEUE_NUMS)
         .map(|q| MessageQueue::new(topic, broker_name, q))
         .collect();
@@ -1661,7 +1661,7 @@ async fn m7_admin_and_cleanup(
         ),
     );
 
-    // 注销前先撤掉注册表里的消费者：否则 30s 心跳循环会把成员关系重新登记回来。
+    // Remove the consumer from the registry before unregistering: otherwise the 30s heartbeat loop re-registers the membership.
     instance.unregister_consumer(consumer_group);
     instance
         .unregister_client(broker_addr, instance.client_id(), producer_group, consumer_group, 5000)
@@ -1686,7 +1686,7 @@ async fn m7_admin_and_cleanup(
         &format!("consumerIdList={still:?}"),
     );
 
-    // 管理接口收尾：删 broker 配置 + namesrv 路由（5.x 默认不随注册删路由）。
+    // Admin cleanup: delete the broker config + the namesrv route (5.x does not delete the route along with registration by default).
     for t in [topic, fallback_topic] {
         match instance.delete_topic_in_broker(broker_addr, t, 5000).await {
             Ok(()) => ck.check(&format!("M7 delete_topic_in_broker {t}"), true, ""),

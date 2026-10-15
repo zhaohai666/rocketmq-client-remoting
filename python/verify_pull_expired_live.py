@@ -40,7 +40,7 @@ def new_client(tag: str) -> MQClientInstance:
 
 
 def committed_offset(group: str, topic: str) -> int:
-    """broker 上该组在这个 topic 各队列的已提交位点之和；单次查询超时按"还没读到"处理。"""
+    """The sum of the committed offsets of that group over the queues of this topic on the broker; a single query timeout is treated as "not read yet"."""
     c = new_client("reader")
     try:
         publish = c.get_topic_publish_info(topic)
@@ -95,7 +95,7 @@ def pull_thread_of(c: DefaultMQPushConsumer, key: str):
 
 
 def dead_thread():
-    """一条跑完就退出的线程：状态与"拉取循环被异常打穿"后的条目完全一致。"""
+    """A thread that exits as soon as it runs: its state is exactly what an entry looks like after the pull loop was pierced by an exception."""
     t = threading.Thread(target=lambda: None, daemon=True)
     t.start()
     t.join()
@@ -106,22 +106,25 @@ _PARKS = []
 
 
 def parked_thread():
-    """一条活着但**永远不再盖章**的线程：状态与"循环卡死在别处"完全一致。
+    """A thread that is alive but **never stamps again**: its state is exactly what "the loop is
+    stuck somewhere else" looks like.
 
-    为什么注入而不真等 120s：真跑的话原循环每轮都会自己刷新时刻，判据到底走了哪一支
-    就不确定了；卡住的循环正是"线程还在、时刻不动"这个形状。
+    Why inject instead of really waiting 120s: if it really ran, the original loop would refresh
+    its own timestamp on every round and it would be unclear which branch of the criterion was
+    actually taken; a stuck loop is precisely the shape "the thread is still there, the timestamp
+    does not move".
     """
     ev = threading.Event()
     t = threading.Thread(target=ev.wait, daemon=True)
     t.start()
-    _PARKS.append(ev)            # 保持引用，别被 GC
+    _PARKS.append(ev)            # keep a reference so it is not garbage collected
     return t
 
 
 def inject_and_rebalance(c: DefaultMQPushConsumer, key: str, mode: str):
     pass
     old = pull_thread_of(c, key)
-    assert old is not None, "队列没分到，注入无意义"
+    assert old is not None, "the queue was not assigned, injecting is meaningless"
     fake = dead_thread() if mode == "dead" else parked_thread()
     with c._lock:
         c._queue_threads[key] = fake
@@ -133,7 +136,7 @@ def inject_and_rebalance(c: DefaultMQPushConsumer, key: str, mode: str):
 
 def wait_rebuilt(c: DefaultMQPushConsumer, key: str, old, fake,
                  timeout: float = 30) -> bool:
-    """等这一路被换成**另一条活着的**循环线程（既不是原来的，也不是注入的那条）。"""
+    """Wait until this lane is replaced by **another live** loop thread (neither the original one nor the injected one)."""
     def ok():
         t = pull_thread_of(c, key)
         return t is not None and t is not old and t is not fake and t.is_alive()
@@ -150,7 +153,7 @@ def pqi_of(info: ConsumerRunningInfo, mq: MessageQueue) -> dict:
 
 
 def business_queue(c: DefaultMQPushConsumer, topic: str):
-    """分配结果里挑出业务队列（排除自动订阅的 %RETRY%<group>）。"""
+    """Pick the business queue out of the assignment result (excluding the automatically subscribed %RETRY%<group>)."""
     return next((q for q in c._assigned_queues() if q.topic == topic), None)
 
 
@@ -159,7 +162,7 @@ def main() -> int:
     group = PREFIX + "_g"
     setup = new_client("setup")
     try:
-        # 1 队列：只有一路循环，注入点唯一，位点判据也唯一
+        # 1 queue: only one loop, so the injection point is unique and so is the offset criterion
         setup.create_topic_in_route(topic, 1, 1)
     finally:
         setup.shutdown()
@@ -180,66 +183,66 @@ def main() -> int:
     try:
         mq = business_queue(c, topic) if wait_until(
             lambda: business_queue(c, topic) is not None, 30) else None
-        check("A0-业务队列已分配（%RETRY% 队列不算）", mq is not None, "mq=%s" % mq)
+        check("A0 the business queue was assigned (the %RETRY% queue does not count)", mq is not None, "mq=%s" % mq)
         if mq is None:
             return 1
         key = c._mq_key(mq)
 
-        # ---------- A1 基线 ----------
+        # ---------- A1 baseline ----------
         bodies1 = [b"pe-1-%d" % i for i in range(3)]
         for b in bodies1:
             producer.send(Message(topic, b))
-        check("A1-首批 3 条被消费", wait_arrivals(listener, 3),
+        check("A1 the first 3 messages were consumed", wait_arrivals(listener, 3),
               "arrivals=%d" % len(listener.bodies()))
-        check("A1-位点提交到 3", wait_until(lambda: committed_offset(group, topic) == 3, 20),
+        check("A1 the offset is committed at 3", wait_until(lambda: committed_offset(group, topic) == 3, 20),
               "offset=%d" % committed_offset(group, topic))
         pqi = pqi_of(c.consumer_running_info(), mq)
         stamp = pqi.get("lastPullTimestamp", 0)
         age = time.time() - stamp / 1000.0
-        check("A1-运行信息报真实 lastPullTimestamp（不是写死的 0）",
+        check("A1 the running info reports a real lastPullTimestamp (not a hardcoded 0)",
               stamp > 0 and 0 <= age < 30,
               "lastPullTimestamp=%d age=%.1fs" % (stamp, age))
 
-        # ---------- A2 线程死掉 → 自愈 ----------
+        # ---------- A2 the thread dies -> self-healing ----------
         t_old, f_old = inject_and_rebalance(c, key, "dead")
         rebuilt = wait_rebuilt(c, key, t_old, f_old)
-        check("A2-停摆线程被换掉（isPullExpired 的线程死亡分支）", rebuilt,
+        check("A2 the stalled thread was replaced (the thread-dead branch of isPullExpired)", rebuilt,
               "new=%s" % pull_thread_of(c, key))
         bodies2 = [b"pe-2-%d" % i for i in range(3)]
         for b in bodies2:
             producer.send(Message(topic, b))
-        check("A2-自愈后同一个队列继续消费（位点走到 6）",
+        check("A2 after self-healing the same queue keeps consuming (the offset advances to 6)",
               wait_arrivals(listener, 6)
               and wait_until(lambda: committed_offset(group, topic) == 6, 25),
               "arrivals=%d offset=%d" % (len(listener.bodies()),
                                          committed_offset(group, topic)))
 
-        # ---------- A3 盖章过期 → 自愈 ----------
+        # ---------- A3 the stamp goes stale -> self-healing ----------
         t_old3, f_old3 = inject_and_rebalance(c, key, "stale")
         rebuilt3 = wait_rebuilt(c, key, t_old3, f_old3)
-        check("A3-超过 120s 没发起拉取的队列被撤并重建（线程还活着也要换）", rebuilt3,
+        check("A3 a queue that did not start a pull for more than 120s was withdrawn and rebuilt (it is replaced even while the thread is still alive)", rebuilt3,
               "new=%s" % pull_thread_of(c, key))
         bodies3 = [b"pe-3-%d" % i for i in range(3)]
         for b in bodies3:
             producer.send(Message(topic, b))
-        check("A3-重建后继续消费（位点走到 9）",
+        check("A3 consumption continues after the rebuild (the offset advances to 9)",
               wait_arrivals(listener, 9)
               and wait_until(lambda: committed_offset(group, topic) == 9, 25),
               "arrivals=%d offset=%d" % (len(listener.bodies()),
                                          committed_offset(group, topic)))
 
-        # ---------- A4 自愈不许回退位点 ----------
-        time.sleep(5)   # 留窗口给"重建时从 0 重投"这类错误显形
+        # ---------- A4 self-healing must not roll the offset back ----------
+        time.sleep(5)   # leave a window for errors like "redelivering from 0 on rebuild" to show up
         all_bodies = bodies1 + bodies2 + bodies3
-        check("A4-9 条各只投一次（撤走前持久化了位点，重建后从 broker 位点续拉）",
+        check("A4 each of the 9 messages is delivered exactly once (the offset was persisted before the withdrawal, and the rebuild resumes from the broker offset)",
               sorted(listener.bodies()) == sorted(all_bodies),
               "arrivals=%d distinct=%d" % (len(listener.bodies()),
                                            len(set(listener.bodies()))))
-        check("A4-没有任何一条被重投（reconsumeTimes 全 0）",
+        check("A4 not a single message was redelivered (all reconsumeTimes are 0)",
               all(t == 0 for b in all_bodies for t in listener.times(b)),
               "times=%s" % sorted({t for b in all_bodies for t in listener.times(b)}))
         pqi2 = pqi_of(c.consumer_running_info(), mq)
-        check("A4-自愈后 lastPullTimestamp 恢复新鲜",
+        check("A4 lastPullTimestamp is fresh again after the self-healing",
               0 <= time.time() - pqi2["lastPullTimestamp"] / 1000.0 < 30,
               "age=%.1fs" % (time.time() - pqi2["lastPullTimestamp"] / 1000.0))
     finally:

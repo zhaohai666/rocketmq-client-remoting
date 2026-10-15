@@ -7,7 +7,7 @@ pub fn create_uniq_id() -> String {
     util_all::create_uniq_id()
 }
 
-/// 已有值时**不覆盖**：重试发送同一条消息时 msgId 必须保持稳定。
+/// Does **not** overwrite an existing value: the msgId must stay stable when the same message is resent on retry.
 pub fn set_uniq_id(msg: &mut Message) {
     if msg.get_property(PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX).is_none() {
         msg.put_property(PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX, &create_uniq_id());
@@ -18,7 +18,7 @@ pub fn get_uniq_id(msg: &Message) -> Option<String> {
     msg.get_property(PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX).map(str::to_string)
 }
 
-/// 消费侧取 `UNIQ_KEY`（同一属性也存在于 `MessageExt`，故两者共用一份键名）。
+/// Reads `UNIQ_KEY` on the consumer side (the same property also exists on `MessageExt`, so both share one key name).
 pub fn get_uniq_id_of_ext(msg: &MessageExt) -> Option<String> {
     msg.get_property(PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX).map(str::to_string)
 }
@@ -32,10 +32,10 @@ mod tests {
     fn set_uniq_id_is_idempotent() {
         let mut msg = Message::new("TopicTest", Some(b"body"));
         set_uniq_id(&mut msg);
-        let first = get_uniq_id(&msg).expect("第一次必须写入");
+        let first = get_uniq_id(&msg).expect("first call must write the value");
         set_uniq_id(&mut msg);
-        assert_eq!(get_uniq_id(&msg).unwrap(), first, "已有值不得覆盖");
-        // 协议字面量：32 个大写 hex（IPv4 环境）
+        assert_eq!(get_uniq_id(&msg).unwrap(), first, "an existing value must not be overwritten");
+        // Protocol literal: 32 uppercase hex chars (IPv4 environment)
         assert_eq!(first.len(), 32, "got {first}");
         assert_eq!(first, first.to_ascii_uppercase());
     }

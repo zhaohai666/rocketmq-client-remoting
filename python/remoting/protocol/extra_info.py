@@ -4,9 +4,9 @@ from typing import Dict, List, Optional
 from common.mix_all import MixAll
 
 KEY_SEPARATOR = " "
-#: 队列之间的分隔符
+#: separator between queues
 QUEUE_SEPARATOR = ";"
-#: ``msgOffsetInfo`` 里同一队列多条 offset 的分隔符
+#: separator between several offsets of the same queue inside ``msgOffsetInfo``
 OFFSET_SEPARATOR = ","
 
 NORMAL_TOPIC = "0"
@@ -136,9 +136,10 @@ def build_extra_info(ck_queue_offset: int, pop_time: int, invisible_time: int,
 
 
 def parse_start_offset_info(start_offset_info: Optional[str]) -> Optional[Dict[str, int]]:
-    """解析 ``startOffsetInfo``，形如 ``"0 3 0;0 2 0"``。
+    """Parse ``startOffsetInfo``, shaped like ``"0 3 0;0 2 0"``.
 
-    key 是 ``"<retryFlag>@<queueId>"``，value 是该队列本次弹出的起始 offset。
+    The key is ``"<retryFlag>@<queueId>"`` and the value is the starting offset at
+    which that queue was popped this time.
     """
     if not start_offset_info:
         return None
@@ -160,9 +161,10 @@ def parse_start_offset_info(start_offset_info: Optional[str]) -> Optional[Dict[s
 
 
 def parse_msg_offset_info(msg_offset_info: Optional[str]) -> Optional[Dict[str, List[int]]]:
-    """解析 ``msgOffsetInfo``，形如 ``"0 3 0,1,2;0 2 0"``。
+    """Parse ``msgOffsetInfo``, shaped like ``"0 3 0,1,2;0 2 0"``.
 
-    key 同 ``parse_start_offset_info``，value 是该队列本次弹出的各条消息 offset 列表。
+    The key is the same as in ``parse_start_offset_info``; the value is the list of
+    per-message offsets at which that queue was popped this time.
     """
     if not msg_offset_info:
         return None
@@ -184,7 +186,7 @@ def parse_msg_offset_info(msg_offset_info: Optional[str]) -> Optional[Dict[str, 
 
 
 def parse_order_count_info(order_count_info: Optional[str]) -> Optional[Dict[str, int]]:
-    """解析 ``orderCountInfo``（顺序消费用），第三段是计数。"""
+    """Parse ``orderCountInfo`` (used by orderly consumption); the third segment is the count."""
     if not order_count_info:
         return None
     out: Dict[str, int] = {}

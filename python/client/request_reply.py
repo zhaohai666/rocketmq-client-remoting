@@ -21,10 +21,10 @@ DEFAULT_REQUEST_TIMEOUT_MILLIS = 3000
 class RequestCallback:
     pass
 
-    def on_success(self, response_message: Optional[Message]) -> None:  # pragma: no cover - 接口
+    def on_success(self, response_message: Optional[Message]) -> None:  # pragma: no cover - interface
         raise NotImplementedError
 
-    def on_exception(self, e: BaseException) -> None:  # pragma: no cover - 接口
+    def on_exception(self, e: BaseException) -> None:  # pragma: no cover - interface
         raise NotImplementedError
 
 
@@ -44,7 +44,7 @@ class RequestResponseFuture:
         self._callback_once = threading.Lock()
         self._callback_fired = False
 
-    # ---------- 等待 / 投递 ----------
+    # ---------- Wait / dispatch ----------
     def wait_response_message(self, timeout_millis: int) -> Optional[Message]:
         pass
         self._event.wait(max(0, timeout_millis) / 1000.0)
@@ -188,13 +188,13 @@ def create_reply_message(request_message: Message, body: bytes) -> Message:
 
 
 def is_reply_message(msg: Message) -> bool:
-    """MSG_TYPE == "reply" 的发送要走 SEND_REPLY_MESSAGE_V2(325)。"""
+    """A message with MSG_TYPE == "reply" must be sent via SEND_REPLY_MESSAGE_V2 (325)."""
     return msg.get_property(MessageConst.PROPERTY_MESSAGE_TYPE) == MixAll.REPLY_MESSAGE_FLAG
 
 
 def react_callback(callback: Optional[Callable[[Optional[Message], Optional[BaseException]], None]],
                    future: RequestResponseFuture) -> None:
-    """（可选）把回调适配成 ``(response, cause)`` 形式，便于脚本使用。"""
+    """(Optional) Adapt a callback into the ``(response, cause)`` form, convenient for scripts."""
     if callback is None:
         return
     callback(future.response_msg, future.cause)

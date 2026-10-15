@@ -13,7 +13,8 @@ enum MessageRequestMode: string
 }
 
 /**
- * broker 下发的单个指配项：队列 + 期望请求模式（PULL/POP）+ attachments。
+ * A single assignment item pushed down by the broker: a queue + the expected request mode
+ * (PULL/POP) + attachments.
  */
 final class MessageQueueAssignment
 {
@@ -65,7 +66,7 @@ final class QueryAssignmentRequestBody
     public string $topic = '';
     public string $consumerGroup = '';
     public string $clientId = '';
-    /** MessageModel（CLUSTERING / BROADCASTING），线格式是枚举 name。 */
+    /** MessageModel (CLUSTERING / BROADCASTING), the wire format is the enum name. */
     public string $messageModel = 'CLUSTERING';
     public string $strategyName = '';
 

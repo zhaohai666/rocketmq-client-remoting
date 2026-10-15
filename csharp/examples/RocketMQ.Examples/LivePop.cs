@@ -1,20 +1,23 @@
-// POP 模式（5.x 轻量消费）真机验证。
-// 用法：rmq pop [namesrv]
+// Real-machine verification of POP mode (5.x lightweight consumption).
+// Usage: rmq pop [namesrv]
 //
-// POP 与 pull 的语义差异是断言的重心：
-//   - **不提交位点**，靠 ack 确认；不 ack 的消息在 invisibleTime 后被复活重投；
-//   - broker 在普通 topic 消息上**不写** POP_CK，客户端必须自己反构 8 段 CK 串。
+// The semantic differences between POP and pull are the centre of the assertions:
+//   - **no offset is committed**, confirmation comes via ack; a message that is not acked is
+//     revived and redelivered after invisibleTime;
+//   - the broker does **not** write POP_CK on a plain topic message, so the client has to
+//     reconstruct the 8-segment CK string itself.
 //
-// 场景：
-//   S1 建 topic(8 队列) + 发 10 条
-//   S2 多队列 POP（queueId=-1, initMode=0）→ FOUND 且拿到消息
-//   S3 每条消息都被盖上 **8 段** POP_CK，且 brokerName/queueId 与消息实际一致
-//   S4 ack 一条 → SUCCESS
-//   S5 ChangeInvisibleTime → SUCCESS 且返回**新的** 8 段 extraInfo
-//   S6 校验真的生效：非法 queueId → MESSAGE_ILLEGAL；越界 offset → NO_MESSAGE
-//   S7 单队列 POP（新消费组 + queueId=0）→ FOUND 且消息 queueId 全为 0
-//   S8 不 ack 会复活：小 invisibleTime POP 后不 ack，等待后重 POP 能拿到同一条消息，
-//      且它的 POP_CK 是 retryFlag=1（来自 %RETRY%<group>_<topic>）—— 至少一次语义
+// Scenarios:
+//   S1 create the topic (8 queues) + send 10 messages
+//   S2 multi-queue POP (queueId=-1, initMode=0) -> FOUND with messages
+//   S3 every message is stamped with an **8-segment** POP_CK whose brokerName/queueId match the message
+//   S4 ack one -> SUCCESS
+//   S5 ChangeInvisibleTime -> SUCCESS and it returns a **new** 8-segment extraInfo
+//   S6 verification really works: an illegal queueId -> MESSAGE_ILLEGAL; an out-of-range offset -> NO_MESSAGE
+//   S7 single-queue POP (a new consumer group + queueId=0) -> FOUND and every message has queueId 0
+//   S8 not acking revives: a POP with a small invisibleTime that is not acked can POP the very
+//      same message again after waiting, and its POP_CK has retryFlag=1 (from
+//      %RETRY%<group>_<topic>) -- at-least-once semantics
 using System.Globalization;
 using System.Text;
 
@@ -87,8 +90,8 @@ public static class LivePop
 
         try
         {
-            // ------------------------------------------------ S1 建 topic + 发消息
-            Console.WriteLine("=== S1 准备 topic 与消息 ===");
+            // ------------------------------------------------ S1 create the topic + send messages
+            Console.WriteLine("=== S1 preparing the topic and the messages ===");
             producer.CreateTopic("TBW102", Topic, QueueNum);
             producer.CreateTopic("TBW102", TopicRevive, ReviveQueueNum);
             for (int i = 0; i < NMsg; ++i)
@@ -102,7 +105,7 @@ public static class LivePop
                 + " msgs to " + Topic);
 
             TopicRouteData? route = client.GetTopicRouteData(Topic);
-            Check("S1 topic 路由可用", route is not null && route.BrokerDatas.Count > 0);
+            Check("S1 the topic route is usable", route is not null && route.BrokerDatas.Count > 0);
             if (route is null || route.BrokerDatas.Count == 0)
             {
                 return Finish(producer);
@@ -112,10 +115,10 @@ public static class LivePop
             string addr = MQClientInstance.FindBrokerAddrInRoute(route, brokerName);
             Console.WriteLine("  brokerName=" + brokerName + " addr=" + addr);
 
-            // ------------------------------------------------ S2 多队列 POP
-            Console.WriteLine("=== S2 多队列 POP（addr 走自动解析路径）===");
+            // ------------------------------------------------ S2 multi-queue POP
+            Console.WriteLine("=== S2 multi-queue POP (the addr goes through the auto-resolution path) ===");
             PopResult res = client.PopMessage(Group, Topic, -1, 32, 60000, 0, 0);
-            Check("S2 POP 取到消息", res.IsFound && res.MsgFoundList.Count > 0,
+            Check("S2 the POP got messages", res.IsFound && res.MsgFoundList.Count > 0,
                 "status=" + PopStatusNames.Name(res.Status)
                     + " count=" + res.MsgFoundList.Count.ToString(CultureInfo.InvariantCulture)
                     + " startOffsetInfo=" + res.StartOffsetInfo);
@@ -124,8 +127,8 @@ public static class LivePop
                 return Finish(producer);
             }
 
-            // ------------------------------------------------ S3 POP_CK 反构
-            Console.WriteLine("=== S3 POP_CK 反构（8 段）===");
+            // ------------------------------------------------ S3 POP_CK reconstruction
+            Console.WriteLine("=== S3 POP_CK reconstruction (8 segments) ===");
             bool all8 = true;
             bool match = true;
             bool hasFirstPopTime = true;
@@ -163,9 +166,9 @@ public static class LivePop
                 }
             }
 
-            Check("S3a 每条消息都有 8 段 POP_CK", all8, "sample='" + sample + "'");
-            Check("S3b CK 的 brokerName/queueId 与消息一致", match);
-            Check("S3c 1ST_POP_TIME 已补", hasFirstPopTime);
+            Check("S3a every message has an 8-segment POP_CK", all8, "sample='" + sample + "'");
+            Check("S3b the CK's brokerName/queueId match the message", match);
+            Check("S3c 1ST_POP_TIME has been filled in", hasFirstPopTime);
 
             // ------------------------------------------------ S4 ack
             Console.WriteLine("=== S4 ACK ===");
@@ -175,7 +178,7 @@ public static class LivePop
             int qid1 = ExtraInfoUtil.GetQueueId(seg1);
             long off1 = ExtraInfoUtil.GetQueueOffset(seg1);
             int ackCode = client.AckMessage(Group, Topic, qid1, ck1, off1, 3000, brokerName, addr);
-            Check("S4 ack 返回 SUCCESS", ackCode == ResponseCode.Success,
+            Check("S4 ack returns SUCCESS", ackCode == ResponseCode.Success,
                 "code=" + ackCode.ToString(CultureInfo.InvariantCulture)
                     + " queueId=" + qid1.ToString(CultureInfo.InvariantCulture)
                     + " offset=" + off1.ToString(CultureInfo.InvariantCulture));
@@ -188,34 +191,35 @@ public static class LivePop
             ChangeInvisibleTimeResult res5 = client.ChangeInvisibleTime(Group, Topic,
                 ExtraInfoUtil.GetQueueId(seg2), ck2, ExtraInfoUtil.GetQueueOffset(seg2), 30000,
                 3000, brokerName, addr);
-            Check("S5a 延长不可见时间成功", res5.Success,
+            Check("S5a extending the invisible time succeeded", res5.Success,
                 "code=" + res5.Code.ToString(CultureInfo.InvariantCulture)
                     + " popTime=" + res5.PopTime.ToString(CultureInfo.InvariantCulture)
                     + " invisibleTime=" + res5.InvisibleTime.ToString(CultureInfo.InvariantCulture));
             string[] newSeg = res5.ExtraInfo.Length == 0
                 ? Array.Empty<string>()
                 : ExtraInfoUtil.Split(res5.ExtraInfo);
-            Check("S5b 返回新的 8 段 extraInfo 且用新值",
+            Check("S5b a new 8-segment extraInfo came back and the new values are used",
                 newSeg.Length == 8
                     && ExtraInfoUtil.GetInvisibleTime(newSeg) == res5.InvisibleTime
                     && ExtraInfoUtil.GetPopTime(newSeg) == res5.PopTime,
                 "new='" + res5.ExtraInfo + "'");
 
-            // ------------------------------------------------ S6 校验真的生效
-            Console.WriteLine("=== S6 非法参数必须被拒绝 ===");
+            // ------------------------------------------------ S6 verification really works
+            Console.WriteLine("=== S6 illegal parameters must be rejected ===");
             int badQueue = client.AckMessage(Group, Topic, QueueNum + 90, ck1, off1, 3000,
                 brokerName, addr);
-            Check("S6a 非法 queueId 被拒（MESSAGE_ILLEGAL）",
+            Check("S6a an illegal queueId is rejected (MESSAGE_ILLEGAL)",
                 badQueue == ResponseCode.MessageIllegal,
                 "code=" + badQueue.ToString(CultureInfo.InvariantCulture));
             int badOffset = client.AckMessage(Group, Topic, qid1, ck1, 1L << 40, 3000,
                 brokerName, addr);
-            Check("S6b 越界 offset 被拒（NO_MESSAGE）", badOffset == ResponseCode.NoMessage,
+            Check("S6b an out-of-range offset is rejected (NO_MESSAGE)", badOffset == ResponseCode.NoMessage,
                 "code=" + badOffset.ToString(CultureInfo.InvariantCulture));
 
-            // ------------------------------------------------ S7 单队列 POP
-            Console.WriteLine("=== S7 单队列 POP ===");
-            // 用新消费组：老组在同一 topic 上已有 pop 位点，重复 POP 拿不到东西
+            // ------------------------------------------------ S7 single-queue POP
+            Console.WriteLine("=== S7 single-queue POP ===");
+            // A new consumer group is used: the old group already has a pop offset on this
+            // topic and repeating the POP would get nothing
             PopResult res7 = client.PopMessage(GroupSingle, Topic, 0, 32, 60000, 0, 0,
                 "*", "TAG", false, 10000, brokerName, addr);
             bool onlyQ0 = true;
@@ -227,13 +231,13 @@ public static class LivePop
                 }
             }
 
-            Check("S7 单队列 POP 取到队列 0 的消息",
+            Check("S7 the single-queue POP got the messages of queue 0",
                 res7.IsFound && res7.MsgFoundList.Count > 0 && onlyQ0,
                 "status=" + PopStatusNames.Name(res7.Status)
                     + " count=" + res7.MsgFoundList.Count.ToString(CultureInfo.InvariantCulture));
 
-            // ------------------------------------------------ S8 不 ack 会复活
-            Console.WriteLine("=== S8 不 ack → 复活重投（至少一次语义）===");
+            // ------------------------------------------------ S8 not acking revives
+            Console.WriteLine("=== S8 not acking -> revived redelivery (at-least-once semantics) ===");
             for (int i = 0; i < ReviveNMsg; ++i)
             {
                 var msg = new Message(TopicRevive,
@@ -258,12 +262,12 @@ public static class LivePop
                 firstKeys.Add(UniqKeyOf(m));
             }
 
-            Check("S8a 首轮 POP 取到消息（不 ack）",
+            Check("S8a the first POP got messages (not acked)",
                 res8a.IsFound && res8a.MsgFoundList.Count > 0,
                 "count=" + res8a.MsgFoundList.Count.ToString(CultureInfo.InvariantCulture));
 
-            Console.WriteLine("  等待 " + ReviveWaitSec.ToString(CultureInfo.InvariantCulture)
-                + " s 让 broker 复活...");
+            Console.WriteLine("  waiting " + ReviveWaitSec.ToString(CultureInfo.InvariantCulture)
+                + " s for the broker to revive...");
             Thread.Sleep(ReviveWaitSec * 1000);
 
             PopResult res8b = client.PopMessage(GroupRevive, TopicRevive, -1, 32, 60000, 0, 0,
@@ -285,10 +289,10 @@ public static class LivePop
                 }
             }
 
-            Check("S8b 未 ack 的消息被复活重投", revived > 0,
+            Check("S8b the un-acked message was revived and redelivered", revived > 0,
                 "revived=" + revived.ToString(CultureInfo.InvariantCulture)
                     + " total=" + res8b.MsgFoundList.Count.ToString(CultureInfo.InvariantCulture));
-            Check("S8c 复活消息的 POP_CK retryFlag=1（来自 %RETRY%<group>_<topic>）",
+            Check("S8c the revived message's POP_CK has retryFlag=1 (from %RETRY%<group>_<topic>)",
                 retryFlags.Contains("1"),
                 "retryFlagsSize=" + retryFlags.Count.ToString(CultureInfo.InvariantCulture));
 
@@ -310,7 +314,7 @@ public static class LivePop
         }
         catch (Exception)
         {
-            // 收尾失败不影响断言结论
+            // a cleanup failure does not affect the conclusion of the assertions
         }
 
         Console.WriteLine("############ PASS=" + _pass.ToString(CultureInfo.InvariantCulture)

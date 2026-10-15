@@ -34,7 +34,7 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 
 def group_is_online(admin: DefaultMQAdminExt, group: str, addr: str):
-    """203 的原始答案：在线返回 ConsumerConnection，不在线返回 None（异常一律当不在线）。"""
+    """The raw answer from 203: online returns ConsumerConnection, offline returns None (any exception is treated as offline)."""
     try:
         return admin.examine_consumer_connection_info(group, broker_addr=addr)
     except (MQBrokerException, MQClientException):
@@ -42,7 +42,7 @@ def group_is_online(admin: DefaultMQAdminExt, group: str, addr: str):
 
 
 def consumer_ids(client, group: str, addr: str):
-    """38 的原始答案：不在线时 broker 直接抛 `no consumer for this group`，当空列表处理。"""
+    """The raw answer from 38: when offline the broker throws `no consumer for this group`, treated as an empty list."""
     try:
         return client.get_consumer_list_by_group(group, 5000, addr=addr).consumer_id_list
     except MQBrokerException:
@@ -56,33 +56,33 @@ def main() -> int:
     admin.start()
     consumer = None
     try:
-        # ---- A0 建 topic ----
+        # ---- A0 create topic ----
         admin.create_topic_in_broker(MASTER, TOPIC, 4, 4)
         print("topic=%s group=%s" % (TOPIC, GROUP))
 
-        # ---- A1 起拉模式消费者并拉一轮 ----
+        # ---- A1 start the pull consumer and pull once ----
         consumer = DefaultMQPullConsumer(GROUP)
         consumer.set_namesrv_addr(NAMESRV)
         consumer.register_topics.add(TOPIC)
         consumer.start()
         mqs = consumer.fetch_subscribe_message_queues(TOPIC)
         pulled = consumer.pull(mqs[0], "*", 0, 32) if mqs else None
-        check("A1 拉模式消费者启动并成功拉取一轮",
+        check("A1 pull consumer started and pulled one round successfully",
               consumer.heartbeat_count() >= 1 and pulled is not None,
               "queues=%d status=%s heartbeats=%d"
               % (len(mqs), pulled.status if pulled else "-", consumer.heartbeat_count()))
 
-        # ---- A2 主节点 203：本组在 broker 的 consumerTable 里，且口径是拉模式 ----
+        # ---- A2 master 203: this group is in the broker's consumerTable, and the mode is pull ----
         conn = group_is_online(admin, GROUP, MASTER)
-        check("A2 主节点 203 查到本组（心跳已注册）", conn is not None,
+        check("A2 master 203 finds this group (heartbeat registered)", conn is not None,
               "connections=%d" % (len(conn.connection_set) if conn else 0))
-        check("A2 消费类型是 CONSUME_ACTIVELY",
+        check("A2 consume type is CONSUME_ACTIVELY",
               conn is not None and conn.consume_type == "CONSUME_ACTIVELY",
               "consumeType=%s" % (conn.consume_type if conn else None))
-        check("A2 消费位点是 CONSUME_FROM_LAST_OFFSET（:353）",
+        check("A2 consume-from-where is CONSUME_FROM_LAST_OFFSET (:353)",
               conn is not None and conn.consume_from_where == "CONSUME_FROM_LAST_OFFSET",
               "consumeFromWhere=%s" % (conn.consume_from_where if conn else None))
-        check("A2 广播/集群口径是 CLUSTERING",
+        check("A2 broadcast/cluster mode is CLUSTERING",
               conn is not None and conn.message_model == "CLUSTERING",
               "messageModel=%s" % (conn.message_model if conn else None))
 
@@ -91,32 +91,32 @@ def main() -> int:
         sub_string = None
         if isinstance(entry, dict):
             sub_string = entry.get("subString") or entry.get("sub_string")
-        check("A2b 203 的订阅表带 registerTopics 的 topic 且 subString=*",
+        check("A2b 203's subscription table carries the registerTopics topic and subString=*",
               sub_string == "*", "subscriptionTable=%s" % subs)
 
-        # ---- A3 38 主节点：consumerTable 里的 clientId 列表 ----
+        # ---- A3 38 master: the clientId list in the consumerTable ----
         client = consumer._mq_client
         ids = consumer_ids(client, GROUP, MASTER)
-        check("A3 主节点 38 查到本 clientId", consumer.client_id in ids, "ids=%s" % ids)
+        check("A3 master 38 finds this clientId", consumer.client_id in ids, "ids=%s" % ids)
 
-        # ---- A4 从节点：心跳同样落到每一台 ----
+        # ---- A4 slave: the heartbeat also reaches every node ----
         if SLAVE:
             slave_conn = group_is_online(admin, GROUP, SLAVE)
-            check("A4 从节点 203 也查到本组（心跳扇出到从节点）", slave_conn is not None,
+            check("A4 slave 203 also finds this group (heartbeat fans out to the slave)", slave_conn is not None,
                   "slave=%s connections=%d"
                   % (SLAVE, len(slave_conn.connection_set) if slave_conn else 0))
             slave_ids = consumer_ids(client, GROUP, SLAVE)
-            check("A4 从节点 38 也查到本 clientId", consumer.client_id in slave_ids,
+            check("A4 slave 38 also finds this clientId", consumer.client_id in slave_ids,
                   "ids=%s" % slave_ids)
 
-        # ---- A5 对照：幽灵组（从未心跳）必须查不到 ----
+        # ---- A5 control: the ghost group (never heartbeats) must not be found ----
         ghost_conn = group_is_online(admin, GHOST_GROUP, MASTER)
         ghost_ids = consumer_ids(client, GHOST_GROUP, MASTER)
-        check("A5 对照：未心跳的幽灵组 203 查不到", ghost_conn is None,
+        check("A5 control: the never-heartbeated ghost group is not found via 203", ghost_conn is None,
               "ghost connections=%d" % (len(ghost_conn.connection_set) if ghost_conn else 0))
-        check("A5 对照：未心跳的幽灵组 38 空列表", ghost_ids == [], "ids=%s" % ghost_ids)
+        check("A5 control: the never-heartbeated ghost group is an empty list via 38", ghost_ids == [], "ids=%s" % ghost_ids)
 
-        # ---- A6 shutdown 立刻注销（35），不必等 ~120s 通道扫描 ----
+        # ---- A6 shutdown unregisters immediately (35), no need to wait for the ~120s channel scan ----
         client_id = consumer.client_id
         consumer.shutdown()
         consumer = None
@@ -127,7 +127,7 @@ def main() -> int:
                 gone = True
                 break
             time.sleep(0.5)
-        check("A6 shutdown 后 203 立刻查不到本组（发过 35 注销）", gone, "clientId=%s" % client_id)
+        check("A6 after shutdown, 203 immediately cannot find this group (a 35 unregister was sent)", gone, "clientId=%s" % client_id)
     finally:
         if consumer is not None:
             try:

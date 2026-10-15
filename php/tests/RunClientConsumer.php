@@ -3,25 +3,27 @@
 declare(strict_types=1);
 
 /**
- * 消费者套件自测（DefaultMQPushConsumer / DefaultMQPullConsumer / DefaultLitePullConsumer
- * + ConsumerSupport 公共基础件）。不依赖 phpunit，不连真机。
+ * Consumer suite self test (DefaultMQPushConsumer / DefaultMQPullConsumer / DefaultLitePullConsumer
+ * + ConsumerSupport common primitives). No phpunit, no real cluster.
  *
- * 运行：php tests/RunClientConsumer.php（或经 tests/run_all.php）
- * 全部通过输出 "ALL TESTS PASSED (N checks)"，任一失败列出明细并以非零码退出。
+ * Run: php tests/RunClientConsumer.php (or via tests/run_all.php)
+ * On success prints "ALL TESTS PASSED (N checks)"; any failure lists details and exits non-zero.
  *
- * 网络用例与 RunClientInstance 同款：本文件以 `--broker` 参数二次拉起自身作为
- * **子进程**假 broker。与实例套件的差别是这里的 broker **有状态**：
- *   - 每队列拉取计数（首拉回 FOUND / OFFSET_ILLEGAL，后续回 NO_NEW_MSG）；
- *   - OTopic 的 QUERY_CONSUMER_OFFSET 在"发生过 OFFSET_ILLEGAL"后返回 77；
- *   - 把 PULL / UPDATE_CONSUMER_OFFSET / CONSUMER_SEND_MSG_BACK / LOCK_BATCH_MQ
- *     请求按行写进 RMQ_LOG 指定的 JSONL 文件，父进程据此断言线上行为
- *     （sysFlag 的 suspend 位、回投 delayLevel、锁队列 mqSet、位点提交值）。
- * 消费者列表（rebalance 用）从 RMQ_CONSUMER_MAP 指定的 JSON 文件读：{group: [cid,...]}。
+ * Network cases follow the RunClientInstance pattern: this file re-spawns itself with the
+ * `--broker` argument as a **child-process** fake broker. Unlike the instance suite, this
+ * broker is **stateful**:
+ *   - per-queue pull counters (first pull returns FOUND / OFFSET_ILLEGAL, later ones NO_NEW_MSG);
+ *   - OTopic's QUERY_CONSUMER_OFFSET returns 77 after "an OFFSET_ILLEGAL happened";
+ *   - writes PULL / UPDATE_CONSUMER_OFFSET / CONSUMER_SEND_MSG_BACK / LOCK_BATCH_MQ
+ *     requests line-by-line into the JSONL file named by RMQ_LOG; the parent process asserts
+ *     wire behavior from it (sysFlag suspend bit, send-back delayLevel, lock mqSet, commit offsets).
+ * The consumer list (for rebalance) is read from the JSON file named by RMQ_CONSUMER_MAP: {group: [cid,...]}.
  */
 
 require_once __DIR__ . '/../bootstrap.php';
 
-// autoloader 只加载类不加载函数：本套件直接调 ConsumerSupport 的全局函数，先保证文件已加载。
+// autoloader loads classes but not functions: this suite calls ConsumerSupport global
+// functions directly, so make sure the file is loaded first.
 if (!function_exists('RocketMQ\\Client\\wire_split')) {
     require_once __DIR__ . '/../src/Client/ConsumerSupport.php';
 }
@@ -68,7 +70,7 @@ use function RocketMQ\Client\scan_offset_table_body;
 use function RocketMQ\Remoting\Protocol\message_queue_key;
 
 // ======================================================================
-// 子进程假 broker：`php RunClientConsumer.php --broker`
+// child-process fake broker: `php RunClientConsumer.php --broker`
 // ======================================================================
 
 if (($argv[1] ?? '') === '--broker') {
@@ -76,10 +78,10 @@ if (($argv[1] ?? '') === '--broker') {
     exit(0);
 }
 
-/** 各 topic 的 FOUND 剧本：body 前缀 / 条数 / 首轮后是否转 NO_NEW_MSG。 */
+/** FOUND script per topic: body prefix / count / whether to switch to NO_NEW_MSG after the first round. */
 function consPullPlan(string $topic, int $seq, string $reqCode): array
 {
-    // 返回 [responseCode, nextBeginOffset, list<array{body, offset}>]
+    // returns [responseCode, nextBeginOffset, list<array{body, offset}>]
     switch ($topic) {
         case 'CTopic':
         case 'RTopic':
@@ -94,7 +96,7 @@ function consPullPlan(string $topic, int $seq, string $reqCode): array
                 ]];
             }
             return [ResponseCode::PULL_NOT_FOUND, 3, []];
-        case 'PTopic2': // 预留
+        case 'PTopic2': // reserved
             return [ResponseCode::PULL_NOT_FOUND, 0, []];
         case 'FTopic':
             if ($seq === 1) {
@@ -138,7 +140,7 @@ function consLog(array $entry): void
     @file_put_contents($path, json_encode($entry, JSON_UNESCAPED_SLASHES) . "\n", FILE_APPEND);
 }
 
-/** 读满 n 字节；EOF 返回 null。 */
+/** Reads exactly n bytes; returns null on EOF. */
 function consReadExact($conn, int $n): ?string
 {
     $buf = '';
@@ -152,7 +154,7 @@ function consReadExact($conn, int $n): ?string
     return $buf;
 }
 
-/** 读一整帧；EOF 返回 null。 */
+/** Reads one full frame; returns null on EOF. */
 function consReadFrame($conn): ?RemotingCommand
 {
     $head = consReadExact($conn, 4);
@@ -170,7 +172,7 @@ function consReadFrame($conn): ?RemotingCommand
     return RemotingCommand::decode($head . $rest);
 }
 
-/** 构造一条 route body：单 broker 单读写队列，全部指向假 broker 自身。 */
+/** Builds a route body: single broker with one read/write queue, all pointing at the fake broker itself. */
 function consRouteBody(string $addr): string
 {
     $qd = new QueueData('b-cons', 1, 1, PermName::PERM_READ | PermName::PERM_WRITE, 0);
@@ -181,7 +183,7 @@ function consRouteBody(string $addr): string
     return $trd->encode();
 }
 
-/** 用 17 段格式编码一条消息，拼进 PULL/LITE_PULL 响应体。 */
+/** Encodes one message in the 17-segment format and concatenates it into the PULL/LITE_PULL response body. */
 function consEncodeMsg(string $topic, string $body, int $queueOffset): string
 {
     $m = new MessageExt(topic: $topic, body: $body);
@@ -303,7 +305,7 @@ function consRespond(RemotingCommand $cmd): ?RemotingCommand
                 'delayLevel' => (int) ($ext['delayLevel'] ?? 0),
                 'maxReconsumeTimes' => isset($ext['maxReconsumeTimes']) ? (int) $ext['maxReconsumeTimes'] : null,
             ]);
-            // FTopic 的回投一律失败：验证 C4 地板（回投失败条目卡住位点提交）。
+            // FTopic send-backs always fail: verifies the C4 floor (failed send-back entries stall offset commit).
             if (($ext['originTopic'] ?? '') === 'FTopic') {
                 return RemotingCommand::createResponseCommand(ResponseCode::SYSTEM_ERROR, 'send back rejected');
             }
@@ -321,7 +323,7 @@ function consRespond(RemotingCommand $cmd): ?RemotingCommand
             ]);
             $resp = RemotingCommand::createResponseCommand(ResponseCode::SUCCESS);
             if ($cmd->code === RequestCode::LOCK_BATCH_MQ) {
-                // 全部锁成功：把请求里的 mqSet 原样回进 lockOKMQSet。
+                // All locks succeed: echo the request's mqSet back as lockOKMQSet.
                 $resp->body = json_encode(['lockOKMQSet' => $mqSet]);
             }
             return $resp;
@@ -373,7 +375,7 @@ function consBrokerMain(): void
 }
 
 /**
- * 子进程假 broker 句柄（与 RunClientInstance 同形，独立声明避免跨文件 exit 污染）。
+ * Child-process fake broker handle (same shape as RunClientInstance; declared separately to avoid cross-file exit pollution).
  */
 final class ConsFakeBroker
 {
@@ -426,11 +428,11 @@ final class ConsFakeBroker
 }
 
 // ======================================================================
-// 测试用监听器
+// test listeners
 // ======================================================================
 
 /**
- * 并发监听器：按首条消息的 topic 分流（CTopic 收下 / RTopic 重投 / PTopic 只认可第 1 条）。
+ * Concurrent listener: routes by the first message's topic (CTopic accepts / RTopic re-consumes / PTopic acks only the 1st).
  */
 final class ConsTopicListener implements MessageListenerConcurrently
 {
@@ -454,14 +456,15 @@ final class ConsTopicListener implements MessageListenerConcurrently
             $context->ackIndex = (int) $b['ackIndex'];
         }
         if (!empty($b['ackIndexOnlyFirst']) && $this->calls[$topic] === 1) {
-            // 首次只认可第 1 条（触发部分 ack 回投）；重排后的再消费整批认可，终结循环。
+            // First round acks only the 1st message (triggers partial-ack send-back); the
+            // re-ordered re-consume acks the whole batch, ending the loop.
             $context->ackIndex = 0;
         }
         return $b['status'];
     }
 }
 
-/** 顺序监听器：第一次挂起、第二次成功（重投场景的骨架）。 */
+/** Orderly listener: suspends the first time, succeeds the second (skeleton for the re-consume scenario). */
 final class ConsOrderlyListener implements MessageListenerOrderly
 {
     public int $calls = 0;
@@ -479,7 +482,7 @@ final class ConsOrderlyListener implements MessageListenerOrderly
 }
 
 // ======================================================================
-// 测试 runner
+// test runner
 // ======================================================================
 
 final class RunClientConsumer
@@ -523,7 +526,7 @@ final class RunClientConsumer
         return 1;
     }
 
-    // ---------------- 日志辅助 ----------------
+    // ---------------- log helpers ----------------
 
     private function loadLog(string $path): void
     {
@@ -563,52 +566,52 @@ final class RunClientConsumer
         }
     }
 
-    // ================================================================ 1. ConsumerSupport 纯逻辑
+    // ================================================================ 1. ConsumerSupport pure logic
 
     private function testConsumerSupportUnit(): void
     {
-        // wire_split：按协议 wire 字段的分隔符切分，丢弃尾部空段。
-        $this->checkSame(['room1'], wire_split('room1@', '@'), 'wire_split 丢尾空段');
-        $this->checkSame(['room1', 'b'], wire_split('room1@b@', '@'), 'wire_split 中段保留尾剔除');
-        $this->checkSame([], wire_split('@', '@'), 'wire_split 全分隔符 → 空');
-        $this->checkSame([''], wire_split('', '@'), 'wire_split 无命中原样返回（含空串）');
-        $this->checkSame(['abc'], wire_split('abc', '@'), 'wire_split 无命中原样返回');
+        // wire_split: splits by the protocol wire-field separator, dropping trailing empty segments.
+        $this->checkSame(['room1'], wire_split('room1@', '@'), 'wire_split drops trailing empty segment');
+        $this->checkSame(['room1', 'b'], wire_split('room1@b@', '@'), 'wire_split keeps interior segments, drops trailing');
+        $this->checkSame([], wire_split('@', '@'), 'wireSplit all separators -> empty');
+        $this->checkSame([''], wire_split('', '@'), 'wire_split no hit returns as-is (including empty string)');
+        $this->checkSame(['abc'], wire_split('abc', '@'), 'wire_split no hit returns as-is');
 
-        // wire_queue_key_string：一致性哈希的输入串，格式固定为
-        // "MessageQueue [topic=..., brokerName=..., queueId=...]"，逐字符不得变形。
+        // wire_queue_key_string: input string for consistent hashing, format fixed as
+        // "MessageQueue [topic=..., brokerName=..., queueId=...]", must not deform character-by-character.
         $mq = new MessageQueue('T', 'b', 3);
         $this->checkSame('MessageQueue [topic=T, brokerName=b, queueId=3]', wire_queue_key_string($mq),
-            'wire_queue_key_string 格式');
+            'wire_queue_key_string format');
 
-        // 本地位点 JSON：严格扁平 map 往返。
+        // local offsets JSON: strict flat-map roundtrip.
         $items = ['Tb1' => 42, 'Tb2' => 7];
         $mqMap = ['Tb1' => new MessageQueue('T', 'b', 1), 'Tb2' => new MessageQueue('T', 'b', 2)];
         $json = build_local_offsets_json($items, $mqMap);
-        $this->checkSame($items, parse_local_offsets_json($json), '本地位点 JSON 往返');
-        // 兼容「对象作 key」的非标准 offsetTable JSON（按协议字段名 brokerName/queueId/topic 回读）。
+        $this->checkSame($items, parse_local_offsets_json($json), 'local offsets JSON roundtrip');
+        // non-standard offsetTable JSON with "object as key" (read back by protocol field names brokerName/queueId/topic).
         $javaStyle = '{"offsetTable":{{"brokerName":"b","queueId":1,"topic":"T"}:42,'
             . '{"brokerName":"b","queueId":2,"topic":"T"}:7}}';
-        $this->checkSame($items, parse_local_offsets_json($javaStyle), 'fastjson2 对象键格式解析');
+        $this->checkSame($items, parse_local_offsets_json($javaStyle), 'fastjson2 object-key format parsing');
         $pretty = "{\n  \"offsetTable\" : {\n    {\"brokerName\":\"b\",\"queueId\":1,\"topic\":\"T\"} : 42\n  }\n}";
-        $this->checkSame(['Tb1' => 42], parse_local_offsets_json($pretty), 'fastjson2 对象键 pretty 容忍');
-        $this->checkSame(null, parse_local_offsets_json('not json'), '坏输入返回 null');
-        $this->checkSame(null, parse_local_offsets_json(''), '空串返回 null');
-        $this->checkSame(null, scan_offset_table_body('{"offsetTable":garbage}'), 'offsetTable 体损坏返回 null');
+        $this->checkSame(['Tb1' => 42], parse_local_offsets_json($pretty), 'fastjson2 object-key pretty tolerance');
+        $this->checkSame(null, parse_local_offsets_json('not json'), 'bad input returns null');
+        $this->checkSame(null, parse_local_offsets_json(''), 'empty string returns null');
+        $this->checkSame(null, scan_offset_table_body('{"offsetTable":garbage}'), 'corrupt offsetTable body returns null');
 
-        // 客户端二次 tag 过滤（订阅表走真实构建入口 FilterAPI）。
+        // client-side second tag filtering (subscription table goes through the real FilterAPI build entry).
         $sub = \RocketMQ\Common\FilterAPI::buildSubscriptionData('T', 'TagA || TagB');
         $mTagA = new MessageExt(topic: 'T', body: 'a');
         $mTagA->setTags('TagA');
         $mTagC = new MessageExt(topic: 'T', body: 'c');
         $mTagC->setTags('TagC');
         $kept = client_side_tag_filter($sub, [$mTagA, $mTagC]);
-        $this->checkSame([$mTagA], $kept, 'tag 过滤保留命中项');
-        $this->checkSame([$mTagA, $mTagC], client_side_tag_filter(null, [$mTagA, $mTagC]), '无订阅不过滤');
-        // SUB_ALL：tagsSet 必须为空 → 不过滤。
+        $this->checkSame([$mTagA], $kept, 'tag filter keeps hits');
+        $this->checkSame([$mTagA, $mTagC], client_side_tag_filter(null, [$mTagA, $mTagC]), 'no subscription does not filter');
+        // SUB_ALL: tagsSet must be empty -> no filtering.
         $subAll = new SubscriptionData('T', '*');
-        $this->checkSame([$mTagA, $mTagC], client_side_tag_filter($subAll, [$mTagA, $mTagC]), 'SUB_ALL 空 tagsSet 放行');
+        $this->checkSame([$mTagA, $mTagC], client_side_tag_filter($subAll, [$mTagA, $mTagC]), 'SUB_ALL empty tagsSet passes through');
 
-        // 投递前过滤钩子：钩子可摘消息、异常一律吞掉。
+        // pre-delivery filter hooks: hooks may prune messages; exceptions are always swallowed.
         $mDrop = new MessageExt(topic: 'T', body: 'drop');
         $dropper = new class {
             public function filterMessage(FilterMessageContext $ctx): void
@@ -627,27 +630,27 @@ final class RunClientConsumer
         };
         $out = filter_messages_for_delivery('G', [$dropper, $bomber], $mq, null, [$mTagA, $mDrop]);
         $this->checkSame(['a'], array_map(static fn(MessageExt $m) => $m->getBody(), $out),
-            '钩子摘除 drop 消息且异常被吞');
+            'hook prunes the drop message and exceptions are swallowed');
 
-        // PopProcessQueue：waitAck 计数与 dropped 标志。
+        // PopProcessQueue: waitAck counting and the dropped flag.
         $pq = new PopProcessQueue();
         $pq->incFoundMsg(3);
         $this->checkSame(3, $pq->waitAckCount(), 'PopProcessQueue incFoundMsg');
-        $this->checkSame(2, $pq->ack(), 'PopProcessQueue ack 减一');
+        $this->checkSame(2, $pq->ack(), 'PopProcessQueue ack decrements by one');
         $pq->decFoundMsg(-1);
-        $this->checkSame(1, $pq->waitAckCount(), 'PopProcessQueue decFoundMsg（协议语义传负数递减）');
-        $this->check(!$pq->isDropped(), 'PopProcessQueue 默认未 dropped');
+        $this->checkSame(1, $pq->waitAckCount(), 'PopProcessQueue decFoundMsg (protocol semantics pass negative to decrement)');
+        $this->check(!$pq->isDropped(), 'PopProcessQueue not dropped by default');
         $pq->setDropped(true);
         $this->check($pq->isDropped(), 'PopProcessQueue setDropped');
 
-        // 消费侧常量取值：POP 延迟档位与不可见时间上下限。
+        // consumer-side constant values: POP delay tiers and invisible-time bounds.
         $this->checkSame([10, 30, 60, 120, 180, 240, 300, 360, 420, 480, 540, 600, 1200, 1800, 3600, 7200],
-            ConsumerDefaults::POP_DELAY_LEVEL, 'POP_DELAY_LEVEL 16 档');
+            ConsumerDefaults::POP_DELAY_LEVEL, 'POP_DELAY_LEVEL 16 tiers');
         $this->checkSame(5000, ConsumerDefaults::MIN_POP_INVISIBLE_TIME, 'MIN_POP_INVISIBLE_TIME');
         $this->checkSame(300000, ConsumerDefaults::MAX_POP_INVISIBLE_TIME, 'MAX_POP_INVISIBLE_TIME');
     }
 
-    // ================================================================ 2. Push 并发：收满 / 重投 / 部分 ack / 位点纠错
+    // ================================================================ 2. Push concurrent: full batches / re-consume / partial ack / offset correction
 
     private function testPushConcurrent(ConsFakeBroker $broker): void
     {
@@ -664,78 +667,78 @@ final class RunClientConsumer
         $c->setInstanceName('CONS-C');
         $c->setNameServerAddresses([$broker->addr]);
         $c->setMessageListener($listener);
-        $c->consumeMessageBatchMaxSize = 3; // 整批投递，部分 ack / 回投场景才 meaningful
+        $c->consumeMessageBatchMaxSize = 3; // whole-batch delivery; needed for partial ack / send-back scenarios
         $c->subscribe('CTopic');
         $c->subscribe('RTopic');
         $c->subscribe('PTopic');
         $c->subscribe('FTopic');
         $c->subscribe('OTopic');
         $c->start();
-        $this->check($c->isStarted(), 'push start 后 isStarted');
-        $this->checkSame(MixAll::clientIdFor('CONS-C', null, false), $c->clientId, 'push clientId 确定性');
-        $this->checkSame(5, $c->assignedQueueCount(), 'start 同步完成首轮 rebalance（5 队列）');
+        $this->check($c->isStarted(), 'push isStarted after start');
+        $this->checkSame(MixAll::clientIdFor('CONS-C', null, false), $c->clientId, 'push clientId deterministic');
+        $this->checkSame(5, $c->assignedQueueCount(), 'start completes the first rebalance synchronously (5 queues)');
 
-        // 第一轮 tick：5 队列各拉一次 FOUND + 一次 NO_NEW_MSG；分发消费全部完成。
+        // first tick: each of the 5 queues pulls one FOUND + one NO_NEW_MSG; dispatch and consumption all finish.
         $c->tick();
-        $this->checkSame(['push-0', 'push-1', 'push-2'], $GLOBALS['RECV']['CTopic'] ?? [], 'CTopic 收满 3 条');
-        $this->checkSame(['retry-0', 'retry-1', 'retry-2'], $GLOBALS['RECV']['RTopic'] ?? [], 'RTopic 收满 3 条');
-        $this->checkSame(['part-0', 'part-1', 'part-2'], $GLOBALS['RECV']['PTopic'] ?? [], 'PTopic 收满 3 条');
-        // C4 地板语义：FTopic 回投 f-1/f-2 失败 → floor=min(1,2)=1 卡住位点，失败条目塞回队首。
-        // 本端口有意偏差：dispatchRound 对失败重排**同 tick 立即重试**（不做延迟提交），
-        // 所以 floor 中间态在单线程内不可观测，只有终态可断言；
-        // "位点不越过失败条目"的真验证靠真机（重试天然跨 tick）。
+        $this->checkSame(['push-0', 'push-1', 'push-2'], $GLOBALS['RECV']['CTopic'] ?? [], 'CTopic receives all 3');
+        $this->checkSame(['retry-0', 'retry-1', 'retry-2'], $GLOBALS['RECV']['RTopic'] ?? [], 'RTopic receives all 3');
+        $this->checkSame(['part-0', 'part-1', 'part-2'], $GLOBALS['RECV']['PTopic'] ?? [], 'PTopic receives all 3');
+        // C4 floor semantics: FTopic send-back of f-1/f-2 fails -> floor=min(1,2)=1 stalls the offset, failed entries are pushed back to the queue head.
+        // Deliberate deviation in this port: dispatchRound retries failed re-orders **immediately in the same tick** (no delayed commit),
+        // so the floor's intermediate state is not observable single-threaded; only the final state can be asserted.
+        // The real verification of "offset never passes failed entries" belongs to a real cluster (retries naturally span ticks).
         $this->checkSame(['f-0', 'f-1', 'f-2', 'f-1', 'f-2'], $GLOBALS['RECV']['FTopic'] ?? [],
-            'FTopic 回投失败的 2 条在同 tick 内被塞回队首重放');
-        // PTopic：回投 p-1/p-2 成功 → broker 会重投到 %RETRY%，客户端照常推进越过它们
-        // （回投成功的消息从本地缓冲移除，位点取剩余 msgs 的 max(queueOffset)+1）。
+            'the 2 failed FTopic send-backs are pushed back to the queue head and replayed within the same tick');
+        // PTopic: send-back of p-1/p-2 succeeds -> the broker will re-deliver to %RETRY%, the client advances past them as usual
+        // (successfully sent-back messages are removed from the local buffer; offset = max(queueOffset)+1 of the remaining msgs).
         $this->checkSame(3, ($c->getConsumerStatus('PTopic')[0]['offset'] ?? -1),
-            '回投成功后位点照常推进到 3');
+            'offset advances past 3 after successful send-back');
 
-        // 第二轮 tick：OTopic OFFSET_ILLEGAL 后重建并按修正位点拉取。
+        // second tick: OTopic rebuilds after OFFSET_ILLEGAL and pulls at the corrected offset.
         $c->tick();
 
-        // 位点终值：C=3 / R=3 / P=3 / F=3（重放后追平）/ O=77（OFFSET_ILLEGAL 纠正）。
+        // final offsets: C=3 / R=3 / P=3 / F=3 (caught up after replay) / O=77 (OFFSET_ILLEGAL corrected).
         $status = $c->getConsumerStatus(null);
         $byTopic = [];
         foreach ($status as $e) {
             $byTopic[$e['mq']->topic] = $e['offset'];
         }
-        $this->checkSame(3, $byTopic['CTopic'] ?? -1, 'CTopic 已消费位点=3');
-        $this->checkSame(3, $byTopic['PTopic'] ?? -1, 'PTopic 位点=3');
-        $this->checkSame(3, $byTopic['RTopic'] ?? -1, 'RTopic 重投后位点=3');
-        $this->checkSame(3, $byTopic['FTopic'] ?? -1, 'FTopic 重放后位点=3');
-        $this->checkSame(77, $byTopic['OTopic'] ?? -1, 'OTopic 位点被纠正为 77');
+        $this->checkSame(3, $byTopic['CTopic'] ?? -1, 'CTopic consumed offset=3');
+        $this->checkSame(3, $byTopic['PTopic'] ?? -1, 'PTopic offset=3');
+        $this->checkSame(3, $byTopic['RTopic'] ?? -1, 'RTopic offset=3 after re-consume');
+        $this->checkSame(3, $byTopic['FTopic'] ?? -1, 'FTopic offset=3 after replay');
+        $this->checkSame(77, $byTopic['OTopic'] ?? -1, 'OTopic offset corrected to 77');
 
-        // 线上行为断言。
+        // wire-behavior assertions.
         $this->loadLog(getenv('RMQ_LOG'));
         $pulls = $this->logWhere(RequestCode::PULL_MESSAGE);
-        $this->check($pulls !== [], '有 PULL 请求日志');
+        $this->check($pulls !== [], 'PULL requests logged');
         foreach ($pulls as $p) {
             $this->check(((int) $p['sysFlag'] & PullSysFlag::FLAG_SUSPEND) === 0,
-                "push 短轮询 suspend 位关闭 (seq={$p['seq']})");
+                "push short-polling suspend bit off (seq={$p['seq']})");
         }
         $firstC = $this->logWhere(RequestCode::PULL_MESSAGE, 'CTopic')[0] ?? null;
-        $this->check($firstC !== null && (int) $firstC['queueOffset'] === 0, 'CTopic 首拉从位点 0 开始');
+        $this->check($firstC !== null && (int) $firstC['queueOffset'] === 0, 'CTopic first pull starts from offset 0');
         $oPulls = $this->logWhere(RequestCode::PULL_MESSAGE, 'OTopic');
         $this->check(count($oPulls) >= 2 && (int) $oPulls[1]['queueOffset'] === 77,
-            'OFFSET_ILLEGAL 后按修正位点 77 重新拉取');
+            're-pulls at corrected offset 77 after OFFSET_ILLEGAL');
 
-        // 回投：RTopic 3 条 + PTopic 2 条成功；FTopic 2 条被 broker 拒绝。
-        // delayLevel = 3 + reconsumeTimes(0)。
+        // send-back: RTopic 3 + PTopic 2 succeed; FTopic 2 rejected by the broker.
+        // delayLevel = 3 + reconsumeTimes(0).
         $backs = $this->logWhere(RequestCode::CONSUMER_SEND_MSG_BACK, null, 'GID-C-CONS');
-        $this->checkSame(7, count($backs), 'RECONSUME_LATER×3 + 部分 ack×2 + 回投失败×2 共 7 次');
+        $this->checkSame(7, count($backs), 'RECONSUME_LATER×3 + partial ack×2 + failed send-back×2 = 7 total');
         foreach ($backs as $b) {
-            $this->checkSame(3, (int) $b['delayLevel'], '回投 delayLevel=3+reconsumeTimes');
-            $this->checkSame(16, (int) $b['maxReconsumeTimes'], 'maxReconsumeTimes -1 → 16');
+            $this->checkSame(3, (int) $b['delayLevel'], 'send-back delayLevel=3+reconsumeTimes');
+            $this->checkSame(16, (int) $b['maxReconsumeTimes'], 'maxReconsumeTimes -1 -> 16');
         }
         $this->checkSame(3, count(array_filter($backs, static fn($e) => ($e['originTopic'] ?? '') === 'RTopic')),
-            'RTopic 回投 3 条');
+            'RTopic sends back 3');
         $this->checkSame(2, count(array_filter($backs, static fn($e) => ($e['originTopic'] ?? '') === 'PTopic')),
-            'PTopic 回投 2 条');
+            'PTopic sends back 2');
         $this->checkSame(2, count(array_filter($backs, static fn($e) => ($e['originTopic'] ?? '') === 'FTopic')),
-            'FTopic 回投 2 条（失败）');
+            'FTopic sends back 2 (failed)');
 
-        // 位点提交：persistOffsetsOnce 把已消费位点写给 broker。
+        // offset commit: persistOffsetsOnce writes consumed offsets to the broker.
         $c->persistOffsetsOnce();
         $this->loadLog(getenv('RMQ_LOG'));
         $updates = $this->logWhere(RequestCode::UPDATE_CONSUMER_OFFSET, null, 'GID-C-CONS');
@@ -748,53 +751,54 @@ final class RunClientConsumer
         $this->checkSame(77, $commitByTopic['OTopic'] ?? -1, 'UPDATE_CONSUMER_OFFSET OTopic=77');
         $this->checkSame(3, $commitByTopic['FTopic'] ?? -1, 'UPDATE_CONSUMER_OFFSET FTopic=3');
 
-        // resetOffset（220 契约）：新位点 42 撤队列重建，之后空拉把位点修正回 3。
+        // resetOffset (220 contract): new offset 42 tears down and rebuilds queues; later empty pulls correct the offset back to 3.
         $c->resetOffset('CTopic', [['mq' => new MessageQueue('CTopic', 'b-cons', 0), 'offset' => 42]]);
         $this->loadLog(getenv('RMQ_LOG'));
         $resetUpdates = array_filter(
             $this->logWhere(RequestCode::UPDATE_CONSUMER_OFFSET, 'CTopic', 'GID-C-CONS'),
             static fn($u) => (int) $u['commitOffset'] === 42,
         );
-        $this->check($resetUpdates !== [], 'resetOffset 把新位点 42 提交给 broker');
+        $this->check($resetUpdates !== [], 'resetOffset commits the new offset 42 to the broker');
         $c->tick();
         $status = $c->getConsumerStatus('CTopic');
-        $this->checkSame(3, $status[0]['offset'] ?? -1, 'resetOffset 后空拉修正位点回到 3');
+        $this->checkSame(3, $status[0]['offset'] ?? -1, 'empty pulls correct the offset back to 3 after resetOffset');
 
-        // 实例鸭子类型契约：adjustThreadPool 是 no-op，corePoolSize 声明值可观测。
+        // instance duck-typing contract: adjustThreadPool is a no-op; declared corePoolSize is observable.
         $c->adjustThreadPool();
-        $this->checkSame(20, $c->getCorePoolSize(), 'corePoolSize 默认 20');
+        $this->checkSame(20, $c->getCorePoolSize(), 'corePoolSize defaults to 20');
 
         $this->cleanup($c);
     }
 
-    // ================================================================ 2b. Push 挂起/恢复（suspend/resume/isPause）
+    // ================================================================ 2b. Push suspend/resume (suspend/resume/isPause)
 
     /**
-     * 契约：suspend/resume 只翻转挂起标志、isPause 读该标志；挂起闸门只作用在
-     * PULL_MESSAGE / POP_MESSAGE 的发送入口（发送前先判 pause 标志）。
+     * Contract: suspend/resume only flips the pause flag, isPause reads it; the pause gate
+     * only applies at the PULL_MESSAGE / POP_MESSAGE send entry point (pause flag checked before sending).
      *
-     * 这里锁的是**顺序**而不是"停没停"：闸门必须落在盖章之后。放前面的话挂起超过
-     * PULL_MAX_IDLE_TIME（120s）就会让停摆判据把这条循环判死，rebalance 撤队列重建，
-     * 运维"暂停两分钟再恢复"实际换来一次整队列重投。PHP 单线程没有"线程死了"分支，
-     * 所以只有超时判据，这条竞态更容易被写错。
+     * What is locked here is **ordering**, not "did it stop": the gate must sit after the timestamp
+     * stamping. If placed before, a suspension longer than PULL_MAX_IDLE_TIME (120s) would make the
+     * stall detector kill this loop, rebalance would tear down and rebuild the queue, and an ops
+     * "pause two minutes then resume" would actually cost a full queue re-delivery. Single-threaded
+     * PHP has no "thread died" branch, so there is only the timeout criterion — this race is easy to get wrong.
      */
     private function testPushSuspendResume(ConsFakeBroker $broker): void
     {
-        // 常量：1000ms 挂起退避与 120s 停摆阈值，二者相差两个数量级才有意义。
+        // constants: 1000ms suspend backoff vs 120s stall threshold — two orders of magnitude apart for a reason.
         $this->checkSame(1.0, ConsumerDefaults::PULL_TIME_DELAY_WHEN_SUSPEND,
-            'PULL_TIME_DELAY_WHEN_SUSPEND = 默认 1000ms');
+            'PULL_TIME_DELAY_WHEN_SUSPEND = default 1000ms');
         $this->checkSame(120.0, ConsumerDefaults::PULL_MAX_IDLE_TIME, 'PULL_MAX_IDLE_TIME = 120s');
 
-        // 未 start 也必须安全（suspend/resume 不校验服务状态），且翻转幂等。
+        // must be safe without start (suspend/resume do not check service state), and flipping is idempotent.
         $idle = new DefaultMQPushConsumer('GID-SUS-IDLE');
         $idle->setInstanceName('CONS-SUS-IDLE');
-        $this->checkSame(false, $idle->isPaused(), '默认不挂起（初始 pause = false）');
+        $this->checkSame(false, $idle->isPaused(), 'not paused by default (initial pause = false)');
         $idle->suspend();
         $idle->suspend();
-        $this->checkSame(true, $idle->isPaused(), '重复 suspend 保持挂起');
+        $this->checkSame(true, $idle->isPaused(), 'repeated suspend stays paused');
         $idle->resume();
         $idle->resume();
-        $this->checkSame(false, $idle->isPaused(), '重复 resume 保持运行');
+        $this->checkSame(false, $idle->isPaused(), 'repeated resume stays running');
 
         $GLOBALS['RECV'] = [];
         $c = new DefaultMQPushConsumer('GID-SUS-CONS');
@@ -803,11 +807,11 @@ final class RunClientConsumer
         $c->setMessageListener(new ConsTopicListener([]));
         $c->subscribe('UTopic');
         $c->start();
-        $this->checkSame(1, $c->assignedQueueCount(), '挂起用例分到 1 个队列');
+        $this->checkSame(1, $c->assignedQueueCount(), 'suspend case gets 1 queue');
 
         try {
-            // 先把拉取跑起来：没有"原本在拉"这个前提，"停了"毫无意义。
-            // tick 次数不固定 —— 首轮 tick 可能花在 resolveInitialOffset 上而不是拉取上。
+            // get pulling going first: without the "was pulling" premise, "it stopped" means nothing.
+            // tick count is not fixed — the first tick may be spent on resolveInitialOffset instead of pulling.
             for ($i = 0; $i < 6; $i++) {
                 $c->tick();
                 usleep(200_000);
@@ -817,47 +821,47 @@ final class RunClientConsumer
                 }
             }
             $before = count($this->logWhere(RequestCode::PULL_MESSAGE, 'UTopic', 'GID-SUS-CONS'));
-            $this->check($before >= 2, "挂起前已有 PULL 请求（$before 笔）");
+            $this->check($before >= 2, "PULL requests already on the wire before suspending ($before entries)");
 
             $key = message_queue_key(new MessageQueue('UTopic', 'b-cons', 0));
             $stampBefore = $c->consumerRunningInfo()->mqTable[$key]['lastPullTimestamp'] ?? 0;
 
             $c->suspend();
-            $this->checkSame(true, $c->isPaused(), 'suspend 后 isPaused 为真');
+            $this->checkSame(true, $c->isPaused(), 'isPaused true after suspend');
 
             $baselinePulls = $before;
-            // 多个 tick、跨过 1s 挂起退避窗口：挂起期间一次网络都不许发。
+            // several ticks, crossing the 1s suspend backoff window: not one network write allowed while suspended.
             for ($i = 0; $i < 4; $i++) {
                 $c->tick();
                 usleep(300_000);
             }
             $this->loadLog(getenv('RMQ_LOG'));
             $this->checkSame($baselinePulls, count($this->logWhere(RequestCode::PULL_MESSAGE, 'UTopic', 'GID-SUS-CONS')),
-                '挂起期间不得再有 PULL_MESSAGE 上线（挂起闸门在发送入口生效）');
+                'no further PULL_MESSAGE on the wire while suspended (pause gate effective at the send entry)');
 
-            // 关键不变量：挂起 ≠ 停摆。时刻必须继续推进，否则 120s 判据会把队列撤掉。
+            // key invariant: suspended ≠ stalled. Timestamps must keep advancing, otherwise the 120s criterion tears the queue down.
             $stampAfter = $c->consumerRunningInfo()->mqTable[$key]['lastPullTimestamp'] ?? 0;
             $this->check($stampAfter > $stampBefore,
-                sprintf('挂起期间 lastPullTimestamp 必须继续推进（%d -> %d）：闸门在盖章之后',
+                sprintf('lastPullTimestamp must keep advancing while suspended (%d -> %d): gate sits after stamping',
                     $stampBefore, $stampAfter));
-            $this->checkSame(1, $c->assignedQueueCount(), '挂起不撤队列、不改分配');
+            $this->checkSame(1, $c->assignedQueueCount(), 'suspend does not tear down queues or change assignment');
             $this->checkSame($stampAfter,
                 $c->consumerRunningInfo()->mqTable[$key]['lastPullTimestamp'] ?? 0,
-                '挂起期间 307 运行信息读到的仍是推进中的时刻');
+                'the 307 running info still reads the advancing timestamp while suspended');
 
             $c->resume();
-            $this->checkSame(false, $c->isPaused(), 'resume 后回到运行态');
+            $this->checkSame(false, $c->isPaused(), 'back to running after resume');
             $c->tick();
             $this->loadLog(getenv('RMQ_LOG'));
             $after = count($this->logWhere(RequestCode::PULL_MESSAGE, 'UTopic', 'GID-SUS-CONS'));
             $this->check($after > $baselinePulls,
-                sprintf('resume 后自己重新发起拉取（%d -> %d）', $baselinePulls, $after));
+                sprintf('pulls resume on their own after resume (%d -> %d)', $baselinePulls, $after));
         } finally {
             $this->cleanup($c);
         }
     }
 
-    // ================================================================ 3. Push 顺序：锁队列 → 挂起重排 → 成功
+    // ================================================================ 3. Push orderly: lock queues -> suspend re-order -> success
 
     private function testPushOrderly(ConsFakeBroker $broker): void
     {
@@ -867,56 +871,58 @@ final class RunClientConsumer
         $c->setInstanceName('CONS-S');
         $c->setNameServerAddresses([$broker->addr]);
         $c->setMessageListener($listener);
-        $c->suspendCurrentQueueTimeMillis = 10; // 挂起重排周期钳到下限，测试不等 1s
-        $c->consumeMessageBatchMaxSize = 3;     // 整批投递：一次挂起/成功覆盖全部 3 条
+        $c->suspendCurrentQueueTimeMillis = 10; // clamp the suspend re-order period to the lower bound so the test does not wait 1s
+        $c->consumeMessageBatchMaxSize = 3;     // whole-batch delivery: one suspend/success covers all 3
         $c->subscribe('STopic');
         $c->start();
-        $this->checkSame(1, $c->assignedQueueCount(), '顺序消费 start 完成 rebalance');
+        $this->checkSame(1, $c->assignedQueueCount(), 'orderly start completes rebalance');
 
-        // 第一轮 tick：LOCK_BATCH_MQ → 拉取 → listener 挂起 → 批次塞回队首。
-        // 一趟 tick 能不能落地取决于假 broker 子进程何时被调度，机器忙时会整轮空转
-        // （锁没发、批没拉，后面一串断言全塌）。所以这里是闸门：在首次投递之前反复
-        // tick，一收到就停——不多跑一轮，"只跑一次"的断言因此仍然成立。
+        // first tick: LOCK_BATCH_MQ -> pull -> listener suspends -> batch pushed back to the queue head.
+        // Whether one tick lands depends on when the fake-broker child process gets scheduled; on a busy
+        // machine whole rounds may spin empty (no lock sent, no batch pulled, and every later assertion collapses).
+        // So this is a gate: tick repeatedly until the first delivery, then stop — no extra round is run,
+        // so the "runs exactly once" assertion still holds.
         for ($i = 0; $i < 8 && ($GLOBALS['RECV']['STopic'] ?? []) === []; $i++) {
             $c->tick();
         }
-        $this->checkSame(['order-0', 'order-1', 'order-2'], $GLOBALS['RECV']['STopic'] ?? [], '顺序首轮收到 3 条');
-        $this->checkSame(1, $listener->calls, '挂起路径 listener 只跑一次');
+        $this->checkSame(['order-0', 'order-1', 'order-2'], $GLOBALS['RECV']['STopic'] ?? [], 'orderly first round receives 3');
+        $this->checkSame(1, $listener->calls, 'listener runs exactly once on the suspend path');
         $sStatus = $c->getConsumerStatus('STopic');
-        $this->check($sStatus === [] || ($sStatus[0]['offset'] ?? -1) <= 0, '挂起期间位点不推进');
+        $this->check($sStatus === [] || ($sStatus[0]['offset'] ?? -1) <= 0, 'offset does not advance while suspended');
 
         $this->loadLog(getenv('RMQ_LOG'));
         $locks = $this->logWhere(RequestCode::LOCK_BATCH_MQ, null, 'GID-S-CONS');
-        $this->check($locks !== [], '顺序消费发起 LOCK_BATCH_MQ');
+        $this->check($locks !== [], 'orderly consumption issues LOCK_BATCH_MQ');
         $lockMqSet = $locks[0]['mqSet'] ?? [];
         $this->check($lockMqSet !== []
             && ($lockMqSet[0]['topic'] ?? '') === 'STopic'
             && ($lockMqSet[0]['brokerName'] ?? '') === 'b-cons',
-            '锁队列请求带 mqSet(topic/brokerName/queueId)');
-        $this->checkSame(MixAll::clientIdFor('CONS-S', null, false), $locks[0]['clientId'] ?? '', '锁队列带 clientId');
-        // 顺序消费不发生 CONSUMER_SEND_MSG_BACK（重试在本地原地重排）。
+            'lock request carries mqSet(topic/brokerName/queueId)');
+        $this->checkSame(MixAll::clientIdFor('CONS-S', null, false), $locks[0]['clientId'] ?? '', 'lock request carries clientId');
+        // orderly consumption never sends CONSUMER_SEND_MSG_BACK (retries are re-ordered locally in place).
         $this->checkSame([], $this->logWhere(RequestCode::CONSUMER_SEND_MSG_BACK, null, 'GID-S-CONS'),
-            '顺序挂起不回投');
+            'orderly suspend does not send back');
 
-        // 挂起到点：重排批次 → SUCCESS → 位点推进到 3。判据是"listener 跑到第二次"，
-        // 所以按闸门推进，不押一个固定时长窗口（下限 10ms 的挂起周期只是最早可能重排的时刻）。
+        // when the suspension period elapses: re-order the batch -> SUCCESS -> offset advances to 3. The criterion is
+        // "the listener ran a second time", so advance by gate rather than betting on a fixed time window
+        // (the 10ms-lower-bound suspend period is just the earliest possible re-order moment).
         for ($i = 0; $i < 20 && $listener->calls < 2; $i++) {
             usleep(20_000);
             $c->tick();
         }
-        $this->checkSame(2, $listener->calls, '重排后 listener 第二次执行');
+        $this->checkSame(2, $listener->calls, 'listener runs a second time after re-order');
         $this->checkSame(array_merge(['order-0', 'order-1', 'order-2'], ['order-0', 'order-1', 'order-2']),
-            $GLOBALS['RECV']['STopic'] ?? [], '同一批消息被原地重排重放');
-        $this->checkSame(3, ($c->getConsumerStatus('STopic')[0]['offset'] ?? -1), 'SUCCESS 后位点=3');
+            $GLOBALS['RECV']['STopic'] ?? [], 'the same batch is re-ordered and replayed in place');
+        $this->checkSame(3, ($c->getConsumerStatus('STopic')[0]['offset'] ?? -1), 'offset=3 after SUCCESS');
 
-        // shutdown 顺序消费要解锁（UNLOCK_BATCH_MQ）。
+        // orderly consumption must unlock on shutdown (UNLOCK_BATCH_MQ).
         $this->cleanup($c);
         $this->loadLog(getenv('RMQ_LOG'));
         $this->check($this->logWhere(RequestCode::UNLOCK_BATCH_MQ, null, 'GID-S-CONS') !== [],
-            'shutdown 发起 UNLOCK_BATCH_MQ');
+            'shutdown issues UNLOCK_BATCH_MQ');
     }
 
-    // ================================================================ 4. PullConsumer：手拉手管位点
+    // ================================================================ 4. PullConsumer: manual offset management
 
     private function testPullConsumer(ConsFakeBroker $broker): void
     {
@@ -925,77 +931,77 @@ final class RunClientConsumer
         $c->setNameServerAddresses([$broker->addr]);
         $c->registerTopic('DTopic');
         $c->start();
-        $this->check($c->mqClient !== null, 'pull start 后实例就绪');
+        $this->check($c->mqClient !== null, 'pull instance ready after start');
 
         $queues = $c->fetchSubscribeMessageQueues('DTopic');
-        $this->checkSame(1, count($queues), 'fetchSubscribeMessageQueues 1 条队列');
+        $this->checkSame(1, count($queues), 'fetchSubscribeMessageQueues returns 1 queue');
         $mq = $queues[0];
-        $this->checkSame('DTopic', $mq->topic, '队列 topic');
+        $this->checkSame('DTopic', $mq->topic, 'queue topic');
 
-        // 已提交位点（QUERY_CONSUMER_OFFSET → DTopic=7）。
+        // committed offset (QUERY_CONSUMER_OFFSET -> DTopic=7).
         $this->checkSame(7, $c->fetchConsumeOffset($mq), 'fetchConsumeOffset=7');
 
-        // 短轮询：suspend 位必须关（INVARIANTS B3：写 true 必现超时）。
+        // short polling: suspend bit must be off (INVARIANTS B3: writing true always times out).
         $r = $c->pull($mq, '*', 0);
         $this->checkSame(PullStatus::FOUND, $r->status, 'pull FOUND');
         $this->checkSame(5, $r->nextBeginOffset, 'pull nextBeginOffset=5');
-        $this->checkSame(1, count($r->msgFoundList), 'pull 拉回 1 条');
-        $this->checkSame('direct-4', $r->msgFoundList[0]->getBody(), 'pull 消息 body');
-        $this->checkSame(4, $r->msgFoundList[0]->queueOffset, 'pull 消息 queueOffset');
+        $this->checkSame(1, count($r->msgFoundList), 'pull brings back 1 message');
+        $this->checkSame('direct-4', $r->msgFoundList[0]->getBody(), 'pull message body');
+        $this->checkSame(4, $r->msgFoundList[0]->queueOffset, 'pull message queueOffset');
 
         $this->loadLog(getenv('RMQ_LOG'));
         $dpull = $this->logWhere(RequestCode::PULL_MESSAGE, 'DTopic', 'GID-P-CONS');
         $this->check($dpull !== [] && (int) $dpull[0]['sysFlag'] === PullSysFlag::FLAG_SUBSCRIPTION,
-            'pull sysFlag=4（短轮询 + 订阅位）');
+            'pull sysFlag=4 (short polling + subscription bit)');
 
-        // 长轮询：suspend 位必须开。
+        // long polling: suspend bit must be on.
         $rb = $c->pullBlockIfNotFound($mq, '*', 0, 32);
-        $this->checkSame(PullStatus::FOUND, $rb->status, 'pullBlockIfNotFound 也能解析');
+        $this->checkSame(PullStatus::FOUND, $rb->status, 'pullBlockIfNotFound parses too');
         $this->loadLog(getenv('RMQ_LOG'));
         $dpull = $this->logWhere(RequestCode::PULL_MESSAGE, 'DTopic', 'GID-P-CONS');
         $last = $dpull[count($dpull) - 1] ?? null;
         $this->check($last !== null && (int) $last['sysFlag'] === (PullSysFlag::FLAG_SUBSCRIPTION | PullSysFlag::FLAG_SUSPEND),
-            'pullBlockIfNotFound sysFlag=6（挂起位开）');
+            'pullBlockIfNotFound sysFlag=6 (suspend bit on)');
 
-        // 位点管理与运维查询。
+        // offset management and ops queries.
         $c->updateConsumeOffset($mq, 9);
         $this->loadLog(getenv('RMQ_LOG'));
         $upd = $this->logWhere(RequestCode::UPDATE_CONSUMER_OFFSET, 'DTopic', 'GID-P-CONS');
-        $this->check($upd !== [] && (int) $upd[0]['commitOffset'] === 9, 'updateConsumeOffset 提交 9');
+        $this->check($upd !== [] && (int) $upd[0]['commitOffset'] === 9, 'updateConsumeOffset commits 9');
         $this->checkSame(55, $c->searchOffset($mq, 1_700_000_000_000), 'searchOffset=55');
         $this->checkSame(100, $c->maxOffset($mq), 'maxOffset=100');
         $this->checkSame(0, $c->minOffset($mq), 'minOffset=0');
         $this->checkSame(1234567890000, $c->earliestMsgStoreTime($mq), 'earliestMsgStoreTime');
 
-        // 回投：delayLevel 调用方指定；maxReconsumeTimes 留 null 交给订阅组（有意差异）。
+        // send-back: delayLevel specified by the caller; maxReconsumeTimes left null for the subscription group (deliberate difference).
         $c->sendMessageBack($r->msgFoundList[0], 2);
         $this->loadLog(getenv('RMQ_LOG'));
         $backs = $this->logWhere(RequestCode::CONSUMER_SEND_MSG_BACK, null, 'GID-P-CONS');
-        $this->checkSame(1, count($backs), 'pull sendMessageBack 1 次');
-        $this->checkSame(2, (int) ($backs[0]['delayLevel'] ?? -1), '回投 delayLevel=2');
-        $this->checkSame(null, $backs[0]['maxReconsumeTimes'] ?? null, 'pull 回投 maxReconsumeTimes 不下发');
+        $this->checkSame(1, count($backs), 'pull sendMessageBack called once');
+        $this->checkSame(2, (int) ($backs[0]['delayLevel'] ?? -1), 'send-back delayLevel=2');
+        $this->checkSame(null, $backs[0]['maxReconsumeTimes'] ?? null, 'pull send-back does not send maxReconsumeTimes');
 
-        // fetchMessageQueuesInBalance：拉模式没有后台 rebalance，就按 rebalanceByTopic
-        // 同一条公式当场算出本实例负责的队列。
-        // 组里只有本实例（RMQ_CONSUMER_MAP 只登记了 CONS-P 一个 clientId）→ 全份都是我的。
+        // fetchMessageQueuesInBalance: pull mode has no background rebalance, so compute this instance's
+        // queues on the spot with the same formula as rebalanceByTopic.
+        // The group contains only this instance (RMQ_CONSUMER_MAP registers only CONS-P) -> the whole share is mine.
         $balanced = $c->fetchMessageQueuesInBalance('DTopic');
-        $this->checkSame(1, count($balanced), '平衡视图给出本实例负责的 1 条队列');
-        $this->checkSame('DTopic', $balanced[0]->topic ?? '', '平衡视图队列 topic');
-        $this->checkSame('b-cons', $balanced[0]->brokerName ?? '', '平衡视图队列 brokerName');
-        $this->checkSame(0, $balanced[0]->queueId ?? -1, '平衡视图队列 queueId');
-        // 查不到消费者列表时**保留现有分配**：换成没登记的组，
-        // 实际拉过的 DTopic 还在（本地记账），没拉过的 ETopic 必须是空 ——
-        // 绝不能回退成"独占全部队列"，否则同组多实例互相重复消费。
+        $this->checkSame(1, count($balanced), 'balanced view gives the 1 queue this instance owns');
+        $this->checkSame('DTopic', $balanced[0]->topic ?? '', 'balanced view queue topic');
+        $this->checkSame('b-cons', $balanced[0]->brokerName ?? '', 'balanced view queue brokerName');
+        $this->checkSame(0, $balanced[0]->queueId ?? -1, 'balanced view queue queueId');
+        // When the consumer list cannot be fetched, **keep the existing allocation**: switch to an unregistered group;
+        // DTopic was actually pulled from so it stays (local bookkeeping), while never-pulled ETopic must be empty —
+        // never fall back to "exclusive ownership of all queues", otherwise multiple instances in one group consume in duplicate.
         $group = $c->consumerGroup;
         $c->consumerGroup = 'GID-NO-MAP';
         $this->checkSame(['DTopic@b-cons@0'],
             array_map(static fn($mq) => "{$mq->topic}@{$mq->brokerName}@{$mq->queueId}",
                 $c->fetchMessageQueuesInBalance('DTopic')),
-            '列表查不到时退回本地 pullFromWhichNodeTable 键集');
+            'falls back to the local pullFromWhichNodeTable key set when the list is unavailable');
         $this->checkSame([], $c->fetchMessageQueuesInBalance('ETopic'),
-            '没拉过又查不到列表 → 空集（与首轮 rebalance 前的空表同语义）');
+            'never pulled and no list -> empty set (same semantics as the empty table before the first rebalance)');
         $c->consumerGroup = $group;
-        // 未启动的消费者一律拒绝（isRunning() 守卫）：新实例直接调用要抛。
+        // not-started consumers are always rejected (isRunning() guard): calling on a fresh instance must throw.
         $idle = new DefaultMQPullConsumer('GID-P-CONS');
         $idle->setNameServerAddresses([$broker->addr]);
         $threw = false;
@@ -1004,12 +1010,12 @@ final class RunClientConsumer
         } catch (MQClientException) {
             $threw = true;
         }
-        $this->check($threw, '未启动就取平衡视图 → MQClientException');
+        $this->check($threw, 'balanced view without start -> MQClientException');
 
         $this->cleanup($c);
     }
 
-    // ================================================================ 5. LitePull：assign 模式双游标 + commit + seek
+    // ================================================================ 5. LitePull: assign-mode dual cursors + commit + seek
 
     private function testLitePull(ConsFakeBroker $broker): void
     {
@@ -1017,73 +1023,73 @@ final class RunClientConsumer
         $c->setInstanceName('CONS-L');
         $c->setNamesrvAddr($broker->addr);
         $mq = new MessageQueue('LTopic', 'b-cons', 0);
-        $c->assign([$mq]); // start 前指派：初始位点解析失败被吞，tick 时再解析
+        $c->assign([$mq]); // assigned before start: initial offset resolution failure is swallowed and retried at tick time
         $c->start();
-        $this->check($c->isRunning(), 'lite start 后 running');
-        $this->checkSame([$mq], $c->assignment(), 'assignment 返回指派队列');
+        $this->check($c->isRunning(), 'lite running after start');
+        $this->checkSame([$mq], $c->assignment(), 'assignment returns the assigned queues');
 
-        // tick：LITE_PULL_MESSAGE 短轮询 → FOUND 2 条进缓冲。
+        // tick: LITE_PULL_MESSAGE short polling -> FOUND 2 into the buffer.
         $c->tick();
-        $this->checkSame(2, $c->pullCursorOf($mq), '拉取游标推进到 2');
-        $this->checkSame(-1, $c->consumeCursorOf($mq), 'poll 前已消费游标未动');
+        $this->checkSame(2, $c->pullCursorOf($mq), 'pull cursor advances to 2');
+        $this->checkSame(-1, $c->consumeCursorOf($mq), 'consume cursor untouched before poll');
 
-        // poll：交出缓冲并推进"已消费游标"（poll 只交出缓冲，拉取游标不动）。
+        // poll: hands out the buffer and advances the "consumed cursor" (poll only hands out the buffer; the pull cursor stays).
         $msgs = $c->poll(500);
-        $this->checkSame(['lite-0', 'lite-1'], array_map(static fn($m) => $m->getBody(), $msgs), 'poll 交出 2 条');
-        $this->checkSame(2, $c->consumeCursorOf($mq), 'poll 后已消费游标=2');
-        $this->checkSame(2, $c->pullCursorOf($mq), 'poll 不动拉取游标');
+        $this->checkSame(['lite-0', 'lite-1'], array_map(static fn($m) => $m->getBody(), $msgs), 'poll hands out 2 messages');
+        $this->checkSame(2, $c->consumeCursorOf($mq), 'consume cursor=2 after poll');
+        $this->checkSame(2, $c->pullCursorOf($mq), 'poll does not move the pull cursor');
 
-        // commit：把"已消费游标"提交给 broker。
+        // commit: commits the "consumed cursor" to the broker.
         $c->commit();
         $this->loadLog(getenv('RMQ_LOG'));
         $upd = $this->logWhere(RequestCode::UPDATE_CONSUMER_OFFSET, 'LTopic', 'GID-L-CONS');
-        $this->check($upd !== [] && (int) $upd[0]['commitOffset'] === 2, 'commit 提交位点 2');
-        $this->checkSame(2, $c->committed($mq), 'committed 读内存位点表');
-        $this->checkSame(2, $c->pendingCommitOf($mq), 'pendingCommit 暴露内存提交位');
+        $this->check($upd !== [] && (int) $upd[0]['commitOffset'] === 2, 'commit commits offset 2');
+        $this->checkSame(2, $c->committed($mq), 'committed reads the in-memory offset table');
+        $this->checkSame(2, $c->pendingCommitOf($mq), 'pendingCommit exposes the in-memory commit position');
 
-        // 指定位点 commit（Map 重载）：只改提交位置，不动游标。
+        // explicit-offset commit (Map overload): only changes the commit position, not the cursors.
         $c->commit([$mq->topic . $mq->brokerName . '0' => 1], true);
         $this->loadLog(getenv('RMQ_LOG'));
         $upd = $this->logWhere(RequestCode::UPDATE_CONSUMER_OFFSET, 'LTopic', 'GID-L-CONS');
         $lastCommit = (int) ($upd[count($upd) - 1]['commitOffset'] ?? -1);
-        $this->checkSame(1, $lastCommit, 'commit(Map) 提交指定位点 1');
-        $this->checkSame(2, $c->pullCursorOf($mq), 'commit(Map) 不动拉取游标');
-        $this->checkSame(2, $c->consumeCursorOf($mq), 'commit(Map) 不动已消费游标');
+        $this->checkSame(1, $lastCommit, 'commit(Map) commits the explicit offset 1');
+        $this->checkSame(2, $c->pullCursorOf($mq), 'commit(Map) does not move the pull cursor');
+        $this->checkSame(2, $c->consumeCursorOf($mq), 'commit(Map) does not move the consume cursor');
 
-        // seek：三张游标一起拨回去，下一轮拉取从新位点出发。
+        // seek: rewinds all three cursors; the next pull round starts from the new offset.
         $c->seek($mq, 1);
-        $this->checkSame(1, $c->pullCursorOf($mq), 'seek 拨回拉取游标');
-        $this->checkSame(1, $c->consumeCursorOf($mq), 'seek 拨回已消费游标');
+        $this->checkSame(1, $c->pullCursorOf($mq), 'seek rewinds the pull cursor');
+        $this->checkSame(1, $c->consumeCursorOf($mq), 'seek rewinds the consume cursor');
         $c->tick();
-        $this->checkSame(2, $c->pullCursorOf($mq), 'seek 后空拉把拉取游标推回 next=2');
+        $this->checkSame(2, $c->pullCursorOf($mq), 'empty pull after seek pushes the pull cursor back to next=2');
 
-        // pause/resume：暂停期间不发起拉取。
+        // pause/resume: no pulling while paused.
         $this->loadLog(getenv('RMQ_LOG'));
         $litePullsBefore = count($this->logWhere(RequestCode::LITE_PULL_MESSAGE, 'LTopic', 'GID-L-CONS'));
         $c->pause([$mq]);
         $c->tick();
         $this->loadLog(getenv('RMQ_LOG'));
         $litePullsPaused = count($this->logWhere(RequestCode::LITE_PULL_MESSAGE, 'LTopic', 'GID-L-CONS'));
-        $this->checkSame($litePullsBefore, $litePullsPaused, 'pause 期间不拉取');
+        $this->checkSame($litePullsBefore, $litePullsPaused, 'no pulling while paused');
         $c->resume([$mq]);
         $c->tick();
         $this->loadLog(getenv('RMQ_LOG'));
         $litePullsResumed = count($this->logWhere(RequestCode::LITE_PULL_MESSAGE, 'LTopic', 'GID-L-CONS'));
-        $this->checkSame($litePullsBefore + 1, $litePullsResumed, 'resume 后恢复拉取');
+        $this->checkSame($litePullsBefore + 1, $litePullsResumed, 'pulling resumes after resume');
 
-        // LITE_PULL 线上行为：lite 位必须置上、suspend 位必须关。
+        // LITE_PULL wire behavior: the lite bit must be set and the suspend bit must be off.
         $liteReq = $this->logWhere(RequestCode::LITE_PULL_MESSAGE, 'LTopic', 'GID-L-CONS');
-        $this->check($liteReq !== [], 'lite 走 LITE_PULL_MESSAGE 请求码');
+        $this->check($liteReq !== [], 'lite uses the LITE_PULL_MESSAGE request code');
         foreach ($liteReq as $e) {
-            $this->check(((int) $e['sysFlag'] & PullSysFlag::FLAG_LITE_PULL_MESSAGE) !== 0, 'lite 位置上');
-            $this->check(((int) $e['sysFlag'] & PullSysFlag::FLAG_SUSPEND) === 0, 'lite 短轮询 suspend 位关');
+            $this->check(((int) $e['sysFlag'] & PullSysFlag::FLAG_LITE_PULL_MESSAGE) !== 0, 'lite bit set');
+            $this->check(((int) $e['sysFlag'] & PullSysFlag::FLAG_SUSPEND) === 0, 'lite short-polling suspend bit off');
         }
 
-        // SimpleMessageListener 包装 callable。
+        // SimpleMessageListener wraps a callable.
         $l = new SimpleMessageListener(static fn(array $ms) => ConsumeConcurrentlyStatus::CONSUME_SUCCESS);
         $ctx = new ConsumeConcurrentlyContext($mq);
         $this->checkSame(ConsumeConcurrentlyStatus::CONSUME_SUCCESS,
-            $l->consumeMessage([], $ctx), 'SimpleMessageListener 透传 callable');
+            $l->consumeMessage([], $ctx), 'SimpleMessageListener passes the callable through');
 
         $this->cleanup($c);
     }
@@ -1094,7 +1100,7 @@ final class RunClientConsumer
     {
         $this->testConsumerSupportUnit();
 
-        // ---- 网络用例：起假 broker + 日志/消费者列表文件 ----
+        // ---- network cases: start the fake broker + log/consumer-list files ----
         $tmpDir = sys_get_temp_dir() . '/rmq-cons-test-' . getmypid();
         if (!is_dir($tmpDir)) {
             @mkdir($tmpDir, 0777, true);
@@ -1103,7 +1109,7 @@ final class RunClientConsumer
         $groupMapPath = $tmpDir . '/groups.json';
         @unlink($logPath);
         putenv("RMQ_LOG={$logPath}");
-        // 消费者列表按组隔离：每个组只含自己的 clientId（顺序必须与客户端一致）。
+        // consumer list isolated per group: each group contains only its own clientId (order must match the client).
         $groupMap = [
             'GID-C-CONS' => [MixAll::clientIdFor('CONS-C', null, false)],
             'GID-S-CONS' => [MixAll::clientIdFor('CONS-S', null, false)],

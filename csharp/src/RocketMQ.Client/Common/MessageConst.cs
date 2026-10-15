@@ -1,4 +1,4 @@
-// ⚠ 这些键名是**协议的一部分**：broker/客户端按字面匹配，改一个字母就静默丢属性。
+// WARNING: These key names are part of the protocol: broker/client match them literally; changing even one letter silently drops the property.
 namespace RocketMQ.Common;
 
 public static class MessageConst
@@ -20,7 +20,7 @@ public static class MessageConst
     public const string PropertyCheckImmunityTimeInSeconds = "CHECK_IMMUNITY_TIME_IN_SECONDS";
     public const string PropertyReconsumeTime = "RECONSUME_TIME";
     public const string PropertyMsgRegion = "MSG_REGION";
-    /// <summary>broker 在 SEND 响应里用 TRACE_ON 决定是否落轨迹（"false" 表示关闭，其余为真）。</summary>
+    /// <summary>The broker uses TRACE_ON in the SEND response to decide whether to record the trace ("false" means off; anything else means on).</summary>
     public const string PropertyTraceSwitch = "TRACE_ON";
     public const string PropertyUniqClientMessageIdKeyidx = "UNIQ_KEY";
     public const string PropertyMaxReconsumeTimes = "MAX_RECONSUME_TIMES";
@@ -73,8 +73,8 @@ public static class MessageConst
     public const int CharacterMaxLength = 255;
     public const string MessageIdPrefix = "MSGID-";
 
-    // 索引查询类型（对应 MessageConst.INDEX_KEY_TYPE / INDEX_UNIQUE_TYPE / INDEX_TAG_TYPE）。
-    // broker 的 QueryMessageRequestHeader.indexType 取这些值；为空时 broker 按 "K" 处理。
+    // Index query types (corresponding to MessageConst.INDEX_KEY_TYPE / INDEX_UNIQUE_TYPE / INDEX_TAG_TYPE).
+    // The broker's QueryMessageRequestHeader.indexType takes these values; when empty the broker treats it as "K".
     public const string IndexKeyType = "K";
     public const string IndexUniqueType = "U";
     public const string IndexTagType = "T";

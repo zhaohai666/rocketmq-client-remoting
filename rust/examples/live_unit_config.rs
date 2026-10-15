@@ -1,25 +1,25 @@
-//! unitName / unitMode / enableStreamRequestType 对**真实 5.5.1 broker** 的联调验证。
+//! Integration verification of unitName / unitMode / enableStreamRequestType against a **real 5.5.1 broker**.
 //!
-//! 这三项里 unitName 和 unitMode 都不该只在客户端自 high —— broker 侧有可观测
-//! 后果，所以全部用真机断言：
-//! - U1 `unitName` 进 clientId（`ip@instanceName@unitName`），且不影响发送；
-//!   不设 unitName 时 clientId 不能凭空多出一段。
-//! - U2 消费者带 `@unitName@STREAM` 时，**broker 回读到的 clientId 就是这个值**
-//!   （`GET_CONSUMER_CONNECTION_LIST`），证明后缀不是客户端单方面加工的；
-//!   同时消息照常投递。
-//! - U3 `unitMode=true` 发到新 topic：broker 走 `AbstractSendMessageProcessor:485-497`
-//!   的 `buildSysFlag(true, false)`，自动建出来的 topic sysFlag 带 UNIT 位（0x1）；
-//!   `unitMode=false` 的对照组不带 —— 这是 unitMode 真正上线的唯一证据。
-//! - U4 `unitMode=true` 的消费者心跳：`ClientManageProcessor:111-116` 用
-//!   `buildSysFlag(false, true)` 建 `%RETRY%` topic，sysFlag 带 UNIT_SUB 位（0x2）。
-//! - U5 `enableStreamRequestType=true` 时每个请求带 `ReqT=0`，普通 broker 忽略它，
-//!   发送与拉取都照常成功（lite 消费者默认就开着 stream，这里当对照组用）。
+//! Of these three knobs, unitName and unitMode must not stay client-side only -- the broker side has
+//! observable consequences, so every assertion below runs against the real machine:
+//! - U1 `unitName` joins the clientId (`ip@instanceName@unitName`) and does not affect sending;
+//!   without unitName the clientId must not grow an extra segment out of nowhere.
+//! - U2 when the consumer carries `@unitName@STREAM`, **the clientId read back from the broker is exactly that value**
+//!   (`GET_CONSUMER_CONNECTION_LIST`), proving the suffix is not something the client fabricated on its own;
+//!   messages are delivered as usual at the same time.
+//! - U3 sending with `unitMode=true` to a new topic: the broker goes through `AbstractSendMessageProcessor:485-497`
+//!   `buildSysFlag(true, false)`, so the auto-created topic sysFlag carries the UNIT bit (0x1);
+//!   the `unitMode=false` control does not -- the only evidence that unitMode really took effect.
+//! - U4 the heartbeat of a `unitMode=true` consumer: `ClientManageProcessor:111-116` uses
+//!   `buildSysFlag(false, true)` to create the `%RETRY%` topic, whose sysFlag carries the UNIT_SUB bit (0x2).
+//! - U5 with `enableStreamRequestType=true` every request carries `ReqT=0`, which a normal broker ignores;
+//!   sending and pulling both succeed as usual (the lite consumer has stream on by default, used here as a control).
 //!
 //!
-//! 前置：NameServer + Broker 已起，`autoCreateTopicEnable=true`、
-//! `autoCreateSubscriptionGroup=true`。
+//! Prerequisites: NameServer + Broker running, with `autoCreateTopicEnable=true` and
+//! `autoCreateSubscriptionGroup=true`.
 //!
-//! 用法：
+//! Usage:
 //! ```text
 //! cargo run --example live_unit_config -- 127.0.0.1:9876
 //! ```
@@ -42,18 +42,18 @@ use rocketmq_client_remoting::common::message::{Message, MessageExt};
 use rocketmq_client_remoting::common::mix_all::MixAll;
 use rocketmq_client_remoting::remoting::protocol::heartbeat::ConsumeFromWhere;
 
-/// 集群探活与「等 broker 侧结果落地」的默认预算（秒）。
+/// Default budget (seconds) for cluster probing and for "waiting for broker-side results to land".
 const WAIT_SECONDS: u64 = 30;
 const FLAG_UNIT: i32 = 0x1 << 0;
 const FLAG_UNIT_SUB: i32 = 0x1 << 1;
 
-// ------------------------------------------------------------------ 骨架
+// ------------------------------------------------------------------ skeleton
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 断言累积器：跑完全部场景再汇总，首个失败不提前退出。
+/// Assertion accumulator: runs every scenario before summing up; the first failure does not exit early.
 struct Checker {
     passed: u32,
     failed: Vec<String>,
@@ -83,7 +83,7 @@ impl Checker {
     }
 }
 
-/// 只记 body 的并发 listener（U2 要证明带 `@STREAM` 的clientId 也能正常收消息）。
+/// Concurrency listener that only records bodies (U2 needs to prove that a clientId carrying `@STREAM` still receives messages normally).
 #[derive(Default)]
 struct Inbox {
     bodies: Mutex<Vec<String>>,
@@ -119,7 +119,7 @@ struct Env {
     ip: String,
     admin: DefaultMQAdminExt,
     broker_addr: Mutex<String>,
-    /// 本次建的 topic / 订阅组，末尾统一删掉，别把开发 broker 越堆越满。
+    /// Topics / subscription groups created by this run, all deleted at the end so the dev broker does not keep piling up.
     topics: Mutex<Vec<String>>,
     groups: Mutex<Vec<String>>,
 }
@@ -163,12 +163,12 @@ impl Env {
         lock(&self.broker_addr).clone()
     }
 
-    /// 生产者的唯一 clientId 片段（同 clientId 会共享 MQClientInstance）。
+    /// The producer's unique clientId fragment (the same clientId shares one MQClientInstance).
     fn instance(&self, kind: &str) -> String {
         format!("uc-{kind}-{}", self.stamp)
     }
 
-    /// 集群探活：端口开着 != broker 已注册到 namesrv，所以轮询。
+    /// Cluster probe: an open port != the broker being registered with the namesrv, so poll.
     async fn start(&self, ck: &mut Checker) -> bool {
         if let Err(e) = self.admin.start().await {
             ck.abort("admin start", &e.to_string());
@@ -179,19 +179,19 @@ impl Env {
             if let Ok(info) = self.admin.fetch_broker_cluster_info().await {
                 if let Some(first) = info.get_broker_addrs().first() {
                     *lock(&self.broker_addr) = first.clone();
-                    ck.check("集群探活", true, &format!("broker={first}"));
+                    ck.check("cluster probe", true, &format!("broker={first}"));
                     return true;
                 }
             }
             if Instant::now() >= deadline {
-                ck.abort("集群探活", "nameServer 在预算内没有返回任何 broker");
+                ck.abort("cluster probe", "name server returned no broker within the budget");
                 return false;
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
 
-    /// 起一个只配了这三项旋钮的生产者。
+    /// Spin up a producer configured with only these three knobs.
     fn make_producer(
         &self,
         kind: &str,
@@ -211,10 +211,10 @@ impl Env {
         .map_err(|e| e.to_string())
     }
 
-    /// 用一个独立的生产者发一条消息（预热与对照组都走这里）。
+    /// Send one message with a dedicated producer (warmup and control both go through here).
     ///
-    /// `unit_mode` 必须能传进来：U3 验的就是它，固定发 false 会让 broker 侧
-    /// 永远建不出 UNIT 位，测试假失败。
+    /// `unit_mode` must be passed in: U3 verifies exactly this; hardcoding false would keep the broker
+    /// from ever creating the UNIT bit and make the test fail spuriously.
     async fn send_as(&self, kind: &str, unit_mode: bool, topic: &str, body: &str) -> Result<(), String> {
         let producer = self.make_producer(&format!("{kind}-{body}"), None, unit_mode, false)?;
         producer.start().await.map_err(|e| e.to_string())?;
@@ -224,16 +224,16 @@ impl Env {
         sent.map(|_| ()).map_err(|e| e.to_string())
     }
 
-    /// 默认（unitMode=false）发一条，用于预热和待验消息。
+    /// Send one message with the default (unitMode=false), used for warmup and for the message under test.
     async fn send(&self, topic: &str, body: &str) -> Result<(), String> {
         self.send_as("plain", false, topic, body).await
     }
 }
 
-// ------------------------------------------------------- 通用等待助手
+// ------------------------------------------------------- generic wait helpers
 
-/// 新 topic 要等 broker 把它注册到 namesrv（默认 30s 一轮）才有独立路由；
-/// 路由可见之后客户端的心跳才会覆盖到这个 broker。
+/// A new topic needs the broker to register it with the namesrv (one sweep every 30s by default) before it has its own route;
+/// only after the route is visible do the client's heartbeats cover that broker.
 async fn wait_route_visible(env: &Env, topic: &str, secs: u64) -> bool {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
@@ -249,7 +249,7 @@ async fn wait_route_visible(env: &Env, topic: &str, secs: u64) -> bool {
     }
 }
 
-/// 读回 broker 上该 topic 的 sysFlag；不存在时 None。
+/// Read back the topic's sysFlag on the broker; None when it does not exist.
 async fn sys_flag(env: &Env, topic: &str) -> Option<i32> {
     env.admin
         .examine_topic_config(&env.broker(), topic)
@@ -258,7 +258,7 @@ async fn sys_flag(env: &Env, topic: &str) -> Option<i32> {
         .map(|cfg| cfg.topic_sys_flag)
 }
 
-/// 等 topic 建出来且带上 `want` 位；返回最后一次读到的 sysFlag 供断言打印。
+/// Wait until the topic exists and carries the `want` bit; return the last sysFlag read for assertion printing.
 async fn wait_flag(env: &Env, topic: &str, want: i32, secs: u64) -> Option<i32> {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
@@ -277,7 +277,7 @@ async fn u1_unit_name_in_client_id(ck: &mut Checker, env: &Env) {
     let producer = match env.make_producer("u1", Some("unitA"), false, false) {
         Ok(p) => p,
         Err(e) => {
-            ck.abort("U1 构造", &e);
+            ck.abort("U1 build", &e);
             return;
         }
     };
@@ -288,42 +288,42 @@ async fn u1_unit_name_in_client_id(ck: &mut Checker, env: &Env) {
     let expect = format!("{}@uc-u1-{}@unitA", env.ip, env.stamp);
     let got = producer.client_id().unwrap_or_default();
     ck.check(
-        "U1 producer clientId 带 unitName",
+        "U1 producer clientId carries unitName",
         got == expect,
-        &format!("{got} (期望 {expect})"),
+        &format!("{got} (expected {expect})"),
     );
     let mut msg = Message::new(&topic, Some(b"u1-body"));
     match producer.send(&mut msg, Some(5000), None).await {
         Ok(r) => {
             let msg_id = r.msg_id.unwrap_or_default();
             ck.check(
-                "U1 unitName 客户端发送成功",
+                "U1 sending with unitName succeeds",
                 !msg_id.is_empty(),
                 &format!("msgId={msg_id}"),
             );
         }
-        Err(e) => ck.abort("U1 unitName 客户端发送成功", &e.to_string()),
+        Err(e) => ck.abort("U1 sending with unitName succeeds", &e.to_string()),
     }
     producer.shutdown();
 
-    // 对照：不设 unitName 时 clientId 不能凭空多出一段
+    // Control: without unitName the clientId must not grow an extra segment out of nowhere
     let plain = match env.make_producer("u1b", None, false, false) {
         Ok(p) => p,
         Err(e) => {
-            ck.abort("U1 对照构造", &e);
+            ck.abort("U1 control build", &e);
             return;
         }
     };
     if let Err(e) = plain.start().await {
-        ck.abort("U1 对照 start", &e.to_string());
+        ck.abort("U1 control start", &e.to_string());
         return;
     }
     let expect2 = format!("{}@uc-u1b-{}", env.ip, env.stamp);
     let got2 = plain.client_id().unwrap_or_default();
     ck.check(
-        "U1 对照：无 unitName 不拼后缀",
+        "U1 control: no unitName means no suffix appended",
         got2 == expect2,
-        &format!("{got2} (期望 {expect2})"),
+        &format!("{got2} (expected {expect2})"),
     );
     plain.shutdown();
 }
@@ -333,13 +333,13 @@ async fn u1_unit_name_in_client_id(ck: &mut Checker, env: &Env) {
 async fn u2_broker_sees_unit_and_stream(ck: &mut Checker, env: &Env) {
     let topic = env.topic("Conn");
     let group = env.group("conn");
-    // 先造出 topic 并等路由可见，否则消费者路由表为空 → 零心跳 → broker 侧查不到连接。
+    // Create the topic first and wait for its route to be visible, otherwise the consumer's route table is empty → zero heartbeats → the broker side finds no connection.
     if let Err(e) = env.send(&topic, "u2-warmup").await {
-        ck.abort("U2 预热发送", &e);
+        ck.abort("U2 warmup send", &e);
         return;
     }
     if !wait_route_visible(env, &topic, WAIT_SECONDS).await {
-        ck.abort("U2 预热 topic 路由可见", "路由在预算内没出现");
+        ck.abort("U2 warmup topic route visible", "route did not appear within the budget");
         return;
     }
 
@@ -349,14 +349,14 @@ async fn u2_broker_sees_unit_and_stream(ck: &mut Checker, env: &Env) {
         instance_name: env.instance("u2"),
         name_server_addrs: vec![env.namesrv.clone()],
         unit_name: Some("unitA".to_string()),
-        // 推送消费者默认关 stream，这里显式开，验的是「开了就上线」
+        // The push consumer has stream off by default; turn it on explicitly here: what we verify is "on means live"
         enable_stream_request_type: true,
         consume_from_where: ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET.to_string(),
         ..Default::default()
     }) {
         Ok(c) => c,
         Err(e) => {
-            ck.abort("U2 消费者构造", &e.to_string());
+            ck.abort("U2 consumer build", &e.to_string());
             return;
         }
     };
@@ -372,12 +372,12 @@ async fn u2_broker_sees_unit_and_stream(ck: &mut Checker, env: &Env) {
     let expect = format!("{}@uc-u2-{}@unitA@STREAM", env.ip, env.stamp);
     let local = consumer.client_id();
     ck.check(
-        "U2 本地 clientId",
+        "U2 local clientId",
         local == expect,
-        &format!("{local} (期望 {expect})"),
+        &format!("{local} (expected {expect})"),
     );
     if let Err(e) = env.send(&topic, "u2-body").await {
-        ck.abort("U2 发送待验消息", &e);
+        ck.abort("U2 send message under test", &e);
         consumer.shutdown();
         return;
     }
@@ -386,12 +386,12 @@ async fn u2_broker_sees_unit_and_stream(ck: &mut Checker, env: &Env) {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     ck.check(
-        "U2 带 @STREAM 后缀的消费者能收到消息",
+        "U2 a consumer with the @STREAM suffix receives messages",
         inbox.count("u2-body") >= 1,
         &format!("got={:?}", inbox.snapshot()),
     );
 
-    // broker 回读：clientId 是心跳里带上来的原值，客户端没有单方面加工。
+    // Read back from the broker: the clientId is the original value carried in the heartbeat; the client did not fabricate anything.
     let mut ids: Vec<String> = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(WAIT_SECONDS);
     loop {
@@ -415,7 +415,7 @@ async fn u2_broker_sees_unit_and_stream(ck: &mut Checker, env: &Env) {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     ck.check(
-        "U2 broker 看到的 clientId 含 @unitA@STREAM",
+        "U2 the clientId seen by the broker contains @unitA@STREAM",
         ids.iter().any(|i| i.ends_with("@unitA@STREAM")),
         &format!("brokerIds={ids:?}"),
     );
@@ -427,22 +427,22 @@ async fn u2_broker_sees_unit_and_stream(ck: &mut Checker, env: &Env) {
 async fn u3_unit_mode_sets_topic_unit_flag(ck: &mut Checker, env: &Env) {
     let t_on = env.topic("On");
     let t_off = env.topic("Off");
-    // 发送链路里 broker 同步建 topic，但配置落地要一点点时间
+    // On the send path the broker creates the topic synchronously, but the config takes a moment to land
     if let Err(e) = env.send_as("u3-on", true, &t_on, "u3-on").await {
-        ck.abort("U3 unitMode=true 发送", &e);
+        ck.abort("U3 unitMode=true send", &e);
         return;
     }
     if let Err(e) = env.send_as("u3-off", false, &t_off, "u3-off").await {
-        ck.abort("U3 unitMode=false 发送", &e);
+        ck.abort("U3 unitMode=false send", &e);
         return;
     }
     let on = wait_flag(env, &t_on, FLAG_UNIT, WAIT_SECONDS).await;
     ck.check(
-        "U3 unitMode=true 建的 topic 带 UNIT 位",
+        "U3 the topic created with unitMode=true carries the UNIT bit",
         on.is_some_and(|f| f & FLAG_UNIT == FLAG_UNIT),
         &format!("sysFlag={on:?}"),
     );
-    // 对照组：等它建出来（不带 UNIT 位），别把「还没建」当成「不带」
+    // Control: wait for it to be created (without the UNIT bit); do not mistake "not yet created" for "created without the bit"
     let deadline = Instant::now() + Duration::from_secs(WAIT_SECONDS);
     let mut off = sys_flag(env, &t_off).await;
     while off.is_none() && Instant::now() < deadline {
@@ -450,7 +450,7 @@ async fn u3_unit_mode_sets_topic_unit_flag(ck: &mut Checker, env: &Env) {
         off = sys_flag(env, &t_off).await;
     }
     ck.check(
-        "U3 unitMode=false 的对照 topic 不带 UNIT 位",
+        "U3 the unitMode=false control topic does not carry the UNIT bit",
         off.is_some_and(|f| f & FLAG_UNIT == 0),
         &format!("sysFlag={off:?}"),
     );
@@ -461,13 +461,13 @@ async fn u3_unit_mode_sets_topic_unit_flag(ck: &mut Checker, env: &Env) {
 async fn u4_heartbeat_sets_retry_unit_sub(ck: &mut Checker, env: &Env) {
     let topic = env.topic("Retry");
     let group = env.group("hb");
-    // 顺序必须是「先发消息，再起消费者」：心跳只发给路由表里已知的 broker。
+    // The order must be "send a message first, then start the consumer": heartbeats only go to brokers already known to the route table.
     if let Err(e) = env.send(&topic, "u4-warmup").await {
-        ck.abort("U4 预热发送", &e);
+        ck.abort("U4 warmup send", &e);
         return;
     }
     if !wait_route_visible(env, &topic, WAIT_SECONDS).await {
-        ck.abort("U4 预热 topic 路由可见", "路由在预算内没出现");
+        ck.abort("U4 warmup topic route visible", "route did not appear within the budget");
         return;
     }
     let consumer = match DefaultMQPushConsumer::with_config(ConsumerConfig {
@@ -479,7 +479,7 @@ async fn u4_heartbeat_sets_retry_unit_sub(ck: &mut Checker, env: &Env) {
     }) {
         Ok(c) => c,
         Err(e) => {
-            ck.abort("U4 消费者构造", &e.to_string());
+            ck.abort("U4 consumer build", &e.to_string());
             return;
         }
     };
@@ -492,11 +492,11 @@ async fn u4_heartbeat_sets_retry_unit_sub(ck: &mut Checker, env: &Env) {
         ck.abort("U4 consumer start", &e.to_string());
         return;
     }
-    // 心跳在 start() 里同步发一次；失败会被 debug 吞掉，所以只看 broker 侧结果
+    // The heartbeat is sent synchronously once inside start(); failures are swallowed at debug level, so only look at the broker-side result
     let retry_topic = MixAll::get_retry_topic(&group);
     let flag = wait_flag(env, &retry_topic, FLAG_UNIT_SUB, WAIT_SECONDS).await;
     ck.check(
-        "U4 unitMode=true 的 %RETRY% topic 带 UNIT_SUB 位",
+        "U4 the %RETRY% topic created with unitMode=true carries the UNIT_SUB bit",
         flag.is_some_and(|f| f & FLAG_UNIT_SUB == FLAG_UNIT_SUB),
         &format!("sysFlag={flag:?}"),
     );
@@ -511,7 +511,7 @@ async fn u5_stream_requests_still_work(ck: &mut Checker, env: &Env) {
     let producer = match env.make_producer("u5p", None, false, true) {
         Ok(p) => p,
         Err(e) => {
-            ck.abort("U5 构造", &e);
+            ck.abort("U5 build", &e);
             return;
         }
     };
@@ -521,7 +521,7 @@ async fn u5_stream_requests_still_work(ck: &mut Checker, env: &Env) {
     }
     let cid = producer.client_id().unwrap_or_default();
     ck.check(
-        "U5 开启 stream 的 producer clientId 带 @STREAM",
+        "U5 the stream-enabled producer clientId carries @STREAM",
         cid.ends_with("@STREAM"),
         &cid,
     );
@@ -533,11 +533,11 @@ async fn u5_stream_requests_still_work(ck: &mut Checker, env: &Env) {
             Err(e) => println!("  [WARN] send u5-{i} failed: {e}"),
         }
     }
-    ck.check("U5 每个请求都带 ReqT=0 时发送正常", sent == 3, &format!("sent={sent}"));
+    ck.check("U5 sending works with ReqT=0 on every request", sent == 3, &format!("sent={sent}"));
     producer.shutdown();
 
     if !wait_route_visible(env, &topic, WAIT_SECONDS).await {
-        ck.abort("U5 topic 路由可见", "路由在预算内没出现");
+        ck.abort("U5 topic route visible", "route did not appear within the budget");
         return;
     }
     let lite = match DefaultLitePullConsumer::with_config(LitePullConsumerConfig {
@@ -550,7 +550,7 @@ async fn u5_stream_requests_still_work(ck: &mut Checker, env: &Env) {
     }) {
         Ok(c) => c,
         Err(e) => {
-            ck.abort("U5 lite 构造", &e.to_string());
+            ck.abort("U5 lite build", &e.to_string());
             return;
         }
     };
@@ -561,11 +561,11 @@ async fn u5_stream_requests_still_work(ck: &mut Checker, env: &Env) {
     }
     let lite_cid = lite.client_id();
     ck.check(
-        "U5 轻量消费者 clientId 默认带 @STREAM",
+        "U5 the lite consumer clientId carries @STREAM by default",
         lite_cid.ends_with("@STREAM"),
         &lite_cid,
     );
-    // poll() 会把本地缓冲一次性排空，所以要跨多次 poll 累加
+    // poll() drains the local buffer in one go, so accumulate across multiple polls
     let mut bodies: Vec<String> = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(WAIT_SECONDS);
     while bodies.len() < 3 && Instant::now() < deadline {
@@ -576,18 +576,18 @@ async fn u5_stream_requests_still_work(ck: &mut Checker, env: &Env) {
     }
     let ok = (0..3).all(|i| bodies.iter().any(|b| b == &format!("u5-{i}")));
     ck.check(
-        "U5 每个请求都带 ReqT=0 时拉取仍正常",
+        "U5 pulling still works with ReqT=0 on every request",
         ok,
         &format!("bodies={bodies:?}"),
     );
     lite.shutdown();
 }
 
-// ------------------------------------------------------------------ 清理
+// ------------------------------------------------------------------ cleanup
 
 async fn cleanup(ck: &mut Checker, env: &Env) {
-    // 先把清单取出来再删：`lock(..).clone()` 直接写在 for 头部会让 MutexGuard
-    // 横跨整个循环体（含 await 点）。
+    // Take the lists out before deleting: writing `lock(..).clone()` directly in the for header would keep the MutexGuard
+    // alive across the whole loop body (including await points).
     let topics: Vec<String> = lock(&env.topics).clone();
     let groups: Vec<String> = lock(&env.groups).clone();
     let broker = env.broker();
@@ -605,10 +605,10 @@ async fn cleanup(ck: &mut Checker, env: &Env) {
             println!("  [WARN] delete_subscription_group({group}) failed: {e}");
         }
     }
-    ck.check("清理本次的 topic / 订阅组", true, "");
+    ck.check("cleaned up this run's topics / subscription groups", true, "");
 }
 
-// ------------------------------------------------------------------ 驱动
+// ------------------------------------------------------------------ driver
 
 async fn run(namesrv: &str) -> Checker {
     let mut ck = Checker::new();

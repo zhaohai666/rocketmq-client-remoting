@@ -1,11 +1,11 @@
-//! 本模块是协议里的 79 个
-//! `CommandCustomHeader` 实现：每个结构体都提供
+//! This module holds the protocol's 79
+//! `CommandCustomHeader` implementations: each struct provides
 //!
 //!
-//! ## 长名 vs 短名
+//! ## Long names vs short names
 //!
 //!
-//! ## 两处刻意的取舍
+//! ## Two deliberate trade-offs
 
 use std::any::Any;
 use std::fmt;
@@ -20,23 +20,23 @@ pub fn bool_text(value: bool) -> String {
     }
 }
 
-/// 读字符串扩展字段（缺失返回 `None`）。
+/// Reads a string extension field (returns `None` if missing).
 pub fn ext_str(ext: &ExtFields, key: &str) -> Option<String> {
     ext.get(key).map(|s| s.to_string())
 }
 
-/// 读 `int` 扩展字段；缺失或不是合法数字返回 `None`
-/// （按「脏数据不 panic」的要求降级）。
+/// Reads an `int` extension field; returns `None` if missing or not a valid number
+/// (degrades per the "dirty data must not panic" requirement).
 pub fn ext_i32(ext: &ExtFields, key: &str) -> Option<i32> {
     ext.get(key).and_then(|v| v.trim().parse::<i32>().ok())
 }
 
-/// 读 `long` 扩展字段。
+/// Reads a `long` extension field.
 pub fn ext_i64(ext: &ExtFields, key: &str) -> Option<i64> {
     ext.get(key).and_then(|v| v.trim().parse::<i64>().ok())
 }
 
-/// 读 `boolean` 扩展字段（`true` / `1` 为真）。
+/// Reads a `boolean` extension field (`true` / `1` count as true).
 pub fn ext_bool(ext: &ExtFields, key: &str) -> Option<bool> {
     ext.get(key).map(|v| {
         let t = v.trim().to_ascii_lowercase();
@@ -44,7 +44,7 @@ pub fn ext_bool(ext: &ExtFields, key: &str) -> Option<bool> {
     })
 }
 
-/// 字段种类 -> Rust 类型。
+/// Field kind -> Rust type.
 macro_rules! field_ty {
     (s) => { Option<String> };
     (i) => { Option<i32> };
@@ -55,7 +55,7 @@ macro_rules! field_ty {
     (E) => { Option<crate::common::boundary_type::BoundaryType> };
 }
 
-/// 定义一个 `CommandCustomHeader`：字段声明顺序 == extFields 写入顺序。
+/// Defines a `CommandCustomHeader`: field declaration order == extFields write order.
 macro_rules! header_struct {
     (
         $(#[$meta:meta])*
@@ -105,10 +105,10 @@ macro_rules! header_struct {
     (@get I, $ext:expr, $key:expr) => { ext_i32($ext, $key).unwrap_or(0) };
 }
 
-/// 让 `Box<dyn CustomHeader>` 可打印。
+/// Makes `Box<dyn CustomHeader>` printable.
 ///
-/// 只输出 `TypeId`：header 里含 topic / group / clientId 等业务标识，日志里不该出现全文；
-/// 需要具体内容时调用方自己 `to_ext_fields` 后打印。
+/// Prints only the `TypeId`: headers carry business identifiers such as topic / group / clientId, and the full contents must not leak into logs;
+/// callers that need the concrete contents should call `to_ext_fields` themselves and print that.
 impl fmt::Debug for dyn CustomHeader + '_ {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "CustomHeader({:?})", self.as_any().type_id())
@@ -122,12 +122,12 @@ impl fmt::Debug for dyn CustomHeader + '_ {
 //   ViewMessageRequestHeader: server-side-only fields ["topic"]
 //   ConsumeMessageDirectlyResultRequestHeader: server-side-only fields ["topic", "topicSysFlag", "groupSysFlag"]
 //   ResetOffsetRequestHeader: server-side-only fields ["queueId", "offset"]
-//   EndTransactionRequestHeader: 客户端额外上报的键 ["bname"]
-//   CheckTransactionStateRequestHeader: 客户端额外上报的键 ["bname"]
-//   CheckTransactionStateResponseHeader: 客户端额外上报的键 ["groupName", "transactionState", "offset"]
+//   EndTransactionRequestHeader: extra client-reported keys ["bname"]
+//   CheckTransactionStateRequestHeader: extra client-reported keys ["bname"]
+//   CheckTransactionStateResponseHeader: extra client-reported keys ["groupName", "transactionState", "offset"]
 //   CheckTransactionStateResponseHeader: server-side-only fields ["producerGroup", "tranStateTableOffset", "commitLogOffset", "commitOrRollback"]
 //   GetAllTopicConfigRequestHeader: server-side-only fields ["topicSeq", "dataVersion", "maxTopicNum"]
-//   GetAllTopicConfigResponseHeader: 客户端额外上报的键 ["dataVersion"]
+//   GetAllTopicConfigResponseHeader: extra client-reported keys ["dataVersion"]
 //   GetAllTopicConfigResponseHeader: server-side-only fields ["totalTopicNum"]
 //   GetConsumeStatsRequestHeader: server-side-only fields ["TOPIC_NAME_SEPARATOR", "topicList"]
 header_struct! {
@@ -170,7 +170,7 @@ header_struct! {
 }
 
 header_struct! {
-/// broker → 请求方 的 PUSH_REPLY_MESSAGE_TO_CLIENT(326) 请求头。
+/// The broker → requester PUSH_REPLY_MESSAGE_TO_CLIENT(326) request header.
     ReplyMessageRequestHeader {
         producer_group: s => "producerGroup",
         topic: s => "topic",
@@ -203,7 +203,7 @@ header_struct! {
 }
 
 header_struct! {
-/// 定时/延迟消息撤回请求（`RECALL_MESSAGE` 370）。
+/// Timed/delayed-message recall request (`RECALL_MESSAGE` 370).
     RecallMessageRequestHeader {
         producer_group: s => "producerGroup",
         topic: s => "topic",
@@ -352,8 +352,8 @@ header_struct! {
 }
 
 header_struct! {
-/// ``index_type`` 取 MessageConst.INDEX_KEY_TYPE("K") / INDEX_UNIQUE_TYPE("U") /
-/// INDEX_TAG_TYPE("T")；broker 侧为空时默认按 "K"（普通 key 索引）查。
+/// ``index_type`` takes the key-index / unique-index / tag-index kinds "K" / "U" /
+/// "T"; when it arrives empty the broker queries by "K" (ordinary key index) by default.
     QueryMessageRequestHeader {
         topic: s => "topic",
         key: s => "key",
@@ -443,7 +443,7 @@ header_struct! {
 }
 
 header_struct! {
-/// GET_CONSUMER_STATUS_FROM_CLIENT(221) 的请求头。
+/// Request header of GET_CONSUMER_STATUS_FROM_CLIENT(221).
     GetConsumerStatusRequestHeader {
         topic: s => "topic",
         group: s => "group",
@@ -563,9 +563,9 @@ header_struct! {
 }
 
 header_struct! {
-/// ⚠ broker 的 checkFields() 会把 ``topicFilterType`` 解析成枚举，**为空直接抛
-/// RemotingCommandException("topicFilterType = [null] value invalid")**，
-/// 所以哪怕只想建普通 topic，也必须显式下发 topicFilterType。
+/// ⚠ the broker's checkFields() parses ``topicFilterType`` into an enum and **throws directly when it is
+/// empty: RemotingCommandException("topicFilterType = [null] value invalid")**,
+/// so even when only creating an ordinary topic, topicFilterType must be sent explicitly.
     CreateTopicRequestHeader {
         topic: s => "topic",
         default_topic: s => "defaultTopic",
@@ -852,8 +852,8 @@ header_struct! {
 }
 
 header_struct! {
-/// ``start_offset_info`` / ``msg_offset_info`` / ``order_count_info`` 是编码过的
-/// 字符串（空格做字段分隔、分号做队列分隔），用 ``extra_info`` 模块解析。
+/// ``start_offset_info`` / ``msg_offset_info`` / ``order_count_info`` are encoded
+/// strings (spaces separate fields, semicolons separate queues), parsed by the ``extra_info`` module.
     PopMessageResponseHeader {
         pop_time: l => "popTime",
         invisible_time: l => "invisibleTime",
@@ -867,8 +867,8 @@ header_struct! {
 }
 
 header_struct! {
-/// ``offset`` 是 **consumeQueue offset**（即 CK 串第 8 段 / msgQueueOffset），
-/// 不是 commitlog offset —— 传错会被 broker 回 NO_MESSAGE。
+/// ``offset`` is the **consumeQueue offset** (i.e. the 8th segment of the CK string / msgQueueOffset),
+/// not the commitlog offset -- passing the wrong one makes the broker answer NO_MESSAGE.
     AckMessageRequestHeader {
         consumer_group: s => "consumerGroup",
         topic: s => "topic",
@@ -895,8 +895,8 @@ header_struct! {
 }
 
 header_struct! {
-/// 返回的是**新的** ``invisible_time`` / ``pop_time`` / ``revive_qid``；
-/// 客户端要用它们重建 extraInfo 供后续 ACK 使用。
+/// Returns the **new** ``invisible_time`` / ``pop_time`` / ``revive_qid``;
+/// the client must use them to rebuild extraInfo for subsequent ACKs.
     ChangeInvisibleTimeResponseHeader {
         pop_time: l => "popTime",
         invisible_time: l => "invisibleTime",
@@ -993,7 +993,7 @@ const PROTOCOL_HEADER_FIELDS: &[(&str, &[&str])] = &[
 
 
 
-// ============================== 测试 ==============================
+// ============================== tests ==============================
 
 #[cfg(test)]
 mod tests {
@@ -1011,7 +1011,7 @@ mod tests {
         ext.iter().map(|(k, _)| k.as_str()).collect()
     }
 
-    /// 逐字节守卫：POP 请求头的 12 个长字段名与顺序按协议定义钉死。
+    /// Byte-for-byte guard: the POP request header's 12 long field names and their order are pinned to the protocol definition.
     #[test]
     fn pop_message_request_header_ext_keys_exactly_match_protocol() {
         let h = PopMessageRequestHeader {
@@ -1021,7 +1021,7 @@ mod tests {
             max_msg_nums: Some(32),
             invisible_time: Some(60000),
             poll_time: Some(0),
-            // bornTime 填 0 会让 broker 直接回 POLLING_TIMEOUT(210)，必须非 0
+            // bornTime set to 0 makes the broker answer POLLING_TIMEOUT(210) directly; it must be non-zero
             born_time: Some(1789613086027),
             init_mode: Some(0),
             exp_type: Some("TAG".into()),
@@ -1062,7 +1062,7 @@ mod tests {
         let mut ext = ExtFields::new();
         h.to_ext_fields(&mut ext);
         assert_eq!(ext.get("order"), Some("false"));
-        // 未设置的 Option 字段不能出现在报文里。
+        // Unset Option fields must not appear on the wire.
         assert!(!ext.contains_key("consumerGroup"));
         assert!(!ext.contains_key("exp"));
         assert!(!ext.contains_key("attemptId"));
@@ -1237,8 +1237,8 @@ mod tests {
         assert_eq!(back1, v1);
     }
 
-    /// broker 的 `checkFields()` 把 `topicFilterType` 解析成枚举，为空直接抛异常；
-    /// 同时守 `attributes` / `force` 两个后加的字段。
+    /// The broker's `checkFields()` parses `topicFilterType` into an enum and throws directly when it is empty;
+    /// also guards the two late-added fields `attributes` / `force`.
     #[test]
     fn create_topic_request_header_guards() {
         let h = CreateTopicRequestHeader {
@@ -1261,7 +1261,7 @@ mod tests {
         assert_eq!(ext.get("order"), Some("false"));
         assert_eq!(ext.len(), 10);
 
-        // 只给 topic 时，可选字段必须整体缺席（而不是写出空串）。
+        // With only topic given, the optional fields must be absent entirely (not written as empty strings).
         let minimal = CreateTopicRequestHeader {
             topic: Some("t".into()),
             ..Default::default()
@@ -1270,7 +1270,7 @@ mod tests {
         minimal.to_ext_fields(&mut ext);
         assert_eq!(keys(&ext), vec!["topic"]);
 
-        // attributes / force 是后加的字段，读取侧必须能把它们还原回来。
+        // attributes / force are late-added fields; the reading side must be able to restore them.
         let full = CreateTopicRequestHeader {
             topic: Some("attr-topic".into()),
             attributes: Some("+deleteWhen\x1d04".into()),
@@ -1284,7 +1284,7 @@ mod tests {
         assert_eq!(back, full);
     }
 
-    /// `RECALL_MESSAGE`(370) 的三条字段名守卫。
+    /// The three field-name guards of `RECALL_MESSAGE`(370).
     #[test]
     fn recall_message_headers_use_wire_keys() {
         let h = RecallMessageRequestHeader {
@@ -1312,7 +1312,7 @@ mod tests {
             Some("0123456789ABCDEF0123456789abcdef")
         );
 
-        // 定时消息的 recallHandle 由 broker 下发，普通消息不带这个键。
+        // A timed message's recallHandle is handed down by the broker; ordinary messages do not carry this key.
         let mut ext = ExtFields::new();
         ext.insert("msgId", "offset-msg-id");
         ext.insert("queueId", "3");
@@ -1327,7 +1327,7 @@ mod tests {
         assert_eq!(send_resp.batch_uniq_id, None);
     }
 
-    /// `QueryMessageRequestHeader` 的逐字段往返守卫。
+    /// Field-by-field round-trip guard for `QueryMessageRequestHeader`.
     #[test]
     fn query_message_request_header_round_trip() {
         let h = QueryMessageRequestHeader {
@@ -1446,7 +1446,7 @@ mod tests {
         }
     }
 
-    /// 数值字段解析必须是十进制整数字符串；脏数据降级为 `None` 而不是 panic。
+    /// Numeric field parsing requires a decimal integer string; dirty data degrades to `None` instead of panicking.
     #[test]
     fn numeric_parsing_is_lenient_never_panics() {
         let mut ext = ExtFields::new();
@@ -1459,7 +1459,7 @@ mod tests {
         h2.from_ext_fields(&ext);
         assert!(h2.queue_id.is_none());
         assert!(h2.consumer_group.is_none());
-        // 越界数字同样降级
+        // out-of-range numbers degrade the same way
         let mut big = ExtFields::new();
         big.insert("queueId", "99999999999999");
         let mut h3 = QueryConsumerOffsetRequestHeader::default();
@@ -1467,7 +1467,7 @@ mod tests {
         assert_eq!(h3.queue_id, None);
     }
 
-    /// `RemotingCommand` 编码链路：`makeCustomHeaderToNet` 之后 extFields 才有内容。
+    /// The `RemotingCommand` encode path: extFields only get content after `makeCustomHeaderToNet`.
     #[test]
     fn header_lands_in_remoting_command_ext_fields() {
         use crate::remoting::protocol::RemotingCommand;
@@ -1492,12 +1492,12 @@ mod tests {
         let root = match std::env::var("ROCKETMQ_SERVER_SRC") {
             Ok(v) if !v.trim().is_empty() => v,
             _ => {
-                eprintln!("ROCKETMQ_SERVER_SRC 未设置，跳过服务端字段名对拍");
+                eprintln!("ROCKETMQ_SERVER_SRC not set, skipping the server-side field-name cross-check");
                 return;
             }
         };
         let root = std::path::PathBuf::from(root);
-        assert!(root.is_dir(), "ROCKETMQ_SERVER_SRC 不是目录: {root:?}");
+        assert!(root.is_dir(), "ROCKETMQ_SERVER_SRC is not a directory: {root:?}");
         for (class, fields) in PROTOCOL_HEADER_FIELDS {
             let declared = java_declared_fields(&root, class, 0);
             if declared.is_empty() {
@@ -1506,13 +1506,13 @@ mod tests {
             for field in *fields {
                 assert!(
                     declared.iter().any(|d| d == field),
-                    "服务端 {class} 已无字段 {field}（当前字段: {declared:?}）"
+                    "server {class} no longer has field {field} (current fields: {declared:?})"
                 );
             }
         }
     }
 
-    /// 递归找 `<name>.java`，收集本类与父类（最多 3 层）声明的字段名。
+    /// Recursively finds `<name>.java` and collects the field names declared by the class and its parents (up to 3 levels).
     fn java_declared_fields(root: &std::path::Path, class: &str, depth: usize) -> Vec<String> {
         let mut out = Vec::new();
         let Some(path) = java_source_file(root, class) else {

@@ -1,8 +1,9 @@
-// 前置：NameServer + Broker 已起，且 broker 配置 **traceTopicEnable=true**
-//（否则 RMQ_SYS_TRACE_TOPIC 不会被预建，也用 admin 建不出来 —— 它是系统 topic，
-// validateSystemTopicWhenUpdateTopic 默认 true 会拒绝创建）。
+// Prerequisite: a NameServer + Broker are up and the broker is configured with
+// **traceTopicEnable=true** (otherwise RMQ_SYS_TRACE_TOPIC is not pre-created and cannot be
+// created with the admin API either -- it is a system topic and
+// validateSystemTopicWhenUpdateTopic defaults to true, which refuses the creation).
 //
-// 场景 S1–S17 与 Check() 一一对应，全部命中才返回 0。
+// Scenarios S1-S17 map one to one onto Check(); it returns 0 only when everything hits.
 using System.Globalization;
 using System.Text;
 
@@ -61,7 +62,7 @@ public static class LiveTrace
 
     private static string BodyText(MessageExt m) => Encoding.UTF8.GetString(m.Body);
 
-    // ---------------- 轨迹读取者：消费 RMQ_SYS_TRACE_TOPIC 并解码 ----------------
+    // ---------------- the trace reader: consumes RMQ_SYS_TRACE_TOPIC and decodes ----------------
     private sealed class TraceCollector : IMessageListenerConcurrently
     {
         private readonly object _lk = new();
@@ -125,7 +126,7 @@ public static class LiveTrace
         }
     }
 
-    // ---------------- 业务消息收集者 ----------------
+    // ---------------- the business message collector ----------------
     private sealed class MsgCollector : IMessageListenerConcurrently
     {
         private readonly object _lk = new();
@@ -158,9 +159,12 @@ public static class LiveTrace
     public static int Run(string[] args)
     {
         string namesrv = args.Length > 0 ? args[0] : "127.0.0.1:9876";
-        // topic 与业务消费组都带 Stamp：多轮真机联调会**依次**打在同一个 broker 上，
-        // 固定名会继承上一轮的位点与残留消息，使断言结果依赖运行顺序。全新 topic + 全新组
-        // 才能让每次运行的起点一致（真正的鲁棒性另有保障，见 S6 的 body 过滤）。
+        // Both the topic and the business consumer group carry a Stamp: several rounds of
+        // real-machine integration run **one after another** against the same broker, and a
+        // fixed name would inherit the previous round's offsets and leftover messages, making
+        // the assertions depend on the run order. A brand new topic + a brand new group is
+        // what makes each run start from the same point (the real robustness is guaranteed
+    // elsewhere, see the body filtering in S6).
         string topic = "TraceTopicLive_" + Stamp;
         string noTraceTopic = "TraceNoTraceTopic_" + Stamp;
         string producerGroup = "GID_trace_producer_live";
@@ -172,7 +176,7 @@ public static class LiveTrace
             + " topic=" + topic);
         Console.WriteLine("=".PadRight(70, '='));
 
-        // ---------------- 轨迹读取者（必须在被测动作之前起来）----------------
+        // ---------------- the trace reader (it has to be up before the action under test)----------------
         var collector = new TraceCollector();
         var traceReader = new DefaultMQPushConsumer(traceReaderGroup);
         traceReader.SetNamesrvAddr(namesrv);
@@ -183,42 +187,45 @@ public static class LiveTrace
         Console.WriteLine("trace reader started (group=" + traceReaderGroup + ", topic="
             + MixAll.TraceTopic + ")");
 
-        // ---------------- S1 预热建 topic ----------------
+        // ---------------- S1 warm-up creates the topic ----------------
         var warm = new DefaultMQProducer(producerGroup + "_warm");
         warm.NamesrvAddr = namesrv;
         warm.Start();
         try
         {
             warm.Send(new Message(topic, Encoding.UTF8.GetBytes("warm-up")), 5000);
-            Check("S1 预热消息发送成功（触发 broker 自动建 topic）", true);
+       Check("S1 the warm-up message was sent successfully (triggering the broker to auto-create the topic)", true);
         }
         catch (Exception e)
         {
-            Check("S1 预热消息发送成功（触发 broker 自动建 topic）", false, e.Message);
+       Check("S1 the warm-up message was sent successfully (triggering the broker to auto-create the topic)", false, e.Message);
             return 1;
         }
 
-        // 预热后等一下再起消费者：降低"位点解析"与"broker consumequeue 异步分发"的竞态。
-        // 这一步只是让时序更宽裕，**不是**正确性保障 —— 预热消息本来就可能被投递，见 S6 的 body 过滤。
+        // Wait a bit after the warm-up before starting the consumer, to reduce the race
+    // between "offset resolution" and the broker's asynchronous consumequeue dispatch.
+        // This only gives the timing more slack, it is **not** a correctness guarantee -- the
+        // warm-up message may well be delivered, see the body filtering in S6.
         Thread.Sleep(1500);
 
-        // ---------------- S2 开轨迹的业务消费者 ----------------
+        // ---------------- S2 the business consumer with tracing on ----------------
         var msgCollector = new MsgCollector();
         var consumer = new DefaultMQPushConsumer(consumerGroup);
         consumer.SetNamesrvAddr(namesrv);
-        // 见文件头 ⚠ 1：必须从队尾起算，否则会吃掉无 keys 的预热消息
+   // See the file header note (1): it must count from the tail, otherwise it would swallow
+        // the warm-up message that has no keys
         consumer.ConsumeFromWhere = ConsumeFromWhere.ConsumeFromLastOffset;
         consumer.Subscribe(topic, "*");
         consumer.SetMessageListener(msgCollector);
-        consumer.EnableTrace = true;                       // ← 消费侧轨迹
+        consumer.EnableTrace = true;                       // <- consumer-side tracing
         consumer.Start();
         bool assigned = WaitUntil(() => consumer.AssignedQueueKeys().Count > 0, 30000);
-        Check("S2 消费者已分配到队列（先起消费者再发消息）", assigned,
+    Check("S2 the consumer was assigned queues (start the consumer before sending)", assigned,
             "assigned=" + consumer.AssignedQueueKeys().Count.ToString(CultureInfo.InvariantCulture));
 
         var producer = new DefaultMQProducer(producerGroup);
         producer.NamesrvAddr = namesrv;
-        producer.EnableTrace = true;                       // ← 发送侧轨迹
+   producer.EnableTrace = true;                       // <- producer-side tracing
         producer.Start();
 
         string body = "trace-live-" + Stamp;
@@ -226,56 +233,59 @@ public static class LiveTrace
         var outMsg = new Message(topic, Encoding.UTF8.GetBytes(body)) { Tags = "TagA", Keys = keys };
         SendResult result = producer.Send(outMsg, 5000);
 
-        Check("S3 SendResult.traceOn == true（broker 默认 traceOn=true）", result.TraceOn,
+     Check("S3 SendResult.traceOn == true (the broker defaults traceOn=true)", result.TraceOn,
             "traceOn=" + (result.TraceOn ? "true" : "false"));
-        Check("S4 SendResult.msgId 是客户端 UNIQ_KEY，且与 offsetMsgId 不同",
+   Check("S4 SendResult.msgId is the client's UNIQ_KEY and differs from offsetMsgId",
             result.MsgId.Length > 0 && result.OffsetMsgId.Length > 0
             && result.MsgId != result.OffsetMsgId,
             "msgId=" + result.MsgId + " offsetMsgId=" + result.OffsetMsgId);
-        Check("S5 SendResult.regionId 已解析（缺省 DefaultRegion）",
+     Check("S5 SendResult.regionId is resolved (the default is DefaultRegion)",
             result.RegionId == MixAll.DefaultTraceRegionId, "region=" + result.RegionId);
 
-        // ---------------- S6/S7 消费侧 ----------------
-        // ⚠ 只统计**本次发送的**消息：topic 上必然还留着 S1 的预热消息，且消费者的起始位点在
-        // "组首次消费"时取的是当时的 maxOffset —— broker 的 consumequeue 是异步分发的，位点可能
-        // 落在预热消息之前，于是预热消息也会被投递过来（真机实测见过）。断言的本意是"本次
-        // 业务消息被消费到"，所以按 body 过滤，而不是赌 topic 上只有一条消息。
+        // ---------------- S6/S7 the consume side ----------------
+  // Only the messages from **this send** are counted: the topic necessarily still holds S1's
+        // warm-up message, and a consumer's starting offset on "the group's first consumption"
+  // is the maxOffset at that moment -- the broker's consumequeue is dispatched
+  // asynchronously, so the offset can land before the warm-up message and the warm-up
+    // message can then be delivered too (observed on a real machine). What the assertion
+ // means is "this business message was consumed", so it filters by body instead of
+  // betting on the topic holding exactly one message.
         static bool IsPrimary(MessageExt m) => BodyText(m).StartsWith("trace-live-", StringComparison.Ordinal);
 
         bool got = WaitUntil(() => msgCollector.Snapshot().Exists(IsPrimary), 25000);
         List<MessageExt> msgs = msgCollector.Snapshot().FindAll(IsPrimary);
-        Check("S6 业务消费者收到本次发送的那 1 条消息（按 body 过滤预热消息）", got && msgs.Count == 1,
+    Check("S6 the business consumer received the 1 message from this send (the warm-up message is filtered out by body)", got && msgs.Count == 1,
             "count=" + msgs.Count.ToString(CultureInfo.InvariantCulture));
         string recvMsgId = msgs.Count == 0 ? string.Empty : msgs[0].MsgId;
         string recvUniq = msgs.Count == 0
             ? string.Empty
             : msgs[0].GetProperty(MessageConst.PropertyUniqClientMessageIdKeyidx);
-        Check("S7 消费侧 msg_id == SendResult.offset_msg_id，且 UNIQ_KEY 经属性带到消费侧",
+  Check("S7 the consume side msg_id == SendResult.offset_msg_id and the UNIQ_KEY travelled there via the properties",
             msgs.Count > 0 && recvMsgId == result.OffsetMsgId && recvUniq == result.MsgId,
             "recv=" + recvMsgId + " offset=" + result.OffsetMsgId + " uniq=" + recvUniq);
 
-        // ---------------- 无 keys 的消息（供 S17 用真机数据锁解码器健壮性）----------------
+        // ---------------- a message with no keys (S17 uses real machine data to lock decoder robustness)----------------
         SendResult keyless = producer.Send(new Message(topic, Encoding.UTF8.GetBytes("no-keys-here")),
             5000);
         static bool IsKeyless(MessageExt m) => BodyText(m) == "no-keys-here";
         bool keylessOk = WaitUntil(() => msgCollector.Snapshot().Exists(IsKeyless), 25000);
         string keylessId = keyless.OffsetMsgId;
 
-        // 关掉消费者 → 触发消费侧轨迹分发器 flush，保证 SubBefore/SubAfter 落盘
+        // close the consumer -> triggers the consume-side trace dispatcher to flush, ensuring SubBefore/SubAfter land
         consumer.Shutdown();
         Thread.Sleep(1000);
 
-        // ---------------- S8 等 Pub 轨迹落地 ----------------
+        // ---------------- S8 wait for the Pub trace to land ----------------
         bool pubOk = WaitUntil(() => collector.HasPub(result.MsgId), 35000);
-        producer.Shutdown();                               // flush 发送侧轨迹
+  producer.Shutdown();   // flush the producer-side trace
         Thread.Sleep(500);
         pubOk = WaitUntil(() => collector.HasPub(result.MsgId), 10000) || pubOk;
 
         List<TraceContext> records = collector.Records();
         List<(string Keys, string Topic, string Text)> raw = collector.Raw();
-        Console.WriteLine("  [info] 收到 " + raw.Count.ToString(CultureInfo.InvariantCulture)
-            + " 条轨迹消息 / 解出 " + records.Count.ToString(CultureInfo.InvariantCulture)
-            + " 条轨迹记录");
+   Console.WriteLine("  [info] received " + raw.Count.ToString(CultureInfo.InvariantCulture)
+            + " trace messages / decoded " + records.Count.ToString(CultureInfo.InvariantCulture)
+            + " trace records");
         foreach (TraceContext r in records)
         {
             Console.WriteLine("         - " + (r.TraceType?.ToString() ?? "-")
@@ -298,9 +308,9 @@ public static class LiveTrace
             }
         }
 
-        Check("S8 轨迹里出现 Pub 记录且 msgId 与 SendResult.msg_id 一致", pubOk && pubCount >= 1,
+   Check("S8 a Pub record appears in the trace and its msgId matches SendResult.msg_id", pubOk && pubCount >= 1,
             "count=" + pubCount.ToString(CultureInfo.InvariantCulture));
-        Check("S9 Pub 轨迹的 topic / groupName 正确",
+        Check("S9 the Pub trace's topic / groupName are correct",
             pub is not null && pub.TraceBeans[0].Topic == topic && pub.GroupName == producerGroup,
             pub is null
                 ? "no pub record"
@@ -312,7 +322,7 @@ public static class LiveTrace
                 if (k.Contains(result.MsgId, StringComparison.Ordinal)) keyHit = true;
             }
 
-            Check("S10 承载 Pub 轨迹的轨迹消息 keys 里含该 msgId（控制台按 keys 反查）", keyHit,
+      Check("S10 the keys of the trace message carrying the Pub trace contain that msgId (the console looks it up by keys)", keyHit,
                 "msgId=" + result.MsgId);
         }
 
@@ -335,9 +345,9 @@ public static class LiveTrace
             }
         }
 
-        Check("S11 轨迹里出现 SubBefore 且 msgId 与消费侧一致", subBeforeCount >= 1,
+  Check("S11 a SubBefore appears in the trace and its msgId matches the consume side", subBeforeCount >= 1,
             "count=" + subBeforeCount.ToString(CultureInfo.InvariantCulture));
-        Check("S12 SubBefore/SubAfter 配对且 requestId 一致、success=true、contextCode=0",
+        Check("S12 SubBefore/SubAfter are paired with the same requestId, success=true, contextCode=0",
             subBefore is not null && subAfter is not null
             && subAfter.RequestId == subBefore.RequestId && subAfter.IsSuccess
             && subAfter.ContextCode == 0,
@@ -345,7 +355,7 @@ public static class LiveTrace
                 ? "no sub_after"
                 : "req=" + subAfter.RequestId + " success=" + (subAfter.IsSuccess ? "true" : "false")
                   + " code=" + subAfter.ContextCode.ToString(CultureInfo.InvariantCulture));
-        Check("S13 SubBefore 的 retryTimes 与被消费消息一致",
+    Check("S13 SubBefore's retryTimes matches the consumed message",
             subBefore is not null && msgs.Count > 0
             && subBefore.TraceBeans[0].RetryTimes == msgs[0].ReconsumeTimes,
             subBefore is null
@@ -355,7 +365,7 @@ public static class LiveTrace
                       ? "-1"
                       : msgs[0].ReconsumeTimes.ToString(CultureInfo.InvariantCulture)));
 
-        // ---------------- S14 防递归 ----------------
+   // ---------------- S14 the recursion guard ----------------
         {
             bool leak = false;
             foreach (TraceContext r in records)
@@ -363,13 +373,13 @@ public static class LiveTrace
                 if (r.TraceBeans.Count > 0 && r.TraceBeans[0].Topic == MixAll.TraceTopic) leak = true;
             }
 
-            Check("S14 没有任何轨迹记录的 topic 是轨迹 topic 本身（防递归）", !leak);
+      Check("S14 no trace record has the trace topic itself as its topic (the recursion guard)", !leak);
         }
 
-        // ---------------- S15 关闭轨迹就不产轨迹 ----------------
+        // ---------------- S15 turning tracing off produces no trace ----------------
         var quiet = new DefaultMQProducer(producerGroup + "_quiet");
         quiet.NamesrvAddr = namesrv;
-        quiet.EnableTrace = false;                         // ← 显式关闭
+        quiet.EnableTrace = false;             // <- explicitly off
         quiet.Start();
         quiet.Send(new Message(noTraceTopic, Encoding.UTF8.GetBytes("no-trace")), 5000);
         quiet.Shutdown();
@@ -385,27 +395,28 @@ public static class LiveTrace
                 }
             }
 
-            Check("S15 enable_trace=false 的生产者不产生 Pub 轨迹", leaked == 0,
+       Check("S15 a producer with enable_trace=false produces no Pub trace", leaked == 0,
                 "leaked=" + leaked.ToString(CultureInfo.InvariantCulture));
         }
 
-        // ---------------- S16 编码结构自检 ----------------
+        // ---------------- S16 the encoding structure self-check ----------------
         {
-            // 每条记录都以 FIELD_SPLITOR 结尾 → 记录数就是 STX 出现次数。
-            // 这条断言的价值：解码器只要丢过任何一条记录（真机踩过），这里立刻红。
+      // Every record ends with FIELD_SPLITOR -> the record count is the number of STX
+        // occurrences. The value of this assertion: if the decoder ever dropped a record
+  // (which happened on a real machine) it goes red right here.
             long segments = 0;
             foreach ((string _, string t, string text) in raw)
             {
                 if (t == MixAll.TraceTopic) segments += CountOf(text, TraceConstants.FieldSplitor);
             }
 
-            Check("S16 轨迹文本记录数（STX 计数）== 解码出的记录数",
+            Check("S16 the number of records in the trace text (STX count) == the number of decoded records",
                 segments == records.Count && records.Count > 0,
                 "segments=" + segments.ToString(CultureInfo.InvariantCulture)
                 + " decoded=" + records.Count.ToString(CultureInfo.InvariantCulture));
         }
 
-        // ---------------- S17 无 keys 消息的轨迹也要解得出来 ----------------
+        // ---------------- S17 a trace for a message with no keys must also decode ----------------
         {
             int before = 0;
             string keylessKeys = string.Empty;
@@ -419,7 +430,7 @@ public static class LiveTrace
                 }
             }
 
-            Check("S17 无 keys 的消息也能解出 SubBefore 轨迹（空 keys 段不崩）",
+       Check("S17 a message with no keys still yields a decodable SubBefore trace (the empty keys segment does not crash it)",
                 keylessOk && before >= 1 && keylessKeys.Length == 0,
                 "consumed=" + (keylessOk ? "true" : "false")
                 + " before=" + before.ToString(CultureInfo.InvariantCulture));

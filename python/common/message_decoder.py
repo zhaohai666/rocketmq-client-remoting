@@ -29,7 +29,7 @@ MESSAGE_STORE_TIMESTAMP_POSITION = 56
 _HEX_TABLE = "0123456789ABCDEF"
 
 
-# ---------------------------------------------------------------- 基础工具
+# ---------------------------------------------------------------- basic utilities
 
 
 def string2bytes(s: str) -> bytes:
@@ -78,7 +78,7 @@ def crc32(data: bytes) -> int:
     return zlib.crc32(data) & 0xFFFFFFFF
 
 
-# ------------------------------------------------------- 属性串 <-> Map
+# ------------------------------------------------------- properties string <-> Map
 
 
 def message_properties_2_string(properties: Optional[Dict[str, str]]) -> str:
@@ -116,7 +116,7 @@ def string_2_message_properties(properties_str: Optional[str]) -> Dict[str, str]
 
 
 def create_message_id(addr_bytes: bytes, offset: int) -> str:
-    """ip+port(8 或 20B) + 8B commitLogOffset -> 十六进制 msgId。"""
+    """ip+port(8 or 20B) + 8B commitLogOffset -> hex msgId."""
     return bytes2string(bytes(addr_bytes) + struct.pack(">q", offset))
 
 
@@ -131,7 +131,7 @@ def decode_message_id(msg_id: str) -> Tuple[str, int, int]:
     return ip, port, offset
 
 
-# ------------------------------------------------- 压缩 / 解压（可选依赖）
+# ------------------------------------------------- compression / decompression (optional dependency)
 
 
 def normalize_compression_type(compression_type: int) -> int:
@@ -180,7 +180,7 @@ class _Lz4Codec:
     def _mod():
         try:
             import lz4.frame  # type: ignore
-        except ImportError as e:  # pragma: no cover - 取决于环境
+        except ImportError as e:  # pragma: no cover - depends on environment
             raise RuntimeError(
                 "lz4 compression requires the 'lz4' package: pip install lz4"
             ) from e
@@ -202,7 +202,7 @@ class _ZstdCodec:
     def _mod():
         try:
             import zstandard  # type: ignore
-        except ImportError as e:  # pragma: no cover - 取决于环境
+        except ImportError as e:  # pragma: no cover - depends on environment
             raise RuntimeError(
                 "zstd compression requires the 'zstandard' package: pip install zstandard"
             ) from e
@@ -229,7 +229,7 @@ def _zstd() -> type:
     return _ZstdCodec
 
 
-# ------------------------------------------- 1) 17 段存储格式：MessageExt
+# ------------------------------------------- 1) 17-segment storage format: MessageExt
 
 
 def _topic_length_size(magic_code: int) -> int:
@@ -292,7 +292,7 @@ def encode_message_ext(message_ext: MessageExt, need_compress: bool = False) -> 
 
 def decode_message(raw: bytes, read_body: bool = True, decompress_body: bool = True,
                    is_client: bool = True, check_crc: bool = False) -> Optional[MessageExt]:
-    """把 17 段消息解码为 MessageExt（对应 ``MessageDecoder.decode``）。"""
+    """Decode a 17-segment message into a MessageExt (corresponds to ``MessageDecoder.decode``)."""
     try:
         msg_ext = MessageExt()
         offset = 0
@@ -375,7 +375,7 @@ def decode_message(raw: bytes, read_body: bool = True, decompress_body: bool = T
 
 
 def decode_messages(raw: bytes, read_body: bool = True) -> List[MessageExt]:
-    """把 17 段消息流解码为 MessageExt 列表（对应 ``MessageDecoder.decodes``，用于 pull 结果）。"""
+    """Decode a stream of 17-segment messages into a list of MessageExt (corresponds to ``MessageDecoder.decodes``, used for pull results)."""
     result: List[MessageExt] = []
     pos = 0
     total = len(raw)
@@ -393,7 +393,7 @@ def decode_messages(raw: bytes, read_body: bool = True) -> List[MessageExt]:
     return result
 
 
-# --------------------------------------- 2) 6 段轻量格式：批量消息 body
+# --------------------------------------- 2) 6-segment lightweight format: batch message body
 
 
 def encode_message(message: Message) -> bytes:
@@ -405,7 +405,7 @@ def encode_message(message: Message) -> bytes:
 
     buf = bytearray()
     buf += struct.pack(">i", store_size)   # 1 TOTALSIZE
-    buf += struct.pack(">i", 0)            # 2 MAGICCODE（批量场景固定 0）
+    buf += struct.pack(">i", 0)            # 2 MAGICCODE (fixed 0 in batch scenario)
     buf += struct.pack(">i", 0)            # 3 BODYCRC
     buf += struct.pack(">i", message.get_flag())  # 4 FLAG
     buf += struct.pack(">i", len(body))    # 5 BODY

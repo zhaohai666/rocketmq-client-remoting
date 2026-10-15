@@ -1,7 +1,8 @@
-// 路由 / 心跳结构体单测（结构体字段与编解码的核心断言）。
+// Unit tests for the route / heartbeat structs (the core assertions on fields and codec).
 //
-// 重点：JSON 字段名与 fastjson2 对齐（键按字母序）、TBW102 回退裁剪、
-// MessageQueue 组装只挑可写队列、ConsumerData 无 4.x 字段。
+// The emphasis: JSON field names aligned with fastjson2 (keys in alphabetical order), the
+// TBW102 fallback trimming, MessageQueue assembly picking only the writable queues, and
+// ConsumerData carrying no 4.x fields.
 using System.Text;
 using RocketMQ.Common;
 using RocketMQ.Remoting.Protocol;
@@ -32,7 +33,7 @@ public class RouteHeartbeatTests
         Assert.Contains("\"cluster\":\"DefaultCluster\"", json);
         Assert.Contains("\"enableActingMaster\":false", json);
 
-        // 解析端容忍 fastjson2 裸数字键
+        // The parsing side tolerates fastjson2's bare numeric keys
         Assert.True(Json.TryParse("{\"brokerAddrs\":{0:\"127.0.0.1:10911\"},\"brokerName\":\"b\",\"cluster\":\"c\",\"enableActingMaster\":false,\"zoneName\":\"\"}",
             out JsonValue v, out _));
         BrokerData back = BrokerData.FromJson(v);
@@ -62,15 +63,15 @@ public class RouteHeartbeatTests
         {
             QueueDatas = new List<QueueData>
             {
-                new("broker-a", 8, 8, 6, 0),   // 可写
-                new("broker-b", 8, 8, 4, 0),   // PERM_READ only -> 不可写
+                new("broker-a", 8, 8, 6, 0),   // writable
+                new("broker-b", 8, 8, 4, 0),   // PERM_READ only -> not writable
                 new("broker-c", 8, 8, 2, 0),   // PERM_WRITE
             },
             BrokerDatas = new List<BrokerData>
             {
                 new("c", "broker-a", new SortedDictionary<long, string> { [0] = "a:10911" }),
                 new("c", "broker-c", new SortedDictionary<long, string> { [0] = "c:10911" }),
-                // broker-b 不在 brokerDatas 中 -> 也要跳过
+                // broker-b is not in brokerDatas -> it must be skipped as well
             },
         };
 
@@ -90,8 +91,8 @@ public class RouteHeartbeatTests
         {
             QueueDatas = new List<QueueData>
             {
-                new("broker-a", 4, 4, 6, 0),   // master 掉线 -> 只剩 brokerId=1
-                new("broker-b", 4, 4, 6, 0),   // 主从都在
+                new("broker-a", 4, 4, 6, 0),   // master down -> only brokerId=1 left
+                new("broker-b", 4, 4, 6, 0),   // both master and slave present
             },
             BrokerDatas = new List<BrokerData>
             {
@@ -108,7 +109,7 @@ public class RouteHeartbeatTests
         Assert.Equal(4, mqs.Count);
         Assert.All(mqs, mq => Assert.Equal("broker-b", mq.BrokerName));
 
-        // 负控：master 放回去，broker-a 的 4 条立刻回来（跳的是「没有 master」而不是名字）
+        // Negative control: put the master back and broker-a's 4 entries come straight back (it skips "there is no master", not the name)
         route.BrokerDatas[0].BrokerAddrs[0] = "a:10911";
         Assert.Equal(8, route.GetAllMessageQueue("T").Count);
     }
@@ -120,8 +121,8 @@ public class RouteHeartbeatTests
         {
             QueueDatas = new List<QueueData>
             {
-                new("broker-a", 4, 4, 6, 0),   // master 掉线 -> 只剩 brokerId=1
-                new("broker-ro", 3, 1, 4, 0),  // 只读 topic（perm=4）
+                new("broker-a", 4, 4, 6, 0),   // master down -> only brokerId=1 left
+                new("broker-ro", 3, 1, 4, 0),  // a read-only topic (perm=4)
             },
             BrokerDatas = new List<BrokerData>
             {
@@ -129,10 +130,10 @@ public class RouteHeartbeatTests
             },
         };
 
-        // 发布侧：perm=6 但有 master 才进；broker-a 没有 master ⇒ 空
+        // Publish side: perm=6 plus a master gets in; broker-a has no master => empty
         Assert.Empty(route.GetAllMessageQueue("T"));
 
-        // 订阅侧：broker-a 的 4 条 + broker-ro 的 3 条（即使 broker-ro 不在 BrokerDatas 里）
+        // Subscribe side: broker-a's 4 entries + broker-ro's 3 (even though broker-ro is not in BrokerDatas)
         List<MessageQueue> sub = route.GetAllSubscribeMessageQueue("T");
         Assert.Equal(7, sub.Count);
         Assert.Equal("broker-a", sub[0].BrokerName);
@@ -140,7 +141,7 @@ public class RouteHeartbeatTests
         Assert.Equal("broker-ro", sub[4].BrokerName);
         Assert.Equal(2, sub[6].QueueId);
 
-        // 负控：perm 抹掉读位（2 = 只写）后 broker-ro 消失，broker-a 不受影响。
+        // Negative control: clearing the read bit from perm (2 = write only) makes broker-ro disappear and leaves broker-a unaffected.
         route.QueueDatas[1].Perm = 2;
         Assert.Equal(4, route.GetAllSubscribeMessageQueue("T").Count);
     }
@@ -176,7 +177,7 @@ public class RouteHeartbeatTests
         {
             QueueDatas = new List<QueueData> { new("b2", 8, 8, 6, 0), new("b1", 8, 8, 6, 0) },
         };
-        Assert.False(a.TopicRouteDataChanged(b)); // 排序后等价
+        Assert.False(a.TopicRouteDataChanged(b)); // equivalent after sorting
         var c = new TopicRouteData
         {
             QueueDatas = new List<QueueData> { new("b1", 8, 8, 6, 0), new("b3", 8, 8, 6, 0) },
@@ -185,7 +186,7 @@ public class RouteHeartbeatTests
         Assert.True(a.TopicRouteDataChanged(null));
     }
 
-    // ---------------------------------------------------------------- 心跳
+    // ---------------------------------------------------------------- Heartbeat
 
     [Fact]
     public void HeartbeatData_JsonFieldNames_Fastjson2Order()
@@ -198,7 +199,7 @@ public class RouteHeartbeatTests
         hb.AddConsumerData(cd);
 
         string json = hb.ToJson().Dump();
-        // 5.x：无 consumeTimestamp/maxReconsumeTimes；有 heartbeatFingerprint/withoutSub
+        // 5.x: no consumeTimestamp/maxReconsumeTimes; there is heartbeatFingerprint/withoutSub
         Assert.Contains("\"clientID\":\"cid\"", json);
         Assert.Contains("\"heartbeatFingerprint\":0", json);
         Assert.Contains("\"withoutSub\":false", json);

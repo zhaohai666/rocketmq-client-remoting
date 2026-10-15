@@ -1,20 +1,20 @@
-//! 非法位点（OFFSET_ILLEGAL）修正分支真机验证。
+//! Live verification of the illegal-offset (OFFSET_ILLEGAL) correction branch.
 //!
-//! 这条分支做四件事：位点改用 broker 给的修正值（`setNextOffset`）→ 丢掉这条队列上
-//! 已取回未消费的消息（`ProcessQueue.setDropped(true)`）→ 把修正位点**立刻**落盘
-//! （`updateAndFreezeOffset` + `persist`）→ 撤掉队列让 rebalance 按修正位点重建
-//! （`removeProcessQueue` + `rebalanceImmediately`）。离线单测只能锁住本地状态怎么清、
-//! 哪个 ack 被作废，下面两件事只有真集群能证明：
+//! This branch does four things: switch the offset to the corrected value given by the broker (`setNextOffset`) → drop the
+//! messages pulled but not yet consumed on this queue (`ProcessQueue.setDropped(true)`) → persist the corrected offset **immediately**
+//! (`updateAndFreezeOffset` + `persist`) → remove the queue so rebalance rebuilds it from the corrected offset
+//! (`removeProcessQueue` + `rebalanceImmediately`). Offline unit tests can only pin down how local state is cleared and
+//! which acks get invalidated; the two things below can only be proven on a real cluster:
 //!
 //!
-//! - S2 「立刻落盘」——纠错后的位点必须马上推给 broker，不能等周期落盘。做法：利用
-//!   `resetOffsetByQueueId` 两笔 RPC 非原子（第 1 笔 commitOffset 无区间校验先落库、
-//!   第 2 笔 222 被 `resetOffsetInner` 拒绝，见 `live_admin.rs` 的实测）的既有行为，
-//!   把 broker 上的已提交位点做成非法值 103，再让一个
-//!   `persist_consumer_offset_interval_millis = 60000` 的新消费者从 103 起拉。窗口内
-//!   唯一能把 103 写回 3（maxOffset）的路径就是纠错分支自带的那次 persist，且全程零投递。
+//! - S2 "immediate persist" -- the corrected offset must be pushed to the broker right away, not left for the periodic persist. Approach: exploit the
+//!   existing non-atomicity of the two `resetOffsetByQueueId` RPCs (the 1st commitOffset is stored first without range validation,
+//!   the 2nd one returning 222 is rejected by `resetOffsetInner`, measured in `live_admin.rs`),
+//!   plant the illegal committed offset 103 on the broker, then let a new consumer with
+//!   `persist_consumer_offset_interval_millis = 60000` start pulling from 103. Within the window,
+//!   the only path that can write 103 back to 3 (maxOffset) is the persist built into the correction branch, with zero deliveries throughout.
 //!
-//! 用法：
+//! Usage:
 //! ```text
 //! cargo run --example live_offset_illegal -- 127.0.0.1:9876
 //! ```
@@ -38,7 +38,7 @@ use rocketmq_client_remoting::remoting::protocol::heartbeat::ConsumeFromWhere;
 
 const QUEUES: i32 = 1;
 const MSGS: i64 = 3;
-/// 非法位点：远超 maxOffset，broker 必回 `PULL_OFFSET_MOVED`。
+/// Illegal offset: far beyond maxOffset, the broker must reply `PULL_OFFSET_MOVED`.
 const ILLEGAL_TARGET: i64 = 103;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -82,10 +82,10 @@ async fn poll_until(mut pred: impl FnMut() -> bool, secs: u64) -> bool {
     }
 }
 
-/// 闸门 listener：把到达的 queueOffset 记下来，然后**卡住**本批（模拟"已取回还没 ack"）。
+/// Gated listener: records the arriving queueOffsets, then **holds** this batch (simulating "pulled but not yet acked").
 ///
-/// 分发循环是单任务的：卡住第一批 ⇒ 单队列上只有 1 条在途，其余留在缓冲里，
-/// 正是 S1 要的窗口。真机上这活由 `spawn_blocking` 承载，阻塞安全。
+/// The dispatch loop is a single task: holding the first batch ⇒ only 1 message is in flight on the single queue while the rest stay in the buffer,
+/// which is exactly the window S1 needs. On a real run this job is carried by `spawn_blocking`, so blocking is safe.
 struct GatedListener {
     state: Mutex<GateState>,
     cv: Condvar,
@@ -127,7 +127,7 @@ impl MessageListenerConcurrently for GatedListener {
         for m in msgs {
             st.arrivals.push(m.queue_offset);
         }
-        // 上限只防死锁：正常路径下由 release 显式放行，且必须晚于纠错
+        // The cap only prevents deadlock: the normal path is released explicitly by release, and must come after the correction
         let deadline = Instant::now() + Duration::from_secs(90);
         while !st.released {
             let now = Instant::now();
@@ -144,7 +144,7 @@ impl MessageListenerConcurrently for GatedListener {
     }
 }
 
-/// 只记到达的 queueOffset：这一趟关心的是"哪些不该来"，不是消息内容。
+/// Records only the arriving queueOffsets: this pass cares about "which messages should not arrive", not the message content.
 struct RecordingListener {
     arrivals: Mutex<Vec<i64>>,
 }
@@ -207,7 +207,7 @@ impl Fixture {
             .await
             .map_err(|e| format!("producer start failed: {e}"))?;
 
-        // 端口开着 != broker 已注册到 nameServer：这里轮询等待
+        // Port open != broker registered with the name server: poll and wait here
         let deadline = Instant::now() + Duration::from_secs(40);
         let broker_addr = loop {
             match admin.fetch_broker_cluster_info().await {
@@ -221,7 +221,7 @@ impl Fixture {
                 _ => {}
             }
             if Instant::now() > deadline {
-                return Err("nameServer 在预算内没有返回任何 broker".to_string());
+                return Err("nameServer returned no broker within the budget".to_string());
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         };
@@ -247,8 +247,8 @@ impl Fixture {
         Ok(())
     }
 
-    /// 该 topic 在路由上的真实队列列表（`%RETRY%<group>` 只有 1 个队列，
-    /// 照主 topic 的队列数去查会误报）。
+    /// The real queue list of this topic from the route (`%RETRY%<group>` has only 1 queue,
+    /// so querying it with the main topic's queue count would give a false report).
     async fn queues(&self, topic: &str) -> Vec<MessageQueue> {
         match self.admin.examine_topic_route(topic).await {
             Ok(route) => route
@@ -260,7 +260,7 @@ impl Fixture {
         }
     }
 
-    /// 单队列 topic 的队列 key（消费者侧 `_mq_map` 的键口径）。
+    /// Queue key of the single-queue topic (matching the consumer-side `_mq_map` key convention).
     async fn queue_key(&self, topic: &str) -> Result<String, String> {
         self.queues(topic)
             .await
@@ -269,7 +269,7 @@ impl Fixture {
             .ok_or_else(|| format!("route of {topic} has no queue"))
     }
 
-    /// broker 上该队列的已提交位点；`None` = 查无记录（`QUERY_NOT_FOUND`）。
+    /// The committed offset of this queue on the broker; `None` = no record found (`QUERY_NOT_FOUND`).
     async fn committed(&self, group: &str, topic: &str) -> Vec<(MessageQueue, Option<i64>)> {
         let mut out = Vec::new();
         for mq in self.queues(topic).await {
@@ -369,7 +369,7 @@ async fn s1_drop_and_rebuild(fx: &Fixture, ck: &mut Checker) {
             return;
         }
     }
-    println!("S1: 已发送 {MSGS} 条（单队列），等 listener 卡住第 1 条...");
+    println!("S1: sent {MSGS} messages (single queue), waiting for the listener to hold the 1st one...");
 
     let ready = poll_until(
         || sink.arrivals().len() == 1 && c.cached_message_count(&key) == (MSGS - 1) as usize,
@@ -378,7 +378,7 @@ async fn s1_drop_and_rebuild(fx: &Fixture, ck: &mut Checker) {
     .await;
     ck.check(
         &format!(
-            "S1-窗口就绪：1 条在途（listener 被闸住）+ {} 条留在缓冲",
+            "S1-window ready: 1 message in flight (listener gated) + {} messages held in the buffer",
             MSGS - 1
         ),
         ready,
@@ -389,25 +389,25 @@ async fn s1_drop_and_rebuild(fx: &Fixture, ck: &mut Checker) {
         ),
     );
 
-    // 服务端重置到 maxOffset：RPC2 写 resetOffsetTable，下一笔 pull 命中
-    // PullMessageProcessor:539-545 被短路成 OFFSET_RESET（nextBeginOffset=修正值）
+    // Server-side reset to maxOffset: RPC2 writes resetOffsetTable, and the next pull hits it
+    // and is short-circuited by the broker into OFFSET_RESET (nextBeginOffset=corrected value)
     if let Err(e) = fx
         .admin
         .reset_offset_by_queue_id(&fx.broker_addr, &group, &topic, 0, MSGS)
         .await
     {
-        println!("  [WARN] resetOffsetByQueueId 第 2 笔 RPC 被拒（本场景预期）: {e}");
+        println!("  [WARN] resetOffsetByQueueId 2nd RPC rejected (expected in this scenario): {e}");
     }
-    println!("S1: 已发出 resetOffsetByQueueId(->{MSGS})，等下一笔 pull 取走服务端重置...");
+    println!("S1: resetOffsetByQueueId(->{MSGS}) issued, waiting for the next pull to pick up the server-side reset...");
 
     let bumped = poll_until(|| c.queue_epoch(&key) >= 1, 45).await;
     ck.check(
-        "S1-broker 判定位点非法后本端丢弃该队列（ProcessQueue.setDropped：代号 +1）",
+        "S1-local side drops the queue after the broker rules the offset illegal (ProcessQueue.setDropped: epoch +1)",
         bumped,
         &format!("epoch={} arrivals={:?}", c.queue_epoch(&key), sink.arrivals()),
     );
 
-    // committed 的等待要点轮询：位点由本端的 persist 推给 broker，不是本地状态
+    // The committed-offset wait must poll: the offset is pushed to the broker by the local persist, not local state
     let mut ok = false;
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
@@ -423,7 +423,7 @@ async fn s1_drop_and_rebuild(fx: &Fixture, ck: &mut Checker) {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     ck.check(
-        &format!("S1-broker 上的位点停在修正值 {MSGS}（本场景两笔重置 RPC 已先写过一次，弱断言）"),
+        &format!("S1-committed offset on the broker stays at the corrected value {MSGS} (the two reset RPCs of this scenario already wrote it once; weak assertion)"),
         ok,
         &fmt(&fx.committed(&group, &topic).await),
     );
@@ -433,7 +433,7 @@ async fn s1_drop_and_rebuild(fx: &Fixture, ck: &mut Checker) {
     let arr = sink.arrivals();
     ck.check(
         &format!(
-            "S1-缓冲里已取回的 {} 条被整批作废（第 1、2 条永不投递）",
+            "S1-the {} messages pulled into the buffer are invalidated as a batch (offsets 1 and 2 are never delivered)",
             MSGS - 1
         ),
         !arr.is_empty() && !arr.contains(&1) && !arr.contains(&2),
@@ -450,7 +450,7 @@ async fn s1_drop_and_rebuild(fx: &Fixture, ck: &mut Checker) {
     let arr = sink.arrivals();
     ck.check(
         &format!(
-            "S1-重建后的队列从修正位点续拉（第 {MSGS} 条新消息正常投递，历史拿过的不重投）"
+            "S1-the rebuilt queue resumes pulling from the corrected offset (message {MSGS} is delivered normally, history already fetched is not redelivered)"
         ),
         got4 && !arr.contains(&1) && !arr.contains(&2),
         &format!("arrivals={arr:?}"),
@@ -470,7 +470,7 @@ async fn s1_drop_and_rebuild(fx: &Fixture, ck: &mut Checker) {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     ck.check(
-        &format!("S1-冻结随重建解除（新消息的 ack 让 broker 位点继续前进到 {}）", MSGS + 1),
+        &format!("S1-freeze is lifted by the rebuild (the ack of new messages advances the broker offset to {})", MSGS + 1),
         ok,
         &format!("committed={}", fmt(&fx.committed(&group, &topic).await)),
     );
@@ -510,12 +510,12 @@ async fn s2_immediate_persist(fx: &Fixture, ck: &mut Checker) {
     }
     let consumed = poll_until(|| sink.arrivals().len() == MSGS as usize, 30).await;
     ck.check(
-        &format!("S2-前置：消费者先正常消费掉 {MSGS} 条"),
+        &format!("S2-precondition: the consumer first consumes the {MSGS} messages normally"),
         consumed,
         &format!("arrivals={:?}", sink.arrivals()),
     );
-    // shutdown 的落盘是 spawn 出去的（不等它），必须先等 broker 上出现 3 再种非法值，
-    // 否则那次迟到落盘会把下面种进去的 103 覆盖回去。
+    // The persist on shutdown is spawned (not waited on); wait until the broker shows 3 before planting the illegal value,
+    // otherwise that late persist would overwrite the 103 planted below.
     c.shutdown();
     let persisted = {
         let mut ok = false;
@@ -527,7 +527,7 @@ async fn s2_immediate_persist(fx: &Fixture, ck: &mut Checker) {
                 break;
             }
             if Instant::now() >= deadline {
-                println!("  [WARN] shutdown persist 未落盘: {}", fmt(&rows));
+                println!("  [WARN] shutdown persist not landed: {}", fmt(&rows));
                 break;
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -535,7 +535,7 @@ async fn s2_immediate_persist(fx: &Fixture, ck: &mut Checker) {
         ok
     };
     ck.check(
-        "S2-前置：关停落盘把位点写到 maxOffset",
+        "S2-precondition: shutdown persist wrote the offset up to maxOffset",
         persisted,
         &fmt(&fx.committed(&group, &topic).await),
     );
@@ -554,18 +554,18 @@ async fn s2_immediate_persist(fx: &Fixture, ck: &mut Checker) {
         }
     }
     ck.check(
-        "S2-前置：越界目标被 resetOffsetInner 拒绝（第 2 笔 RPC）",
+        "S2-precondition: out-of-range target rejected by resetOffsetInner (2nd RPC)",
         rejected,
         &remark,
     );
     let rows = fx.committed(&group, &topic).await;
     ck.check(
-        &format!("S2-前置：第 1 笔 commitOffset 已把非法位点 {ILLEGAL_TARGET} 落库（两笔 RPC 非原子）"),
+        &format!("S2-precondition: the 1st commitOffset already stored the illegal offset {ILLEGAL_TARGET} (the two RPCs are not atomic)"),
         !rows.is_empty() && rows.iter().all(|(_, o)| *o == Some(ILLEGAL_TARGET)),
         &fmt(&rows),
     );
 
-    // 周期落盘拉长到 60s：窗口内唯一能改写 broker 位点的路径是纠错分支自带的立即 persist
+    // Periodic persist stretched to 60s: within the window the only path that can rewrite the broker offset is the immediate persist built into the correction branch
     let l2 = RecordingListener::new();
     let c2 = match fx.consumer(&group, "persist2", &topic, 1, true, Some(60_000)) {
         Ok(c) => c,
@@ -582,7 +582,7 @@ async fn s2_immediate_persist(fx: &Fixture, ck: &mut Checker) {
         return;
     }
     println!(
-        "S2: 新消费者从非法位点 {ILLEGAL_TARGET} 起拉，等纠错把 broker 位点写回 {MSGS}（周期落盘=60s）..."
+        "S2: the new consumer starts pulling from the illegal offset {ILLEGAL_TARGET}, waiting for the correction to write the broker offset back to {MSGS} (periodic persist=60s)..."
     );
     let mut ok = false;
     let mut last;
@@ -601,22 +601,22 @@ async fn s2_immediate_persist(fx: &Fixture, ck: &mut Checker) {
     let elapsed = t0.elapsed();
     ck.check(
         &format!(
-            "S2-broker 位点由 {ILLEGAL_TARGET} 纠回 {MSGS}（纠错分支自带的那次 persist）"
+            "S2-broker offset corrected from {ILLEGAL_TARGET} back to {MSGS} (the persist built into the correction branch)"
         ),
         ok,
         &format!("elapsed={:.1}s committed={}", elapsed.as_secs_f64(), fmt(&last)),
     );
 
-    // 再等一个静默窗口：位点被纠回后不会回头重投 0..2，也不会再被改写
+    // Then wait one more silent window: after the correction the offset does not go back and redeliver 0..2, nor is it rewritten again
     tokio::time::sleep(Duration::from_secs(6)).await;
     ck.check(
-        "S2-全程零投递（修正位点落在历史消息之后，一条都不下发）",
+        "S2-zero deliveries throughout (the corrected offset lands after the historical messages, none are dispatched)",
         l2.arrivals().is_empty(),
         &format!("arrivals={:?}", l2.arrivals()),
     );
     let rows = fx.committed(&group, &topic).await;
     ck.check(
-        &format!("S2-静默窗口后位点仍停在 {MSGS}"),
+        &format!("S2-after the silent window the offset still stays at {MSGS}"),
         !rows.is_empty() && rows.iter().all(|(_, o)| *o == Some(MSGS)),
         &fmt(&rows),
     );
@@ -626,7 +626,7 @@ async fn s2_immediate_persist(fx: &Fixture, ck: &mut Checker) {
 
 async fn cleanup(fx: &Fixture, topic: &str, group: &str) {
     if let Err(e) = fx.admin.delete_topic(topic, None).await {
-        println!("    (deleteTopic({topic}) 失败: {e})");
+        println!("    (deleteTopic({topic}) failed: {e})");
     } else {
         println!("    (deleteTopic({topic}) OK)");
     }
@@ -635,7 +635,7 @@ async fn cleanup(fx: &Fixture, topic: &str, group: &str) {
         .delete_subscription_group(&fx.broker_addr, group, true)
         .await
     {
-        println!("    (deleteSubscriptionGroup({group}) 失败: {e})");
+        println!("    (deleteSubscriptionGroup({group}) failed: {e})");
     }
 }
 
@@ -644,11 +644,11 @@ async fn run(namesrv: &str) -> Checker {
     let fx = match Fixture::new(namesrv).await {
         Ok(fx) => fx,
         Err(e) => {
-            ck.check("集群探活", false, &e);
+            ck.check("cluster probe", false, &e);
             return ck;
         }
     };
-    ck.check("集群探活", true, &format!("broker={}", fx.broker_addr));
+    ck.check("cluster probe", true, &format!("broker={}", fx.broker_addr));
     s1_drop_and_rebuild(&fx, &mut ck).await;
     s2_immediate_persist(&fx, &mut ck).await;
     fx.shutdown();
@@ -656,7 +656,7 @@ async fn run(namesrv: &str) -> Checker {
 }
 
 fn report(ck: &mut Checker) {
-    println!("\n== 结果：{} PASS / {} FAIL ==", ck.passed, ck.failed.len());
+    println!("\n== Result: {} PASS / {} FAIL ==", ck.passed, ck.failed.len());
     for f in &ck.failed {
         println!("  FAILED: {f}");
     }

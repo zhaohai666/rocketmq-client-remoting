@@ -1,10 +1,11 @@
-// 进程内假集群（1 个 namesrv + N 个 broker，只说 remoting 协议）。
+// An in-process fake cluster (1 namesrv + N brokers, speaking only the remoting protocol).
 //
-// 真集群造不出 SYSTEM_BUSY，也造不出「慢 broker 把总预算吃光」，而这两条恰好是发送内核
-// 的全部难点，所以这里把每个 broker 的应答码、应答延迟与「干脆不回」脚本化。
+// A real cluster cannot produce SYSTEM_BUSY, and it cannot produce "a slow broker eats
+// the whole budget" either, yet those two are the entire difficulty of the send kernel,
+// so each broker's response code, response delay and "simply never answers" is scripted here.
 //
-// 从 SendRetryTests 抽出来说给两类用例共用：同步重试内核（SendRetryTests）与异步发送
-// 内核（ProducerAsyncTests）。
+// Extracted out of SendRetryTests to be shared by two kinds of cases: the synchronous
+// retry kernel (SendRetryTests) and the async send kernel (ProducerAsyncTests).
 using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Globalization;
@@ -13,20 +14,23 @@ using System.Net.Sockets;
 using RocketMQ.Common;
 using RocketMQ.Remoting;
 using RocketMQ.Remoting.Protocol;
-// PropertyMap 是 src 侧的 global using 别名（SortedDictionary<string,string>），测试项目要显式声明。
+// PropertyMap is a global using alias on the src side (SortedDictionary<string,string>), so the test project has to declare it explicitly.
 using PropertyMap = System.Collections.Generic.SortedDictionary<string, string>;
 
 namespace RocketMQ.Client.Tests;
 
 /// <summary>
-/// 一笔上线报文的取证：请求码（发送/路由/心跳…）、opaque、extFields 和原始 body。
-/// 客户端自说自话不算证据，只有从 socket 上抓下来的字段才能证明钩子真的生效了。
+/// The evidence of one request that went on the wire: the request code
+/// (send/route/heartbeat...), opaque, extFields and the raw body. The client talking
+/// about itself does not count as evidence -- only fields captured off the socket prove
+/// that a hook really took effect.
 /// </summary>
 internal sealed class WireRecord
 {
     public int Code { get; init; }
 
-    /// <summary>上线时的 opaque（重试链要求每轮换新值，否则两次尝试的应答串台）。</summary>
+    /// <summary>The opaque at the time it went on the wire (the retry chain requires a
+    /// new value each round, otherwise the responses of two attempts cross wires).</summary>
     public int Opaque { get; init; }
 
     public PropertyMap Ext { get; init; } = new();
@@ -35,8 +39,9 @@ internal sealed class WireRecord
 
     public byte Language { get; init; }
 
-    /// <summary>到达时刻（ms，相对 <see cref="MockCluster.ClockOrigin" />）。
-    /// 定时任务的节奏断言只能靠它：报文内容完全正常，只有到达时刻能证明周期对不对。</summary>
+    /// <summary>The arrival instant (ms, relative to <see cref="MockCluster.ClockOrigin" />).
+    /// The rhythm assertions of timed tasks depend on it alone: the request content is
+    /// perfectly normal and only the arrival instant proves the period is right.</summary>
     public long ArrivalMs { get; init; }
 
     public static WireRecord Of(RemotingCommand req, long arrivalMs = 0) => new()
@@ -50,7 +55,8 @@ internal sealed class WireRecord
         ArrivalMs = arrivalMs,
     };
 
-    /// <summary>还原成裸报文，用来做 broker 侧的验签复算。</summary>
+    /// <summary>Restored into a raw request, used to recompute the signature broker
+    /// side.</summary>
     public RemotingCommand ToCommand()
     {
         var cmd = RemotingCommand.CreateRequestCommand(Code, null);
@@ -66,18 +72,22 @@ internal sealed class WireRecord
 }
 
 /// <summary>
-/// 进程内假集群。broker 名固定为 broker-0..N，路由里的队列顺序与之一致，
-/// 因此第一次发送必然落在 broker-0（选队是轮询，游标从 0 起）。
+/// An in-process fake cluster. Broker names are fixed as broker-0..N and the queue order
+/// in the route matches, so the first send necessarily lands on broker-0 (queue selection
+/// is round-robin and the cursor starts at 0).
 /// </summary>
 internal sealed class MockCluster : IDisposable
 {
-    /// <summary>脚本里表示「收下沉不应答」的哨兵应答码：把客户端逼到超时。</summary>
+    /// <summary>The sentinel response code in the script meaning "receive but do not
+    /// answer": it forces the client into a timeout.</summary>
     public const int NoReply = -1;
 
-    /// <summary>取证的条数上限：后台线程会持续打，留几百条足够判断"有没有打标"。</summary>
+    /// <summary>Cap on the number of evidence records: background threads keep sending,
+    /// a few hundred is enough to tell "was it tagged or not".</summary>
     private const int RequestLogCap = 500;
 
-    /// <summary>单帧长度上限，超了直接断开（和客户端的判据一致）。</summary>
+    /// <summary>Cap on a single frame's length; beyond it the connection is dropped
+    /// directly (the same criterion the client uses).</summary>
     private const int MaxFrame = 20 * 1024 * 1024;
 
     private readonly object _gate = new();
@@ -90,7 +100,8 @@ internal sealed class MockCluster : IDisposable
 
     public string NamesrvAddr { get; private init; } = string.Empty;
 
-    /// <summary>路由里 broker-N 的地址（与下标同序）；<see cref="DeadAddr"/> 那几台没人监听。</summary>
+    /// <summary>The address of broker-N in the route (in the same order as the index);
+    /// nobody is listening on the <see cref="DeadAddr" /> ones.</summary>
     public IReadOnlyList<string> BrokerAddrs
     {
         get
@@ -102,7 +113,8 @@ internal sealed class MockCluster : IDisposable
         }
     }
 
-    /// <summary>单个 broker 的脚本：按顺序弹出 (应答码, 应答前 sleep 毫秒)，耗尽后一直用 Tail。</summary>
+    /// <summary>A single broker's script: pops (response code, sleep ms before
+    /// responding) in order, then keeps using Tail forever once exhausted.</summary>
     private sealed class BrokerScript
     {
         public Queue<(int Code, int DelayMs)> Steps { get; } = new();
@@ -111,14 +123,16 @@ internal sealed class MockCluster : IDisposable
         public readonly List<int> SendOpaques = new();
     }
 
-    /// <summary>起 brokerCount 个真监听的 broker + 一个 namesrv。</summary>
+    /// <summary>Starts brokerCount really-listening brokers plus one namesrv.</summary>
     public static MockCluster Start(int brokerCount, bool routeOk = true) =>
         StartAt(Enumerable.Repeat<string?>(null, brokerCount).ToList(), routeOk);
 
     /// <summary>
-    /// 按给定的地址表起集群：<b>null = 起一个真监听的 mock broker</b>，非 null 原样写进路由
-    /// （塞 <see cref="DeadAddr" /> 就能造出「这台 broker 建连必败」）。broker 名仍是
-    /// broker-0..N，所以 <see cref="Requests" /> 的下标与这里的顺序一致。
+    /// Starts the cluster with the given address table: <b>null = start a really-listening
+    /// mock broker</b>, non-null is written into the route verbatim (putting
+    /// <see cref="DeadAddr" /> there produces "connecting to this broker always
+    /// fails"). Broker names are still broker-0..N, so the index of
+    /// <see cref="Requests" /> matches the order here.
     /// </summary>
     public static MockCluster StartAt(List<string?> addrs, bool routeOk = true)
     {
@@ -147,7 +161,8 @@ internal sealed class MockCluster : IDisposable
         return cluster;
     }
 
-    /// <summary>只起 namesrv，路由指向给定地址（可以用一个已经关掉的端口造连接失败）。</summary>
+    /// <summary>Starts only the namesrv, with the route pointing at the given address (an
+    /// already-closed port can be used to produce a connect failure).</summary>
     public static MockCluster WithAddrs(List<string> brokerAddrs, bool routeOk = true)
     {
         Socket namesrv = BindLoopback();
@@ -169,7 +184,8 @@ internal sealed class MockCluster : IDisposable
         return cluster;
     }
 
-    /// <summary>脚本化第 index 个 broker：先按 steps 依次应答，之后一直用 tail。</summary>
+    /// <summary>Scripts the index-th broker: replies following steps first, then uses
+    /// tail forever.</summary>
     public void Script(int index, List<(int Code, int DelayMs)> steps,
         (int Code, int DelayMs) tail)
     {
@@ -188,13 +204,15 @@ internal sealed class MockCluster : IDisposable
         }
     }
 
-    /// <summary>让第 index 个 broker 从此**收而不答**（把客户端逼到响应超时）。</summary>
+    /// <summary>Makes the index-th broker **receive but never answer** from now on (forcing
+    /// the client into a response timeout).</summary>
     public void MakeSilent(int index) =>
         Script(index, new List<(int, int)>(), (NoReply, 0));
 
     /// <summary>
-    /// 给某个请求码挂应答体（按 broker 生效）。用于那些"没有 body 就等于失败"的管理类调用 ——
-    /// 比如 222 的调用方要求至少一台 broker 回了非空 ResetOffsetBody。
+    /// Attaches a response body to a request code (per broker). Used for those admin
+    /// calls where "no body equals failure" -- e.g. the caller of 222 requires at least
+    /// one broker to return a non-empty ResetOffsetBody.
     /// </summary>
     public void SetReplyBody(int code, Func<RemotingCommand, byte[]> bodyFor)
     {
@@ -209,8 +227,10 @@ internal sealed class MockCluster : IDisposable
     private Func<RemotingCommand, byte[]>? _routeBodyFor;
 
     /// <summary>
-    /// 覆盖 name server 的路由应答体（每笔请求现算）。默认那台固定路由每台只有一个队列，
-    /// 而「消费者跑起来之后 topic 扩缩容」这类用例必须能改读队列数。
+    /// Overrides the name server's route response body (computed per request). By default
+    /// that fixed route has only one queue per broker, and cases like "the topic scales
+    /// up/down after the consumer has started" must be able to change the read queue
+    /// count.
     /// </summary>
     public void SetRouteBody(Func<RemotingCommand, byte[]> bodyFor)
     {
@@ -221,8 +241,10 @@ internal sealed class MockCluster : IDisposable
     }
 
     /// <summary>
-    /// 一笔脚本化的 PULL_MESSAGE 应答（FIFO 命中，每笔只回一次）。<see cref="Gate" /> 非空时
-    /// 应答先等它 —— 用来把「请求已到 broker、应答还在路上」的窗口拉成确定性的。
+    /// A scripted PULL_MESSAGE response (FIFO hit, replied once per request). When
+    /// <see cref="Gate" /> is non-null the response first waits on it -- used to turn the
+    /// "the request has reached the broker, the response is still on its way" window
+    /// into a deterministic one.
     /// </summary>
     internal sealed class ScriptedPull
     {
@@ -257,7 +279,7 @@ internal sealed class MockCluster : IDisposable
             script = _pullScripts.Count > 0 ? _pullScripts.Dequeue() : null;
         }
 
-        // 5s 兜底：用例失败时也不能把连接线程永久卡住（Dispose 会等它）。
+        // A 5s backstop: even when a case fails it must not block a connection thread forever (Dispose waits on it).
         script?.Gate?.Wait(TimeSpan.FromSeconds(5));
 
         if (script is null)
@@ -286,7 +308,7 @@ internal sealed class MockCluster : IDisposable
         return resp;
     }
 
-    /// <summary>第 index 个 broker 收到的 SEND 请求数。</summary>
+    /// <summary>The number of SEND requests the index-th broker received.</summary>
     public int Requests(int index)
     {
         lock (_gate)
@@ -296,8 +318,10 @@ internal sealed class MockCluster : IDisposable
     }
 
     /// <summary>
-    /// 第 index 个 broker 上第 n 笔（从 0 起）**发送**请求的 opaque；还没收到这么多笔时返回
-    /// <see cref="int.MinValue" />。异步重试链要求每轮换新 opaque，并发发送要求两两不重复。
+    /// The opaque of the n-th (from 0) **send** request on the index-th broker; it
+    /// returns <see cref="int.MinValue" /> when that many have not arrived yet. The async
+    /// retry chain requires a new opaque each round and concurrent sends require them to
+    /// differ pairwise.
     /// </summary>
     public int SendOpaque(int index, int n)
     {
@@ -308,7 +332,8 @@ internal sealed class MockCluster : IDisposable
         }
     }
 
-    /// <summary>记下每一笔上线报文（namesrv 与 broker 都算），供钩子类断言回查。</summary>
+    /// <summary>Records every request that goes on the wire (both namesrv and broker), for
+    /// hook assertions to look back at.</summary>
     private void Record(RemotingCommand req)
     {
         lock (_gate)
@@ -320,7 +345,8 @@ internal sealed class MockCluster : IDisposable
         }
     }
 
-    /// <summary>假集群起点的单调钟（<see cref="WireRecord.ArrivalMs" /> 的时间原点）。</summary>
+    /// <summary>The monotonic clock at the fake cluster's start point (the time origin of
+    /// <see cref="WireRecord.ArrivalMs" />).</summary>
     public long ClockOrigin => _clock.ElapsedMilliseconds;
 
     public void ClearRequests()
@@ -332,8 +358,9 @@ internal sealed class MockCluster : IDisposable
     }
 
     /// <summary>
-    /// 按到达顺序取出全部取证快照。判「谁先谁后」时唯一的落点 ——
-    /// 比如注销(35) 必须排在业务发送之后、且走的是还没关的那条长连接。
+    /// Takes out all the evidence snapshots in arrival order. The only landing point for
+    /// deciding "who came first" -- for example an unregister(35) must come after the
+    /// business send, and over the long connection that is not closed yet.
     /// </summary>
     public List<WireRecord> Records()
     {
@@ -343,7 +370,7 @@ internal sealed class MockCluster : IDisposable
         }
     }
 
-    /// <summary>指定请求码上收到过多少笔请求。</summary>
+    /// <summary>How many requests were received on the given request code.</summary>
     public int CountRequests(int code)
     {
         lock (_gate)
@@ -352,7 +379,8 @@ internal sealed class MockCluster : IDisposable
         }
     }
 
-    /// <summary>指定请求码上，extFields 里 key=value 命中了多少笔。</summary>
+    /// <summary>On the given request code, how many requests had key=value in
+    /// extFields.</summary>
     public int CountRequestsWith(int code, string key, string value)
     {
         lock (_gate)
@@ -370,7 +398,8 @@ internal sealed class MockCluster : IDisposable
         }
     }
 
-    /// <summary>第 n 笔（从 0 起）发送请求的取证，跨 broker 按到达顺序。</summary>
+    /// <summary>The evidence of the n-th (from 0) send request, across brokers in
+    /// arrival order.</summary>
     public WireRecord? SendRequestAt(int n)
     {
         lock (_gate)
@@ -379,7 +408,8 @@ internal sealed class MockCluster : IDisposable
         }
     }
 
-    /// <summary>指定请求码里是否有任何一笔带了这个 extField。</summary>
+    /// <summary>Whether any request on the given request code carried this
+    /// extField.</summary>
     public bool AnyRequestHas(int code, string key)
     {
         lock (_gate)
@@ -398,7 +428,7 @@ internal sealed class MockCluster : IDisposable
             }
             catch (Exception)
             {
-                // 关闭监听端口时不需要处理任何异常
+                // Closing the listening port does not need any exception handling
             }
         }
     }
@@ -435,8 +465,9 @@ internal sealed class MockCluster : IDisposable
     private RemotingCommand? BrokerRespond(int index, RemotingCommand req)
     {
         Record(req);
-        // 361 与 11 都按拉取应答：客户端是否切码由离线用例单独断言（#107），
-        // 这里只管「码换对了也得能通」。
+        // Both 361 and 11 are answered as pull responses: whether the client switches
+        // code is asserted separately by offline cases (#107); this only covers "the code
+        // has to work once it is switched too".
         if (req.Code == RequestCode.PullMessage || req.Code == RequestCode.LitePullMessage)
         {
             return req.IsOnewayRpc() ? null : PullRespond(req);
@@ -458,7 +489,7 @@ internal sealed class MockCluster : IDisposable
                 return withBody;
             }
 
-            // 心跳等非发送请求一律应答成功，别让后台线程卡在错误上
+            // Heartbeats and other non-send requests are always answered successfully, do not let the background thread get stuck on an error
             return req.IsOnewayRpc() ? null : Respond(req, ResponseCode.Success, null);
         }
 
@@ -489,7 +520,7 @@ internal sealed class MockCluster : IDisposable
             code == ResponseCode.Success ? null : "mock failure");
         if (IsStoreStatus(code))
         {
-            // 只有 broker 真的收了消息才有 msgId/queueOffset 可回
+            // Only when the broker really took the message is there a msgId/queueOffset to reply with
             resp.AddExtField("msgId", "MOCK-" + index.ToString(CultureInfo.InvariantCulture)
                                          + "-" + seq.ToString(CultureInfo.InvariantCulture));
             resp.AddExtField("queueId", "0");
@@ -508,7 +539,8 @@ internal sealed class MockCluster : IDisposable
             or RequestCode.SendBatchMessage or RequestCode.SendReplyMessage
             or RequestCode.SendReplyMessageV2;
 
-    /// <summary>路由里的队列顺序与 broker 名一致，且每台只有一个队列。</summary>
+    /// <summary>The queue order in the route matches the broker names, and each has only
+    /// one queue.</summary>
     private static byte[] BuildRoute(List<string> brokerAddrs)
     {
         var route = new TopicRouteData();
@@ -530,7 +562,7 @@ internal sealed class MockCluster : IDisposable
     private static RemotingCommand Respond(RemotingCommand req, int code, string? remark)
     {
         var resp = RemotingCommand.CreateResponseCommand(code, remark);
-        // 客户端按 opaque 配对，串了的响应会被当噪声丢掉
+        // The client pairs requests by opaque, a cross-wired response is dropped as noise
         resp.Opaque = req.Opaque;
         resp.SerializeTypeCurrentRpc = req.SerializeTypeCurrentRpc;
         return resp;
@@ -557,9 +589,11 @@ internal sealed class MockCluster : IDisposable
     }
 
     /// <summary>
-    /// accept 循环：每条连接一个线程。这里刻意用**专用线程**而不是 Task ——
-    /// 读帧和脚本化延迟都是阻塞调用，几百个卡在 Read 上的工作项会让线程池饥饿，
-    /// 实测把下一次 accept 拖到秒级，计时断言就成了假失败。
+    /// The accept loop: one thread per connection. A **dedicated thread** is used here
+    /// rather than a Task on purpose -- reading a frame and the scripted delay are both
+    /// blocking calls, and a few hundred work items stuck in Read would starve the thread
+    /// pool; measured, that drags the next accept out to seconds and turns the timing
+    /// assertions into false failures.
     /// </summary>
     private static void Serve(Socket listener, Func<RemotingCommand, RemotingCommand?> respond)
     {
@@ -574,7 +608,7 @@ internal sealed class MockCluster : IDisposable
                 }
                 catch (Exception)
                 {
-                    return; // Dispose 之后 Accept 必然抛，正常收工
+                    return; // after Dispose, Accept necessarily throws, this is a normal shutdown
                 }
 
                 new Thread(() =>
@@ -587,7 +621,7 @@ internal sealed class MockCluster : IDisposable
                         }
                         catch (Exception)
                         {
-                            // 半路断连、解码失败：丢掉这条连接即可
+                            // A mid-stream disconnect or a decode failure: just drop this connection
                         }
                     }
                 })

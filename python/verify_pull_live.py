@@ -1,24 +1,34 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""主动拉取消费者（DefaultMQPullConsumer）真机验证。
+"""Verification of the active-pull consumer (DefaultMQPullConsumer) against a real machine.
 
-用法（需本地 RocketMQ 5.5.1 集群）：
+Usage (requires a local RocketMQ 5.5.1 cluster):
     .venv/bin/python verify_pull_live.py 127.0.0.1:9876
 
-为什么单独测：`DefaultMQPullConsumer` 在项目里存在已久，但**从未被任何测试或联调脚本
-调用过**（grep 全仓 0 命中）——也就是说它是"纸面能力"。本脚本把它真正跑起来。
+Why it is tested on its own: `DefaultMQPullConsumer` has existed in this project for a long
+time but has **never been called by any test or integration script** (grep finds 0 hits across
+the whole repository) -- in other words, it was a "paper capability". This script actually runs
+it.
 
-场景（拉模式的核心是「调用方自己拉、自己管位点」，所以断言都围绕这一点）：
-  S1 建 topic + fetch_subscribe_message_queues → 拿到 4 个队列
-  S2 生产 12 条 → 每队列 min/max offset 差值 = 3（消息均匀落到 4 队列）
-  S3 **手动拉取**：逐队列从 min offset 拉到 max offset → 收全 12 条且 body 与发送集合一致
-  S4 **手动提交位点**：update_consume_offset → fetch_consume_offset 回读一致（broker 往返）
-  S5 **位点由调用方掌控**：从已提交位点再拉 → NO_NEW_MSG；把位点退回 min 再拉 → FOUND
-     （push 模式做不到这一点，这正是 pull 模式的存在意义）
-  S6 search_offset(now) / earliest_msg_store_time → 均 > 0
-  S7 send_message_back → 消息落到 %RETRY%group，可被拉取到（回投链路真实可用）
-  S8 fetch_message_queues_in_balance → 只给本实例那份，两实例不重叠且合起来覆盖全组
-     （判据是「从没拉取过的实例也拿到非空」：算不动时的兜底是保留现有分配=空集）
+Scenarios (the core of the pull mode is that "the caller pulls and owns the offsets", so every
+assertion revolves around that):
+  S1 create topic + fetch_subscribe_message_queues -> obtain 4 queues
+  S2 produce 12 messages -> the min/max offset difference of each queue = 3 (the messages are
+     spread evenly over the 4 queues)
+  S3 **manual pulling**: per queue, pull from the min offset to the max offset -> collect all 12
+     messages and their bodies match the sent set
+  S4 **manual offset commit**: update_consume_offset -> fetch_consume_offset reads back the same
+     value (a real round trip to the broker)
+  S5 **the caller owns the offsets**: pulling again from the committed offset -> NO_NEW_MSG; moving
+     the offset back to min and pulling again -> FOUND (the push mode cannot do this, which is
+     exactly the reason the pull mode exists)
+  S6 search_offset(now) / earliest_msg_store_time -> both > 0
+  S7 send_message_back -> the message lands in %RETRY%group and can be pulled (the send-back chain
+     really works)
+  S8 fetch_message_queues_in_balance -> each instance only gets its own share; the two shares do
+     not overlap and together cover the whole group (the criterion is "an instance that never pulled
+     also gets a non-empty result": the fallback when the computation fails is to keep the existing
+     assignment, that is, an empty set)
 """
 from __future__ import annotations
 
@@ -65,7 +75,7 @@ def make_consumer() -> DefaultMQPullConsumer:
 
 
 def prepare_topic() -> None:
-    """先建 topic 再起消费者：消费者不做默认 topic 兜底，topic 不存在就拿不到路由。"""
+    """Create the topic first and only then start the consumer: the consumer does not fall back to a default topic, so without the topic it cannot get a route."""
     prod = DefaultMQProducer("PG_Prepare_%d" % STAMP)
     prod.set_namesrv_addr(NAMESRV)
     prod.start()
@@ -92,7 +102,7 @@ def prepare_topic() -> None:
 
 def safe_pull(consumer: DefaultMQPullConsumer, q: MessageQueue, expr: str, offset: int,
               max_nums: int = 32, timeout: int = 5000):
-    """包一层 pull：超时/网络异常返回 (None, detail)，让断言能报 FAIL 而不是抛栈中断脚本。"""
+    """Wrap a pull: a timeout / network exception returns (None, detail), so that an assertion can report FAIL instead of a stack trace aborting the script."""
     try:
         return consumer.pull(q, expr, offset, max_nums, timeout), ""
     except RemotingException as e:
@@ -100,11 +110,11 @@ def safe_pull(consumer: DefaultMQPullConsumer, q: MessageQueue, expr: str, offse
 
 
 def scenario_queues(consumer: DefaultMQPullConsumer):
-    print("\nS1 建 topic + fetch_subscribe_message_queues")
+    print("\nS1 create topic + fetch_subscribe_message_queues")
     queues = consumer.fetch_subscribe_message_queues(TOPIC)
-    check("S1 拿到 %d 个队列" % QUEUE_NUM, len(queues) == QUEUE_NUM,
+    check("S1 obtained %d queues" % QUEUE_NUM, len(queues) == QUEUE_NUM,
           "got=%d" % len(queues))
-    check("S1 队列 topic 与 broker 名非空",
+    check("S1 the queue topic and the broker name are not empty",
           bool(queues) and all(q.topic == TOPIC and q.broker_name for q in queues),
           "sample=%s/%s" % ((queues[0].broker_name, queues[0].queue_id) if queues else "n/a",
                             len(queues)))
@@ -112,7 +122,7 @@ def scenario_queues(consumer: DefaultMQPullConsumer):
 
 
 def scenario_produce() -> list:
-    print("\nS2 生产 %d 条" % N_MSG)
+    print("\nS2 produce %d messages" % N_MSG)
     prod = DefaultMQProducer("PG_PullLive_%d" % STAMP)
     prod.set_namesrv_addr(NAMESRV)
     prod.start()
@@ -126,14 +136,16 @@ def scenario_produce() -> list:
             sent.append(body)
     finally:
         prod.shutdown()
-    check("S2 生产 %d 条成功" % N_MSG, len(sent) == N_MSG, "sent=%d" % len(sent))
+    check("S2 producing %d messages succeeded" % N_MSG, len(sent) == N_MSG, "sent=%d" % len(sent))
     return sent
 
 
 def wait_offsets(consumer: DefaultMQPullConsumer, routes, expect: int):
-    """等 consumequeue 异步分发落地：轮询到各队列 max-min 之和 >= expect。
+    """Wait for the asynchronous consumequeue dispatch to land: poll until the sum of max-min over
+    all queues is >= expect.
 
-    ⚠ 不能"刚发完立刻查 maxOffset"——broker 是异步分发的，会读到 0。
+    CAUTION: you must not "query maxOffset right after sending" -- the broker dispatches
+    asynchronously, so you would read 0.
     """
     deadline = time.time() + 25
     lo = {}
@@ -151,7 +163,7 @@ def wait_offsets(consumer: DefaultMQPullConsumer, routes, expect: int):
 
 
 def scenario_pull(consumer: DefaultMQPullConsumer, routes, lo, hi, sent_set) -> set:
-    print("\nS3 手动拉取（逐队列 min -> max）")
+    print("\nS3 manual pulling (per queue, min -> max)")
     got = set()
     for q in routes:
         offset = lo[q]
@@ -160,7 +172,7 @@ def scenario_pull(consumer: DefaultMQPullConsumer, routes, lo, hi, sent_set) -> 
             guard += 1
             result, err = safe_pull(consumer, q, "*", offset)
             if result is None:
-                check("S3 拉取 %s:%d 异常" % (q.broker_name, q.queue_id), False, err)
+                check("S3 pulling %s:%d raised an exception" % (q.broker_name, q.queue_id), False, err)
                 break
             if result.status == PullStatus.FOUND:
                 for m in result.msg_found_list:
@@ -173,40 +185,41 @@ def scenario_pull(consumer: DefaultMQPullConsumer, routes, lo, hi, sent_set) -> 
             elif result.status == PullStatus.OFFSET_ILLEGAL:
                 break
             else:
-                check("S3 拉取 %s:%d 状态异常" % (q.broker_name, q.queue_id), False,
+                check("S3 the status of the pull from %s:%d is unexpected" % (q.broker_name, q.queue_id), False,
                       "status=%s" % result.status)
                 break
-    check("S3 手动拉取收全 %d 条且内容一致" % N_MSG, got == sent_set,
+    check("S3 manual pulling collected all %d messages with matching content" % N_MSG, got == sent_set,
           "got=%d missing=%s extra=%s" % (len(got), sorted(sent_set - got),
                                           sorted(got - sent_set)))
     return got
 
 
 def scenario_commit(consumer: DefaultMQPullConsumer, q, target: int) -> int:
-    print("\nS4 手动提交位点并回读")
+    print("\nS4 manually commit the offset and read it back")
     consumer.update_consume_offset(q, target)
     back = consumer.fetch_consume_offset(q)
-    check("S4 位点提交后回读一致", back == target,
+    check("S4 the offset read back after the commit matches", back == target,
           "committed=%s target=%d" % (back, target))
     return target
 
 
 def scenario_own_offset(consumer: DefaultMQPullConsumer, q, committed: int, lo: int) -> None:
-    print("\nS5 位点由调用方掌控")
+    print("\nS5 the caller owns the offset")
     r1, err1 = safe_pull(consumer, q, "*", committed)
     if r1 is None:
-        check("S5 从已提交位点再拉 = NO_NEW_MSG", False, err1)
+        check("S5 pulling again from the committed offset = NO_NEW_MSG", False, err1)
     else:
-        check("S5 从已提交位点再拉 = NO_NEW_MSG",
+        check("S5 pulling again from the committed offset = NO_NEW_MSG",
               r1.status == PullStatus.NO_NEW_MSG and len(r1.msg_found_list) == 0,
               "status=%s n=%d" % (r1.status, len(r1.msg_found_list)))
 
-    # 关键能力：把位点退回 min，就能把同一批消息**再拉一次**（push 模式做不到）
+    # The key capability: moving the offset back to min lets you **pull the same messages again**
+    # (which the push mode cannot do)
     r2, err2 = safe_pull(consumer, q, "*", lo)
     if r2 is None:
-        check("S5 位点退回 min 后可重拉（pull 模式的核心能力）", False, err2)
+        check("S5 after moving the offset back to min they can be pulled again (the core capability of the pull mode)", False, err2)
     else:
-        check("S5 位点退回 min 后可重拉（pull 模式的核心能力）",
+        check("S5 after moving the offset back to min they can be pulled again (the core capability of the pull mode)",
               r2.status == PullStatus.FOUND and len(r2.msg_found_list) > 0,
               "status=%s n=%d" % (r2.status, len(r2.msg_found_list)))
 
@@ -224,17 +237,17 @@ def scenario_offset_query(consumer: DefaultMQPullConsumer, q, lo: int, hi: int) 
 def scenario_send_back(consumer: DefaultMQPullConsumer, sample: MessageExt,
                        expect_body: bytes) -> None:
     pass
-    print("\nS7 send_message_back -> %%RETRY%%group 可拉取")
+    print("\nS7 send_message_back -> %%RETRY%%group can be pulled")
     try:
-        # delayLevel=0 时 broker 改写成 3 + reconsumeTimes（默认 10s 延迟）
+        # When delayLevel=0 the broker rewrites it to 3 + reconsumeTimes (the default 10s delay)
         consumer.send_message_back(sample, 0)
-        check("S7 回投请求被 broker 接受", True,
+        check("S7 the send-back request was accepted by the broker", True,
               "offset=%d body=%s" % (sample.commit_log_offset, bytes(sample.body)))
     except BaseException as e:  # noqa: BLE001
-        check("S7 回投请求被 broker 接受", False, "%s: %s" % (type(e).__name__, e))
+        check("S7 the send-back request was accepted by the broker", False, "%s: %s" % (type(e).__name__, e))
         return
 
-    # 等延迟消息落地后拉 %RETRY%group
+    # After the delayed message lands, pull %RETRY%group
     found = False
     detail = "not tried"
     deadline = time.time() + 40
@@ -268,7 +281,7 @@ def scenario_send_back(consumer: DefaultMQPullConsumer, sample: MessageExt,
                 break
         if not found:
             time.sleep(1)
-    check("S7 %%RETRY%% 拉到了被回投的消息", found, detail)
+    check("S7 %%RETRY%% pulled the message that was sent back", found, detail)
 
 
 def scenario_balance_view(consumer: DefaultMQPullConsumer) -> None:
@@ -289,21 +302,21 @@ def scenario_balance_view(consumer: DefaultMQPullConsumer) -> None:
             if len(cid_all) >= 2:
                 break
             time.sleep(1)
-        check("S8 broker 的 38 数得出组里两个实例（心跳真的注册进了 consumerTable）",
+        check("S8 the broker's 38 counts two instances of the group (the heartbeat really registered into consumerTable)",
               len(cid_all) >= 2, "cid_all=%s" % sorted(cid_all))
 
         mine_a = consumer.fetch_message_queues_in_balance(TOPIC)
         mine_b = b.fetch_message_queues_in_balance(TOPIC)
-        check("S8 从未拉取过的实例也算出了自己那份（证明走的是路由+38，不是兜底）",
+        check("S8 the instance that never pulled also computed its own share (proving it went through the route + 38, not the fallback)",
               len(mine_b) > 0, "b pulled nothing, mine_b=%d" % len(mine_b))
-        check("S8 两个实例的份额都落在订阅视图里",
+        check("S8 the shares of both instances are contained in the subscription view",
               set(key(mine_a)) <= set(key(whole)) and set(key(mine_b)) <= set(key(whole)),
               "a=%s b=%s" % (key(mine_a), key(mine_b)))
         overlap = set(key(mine_a)) & set(key(mine_b))
-        check("S8 两个实例的份额不重叠（重叠=同一条消息被消费两次）",
+        check("S8 the shares of the two instances do not overlap (an overlap means the same message is consumed twice)",
               len(overlap) == 0, "a=%s b=%s overlap=%s"
               % (key(mine_a), key(mine_b), sorted(overlap)))
-        check("S8 两个实例合起来覆盖整个 topic",
+        check("S8 the two instances together cover the whole topic",
               set(key(mine_a)) | set(key(mine_b)) == set(key(whole)),
               "a=%d b=%d whole=%d" % (len(mine_a), len(mine_b), len(whole)))
     finally:
@@ -311,25 +324,25 @@ def scenario_balance_view(consumer: DefaultMQPullConsumer) -> None:
 
 
 def main() -> int:
-    print("拉模式消费者真机验证 topic=%s group=%s" % (TOPIC, GROUP))
+    print("Pull-mode consumer verification against a real machine, topic=%s group=%s" % (TOPIC, GROUP))
     prepare_topic()
 
     consumer = make_consumer()
     try:
         routes = scenario_queues(consumer)
         if len(routes) != QUEUE_NUM:
-            print("!! 队列数不对，后续场景跳过")
+            print("!! the queue count is wrong, skipping the remaining scenarios")
             return 1
 
         sent = scenario_produce()
         lo, hi = wait_offsets(consumer, routes, N_MSG)
         for q in routes:
-            check("S2 队列 %s:%d 有 %d 条" % (q.broker_name, q.queue_id, PER_QUEUE),
+            check("S2 queue %s:%d holds %d messages" % (q.broker_name, q.queue_id, PER_QUEUE),
                   hi[q] - lo[q] == PER_QUEUE, "min=%d max=%d" % (lo[q], hi[q]))
 
         got = scenario_pull(consumer, routes, lo, hi, set(sent))
         if not got:
-            print("!! 一条都没拉到，后续场景跳过")
+            print("!! not a single message was pulled, skipping the remaining scenarios")
             return 1
 
         q0 = routes[0]
@@ -337,7 +350,7 @@ def main() -> int:
         scenario_own_offset(consumer, q0, committed, lo[q0])
         scenario_offset_query(consumer, q0, lo[q0], hi[q0])
 
-        # 回投需要一条真实拉取到的 MessageExt（带 commitLogOffset）
+        # Sending a message back needs a genuinely pulled MessageExt (carrying commitLogOffset)
         sample = None
         for q in routes:
             r, _err = safe_pull(consumer, q, "*", lo[q], max_nums=1)
@@ -345,7 +358,7 @@ def main() -> int:
                 sample = r.msg_found_list[0]
                 break
         if sample is None:
-            check("S7 取样本消息", False, "no message available")
+            check("S7 obtained the sample message", False, "no message available")
         else:
             scenario_send_back(consumer, sample, bytes(sample.body))
 

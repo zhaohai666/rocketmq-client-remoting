@@ -5,18 +5,18 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * TopicConfig：创建/更新 topic 时上报给 broker 的配置载体。
+ * TopicConfig: the config payload reported to the broker when creating/updating a topic.
  *
- * 字段与默认值以 broker 5.x 的实际解析口径为准（实测确认，勿凭记忆改）：
- * ``new TopicConfig("t")`` → readQueueNums=16, writeQueueNums=16, perm=6,
- * topicFilterType=SINGLE_TAG, topicSysFlag=0, order=false, attributes={}。
- * ``attributes`` **会被序列化**——协议里它是普通字段，不是内部字段。
+ * Field names and default values follow the broker 5.x's actual parsing (confirmed by testing; do not change from memory):
+ * ``new TopicConfig("t")`` -> readQueueNums=16, writeQueueNums=16, perm=6,
+ * topicFilterType=SINGLE_TAG, topicSysFlag=0, order=false, attributes={}.
+ * ``attributes`` **is serialized** — in the protocol it is a normal field, not an internal one.
  */
 final class TopicConfig
 {
-    /** broker 侧默认读队列数 */
+    /** Default read queue count on the broker side */
     public const DEFAULT_READ_QUEUE_NUMS = 16;
-    /** broker 侧默认写队列数 */
+    /** Default write queue count on the broker side */
     public const DEFAULT_WRITE_QUEUE_NUMS = 16;
     /** PermName.PERM_READ | PermName.PERM_WRITE */
     public const DEFAULT_PERM = 6;
@@ -50,8 +50,8 @@ final class TopicConfig
             'topicFilterType' => $this->topicFilterType,
             'topicSysFlag' => $this->topicSysFlag,
             'order' => $this->order,
-            // 协议里 attributes 是 Map（默认 {}）：PHP 空 array 会编成 []，
-            // broker 按 Map 解析时报 "expect '{', but '['" —— 空表必须输出对象。
+            // In the protocol attributes is a Map (default {}): a PHP empty array encodes to [],
+            // and the broker parsing it as a Map would report "expect '{', but '['" — an empty table must output an object.
             'attributes' => $this->attributes === [] ? new \stdClass() : $this->attributes,
         ];
     }

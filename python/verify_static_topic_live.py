@@ -1,18 +1,18 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""真机静态主题腿。
+"""The static-topic leg against a real machine.
 
-S1 createStaticTopic(513)：单 broker，totalQueues=8，物理 4 队列
-   （currIdMap 0-3 → 物理 0-3，4-7 无承载者）。
-S2 路由回读：TopicQueueMappingByBroker 非空。
-S3 topicRouteData2EndpointsForStaticTopic：8 条端点（0-3 → broker-a，
-   4-7 → __syslo__none__）。
-S4 实例重写：getBrokerNameFromMessageQueue 对 mock 队列名解析到真实
-   broker；表外 id 与非静态主题透传。
-S5 端到端：普通生产者发 4 条、PUSH 消费者收齐 4 条（静态主题经物理
-   队列可正常收发）。
+S1 createStaticTopic(513): a single broker, totalQueues=8, 4 physical queues
+   (currIdMap 0-3 -> physical 0-3, 4-7 have no carrier).
+S2 Reading the route back: TopicQueueMappingByBroker is not empty.
+S3 topicRouteData2EndpointsForStaticTopic: 8 endpoints (0-3 -> broker-a,
+   4-7 -> __syslo__none__).
+S4 Instance rewriting: getBrokerNameFromMessageQueue resolves a mock queue name to the
+   real broker; ids outside the table and non-static topics are passed through.
+S5 End to end: an ordinary producer sends 4 messages and a PUSH consumer collects all 4
+   (a static topic sends and receives normally through its physical queues).
 
-用法：python verify_static_topic_live.py [namesrv]
+Usage: python verify_static_topic_live.py [namesrv]
 """
 from __future__ import annotations
 
@@ -66,8 +66,8 @@ class Recorder(MessageListenerConcurrently):
 
 
 def mapping_detail(broker_name: str) -> dict:
-    """单 broker 的 TopicQueueMappingDetail 文档（513 body，服务端
-    TopicQueueMappingDetail 的 fastjson2 字段名）。"""
+    """The TopicQueueMappingDetail document for a single broker (the 513 body; the fastjson2
+    field names of the server-side TopicQueueMappingDetail)."""
     hosted = {}
     for gid in range(PHYSICAL_QUEUES):
         hosted[str(gid)] = [{
@@ -93,7 +93,7 @@ def mapping_detail(broker_name: str) -> dict:
 
 
 def main() -> int:
-    print("\nS1 起管理端，createStaticTopic(513)")
+    print("\nS1 starting the admin client, createStaticTopic(513)")
     admin = DefaultMQAdminExt()
     admin.set_namesrv_addr(NAMESRV)
     admin.set_timeout_millis(10000)
@@ -102,16 +102,16 @@ def main() -> int:
         info = admin.fetch_broker_cluster_info()
         broker_name = sorted(info.broker_addr_table.keys())[0]
         broker_addr = info.broker_addr_table[broker_name][0]
-        check("S1 broker 地址解析", bool(broker_addr), "%s(%s)" % (broker_name, broker_addr))
+        check("S1 resolved the broker address", bool(broker_addr), "%s(%s)" % (broker_name, broker_addr))
 
         config = TopicConfig(TOPIC, PHYSICAL_QUEUES, PHYSICAL_QUEUES)
         admin.create_static_topic(broker_addr, "TBW102", config,
                                   mapping_detail(broker_name), True)
-        check("S1 createStaticTopic(513) 被接受", True, "totalQueues=%d" % TOTAL_QUEUES)
+        check("S1 createStaticTopic(513) was accepted", True, "totalQueues=%d" % TOTAL_QUEUES)
     finally:
         admin.shutdown()
 
-    print("\nS2/S3 路由回读 + 端点集推导")
+    print("\nS2/S3 reading the route back + deriving the endpoint set")
     route = None
     deadline = time.time() + 30
     while time.time() < deadline:
@@ -129,28 +129,28 @@ def main() -> int:
         finally:
             probe.shutdown()
         time.sleep(2)
-    check("S2 路由携带 TopicQueueMappingByBroker", route is not None)
+    check("S2 the route carries TopicQueueMappingByBroker", route is not None)
     if route is None:
         return 1
 
     endpoints = topic_route_data_2_endpoints_for_static_topic(TOPIC, route)
-    check("S3 端点集非空", endpoints is not None)
+    check("S3 the endpoint set is not empty", endpoints is not None)
     if endpoints is None:
         return 1
     mock_name = get_mock_broker_name("__global__")
-    check("S3 端点总数 = totalQueues", len(endpoints) == TOTAL_QUEUES,
+    check("S3 the total number of endpoints = totalQueues", len(endpoints) == TOTAL_QUEUES,
           "got %d want %d" % (len(endpoints), TOTAL_QUEUES))
     hosted_ok = all(
         endpoints.get(MessageQueue(TOPIC, mock_name, gid)) == broker_name
         for gid in range(PHYSICAL_QUEUES))
-    check("S3 承载 id 0-%d → broker" % (PHYSICAL_QUEUES - 1), hosted_ok)
+    check("S3 hosted ids 0-%d -> broker" % (PHYSICAL_QUEUES - 1), hosted_ok)
     unhosted_ok = all(
         endpoints.get(MessageQueue(TOPIC, mock_name, gid)) == LOGICAL_QUEUE_MOCK_NOT_EXIST
         for gid in range(PHYSICAL_QUEUES, TOTAL_QUEUES))
-    check("S3 无承载 id %d-%d → __syslo__none__" % (PHYSICAL_QUEUES, TOTAL_QUEUES - 1),
+    check("S3 unhosted ids %d-%d -> __syslo__none__" % (PHYSICAL_QUEUES, TOTAL_QUEUES - 1),
           unhosted_ok)
 
-    print("\nS4/S5 实例重写 + 端到端收发")
+    print("\nS4/S5 instance rewriting + end-to-end send and receive")
     rec = Recorder()
     consumer = DefaultMQPushConsumer(GROUP)
     consumer.set_namesrv_addr(NAMESRV)
@@ -164,22 +164,23 @@ def main() -> int:
         inst.get_broker_name_from_message_queue(
             MessageQueue(TOPIC, mock_name, gid)) == broker_name
         for gid in range(PHYSICAL_QUEUES))
-    check("S4 实例把 mock 队列重写到真实 broker", rewrite_ok)
-    # id TOTAL-1 在端点表内，值就是 __syslo__none__（哨兵值：返回端点值本身）；
-    # 透传用例要用表外 id（Go 单测用 99）。
+    check("S4 the instance rewrites the mock queue to the real broker", rewrite_ok)
+    # id TOTAL-1 is inside the endpoint table and its value is __syslo__none__ (a sentinel
+    # value: the endpoint value itself is returned); the pass-through case needs an id outside
+    # the table (the Go unit test uses 99).
     unhosted_rewrite = inst.get_broker_name_from_message_queue(
         MessageQueue(TOPIC, mock_name, TOTAL_QUEUES - 1)) \
         if inst is not None else None
-    check("S4 无承载 id 返回哨兵值", unhosted_rewrite == LOGICAL_QUEUE_MOCK_NOT_EXIST,
+    check("S4 an unhosted id returns the sentinel value", unhosted_rewrite == LOGICAL_QUEUE_MOCK_NOT_EXIST,
           str(unhosted_rewrite))
     outside_rewrite = inst.get_broker_name_from_message_queue(
         MessageQueue(TOPIC, mock_name, 99)) if inst is not None else None
-    check("S4 表外 id 透传 mock 名", outside_rewrite == mock_name,
+    check("S4 an id outside the table passes the mock name through", outside_rewrite == mock_name,
           str(outside_rewrite))
     plain_rewrite = inst.get_broker_name_from_message_queue(
         MessageQueue("Plain_%d" % STAMP, broker_name, 0)) \
         if inst is not None else None
-    check("S4 非静态主题原样透传", plain_rewrite == broker_name, str(plain_rewrite))
+    check("S4 a non-static topic is passed through unchanged", plain_rewrite == broker_name, str(plain_rewrite))
 
     prod = DefaultMQProducer("StaticProd_%d" % STAMP)
     prod.set_namesrv_addr(NAMESRV)
@@ -191,7 +192,7 @@ def main() -> int:
             sent += 1
     finally:
         prod.shutdown()
-    check("S5 发送 %d 条" % PHYSICAL_QUEUES, sent == PHYSICAL_QUEUES)
+    check("S5 sent %d messages" % PHYSICAL_QUEUES, sent == PHYSICAL_QUEUES)
 
     ok = False
     deadline = time.time() + 40
@@ -201,7 +202,7 @@ def main() -> int:
                 ok = True
                 break
         time.sleep(1)
-    check("S5 消费收齐 %d 条" % PHYSICAL_QUEUES, ok,
+    check("S5 the consumer collected all %d messages" % PHYSICAL_QUEUES, ok,
           "got %d" % len(rec.bodies))
     consumer.shutdown()
     return 0 if FAIL == 0 else 1

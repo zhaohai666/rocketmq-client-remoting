@@ -47,7 +47,7 @@ def _producer(instance_name, create_topic_key=None, default_topic_queue_nums=Non
 
 
 def _queue_nums(admin, broker_addr, topic):
-    """读回 broker 上该 topic 的 (read, write) 队列数；还不存在返回 (None, None)。"""
+    """Read back the (read, write) queue counts of that topic on the broker; returns (None, None) when it does not exist yet."""
     try:
         cfg = admin.examine_topic_config(broker_addr, topic)
     except Exception:  # noqa: BLE001
@@ -56,7 +56,7 @@ def _queue_nums(admin, broker_addr, topic):
 
 
 def _total_messages(admin, topic):
-    """该 topic 全 broker 的落库条数（新 topic 的 minOffset 恒为 0）。"""
+    """The number of persisted messages of that topic across all brokers (the minOffset of a new topic is always 0)."""
     try:
         stats = admin.examine_topic_stats(topic)
     except Exception:  # noqa: BLE001
@@ -96,41 +96,41 @@ def main():
             pass
         time.sleep(1)
     if cluster is None:
-        check("集群探活", False, "nameServer 无 broker 注册")
+        check("cluster liveness", False, "no broker registered on the nameServer")
         admin.shutdown()
         return 1
     broker_addr = cluster.get_broker_addrs()[0]
     broker_name = next((name for name, ids in cluster.broker_addr_table.items()
                         if broker_addr in ids.values()), "")
-    check("集群探活", True, "broker=%s" % broker_addr)
+    check("cluster liveness", True, "broker=%s" % broker_addr)
 
     topics = []
-    # H0：TBW102 是这个 broker 上真正的「模板 topic」，H2/H3 的判据都依赖它的队列数
+    # H0: TBW102 is the real "template topic" on this broker, and the criteria of H2/H3 both depend on its queue count
     tbw_read, tbw_write = _queue_nums(admin, broker_addr, MixAll.DEFAULT_TOPIC)
     if tbw_write is None:
-        check("H0 TBW102 模板可读", False, "examine_topic_config(TBW102) 读不到")
+        check("H0 the TBW102 template is readable", False, "examine_topic_config(TBW102) cannot be read")
         admin.shutdown()
         return 1
-    check("H0 TBW102 模板可读", tbw_write > 0, "read=%s write=%s" % (tbw_read, tbw_write))
+    check("H0 the TBW102 template is readable", tbw_write > 0, "read=%s write=%s" % (tbw_read, tbw_write))
 
-    # ---------------- H1 默认值：d=4，建出来的 topic 取 min(4, TBW102) ----------------
+    # ---------------- H1 the default: d=4, the created topic takes min(4, TBW102) ----------------
     t1 = "HdrDef_%d" % STAMP
     topics.append(t1)
     p1 = _producer("hdr-h1-%d" % STAMP)
     p1.start()
     try:
         r1 = p1.send(Message(t1, b"h1"))
-        check("H1 默认配置发送成功", r1.send_status == SendStatus.SEND_OK,
+        check("H1 the send with the default configuration succeeded", r1.send_status == SendStatus.SEND_OK,
               "msgId=%s mq=%s" % (r1.msg_id, r1.message_queue))
     finally:
         p1.shutdown()
     _wait_until(lambda: _queue_nums(admin, broker_addr, t1)[0] is not None, 10)
     h1_read, h1_write = _queue_nums(admin, broker_addr, t1)
-    check("H1 默认 d=4 建的 topic 队列数=min(4, TBW102)",
+    check("H1 the queue count of the topic created with the default d=4 = min(4, TBW102)",
           h1_write == min(4, tbw_write) and h1_read == h1_write,
           "read=%s write=%s (TBW102=%s)" % (h1_read, h1_write, tbw_write))
 
-    # ---------------- H2 set_default_topic_queue_nums(2) 真的生效 ----------------
+    # ---------------- H2 set_default_topic_queue_nums(2) really takes effect ----------------
     t2 = "HdrNums_%d" % STAMP
     topics.append(t2)
     p2 = _producer("hdr-h2-%d" % STAMP, default_topic_queue_nums=2)
@@ -141,19 +141,19 @@ def main():
         p2.shutdown()
     _wait_until(lambda: _queue_nums(admin, broker_addr, t2)[0] is not None, 10)
     h2_read, h2_write = _queue_nums(admin, broker_addr, t2)
-    check("H2 defaultTopicQueueNums=2 建的 topic 只有 2 条队列",
+    check("H2 the topic created with defaultTopicQueueNums=2 has only 2 queues",
           h2_write == min(2, tbw_write) and h2_read == h2_write,
-          "read=%s write=%s（写死 4 的旧行为会是 %s）" % (h2_read, h2_write, h1_write))
+          "read=%s write=%s (the old hardcoded-4 behaviour would be %s)" % (h2_read, h2_write, h1_write))
 
-    # ---------------- H3 set_create_topic_key(src) 真的生效 ----------------
-    # 模板 topic 必须带 PERM_INHERIT，否则 TopicConfigManager:286 的 isInherited
-    # 不通过，broker 直接拒绝自动建 topic。
+    # ---------------- H3 set_create_topic_key(src) really takes effect ----------------
+    # The template topic must carry PERM_INHERIT, otherwise isInherited at
+    # TopicConfigManager:286 does not pass and the broker simply refuses to auto-create the topic.
     src = "HdrSrc_%d" % STAMP
     topics.append(src)
     admin.create_topic_in_broker(broker_addr, src, 3, 3,
                                  PermName.PERM_READ | PermName.PERM_WRITE | PermName.PERM_INHERIT)
     src_read, src_write = _queue_nums(admin, broker_addr, src)
-    check("H3 模板 topic 建好（3 条队列、带 INHERIT）",
+    check("H3 the template topic was created (3 queues, with INHERIT)",
           src_write == 3 and (src_read, src_write) != (tbw_read, tbw_write),
           "src=(%s,%s) tbw102=(%s,%s)" % (src_read, src_write, tbw_read, tbw_write))
 
@@ -167,11 +167,11 @@ def main():
         p3.shutdown()
     _wait_until(lambda: _queue_nums(admin, broker_addr, t3)[0] is not None, 10)
     h3_read, h3_write = _queue_nums(admin, broker_addr, t3)
-    check("H3 createTopicKey=模板 topic 时被继承（min(8,3)=3 而不是 TBW102 的 %s）" % tbw_write,
+    check("H3 createTopicKey=template topic is inherited (min(8,3)=3 instead of TBW102's %s)" % tbw_write,
           h3_write == 3 and h3_read == 3,
           "read=%s write=%s" % (h3_read, h3_write))
 
-    # ---------------- H4 五种入口都照常落地 ----------------
+    # ---------------- H4 all five entry points land as usual ----------------
     t4 = "HdrEntries_%d" % STAMP
     topics.append(t4)
     p4 = _producer("hdr-h4-%d" % STAMP)
@@ -182,14 +182,14 @@ def main():
         rs = p4.send(Message(t4, b"h4-sync"))
         landed["sync"] = rs.send_status == SendStatus.SEND_OK
 
-        # 定点发送：显式给 mq，落在 H1 之外另一条路径（broker 名由调用方给）
+        # Pinned send: the mq is given explicitly, which takes a different path than H1 (the broker name is supplied by the caller)
         mq = rs.message_queue
         rb = p4.send(Message(t4, b"h4-pinned"), mq=mq)
         landed["pinned"] = (rb.send_status == SendStatus.SEND_OK
                             and rb.message_queue.broker_name == mq.broker_name)
 
         p4.send_oneway(Message(t4, b"h4-oneway"))
-        landed["oneway"] = True      # 单向没有应答，只能靠 H4 的总数兜底
+        landed["oneway"] = True      # a oneway has no reply, so only the total of H4 can back it up
 
         batch = [Message(t4, b"h4-batch-%d" % i) for i in range(3)]
         rr = p4.send(batch)
@@ -203,15 +203,15 @@ def main():
         p4.shutdown()
 
     for entry in ("sync", "pinned", "oneway", "batch", "async"):
-        check("H4 %s 入口发送成功" % entry, landed.get(entry, False),
-              "" if landed.get(entry) else "该入口没有拿到 SEND_OK")
-    # 1 同步 + 1 定点 + 1 单向 + 3 批量 + 1 异步 = 7 条
+        check("H4 the %s entry point sent successfully" % entry, landed.get(entry, False),
+              "" if landed.get(entry) else "that entry point did not get SEND_OK")
+    # 1 sync + 1 pinned + 1 oneway + 3 batch + 1 async = 7 messages
     got = _wait_until(lambda: _total_messages(admin, t4) >= 7, 20)
     total = _total_messages(admin, t4)
-    check("H4 七条消息逐条落库（批量按子消息计）", got and total == 7,
+    check("H4 all seven messages were persisted one by one (the batch counted per sub-message)", got and total == 7,
           "total=%s ok=%s" % (total, landed))
 
-    # ---------------- H5 brokerName 落在选中的那台 ----------------
+    # ---------------- H5 brokerName lands on the selected machine ----------------
     r5 = None
     p5 = _producer("hdr-h5-%d" % STAMP)
     p5.start()
@@ -221,22 +221,22 @@ def main():
         r5 = p5.send(Message(t5, b"h5"))
     finally:
         p5.shutdown()
-    check("H5 落点 broker 名与路由一致（n 就是它）",
+    check("H5 the broker name of the landing point matches the route (n is exactly it)",
           r5 is not None and r5.send_status == SendStatus.SEND_OK
           and r5.message_queue.broker_name == broker_name,
-          "落点=%s 路由=%s" % (getattr(r5.message_queue, "broker_name", None) if r5 else None,
+          "landing=%s route=%s" % (getattr(r5.message_queue, "broker_name", None) if r5 else None,
                                broker_name))
 
-    # ---------------- 清理 ----------------
+    # ---------------- cleanup ----------------
     for t in topics:
         try:
             admin.delete_topic(t)
         except Exception as e:  # noqa: BLE001
-            print("    (delete_topic(%s) 失败: %s)" % (t, e))
+            print("    (delete_topic(%s) failed: %s)" % (t, e))
     admin.shutdown()
 
     passed = sum(1 for _, ok, _ in results if ok)
-    print("\n== 结果: %d/%d 通过 ==" % (passed, len(results)))
+    print("\n== Result: %d/%d passed ==" % (passed, len(results)))
     return 0 if passed == len(results) else 1
 
 

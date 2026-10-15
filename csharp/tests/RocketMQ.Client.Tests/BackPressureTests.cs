@@ -1,7 +1,8 @@
-// ``FairSemaphore`` 的单测 —— 只测那个公平计数信号量本身。
+// Unit tests for ``FairSemaphore`` -- testing only that fair counting semaphore itself.
 //
-// 生产者那一侧怎么用它（拿不到就回调、还几次）由真机工具 `dotnet backpressure` 钉
-// （见 csharp/README.md 的联调表）。
+// How the producer side uses it (call back when it cannot get one, return it a few times)
+// is pinned by the real-machine tool `dotnet backpressure` (see the integration table in
+// csharp/README.md).
 using System;
 using System.Collections.Generic;
 using System.Threading;
@@ -17,7 +18,7 @@ public class BackPressureTests
         var deadline = Environment.TickCount64 + timeoutMs;
         while (!predicate())
         {
-            Assert.True(Environment.TickCount64 < deadline, "等待条件超时");
+            Assert.True(Environment.TickCount64 < deadline, "the wait condition timed out");
             Thread.Sleep(5);
         }
     }
@@ -39,8 +40,9 @@ public class BackPressureTests
         long began = Environment.TickCount64;
         Assert.False(sem.TryAcquire(1, 120));
         long elapsed = Environment.TickCount64 - began;
-        Assert.InRange(elapsed, 100, 1000); // 不提前返回，也不无限等
-        // 超时的人已经出队，不会把后面的人永久挡在一个已经消失的请求上
+        Assert.InRange(elapsed, 100, 1000); // it neither returns early nor waits forever
+        // Someone who timed out has already left the queue, so they cannot permanently block
+        // everyone behind them on a request that no longer exists
         sem.Release(1);
         Assert.True(sem.TryAcquire(1, 0));
     }
@@ -56,9 +58,9 @@ public class BackPressureTests
     [Fact]
     public void OnlyTheQueueHeadIsGranted()
     {
-        // 公平模式的全部意义：排在别人后面的请求**不许**插队，哪怕许可现在够它
+        // The entire point of fair mode: a request queued behind others is **not** allowed to jump the queue, even when a permit is available for it right now
         var sem = new FairSemaphore(2);
-        Assert.True(sem.TryAcquire(2, 0)); // 掏空
+        Assert.True(sem.TryAcquire(2, 0)); // drain it
         var acquired = new List<string>();
         var big = new Thread(() =>
         {
@@ -66,7 +68,7 @@ public class BackPressureTests
         });
         big.Start();
         WaitUntil(() => sem.WaitingCount() == 1);
-        // 现在空闲 0、队首是一个要 2 个的大请求。还 1 个只够小请求 —— 它必须等。
+        // Now 0 free and the head is a big request needing 2. Handing back 1 is only enough for the small request -- it must wait.
         var small = new Thread(() =>
         {
             if (sem.TryAcquire(1, 300)) acquired.Add("small");
@@ -75,8 +77,8 @@ public class BackPressureTests
         WaitUntil(() => sem.WaitingCount() == 2);
         sem.Release(1);
         small.Join(5000);
-        Assert.DoesNotContain("small", acquired); // 队首没满足时后来者插队了
-        sem.Release(1); // 补齐队首要的 2 个
+        Assert.DoesNotContain("small", acquired); // a later request jumped the queue while the head was unsatisfied
+        sem.Release(1); // top up the head's 2
         big.Join(5000);
         Assert.Contains("big", acquired);
     }
@@ -103,18 +105,20 @@ public class BackPressureTests
         sem.Release(1);
         sem.Release(1);
         JoinAll(new[] { a, b });
-        // 队列顺序就是醒来顺序（公平信号量的可观察承诺）
+        // The queue order is the wake-up order (the observable promise of a fair semaphore)
         Assert.Equal(new[] { "a", "b" }, order);
     }
 
     [Fact]
     public void GrantedHeadStillFeedsTheWaiterBehindIt()
     {
-        // 队首要 5 个、空闲 6 个：队首拿走 5 个后剩 1 个，正好够排在第二的那 1 个 ——
-        // 但 Release 早就跑完了，没人为它叫醒。少那一嗓子它就睡到自己的超时。
-        // （这里的竞态窗口比下面那条窄，靠 sleep 排不出确定顺序，所以只作补充。）
+        // The head needs 5 and 6 are free: after the head takes 5, 1 is left, exactly
+        // enough for the 1 that is queued second -- but Release already finished and nobody
+        // is going to wake it. Without that one shout it sleeps until its own timeout.
+        // (The race window here is narrower than the one below and a sleep cannot order it
+        // deterministically, so this is only a supplement.)
         var sem = new FairSemaphore(6);
-        Assert.True(sem.TryAcquire(5, 0)); // 空闲 1
+        Assert.True(sem.TryAcquire(5, 0)); // 1 free
         var got = new List<string>();
         var head = new Thread(() =>
         {
@@ -128,7 +132,7 @@ public class BackPressureTests
         });
         second.Start();
         WaitUntil(() => sem.WaitingCount() == 2);
-        sem.Release(5); // 只够队首（它要 5 个，第二个要 1 个，都不够它一个 5+1）
+        sem.Release(5); // only enough for the head (it needs 5, the second needs 1, neither is satisfied by 5+1)
         JoinAll(new[] { head, second });
         Assert.Equal(2, got.Count);
     }
@@ -136,9 +140,10 @@ public class BackPressureTests
     [Fact]
     public void TimedOutHeadWakesTheWaiterBehindIt()
     {
-        // 回归守卫：队首要 4 个但总量只有 3 个 ⇒ 它必然超时；它超时出队后，排在第二、
-        // 只要 1 个的人应当**立刻**被叫醒。少了「超时也 PulseAll」这一步，第二个人要
-        // 一直睡到自己的超时（实测 3002ms）。
+        // Regression guard: the head needs 4 but only 3 exist in total => it must time out;
+        // once it times out and leaves the queue, the person queued second who needs only 1
+        // must be woken **immediately**. Without the "PulseAll on timeout too" step the
+        // second person sleeps until its own timeout (measured at 3002ms).
         var sem = new FairSemaphore(3);
         var headResult = false;
         long secondWaitedMs = -1;
@@ -155,14 +160,14 @@ public class BackPressureTests
         WaitUntil(() => sem.WaitingCount() == 2);
         JoinAll(new[] { head, second }, 8000);
         Assert.False(headResult);
-        Assert.True(secondWaitedMs < 2000, "第二个人睡到了自己的超时：" + secondWaitedMs + "ms");
+        Assert.True(secondWaitedMs < 2000, "the second person slept until its own timeout: " + secondWaitedMs + "ms");
     }
 
     [Fact]
     public void SetTotalPermitsKeepsOutstandingWork()
     {
         var sem = new FairSemaphore(10);
-        Assert.True(sem.TryAcquire(4, 0)); // 在途 4
+        Assert.True(sem.TryAcquire(4, 0)); // 4 in flight
         sem.SetTotalPermits(15);
         Assert.Equal(11, sem.AvailablePermits());
         Assert.Equal(15, sem.TotalPermits());
@@ -191,8 +196,8 @@ public class BackPressureTests
         var waiter = new Thread(() => got = sem.TryAcquire(1, 5000));
         waiter.Start();
         WaitUntil(() => sem.WaitingCount() == 1);
-        sem.SetTotalPermits(5); // 扩容
-        sem.Release(1); // 在途的那份还回去
+        sem.SetTotalPermits(5); // grow
+        sem.Release(1); // give the in-flight share back
         waiter.Join(5000);
         Assert.True(got);
     }

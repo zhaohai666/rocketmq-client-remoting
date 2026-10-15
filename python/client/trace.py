@@ -165,7 +165,7 @@ class TraceDataEncoder:
 
     @staticmethod
     def _decode_context(context: str) -> Optional[TraceContext]:
-        """解一条轨迹记录（一段 FIELD_SPLITOR 之内）。无法识别时返回 None。"""
+        """Parse one trace record (within a FIELD_SPLITOR segment). Return None when unrecognized."""
         line = split_dropping_trailing_empty(context, TraceConstants.CONTENT_SPLITOR)
         if not line:
             return None
@@ -185,12 +185,12 @@ class TraceDataEncoder:
             bean.body_length = int(line[9])
             ctx.cost_time = int(line[10])
             bean.msg_type = MessageType(int(line[11]))
-            if len(line) == 13:                                   # 老版本：无 offsetMsgId
+            if len(line) == 13:                                   # old version: no offsetMsgId
                 ctx.is_success = line[12] == "true"
             elif len(line) == 14:
                 bean.offset_msg_id = line[12]
                 ctx.is_success = line[13] == "true"
-            if len(line) >= 15:                                   # 兼容更老版本
+            if len(line) >= 15:                                   # compatible with even older version
                 bean.offset_msg_id = line[12]
                 ctx.is_success = line[13] == "true"
                 bean.client_host = line[14]
@@ -206,7 +206,7 @@ class TraceDataEncoder:
             bean = TraceBean()
             bean.msg_id = line[5]
             bean.retry_times = int(line[6])
-            bean.keys = _field(line, 7)          # 无 keys 的消息会缺这段，见 _field 注释
+            bean.keys = _field(line, 7)          # messages without keys skip this segment; see _field comment
             ctx.trace_beans = [bean]
             return ctx
         if kind == TraceType.SUB_AFTER.value:
@@ -221,7 +221,7 @@ class TraceDataEncoder:
             ctx.is_success = line[4] == "true"
             if len(line) >= 7:
                 ctx.context_code = int(line[6])
-            if len(line) >= 9:                                    # 兼容老版本
+            if len(line) >= 9:                                    # compatible with old version
                 ctx.time_stamp = int(line[7])
                 ctx.group_name = line[8]
             return ctx

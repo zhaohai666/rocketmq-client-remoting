@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * Topic 的 tag 过滤类型：单 tag 还是多 tag（建 topic 时上报的字段）。
+ * Tag filter type for a topic: single tag or multi tag (field reported when creating a topic).
  */
 final class TopicFilterType
 {

@@ -1,17 +1,20 @@
-// 生产者退出时的 UNREGISTER_CLIENT(35) 真机验证（C#）。
-// 用法：rmq unreg-live [namesrv]
+// Real-machine verification of UNREGISTER_CLIENT(35) on producer exit (C#).
+// Usage: rmq unreg-live [namesrv]
 //
-// 场景段：U1~U6。
+// Scenario sections: U1~U6.
 //
-// ⚠ 判据强度：C# 里每个生产者各自持有一份 `MQClientInstance`、各自一条 TCP 连接，退出时
-// 连接也会关掉，broker 的通道扫描同样会把组摘掉 —— 单看 U5 分不出是 35 还是断连的功劳，
-// 所以这里必须由钩子抓帧（U3）直接证明「线上走了这一发」。
-// 另：「每一发 35 都回 SUCCESS」在本移植**不可观测** —— 传输层有意不调
-// `IRpcHook#DoAfterResponse`（见 Remoting/RemotingClient.cs 的说明），
-// U5 的 broker 侧效果就是它的替代判据。头形状、从节点扇出、单台失败被吞这三条
-// 在 `tests/RocketMQ.Client.Tests/ProducerUnregisterTests.cs` 里离线锁死。
+// Note on the strength of the criteria: in C# each producer holds its own
+// `MQClientInstance` and its own TCP connection, and the connection is closed on exit too,
+// so the broker's channel scan would remove the group anyway -- looking at U5 alone you
+// cannot tell whether the 35 or the disconnect deserves the credit, so a hook has to
+// capture the frame (U3) and prove directly that "this one really went on the wire".
+// Also: "every 35 gets a SUCCESS" is **not observable** in this port -- the transport layer
+// deliberately does not call `IRpcHook#DoAfterResponse` (see the notes in
+// Remoting/RemotingClient.cs), and U5's broker-side effect is its substitute criterion. The
+// header shape, the fan-out to the slave and the swallowed single-machine failure are pinned
+// offline in `tests/RocketMQ.Client.Tests/ProducerUnregisterTests.cs`.
 //
-// 前置：NameServer + Broker 已起，``autoCreateTopicEnable=true``。
+// Prerequisite: a NameServer + Broker are up, with ``autoCreateTopicEnable=true``.
 using System.Globalization;
 using System.Text;
 
@@ -91,7 +94,8 @@ public static class ProducerUnregisterLive
             }
         }
 
-        /// <summary>本端口的传输层有意不调这一句（见文件头说明），所以永远不会被触发。</summary>
+        /// <summary>This port's transport layer deliberately never calls this (see the
+        /// file header notes), so it is never triggered.</summary>
         public void DoAfterResponse(string remoteAddr, RemotingCommand request,
             RemotingCommand? response)
         {
@@ -107,7 +111,8 @@ public static class ProducerUnregisterLive
 
         public List<Frame> Of(int code) => Frames().Where(f => f.Code == code).ToList();
 
-        /// <summary>最后一条业务发送的序号（用来判「注销排在发送之后」）。</summary>
+        /// <summary>The sequence number of the last business send (used to decide "the
+        /// unregister comes after the send").</summary>
         public int LastOf(params int[] codes)
         {
             int seq = -1;
@@ -143,7 +148,7 @@ public static class ProducerUnregisterLive
                 return new List<string>();
             }
 
-            Console.WriteLine("  [diag] ExamineProducerConnectionInfo(" + group + ") 异常: " + msg);
+            Console.WriteLine("  [diag] ExamineProducerConnectionInfo(" + group + ") threw: " + msg);
             return new List<string>();
         }
     }
@@ -206,15 +211,15 @@ public static class ProducerUnregisterLive
 
             if (cluster.BrokerAddrTable.Count == 0)
             {
-                Check("集群探活", false, "nameServer 无 broker 注册");
+                Check("the cluster liveness probe", false, "the nameServer has no broker registered");
                 return 1;
             }
 
             List<string> brokers = cluster.GetBrokerAddrs();
-            Check("集群探活", true, "brokers=" + Join(brokers));
+            Check("the cluster liveness probe", true, "brokers=" + Join(brokers));
             RunChecks(namesrv, brokers, admin);
             Console.WriteLine();
-            Console.WriteLine("== 结果: " + Num(_pass) + "/" + Num(_pass + _fail) + " 通过 ==");
+            Console.WriteLine("== result: " + Num(_pass) + "/" + Num(_pass + _fail) + " passed ==");
             return _fail == 0 ? 0 : 1;
         }
         finally
@@ -243,7 +248,7 @@ public static class ProducerUnregisterLive
 
         SendResult r = p.Producer.Send(new Message(topic, Encoding.UTF8.GetBytes("unreg-probe")),
             5000);
-        Check("U1 生产者发送成功", r.SendStatus == SendStatus.SendOk, "msgId=" + r.MsgId);
+        Check("U1 the producer sent successfully", r.SendStatus == SendStatus.SendOk, "msgId=" + r.MsgId);
         peer.Producer.Send(new Message(topic, Encoding.UTF8.GetBytes("peer")), 5000);
 
         string clientId = p.Producer.ClientId;
@@ -253,21 +258,22 @@ public static class ProducerUnregisterLive
             seen = ConnectionClientIds(admin, brokerAddr, group);
             return seen.Contains(clientId);
         }, 70000);
-        Check("U2 心跳后 204 能看到本 clientId", registered,
-            "clientId=" + clientId + " 当前=" + Join(seen));
+        Check("U2 after the heartbeat a 204 sees this clientId", registered,
+            "clientId=" + clientId + " currently=" + Join(seen));
         List<string> peerSeen = ConnectionClientIds(admin, brokerAddr, peerGroup);
-        Check("U2b 对照组注册可见（204 这条判据本身有效）",
-            peerSeen.Contains(peer.Producer.ClientId), "当前=" + Join(peerSeen));
+        Check("U2b the control group's registration is visible (this 204 criterion is itself valid)",
+            peerSeen.Contains(peer.Producer.ClientId), "currently=" + Join(peerSeen));
 
-        Check("U3 前置：还没退出时不应有 35", probe.Of(RequestCode.UnregisterClient).Count == 0,
+        Check("U3 precondition: there must be no 35 before exiting", probe.Of(RequestCode.UnregisterClient).Count == 0,
             "count=" + Num(probe.Of(RequestCode.UnregisterClient).Count));
 
-        // 注销走的是**还开着**的那条长连接：C# 的 Shutdown 顺序是先 35 再关客户端，
-        // 这条顺序只有 broker 侧能验证（U5）。
+        // The unregister goes over the long connection that is **still open**: C#'s Shutdown
+        // order is "35 first, then close the client", and only the broker side can verify
+        // that order (U5).
         p.Producer.Shutdown();
 
         List<UnregisterProbe.Frame> unregs = probe.Of(RequestCode.UnregisterClient);
-        Check("U3 Shutdown 给每台已知 broker 各发了一发 35",
+        Check("U3 Shutdown sent one 35 to each known broker",
             unregs.Count == brokers.Count,
             "count=" + Num(unregs.Count) + " brokers=" + Num(brokers.Count));
         bool shapeOk = unregs.Count > 0;
@@ -279,21 +285,21 @@ public static class ProducerUnregisterLive
             if (!brokers.Contains(f.Addr)) shapeOk = false;
         }
 
-        Check("U3b 35 的头是 clientID + producerGroup，consumerGroup 不上线（该字段传 null）",
+        Check("U3b the 35 header is clientID + producerGroup, consumerGroup does not go on the wire (that field is passed as null)",
             shapeOk, unregs.Count == 0
-                ? "没抓到帧"
+                ? "no frame was captured"
                 : ("addr=" + unregs[0].Addr + " ext=" + ExtText(unregs[0].Ext)));
         int lastSend = probe.LastOf(RequestCode.SendMessage, RequestCode.SendMessageV2);
         int firstUnreg = unregs.Count == 0 ? -1 : unregs[0].Seq;
-        Check("U3c 35 排在业务发送之后", lastSend >= 0 && firstUnreg > lastSend,
+        Check("U3c the 35 comes after the business send", lastSend >= 0 && firstUnreg > lastSend,
             "last_send=" + Num(lastSend) + " first_unreg=" + Num(firstUnreg));
 
         bool gone = WaitUntil(() => ConnectionClientIds(admin, brokerAddr, group).Count == 0, 10000);
-        Check("U5 退出后 204 查不到这个组（broker 回 not exist）", gone,
-            "当前=" + Join(ConnectionClientIds(admin, brokerAddr, group)));
+        Check("U5 after exiting, a 204 no longer finds this group (the broker replies not exist)", gone,
+            "currently=" + Join(ConnectionClientIds(admin, brokerAddr, group)));
 
         List<string> peerAfter = ConnectionClientIds(admin, brokerAddr, peerGroup);
-        Check("U6 对照组仍在（排掉「broker 全清」这种假阳性）",
-            peerAfter.Contains(peer.Producer.ClientId), "当前=" + Join(peerAfter));
+        Check("U6 the control group is still there (ruling out a false positive of the broker having cleared everything)",
+            peerAfter.Contains(peer.Producer.ClientId), "currently=" + Join(peerAfter));
     }
 }

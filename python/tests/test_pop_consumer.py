@@ -26,7 +26,7 @@ BROKER = "broker-a"
 def ck(queue_id: int = 0, offset: int = 0, retry: str = "0",
        pop_time: int = 1000, invisible: int = 60000, revive_qid: int = 0,
        ck_offset: int = 0) -> str:
-    """拼一条 POP_CK。retry 段决定 getRealTopic 的结果。"""
+    """Assemble a POP_CK. The retry segment determines the result of getRealTopic."""
     seg = [str(ck_offset), str(pop_time), str(invisible), str(revive_qid),
            retry, BROKER, str(queue_id), str(offset)]
     return " ".join(seg)
@@ -54,7 +54,7 @@ def consumer(**kw) -> DefaultMQPushConsumer:
 
 
 class Recording:
-    """替换掉真正发请求的两个方法，记录调用（离线单测不能联网）。"""
+    """Replace the two methods that actually send requests and record the calls (offline unit tests cannot network)."""
 
     def __init__(self, c: DefaultMQPushConsumer):
         self.acked = []
@@ -64,12 +64,12 @@ class Recording:
             lambda m, level: self.changed.append((m, level)))
 
 
-# ---------------------------------------------------------------- 配置默认值
+# ---------------------------------------------------------------- Configuration defaults
 
 
 class TestDefaults:
     def test_pop_mode_off_by_default(self):
-        """关掉时必须完全走原来的 pull 路径，行为与改动前一致。"""
+        """When off, it must fully follow the original pull path, behaving the same as before the change."""
         assert DefaultMQPushConsumer(GROUP).pop_mode is False
 
     def test_pop_defaults_match_the_protocol_defaults(self):
@@ -77,10 +77,10 @@ class TestDefaults:
         assert c.pop_invisible_time == 60000
         assert c.pop_batch_nums == 32
         assert c.pop_threshold_for_queue == 96
-        assert c.pop_batch_nums <= 32  # broker 侧 >32 会回 INVALID_PARAMETER
+        assert c.pop_batch_nums <= 32  # the broker side replies INVALID_PARAMETER for >32
 
     def test_poll_time_must_be_shorter_than_request_timeout(self):
-        """长轮询挂起时长必须 < 请求超时，否则客户端先超时、每次都空转。"""
+        """The long-polling suspension must be < the request timeout, otherwise the client times out first and spins empty every time."""
         c = DefaultMQPushConsumer(GROUP)
         assert c.pop_poll_time_millis < c.pop_timeout_millis
 
@@ -120,7 +120,7 @@ class TestPopProcessQueue:
         assert pq.is_dropped() is True
 
 
-# ---------------------------------------------------------------- ackIndex 语义
+# ---------------------------------------------------------------- ackIndex semantics
 
 
 class TestProcessPopConsumeResult:
@@ -148,11 +148,11 @@ class TestProcessPopConsumeResult:
         pq = PopProcessQueue()
         pq.inc_found_msg(4)
         ctx = ConsumeConcurrentlyContext()
-        ctx.ack_index = 1  # 只 ack 前两条
+        ctx.ack_index = 1  # only ack the first two
         c._process_pop_consume_result(ConsumeConcurrentlyStatus.CONSUME_SUCCESS,
                                       ctx, msgs, pq, None)
         assert len(rec.acked) == 2
-        # 后两条走延长不可见时间
+        # the last two go through invisible-time extension
         assert len(rec.changed) == 2
         assert [m.queue_offset for m, _ in rec.changed] == [2, 3]
         assert pq.wait_ack_count() == 0
@@ -178,7 +178,7 @@ class TestProcessPopConsumeResult:
         pq = PopProcessQueue()
         pq.inc_found_msg(3)
         ctx = ConsumeConcurrentlyContext()
-        ctx.ack_index = 2  # 即使 listener 设了也无效
+        ctx.ack_index = 2  # ineffective even if the listener sets it
         c._process_pop_consume_result(ConsumeConcurrentlyStatus.RECONSUME_LATER,
                                       ctx, msgs, pq, None)
         assert rec.acked == []
@@ -196,10 +196,10 @@ class TestProcessPopConsumeResult:
         assert rec.changed == [(msgs[0], 2)]
 
     def test_max_reconsume_times_reached_routes_to_check_need_ack_or_delay(self):
-        """重试次数用尽 → 不再走普通延长，改走 checkNeedAckOrDelay。
+        """Retries exhausted → no longer the ordinary extension, but checkNeedAckOrDelay.
 
-        存活 30s、未超过最大档 2 倍 → 选中 30s 那一档后 +1 → 60s。
-        （注意别用 born_timestamp=0：那样"存活时间"是几十年，会直接 ack 丢弃。）
+        Alive for 30s, not exceeding twice the max level → after picking the 30s level, +1 → 60s.
+        (Careful not to use born_timestamp=0: then the "alive time" would be decades, and it would be acked and dropped directly.)
         """
         c = wired(max_reconsume_times=2)
         born = int(time.time() * 1000) - 30 * 1000
@@ -211,7 +211,7 @@ class TestProcessPopConsumeResult:
         assert c._mq_client.invisible_ms == [(TOPIC, 11, 60 * 1000)]
 
     def test_over_max_reconsume_and_too_old_is_acked_and_dropped(self):
-        """既要超重试次数、又要存活超过最大档 2 倍 → 直接 ack 丢弃。"""
+        """Both exceeding the retry count and being alive more than twice the max level → acked and dropped directly."""
         c = wired(max_reconsume_times=2)
         born = int(time.time() * 1000) - (POP_DELAY_LEVEL[-1] * 2 + 10) * 1000
         msgs = [msg(pop_ck=ck(offset=12), reconsume_times=5, born_timestamp=born)]
@@ -222,7 +222,7 @@ class TestProcessPopConsumeResult:
         assert c._mq_client.invisible_ms == []
 
 
-# ---------------------------------------------------------------- POP_CK 还原
+# ---------------------------------------------------------------- POP_CK restoration
 
 
 class TestPopCkTarget:
@@ -234,10 +234,10 @@ class TestPopCkTarget:
         assert extra == m.properties[MessageConst.PROPERTY_POP_CK]
 
     def test_retry_flag_one_rebuilds_retry_topic(self):
-        """retryFlag=1 → 真实 topic 是 %RETRY%<group>_<topic>（V1 下划线）。
+        """retryFlag=1 → the real topic is %RETRY%<group>_<topic> (V1 underscore).
 
-        即使消息上的 topic 已经被 resetRetryAndNamespace 还原过，只要 CK 里是 1，
-        ack 的目标 topic 也必须是带 %RETRY% 前缀的那个。
+        Even if the topic on the message has already been restored by resetRetryAndNamespace, as long as the CK says 1,
+        the ack's target topic must be the one with the %RETRY% prefix.
         """
         c = consumer()
         m = msg(topic=TOPIC, queue_id=1, pop_ck=ck(queue_id=1, offset=2, retry="1"))
@@ -246,7 +246,7 @@ class TestPopCkTarget:
         assert (broker, qid, offset) == (BROKER, 1, 2)
 
     def test_retry_flag_two_uses_plus_separator(self):
-        """V2 用 '+' 分隔（enableRetryTopicV2=true 时）。"""
+        """V2 uses '+' as the separator (when enableRetryTopicV2=true)."""
         c = consumer()
         m = msg(topic=TOPIC, pop_ck=ck(retry="2"))
         topic, _, _, _, _ = c._pop_ck_target(m)
@@ -257,9 +257,9 @@ class TestPopCkTarget:
         assert c._pop_ck_target(msg()) is None
 
     def test_short_ck_returns_none(self):
-        """段数不够（<8）时不能抛，只能放弃 ack —— 交给 broker 复活。"""
+        """With too few segments (<8) it must not throw; the only option is to give up the ack — leave revival to the broker."""
         c = consumer()
-        m = msg(pop_ck=build_extra_info(0, 1, 2, 3, TOPIC, BROKER, 4))  # 7 段
+        m = msg(pop_ck=build_extra_info(0, 1, 2, 3, TOPIC, BROKER, 4))  # 7 segments
         assert c._pop_ck_target(m) is None
 
     def test_truncated_garbage_ck_returns_none(self):
@@ -268,11 +268,11 @@ class TestPopCkTarget:
         assert c._pop_ck_target(m) is None
 
 
-# ---------------------------------------------------------------- 延迟档位
+# ---------------------------------------------------------------- Delay levels
 
 
 class FakeClient:
-    """替身 MQClientInstance：记录真正要发到 broker 的参数（离线不能联网）。"""
+    """MQClientInstance double: records the parameters actually to be sent to the broker (offline cannot network)."""
 
     def __init__(self):
         self.invisible_ms = []
@@ -291,7 +291,7 @@ class FakeClient:
 
 
 def wired(**kw):
-    """造一个"已启动"的消费者，client 是替身，可观测真实出参。"""
+    """Build a "started" consumer whose client is a double, so the real outgoing parameters are observable."""
     c = consumer(**kw)
     c._started = True
     c._mq_client = FakeClient()
@@ -300,17 +300,17 @@ def wired(**kw):
 
 class TestDelayLevel:
     def test_delay_level_is_seconds_converted_to_millis(self):
-        """档位表单位是**秒**，CHANGE_MESSAGE_INVISIBLETIME 要的是毫秒。"""
+        """The level table's unit is **seconds**, while CHANGE_MESSAGE_INVISIBLETIME wants milliseconds."""
         c = wired()
         c._change_pop_invisible_time(msg(pop_ck=ck(offset=9)), 3)
-        # POP_DELAY_LEVEL = (10, 30, 60, 120, ...) → 索引 3 是 120 秒
+        # POP_DELAY_LEVEL = (10, 30, 60, 120, ...) → index 3 is 120 seconds
         assert c._mq_client.invisible_ms == [(TOPIC, 9, 120 * 1000)]
 
     def test_level_zero_falls_back_to_reconsume_times(self):
         pass
         c = wired()
         c._change_pop_invisible_time(msg(pop_ck=ck(offset=1), reconsume_times=3), 0)
-        # delayLevel 0 → reconsumeTimes=3 → POP_DELAY_LEVEL[3] = 120 秒
+        # delayLevel 0 → reconsumeTimes=3 → POP_DELAY_LEVEL[3] = 120 seconds
         assert c._mq_client.invisible_ms == [(TOPIC, 1, 120 * 1000)]
 
     def test_level_beyond_table_clamps_to_last(self):
@@ -319,7 +319,7 @@ class TestDelayLevel:
         assert c._mq_client.invisible_ms == [(TOPIC, 2, POP_DELAY_LEVEL[-1] * 1000)]
 
     def test_check_need_ack_or_delay_drops_when_too_old(self):
-        """存活时间 > 最大档 * 2 → 直接 ack 丢弃，不再无限重试。"""
+        """Alive time > max level * 2 → acked and dropped directly, no more infinite retries."""
         c = consumer()
         rec = Recording(c)
         born = int(time.time() * 1000) - (7200 * 2 + 10) * 1000
@@ -329,7 +329,7 @@ class TestDelayLevel:
         assert rec.changed == []
 
     def test_check_need_ack_or_delay_picks_next_level_up(self):
-        """存活 30s → 自顶向下找到 30s 那一档后 +1 → 下一档 60s。"""
+        """Alive 30s → after finding the 30s level top-down, +1 → the next level 60s."""
         c = wired()
         born = int(time.time() * 1000) - 30 * 1000
         c._check_need_ack_or_delay(msg(pop_ck=ck(offset=5), born_timestamp=born))
@@ -351,7 +351,7 @@ class TestDelayLevel:
         assert c._mq_client.invisible_ms == []
 
 
-# ---------------------------------------------------------------- 超时判定
+# ---------------------------------------------------------------- Timeout judgment
 
 
 class TestIsPopTimeout:
@@ -373,18 +373,18 @@ class TestIsPopTimeout:
         assert DefaultMQPushConsumer._is_pop_timeout([msg()], now - 60001, 60000) is True
 
 
-# ---------------------------------------------------------------- 切批
+# ---------------------------------------------------------------- Batch splitting
 
 
 class TestSubmitPopConsumeRequest:
     def test_splits_by_batch_max_size(self):
-        """consume_message_batch_max_size=4，10 条 → 4+4+2 三批。"""
+        """consume_message_batch_max_size=4, 10 messages → 4+4+2 three batches."""
         c = consumer(consume_message_batch_max_size=4)
         batches = []
         c._consume_pop_batch = lambda b, pq, mq: batches.append(list(b))
         pq = PopProcessQueue()
         msgs = [msg(queue_offset=i, pop_ck=ck(offset=i)) for i in range(10)]
-        # _pop_executor 为 None → 同步执行
+        # _pop_executor is None → synchronous execution
         c._submit_pop_consume_request(msgs, pq, None)
         assert [len(b) for b in batches] == [4, 4, 2]
         assert [m.queue_offset for b in batches for m in b] == list(range(10))
@@ -406,12 +406,12 @@ class TestSubmitPopConsumeRequest:
         assert [len(b) for b in batches] == [1, 1, 1]
 
 
-# ---------------------------------------------------------------- 超时批直接丢弃
+# ---------------------------------------------------------------- Timeout batches dropped directly
 
 
 class TestTimeoutBatchDropped:
     def test_expired_batch_is_not_consumed(self):
-        """已超过 invisibleTime 的批次：不投递 listener，计数器也要归还。"""
+        """A batch past invisibleTime: not delivered to the listener, and the counter is returned as well."""
         c = consumer()
         seen = []
         c.message_listener = type("L", (), {
@@ -442,7 +442,7 @@ class TestTimeoutBatchDropped:
         assert seen == []
 
 
-# ------------------------------------------------ POP 循环的 pullRT / pullTPS
+# ------------------------------------------------ pullRT / pullTPS of the POP loop
 
 
 class TestPopLoopPullStats:
@@ -450,7 +450,7 @@ class TestPopLoopPullStats:
 
     @staticmethod
     def _run_rounds(results):
-        """跑真的 `_queue_pop_loop`，逐轮喂给定的 PopResult，喂完自动收线程。"""
+        """Run the real `_queue_pop_loop`, feeding the given PopResult round by round, and collect the thread automatically when done."""
         c = consumer()
         c._started = True
         mq = MessageQueue(TOPIC, BROKER, 0)
@@ -464,7 +464,7 @@ class TestPopLoopPullStats:
 
         class PopClient:
             def pop_message(self, group, topic, queue_id, **kw):
-                # 每轮至少 20ms，否则 RT 取整成 0，"记了"和"记了个 0"分不开
+                # At least 20ms per round, otherwise RT rounds to 0 and "recorded" and "recorded a 0" are indistinguishable
                 time.sleep(0.02)
                 if not pending:
                     c._stop.set()
@@ -476,7 +476,7 @@ class TestPopLoopPullStats:
         c._queue_threads[key] = thread
         thread.start()
         thread.join(10)
-        assert not thread.is_alive(), "POP 循环没在喂完结果后退出"
+        assert not thread.is_alive(), "the POP loop did not exit after the results were fed"
         return c, delivered
 
     @staticmethod
@@ -491,8 +491,8 @@ class TestPopLoopPullStats:
             [PopResult(PopStatus.FOUND, [msg(queue_offset=1), msg(queue_offset=2)])])
         assert delivered == [2]
         rt, tps = self._items(c)
-        assert rt is not None and rt.times == 1 and rt.value > 0, "RT 每轮 FOUND 都记一次"
-        assert tps is not None and tps.times == 1 and tps.value == 2, "TPS 按弹到的条数记"
+        assert rt is not None and rt.times == 1 and rt.value > 0, "RT is recorded once for every FOUND round"
+        assert tps is not None and tps.times == 1 and tps.value == 2, "TPS is recorded by the number of messages popped"
 
     def test_found_with_empty_list_records_rt_only(self):
         pass
@@ -500,10 +500,10 @@ class TestPopLoopPullStats:
         assert delivered == []
         rt, tps = self._items(c)
         assert rt is not None and rt.times == 1
-        assert tps is None, "空结果不产生 TPS 项"
+        assert tps is None, "an empty result produces no TPS entry"
 
     def test_polling_not_found_records_nothing(self):
-        """长轮询空手而归（POP 模式下这是常态）不该进 RT，否则平均 RT 被稀释成假低。"""
+        """Long-polling coming back empty-handed (the norm in POP mode) must not enter RT, otherwise the average RT is diluted to a fake low."""
         c, _ = self._run_rounds([PopResult(PopStatus.POLLING_NOT_FOUND)])
         rt, tps = self._items(c)
         assert rt is None and tps is None

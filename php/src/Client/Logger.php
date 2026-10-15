@@ -22,7 +22,7 @@ final class Logger
     private static ?FileSink $sink = null;
     private static bool $sinkResolved = false;
 
-    /** ROCKETMQ_CLIENT_LOG_LEVEL 只在首次用到时解析一次（同 sink 的一次性解析）。 */
+    /** ROCKETMQ_CLIENT_LOG_LEVEL is parsed once on first use (same one-time resolution as the sink). */
     private static bool $levelResolved = false;
 
     public static function setLevel(int $level): void
@@ -31,20 +31,20 @@ final class Logger
         self::$levelResolved = true;
     }
 
-    /** @param (\Closure(string): void)|null $handler null 恢复默认（文件 + stderr） */
+    /** @param (\Closure(string): void)|null $handler null restores the default (file + stderr) */
     public static function setHandler(?\Closure $handler): void
     {
         self::$handler = $handler;
     }
 
-    /** 当前生效的日志文件绝对路径；未启用文件落盘时返回 null（诊断/用例用）。 */
+    /** Absolute path of the active log file; null when file logging is disabled (diagnostics/tests). */
     public static function logFilePath(): ?string
     {
         $sink = self::sink();
         return $sink === null ? null : $sink->path;
     }
 
-    /** 关闭文件句柄（进程退出前调用；轮转与重开不依赖它）。 */
+    /** Close the file handle (call before process exit; rotation and reopening do not depend on it). */
     public static function close(): void
     {
         if (self::$sink !== null) {
@@ -53,9 +53,9 @@ final class Logger
     }
 
     /**
-     * 生效级别：ROCKETMQ_CLIENT_LOG_LEVEL 优先，取不到或名字不认识回 INFO。
-     * TRACE 归到最详细档（本端口最细档是 DEBUG）。
-     * setLevel() 显式调用过则以调用方为准。
+     * Effective level: ROCKETMQ_CLIENT_LOG_LEVEL takes precedence; if missing or the name is
+     * unrecognized, fall back to INFO. TRACE maps to the most verbose tier (DEBUG is the
+     * finest tier in this port). If setLevel() was called explicitly, the caller wins.
      */
     private static function resolvedLevel(): int
     {
@@ -116,7 +116,7 @@ final class Logger
         fwrite(STDERR, $line);
     }
 
-    /** 解析一次落盘目标（模块级 sink，进程内只解析一次）。 */
+    /** Resolve the sink target once (module-level sink, resolved only once per process). */
     private static function sink(): ?FileSink
     {
         if (self::$sinkResolved) {
@@ -135,7 +135,8 @@ final class Logger
         if ($upper === 'OFF' || $upper === 'NONE') {
             return self::$sink = null;
         }
-        // 含路径分隔符的取值按完整路径处理，否则拼到日志目录下
+        // A value containing a path separator is treated as a full path, otherwise it is
+        // appended to the log directory
         if (!str_starts_with($file, '/') && !str_contains($file, DIRECTORY_SEPARATOR)) {
             $dir = getenv('ROCKETMQ_CLIENT_LOG_DIR');
             if ($dir === false || $dir === '') {
@@ -147,9 +148,9 @@ final class Logger
     }
 
     /**
-     * 默认日志目录 = <当前工作目录>/logs/rocketmqlogs，刻意避开用户 HOME
-     * （见类注释中同名取舍的说明）。
-     * cwd 取不到（已删除的目录）时退回系统临时目录，而不是 HOME。
+     * Default log directory = <cwd>/logs/rocketmqlogs, deliberately avoiding the user HOME
+     * (see the trade-off note under the same name in the class comment).
+     * If cwd is unavailable (deleted directory), fall back to the system temp dir, not HOME.
      */
     public static function defaultLogDir(): string
     {
@@ -162,7 +163,7 @@ final class Logger
 }
 
 /**
- * 按大小轮转的文件落盘点。写失败只降级（一次），绝不影响客户端主流程。
+ * Size-rotating file sink. Write failures degrade (once) and never affect the client main flow.
  */
 final class FileSink
 {
@@ -216,7 +217,7 @@ final class FileSink
         return true;
     }
 
-    /** 备份窗左移：删 .N，.N-1→.N … .1→.2，当前→.1，然后重开新文件。 */
+    /** Shift the backup window left: delete .N, .N-1->.N ... .1->.2, current->.1, then reopen a new file. */
     private function roll(): void
     {
         $this->close();

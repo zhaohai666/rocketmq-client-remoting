@@ -1,8 +1,9 @@
-// 推送消费者 suspend()/resume()（挂起/恢复）的离线单测 —— 进程内假集群，不需要真集群。
+// Offline unit tests for push consumer suspend()/resume() -- an in-process fake cluster, no real cluster needed.
 //
 //
-// 为什么必须从 socket 上取证：suspend() 不抛错、不返回任何东西，唯一的可观测事实就是
-// 「PULL_MESSAGE(11) 到底还上不上线」。这里挂起 2.5s 数请求，恢复后再数一次。
+// Why the evidence must come off the socket: suspend() neither throws nor returns
+// anything, and the only observable fact is "does PULL_MESSAGE(11) still go out". Here it
+// suspends for 2.5s and counts the requests, then counts once more after resuming.
 using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
@@ -11,7 +12,7 @@ using RocketMQ.Common;
 using RocketMQ.Remoting;
 using RocketMQ.Remoting.Protocol;
 using Xunit;
-// PropertyMap 是 src 侧的 global using 别名（SortedDictionary<string,string>），测试项目要显式声明。
+// PropertyMap is a global using alias on the src side (SortedDictionary<string,string>), so the test project has to declare it explicitly.
 using PropertyMap = System.Collections.Generic.SortedDictionary<string, string>;
 
 namespace RocketMQ.Client.Tests;
@@ -22,12 +23,14 @@ public class SuspendResumeTests
     private const string Broker = "broker-a";
     private const int MaxFrame = 20 * 1024 * 1024;
 
-    /// <summary>一笔到达的请求：码 + 上线原样的 extFields。</summary>
+    /// <summary>An arriving request: the code plus the extFields exactly as they went on
+    /// the wire.</summary>
     private sealed record WireReq(int Code, PropertyMap Ext);
 
     /// <summary>
-    /// 假 namesrv + 假 broker：回路由、从心跳里认下 clientID 以便重平衡真能分到队列、
-    /// 回「没有已提交位点」、回「这轮没有新消息」，并把每笔请求记账。
+    /// A fake namesrv + fake broker: answers routes, recognises the clientID from the
+    /// heartbeat so the rebalance really can get queues, answers "no committed offset"
+    /// and "no new messages this round", and records every request.
     /// </summary>
     private sealed class SuspendEndpoint : IDisposable
     {
@@ -61,7 +64,8 @@ public class SuspendResumeTests
             }
         }
 
-        /// <summary>拉取请求里出现过的队列（消费组|queueId），用来验证挂起没有拆掉分配。</summary>
+        /// <summary>The queues seen in pull requests (consumer group|queueId), used to
+        /// verify that suspending did not tear down the assignment.</summary>
         public SortedSet<string> PulledQueues()
         {
             lock (_gate)
@@ -95,7 +99,7 @@ public class SuspendResumeTests
             }
             catch (Exception)
             {
-                // 关监听端口不需要处理异常
+                // Closing the listening port needs no exception handling
             }
         }
 
@@ -110,7 +114,7 @@ public class SuspendResumeTests
                 }
                 catch (Exception)
                 {
-                    return;  // Dispose 之后 Accept 必抛，正常收工
+                    return;  // after Dispose, Accept necessarily throws, this is a normal shutdown
                 }
 
                 new Thread(() =>
@@ -123,7 +127,7 @@ public class SuspendResumeTests
                         }
                         catch (Exception)
                         {
-                            // 半路断连 / 解码失败：丢掉这条连接即可
+                            // A mid-stream disconnect / decode failure: just drop this connection
                         }
                     }
                 })
@@ -163,7 +167,7 @@ public class SuspendResumeTests
                 RemotingCommand? resp = Respond(req);
                 if (resp is null)
                 {
-                    continue;  // oneway 没有应答可写
+                    continue;  // oneway has no response to write
                 }
 
                 byte[] wire = resp.Encode();
@@ -323,13 +327,14 @@ public class SuspendResumeTests
             string key = DefaultMQPushConsumer.OffsetKeyForTest(new MessageQueue(Topic, Broker, 0));
 
             Assert.True(WaitFor(() => endpoint.Count(RequestCode.PullMessage) >= 2, TimeSpan.FromSeconds(10)),
-                "挂起之前拉取循环必须真的在打；已到达的请求码：" + string.Join(",", endpoint.Codes()));
+                "the pull loop must really be running before the suspend; request codes that arrived:" + string.Join(",", endpoint.Codes()));
 
             consumer.Suspend();
-            Assert.True(consumer.IsPaused, "isPause() 要如实反映挂起");
+            Assert.True(consumer.IsPaused, "isPause() must reflect the suspend truthfully");
 
-            // 挂起前已在途的那一笔先落地，再取基线，否则把合法的一笔算成漏网；
-            // 300ms 也给了循环一次「盖章 + 停在挂起闸门」的时间。
+            // The one already in flight before the suspend lands first, and only then is the
+            // baseline taken, otherwise a legitimate request counts as a leak; the 300ms
+            // also gives the loop time to "stamp + stop at the suspend gate".
             Thread.Sleep(600);
             int baseline = endpoint.Count(RequestCode.PullMessage);
             long stampBefore = consumer.LastPullAt(key);
@@ -337,24 +342,25 @@ public class SuspendResumeTests
 
             int pausedCount = endpoint.Count(RequestCode.PullMessage);
             Assert.True(pausedCount == baseline,
-                "挂起期间不能有新的 PULL_MESSAGE 上线："
-                + $"基线 {baseline}，挂起 2.5s 后 {pausedCount}");
+                "no new PULL_MESSAGE may go on the wire while suspended:"
+                + $"baseline {baseline}, after 2.5s suspended {pausedCount}");
 
-            // 顺序不变量：盖章在挂起判定**之前**，所以暂停的循环仍在按时盖章，
-            // 120s 停摆判据不会把一个只是挂起的消费者判成死循环。
+            // An ordering invariant: the stamping happens **before** the suspend decision,
+            // so a suspended loop still stamps on time and the 120s stalled criterion
+            // never judges a merely suspended consumer to be a dead loop.
             Assert.True(consumer.LastPullAt(key) > stampBefore,
-                "挂起期间 lastPullTimestamp 必须继续推进，否则 isPullExpired 会误拆这条循环");
+                "lastPullTimestamp must keep advancing while suspended, otherwise isPullExpired would wrongly tear down this loop");
             Assert.False(consumer.PullStalledForTest(key, UtilAll.CurrentTimeMillis()),
-                "挂起不等于停摆：自愈判据在这段窗口里必须保持安静");
+                "suspended is not stalled: the self-healing criterion must stay quiet during this window");
 
             SortedSet<string> queuesBefore = endpoint.PulledQueues();
             consumer.Resume();
             Assert.False(consumer.IsPaused);
 
             Assert.True(WaitFor(() => endpoint.Count(RequestCode.PullMessage) > baseline, TimeSpan.FromSeconds(5)),
-                "Resume() 之后拉取必须恢复");
+                "pulling must resume after Resume()");
             Assert.True(queuesBefore.SetEquals(endpoint.PulledQueues()),
-                "挂起/恢复只是暂停发请求，分配集必须原地保留");
+                "suspending/resuming only pauses sending requests, the assignment set must be kept in place");
         }
         finally
         {

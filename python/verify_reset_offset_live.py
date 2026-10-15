@@ -55,7 +55,7 @@ def wait_until(pred, timeout: float, interval: float = 1.0) -> bool:
 
 
 def committed(client: MQClientInstance, group: str, topic: str):
-    """[(MessageQueue, maxOffset, committed or None)]，committed=None 表示 broker 上查无记录。"""
+    """[(MessageQueue, maxOffset, committed or None)], where committed=None means the broker has no record."""
     publish = client.get_topic_publish_info(topic)
     if publish is None or not publish.msg_queue_list:
         return None
@@ -78,10 +78,13 @@ def fmt_rows(rows) -> str:
 
 
 class SteppingListener(MessageListenerConcurrently):
-    """每一批都停在闸门上，由测试逐批放行 —— 批与批之间的本地状态因此可以被采样。
+    """Every batch is held at the gate and the test releases them one by one, so that the local
+    state between batches can be sampled.
 
-    S1 的关键采样点（旧批次已放行、新队列第一批还没 ack）只有在"逐批可控"时才存在；
-    一次性放行的 listener 会把 11（旧批次 ack）与随后的重投混在一个瞬间里。
+    The key sampling point of S1 (the old batch has been released, the first batch of the new queue
+    has not been acked yet) only exists when the batches are controllable one by one; a listener
+    that releases everything at once mixes the 11 (the old batch ack) and the following redelivery
+    into a single instant.
     """
 
     def __init__(self):
@@ -92,7 +95,7 @@ class SteppingListener(MessageListenerConcurrently):
     def consume_message(self, msgs, context):
         with self._lock:
             self._batches.append([m.queue_offset for m in msgs])
-        # 上限只防死锁：正常路径由测试逐批 release()
+        # The upper bound only guards against a deadlock: on the normal path the test calls release() batch by batch
         self._release.wait(90)
         self._release.clear()
         return ConsumeConcurrentlyStatus.CONSUME_SUCCESS
@@ -128,7 +131,7 @@ class RecordingListener(MessageListenerConcurrently):
 
 
 def consumer_key(c: DefaultMQPushConsumer, topic: str):
-    """消费者视角下该 topic 的队列 key（用 _mq_map 的键，避免自己拼 brokerName）。"""
+    """The queue key of that topic from the consumer's point of view (uses the key of _mq_map instead of assembling brokerName by hand)."""
     with c._lock:
         for key, mq in c._mq_map.items():
             if mq.topic == topic:
@@ -178,13 +181,14 @@ def start_consumer(group: str, topic: str, listener, batch_size: int, persist_ms
     return c
 
 
-# ------------------------------------------------ S1：回退重置 + 在途批次作废
+# ------------------------------------------------ S1: the backward reset + voiding the in-flight batch
 
 
 def s1_backward_reset(setup: MQClientInstance, admin: DefaultMQAdminExt,
                       broker_addr: str, producer: DefaultMQProducer) -> None:
-    print("\n--- S1：回退重置（10 → 3）立刻落盘 + 在途批次整批作废 ---")
-    # 前置：先用普通 listener 把 broker 上的位点做成 10（reset 要求该组在 broker 上有记录）
+    print("\n--- S1: the backward reset (10 -> 3) persists immediately + the in-flight batch is voided as a whole ---")
+    # Precondition: use an ordinary listener to bring the offset on the broker to 10 (the reset requires that the
+    # group has a record on the broker)
     l0 = RecordingListener()
     c0 = start_consumer(GROUP1, TOPIC1, l0, 1, 0)
     time.sleep(1)
@@ -193,22 +197,24 @@ def s1_backward_reset(setup: MQClientInstance, admin: DefaultMQAdminExt,
         producer.send(Message(TOPIC1, b"rb-%d" % i))
         if i == 2:
             t_mid = int(time.time() * 1000)
-            # 让第 3 条（offset 3）与前面三条拉开存储时间，后面按时间戳重置才能稳定命中 3
+            # Give the 3rd entry (offset 3) some distance in store time from the previous three, so that the
+    # timestamp-based reset later reliably hits 3
             time.sleep(2)
     ok = wait_until(lambda: len(l0.offsets()) == MSGS, 30, 0.2)
-    check("S1-前置：消费者消费掉 %d 条" % MSGS, ok, "arrivals=%s" % l0.offsets())
+    check("S1-precondition: the consumer consumed %d messages" % MSGS, ok, "arrivals=%s" % l0.offsets())
 
     def broker_is(n):
         rows = committed(setup, GROUP1, TOPIC1)
         return bool(rows) and all(o == n for _, _, o in rows)
 
     ok = wait_until(lambda: broker_is(MSGS), 20, 0.5)
-    check("S1-前置：broker 位点周期落盘到 %d（reset 要求组在 broker 上有记录）" % MSGS, ok,
+    check("S1-precondition: the broker offset was periodically persisted at %d (the reset requires the group to have a record on the broker)" % MSGS, ok,
           fmt_rows(committed(setup, GROUP1, TOPIC1) or []))
     c0.shutdown()
     time.sleep(1)
 
-    # 主力消费者：逐批闸住 + 周期落盘 60s ⇒ 窗口内唯一能改 broker 位点的路径是重置自带的那次
+    # The main consumer: gated batch by batch + a 60s periodic persist => the only path inside the window
+    # that can change the broker offset is the persist that the reset itself brings along
     listener = SteppingListener()
     c = start_consumer(GROUP1, TOPIC1, listener, 1, 60000)
     t_start = time.time()
@@ -226,7 +232,7 @@ def s1_backward_reset(setup: MQClientInstance, admin: DefaultMQAdminExt,
         return len(listener.batches()) >= 1 and len(c._pending.get(k, ())) == 4
 
     ok = wait_until(arranged, 30, 0.05)
-    check("S1-窗口就绪：1 条在途（offset 10 卡在 listener）+ 4 条留在缓冲",
+    check("S1-window ready: 1 in-flight (offset 10 stuck in the listener) + 4 left in the buffer",
           ok and listener.offsets()[:1] == [10],
           "arrivals=%s pending=%s" % (listener.offsets(),
                                       len(c._pending.get(key, ())) if key else "?"))
@@ -236,59 +242,61 @@ def s1_backward_reset(setup: MQClientInstance, admin: DefaultMQAdminExt,
         return
 
     wait_until(lambda: time.time() - t_start > 12, 15, 0.5)
-    check("S1-首跳周期落盘已过（此后 60s 内不再有周期写）",
+    check("S1 the first periodic persist has already happened (no periodic writes for the next 60s)",
           time.time() - t_start > 12 and broker_is(MSGS),
           fmt_rows(committed(setup, GROUP1, TOPIC1) or []))
 
-    # 按时间戳重置到 3：t_mid 落在第 3 条与第 4 条之间 ⇒ getOffsetInQueueByTime 命中 3，
-    # 3 < consumerOffset(10) 且 isForce=true ⇒ broker 推 {mq: 3}
+    # Reset by timestamp to 3: t_mid falls between the 3rd and the 4th entry, so
+    # getOffsetInQueueByTime hits 3, and since 3 < consumerOffset(10) with isForce=true the broker
+    # pushes {mq: 3}
     reset_ts = t_mid + 500
     t0 = time.time()
     table = admin.reset_offset_by_timestamp(TOPIC1, GROUP1, reset_ts, True)
-    check("S1-222 响应里的目标位点就是 3", [v for v in table.values()] == [BACK_TARGET],
+    check("S1 the target offset in the 222 response is exactly 3", [v for v in table.values()] == [BACK_TARGET],
           "table=%s" % {str(k): v for k, v in table.items()})
 
     ok = wait_before(lambda: broker_is(BACK_TARGET), 2.0)
     elapsed = time.time() - t0
-    check("S1-broker 位点 %.1fs 内变成 %d（重置路径自带的那次 persist，周期落盘=60s）"
+    check("S1 the broker offset becomes %d within %.1fs (the persist that the reset path brings along, periodic persist=60s)"
           % (elapsed, BACK_TARGET), ok, fmt_rows(committed(setup, GROUP1, TOPIC1) or []))
 
     off = local_offset(c, TOPIC1)
-    check("S1-重置后本地表里没有旧位点（removeOffset；新位点经撤销尾巴出去）",
+    check("S1 after the reset the local table has no old offset (removeOffset; the new offset leaves through the revoked tail)",
           off is None, "local_offset=%s epoch=%d" % (off, c._queue_epoch.get(key, 0)))
 
-    # 放行旧批次：它的 ack 属于已被撤销的 ProcessQueue，必须作废
+    # Release the old batch: its ack belongs to a ProcessQueue that has already been revoked, so it must be voided
     listener.release()
     ok = listener.wait_batch(2, 20.0)
     off = local_offset(c, TOPIC1)
-    check("S1-旧批次 ack 作废（放行后新队列第一批 offset %d 已在途时，本地位点仍未越过 3）"
+    check("S1 the old batch ack is voided (after the release, while the first batch of the new queue at offset %d is in-flight, the local offset is still not past 3)"
           % (listener.batches()[1][0] if ok and len(listener.batches()) > 1 else -1),
           ok and (off is None or off <= BACK_TARGET),
           "local_offset=%s arrivals=%s" % (off, listener.offsets()))
 
-    # 逐批放行走完重投：3..14 每条重投一次（旧缓冲里 11..14 也已作废，只能作为重投出现）
+    # Releasing batch by batch walks through the redelivery: 3..14 are each redelivered once (the 11..14 in the
+    # old buffer have already been voided and can only appear as redeliveries)
     expected = [10] + list(range(BACK_TARGET, MSGS + 5))
     for n in range(2, len(expected) + 1):
         listener.release()
         if n + 1 <= len(expected):
             listener.wait_batch(n + 1, 15.0)
     arr = listener.offsets()
-    check("S1-队列被真正重建：重投序列是 %s" % expected, arr == expected, "arrivals=%s" % arr)
+    check("S1 the queue is really rebuilt: the redelivery sequence is %s" % expected, arr == expected, "arrivals=%s" % arr)
     wait_until(lambda: local_offset(c, TOPIC1) == MSGS + 5, 10, 0.05)
 
     rows = committed(setup, GROUP1, TOPIC1) or []
-    check("S1-窗口内只有重置那次写 broker（位点仍停在 %d，周期落盘=60s）" % BACK_TARGET,
+    check("S1 inside the window only the reset wrote to the broker (the offset is still parked at %d, periodic persist=60s)" % BACK_TARGET,
           bool(rows) and all(o == BACK_TARGET for _, _, o in rows), fmt_rows(rows))
 
-    # 关停会同步落盘一次：重投的 ack 才是最终值（15 = 最后一条 14 的 +1）
+    # Shutting down persists once synchronously: the ack of the redelivery is the final value (15 = the last entry 14 plus one)
     c.shutdown()
     ok = wait_until(lambda: broker_is(MSGS + 5), 15, 0.5)
-    check("S1-关停落盘把重投的 ack 写回 broker（位点前进到 %d）" % (MSGS + 5), ok,
+    check("S1 the persist on shutdown writes the ack of the redelivery back to the broker (the offset advances to %d)" % (MSGS + 5), ok,
           fmt_rows(committed(setup, GROUP1, TOPIC1) or []))
 
 
 def wait_before(pred, seconds: float, interval: float = 0.05) -> bool:
-    """在 seconds 秒内轮询（用于"很快就要发生"的断言，比 wait_until 采样密）。"""
+    """Poll for seconds seconds (used by assertions about something that "is about to happen", sampling more densely than wait_until)."""
     deadline = time.time() + seconds
     while time.time() < deadline:
         if pred():
@@ -297,16 +305,18 @@ def wait_before(pred, seconds: float, interval: float = 0.05) -> bool:
     return pred()
 
 
-# ------------------------------------------------ S2：前跳重置 + 恢复
+# ------------------------------------------------ S2: the forward reset + recovery
 
 
 def s2_forward_skip(setup: MQClientInstance, admin: DefaultMQAdminExt,
                     broker_addr: str, producer: DefaultMQProducer) -> None:
-    print("\n--- S2：前跳重置（timestamp=-1 → maxOffset）不重投 + 新消息照常消费 ---")
+    print("\n--- S2: the forward reset (timestamp=-1 -> maxOffset) does not redeliver + new messages are still consumed ---")
     listener = SteppingListener()
-    # 周期落盘用默认 5s：本场景要先靠首跳（start 后 10s）在 broker 上给这个组建记录
-    #（Broker2Client.resetOffset 对 queryOffset==-1 的组直接回 SYSTEM_ERROR），
-    # 再等一个 >5s 的窗口做重置 —— 重置那笔 persist 与周期写不同刻，判据仍然干净。
+    # The periodic persist uses the default 5s: in this scenario the first flush (10s after start) has to
+    # first establish the record of this group on the broker (Broker2Client.resetOffset replies
+    # SYSTEM_ERROR directly for a group with queryOffset==-1), and only then do we wait for a window
+    # longer than 5s to do the reset -- the persist of the reset happens at a different moment from
+    # the periodic write, so the criterion stays clean.
     c = start_consumer(GROUP2, TOPIC2, listener, 1, 0)
     t_start = time.time()
     time.sleep(2)
@@ -323,14 +333,14 @@ def s2_forward_skip(setup: MQClientInstance, admin: DefaultMQAdminExt,
         key = k
         return len(listener.batches()) >= 4
 
-    # 逐批放行前 3 条：第 4 条（offset 3）留在 listener 里当"在途批次"
+    # Release the first 3 entries batch by batch: the 4th entry (offset 3) stays in the listener as the "in-flight batch"
     for n in range(1, 5):
         if not listener.wait_batch(n, 30.0):
             break
         if n < 4:
             listener.release()
     ok = arranged()
-    check("S2-窗口就绪：前 3 条已 ack、第 4 条卡在 listener",
+    check("S2-window ready: the first 3 are acked and the 4th is stuck in the listener",
           ok and listener.offsets()[:4] == [0, 1, 2, 3], "arrivals=%s" % listener.offsets())
     if not ok or key is None:
         listener.release()
@@ -341,39 +351,42 @@ def s2_forward_skip(setup: MQClientInstance, admin: DefaultMQAdminExt,
         rows = committed(setup, GROUP2, TOPIC2)
         return bool(rows) and all(o == n for _, _, o in rows)
 
-    # 等首跳落盘把组建出来（本地已消费位点 3 = 前三条的 ack），并留出 >5s 的静默窗口
+    # Wait for the first flush to establish the record of this group (the locally consumed offset 3 = the acks of
+    # the first three) and leave a silent window longer than 5s
     ok = wait_until(lambda: time.time() - t_start > 12 and broker_is(3), 20, 0.5)
-    check("S2-前置：broker 上该组有记录（q0:3），且下一笔周期写还在 5s 之外", ok,
+    check("S2-precondition: the group has a record on the broker (q0:3) and the next periodic write is still more than 5s away", ok,
           fmt_rows(committed(setup, GROUP2, TOPIC2) or []))
 
     t0 = time.time()
     table = admin.reset_offset_by_timestamp(TOPIC2, GROUP2, -1, True)
-    check("S2-222 响应里的目标位点就是 maxOffset(%d)" % MSGS,
+    check("S2 the target offset in the 222 response is exactly maxOffset(%d)" % MSGS,
           [v for v in table.values()] == [MSGS],
           "table=%s" % {str(k): v for k, v in table.items()})
 
     ok = wait_before(lambda: broker_is(MSGS), 2.0)
     elapsed = time.time() - t0
-    check("S2-broker 位点 %.1fs 内前跳到 %d（重置路径自带的那次 persist）" % (elapsed, MSGS), ok,
+    check("S2 the broker offset jumps forward to %d within %.1fs (the persist that the reset path brings along)" % (elapsed, MSGS), ok,
           fmt_rows(committed(setup, GROUP2, TOPIC2) or []))
 
     listener.release()
     time.sleep(3)
-    check("S2-被跳过的 4..%d 一条都不投（在途那条的 ack 也作废）" % (MSGS - 1),
+    check("S2 not one of the skipped 4..%d is delivered (the ack of the in-flight entry is voided too)" % (MSGS - 1),
           listener.offsets() == [0, 1, 2, 3], "arrivals=%s" % listener.offsets())
 
     producer.send(Message(TOPIC2, b"rs-new"))
     ok = listener.wait_batch(5, 20.0)
     listener.release()
-    check("S2-重建后的队列从队尾续跑（新消息 offset %d 正常投递）" % MSGS,
+    check("S2 the rebuilt queue continues from the tail (the new message at offset %d is delivered normally)" % MSGS,
           ok and listener.offsets() == [0, 1, 2, 3, MSGS], "arrivals=%s" % listener.offsets())
 
-    # release() 只让 listener 返回；ack 是消费线程随后落的。不等本地位点真的推到 11 就
-    # 关停，关停那次 persist 可能跑在 ack 之前（写回的还是 10）——这是断言竞态，不是语义问题。
+    # release() only lets the listener return; the ack is written afterwards by the consume thread.
+    # Shutting down without waiting for the local offset to really reach 11 means the persist on
+    # shutdown may run before the ack (writing back 10 again) -- that is a race in the assertion, not
+    # a semantic problem.
     wait_until(lambda: local_offset(c, TOPIC2) == MSGS + 1, 10, 0.05)
     c.shutdown()
     ok = wait_until(lambda: broker_is(MSGS + 1), 15, 0.5)
-    check("S2-关停落盘把新消息的 ack 写回 broker（位点前进到 %d）" % (MSGS + 1), ok,
+    check("S2 the persist on shutdown writes the ack of the new message back to the broker (the offset advances to %d)" % (MSGS + 1), ok,
           fmt_rows(committed(setup, GROUP2, TOPIC2) or []))
 
 
@@ -394,7 +407,7 @@ def main() -> int:
     setup = new_client("setup")
     setup.create_topic_in_route(TOPIC1, 1, 1)
     setup.create_topic_in_route(TOPIC2, 1, 1)
-    print("TOPIC1=%s TOPIC2=%s（各 1 队列，各 %d 条消息）" % (TOPIC1, TOPIC2, MSGS))
+    print("TOPIC1=%s TOPIC2=%s (1 queue and %d messages each)" % (TOPIC1, TOPIC2, MSGS))
 
     admin = DefaultMQAdminExt()
     admin.set_namesrv_addr(NAMESRV)
@@ -402,7 +415,7 @@ def main() -> int:
     admin.start()
     broker_addr = wait_broker_addr(admin)
     if broker_addr is None:
-        check("集群探活", False, "nameServer 上无 broker 注册")
+        check("cluster liveness", False, "no broker registered on the nameServer")
         admin.shutdown()
         setup.shutdown()
         return 1
@@ -414,9 +427,9 @@ def main() -> int:
     time.sleep(1)
 
     try:
-        check("开关热改：useServerSideResetOffset=false（220 推送路径的前提）",
+        check("hot-switch the flag: useServerSideResetOffset=false (a precondition of the 220 push path)",
               set_server_side_reset(admin, broker_addr, "false"),
-              "回读 useServerSideResetOffset=%s"
+              "read back useServerSideResetOffset=%s"
               % admin.get_broker_config(broker_addr).get("useServerSideResetOffset"))
         s1_backward_reset(setup, admin, broker_addr, producer)
         s2_forward_skip(setup, admin, broker_addr, producer)
@@ -424,9 +437,9 @@ def main() -> int:
     finally:
         try:
             ok = set_server_side_reset(admin, broker_addr, "true")
-            check("还原 useServerSideResetOffset=true", ok)
+            check("restored useServerSideResetOffset=true", ok)
         except Exception as e:  # noqa: BLE001
-            check("还原 useServerSideResetOffset=true", False, str(e))
+            check("restored useServerSideResetOffset=true", False, str(e))
         producer.shutdown()
         admin.shutdown()
         setup.shutdown()

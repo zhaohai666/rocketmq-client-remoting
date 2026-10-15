@@ -1,24 +1,24 @@
-//! 订阅 tag 位点修正分支真机验证。
+//! Live verification of the subscription-tag offset correction branch.
 //!
-//! 离线单测（`src/client/consumer.rs` 的 `correct_tags_offset_*` 与
-//! `dispatch_loop_keeps_the_correction_out_until_the_listener_returns`）锁的是**判据**；
-//! 这里锁真机上两件离线锁不住的事：
-//! - **A 修正确实走到了 broker**：位点最终由 `UPDATE_CONSUMER_OFFSET` 落盘，只有真集群能
-//!   证明 broker 上的已提交位点前移了。
-//! - **B 是在零投递的前提下前移的**：订阅表达式永不匹配时，broker 侧按组订阅过滤
-//!   （`PullMessageProcessor` 拿 heartbeat 注册的 SubscriptionData）→ `PULL_RETRY_IMMEDIATELY`
-//!   → 客户端 `NO_MATCHED_MSG`。没有修正时这条队列的位点永远停在"未提交"。
+//! Offline unit tests (`correct_tags_offset_*` and
+//! `dispatch_loop_keeps_the_correction_out_until_the_listener_returns` in `src/client/consumer.rs`) pin the **criteria**;
+//! here we pin two things only a real cluster can show:
+//! - **A the correction really reaches the broker**: the offset is eventually persisted via `UPDATE_CONSUMER_OFFSET`; only a real cluster can
+//!   prove that the committed offset on the broker moved forward.
+//! - **B it moves forward under zero deliveries**: when the subscription expression never matches, the broker filters by the group's subscription
+//!   (the pull request carries the SubscriptionData registered by the heartbeat) → `PULL_RETRY_IMMEDIATELY`
+//!   → the client gets `NO_MATCHED_MSG`. Without the correction the offset of this queue would stay at "not committed" forever.
 //!
-//! 场景：
-//! - S1 对照组：`TagA` 订阅正常消费 5 条 —— 证明消息确实在队列里，且"已提交位点 == 各队列
-//!   maxOffset"这个数值口径就是常规消费的落点（排除 S2 的假绿）。
-//! - S2 NO_MATCHED_MSG：`TagB` 订阅（永不匹配）。断言 listener 0 条 + 每条队列的已提交位点
-//!   == 该队列 maxOffset。
-//! - S3 NO_NEW_MSG：同一个消费者启动时自动补上 `%RETRY%<group>`（该队列空）→
-//!   `PULL_NOT_FOUND` → `NO_NEW_MSG`。断言 broker 上出现值 == maxOffset(0) 的记录。
-//! - S4 收尾：再等一个静默窗口，listener 依旧是 0 条（修正不会凭空投递）。
+//! Scenarios:
+//! - S1 control group: a `TagA` subscription consumes 5 messages normally -- proving the messages really are in the queue, and that
+//!   "committed offset == each queue's maxOffset" is exactly where regular consumption lands (rules out a false green in S2).
+//! - S2 NO_MATCHED_MSG: a `TagB` subscription (never matches). Assert 0 deliveries to the listener + every queue's committed offset
+//!   == that queue's maxOffset.
+//! - S3 NO_NEW_MSG: at startup the same consumer automatically picks up `%RETRY%<group>` (that queue is empty) →
+//!   `PULL_NOT_FOUND` → `NO_NEW_MSG`. Assert a record with value == maxOffset(0) appears on the broker.
+//! - S4 wrap-up: wait one more silent window; the listener still has 0 messages (the correction does not conjure deliveries).
 //!
-//! 用法：
+//! Usage:
 //! ```text
 //! cargo run --example live_correct_tags_offset -- 127.0.0.1:9876
 //! ```
@@ -42,7 +42,7 @@ use rocketmq_client_remoting::remoting::protocol::route::TopicRouteData;
 
 const QUEUES: i32 = 4;
 const MSGS: usize = 5;
-/// 持久化首跳 10s + 周期 5s（默认值），再留一个周期的余量。
+/// First persist hop 10s + period 5s (defaults), plus one extra period of margin.
 const PERSIST_WINDOW_SECS: u64 = 45;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -86,7 +86,7 @@ async fn poll_until(mut pred: impl FnMut() -> bool, secs: u64) -> bool {
     }
 }
 
-/// 只数到达条数与 tag：这一趟关心的是"一条都不该来"，不是消息内容。
+/// Counts only the arriving messages and tags: this pass cares about "not a single one should arrive", not the message content.
 struct Sink {
     arrivals: Mutex<Vec<String>>,
 }
@@ -175,11 +175,11 @@ impl Fixture {
         format!("RustLiveCto{}", self.stamp)
     }
 
-    /// 该 topic 在路由上的真实队列列表。
+    /// The real queue list of this topic from the route.
     ///
-    /// 不能用「主 topic 有几个队列」当通用假设：`%RETRY%<group>` 是 broker 建的，
-    /// 只有 1 个队列（本端也按路由查）。照 4 个去查会把"只有 q0 有记录"
-    /// 误报成失败。
+    /// Never assume "however many queues the main topic has" as a general rule: `%RETRY%<group>` is created by the broker
+    /// with only 1 queue (this client also queries it via the route). Querying 4 queues would misreport
+    /// "only q0 has a record" as a failure.
     async fn queues(&self, topic: &str) -> Vec<MessageQueue> {
         match self.admin.get_topic_publish_info(topic, false).await {
             Ok(publish) => publish
@@ -242,7 +242,7 @@ impl Fixture {
         Ok(consumer)
     }
 
-    /// [(mq, maxOffset, committed)]；committed=None 表示 broker 上查无记录。
+    /// [(mq, maxOffset, committed)]; committed=None means no record found on the broker.
     async fn offsets(
         &self,
         group: &str,
@@ -308,7 +308,7 @@ async fn run(namesrv: &str) -> Checker {
     }
     println!("topic={topic} queues={QUEUES}");
 
-    // ---------- S1 对照组 ----------
+    // ---------- S1 control group ----------
     let ctrl_sink = Sink::new();
     let ctrl = match fx.consumer(&group_ctrl, &topic, "TagA", ctrl_sink.clone(), true) {
         Ok(c) => c,
@@ -335,14 +335,14 @@ async fn run(namesrv: &str) -> Checker {
             return ck;
         }
     }
-    println!("S1: 已发送 {MSGS} 条 TagA，等对照组消费...");
+    println!("S1: sent {MSGS} TagA messages, waiting for the control group to consume...");
     let got = poll_until(|| ctrl_sink.arrivals() >= MSGS, 30).await;
     ck.check(
-        &format!("S1-对照组（TagA）收齐 {MSGS} 条 —— 消息确实在队列里"),
+        &format!("S1-the control group (TagA) received all {MSGS} messages -- the messages really are in the queue"),
         got && ctrl_sink.arrivals() == MSGS,
         &format!("arrivals={}", ctrl_sink.arrivals()),
     );
-    // 轮询 broker 侧口径（此处不能用闭包跨 await 持锁，改为显式循环）
+    // Poll the broker-side view (a closure cannot hold the lock across await here, so an explicit loop is used)
     let mut ctrl_rows = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(25);
     loop {
@@ -363,12 +363,12 @@ async fn run(namesrv: &str) -> Checker {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     ck.check(
-        "S1-对照组的已提交位点 == 各队列 maxOffset（数值口径）",
+        "S1-the control group's committed offset == each queue's maxOffset (numeric convention)",
         !ctrl_rows.is_empty() && ctrl_rows.iter().all(|(_, m, o)| o.is_some() && o == &Some(*m)),
         &fmt(&ctrl_rows),
     );
     ck.check(
-        "S1-对照组确实把消息推进了队列（maxOffset 总和 > 0）",
+        "S1-the control group really pushed messages into the queue (sum of maxOffset > 0)",
         ctrl_rows.iter().map(|(_, m, _)| *m).sum::<i64>() > 0,
         &format!(
             "maxSum={}",
@@ -377,7 +377,7 @@ async fn run(namesrv: &str) -> Checker {
     );
     ctrl.shutdown();
 
-    // ---------- S2 NO_MATCHED_MSG：永不匹配的订阅，零投递但位点要走 ----------
+    // ---------- S2 NO_MATCHED_MSG: never-matching subscription, zero deliveries but the offset must move ----------
     let test_sink = Sink::new();
     let test = match fx.consumer(&group_test, &topic, "TagB", test_sink.clone(), false) {
         Ok(c) => c,
@@ -392,7 +392,7 @@ async fn run(namesrv: &str) -> Checker {
         fx.shutdown();
         return ck;
     }
-    println!("S2: 消费者（TagB，永不匹配）已启动，等空应答修正落盘（首跳 10s + 周期 5s）...");
+    println!("S2: the consumer (TagB, never matches) is started, waiting for the empty-reply correction to persist (first hop 10s + period 5s)...");
     let mut test_rows = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(PERSIST_WINDOW_SECS);
     loop {
@@ -413,17 +413,17 @@ async fn run(namesrv: &str) -> Checker {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     ck.check(
-        "S2-零投递（listener 一条都没收到）",
+        "S2-zero deliveries (the listener received nothing)",
         test_sink.arrivals() == 0,
         &format!("arrivals={}", test_sink.arrivals()),
     );
     ck.check(
-        "S2-每条队列的已提交位点都 == 该队列 maxOffset（空应答修正生效）",
+        "S2-every queue's committed offset == that queue's maxOffset (the empty-reply correction took effect)",
         !test_rows.is_empty() && test_rows.iter().all(|(_, m, o)| o.is_some() && o == &Some(*m)),
         &fmt(&test_rows),
     );
     ck.check(
-        "S2-修正后的位点总和 == 对照组（同一条队列的最大位点）",
+        "S2-the corrected offset sum == the control group's (the max offsets of the same queues)",
         test_rows.iter().map(|(_, _, o)| o.unwrap_or(-1)).sum::<i64>()
             == ctrl_rows.iter().map(|(_, m, _)| *m).sum::<i64>(),
         &format!(
@@ -433,9 +433,9 @@ async fn run(namesrv: &str) -> Checker {
         ),
     );
 
-    // ---------- S3 NO_NEW_MSG：%RETRY%<group> 空队列也要留下位点记录 ----------
+    // ---------- S3 NO_NEW_MSG: even the empty %RETRY%<group> queue must leave an offset record ----------
     let retry_topic = format!("%RETRY%{group_test}");
-    println!("S3: 等 {retry_topic} 的位点记录（空队列 NO_NEW_MSG）...");
+    println!("S3: waiting for the offset record of {retry_topic} (empty queue NO_NEW_MSG)...");
     let mut retry_rows = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(PERSIST_WINDOW_SECS);
     loop {
@@ -456,12 +456,12 @@ async fn run(namesrv: &str) -> Checker {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     ck.check(
-        &format!("S3-{retry_topic} 上出现位点记录且等于 maxOffset"),
+        &format!("S3-an offset record appears on {retry_topic} and equals maxOffset"),
         !retry_rows.is_empty() && retry_rows.iter().all(|(_, m, o)| o.is_some() && o == &Some(*m)),
         &fmt(&retry_rows),
     );
     ck.check(
-        "S3-该位点确实是 0（空队列的 nextBeginOffset）",
+        "S3-that offset is indeed 0 (nextBeginOffset of the empty queue)",
         !retry_rows.is_empty() && retry_rows.iter().all(|(_, _, o)| o == &Some(0)),
         &format!(
             "offsets={:?}",
@@ -469,11 +469,11 @@ async fn run(namesrv: &str) -> Checker {
         ),
     );
 
-    // ---------- S4 收尾：静默窗口内仍然零投递 ----------
+    // ---------- S4 wrap-up: still zero deliveries within the silent window ----------
     tokio::time::sleep(Duration::from_secs(6)).await;
     let after = test_sink.arrivals();
     ck.check(
-        "S4-整轮下来 listener 依旧是 0 条（修正不会凭空投递）",
+        "S4-across the whole run the listener still has 0 messages (the correction does not conjure deliveries)",
         after == 0,
         &format!("arrivals={after}"),
     );
@@ -485,7 +485,7 @@ async fn run(namesrv: &str) -> Checker {
 
 fn report(ck: &mut Checker) {
     println!(
-        "\n== 结果：{} PASS / {} FAIL ==",
+        "\n== Result: {} PASS / {} FAIL ==",
         ck.passed,
         ck.failed.len()
     );

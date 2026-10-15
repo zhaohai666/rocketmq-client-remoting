@@ -181,7 +181,7 @@ class MQFaultStrategy:
         self.latency_max = list(self.LATENCY_MAX)
         self.not_available_duration = list(self.NOT_AVAILABLE_DURATION)
 
-    # ---- 配置 ----
+    # ---- config ----
     def is_send_latency_fault_enable(self) -> bool:
         return self._send_latency_fault_enable
 
@@ -211,7 +211,7 @@ class MQFaultStrategy:
     def detect_interval_millis(self) -> float:
         return self._latency_fault_tolerance.detect_interval_millis
 
-    # ---- 队列选择 ----
+    # ---- queue selection ----
     def _available_filter(self, mq: MessageQueue) -> bool:
         return self._latency_fault_tolerance.is_available(mq.get_broker_name())
 
@@ -237,7 +237,7 @@ class MQFaultStrategy:
             return mq
         return tp_info.select_one_message_queue()
 
-    # ---- 故障记录 ----
+    # ---- failure recording ----
     def update_fault_item(self, broker_name: str, current_latency: float,
                           isolation: bool, reachable: bool) -> None:
         if not self._send_latency_fault_enable:

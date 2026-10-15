@@ -1,17 +1,17 @@
-//! 手动拉取消费者：`DefaultMQPullConsumer`（RPC 门面）与
-//! `DefaultLitePullConsumer`（后台拉取 + 本地缓冲）。
+//! Manual pull consumers: `DefaultMQPullConsumer` (RPC facade) and
+//! `DefaultLitePullConsumer` (background pull + local buffer).
 //!
-//! 两者都是「调用方拿位点」的消费者，区别只在于谁去拉：
+//! Both are "the caller holds the offset" consumers; the only difference is who pulls:
 //!
-//! * [`DefaultMQPullConsumer`]：纯 RPC 门面。调用方自己 `pull(mq, offset)` 逐队列拉、
-//!   自己 `update_consume_offset` 提交位点；没有本地缓冲、没有后台线程、不做重平衡。
-//! * [`DefaultLitePullConsumer`]：`subscribe(..)`/`assign(..)` + 后台拉取线程把消息灌进
-//!   本地缓冲 + `poll(..)` 取批；位点默认 auto-commit。
+//! * [`DefaultMQPullConsumer`]: pure RPC facade. The caller pulls queue by queue with
+//!   `pull(mq, offset)` and commits offsets itself with `update_consume_offset`; no local buffer, no background thread, no rebalance.
+//! * [`DefaultLitePullConsumer`]: `subscribe(..)`/`assign(..)` + a background pull thread feeding
+//!   the local buffer + `poll(..)` to take batches; offsets auto-commit by default.
 //!
-//! # 并发模型
+//! # Concurrency model
 //!
-//! lite 的心跳与拉取循环用 tokio 任务 + [`tokio::sync::Notify`]，
-//! 对应线程 + 条件变量的经典口径，行为不变。
+//! The lite heartbeat and pull loops use tokio tasks + [`tokio::sync::Notify`],
+//! matching the classic thread + condition-variable formulation; behavior unchanged.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
@@ -51,33 +51,33 @@ use crate::{bail, rmq_debug, rmq_error, rmq_warn};
 use crate::client::consumer::ExpressionType;
 use crate::client::validators;
 
-/// 两个消费者共用的默认值：`broker_suspend_max_time_millis` = 20000。
+/// Defaults shared by both consumers: `broker_suspend_max_time_millis` = 20000.
 pub const DEFAULT_BROKER_SUSPEND_MAX_TIME_MILLIS: i64 = 20_000;
-/// `consumer_timeout_millis_when_suspend` = 30000（长轮询时的请求超时）。
+/// `consumer_timeout_millis_when_suspend` = 30000 (request timeout when long polling).
 pub const DEFAULT_CONSUMER_TIMEOUT_MILLIS_WHEN_SUSPEND: i64 = 30_000;
-/// `DefaultMQPullConsumer` 的 `consumer_pull_timeout_millis` = 10000。
+/// `consumer_pull_timeout_millis` = 10000 for `DefaultMQPullConsumer`.
 pub const DEFAULT_CONSUMER_PULL_TIMEOUT_MILLIS: i64 = 10_000;
-/// `pull()` 里写死的 `suspendTimeoutMillis`（短轮询用不到，但报文照发）。
+/// The hard-coded `suspendTimeoutMillis` in `pull()` (unused by short polling, but still sent in the request header).
 const PULL_SUSPEND_TIMEOUT_MILLIS: i64 = 15_000;
-/// lite 单队列拉取写死的请求超时。
+/// The hard-coded request timeout for lite per-queue pulls.
 const LITE_PULL_TIMEOUT_MILLIS: i64 = 30_000;
-/// lite 心跳循环间隔（50 次 0.1s 轮询）。
+/// Lite heartbeat loop interval (50 polls of 0.1s).
 const LITE_HEARTBEAT_INTERVAL_MILLIS: u64 = 5_000;
-/// lite 心跳 RPC 超时。
+/// Lite heartbeat RPC timeout.
 const LITE_HEARTBEAT_TIMEOUT_MILLIS: i64 = 5_000;
-/// lite 重平衡最小间隔（subscribe 模式）。
+/// Minimum lite rebalance interval (subscribe mode).
 const LITE_REBALANCE_INTERVAL_MILLIS: i64 = 1_000;
-/// `poll()` 单次 drain 上限（1024 条）。
+/// Single-drain cap for `poll()` (1024 messages).
 pub const MAX_POLL_BATCH_SIZE: usize = 1024;
-/// 心跳的 RPC 超时同上，此处仅为可读性命名。
+/// The heartbeat RPC timeout is the same as above; named here only for readability.
 const LITE_PULL_RPC_TIMEOUT_MILLIS: i64 = 5_000;
 const LITE_METADATA_FIRST_DELAY_MILLIS: u64 = 10_000;
 
 pub const DEFAULT_HEARTBEAT_BROKER_INTERVAL_MILLIS: u64 = 30_000;
-/// 经典拉模式消费者的心跳 RPC 超时（与 lite 的 5000ms 同口径）。
+/// Heartbeat RPC timeout for the classic pull-mode consumer (same 5000ms figure as lite).
 const PULL_HEARTBEAT_TIMEOUT_MILLIS: i64 = 5_000;
 
-/// 取锁；中毒时照用，理由同 `consumer::lock`。
+/// Take the lock; still used when poisoned, same reason as `consumer::lock`.
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -86,7 +86,7 @@ fn read_cfg<T: Clone>(cell: &RwLock<T>) -> T {
     cell.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-/// `sleep ∥ stop`：`true` = 收到停止信号，循环应当退出。
+/// `sleep ∥ stop`: `true` = stop signal received, the loop should exit.
 async fn wait_or_stop(rx: &mut watch::Receiver<bool>, millis: u64) -> bool {
     if *rx.borrow_and_update() {
         return true;
@@ -113,59 +113,59 @@ fn same_queue_set(old: &[MessageQueue], new: &[MessageQueue]) -> bool {
     new.iter().all(|mq| old_set.contains(&mq_key(mq)))
 }
 
-/// 拉取请求的 sysFlag：`pull` = `suspend = false`、
-/// `pull_block_if_not_found` = `suspend = true`，两者 `commit_offset` 都是 false。
+/// sysFlag of pull requests: `pull` = `suspend = false`,
+/// `pull_block_if_not_found` = `suspend = true`; `commit_offset` is false for both.
 ///
-/// ⚠ 短轮询这条**绝不能**置 suspend 位：broker 会在队尾挂到
-/// `brokerSuspendMaxTimeMillis`（20s），而客户端 10s 就超时 ——
-/// 真机必现 `RemotingTimeoutException`（踩坑记录）。
+/// ⚠ The short-polling path must **never** set the suspend bit: the broker would hang at the
+/// queue tail until `brokerSuspendMaxTimeMillis` (20s) while the client times out at 10s --
+/// `RemotingTimeoutException` is guaranteed on real brokers (pitfall record).
 fn pull_sys_flag(block: bool) -> i32 {
     PullSysFlag::build_sys_flag_basic(false, block, true, false)
 }
 
-/// ⚠ 不要并进 [`pull_sys_flag`]：那条是经典拉取的（:795/:842），多这一位会让普通消费者
-/// 也撞上 lite 开关。
+/// ⚠ Do not merge into [`pull_sys_flag`]: that one is for classic pull (:795/:842); setting this
+/// extra bit would make ordinary consumers hit the lite switch too.
 fn lite_pull_sys_flag() -> i32 {
     PullSysFlag::build_sys_flag(false, false, true, false, true)
 }
 
 // ================================================================ DefaultMQPullConsumer
 
-/// [`DefaultMQPullConsumer`] 的配置（一批平铺属性）。
+/// Configuration of [`DefaultMQPullConsumer`] (a flat set of properties).
 #[derive(Debug, Clone)]
 pub struct PullConsumerConfig {
-    /// 消费组名。
+    /// Consumer group name.
     pub consumer_group: String,
-    /// 命名空间。
+    /// Namespace.
     pub namespace: String,
-    /// 实例名，默认 `"DEFAULT"`。
+    /// Instance name, default `"DEFAULT"`.
     pub instance_name: String,
-    /// `client_id`；`None` 时 `start()` 现造。
+    /// `client_id`; created on the spot by `start()` when `None`.
     pub client_id: Option<String>,
     pub unit_name: Option<String>,
     pub namespace_v2: Option<String>,
     pub unit_mode: bool,
     pub enable_stream_request_type: bool,
     pub poll_name_server_interval_millis: u64,
-    /// NameServer 地址列表。
+    /// Name server address list.
     pub name_server_addrs: Vec<String>,
-    /// `None` = 交给环境变量 `ROCKETMQ_TLS_ENABLE`
-    /// （拉取消费者本没有这个字段，这里与推送消费者统一）。
+    /// `None` = defer to the `ROCKETMQ_TLS_ENABLE` environment variable
+    /// (the pull consumer had no such field; unified here with the push consumer).
     pub tls_enable: Option<bool>,
     pub socks_proxy: Option<SocksProxyConfig>,
-    /// `message_model`；拉模式只影响 `subscriptionAutomatically`
-    /// （本移植版不做注册），其余行为与它无关。
+    /// `message_model`; in pull mode it only affects `subscriptionAutomatically`
+    /// (this port does not register it); the rest of the behavior is independent of it.
     pub message_model: String,
-    /// `broker_suspend_max_time_millis` = 20000：长轮询时下发给 broker 的挂起时长。
+    /// `broker_suspend_max_time_millis` = 20000: the suspend duration sent down to the broker when long polling.
     pub broker_suspend_max_time_millis: i64,
-    /// `consumer_pull_timeout_millis` = 10000：短轮询默认请求超时。
+    /// `consumer_pull_timeout_millis` = 10000: default request timeout for short polling.
     pub consumer_pull_timeout_millis: i64,
-    /// `consumer_timeout_millis_when_suspend` = 30000：长轮询请求超时。
+    /// `consumer_timeout_millis_when_suspend` = 30000: request timeout for long polling.
     pub consumer_timeout_millis_when_suspend: i64,
-    /// `heartbeat_enabled`（默认 true）：置 false 后
-    /// start 的同步那轮与后台循环都不发心跳。
+    /// `heartbeat_enabled` (default true): once false, neither the synchronous round in
+    /// start nor the background loop sends heartbeats.
     pub heartbeat_enabled: bool,
-    /// `heartbeat_interval_millis`（默认 30000ms）。
+    /// `heartbeat_interval_millis` (default 30000ms).
     pub heartbeat_broker_interval_millis: u64,
 }
 
@@ -198,13 +198,13 @@ struct PullInner {
     cfg: RwLock<PullConsumerConfig>,
     client: Mutex<Option<MQClientInstance>>,
     started: AtomicBool,
-    /// 心跳循环的存活标记（与 lite 的 `running` 同义）。
+    /// Liveness flag of the heartbeat loop (same meaning as lite's `running`).
     running: AtomicBool,
     runtime: OnceLock<tokio::runtime::Handle>,
-    /// 后台循环的停止信号（true = 停）。
+    /// Stop signal for the background loops (true = stop).
     stop: watch::Sender<bool>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
-    /// 心跳成功轮数（一轮至少一台 broker 收到才算），真机/离线用例的断言落点。
+    /// Successful heartbeat rounds (a round counts when at least one broker received it); assertion point for real-broker/offline cases.
     heartbeat_count: AtomicUsize,
     filter_hooks: FilterMessageHookList,
     register_topics: Mutex<BTreeSet<String>>,
@@ -236,7 +236,7 @@ impl Default for PullInner {
 }
 
 impl Drop for PullInner {
-    /// 忘记 `shutdown()` 也不能把心跳循环留着（同 lite / 推送消费者）。
+    /// Forgetting `shutdown()` must not leave the heartbeat loop running (same as lite / push consumers).
     fn drop(&mut self) {
         self.running.store(false, Ordering::Release);
         let _ = self.stop.send(true);
@@ -246,9 +246,9 @@ impl Drop for PullInner {
     }
 }
 
-/// 用法：`start()` → `fetch_subscribe_message_queues(topic)` 拿队列 → 逐队列
-/// `pull(mq, expr, offset, maxNums)` → 自己 `update_consume_offset` 提交 →
-/// `shutdown()`。克隆出的副本共享同一份状态。
+/// Usage: `start()` → `fetch_subscribe_message_queues(topic)` to get queues → per-queue
+/// `pull(mq, expr, offset, maxNums)` → commit via `update_consume_offset` yourself →
+/// `shutdown()`. Clones share the same state.
 #[derive(Clone)]
 pub struct DefaultMQPullConsumer {
     inner: Arc<PullInner>,
@@ -271,8 +271,8 @@ impl std::fmt::Debug for DefaultMQPullConsumer {
 }
 
 impl DefaultMQPullConsumer {
-    /// 按消费组名构造；组名空白报错
-    /// （`MQClientException("consumerGroup is empty")`）。
+    /// Construct by consumer group name; a blank group name errors
+    /// (`MQClientException("consumerGroup is empty")`).
     pub fn new(consumer_group: &str) -> Result<DefaultMQPullConsumer> {
         DefaultMQPullConsumer::with_config(PullConsumerConfig {
             consumer_group: consumer_group.to_string(),
@@ -280,7 +280,7 @@ impl DefaultMQPullConsumer {
         })
     }
 
-    /// 按消费组名 + RPC 钩子构造。
+    /// Construct by consumer group name + RPC hook.
     pub fn with_rpc_hook(
         consumer_group: &str,
         rpc_hook: Option<Arc<dyn RPCHook>>,
@@ -290,15 +290,15 @@ impl DefaultMQPullConsumer {
         Ok(consumer)
     }
 
-    /// 直接以一份完整配置构造（等价于逐个赋属性）。
+    /// Construct directly from a complete config (equivalent to assigning properties one by one).
     pub fn with_config(cfg: PullConsumerConfig) -> Result<DefaultMQPullConsumer> {
         if cfg.consumer_group.trim().is_empty() {
             bail!("consumerGroup is empty");
         }
         Ok(DefaultMQPullConsumer {
             inner: Arc::new({
-                // `PullInner` 有 `Drop`，不能走 `..Default::default()` 的结构体更新语法
-                // （同 lite），先整体默认构造再替换 cfg。
+                // `PullInner` has a `Drop`, so the `..Default::default()` struct-update syntax is not allowed
+                // (same as lite): build the whole default first, then replace cfg.
                 let mut inner = PullInner::default();
                 inner.cfg = RwLock::new(cfg);
                 inner
@@ -306,12 +306,12 @@ impl DefaultMQPullConsumer {
         })
     }
 
-    /// 当前配置快照。
+    /// Snapshot of the current config.
     pub fn config(&self) -> PullConsumerConfig {
         read_cfg(&self.inner.cfg)
     }
 
-    /// 改配置（直接赋属性）。
+    /// Change the config (direct property assignment).
     pub fn update_config(&self, f: impl FnOnce(&mut PullConsumerConfig)) {
         {
             let mut w = self.inner.cfg.write().unwrap_or_else(|e| e.into_inner());
@@ -338,9 +338,9 @@ impl DefaultMQPullConsumer {
         self.inner.started.load(Ordering::Acquire)
     }
 
-    // ---------------- 配置 ----------------
+    // ---------------- Configuration ----------------
 
-    /// 分号分隔，逐项 trim、丢空。
+    /// Semicolon-separated; each item is trimmed, empty items dropped.
     pub fn set_namesrv_addr(&self, addr: &str) {
         let addrs = split_addrs(addr);
         self.update_config(|c| c.name_server_addrs = addrs);
@@ -440,7 +440,7 @@ impl DefaultMQPullConsumer {
         lock(&self.inner.register_topics).insert(topic);
     }
 
-    // ---------------- 投递前过滤钩子 ----------------
+    // ---------------- Pre-delivery filter hooks ----------------
 
     pub fn register_filter_message_hook(&self, hook: Arc<dyn FilterMessageHook>) {
         self.inner.filter_hooks.register(hook);
@@ -466,9 +466,9 @@ impl DefaultMQPullConsumer {
         )
     }
 
-    // ---------------- 生命周期 ----------------
+    // ---------------- Lifecycle ----------------
 
-    /// 幂等、必须有 name server，`client_id` 缺省时现造。
+    /// Idempotent, requires a name server; `client_id` is created on the spot when absent.
     pub async fn start(&self) -> Result<()> {
         if self
             .inner
@@ -536,7 +536,7 @@ impl DefaultMQPullConsumer {
             self.inner.started.store(false, Ordering::Release);
             return Err(e);
         }
-        // 动态 name server：实例可能已从地址服务器拿到地址，回填。
+        // Dynamic name server: the instance may already have addresses from the address server; backfill.
         if cfg.name_server_addrs.is_empty() {
             let addrs = client.name_server_addrs();
             if !addrs.is_empty() {
@@ -555,7 +555,7 @@ impl DefaultMQPullConsumer {
         Ok(())
     }
 
-    /// `shutdown()`；未启动时是 no-op。
+    /// `shutdown()`; a no-op when not started.
     pub fn shutdown(&self) {
         if self
             .inner
@@ -565,8 +565,8 @@ impl DefaultMQPullConsumer {
         {
             return;
         }
-        // 先停心跳：被 abort 的那一轮可能已经在线上，落回 broker 会把本 clientId
-        // 重新塞进 ConsumerManager（与推送消费者 shutdown 同一理由）。
+        // Stop the heartbeat first: an aborted round may already be on the wire, and landing on the
+        // broker would shove this clientId back into ConsumerManager (same reason as push consumer shutdown).
         self.inner.running.store(false, Ordering::Release);
         let _ = self.inner.stop.send(true);
         for task in lock(&self.inner.tasks).drain(..) {
@@ -574,14 +574,14 @@ impl DefaultMQPullConsumer {
         }
         let group = self.consumer_group();
         let client_id = self.client_id();
-        // 注销要发 RPC —— 与生产者/推送消费者同款：挂到运行时上执行并**有界等待**
-        // 落地（`run_finalize_blocking`，「shutdown 后立刻退进程」也发得出去）；
-        // 没有运行时则退化为只摘组 + 关实例。
+        // Unregistering sends RPCs -- same treatment as producers/push consumers: run it on the runtime and wait
+        // for it to land with a bound (`run_finalize_blocking`, so it still goes out when the process exits right after shutdown);
+        // without a runtime, degrade to only dropping the group registration + shutting the instance.
         match self.runtime_handle() {
             Some(handle) => {
                 let this = self.clone();
                 let finalize = async move {
-                    // 锁不能跨 await（MutexGuard 不是 Send）：先把 client 取出来。
+                    // The lock must not cross an await (MutexGuard is not Send): take the client out first.
                     let client = lock(&this.inner.client).take();
                     if let Some(client) = client {
                         client
@@ -622,16 +622,16 @@ impl DefaultMQPullConsumer {
             .ok_or_else(|| Error::client("consumer not started, call start() first"))
     }
 
-    // ---------------- 心跳 ----------------
+    // ---------------- Heartbeat ----------------
 
-    /// 心跳成功轮数（一轮至少一台 broker 收到才算；真机/离线用例的断言落点）。
+    /// Successful heartbeat rounds (a round counts when at least one broker received it; assertion point for real-broker/offline cases).
     pub fn heartbeat_count(&self) -> usize {
         self.inner.heartbeat_count.load(Ordering::SeqCst)
     }
 
-    /// 心跳前的路由刷新（同 lite 版）：心跳只发给「路由表里已知的
-    /// broker」，自建实例刚 start 时路由表是空的。先把 registerTopics 的路由拉一遍并
-    /// 登记为在用，start() 里那次同步心跳才真正到达 broker。
+    /// Route refresh before heartbeating (same as the lite version): heartbeats only go to
+    /// brokers already known in the route table, which is empty right after a self-created instance
+    /// starts. Pull the routes of registerTopics once and register them as in use first, so that the synchronous heartbeat inside start() actually reaches the broker.
     async fn refresh_route_for_heartbeat(&self) {
         let Ok(client) = self.require_client() else {
             return;
@@ -645,7 +645,7 @@ impl DefaultMQPullConsumer {
         }
     }
 
-    /// 向路由里的每台 broker（同 lite 版，**含从节点**）发一份心跳，返回成功台数。
+    /// Send one heartbeat to every broker in the route table (same as the lite version, **including slaves**), returning the number of successes.
     pub async fn send_heartbeat_to_all_broker(&self) -> usize {
         send_pull_heartbeat(&self.inner).await
     }
@@ -655,7 +655,7 @@ impl DefaultMQPullConsumer {
             rmq_warn!("pull consumer: no tokio runtime, heartbeat loop disabled");
             return;
         };
-        // 握 Weak 而不是 Arc（同 lite）：消费者被丢弃时 Drop 才有机会跑。
+        // Hold a Weak instead of an Arc (same as lite): only then can Drop get its chance to run when the consumer is discarded.
         let weak = Arc::downgrade(&self.inner);
         let rx = self.inner.stop.subscribe();
         let task = handle.spawn(async move {
@@ -675,15 +675,15 @@ impl DefaultMQPullConsumer {
         Some(handle)
     }
 
-    // ---------------- 拉取 ----------------
+    // ---------------- Pulling ----------------
 
-    /// 按**订阅信息**列队列。
+    /// List queues by **subscription info**.
     ///
-    /// ⚠ 与 lite 版不同，这里**不拼命名空间**：直接把入参 topic
-    /// 传给路由查询，与线上基准逐字一致。
+    /// ⚠ Unlike the lite version, **no namespace is applied** here: the input topic is passed
+    /// straight to the route query, verbatim identical to the online baseline.
     pub async fn fetch_subscribe_message_queues(&self, topic: &str) -> Result<Vec<MessageQueue>> {
         let client = self.require_client()?;
-        // 口径：不改队列身份，直接返回列表。
+        // Policy: do not alter queue identity; return the list directly.
         Ok(client.get_topic_subscribe_info(topic).await)
     }
 
@@ -745,7 +745,7 @@ impl DefaultMQPullConsumer {
         Ok(out)
     }
 
-    /// **短轮询**（`suspend=False`），位点由调用方 `update_consume_offset` 提交。
+    /// **Short polling** (`suspend=False`); offsets are committed by the caller via `update_consume_offset`.
     pub async fn pull(
         &self,
         mq: &MessageQueue,
@@ -790,12 +790,12 @@ impl DefaultMQPullConsumer {
         Ok(self.apply_delivery_filter(mq, result))
     }
 
-    /// 长轮询（`suspend=True`，超时用
-    /// `consumer_timeout_millis_when_suspend`，挂起时长用
-    /// `broker_suspend_max_time_millis`）。
+    /// Long polling (`suspend=True`), using
+    /// `consumer_timeout_millis_when_suspend` for the timeout and
+    /// `broker_suspend_max_time_millis` for the suspend duration.
     ///
-    /// ⚠ 请求超时必须明显大于挂起时长，否则消息恰好在挂起末尾到达时会稳定超时
-    /// （默认 30000 > 20000 正是这个比例）。
+    /// ⚠ The request timeout must clearly exceed the suspend duration, otherwise a message
+    /// arriving exactly at the end of suspension will reliably time out (the default 30000 > 20000 is exactly this ratio).
     pub async fn pull_block_if_not_found(
         &self,
         mq: &MessageQueue,
@@ -838,7 +838,7 @@ impl DefaultMQPullConsumer {
         Ok(self.apply_delivery_filter(mq, result))
     }
 
-    /// 只在 FOUND 且非空时跑投递前过滤。
+    /// Run the pre-delivery filter only when FOUND and non-empty.
     fn apply_delivery_filter(&self, mq: &MessageQueue, mut result: PullResult) -> PullResult {
         if result.status == PullStatus::Found && !result.msg_found_list.is_empty() {
             result.msg_found_list =
@@ -847,7 +847,7 @@ impl DefaultMQPullConsumer {
         result
     }
 
-    // ---------------- 位点管理 ----------------
+    // ---------------- Offset management ----------------
 
     pub async fn fetch_consume_offset(&self, mq: &MessageQueue) -> Result<Option<i64>> {
         let client = self.require_client()?;
@@ -886,7 +886,7 @@ impl DefaultMQPullConsumer {
             .await
     }
 
-    /// `GET_EARLIEST_MSG_STORETIME`(32)：取队列最早存储时间。
+    /// `GET_EARLIEST_MSG_STORETIME`(32): the queue's earliest store time.
     pub async fn earliest_msg_store_time(&self, mq: &MessageQueue) -> Result<i64> {
         let client = self.require_client()?;
         client
@@ -898,7 +898,7 @@ impl DefaultMQPullConsumer {
         let client = self.require_client()?;
         let group = self.consumer_group();
         let broker = msg.broker_name.clone().unwrap_or_default();
-        // 从节点不接 CONSUMER_SEND_MSG_BACK（master 专属），所以这里只认 brokerId=0
+        // Slave nodes do not accept CONSUMER_SEND_MSG_BACK (master only), so only brokerId=0 is considered here
         let addr = client
             .find_broker_address_in_publish(&broker)
             .ok_or_else(|| Error::client(format!("Broker[{broker}] master node does not exist")))?;
@@ -936,7 +936,7 @@ impl DefaultMQPullConsumer {
     }
 }
 
-/// 空串回落 SUB_ALL。
+/// An empty string falls back to SUB_ALL.
 fn sub_expression_of(sub: &SubscriptionData) -> &str {
     if sub.sub_string.is_empty() {
         FilterAPI::SUB_ALL
@@ -945,7 +945,7 @@ fn sub_expression_of(sub: &SubscriptionData) -> &str {
     }
 }
 
-/// 按分号切分 + 逐项 trim + 丢空。
+/// Split on semicolons + trim each item + drop empty ones.
 fn split_addrs(addr: &str) -> Vec<String> {
     addr.split(';')
         .map(str::trim)
@@ -954,7 +954,7 @@ fn split_addrs(addr: &str) -> Vec<String> {
         .collect()
 }
 
-/// 构造拉模式消费者组的一份 ConsumerData。
+/// Build one ConsumerData for the pull-mode consumer group.
 fn build_pull_heartbeat(inner: &PullInner) -> HeartbeatData {
     let cfg = read_cfg(&inner.cfg);
     let mut hb = HeartbeatData::new(cfg.client_id.clone().unwrap_or_default());
@@ -975,8 +975,8 @@ fn build_pull_heartbeat(inner: &PullInner) -> HeartbeatData {
     hb
 }
 
-/// 向所有已知 broker（含从节点）发一次本组
-/// 心跳，返回成功台数。
+/// Send this group's heartbeat once to all known
+/// brokers (including slaves), returning the number of successes.
 async fn send_pull_heartbeat(inner: &PullInner) -> usize {
     let Some(client) = lock(&inner.client).clone() else {
         return 0;
@@ -998,8 +998,8 @@ async fn send_pull_heartbeat(inner: &PullInner) -> usize {
     ok
 }
 
-/// 心跳后台循环：先等一个周期再发 ——
-/// start() 里已同步发过一轮，循环的第一次是「第二个心跳周期」。
+/// Heartbeat background loop: wait one full period before sending --
+/// start() already sent one round synchronously, so the loop's first round is "the second heartbeat period".
 async fn pull_heartbeat_loop(inner: Arc<PullInner>, mut rx: watch::Receiver<bool>) {
     while inner.running.load(Ordering::Acquire) {
         if wait_or_stop(
@@ -1019,50 +1019,50 @@ async fn pull_heartbeat_loop(inner: Arc<PullInner>, mut rx: watch::Receiver<bool
 
 // ================================================================ DefaultLitePullConsumer
 
-/// [`DefaultLitePullConsumer`] 的配置。
+/// Configuration of [`DefaultLitePullConsumer`].
 #[derive(Debug, Clone)]
 pub struct LitePullConsumerConfig {
-    /// 消费组名。
+    /// Consumer group name.
     pub consumer_group: String,
-    /// 命名空间。
+    /// Namespace.
     pub namespace: String,
-    /// 实例名，默认 `"DEFAULT"`。
+    /// Instance name, default `"DEFAULT"`.
     pub instance_name: String,
-    /// `client_id`；`None` 时 `start()` 现造。
+    /// `client_id`; created on the spot by `start()` when `None`.
     pub client_id: Option<String>,
     pub unit_name: Option<String>,
     pub namespace_v2: Option<String>,
     pub unit_mode: bool,
     pub enable_stream_request_type: bool,
     pub poll_name_server_interval_millis: u64,
-    /// NameServer 地址列表。
+    /// Name server address list.
     pub name_server_addrs: Vec<String>,
-    /// `tls_enable`（同上，与推送消费者统一）。
+    /// `tls_enable` (same note as above, unified with the push consumer).
     pub tls_enable: Option<bool>,
-    /// SOCKS 代理（同上，与推送消费者统一）。
+    /// SOCKS proxy (same note as above, unified with the push consumer).
     pub socks_proxy: Option<SocksProxyConfig>,
-    /// `message_model`。
+    /// `message_model`.
     pub message_model: String,
-    /// 仅影响**首次**位点解析。
+    /// Affects only the **first** offset resolution.
     pub consume_from_where: String,
     pub consume_timestamp: String,
-    /// `pull_batch_size` = 32（setter 里 `max(1, n)`）。
+    /// `pull_batch_size` = 32 (`max(1, n)` in the setter).
     pub pull_batch_size: i32,
-    /// `poll_timeout_millis` = 5000（`max(0, ms)`）。
+    /// `poll_timeout_millis` = 5000 (`max(0, ms)`).
     pub poll_timeout_millis: i64,
-    /// `auto_commit` = true：**拉到即提交**，不是 poll 之后。
+    /// `auto_commit` = true: **commit as soon as pulled**, not after poll().
     pub auto_commit: bool,
-    /// `auto_commit_interval_millis` = 5000（`max(0, ms)`）。
+    /// `auto_commit_interval_millis` = 5000 (`max(0, ms)`).
     pub auto_commit_interval_millis: i64,
-    /// `consumer_timeout_millis_when_suspend` = 30000：lite 恒短轮询，
-    /// 字段只为配置形状保留，拉取路径不读它。
+    /// `consumer_timeout_millis_when_suspend` = 30000: lite always short-polls,
+    /// the field is kept only for the config shape; the pull path never reads it.
     pub consumer_timeout_millis_when_suspend: i64,
-    /// `broker_suspend_max_time_millis` = 20000：同上，拉取路径不读。
+    /// `broker_suspend_max_time_millis` = 20000: same as above, the pull path never reads it.
     pub broker_suspend_max_time_millis: i64,
-    /// `pull_interval_millis` = 50：队尾空轮询时的退避（`max(0, ms)`）。
+    /// `pull_interval_millis` = 50: backoff when the queue tail is empty (`max(0, ms)`).
     pub pull_interval_millis: i64,
-    /// `pull_thread_nums` = 1：**本实现恒为单拉取循环**，
-    /// 字段只为配置形状保留。
+    /// `pull_thread_nums` = 1: **this implementation is always a single pull loop**;
+    /// the field is kept only for the config shape.
     pub pull_thread_nums: i32,
     /// [`register_topic_message_queue_change_listener`]: DefaultLitePullConsumer::register_topic_message_queue_change_listener
     pub topic_metadata_check_interval_millis: i64,
@@ -1100,19 +1100,19 @@ impl Default for LitePullConsumerConfig {
 }
 
 struct LiteState {
-    /// 订阅表 `topic -> sub_expression`（subscribe 模式）。
+    /// Subscription table `topic -> sub_expression` (subscribe mode).
     subscription: BTreeMap<String, String>,
-    /// 进心跳的订阅集。
+    /// The subscription set carried into heartbeats.
     subscription_data: BTreeMap<String, SubscriptionData>,
-    /// assign 模式下的 tag 表达式。
+    /// Tag expressions in assign mode.
     assign_sub_expr: BTreeMap<String, String>,
     assign_mode: bool,
-    /// 当前分配（`BTreeMap` 保证按队列名有序）。
+    /// Current assignment (`BTreeMap` keeps it ordered by queue key).
     assigned: BTreeMap<String, MessageQueue>,
     next_offset: BTreeMap<String, i64>,
     consume_offset: BTreeMap<String, i64>,
     offset_table: BTreeMap<String, i64>,
-    /// `seek()` 钉住的位点，优先于 `consume_from_where`。
+    /// Offsets pinned by `seek()`, taking precedence over `consume_from_where`.
     seek_offset: BTreeMap<String, i64>,
     next_auto_commit_deadline: i64,
     paused: BTreeSet<String>,
@@ -1150,7 +1150,7 @@ struct LiteInner {
     strategy: RwLock<Arc<dyn AllocateMessageQueueStrategy>>,
     listener: Mutex<Option<Arc<dyn MessageQueueListener>>>,
     rpc_hook: RwLock<Option<Arc<dyn RPCHook>>>,
-    /// 本地缓冲 + 缓冲就绪通知。
+    /// Local buffer + buffer-ready notification.
     buffer: Mutex<VecDeque<MessageExt>>,
     buffer_signal: Notify,
     topic_listeners: Mutex<BTreeMap<String, Arc<dyn TopicMessageQueueChangeListener>>>,
@@ -1180,7 +1180,7 @@ impl Default for LiteInner {
 }
 
 impl Drop for LiteInner {
-    /// 忘记 `shutdown()` 也不能留下还在跑的循环（同推送消费者）。
+    /// Forgetting `shutdown()` must not leave running loops behind (same as the push consumer).
     fn drop(&mut self) {
         self.running.store(false, Ordering::Release);
         let _ = self.stop.send(true);
@@ -1195,19 +1195,19 @@ pub trait TopicMessageQueueChangeListener: Send + Sync {
     fn on_changed(&self, topic: &str, message_queues: &[MessageQueue]);
 }
 
-/// 两种模式：
-/// * **subscribe**：`subscribe(topic, expr)` → 后台按 [`AllocateMessageQueueStrategy`]
-///   重平衡 → 后台拉取；
-/// * **assign**：`assign(&[mq])` 显式指定队列，不重平衡（tag 表达式用
-///   [`set_sub_expression_for_assign`](Self::set_sub_expression_for_assign)）。
+/// Two modes:
+/// * **subscribe**: `subscribe(topic, expr)` → background rebalance per [`AllocateMessageQueueStrategy`]
+///   → background pull;
+/// * **assign**: `assign(&[mq])` names the queues explicitly, no rebalance (tag expression via
+///   [`set_sub_expression_for_assign`](Self::set_sub_expression_for_assign)).
 ///
-/// 两种模式都由单个后台循环做**短轮询**把消息灌进本地缓冲，`poll()` 只从缓冲取。
-/// 位点默认 auto-commit —— 注意提交点是「拉进缓冲」而非「poll 给用户」，
-/// 进程崩溃会丢掉缓冲里未 poll 的消息（同一取舍）。
+/// In both modes a single background loop does **short polling** to feed messages into the local buffer; `poll()` only takes from the buffer.
+/// Offsets auto-commit by default -- note the commit point is "pulled into the buffer", not "polled to the user",
+/// so a process crash loses buffered messages that were never polled (the same trade-off).
 ///
-/// ⚠ subscribe 模式下 `start()` **不**同步重平衡：刚 start 完
-/// [`assignment`](Self::assignment) 很可能是空的，要等后台循环第一轮（≤1s）。
-/// 依赖队列分配的调用方（`pause`、按队列 `seek`）先 `rebalance().await` 一次。
+/// ⚠ In subscribe mode `start()` does **not** rebalance synchronously: right after start,
+/// [`assignment`](Self::assignment) is very likely empty; wait for the background loop's first round (≤1s).
+/// Callers that depend on the queue assignment (`pause`, per-queue `seek`) should run `rebalance().await` once first.
 #[derive(Clone)]
 pub struct DefaultLitePullConsumer {
     inner: Arc<LiteInner>,
@@ -1234,7 +1234,7 @@ impl std::fmt::Debug for DefaultLitePullConsumer {
 }
 
 impl DefaultLitePullConsumer {
-    /// 按消费组名构造 lite 消费者。
+    /// Construct a lite consumer by consumer group name.
     pub fn new(consumer_group: &str) -> Result<DefaultLitePullConsumer> {
         DefaultLitePullConsumer::with_config(LitePullConsumerConfig {
             consumer_group: consumer_group.to_string(),
@@ -1242,7 +1242,7 @@ impl DefaultLitePullConsumer {
         })
     }
 
-    /// 按消费组名 + RPC 钩子构造 lite 消费者。
+    /// Construct a lite consumer by consumer group name + RPC hook.
     pub fn with_rpc_hook(
         consumer_group: &str,
         rpc_hook: Option<Arc<dyn RPCHook>>,
@@ -1252,25 +1252,25 @@ impl DefaultLitePullConsumer {
         Ok(consumer)
     }
 
-    /// 直接以一份完整配置构造。
+    /// Construct directly from a complete config.
     pub fn with_config(cfg: LitePullConsumerConfig) -> Result<DefaultLitePullConsumer> {
         if cfg.consumer_group.trim().is_empty() {
             bail!("consumerGroup is empty");
         }
-        // `LiteInner` 有 `Drop`，所以不能用 `..Default::default()` 的结构体更新语法，
-        // 只能先整体默认构造再替换 cfg。
+        // `LiteInner` has a `Drop`, so the `..Default::default()` struct-update syntax is not allowed;
+        // build the whole default first, then replace cfg.
         let mut inner = LiteInner::default();
         inner.cfg = RwLock::new(cfg);
         let inner = Arc::new(inner);
         Ok(DefaultLitePullConsumer { inner })
     }
 
-    /// 当前配置快照。
+    /// Snapshot of the current config.
     pub fn config(&self) -> LitePullConsumerConfig {
         read_cfg(&self.inner.cfg)
     }
 
-    /// 改配置（直接赋属性 + 一批 `set_*`；钳制规则照抄 setter）。
+    /// Change the config (direct property assignment + a batch of `set_*`; clamping rules copy the setters).
     pub fn update_config(&self, f: impl FnOnce(&mut LitePullConsumerConfig)) {
         {
             let mut w = self.inner.cfg.write().unwrap_or_else(|e| e.into_inner());
@@ -1282,12 +1282,12 @@ impl DefaultLitePullConsumer {
         }
     }
 
-    /// `max(1, n)`。
+    /// `max(1, n)`.
     pub fn set_pull_batch_size(&self, n: i32) {
         self.update_config(|c| c.pull_batch_size = n);
     }
 
-    /// `max(0, ms)`。
+    /// `max(0, ms)`.
     pub fn set_poll_timeout_millis(&self, ms: i64) {
         self.update_config(|c| c.poll_timeout_millis = ms);
     }
@@ -1296,12 +1296,12 @@ impl DefaultLitePullConsumer {
         self.update_config(|c| c.auto_commit = auto);
     }
 
-    /// `max(0, ms)`。
+    /// `max(0, ms)`.
     pub fn set_auto_commit_interval_millis(&self, ms: i64) {
         self.update_config(|c| c.auto_commit_interval_millis = ms);
     }
 
-    /// `max(0, ms)`。
+    /// `max(0, ms)`.
     pub fn set_pull_interval_millis(&self, ms: i64) {
         self.update_config(|self_c| self_c.pull_interval_millis = ms);
     }
@@ -1429,12 +1429,12 @@ impl DefaultLitePullConsumer {
         self.inner.running.load(Ordering::Acquire)
     }
 
-    // ---------------- 订阅 / 分配 ----------------
+    // ---------------- Subscribe / assign ----------------
 
-    /// 切回 subscribe 模式。
+    /// Switch back to subscribe mode.
     ///
-    /// 表达式非法（`FilterAPI` 抛错）时只丢订阅表里的那条
-    /// ，`subscription` 仍记下 —— 与线上基准一致。
+    /// When the expression is invalid (`FilterAPI` errors), only that entry is dropped from the subscription table
+    /// ; `subscription` still records it -- consistent with the online baseline.
     pub fn subscribe(&self, topic: &str, sub_expression: &str) {
         let topic = with_namespace(&self.config().namespace, topic);
         {
@@ -1455,8 +1455,8 @@ impl DefaultLitePullConsumer {
         }
     }
 
-    /// lite 只认 tag 表达式，`MessageSelector`
-    /// 一律按 tag 处理。
+    /// Lite only recognizes tag expressions; a `MessageSelector`
+    /// is always handled as its tag expression.
     pub fn subscribe_with_selector(&self, topic: &str, selector: &MessageSelector) {
         self.subscribe(topic, &selector.expression);
     }
@@ -1468,8 +1468,8 @@ impl DefaultLitePullConsumer {
         state.subscription_data.remove(&topic);
     }
 
-    /// assign 模式下给某 topic 指定 tag
-    /// 表达式，同时登记 `SubscriptionData`（assign 模式 broker 也要订阅信息）。
+    /// In assign mode, set the tag
+    /// expression for a topic and register the `SubscriptionData` too (the broker needs subscription info in assign mode as well).
     pub fn set_sub_expression_for_assign(&self, topic: &str, sub_expression: &str) {
         let topic = with_namespace(&self.config().namespace, topic);
         let mut state = lock(&self.inner.state);
@@ -1487,11 +1487,11 @@ impl DefaultLitePullConsumer {
         }
     }
 
-    /// 切到 assign 模式（不走重平衡）。
+    /// Switch to assign mode (no rebalance).
     ///
-    /// 初始位点解析需要 RPC，故这里只登记队列，位点留给
-    /// [`start`](Self::start)（同步解析语义相同、时机后移，
-    /// 因为 `assign()` 不是 async）。已在 `next_offset` 里的队列不覆盖。
+    /// Initial offset resolution needs RPCs, so this only registers the queues and leaves offsets to
+    /// [`start`](Self::start) (synchronous resolution has the same semantics, just later timing,
+    /// because `assign()` is not async). Queues already in `next_offset` are not overwritten.
     pub fn assign(&self, message_queues: &[MessageQueue]) {
         let mut state = lock(&self.inner.state);
         state.assign_mode = true;
@@ -1512,7 +1512,7 @@ impl DefaultLitePullConsumer {
         }
     }
 
-    /// 当前订阅表（topic -> 表达式）。
+    /// Current subscription table (topic -> expression).
     pub fn subscription(&self) -> Vec<(String, String)> {
         lock(&self.inner.state)
             .subscription
@@ -1521,7 +1521,7 @@ impl DefaultLitePullConsumer {
             .collect()
     }
 
-    /// 当前进入心跳的订阅集。
+    /// The current subscription set carried into heartbeats.
     pub fn subscriptions(&self) -> Vec<SubscriptionData> {
         lock(&self.inner.state)
             .subscription_data
@@ -1530,20 +1530,20 @@ impl DefaultLitePullConsumer {
             .collect()
     }
 
-    /// 是否 assign 模式。
+    /// Whether in assign mode.
     pub fn is_assign_mode(&self) -> bool {
         lock(&self.inner.state).assign_mode
     }
 
-    // ---------------- 生命周期 ----------------
+    // ---------------- Lifecycle ----------------
 
-    /// 幂等；先查组名，再有 name server，必须已有订阅或 assign；
-    /// **先把订阅 topic 的路由缓存进来，再同步发一次心跳**，最后起后台循环。
+    /// Idempotent; first checks the group name, then requires a name server and an existing subscription or assign;
+    /// **first caches the routes of the subscribed topics, then sends one heartbeat synchronously**, finally starts the background loops.
     ///
-    /// 心跳只发给路由表里已知的 broker，所以刷路由必须在那次同步心跳之前
-    /// （见 [`refresh_route_for_heartbeat`](Self::refresh_route_for_heartbeat)）：
-    /// 否则 start() 那一轮发 0 份，订阅要等到 5s 心跳循环第一轮才注册上 broker，
-    /// 同组多实例时对端要晚一个心跳周期才能看见彼此。
+    /// Heartbeats only go to brokers already known in the route table, so the route refresh must happen before that synchronous heartbeat
+    /// (see [`refresh_route_for_heartbeat`](Self::refresh_route_for_heartbeat)):
+    /// otherwise the start() round sends 0 heartbeats and subscriptions would only reach the broker at the heartbeat loop's first round 5s later,
+    /// so with multiple instances in one group the peers would see each other one heartbeat cycle late.
     pub async fn start(&self) -> Result<()> {
         if self
             .inner
@@ -1631,7 +1631,7 @@ impl DefaultLitePullConsumer {
         client.register_consumer_group(&cfg.consumer_group);
         *lock(&self.inner.client) = Some(client);
 
-        // assign 模式：start 时补齐初始位点
+        // assign mode: complete the initial offsets at start
         let pending: Vec<MessageQueue> = {
             let state = lock(&self.inner.state);
             state
@@ -1645,7 +1645,7 @@ impl DefaultLitePullConsumer {
             self.resolve_offsets_for(&pending).await;
         }
 
-        // 先把 tag 订阅注册给 broker，再起后台拉取
+        // Register the tag subscriptions with the broker first, then start the background pull
         self.refresh_route_for_heartbeat().await;
         self.send_heartbeat_to_all_broker().await;
         self.inner.running.store(true, Ordering::Release);
@@ -1654,14 +1654,14 @@ impl DefaultLitePullConsumer {
         Ok(())
     }
 
-    /// 停循环 → 末次 commit（auto_commit 时）→ 唤醒 poll
-    /// → 关实例。
+    /// Stop the loops → final commit (when auto_commit) → wake up poll
+    /// → close the instance.
     ///
-    /// 末次提交与 `client.shutdown()` 一起派发到运行时上**串行**
-    /// 执行（提交要发 RPC，必须发生在实例关闭之前），且本方法**阻塞等它落地**
-    /// （上限 [`SHUTDOWN_FINALIZE_BUDGET`]，「shutdown 后立刻退进程」不会再丢末次
-    /// 提交）；current_thread 运行时里退化为游离任务并告警（见
-    /// [`run_finalize_blocking`] 的情形 2/3）；没有运行时时退化为直接关闭。
+    /// The final commit and `client.shutdown()` are dispatched onto the runtime to run **serially**
+    /// (the commit sends RPCs and must happen before the instance closes), and this method **blocks until it lands**
+    /// (bounded by [`SHUTDOWN_FINALIZE_BUDGET`], so "the process exits right after shutdown" no longer loses the final
+    /// commit); on a current_thread runtime it degrades to a detached task with a warning (see
+    /// [`run_finalize_blocking`] cases 2/3); with no runtime it degrades to closing directly.
     pub fn shutdown(&self) {
         if self
             .inner
@@ -1676,7 +1676,7 @@ impl DefaultLitePullConsumer {
         for task in lock(&self.inner.tasks).drain(..) {
             task.abort();
         }
-        // 唤醒可能卡在 poll() 里的调用方
+        // Wake up any callers possibly stuck in poll()
         self.inner.buffer_signal.notify_waiters();
 
         let auto_commit = self.config().auto_commit;
@@ -1707,8 +1707,8 @@ impl DefaultLitePullConsumer {
                 );
             }
             None => {
-                // 无运行时：提交不了，至少把连接关掉
-                // （与「commit 失败只 debug 日志」同级别降级）。
+                // No runtime: the commit is impossible, at least close the connections
+                // (the same degradation level as "commit failure only logs at debug").
                 rmq_warn!("lite shutdown: no tokio runtime, skip final offset commit");
                 self.close_client();
             }
@@ -1741,12 +1741,12 @@ impl DefaultLitePullConsumer {
             .ok_or_else(|| Error::client("consumer not started, call start() first"))
     }
 
-    // ---------------- 心跳 ----------------
+    // ---------------- Heartbeat ----------------
 
-    /// 心跳只发给「路由表里已知的 broker」，
-    /// 而自建实例刚 start 时路由表还是空的，那一轮会发 0 份 —— 订阅要等到 5s 心跳
-    /// 循环的第一轮才注册上 broker。所以这里先把本实例关注的 topic（订阅的 + assign
-    /// 到的）路由拉一遍并登记为在用，让 start() 里那次同步心跳真正到达 broker。
+    /// Heartbeats only go to "brokers already known in the route table", and a
+    /// self-created instance still has an empty route table right after start, so that round sends 0 -- the subscriptions would only get registered
+    /// with the broker at the heartbeat loop's first round 5s later. So this first pulls the routes of the topics this instance cares about (subscribed + assigned)
+    /// and registers them as in use, letting the one synchronous heartbeat inside start() actually reach the broker.
     async fn refresh_route_for_heartbeat(&self) {
         let Ok(client) = Self::require_client(&self.inner) else {
             return;
@@ -1769,20 +1769,20 @@ impl DefaultLitePullConsumer {
         }
     }
 
-    /// 向路由里的每个 broker 发一份，返回成功数。
+    /// Send one heartbeat to each broker in the route table, returning the number of successes.
     pub async fn send_heartbeat_to_all_broker(&self) -> usize {
         send_lite_heartbeat(&self.inner).await
     }
 
-    // ---------------- 后台循环 ----------------
+    // ---------------- Background loops ----------------
 
     fn spawn_loops(&self) {
         let Some(handle) = self.runtime_handle() else {
             rmq_warn!("lite pull consumer: no tokio runtime, background loops disabled");
             return;
         };
-        // 后台任务握 Weak 而不是 Arc：消费者被丢弃时 Drop 才有机会跑（否则任务自己就把
-        // 引用计数留着了，Drop 永不触发）。两个循环的 future 类型不同，只能各写一行。
+        // Background tasks hold a Weak instead of an Arc: only then can Drop get its chance to run when the consumer is discarded (otherwise the
+        // task itself keeps the reference count alive and Drop never fires). The two loops' future types differ, so each needs its own line.
         let mut tasks = lock(&self.inner.tasks);
         tasks.push(handle.spawn(Self::run_guarded(
             Arc::downgrade(&self.inner),
@@ -1811,10 +1811,10 @@ impl DefaultLitePullConsumer {
         }
     }
 
-    // ---------------- poll / 位点 ----------------
+    // ---------------- poll / offsets ----------------
 
-    /// 等缓冲非空（最多 `poll_timeout_millis`），
-    /// 一次最多取 [`MAX_POLL_BATCH_SIZE`] 条。
+    /// Wait for the buffer to become non-empty (at most `poll_timeout_millis`),
+    /// taking at most [`MAX_POLL_BATCH_SIZE`] messages per call.
     pub async fn poll(&self, timeout_millis: Option<i64>) -> Vec<MessageExt> {
         if self.config().auto_commit {
             self.maybe_auto_commit().await;
@@ -1822,9 +1822,9 @@ impl DefaultLitePullConsumer {
         let timeout = timeout_millis.unwrap_or_else(|| self.config().poll_timeout_millis);
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout.max(0) as u64);
         loop {
-            // 先挂上唤醒再查缓冲（等价于「check 完才 wait」）：
-            // 反过来写时，检查与挂起之间 enqueue 的那次 notify 会丢，
-            // 用户只能白等到一个 deadline。`enable()` 才是真正登记兴趣的点。
+            // Arm the wakeup before checking the buffer (equivalent to "wait only after the check"):
+            // written the other way, the notify enqueued between the check and the suspend would be lost,
+            // and the user would wait pointlessly until the deadline. `enable()` is the actual point where interest is registered.
             let mut notified = std::pin::pin!(self.inner.buffer_signal.notified());
             notified.as_mut().enable();
             if let Some(drained) = self.try_drain() {
@@ -1835,14 +1835,14 @@ impl DefaultLitePullConsumer {
             if remaining.is_zero() {
                 return Vec::new();
             }
-            // 等价于带超时的条件等待：被叫醒就再查一次缓冲，
-            // 没到 deadline 就继续等（假唤醒无害）。
+            // Equivalent of a timed condition wait: when woken, recheck the buffer once,
+            // and keep waiting while the deadline has not passed (spurious wakeups are harmless).
             let _ = tokio::time::timeout(remaining, notified).await;
         }
     }
 
-    /// 一次性 drain 缓冲（最多 1024 条）。
-    /// `None` = 缓冲为空，调用方该继续等。
+    /// One-shot drain of the buffer (at most 1024 messages).
+    /// `None` = the buffer is empty; the caller should keep waiting.
     fn try_drain(&self) -> Option<Vec<MessageExt>> {
         let mut buffer = lock(&self.inner.buffer);
         if buffer.is_empty() {
@@ -1852,11 +1852,11 @@ impl DefaultLitePullConsumer {
         Some(buffer.drain(..take).collect())
     }
 
-    /// 交付出去的这批消息推进**已消费游标**（拉取游标一格都不动）。
+    /// Advance the **consumed cursor** by the batch just delivered (the pull cursor does not move at all).
     fn advance_consume_offset(&self, msgs: &[MessageExt]) {
         let mut state = lock(&self.inner.state);
-        // 先把「有拉取记录的队列」按 (topic, brokerName, queueId) 建索引，
-        // 再用消息自己的坐标反查 mq_key —— 从消息字段拼 key 会绕过持有判断。
+        // First index "queues with pull records" by (topic, brokerName, queueId),
+        // then reverse-lookup mq_key via the message's own coordinates -- building the key from message fields would bypass the holding check.
         let held: BTreeMap<(String, String, i32), String> = state
             .next_offset
             .keys()
@@ -1883,7 +1883,7 @@ impl DefaultLitePullConsumer {
         }
     }
 
-    /// 钉住游标并丢掉缓冲里该队列早于 `offset` 的消息。
+    /// Pin the cursor and drop from the buffer this queue's messages earlier than `offset`.
     pub fn seek(&self, mq: &MessageQueue, offset: i64) {
         let key = mq_key(mq);
         {
@@ -1955,8 +1955,8 @@ impl DefaultLitePullConsumer {
         }
     }
 
-    /// 提交源绝不能是拉取游标：本地缓冲里压着没交出去的消息不算已消费，
-    /// 提前提交会让那段消息在重启后永远不再投递（静默丢消息）。
+    /// The commit source must never be the pull cursor: messages sitting undelivered in the local buffer are not consumed,
+    /// and committing them early would make that range never redelivered after a restart (silent message loss).
     pub async fn commit(&self) -> Result<()> {
         let scope: Vec<String> = lock(&self.inner.state).assigned.keys().cloned().collect();
         let targets: BTreeMap<String, i64> = {
@@ -2011,7 +2011,7 @@ impl DefaultLitePullConsumer {
         self.commit_targets(targets, &scope, persist).await
     }
 
-    /// 三个入口的共同部分：写内存位点表（两道守卫），`persist` 再把这一批刷给 broker。
+    /// The common part of the three entry points: write the in-memory offset table (with two guards); `persist` then flushes this batch to the broker.
     async fn commit_targets(
         &self,
         targets: BTreeMap<String, i64>,
@@ -2096,7 +2096,7 @@ impl DefaultLitePullConsumer {
         }
     }
 
-    /// 拉取游标（观测点：broker 侧流量分不出两条游标，真机对拍要看的就是这个数）。
+    /// Pull cursor (observation point: broker-side traffic cannot tell the two cursors apart; on a real cluster this is the value to cross-check).
     pub fn pull_cursor_of(&self, mq: &MessageQueue) -> i64 {
         lock(&self.inner.state)
             .next_offset
@@ -2105,7 +2105,7 @@ impl DefaultLitePullConsumer {
             .unwrap_or(-1)
     }
 
-    /// 已消费游标（`poll()` 交付出去的那一格）。
+    /// Consumed cursor (the slot handed out by `poll()`).
     pub fn consume_cursor_of(&self, mq: &MessageQueue) -> i64 {
         lock(&self.inner.state)
             .consume_offset
@@ -2114,7 +2114,7 @@ impl DefaultLitePullConsumer {
             .unwrap_or(-1)
     }
 
-    /// 内存位点表里那一格（`persist=false` 提交但还没落盘的值就在这）。
+    /// The slot in the in-memory offset table (values committed with `persist=false` but not yet flushed live here).
     pub fn pending_commit_of(&self, mq: &MessageQueue) -> i64 {
         lock(&self.inner.state)
             .offset_table
@@ -2134,13 +2134,13 @@ impl DefaultLitePullConsumer {
         lock(&self.inner.state).assigned.values().cloned().collect()
     }
 
-    /// 该 topic 的全部可消费队列（订阅口径：读位、不筛 master），topic 按命名空间拼好后查。
+    /// All consumable queues of the topic (subscription view: read-only, no master filtering); the topic is namespace-wrapped before lookup.
     ///
-    /// 两件事必须一起做对，否则队列变更监听静默失真：
-    /// 1. **每轮现问 name server**，不吃周期刷新的路由缓存；少了这一步，扩容最快也要等
-    ///    一次路由轮询才看得见（监听回调比预期慢一个周期）。
-    /// 2. 空队列集是**报错**，不是返回空表 —— "查不到" ≠ "这个 topic 缩到 0 队列"，
-    ///    后者会让监听器收到一次假缩容回调并把快照刷成空集。
+    /// Two things must be right together, otherwise queue-change listeners silently drift:
+    /// 1. **Ask the name server fresh every round**, not the periodically refreshed route cache; skipping this, a scale-out is visible at the earliest after
+    ///    one route poll (the listener callback would lag one period behind expectation).
+    /// 2. An empty queue set is **an error**, not an empty return -- "cannot find" ≠ "this topic shrank to 0 queues";
+    ///    the latter would hand the listener a fake scale-in callback and flush its snapshot to the empty set.
     pub async fn fetch_message_queues(&self, topic: &str) -> Result<Vec<MessageQueue>> {
         let client = Self::require_client(&self.inner)?;
         let topic = with_namespace(&self.config().namespace, topic);
@@ -2160,7 +2160,7 @@ impl DefaultLitePullConsumer {
         Ok(queues)
     }
 
-    /// `fetch_subscribe_message_queues`（lite 版 = `fetch_message_queues`）。
+    /// `fetch_subscribe_message_queues` (lite version = `fetch_message_queues`).
     pub async fn fetch_subscribe_message_queues(&self, topic: &str) -> Result<Vec<MessageQueue>> {
         self.fetch_message_queues(topic).await
     }
@@ -2183,7 +2183,7 @@ impl DefaultLitePullConsumer {
         self.update_config(|c| c.topic_metadata_check_interval_millis = millis.max(1000));
     }
 
-    /// 当前比对周期（毫秒）。
+    /// The current compare period (millis).
     pub fn topic_metadata_check_interval_millis(&self) -> i64 {
         self.config().topic_metadata_check_interval_millis
     }
@@ -2222,11 +2222,11 @@ impl DefaultLitePullConsumer {
         Ok(())
     }
 
-    /// 跑一轮比对（后台循环调它，测试与调用方也可以直接驱动），返回回调触发了几次。
+    /// Run one compare round (the background loop calls it; tests and callers may also drive it directly), returning how many callbacks fired.
     ///
-    /// ⚠ 有意做法：单个 topic 失败只记日志、跳过它自己，同轮其余 topic 照常比对。
-    /// 一个长期查不到路由的 topic 不该把排在它后面的监听器永久饿死；下一轮照常，
-    /// 两种写法都不打断调度。
+    /// ⚠ Deliberate: a single topic failing is logged and skipped for that topic only; the other topics of the same round still compare.
+    /// A topic whose route cannot be found for a long time should not starve the listeners ordered after it forever; the next round proceeds normally,
+    /// and neither style interrupts the scheduling.
     pub async fn fetch_topic_message_queues_and_compare(&self) -> usize {
         let entries: Vec<(String, Arc<dyn TopicMessageQueueChangeListener>)> = lock(
             &self.inner.topic_listeners,
@@ -2266,14 +2266,14 @@ impl DefaultLitePullConsumer {
         fired
     }
 
-    /// 本地缓冲当前条数（测试与观测用）。
+    /// Current local buffer count (for tests and observation).
     pub fn buffered_message_count(&self) -> usize {
         lock(&self.inner.buffer).len()
     }
 
-    // ---------------- 拉取服务的内部件 ----------------
+    // ---------------- Internals of the pull service ----------------
 
-    /// subscribe 表 → assign 表达式 → `"*"`。
+    /// subscribe table → assign expression → `"*"`.
     fn subscription_for(&self, topic: &str) -> String {
         let state = lock(&self.inner.state);
         if let Some(expr) = state.subscription.get(topic) {
@@ -2285,8 +2285,8 @@ impl DefaultLitePullConsumer {
         FilterAPI::SUB_ALL.to_string()
     }
 
-    /// 初始位点解析的批量版：逐队列解析，失败只记日志
-    /// （`assign` / `rebalance` / 首拉三处都吞掉错误）。
+    /// Batch form of initial offset resolution: resolve queue by queue, failures are only logged
+    /// (the `assign` / `rebalance` / first-pull sites all swallow the errors).
     async fn resolve_offsets_for(&self, mqs: &[MessageQueue]) {
         let Ok(client) = Self::require_client(&self.inner) else {
             return;
@@ -2305,10 +2305,10 @@ impl DefaultLitePullConsumer {
         }
     }
 
-    /// 重平衡（subscribe 模式）：逐 topic 取全部队列 + 消费组实例列表
-    /// → 分配策略 → 并集。查不到实例列表时**保留当前分配**
-    /// （等价于「只有我一人时独占」；这里与推送消费者
-    /// 同口径，见 [`crate::client::consumer::DefaultMQPushConsumer`] 的说明）。
+    /// Rebalance (subscribe mode): per topic fetch all queues + the consumer group's instance list
+    /// → allocation strategy → union. When the instance list cannot be fetched, **keep the current assignment**
+    /// (equivalent to "exclusive when I am the only one"; the same stance as the push consumer here,
+    /// see the note on [`crate::client::consumer::DefaultMQPushConsumer`]).
     pub async fn rebalance(&self) {
         let Ok(client) = Self::require_client(&self.inner) else {
             return;
@@ -2330,7 +2330,7 @@ impl DefaultLitePullConsumer {
         let mut new_assigned: BTreeMap<String, MessageQueue> = BTreeMap::new();
         let baseline: Vec<MessageQueue> =
             lock(&self.inner.state).assigned.values().cloned().collect();
-        // topic -> (全部队列, 分到的队列)，用于 MessageQueueListener 回调
+        // topic -> (all queues, allocated queues), used for the MessageQueueListener callback
         let mut per_topic: Vec<(String, Vec<MessageQueue>, Vec<MessageQueue>)> = Vec::new();
         for topic in topics {
             let mut mq_all: Vec<MessageQueue> = client.get_topic_subscribe_info(&topic).await;
@@ -2366,7 +2366,7 @@ impl DefaultLitePullConsumer {
 
         let (added, changed_topics, revoked) = {
             let mut state = lock(&self.inner.state);
-            // 先快照旧的分配：`state.assigned` 之后要被整体替换，借用不能跨过那次赋值。
+            // Snapshot the old assignment first: `state.assigned` is about to be replaced wholesale, and a borrow cannot survive that assignment.
             let old: BTreeMap<String, MessageQueue> = state.assigned.clone();
             let added: Vec<MessageQueue> = new_assigned
                 .keys()
@@ -2430,15 +2430,15 @@ impl DefaultLitePullConsumer {
         }
     }
 
-    /// 短轮询拉一批，命中则过滤 tag → 灌缓冲 → 推游标 →
-    /// 节流 auto-commit。返回 `true` = 本轮有消息进缓冲（退避判断用）。
+    /// Short-poll one batch; on a hit, filter tags → feed the buffer → advance the cursor →
+    /// throttle auto-commit. Returning `true` = this round put messages into the buffer (used for the backoff decision).
     async fn pull_one(&self, mq: &MessageQueue) -> bool {
         let Ok(client) = Self::require_client(&self.inner) else {
             return false;
         };
         let key = mq_key(mq);
-        // 先取快照再 await：MutexGuard 不是 Send，直接把 lock(...) 写在 match 的
-        // scrutinee 里会让整个 future 不 Send（临时量活到 match 结束）。
+        // Snapshot first, then await: a MutexGuard is not Send, and calling lock(...) directly in the match
+        // scrutinee would make the whole future non-Send (the temporary lives until the match ends).
         let known_offset = { lock(&self.inner.state).next_offset.get(&key).copied() };
         let offset = match known_offset {
             Some(offset) => offset,
@@ -2463,8 +2463,8 @@ impl DefaultLitePullConsumer {
                 mq,
                 offset,
                 cfg.pull_batch_size,
-                // 短轮询（suspend=False），位点由 auto-commit 单独提交；
-                // lite 位见 lite_pull_sys_flag（#107）
+                // Short polling (suspend=False); offsets are committed separately by auto-commit;
+                // for the lite bit see lite_pull_sys_flag (#107)
                 lite_pull_sys_flag(),
                 0,
                 &expr,
@@ -2499,12 +2499,12 @@ impl DefaultLitePullConsumer {
         if !intact || result.status != PullStatus::Found || result.msg_found_list.is_empty() {
             return false;
         }
-        // 按表达式现算 tagsSet 再筛（无集合 = 不筛）
+        // Recompute tagsSet from the expression on the spot, then filter (no set = no filtering)
         let sub = FilterAPI::build_subscription_data(&mq.topic, Some(&expr)).ok();
         let msgs = client_side_tag_filter(sub.as_ref(), result.msg_found_list);
         if msgs.is_empty() {
-            // 全被 tag 过滤掉：窗口在 broker 眼里已经读过（游标上面推过了），
-            // 只是没有可交付的——不能像旧实现那样原地重拉同一窗口。
+            // All dropped by the tag filter: as far as the broker is concerned this window has already been read (the cursor was advanced above),
+            // there is simply nothing deliverable -- the window must not be re-pulled in place like the old implementation did.
             return false;
         }
         self.enqueue(msgs);
@@ -2519,11 +2519,11 @@ impl DefaultLitePullConsumer {
     }
 }
 
-/// `seek` → broker 已提交位点（保证重启续消费）
-/// → `CONSUME_FROM_FIRST_OFFSET` ⇒ min → `CONSUME_FROM_TIMESTAMP` ⇒ 按时间查 → 否则 max。
+/// `seek` → the offset committed on the broker (so consumption continues after a restart)
+/// → `CONSUME_FROM_FIRST_OFFSET` ⇒ min → `CONSUME_FROM_TIMESTAMP` ⇒ query by timestamp → otherwise max.
 ///
-/// 与推送消费者的 `resolve_initial_offset` 不同：lite 没有广播模式的本地位点存储、
-/// 没有 SQL92 特例，也不给 `%RETRY%` 特殊起步（lite 不自动订阅重试主题）。
+/// Unlike the push consumer's `resolve_initial_offset`: lite has no local offset store for broadcasting mode,
+/// no SQL92 special case, and no special start for `%RETRY%` (lite does not auto-subscribe retry topics).
 async fn resolve_initial_offset(
     inner: &LiteInner,
     client: &MQClientInstance,
@@ -2552,7 +2552,7 @@ async fn resolve_initial_offset(
         return Ok(0);
     }
     if cfg.consume_from_where == ConsumeFromWhere::CONSUME_FROM_TIMESTAMP {
-        // 与推送消费者共用解析器：两种消费者的 consumeTimestamp 语义必须一致
+        // Shares the parser with the push consumer: the consumeTimestamp semantics of both consumers must stay consistent
         let ts = consume_timestamp_millis(&cfg.consume_timestamp)?;
         return client
             .search_offset_by_timestamp(mq, ts, LITE_PULL_RPC_TIMEOUT_MILLIS, None)
@@ -2563,8 +2563,8 @@ async fn resolve_initial_offset(
         .await
 }
 
-/// 心跳报文：只带**本消费者自己**的 ConsumerData
-/// （lite 不进实例注册表，报文由自己拼）。
+/// Heartbeat packet: carries only **this consumer's own** ConsumerData
+/// (lite does not enter the instance registry; the packet is assembled here).
 fn build_lite_heartbeat(inner: &LiteInner) -> HeartbeatData {
     let cfg = read_cfg(&inner.cfg);
     let mut hb = HeartbeatData::new(cfg.client_id.clone().unwrap_or_default());
@@ -2584,8 +2584,8 @@ fn build_lite_heartbeat(inner: &LiteInner) -> HeartbeatData {
     hb
 }
 
-/// 路由里的每个 broker（**含从节点**）发一份。
-/// 没有 client（未 start / 已 shutdown）就发 0 份而不是退出循环。
+/// Send one copy to every broker in the route table (**including slaves**).
+/// With no client (not started / already shut down) it sends 0 copies instead of exiting the loop.
 async fn send_lite_heartbeat(inner: &LiteInner) -> usize {
     let Some(client) = lock(&inner.client).clone() else {
         return 0;
@@ -2604,8 +2604,8 @@ async fn send_lite_heartbeat(inner: &LiteInner) -> usize {
     ok
 }
 
-/// 先发一轮（start 里已同步发过一轮，这里紧跟着第二次，
-/// 与 lite 版同序），之后每 5s 一轮。
+/// Sends one round first (start() already sent one round synchronously; this immediately follows as the second,
+/// in the same order as the lite version), then one round every 5s.
 async fn heartbeat_loop(inner: Arc<LiteInner>, mut rx: watch::Receiver<bool>) {
     while inner.running.load(Ordering::Acquire) {
         if *rx.borrow_and_update() {
@@ -2618,15 +2618,15 @@ async fn heartbeat_loop(inner: Arc<LiteInner>, mut rx: watch::Receiver<bool>) {
     }
 }
 
-/// 启动后 10s 首查，此后每 `topic_metadata_check_interval_millis` 一趟比对队列集合变更。
+/// First check 10s after startup, then compare queue-set changes every `topic_metadata_check_interval_millis`.
 async fn metadata_loop(inner: Arc<LiteInner>, rx: watch::Receiver<bool>) {
     metadata_loop_after(&inner, rx, LITE_METADATA_FIRST_DELAY_MILLIS).await;
 }
 
-/// `metadata_loop` 但首查延迟可注入，单测用它把 10s 缩成几十毫秒。
+/// Same as `metadata_loop` but with an injectable first-check delay; unit tests use it to shrink the 10s to a few tens of milliseconds.
 ///
-/// ⚠ 首查延迟只在**第一趟之前**生效。把它留在循环里，每趟都会先等满 10s，
-/// 1s 的检查周期会被拖成 11s —— 扩容后监听器要晚一个数量级才动。
+/// ⚠ The first-check delay applies only **before the first round**. Left inside the loop, every round would wait a full 10s first,
+/// dragging the 1s check period out to 11s -- after a scale-out the listener would react an order of magnitude later.
 async fn metadata_loop_after(
     inner: &Arc<LiteInner>,
     mut rx: watch::Receiver<bool>,
@@ -2650,9 +2650,9 @@ async fn metadata_loop_after(
     }
 }
 
-/// 单循环轮转所有已分配队列。
-/// subscribe 模式下每 >1s 重平衡一次；一轮里没有任何消息则退避
-/// `pull_interval_millis`，有消息则 5ms 后立刻续拉。
+/// A single loop round-robins all assigned queues.
+/// In subscribe mode it rebalances every >1s; when a round yields no messages it backs off
+/// `pull_interval_millis`; with messages it resumes pulling after just 5ms.
 async fn pull_service_loop(inner: Arc<LiteInner>, mut rx: watch::Receiver<bool>) {
     while inner.running.load(Ordering::Acquire) {
         if *rx.borrow_and_update() {
@@ -2699,7 +2699,7 @@ async fn pull_service_loop(inner: Arc<LiteInner>, mut rx: watch::Receiver<bool>)
     }
 }
 
-/// `mq_key` 的排序键形式，供 `BTreeMap` 键序与队列顺序保持一致性检查用。
+/// Sort-key form of `mq_key`, used to keep `BTreeMap` key order consistent with queue order.
 fn _key_order_proof(mq: &MessageQueue) -> (String, String, i32) {
     mq_sort_key(mq)
 }
@@ -2707,8 +2707,8 @@ fn _key_order_proof(mq: &MessageQueue) -> (String, String, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // 心跳真机外的最小闭环（假 namesrv + 假 broker）：帧读写与 producer 的
-    // `send_retry_tests` 同款，但只关心 34/35 两号报文。
+    // Minimal heartbeat end-to-end loop outside real brokers (fake namesrv + fake broker): the frame read/write matches the
+    // producer's `send_retry_tests`, but only the 34/35 request codes matter here.
     use crate::common::message_decoder::encode_message_ext;
     use crate::common::sysflag::PermName;
     use crate::remoting::protocol::body::GetConsumerListByGroupResponseBody;
@@ -2732,7 +2732,7 @@ mod tests {
         m
     }
 
-    // ---------------------------------------------------------- 生命周期守卫
+    // ---------------------------------------------------------- Lifecycle guards
 
     #[test]
     fn blank_consumer_group_is_rejected_by_both_consumers() {
@@ -2755,23 +2755,23 @@ mod tests {
             ("bad group", "contains illegal characters"),
             (long_group.as_str(), "is longer than group max length"),
         ] {
-            let pull = DefaultMQPullConsumer::new(group).expect("构造不该提前拒绝");
+            let pull = DefaultMQPullConsumer::new(group).expect("construction must not reject early");
             pull.set_namesrv_addr("127.0.0.1:1");
-            let err = pull.start().await.expect_err("pull: 非法组名必须本地失败");
+            let err = pull.start().await.expect_err("pull: an illegal group name must fail locally");
             assert!(err.to_string().contains(needle), "pull {group}: {err}");
             assert!(
                 !pull.is_started(),
-                "pull {group}: 失败的 start 必须回滚 started"
+                "pull {group}: a failed start must roll back started"
             );
 
-            let lite = DefaultLitePullConsumer::new(group).expect("构造不该提前拒绝");
+            let lite = DefaultLitePullConsumer::new(group).expect("construction must not reject early");
             lite.set_namesrv_addr("127.0.0.1:1");
             lite.subscribe("T", "TagA");
-            let err = lite.start().await.expect_err("lite: 非法组名必须本地失败");
+            let err = lite.start().await.expect_err("lite: an illegal group name must fail locally");
             assert!(err.to_string().contains(needle), "lite {group}: {err}");
             assert!(
                 !lite.is_started(),
-                "lite {group}: 失败的 start 必须回滚 started"
+                "lite {group}: a failed start must roll back started"
             );
         }
     }
@@ -2781,7 +2781,7 @@ mod tests {
         let c = DefaultMQPullConsumer::new("PG").unwrap();
         assert!(c.start().await.is_err());
         let mq = queue("T", "broker-a", 0);
-        // 未 start 的每个入口都要给出同一句错误，而不是 panic / 空转
+        // Every entry point before start must report the same error, not panic / spin
         for label in ["pull", "offset"] {
             let r = match label {
                 "pull" => c
@@ -2813,7 +2813,7 @@ mod tests {
             .send_message_back(&msg("T", "broker-a", 0, 0, "b"), 3)
             .await
             .is_err());
-        // 未 start 时 shutdown 是 no-op，不能抛
+        // shutdown before start is a no-op and must not throw
         c.shutdown();
         assert!(!c.is_started());
     }
@@ -2832,7 +2832,7 @@ mod tests {
             e.contains("subscription is not set, call subscribe() or assign() first"),
             "{e}"
         );
-        // 缺 name server 的校验在前，且顺序固定
+        // The missing name server check comes first, and the order is fixed
         let c2 = DefaultLitePullConsumer::new("LitePG").unwrap();
         c2.subscribe("T", "*");
         let e2 = c2
@@ -2845,7 +2845,7 @@ mod tests {
         c2.shutdown();
     }
 
-    // ---------------------------------------------------------- 配置形状
+    // ---------------------------------------------------------- Config shape
 
     #[test]
     fn config_defaults_match_the_golden_reference() {
@@ -2902,9 +2902,9 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------- 拉取标志位
+    // ---------------------------------------------------------- Pull sysFlags
 
-    /// 直接测 sysFlag 的 suspend 位本身。
+    /// Test the suspend bit of sysFlag directly.
     #[test]
     fn pull_is_short_poll_and_block_is_long_poll() {
         let short = pull_sys_flag(false);
@@ -2926,7 +2926,7 @@ mod tests {
         assert_eq!(sub_expression_of(&tagged), "TagA || TagB");
     }
 
-    // ---------------------------------------------------------- 订阅 / 分配表
+    // ---------------------------------------------------------- Subscription / assignment tables
 
     #[test]
     fn subscriptions_are_namespaced_and_overwritable() {
@@ -2937,7 +2937,7 @@ mod tests {
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0].0, "NS1%Topic");
         assert_eq!(c.subscriptions()[0].tags_set, vec!["TagA".to_string()]);
-        // 同 topic 再订阅是覆盖，不追加
+        // Subscribing the same topic again overwrites, it does not append
         c.subscribe("Topic", "TagB");
         assert_eq!(c.subscription().len(), 1);
         assert_eq!(c.subscription()[0].1, "TagB");
@@ -2948,8 +2948,8 @@ mod tests {
 
     #[test]
     fn bad_tag_expression_drops_only_subscription_data() {
-        // `"||"` 会让 FilterAPI 抛 `subString split error`：保留
-        // `subscription` 条目、丢掉 `subscription_data`
+        // `"||"` makes FilterAPI throw `subString split error`: keep the
+        // `subscription` entry and drop the `subscription_data`
         let c = DefaultLitePullConsumer::new("LitePG").unwrap();
         c.subscribe("T", "||");
         assert_eq!(c.subscription().len(), 1);
@@ -2963,7 +2963,7 @@ mod tests {
         assert!(!c.is_assign_mode());
         c.assign(&[queue("T", "broker-a", 1), queue("T", "broker-a", 0)]);
         assert!(c.is_assign_mode());
-        // 分配快照按 key 有序（遍历序固定）
+        // The assignment snapshot is ordered by key (deterministic iteration order)
         assert_eq!(
             c.assignment(),
             vec![queue("T", "broker-a", 0), queue("T", "broker-a", 1)]
@@ -2973,35 +2973,35 @@ mod tests {
         assert_eq!(c.subscriptions().len(), 1);
     }
 
-    // ---------------------------------------------------- 三张位点表（#68）
+    // ---------------------------------------------------- The three offset tables (#68)
 
     #[tokio::test]
     async fn poll_advances_consume_cursor_not_pull_cursor() {
         let c = DefaultLitePullConsumer::new("LitePG").unwrap();
         let q = queue("T", "broker-a", 0);
-        // 拉取游标由后台拉取推进：单测里没有网络，手工写成 5（缓冲里只有 3 条交付过）
+        // The pull cursor is advanced by the background pull: unit tests have no network, so it is set to 5 by hand (only 3 delivered messages sit in the buffer)
         {
             let mut state = lock(&c.inner.state);
             state.assigned.insert(mq_key(&q), q.clone());
             state.next_offset.insert(mq_key(&q), 5);
         }
-        assert_eq!(c.pull_cursor_of(&q), 5, "拉取游标 = 后台已经拉到的那一格");
+        assert_eq!(c.pull_cursor_of(&q), 5, "pull cursor = the slot the background has already pulled to");
         assert_eq!(
             c.consume_cursor_of(&q),
             -1,
-            "一条都没交付 ⇒ 已消费游标还是 -1"
+            "nothing delivered ⇒ the consumed cursor is still -1"
         );
-        // 缓冲里压着 3 条：交付之前不算已消费
+        // 3 messages sit in the buffer: not consumed until they are delivered
         c.enqueue(
             (0..3)
                 .map(|i| msg("T", "broker-a", 0, i, &format!("m{i}")))
                 .collect(),
         );
-        assert_eq!(c.consume_cursor_of(&q), -1, "没 poll 就不算已消费");
+        assert_eq!(c.consume_cursor_of(&q), -1, "not polled yet, so not consumed");
         let got = c.poll(Some(10)).await;
         assert_eq!(got.len(), 3);
-        assert_eq!(c.consume_cursor_of(&q), 3, "交出去的那一格才是已消费");
-        assert_eq!(c.pull_cursor_of(&q), 5, "poll 绝不改拉取游标");
+        assert_eq!(c.consume_cursor_of(&q), 3, "the slot handed out is what counts as consumed");
+        assert_eq!(c.pull_cursor_of(&q), 5, "poll must never change the pull cursor");
     }
 
     #[tokio::test]
@@ -3018,23 +3018,23 @@ mod tests {
         let q0 = queue("T", "broker-a", 0);
         let q1 = queue("T", "broker-a", 1);
         c.assign(&[q0.clone(), q1.clone()]);
-        // commitAll 走的是已消费游标：一条都没交付 ⇒ 一格都不写
+        // commitAll works off the consumed cursor: nothing delivered ⇒ not a single slot is written
         c.commit().await.unwrap();
         assert_eq!(
             c.pending_commit_of(&q0),
             -1,
-            "commitAll 不提交没消费过的队列"
+            "commitAll does not commit queues that were never consumed"
         );
 
-        // 指定位点只写提交落点，两条游标一律不动
+        // Explicit offsets write only the commit target; neither cursor moves
         let mut specified = BTreeMap::new();
         specified.insert(mq_key(&q0), 5);
         specified.insert(mq_key(&q1), 8);
         c.commit_offsets(&specified, false).await.unwrap();
-        assert_eq!(c.pending_commit_of(&q0), 5, "指定位点进内存位点表");
-        assert_eq!(c.pending_commit_of(&q1), 8, "指定位点进内存位点表(q1)");
-        assert_eq!(c.pull_cursor_of(&q0), -1, "提交位点不改拉取游标");
-        assert_eq!(c.consume_cursor_of(&q0), -1, "提交位点不改已消费游标");
+        assert_eq!(c.pending_commit_of(&q0), 5, "explicit offsets go into the in-memory offset table");
+        assert_eq!(c.pending_commit_of(&q1), 8, "explicit offsets go into the in-memory offset table (q1)");
+        assert_eq!(c.pull_cursor_of(&q0), -1, "committing an offset does not move the pull cursor");
+        assert_eq!(c.consume_cursor_of(&q0), -1, "committing an offset does not move the consumed cursor");
 
         let mut guarded = BTreeMap::new();
         guarded.insert(mq_key(&q0), -1);
@@ -3043,41 +3043,41 @@ mod tests {
         assert_eq!(
             c.pending_commit_of(&q0),
             5,
-            "offset == -1 只记日志，不覆盖已有位点"
+            "offset == -1 only logs, it does not overwrite an existing offset"
         );
         assert_eq!(
             c.pending_commit_of(&queue("T", "broker-a", 7)),
             -1,
-            "没分配到的队列不替它提交"
+            "a queue that was never assigned is not committed on its behalf"
         );
 
         c.commit_offsets(&BTreeMap::new(), false).await.unwrap();
-        assert_eq!(c.pending_commit_of(&q0), 5, "空 map 忽略这次提交");
+        assert_eq!(c.pending_commit_of(&q0), 5, "an empty map ignores this commit");
         c.commit_queues(&[], false).await.unwrap();
-        assert_eq!(c.pending_commit_of(&q0), 5, "空集合忽略这次提交");
+        assert_eq!(c.pending_commit_of(&q0), 5, "an empty queue set ignores this commit");
 
-        // commit(Set) 走的是已消费游标，不是任意指定值：未交付 ⇒ 守卫拦住
+        // commit(Set) works off the consumed cursor, not arbitrary values: nothing delivered ⇒ the guard blocks it
         c.commit_queues(std::slice::from_ref(&q0), false)
             .await
             .unwrap();
         assert_eq!(
             c.pending_commit_of(&q0),
             5,
-            "commit(Set) 在没有交付记录时不写 -1"
+            "commit(Set) writes no -1 when there is no delivery record"
         );
 
         c.assign(std::slice::from_ref(&q0));
-        assert_eq!(c.pull_cursor_of(&q1), -1, "assign 撤队列后拉取游标消失");
+        assert_eq!(c.pull_cursor_of(&q1), -1, "the pull cursor disappears after assign revokes the queue");
         assert_eq!(
             c.consume_cursor_of(&q1),
             -1,
-            "assign 撤队列后已消费游标消失"
+            "the consumed cursor disappears after assign revokes the queue"
         );
-        assert_eq!(c.pending_commit_of(&q1), 8, "assign 模式不碰 offsetStore");
+        assert_eq!(c.pending_commit_of(&q1), 8, "assign mode does not touch the offsetStore");
         let mut late = BTreeMap::new();
         late.insert(mq_key(&q1), 99);
         c.commit_offsets(&late, false).await.unwrap();
-        assert_eq!(c.pending_commit_of(&q1), 8, "撤掉的队列不替它改位点");
+        assert_eq!(c.pending_commit_of(&q1), 8, "a revoked queue's offset is not amended on its behalf");
 
         c.commit_queues(std::slice::from_ref(&q0), true)
             .await
@@ -3085,9 +3085,9 @@ mod tests {
         assert_eq!(
             c.pending_commit_of(&q1),
             -1,
-            "persistAll 会把没点名的队列从内存表里丢掉"
+            "persistAll drops queues that were not named from the in-memory table"
         );
-        assert_eq!(c.pending_commit_of(&q0), 5, "点名的队列留在表里");
+        assert_eq!(c.pending_commit_of(&q0), 5, "the named queue stays in the table");
     }
 
     #[test]
@@ -3096,27 +3096,27 @@ mod tests {
         let q = queue("T", "broker-a", 0);
         c.assign(std::slice::from_ref(&q));
         c.seek(&q, 2);
-        assert_eq!(c.pull_cursor_of(&q), 2, "seek 改拉取游标");
-        assert_eq!(c.consume_cursor_of(&q), 2, "seek 也要改已消费游标");
+        assert_eq!(c.pull_cursor_of(&q), 2, "seek moves the pull cursor");
+        assert_eq!(c.consume_cursor_of(&q), 2, "seek must move the consumed cursor too");
     }
 
     #[tokio::test]
     async fn auto_commit_deadline_starts_at_minus_one() {
         let c = DefaultLitePullConsumer::new("LitePG").unwrap();
         assert_eq!(lock(&c.inner.state).next_auto_commit_deadline, -1);
-        // 没交付过：这次"到点提交"发不出任何东西，只把截止时刻推到下一个周期
+        // Nothing was delivered: this "due commit" sends nothing and only pushes the deadline to the next period
         c.maybe_auto_commit().await;
         assert!(
             lock(&c.inner.state).next_auto_commit_deadline > 0,
-            "提交完要把截止时刻推到下一周期"
+            "the commit must push the deadline to the next period"
         );
-        // 再查一次：还没到点，不该重复提交
+        // Check again: not due yet, so it must not commit twice
         let before = lock(&c.inner.state).next_auto_commit_deadline;
         c.maybe_auto_commit().await;
         assert_eq!(
             lock(&c.inner.state).next_auto_commit_deadline,
             before,
-            "没到点就不该再提交"
+            "it should not commit again before the deadline"
         );
     }
 
@@ -3133,7 +3133,7 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------- 缓冲 / poll / seek
+    // ---------------------------------------------------------- Buffer / poll / seek
 
     #[tokio::test]
     async fn poll_drains_buffer_and_times_out_when_empty() {
@@ -3207,16 +3207,16 @@ mod tests {
         assert!(lock(&c.inner.state).paused.contains(&mq_key(&mq)));
         c.resume(std::slice::from_ref(&mq));
         assert!(lock(&c.inner.state).paused.is_empty());
-        // 重复 pause / resume 不报错
+        // Repeated pause / resume does not error
         c.pause(&[mq.clone(), mq.clone()]);
         c.resume(&[mq]);
         assert!(lock(&c.inner.state).paused.is_empty());
     }
 
-    // ---------------------------------------------------------- 时间戳解析
+    // ---------------------------------------------------------- Timestamp parsing
 
-    /// 金标向量：该字段**只**是 14 位本地墙钟，纯数字的 epoch 毫秒必须被拒 ——
-    /// 旧实现走 `isdigit()` 分支把 "20230101000000" 当 epoch 解释成公元 2611 年。
+    /// Golden vector: this field is **only** a 14-digit local wall clock; an all-digits epoch-millis value must be rejected --
+    /// the old implementation took the `isdigit()` branch and read "20230101000000" as epoch millis, landing in the year 2611 AD.
     #[test]
     fn consume_timestamp_is_wall_clock_only() {
         use chrono::TimeZone;
@@ -3260,7 +3260,7 @@ mod tests {
         c.assign(&[queue("T", "broker-a", 0)]);
         let err = c.start().await.unwrap_err().to_string();
         assert!(err.contains("consumeTimestamp is invalid"), "{err}");
-        // 合法墙钟不能被这条守卫误杀
+        // A valid wall clock must not be killed by this guard by mistake
         c.set_consume_timestamp("20230101000000");
         assert!(c.start().await.is_ok());
         c.shutdown();
@@ -3268,8 +3268,8 @@ mod tests {
 
     #[test]
     fn namespace_v2_setter_getter_round_trip_on_both_pull_facades() {
-        let pull = DefaultMQPullConsumer::new("PullPG").expect("合法组名不该构造失败");
-        assert_eq!(pull.get_namespace_v2(), None, "默认不设");
+        let pull = DefaultMQPullConsumer::new("PullPG").expect("a legal group name must not fail construction");
+        assert_eq!(pull.get_namespace_v2(), None, "unset by default");
         pull.set_namespace_v2(Some("NS_V2"));
         assert_eq!(pull.get_namespace_v2(), Some("NS_V2".to_string()));
         assert_eq!(pull.config().namespace_v2, Some("NS_V2".to_string()));
@@ -3277,10 +3277,10 @@ mod tests {
         assert_eq!(
             pull.get_namespace_v2(),
             None,
-            "None = 清除"
+            "None = clear"
         );
 
-        let lite = DefaultLitePullConsumer::new("LitePG").expect("合法组名不该构造失败");
+        let lite = DefaultLitePullConsumer::new("LitePG").expect("a legal group name must not fail construction");
         assert_eq!(lite.get_namespace_v2(), None);
         lite.set_namespace_v2(Some("NS_V2"));
         assert_eq!(lite.get_namespace_v2(), Some("NS_V2".to_string()));
@@ -3289,7 +3289,7 @@ mod tests {
         assert_eq!(
             lite.get_namespace_v2(),
             Some("NS_V2".to_string()),
-            "v1 namespace 不覆盖 v2"
+            "the v1 namespace does not overwrite v2"
         );
         lite.set_namespace_v2(None);
         assert_eq!(lite.get_namespace_v2(), None);
@@ -3297,9 +3297,9 @@ mod tests {
 
     #[tokio::test]
     async fn lite_start_registers_namespace_hook_before_stream_and_user_acl() {
-        // 门面透传接缝：`LitePullConsumerConfig.namespace_v2` → `MQClientInstanceConfig`
-        // → 实例传输层。链序必须是 Namespace → Stream（拉模式默认开）→ 用户 ACL，
-        // 且 nsd/ns/ReqT 都在 ACL 签名之前写入（`MQClientAPIImpl:329-335`）。
+        // Facade pass-through seams: `LitePullConsumerConfig.namespace_v2` -> `MQClientInstanceConfig`
+        // -> the instance transport layer. The chain order must be Namespace -> Stream (on by default in pull mode) -> user ACL,
+        // and nsd/ns/ReqT are all written before the ACL signature is computed.
         use crate::remoting::protocol::RemotingCommand;
         use crate::remoting::rpchook::{AclClientRPCHook, SessionCredentials};
         static SEQ: AtomicUsize = AtomicUsize::new(0);
@@ -3314,11 +3314,11 @@ mod tests {
             SessionCredentials::new("AK", "SK"),
         ))));
         c.assign(&[queue("T", "broker-a", 0)]);
-        // 不可达 namesrv：start 仍成功（路由刷新软失败，同 `lite_start_rejects_epoch_millis_timestamp`）
-        c.start().await.expect("start 应成功");
+        // Unreachable namesrv: start still succeeds (route refresh fails softly, same as `lite_start_rejects_epoch_millis_timestamp`)
+        c.start().await.expect("start should succeed");
         let client = DefaultLitePullConsumer::require_client(&c.inner).unwrap();
         let hooks = client.remoting_client().rpc_hooks();
-        assert_eq!(hooks.len(), 3, "Namespace → Stream → 用户 ACL");
+        assert_eq!(hooks.len(), 3, "Namespace → Stream → user ACL");
 
         let mut cmd = RemotingCommand::create_request_command(request_code::SEND_MESSAGE_V2, None);
         hooks[0].do_before_request("127.0.0.1:9876", &mut cmd);
@@ -3333,10 +3333,10 @@ mod tests {
         assert_eq!(
             cmd.get_ext_field(MixAll::REQ_T),
             None,
-            "第一位必须是 Namespace"
+            "the first hook must be Namespace"
         );
         hooks[1].do_before_request("127.0.0.1:9876", &mut cmd);
-        // 轻量消费者默认 enable_stream_request_type=true ⇒ 第二位是 Stream
+        // The lite consumer defaults enable_stream_request_type=true ⇒ the second hook is Stream
         assert_eq!(cmd.get_ext_field(MixAll::REQ_T), Some("0"));
         assert_eq!(cmd.get_ext_field(SessionCredentials::ACCESS_KEY), None);
         hooks[2].do_before_request("127.0.0.1:9876", &mut cmd);
@@ -3348,7 +3348,7 @@ mod tests {
         c.shutdown();
     }
 
-    // ---------------------------------------------------------- 心跳报文
+    // ---------------------------------------------------------- Heartbeat packet
 
     #[test]
     fn heartbeat_carries_only_own_consumer_data() {
@@ -3369,17 +3369,17 @@ mod tests {
         assert!(!cd.unit_mode);
         assert_eq!(cd.subscription_data_set.len(), 1);
         assert_eq!(cd.subscription_data_set[0].topic, "T");
-        // 没有订阅时仍是一条 ConsumerData
+        // With no subscriptions there is still one ConsumerData
         c.unsubscribe("T");
         assert!(build_lite_heartbeat(&c.inner).consumer_data_set[0]
             .subscription_data_set
             .is_empty());
     }
 
-    // -------------------------------------------- 拉模式消费者心跳（#98）
+    // -------------------------------------------- Pull-mode consumer heartbeat (#98)
 
-    /// 假 namesrv：只答 `GET_ROUTEINFO_BY_TOPIC`，回一份「一台主 + 一台从」的路由
-    /// （同一 brokerName，brokerId 0/1）；其余请求一律 SUCCESS。
+    /// Fake namesrv: answers only `GET_ROUTEINFO_BY_TOPIC`, returning a "one master + one slave" route
+    /// (same brokerName, brokerId 0/1); all other requests just get SUCCESS.
     fn spawn_fake_namesrv(
         listener: TcpListener,
         broker_name: String,
@@ -3405,8 +3405,8 @@ mod tests {
                         };
                         let mut response = answer_for(&request, response_code::SUCCESS);
                         if request.code == request_code::GET_ROUTEINFO_BY_TOPIC {
-                            // 每笔请求现读：用例中途改队列数（扩缩容）必须能被下一轮
-                            // 路由刷新看到，否则测不到"集合变了"。
+                            // Re-read on every request: a case that changes the queue count mid-run (scale in/out) must be visible to the
+                            // next route refresh, otherwise "the set changed" cannot be tested.
                             let topic = request
                                 .get_ext_field("topic")
                                 .unwrap_or_default()
@@ -3426,10 +3426,10 @@ mod tests {
         })
     }
 
-    /// 「一台主 + 一台从」的路由 body（`TopicRouteData` 的 JSON 形态）。
-    /// `read_queues` 是读队列数：客户端按 `topicRouteData2TopicSubscribeInfo` 把它展开成
-    /// queueId 0..n-1，平衡视图的分片判据就靠它（1 个队列时「自己那一份」与「全部」同形，
-    /// 什么也证明不了）。
+    /// The route body for "one master + one slave" (the JSON form of `TopicRouteData`).
+    /// `read_queues` is the read-queue count: the client expands it into queueId 0..n-1 via `topicRouteData2TopicSubscribeInfo`,
+    /// and the sharding criterion of the balanced view relies on it (with 1 queue, "own share" and "all" have the same shape,
+    /// proving nothing).
     fn route_body(broker_name: &str, master_addr: &str, slave_addr: &str, read_queues: i32) -> Vec<u8> {
         let route = TopicRouteData {
             queue_datas: vec![QueueData::new(
@@ -3450,10 +3450,10 @@ mod tests {
             )],
             ..Default::default()
         };
-        serde_json::to_vec(&route.to_json_value()).expect("路由可序列化")
+        serde_json::to_vec(&route.to_json_value()).expect("the route must serialize")
     }
 
-    /// 读一整帧并解码（`decode` 从 totalLength 开始，所以帧要连长度前缀一起给）。
+    /// Read one whole frame and decode it (`decode` starts at totalLength, so the frame must come with its length prefix).
     async fn read_frame(stream: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
         let mut len_buf = [0_u8; 4];
         stream.read_exact(&mut len_buf).await.ok()?;
@@ -3473,7 +3473,7 @@ mod tests {
         let _ = stream.flush().await;
     }
 
-    /// 带请求 `opaque` 的应答（客户端按 opaque 配对，串了就当噪声丢掉）。
+    /// A response carrying the request's `opaque` (the client pairs by opaque and drops mismatches as noise).
     fn answer_for(request: &RemotingCommand, code: i32) -> RemotingCommand {
         let mut response = RemotingCommand::create_response(code, None);
         response.opaque = request.opaque;
@@ -3481,39 +3481,39 @@ mod tests {
         response
     }
 
-    /// 一份 35（UNREGISTER_CLIENT）的 extFields 快照。
+    /// An extFields snapshot of one 35 (UNREGISTER_CLIENT) request.
     type UnregisterExt = Vec<(String, String)>;
 
-    /// 一笔收到的请求：请求码 + extFields 快照。
+    /// One received request: request code + extFields snapshot.
     type RecordedRequest = (i32, Vec<(String, String)>);
 
-    /// 一笔脚本化的 PULL_MESSAGE 应答。
+    /// One scripted PULL_MESSAGE reply.
     struct ScriptedPull {
         code: i32,
         ext: Vec<(&'static str, String)>,
-        /// 回包 body（FOUND 的消息流；其余形态为空）。
+        /// The reply body (the message stream for FOUND; empty in other shapes).
         body: Option<Vec<u8>>,
-        /// 发车闸：`Some` 时先等闸放行再回包 —— 「应答还在路上，客户端先 seek 了」
-        /// 这类在途竞态靠它定序。
+        /// Departure gate: with `Some`, the reply waits for the gate to open first -- in-flight races like
+        /// "the reply is still on the wire while the client already seeked" are sequenced with it.
         gate: Option<tokio::sync::oneshot::Receiver<()>>,
     }
 
-    /// 假 broker：记录 34（心跳 body）与 35（注销 extFields）两号报文，其余一律 SUCCESS。
+    /// Fake broker: records the 34 (heartbeat body) and 35 (unregister extFields) packets; everything else just gets SUCCESS.
     struct FakeBroker {
         addr: String,
-        /// 收到的 HEART_BEAT 原始 body，按到达顺序。
+        /// The raw HEART_BEAT bodies received, in arrival order.
         heartbeat_bodies: Arc<Mutex<Vec<Vec<u8>>>>,
-        /// 收到的 UNREGISTER_CLIENT extFields，按到达顺序。
+        /// The UNREGISTER_CLIENT extFields received, in arrival order.
         unregisters: Arc<Mutex<Vec<UnregisterExt>>>,
-        /// 收到的**每一笔**请求（code + extFields 快照），按到达顺序 —— 「这个 RPC
-        /// 到底发没发」型断言（如 FIRST_OFFSET 不该发 minOffset）靠它。
+        /// **Every** received request (code + extFields snapshot), in arrival order -- the "did this RPC
+        /// actually go out" style assertions (e.g. FIRST_OFFSET must not send minOffset) rely on it.
         requests: Arc<Mutex<Vec<RecordedRequest>>>,
-        /// 预排的 PULL_MESSAGE 应答脚本（FIFO）：先到先得，排空了按 [`answer_pull`]
-        /// 的「空 broker」形态应答。
+        /// Pre-scripted PULL_MESSAGE replies (FIFO): first come first served; once drained, answer in the
+        /// "empty broker" shape of [`answer_pull`].
         pull_scripts: Arc<Mutex<VecDeque<ScriptedPull>>>,
-        /// 38（GET_CONSUMER_LIST_BY_GROUP）的应答内容：本组当前有哪些 clientId。
-        /// 空 Vec 就是「broker 不认识这个组」（回空列表），与「查不到」在两端口
-        /// 是同一分支，够测平衡视图的兜底路径。
+        /// The reply content for 38 (GET_CONSUMER_LIST_BY_GROUP): which clientIds the group currently has.
+        /// An empty Vec means "the broker does not know this group" (it answers an empty list), which lands in the same branch as
+        /// "not found" -- enough to exercise the fallback path of the balanced view.
         cid_list: Arc<Mutex<Vec<String>>>,
     }
 
@@ -3521,8 +3521,8 @@ mod tests {
         async fn start() -> Arc<FakeBroker> {
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await
-                .expect("bind 假 broker");
-            let addr = listener.local_addr().expect("假 broker 地址").to_string();
+                .expect("bind the fake broker");
+            let addr = listener.local_addr().expect("fake broker address").to_string();
             let broker = Arc::new(FakeBroker {
                 addr,
                 heartbeat_bodies: Arc::new(Mutex::new(Vec::new())),
@@ -3582,12 +3582,12 @@ mod tests {
             broker
         }
 
-        /// 收到的请求码，按到达顺序。
+        /// The received request codes, in arrival order.
         fn codes(&self) -> Vec<i32> {
             lock(&self.requests).iter().map(|(code, _)| *code).collect()
         }
 
-        /// 收到的 PULL_MESSAGE 的 `queueOffset`，按到达顺序。
+        /// The `queueOffset`s of the received PULL_MESSAGEs, in arrival order.
         fn pull_offsets(&self) -> Vec<i64> {
             lock(&self.requests)
                 .iter()
@@ -3602,7 +3602,7 @@ mod tests {
                 .collect()
         }
 
-        /// 收到的拉取请求的**请求码**（11=PULL_MESSAGE / 361=LITE_PULL_MESSAGE），按到达顺序。
+        /// The **request codes** of the received pull requests (11=PULL_MESSAGE / 361=LITE_PULL_MESSAGE), in arrival order.
         fn pull_request_codes(&self) -> Vec<i32> {
             lock(&self.requests)
                 .iter()
@@ -3613,7 +3613,7 @@ mod tests {
                 .collect()
         }
 
-        /// 收到的拉取请求的 `sysFlag`，按到达顺序。
+        /// The `sysFlag`s of the received pull requests, in arrival order.
         fn pull_sys_flags(&self) -> Vec<i32> {
             lock(&self.requests)
                 .iter()
@@ -3628,11 +3628,11 @@ mod tests {
                 .collect()
         }
 
-        /// 收到的每份心跳解成 `HeartbeatData`（解不开就炸在断言线程上）。
+        /// Decode every received heartbeat into `HeartbeatData` (a decode failure blows up right in the assertion).
         fn heartbeats(&self) -> Vec<HeartbeatData> {
             lock(&self.heartbeat_bodies)
                 .iter()
-                .map(|b| HeartbeatData::decode(b).expect("34 的 body 必须是合法 HeartbeatData"))
+                .map(|b| HeartbeatData::decode(b).expect("the body of 34 must be a valid HeartbeatData"))
                 .collect()
         }
 
@@ -3640,12 +3640,12 @@ mod tests {
             lock(&self.unregisters).clone()
         }
 
-        /// 设定 38（GET_CONSUMER_LIST_BY_GROUP）的应答内容：本组有哪些 clientId。
+        /// Set the reply content of 38 (GET_CONSUMER_LIST_BY_GROUP): which clientIds the group has.
         fn set_cid_list(&self, cids: &[&str]) {
             *lock(&self.cid_list) = cids.iter().map(|s| s.to_string()).collect();
         }
 
-        /// 排一笔脚本化 PULL_MESSAGE 应答（FIFO 命中，每笔只回一次）。
+        /// Queue one scripted PULL_MESSAGE reply (FIFO hit; each request is answered only once).
         fn script_pull(
             &self,
             code: i32,
@@ -3699,15 +3699,15 @@ mod tests {
         response
     }
 
-    /// 一台主 + 一台从（同一 brokerName）的假集群。
+    /// A fake cluster of one master + one slave (same brokerName).
     struct FakePullCluster {
         namesrv_addr: String,
         master: Arc<FakeBroker>,
         slave: Arc<FakeBroker>,
         tasks: Vec<JoinHandle<()>>,
-        /// 假 namesrv 现读这个值出路由：改它就是"topic 扩缩容"。
+        /// The fake namesrv reads this value on the spot when answering routes: changing it is "the topic scaling in/out".
         read_queues: Arc<std::sync::atomic::AtomicI32>,
-        /// 假 namesrv 收到过的每一笔路由查询（按到达顺序，含重复）。
+        /// Every route query the fake namesrv has received (in arrival order, duplicates included).
         ns_route_queries: Arc<Mutex<Vec<String>>>,
     }
 
@@ -3716,12 +3716,12 @@ mod tests {
             FakePullCluster::start_queues(1).await
         }
 
-        /// 把路由里的读队列数改成 `n`（扩/缩容），下一次路由刷新即可见。
+        /// Change the route's read-queue count to `n` (scale in/out); the next route refresh will see it.
         fn scale_to(&self, n: i32) {
             self.read_queues.store(n, std::sync::atomic::Ordering::Release);
         }
 
-        /// 丢弃已记录的路由查询，之后的断言只看着"这一趟"。
+        /// Discard the recorded route queries so later assertions only see "this round".
         fn clear_route_queries(&self) {
             lock(&self.ns_route_queries).clear();
         }
@@ -3730,20 +3730,20 @@ mod tests {
             lock(&self.ns_route_queries).clone()
         }
 
-        /// 主从两台的 38 应答内容一起设：查询打哪台由路由决定，用例不该关心这个细节。
+        /// Set the 38 reply on both master and slave together: which one the query reaches is decided by the route; cases should not care about that detail.
         fn set_cid_list(&self, cids: &[&str]) {
             self.master.set_cid_list(cids);
             self.slave.set_cid_list(cids);
         }
 
-        /// `read_queues` 个读队列的那一台 broker（其余行为同 [`FakePullCluster::start`]）。
+        /// The broker carrying `read_queues` read queues (everything else as in [`FakePullCluster::start`]).
         async fn start_queues(read_queues: i32) -> FakePullCluster {
             let master = FakeBroker::start().await;
             let slave = FakeBroker::start().await;
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await
-                .expect("bind 假 namesrv");
-            let namesrv_addr = listener.local_addr().expect("假 namesrv 地址").to_string();
+                .expect("bind the fake namesrv");
+            let namesrv_addr = listener.local_addr().expect("fake namesrv address").to_string();
             let broker_name = "broker-a".to_string();
             let read_queues = Arc::new(std::sync::atomic::AtomicI32::new(read_queues));
             let seen = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -3774,23 +3774,23 @@ mod tests {
         }
     }
 
-    /// 起一个指向假集群的拉模式消费者。`instance` 必须每个用例唯一：同 clientId 会共享
-    /// [`MQClientInstance`]（连带路由表与 namesrv 地址）。
+    /// Start a pull-mode consumer pointing at the fake cluster. `instance` must be unique per case: the same clientId would share
+    /// the [`MQClientInstance`] (and with it the route table and the namesrv address).
     async fn started_pull(
         instance: &str,
         group: &str,
         cluster: &FakePullCluster,
         topic: &str,
     ) -> DefaultMQPullConsumer {
-        let c = DefaultMQPullConsumer::new(group).expect("组名合法");
+        let c = DefaultMQPullConsumer::new(group).expect("the group name is legal");
         c.set_instance_name(instance);
         c.set_namesrv_addr(&cluster.namesrv_addr);
         c.register_topic(topic);
-        c.start().await.expect("假集群里 start 应当成功");
+        c.start().await.expect("start should succeed against the fake cluster");
         c
     }
 
-    /// 轮询等条件成立（最多 5s）；失败时 panic，避免用固定 sleep 掩盖竞态。
+    /// Poll until the condition holds (at most 5s); panic on failure, so a fixed sleep cannot mask a race.
     async fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while tokio::time::Instant::now() < deadline {
@@ -3799,7 +3799,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        panic!("等待超时：{what}");
+        panic!("wait timed out: {what}");
     }
 
     #[test]
@@ -3810,7 +3810,7 @@ mod tests {
         c.register_topic("T1");
         let hb = build_pull_heartbeat(&c.inner);
         assert_eq!(hb.client_id, "cid-1");
-        assert_eq!(hb.consumer_data_set.len(), 1, "拉模式组只发自己的一份");
+        assert_eq!(hb.consumer_data_set.len(), 1, "the pull group sends only its own ConsumerData");
         let cd = &hb.consumer_data_set[0];
         assert_eq!(cd.group_name, "PG_PullHb");
         assert_eq!(cd.consume_type, ConsumeType::CONSUME_ACTIVELY);
@@ -3825,21 +3825,21 @@ mod tests {
             .iter()
             .map(|s| s.topic.as_str())
             .collect();
-        assert_eq!(topics, vec!["T1", "T2"], "订阅集来自 registerTopics");
+        assert_eq!(topics, vec!["T1", "T2"], "the subscription set comes from registerTopics");
         for sub in &cd.subscription_data_set {
             assert_eq!(sub.sub_string, "*");
-            assert_eq!(sub.sub_version, 0, "subVersion 显式置 0");
+            assert_eq!(sub.sub_version, 0, "subVersion is explicitly set to 0");
         }
 
-        // 没有 registerTopics：照样一份 ConsumerData，订阅集为空
+        // Without registerTopics: still one ConsumerData, with an empty subscription set
         let bare = DefaultMQPullConsumer::new("PG_PullHbBare").unwrap();
         let hb2 = build_pull_heartbeat(&bare.inner);
         assert_eq!(hb2.consumer_data_set.len(), 1);
         assert!(hb2.consumer_data_set[0].subscription_data_set.is_empty());
     }
 
-    /// start() 的同步一轮必须**主从各一份**：broker 的 ConsumerManager 是每台各自一份
-    /// 状态，从节点收不到心跳就会对指向自己的拉取回 `SUBSCRIPTION_NOT_EXIST`。
+    /// The synchronous round of start() must send **one copy each to the master and the slave**: each broker's ConsumerManager keeps its own
+    /// state, and a slave that never received the heartbeat would answer pulls pointed at it with `SUBSCRIPTION_NOT_EXIST`.
     #[tokio::test]
     async fn pull_start_heartbeats_master_and_slave_with_the_wire_shape() {
         let cluster = FakePullCluster::start().await;
@@ -3847,8 +3847,8 @@ mod tests {
 
         let master = cluster.master.heartbeats();
         let slave = cluster.slave.heartbeats();
-        assert_eq!(master.len(), 1, "start 的同步一轮先到主节点");
-        assert_eq!(slave.len(), 1, "从节点也要发");
+        assert_eq!(master.len(), 1, "the synchronous round of start reaches the master first");
+        assert_eq!(slave.len(), 1, "the slave must receive one too");
         for hb in [&master[0], &slave[0]] {
             assert_eq!(hb.client_id, c.client_id());
             let cd = &hb.consumer_data_set[0];
@@ -3862,12 +3862,12 @@ mod tests {
             assert_eq!(cd.subscription_data_set[0].topic, "T");
             assert_eq!(cd.subscription_data_set[0].sub_version, 0);
         }
-        assert_eq!(c.heartbeat_count(), 1, "一轮两台都成功才算一轮");
+        assert_eq!(c.heartbeat_count(), 1, "a round counts only when both brokers succeeded");
         c.shutdown();
     }
 
-    /// 后台循环按 `heartbeat_broker_interval_millis` 重发；`heartbeat_enabled=false`
-    /// 只停发不退出（跳过本轮而不是退出循环）。
+    /// The background loop repeats every `heartbeat_broker_interval_millis`; `heartbeat_enabled=false`
+    /// only suppresses sending without exiting the loop (the round is skipped, not the loop ended).
     #[tokio::test]
     async fn pull_heartbeat_loop_repeats_and_honours_the_disable_switch() {
         let cluster = FakePullCluster::start().await;
@@ -3876,16 +3876,16 @@ mod tests {
         c.set_namesrv_addr(&cluster.namesrv_addr);
         c.register_topic("T");
         c.update_config(|cfg| cfg.heartbeat_broker_interval_millis = 100);
-        c.start().await.expect("假集群里 start 应当成功");
+        c.start().await.expect("start should succeed against the fake cluster");
 
-        // 首轮同步 + 至少两个周期轮
+        // The initial synchronous round + at least two periodic rounds
         wait_until(
             || cluster.master.heartbeats().len() >= 3 && cluster.slave.heartbeats().len() >= 3,
-            "心跳循环按 100ms 周期重发（主从同步涨）",
+            "the heartbeat loop repeats every 100ms (master and slave counts grow together)",
         )
         .await;
 
-        // 关掉开关：先静默一拍让在途的那轮落地，再看计数是否冻结
+        // Switch off: first let one quiet beat pass so in-flight rounds land, then check whether the count froze
         c.update_config(|cfg| cfg.heartbeat_enabled = false);
         tokio::time::sleep(Duration::from_millis(150)).await;
         let frozen = c.heartbeat_count();
@@ -3894,12 +3894,12 @@ mod tests {
         assert_eq!(
             c.heartbeat_count(),
             frozen,
-            "heartbeat_enabled=false 后不再发"
+            "nothing is sent after heartbeat_enabled=false"
         );
         assert_eq!(
             cluster.master.heartbeats().len(),
             master_seen,
-            "线上也不能再有新的 34"
+            "the wire must not carry any new 34 either"
         );
         c.shutdown();
     }
@@ -3910,16 +3910,16 @@ mod tests {
         let c = started_pull("pull_hb_unreg", "PG_PullHbUnreg", &cluster, "T").await;
         let client_id = c.client_id();
         c.shutdown();
-        // 35 挂在运行时上异步发（shutdown 是同步 API）：等它落地
+        // The 35 goes out asynchronously on the runtime (shutdown is a sync API): wait for it to land
         wait_until(
             || !cluster.master.unregisters().is_empty() && !cluster.slave.unregisters().is_empty(),
-            "主从都收到 35",
+            "both the master and the slave receive a 35",
         )
         .await;
 
         for (name, broker) in [("master", &cluster.master), ("slave", &cluster.slave)] {
             let unregs = broker.unregisters();
-            assert_eq!(unregs.len(), 1, "{name}: 一次 shutdown 只注销一次");
+            assert_eq!(unregs.len(), 1, "{name}: one shutdown unregisters exactly once");
             let field = |k: &str| -> Option<String> {
                 unregs[0]
                     .iter()
@@ -3936,21 +3936,21 @@ mod tests {
                 Some("PG_PullHbUnreg"),
                 "{name}"
             );
-            assert_eq!(field("producerGroup"), None, "{name}: 空槽位不上线");
+            assert_eq!(field("producerGroup"), None, "{name}: an empty slot never goes on the wire");
         }
-        // 注销之后心跳必须已经停了（循环先停、abort，再发 35）
+        // Once unregistered, heartbeating must already have stopped (the loop is stopped and aborted before the 35 goes out)
         let beats = cluster.master.heartbeats().len();
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
             cluster.master.heartbeats().len(),
             beats,
-            "shutdown 后不再发心跳"
+            "no heartbeat is sent after shutdown"
         );
     }
 
-    /// 「shutdown 后立刻退进程」也发得出去：多线程运行时里 `shutdown()` 会等 35
-    /// 落地才回来。断言在返回后**不 await、不等一拍** —— 旧实现（spawn 后立即返回）
-    /// 下收尾任务还没被调度过，35 必然缺席，本用例就是为了钉住这个回归。
+    /// Even "the process exits right after shutdown" still sends it out: on a multi_thread runtime `shutdown()` waits until the 35 has
+    /// landed before returning. The assertions below run **with no await and no extra beat** after the return -- under the old
+    /// implementation (spawn then return immediately) the finalize task had never been scheduled, so the 35 was necessarily missing; this case exists to pin that regression.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_returns_only_after_unregister_landed() {
         let cluster = FakePullCluster::start().await;
@@ -3959,10 +3959,10 @@ mod tests {
 
         c.shutdown();
 
-        // 到这里收尾必须已经完成：主从各一份 35。
+        // By this point the finalize must be complete: one landed 35 on each of the master and the slave.
         for (name, broker) in [("master", &cluster.master), ("slave", &cluster.slave)] {
             let unregs = broker.unregisters();
-            assert_eq!(unregs.len(), 1, "{name}: shutdown 返回时 35 必须已经落地");
+            assert_eq!(unregs.len(), 1, "{name}: the 35 must have landed by the time shutdown returned");
             let field = |k: &str| -> Option<String> {
                 unregs[0]
                     .iter()
@@ -3982,16 +3982,16 @@ mod tests {
         }
     }
 
-    /// 进程立刻退出也不丢：`shutdown()` 返回后马上拆掉整个运行时（等价于
-    /// 「shutdown 之后紧跟 `process::exit`」）。旧实现下收尾任务随运行时一起被
-    /// 取消，主从一台都收不到 35；现在 35 在返回前已经落地，拆运行时只是收尸。
+    /// An immediate process exit does not lose it: the whole runtime is dropped right after `shutdown()` returns (equivalent to
+    /// "`shutdown` followed immediately by `process::exit`"). Under the old implementation the finalize task was cancelled along with the runtime,
+    /// and neither the master nor the slave received a 35; now the 35 has landed before the return, and tearing down the runtime only sweeps the remains.
     #[test]
     fn shutdown_survives_immediate_runtime_drop() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
-            .expect("多线程运行时");
+            .expect("multi-thread runtime");
         let (cluster, consumer, client_id) = runtime.block_on(async {
             let cluster = FakePullCluster::start().await;
             let c = started_pull("pull_unreg_exit", "PG_PullUnregExit", &cluster, "T").await;
@@ -3999,13 +3999,13 @@ mod tests {
             (cluster, c, client_id)
         });
 
-        // 运行时外（纯 std 线程）调用 shutdown —— 这正是 `main()` 收尾时的形态。
+        // Calling shutdown outside a runtime (a plain std thread) -- exactly the shape of `main()` cleanup.
         consumer.shutdown();
         drop(runtime);
 
         for (name, broker) in [("master", &cluster.master), ("slave", &cluster.slave)] {
             let unregs = broker.unregisters();
-            assert_eq!(unregs.len(), 1, "{name}: 进程退出前 35 必须已经落地");
+            assert_eq!(unregs.len(), 1, "{name}: the 35 must have landed before process exit");
             let field = |k: &str| -> Option<String> {
                 unregs[0]
                     .iter()
@@ -4035,7 +4035,7 @@ mod tests {
         let out = client_side_tag_filter(sub.as_ref(), vec![a, b]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].queue_offset, 0);
-        // SUB_ALL 时 tags_set 为空 ⇒ 不筛
+        // SUB_ALL leaves tags_set empty ⇒ no filtering
         let all = FilterAPI::build_subscription_data("T", Some("*")).ok();
         let mut c1 = msg("T", "broker-a", 0, 2, "c");
         c1.set_tags("TagC");
@@ -4071,22 +4071,22 @@ mod tests {
         assert_eq!(
             pull.allocate_message_queue_strategy().get_name(),
             "AVG",
-            "pull 默认策略 = AVG"
+            "the pull default strategy is AVG"
         );
         pull.set_allocate_message_queue_strategy(Arc::new(AllocateMessageQueueAveragelyByCircle));
         let pull_strategy = pull.allocate_message_queue_strategy();
-        assert_eq!(pull_strategy.get_name(), "AVG_BY_CIRCLE", "pull 可替换");
+        assert_eq!(pull_strategy.get_name(), "AVG_BY_CIRCLE", "pull allows replacement");
         assert_eq!(
             allocate_ids(&*pull_strategy, "PG"),
             vec![0, 2],
-            "pull 换上的策略就是 getter 读回的那个"
+            "the strategy set on pull is exactly the one the getter reads back"
         );
 
         let lite = DefaultLitePullConsumer::new("LG").unwrap();
         assert_eq!(
             lite.allocate_message_queue_strategy().get_name(),
             "AVG",
-            "lite 默认策略 = AVG"
+            "the lite default strategy is AVG"
         );
         let by_config = Arc::new(AllocateMessageQueueByConfig::new(vec![
             queue("T", "broker-a", 0),
@@ -4094,20 +4094,20 @@ mod tests {
         ]));
         lite.set_allocate_message_queue_strategy(by_config.clone());
         assert_eq!(lite.allocate_message_queue_strategy().get_name(), "CONFIG");
-        // getter 交出的是共享引用而不是快照：之后改列表照样作用于 rebalance
+        // The getter hands out a shared reference, not a snapshot: later changes to the list still act on rebalance
         by_config.set_message_queue_list(vec![queue("T", "broker-a", 3)]);
         assert_eq!(
             allocate_ids(&*lite.allocate_message_queue_strategy(), "LG"),
             vec![3],
-            "CONFIG 策略无视 mqAll/cidAll 返回配置队列"
+            "the CONFIG strategy ignores mqAll/cidAll and returns the configured queues"
         );
     }
 
-    // --------------------------------- FIRST_OFFSET 的起点是字面量 0（#100 附带）
+    // --------------------------------- FIRST_OFFSET starts at literal 0 (side note of #100)
 
-    /// minOffset 属 MQAdminImpl 口径（只认 master），主掉线期间会让新起的 lite-pull
-    /// 一条都拉不到；起点 0 越界时由 broker 用 `PULL_OFFSET_MOVED` 纠正
-    /// （`handle_offset_illegal`）。
+    /// minOffset is queried on the master only (the admin-side stance here); while the master is down a newly started lite-pull
+    /// would fetch nothing at all; an out-of-range start offset 0 is corrected by the broker via `PULL_OFFSET_MOVED`
+    /// (`handle_offset_illegal`).
     #[tokio::test]
     async fn lite_first_offset_starts_at_zero_without_a_min_offset_rpc() {
         let cluster = FakePullCluster::start().await;
@@ -4117,24 +4117,24 @@ mod tests {
         first.set_namesrv_addr(&cluster.namesrv_addr);
         first.set_consume_from_where(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
         first.assign(&[queue("T", "broker-a", 0)]);
-        first.start().await.expect("假集群里 start 应当成功");
+        first.start().await.expect("start should succeed against the fake cluster");
         wait_until(
             || !cluster.master.pull_offsets().is_empty(),
-            "FIRST_OFFSET 消费者的第一次拉取",
+            "the FIRST_OFFSET consumer's first pull",
         )
         .await;
         assert_eq!(
             cluster.master.pull_offsets()[0],
             0,
-            "起点就是 0，直接上拉取请求"
+            "the start point is simply 0, sent directly in the pull request"
         );
 
-        // 负控：LAST_OFFSET 那一支该发 maxOffset —— 先证明这份请求日志不是哑的
+        // Negative control: the LAST_OFFSET branch must send maxOffset -- first prove this request log is not mute
         let last = DefaultLitePullConsumer::new("LitePG_Last").unwrap();
         last.set_instance_name("lite_last_offset");
         last.set_namesrv_addr(&cluster.namesrv_addr);
         last.assign(&[queue("T", "broker-a", 0)]);
-        last.start().await.expect("假集群里 start 应当成功");
+        last.start().await.expect("start should succeed against the fake cluster");
         wait_until(
             || {
                 cluster
@@ -4142,20 +4142,20 @@ mod tests {
                     .codes()
                     .contains(&request_code::GET_MAX_OFFSET)
             },
-            "LAST_OFFSET 消费者的 maxOffset 查询",
+            "the LAST_OFFSET consumer's maxOffset query",
         )
         .await;
 
         let codes = cluster.master.codes();
         assert!(
             !codes.contains(&request_code::GET_MIN_OFFSET),
-            "FIRST_OFFSET 是字面量 0，一次 minOffset 都不该发：{codes:?}"
+            "FIRST_OFFSET is the literal 0: not one minOffset request may be sent: {codes:?}"
         );
         first.shutdown();
         last.shutdown();
     }
 
-    // --------------------------------- 请求码 / lite 位（#107）
+    // --------------------------------- Request codes / lite bit (#107)
 
     #[tokio::test]
     async fn lite_pull_uses_code_361_and_sets_the_lite_bit() {
@@ -4164,22 +4164,22 @@ mod tests {
         let c = started_lite("lite_code", "LitePG_LiteCode", &cluster, &q).await;
         wait_until(
             || !cluster.master.pull_request_codes().is_empty(),
-            "lite 的第一笔拉取",
+            "lite's first pull",
         )
         .await;
 
         let codes = cluster.master.pull_request_codes();
         assert!(
             codes.iter().all(|x| *x == request_code::LITE_PULL_MESSAGE),
-            "lite 拉取请求码必须全是 LITE_PULL_MESSAGE(361)：{codes:?}"
+            "every lite pull request code must be LITE_PULL_MESSAGE(361): {codes:?}"
         );
 
         let flags = cluster.master.pull_sys_flags();
-        assert!(!flags.is_empty(), "至少一笔带 sysFlag 的拉取");
+        assert!(!flags.is_empty(), "at least one pull carrying a sysFlag");
         for f in &flags {
             assert!(
                 PullSysFlag::has_lite_pull_flag(*f),
-                "lite 位必须置上：{f:#x}"
+                "the lite bit must be set: {f:#x}"
             );
             assert!(!PullSysFlag::has_commit_offset_flag(*f), "{f:#x}");
             assert!(!PullSysFlag::has_suspend_flag(*f), "{f:#x}");
@@ -4187,43 +4187,43 @@ mod tests {
             assert!(!PullSysFlag::has_class_filter_flag(*f), "{f:#x}");
         }
 
-        // 负控：经典拉取（DefaultMQPullConsumerImpl.pullSyncImpl:248 的 4 参版本）必须是
-        // 11 且**不带** lite 位 —— 多这一位会让普通消费者也撞上 lite 开关。
+        // Negative control: the classic pull (the 4-arg form used by DefaultMQPullConsumer.pull/pull_block_if_not_found) must be
+        // 11 and must **not carry** the lite bit -- that extra bit would make ordinary consumers hit the lite switch too.
         let classic = started_pull("lite_code_classic", "PG_ClassicCode", &cluster, "T").await;
         classic
             .pull(&q, "*", 0, 32, Some(5000))
             .await
-            .expect("假集群里经典拉取应当成功");
+            .expect("the classic pull should succeed against the fake cluster");
         let ccodes = cluster.master.pull_request_codes();
         assert!(
             ccodes.contains(&request_code::PULL_MESSAGE),
-            "经典拉取必须是 PULL_MESSAGE(11)：{ccodes:?}"
+            "the classic pull must be PULL_MESSAGE(11): {ccodes:?}"
         );
         let cflags = cluster.master.pull_sys_flags();
         assert!(
             cflags.iter().any(|f| !PullSysFlag::has_lite_pull_flag(*f)),
-            "经典拉取不该带 lite 位：{cflags:?}"
+            "the classic pull must not carry the lite bit: {cflags:?}"
         );
         c.shutdown();
         classic.shutdown();
     }
 
-    // ---------------------- 拉取游标跟住 nextBeginOffset（#105）
+    // ---------------------- The pull cursor follows nextBeginOffset (#105)
 
-    /// 起一个指向假集群的 lite-pull（assign + FIRST_OFFSET：起点是字面量 0，不做
-    /// 起点位点查询 RPC，第一笔 PULL_MESSAGE 确定落在 `queueOffset=0`）。
+    /// Start a lite-pull consumer against the fake cluster (assign + FIRST_OFFSET: the start point is the literal 0, so no
+    /// start-offset query RPC is made and the first PULL_MESSAGE deterministically lands at `queueOffset=0`).
     async fn started_lite(
         instance: &str,
         group: &str,
         cluster: &FakePullCluster,
         mq: &MessageQueue,
     ) -> DefaultLitePullConsumer {
-        let c = DefaultLitePullConsumer::new(group).expect("组名合法");
+        let c = DefaultLitePullConsumer::new(group).expect("the group name is legal");
         c.set_instance_name(instance);
         c.set_namesrv_addr(&cluster.namesrv_addr);
         c.set_consume_from_where(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
         c.assign(std::slice::from_ref(mq));
-        c.start().await.expect("假集群里 start 应当成功");
+        c.start().await.expect("start should succeed against the fake cluster");
         c
     }
 
@@ -4245,25 +4245,25 @@ mod tests {
 
         wait_until(
             || c.pull_cursor_of(&q) == 5,
-            "NO_MATCHED_MSG 后拉取游标跟到 nextBeginOffset=5",
+            "after NO_MATCHED_MSG the pull cursor follows to nextBeginOffset=5",
         )
         .await;
-        // 不是内存表里改了个数：下一笔 PULL_MESSAGE 真的从 5 起
+        // Not just a number rewritten in the memory table: the next PULL_MESSAGE really starts from 5
         wait_until(
             || cluster.master.pull_offsets().contains(&5),
-            "下一笔 PULL_MESSAGE 从 5 开始",
+            "the next PULL_MESSAGE starts from 5",
         )
         .await;
         assert_eq!(
             c.buffered_message_count(),
             0,
-            "NO_MATCHED_MSG 没有可交付的消息"
+            "NO_MATCHED_MSG has nothing deliverable"
         );
         c.shutdown();
     }
 
-    /// OFFSET_ILLEGAL 的 nextBeginOffset 是 broker 对越界位点的纠正值：跟过去才算
-    /// 「越界自愈」，停在旧位点会每轮收到同一个纠正、原地打转。
+    /// The nextBeginOffset of OFFSET_ILLEGAL is the broker's correction for an out-of-range offset: only following it counts
+    /// as "self-healing from an illegal offset"; staying at the old offset would receive the same correction every round and spin in place.
     #[tokio::test]
     async fn lite_cursor_adopts_the_brokers_offset_correction() {
         let cluster = FakePullCluster::start().await;
@@ -4282,12 +4282,12 @@ mod tests {
 
         wait_until(
             || c.pull_cursor_of(&q) == 42,
-            "OFFSET_ILLEGAL 后拉取游标采纳 broker 纠正",
+            "after OFFSET_ILLEGAL the pull cursor adopts the broker's correction",
         )
         .await;
         wait_until(
             || cluster.master.pull_offsets().contains(&42),
-            "下一笔 PULL_MESSAGE 从 42 开始",
+            "the next PULL_MESSAGE starts from 42",
         )
         .await;
         c.shutdown();
@@ -4298,7 +4298,7 @@ mod tests {
         let cluster = FakePullCluster::start().await;
         let q = queue("T", "broker-a", 0);
         let body =
-            encode_message_ext(&msg("T", "broker-a", 0, 2, "late"), false).expect("消息可编码");
+            encode_message_ext(&msg("T", "broker-a", 0, 2, "late"), false).expect("the message must encode");
         let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
         cluster.master.script_pull(
             response_code::SUCCESS,
@@ -4314,27 +4314,27 @@ mod tests {
 
         wait_until(
             || !cluster.master.pull_offsets().is_empty(),
-            "第一笔拉取到达 broker",
+            "the first pull reaching the broker",
         )
         .await;
         c.seek(&q, 99);
-        gate_tx.send(()).expect("放闸");
+        gate_tx.send(()).expect("open the gate");
         wait_until(
             || cluster.master.pull_offsets().contains(&99),
-            "seek 之后下一笔 PULL_MESSAGE 从 99 起",
+            "after seek the next PULL_MESSAGE starts from 99",
         )
         .await;
-        assert_eq!(c.pull_cursor_of(&q), 99, "在途应答不得盖掉 seek 写下的位点");
-        assert_eq!(c.buffered_message_count(), 0, "被刹车的一轮不许入缓冲");
+        assert_eq!(c.pull_cursor_of(&q), 99, "an in-flight reply must not overwrite the offset seek wrote down");
+        assert_eq!(c.buffered_message_count(), 0, "the braked round must not enter the buffer");
         c.shutdown();
     }
 
-    // ------------------------------------------------------------ 平衡视图
+    // ------------------------------------------------------------ Balanced view
 
-    /// 同组只有本实例：整份订阅信息都是自己的，且按 house 口径排好序。
+    /// The group holds only this instance: the entire subscribe info is its own, sorted per the house convention.
     #[tokio::test]
     async fn balance_view_sole_instance_takes_every_queue() {
-        // 3 个队列：1 个队列时「自己那一份」与「全部」同形，什么也证明不了。
+        // 3 queues: with 1 queue, "own share" and "all" are the same shape, which proves nothing.
         let cluster = FakePullCluster::start_queues(3).await;
         let c = started_pull("bal_sole", "PG_BalSole", &cluster, "T").await;
         let cid = c.client_id();
@@ -4343,18 +4343,18 @@ mod tests {
         let view = c
             .fetch_message_queues_in_balance("T")
             .await
-            .expect("假集群里平衡视图应当算得出来");
+            .expect("the balanced view must be computable");
         assert_eq!(
             view.iter().map(|q| q.queue_id).collect::<Vec<i32>>(),
             vec![0, 1, 2],
-            "单实例认领全部队列，且按 queueId 升序"
+            "a sole instance claims every queue, in ascending queueId"
         );
         assert!(view.iter().all(|q| q.topic == "T" && q.broker_name == "broker-a"));
         c.shutdown();
     }
 
-    /// 同组两实例：各自只拿到自己那一份；两份不重叠、合起来是全部。
-    /// 重叠就是重复消费，这条判据只能靠两个真实例互相对拍。
+    /// Two instances in the same group: each gets only its own share; the shares do not overlap and together cover everything.
+    /// Overlap would mean duplicate consumption, and this criterion can only be verified by cross-checking two live instances against each other.
     #[tokio::test]
     async fn balance_view_returns_only_this_instances_share() {
         let cluster = FakePullCluster::start_queues(2).await;
@@ -4372,27 +4372,27 @@ mod tests {
         let va = a
             .fetch_message_queues_in_balance("T")
             .await
-            .expect("a 的平衡视图");
+            .expect("the balanced view of a");
         let vb = b
             .fetch_message_queues_in_balance("T")
             .await
-            .expect("b 的平衡视图");
-        assert_eq!(va.len(), 1, "两个实例分两个队列：每个只拿 1 个");
+            .expect("the balanced view of b");
+        assert_eq!(va.len(), 1, "two instances across two queues: each takes exactly 1");
         assert_eq!(vb.len(), 1);
-        assert_ne!(va[0], vb[0], "两份不得重叠（重叠即重复消费）");
+        assert_ne!(va[0], vb[0], "the two shares must not overlap (overlap means duplicate consumption)");
         let mut both = vec![va[0].clone(), vb[0].clone()];
         sort_mqs(&mut both);
         assert_eq!(
             both.iter().map(|q| q.queue_id).collect::<Vec<i32>>(),
             vec![0, 1],
-            "两份合起来必须覆盖全部队列，谁都不许漏"
+            "the two shares together must cover every queue, missing none"
         );
         a.shutdown();
         b.shutdown();
     }
 
-    /// broker 不认识本组（38 回空列表）：**算不动** ≠ 算出来是空，此时保持现有分配
-    /// （本地拉过的队列），绝不回退成「独占全部队列」。
+    /// The broker does not know this group (38 answers an empty list): "cannot compute" ≠ "computes to empty"; in that case keep the current assignment
+    /// (the queues this instance has pulled locally), and never fall back to "take all queues exclusively".
     #[tokio::test]
     async fn balance_view_keeps_current_assignment_when_the_group_is_unknown() {
         let cluster = FakePullCluster::start_queues(3).await;
@@ -4402,32 +4402,32 @@ mod tests {
         assert!(
             c.fetch_message_queues_in_balance("T")
                 .await
-                .expect("兜底路径不该报错")
+                .expect("the fallback path must not error")
                 .is_empty(),
-            "还没拉过任何队列：现有分配就是空"
+            "nothing pulled yet: the current assignment is simply empty"
         );
 
         let mut all = c
             .fetch_subscribe_message_queues("T")
             .await
-            .expect("订阅信息可查");
+            .expect("the subscribe info must be queryable");
         sort_mqs(&mut all);
         assert_eq!(all.len(), 3);
         c.pull(&all[2], "*", 0, 32, Some(5000))
             .await
-            .expect("假集群里拉取应当成功");
+            .expect("the pull should succeed against the fake cluster");
 
         assert_eq!(
-            c.fetch_message_queues_in_balance("T").await.expect("兜底视图"),
+            c.fetch_message_queues_in_balance("T").await.expect("the fallback view"),
             vec![all[2].clone()],
-            "兜底只认领自己拉过的那一个，不是路由里的全部 3 个"
+            "the fallback claims only the one queue it has pulled, not all 3 in the route"
         );
         assert!(
             c.fetch_message_queues_in_balance("OtherBalTopic")
                 .await
-                .expect("别的 topic 也走得通")
+                .expect("other topics must work through the same path")
                 .is_empty(),
-            "兜底同样按 topic 收口，不许把 T 的队列漏给别的 topic"
+            "the fallback is scoped per topic too: T's queues must not leak into another topic"
         );
         c.shutdown();
     }
@@ -4435,41 +4435,41 @@ mod tests {
     #[tokio::test]
     async fn balance_view_broadcasting_takes_all_without_the_consumer_list() {
         let cluster = FakePullCluster::start_queues(3).await;
-        let c = DefaultMQPullConsumer::new("PG_BalBcast").expect("组名合法");
+        let c = DefaultMQPullConsumer::new("PG_BalBcast").expect("the group name is legal");
         c.set_instance_name("bal_bcast");
         c.set_namesrv_addr(&cluster.namesrv_addr);
         c.set_message_model(MessageModel::BROADCASTING);
         c.register_topic("T");
-        c.start().await.expect("假集群里 start 应当成功");
+        c.start().await.expect("start should succeed against the fake cluster");
         cluster.set_cid_list(&["someone-else"]);
 
         let view = c
             .fetch_message_queues_in_balance("T")
             .await
-            .expect("广播视图");
-        assert_eq!(view.len(), 3, "广播不看消费者列表：全量认领");
+            .expect("the broadcasting view");
+        assert_eq!(view.len(), 3, "broadcasting ignores the consumer list: it claims everything");
         c.shutdown();
     }
 
     #[tokio::test]
     async fn balance_view_requires_a_started_consumer() {
-        let c = DefaultMQPullConsumer::new("PG_BalNotStarted").expect("组名合法");
+        let c = DefaultMQPullConsumer::new("PG_BalNotStarted").expect("the group name is legal");
         let err = c
             .fetch_message_queues_in_balance("T")
             .await
-            .expect_err("未启动必须报错");
+            .expect_err("an unstarted consumer must error");
         assert!(
             err.to_string().contains("not started"),
-            "报的是未启动：{err}"
+            "the error must be the not-started one: {err}"
         );
     }
 
-    // ---------------------- lite 的 topic 队列集合变更监听器
+    // ---------------------- Lite's topic queue-set change listener
 
-    /// 监听器事件的收纳形态：`(topic, 排序后的 queueId 列表)` 序列。
+    /// Accumulator shape for listener events: a sequence of `(topic, sorted queueId list)` pairs.
     type QueueChangeEvents = Arc<Mutex<Vec<(String, Vec<i32>)>>>;
 
-    /// 收集 `on_changed` 的监听器（队列 id 排序后存下来，比对与顺序无关）。
+    /// A listener that collects `on_changed` calls (queue ids are sorted before storing so comparisons ignore order).
     struct RecordingQueueListener {
         events: QueueChangeEvents,
     }
@@ -4494,46 +4494,46 @@ mod tests {
         }
     }
 
-    /// 起一个 subscribe 模式的 lite 消费者（与 `started_lite` 的 assign 版不同：
-    /// 队列集合变更监听只在 subscribe 模式下有意义）。
+    /// Start a lite consumer in subscribe mode (unlike the assign-based `started_lite`:
+    /// queue-set change listeners only make sense in subscribe mode).
     async fn started_lite_subscribe(
         instance: &str,
         group: &str,
         cluster: &FakePullCluster,
         topic: &str,
     ) -> DefaultLitePullConsumer {
-        let c = DefaultLitePullConsumer::new(group).expect("组名合法");
+        let c = DefaultLitePullConsumer::new(group).expect("the group name is legal");
         c.set_instance_name(instance);
         c.set_namesrv_addr(&cluster.namesrv_addr);
         c.subscribe(topic, "*");
-        c.start().await.expect("假集群里 start 应当成功");
+        c.start().await.expect("start should succeed against the fake cluster");
         c
     }
 
     #[test]
     fn same_queue_set_matches_by_set_equality() {
         let q = |id: i32| queue("T", "broker-a", id);
-        assert!(!same_queue_set(&[], &[q(0)]), "数量不等即变化");
-        assert!(same_queue_set(&[q(0), q(1)], &[q(1), q(0)]), "集合与顺序无关");
-        assert!(!same_queue_set(&[q(0), q(1)], &[q(0), q(2)]), "同数量不同成员是变化");
+        assert!(!same_queue_set(&[], &[q(0)]), "a count mismatch is already a change");
+        assert!(same_queue_set(&[q(0), q(1)], &[q(1), q(0)]), "set equality ignores order");
+        assert!(!same_queue_set(&[q(0), q(1)], &[q(0), q(2)]), "same count with different members is a change");
         assert!(same_queue_set(&[q(0)], &[q(0)]));
     }
 
     #[tokio::test]
     async fn queue_change_listener_guards_and_interval() {
-        let c = DefaultLitePullConsumer::new("LiteQC_Guard").expect("组名合法");
+        let c = DefaultLitePullConsumer::new("LiteQC_Guard").expect("the group name is legal");
         let (listener, _) = RecordingQueueListener::new();
         let err = c
             .register_topic_message_queue_change_listener("  ", listener)
             .await
-            .expect_err("空 topic 必须报错");
+            .expect_err("a blank topic must error");
         assert!(
             err.to_string().contains("Topic or listener is null"),
-            "报的是那句固定错误文案：{err}"
+            "the error must be that fixed message: {err}"
         );
         assert_eq!(c.topic_metadata_check_interval_millis(), 30_000);
         c.set_topic_metadata_check_interval_millis(0);
-        assert_eq!(c.topic_metadata_check_interval_millis(), 1_000, "夹到 1s 下限");
+        assert_eq!(c.topic_metadata_check_interval_millis(), 1_000, "clamped to the 1s floor");
         c.set_topic_metadata_check_interval_millis(2_500);
         assert_eq!(c.topic_metadata_check_interval_millis(), 2_500);
     }
@@ -4546,37 +4546,37 @@ mod tests {
         let (listener, events) = RecordingQueueListener::new();
         c.register_topic_message_queue_change_listener("T", listener)
             .await
-            .expect("注册成功");
-        // 运行中注册立刻记快照 ⇒ 首轮不许把"现状"报成变化
+            .expect("registration must succeed");
+        // Registering while running snapshots at once ⇒ the first round must not report "the status quo" as a change
         assert_eq!(
             c.fetch_topic_message_queues_and_compare().await,
             0,
-            "注册即快照，未变化不该回调"
+            "registration snapshots immediately: no change, no callback"
         );
         assert!(lock(&events).is_empty());
 
-        cluster.scale_to(4); // 扩容：比对那一趟自己会去问 nameserver
+        cluster.scale_to(4); // scale out: the compare round asks the name server itself
         assert_eq!(
             c.fetch_topic_message_queues_and_compare().await,
             1,
-            "扩容必须回调一次"
+            "a scale-out must fire exactly one callback"
         );
         assert_eq!(
             c.fetch_topic_message_queues_and_compare().await,
             0,
-            "同一集合不得重复回调"
+            "the same set must not call back twice"
         );
 
-        cluster.scale_to(1); // 缩容
+        cluster.scale_to(1); // scale in
         assert_eq!(
             c.fetch_topic_message_queues_and_compare().await,
             1,
-            "缩容同样要回调"
+            "a scale-in must call back too"
         );
         assert_eq!(
             *lock(&events),
             vec![("T".to_string(), vec![0, 1, 2, 3]), ("T".to_string(), vec![0])],
-            "回调收到的是变化后的完整队列集合"
+            "the callback receives the complete post-change queue set"
         );
         c.shutdown();
     }
@@ -4584,24 +4584,24 @@ mod tests {
     #[tokio::test]
     async fn queue_change_listener_before_start_defers_snapshot() {
         let cluster = FakePullCluster::start_queues(2).await;
-        let c = DefaultLitePullConsumer::new("LiteQC_Pre").expect("组名合法");
+        let c = DefaultLitePullConsumer::new("LiteQC_Pre").expect("the group name is legal");
         c.set_instance_name("lite_qc_pre");
         c.set_namesrv_addr(&cluster.namesrv_addr);
         c.subscribe("T", "*");
         let (listener, events) = RecordingQueueListener::new();
         c.register_topic_message_queue_change_listener("T", listener)
             .await
-            .expect("未启动也能注册");
+            .expect("registration must work before start too");
         assert!(
             lock(&c.inner.queues_for_topic).is_empty(),
-            "未启动不记快照（只在 RUNNING 记）"
+            "no snapshot before start (only recorded while RUNNING)"
         );
 
-        c.start().await.expect("start 成功");
+        c.start().await.expect("start must succeed");
         assert_eq!(
             c.fetch_topic_message_queues_and_compare().await,
             1,
-            "没有快照 ⇒ 首轮一定报一次"
+            "with no snapshot the first round must report once"
         );
         assert_eq!(*lock(&events), vec![("T".to_string(), vec![0, 1])]);
         c.shutdown();
@@ -4615,16 +4615,16 @@ mod tests {
         let (second, second_events) = RecordingQueueListener::new();
         c.register_topic_message_queue_change_listener("T", first)
             .await
-            .expect("首次注册");
+            .expect("the first registration");
         c.register_topic_message_queue_change_listener("T", second)
             .await
-            .expect("重复注册：覆盖旧监听器并 warn");
-        assert_eq!(lock(&c.inner.topic_listeners).len(), 1, "同一 topic 只留一个监听器");
+            .expect("re-registration: it overwrites the old listener and warns");
+        assert_eq!(lock(&c.inner.topic_listeners).len(), 1, "only one listener survives per topic");
 
         cluster.scale_to(3);
         assert_eq!(c.fetch_topic_message_queues_and_compare().await, 1);
-        assert!(lock(&first_events).is_empty(), "被覆盖的监听器不该再收");
-        assert_eq!(lock(&second_events).len(), 1, "现监听器收到回调");
+        assert!(lock(&first_events).is_empty(), "the overwritten listener must receive no more events");
+        assert_eq!(lock(&second_events).len(), 1, "the current listener gets the callback");
         c.shutdown();
     }
 
@@ -4635,10 +4635,10 @@ mod tests {
         let (listener, events) = RecordingQueueListener::new();
         c.register_topic_message_queue_change_listener("T", listener)
             .await
-            .expect("注册");
+            .expect("registration");
 
         cluster.scale_to(2);
-        // 首查延迟注入成 50ms（默认 10s），周期 100ms
+        // The first-check delay is injected as 50ms (default 10s); the period is 100ms
         let inner = c.inner.clone();
         let stop = c.inner.stop.subscribe();
         let task = tokio::spawn(async move {
@@ -4646,7 +4646,7 @@ mod tests {
         });
         wait_until(
             || !lock(&events).is_empty(),
-            "后台循环应当自己跑出一轮比对",
+            "the background loop should run a compare round on its own",
         )
         .await;
         assert_eq!(lock(&events)[0].1, vec![0, 1]);
@@ -4656,8 +4656,8 @@ mod tests {
         c.shutdown();
     }
 
-    /// 首查延迟只该作用在**第一趟之前**：留在循环里就等于每趟都「首查 + 周期」，
-    /// 1s 的周期会被拖成 4s，扩容后的回调慢一个数量级。
+    /// The first-check delay should only apply **before the first round**: left inside the loop, every round pays "first delay + period",
+    /// dragging the 1s period out to 4s, and the post-scale-out callback is an order of magnitude slower.
     #[tokio::test]
     async fn queue_change_metadata_period_excludes_the_first_delay() {
         let cluster = FakePullCluster::start_queues(1).await;
@@ -4665,8 +4665,8 @@ mod tests {
         let (listener, events) = RecordingQueueListener::new();
         c.register_topic_message_queue_change_listener("T", listener)
             .await
-            .expect("注册");
-        // 周期写 0 也会被夹到 1s 下限，所以这里的首查延迟取得比周期大得多
+            .expect("registration");
+        // Even a 0 period is clamped to the 1s floor, so the injected first delay here is much larger than the period
         c.set_topic_metadata_check_interval_millis(0);
         let inner = c.inner.clone();
         let stop = c.inner.stop.subscribe();
@@ -4675,17 +4675,17 @@ mod tests {
         });
 
         cluster.scale_to(2);
-        wait_until(|| !lock(&events).is_empty(), "第一趟要抓到扩容").await;
+        wait_until(|| !lock(&events).is_empty(), "the first round must catch the scale-out").await;
 
         cluster.scale_to(3);
         let second = tokio::time::timeout(
             Duration::from_millis(1500),
-            wait_until(|| lock(&events).len() >= 2, "第二趟要抓到再次扩容"),
+            wait_until(|| lock(&events).len() >= 2, "the second round must catch the next scale-out"),
         )
         .await;
         assert!(
             second.is_ok(),
-            "检查周期里混进了首查延迟：每趟都多等 3s"
+            "the first delay leaked into the check period: every round would wait 3s more"
         );
         assert_eq!(lock(&events)[1].1, vec![0, 1, 2]);
 
@@ -4695,8 +4695,8 @@ mod tests {
         c.shutdown();
     }
 
-    /// 比对那一趟必须**现问 name server**，而不是读周期刷新的路由缓存：
-    /// 少了这一步，扩容最快也要等一次路由轮询才看得见，监听回调整整慢一个周期。
+    /// The compare round must **ask the name server on the spot**, not read the periodically refreshed route cache:
+    /// without this step, a scale-out would be seen at the earliest after one route poll, and the listener callback would lag a whole period.
     #[tokio::test]
     async fn queue_change_round_asks_the_nameserver_every_time() {
         let cluster = FakePullCluster::start_queues(1).await;
@@ -4704,15 +4704,15 @@ mod tests {
         let (listener, _) = RecordingQueueListener::new();
         c.register_topic_message_queue_change_listener("T", listener)
             .await
-            .expect("注册");
+            .expect("registration");
 
         cluster.clear_route_queries();
         c.fetch_topic_message_queues_and_compare().await;
         let first = cluster.route_queries();
-        assert!(!first.is_empty(), "一趟比对至少问一次路由：{first:?}");
+        assert!(!first.is_empty(), "one compare round must query the route at least once: {first:?}");
         assert!(
             first.iter().all(|t| t == "T"),
-            "问的就是这个 topic：{first:?}"
+            "the topic asked about must be exactly this one: {first:?}"
         );
 
         cluster.clear_route_queries();
@@ -4720,39 +4720,39 @@ mod tests {
         let second = cluster.route_queries();
         assert!(
             !second.is_empty(),
-            "下一趟还得再问一次（吃缓存就测不出变化）"
+            "the next round must ask again (serving from the cache could not detect the change)"
         );
         c.shutdown();
     }
 
-    /// 查不到队列 ⇒ **报错**，不是回空表。空表会被比对那一趟读成"这个 topic 缩到 0
-    /// 队列"，于是回调一次假缩容、快照也被刷成空集。
+    /// When no queue can be found the call must **error**, not return an empty list: the compare round would read empty as "this topic shrank
+    /// to 0 queues" and fire a fake scale-in callback, and the snapshot would be flushed to the empty set.
     #[tokio::test]
     async fn fetch_message_queues_reports_instead_of_returning_empty() {
         let cluster = FakePullCluster::start_queues(1).await;
         let c = started_lite_subscribe("lite_qc_empty", "LiteQC_Empty", &cluster, "T").await;
-        cluster.scale_to(0); // 路由里一个读队列都不剩
+        cluster.scale_to(0); // not a single read queue left in the route
         let err = c
             .fetch_message_queues("T")
             .await
-            .expect_err("没有可用队列时必须报错");
+            .expect_err("it must error when no queue is available");
         assert!(
             err.to_string()
                 .contains("Can not find Message Queue for this topic"),
-            "报的是「查不到队列」：{err}"
+            "the error must be the 'queue not found' one: {err}"
         );
-        // 监听器那边也不能因为这一次查不到就收到假缩容回调。
+        // The listener side must not receive a fake scale-in callback just because this lookup failed.
         let (listener, events) = RecordingQueueListener::new();
         c.register_topic_message_queue_change_listener("T", listener)
             .await
-            .expect("注册");
+            .expect("registration");
         cluster.clear_route_queries();
         assert_eq!(
             c.fetch_topic_message_queues_and_compare().await,
             0,
-            "查不到队列的那一趟不发回调"
+            "the round that cannot find queues must not fire a callback"
         );
-        assert!(lock(&events).is_empty(), "没有回调事件");
+        assert!(lock(&events).is_empty(), "no callback events");
         c.shutdown();
     }
 }

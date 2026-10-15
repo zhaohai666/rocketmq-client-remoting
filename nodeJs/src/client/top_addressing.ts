@@ -1,8 +1,10 @@
 // -*- coding: utf-8 -*-
-// HTTP namesrv 寻址：从 HTTP "ws" 端点解析 namesrv 地址列表。
+// HTTP namesrv addressing: resolves the namesrv address list from an HTTP "ws"
+// endpoint.
 //
-// 域名必须由构造函数或 ROCKETMQ_NAMESRV_DOMAIN 环境变量显式给出——**刻意不设**内建
-// 默认域名。
+// The domain must be given explicitly via the constructor or the
+// ROCKETMQ_NAMESRV_DOMAIN environment variable — there is deliberately NO
+// built-in default domain.
 import os from 'node:os';
 
 export function clearNewLine(s: string | null): string | null {
@@ -13,7 +15,7 @@ export function clearNewLine(s: string | null): string | null {
 export class DefaultTopAddressing {
   wsAddr: string | null;
   unitName: string | null;
-  // 变更回调：HTTP 端点返回的地址列表与上次看到的**不一样**时触发。
+  // Change callback: fires when the address list returned by the HTTP endpoint DIFFERS from the one last seen.
   private changeCallBack: ((addrs: string) => string | null) | null = null;
   private lastAddrs: string | null = null;
 
@@ -58,8 +60,7 @@ export class DefaultTopAddressing {
       if (!resp.ok) return null;
       const text = await resp.text();
       const addrs = clearNewLine(text);
-      // 只有变化值才走变更回调（onNameServerAddressChange -> updateNameServerAddressList），
-      // 未变的应答静默。
+      // Only changed values go through the change callback (onNameServerAddressChange -> updateNameServerAddressList); unchanged answers stay silent.
       if (addrs != null && addrs !== '' && addrs !== this.lastAddrs) {
         const prev = this.lastAddrs;
         this.lastAddrs = addrs;

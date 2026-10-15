@@ -1,4 +1,4 @@
-// 用法：rmq pinned-guard [namesrv]（需本地 5.5.1 集群，autoCreateTopicEnable=true）
+// Usage: rmq pinned-guard [namesrv] (needs a local 5.5.1 cluster, autoCreateTopicEnable=true)
 using System.Diagnostics;
 using System.Globalization;
 using System.Text;
@@ -15,7 +15,9 @@ public static class LivePinnedGuard
     private const string AsyncWording =
         "Topic of the message does not match its target message queue";
 
-    /// <summary>反腿的耗时上界：守卫是纯字符串比较，真机给 50ms 已留两个数量级余量。</summary>
+   /// <summary>The upper bound on the negative leg's elapsed time: the guard is a pure string
+    /// comparison, so 50ms on a real machine already leaves two orders of magnitude of
+    /// slack.</summary>
     private const double LocalBudgetMs = 50.0;
 
     private static string _namesrv = "127.0.0.1:9876";
@@ -41,7 +43,8 @@ public static class LivePinnedGuard
 
     private static byte[] Bytes(string s) => Encoding.UTF8.GetBytes(s);
 
-    /// <summary>带 keys 的消息：C# 只有 (topic, tags, keys, body) 这一个带 keys 的构造。</summary>
+   /// <summary>A message with keys: (topic, tags, keys, body) is the only constructor with
+    /// keys in C#.</summary>
     private static Message Keyed(string topic, string body, string keys) =>
         new(topic, null!, keys, Bytes(body));
 
@@ -60,7 +63,8 @@ public static class LivePinnedGuard
         return pred();
     }
 
-    /// <summary>等 maxOffset 涨到 want 再返回（broker 的 ConsumeQueue 派发比 SEND 回包慢几毫秒）。</summary>
+   /// <summary>Waits until maxOffset climbs to want before returning (the broker's
+    /// ConsumeQueue dispatch is a few milliseconds slower than the SEND reply).</summary>
     private static long WaitOffset(DefaultMQProducer prod, MessageQueue mq, long want,
         int timeoutMs = 5000)
     {
@@ -78,7 +82,8 @@ public static class LivePinnedGuard
         throw new InvalidOperationException("topic " + topic + " has no queue 0");
     }
 
-    /// <summary>跑一次定点同步发送，返回 (异常或 null, 耗时毫秒)。</summary>
+    /// <summary>Runs one pinned synchronous send and returns (the exception or null, the
+    /// elapsed milliseconds).</summary>
     private static (MQClientException? Err, double Ms) TimedSend(Func<SendResult> send)
     {
         var sw = Stopwatch.StartNew();
@@ -93,7 +98,8 @@ public static class LivePinnedGuard
         }
     }
 
-    /// <summary>一次异步发送的终态（成功/异常各记一笔，回调恰好一次）。</summary>
+    /// <summary>The terminal state of one async send (one record for success and one for the
+   /// exception, the callback fires exactly once).</summary>
     private sealed class EventSink : ISendCallback
     {
         private readonly object _lk = new();
@@ -120,7 +126,8 @@ public static class LivePinnedGuard
         }
     }
 
-    /// <summary>把正腿消息的 keys 收进一个袋子；CONSUME_FROM_FIRST_OFFSET 免得和发送抢 rebalance。</summary>
+   /// <summary>Puts the keys of the positive leg's messages into a bag;
+    /// CONSUME_FROM_FIRST_OFFSET keeps it from racing the send for the rebalance.</summary>
     private sealed class KeyListener : IMessageListenerConcurrently
     {
         private readonly object _lk = new();
@@ -169,7 +176,7 @@ public static class LivePinnedGuard
             List<string> addrs = cluster.GetBrokerAddrs();
             if (addrs.Count == 0)
             {
-                Check("集群探活", false, "nameServer 无 broker 注册");
+      Check("the cluster liveness probe", false, "the nameServer has no broker registered");
                 admin.Shutdown();
                 return Report();
             }
@@ -178,12 +185,12 @@ public static class LivePinnedGuard
         }
         catch (Exception e)
         {
-            Check("集群探活", false, "fetchBrokerClusterInfo: " + e.Message);
+         Check("the cluster liveness probe", false, "fetchBrokerClusterInfo: " + e.Message);
             admin.Shutdown();
             return Report();
         }
 
-        Check("集群探活", true, "broker=" + brokerAddr);
+        Check("the cluster liveness probe", true, "broker=" + brokerAddr);
 
         DefaultMQProducer? prod = null;
         DefaultMQProducer? nsProd = null;
@@ -201,19 +208,20 @@ public static class LivePinnedGuard
             prod.CreateTopic(MixAll.DefaultTopic, other, 4);
             if (!(WaitRoute(prod, topic) && WaitRoute(prod, other)))
             {
-                Check("S0 两条 topic 的路由都注册好了", false);
+  Check("S0 both topics' routes are registered", false);
                 return Report();
             }
 
             MessageQueue mq0 = QueueZero(prod, topic);
-            // 反腿的目标队列：**真**队列（同 broker 上的另一条 topic queue 0）。
-            // 不存在的 broker/队列会先死在路由上，就分不清拒的是 topic 还是地址了。
+        // The negative leg's target queue: a **real** queue (queue 0 of another topic on the
+        // same broker). A non-existent broker/queue would die on the route first, and then
+  // you could not tell whether the topic or the address was what got rejected.
             MessageQueue mqOther = QueueZero(prod, other);
-            Check("S0 两条 topic 的路由都可用（反腿用真队列，拒的才一定是 topic 而不是地址）",
+        Check("S0 both topics' routes are usable (the negative leg uses a real queue, so what is rejected is definitely the topic and not the address)",
                 true, "A=" + mq0.BrokerName + "/" + mq0.QueueId
                 + " B=" + mqOther.BrokerName + "/" + mqOther.QueueId);
 
-            // 消费者先起：CONSUME_FROM_FIRST_OFFSET，免得和发送抢 rebalance 的时间点
+        // The consumer starts first: CONSUME_FROM_FIRST_OFFSET, so it does not race the send for the rebalance timing
             push = new DefaultMQPushConsumer(group)
             {
                 InstanceName = "pin-guard-live-" + stamp,
@@ -224,11 +232,11 @@ public static class LivePinnedGuard
             push.SetMessageListener(sink);
             push.Start();
 
-            // ---------------- S1 正腿：真路由队列上的定点发送 ----------------
-            Console.WriteLine("=== S1 真实路由队列上的定点发送 ===");
+            // ---------------- S1 the positive leg: a pinned send to a real route queue ----------------
+            Console.WriteLine("=== S1 a pinned send to a real route queue ===");
             string kSingle = "pinned-live-single";
             SendResult r1 = prod.Send(Keyed(topic, "s1-single", kSingle), mq0, 3000);
-            Check("S1a 同步单条定点 SEND_OK 且落在队列 " + mq0.QueueId,
+            Check("S1a the synchronous single pinned send is SEND_OK and landed on queue " + mq0.QueueId,
                 r1.SendStatus == SendStatus.SendOk && r1.MessageQueue.QueueId == mq0.QueueId
                 && r1.MessageQueue.Topic == topic,
                 "status=" + SendStatusNames.Name(r1.SendStatus) + " mq=" + r1.MessageQueue);
@@ -238,39 +246,41 @@ public static class LivePinnedGuard
             SendResult rb = prod.SendBatch(
                 new List<Message> { Keyed(topic, "s1-b1", kB1), Keyed(topic, "s1-b2", kB2) },
                 mq0, 3000);
-            Check("S1b 同步批量定点 SEND_OK 且同一队列",
+        Check("S1b the synchronous batch pinned send is SEND_OK and on the same queue",
                 rb.SendStatus == SendStatus.SendOk && rb.MessageQueue.QueueId == mq0.QueueId,
                 "status=" + SendStatusNames.Name(rb.SendStatus) + " mq=" + rb.MessageQueue);
 
             long offAfterS1 = WaitOffset(prod, mq0, 3);
-            // 批量在消费队列上按**子消息**逐条落位（broker 收到 inner-batch 后拆开写）⇒ 2 条子消息涨 2
-            Check("S1c 三笔子消息都真落库（maxOffset = 单条 1 + 批量子消息 2）",
+      // A batch lands on the consume queue **per sub-message** (the broker splits the
+        // inner-batch apart after receiving it) => 2 sub messages move the offset by 2
+  Check("S1c all three sub-messages really landed (maxOffset = 1 single + 2 batch sub-messages)",
                 offAfterS1 == 3, "maxOffset=" + offAfterS1.ToString(CultureInfo.InvariantCulture));
 
-            // ---------------- S2 反腿：同步拒绝，本端、无痕 ----------------
-            Console.WriteLine("=== S2 topic 不符：本端亚毫秒拒，broker 上无痕 ===");
+            // ---------------- S2 the negative leg: a synchronous rejection, local and traceless ----------------
+            Console.WriteLine("=== S2 a mismatched topic: rejected sub-millisecond locally, no trace on the broker ===");
             (MQClientException? e, double elapsed) = TimedSend(() =>
                 prod.Send(Keyed(topic, "refused", "pinned-live-refused"), mqOther, 3000));
-            Check("S2a 同步单条拒，文案与协议约定逐字一致",
+            Check("S2a the synchronous single send is rejected with the text verbatim as agreed by the protocol",
                 e is not null && e.Message == SyncWording,
-                Fmt(elapsed) + "ms " + (e is null ? "没有抛异常" : e.Message));
-            // 本端拒绝的码是 MQClientException 默认 1（UNKNOWN），不是 broker 回码
-            Check("S2b 拒在本端：亚毫秒且响应码是客户端默认值（不是超时/不是 broker remark）",
+          Fmt(elapsed) + "ms " + (e is null ? "nothing was thrown" : e.Message));
+        // The code of a local rejection is MQClientException's default 1 (UNKNOWN), not a code
+        // returned by the broker
+       Check("S2b the rejection is local: sub-millisecond and the response code is the client's default (not a timeout / not a broker remark)",
                 e is not null && elapsed < LocalBudgetMs && e.ResponseCode == 1,
                 Fmt(elapsed) + "ms code=" + (e?.ResponseCode.ToString(CultureInfo.InvariantCulture) ?? "n/a"));
             (MQClientException? e2, double elapsed2) = TimedSend(() =>
                 prod.SendBatch(new List<Message> { Keyed(topic, "r1", ""), Keyed(topic, "r2", "") },
                     mqOther, 3000));
-            Check("S2c 同步批量共用同一处守卫与同一句文案",
+            Check("S2c the synchronous batch shares the same guard and the same message text",
                 e2 is not null && e2.Message == SyncWording && elapsed2 < LocalBudgetMs,
-                Fmt(elapsed2) + "ms " + (e2 is null ? "没有抛异常" : e2.Message));
+        Fmt(elapsed2) + "ms " + (e2 is null ? "nothing was thrown" : e2.Message));
             long offA = prod.MaxOffset(mq0);
             long offB = prod.MaxOffset(mqOther);
-            Check("S2d wire 反证：A 的 maxOffset 一动没动，B 上一条都没有",
+            Check("S2d the wire counter-proof: A's maxOffset did not move at all and B has not a single message",
                 offA == offAfterS1 && offB == 0, "A=" + offA + " B=" + offB);
 
-            // ---------------- S3 命名空间：wrap 幂等，只拒真的不同名 ----------------
-            Console.WriteLine("=== S3 命名空间下的比较（ns%topic 与裸 topic 都不误拒）===");
+            // ---------------- S3 the namespace: wrap is idempotent and only a genuinely different name is rejected ----------------
+            Console.WriteLine("=== S3 the comparison under a namespace (neither ns%topic nor a bare topic is rejected by mistake) ===");
             nsProd = new DefaultMQProducer("PG_pin_guard_ns_" + stamp)
             {
                 InstanceName = "pin-guard-ns-" + stamp,
@@ -279,37 +289,37 @@ public static class LivePinnedGuard
             nsProd.Namespace = ns;
             nsProd.Start();
             nsProd.CreateTopic(MixAll.DefaultTopic, wTopic, 4);
-            Check("S3a 带前缀 topic 的路由可用", WaitRoute(nsProd, wTopic), "topic=" + wTopic);
+            Check("S3a the prefixed topic's route is usable", WaitRoute(nsProd, wTopic), "topic=" + wTopic);
             MessageQueue mqw = QueueZero(nsProd, wTopic);
             string kNs1 = "pinned-live-ns-q";
             string kNs2 = "pinned-live-ns-m";
             SendResult n1 = nsProd.Send(Keyed(topic, "ns-wrapped-queue", kNs1), mqw, 3000);
-            Check("S3b 队列 topic 已带 ns 前缀：wrap 幂等，不误拒",
+            Check("S3b the queue's topic already carries the ns prefix: wrap is idempotent, no mistaken rejection",
                 n1.SendStatus == SendStatus.SendOk, "status=" + SendStatusNames.Name(n1.SendStatus));
             SendResult n2 = nsProd.Send(Keyed(wTopic, "ns-wrapped-message", kNs2), mqw, 3000);
-            Check("S3c 消息 topic 自己已带前缀同样放行",
+            Check("S3c a message topic that already carries the prefix is let through too",
                 n2.SendStatus == SendStatus.SendOk, "status=" + SendStatusNames.Name(n2.SendStatus));
             (MQClientException? e3, double elapsed3) = TimedSend(() =>
                 nsProd.Send(Keyed(topic, "ns2-refused", ""),
                     new MessageQueue("ns2%" + topic, mqw.BrokerName, 0), 3000));
-            Check("S3d 换成 ns2% 前缀才拒（对照腿：拒的是名字，不是「有前缀」）",
+            Check("S3d only switching to the ns2% prefix is rejected (the control leg: what is rejected is the name, not \"having a prefix\")",
                 e3 is not null && e3.Message == SyncWording && elapsed3 < LocalBudgetMs,
-                Fmt(elapsed3) + "ms " + (e3 is null ? "没有抛异常" : e3.Message));
-            Check("S3e 两条放行腿真落进 ns1%topic（maxOffset=2）",
+                Fmt(elapsed3) + "ms " + (e3 is null ? "nothing was thrown" : e3.Message));
+            Check("S3e the two allowed legs really landed in ns1%topic (maxOffset=2)",
                 WaitOffset(nsProd, mqw, 2) == 2,
                 "maxOffset=" + nsProd.MaxOffset(mqw).ToString(CultureInfo.InvariantCulture));
 
-            // ---------------- S4 异步：回调里是异步那处文案 ----------------
-            Console.WriteLine("=== S4 异步单条/批量：拒绝走回调，放行走内核 ===");
+            // ---------------- S4 async: the callback carries the async message text ----------------
+            Console.WriteLine("=== S4 async single/batch: a rejection goes to the callback, an allowed one goes through the kernel ===");
             var refused1 = new EventSink();
             prod.SendAsync(Keyed(topic, "async-refused", "pinned-live-async-refused"),
                 refused1, 3000, mqOther);
             bool okEv = WaitUntil(refused1.Done, 10000, 50);
             (string kind1, _, Exception? err1) = refused1.First();
-            Check("S4a 单条异步拒绝走回调、文案是异步那处",
+            Check("S4a the async single send is rejected via the callback and the text is the async one",
                 okEv && kind1 == "err" && err1 is not null && err1.Message.Contains(AsyncWording),
                 kind1 + " " + (err1?.Message ?? ""));
-            Check("S4b 拒后 maxOffset 仍不动（异步也没偷发）",
+            Check("S4b after the rejection maxOffset still does not move (async did not sneak a send out either)",
                 prod.MaxOffset(mq0) == offAfterS1,
                 "maxOffset=" + prod.MaxOffset(mq0).ToString(CultureInfo.InvariantCulture));
 
@@ -318,7 +328,7 @@ public static class LivePinnedGuard
                 refused2, 3000, mqOther);
             WaitUntil(refused2.Done, 10000, 50);
             (string kind2, _, Exception? err2) = refused2.First();
-            Check("S4c 批量异步共用同一处文案与同一条拒绝路径",
+            Check("S4c batch async shares the same message text and the same rejection path",
                 kind2 == "err" && err2 is not null && err2.Message.Contains(AsyncWording),
                 kind2 + " " + (err2?.Message ?? ""));
 
@@ -333,27 +343,27 @@ public static class LivePinnedGuard
             WaitUntil(() => ok1.Done() && ok2.Done(), 10000, 50);
             (string kindS, SendResult? resS, _) = ok1.First();
             (string kindB, SendResult? resB, _) = ok2.First();
-            Check("S4d 两条放行腿都 SEND_OK",
+            Check("S4d both allowed legs got SEND_OK",
                 kindS == "ok" && resS?.SendStatus == SendStatus.SendOk
                 && kindB == "ok" && resB?.SendStatus == SendStatus.SendOk,
                 "single=" + kindS + " batch=" + kindB);
             long offAsync = WaitOffset(prod, mq0, offAfterS1 + 3);
-            Check("S4e 异步放行腿同样真落库（单条 1 + 批量子消息 2，maxOffset 再涨 3）",
+        Check("S4e the async allowed leg really landed too (1 single + 2 batch sub-messages, maxOffset climbs by 3 more)",
                 offAsync == offAfterS1 + 3,
                 "maxOffset=" + offAsync.ToString(CultureInfo.InvariantCulture));
 
-            Console.WriteLine("=== S5 单向定点没有守卫：msg 自己的 topic 说了算 ===");
+  Console.WriteLine("=== S5 a pinned oneway has no guard: the msg's own topic decides ===");
             string kOw = "pinned-live-oneway";
             prod.SendOneway(Keyed(topic, "oneway", kOw), mqOther);
             bool landed = WaitUntil(() => prod.MaxOffset(mq0) == offAsync + 1, 10000, 100);
-            Check("S5a 单向定点没有守卫：报文按 msg 自己的 topic 落进 A",
+            Check("S5a a pinned oneway has no guard: the request landed in A according to the msg's own topic",
                 landed, "A maxOffset=" + prod.MaxOffset(mq0).ToString(CultureInfo.InvariantCulture));
-            Check("S5b 目标队列所在的 B 一条都没有（是单向路径固有的口子，不是漏发）",
+        Check("S5b B, the topic the queue belonged to, has not a single message (this is a hole inherent to the oneway path, not a missed send)",
                 prod.MaxOffset(mqOther) == 0,
                 "B maxOffset=" + prod.MaxOffset(mqOther).ToString(CultureInfo.InvariantCulture));
 
-            // ---------------- S6 正腿收尾：消息一条不少 ----------------
-            Console.WriteLine("=== S6 push 消费者收齐正腿消息 ===");
+     // ---------------- S6 the positive leg winds up: not one message missing ----------------
+     Console.WriteLine("=== S6 a push consumer receives all the positive leg's messages ===");
             var expected = new List<string> { kSingle, kB1, kB2, kAs, kAb1, kAb2, kOw };
             WaitUntil(() =>
             {
@@ -362,12 +372,12 @@ public static class LivePinnedGuard
             }, 40000, 500);
             List<string> received = sink.Snapshot();
             List<string> missing = expected.Where(k => !received.Contains(k)).ToList();
-            Check("S6 正腿消息一条不少地被消费到", missing.Count == 0,
+   Check("S6 not one of the positive leg's messages is missing from the consumption", missing.Count == 0,
                 "received=" + Join(received) + " missing=" + Join(missing));
         }
         catch (Exception e)
         {
-            Check("联调过程中出现未预期异常", false, e.ToString());
+            Check("an unexpected exception occurred during the integration", false, e.ToString());
         }
         finally
         {
@@ -384,7 +394,7 @@ public static class LivePinnedGuard
                 }
                 catch (Exception)
                 {
-                    // 收尾失败不掩盖主断言
+                // a cleanup failure does not mask the main assertion
                 }
             }
 

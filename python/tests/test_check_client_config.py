@@ -35,7 +35,7 @@ def _consumer(*subs: SubscriptionData) -> DefaultMQPushConsumer:
 
 
 class _Recorder:
-    """替身 remoting 层：记下每一笔请求，按脚本回放响应码（None 表示抛异常）。"""
+    """Double remoting layer: records every request and replays response codes per script (None means raise)."""
 
     def __init__(self, responses: Optional[list] = None):
         self.requests: List[tuple] = []          # (addr, RemotingCommand)
@@ -49,7 +49,7 @@ class _Recorder:
         return RemotingCommand.create_response_command(
             outcome, "remark-%d" % outcome if outcome != ResponseCode.SUCCESS else None)
 
-    # MQClientInstance 只在 _invoke_sync 里用到 remoting_client，其余方法不碰
+    # MQClientInstance only touches remoting_client inside _invoke_sync; other methods do not
     def register_rpc_hook(self, *a, **kw):
         pass
 
@@ -65,8 +65,8 @@ class _Recorder:
 
     @property
     def check_requests(self) -> List[tuple]:
-        """只看 46 号请求：路由缓存空时 ``find_broker_addr_by_topic`` 会顺手补拉一次路由
-        （GET_ROUTEINFO_BY_TOPIC 也会打到这里），那是预期内的副作用，不该影响断言。
+        """Only look at request 46: when the route cache is empty, ``find_broker_addr_by_topic`` opportunistically pulls the route once more
+        (GET_ROUTEINFO_BY_TOPIC also lands here); that is an expected side effect and must not affect assertions.
         """
         return [(addr, req, t) for addr, req, t in self.requests
                 if req.code == RequestCode.CHECK_CLIENT_CONFIG]
@@ -106,7 +106,7 @@ def test_sql92_request_shape_matches_the_wire_contract():
     assert rec.codes == [RequestCode.CHECK_CLIENT_CONFIG]
     addr, req, timeout = rec.check_requests[0]
     assert addr == BROKER
-    # 请求头 null ⇒ 线上没有 extFields；body 是 CheckClientRequestBody 的 JSON
+    # A null request header means no extFields on the wire; the body is CheckClientRequestBody JSON
     assert not req.ext_fields
     assert timeout == 3000
     body = rec.body_of()
@@ -122,7 +122,7 @@ def test_sql92_request_shape_matches_the_wire_contract():
 
 
 def test_broker_reject_code_becomes_client_exception():
-    """SUBSCRIPTION_PARSE_FAILED(23) 原样带上响应码 —— 这是启动失败的判据。"""
+    """SUBSCRIPTION_PARSE_FAILED(23) carries the response code as-is — this is the criterion for startup failure."""
     inst, rec = _instance(_sub(expression="a >"))
     rec.responses = [ResponseCode.SUBSCRIPTION_PARSE_FAILED]
     with pytest.raises(MQClientException) as ei:
@@ -175,7 +175,7 @@ def test_empty_subscription_returns_whole_check():
 
 
 def test_check_subscriptions_helper_covers_unregistered_consumers():
-    """consumerTable 只收推模式消费者；未登记的调用方用内层循环拿同样的语义。"""
+    """consumerTable only holds push-mode consumers; unregistered callers get the same semantics via the inner loop."""
     inst, rec = _instance(_sub())
     inst.check_subscriptions_in_broker(GROUP, [_sub()])
     assert rec.codes == [RequestCode.CHECK_CLIENT_CONFIG]

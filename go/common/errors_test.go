@@ -31,7 +31,7 @@ func TestErrorTextsMatchTheOtherPorts(t *testing.T) {
 }
 
 func TestRequestTimeoutTextMatchesGolden(t *testing.T) {
-	// 超时错误文案的固定字面量
+	// The fixed literal of the timeout error message
 	e := RequestTimeoutError("TopicTest", 3000)
 	want := "send request message to <TopicTest> OK, but wait reply message timeout, 3000 ms."
 	if e.Error() != want {

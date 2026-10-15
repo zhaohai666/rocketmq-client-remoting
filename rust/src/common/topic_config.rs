@@ -1,8 +1,8 @@
-//! ## 为什么协议层不引它
+//! ## Why the protocol layer does not depend on this type
 //!
-//! `remoting::protocol::admin_body::TopicConfigSerializeWrapper` 里
-//! `topicConfigTable` 存的是原始 [`Value`]（协议层不依赖 common 层），
-//! 上层读到后再用 [`TopicConfig::from_json_value`] 转成强类型。
+//! In `remoting::protocol::admin_body::TopicConfigSerializeWrapper`,
+//! `topicConfigTable` holds raw [`Value`]s (the protocol layer does not depend on the common layer);
+//! after the upper layer reads them, it converts them into the strongly typed form with [`TopicConfig::from_json_value`].
 
 use std::fmt;
 
@@ -18,7 +18,7 @@ use crate::remoting::protocol::serialize::RemotingSerializable;
 
 pub const DEFAULT_READ_QUEUE_NUMS: i32 = 16;
 pub const DEFAULT_WRITE_QUEUE_NUMS: i32 = 16;
-/// `PermName.PERM_READ | PermName.PERM_WRITE`。
+/// `PermName.PERM_READ | PermName.PERM_WRITE`.
 pub const DEFAULT_PERM: i32 = 6;
 
 pub struct TopicFilterType;
@@ -37,7 +37,7 @@ pub struct TopicConfig {
     pub topic_filter_type: String,
     pub topic_sys_flag: i32,
     pub order: bool,
-    /// 保序容器：`+key` / `-key` 的插入顺序会体现在报文文本里。
+    /// Order-preserving container: the insertion order of `+key` / `-key` entries is reflected in the wire text.
     pub attributes: StringMap,
 }
 
@@ -64,12 +64,12 @@ impl TopicConfig {
         }
     }
 
-    /// 写出紧凑 JSON 串（与 `to_json_value()` 的序列化结果一致）。
+    /// Writes the compact JSON string (identical to the serialization of `to_json_value()`).
     pub fn encode(&self) -> String {
         self.to_json_value().to_string()
     }
 
-    /// 键顺序按线上记录的 JSON 字面量钉死。
+    /// Key order is pinned to the recorded wire JSON literal.
     pub fn to_json_value(&self) -> Value {
         json_object(vec![
             ("topicName", Value::String(self.topic_name.clone())),
@@ -109,7 +109,7 @@ impl TopicConfig {
         TopicConfig::from_json_value(&value)
     }
 
-    /// `attributes` 里某个 key 的原始文本（`+cgt` 这类扩展属性）。
+    /// Raw text of a key inside `attributes` (extended attributes such as `+cgt`).
     pub fn attribute(&self, key: &str) -> Option<&str> {
         self.attributes.get(key)
     }
@@ -123,7 +123,7 @@ impl TopicConfig {
     }
 }
 
-/// 诊断用的文本形式（`perm` 走 `PermName::perm_to_string`）。
+/// Text form for diagnostics (`perm` goes through `PermName::perm_to_string`).
 impl fmt::Display for TopicConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -150,7 +150,7 @@ mod tests {
 
     #[test]
     fn defaults_match_server_probe() {
-        // 默认值以 broker 侧记录的真值为准
+        // Defaults follow the recorded broker-side ground truth
         let cfg = TopicConfig::new("t");
         assert_eq!(cfg.read_queue_nums, 16);
         assert_eq!(cfg.write_queue_nums, 16);
@@ -180,7 +180,7 @@ mod tests {
         assert_eq!(cfg.attribute("+fileReservedTime"), Some("72"));
         assert_eq!(cfg.read_queue_nums, 16);
         assert_eq!(cfg.perm, 6);
-        // 读回后再写出的仍是同一份键顺序
+        // Encoding after reading back still yields the same key order
         assert!(cfg.encode().starts_with(r#"{"topicName":"attr-topic","#));
     }
 
@@ -195,8 +195,8 @@ mod tests {
             r#"{"topicName":"t","attributes":null,"order":null,"readQueueNums":"8"}"#,
         )
         .unwrap();
-        assert_eq!(cfg.read_queue_nums, 8, "数字写成字符串也要能读");
-        assert!(!cfg.order, "null 回默认值");
+        assert_eq!(cfg.read_queue_nums, 8, "numbers written as strings must still parse");
+        assert!(!cfg.order, "null falls back to the default");
         assert!(cfg.attributes.is_empty());
     }
 

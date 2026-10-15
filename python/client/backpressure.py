@@ -11,7 +11,7 @@ MIN_ASYNC_SEND_SIZE = 1024 * 1024
 
 
 class _Pending:
-    """一个还在排队的许可申请（只为让队首能被稳定识别，不代表已拿到许可）。"""
+    """A permit request still waiting in the queue (only so the queue head can be stably identified; does not mean the permit is acquired)."""
 
     __slots__ = ("permits",)
 
@@ -38,16 +38,16 @@ class FairSemaphore:
                 if self._queue[0] is request and self._free >= permits:
                     self._queue.popleft()
                     self._free -= permits
-                    self._cond.notify_all()  # 队首换人，下一个人可能就够了
+                    self._cond.notify_all()  # head changed; the next person may now be satisfied
                     return True
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    # 超时：把自己从队列里摘掉，别挡后面的人
+                    # timeout: remove self from the queue, don't block those behind
                     try:
                         self._queue.remove(request)
-                    except ValueError:  # pragma: no cover —— 只有被 grant 后才会不在队里
+                    except ValueError:  # pragma: no cover -- only absent from the queue after being granted
                         pass
-                    self._cond.notify_all()  # 同上：挡路的人走了
+                    self._cond.notify_all()  # same as above: the blocker is gone
                     return False
                 self._cond.wait(remaining)
 

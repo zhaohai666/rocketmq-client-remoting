@@ -1,18 +1,19 @@
-// ⚠ 级别与文件路径在**首次写日志时**求值并缓存，因此必须在第一次日志输出前设置环境变量。
-//   程序内可用 SetLogLevel() / SetLogFile() 直接改（后者会重新打开文件）。
+// WARNING: Level and file path are evaluated and cached on the first log write, so the environment
+//   variables must be set before the first log output.
+//   Inside the program you can change them directly via SetLogLevel() / SetLogFile() (the latter reopens the file).
 //
 //
 //
-// 非显然的实现要点：
-//   - 调用点由 [CallerFilePath]/[CallerLineNumber] 特性在调用处展开捕获，
-//     因此 Debug/Info/Warn/Error 是带可选 caller 参数的公开方法。
-//   - 显式线程名缓存天然成立：SetThreadName 直接设置
-//     Thread.CurrentThread.Name（每个托管线程各自持有），同时缓存到 [ThreadStatic] 字段。
-//   - 没有可移植的"OS 线程名"读取 API，故这一档即
-//     托管线程名（已由 SetThreadName 设置）；未命名线程回落 "main" / "tid-xxxx"。
-//   - 主线程判定：在类型静态初始化时捕获 Environment.CurrentManagedThreadId（那一刻
-//     通常是进程主线程），后续比对即可。
-//   - 级别/路径/轮转参数均用 Lazy 在首次使用时求值并缓存，之后不再读环境变量。
+// Non-obvious implementation notes:
+//   - The call site is expanded at the call location via the [CallerFilePath]/[CallerLineNumber] attributes,
+//     so Debug/Info/Warn/Error are public methods that take optional caller parameters.
+//   - Explicit thread name caching is naturally satisfied: SetThreadName directly sets
+//     Thread.CurrentThread.Name (each managed thread holds its own), and also caches it into a [ThreadStatic] field.
+//   - There is no portable "OS thread name" read API, so this tier is simply
+//     the managed thread name (already set by SetThreadName); unnamed threads fall back to "main" / "tid-xxxx".
+//   - Main-thread detection: capture Environment.CurrentManagedThreadId during the type's static initialization
+//     (at that moment it is usually the process main thread), then compare later.
+//   - Level/path/rotation parameters are all evaluated and cached on first use via Lazy, after which env vars are no longer read.
 using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -20,7 +21,7 @@ using System.Threading;
 
 namespace RocketMQ.Common;
 
-// 日志级别（数值沿用客户端日志的通用约定）。
+// Log level (values follow the common convention used by client logging).
 public enum LogLevel
 {
     Debug = 0,
@@ -30,36 +31,36 @@ public enum LogLevel
     Off = 4,
 }
 
-// 轻量客户端日志。静态类，进程内单例；只依赖 BCL。
+// Lightweight client logger. Static class, process-wide singleton; depends only on the BCL.
 public static class ClientLog
 {
-    // ---------------------------------------------------------------- 内部状态
-    // 日志文件输出状态（file sink）。
+    // ---------------------------------------------------------------- Internal state
+    // Log file output state (file sink).
     private sealed class LogFileState
     {
-        public string Path = "";            // 空 = 关闭文件输出
-        public StreamWriter? Writer;        // null = 尚未打开
-        public bool ExplicitPath;           // 是否由 SetLogFile() 指定
-        public bool OpenFailed;             // 打开失败则静默降级为仅 stderr
-        public long Size;                   // 当前文件已写字节数（本进程视角）
+        public string Path = "";            // empty = file output disabled
+        public StreamWriter? Writer;        // null = not yet opened
+        public bool ExplicitPath;           // whether set via SetLogFile()
+        public bool OpenFailed;             // if open failed, silently degrade to stderr only
+        public long Size;                   // bytes written to the current file so far (from this process view)
     }
 
     private static readonly LogFileState Sink = new();
     private static readonly object FileLock = new();
 
-    // 文件写入统一用无 BOM 的 UTF-8，字节数与 Size 统计一致。
+    // File writes uniformly use BOM-less UTF-8, consistent with the Size accounting in bytes.
     private static readonly Encoding Utf8NoBom = new UTF8Encoding(false);
 
-    // ---------------------------------------------------------------- 级别
-    // 环境变量原始值，首次访问时读取并缓存（之后不再读环境变量）。
+    // ---------------------------------------------------------------- Level
+    // Raw environment variable value, read and cached on first access (env vars are not read afterwards).
     private static readonly Lazy<string?> RawLevelEnv =
         new(() => Environment.GetEnvironmentVariable("ROCKETMQ_CLIENT_LOG_LEVEL"));
 
     private static readonly Lazy<int> DefaultLevel =
         new(() => ParseLevel(RawLevelEnv.Value));
 
-    // -1 = 尚未解析（首次使用时按环境变量/默认填充）；>=0 表示已确定的级别。
-    // SetLogLevel 通过 Interlocked 覆盖该值，保证原子读写。
+    // -1 = not yet resolved (filled from env var/default on first use); >=0 means a determined level.
+    // SetLogLevel overrides this value via Interlocked to guarantee atomic read/write.
     private static int _level = -1;
 
     private static int ResolveLevelOnce()
@@ -69,9 +70,9 @@ public static class ClientLog
         return _level;
     }
 
-    // 环境变量是否**显式**指定了级别。宿主程序若要"默认 INFO、但尊重外部显式配置"，
-    // 写成 `if (!ClientLog.LogLevelSetFromEnv()) ClientLog.SetLogLevel(LogLevel.Info);`，
-    // 这样真机排查时直接 `ROCKETMQ_CLIENT_LOG_LEVEL=DEBUG ./app` 就能提高日志级别而不必改代码。
+    // Whether the environment variable **explicitly** specified the level. If a host program wants
+    // "default INFO, but respect explicit external config", write `if (!ClientLog.LogLevelSetFromEnv()) ClientLog.SetLogLevel(LogLevel.Info);`,
+    // so that in real-device troubleshooting you can simply `ROCKETMQ_CLIENT_LOG_LEVEL=DEBUG ./app` to raise the level without changing code.
     public static bool LogLevelSetFromEnv() => RawLevelEnv.Value is not null;
 
     public static LogLevel LogLevel
@@ -93,13 +94,13 @@ public static class ClientLog
     private static readonly Lazy<int> MaxIndex =
         new(() => ResolveMaxIndex());
 
-    // 运行时覆盖（优先于环境变量）：宿主程序/测试可在启动后注入阈值。
+    // Runtime override (takes precedence over env var): host program/tests can inject thresholds after startup.
     private static long? _maxSizeOverride;
     private static int? _maxIndexOverride;
 
     /// <summary>
-    /// 程序内设定轮转阈值（优先于环境变量）。maxSize&lt;=0 关闭按大小轮转；
-    /// maxIndex&lt;=0 不保留备份（环境变量只能在启动前设置，此方法则是运行期覆盖）。
+    /// Set the rotation thresholds in-process (takes precedence over env vars). maxSize&lt;=0 disables size-based rotation;
+    /// maxIndex&lt;=0 keeps no backups (env vars can only be set before startup, whereas this method overrides at runtime).
     /// </summary>
     public static void SetLogFileLimits(long maxSize, int maxIndex)
     {
@@ -110,8 +111,8 @@ public static class ClientLog
     public static long LogFileMaxSize => _maxSizeOverride ?? MaxSize.Value;
     public static int LogFileMaxIndex => _maxIndexOverride ?? MaxIndex.Value;
 
-    // ---------------------------------------------------------------- 日志文件
-    // 默认路径，首次访问时读取环境变量并缓存。$HOME 为空时回落 USERPROFILE（Windows）。
+    // ---------------------------------------------------------------- Log file
+    // Default path, read from env var and cached on first access. Falls back to USERPROFILE (Windows) when $HOME is empty.
     private static readonly Lazy<string> DefaultFilePath =
         new(() => ResolveDefaultFilePath());
 
@@ -129,7 +130,7 @@ public static class ClientLog
         return Path.Combine(home, "logs", "rocketmqlogs", "rocketmq_csharp_client.log");
     }
 
-    // 宿主程序可直接指定日志文件（空串 = 关闭文件输出）。
+    // Host program can specify the log file directly (empty string = disable file output).
     public static void SetLogFile(string path)
     {
         lock (FileLock)
@@ -149,10 +150,10 @@ public static class ClientLog
         }
     }
 
-    // ---------------------------------------------------------------- 线程名
-    // 取值优先级：本线程设置的名称（thread_local，天然按线程持有）-> "main"（进程主线程）
-    //   -> OS 线程名（C# 无独立可移植 API，等价于托管线程名）-> tid 短哈希。
-    // 结果按线程缓存（[ThreadStatic]），线程改名请用 SetThreadName()。
+    // ---------------------------------------------------------------- Thread name
+    // Resolution priority: name set by this thread (thread_local, naturally thread-held) -> "main" (process main thread)
+    //   -> OS thread name (C# has no separate portable API, equivalent to managed thread name) -> tid short hash.
+    // Result is cached per thread ([ThreadStatic]); to rename a thread use SetThreadName().
     [ThreadStatic]
     private static string? _threadNameResolved;
 
@@ -170,7 +171,7 @@ public static class ClientLog
         }
         catch (InvalidOperationException)
         {
-            // 线程名只能赋值一次；缓存已设置，忽略框架侧的冲突。
+            // A thread name can only be assigned once; the cache is already set, so ignore the framework-side conflict.
         }
     }
 
@@ -197,9 +198,9 @@ public static class ClientLog
         return fallback;
     }
 
-    // ---------------------------------------------------------------- 公开入口
-    // 以下四个方法是日志输出的公开入口。[CallerFilePath]/
-    // [CallerLineNumber] 在**调用点**展开，捕获调用方的文件与行号。
+    // ---------------------------------------------------------------- Public entry points
+    // The four methods below are the public entry points for log output. [CallerFilePath]/
+    // [CallerLineNumber] are expanded at the **call site**, capturing the caller's file and line number.
     public static void Debug(string msg,
         [CallerFilePath] string file = "", [CallerLineNumber] int line = 0)
         => WriteLine(LogLevel.Debug, msg, file, line);
@@ -216,7 +217,7 @@ public static class ClientLog
         [CallerFilePath] string file = "", [CallerLineNumber] int line = 0)
         => WriteLine(LogLevel.Error, msg, file, line);
 
-    // ---------------------------------------------------------------- 内部实现
+    // ---------------------------------------------------------------- Internal implementation
     private static string LevelName(LogLevel level) => level switch
     {
         LogLevel.Debug => "DEBUG",
@@ -275,8 +276,8 @@ public static class ClientLog
             string? dir = Path.GetDirectoryName(Sink.Path);
             if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
-            // FileShare.ReadWrite：Windows 是强制锁，默认的 FileShare.Read 会让 tail 式并发读
-            // 直接抛 IOException（POSIX 下无强制锁所以只在 Windows 暴露）。
+            // FileShare.ReadWrite: on Windows this is a mandatory lock; the default FileShare.Read would make a tail-style
+            // concurrent reader throw IOException directly (no mandatory lock under POSIX, so only exposed on Windows).
             Sink.Writer = new StreamWriter(
                 new FileStream(Sink.Path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite),
                 Utf8NoBom);
@@ -294,7 +295,7 @@ public static class ClientLog
         }
         catch (Exception)
         {
-            // 静默降级为仅 stderr（不阻断客户端），但只提示一次。
+            // Silently degrade to stderr only (do not block the client), but only warn once.
             Sink.OpenFailed = true;
             try
             {
@@ -302,13 +303,13 @@ public static class ClientLog
             }
             catch (Exception)
             {
-                // 控制台也不可用时忽略
+                // Ignore when the console is also unavailable
             }
             return false;
         }
     }
 
-    // FixedWindow 滚动：<file>.N 最旧，先删；然后 .N-1 -> .N …… .1 -> .2；最后 base -> .1
+    // FixedWindow rotation: <file>.N is oldest, delete first; then .N-1 -> .N ... .1 -> .2; finally base -> .1
     private static void RollLocked(string basePath, int maxIndex)
     {
         string top = basePath + "." + maxIndex.ToString(CultureInfo.InvariantCulture);
@@ -333,7 +334,7 @@ public static class ClientLog
     {
         if ((int)level < (int)LogLevel) return;
 
-        DateTime now = DateTime.Now; // 本地时间
+        DateTime now = DateTime.Now; // local time
         string ts = now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
         string ms = now.Millisecond.ToString("D3", CultureInfo.InvariantCulture);
         string levelName = LevelName(level);
@@ -347,11 +348,11 @@ public static class ClientLog
             ts, ms, levelName, pid, threadName, fileName, line);
         string output = head + (msg ?? "") + "\n";
 
-        // stderr（每次 Write 自身原子，保证 tail -f 实时可见）。
+        // stderr (each Write is atomic on its own, guaranteeing tail -f visibility in real time).
         Console.Error.Write(output);
         Console.Error.Flush();
 
-        // 文件：在锁内保证行原子性，并按大小轮转。
+        // File: guarantee line atomicity inside the lock, and rotate by size.
         lock (FileLock)
         {
             if (!Sink.ExplicitPath) Sink.Path = DefaultFilePath.Value;
@@ -372,7 +373,7 @@ public static class ClientLog
                     }
                     catch (IOException)
                     {
-                        // 轮转失败则降级为直接写新文件，不阻断客户端（刻意忽略错误码）。
+                        // On rotation failure, degrade to writing a fresh file directly, without blocking the client (error code intentionally ignored).
                     }
                     if (!OpenSinkLocked()) return;
                 }
@@ -380,7 +381,7 @@ public static class ClientLog
 
             StreamWriter writer = Sink.Writer!;
             writer.Write(output);
-            writer.Flush(); // 保证 tail -f 实时可见
+            writer.Flush(); // guarantee tail -f visibility in real time
             Sink.Size += Utf8NoBom.GetByteCount(output);
         }
     }

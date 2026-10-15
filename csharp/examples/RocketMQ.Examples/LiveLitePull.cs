@@ -1,7 +1,7 @@
-// 轻量拉取消费者（DefaultLitePullConsumer）真机验证。
-// 用法：rmq lite-pull [namesrv]
+// Lite pull consumer (DefaultLitePullConsumer) live verification.
+// Usage: rmq lite-pull [namesrv]
 //
-// 场景 S1–S8：rebalance、subscribe/assign、poll、自动与手动提交、seek、位点恢复。
+// Scenarios S1-S8: rebalance, subscribe/assign, poll, auto and manual commit, seek, offset recovery.
 using System.Globalization;
 using System.Text;
 
@@ -73,7 +73,7 @@ public static class LiveLitePull
         return collected;
     }
 
-    /// <summary>按**时间**排空缓冲：策略只分到部分队列时收条数未知，不能按条数等。</summary>
+    /// <summary>Drains the buffer by **time**: when a strategy is assigned only part of the queues the message count is unknown, so we cannot wait by count.</summary>
     private static List<MessageExt> DrainFor(DefaultLitePullConsumer c, int durationMs)
     {
         var collected = new List<MessageExt>();
@@ -86,7 +86,7 @@ public static class LiveLitePull
         return collected;
     }
 
-    /// <summary>队列列表 → key 集合（"brokerName#queueId"），用于跨语言比分配结果。</summary>
+    /// <summary>Queue list -> key set ("brokerName#queueId"), for cross-language comparison of assignment results.</summary>
     private static HashSet<string> QueueKeys(IEnumerable<MessageQueue> queues)
     {
         var keys = new HashSet<string>(StringComparer.Ordinal);
@@ -101,7 +101,7 @@ public static class LiveLitePull
     private static string KeySetText(IEnumerable<string> keys) =>
         Join(keys.OrderBy(k => k, StringComparer.Ordinal));
 
-    /// <summary>消息列表 → body 集合；给定 onlyOnQueues 时只统计来自这些队列的消息。</summary>
+    /// <summary>Message list -> body set; when onlyOnQueues is given, counts only messages from those queues.</summary>
     private static HashSet<string> BodiesOf(IEnumerable<MessageExt> msgs,
         HashSet<string>? onlyOnQueues = null)
     {
@@ -119,7 +119,7 @@ public static class LiveLitePull
         return bodies;
     }
 
-    /// <summary>等两个实例把队列**分完**（分配收敛要两边各跑一轮心跳 + rebalance）。</summary>
+    /// <summary>Waits for both instances to **fully split** the queues (assignment convergence takes one round of heartbeat + rebalance on each side).</summary>
     private static (List<MessageQueue> A, List<MessageQueue> B) WaitSplitAssignment(
         DefaultLitePullConsumer a, DefaultLitePullConsumer b, int total, int timeoutMs = 25000)
     {
@@ -143,15 +143,15 @@ public static class LiveLitePull
         return (va, vb);
     }
 
-    /// <summary>给 lite 消费者装上策略 + 订阅（未 Start）。S7d~S7f 三个场景都用同一套配置面。</summary>
+    /// <summary>Installs strategy + subscription on the lite consumer (not started). Scenarios S7d-S7f all share this config surface.</summary>
     private static void SetupConsumer(DefaultLitePullConsumer c, string namesrv, string instanceName,
         IAllocateMessageQueueStrategy strategy)
     {
         c.SetNamesrvAddr(namesrv);
         c.SetInstanceName(instanceName);
         c.SetPollTimeoutMillis(1000);
-        // 存量消息在 S2 就发完了，新组默认 LAST 会跳过它们 → 收不到任何一条。
-        // 这里要验的是「策略真的驱动了收发」，所以从队首起消费。
+        // Stock messages were all produced back in S2; a new group defaults to LAST and would skip them -> nothing received.
+        // What we verify here is "the strategy really drives consumption", so consume from the queue head.
         c.SetConsumeFromWhere(ConsumeFromWhere.ConsumeFromFirstOffset);
         c.SetAllocateMessageQueueStrategy(strategy);
         c.Subscribe(Topic, "*");
@@ -207,9 +207,9 @@ public static class LiveLitePull
     }
 
     /// <summary>
-    /// 「全员同机房」resolver：真实集群只有一个 broker，把队列和客户端都记成同一个机房，
-    /// 于是 NEARBY 必定走「自己机房」那条分支、等价于内层策略。同时留调用记录 ——
-    /// 证明 rebalance 真的逐个问过队列和客户端的机房，而不是策略换了个名字却没参与分配。
+    /// An "everyone in the same machine room" resolver: the real cluster has only one broker, so queues and clients are all recorded in the same room,
+    /// hence NEARBY necessarily takes the "own room" branch, equivalent to the inner strategy. It also keeps call records -
+    /// proving rebalance really asked each queue and client for its room, instead of the strategy being renamed yet never participating in assignment.
     /// </summary>
     private sealed class OneRoom : IMachineRoomResolver
     {
@@ -256,7 +256,7 @@ public static class LiveLitePull
         }
     }
 
-    /// <summary>独立探针读 broker 上这一格的位点；QUERY_NOT_FOUND（还没提交过）记成 -1。</summary>
+    /// <summary>Independent probe reading the broker offset for this slot; QUERY_NOT_FOUND (never committed) is recorded as -1.</summary>
     private static long BrokerOffset(DefaultMQPullConsumer probe, MessageQueue mq) =>
         probe.FetchConsumeOffset(mq, out long off) ? off : -1;
 
@@ -264,7 +264,7 @@ public static class LiveLitePull
     {
         string offTopic = "LiteOffNet_" + Stamp;
         string offGroup = "LiteOffPGNet_" + Stamp;
-        const int NBig = 1200;   // > poll 单次上限 1024 ⇒ 一次交付必然留下没交出去的尾巴
+        const int NBig = 1200;   // > the poll single-shot cap of 1024 => one delivery is bound to leave an undelivered tail
 
         List<MessageQueue> queues = new();
         int landed = 0;
@@ -296,7 +296,7 @@ public static class LiveLitePull
                 if (queues.Count == 0) Thread.Sleep(500);
             }
 
-            Check("S8 准备 topic（1 条队列）", queues.Count == 1, "queues=" + queues.Count);
+            Check("S8 prepare topic (1 queue)", queues.Count == 1, "queues=" + queues.Count);
             if (queues.Count == 1)
             {
                 for (int from = 0; from < NBig; from += 300)
@@ -325,9 +325,9 @@ public static class LiveLitePull
             prep.Shutdown();
         }
 
-        Check("S8 生产 " + NBig + " 条成功", landed == NBig, "landed=" + landed);
+        Check("S8 produced " + NBig + " messages OK", landed == NBig, "landed=" + landed);
 
-        // 独立读 broker 位点的探针（自己的组、自己的连接，不碰被测实例的任何内存）
+        // Independent probe reading broker offsets (own group, own connection; never touches any memory of the instances under test)
         var probe = new DefaultMQPullConsumer(offGroup);
         probe.SetNamesrvAddr(namesrv);
         probe.Start();
@@ -338,69 +338,69 @@ public static class LiveLitePull
         o.SetInstanceName("liteoff");
         o.SetPollTimeoutMillis(1000);
         o.SetPullBatchSize(32);
-        o.SetAutoCommit(false);   // 提交时机全部由场景控制
+        o.SetAutoCommit(false);   // commit timing is fully controlled by the scenarios
         o.SetConsumeFromWhere(ConsumeFromWhere.ConsumeFromFirstOffset);
         o.Assign(new[] { q0 });
         o.Start();
 
-        // S8a 只拉不交付：拉取游标跑到 1200，已消费游标一格都不许动
+        // S8a pull only, no delivery: the pull cursor runs to 1200 while the consumed cursor must not move at all
         long pullDeadline = NowMs() + 30000;
         while (o.PullCursorOf(q0) < NBig && NowMs() < pullDeadline) Thread.Sleep(200);
-        Check("S8a 后台把 " + NBig + " 条全拉进本地缓冲（拉取游标=" + o.PullCursorOf(q0) + "）",
+        Check("S8a background pulled all " + NBig + " into the local buffer (pull cursor=" + o.PullCursorOf(q0) + ")",
             o.PullCursorOf(q0) == NBig, "pullCursor=" + o.PullCursorOf(q0));
-        Check("S8a 一条都没交付 ⇒ 已消费游标停在 -1", o.ConsumeCursorOf(q0) == -1,
+        Check("S8a nothing delivered => consumed cursor stays at -1", o.ConsumeCursorOf(q0) == -1,
             "consumeCursor=" + o.ConsumeCursorOf(q0));
-        // 这条是 #68 的核心：旧实现 Commit() 遍历的就是拉取游标，这里会把 1200 发出去，
-        // 调用方在此之前崩掉 ⇒ 1200 条一条都没消费过却再也不会投。
+        // This is the core of #68: the old Commit() iterated the pull cursor and would have committed 1200 here;
+        // if the caller crashed before that, 1200 messages were never consumed yet would never be delivered again.
         o.Commit();
         long afterEmptyCommit = BrokerOffset(probe, q0);
-        Check("S8a 没交付过 ⇒ broker 位点没被推走（旧实现在这里提交 " + NBig + "）",
+        Check("S8a nothing delivered => broker offset not pushed (old implementation would commit " + NBig + " here)",
             afterEmptyCommit != NBig, "brokerOffset=" + afterEmptyCommit);
 
-        // S8b poll 单次上限 1024 < 缓冲里的 1200 ⇒ 尾巴那 176 条不算已消费
+        // S8b poll single-shot cap 1024 < 1200 in buffer => the 176-message tail does not count as consumed
         var all = new List<MessageExt>();
         List<MessageExt> first = o.Poll(3000);
         all.AddRange(first);
-        Check("S8b 一次 poll 交出 1024 条（单次交付上限）", first.Count == 1024,
+        Check("S8b one poll delivered 1024 messages (single-delivery cap)", first.Count == 1024,
             "got=" + first.Count);
-        Check("S8b 已消费游标 = 交出去的那一格", o.ConsumeCursorOf(q0) == 1024,
+        Check("S8b consumed cursor = the delivered slot", o.ConsumeCursorOf(q0) == 1024,
             "consumeCursor=" + o.ConsumeCursorOf(q0));
-        Check("S8b 缓冲里还压着 " + (NBig - 1024) + " 条没交付",
+        Check("S8b buffer still holds " + (NBig - 1024) + " undelivered messages",
             o.PullCursorOf(q0) == NBig && o.ConsumeCursorOf(q0) < o.PullCursorOf(q0),
             "pull=" + o.PullCursorOf(q0));
         o.Commit();
         long brokerOffset = BrokerOffset(probe, q0);
-        Check("S8b 提交给 broker 的正是 1024（不是 " + NBig + "）", brokerOffset == 1024,
+        Check("S8b committed to the broker is exactly 1024 (not " + NBig + ")", brokerOffset == 1024,
             "brokerOffset=" + brokerOffset);
 
-        // S8c 指定一个更靠前的位点：只改提交落点，两条游标都不许动
+        // S8c specify an earlier offset: only the commit landing point changes; both cursors must not move
         long pullBefore = o.PullCursorOf(q0);
         long consumeBefore = o.ConsumeCursorOf(q0);
         o.Commit(new Dictionary<MessageQueue, long> { [q0] = 5 }, persist: true);
         long brokerRewound = BrokerOffset(probe, q0);
-        Check("S8c commit(map) 把 broker 位点改到调用方指定的 5", brokerRewound == 5,
+        Check("S8c commit(map) moved the broker offset to the caller-specified 5", brokerRewound == 5,
             "brokerOffset=" + brokerRewound);
-        Check("S8c 提交位点不改拉取游标", o.PullCursorOf(q0) == pullBefore,
+        Check("S8c committing does not change the pull cursor", o.PullCursorOf(q0) == pullBefore,
             "pullCursor=" + o.PullCursorOf(q0));
-        Check("S8c 提交位点不改已消费游标", o.ConsumeCursorOf(q0) == consumeBefore,
+        Check("S8c committing does not change the consumed cursor", o.ConsumeCursorOf(q0) == consumeBefore,
             "consumeCursor=" + o.ConsumeCursorOf(q0));
-        // 位点退回 5 之后，尾巴那 176 条照旧交付（缓冲与 broker 位点无关）
+        // After rewinding to 5, the 176-message tail is still delivered (the buffer is independent of the broker offset)
         List<MessageExt> tail = o.Poll(3000);
         all.AddRange(tail);
-        Check("S8c 退回 5 之后缓冲里剩下的 " + (NBig - 1024) + " 条照旧交付",
+        Check("S8c after rewinding to 5 the remaining " + (NBig - 1024) + " messages are delivered as usual",
             tail.Count == NBig - 1024, "got=" + tail.Count);
-        Check("S8 全程收全 " + NBig + " 条且一条不重不漏",
+        Check("S8 received all " + NBig + " messages with none duplicated or missing",
             BodiesOf(all).Count == NBig, "distinct=" + BodiesOf(all).Count);
 
-        // S8d 一个字节都不许上线：Committed() 看得见、broker 看不见
+        // S8d not a single byte may go out: visible to Committed(), invisible to the broker
         o.Commit(new Dictionary<MessageQueue, long> { [q0] = 777 }, persist: false);
-        Check("S8d persist=false：Committed() 读到内存表的 777", o.Committed(q0) == 777,
+        Check("S8d persist=false: Committed() reads 777 from the in-memory table", o.Committed(q0) == 777,
             "committed=" + o.Committed(q0));
         long brokerStill = BrokerOffset(probe, q0);
-        Check("S8d persist=false：broker 侧还是上一轮的 5", brokerStill == 5,
+        Check("S8d persist=false: broker side still has the previous round's 5", brokerStill == 5,
             "brokerOffset=" + brokerStill);
 
-        // S8e 新实例（同组）从 broker 上那一格续消费：内存表不跨实例
+        // S8e a new instance (same group) resumes from the broker slot: the in-memory table does not cross instances
         var o2 = new DefaultLitePullConsumer(offGroup);
         o2.SetNamesrvAddr(namesrv);
         o2.SetInstanceName("liteoff2");
@@ -411,61 +411,61 @@ public static class LiveLitePull
         o2.Assign(new[] { q0 });
         o2.Start();
         long start2 = o2.PullCursorOf(q0);
-        // 上界只要求「没吃到另一个实例内存里那格 777」：起点的拉取游标会被后台续拉往前推，
-        // 卡死等于 5 就成了赌时序，所以下界取 5、上界只要求没越过 777。
-        Check("S8e 新实例的起点是 broker 上的 5（不是另一个实例内存里的 777）",
+        // The lower bound only requires "did not consume the in-memory 777 of the other instance": the starting pull cursor gets pushed forward by background pulling,
+        // being stuck at exactly 5 would be timing-dependent, so the lower bound is 5 and the upper bound only requires not passing 777.
+        Check("S8e new instance starts from the broker's 5 (not the other instance's in-memory 777)",
             start2 >= 5 && start2 < 777, "pullCursor=" + start2);
         o2.Shutdown();
 
-        // S8f seek 同时改写两条游标：重放的段不能被旧位点跳过
-        // 先暂停这条队列：后台续拉会把拉取游标推过 60，不停下来这条断言就成了赌时序。
+        // S8f seek rewrites both cursors at once: the replayed segment must not be skipped by the old offset
+        // Pause this queue first: background pulling would push the pull cursor past 60; without pausing, this assertion becomes timing-dependent.
         o.Pause(new[] { q0 });
         Thread.Sleep(300);
         o.Seek(q0, 60);
-        Check("S8f seek 改拉取游标", o.PullCursorOf(q0) == 60, "pullCursor=" + o.PullCursorOf(q0));
-        Check("S8f seek 也改已消费游标", o.ConsumeCursorOf(q0) == 60,
+        Check("S8f seek changed the pull cursor", o.PullCursorOf(q0) == 60, "pullCursor=" + o.PullCursorOf(q0));
+        Check("S8f seek also changed the consumed cursor", o.ConsumeCursorOf(q0) == 60,
             "consumeCursor=" + o.ConsumeCursorOf(q0));
         o.Commit();
         long brokerSeeked = BrokerOffset(probe, q0);
-        Check("S8f seek 之后 commit 落到 60", brokerSeeked == 60, "brokerOffset=" + brokerSeeked);
+        Check("S8f after seek, commit lands at 60", brokerSeeked == 60, "brokerOffset=" + brokerSeeked);
         o.Resume(new[] { q0 });
 
         if (foreignPool.Count < 2)
         {
-            Check("S8g 需要主 topic 至少 2 条队列", false, "queues=" + foreignPool.Count);
+            Check("S8g requires the main topic to have at least 2 queues", false, "queues=" + foreignPool.Count);
             o.Shutdown();
             probe.Shutdown();
             return;
         }
 
-        MessageQueue foreign = foreignPool[1];   // 另一个 topic 的队列，offGroup 没碰过
-        o.Assign(new[] { q0, foreign });         // 只多一条游标，不影响上面的对列
+        MessageQueue foreign = foreignPool[1];   // a queue of another topic, untouched by offGroup
+        o.Assign(new[] { q0, foreign });         // only adds one more cursor; does not affect the reconciliation above
         o.Commit(new Dictionary<MessageQueue, long> { [q0] = 300 }, persist: false);
-        Check("S8g 未落盘的内存值先看得见", o.PendingCommitOf(q0) == 300,
+        Check("S8g un-persisted in-memory value is visible first", o.PendingCommitOf(q0) == 300,
             "pending=" + o.PendingCommitOf(q0));
         o.Commit(new List<MessageQueue>(), persist: true);
-        Check("S8g 空集合不清表也不发消息", o.PendingCommitOf(q0) == 300,
+        Check("S8g empty set neither clears the table nor sends anything", o.PendingCommitOf(q0) == 300,
             "pending=" + o.PendingCommitOf(q0));
         long brokerStill2 = BrokerOffset(probe, q0);
-        Check("S8g 空集合没动 broker", brokerStill2 == 60, "brokerOffset=" + brokerStill2);
-        // 点名一条 foreign 队列：它没有消费记录（-1 守卫拦下写表），
-        // 但 persistAll 扫表时把 q0 那份未落盘的值清了 —— 这才是「提交部分队列」的代价。
+        Check("S8g empty set left the broker untouched", brokerStill2 == 60, "brokerOffset=" + brokerStill2);
+        // Naming a foreign queue: it has no consumption record (the -1 guard blocks the table write),
+        // but persistAll's table scan clears the un-persisted q0 value - that is the real price of "committing a subset of queues".
         o.Commit(new[] { foreign }, persist: true);
-        Check("S8g 点名提交会把没点名的内存值清掉（清理未用到的 mq）",
+        Check("S8g named commit clears the in-memory value of queues not named (prune of unused mqs)",
             o.PendingCommitOf(q0) == -1, "pending=" + o.PendingCommitOf(q0));
-        Check("S8g 清掉之后回读到的是 broker 上那一格（并回填进表）",
+        Check("S8g after clearing, reads come back from the broker slot (and are back-filled into the table)",
             o.Committed(q0) == 60 && o.PendingCommitOf(q0) == 60,
             "committed=" + o.Committed(q0) + " pending=" + o.PendingCommitOf(q0));
         long brokerAfterPrune = BrokerOffset(probe, q0);
-        Check("S8g 清理只是丢内存值，没往 broker 写 300", brokerAfterPrune == 60,
+        Check("S8g pruning only drops the in-memory value; nothing was written to the broker as 300", brokerAfterPrune == 60,
             "brokerOffset=" + brokerAfterPrune);
-        // commit(Set) 取的是当下已消费游标，不是内存里那格
+        // commit(Set) takes the current consumed cursor, not the in-memory slot
         o.Commit(new Dictionary<MessageQueue, long> { [q0] = 300 }, persist: false);
         o.Commit(new[] { q0 }, persist: true);
         long brokerSet = BrokerOffset(probe, q0);
-        Check("S8g commit(Set) 提交的是已消费游标（60），不是内存里那格 300", brokerSet == 60,
+        Check("S8g commit(Set) commits the consumed cursor (60), not the in-memory 300", brokerSet == 60,
             "brokerOffset=" + brokerSet);
-        Check("S8g persistAll 之后内存表回到已消费游标",
+        Check("S8g after persistAll the in-memory table returns to the consumed cursor",
             o.PendingCommitOf(q0) == 60, "pending=" + o.PendingCommitOf(q0));
 
         o.Shutdown();
@@ -484,16 +484,16 @@ public static class LiveLitePull
         string group7 = "LitePG7Net_" + Stamp;
         string group8 = "LitePG8Net_" + Stamp;
         string group9 = "LitePG9Net_" + Stamp;
-        string group10 = "LitePG10Net_" + Stamp;   // S7d 一致性哈希环
-        string group11 = "LitePG11Net_" + Stamp;   // S7e 机房就近
-        string group12 = "LitePG12Net_" + Stamp;   // S7f 机房配错
+        string group10 = "LitePG10Net_" + Stamp;   // S7d consistent hash ring
+        string group11 = "LitePG11Net_" + Stamp;   // S7e machine-room nearby
+        string group12 = "LitePG12Net_" + Stamp;   // S7f machine-room misconfigured
 
         Console.WriteLine(new string('=', 70));
         Console.WriteLine("LitePullConsumer live (C#): namesrv=" + namesrv + " topic=" + Topic
             + " group=" + group1);
         Console.WriteLine(new string('=', 70));
 
-        // ---------------- 建 topic ----------------
+        // ---------------- create topics ----------------
         {
             var prep = new DefaultMQProducer("PG_PrepareLiteNet_" + Stamp);
             prep.NamesrvAddr = namesrv;
@@ -510,9 +510,9 @@ public static class LiveLitePull
             prep.Shutdown();
         }
 
-        // ---------------- S1 subscribe 模式：先起消费者再发消息 ----------------
+        // ---------------- S1 subscribe mode: start the consumer before producing ----------------
         Console.WriteLine();
-        Console.WriteLine("S1 subscribe 模式启动 + 等待 rebalance 分到位点");
+        Console.WriteLine("S1 subscribe mode started + waiting for rebalance to assign queues");
         var c1 = new DefaultLitePullConsumer(group1);
         c1.SetNamesrvAddr(namesrv);
         c1.SetPollTimeoutMillis(1000);
@@ -520,21 +520,21 @@ public static class LiveLitePull
         c1.Start();
 
         List<MessageQueue> assigned = WaitAssignment(c1);
-        Check("S1 rebalance 分配到 " + QueueNum.ToString(CultureInfo.InvariantCulture) + " 个队列",
+        Check("S1 rebalance assigned " + QueueNum.ToString(CultureInfo.InvariantCulture) + " queues",
             assigned.Count == QueueNum,
             "assigned=" + assigned.Count.ToString(CultureInfo.InvariantCulture));
         if (assigned.Count == 0)
         {
-            Console.WriteLine("!! 未分配到队列，后续跳过");
+            Console.WriteLine("!! no queue assigned; skipping the rest");
             c1.Shutdown();
             Console.WriteLine();
             Console.WriteLine("LitePullConsumer: PASS=" + _pass + " FAIL=" + _fail);
             return 1;
         }
 
-        // ---------------- S2 生产 + poll 收全 ----------------
+        // ---------------- S2 produce + poll receive-all ----------------
         Console.WriteLine();
-        Console.WriteLine("S2 生产 " + NMsg.ToString(CultureInfo.InvariantCulture) + " 条（交替 TagA/TagB）");
+        Console.WriteLine("S2 producing " + NMsg.ToString(CultureInfo.InvariantCulture) + " messages (alternating TagA/TagB)");
         var sent = new HashSet<string>(StringComparer.Ordinal);
         {
             var prod = new DefaultMQProducer("PG_LiteLiveNet_" + Stamp);
@@ -563,7 +563,7 @@ public static class LiveLitePull
                 }
             }
 
-            Check("S2 生产 " + NMsg.ToString(CultureInfo.InvariantCulture) + " 条成功", sentOk == NMsg,
+            Check("S2 produced " + NMsg.ToString(CultureInfo.InvariantCulture) + " messages OK", sentOk == NMsg,
                 "sentOk=" + sentOk.ToString(CultureInfo.InvariantCulture));
             prod.Shutdown();
         }
@@ -578,22 +578,22 @@ public static class LiveLitePull
 
             var missing = new HashSet<string>(sent.Except(gotSet));
             var extra = new HashSet<string>(gotSet.Except(sent));
-            Check("S2 subscribe+poll 收全 "
-                + NMsg.ToString(CultureInfo.InvariantCulture) + " 条且内容一致", gotSet.SetEquals(sent),
+            Check("S2 subscribe+poll received all "
+                + NMsg.ToString(CultureInfo.InvariantCulture) + " messages with matching content", gotSet.SetEquals(sent),
                 "got=" + gotSet.Count.ToString(CultureInfo.InvariantCulture)
                 + " missing=[" + Join(missing) + "] extra=[" + Join(extra) + "]");
         }
 
-        // ---------------- S3 auto-commit 位点 ----------------
+        // ---------------- S3 auto-commit offsets ----------------
         Console.WriteLine();
-        Console.WriteLine("S3 auto-commit 位点");
+        Console.WriteLine("S3 auto-commit offsets");
         {
             bool allPositive = false;
             var detail = new StringBuilder();
             long spinDeadline = NowMs() + 20000;
             while (true)
             {
-                c1.Poll(500);   // 空转也算一次 poll
+                c1.Poll(500);   // an idle cycle still counts as a poll
                 allPositive = true;
                 detail.Clear();
                 foreach (MessageQueue mq in assigned)
@@ -612,13 +612,13 @@ public static class LiveLitePull
                 }
             }
 
-            Check("S3 继续 poll 过自动提交周期后位点自己落盘（没人调 commit）", allPositive,
+            Check("S3 after another auto-commit cycle the offsets persist on their own (nobody called commit)", allPositive,
                 "committed=" + detail);
         }
 
-        // ---------------- S4 assign 模式：assign 全部队列 + seek 到队首重新收全 ----------------
+        // ---------------- S4 assign mode: assign all queues + seek to queue head and receive all again ----------------
         Console.WriteLine();
-        Console.WriteLine("S4 assign 模式：assign 全部队列 + seek 到队首重新收全");
+        Console.WriteLine("S4 assign mode: assign all queues + seek to queue head and receive all again");
         {
             var c2 = new DefaultLitePullConsumer(group2);
             c2.SetNamesrvAddr(namesrv);
@@ -639,15 +639,15 @@ public static class LiveLitePull
                 got2Set.Add(BodyOf(m));
             }
 
-            Check("S4 assign+seek+poll 重新收全 "
-                + NMsg.ToString(CultureInfo.InvariantCulture) + " 条", got2Set.SetEquals(sent),
+            Check("S4 assign+seek+poll received all "
+                + NMsg.ToString(CultureInfo.InvariantCulture) + " messages", got2Set.SetEquals(sent),
                 "got=" + got2Set.Count.ToString(CultureInfo.InvariantCulture));
             c2.Shutdown();
         }
 
-        // ---------------- S5 订阅级 tag 过滤 ----------------
+        // ---------------- S5 subscription-level tag filtering ----------------
         Console.WriteLine();
-        Console.WriteLine("S5 订阅 TagA：只收 TagA 的 6 条");
+        Console.WriteLine("S5 subscribing to TagA: receive only the 6 TagA messages");
         {
             var c3 = new DefaultLitePullConsumer(group3);
             c3.SetNamesrvAddr(namesrv);
@@ -663,17 +663,17 @@ public static class LiveLitePull
                 got3Set.Add(BodyOf(m));
             }
 
-            // 偶数下标（lite-00/02/...）才是 TagA
+            // Even indexes (lite-00/02/...) are the TagA ones
             bool onlyA = got3Set.Count == 6
                 && got3Set.All(b => (b[^1] - '0') % 2 == 0);
-            Check("S5 仅收 TagA 且恰好 6 条", onlyA,
+            Check("S5 received only TagA and exactly 6 messages", onlyA,
                 "got=" + got3Set.Count.ToString(CultureInfo.InvariantCulture));
             c3.Shutdown();
         }
 
-        // ---------------- S6 CONSUME_FROM_TIMESTAMP：14 位本地墙钟 ----------------
+        // ---------------- S6 CONSUME_FROM_TIMESTAMP: 14-digit local wall clock ----------------
         Console.WriteLine();
-        Console.WriteLine("S6 CONSUME_FROM_TIMESTAMP：墙钟起点收全 + 时间戳→位点映射");
+        Console.WriteLine("S6 CONSUME_FROM_TIMESTAMP: wall-clock start + timestamp-to-offset mapping");
         long wall = NowMs();
         {
             var c4 = new DefaultLitePullConsumer(group4);
@@ -691,8 +691,8 @@ public static class LiveLitePull
                 got4Set.Add(BodyOf(m));
             }
 
-            Check("S6a 起点=" + c4.ConsumeTimestamp + " 早于全部消息 → 收全 "
-                + NMsg.ToString(CultureInfo.InvariantCulture) + " 条", got4Set.SetEquals(sent),
+            Check("S6a start=" + c4.ConsumeTimestamp + " earlier than all messages -> received all "
+                + NMsg.ToString(CultureInfo.InvariantCulture) + " messages", got4Set.SetEquals(sent),
                 "got=" + got4Set.Count.ToString(CultureInfo.InvariantCulture));
             c4.Shutdown();
         }
@@ -708,15 +708,15 @@ public static class LiveLitePull
             List<MessageQueue> q5 = WaitAssignment(c5);
             long sumPast = q5.Sum(mq => c5.OffsetForTimestamp(mq, wall - 30 * 60 * 1000));
             long sumFuture = q5.Sum(mq => c5.OffsetForTimestamp(mq, wall + 10 * 60 * 1000));
-            Check("S6b 30 分钟前 → 各队列队首", sumPast == 0, "sumOffset=" + sumPast);
-            Check("S6b 10 分钟后 → 越过全部 " + NMsg.ToString(CultureInfo.InvariantCulture) + " 条",
+            Check("S6b 30 minutes ago -> queue head of every queue", sumPast == 0, "sumOffset=" + sumPast);
+            Check("S6b 10 minutes later -> past all " + NMsg.ToString(CultureInfo.InvariantCulture) + " messages",
                 sumFuture == NMsg, "sumOffset=" + sumFuture);
             c5.Shutdown();
         }
 
-        // ---------------- S7 可插拔队列分配策略 ----------------
+        // ---------------- S7 pluggable queue assignment strategies ----------------
         Console.WriteLine();
-        Console.WriteLine("S7 可插拔队列分配策略");
+        Console.WriteLine("S7 pluggable queue assignment strategies");
         {
             List<MessageQueue> allQueues = c1.FetchMessageQueues(Topic);
             allQueues.Sort();
@@ -724,7 +724,7 @@ public static class LiveLitePull
 
             var probe = new DefaultLitePullConsumer(group6);
             probe.SetNamesrvAddr(namesrv);
-            Check("S7a 默认策略名 = AVG",
+            Check("S7a default strategy name = AVG",
                 probe.AllocateMessageQueueStrategy?.GetName() == "AVG",
                 "name=" + (probe.AllocateMessageQueueStrategy?.GetName() ?? "<null>"));
             probe.SetAllocateMessageQueueStrategy(null);
@@ -732,21 +732,21 @@ public static class LiveLitePull
             try
             {
                 probe.Start();
-                Check("S7a 策略为 null 时 Start() 报协议约定的原文案", false, "没有抛异常");
+                Check("S7a null strategy: Start() reports the protocol-exact message", false, "no exception thrown");
                 probe.Shutdown();
             }
             catch (MQClientException e)
             {
-                Check("S7a 策略为 null 时 Start() 报协议约定的原文案",
+                Check("S7a null strategy: Start() reports the protocol-exact message",
                     e.Message.Contains("allocateMessageQueueStrategy is null", StringComparison.Ordinal),
                     e.Message);
             }
 
-            // S7b AVG_BY_CIRCLE：同组两实例交叉切分，不重不漏
+            // S7b AVG_BY_CIRCLE: two instances of the same group interleave the split, no overlap and no gap
             var circle = new AllocateMessageQueueAveragelyByCircle();
             var ca = new DefaultLitePullConsumer(group7);
             var cb = new DefaultLitePullConsumer(group7);
-            // 同进程两个实例必须有不同的 instanceName（clientId 前缀），否则 broker 侧只看到一个消费者
+            // Two instances in the same process must have different instanceNames (clientId prefix); otherwise the broker side sees only one consumer
             ca.SetInstanceName("s7ca");
             cb.SetInstanceName("s7cb");
             foreach (DefaultLitePullConsumer c in new[] { ca, cb })
@@ -757,7 +757,7 @@ public static class LiveLitePull
                 c.Subscribe(Topic, "*");
             }
 
-            Check("S7b 替换后策略名 = AVG_BY_CIRCLE",
+            Check("S7b after replacement strategy name = AVG_BY_CIRCLE",
                 ca.AllocateMessageQueueStrategy?.GetName() == "AVG_BY_CIRCLE");
             ca.Start();
             cb.Start();
@@ -765,13 +765,13 @@ public static class LiveLitePull
             HashSet<string> ka = QueueKeys(qa), kb = QueueKeys(qb);
             var overlap = new HashSet<string>(ka.Intersect(kb, StringComparer.Ordinal));
             var both = new HashSet<string>(ka.Union(kb, StringComparer.Ordinal));
-            Check("S7b 两实例分配无交集", overlap.Count == 0, "overlap=[" + KeySetText(overlap) + "]");
-            Check("S7b 并集覆盖全部 " + totalQueues.ToString(CultureInfo.InvariantCulture) + " 个队列",
+            Check("S7b the two instances' assignments do not overlap", overlap.Count == 0, "overlap=[" + KeySetText(overlap) + "]");
+            Check("S7b union covers all " + totalQueues.ToString(CultureInfo.InvariantCulture) + " queues",
                 both.SetEquals(QueueKeys(allQueues)),
                 "a=" + ka.Count.ToString(CultureInfo.InvariantCulture)
                 + " b=" + kb.Count.ToString(CultureInfo.InvariantCulture));
-            // 环形分配的签名：拿到的是「按下标取模」的交叉队列而非连续段
-            // （4 队列 / 2 实例 → 各 2 条且下标步长为 2；AVG 会给连续两段）。
+            // Signature of ring assignment: what you get is the interleaved queues of "index modulo", not contiguous segments
+            // (4 queues / 2 instances -> 2 each with index step 2; AVG would give two contiguous segments).
             var posA = new List<int>();
             for (int i = 0; i < allQueues.Count; ++i)
             {
@@ -791,13 +791,13 @@ public static class LiveLitePull
                 }
             }
 
-            Check("S7b 分配形状是交叉（步长 2），不是 AVG 的连续段",
+            Check("S7b assignment shape is interleaved (step 2), not AVG's contiguous segments",
                 totalQueues != 4 || circleShape,
                 "posA=[" + Join(posA.Select(x => x.ToString(CultureInfo.InvariantCulture))) + "]");
             ca.Shutdown();
             cb.Shutdown();
 
-            // S7c CONFIG：只分配配置进去的一半队列，Poll 到的消息也只能来自这些队列
+            // S7c CONFIG: only the configured half of queues is assigned; polled messages can only come from those queues
             List<MessageQueue> halfA = allQueues.GetRange(0, totalQueues / 2);
             List<MessageQueue> halfB = allQueues.GetRange(totalQueues / 2, totalQueues - totalQueues / 2);
             var cfgA = new AllocateMessageQueueByConfig(halfA);
@@ -818,16 +818,16 @@ public static class LiveLitePull
             c7.Start();
             List<MessageQueue> a6 = WaitAssignment(c6);
             List<MessageQueue> a7 = WaitAssignment(c7);
-            Check("S7c CONFIG 只给配置进去的队列（无视 mqAll/cidAll）",
+            Check("S7c CONFIG assigns only the configured queues (ignoring mqAll/cidAll)",
                 QueueKeys(a6).SetEquals(QueueKeys(halfA)) && QueueKeys(a7).SetEquals(QueueKeys(halfB)),
                 "a=[" + KeySetText(QueueKeys(a6)) + "] b=[" + KeySetText(QueueKeys(a7)) + "]");
-            // 两个 CONFIG 消费者各看一半：并集恰好是全部 12 条、交集为空 → 策略真的驱动了收发
+            // Two CONFIG consumers each see one half: union is exactly all 12 and intersection is empty -> the strategy really drives consumption
             List<MessageExt> g6 = DrainFor(c6, 8000);
             List<MessageExt> g7 = DrainFor(c7, 8000);
             HashSet<string> cfgKeysA = QueueKeys(halfA), cfgKeysB = QueueKeys(halfB);
             HashSet<string> b6 = BodiesOf(g6), b7 = BodiesOf(g7);
             HashSet<string> onCfgA = BodiesOf(g6, cfgKeysA), onCfgB = BodiesOf(g7, cfgKeysB);
-            Check("S7c CONFIG 消费者只收到自己配置队列里的消息",
+            Check("S7c CONFIG consumer received only messages from its configured queues",
                 b6.SetEquals(onCfgA) && b7.SetEquals(onCfgB),
                 "a=" + b6.Count.ToString(CultureInfo.InvariantCulture)
                 + " aOnCfg=" + onCfgA.Count.ToString(CultureInfo.InvariantCulture)
@@ -835,8 +835,8 @@ public static class LiveLitePull
                 + " bOnCfg=" + onCfgB.Count.ToString(CultureInfo.InvariantCulture));
             var unionBodies = new HashSet<string>(b6.Union(b7, StringComparer.Ordinal));
             var interBodies = new HashSet<string>(b6.Intersect(b7, StringComparer.Ordinal));
-            Check("S7c 两半合起来恰好覆盖全部 "
-                + NMsg.ToString(CultureInfo.InvariantCulture) + " 条且互不重叠",
+            Check("S7c the two halves together cover exactly all "
+                + NMsg.ToString(CultureInfo.InvariantCulture) + " messages without overlap",
                 unionBodies.SetEquals(sent) && interBodies.Count == 0,
                 "union=" + unionBodies.Count.ToString(CultureInfo.InvariantCulture)
                 + " inter=" + interBodies.Count.ToString(CultureInfo.InvariantCulture));
@@ -849,31 +849,31 @@ public static class LiveLitePull
                 var d2 = new DefaultLitePullConsumer(group10);
                 SetupConsumer(d1, namesrv, "s7da", ch);
                 SetupConsumer(d2, namesrv, "s7db", ch);
-                Check("S7d 替换后策略名 = CONSISTENT_HASH",
+                Check("S7d after replacement strategy name = CONSISTENT_HASH",
                     d1.AllocateMessageQueueStrategy?.GetName() == "CONSISTENT_HASH",
                     d1.AllocateMessageQueueStrategy?.GetName() ?? "<null>");
                 d1.Start();
                 d2.Start();
                 (bool converged, string detail) = WaitUntilPredictionConverged(
                     group10, allQueues, new[] { d1, d2 }, new[] { d1, d2 }, new IAllocateMessageQueueStrategy[] { ch, ch });
-                Check("S7d 线上分配收敛到一致性环的离线预测", converged, detail);
+                Check("S7d online assignment converged to the offline prediction of the consistent hash ring", converged, detail);
                 HashSet<string> k1 = QueueKeys(d1.Assignment()), k2 = QueueKeys(d2.Assignment());
-                Check("S7d 两实例分配无交集", !k1.Overlaps(k2),
+                Check("S7d the two instances' assignments do not overlap", !k1.Overlaps(k2),
                     "overlap=[" + KeySetText(k1.Intersect(k2, StringComparer.Ordinal)) + "]");
-                Check("S7d 并集覆盖全部 " + totalQueues.ToString(CultureInfo.InvariantCulture) + " 个队列",
+                Check("S7d union covers all " + totalQueues.ToString(CultureInfo.InvariantCulture) + " queues",
                     new HashSet<string>(k1.Union(k2, StringComparer.Ordinal)).SetEquals(QueueKeys(allQueues)),
                     "a=" + k1.Count.ToString(CultureInfo.InvariantCulture)
                     + " b=" + k2.Count.ToString(CultureInfo.InvariantCulture));
                 HashSet<string> joined = BodiesOf(DrainFor(d1, 8000));
                 joined.UnionWith(BodiesOf(DrainFor(d2, 8000)));
-                Check("S7d 两实例合起来收到全部 "
-                    + NMsg.ToString(CultureInfo.InvariantCulture) + " 条（环真的在驱动收发）",
+                Check("S7d the two instances together received all "
+                    + NMsg.ToString(CultureInfo.InvariantCulture) + " messages (the ring really drives consumption)",
                     joined.SetEquals(sent), "union=" + joined.Count.ToString(CultureInfo.InvariantCulture));
                 d1.Shutdown();
                 d2.Shutdown();
             }
 
-            // S7e MACHINE_ROOM_NEARBY：真实集群只有一个机房 ⇒ 装饰器必须原样透传内层策略。
+            // S7e MACHINE_ROOM_NEARBY: the real cluster has a single room => the decorator must pass the inner strategy through unchanged.
             {
                 var inner = new AllocateMessageQueueConsistentHash();
                 var resolver = new OneRoom();
@@ -882,7 +882,7 @@ public static class LiveLitePull
                 var e2 = new DefaultLitePullConsumer(group11);
                 SetupConsumer(e1, namesrv, "s7ea", nearby);
                 SetupConsumer(e2, namesrv, "s7eb", nearby);
-                Check("S7e 装饰后的策略名 = MACHINE_ROOM_NEARBY-CONSISTENT_HASH",
+                Check("S7e decorated strategy name = MACHINE_ROOM_NEARBY-CONSISTENT_HASH",
                     e1.AllocateMessageQueueStrategy?.GetName() == "MACHINE_ROOM_NEARBY-CONSISTENT_HASH",
                     e1.AllocateMessageQueueStrategy?.GetName() ?? "<null>");
                 e1.Start();
@@ -890,23 +890,23 @@ public static class LiveLitePull
                 (bool converged, string detail) = WaitUntilPredictionConverged(
                     group11, allQueues, new[] { e1, e2 }, new[] { e1, e2 },
                     new IAllocateMessageQueueStrategy[] { inner, inner });
-                Check("S7e NEARBY 的线上分配 == 内层环的离线预测", converged, detail);
+                Check("S7e NEARBY's online assignment == the inner ring's offline prediction", converged, detail);
                 HashSet<string> k1 = QueueKeys(e1.Assignment()), k2 = QueueKeys(e2.Assignment());
-                Check("S7e NEARBY 两实例分配无交集且不漏",
+                Check("S7e NEARBY's two instances do not overlap and leave no gap",
                     !k1.Overlaps(k2)
                     && new HashSet<string>(k1.Union(k2, StringComparer.Ordinal)).SetEquals(QueueKeys(allQueues)),
                     "a=" + k1.Count.ToString(CultureInfo.InvariantCulture)
                     + " b=" + k2.Count.ToString(CultureInfo.InvariantCulture));
-                // resolver 真的被 rebalance 调用过，且看到的是真实 brokerName + 两个真实 clientId。
+                // The resolver really was called by rebalance, and saw the real brokerName + two real clientIds.
                 List<string> brokerCalls = resolver.BrokerCalls();
                 var seenBrokers = new HashSet<string>(brokerCalls, StringComparer.Ordinal);
                 var realBrokers = new HashSet<string>(allQueues.Select(mq => mq.BrokerName), StringComparer.Ordinal);
-                Check("S7e resolver 被逐个队列问过机房（"
-                    + brokerCalls.Count.ToString(CultureInfo.InvariantCulture) + " 次）",
+                Check("S7e resolver was asked per queue for machine rooms ("
+                    + brokerCalls.Count.ToString(CultureInfo.InvariantCulture) + " times)",
                     brokerCalls.Count > 0 && seenBrokers.SetEquals(realBrokers),
                     "brokers=[" + KeySetText(seenBrokers) + "]");
                 HashSet<string> calls = new(resolver.ConsumerCalls(), StringComparer.Ordinal);
-                Check("S7e resolver 被问过两个真实 clientId",
+                Check("S7e resolver was asked about both real clientIds",
                     calls.Contains(e1.ClientId) && calls.Contains(e2.ClientId),
                     "calls=[" + KeySetText(calls) + "]");
                 e1.Shutdown();
@@ -915,7 +915,7 @@ public static class LiveLitePull
 
             {
                 var room = new AllocateMessageQueueByMachineRoom(new[] { OneRoom.Room });
-                Check("S7f 策略名 = MACHINE_ROOM 且白名单能读回",
+                Check("S7f strategy name = MACHINE_ROOM and the whitelist reads back",
                     room.GetName() == "MACHINE_ROOM" && room.GetConsumeridcs().Contains(OneRoom.Room),
                     "idcs=[" + KeySetText(room.GetConsumeridcs()) + "]");
                 var avg = new AllocateMessageQueueAveragely();
@@ -926,16 +926,16 @@ public static class LiveLitePull
                 f1.Start();
                 f2.Start();
                 List<MessageQueue> ctrl = WaitAssignment(f2);
-                Check("S7f 同组对照组（AVG）正常分到队列", ctrl.Count > 0,
+                Check("S7f same-group control group (AVG) assigns queues normally", ctrl.Count > 0,
                     "ctrl=[" + KeySetText(QueueKeys(ctrl)) + "]");
-                Check("S7f 机房不匹配真实 brokerName → 一条都不分（不报错也不误吃）",
+                Check("S7f machine room does not match the real brokerName -> assigns nothing (no error, no mistaken consumption)",
                     f1.Assignment().Count == 0, "assignment=[" + KeySetText(QueueKeys(f1.Assignment())) + "]");
                 (bool converged, string detail) = WaitUntilPredictionConverged(
                     group12, allQueues, new[] { f1, f2 }, new[] { f1, f2 },
                     new IAllocateMessageQueueStrategy[] { room, avg });
-                Check("S7f 两边线上分配各自收敛到自己策略的离线预测", converged, detail);
+                Check("S7f both sides' online assignments converged to their own strategy's offline prediction", converged, detail);
                 List<MessageExt> starved = DrainFor(f1, 5000);
-                Check("S7f 被饿死的一方 poll 不到消息也不抛错", starved.Count == 0,
+                Check("S7f the starved side polls no messages and throws no error", starved.Count == 0,
                     "got=" + starved.Count.ToString(CultureInfo.InvariantCulture));
                 f1.Shutdown();
                 f2.Shutdown();
@@ -944,11 +944,11 @@ public static class LiveLitePull
 
         c1.Shutdown();
 
-        // ---------------- S8 三张位点表 ----------------
-        // 单测锁得住表形状，锁不住「提交错一格在真机是静默丢消息」：所以每个数字都在 broker
-        // 上数一遍。用一条 1 队列的新 topic，1200 条全落在同一段连续位点上。
+        // ---------------- S8 three offset tables ----------------
+        // Unit tests can lock the table shape but not "committing to the wrong slot silently loses messages in production": so every number is
+        // counted on the broker. Use a new 1-queue topic so all 1200 messages land on one contiguous offset segment.
         Console.WriteLine();
-        Console.WriteLine("S8 三张位点表：拉取游标 / 已消费游标 / 提交落点");
+        Console.WriteLine("S8 three offset tables: pull cursor / consumed cursor / commit landing");
         ThreeOffsetTable(namesrv, assigned);
 
         Console.WriteLine();

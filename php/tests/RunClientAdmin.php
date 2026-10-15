@@ -3,17 +3,19 @@
 declare(strict_types=1);
 
 /**
- * Client Admin（管理端）纯 PHP assert 风格自测（不依赖 phpunit，不连真机）。
+ * Client Admin pure-PHP assert-style self-test (no phpunit, no real cluster).
  *
- * 覆盖：Subscription 协议模型、DefaultMQAdminExt 全量方法面（请求头字段 / 请求码 /
- * body 编码形态 / 分页 / KV 广播 / offset 重置 / 异常路径）。
+ * Covers: the Subscription protocol model, the full DefaultMQAdminExt method surface
+ * (request header fields / request codes / body encoding shape / pagination / KV
+ * broadcast / offset reset / exception paths).
  *
- * 网络层替身：FakeAdmin 覆写 DefaultMQAdminExt::invokeSyncOn（同步传输入口的等价点），
- * 按脚本应答并记录全部请求；FakeClient 子类化
- * MQClientInstance，覆写委托给实例的管理类方法并记录调用。
+ * Network-layer doubles: FakeAdmin overrides DefaultMQAdminExt::invokeSyncOn (the
+ * equivalent point of the sync transport entry) answering per script and recording all
+ * requests; FakeClient subclasses MQClientInstance, overriding the admin-oriented methods
+ * delegated to the instance and recording calls.
  *
- * 运行：C:/Users/zhaoh/.workbuddy/binaries/php/versions/8.3/php.exe tests/RunClientAdmin.php
- * 全部通过输出 "ALL TESTS PASSED (N checks)"，任一失败列出明细并以非零码退出。
+ * Run: C:/Users/zhaoh/.workbuddy/binaries/php/versions/8.3/php.exe tests/RunClientAdmin.php
+ * On success prints "ALL TESTS PASSED (N checks)"; any failure lists details and exits non-zero.
  */
 
 require_once __DIR__ . '/../bootstrap.php';
@@ -55,9 +57,9 @@ use RocketMQ\Remoting\Protocol\TopicList;
 use RocketMQ\Remoting\Protocol\TopicRouteData;
 use RocketMQ\Remoting\Protocol\TopicStatsTable;
 
-// ==================================================================== 测试替身
+// ==================================================================== test doubles
 
-/** 记录请求、按脚本应答的 Admin（拦截全部同步 RPC）。 */
+/** Admin that records requests and answers per script (intercepts all sync RPCs). */
 final class FakeAdmin extends DefaultMQAdminExt
 {
     /** @var list<array{addr: string, cmd: RemotingCommand}> */
@@ -66,7 +68,7 @@ final class FakeAdmin extends DefaultMQAdminExt
     /** @var callable(RemotingCommand, string): ?RemotingCommand|null */
     public $handler = null;
 
-    /** @var array<string, \Throwable> 命中地址时直接抛（模拟连接失败） */
+    /** @var array<string, \Throwable> thrown directly when the address is hit (simulates connect failure) */
     public array $failAddrs = [];
 
     protected function invokeSyncOn(MQClientInstance $client, string $addr, RemotingCommand $request, ?int $timeoutMillis): RemotingCommand
@@ -81,7 +83,7 @@ final class FakeAdmin extends DefaultMQAdminExt
     }
 }
 
-/** 记录委托调用的 MQClientInstance 替身（构造离线、不发真实网络请求）。 */
+/** MQClientInstance double that records delegated calls (offline constructor, no real network requests). */
 final class FakeClient extends MQClientInstance
 {
     public ?ClusterInfo $clusterInfo = null;
@@ -307,7 +309,7 @@ final class RunClientAdmin
         return 1;
     }
 
-    // ================================================================ 造数助手
+    // ================================================================ data helpers
 
     private FakeClient $client;
 
@@ -328,7 +330,7 @@ final class RunClientAdmin
         return $trd;
     }
 
-    /** %RETRY% 组主题的路由（consumed() 的扇出用），指向 broker-a。 */
+    /** Route for the %RETRY% group topic (used by the consumed() fan-out), pointing to broker-a. */
     private function retryRoute(): TopicRouteData
     {
         $trd = new TopicRouteData();
@@ -396,24 +398,24 @@ final class RunClientAdmin
         return $cs->encode();
     }
 
-    // ================================================================ Subscription 模型
+    // ================================================================ Subscription model
 
     private function testSubscriptionModels(): void
     {
         // ---- GroupRetryPolicy
         $p = new GroupRetryPolicy();
-        $this->checkSame(GroupRetryPolicyType::CUSTOMIZED, $p->type, 'GroupRetryPolicy 默认 type=CUSTOMIZED');
-        $this->checkSame(null, $p->exponentialRetryPolicy, 'GroupRetryPolicy 默认 exponential=null');
-        $this->checkSame(['type' => 'CUSTOMIZED'], $p->toDict(), 'GroupRetryPolicy.toDict 只输出 type');
+        $this->checkSame(GroupRetryPolicyType::CUSTOMIZED, $p->type, 'GroupRetryPolicy default type=CUSTOMIZED');
+        $this->checkSame(null, $p->exponentialRetryPolicy, 'GroupRetryPolicy default exponential=null');
+        $this->checkSame(['type' => 'CUSTOMIZED'], $p->toDict(), 'GroupRetryPolicy.toDict emits type only');
         $p2 = new GroupRetryPolicy(GroupRetryPolicyType::EXPONENTIAL, ['initialInterval' => 100], ['retryTimes' => 3]);
         $d2 = $p2->toDict();
-        $this->checkSame('EXPONENTIAL', $d2['type'], 'GroupRetryPolicy 指定 type');
-        $this->checkSame(['initialInterval' => 100], $d2['exponentialRetryPolicy'], 'GroupRetryPolicy 输出 exponentialRetryPolicy');
-        $this->checkSame(['retryTimes' => 3], $d2['customizedRetryPolicy'], 'GroupRetryPolicy 输出 customizedRetryPolicy');
+        $this->checkSame('EXPONENTIAL', $d2['type'], 'GroupRetryPolicy explicit type');
+        $this->checkSame(['initialInterval' => 100], $d2['exponentialRetryPolicy'], 'GroupRetryPolicy emits exponentialRetryPolicy');
+        $this->checkSame(['retryTimes' => 3], $d2['customizedRetryPolicy'], 'GroupRetryPolicy emits customizedRetryPolicy');
         $rt = GroupRetryPolicy::fromDict(['type' => 'EXPONENTIAL']);
         $this->checkSame('EXPONENTIAL', $rt->type, 'GroupRetryPolicy.fromDict type');
-        $this->checkSame(null, $rt->customizedRetryPolicy, 'GroupRetryPolicy.fromDict 缺省子策略 null');
-        $this->checkSame('CUSTOMIZED', GroupRetryPolicy::fromDict(null)->type, 'GroupRetryPolicy.fromDict(null) 兜底 CUSTOMIZED');
+        $this->checkSame(null, $rt->customizedRetryPolicy, 'GroupRetryPolicy.fromDict missing sub-policy → null');
+        $this->checkSame('CUSTOMIZED', GroupRetryPolicy::fromDict(null)->type, 'GroupRetryPolicy.fromDict(null) falls back to CUSTOMIZED');
 
         // ---- SimpleSubscriptionData
         $s = new SimpleSubscriptionData('T1', 'SQL92', 'a>1', 9);
@@ -423,12 +425,12 @@ final class RunClientAdmin
             'SimpleSubscriptionData.toDict'
         );
         $sd = SimpleSubscriptionData::fromDict([]);
-        $this->checkSame('', $sd->topic, 'SimpleSubscriptionData 默认 topic 空串');
-        $this->checkSame('TAG', $sd->expressionType, 'SimpleSubscriptionData 默认 expressionType=TAG');
-        $this->checkSame('*', $sd->expression, 'SimpleSubscriptionData 默认 expression=*');
-        $this->checkSame(0, $sd->version, 'SimpleSubscriptionData 默认 version=0');
+        $this->checkSame('', $sd->topic, 'SimpleSubscriptionData default topic empty string');
+        $this->checkSame('TAG', $sd->expressionType, 'SimpleSubscriptionData default expressionType=TAG');
+        $this->checkSame('*', $sd->expression, 'SimpleSubscriptionData default expression=*');
+        $this->checkSame(0, $sd->version, 'SimpleSubscriptionData default version=0');
 
-        // ---- SubscriptionGroupConfig（字段默认值）
+        // ---- SubscriptionGroupConfig (field defaults)
         $cfg = new SubscriptionGroupConfig('MyGroup');
         $this->checkSame('MyGroup', $cfg->groupName, 'SubscriptionGroupConfig groupName');
         $this->checkSame(true, $cfg->consumeEnable, 'SubscriptionGroupConfig consumeEnable=true');
@@ -447,8 +449,8 @@ final class RunClientAdmin
 
         $json = json_decode($cfg->encode(), true);
         $this->checkSame('MyGroup', $json['groupName'], 'SubscriptionGroupConfig.encode groupName');
-        $this->checkSame(['type' => 'CUSTOMIZED'], $json['groupRetryPolicy'], 'SubscriptionGroupConfig.encode groupRetryPolicy 只含 type');
-        $this->check(!isset($json['subscriptionDataSet']), 'SubscriptionGroupConfig.encode null 字段不出现（fastjson2 语义）');
+        $this->checkSame(['type' => 'CUSTOMIZED'], $json['groupRetryPolicy'], 'SubscriptionGroupConfig.encode groupRetryPolicy contains type only');
+        $this->check(!isset($json['subscriptionDataSet']), 'SubscriptionGroupConfig.encode null fields omitted (fastjson2 semantics)');
         $this->checkSame([], $json['attributes'], 'SubscriptionGroupConfig.encode attributes={}');
 
         $cfg2 = SubscriptionGroupConfig::decode($cfg->encode());
@@ -458,7 +460,7 @@ final class RunClientAdmin
         $cfg3->subscriptionDataSet = [new SimpleSubscriptionData('T', 'TAG', '*', 5)];
         $cfg3->attributes = ['x' => 'y'];
         $rt3 = SubscriptionGroupConfig::fromDict(json_decode($cfg3->encode(), true));
-        $this->checkSame(1, count($rt3->subscriptionDataSet ?? []), 'subscriptionDataSet 非空时序列化并还原');
+        $this->checkSame(1, count($rt3->subscriptionDataSet ?? []), 'subscriptionDataSet serialized and restored when non-empty');
         $this->checkSame('T', $rt3->subscriptionDataSet[0]->topic, 'subscriptionDataSet[0].topic');
         $this->checkSame(5, $rt3->subscriptionDataSet[0]->version, 'subscriptionDataSet[0].version');
         $this->checkSame(['x' => 'y'], $rt3->attributes, 'attributes roundtrip');
@@ -473,12 +475,12 @@ final class RunClientAdmin
         $this->checkSame(3, $jw['forbiddenTable']['T@G'], 'Wrapper.encode forbiddenTable');
         $this->checkSame('G1', $jw['subscriptionGroupTable']['G1']['groupName'], 'Wrapper.encode subscriptionGroupTable');
         $rw = SubscriptionGroupWrapper::decode($w->encode());
-        $this->check($rw->subscriptionGroupTable['G1'] instanceof SubscriptionGroupConfig, 'Wrapper.decode 还原 SubscriptionGroupConfig');
+        $this->check($rw->subscriptionGroupTable['G1'] instanceof SubscriptionGroupConfig, 'Wrapper.decode restores SubscriptionGroupConfig');
         $this->checkSame(1, $rw->dataVersion['counter'], 'Wrapper.decode dataVersion');
-        $this->checkSame([], SubscriptionGroupWrapper::decode('{}')->subscriptionGroupTable, 'Wrapper.decode 空对象');
+        $this->checkSame([], SubscriptionGroupWrapper::decode('{}')->subscriptionGroupTable, 'Wrapper.decode empty object');
     }
 
-    // ================================================================ 配置与生命周期
+    // ================================================================ Configuration and lifecycle
 
     private function testAdminConfigLifecycle(): void
     {
@@ -486,19 +488,19 @@ final class RunClientAdmin
         $this->checkSame('ORDER_TOPIC_CONFIG', DefaultMQAdminExt::NAMESPACE_ORDER_TOPIC_CONFIG, 'NAMESPACE_ORDER_TOPIC_CONFIG');
 
         $admin = new FakeAdmin();
-        $this->checkSame('ADMIN', $admin->instanceName, '默认 instanceName=ADMIN');
-        $this->checkSame(null, $admin->clientId, '默认 clientId=null');
-        $this->checkSame(null, $admin->unitName, '默认 unitName=null');
-        $this->checkSame(false, $admin->enableStreamRequestType, '默认 enableStreamRequestType=false');
-        $this->checkSame(false, $admin->vipChannelEnabled, '默认 vipChannelEnabled=false');
-        $this->checkSame(30000, $admin->pollNameServerInterval, '默认 pollNameServerInterval=30000');
-        $this->checkSame(DefaultMQAdminExt::DEFAULT_TIMEOUT, $admin->timeoutMillis, '默认 timeoutMillis=DEFAULT_TIMEOUT');
-        $this->checkSame(null, $admin->rpcHook, '默认 rpcHook=null');
-        $this->checkSame('', $admin->namespace, '默认 namespace 空串');
+        $this->checkSame('ADMIN', $admin->instanceName, 'default instanceName=ADMIN');
+        $this->checkSame(null, $admin->clientId, 'default clientId=null');
+        $this->checkSame(null, $admin->unitName, 'default unitName=null');
+        $this->checkSame(false, $admin->enableStreamRequestType, 'default enableStreamRequestType=false');
+        $this->checkSame(false, $admin->vipChannelEnabled, 'default vipChannelEnabled=false');
+        $this->checkSame(30000, $admin->pollNameServerInterval, 'default pollNameServerInterval=30000');
+        $this->checkSame(DefaultMQAdminExt::DEFAULT_TIMEOUT, $admin->timeoutMillis, 'default timeoutMillis=DEFAULT_TIMEOUT');
+        $this->checkSame(null, $admin->rpcHook, 'default rpcHook=null');
+        $this->checkSame('', $admin->namespace, 'default namespace empty string');
 
         $admin->setNamesrvAddr(' a:1 ; b:2 ; ;');
-        $this->checkSame(['a:1', 'b:2'], $admin->getNameServerAddressList(), 'setNamesrvAddr 分号切分并 trim');
-        $this->checkSame('a:1;b:2', $admin->getNameServerAddr(), 'getNameServerAddr 分号拼接');
+        $this->checkSame(['a:1', 'b:2'], $admin->getNameServerAddressList(), 'setNamesrvAddr splits on semicolons and trims');
+        $this->checkSame('a:1;b:2', $admin->getNameServerAddr(), 'getNameServerAddr joins with semicolons');
         $admin->setNameServerAddresses(['c:3']);
         $this->checkSame(['c:3'], $admin->getNameServerAddressList(), 'setNameServerAddresses');
 
@@ -513,111 +515,111 @@ final class RunClientAdmin
         $admin->setTimeoutMillis(1234);
         $this->checkSame(1234, $admin->timeoutMillis, 'setTimeoutMillis');
 
-        // 未启动（未注入）时禁止使用
+        // Forbidden to use before start (before injection)
         $bare = new FakeAdmin();
-        $this->checkThrows(fn() => $bare->fetchAllTopicList(), MQClientException::class, '未 start 调用 → admin not started');
-        $this->checkThrows(fn() => $bare->getMqClientInstance(), MQClientException::class, '未 start 取实例 → 抛');
+        $this->checkThrows(fn() => $bare->fetchAllTopicList(), MQClientException::class, 'call before start → admin not started');
+        $this->checkThrows(fn() => $bare->getMqClientInstance(), MQClientException::class, 'fetch instance before start → throws');
 
-        // start() 无地址
+        // start() without address
         $bare2 = new DefaultMQAdminExt();
-        $this->checkThrows(fn() => $bare2->start(), MQClientException::class, 'start 无 NameServer → 抛');
-        $bare2->shutdown(); // 未 start 时 no-op
-        $this->check(true, 'shutdown 未 start 是 no-op');
+        $this->checkThrows(fn() => $bare2->start(), MQClientException::class, 'start without NameServer → throws');
+        $bare2->shutdown(); // no-op before start
+        $this->check(true, 'shutdown before start is a no-op');
 
-        // 真实 start()（离线路径：无在用 topic / 无 broker / 无消费者，无网络请求）
+        // Real start() (offline path: no in-use topics / no brokers / no consumers, no network requests)
         $real = new DefaultMQAdminExt();
         $real->setNamesrvAddr('127.0.0.1:9876');
         $real->setInstanceName('DEFAULT');
         $real->start();
-        $this->check($real->instanceName !== 'DEFAULT', "start 时 DEFAULT 实例名换成 <pid>#<nanoTime>");
-        // changeInstanceNameToPID 已把 DEFAULT 换成 <pid>#<nanoTime>，
-        // clientId 形如 <ip>@<pid>#<nanoTime>，不再含字面量 DEFAULT。
+        $this->check($real->instanceName !== 'DEFAULT', "start replaces the DEFAULT instance name with <pid>#<nanoTime>");
+        // changeInstanceNameToPID already replaced DEFAULT with <pid>#<nanoTime>;
+        // clientId looks like <ip>@<pid>#<nanoTime> and no longer contains the literal DEFAULT.
         $this->check(
             $real->getClientId() !== null && str_contains((string) $real->getClientId(), '@')
                 && !str_contains((string) $real->getClientId(), '@DEFAULT'),
-            'clientId 形如 ip@instanceName（DEFAULT 已被换成 pid 形态）',
+            'clientId looks like ip@instanceName (DEFAULT replaced by the pid form)',
         );
-        $this->check($real->getMqClientInstance() instanceof MQClientInstance, 'start 后能取到 MQClientInstance');
+        $this->check($real->getMqClientInstance() instanceof MQClientInstance, 'MQClientInstance obtainable after start');
         $real->shutdown();
         $real2 = $real;
         $real2->shutdown();
-        $this->check(true, '重复 shutdown 是 no-op');
+        $this->check(true, 'duplicate shutdown is a no-op');
 
-        // 注入替身
+        // Inject the double
         $injected = new FakeAdmin();
         $fc = new FakeClient();
         $injected->setMqClientInstance($fc);
-        $this->check($injected->getMqClientInstance() === $fc, 'setMqClientInstance 注入并取回');
+        $this->check($injected->getMqClientInstance() === $fc, 'setMqClientInstance injects and returns');
 
-        // permIsValid（权限位判定）
+        // permIsValid (permission-bit check)
         $this->checkSame(true, DefaultMQAdminExt::permIsValid('6'), "permIsValid('6')");
         $this->checkSame(true, DefaultMQAdminExt::permIsValid('0'), "permIsValid('0')");
         $this->checkSame(true, DefaultMQAdminExt::permIsValid(4), 'permIsValid(4)');
-        $this->checkSame(false, DefaultMQAdminExt::permIsValid('8'), 'permIsValid(8)=false（>= PRIORITY）');
+        $this->checkSame(false, DefaultMQAdminExt::permIsValid('8'), 'permIsValid(8)=false (>= PRIORITY)');
         $this->checkSame(false, DefaultMQAdminExt::permIsValid('-1'), 'permIsValid(-1)=false');
-        $this->checkSame(false, DefaultMQAdminExt::permIsValid('abc'), "permIsValid('abc')=false（NumberFormatException 语义）");
+        $this->checkSame(false, DefaultMQAdminExt::permIsValid('abc'), "permIsValid('abc')=false (NumberFormatException semantics)");
         $this->checkSame(false, DefaultMQAdminExt::permIsValid(null), 'permIsValid(null)=false');
     }
 
-    // ================================================================ 底层调用助手
+    // ================================================================ Low-level invoke helpers
 
     private function testInvokeHelpers(): void
     {
-        // invokeBroker：请求码 + ext 字段一律字符串化
+        // invokeBroker: request code + ext fields always stringified
         $admin = $this->newAdmin();
         $admin->handler = fn(RemotingCommand $cmd) => $this->errResponse(ResponseCode::SYSTEM_ERROR, 'boom');
-        $this->checkThrows(fn() => $admin->getSystemTopicListFromBroker('b:1'), MQBrokerException::class, '非 SUCCESS → MQBrokerException');
+        $this->checkThrows(fn() => $admin->getSystemTopicListFromBroker('b:1'), MQBrokerException::class, 'non-SUCCESS → MQBrokerException');
         $e = $this->capture(fn() => $admin->getSystemTopicListFromBroker('b:1'));
-        $this->check($e instanceof MQBrokerException && $e->responseCode === ResponseCode::SYSTEM_ERROR, 'MQBrokerException 带响应码');
-        $this->check($e !== null && str_contains($e->getMessage(), 'boom'), 'MQBrokerException 带 remark');
+        $this->check($e instanceof MQBrokerException && $e->responseCode === ResponseCode::SYSTEM_ERROR, 'MQBrokerException carries the response code');
+        $this->check($e !== null && str_contains($e->getMessage(), 'boom'), 'MQBrokerException carries the remark');
 
-        // VIP 通道：broker 请求端口 -2
+        // VIP channel: broker request port -2
         $admin2 = $this->newAdmin();
         $admin2->setVipChannelEnabled(true);
         $admin2->getSystemTopicListFromBroker('10.0.0.1:10911');
-        $this->checkSame('10.0.0.1:10909', $this->lastAddr($admin2), 'VIP 开启时 broker 地址端口-2');
+        $this->checkSame('10.0.0.1:10909', $this->lastAddr($admin2), 'VIP on → broker address port-2');
 
-        // NameServer 广播：PUT_KV_CONFIG 打到每一个 NameServer
+        // NameServer broadcast: PUT_KV_CONFIG hits every NameServer
         $admin3 = $this->newAdmin();
         $admin3->createAndUpdateKvConfig('NS', 'K', 'V');
         $putReqs = $this->reqsByCode($admin3, RequestCode::PUT_KV_CONFIG);
-        $this->checkSame(1, count($putReqs), '单 NameServer 时 PUT 1 次');
-        $this->checkSame('10.0.0.1:9876', $putReqs[0]['addr'], 'PUT 打到 NameServer 地址');
+        $this->checkSame(1, count($putReqs), 'single NameServer → 1 PUT');
+        $this->checkSame('10.0.0.1:9876', $putReqs[0]['addr'], 'PUT hits the NameServer address');
         $this->checkSame(
             ['namespace' => 'NS', 'key' => 'K', 'value' => 'V'],
             $putReqs[0]['cmd']->extFields,
-            'PUT_KV_CONFIG ext 字段'
+            'PUT_KV_CONFIG ext fields'
         );
 
         $admin3b = $this->newAdmin();
         $admin3b->setNameServerAddresses(['10.0.0.1:1', '10.0.0.1:2']);
         $admin3b->createAndUpdateKvConfig('NS', 'K', 'V');
-        $this->checkSame(2, count($this->cmdsByCode($admin3b, RequestCode::PUT_KV_CONFIG)), 'PUT 广播到每一个 NameServer（2 台）');
+        $this->checkSame(2, count($this->cmdsByCode($admin3b, RequestCode::PUT_KV_CONFIG)), 'PUT broadcast to every NameServer (2 of them)');
 
-        // 广播中任一失败：收齐后抛（含 remark）
+        // Any broadcast failure: throws after all collected (with remark)
         $admin3c = $this->newAdmin();
         $admin3c->setNameServerAddresses(['10.0.0.1:1', '10.0.0.1:2']);
         $admin3c->handler = fn(RemotingCommand $c, string $addr) => $addr === '10.0.0.1:2'
             ? $this->errResponse(ResponseCode::NO_PERMISSION, 'denied')
             : $this->okResponse();
         $err = $this->capture(fn() => $admin3c->createAndUpdateKvConfig('NS', 'K', 'V'));
-        $this->check($err instanceof MQClientException, '广播任一失败 → MQClientException');
-        $this->check($err instanceof MQClientException && $err->responseCode === ResponseCode::NO_PERMISSION, '广播失败带响应码');
-        $this->check($err !== null && str_contains($err->getMessage(), 'denied'), '广播失败带 remark');
-        $this->checkSame(2, count($this->cmdsByCode($admin3c, RequestCode::PUT_KV_CONFIG)), '广播失败也要把两台都发完');
+        $this->check($err instanceof MQClientException, 'any broadcast failure → MQClientException');
+        $this->check($err instanceof MQClientException && $err->responseCode === ResponseCode::NO_PERMISSION, 'broadcast failure carries the response code');
+        $this->check($err !== null && str_contains($err->getMessage(), 'denied'), 'broadcast failure carries the remark');
+        $this->checkSame(2, count($this->cmdsByCode($admin3c, RequestCode::PUT_KV_CONFIG)), 'broadcast sends to both even when failing');
 
-        // invokeNamesrvOne：第一台连接失败 → 换下一台
+        // invokeNamesrvOne: first server connect fails → moves to the next
         $admin4 = $this->newAdmin();
         $admin4->setNameServerAddresses(['10.0.0.1:1', '10.0.0.1:2']);
         $admin4->failAddrs['10.0.0.1:1'] = new RemotingConnectException('10.0.0.1:1');
         $admin4->getKvListByNamespace('NS');
-        $this->checkSame('10.0.0.1:2', $this->lastAddr($admin4), '第一台不可达时落到第二台');
+        $this->checkSame('10.0.0.1:2', $this->lastAddr($admin4), 'first unreachable → falls to the second');
 
         $admin4b = $this->newAdmin();
         $admin4b->failAddrs['10.0.0.1:9876'] = new RemotingConnectException('x');
-        $this->checkThrows(fn() => $admin4b->getKvListByNamespace('NS'), MQClientException::class, '全部 NameServer 不可达 → all name servers unreachable');
+        $this->checkThrows(fn() => $admin4b->getKvListByNamespace('NS'), MQClientException::class, 'all NameServers unreachable → all name servers unreachable');
 
-        // 默认超时透传（timeout 参数）
+        // Default timeout pass-through (timeout parameter)
         $admin5 = $this->newAdmin();
         $admin5->setTimeoutMillis(777);
         $seen = null;
@@ -626,29 +628,29 @@ final class RunClientAdmin
             return $this->okResponse();
         };
         $admin5->getSystemTopicListFromBroker('b:9', 5555);
-        $this->check(true, '显式超时可传（占位）');
+        $this->check(true, 'explicit timeout accepted (placeholder)');
         $this->checkSame(RequestCode::GET_SYSTEM_TOPIC_LIST_FROM_BROKER, $seen->code, 'GET_SYSTEM_TOPIC_LIST_FROM_BROKER=305');
     }
 
-    // ================================================================ Topic 管理
+    // ================================================================ Topic management
 
     private function testTopicManagement(): void
     {
-        // createTopic → createTopicInRoute(默认 perm=READ|WRITE)
+        // createTopic → createTopicInRoute (default perm=READ|WRITE)
         $admin = $this->newAdmin();
         $admin->createTopic('key', 'NewTopic', 8);
-        $this->checkSame(1, count($this->client->createTopicInRouteCalls), 'createTopic 走 createTopicInRoute');
+        $this->checkSame(1, count($this->client->createTopicInRouteCalls), 'createTopic goes through createTopicInRoute');
         $call = $this->client->createTopicInRouteCalls[0];
-        $this->checkSame('NewTopic', $call['topic'], 'createTopic topic 名');
+        $this->checkSame('NewTopic', $call['topic'], 'createTopic topic name');
         $this->checkSame(8, $call['read'], 'createTopic readQueueNums');
         $this->checkSame(8, $call['write'], 'createTopic writeQueueNums');
         $this->checkSame(MixAll::READ_PERM_BY_DEFAULT, $call['perm'], 'createTopic perm=READ|WRITE');
 
-        // createAndUpdateTopicConfig → createTopicInBroker(defaultTopic=TBW102)
+        // createAndUpdateTopicConfig → createTopicInBroker (defaultTopic=TBW102)
         $admin2 = $this->newAdmin();
         $cfg = new TopicConfig('T1', 4, 6, 6);
         $admin2->createAndUpdateTopicConfig('b:1', $cfg);
-        $this->checkSame(1, count($this->client->createTopicInBrokerCalls), 'createAndUpdateTopicConfig 走 createTopicInBroker');
+        $this->checkSame(1, count($this->client->createTopicInBrokerCalls), 'createAndUpdateTopicConfig goes through createTopicInBroker');
         $c = $this->client->createTopicInBrokerCalls[0];
         $this->checkSame('b:1', $c['addr'], 'createAndUpdateTopicConfig addr');
         $this->checkSame(MixAll::DEFAULT_TOPIC, $c['defaultTopic'], 'createAndUpdateTopicConfig defaultTopic=TBW102');
@@ -658,46 +660,46 @@ final class RunClientAdmin
 
         $admin2b = $this->newAdmin();
         $admin2b->createTopicInBroker('b:2', 'T2', 1, 2, 4);
-        $this->checkSame('T2', $this->client->createTopicInBrokerCalls[0]['topic'], 'createTopicInBroker 直通');
+        $this->checkSame('T2', $this->client->createTopicInBrokerCalls[0]['topic'], 'createTopicInBroker pass-through');
 
         $admin2c = $this->newAdmin();
         $admin2c->deleteTopicInBroker('b:3', 'T3');
-        $this->checkSame(['addr' => 'b:3', 'topic' => 'T3'], $this->client->deleteTopicInBrokerCalls[0], 'deleteTopicInBroker 直通');
+        $this->checkSame(['addr' => 'b:3', 'topic' => 'T3'], $this->client->deleteTopicInBrokerCalls[0], 'deleteTopicInBroker pass-through');
 
-        // examineTopicConfig：351 + topic + lo=true
+        // examineTopicConfig: 351 + topic + lo=true
         $admin3 = $this->newAdmin();
         $admin3->handler = fn() => $this->okResponse((new TopicConfig('T', 3, 3, 6))->encode());
         $got = $admin3->examineTopicConfig('b:1', 'T');
         $cmd = $this->lastCmd($admin3);
         $this->checkSame(RequestCode::GET_TOPIC_CONFIG, $cmd->code, 'GET_TOPIC_CONFIG=351');
-        $this->checkSame('T', $cmd->extFields['topic'] ?? null, 'GET_TOPIC_CONFIG 带 topic');
-        $this->checkSame('true', $cmd->extFields['lo'] ?? null, 'GET_TOPIC_CONFIG 带 lo=true');
-        $this->checkSame('T', $got->topicName, 'examineTopicConfig 解析 TopicConfig');
+        $this->checkSame('T', $cmd->extFields['topic'] ?? null, 'GET_TOPIC_CONFIG carries topic');
+        $this->checkSame('true', $cmd->extFields['lo'] ?? null, 'GET_TOPIC_CONFIG carries lo=true');
+        $this->checkSame('T', $got->topicName, 'examineTopicConfig parses TopicConfig');
         $this->checkSame(3, $got->readQueueNums, 'examineTopicConfig readQueueNums');
         $admin3->handler = fn() => $this->okResponse(null);
-        $this->checkThrows(fn() => $admin3->examineTopicConfig('b:1', 'T'), MQBrokerException::class, 'examineTopicConfig 空 body → MQBrokerException');
+        $this->checkThrows(fn() => $admin3->examineTopicConfig('b:1', 'T'), MQBrokerException::class, 'examineTopicConfig empty body → MQBrokerException');
 
-        // deleteTopicInNameServer：显式地址列表；VIP 开启也不转换 NameServer 端口
+        // deleteTopicInNameServer: explicit address list; VIP on does not convert the NameServer port either
         $admin4 = $this->newAdmin();
         $admin4->setVipChannelEnabled(true);
         $admin4->deleteTopicInNameServer(['ns:1', 'ns:2'], 'T');
         $delReqs = $this->reqsByCode($admin4, RequestCode::DELETE_TOPIC_IN_NAMESRV);
-        $this->checkSame(2, count($delReqs), 'deleteTopicInNameServer 按给定地址逐个发');
+        $this->checkSame(2, count($delReqs), 'deleteTopicInNameServer sends to each given address');
         $this->checkSame(RequestCode::DELETE_TOPIC_IN_NAMESRV, $delReqs[0]['cmd']->code, 'DELETE_TOPIC_IN_NAMESRV=216');
         $this->checkSame('T', $delReqs[0]['cmd']->extFields['topic'] ?? null, 'DELETE_TOPIC_IN_NAMESRV ext topic');
-        $this->checkSame('ns:1', $delReqs[0]['addr'], 'NameServer 地址不走 VIP 端口转换');
-        $this->checkSame('ns:2', $delReqs[1]['addr'], '第二台 NameServer 原样');
+        $this->checkSame('ns:1', $delReqs[0]['addr'], 'NameServer addresses skip the VIP port conversion');
+        $this->checkSame('ns:2', $delReqs[1]['addr'], 'second NameServer untouched');
 
         $admin4b = $this->newAdmin();
         $admin4b->setNameServerAddresses(['ns:a', 'ns:b']);
         $admin4b->deleteTopicInNameServer(null, 'T');
-        $this->checkSame(['ns:a', 'ns:b'], array_map(fn($r) => $r['addr'], $this->reqsByCode($admin4b, RequestCode::DELETE_TOPIC_IN_NAMESRV)), '地址为空时回退全部 NameServer');
+        $this->checkSame(['ns:a', 'ns:b'], array_map(fn($r) => $r['addr'], $this->reqsByCode($admin4b, RequestCode::DELETE_TOPIC_IN_NAMESRV)), 'empty address list falls back to all NameServers');
 
         $admin4c = $this->newAdmin();
         $admin4c->deleteTopicInNamesrv('T');
-        $this->checkSame(['T'], $this->client->deleteTopicInNamesrvCalls, 'deleteTopicInNamesrv 旧名走实例');
+        $this->checkSame(['T'], $this->client->deleteTopicInNamesrvCalls, 'deleteTopicInNamesrv legacy name goes to the instance');
 
-        // deleteTopic：清 broker + namesrv + KV namespace，失败降级为 warn
+        // deleteTopic: clears broker + namesrv + KV namespace; failure degrades to warn
         $admin5 = $this->newAdmin();
         $ci = new ClusterInfo();
         $ci->brokerAddrTable = ['broker-a' => [0 => 'b:a', 1 => 'b:a-s']];
@@ -706,17 +708,17 @@ final class RunClientAdmin
         $this->client->topicRoutes['T'] = new TopicRouteData();
         $admin5->kvNamespaceToDeleteList = ['ORDER_TOPIC_CONFIG'];
         $admin5->deleteTopic('T', 'C1');
-        $this->checkSame([['addr' => 'b:a', 'topic' => 'T'], ['addr' => 'b:a-s', 'topic' => 'T']], $this->client->deleteTopicInBrokerCalls, 'deleteTopic 清集群内全部 broker');
-        $this->checkSame(['T'], $this->client->deleteTopicInNamesrvCalls, 'deleteTopic 清 NameServer 路由');
+        $this->checkSame([['addr' => 'b:a', 'topic' => 'T'], ['addr' => 'b:a-s', 'topic' => 'T']], $this->client->deleteTopicInBrokerCalls, 'deleteTopic clears every broker in the cluster');
+        $this->checkSame(['T'], $this->client->deleteTopicInNamesrvCalls, 'deleteTopic clears the NameServer route');
         $delKv = $this->cmdsByCode($admin5, RequestCode::DELETE_KV_CONFIG);
-        $this->checkSame(1, count($delKv), 'deleteTopic 清 KV namespace');
-        $this->checkSame('T', $delKv[0]->extFields['key'] ?? null, 'deleteTopic 的 KV key=topic');
+        $this->checkSame(1, count($delKv), 'deleteTopic clears the KV namespace');
+        $this->checkSame('T', $delKv[0]->extFields['key'] ?? null, 'deleteTopic KV key=topic');
 
         $admin5b = $this->newAdmin();
         $admin5b->kvNamespaceToDeleteList = ['NS1'];
         $admin5b->handler = fn() => $this->errResponse(ResponseCode::SYSTEM_ERROR, 'x');
-        $admin5b->deleteTopic('T'); // broker 删除失败也应继续
-        $this->checkSame(1, count($this->client->deleteTopicInNamesrvCalls), 'broker 删除失败不阻断 NameServer 清理');
+        $admin5b->deleteTopic('T'); // broker deletion failure should not block
+        $this->checkSame(1, count($this->client->deleteTopicInNamesrvCalls), 'broker deletion failure does not block NameServer cleanup');
 
         // fetchAllTopicList / fetchAllTopicRoute
         $admin6 = $this->newAdmin();
@@ -726,16 +728,16 @@ final class RunClientAdmin
         $tl = $admin6->fetchAllTopicList();
         $this->checkSame(['T1', 'T2'], $tl->getTopicList(), 'fetchAllTopicList');
         $routes = $admin6->fetchAllTopicRoute();
-        $this->checkSame(1, count($routes), 'fetchAllTopicRoute 只收有路由的 topic');
+        $this->checkSame(1, count($routes), 'fetchAllTopicRoute collects only topics with routes');
 
-        // fetchTopicsByCluster：224 + cluster 字段名
+        // fetchTopicsByCluster: 224 + cluster field name
         $admin7 = $this->newAdmin();
         $admin7->handler = fn() => $this->okResponse(json_encode(['topicList' => ['TA', 'TB', 'TA']]));
         $topics = $admin7->fetchTopicsByCluster('C1');
         $cmd7 = $this->lastCmd($admin7);
         $this->checkSame(RequestCode::GET_TOPICS_BY_CLUSTER, $cmd7->code, 'GET_TOPICS_BY_CLUSTER=224');
-        $this->checkSame('C1', $cmd7->extFields['cluster'] ?? null, 'GET_TOPICS_BY_CLUSTER 字段名必须是 cluster');
-        $this->checkSame(['TA', 'TB'], $topics, 'fetchTopicsByCluster 去重');
+        $this->checkSame('C1', $cmd7->extFields['cluster'] ?? null, 'GET_TOPICS_BY_CLUSTER field name must be cluster');
+        $this->checkSame(['TA', 'TB'], $topics, 'fetchTopicsByCluster deduplicates');
 
         // getClusterList / getTopicClusterList
         $admin8 = $this->newAdmin();
@@ -743,14 +745,14 @@ final class RunClientAdmin
         $ci8->clusterAddrTable = ['C1' => ['broker-a'], 'C2' => ['broker-x']];
         $this->client->clusterInfo = $ci8;
         $this->route('T', 'broker-a', 'b:1');
-        $this->checkSame(['C1'], $admin8->getClusterList('T'), 'getClusterList 按路由 broker 求交集');
-        $this->checkSame(['C1'], $admin8->getTopicClusterList('T'), 'getTopicClusterList 别名');
+        $this->checkSame(['C1'], $admin8->getClusterList('T'), 'getClusterList intersects by route brokers');
+        $this->checkSame(['C1'], $admin8->getTopicClusterList('T'), 'getTopicClusterList alias');
 
-        // examineTopicRoute：路由缺失抛
+        // examineTopicRoute: throws when the route is missing
         $admin9 = $this->newAdmin();
-        $this->checkThrows(fn() => $admin9->examineTopicRoute('Nope'), MQClientException::class, 'examineTopicRoute 无路由 → 抛');
+        $this->checkThrows(fn() => $admin9->examineTopicRoute('Nope'), MQClientException::class, 'examineTopicRoute no route → throws');
         $this->route('T', 'broker-a', 'b:1');
-        $this->checkSame('broker-a', $admin9->examineTopicRoute('T')->getBrokerDatas()[0]->brokerName, 'examineTopicRoute 命中');
+        $this->checkSame('broker-a', $admin9->examineTopicRoute('T')->getBrokerDatas()[0]->brokerName, 'examineTopicRoute hit');
 
         // get_all_topic_config / get_user_topic_config
         $admin10 = $this->newAdmin();
@@ -771,21 +773,21 @@ final class RunClientAdmin
         };
         $all = $admin10->getAllTopicConfig('b:1');
         $this->checkSame(RequestCode::GET_ALL_TOPIC_CONFIG, $this->lastCmd($admin10)->code, 'GET_ALL_TOPIC_CONFIG=21');
-        $this->checkSame(4, count($all->topicConfigTable), 'getAllTopicConfig 全量表');
+        $this->checkSame(4, count($all->topicConfigTable), 'getAllTopicConfig full table');
         $user = $admin10->getUserTopicConfig('b:1');
-        $this->checkSame(['T1'], array_keys($user->topicConfigTable), 'getUserTopicConfig 剔除系统/retry/DLQ');
+        $this->checkSame(['T1'], array_keys($user->topicConfigTable), 'getUserTopicConfig strips system/retry/DLQ');
         $userSpecial = $admin10->getUserTopicConfig('b:1', true);
-        $this->checkSame(['T1', '%RETRY%G', '%DLQ%G'], array_keys($userSpecial->topicConfigTable), 'specialTopic=true 保留 retry/DLQ');
+        $this->checkSame(['T1', '%RETRY%G', '%DLQ%G'], array_keys($userSpecial->topicConfigTable), 'specialTopic=true keeps retry/DLQ');
         $admin10b = $this->newAdmin();
         $admin10b->handler = fn() => $this->okResponse(null);
-        $this->checkSame([], $admin10b->getAllTopicConfig('b:1')->topicConfigTable, 'getAllTopicConfig 空 body → 空 wrapper');
+        $this->checkSame([], $admin10b->getAllTopicConfig('b:1')->topicConfigTable, 'getAllTopicConfig empty body → empty wrapper');
 
         // getSystemTopicListFromBroker
         $admin11 = $this->newAdmin();
         $admin11->handler = fn() => $this->okResponse((new TopicList())->encode());
-        $this->checkSame([], $admin11->getSystemTopicListFromBroker('b:1')->getTopicList(), 'getSystemTopicListFromBroker 空');
+        $this->checkSame([], $admin11->getSystemTopicListFromBroker('b:1')->getTopicList(), 'getSystemTopicListFromBroker empty');
 
-        // examineTopicStats 合并
+        // examineTopicStats merge
         $admin12 = $this->newAdmin();
         $trd = new TopicRouteData();
         $trd->brokerDatas = [
@@ -803,17 +805,17 @@ final class RunClientAdmin
             return $this->okResponse($t->encode());
         };
         $stats = $admin12->examineTopicStats('TS');
-        $this->checkSame(2, count($stats->offsetTable), 'examineTopicStats 合并两台 broker 的 offsetTable');
-        $this->checkSame(3.0, $stats->topicPutTps, 'examineTopicStats TPS 累加');
+        $this->checkSame(2, count($stats->offsetTable), 'examineTopicStats merges offsetTable from both brokers');
+        $this->checkSame(3.0, $stats->topicPutTps, 'examineTopicStats accumulates TPS');
         $statsCmd = $this->lastCmd($admin12);
         $this->checkSame(RequestCode::GET_TOPIC_STATS_INFO, $statsCmd->code, 'GET_TOPIC_STATS_INFO=202');
         $this->checkSame('TS', $statsCmd->extFields['topic'] ?? null, 'GET_TOPIC_STATS_INFO ext topic');
         $admin12b = $this->newAdmin();
         $admin12b->handler = fn() => $this->errResponse(ResponseCode::SYSTEM_ERROR, 'x');
-        $this->checkThrows(fn() => $admin12b->examineTopicStats('TS'), MQClientException::class, 'examineTopicStats 全失败 → Not found the topic stats info');
+        $this->checkThrows(fn() => $admin12b->examineTopicStats('TS'), MQClientException::class, 'examineTopicStats all fail → Not found the topic stats info');
     }
 
-    // ================================================================ 集群 / Broker
+    // ================================================================ Cluster / Broker
 
     private function testClusterBroker(): void
     {
@@ -821,8 +823,8 @@ final class RunClientAdmin
         $ci = new ClusterInfo();
         $ci->brokerAddrTable = ['broker-a' => [0 => 'b:a', 1 => 'b:a-s']];
         $this->client->clusterInfo = $ci;
-        $this->check($admin->fetchBrokerClusterInfo() === $this->client->clusterInfo, 'fetchBrokerClusterInfo 直通实例');
-        $this->check($admin->examineBrokerClusterInfo() === $this->client->clusterInfo, 'examineBrokerClusterInfo 别名');
+        $this->check($admin->fetchBrokerClusterInfo() === $this->client->clusterInfo, 'fetchBrokerClusterInfo passes through to the instance');
+        $this->check($admin->examineBrokerClusterInfo() === $this->client->clusterInfo, 'examineBrokerClusterInfo alias');
 
         $admin2 = $this->newAdmin();
         $kv = new KVTable();
@@ -830,52 +832,52 @@ final class RunClientAdmin
         $admin2->handler = fn() => $this->okResponse($kv->encode());
         $got = $admin2->fetchBrokerRuntimeStats('b:1');
         $this->checkSame(RequestCode::GET_BROKER_RUNTIME_INFO, $this->lastCmd($admin2)->code, 'GET_BROKER_RUNTIME_INFO=28');
-        $this->checkSame(['putTps' => '1.0'], $got->table, 'fetchBrokerRuntimeStats 解析 KVTable');
-        $this->checkSame($admin2->getBrokerRuntimeInfo('b:1')->table, $got->table, 'getBrokerRuntimeInfo 旧接口别名');
+        $this->checkSame(['putTps' => '1.0'], $got->table, 'fetchBrokerRuntimeStats parses KVTable');
+        $this->checkSame($admin2->getBrokerRuntimeInfo('b:1')->table, $got->table, 'getBrokerRuntimeInfo legacy interface alias');
         $admin2->handler = fn() => $this->okResponse(null);
-        $this->checkSame([], $admin2->fetchBrokerRuntimeStats('b:1')->table, 'fetchBrokerRuntimeStats 空 body → 空 KVTable');
+        $this->checkSame([], $admin2->fetchBrokerRuntimeStats('b:1')->table, 'fetchBrokerRuntimeStats empty body → empty KVTable');
 
-        // getBrokerConfig：body 是 properties 文本
+        // getBrokerConfig: body is a properties text
         $admin3 = $this->newAdmin();
         $admin3->handler = fn() => $this->okResponse("brokerId=0\nbrokerName=broker-a\n");
         $props = $admin3->getBrokerConfig('b:1');
         $this->checkSame(RequestCode::GET_BROKER_CONFIG, $this->lastCmd($admin3)->code, 'GET_BROKER_CONFIG=26');
-        $this->checkSame(['brokerId' => '0', 'brokerName' => 'broker-a'], $props, 'getBrokerConfig 按 properties 文本解析');
+        $this->checkSame(['brokerId' => '0', 'brokerName' => 'broker-a'], $props, 'getBrokerConfig parses the properties text');
 
-        // updateBrokerConfig：body 是 properties 文本 + brokerPermission 校验
+        // updateBrokerConfig: body is a properties text + brokerPermission validation
         $admin4 = $this->newAdmin();
         $admin4->updateBrokerConfig('b:1', ['brokerName' => 'x']);
         $cmd4 = $this->lastCmd($admin4);
         $this->checkSame(RequestCode::UPDATE_BROKER_CONFIG, $cmd4->code, 'UPDATE_BROKER_CONFIG=25');
-        $this->checkSame("brokerName=x\n", $cmd4->body, 'updateBrokerConfig body 为 k=v\n 文本');
+        $this->checkSame("brokerName=x\n", $cmd4->body, 'updateBrokerConfig body is k=v\n text');
         $n0 = count($admin4->requests);
         $admin4->updateBrokerConfig('b:1', []);
-        $this->checkSame($n0, count($admin4->requests), 'updateBrokerConfig 空属性不发请求');
+        $this->checkSame($n0, count($admin4->requests), 'updateBrokerConfig sends no request for empty properties');
         $e = $this->capture(fn() => $admin4->updateBrokerConfig('b:1', ['brokerPermission' => '8']));
-        $this->check($e instanceof MQClientException && $e->responseCode === ResponseCode::NO_PERMISSION, 'brokerPermission 非法 → NO_PERMISSION');
+        $this->check($e instanceof MQClientException && $e->responseCode === ResponseCode::NO_PERMISSION, 'illegal brokerPermission → NO_PERMISSION');
         $e2 = $this->capture(fn() => $admin4->updateBrokerConfig('b:1', ['brokerPermission' => 'abc']));
-        $this->check($e2 instanceof MQClientException, "brokerPermission='abc' 非法");
+        $this->check($e2 instanceof MQClientException, "brokerPermission='abc' illegal");
 
         // wipe / add write perm
         $admin5 = $this->newAdmin();
         $admin5->handler = fn() => $this->okResponse(null, ['wipeTopicCount' => '3']);
-        $this->checkSame(3, $admin5->wipeWritePermOfBroker('ns:1', 'broker-a'), 'wipeWritePermOfBroker 取 wipeTopicCount');
+        $this->checkSame(3, $admin5->wipeWritePermOfBroker('ns:1', 'broker-a'), 'wipeWritePermOfBroker reads wipeTopicCount');
         $this->checkSame(RequestCode::WIPE_WRITE_PERM_OF_BROKER, $this->lastCmd($admin5)->code, 'WIPE_WRITE_PERM_OF_BROKER=205');
         $this->checkSame('broker-a', $this->lastCmd($admin5)->extFields['brokerName'] ?? null, 'wipe ext brokerName');
         $admin5->handler = fn() => $this->okResponse(null, ['addTopicCount' => '2']);
-        $this->checkSame(2, $admin5->addWritePermOfBroker('ns:1', 'broker-a'), 'addWritePermOfBroker 取 addTopicCount');
+        $this->checkSame(2, $admin5->addWritePermOfBroker('ns:1', 'broker-a'), 'addWritePermOfBroker reads addTopicCount');
         $this->checkSame(RequestCode::ADD_WRITE_PERM_OF_BROKER, $this->lastCmd($admin5)->code, 'ADD_WRITE_PERM_OF_BROKER=327');
 
-        // cleanUnusedTopic：全成功 true / 任一失败 false
+        // cleanUnusedTopic: all succeed true / any failure false
         $admin6 = $this->newAdmin();
         $admin6->setNameServerAddresses(['ns:1']);
         $ci6 = new ClusterInfo();
         $ci6->brokerAddrTable = ['broker-a' => [0 => 'b:a']];
         $this->client->clusterInfo = $ci6;
-        $this->checkSame(true, $admin6->cleanUnusedTopic(), 'cleanUnusedTopic 全成功');
+        $this->checkSame(true, $admin6->cleanUnusedTopic(), 'cleanUnusedTopic all succeed');
         $this->checkSame(RequestCode::CLEAN_UNUSED_TOPIC, $this->lastCmd($admin6)->code, 'CLEAN_UNUSED_TOPIC=316');
         $admin6->handler = fn() => $this->errResponse(ResponseCode::SYSTEM_ERROR, 'x');
-        $this->checkSame(false, $admin6->cleanUnusedTopic(), 'cleanUnusedTopic 失败 false');
+        $this->checkSame(false, $admin6->cleanUnusedTopic(), 'cleanUnusedTopic failure → false');
 
         // viewBrokerStatsData
         $admin7 = $this->newAdmin();
@@ -883,15 +885,15 @@ final class RunClientAdmin
         $got7 = $admin7->viewBrokerStatsData('b:1', 'SN', 'SK');
         $this->checkSame(RequestCode::VIEW_BROKER_STATS_DATA, $this->lastCmd($admin7)->code, 'VIEW_BROKER_STATS_DATA=315');
         $this->checkSame(['statsName' => 'SN', 'statsKey' => 'SK'], $this->lastCmd($admin7)->extFields, 'VIEW_BROKER_STATS_DATA ext');
-        $this->checkSame(['statsMinute' => []], $got7, 'viewBrokerStatsData 解析 body');
+        $this->checkSame(['statsMinute' => []], $got7, 'viewBrokerStatsData parses the body');
     }
 
-    // ================================================================ NameServer KV 配置
+    // ================================================================ NameServer KV configuration
 
     private function testKvConfig(): void
     {
         $admin = $this->newAdmin();
-        $this->assertSamePub($admin->putKvConfig('NS', 'K', 'V'), null, 'putKvConfig 无返回');
+        $this->assertSamePub($admin->putKvConfig('NS', 'K', 'V'), null, 'putKvConfig returns nothing');
         $this->checkSame(RequestCode::PUT_KV_CONFIG, $this->lastCmd($admin)->code, 'PUT_KV_CONFIG=100');
 
         $admin2 = $this->newAdmin();
@@ -901,60 +903,60 @@ final class RunClientAdmin
 
         $admin3 = $this->newAdmin();
         $admin3->handler = fn() => $this->okResponse(null, ['value' => 'V1']);
-        $this->checkSame('V1', $admin3->getKvConfig('NS', 'K'), 'getKvConfig 取 ext value');
+        $this->checkSame('V1', $admin3->getKvConfig('NS', 'K'), 'getKvConfig reads ext value');
         $this->checkSame(RequestCode::GET_KV_CONFIG, $this->lastCmd($admin3)->code, 'GET_KV_CONFIG=101');
         $admin3->handler = fn() => $this->errResponse(ResponseCode::SYSTEM_ERROR, 'x');
-        // getKvConfig：非 SUCCESS **不抛**，返回 null（与 checkResponse 语义不同）
-        $this->checkSame(null, $admin3->getKvConfig('NS', 'K'), 'getKvConfig 非 SUCCESS → null（不抛异常）');
+        // getKvConfig: non-SUCCESS does **not** throw, returns null (different from checkResponse semantics)
+        $this->checkSame(null, $admin3->getKvConfig('NS', 'K'), 'getKvConfig non-SUCCESS → null (no exception)');
 
         $admin4 = $this->newAdmin();
         $kv = new KVTable();
         $kv->table = ['k1' => 'v1'];
         $admin4->handler = fn() => $this->okResponse($kv->encode());
-        $this->checkSame(['k1' => 'v1'], $admin4->getKvListByNamespace('NS')->table, 'getKvListByNamespace 解析 KVTable');
+        $this->checkSame(['k1' => 'v1'], $admin4->getKvListByNamespace('NS')->table, 'getKvListByNamespace parses KVTable');
         $this->checkSame(RequestCode::GET_KVLIST_BY_NAMESPACE, $this->lastCmd($admin4)->code, 'GET_KVLIST_BY_NAMESPACE=219');
         $admin4->handler = fn() => $this->okResponse(null);
-        $this->checkSame([], $admin4->getKvListByNamespace('NS')->table, 'getKvListByNamespace 空 body');
+        $this->checkSame([], $admin4->getKvListByNamespace('NS')->table, 'getKvListByNamespace empty body');
 
-        // createOrUpdateOrderConf：集群模式直写
+        // createOrUpdateOrderConf: cluster mode writes directly
         $admin5 = $this->newAdmin();
         $admin5->createOrUpdateOrderConf('T', 'broker-a:q', true);
         $this->checkSame(
             ['namespace' => DefaultMQAdminExt::NAMESPACE_ORDER_TOPIC_CONFIG, 'key' => 'T', 'value' => 'broker-a:q'],
             $this->lastCmd($admin5)->extFields,
-            'createOrUpdateOrderConf 集群模式直写 ORDER_TOPIC_CONFIG'
+            'createOrUpdateOrderConf cluster mode writes ORDER_TOPIC_CONFIG directly'
         );
-        // 非集群模式：读改写
+        // Non-cluster mode: read-modify-write
         $admin6 = $this->newAdmin();
         $admin6->handler = fn() => $this->okResponse(null, ['value' => 't1:conf1;t2:conf2']);
         $admin6->createOrUpdateOrderConf('T', 't3:conf3', false);
         $puts = $this->cmdsByCode($admin6, RequestCode::PUT_KV_CONFIG);
-        $this->checkSame(1, count($puts), 'createOrUpdateOrderConf 非集群 = 1 次 PUT');
-        $this->checkSame('t1:conf1;t2:conf2;t3:conf3', $puts[0]->extFields['value'] ?? null, 'createOrUpdateOrderConf 替换条目后整体写回');
+        $this->checkSame(1, count($puts), 'createOrUpdateOrderConf non-cluster = 1 PUT');
+        $this->checkSame('t1:conf1;t2:conf2;t3:conf3', $puts[0]->extFields['value'] ?? null, 'createOrUpdateOrderConf replaces the entry then writes the whole back');
         $admin6b = $this->newAdmin();
         $admin6b->handler = fn() => $this->okResponse(null, ['value' => 't1:conf1;t2:conf2']);
         $admin6b->createOrUpdateOrderConf('T', 't2:newconf', false);
         $puts2 = $this->cmdsByCode($admin6b, RequestCode::PUT_KV_CONFIG);
-        $this->checkSame('t1:conf1;t2:newconf', $puts2[0]->extFields['value'] ?? null, 'createOrUpdateOrderConf 同 key 替换');
-        $this->checkThrows(fn() => $admin6b->createOrUpdateOrderConf('', 'v'), MQClientException::class, 'createOrUpdateOrderConf 空 key 抛');
-        $this->checkThrows(fn() => $admin6b->createOrUpdateOrderConf('T', ''), MQClientException::class, 'createOrUpdateOrderConf 空 value 抛');
-        $this->checkThrows(fn() => $admin6b->createOrUpdateOrderConf('T', ':conf'), MQClientException::class, 'createOrUpdateOrderConf value 无 key 抛');
-        // getKvConfig 抛异常时按空表继续（异常被吞，old_confs 视为空串）
-        // 注意：put 广播对连接失败**不容错**（不做 try/catch 兜底），
-        // 所以这里只让首次 GET 失败，PUT 必须能正常到达。
+        $this->checkSame('t1:conf1;t2:newconf', $puts2[0]->extFields['value'] ?? null, 'createOrUpdateOrderConf replaces the same key');
+        $this->checkThrows(fn() => $admin6b->createOrUpdateOrderConf('', 'v'), MQClientException::class, 'createOrUpdateOrderConf empty key throws');
+        $this->checkThrows(fn() => $admin6b->createOrUpdateOrderConf('T', ''), MQClientException::class, 'createOrUpdateOrderConf empty value throws');
+        $this->checkThrows(fn() => $admin6b->createOrUpdateOrderConf('T', ':conf'), MQClientException::class, 'createOrUpdateOrderConf value without key throws');
+        // getKvConfig exception continues with an empty table (exception swallowed, old_confs treated as empty)
+        // Note: the PUT broadcast has **no fault tolerance** for connect failures (no try/catch fallback),
+        // so here only the first GET fails; the PUT must arrive normally.
         $admin6c = $this->newAdmin();
         $seen6c = 0;
         $admin6c->handler = function (RemotingCommand $c, string $addr) use (&$seen6c) {
             if ($c->code === RequestCode::GET_KV_CONFIG && $seen6c++ === 0) {
                 throw new RemotingConnectException('x');
             }
-            return null; // harness 兜底 SUCCESS
+            return null; // harness falls back to SUCCESS
         };
         $admin6c->createOrUpdateOrderConf('T', 't1:conf1', false);
         $puts3 = $this->cmdsByCode($admin6c, RequestCode::PUT_KV_CONFIG);
-        $this->checkSame(1, count($puts3), '读失败后 PUT 仍发出');
-        $this->checkSame('t1:conf1', $puts3[0]->extFields['value'] ?? null, 'createOrUpdateOrderConf 读失败按空表继续');
-        $this->checkSame('ORDER_TOPIC_CONFIG', $puts3[0]->extFields['namespace'] ?? null, 'order conf 用 ORDER_TOPIC_CONFIG namespace');
+        $this->checkSame(1, count($puts3), 'PUT still sent after the read failure');
+        $this->checkSame('t1:conf1', $puts3[0]->extFields['value'] ?? null, 'createOrUpdateOrderConf continues with an empty table after a read failure');
+        $this->checkSame('ORDER_TOPIC_CONFIG', $puts3[0]->extFields['namespace'] ?? null, 'order conf uses the ORDER_TOPIC_CONFIG namespace');
     }
 
     private function assertSamePub(mixed $a, mixed $b, string $label): void
@@ -962,11 +964,11 @@ final class RunClientAdmin
         $this->checkSame($a, $b, $label);
     }
 
-    // ================================================================ 订阅组管理
+    // ================================================================ Subscription group management
 
     private function testSubscriptionGroup(): void
     {
-        // createAndUpdateSubscriptionGroupConfig：body 是 SubscriptionGroupConfig JSON
+        // createAndUpdateSubscriptionGroupConfig: body is SubscriptionGroupConfig JSON
         $admin = $this->newAdmin();
         $cfg = new SubscriptionGroupConfig('G1');
         $cfg->retryMaxTimes = 9;
@@ -974,18 +976,18 @@ final class RunClientAdmin
         $cmd = $this->lastCmd($admin);
         $this->checkSame(RequestCode::UPDATE_AND_CREATE_SUBSCRIPTIONGROUP, $cmd->code, 'UPDATE_AND_CREATE_SUBSCRIPTIONGROUP=200');
         $decoded = SubscriptionGroupConfig::decode($cmd->body ?? '');
-        $this->checkSame('G1', $decoded->groupName, '200 body 是 SubscriptionGroupConfig JSON');
-        $this->checkSame(9, $decoded->retryMaxTimes, '200 body 字段保留');
+        $this->checkSame('G1', $decoded->groupName, '200 body is SubscriptionGroupConfig JSON');
+        $this->checkSame(9, $decoded->retryMaxTimes, '200 body field preserved');
 
-        // getSubscriptionGroupConfig：352 单查
+        // getSubscriptionGroupConfig: 352 single lookup
         $admin2 = $this->newAdmin();
         $admin2->handler = fn() => $this->okResponse((new SubscriptionGroupConfig('G2'))->encode());
         $got = $admin2->getSubscriptionGroupConfig('b:1', 'G2');
         $this->checkSame(RequestCode::GET_SUBSCRIPTIONGROUP_CONFIG, $this->lastCmd($admin2)->code, 'GET_SUBSCRIPTIONGROUP_CONFIG=352');
         $this->checkSame('G2', $this->lastCmd($admin2)->extFields['group'] ?? null, '352 ext group');
-        $this->checkSame('G2', $got?->groupName, 'getSubscriptionGroupConfig 解析');
+        $this->checkSame('G2', $got?->groupName, 'getSubscriptionGroupConfig parses');
         $admin2->handler = fn() => $this->okResponse(null);
-        $this->checkSame(null, $admin2->getSubscriptionGroupConfig('b:1', 'G2'), 'getSubscriptionGroupConfig 空 body → null');
+        $this->checkSame(null, $admin2->getSubscriptionGroupConfig('b:1', 'G2'), 'getSubscriptionGroupConfig empty body → null');
 
         // deleteSubscriptionGroup
         $admin3 = $this->newAdmin();
@@ -993,9 +995,9 @@ final class RunClientAdmin
         $this->checkSame(RequestCode::DELETE_SUBSCRIPTIONGROUP, $this->lastCmd($admin3)->code, 'DELETE_SUBSCRIPTIONGROUP=207');
         $this->checkSame(['groupName' => 'G1', 'cleanOffset' => 'true'], $this->lastCmd($admin3)->extFields, '207 ext cleanOffset=true');
         $admin3->deleteSubscriptionGroup('b:1', 'G1');
-        $this->checkSame('false', $this->lastCmd($admin3)->extFields['cleanOffset'] ?? null, '207 ext cleanOffset=false 缺省');
+        $this->checkSame('false', $this->lastCmd($admin3)->extFields['cleanOffset'] ?? null, '207 ext cleanOffset=false default');
 
-        // 分页：totalGroupNum=4，每页 2 组
+        // Pagination: totalGroupNum=4, 2 groups per page
         $admin4 = $this->newAdmin();
         $page = 0;
         $admin4->handler = function (RemotingCommand $cmd) use (&$page) {
@@ -1011,19 +1013,19 @@ final class RunClientAdmin
             return $this->okResponse($w->encode(), ['totalGroupNum' => '4']);
         };
         $wrapper = $admin4->getAllSubscriptionGroup('b:1');
-        $this->checkSame(2, count($admin4->requests), '分页收满 2 页');
-        $this->checkSame(['G1', 'G2', 'G3', 'G4'], array_keys($wrapper->subscriptionGroupTable), '分页结果合并');
-        $this->checkSame(['counter' => 7], $wrapper->dataVersion, '分页结果保留 dataVersion');
+        $this->checkSame(2, count($admin4->requests), 'pagination collects all 2 pages');
+        $this->checkSame(['G1', 'G2', 'G3', 'G4'], array_keys($wrapper->subscriptionGroupTable), 'paged results merged');
+        $this->checkSame(['counter' => 7], $wrapper->dataVersion, 'paged results keep dataVersion');
         $r1 = $admin4->requests[0]['cmd'];
         $r2 = $admin4->requests[1]['cmd'];
         $this->checkSame(RequestCode::GET_ALL_SUBSCRIPTIONGROUP_CONFIG, $r1->code, 'GET_ALL_SUBSCRIPTIONGROUP_CONFIG=201');
-        $this->checkSame('0', $r1->extFields['groupSeq'] ?? null, '首页 groupSeq=0');
+        $this->checkSame('0', $r1->extFields['groupSeq'] ?? null, 'first page groupSeq=0');
         $this->checkSame('10000', $r1->extFields['maxGroupNum'] ?? null, 'maxGroupNum=10000');
-        $this->check(!isset($r1->extFields['dataVersion']), '首页不带 dataVersion');
-        $this->checkSame('2', $r2->extFields['groupSeq'] ?? null, '第二页 groupSeq=2');
-        $this->checkSame('{"counter":7}', $r2->extFields['dataVersion'] ?? null, '第二页带 dataVersion JSON');
+        $this->check(!isset($r1->extFields['dataVersion']), 'first page carries no dataVersion');
+        $this->checkSame('2', $r2->extFields['groupSeq'] ?? null, 'second page groupSeq=2');
+        $this->checkSame('{"counter":7}', $r2->extFields['dataVersion'] ?? null, 'second page carries dataVersion JSON');
 
-        // 老 broker：不带 totalGroupNum，单轮结束
+        // Old broker: no totalGroupNum, single round
         $admin5 = $this->newAdmin();
         $admin5->handler = function () {
             $w = new SubscriptionGroupWrapper();
@@ -1031,10 +1033,10 @@ final class RunClientAdmin
             return $this->okResponse($w->encode());
         };
         $w5 = $admin5->getAllSubscriptionGroup('b:1');
-        $this->checkSame(1, count($admin5->requests), '老 broker 单轮结束');
-        $this->checkSame(['G1'], array_keys($w5->subscriptionGroupTable), '老 broker 结果');
+        $this->checkSame(1, count($admin5->requests), 'old broker finishes in a single round');
+        $this->checkSame(['G1'], array_keys($w5->subscriptionGroupTable), 'old broker result');
 
-        // dataVersion 变化 → 重启分页
+        // dataVersion changed → restart pagination
         $admin6 = $this->newAdmin();
         $turn = 0;
         $admin6->handler = function (RemotingCommand $cmd) use (&$turn) {
@@ -1049,14 +1051,14 @@ final class RunClientAdmin
             return $this->okResponse($w->encode(), ['totalGroupNum' => '3']);
         };
         $w6 = $admin6->getAllSubscriptionGroup('b:1');
-        $this->checkSame(4, count($admin6->requests), 'dataVersion 变化后重启分页（共 4 轮）');
-        $this->checkSame(['P3', 'P4'], array_keys($w6->subscriptionGroupTable), '重启后清掉旧页数据');
-        $this->checkSame('0', $admin6->requests[2]['cmd']->extFields['groupSeq'] ?? null, '重启轮 groupSeq 归零');
+        $this->checkSame(4, count($admin6->requests), 'dataVersion change restarts pagination (4 rounds total)');
+        $this->checkSame(['P3', 'P4'], array_keys($w6->subscriptionGroupTable), 'old page data cleared after restart');
+        $this->checkSame('0', $admin6->requests[2]['cmd']->extFields['groupSeq'] ?? null, 'restart round groupSeq reset to 0');
 
-        // 非 SUCCESS → MQBrokerException
+        // Non-SUCCESS → MQBrokerException
         $admin7 = $this->newAdmin();
         $admin7->handler = fn() => $this->errResponse(ResponseCode::SYSTEM_ERROR, 'bad');
-        $this->checkThrows(fn() => $admin7->getAllSubscriptionGroup('b:1'), MQBrokerException::class, '分页非 SUCCESS → MQBrokerException');
+        $this->checkThrows(fn() => $admin7->getAllSubscriptionGroup('b:1'), MQBrokerException::class, 'pagination non-SUCCESS → MQBrokerException');
 
         // examineSubscriptionGroupConfig
         $admin8 = $this->newAdmin();
@@ -1065,10 +1067,10 @@ final class RunClientAdmin
             $w->subscriptionGroupTable = ['G1' => new SubscriptionGroupConfig('G1'), 'G2' => new SubscriptionGroupConfig('G2')];
             return $this->okResponse($w->encode());
         };
-        $this->checkSame('G2', $admin8->examineSubscriptionGroupConfig('b:1', 'G2')?->groupName, 'examineSubscriptionGroupConfig 取目标组');
-        $this->checkSame(null, $admin8->examineSubscriptionGroupConfig('b:1', 'Nope'), 'examineSubscriptionGroupConfig 未命中 → null');
+        $this->checkSame('G2', $admin8->examineSubscriptionGroupConfig('b:1', 'G2')?->groupName, 'examineSubscriptionGroupConfig picks the target group');
+        $this->checkSame(null, $admin8->examineSubscriptionGroupConfig('b:1', 'Nope'), 'examineSubscriptionGroupConfig miss → null');
 
-        // getUserSubscriptionGroup 过滤系统组/预定义组
+        // getUserSubscriptionGroup filters system/predefined groups
         $admin9 = $this->newAdmin();
         $admin9->handler = function () {
             $w = new SubscriptionGroupWrapper();
@@ -1079,9 +1081,9 @@ final class RunClientAdmin
             ];
             return $this->okResponse($w->encode());
         };
-        $this->checkSame(['G1'], array_keys($admin9->getUserSubscriptionGroup('b:1')->subscriptionGroupTable), 'getUserSubscriptionGroup 过滤');
+        $this->checkSame(['G1'], array_keys($admin9->getUserSubscriptionGroup('b:1')->subscriptionGroupTable), 'getUserSubscriptionGroup filters');
 
-        // 批量：createAndUpdateSubscriptionGroupConfigList
+        // Batch: createAndUpdateSubscriptionGroupConfigList
         $admin10 = $this->newAdmin();
         $g1 = new SubscriptionGroupConfig('G1');
         $g2 = new SubscriptionGroupConfig('G2');
@@ -1090,21 +1092,21 @@ final class RunClientAdmin
         $this->checkSame(RequestCode::UPDATE_AND_CREATE_SUBSCRIPTIONGROUP_LIST, $cmd10->code, 'UPDATE_AND_CREATE_SUBSCRIPTIONGROUP_LIST=225');
         $body10 = json_decode($cmd10->body ?? '', true);
         $this->checkSame(['G1', 'G2'], array_map(fn($x) => $x['groupName'], $body10['groupConfigList'] ?? []), '225 body key=groupConfigList');
-        $this->checkThrows(fn() => $admin10->createAndUpdateSubscriptionGroupConfigList('b:1', []), MQClientException::class, '批量订阅组空列表抛');
+        $this->checkThrows(fn() => $admin10->createAndUpdateSubscriptionGroupConfigList('b:1', []), MQClientException::class, 'batch subscription group empty list throws');
     }
 
-    // ================================================================ 消费者 / 生产者连接
+    // ================================================================ Consumer / producer connections
 
     private function testConnectionAndStats(): void
     {
-        // 集群信息供 firstBrokerAddr 使用
+        // Cluster info for firstBrokerAddr
         $ci = new ClusterInfo();
         $ci->brokerAddrTable = ['broker-a' => [0 => 'b:a']];
         $this->client->clusterInfo = $ci;
 
-        // examineConsumerConnectionInfo：默认取第一台 broker
+        // examineConsumerConnectionInfo: takes the first broker by default
         $admin = $this->newAdmin();
-        $this->client->clusterInfo = $ci; // newAdmin 会重建 FakeClient，需重新播种
+        $this->client->clusterInfo = $ci; // newAdmin rebuilds FakeClient, reseed needed
         $cc = new ConsumerConnection();
         $cc->consumeType = 'CONSUME_PASSIVELY';
         $cc->subscriptionTable = ['T' => ['tagsSet' => ['TagA']]];
@@ -1112,20 +1114,20 @@ final class RunClientAdmin
         $got = $admin->examineConsumerConnectionInfo('G1');
         $this->checkSame(RequestCode::GET_CONSUMER_CONNECTION_LIST, $this->lastCmd($admin)->code, 'GET_CONSUMER_CONNECTION_LIST=203');
         $this->checkSame('G1', $this->lastCmd($admin)->extFields['consumerGroup'] ?? null, '203 ext consumerGroup');
-        $this->checkSame('b:a', $this->lastAddr($admin), '未给 broker 地址时取集群第一台');
-        $this->checkSame('CONSUME_PASSIVELY', $got->consumeType, 'examineConsumerConnectionInfo 解析');
-        $this->check($admin->examineConsumerConnection('G1')->consumeType === 'CONSUME_PASSIVELY', 'examineConsumerConnection 别名');
+        $this->checkSame('b:a', $this->lastAddr($admin), 'first cluster broker used when no broker address given');
+        $this->checkSame('CONSUME_PASSIVELY', $got->consumeType, 'examineConsumerConnectionInfo parses');
+        $this->check($admin->examineConsumerConnection('G1')->consumeType === 'CONSUME_PASSIVELY', 'examineConsumerConnection alias');
         $admin->handler = fn() => $this->okResponse(null);
-        $this->checkThrows(fn() => $admin->examineConsumerConnectionInfo('G1'), MQClientException::class, '空 body → group not online');
+        $this->checkThrows(fn() => $admin->examineConsumerConnectionInfo('G1'), MQClientException::class, 'empty body → group not online');
 
-        // examineProducerConnectionInfo：空 body → ProducerConnection
+        // examineProducerConnectionInfo: empty body → ProducerConnection
         $admin2 = $this->newAdmin();
         $this->client->clusterInfo = $ci;
         $admin2->handler = fn() => $this->okResponse(null);
         $pc = $admin2->examineProducerConnectionInfo('PG');
         $this->checkSame(RequestCode::GET_PRODUCER_CONNECTION_LIST, $this->lastCmd($admin2)->code, 'GET_PRODUCER_CONNECTION_LIST=204');
         $this->checkSame('PG', $this->lastCmd($admin2)->extFields['producerGroup'] ?? null, '204 ext producerGroup');
-        $this->checkSame([], $pc->connectionSet, '空 body → ProducerConnection');
+        $this->checkSame([], $pc->connectionSet, 'empty body → ProducerConnection');
 
         // examineConsumerRunningInfo
         $admin3 = $this->newAdmin();
@@ -1139,18 +1141,18 @@ final class RunClientAdmin
         $this->checkSame('G1', $cmd3->extFields['consumerGroup'] ?? null, '307 ext consumerGroup');
         $this->checkSame('cid-1', $cmd3->extFields['clientId'] ?? null, '307 ext clientId');
         $this->checkSame('true', $cmd3->extFields['jstackEnable'] ?? null, '307 ext jstackEnable=true');
-        $this->checkSame('CONSUME_PASSIVELY', $got3->properties['PROP_CONSUME_TYPE'] ?? null, '307 body 解析');
-        $this->check($admin3->getConsumerRunningInfo('G1', 'cid-1') !== null, 'getConsumerRunningInfo 别名');
+        $this->checkSame('CONSUME_PASSIVELY', $got3->properties['PROP_CONSUME_TYPE'] ?? null, '307 body parsed');
+        $this->check($admin3->getConsumerRunningInfo('G1', 'cid-1') !== null, 'getConsumerRunningInfo alias');
         $admin3->handler = fn() => $this->okResponse(null);
-        $this->checkThrows(fn() => $admin3->examineConsumerRunningInfo('G1', 'cid-1'), MQClientException::class, '307 空 body → 抛');
+        $this->checkThrows(fn() => $admin3->examineConsumerRunningInfo('G1', 'cid-1'), MQClientException::class, '307 empty body → throws');
 
-        // getConsumerListByGroup 委托实例
+        // getConsumerListByGroup delegates to the instance
         $admin4 = $this->newAdmin();
         $this->client->clusterInfo = $ci;
         $this->client->consumerIdList = ['c1', 'c2'];
         $list = $admin4->getConsumerListByGroup('G1');
-        $this->checkSame('b:a', $this->client->consumerListCalls[0]['addr'] ?? null, 'getConsumerListByGroup 默认第一台 broker');
-        $this->checkSame(['c1', 'c2'], $list->consumerIdList, 'getConsumerListByGroup 结果');
+        $this->checkSame('b:a', $this->client->consumerListCalls[0]['addr'] ?? null, 'getConsumerListByGroup defaults to the first broker');
+        $this->checkSame(['c1', 'c2'], $list->consumerIdList, 'getConsumerListByGroup result');
 
         // examineConsumeStats
         $admin5 = $this->newAdmin();
@@ -1158,11 +1160,11 @@ final class RunClientAdmin
         $cs = $admin5->examineConsumeStats('b:1', 'G1', 'T', ['T1', 'T2']);
         $cmd5 = $this->lastCmd($admin5);
         $this->checkSame(RequestCode::GET_CONSUME_STATS, $cmd5->code, 'GET_CONSUME_STATS=208');
-        $this->checkSame(['consumerGroup' => 'G1', 'topic' => 'T', 'topicList' => 'T1;T2'], $cmd5->extFields, '208 ext（topicList 分号拼接）');
-        $this->checkSame(2.5, $cs->consumeTps, '208 解析 consumeTps');
-        $this->checkSame(7, $cs->offsetTable[0]['value']->consumerOffset, '208 解析 consumerOffset');
+        $this->checkSame(['consumerGroup' => 'G1', 'topic' => 'T', 'topicList' => 'T1;T2'], $cmd5->extFields, '208 ext (topicList joined with semicolons)');
+        $this->checkSame(2.5, $cs->consumeTps, '208 parses consumeTps');
+        $this->checkSame(7, $cs->offsetTable[0]['value']->consumerOffset, '208 parses consumerOffset');
         $admin5->handler = fn() => $this->okResponse(null);
-        $this->checkSame([], $admin5->examineConsumeStats('b:1', 'G1')->offsetTable, '208 空 body → 空 ConsumeStats');
+        $this->checkSame([], $admin5->examineConsumeStats('b:1', 'G1')->offsetTable, '208 empty body → empty ConsumeStats');
 
         // fetchConsumeStatsInBroker
         $admin6 = $this->newAdmin();
@@ -1172,9 +1174,9 @@ final class RunClientAdmin
         $got6 = $admin6->fetchConsumeStatsInBroker('b:1', true);
         $this->checkSame(RequestCode::GET_BROKER_CONSUME_STATS, $this->lastCmd($admin6)->code, 'GET_BROKER_CONSUME_STATS=317');
         $this->checkSame('true', $this->lastCmd($admin6)->extFields['isOrder'] ?? null, '317 ext isOrder=true');
-        $this->checkSame(1, count($got6->statsList), '317 解析 statsList');
+        $this->checkSame(1, count($got6->statsList), '317 parses statsList');
         $admin6->handler = fn() => $this->okResponse(null);
-        $this->checkSame([], $admin6->fetchConsumeStatsInBroker('b:1')->statsList, '317 空 body');
+        $this->checkSame([], $admin6->fetchConsumeStatsInBroker('b:1')->statsList, '317 empty body');
 
         // queryTopicConsumeByWho
         $admin7 = $this->newAdmin();
@@ -1182,11 +1184,11 @@ final class RunClientAdmin
         $groups = $admin7->queryTopicConsumeByWho('b:1', 'T');
         $this->checkSame(RequestCode::QUERY_TOPIC_CONSUME_BY_WHO, $this->lastCmd($admin7)->code, 'QUERY_TOPIC_CONSUME_BY_WHO=300');
         $this->checkSame('T', $this->lastCmd($admin7)->extFields['topic'] ?? null, '300 ext topic');
-        $this->checkSame(['GA', 'GB'], $groups, '300 groupList 去重');
+        $this->checkSame(['GA', 'GB'], $groups, '300 groupList deduplicated');
         $admin7->handler = fn() => $this->okResponse(null);
-        $this->checkSame([], $admin7->queryTopicConsumeByWho('b:1', 'T'), '300 空 body → 空');
+        $this->checkSame([], $admin7->queryTopicConsumeByWho('b:1', 'T'), '300 empty body → empty');
 
-        // examineConsumeStatsGroup：retry 路由扇出合并
+        // examineConsumeStatsGroup: retry route fan-out merge
         $admin8 = $this->newAdmin();
         $retryRoute = new TopicRouteData();
         $retryRoute->brokerDatas = [
@@ -1194,17 +1196,17 @@ final class RunClientAdmin
             new BrokerData('C', 'broker-b', [0 => 'b:b']),
         ];
         $this->client->topicRoutes[MixAll::RETRY_GROUP_TOPIC_PREFIX . 'G1'] = $retryRoute;
-        // 两台 broker 各自回报自己的队列（brokerName 不同 → MessageQueue 键不同，合并后 2 条）
+        // Both brokers each report their own queues (different brokerName → different MessageQueue keys, 2 entries after merge)
         $admin8->handler = fn(RemotingCommand $cmd, string $addr) => $this->okResponse(
             $this->statsBody(1.5, 'T', $addr === 'b:a' ? 'broker-a' : 'broker-b', 0, 1),
         );
         $merged = $admin8->examineConsumeStatsGroup('G1', 'T');
-        $this->checkSame(3.0, $merged->consumeTps, 'examineConsumeStatsGroup consumeTps 累加');
-        $this->checkSame(2, count($merged->offsetTable), 'examineConsumeStatsGroup offsetTable 合并');
-        $this->checkSame(RequestCode::GET_CONSUME_STATS, $this->lastCmd($admin8)->code, 'examineConsumeStatsGroup 逐台 208');
+        $this->checkSame(3.0, $merged->consumeTps, 'examineConsumeStatsGroup accumulates consumeTps');
+        $this->checkSame(2, count($merged->offsetTable), 'examineConsumeStatsGroup merges offsetTable');
+        $this->checkSame(RequestCode::GET_CONSUME_STATS, $this->lastCmd($admin8)->code, 'examineConsumeStatsGroup per-broker 208');
         $admin8b = $this->newAdmin();
         $this->client->topicRoutes[MixAll::RETRY_GROUP_TOPIC_PREFIX . 'G2'] = new TopicRouteData();
-        $this->checkThrows(fn() => $admin8b->examineConsumeStatsGroup('G2'), MQClientException::class, 'examineConsumeStatsGroup 全空 → 抛');
+        $this->checkThrows(fn() => $admin8b->examineConsumeStatsGroup('G2'), MQClientException::class, 'examineConsumeStatsGroup all empty → throws');
 
         // consumed()
         $admin9 = $this->newAdmin();
@@ -1219,13 +1221,13 @@ final class RunClientAdmin
         $msg->setQueueOffset(3);
         $msg->storeHost = '10.0.0.1';
         $msg->storeHostPort = 10911;
-        $this->checkSame(true, $admin9->consumed($msg, 'G1'), 'consumed: 位点越过 → true');
+        $this->checkSame(true, $admin9->consumed($msg, 'G1'), 'consumed: offset advanced → true');
         $msg2 = new MessageExt(topic: 'T', body: 'x');
         $msg2->setQueueId(0);
         $msg2->setQueueOffset(9);
         $msg2->storeHost = '10.0.0.1';
         $msg2->storeHostPort = 10911;
-        $this->checkSame(false, $admin9->consumed($msg2, 'G1'), 'consumed: 位点未越过 → false');
+        $this->checkSame(false, $admin9->consumed($msg2, 'G1'), 'consumed: offset not advanced → false');
 
         // queryTopicsByConsumerToBroker / queryTopicsByConsumer
         $admin10 = $this->newAdmin();
@@ -1235,7 +1237,7 @@ final class RunClientAdmin
         $got10 = $admin10->queryTopicsByConsumerToBroker('b:1', 'G1');
         $this->checkSame(RequestCode::QUERY_TOPICS_BY_CONSUMER, $this->lastCmd($admin10)->code, 'QUERY_TOPICS_BY_CONSUMER=343');
         $this->checkSame('G1', $this->lastCmd($admin10)->extFields['group'] ?? null, '343 ext group');
-        $this->checkSame(['T1'], $got10->getTopicList(), '343 解析');
+        $this->checkSame(['T1'], $got10->getTopicList(), '343 parses');
 
         $admin11 = $this->newAdmin();
         $this->client->topicRoutes[MixAll::RETRY_GROUP_TOPIC_PREFIX . 'G1'] = new TopicRouteData();
@@ -1245,25 +1247,25 @@ final class RunClientAdmin
         ];
         $admin11->handler = fn() => $this->okResponse((new TopicList())->encode());
         $merged11 = $admin11->queryTopicsByConsumer('G1');
-        $this->checkSame([], $merged11->getTopicList(), 'queryTopicsByConsumer 空结果合并');
+        $this->checkSame([], $merged11->getTopicList(), 'queryTopicsByConsumer merges empty results');
 
         // querySubscription / getConsumeStatus / cloneGroupOffset
         $admin12 = $this->newAdmin();
         $admin12->handler = fn() => $this->okResponse(json_encode(['topics' => ['T']]));
         $sub = $admin12->querySubscription('b:1', 'G1', 'T');
         $this->checkSame(RequestCode::QUERY_SUBSCRIPTION_BY_CONSUMER, $this->lastCmd($admin12)->code, 'QUERY_SUBSCRIPTION_BY_CONSUMER=345');
-        $this->checkSame(['topics' => ['T']], $sub, '345 解析');
+        $this->checkSame(['topics' => ['T']], $sub, '345 parses');
         $admin12->handler = fn() => $this->okResponse(null);
-        $this->checkSame(null, $admin12->querySubscription('b:1', 'G1', 'T'), '345 空 body → null');
+        $this->checkSame(null, $admin12->querySubscription('b:1', 'G1', 'T'), '345 empty body → null');
 
         $admin13 = $this->newAdmin();
         $admin13->handler = fn() => $this->okResponse(json_encode(['consumerTable' => ['cid-1' => ['pullRT' => 1.5]]]));
         $status = $admin13->getConsumeStatus('b:1', 'T', 'G1', 'cid-1');
         $this->checkSame(RequestCode::INVOKE_BROKER_TO_GET_CONSUMER_STATUS, $this->lastCmd($admin13)->code, 'INVOKE_BROKER_TO_GET_CONSUMER_STATUS=223');
         $this->checkSame('cid-1', $this->lastCmd($admin13)->extFields['clientAddr'] ?? null, '223 ext clientAddr');
-        $this->checkSame(['cid-1' => ['pullRT' => 1.5]], $status, '223 取 consumerTable');
+        $this->checkSame(['cid-1' => ['pullRT' => 1.5]], $status, '223 reads consumerTable');
         $admin13->handler = fn() => $this->okResponse(null);
-        $this->checkSame([], $admin13->getConsumeStatus('b:1', 'T', 'G1'), '223 空 body → 空');
+        $this->checkSame([], $admin13->getConsumeStatus('b:1', 'T', 'G1'), '223 empty body → empty');
 
         $admin14 = $this->newAdmin();
         $admin14->cloneGroupOffset('b:1', 'S', 'D', 'T', true);
@@ -1275,11 +1277,11 @@ final class RunClientAdmin
         );
     }
 
-    // ================================================================ 消息轨迹
+    // ================================================================ Message track
 
     private function testMessageTrack(): void
     {
-        // PULL（CONSUME_ACTIVELY）
+        // PULL (CONSUME_ACTIVELY)
         $admin = $this->newAdmin();
         $this->route('T', 'broker-a', 'b:a');
         $this->client->clusterInfo = new ClusterInfo();
@@ -1296,12 +1298,12 @@ final class RunClientAdmin
             return $this->okResponse($this->statsBody(1.0, 'T', 'broker-a', 0, 9));
         };
         $tracks = $admin->messageTrackDetail($this->trackMsg());
-        $this->checkSame(1, count($tracks), 'messageTrackDetail 单组');
+        $this->checkSame(1, count($tracks), 'messageTrackDetail single group');
         $this->checkSame('GA', $tracks[0]->consumerGroup, 'track consumerGroup');
         $this->checkSame(TrackType::PULL, $tracks[0]->trackType, 'CONSUME_ACTIVELY → PULL');
-        $this->checkSame(null, $tracks[0]->exceptionDesc, 'track 无异常描述');
+        $this->checkSame(null, $tracks[0]->exceptionDesc, 'track without exception description');
 
-        // NOT_ONLINE（206）
+        // NOT_ONLINE (206)
         $admin2 = $this->newAdmin();
         $this->route('T', 'broker-a', 'b:a');
         $this->client->clusterInfo = new ClusterInfo();
@@ -1314,9 +1316,9 @@ final class RunClientAdmin
         };
         $tracks2 = $admin2->messageTrackDetail($this->trackMsg());
         $this->checkSame(TrackType::NOT_ONLINE, $tracks2[0]->trackType, '206 → NOT_ONLINE');
-        $this->check(str_contains((string) $tracks2[0]->exceptionDesc, 'CODE:206'), 'NOT_ONLINE 带异常描述');
+        $this->check(str_contains((string) $tracks2[0]->exceptionDesc, 'CODE:206'), 'NOT_ONLINE carries the exception description');
 
-        // CONSUMED + CONSUMED_BUT_FILTERED（订阅比消息窄）
+        // CONSUMED + CONSUMED_BUT_FILTERED (subscription narrower than the message)
         $admin3 = $this->newAdmin();
         $this->route('T', 'broker-a', 'b:a');
         $this->client->clusterInfo = new ClusterInfo();
@@ -1337,15 +1339,15 @@ final class RunClientAdmin
         $msgTagA = $this->trackMsg();
         $msgTagA->setTags('TagA');
         $t3 = $admin3->messageTrackDetail($msgTagA);
-        $this->checkSame(TrackType::CONSUMED, $t3[0]->trackType, '位点越过且订阅含消息 tag → CONSUMED');
+        $this->checkSame(TrackType::CONSUMED, $t3[0]->trackType, 'offset advanced and subscription contains the message tag → CONSUMED');
         $msgTagB = $this->trackMsg();
         $msgTagB->setTags('TagB');
         $t3b = $admin3->messageTrackDetail($msgTagB);
-        $this->checkSame(TrackType::CONSUMED_BUT_FILTERED, $t3b[0]->trackType, '订阅不含消息 tag → CONSUMED_BUT_FILTERED');
+        $this->checkSame(TrackType::CONSUMED_BUT_FILTERED, $t3b[0]->trackType, 'subscription lacks the message tag → CONSUMED_BUT_FILTERED');
         $msgNoTag = $this->trackMsg();
         $t3c = $admin3->messageTrackDetail($msgNoTag);
-        $this->checkSame(TrackType::CONSUMED_BUT_FILTERED, $t3c[0]->trackType, '无 tag 消息对窄订阅 → CONSUMED_BUT_FILTERED');
-        // 订阅含 "*" → 保持 CONSUMED
+        $this->checkSame(TrackType::CONSUMED_BUT_FILTERED, $t3c[0]->trackType, 'tag-less message against a narrow subscription → CONSUMED_BUT_FILTERED');
+        // Subscription contains "*" → stays CONSUMED
         $cc3b = clone $cc3;
         $cc3b->subscriptionTable = ['T' => ['tagsSet' => ['*']]];
         $admin3->handler = function (RemotingCommand $cmd, string $addr) use ($cc3b) {
@@ -1358,7 +1360,7 @@ final class RunClientAdmin
             return $this->okResponse($this->statsBody(1.0, 'T', 'broker-a', 0, 9));
         };
         $t3d = $admin3->messageTrackDetail($msgNoTag);
-        $this->checkSame(TrackType::CONSUMED, $t3d[0]->trackType, '订阅含 * → CONSUMED');
+        $this->checkSame(TrackType::CONSUMED, $t3d[0]->trackType, 'subscription contains * → CONSUMED');
 
         // NOT_CONSUME_YET
         $admin4 = $this->newAdmin();
@@ -1378,10 +1380,11 @@ final class RunClientAdmin
             return $this->okResponse($this->statsBody(1.0, 'T', 'broker-a', 0, 1));
         };
         $t4 = $admin4->messageTrackDetail($this->trackMsg());
-        $this->checkSame(TrackType::NOT_CONSUME_YET, $t4[0]->trackType, '位点未越过 → NOT_CONSUME_YET');
+        $this->checkSame(TrackType::NOT_CONSUME_YET, $t4[0]->trackType, 'offset not advanced → NOT_CONSUME_YET');
 
-        // BROADCAST_CONSUMPTION（213）—— 判据：213 在 consumed() 阶段（208）返回
-        // 才会落 CONSUME_BROADCASTING；连接阶段（203）的 213 只落 UNKNOWN + desc。
+        // BROADCAST_CONSUMPTION (213) — criterion: only when 213 comes back during the consumed()
+        // phase (208) does it become CONSUME_BROADCASTING; a 213 at the connection phase (203)
+        // yields UNKNOWN + desc.
         $admin5 = $this->newAdmin();
         $this->route('T', 'broker-a', 'b:a');
         $this->client->clusterInfo = new ClusterInfo();
@@ -1401,11 +1404,11 @@ final class RunClientAdmin
         $t5 = $admin5->messageTrackDetail($this->trackMsg());
         $this->checkSame(TrackType::CONSUME_BROADCASTING, $t5[0]->trackType, '213 → CONSUME_BROADCASTING');
 
-        // 无可用 broker → 空列表
+        // No available broker → empty list
         $admin6 = $this->newAdmin();
         $emptyRoute = new TopicRouteData();
         $this->client->topicRoutes['T'] = $emptyRoute;
-        $this->checkSame([], $admin6->messageTrackDetail($this->trackMsg()), '无 broker → 空轨迹');
+        $this->checkSame([], $admin6->messageTrackDetail($this->trackMsg()), 'no broker → empty tracks');
 
         // MessageTrack DTO
         $mt = new MessageTrack('G1', TrackType::CONSUMED, 'note');
@@ -1418,10 +1421,10 @@ final class RunClientAdmin
         $this->checkSame($mt->consumerGroup, $mt2->consumerGroup, 'MessageTrack roundtrip consumerGroup');
         $this->checkSame($mt->trackType, $mt2->trackType, 'MessageTrack roundtrip trackType');
         $mt3 = MessageTrack::fromDict(['consumerGroup' => 'G2']);
-        $this->checkSame(TrackType::UNKNOWN, $mt3->trackType, 'MessageTrack 缺 trackType → UNKNOWN');
+        $this->checkSame(TrackType::UNKNOWN, $mt3->trackType, 'MessageTrack missing trackType → UNKNOWN');
         $mt4 = new MessageTrack('G3');
-        $this->checkSame(['consumerGroup' => 'G3', 'trackType' => 'UNKNOWN'], $mt4->toDict(), 'MessageTrack null exceptionDesc 不序列化');
-        $this->checkSame(TrackType::CONSUMED, TrackType::CONSUMED, 'TrackType 常量存在');
+        $this->checkSame(['consumerGroup' => 'G3', 'trackType' => 'UNKNOWN'], $mt4->toDict(), 'MessageTrack null exceptionDesc not serialized');
+        $this->checkSame(TrackType::CONSUMED, TrackType::CONSUMED, 'TrackType constant exists');
         $this->checkSame('CONSUMED_BUT_FILTERED', TrackType::CONSUMED_BUT_FILTERED, 'TrackType.CONSUMED_BUT_FILTERED');
         $this->checkSame('NOT_CONSUME_YET', TrackType::NOT_CONSUME_YET, 'TrackType.NOT_CONSUME_YET');
         $this->checkSame('NOT_ONLINE', TrackType::NOT_ONLINE, 'TrackType.NOT_ONLINE');
@@ -1437,51 +1440,51 @@ final class RunClientAdmin
         return $msg;
     }
 
-    // ================================================================ Offset 管理
+    // ================================================================ Offset management
 
     private function testOffsetManagement(): void
     {
         $mq = new MessageQueue('T', 'broker-a', 0);
 
-        // max/min offset 委托
+        // max/min offset delegation
         $admin = $this->newAdmin();
         $this->client->maxOffsetValue = 11;
         $this->client->minOffsetValue = 2;
-        $this->checkSame(11, $admin->maxOffset($mq), 'maxOffset 委托');
-        $this->checkSame(2, $admin->minOffset($mq), 'minOffset 委托');
+        $this->checkSame(11, $admin->maxOffset($mq), 'maxOffset delegation');
+        $this->checkSame(2, $admin->minOffset($mq), 'minOffset delegation');
 
-        // search 边界
+        // search boundary
         $admin2 = $this->newAdmin();
         $this->client->searchOffsetValue = 5;
-        $this->checkSame(5, $admin2->searchOffset($mq, 111), 'searchOffset 委托');
-        $this->checkSame('LOWER', $this->client->searchOffsetCalls[0]['boundary']?->value, 'searchOffset 显式 LOWER');
+        $this->checkSame(5, $admin2->searchOffset($mq, 111), 'searchOffset delegation');
+        $this->checkSame('LOWER', $this->client->searchOffsetCalls[0]['boundary']?->value, 'searchOffset explicit LOWER');
         $this->checkSame(5, $admin2->searchLowerBoundaryOffset($mq, 111), 'searchLowerBoundaryOffset');
         $this->checkSame('LOWER', $this->client->searchOffsetCalls[1]['boundary']?->value, 'searchLower LOWER');
         $this->checkSame(5, $admin2->searchUpperBoundaryOffset($mq, 111), 'searchUpperBoundaryOffset');
         $this->checkSame('UPPER', $this->client->searchOffsetCalls[2]['boundary']?->value, 'searchUpper UPPER');
-        $this->checkSame(111, $this->client->searchOffsetCalls[0]['ts'], 'searchOffset timestamp 透传');
+        $this->checkSame(111, $this->client->searchOffsetCalls[0]['ts'], 'searchOffset timestamp pass-through');
 
         // earliestMsgStoreTime
         $admin3 = $this->newAdmin();
         $this->client->brokerAddrTable = ['broker-a' => [MixAll::MASTER_ID => 'b:a']];
         $admin3->handler = fn() => $this->okResponse(null, ['timestamp' => '123456']);
-        $this->checkSame(123456, $admin3->earliestMsgStoreTime($mq), 'earliestMsgStoreTime 取 ext timestamp');
+        $this->checkSame(123456, $admin3->earliestMsgStoreTime($mq), 'earliestMsgStoreTime reads ext timestamp');
         $cmd3 = $this->lastCmd($admin3);
         $this->checkSame(RequestCode::GET_EARLIEST_MSG_STORETIME, $cmd3->code, 'GET_EARLIEST_MSG_STORETIME=32');
         $this->checkSame(['topic' => 'T', 'queueId' => '0', 'brokerName' => 'broker-a'], $cmd3->extFields, '32 ext');
         $admin3b = $this->newAdmin();
-        $this->checkThrows(fn() => $admin3b->earliestMsgStoreTime(new MessageQueue('T', 'no-broker', 0)), MQClientException::class, 'earliestMsgStoreTime 无主 → The broker[X] not exist');
+        $this->checkThrows(fn() => $admin3b->earliestMsgStoreTime(new MessageQueue('T', 'no-broker', 0)), MQClientException::class, 'earliestMsgStoreTime no master → The broker[X] not exist');
 
         // examineConsumerOffset / updateConsumerOffset / ToBroker
         $admin4 = $this->newAdmin();
         $this->client->queryOffsetValue = 42;
-        $this->checkSame(42, $admin4->examineConsumerOffset('G1', $mq), 'examineConsumerOffset 委托');
+        $this->checkSame(42, $admin4->examineConsumerOffset('G1', $mq), 'examineConsumerOffset delegation');
         $admin4->updateConsumerOffset('G1', $mq, 42);
-        $this->checkSame(42, $this->client->updateOffsetCalls[0]['offset'], 'updateConsumerOffset 委托');
+        $this->checkSame(42, $this->client->updateOffsetCalls[0]['offset'], 'updateConsumerOffset delegation');
         $admin4->updateConsumerOffsetToBroker('b:9', 'G1', $mq, 43);
-        $this->checkSame('b:9', $this->client->updateOffsetCalls[1]['addr'], 'updateConsumerOffsetToBroker 显式 addr');
+        $this->checkSame('b:9', $this->client->updateOffsetCalls[1]['addr'], 'updateConsumerOffsetToBroker explicit addr');
 
-        // resetOffsetByTimestamp：单 broker + ext 形态
+        // resetOffsetByTimestamp: single broker + ext shape
         $admin5 = $this->newAdmin();
         $this->route('T', 'broker-a', 'b:a');
         $admin5->handler = function () {
@@ -1490,18 +1493,18 @@ final class RunClientAdmin
             return $this->okResponse($b->encode());
         };
         $reset = $admin5->resetOffsetByTimestamp('T', 'G1', 123456);
-        $this->checkSame(1, count($reset), 'resetOffsetByTimestamp 返回队列表');
-        $this->checkSame(100, $reset[0]['offset'], 'resetOffsetByTimestamp offset 值');
+        $this->checkSame(1, count($reset), 'resetOffsetByTimestamp returns the queue table');
+        $this->checkSame(100, $reset[0]['offset'], 'resetOffsetByTimestamp offset value');
         $this->checkSame('broker-a', $reset[0]['mq']->brokerName, 'resetOffsetByTimestamp mq.brokerName');
         $cmd5 = $this->lastCmd($admin5);
         $this->checkSame(RequestCode::INVOKE_BROKER_TO_RESET_OFFSET, $cmd5->code, 'INVOKE_BROKER_TO_RESET_OFFSET=222');
         $this->checkSame(
             ['topic' => 'T', 'group' => 'G1', 'timestamp' => '123456', 'isForce' => 'true', 'offset' => '-1'],
             $cmd5->extFields,
-            '222 ext（键名是 isForce 不是 force；offset 缺省 -1）'
+            '222 ext (key is isForce not force; offset defaults to -1)'
         );
 
-        // LMQ topic 重路由到 clusterName
+        // LMQ topic re-routed via clusterName
         $admin6 = $this->newAdmin();
         $this->route('ClusterA', 'broker-c', 'b:c');
         $admin6->handler = function () {
@@ -1510,13 +1513,13 @@ final class RunClientAdmin
             return $this->okResponse($b->encode());
         };
         $reset6 = $admin6->resetOffsetByTimestamp('%LMQ%x', 'G1', 1, true, 'ClusterA');
-        $this->checkSame('broker-c', $reset6[0]['mq']->brokerName, 'LMQ topic 按 clusterName 查路由');
+        $this->checkSame('broker-c', $reset6[0]['mq']->brokerName, 'LMQ topic looks up the route by clusterName');
 
-        // 空 offset 表 → 抛
+        // Empty offset table → throws
         $admin7 = $this->newAdmin();
         $this->route('T', 'broker-a', 'b:a');
         $admin7->handler = fn() => $this->okResponse(null);
-        $this->checkThrows(fn() => $admin7->resetOffsetByTimestamp('T', 'G1', 1), MQClientException::class, 'reset 无队列表 → 抛');
+        $this->checkThrows(fn() => $admin7->resetOffsetByTimestamp('T', 'G1', 1), MQClientException::class, 'reset without a queue table → throws');
 
         // is_cpp → language=CPP
         $admin8 = $this->newAdmin();
@@ -1529,14 +1532,14 @@ final class RunClientAdmin
         $admin8->resetOffsetByTimestamp('T', 'G1', 1, true, null, true);
         $this->checkSame(LanguageCode::CPP->value, $this->lastCmd($admin8)->language, 'is_cpp=true → language=CPP');
 
-        // 222 非 SUCCESS → MQClientException
+        // 222 non-SUCCESS → MQClientException
         $admin9 = $this->newAdmin();
         $this->route('T', 'broker-a', 'b:a');
         $admin9->handler = fn() => $this->errResponse(ResponseCode::CONSUMER_NOT_ONLINE, 'no consumer');
         $e9 = $this->capture(fn() => $admin9->resetOffsetByTimestamp('T', 'G1', 1));
-        $this->check($e9 instanceof MQClientException && $e9->responseCode === ResponseCode::CONSUMER_NOT_ONLINE, '222 失败带响应码上抛');
+        $this->check($e9 instanceof MQClientException && $e9->responseCode === ResponseCode::CONSUMER_NOT_ONLINE, '222 failure propagates with the response code');
 
-        // resetOffsetByQueueId：两笔 RPC
+        // resetOffsetByQueueId: two RPCs
         $admin10 = $this->newAdmin();
         $admin10->handler = function () {
             $b = new ResetOffsetBody();
@@ -1544,46 +1547,46 @@ final class RunClientAdmin
             return $this->okResponse($b->encode());
         };
         $reset10 = $admin10->resetOffsetByQueueId('b:1', 'G1', 'T', 3, 55);
-        $this->checkSame(1, count($this->client->updateOffsetCalls), 'resetOffsetByQueueId 第一笔 25 更新位点');
-        $this->checkSame(55, $this->client->updateOffsetCalls[0]['offset'], '第一笔位点值');
-        $this->checkSame('b:1', $this->client->updateOffsetCalls[0]['addr'], '第一笔打指定 broker');
+        $this->checkSame(1, count($this->client->updateOffsetCalls), 'resetOffsetByQueueId first call 25 updates the offset');
+        $this->checkSame(55, $this->client->updateOffsetCalls[0]['offset'], 'first call offset value');
+        $this->checkSame('b:1', $this->client->updateOffsetCalls[0]['addr'], 'first call hits the given broker');
         $cmd10 = $this->lastCmd($admin10);
-        $this->checkSame(RequestCode::INVOKE_BROKER_TO_RESET_OFFSET, $cmd10->code, 'resetOffsetByQueueId 第二笔 222');
+        $this->checkSame(RequestCode::INVOKE_BROKER_TO_RESET_OFFSET, $cmd10->code, 'resetOffsetByQueueId second call 222');
         $this->checkSame(
             ['topic' => 'T', 'group' => 'G1', 'timestamp' => '0', 'isForce' => 'false', 'offset' => '55', 'queueId' => '3'],
             $cmd10->extFields,
-            '222 单队列重载 ext（timestamp=0/force=false/offset=55/queueId=3）'
+            '222 single-queue overload ext (timestamp=0/force=false/offset=55/queueId=3)'
         );
-        $this->checkSame(55, $reset10[0]['offset'], 'resetOffsetByQueueId 返回队列表');
+        $this->checkSame(55, $reset10[0]['offset'], 'resetOffsetByQueueId returns the queue table');
 
-        // resetOffsetNew：206 退化旧实现
+        // resetOffsetNew: 206 falls back to the legacy implementation
         $admin11 = $this->newAdmin();
         $trd = $this->route('T', 'broker-a', 'b:a', 1, 1);
         $admin11->handler = fn() => $this->errResponse(ResponseCode::CONSUMER_NOT_ONLINE, 'offline');
         $this->client->queryOffsetValue = 2;
         $this->client->maxOffsetValue = 10;
         $admin11->resetOffsetNew('G1', 'T', -1);
-        $this->checkSame(1, count($this->client->updateOffsetCalls), 'resetOffsetNew 退化路径写回位点');
+        $this->checkSame(1, count($this->client->updateOffsetCalls), 'resetOffsetNew fallback path writes back the offset');
         $this->checkSame(10, $this->client->updateOffsetCalls[0]['offset'], 'timestamp=-1 → maxOffset');
 
         $admin12 = $this->newAdmin();
         $this->route('T', 'broker-a', 'b:a');
         $admin12->handler = fn() => $this->errResponse(ResponseCode::SYSTEM_ERROR, 'x');
         $e12 = $this->capture(fn() => $admin12->resetOffsetNew('G1', 'T', -1));
-        $this->check($e12 instanceof MQClientException && $e12->responseCode === ResponseCode::SYSTEM_ERROR, 'resetOffsetNew 非 206 原样上抛');
+        $this->check($e12 instanceof MQClientException && $e12->responseCode === ResponseCode::SYSTEM_ERROR, 'resetOffsetNew non-206 rethrown as-is');
 
-        // resetOffsetByTimestampOld：force=false 且 reset > consumer → 不写回
+        // resetOffsetByTimestampOld: force=false and reset > consumer → no write-back
         $admin13 = $this->newAdmin();
         $this->route('T', 'broker-a', 'b:a', 1, 1);
         $this->client->queryOffsetValue = 2;
         $this->client->searchOffsetValue = 9;
         $got13 = $admin13->resetOffsetByTimestampOld('G1', 'T', 100, false);
-        $this->checkSame([], $got13, 'force=false 且位点前进 → 不写回');
+        $this->checkSame([], $got13, 'force=false and offset advanced → no write-back');
         $got13b = $admin13->resetOffsetByTimestampOld('G1', 'T', 100, true);
-        $this->checkSame(9, $got13b[0]['offset'] ?? null, 'force=true → 写回 search 位点');
-        $this->checkSame(1, count($this->client->updateOffsetCalls), 'force=true 执行 updateConsumerOffset');
+        $this->checkSame(9, $got13b[0]['offset'] ?? null, 'force=true → writes back the search offset');
+        $this->checkSame(1, count($this->client->updateOffsetCalls), 'force=true performs updateConsumerOffset');
 
-        // queryMessage 系列
+        // queryMessage family
         $admin14 = $this->newAdmin();
         $m1 = new MessageExt(topic: 'T', body: 'b');
         $m1->setTags('k1');
@@ -1593,42 +1596,42 @@ final class RunClientAdmin
             'indexType' => $this->client->queryMessageCalls[0]['indexType'],
             'uniqKey' => $this->client->queryMessageCalls[0]['uniqKey'],
         ], 'queryMessage indexType=K');
-        $this->checkSame([$m1], $got14, 'queryMessage 结果');
+        $this->checkSame([$m1], $got14, 'queryMessage result');
         $uniq = $admin14->queryMessageByUniqKey('T', 'u1');
         $this->checkSame('U', $this->client->queryMessageCalls[1]['indexType'], 'queryMessageByUniqKey indexType=U');
         $this->checkSame(true, $this->client->queryMessageCalls[1]['uniqKey'], 'queryMessageByUniqKey uniqKey=true');
         $this->checkSame(32, $this->client->queryMessageCalls[1]['maxNum'], 'queryMessageByUniqKey maxNum=32');
-        $this->checkSame($m1, $uniq, 'queryMessageByUniqKey 取首条');
+        $this->checkSame($m1, $uniq, 'queryMessageByUniqKey takes the first hit');
         $this->client->queryMessageResult = [];
-        $this->checkSame(null, $admin14->queryMessageByUniqKey('T', 'u1'), 'uniqKey 查不到 → null');
+        $this->checkSame(null, $admin14->queryMessageByUniqKey('T', 'u1'), 'uniqKey not found → null');
         $admin14->queryMessageByKey('T', 'k2', 5);
-        $this->checkSame(5, $this->client->queryMessageCalls[3]['maxNum'], 'queryMessageByKey maxNum 透传');
+        $this->checkSame(5, $this->client->queryMessageCalls[3]['maxNum'], 'queryMessageByKey maxNum pass-through');
 
-        // viewMessage：offset msgId 直查
+        // viewMessage: offset msgId direct lookup
         $admin15 = $this->newAdmin();
         $target = new MessageExt(topic: 'T', body: 'vb');
         $msgId = '7f00000100002a9f0000000000000064';
         $admin15->handler = fn(RemotingCommand $cmd) => $this->okResponse(\RocketMQ\Common\MessageDecoder::encodeMessageExt($target));
         $got15 = $admin15->viewMessage('T', $msgId);
         $this->checkSame(RequestCode::VIEW_MESSAGE_BY_ID, $this->lastCmd($admin15)->code, 'VIEW_MESSAGE_BY_ID=33');
-        $this->checkSame('127.0.0.1:10911', $this->lastAddr($admin15), 'viewMessage 按 msgId 解出 broker 地址（直连解码地址，不走路由）');
-        $this->checkSame($target->getBody(), $got15->getBody(), 'viewMessage 命中 offset msgId');
+        $this->checkSame('127.0.0.1:10911', $this->lastAddr($admin15), 'viewMessage decodes the broker address from msgId (decodes the address directly, no route lookup)');
+        $this->checkSame($target->getBody(), $got15->getBody(), 'viewMessage hits the offset msgId');
 
-        // viewMessage：port=0（uniqKey 形态）→ 兜底 uniq 查询
+        // viewMessage: port=0 (uniqKey shape) → falls back to the uniq query
         $admin16 = $this->newAdmin();
         $admin16->handler = fn() => $this->okResponse(null);
         $this->client->queryMessageResult = [$target];
         $got16 = $admin16->viewMessage('T', '7f0000010000000000000000000064');
-        $this->checkSame($target, $got16, 'viewMessage 兜底 uniq key 命中');
-        $this->checkSame('U', $this->client->queryMessageCalls[0]['indexType'] ?? null, '兜底走 uniq 查询');
+        $this->checkSame($target, $got16, 'viewMessage uniq-key fallback hit');
+        $this->checkSame('U', $this->client->queryMessageCalls[0]['indexType'] ?? null, 'fallback goes through the uniq query');
 
-        // viewMessage：全失败
+        // viewMessage: all fail
         $admin17 = $this->newAdmin();
         $admin17->handler = fn() => $this->okResponse(null);
         $this->client->queryMessageResult = [];
         $e17 = $this->capture(fn() => $admin17->viewMessage('T', '7f00000100002a9f0000000000000064'));
-        $this->check($e17 instanceof MQClientException && $e17->responseCode === ResponseCode::NO_MESSAGE, 'viewMessage 全失败 → NO_MESSAGE');
-        $this->check($e17 !== null && $e17->getPrevious() !== null, 'viewMessage 保留 by-id 失败原因');
+        $this->check($e17 instanceof MQClientException && $e17->responseCode === ResponseCode::NO_MESSAGE, 'viewMessage all fail → NO_MESSAGE');
+        $this->check($e17 !== null && $e17->getPrevious() !== null, 'viewMessage keeps the by-id failure cause');
 
         // queryConsumeQueue
         $admin18 = $this->newAdmin();
@@ -1642,9 +1645,9 @@ final class RunClientAdmin
             $this->lastCmd($admin18)->extFields,
             '321 ext'
         );
-        $this->checkSame(88, $got18->maxQueueIndex, '321 解析');
+        $this->checkSame(88, $got18->maxQueueIndex, '321 parses');
 
-        // consumeMessageDirectly：offset msgId 全链路 → viewMessage 定位 storeHost + 309 下发
+        // consumeMessageDirectly: offset msgId full chain → viewMessage locates storeHost + 309 dispatch
         $admin19 = $this->newAdmin();
         $stored = new MessageExt(topic: 'T', body: 'vb');
         $stored->setStoreHost('10.0.0.9');
@@ -1658,24 +1661,24 @@ final class RunClientAdmin
         $res19 = $admin19->consumeMessageDirectly('G1', 'cid-1', 'T', '7f00000100002a9f0000000000000064');
         $byId = $admin19->requests[0]['cmd'];
         $direct = $admin19->requests[1]['cmd'];
-        $this->checkSame(RequestCode::VIEW_MESSAGE_BY_ID, $byId->code, '309 前置 viewMessage 定位');
+        $this->checkSame(RequestCode::VIEW_MESSAGE_BY_ID, $byId->code, '309 preceded by viewMessage to locate');
         $this->checkSame(RequestCode::CONSUME_MESSAGE_DIRECTLY, $direct->code, 'CONSUME_MESSAGE_DIRECTLY=309');
-        $this->checkSame('10.0.0.9:10911', $admin19->requests[1]['addr'], '309 发给消息 storeHost');
+        $this->checkSame('10.0.0.9:10911', $admin19->requests[1]['addr'], '309 sent to the message storeHost');
         $this->checkSame(
             ['consumerGroup' => 'G1', 'clientId' => 'cid-1', 'msgId' => '7f00000100002a9f0000000000000064', 'topic' => 'T'],
             $direct->extFields,
-            '309 ext（无 UNIQ_KEY 时 msgId 原样下发）'
+            '309 ext (without UNIQ_KEY the msgId is dispatched as-is)'
         );
-        $this->check($res19 instanceof ConsumeMessageDirectlyResult, '309 body 解码为 ConsumeMessageDirectlyResult');
+        $this->check($res19 instanceof ConsumeMessageDirectlyResult, '309 body decoded as ConsumeMessageDirectlyResult');
 
-        // consumeMessageDirectly：带 UNIQ_KEY 的消息 → 下发 offsetMsgId
+        // consumeMessageDirectly: message with UNIQ_KEY → dispatches offsetMsgId
         $admin20 = $this->newAdmin();
         $uniqMsg = new MessageExt(topic: 'T', body: 'vb');
         $uniqMsg->setStoreHost('10.0.0.9');
         $uniqMsg->storeHostPort = 10911;
         $uniqMsg->putProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX, 'uniq-abc');
         $uniqMsg->setOffsetMsgId('7f00000100002a9f0000000000000065');
-        // uniqKey 形态的 msgId 硬解必失败 → viewMessage 兜底走 uniq 查询，替身从这里回消息
+        // Hard-decoding a uniqKey-shaped msgId must fail → viewMessage falls back to the uniq query; the double answers from there
         $this->client->queryMessageResult = [$uniqMsg];
         $admin20->handler = function (RemotingCommand $cmd) use ($uniqMsg) {
             if ($cmd->code === RequestCode::VIEW_MESSAGE_BY_ID) {
@@ -1684,31 +1687,31 @@ final class RunClientAdmin
             return $this->okResponse((new ConsumeMessageDirectlyResult())->encode());
         };
         $admin20->consumeMessageDirectly('G1', 'cid-1', 'T', 'uniq-abc');
-        $this->checkSame(1, count($admin20->requests), '309 uniqKey 硬解失败 → 不发 VIEW_MESSAGE_BY_ID');
-        $this->checkSame(RequestCode::CONSUME_MESSAGE_DIRECTLY, $admin20->requests[0]['cmd']->code, '309 uniqKey 兜底直达');
-        $this->checkSame('10.0.0.9:10911', $admin20->requests[0]['addr'], '309 uniqKey 兜底仍发 storeHost');
-        $this->checkSame('7f00000100002a9f0000000000000065', $admin20->requests[0]['cmd']->extFields['msgId'] ?? null, '309 带 UNIQ_KEY → 下发 offsetMsgId（两路径一致）');
+        $this->checkSame(1, count($admin20->requests), '309 uniqKey hard-decode failure → no VIEW_MESSAGE_BY_ID sent');
+        $this->checkSame(RequestCode::CONSUME_MESSAGE_DIRECTLY, $admin20->requests[0]['cmd']->code, '309 uniqKey fallback goes direct');
+        $this->checkSame('10.0.0.9:10911', $admin20->requests[0]['addr'], '309 uniqKey fallback still targets storeHost');
+        $this->checkSame('7f00000100002a9f0000000000000065', $admin20->requests[0]['cmd']->extFields['msgId'] ?? null, '309 with UNIQ_KEY → dispatches offsetMsgId (both paths agree)');
 
-        // consumeMessageDirectly：显式 brokerAddr 跳过 viewMessage 直发
+        // consumeMessageDirectly: explicit brokerAddr skips viewMessage and sends directly
         $admin21 = $this->newAdmin();
         $admin21->handler = fn() => $this->okResponse((new ConsumeMessageDirectlyResult())->encode());
         $admin21->consumeMessageDirectly('G1', 'cid-1', 'T', 'm-1', 'b:1');
-        $this->checkSame(1, count($admin21->requests), '309 显式 brokerAddr 不做 viewMessage');
-        $this->checkSame('b:1', $this->lastAddr($admin21), '309 直发指定地址');
-        $this->checkSame('m-1', $this->lastCmd($admin21)->extFields['msgId'] ?? null, '309 显式地址 msgId 原样');
+        $this->checkSame(1, count($admin21->requests), '309 explicit brokerAddr skips viewMessage');
+        $this->checkSame('b:1', $this->lastAddr($admin21), '309 sends to the given address');
+        $this->checkSame('m-1', $this->lastCmd($admin21)->extFields['msgId'] ?? null, '309 explicit address msgId as-is');
 
-        // consumeMessageDirectly：空 body → 抛；非 SUCCESS → MQBrokerException
+        // consumeMessageDirectly: empty body → throws; non-SUCCESS → MQBrokerException
         $admin22 = $this->newAdmin();
         $admin22->handler = fn() => $this->okResponse(null);
-        $this->checkThrows(fn() => $admin22->consumeMessageDirectly('G1', 'cid-1', 'T', 'm-1', 'b:1'), MQClientException::class, '309 空 body 抛');
+        $this->checkThrows(fn() => $admin22->consumeMessageDirectly('G1', 'cid-1', 'T', 'm-1', 'b:1'), MQClientException::class, '309 empty body throws');
         $admin23 = $this->newAdmin();
         $admin23->handler = fn() => $this->errResponse(ResponseCode::SYSTEM_ERROR, 'client offline');
         $e23 = $this->capture(fn() => $admin23->consumeMessageDirectly('G1', 'cid-1', 'T', 'm-1', 'b:1'));
-        $this->check($e23 instanceof MQBrokerException, '309 非 SUCCESS → MQBrokerException');
-        $this->checkSame('client offline', $e23?->getMessage(), '309 非 SUCCESS 透传 remark');
+        $this->check($e23 instanceof MQBrokerException, '309 non-SUCCESS → MQBrokerException');
+        $this->checkSame('client offline', $e23?->getMessage(), '309 non-SUCCESS passes the remark through');
     }
 
-    // ================================================================ 批量 / 运维 / NameServer 配置
+    // ================================================================ Batch / ops / NameServer configuration
 
     private function testBatchAndOps(): void
     {
@@ -1717,10 +1720,10 @@ final class RunClientAdmin
         $admin->createAndUpdateTopicConfigList('b:1', [new TopicConfig('T1', 1, 1), new TopicConfig('T2', 2, 2)]);
         $cmd = $this->lastCmd($admin);
         $this->checkSame(RequestCode::UPDATE_AND_CREATE_TOPIC_LIST, $cmd->code, 'UPDATE_AND_CREATE_TOPIC_LIST=18');
-        $this->checkSame([], $cmd->extFields, '18 custom header 为空');
+        $this->checkSame([], $cmd->extFields, '18 custom header empty');
         $body = json_decode($cmd->body ?? '', true);
         $this->checkSame(['T1', 'T2'], array_map(fn($x) => $x['topicName'], $body['topicConfigList'] ?? []), '18 body key=topicConfigList');
-        $this->checkThrows(fn() => $admin->createAndUpdateTopicConfigList('b:1', []), MQClientException::class, '批量 topic 空列表抛');
+        $this->checkThrows(fn() => $admin->createAndUpdateTopicConfigList('b:1', []), MQClientException::class, 'batch topic empty list throws');
 
         // createStaticTopic
         $admin2 = $this->newAdmin();
@@ -1734,35 +1737,35 @@ final class RunClientAdmin
         $this->checkSame('8', $ext2['writeQueueNums'] ?? null, '513 ext writeQueueNums');
         $this->checkSame('6', $ext2['perm'] ?? null, '513 ext perm');
         $this->checkSame('SINGLE_TAG', $ext2['topicFilterType'] ?? null, '513 ext topicFilterType');
-        $this->checkSame('false', $ext2['order'] ?? null, '513 ext order 小写');
-        $this->checkSame('true', $ext2['force'] ?? null, '513 ext force 小写');
-        $this->checkSame(['b:1' => ['0' => 0]], json_decode($cmd2->body ?? '', true), '513 body 是 mappingDetail JSON');
+        $this->checkSame('false', $ext2['order'] ?? null, '513 ext order lowercase');
+        $this->checkSame('true', $ext2['force'] ?? null, '513 ext force lowercase');
+        $this->checkSame(['b:1' => ['0' => 0]], json_decode($cmd2->body ?? '', true), '513 body is the mappingDetail JSON');
 
         // updateAndGetGroupReadForbidden
         $admin3 = $this->newAdmin();
         $admin3->handler = fn() => $this->okResponse(json_encode(['forbidden' => false]));
         $got3 = $admin3->updateAndGetGroupReadForbidden('b:1', 'G1', 'T', true);
         $this->checkSame(RequestCode::UPDATE_AND_GET_GROUP_FORBIDDEN, $this->lastCmd($admin3)->code, 'UPDATE_AND_GET_GROUP_FORBIDDEN=353');
-        $this->checkSame('true', $this->lastCmd($admin3)->extFields['readable'] ?? null, '353 readable=true 下发');
-        $this->checkSame(['forbidden' => false], $got3, '353 解析 GroupForbidden');
+        $this->checkSame('true', $this->lastCmd($admin3)->extFields['readable'] ?? null, '353 readable=true dispatched');
+        $this->checkSame(['forbidden' => false], $got3, '353 parses GroupForbidden');
         $admin3->updateAndGetGroupReadForbidden('b:1', 'G1', 'T');
-        $this->check(!isset($this->lastCmd($admin3)->extFields['readable']), '353 readable=null 不下发');
+        $this->check(!isset($this->lastCmd($admin3)->extFields['readable']), '353 readable=null not dispatched');
         $admin3->handler = fn() => $this->okResponse(null);
-        $this->checkThrows(fn() => $admin3->updateAndGetGroupReadForbidden('b:1', 'G1', 'T'), MQClientException::class, '353 空 body 抛');
-        $this->checkThrows(fn() => $admin3->updateAndGetGroupReadForbidden('b:1', '', 'T'), MQClientException::class, '353 group 必填');
-        $this->checkThrows(fn() => $admin3->updateAndGetGroupReadForbidden('b:1', 'G', ''), MQClientException::class, '353 topic 必填');
+        $this->checkThrows(fn() => $admin3->updateAndGetGroupReadForbidden('b:1', 'G1', 'T'), MQClientException::class, '353 empty body throws');
+        $this->checkThrows(fn() => $admin3->updateAndGetGroupReadForbidden('b:1', '', 'T'), MQClientException::class, '353 group required');
+        $this->checkThrows(fn() => $admin3->updateAndGetGroupReadForbidden('b:1', 'G', ''), MQClientException::class, '353 topic required');
 
-        // resumeCheckHalfMessage：非 SUCCESS 返回 false 不抛
+        // resumeCheckHalfMessage: non-SUCCESS returns false without throwing
         $admin4 = $this->newAdmin();
-        $this->checkSame(true, $admin4->resumeCheckHalfMessage('b:1', 'T', 'm1'), '323 成功 → true');
+        $this->checkSame(true, $admin4->resumeCheckHalfMessage('b:1', 'T', 'm1'), '323 success → true');
         $cmd4 = $this->lastCmd($admin4);
         $this->checkSame(RequestCode::RESUME_CHECK_HALF_MESSAGE, $cmd4->code, 'RESUME_CHECK_HALF_MESSAGE=323');
         $this->checkSame(['topic' => 'T', 'msgId' => 'm1'], $cmd4->extFields, '323 ext');
         $admin4->handler = fn() => $this->errResponse(ResponseCode::SYSTEM_ERROR, 'not half');
-        $this->checkSame(false, $admin4->resumeCheckHalfMessage('b:1', 'T', 'm1'), '323 broker 拒绝 → false 不抛');
+        $this->checkSame(false, $admin4->resumeCheckHalfMessage('b:1', 'T', 'm1'), '323 broker rejects → false without throwing');
         $admin4->resumeCheckHalfMessage('b:1', 'T');
-        $this->checkSame(['topic' => 'T'], $this->lastCmd($admin4)->extFields, '323 无 msgId 时不下发');
-        $this->checkThrows(fn() => $admin4->resumeCheckHalfMessage('b:1', ''), MQClientException::class, '323 topic 必填');
+        $this->checkSame(['topic' => 'T'], $this->lastCmd($admin4)->extFields, '323 without msgId nothing dispatched');
+        $this->checkThrows(fn() => $admin4->resumeCheckHalfMessage('b:1', ''), MQClientException::class, '323 topic required');
 
         // cleanExpiredConsumerQueue / deleteExpiredCommitLog / ByAddr
         $admin5 = $this->newAdmin();
@@ -1773,17 +1776,17 @@ final class RunClientAdmin
         $this->checkSame(RequestCode::DELETE_EXPIRED_COMMITLOG, $this->lastCmd($admin5)->code, 'DELETE_EXPIRED_COMMITLOG=329');
         $this->checkSame('48', $this->lastCmd($admin5)->extFields['time'] ?? null, '329 ext time');
         $admin5->cleanUnusedTopicByAddr('b:2');
-        $this->checkSame(RequestCode::CLEAN_UNUSED_TOPIC, $this->lastCmd($admin5)->code, 'cleanUnusedTopicByAddr 单请求 316');
+        $this->checkSame(RequestCode::CLEAN_UNUSED_TOPIC, $this->lastCmd($admin5)->code, 'cleanUnusedTopicByAddr single request 316');
         $failed = $admin5->cleanExpiredConsumerQueueByAddr(['b:ok', 'b:bad'], 1);
         $admin5->handler = fn() => $this->errResponse(ResponseCode::SYSTEM_ERROR, 'x');
         $failed2 = $admin5->cleanExpiredConsumerQueueByAddr(['b:bad2', 'b:bad3'], 1);
-        $this->checkSame(['b:bad2', 'b:bad3'], $failed2, 'cleanExpiredConsumerQueueByAddr 返回失败地址');
+        $this->checkSame(['b:bad2', 'b:bad3'], $failed2, 'cleanExpiredConsumerQueueByAddr returns failed addresses');
         $admin5->handler = fn() => $this->okResponse();
-        $this->checkSame([], $admin5->deleteExpiredCommitLogByAddr(['b:1'], 1), 'deleteExpiredCommitLogByAddr 全成功');
+        $this->checkSame([], $admin5->deleteExpiredCommitLogByAddr(['b:1'], 1), 'deleteExpiredCommitLogByAddr all succeed');
         $admin5->handler = fn() => $this->errResponse(ResponseCode::SYSTEM_ERROR, 'x');
-        $this->checkSame(['b:1'], $admin5->deleteExpiredCommitLogByAddr(['b:1'], 1), 'deleteExpiredCommitLogByAddr 失败地址');
-        $this->check(true, 'cleanExpiredConsumerQueueByAddr 成功段执行（占位）');
-        $this->checkSame([], $failed, 'cleanExpiredConsumerQueueByAddr 全成功返回空');
+        $this->checkSame(['b:1'], $admin5->deleteExpiredCommitLogByAddr(['b:1'], 1), 'deleteExpiredCommitLogByAddr failed address');
+        $this->check(true, 'cleanExpiredConsumerQueueByAddr success segment executed (placeholder)');
+        $this->checkSame([], $failed, 'cleanExpiredConsumerQueueByAddr all succeed → empty');
 
         // queryConsumeTimeSpan
         $admin6 = $this->newAdmin();
@@ -1805,38 +1808,38 @@ final class RunClientAdmin
         $spans = $admin6->queryConsumeTimeSpan('T', 'G1');
         $this->checkSame(RequestCode::QUERY_CONSUME_TIME_SPAN, $this->lastCmd($admin6)->code, 'QUERY_CONSUME_TIME_SPAN=303');
         $this->checkSame(['topic' => 'T', 'group' => 'G1'], $this->lastCmd($admin6)->extFields, '303 ext');
-        $this->checkSame(1, count($spans), 'queryConsumeTimeSpan 空 body broker 跳过');
+        $this->checkSame(1, count($spans), 'queryConsumeTimeSpan skips empty-body brokers');
 
-        // updateNameServerConfig：properties 文本 + 广播
+        // updateNameServerConfig: properties text + broadcast
         $admin7 = $this->newAdmin();
         $admin7->setNameServerAddresses(['ns:1', 'ns:2']);
         $admin7->updateNameServerConfig(['k' => 'v']);
         $upds = $this->cmdsByCode($admin7, RequestCode::UPDATE_NAMESRV_CONFIG);
-        $this->checkSame(2, count($upds), 'UPDATE_NAMESRV_CONFIG 广播两台');
-        $this->checkSame("k=v\n", $upds[0]->body, '318 body 为 k=v\n 文本');
+        $this->checkSame(2, count($upds), 'UPDATE_NAMESRV_CONFIG broadcasts to both');
+        $this->checkSame("k=v\n", $upds[0]->body, '318 body is k=v\n text');
         $n = count($admin7->requests);
         $admin7->updateNameServerConfig([]);
-        $this->checkSame($n, count($admin7->requests), '318 空属性不发请求');
+        $this->checkSame($n, count($admin7->requests), '318 sends no request for empty properties');
         $admin7->handler = fn() => $this->errResponse(ResponseCode::SYSTEM_ERROR, 'denied');
         $e7 = $this->capture(fn() => $admin7->updateNameServerConfig(['k' => 'v']));
-        $this->check($e7 instanceof MQClientException && str_contains($e7->getMessage(), 'denied'), '318 任一失败统一抛');
+        $this->check($e7 instanceof MQClientException && str_contains($e7->getMessage(), 'denied'), '318 any failure throws uniformly');
 
         // getNameServerConfig
         $admin8 = $this->newAdmin();
         $admin8->setNameServerAddresses(['ns:1', 'ns:2']);
         $admin8->handler = fn() => $this->okResponse("a=1\n");
         $conf = $admin8->getNameServerConfig();
-        $this->checkSame(2, count($conf), '319 逐台查询');
-        $this->checkSame(['a' => '1'], $conf['ns:1'], '319 properties 解析');
+        $this->checkSame(2, count($conf), '319 per-server query');
+        $this->checkSame(['a' => '1'], $conf['ns:1'], '319 properties parsing');
         $admin8->handler = fn() => $this->errResponse(ResponseCode::SYSTEM_ERROR, 'x');
-        $this->checkThrows(fn() => $admin8->getNameServerConfig(), MQClientException::class, '319 全失败统一抛');
+        $this->checkThrows(fn() => $admin8->getNameServerConfig(), MQClientException::class, '319 all fail throws uniformly');
         $admin9 = $this->newAdmin();
         $admin9->setNameServerAddresses(['ns:1', 'ns:2']);
         $admin9->handler = fn(RemotingCommand $c, string $addr) => $addr === 'ns:1'
             ? $this->okResponse("a=1\n")
             : $this->errResponse(ResponseCode::SYSTEM_ERROR, 'x');
         $partial = $admin9->getNameServerConfig();
-        $this->checkSame(['ns:1'], array_keys($partial), '319 部分成功返回可用项');
+        $this->checkSame(['ns:1'], array_keys($partial), '319 partial success returns usable entries');
 
         // setMessageRequestMode
         $admin10 = $this->newAdmin();
@@ -1845,13 +1848,13 @@ final class RunClientAdmin
         $this->checkSame(
             ['topic' => 'T', 'consumerGroup' => 'G1', 'mode' => 'POP', 'popShareQueueNum' => '4'],
             $this->lastCmd($admin10)->extFields,
-            '401 ext（popShareQueueNum>0 才下发）'
+            '401 ext (popShareQueueNum>0 only)'
         );
         $admin10->setMessageRequestMode('b:1', 'T', 'G1', 'PULL');
-        $this->check(!isset($this->lastCmd($admin10)->extFields['popShareQueueNum']), '401 popShareQueueNum=0 不下发');
+        $this->check(!isset($this->lastCmd($admin10)->extFields['popShareQueueNum']), '401 popShareQueueNum=0 not dispatched');
     }
 
-    // ================================================================ 入口
+    // ================================================================ Entry point
 
     public function run(): int
     {

@@ -1,25 +1,25 @@
-//! 流控闸门真机验证（覆盖 S0..S5 六项场景）。
+//! Live verification of the flow-control gates (covers the six scenarios S0..S5).
 //!
-//! 离线单测（`src/client/consumer.rs` 的 `flow_control_hits_each_threshold`）锁的是**判据
-//! 本身**；这里锁真机上两件离线永远锁不住的事：
-//! - **A** 闸门在真实 broker 上**确实会命中**。单位错一位、阈值读错一个字段，离线拿 mock
-//!   缓冲照样"能命中"，真机上却永远不命中（或永远命中）。Rust 就曾在
-//!   `pull_threshold_size_for_topic` 那道闸门上误用了队列级开关，离线全绿。
-//! - **B** 命中之后**一条消息都不许丢**。流控只是"暂停拉取"，不是"丢弃/跳过"：暂停期间
-//!   位点不许越过还没消费完的消息，恢复后同一个队列必须继续消费到末尾。实现写成"命中就
-//!   丢批 / 退出循环"在十几秒窗口里完全看不出来，只有把全部消息数完才暴露。
+//! The offline unit test (`flow_control_hits_each_threshold` in `src/client/consumer.rs`) locks the
+//! **criteria themselves**; this file locks two things on a live machine that offline tests never can:
+//! - **A** the gates **do fire on a real broker**. One wrong unit or one misread threshold field and an
+//!   offline mock buffer still "fires", while on a real machine it never fires (or always fires). This crate
+//!   once misused a queue-level switch on the `pull_threshold_size_for_topic` gate, with offline all green.
+//! - **B** after a hit **not one message may be lost**. Flow control only "pauses pulling", it is not "discard/skip": while
+//!   paused the offset must not move past unconsumed messages, and after recovery the same queue must keep consuming to
+//!   the end. An implementation written as "drop the batch / exit the loop" is invisible in a ten-second window; only counting every message exposes it.
 //!
 //!
-//! ⚠ 大消息必须是**不可压缩**的伪随机字节：生产者对超过压缩阈值的 body 先试压，全同字节
-//!   的 payload 会被压到几百字节，broker 落盘的 `storeSize` 跟着变几百字节 —— "size 闸门
-//!   永不命中"就成了夹具问题。
-//! ⚠ S1/S4 的 topic 必须只有 **1 条队列**：8 条 400KB 摊到 4 条队列上每条才 800KB，
-//!   永远够不到 1MiB 这道**队列级**闸门。
-//! ⚠ 大消息必须**并发投递**（见 `Fixture::produce`）：闸门看的是"进比出快"堆出来的缓冲，
-//!   串行 send 每条 ~190ms 与 300ms/批的慢消费几乎同步，缓冲只到 1~2 条，字节闸门会在
-//!   真机上"永不命中" —— 那是夹具节奏，不是判据。
+//! ⚠ Big messages must be **incompressible** pseudo-random bytes: the producer compresses bodies above the
+//!   compression threshold, so an all-same-byte payload compresses to a few hundred bytes and the broker's
+//!   on-disk `storeSize` follows at a few hundred bytes -- "the size gate never fires" then becomes a fixture problem.
+//! ⚠ The S1/S4 topics must have exactly **1 queue**: 8 x 400KB spread over 4 queues is only 800KB each,
+//!   forever short of the 1MiB **queue-level** gate.
+//! ⚠ Big messages must be **delivered concurrently** (see `Fixture::produce`): the gate watches the buffer built up
+//!   by "in faster than out"; serial sends at ~190ms per message are nearly in sync with the 300ms/batch slow
+//!   consumer, the buffer only reaches 1~2 messages, and the byte gate "never fires" on a real machine -- that is fixture pacing, not the criteria.
 //!
-//! 用法：
+//! Usage:
 //! ```text
 //! cargo run --example live_flow_control -- 127.0.0.1:9876
 //! ```
@@ -45,10 +45,10 @@ use rocketmq_client_remoting::error::Error;
 use rocketmq_client_remoting::remoting::protocol::route::TopicRouteData;
 use tokio::task::JoinSet;
 
-/// 一条"远大于任何真机缓冲"的阈值，等价于把那道闸门关掉。
+/// A threshold "far larger than any live-machine buffer", equivalent to turning that gate off.
 const GATE_OFF: i32 = 65535;
-/// 字节闸门"关闭"的写法同上：`pullThresholdSizeForQueue` 合法域 [1, 1024]（单位 MiB），
-/// 0 已非法，用 1024 MiB 表示不拦。
+/// The byte-gate "off" spelling is the same idea: the legal domain of `pullThresholdSizeForQueue` is [1, 1024] (in MiB),
+/// 0 is already illegal, so 1024 MiB means "do not throttle".
 const GATE_OFF_SIZE_MIB: i32 = 1024;
 const GATE_ONE_MIB: i32 = 1;
 const BIG: usize = 400 * 1024;
@@ -57,7 +57,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 断言累积器：跑完全部场景再汇总，首个失败不提前退出。
+/// Assertion accumulator: every scenario runs to completion before the summary; the first failure does not exit early.
 struct Checker {
     passed: u32,
     failed: Vec<String>,
@@ -100,12 +100,12 @@ async fn poll_until(mut pred: impl FnMut() -> bool, secs: u64) -> bool {
     }
 }
 
-/// 收消息用：记录 body，可选地每批睡 `batch_cost`（制造"已拉未消费"的堆积）。
+/// For consuming: records bodies and optionally sleeps `batch_cost` per batch (creates a "pulled but unconsumed" backlog).
 struct Sink {
     bodies: Mutex<BTreeSet<String>>,
     count: Mutex<usize>,
-    /// 见过的最大 `MessageExt.store_size`：字节闸门的输入就是它，为 0 就说明解码没带上
-    /// broker 的 TOTALSIZE（那时 size 闸门必然永不命中，与判据实现无关）。
+    /// The largest `MessageExt.store_size` seen: the byte gate's input is exactly this; 0 means the decode never carried
+    /// the broker's TOTALSIZE (the size gate then can never fire, unrelated to the criteria implementation).
     max_store_size: Mutex<i32>,
     batch_cost: Duration,
 }
@@ -158,8 +158,8 @@ impl MessageListenerConcurrently for Sink {
     }
 }
 
-/// 400KB **不可压缩**消息体：前缀 + xorshift64* 伪随机尾巴。
-/// 不用 `rand`（不给 crate 加依赖），也不需要可复现 —— 只要压不动。
+/// A 400KB **incompressible** body: a prefix + an xorshift64* pseudo-random tail.
+/// Not `rand` (no new crate dependency), and it need not be reproducible -- it only has to resist compression.
 fn big_body(tag: usize) -> Vec<u8> {
     let mut out = format!("FCBIG-{tag:03}").into_bytes();
     let mut state: u64 = 0x9E3779B97F4A7C15 ^ (tag as u64).wrapping_mul(0xD1B54A32D192ED03);
@@ -167,7 +167,7 @@ fn big_body(tag: usize) -> Vec<u8> {
         state = 0x2545F4914F6CDD1D;
     }
     while out.len() < BIG {
-        // xorshift64*：每次出一个 8 字节块
+        // xorshift64*: emits one 8-byte block per step
         state ^= state >> 12;
         state ^= state << 25;
         state ^= state >> 27;
@@ -229,7 +229,7 @@ impl Fixture {
         format!("rust-live-flow-{kind}-{}", self.stamp)
     }
 
-    /// 显式建 topic（不靠 autoCreateTopicEnable，队列数才确定 —— S1 依赖"就是 1 条队列"）。
+    /// Creates the topic explicitly (not relying on autoCreateTopicEnable, so the queue count is definite -- S1 depends on "exactly 1 queue").
     async fn create_topic(&self, topic: &str, queues: i32) -> Result<(), String> {
         self.admin
             .create_topic_in_broker(
@@ -248,12 +248,12 @@ impl Fixture {
             )
             .await
             .map_err(|e| format!("create topic {topic} failed: {e}"))?;
-        // 等 NameServer 路由传播，否则消费者首轮 rebalance 仍查不到
+        // Wait for NameServer route propagation, otherwise the consumer's first rebalance still finds nothing
         tokio::time::sleep(Duration::from_secs(3)).await;
         Ok(())
     }
 
-    /// 起一个已订阅、已设 listener 的**未启动**消费者（闸门由调用方 update_config 调）。
+    /// Builds a subscribed, listener-equipped **not-yet-started** consumer (gates are set by the caller via update_config).
     fn consumer(
         &self,
         group: &str,
@@ -275,13 +275,13 @@ impl Fixture {
         Ok(consumer)
     }
 
-    /// 并发地把一批消息一次打进 broker —— 流控夹具能不能成立，关键在这一步的节奏。
+    /// Fires a batch of messages into the broker concurrently -- whether the flow-control fixture works at all hinges on the pacing of this step.
     ///
-    /// 字节闸门的输入是"已拉未消费"缓冲，而缓冲堆不堆得起来取决于**进比出快**。
-    /// 串行 send 每条 400KB 实测要 ~190ms，和 300ms/批的慢 listener 差不多同步，
-    /// 缓冲只堆到 1~2 条（≈0.8MiB）就停下来等下一条：闸门"真机上永不命中"其实是
-    /// 投递节奏的问题，不是判据错。并发投递后 8 条在 ~100ms 内全部落盘，缓冲必然越过
-    /// 1MiB，判据于是与线程/网络节奏解耦。
+    /// The byte gate's input is the "pulled but unconsumed" buffer, and whether that backlog builds depends on **in faster than out**.
+    /// Serial sends measured ~190ms per 400KB message, roughly in sync with the 300ms/batch slow listener;
+    /// the backlog stalls at 1~2 messages (≈0.8MiB) waiting for the next one: a gate that "never fires on a real
+    /// machine" is then a delivery-pacing problem, not wrong criteria. With concurrent delivery all 8 messages land
+    /// within ~100ms, the backlog necessarily crosses 1MiB, and the criteria decouple from thread/network pacing.
     async fn produce(&self, topic: &str, bodies: Vec<Vec<u8>>) -> Result<(), String> {
         let mut set: JoinSet<Result<(), String>> = JoinSet::new();
         for body in bodies {
@@ -317,14 +317,14 @@ fn broker_of(route: &TopicRouteData) -> Result<String, String> {
         .ok_or_else(|| format!("broker {} has no address", bd.broker_name))
 }
 
-/// 闸门参数：`count`/`size`/`span`/`topic_count`，None 表示用默认值。
+/// Gate parameters: `count`/`size`/`span`/`topic_count`; None means use the default value.
 #[derive(Default, Clone, Copy)]
 struct Gates {
     count: Option<i32>,
     size: Option<i32>,
     span: Option<i64>,
     topic_count: Option<i32>,
-    /// true 时把消费线程池钉成 1 线程。
+    /// When true, pins the consume thread pool to 1 thread.
     single_consumer: bool,
 }
 
@@ -382,7 +382,7 @@ async fn run_gate_case(
         ck.abort(&format!("{label} start"), &format!("{e}"));
         return None;
     }
-    // 等分配稳定：消费者要先被 broker 登记（30s 心跳，启动期缩短），rebalance 才有分配
+    // Wait for the assignment to settle: the consumer must first be registered with the broker (30s heartbeat, shortened during start-up) before rebalance can assign anything
     tokio::time::sleep(Duration::from_secs(3)).await;
     if let Err(e) = fx.produce(&topic, bodies).await {
         ck.abort(&format!("{label} produce"), &e);
@@ -393,7 +393,7 @@ async fn run_gate_case(
 
 async fn run(namesrv: &str) -> Checker {
     let mut ck = Checker::new();
-    println!("== 流控真机验证：{namesrv} ==");
+    println!("== flow-control live verification: {namesrv} ==");
     let mut fx = match Fixture::new(namesrv) {
         Ok(v) => v,
         Err(e) => {
@@ -408,7 +408,7 @@ async fn run(namesrv: &str) -> Checker {
 
     let small: Vec<Vec<u8>> = (0..12).map(|i| format!("ok-{i:03}").into_bytes()).collect();
 
-    // ---------------- S0 默认闸门 + 快消费：不该命中 ----------------
+    // ---------------- S0 default gates + fast consumption: must not fire ----------------
     if let Some((sink, c)) = run_gate_case(
         &mut ck,
         &fx,
@@ -425,7 +425,7 @@ async fn run(namesrv: &str) -> Checker {
         let all = poll_until(|| sink.count() >= 12, 40).await;
         let fc = c.flow_control_triggered();
         c.shutdown();
-        // 闸门误伤正常流量是最难查的事故（生产上表现为吞吐莫名腰斩），锁 triggered==0
+        // A gate falsely throttling normal traffic is the hardest incident to debug (in production it shows as throughput mysteriously halved), so lock triggered==0
         ck.check(
             "S0 default gates do not fire on ordinary traffic",
             fc == 0,
@@ -438,7 +438,7 @@ async fn run(namesrv: &str) -> Checker {
         );
     }
 
-    // ---------------- S1 队列级字节闸门（必须单队列）----------------
+    // ---------------- S1 queue-level byte gate (must be a single queue) ----------------
     let big8: Vec<Vec<u8>> = (0..8).map(big_body).collect();
     let size_gates = Gates {
         count: Some(GATE_OFF),
@@ -460,9 +460,9 @@ async fn run(namesrv: &str) -> Checker {
     )
     .await
     {
-        // 缓冲条数峰值一起打出来：字节闸门的输入就是这份缓冲，峰值 <3 条（3×400KB>1MiB）
-        // 说明堆积没形成，命中与否都无从谈起 —— 命中判据失败时先看这个数字，能一眼分清
-        // "闸门没接上"和"夹具没堆起来"（后者曾是串行投递造成的）。
+        // The buffered-count peak is printed alongside: the byte gate's input is exactly this buffer, and a peak <3 messages
+        // (3×400KB>1MiB) means no backlog formed, so firing or not is moot -- when the fire assertion fails, look at this
+        // number first to tell "gate not wired up" from "fixture never built a backlog" (the latter once came from serial delivery).
         let mut peak = 0usize;
         let hit = poll_until(
             || {
@@ -492,7 +492,7 @@ async fn run(namesrv: &str) -> Checker {
         c.shutdown();
     }
 
-    // ---------------- S2 位点跨度闸门 ----------------
+    // ---------------- S2 offset-span gate ----------------
     let span_gates = Gates {
         count: Some(GATE_OFF),
         size: Some(GATE_OFF_SIZE_MIB),
@@ -530,7 +530,7 @@ async fn run(namesrv: &str) -> Checker {
         );
     }
 
-    // ---------------- S3 topic 级条数闸门（跨队列累计）----------------
+    // ---------------- S3 topic-level count gate (accumulated across queues) ----------------
     let topic_gates = Gates {
         count: Some(GATE_OFF),
         size: Some(GATE_OFF_SIZE_MIB),
@@ -568,9 +568,9 @@ async fn run(namesrv: &str) -> Checker {
         );
     }
 
-    // ---------------- S4 命中过流控的队列恢复后继续消费 ----------------
-    // 复用 S1 的组与 topic（位点已由 S1 提交到 broker 末尾）。这一条锁的是"暂停 100ms"
-    // 被写成"退出拉取循环"的错误 —— 那条队列会永久停摆，而 S1 已消费完的消息看不出差别。
+    // ---------------- S4 a queue that hit flow control keeps consuming after recovery ----------------
+    // Reuses S1's group and topic (the offset was already committed by S1 to the broker's end). This locks the
+    // "pause 100ms" written as "exit the pull loop" bug -- that queue would halt forever, and S1's already-consumed messages cannot tell the difference.
     let big6: Vec<Vec<u8>> = (100..106).map(big_body).collect();
     if let Some((sink, c)) = run_gate_case(
         &mut ck,
@@ -611,8 +611,8 @@ async fn run(namesrv: &str) -> Checker {
         match fx.consumer(&s5_group, &s5_topic, sink5.clone()) {
             Err(e) => ck.abort("S5 build consumer", &e),
             Ok(c5) => {
-                // 每条闸门取端点：`pullBatchSize=1024` 这类"贴着上限=实际不拦"的写法在
-                // 生产里很常见，误拒等于把用户挡在门外（区间写成开区间的后果）。
+                // Each gate takes an endpoint: spellings like `pullBatchSize=1024` -- "right at the upper bound = effectively
+                // no throttle" -- are common in production; a false rejection locks the user out (the consequence of writing the interval as open).
                 c5.update_config(|x| {
                     x.consume_thread_min = 1;
                     x.consume_thread_max = 2;
@@ -644,7 +644,7 @@ async fn run(namesrv: &str) -> Checker {
                         &format!("count={} distinct={}", sink5.count(), sink5.distinct()),
                     );
 
-                    // 越界配置：本地拒 + 不回滚 started 标志（失败的 start 必须留干净对象）
+                    // Out-of-range configs: rejected locally + the started flag is not rolled back (a failed start must leave a clean object)
                     type GateBreaker = fn(&mut ConsumerConfig);
                     let illegal: Vec<(GateBreaker, &str)> = vec![
                         (
@@ -699,15 +699,15 @@ async fn run(namesrv: &str) -> Checker {
                         );
                     }
 
-                    // broker 侧的反证
+                    // Counter-evidence from the broker side
                     match fx.admin.get_topic_route_data(&s5_topic).await {
                         None => ck.abort("S5 route of the boundary topic", "no route from namesrv"),
                         Some(route) => match broker_of(&route) {
                             Err(e) => ck.abort("S5 broker address", &e),
                             Ok(addr) => {
-                                // 从未成功注册的组：broker 的 GET_CONSUMER_LIST_BY_GROUP 回的
-                                // 不是空列表而是 "no consumer for this group"（code=1）。两种
-                                // 形态都算"查无此组"，但**绝不能**带任何 clientId。
+                                // A group that never registered successfully: the broker's GET_CONSUMER_LIST_BY_GROUP answers
+                                // not an empty list but "no consumer for this group" (code=1). Both shapes count as
+                                // "group not found", but **no** clientId may ever be included.
                                 let bad = fx
                                     .admin
                                     .get_consumer_list_by_group(&bad_group, 5000, Some(&addr))
@@ -717,12 +717,12 @@ async fn run(namesrv: &str) -> Checker {
                                         body.consumer_id_list.is_empty(),
                                         format!("ids={:?}", body.consumer_id_list),
                                     ),
-                                    // 只有 broker 亲口回的错才算"查无此组"。连不上/超时必须
-                                    // 判失败，否则反证退化成"什么都没查到"的空话。
+                                    // Only an error the broker itself returns counts as "group not found". Connection failures/timeouts must
+                                    // count as a failure, otherwise the counter-evidence degenerates into the empty claim "nothing was found".
                                     Err(e @ Error::Broker { .. }) => {
-                                        (true, format!("broker 拒绝: {e}"))
+                                        (true, format!("broker refused: {e}"))
                                     }
-                                    Err(e) => (false, format!("探测请求失败: {e}")),
+                                    Err(e) => (false, format!("probe request failed: {e}")),
                                 };
                                 ck.check("S5 broker never heard of the rejected group", absent, &detail);
                                 let ok_ids = fx
@@ -740,7 +740,7 @@ async fn run(namesrv: &str) -> Checker {
                         },
                     }
                 }
-                // 反证必须发生在 shutdown 之前：早退会撤掉 broker 侧那条注册
+                // The counter-evidence must happen before shutdown: an early return would tear down the broker-side registration
                 c5.shutdown();
             }
         }
@@ -752,7 +752,7 @@ async fn run(namesrv: &str) -> Checker {
 
 fn report(ck: &mut Checker) {
     println!(
-        "\n== 结果：{} PASS / {} FAIL ==",
+        "\n== result: {} PASS / {} FAIL ==",
         ck.passed,
         ck.failed.len()
     );

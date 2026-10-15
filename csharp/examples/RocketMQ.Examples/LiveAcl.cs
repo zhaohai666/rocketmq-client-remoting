@@ -1,25 +1,34 @@
-// 前置：broker 开了 `authenticationEnabled=true`，并用 `initAuthenticationUser`
-//       建了 accessKey/secretKey 对应的 SUPER 用户（见 /tmp/run_acl_live.sh 的
-//       broker_acl.conf）。此时**所有** broker RPC 都要求合法签名：
-//       AuthConfig.isAuthenticationRequired() = authenticationEnabled && !whitelist.contains(rpc)，
-//       而白名单默认为空。
+// Prerequisite: the broker has `authenticationEnabled=true` and a SUPER user matching the
+//       accessKey/secretKey pair has been created with `initAuthenticationUser` (see
+//       broker_acl.conf in /tmp/run_acl_live.sh). At that point **every** broker RPC requires
+//       a valid signature:
+//       AuthConfig.isAuthenticationRequired() = authenticationEnabled && !whitelist.contains(rpc),
+//       and the whitelist is empty by default.
 //
-// 场景：
-//   S1 正向：带凭据的 admin 建 topic → 成功（管理路径签名被接受）
-//   S2 反向：不带凭据的 admin 建 topic → 被拒（broker NO_PERMISSION=16）
-//   S3 反向：secretKey 错误的生产者发送 → 被拒（NO_PERMISSION=16）
-//   S4 正向：带凭据的生产者发 3 条 → SendOk（msgId 由 broker 赋值）
-//   S5 正向：带凭据的消费者收满 3 条（心跳 / 长轮询拉取 / 位点提交都带签名）
-//            ⚠ S4/S5 必须**先起消费者再发送**，否则 CONSUME_FROM_LAST_OFFSET 的初始位点
-//              语义 + broker 异步分发会让同一时序在不同客户端实现间结果不一致（见 S4/S5 处注释）
-//   S6 反向：不带凭据直连 broker 的裸 RPC → 被拒（NO_PERMISSION=16）
-//   S7 正向：不带凭据走 NameServer 路由查询仍成功（钩子只作用于需要鉴权的目标）
+// Scenarios:
+//   S1 positive: an admin with credentials creates a topic -> success (the signature on the
+// admin path is accepted)
+//   S2 negative: an admin without credentials creates a topic -> rejected (the broker replies
+// NO_PERMISSION=16)
+//   S3 negative: a producer with a wrong secretKey sends -> rejected (NO_PERMISSION=16)
+//   S4 positive: a producer with credentials sends 3 -> SendOk (the msgId is assigned by the
+// broker)
+//   S5 positive: a consumer with credentials receives all 3 (the heartbeat / long poll /
+// offset commit all carry signatures)
+//            Note: S4/S5 must **start the consumer before sending**, otherwise the
+//              CONSUME_FROM_LAST_OFFSET initial-offset semantics plus the broker's
+//              asynchronous dispatch make the same timing give different results across
+//              client implementations (see the comments at S4/S5)
+//   S6 negative: a bare RPC straight to the broker without credentials -> rejected
+// (NO_PERMISSION=16)
+//   S7 positive: a route query through the NameServer without credentials still succeeds
+// (the hook only applies to targets that require authentication)
 //
-// 关键事实（不要凭记忆改）：broker 侧所有鉴权失败都抛
-// AbortProcessException(NO_PERMISSION=16)；
-// 失败原因用 ResponseCode 区分不了，只能看 remark：
-//   - 签名不对 → "check signature failed."
-//   - 凭据缺失 → "User:null is not found."
+// Key facts (do not change them from memory): every broker-side authentication failure
+// throws AbortProcessException(NO_PERMISSION=16);
+// the reason cannot be told apart by ResponseCode, only by the remark:
+//   - a wrong signature -> "check signature failed."
+//   - missing credentials -> "User:null is not found."
 using System.Text;
 
 using RocketMQ.Client;
@@ -29,12 +38,13 @@ namespace RocketMQ.Examples;
 
 public static class LiveAcl
 {
-    // broker 侧鉴权失败的统一响应码。
+    // The broker's uniform response code for an authentication failure.
     private const int NoPermission = 16;
 
-    // CreateTopicInRoute 会把底层 MQBrokerException 的 Message 拼进异常，形如
-    // "create new topic failed: CODE: 16 DESC: ..."，故用这个标记识别 NO_PERMISSION。
-    // 由 NoPermission 派生，避免两处数字各写一遍后漂移。
+    // CreateTopicInRoute splices the underlying MQBrokerException's Message into the
+    // exception, of the form "create new topic failed: CODE: 16 DESC: ...", so this marker
+    // identifies NO_PERMISSION. Derived from NoPermission so the number is not written
+    // twice and then drifts.
     private static readonly string NoPermissionMarker =
         "CODE: " + NoPermission.ToString(CultureInfo.InvariantCulture);
 
@@ -106,9 +116,9 @@ public static class LiveAcl
             + " group=" + group + " ak=" + ak);
         Console.WriteLine("======================================================================");
 
-        // ---------------- S1 正向：带凭据 admin 建 topic ----------------
+        // ---------------- S1 positive: an admin with credentials creates the topic ----------------
         Console.WriteLine();
-        Console.WriteLine("S1 带凭据 admin 建 topic");
+        Console.WriteLine("S1 an admin with credentials creates the topic");
         {
             var admin = new DefaultMQAdminExt("ACL_ADMIN_OK");
             admin.SetNamesrvAddr(namesrv);
@@ -117,11 +127,11 @@ public static class LiveAcl
             try
             {
                 admin.CreateTopic("TBW102", topic, 4);
-                Check("S1 带凭据 admin 建 topic 成功", true);
+    Check("S1 the admin with credentials created the topic successfully", true);
             }
             catch (Exception e)
             {
-                Check("S1 带凭据 admin 建 topic 成功", false, e.Message);
+      Check("S1 the admin with credentials created the topic successfully", false, e.Message);
             }
             finally
             {
@@ -129,9 +139,9 @@ public static class LiveAcl
             }
         }
 
-        // ---------------- S2 反向：无凭据 admin 必须被拒 ----------------
+        // ---------------- S2 negative: an admin without credentials must be rejected ----------------
         Console.WriteLine();
-        Console.WriteLine("S2 不带凭据的 admin 建 topic 必须被拒");
+        Console.WriteLine("S2 an admin without credentials creating a topic must be rejected");
         {
             var admin = new DefaultMQAdminExt("ACL_ADMIN_NO");
             admin.SetNamesrvAddr(namesrv);
@@ -153,12 +163,12 @@ public static class LiveAcl
                 admin.Shutdown();
             }
 
-            Check("S2 无凭据 admin 被 broker 拒绝(NO_PERMISSION=16)", rejected, detail);
+        Check("S2 the admin without credentials was rejected by the broker (NO_PERMISSION=16)", rejected, detail);
         }
 
-        // ---------------- S3 反向：错误 secretKey 必须被拒 ----------------
+     // ---------------- S3 negative: a wrong secretKey must be rejected ----------------
         Console.WriteLine();
-        Console.WriteLine("S3 错误 secretKey 的生产者必须被拒");
+        Console.WriteLine("S3 a producer with a wrong secretKey must be rejected");
         {
             var bad = new DefaultMQProducer("PG_AclNetBad_" + stamp);
             bad.NamesrvAddr = namesrv;
@@ -187,12 +197,12 @@ public static class LiveAcl
                 bad.Shutdown();
             }
 
-            Check("S3 错误 secretKey 被 broker 拒绝(NO_PERMISSION=16)", rejected, detail);
+        Check("S3 the wrong secretKey was rejected by the broker (NO_PERMISSION=16)", rejected, detail);
         }
 
         int sent = 0;
         Console.WriteLine();
-        Console.WriteLine("S4/S5 带正确凭据的生产者/消费者（先起消费者再发送）");
+        Console.WriteLine("S4/S5 the producer/consumer with the correct credentials (start the consumer before sending)");
         {
             var listener = new CountingListener();
             var consumer = new DefaultMQPushConsumer(group);
@@ -203,7 +213,8 @@ public static class LiveAcl
             consumer.Start();
             try
             {
-                // 等 rebalance 把队列分下来：初始位点必须在 topic 还空着的时候解析
+        // Wait for the rebalance to hand the queues over: the initial offset has to be
+  // resolved while the topic is still empty
                 Thread.Sleep(5000);
 
                 var evidence = new StringBuilder();
@@ -231,11 +242,13 @@ public static class LiveAcl
                 }
 
                 prod.Shutdown();
-                // msgId 由 broker 生成：非空即证明 broker 真的接受了这条签名请求
-                Check("S4 带凭据生产者发送 3 条(SendOk)", sent == 3,
+            // the msgId is generated by the broker: a non-empty one proves the broker really
+     // accepted this signed request
+     Check("S4 the producer with credentials sent 3 (SendOk)", sent == 3,
                     "sent=" + sent.ToString(CultureInfo.InvariantCulture) + " " + evidence);
 
-                // S5：心跳 / 长轮询拉取 / 位点提交全程带签名，收满才算消费链路鉴权通过
+     // S5: the heartbeat / long poll / offset commit all carry signatures the whole way; only
+     // receiving everything means the consume path passed authentication
                 long deadline = NowMs() + 30000;
                 while (NowMs() < deadline && listener.Count < sent)
                 {
@@ -243,7 +256,7 @@ public static class LiveAcl
                 }
 
                 List<string> bodies = listener.Snapshot();
-                Check("S5 带凭据消费者收满 " + sent.ToString(CultureInfo.InvariantCulture) + " 条",
+       Check("S5 the consumer with credentials received all " + sent.ToString(CultureInfo.InvariantCulture),
                     listener.Count == sent,
                     "got=" + listener.Count.ToString(CultureInfo.InvariantCulture)
                         + " bodies=" + string.Join(" ", bodies));
@@ -254,9 +267,9 @@ public static class LiveAcl
             }
         }
 
-        // ---------------- S6 反向：无凭据裸 broker RPC 必须被拒 ----------------
+        // ---------------- S6 negative: a bare broker RPC without credentials must be rejected ----------------
         Console.WriteLine();
-        Console.WriteLine("S6 不带凭据的直接 broker RPC 必须被拒");
+        Console.WriteLine("S6 a direct broker RPC without credentials must be rejected");
         {
             var client = new MQClientInstance("ACL_PROBE_" + stamp, new List<string> { namesrv });
             client.Start();
@@ -273,9 +286,10 @@ public static class LiveAcl
                 {
                     try
                     {
-                        // GetConsumerListByGroup 是**裸** RPC：非 SUCCESS 直接抛 MQBrokerException。
-                        // 不能用 GetConsumerIdListByGroup —— 它内部吞掉异常返回 null，
-                        // 「被拒绝」与「查不到」在调用方看来一模一样（曾因此把 FAIL 看成 PASS）。
+   // GetConsumerListByGroup is a **bare** RPC: a non-SUCCESS reply throws MQBrokerException
+          // straight away. GetConsumerIdListByGroup must not be used -- it swallows the
+     // exception internally and returns null, which makes "rejected" and "not found" look
+  // identical to the caller (a FAIL was once read as a PASS because of this).
                         client.GetConsumerListByGroup(group, addr, 5000);
                         detail = "unexpectedly succeeded, addr=" + addr;
                     }
@@ -292,7 +306,7 @@ public static class LiveAcl
                     }
                 }
 
-                Check("S6 无凭据 broker RPC 被拒绝(NO_PERMISSION=16)", rejected, detail);
+  Check("S6 the broker RPC without credentials was rejected (NO_PERMISSION=16)", rejected, detail);
             }
             finally
             {
@@ -300,9 +314,9 @@ public static class LiveAcl
             }
         }
 
-        // ---------------- S7 正向：无凭据走 namesrv 仍应成功 ----------------
+    // ---------------- S7 positive: no credentials going through the namesrv must still succeed ----------------
         Console.WriteLine();
-        Console.WriteLine("S7 不带凭据走 NameServer 路由查询仍应成功");
+        Console.WriteLine("S7 a route query through the NameServer without credentials must still succeed");
         {
             var client = new MQClientInstance("ACL_NS_" + stamp, new List<string> { namesrv });
             client.Start();
@@ -325,7 +339,7 @@ public static class LiveAcl
                 client.Shutdown();
             }
 
-            Check("S7 无凭据 namesrv 路由查询成功", ok, detail);
+  Check("S7 the route query through the namesrv without credentials succeeded", ok, detail);
         }
 
         Console.WriteLine();
@@ -334,11 +348,11 @@ public static class LiveAcl
             + " FAIL=" + _fail.ToString(CultureInfo.InvariantCulture));
         if (_fail == 0)
         {
-            Console.WriteLine("  result: ACL 鉴权（签名 / 拒绝 / namesrv 兼容）真机通过");
+ Console.WriteLine("  result: ACL authentication (signature / rejection / namesrv compatibility) passed on a real machine");
             return 0;
         }
 
-        Console.WriteLine("  result: " + _fail.ToString(CultureInfo.InvariantCulture) + " 项失败");
+ Console.WriteLine("  result: " + _fail.ToString(CultureInfo.InvariantCulture) + " failures");
         return 1;
     }
 }

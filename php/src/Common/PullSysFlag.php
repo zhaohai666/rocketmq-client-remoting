@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * Pull 请求的系统标志位：协议字段 sysFlag 在拉取请求里的位定义。
+ * System flag bits for pull requests: bit definitions of the protocol field sysFlag in pull requests.
  */
 final class PullSysFlag
 {

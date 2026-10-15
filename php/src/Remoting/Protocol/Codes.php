@@ -5,13 +5,15 @@ declare(strict_types=1);
 namespace RocketMQ\Remoting\Protocol;
 
 /**
- * 请求码 / 响应码 / 语言码 / 序列化类型：数值与字面量都是协议常量，
- * broker 按字面值匹配，改一个数就等于把那个功能关掉。
+ * Request code / response code / language code / serialize type: the numbers and the literals are all
+ * protocol constants, the broker matches them by literal value, and changing one number is the same as
+ * switching off that feature.
  *
- * RequestCode / ResponseCode 的常量名一律 UPPER_SNAKE，和协议里的字段名同形。
+ * The constant names of RequestCode / ResponseCode are all UPPER_SNAKE, mirroring the field names in the
+ * protocol.
  */
 
-/** 请求码全集。 */
+/** The complete set of request codes. */
 final class RequestCode
 {
     public const SEND_MESSAGE = 10;
@@ -136,7 +138,7 @@ final class RequestCode
     public const UPDATE_AND_GET_GROUP_FORBIDDEN = 353;
     public const GET_BROKER_MEMBER_GROUP = 901;
     public const BROKER_HEARTBEAT = 904;
-    // ---- 以下是 broker 侧另有的管理码（controller / acl / 冷数据 / 静态 topic），本端只声明不主动调用 ----
+    // ---- The management codes that exist only on the broker side (controller / acl / cold data / static topic), declared here but never actively invoked ----
     public const CHECK_ROCKSDB_CQ_WRITE_PROGRESS = 354;
     public const EXPORT_ROCKSDB_CONFIG_TO_JSON = 355;
     public const LITE_PULL_MESSAGE = 361;
@@ -183,7 +185,7 @@ final class RequestCode
     public const DELETE_SUBSCRIPTION_GROUP_LIST = 5003;
 }
 
-/** 系统级响应码：任何 broker 都会回的基线那五个。 */
+/** System-level response codes: the five baseline codes every broker answers with. */
 final class RemotingSysResponseCode
 {
     public const SUCCESS = 0;
@@ -194,12 +196,12 @@ final class RemotingSysResponseCode
 }
 
 /**
- * 业务响应码表：协议里它是「系统码 + 业务码」一张表，PHP 常量不能继承，
- * 这里把系统级那五个原样再声明一份。
+ * The table of business response codes: in the protocol it is a single table of "system codes + business
+ * codes", PHP constants cannot be inherited, so the five system-level codes are re-declared here verbatim.
  */
 final class ResponseCode
 {
-    // ---- RemotingSysResponseCode（继承部分）----
+    // ---- RemotingSysResponseCode (the inherited part) ----
     public const SUCCESS = RemotingSysResponseCode::SUCCESS;
     public const SYSTEM_ERROR = RemotingSysResponseCode::SYSTEM_ERROR;
     public const SYSTEM_BUSY = RemotingSysResponseCode::SYSTEM_BUSY;
@@ -265,7 +267,7 @@ final class ResponseCode
     public const LITE_SUBSCRIPTION_QUOTA_EXCEEDED = 2018;
     public const USER_NOT_EXIST = 3001;
     public const POLICY_NOT_EXIST = 3002;
-    // 客户端侧伪响应码：负值只在本地产生，从不上报文
+    // Pseudo response codes on the client side: negative values are only produced locally and never go on the wire
     public const RPC_UNKNOWN = -1000;
     public const RPC_ADDR_IS_NULL = -1002;
     public const RPC_SEND_TO_CHANNEL_FAILED = -1004;
@@ -273,8 +275,10 @@ final class ResponseCode
 }
 
 /**
- * 语言枚举：码值是协议里定死的字节取值，本端口上报 PHP=10。
- * （broker 只用这个字段做展示，不校验枚举值，多出来的语言码不影响兼容。）
+ * The language enum: the code values are the byte values fixed in the protocol, and this port reports
+ * PHP=10.
+ * (The broker only uses this field for display and does not validate the enum value, so extra language
+ * codes do not affect compatibility.)
  */
 enum LanguageCode: int
 {
@@ -293,7 +297,7 @@ enum LanguageCode: int
     case RUST = 12;
     case NODE_JS = 13;
 
-    /** 码值（取低 8 位）→ 枚举名；未知返回 null。 */
+    /** Code value (taking the low 8 bits) -> enum name; returns null when unknown. */
     public static function valueOf(int $code): ?string
     {
         $c = $code & 0xFF;
@@ -305,7 +309,7 @@ enum LanguageCode: int
         return null;
     }
 
-    /** 枚举名（大小写不敏感）→ 码值，未知回 OTHER。 */
+    /** Enum name (case insensitive) -> code value, falling back to OTHER when unknown. */
     public static function nameToCode(string $name): int
     {
         $upper = strtoupper($name);
@@ -318,13 +322,13 @@ enum LanguageCode: int
     }
 }
 
-/** header 的序列化类型：JSON 还是紧凑的 ROCKETMQ 自研格式。 */
+/** The serialize type of the header: JSON or the compact ROCKETMQ-proprietary format. */
 enum SerializeType: int
 {
     case JSON = 0;
     case ROCKETMQ = 1;
 
-    /** 码值（取低 8 位）→ 名字；未知返回 null。 */
+    /** Code value (taking the low 8 bits) -> name; returns null when unknown. */
     public static function nameOf(int $code): ?string
     {
         return match ($code & 0xFF) {
@@ -335,14 +339,14 @@ enum SerializeType: int
     }
 }
 
-/** 命令类型：请求还是应答。 */
+/** The command type: request or response. */
 enum RemotingCommandType: string
 {
     case REQUEST_COMMAND = 'REQUEST_COMMAND';
     case RESPONSE_COMMAND = 'RESPONSE_COMMAND';
 }
 
-/** 被禁对象类型码（broker 返回禁写/禁读错误时区分是哪一类）。 */
+/** The forbidden object type codes (which category is meant when the broker returns a forbid-write / forbid-read error). */
 final class ForbiddenType
 {
     public const BROKER_FORBIDDEN = 1;
@@ -352,13 +356,13 @@ final class ForbiddenType
     public const SUBSCRIPTION_FORBIDDEN = 5;
 }
 
-/** 请求类型：目前协议里只有 STREAM 一个取值，走 ReqT 头。 */
+/** The request type: the protocol currently has only the single value STREAM, carried in the ReqT header. */
 final class RequestType
 {
     public const STREAM = 0;
 }
 
-/** 请求来源：SDK 还是各类 proxy 转发。 */
+/** The request source: the SDK itself or one of the various proxy forwards. */
 final class RequestSource
 {
     public const SDK = -1;

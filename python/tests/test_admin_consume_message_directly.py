@@ -18,7 +18,7 @@ OFFSET_MSG_ID = "0A00000100002A0000000000000016B0"
 UNIQ_MSG_ID = "C0A80164123456780000000000001234"
 
 
-# ------------------------------------------------------------------ 测试替身
+# ------------------------------------------------------------------ Test doubles
 
 def _ok(body: bytes = b"") -> RemotingCommand:
     r = RemotingCommand()
@@ -35,7 +35,7 @@ def _err(code: int, remark: str) -> RemotingCommand:
 
 
 class _FakeClient:
-    """替掉 admin 的同步网络层与路由查询，收集发出的请求。"""
+    """Replace the admin's synchronous network layer and route lookups, collecting outgoing requests."""
 
     def __init__(self, responses, route=None):
         self._responses = list(responses)
@@ -57,7 +57,7 @@ class _FakeClient:
         return self.route
 
     def _check_response(self, response):
-        """与 `MQClientInstance._check_response:524` 同语义：非 SUCCESS 抛 MQBrokerException。"""
+        """Same semantics as `MQClientInstance._check_response:524`: raise MQBrokerException on non-SUCCESS."""
         if response.code == ResponseCode.SUCCESS:
             return response
         raise MQBrokerException(response.code, response.remark or "")
@@ -99,10 +99,10 @@ def _route(*broker_names_and_addrs) -> TopicRouteData:
     return route
 
 
-# ------------------------------------------------------------------ 头形状
+# ------------------------------------------------------------------ Header shape
 
 def test_uniq_key_msg_id_is_replaced_by_offset_msg_id():
-    """客户端 uniqKey 必须换成 offsetMsgId 再下发：broker 按 commitLog 偏移取消息。"""
+    """The client must replace uniqKey with offsetMsgId before sending: the broker fetches the message by commitLog offset."""
     client = _FakeClient([_ok(_result_body())])
     admin = _admin(client, _msg(uniq_key=True))
 
@@ -110,14 +110,14 @@ def test_uniq_key_msg_id_is_replaced_by_offset_msg_id():
 
     assert len(client.requests) == 1
     addr, request = client.requests[0]
-    # 发给存储这条消息的 broker（viewMessage 解析出的 storeHost）
+    # Sent to the broker storing this message (storeHost resolved by viewMessage)
     assert addr == STORE_ADDR
     assert request.code == RequestCode.CONSUME_MESSAGE_DIRECTLY
     assert request.ext_fields["msgId"] == OFFSET_MSG_ID
     assert request.ext_fields["consumerGroup"] == GROUP
     assert request.ext_fields["clientId"] == CLIENT_ID
     assert request.ext_fields["topic"] == TOPIC
-    # 应答 body 是消费者端判定，原样解码
+    # The response body is decided by the consumer side; decode it as-is
     assert result.consume_result == CMResult.CR_SUCCESS
     assert result.remark == "OK"
     assert result.spent_time_mills == 12
@@ -163,7 +163,7 @@ def test_broker_name_enriched_from_route_when_addr_matches():
 
 
 def test_route_lookup_failure_does_not_block_the_call():
-    """路由查不到（网络抖动/无权限）只影响 brokerName 补充，主流程照发。"""
+    """Route lookup failure (network flapping / no permission) only affects brokerName enrichment; the main flow proceeds."""
     client = _FakeClient([_ok(_result_body())], route=None)
     admin = _admin(client, _msg(uniq_key=False))
 
@@ -175,7 +175,7 @@ def test_route_lookup_failure_does_not_block_the_call():
 
 
 def test_explicit_broker_addr_overrides_store_host():
-    """显式 brokerAddr 优先于 viewMessage 解析出的 storeHost（Address 形态覆盖参数）。"""
+    """Explicit brokerAddr takes precedence over the storeHost resolved by viewMessage (Address-form override parameter)."""
     other = "10.1.1.5:10911"
     client = _FakeClient([_ok(_result_body())])
     admin = _admin(client, _msg(uniq_key=False))
@@ -187,11 +187,10 @@ def test_explicit_broker_addr_overrides_store_host():
     assert addr == other
 
 
-# ------------------------------------------------------------------ 错误契约
+# ------------------------------------------------------------------ Error contract
 
 def test_empty_body_raises_client_exception():
-    """broker 回 SUCCESS 但 body 为空（消息查空被吞时）必须显式失败，不能返回
-    一个 consumeResult=None 的空结果。"""
+    """A broker SUCCESS with an empty body (when the message lookup is swallowed) must fail explicitly instead of returning an empty result with consumeResult=None."""
     client = _FakeClient([_ok(b"")])
     admin = _admin(client, _msg(uniq_key=True))
 
@@ -203,7 +202,7 @@ def test_empty_body_raises_client_exception():
 
 
 def test_broker_rejection_raises_broker_exception():
-    """非 SUCCESS 走 `_check_response` 的 MQBrokerException 契约（组不在线等）。"""
+    """Non-SUCCESS follows the `_check_response` MQBrokerException contract (e.g. group not online)."""
     client = _FakeClient([_err(ResponseCode.CONSUMER_NOT_ONLINE, "consumer not online")])
     admin = _admin(client, _msg(uniq_key=True))
 
@@ -215,7 +214,7 @@ def test_broker_rejection_raises_broker_exception():
 
 
 def test_missing_group_or_client_id_fails_fast():
-    """group / clientId 缺省直接本地失败，不发起任何网络请求。"""
+    """Missing group / clientId fails locally without issuing any network request."""
     client = _FakeClient([])
     admin = _admin(client, _msg(uniq_key=True))
 

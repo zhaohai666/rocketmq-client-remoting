@@ -1,8 +1,8 @@
-// POP 模式（5.x 轻量消费）单测 —— 纯逻辑，不联网。
+// Unit tests for POP mode (5.x lightweight consumption) -- pure logic, no networking.
 using RocketMQ.Common;
 using RocketMQ.Remoting.Protocol;
 using Xunit;
-// 与 src 侧的 global using 保持一致（测试项目没有该全局别名）
+// Kept consistent with the global usings on the src side (the test project does not have that global alias)
 using PropertyMap = System.Collections.Generic.SortedDictionary<string, string>;
 
 namespace RocketMQ.Client.Tests;
@@ -34,7 +34,7 @@ public class PopTests
             MsgOffsetInfo = msgOffsetInfo,
         };
 
-    // ------------------------------------------------ 1. extraInfo 拼装/切分
+    // ------------------------------------------------ 1. extraInfo assembly / splitting
 
     [Fact]
     public void BuildExtraInfoWithMsgQueueOffsetHasEightSegments()
@@ -113,7 +113,7 @@ public class PopTests
     [Fact]
     public void PopRetryTopicsAreSeparateFromPushRetryTopic()
     {
-        // POP 的重投 topic 带 topic 后缀；push 的 %RETRY%<group> 不带 —— 两套互不混。
+        // POP's redelivery topic carries a topic suffix while push's %RETRY%<group> does not -- the two schemes never mix.
         Assert.Equal("%RETRY%" + Group + "_" + Topic,
             ExtraInfoUtil.BuildPopRetryTopicV1(Topic, Group));
         Assert.Equal("%RETRY%" + Group + "+" + Topic,
@@ -133,7 +133,7 @@ public class PopTests
         Assert.Throws<ArgumentException>(() => ExtraInfoUtil.GetRealTopic(Topic, Group, "9"));
     }
 
-    // ------------------------------------------------ 解析响应头编码
+    // ------------------------------------------------ Parsing the response header encoding
 
     [Fact]
     public void ParseStartOffsetInfoSplitsQueues()
@@ -145,7 +145,7 @@ public class PopTests
         Assert.Equal(0, start["0@3"]);
         Assert.Equal(0, start["0@2"]);
 
-        // 只有一段时不该被 ";" 切坏
+        // A single segment must not be broken up by ";"
         Dictionary<string, long>? single = ExtraInfoUtil.ParseStartOffsetInfo("0 3 5");
         Assert.NotNull(single);
         Assert.Equal(5, single!["0@3"]);
@@ -188,13 +188,13 @@ public class PopTests
         Assert.Equal("qo3%7", ExtraInfoUtil.GetQueueOffsetKeyValueKey(3, 7));
         Assert.Equal("0@qo3%7", ExtraInfoUtil.GetQueueOffsetMapKey(Topic, 3, 7));
 
-        // 带 popCk 的重载用 CK 第 5 段当 retryFlag（broker 可能改写 topic，不能只看 topic）
+        // The overload carrying popCk uses segment 5 of the CK as the retryFlag (the broker may rewrite the topic, so looking only at the topic is not enough)
         string retryCk = ExtraInfoUtil.BuildExtraInfo(0, 1, 2, 0,
             ExtraInfoUtil.BuildPopRetryTopicV1(Topic, Group), Broker, 3);
         Assert.Equal("1@3", ExtraInfoUtil.GetStartOffsetInfoMapKey(Topic, retryCk, 3));
     }
 
-    // ------------------------------------------------ 2. 请求/响应头 extFields 键名
+    // ------------------------------------------------ 2. extFields key names of the request/response headers
 
     [Fact]
     public void PopMessageRequestHeaderUsesLegacyFieldNamesVerbatim()
@@ -215,7 +215,7 @@ public class PopTests
         };
         PropertyMap ext = h.ToExtFields();
 
-        // 12 个字段全在（order 是 primitive boolean，总出现）
+        // all 12 fields are present (order is a primitive boolean, it always appears)
         string[] expected =
         {
             "consumerGroup", "topic", "queueId", "maxMsgNums", "invisibleTime", "pollTime",
@@ -243,7 +243,7 @@ public class PopTests
         Assert.False(ext.ContainsKey("attemptId"));
         Assert.False(ext.ContainsKey("bornTime"));
 
-        // order 是 primitive，未被赋值也要出现
+        // order is primitive, so it appears even when it was never assigned
         Assert.True(ext.ContainsKey("order"));
         Assert.Equal("false", ext["order"]);
     }
@@ -343,7 +343,7 @@ public class PopTests
         Assert.Equal(3, resp.ReviveQid);
     }
 
-    // ------------------------------------------------ 3. POP_CK 反构
+    // ------------------------------------------------ 3. POP_CK reconstruction
 
     [Fact]
     public void StampPopCkBuildsEightSegmentsMatchingTheMessage()
@@ -366,7 +366,7 @@ public class PopTests
             Assert.Equal(Broker, ExtraInfoUtil.GetBrokerName(seg));
             Assert.Equal(m.QueueId, ExtraInfoUtil.GetQueueId(seg));
 
-            // msgQueueOffset 来自 msgOffsetInfo，不是消息自身的 queueOffset
+            // msgQueueOffset comes from msgOffsetInfo, not from the message's own queueOffset
             long want = m.QueueId switch { 0 => 5, 3 => 6, _ => 7 };
             Assert.Equal(want, ExtraInfoUtil.GetQueueOffset(seg));
         }
@@ -385,7 +385,7 @@ public class PopTests
     [Fact]
     public void StampPopCkDoesNotOverrideExistingCk()
     {
-        // retry topic 弹回来的消息 broker 已经写好 POP_CK（retryFlag=1），绝不能覆盖。
+        // A message popped back from a retry topic already carries POP_CK written by the broker (retryFlag=1), it must never be overwritten.
         const string existing = "1 1 2 0 1 broker-a 0 0";
         var msgs = new List<MessageExt> { MakeMsg(Topic, 3, 0) };
         msgs[0].Properties[MessageConst.PropertyPopCk] = existing;
@@ -398,9 +398,9 @@ public class PopTests
     [Fact]
     public void StampPopCkIndexSelectsRightOffsetWithinQueue()
     {
-        // 同队列 3 条：下标是在**本批该队列的 queueOffset 排序表**里求，不是直接在
-        // msgOffsetInfo 里按值找 —— 所以这里故意让 msgOffsetInfo 的值与消息自身的
-        // queueOffset 不同（100/101/102 vs 10/11/12）。若按值找会一条都盖不上 POP_CK。
+        // 3 messages in the same queue: the index is looked up in **this batch's queueOffset-sorted table for that queue**, not by
+        // searching msgOffsetInfo by value -- so here msgOffsetInfo's values are deliberately made different from the messages' own
+        // queueOffset (100/101/102 vs 10/11/12). Searching by value would fail to overwrite POP_CK on a single message.
         var msgs = new List<MessageExt>
         {
             MakeMsg(Topic, 3, 10),
@@ -427,7 +427,7 @@ public class PopTests
 
         string[] seg = ExtraInfoUtil.Split(msgs[0].Properties[MessageConst.PropertyPopCk]);
         Assert.Equal(8, seg.Length);
-        // 降级分支里 ckQueueOffset 与自己那条的 msgQueueOffset 都用消息自身 queueOffset
+        // In the fallback branch both ckQueueOffset and that entry's own msgQueueOffset use the message's own queueOffset
         Assert.Equal(42, ExtraInfoUtil.GetCkQueueOffset(seg));
         Assert.Equal(42, ExtraInfoUtil.GetQueueOffset(seg));
     }
@@ -445,7 +445,7 @@ public class PopTests
         Assert.Equal("111", msgs[1].Properties[MessageConst.PropertyFirstPopTime]);
     }
 
-    // ------------------------------------------------ 4. 状态名
+    // ------------------------------------------------ 4. State names
 
     [Fact]
     public void PopStatusNamesMatchLegacy()

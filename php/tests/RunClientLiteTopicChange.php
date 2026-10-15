@@ -3,26 +3,36 @@
 declare(strict_types=1);
 
 /**
- * 轻量拉取消费者的「topic 队列集合变更」监听（registerTopicMessageQueueChangeListener）
- * 离线单测 —— 不需要集群。
+ * Lite pull consumer "topic message queue set change" listener
+ * (registerTopicMessageQueueChangeListener) offline unit test -- no cluster needed.
  *
- * 锁的是本端口自己的契约，判据全部取自线上报文：
- *   * 回调只在**队列集合**相对上一次快照真的变化时发一次；顺序变了不算变化。
- *   * 启动前注册 = 没有快照，第一趟必然回调一次（把当前集合交给调用方）；
- *     运行中注册 = 立刻记一版快照，当前状态不会被当成「变化」重复上报。
- *   * 每趟比对都**现问 name server**（不吃路由缓存），否则扩容最快要等一次周期轮询才看得见。
- *   * 查不到队列时**抛**而不是回空表 —— "查不到" ≠ "缩到 0 队列"，后者会让监听器
- *     收到一次假缩容回调、并把快照刷成空集。
- *   * 一个 topic 查不到只跳过它自己，本轮其余 topic 照常比对。
- *   * 重复注册同一 topic 覆盖旧监听器。
- *   * 命名空间：登记用裸名，比对与回调都用套好前缀的那一个键，且绝不二次套壳。
+ * This locks in this port's own contract; all criteria come from live wire traffic:
+ *   * The callback fires once only when the **queue set** actually changed relative
+ *     to the previous snapshot; a reordering alone is not a change.
+ *   * Registered before start = no snapshot, so the first pass always fires once
+ *     (handing the current set to the caller);
+ *     registered while running = a snapshot is recorded immediately, so the current
+ *     state is not re-reported as a "change".
+ *   * Every comparison pass **asks the name server fresh** (no route cache), otherwise
+ *     a scale-up would only become visible after one polling cycle at best.
+ *   * When queues cannot be found it **throws** instead of returning an empty list --
+ *     "not found" != "shrunk to 0 queues"; the latter would deliver a fake shrink
+ *     callback to the listener and flush the snapshot to an empty set.
+ *   * One topic failing to resolve only skips that topic itself; the rest of this
+ *     round's topics are still compared as usual.
+ *   * Registering the same topic twice overwrites the old listener.
+ *   * Namespacing: register with the bare name; comparison and callbacks both use
+ *     the one namespaced key, and never double-wrap.
  *
- * PHP 没有线程，比对那一趟由 tick() 按周期驱动；单测直接调
- * fetchTopicMessageQueuesAndCompare() 自己定序，只有一条用例走 tick()。
+ * PHP has no threads; the comparison pass is driven by tick() on a period. The unit
+ * test calls fetchTopicMessageQueuesAndCompare() directly to control ordering; only
+ * one case goes through tick().
  *
- * 运行：php tests/RunClientLiteTopicChange.php
- * 假 name server 与本文件同进程族：以 `--ns` 参数二次拉起自身，路由内容每次现读
- * 一份 JSON（topic => 读队列数），父进程改文件就等于「集群扩缩容」。
+ * Run: php tests/RunClientLiteTopicChange.php
+ * The fake name server is in the same process family as this file: it re-spawns
+ * itself with the `--ns` argument, and route contents are freshly read each time
+ * from a JSON file (topic => read queue count); the parent editing that file equals
+ * "cluster scale up/down".
  */
 
 require_once __DIR__ . '/../bootstrap.php';
@@ -59,7 +69,7 @@ function liteCheck(bool $ok, string $name, string $detail = ''): void
 }
 
 // ======================================================================
-// 假 name server（子进程）
+// Fake name server (child process)
 // ======================================================================
 
 function liteNsReadExact($conn, int $n): ?string
@@ -92,7 +102,7 @@ function liteNsReadFrame($conn): ?RemotingCommand
     return RemotingCommand::decode($head . $rest);
 }
 
-/** 路由内容每次现读：父进程改这个文件就是「集群扩缩容」。 */
+/** Route contents are read fresh each time: the parent editing this file equals "cluster scale up/down". */
 function liteRoutes(): array
 {
     $path = (string) getenv('RMQ_LITE_ROUTES');
@@ -165,7 +175,7 @@ function liteNsMain(): void
     @fclose($server);
 }
 
-/** 子进程假 name server 句柄。 */
+/** Child-process fake name server handle. */
 final class LiteFakeNameserver
 {
     /** @var resource */
@@ -200,7 +210,8 @@ final class LiteFakeNameserver
         $env = getenv();
         $env['RMQ_LITE_ROUTES'] = $routes;
         $env['RMQ_LITE_LOG'] = $log;
-        // 客户端日志钉在临时目录：本端口默认按 cwd 落盘，测试不该在仓库里长 logs/。
+        // Pin client logs to the temp dir: this port writes logs under cwd by default,
+        // and the test must not grow logs/ inside the repo.
         $env['ROCKETMQ_CLIENT_LOG_DIR'] = $seqDir;
         $proc = proc_open($cmd, $desc, $pipes, null, $env);
         if (!is_resource($proc)) {
@@ -220,7 +231,7 @@ final class LiteFakeNameserver
         return $self;
     }
 
-    /** @param array<string,int> $map topic => 读队列数 */
+    /** @param array<string,int> $map topic => read queue count */
     public function writeRoutes(array $map): void
     {
         @file_put_contents($this->routesFile, json_encode($map, JSON_UNESCAPED_SLASHES));
@@ -242,7 +253,7 @@ final class LiteFakeNameserver
         $this->writeRoutes($map);
     }
 
-    /** @return list<string> 收到过的路由查询 topic，按到达顺序 */
+    /** @return list<string> route-query topics received so far, in arrival order */
     public function queries(): array
     {
         $raw = (string) @file_get_contents($this->logFile);
@@ -271,7 +282,7 @@ final class LiteFakeNameserver
 }
 
 // ======================================================================
-// 记录用的队列变更监听器
+// Recording queue-change listener
 // ======================================================================
 
 final class LiteRecorder
@@ -293,14 +304,14 @@ final class LiteRecorder
 }
 
 // ======================================================================
-// 脚手架
+// Scaffolding
 // ======================================================================
 
 final class LiteHarness
 {
     public static int $seq = 0;
 
-    /** @return array{0:LiteFakeNameserver,1:string} 假端点 + 本用例专属 topic */
+    /** @return array{0:LiteFakeNameserver,1:string} fake endpoint + this case's own topic */
     public static function open(string $topicName, int $queues = 1): array
     {
         self::$seq++;
@@ -338,17 +349,17 @@ final class LiteHarness
 
 $GROUP = 'GID_lite_qc_unit';
 
-// ---------------------------------------------------------------- 1. 入参守卫与周期
+// ---------------------------------------------------------------- 1. Argument guards and period
 {
     $c = new DefaultLitePullConsumer($GROUP);
     foreach ([
-        ['空 topic', static function (DefaultLitePullConsumer $x): void {
+        ['empty topic', static function (DefaultLitePullConsumer $x): void {
             $x->registerTopicMessageQueueChangeListener('', new LiteRecorder());
         }],
-        ['空白 topic', static function (DefaultLitePullConsumer $x): void {
+        ['blank topic', static function (DefaultLitePullConsumer $x): void {
             $x->registerTopicMessageQueueChangeListener('   ', new LiteRecorder());
         }],
-        ['null 监听器', static function (DefaultLitePullConsumer $x): void {
+        ['null listener', static function (DefaultLitePullConsumer $x): void {
             $x->registerTopicMessageQueueChangeListener('AnyTopic', null);
         }],
     ] as [$label, $act]) {
@@ -358,20 +369,20 @@ $GROUP = 'GID_lite_qc_unit';
         } catch (MQClientException $e) {
             $threw = $e->getMessage();
         }
-        liteCheck(str_contains($threw, 'Topic or listener is null'), "$label 被拒", $threw);
+        liteCheck(str_contains($threw, 'Topic or listener is null'), "$label rejected", $threw);
     }
 
-    liteCheck($c->topicMetadataCheckIntervalMillis() === 30000, '默认比对周期 30s');
+    liteCheck($c->topicMetadataCheckIntervalMillis() === 30000, 'default compare period is 30s');
     $c->setTopicMetadataCheckIntervalMillis(0);
     liteCheck(
         $c->topicMetadataCheckIntervalMillis() === 1000,
-        '周期下限收到 1s（0 会把每次 tick 变成 RPC 风暴）'
+        'period floor clamps to 1s (0 would turn every tick into an RPC storm)'
     );
     $c->setTopicMetadataCheckIntervalMillis(5000);
-    liteCheck($c->topicMetadataCheckIntervalMillis() === 5000, '周期可放大');
+    liteCheck($c->topicMetadataCheckIntervalMillis() === 5000, 'period can be raised');
 }
 
-// ---------------------------------------------------------------- 2. 未启动查队列
+// ---------------------------------------------------------------- 2. Fetching queues before start
 {
     $c = new DefaultLitePullConsumer($GROUP);
     $threw = '';
@@ -380,11 +391,12 @@ $GROUP = 'GID_lite_qc_unit';
     } catch (MQClientException $e) {
         $threw = $e->getMessage();
     }
-    // 空表会被调用方读成「没有队列可用」而停手，未启动必须说清楚。
-    liteCheck(str_contains($threw, 'not started'), '未启动查队列直接报错', $threw);
+    // An empty list would be read by callers as "no queues available" and stop;
+    // before start the error must be explicit.
+    liteCheck(str_contains($threw, 'not started'), 'fetching queues before start fails outright', $threw);
 }
 
-// ---------------------------------------------------------------- 3. 启动前注册
+// ---------------------------------------------------------------- 3. Registered before start
 {
     [$ns, $topic] = LiteHarness::open('LiteQcPre', 2);
     $rec = new LiteRecorder();
@@ -394,35 +406,36 @@ $GROUP = 'GID_lite_qc_unit';
     $c->subscribe($topic, '*');
     $c->registerTopicMessageQueueChangeListener($topic, $rec);
     $c->start();
-    // 注册时还没法查队列 ⇒ 没有快照 ⇒ 第一趟把「当前集合」当变化交出来。
-    liteCheck($c->fetchTopicMessageQueuesAndCompare() === 1, '启动后第一趟回调一次');
-    liteCheck(LiteHarness::idsOf($rec, 0) === '0,1', '首回调带当前队列集合', LiteHarness::idsOf($rec, 0));
-    liteCheck($c->fetchTopicMessageQueuesAndCompare() === 0, '集合没变就不再回调');
+    // No queues could be fetched at registration time => no snapshot => the first
+    // pass hands over the "current set" as a change.
+    liteCheck($c->fetchTopicMessageQueuesAndCompare() === 1, 'first pass after start fires once');
+    liteCheck(LiteHarness::idsOf($rec, 0) === '0,1', 'first callback carries the current queue set', LiteHarness::idsOf($rec, 0));
+    liteCheck($c->fetchTopicMessageQueuesAndCompare() === 0, 'no repeat callback while the set is unchanged');
     $c->shutdown();
     $ns->stop();
 }
 
-// ---------------------------------------------------------------- 4. 运行中注册 + 扩缩容
+// ---------------------------------------------------------------- 4. Registered while running + scale up/down
 {
     [$ns, $topic] = LiteHarness::open('LiteQcScale', 1);
     $c = LiteHarness::started($ns, 'lite_qc_scale', $GROUP, $topic);
     $rec = new LiteRecorder();
     $c->registerTopicMessageQueueChangeListener($topic, $rec);
-    liteCheck($c->fetchTopicMessageQueuesAndCompare() === 0, '运行中注册后第一趟不误报');
+    liteCheck($c->fetchTopicMessageQueuesAndCompare() === 0, 'first pass after mid-run registration does not false-fire');
 
     $ns->setQueues($topic, 3);
-    liteCheck($c->fetchTopicMessageQueuesAndCompare() === 1, '扩容被观察到');
-    liteCheck(LiteHarness::idsOf($rec, 0) === '0,1,2', '回调带扩容后的集合', LiteHarness::idsOf($rec, 0));
-    liteCheck($c->fetchTopicMessageQueuesAndCompare() === 0, '同一集合不重复回调');
+    liteCheck($c->fetchTopicMessageQueuesAndCompare() === 1, 'scale-up is observed');
+    liteCheck(LiteHarness::idsOf($rec, 0) === '0,1,2', 'callback carries the scaled-up set', LiteHarness::idsOf($rec, 0));
+    liteCheck($c->fetchTopicMessageQueuesAndCompare() === 0, 'same set does not fire again');
 
     $ns->setQueues($topic, 2);
-    liteCheck($c->fetchTopicMessageQueuesAndCompare() === 1, '缩容也被观察到');
-    liteCheck(LiteHarness::idsOf($rec, 1) === '0,1', '回调带缩容后的集合', LiteHarness::idsOf($rec, 1));
+    liteCheck($c->fetchTopicMessageQueuesAndCompare() === 1, 'scale-down is also observed');
+    liteCheck(LiteHarness::idsOf($rec, 1) === '0,1', 'callback carries the scaled-down set', LiteHarness::idsOf($rec, 1));
     $c->shutdown();
     $ns->stop();
 }
 
-// ---------------------------------------------------------------- 5. 每趟现问 name server
+// ---------------------------------------------------------------- 5. Every pass asks the name server fresh
 {
     [$ns, $topic] = LiteHarness::open('LiteQcFresh', 2);
     $c = LiteHarness::started($ns, 'lite_qc_fresh', $GROUP, $topic);
@@ -434,57 +447,59 @@ $GROUP = 'GID_lite_qc_unit';
     $ns->clearQueries();
     $c->fetchTopicMessageQueuesAndCompare();
     $second = count($ns->queries());
-    liteCheck($first >= 1, '比对这一趟会问路由', (string) $first);
-    // 吃缓存的话扩容要等一次周期轮询才看得见，监听整整慢一个周期。
-    liteCheck($second >= 1, '下一趟再问一次', (string) $second);
-    liteCheck($rec->count() === 0, '集合没变时问了也不回调');
+    liteCheck($first >= 1, 'the comparison pass queries routes', (string) $first);
+    // With a cache, a scale-up would only surface after one polling cycle, delaying
+    // the listener by a full period.
+    liteCheck($second >= 1, 'the next pass queries again', (string) $second);
+    liteCheck($rec->count() === 0, 'no callback when the set is unchanged, even after querying');
     $c->shutdown();
     $ns->stop();
 }
 
-// ---------------------------------------------------------------- 6. 一个 topic 失败不饿死别人
+// ---------------------------------------------------------------- 6. One failing topic does not starve the others
 {
     [$ns, $topic] = LiteHarness::open('LiteQcIsolate', 2);
     $ghost = 'LiteQcGhost';
     $good = new LiteRecorder();
     $bad = new LiteRecorder();
     $c = LiteHarness::started($ns, 'lite_qc_isolate', $GROUP, $topic);
-    // 先登记查不到的那个：它排在前面，如果异常逃出循环体，后面正常的就收不到回调。
+    // Register the unresolvable one first: it sorts first, and if the exception
+    // escaped the loop the healthy one would never get its callback.
     $c->registerTopicMessageQueueChangeListener($ghost, $bad);
     $c->registerTopicMessageQueueChangeListener($topic, $good);
     $ns->setQueues($topic, 3);
-    liteCheck($c->fetchTopicMessageQueuesAndCompare() === 1, '坏 topic 不影响本轮其余比对');
-    liteCheck($bad->count() === 0, '查不到路由的 topic 不发回调（也绝不回空表假装缩容）');
-    liteCheck(LiteHarness::idsOf($good, 0) === '0,1,2', '正常 topic 收到的是新集合', LiteHarness::idsOf($good, 0));
+    liteCheck($c->fetchTopicMessageQueuesAndCompare() === 1, 'a bad topic does not affect the rest of this round');
+    liteCheck($bad->count() === 0, 'unresolvable topic fires no callback (and never pretends to shrink with an empty list)');
+    liteCheck(LiteHarness::idsOf($good, 0) === '0,1,2', 'healthy topic receives the new set', LiteHarness::idsOf($good, 0));
     $c->shutdown();
     $ns->stop();
 }
 
-// ---------------------------------------------------------------- 7. 查不到队列时报错
+// ---------------------------------------------------------------- 7. Error when queues cannot be found
 {
     [$ns, $topic] = LiteHarness::open('LiteQcEmpty', 1);
     $c = LiteHarness::started($ns, 'lite_qc_empty', $GROUP, $topic);
-    $ns->setQueues($topic, 0);   // 路由还在，读队列数没了
+    $ns->setQueues($topic, 0);   // route still there, read queue count gone
     $threw = '';
     try {
         $c->fetchMessageQueues($topic);
     } catch (MQClientException $e) {
         $threw = $e->getMessage();
     }
-    liteCheck(str_contains($threw, 'Can not find Message Queue'), '没有可用队列时报错', $threw);
-    $ns->drop($topic);           // 干脆没有这个 topic 的路由
+    liteCheck(str_contains($threw, 'Can not find Message Queue'), 'errors when no queues are available', $threw);
+    $ns->drop($topic);           // no route for this topic at all
     $threw = '';
     try {
         $c->fetchMessageQueues($topic);
     } catch (MQClientException $e) {
         $threw = $e->getMessage();
     }
-    liteCheck(str_contains($threw, 'Can not find Message Queue'), '查不到路由时同样报错', $threw);
+    liteCheck(str_contains($threw, 'Can not find Message Queue'), 'same error when the route is missing entirely', $threw);
     $c->shutdown();
     $ns->stop();
 }
 
-// ---------------------------------------------------------------- 8. 重复注册覆盖旧的
+// ---------------------------------------------------------------- 8. Re-registering overwrites the old listener
 {
     [$ns, $topic] = LiteHarness::open('LiteQcOverwrite', 1);
     $c = LiteHarness::started($ns, 'lite_qc_overwrite', $GROUP, $topic);
@@ -493,14 +508,14 @@ $GROUP = 'GID_lite_qc_unit';
     $c->registerTopicMessageQueueChangeListener($topic, $first);
     $c->registerTopicMessageQueueChangeListener($topic, $second);
     $ns->setQueues($topic, 2);
-    liteCheck($c->fetchTopicMessageQueuesAndCompare() === 1, '覆盖后同一 topic 只回一次');
-    liteCheck($first->count() === 0, '旧监听器不再收到回调');
-    liteCheck($second->count() === 1, '只有新监听器收到');
+    liteCheck($c->fetchTopicMessageQueuesAndCompare() === 1, 'after overwrite the same topic fires only once');
+    liteCheck($first->count() === 0, 'old listener receives no callback');
+    liteCheck($second->count() === 1, 'only the new listener is notified');
     $c->shutdown();
     $ns->stop();
 }
 
-// ---------------------------------------------------------------- 9. 命名空间口径
+// ---------------------------------------------------------------- 9. Namespace semantics
 {
     $nameSpace = 'MQ_INST_lite';
     $plain = 'LiteQcNs';
@@ -511,48 +526,50 @@ $GROUP = 'GID_lite_qc_unit';
     $c->registerTopicMessageQueueChangeListener($plain, $rec);
     $ns->clearQueries();
     $ns->setQueues($wrapped, 2);
-    liteCheck($c->fetchTopicMessageQueuesAndCompare() === 1, '带命名空间也能比对出变化');
-    liteCheck(LiteHarness::topicOf($rec, 0) === $wrapped, '回调的 topic 是套好命名空间的那一个', LiteHarness::topicOf($rec, 0));
-    liteCheck(LiteHarness::idsOf($rec, 0) === '0,1', '回调带扩容后的集合', LiteHarness::idsOf($rec, 0));
+    liteCheck($c->fetchTopicMessageQueuesAndCompare() === 1, 'comparison detects changes with a namespace too');
+    liteCheck(LiteHarness::topicOf($rec, 0) === $wrapped, 'callback topic is the namespaced one', LiteHarness::topicOf($rec, 0));
+    liteCheck(LiteHarness::idsOf($rec, 0) === '0,1', 'callback carries the scaled-up set', LiteHarness::idsOf($rec, 0));
     $asked = $ns->queries();
-    liteCheck(in_array($wrapped, $asked, true), '比对拿套好的键去问路由', implode('|', $asked));
+    liteCheck(in_array($wrapped, $asked, true), 'comparison queries routes with the namespaced key', implode('|', $asked));
     liteCheck(
         !in_array($nameSpace . '%' . $wrapped, $asked, true),
-        '绝不出现二次套壳的查询',
+        'never a double-wrapped query',
         implode('|', $asked)
     );
-    // 拿已经套好的键再登记一次：只是覆盖同一个条目，不会长出第二个前缀。
+    // Re-register with the already-namespaced key: it just overwrites the same
+    // entry, no second prefix grows.
     $c->registerTopicMessageQueueChangeListener($wrapped, $rec);
     $ns->clearQueries();
     $ns->setQueues($wrapped, 3);
-    liteCheck($c->fetchTopicMessageQueuesAndCompare() === 1, '重复登记套好的键不会多出一份监听器');
-    liteCheck($rec->count() === 2, '回调仍然只来一次', (string) $rec->count());
+    liteCheck($c->fetchTopicMessageQueuesAndCompare() === 1, 're-registering the namespaced key does not add a second listener');
+    liteCheck($rec->count() === 2, 'callback still comes exactly once', (string) $rec->count());
     $c->shutdown();
     $ns->stop();
 }
 
-// ---------------------------------------------------------------- 10. tick 真的在驱动比对
+// ---------------------------------------------------------------- 10. tick really drives the comparison
 {
     [$ns, $topic] = LiteHarness::open('LiteQcTick', 1);
     $c = LiteHarness::started($ns, 'lite_qc_tick', $GROUP, $topic);
     $rec = new LiteRecorder();
     $c->registerTopicMessageQueueChangeListener($topic, $rec);
     $ns->setQueues($topic, 2);
-    // 首查本来排在 start 之后 10s；这里把它提前，让 tick 走真实分支。
+    // The first check is normally scheduled 10s after start; pull it earlier here
+    // so tick() takes the real branch.
     $c->nextMetadataCheckAt = microtime(true) - 1.0;
     $c->tick();
-    liteCheck($rec->count() === 1, 'tick 自己跑出一轮比对', (string) $rec->count());
-    liteCheck(LiteHarness::idsOf($rec, 0) === '0,1', 'tick 驱动的那一趟收到新集合', LiteHarness::idsOf($rec, 0));
+    liteCheck($rec->count() === 1, 'tick runs a comparison round by itself', (string) $rec->count());
+    liteCheck(LiteHarness::idsOf($rec, 0) === '0,1', 'the tick-driven pass receives the new set', LiteHarness::idsOf($rec, 0));
     liteCheck(
         $c->nextMetadataCheckAt > microtime(true),
-        '跑完一轮就把下一趟推到下个周期',
+        'after a round the next pass is pushed to the next period',
         (string) ($c->nextMetadataCheckAt - microtime(true))
     );
     $c->shutdown();
     $ns->stop();
 }
 
-// ---------------------------------------------------------------- 11. 回调抛异常不影响比对
+// ---------------------------------------------------------------- 11. Listener throwing does not break the comparison
 {
     [$ns, $topic] = LiteHarness::open('LiteQcBoom', 1);
     $c = LiteHarness::started($ns, 'lite_qc_boom', $GROUP, $topic);
@@ -566,11 +583,12 @@ $GROUP = 'GID_lite_qc_unit';
     try {
         $fired = $c->fetchTopicMessageQueuesAndCompare();
     } catch (Throwable $e) {
-        liteCheck(false, '调用方监听器抛异常不该把比对带下去', $e->getMessage());
+        liteCheck(false, 'a caller listener throwing must not take down the comparison', $e->getMessage());
     }
-    liteCheck($fired === 1, '回调照常计一次');
-    // 快照已经推进，所以异常不会让下一轮重复上报同一个集合。
-    liteCheck($c->fetchTopicMessageQueuesAndCompare() === 0, '抛过异常的那一趟快照照样生效');
+    liteCheck($fired === 1, 'callback still counts as one fire');
+    // The snapshot has already advanced, so the exception does not re-report the
+    // same set on the next round.
+    liteCheck($c->fetchTopicMessageQueuesAndCompare() === 0, 'snapshot still applies after the pass that threw');
     $c->shutdown();
     $ns->stop();
 }

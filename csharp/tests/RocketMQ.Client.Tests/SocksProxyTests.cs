@@ -1,10 +1,13 @@
-// SOCKS 代理传输层单测：本地手写假 SOCKS5 / SOCKS4 服务器（最小握手 + CONNECT +
-// 双向转发到本机 echo broker），断言 RemotingClient 配上 SocksProxyConfig 后经代理
-// 完成一次完整 invokeSync；再覆盖用户名密码子协商的成功与拒绝、方法拒绝、CONNECT
-// 被拒、死代理四条失败路径。
+// SOCKS proxy transport layer unit tests: a hand-written local fake SOCKS5 / SOCKS4
+// server (minimal handshake + CONNECT + bidirectional forwarding to a local echo
+// broker) asserts that RemotingClient, once configured with SocksProxyConfig, completes a
+// full invokeSync through the proxy; then the four failure paths are covered: username
+// and password sub-negotiation success and rejection, method rejection, and a rejected
+// CONNECT, plus a dead proxy.
 //
-// 本机 loopback 怪癖：刚关闭的端口约 2s 内还可能"连上"再被拒——所以「连接失败类」
-// 断言一律给 ≥30s 的超时预算（connect 30s + invoke 60s），而不是用默认 3s。
+// A local loopback quirk: a just-closed port may still "connect" and then be rejected for
+// about 2s -- so every "connection failure" assertion is given a timeout budget of >=30s
+// (connect 30s + invoke 60s) instead of the default 3s.
 using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
@@ -17,9 +20,10 @@ namespace RocketMQ.Client.Tests;
 
 public class SocksProxyTests
 {
-    // ---------------------------------------------------------------- 测试基础设施
+    // ---------------------------------------------------------------- Test infrastructure
 
-    /// <summary>通用 TCP 测试服务器：Bind(0) 起监听，每条连接交给 handler 异步处理。</summary>
+    /// <summary>A general purpose TCP test server: Bind(0) to start listening, each
+    /// connection handled asynchronously by the handler.</summary>
     private sealed class TcpTestServer : IDisposable
     {
         private readonly Socket _listener;
@@ -61,7 +65,8 @@ public class SocksProxyTests
         }
     }
 
-    /// <summary>echo broker：按 totalLength 收完整请求帧，把 code 原样编码为响应回写。</summary>
+    /// <summary>An echo broker: reads a whole request frame by totalLength, then writes
+    /// back a response encoding the code verbatim.</summary>
     private static async Task HandleEcho(Socket client)
     {
         var buf = new MemoryStream();
@@ -113,17 +118,18 @@ public class SocksProxyTests
         }
         catch
         {
-            // 连接断开即退出
+            // Exits as soon as the connection drops
         }
         finally
         {
-            try { client.Dispose(); } catch { /* 忽略 */ }
+            try { client.Dispose(); } catch { /* ignore */ }
         }
     }
 
     /// <summary>
-    /// 假 SOCKS5 服务器：最小握手（方法选择 + 可选 RFC 1929 用户名密码子协商）+
-    /// CONNECT 到真实目标 + 双向转发。Username 非空 = 要求用户名密码认证。
+    /// A fake SOCKS5 server: minimal handshake (method selection + optional RFC 1929
+    /// username/password sub-negotiation) + CONNECT to the real target + bidirectional
+    /// forwarding. A non-empty Username means username/password auth is required.
     /// </summary>
     private sealed class FakeSocks5Server : IDisposable
     {
@@ -131,9 +137,9 @@ public class SocksProxyTests
 
         public string? Username;
         public string? Password;
-        public bool RejectConnect;       // CONNECT 回 REP=1（一般性失败）
-        public int AuthRejections;       // 用户名密码被拒次数
-        public int ConnectCount;         // 成功 CONNECT 次数
+        public bool RejectConnect;       // CONNECT replies REP=1 (general failure)
+        public int AuthRejections;       // how many times the username/password was rejected
+        public int ConnectCount;         // how many CONNECTs succeeded
 
         public FakeSocks5Server()
         {
@@ -150,13 +156,13 @@ public class SocksProxyTests
                 byte[] head = await ReadExactAsync(client, 2);
                 if (head[0] != 5)
                 {
-                    return; // 不是 SOCKS5，直接断
+                    return; // not SOCKS5, drop right away
                 }
 
                 byte[] methods = await ReadExactAsync(client, head[1]);
                 if (Username is not null)
                 {
-                    // 要求用户名密码认证：客户端必须提供 0x02 方法
+                    // Username/password auth required: the client must offer method 0x02
                     if (Array.IndexOf(methods, (byte)0x02) < 0)
                     {
                         await client.SendAsync(new byte[] { 5, 0xFF });
@@ -164,7 +170,7 @@ public class SocksProxyTests
                     }
 
                     await client.SendAsync(new byte[] { 5, 0x02 });
-                    await ReadExactAsync(client, 1); // VER（RFC 1929 固定为 1，校验略）
+                    await ReadExactAsync(client, 1); // VER (fixed at 1 in RFC 1929, the check is skipped)
                     byte[] ulenByte = await ReadExactAsync(client, 1);
                     byte[] user = await ReadExactAsync(client, ulenByte[0]);
                     byte[] plenByte = await ReadExactAsync(client, 1);
@@ -173,7 +179,7 @@ public class SocksProxyTests
                         || Encoding.UTF8.GetString(pass) != (Password ?? string.Empty))
                     {
                         Interlocked.Increment(ref AuthRejections);
-                        await client.SendAsync(new byte[] { 1, 1 }); // status != 0 = 拒绝
+                        await client.SendAsync(new byte[] { 1, 1 }); // status != 0 means rejected
                         return;
                     }
 
@@ -184,7 +190,7 @@ public class SocksProxyTests
                     await client.SendAsync(new byte[] { 5, 0x00 });
                 }
 
-                // CONNECT：VER CMD RSV ATYP ADDR PORT
+                // CONNECT: VER CMD RSV ATYP ADDR PORT
                 byte[] req = await ReadExactAsync(client, 4);
                 byte[] addr;
                 if (req[3] == 1)
@@ -218,18 +224,18 @@ public class SocksProxyTests
                 Interlocked.Increment(ref ConnectCount);
                 await client.SendAsync(new byte[] { 5, 0, 0, 1, 0, 0, 0, 0, 0, 0 });
 
-                // 双向转发：SOCKS 隧道里跑的就是 echo broker 的 RocketMQ 帧
+                // Bidirectional forwarding: what runs inside the SOCKS tunnel are the echo broker's RocketMQ frames
                 Task a = Relay(client, target);
                 Task b = Relay(target, client);
                 await Task.WhenAll(a, b);
             }
             catch
             {
-                // 握手失败 / 断开即结束
+                // A failed handshake / a disconnect ends it
             }
             finally
             {
-                try { client.Dispose(); } catch { /* 忽略 */ }
+                try { client.Dispose(); } catch { /* ignore */ }
             }
         }
 
@@ -239,8 +245,9 @@ public class SocksProxyTests
         }
     }
 
-    /// <summary>假 SOCKS4/4a 服务器：8 字节头 + USERID(NUL 结尾) [+ DOMAIN(NUL 结尾)]，
-    /// 回 CD=0x5A 后双向转发。</summary>
+    /// <summary>A fake SOCKS4/4a server: an 8-byte header + USERID (NUL terminated)
+    /// [+ DOMAIN (NUL terminated)], replying CD=0x5A and then forwarding
+    /// bidirectionally.</summary>
     private sealed class FakeSocks4Server : IDisposable
     {
         private readonly TcpTestServer _server;
@@ -264,12 +271,12 @@ public class SocksProxyTests
                     return;
                 }
 
-                // USERID：读到 NUL
+                // USERID: read up to NUL
                 while ((await ReadExactAsync(client, 1))[0] != 0)
                 {
                 }
 
-                // SOCKS4a：DSTIP = 0.0.0.x 时其后跟 NUL 结尾的域名
+                // SOCKS4a: when DSTIP = 0.0.0.x a NUL terminated domain name follows
                 if (head[4] == 0 && head[5] == 0 && head[6] == 0)
                 {
                     while ((await ReadExactAsync(client, 1))[0] != 0)
@@ -281,7 +288,7 @@ public class SocksProxyTests
                 var target = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
                 await target.ConnectAsync(new IPEndPoint(new IPAddress(head.AsSpan(4, 4)), port));
                 Interlocked.Increment(ref ConnectCount);
-                // VN CD DSTPORT(2) DSTIP(4)，CD = 0x5A 表示同意
+                // VN CD DSTPORT(2) DSTIP(4), CD = 0x5A means granted
                 await client.SendAsync(new byte[] { 0, 0x5A, head[2], head[3], 0, 0, 0, 0 });
 
                 Task a = Relay(client, target);
@@ -290,11 +297,11 @@ public class SocksProxyTests
             }
             catch
             {
-                // 握手失败 / 断开即结束
+                // A failed handshake / a disconnect ends it
             }
             finally
             {
-                try { client.Dispose(); } catch { /* 忽略 */ }
+                try { client.Dispose(); } catch { /* ignore */ }
             }
         }
 
@@ -322,11 +329,11 @@ public class SocksProxyTests
         }
         catch
         {
-            // 单向断开即退出，另一向会随之见到 EOF/异常
+            // Exits as soon as one direction drops, the other then sees an EOF/an exception
         }
         finally
         {
-            try { to.Dispose(); } catch { /* 忽略 */ }
+            try { to.Dispose(); } catch { /* ignore */ }
         }
     }
 
@@ -358,7 +365,7 @@ public class SocksProxyTests
         return RemotingCommand.CreateRequestCommand(RequestCode.SendMessage, hdr);
     }
 
-    // ---------------------------------------------------------------- 用例
+    // ---------------------------------------------------------------- Cases
 
     [Fact]
     public async Task InvokeSync_ThroughSocks5_NoAuth_Succeeds()
@@ -415,7 +422,7 @@ public class SocksProxyTests
         Task brokerLoop = Task.Run(broker.Loop);
         try
         {
-            // 连接失败类断言：给 ≥30s 预算（本机 loopback 怪癖 + 子协商往返余量）
+            // "Connection failure" assertions: give a >=30s budget (local loopback quirk + sub-negotiation round-trip slack)
             using var client = new RemotingClient(connectTimeoutMillis: 30000, invokeTimeoutMillis: 60000,
                 socksProxy: new SocksProxyConfig { Addr = proxy.Addr, Username = "rmq", Password = "wrong" });
             RemotingConnectException ex = Assert.Throws<RemotingConnectException>(
@@ -440,7 +447,7 @@ public class SocksProxyTests
         Task brokerLoop = Task.Run(broker.Loop);
         try
         {
-            // 客户端没配凭证 → 只报 0x00 方法 → 代理回 0xFF
+            // The client has no credentials configured -> it only offers method 0x00 -> the proxy replies 0xFF
             using var client = new RemotingClient(connectTimeoutMillis: 30000, invokeTimeoutMillis: 60000,
                 socksProxy: new SocksProxyConfig { Addr = proxy.Addr });
             RemotingConnectException ex = Assert.Throws<RemotingConnectException>(
@@ -487,7 +494,7 @@ public class SocksProxyTests
         Task brokerLoop = Task.Run(broker.Loop);
         try
         {
-            // 目标是 127.0.0.1（IPv4 字面量）→ 原生 SOCKS4（非 4a），USERID 取 Username
+            // The target is 127.0.0.1 (an IPv4 literal) -> native SOCKS4 (not 4a), with USERID taken from Username
             using var client = new RemotingClient(connectTimeoutMillis: 10000, invokeTimeoutMillis: 15000,
                 socksProxy: new SocksProxyConfig
                 {
@@ -509,14 +516,15 @@ public class SocksProxyTests
     [Fact]
     public void InvokeSync_DeadProxy_ThrowsConnectException()
     {
-        // 预留一个没人监听的 loopback 端口当"死代理"
+        // Reserve a loopback port nobody listens on as the "dead proxy"
         var reserved = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
         reserved.Bind(new IPEndPoint(IPAddress.Loopback, 0));
         string deadAddr = ((IPEndPoint)reserved.LocalEndPoint!).ToString();
         reserved.Dispose();
 
-        // 本机 loopback 怪癖：刚关闭的端口约 2s 内还可能"连上"再被拒，
-        // 所以 connect/invoke 都给足 ≥30s 预算，断言只看异常类型。
+        // A local loopback quirk: a just-closed port may still "connect" and then be
+        // rejected for about 2s, so connect/invoke both get a full >=30s budget and the
+        // assertion only looks at the exception type.
         using var client = new RemotingClient(connectTimeoutMillis: 30000, invokeTimeoutMillis: 60000,
             socksProxy: new SocksProxyConfig { Addr = deadAddr });
         Assert.Throws<RemotingConnectException>(

@@ -35,14 +35,16 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 
 class ConsumeCollector:
-    """先 start 再发消息：消费者若晚于投递启动（默认从最新位点消费）会整个错过消息。"""
+    """Start first and only then send the messages: a consumer that comes up after the delivery started (the default consumes from the latest offset) would miss the messages entirely."""
 
     def __init__(self, topic: str, group: str):
         self.msgs = []
         self._consumer = DefaultMQPushConsumer(group)
         self._consumer.set_namesrv_addr(NAMESRV)
-        # 全新消费组 + 默认 LAST_OFFSET：broker 会把位点直接种到队尾，消费者拿到队列
-        # 之前发的那几条就永远读不到了。这里必须显式从 0 开始（与 verify_message_types 一致）。
+        # A brand-new consumer group plus the default LAST_OFFSET: the broker seeds the offset
+        # straight to the tail, so the few messages sent before the consumer got its queue could
+        # never be read. It has to explicitly start from 0 here (consistent with
+        # verify_message_types).
         self._consumer.set_consume_from_where(ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET)
         self._consumer.subscribe(topic, "*")
 
@@ -51,7 +53,7 @@ class ConsumeCollector:
             from client.consumer import ConsumeConcurrentlyStatus
             return ConsumeConcurrentlyStatus.CONSUME_SUCCESS
 
-        # 必须是 SimpleMessageListener；回调参数是**消息列表**（不是单条）
+        # It has to be a SimpleMessageListener; the callback parameter is a **list of messages** (not a single one)
         self._consumer.set_message_listener(SimpleMessageListener(self._on_msg))
 
     def _on_msg(self, msgs):
@@ -62,7 +64,7 @@ class ConsumeCollector:
 
     def start(self):
         self._consumer.start()
-        # 等消费者完成路由/队列就绪，避免刚启动时的空窗
+        # Wait for the consumer to finish resolving its route/queues, to avoid the blank window right after startup
         time.sleep(2)
 
     def wait_and_stop(self, seconds: int):
@@ -87,7 +89,7 @@ class RollbackListener(TransactionListener):
 
 
 class UnknownThenCommitListener(TransactionListener):
-    """本地事务返回 UNKNOW，等 broker 回查时才判 COMMIT。"""
+    """The local transaction returns UNKNOW; COMMIT is only decided when the broker checks back."""
 
     def __init__(self):
         self.check_calls = 0
@@ -112,11 +114,14 @@ def main() -> int:
     topic_rb = PREFIX + "_TxRollback"
     topic_ck = PREFIX + "_TxCheck"
 
-    # topic 必须先建好，再启动消费者。靠 broker 自动建 topic 的话，新 topic 要到下一次
-    # broker 注册（registerNameServerPeriod=30s）才进 NameServer 路由；而消费者心跳又只发往
-    # 路由里已有的 broker（get_route_of_all_brokers 读的是缓存路由）。两者叠加，"消费者先于
-    # topic 启动"要白等 30s 以上才分得到队列，远超本脚本 8~25s 的观测窗。
-    # admin 建 topic 会让 broker 立刻重新注册，NameServer 当场就有路由。
+    # The topic has to be created first, and only then the consumer started. If the topic were
+    # auto-created by the broker, it would only enter the NameServer route on the next broker
+    # registration (registerNameServerPeriod=30s); and the consumer heartbeat only goes to the
+    # brokers already present in the route (get_route_of_all_brokers reads the cached route).
+    # Combined, "the consumer starts before the topic exists" means waiting over 30s before it
+    # gets any queue assigned, far beyond the 8~25s observation window of this script.
+    # Creating the topic via admin makes the broker re-register immediately, so the NameServer
+    # has the route on the spot.
     admin = DefaultMQAdminExt()
     admin.set_namesrv_addr(NAMESRV)
     admin.start()
@@ -127,13 +132,14 @@ def main() -> int:
     finally:
         admin.shutdown()
 
-    # ---------- 0. 对照组：普通（非事务）消息 ----------
-    # 先证明消费者链路本身是通的，否则"事务消息没被消费"可能只是脚本/消费者用法问题
+    # ---------- 0. control group: an ordinary (non-transactional) message ----------
+    # First prove that the consumer path itself works, otherwise "the transactional message was
+    # not consumed" might just be a problem with this script or with how the consumer is used
     plain = ConsumeCollector(topic_plain, PREFIX + "_cg_plain")
     plain.start()
     producer.send(Message(topic_plain, b"plain-msg"))
     plain.wait_and_stop(8)
-    check("对照组-普通消息可被消费",
+    check("control group - the ordinary message can be consumed",
           any(m.body == b"plain-msg" for m in plain.msgs),
           "received=%d" % len(plain.msgs))
 
@@ -144,15 +150,15 @@ def main() -> int:
     try:
         tsr = producer.send_message_in_transaction(
             Message(topic, b"tx-commit"), listener)
-        check("事务-COMMIT 发送状态",
+        check("transaction - COMMIT send status",
               tsr.send_status.name == "SEND_OK"
               and tsr.get_local_transaction_state() == LocalTransactionState.COMMIT_MESSAGE,
               "state=%s" % tsr.get_local_transaction_state())
     except Exception as e:  # noqa: BLE001
-        check("事务-COMMIT 发送状态", False, "throw=%s" % e)
+        check("transaction - COMMIT send status", False, "throw=%s" % e)
 
     run.wait_and_stop(10)
-    check("事务-COMMIT 落库可被消费",
+    check("transaction - the COMMIT message is persisted and can be consumed",
           any(m.body == b"tx-commit" for m in run.msgs),
           "received=%d" % len(run.msgs))
 
@@ -163,37 +169,37 @@ def main() -> int:
     try:
         tsr = producer.send_message_in_transaction(
             Message(topic_rb, b"tx-rollback"), rb_listener)
-        check("事务-ROLLBACK 发送状态",
+        check("transaction - ROLLBACK send status",
               tsr.get_local_transaction_state() == LocalTransactionState.ROLLBACK_MESSAGE,
               "state=%s" % tsr.get_local_transaction_state())
     except Exception as e:  # noqa: BLE001
-        check("事务-ROLLBACK 发送状态", False, "throw=%s" % e)
+        check("transaction - ROLLBACK send status", False, "throw=%s" % e)
 
     run2.wait_and_stop(10)
-    check("事务-ROLLBACK 不被投递",
+    check("transaction - ROLLBACK is not delivered",
           not any(m.body == b"tx-rollback" for m in run2.msgs),
           "received=%d" % len(run2.msgs))
 
-    # ---------- 3. UNKNOW + broker 回查 ----------
+    # ---------- 3. UNKNOW + broker check-back ----------
     ck_listener = UnknownThenCommitListener()
     run3 = ConsumeCollector(topic_ck, PREFIX + "_cg_ck")
     run3.start()
     try:
         tsr = producer.send_message_in_transaction(
             Message(topic_ck, b"tx-check"), ck_listener)
-        check("事务-UNKNOW 发送状态",
+        check("transaction - UNKNOW send status",
               tsr.get_local_transaction_state() == LocalTransactionState.UNKNOW,
               "state=%s" % tsr.get_local_transaction_state())
     except Exception as e:  # noqa: BLE001
-        check("事务-UNKNOW 发送状态", False, "throw=%s" % e)
+        check("transaction - UNKNOW send status", False, "throw=%s" % e)
 
     deadline = time.time() + 90
     while ck_listener.check_calls == 0 and time.time() < deadline:
         time.sleep(1)
     run3.wait_and_stop(10)
-    check("事务-UNKNOW 触发 broker 回查", ck_listener.check_calls > 0,
+    check("transaction - UNKNOW triggered a broker check-back", ck_listener.check_calls > 0,
           "check_local_transaction_calls=%d" % ck_listener.check_calls)
-    check("事务-UNKNOW 回查后最终投递",
+    check("transaction - the UNKNOW message is finally delivered after the check-back",
           any(m.body == b"tx-check" for m in run3.msgs),
           "received=%d" % len(run3.msgs))
 

@@ -1,7 +1,7 @@
-//! - `assignments == null`（body 为空 / 缺键 / 显式 null）→ 「无效结果」，客户端
-//!   **跳过本轮更新、保留上一次分配**；[`QueryAssignmentResponseBody::decode`] 回 `None`。
-//! - `assignments == 空数组` → 「清除我之前拿到的全部负载」；decode 回 `Some(vec![])`。
-//! - 报文本身不合法 → `Err`（严出：不猜）。
+//! - `assignments == null` (empty body / missing key / explicit null) → "invalid result", the
+//!   client **skips this round of update and keeps the previous assignment**; [`QueryAssignmentResponseBody::decode`] returns `None`.
+//! - `assignments == empty array` → "clear all assignments previously received"; decode returns `Some(vec![])`.
+//! - Payload itself is malformed → `Err` (strict failure: no guessing).
 
 use serde_json::Value;
 
@@ -14,18 +14,18 @@ use crate::error::{Error, Result};
 pub const MESSAGE_REQUEST_MODE_POP: &str = "POP";
 pub const MESSAGE_REQUEST_MODE_PULL: &str = "PULL";
 
-// ---------------------------------------------------------------- 请求体
+// ---------------------------------------------------------------- request body
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct QueryAssignmentRequestBody {
     pub topic: String,
     pub consumer_group: String,
     pub client_id: String,
-    /// 本端的分配策略名（"AVG" / "AVG_CIRCLE" / …）。broker 只认识
-    /// `AllocateMessageQueueAveragely`（AVG）与 `AVG_BY_CIRCLE`，其余回 null
-    /// （= 无效结果，客户端保留上一次分配）。
+    /// The allocation strategy name used on this side ("AVG" / "AVG_CIRCLE" / ...). The broker only knows
+    /// `AllocateMessageQueueAveragely` (AVG) and `AVG_BY_CIRCLE`; anything else yields null
+    /// (= invalid result, and the client keeps its previous assignment).
     pub strategy_name: String,
-    /// 枚举名："CLUSTERING" / "BROADCASTING"。
+    /// Enum names: "CLUSTERING" / "BROADCASTING".
     pub message_model: String,
 }
 
@@ -76,7 +76,7 @@ impl QueryAssignmentRequestBody {
     }
 }
 
-// ---------------------------------------------------------------- 单个分配项
+// ---------------------------------------------------------------- single assignment item
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageQueueAssignment {
@@ -119,8 +119,8 @@ impl MessageQueueAssignment {
     }
 }
 
-/// `jraw_map` 的姊妹：字段是对象则克隆，否则（缺失 / null / 脏类型）回 `Value::Null`
-/// —— 正好喂给 `MessageQueueKey::from_value`（非对象回 None）。
+/// Sibling of `jraw_map`: clones the field when it is an object, otherwise (missing / null / dirty type) returns `Value::Null`
+/// -- exactly the input `MessageQueueKey::from_value` expects (non-object maps to None).
 fn jraw_map_null(value: &Value, key: &str) -> Value {
     match value.get(key) {
         Some(v) if v.is_object() => v.clone(),
@@ -128,7 +128,7 @@ fn jraw_map_null(value: &Value, key: &str) -> Value {
     }
 }
 
-// ---------------------------------------------------------------- 响应体
+// ---------------------------------------------------------------- response body
 
 pub struct QueryAssignmentResponseBody;
 
@@ -147,7 +147,7 @@ impl QueryAssignmentResponseBody {
         )]))
     }
 
-    /// 解析 400 响应 body。返回值的三态即语义：
+    /// Parses the 400 response body. The three return states carry the semantics:
     pub fn decode(data: &[u8]) -> Result<Option<Vec<MessageQueueAssignment>>> {
         if data.is_empty() {
             return Ok(None);
@@ -198,7 +198,7 @@ mod tests {
             "\"strategyName\":\"AVG\"",
             "\"messageModel\":\"CLUSTERING\"",
         ] {
-            assert!(text.contains(key), "{text} 缺 {key}");
+            assert!(text.contains(key), "{text} missing {key}");
         }
     }
 
@@ -212,7 +212,7 @@ mod tests {
         let back = QueryAssignmentRequestBody::decode(&full.encode()).unwrap();
         assert_eq!(back, full);
 
-        // 脏类型：字符串字段写成对象 → 回默认值而不是 panic（fastjson2 的 to_string 容错）
+        // Dirty type: a string field written as an object -> returns the default instead of panicking (the tolerant parser stringifies it)
         let v: Value = serde_json::from_str(
             "{\"topic\":{\"a\":1},\"consumerGroup\":\"G\",\"clientId\":\"C\",\"strategyName\":\"AVG\",\"messageModel\":\"CLUSTERING\"}",
         )
@@ -233,7 +233,7 @@ mod tests {
             .unwrap(),
             None
         );
-        // 显式空数组：Some(空) —— 「清除之前的全部分配」
+        // Explicit empty array: Some(empty) -- "clear all previous assignments"
         let got =
             QueryAssignmentResponseBody::decode(b"{\"messageQueueAssignments\":[]}").unwrap();
         assert_eq!(got.map(|v| v.len()), Some(0));
@@ -248,7 +248,7 @@ mod tests {
         ]}"#;
         let got = QueryAssignmentResponseBody::decode(data)
             .unwrap()
-            .expect("有集");
+            .expect("assignments present");
         assert_eq!(got.len(), 3);
         assert_eq!(
             got[0].message_queue.as_ref(),
@@ -261,7 +261,7 @@ mod tests {
 
     #[test]
     fn response_body_rejects_malformed_payloads() {
-        // 顶层不是对象 / 集不是数组 → 严出报错
+        // Top level is not an object / the list is not an array -> strict error
         assert!(QueryAssignmentResponseBody::decode(b"[1,2]").is_err());
         assert!(
             QueryAssignmentResponseBody::decode(b"{\"messageQueueAssignments\":\"nope\"}").is_err()
@@ -282,10 +282,10 @@ mod tests {
             &items,
         )))
         .unwrap()
-        .expect("有集");
+        .expect("assignments present");
         assert_eq!(got, items);
 
-        // None 编码不带键 → 解码回 None
+        // None encodes without the key -> decodes back to None
         let none_body = QueryAssignmentResponseBody::encode(None);
         assert!(QueryAssignmentResponseBody::decode(&none_body)
             .unwrap()

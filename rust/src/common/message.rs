@@ -1,5 +1,5 @@
-//! 属性容器一律用 [`StringMap`]（保序）：17 段格式第 17 项是按插入顺序拼出来的
-//! `k\x01v\x02` 字节串，换成 `HashMap` 会直接破坏逐字节一致性。
+//! Property containers always use [`StringMap`] (order-preserving): item 17 of the 17-field format is a
+//! `k\x01v\x02` byte string composed in insertion order, and switching to `HashMap` would break byte-for-byte consistency outright.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -12,9 +12,9 @@ use crate::common::mix_all::MixAll;
 use crate::error::{Error, Result};
 use crate::remoting::protocol::ext_fields::StringMap;
 
-/// `WAIT` 的唯一判据：属性缺失按 true，否则只认大小写不敏感的 `true`。
-/// 所有写 `WAIT` 的地方（`MessageBatch::generate_from_list`、
-/// `AggregateKey::of_message`）都必须走它，见 [`Message::is_wait_store_msg_ok`] 的注释。
+/// The single criterion for `WAIT`: a missing property counts as true, otherwise only a case-insensitive `true` is accepted.
+/// Every place that writes `WAIT` (`MessageBatch::generate_from_list`,
+/// `AggregateKey::of_message`) must go through it, see the comment on [`Message::is_wait_store_msg_ok`].
 pub fn wait_store_msg_ok_of(raw: Option<&str>) -> bool {
     match raw {
         None => true,
@@ -123,7 +123,7 @@ pub struct Message {
 }
 
 impl Message {
-    /// `body=None` 时置空串（协议侧 body 长度域写 0，而不是省略正文）。
+    /// When `body=None` an empty string is set (the protocol body length field writes 0 rather than omitting the body).
     pub fn new(topic: &str, body: Option<&[u8]>) -> Message {
         Message {
             topic: topic.to_string(),
@@ -134,7 +134,7 @@ impl Message {
         }
     }
 
-    /// **空 tags / keys 不写入属性**：只有非空字符串才落到 `TAGS` / `KEYS` 上。
+    /// **Empty tags / keys are not written into properties**: only non-empty strings land on `TAGS` / `KEYS`.
     pub fn with_tags_and_keys(
         topic: &str,
         body: Option<&[u8]>,
@@ -170,7 +170,7 @@ impl Message {
         self.topic = topic.to_string();
     }
 
-    /// 无正文时返回空切片（构造期已兜底成空串，不会返回 `None`）。
+    /// Returns an empty slice when there is no body (construction already defaults it to an empty string, so `None` is never returned).
     pub fn get_body(&self) -> &[u8] {
         self.body.as_deref().unwrap_or(&[])
     }
@@ -219,11 +219,11 @@ impl Message {
         self.properties.get(PROPERTY_KEYS)
     }
 
-    /// ⚠ 千万别写成 `get_wait_store_msg_ok() == Some("true")`。本端口的 `Message::new`
-    /// **不**预先写 `WAIT`，所以"属性缺省"是
-    /// **常态而不是边角**：按 `== Some("true")` 判会让一条普通消息变成 `WAIT=false`，
-    /// 批量发送时就会以 `WAIT=false` 下发 —— broker 不等刷盘就回 `SEND_OK`，
-    /// 持久性悄悄降级，而客户端侧一切正常。判据统一走 [`wait_store_msg_ok_of`]。
+    /// ⚠ Never write this as `get_wait_store_msg_ok() == Some("true")`. This crate's `Message::new`
+    /// does **not** pre-write `WAIT`, so a "missing property" is
+    /// **the norm, not an edge case**: judging by `== Some("true")` turns an ordinary message into `WAIT=false`,
+    /// and batch sending would then ship it as `WAIT=false` -- the broker replies `SEND_OK` without waiting for a flush,
+    /// durability silently degrades, and everything still looks fine client-side. The criterion goes through [`wait_store_msg_ok_of`] uniformly.
     pub fn is_wait_store_msg_ok(&self) -> bool {
         wait_store_msg_ok_of(self.get_wait_store_msg_ok())
     }
@@ -233,7 +233,7 @@ impl Message {
             .insert(PROPERTY_DELAY_TIME_LEVEL, level.to_string());
     }
 
-    /// 返回属性里的原始字符串（缺失时为 `None`，不做数值转换）。
+    /// Returns the raw string from the properties (`None` when missing, no numeric conversion).
     pub fn get_delay_time_level(&self) -> Option<&str> {
         self.properties.get(PROPERTY_DELAY_TIME_LEVEL)
     }
@@ -331,7 +331,7 @@ impl fmt::Display for Message {
 pub struct MessageExt {
     pub topic: String,
     pub flag: i32,
-    /// 17 段格式里 `bodyLen <= 0` 或 `readBody=false` 时为 `None`（与「空正文」区分）。
+    /// `None` when `bodyLen <= 0` or `readBody=false` in the 17-field format (distinguished from "empty body").
     pub body: Option<Vec<u8>>,
     pub properties: StringMap,
     pub transaction_id: Option<String>,
@@ -357,7 +357,7 @@ pub struct MessageExt {
 }
 
 impl MessageExt {
-    /// 空消息（各字段取协议默认值，正文是空串而不是 `None`）。
+    /// Empty message (every field takes the protocol default, the body is an empty string rather than `None`).
     pub fn new() -> MessageExt {
         MessageExt {
             topic: String::new(),
@@ -377,7 +377,7 @@ impl MessageExt {
         }
     }
 
-    /// 剥回普通消息（上层「重投 / 转发」场景只要正文和属性）。
+    /// Strips back to an ordinary message (upper-layer "redelivery / forwarding" scenarios only need body and properties).
     pub fn to_message(&self) -> Message {
         Message {
             topic: self.topic.clone(),
@@ -615,12 +615,12 @@ impl MessageExt {
         self.msg_type = msg_type.map(|s| s.to_string());
     }
 
-    /// 组装 born host 文本：端口为 0 时只返回 IP。
+    /// Assembles the born host text: with port 0 only the IP is returned.
     pub fn get_born_host_string(&self) -> Option<String> {
         host_with_port(self.born_host.as_deref(), self.born_host_port)
     }
 
-    /// 组装 store host 文本：规则同 born host。
+    /// Assembles the store host text: same rule as born host.
     pub fn get_store_host_string(&self) -> Option<String> {
         host_with_port(self.store_host.as_deref(), self.store_host_port)
     }
@@ -647,11 +647,11 @@ impl fmt::Display for MessageExt {
     }
 }
 
-/// 自己没有序列化字段：正文由 [`encode`](Self::encode) 生成，即每条 6 段轻量格式
-/// （见 [`crate::common::message_decoder`]）的拼接结果。
+/// Has no serialization fields of its own: the body is produced by [`encode`](Self::encode), i.e. the concatenation of
+/// each message in the 6-field lightweight format (see [`crate::common::message_decoder`]).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MessageBatch {
-    /// 批量消息作为「一条消息」发送时的外层字段（topic / WAIT / body）。
+    /// Outer fields when the batch is sent "as one message" (topic / WAIT / body).
     pub message: Message,
     pub messages: Vec<Message>,
 }
@@ -760,13 +760,13 @@ mod tests {
 
     #[test]
     fn message_queue_hashcode_matches_contract() {
-        // 与线上记录的字面量一致（rebalance 依赖它）
+        // Matches the literals recorded from the wire (rebalance depends on it)
         let cases = [
             ("TopicTest", "BrokerA", 0, -1229861880i32),
             ("TopicTest", "BrokerA", 3, -1229861787),
             ("", "", 0, 29791),
             ("%RETRY%GroupA", "BrokerB", 1, 566955243),
-            ("A", "B", 0, 93282), // 最短串的组合
+            ("A", "B", 0, 93282), // combination of the shortest strings
         ];
         for (topic, broker, qid, expected) in cases {
             assert_eq!(MessageQueue::new(topic, broker, qid).hashcode(), expected);
@@ -954,12 +954,12 @@ mod tests {
                 msg.get_deliver_time_ms()
             ),
             (0, 0, 0),
-            "缺属性时三个 getter 都是 0"
+            "all three getters are 0 when the property is missing"
         );
         msg.set_delay_time_sec(10);
         msg.set_delay_time_ms(10_000);
         msg.set_deliver_time_ms(1_700_000_000_000);
-        // 属性值必须是字符串数字（broker 侧按字符串解析）
+        // Property values must be numeric strings (the broker parses them as strings)
         assert_eq!(msg.get_property(PROPERTY_TIMER_DELAY_SEC), Some("10"));
         assert_eq!(msg.get_property(PROPERTY_TIMER_DELAY_MS), Some("10000"));
         assert_eq!(
@@ -969,10 +969,10 @@ mod tests {
         assert_eq!(msg.get_delay_time_sec(), 10);
         assert_eq!(msg.get_delay_time_ms(), 10_000);
         assert_eq!(msg.get_deliver_time_ms(), 1_700_000_000_000);
-        // 重复 set 覆盖（putProperty 语义）
+        // Repeated set overwrites (putProperty semantics)
         msg.set_deliver_time_ms(1);
         assert_eq!(msg.get_deliver_time_ms(), 1);
-        // 非法值与 delay_time_level 同口径：0，不 panic
+        // Invalid values follow the same convention as delay_time_level: 0, no panic
         msg.put_property(PROPERTY_TIMER_DELAY_SEC, "not-a-number");
         assert_eq!(msg.get_delay_time_sec(), 0);
     }
@@ -1019,7 +1019,7 @@ mod tests {
         let mut w2 = Message::new("T", Some(b"b"));
         w2.set_wait_store_msg_ok(false);
         assert!(MessageBatch::generate_from_list(vec![w1, w2]).is_err());
-        // 错误消息字面量固定不动（上层按字符串匹配日志）
+        // The error message literal is pinned (upper layers match logs by string)
         let err = MessageBatch::generate_from_list(vec![])
             .unwrap_err()
             .to_string();
@@ -1035,7 +1035,7 @@ mod tests {
         let batch = MessageBatch::generate_from_list(vec![a, b]).unwrap();
         assert_eq!(batch.get_property(PROPERTY_WAIT_STORE_MSG_OK), Some("true"));
 
-        // 显式 false 要原样传下去
+        // An explicit false must pass through as is
         let mut c = Message::new("T", Some(b"c"));
         c.set_wait_store_msg_ok(false);
         let mut d = Message::new("T", Some(b"d"));
@@ -1047,11 +1047,11 @@ mod tests {
         );
     }
 
-    /// 回归：**没设过 `WAIT` 的普通消息**组成的批量必须是 `WAIT=true`。
+    /// Regression: a batch of **ordinary messages that never set `WAIT`** must come out `WAIT=true`.
     #[test]
     fn batch_defaults_wait_store_msg_ok_to_true() {
         let messages = vec![Message::new("T", Some(b"a")), Message::new("T", Some(b"b"))];
-        // 前提：Message::new 不预写 WAIT
+        // Premise: Message::new does not pre-write WAIT
         assert_eq!(messages[0].get_wait_store_msg_ok(), None);
         let batch = MessageBatch::generate_from_list(messages).unwrap();
         assert_eq!(batch.get_property(PROPERTY_WAIT_STORE_MSG_OK), Some("true"));

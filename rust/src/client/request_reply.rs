@@ -1,30 +1,30 @@
-//! Request-Reply（5.x）客户端侧支撑。
+//! Request-Reply (5.x) client-side support.
 //!
 //!
 //!
 //! ```text
-//! 请求方 (producer.request)                        应答方 (push consumer)
+//! requester (producer.request)                       replier (push consumer)
 //! ─────────────────────────────                    ──────────────────────
 //! msg.properties[CORRELATION_ID] = uuid
-//! msg.properties[REPLY_TO_CLIENT] = clientId  ──►  收到请求消息（broker 已写入 CLUSTER）
+//! msg.properties[REPLY_TO_CLIENT] = clientId  ──►  receives the request message (broker has written CLUSTER)
 //! msg.properties[TTL] = timeoutMillis               create_reply_message(request_msg, body):
 //!                                                     topic       = <CLUSTER>_REPLY_TOPIC
-//!                                                     CORRELATION_ID / REPLY_TO_CLIENT / TTL 原样带回
+//!                                                     CORRELATION_ID / REPLY_TO_CLIENT / TTL copied back as-is
 //!                                                     MSG_TYPE    = "reply"
 //! ◄── PUSH_REPLY_MESSAGE_TO_CLIENT(326) ────────    producer.send(reply) →
-//!     （broker 按 REPLY_TO_CLIENT 找到请求方连接）      broker 走 SEND_REPLY_MESSAGE_V2(325)
+//!     (broker finds the requester connection by REPLY_TO_CLIENT)      broker goes through SEND_REPLY_MESSAGE_V2(325)
 //! ```
 //!
-//! 两个关键点（错了真机就不通）：
-//! 1. 应答消息必须带 `MSG_TYPE == "reply"`，客户端发送时据此把请求码从
-//!    `SEND_MESSAGE_V2(310)` 换成 `SEND_REPLY_MESSAGE_V2(325)`；
-//!    broker 的 `ReplyMessageProcessor` 只在 324/325 上注册。
-//! 2. `REPLY_TO_CLIENT` 是**请求方的 clientId**，broker 用它在 producerManager 里
-//!    反查 channel 才能把应答推回来 —— 所以请求方必须发过心跳（已注册为 producer）。
+//! Two key points (get them wrong and it never works against a live broker):
+//! 1. The reply message must carry `MSG_TYPE == "reply"`; on send the client uses this to
+//!    switch the request code from `SEND_MESSAGE_V2(310)` to `SEND_REPLY_MESSAGE_V2(325)`;
+//!    the broker's `ReplyMessageProcessor` is registered only on 324/325.
+//! 2. `REPLY_TO_CLIENT` is the **requester's clientId**; the broker looks it up in
+//!    producerManager to find the channel over which to push the reply back -- so the requester must have sent a heartbeat (already registered as a producer).
 //!
-//! 等待与唤醒：本实现整体是 tokio 异步的，同步等待方用
-//! [`tokio::sync::Notify`]（sticky 标志 + `notify_waiters`）唤醒，
-//! 唤醒语义与 sticky event 一致。
+//! Waiting and wakeup: this implementation is tokio-async throughout; synchronous
+//! waiters are woken via [`tokio::sync::Notify`] (sticky flag + `notify_waiters`),
+//! matching sticky-event wakeup semantics.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -45,15 +45,15 @@ use crate::rmq_warn;
 
 pub const DEFAULT_REQUEST_TIMEOUT_MILLIS: i64 = 3000;
 
-// ---------------------------------------------------------------- 回调
+// ---------------------------------------------------------------- callback
 
 pub trait RequestCallback: Send + Sync {
     fn on_success(&self, response_message: Option<MessageExt>);
-    /// 请求或等待失败。
+    /// The request or the wait failed.
     fn on_exception(&self, cause: &Error);
 }
 
-// ---------------------------------------------------------------- 等待槽
+// ---------------------------------------------------------------- wait slot
 
 pub struct RequestResponseFuture {
     pub correlation_id: String,
@@ -61,7 +61,7 @@ pub struct RequestResponseFuture {
     pub begin_timestamp: i64,
     request_callback: Option<std::sync::Arc<dyn RequestCallback>>,
     send_request_ok: AtomicBool,
-    /// 已投递过应答（sticky：后到的等待不会再阻塞）。
+    /// A response has already been delivered (sticky: a later wait will not block again).
     responded: AtomicBool,
     callback_fired: AtomicBool,
     state: Mutex<FutureState>,
@@ -75,7 +75,7 @@ struct FutureState {
 }
 
 impl RequestResponseFuture {
-    /// 新建等待中的请求-应答 future（不带回调）。
+    /// Creates a waiting request-reply future (without a callback).
     pub fn new(correlation_id: &str, timeout_millis: i64) -> RequestResponseFuture {
         RequestResponseFuture::with_callback(correlation_id, timeout_millis, None)
     }
@@ -98,10 +98,10 @@ impl RequestResponseFuture {
         }
     }
 
-    // ---------------- 等待 / 投递 ----------------
+    // ---------------- waiting / delivery ----------------
 
-    /// 先 `enable()` 出等待凭据再看当前值，保证「应答先于等待到达」不会丢唤醒
-    /// （`Notify::notify_waiters` 只叫醒当时已在等的人）。
+    /// `enable()` the wait ticket before checking the current value so "response arrives before the wait" cannot lose its wakeup
+    /// (`Notify::notify_waiters` only wakes whoever is already waiting at that moment).
     pub async fn wait_response_message(&self, timeout_millis: i64) -> Option<MessageExt> {
         let deadline =
             tokio::time::Instant::now() + Duration::from_millis(timeout_millis.max(0) as u64);
@@ -113,7 +113,7 @@ impl RequestResponseFuture {
                 return Some(msg);
             }
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                // 超时：返回当时的值（没来过应答就是 None）
+                // timeout: return the current value (None if no response ever arrived)
                 return self.response_message();
             }
         }
@@ -135,7 +135,7 @@ impl RequestResponseFuture {
         util_all::current_time_millis() - self.begin_timestamp > self.timeout_millis
     }
 
-    /// 没有回调时是 no-op（同步调用方靠 [`Self::wait_response_message`] 唤醒）。
+    /// A no-op when there is no callback (synchronous callers rely on [`Self::wait_response_message`] to wake up).
     pub fn execute_request_callback(&self) {
         let Some(callback) = self.request_callback.as_ref() else {
             return;
@@ -186,7 +186,7 @@ impl std::fmt::Debug for RequestResponseFuture {
     }
 }
 
-// ---------------------------------------------------------------- 等待槽表
+// ---------------------------------------------------------------- wait-slot table
 
 #[derive(Default)]
 pub struct RequestFutureHolder {
@@ -296,8 +296,8 @@ pub fn stop_expired_request_scan() {
     stop_scan(&SCAN_TASK, &SCAN_PRODUCERS);
 }
 
-/// [`start_expired_request_scan`] 的可注入版本：槽位与计数由调用方给出，
-/// 这样并发跑的单元测试能各用一套局部状态，不必断言进程级全局。
+/// Injectable variant of [`start_expired_request_scan`]: slot and counter come from the caller,
+/// so concurrently running unit tests each get their own local state instead of asserting on process-global state.
 fn start_scan(
     slot: &Mutex<Option<tokio::task::JoinHandle<()>>>,
     count: &AtomicUsize,
@@ -327,16 +327,16 @@ fn stop_scan(slot: &Mutex<Option<tokio::task::JoinHandle<()>>>, count: &AtomicUs
     }
 }
 
-// ---------------------------------------------------------------- 报文工具
+// ---------------------------------------------------------------- payload utilities
 
-/// 上一个 correlationId 的随机源状态（无 `rand` 依赖，与 `trace_context` 同一套做法）。
+/// Random source state for the previous correlationId (no `rand` dependency; same approach as `trace_context`).
 static ID_SEED: AtomicU64 = AtomicU64::new(0);
 
-/// splitmix64 的黄金比例增量（`0x9E3779B97F4A7C15`，只对 u64 有意义）。
+/// The splitmix64 golden-ratio increment (`0x9E3779B97F4A7C15`, only meaningful for u64).
 const SPLITMIX_DELTA: u64 = 0x9E37_79B9_7F4A_7C15;
 
-/// 本 crate 不引 `uuid`/`rand`，用 splitmix64(nanos ^ pid ^ 自增) 造 128 bit，
-/// 再按 v4 的 version/variant 位排成标准 8-4-4-4-12 形态，长度与字符集和 UUID 一致。
+/// This crate does not pull in `uuid`/`rand`; it builds 128 bits from splitmix64(nanos ^ pid ^ counter),
+/// then arranges the v4 version/variant bits into the standard 8-4-4-4-12 shape, matching UUID in length and charset.
 pub fn create_correlation_id() -> String {
     let base = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -344,7 +344,7 @@ pub fn create_correlation_id() -> String {
         .unwrap_or(0)
         ^ (util_all::get_pid() as u64) << 16
         ^ ID_SEED.fetch_add(1, Ordering::Relaxed);
-    // 两个不同种子的 splitmix64 输出拼成 128 bit（hi 在前，即 hex 的第 0..16 位）。
+    // Two splitmix64 outputs with different seeds are stitched into 128 bits (hi first, i.e. hex chars 0..16).
     let bits =
         ((splitmix64(base) as u128) << 64) | splitmix64(base.wrapping_add(SPLITMIX_DELTA)) as u128;
 
@@ -390,7 +390,7 @@ pub fn create_reply_message(request_message: &Message, body: &[u8]) -> Result<Me
         PROPERTY_MESSAGE_REPLY_TO_CLIENT,
         PROPERTY_MESSAGE_TTL,
     ] {
-        // 三个关联属性原样带回；请求消息缺某项时不写该属性（不给 "None"）。
+        // The three correlated properties are copied back as-is; if the request message lacks one, that property is not written (never "None").
         if let Some(value) = request_message.get_property(name) {
             reply.put_property(name, value);
         }
@@ -399,7 +399,7 @@ pub fn create_reply_message(request_message: &Message, body: &[u8]) -> Result<Me
     Ok(reply)
 }
 
-/// `MSG_TYPE == "reply"` 的发送要走 `SEND_REPLY_MESSAGE_V2(325)`。
+/// A send with `MSG_TYPE == "reply"` must go through `SEND_REPLY_MESSAGE_V2(325)`.
 pub fn is_reply_message(msg: &Message) -> bool {
     msg.get_property(PROPERTY_MESSAGE_TYPE) == Some(MixAll::REPLY_MESSAGE_FLAG)
 }
@@ -417,14 +417,14 @@ mod tests {
         m
     }
 
-    // ---------------- 应答消息构造 ----------------
+    // ---------------- reply message construction ----------------
 
     #[test]
     fn create_reply_message_matches_wire_shape() {
         let reply = create_reply_message(&request_msg(), b"pong").unwrap();
         assert_eq!(reply.get_topic(), "DefaultCluster_REPLY_TOPIC");
         assert_eq!(reply.get_body(), b"pong");
-        // 四个属性一个都不能少，且 CORRELATION_ID/REPLY_TO_CLIENT/TTL 是原样带回
+        // None of the four properties may be missing, and CORRELATION_ID/REPLY_TO_CLIENT/TTL must be copied back as-is
         assert_eq!(reply.get_property(PROPERTY_MESSAGE_TYPE), Some("reply"));
         assert_eq!(reply.get_property(PROPERTY_CORRELATION_ID), Some("corr-1"));
         assert_eq!(
@@ -462,7 +462,7 @@ mod tests {
 
     #[test]
     fn reply_topic_is_a_postfix_not_a_prefix() {
-        // 别把 Request-Reply 的 <cluster>_REPLY_TOPIC 与老的控制台前缀 %REPLY% 搞混
+        // Do not confuse Request-Reply's <cluster>_REPLY_TOPIC with the old console prefix %REPLY%
         assert_eq!(MixAll::REPLY_TOPIC_POSTFIX, "REPLY_TOPIC");
         assert_eq!(MixAll::REPLY_MESSAGE_FLAG, "reply");
         assert_eq!(
@@ -475,7 +475,7 @@ mod tests {
         );
     }
 
-    // ---------------- 等待槽 ----------------
+    // ---------------- wait slot ----------------
 
     #[test]
     fn correlation_id_looks_like_a_uuid_and_is_unique() {
@@ -490,10 +490,10 @@ mod tests {
                     .all(|c| c == '-' || c.is_ascii_digit() || ('a'..='f').contains(&c)),
                 "got {id}"
             );
-            assert_eq!(&id[14..15], "4", "version 位");
+            assert_eq!(&id[14..15], "4", "version bits");
             assert!(
                 matches!(&id[19..20], "8" | "9" | "a" | "b"),
-                "variant 位: got {id}"
+                "variant bits: got {id}"
             );
         }
     }
@@ -516,24 +516,24 @@ mod tests {
             msg.set_body(Some(b"pong"));
             filler.put_response_message(Some(msg));
         });
-        let got = f.wait_response_message(2000).await.expect("必须被唤醒");
+        let got = f.wait_response_message(2000).await.expect("must be woken up");
         assert_eq!(got.get_body(), b"pong");
         assert!(!f.is_timeout());
         handle.await.unwrap();
     }
 
-    /// 应答先到、等待后起：sticky 语义不允许丢唤醒。
+    /// Response arrives first, wait starts after: sticky semantics must not lose the wakeup.
     #[tokio::test]
     async fn response_before_wait_is_not_lost() {
         let f = RequestResponseFuture::new("c1", 1000);
         let mut msg = MessageExt::new();
         msg.set_body(Some(b"early"));
         f.put_response_message(Some(msg));
-        let got = f.wait_response_message(10).await.expect("不能超时");
+        let got = f.wait_response_message(10).await.expect("must not time out");
         assert_eq!(got.get_body(), b"early");
     }
 
-    /// 记录回调触发次数（`Arc` 共享，回调后仍可断言）。
+    /// Records callback invocations (`Arc`-shared so assertions still work after the callback fires).
     struct Recorder {
         successes: std::sync::atomic::AtomicU32,
         failures: std::sync::atomic::AtomicU32,
@@ -572,7 +572,7 @@ mod tests {
     fn callback_fires_at_most_once() {
         let recorder = std::sync::Arc::new(Recorder::new());
         let f = RequestResponseFuture::with_callback("c1", 1000, Some(recorder.clone()));
-        assert_eq!(recorder.successes(), 0, "没投递前不能回调");
+        assert_eq!(recorder.successes(), 0, "no callback before delivery");
         f.execute_request_callback();
         assert_eq!(recorder.successes(), 1);
         let mut msg = MessageExt::new();
@@ -580,7 +580,7 @@ mod tests {
         f.put_response_message(Some(msg));
         f.execute_request_callback();
         f.execute_request_callback();
-        assert_eq!(recorder.successes(), 1, "回调只允许一次");
+        assert_eq!(recorder.successes(), 1, "callback allowed only once");
         assert_eq!(recorder.failures(), 0);
     }
 
@@ -591,7 +591,7 @@ mod tests {
         f.set_failed(Error::client("send failed"));
         assert!(!f.is_send_request_ok());
         f.execute_request_callback();
-        // 第二次不得再回调
+        // the second call must not fire the callback again
         f.execute_request_callback();
         assert_eq!(recorder.failures(), 1);
         assert_eq!(recorder.successes(), 0);
@@ -603,7 +603,7 @@ mod tests {
         assert!(logged.unwrap_or_default().contains("send failed"));
     }
 
-    // ---------------- 等待槽表 ----------------
+    // ---------------- wait-slot table ----------------
 
     #[test]
     fn holder_put_response_removes_the_entry() {
@@ -622,7 +622,7 @@ mod tests {
             &f
         ));
         assert!(holder.get_request("c1").is_none());
-        // 重复应答：摘不到了，只记日志
+        // duplicate response: already removed, only logged
         assert!(holder.put_response(Some("c1"), msg).is_none());
     }
 
@@ -652,7 +652,7 @@ mod tests {
     }
 
 
-    /// 计数回调（比 Recorder 更便于拿 Arc 共享计数）。
+    /// Counting callback (easier than Recorder to share counts through an `Arc`).
     struct SweepCounter {
         failures: AtomicUsize,
         last_error: Mutex<Option<String>>,
@@ -681,7 +681,7 @@ mod tests {
 
         let removed = scan_expired_request(&holder);
         assert_eq!(removed, 1);
-        assert!(holder.is_empty(), "超时项必须从表里摘除");
+        assert!(holder.is_empty(), "timed-out entry must be removed from the table");
         assert!(f.is_send_request_ok());
         assert_eq!(counter.failures.load(Ordering::SeqCst), 1);
         let logged = counter
@@ -695,7 +695,7 @@ mod tests {
             "MQClientException(code=10006): request timeout, no reply message."
         );
 
-        // 再扫一轮：表已空，回调不得重复触发
+        // scan again: table is empty, the callback must not fire again
         assert_eq!(scan_expired_request(&holder), 0);
         assert_eq!(counter.failures.load(Ordering::SeqCst), 1);
     }
@@ -719,8 +719,8 @@ mod tests {
 
     #[tokio::test]
     async fn start_expired_request_scan_counts_producers() {
-        // 用一套局部的槽位/计数：进程级全局会被并发跑的其它测试同时改写，
-        // 断言绝对值必然假失败。任务 3s 后才首扫，测试结束 runtime 一并销毁。
+        // Use a local slot/counter pair: the process-level global is concurrently mutated by other tests,
+        // so asserting absolute values would fail spuriously. The task's first scan is only after 3s, and the runtime is destroyed together with the test.
         let slot: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None);
         let count = AtomicUsize::new(0);
         let handle = tokio::runtime::Handle::current();

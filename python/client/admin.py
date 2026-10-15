@@ -34,7 +34,7 @@ from .mq_client_manager import MQClientManager
 
 logger = get_logger()
 
-# 默认超时（对应 DefaultMQAdminExt.DEFAULT_TIMEOUT = 5000 * 3）
+# Default timeout (corresponds to DefaultMQAdminExt.DEFAULT_TIMEOUT = 5000 * 3)
 DEFAULT_TIMEOUT = 5000 * 3
 
 NAMESPACE_ORDER_TOPIC_CONFIG = "ORDER_TOPIC_CONFIG"
@@ -111,7 +111,7 @@ class DefaultMQAdminExt:
         self._mq_client: Optional[MQClientInstance] = None
         self._started = False
 
-    # ---------------- 配置与生命周期 ----------------
+    # ---------------- Configuration and lifecycle ----------------
     def set_namesrv_addr(self, addr: str) -> None:
         self.name_server_addrs = [a.strip() for a in addr.split(";") if a.strip()]
 
@@ -204,12 +204,12 @@ class DefaultMQAdminExt:
             raise MQClientException("admin not started, call start() first")
         return self._mq_client
 
-    # ---------------- 底层调用助手 ----------------
+    # ---------------- Low-level invocation helpers ----------------
     def _invoke_broker(self, addr: str, code: int,
                        ext_fields: Optional[Dict[str, str]] = None,
                        body: Optional[bytes] = None,
                        timeout_millis: Optional[int] = None) -> RemotingCommand:
-        """发到指定 Broker 并校验 SUCCESS。"""
+        """Send to the specified Broker and verify SUCCESS."""
         client = self._require_client()
         addr = MixAll.broker_vip_channel(self.vip_channel_enabled, addr)
         request = RemotingCommand.create_request_command(code, None)
@@ -275,7 +275,7 @@ class DefaultMQAdminExt:
     def _find_first_broker_addr(self, client: MQClientInstance) -> str:
         return DefaultMQAdminExt._first_broker_addr(client)
 
-    # ---------------- Topic 管理 ----------------
+    # ---------------- Topic management ----------------
     def create_topic(self, key: str, new_topic: str, queue_num: int = 4,
                      topic_sys_flag: int = 0) -> None:
         client = self._require_client()
@@ -306,12 +306,12 @@ class DefaultMQAdminExt:
                                       {"topic": topic})
 
     def delete_topic_in_namesrv(self, topic: str) -> None:
-        """兼容旧名：删除 NameServer 上的 topic 路由。"""
+        """Backward-compatible alias: delete the topic route on the NameServer."""
         client = self._require_client()
         client.delete_topic_in_namesrv(topic)
 
     def delete_topic(self, topic: str, cluster_name: Optional[str] = None) -> None:
-        """删除 topic（先清各 broker，再清 NameServer 路由，最后清 KV namespace）。"""
+        """Delete a topic (clear it on each broker, then the NameServer route, then the KV namespace)."""
         client = self._require_client()
         for broker in self._broker_addrs_of_cluster(client, cluster_name):
             try:
@@ -372,7 +372,7 @@ class DefaultMQAdminExt:
         return self.get_cluster_list(topic)
 
     def fetch_all_topic_route(self) -> List[TopicRouteData]:
-        """拉取全部 topic 的路由（遍历 Nameserver 的 topic 列表）。"""
+        """Fetch the routes of all topics (by iterating the NameServer's topic list)."""
         client = self._require_client()
         result: List[TopicRouteData] = []
         topics = client.get_all_topic_list_from_name_server()
@@ -463,7 +463,7 @@ class DefaultMQAdminExt:
             return TopicStatsTable()
         return TopicStatsTable.decode(response.body)
 
-    # ---------------- 集群 / Broker ----------------
+    # ---------------- Cluster / Broker ----------------
     def fetch_broker_cluster_info(self) -> ClusterInfo:
         return self._require_client().get_broker_cluster_info()
 
@@ -507,7 +507,7 @@ class DefaultMQAdminExt:
     def _invoke_namesrv_addr(self, addr: str, code: int,
                              ext_fields: Optional[Dict[str, str]] = None,
                              timeout_millis: Optional[int] = None) -> RemotingCommand:
-        """发到**显式给定**的 NameServer 并校验 SUCCESS（不走 VIP 通道）。"""
+        """Send to an explicitly given NameServer and verify SUCCESS (does not use the VIP channel)."""
         client = self._require_client()
         request = RemotingCommand.create_request_command(code, None)
         if ext_fields:
@@ -550,7 +550,7 @@ class DefaultMQAdminExt:
             return {}
         return fastjson_loads(response.body.decode("utf-8"))
 
-    # ---------------- NameServer KV 配置 ----------------
+    # ---------------- NameServer KV config ----------------
     def create_and_update_kv_config(self, namespace: str, key: str, value: str) -> None:
         pass
         self._invoke_namesrv_all(RequestCode.PUT_KV_CONFIG,
@@ -577,7 +577,7 @@ class DefaultMQAdminExt:
             return KVTable()
         return KVTable.decode(response.body)
 
-    # ---------------- 订阅组管理 ----------------
+    # ---------------- Subscription group management ----------------
     def create_and_update_subscription_group_config(self, addr: str,
                                                     config: SubscriptionGroupConfig) -> None:
         pass
@@ -635,7 +635,7 @@ class DefaultMQAdminExt:
 
             total = response.ext_fields.get("totalGroupNum")
             if total is None:
-                # 老 broker：一次返回全部
+                # Old broker: returns everything at once
                 break
             total = int(total)
             if current_data_version != new_version:
@@ -668,7 +668,7 @@ class DefaultMQAdminExt:
                             {"groupName": group_name,
                              "cleanOffset": "true" if remove_offset else "false"})
 
-    # ---------------- 消费者 / 生产者连接 ----------------
+    # ---------------- Consumer / producer connections ----------------
     def examine_consumer_connection_info(self, consumer_group: str,
                                          broker_addr: Optional[str] = None) -> ConsumerConnection:
         addr = broker_addr or self._find_first_broker_addr(self._require_client())
@@ -737,7 +737,7 @@ class DefaultMQAdminExt:
         if not broker_name:
             try:
                 route = self._require_client().get_topic_route_data(topic)
-            except Exception:  # noqa: BLE001 — brokerName 只是补充信息，拿不到不阻塞
+            except Exception:  # noqa: BLE001 — brokerName is only supplementary info; missing it is not blocking
                 route = None
             for bd in (route.get_broker_datas() if route else []):
                 if addr in (bd.broker_addrs or {}).values():
@@ -756,7 +756,7 @@ class DefaultMQAdminExt:
             raise MQClientException("no consume result for client %s" % client_id)
         return ConsumeMessageDirectlyResult.decode(response.body)
 
-    # ---------------- 消费统计 ----------------
+    # ---------------- Consumption stats ----------------
     def examine_consume_stats(self, broker_addr: str, consumer_group: str,
                               topic: Optional[str] = None,
                               topic_list: Optional[List[str]] = None) -> ConsumeStats:
@@ -926,7 +926,7 @@ class DefaultMQAdminExt:
                              "topic": topic,
                              "offline": "true" if is_offline else "false"})
 
-    # ---------------- Offset 管理 ----------------
+    # ---------------- Offset management ----------------
     def max_offset(self, mq: MessageQueue) -> int:
         return self._require_client().get_max_offset(mq)
 
@@ -1067,7 +1067,7 @@ class DefaultMQAdminExt:
                         result[mq] = reset_offset
         return result
 
-    # ---------------- 消息查询 ----------------
+    # ---------------- Message query ----------------
     def query_message(self, topic: str, key: str, max_num: int, begin: int, end: int):
         pass
         from common.message_const import MessageConst
@@ -1084,7 +1084,7 @@ class DefaultMQAdminExt:
         return messages[0] if messages else None
 
     def query_message_by_key(self, topic: str, key: str, max_num: int = 32) -> List[MessageExt]:
-        """按普通 KEYS 索引查询（对应工具 queryMsgByKey 的 NORMAL 模式）。"""
+        """Query by the normal KEYS index (corresponds to the NORMAL mode of the queryMsgByKey tool)."""
         from common.message_const import MessageConst
         return self._require_client().query_message_all_brokers(
             topic, key, max_num, 0, int(time.time() * 1000) + 60 * 60 * 1000,
@@ -1226,7 +1226,7 @@ class DefaultMQAdminExt:
         self.put_kv_config(NAMESPACE_ORDER_TOPIC_CONFIG, key,
                            ";".join(entries.values()))
 
-    # ---------------- 运维清理类 ----------------
+    # ---------------- Operational cleanup ----------------
     def clean_expired_consumer_queue(self, broker_addr: str, time_hours: int) -> None:
         pass
         self._invoke_broker(broker_addr, RequestCode.CLEAN_EXPIRED_CONSUMEQUEUE,
@@ -1279,7 +1279,7 @@ class DefaultMQAdminExt:
             spans.extend(body.consume_time_span_set)
         return spans
 
-    # ---------------- NameServer 配置（318/319） ----------------
+    # ---------------- NameServer config (318/319) ----------------
     def update_name_server_config(self, properties: Dict[str, str],
                                   timeout_millis: Optional[int] = None) -> None:
         pass
@@ -1337,7 +1337,7 @@ class DefaultMQAdminExt:
                             ext_fields=ext)
 
 
-# ---------------------------------------------------------------- 辅助
+# ---------------------------------------------------------------- Helpers
 def _perm_is_valid(value) -> bool:
     pass
     try:

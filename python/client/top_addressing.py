@@ -41,18 +41,18 @@ class DefaultTopAddressing:
             self.ws_addr = self.get_ws_addr(dom, subgroup) if dom else ""
         self.ns_addr: Optional[str] = None
 
-    # ---------------- URL 构造（MixAll.getWSAddr / fetchNSAddr 语义）----------------
+    # ---------------- URL construction (MixAll.getWSAddr / fetchNSAddr semantics) ----------------
 
     @staticmethod
     def get_ws_addr(domain: str, subgroup: Optional[str] = None) -> str:
-        """对应 ``MixAll.getWSAddr``：domain 自带端口（含 ':'）时不追加默认 :8080。"""
+        """Corresponds to ``MixAll.getWSAddr``: when the domain already carries a port (contains ':'), do not append the default :8080."""
         grp = subgroup or DEFAULT_DOMAIN_SUBGROUP
         if ":" in domain:
             return "http://%s/rocketmq/%s" % (domain, grp)
         return "http://%s:8080/rocketmq/%s" % (domain, grp)
 
     def build_url(self) -> str:
-        """对应 ``fetchNSAddr`` 里的 URL 拼装（unitName / para 规则逐条照抄）。"""
+        """Corresponds to the URL assembly inside ``fetchNSAddr`` (unitName / para rules copied verbatim)."""
         url = self.ws_addr
         if self._para:
             if self._unit_name.strip():
@@ -68,10 +68,10 @@ class DefaultTopAddressing:
 
     @staticmethod
     def is_configured() -> bool:
-        """动态取址是否可用（domain 已显式配置）。"""
+        """Whether dynamic addressing is available (domain explicitly configured)."""
         return bool(os.environ.get("ROCKETMQ_NAMESRV_DOMAIN", ""))
 
-    # ---------------- 取址 ----------------
+    # ---------------- addressing ----------------
 
     def fetch_ns_addr(self, verbose: bool = True) -> Optional[str]:
         pass
@@ -99,7 +99,7 @@ class DefaultTopAddressing:
                 return self.ns_addr
         return None
 
-    # ---------------- 传输 ----------------
+    # ---------------- transport ----------------
 
     def _http_get(self, url: str, timeout_seconds: float) -> Optional[str]:
         pass

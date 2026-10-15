@@ -12,7 +12,7 @@ from common.message import MessageQueue
 
 
 class FakeInstance:
-    """只需要订阅视图（get_topic_subscribe_info）的最小 MQClientInstance 替身。"""
+    """A minimal MQClientInstance double that only needs the subscription view (get_topic_subscribe_info)."""
 
     def __init__(self):
         self.queues = {}
@@ -90,7 +90,7 @@ def test_snapshot_only_taken_when_started():
     rec = Recorder()
     c.register_topic_message_queue_change_listener("T", rec)
     assert c._message_queues_for_topic["T"] == set(fake.queues["T"])
-    assert rec.events == []          # 快照当下不算变化
+    assert rec.events == []          # a snapshot taken now does not count as a change
     assert c.fetch_topic_message_queues_and_compare() == 0
 
 
@@ -109,19 +109,19 @@ def test_callback_fires_only_on_change():
     fake.set("T", [("broker-a", 0)])
     rec = Recorder()
     c.register_topic_message_queue_change_listener("T", rec)
-    c._started = True                 # 让注册的快照分支生效过一遍
+    c._started = True                 # make the registration snapshot branch take effect once
     assert rec.events == []
 
-    fake.set("T", [("broker-a", 0), ("broker-a", 1)])   # 扩容
+    fake.set("T", [("broker-a", 0), ("broker-a", 1)])   # scale up
     assert c.fetch_topic_message_queues_and_compare() == 1
     assert rec.events == [("T", [0, 1])]
-    assert c.fetch_topic_message_queues_and_compare() == 0   # 未变不再回调
+    assert c.fetch_topic_message_queues_and_compare() == 0   # no change → no further callback
     assert rec.events == [("T", [0, 1])]
 
-    fake.set("T", [("broker-a", 0)])                      # 缩容
+    fake.set("T", [("broker-a", 0)])                      # scale down
     assert c.fetch_topic_message_queues_and_compare() == 1
     assert rec.events == [("T", [0, 1]), ("T", [0])]
-    # 快照跟着新集合走，否则缩容会反复回调
+    # the snapshot follows the new set, otherwise a scale-down would repeatedly call back
     assert c._message_queues_for_topic["T"] == set(fake.queues["T"])
 
 
@@ -134,7 +134,7 @@ def test_one_topic_failure_does_not_stop_the_round():
     c.register_topic_message_queue_change_listener("OK", ok_rec)
     assert c.fetch_topic_message_queues_and_compare() == 1
     assert ok_rec.events == [("OK", [0])]
-    assert bad_rec.events == []       # 抛异常的那个 topic 不回调
+    assert bad_rec.events == []       # the topic that raised is not called back
 
 
 def test_listener_key_is_namespaced_and_reported_back():
@@ -185,11 +185,11 @@ def test_metadata_loop_periodically_compares():
                          daemon=True)
     t.start()
     try:
-        assert _until(2.5, lambda: bool(rec.events)), "后台循环没有在比对队列集合"
+        assert _until(2.5, lambda: bool(rec.events)), "the background loop did not compare queue sets"
         assert rec.events[-1] == ("T", [0])
         fake.set("T", [("broker-a", 0), ("broker-a", 1)])
         assert _until(2.5, lambda: rec.events == [("T", [0]), ("T", [0, 1])]), \
-            "扩容后的第二轮比对没触发回调: %s" % rec.events
+            "the second comparison after scale-up did not trigger a callback: %s" % rec.events
     finally:
         c._running = False
         t.join(timeout=2.0)
@@ -197,10 +197,10 @@ def test_metadata_loop_periodically_compares():
 
 
 def test_empty_queue_set_is_not_found_not_a_scale_in():
-    """空队列集 ≡ "查不到"：取队列抛错、比对跳过，快照不被清空。
+    """An empty queue set ≡ "not found": fetching queues raises, the comparison is skipped, and the snapshot is not cleared.
 
-    nameserver 抖动或 topic 暂时没路由时，返回空列表会被读成"缩到 0 队列"，
-    于是白报一次假缩容回调，还把快照抹成空集（下一轮又"扩回"一次）。
+    When the nameserver flutters or a topic temporarily has no route, returning an empty list would be read as "scaled to 0 queues",
+    producing a spurious scale-down callback and wiping the snapshot to an empty set (which "scales back up" on the next round).
     """
     c, fake = _consumer()
     fake.set("T", [("broker-a", 0), ("broker-a", 1)])
@@ -219,7 +219,7 @@ def test_empty_queue_set_is_not_found_not_a_scale_in():
     assert c._message_queues_for_topic["T"] == {
         MessageQueue("T", "broker-a", 0), MessageQueue("T", "broker-a", 1)}
 
-    # 路由回来且和快照一致 ⇒ 仍然不算变化
+    # the route is back and matches the snapshot ⇒ still not a change
     fake.set("T", [("broker-a", 0), ("broker-a", 1)])
     assert c.fetch_topic_message_queues_and_compare() == 0
     assert rec.events == []

@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * 消息队列标识：topic + brokerName + queueId，路由与队列分配都以它为键。
+ * Message queue identity: topic + brokerName + queueId, used as the key for routing and queue allocation.
  */
 final class MessageQueue
 {
@@ -16,7 +16,7 @@ final class MessageQueue
     ) {
     }
 
-    // ---- getter / setter（属性名就是协议字段名，必须 camelCase）----
+    // ---- getter / setter (property names are protocol field names and must be camelCase) ----
 
     public function getTopic(): string
     {
@@ -54,8 +54,9 @@ final class MessageQueue
     }
 
     /**
-     * 队列哈希：((31+brokerHash)*31+queueId)*31+topicHash，结果按 32 位有符号回绕。
-     * 队列的稳定排序和分配结果的均摊都依赖这个数值，换算法会静默改变分配。
+     * Queue hash: ((31+brokerHash)*31+queueId)*31+topicHash, with the result wrapped to 32-bit signed.
+     * Stable queue ordering and balanced allocation results both depend on this value; changing the algorithm would
+     * silently alter the allocation.
      */
     public function hashcode(): int
     {
@@ -66,8 +67,8 @@ final class MessageQueue
 
     private static function strHash(string $s): int
     {
-        // 按 UTF-16 码元累加（BMP 内与按码点累加等价），
-        // 最后统一做 32 位有符号回绕
+        // Accumulate over UTF-16 code units (equivalent to code-point accumulation within BMP),
+        // then apply 32-bit signed wraparound at the end
         $h = 0;
         $u16 = mb_convert_encoding($s, 'UTF-16BE', 'UTF-8');
         for ($i = 0, $n = strlen($u16); $i < $n; $i += 2) {
@@ -77,7 +78,7 @@ final class MessageQueue
         return self::wrapInt32($h);
     }
 
-    /** 任意整数按 32 位有符号回绕。 */
+    /** Wrap any integer to 32-bit signed. */
     public static function wrapInt32(int $x): int
     {
         $x &= 0xFFFFFFFF;

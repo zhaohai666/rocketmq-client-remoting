@@ -25,7 +25,8 @@ public class CorrectTagsOffsetTests
     private static List<MessageExt> OffsetBatch(int n)
         => Enumerable.Range(0, n).Select(i => Ext(i)).ToList();
 
-    /// <summary>不 Start 的消费者即可：CorrectTagsOffset / Take / Finish 全在本地状态上。</summary>
+    /// <summary>A consumer that is not Started is enough: CorrectTagsOffset / Take / Finish
+    /// all work on local state.</summary>
     private sealed class Harness
     {
         private readonly DefaultMQPushConsumer _consumer;
@@ -53,7 +54,8 @@ public class CorrectTagsOffsetTests
         public int PendingCount() => _consumer.PendingForTest(_key).Count;
     }
 
-    /// <summary>空应答的两个状态（NO_NEW_MSG / NO_MATCHED_MSG）都推进；其余状态一律不碰位点。</summary>
+    /// <summary>Both states of an empty response (NO_NEW_MSG / NO_MATCHED_MSG) advance;
+    /// every other state leaves the offset alone.</summary>
     [Fact]
     public void AdvancesOnlyOnEmptyPullStatuses()
     {
@@ -101,30 +103,32 @@ public class CorrectTagsOffsetTests
         Assert.Equal(0, h.Offset());
     }
 
-    /// <summary>ProcessQueue 里还有消息（缓冲里的 + listener 手里的）就一律不动位点。</summary>
+    /// <summary>While the ProcessQueue still holds messages (the ones in the buffer plus
+    /// the ones in the listener's hand) the offset is never moved.</summary>
     [Fact]
     public void RespectsTheProcessQueueGuard()
     {
-        // 缓冲里还有没消费的
+        // there are still unconsumed messages in the buffer
         var h = new Harness();
         h.SeedPending(new List<MessageExt> { Ext(0) });
         h.Correct(PullStatus.NoNewMsg, 42);
         Assert.Null(h.Offset());
 
-        // 缓冲空了，但有一条在 listener 手里（removeMessage 还没跑）
+        // the buffer is empty but one message is in the listener's hand (removeMessage has not run yet)
         h.Take();
         Assert.Equal(1, h.InFlight());
         h.Correct(PullStatus.NoMatchedMsg, 42);
         Assert.Null(h.Offset());
 
-        // 消费收尾（含异常回塞路径）后计数归零，修正才允许生效
+        // after consumption finishes (including the exception put-back path) the count drops to zero and only then may the correction take effect
         h.Finish();
         Assert.Equal(0, h.InFlight());
         h.Correct(PullStatus.NoMatchedMsg, 42);
         Assert.Equal(42, h.Offset());
     }
 
-    /// <summary>连 pending 表项都没有（从未拉过该队列）按空处理，不能因为缺项漏掉修正。</summary>
+    /// <summary>Not even a pending table entry (that queue was never pulled) is treated as
+    /// empty; the correction must not be skipped for a missing entry.</summary>
     [Fact]
     public void MissingPendingEntryAllowsCorrection()
     {
@@ -133,7 +137,8 @@ public class CorrectTagsOffsetTests
         Assert.Equal(7, h.Offset());
     }
 
-    /// <summary>取批次必须与登记在途同一临界区：取走后闸门立刻关上。</summary>
+    /// <summary>Taking a batch must be in the same critical section as registering it in
+    /// flight: once taken, the gate closes immediately.</summary>
     [Fact]
     public void TakeRegistersInFlightInTheSameCriticalSection()
     {
@@ -147,19 +152,20 @@ public class CorrectTagsOffsetTests
         h.Correct(PullStatus.NoNewMsg, 42);
         Assert.Null(h.Offset());
 
-        // 还有余量没被取走：缓冲非空，同样挡着
+        // there is still an untaken allowance left: the buffer is non-empty, which blocks it too
         h.Finish();
         h.Correct(PullStatus.NoNewMsg, 42);
         Assert.Null(h.Offset());
 
-        // 第二批发完，闸门全开
+        // the second batch finished, the gate is fully open
         Assert.Single(h.Take());
         h.Finish();
         h.Correct(PullStatus.NoNewMsg, 42);
         Assert.Equal(42, h.Offset());
     }
 
-    /// <summary>两批同时在途（两个消费线程）计数必须累加；清零后又被擦除的 key 要能重新登记。</summary>
+    /// <summary>Two batches in flight at once (two consume threads) must accumulate, and a
+    /// key that was erased after being zeroed must be able to register again.</summary>
     [Fact]
     public void InFlightCountsAccumulateAndCanBeReRegistered()
     {
@@ -189,7 +195,8 @@ public class CorrectTagsOffsetTests
         Assert.Equal(42, h2.Offset());
     }
 
-    /// <summary>闸门不能被自己的记账弄死：空队列 take 不登记，重复 finish 不复活计数。</summary>
+    /// <summary>The gate must not be killed by its own bookkeeping: a take on an empty
+    /// queue does not register, and a repeated finish does not revive the count.</summary>
     [Fact]
     public void BookkeepingIsIdempotentAndLeakFree()
     {

@@ -1,4 +1,4 @@
-// 拉取路径。
+// Pull path.
 //
 // Three rules here are easy to get wrong and expensive to debug — they are
 // called out again at each site:
@@ -64,14 +64,15 @@ export class PullAPI {
     this.pullFromWhichNode.set(mqKey(mq), brokerID);
   }
 
-  // forgetPullFromWhichNode 丢弃某一条队列的选主记录；下次从空重建。
+  // forgetPullFromWhichNode discards one queue's broker-selection record; the next lookup rebuilds from empty.
   forgetPullFromWhichNode(mq: MessageQueue): void {
     this.pullFromWhichNode.delete(mqKey(mq));
   }
 
-  // pulledQueues 把选主表的 key 集合还原成 MessageQueue 列表，也就是"当前消费者
-  // 真正在跑的分配"。mqKey 是 topic@brokerName@queueId 三元组，两者都不允许含 '@'
-  // （由 Validators 保证），切分不会歧义。
+  // pulledQueues turns the selection table's key set back into a MessageQueue
+  // list — i.e. "the assignment the consumer is actually running". mqKey is the
+  // topic@brokerName@queueId triple; neither part may contain '@' (guaranteed by
+  // Validators), so the split is unambiguous.
   pulledQueues(): MessageQueue[] {
     const out: MessageQueue[] = [];
     for (const key of this.pullFromWhichNode.keys()) {
@@ -84,8 +85,9 @@ export class PullAPI {
     return out;
   }
 
-  // findAddrInSubscribe 返回 (addr, isSlave) 或 null；isSlave 依据**真正命中**的那个
-  // brokerId 判定，不能拿请求 id 直接算。
+  // findAddrInSubscribe returns (addr, isSlave) or null; isSlave is decided by
+  // the brokerId that ACTUALLY matched, not computed directly from the request
+  // id.
   private findAddrInSubscribe(brokerName: string, brokerId: number,
     onlyThisBroker: boolean): { addr: string; isSlave: boolean } | null {
     const addrs = this.mqClient.getBrokerAddrTable().get(brokerName);
@@ -109,10 +111,10 @@ export class PullAPI {
     return null;
   }
 
-  // pullKernel：拉取内核。
+  // pullKernel: the pull kernel.
   //
-  // suspendTimeoutMillis > 0 时 broker 会 hold 住请求（LONG poll）；短轮询调用方
-  // 传 0，并在 sysFlag 里把 suspend 位关掉。
+  // When suspendTimeoutMillis > 0 the broker holds the request (LONG poll);
+  // short-poll callers pass 0 and clear the suspend bit in sysFlag.
   async pullKernel(mq: MessageQueue, offset: number, sub: SubscriptionData,
     sysFlag: number, commitOffset: number, maxMsgNums: number,
     suspendTimeoutMillis: number, timeoutMillis: number,
@@ -182,8 +184,9 @@ export class PullAPI {
       RequestCode.LITE_PULL_MESSAGE);
   }
 
-  // processPullResult：每次响应都必须走，不只是 FOUND——规则 3：选主表由每一条
-  // 回执喂进去，字段缺失就当 master。
+  // processPullResult: must run on every response, not just FOUND — rule 3: the
+  // selection table is fed by every acknowledgement, and a missing field counts
+  // as master.
   processPullResult(mq: MessageQueue, result: PullResult, sub: SubscriptionData): PullResult {
     const brokerId = result.suggestWhichBrokerId != null ? result.suggestWhichBrokerId : MixAll.MASTER_ID;
     this.updatePullFromWhichNode(mq, brokerId);
@@ -217,13 +220,14 @@ export class PullAPI {
   }
 }
 
-// clientSideTagFilter：processPullResult 里的第二层、字符串级别的 tag 过滤。
-// 守卫里那个"tagsSet 非空"就是为什么 FilterAPI 的 SUB_ALL 分支必须让 tagsSet 保持
-// **空**：订阅 "*" 是要把过滤整个关掉，而不是把所有消息过滤掉。
+// clientSideTagFilter: the second, string-level tag filter inside
+// processPullResult. The guard's "tagsSet non-empty" check is exactly why
+// FilterAPI's SUB_ALL branch must keep tagsSet EMPTY: subscribing to "*" means
+// switching filtering off entirely, not filtering out every message.
 function clientSideTagFilter(sub: SubscriptionData, msgs: MessageExt[]): MessageExt[] {
-  // tagsSet 在本实现里是 Set——用 .size，不要用 .length。
-  // 对 Set 用 `.length === 0` 永远为 false，会把 '*' 订阅（空 tagsSet → 关掉过滤）
-  // 悄悄变成"过滤掉所有"。
+  // tagsSet is a Set in this implementation — use .size, not .length.
+  // `.length === 0` on a Set is always false, which would silently turn a '*'
+  // subscription (empty tagsSet -> filtering off) into "filter out everything".
   const tagsSet: any = sub ? (sub as any).tagsSet : null;
   const empty = tagsSet == null ||
     (typeof tagsSet.size === 'number' ? tagsSet.size === 0 : tagsSet.length === 0);

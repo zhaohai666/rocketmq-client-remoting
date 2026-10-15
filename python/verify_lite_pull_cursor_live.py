@@ -56,7 +56,7 @@ def cursor_row(c: DefaultLitePullConsumer, mqs: list) -> str:
 
 
 def drain(c: DefaultLitePullConsumer, expect: int, timeout: float = 30.0) -> list:
-    """反复 poll 直到收齐 expect 条（或超时）。"""
+    """Poll repeatedly until expect messages are collected (or timeout)."""
     out: list = []
     deadline = time.time() + timeout
     while len(out) < expect and time.time() < deadline:
@@ -65,7 +65,7 @@ def drain(c: DefaultLitePullConsumer, expect: int, timeout: float = 30.0) -> lis
 
 
 def poll_quiet(c: DefaultLitePullConsumer, seconds: float = 1.0) -> list:
-    """在给定窗口里盯住缓冲：返回这期间 poll 出来的全部消息（断言「不该有」时用）。"""
+    """Watch the buffer over the given window: return all messages polled during it (used to assert "should be none")."""
     out: list = []
     deadline = time.time() + seconds
     while time.time() < deadline:
@@ -85,11 +85,11 @@ def main() -> int:
     time.sleep(1)
 
     mqs = queues_of(setup, TOPIC)
-    check("路由可见：%d 条队列" % QUEUES, len(mqs) == QUEUES, "got=%d" % len(mqs))
+    check("route visible: %d queues" % QUEUES, len(mqs) == QUEUES, "got=%d" % len(mqs))
     if len(mqs) != QUEUES:
         return 1
 
-    # ---------- S1 对照组：* 订阅 + seek(0)，每条队列一条消息全收 ----------
+    # ---------- S1 control group: * subscription + seek(0), receive the one message on each queue ----------
     for i, mq in enumerate(mqs):
         msg = Message(TOPIC, b"lc-s1-%d" % i)
         msg.set_tags("TagA")
@@ -98,7 +98,7 @@ def main() -> int:
     c = DefaultLitePullConsumer(GROUP)
     c.set_namesrv_addr(NAMESRV)
     c.set_consume_from_where(ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET)
-    # 位点越界那一腿绝不能把越界值提交上去：关掉自动提交，只看拉取/交付两条游标。
+    # The out-of-range offset leg must never commit the out-of-range value: turn off auto-commit and only watch the pull/delivery cursors.
     c.set_auto_commit(False)
     c.set_pull_interval_millis(200)
     c.assign(mqs)
@@ -109,48 +109,48 @@ def main() -> int:
         c.seek(mq, 0)
 
     got1 = drain(c, QUEUES)
-    check("S1-对照组：* 订阅下 4 条钉到队列的消息全收", len(got1) == QUEUES,
+    check("S1-control: all 4 messages pinned to queues received under * subscription", len(got1) == QUEUES,
           "got=%d bodies=%s" % (len(got1), sorted(bytes(m.body) for m in got1)[:6]))
 
     def _s1_max_is_one():
         return all(setup.get_max_offset(mq) == 1 for mq in mqs)
 
-    check("S1-每条队列 maxOffset == 1（后面两条腿的标尺）",
+    check("S1-per-queue maxOffset == 1 (the yardstick for the next two legs)",
           wait_until(_s1_max_is_one, 10),
           " ".join("q%d:%d" % (mq.queue_id, setup.get_max_offset(mq)) for mq in mqs))
 
-    # ---------- S2 NO_MATCHED_MSG：整段被表达式滤掉，游标要跟过整段 ----------
+    # ---------- S2 NO_MATCHED_MSG: the whole span is filtered by the expression, the cursor must span it ----------
     c.set_sub_expression_for_assign(TOPIC, NEVER_MATCH)
     for mq in mqs:
         c.seek(mq, 0)
 
     ok2 = wait_until(lambda: all(c.pull_cursor_of(mq) == 1 for mq in mqs), 20)
-    check("S2-NO_MATCHED_MSG 后拉取游标越过整段不匹配区间（== maxOffset=1）", ok2,
+    check("S2-pull cursor spans the whole non-matching span after NO_MATCHED_MSG (== maxOffset=1)", ok2,
           cursor_row(c, mqs))
-    check("S2-空应答期间零投递", not poll_quiet(c, 1.5), "不该有消息交付")
+    check("S2-zero delivery during the empty replies", not poll_quiet(c, 1.5), "no messages should be delivered")
 
-    # ---------- S3 OFFSET_ILLEGAL：越界位点被 broker 纠正 + 消息真的回来 ----------
+    # ---------- S3 OFFSET_ILLEGAL: the out-of-range offset is corrected by the broker + the messages really come back ----------
     for mq in mqs:
         c.seek(mq, setup.get_max_offset(mq) + BIG_AHEAD)
 
     ok3 = wait_until(lambda: all(c.pull_cursor_of(mq) == 1 for mq in mqs), 20)
-    check("S3-越界位点被 broker 纠正后游标回到 maxOffset（越界自愈）", ok3,
+    check("S3-after the broker corrects the out-of-range offset, the cursor returns to maxOffset (self-heal)", ok3,
           cursor_row(c, mqs))
 
-    # S2 换上的永不匹配表达式要换回来，否则下面 4 条 TagA 会被 broker 原样滤掉。
+    # The never-match expression from S2 must be swapped back, otherwise the 4 TagA below will be filtered out by the broker as-is.
     c.set_sub_expression_for_assign(TOPIC, "*")
 
-    # 起点还要能通过心跳/提交之外的路径被 broker 接受：这里只发消息、不碰位点。
+    # The start point must also be accepted by the broker via a path other than heartbeat/commit: here we only send messages, never touch the offset.
     for i, mq in enumerate(mqs):
         msg = Message(TOPIC, b"lc-s3-%d" % i)
         msg.set_tags("TagA")
         producer.send(msg, mq=mq)
 
     got3 = drain(c, QUEUES, timeout=40.0)
-    check("S3-自愈后新消息全部送达（旧实现：游标卡在 +1000，一条都看不到）",
+    check("S3-after self-heal, all new messages are delivered (old impl: cursor stuck at +1000, nothing visible)",
           len(got3) == QUEUES,
           "got=%d bodies=%s" % (len(got3), sorted(bytes(m.body) for m in got3)[:6]))
-    check("S3-收到的正是越界之后钉进去的那 4 条",
+    check("S3-received exactly the 4 pinned in after the out-of-range point",
           sorted(bytes(m.body) for m in got3)[:QUEUES]
           == sorted(b"lc-s3-%d" % i for i in range(QUEUES)),
           "bodies=%s" % sorted(bytes(m.body) for m in got3)[:6])

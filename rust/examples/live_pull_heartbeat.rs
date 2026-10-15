@@ -1,11 +1,11 @@
-//! 拉模式消费者（`DefaultMQPullConsumer`）的心跳必须把消费组注册进 broker（#98）——
-//! 对真实 5.5.1 集群的验证。
+//! The pull consumer (`DefaultMQPullConsumer`) heartbeat must register the consumer group with the broker (#98) --
+//! verified against a real 5.5.1 cluster.
 //!
-//! 为什么必须真机：离线单测只能证明报文形状（`pull_heartbeat_matches_the_wire_shape` 等），
-//! 证明不了 broker 的 `ConsumerManager.consumerTable` 真的登记了本组，也证明不了 35 之后
-//! 立刻摘除 —— 这两件事只有真 broker 有。
+//! Why a real cluster is required: offline unit tests can only prove the wire shape (`pull_heartbeat_matches_the_wire_shape` etc.),
+//! they cannot prove the broker's `ConsumerManager.consumerTable` really registered this group, nor that after request 35
+//! the group is removed right away -- only a real broker has these two.
 //!
-//! 用法（先按 runbook 起本地集群）：
+//! Usage (start the local cluster per the runbook first):
 //! ```text
 //! cargo run --example live_pull_heartbeat -- 127.0.0.1:9876 127.0.0.1:10911 [127.0.0.1:10931]
 //! ```
@@ -22,7 +22,7 @@ use rocketmq_client_remoting::client::result::PullStatus;
 use rocketmq_client_remoting::common::topic_config::DEFAULT_PERM;
 use rocketmq_client_remoting::remoting::protocol::body::ConsumerConnection;
 
-// ------------------------------------------------------------------ 骨架
+// ------------------------------------------------------------------ Skeleton
 
 fn stamp() -> String {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -31,7 +31,7 @@ fn stamp() -> String {
     }
 }
 
-/// 断言累积器：一次跑完所有场景再汇总，首个失败不提前退出。
+/// Assertion accumulator: runs all scenarios in one pass before summarizing; the first failure does not exit early.
 struct Checker {
     passed: u32,
     failed: Vec<String>,
@@ -69,10 +69,10 @@ fn report(ck: &Checker) {
     }
 }
 
-// ------------------------------------------------------------------ 判据
+// ------------------------------------------------------------------ Criteria
 
-/// 203 的原始答案：在线返回 `Some(connection)`；组不在时 broker 抛
-/// `MQBrokerException`（206 CONSUMER_NOT_ONLINE）→ 一律当不在线，报错文本带回。
+/// The raw answer of 203: when online returns `Some(connection)`; when the group is absent the broker fails
+/// the request (206 CONSUMER_NOT_ONLINE) → always treated as offline, with the error text carried back.
 async fn group_is_online(
     admin: &DefaultMQAdminExt,
     group: &str,
@@ -84,7 +84,7 @@ async fn group_is_online(
         .map_err(|e| e.to_string())
 }
 
-/// 38 的原始答案：组不在时 broker 直接回 `no consumer for this group`，当空列表。
+/// The raw answer of 38: when the group is absent the broker directly replies `no consumer for this group`, treated as an empty list.
 async fn consumer_ids(
     admin: &DefaultMQAdminExt,
     group: &str,
@@ -97,7 +97,7 @@ async fn consumer_ids(
         .map_err(|e| e.to_string())
 }
 
-/// 203 订阅表里某 topic 的 `subString`（表是 topic → SubscriptionData JSON 的键值对）。
+/// The `subString` of a topic in the 203 subscription table (the table is a topic → SubscriptionData JSON key-value map).
 fn sub_string_of(conn: &ConsumerConnection, topic: &str) -> Option<String> {
     conn.subscription_table
         .iter()
@@ -107,7 +107,7 @@ fn sub_string_of(conn: &ConsumerConnection, topic: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-// ------------------------------------------------------------------ 主流程
+// ------------------------------------------------------------------ Main flow
 
 async fn run(namesrv: &str, master: &str, slave: Option<&str>) -> Checker {
     let mut ck = Checker::new();
@@ -126,17 +126,17 @@ async fn run(namesrv: &str, master: &str, slave: Option<&str>) -> Checker {
         return ck;
     }
 
-    // ---- A0 建 topic ----
+    // ---- A0 create topic ----
     if let Err(e) = admin
         .create_topic_in_broker(master, &topic, 4, 4, DEFAULT_PERM)
         .await
     {
-        ck.abort("A0 建 topic", &e.to_string());
+        ck.abort("A0 create topic", &e.to_string());
         admin.shutdown();
         return ck;
     }
 
-    // ---- A1 起拉模式消费者并拉一轮 ----
+    // ---- A1 start the pull consumer and pull one round ----
     let mut consumer: Option<DefaultMQPullConsumer> = None;
     match DefaultMQPullConsumer::with_config(PullConsumerConfig {
         consumer_group: group.clone(),
@@ -158,7 +158,7 @@ async fn run(namesrv: &str, master: &str, slave: Option<&str>) -> Checker {
                         .and_then(|r| r.as_ref().ok())
                         .map(|r| r.status);
                     ck.check(
-                        "A1 拉模式消费者启动并成功拉取一轮",
+                        "A1 pull consumer starts and pulls one round successfully",
                         c.heartbeat_count() >= 1
                             && matches!(pulled, Some(PullStatus::Found) | Some(PullStatus::NoNewMsg)),
                         &format!(
@@ -169,10 +169,10 @@ async fn run(namesrv: &str, master: &str, slave: Option<&str>) -> Checker {
                     );
                     consumer = Some(c);
                 }
-                Err(e) => ck.abort("A1 消费者 start", &e.to_string()),
+                Err(e) => ck.abort("A1 consumer start", &e.to_string()),
             }
         }
-        Err(e) => ck.abort("A1 消费者构造", &e.to_string()),
+        Err(e) => ck.abort("A1 consumer build", &e.to_string()),
     }
 
     let Some(c) = consumer else {
@@ -181,102 +181,102 @@ async fn run(namesrv: &str, master: &str, slave: Option<&str>) -> Checker {
         return ck;
     };
 
-    // ---- A2 主节点 203 ----
+    // ---- A2 master, request 203 ----
     let master_conn = match group_is_online(&admin, &group, master).await {
         Ok(conn) => {
             ck.check(
-                "A2 主节点 203 查到本组（心跳已注册）",
+                "A2 master 203 finds this group (heartbeat registered)",
                 true,
                 &format!("connections={}", conn.connection_set.len()),
             );
             ck.check(
-                "A2 消费类型是 CONSUME_ACTIVELY",
+                "A2 consume type is CONSUME_ACTIVELY",
                 conn.consume_type.as_deref() == Some("CONSUME_ACTIVELY"),
                 &format!("consumeType={:?}", conn.consume_type),
             );
             ck.check(
-                "A2 消费位点是 CONSUME_FROM_LAST_OFFSET",
+                "A2 consume-from-where is CONSUME_FROM_LAST_OFFSET",
                 conn.consume_from_where.as_deref() == Some("CONSUME_FROM_LAST_OFFSET"),
                 &format!("consumeFromWhere={:?}", conn.consume_from_where),
             );
             ck.check(
-                "A2 广播/集群口径是 CLUSTERING",
+                "A2 broadcast/clustering mode is CLUSTERING",
                 conn.message_model.as_deref() == Some("CLUSTERING"),
                 &format!("messageModel={:?}", conn.message_model),
             );
             Some(conn)
         }
         Err(e) => {
-            ck.abort("A2 主节点 203 查到本组（心跳已注册）", &e);
+            ck.abort("A2 master 203 finds this group (heartbeat registered)", &e);
             None
         }
     };
 
-    // ---- A2b 订阅集来自 registerTopics（subscriptions():357-385）----
+    // ---- A2b the subscription set comes from registerTopics ----
     if let Some(conn) = &master_conn {
         let sub = sub_string_of(conn, &topic);
         ck.check(
-            "A2b 203 的订阅表带 registerTopics 的 topic 且 subString=*",
+            "A2b the 203 subscription table carries the registerTopics topic with subString=*",
             sub.as_deref() == Some("*"),
             &format!("subscriptionTable={:?}", conn.subscription_table),
         );
     } else {
-        ck.abort("A2b 203 的订阅表", "203 不可用，跳过");
+        ck.abort("A2b 203 subscription table", "203 unavailable, skipped");
     }
 
-    // ---- A3 主节点 38 ----
+    // ---- A3 master, request 38 ----
     match consumer_ids(&admin, &group, master).await {
         Ok(ids) => ck.check(
-            "A3 主节点 38 查到本 clientId",
+            "A3 master 38 finds this clientId",
             ids.iter().any(|id| id == &c.client_id()),
             &format!("ids={ids:?} clientId={}", c.client_id()),
         ),
-        Err(e) => ck.abort("A3 主节点 38 查到本 clientId", &e),
+        Err(e) => ck.abort("A3 master 38 finds this clientId", &e),
     }
 
-    // ---- A4 从节点 ----
+    // ---- A4 slave ----
     if let Some(slave) = slave {
         match group_is_online(&admin, &group, slave).await {
             Ok(conn) => ck.check(
-                "A4 从节点 203 也查到本组（心跳扇出到从节点）",
+                "A4 slave 203 also finds this group (heartbeat fans out to the slave)",
                 true,
                 &format!("slave={slave} connections={}", conn.connection_set.len()),
             ),
-            Err(e) => ck.abort("A4 从节点 203 也查到本组（心跳扇出到从节点）", &e),
+            Err(e) => ck.abort("A4 slave 203 also finds this group (heartbeat fans out to the slave)", &e),
         }
         match consumer_ids(&admin, &group, slave).await {
             Ok(ids) => ck.check(
-                "A4 从节点 38 也查到本 clientId",
+                "A4 slave 38 also finds this clientId",
                 ids.iter().any(|id| id == &c.client_id()),
                 &format!("ids={ids:?}"),
             ),
-            Err(e) => ck.abort("A4 从节点 38 也查到本 clientId", &e),
+            Err(e) => ck.abort("A4 slave 38 also finds this clientId", &e),
         }
     }
 
-    // ---- A5 对照：幽灵组（从未心跳）必须查不到 ----
+    // ---- A5 control: ghost group (never heartbeated) must not be found ----
     match group_is_online(&admin, &ghost, master).await {
         Ok(conn) => ck.check(
-            "A5 对照：未心跳的幽灵组 203 查不到",
+            "A5 control: the never-heartbeated ghost group is not found by 203",
             false,
             &format!("ghost connections={}", conn.connection_set.len()),
         ),
         Err(e) => ck.check(
-            "A5 对照：未心跳的幽灵组 203 查不到",
+            "A5 control: the never-heartbeated ghost group is not found by 203",
             true,
             &format!("err={e}"),
         ),
     }
     match consumer_ids(&admin, &ghost, master).await {
         Ok(ids) => ck.check(
-            "A5 对照：未心跳的幽灵组 38 空列表",
+            "A5 control: the never-heartbeated ghost group gets an empty list from 38",
             ids.is_empty(),
             &format!("ids={ids:?}"),
         ),
-        Err(_) => ck.check("A5 对照：未心跳的幽灵组 38 空列表", true, "broker 报 no consumer"),
+        Err(_) => ck.check("A5 control: the never-heartbeated ghost group gets an empty list from 38", true, "broker reports no consumer"),
     }
 
-    // ---- A6 shutdown 立刻注销（35）----
+    // ---- A6 shutdown unregisters immediately (35) ----
     let client_id = c.client_id();
     c.shutdown();
     let mut gone = false;
@@ -289,7 +289,7 @@ async fn run(namesrv: &str, master: &str, slave: Option<&str>) -> Checker {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     ck.check(
-        "A6 shutdown 后 203 立刻查不到本组（发过 35 注销）",
+        "A6 after shutdown 203 immediately cannot find this group (unregister 35 was sent)",
         gone,
         &format!("clientId={client_id}"),
     );

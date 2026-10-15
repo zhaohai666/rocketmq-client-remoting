@@ -13,14 +13,14 @@ from common.mix_all import MixAll
 from remoting.exception import RemotingConnectException
 from remoting.protocol.heartbeat import MessageModel
 
-# <IP>@<pid>#<纳秒>
+# <IP>@<pid>#<nanoseconds>
 CLIENT_ID_PATTERN = re.compile(r"^[^@\s]+@%d#\d+$" % MixAll.pid())
 STREAM_CLIENT_ID_PATTERN = re.compile(r"^[^@\s]+@%d#\d+@STREAM$" % MixAll.pid())
 
 
 def _split(client_id: str):
     ip, _, instance = client_id.partition("@")
-    assert instance, "clientId 少了 IP@instanceName 的分隔符: %s" % client_id
+    assert instance, "clientId is missing the IP@instanceName separator: %s" % client_id
     return ip, instance
 
 
@@ -60,7 +60,7 @@ class TestProducerClientId:
             assert CLIENT_ID_PATTERN.match(p.client_id), p.client_id
             ip, instance = _split(p.client_id)
             assert ip == MixAll.cached_ip_str()
-            # instanceName 就地写回：重启不能再换一个 clientId
+            # instanceName is written back in place: a restart must not produce a different clientId
             assert p.instance_name == instance
             restarted = p.client_id
         finally:
@@ -72,7 +72,7 @@ class TestProducerClientId:
             p.shutdown()
 
     def test_two_producers_in_one_process_do_not_share_a_client_id(self):
-        """旧口径（秒级时间戳）在同一秒内必然撞车，撞了就等于共用 INSTANCE_MAP 的键。"""
+        """The old scheme (second-level timestamp) necessarily collides within the same second, and a collision means sharing an INSTANCE_MAP key."""
         a = DefaultMQProducer("PID_clientid_a")
         b = DefaultMQProducer("PID_clientid_b")
         for c in (a, b):
@@ -196,7 +196,7 @@ class TestUnitNameClientId:
         assert MixAll.build_mq_client_id("10.0.0.1", "inst", "unit-a") == "10.0.0.1@inst@unit-a"
         assert MixAll.build_mq_client_id("10.0.0.1", "inst", "   ") == "10.0.0.1@inst"
         assert MixAll.build_mq_client_id("10.0.0.1", "inst", None) == "10.0.0.1@inst"
-        # 两段后缀顺序固定：先 unitName 再 STREAM
+        # The two suffix segments have a fixed order: unitName first, then STREAM
         assert (MixAll.build_mq_client_id("10.0.0.1", "inst", "unit-a", True)
                 == "10.0.0.1@inst@unit-a@STREAM")
 
@@ -208,7 +208,7 @@ class TestUnitNameClientId:
         p.start()
         try:
             assert p.client_id == "%s@unit-producer@unitA" % MixAll.cached_ip_str()
-            # unitName 不参与 changeInstanceNameToPID：instanceName 该原样留着
+            # unitName does not participate in changeInstanceNameToPID: instanceName should be kept as-is
             assert p.instance_name == "unit-producer"
             assert p.get_unit_name() == "unitA"
         finally:
@@ -226,8 +226,8 @@ class TestUnitNameClientId:
             p.shutdown()
 
     def test_two_units_get_two_client_ids(self):
-        """同进程同 instanceName、不同 unitName 的两个客户端不能共用一个 clientId ——
-        否则 INSTANCE_MAP 里后者会覆盖前者，心跳与 rebalance 都会串台。"""
+        """Two clients in the same process with the same instanceName but different unitName must not share a clientId —
+        otherwise the latter would overwrite the former in INSTANCE_MAP, and heartbeats and rebalance would cross-talk."""
         a = DefaultMQProducer("PID_clientid_unit_a")
         b = DefaultMQProducer("PID_clientid_unit_b")
         for c in (a, b):
@@ -294,7 +294,7 @@ class TestAdminClientId:
     lambda: DefaultMQProducer("PID_clientid_dead_group"),
 ])
 def test_failed_start_does_not_leave_a_stamped_client_id_behind(factory):
-    """start() 失败在地址校验之前时不该已经改名：改名与拼 clientId 都在校验之后。"""
+    """When start() fails before address validation, the rename must not have happened yet: both the rename and clientId assembly happen after validation."""
     c = factory()
     with pytest.raises(Exception):
         c.start()

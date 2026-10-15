@@ -31,8 +31,9 @@ public sealed class DefaultTopAddressing
         _timeoutMillis = timeoutMillis;
         _unitName = unitName ?? string.Empty;
         _para = para;
-        // ⚠ UseProxy=false 必须显式设：HttpClient 默认读系统代理，配了代理的机器上
-        // 连 loopback 都会被拖到代理超时（实测每请求 ~10s）。
+        // WARNING: UseProxy=false must be set explicitly: HttpClient reads system proxies by
+        // default, and on machines with a proxy configured even loopback connections get dragged
+        // into the proxy timeout (measured ~10s per request).
         _http = http ?? new HttpClient(new HttpClientHandler
         {
             UseProxy = false,
@@ -49,7 +50,7 @@ public sealed class DefaultTopAddressing
             : (string.IsNullOrEmpty(dom) ? string.Empty : GetWsAddr(dom, subgroup));
     }
 
-    /// <summary>对应 MixAll.getWSAddr：domain 自带端口（含 ':'）时不追加默认 :8080。</summary>
+    /// <summary>Corresponds to MixAll.getWSAddr: when the domain already carries a port (contains ':'), the default :8080 is not appended.</summary>
     public static string GetWsAddr(string domain, string? subgroup = null)
     {
         string grp = subgroup ?? DefaultDomainSubgroup;
@@ -58,7 +59,7 @@ public sealed class DefaultTopAddressing
             : "http://" + domain + ":8080/rocketmq/" + grp;
     }
 
-    /// <summary>动态取址是否可用（domain 已显式配置）。</summary>
+    /// <summary>Whether dynamic address fetching is available (domain explicitly configured).</summary>
     public static bool IsConfigured()
     {
         string? env = Environment.GetEnvironmentVariable("ROCKETMQ_NAMESRV_DOMAIN")
@@ -66,7 +67,7 @@ public sealed class DefaultTopAddressing
         return !string.IsNullOrEmpty(env);
     }
 
-    /// <summary>对应 fetchNSAddr 里的 URL 拼装（unitName / para 规则逐条照抄）。</summary>
+    /// <summary>Corresponds to the URL assembly in fetchNSAddr (unitName / para rules copied verbatim).</summary>
     public string BuildUrl()
     {
         string url = WsAddr;

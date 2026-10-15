@@ -39,34 +39,36 @@ use RocketMQ\Remoting\Protocol\TopicStatsTable;
 use RocketMQ\Remoting\Protocol\RemotingSerializable;
 use RocketMQ\Remoting\RPCHook;
 use RocketMQ\Remoting\SocksProxyConfig;
-// 命名空间级函数（定义于 AdminBodies.php；该文件随其中任一类被 autoload 时一并生效）
+// Namespace-level function (defined in AdminBodies.php; that file takes effect when any of its classes is autoloaded)
 use function RocketMQ\Remoting\Protocol\message_queue_key;
 
 /**
- * 管理端。
+ * Admin side.
  *
- * 覆盖：Topic 增删查/配置、Broker 集群信息与运行时信息/配置、NameServer KV 配置、
- * 订阅组管理、消费者/生产者连接、消费统计、offset 管理（含真实 broker 位点重置）、
- * 消息查询（key / uniqKey / msgId / ConsumeQueue）。
+ * Covers: Topic create/delete/query/config, Broker cluster info and runtime info/config,
+ * NameServer KV config, subscription group management, consumer/producer connections,
+ * consume stats, offset management (including real broker offset reset), message query
+ * (key / uniqKey / msgId / ConsumeQueue).
  *
- * 协议要点（真机探针 + broker 行为核对结论，勿凭记忆改）：
- * - GET_BROKER_CONFIG 的 body 是 **properties 文本**（``k=v\n``），不是 JSON。
- * - UPDATE_AND_CREATE_SUBSCRIPTIONGROUP 的 body 是 SubscriptionGroupConfig **JSON**。
- * - GET_TOPIC_CONFIG 请求头带 ``topic`` + ``lo``，响应体是 TopicConfigAndQueueMapping JSON。
- * - GET_ALL_SUBSCRIPTIONGROUP_CONFIG 是**分页**接口（groupSeq / maxGroupNum / dataVersion）。
- * - ResetOffsetBody.offsetTable 是 Map<MessageQueue, Long>。
- * - KV 配置类请求打到 **NameServer**，且 PUT/DELETE 要广播到**每一个** NameServer。
+ * Protocol essentials (conclusions from live probes + broker behavior checks; do not
+ * change from memory):
+ * - GET_BROKER_CONFIG's body is a **properties text** (``k=v\n``), not JSON.
+ * - UPDATE_AND_CREATE_SUBSCRIPTIONGROUP's body is SubscriptionGroupConfig **JSON**.
+ * - GET_TOPIC_CONFIG's request header carries ``topic`` + ``lo``; the response body is TopicConfigAndQueueMapping JSON.
+ * - GET_ALL_SUBSCRIPTIONGROUP_CONFIG is a **paged** API (groupSeq / maxGroupNum / dataVersion).
+ * - ResetOffsetBody.offsetTable is a Map<MessageQueue, Long>.
+ * - KV config requests go to the **NameServer**, and PUT/DELETE must broadcast to **every** NameServer.
  *
- * 管理端全部是同步阻塞 RPC：``$client->remotingClient->invokeSync(...)``（超时由参数控制）；
- * 非 SUCCESS 的收口统一在本类的 ``checkResponse``。
- * 测试/依赖注入可 ``setMqClientInstance`` 预置实例并覆写 ``invokeSyncOn``。
+ * The admin side is entirely synchronous blocking RPC: ``$client->remotingClient->invokeSync(...)`` (timeout controlled by parameters);
+ * non-SUCCESS responses are funneled through this class's ``checkResponse``.
+ * Tests/dependency injection can preset an instance via ``setMqClientInstance`` and override ``invokeSyncOn``.
  */
 class DefaultMQAdminExt
 {
-    /** 默认超时，5000 * 3。 */
+    /** Default timeout, 5000 * 3. */
     public const DEFAULT_TIMEOUT = 5000 * 3;
 
-    /** NameServer KV 里存放订单路由配置的 namespace 名。 */
+    /** Namespace name storing the order route config in the NameServer KV. */
     public const NAMESPACE_ORDER_TOPIC_CONFIG = 'ORDER_TOPIC_CONFIG';
 
     public string $namespace;
@@ -75,42 +77,45 @@ class DefaultMQAdminExt
 
     public ?string $clientId = null;
 
-    /** start() 之后才非 null。 */
+    /** Only non-null after start(). */
     public function getClientId(): ?string
     {
         return $this->clientId;
     }
 
     /**
-     * unitName 与 enableStreamRequestType 只影响 clientId / 取址 URL / 请求扩展字段，
-     * 对 admin 同样有效。（unitMode 在这里没有落点：admin 不发消息，也不注册消费者，
-     * 没有需要携带 unitMode 的请求。）
+     * unitName and enableStreamRequestType only affect the clientId / address-lookup URL /
+     * request extension fields; they are equally valid for admin. (unitMode has no
+     * foothold here: admin does not send messages and does not register consumers, so
+     * there is no request that needs to carry unitMode.)
      */
     public ?string $unitName = null;
 
     public bool $enableStreamRequestType = false;
 
     /**
-     * 5.x 新命名空间：非空时**每笔**请求带 `nsd=true` / `ns=<该值>` 两个扩展头，
-     * 由 broker 解析到对应 serverless 实例。
-     * 与 `$namespace`（客户端给资源名拼 `namespace%` 前缀）是两套机制，这里**不**改
-     * 任何资源名。见 NamespaceRpcHook。
+     * 5.x new namespace: when non-empty, **every** request carries the `nsd=true` / `ns=<value>`
+     * two extension headers, which the broker resolves to the corresponding serverless
+     * instance. This is a separate mechanism from `$namespace` (the client prefixes
+     * resource names with `namespace%`); nothing here **changes** any resource name.
+     * See NamespaceRpcHook.
      */
     public string $namespaceV2 = '';
 
     /**
-     * VIP 通道开关（默认 false）：true 时 broker 请求改走 VIP 端口（端口 - 2）。
-     * 只对本 admin 的 broker 调用生效——admin 不发消息、不注册消费者。
+     * VIP channel switch (default false): when true, broker requests go through the VIP
+     * port (port - 2). Only affects this admin's broker calls -- admin sends no messages
+     * and registers no consumers.
      */
     public bool $vipChannelEnabled = false;
 
     /** @var list<string> */
     public array $nameServerAddrs = [];
 
-    /** TLS 开关（null = 交给 env ROCKETMQ_TLS_ENABLE）。 */
+    /** TLS switch (null = delegate to env ROCKETMQ_TLS_ENABLE). */
     public ?bool $tlsEnable = null;
 
-    /** TLS 细项（caCert/clientCert/clientKey/serverName），语义见 RemotingClient::$tlsOptions。 */
+    /** TLS details (caCert/clientCert/clientKey/serverName); semantics see RemotingClient::$tlsOptions. */
     public ?array $tlsOptions = null;
 
     public ?SocksProxyConfig $socksProxy = null;
@@ -119,7 +124,7 @@ class DefaultMQAdminExt
 
     public ?RPCHook $rpcHook;
 
-    /** 删除 topic 时一并清理的 KV namespace。 */
+    /** KV namespace cleaned up along with topic deletion. */
     public array $kvNamespaceToDeleteList = [];
 
     public int $timeoutMillis;
@@ -138,7 +143,7 @@ class DefaultMQAdminExt
         $this->timeoutMillis = $timeoutMillis;
     }
 
-    // ---------------- 配置与生命周期 ----------------
+    // ---------------- Config and lifecycle ----------------
 
     public function setNamesrvAddr(string $addr): void
     {
@@ -156,9 +161,10 @@ class DefaultMQAdminExt
     public function setNameServerAddresses(array $addrs): void
     {
         $this->nameServerAddrs = array_values($addrs);
-        // setter 通常在 start() 前调用，start() 用该列表构建 MQClientInstance。
-        // 本端口允许注入现成实例（setMqClientInstance），此时同步给 client，
-        // 避免 admin 与 client 两份地址列表漂移（invokeNamesrvOne/All 读 client 侧）。
+        // Setters are usually called before start(); start() uses this list to build the MQClientInstance.
+        // This port allows injecting a ready-made instance (setMqClientInstance), in which case
+        // it is synced to the client to avoid two address lists drifting between admin and client
+        // (invokeNamesrvOne/All read the client side).
         $this->mqClient?->updateNameServerAddressList($this->nameServerAddrs);
     }
 
@@ -167,7 +173,7 @@ class DefaultMQAdminExt
         $this->instanceName = $name;
     }
 
-    /** 单元名：影响 clientId 后缀与动态取址 URL。 */
+    /** Unit name: affects the clientId suffix and the dynamic address-lookup URL. */
     public function setUnitName(?string $unitName): void
     {
         $this->unitName = $unitName;
@@ -178,16 +184,16 @@ class DefaultMQAdminExt
         return $this->unitName;
     }
 
-    /** 是否给请求加 `ReqT=0` 流控标记（@STREAM clientId 后缀）。 */
+    /** Whether to add the `ReqT=0` flow-control marker to requests (@STREAM clientId suffix). */
     public function setEnableStreamRequestType(bool $enable): void
     {
         $this->enableStreamRequestType = $enable;
     }
 
     /**
-     * 服务端命名空间（`nsd`/`ns` 扩展头），不改资源名；与 `$namespace` 那套
-     * 「客户端拼前缀」的机制互不相干。
-     * start() 之后改也生效——钩子每笔请求实时读 {@see MQClientInstance::$namespaceV2}。
+     * Server-side namespace (`nsd`/`ns` extension headers), does not change resource names;
+     * unrelated to the `$namespace` "client prefix" mechanism.
+     * Changing it after start() also takes effect -- the hook reads {@see MQClientInstance::$namespaceV2} per request in real time.
      */
     public function setNamespaceV2(string $namespaceV2): void
     {
@@ -241,10 +247,11 @@ class DefaultMQAdminExt
         if ($this->nameServerAddrs === []) {
             throw new MQClientException('name server address is not set');
         }
-        // instanceName 无条件走 changeInstanceNameToPID，
-        // clientId 再按 ``<本机 IP>@<instanceName>[@<unitName>][@STREAM]`` 拼装。
-        // 本客户端的 admin 默认 instanceName 是 "ADMIN"（admin 用私有实例、不和其他
-        // 客户端共用），所以这一步只在调用方显式设成 "DEFAULT" 时才起作用。
+        // instanceName unconditionally goes through changeInstanceNameToPID;
+        // clientId is then assembled as ``<local IP>@<instanceName>[@<unitName>][@STREAM]``.
+        // This client's admin defaults instanceName to "ADMIN" (admin uses a private instance,
+        // not shared with other clients), so this step only takes effect when the caller
+        // explicitly sets it to "DEFAULT".
         $this->instanceName = MixAll::changeInstanceNameToPid($this->instanceName);
         if ($this->clientId === null) {
             $this->clientId = MixAll::clientIdFor(
@@ -288,8 +295,8 @@ class DefaultMQAdminExt
     }
 
     /**
-     * 测试 / 依赖注入缝：直接预置一个已就绪的 MQClientInstance（等价于 start()
-     * 之后的内部状态）。生产路径请走 start()。
+     * Test / dependency-injection seam: directly preset a ready MQClientInstance (equivalent
+     * to the internal state after start()). The production path goes through start().
      */
     public function setMqClientInstance(MQClientInstance $client): void
     {
@@ -305,11 +312,12 @@ class DefaultMQAdminExt
         return $this->mqClient;
     }
 
-    // ---------------- 底层调用助手 ----------------
+    // ---------------- Low-level call helpers ----------------
 
     /**
-     * 同步 RPC 的唯一出口：MQClientInstance 的 invokeSync 是私有的，
-     * 这里走公共的 remotingClient；测试子类覆写本方法即可拦截全部同步调用。
+     * The only exit point for synchronous RPC: MQClientInstance's invokeSync is private,
+     * so this goes through the public remotingClient; test subclasses can intercept all
+     * synchronous calls by overriding this method.
      */
     protected function invokeSyncOn(
         MQClientInstance $client,
@@ -320,7 +328,7 @@ class DefaultMQAdminExt
         return $client->remotingClient->invokeSync($addr, $request, $timeoutMillis);
     }
 
-    /** 非 SUCCESS 抛 MQBrokerException。 */
+    /** Throws MQBrokerException on non-SUCCESS. */
     protected function checkResponse(RemotingCommand $response): RemotingCommand
     {
         if ($response->code === ResponseCode::SUCCESS) {
@@ -329,7 +337,7 @@ class DefaultMQAdminExt
         throw new MQBrokerException($response->code, $response->remark ?? '');
     }
 
-    /** 发到指定 Broker 并校验 SUCCESS。 */
+    /** Send to the specified Broker and verify SUCCESS. */
     protected function invokeBroker(
         string $addr,
         int $code,
@@ -349,8 +357,8 @@ class DefaultMQAdminExt
     }
 
     /**
-     * KV 配置写入/删除要广播到**所有** NameServer（name server 之间不复制 KV）。
-     * 任一失败即在收齐后抛错（保留最后一个错误响应统一抛）。
+     * KV config write/delete must broadcast to **all** NameServers (name servers do not replicate KV).
+     * Any failure throws after all responses are collected (the last error response is kept and thrown uniformly).
      */
     protected function invokeNamesrvAll(int $code, ?array $extFields = null, ?int $timeoutMillis = null): ?RemotingCommand
     {
@@ -374,7 +382,7 @@ class DefaultMQAdminExt
         return null;
     }
 
-    /** 发到第一个可用 NameServer（读类请求不需要广播）。 */
+    /** Send to the first available NameServer (read requests need no broadcast). */
     protected function invokeNamesrvOne(int $code, ?array $extFields = null, ?int $timeoutMillis = null): RemotingCommand
     {
         $client = $this->requireClient();
@@ -391,7 +399,7 @@ class DefaultMQAdminExt
         throw new MQClientException('all name servers unreachable: ' . ($lastExc !== null ? $lastExc->getMessage() : ''));
     }
 
-    /** 发到**显式给定**的 NameServer 并校验 SUCCESS（不走 VIP 通道）。 */
+    /** Send to the **explicitly given** NameServer and verify SUCCESS (does not go through the VIP channel). */
     protected function invokeNamesrvAddr(string $addr, int $code, ?array $extFields = null, ?int $timeoutMillis = null): RemotingCommand
     {
         $client = $this->requireClient();
@@ -418,7 +426,7 @@ class DefaultMQAdminExt
                 return $addrs[0];
             }
         } catch (\Throwable) {
-            // 吞掉后统一抛 no broker address available
+            // Swallowed, then uniformly throws no broker address available
         }
         throw new MQClientException('no broker address available');
     }
@@ -428,7 +436,7 @@ class DefaultMQAdminExt
         return self::firstBrokerAddr($client);
     }
 
-    // ---------------- Topic 管理 ----------------
+    // ---------------- Topic management ----------------
 
     public function createTopic(string $key, string $newTopic, int $queueNum = 4, int $topicSysFlag = 0): void
     {
@@ -436,7 +444,7 @@ class DefaultMQAdminExt
         $client->createTopicInRoute($newTopic, $queueNum, $queueNum, MixAll::READ_PERM_BY_DEFAULT);
     }
 
-    /** 向指定 broker 下发 topic 配置（走 createTopicKey，即 TBW102）。 */
+    /** Send the topic config to the specified broker (via createTopicKey, i.e. TBW102). */
     public function createAndUpdateTopicConfig(string $addr, TopicConfig $config): void
     {
         $client = $this->requireClient();
@@ -466,21 +474,22 @@ class DefaultMQAdminExt
     {
         $client = $this->requireClient();
         $targets = $addrs !== null && $addrs !== [] ? array_values($addrs) : array_values($client->nameServerAddrs);
-        // NameServer 请求不能走 invokeBroker：VIP 开关打开时它会把 NameServer
-        // 的端口也 -2，所以这里直连 NameServer 地址。
+        // NameServer requests cannot go through invokeBroker: when the VIP switch is on it
+        // would also subtract 2 from the NameServer's port, so connect to the NameServer
+        // address directly here.
         foreach ($targets as $nsAddr) {
             $this->invokeNamesrvAddr($nsAddr, RequestCode::DELETE_TOPIC_IN_NAMESRV, ['topic' => $topic]);
         }
     }
 
-    /** 兼容旧名：删除 NameServer 上的 topic 路由。 */
+    /** Compatibility with the old name: delete the topic route on the NameServer. */
     public function deleteTopicInNamesrv(string $topic): void
     {
         $client = $this->requireClient();
         $client->deleteTopicInNamesrv($topic);
     }
 
-    /** 删除 topic（先清各 broker，再清 NameServer 路由，最后清 KV namespace）。 */
+    /** Delete a topic (first each broker, then the NameServer route, and finally the KV namespace). */
     public function deleteTopic(string $topic, ?string $clusterName = null): void
     {
         $client = $this->requireClient();
@@ -538,12 +547,13 @@ class DefaultMQAdminExt
     }
 
     /**
-     * GET_TOPICS_BY_CLUSTER 打到 NameServer。
+     * GET_TOPICS_BY_CLUSTER goes to the NameServer.
      *
-     * 字段名必须是协议头里的 ``cluster``：早先写成 ``clusterName`` 时 NameServer
-     * 查不到集群（NPE 被吞），只回 SUCCESS + 空列表。
+     * The field name must be ``cluster`` from the protocol header: when it was earlier
+     * written as ``clusterName`` the NameServer could not find the cluster (NPE swallowed),
+     * only returning SUCCESS + an empty list.
      *
-     * 结果按 topic 名去重后回列表。
+     * Results are deduplicated by topic name before being returned as a list.
      *
      * @return list<string>
      */
@@ -560,7 +570,7 @@ class DefaultMQAdminExt
         return array_keys($topics);
     }
 
-    /** 包含该 topic 的路由 broker 所在集群名集合。 @return list<string> */
+    /** Set of cluster names of the brokers hosting this topic's route. @return list<string> */
     public function getClusterList(string $topic): array
     {
         $client = $this->requireClient();
@@ -589,7 +599,7 @@ class DefaultMQAdminExt
     }
 
     /**
-     * 拉取全部 topic 的路由（遍历 Nameserver 的 topic 列表）。
+     * Fetch the routes of all topics (iterating the Nameserver's topic list).
      *
      * @return list<TopicRouteData>
      */
@@ -621,7 +631,7 @@ class DefaultMQAdminExt
         return $route;
     }
 
-    /** GET_TOPIC_CONFIG：body 为 TopicConfig JSON。 */
+    /** GET_TOPIC_CONFIG: body is TopicConfig JSON. */
     public function examineTopicConfig(string $addr, string $topic): TopicConfig
     {
         $response = $this->invokeBroker($addr, RequestCode::GET_TOPIC_CONFIG, ['topic' => $topic, 'lo' => 'true']);
@@ -641,7 +651,7 @@ class DefaultMQAdminExt
         return TopicConfigSerializeWrapper::decode($response->body);
     }
 
-    /** 剔除系统 topic 与 %RETRY%/%DLQ%（specialTopic=false 时连重试/死信队列一起剔除）。 */
+    /** Exclude system topics and %RETRY%/%DLQ% (when specialTopic=false, retry/dead-letter queues are excluded too). */
     public function getUserTopicConfig(string $brokerAddr, bool $specialTopic = false, ?int $timeoutMillis = null): TopicConfigSerializeWrapper
     {
         $wrapper = $this->getAllTopicConfig($brokerAddr, $timeoutMillis);
@@ -674,7 +684,7 @@ class DefaultMQAdminExt
         return TopicList::decode($response->body);
     }
 
-    /** 遍历该 topic 的所有 broker 合并统计。 */
+    /** Merge stats across all brokers of this topic. */
     public function examineTopicStats(string $topic): TopicStatsTable
     {
         $route = $this->examineTopicRoute($topic);
@@ -709,7 +719,7 @@ class DefaultMQAdminExt
     }
 
     /**
-     * dict.update 语义合并以 MessageQueue 为键的表（同键后值覆盖前值）。
+     * Merge a MessageQueue-keyed table with dict.update semantics (same key: later value overwrites earlier).
      *
      * @param list<array{mq: MessageQueue, value: mixed}> $dst
      * @param list<array{mq: MessageQueue, value: mixed}> $src
@@ -726,7 +736,7 @@ class DefaultMQAdminExt
         $dst = array_values($byKey);
     }
 
-    // ---------------- 集群 / Broker ----------------
+    // ---------------- Cluster / Broker ----------------
 
     public function fetchBrokerClusterInfo(): ClusterInfo
     {
@@ -747,16 +757,17 @@ class DefaultMQAdminExt
         return KVTable::decode($response->body);
     }
 
-    // 兼容旧接口名：getBrokerRuntimeInfo
+    // Compatibility with the old interface name: getBrokerRuntimeInfo
     public function getBrokerRuntimeInfo(string $brokerAddr, ?int $timeoutMillis = null): KVTable
     {
         return $this->fetchBrokerRuntimeStats($brokerAddr, $timeoutMillis);
     }
 
     /**
-     * GET_BROKER_CONFIG：响应体是 **properties 文本**，不是 JSON/KVTable。
+     * GET_BROKER_CONFIG: the response body is **properties text**, not JSON/KVTable.
      *
-     * 历史实现的 bug：把 body 当 KVTable JSON 解析，真实 broker 上必然失败。
+     * A historical implementation bug: parsing the body as KVTable JSON, which necessarily
+     * fails on a real broker.
      *
      * @return array<string, string>
      */
@@ -768,7 +779,7 @@ class DefaultMQAdminExt
     }
 
     /**
-     * UPDATE_BROKER_CONFIG：body 为 properties 文本；下发前先校验 brokerPermission 取值合法。
+     * UPDATE_BROKER_CONFIG: body is properties text; validate the brokerPermission value before sending.
      *
      * @param array<string, string> $properties
      */
@@ -800,7 +811,7 @@ class DefaultMQAdminExt
         return (int) (($response->extFields['addTopicCount'] ?? 0) ?: 0);
     }
 
-    /** 逐 broker 下发 CLEAN_UNUSED_TOPIC，任一失败返回 false。 */
+    /** Send CLEAN_UNUSED_TOPIC broker by broker; returns false if any fails. */
     public function cleanUnusedTopic(?string $clusterName = null, ?string $topic = null): bool
     {
         $client = $this->requireClient();
@@ -829,15 +840,15 @@ class DefaultMQAdminExt
         return is_array($obj) ? $obj : [];
     }
 
-    // ---------------- NameServer KV 配置 ----------------
+    // ---------------- NameServer KV config ----------------
 
-    /** PUT_KV_CONFIG：广播到所有 NameServer。 */
+    /** PUT_KV_CONFIG: broadcast to all NameServers. */
     public function createAndUpdateKvConfig(string $namespace, string $key, string $value): void
     {
         $this->invokeNamesrvAll(RequestCode::PUT_KV_CONFIG, ['namespace' => $namespace, 'key' => $key, 'value' => $value]);
     }
 
-    // 兼容别名：真正的实现在 createAndUpdateKvConfig
+    // Compatibility alias: the real implementation is in createAndUpdateKvConfig
     public function putKvConfig(string $namespace, string $key, string $value): void
     {
         $this->createAndUpdateKvConfig($namespace, $key, $value);
@@ -866,22 +877,22 @@ class DefaultMQAdminExt
         return KVTable::decode($response->body);
     }
 
-    // ---------------- 订阅组管理 ----------------
+    // ---------------- Subscription group management ----------------
 
-    /** UPDATE_AND_CREATE_SUBSCRIPTIONGROUP：body 为 SubscriptionGroupConfig JSON。 */
+    /** UPDATE_AND_CREATE_SUBSCRIPTIONGROUP: body is SubscriptionGroupConfig JSON. */
     public function createAndUpdateSubscriptionGroupConfig(string $addr, SubscriptionGroupConfig $config): void
     {
         $this->invokeBroker($addr, RequestCode::UPDATE_AND_CREATE_SUBSCRIPTIONGROUP, body: $config->encode());
     }
 
-    /** 拉全部订阅组后取目标 group。 */
+    /** Pull all subscription groups, then take the target group. */
     public function examineSubscriptionGroupConfig(string $addr, string $group): ?SubscriptionGroupConfig
     {
         $wrapper = $this->getAllSubscriptionGroup($addr);
         return $wrapper->subscriptionGroupTable[$group] ?? null;
     }
 
-    /** GET_SUBSCRIPTIONGROUP_CONFIG：单组查询。 */
+    /** GET_SUBSCRIPTIONGROUP_CONFIG: single-group query. */
     public function getSubscriptionGroupConfig(string $addr, string $group): ?SubscriptionGroupConfig
     {
         $response = $this->invokeBroker($addr, RequestCode::GET_SUBSCRIPTIONGROUP_CONFIG, ['group' => $group]);
@@ -892,9 +903,9 @@ class DefaultMQAdminExt
     }
 
     /**
-     * GET_ALL_SUBSCRIPTIONGROUP_CONFIG 是**分页**接口：累积到 groupSeq >= totalGroupNum-1。
+     * GET_ALL_SUBSCRIPTIONGROUP_CONFIG is a **paged** API: accumulate until groupSeq >= totalGroupNum-1.
      *
-     * 老版本 broker 不带 totalGroupNum，此时一次性返回全部（单轮即结束）。
+     * Old brokers do not carry totalGroupNum, in which case everything is returned at once (ends in a single round).
      */
     public function getAllSubscriptionGroup(string $brokerAddr, ?int $timeoutMillis = null): SubscriptionGroupWrapper
     {
@@ -944,7 +955,7 @@ class DefaultMQAdminExt
 
             $totalRaw = $response->extFields['totalGroupNum'] ?? null;
             if ($totalRaw === null) {
-                // 老 broker：一次返回全部
+                // Old broker: returns everything at once
                 break;
             }
             $total = (int) $totalRaw;
@@ -990,7 +1001,7 @@ class DefaultMQAdminExt
         ]);
     }
 
-    // ---------------- 消费者 / 生产者连接 ----------------
+    // ---------------- Consumer / producer connections ----------------
 
     public function examineConsumerConnectionInfo(string $consumerGroup, ?string $brokerAddr = null): ConsumerConnection
     {
@@ -1043,7 +1054,7 @@ class DefaultMQAdminExt
         return $client->getConsumerListByGroup($consumerGroup, addr: $addr);
     }
 
-    // ---------------- 消费统计 ----------------
+    // ---------------- Consume stats ----------------
 
     public function examineConsumeStats(string $brokerAddr, string $consumerGroup, ?string $topic = null, ?array $topicList = null): ConsumeStats
     {
@@ -1076,7 +1087,7 @@ class DefaultMQAdminExt
     }
 
     /**
-     * broker 回的是 groupList，这里去重后回列表。
+     * The broker returns a groupList; it is deduplicated here before being returned as a list.
      *
      * @return list<string>
      */
@@ -1094,12 +1105,13 @@ class DefaultMQAdminExt
         return array_keys($groups);
     }
 
-    // ---------------- 消息轨迹 ----------------
+    // ---------------- Message tracking ----------------
 
     /**
-     * ``examineConsumeStats(group[, topic])``：按 ``%RETRY%<group>`` 的路由扇出全部 broker，
-     * 逐台取统计并合并（offsetTable 并入、consumeTps 累加）；
-     * 全空时抛 MQClientException。
+     * ``examineConsumeStats(group[, topic])``: fan out to all brokers per the
+     * ``%RETRY%<group>`` route, fetching and merging stats broker by broker
+     * (offsetTable merged in, consumeTps accumulated);
+     * throws MQClientException when everything is empty.
      */
     public function examineConsumeStatsGroup(string $consumerGroup, ?string $topic = null): ConsumeStats
     {
@@ -1120,8 +1132,8 @@ class DefaultMQAdminExt
     }
 
     /**
-     * 该组在本队列的 consumerOffset 是否已越过这条消息的 queueOffset
-     * （位点越过 ⇒ 已消费）。
+     * Whether the group's consumerOffset on this queue has already passed this message's
+     * queueOffset (offset passed => consumed).
      */
     public function consumed(MessageExt $msg, string $group): bool
     {
@@ -1133,7 +1145,7 @@ class DefaultMQAdminExt
                 $brokerAddrs = $ci->brokerAddrTable[$mq->brokerName] ?? null;
                 if ($brokerAddrs !== null) {
                     $addr = $brokerAddrs[MixAll::MASTER_ID] ?? null;
-                    // broker 地址注册时就是 ip:port 形态，直接和消息的 storeHost 比对。
+                    // Broker addresses are registered as ip:port, so compare directly with the message's storeHost.
                     if ($addr !== null && $storeHost !== null && $storeHost !== '' && $addr === $storeHost) {
                         if ($wrapper->consumerOffset > $msg->queueOffset) {
                             return true;
@@ -1146,7 +1158,7 @@ class DefaultMQAdminExt
     }
 
     /**
-     * 查谁在消费这个 topic，逐组判 CONSUMED / FILTERED / PULL / NOT_ONLINE / BROADCASTING…。
+     * Query who is consuming this topic, judging per group CONSUMED / FILTERED / PULL / NOT_ONLINE / BROADCASTING...
      *
      * @return list<MessageTrack>
      */
@@ -1165,7 +1177,7 @@ class DefaultMQAdminExt
             return $result;
         }
         $groups = $this->queryTopicConsumeByWho($brokerAddr, $msg->topic);
-        // broker 返回顺序不稳定，这里排序让输出确定
+        // The broker's return order is unstable; sort here to make the output deterministic
         $sorted = $groups;
         sort($sorted, SORT_STRING);
         foreach ($sorted as $group) {
@@ -1207,9 +1219,11 @@ class DefaultMQAdminExt
 
                 if ($ifConsumed) {
                     $mt->trackType = TrackType::CONSUMED;
-                    // 再查订阅表里本 topic 的 tagsSet：非空、既不含消息 tag 也不含
-                    // "*" ⇒ 订阅比消息窄，消息是被过滤掉的那部分（SQL92 订阅 tagsSet
-                    // 为空，同样落回 CONSUMED —— 既有判定口径，保持不变）。
+                    // Also check this topic's tagsSet in the subscription table: non-empty and containing
+                    // neither the message tag nor "*" => the subscription is narrower than the message,
+                    // so the message is the filtered-out part (SQL92 subscriptions have an empty
+                    // tagsSet and likewise fall back to CONSUMED -- the existing judgment
+                    // convention, kept unchanged).
                     $sub = $cc->subscriptionTable[$msg->topic] ?? null;
                     if (is_array($sub)) {
                         $tagsSet = array_map(strval(...), array_values((array) ($sub['tagsSet'] ?? [])));
@@ -1228,10 +1242,11 @@ class DefaultMQAdminExt
     }
 
     /**
-     * QUERY_TOPICS_BY_CONSUMER(343) 的单 broker 原始调用。
+     * The raw single-broker call of QUERY_TOPICS_BY_CONSUMER(343).
      *
-     * broker 端是从位点表（``topic@group`` 键）反查该组消费过哪些 topic。
-     * 所以组从没提交过位点时回空表，这是预期而不是 bug。
+     * The broker side reverse-looks-up which topics this group has consumed from the offset
+     * table (``topic@group`` keys). So an empty table is returned when the group has never
+     * committed offsets; this is expected, not a bug.
      */
     public function queryTopicsByConsumerToBroker(string $brokerAddr, string $group): TopicList
     {
@@ -1243,8 +1258,8 @@ class DefaultMQAdminExt
     }
 
     /**
-     * 先按 ``%RETRY%<group>`` 查路由，再对路由里每个 broker 下发 343 并合并。
-     * 协议的 topicList 是集合语义，这里去重后回列表。
+     * First query the route by ``%RETRY%<group>``, then send 343 to every broker in the route and merge.
+     * The protocol's topicList has set semantics; it is deduplicated here before being returned as a list.
      */
     public function queryTopicsByConsumer(string $group): TopicList
     {
@@ -1304,7 +1319,7 @@ class DefaultMQAdminExt
         ]);
     }
 
-    // ---------------- Offset 管理 ----------------
+    // ---------------- Offset management ----------------
 
     public function maxOffset(MessageQueue $mq): int
     {
@@ -1316,23 +1331,24 @@ class DefaultMQAdminExt
         return $this->requireClient()->getMinOffset($mq);
     }
 
-    /** SEARCH_OFFSET_BY_TIMESTAMP：显式下发 LOWER 边界。 */
+    /** SEARCH_OFFSET_BY_TIMESTAMP: explicitly send the LOWER boundary. */
     public function searchOffset(MessageQueue $mq, int $timestamp): int
     {
         return $this->requireClient()->searchOffsetByTimestamp($mq, $timestamp, boundaryType: BoundaryType::LOWER);
     }
 
-    /** 按时间戳找下界位点。 */
+    /** Find the lower-bound offset by timestamp. */
     public function searchLowerBoundaryOffset(MessageQueue $mq, int $timestamp): int
     {
         return $this->requireClient()->searchOffsetByTimestamp($mq, $timestamp, boundaryType: BoundaryType::LOWER);
     }
 
     /**
-     * SEARCH_OFFSET_BY_TIMESTAMP 的 UPPER 边界。
+     * The UPPER boundary of SEARCH_OFFSET_BY_TIMESTAMP.
      *
-     * 与 LOWER 的差异只在多条消息共享 storeTime、或时间戳落在空档/队尾时可见：
-     * 队尾之后 UPPER 回最后一条自己的位点，LOWER 回它的下一个位点（maxOffset）。
+     * The difference from LOWER is only visible when multiple messages share a storeTime,
+     * or when the timestamp falls in a gap / at the tail: past the tail, UPPER returns the
+     * last message's own offset, while LOWER returns its next offset (maxOffset).
      */
     public function searchUpperBoundaryOffset(MessageQueue $mq, int $timestamp): int
     {
@@ -1342,8 +1358,8 @@ class DefaultMQAdminExt
     public function earliestMsgStoreTime(MessageQueue $mq): int
     {
         $client = $this->requireClient();
-        // earliestMsgStoreTime 与 max/min/search 同一个形状：
-        // 只认 master，刷一次路由重查，仍拿不到抛「The broker[X] not exist」。
+        // earliestMsgStoreTime has the same shape as max/min/search:
+        // master only, refresh the route once and re-query; if still unavailable, throw "The broker[X] not exist".
         $addr = $this->publishAddrInAdmin($client, $mq);
         $response = $this->invokeBroker($addr, RequestCode::GET_EARLIEST_MSG_STORETIME, [
             'topic' => $mq->topic,
@@ -1369,18 +1385,21 @@ class DefaultMQAdminExt
     }
 
     /**
-     * 按时间戳重置位点。
+     * Reset offsets by timestamp.
      *
-     * 逐 broker 下发 INVOKE_BROKER_TO_RESET_OFFSET（broker 端按 timestamp 计算新位点，
-     * 并同步在线消费者 + 更新 offset 表），汇总 ``Map<MessageQueue, Long>``。
+     * Send INVOKE_BROKER_TO_RESET_OFFSET broker by broker (the broker side computes the new
+     * offset by timestamp, syncs online consumers + updates the offset table), aggregating
+     * ``Map<MessageQueue, Long>``.
      *
-     * ``is_cpp`` 只影响 broker 推给**在线消费者**的 220 报文形状：broker 按发起方
-     * （也就是本请求）的 language 判断，CPP 回 ``ResetOffsetBodyForC``（JSON 数组），
-     * 其余回 ``ResetOffsetBody``（对象即键的 map）。管理端按协议默认走后者，
-     * 本端口默认 ``false``。
+     * ``is_cpp`` only affects the shape of the 220 message the broker pushes to **online
+     * consumers**: the broker judges by the initiator's (i.e. this request's) language;
+     * CPP returns ``ResetOffsetBodyForC`` (JSON array), others return ``ResetOffsetBody``
+     * (object-as-key map). The admin side defaults to the latter per protocol;
+     * this port defaults to ``false``.
      *
-     * 注意：这里**不再**走「逐队列 searchOffset + updateConsumerOffset」的旧本地实现——
-     * 那不会同步在线消费者，也不会做 broker 端一致性校验。
+     * Note: this **no longer** uses the old local implementation of "per-queue searchOffset +
+     * updateConsumerOffset" -- that does not sync online consumers and does no
+     * broker-side consistency check.
      *
      * @return list<array{mq: MessageQueue, offset: int}>
      */
@@ -1413,11 +1432,12 @@ class DefaultMQAdminExt
     }
 
     /**
-     * 一笔 ``INVOKE_BROKER_TO_RESET_OFFSET``(222)，回 broker 实际重置的队列表。
+     * One ``INVOKE_BROKER_TO_RESET_OFFSET``(222), returning the queue list the broker actually reset.
      *
-     * 222 有两种用法：只带 timestamp + isForce 时按时间戳重置整个 topic；带
-     * ``queueId`` + ``offset`` 时只重置单个队列。``offset`` 为 null 时按协议写 ``-1``
-     * （broker 判成 null，转去按 timestamp 算位点）。
+     * 222 has two usages: with only timestamp + isForce it resets the whole topic by
+     * timestamp; with ``queueId`` + ``offset`` it resets a single queue. When ``offset``
+     * is null, write ``-1`` per protocol (the broker treats it as null and switches to
+     * computing the offset by timestamp).
      *
      * @return list<array{mq: MessageQueue, offset: int}>
      */
@@ -1437,13 +1457,14 @@ class DefaultMQAdminExt
             'topic' => $topic,
             'group' => $group,
             'timestamp' => (string) $timestamp,
-            // 键名是 **isForce** 不是 force：broker 侧按请求头字段名 isForce 取值。
-            // 写成 force 时 broker 的 isForce 恒为 false，重置分支退化成「取时间戳位点」，
-            // 前重（timestamp=-1）会把 consumerOffset 原样回显而不是跳到 maxOffset。
-            // 5.5.1 真机探针：{"force":"true", timestamp:-1} → 目标 3（=consumerOffset），
-            //               {"isForce":"true", timestamp:-1} → 目标 10（=maxOffset）。
+            // The key name is **isForce**, not force: the broker side reads the request header field named isForce.
+            // When written as force, the broker's isForce is always false and the reset branch degrades to
+            // "take the timestamp offset"; a rewind (timestamp=-1) echoes consumerOffset as-is
+            // instead of jumping to maxOffset.
+            // 5.5.1 live probe: {"force":"true", timestamp:-1} -> target 3 (=consumerOffset),
+            //               {"isForce":"true", timestamp:-1} -> target 10 (=maxOffset).
             'isForce' => $isForce ? 'true' : 'false',
-            // 协议里 offset=-1 表示 offset 为空
+            // offset=-1 in the protocol means offset is empty
             'offset' => (string) ($offset ?? -1),
         ];
         if ($queueId !== null) {
@@ -1469,23 +1490,26 @@ class DefaultMQAdminExt
     }
 
     /**
-     * 按队列重置位点。
+     * Reset offsets by queue.
      *
-     * 必须打**两笔** RPC，缺一不可：
-     * 1. ``updateConsumerOffset``(25) 直接把 offsetTable 改成目标位点；
-     * 2. 带 ``queueId`` + ``offset`` 的 222 走 broker 端的重置入口，
-     *    先按 ``[min, max+1]`` 校验目标位点（越界回 SYSTEM_ERROR
-     *    ``Target offset N not in consume queue range [min-max]``），再写入
-     *    broker 的 resetOffset 表——它同时写 ``resetOffsetTable``（一次性，
-     *    下次 pull 用 ``queryThenEraseResetOffset`` 取走）和 ``offsetTable``，并清掉该队列的
-     *    POP 在途计数。只做第 1 步的话在线消费者仍按自己内存里的位点继续拉。
+     * **Two** RPCs must be made, neither is optional:
+     * 1. ``updateConsumerOffset``(25) directly changes offsetTable to the target offset;
+     * 2. the 222 with ``queueId`` + ``offset`` goes through the broker's reset entry,
+     *    first validating the target offset by ``[min, max+1]`` (out-of-range returns SYSTEM_ERROR
+     *    ``Target offset N not in consume queue range [min-max]``), then writing to the
+     *    broker's resetOffset table -- which writes both ``resetOffsetTable`` (one-shot,
+     *    taken by the next pull via ``queryThenEraseResetOffset``) and ``offsetTable``, and clears
+     *    that queue's POP in-flight count. Doing only step 1 leaves online consumers
+     *    continuing to pull with their own in-memory offsets.
      *
-     * 协议返回值本身不含结果（只打日志），这里把 broker 报回的队列表返回，便于调用方核对。
+     * The protocol's return value itself carries no result (only logging); here the queue
+     * list the broker reports is returned for the caller to verify.
      *
-     * ⚠ 实测（5.5.1 真机）这两笔 RPC **不是原子的**：broker 的 commitOffset
-     * 只做覆盖写（连 offset 变小都只打 ``[NOTIFYME]`` warn，不做区间校验），所以第 2 笔
-     * 被以 ``Target offset N not in consume queue range [min-max]`` 拒绝时，
-     * 第 1 笔已经把非法位点落库。这里同样不做保护性回滚。
+     * WARNING: measured (5.5.1 live) these two RPCs are **not atomic**: the broker's commitOffset
+     * only does an overwrite write (even a shrinking offset only logs a ``[NOTIFYME]``
+     * warn, with no range check), so when the second RPC is rejected with
+     * ``Target offset N not in consume queue range [min-max]``,
+     * the first RPC has already persisted the illegal offset. No protective rollback is done here either.
      *
      * @return list<array{mq: MessageQueue, offset: int}>
      */
@@ -1497,7 +1521,7 @@ class DefaultMQAdminExt
             new MessageQueue($topic, '', $queueId),
             $resetOffset,
         );
-        // 单队列重置不带 force（默认 false）、timestamp 传 0（offset 已给定，不参与算）
+        // Single-queue reset carries no force (default false) and passes timestamp 0 (offset is already given, not used in computation)
         return $this->invokeBrokerResetOffset(
             $brokerAddr,
             $topic,
@@ -1510,7 +1534,7 @@ class DefaultMQAdminExt
         );
     }
 
-    /** 先试新版（broker 端重置），消费者不在线时退化到旧版本地实现。 */
+    /** Try the new version first (broker-side reset); degrade to the old local implementation when the consumer is not online. */
     public function resetOffsetNew(string $consumerGroup, string $topic, int $timestamp): void
     {
         try {
@@ -1525,7 +1549,7 @@ class DefaultMQAdminExt
     }
 
     /**
-     * 旧版按时间戳重置：逐队列 searchOffset 后按 force 决策写回（不通知在线消费者）。
+     * Old-style reset by timestamp: searchOffset per queue, then write back per the force decision (does not notify online consumers).
      *
      * @return list<array{mq: MessageQueue, offset: int}>
      */
@@ -1567,7 +1591,7 @@ class DefaultMQAdminExt
     }
 
     /**
-     * dict.update 语义合并 ResetOffset 形态的 offset 表（同键后值覆盖前值）。
+     * Merge a ResetOffset-shaped offset table with dict.update semantics (same key: later value overwrites earlier).
      *
      * @param list<array{mq: MessageQueue, offset: int}> $dst
      * @param list<array{mq: MessageQueue, offset: int}> $src
@@ -1584,11 +1608,11 @@ class DefaultMQAdminExt
         $dst = array_values($byKey);
     }
 
-    /** admin 的 offset 查询口径：只打主，主没了就报错。 */
+    /** Admin's offset query convention: master only; report an error when the master is gone. */
     private function publishAddrInAdmin(MQClientInstance $client, MessageQueue $mq): string
     {
-        // MQClientInstance 里对应实现是私有的（publishAddrInAdmin），这里按同口径组装：
-        // 查发布地址（只认 master）→ 刷一次路由 → 重查 → 仍拿不到抛「The broker[X] not exist」。
+        // The corresponding implementation in MQClientInstance is private (publishAddrInAdmin); assembled here with the same convention:
+        // look up the publish address (master only) -> refresh the route once -> re-query -> if still unavailable, throw "The broker[X] not exist".
         $addr = $client->findBrokerAddressInPublish($mq->brokerName);
         if ($addr === null || $addr === '') {
             $client->updateTopicRouteInfoFromNameServer($mq->topic);
@@ -1600,9 +1624,9 @@ class DefaultMQAdminExt
         return $addr;
     }
 
-    // ---------------- 消息查询 ----------------
+    // ---------------- Message query ----------------
 
-    /** 按 KEYS 查消息：查所有 broker + 客户端侧 key 二次校验。 */
+    /** Query messages by KEYS: query all brokers + client-side secondary key validation. */
     public function queryMessage(string $topic, string $key, int $maxNum, int $begin, int $end): array
     {
         return $this->requireClient()->queryMessageAllBrokers(
@@ -1617,10 +1641,11 @@ class DefaultMQAdminExt
     }
 
     /**
-     * 按 uniqKey 查消息：indexType="U" + extFields["_UNIQUE_KEY_QUERY"]="true"。
+     * Query messages by uniqKey: indexType="U" + extFields["_UNIQUE_KEY_QUERY"]="true".
      *
-     * 注意：broker 侧 uniqKey 索引只有 RocksDB 索引实现支持（IndexRocksDBStore）；
-     * 默认的文件索引下该查询可能返回空，这属于 broker 配置差异而非客户端问题。
+     * Note: the broker-side uniqKey index is only supported by the RocksDB index
+     * implementation (IndexRocksDBStore); under the default file index this query may
+     * return empty, which is a broker configuration difference rather than a client issue.
      */
     public function queryMessageByUniqKey(string $topic, string $uniqKey): ?MessageExt
     {
@@ -1636,7 +1661,7 @@ class DefaultMQAdminExt
         return $messages[0] ?? null;
     }
 
-    /** 按普通 KEYS 索引查询（对应工具 queryMsgByKey 的 NORMAL 模式）。
+    /** Query by the normal KEYS index (corresponds to the NORMAL mode of the queryMsgByKey tool).
      *
      * @return list<MessageExt>
      */
@@ -1654,13 +1679,14 @@ class DefaultMQAdminExt
     }
 
     /**
-     * 查看单条消息。
+     * View a single message.
      *
-     * 先按 offsetMsgId 解出 broker 地址 + commitLog 偏移走 VIEW_MESSAGE_BY_ID，
-     * **任何**失败都退回按 UNIQ_KEY 查索引。必须留这条兜底：5.x 客户端的 msgId 是
-     * 客户端生成的 uniqKey，同样是 32 位十六进制，硬解会拼出一个不存在的 ip:port
-     * （端口超出 16 位就不是合法的 offsetMsgId，这里校验后走兜底，
-     * 不把异常抛到调用方手里破掉异常契约）。
+     * First decode the broker address + commitLog offset from offsetMsgId and go through
+     * VIEW_MESSAGE_BY_ID, falling back to the UNIQ_KEY index on **any** failure. This
+     * fallback must be kept: a 5.x client's msgId is a client-generated uniqKey, also 32
+     * hex digits, so hard-decoding would assemble a nonexistent ip:port
+     * (a port beyond 16 bits is not a valid offsetMsgId; it is validated here and the
+     * fallback is taken, without throwing the exception to the caller and breaking the exception contract).
      */
     public function viewMessage(string $topic, string $msgId): MessageExt
     {
@@ -1685,7 +1711,7 @@ class DefaultMQAdminExt
                 $byIdError = new MQBrokerException(ResponseCode::NO_MESSAGE, sprintf('message not found: %s', $msgId));
             }
         } catch (\Throwable $e) {
-            // 只记下错误，走 uniqKey 兜底
+            // Only record the error and take the uniqKey fallback
             $byIdError = $e;
         }
 
@@ -1855,7 +1881,7 @@ class DefaultMQAdminExt
         $this->putKvConfig(self::NAMESPACE_ORDER_TOPIC_CONFIG, $key, implode(';', array_values($entries)));
     }
 
-    // ---------------- 运维清理类 ----------------
+    // ---------------- Operational cleanup ----------------
 
     public function cleanExpiredConsumerQueue(string $brokerAddr, int $timeHours): void
     {
@@ -1919,7 +1945,7 @@ class DefaultMQAdminExt
         return $spans;
     }
 
-    // ---------------- NameServer 配置（318/319） ----------------
+    // ---------------- NameServer config (318/319) ----------------
 
     public function updateNameServerConfig(array $properties, ?int $timeoutMillis = null): void
     {
@@ -1989,7 +2015,7 @@ class DefaultMQAdminExt
         $this->invokeBroker($brokerAddr, RequestCode::SET_MESSAGE_REQUEST_MODE, body: json_encode($body));
     }
 
-    // ---------------------------------------------------------------- 辅助
+    // ---------------------------------------------------------------- Helpers
 
     public static function permIsValid(int|string|null $value): bool
     {

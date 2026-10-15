@@ -17,7 +17,7 @@ ADDR_B = "127.0.0.1:10912"
 GROUP_RETRY = MixAll.get_retry_topic(GROUP)
 
 
-# ------------------------------------------------------------------ 测试替身
+# ------------------------------------------------------------------ Test doubles
 
 def _ok(body: bytes = b"") -> RemotingCommand:
     r = RemotingCommand()
@@ -34,7 +34,7 @@ def _err(code: int, remark: str) -> RemotingCommand:
 
 
 class _FakeClient:
-    """只替掉 admin 用到的三个入口：同步调用、写位点、查路由。"""
+    """Only replaces the three entry points used by admin: synchronous call, offset write, and route lookup."""
 
     def __init__(self, responses, route=None):
         self._responses = list(responses)
@@ -61,7 +61,7 @@ class _FakeClient:
         return self.route
 
     def _check_response(self, response):
-        """与 `MQClientInstance._check_response:524` 同语义：非 SUCCESS 抛 MQBrokerException。"""
+        """Same semantics as `MQClientInstance._check_response:524`: raise MQBrokerException on non-SUCCESS."""
         if response.code == ResponseCode.SUCCESS:
             return response
         raise MQBrokerException(response.code, response.remark or "")
@@ -69,7 +69,7 @@ class _FakeClient:
 
 def _admin(client: _FakeClient) -> DefaultMQAdminExt:
     admin = DefaultMQAdminExt()
-    # 不起线程、不连集群：只把 client 塞进去，让被测方法走到协议编码那一层
+    # No threads, no cluster connection: just inject the client so the method under test reaches the protocol encoding layer
     admin._mq_client = client
     admin._started = True
     return admin
@@ -88,20 +88,20 @@ def _reset_body(mq: MessageQueue, offset: int) -> bytes:
     return body.encode()
 
 
-# ------------------------------------------------------------------ 222 编码
+# ------------------------------------------------------------------ 222 encoding
 
 def test_reset_offset_by_queue_id_sends_update_then_222_with_queue_id():
     pass
     target_mq = MessageQueue(TOPIC, "", 3)
-    # 第 1 笔(25)在 client.update_consumer_offset 这一层被替身吃掉，队列里只剩 222 的响应
+    # The first call (25) is swallowed by the double at the client.update_consumer_offset layer; only the 222 response remains in the queue
     client = _FakeClient([_ok(_reset_body(MessageQueue(TOPIC, "broker-a", 3), 7))])
     admin = _admin(client)
 
     result = admin.reset_offset_by_queue_id(ADDR_A, GROUP, TOPIC, 3, 7)
 
-    # 第 1 笔：25 由 MQClientInstance 发出，且必须显式打在给定 broker 上
+    # First call: 25 is issued by MQClientInstance and must be sent explicitly to the given broker
     assert client.offset_updates == [(GROUP, target_mq, 7, ADDR_A)]
-    # 第 2 笔：222
+    # Second call: 222
     assert len(client.requests) == 1
     addr, request = client.requests[0]
     assert addr == ADDR_A
@@ -134,13 +134,13 @@ def test_reset_offset_by_timestamp_omits_queue_id_and_keeps_map_body_language():
     assert request.language == LanguageCode.PYTHON
     assert request.language != LanguageCode.CPP
     assert offsets and list(offsets.values()) == [9]
-    # 路由按业务 topic 查（LMQ/wheel_timer 才换成 clusterName）
+    # The route is looked up by the business topic (LMQ/wheel_timer use clusterName instead)
     assert client.route_lookups == [TOPIC]
 
 
 def test_reset_offset_by_timestamp_can_opt_into_the_cpp_body():
-    """``is_cpp=True`` 仍要把 language 覆盖成 CPP（纯 C++ 消费组才需要 ForC 数组体）；
-    这是对上面「默认不覆盖」的负向对照，防止哪天顺手把开关删了。"""
+    """``is_cpp=True`` still overrides language to CPP (only pure C++ consumer groups need the ForC array body);
+    this is a negative control against the "default no-override" behavior above, preventing the switch from being casually removed someday."""
     client = _FakeClient([_ok(_reset_body(MessageQueue(TOPIC, "broker-a", 0), 9))],
                          route=_route(("broker-a", ADDR_A)))
     admin = _admin(client)
@@ -152,9 +152,9 @@ def test_reset_offset_by_timestamp_can_opt_into_the_cpp_body():
 
 
 def test_reset_offset_by_queue_id_propagates_broker_remark():
-    """越界位点由 broker 的 `resetOffsetInner` 拒绝（真机 remark：
-    `Target offset 102 not in consume queue range [0-2]`）；必须原样带上 code+remark，
-    而不是吞成"重置成功但空表"。
+    """Out-of-range offsets are rejected by the broker's `resetOffsetInner` (real-machine remark:
+    `Target offset 102 not in consume queue range [0-2]`); the code+remark must be carried through as-is,
+    instead of being swallowed into "reset succeeded but empty table".
     """
     client = _FakeClient([
         _err(ResponseCode.SYSTEM_ERROR, "Target offset 102 not in consume queue range [0-2]"),
@@ -217,7 +217,7 @@ def test_query_topics_by_consumer_routes_by_retry_topic_and_dedupes():
 
 
 def test_query_topics_by_consumer_returns_empty_topic_list_when_group_has_no_offset():
-    """broker 的 `whichTopicByConsumer` 读位点表：没提交过位点的组回空表而不是报错。"""
+    """The broker's `whichTopicByConsumer` reads the offset table: a group that never committed offsets returns an empty list instead of an error."""
     client = _FakeClient([_ok(_topic_list_body([]))], route=_route(("broker-a", ADDR_A)))
     admin = _admin(client)
 

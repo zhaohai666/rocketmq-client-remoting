@@ -1,42 +1,42 @@
-//! 管理与统计类报文模型：
+//! Admin and statistics payload models:
 //! `TopicStatsTable` / `TopicOffset` / `ConsumeStats` / `OffsetWrapper` /
-//! `TopicConfigSerializeWrapper` / `ConsumeQueueData` / `QueryConsumeQueueResponseBody`。
+//! `TopicConfigSerializeWrapper` / `ConsumeQueueData` / `QueryConsumeQueueResponseBody`.
 //!
-//! ## 关键坑：MessageQueue 做 map 键
+//! ## Key pitfall: MessageQueue as a map key
 //!
 //!
 //! ```text
 //! {"offsetTable":{{"brokerName":"broker-a","queueId":3,"topic":"MyTopic"}:{...}}}
 //! ```
 //!
-//! 因此这里不能把键当普通字符串：写出时用 [`message_queue_key`]（键按字母序，与
-//! fastjson2 一致），读回时用 [`parse_message_queue_key`] /
-//! [`decode_message_queue_map`]，并依赖 `serialize::fastjson` 的容忍解析。
+//! So keys must not be treated as plain strings here: on write use [`message_queue_key`] (keys in
+//! alphabetical order, matching fastjson2), on read use [`parse_message_queue_key`] /
+//! [`decode_message_queue_map`], and rely on the tolerant parsing of `serialize::fastjson`.
 //!
-//! ## 为什么这里有 `MessageQueueKey` 而不是 `crate::common::MessageQueue`
+//! ## Why `MessageQueueKey` here instead of `crate::common::MessageQueue`
 //!
-//! 协议层必须能脱离 common 层独立编译（本层不引用 common），
-//! 所以在本层声明一个最小可比较的键类型；上层可以直接 `From` 转换。
+//! The protocol layer must compile independently of the common layer (this layer does not reference common),
+//! so a minimal comparable key type is declared in this layer; upper layers can convert via `From` directly.
 //!
-//! 本模块同时导出 `j*` 系列 JSON 取值工具，供 `route` / `body` / `heartbeat` /
-//! `subscription` 复用。
+//! This module also exports the `j*` family of JSON access helpers, reused by `route` / `body` /
+//! `heartbeat` / `subscription`.
 
 use serde_json::{Map, Value};
 
 use super::serialize::{fastjson, RemotingSerializable};
 use crate::error::{Error, Result};
 
-// ---------------------------------------------------------------- 通用 JSON 取值工具
+// ---------------------------------------------------------------- generic JSON access helpers
 //
-// JSON 取值的宽松转换语义：
-// 缺键回默认值，数字写成字符串也能读，脏数据回默认值而不是 panic。
+// Lenient conversion semantics for JSON access:
+// a missing key falls back to the default, numbers written as strings still parse, and dirty data falls back to the default instead of panicking.
 
-/// 取原始字段（不存在或显式 `null` 都返回 `None`）。
+/// Gets the raw field (returns `None` for both missing and explicit `null`).
 pub fn jfield<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
     value.get(key).filter(|v| !v.is_null())
 }
 
-/// 字符串字段：缺失 / null 返回 `None`。
+/// String field: returns `None` when missing / null.
 pub fn jstring(value: &Value, key: &str) -> Option<String> {
     match jfield(value, key)? {
         Value::String(s) => Some(s.clone()),
@@ -44,17 +44,17 @@ pub fn jstring(value: &Value, key: &str) -> Option<String> {
     }
 }
 
-/// 字符串字段，带默认值（对应 `d.get(k, "")`）。
+/// String field with a default (equivalent to `d.get(k, "")`).
 pub fn jstring_or(value: &Value, key: &str, default: &str) -> String {
     jstring(value, key).unwrap_or_else(|| default.to_string())
 }
 
-/// `int` 字段：接受数字、数字字符串、布尔（fastjson2 的历史输出）。
+/// `int` field: accepts numbers, numeric strings, and booleans (fastjson2's historical output).
 pub fn jint(value: &Value, key: &str, default: i32) -> i32 {
     jlong(value, key, default as i64) as i32
 }
 
-/// `long` 字段。
+/// `long` field.
 pub fn jlong(value: &Value, key: &str, default: i64) -> i64 {
     match jfield(value, key) {
         Some(Value::Number(n)) => n
@@ -69,7 +69,7 @@ pub fn jlong(value: &Value, key: &str, default: i64) -> i64 {
     }
 }
 
-/// `double` / TPS 字段。
+/// `double` / TPS field.
 pub fn jdouble(value: &Value, key: &str, default: f64) -> f64 {
     match jfield(value, key) {
         Some(Value::Number(n)) => n.as_f64().unwrap_or(default),
@@ -78,7 +78,7 @@ pub fn jdouble(value: &Value, key: &str, default: f64) -> f64 {
     }
 }
 
-/// 布尔字段（对应 `d.get(k, default)`；只认真正的 `true` / `"true"`）。
+/// Boolean field (equivalent to `d.get(k, default)`; only a real `true` / `"true"` counts).
 pub fn jboolean(value: &Value, key: &str, default: bool) -> bool {
     match jfield(value, key) {
         Some(Value::Bool(b)) => *b,
@@ -97,9 +97,9 @@ pub fn jboolean(value: &Value, key: &str, default: bool) -> bool {
     }
 }
 
-/// 对象字段的 (key, value) 列表，保持 JSON 里的顺序；缺失或 null 回空表。
+/// (key, value) list of an object field, preserving the order in the JSON; missing or null yields an empty list.
 ///
-/// 非对象（且非 null）说明报文形状不对，返回 `Err(Decode)`。
+/// A non-object (and non-null) means the payload shape is wrong, returning `Err(Decode)`.
 pub fn jentries<'a>(value: &'a Value, key: &str) -> Result<Vec<(&'a String, &'a Value)>> {
     match jfield(value, key) {
         None => Ok(Vec::new()),
@@ -108,7 +108,7 @@ pub fn jentries<'a>(value: &'a Value, key: &str) -> Result<Vec<(&'a String, &'a 
     }
 }
 
-/// 数组字段的元素列表；缺失或 null 回空表。
+/// Element list of an array field; missing or null yields an empty list.
 pub fn jarray<'a>(value: &'a Value, key: &str) -> Result<Vec<&'a Value>> {
     match jfield(value, key) {
         None => Ok(Vec::new()),
@@ -117,7 +117,7 @@ pub fn jarray<'a>(value: &'a Value, key: &str) -> Result<Vec<&'a Value>> {
     }
 }
 
-/// 顶层必须是对象；`null` / 非对象都算脏数据。
+/// The top level must be an object; `null` / non-object both count as dirty data.
 pub fn expect_object(value: &Value, what: &str) -> Result<()> {
     if value.is_object() {
         Ok(())
@@ -129,7 +129,7 @@ pub fn expect_object(value: &Value, what: &str) -> Result<()> {
     }
 }
 
-/// 原样透传的 map 字段（缺失或 `null` 时给 `{}`）。
+/// Pass-through map field (gives `{}` when missing or `null`).
 pub fn jraw_map(value: &Value, key: &str) -> Value {
     match jfield(value, key) {
         Some(Value::Object(map)) => Value::Object(map.clone()),
@@ -137,7 +137,7 @@ pub fn jraw_map(value: &Value, key: &str) -> Value {
     }
 }
 
-/// 错误信息里截断打印脏数据，避免把整个 broker 响应塞进日志。
+/// Truncates dirty data when printing in error messages, so an entire broker response is not dumped into logs.
 fn compact(value: &Value) -> String {
     let text = value.to_string();
     if text.len() > 120 {
@@ -147,7 +147,7 @@ fn compact(value: &Value) -> String {
     }
 }
 
-/// 按插入顺序构造 JSON 对象（`Map` 开了 `preserve_order`）。
+/// Builds a JSON object in insertion order (`Map` compiled with `preserve_order`).
 pub fn json_object(pairs: Vec<(&'static str, Value)>) -> Value {
     let mut map = Map::new();
     for (k, v) in pairs {
@@ -160,9 +160,9 @@ fn number_or_null(v: i64) -> Value {
     Value::from(v)
 }
 
-// ---------------------------------------------------------------- MessageQueue 键
+// ---------------------------------------------------------------- MessageQueue keys
 
-/// `MessageQueue` 在本层的最小形态：只用作 map 键与路由产物。
+/// Minimal form of `MessageQueue` in this layer: used only as a map key and a routing artifact.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MessageQueueKey {
     pub topic: String,
@@ -179,12 +179,12 @@ impl MessageQueueKey {
         }
     }
 
-    /// 内联对象键文本（等价于 [`message_queue_key`]）。
+    /// Inline object key text (equivalent to [`message_queue_key`]).
     pub fn key_string(&self) -> String {
         message_queue_key(self)
     }
 
-    /// 从 fastjson2 内联对象 `Value` 还原；不是对象返回 `None`。
+    /// Restores from a fastjson2 inline object `Value`; returns `None` if it is not an object.
     pub fn from_value(value: &Value) -> Option<MessageQueueKey> {
         if !value.is_object() {
             return None;
@@ -197,7 +197,7 @@ impl MessageQueueKey {
     }
 }
 
-/// 把 `MessageQueue` 序列化成 fastjson2 风格的内联对象键（键按字母序）。
+/// Serializes a `MessageQueue` into a fastjson2-style inline object key (keys in alphabetical order).
 pub fn message_queue_key(mq: &MessageQueueKey) -> String {
     format!(
         "{{\"brokerName\":{},\"queueId\":{},\"topic\":{}}}",
@@ -211,17 +211,17 @@ fn json_text(s: &str) -> String {
     Value::String(s.to_string()).to_string()
 }
 
-/// 把 fastjson2 写出的 MessageQueue 内联对象键还原成 [`MessageQueueKey`]。
+/// Restores a MessageQueue inline object key written by fastjson2 into a [`MessageQueueKey`].
 ///
-/// 返回 `None` 表示这不是内联对象键（例如 `"0"`、`"G1"` 这类普通字符串键）。
+/// A `None` return means this is not an inline object key (e.g. plain string keys like `"0"`, `"G1"`).
 pub fn parse_message_queue_key(key: &str) -> Option<MessageQueueKey> {
     let value = fastjson::decode_map_key(key)?;
     MessageQueueKey::from_value(&value)
 }
 
-/// 通用：解析以 MessageQueue 为键的 map（fastjson2 非字符串键），保持报文顺序。
+/// Generic: parses a map keyed by MessageQueue (fastjson2 non-string keys), preserving payload order.
 ///
-/// 非内联对象键（报文里形状不对的那几项）直接跳过。
+/// Non-inline-object keys (the malformed entries in the payload) are skipped outright.
 pub fn decode_message_queue_map<T, F>(raw: Option<&Value>, parse: F) -> Result<Vec<(MessageQueueKey, T)>>
 where
     F: Fn(&Value) -> Result<T>,
@@ -242,7 +242,7 @@ where
     Ok(out)
 }
 
-/// 把 MessageQueue 键的表写回 fastjson2 内联对象键形式。
+/// Writes a MessageQueue-keyed table back into fastjson2 inline object key form.
 pub fn encode_message_queue_map<T, F>(table: &[(MessageQueueKey, T)], value_of: F) -> Value
 where
     F: Fn(&T) -> Value,
@@ -337,7 +337,7 @@ impl TopicStatsTable {
         TopicStatsTable::from_json_value(&RemotingSerializable::decode(data)?)
     }
 
-    /// 所有队列 `maxOffset` 之和（admin 工具常用）。
+    /// Sum of `maxOffset` over all queues (commonly used by admin tools).
     pub fn total_max_offset(&self) -> i64 {
         self.offset_table.iter().map(|(_, o)| o.max_offset).sum()
     }
@@ -586,7 +586,7 @@ impl QueryConsumeQueueResponseBody {
                 for item in items {
                     list.push(ConsumeQueueData::from_json_value(item)?);
                 }
-                // 空数组等价于 None：没有条目就不给 Some(空表)。
+                // An empty array is equivalent to None: no entries means no Some(empty list).
                 Some(list)
             }
         };
@@ -622,7 +622,7 @@ mod tests {
         r#""topicPutTps":0.0}"#
     );
 
-    /// 线上记录的 ConsumeStats 应答报文。
+    /// A ConsumeStats response payload captured from the wire.
     pub const WIRE_CONSUME_STATS: &str = concat!(
         r#"{"consumeTps":1.5,"offsetTable":{{"brokerName":"broker-a","queueId":3,"topic":"MyTopic"}:"#,
         r#"{"brokerOffset":100,"consumerOffset":90,"lastTimestamp":1700000000000,"pullOffset":0}}}"#
@@ -640,7 +640,7 @@ mod tests {
 
     #[test]
     fn plain_string_map_keys_are_not_message_queues() {
-        // 普通字符串键（"0" / "G1"）不是消息队列键，一律判 false
+        // Plain string keys ("0" / "G1") are not message-queue keys; always false
         assert!(parse_message_queue_key("0").is_none());
         assert!(parse_message_queue_key("G1").is_none());
         assert!(parse_message_queue_key("").is_none());
@@ -660,7 +660,7 @@ mod tests {
         assert_eq!(offset.last_update_timestamp, 1700000000000);
         assert_eq!(table.topic_put_tps, 0.0);
         assert_eq!(table.total_max_offset(), 500);
-        // 重新编码后键文本仍然逐字节一致（broker 侧按文本比对位点表）。
+        // After re-encoding the key text is still byte-for-byte identical (the broker compares offset tables as text).
         let again = TopicStatsTable::from_json_value(&table.to_json_value()).unwrap();
         assert_eq!(again.offset_table[0].0, *mq);
     }
@@ -679,7 +679,7 @@ mod tests {
 
     #[test]
     fn two_entry_offset_table_keeps_report_order() {
-        // 两队列的报文夹具：totalMaxOffset 应为 8 + 2 = 10
+        // Two-queue payload fixture: totalMaxOffset should be 8 + 2 = 10
         let text = concat!(
             r#"{"offsetTable":{{"brokerName":"broker-a","queueId":0,"topic":"T"}:"#,
             r#"{"minOffset":0,"maxOffset":8,"lastUpdateTimestamp":1789374000000},"#,
@@ -707,7 +707,7 @@ mod tests {
 
     #[test]
     fn reset_style_long_value_map_decodes() {
-        // admin_body 的通用键解码也被 body.rs 的 ResetOffsetBody 复用
+        // The generic key decoding in admin_body is also reused by ResetOffsetBody in body.rs
         let value: Value = fastjson::from_str(
             r#"{"offsetTable":{{"brokerName":"b","queueId":0,"topic":"T"}:10,{"brokerName":"b","queueId":1,"topic":"T"}:20}}"#,
         )
@@ -736,7 +736,7 @@ mod tests {
 
     #[test]
     fn consume_queue_data_omits_null_optionals() {
-        // 探针：{"bitMap":null,"eval":false,"physicOffset":0,"physicSize":100,"tagsCode":0}
+        // Probe: {"bitMap":null,"eval":false,"physicOffset":0,"physicSize":100,"tagsCode":0}
         let d = ConsumeQueueData {
             physic_offset: 0,
             physic_size: 100,

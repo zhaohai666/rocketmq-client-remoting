@@ -1,4 +1,4 @@
-// Admin/管理侧 wire beans: TopicConfig, the subscription-group models and the
+// Admin/admin-side wire beans: TopicConfig, the subscription-group models and the
 // response bodies of the DefaultMQAdminExt surface.
 //
 // Field names were captured from a live 5.5.1 server's serialized responses.

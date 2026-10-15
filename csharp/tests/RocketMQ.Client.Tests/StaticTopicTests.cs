@@ -1,6 +1,7 @@
-// 静态主题路由测试（覆盖五类用例）：
-// mock broker 名推导、类型化映射解析缺省值、端点推导（未承载队列哨兵 / scope
-// 不合并 / epoch 围栏）、以及 GetBrokerNameFromMessageQueue 的重写/透传。
+// Static topic route tests (covering five kinds of case):
+// deriving the mock broker name, the typed mapping's default values, endpoint derivation
+// (the not-serving-queues sentinel / scope not merged / the epoch fence), and the
+// rewrite/pass-through of GetBrokerNameFromMessageQueue.
 using System.Globalization;
 using RocketMQ.Common;
 using RocketMQ.Remoting.Protocol;
@@ -89,7 +90,7 @@ public class StaticTopicTests
 
         Assert.Equal("__syslo__none__",
             endpoints[new MessageQueue("StaticTopic", "__syslo__global__", 3)]);
-        // 空映射（非静态主题）返回 false。
+        // an empty mapping (not a static topic) returns false.
         Assert.False(StaticTopic.TopicRouteData2EndpointsForStaticTopic("T", new TopicRouteData(),
             new Dictionary<MessageQueue, string>()));
     }
@@ -123,7 +124,7 @@ public class StaticTopicTests
             new MessageQueue("StaticTopic", "__syslo__global__", 0)));
         Assert.Equal("broker-b", inst.GetBrokerNameFromMessageQueue(
             new MessageQueue("StaticTopic", "__syslo__global__", 1)));
-        // 表里没有的队列 / 非静态主题原样透传自己的 broker 名。
+        // a queue that is not in the table / a non-static topic passes its own broker name through as is.
         Assert.Equal("__syslo__global__", inst.GetBrokerNameFromMessageQueue(
             new MessageQueue("StaticTopic", "__syslo__global__", 99)));
         Assert.Equal("broker-a", inst.GetBrokerNameFromMessageQueue(

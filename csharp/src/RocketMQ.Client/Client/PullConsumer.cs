@@ -1,8 +1,9 @@
-// 与 push 消费者（DefaultMQPushConsumer）的区别：**由调用方自己拉、自己管位点**。
-// 没有后台拉取线程、没有 rebalance、没有消费监听器；只有：
+// The difference from a push consumer (DefaultMQPushConsumer): **the caller does the
+// pulling and manages the offsets itself**. There is no background pulling thread, no
+// rebalance and no consume listener; only:
 //   FetchSubscribeMessageQueues / Pull / PullAsync / PullBlockIfNotFound /
 //   FetchConsumeOffset / UpdateConsumeOffset / SearchOffset / MaxOffset / MinOffset /
-//   EarliestMsgStoreTime / SendMessageBack / CreateTopic。
+//   EarliestMsgStoreTime / SendMessageBack / CreateTopic.
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -65,7 +66,7 @@ public sealed class DefaultMQPullConsumer
         _consumerGroup = consumerGroup;
     }
 
-    // ---------------- 配置 ----------------
+    // ---------------- Configuration ----------------
     public void SetNamesrvAddr(string addr) => SetNameServerAddresses(SplitSemicolon(addr));
 
     public void SetNameServerAddresses(IEnumerable<string> addrs)
@@ -150,7 +151,8 @@ public sealed class DefaultMQPullConsumer
         set => _socksProxyConfig = value;
     }
 
-    /// <summary>是否周期性发心跳（对齐 push 消费者的开关；启动时那一轮不受影响）。</summary>
+    /// <summary>Whether to send heartbeats periodically (mirrors the push consumer's
+    /// switch; the round at startup is not affected).</summary>
     public bool HeartbeatEnabled
     {
         get => _heartbeatEnabled;
@@ -163,11 +165,13 @@ public sealed class DefaultMQPullConsumer
         set => _heartbeatBrokerIntervalMillis = value;
     }
 
-    /// <summary>心跳成功轮数（真机验证用）。</summary>
+    /// <summary>Number of successful heartbeat rounds (for verification on a real
+    /// machine).</summary>
     public long HeartbeatCount => Interlocked.Read(ref _heartbeatCount);
 
-    // ---------------- ACL 鉴权 ----------------
-    /// <summary>必须在 Start() 之前调用：钩子在 Start() 里绑定到 MqClient。</summary>
+    // ---------------- ACL authentication ----------------
+    /// <summary>Must be called before Start(): the hook is bound to the MqClient inside
+    /// Start().</summary>
     public void SetRpcHook(IRpcHook hook) => _rpcHook = hook;
 
     public void SetCredentials(string accessKey, string secretKey, string securityToken = "") =>
@@ -181,7 +185,7 @@ public sealed class DefaultMQPullConsumer
 
     public bool IsStarted => _started;
 
-    // ---------------- 生命周期 ----------------
+    // ---------------- Lifecycle ----------------
     public void Start()
     {
         lock (_lock)
@@ -239,7 +243,8 @@ public sealed class DefaultMQPullConsumer
             }
             catch
             {
-                // 起不来就把引用还回去：否则计数漏减，共享实例永远等不到归零收尾
+                // Hand the reference back if startup fails: otherwise the count is never
+                // decremented and a shared instance never reaches zero to finish up
                 MQClientManager.Instance.UnregisterMQClient(_clientId, _mqClient);
                 _mqClient = null;
                 throw;
@@ -289,15 +294,19 @@ public sealed class DefaultMQPullConsumer
         }
     }
 
-    // ---------------- 心跳（把消费组注册给 broker） ----------------
+    // ---------------- Heartbeat (registers the consumer group with the broker) ----------------
     /// <summary>
-    /// 为什么拉模式也必须心跳：broker 的 <c>ConsumerManager.consumerTable</c> 是按台的，
-    /// 只有心跳（或带订阅标志的拉取）才会建表。没有心跳时 203 consumerConnection /
-    /// 38 GET_CONSUMER_LIST_BY_GROUP 都看不到本组，isRejectPullConsumerEnabled=true 的
-    /// broker 会给本组每次拉取都回 "the pull consumer is rejected by server"
-    /// （PullMessageProcessor:493-505）。而 ClientManageProcessor:87-92 **跳过** ACTIVELY
-    /// 类型心跳的订阅注册 —— 拉模式靠自带订阅标志的拉取走补偿分支（:397-412），
-    /// 所以缺心跳的失效是静默的：拉取照样成功，只是 broker 侧完全不知道本组存在。
+    /// Why pull mode must heartbeat too: the broker's
+    /// <c>ConsumerManager.consumerTable</c> is per-instance, and the table is only created
+    /// by a heartbeat (or by a pull carrying the subscription flag). Without a heartbeat,
+    /// neither 203 consumerConnection nor 38 GET_CONSUMER_LIST_BY_GROUP shows this group,
+    /// and a broker with isRejectPullConsumerEnabled=true answers every pull of this
+    /// group with "the pull consumer is rejected by server"
+    /// (PullMessageProcessor:493-505). And ClientManageProcessor:87-92 **skips** the
+    /// subscription registration of ACTIVELY-type heartbeats -- pull mode relies on the
+    /// compensating branch taken by a pull that carries the subscription flag
+    /// (:397-412), so the failure caused by a missing heartbeat is silent: pulling still
+    /// succeeds, the broker simply has no idea this group exists.
     /// </summary>
     private void RefreshRouteForHeartbeat()
     {
@@ -401,7 +410,8 @@ public sealed class DefaultMQPullConsumer
     {
         while (!_heartbeatStop)
         {
-            // 停机时由 Shutdown() 置位，最多等一个周期（分片睡，别一次睡满 30s）
+            // Shutdown() sets it; at most one cycle is waited out (sleep in slices, never
+            // one full 30s sleep)
             for (int slept = 0; slept < _heartbeatBrokerIntervalMillis && !_heartbeatStop; slept += 100)
             {
                 Thread.Sleep(Math.Min(100, _heartbeatBrokerIntervalMillis - slept));
@@ -412,8 +422,9 @@ public sealed class DefaultMQPullConsumer
                 continue;
             }
 
-            // 常驻循环的边界：这里逃出的异常会杀掉心跳线程（后续心跳全没了），必须接住；
-            // 逐台失败已在 SendHeartbeatToAllBroker 内部处理。
+            // The boundary of the resident loop: an exception escaping here would kill the
+            // heartbeat thread (no more heartbeats at all), so it must be caught;
+            // per-broker failures are already handled inside SendHeartbeatToAllBroker.
             try
             {
                 SendHeartbeatToAllBroker();
@@ -498,7 +509,8 @@ public sealed class DefaultMQPullConsumer
         return DedupeQueues(outList);
     }
 
-    /// <summary>订阅信息口径的全部队列（读位、不筛 master），按 house 排序口径返回。</summary>
+    /// <summary>All queues as seen by the subscription info (offset reads, master not
+    /// filtered), returned in the house ordering.</summary>
     private static List<MessageQueue> SubscribeQueuesOfTopic(MQClientInstance c, string realTopic)
     {
         TopicRouteData? route = c.GetTopicRouteData(realTopic);
@@ -527,7 +539,8 @@ public sealed class DefaultMQPullConsumer
         }
     }
 
-    /// <summary>按 (topic, brokerName, queueId) 去重；入参必须已排序，重复项必相邻。</summary>
+    /// <summary>Deduplicates by (topic, brokerName, queueId); the input must already be
+    /// sorted so duplicates are adjacent.</summary>
     private static List<MessageQueue> DedupeQueues(List<MessageQueue> sorted)
     {
         var outList = new List<MessageQueue>(sorted.Count);
@@ -587,7 +600,7 @@ public sealed class DefaultMQPullConsumer
         IPullCallback callback, int timeoutMillis = -1)
     {
         ArgumentNullException.ThrowIfNull(callback);
-        _ = RequireClient(); // 未启动：同步抛，语义与同步 Pull 对齐（线程池里再抛就太晚了）
+        _ = RequireClient(); // not started: throws synchronously, matching the synchronous Pull (throwing from the thread pool would be far too late)
         _ = Task.Run(() =>
         {
             PullResult result;
@@ -620,8 +633,9 @@ public sealed class DefaultMQPullConsumer
         });
     }
 
-    /// <summary>按 (topic, brokerName, queueId) 定位队列的重载（免拼 MessageQueue；语义与
-    /// <see cref="PullAsync(MessageQueue,string,long,int,IPullCallback,int)"/> 完全一致）。</summary>
+    /// <summary>The overload that locates the queue by (topic, brokerName, queueId) (no
+    /// need to assemble a MessageQueue; the semantics are exactly those of
+    /// <see cref="PullAsync(MessageQueue,string,long,int,IPullCallback,int)"/>).</summary>
     public void PullAsync(string topic, string subExpression, string brokerName, int queueId,
         long offset, int maxNums, IPullCallback callback, int timeoutMillis = -1) =>
         PullAsync(new MessageQueue(topic, brokerName, queueId), subExpression, offset, maxNums,
@@ -643,8 +657,9 @@ public sealed class DefaultMQPullConsumer
         }
     }
 
-    // ---------------- 位点管理 ----------------
-    /// <summary>返回 false 表示该消费组在该队列上尚无位点（broker 回 QUERY_NOT_FOUND）。</summary>
+    // ---------------- Offset management ----------------
+    /// <summary>false means this consumer group has no offset on that queue yet (the
+    /// broker replies QUERY_NOT_FOUND).</summary>
     public bool FetchConsumeOffset(MessageQueue mq, out long outOffset) =>
         RequireClient().QueryConsumerOffset(_consumerGroup, mq, out outOffset);
 
@@ -699,12 +714,12 @@ public sealed class DefaultMQPullConsumer
     public void CreateTopic(string key, string newTopic, int queueNum = 4)
     {
         MQClientInstance c = RequireClient();
-        // C# 的 CreateTopicInRoute 忽略 key 形参，统一走默认 topic（MixAll.DefaultTopic）建路由
+        // C#'s CreateTopicInRoute ignores the key argument and always creates the route with the default topic (MixAll.DefaultTopic)
         _ = key;
         c.CreateTopicInRoute(NamespaceUtil.WrapNamespace(_namespace, newTopic), queueNum, queueNum, 6);
     }
 
-    // ---------------- 内部工具 ----------------
+    // ---------------- Internal utilities ----------------
     private MQClientInstance RequireClient()
     {
         MQClientInstance? c = _mqClient;
@@ -719,7 +734,7 @@ public sealed class DefaultMQPullConsumer
     private MessageQueue WrapMq(MessageQueue mq)
     {
         string topic = NamespaceUtil.WrapNamespace(_namespace, mq.Topic);
-        // 未配置命名空间时直接复用原对象，省一次分配（零开销路径）。
+        // Reuse the original object when no namespace is configured, saving one allocation (the zero-overhead path).
         return topic == mq.Topic ? mq : new MessageQueue(topic, mq.BrokerName, mq.QueueId);
     }
 

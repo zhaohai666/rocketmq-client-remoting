@@ -119,7 +119,7 @@ class BrokerData:
         return "BrokerData [brokerName=%s, brokerAddrs=%s]" % (self.broker_name, self.broker_addrs)
 
 
-Long = int  # 协议里的 long（64 位整型）别名，便于阅读
+Long = int  # an alias for the protocol's long (64-bit integer), for readability
 
 
 class TopicRouteData:
@@ -131,23 +131,29 @@ class TopicRouteData:
         self.topic_queue_mapping_by_broker: Optional[Dict[str, dict]] = None
 
     def get_broker_datas(self) -> List["BrokerData"]:
-        """返回 broker 数据列表。"""
+        """Return the broker data list."""
         return self.broker_datas
 
     def get_all_message_queue(self, topic: str = "") -> List["MessageQueue"]:
-        """根据 queueDatas + brokerDatas 组装全部可写 MessageQueue。
+        """Assemble every writable MessageQueue from queueDatas + brokerDatas.
 
-        topic 用于回填到每个 MessageQueue（必须用真实 topic，而不是空串），否则后续
-        send/pull 用 mq.topic 回查路由时会查不到。
+        topic is filled back into each MessageQueue (it must be the real topic, not an
+        empty string), otherwise the later send/pull lookups that use mq.topic to find
+        the route again would find nothing.
 
-        两条跳过条件：
-        路由里查不到同名 broker，**或者**该 broker 的 brokerAddrs 里没有 ``MASTER_ID``。
-        后者不是冗余判断：从节点自己也会注册进 namesrv，且默认配置下它照样带写位
-        （namesrv 侧只在「prime slave 且 enableActingMaster」时才抹掉
-        WRITE）——master 一旦掉线，路由里同一个 brokerName 就只剩 brokerId=1，写位还在。
-        漏判这条，生产者会挑中这台队列并把消息发到从节点上，而从节点对发送请求是
-        ``rejectRequest``（``SendMessageProcessor:131`` ⇒ SYSTEM_BUSY，还是个可重试码），
-        于是白烧一轮超时；这种队列本就不该进发布信息，发送应直接当无路由处理。
+        There are two skip conditions: no broker of the same name is found in the
+        route, **or** the broker's brokerAddrs does not contain ``MASTER_ID``.
+        The second one is not a redundant check: a slave node registers itself into
+        namesrv as well, and with the default configuration it still carries the write
+        permission (the namesrv side only strips WRITE when the slave is "prime" and
+        enableActingMaster is set) -- once the master goes down, the same brokerName in
+        the route only has brokerId=1 left, write permission included. Missing this
+        check means the producer picks that queue and sends the message to the slave,
+        while the slave rejects send requests with
+        ``rejectRequest`` (``SendMessageProcessor:131`` => SYSTEM_BUSY, still a
+        retriable code), wasting a whole timeout round; such a queue should never enter
+        the publish info in the first place, and the send should be treated as having
+        no route at all.
         """
         mqs: List["MessageQueue"] = []
         for qd in self.queue_datas:
@@ -167,12 +173,15 @@ class TopicRouteData:
         return mqs
 
     def get_all_subscribe_message_queue(self, topic: str = "") -> List["MessageQueue"]:
-        """按 queueDatas 组装全部**可读** MessageQueue。
+        """Assemble every **readable** MessageQueue from queueDatas.
 
-        与 :meth:`get_all_message_queue`（发布侧）有两处刻意的不同，都是路由语义：
-        ①只看**读**位与 ``readQueueNums``（perm=4 的只读 topic 照样能被消费）；
-        ②**不要求 broker 有 master** —— 主挂掉后从节点仍要能被拉取，客户端侧
-        订阅寻址正是为此才带从节点回退。只有发布信息需要 master。
+        It differs from :meth:`get_all_message_queue` (the publish side) in two
+        deliberate ways, both of which are route semantics:
+        (1) only the **read** permission and ``readQueueNums`` are considered (a
+        read-only topic with perm=4 can still be consumed);
+        (2) the broker is **not required to have a master** -- after the master dies
+        the slave must still be pullable, which is exactly why client-side subscription
+        addressing carries the slave fallback. Only the publish info needs a master.
         """
         mqs: List["MessageQueue"] = []
         for qd in self.queue_datas:

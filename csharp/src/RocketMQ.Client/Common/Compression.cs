@@ -18,7 +18,7 @@ public static class CompressionType
                 return LZ4;
             case 2:
                 return ZSTD;
-            case 0: // 兼容老版本：没有类型位的压缩消息按 ZLIB 处理
+            case 0: // Compatibility with old versions: compressed messages without a type bit are treated as ZLIB
             case 3:
                 return ZLIB;
             default:
@@ -46,12 +46,12 @@ public static class CompressionType
 
 public static class CompressorFactory
 {
-    // 当前构建是否编入了 zlib 支持（C# 内置 ZLibStream，恒为 true）。
+    // Whether the current build includes zlib support (C# has built-in ZLibStream, always true).
     public static bool HasZlibSupport() => true;
 
     /// <summary>
-    /// 当前进程能否用 LZ4（取决于能否加载到带 LZ4F 导出的 liblz4）。
-    /// 探测结果会缓存，调用很便宜。
+    /// Whether the current process can use LZ4 (depends on whether liblz4 with LZ4F exports can be loaded).
+    /// The probe result is cached, so calling it is cheap.
     /// </summary>
     public static bool HasLz4Support()
     {
@@ -59,7 +59,7 @@ public static class CompressorFactory
         return NativeLz4Codec.IsAvailable;
     }
 
-    /// <summary>当前进程能否用 ZSTD（取决于能否加载到 libzstd）。探测结果缓存。</summary>
+    /// <summary>Whether the current process can use ZSTD (depends on whether libzstd can be loaded). Probe result is cached.</summary>
     public static bool HasZstdSupport()
     {
         NativeCompressionLibrary.EnsureProbed();
@@ -112,7 +112,7 @@ public static class CompressorFactory
         }
     }
 
-    // 关键：不能原样返回。返回压缩字节会被上层当作正文，属静默数据损坏。
+    // Critical: must not return as-is. Returning compressed bytes would make the upper layer treat them as the body, which is silent data corruption.
     private static InvalidOperationException Unsupported(string what, int type) =>
         new("unsupported compression type for " + what + ": " + type.ToString(CultureInfo.InvariantCulture));
 

@@ -3,28 +3,31 @@
 declare(strict_types=1);
 
 /**
- * RunRemoting SOCKS 代理用例的子进程：在一个进程里同时扮演
- *   1) 目标 echo 服务（连接后原样回显字节，父进程用 RocketMQ 帧做请求/响应断言）
- *   2) 假 SOCKS 代理（按 $argv[1] 的模式做最小握手 + CONNECT，成功后把两条流对接）
+ * Child process for the RunRemoting SOCKS proxy cases: a single process playing two roles,
+ *   1) the target echo service (echoes bytes verbatim after connect; the parent asserts
+ *      requests/responses with RocketMQ frames)
+ *   2) a fake SOCKS proxy (minimal handshake + CONNECT per the $argv[1] mode; on success it
+ *      splices the two streams together)
  *
- * 启动后先向 stdout 打一行 ``READY <proxyPort> <targetPort>`` 再进入服务循环；
- * 父进程读这行拿端口。父进程关闭客户端连接 → 隧道结束 → 本进程自然退出；
- * 测试失败路径由父进程 proc_terminate 兜底。
+ * On startup it first prints one line ``READY <proxyPort> <targetPort>`` to stdout, then enters
+ * the service loop; the parent reads that line to get the ports. When the parent closes the
+ * client connection -> the tunnel ends -> this process exits naturally; failure paths are backed
+ * up by the parent's proc_terminate.
  *
- * 模式：
- *   socks5_ok            SOCKS5 无认证
- *   socks5_auth          SOCKS5 用户名/密码子协商（期望 user/pass 来自 $argv[2]/[3]）
- *   socks5_reject_auth   子协商返回失败状态（0x01）
- *   socks5_reject_connect 方法协商通过、CONNECT 回 REP=0x01（general failure）
- *   socks4_ok            SOCKS4（无 userid 校验）
- *   socks4_reject        CONNECT 回 CD=91
+ * Modes:
+ *   socks5_ok            SOCKS5 without authentication
+ *   socks5_auth          SOCKS5 username/password sub-negotiation (expects user/pass from $argv[2]/[3])
+ *   socks5_reject_auth   the sub-negotiation returns a failure status (0x01)
+ *   socks5_reject_connect method negotiation passes, CONNECT replies REP=0x01 (general failure)
+ *   socks4_ok            SOCKS4 (no userid validation)
+ *   socks4_reject        CONNECT replies CD=91
  */
 
 $mode = $argv[1] ?? '';
 $user = $argv[2] ?? '';
 $pass = $argv[3] ?? '';
 
-// ---- 两个监听先就位，端口报给父进程 ----
+// ---- Both listeners in place first, then report the ports to the parent ----
 $target = stream_socket_server('tcp://127.0.0.1:0', $errno, $errstr);
 if ($target === false) {
     fwrite(STDERR, "target listen failed: $errstr\n");
@@ -40,7 +43,7 @@ $pName = (string)stream_socket_get_name($proxy, false);
 fwrite(STDOUT, sprintf("READY %d %d\n", (int)substr($pName, strrpos($pName, ':') + 1), (int)substr($tName, strrpos($tName, ':') + 1)));
 fflush(STDOUT);
 
-// ---- 阻塞读 n 字节（本地环回、父进程就在隔壁，无需超时兜底） ----
+// ---- Blocking read of n bytes (local loopback, the parent is right next door; no timeout backstop needed) ----
 function sockReadExact($conn, int $need): string
 {
     $buf = '';
@@ -48,7 +51,7 @@ function sockReadExact($conn, int $need): string
         $chunk = fread($conn, $need - strlen($buf));
         if ($chunk === false || $chunk === '') {
             if (feof($conn)) {
-                exit(3); // 客户端提前断开
+                exit(3); // client disconnected early
             }
             continue;
         }
@@ -58,9 +61,11 @@ function sockReadExact($conn, int $need): string
 }
 
 /**
- * 隧道数据面：pConn(客户端↔代理) ↔ tConn(代理拨向目标的连接) ↔ srv(目标 echo 服务侧)。
- * 三条流一起 select：pConn → tConn，tConn → pConn，srv 回显到 srv。
- * 注意非阻塞流 fread 返回 ''/false 只是暂时无数据，以 feof 定夺真 EOF（Windows 同款怪癖）。
+ * Tunnel data plane: pConn (client<->proxy) <-> tConn (proxy dials the target) <-> srv (the
+ * target echo service side). All three streams are selected together: pConn -> tConn,
+ * tConn -> pConn, srv echoes to srv.
+ * Note that on non-blocking streams fread returning ''/false only means "no data for now"; feof
+ * decides a real EOF (the same quirk as on Windows).
  */
 function tunnelEcho($pConn, $tConn, $targetServer): void
 {
@@ -95,7 +100,7 @@ function tunnelEcho($pConn, $tConn, $targetServer): void
     }
 }
 
-// ---- 接一个代理连接并按模式握手 ----
+// ---- Accept one proxy connection and shake hands per the mode ----
 $pConn = @stream_socket_accept($proxy, 30);
 if ($pConn === false) {
     fwrite(STDERR, "proxy accept timeout\n");
@@ -108,17 +113,18 @@ switch ($mode) {
     case 'socks5_auth':
     case 'socks5_reject_auth':
     case 'socks5_reject_connect':
-        // 1) 方法协商
+        // 1) Method negotiation
         $head = unpack('Cver/Cn', sockReadExact($pConn, 2));
         if ($head['ver'] !== 5) {
             exit(5);
         }
         sockReadExact($pConn, $head['n']);
         if ($mode === 'socks5_ok' || $mode === 'socks5_reject_connect') {
-            // reject_connect 也走无认证 greeting：卡点在 CONNECT 的 REP，不在方法协商
+            // reject_connect also uses the no-auth greeting: the sticking point is CONNECT's REP,
+            // not the method negotiation
             fwrite($pConn, "\x05\x00");
         } else {
-            // 其余三个模式都要求走用户名/密码子协商
+            // The other three modes all require the username/password sub-negotiation
             fwrite($pConn, "\x05\x02");
             $aVer = unpack('Cver/Culen', sockReadExact($pConn, 2));
             $aUser = sockReadExact($pConn, $aVer['ulen']);
@@ -126,7 +132,7 @@ switch ($mode) {
             $aPass = sockReadExact($pConn, $aPassLen['plen']);
             if ($mode === 'socks5_reject_auth' || $aUser !== $user || $aPass !== $pass) {
                 fwrite($pConn, "\x01\x01");
-                exit(0); // 认证失败，父进程应在客户端侧看到握手异常
+                exit(0); // auth failed; the parent should see a handshake exception on the client side
             }
             fwrite($pConn, "\x01\x00");
         }
@@ -147,7 +153,7 @@ switch ($mode) {
             fwrite($pConn, "\x05\x01\x00\x01" . str_repeat("\x00", 6));
             exit(0);
         }
-        // 3) 连目标，回成功，开始对拷
+        // 3) Connect to the target, reply success, start the byte-for-byte copy
         $tConn = @stream_socket_client(sprintf('tcp://127.0.0.1:%d', $dstPort), $errno, $errstr, 5);
         if ($tConn === false) {
             fwrite($pConn, "\x05\x05\x00\x01" . str_repeat("\x00", 6)); // connection refused
@@ -162,7 +168,7 @@ switch ($mode) {
     case 'socks4_ok':
     case 'socks4_reject':
         $req = unpack('Cver/Ccmd/nport/Nip', sockReadExact($pConn, 8));
-        // userid 读到 0x00 结尾（本端口测试不带 userid）
+        // userid reads until 0x00 (this port's tests carry no userid)
         while (true) {
             $c = sockReadExact($pConn, 1);
             if ($c === "\x00") {

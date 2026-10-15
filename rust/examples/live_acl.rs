@@ -1,35 +1,44 @@
-//! ACL 鉴权对**真实 5.5.1 broker** 的联调验证（覆盖 S1..S8，其中 S8 是拉模式签名链路）。
+//! Integration verification of ACL authentication against a **real 5.5.1 broker**
+//! (covers S1..S8, where S8 is the pull-mode signature chain).
 //!
 //!
-//! 断言的都是「签名真的被 broker 认/不认」，而不是本地编解码：
-//! - S1 带凭据的实例建 topic 成功（管理路径签名被接受）。
-//! - S2 **不带凭据**建 topic → broker 回 NO_PERMISSION(16)。
-//! - S3 **secretKey 写错**的生产者发送 → 16。签名算错和没签名在 broker 侧同一种拒绝，
-//!   所以这条同时反证「签名内容参与校验」而不是「只要带了 AccessKey 就放行」。
-//! - S4 带凭据的生产者发 3 条全 SEND_OK，且 msgId 由 broker 赋值（非空即证签名请求被采纳）。
-//! - S5 带凭据的 push 消费者收满 3 条 —— 心跳 / 长轮询拉取 / 位点提交三条 RPC 全程带签名，
-//!   任一漏签都收不到消息。
-//! - S6 **不带凭据**的原始 broker RPC（GET_CONSUMER_LIST_BY_GROUP）→ 16。
-//!   注意必须走显式给 addr 的 [`get_consumer_list_by_group`]，不能用
-//!   [`get_consumer_id_list_by_group`]：后者把异常吞掉回 `None`，
-//!   「被拒」和「成功」在调用方看来一模一样。
-//! - S7 不带凭据查 **NameServer** 路由仍成功 —— 鉴权只在 broker 侧，
-//!   反证钩子没把 namesrv 路径打坏。
-//! - S8 带凭据的 pull 消费者：`fetch_subscribe_message_queues` / `pull` /
-//!   `update_consume_offset` / `fetch_consume_offset` 四条签名 RPC 闭环。
-//!   拉模式的位点 RPC 用的是另一套请求码，这里单独补上。
-//! - S9 清理：带凭据删掉本次建的 topic。
+//! Every assertion checks whether the broker really accepts/rejects the signature,
+//! not local encoding/decoding:
+//! - S1: an instance carrying credentials creates the topic successfully (the admin path signature is accepted).
+//! - S2: creating the topic **without credentials** → the broker replies NO_PERMISSION(16).
+//! - S3: send from a producer whose **secretKey is wrong** → 16. A mis-computed signature and no
+//!   signature at all are rejected the same way on the broker side, so this case also proves the
+//!   reverse: that the signature *content* participates in validation rather than "any request that
+//!   carries an AccessKey is let through".
+//! - S4: a producer with credentials sends 3 messages, all SEND_OK, and the msgIds are assigned by
+//!   the broker (non-empty msgId proves the signed request was adopted).
+//! - S5: a push consumer with credentials receives all 3 messages —— the heartbeat / long-polling
+//!   pull / offset commit RPCs all carry the signature end to end; a missing signature on any one of
+//!   them means no message arrives.
+//! - S6: a raw broker RPC **without credentials** (GET_CONSUMER_LIST_BY_GROUP) → 16.
+//!   Note it must go through [`get_consumer_list_by_group`] with an explicit addr, not
+//!   [`get_consumer_id_list_by_group`]: the latter swallows the exception and returns `None`,
+//!   which makes "rejected" and "succeeded" look identical to the caller.
+//! - S7: querying **NameServer** routes without credentials still succeeds —— authentication only
+//!   happens on the broker side, which proves the hook did not break the namesrv path.
+//! - S8: a pull consumer with credentials: the four signed RPCs `fetch_subscribe_message_queues` /
+//!   `pull` / `update_consume_offset` / `fetch_consume_offset` close the loop.
+//!   Pull-mode offset RPCs use a different request code, so they are covered separately here.
+//! - S9 cleanup: delete the topic created this round, with credentials.
 //!
-//! ⚠ S4/S5 必须**先起消费者再发送**：push 消费者默认
-//! `CONSUME_FROM_LAST_OFFSET` 会把新消费组的初始位点解析成该队列**当时的** maxOffset，
-//! 而 broker 的 consumequeue 是异步分发的，「先发再收」的结果并不稳定。
-//! 这里既先起消费者、又显式用 `CONSUME_FROM_FIRST_OFFSET`，两道保险都留着。
+//! ⚠ S4/S5 must **start the consumer before sending**: a push consumer defaults to
+//! `CONSUME_FROM_LAST_OFFSET`, which resolves the initial offset of a brand-new consumer group to the
+//! queue's maxOffset **at that moment**, and the broker's consumequeue is dispatched asynchronously,
+//! so "send first, receive later" is not deterministic.
+//! Here we both start the consumer first *and* explicitly use `CONSUME_FROM_FIRST_OFFSET`, keeping
+//! both safeguards.
 //!
-//! ⚠ 每个角色都用自己的 `instance_name`（→ 独立 clientId → 独立 [`MQClientInstance`]
-//! → 独立 remoting 通道）。凭据是**注册到通道上**的，两个角色若复用同一实例，
-//! 「无凭据被拒」会被另一个角色的签名带过去而变成假 PASS。
+//! ⚠ Every role uses its own `instance_name` (→ its own clientId → its own [`MQClientInstance`]
+//! → its own remoting channel). Credentials are **registered on the channel**, so if two roles share
+//! one instance, "rejected without credentials" would be carried through by the other role's
+//! signature and turn into a false PASS.
 //!
-//! 用法：
+//! Usage:
 //! ```text
 //! cargo run --example live_acl -- 127.0.0.1:9876 [accessKey] [secretKey]
 //! ```
@@ -60,12 +69,12 @@ use rocketmq_client_remoting::remoting::protocol::heartbeat::ConsumeFromWhere;
 use rocketmq_client_remoting::remoting::protocol::route::TopicRouteData;
 use rocketmq_client_remoting::remoting::rpchook::{AclClientRPCHook, RPCHook, SessionCredentials};
 
-/// 建出来的 topic 队列数（默认 4）。
+/// Number of queues for the created topic (4 by default).
 const QUEUE_NUMS: i32 = 4;
-/// S4 发送条数。
+/// How many messages S4 sends.
 const N_MSG: usize = 3;
 const NO_PERMISSION: i32 = 16;
-/// 等 push 消费者收满的窗口。
+/// How long we wait for the push consumer to receive everything.
 const RECV_WAIT: Duration = Duration::from_secs(30);
 
 fn stamp() -> String {
@@ -75,7 +84,8 @@ fn stamp() -> String {
     }
 }
 
-/// 断言累积器：跑完所有场景再汇总，首个失败不提前退出。
+/// Assertion accumulator: run all scenarios first and then summarize; the first failure does not
+/// exit early.
 struct Checker {
     passed: u32,
     failed: Vec<String>,
@@ -102,15 +112,18 @@ impl Checker {
     }
 }
 
-/// 锁中毒时照常取内值（一次 panic 不该让整轮验证连锁崩）。
+/// Read the inner value even when the lock is poisoned (one panic should not bring down the whole
+/// verification run).
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 拒绝类断言：必须是 broker 回的 NO_PERMISSION，不能是连不上/超时。
+/// Rejection assertion: it must be a NO_PERMISSION returned by the broker, not an
+/// unreachable/timeout.
 ///
-/// 「拿不到 16」和「拿到 16 但理由是别的」都得算失败 —— 没签名时如果 broker 被配成
-/// 不鉴权，正向场景照样全绿，只有反向场景能戳穿这种假通过。
+/// Both "no 16 at all" and "a 16 for some other reason" count as failures —— if the broker happens
+/// to be configured without authentication, all the positive scenarios still pass green; only the
+/// negative scenarios can expose that false pass.
 fn denied(err: &Error) -> bool {
     err.response_code() == Some(NO_PERMISSION)
 }
@@ -162,7 +175,7 @@ impl MessageListenerConcurrently for AclListener {
     }
 }
 
-// ------------------------------------------------------------------ 夹具
+// ------------------------------------------------------------------ fixtures
 
 struct Fixture {
     namesrv: String,
@@ -173,7 +186,8 @@ struct Fixture {
     group: String,
     broker_name: String,
     broker_addr: String,
-    /// 只用来定位 broker 地址的无凭据实例（S6/S7 的反向与兼容场景都复用它）。
+    /// A credential-free instance used only to locate a broker address (reused by both the
+    /// negative and the compatibility scenarios S6/S7).
     probe: MQClientInstance,
 }
 
@@ -202,7 +216,8 @@ impl Fixture {
             .start()
             .await
             .map_err(|e| format!("probe start failed: {e}"))?;
-        // 路由查询不经鉴权（S7 就是这么证的），所以拿 TBW102 的路由就能定位一台 broker。
+        // Route lookup is not authenticated (that is exactly what S7 proves), so the route of
+        // TBW102 is enough to locate a broker.
         let route = self
             .probe
             .get_topic_route_data(MixAll::DEFAULT_TOPIC)
@@ -218,11 +233,12 @@ impl Fixture {
         format!("live-acl-{kind}-{}", self.stamp)
     }
 
-    /// 起一个**带凭据**的裸实例（当作 admin 用：建/删 topic）。
+    /// Start a bare **credential-carrying** instance (used as the admin: create/delete topic).
     ///
-    /// Rust 的 admin 层还没移植，
-    /// 而 producer 内部做的正是「建实例 → 把钩子注册到 remoting 通道」，
-    /// 这里直接照那两步做，语义等价。
+    /// The Rust admin layer has not been ported yet,
+    /// and what a producer does internally is precisely "create the instance → register the hook
+    /// on the remoting channel",
+    /// so we do those two steps directly here, which is semantically equivalent.
     async fn signed_admin(&self, kind: &str) -> Result<MQClientInstance, String> {
         let instance = MQClientInstance::new(
             &format!("rust-live-acl-{kind}-{}", self.stamp),
@@ -238,8 +254,9 @@ impl Fixture {
         Ok(instance)
     }
 
-    /// 带凭据建 topic（不靠 `autoCreateTopicEnable`：开了鉴权之后匿名客户端连不上 broker，
-    /// 靠默认 topic 兜底也拿不到确定队列数）。
+    /// Create a topic with credentials (not relying on `autoCreateTopicEnable`: once authentication
+    /// is on, anonymous clients cannot connect to the broker, and falling back to the default topic
+    /// yields no deterministic queue count either).
     async fn create_topic(&self, admin: &MQClientInstance, topic: &str) -> Result<(), String> {
         admin
             .create_topic_in_broker(
@@ -260,7 +277,7 @@ impl Fixture {
             .map_err(|e| format!("create topic {topic} failed ({e}): {}", code_of(&e)))
     }
 
-    /// 带凭据的生产者（`sk` 传空串表示用夹具给的 secretKey）。
+    /// A producer with credentials (an empty `sk` means "use the secretKey held by the fixture").
     fn producer(&self, kind: &str, secret_key: Option<&str>) -> Result<DefaultMQProducer, String> {
         let sk = secret_key.unwrap_or(&self.secret_key);
         let producer = DefaultMQProducer::with_rpc_hook(
@@ -300,29 +317,30 @@ fn broker_of(route: &TopicRouteData) -> Result<(String, String), String> {
 
 // ------------------------------------------------------------------ S1/S2 admin
 
-/// S1 带凭据建 topic 成功；S2 不带凭据建 topic 被拒。
+/// S1: creating the topic with credentials succeeds; S2: creating it without credentials is
+/// rejected.
 async fn s1_s2_admin(ck: &mut Checker, fx: &Fixture, denied_topic: &str) -> bool {
-    println!("\nS1/S2 admin 建 topic：带凭据 vs 不带凭据");
+    println!("\nS1/S2 admin create topic: with credentials vs without credentials");
     let admin = match fx.signed_admin("admin").await {
         Ok(admin) => admin,
         Err(e) => {
-            ck.abort("S1 带凭据实例启动", &e);
+            ck.abort("S1 start instance with credentials", &e);
             return false;
         }
     };
     let created = match fx.create_topic(&admin, &fx.topic).await {
         Ok(()) => {
-            ck.check("S1 带凭据建 topic 成功", true, "");
+            ck.check("S1 create topic with credentials succeeded", true, "");
             true
         }
         Err(e) => {
-            ck.abort("S1 带凭据建 topic", &e);
+            ck.abort("S1 create topic with credentials", &e);
             false
         }
     };
     admin.shutdown();
 
-    // S2：同一个 RPC、同一台 broker，只是没注册钩子。
+    // S2: the very same RPC against the very same broker, just without registering the hook.
     match fx
         .probe
         .create_topic_in_broker(
@@ -342,12 +360,12 @@ async fn s1_s2_admin(ck: &mut Checker, fx: &Fixture, denied_topic: &str) -> bool
         .await
     {
         Ok(()) => ck.check(
-            "S2 无凭据建 topic 被 broker 拒绝",
+            "S2 create topic without credentials rejected by broker",
             false,
-            "broker 竟然接受了匿名请求（多半是 authenticationEnabled 没开）",
+            "the broker accepted an anonymous request (most likely authenticationEnabled is off)",
         ),
         Err(e) => ck.check(
-            "S2 无凭据建 topic 被 broker 拒绝",
+            "S2 create topic without credentials rejected by broker",
             denied(&e),
             &format!("{} {e}", code_of(&e)),
         ),
@@ -355,14 +373,14 @@ async fn s1_s2_admin(ck: &mut Checker, fx: &Fixture, denied_topic: &str) -> bool
     created
 }
 
-// ------------------------------------------------------------------ S3 错误 secretKey
+// ------------------------------------------------------------------ S3 wrong secretKey
 
 async fn s3_bad_secret(ck: &mut Checker, fx: &Fixture) {
-    println!("\nS3 错误 secretKey 的生产者必须被拒");
+    println!("\nS3 a producer with a wrong secretKey must be rejected");
     let producer = match fx.producer("badsk", Some("WRONG_SECRET_KEY")) {
         Ok(p) => p,
         Err(e) => {
-            ck.abort("S3 构造", &e);
+            ck.abort("S3 build", &e);
             return;
         }
     };
@@ -371,21 +389,22 @@ async fn s3_bad_secret(ck: &mut Checker, fx: &Fixture) {
         return;
     }
     let evidence = fx.send_bodies(&producer, &["should-not-send".to_string()]).await;
-    // send_bodies 把错误压成证据串：这里靠「有没有 SEND_OK」判成败。
+    // send_bodies squashes errors into an evidence string: here success is decided by whether a
+    // "SEND_OK" shows up.
     let accepted = evidence.iter().any(|s| s.contains("SendOk") || s.starts_with("SEND_OK"));
     ck.check(
-        "S3 错误 secretKey 被 broker 拒绝",
+        "S3 wrong secretKey rejected by broker",
         !accepted,
         &format!("evidence={evidence:?}"),
     );
     producer.shutdown();
 }
 
-// ------------------------------------------------------------------ S4/S5 正向链路
+// ------------------------------------------------------------------ S4/S5 positive path
 
-/// 先起带凭据的 push 消费者，再发送，最后确认收满。
+/// Start the push consumer with credentials first, then send, then confirm everything arrived.
 async fn s4_s5_signed_roundtrip(ck: &mut Checker, fx: &Fixture) -> Vec<String> {
-    println!("\nS4/S5 带正确凭据的生产者/消费者（先起消费者再发送）");
+    println!("\nS4/S5 producer/consumer with correct credentials (start the consumer before sending)");
     let bodies: Vec<String> = (0..N_MSG).map(|i| format!("acl-ok-{i}")).collect();
 
     let inbox = Arc::new(Inbox::default());
@@ -398,7 +417,7 @@ async fn s4_s5_signed_roundtrip(ck: &mut Checker, fx: &Fixture) -> Vec<String> {
     }) {
         Ok(c) => c,
         Err(e) => {
-            ck.abort("S5 消费者构造", &e.to_string());
+            ck.abort("S5 build consumer", &e.to_string());
             return Vec::new();
         }
     };
@@ -409,23 +428,24 @@ async fn s4_s5_signed_roundtrip(ck: &mut Checker, fx: &Fixture) -> Vec<String> {
     }
     consumer.set_message_listener_concurrently(Arc::new(AclListener(inbox.clone())));
     if let Err(e) = consumer.start().await {
-        ck.abort("S5 消费者 start（心跳/注册需签名）", &e.to_string());
+        ck.abort("S5 start consumer (heartbeat/registration needs a signature)", &e.to_string());
         return Vec::new();
     }
 
-    // 等首轮重平衡把队列分下来：初始位点必须在 topic 还空着的时候解析。
+    // Wait for the first rebalance to assign the queues: the initial offset must be resolved while
+    // the topic is still empty.
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     let producer = match fx.producer("ok", None) {
         Ok(p) => p,
         Err(e) => {
-            ck.abort("S4 构造", &e);
+            ck.abort("S4 build", &e);
             consumer.shutdown();
             return Vec::new();
         }
     };
     if let Err(e) = producer.start().await {
-        ck.abort("S4 生产者 start（注册需签名）", &e.to_string());
+        ck.abort("S4 start producer (registration needs a signature)", &e.to_string());
         consumer.shutdown();
         return Vec::new();
     }
@@ -436,13 +456,14 @@ async fn s4_s5_signed_roundtrip(ck: &mut Checker, fx: &Fixture) -> Vec<String> {
         .filter(|s| s.starts_with("SEND_OK") || s.contains("SendOk"))
         .count();
     ck.check(
-        &format!("S4 带凭据生产者发送 {N_MSG} 条"),
+        &format!("S4 producer with credentials sends {N_MSG} messages"),
         sent == N_MSG,
         &format!("sent={sent} evidence={evidence:?}"),
     );
-    // msgId 由 broker 赋值：非空即证 broker 真的采纳了这条签名请求。
+    // The msgId is assigned by the broker: a non-empty one proves the broker really adopted this
+    // signed request.
     ck.check(
-        "S4 broker 给消息赋了 msgId",
+        "S4 broker assigned a msgId to the messages",
         evidence.iter().all(|s| s.split(':').nth(1).is_some_and(|id| !id.is_empty())),
         &format!("evidence={evidence:?}"),
     );
@@ -452,7 +473,7 @@ async fn s4_s5_signed_roundtrip(ck: &mut Checker, fx: &Fixture) -> Vec<String> {
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
     ck.check(
-        &format!("S5 带凭据 push 消费者收满 {sent} 条（心跳/拉取/提交位点全签名）"),
+        &format!("S5 push consumer with credentials received all {sent} messages (heartbeat/pull/offset commit all signed)"),
         sent == N_MSG && inbox.len() == sent,
         &format!("got={} bodies={:?}", inbox.len(), inbox.snapshot()),
     );
@@ -460,22 +481,22 @@ async fn s4_s5_signed_roundtrip(ck: &mut Checker, fx: &Fixture) -> Vec<String> {
     if sent == N_MSG { bodies } else { Vec::new() }
 }
 
-// ------------------------------------------------------------------ S6/S7 边界
+// ------------------------------------------------------------------ S6/S7 boundary
 
 async fn s6_unsigned_broker_rpc(ck: &mut Checker, fx: &Fixture) {
-    println!("\nS6 不带凭据的直接 broker RPC 必须被拒");
+    println!("\nS6 a direct broker RPC without credentials must be rejected");
     match fx
         .probe
         .get_consumer_list_by_group(&fx.group, 5000, Some(&fx.broker_addr))
         .await
     {
         Ok(list) => ck.check(
-            "S6 无凭据 broker RPC 被拒绝",
+            "S6 broker RPC without credentials rejected",
             false,
-            &format!("broker 竟然回了 {:?}（多半是没开鉴权）", list),
+            &format!("the broker actually replied {:?} (most likely authentication is off)", list),
         ),
         Err(e) => ck.check(
-            "S6 无凭据 broker RPC 被拒绝",
+            "S6 broker RPC without credentials rejected",
             denied(&e),
             &format!("{} {e}", code_of(&e)),
         ),
@@ -483,31 +504,31 @@ async fn s6_unsigned_broker_rpc(ck: &mut Checker, fx: &Fixture) {
 }
 
 async fn s7_namesrv_without_creds(ck: &mut Checker, fx: &Fixture) {
-    println!("\nS7 不带凭据走 NameServer 路由查询仍应成功");
+    println!("\nS7 a NameServer route query without credentials should still succeed");
     match fx
         .probe
         .update_topic_route_info_from_name_server(&fx.topic, 5000, false)
         .await
     {
         Ok(ok) => ck.check(
-            "S7 无凭据 namesrv 路由查询成功",
+            "S7 namesrv route query without credentials succeeded",
             ok,
             &format!("update returned {ok}"),
         ),
         Err(e) => ck.check(
-            "S7 无凭据 namesrv 路由查询成功",
+            "S7 namesrv route query without credentials succeeded",
             false,
             &format!("{} {e}", code_of(&e)),
         ),
     }
 }
 
-// ------------------------------------------------------------------ S8 拉模式签名链路
+// ------------------------------------------------------------------ S8 pull-mode signature chain
 
 async fn s8_signed_pull(ck: &mut Checker, fx: &Fixture, bodies: &[String]) {
-    println!("\nS8 带凭据的 pull 消费者：取队列 / 拉取 / 提交位点 全签名");
+    println!("\nS8 pull consumer with credentials: fetch queues / pull / commit offsets, all signed");
     if bodies.is_empty() {
-        ck.abort("S8 拉取", "S4/S5 没发成消息，跳过");
+        ck.abort("S8 pull", "S4/S5 did not send any message, skipping");
         return;
     }
     let consumer = match DefaultMQPullConsumer::with_config(PullConsumerConfig {
@@ -518,7 +539,7 @@ async fn s8_signed_pull(ck: &mut Checker, fx: &Fixture, bodies: &[String]) {
     }) {
         Ok(c) => c,
         Err(e) => {
-            ck.abort("S8 构造", &e.to_string());
+            ck.abort("S8 build", &e.to_string());
             return;
         }
     };
@@ -531,7 +552,7 @@ async fn s8_signed_pull(ck: &mut Checker, fx: &Fixture, bodies: &[String]) {
         Ok(mqs) => mqs,
         Err(e) => {
             ck.abort(
-                "S8 fetch_subscribe_message_queues（签名取路由）",
+                "S8 fetch_subscribe_message_queues (signed route lookup)",
                 &format!("{} {e}", code_of(&e)),
             );
             consumer.shutdown();
@@ -542,7 +563,8 @@ async fn s8_signed_pull(ck: &mut Checker, fx: &Fixture, bodies: &[String]) {
     let mut commit_failed: Vec<String> = Vec::new();
     let mut readback_failed: Vec<String> = Vec::new();
     for mq in &mqs {
-        // 未提交过的组位点为 None（setZeroIfNotFound=false 口径），从 0 起拉。
+        // The group offset of a never-committed group is None (with setZeroIfNotFound=false semantics),
+        // so we start pulling from 0.
         let offset = consumer
             .fetch_consume_offset(mq)
             .await
@@ -553,7 +575,8 @@ async fn s8_signed_pull(ck: &mut Checker, fx: &Fixture, bodies: &[String]) {
                 for m in &r.msg_found_list {
                     got.insert(String::from_utf8_lossy(m.get_body()).into_owned());
                 }
-                // 位点提交是另一条 RPC（UPDATE_CONSUMER_OFFSET），漏签会静默失败成异常。
+                // Offset commit is a different RPC (UPDATE_CONSUMER_OFFSET); a missing signature makes it fail
+                // silently as an exception.
                 if let Err(e) =
                     consumer.update_consume_offset(mq, r.next_begin_offset).await
                 {
@@ -565,35 +588,35 @@ async fn s8_signed_pull(ck: &mut Checker, fx: &Fixture, bodies: &[String]) {
                 }
             }
             Ok(r) => {
-                // 空队列 / 无匹配都算正常，只要签名没被拒。
-                println!("  [INFO] {} 拉到 {:?}", mq.queue_id, r.status);
+                // An empty queue / no match is fine, as long as the signature was not rejected.
+                println!("  [INFO] {} pulled {:?}", mq.queue_id, r.status);
             }
             Err(e) => commit_failed.push(format!("pull:{} {e}", code_of(&e))),
         }
     }
     let want: BTreeSet<String> = bodies.iter().cloned().collect();
     ck.check(
-        &format!("S8 带凭据 pull 拉到全部 {} 条", bodies.len()),
+        &format!("S8 pull with credentials fetched all {} messages", bodies.len()),
         got == want,
         &format!("got={got:?}"),
     );
     ck.check(
-        "S8 带凭据提交位点并回读一致",
+        "S8 offsets committed with credentials and read back consistently",
         commit_failed.is_empty() && readback_failed.is_empty(),
         &format!("commit={commit_failed:?} readback={readback_failed:?}"),
     );
     consumer.shutdown();
 }
 
-// ------------------------------------------------------------------ S9 清理
+// ------------------------------------------------------------------ S9 cleanup
 
 async fn s9_cleanup(ck: &mut Checker, fx: &Fixture) {
-    println!("\nS9 清理：带凭据删掉本次建的 topic");
+    println!("\nS9 cleanup: delete the topic created this round, with credentials");
     match fx.signed_admin("cleaner").await {
         Ok(admin) => {
             let r = admin.delete_topic_in_broker(&fx.broker_addr, &fx.topic, 5000).await;
             ck.check(
-                "S9 删除本次建的 topic",
+                "S9 delete the topic created this round",
                 r.is_ok(),
                 &match r {
                     Err(e) => format!("{} {e}", code_of(&e)),
@@ -602,24 +625,24 @@ async fn s9_cleanup(ck: &mut Checker, fx: &Fixture) {
             );
             admin.shutdown();
         }
-        Err(e) => ck.abort("S9 实例启动", &e),
+        Err(e) => ck.abort("S9 start instance", &e),
     }
 }
 
-// ------------------------------------------------------------------ 驱动
+// ------------------------------------------------------------------ driver
 
 async fn run(namesrv: &str, access_key: &str, secret_key: &str) -> Checker {
     let mut ck = Checker::new();
     let mut fx = match Fixture::new(namesrv, access_key, secret_key) {
         Ok(fx) => fx,
         Err(e) => {
-            ck.abort("夹具构造", &e);
+            ck.abort("build fixture", &e);
             return ck;
         }
     };
     println!("== live ACL check, namesrv={namesrv} ak={access_key} ==");
     if let Err(e) = fx.start().await {
-        ck.abort("夹具启动（查 namesrv 路由）", &e);
+        ck.abort("start fixture (query namesrv route)", &e);
         return ck;
     }
     println!(
@@ -636,7 +659,7 @@ async fn run(namesrv: &str, access_key: &str, secret_key: &str) -> Checker {
         s8_signed_pull(&mut ck, &fx, &bodies).await;
         s9_cleanup(&mut ck, &fx).await;
     } else {
-        ck.abort("后续场景", "topic 没建起来，跳过");
+        ck.abort("remaining scenarios", "the topic was not created, skipping");
     }
     fx.probe.shutdown();
     ck

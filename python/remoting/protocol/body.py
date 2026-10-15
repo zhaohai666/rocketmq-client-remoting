@@ -5,7 +5,7 @@ from typing import Dict, List, Optional
 
 from common.subscription_data import SubscriptionData
 from remoting.protocol.serialize import RemotingSerializable, fastjson_loads
-# MessageQueue 作为 map 键的解析/序列化（fastjson2 非字符串键）+ 共用 DTO
+# Parsing/serialization of MessageQueue as a map key (fastjson2 non-string keys) + shared DTOs
 from .admin_body import decode_message_queue_map, message_queue_key  # noqa: F401
 
 
@@ -160,12 +160,14 @@ class GetConsumerListByGroupResponseBody:
 
 
 class CheckClientRequestBody:
-    """协议模型 ``CheckClientRequestBody``。
+    """The protocol model ``CheckClientRequestBody``.
 
-    只被 ``CHECK_CLIENT_CONFIG(46)`` 用到：broker 拿 clientId/group 记日志，真正被校验的
-    只有 ``subscriptionData`` 的 expressionType 与 subString（broker 侧
-    ``ClientManageProcessor.checkClientConfig``）。namespace 字段在 5.5.1 协议里存在但
-    发送端不填，这里同样保留字段而不写值（fastjson 不序列化 None）。
+    It is only used by ``CHECK_CLIENT_CONFIG(46)``: the broker logs clientId/group and
+    what it really validates is only the expressionType and subString of
+    ``subscriptionData`` (on the broker side, in
+    ``ClientManageProcessor.checkClientConfig``). The namespace field exists in the
+    5.5.1 protocol but the sender never fills it, so the field is kept here without a
+    value (fastjson does not serialize None).
     """
 
     def __init__(self):
@@ -213,7 +215,7 @@ class ClusterInfo:
         self.cluster_addr_table: Dict[str, List[str]] = {}
 
     def get_broker_addrs(self) -> List[str]:
-        """收集所有 broker 的地址（去重，按 broker 名称、brokerId 顺序）。"""
+        """Collect the addresses of all brokers (deduplicated, ordered by broker name then brokerId)."""
         addrs: List[str] = []
         seen = set()
         for broker_name in sorted(self.broker_addr_table.keys()):
@@ -240,8 +242,8 @@ class ClusterInfo:
     @staticmethod
     def from_dict(d: dict) -> "ClusterInfo":
         ci = ClusterInfo()
-        # 真实 RocketMQ 的 brokerAddrTable[name] 是一个 BrokerData 对象，
-        # 真正的 {brokerId: addr} 映射在其中的 brokerAddrs 字段下。
+        # In real RocketMQ, brokerAddrTable[name] is a BrokerData object, and the actual
+        # {brokerId: addr} mapping lives in its brokerAddrs field.
         ci.broker_addr_table = {
             k: {int(kk): v for kk, v in (vv.get("brokerAddrs") or {}).items()}
             for k, vv in (d.get("brokerAddrTable") or {}).items()
@@ -258,20 +260,23 @@ class ClusterInfo:
 
 
 class ConsumerRunningInfo:
-    """协议模型 ``ConsumerRunningInfo``。
+    """The protocol model ``ConsumerRunningInfo``.
 
-    两端都用得到：**admin 侧**解析 broker 汇总的运行信息；**客户端侧**在应答
-    GET_CONSUMER_RUNNING_INFO(307) 时编码自己的运行信息。
+    Both ends use it: the **admin side** parses the running info aggregated by the
+    broker; the **client side** encodes its own running info when replying to
+    GET_CONSUMER_RUNNING_INFO(307).
 
-    ⚠ ``mqTable`` / ``mqPopTable`` 的键是 ``MessageQueue``，broker 侧 fastjson 会把它
-    内联成 JSON 对象（``{{"brokerName":...,"queueId":...,"topic":...}:{...}}``）——这不是
-    合法 JSON，但 broker 按 fastjson 容错解析能读回来，所以必须用 ``message_queue_key`` /
-    ``decode_message_queue_map`` 处理，不能当普通字符串键。
+    CAUTION: the keys of ``mqTable`` / ``mqPopTable`` are ``MessageQueue``, and the
+    broker-side fastjson inlines them as JSON objects
+    (``{{"brokerName":...,"queueId":...,"topic":...}:{...}}``) -- that is not valid JSON,
+    but the broker can read it back thanks to fastjson's lenient parsing, so it must be
+    handled with ``message_queue_key`` / ``decode_message_queue_map`` and cannot be
+    treated as ordinary string keys.
     """
 
     PROP_NAMESERVER_ADDR = "PROP_NAMESERVER_ADDR"
     PROP_THREADPOOL_CORE_SIZE = "PROP_THREADPOOL_CORE_SIZE"
-    PROP_CONSUME_ORDERLY = "PROP_CONSUMEORDERLY"   # 协议常量名就没有下划线（拼写如此）
+    PROP_CONSUME_ORDERLY = "PROP_CONSUMEORDERLY"   # the protocol constant name has no underscore (spelled that way)
     PROP_CONSUME_TYPE = "PROP_CONSUME_TYPE"
     PROP_CLIENT_VERSION = "PROP_CLIENT_VERSION"
     PROP_CONSUMER_START_TIMESTAMP = "PROP_CONSUMER_START_TIMESTAMP"
@@ -455,12 +460,14 @@ class ConsumeStatus:
 
 
 class ConsumeStatsList:
-    """协议模型 `body.ConsumeStatsList`（`GET_BROKER_CONSUME_STATS` 响应）。
+    """The protocol model `body.ConsumeStatsList` (the `GET_BROKER_CONSUME_STATS` response).
 
-    ⚠ JSON 键是协议字段名 `consumeStatsList`，不是 `statsList`：写错键名时
-    真机响应会解析成空列表，看着像「这个 broker 没有积压」。
-    `brokerAddr` 是协议里的 String 字段，走 NON_NULL 序列化所以 None 时整键消失；
-    `totalDiff` / `totalInflightDiff` 是 `long` 原语字段，恒在。
+    CAUTION: the JSON key is the protocol field name `consumeStatsList`, not
+    `statsList`: with the wrong key name a real response parses into an empty list,
+    which looks like "this broker has no backlog".
+    `brokerAddr` is a String field in the protocol, serialized with NON_NULL, so when
+    it is None the whole key disappears; `totalDiff` / `totalInflightDiff` are `long`
+    primitive fields and are always present.
     """
 
     def __init__(self):
@@ -495,11 +502,12 @@ class ConsumeStatsList:
 
 
 class ResetOffsetBody:
-    """协议模型 ``ResetOffsetBody``。
+    """The protocol model ``ResetOffsetBody``.
 
-    ⚠ 协议字段是 ``Map<MessageQueue, Long> offsetTable``，**不是** topic→queueId→offset
-    的嵌套 map（真实 broker 响应解析不出来即是这个形状）。
-    broker 侧 fastjson 会把 MessageQueue 键内联成 JSON 对象，故用 admin_body 的键工具解析。
+    CAUTION: the protocol field is ``Map<MessageQueue, Long> offsetTable``, **not** a
+    nested topic->queueId->offset map (a real broker response that fails to parse has
+    exactly this shape). The broker-side fastjson inlines MessageQueue keys as JSON
+    objects, so the key helpers from admin_body are used to parse them.
     """
 
     def __init__(self):
@@ -548,11 +556,13 @@ class MessageQueueForC:
 
 
 class ResetOffsetBodyForC:
-    """协议模型 ``ResetOffsetBodyForC``：``offsetTable`` 是
-    **数组**（每条自带 offset），不是 map。
+    """The protocol model ``ResetOffsetBodyForC``: ``offsetTable`` is an
+    **array** (each entry carries its own offset), not a map.
 
-    只有 222（RESET_CONSUMER_OFFSET）发起方的 language 是 CPP 时 broker 才推这种体
-    （``Broker2Client.resetOffset``），所以必须能解析——收到却解析不出等于整笔重置静默丢弃。
+    The broker only pushes this body when the language of the 222
+    (RESET_CONSUMER_OFFSET) initiator is CPP (``Broker2Client.resetOffset``), so it
+    must be parseable -- failing to parse one that arrived means silently dropping the
+    whole reset.
     """
 
     def __init__(self):

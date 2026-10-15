@@ -16,7 +16,7 @@ KEY = "key"
 
 
 class _RecordingConsumeHook(ConsumeMessageHook):
-    """只记 after 钩子看到的 (status, success, ConsumeContextType)。"""
+    """Only records the (status, success, ConsumeContextType) seen by the after hook."""
 
     def __init__(self):
         self.after = []
@@ -42,7 +42,7 @@ def msg(queue_offset: int, reconsume_times: int = 0) -> MessageExt:
 
 
 class FixedListener:
-    """返回固定状态，并（可选）把 ack_index 写进 context。"""
+    """Returns a fixed status and (optionally) writes ack_index into the context."""
 
     def __init__(self, status, ack_index=None):
         self.status = status
@@ -55,7 +55,7 @@ class FixedListener:
 
 
 class Harness:
-    """一个不碰网络的 push consumer：位点/待发队列手动搭好，回投只记录。"""
+    """A push consumer that never touches the network: offsets / pending queue set up manually, send-back only recorded."""
 
     def __init__(self, model=None, batch_max=3):
         self.c = DefaultMQPushConsumer(GROUP)
@@ -92,7 +92,7 @@ class Harness:
         return sorted(m.queue_offset for m, _ in self.backed)
 
 
-# --------------------------------------------------------------- 默认值
+# --------------------------------------------------------------- Defaults
 
 
 class TestContextDefault:
@@ -120,7 +120,7 @@ class TestConsumeSuccess:
         assert h.offset == 2
 
     def test_partial_ack_commits_prefix_and_redelivers_tail(self):
-        """核心场景：listener 只认可第一条 → 后两条必须回投，而不是被位点越过。"""
+        """Core scenario: the listener acks only the first message → the last two must be sent back, not skipped over by the offset."""
         h = Harness()
         listener = FixedListener(ConsumeConcurrentlyStatus.CONSUME_SUCCESS, ack_index=0)
         assert h.consume([msg(0), msg(1), msg(2)], listener) is True
@@ -150,7 +150,7 @@ class TestConsumeSuccess:
         assert ok is False
         assert h.pending_offsets == [1]
         assert batch[1].reconsume_times == 1
-        # 认可前缀 0 + 回投成功的 2 → 本来会提交到 3，但 1 还在队里，只能停在 1
+        # Acked prefix 0 + successfully sent-back 2 → would commit to 3, but 1 is still in the queue, so it stops at 1
         assert h.offset == 1
 
     def test_all_send_backs_failing_keeps_offset_frozen(self):
@@ -190,9 +190,9 @@ class TestReconsumeLater:
         hook = _RecordingConsumeHook()
         h.c.register_consume_message_hook(hook)
         assert h.consume([msg(0), msg(1)], FixedListener(None)) is True
-        assert h.backed_offsets == [0, 1], "整批回投"
+        assert h.backed_offsets == [0, 1], "the whole batch is sent back"
         assert hook.after == [("RECONSUME_LATER", False, "RETURNNULL")], (
-            "status 的形态是裸成员名，不是带类名的枚举字符串")
+            "the status is the bare member name, not a class-qualified enum string")
 
     def test_hook_status_is_the_uppercase_enum_name_on_the_success_path_too(self):
         pass

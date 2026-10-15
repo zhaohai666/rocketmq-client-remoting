@@ -19,8 +19,8 @@ from remoting.protocol.heartbeat import MessageModel
 
 TOPIC = "TopicSchedUnit"
 
-# 计时断言预算（秒）。Windows 回环端口有 ~2s 拒连延迟，这里虽不连 socket，
-# 但线程调度也可能被拖慢，统一给 30s。
+# Timing-assertion budget (seconds). Windows loopback ports have a ~2s connection-refused delay; although no socket is connected here,
+# thread scheduling can also be slowed down, so a uniform 30s is given.
 WAIT_TIMEOUT = 30.0
 
 
@@ -42,13 +42,13 @@ def _msg(topic, broker, qid, offset):
 
 
 def _found(offset, step=10):
-    """FOUND：next_begin_offset = offset + step，位点推进可被流水验证。"""
+    """FOUND: next_begin_offset = offset + step, so the offset advance can be verified by the pipeline."""
     return PullResult(PullStatus.FOUND, offset + step, 0, offset + step,
                       [_msg(TOPIC, "broker-a", 0, offset)])
 
 
 class FakePullConsumer:
-    """DefaultMQPullConsumer 的内存替身：记录每次 pull，队列视图可控。"""
+    """An in-memory stand-in for DefaultMQPullConsumer: records every pull, with a controllable queue view."""
 
     def __init__(self):
         self.consumer_group = "PG_SchedUnit"
@@ -59,14 +59,14 @@ class FakePullConsumer:
         self._assigned = {}
         self._lock = threading.Lock()
         self.pulls = []            # [(mq, offset, sub_expression)]
-        self.inflight = set()      # 当前正处于 pull() 里的队列键
-        self.serial_violations = []  # 同队列并发进入 pull 的证据（必须恒空）
-        self._results = {}         # queue key -> deque（弹空走默认 _found）
-        self.committed = {}        # queue key -> int（fetch_consume_offset）
+        self.inflight = set()      # queue keys currently inside pull()
+        self.serial_violations = []  # evidence of concurrent pull entry on the same queue (must always be empty)
+        self._results = {}         # queue key -> deque (popping empty falls through to the default _found)
+        self.committed = {}        # queue key -> int (fetch_consume_offset)
         self.max_offsets = {}      # queue key -> int
-        self.pull_hook = None      # 在 pull 内执行的旁路（阻塞/置事件）
+        self.pull_hook = None      # a bypass executed inside pull (blocking/setting events)
 
-    # ---- 测试脚手架 ----
+    # ---- test scaffolding ----
     def set_queues(self, topic, queues):
         with self._lock:
             self._assigned[topic] = list(queues)
@@ -91,7 +91,7 @@ class FakePullConsumer:
                     return offset
         return None
 
-    # ---- DefaultMQPullConsumer 契约面 ----
+    # ---- the DefaultMQPullConsumer contract surface ----
     def start(self):
         self.started += 1
 
@@ -160,7 +160,7 @@ def _queues(n, topic=TOPIC):
 
 
 def _started_service(queues=None, topic=TOPIC):
-    """建服务（复用注入消费者）→ 注册回调 → start，返回 (service, consumer, callback)。"""
+    """Build the service (reusing the injected consumer) -> register the callback -> start, returning (service, consumer, callback)."""
     consumer = FakePullConsumer()
     consumer.set_queues(topic, queues if queues is not None else _queues(3))
     service = PullConsumerScheduleService(pull_consumer=consumer)
@@ -197,7 +197,7 @@ class TestRegistrationAndExpansion:
         service, consumer, callback = _started_service(_queues(3))
         try:
             assert _wait_for(lambda: len(consumer.counts()) >= 3), \
-                "三个队列都要被拉到"
+                "all three queues must be pulled"
             assert set(service.task_table()) == set(_queues(3))
             assert callback.count() >= 3
         finally:
@@ -219,7 +219,7 @@ class TestRegistrationAndExpansion:
     def test_repeated_start_is_noop(self):
         service, consumer, _ = _started_service(_queues(1))
         try:
-            service.start()  # 幂等，不重复建线程
+            service.start()  # idempotent, no duplicate threads
             assert len(service.task_table()) == 1
         finally:
             service.shutdown()
@@ -227,7 +227,7 @@ class TestRegistrationAndExpansion:
 
 class TestDelayAndReschedule:
     def test_not_due_never_dispatches_early(self):
-        # 首轮 0ms，第二轮起常驻 30s —— 观察窗口内只应有一轮。
+        # first round 0ms, from the second round on a resident 30s -- only one round should be observed within the window.
         consumer = FakePullConsumer()
         consumer.set_queues(TOPIC, _queues(1))
         service = PullConsumerScheduleService(pull_consumer=consumer)
@@ -237,31 +237,31 @@ class TestDelayAndReschedule:
         try:
             assert _wait_for(lambda: len(consumer.pulls) >= 1)
             time.sleep(0.3)
-            assert len(consumer.pulls) == 1, "未到延迟不得再派"
+            assert len(consumer.pulls) == 1, "no second dispatch before the delay is due"
         finally:
             service.shutdown()
 
     def test_context_delay_resolution_priority(self):
-        """显式返回值 > pull_message_later（一次性）> 常驻 set_pull_interval。"""
+        """Explicit return value > pull_message_later (one-shot) > the resident set_pull_interval."""
         ctx = PullTaskContext(FakePullConsumer(), MessageQueue(TOPIC, "broker-a", 0))
         assert ctx.pull_next_delay_millis == DEFAULT_PULL_NEXT_DELAY_MILLIS
-        # 1) 返回值压过一切
+        # 1) the return value overrides everything
         ctx.pull_message_later(50)
         assert ctx.consume_next_delay_millis(7) == 7
-        # 2) 无返回值时用一次性顺延，且用掉即清
+        # 2) with no return value the one-shot postponement is used, and it is cleared on use
         ctx.pull_message_later(50)
         assert ctx.consume_next_delay_millis(None) == 50
         assert ctx.consume_next_delay_millis(None) == DEFAULT_PULL_NEXT_DELAY_MILLIS
-        # 3) 常驻间隔
+        # 3) the resident interval
         ctx.set_pull_interval(300)
         assert ctx.consume_next_delay_millis(None) == 300
         assert ctx.consume_next_delay_millis(None) == 300
-        # 4) 负数钳到 0；last_next_delay 可观测
+        # 4) negatives are clamped to 0; last_next_delay is observable
         assert ctx.consume_next_delay_millis(-5) == 0
         assert ctx.last_next_delay_millis == 0
 
     def test_return_value_reschedules_next_round(self):
-        """回调返回下一轮延迟：第一轮返回 0（立刻再来），第二轮返回 30000（不再来）。"""
+        """The callback returns the next round's delay: the first round returns 0 (come again immediately), the second returns 30000 (no more)."""
         consumer = FakePullConsumer()
         consumer.set_queues(TOPIC, _queues(1))
 
@@ -282,9 +282,9 @@ class TestDelayAndReschedule:
         service.register_pull_task(TOPIC, cb, next_delay_millis=30000)
         service.start()
         try:
-            assert cb.event.wait(WAIT_TIMEOUT), "返回 0 应立刻重排第二轮"
+            assert cb.event.wait(WAIT_TIMEOUT), "returning 0 should reschedule the second round immediately"
             time.sleep(0.2)
-            assert cb.n == 2, "返回 30000 后窗口内不得有第三轮"
+            assert cb.n == 2, "after returning 30000 there must be no third round within the window"
         finally:
             service.shutdown()
 
@@ -297,8 +297,8 @@ class TestDelayAndReschedule:
             def do_pull_task(self, mq, result, context):
                 context.round_flag = len(rounds)
                 if not rounds:
-                    # 首轮：一次性顺延 30s（常驻 10ms 被它压过、只此一轮），
-                    # 并把堆里的下一次派发等掉 —— 用事件放行替代墙钟。
+                    # first round: one-shot postponement of 30s (it overrides the resident 10ms, for this round only),
+                    # and wait out the next dispatch in the heap -- an event release is used instead of the wall clock.
                     rounds.append(mq)
                     context.pull_message_later(30000)
                     return None
@@ -311,7 +311,7 @@ class TestDelayAndReschedule:
         try:
             assert _wait_for(lambda: len(consumer.pulls) >= 1)
             time.sleep(0.2)
-            assert len(consumer.pulls) == 1, "一次性顺延生效，第二轮被推到 30s 后"
+            assert len(consumer.pulls) == 1, "the one-shot postponement took effect, the second round was pushed to 30s later"
         finally:
             service.shutdown()
 
@@ -319,12 +319,12 @@ class TestDelayAndReschedule:
 class TestOffsetSources:
     def test_fixed_int_offset_then_cursor_follows_next_begin(self):
         service, consumer, cb = _started_service(_queues(1))
-        service.get_pull_consumer()  # 覆盖访问器
+        service.get_pull_consumer()  # cover the accessor
         try:
             assert _wait_for(lambda: len(consumer.pulls) >= 2)
             offs = [p[1] for p in consumer.pulls]
             assert offs[0] == 0
-            assert offs[1] == 10, "_found 的 next_begin_offset=offset+10，游标必须跟上"
+            assert offs[1] == 10, "_found's next_begin_offset=offset+10, so the cursor must follow"
         finally:
             service.shutdown()
 
@@ -346,7 +346,7 @@ class TestOffsetSources:
             assert _wait_for(lambda: len(consumer.pulls) >= 2)
             assert consumer.pulls[0][1] == 5
             assert consumer.pulls[1][1] == 15
-            assert len(calls) == 1, "来源只求值一次，之后走游标"
+            assert len(calls) == 1, "the source is evaluated only once, after which the cursor takes over"
         finally:
             service.shutdown()
 
@@ -366,8 +366,8 @@ class TestOffsetSources:
             first = {}
             for mq, off, _s in consumer.pulls:
                 first.setdefault(mq.queue_id, off)
-            assert first[0] == 7, "有提交位点 → 从位点表续"
-            assert first[1] == 55, "无提交位点 → 退队尾（CONSUME_FROM_LAST 语义）"
+            assert first[0] == 7, "with a committed offset -> continue from the offset table"
+            assert first[1] == 55, "with no committed offset -> fall to the queue tail (CONSUME_FROM_LAST semantics)"
         finally:
             service.shutdown()
 
@@ -385,7 +385,7 @@ class TestOffsetSources:
         try:
             assert _wait_for(lambda: len(consumer.pulls) >= 2)
             assert consumer.pulls[0][1] == 5
-            assert consumer.pulls[1][1] == 42, "OFFSET_ILLEGAL 用 next_begin_offset 纠偏"
+            assert consumer.pulls[1][1] == 42, "OFFSET_ILLEGAL corrects via next_begin_offset"
         finally:
             service.shutdown()
 
@@ -410,15 +410,15 @@ class TestOffsetSources:
         try:
             assert _wait_for(lambda: len(consumer.pulls) >= 2)
             assert consumer.pulls[0][1] == 3
-            assert consumer.pulls[1][1] == 1000, "seek 压过 next_begin_offset"
+            assert consumer.pulls[1][1] == 1000, "seek overrides next_begin_offset"
         finally:
             service.shutdown()
 
 
 class TestSerialisationAndErrors:
     def test_same_queue_never_pulls_twice_concurrently(self):
-        """回调返回 0 让队列尽快连轴转，串行性由 in_flight 闸门结构保证；
-        fake 里若同一队列并发进入 pull 会记进 serial_violations（恒空即通过）。"""
+        """Returning 0 from the callback keeps the queue turning over as fast as possible; serialization is guaranteed by the in_flight gate structure;
+        if the same queue enters pull concurrently in the fake it is recorded in serial_violations (always empty means pass)."""
         service, consumer, _cb = _started_service(_queues(2))
         try:
             assert _wait_for(lambda: sum(consumer.counts().values()) >= 12)
@@ -434,7 +434,7 @@ class TestSerialisationAndErrors:
         release = threading.Event()
 
         def hook(mq):
-            if consumer.pulls:  # 首轮已记账 → 现在进的是第二轮
+            if consumer.pulls:  # the first round is already booked -> this entry is the second round
                 second_round.set()
                 release.wait(WAIT_TIMEOUT)
 
@@ -448,11 +448,11 @@ class TestSerialisationAndErrors:
         service.pull_thread_nums = 2
         service.start()
         try:
-            assert second_round.wait(WAIT_TIMEOUT), "异常轮之后必须按 1000ms 重来一轮"
+            assert second_round.wait(WAIT_TIMEOUT), "after the exception round there must be another round per the 1000ms"
             task = list(service.task_table().values())[0]
             assert task.context.last_next_delay_millis == PULL_TASK_EXCEPTION_DELAY_MILLIS
-            assert task.context.pull_next_delay_millis == 10, "常驻间隔不被异常轮污染"
-            assert task.context.round_count == 1, "pull 成功即推进游标/轮数，与回调无关"
+            assert task.context.pull_next_delay_millis == 10, "the resident interval is not polluted by the exception round"
+            assert task.context.round_count == 1, "a successful pull advances the cursor/round count, regardless of the callback"
         finally:
             release.set()
             service.shutdown()
@@ -461,8 +461,8 @@ class TestSerialisationAndErrors:
         consumer = FakePullConsumer()
         q0 = MessageQueue(TOPIC, "broker-a", 0)
         consumer.set_queues(TOPIC, [q0])
-        # 连失败两轮（失败轮不进 pulls 流水）：第三轮成功时起点仍应是 1 —— 证明
-        # 拉取失败既不推进游标、也不让任务从堆里消失。
+        # two failed rounds in a row (failed rounds do not enter the pulls pipeline): when the third round succeeds the start offset should still be 1 -- proving
+        # a pull failure neither advances the cursor nor makes the task disappear from the heap.
         consumer.script(q0, [RuntimeError("rpc down"), RuntimeError("rpc down again")])
         service = PullConsumerScheduleService(pull_consumer=consumer)
         service.register_pull_task(TOPIC, _RecordingCallback(), offset=1,
@@ -470,9 +470,9 @@ class TestSerialisationAndErrors:
         service.start()
         try:
             assert _wait_for(lambda: len(consumer.pulls) >= 1)
-            assert consumer.pulls[0][1] == 1, "失败轮之后的重试仍从原游标起步"
+            assert consumer.pulls[0][1] == 1, "the retry after a failed round still starts from the original cursor"
             assert _wait_for(lambda: len(consumer.pulls) >= 2)
-            assert consumer.pulls[1][1] == 11, "成功轮才推进游标"
+            assert consumer.pulls[1][1] == 11, "only a successful round advances the cursor"
         finally:
             service.shutdown()
 
@@ -482,7 +482,7 @@ class TestSerialisationAndErrors:
             assert _wait_for(lambda: len(consumer.pulls) >= 1)
             del service._callback_table[TOPIC]
             assert _wait_for(lambda: service.task_table() == {})
-            # 丢任务后不再派发
+            # no more dispatch after the task is dropped
             n = len(consumer.pulls)
             time.sleep(0.15)
             assert len(consumer.pulls) == n
@@ -496,7 +496,7 @@ class TestQueueSetChanges:
         q0, q1, q2 = _queues(3)
         consumer.set_queues(TOPIC, [q0, q1])
         service = PullConsumerScheduleService(pull_consumer=consumer)
-        service.queue_check_interval_millis = 100  # 测试里把复查周期调小
+        service.queue_check_interval_millis = 100  # shrink the recheck period in the test
         cb = _RecordingCallback()
         service.register_pull_task(TOPIC, cb, next_delay_millis=10)
         service.start()
@@ -508,7 +508,7 @@ class TestQueueSetChanges:
             revoked_before = consumer.counts().get((TOPIC, "broker-a", 0), 0)
             time.sleep(0.25)
             assert consumer.counts().get((TOPIC, "broker-a", 0), 0) == revoked_before, \
-                "撤掉的队列不得再被拉"
+                "a revoked queue must not be pulled again"
         finally:
             service.shutdown()
 
@@ -527,8 +527,8 @@ class TestQueueSetChanges:
                 raise RuntimeError("route down")
 
             consumer.fetch_message_queues_in_balance = boom
-            time.sleep(0.35)  # 至少跨两轮复查
-            assert set(service.task_table()) == set(qs), "视图拿不到绝不能撤光任务"
+            time.sleep(0.35)  # span at least two recheck rounds
+            assert set(service.task_table()) == set(qs), "failing to get the view must never revoke all tasks"
         finally:
             service.shutdown()
 
@@ -549,7 +549,7 @@ class TestShutdown:
         service = PullConsumerScheduleService(pull_consumer=consumer)
         service.register_pull_task(TOPIC, _RecordingCallback(), next_delay_millis=10)
         service.start()
-        assert entered.wait(WAIT_TIMEOUT), "第一轮 pull 已进入阻塞"
+        assert entered.wait(WAIT_TIMEOUT), "the first round's pull has entered blocking"
         done = threading.Event()
 
         def _shutdown():
@@ -559,17 +559,17 @@ class TestShutdown:
         t = threading.Thread(target=_shutdown)
         t.start()
         time.sleep(0.2)
-        assert not done.is_set(), "在途 pull 未返回前 shutdown 不得放行（排空）"
+        assert not done.is_set(), "shutdown must not be let through before the in-flight pull returns (draining)"
         release.set()
-        assert done.wait(WAIT_TIMEOUT), "在途 pull 返回后 shutdown 应完成"
+        assert done.wait(WAIT_TIMEOUT), "shutdown should complete after the in-flight pull returns"
         t.join(5.0)
-        assert consumer.shutdown_called == 0, "复用的消费者所有权在调用方，服务不得关它"
+        assert consumer.shutdown_called == 0, "a reused consumer is owned by the caller; the service must not close it"
         assert consumer.serial_violations == []
-        service.shutdown()  # 幂等
+        service.shutdown()  # idempotent
 
     def test_own_consumer_is_closed_on_shutdown(self, monkeypatch):
-        """consumer_group 构造（服务自建消费者）→ shutdown 先停调度再关消费者，
-        消费者又经 MQClientManager 引用计数关实例 —— 用假 MQClientInstance 验证整链。"""
+        """consumer_group construction (the service builds its own consumer) -> shutdown stops the scheduling first then closes the consumer,
+        and the consumer in turn closes the instance via MQClientManager reference counting -- a fake MQClientInstance verifies the whole chain."""
         import client.consumer as consumer_mod
 
         holder = {}
@@ -608,11 +608,11 @@ class TestShutdown:
                 return [q0] if topic == TOPIC else []
 
             def get_consumer_id_list_by_group(self, topic, group, timeout_millis=5000):
-                # 分配公式要求 currentCID ∈ cidAll：回消费者自己 start 时定出的 clientId。
+                # the allocation formula requires currentCID in cidAll: reply with the clientId the consumer itself set at start.
                 return [holder["consumer"].client_id]
 
             def query_consumer_offset(self, group, mq, timeout_millis=5000):
-                return None  # 无提交位点 → offset=None 的来源会落到 max_offset
+                return None  # no committed offset -> the offset=None source falls to max_offset
 
             def get_max_offset(self, mq, timeout_millis=5000):
                 return 100
@@ -633,19 +633,19 @@ class TestShutdown:
         service.start()
         assert isinstance(consumer, DefaultMQPullConsumer)
         assert consumer._started is True
-        # 队列展开走真 fetch_message_queues_in_balance（读位口径 + 分配公式），
-        # 任务键应落到假 client 给出的 q0，并且真的拉到过。
+        # queue expansion goes through the real fetch_message_queues_in_balance (read criterion + allocation formula),
+        # the task key should land on the q0 given by the fake client, and it was really pulled.
         assert _wait_for(lambda: q0 in service.task_table())
         assert _wait_for(lambda: q0 in consumer._pull_from_which_node)
         client = holder["client"]
         service.shutdown()
-        assert consumer._started is False, "自建消费者随服务关闭"
-        assert client.shutdown_called == 1, "引用计数归零 → 实例真关"
+        assert consumer._started is False, "the self-built consumer is closed along with the service"
+        assert client.shutdown_called == 1, "reference count dropped to zero -> the instance is really closed"
 
     def test_operations_after_shutdown_are_noop(self):
         service, consumer, _ = _started_service(_queues(1))
         service.shutdown()
         pulls = len(consumer.pulls)
         time.sleep(0.2)
-        assert len(consumer.pulls) == pulls, "停调度后不得再有派发"
-        service.shutdown()  # 幂等
+        assert len(consumer.pulls) == pulls, "no more dispatch after the scheduling is stopped"
+        service.shutdown()  # idempotent

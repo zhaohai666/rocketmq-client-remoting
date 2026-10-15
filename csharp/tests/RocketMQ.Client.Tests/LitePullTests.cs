@@ -1,5 +1,5 @@
-// 轻量拉取消费者（DefaultLitePullConsumer）+ 220/221/309 body 单测
-// （覆盖拉取主流程与位点表的核心场景）。
+// Unit tests for the lightweight pull consumer (DefaultLitePullConsumer) and the
+// 220/221/309 bodies (covering the main pull flow and the core offset table scenarios).
 using RocketMQ.Client;
 using RocketMQ.Common;
 using RocketMQ.Remoting.Protocol;
@@ -9,11 +9,12 @@ namespace RocketMQ.Client.Tests;
 
 public class LitePullTests
 {
-    /// <summary>这版 xunit 的 Assert.Equal 不带 because 参数，数值断言统一走这个包装。</summary>
+    /// <summary>This version of xunit's Assert.Equal takes no because argument, so numeric
+    /// assertions all go through this wrapper.</summary>
     private static void Eq(long expected, long actual, string because) =>
         Assert.True(actual == expected, $"expected {expected}, actual {actual}, because {because}");
 
-    // ---------------------------------------------- start 之前的纯状态行为
+    // ---------------------------------------------- Pure state behaviour before start
 
     [Fact]
     public void Constructor_DefaultGroup()
@@ -27,7 +28,7 @@ public class LitePullTests
     public void Start_WithoutSubscriptionOrNamesrv_Throws()
     {
         var c = new DefaultLitePullConsumer();
-        // start 前没配 namesrv：必须显式报错（不能静默起空转线程）
+        // No namesrv configured before start: it must report an error explicitly (it must not silently spin up an idle thread)
         Assert.ThrowsAny<MQClientException>(c.Start);
     }
 
@@ -42,12 +43,11 @@ public class LitePullTests
     [Fact]
     public void Start_RejectsEpochLookingConsumeTimestamp()
     {
-        // 组名要合法且不能是保留的 DEFAULT_CONSUMER：checkConfig 排在起点校验之前，
-        // 用默认组只会测到组名那条错误。
+        // The group name must be legal and must not be the reserved DEFAULT_CONSUMER: checkConfig comes before the starting-point check, so using the default group would only exercise the group-name error.
         var c = new DefaultLitePullConsumer("LitePullTsGroup");
         c.SetNamesrvAddr("127.0.0.1:1");
         c.Subscribe("MyTopic", "*");
-        // 纯数字的 epoch 毫秒必须被拒（旧实现按 epoch 解释，静默算出错位起点）
+        // A purely numeric epoch millisecond value must be rejected (the old implementation interpreted it as an epoch and silently computed a wrong starting point)
         c.SetConsumeTimestamp("1700000000000");
         var ex = Assert.Throws<MQClientException>(c.Start);
         Assert.Contains("consumeTimestamp is invalid", ex.Message);
@@ -60,7 +60,7 @@ public class LitePullTests
         c.SetNamesrvAddr("127.0.0.1:1");
         c.Subscribe("MyTopic", "*");
         c.SetConsumeTimestamp("20230101000000");
-        // 合法值不能被这条启动守卫误杀（namesrv 不可达是另一回事）
+        // A legal value must not be killed by this startup guard (an unreachable namesrv is a different matter)
         var ex = Record.Exception(c.Start);
         Assert.DoesNotContain("consumeTimestamp is invalid", ex?.Message ?? string.Empty);
         c.Shutdown();
@@ -73,36 +73,38 @@ public class LitePullTests
 
         c.Subscribe("MyTopic", "TagA || TagB");
 
-        // assign（未启动时 resolve initial offset 会失败但必须被吞掉，不能崩）
+        // assign (resolving the initial offset while not started will fail but must be swallowed, it must not crash)
         var mq = new MessageQueue("MyTopic", "broker-a", 3);
         c.Assign(new[] { mq });
         Assert.Single(c.Assignment());
         Assert.Equal(3, c.Assignment()[0].QueueId);
 
-        // 未启动 committed 必须回 -1（没有 client 可查）
+        // committed must return -1 while not started (there is no client to query)
         Assert.Equal(-1, c.Committed(mq));
 
-        // poll 空缓冲：短超时返回空列表（不阻塞、不崩）
+        // poll with an empty buffer: a short timeout returns an empty list (no blocking, no crash)
         Assert.Empty(c.Poll(20));
 
-        // seek 未启动也要能登记位点（不查 broker）
+        // seek must be able to register an offset while not started too (it does not query the broker)
         c.Seek(mq, 42);
         Assert.Single(c.Assignment());
 
-        // pause / resume 未启动不崩
+        // pause / resume must not crash while not started
         c.Pause(new[] { mq });
         c.Resume(new[] { mq });
 
         c.Subscribe("MyTopic", "TagC");
     }
 
-    // ---------------------------------------------- 三张位点表（读写、覆盖与守卫）
+    // ---------------------------------------------- The three offset tables (read/write, overwrite and guards)
 
     /// <summary>
-    /// #68 的核心：拉取游标 / 已消费游标 / 内存位点表是三样东西，提交只能走第三样，
-    /// 而 commitAll 的取数来源是**已消费**游标。这里全程不起网络，靠 seek 与 commit(map)
-    /// 把三张表各自填满，再验守卫（-1、非本实例持有）、空入参、以及 persistAll 的
-    /// "remove unused mq" 清理。
+    /// The core of #68: the pull cursor / the consumed cursor / the in-memory offset table
+    /// are three different things and a commit may only go through the third, while the
+    /// data source of commitAll is the **consumed** cursor. No network is involved here:
+    /// seek and commit(map) fill each of the three tables, then the guards (-1, not held
+    /// by this instance), empty arguments and the "remove unused mq" cleanup of persistAll
+    /// are verified.
     /// </summary>
     [Fact]
     public void LitePullOffsetTable_ThreeTablesGuardsWithoutNetwork()
@@ -119,7 +121,7 @@ public class LitePullTests
         c.Commit();
         Assert.Equal(-1L, c.Committed(q0));
 
-        // Commit(map) 只写提交落点，两条游标一律不动
+        // Commit(map) only writes the commit landing point, neither cursor moves
         c.Commit(new Dictionary<MessageQueue, long> { [q0] = 5, [q1] = 8 }, persist: false);
         Assert.Equal(5L, c.Committed(q0));
         Assert.Equal(8L, c.Committed(q1));
@@ -127,33 +129,33 @@ public class LitePullTests
         Assert.Equal(-1L, c.ConsumeCursorOf(q0));
 
         c.Commit(new Dictionary<MessageQueue, long> { [q0] = -1, [stranger] = 3 }, persist: false);
-        Eq(5L, c.Committed(q0), "offset == -1 只记日志，不覆盖已有位点");
-        Eq(-1L, c.Committed(stranger), "没分配到的队列不替它提交");
+        Eq(5L, c.Committed(q0), "an offset of -1 is only logged, it does not overwrite an existing offset");
+        Eq(-1L, c.Committed(stranger), "a queue that was not assigned is not committed on its behalf");
 
         c.Commit(new Dictionary<MessageQueue, long>(), persist: false);
-        Eq(5L, c.Committed(q0), "空 map 忽略这次提交");
+        Eq(5L, c.Committed(q0), "an empty map ignores this commit");
         c.Commit(Array.Empty<MessageQueue>(), persist: false);
-        Eq(5L, c.Committed(q0), "空集合忽略这次提交");
+        Eq(5L, c.Committed(q0), "an empty set ignores this commit");
 
-        // Commit(Set) 取的是已消费游标，不是任意指定值：没交付过 ⇒ 守卫拦住
+        // Commit(Set) takes the consumed cursor, not any given value: nothing was delivered => the guard stops it
         c.Commit(new[] { q0 }, persist: false);
-        Eq(5L, c.Committed(q0), "Commit(Set) 在没有交付记录时不写 -1");
+        Eq(5L, c.Committed(q0), "Commit(Set) does not write -1 when there is no delivery record");
 
         c.Seek(q0, 2);
         Assert.Equal(2L, c.PullCursorOf(q0));
-        Eq(2L, c.ConsumeCursorOf(q0), "seek 也要改已消费游标，否则重放的段会被旧位点跳过");
+        Eq(2L, c.ConsumeCursorOf(q0), "seek must also move the consumed cursor, otherwise a replayed range would be skipped by the old offset");
 
         c.Assign(new[] { q0 });
         Assert.Equal(-1L, c.PullCursorOf(q1));
         Assert.Equal(-1L, c.ConsumeCursorOf(q1));
-        Eq(8L, c.Committed(q1), "assign 模式不碰 offsetStore");
+        Eq(8L, c.Committed(q1), "assign mode does not touch offsetStore");
         c.Commit(new Dictionary<MessageQueue, long> { [q1] = 99 }, persist: false);
-        Eq(8L, c.Committed(q1), "撤掉的队列不替它改位点");
+        Eq(8L, c.Committed(q1), "a withdrawn queue does not get its offset changed on its behalf");
 
         c.Commit(new[] { q0 }, persist: true);
-        Eq(2L, c.Committed(q0), "Commit(Set) 提交的是已消费游标");
-        Eq(-1L, c.Committed(q1), "persistAll 会把没点名的队列从内存表里丢掉");
-        Eq(2L, c.PendingCommitOf(q0), "点名的队列留在表里");
+        Eq(2L, c.Committed(q0), "Commit(Set) commits the consumed cursor");
+        Eq(-1L, c.Committed(q1), "persistAll drops an unnamed queue from the in-memory table");
+        Eq(2L, c.PendingCommitOf(q0), "a named queue stays in the table");
     }
 
     // ---------------------------------------------- 221 GetConsumerStatusBody
@@ -166,8 +168,7 @@ public class LitePullTests
         b.MessageQueueTable[new MessageQueue("MyTopic", "broker-a", 1)] = 7;
 
         string json = System.Text.Encoding.UTF8.GetString(b.Encode());
-        // 键是 fastjson2 风格的 MessageQueue 内联 JSON（字母序：brokerName, queueId, topic），
-        // 作为**转义字符串键**序列化（与已真机验证过的 307 MqTable 同款编码）
+        // The key is fastjson2-style inline MessageQueue JSON (alphabetical: brokerName, queueId, topic), serialised as an **escaped string key** (the same encoding as the already machine-verified 307 MqTable)
         Assert.Contains(
             "\"{\\\"brokerName\\\":\\\"broker-a\\\",\\\"queueId\\\":3,\\\"topic\\\":\\\"MyTopic\\\"}\":42",
             json);
@@ -208,7 +209,7 @@ public class LitePullTests
         };
         Assert.True(ConsumeMessageDirectlyResult.Decode(bad.Encode(), out ConsumeMessageDirectlyResult back));
         Assert.True(back.Order);
-        Assert.True(back.AutoCommit);   // 往返保持默认 true
+        Assert.True(back.AutoCommit);   // the round trip keeps the default true
         Assert.Equal("CR_THROW_EXCEPTION", back.ConsumeResult);
         Assert.Equal("std::exception: boom", back.Remark);
         Assert.Equal(33, back.SpentTimeMills);

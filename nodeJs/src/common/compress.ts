@@ -1,19 +1,19 @@
 // -*- coding: utf-8 -*-
-// LZ4 block + frame 编解码与一个最小可用的 ZSTD frame 编解码 —— 纯 TypeScript，
-// 零第三方依赖（仓库规则）。
+// LZ4 block + frame codec and a minimal usable ZSTD frame codec — pure TypeScript,
+// zero third-party dependencies (repository rule).
 //
-// LZ4：经典 remoting 协议在 wire 上传的是 **LZ4 Frame 格式**（服务端按 Frame 规范
-// 落盘与下发，lz4 CLI 走的也是同一份规范），所以压缩分派调用的是
-// `lz4CompressFrame`/`lz4DecompressFrame`；下面的 block 层是每个 frame 块内部装的东西。
-// 为什么不能只发裸 block，见后文 ⚠ 说明。
+// LZ4: the classic remoting protocol transmits **LZ4 Frame format** on the wire (the server persists
+// and dispatches per the Frame spec, and the lz4 CLI uses the same spec), so compression dispatch
+// calls `lz4CompressFrame`/`lz4DecompressFrame`; the block layer below is what each frame block wraps internally.
+// Why a bare block cannot be sent alone is explained later (see the ⚠ note).
 //
-// ZSTD：走 `node:zlib` 的 zstd 绑定做真压缩 —— Node 自带，仍然零第三方依赖。这一
-// 点很重要：broker 侧写的可能是**压缩过的** Compressed block，只会读 Raw/RLE 帧
-// 的解码器无法解出 broker 或其他 producer 写出的消息。
-// 在没有该绑定的运行环境（< 23.8）上，退化为下面手写的编解码：ENCODE 输出仅由
-// RAW block 组成的合法 zstd 帧（长重复段用 RLE），任何标准解码器都能接；DECODE 只
-// 认 Raw/RLE 帧。回退路径遇到 Compressed block 抛明确错误 ——
-// **不支持就抛，绝不静默 passthrough**。
+// ZSTD: compression uses the `node:zlib` zstd binding — bundled with Node, still zero third-party deps. This
+// matters: the broker may write **compressed** Compressed blocks, and a decoder that only reads Raw/RLE frames
+// cannot decode messages written by the broker or other producers.
+// On runtimes without that binding (< 23.8) we fall back to the hand-written codec below: ENCODE emits only
+// valid zstd frames made of RAW blocks (long repeated runs use RLE), which any standard decoder accepts; DECODE only
+// understands Raw/RLE frames. The fallback throws a clear error on a Compressed block —
+// **if unsupported, throw; never silently pass through**.
 import zlib from 'node:zlib';
 import { MessageSysFlag } from './sysflag.ts';
 
@@ -29,8 +29,8 @@ function lz4Hash(u32: number): number {
   return Math.imul(u32, 2654435761) >>> (32 - LZ4_HASH_LOG);
 }
 
-// lz4CompressBlock 把 data 编成一个 LZ4 block（不带 frame header）——
-// RocketMQ wire 上放的就是裸 block，作为 frame 的一块。
+// lz4CompressBlock encodes data into one LZ4 block (without a frame header) —
+// what RocketMQ places on the wire is the bare block, as one block of a frame.
 export function lz4CompressBlock(data: Buffer): Buffer {
   const n = data.length;
   if (n === 0) return Buffer.alloc(0);
@@ -145,16 +145,16 @@ export function lz4DecompressBlock(data: Buffer): Buffer {
 
 // ---------------------------------------------------------------- LZ4 frame
 
-// ⚠ RocketMQ wire 上的 LZ4 是 **LZ4 Frame 格式**（服务端按 LZ4 Frame 规范读写）——
-// 裸 block 只能自环自解，跟 broker 或其他任何 writer 写出的消息都解不开。此前的
-// block 直发是隐藏缺陷（一直要到压缩互通验证时才暴露出来）。
+// ⚠ The LZ4 on RocketMQ's wire is the **LZ4 Frame format** (the server reads/writes per the LZ4 Frame spec) —
+// a bare block can only round-trip with itself and cannot decode messages written by the broker or any other writer.
+// Sending a bare block directly was a latent defect (only exposed when compression interoperability was tested).
 // Frame = magic + FLG + BD + [C.Size(8B)] + HC + {BlockSize(4B) + block}*
-//         + EndMark(4B) + [C.Checksum(4B)]；block 就是上面的裸 block 层。
+//         + EndMark(4B) + [C.Checksum(4B)]; a block is the bare block layer described above.
 
 const LZ4_MAGIC = 0x184d2204;
-const LZ4_FRAME_BLOCK_SIZE = 65536; // BD=0x40 → 64KB，与 LZ4 Frame 常规默认一致
+const LZ4_FRAME_BLOCK_SIZE = 65536; // BD=0x40 → 64KB, matching the common LZ4 Frame default
 
-// xxhash32（Frame 的 HC 与 C.Checksum 用）。Math.imul 天然 mod 2^32。
+// xxhash32 (used for the Frame's HC and C.Checksum). Math.imul is naturally mod 2^32.
 export function xxh32(data: Buffer, seed = 0): number {
   const P1 = 2654435761, P2 = 2246822519, P3 = 3266489917, P4 = 668265263, P5 = 374761393;
   const n = data.length;
@@ -183,7 +183,7 @@ export function xxh32(data: Buffer, seed = 0): number {
     h = (seed + P5) >>> 0;
   }
   h = (h + n) >>> 0;
-  // 尾部 4 字节轮用 P3/P4（XXH32_finalize 官方口径；不是 P5/P1）
+  // The trailing 4 bytes cycle through P3/P4 (per the official XXH32_finalize spec; not P5/P1)
   while (i + 4 <= n) {
     h = (h + Math.imul(data.readUInt32LE(i), P3)) >>> 0;
     h = (((h << 17) | (h >>> 15)) >>> 0);
@@ -204,8 +204,9 @@ export function xxh32(data: Buffer, seed = 0): number {
   return h >>> 0;
 }
 
-// lz4CompressFrame 压成 LZ4 Frame（服务端约定的规范）。FLG = version01 | B.Indep |
-// C.Size；不带块校验/内容校验（沿用 Frame 常规默认）；块压不动时存 raw 块（bit31 置位）。
+// lz4CompressFrame compresses into an LZ4 Frame (the spec the server expects). FLG = version01 | B.Indep |
+// C.Size; no block checksum / content checksum (following the common Frame default); when a block cannot be
+// compressed it is stored as a raw block (bit31 set).
 export function lz4CompressFrame(data: Buffer): Buffer {
   const flg = 0x40 | 0x20 | 0x08; // version=01, B.Indep=1, C.Size=1
   const bd = 0x40; // BlockMaxSize=64KB
@@ -213,7 +214,7 @@ export function lz4CompressFrame(data: Buffer): Buffer {
   const cs = Buffer.alloc(8);
   cs.writeBigUInt64LE(BigInt(data.length), 0);
   const parts: Buffer[] = [Buffer.from([0x04, 0x22, 0x4d, 0x18]), header, cs];
-  // HC = xxh32(FLG+BD+C.Size, 0) 的第二字节
+  // HC = the second byte of xxh32(FLG+BD+C.Size, 0)
   parts.push(Buffer.from([((xxh32(Buffer.concat([header, cs])) >>> 8) & 0xff)]));
   const n = data.length;
   let pos = 0;
@@ -223,7 +224,7 @@ export function lz4CompressFrame(data: Buffer): Buffer {
     const block = lz4CompressBlock(chunk);
     const sizeField = Buffer.alloc(4);
     if (block.length === 0 || block.length >= chunk.length) {
-      // 压不动：存 raw 块（bit31 置位）
+      // Cannot compress: store a raw block (bit31 set)
       sizeField.writeUInt32LE((0x80000000 | chunk.length) >>> 0, 0);
       parts.push(sizeField, chunk);
     } else {
@@ -235,7 +236,7 @@ export function lz4CompressFrame(data: Buffer): Buffer {
   return Buffer.concat(parts);
 }
 
-// lz4DecompressFrame 解 LZ4 Frame；坏 magic/坏 HC/坏块一律抛异常。
+// lz4DecompressFrame decodes an LZ4 Frame; a bad magic / bad HC / bad block always throws.
 export function lz4DecompressFrame(data: Buffer): Buffer {
   if (data.length < 7) throw new Error('lz4 frame decompress: input too short');
   if (data.readUInt32LE(0) !== LZ4_MAGIC) {
@@ -247,14 +248,14 @@ export function lz4DecompressFrame(data: Buffer): Buffer {
   const blockChecksum = (flg & 0x10) !== 0;
   const contentSizeFlag = (flg & 0x08) !== 0;
   const contentChecksum = (flg & 0x04) !== 0;
-  p += 1; // BD（解码按块头 size 走，BlockMaxSize 不需要）
+  p += 1; // BD (decoding follows the block header size; BlockMaxSize is not needed)
   let contentSize = 0;
   if (contentSizeFlag) {
     if (p + 8 > data.length) throw new Error('lz4 frame decompress: truncated content size');
     contentSize = Number(data.readBigUInt64LE(p));
     p += 8;
   }
-  // HC = xxh32(FLG+BD+[C.Size]) 的第二字节（header checksum 存在于标准帧）
+  // HC = the second byte of xxh32(FLG+BD+[C.Size]) (the header checksum exists in standard frames)
   const headerEnd = p;
   if (p >= data.length) throw new Error('lz4 frame decompress: truncated header checksum');
   const hc = data[p++];
@@ -343,9 +344,9 @@ function isRunOfOneByte(data: Buffer, from: number, len: number): boolean {
   return true;
 }
 
-// zstdDecompressFrame 是不依赖外部绑定的回退解码：只解由 Raw/RLE block 组成的 ZSTD
-// 帧（也就是 zstdCompressRaw 自己写出、以及旧版 Node 写出的那种）。Compressed block
-// ——真实 zstd 编码器（服务端 writer 用的那类）产出的块——会抛错；请用 zstdDecompress。
+// zstdDecompressFrame is the binding-independent fallback decoder: it only decodes ZSTD frames made of Raw/RLE
+// blocks (the kind zstdCompressRaw itself writes, and older Node versions wrote). A Compressed block
+// — produced by a real zstd encoder (the kind the server writer uses) — will throw; use zstdDecompress instead.
 export function zstdDecompressFrame(data: Buffer): Buffer {
   let p = 0;
   if (data.length < 4) throw new Error('zstd decompress: input too short');
@@ -404,8 +405,9 @@ const nodeZstd = (zlib as unknown as {
 const HAS_NODE_ZSTD = typeof nodeZstd.zstdCompressSync === 'function'
   && typeof nodeZstd.zstdDecompressSync === 'function';
 
-// zstdCompress 写真正的 zstd 帧（level 1..22；<=0 走库默认，broker 侧 writer 也走
-// 库默认）。没有绑定就退化为只写 Raw/RLE 的存帧——线上合法，只是没有压缩收益。
+// zstdCompress writes a real zstd frame (level 1..22; <=0 uses the library default, as does the broker-side
+// writer). Without the binding it falls back to a stored frame that only writes Raw/RLE — valid on the wire,
+// just with no compression benefit.
 export function zstdCompress(data: Buffer, level?: number): Buffer {
   if (!HAS_NODE_ZSTD) return zstdCompressRaw(data);
   return level && level >= 1
@@ -426,9 +428,9 @@ export function zstdDecompress(data: Buffer): Buffer {
 // compressFor encodes `data` for the given MessageSysFlag compression type
 // (the value at bit 8-10 of sysFlag: 1=LZ4, 2=ZSTD, 3=ZLIB).
 //
-// `level` 是 producer 配的 compressLevel（默认 5，范围 0-9）。ZLIB 直接把它当 deflate
-// level 用；ZSTD 把它映射到 zstd level（1-9 两个刻度都合法）。LZ4 的 block 格式没有
-// level 概念。
+// `level` is the compressLevel configured on the producer (default 5, range 0-9). ZLIB uses it directly as the deflate
+// level; ZSTD maps it onto the zstd level (both the 1-9 scale and others are valid). LZ4's block format has no
+// notion of level.
 export function compressFor(data: Buffer, compressionType: number, level: number = 5): Buffer {
   switch (compressionType) {
     case MessageSysFlag.ZLIB_TYPE: {
@@ -454,8 +456,8 @@ export function decompressFor(data: Buffer, compressionType: number): Buffer {
   }
 }
 
-// compressionTypeByName 把 producer 面向用户的压缩名（"ZLIB"/"LZ4"/"ZSTD" 等）映到
-// sysFlag 里的数值。名字大小写不敏感，也接受数字字符串。
+// compressionTypeByName maps the producer-facing compression name ("ZLIB"/"LZ4"/"ZSTD", etc.) onto
+// the numeric value in sysFlag. The name is case-insensitive and numeric strings are also accepted.
 export function compressionTypeByName(name: string | number): number {
   if (typeof name === 'number') {
     if (name === MessageSysFlag.LZ4_TYPE || name === MessageSysFlag.ZSTD_TYPE

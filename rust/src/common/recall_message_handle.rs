@@ -1,8 +1,8 @@
-//! handle 由 **broker** 在 SEND 响应的 `recallHandle` 字段里下发（只给定时消息，见
-//! `SendMessageProcessor#attachRecallHandle`），内容是 base64url 编码的
-//! `v1 <topic> <brokerName> <deliverMs> <uniqKey>`（空格分隔）。
-//! 客户端 `recallMessage(370)` 时既要原样把 handle 发回去，又要从里面读 `brokerName`
-//! 来决定请求打到哪台 broker —— 拿不到 handle 就只能靠 topic 路由碰运气。
+//! The handle is issued by the **broker** in the `recallHandle` field of the SEND response (only for timer messages),
+//! and its content is the base64url encoding of
+//! `v1 <topic> <brokerName> <deliverMs> <uniqKey>` (space-separated).
+//! When the client calls `recallMessage(370)` it must both send the handle back verbatim and read `brokerName` from it
+//! to decide which broker the request goes to -- without the handle it can only fall back to topic routing and hope.
 
 use base64::Engine;
 
@@ -56,7 +56,7 @@ mod tests {
     fn client_message(err: Error) -> String {
         match err {
             Error::Client { message, .. } => message,
-            other => panic!("期望客户端错误，实际 {other}"),
+            other => panic!("expected a client error, got {other}"),
         }
     }
 
@@ -75,8 +75,8 @@ mod tests {
         );
     }
 
-    /// 载荷 `"v1 TopicA broker-a 1700000000000 <UNIQ_KEY>"` 的 base64url，
-    /// 用 URL 安全的 Base64 编码器口径（含填充）算出。
+    /// base64url of the payload `"v1 TopicA broker-a 1700000000000 <UNIQ_KEY>"`,
+    /// computed with the URL-safe Base64 encoder variant (with padding).
     #[test]
     fn encoding_matches_the_wire_vector() {
         assert_eq!(
@@ -90,7 +90,7 @@ mod tests {
     fn padded_and_unpadded_handles_both_decode() {
         let padded = build_handle("TopicA", "broker-a", "1700000000000", UNIQ_KEY);
         let unpadded = padded.trim_end_matches('=').to_string();
-        assert_ne!(padded, unpadded, "URL 安全编码器确实会补填充");
+        assert_ne!(padded, unpadded, "the URL-safe encoder does add padding");
         assert_eq!(
             decode_handle(&unpadded).expect("unpadded"),
             decode_handle(&padded).expect("padded")

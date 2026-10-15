@@ -1,19 +1,19 @@
-//! 跨语言压缩互通的一端：`send` 发一条会自动压缩的消息，`recv` 用
-//! [`DefaultLitePullConsumer`] 收回来并本地重建同一份载荷比 CRC32。
+//! One end of the cross-language compression interop matrix: `send` sends a message that gets compressed automatically, `recv`
+//! uses [`DefaultLitePullConsumer`] to receive it back, rebuilds the same payload locally and compares CRC32.
 //!
 //!
-//! 用法：
+//! Usage:
 //! ```text
 //! cargo run --example live_compression_matrix -- send <topic> <group> <size> [namesrv] [codec]
 //! cargo run --example live_compression_matrix -- recv <topic> <group> <size> [namesrv] [codec]
 //! cargo run --example live_compression_matrix -- reuse <topic> <group> <size> [namesrv] [codec]
 //! ```
 //!
-//! `codec`（`zlib` / `lz4` / `zstd`，默认 `zlib`）只决定发送端用哪个压缩算法；
-//! 接收端按消息 sysFlag 的类型位自动解压，传不传都一样。
+//! `codec` (`zlib` / `lz4` / `zstd`, default `zlib`) only decides which compression algorithm the sender uses;
+//! the receiver decompresses automatically according to the message sysFlag type bits, with or without it.
 //!
-//! `recv` 走 lite 拉取消费者（订阅 + 后台灌缓冲 + poll），顺带证明解压发生在
-//! 解码路径里（`MessageDecoder` 会清掉 `COMPRESSED_FLAG`）。
+//! `recv` goes through the lite pull consumer (subscribe + background buffer fill + poll), and incidentally proves that decompression happens
+//! in the decode path (`MessageDecoder` clears the `COMPRESSED_FLAG`).
 
 use std::env;
 use std::process::ExitCode;
@@ -48,8 +48,8 @@ fn usage() -> ExitCode {
     ExitCode::FAILURE
 }
 
-/// `zlib` / `lz4` / `zstd` → [`MessageSysFlag`] 的算法号；未知名字直接失败，
-/// 免得矩阵里把「拼错 codec」当成「互通失败」。
+/// `zlib` / `lz4` / `zstd` → the [`MessageSysFlag`] algorithm numbers; an unknown name fails outright,
+/// so the matrix does not mistake "a misspelled codec" for "an interop failure".
 fn parse_codec(raw: &str) -> Result<i32, String> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "" | "zlib" => Ok(MessageSysFlag::ZLIB_TYPE),
@@ -112,7 +112,7 @@ async fn main() -> ExitCode {
     }
 }
 
-/// `group` 只在 recv 侧有用；send 侧用它派生一个稳定的 producer group。
+/// `group` is only meaningful on the recv side; the send side derives a stable producer group from it.
 async fn send(
     namesrv: &str,
     topic: &str,
@@ -135,7 +135,7 @@ async fn send(
         eprintln!("SEND_FAIL bad codec {codec}: {e}");
         return ExitCode::FAILURE;
     }
-    // 阈值以下不会压缩，矩阵要的是「真的压过」，所以调用方给够载荷尺寸（默认阈值 4 KiB）。
+    // Below the threshold nothing gets compressed, and the matrix needs "really compressed", so the caller supplies a large enough payload (default threshold 4 KiB).
     if let Err(e) = producer.start().await {
         eprintln!("SEND_FAIL start failed: {e}");
         return ExitCode::FAILURE;
@@ -160,7 +160,7 @@ async fn send(
     }
 }
 
-/// 起一个 lite 拉取消费者，尽量收满 `want` 条（60s 超时）；搭建失败返回 `None`。
+/// Starts a lite pull consumer and collects up to `want` messages (60s timeout); returns `None` if setup fails.
 async fn collect(namesrv: &str, topic: &str, group: &str, want: usize) -> Option<Vec<MessageExt>> {
     let cfg = LitePullConsumerConfig {
         consumer_group: group.to_string(),
@@ -225,7 +225,7 @@ async fn recv(namesrv: &str, topic: &str, group: &str, payload: &[u8], crc: u32)
     }
 }
 
-/// 同一条 `Message` 连发两次，再各收一条回来比对。
+/// Sends the same `Message` twice in a row, then receives one back for each and compares.
 async fn reuse(
     namesrv: &str,
     topic: &str,

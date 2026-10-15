@@ -1,28 +1,36 @@
-// C# 客户端的**真实集群**消息类型联调。
+// **Real cluster** message type integration of the C# client.
 //
-// 覆盖 11 类消息能力，全部打真实 nameServer + broker：
-//   1. 同步普通消息（Send → SEND_MESSAGE_V2，落库读回）
-//   2. 异步发送（sendAsync + SendCallback）
-//   3. 单向发送（SendOneway，只发不等响应；只能靠读回计数佐证）
-//   4. 顺序消息（sendBySelector 同 key 落同队列 + 顺序消费保序）
-//   5. 带 Tag 消息 + 服务端 Tag 过滤
-//   6. 用户属性透传
-//   7. 延迟消息（setDelayTimeLevel 并校验 store_ts - born_ts >= 3000ms）
-//   8. 定时消息（TIMER_DELIVER_MS 属性，broker 定时仓储二级存储后投递，同样校验投递延迟）
-//   9. 带 Key 消息 + 按 Key 服务端查询（QUERY_MESSAGE）
-//  10. 事务消息（两阶段的提交路径；完整链路见 RunTransaction）+ 落库可消费
-//  11. 批量消息（SendBatch → SEND_BATCH_MESSAGE(320)，broker 按 N 条独立消息投递、offset 连续）
-//  附：消费者心跳注册（HEART_BEAT）
+// Covers 11 message capabilities, all against a real nameServer + broker:
+//   1. a synchronous ordinary message (Send -> SEND_MESSAGE_V2, persisted and read back)
+//   2. an async send (sendAsync + SendCallback)
+//   3. a oneway send (SendOneway, fires and does not wait for a response; only the read-back
+//      count can corroborate it)
+//   4. an orderly message (sendBySelector routes the same key to the same queue + orderly
+//      consumption preserves the order)
+//   5. a tagged message + server-side tag filtering
+//   6. user property pass-through
+//   7. a delayed message (setDelayTimeLevel plus verifying store_ts - born_ts >= 3000ms)
+//   8. a scheduled message (the TIMER_DELIVER_MS property; the broker puts it in the timer
+//      store's secondary storage and delivers it later, again verifying the delivery delay)
+//   9. a keyed message + server-side lookup by key (QUERY_MESSAGE)
+//  10. a transactional message (the two-phase commit path; the full chain is in
+//      RunTransaction) + consumable after being persisted
+//  11. a batch message (SendBatch -> SEND_BATCH_MESSAGE(320); the broker delivers it as N
+//      independent messages with contiguous offsets)
+//  In addition: consumer heartbeat registration (HEART_BEAT)
 //
-// 本程序自身不启动集群；调用方需先启动 nameServer(9876) + broker(10911) 且
-// autoCreateTopicEnable=true。用法（由 Program 以
-// "message-types [namesrv] [ak] [sk]" 形式调用）。
+// This program does not start a cluster itself; the caller must start nameServer(9876) +
+// broker(10911) first with autoCreateTopicEnable=true. Usage (called by Program in the
+// form "message-types [namesrv] [ak] [sk]").
 //
-// 传了 accessKey/secretKey 时（broker 开 authenticationEnabled 的集群）：
-//   - 本程序引导的**每个**客户端（生产者 / push 消费者 / admin）都挂上 ACL 凭据；
-//   - 先跑一个不带凭据的探测生产者，断言其发送被拒（NO_PERMISSION=16）——
-//     没有这条反向断言，在未开鉴权的集群上全绿只是假通过。
-// 不带凭据时行为与旧版完全一致（纯文本集群的 harness 照常可用）。
+// When accessKey/secretKey are passed (a cluster with the broker's authenticationEnabled on):
+//   - **every** client this program brings up (producer / push consumer / admin) gets the ACL
+//     credentials attached;
+//   - a probe producer without credentials runs first and its send is asserted to be
+//     rejected (NO_PERMISSION=16) -- without this reverse assertion, being all green on a
+//     cluster without auth enabled would just be a false pass.
+// Without credentials the behaviour is exactly as in the old version (the plain-text cluster
+// harness still works).
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -34,12 +42,13 @@ using RocketMQ.Remoting.Protocol;
 
 namespace RocketMQ.Examples;
 
-/// <summary>真实集群 11 类消息能力联调（可选 ACL 凭据 + 无凭据反向断言）。</summary>
+/// <summary>Real cluster integration of 11 message capabilities (optional ACL credentials plus the no-credentials reverse assertion).</summary>
 internal static class LiveMessageTypes
 {
     private static string _gNamesrv = "127.0.0.1:9876";
     private static string _gPrefix = string.Empty;
-    // ACL 凭据：两者都非空才生效；为空时所有客户端不挂钩子，行为与旧版一致。
+    // ACL credentials: they only take effect when both are non-empty; when empty no client
+    // gets a hook and the behaviour is exactly as in the old version.
     private static string _gAk = string.Empty;
     private static string _gSk = string.Empty;
     private static bool WithAcl => _gAk.Length > 0 && _gSk.Length > 0;
@@ -47,11 +56,13 @@ internal static class LiveMessageTypes
     private static int _gPass;
     private static int _gFail;
 
-    // broker 侧鉴权失败的统一响应码（详见本目录 acl 用例）。
+    // The broker's uniform response code for an auth failure (see the acl cases in this directory).
     private const int NoPermission = 16;
 
-    // 给本程序引导的每类客户端装 ACL 凭据。三者的 SetCredentials 语义一致：
-    // Start() 前绑定，Start() 时经 RequestHooks.Compose 注册进传输层单槽钩子。
+    // Attaches the ACL credentials to every kind of client this program brings up. The
+    // SetCredentials semantics are the same for all three: bound before Start() and
+    // registered into the transport layer's single hook slot by RequestHooks.Compose during
+    // Start().
     private static void ApplyCreds(DefaultMQProducer prod)
     {
         if (WithAcl) prod.SetCredentials(_gAk, _gSk);
@@ -79,7 +90,7 @@ internal static class LiveMessageTypes
 
     private static byte[] Str2Bytes(string s) => Encoding.UTF8.GetBytes(s);
 
-    // ---------------- 监听器 ----------------
+    // ---------------- listeners ----------------
 
     private sealed class CollectingListenerConcurrently : IMessageListenerConcurrently
     {
@@ -162,7 +173,7 @@ internal static class LiveMessageTypes
             LocalTransactionState.CommitMessage;
     }
 
-    /// <summary>本地事务回滚：broker 不应把半消息投递出来。</summary>
+    /// <summary>The local transaction rolls back: the broker must not deliver the half message.</summary>
     private sealed class RollbackTxListener : ITransactionListener
     {
         public LocalTransactionState ExecuteLocalTransaction(Message msg, string arg) =>
@@ -173,8 +184,10 @@ internal static class LiveMessageTypes
     }
 
     /// <summary>
-    /// 本地事务返回 Unknow，等 broker 回查时才判 Commit。
-    /// CheckCalls 用于证明 **broker 确实回调过**（否则"最终收到"可能只是普通消息路径）。
+   /// The local transaction returns Unknow and Commit is only decided when the broker checks
+    /// back.
+    /// CheckCalls exists to prove the broker **really called back** (otherwise "eventually
+    /// received" could just be the ordinary message path).
     /// </summary>
     private sealed class UnknownThenCommitTxListener : ITransactionListener
     {
@@ -192,9 +205,10 @@ internal static class LiveMessageTypes
         }
     }
 
-    // ---------------- 消费辅助 ----------------
+    // ---------------- consumption helpers ----------------
 
-    // 活跃等待直至收到 expect 条（或最多 durationSec 秒），再关闭消费者，返回已收到的消息。
+    // Waits actively until expect messages arrive (or at most durationSec seconds), then
+  // closes the consumer and returns the messages received.
     private static List<MessageExt> RunConsumer(string topic, string subExpr, int durationSec,
         bool orderly, string groupSuffix, int expect = 0, int pullTimeout = 3000, int pullSuspend = 1000)
     {
@@ -227,7 +241,8 @@ internal static class LiveMessageTypes
         return msgs;
     }
 
-    // 等待 broker 在 nameServer 注册完成（避免端口刚开、注册未落地的竞态）
+    // Wait for the broker's registration with the nameServer to complete (avoiding the race
+  // where the port is just opened but the registration has not landed)
     private static List<string> WaitBroker(DefaultMQProducer prod)
     {
         var addrs = new List<string>();
@@ -246,7 +261,7 @@ internal static class LiveMessageTypes
             }
             catch (Exception)
             {
-                // 路由还没就绪，继续等
+   // the route is not ready yet, keep waiting
             }
 
             Thread.Sleep(1000);
@@ -255,7 +270,7 @@ internal static class LiveMessageTypes
         return addrs;
     }
 
-    // ---------------- 入口 ----------------
+    // ---------------- entry point ----------------
 
     public static int Run(string[] args)
     {
@@ -269,17 +284,21 @@ internal static class LiveMessageTypes
         long stamp = UtilAll.CurrentTimeSeconds();
         _gPrefix = "MTDotnet_" + stamp;
 
-        Console.WriteLine("=== C# 客户端消息类型联调（真实集群）===");
+        Console.WriteLine("=== C# client message type integration (real cluster) ===");
         Console.WriteLine("namesrv = " + _gNamesrv + "  prefix = " + _gPrefix +
                           "  acl = " + (WithAcl ? "on(ak=" + _gAk + ")" : "off"));
 
-        // ---------- 0. 反向断言：不带凭据的发送必须被拒（NO_PERMISSION=16） ----------
-        // 只有传了凭据才跑：这一半断言用来戳穿「集群其实没开鉴权」的假通过。
-        // 探测发送打到 TBW102（每个 broker 启动即注册默认 topic，路由必然可解析；
-        // 若打全新 topic，无路由会在本地先炸，根本走不到 broker 的鉴权环节）。
-        // 探测生产者放在**第一个**启动：本端口的客户端 Start() 时默认 instanceName 会被
-        // 改写成 <pid>#<nanoTime>，每个客户端各自独占一个 MQClientInstance 与传输层
-        // 钩子槽，本不存在「先到先得」的串扰；仍按先起先关的顺序跑，两种实例语义下都安全。
+        // ---------- 0. the reverse assertion: a send without credentials must be rejected (NO_PERMISSION=16) ----------
+     // This half only runs when credentials were passed: it exists to puncture the false
+   // pass of "the cluster actually has auth disabled".
+        // The probe send targets TBW102 (every broker registers the default topic on
+    // startup, so the route always resolves; against a brand new topic the missing route
+        // would blow up locally and never reach the broker's auth step).
+        // The probe producer is started **first**: in this port a client's Start()
+        // rewrites the default instanceName to <pid>#<nanoTime>, and each client owns its
+    // own MQClientInstance and transport hook slot, so there is no first-come-first-served
+        // cross-talk to begin with; running it first-started-first-stopped is safe under
+        // both instance semantics anyway.
         if (WithAcl)
         {
             var probe = new DefaultMQProducer(_gPrefix + "_probe")
@@ -295,7 +314,7 @@ internal static class LiveMessageTypes
                 try
                 {
                     probe.Send(new Message(MixAll.DefaultTopic, Str2Bytes("no-cred-probe")));
-                    probeDetail = "unexpectedly succeeded（集群可能没开鉴权）";
+        probeDetail = "unexpectedly succeeded (the cluster may not have auth enabled)";
                 }
                 catch (MQBrokerException e)
                 {
@@ -305,7 +324,8 @@ internal static class LiveMessageTypes
                 }
                 catch (Exception e)
                 {
-                    // 部分管理路径会把底层异常拼进消息文本，按码值文本兜底识别。
+           // Some admin paths splice the underlying exception into the message text, so
+    // fall back to identifying it by the code's text.
                     probeDetail = e.Message;
                     rejected = probeDetail.Contains("CODE: "
                                  + NoPermission.ToString(CultureInfo.InvariantCulture), StringComparison.Ordinal);
@@ -320,8 +340,9 @@ internal static class LiveMessageTypes
                 probe.Shutdown();
             }
 
-            Check("反向: 无凭据发送被拒(NO_PERMISSION=16)", rejected, probeDetail);
-            // 关停后再等一拍，确保探测实例的资源彻底归还，不影响后续正式客户端。
+  Check("reverse: a send without credentials is rejected (NO_PERMISSION=16)", rejected, probeDetail);
+            // Wait a beat after shutting down, to make sure the probe instance's resources are
+   // fully returned so they cannot affect the real clients afterwards.
             Thread.Sleep(1000);
         }
 
@@ -337,22 +358,23 @@ internal static class LiveMessageTypes
         }
         catch (Exception e)
         {
-            Check("生产者启动", false, e.Message);
+    Check("the producer started", false, e.Message);
             return 1;
         }
 
         List<string> brokers = WaitBroker(prod);
         if (brokers.Count == 0)
         {
-            Check("集群探活", false, "nameServer 无 broker 注册");
+            Check("the cluster liveness probe", false, "the nameServer has no broker registered");
             prod.Shutdown();
             return 1;
         }
 
-        Check("集群探活", true, "brokers=" + string.Join(",", brokers));
+        Check("the cluster liveness probe", true, "brokers=" + string.Join(",", brokers));
 
-        // 预建本用例全部 topic：新 topic 只能等 broker 每 30s 一轮的
-        // registerNameServerPeriod 才进路由，期间消费者的订阅是空转的。
+        // Pre-create every topic this case uses: a new topic only enters the route after the
+    // broker's registerNameServerPeriod round (one every 30s), and until then the consumer's
+  // subscription just spins doing nothing.
         {
             var admin = new DefaultMQAdminExt();
             admin.SetNamesrvAddr(_gNamesrv);
@@ -371,14 +393,14 @@ internal static class LiveMessageTypes
             }
             catch (Exception e)
             {
-                Console.WriteLine("  预建 topic 失败（改用自动创建）: " + e.Message);
+   Console.WriteLine("  pre-creating the topic failed (falling back to auto-creation): " + e.Message);
             }
             admin.Shutdown();
         }
 
         long t0 = UtilAll.CurrentTimeMillis();
 
-        // ---------- 1. 同步普通消息 ----------
+      // ---------- 1. a synchronous ordinary message ----------
         {
             string topic = _gPrefix + "_Normal";
             var bodies = new List<string>();
@@ -402,12 +424,12 @@ internal static class LiveMessageTypes
             List<MessageExt> run = RunConsumer(topic, "*", 12, false, "normal", expect: 3);
             var got = run.Select(m => Bytes2Str(m.Body)).OrderBy(x => x, StringComparer.Ordinal).ToList();
             bool readBack = got.SequenceEqual(bodies.OrderBy(x => x, StringComparer.Ordinal));
-            Check("同步普通发送(SendOk)", allOk);
-            Check("同步普通消息落库读回 3/3", readBack,
+       Check("the synchronous ordinary send is SendOk", allOk);
+    Check("the 3/3 synchronous ordinary messages are persisted and read back", readBack,
                 "received=" + run.Count.ToString(CultureInfo.InvariantCulture));
         }
 
-        // ---------- 2. 异步发送 ----------
+        // ---------- 2. an async send ----------
         {
             string topic = _gPrefix + "_Async";
             var cb = new CollectingCallback();
@@ -418,7 +440,7 @@ internal static class LiveMessageTypes
             }
             catch (Exception e)
             {
-                Check("异步发送 sendAsync", false, "throw: " + e.Message);
+          Check("the async send sendAsync", false, "throw: " + e.Message);
             }
 
             for (int i = 0; i < 200 && cb.Ok() + cb.Err() == 0; ++i)
@@ -428,13 +450,15 @@ internal static class LiveMessageTypes
 
             List<SendResult> rs = cb.Results();
             bool ok = cb.Ok() == 1 && cb.Err() == 0 && rs.Count > 0 && rs[0].SendStatus == SendStatus.SendOk;
-            Check("异步发送 sendAsync", ok, "ok=" + cb.Ok().ToString(CultureInfo.InvariantCulture)
+   Check("the async send sendAsync", ok, "ok=" + cb.Ok().ToString(CultureInfo.InvariantCulture)
                   + " err=" + cb.Err().ToString(CultureInfo.InvariantCulture));
         }
 
-        // ---------- 3. 单向发送（SendOneway）----------
-        // 单向不等 broker 响应，本端只能证明「发出去且 broker 真落了库」：
-        // 判据取消费侧读回条数（这是全程序里唯一允许只靠读回计数的类型）。
+        // ---------- 3. a oneway send (SendOneway)----------
+  // A oneway does not wait for a broker response, so this side can only prove "it went out
+    // and the broker really persisted it": the criterion is the read-back count on the
+  // consume side (the only type in this whole program allowed to rely on the read-back
+  // count alone).
         {
             string topic = _gPrefix + "_Oneway";
             bool threw = false;
@@ -453,11 +477,11 @@ internal static class LiveMessageTypes
             }
 
             List<MessageExt> run = RunConsumer(topic, "*", 15, false, "oneway", expect: 3);
-            Check("单向发送 SendOneway(3 条)落库读回", !threw && run.Count == 3,
+            Check("the oneway send SendOneway(3 messages) is persisted and read back", !threw && run.Count == 3,
                 "received=" + run.Count.ToString(CultureInfo.InvariantCulture) + "/3");
         }
 
-        // ---------- 4. 顺序消息：同 key 落同队列 + 顺序消费保序 ----------
+        // ---------- 4. an orderly message: the same key routes to the same queue + orderly consumption preserves the order ----------
         List<byte[]> bodiesOrder = new();
         {
             string topic = _gPrefix + "_Order";
@@ -471,7 +495,7 @@ internal static class LiveMessageTypes
                 if (!qids.Contains(sr.MessageQueue.QueueId)) qids.Add(sr.MessageQueue.QueueId);
             }
 
-            Check("顺序发送: 同 key 路由到同一队列", qids.Count == 1,
+      Check("orderly send: the same key routes to the same queue", qids.Count == 1,
                 "distinct_queue_ids=" + (qids.Count == 0 ? "?" : string.Join(",", qids)));
 
             List<MessageExt> run = RunConsumer(topic, "*", 12, /*orderly=*/true, "order", /*expect=*/10);
@@ -491,10 +515,10 @@ internal static class LiveMessageTypes
                 orderDetail += " first=" + recv[0] + " last=" + recv[run.Count - 1];
             }
 
-            Check("顺序消费保序", run.Count == 10 && seqOk && offsetOk, orderDetail);
+        Check("orderly consumption preserves the order", run.Count == 10 && seqOk && offsetOk, orderDetail);
         }
 
-        // ---------- 5. 带 Tag 消息 + 服务端 Tag 过滤 ----------
+     // ---------- 5. a tagged message + server-side tag filtering ----------
         {
             string topic = _gPrefix + "_Tag";
             for (int i = 0; i < 3; ++i)
@@ -511,11 +535,11 @@ internal static class LiveMessageTypes
 
             List<MessageExt> run = RunConsumer(topic, "TagA", 12, false, "tag");
             bool allA = run.All(m => m.Tags == "TagA");
-            Check("Tag 过滤消费（仅收到 TagA）", run.Count == 3 && allA,
+            Check("tag-filtered consumption (only TagA received)", run.Count == 3 && allA,
                 "received=" + run.Count.ToString(CultureInfo.InvariantCulture));
         }
 
-        // ---------- 6. 用户属性透传 ----------
+        // ---------- 6. user property pass-through ----------
         {
             string topic = _gPrefix + "_Prop";
             for (int i = 0; i < 3; ++i)
@@ -529,11 +553,11 @@ internal static class LiveMessageTypes
             List<MessageExt> run = RunConsumer(topic, "*", 12, false, "prop");
             bool okCity = run.All(m => m.GetUserProperty("city") == "Hangzhou");
             bool okEnv = run.All(m => m.GetUserProperty("env") == "prod");
-            Check("用户属性透传(city=Hangzhou, env=prod)", okCity && okEnv && run.Count == 3,
+   Check("user property pass-through (city=Hangzhou, env=prod)", okCity && okEnv && run.Count == 3,
                 "received=" + run.Count.ToString(CultureInfo.InvariantCulture));
         }
 
-        // ---------- 7. 延迟消息（delay level）----------
+        // ---------- 7. a delayed message (delay level)----------
         {
             string topic = _gPrefix + "_Delay";
             prod.Send(new Message(topic, Str2Bytes("normal-now")));
@@ -549,26 +573,29 @@ internal static class LiveMessageTypes
                 else if (Bytes2Str(m.Body) == "normal-now") normal.Add(m);
             }
 
-            Check("延迟消息最终投递", delayed.Count > 0,
+     Check("the delayed message is eventually delivered", delayed.Count > 0,
                 "delayed received=" + delayed.Count.ToString(CultureInfo.InvariantCulture)
                 + " normal=" + normal.Count.ToString(CultureInfo.InvariantCulture));
             if (delayed.Count > 0)
             {
                 long drift = delayed[0].StoreTimestamp - delayed[0].BornTimestamp;
-                Check("延迟生效(store_ts-born_ts>=3000ms)", drift >= 3000,
+  Check("the delay took effect (store_ts-born_ts>=3000ms)", drift >= 3000,
                     "drift=" + drift.ToString(CultureInfo.InvariantCulture) + "ms");
             }
             else
             {
-                Check("延迟生效(store_ts-born_ts>=3000ms)", false, "无延迟消息可校验");
+     Check("the delay took effect (store_ts-born_ts>=3000ms)", false, "no delayed message to verify");
             }
         }
 
-        // ---------- 8. 定时消息（TIMER_DELIVER_MS）----------
-        // 与 delay level 走不同机制：broker 把带 TIMER_DELIVER_MS 的消息收进定时
-        // 仓储（SCHEDULE_TOPIC_XXXX 之外的二级存储），到点再投递回目标队列。
-        // 客户端侧只需把属性写进 user property（SetDeliverTimeMs 即该属性的便捷入口），
-        // 判据仍是读回消息的 store_ts - born_ts：定时未生效的话 drift 只有毫秒级。
+   // ---------- 8. a scheduled message (TIMER_DELIVER_MS)----------
+   // A different mechanism from delay level: the broker puts a message carrying
+        // TIMER_DELIVER_MS into the timer store (a secondary storage outside
+   // SCHEDULE_TOPIC_XXXX) and delivers it back to the target queue when it is due.
+        // On the client side all that is needed is to write the property into the user properties
+   // (SetDeliverTimeMs is the convenient entry point for it), and the criterion is still the
+  // store_ts - born_ts of the message read back: if the timer did not take effect the drift
+ // would only be milliseconds.
         {
             string topic = _gPrefix + "_Timer";
             long deliverAt = UtilAll.CurrentTimeMillis() + 5000;
@@ -578,21 +605,21 @@ internal static class LiveMessageTypes
 
             List<MessageExt> run = RunConsumer(topic, "*", 25, false, "timer", expect: 1);
             var hit = run.Where(m => Bytes2Str(m.Body) == "timer-5s").ToList();
-            Check("定时消息(TIMER_DELIVER_MS)最终投递", hit.Count > 0,
+        Check("the scheduled message (TIMER_DELIVER_MS) is eventually delivered", hit.Count > 0,
                 "received=" + hit.Count.ToString(CultureInfo.InvariantCulture) + "/1");
             if (hit.Count > 0)
             {
                 long drift = hit[0].StoreTimestamp - hit[0].BornTimestamp;
-                Check("定时生效(store_ts-born_ts>=4000ms)", drift >= 4000,
+          Check("the timer took effect (store_ts-born_ts>=4000ms)", drift >= 4000,
                     "drift=" + drift.ToString(CultureInfo.InvariantCulture) + "ms");
             }
             else
             {
-                Check("定时生效(store_ts-born_ts>=4000ms)", false, "无定时消息可校验");
+     Check("the timer took effect (store_ts-born_ts>=4000ms)", false, "no scheduled message to verify");
             }
         }
 
-        // ---------- 9. 带 Key 消息 + 按 Key 查询 ----------
+      // ---------- 9. a keyed message + lookup by key ----------
         {
             string topic = _gPrefix + "_Key";
             string key = "MTKEY_" + stamp.ToString(CultureInfo.InvariantCulture);
@@ -604,10 +631,10 @@ internal static class LiveMessageTypes
             long end = UtilAll.CurrentTimeMillis() + 120000;
             List<MessageExt> found = prod.QueryMessage(topic, key, 10, begin, end);
             bool hit = found.Any(x => Bytes2Str(x.Body) == "key-msg-payload");
-            Check("按 Key 查询(query_message)", hit, "returned=" + found.Count.ToString(CultureInfo.InvariantCulture));
+      Check("lookup by key (query_message)", hit, "returned=" + found.Count.ToString(CultureInfo.InvariantCulture));
         }
 
-        // ---------- 10. 事务消息：COMMIT（半消息 → 本地事务提交 → 落库可消费）----------
+    // ---------- 10. a transactional message: COMMIT (half message -> local transaction commit -> consumable after being persisted)----------
         {
             string topic = _gPrefix + "_Tx";
             var listener = new CommitTxListener();
@@ -626,11 +653,11 @@ internal static class LiveMessageTypes
                 stateStr = "throw: " + e.Message;
             }
 
-            Check("事务-COMMIT 发送状态", txOk, "state=" + stateStr);
+            Check("transaction-COMMIT send state", txOk, "state=" + stateStr);
 
             List<MessageExt> run = RunConsumer(topic, "*", 10, false, "tx");
             bool consumed = run.Any(m => Bytes2Str(m.Body) == "tx-commit");
-            Check("事务-COMMIT 落库可被消费", consumed,
+        Check("transaction-COMMIT is persisted and consumable", consumed,
                 "received=" + run.Count.ToString(CultureInfo.InvariantCulture));
         }
 
@@ -653,15 +680,15 @@ internal static class LiveMessageTypes
                 stateStr = "throw: " + e.Message;
             }
 
-            Check("事务-ROLLBACK 发送状态", txOk, "state=" + stateStr);
+        Check("transaction-ROLLBACK send state", txOk, "state=" + stateStr);
 
             List<MessageExt> run = RunConsumer(topic, "*", 10, false, "txrollback");
             bool consumed = run.Any(m => Bytes2Str(m.Body) == "tx-rollback");
-            Check("事务-ROLLBACK 不被投递", !consumed,
+         Check("transaction-ROLLBACK is not delivered", !consumed,
                 "received=" + run.Count.ToString(CultureInfo.InvariantCulture));
         }
 
-        // ---------- 10.3 UNKNOW + broker 回查 ----------
+        // ---------- 10.3 UNKNOW + the broker checking back ----------
         {
             string topic = _gPrefix + "_TxCheck";
             var listener = new UnknownThenCommitTxListener();
@@ -680,7 +707,7 @@ internal static class LiveMessageTypes
                 stateStr = "throw: " + e.Message;
             }
 
-            Check("事务-UNKNOW 发送状态", txOk, "state=" + stateStr);
+     Check("transaction-UNKNOW send state", txOk, "state=" + stateStr);
 
             long checkDeadline = UtilAll.CurrentTimeMillis() + 90_000;
             while (listener.CheckCalls == 0 && UtilAll.CurrentTimeMillis() < checkDeadline)
@@ -690,16 +717,18 @@ internal static class LiveMessageTypes
             List<MessageExt> run = RunConsumer(topic, "*", 10, false, "txcheck");
             bool consumed = run.Any(m => Bytes2Str(m.Body) == "tx-check");
             int checks = listener.CheckCalls;
-            Check("事务-UNKNOW 触发 broker 回查", checks > 0,
+            Check("transaction-UNKNOW triggered the broker to check back", checks > 0,
                 "checkLocalTransaction_calls=" + checks.ToString(CultureInfo.InvariantCulture));
-            Check("事务-UNKNOW 回查后最终投递", consumed,
+            Check("transaction-UNKNOW is eventually delivered after the check-back", consumed,
                 "received=" + run.Count.ToString(CultureInfo.InvariantCulture));
         }
 
-        // ---------- 11. 批量消息（SEND_BATCH_MESSAGE 320）----------
-        // 请求码从 310 换成 320 之后，要在真 broker 上重新证明它确实按「批量写入」处理：
-        // 判据是消费侧收到 N 条**各自完整**的消息且 queueOffset 连续。若 broker 把批量
-        // body 当单条存（header.batch 没生效），这里只会收到 1 条拼接字节的消息。
+        // ---------- 11. a batch message (SEND_BATCH_MESSAGE 320)----------
+    // After the request code switches from 310 to 320 it has to be proven on a real broker
+    // that it really is handled as a "batch write": the criterion is that the consume side
+  // receives N **individually complete** messages with contiguous queueOffsets. If the
+    // broker stored the batch body as a single message (header.batch not taking effect), only
+  // one message of concatenated bytes would arrive here.
         {
             string topic = _gPrefix + "_Batch";
             bool batchOk;
@@ -722,7 +751,7 @@ internal static class LiveMessageTypes
                 detail = "throw: " + e.Message;
             }
 
-            Check("批量发送 SendBatch(3 条)", batchOk, detail);
+            Check("the batch send SendBatch(3 messages)", batchOk, detail);
 
             List<MessageExt> msgs = RunConsumer(topic, "*", 15, false, "batch", expect: 3);
             var bodies = new HashSet<string>();
@@ -746,12 +775,12 @@ internal static class LiveMessageTypes
                 if (!bodies.Contains("batch-" + i.ToString(CultureInfo.InvariantCulture))) exact = false;
             }
 
-            Check("批量消息被 broker 按 3 条独立消息投递", exact && contiguous,
+   Check("the batch messages were delivered by the broker as 3 independent messages", exact && contiguous,
                 "received=" + msgs.Count.ToString(CultureInfo.InvariantCulture)
                 + " offsets=" + string.Join(",", offsets));
         }
 
-        // ---------- 附：心跳注册 ----------
+    // ---------- in addition: heartbeat registration ----------
         {
             string topic = _gPrefix + "_Hb";
             prod.Send(new Message(topic, Str2Bytes("hb-probe")));
@@ -774,16 +803,16 @@ internal static class LiveMessageTypes
 
             long hb = cons.HeartbeatCount;
             cons.Shutdown();
-            Check("消费者心跳注册(HEART_BEAT)", hb > 0,
+      Check("the consumer heartbeat registration (HEART_BEAT)", hb > 0,
                 "heartbeat_ok=" + hb.ToString(CultureInfo.InvariantCulture)
                 + " consumed=" + listener.Snapshot().Count.ToString(CultureInfo.InvariantCulture));
         }
 
         prod.Shutdown();
 
-        // ---------- 汇总 ----------
+  // ---------- summary ----------
         Console.WriteLine();
-        Console.WriteLine("================ C# 消息类型联调汇总 ================");
+   Console.WriteLine("================ C# message type integration summary ================");
         foreach ((string Name, bool Ok) r in Results)
         {
             Console.WriteLine("  [" + (r.Ok ? "PASS" : "FAIL") + "] " + r.Name);
@@ -794,11 +823,11 @@ internal static class LiveMessageTypes
                           + " FAIL=" + _gFail.ToString(CultureInfo.InvariantCulture));
         if (_gFail > 0)
         {
-            Console.WriteLine("结果: " + _gFail.ToString(CultureInfo.InvariantCulture) + " 项失败");
+        Console.WriteLine("result: " + _gFail.ToString(CultureInfo.InvariantCulture) + " failures");
             return 1;
         }
 
-        Console.WriteLine("结果: 全部通过（C# 客户端对真实集群完成全部消息类型收发）");
+        Console.WriteLine("result: everything passed (the C# client completed every message type send/receive against a real cluster)");
         return 0;
     }
 }

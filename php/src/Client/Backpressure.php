@@ -13,7 +13,7 @@ final class FairSemaphore
     private int $total;
     private int $free;
 
-    /** @var list<Pending> 一个还在排队的许可申请（只为让队首能被稳定识别） */
+    /** @var list<Pending> a permit request still waiting in line (only so the head can be stably identified) */
     private array $queue = [];
 
     public function __construct(int $permits)
@@ -34,7 +34,7 @@ final class FairSemaphore
             return true;
         }
 
-        // 超时/拿不到：把自己从队列里摘掉，别挡后面的人
+        // Timeout / no permit: remove yourself from the queue so you don't block those behind you
         $this->removeRequest($request);
         return false;
     }
@@ -74,7 +74,7 @@ final class FairSemaphore
     }
 }
 
-/** 一个还在排队的许可申请。 */
+/** A permit request still waiting in line. */
 final class Pending
 {
     public function __construct(public int $permits)

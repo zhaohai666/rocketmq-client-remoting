@@ -20,10 +20,10 @@ ADDR_B = "127.0.0.1:10912"
 NS_ADDR = "127.0.0.1:9876"
 
 
-# ------------------------------------------------------------------ 测试替身
+# ------------------------------------------------------------------ Test doubles
 
 class _FakeClient:
-    """只替掉同步调用入口，记录每个请求实际打到的地址。"""
+    """Only replaces the synchronous call entry point, recording the address each request actually hits."""
 
     def __init__(self, responses=None, name_server_addrs=None, route=None):
         self._responses = list(responses or [])
@@ -96,7 +96,7 @@ def _cc(consume_type: str = "CONSUME_PASSIVELY",
     return cc
 
 
-# ------------------------------------------------------------------ VIP 通道
+# ------------------------------------------------------------------ VIP channel
 
 def test_broker_vip_channel_vectors():
     assert MixAll.broker_vip_channel(False, ADDR_A) == ADDR_A
@@ -111,17 +111,17 @@ def test_vip_knob_defaults_off_and_only_rewrites_broker_requests():
     admin = _admin(client)
     assert admin.vip_channel_enabled is False
 
-    # 开关关闭：broker 请求走原端口
+    # Switch off: broker requests use the original port
     admin._invoke_broker(ADDR_A, 17)
     assert client.requests[-1][0] == ADDR_A
 
-    # 开关打开：broker 请求改走 VIP 端口（端口 - 2）
+    # Switch on: broker requests go through the VIP port (port - 2)
     admin.set_vip_channel_enabled(True)
     assert admin.vip_channel_enabled is True
     admin._invoke_broker(ADDR_A, 17)
     assert client.requests[-1][0] == "127.0.0.1:10909"
 
-    # NameServer 类请求不受开关影响：DELETE_TOPIC_IN_NAMESRV 直连原端口
+    # NameServer-type requests are unaffected by the switch: DELETE_TOPIC_IN_NAMESRV uses the original port
     admin.delete_topic_in_name_server([NS_ADDR], TOPIC)
     assert client.requests[-1][0] == NS_ADDR
 
@@ -163,7 +163,7 @@ def test_consumed_true_when_master_offset_passed_queue_offset():
     admin = _admin(_FakeClient([_ok(stats.encode())], route=_route(("broker-a", ADDR_A))))
     admin.examine_broker_cluster_info = _cluster_info
 
-    # storeHost 127.0.0.1:10911 == master 地址 ⇒ 同机；consumerOffset 11 > queueOffset 10
+    # storeHost 127.0.0.1:10911 == master address => same machine; consumerOffset 11 > queueOffset 10
     msg = _msg(store_host="127.0.0.1", store_port=10911)
     assert admin.consumed(msg, GROUP) is True
 
@@ -177,7 +177,7 @@ def test_consumed_false_when_offset_not_passed():
 
     msg = _msg(store_host="127.0.0.1", store_port=10911)
     msg.queue_offset = 10
-    # consumerOffset == queueOffset ⇒ 还没消费到这条
+    # consumerOffset == queueOffset => this message has not been consumed yet
     assert admin.consumed(msg, GROUP) is False
 
 
@@ -294,7 +294,7 @@ def test_message_track_groups_sorted_and_no_route_means_empty(monkeypatch):
     monkeypatch.setattr(admin, "consumed", lambda msg, group: False)
 
     tracks = admin.message_track_detail(_msg())
-    assert [t.consumer_group for t in tracks] == ["g-a", "g-b"]  # set 排序，输出确定
+    assert [t.consumer_group for t in tracks] == ["g-a", "g-b"]  # set ordering; output is deterministic
 
     monkeypatch.setattr(admin, "examine_topic_route", lambda topic: _route())
     assert admin.message_track_detail(_msg()) == []

@@ -40,9 +40,9 @@ FASTJSON_SUB_GROUP = ('{"attributes":{},"brokerId":0,"consumeBroadcastEnable":tr
 
 
 def test_fastjson_parses_object_keys():
-    """核心：非字符串键的内联对象必须能解析（标准 json 会失败）。"""
+    """Core: inline objects with non-string keys must be parseable (standard json fails)."""
     with pytest.raises(Exception):
-        __import__("json").loads(FASTJSON_TOPIC_STATS)  # 证明确实是非法 JSON
+        __import__("json").loads(FASTJSON_TOPIC_STATS)  # proves it is indeed invalid JSON
     obj = fastjson_loads(FASTJSON_TOPIC_STATS)
     assert set(obj["offsetTable"].keys()) == {
         '{"brokerName":"broker-a","queueId":3,"topic":"MyTopic"}'}
@@ -51,7 +51,7 @@ def test_fastjson_parses_object_keys():
 
 
 def test_fastjson_number_keys_still_supported():
-    """BrokerData.brokerAddrs 的数字键（zhaohai666 5.x 会输出裸数字键）。"""
+    """Numeric keys of BrokerData.brokerAddrs (zhaohai666 5.x emits bare numeric keys)."""
     obj = fastjson_loads('{"brokerAddrs":{0:"127.0.0.1:10911",1:"127.0.0.1:10912"}}')
     assert obj["brokerAddrs"]["0"] == "127.0.0.1:10911"
     assert obj["brokerAddrs"]["1"] == "127.0.0.1:10912"
@@ -74,7 +74,7 @@ def test_fastjson_rejects_garbage():
         fastjson_loads('{"a":}')
 
 
-# ---------------------------------------------------------------- 管理端 DTO
+# ---------------------------------------------------------------- Admin DTOs
 
 
 def test_topic_stats_table_decode():
@@ -136,14 +136,14 @@ def test_consume_stats_list_uses_the_server_field_name():
     assert sl.total_diff == 7
     assert sl.total_inflight_diff == 2
 
-    # 旧键名的响应必须解析不出行，否则掩盖回归
+    # A response with the old key name must parse to no rows, otherwise a regression is masked
     assert ConsumeStatsList.decode(b'{"statsList":[{"G":[{}]}]}').stats_list == []
 
     assert json.loads(ConsumeStatsList().encode()) == {
         "consumeStatsList": [], "totalDiff": 0, "totalInflightDiff": 0}
 
 
-# ---------------------------------------------------------------- TopicConfig / 订阅组
+# ---------------------------------------------------------------- TopicConfig / subscription groups
 
 
 def test_topic_config_server_side_defaults():
@@ -180,7 +180,7 @@ def test_subscription_group_config_fields():
     assert cfg.consume_timeout_minute == 15
     assert cfg.broker_id == 0
     assert cfg.group_retry_policy.type == "CUSTOMIZED"
-    # fastjson2 跳过 null：subscriptionDataSet 不应出现
+    # fastjson2 skips null: subscriptionDataSet should not appear
     assert config_has_no_null_sub_set(cfg)
     assert "subscriptionDataSet" not in cfg.to_dict()
 
@@ -230,10 +230,10 @@ def test_properties_whitespace_is_a_valid_separator():
     assert props["a"] == "b", props
     assert props["onlykey"] == "", props
     assert props["k"] == "v", props
-    # 空白分隔时，值里的 '=' 原样保留
+    # When separated by whitespace, an '=' inside the value is kept as-is
     props2 = MixAll.string2_properties("a b=c=d\n")
     assert props2["a"] == "b=c=d", props2
-    # 有 '=' 时 '=' 优先于空白成为分隔符（值里的空格保留）
+    # With '=', '=' takes precedence over whitespace as the separator (spaces inside the value are kept)
     props3 = MixAll.string2_properties("messageDelayLevel=1s 5s 10s\n")
     assert props3["messageDelayLevel"] == "1s 5s 10s", props3
 
@@ -265,7 +265,7 @@ def test_unique_msg_query_flag_is_extfield_name():
 
 
 def test_message_const_index_types():
-    """broker 的 indexType 取值：K / U / T。"""
+    """Broker indexType values: K / U / T."""
     from common.message_const import MessageConst
     assert MessageConst.INDEX_KEY_TYPE == "K"
     assert MessageConst.INDEX_UNIQUE_TYPE == "U"
@@ -273,7 +273,7 @@ def test_message_const_index_types():
 
 
 def test_create_topic_header_sends_topic_filter_type():
-    """broker 的 CreateTopicRequestHeader.checkFields 要求 topicFilterType 非空。"""
+    """The broker's CreateTopicRequestHeader.checkFields requires topicFilterType to be non-empty."""
     from remoting.protocol.headers import CreateTopicRequestHeader
     h = CreateTopicRequestHeader()
     h.topic = "t"

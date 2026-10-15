@@ -1,14 +1,14 @@
-//! 发布路由取 master 真机验证。
+//! Real-cluster verification of publish routing picking the master.
 //!
-//! 前置：namesrv + master + slave 都在跑（按本地集群 runbook）；脚本自己**只停一次 master**
-//! （`scripts/rmq_test_broker.sh` 只认 master 的 java 进程），`Drop` 保险保证 master 一定回来。
-//!
-//!
-//! 离线单测（`src/client/mq_client.rs` 的 `publish_route_*` 组）锁的是**判据**；真机锁的是
-//! 判据作用在真实路由形状上的结果 —— 名字服务里 broker-a 真的只剩 `{1: slave}`。
+//! Precondition: namesrv + master + slave are all running (per the local cluster runbook); the script itself **stops the master exactly once**
+//! (`scripts/rmq_test_broker.sh` only recognises the master's java process), and the `Drop` guard guarantees the master always comes back.
 //!
 //!
-//! 用法：
+//! The offline unit tests (the `publish_route_*` group in `src/client/mq_client.rs`) pin the **criteria**; the real cluster pins
+//! what those criteria yield on a real route shape -- in the name server broker-a really ends up with only `{1: slave}`.
+//!
+//!
+//! Usage:
 //! ```text
 //! cargo run --example live_publish_route_master -- 127.0.0.1:9876 127.0.0.1:10911 [127.0.0.1:10931]
 //! ```
@@ -34,7 +34,7 @@ use rocketmq_client_remoting::remoting::protocol::heartbeat::ConsumeFromWhere;
 
 const QUEUES: i32 = 4;
 const BROKER_NAME: &str = "broker-a";
-/// 本端失败上界：发布信息为空时压根没有 wire 调用，真机给 500ms 已留量级余量。
+/// Upper bound for the local failure: an empty publish info makes no wire call at all, and 500ms leaves an order-of-magnitude margin on a real cluster.
 const LOCAL_BUDGET_MS: f64 = 500.0;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -65,7 +65,7 @@ impl Checker {
     }
 }
 
-/// broker 开关：`scripts/rmq_test_broker.sh`（**只碰 master**），四个语言的 live 用例共用。
+/// Broker switch: `scripts/rmq_test_broker.sh` (**touches the master only**); shared infrastructure for the live cases.
 fn broker_ctl(script: &PathBuf, action: &str) -> (bool, String) {
     let out_path = format!("/tmp/rmq_pr_master_rs_broker_ctl.{action}.log");
     let file = match fs::File::create(&out_path) {
@@ -76,8 +76,8 @@ fn broker_ctl(script: &PathBuf, action: &str) -> (bool, String) {
         Ok(f) => f,
         Err(e) => return (false, format!("dup {out_path} failed: {e}")),
     };
-    // 输出走**文件**而不是管道：start 会把 broker 拉成常驻进程，管道的写端被它继承，
-    // 谁继承谁就等不到 EOF。
+    // Output goes to a **file**, not a pipe: start turns the broker into a resident process that inherits the pipe's
+    // write end, and whoever inherits it never sees EOF.
     let status = std::process::Command::new("sh")
         .arg(script)
         .arg(action)
@@ -94,8 +94,8 @@ fn broker_ctl(script: &PathBuf, action: &str) -> (bool, String) {
     }
 }
 
-/// 收尾保险：无论用例走到哪一步（含提前 return / panic），都不能把测试集群留在
-/// 「master 停着」的状态交给下一个用例 —— start 幂等，已在跑就直接返回。
+/// Finaliser guard: no matter where the case stops (including an early return / panic), the test cluster must never be
+/// left in the "master down" state for the next case -- start is idempotent and returns directly if already running.
 struct BrokerGuard {
     script: PathBuf,
 }
@@ -106,16 +106,16 @@ impl Drop for BrokerGuard {
         if up {
             return;
         }
-        println!("  [cleanup] 用例结束时 master 是 DOWN，补一次 start");
+        println!("  [cleanup] master was DOWN when the case ended, running a compensating start");
         let (ok, out) = broker_ctl(&self.script, "start");
         if !ok {
-            println!("  [cleanup] master 仍没起来：{out}");
+            println!("  [cleanup] master still not up: {out}");
         }
     }
 }
 
-/// 异步条件等待：真机窗口里路由/位点的收敛是异步的，超时不算断言失败，
-/// 由调用方对返回值做断言（拿不到就是 None）。
+/// Async condition wait: route/offset convergence inside the real-cluster window is asynchronous; a timeout is not an
+/// assertion failure, the caller asserts on the return value (None means it never converged).
 async fn wait_until<T, F, Fut>(mut f: F, secs: u64, what: &str) -> Option<T>
 where
     F: FnMut() -> Fut,
@@ -127,7 +127,7 @@ where
             return Some(v);
         }
         if Instant::now() >= deadline {
-            println!("    (等不到 {what})");
+            println!("    (timed out waiting for {what})");
             return None;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -138,7 +138,7 @@ fn has_id(addrs: &[(i64, String)], id: i64) -> bool {
     addrs.iter().any(|(k, _)| *k == id)
 }
 
-/// 只收 body：这一趟关心的是"从节点上的 4 条能不能收齐"，不关心位点与顺序。
+/// Collects bodies only: this pass only cares whether "the 4 seeded messages can all be received off the slave", not offsets or order.
 struct Sink {
     bodies: Mutex<Vec<Vec<u8>>>,
 }
@@ -186,8 +186,8 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        // 管理实例与生产者实例的 clientId 不同（instance_name 不同）⇒ 进程内是两个
-        // MQClientInstance：S5 的「旧缓存」看的是发送实例自己那张表，这里要能分别驱动。
+        // The admin instance and producer instance have different clientIds (different instance_name) ⇒ two separate
+        // MQClientInstances in-process: S5's "stale cache" looks at the send instance's own table, so both must be drivable independently.
         let admin = MQClientInstance::new(
             &format!("pr_master_rs_admin_{stamp}"),
             vec![namesrv.to_string()],
@@ -219,14 +219,14 @@ impl Fixture {
         })
     }
 
-    /// 强制刷新后取 broker-a 的 brokerAddrs（刷不到返回 None）。
+    /// Fetches broker-a's brokerAddrs after a forced refresh (None if it cannot be refreshed).
     async fn route_addrs(&self, topic: &str) -> Option<Vec<(i64, String)>> {
         if let Err(e) = self
             .admin
             .update_topic_route_info_from_name_server(topic, 5000, false)
             .await
         {
-            println!("    (路由刷新失败: {e})");
+            println!("    (route refresh failed: {e})");
         }
         let route = self.admin.get_topic_route_data(topic).await?;
         route
@@ -258,8 +258,8 @@ impl Fixture {
         Ok(info.msg_queue_list())
     }
 
-    /// 关闭客户端 + 删 topic。删之前先确保 master 在（`start` 幂等）——
-    /// 停窗口里提前退出时 topic 也要删得掉，不能留一份孤儿配置。
+    /// Shuts the clients down + deletes the topic. Before deleting, make sure the master is up (`start` is idempotent) --
+    /// on an early exit inside the stop window the topic must still be deletable; no orphan config may be left behind.
     async fn cleanup(&self, script: &PathBuf) {
         let _ = broker_ctl(script, "start");
         for addr in [&self.master, &self.slave] {
@@ -268,11 +268,11 @@ impl Fixture {
                 .delete_topic_in_broker(addr, &self.topic, 5000)
                 .await
             {
-                println!("    (delete topic on {addr} 失败: {e})");
+                println!("    (delete topic on {addr} failed: {e})");
             }
         }
         if let Err(e) = self.admin.delete_topic_in_namesrv(&self.topic, 5000).await {
-            println!("    (delete topic in namesrv 失败: {e})");
+            println!("    (delete topic in namesrv failed: {e})");
         }
         if let Some(c) = lock(&self.consumer).take() {
             c.shutdown();
@@ -293,17 +293,17 @@ fn fmt_bodies(bodies: &[Vec<u8>]) -> String {
 async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
     let topic = fx.topic.clone();
 
-    // ---------- S0 控制腿 ----------
-    println!("S0 控制腿（master 在）：路由 {{0: master, 1: slave}}、发布/订阅各 {QUEUES} 条");
+    // ---------- S0 control leg ----------
+    println!("S0 control leg (master up): route {{0: master, 1: slave}}, {QUEUES} publish/subscribe queues each");
     if let Err(e) = fx
         .admin
         .create_topic_in_route(&topic, QUEUES, QUEUES, DEFAULT_PERM, 0, None, 5000)
         .await
     {
-        ck.check("S0 建 topic（master）", false, &e.to_string());
+        ck.check("S0 create topic (master)", false, &e.to_string());
         return;
     }
-    // 从节点也直建一份，不赌 SlaveSynchronize 的 5s 周期
+    // Also create it directly on the slave instead of betting on SlaveSynchronize's 5s cycle
     if let Err(e) = fx
         .admin
         .create_topic_in_broker(
@@ -322,7 +322,7 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
         )
         .await
     {
-        println!("    (从节点建 topic 失败: {e})");
+        println!("    (creating the topic on the slave failed: {e})");
     }
 
     let addrs = wait_until(
@@ -335,11 +335,11 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
             }
         },
         30,
-        "路由 {0, 1}",
+        "route {0, 1}",
     )
     .await;
     ck.check(
-        "S0 路由含 {0: master, 1: slave}",
+        "S0 the route contains {0: master, 1: slave}",
         addrs.is_some(),
         &format!("broker_addrs={addrs:?}"),
     );
@@ -348,7 +348,7 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
     };
     let route_slave = addrs.iter().find(|(id, _)| *id == 1).map(|(_, a)| a.clone());
     ck.check(
-        "S0 从节点地址与参数一致",
+        "S0 the slave address matches the argument",
         route_slave.as_deref() == Some(fx.slave.as_str()),
         &format!("route={route_slave:?} argv={}", fx.slave),
     );
@@ -356,14 +356,14 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
     let queues = match fx.seed_queues().await {
         Ok(q) => q,
         Err(e) => {
-            ck.check("S0 发布队列 4（控制）", false, &e.to_string());
+            ck.check("S0 publish queues 4 (control)", false, &e.to_string());
             return;
         }
     };
     let mut queues = queues;
     queues.sort_by_key(|q| q.queue_id);
     ck.check(
-        &format!("S0 发布队列 {QUEUES}（控制）"),
+        &format!("S0 publish queues {QUEUES} (control)"),
         queues.len() == QUEUES as usize,
         &format!(
             "queues={:?}",
@@ -372,7 +372,7 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
     );
     let subs = fx.admin.get_topic_subscribe_info(&topic).await;
     ck.check(
-        &format!("S0 订阅队列 {QUEUES}（控制）"),
+        &format!("S0 subscribe queues {QUEUES} (control)"),
         subs.len() == QUEUES as usize,
         &format!(
             "queues={:?}",
@@ -383,8 +383,8 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
         return;
     }
 
-    // ---------- S1 预埋 ----------
-    println!("\nS1 预埋 {QUEUES} 条（每队列定点一条）并等从节点 store 追上");
+    // ---------- S1 seed ----------
+    println!("\nS1 seed {QUEUES} messages (one pinned per queue) and wait for the slave's store to catch up");
     let mut seeded: Vec<Vec<u8>> = Vec::new();
     for (i, mq) in queues.iter().enumerate() {
         let body = format!("pr-master-{i}").into_bytes();
@@ -392,15 +392,15 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
         match fx.producer.send(&mut msg, Some(20000), Some(mq)).await {
             Ok(r) if r.status == SendStatus::SendOk => seeded.push(body),
             Ok(r) => ck.check(
-                &format!("S1 第 {i} 条预埋 SEND_OK"),
+                &format!("S1 seed {i} SEND_OK"),
                 false,
                 &format!("status={:?}", r.status),
             ),
-            Err(e) => ck.check(&format!("S1 第 {i} 条预埋 SEND_OK"), false, &e.to_string()),
+            Err(e) => ck.check(&format!("S1 seed {i} SEND_OK"), false, &e.to_string()),
         }
     }
     ck.check(
-        &format!("S1 {QUEUES} 条预埋全部 SEND_OK"),
+        &format!("S1 all {QUEUES} seeded sends are SEND_OK"),
         seeded.len() == QUEUES as usize,
         &format!("seeded={}", seeded.len()),
     );
@@ -412,7 +412,7 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
     for mq in &queues {
         match fx.admin.get_max_offset(mq, 5000, None).await {
             Ok(o) => master_max.push((mq.queue_id, o)),
-            Err(e) => println!("    (master maxOffset 查询失败: {e})"),
+            Err(e) => println!("    (master maxOffset query failed: {e})"),
         }
     }
     let caught_up = wait_until(
@@ -425,7 +425,7 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
                 match fx.admin.get_max_offset(mq, 5000, Some(&fx.slave)).await {
                     Ok(o) => slave_max.push((mq.queue_id, o)),
                     Err(e) => {
-                        println!("    (从节点取 maxOffset 失败: {e})");
+                        println!("    (fetching the slave's maxOffset failed: {e})");
                         return None;
                     }
                 }
@@ -440,21 +440,21 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
             }
         },
         30,
-        "从节点复制追上",
+        "slave replication caught up",
     )
     .await;
     ck.check(
-        &format!("S1 {QUEUES} 条已复制到从节点 store"),
+        &format!("S1 all {QUEUES} messages are replicated to the slave's store"),
         caught_up.is_some(),
         &format!("master={master_max:?} slave={:?}", caught_up.unwrap_or_default()),
     );
 
-    // ---------- S2 停 master ----------
-    println!("\nS2 停 master（scripts/rmq_test_broker.sh stop），等路由只剩从节点");
+    // ---------- S2 stop master ----------
+    println!("\nS2 stop the master (scripts/rmq_test_broker.sh stop), wait until the route has only the slave left");
     let script_for_stop = script.to_path_buf();
     let stopped = tokio::task::spawn_blocking(move || broker_ctl(&script_for_stop, "stop")).await;
-    let (ok, out) = stopped.unwrap_or_else(|e| (false, format!("stop 任务 panic: {e}")));
-    ck.check("S2 master 已优雅停机", ok, &out);
+    let (ok, out) = stopped.unwrap_or_else(|e| (false, format!("stop task panicked: {e}")));
+    ck.check("S2 the master shut down gracefully", ok, &out);
 
     let down_addrs = wait_until(
         || async {
@@ -466,11 +466,11 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
             }
         },
         60,
-        "masterless 路由",
+        "masterless route",
     )
     .await;
     ck.check(
-        "S2 路由里 broker-a 只剩 {1: slave}",
+        "S2 in the route broker-a has only {1: slave} left",
         down_addrs.is_some(),
         &format!("broker_addrs={down_addrs:?}"),
     );
@@ -478,18 +478,18 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
         return;
     }
 
-    // ---------- S3 (A) 发布信息组不出队列 ----------
-    println!("\nS3 (A) 发布信息跳过没有 master 的 broker");
-    // 访问器契约：只在发布信息**有队列**时 Ok，否则本端 10005。此刻它抛，
-    // 等价于 `msg_queue_list == 0` 的情形（且这里还多证了一次
-    // 「重新拉回来的路由照样组不出队列」——访问器会先刷一次路由）。
+    // ---------- S3 (A) publish info yields no queues ----------
+    println!("\nS3 (A) publish info skips brokers without a master");
+    // Accessor contract: Ok only when the publish info **has queues**, otherwise this side raises 10005. It throws here,
+    // equivalent to the `msg_queue_list == 0` case (and this also proves once more that "a freshly re-fetched route still
+    // cannot form queues" -- the accessor refreshes the route first).
     let publish_down = fx.admin.get_topic_publish_info(&topic, false).await;
     let publish_err = match &publish_down {
-        Ok(info) => format!("意外拿到 {} 条队列", info.msg_queue_list().len()),
+        Ok(info) => format!("unexpectedly got {} queues", info.msg_queue_list().len()),
         Err(e) => e.to_string(),
     };
     ck.check(
-        "S3 停 master 后发布队列 == 0（访问器本端抛「选不到队列」）",
+        "S3 after stopping the master, publish queues == 0 (the accessor raises the local \"no queue selectable\" error)",
         publish_down
             .as_ref()
             .err()
@@ -498,10 +498,10 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
         &publish_err,
     );
 
-    // ---------- S4 (C) 订阅队列 ----------
+    // ---------- S4 (C) subscribe queues ----------
     let subs_down = fx.admin.get_topic_subscribe_info(&topic).await;
     ck.check(
-        &format!("S4 (C) 订阅队列仍是 {QUEUES}、且都在 {BROKER_NAME}（消费侧不看 master）"),
+        &format!("S4 (C) subscribe queues still {QUEUES}, all on {BROKER_NAME} (the consume side does not look at the master)"),
         subs_down.len() == QUEUES as usize && subs_down.iter().all(|q| q.broker_name == BROKER_NAME),
         &format!(
             "queues={:?}",
@@ -509,11 +509,11 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
         ),
     );
 
-    // ---------- S5 (A 定型) 发送快速失败 ----------
-    // 分两段看：**缓存还没刷**时（现实中 30s 周期任务未到）发送实例手里还是停前的旧路由，
-    // 地址解析落在死掉的 master 上，快速失败、绝不静默改发从节点；**路由刷成停后形状**后
-    // （周期任务 / 显式刷新），(A) 生效：发布队列为空，发送连一条 wire 都不发。
-    println!("\nS5 不指定队列的同步发送：旧缓存快速失败 → 刷新后本端快速失败");
+    // ---------- S5 (A fixed) send fails fast ----------
+    // Two phases: while **the cache is not yet refreshed** (in reality the 30s periodic task has not fired) the send instance still holds
+    // the pre-stop route, address resolution lands on the dead master, fails fast and never silently re-targets the slave; once **the route is
+    // refreshed into the post-stop shape** (periodic task / explicit refresh), (A) kicks in: publish queues are empty and the send emits no wire call at all.
+    println!("\nS5 sync send without a queue: stale cache fails fast → after refresh this side fails fast");
     let began = Instant::now();
     let mut msg = Message::new(&topic, Some(b"must-not-send"));
     let stale = fx.producer.send(&mut msg, Some(20000), None).await;
@@ -522,35 +522,35 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
         Ok(r) => format!("Ok(status={:?})", r.status),
         Err(e) => e.to_string(),
     };
-    // 这一腿是机会腿：周期刷新是否已经跑过不由本脚本定。两条腿的共同判据是
-    // "快速失败 + 绝不落到从节点地址上"（旧缓存腿打的是死掉的 master）。
+    // This leg is opportunistic: whether the periodic refresh already ran is not up to this script. Both legs share the
+    // criterion "fails fast + never lands on the slave address" (the stale-cache leg aims at the dead master).
     ck.check(
-        "S5 发送快速失败，且报错里没有从节点地址（绝不改发从节点）",
+        "S5 the send fails fast and the error never mentions the slave address (never re-targets the slave)",
         stale.is_err() && stale_ms < LOCAL_BUDGET_MS && !stale_text.contains(&fx.slave),
         &format!("{stale_ms:.0}ms {stale_text}"),
     );
 
-    // 让发送实例自己的路由缓存刷成停后形状（与 30s 周期任务同一条代码路径）
+    // Refresh the send instance's own route cache into the post-stop shape (the same code path as the 30s periodic task)
     let Some(pcli) = fx.producer.client() else {
-        ck.check("S5b 拿到发送实例", false, "producer 未启动");
+        ck.check("S5b got the send instance", false, "the producer is not started");
         return;
     };
     if let Err(e) = pcli
         .update_topic_route_info_from_name_server(&topic, 5000, false)
         .await
     {
-        println!("    (发送实例路由刷新失败: {e})");
+        println!("    (send instance route refresh failed: {e})");
     }
     let send_publish = pcli.get_topic_publish_info(&topic, false).await;
     ck.check(
-        "S5b 发送实例的发布队列也 == 0（(A) 就作用在这里）",
+        "S5b the send instance's publish queues are also == 0 ((A) acts exactly here)",
         send_publish
             .as_ref()
             .err()
             .map(|e| e.to_string().contains("Can not find Message Queue for topic"))
             .unwrap_or(false),
         &match &send_publish {
-            Ok(info) => format!("意外拿到 {} 条队列", info.msg_queue_list().len()),
+            Ok(info) => format!("unexpectedly got {} queues", info.msg_queue_list().len()),
             Err(e) => e.to_string(),
         },
     );
@@ -564,7 +564,7 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
         Err(e) => e.to_string(),
     };
     ck.check(
-        "S5c 刷新后：本端 10005 抛「选不到队列」，无 wire 调用（无 BrokersSent）",
+        "S5c after refresh: local side raises 10005 \"no queue selectable\", no wire call (no BrokersSent)",
         fresh
             .as_ref()
             .err()
@@ -581,8 +581,8 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
         ),
     );
 
-    // ---------- S5d 对照：定点发送的下场 ----------
-    println!("\nS5d 对照：定点发到该队列 → 本端报「broker 不存在」，一条 wire 都不发");
+    // ---------- S5d control: what happens to a pinned send ----------
+    println!("\nS5d control: pinned send to that queue -> local side reports broker-not-exist, not a single wire call");
     let mq0 = MessageQueue::new(&topic, BROKER_NAME, 0);
     let mut msg3 = Message::new(&topic, Some(b"pinned-to-slave"));
     let began = Instant::now();
@@ -593,7 +593,7 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
         Err(e) => e.to_string(),
     };
     ck.check(
-        "S5d 定点发送本端报「The broker[broker-a] not exist」，无 wire 调用（无 BrokersSent）",
+        "S5d pinned send: local side reports \"The broker[broker-a] not exist\", no wire call (no BrokersSent)",
         pinned
             .as_ref()
             .err()
@@ -608,7 +608,7 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
         &format!("{pinned_ms:.0}ms {pinned_text}"),
     );
 
-    println!("\nS5e (D) 顺序锁：停窗口内整台跳过（不刷路由、不发 wire）");
+    println!("\nS5e (D) orderly lock: whole broker skipped inside the stop window (no route refresh, no wire)");
     let group = format!("GID_PrMasterRs_{}", fx.stamp);
     let client_id = format!("pr_master_rs_lock_{}", fx.stamp);
     let lock_mqs = vec![MessageQueue::new(&topic, BROKER_NAME, 0)];
@@ -616,28 +616,29 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
     let locks = match fx.admin.lock_batch_mq(&group, &client_id, &lock_mqs, 3000).await {
         Ok(l) => l,
         Err(e) => {
-            println!("    (lock_batch_mq 失败: {e})");
+            println!("    (lock_batch_mq failed: {e})");
             Vec::new()
         }
     };
     let lock_ms = began.elapsed().as_secs_f64() * 1000.0;
     ck.check(
-        "S5e 只剩从节点时一台都锁不上（旧口径会退到从节点上锁）",
+        "S5e with only the slave left nothing can be locked (old behavior would fall back to locking on the slave)",
         locks.is_empty() && lock_ms < LOCAL_BUDGET_MS,
         &format!(
             "{lock_ms:.0}ms locked={:?}",
             locks.iter().map(|q| (&q.broker_name, q.queue_id)).collect::<Vec<_>>()
         ),
     );
-    // 对照腿：同一窗口内从节点对该队列照常服务（本端口的 invoke_sync 不开放给 example，
-    // 打不出"点名从节点锁一把"的原始报文；用从节点仍在服务同一条队列来排除
-    // "空锁集是因为从节点不可达"这一解释）。
+    // Control leg: inside the same window the slave still serves this queue normally (the local
+    // invoke_sync port is not exposed to examples, so the raw "lock on the named slave" request
+    // cannot be produced; use the slave still serving the same queue to rule out the explanation
+    // that the empty lock set is because the slave is unreachable).
     let slave_serving = fx
         .admin
         .get_max_offset(&lock_mqs[0], 5000, Some(&fx.slave))
         .await;
     ck.check(
-        "S5e2 对照：窗口内从节点对该队列照常服务（空集不是从节点不可达）",
+        "S5e2 control: inside the window the slave still serves this queue (the empty set is not the slave being unreachable)",
         matches!(slave_serving, Ok(v) if v >= 1),
         &format!("slave maxOffset={slave_serving:?}"),
     );
@@ -645,13 +646,13 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
     let _ = fx.admin.unlock_batch_mq(&group, &client_id, &lock_mqs, 3000).await;
     let unlock_ms = began.elapsed().as_secs_f64() * 1000.0;
     ck.check(
-        "S5e3 解锁同样安静跳过（不抛、不发）",
+        "S5e3 unlock is likewise quietly skipped (no throw, no send)",
         unlock_ms < LOCAL_BUDGET_MS,
         &format!("{unlock_ms:.0}ms"),
     );
 
-    // ---------- S5f (E) 订阅口径：POP 只认主 ----------
-    println!("\nS5f (E) POP 拉取：本端报「The broker[broker-a] not exist」（不发 wire）");
+    // ---------- S5f (E) subscribe semantics: POP only accepts the master ----------
+    println!("\nS5f (E) POP pull: local side reports \"The broker[broker-a] not exist\" (no wire sent)");
     let began = Instant::now();
     let pop = fx
         .admin
@@ -665,7 +666,7 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
         Err(e) => e.to_string(),
     };
     ck.check(
-        "S5f 停窗口内 POP 本端报「The broker[broker-a] not exist」（不是从节点回的错）",
+        "S5f inside the stop window POP reports \"The broker[broker-a] not exist\" locally (not an error returned by the slave)",
         pop.as_ref()
             .err()
             .map(|e| {
@@ -677,7 +678,7 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
         &format!("{pop_ms:.0}ms {pop_text}"),
     );
 
-    println!("\nS5g (F) 位点读取：冷实例刷一次路由后放宽到从节点");
+    println!("\nS5g (F) offset read: a cold instance relaxes to the slave after one route refresh");
     let cold = MQClientInstance::new(
         &format!("pr_master_rs_cold_{}", fx.stamp),
         vec![fx.namesrv.clone()],
@@ -692,14 +693,14 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
         Err(e) => e.to_string(),
     };
     ck.check(
-        "S5g 冷实例位点读取不报错：刷路由 → 退到从节点由 broker 答复",
+        "S5g cold-instance offset read does not error: refresh route -> fall back to the slave, answered by the broker",
         off.is_ok(),
         &format!("{cold_ms:.0}ms {cold_text}"),
     );
     cold.shutdown();
 
-    // ---------- S6 (C 端到端) 停窗口内消费 ----------
-    println!("\nS6 停窗口内新起的 push 消费者：{QUEUES} 条队列 + 从从节点收齐预埋的 {QUEUES} 条");
+    // ---------- S6 (C end-to-end) consume inside the stop window ----------
+    println!("\nS6 push consumer started inside the stop window: {QUEUES} queues + collect the {QUEUES} seeded messages from the slave");
     let sink = Sink::new();
     let consumer = match fx.build_consumer(&group, sink.clone()) {
         Ok(c) => c,
@@ -713,14 +714,14 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
         ck.check("S6 consumer start", false, &e.to_string());
         return;
     }
-    // client 实例是 start 时才建的：要在 start **之后**再取一次。
+    // The client instance is only built at start: fetch it again **after** start.
     let consumer_client = consumer.client().or(consumer_client);
     *lock(&fx.consumer) = Some(consumer);
     match consumer_client {
         Some(ccli) => {
             let subs_in_window = ccli.get_topic_subscribe_info(&topic).await;
             ck.check(
-                &format!("S6a 窗口内消费者自己的订阅信息也是 {QUEUES} 条"),
+                &format!("S6a the consumer's own subscribe info inside the window is also {QUEUES} queues"),
                 subs_in_window.len() == QUEUES as usize,
                 &format!(
                     "queues={:?}",
@@ -728,7 +729,7 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
                 ),
             );
         }
-        None => ck.check("S6a 拿到消费者自己的实例", false, "consumer.client() 为 None"),
+        None => ck.check("S6a got the consumer's own instance", false, "consumer.client() is None"),
     }
     let mut expected = seeded.clone();
     expected.sort();
@@ -743,22 +744,22 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
             }
         },
         60,
-        "4 条预埋消息",
+        "4 seeded messages",
     )
     .await;
     ck.check(
-        &format!("S6 停 master 期间从从节点收齐 {QUEUES} 条"),
+        &format!("S6 collected all {QUEUES} from the slave while the master is down"),
         got_ok.is_some(),
         &format!("got=[{}]", fmt_bodies(&sink.bodies())),
     );
 
-    // ---------- S7 负控（先把 master 拉回来） ----------
-    println!("\nS7 负控：master 拉回后发布队列恢复、发送恢复");
+    // ---------- S7 negative control (bring the master back first) ----------
+    println!("\nS7 negative control: after the master is back, publish queues and sends recover");
     let script_for_start = script.to_path_buf();
     let started = tokio::task::spawn_blocking(move || broker_ctl(&script_for_start, "start")).await;
-    let (ok, out) = started.unwrap_or_else(|e| (false, format!("start 任务 panic: {e}")));
+    let (ok, out) = started.unwrap_or_else(|e| (false, format!("start task panicked: {e}")));
     if !ok {
-        ck.check("S7 master 复位", false, &out);
+        ck.check("S7 master reset", false, &out);
     }
 
     let queues_back = wait_until(
@@ -776,11 +777,11 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
             }
         },
         60,
-        "发布队列恢复",
+        "publish queues recovered",
     )
     .await;
     ck.check(
-        &format!("S7 发布队列恢复 {QUEUES}"),
+        &format!("S7 publish queues recovered {QUEUES}"),
         queues_back.is_some(),
         &format!(
             "queues={:?}",
@@ -789,23 +790,23 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
                 .map(|q| q.iter().map(|x| (&x.broker_name, x.queue_id)).collect::<Vec<_>>())
         ),
     );
-    // 两条失败发送都没在 broker 上留下消息：每条预埋队列的 maxOffset 仍是 1
+    // Neither failed send left a message on the broker: every seeded queue's maxOffset is still 1
     let mut after: Vec<(i32, i64)> = Vec::new();
     for mq in queues_back.as_ref().unwrap_or(&queues).iter() {
         match fx.admin.get_max_offset(mq, 5000, None).await {
             Ok(o) => after.push((mq.queue_id, o)),
-            Err(e) => println!("    (maxOffset 查询失败: {e})"),
+            Err(e) => println!("    (maxOffset query failed: {e})"),
         }
     }
     ck.check(
-        "S7b 两条失败发送没留下消息（maxOffset 仍是 1）",
+        "S7b the two failed sends left no message (maxOffset still 1)",
         !after.is_empty() && after.iter().all(|(_, v)| *v == 1),
         &format!("maxOffset={after:?}"),
     );
     let mut back = Message::new(&topic, Some(b"pr-master-back"));
     let back_res = fx.producer.send(&mut back, Some(20000), None).await;
     ck.check(
-        "S7c 发送恢复 SEND_OK",
+        "S7c send recovered SEND_OK",
         matches!(&back_res, Ok(r) if r.status == SendStatus::SendOk),
         &match &back_res {
             Ok(r) => format!("status={:?} msgId={:?}", r.status, r.msg_id),
@@ -821,8 +822,8 @@ async fn run(namesrv: &str, master: &str, slave: &str) -> Checker {
 
     let (ok, out) = broker_ctl(&broker_script, "status");
     if !ok {
-        println!("master 没在跑：先按本地集群 runbook 起 namesrv + master + slave（{out}）");
-        ck.check("前置 master UP", false, &out);
+        println!("master is not running: start namesrv + master + slave first per the local cluster runbook ({out})");
+        ck.check("precondition master UP", false, &out);
         return ck;
     }
 
@@ -833,7 +834,7 @@ async fn run(namesrv: &str, master: &str, slave: &str) -> Checker {
             return ck;
         }
     };
-    // 顺序：先声明 guard（后 drop），再跑场景；场景里任何提前 return 都会回到这里。
+    // Order: declare the guard first (dropped later), then run the scenario; any early return inside the scenario comes back here.
     let _guard = BrokerGuard {
         script: broker_script.clone(),
     };
@@ -846,7 +847,7 @@ async fn run(namesrv: &str, master: &str, slave: &str) -> Checker {
 
 fn report(ck: &Checker) {
     println!(
-        "\n== 结果: {}/{} 通过 ==",
+        "\n== result: {}/{} passed ==",
         ck.passed,
         ck.passed as usize + ck.failed.len()
     );

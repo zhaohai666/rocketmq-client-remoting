@@ -5,10 +5,11 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * 定时消息撤回句柄 v1：topic / brokerName / timestampStr / messageId 四段。
+ * Scheduled message recall handle v1: four segments, topic / brokerName / timestampStr / messageId.
  *
- * ``timestampStr`` 保留字符串而不是转成 int：协议里它就是原样存的文本，
- * 撤回时要把它一字不差回填到请求里，非法时间戳由 broker 判定（``ILLEGAL_OPERATION``）。
+ * ``timestampStr`` is kept as a string instead of being converted to an int: the protocol stores it as
+ * plain text verbatim, and a recall has to fill it back into the request byte for byte; an illegal
+ * timestamp is judged by the broker (``ILLEGAL_OPERATION``).
  */
 final class HandleV1
 {

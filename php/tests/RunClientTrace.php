@@ -4,21 +4,25 @@ declare(strict_types=1);
 
 /*
  * =====================================================================================
- * 消息轨迹（trace）自测：纯 assert 风格（无 phpunit），成功打印
- * `ALL TESTS PASSED (N checks)`，失败非零退出。
+ * Message trace self-test: pure assert style (no phpunit); on success prints
+ * `ALL TESTS PASSED (N checks)`, on failure exits non-zero.
  * -------------------------------------------------------------------------------------
- * 依赖 php/src/Client/{Hook,SendResult,ConsumerResult}.php，本套件**直接使用真实实现**。下方 namespace RocketMQ\Client 里的
- * 条件桩（stub）只在这些真实文件缺失时兜底：真机/全量回归时它们存在，class_exists /
- * interface_exists / enum_exists 命中真实定义即全部跳过。**不修改任何真实源文件**。
- * 注意：Hook.php 里 SendMessageHook/ConsumeMessageHook/EndTransactionHook 是
- * **interface**，其兜底判断必须用 interface_exists（用 class_exists 会对接口判 false
- * 并撞名重声明）。
+ * Depends on php/src/Client/{Hook,SendResult,ConsumerResult}.php; this suite **uses the real
+ * implementations directly**. The conditional stubs in namespace RocketMQ\Client below are only
+ * a fallback for when those real files are missing: during live/full regression runs they exist,
+ * and class_exists / interface_exists / enum_exists hit the real definitions so all stubs are
+ * skipped. **No real source file is modified**.
+ * Note: in Hook.php SendMessageHook/ConsumeMessageHook/EndTransactionHook are
+ * **interfaces**, so their fallback checks must use interface_exists (class_exists would return
+ * false for an interface and cause a name-collision redeclaration).
  * -------------------------------------------------------------------------------------
- * 同名冲突（已解决）：php/src/Client/TraceContext.php（W3C traceparent 助手）原先与消息轨迹上下文
- * TraceContext **同为 RocketMQ\Client\TraceContext**，
- * 且 PSR-4 直命中会让前者永远抢先。现已把 W3C 那个更名为
- * `RocketMQ\Client\TraceContextPropagator`（文件同步改名），本套件因此**不再需要**
- * 显式 require Trace.php，走真实 autoload 路径（更贴近生产）。
+ * Name conflict (resolved): php/src/Client/TraceContext.php (the W3C traceparent helper)
+ * previously shared **the same RocketMQ\Client\TraceContext name** with the message-trace
+ * context TraceContext,
+ * and a direct PSR-4 hit would let the former always win. The W3C one has been renamed to
+ * `RocketMQ\Client\TraceContextPropagator` (file renamed accordingly), so this suite **no longer
+ * needs** to require Trace.php explicitly and goes through the real autoload path (closer to
+ * production).
  * =====================================================================================
  */
 namespace RocketMQ\Client {
@@ -180,10 +184,12 @@ namespace {
     const MSG_ID_1 = 'AC1400A1F0A018B4AAC2A1B2C3D4E5F6';
     const MSG_ID_2 = 'AC1400A1F0A018B4AAC2A1B2C3D4E5F7';
     const OFFSET_MSG_ID = 'AC1400A1000027100000000000000001';
-    const BODY = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; // 42 字节
+    const BODY = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; // 42 bytes
 
-    // ---- 轨迹日志编码的固定向量（勿手改；改了就与轨迹控制台不兼容）----
-    // 用 define() 落成全局常量：类方法内部看不到文件级 $变量，但能看到全局常量。
+    // ---- Fixed vectors of the trace-log encoding (do not hand-edit; changing them breaks
+    // compatibility with the trace console) ----
+    // define() turns them into global constants: class methods cannot see file-level $variables
+    // but can see global constants.
     define('EXPECTED_PUB', implode(SOH, [
         'Pub', '1700000000000', 'DefaultRegion', 'GID_test', 'TopicTest',
         MSG_ID_1, 'TagA', 'KeyA KeyB', '127.0.0.1:10911', '42', '7', '0',
@@ -212,9 +218,9 @@ namespace {
         'TopicTest', MSG_ID_1, 'true',
     ]) . STX);
 
-    // ---- 测试替身（不依赖集群/线程）----
+    // ---- Test doubles (no cluster/thread dependency) ----
 
-    /** 替身：只记录 send 调用，不发网络。 */
+    /** Double: records send calls only, no network. */
     final class FakeTraceProducer
     {
         /** @var list<array{0:string,1:?string,2:?string}> */
@@ -244,7 +250,7 @@ namespace {
         }
     }
 
-    /** 替身：只记录 append 调用。 */
+    /** Double: records append calls only. */
     final class CapturingDispatcher
     {
         /** @var list<TraceContext> */
@@ -268,8 +274,9 @@ namespace {
     }
 
     /**
-     * 测试用 SendResult 替身：hook 只按属性鸭子访问 SendResult（无类型约束），
-     * 这样本套件不依赖并行子任务 SendResult 的具体构造签名。
+     * Test-double SendResult: the hook accesses SendResult duck-typed by property (no type
+     * constraint), so this suite does not depend on the exact constructor signature of the
+     * parallel sub-task's SendResult.
      */
     final class TestSendResult
     {
@@ -321,7 +328,7 @@ namespace {
             }
         }
 
-        // ============================================================ 构造辅助
+        // ============================================================ Construction helpers
 
         private static function bean(
             string $msgId = MSG_ID_1,
@@ -414,7 +421,7 @@ namespace {
             return $ctx;
         }
 
-        // ============================================================ 常量与枚举
+        // ============================================================ Constants and enums
 
         private function testConstantsAndEnums(): void
         {
@@ -425,15 +432,15 @@ namespace {
             $this->checkSame('rmq_sys_TRACE_DATA_', TraceConstants::TRACE_TOPIC_PREFIX, 'TRACE_TOPIC_PREFIX');
             $this->checkSame('To_', TraceConstants::TO_PREFIX, 'TO_PREFIX');
             $this->checkSame('From_', TraceConstants::FROM_PREFIX, 'FROM_PREFIX');
-            $this->checkSame('EndTransaction', TraceConstants::END_TRANSACTION, 'END_TRANSACTION 常量');
+            $this->checkSame('EndTransaction', TraceConstants::END_TRANSACTION, 'END_TRANSACTION constant');
             $this->checkSame('rocketmq', TraceConstants::ROCKETMQ_SERVICE, 'ROCKETMQ_SERVICE');
             $this->checkSame('rocketmq.success', TraceConstants::ROCKETMQ_SUCCESS, 'ROCKETMQ_SUCCESS');
             $this->checkSame('rocketmq.tags', TraceConstants::ROCKETMQ_TAGS, 'ROCKETMQ_TAGS');
             $this->checkSame('rocketmq.keys', TraceConstants::ROCKETMQ_KEYS, 'ROCKETMQ_KEYS');
             $this->checkSame('rocketmq.store_host', TraceConstants::ROCKETMQ_STORE_HOST, 'ROCKETMQ_STORE_HOST');
             $this->checkSame('rocketmq.body_length', TraceConstants::ROCKETMQ_BODY_LENGTH, 'ROCKETMQ_BODY_LENGTH');
-            $this->checkSame('rocketmq.mgs_id', TraceConstants::ROCKETMQ_MSG_ID, 'ROCKETMQ_MSG_ID(协议字段名含 mgs 拼写)');
-            $this->checkSame('rocketmq.mgs_type', TraceConstants::ROCKETMQ_MSG_TYPE, 'ROCKETMQ_MSG_TYPE(协议字段名含 mgs 拼写)');
+            $this->checkSame('rocketmq.mgs_id', TraceConstants::ROCKETMQ_MSG_ID, 'ROCKETMQ_MSG_ID (the protocol field name carries the mgs typo)');
+            $this->checkSame('rocketmq.mgs_type', TraceConstants::ROCKETMQ_MSG_TYPE, 'ROCKETMQ_MSG_TYPE (the protocol field name carries the mgs typo)');
             $this->checkSame('rocketmq.region_id', TraceConstants::ROCKETMQ_REGION_ID, 'ROCKETMQ_REGION_ID');
             $this->checkSame('rocketmq.transaction_id', TraceConstants::ROCKETMQ_TRANSACTION_ID, 'ROCKETMQ_TRANSACTION_ID');
             $this->checkSame('rocketmq.transaction_state', TraceConstants::ROCKETMQ_TRANSACTION_STATE, 'ROCKETMQ_TRANSACTION_STATE');
@@ -445,7 +452,7 @@ namespace {
             $this->checkSame('SubBefore', TraceType::SUB_BEFORE->value, 'TraceType.SUB_BEFORE');
             $this->checkSame('SubAfter', TraceType::SUB_AFTER->value, 'TraceType.SUB_AFTER');
             $this->checkSame('EndTransaction', TraceType::END_TRANSACTION->value, 'TraceType.END_TRANSACTION');
-            $this->checkSame(5, count(TraceType::cases()), 'TraceType 共 5 项');
+            $this->checkSame(5, count(TraceType::cases()), 'TraceType has 5 entries');
 
             $this->checkSame('LOCAL', AccessChannel::LOCAL->value, 'AccessChannel.LOCAL');
             $this->checkSame('CLOUD', AccessChannel::CLOUD->value, 'AccessChannel.CLOUD');
@@ -453,7 +460,7 @@ namespace {
             $this->checkSame('PRODUCE', TraceDispatcherType::PRODUCE->value, 'TraceDispatcherType.PRODUCE');
             $this->checkSame('CONSUME', TraceDispatcherType::CONSUME->value, 'TraceDispatcherType.CONSUME');
 
-            // 编码口径依赖的 Common 常量/枚举
+            // Common constants/enums the encoding semantics depend on
             $this->checkSame('RMQ_SYS_TRACE_TOPIC', MixAll::TRACE_TOPIC, 'MixAll.TRACE_TOPIC');
             $this->checkSame('DefaultRegion', MixAll::DEFAULT_TRACE_REGION_ID, 'MixAll.DEFAULT_TRACE_REGION_ID');
             $this->checkSame(' ', MessageConst::KEY_SEPARATOR, 'MessageConst.KEY_SEPARATOR');
@@ -463,7 +470,7 @@ namespace {
                 MessageType::NORMAL_MSG->value, MessageType::TRANS_MSG_HALF->value,
                 MessageType::TRANS_MSG_COMMIT->value, MessageType::DELAY_MSG->value,
                 MessageType::ORDER_MSG->value,
-            ], 'MessageType 值序 = 协议枚举序号');
+            ], 'MessageType value order = protocol enum ordinals');
             $this->checkSame('Normal', MessageType::NORMAL_MSG->shortName(), 'MessageType.NORMAL_MSG.shortName');
             $this->checkSame('Trans', MessageType::TRANS_MSG_HALF->shortName(), 'MessageType.TRANS_MSG_HALF.shortName');
             $this->checkSame('TransCommit', MessageType::TRANS_MSG_COMMIT->shortName(), 'MessageType.TRANS_MSG_COMMIT.shortName');
@@ -474,31 +481,31 @@ namespace {
         private function testDefaults(): void
         {
             $tb = new TraceTransferBean();
-            $this->checkSame('', $tb->transData, 'TraceTransferBean.transData 默认空串');
-            $this->checkSame([], $tb->transKey, 'TraceTransferBean.transKey 默认空集');
+            $this->checkSame('', $tb->transData, 'TraceTransferBean.transData defaults to empty string');
+            $this->checkSame([], $tb->transKey, 'TraceTransferBean.transKey defaults to empty set');
 
             $a = new TraceContext();
             $b = new TraceContext();
-            $this->check($a->requestId !== $b->requestId, 'TraceContext.requestId 唯一');
-            $this->checkSame(32, strlen($a->requestId), 'TraceContext.requestId 长度 32');
-            $this->checkSame(true, $a->isSuccess, 'TraceContext.isSuccess 默认 true');
-            $this->checkSame([], $a->traceBeans, 'TraceContext.traceBeans 默认空');
-            $this->check(abs($a->timeStamp - \RocketMQ\Common\UtilAll::currentTimeMillis()) < 5000, 'TraceContext.timeStamp 近似当前毫秒');
-            $this->checkSame(AccessChannel::LOCAL, $a->accessChannelOrLocal(), 'accessChannelOrLocal 默认 LOCAL');
+            $this->check($a->requestId !== $b->requestId, 'TraceContext.requestId is unique');
+            $this->checkSame(32, strlen($a->requestId), 'TraceContext.requestId length 32');
+            $this->checkSame(true, $a->isSuccess, 'TraceContext.isSuccess defaults to true');
+            $this->checkSame([], $a->traceBeans, 'TraceContext.traceBeans defaults to empty');
+            $this->check(abs($a->timeStamp - \RocketMQ\Common\UtilAll::currentTimeMillis()) < 5000, 'TraceContext.timeStamp is approximately the current millis');
+            $this->checkSame(AccessChannel::LOCAL, $a->accessChannelOrLocal(), 'accessChannelOrLocal defaults to LOCAL');
             $a->accessChannel = AccessChannel::CLOUD;
-            $this->checkSame(AccessChannel::CLOUD, $a->accessChannelOrLocal(), 'accessChannelOrLocal 尊重显式 CLOUD');
+            $this->checkSame(AccessChannel::CLOUD, $a->accessChannelOrLocal(), 'accessChannelOrLocal respects an explicit CLOUD');
 
             $bean = new TraceBean();
-            $this->checkSame('', $bean->topic, 'TraceBean.topic 默认空');
-            $this->check($bean->storeHost !== '' && $bean->storeHost === $bean->clientHost, 'TraceBean storeHost/clientHost 默认同 LOCAL_ADDRESS');
-            $this->checkSame($bean->storeHost, TraceBean::localAddress(), 'TraceBean.localAddress() 与默认值一致');
-            $this->checkSame(null, $bean->msgType, 'TraceBean.msgType 默认 null');
-            $this->checkSame(false, $bean->fromTransactionCheck, 'TraceBean.fromTransactionCheck 默认 false');
+            $this->checkSame('', $bean->topic, 'TraceBean.topic defaults to empty');
+            $this->check($bean->storeHost !== '' && $bean->storeHost === $bean->clientHost, 'TraceBean storeHost/clientHost default to the same LOCAL_ADDRESS');
+            $this->checkSame($bean->storeHost, TraceBean::localAddress(), 'TraceBean.localAddress() matches the default value');
+            $this->checkSame(null, $bean->msgType, 'TraceBean.msgType defaults to null');
+            $this->checkSame(false, $bean->fromTransactionCheck, 'TraceBean.fromTransactionCheck defaults to false');
 
-            $this->check($a->__toString() !== '', 'TraceContext.__toString 可渲染');
+            $this->check($a->__toString() !== '', 'TraceContext.__toString renders');
         }
 
-        // ============================================================ 编码（逐字节）
+        // ============================================================ Encoding (byte-exact)
 
         private function testEncodePubByteExact(): void
         {
@@ -519,7 +526,7 @@ namespace {
             $ctx->traceBeans = [self::bean()];
 
             $tb = TraceDataEncoder::encoderFromContextBean($ctx);
-            $this->checkSame($expected, $tb->transData, 'PUB 编码逐字节 = 固定向量');
+            $this->checkSame($expected, $tb->transData, 'PUB encoding byte-exact = the fixed vector');
             $keys = array_keys($tb->transKey);
             sort($keys, SORT_STRING);
             $this->checkSame([MSG_ID_1, 'KeyA', 'KeyB'], $keys, 'PUB transKey = {msgId, KeyA, KeyB}');
@@ -545,10 +552,10 @@ namespace {
             $ctx->traceBeans = [self::bean(), self::bean(msgId: MSG_ID_2, keys: 'KeyC', retryTimes: 0)];
 
             $tb = TraceDataEncoder::encoderFromContextBean($ctx);
-            $this->checkSame($expected, $tb->transData, 'SUB_BEFORE 多 context 逐字节 = 固定向量');
+            $this->checkSame($expected, $tb->transData, 'SUB_BEFORE multi-context byte-exact = the fixed vector');
             $keys = array_keys($tb->transKey);
             sort($keys, SORT_STRING);
-            $this->checkSame([MSG_ID_1, MSG_ID_2, 'KeyA', 'KeyB', 'KeyC'], $keys, 'SUB_BEFORE transKey 合并两条');
+            $this->checkSame([MSG_ID_1, MSG_ID_2, 'KeyA', 'KeyB', 'KeyC'], $keys, 'SUB_BEFORE transKey merges both entries');
         }
 
         private function testEncodeSubAfterByteExact(): void
@@ -571,14 +578,15 @@ namespace {
             $ctx->contextCode = 2;
             $ctx->accessChannel = AccessChannel::LOCAL;
             $ctx->traceBeans = [self::bean()];
-            $this->checkSame($expectedLocal, TraceDataEncoder::encoderFromContextBean($ctx)->transData, 'SUB_AFTER(LOCAL) 逐字节 = 固定向量（含 timestamp+group）');
+            $this->checkSame($expectedLocal, TraceDataEncoder::encoderFromContextBean($ctx)->transData, 'SUB_AFTER(LOCAL) byte-exact = the fixed vector (with timestamp+group)');
 
             $ctx->accessChannel = AccessChannel::CLOUD;
-            $this->checkSame($expectedCloud, TraceDataEncoder::encoderFromContextBean($ctx)->transData, 'SUB_AFTER(CLOUD) 去掉 timestamp+group 两段');
+            $this->checkSame($expectedCloud, TraceDataEncoder::encoderFromContextBean($ctx)->transData, 'SUB_AFTER(CLOUD) drops the timestamp+group segments');
 
-            // accessChannel 为 null → 按 LOCAL 处理（有意的健壮性兜底：缺省按 LOCAL，不因空值抛错）
+            // accessChannel null -> handled as LOCAL (a deliberate robustness fallback: default to
+            // LOCAL instead of throwing on a null)
             $ctx->accessChannel = null;
-            $this->checkSame($expectedLocal, TraceDataEncoder::encoderFromContextBean($ctx)->transData, 'SUB_AFTER(accessChannel=null) 按 LOCAL 处理');
+            $this->checkSame($expectedLocal, TraceDataEncoder::encoderFromContextBean($ctx)->transData, 'SUB_AFTER(accessChannel=null) handled as LOCAL');
         }
 
         private function testEncodeEndTransactionAndRecallByteExact(): void
@@ -592,7 +600,7 @@ namespace {
             $this->checkSame(
                 EXPECTED_END_TRANSACTION,
                 TraceDataEncoder::encoderFromContextBean($endTx)->transData,
-                'END_TRANSACTION 编码逐字节 = 固定向量'
+                'END_TRANSACTION encoding byte-exact = the fixed vector'
             );
 
             $recall = new TraceContext();
@@ -605,7 +613,7 @@ namespace {
             $this->checkSame(
                 EXPECTED_RECALL,
                 TraceDataEncoder::encoderFromContextBean($recall)->transData,
-                'RECALL 编码逐字节 = 固定向量'
+                'RECALL encoding byte-exact = the fixed vector'
             );
 
             $this->checkSame(null, TraceDataEncoder::encoderFromContextBean(null), 'encoderFromContextBean(null) → null');
@@ -632,34 +640,34 @@ namespace {
                 OFFSET_MSG_ID, 'true',
             ]) . STX;
             $tb = TraceDataEncoder::encoderFromContextBean($ctx);
-            $this->checkSame($expected, $tb->transData, 'PUB 中文/特殊字符 UTF-8 逐字节不变');
+            $this->checkSame($expected, $tb->transData, 'PUB Chinese/special chars stay byte-identical in UTF-8');
             $keys = array_keys($tb->transKey);
             sort($keys, SORT_STRING);
-            $this->checkSame([MSG_ID_1, '键一', '键二'], $keys, '中文 keys 按空格拆分');
+            $this->checkSame([MSG_ID_1, '键一', '键二'], $keys, 'Chinese keys split on spaces');
 
-            // 中文往返解码
+            // Chinese round-trip decoding
             $back = TraceDataEncoder::decoderFromTraceDataString($tb->transData);
-            $this->checkSame(1, count($back), '中文 PUB 解码 1 条');
-            $this->checkSame('主题', $back[0]->traceBeans[0]->topic, '中文 topic 往返');
-            $this->checkSame('GID_中文', $back[0]->groupName, '中文 groupName 往返');
-            $this->checkSame('键一 键二', $back[0]->traceBeans[0]->keys, '中文 keys 往返');
+            $this->checkSame(1, count($back), 'Chinese PUB decodes 1 record');
+            $this->checkSame('主题', $back[0]->traceBeans[0]->topic, 'Chinese topic round-trips');
+            $this->checkSame('GID_中文', $back[0]->groupName, 'Chinese groupName round-trips');
+            $this->checkSame('键一 键二', $back[0]->traceBeans[0]->keys, 'Chinese keys round-trip');
         }
 
-        // ============================================================ wire_split / 解码
+        // ============================================================ wire_split / decoding
 
         private function testWireSplitSemantics(): void
         {
-            $this->checkSame(['a'], TraceDataEncoder::wireSplit('a' . STX, STX), 'wireSplit 丢掉末尾空串');
-            $this->checkSame([], TraceDataEncoder::wireSplit(STX, STX), 'wireSplit(单分隔符) → []');
-            $this->checkSame(['a', 'b'], TraceDataEncoder::wireSplit('a' . STX . 'b' . STX, STX), 'wireSplit 多段去尾空');
-            $this->checkSame(['a', '', 'b'], TraceDataEncoder::wireSplit('a' . SOH . SOH . 'b', SOH), 'wireSplit 保留中间空串');
-            // PHP 原生 explode 保留末尾空串 —— 这正是不能直接用的原因
-            $this->checkSame(['a', ''], explode(STX, 'a' . STX), 'explode 原生保留末尾空串（对照）');
+            $this->checkSame(['a'], TraceDataEncoder::wireSplit('a' . STX, STX), 'wireSplit drops the trailing empty string');
+            $this->checkSame([], TraceDataEncoder::wireSplit(STX, STX), 'wireSplit(single separator) -> []');
+            $this->checkSame(['a', 'b'], TraceDataEncoder::wireSplit('a' . STX . 'b' . STX, STX), 'wireSplit drops the trailing empty across multiple segments');
+            $this->checkSame(['a', '', 'b'], TraceDataEncoder::wireSplit('a' . SOH . SOH . 'b', SOH), 'wireSplit keeps middle empty strings');
+            // PHP's native explode keeps the trailing empty string — exactly why it cannot be used directly
+            $this->checkSame(['a', ''], explode(STX, 'a' . STX), 'native explode keeps the trailing empty string (control)');
         }
 
         private function testDecodeRoundTrips(): void
         {
-            // PUB 往返
+            // PUB round-trip
             $ctx = new TraceContext();
             $ctx->traceType = TraceType::PUB;
             $ctx->timeStamp = 1700000000000;
@@ -671,24 +679,24 @@ namespace {
             $decoded = TraceDataEncoder::decoderFromTraceDataString(
                 TraceDataEncoder::encoderFromContextBean($ctx)->transData
             );
-            $this->checkSame(1, count($decoded), 'PUB 往返条数');
+            $this->checkSame(1, count($decoded), 'PUB round-trip record count');
             $got = $decoded[0];
-            $this->checkSame(TraceType::PUB, $got->traceType, 'PUB 往返 traceType');
-            $this->checkSame(1700000000000, $got->timeStamp, 'PUB 往返 timeStamp');
-            $this->checkSame('DefaultRegion', $got->regionId, 'PUB 往返 regionId');
-            $this->checkSame('GID_test', $got->groupName, 'PUB 往返 groupName');
-            $this->checkSame(7, $got->costTime, 'PUB 往返 costTime');
-            $this->checkSame(true, $got->isSuccess, 'PUB 往返 isSuccess');
+            $this->checkSame(TraceType::PUB, $got->traceType, 'PUB round-trip traceType');
+            $this->checkSame(1700000000000, $got->timeStamp, 'PUB round-trip timeStamp');
+            $this->checkSame('DefaultRegion', $got->regionId, 'PUB round-trip regionId');
+            $this->checkSame('GID_test', $got->groupName, 'PUB round-trip groupName');
+            $this->checkSame(7, $got->costTime, 'PUB round-trip costTime');
+            $this->checkSame(true, $got->isSuccess, 'PUB round-trip isSuccess');
             $bean = $got->traceBeans[0];
             $this->checkSame(['TopicTest', MSG_ID_1, 'TagA', 'KeyA KeyB', '127.0.0.1:10911'], [
                 $bean->topic, $bean->msgId, $bean->tags, $bean->keys, $bean->storeHost,
-            ], 'PUB 往返 bean 五字段');
-            $this->checkSame(42, $bean->bodyLength, 'PUB 往返 bodyLength');
-            $this->checkSame(OFFSET_MSG_ID, $bean->offsetMsgId, 'PUB 往返 offsetMsgId');
-            $this->checkSame(MessageType::NORMAL_MSG, $bean->msgType, 'PUB 往返 msgType');
-            $this->checkSame(TraceBean::localAddress(), $bean->clientHost, 'PUB 解码 clientHost 落 LOCAL_ADDRESS');
+            ], 'PUB round-trip bean five fields');
+            $this->checkSame(42, $bean->bodyLength, 'PUB round-trip bodyLength');
+            $this->checkSame(OFFSET_MSG_ID, $bean->offsetMsgId, 'PUB round-trip offsetMsgId');
+            $this->checkSame(MessageType::NORMAL_MSG, $bean->msgType, 'PUB round-trip msgType');
+            $this->checkSame(TraceBean::localAddress(), $bean->clientHost, 'PUB decoding lands clientHost on LOCAL_ADDRESS');
 
-            // SUB_BEFORE 往返：requestId / retryTimes
+            // SUB_BEFORE round-trip: requestId / retryTimes
             $sb = new TraceContext();
             $sb->traceType = TraceType::SUB_BEFORE;
             $sb->timeStamp = 1700000000000;
@@ -697,13 +705,13 @@ namespace {
             $sb->requestId = 'REQ-SUB-001';
             $sb->traceBeans = [self::bean(), self::bean(msgId: MSG_ID_2, keys: 'KeyC', retryTimes: 0)];
             $dec = TraceDataEncoder::decoderFromTraceDataString(TraceDataEncoder::encoderFromContextBean($sb)->transData);
-            $this->checkSame(2, count($dec), 'SUB_BEFORE 往返条数');
-            $this->checkSame([MSG_ID_1, MSG_ID_2], array_map(static fn($c) => $c->traceBeans[0]->msgId, $dec), 'SUB_BEFORE 往返 msgId 顺序');
-            $this->checkSame([2, 0], array_map(static fn($c) => $c->traceBeans[0]->retryTimes, $dec), 'SUB_BEFORE 往返 retryTimes');
-            $this->checkSame('REQ-SUB-001', $dec[0]->requestId, 'SUB_BEFORE 往返 requestId');
-            $this->checkSame('CID_test', $dec[1]->groupName, 'SUB_BEFORE 往返 groupName');
+            $this->checkSame(2, count($dec), 'SUB_BEFORE round-trip record count');
+            $this->checkSame([MSG_ID_1, MSG_ID_2], array_map(static fn($c) => $c->traceBeans[0]->msgId, $dec), 'SUB_BEFORE round-trip msgId order');
+            $this->checkSame([2, 0], array_map(static fn($c) => $c->traceBeans[0]->retryTimes, $dec), 'SUB_BEFORE round-trip retryTimes');
+            $this->checkSame('REQ-SUB-001', $dec[0]->requestId, 'SUB_BEFORE round-trip requestId');
+            $this->checkSame('CID_test', $dec[1]->groupName, 'SUB_BEFORE round-trip groupName');
 
-            // SUB_AFTER 往返（含 contextCode + legacy 分支）
+            // SUB_AFTER round-trip (with contextCode + legacy branch)
             $sa = new TraceContext();
             $sa->traceType = TraceType::SUB_AFTER;
             $sa->timeStamp = 1700000000000;
@@ -717,19 +725,19 @@ namespace {
             $gotSa = TraceDataEncoder::decoderFromTraceDataString(
                 TraceDataEncoder::encoderFromContextBean($sa)->transData
             )[0];
-            $this->checkSame(4, $gotSa->contextCode, 'SUB_AFTER 往返 contextCode');
-            $this->checkSame(false, $gotSa->isSuccess, 'SUB_AFTER 往返 isSuccess');
-            $this->checkSame(1700000000000, $gotSa->timeStamp, 'SUB_AFTER 往返 timeStamp');
-            $this->checkSame('CID_test', $gotSa->groupName, 'SUB_AFTER 往返 groupName');
+            $this->checkSame(4, $gotSa->contextCode, 'SUB_AFTER round-trip contextCode');
+            $this->checkSame(false, $gotSa->isSuccess, 'SUB_AFTER round-trip isSuccess');
+            $this->checkSame(1700000000000, $gotSa->timeStamp, 'SUB_AFTER round-trip timeStamp');
+            $this->checkSame('CID_test', $gotSa->groupName, 'SUB_AFTER round-trip groupName');
 
-            // 老版本只有 7 段时不应读到 timestamp/group
+            // With only 7 segments the legacy version must not read timestamp/group
             $legacy = implode(SOH, ['SubAfter', 'REQ', MSG_ID_1, '5', 'true', 'KeyA', '0']);
             $gotLegacy = TraceDataEncoder::decoderFromTraceDataString($legacy)[0];
             $this->checkSame(0, $gotLegacy->contextCode, 'legacy SubAfter contextCode=0');
-            $this->check($gotLegacy->timeStamp > 1700000000000, 'legacy SubAfter 落当前时间默认值');
-            $this->checkSame('', $gotLegacy->groupName, 'legacy SubAfter groupName 空');
+            $this->check($gotLegacy->timeStamp > 1700000000000, 'legacy SubAfter falls back to the current-time default');
+            $this->checkSame('', $gotLegacy->groupName, 'legacy SubAfter groupName empty');
 
-            // END_TRANSACTION 往返
+            // END_TRANSACTION round-trip
             $endTx = new TraceContext();
             $endTx->traceType = TraceType::END_TRANSACTION;
             $endTx->timeStamp = 1700000000000;
@@ -739,45 +747,45 @@ namespace {
             $gotEnd = TraceDataEncoder::decoderFromTraceDataString(
                 TraceDataEncoder::encoderFromContextBean($endTx)->transData
             )[0];
-            $this->checkSame(TraceType::END_TRANSACTION, $gotEnd->traceType, 'END_TRANSACTION 往返 traceType');
-            $this->checkSame('TRAN-001', $gotEnd->traceBeans[0]->transactionId, 'END_TRANSACTION 往返 transactionId');
-            $this->checkSame('COMMIT_MESSAGE', $gotEnd->traceBeans[0]->transactionState, 'END_TRANSACTION 往返 transactionState(字符串)');
-            $this->checkSame(false, $gotEnd->traceBeans[0]->fromTransactionCheck, 'END_TRANSACTION 往返 fromTransactionCheck');
-            $this->checkSame(MessageType::NORMAL_MSG, $gotEnd->traceBeans[0]->msgType, 'END_TRANSACTION 往返 msgType');
+            $this->checkSame(TraceType::END_TRANSACTION, $gotEnd->traceType, 'END_TRANSACTION round-trip traceType');
+            $this->checkSame('TRAN-001', $gotEnd->traceBeans[0]->transactionId, 'END_TRANSACTION round-trip transactionId');
+            $this->checkSame('COMMIT_MESSAGE', $gotEnd->traceBeans[0]->transactionState, 'END_TRANSACTION round-trip transactionState(string)');
+            $this->checkSame(false, $gotEnd->traceBeans[0]->fromTransactionCheck, 'END_TRANSACTION round-trip fromTransactionCheck');
+            $this->checkSame(MessageType::NORMAL_MSG, $gotEnd->traceBeans[0]->msgType, 'END_TRANSACTION round-trip msgType');
         }
 
         private function testDecodeRobustness(): void
         {
-            $this->checkSame([], TraceDataEncoder::decoderFromTraceDataString(''), '空串解码 → []');
-            $this->checkSame([], TraceDataEncoder::decoderFromTraceDataString(null), 'null 解码 → []');
-            $this->checkSame([], TraceDataEncoder::decoderFromTraceDataString('Bogus' . SOH . '1' . STX), '未知记录类型 → []');
-            $this->checkSame([], TraceDataEncoder::decoderFromTraceDataString(STX . STX), '纯分隔符 → []');
+            $this->checkSame([], TraceDataEncoder::decoderFromTraceDataString(''), 'decoding an empty string -> []');
+            $this->checkSame([], TraceDataEncoder::decoderFromTraceDataString(null), 'decoding null -> []');
+            $this->checkSame([], TraceDataEncoder::decoderFromTraceDataString('Bogus' . SOH . '1' . STX), 'unknown record type -> []');
+            $this->checkSame([], TraceDataEncoder::decoderFromTraceDataString(STX . STX), 'bare separators -> []');
 
-            // 无 keys 的 SubBefore：缺字段兜成空串，不抛越界错误
+            // SubBefore without keys: missing fields fall back to an empty string instead of an out-of-bounds error
             $raw = implode(SOH, ['SubBefore', '1700000000000', 'DefaultRegion', 'GID_trace_live',
                 'REQ-001', MSG_ID_1, '0', '']) . STX;
             $records = TraceDataEncoder::decoderFromTraceDataString($raw);
-            $this->checkSame(1, count($records), '无 keys 的 SubBefore 可解');
-            $this->checkSame('', $records[0]->traceBeans[0]->keys, '无 keys 的 SubBefore keys 兜空串');
-            $this->checkSame(0, $records[0]->traceBeans[0]->retryTimes, '无 keys 的 SubBefore retryTimes=0');
-            $this->checkSame(MSG_ID_1, $records[0]->traceBeans[0]->msgId, '无 keys 的 SubBefore msgId');
+            $this->checkSame(1, count($records), 'keyless SubBefore is decodable');
+            $this->checkSame('', $records[0]->traceBeans[0]->keys, 'keyless SubBefore keys fall back to an empty string');
+            $this->checkSame(0, $records[0]->traceBeans[0]->retryTimes, 'keyless SubBefore retryTimes=0');
+            $this->checkSame(MSG_ID_1, $records[0]->traceBeans[0]->msgId, 'keyless SubBefore msgId');
 
-            // 一条坏记录不能毁掉整条轨迹消息
-            $broken = implode(SOH, ['SubAfter', 'REQ-9', MSG_ID_2]) . STX;   // 段数不足
+            // One broken record must not destroy the whole trace message
+            $broken = implode(SOH, ['SubAfter', 'REQ-9', MSG_ID_2]) . STX;   // too few segments
             $goodPub = TraceDataEncoder::encoderFromContextBean(self::pubContext())->transData;
             $goodSub = implode(SOH, ['SubBefore', '1700000000000', 'R', 'G', 'REQ-1', MSG_ID_1, '0', 'K']) . STX;
             $recs = TraceDataEncoder::decoderFromTraceDataString($goodPub . $broken . $goodSub);
             $this->checkSame(
                 [TraceType::PUB, TraceType::SUB_BEFORE],
                 array_map(static fn($c) => $c->traceType, $recs),
-                '坏记录只跳过自己（其余照解）'
+                'a broken record skips only itself (the rest still decode)'
             );
 
-            // 未知记录整条被忽略，已知记录照解
+            // Unknown records are ignored wholesale; known records still decode
             $raw2 = implode(SOH, ['SomethingNew', '1', '2']) . STX
                 . TraceDataEncoder::encoderFromContextBean(self::recallContext())->transData;
             $recs2 = TraceDataEncoder::decoderFromTraceDataString($raw2);
-            $this->checkSame([TraceType::RECALL], array_map(static fn($c) => $c->traceType, $recs2), '未知记录被忽略');
+            $this->checkSame([TraceType::RECALL], array_map(static fn($c) => $c->traceType, $recs2), 'unknown records are ignored');
         }
 
         private static function recallContext(): TraceContext
@@ -792,55 +800,55 @@ namespace {
             return $recall;
         }
 
-        // ============================================================ 分发器
+        // ============================================================ Dispatcher
 
         private function testDispatcherDefaults(): void
         {
             $d = self::makeDispatcher();
-            $this->checkSame(MixAll::TRACE_TOPIC, $d->traceTopicName, 'dispatcher 默认 traceTopic');
-            $this->checkSame(10, $d->batchNum, 'dispatcher batchNum 默认 10');
-            $this->checkSame(128000, $d->maxMsgSize, 'dispatcher maxMsgSize 默认 128000');
-            $this->checkSame(2048, AsyncTraceDispatcher::MAX_QUEUE_SIZE, 'dispatcher 队列上限 2048');
+            $this->checkSame(MixAll::TRACE_TOPIC, $d->traceTopicName, 'dispatcher default traceTopic');
+            $this->checkSame(10, $d->batchNum, 'dispatcher batchNum defaults to 10');
+            $this->checkSame(128000, $d->maxMsgSize, 'dispatcher maxMsgSize defaults to 128000');
+            $this->checkSame(2048, AsyncTraceDispatcher::MAX_QUEUE_SIZE, 'dispatcher queue cap 2048');
 
             $d2 = new AsyncTraceDispatcher('GID_test', TraceDispatcherType::PRODUCE, 50, null, null);
             $d2->traceProducer = new FakeTraceProducer();
-            $this->checkSame(20, $d2->batchNum, 'batchNum 上限 20');
+            $this->checkSame(20, $d2->batchNum, 'batchNum capped at 20');
 
-            $this->check(str_contains($d->genGroupNameForTrace(), TraceConstants::GROUP_NAME_PREFIX), '内部生产者组名含 GROUP_NAME_PREFIX');
-            $this->check(str_contains($d->genGroupNameForTrace(), '-PRODUCE-'), '内部生产者组名含 -PRODUCE-');
+            $this->check(str_contains($d->genGroupNameForTrace(), TraceConstants::GROUP_NAME_PREFIX), 'the internal producer group name contains GROUP_NAME_PREFIX');
+            $this->check(str_contains($d->genGroupNameForTrace(), '-PRODUCE-'), 'the internal producer group name contains -PRODUCE-');
             $dConsume = new AsyncTraceDispatcher('CID_test', TraceDispatcherType::CONSUME);
-            $this->check(str_contains($dConsume->genGroupNameForTrace(), '-CONSUME-'), '内部生产者组名含 -CONSUME-');
+            $this->check(str_contains($dConsume->genGroupNameForTrace(), '-CONSUME-'), 'the internal producer group name contains -CONSUME-');
 
             $custom = new AsyncTraceDispatcher('GID_test', TraceDispatcherType::PRODUCE, 10, 'MyTraceTopic');
             $custom->traceProducer = new FakeTraceProducer();
-            $this->checkSame('MyTraceTopic', $custom->getTraceTopicName(), '自定义 traceTopic');
+            $this->checkSame('MyTraceTopic', $custom->getTraceTopicName(), 'custom traceTopic');
         }
 
         private function testDispatcherAppendAndFlush(): void
         {
             $d = self::makeDispatcher();
-            $this->checkSame(true, $d->append(self::pubContext()), 'append 入队成功');
+            $this->checkSame(true, $d->append(self::pubContext()), 'append enqueues successfully');
             $d->flush();
-            $this->checkSame(0, count($d->traceContextQueue), 'flush 排空队列');
-            $this->checkSame(1, count($d->traceProducer->sent), 'flush 触发一次发送');
-            $this->checkSame(MixAll::TRACE_TOPIC, $d->traceProducer->sent[0][0], '轨迹消息 topic');
-            $this->checkSame(EXPECTED_PUB, $d->traceProducer->sent[0][1], '轨迹消息体 = PUB 编码');
+            $this->checkSame(0, count($d->traceContextQueue), 'flush drains the queue');
+            $this->checkSame(1, count($d->traceProducer->sent), 'flush triggers exactly one send');
+            $this->checkSame(MixAll::TRACE_TOPIC, $d->traceProducer->sent[0][0], 'trace message topic');
+            $this->checkSame(EXPECTED_PUB, $d->traceProducer->sent[0][1], 'trace message body = the PUB encoding');
             $keys = explode(' ', (string) $d->traceProducer->sent[0][2]);
             sort($keys, SORT_STRING);
-            $this->checkSame([MSG_ID_1, 'KeyA', 'KeyB'], $keys, '轨迹消息 keys = 原始 msgId + 业务 keys');
+            $this->checkSame([MSG_ID_1, 'KeyA', 'KeyB'], $keys, 'trace message keys = raw msgId + business keys');
         }
 
         private function testDispatcherSkipsInvalidContexts(): void
         {
             $d = self::makeDispatcher();
             $noRegion = self::pubContext(region: '');
-            $this->check($noRegion->traceBeans !== [], '前置：noRegion 仍有 beans');
+            $this->check($noRegion->traceBeans !== [], 'precondition: noRegion still has beans');
             $d->append($noRegion);
             $empty = self::pubContext();
             $empty->traceBeans = [];
             $d->append($empty);
             $d->flush();
-            $this->checkSame([], $d->traceProducer->sent, '无 region 或无 beans 的 context 不发送');
+            $this->checkSame([], $d->traceProducer->sent, 'a context with no region or no beans is not sent');
         }
 
         private function testDispatcherCloudTopic(): void
@@ -850,7 +858,7 @@ namespace {
             $ctx->accessChannel = AccessChannel::CLOUD;
             $d->append($ctx);
             $d->flush();
-            $this->checkSame('rmq_sys_TRACE_DATA_DefaultRegion', $d->traceProducer->sent[0][0], 'CLOUD 通道用 TRACE_TOPIC_PREFIX+regionId');
+            $this->checkSame('rmq_sys_TRACE_DATA_DefaultRegion', $d->traceProducer->sent[0][0], 'the CLOUD channel uses TRACE_TOPIC_PREFIX+regionId');
         }
 
         private function testDispatcherGroupsByBusinessTopic(): void
@@ -860,28 +868,29 @@ namespace {
             $d->append(self::pubContext(topic: 'TopicB'));
             $d->append(self::pubContext(topic: 'TopicA'));
             $d->flush();
-            $this->checkSame(2, count($d->traceProducer->sent), '按 (业务 topic,轨迹 topic) 分组 → 2 组');
+            $this->checkSame(2, count($d->traceProducer->sent), 'grouped by (business topic, trace topic) -> 2 groups');
             $counts = array_map(
                 static fn($s) => substr_count((string) $s[1], STX),
                 $d->traceProducer->sent
             );
             sort($counts);
-            $this->checkSame([1, 2], $counts, 'TopicA 组 2 条记录、TopicB 组 1 条（按 STX 计）');
+            $this->checkSame([1, 2], $counts, 'TopicA group holds 2 records, TopicB group 1 (counted by STX)');
         }
 
         private function testDispatcherSplitsOverMaxSize(): void
         {
             $d = self::makeDispatcher();
-            // 阈值设为 1：单条编码长度必然 >= 1 → 每条记录都触发一次切块发送
+            // Threshold set to 1: a single record's encoded length is always >= 1, so every record
+            // triggers one split-send
             $d->maxMsgSize = 1;
-            $this->checkSame(1, $d->maxMsgSize, '阈值语义自检：maxMsgSize=1 时每条记录都超阈值');
+            $this->checkSame(1, $d->maxMsgSize, 'threshold semantics self-check: with maxMsgSize=1 every record exceeds it');
             for ($i = 0; $i < 3; $i++) {
                 $d->append(self::pubContext());
             }
             $d->flush();
-            $this->checkSame(3, count($d->traceProducer->sent), '超长 body 逐条切块发送 3 次');
+            $this->checkSame(3, count($d->traceProducer->sent), 'an oversized body is split-sent record by record, 3 times');
             foreach ($d->traceProducer->sent as $i => $s) {
-                $this->checkSame(EXPECTED_PUB, $s[1], "切块 {$i} 消息体为单条编码");
+                $this->checkSame(EXPECTED_PUB, $s[1], "split chunk {$i} body is a single-record encoding");
             }
         }
 
@@ -892,9 +901,9 @@ namespace {
             for ($i = 0; $i < AsyncTraceDispatcher::MAX_QUEUE_SIZE; $i++) {
                 $d->append($ctx);
             }
-            $this->checkSame(false, $d->append($ctx), '队列满后 append 返回 false');
-            $this->checkSame(1, $d->discardCount, '队列满丢弃计数 +1');
-            $this->checkSame(AsyncTraceDispatcher::MAX_QUEUE_SIZE, count($d->traceContextQueue), '队列长度封顶 2048');
+            $this->checkSame(false, $d->append($ctx), 'append returns false once the queue is full');
+            $this->checkSame(1, $d->discardCount, 'the discard counter increments by 1 when the queue is full');
+            $this->checkSame(AsyncTraceDispatcher::MAX_QUEUE_SIZE, count($d->traceContextQueue), 'the queue length is capped at 2048');
         }
 
         private function testDispatcherShutdownFlushes(): void
@@ -904,12 +913,12 @@ namespace {
             $d->isStarted = true;
             $d->stopped = true;
             $d->shutdown();
-            $this->checkSame(0, count($d->traceContextQueue), 'shutdown 前 flush 排空队列');
-            $this->checkSame(true, $d->traceProducer->stopped, 'shutdown 关闭内部生产者');
-            $this->checkSame(true, $d->stopped, 'shutdown 置 stopped');
+            $this->checkSame(0, count($d->traceContextQueue), 'flush drains the queue before shutdown');
+            $this->checkSame(true, $d->traceProducer->stopped, 'shutdown closes the internal producer');
+            $this->checkSame(true, $d->stopped, 'shutdown sets stopped');
         }
 
-        // ============================================================ 发送钩子
+        // ============================================================ Send hook
 
         private function testSendHookRoundTrip(): void
         {
@@ -919,7 +928,7 @@ namespace {
 
             $ctx = self::sendContext();
             $hook->sendMessageBefore($ctx);
-            $this->check($ctx->mqTraceContext instanceof TraceContext, 'before 写入 mqTraceContext');
+            $this->check($ctx->mqTraceContext instanceof TraceContext, 'before writes mqTraceContext');
             $this->checkSame(TraceType::PUB, $ctx->mqTraceContext->traceType, 'before traceType=PUB');
             $this->checkSame('GID_test', $ctx->mqTraceContext->groupName, 'before groupName');
             $this->checkSame('TopicTest', $ctx->mqTraceContext->traceBeans[0]->topic, 'before bean.topic');
@@ -930,10 +939,10 @@ namespace {
             $this->checkSame(MessageType::NORMAL_MSG, $ctx->mqTraceContext->traceBeans[0]->msgType, 'before bean.msgType');
 
             $hook->sendMessageAfter($ctx);
-            $this->checkSame(1, count($d->appended), 'after 入队 1 条');
+            $this->checkSame(1, count($d->appended), 'after enqueues 1 record');
             $got = $d->appended[0];
             $this->checkSame(TraceType::PUB, $got->traceType, 'after traceType=PUB');
-            $this->checkSame('DefaultRegion', $got->regionId, 'after regionId 来自 SendResult');
+            $this->checkSame('DefaultRegion', $got->regionId, 'after regionId comes from the SendResult');
             $this->checkSame(true, $got->isSuccess, 'after isSuccess(SEND_OK)');
             $this->check($got->costTime >= 0, 'after costTime >= 0');
             $this->checkSame(MSG_ID_1, $got->traceBeans[0]->msgId, 'after bean.msgId=SendResult.msgId');
@@ -947,9 +956,9 @@ namespace {
             $hook = new SendMessageTraceHook($d);
             $ctx = self::sendContext(topic: MixAll::TRACE_TOPIC);
             $hook->sendMessageBefore($ctx);
-            $this->checkSame(null, $ctx->mqTraceContext, '轨迹 topic 自身 before 不建 context');
+            $this->checkSame(null, $ctx->mqTraceContext, 'the trace topic itself builds no context in before');
             $hook->sendMessageAfter($ctx);
-            $this->checkSame([], $d->appended, '轨迹 topic 自身 after 不入队');
+            $this->checkSame([], $d->appended, 'the trace topic itself does not enqueue in after');
         }
 
         private function testSendHookSkipsTraceOffOrNoRegion(): void
@@ -960,12 +969,12 @@ namespace {
             $off = self::sendContext(traceOn: false);
             $hook->sendMessageBefore($off);
             $hook->sendMessageAfter($off);
-            $this->checkSame([], $d->appended, 'broker traceOn=false 不入队');
+            $this->checkSame([], $d->appended, 'broker traceOn=false does not enqueue');
 
             $noRegion = self::sendContext(region: null);
             $hook->sendMessageBefore($noRegion);
             $hook->sendMessageAfter($noRegion);
-            $this->checkSame([], $d->appended, 'regionId=null 不入队');
+            $this->checkSame([], $d->appended, 'regionId=null does not enqueue');
         }
 
         private function testSendHookMarksFailureStatus(): void
@@ -976,19 +985,19 @@ namespace {
             $ctx->sendResult->sendStatus = SendStatus::FLUSH_DISK_TIMEOUT;
             $hook->sendMessageBefore($ctx);
             $hook->sendMessageAfter($ctx);
-            $this->checkSame(false, $d->appended[0]->isSuccess, '非 SEND_OK → isSuccess=false');
+            $this->checkSame(false, $d->appended[0]->isSuccess, 'non SEND_OK -> isSuccess=false');
         }
 
         private function testSendHookRequiresBefore(): void
         {
             $d = new CapturingDispatcher();
             $hook = new SendMessageTraceHook($d);
-            $ctx = self::sendContext(); // 不跑 before → mqTraceContext 为 null
+            $ctx = self::sendContext(); // no before run -> mqTraceContext stays null
             $hook->sendMessageAfter($ctx);
-            $this->checkSame([], $d->appended, '未跑 before 时 after 不入队');
+            $this->checkSame([], $d->appended, 'after does not enqueue when before was not run');
         }
 
-        // ============================================================ 消费钩子
+        // ============================================================ Consume hook
 
         private function testConsumeHookBeforeAndAfterShareRequestId(): void
         {
@@ -998,21 +1007,21 @@ namespace {
 
             $ctx = self::consumeContext();
             $hook->consumeMessageBefore($ctx);
-            $this->checkSame(1, count($d->appended), 'consume before 入队 1 条');
+            $this->checkSame(1, count($d->appended), 'consume before enqueues 1 record');
             $before = $d->appended[0];
             $this->checkSame(TraceType::SUB_BEFORE, $before->traceType, 'before traceType=SubBefore');
             $this->checkSame('CID_test', $before->groupName, 'before groupName');
-            $this->checkSame('DefaultRegion', $before->regionId, 'before regionId 来自消息属性');
+            $this->checkSame('DefaultRegion', $before->regionId, 'before regionId comes from the message property');
             $this->checkSame(MSG_ID_1, $before->traceBeans[0]->msgId, 'before bean.msgId');
             $this->checkSame(1, $before->traceBeans[0]->retryTimes, 'before bean.retryTimes');
             $this->checkSame(42, $before->traceBeans[0]->bodyLength, 'before bean.bodyLength=storeSize');
             $this->checkSame(1700000000000, $before->traceBeans[0]->storeTime, 'before bean.storeTime');
 
             $hook->consumeMessageAfter($ctx);
-            $this->checkSame(2, count($d->appended), 'consume after 再入队 1 条');
+            $this->checkSame(2, count($d->appended), 'consume after enqueues 1 more record');
             $after = $d->appended[1];
             $this->checkSame(TraceType::SUB_AFTER, $after->traceType, 'after traceType=SubAfter');
-            $this->checkSame($before->requestId, $after->requestId, 'before/after 共用 requestId');
+            $this->checkSame($before->requestId, $after->requestId, 'before/after share the requestId');
             $this->checkSame(true, $after->isSuccess, 'after isSuccess');
             $this->check($after->costTime >= 0, 'after costTime >= 0');
             $this->checkSame(0, $after->contextCode, 'after contextCode(SUCCESS ordinal=0)');
@@ -1027,15 +1036,15 @@ namespace {
             $ctx->success = false;
             $hook->consumeMessageBefore($ctx);
             $hook->consumeMessageAfter($ctx);
-            $this->checkSame(4, $d->appended[1]->contextCode, 'contextCode: FAILED ordinal=4（按名查枚举）');
+            $this->checkSame(4, $d->appended[1]->contextCode, 'contextCode: FAILED ordinal=4 (enum looked up by name)');
             $this->checkSame(false, $d->appended[1]->isSuccess, 'after isSuccess=false');
 
-            // 未知名字静默退化为 0（不崩）
+            // An unknown name degrades silently to 0 (no crash)
             $ctx2 = self::consumeContext();
             $ctx2->props = ['ConsumeContextType' => 'NO_SUCH_TYPE'];
             $hook->consumeMessageBefore($ctx2);
             $hook->consumeMessageAfter($ctx2);
-            $this->checkSame(0, $d->appended[3]->contextCode, '未知 contextType 静默退化 0');
+            $this->checkSame(0, $d->appended[3]->contextCode, 'an unknown contextType degrades silently to 0');
         }
 
         private function testConsumeHookSkipsTraceOff(): void
@@ -1044,9 +1053,9 @@ namespace {
             $hook = new ConsumeMessageTraceHook($d);
             $ctx = self::consumeContext(traceOn: 'false');
             $hook->consumeMessageBefore($ctx);
-            $this->checkSame([], $d->appended, '消息 TRACE_ON=false → before 不落轨迹');
+            $this->checkSame([], $d->appended, 'message TRACE_ON=false -> before writes no trace');
             $hook->consumeMessageAfter($ctx);
-            $this->checkSame([], $d->appended, 'before 没落 → after 也不落');
+            $this->checkSame([], $d->appended, 'no trace in before -> none in after either');
         }
 
         private function testConsumeHookAfterWithoutBefore(): void
@@ -1055,10 +1064,10 @@ namespace {
             $hook = new ConsumeMessageTraceHook($d);
             $ctx = self::consumeContext();
             $hook->consumeMessageAfter($ctx);
-            $this->checkSame([], $d->appended, '未跑 before 时 after 不入队');
+            $this->checkSame([], $d->appended, 'after does not enqueue when before was not run');
         }
 
-        // ============================================================ 事务收尾钩子
+        // ============================================================ End-transaction hook
 
         private function testEndTransactionHook(): void
         {
@@ -1078,11 +1087,11 @@ namespace {
             $ctx->fromTransactionCheck = false;
             $hook->endTransaction($ctx);
 
-            $this->checkSame(1, count($d->appended), 'endTransaction 入队 1 条');
+            $this->checkSame(1, count($d->appended), 'endTransaction enqueues 1 record');
             $got = $d->appended[0];
             $this->checkSame(TraceType::END_TRANSACTION, $got->traceType, 'endTransaction traceType');
             $this->checkSame('GID_test', $got->groupName, 'endTransaction groupName');
-            $this->checkSame('RegionX', $got->regionId, 'endTransaction regionId 来自消息属性');
+            $this->checkSame('RegionX', $got->regionId, 'endTransaction regionId comes from the message property');
             $bean = $got->traceBeans[0];
             $this->checkSame(MessageType::TRANS_MSG_COMMIT, $bean->msgType, 'endTransaction msgType=TRANS_MSG_COMMIT');
             $this->checkSame('CID@1', $bean->clientHost, 'endTransaction clientHost=dispatcher.clientId()');
@@ -1093,7 +1102,7 @@ namespace {
             $this->checkSame('TagA', $bean->tags, 'endTransaction tags');
             $this->checkSame('KeyA', $bean->keys, 'endTransaction keys');
 
-            // 无 MSG_REGION → 落 DefaultRegion
+            // No MSG_REGION -> falls to DefaultRegion
             $msg2 = new MessageExt('TopicTest', BODY, 'TagA', 'KeyA');
             $ctx2 = new EndTransactionContext();
             $ctx2->producerGroup = 'GID_test';
@@ -1104,19 +1113,19 @@ namespace {
             $ctx2->transactionState = 'ROLLBACK_MESSAGE';
             $ctx2->fromTransactionCheck = true;
             $hook->endTransaction($ctx2);
-            $this->checkSame(MixAll::DEFAULT_TRACE_REGION_ID, $d->appended[1]->regionId, 'endTransaction 无 region → DefaultRegion');
+            $this->checkSame(MixAll::DEFAULT_TRACE_REGION_ID, $d->appended[1]->regionId, 'endTransaction with no region -> DefaultRegion');
             $this->checkSame(true, $d->appended[1]->traceBeans[0]->fromTransactionCheck, 'endTransaction fromTransactionCheck=true');
 
-            // 轨迹 topic 自身不追踪
+            // The trace topic itself is not traced
             $msg3 = new MessageExt(MixAll::TRACE_TOPIC, BODY);
             $ctx3 = new EndTransactionContext();
             $ctx3->producerGroup = 'GID_test';
             $ctx3->message = $msg3;
             $hook->endTransaction($ctx3);
-            $this->checkSame(2, count($d->appended), '轨迹 topic 自身 endTransaction 不入队');
+            $this->checkSame(2, count($d->appended), 'endTransaction on the trace topic itself does not enqueue');
         }
 
-        // ============================================================ 收尾
+        // ============================================================ Teardown
 
         public function run(): int
         {

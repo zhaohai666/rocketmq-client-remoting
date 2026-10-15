@@ -16,7 +16,7 @@ ADDR = "127.0.0.1:10911"
 
 
 def _new_instance(prefix: str) -> MQClientInstance:
-    """只构造、不 start() 的实例：不建连、不发心跳，纯离线断言。"""
+    """An instance that is only constructed, not start()ed: no connection, no heartbeat, pure offline assertions."""
     return MQClientInstance("%s_%d" % (prefix, threading.get_ident()),
                             ["127.0.0.1:9876"])
 
@@ -25,7 +25,7 @@ def _drop(inst: MQClientInstance) -> None:
     MQClientInstance.INSTANCE_MAP.pop(inst.client_id, None)
 
 
-# ---------------------------------------------------------------- 报文形状
+# ---------------------------------------------------------------- Request shape
 def test_wire_value_is_the_uppercase_enum_name_not_the_lowercase_name():
     pass
     for boundary, expected in ((BoundaryType.LOWER, "LOWER"), (BoundaryType.UPPER, "UPPER")):
@@ -36,7 +36,7 @@ def test_wire_value_is_the_uppercase_enum_name_not_the_lowercase_name():
 
 
 def test_unset_boundary_omits_the_field():
-    """@CFNullable：没设就整键不写，不能发 ``boundaryType=""``。"""
+    """@CFNullable: when unset, the whole key is omitted; it must not send ``boundaryType=""``."""
     header = SearchOffsetRequestHeader()
     header.topic, header.queue_id, header.timestamp = MQ.topic, MQ.queue_id, 1
     assert "boundaryType" not in header.to_ext_fields()
@@ -45,7 +45,7 @@ def test_unset_boundary_omits_the_field():
 
 
 def test_decode_is_lenient_on_unknown_type_values():
-    """``BoundaryType.getType``：只有 upper（大小写不敏感）才是 UPPER。"""
+    """``BoundaryType.getType``: only upper (case-insensitive) is UPPER."""
     header = SearchOffsetRequestHeader()
     for text, expected in (("UPPER", BoundaryType.UPPER), ("upper", BoundaryType.UPPER),
                            ("Upper", BoundaryType.UPPER), ("LOWER", BoundaryType.LOWER),
@@ -58,9 +58,9 @@ def test_decode_is_lenient_on_unknown_type_values():
     assert BoundaryType.UPPER.lowercase_name == "upper"
 
 
-# ---------------------------------------------------------------- 调用链
+# ---------------------------------------------------------------- Call chain
 class _Capture:
-    """把 ``_invoke_sync`` 收到的请求记下来（并落 extFields），回一个带 offset 的应答。"""
+    """Record the requests received by ``_invoke_sync`` (and land extFields), replying with an offset-carrying response."""
 
     def __init__(self):
         self.requests = []

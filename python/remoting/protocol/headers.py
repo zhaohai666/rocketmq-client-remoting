@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-"""全部请求/响应头（对应协议 rocketmq.remoting.protocol.header.* 各头）。
+"""All request/response headers (corresponding to the headers of the protocol's
+rocketmq.remoting.protocol.header.* packages).
 
-每个 header 提供 to_ext_fields()（仅输出非 None 字段，与 broker 侧
-makeCustomHeaderToNet 的序列化口径一致）
-和 from_ext_fields()（把 ext_fields 映射回字段）。
+Every header provides to_ext_fields() (emitting only the non-None fields, matching the
+serialization behaviour of makeCustomHeaderToNet on the broker side)
+and from_ext_fields() (mapping ext_fields back to fields).
 """
 from __future__ import annotations
 
@@ -11,7 +12,7 @@ from typing import Optional
 
 from common.boundary_type import BoundaryType
 
-# ---------------- 基类 ----------------
+# ---------------- base class ----------------
 
 
 class CommandCustomHeader:
@@ -23,12 +24,15 @@ class CommandCustomHeader:
 
 
 def _ext(fields: dict) -> dict:
-    """过滤 None，并把 bool 规范成入网的小写形式 ``"false"``/``"true"``。
+    """Filter out None and normalize bool into the lowercase on-wire form
+    ``"false"``/``"true"``.
 
-    为什么必须显式转换：``RemotingCommand`` 落 ext_fields 时统一走 ``str(v)``，
-    Python 的 ``str(False)`` 是 ``"False"``，而 broker 侧 ``Boolean.parseBoolean``
-    期望的入网文本是小写的 ``"false"``。虽大小写不敏感、功能上不出错，但线上报文
-    口径必须统一成小写（对比抓包/单测断言时才不会别扭）。
+    Why the explicit conversion is necessary: when ``RemotingCommand`` fills
+    ext_fields it uniformly goes through ``str(v)``, and Python's ``str(False)`` is
+    ``"False"``, while the broker-side ``Boolean.parseBoolean`` expects the lowercase
+    on-wire text ``"false"``. It is case-insensitive and functionally harmless, but the
+    messages on the wire must consistently use lowercase (otherwise packet captures and
+    unit-test assertions look odd).
     """
     out = {}
     for k, v in fields.items():
@@ -52,7 +56,7 @@ def _b(v) -> Optional[bool]:
     return str(v).lower() in ("true", "1")
 
 
-# ---------------- 发送消息 ----------------
+# ---------------- send message ----------------
 
 
 class SendMessageRequestHeader(CommandCustomHeader):
@@ -105,7 +109,8 @@ class SendMessageRequestHeader(CommandCustomHeader):
 
 
 class SendMessageRequestHeaderV2(CommandCustomHeader):
-    """短字段名编码（producerGroup->a ...），入网键名必须与协议 V2 头逐字一致。"""
+    """Short field name encoding (producerGroup->a ...); the on-wire key names must match
+    the protocol's V2 header verbatim."""
 
     def __init__(self):
         self.producer_group: Optional[str] = None
@@ -121,7 +126,7 @@ class SendMessageRequestHeaderV2(CommandCustomHeader):
         self.unit_mode: Optional[bool] = None
         self.max_reconsume_times: Optional[int] = None
         self.batch: Optional[bool] = None
-        # 协议 V2 头里 brokerName 的短名就是 n
+        # in the protocol's V2 header the short name of brokerName is simply n
         self.broker_name: Optional[str] = None
 
     def to_ext_fields(self) -> dict:
@@ -160,12 +165,14 @@ class SendMessageRequestHeaderV2(CommandCustomHeader):
 
 
 class ReplyMessageRequestHeader(CommandCustomHeader):
-    """broker → 请求方 的 PUSH_REPLY_MESSAGE_TO_CLIENT(326) 请求头。
+    """The request header of the broker -> requester PUSH_REPLY_MESSAGE_TO_CLIENT(326).
 
-    对应协议头 ``ReplyMessageRequestHeader``
-    （字段与 ``SendMessageRequestHeader`` 高度重合，但多了 bornHost/storeHost/storeTimestamp，
-    broker 的 ``ReplyMessageProcessor#pushReplyMessage`` 就是用它拼出来的）。
-    请求方收到后据此 + body 还原出真正的应答 MessageExt。
+    It corresponds to the protocol header ``ReplyMessageRequestHeader`` (its fields
+    overlap heavily with ``SendMessageRequestHeader``, but it adds
+    bornHost/storeHost/storeTimestamp, which is what the broker's
+    ``ReplyMessageProcessor#pushReplyMessage`` uses to assemble the message). Upon
+    receipt, the requester reconstructs the real reply MessageExt from it plus the
+    body.
     """
 
     def __init__(self):
@@ -226,8 +233,9 @@ class SendMessageResponseHeader(CommandCustomHeader):
         self.queue_offset: Optional[int] = None
         self.transaction_id: Optional[str] = None
         self.batch_uniq_id: Optional[str] = None
-        # 只给定时/延迟消息：broker 的 SendMessageProcessor#attachRecallHandle 看到
-        # TIMER_OUT_MS + REAL_TOPIC 才挂上，普通消息恒为 None。
+        # Only for timer/delay messages: the broker's
+        # SendMessageProcessor#attachRecallHandle attaches it only when it sees
+        # TIMER_OUT_MS + REAL_TOPIC; it is always None for ordinary messages.
         self.recall_handle: Optional[str] = None
 
     def to_ext_fields(self) -> dict:
@@ -250,12 +258,15 @@ class SendMessageResponseHeader(CommandCustomHeader):
 
 
 class RecallMessageRequestHeader(CommandCustomHeader):
-    """对应协议头 RecallMessageRequestHeader。
+    """Corresponds to the protocol header RecallMessageRequestHeader.
 
-    ⚠ 该头继承协议的 ``TopicRequestHeader`` → ``RpcRequestHeader``，父类字段 ``bname`` 的
-    **入网键名就是 bname**（不是 brokerName）：写成 ``brokerName`` 会被 broker 静默丢掉。
-    broker 的 RecallMessageProcessor 其实只用 topic/producerGroup/recallHandle，
-    校验句柄里的 brokerName 也是从 handle 解出来的，但报文的键名仍须逐字用 bname。
+    CAUTION: this header inherits the protocol's ``TopicRequestHeader`` ->
+    ``RpcRequestHeader``, and the **on-wire key name** of the parent field ``bname``
+    is literally ``bname`` (not brokerName): writing ``brokerName`` makes the broker
+    silently drop the field. The broker's RecallMessageProcessor only really uses
+    topic/producerGroup/recallHandle, and the brokerName validated inside the handle is
+    also extracted from the handle, but the key name in the message must still be
+    ``bname`` verbatim.
     """
 
     def __init__(self):
@@ -280,7 +291,8 @@ class RecallMessageRequestHeader(CommandCustomHeader):
 
 
 class RecallMessageResponseHeader(CommandCustomHeader):
-    """对应协议头 RecallMessageResponseHeader：只有一个字段 ``msgId``。"""
+    """Corresponds to the protocol header RecallMessageResponseHeader: it has a single
+    field ``msgId``."""
 
     def __init__(self):
         self.msg_id: Optional[str] = None
@@ -292,7 +304,7 @@ class RecallMessageResponseHeader(CommandCustomHeader):
         self.msg_id = ext.get("msgId")
 
 
-# ---------------- 拉取消息 ----------------
+# ---------------- pull message ----------------
 
 
 class PullMessageRequestHeader(CommandCustomHeader):
@@ -384,7 +396,7 @@ class PullMessageResponseHeader(CommandCustomHeader):
         self.offset_delta = _l(ext.get("offsetDelta"))
 
 
-# ---------------- 偏移量 ----------------
+# ---------------- offset ----------------
 
 
 class QueryConsumerOffsetRequestHeader(CommandCustomHeader):
@@ -506,8 +518,9 @@ class SearchOffsetRequestHeader(CommandCustomHeader):
         self.topic: Optional[str] = None
         self.queue_id: Optional[int] = None
         self.timestamp: Optional[int] = None
-        # 协议里该字段是 @CFNullable：为 None 时**不写键**（已废弃的
-        # 5 参 searchOffset 形状就是不带 timestamp 键）。
+        # In the protocol this field is @CFNullable: when it is None the **key is not
+        # written at all** (the deprecated 5-parameter searchOffset shape simply has
+        # no timestamp key).
         self.boundary_type: Optional[BoundaryType] = None
 
     def to_ext_fields(self) -> dict:
@@ -515,8 +528,9 @@ class SearchOffsetRequestHeader(CommandCustomHeader):
             "topic": self.topic,
             "queueId": self.queue_id,
             "timestamp": self.timestamp,
-            # 入网文本是枚举名大写（broker 侧 makeCustomHeaderToNet 的 Enum.toString()），
-            # 不是 BoundaryType.getName() 的小写名。
+            # The on-wire text is the enum name in upper case (Enum.toString() in the
+            # broker-side makeCustomHeaderToNet), not the lowercase name from
+            # BoundaryType.getName().
             "boundaryType": self.boundary_type.value if self.boundary_type is not None else None,
         })
 
@@ -525,8 +539,10 @@ class SearchOffsetRequestHeader(CommandCustomHeader):
         self.queue_id = _i(ext.get("queueId"))
         self.timestamp = _l(ext.get("timestamp"))
         value = ext.get("boundaryType")
-        # 缺键 ⇒ None（broker 侧对缺省 boundaryType 自行回落 LOWER）；
-        # 有键但值不认识 ⇒ 按 BoundaryType.get_type 的宽松语义，给 LOWER。
+        # missing key => None (the broker side falls back to LOWER by itself for a
+        # default boundaryType);
+        # key present but value unknown => following the lenient semantics of
+        # BoundaryType.get_type, return LOWER.
         self.boundary_type = BoundaryType.get_type(value) if value is not None else None
 
 
@@ -565,7 +581,7 @@ class GetEarliestMsgStoretimeResponseHeader(CommandCustomHeader):
         self.timestamp = _l(ext.get("timestamp"))
 
 
-# ---------------- 查询消息 ----------------
+# ---------------- query message ----------------
 
 
 class QueryMessageRequestHeader(CommandCustomHeader):
@@ -630,7 +646,7 @@ class ViewMessageResponseHeader(CommandCustomHeader):
         pass
 
 
-# ---------------- 心跳 / 注销 ----------------
+# ---------------- heartbeat / unregister ----------------
 
 
 class HeartbeatRequestHeader(CommandCustomHeader):
@@ -663,7 +679,7 @@ class UnregisterClientRequestHeader(CommandCustomHeader):
         self.consumer_group = ext.get("consumerGroup")
 
 
-# ---------------- 消费管理 ----------------
+# ---------------- consumer management ----------------
 
 
 class ConsumerSendMsgBackRequestHeader(CommandCustomHeader):
@@ -738,7 +754,7 @@ class GetConsumerConnectionListRequestHeader(CommandCustomHeader):
 
 
 class GetConsumerStatusRequestHeader(CommandCustomHeader):
-    """GET_CONSUMER_STATUS_FROM_CLIENT(221) 的请求头。"""
+    """The request header of GET_CONSUMER_STATUS_FROM_CLIENT(221)."""
 
     def __init__(self):
         self.topic: Optional[str] = None
@@ -818,7 +834,7 @@ class ResetOffsetRequestHeader(CommandCustomHeader):
         self.is_force = _b(ext.get("isForce"))
 
 
-# ---------------- 锁 ----------------
+# ---------------- lock ----------------
 
 
 class LockBatchMqRequestHeader(CommandCustomHeader):
@@ -847,17 +863,18 @@ class UnlockBatchMqRequestHeader(CommandCustomHeader):
         self.client_id = ext.get("clientId")
 
 
-# ---------------- 事务 ----------------
+# ---------------- transaction ----------------
 
 
 class EndTransactionRequestHeader(CommandCustomHeader):
-    """对应协议头 EndTransactionRequestHeader。
+    """Corresponds to the protocol header EndTransactionRequestHeader.
 
-    ⚠ 继承 RpcRequestHeader 的 brokerName 字段**入网键名是 ``bname``**
-    （setter 为 setBrokerName，但协议字段声明名是 bname）。写错键 broker 会静默丢字段。
-    字段名严格与协议一致：topic / producerGroup / tranStateTableOffset /
-    commitLogOffset / commitOrRollback / fromTransactionCheck / msgId /
-    transactionId / bname。
+    CAUTION: the brokerName field inherited from RpcRequestHeader has an **on-wire key
+    name of ``bname``** (the setter is setBrokerName, but the protocol declares the field
+    as bname). A wrong key makes the broker silently drop the field.
+    The field names strictly follow the protocol: topic / producerGroup /
+    tranStateTableOffset / commitLogOffset / commitOrRollback / fromTransactionCheck /
+    msgId / transactionId / bname.
     """
 
     def __init__(self):
@@ -910,11 +927,11 @@ class EndTransactionResponseHeader(CommandCustomHeader):
 
 
 class CheckTransactionStateRequestHeader(CommandCustomHeader):
-    """对应协议头 CheckTransactionStateRequestHeader。
+    """Corresponds to the protocol header CheckTransactionStateRequestHeader.
 
-    ⚠ 同样继承 RpcRequestHeader：brokerName 入网键名是 ``bname``。字段名严格与协议
-    一致：topic / tranStateTableOffset / commitLogOffset / msgId / transactionId /
-    offsetMsgId / bname。
+    CAUTION: it also inherits RpcRequestHeader, so the on-wire key name of brokerName is
+    ``bname``. The field names strictly follow the protocol: topic /
+    tranStateTableOffset / commitLogOffset / msgId / transactionId / offsetMsgId / bname.
     """
 
     def __init__(self):
@@ -965,7 +982,7 @@ class CheckTransactionStateResponseHeader(CommandCustomHeader):
         self.offset = _l(ext.get("offset"))
 
 
-# ---------------- 管理 / 查询 ----------------
+# ---------------- admin / query ----------------
 
 
 class GetAllTopicConfigRequestHeader(CommandCustomHeader):
@@ -1013,7 +1030,7 @@ class CreateTopicRequestHeader(CommandCustomHeader):
         self.topic_filter_type: Optional[str] = None
         self.topic_sys_flag: Optional[int] = None
         self.order: Optional[bool] = None
-        # AttributeParser.parseToString 格式："k1=v1,k2" （值为空时只留 key）
+        # AttributeParser.parseToString format: "k1=v1,k2" (an empty value keeps only the key)
         self.attributes: Optional[str] = None
         self.force: Optional[bool] = None
 
@@ -1481,19 +1498,21 @@ class QueryDataVersionResponseHeader(CommandCustomHeader):
         self.changed = bool(v) if v is not None else None
 
 
-# ---------------- POP 模式（5.x 轻量消费） ----------------
+# ---------------- POP mode (5.x lightweight consumption) ----------------
 #
-# ext key 必须逐字等于协议字段名：broker 用 fastjson 按协议属性名反序列化，
-# 错一个字母就**静默丢字段**（不报错、行为静默退化），所以下面每个 key 都对着
-# 协议里 Pop*Header 系列的字段声明逐字核对。
+# An ext key must equal the protocol field name verbatim: the broker deserializes it
+# with fastjson using the protocol property names, and a single wrong letter
+# **silently drops the field** (no error, the behaviour just degrades silently), so
+# every key below was checked verbatim against the field declarations of the Pop*Header
+# family in the protocol.
 #
-# 另外注意 `order` / `suspend` 这两个字段协议里是**非空** Boolean/boolean
-# （`order = Boolean.FALSE`、`suspend = false`），
-# `encodeHeader` 只会跳过 null，所以它们**总是**出现在报文里 —— 这里也不做 None 过滤。
+# Also note that `order` / `suspend` are **non-null** Boolean/boolean fields in the
+# protocol (`order = Boolean.FALSE`, `suspend = false`), and `encodeHeader` only skips
+# nulls, so they **always** appear in the message -- so no None filtering is done here.
 
 
 class PopMessageRequestHeader(CommandCustomHeader):
-    """协议头 ``PopMessageRequestHeader``（RequestCode.POP_MESSAGE = 200050）。"""
+    """The protocol header ``PopMessageRequestHeader`` (RequestCode.POP_MESSAGE = 200050)."""
 
     def __init__(self):
         self.consumer_group: Optional[str] = None
@@ -1502,10 +1521,12 @@ class PopMessageRequestHeader(CommandCustomHeader):
         self.max_msg_nums: Optional[int] = None
         self.invisible_time: Optional[int] = None
         self.poll_time: Optional[int] = None
-        # bornTime 必须是**当前毫秒时间戳**：broker 校验
-        # `now - bornTime - pollTime > 500` 就直接回 POLLING_TIMEOUT(210)。
+        # bornTime must be the **current millisecond timestamp**: the broker replies with
+        # POLLING_TIMEOUT(210) straight away once it checks
+        # `now - bornTime - pollTime > 500`.
         self.born_time: Optional[int] = None
-        # 0 = MIN（从最小位点开始，能消费历史），1 = MAX（只拿新消息）
+        # 0 = MIN (start from the smallest offset, historical messages can be
+        # consumed), 1 = MAX (only new messages)
         self.init_mode: Optional[int] = None
         self.exp_type: Optional[str] = None
         self.exp: Optional[str] = None
@@ -1530,10 +1551,11 @@ class PopMessageRequestHeader(CommandCustomHeader):
 
 
 class PopMessageResponseHeader(CommandCustomHeader):
-    """协议头 ``PopMessageResponseHeader``。
+    """The protocol header ``PopMessageResponseHeader``.
 
-    ``start_offset_info`` / ``msg_offset_info`` / ``order_count_info`` 是编码过的
-    字符串（空格做字段分隔、分号做队列分隔），用 ``extra_info`` 模块解析。
+    ``start_offset_info`` / ``msg_offset_info`` / ``order_count_info`` are encoded
+    strings (a space separates the fields, a semicolon separates the queues); parse
+    them with the ``extra_info`` module.
     """
 
     def __init__(self):
@@ -1567,10 +1589,11 @@ class PopMessageResponseHeader(CommandCustomHeader):
 
 
 class AckMessageRequestHeader(CommandCustomHeader):
-    """协议头 ``AckMessageRequestHeader``（RequestCode.ACK_MESSAGE = 200051）。
+    """The protocol header ``AckMessageRequestHeader`` (RequestCode.ACK_MESSAGE = 200051).
 
-    ``offset`` 是 **consumeQueue offset**（即 CK 串第 8 段 / msgQueueOffset），
-    不是 commitlog offset —— 传错会被 broker 回 NO_MESSAGE。
+    ``offset`` is the **consumeQueue offset** (that is, the 8th segment of the CK
+    string / msgQueueOffset), not the commitlog offset -- passing the wrong one makes
+    the broker reply with NO_MESSAGE.
     """
 
     def __init__(self):
@@ -1593,7 +1616,7 @@ class AckMessageRequestHeader(CommandCustomHeader):
 
 
 class ChangeInvisibleTimeRequestHeader(CommandCustomHeader):
-    """协议头 ``ChangeInvisibleTimeRequestHeader``（CHANGE_MESSAGE_INVISIBLETIME = 200053）。"""
+    """The protocol header ``ChangeInvisibleTimeRequestHeader`` (CHANGE_MESSAGE_INVISIBLETIME = 200053)."""
 
     def __init__(self):
         self.consumer_group: Optional[str] = None
@@ -1619,10 +1642,10 @@ class ChangeInvisibleTimeRequestHeader(CommandCustomHeader):
 
 
 class ChangeInvisibleTimeResponseHeader(CommandCustomHeader):
-    """协议头 ``ChangeInvisibleTimeResponseHeader``。
+    """The protocol header ``ChangeInvisibleTimeResponseHeader``.
 
-    返回的是**新的** ``invisible_time`` / ``pop_time`` / ``revive_qid``；
-    客户端要用它们重建 extraInfo 供后续 ACK 使用。
+    What it returns are the **new** ``invisible_time`` / ``pop_time`` / ``revive_qid``;
+    the client uses them to rebuild extraInfo for subsequent ACKs.
     """
 
     def __init__(self):

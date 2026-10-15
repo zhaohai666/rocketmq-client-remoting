@@ -6,7 +6,7 @@ import (
 )
 
 func TestMessageQueueHashCodeVectors(t *testing.T) {
-	// MessageQueue 哈希：字符串哈希逐段组合 topic/broker 再并入 queueId，32 位回绕
+	// MessageQueue hash: a string hash combines topic/broker segment-by-segment, then folds in queueId, wrapping in 32 bits
 	cases := []struct {
 		topic  string
 		broker string
@@ -33,7 +33,7 @@ func TestMessageQueueWireStringIsTheHashTarget(t *testing.T) {
 	if q.WireString() != want {
 		t.Fatalf("WireString = %q", q.WireString())
 	}
-	// String() 是日志形态，故意与 WireString 不同：一致哈希路由吃的是 WireString
+	// String() is the log form, deliberately different from WireString; the consistent-hash router uses WireString
 	if q.String() == q.WireString() {
 		t.Fatal("String and WireString must stay different")
 	}
@@ -53,7 +53,7 @@ func TestMessageQueueCompareTo(t *testing.T) {
 	if a.CompareTo(NewMessageQueue("TopicA", "BrokerB", 2)) >= 0 {
 		t.Fatal("queue id last")
 	}
-	// 可比较值类型：直接当 map key 用（rebalance/offset 表的前提）
+	// Comparable value type: used directly as a map key (prerequisite for the rebalance/offset tables)
 	seen := map[MessageQueue]int{a: 1}
 	if seen[NewMessageQueue("TopicA", "BrokerB", 1)] != 1 {
 		t.Fatal("identical queue must hit the same map slot")
@@ -61,7 +61,7 @@ func TestMessageQueueCompareTo(t *testing.T) {
 }
 
 func TestWaitStoreMsgOKRule(t *testing.T) {
-	// absent == true；只有大小写不敏感的 "true" 是 true（"1"/""/yes 都是 false）
+	// absent == true; only the case-insensitive "true" is true ("1"/""/"yes" are all false)
 	cases := []struct {
 		value   string
 		present bool
@@ -83,7 +83,7 @@ func TestWaitStoreMsgOKRule(t *testing.T) {
 
 func TestMessageWaitAndDelayDefaults(t *testing.T) {
 	m := NewMessage("T", []byte("b"))
-	// Message 构造从来不预写 WAIT —— 缺席是常态，必须当 true
+	// Message construction never pre-writes WAIT — absence is the norm and must read as true
 	if !m.IsWaitStoreMsgOK() {
 		t.Fatal("absent WAIT must default true")
 	}
@@ -118,7 +118,7 @@ func TestMessageBodyNilVsZeroLength(t *testing.T) {
 	if len(zero.GetBody()) != 0 {
 		t.Fatal("GetBody never returns nil to callers")
 	}
-	// NewMessage 把 nil 归一成空
+	// NewMessage normalizes nil into empty
 	if m := NewMessage("T", nil); m.Body == nil {
 		t.Fatal("NewMessage normalizes nil body")
 	}
@@ -133,7 +133,7 @@ func TestMessageBodyNilVsZeroLength(t *testing.T) {
 }
 
 func TestMessagePropertiesAccessors(t *testing.T) {
-	m := &Message{} // Properties 为 nil，所有访问都必须安全
+	m := &Message{} // Properties is nil; every accessor must stay safe
 	if _, ok := m.GetProperty("TAGS"); ok {
 		t.Fatal("nil props")
 	}
@@ -153,7 +153,7 @@ func TestMessagePropertiesAccessors(t *testing.T) {
 	if m.Properties.Len() != 0 {
 		t.Fatal("cleared")
 	}
-	// NewMessageWithTags：空 tags/keys 不写属性
+	// NewMessageWithTags: empty tags/keys does not write properties
 	if bare := NewMessageWithTags("T", []byte("b"), "", "", 0); bare.Properties != nil {
 		t.Fatal("empty tags must not create properties")
 	}
@@ -192,7 +192,7 @@ func TestMessageExtHostStringsAndDerivations(t *testing.T) {
 	if e.BornHostString() != "10.0.0.1:54321" {
 		t.Fatalf("got %q", e.BornHostString())
 	}
-	// ExtFromMessage -> ToMessage 往返：属性是克隆，互不影响
+	// ExtFromMessage -> ToMessage round trip: properties are cloned, independently
 	m := NewMessage("T", []byte("b"))
 	m.SetTags("TagA")
 	e = ExtFromMessage(m)
@@ -257,7 +257,7 @@ func TestBatchGenerateFromListRejects(t *testing.T) {
 	wait[1].SetWaitStoreMsgOK(false)
 	assertReject(t, wait, "The waitStoreMsgOK of the messages in one batch should be the same")
 
-	// delay level 0 不是延迟消息，放行
+	// delay level 0 is not a delayed message, allow it
 	zero := NewMessage("T", []byte("a"))
 	zero.PutProperty(PropertyDelayTimeLevel, "0")
 	if _, err := GenerateFromList([]*Message{zero}); err != nil {
@@ -267,7 +267,7 @@ func TestBatchGenerateFromListRejects(t *testing.T) {
 
 const batchOneHex = "0000002C00000000000000000000000700000004626F64790012544147530154616741024B455953016B3102"
 
-// 两条：m1 无属性；m2 带 TAGS=TagA
+// Two messages: m1 has no properties; m2 carries TAGS=TagA
 const batchTwoHex = "00000018000000000000000000000000000000026D310000" +
 	"00000022000000000000000000000000000000026D32000A54414753015461674102"
 
@@ -317,7 +317,7 @@ func TestBatchEncodeDecodeRoundTrip(t *testing.T) {
 	if v, ok := msgs[1].GetProperty(PropertyTags); !ok || v != "TagA" {
 		t.Fatalf("m2 tags %q", v)
 	}
-	// 单条帧：flag 与 body、属性一起回来
+	// Single frame: flag, body and properties come back together
 	one := NewMessage("", []byte("body"))
 	one.Flag = 7
 	one.SetTags("TagA")
@@ -335,7 +335,7 @@ func TestBatchEncodeDecodeRoundTrip(t *testing.T) {
 	if CountInnerMsgNum(body) != 2 {
 		t.Fatalf("inner count %d", CountInnerMsgNum(body))
 	}
-	// 帧被截断时列表停在最后一条完整消息
+	// When the frame is truncated, the list stops at the last complete message
 	if got := DecodeBatchMessages(body[:30]); len(got) != 1 {
 		t.Fatalf("truncated decode %d", len(got))
 	}

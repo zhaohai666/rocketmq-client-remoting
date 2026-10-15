@@ -41,14 +41,14 @@ class PullTaskContext:
         self._offset_source = offset
         self.next_offset: Optional[int] = None
         self._one_shot_delay_millis: Optional[int] = None
-        # 观测：已完成的拉取轮数 / 上一轮实际采用的延迟（排障与单测都靠它，
-        # 不让断言依赖墙钟计时）。
+        # observation: number of completed pull rounds / actual delay used in the previous round
+        # (both troubleshooting and unit tests rely on it; assertions must not depend on wall-clock timing).
         self.round_count = 0
         self.last_next_delay_millis: Optional[int] = None
 
-    # ---------------- 位点 ----------------
+    # ---------------- offset ----------------
     def resolve_offset(self) -> int:
-        """本轮拉取的起始位点：已有游标直接用；首轮按登记的来源求值。"""
+        """Starting offset for this pull round: reuse the existing cursor directly; the first round is evaluated from the registered source."""
         if self.next_offset is None:
             src = self._offset_source
             if src is None:
@@ -60,7 +60,7 @@ class PullTaskContext:
         return self.next_offset
 
     def _offset_from_broker(self) -> int:
-        """offset=None 的来源：broker 位点表优先，查不到退到队尾（LAST 语义）。"""
+        """Source when offset=None: broker offset table takes priority; fall back to the queue tail (LAST semantics) when not found."""
         mq = self.message_queue
         committed = self.pull_consumer.fetch_consume_offset(mq)
         if committed is not None:
@@ -68,25 +68,25 @@ class PullTaskContext:
         return int(self.pull_consumer.max_offset(mq))
 
     def seek(self, offset: int) -> None:
-        """手动改写下一轮起点（回调里根据结果决定重读位置时用）。"""
+        """Manually override the next round's start (used in callbacks to decide the re-read position from the result)."""
         self.next_offset = int(offset)
 
     def record_pull_result(self, result: PullResult) -> None:
-        """拉取成功后推进游标（OFFSET_ILLEGAL 时 next_begin_offset 就是 broker 建议位点）。"""
+        """Advance the cursor after a successful pull (on OFFSET_ILLEGAL, next_begin_offset is the broker-suggested offset)."""
         self.next_offset = int(result.next_begin_offset)
         self.round_count += 1
 
-    # ---------------- 下一轮延迟 ----------------
+    # ---------------- next-round delay ----------------
     def set_pull_interval(self, millis: int) -> None:
         pass
         self.pull_next_delay_millis = int(millis)
 
     def pull_message_later(self, millis: int) -> None:
-        """顺延下一轮 ``millis`` 毫秒（一次性；再下一轮回到常驻间隔）。"""
+        """Defer the next round by ``millis`` ms (one-shot; the round after returns to the resident interval)."""
         self._one_shot_delay_millis = int(millis)
 
     def consume_next_delay_millis(self, returned_delay: Optional[int]) -> int:
-        """结算下一轮延迟：回调显式返回值 > 一次性顺延（消费掉） > 常驻间隔。"""
+        """Settle the next-round delay: explicit callback return value > one-shot deferral (consumed) > resident interval."""
         if returned_delay is not None:
             delay = int(returned_delay)
         elif self._one_shot_delay_millis is not None:
@@ -108,7 +108,7 @@ class PullTaskCallback:
 
 
 class _TaskSpec:
-    """register_pull_task 按 topic 存的登记项（回调 + 任务模板参数）。"""
+    """Registration entry stored per topic by register_pull_task (callback + task template params)."""
 
     __slots__ = ("callback", "subscription_expression", "offset",
                  "next_delay_millis", "max_msg_nums", "timeout_millis")
@@ -139,7 +139,7 @@ class _PullTask:
     def __init__(self, context: PullTaskContext):
         self.context = context
         self.cancelled = False
-        # queue 维度串行的闸门：入堆派发前置 True，_run_task 收尾置 False。
+        # gate for queue-dimensional serialization: set True before heap dispatch, set False at the end of _run_task.
         self.in_flight = False
 
 
@@ -164,7 +164,7 @@ class PullConsumerScheduleService:
         self.queue_check_interval_millis = DEFAULT_QUEUE_CHECK_INTERVAL_MILLIS
         self._callback_table: Dict[str, _TaskSpec] = {}
         self._task_table: Dict[MessageQueue, _PullTask] = {}
-        # 到期堆：(monotonic 到期时刻, 入堆序号, task)——序号只为堆比较稳定。
+        # due heap: (monotonic due time, enqueue sequence, task) -- the sequence only keeps heap comparison stable.
         self._heap: List = []
         self._heap_seq = itertools.count()
         self._cond = threading.Condition()
@@ -174,7 +174,7 @@ class PullConsumerScheduleService:
         self._next_queue_check_at: Optional[float] = None
         self._started = False
 
-    # ---------------- 对外 API ----------------
+    # ---------------- public API ----------------
     def get_pull_consumer(self) -> DefaultMQPullConsumer:
         pass
         return self._pull_consumer
@@ -198,8 +198,8 @@ class PullConsumerScheduleService:
             self._put_tasks_for_topic(topic)
 
     def start(self) -> None:
-        """拉起消费者（幂等；复用模式下也是——MQClientManager 计数保证安全）、
-        建工作池与调度线程，并为所有已登记 topic 展开队列。"""
+        """Start the consumer (idempotent; also under reuse mode -- MQClientManager's count guarantees
+        safety), build the worker pool and scheduling thread, and expand queues for all registered topics."""
         if self._started:
             return
         self._pull_consumer.start()
@@ -245,7 +245,7 @@ class PullConsumerScheduleService:
         logger.info("PullConsumerScheduleService shutdown OK, group=%s",
                     self._pull_consumer.consumer_group)
 
-    # ---------------- 观测（测试/排障） ----------------
+    # ---------------- observation (testing/troubleshooting) ----------------
     def task_table(self) -> Dict[MessageQueue, _PullTask]:
         pass
         with self._cond:
@@ -257,18 +257,18 @@ class PullConsumerScheduleService:
     def _queues_of_topic(self, topic: str) -> List[MessageQueue]:
         if self._pull_consumer.message_model == MessageModel.BROADCASTING:
             return list(self._pull_consumer.fetch_subscribe_message_queues(topic))
-        # CLUSTERING → mqDivided：本实例应得的那份（本端无后台 rebalance，
-        # 用带「拿不到视图保留现有分配」兜底的当场分配公式）。
+        # CLUSTERING -> mqDivided: the share this instance should get (no background rebalance on this side,
+        # uses an on-the-spot allocation formula with a "keep existing allocation if the view is unavailable" fallback).
         return list(self._pull_consumer.fetch_message_queues_in_balance(topic))
 
     def _put_tasks_for_topic(self, topic: str) -> None:
-        """把 topic 的队列集合对齐到任务表：撤掉不在新集合的任务、新队列 0 延迟入堆。"""
+        """Align the topic's queue set to the task table: drop tasks not in the new set, enqueue new queues with 0 delay."""
         spec = self._callback_table.get(topic)
         if spec is None:
             return
         try:
             queues = self._queues_of_topic(topic)
-        except Exception as e:  # noqa: BLE001 —— 视图拿不到就保留现有分配，绝不撤光
+        except Exception as e:  # noqa: BLE001 -- if the view is unavailable, keep the existing allocation; never drop everything
             logger.debug("queue view unavailable for %s: %s", topic, e)
             return
         new_set = {mq for mq in queues if mq.topic == topic}
@@ -288,12 +288,12 @@ class PullConsumerScheduleService:
                                                 next(self._heap_seq), task))
             self._cond.notify_all()
 
-    # ---------------- 调度循环 ----------------
+    # ---------------- scheduling loop ----------------
     def _schedule_loop(self) -> None:
         while not self._stop.is_set():
             try:
                 self._tick()
-            except BaseException:  # noqa: BLE001 —— 循环体任何异常都不能杀调度线程
+            except BaseException:  # noqa: BLE001 -- no exception in the loop body may kill the scheduling thread
                 logger.exception("pull schedule loop error")
             with self._cond:
                 if self._stop.is_set() or not self._started:
@@ -303,7 +303,7 @@ class PullConsumerScheduleService:
         logger.debug("pull scheduler loop exited")
 
     def _sleep_budget_locked(self) -> float:
-        """持锁状态下算「最多睡多久」：最早到期时刻、队列复查时刻、0.5s 封顶。"""
+        """Under the lock, compute "sleep at most how long": earliest due time, queue recheck time, capped at 0.5s."""
         deadline = time.monotonic() + 0.5
         if self._heap:
             deadline = min(deadline, self._heap[0][0])
@@ -312,13 +312,13 @@ class PullConsumerScheduleService:
         return max(0.01, deadline - time.monotonic())
 
     def _tick(self) -> None:
-        """到期任务派发给工作池；到复查时刻则增撤一轮队列。"""
+        """Dispatch due tasks to the worker pool; when the recheck time arrives, add/drop one round of queues."""
         due: List[_PullTask] = []
         topics_to_check: Optional[List[str]] = None
         now = time.monotonic()
         with self._cond:
             if self._next_queue_check_at is None:
-                # 首轮复查从本 tick 起按周期排（start 时已展开过一遍，不必立刻复查）。
+                # the first recheck is scheduled from this tick by period (already expanded once at start, no immediate recheck needed).
                 self._next_queue_check_at = now + self.queue_check_interval_millis / 1000.0
             elif now >= self._next_queue_check_at:
                 self._next_queue_check_at = now + self.queue_check_interval_millis / 1000.0
@@ -327,7 +327,7 @@ class PullConsumerScheduleService:
                 _, _, task = heapq.heappop(self._heap)
                 if task.cancelled or task.in_flight:
                     continue
-                # 入队前先占住 in_flight：queue 维度串行从这里开始保证。
+                # occupy in_flight before enqueue: queue-dimensional serialization is guaranteed from here.
                 task.in_flight = True
                 due.append(task)
         if not self._stop.is_set():
@@ -336,8 +336,9 @@ class PullConsumerScheduleService:
                 try:
                     workers.submit(self._run_task, task)
                 except (RejectedExecutionError, AttributeError) as e:
-                    # 池拒绝（队列满）或已摘除（shutdown 竞窗）：撤闸并顺延重排，
-                    # 绝不能让任务从此脱离堆——否则该队列再也不会被拉。
+                    # pool rejected (queue full) or already removed (shutdown race window): release the gate
+                    # and re-enqueue with deferral; never let the task leave the heap -- otherwise that queue
+                    # would never be pulled again.
                     task.in_flight = False
                     logger.debug("pull task rejected, reschedule later: %s", e)
                     if isinstance(e, RejectedExecutionError) and not self._stop.is_set():
@@ -350,7 +351,7 @@ class PullConsumerScheduleService:
             for topic in topics_to_check:
                 self._put_tasks_for_topic(topic)
 
-    # ---------------- 单个任务的一轮（工作线程上跑） ----------------
+    # ---------------- one round of a single task (runs on a worker thread) ----------------
     def _run_task(self, task: _PullTask) -> None:
         context = task.context
         mq = context.message_queue
@@ -365,7 +366,7 @@ class PullConsumerScheduleService:
             result = self._pull_consumer.pull(
                 mq, context.subscription_expression, offset,
                 context.max_msg_nums, context.timeout_millis)
-        except BaseException as e:  # noqa: BLE001 —— 拉取失败只顺延，不杀线程
+        except BaseException as e:  # noqa: BLE001 -- a failed pull only defers; does not kill the thread
             failed = True
             logger.error("pull schedule: pull %s failed: %s", mq, e)
         if task.cancelled:

@@ -143,35 +143,35 @@ func main() {
 	}
 	defer admin.Shutdown()
 	if err := admin.CreateTopic(common.DefaultTopic, topic, baseQueueNum, 0); err != nil {
-		check("建 Topic（2 队列）", false, err.Error())
+		check("create Topic (2 queues)", false, err.Error())
 		os.Exit(1)
 	}
-	check("建 Topic（2 队列）", true, "")
+	check("create Topic (2 queues)", true, "")
 
 	c := client.MustNewDefaultLitePullConsumer(group)
 	c.SetNameServerAddresses([]string{*nsAddr})
 	c.SetInstanceName("lite-qc-live")
 	c.SetTopicMetadataCheckIntervalMillis(checkIntervalMs)
 	if c.TopicMetadataCheckIntervalMillis() != checkIntervalMs {
-		check("检查周期压到 1s 下限", false,
+		check("check interval pushed to the 1s floor", false,
 			fmt.Sprintf("actual=%d", c.TopicMetadataCheckIntervalMillis()))
 		os.Exit(1)
 	}
-	check("检查周期压到 1s 下限", true, "")
+	check("check interval pushed to the 1s floor", true, "")
 
 	if err := c.Subscribe(topic, "*"); err != nil {
 		check("Subscribe", false, err.Error())
 		os.Exit(1)
 	}
 	if err := c.Start(); err != nil {
-		check("消费者启动", false, err.Error())
+		check("consumer started", false, err.Error())
 		os.Exit(1)
 	}
 	defer c.Shutdown()
 	loopStart := time.Now()
 
 	ok, waited := waitQueueNum(c, topic, baseQueueNum, 30*time.Second)
-	check("L0 路由可见（2 个队列）", ok, fmt.Sprintf("after=%s", waited))
+	check("L0 route visible (2 queues)", ok, fmt.Sprintf("after=%s", waited))
 	if !ok {
 		fmt.Printf("\nPASS=%d FAIL=%d\n", passCount, failCount)
 		os.Exit(1)
@@ -181,11 +181,11 @@ func main() {
 	// Registering while RUNNING snapshots the current set, so the first round
 	// must stay quiet.
 	if err := c.RegisterTopicMessageQueueChangeListener(topic, rec); err != nil {
-		check("注册队列变更监听", false, err.Error())
+		check("queue-change listener registered", false, err.Error())
 		os.Exit(1)
 	}
 	time.Sleep(3 * time.Second)
-	check("L1 队列没动 ⇒ 静默", len(rec.snapshot()) == 0,
+	check("L1 queues unchanged => silent", len(rec.snapshot()) == 0,
 		fmt.Sprintf("events=%v", rec.snapshot()))
 
 	// Wait past the 10s initial delay so the following measurements only see
@@ -193,39 +193,39 @@ func main() {
 	if wait := time.Duration(firstDelayS*1.5)*time.Second - time.Since(loopStart); wait > 0 {
 		time.Sleep(wait)
 	}
-	check("L1b 首查那趟真的跑过 ⇒ 依旧静默", len(rec.snapshot()) == 0,
+	check("L1b the first scheduled round really ran => still silent", len(rec.snapshot()) == 0,
 		fmt.Sprintf("events=%v", rec.snapshot()))
 
 	// ---- L2 scale out 2 -> 4
 	if err := admin.CreateTopic(common.DefaultTopic, topic, scaledQueueNum, 0); err != nil {
-		check("扩容到 4 队列", false, err.Error())
+		check("scaled up to 4 queues", false, err.Error())
 	}
 	nsSeen, tNs := waitQueueNum(c, topic, scaledQueueNum, 45*time.Second)
-	check("L2a nameserver 报出 4 个队列", nsSeen, fmt.Sprintf("after=%s", tNs))
+	check("L2a nameserver reports 4 queues", nsSeen, fmt.Sprintf("after=%s", tNs))
 	if nsSeen {
 		gotCB, tCB := waitEvents(rec, func(e [][]int) bool {
 			return matches(e, idsOf(scaledQueueNum))
 		}, freshnessWindowSec*time.Second)
-		check("L2b 比对趟次现查路由（回调紧跟 nameserver，不等 30s 缓存）",
+		check("L2b the check round re-queries the route (callback follows the nameserver, not the 30s cache)",
 			gotCB, fmt.Sprintf("callback waited=%s", tCB))
 	}
 
 	// ---- L3 the snapshot advanced: one change, one callback
 	time.Sleep(3 * time.Second)
-	check("L3 回调后快照推进 ⇒ 不重复回调", len(rec.snapshot()) == 1,
+	check("L3 snapshot advanced after the callback => no duplicate callback", len(rec.snapshot()) == 1,
 		fmt.Sprintf("events=%v", rec.snapshot()))
 
 	// ---- L4 scale back in 4 -> 2
 	if err := admin.CreateTopic(common.DefaultTopic, topic, baseQueueNum, 0); err != nil {
-		check("缩容回 2 队列", false, err.Error())
+		check("scaled back to 2 queues", false, err.Error())
 	}
 	nsSeen, tNs = waitQueueNum(c, topic, baseQueueNum, 45*time.Second)
-	check("L4a nameserver 报回 2 个队列", nsSeen, fmt.Sprintf("after=%s", tNs))
+	check("L4a nameserver reports 2 queues again", nsSeen, fmt.Sprintf("after=%s", tNs))
 	if nsSeen {
 		gotCB, tCB := waitEvents(rec, func(e [][]int) bool {
 			return matches(e, idsOf(scaledQueueNum), idsOf(baseQueueNum))
 		}, freshnessWindowSec*time.Second)
-		check("L4b 缩容同样靠现查路由看到", gotCB,
+		check("L4b scale-in is also seen through a fresh route query", gotCB,
 			fmt.Sprintf("callback waited=%s", tCB))
 	}
 
@@ -236,7 +236,7 @@ func main() {
 	} else {
 		notFound = fmt.Sprintf("no error, queues=%d", len(queues))
 	}
-	check("L5 未知 topic 取队列报「查不到」而不是返回空",
+	check("L5 fetching queues for an unknown topic reports \"not found\" instead of returning empty",
 		strings.Contains(notFound, "Namesrv return empty"), notFound)
 
 	fmt.Printf("\nPASS=%d FAIL=%d\n", passCount, failCount)

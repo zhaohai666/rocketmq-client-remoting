@@ -35,13 +35,13 @@ class ConsumeExecutor:
         self._lock = threading.Lock()
         self._work_available = threading.Condition(self._lock)
         self._workers = 0
-        self._idle = 0             # 其中处于等待状态的数量
+        self._idle = 0             # number of them in a waiting state
         self._threads: List[threading.Thread] = []
         self._seq = int(thread_index_from)
         self._shutdown = False
         self._handler_exceptions = 0
 
-    # ---------------- 对外 API ----------------
+    # ---------------- public API ----------------
 
     def submit(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
         pass
@@ -95,7 +95,7 @@ class ConsumeExecutor:
             return len(self._queue)
 
     def handler_exception_count(self) -> int:
-        """被吞掉的任务异常计数（仅供观测/单测）。"""
+        """Count of task exceptions that were swallowed (for observation/unit tests only)."""
         return self._handler_exceptions
 
     def shutdown(self, wait: bool = False) -> None:
@@ -111,10 +111,10 @@ class ConsumeExecutor:
             for t in threads:
                 t.join()
 
-    # ---------------- 内部 ----------------
+    # ---------------- internal ----------------
 
     def _spawn_locked(self) -> None:
-        """调用方必须已持有 ``self._lock``。"""
+        """Caller must already hold ``self._lock``."""
         self._workers += 1
         name = "%s%s%d" % (self._prefix, self._name_sep, self._seq)
         self._seq += 1
@@ -134,7 +134,7 @@ class ConsumeExecutor:
                         self._idle -= 1
                     if self._queue or self._shutdown:
                         break
-                    # 空闲超时：只有超编线程（> core）才退出
+                    # idle timeout: only over-quota threads (> core) exit
                     if self._workers > self._core:
                         self._workers -= 1
                         self._retire_locked()
@@ -154,7 +154,7 @@ class ConsumeExecutor:
                 logger.exception("consume executor task raised, worker kept alive")
 
     def _retire_locked(self) -> None:
-        """调用方必须已持有 ``self._lock``：把退出线程从名册里摘掉。"""
+        """Caller must already hold ``self._lock``: remove the exited thread from the roster."""
         cur = threading.current_thread()
         for i, t in enumerate(self._threads):
             if t is cur:

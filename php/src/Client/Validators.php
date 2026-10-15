@@ -14,10 +14,10 @@ final class Validators
 {
     public const CHARACTER_MAX_LENGTH = 255;
 
-    /** 文件系统分隔符：多队列分发（LMQ）路径里不允许出现。 */
+    /** Filesystem separator: must not appear in multi-queue dispatch (LMQ) paths. */
     public const FILE_SEPARATOR = DIRECTORY_SEPARATOR;
 
-    /** 对应 ``Validators.checkGroup``。 */
+    /** Corresponds to ``Validators.checkGroup``. */
     public static function checkGroup(?string $group): void
     {
         if ($group === null || trim($group) === '') {
@@ -39,7 +39,7 @@ final class Validators
         }
     }
 
-    /** 对应 ``Validators.checkTopic``。 */
+    /** Corresponds to ``Validators.checkTopic``. */
     public static function checkTopic(?string $topic): void
     {
         if ($topic === null || trim($topic) === '') {
@@ -60,7 +60,7 @@ final class Validators
         }
     }
 
-    /** 对应 ``Validators.isSystemTopic``：命中系统 topic 直接抛，正常时返回。 */
+    /** Corresponds to ``Validators.isSystemTopic``: throws immediately when the system topic is hit, returns normally otherwise. */
     public static function isSystemTopic(string $topic): void
     {
         if (TopicValidator::isSystemTopic($topic)) {
@@ -68,7 +68,7 @@ final class Validators
         }
     }
 
-    /** 对应 ``Validators.isNotAllowedSendTopic``。 */
+    /** Corresponds to ``Validators.isNotAllowedSendTopic``. */
     public static function isNotAllowedSendTopic(string $topic): void
     {
         if (TopicValidator::isNotAllowedSendTopic($topic)) {
@@ -77,11 +77,11 @@ final class Validators
     }
 
     /**
-     * 对应 ``Validators.checkMessage(msg, producer)``（顺序与文案逐条照抄）。
+     * Corresponds to ``Validators.checkMessage(msg, producer)`` (order and wording copied verbatim).
      *
-     * 码值口径：null message / null body / zero body / oversize body /
-     * INNER_MULTI_DISPATCH 这五条带 MESSAGE_ILLEGAL(13)；禁发 topic、系统 topic、
-     * checkTopic、checkGroup 走纯客户端错误（responseCode 为 null）。
+     * Code value conventions: null message / null body / zero body / oversize body /
+     * INNER_MULTI_DISPATCH carry MESSAGE_ILLEGAL(13); forbidden-send topic, system topic,
+     * checkTopic and checkGroup use pure client-side errors (responseCode is null).
      */
     public static function checkMessage(?Message $msg, int $maxMessageSize): void
     {
@@ -103,7 +103,7 @@ final class Validators
                 ResponseCode::MESSAGE_ILLEGAL
             );
         }
-        // 多队列分发（LMQ）的路径里带文件系统分隔符会让 broker 侧建队列时拼出越界路径
+        // A filesystem separator in the multi-queue dispatch (LMQ) path makes the broker side build an out-of-bounds path when creating queues
         $lmqPath = $msg->getProperty(MessageConst::PROPERTY_INNER_MULTI_DISPATCH);
         if ($lmqPath !== null && $lmqPath !== '' && str_contains($lmqPath, self::FILE_SEPARATOR)) {
             throw new MQClientException(

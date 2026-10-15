@@ -3,38 +3,42 @@
 declare(strict_types=1);
 
 /**
- * PHP 端全部单测入口（无 phpunit 依赖）。
+ * Entry point for all PHP-side unit tests (no phpunit dependency).
  *
- * 运行：C:/Users/zhaoh/.workbuddy/binaries/php/versions/8.3/php.exe tests/run_all.php
+ * Run: C:/Users/zhaoh/.workbuddy/binaries/php/versions/8.3/php.exe tests/run_all.php
  *
- * 内容：
- *   0) 静态守卫——全量类名冲突扫描（PHP 无模块隔离，同名类必然踩踏）
- *   1) 各子套件顺序执行，任一失败即以非零码退出
+ * Contents:
+ *   0) Static guard — a full class-name conflict scan (PHP has no module isolation; same-named
+ *      classes inevitably stomp on each other)
+ *   1) Each sub-suite runs in order; any failure exits with a non-zero code
  *
- * 真机联调用例不在本入口内，见 scripts/with_cluster.sh + examples/live_*.php。
+ * Live-cluster test cases are not part of this entry point; see scripts/with_cluster.sh +
+ * examples/live_*.php.
  */
 
 $suites = [
-    'Common 层' => __DIR__ . '/RunCommon.php',
-    'Remoting 层' => __DIR__ . '/RunRemoting.php',
-    'Client 日志' => __DIR__ . '/RunClientLogger.php',
-    'Client 叶子' => __DIR__ . '/RunClientLeaf.php',
-    'Client 轨迹' => __DIR__ . '/RunClientTrace.php',
+    'Common layer' => __DIR__ . '/RunCommon.php',
+    'Remoting layer' => __DIR__ . '/RunRemoting.php',
+    'Client logger' => __DIR__ . '/RunClientLogger.php',
+    'Client leaf' => __DIR__ . '/RunClientLeaf.php',
+    'Client trace' => __DIR__ . '/RunClientTrace.php',
     'Client OpenTracing' => __DIR__ . '/RunClientOpenTracing.php',
-    'Client 聚合器' => __DIR__ . '/RunClientAccumulator.php',
-    'Client 实例' => __DIR__ . '/RunClientInstance.php',
-    'Client 故障探活' => __DIR__ . '/RunClientFaultDetector.php',
-    'Client 消费者' => __DIR__ . '/RunClientConsumer.php',
-    'Client 生产者' => __DIR__ . '/RunClientProducer.php',
-    'Client 队列变更监听' => __DIR__ . '/RunClientLiteTopicChange.php',
-    'Client 静态主题路由' => __DIR__ . '/RunClientStaticTopic.php',
+    'Client accumulator' => __DIR__ . '/RunClientAccumulator.php',
+    'Client instance' => __DIR__ . '/RunClientInstance.php',
+    'Client fault detector' => __DIR__ . '/RunClientFaultDetector.php',
+    'Client consumer' => __DIR__ . '/RunClientConsumer.php',
+    'Client producer' => __DIR__ . '/RunClientProducer.php',
+    'Client queue-change listener' => __DIR__ . '/RunClientLiteTopicChange.php',
+    'Client static topic route' => __DIR__ . '/RunClientStaticTopic.php',
 ];
 
-// 顶层先加载 autoloader，避免各子套件重复注册。
+// Load the autoloader at the top level so the sub-suites do not register it repeatedly.
 require_once __DIR__ . '/../bootstrap.php';
 
-// 子套件一律把客户端日志钉到临时目录：本端口默认按 cwd 落盘（见 src/Client/Logger.php
-// 的取舍说明），从仓库根跑测试就会在仓库里长出 logs/。真机联调不经过本入口，不受影响。
+// Sub-suites always pin the client log to a temp directory: this port writes logs relative to
+// the cwd by default (see the trade-off notes in src/Client/Logger.php), so running tests from
+// the repo root would grow logs/ inside the repo. Live-cluster runs do not go through this
+// entry point and are unaffected.
 $suiteLogDir = sys_get_temp_dir() . '/rmq_php_suite_logs_' . getmypid();
 putenv('ROCKETMQ_CLIENT_LOG_DIR=' . $suiteLogDir);
 
@@ -42,17 +46,18 @@ $failed = 0;
 $totalChecks = 0;
 
 // ---------------------------------------------------------------------------
-// 0) 类名冲突扫描
+// 0) Class-name conflict scan
 // ---------------------------------------------------------------------------
-// 背景：PHP 没有命名空间级别的文件隔离，同一个 FQCN 若在两个文件里声明，先被
-// autoload 命中的那个胜出，另一个永远拿不到——这是**静默**错误（不报 fatal，
-// 只是方法签名在运行期爆炸或语义悄悄跑偏）。曾真实踩过：
-//   RocketMQ\Client\TraceContext 同时被 TraceContext.php(W3C traceparent) 与
-//   Trace.php(消息轨迹上下文) 声明。
-// 所以把扫描做成常驻守卫：任何重复声明直接判失败。
+// Background: PHP has no namespace-level file isolation. If the same FQCN is declared in two
+// files, the one autoloaded first wins and the other never loads — a **silent** error (no fatal
+// is reported; method signatures just explode at runtime or the semantics quietly drift). This
+// really happened once:
+//   RocketMQ\Client\TraceContext was declared by both TraceContext.php (W3C traceparent) and
+//   Trace.php (the message-trace context).
+// Hence the scan is a permanent guard: any duplicate declaration fails outright.
 $conflicts = scan_class_conflicts(__DIR__ . '/../src');
 
-printf("=== 静态守卫：类名冲突扫描 (%s) ===\n", count($conflicts) === 0 ? 'CLEAN' : 'CONFLICT');
+printf("=== static guard: class conflict scan (%s) ===\n", count($conflicts) === 0 ? 'CLEAN' : 'CONFLICT');
 if ($conflicts !== []) {
     foreach ($conflicts as $fqcn => $files) {
         printf("  CONFLICT %s\n", $fqcn);
@@ -68,7 +73,7 @@ echo "\n";
 
 foreach ($suites as $name => $file) {
     if (!is_file($file)) {
-        fwrite(STDERR, sprintf("[SKIP] %s: 未找到 %s\n", $name, basename($file)));
+        fwrite(STDERR, sprintf("[SKIP] %s: %s not found\n", $name, basename($file)));
         continue;
     }
     printf("=== %s (%s) ===\n", $name, basename($file));
@@ -100,11 +105,12 @@ exit(1);
 // ---------------------------------------------------------------------------
 
 /**
- * 扫描 src/ 下所有 PHP 文件，按 token 解析出「已声明的 FQCN -> 文件列表」，
- * 返回出现次数 > 1 的项。
+ * Scans every PHP file under src/, parsing out "declared FQCN -> file list" by token,
+ * returning the entries that occur more than once.
  *
- * 说明：必须用 token_get_all 而不是正则——`RocketMQ\Client\Foo` 这种字面量在
- * use 语句、docblock、字符串里大量出现，正则必然误报。
+ * Note: token_get_all must be used instead of a regex — literals like `RocketMQ\Client\Foo`
+ * appear extensively in use statements, docblocks and strings; a regex would inevitably
+ * false-positive.
  *
  * @return array<string, list<string>>
  */
@@ -139,7 +145,7 @@ function scan_class_conflicts(string $srcDir): array
 }
 
 /**
- * 从一个文件里解析出 namespace 与顶层 class/interface/trait/enum 短名。
+ * Parses the namespace and top-level class/interface/trait/enum short names from one file.
  *
  * @return array{0: string, 1: list<string>}
  */
@@ -162,7 +168,7 @@ function parse_declarations(string $code): array
         if ($tok[0] === T_NAMESPACE) {
             $namespace = '';
             $i++;
-            // 组装 namespace 名（可能带裸名，如 namespace A\B;）
+            // Assemble the namespace name (may carry a bare name, e.g. namespace A\B;)
             while ($i < $count) {
                 $t = $tokens[$i];
                 if ($t === ';' || $t === '{' || $t === '(') {
@@ -182,7 +188,7 @@ function parse_declarations(string $code): array
         }
 
         if (in_array($tok[0], $declKinds, true)) {
-            // T_CLASS 也可能是 `Foo::class`
+            // T_CLASS may also be `Foo::class`
             $prev = $i - 1;
             while ($prev >= 0 && is_array($tokens[$prev]) && $tokens[$prev][0] === T_WHITESPACE) {
                 $prev--;

@@ -3,14 +3,14 @@
 declare(strict_types=1);
 
 /**
- * 静态主题路由离线单测（五个用例）—— 不需要集群。
+ * Static topic routing offline unit test (five cases) -- no cluster needed.
  *
- * 覆盖：mock broker 名推导、类型化映射解析缺省值、端点推导（未承载队列 ->
- * "__syslo__none__" 哨兵、scope 不合并、epoch 围栏）、getBrokerNameFromMessageQueue
- * 的重写/透传。
+ * Covers: mock broker name derivation, typed mapping parsing defaults, endpoint
+ * derivation (unhosted queue -> "__syslo__none__" sentinel, scopes not merged, epoch
+ * fencing), and getBrokerNameFromMessageQueue rewrite/pass-through.
  *
- * 运行：php tests/RunClientStaticTopic.php
- * 全部通过输出 "ALL TESTS PASSED (N checks)"，任一失败列出明细并以非零码退出。
+ * Run: php tests/RunClientStaticTopic.php
+ * On full success prints "ALL TESTS PASSED (N checks)"; any failure lists details and exits non-zero.
  */
 
 require_once __DIR__ . '/../bootstrap.php';
@@ -59,13 +59,13 @@ function mappingRoute(array $entries): TopicRouteData
     return $route;
 }
 
-// 1) mock broker 名推导
+// 1) mock broker name derivation
 checkSame('__syslo__global__', StaticTopic::getMockBrokerName('__global__'), 'mock name strips global underscores');
 checkSame('__syslo__zone-a', StaticTopic::getMockBrokerName('zone-a'), 'mock name prefixes other scopes verbatim');
 check(StaticTopic::isLogicalQueueMockBrokerName('__syslo__global__'), 'mock prefix detected');
 check(!StaticTopic::isLogicalQueueMockBrokerName('broker-a'), 'real broker name is not mock');
 
-// 2) 类型化解析的缺省值
+// 2) Defaults of typed parsing
 $info = StaticTopic::parseTopicQueueMappingInfo([
     'totalQueues' => 2,
     'bname' => 'b1',
@@ -80,7 +80,7 @@ if ($info !== null) {
 }
 check(StaticTopic::parseTopicQueueMappingInfo('not-an-object') === null, 'non-object raw rejected');
 
-// 3) 单 scope + 未承载队列 -> NOT_EXIST 哨兵
+// 3) Single scope + unhosted queue -> NOT_EXIST sentinel
 $route = mappingRoute([
     'broker-a' => rawMapping('__global__', 4, 'broker-a', 0, ['0' => 0, '1' => 1, '2' => 2]),
 ]);
@@ -98,7 +98,7 @@ if ($endpoints !== null) {
 check(StaticTopic::topicRouteData2EndpointsForStaticTopic('T', new TopicRouteData()) === null,
     'empty mapping yields no endpoints');
 
-// 4) scope 之间不合并 + epoch 围栏
+// 4) Scopes do not merge + epoch fencing
 $route2 = mappingRoute([
     'broker-old' => rawMapping('__global__', 1, 'broker-old', 3, ['0' => 0]),
     'broker-new' => rawMapping('__global__', 1, 'broker-new', 7, ['0' => 0]),
@@ -114,7 +114,7 @@ if ($endpoints2 !== null) {
     checkSame(2, count($endpoints2), 'scopes do not merge');
 }
 
-// 5) 实例的 getBrokerNameFromMessageQueue 重写/透传
+// 5) Instance's getBrokerNameFromMessageQueue rewrite/pass-through
 $inst = new MQClientInstance('static-test@DEFAULT', ['127.0.0.1:9876']);
 $inst->topicEndPointsTable['StaticTopic'] = [
     StaticTopic::queueKey(new MessageQueue('StaticTopic', '__syslo__global__', 0)) => 'broker-a',
@@ -124,7 +124,7 @@ checkSame('broker-a', $inst->getBrokerNameFromMessageQueue(new MessageQueue('Sta
     'global 0 rewritten');
 checkSame('broker-b', $inst->getBrokerNameFromMessageQueue(new MessageQueue('StaticTopic', '__syslo__global__', 1)),
     'global 1 rewritten');
-// 表里没有的队列 / 非静态主题原样透传自己的 broker 名。
+// Queues absent from the table / non-static topics pass their own broker name through unchanged.
 checkSame('__syslo__global__', $inst->getBrokerNameFromMessageQueue(new MessageQueue('StaticTopic', '__syslo__global__', 99)),
     'unknown queue passes mock name through');
 checkSame('broker-a', $inst->getBrokerNameFromMessageQueue(new MessageQueue('Plain', 'broker-a', 0)),

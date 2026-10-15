@@ -1,5 +1,6 @@
-// 消费端（DefaultMQPushConsumer 的 309 处理器，Consumer.cs）由 ConsumerStatsTests 一线
-// 已有覆盖；这里锁发起端（DefaultMQAdminExt.ConsumeMessageDirectly）。
+// The consume side (DefaultMQPushConsumer's 309 handler, Consumer.cs) is already covered
+// on one front by ConsumerStatsTests; here the originating side
+// (DefaultMQAdminExt.ConsumeMessageDirectly) is pinned.
 using System;
 using System.Globalization;
 using RocketMQ.Client;
@@ -24,7 +25,7 @@ public class ConsumeMessageDirectlyTests
         return admin;
     }
 
-    /// <summary>ip:port + commitLogOffset → 大写十六进制 offset msgId。</summary>
+    /// <summary>ip:port + commitLogOffset -> an uppercase hex offset msgId.</summary>
     private static string BuildOffsetMsgId(string addr, long offset)
     {
         int colon = addr.LastIndexOf(':');
@@ -69,7 +70,7 @@ public class ConsumeMessageDirectlyTests
         SpentTimeMills = 42,
     }.Encode();
 
-    // ---------------------------------------------------------------- 报文形状 + 结果解码
+    // ---------------------------------------------------------------- Wire shape + result decoding
 
     [Fact]
     public void SendsTheExpectedHeaderFieldsToTheStoreHostAndDecodesTheResult()
@@ -115,7 +116,7 @@ public class ConsumeMessageDirectlyTests
         DefaultMQAdminExt admin = StartedAdmin(cluster);
         try
         {
-            // 位点 8192 只是让入参 msgId 与消息真实 OffsetMsgId(4096) 不同
+            // the offset 8192 only serves to make the incoming msgId differ from the message's real OffsetMsgId(4096)
             string inputMsgId = BuildOffsetMsgId(brokerAddr, 8192);
             admin.ConsumeMessageDirectly(Group, Client, Topic, inputMsgId);
 
@@ -153,16 +154,16 @@ public class ConsumeMessageDirectlyTests
         }
     }
 
-    // ---------------------------------------------------------------- 失败分支
+    // ---------------------------------------------------------------- Failure branches
 
-    /// <summary>309 回 SUCCESS 但 body 为空 ⇒ MQClientException（空 body 按失败处理）。</summary>
+    /// <summary>309 replies SUCCESS but the body is empty => MQClientException (an empty body is treated as failure).</summary>
     [Fact]
     public void EmptyResultBodyThrows()
     {
         using var cluster = MockCluster.Start(1);
         string brokerAddr = cluster.BrokerAddrs[0];
         cluster.SetReplyBody(RequestCode.ViewMessageById, _ => EncodedViewBody(brokerAddr, null));
-        // 309 不挂应答体：mock 回 SUCCESS + 无 body
+        // 309 carries no response body: the mock replies SUCCESS with no body
         DefaultMQAdminExt admin = StartedAdmin(cluster);
         try
         {
@@ -178,7 +179,7 @@ public class ConsumeMessageDirectlyTests
         }
     }
 
-    /// <summary>未 Start 直接调用 ⇒ MQClientException（不碰网络）。</summary>
+    /// <summary>Calling it without Start => MQClientException (the network is not touched).</summary>
     [Fact]
     public void RequiresStartBeforeUse()
     {

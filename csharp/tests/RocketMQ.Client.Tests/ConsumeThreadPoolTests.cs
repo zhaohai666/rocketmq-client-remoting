@@ -37,7 +37,6 @@ public class ConsumeExecutorTests
 
         ex.Submit(Block);
         ex.Submit(Block);
-        // 两个 worker 被占住；第 3、4 个任务只能排队（未到 core 时不会建线程）
         ex.Submit(() => { });
         ex.Submit(() => { });
         SleepMs(150);
@@ -58,7 +57,7 @@ public class ConsumeExecutorTests
         for (int i = 0; i < 3; i++) ex.Submit(() => { });
         Assert.Equal(1, ex.WorkerCount());
         Assert.Equal(3, ex.QueuedCount());
-        ex.SetCorePoolSize(4);   // delta=3, queue=3 → 应补 3 个
+        ex.SetCorePoolSize(4);   // delta=3, queue=3 -> 3 more should be added
         SleepMs(200);
         Assert.Equal(4, ex.WorkerCount());
         Assert.Equal(0, ex.QueuedCount());
@@ -69,20 +68,20 @@ public class ConsumeExecutorTests
     [Fact]
     public void ExtraThreadRetiresAfterKeepAliveCoreThreadDoesNot()
     {
-        // > core 的线程空闲到 keepAlive 退出；<= core 的线程永不退出
+        // Threads above core exit after being idle for keepAlive; threads at or below core never exit
         var ex = new ConsumeExecutor(1, 4, keepAliveSeconds: 0.2);
         ex.Submit(() => { });
-        ex.SetCorePoolSize(2);   // 队列空 → 不补线程，core 变 2
+        ex.SetCorePoolSize(2);   // queue empty -> no extra thread, core becomes 2
         SleepMs(80);
         Assert.Equal(2, ex.GetCorePoolSize());
-        ex.Submit(() => { });    // 把 worker 抬到 2（仍 <= core）
+        ex.Submit(() => { });    // raise the worker to 2 (still <= core)
         SleepMs(80);
         Assert.Equal(2, ex.WorkerCount());
-        ex.SetCorePoolSize(1);   // core 降到 1 → 多出来的那个成为"超编"
-        SleepMs(700);            // 超过 keepAlive
+        ex.SetCorePoolSize(1);   // core drops to 1 -> the extra one becomes "over core"
+        SleepMs(700);            // longer than keepAlive
         Assert.Equal(1, ex.WorkerCount());
         SleepMs(400);
-        Assert.Equal(1, ex.WorkerCount());   // core 内线程不会退出
+        Assert.Equal(1, ex.WorkerCount());   // a thread within core does not exit
         ex.Shutdown(true);
     }
 
@@ -96,7 +95,7 @@ public class ConsumeExecutorTests
         Assert.Equal(1, ex.WorkerCount());
         var ran = new ManualResetEventSlim(false);
         ex.Submit(ran.Set);
-        Assert.True(ran.Wait(TimeSpan.FromSeconds(3)));   // 同一个 worker 还能继续干活
+        Assert.True(ran.Wait(TimeSpan.FromSeconds(3)));   // the same worker can still work
         ex.Shutdown(true);
     }
 
@@ -120,9 +119,9 @@ public class ConsumeExecutorTests
             busy.Set();
             release.Wait();
         });
-        Assert.True(busy.Wait(5000), "worker 没跑起来");
-        ex.Submit(() => release.Wait()); // 队列第 1 格
-        ex.Submit(() => release.Wait()); // 队列第 2 格 = 满
+        Assert.True(busy.Wait(5000), "the worker did not start");
+        ex.Submit(() => release.Wait()); // queue slot 1
+        ex.Submit(() => release.Wait()); // queue slot 2 = full
         Assert.Equal(2, ex.QueuedCount());
         var e = Assert.Throws<RejectedExecutionException>(() => ex.Submit(() => { }));
         Assert.Contains("queue is full", e.Message);
@@ -171,7 +170,7 @@ public class ConsumeExecutorTests
             Thread.Sleep(10);
         }
 
-        Assert.False(cond(), "条件未在 5s 内成立");
+        Assert.False(cond(), "the condition was not met within 5s");
     }
 
     [Fact]
@@ -216,7 +215,7 @@ public class ConsumeExecutorTests
         ex.Shutdown(true);
     }
 
-    // ------------------------------------------------ 消费者侧（不联网）
+    // ------------------------------------------------ Consumer side (no networking)
 
     [Fact]
     public void LegacyDefaults()
@@ -237,12 +236,12 @@ public class ConsumeExecutorTests
         Assert.False(c.UpdateCorePoolSize(0));
         Assert.False(c.UpdateCorePoolSize(-1));
         Assert.False(c.UpdateCorePoolSize(20));     // == consumeThreadMax
-        Assert.True(c.UpdateCorePoolSize(19));      // 刚好低于 max
+        Assert.True(c.UpdateCorePoolSize(19));      // just below max
         Assert.Equal(19, c.GetCorePoolSize());
-        // Short.MAX_VALUE 上界：要把 consumeThreadMax 抬上去才轮得到这条守卫
+        // The Short.MAX_VALUE upper bound: consumeThreadMax has to be raised for this guard to be reached
         c.SetConsumeThreadMax(40000);
         Assert.False(c.UpdateCorePoolSize(32768));  // above Short.MAX_VALUE
-        Assert.True(c.UpdateCorePoolSize(32767));   // 上界本身合法
+        Assert.True(c.UpdateCorePoolSize(32767));   // the upper bound itself is legal
         Assert.Equal(32767, c.GetCorePoolSize());
     }
 
@@ -253,7 +252,7 @@ public class ConsumeExecutorTests
         Assert.Equal(20, c.ConsumeThreadMax);
         Assert.False(c.UpdateCorePoolSize(30));
         Assert.False(c.UpdateCorePoolSize(21));
-        Assert.Equal(20, c.GetCorePoolSize());      // 一个都没落下去
+        Assert.Equal(20, c.GetCorePoolSize());      // not one got through
         c.SetConsumeThreadMax(30);
         Assert.True(c.UpdateCorePoolSize(25));
         Assert.Equal(25, c.GetCorePoolSize());
@@ -267,7 +266,7 @@ public class ConsumeExecutorTests
         Assert.Equal(4, c.ConsumeThreadMin);
         Assert.Equal(4, c.ConsumeThreadMax);
         Assert.Equal(4, c.GetCorePoolSize());
-        Assert.False(c.UpdateCorePoolSize(4));      // max 现在是 4
+        Assert.False(c.UpdateCorePoolSize(4));      // max is 4 now
         Assert.True(c.UpdateCorePoolSize(3));
         Assert.Equal(3, c.GetCorePoolSize());
     }
@@ -283,7 +282,7 @@ public class ConsumeExecutorTests
         Assert.Equal(8, c.GetCorePoolSize());
         c.SetConsumeThreadMin(0);
         c.SetConsumeThreadMax(-5);
-        Assert.Equal(1, c.ConsumeThreadMin);        // 钳到 1
+        Assert.Equal(1, c.ConsumeThreadMin);        // clamped to 1
         Assert.Equal(1, c.ConsumeThreadMax);
     }
 
@@ -291,12 +290,12 @@ public class ConsumeExecutorTests
     public void ExecutorObservabilityWithoutStart()
     {
         var c = new DefaultMQPushConsumer("GID_ThreadPoolUnit");
-        // 未 Start（未建执行器）时观测值恒为 0，不应崩
+        // While not Started (no executor built yet) the observed value is always 0, it must not crash
         Assert.Equal(0, c.ConsumeExecutorWorkers());
         Assert.Equal(0, c.ConsumeExecutorQueued());
     }
 
-    // ------------------------------------------------ msgAccCnt / 阈值
+    // ------------------------------------------------ msgAccCnt / thresholds
 
     [Fact]
     public void MsgAccCntIsMaxOffsetMinusLastQueueOffset()
@@ -320,7 +319,7 @@ public class ConsumeExecutorTests
     public void MsgAccCntIgnoresMissingOrGarbageProperty()
     {
         var c = new DefaultMQPushConsumer("GID_ThreadPoolUnit");
-        c.UpdateMsgAccCnt("k1", new List<MessageExt> { MakeMsg(10, null) });      // 缺属性
+        c.UpdateMsgAccCnt("k1", new List<MessageExt> { MakeMsg(10, null) });      // property missing
         Assert.Equal(0, c.MsgAccCnt("k1"));
         c.UpdateMsgAccCnt("k1", new List<MessageExt> { MakeMsg(10, "not-a-number") });
         Assert.Equal(0, c.MsgAccCnt("k1"));
@@ -331,7 +330,7 @@ public class ConsumeExecutorTests
     {
         var c = new DefaultMQPushConsumer("GID_ThreadPoolUnit");
         c.UpdateMsgAccCnt("k1", new List<MessageExt> { MakeMsg(10, "500") });
-        c.UpdateMsgAccCnt("k1", new List<MessageExt> { MakeMsg(400, "450") });   // 新一批积压变小
+        c.UpdateMsgAccCnt("k1", new List<MessageExt> { MakeMsg(400, "450") });   // a new, smaller backlog
         Assert.Equal(50, c.MsgAccCnt("k1"));
     }
 
@@ -350,15 +349,15 @@ public class ConsumeExecutorTests
     {
         var c = new DefaultMQPushConsumer("GID_ThreadPoolUnit");
         c.SetAdjustThreadPoolNumsThreshold(100);
-        c.UpdateMsgAccCnt("a", new List<MessageExt> { MakeMsg(0, "500") });      // 500 >= 100 → inc 分支
+        c.UpdateMsgAccCnt("a", new List<MessageExt> { MakeMsg(0, "500") });      // 500 >= 100 -> inc branch
         int before = c.GetCorePoolSize();
         c.AdjustThreadPool();
-        Assert.Equal(before, c.GetCorePoolSize());  // inc 是空实现
+        Assert.Equal(before, c.GetCorePoolSize());  // inc is an empty implementation
         c.SetAdjustThreadPoolNumsThreshold(1000);
-        c.UpdateMsgAccCnt("a", new List<MessageExt> { MakeMsg(0, "10") });       // 10 < 800 → dec 分支
+        c.UpdateMsgAccCnt("a", new List<MessageExt> { MakeMsg(0, "10") });       // 10 < 800 -> dec branch
         c.AdjustThreadPool();
-        Assert.Equal(before, c.GetCorePoolSize());  // dec 也是空实现
-        // 自动 no-op ≠ API 失效
+        Assert.Equal(before, c.GetCorePoolSize());  // dec is an empty implementation too
+        // an automatic no-op != a broken API
         Assert.True(c.UpdateCorePoolSize(11));
         Assert.Equal(11, c.GetCorePoolSize());
     }
@@ -366,15 +365,15 @@ public class ConsumeExecutorTests
     [Fact]
     public void UpdateCorePoolSizePropagatesToInjectedExecutor()
     {
-        // 通过内部注入执行器验证"显式 API 真的会落到执行器上"（不用起集群）
+        // Verifying "the explicit API really does reach the executor" via internal executor injection (no cluster needed)
         var c = new DefaultMQPushConsumer("GID_ThreadPoolUnit");
         using var ex = new ConsumeExecutor(20, 64, keepAliveSeconds: 30);
         c.PopConsumeExecutorForTest = ex;
         Assert.Equal(20, c.GetCorePoolSize());
-        Assert.True(c.UpdateCorePoolSize(13));      // < 默认 max 20，能落下去
+        Assert.True(c.UpdateCorePoolSize(13));      // < the default max 20, it gets through
         Assert.Equal(13, ex.GetCorePoolSize());
         Assert.Equal(13, c.GetCorePoolSize());
-        Assert.False(c.UpdateCorePoolSize(20));     // 守卫仍按 consumeThreadMax 判
+        Assert.False(c.UpdateCorePoolSize(20));     // the guard still judges by consumeThreadMax
         Assert.Equal(13, ex.GetCorePoolSize());
         c.SetConsumeThreadMax(40);
         Assert.True(c.UpdateCorePoolSize(33));

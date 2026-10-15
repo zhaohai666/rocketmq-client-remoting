@@ -1,9 +1,9 @@
-// 消息编解码（已对真实 5.5.1 集群验证），两条**互不可混用**的路径：
-//   1) 17 段存储格式：EncodeMessageExt / DecodeMessage / DecodeMessages（broker 写入与 pull 返回）；
-//   2) 6 段轻量格式：EncodeMessage / EncodeMessages / DecodeBatchMessage / DecodeBatchMessages（批量 body）。
+// Message encode/decode (verified against a real 5.5.1 cluster), two **mutually non-interchangeable** paths:
+//   1) 17-segment storage format: EncodeMessageExt / DecodeMessage / DecodeMessages (broker write and pull return);
+//   2) 6-segment lightweight format: EncodeMessage / EncodeMessages / DecodeBatchMessage / DecodeBatchMessages (batch body).
 //
 //
-// 17 段存储格式字段顺序与偏移（大端，单位字节）：
+// Field order and offsets of the 17-segment storage format (big-endian, in bytes):
 //   0  TOTALSIZE(4)
 //   4  MAGICCODE(4, v1=-626843481 / v2=-626843477)
 //   8  BODYCRC(4)
@@ -28,7 +28,7 @@ namespace RocketMQ.Common;
 
 public static class MessageDecoder
 {
-    // 占位：C# 侧统一使用 UTF-8。
+    // Placeholder: the C# side uniformly uses UTF-8.
     private const int CharsetUtf8Separator = 0;
     private const byte NameValueSeparator = 1;
     private const byte PropertySeparator = 2;
@@ -45,15 +45,15 @@ public static class MessageDecoder
     public const int SysflagPosition = 4 + 4 + 4 + 4 + 4 + 8 + 8;
     public const int MessageStoreTimestampPosition = 56;
 
-    // ---------------------------------------------------------------- 基础工具
+    // ---------------------------------------------------------------- Basic utilities
 
-    // IP + port -> 8B(v4) / 20B(v6)，与 broker 侧 InetSocketAddress 编码一致。
+    // IP + port -> 8B(v4) / 20B(v6), consistent with the broker-side InetSocketAddress encoding.
     public static byte[] IpAndPortToBytes(string ip, int port, bool v6 = false)
     {
         byte[] addr;
         if (!UtilAll.IpToBytes(ip, v6, out addr))
         {
-            // 非法 IP 回退 127.0.0.1（保持长度与调用方期望一致）。
+            // Fall back to 127.0.0.1 for illegal IP (keep length consistent with caller expectations).
             UtilAll.IpToBytes("127.0.0.1", false, out addr);
             if (v6)
             {
@@ -67,7 +67,7 @@ public static class MessageDecoder
         return outBuf.ToArray();
     }
 
-    // 8B / 20B -> (ip, port)。
+    // 8B / 20B -> (ip, port).
     public static bool BytesToIpAndPort(byte[] raw, out string ip, out int port)
     {
         ip = string.Empty;
@@ -101,7 +101,7 @@ public static class MessageDecoder
 
     public static string Bytes2String(byte[] bs) => UtilAll.Bytes2String(bs);
 
-    // ------------------------------------------------------- 属性串 <-> Map
+    // ------------------------------------------------------- Property string <-> Map
 
     public static string MessagePropertiesToString(PropertyMap properties)
     {
@@ -153,7 +153,7 @@ public static class MessageDecoder
 
     // ---------------------------------------------------------------- msgId
 
-    // ip+port(8 或 20B) + 8B commitLogOffset -> 大写十六进制 msgId。
+    // ip+port(8 or 20B) + 8B commitLogOffset -> uppercase hex msgId.
     public static string CreateMessageId(byte[] addrBytes, long offset)
     {
         var raw = new ByteWriter(addrBytes.Length + 8);
@@ -184,7 +184,7 @@ public static class MessageDecoder
         return true;
     }
 
-    // ------------------------------------------- 1) 17 段存储格式：MessageExt
+    // ------------------------------------------- 1) 17-segment storage format: MessageExt
 
     public static byte[] EncodeMessageExt(MessageExt messageExt, bool needCompress = false)
     {
@@ -367,7 +367,7 @@ public static class MessageDecoder
         }
     }
 
-    // 消息流 -> MessageExt 列表（对应 MessageDecoder.decodes，用于 pull 结果）。
+    // Message stream -> MessageExt list (corresponds to MessageDecoder.decodes, used for pull results).
     public static List<MessageExt> DecodeMessages(byte[] raw, bool readBody = true)
     {
         var result = new List<MessageExt>();
@@ -398,7 +398,7 @@ public static class MessageDecoder
         return result;
     }
 
-    // --------------------------------------- 2) 6 段轻量格式：批量消息 body
+    // --------------------------------------- 2) 6-segment lightweight format: batch message body
 
     public static byte[] EncodeMessage(Message message)
     {
@@ -410,7 +410,7 @@ public static class MessageDecoder
 
         var buf = new ByteWriter();
         buf.WriteInt32(storeSize);                                     // 1 TOTALSIZE
-        buf.WriteInt32(0);                                             // 2 MAGICCODE（批量场景固定 0）
+        buf.WriteInt32(0);                                             // 2 MAGICCODE (fixed 0 in batch scenario)
         buf.WriteInt32(0);                                             // 3 BODYCRC
         buf.WriteInt32(message.Flag);                                  // 4 FLAG
         buf.WriteInt32(body.Length);                                   // 5 BODY
@@ -518,9 +518,9 @@ public static class MessageDecoder
         return count;
     }
 
-    // ---------------------------------------------------------------- 内部辅助
+    // ---------------------------------------------------------------- Internal helpers
 
-    // 压缩：仅在 needCompress 且 sysFlag 已置 COMPRESSED_FLAG 时执行。
+    // Compression: only performed when needCompress is true and sysFlag already has COMPRESSED_FLAG set.
     private static byte[] MaybeCompress(byte[] body, bool needCompress, int sysFlag)
     {
         if (!needCompress)

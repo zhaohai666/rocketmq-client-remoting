@@ -224,9 +224,9 @@ const (
 	// delayLevel 3 = 10s on the broker's default messageDelayLevel table
 	// ("1s 5s 10s 30s 1m ..."). The consumer-side assertion tolerates clock
 	// rounding, hence >= 8s rather than >= 10s.
-	delayLevel           = 3
-	delayLevelMinMillis  = 8000
-	timerDeliverAheadMs  = 5000
+	delayLevel            = 3
+	delayLevelMinMillis   = 8000
+	timerDeliverAheadMs   = 5000
 	timerDeliverMinMillis = 3000
 )
 
@@ -280,10 +280,10 @@ func main() {
 // no session credentials must come back as broker response code 16
 // (NO_PERMISSION), not merely "some error".
 func runUncredentialedProbe(ns, topic, group string) {
-	fmt.Println("---- A0 无凭据负向探测（必须先跑：hook 属于实例、只在实例首建时装载）----")
+	fmt.Println("---- A0 uncredentialed negative probe (must run first: hook belongs to instance, loaded only when instance is first created) ----")
 	p, err := client.NewDefaultMQProducer(group + "_NoAuth")
 	if err != nil {
-		check("无凭据发送被拒绝(NO_PERMISSION=16)", false, " producer build: "+err.Error())
+		check("uncredentialed send rejected (NO_PERMISSION=16)", false, " producer build: "+err.Error())
 		return
 	}
 	p.SetNameServerAddresses([]string{ns})
@@ -291,25 +291,25 @@ func runUncredentialedProbe(ns, topic, group string) {
 	p.SetSendMsgTimeout(3000)
 	p.SetRetryTimesWhenSendFailed(0)
 	if err := p.Start(); err != nil {
-		check("无凭据发送被拒绝(NO_PERMISSION=16)", false, " start: "+err.Error())
+		check("uncredentialed send rejected (NO_PERMISSION=16)", false, " start: "+err.Error())
 		return
 	}
 	defer p.Shutdown()
 
 	res, err := p.Send(common.NewMessage(topic, []byte("go-acl-must-be-rejected")))
 	if err == nil {
-		check("无凭据发送被拒绝(NO_PERMISSION=16)", false,
-			fmt.Sprintf(" 竟然被接受 msgId=%s（集群没有强制 ACL？）", res.MsgID))
+		check("uncredentialed send rejected (NO_PERMISSION=16)", false,
+			fmt.Sprintf(" unexpectedly accepted msgId=%s (cluster did not enforce ACL?)", res.MsgID))
 		return
 	}
 	code, remark := brokerErrorParts(err)
-	check("无凭据发送被拒绝(NO_PERMISSION=16)", code == remoting.RespNoPermission,
+	check("uncredentialed send rejected (NO_PERMISSION=16)", code == remoting.RespNoPermission,
 		fmt.Sprintf(" code=%d remark=%q", code, remark))
 }
 
 // sendPhase boots one credentialed producer and exercises every send path.
 func sendPhase(ns string, hook remoting.RPCHook, group, mainTopic, tagTopic, orderTopic, msgKey string) {
-	fmt.Println("\n---- B 有凭据发送：全部消息类型 ----")
+	fmt.Println("\n---- B credentialed sends: all message types ----")
 	p, err := client.NewDefaultMQProducer(group)
 	if err != nil {
 		fatal("producer: %v", err)
@@ -322,7 +322,7 @@ func sendPhase(ns string, hook remoting.RPCHook, group, mainTopic, tagTopic, ord
 		fatal("producer start: %v", err)
 	}
 	defer p.Shutdown()
-	check("ACL 生产者启动（签名心跳/路由）", true, "")
+	check("ACL producer started (signed heartbeat/route)", true, "")
 
 	// B1 sync normal + keys + user property
 	syncMsg := common.NewMessage(mainTopic, []byte("acl-sync"))
@@ -330,7 +330,7 @@ func sendPhase(ns string, hook remoting.RPCHook, group, mainTopic, tagTopic, ord
 	syncMsg.SetKeys(msgKey)
 	syncMsg.PutProperty("x-go-acl-prop", "passed-through")
 	res, err := p.Send(syncMsg)
-	check("同步发送(SEND_MESSAGE)", err == nil && res != nil && res.SendStatus == client.SendOK,
+	check("sync send (SEND_MESSAGE)", err == nil && res != nil && res.SendStatus == client.SendOK,
 		detail(res, err))
 
 	// B2 async with callback
@@ -342,22 +342,22 @@ func sendPhase(ns string, hook remoting.RPCHook, group, mainTopic, tagTopic, ord
 		ExceptFn:  func(e error) { aerr <- e },
 	}
 	if err := p.SendAsync(asyncMsg, cb); err != nil {
-		check("异步发送(回调提交)", false, " err="+err.Error())
+		check("async send (callback commit)", false, " err="+err.Error())
 	} else {
 		select {
 		case r := <-out:
-			check("异步发送(回调返回 SEND_OK)", r.SendStatus == client.SendOK,
+			check("async send (callback returns SEND_OK)", r.SendStatus == client.SendOK,
 				fmt.Sprintf(" status=%s msgId=%s", r.SendStatus, r.MsgID))
 		case e := <-aerr:
-			check("异步发送(回调返回 SEND_OK)", false, " err="+e.Error())
+			check("async send (callback returns SEND_OK)", false, " err="+e.Error())
 		case <-time.After(15 * time.Second):
-			check("异步发送(回调返回 SEND_OK)", false, " 回调 15s 内没回来")
+			check("async send (callback returns SEND_OK)", false, " callback did not return within 15s")
 		}
 	}
 
 	// B3 oneway
 	owErr := p.SendOneway(common.NewMessage(mainTopic, []byte("acl-oneway")), nil)
-	check("单向发送(ONEWAY) 本地无错误", owErr == nil, errText(owErr))
+	check("oneway send (ONEWAY) no local error", owErr == nil, errText(owErr))
 
 	// B4 batch (SEND_BATCH_MESSAGE)
 	batch := make([]*common.Message, 0, 3)
@@ -366,7 +366,7 @@ func sendPhase(ns string, hook remoting.RPCHook, group, mainTopic, tagTopic, ord
 			[]byte(fmt.Sprintf("acl-batch-%d", i))))
 	}
 	bres, err := p.SendBatch(batch)
-	check("批量发送(SEND_BATCH_MESSAGE) 3 条", err == nil && bres != nil && bres.SendStatus == client.SendOK,
+	check("batch send (SEND_BATCH_MESSAGE) 3 messages", err == nil && bres != nil && bres.SendStatus == client.SendOK,
 		detail(bres, err))
 
 	// B5 delay level — the level itself only needs to be accepted here;
@@ -375,7 +375,7 @@ func sendPhase(ns string, hook remoting.RPCHook, group, mainTopic, tagTopic, ord
 	delayMsg := common.NewMessage(mainTopic, []byte("acl-delay"))
 	delayMsg.SetDelayTimeLevel(delayLevel)
 	dres, err := p.Send(delayMsg)
-	check("延时消息(LEVEL "+strconv.Itoa(delayLevel)+") 发送", err == nil && dres != nil && dres.SendStatus == client.SendOK,
+	check("delay message (LEVEL "+strconv.Itoa(delayLevel)+") sent", err == nil && dres != nil && dres.SendStatus == client.SendOK,
 		detail(dres, err))
 
 	// B6 scheduled/timer message — TIMER_DELIVER_MS 5s ahead.
@@ -383,7 +383,7 @@ func sendPhase(ns string, hook remoting.RPCHook, group, mainTopic, tagTopic, ord
 	timerMsg.PutProperty(common.PropertyTimerDeliverMs,
 		strconv.FormatInt(time.Now().UnixMilli()+timerDeliverAheadMs, 10))
 	tres, err := p.Send(timerMsg)
-	check("定时消息(TIMER_DELIVER_MS+5s) 发送", err == nil && tres != nil && tres.SendStatus == client.SendOK,
+	check("scheduled message (TIMER_DELIVER_MS+5s) sent", err == nil && tres != nil && tres.SendStatus == client.SendOK,
 		detail(tres, err))
 
 	// B7 transaction: half message -> ExecuteLocalTransaction(COMMIT) ->
@@ -391,7 +391,7 @@ func sendPhase(ns string, hook remoting.RPCHook, group, mainTopic, tagTopic, ord
 	txListener := &commitListener{}
 	txMsg := common.NewMessage(mainTopic, []byte("acl-tx"))
 	txRes, err := p.SendMessageInTransaction(txMsg, txListener, nil)
-	check("事务消息 半消息->提交(END_TRANSACTION=COMMIT)",
+	check("transaction message half->commit (END_TRANSACTION=COMMIT)",
 		err == nil && txRes != nil && txRes.LocalTransactionState == client.CommitMessage && txListener.count() == 1,
 		txDetail(txRes, err, txListener))
 
@@ -407,7 +407,7 @@ func sendPhase(ns string, hook remoting.RPCHook, group, mainTopic, tagTopic, ord
 			tagOK++
 		}
 	}
-	check("标签消息 4 条(2xTagA 2xTagB) 发送", tagOK == 4, fmt.Sprintf(" ok=%d", tagOK))
+	check("tag messages 4 (2xTagA 2xTagB) sent", tagOK == 4, fmt.Sprintf(" ok=%d", tagOK))
 
 	// B9 orderly send through the queue selector: 5 messages, same arg, must
 	//     land on one queue in send order.
@@ -429,16 +429,16 @@ func sendPhase(ns string, hook remoting.RPCHook, group, mainTopic, tagTopic, ord
 		}
 		ordOK++
 	}
-	check("顺序消息 5 条(选择器) 发送", ordOK == 5,
+	check("orderly messages 5 (selector) sent", ordOK == 5,
 		fmt.Sprintf(" ok=%d%s", ordOK, ordFail))
-	check("顺序消息 同 arg 落同一队列", ordOK == 5 && allSame, " queue="+first)
+	check("orderly messages same arg lands same queue", ordOK == 5 && allSame, " queue="+first)
 }
 
 // consumePhase starts three credentialed push consumers and asserts the
 // read-back of everything the send phase wrote.
 func consumePhase(ns string, hook remoting.RPCHook, mainTopic, tagTopic, orderTopic,
 	mainGroup, tagGroup, orderGroup, msgKey string) {
-	fmt.Println("\n---- C 有凭据消费：读回并断言全部消息类型 ----")
+	fmt.Println("\n---- C credentialed consumption: read back and assert all message types ----")
 
 	// C1 main topic: all 9 messages, incl. delay/timer/tx/oneway read-back.
 	mainCol := &concurrentCollector{}
@@ -466,41 +466,41 @@ func consumePhase(ns string, hook remoting.RPCHook, mainTopic, tagTopic, orderTo
 			missing = append(missing, w)
 		}
 	}
-	check("全部 9 条消息被消费读回", gotAll && len(missing) == 0,
+	check("all 9 messages consumed and read back", gotAll && len(missing) == 0,
 		fmt.Sprintf(" got=%d missing=%v", mainCol.count(), missing))
 
 	// oneway has no send-side receipt: the read-back IS its proof of arrival.
 	if m, ok := mainCol.find("acl-oneway"); ok {
-		check("单向发送的消息真实落盘(读回)", true, fmt.Sprintf(" offsetMsgId=%s", m.OffsetMsgID))
+		check("oneway message truly persisted (read back)", true, fmt.Sprintf(" offsetMsgId=%s", m.OffsetMsgID))
 	} else {
-		check("单向发送的消息真实落盘(读回)", false, " 没读到 acl-oneway")
+		check("oneway message truly persisted (read back)", false, " acl-oneway not read")
 	}
 
 	// user property + keys + tag pass-through on the sync message.
 	if m, ok := mainCol.find("acl-sync"); ok {
 		prop, _ := m.GetProperty("x-go-acl-prop")
-		check("用户自定义属性透传", prop == "passed-through", fmt.Sprintf(" x-go-acl-prop=%q", prop))
+		check("user-defined property passthrough", prop == "passed-through", fmt.Sprintf(" x-go-acl-prop=%q", prop))
 		keys, _ := m.GetProperty(common.PropertyKeys)
-		check("消息 KEYS 透传", keys == msgKey, fmt.Sprintf(" KEYS=%q want=%q", keys, msgKey))
+		check("message KEYS passthrough", keys == msgKey, fmt.Sprintf(" KEYS=%q want=%q", keys, msgKey))
 		tags, _ := m.GetProperty(common.PropertyTags)
-		check("消息 TAGS 透传", tags == "aclTag", fmt.Sprintf(" TAGS=%q", tags))
+		check("message TAGS passthrough", tags == "aclTag", fmt.Sprintf(" TAGS=%q", tags))
 	} else {
-		skip("用户自定义属性透传", " (acl-sync 未被消费，无法检查属性)")
+		skip("user-defined property passthrough", " (acl-sync not consumed, cannot check property)")
 	}
 
 	// the committed transaction message must be consumable like any normal
 	// message — that is what proves half -> COMMIT -> END_TRANSACTION worked.
 	if m, ok := mainCol.find("acl-tx"); ok {
-		check("事务消息提交后可被消费(读回)", true, fmt.Sprintf(" msgId=%s", m.MsgID))
+		check("transaction message consumable after commit (read back)", true, fmt.Sprintf(" msgId=%s", m.MsgID))
 	} else {
-		check("事务消息提交后可被消费(读回)", false, " 没读到 acl-tx")
+		check("transaction message consumable after commit (read back)", false, " acl-tx not read")
 	}
 
 	// delay level: the broker only releases the message after the level has
 	// elapsed; store_timestamp is the release append, born_timestamp the send.
-	assertDelay(mainCol, "acl-delay", delayLevelMinMillis, "延时消息 store-born >= 8s(LEVEL 3=10s)")
+	assertDelay(mainCol, "acl-delay", delayLevelMinMillis, "delay message store-born >= 8s (LEVEL 3=10s)")
 	// timer: TIMER_DELIVER_MS 5s ahead -> release ~5s after the send.
-	assertDelay(mainCol, "acl-timer", timerDeliverMinMillis, "定时消息 store-born >= 3s(预投递 5s)")
+	assertDelay(mainCol, "acl-timer", timerDeliverMinMillis, "scheduled message store-born >= 3s (deliver-ahead 5s)")
 
 	// C2 tag filtering: exactly the two TagA messages, never a TagB.
 	tagCol := &concurrentCollector{}
@@ -521,7 +521,7 @@ func consumePhase(ns string, hook remoting.RPCHook, mainTopic, tagTopic, orderTo
 	_, hit2 := tset["acl-tag-hit-2"]
 	_, miss1 := tset["acl-tag-miss-1"]
 	_, miss2 := tset["acl-tag-miss-2"]
-	check("TAG 过滤消费：只收到 TagA 2 条、TagB 0 条",
+	check("tag filtering consumption: only TagA 2 received, TagB 0",
 		hit1 && hit2 && !miss1 && !miss2 && tagCol.count() == 2,
 		fmt.Sprintf(" got=%d bodies=%v", tagCol.count(), sortedKeys(tset)))
 
@@ -554,24 +554,24 @@ func consumePhase(ns string, hook remoting.RPCHook, mainTopic, tagTopic, orderTo
 			}
 		}
 	}
-	check("顺序消费收到 5 条", gotOrder && len(recs) == 5, fmt.Sprintf(" got=%d", len(recs)))
-	check("顺序消费全在同一队列且 offset 递增", oneQueue && offsetsAsc,
+	check("orderly consumption received 5 messages", gotOrder && len(recs) == 5, fmt.Sprintf(" got=%d", len(recs)))
+	check("orderly consumption all on same queue with increasing offset", oneQueue && offsetsAsc,
 		fmt.Sprintf(" queue=%s same=%v offsetsAsc=%v", recs0Name(recs), oneQueue, offsetsAsc))
-	check("顺序消费保持发送顺序 acl-order-0..4", bodiesAsc, "")
+	check("orderly consumption preserves send order acl-order-0..4", bodiesAsc, "")
 }
 
 // adminPhase proves the server-side KEYS index query over the ACL hook.
 func adminPhase(ns string, hook remoting.RPCHook, mainTopic, msgKey string) {
-	fmt.Println("\n---- D 管理端：按 KEYS 查询 ----")
+	fmt.Println("\n---- D admin: query by KEYS ----")
 	admin := client.NewDefaultMQAdminExt(hook)
 	admin.SetInstanceName("GoAclAdmin")
 	admin.SetNameServerAddresses([]string{ns})
 	if err := admin.Start(); err != nil {
-		check("ACL 管理端启动", false, err.Error())
+		check("ACL admin started", false, err.Error())
 		return
 	}
 	defer admin.Shutdown()
-	check("ACL 管理端启动", true, "")
+	check("ACL admin started", true, "")
 
 	// The broker's index build service flushes on its own cadence, so poll.
 	var found []*common.MessageExt
@@ -584,11 +584,11 @@ func adminPhase(ns string, hook remoting.RPCHook, mainTopic, msgKey string) {
 		}
 		time.Sleep(2 * time.Second)
 	}
-	check("按 KEYS 服务端查询命中", qerr == nil && len(found) >= 1,
+	check("server-side KEYS query hit", qerr == nil && len(found) >= 1,
 		fmt.Sprintf(" n=%d err=%v", len(found), qerr))
 	if len(found) >= 1 {
 		body := string(found[0].Body)
-		check("KEYS 查询返回的消息正确", body == "acl-sync", fmt.Sprintf(" body=%q", body))
+		check("KEYS query returned correct message", body == "acl-sync", fmt.Sprintf(" body=%q", body))
 	}
 }
 
@@ -619,7 +619,7 @@ func (l ordConsListener) ConsumeMessage(msgs []*common.MessageExt,
 func assertDelay(col *concurrentCollector, body string, minMillis int64, name string) {
 	m, ok := col.find(body)
 	if !ok {
-		check(name, false, " 没读到 "+body)
+		check(name, false, " not read: "+body)
 		return
 	}
 	delta := m.StoreTimestamp - m.BornTimestamp

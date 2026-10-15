@@ -22,8 +22,8 @@ def test_try_acquire_times_out_without_raising():
     began = time.monotonic()
     assert sem.try_acquire(1, 120) is False
     elapsed_ms = int((time.monotonic() - began) * 1000)
-    assert 100 <= elapsed_ms < 1000, "超时不该提前返回，也不该无限等"
-    # 超时的人已经出队，不会把后面的人永久挡在一个已经消失的请求上
+    assert 100 <= elapsed_ms < 1000, "a timeout should not return early, nor wait forever"
+    # The timed-out party has left the queue and will not permanently block those behind it on a vanished request
     sem.release(1)
     assert sem.try_acquire(1, 0) is True
 
@@ -35,23 +35,23 @@ def test_non_positive_timeout_never_waits():
 
 
 def test_only_the_queue_head_is_granted():
-    """公平模式的全部意义：排在别人后面的请求**不许**插队，哪怕许可现在够它。"""
+    """The whole point of fair mode: a request queued behind others must **not** jump the queue, even if permits are now sufficient for it."""
     sem = FairSemaphore(2)
-    assert sem.try_acquire(2, 0) is True          # 掏空
+    assert sem.try_acquire(2, 0) is True          # drained
     acquired: list = []
     big = threading.Thread(target=lambda: acquired.append(
         ("big", sem.try_acquire(2, 5000))))
     big.start()
     _wait_until(lambda: len(sem._queue) == 1)
-    # 现在空闲 0、队首是一个要 2 个的大请求。还 1 个只够小请求 —— 它必须等。
+    # Now 0 free, and the head is a big request wanting 2. Returning 1 is only enough for the small request — it must wait.
     small = threading.Thread(target=lambda: acquired.append(
         ("small", sem.try_acquire(1, 300))))
     small.start()
     _wait_until(lambda: len(sem._queue) == 2)
     sem.release(1)
     small.join(5.0)
-    assert ("small", False) in acquired, "队首还没满足时后来者插队了"
-    sem.release(1)                               # 补齐队首要的 2 个
+    assert ("small", False) in acquired, "a later arrival jumped the queue before the head was satisfied"
+    sem.release(1)                               # top up to the 2 the head wants
     big.join(5.0)
     assert ("big", True) in acquired
 
@@ -76,14 +76,14 @@ def test_release_wakes_the_head_in_order():
     sem.release(1)
     sem.release(1)
     _wait_threads(threads)
-    # 队列顺序就是醒来顺序（公平信号量的可观察承诺）
+    # Queue order is wake-up order (the observable promise of a fair semaphore)
     assert order == ["a", "b"]
 
 
 def test_set_total_permits_keeps_outstanding_work():
     pass
     sem = FairSemaphore(10)
-    assert sem.try_acquire(4, 0) is True          # 在途 4
+    assert sem.try_acquire(4, 0) is True          # 4 in flight
     sem.set_total_permits(15)
     assert sem.available_permits() == 11          # 15 - 4
     assert sem.total_permits() == 15
@@ -110,23 +110,23 @@ def test_shrink_wakes_someone_blocked_on_the_old_capacity():
     waiter = threading.Thread(target=lambda: got.append(sem.try_acquire(1, 5000)))
     waiter.start()
     _wait_until(lambda: len(sem._queue) == 1)
-    sem.set_total_permits(5)                     # 扩容
-    sem.release(1)                               # 在途的那份还回去
+    sem.set_total_permits(5)                     # expand
+    sem.release(1)                               # return the in-flight share
     waiter.join(5.0)
     assert got == [True]
 
 
 def test_a_granted_head_still_feeds_the_waiter_behind_it():
-    """队首拿走许可之后，剩下的空闲如果够后面的人，他必须最终拿到。
+    """After the head takes the permits, the remaining free capacity must eventually be enough for the person behind it.
 
-    这里锁的是「一次 release 只放一个」这件事不会发生：空闲 6、队首要 5、第二个人要 1，
-    两个人都该拿到，且都不该等到超时。（``try_acquire`` 拿到许可后还会再 ``notify_all``
-    一次，为的是另一种更刁的排布 —— 第二个人是在那次通知**之后**才排上队的，就没人再喊过他，
-    只能靠队首离场时补这一嗓子。那个窗口在本用例里没法稳定复现，所以这里的断言只覆盖
-    「都被叫醒」这一半，另一半的回归守卫是下面那个超时退出的用例。）
+    What is locked in here is that "one release only lets one through" does not happen: 6 free, the head wants 5, the second wants 1,
+    both should get their permits, and neither should wait until timeout. (``try_acquire`` calls ``notify_all`` once more after
+    acquiring, for a different, trickier arrangement — the second person queues up only *after* that notification, so nobody calls out to it again,
+    and it can only rely on this extra shout when the head leaves. That window cannot be reproduced reliably in this test,
+    so the assertions here only cover the "both woken" half; the regression guard for the other half is the timeout-exit case below.)
     """
     sem = FairSemaphore(6)
-    assert sem.try_acquire(5, 0) is True           # 在途 5，空闲 1
+    assert sem.try_acquire(5, 0) is True           # 5 in flight, 1 free
     outcome: list = []
     lock = threading.Lock()
     began = time.monotonic()
@@ -139,29 +139,29 @@ def test_a_granted_head_still_feeds_the_waiter_behind_it():
     head = threading.Thread(target=_waiter, args=("head", 5, 3000))
     head.start()
     _wait_until(lambda: len(sem._queue) == 1)
-    # 空闲 1 个，够第二个人 —— 但公平模式下它必须等队首先走
+    # 1 free, enough for the second person — but in fair mode it must wait for the head to leave first
     second = threading.Thread(target=_waiter, args=("second", 1, 3000))
     second.start()
     _wait_until(lambda: len(sem._queue) == 2)
-    sem.release(5)                                 # 空闲 1 → 6：队首这就够了
+    sem.release(5)                                 # free 1 → 6: the head now has enough
     _wait_threads([head, second])
     got = {tag: (ok, ms) for tag, ok, ms in outcome}
     assert got["head"][0] is True
-    assert got["second"][0] is True, "队首拿走许可后，第二个人被丢下了（丢唤醒）"
-    # 拿到许可不该花掉整个预算：睡到超时说明根本没被叫醒
+    assert got["second"][0] is True, "after the head took the permits, the second was left behind (lost wakeup)"
+    # Getting the permit should not burn the whole budget: sleeping until timeout means it was never woken
     assert got["second"][1] < 2000, "second waited %dms" % got["second"][1]
     assert sem.available_permits() == 0            # 6 - 5 - 1
 
 
 def test_a_timed_out_head_wakes_the_waiter_behind_it():
-    """队首**超时退出**也是一次队首换人：它要的许可数超过总容量时，后面的人本来能过。
+    """A head that **times out** is also a head change: when it wants more permits than the total capacity, the person behind it could have passed.
 
-    这条是丢唤醒的回归守卫（少了离场时的那次 ``notify_all``，second 会一路睡满 3000ms）：
-    真机上对应的表现是异步发送白等满预算，再回调一个 ``semaphoreAsyncNum timeout``，
-    而许可其实早就空出来了。
+    This is the regression guard for lost wakeups (without that extra ``notify_all`` on exit, second would sleep the full 3000ms):
+    the real-world symptom is an async send burning its whole budget for nothing, then a ``semaphoreAsyncNum timeout`` callback,
+    even though the permits were freed long ago.
     """
     sem = FairSemaphore(3)
-    assert sem.try_acquire(3, 0) is True           # 掏空
+    assert sem.try_acquire(3, 0) is True           # drained
     outcome: list = []
     lock = threading.Lock()
     began = time.monotonic()
@@ -171,18 +171,18 @@ def test_a_timed_out_head_wakes_the_waiter_behind_it():
         with lock:
             outcome.append((tag, got, int((time.monotonic() - began) * 1000)))
 
-    # 队首要 4 个 > 总量 3：它永远拿不到，只能等满自己的 200ms 预算
+    # The head wants 4 > total 3: it can never acquire, only burn its full 200ms budget
     head = threading.Thread(target=_waiter, args=("head", 4, 200))
     head.start()
     _wait_until(lambda: len(sem._queue) == 1)
     second = threading.Thread(target=_waiter, args=("second", 1, 3000))
     second.start()
     _wait_until(lambda: len(sem._queue) == 2)
-    sem.release(3)                                 # 空闲够 second，但队首是那个贪心的
+    sem.release(3)                                 # free is enough for second, but the head is the greedy one
     _wait_threads([head, second], timeout=5.0)
     got = {tag: (ok, ms) for tag, ok, ms in outcome}
-    assert got["head"][0] is False, "要得比总量还多，本该拿不到"
-    assert got["second"][0] is True, "队首退出后没被叫醒（丢唤醒）"
+    assert got["head"][0] is False, "asking for more than the total should never succeed"
+    assert got["second"][0] is True, "not woken after the head exited (lost wakeup)"
     assert got["second"][1] < 2000, "second waited %dms" % got["second"][1]
 
 
@@ -208,5 +208,5 @@ def _wait_until(predicate, timeout: float = 3.0) -> None:
     deadline = time.monotonic() + timeout
     while not predicate():
         if time.monotonic() > deadline:
-            raise AssertionError("等待条件超时")
+            raise AssertionError("timed out waiting for condition")
         time.sleep(0.005)

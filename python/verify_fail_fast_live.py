@@ -25,10 +25,10 @@ BROKER_CTL = os.path.join(ROOT, "scripts", "rmq_test_broker.sh")
 TOPIC = "FailFastPy_%d" % int(time.time() * 1000)
 GROUP = "fail_fast_py_" + TOPIC
 
-# 客户端侧超时故意放到 30s：判死若走的是超时路径，至少要等这么久。
+# The client-side timeout is deliberately 30s: if death detection went through the timeout path it would have to wait at least this long.
 CLIENT_TIMEOUT_MILLIS = 30000
 BROKER_SUSPEND_MILLIS = 20000
-# failFast 应当是毫秒级；留 8s 给真机调度（EOF 到达 + 回调投递）。
+# failFast should be millisecond-scale; allow 8s for real-machine scheduling (EOF arrival + callback delivery).
 FAIL_FAST_LIMIT_SECONDS = 8.0
 BASELINE_MSGS = 5
 
@@ -47,11 +47,11 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 
 def broker_ctl(action: str) -> tuple:
-    """跑 scripts/rmq_test_broker.sh，返回 (returncode, 输出)。
+    """Run scripts/rmq_test_broker.sh and return (returncode, output).
 
-    输出走**文件**而不是管道：start 会把 broker 拉成常驻进程，管道的写端被它继承，
-    ``subprocess`` 就要等到写端全部关闭才返回 —— 表现为脚本明明已经打印结果，
-    调用方还是卡死。文件重定向没有这个问题。
+    Output goes to a file, not a pipe: start turns the broker into a resident process which inherits the pipe's write end,
+    so ``subprocess`` will not return until every write end is closed -- this shows up as the script having already printed its result
+    while the caller is still stuck. File redirection has no such problem.
     """
     out_path = "/tmp/rmq_fail_fast_broker_ctl.%s.log" % action
     with open(out_path, "w") as fh:
@@ -68,8 +68,8 @@ def send_ok(producer: DefaultMQProducer, tag: str, timeout: int = 5000):
 
 
 def parked_pull_request(group: str, mq, queue_offset: int) -> RemotingCommand:
-    """手工构造一条 suspend=True 的长轮询：不经 pull consumer 的钳制，
-    30s 客户端超时与 20s broker suspend 都由本脚本说了算。"""
+    """Hand-build a long-poll request with suspend=True: bypassing the pull consumer's clamps,
+    both the 30s client timeout and the 20s broker suspend are decided by this script."""
     header = PullMessageRequestHeader()
     header.consumer_group = group
     header.topic = mq.topic
@@ -91,7 +91,7 @@ def parked_pull_request(group: str, mq, queue_offset: int) -> RemotingCommand:
 def main() -> int:
     code, out = broker_ctl("status")
     if code != 0:
-        print("broker 没在跑：先按本地集群 runbook 起 namesrv + broker（%s）" % out)
+        print("broker is not running: start namesrv + broker first per the local cluster runbook (%s)" % out)
         return 2
 
     producer = DefaultMQProducer(GROUP + "_p")
@@ -107,35 +107,35 @@ def main() -> int:
         producer.start()
         results = [send_ok(producer, "base-%d" % i) for i in range(BASELINE_MSGS)]
         landed = sum(1 for r in results if r.send_status == SendStatus.SEND_OK)
-        check("L1 基线：%d 条同步发送 SEND_OK" % BASELINE_MSGS, landed == BASELINE_MSGS,
+        check("L1 baseline: %d synchronous sends SEND_OK" % BASELINE_MSGS, landed == BASELINE_MSGS,
               "landed=%d" % landed)
 
         consumer.start()
         queues = consumer.fetch_subscribe_message_queues(TOPIC)
-        check("L1 取到队列", bool(queues), "queues=%d" % len(queues))
+        check("L1 got the queues", bool(queues), "queues=%d" % len(queues))
         if not queues:
             return 1
         mq = queues[0]
         client = consumer._mq_client
         broker_addr = client.find_broker_addr_in_route(client.get_topic_route_data(TOPIC),
                                                       mq.broker_name)
-        check("L1 拿到 broker 地址", bool(broker_addr), "addr=%s" % broker_addr)
+        check("L1 got the broker address", bool(broker_addr), "addr=%s" % broker_addr)
         if not broker_addr:
             return 1
         max_offset = consumer.max_offset(mq)
-        check("L1 待挂长轮询的队列有位点可用", max_offset is not None,
+        check("L1 the queue to park the long-poll on has a usable offset", max_offset is not None,
               "mq=%s max_offset=%s" % (mq, max_offset))
         if max_offset is None:
             return 1
-        # 发送是跨队列轮转的，单条队列的队尾只覆盖落在它上面的那部分，
-        # 所以"5 条真的落盘"要看全部队列的合计。
+        # Sends rotate across queues, so a single queue's tail only covers the part that landed on it,
+        # which is why "all 5 really landed" must be judged by the sum across all queues.
         total_max_offset = max_offset
         for q in queues[1:]:
             other = consumer.max_offset(q)
             if other is not None:
                 total_max_offset += other
-        check("L1 各队列队尾位点合计覆盖刚发的 %d 条（真的落盘）" % BASELINE_MSGS,
-              total_max_offset >= BASELINE_MSGS, "max_offset 合计=%d" % total_max_offset)
+        check("L1 the summed queue tail offsets cover the %d just sent (really landed)" % BASELINE_MSGS,
+              total_max_offset >= BASELINE_MSGS, "max_offset sum=%d" % total_max_offset)
 
         # ------------------------------------------------------------------ L2
         remoting = client.remoting_client
@@ -150,7 +150,7 @@ def main() -> int:
             try:
                 resp = remoting.invoke_sync(broker_addr, req, CLIENT_TIMEOUT_MILLIS)
                 outcome, err = "response:%s" % resp.code, None
-            except BaseException as e:  # noqa: BLE001 - 要的就是异常类型
+            except BaseException as e:  # noqa: BLE001 - we want the exception type
                 outcome, err = type(e).__name__, e
             cost = time.monotonic() - started
             with park_lock:
@@ -163,66 +163,66 @@ def main() -> int:
             t.start()
         time.sleep(2.0)
         still_parked = sum(1 for t in threads if t.is_alive())
-        check("L2 三条长轮询真的挂在 broker 上（2s 后仍未返回）", still_parked == 3,
+        check("L2 the three long-polls really parked on the broker (still not returned after 2s)", still_parked == 3,
               "parked=%d" % still_parked)
         inflight = len(remoting._response_table)
-        check("L2 在途表里有它们", inflight >= baseline_in_flight + 3,
+        check("L2 they are in the in-flight table", inflight >= baseline_in_flight + 3,
               "in_flight=%d (baseline=%d)" % (inflight, baseline_in_flight))
         kill_at = time.monotonic()
 
         # ------------------------------------------------------------------ L3
         code, out = broker_ctl("stop")
-        check("L3 停掉 broker", code == 0, out.replace("\n", " | "))
+        check("L3 stop the broker", code == 0, out.replace("\n", " | "))
         got_all = park_done.wait(60.0)
         for t in threads:
             t.join(1.0)
-        check("L3 挂起的长轮询全部返回（没有卡死）", got_all and len(parked) == 3,
+        check("L3 all parked long-polls returned (nothing got stuck)", got_all and len(parked) == 3,
               "got=%d" % len(parked))
         types = sorted({p[1] for p in parked})
         send_fail = [p for p in parked if p[1] == "RemotingSendRequestException"]
         timeout_like = [p for p in parked if "Timeout" in p[1]]
-        check("L3 报的是 RemotingSendRequestException（failFast 的口径）",
+        check("L3 the error reported is RemotingSendRequestException (the failFast criterion)",
               len(send_fail) == 3, "types=%s" % types)
-        check("L3 一条都没被报成超时（类型错 = 重试决策错）", not timeout_like,
+        check("L3 none was reported as a timeout (wrong type = wrong retry decision)", not timeout_like,
               "timeout=%d" % len(timeout_like))
         worst = max((p[2] for p in parked), default=0.0)
-        check("L3 判死耗时远小于 %ds 客户端超时" % (CLIENT_TIMEOUT_MILLIS // 1000),
+        check("L3 death-detection time far below the %ds client timeout" % (CLIENT_TIMEOUT_MILLIS // 1000),
               worst < FAIL_FAST_LIMIT_SECONDS,
               "worst=%.2fs limit=%.0fs" % (worst, FAIL_FAST_LIMIT_SECONDS))
         if send_fail:
-            check("L3 异常文案带着断连原因", "connection closed" in str(send_fail[0][3]),
+            check("L3 the exception message carries the disconnect reason", "connection closed" in str(send_fail[0][3]),
                   str(send_fail[0][3]))
         left = len(remoting._response_table)
-        check("L3 判死之后在途表排空", left < inflight, "in_flight=%d" % left)
+        check("L3 the in-flight table drains after death detection", left < inflight, "in_flight=%d" % left)
 
         # ------------------------------------------------------------------ L4
         try:
             req = RemotingCommand.create_request_command(
                 RequestCode.GET_ALL_TOPIC_LIST_FROM_NAMESERVER, None)
             resp = remoting.invoke_sync(NAMESRV, req, 3000)
-            check("L4 namesrv 连接没被牵连（broker 死了它还在服务）",
+            check("L4 the namesrv connection is not affected (the broker died but it still serves)",
                   resp.code == ResponseCode.SUCCESS, "code=%s" % resp.code)
         except BaseException as e:  # noqa: BLE001
-            check("L4 namesrv 连接没被牵连（broker 死了它还在服务）", False, repr(e))
+            check("L4 the namesrv connection is not affected (the broker died but it still serves)", False, repr(e))
 
         # ------------------------------------------------------------------ L5
         code, out = broker_ctl("start")
-        check("L5 broker 重新拉起", code == 0, out.replace("\n", " | ")[:160])
+        check("L5 the broker is brought back up", code == 0, out.replace("\n", " | ")[:160])
         recovered, err = None, None
         deadline = time.monotonic() + 150.0
         while time.monotonic() < deadline:
             try:
                 recovered = send_ok(producer, "after-restart")
                 break
-            except BaseException as e:  # noqa: BLE001 - 恢复窗口内允许失败
+            except BaseException as e:  # noqa: BLE001 - failures are allowed within the recovery window
                 err, recovered = e, None
                 time.sleep(2.0)
-        check("L5 同一个 producer 实例重新建连后照常发送",
+        check("L5 the same producer instance sends normally after reconnecting",
               recovered is not None and recovered.send_status == SendStatus.SEND_OK,
               "" if recovered else repr(err))
 
-        # 已经拿到 SEND_OK 的消息必须还在：快速失败不能把已落地的说成丢了。
-        # 重启后路由要重新注册，失败就重试几次。
+        # Messages that already got SEND_OK must still be there: fail-fast must not claim already-landed messages as lost.
+        # After the restart the route must re-register, so retry a few times on failure.
         total_after, tried = 0, 0
         while tried < 10:
             tried += 1
@@ -232,11 +232,11 @@ def main() -> int:
                     total_after += consumer.max_offset(q) or 0
                 if total_after >= BASELINE_MSGS:
                     break
-            except BaseException:  # noqa: BLE001 - 路由还没回来
+            except BaseException:  # noqa: BLE001 - the route is not back yet
                 pass
             time.sleep(2.0)
-        check("L5 重启后 broker 上仍有那 %d 条 SEND_OK 的消息" % BASELINE_MSGS,
-              total_after >= BASELINE_MSGS, "max_offset 合计=%d" % total_after)
+        check("L5 the broker still has those %d SEND_OK messages after the restart" % BASELINE_MSGS,
+              total_after >= BASELINE_MSGS, "max_offset sum=%d" % total_after)
     finally:
         for t in threads:
             if t.is_alive():
@@ -249,14 +249,14 @@ def main() -> int:
             producer.shutdown()
         except BaseException:  # noqa: BLE001
             pass
-        # 中途抛异常也不能把集群留在停机状态：这条脚本借用了大家的测试集群。
+        # An exception midway must not leave the cluster stopped: this script borrows everyone's test cluster.
         try:
             if broker_ctl("status")[0] != 0:
-                print("  [WARN] 收尾时 broker 仍停着，重新拉起")
+                print("  [WARN] the broker is still down during cleanup, bringing it back up")
                 code, out = broker_ctl("start")
                 print("  [WARN] broker start: %s" % out.replace("\n", " | ")[:160])
         except BaseException as e:  # noqa: BLE001
-            print("  [WARN] 收尾拉起 broker 失败：%r（需手工重启，见本地集群 runbook）" % e)
+            print("  [WARN] failed to bring the broker back up during cleanup: %r (a manual restart is needed, see the local cluster runbook)" % e)
 
     print("\n%d PASS / %d FAIL" % (PASS, FAIL))
     return 0 if FAIL == 0 else 1

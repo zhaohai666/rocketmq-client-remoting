@@ -1,10 +1,10 @@
-//! 心跳报文模型：`ProducerData` / `ConsumerData` / `HeartbeatData`，以及
-//! `ConsumerData.subscriptionDataSet` 需要的 [`SubscriptionData`]。
+//! Heartbeat payload models: `ProducerData` / `ConsumerData` / `HeartbeatData`, plus
+//! the [`SubscriptionData`] needed by `ConsumerData.subscriptionDataSet`.
 //!
-//! ## 为什么本层自带 `SubscriptionData`
+//! ## Why this layer carries its own `SubscriptionData`
 //!
 //!
-//! ## 报文细节
+//! ## Payload details
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -14,7 +14,7 @@ use super::admin_body::{expect_object, jarray, jboolean, jlong, json_object, jst
 use super::serialize::RemotingSerializable;
 use crate::error::{Error, Result};
 
-/// `System.currentTimeMillis()`：`subVersion` 的默认值来源。
+/// `System.currentTimeMillis()`: the source of the `subVersion` default.
 pub fn now_millis() -> i64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(d) => d.as_millis() as i64,
@@ -22,14 +22,14 @@ pub fn now_millis() -> i64 {
     }
 }
 
-// ---------------------------------------------------------------- 枚举常量
+// ---------------------------------------------------------------- enum constants
 
 pub struct ConsumeType;
 
 impl ConsumeType {
-    /// 主动消费（pull 客户端）
+    /// Active consumption (pull client)
     pub const CONSUME_ACTIVELY: &'static str = "CONSUME_ACTIVELY";
-    /// 被动消费（push 客户端）
+    /// Passive consumption (push client)
     pub const CONSUME_PASSIVELY: &'static str = "CONSUME_PASSIVELY";
     pub const CONSUME_POP: &'static str = "CONSUME_POP";
 }
@@ -76,7 +76,7 @@ pub struct SubscriptionData {
 
 impl Default for SubscriptionData {
     fn default() -> Self {
-        // subVersion 取当前毫秒时间戳。
+        // subVersion takes the current millisecond timestamp.
         SubscriptionData {
             class_filter_mode: false,
             topic: String::new(),
@@ -98,7 +98,7 @@ impl SubscriptionData {
         }
     }
 
-    /// 一次性设置 tag 集合与对应哈希集合：**去重 + 升序**（顺序会进报文）。
+    /// Sets the tag set and the matching hash set in one go: **dedup + ascending** (the order goes into the payload).
     pub fn set_tags(&mut self, tags: Vec<String>, codes: Vec<i32>) {
         let mut tags: Vec<String> = tags;
         tags.sort();
@@ -146,7 +146,7 @@ impl SubscriptionData {
         }
         let mut code_set: Vec<i32> = Vec::new();
         for item in jarray(value, "codeSet")? {
-            // broker 回的 codeSet 里数字和数字字符串都会出现，两种都读。
+            // The broker's codeSet contains both numbers and numeric strings; read both.
             let code = match item {
                 Value::Number(n) => n
                     .as_i64()
@@ -164,7 +164,7 @@ impl SubscriptionData {
         code_set.sort();
         code_set.dedup();
         Ok(SubscriptionData {
-            // classFilterMode 缺省为 false（只认真值 true / 非零）
+            // classFilterMode defaults to false (only a real true / nonzero counts)
             class_filter_mode: jboolean(value, "classFilterMode", false),
             topic: jstring_or(value, "topic", ""),
             sub_string: jstring_or(value, "subString", ""),
@@ -183,7 +183,7 @@ pub struct FilterAPI;
 impl FilterAPI {
     pub const SUB_ALL: &'static str = "*";
 
-    /// 按订阅表达式构造订阅数据。
+    /// Builds subscription data from a subscription expression.
     pub fn build_subscription_data(
         topic: &str,
         sub_string: Option<&str>,
@@ -212,7 +212,7 @@ impl FilterAPI {
                 codes.push(crate::common::util_all::java_string_hash(tag));
             }
         }
-        // set_tags 负责去重 + 升序。
+        // set_tags takes care of dedup + ascending order.
         sub.set_tags(tags, codes);
         Ok(sub)
     }
@@ -293,7 +293,7 @@ impl ConsumerData {
         }
     }
 
-    /// 加入订阅（集合语义：重复元素会被折叠掉）。
+    /// Adds a subscription (set semantics: duplicates are folded away).
     pub fn add_subscription_data(&mut self, data: SubscriptionData) {
         if !self.subscription_data_set.contains(&data) {
             self.subscription_data_set.push(data);
@@ -350,9 +350,9 @@ pub struct HeartbeatData {
     pub client_id: String,
     pub producer_data_set: Vec<ProducerData>,
     pub consumer_data_set: Vec<ConsumerData>,
-    /// 只读：编码时恒写 0（见模块头的说明）。
+    /// Read-only: always written as 0 when encoding (see the module header).
     pub heartbeat_fingerprint: i64,
-    /// 只读：编码时恒写 `false`。
+    /// Read-only: always written as `false` when encoding.
     pub without_sub: bool,
 }
 
@@ -373,7 +373,7 @@ impl HeartbeatData {
         }
     }
 
-    /// 集合语义：重复 group / 重复 consumer 会被折叠。
+    /// Set semantics: duplicate groups / duplicate consumers are folded.
     pub fn add_producer_data(&mut self, data: ProducerData) {
         if !self.producer_data_set.contains(&data) {
             self.producer_data_set.push(data);
@@ -441,7 +441,7 @@ impl HeartbeatData {
     }
 }
 
-/// 把 `subscriptionDataSet` 之外的标量字段读出来，供上层日志/调试用。
+/// Reads out the scalar fields other than `subscriptionDataSet`, for upper-layer logging/debugging.
 pub fn consumer_data_summary(data: &ConsumerData) -> String {
     format!(
         "ConsumerData [groupName={}, consumeType={}, messageModel={}, consumeFromWhere={}]",
@@ -465,13 +465,13 @@ mod tests {
         let text = RemotingSerializable::to_json_string(&sd.to_json_value());
         assert!(text.contains(r#""classFilterMode":false"#));
         assert!(text.contains(r#""subString":"TagA||TagB"#));
-        assert!(text.contains(r#""subVersion":1700000000000"#), "subVersion 必须是整数");
+        assert!(text.contains(r#""subVersion":1700000000000"#), "subVersion must be an integer");
         assert!(text.contains(r#""expressionType":"TAG""#));
         assert!(text.contains(r#""topic":"TopicProbe""#));
         assert!(text.contains(r#""tagsSet":["TagA","TagB"]"#));
         assert!(text.contains(r#""codeSet":[2598919,2598920]"#));
         assert!(!text.contains("filterClassSource"));
-        assert!(!text.contains("class_filter_mode"), "不得出现 snake_case 键");
+        assert!(!text.contains("class_filter_mode"), "no snake_case keys allowed");
         assert_eq!(SubscriptionData::from_json_value(&sd.to_json_value()).unwrap(), sd);
 
         let mut other = sd.clone();
@@ -482,12 +482,12 @@ mod tests {
     #[test]
     fn subscription_data_sub_version_defaults_to_now() {
         let fresh = SubscriptionData::default();
-        assert!(fresh.sub_version > 1_600_000_000_000, "默认应为当前毫秒量级");
+        assert!(fresh.sub_version > 1_600_000_000_000, "default should be on the order of current milliseconds");
         assert_eq!(fresh.expression_type, "TAG");
         assert!(fresh.tags_set.is_empty() && fresh.code_set.is_empty());
     }
 
-    /// 心跳 JSON 的逐字节守卫：键序与字段都按报文钉死。
+    /// Byte-for-byte guard of the heartbeat JSON: key order and fields are pinned to the payload.
     #[test]
     fn heartbeat_exact_json_matches_fastjson2() {
         let mut hb = HeartbeatData::new("cid");
@@ -496,7 +496,7 @@ mod tests {
             RemotingSerializable::to_json_string(&hb.to_json_value()),
             r#"{"clientID":"cid","consumerDataSet":[],"heartbeatFingerprint":0,"producerDataSet":[{"groupName":"pg"}],"withoutSub":false}"#
         );
-        // 稳定：同一对象两次编码逐字节一致（集合有序，无随机成分）。
+        // Stable: encoding the same object twice is byte-for-byte identical (ordered sets, no randomness).
         assert_eq!(hb.encode(), hb.encode());
     }
 
@@ -513,7 +513,7 @@ mod tests {
         sd.sub_version = 1700000000000;
         cd.add_subscription_data(sd.clone());
         cd.add_subscription_data(sd);
-        assert_eq!(cd.subscription_data_set.len(), 1, "重复订阅被折叠（set 语义）");
+        assert_eq!(cd.subscription_data_set.len(), 1, "duplicate subscription folded (set semantics)");
         let text = RemotingSerializable::to_json_string(&cd.to_json_value());
         assert!(text.contains(r#""groupName":"cg_probe""#));
         assert!(text.contains(r#""consumeType":"CONSUME_PASSIVELY""#));
@@ -521,8 +521,8 @@ mod tests {
         assert!(text.contains(r#""consumeFromWhere":"CONSUME_FROM_LAST_OFFSET""#));
         assert!(text.contains(r#""unitMode":false"#));
         assert!(text.contains(r#""subscriptionDataSet":["#));
-        assert!(!text.contains("consumeTimestamp"), "服务端 5.x 无此字段");
-        assert!(!text.contains("maxReconsumeTimes"), "服务端 5.x 无此字段");
+        assert!(!text.contains("consumeTimestamp"), "server 5.x has no such field");
+        assert!(!text.contains("maxReconsumeTimes"), "server 5.x has no such field");
         assert_eq!(ConsumerData::from_json_value(&cd.to_json_value()).unwrap(), cd);
         assert_eq!(
             consumer_data_summary(&cd),
@@ -550,7 +550,7 @@ mod tests {
         assert!(text.contains(r#""clientID":"10.0.0.1@12345""#));
         assert!(text.contains(r#""heartbeatFingerprint":0"#));
         assert!(text.contains(r#""withoutSub":false"#));
-        assert!(!text.contains("isWithoutSub"), "写出用 withoutSub，不是 isWithoutSub");
+        assert!(!text.contains("isWithoutSub"), "writes withoutSub, not isWithoutSub");
 
         let decoded = HeartbeatData::decode(&full.encode()).unwrap();
         assert_eq!(decoded.client_id, full.client_id);
@@ -569,7 +569,7 @@ mod tests {
         let hb = HeartbeatData::decode(text.as_bytes()).unwrap();
         assert!(hb.without_sub);
         assert_eq!(hb.heartbeat_fingerprint, 7);
-        // 编码回到 V1 路径的固定值。
+        // Encoding goes back to the fixed V1-path values.
         let back = RemotingSerializable::to_json_string(&hb.to_json_value());
         assert!(back.contains(r#""heartbeatFingerprint":0"#));
         assert!(back.contains(r#""withoutSub":false"#));
@@ -579,15 +579,15 @@ mod tests {
     fn missing_and_tolerant_pieces() {
         let hb = HeartbeatData::decode(br#"{"clientID":"c","producerDataSet":null,"subscriptionDataSet":[{"topic":"T"}]}"#).unwrap();
         assert_eq!(hb, HeartbeatData::new("c"));
-        // 数字形式的布尔、字符串形式的数字都能读。
+        // Booleans in numeric form and numbers in string form both parse.
         let cd = ConsumerData::from_json_value(
             &serde_json::json!({"groupName":"g","unitMode":1,"subscriptionDataSet":[{"subVersion":"5","codeSet":["7"],"tagsSet":["A"],"classFilterMode":"no"}]}),
         )
         .unwrap();
-        assert!(cd.unit_mode, "数字 1 视为 true（宽松布尔语义）");
+        assert!(cd.unit_mode, "numeric 1 counts as true (lenient boolean semantics)");
         assert_eq!(cd.subscription_data_set[0].sub_version, 5);
         assert_eq!(cd.subscription_data_set[0].code_set, vec![7]);
-        assert!(!cd.subscription_data_set[0].class_filter_mode, "\"no\" 不是 true");
+        assert!(!cd.subscription_data_set[0].class_filter_mode, "\"no\" is not true");
     }
 
     #[test]
@@ -609,10 +609,10 @@ mod tests {
         }
     }
 
-    /// 黄金向量取自**线上记录的真实行为**，不是按规则手推的。
+    /// The golden vectors come from **real behavior recorded on the wire**, not hand-derived from rules.
     #[test]
     fn filter_api_matches_the_golden_reference_vector_by_vector() {
-        /// (用例名, 订阅表达式, 期望 subString, 期望 tagsSet, 期望 codeSet)
+        /// (case name, subscription expression, expected subString, expected tagsSet, expected codeSet)
         type Case = (&'static str, Option<&'static str>, &'static str, &'static [&'static str], &'static [i32]);
         let cases: &[Case] = &[
             ("none", None, "*", &[], &[]),
@@ -646,7 +646,7 @@ mod tests {
             assert_eq!(&sub.sub_string, sub_string, "{what} subString");
             assert_eq!(&sub.tags_set, tags, "{what} tagsSet");
             assert_eq!(&sub.code_set, codes, "{what} codeSet");
-            // 构建订阅数据时不会改写 expressionType / classFilterMode。
+            // Building subscription data does not rewrite expressionType / classFilterMode.
             assert_eq!(sub.expression_type, ExpressionType::TAG, "{what}");
             assert!(!sub.class_filter_mode, "{what}");
         }

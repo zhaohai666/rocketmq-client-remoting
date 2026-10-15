@@ -1,5 +1,6 @@
-// 复合且管理端不需要解释内容的字段（subscriptionTable / mqTable / statsList 等）
-// 一律用 JsonValue 透传，避免过度建模导致字段丢失。
+// Composite fields the admin side does not need to interpret (subscriptionTable / mqTable /
+// statsList, etc.) are always passed through as JsonValue, avoiding over-modeling that would
+// drop fields.
 using System.Globalization;
 using RocketMQ.Common;
 
@@ -35,7 +36,7 @@ public sealed class KvTable
 
 public sealed class TopicList
 {
-    // JSON 键是 "topicList"；C# 属性不能与类型同名，故改名 Topics
+    // The JSON key is "topicList"; a C# property cannot share the type's name, hence Topics
     public List<string> Topics { get; } = new();
     public string BrokerAddr { get; set; } = string.Empty;
     public bool HasBrokerAddr { get; set; }
@@ -216,10 +217,10 @@ public sealed class ClusterInfo
     public SortedDictionary<string, BrokerData> BrokerAddrTable { get; } = new();
     public SortedDictionary<string, List<string>> ClusterAddrTable { get; } = new();
 
-    /// <summary>收集所有 broker 地址（去重，按 brokerName、brokerId 顺序）。</summary>
+    /// <summary>Collects all broker addresses (deduplicated, ordered by brokerName then brokerId).</summary>
     public List<string> GetBrokerAddrs()
     {
-        // brokerAddrTable 已按 brokerName 排序，内层 brokerAddrs 也按 brokerId 排序
+        // brokerAddrTable is already sorted by brokerName; the inner brokerAddrs are sorted by brokerId too
         var addrs = new List<string>();
         foreach (var kv in BrokerAddrTable)
         {
@@ -236,7 +237,7 @@ public sealed class ClusterInfo
         return addrs;
     }
 
-    /// <summary>按集群名列出其下所有 broker 地址（clusterName 为空则返回全部）。</summary>
+    /// <summary>Lists all broker addresses under a cluster name (empty clusterName returns all).</summary>
     public List<string> GetBrokerAddrsOfCluster(string clusterName)
     {
         if (clusterName.Length == 0)
@@ -300,8 +301,8 @@ public sealed class ClusterInfo
     public static ClusterInfo FromJson(JsonValue v)
     {
         var ci = new ClusterInfo();
-        // 真实 RocketMQ 的 brokerAddrTable[name] 是 BrokerData 对象，
-        // 真正的 {brokerId: addr} 映射在其中的 brokerAddrs 字段下。
+        // In real RocketMQ, brokerAddrTable[name] is a BrokerData object, and the real
+        // {brokerId: addr} mapping lives in its brokerAddrs field.
         JsonValue? brokers = v.Find("brokerAddrTable");
         if (brokers is { IsObject: true })
         {
@@ -316,7 +317,7 @@ public sealed class ClusterInfo
         {
             foreach (var kv in clusters.ObjectItems())
             {
-                // 兼容两种写法：数组形式（标准）与字符串形式（个别老版本）
+                // Support both forms: array (standard) and string (a few old versions)
                 if (kv.Value.IsArray)
                 {
                     var names = new List<string>();
@@ -392,7 +393,7 @@ public sealed class ConsumerConnection
 {
     public List<Connection> ConnectionSet { get; } = new();
 
-    // 透传（Map<String, SubscriptionData>）
+    // pass-through (Map<String, SubscriptionData>)
     public JsonValue SubscriptionTable { get; set; } = JsonValue.Null;
 
     public string ConsumeType { get; set; } = string.Empty;
@@ -543,19 +544,19 @@ public sealed class ConsumerRunningInfo
 
     public PropertyMap Properties { get; set; } = new();
 
-    // 透传（List<SubscriptionData>）
+    // pass-through (List<SubscriptionData>)
     public JsonValue SubscriptionSet { get; set; } = JsonValue.Null;
 
-    // 透传（Map<MessageQueue, ProcessQueueInfo>）
+    // pass-through (Map<MessageQueue, ProcessQueueInfo>)
     public JsonValue MqTable { get; set; } = JsonValue.Null;
 
-    // 透传（Map<MessageQueue, ProcessQueueInfo>，POP 模式）
+    // pass-through (Map<MessageQueue, ProcessQueueInfo>, POP mode)
     public JsonValue MqPopTable { get; set; } = JsonValue.Null;
 
-    // 透传（Map<String, ConsumeStatus>）
+    // pass-through (Map<String, ConsumeStatus>)
     public JsonValue StatusTable { get; set; } = JsonValue.Null;
 
-    // 透传（Map<String, String>）
+    // pass-through (Map<String, String>)
     public JsonValue UserConsumerInfo { get; set; } = JsonValue.Null;
 
     public string Jstack { get; set; } = string.Empty;
@@ -615,7 +616,7 @@ public sealed class ConsumerRunningInfo
 
 public sealed class ConsumeStatsList
 {
-    // 透传
+    // pass-through
     public JsonValue StatsList { get; set; } = JsonValue.Null;
 
     public string BrokerAddr { get; set; } = string.Empty;
@@ -877,7 +878,7 @@ public sealed class ConsumeMessageDirectlyResult
     }
 }
 
-/// <summary>body 层字符串 map 编解码辅助。</summary>
+/// <summary>String map codec helper for the body layer.</summary>
 internal static class AdminJsonStrings
 {
     public static JsonValue MakeStringMap(PropertyMap m)

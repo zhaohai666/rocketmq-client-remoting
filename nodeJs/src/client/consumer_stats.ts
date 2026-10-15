@@ -1,36 +1,40 @@
 // -*- coding: utf-8 -*-
-// 消费端统计（ConsumerStatsManager + StatsItem/StatsItemSet/StatsSnapshot）。
+// Consumer-side stats (ConsumerStatsManager + StatsItem/StatsItemSet/StatsSnapshot).
 //
-// 真实的模型（**不是**"每分钟一个桶"这个名字暗示的样子）：
+// The real model (NOT what the "one bucket per minute" name suggests):
 //
-// * 一个 StatsItem 里维护**累计**的 value/times（只增不减），并挂两条采样快照链：
-//   `csListMinute`（每 10s 落一个累计点）和 `csListHour`（每 10 分钟落一个累计点）；
-// * 快照计算走 computeStatsData：
-//       sum       = last.value - first.value          (窗口差)
-//       tps       = sum * 1000.0 / (last.ts - first.ts)  (每秒)
+// * A StatsItem maintains CUMULATIVE value/times (monotonically increasing)
+//   with two sample-snapshot chains attached: `csListMinute` (one cumulative
+//   point every 10s) and `csListHour` (one cumulative point every 10 minutes);
+// * Snapshots are computed by computeStatsData:
+//       sum       = last.value - first.value          (window difference)
+//       tps       = sum * 1000.0 / (last.ts - first.ts)  (per second)
 //       timesDiff = last.times - first.times
-//       avgpt     = timesDiff > 0 ? sum / timesDiff : 0  ("平均每次") —— RT 类
-//                   指标上就是平均耗时（ms）
-// * TPS 类计数器走 addValue(key, msgs, 1)：value 累计消息数、times 累计调用次数 →
-//   tps = 每秒的调用（或消息）数；
-// * RT 类计数器走 addRTValue(key, rt, 1)：value 累计耗时 ms、times 累计调用次数
-//   → avgpt = 平均耗时；
-// * consumeStatus(group, topic) 除了 consumeFailedMsgs 之外全部读 MINUTE 快照；
-//   consumeFailedMsgs 取的是失败集合的 HOUR 窗口 sum ——**故意跨窗口**，是刻意的
-//   设计，别"顺手改正"。
+//       avgpt     = timesDiff > 0 ? sum / timesDiff : 0  ("per call") — on RT
+//                   metrics this is the average latency (ms)
+// * TPS counters go through addValue(key, msgs, 1): value accumulates the
+//   message count, times accumulates the call count →
+//   tps = calls (or messages) per second;
+// * RT counters go through addRTValue(key, rt, 1): value accumulates elapsed
+//   ms, times accumulates the call count → avgpt = average latency;
+// * consumeStatus(group, topic) reads the MINUTE snapshot for everything
+//   except consumeFailedMsgs; consumeFailedMsgs takes the failed set's
+//   HOUR-window sum — a DELIBERATE cross-window choice, do not "fix" it in
+//   passing.
 //
-// 实现细节的差异（语义一致）：每个 StatsItem 原本各自挂一个 10s/10min 采样器；这里
-// 用**管理器级别的一把**采样定时器统一遍历所有集合——采样精度不变（10s），少掉几十
-// 个定时器。
+// Implementation detail (semantics identical): originally each StatsItem had
+// its own 10s/10min sampler; here ONE manager-level sampling timer walks every
+// set uniformly — the sampling precision is unchanged (10s) while dozens of
+// timers are saved.
 import { ConsumeStatus } from '../remoting/bodies.ts';
 import { getLogger } from '../logging.ts';
 
 const logger = getLogger('consumer-stats');
 
-// 采样间隔：minute 每 10s 一点，hour 每 10min 一点。
+// Sampling interval: minute takes a point every 10s, hour every 10min.
 export const SAMPLING_INTERVAL_SECONDS = 10.0;
 export const HOUR_SAMPLING_INTERVAL_SECONDS = 600.0;
-// 快照链长度上限：约 60 个点 ≈ 10 分钟窗口（分钟链）。
+// Snapshot-chain length cap: about 60 points ≈ a 10-minute window (minute chain).
 const MINUTE_LIST_MAX = 60;
 const HOUR_LIST_MAX = 60;
 
@@ -47,7 +51,7 @@ interface SamplePoint {
   times: number;   // cumulative times
 }
 
-// 快照计算：窗口首尾差值 -> sum / tps / timesDiff / avgpt。
+// Snapshot computation: window first-vs-last difference -> sum / tps / timesDiff / avgpt.
 export function computeStatsData(csList: SamplePoint[]): StatsSnapshot {
   const ss = new StatsSnapshot();
   if (csList.length === 0) return ss;
@@ -169,14 +173,14 @@ export class ConsumerStatsManager {
     ];
   }
 
-  // start 本身只做定时器；采样精度保持 10s。
+  // start itself only sets up the timer; the sampling precision stays 10s.
   start(): void {
     if (this._timer != null) return;
     this._timer = setInterval(() => {
       try {
         this._rounds += 1;
         for (const s of this._sets) s.sampleAll();
-        if (this._rounds % 60 === 0) { // 60 × 10s = 10 minutes
+        if (this._rounds % 60 === 0) { // 60 x 10s = 10 minutes
           for (const s of this._sets) s.sampleHourAll();
         }
       } catch (e) {
@@ -198,7 +202,7 @@ export class ConsumerStatsManager {
     return `${topic}@${group}`;
   }
 
-  // ---- 记录接口：incPullRT / incPullTPS / incConsumeRT / incConsumeOKTPS / incConsumeFailedTPS ----
+  // ---- recording interface: incPullRT / incPullTPS / incConsumeRT / incConsumeOKTPS / incConsumeFailedTPS ----
   incPullRT(group: string, topic: string, rt: number): void {
     this.topicAndGroupPullRT.addValue(ConsumerStatsManager._key(topic, group), rt, 1);
   }
@@ -219,8 +223,9 @@ export class ConsumerStatsManager {
     this.topicAndGroupConsumeFailedTPS.addValue(ConsumerStatsManager._key(topic, group), msgs, 1);
   }
 
-  // consumeStatus：除 consumeFailedMsgs 外全部走 MINUTE 快照；consumeFailedMsgs
-  // 取失败集合的 HOUR 窗口 sum ——跨窗口是刻意设计，别自作主张改。
+  // consumeStatus: everything except consumeFailedMsgs uses the MINUTE
+  // snapshot; consumeFailedMsgs takes the failed set's HOUR-window sum — the
+  // cross-window is deliberate, do not change it unilaterally.
   consumeStatus(group: string, topic: string): ConsumeStatus {
     const cs = new ConsumeStatus();
     const key = ConsumerStatsManager._key(topic, group);

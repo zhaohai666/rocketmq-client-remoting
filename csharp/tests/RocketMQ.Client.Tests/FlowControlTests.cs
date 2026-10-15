@@ -1,4 +1,4 @@
-// 拉取前流控判定的单测 —— 不需要集群。
+// Unit tests for the pre-pull flow-control decision -- no cluster needed.
 using System.Globalization;
 
 using RocketMQ.Client;
@@ -30,7 +30,8 @@ public class FlowControlTests
     private static List<MessageExt> NSized(string topic, int storeSize, int n)
         => Enumerable.Range(0, n).Select(i => Sized(topic, storeSize, i)).ToList();
 
-    /// <summary>关掉除条数以外的所有闸门：先命中的那条会掩盖被测分支。</summary>
+    /// <summary>Turns off every gate except the message count: whichever one matches first
+    /// would mask the branch under test.</summary>
     private static void GatesOffExceptCounts(DefaultMQPushConsumer c)
     {
         c.PullThresholdForQueue = int.MaxValue;
@@ -40,7 +41,8 @@ public class FlowControlTests
         c.PullThresholdSizeForTopic = -1;
     }
 
-    /// <summary>把一批消息预置进某队列缓冲，并登记该队列已分配（topic 级阈值靠这张表聚合）。</summary>
+    /// <summary>Preloads a batch of messages into some queue's buffer and registers that
+    /// queue as assigned (the topic-level thresholds aggregate through this table).</summary>
     private static void Stage(DefaultMQPushConsumer c, MessageQueue mq, List<MessageExt> msgs)
     {
         string key = DefaultMQPushConsumer.OffsetKeyForTest(mq);
@@ -56,11 +58,11 @@ public class FlowControlTests
     {
         var c = new DefaultMQPushConsumer("GID_FlowControlDefaultsNet");
         var mq = QueueOf(Topic, 0);
-        // 默认 1000 条 / 100MiB / 跨度 2000，topic 级关闭：小缓冲一律不命中
+        // the defaults are 1000 messages / 100MiB / span 2000, and the topic level is off: a small buffer never matches
         Stage(c, mq, NSized(Topic, 100, 1));
         Assert.False(Hit(c, mq));
         Assert.Equal(0L, c.FlowControlTriggered);
-        // 缓冲为空（还没拉过任何消息）同样不命中，且跨度不能被算成负数
+        // An empty buffer (nothing pulled yet) does not match either, and the span must not come out negative
         Stage(c, mq, new List<MessageExt>());
         Assert.False(Hit(c, mq));
     }
@@ -79,7 +81,7 @@ public class FlowControlTests
         Assert.Equal(1L, c.FlowControlTriggered);
         c.PullThresholdForQueue = 0;
         Stage(c, mq, NSized(Topic, 100, 1));
-        Assert.True(Hit(c, mq), "PullThresholdForQueue=0 要按 1 条算（max(1,n) 守卫）");
+        Assert.True(Hit(c, mq), "PullThresholdForQueue=0 must be counted as 1 message (the max(1,n) guard)");
     }
 
     [Fact]
@@ -91,12 +93,12 @@ public class FlowControlTests
         c.PullThresholdSizeForQueue = 1;             // 1 MiB
         Stage(c, mq, NSized(Topic, 300, 3));         // 900 B
         Assert.False(Hit(c, mq));
-        // 单位是 MiB 而不是字节：正好 1 MiB 就算命中（>=）
+        // The unit is MiB rather than bytes: exactly 1 MiB counts as a match (>=)
         Stage(c, mq, new List<MessageExt> { Sized(Topic, MiB, 0) });
-        Assert.True(Hit(c, mq), "正好 1MiB 要命中（>=，不是 >）");
+        Assert.True(Hit(c, mq), "exactly 1MiB must match (>=, not >)");
         Stage(c, mq, NSized(Topic, 2 * MiB, 4));
         Assert.True(Hit(c, mq));
-        // 0 = 关闭这条闸门，再大的缓冲也不管
+        // 0 = this gate is off, no matter how large the buffer is
         c.PullThresholdSizeForQueue = 0;
         Assert.False(Hit(c, mq));
     }
@@ -111,14 +113,14 @@ public class FlowControlTests
         Stage(c, mq, new List<MessageExt> { Sized(Topic, 1, 0), Sized(Topic, 1, 100) });
         Assert.True(Hit(c, mq));
         c.ConsumeConcurrentlyMaxSpan = 100;
-        Assert.False(Hit(c, mq), "跨度 100 不严格大于 100，不该命中");
-        // 乱序缓冲也要量出真实跨度（min/max 而不是首尾差）
+        Assert.False(Hit(c, mq), "a span of 100 is not strictly greater than 100, it must not match");
+        // an out-of-order buffer must still measure the real span (min/max, not first-minus-last)
         c.ConsumeConcurrentlyMaxSpan = 10;
         Stage(c, mq, new List<MessageExt>
         {
             Sized(Topic, 1, 50), Sized(Topic, 1, 5), Sized(Topic, 1, 7),
         });
-        Assert.True(Hit(c, mq), "乱序缓冲要按 max-min 量跨度，不是首尾差");
+        Assert.True(Hit(c, mq), "an out-of-order buffer must measure the span as max-min, not first-minus-last");
         c.ConsumeConcurrentlyMaxSpan = 0;
         Assert.False(Hit(c, mq));
     }
@@ -132,17 +134,17 @@ public class FlowControlTests
         MessageQueue other = QueueOf(OtherTopic, 0);
         GatesOffExceptCounts(c);
         c.PullThresholdForTopic = 2;
-        // 单队列 1 条：topic 级也只看到 1 条
+        // a single queue with 1 message: the topic level only sees 1 message as well
         Stage(c, q0, NSized(Topic, 1, 1));
         Assert.False(Hit(c, q0));
-        // 同 topic 的兄弟队列各 1 条 ⇒ 累计 2 条，两条队列都必须停
+        // sibling queues of the same topic with 1 message each => 2 accumulated, and both queues must be stopped
         Stage(c, q1, NSized(Topic, 1, 1));
         Assert.True(Hit(c, q0));
         Assert.True(Hit(c, q1));
-        // 别的 topic 不许掺进来：把本 topic 降到 1 条，另一 topic 堆 5 条
+        // another topic must not be mixed in: drop this topic to 1 message and pile 5 onto the other topic
         Stage(c, q1, new List<MessageExt>());
         Stage(c, other, NSized(OtherTopic, 1, 5));
-        Assert.False(Hit(c, q0), "别的 topic 的缓冲不能算进本 topic 的累计");
+        Assert.False(Hit(c, q0), "another topic's buffer must not count towards this topic's total");
     }
 
     [Fact]
@@ -152,33 +154,33 @@ public class FlowControlTests
         MessageQueue q0 = QueueOf(Topic, 0);
         MessageQueue q1 = QueueOf(Topic, 1);
         GatesOffExceptCounts(c);
-        // 队列级字节闸门**关掉**（0），只留 topic 级：误用队列级开关当闸门会让这条静默失效
+        // the queue-level byte gate is **off** (0), only the topic level remains: misusing the queue-level switch as the gate makes this silently ineffective
         c.PullThresholdSizeForTopic = 1;
         Stage(c, q0, new List<MessageExt> { Sized(Topic, MiB / 2, 0) });
         Assert.False(Hit(c, q0));
         Stage(c, q1, new List<MessageExt> { Sized(Topic, 3 * MiB / 2, 0) });
-        Assert.True(Hit(c, q0), "队列级 size 闸门关掉时主题级 size 仍要生效");
+        Assert.True(Hit(c, q0), "with the queue-level size gate off the topic-level size must still apply");
         Assert.True(Hit(c, q1));
-        // 队列级那道还开着时先命中队列级（判定顺序：条数 → 字节 → 跨度 → topic 条数 → topic 字节）
+        // while the queue-level one is still on, the queue level matches first (decision order: count -> bytes -> span -> topic count -> topic bytes)
         c.PullThresholdSizeForQueue = 1;
         Stage(c, q0, new List<MessageExt> { Sized(Topic, 2 * MiB, 0) });
         long before = c.FlowControlTriggered;
         Assert.True(Hit(c, q0));
-        // 一次判定只记一格，即使多条闸门同时命中
+        // one decision records exactly one slot, even when several gates match at once
         Assert.Equal(before + 1, c.FlowControlTriggered);
     }
 
     [Fact]
     public void ReasonText_UsesMbUnitWithOneDecimal()
     {
-        // 日志里的数字格式锁定为 "%.1fMB"，断言按同一形状取数
+        // the number format in the log is locked to "%.1fMB", and the assertion parses in the same shape
         var c = new DefaultMQPushConsumer("GID_FlowControlFormatNet");
         var mq = QueueOf(Topic, 0);
         GatesOffExceptCounts(c);
         c.PullThresholdSizeForQueue = 1;
         Stage(c, mq, new List<MessageExt> { Sized(Topic, (3 * MiB) / 2, 0) });
         Assert.True(Hit(c, mq));
-        // 1.5MiB 在 InvariantCulture 下必须写成 "1.5MB"，不能带本地千分位或逗号小数点
+        // 1.5MiB must be written as "1.5MB" under InvariantCulture, with no local thousands separator or comma decimal point
         Assert.Equal("1.5", (1.5).ToString("F1", CultureInfo.InvariantCulture));
     }
 }

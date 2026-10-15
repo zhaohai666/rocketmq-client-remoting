@@ -17,7 +17,7 @@ class ClientErrorCode:
 
 
 class MQClientException(Exception):
-    """对应 MQClientException。response_code 非 0 时为 broker 侧错误码。"""
+    """Corresponds to MQClientException. When response_code is non-zero it is a broker-side error code."""
 
     def __init__(self, message: str = "", response_code: Optional[int] = None, cause: Optional[Exception] = None):
         super().__init__(message)
@@ -29,7 +29,7 @@ class MQClientException(Exception):
 
 
 class MQBrokerException(Exception):
-    """对应 MQBrokerException：broker 返回非 SUCCESS 码。"""
+    """Corresponds to MQBrokerException: the broker returned a non-SUCCESS code."""
 
     def __init__(self, response_code: int, error_message: str = ""):
         super().__init__(error_message)

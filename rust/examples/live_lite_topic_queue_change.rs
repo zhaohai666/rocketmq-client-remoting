@@ -1,22 +1,22 @@
-//! [`DefaultLitePullConsumer`] 的 topic 队列集合变更监听对**真实 5.5.1 broker** 的联调验证。
+//! Integration verification of the [`DefaultLitePullConsumer`] topic queue-set change listener against a **real 5.5.1 broker**.
 //!
-//! 用法（先按 runbook 起本地集群）：
+//! Usage (start the local cluster per the runbook first):
 //! ```text
 //! cargo run --example live_lite_topic_queue_change -- 127.0.0.1:9876
 //! ```
 //!
-//! 为什么必须真机：比对趟次每趟都现问 nameserver 取订阅队列集合，而普通路由缓存是 30s
-//! 才刷一次。假 nameserver 能证比对逻辑，只有真集群能证「现查」。这里把检查周期压到 1s
-//! 下限、路由轮询保持默认 30s，再把 topic 真的扩容：过了首查延迟的稳定期里，从 nameserver
-//! 报出新队列数到监听器收到回调只该隔一两趟检查（≤5s）；读 30s 缓存的话这个窗口会拖到半
-//! 分钟以上。
+//! Why a real cluster is required: every comparison round queries the name server afresh for the subscribed queue set, while the ordinary
+//! route cache only refreshes every 30s. A fake nameserver can prove the comparison logic; only a real cluster can prove the "fresh lookup".
+//! Here the check interval is pushed to its 1s floor, the route polling keeps the default 30s, and the topic is really scaled up:
+//! in the stable period after the first-lookup delay, from the name server reporting the new queue count to the listener receiving the callback
+//! only one or two check rounds should pass (≤5s); with a 30s cache read this window would stretch to half a minute or more.
 //!
-//! - L1 队列没动 ⇒ 监听器不被打扰
-//! - L1b 首查那趟真的跑过 ⇒ 依旧静默（运行中注册的快照不算变化）
-//! - L2 扩容 2→4：nameserver 认了之后回调紧跟几趟检查
-//! - L3 回调后快照推进 ⇒ 同一套队列不重复回调
-//! - L4 缩容 4→2：同样靠现查看到
-//! - L5 没建过的 topic：取不到队列算「查不到」，不伪装成缩到 0 队列
+//! - L1 queues untouched ⇒ the listener is not disturbed
+//! - L1b the first-lookup round really ran ⇒ still silent (the snapshot registered while running does not count as a change)
+//! - L2 scale up 2→4: once the name server acknowledges, the callback follows within a few check rounds
+//! - L3 after the callback the snapshot advances ⇒ the same queue set is not reported twice
+//! - L4 scale down 4→2: also seen via the fresh lookup
+//! - L5 never-created topic: failing to fetch queues counts as "not found", not disguised as scaled down to 0 queues
 
 use std::collections::BTreeSet;
 use std::env;
@@ -35,11 +35,11 @@ use rocketmq_client_remoting::remoting::protocol::route::TopicRouteData;
 
 const BASE_QUEUES: i32 = 2;
 const SCALED_QUEUES: i32 = 4;
-/// 检查周期压到下限，好把「每趟现查」和「吃 30s 缓存」在时间上分开。
+/// Check interval pushed to the floor, to separate "fresh lookup every round" from "reading the 30s cache" in time.
 const CHECK_INTERVAL_MILLIS: i64 = 1000;
-/// 后台比对的首查延迟（实现里的默认值）+ 一点余量。
+/// First-lookup delay of the background comparison (the default in the implementation) + some margin.
 const FIRST_DELAY: Duration = Duration::from_millis(12_000);
-/// nameserver 见到变化后允许的最大回调间隔。
+/// Maximum allowed callback gap after the name server sees the change.
 const FRESH_WINDOW: Duration = Duration::from_millis(5_000);
 
 struct Checker {
@@ -63,7 +63,7 @@ impl Checker {
     }
 }
 
-/// 只记回调，不改状态；后台任务也会调它，所以自带锁。
+/// Records callbacks only, changes no state; the background task also calls it, so it carries its own lock.
 struct Recorder {
     events: Mutex<Vec<(String, Vec<i32>)>>,
 }
@@ -110,7 +110,7 @@ fn guard<T>(v: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     v.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 现查队列集合，直到报出 `want` 个为止；返回等待时长，超时返回 None。
+/// Freshly queries the queue set until it reports `want` queues; returns the wait duration, or None on timeout.
 async fn wait_queue_num(
     consumer: &DefaultLitePullConsumer,
     topic: &str,
@@ -129,7 +129,7 @@ async fn wait_queue_num(
     None
 }
 
-/// 等监听器记到 `want` 条回调；返回等待时长，超时返回 None。
+/// Waits for the listener to record `want` callbacks; returns the wait duration, or None on timeout.
 async fn wait_events(rec: &Recorder, want: usize, timeout: Duration) -> Option<Duration> {
     let start = Instant::now();
     while start.elapsed() < timeout {
@@ -141,7 +141,7 @@ async fn wait_events(rec: &Recorder, want: usize, timeout: Duration) -> Option<D
     None
 }
 
-/// 对同一 topic 再下发一次建 topic 请求，把读写队列数改成 `queues`。
+/// Issues another create-topic request for the same topic, changing the read/write queue counts to `queues`.
 async fn scale_topic(admin: &MQClientInstance, broker_addr: &str, topic: &str, queues: i32) {
     let _ = admin
         .create_topic_in_broker(
@@ -181,19 +181,19 @@ async fn run(namesrv: &str) -> Checker {
     let route = match admin.get_topic_route_data(MixAll::DEFAULT_TOPIC).await {
         Some(r) => r,
         None => {
-            ck.check("默认 topic 路由", false, "namesrv 没有返回路由");
+            ck.check("default topic route", false, "namesrv returned no route");
             return ck;
         }
     };
     let broker_addr = match broker_addr_of(&route) {
         Some(a) => a,
         None => {
-            ck.check("broker 地址", false, "路由里没有 broker 地址");
+            ck.check("broker address", false, "no broker address in the route");
             return ck;
         }
     };
 
-    // ---- 建 topic（2 队列）
+    // ---- create topic (2 queues)
     scale_topic(&admin, &broker_addr, &topic, BASE_QUEUES).await;
 
     let cfg = LitePullConsumerConfig {
@@ -206,59 +206,59 @@ async fn run(namesrv: &str) -> Checker {
     let consumer = match DefaultLitePullConsumer::with_config(cfg) {
         Ok(c) => c,
         Err(e) => {
-            ck.check("构造 lite 消费者", false, &e.to_string());
+            ck.check("build lite consumer", false, &e.to_string());
             return ck;
         }
     };
     consumer.set_topic_metadata_check_interval_millis(CHECK_INTERVAL_MILLIS);
     ck.check(
-        "L0 检查周期压到 1s 下限",
+        "L0 check interval pushed to the 1s floor",
         consumer.topic_metadata_check_interval_millis() == CHECK_INTERVAL_MILLIS,
         &consumer.topic_metadata_check_interval_millis().to_string(),
     );
     consumer.subscribe(&topic, "*");
     if let Err(e) = consumer.start().await {
-        ck.check("消费者启动", false, &e.to_string());
+        ck.check("consumer start", false, &e.to_string());
         return ck;
     }
     let loop_start = Instant::now();
 
     let visible = wait_queue_num(&consumer, &topic, BASE_QUEUES as usize, Duration::from_secs(30)).await;
-    ck.check("L0 路由可见（2 个队列）", visible.is_some(), "超时");
+    ck.check("L0 route visible (2 queues)", visible.is_some(), "timeout");
 
-    // 运行中注册 ⇒ 立刻记快照 ⇒ 首轮不该回调
+    // Registered while running ⇒ the snapshot is recorded immediately ⇒ the first round should not call back
     let rec = Recorder::new();
     let listener: Arc<dyn TopicMessageQueueChangeListener> = rec.clone();
     if let Err(e) = consumer
         .register_topic_message_queue_change_listener(&topic, listener)
         .await
     {
-        ck.check("注册队列变更监听", false, &e.to_string());
+        ck.check("register queue change listener", false, &e.to_string());
         consumer.shutdown();
         return ck;
     }
     tokio::time::sleep(Duration::from_secs(3)).await;
     ck.check(
-        "L1 队列没动 ⇒ 静默",
+        "L1 queues untouched ⇒ silent",
         rec.count() == 0,
         &format!("{:?}", guard(&rec.events)),
     );
 
-    // 等到首查延迟过去，此后只剩 1s 一趟的稳定期
+    // Wait out the first-lookup delay; after that only the stable 1s-per-round period remains
     let elapsed = loop_start.elapsed();
     if elapsed < FIRST_DELAY {
         tokio::time::sleep(FIRST_DELAY - elapsed).await;
     }
     ck.check(
-        "L1b 首查那趟真的跑过 ⇒ 依旧静默",
+        "L1b the first-lookup round really ran ⇒ still silent",
         rec.count() == 0,
         &format!("{:?}", guard(&rec.events)),
     );
 
-    // ---- L2 扩容 2→4
+    // ---- L2 scale up 2→4
     scale_topic(&admin, &broker_addr, &topic, SCALED_QUEUES).await;
     let ns = wait_queue_num(&consumer, &topic, SCALED_QUEUES as usize, Duration::from_secs(45)).await;
-    ck.check("L2a nameserver 报出 4 个队列", ns.is_some(), "超时");
+    ck.check("L2a nameserver reports 4 queues", ns.is_some(), "timeout");
     if ns.is_some() {
         let cb = wait_events(&rec, 1, FRESH_WINDOW).await;
         let got = cb.is_some()
@@ -268,24 +268,24 @@ async fn run(namesrv: &str) -> Checker {
                 .map(|(_, ids)| *ids == seq(SCALED_QUEUES))
                 .unwrap_or(false);
         ck.check(
-            "L2b 比对趟次现查路由（回调紧跟 nameserver，不等 30s 缓存）",
+            "L2b the comparison round queries the route afresh (the callback follows the nameserver instead of waiting for the 30s cache)",
             got,
             &format!("callback={cb:?}, events={:?}", rec.snapshot()),
         );
     }
 
-    // ---- L3 快照推进
+    // ---- L3 snapshot advance
     tokio::time::sleep(Duration::from_secs(3)).await;
     ck.check(
-        "L3 回调后快照推进 ⇒ 不重复回调",
+        "L3 after the callback the snapshot advances ⇒ no repeated callback",
         rec.count() == 1,
         &format!("events={:?}", rec.snapshot()),
     );
 
-    // ---- L4 缩容 4→2
+    // ---- L4 scale down 4→2
     scale_topic(&admin, &broker_addr, &topic, BASE_QUEUES).await;
     let ns = wait_queue_num(&consumer, &topic, BASE_QUEUES as usize, Duration::from_secs(45)).await;
-    ck.check("L4a nameserver 报回 2 个队列", ns.is_some(), "超时");
+    ck.check("L4a nameserver reports back 2 queues", ns.is_some(), "timeout");
     if ns.is_some() {
         let cb = wait_events(&rec, 2, FRESH_WINDOW).await;
         let got = cb.is_some()
@@ -295,19 +295,19 @@ async fn run(namesrv: &str) -> Checker {
                 .map(|(_, ids)| *ids == seq(BASE_QUEUES))
                 .unwrap_or(false);
         ck.check(
-            "L4b 缩容同样靠现查路由看到",
+            "L4b the scale-down is likewise seen via the fresh route lookup",
             got,
             &format!("callback={cb:?}, events={:?}", rec.snapshot()),
         );
     }
 
-    // ---- L5 未知 topic：空队列集算「查不到」
+    // ---- L5 unknown topic: an empty queue set counts as "not found"
     let raised = match consumer.fetch_message_queues(&ghost).await {
         Ok(q) => format!("no error, queues={}", q.len()),
         Err(e) => e.to_string(),
     };
     ck.check(
-        "L5 未知 topic 取队列抛「查不到」而不是返回空",
+        "L5 fetching queues of an unknown topic raises not-found instead of returning empty",
         raised.contains("Namesrv return empty") || raised.contains("Can not find"),
         &raised,
     );

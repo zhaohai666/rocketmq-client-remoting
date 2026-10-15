@@ -121,7 +121,7 @@ func TestLz4MalformedFramesError(t *testing.T) {
 	bad("bad header checksum", func(b []byte) []byte { b[13] ^= 0xff; return b })
 	bad("truncated block", func(b []byte) []byte { return b[:len(b)-8] })
 	bad("truncated checksum", func(b []byte) []byte {
-		// 用带内容校验和的帧验证截断
+		// Use the content-checksum frame to verify truncation
 		f := hexFixture(t, lz4CliFixtureWithChecksum)
 		return f[:len(f)-2]
 	})
@@ -221,7 +221,7 @@ func TestXxh32OfficialVectors(t *testing.T) {
 }
 
 func TestCompressCrossTypeDispatch(t *testing.T) {
-	// 全类型矩阵：同一 payload 三种类型各自成环，且输出互不相同（算法不同）。
+	// Full type matrix: the same payload round-trips under all three types, and the outputs differ from one another (different algorithms).
 	seen := map[string]bool{}
 	for _, typ := range []int32{ZlibType, Lz4Type, ZstdType} {
 		enc, err := Compress(zlibPayload, typ, DefaultCompressLevel)

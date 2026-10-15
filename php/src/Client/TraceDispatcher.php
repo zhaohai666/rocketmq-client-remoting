@@ -26,7 +26,7 @@ final class BrokerSetSelector
 
     /**
      * @param list<MessageQueue> $mqs
-     * @param array<string,true>|null $arg broker 集合
+     * @param array<string,true>|null $arg broker set
      */
     public function select(array $mqs, Message $msg, mixed $arg): MessageQueue
     {
@@ -50,13 +50,13 @@ final class BrokerSetSelector
 }
 
 /**
- * 轨迹异步分发器。
+ * Trace async dispatcher.
  */
 final class AsyncTraceDispatcher
 {
-    /** 内部生产者组名的全局自增序号（从 1 起）。 */
+    /** Global incrementing sequence for internal producer group names (from 1). */
     private static int $counter = 1;
-    /** traceInstanceId 的全局自增序号（从 0 起）。 */
+    /** Global incrementing sequence for traceInstanceId (from 0). */
     private static int $instanceNum = 0;
 
     public const WAIT_FOR_SHUTDOWN = 5000;
@@ -73,13 +73,13 @@ final class AsyncTraceDispatcher
     public int $discardCount = 0;
     public bool $stopped = false;
     public bool $isStarted = false;
-    /** PHP 无线程：恒为 null（保留字段以兼容线上结构）。 */
+    /** PHP has no threads: always null (field kept for compatibility with the online structure). */
     public mixed $worker = null;
     public AccessChannel $accessChannel = AccessChannel::LOCAL;
     public string $namespaceV2 = '';
     public mixed $hostProducer = null;
     public mixed $hostConsumer = null;
-    /** 内部生产者（DefaultMQProducer 未移植时为 null，可由调用方注入 fake）。 */
+    /** Internal producer (null while DefaultMQProducer is not ported; callers may inject a fake). */
     public mixed $traceProducer = null;
     public int $sendWhichQueue = 0;
     public int $lastFlushTime;
@@ -101,11 +101,11 @@ final class AsyncTraceDispatcher
         $this->traceProducer = $this->getAndCreateTraceProducer($rpcHook);
     }
 
-    // ---------------- 内部生产者 ----------------
+    // ---------------- Internal producer ----------------
 
     private function getAndCreateTraceProducer(mixed $rpcHook): mixed
     {
-        // DefaultMQProducer 由其它子任务移植；未落地时不自行创建（测试注入 fake）。
+        // DefaultMQProducer is ported by another subtask; while it is not in place, do not create one yourself (tests inject a fake).
         if (!class_exists(\RocketMQ\Client\DefaultMQProducer::class)) {
             return null;
         }
@@ -117,7 +117,7 @@ final class AsyncTraceDispatcher
             if (method_exists($producer, 'setMaxMessageSize')) {
                 $producer->setMaxMessageSize($this->maxMsgSize);
             }
-            // ⚠ 必须关闭自身的轨迹，否则轨迹消息会被再次追踪 → 无限递归
+            // WARNING: its own tracing must be disabled, otherwise trace messages get traced again -> infinite recursion
             if (method_exists($producer, 'setEnableTrace')) {
                 $producer->setEnableTrace(false);
             }
@@ -128,7 +128,7 @@ final class AsyncTraceDispatcher
         }
     }
 
-    /** 内部生产者组名：_INNER_TRACE_PRODUCER-<group>-<PRODUCE|CONSUME>-<N>。 */
+    /** Internal producer group name: _INNER_TRACE_PRODUCER-<group>-<PRODUCE|CONSUME>-<N>. */
     public function genGroupNameForTrace(): string
     {
         return sprintf(
@@ -165,7 +165,7 @@ final class AsyncTraceDispatcher
         return $this->namespaceV2;
     }
 
-    /** 宿主客户端的 clientId（EndTransaction 轨迹的 clientHost 用它）。 */
+    /** The host client's clientId (used for the EndTransaction trace's clientHost). */
     public function clientId(): string
     {
         $host = $this->hostProducer ?? $this->hostConsumer;
@@ -196,7 +196,7 @@ final class AsyncTraceDispatcher
         return '';
     }
 
-    // ---------------- 生命周期 ----------------
+    // ---------------- Lifecycle ----------------
 
     public function start(string $nameSrvAddr, ?AccessChannel $accessChannel = null): void
     {
@@ -219,7 +219,7 @@ final class AsyncTraceDispatcher
             $this->isStarted = true;
         }
         $this->accessChannel = $accessChannel ?? AccessChannel::LOCAL;
-        // PHP 无线程：不启动 worker，刷写靠 flush()/pumpOnce() 显式驱动。
+        // PHP has no threads: do not start a worker; flushing is driven explicitly by flush()/pumpOnce().
         $this->stopped = false;
     }
 
@@ -240,7 +240,7 @@ final class AsyncTraceDispatcher
         $this->stopped = true;
     }
 
-    // ---------------- 入队 / 刷写 ----------------
+    // ---------------- Enqueue / flush ----------------
 
     public function append(TraceContext $ctx): bool
     {
@@ -265,9 +265,9 @@ final class AsyncTraceDispatcher
     }
 
     /**
-     * 显式跑一轮后台循环（线程体的等价物）。
+     * Explicitly run one round of the background loop (the equivalent of the thread body).
      *
-     * @param bool $forceFlush true 时无条件刷写（等价 flush 的一步）
+     * @param bool $forceFlush when true, flush unconditionally (equivalent to one step of flush)
      */
     public function pumpOnce(bool $forceFlush = false): void
     {
@@ -298,7 +298,7 @@ final class AsyncTraceDispatcher
         }
     }
 
-    // ---------------- 发送 ----------------
+    // ---------------- Send ----------------
 
     private function sendTraceData(array $contextList): void
     {
@@ -365,7 +365,7 @@ final class AsyncTraceDispatcher
             return;
         }
         $msg = new Message($traceTopic, $data);
-        // keys 里放的是**原始消息的 msgId**（不是 offsetMsgId），控制台按它反查轨迹
+        // keys hold the **original message's msgId** (not offsetMsgId); the console uses it to look up traces
         $keys = [];
         foreach ($keySet as $k => $_) {
             if ($k !== '') {

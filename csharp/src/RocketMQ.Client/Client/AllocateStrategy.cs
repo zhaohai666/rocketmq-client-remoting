@@ -1,7 +1,8 @@
-// 队列分配策略（rebalance 时把某个 topic 的队列分给同一消费组里的各个消费者）。
+// Queue allocation strategies (during rebalance, distribute a topic's queues
+// among the consumers of the same consume group).
 //
 //
-// ## 移植范围
+// ## Porting scope
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -222,7 +223,7 @@ public sealed class AllocateMessageQueueByMachineRoom : IAllocateMessageQueueStr
     {
     }
 
-    /// <summary>按机房集合（consumeridcs）构造：只在这些机房内分配队列。</summary>
+    /// <summary>Constructs from a set of machine rooms (consumeridcs): queues are only allocated within these rooms.</summary>
     public AllocateMessageQueueByMachineRoom(IEnumerable<string> consumeridcs)
     {
         _consumeridcs = new HashSet<string>(consumeridcs, StringComparer.Ordinal);
@@ -265,7 +266,7 @@ public sealed class AllocateMessageQueueByMachineRoom : IAllocateMessageQueueStr
             }
         }
 
-        int cidSize = cidAll.Count;  // 守卫保证 >= 1
+        int cidSize = cidAll.Count;  // the guard above guarantees >= 1
         int mod = premqAll.Count / cidSize;
         int rem = premqAll.Count % cidSize;
         int startIndex = mod * currentIndex;
@@ -277,8 +278,8 @@ public sealed class AllocateMessageQueueByMachineRoom : IAllocateMessageQueueStr
 
         if (rem > currentIndex)
         {
-            // 越界不可能：`currentIndex < rem` 且 `rem < cidSize`
-            // ⇒ `currentIndex + mod*cidSize < rem + mod*cidSize == premqAll.Count`。
+            // Out-of-bounds is impossible: `currentIndex < rem` and `rem < cidSize`
+            // imply `currentIndex + mod*cidSize < rem + mod*cidSize == premqAll.Count`.
             result.Add(premqAll[currentIndex + (mod * cidSize)]);
         }
 
@@ -380,12 +381,12 @@ public sealed class AllocateMachineRoomNearby : IAllocateMessageQueueStrategy
                 mqInThisMachineRoom, consumerInThisMachineRoom));
         }
 
-        // 2. 没有任何存活消费者的机房，其队列由全部消费者共享。
+        // 2. Queues of machine rooms with no live consumer are shared by all consumers.
         foreach (KeyValuePair<string, List<MessageQueue>> machineRoomEntry in mr2Mq)
         {
             if (mr2c.ContainsKey(machineRoomEntry.Key))
             {
-                continue;  // 该机房有活消费者 ⇒ 队列留给它自己
+                continue;  // this room has a live consumer => its queues are left to it
             }
 
             allocateResults.AddRange(_allocateMessageQueueStrategy.Allocate(consumerGroup, currentCid,

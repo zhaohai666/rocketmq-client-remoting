@@ -1,24 +1,24 @@
-//! lite-pull **请求码 / broker 开关**（#107）真机验证。
+//! Live verification of the lite-pull **request code / broker switch** (#107).
 //!
-//! 为什么必须真机：`FLAG_LITE_PULL_MESSAGE(0x10)` + `LITE_PULL_MESSAGE(361)` 这条链在离线
-//! 假 broker 上永远是绿的 —— 少了位、码还是 11 时，报文依然是一个完全合法的 pull，
-//! 假 broker（和真 broker 的普通 pull 分支）照常回消息。能把它区分出来的只有真 broker 的
-//! `litePullMessageEnable` 开关（`PullMessageProcessor:325-331` **只拦 361**）：把开关在
-//! 运行时翻成 false（UPDATE_BROKER_CONFIG，无需重启）：
+//! Why a real machine is required: the `FLAG_LITE_PULL_MESSAGE(0x10)` + `LITE_PULL_MESSAGE(361)` chain is always green on an
+//! offline fake broker -- with the bit missing or the code still 11, the packet is still a perfectly legal pull,
+//! and the fake broker (and a real broker's plain pull branch) replies as usual. The only thing that can tell them apart
+//! is a real broker's `litePullMessageEnable` switch (the broker's pull processor **intercepts only 361**): flip the switch
+//! to false at runtime (UPDATE_BROKER_CONFIG, no restart needed):
 //!
-//!   S1 开关默认 true：lite pull 全链路正常（基线）。
-//!   S2 开关 false：
-//!      S2a 裸 361 请求 → NO_PERMISSION(16) + "…for lite pull consumer is forbidden"；
-//!      S2b 同队列同一位点的裸 11 请求 → 照常 SUCCESS 且拿到消息（**对照**：开关只管
-//!          lite，普通 pull 不受影响 —— 没有这条腿，S2a 的失败可能只是 broker 坏了）；
-//!      S2c lite 消费者安静饿死：消息明明在，poll 一条不来、拉取游标纹丝不动
-//!          （旧实现位不置/码为 11，这条腿会收到消息 → 判别器变红）；
-//!      S2d push 消费者照常消费（**对照**：整条消费链路没坏）。
-//!   S3 开关还原 true：lite pull 立即恢复。
+//!   S1 switch defaults to true: the lite pull full chain works (baseline).
+//!   S2 switch false:
+//!      S2a bare 361 request → NO_PERMISSION(16) + "...for lite pull consumer is forbidden";
+//!      S2b bare 11 request on the same queue at the same offset → SUCCESS as usual with messages (**control**: the switch
+//!          only governs lite; the plain pull is unaffected -- without this leg, S2a's failure might just be a broken broker);
+//!      S2c the lite consumer quietly starves: the messages are there, poll returns none and the pull cursor does not move
+//!          (an old implementation leaving the bit unset / using code 11 would receive messages here → the discriminator goes red);
+//!      S2d the push consumer keeps consuming (**control**: the whole consume chain is intact).
+//!   S3 switch restored to true: lite pull recovers immediately.
 //!
-//! 退出前**无条件**把 `litePullMessageEnable` 改回原值（与 live_reset_offset.rs 同款）。
+//! Before exiting, `litePullMessageEnable` is **unconditionally** restored to its original value (same pattern as live_reset_offset.rs).
 //!
-//! 用法：
+//! Usage:
 //! ```text
 //! cargo run --example live_lite_pull_code -- 127.0.0.1:9876
 //! ```
@@ -81,7 +81,7 @@ fn lite_flag() -> i32 {
                                 /*lite_pull=*/true)
 }
 
-/// `DefaultMQPullConsumerImpl.pullSyncImpl:248` 的 4 参版本，lite 位必须为 0。
+/// The 4-argument variant used by the classic pull path; the lite bit must stay 0.
 fn classic_flag() -> i32 {
     PullSysFlag::build_sys_flag_basic(/*commit_offset=*/false, /*suspend=*/false,
                                       /*subscription=*/true, /*class_filter=*/false)
@@ -157,7 +157,7 @@ impl Fixture {
             .await
             .map_err(|e| format!("producer start failed: {e}"))?;
 
-        // 端口开着 != broker 已注册到 nameServer：轮询等它注册。
+        // An open port != the broker is registered with the nameServer: poll until it registers.
         let deadline = Instant::now() + Duration::from_secs(40);
         let broker_addr = loop {
             if let Ok(info) = admin.fetch_broker_cluster_info().await {
@@ -170,7 +170,7 @@ impl Fixture {
                 }
             }
             if Instant::now() > deadline {
-                return Err("nameServer 在预算内没有返回任何 broker".to_string());
+                return Err("nameServer returned no broker within the budget".to_string());
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         };
@@ -245,7 +245,7 @@ impl Fixture {
             name_server_addrs: vec![self.namesrv.clone()],
             instance_name: format!("rust-lite-code-{group}"),
             poll_timeout_millis: 500,
-            // 位点由用例自己看：关掉自动提交，S2c 的「游标纹丝不动」才干净。
+            // The offset is watched by the case itself: auto-commit is off so S2c's "cursor does not move" stays clean.
             auto_commit: false,
             pull_interval_millis: 200,
             consume_from_where: ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET.to_string(),
@@ -263,7 +263,7 @@ impl Fixture {
     }
 }
 
-/// 给定窗口里反复 poll，返回收到的 body。
+/// Polls repeatedly within the given window and returns the received bodies.
 async fn poll_for(c: &DefaultLitePullConsumer, window: Duration) -> Vec<String> {
     let mut out = Vec::new();
     let deadline = Instant::now() + window;
@@ -306,40 +306,40 @@ async fn run(namesrv: &str) -> Checker {
     let q0 = match fx.queue0(&topic).await {
         Ok(q) => q,
         Err(e) => {
-            ck.check("路由可见：1 条队列", false, &e);
+            ck.check("route visible: 1 queue", false, &e);
             fx.shutdown();
             return ck;
         }
     };
-    ck.check("路由可见：1 条队列", true, &format!("queueId={}", q0.queue_id));
+    ck.check("route visible: 1 queue", true, &format!("queueId={}", q0.queue_id));
 
     let mut c1: Option<DefaultLitePullConsumer> = None;
     let mut c2: Option<DefaultLitePullConsumer> = None;
     let mut c3: Option<DefaultLitePullConsumer> = None;
     let mut push: Option<DefaultMQPushConsumer> = None;
 
-    // ---------- R0 开关基线 ----------
+    // ---------- R0 switch baseline ----------
     let original = fx.read_flag().await;
     ck.check(
-        &format!("R0 能读到 broker 的 {CONFIG_KEY}"),
+        &format!("R0 can read the broker's {CONFIG_KEY}"),
         original.is_some(),
         &format!("value={:?}", original),
     );
     if original.as_deref() != Some("true") {
         ck.check(
-            &format!("R0 已临时打开 {CONFIG_KEY}"),
+            &format!("R0 temporarily turned {CONFIG_KEY} on"),
             fx.write_flag("true").await,
             "",
         );
     }
     if fx.read_flag().await.as_deref() != Some("true") {
-        ck.check("R0 开关不在 true，后续检查无意义", false, "");
+        ck.check("R0 the switch is not true, later checks are meaningless", false, "");
         fx.shutdown();
         return ck;
     }
 
-    // ---------- S1 基线：开关 true，lite 正常 ----------
-    println!("\nS1 开关 true：lite pull 基线");
+    // ---------- S1 baseline: switch true, lite works ----------
+    println!("\nS1 switch true: lite pull baseline");
     if let Err(e) = fx.send(&topic, "lite-code-s1", &q0).await {
         ck.check("S1 pinned send", false, &e);
     }
@@ -362,12 +362,12 @@ async fn run(namesrv: &str) -> Checker {
                     got
                 };
                 ck.check(
-                    "S1 lite 消费者收到消息",
+                    "S1 the lite consumer received the message",
                     got.iter().any(|b| b == "lite-code-s1"),
                     &format!("got={}", join(&got)),
                 );
                 ck.check(
-                    "S1 拉取游标已推进",
+                    "S1 the pull cursor has advanced",
                     c.pull_cursor_of(&q0) >= 1,
                     &format!("cursor={}", c.pull_cursor_of(&q0)),
                 );
@@ -377,12 +377,12 @@ async fn run(namesrv: &str) -> Checker {
         Err(e) => ck.check("S1 lite build", false, &e),
     }
 
-    // ---------- S2 开关 false ----------
-    println!("\nS2 运行时关闭 {CONFIG_KEY}（UPDATE_BROKER_CONFIG，不重启 broker）");
-    ck.check("S2 开关已改为 false", fx.write_flag("false").await, "");
+    // ---------- S2 switch false ----------
+    println!("\nS2 turning {CONFIG_KEY} off at runtime (UPDATE_BROKER_CONFIG, no broker restart)");
+    ck.check("S2 switch set to false", fx.write_flag("false").await, "");
     let read_back = fx.read_flag().await;
     ck.check(
-        "S2 开关读回确认",
+        "S2 switch read-back confirmed",
         read_back.as_deref() == Some("false"),
         &format!("value={:?}", read_back),
     );
@@ -391,11 +391,11 @@ async fn run(namesrv: &str) -> Checker {
         ck.check("S2 pinned send", false, &e);
     }
 
-    // S2a：裸 361 → NO_PERMISSION + 固定 remark（走我们自己的客户端 API 选码）
+    // S2a: bare 361 => NO_PERMISSION + the fixed remark (the code is chosen by our own client API)
     let client = match fx.admin.get_mq_client_instance() {
         Ok(c) => Some(c),
         Err(e) => {
-            ck.check("S2a 取 admin 的 MQClientInstance", false, &e.to_string());
+            ck.check("S2a fetch the admin's MQClientInstance", false, &e.to_string());
             None
         }
     };
@@ -421,29 +421,29 @@ async fn run(namesrv: &str) -> Checker {
             .await;
         match lite_result {
             Ok(_) => ck.check(
-                "S2a 裸 361 被开关拒绝（NO_PERMISSION=16）",
+                "S2a bare 361 rejected by the switch (NO_PERMISSION=16)",
                 false,
-                "竟然 SUCCESS —— lite 位/码没生效",
+                "returned SUCCESS -- the lite bit/code had no effect",
             ),
             Err(Error::Broker {
                 response_code,
                 message,
             }) => {
                 ck.check(
-                    "S2a 裸 361 被开关拒绝（NO_PERMISSION=16）",
+                    "S2a bare 361 rejected by the switch (NO_PERMISSION=16)",
                     response_code == 16,
                     &format!("code={response_code} remark={message}"),
                 );
                 ck.check(
-                    "S2a 拒绝理由正是 lite 开关",
+                    "S2a the refusal reason is exactly the lite switch",
                     message.contains(DENY_REMARK),
                     &message,
                 );
             }
-            Err(e) => ck.check("S2a 裸 361 被开关拒绝（NO_PERMISSION=16）", false, &e.to_string()),
+            Err(e) => ck.check("S2a bare 361 rejected by the switch (NO_PERMISSION=16)", false, &e.to_string()),
         }
 
-        // S2b：同队列同一位点的裸 11 → 照常拿消息（对照组）
+        // S2b: bare 11 on the same queue at the same offset => messages as usual (control leg)
         let classic_result = client
             .pull_message(
                 &group1,
@@ -471,16 +471,16 @@ async fn run(namesrv: &str) -> Checker {
                     .map(|m| String::from_utf8_lossy(m.get_body()).to_string())
                     .collect();
                 ck.check(
-                    "S2b 对照组：裸 11 不受开关影响，照常拿消息",
+                    "S2b control: bare 11 is unaffected by the switch and gets messages",
                     got.iter().any(|b| b == "lite-code-s1" || b == "lite-code-s2"),
                     &format!("status={:?} got={}", r.status, join(&got)),
                 );
             }
-            Err(e) => ck.check("S2b 对照组：裸 11 不受开关影响", false, &e.to_string()),
+            Err(e) => ck.check("S2b control: bare 11 is unaffected by the switch", false, &e.to_string()),
         }
     }
 
-    // S2c：lite 消费者安静饿死（消息在，但一条不来；游标不动）
+    // S2c: the lite consumer quietly starves (messages exist, none arrive; the cursor does not move)
     match fx.lite(&group2, &q0) {
         Ok(c) => {
             if let Err(e) = c.start().await {
@@ -488,12 +488,12 @@ async fn run(namesrv: &str) -> Checker {
             } else {
                 let starved = poll_for(&c, Duration::from_secs(8)).await;
                 ck.check(
-                    "S2c 开关关闭期间 lite 消费者一条都收不到",
+                    "S2c while the switch is off the lite consumer receives nothing",
                     starved.is_empty(),
                     &format!("got={}", join(&starved)),
                 );
                 ck.check(
-                    "S2c 拉取游标纹丝不动",
+                    "S2c the pull cursor does not move at all",
                     c.pull_cursor_of(&q0) == 0,
                     &format!("cursor={}", c.pull_cursor_of(&q0)),
                 );
@@ -503,7 +503,7 @@ async fn run(namesrv: &str) -> Checker {
         Err(e) => ck.check("S2c lite build", false, &e),
     }
 
-    // S2d：push 消费者照常消费（对照组）
+    // S2d: the push consumer keeps consuming (control leg)
     let sink = BodySink::new();
     let cfg = ConsumerConfig {
         consumer_group: format!("GID_RustLiteCode_push_{}", fx.stamp),
@@ -528,7 +528,7 @@ async fn run(namesrv: &str) -> Checker {
                         tokio::time::sleep(Duration::from_millis(300)).await;
                     }
                     ck.check(
-                        "S2d 对照组：push 消费者照常收到消息（开关只管 lite）",
+                        "S2d control: the push consumer receives messages as usual (the switch governs lite only)",
                         sink.has("lite-code-s2d"),
                         &format!("got={}", join(&sink.snapshot())),
                     );
@@ -540,9 +540,9 @@ async fn run(namesrv: &str) -> Checker {
         Err(e) => ck.check("S2d push build", false, &e.to_string()),
     }
 
-    // ---------- S3 还原 ----------
-    println!("\nS3 开关还原 true：lite 恢复");
-    ck.check("S3 开关已还原", fx.write_flag("true").await, "");
+    // ---------- S3 restore ----------
+    println!("\nS3 switch restored to true: lite recovers");
+    ck.check("S3 switch restored", fx.write_flag("true").await, "");
     if let Err(e) = fx.send(&topic, "lite-code-s3", &q0).await {
         ck.check("S3 pinned send", false, &e);
     }
@@ -565,7 +565,7 @@ async fn run(namesrv: &str) -> Checker {
                     got
                 };
                 ck.check(
-                    "S3 还原后 lite 消费者立即恢复",
+                    "S3 after the restore the lite consumer recovers immediately",
                     !got.is_empty(),
                     &format!("got={}", join(&got)),
                 );
@@ -575,7 +575,7 @@ async fn run(namesrv: &str) -> Checker {
         Err(e) => ck.check("S3 lite build", false, &e),
     }
 
-    // ---------- 收尾：消费者 → 还原开关 → fixture ----------
+    // ---------- wrap-up: consumers -> restore switch -> fixture ----------
     for c in [&c1, &c2, &c3].into_iter().flatten() {
         c.shutdown();
     }

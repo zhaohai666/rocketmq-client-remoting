@@ -60,7 +60,7 @@ func TestCompressionTypeBits(t *testing.T) {
 	if got := GetCompressionType(MessageSysFlagCompressionLz4); got != Lz4Type {
 		t.Fatalf("lz4 type = %d", got)
 	}
-	// SetCompressionType 只动类型位，其余位（含 COMPRESSED）保持
+	// SetCompressionType only touches the type bits; the other bits (including COMPRESSED) are preserved
 	set := SetCompressionType(MessageSysFlagCompressed|0xFF&^MessageSysFlagCompressionTypeMask, ZstdType)
 	if GetCompressionType(set) != ZstdType {
 		t.Fatalf("set type = %d", GetCompressionType(set))

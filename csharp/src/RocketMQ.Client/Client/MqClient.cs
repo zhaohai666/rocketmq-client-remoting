@@ -1,8 +1,9 @@
-// 职责：NameServer 地址管理、Topic 路由获取与缓存、Broker 地址解析、
-// 消息发送（SEND_MESSAGE_V2）、拉取（PULL_MESSAGE）、offset 查询/更新、心跳、
-// 按 Key 查询消息、创建 Topic。
+// Responsibilities: NameServer address management, topic route fetching and caching,
+// broker address resolution, message sending (SEND_MESSAGE_V2), pulling
+// (PULL_MESSAGE), offset query/update, heartbeat, message lookup by key, and topic
+// creation.
 //
-// 按协议口径逐项实现。
+// Implemented item by item against the protocol rules.
 using System.Diagnostics;
 using System.Globalization;
 using System.Text;
@@ -42,8 +43,10 @@ public static class ClientIds
 
 internal static class Schedules
 {
-    /// <summary>睡到 <paramref name="deadlineTick"/>（Environment.TickCount64 口径），
-    /// <paramref name="stop"/> 被 Set 时立刻返回（提前返回由调用方的循环条件收尾）。</summary>
+    // <summary>Sleeps until <paramref name="deadlineTick"/> (on the
+    /// Environment.TickCount64 scale) and returns immediately once
+    /// <paramref name="stop"/> is set (the early return is finalised by the caller's
+    /// loop condition).</summary>
     public static void WaitUntil(ManualResetEventSlim stop, long deadlineTick)
     {
         long remain = deadlineTick - Environment.TickCount64;
@@ -53,8 +56,10 @@ internal static class Schedules
         }
     }
 
-    /// <summary>没有可等待事件的任务（生产者心跳线程）用 100ms 分段睡到计划时刻：
-    /// 每段都重新对着**绝对时刻**算，误差不累积，关停响应也在 100ms 内。</summary>
+    /// <summary>Tasks with no event to wait on (the producer heartbeat thread) sleep in
+    /// 100ms slices until the scheduled instant: each slice recomputes against the
+    /// **absolute** instant, so the error does not accumulate and shutdown stays
+    /// responsive within 100ms.</summary>
     public static void WaitUntil(Func<bool> running, long deadlineTick)
     {
         long remain;
@@ -82,7 +87,8 @@ public sealed class TopicPublishInfo
             throw new MQClientException("no message queue for publish info");
         }
 
-        // 游标用原子自增：生产端可能被多线程并发调用，且游标是跨调用共享状态
+        // The cursor uses atomic increment: the producer side may be called concurrently
+        // from several threads and the cursor is state shared across calls
         long idx = Interlocked.Increment(ref _index) - 1;
         return MsgQueueList[(int)(idx % MsgQueueList.Count)];
     }
@@ -109,8 +115,9 @@ public sealed class TopicPublishInfo
     }
 
     /// <summary>
-    /// 带过滤器的轮询：游标照常推进，
-    /// 一轮内全部不匹配返回 null，由调用方退化选择。filter 与 brokerFilter 都通过才选中。
+    /// Round-robin with a filter: the cursor still advances, a round where nothing
+    /// matches returns null and the caller degrades to its own selection. A queue is
+    /// chosen only when both filter and brokerFilter pass.
     /// </summary>
     public MessageQueue? SelectOneMessageQueue(Func<MessageQueue, bool> filter,
                                                Func<MessageQueue, bool> brokerFilter)
@@ -133,14 +140,14 @@ public sealed class TopicPublishInfo
         return null;
     }
 
-    /// <summary>重置轮询游标（故障规避 resetIndex 用）。</summary>
+    /// <summary>Resets the round-robin cursor (used by fault-avoidance resetIndex).</summary>
     public void ResetIndex()
     {
         Interlocked.Exchange(ref _index, 0);
     }
 }
 
-/// <summary>客户端核心编排实例。</summary>
+/// <summary>The core orchestration instance of the client.</summary>
 public sealed class MQClientInstance : IDisposable
 {
     private readonly string _clientId;
@@ -179,7 +186,7 @@ public sealed class MQClientInstance : IDisposable
 
     public ConsumerStatsManager ConsumerStats { get; } = new();
 
-    // ---- broker 主动通知 40（实例级处理器 + 每个消费者的「叫醒」回调）----
+    // ---- broker-initiated notification 40 (instance-level handler plus a per-consumer "wake up" callback) ----
     private readonly object _wakeupLock = new();
     private readonly Dictionary<string, Action> _rebalanceWakeups = new(StringComparer.Ordinal);
     private long _consumerIdsChangedCount;
@@ -197,10 +204,11 @@ public sealed class MQClientInstance : IDisposable
         UpdateNameServerAddressList(addrs);
     }
 
-    /// <summary>是否已 Start（诊断用）。</summary>
+    /// <summary>Whether Start has been called (for diagnostics).</summary>
     public bool Started => _started;
 
-    /// <summary>实例持有的路由刷新周期（离线用例断言门面透传结果用）。</summary>
+    /// <summary>The route refresh interval held by the instance (offline cases assert the
+    /// facade passes the value through).</summary>
     public int PollNameServerIntervalMillis => _pollNameServerIntervalMillis;
 
     internal static bool TlsEnabledFromEnv() => RemotingClient.EnvTlsEnabled();
@@ -227,8 +235,9 @@ public sealed class MQClientInstance : IDisposable
     }
 
 
-    /// <summary>收到过多少次 broker 的 40 通知。反向请求只有 broker 发得出来，用例
-    /// 注入不了，计数是真机断言的唯一落点。</summary>
+    /// <summary>How many broker notification-40 messages have been received. Only the
+    /// broker can send a reverse request, so a test cannot inject one and this counter is
+    /// the only assertion point on a real connection.</summary>
     public long ConsumerIdsChangedCount => Interlocked.Read(ref _consumerIdsChangedCount);
 
     public void RegisterRebalanceWakeup(string group, Action wakeup)
@@ -281,7 +290,8 @@ public sealed class MQClientInstance : IDisposable
     private readonly object _facadeProcessorLock = new();
     private readonly Dictionary<int, List<RemotingClient.RequestProcessor>> _facadeProcessors = new();
 
-    /// <summary>门面把反向请求处理器登记到实例（共享实例下按登记人数扇出，不互相覆盖）。</summary>
+    /// <summary>Registers the facade's reverse request handler on the instance (fan-out
+    /// per registration under a shared instance, never overwriting each other).</summary>
     public void RegisterFacadeProcessor(int requestCode, RemotingClient.RequestProcessor handler)
     {
         lock (_facadeProcessorLock)
@@ -297,7 +307,8 @@ public sealed class MQClientInstance : IDisposable
         }
     }
 
-    /// <summary>门面退出时摘除自己的处理器；最后一个摘除者负责卸掉传输层的槽。</summary>
+    /// <summary>The facade removes its own handler on exit; the last one out also removes
+    /// the transport layer's slot.</summary>
     public void UnregisterFacadeProcessor(int requestCode, RemotingClient.RequestProcessor handler)
     {
         lock (_facadeProcessorLock)
@@ -317,10 +328,11 @@ public sealed class MQClientInstance : IDisposable
     }
 
     /// <summary>
-    /// 驱动一次门面处理器的多播分派。公开只为让离线用例能驱动这条反向路径
-    /// （真连接上 broker 推不进来，与 <see cref="ProcessNotifyConsumerIdsChanged"/> 同一理由），
-    /// 勿用于业务代码 —— 传输层自己会按注册表调它。
-    /// 返回第一个非 null 的应答；该 code 没有任何登记者时返回 null。
+    /// Drives one multicast dispatch of the facade handlers. Public only so that offline
+    /// cases can drive this reverse path (on a real connection the broker cannot push
+    /// in, for the same reason as <see cref="ProcessNotifyConsumerIdsChanged"/>); do not
+    /// use it from business code -- the transport layer calls it from the registry.
+    /// Returns the first non-null response, or null when nobody registered for that code.
     /// </summary>
     public RemotingCommand? DispatchFacadeProcessor(RemotingCommand cmd, string addr)
     {
@@ -354,7 +366,9 @@ public sealed class MQClientInstance : IDisposable
         return null;
     }
 
-    /// <summary>某 code 当前登记了几个门面处理器（测试观测面：共享实例下互不覆盖的落点）。</summary>
+    /// <summary>How many facade handlers are currently registered for a code (a test
+    /// observation point: under a shared instance the registrations do not overwrite each
+    /// other).</summary>
     public int FacadeProcessorCount(int requestCode)
     {
         lock (_facadeProcessorLock)
@@ -366,7 +380,7 @@ public sealed class MQClientInstance : IDisposable
 
     public bool RegisterRpcHook(IRpcHook hook) => _remotingClient.RegisterRpcHook(hook);
 
-    // ---------------- 生命周期 ----------------
+    // ---------------- Lifecycle ----------------
 
     public void Start()
     {
@@ -421,8 +435,9 @@ public sealed class MQClientInstance : IDisposable
         }
 
         ConsumerStats.Shutdown();
-        // 40 的回调是消费者登记的闭包（捕获了消费者状态）：关连接之前先摘掉处理器和
-        // 回调表，避免收尾期间 broker 的 40 还打进一个正在退出的消费者。
+        // The 40 callback is a closure registered by the consumer (it captures consumer
+        // state): remove the handler and the callback table before closing the connection,
+        // so a broker 40 during shutdown does not reach a consumer that is already exiting.
         _remotingClient.UnregisterProcessor(RequestCode.NotifyConsumerIdsChanged);
         lock (_wakeupLock)
         {
@@ -518,7 +533,7 @@ public sealed class MQClientInstance : IDisposable
         RemotingClient.InvokeCallback callback) =>
         _remotingClient.InvokeAsync(addr, request, callback, timeoutMillis);
 
-    /// <summary>把响应码非 SUCCESS 转成 MQBrokerException。</summary>
+    /// <summary>Turns a response code other than SUCCESS into an MQBrokerException.</summary>
     public static void CheckResponseCode(RemotingCommand response)
     {
         if (response.Code != ResponseCode.Success)
@@ -527,7 +542,7 @@ public sealed class MQClientInstance : IDisposable
         }
     }
 
-    // ---------------- 路由管理 ----------------
+    // ---------------- Route management ----------------
 
     public bool UpdateTopicRouteInfoFromNameServer(string topic, bool isDefault = false, int timeoutMillis = 5000)
     {
@@ -552,7 +567,7 @@ public sealed class MQClientInstance : IDisposable
                         return TopicRouteData.Decode(response.Body, out @out);
                     }
 
-                    // 第一个可达的 NS 明确返回非 SUCCESS（如 TOPIC_NOT_EXIST）就停止轮询
+                    // Stop polling as soon as the first reachable NS explicitly returns non-SUCCESS (e.g. TOPIC_NOT_EXIST)
                     break;
                 }
                 catch (RemotingException)
@@ -630,9 +645,11 @@ public sealed class MQClientInstance : IDisposable
     }
 
     /// <summary>
-    /// 取发布信息（**缓存实例共享**，轮询游标在实例内推进）；
-    /// 缓存未命中会触发一次路由刷新，仍拿不到则抛 MQClientException。
-    /// <paramref name="isDefault"/> 透传给路由刷新：仅生产者发真实路由拉不到时传 true。
+    /// Fetches the publish info (**shared per cache instance**, the round-robin cursor
+    /// advances inside the instance); a cache miss triggers one route refresh and an
+    /// MQClientException is thrown when it still cannot be obtained.
+    /// <paramref name="isDefault"/> is passed through to the route refresh: only pass
+    /// true when a producer cannot fetch the real route.
     /// </summary>
     public TopicPublishInfo GetTopicPublishInfo(string topic, bool isDefault = false)
     {
@@ -667,7 +684,8 @@ public sealed class MQClientInstance : IDisposable
         return route.GetAllSubscribeMessageQueue(topic);
     }
 
-    /// <summary>取缓存路由；未命中会尝试刷新一次，仍没有返回 null。</summary>
+    /// <summary>Gets the cached route; on a miss it tries one refresh and returns null when
+    /// there is still none.</summary>
     public TopicRouteData? GetTopicRouteData(string topic)
     {
         lock (_routeLock)
@@ -684,7 +702,7 @@ public sealed class MQClientInstance : IDisposable
         }
         catch (Exception)
         {
-            // 路由刷新失败不抛，交给下面的查表返回空
+            // A failed route refresh does not throw; the table lookup below returns empty
         }
 
         lock (_routeLock)
@@ -790,8 +808,10 @@ public sealed class MQClientInstance : IDisposable
         return addrs;
     }
 
-    /// 返回空串是正常结果（master 掉线就是这个形状），报什么错由调用方决定
-    /// （<c>sendKernelImpl</c> 报 MQClientException、<c>endTransaction</c> 什么都不报）。
+    /// Returning an empty string is a normal outcome (a down master looks exactly like
+    /// this); what error to report is up to the caller
+    /// (<c>sendKernelImpl</c> reports MQClientException, <c>endTransaction</c> reports
+    /// nothing).
     /// </summary>
     public string FindBrokerAddressInPublish(string brokerName)
     {
@@ -808,19 +828,22 @@ public sealed class MQClientInstance : IDisposable
         }
     }
 
-    /// 对应 <c>DefaultMQProducerImpl.sendKernelImpl:919-924</c>（发送）、
+    /// Matches <c>DefaultMQProducerImpl.sendKernelImpl:919-924</c> (send),
     /// <c>DefaultMQPushConsumerImpl.changePopInvisibleTimeAsync:869-876</c> / <c>ackAsync</c>
-    /// （POP 的 ack 与延长不可见时间走 <c>findBrokerAddressInSubscribe(brokerName, MASTER_ID, true)</c>，
-    /// 只要主），以及 <c>MQAdminImpl</c> 的 offset 查询（见 <see cref="PublishAddrInAdmin"/>）。
-    /// 形状一致：查发布地址（只认 brokerId=0）→ 查不到按 topic 刷一次路由 → 重查 →
-    /// 仍查不到照 <c>sendKernelImpl:1100</c> 抛
-    /// <c>MQClientException("The broker[X] not exist")</c>（本端口码为 -1，表示
-    /// 「不是 broker 回的码」）。
+    /// (POP's ack and invisible-time extension go through
+    /// <c>findBrokerAddressInSubscribe(brokerName, MASTER_ID, true)</c>, master only),
+    /// as well as MQAdminImpl's offset query (see <see cref="PublishAddrInAdmin"/>).
+    /// Same shape: look up the publish address (brokerId=0 only) -> on a miss refresh the
+    /// route once for the topic -> look again -> if still missing throw
+    /// <c>MQClientException("The broker[X] not exist")</c> exactly as
+    /// <c>sendKernelImpl:1100</c> does (the code in this port is -1, meaning "not a code
+    /// returned by the broker").
     ///
-    /// 定点发送不会在 <c>sendDefaultImpl</c> 里取发布信息，这里是它唯一的路由来源；
-    /// 主从切换期间这也是「本端立刻报错」与「把请求打到从节点上白挨一轮 SYSTEM_BUSY(2)」的
-    /// 分水岭 —— 从节点不接 SEND_MESSAGE / CONSUMER_SEND_MSG_BACK / CHANGE_INVISIBLE_TIME
-    /// 这些写请求。
+    /// A pinned send does not fetch publish info inside <c>sendDefaultImpl</c>, so this is
+    /// its only source of routing; during a master/slave switch this is also the dividing
+    /// line between "fail immediately on our side" and "send the request to a slave and
+    /// eat a round of SYSTEM_BUSY(2) for nothing" -- slaves do not accept the write
+    /// requests SEND_MESSAGE / CONSUMER_SEND_MSG_BACK / CHANGE_INVISIBLE_TIME.
     /// </summary>
     public string PublishAddrFor(string brokerName, string topic)
     {
@@ -883,8 +906,10 @@ public sealed class MQClientInstance : IDisposable
         return addr;
     }
 
-    /// <summary>测试工程与本程序集没有 InternalsVisibleTo 关系，故用 public，勿用于业务代码：
-    /// 离线用例没有名字服务，直接播种端点表（等价于一次静态主题路由落库）。</summary>
+    /// <summary>The test project has no InternalsVisibleTo relationship with this
+    /// assembly, hence public; do not use it from business code: offline cases have no
+    /// name server, so they seed the endpoint table directly (equivalent to persisting a
+    /// static topic route).</summary>
     public void SetTopicEndPointsForTest(string topic, Dictionary<MessageQueue, string> endpoints)
     {
         lock (_routeLock)
@@ -918,7 +943,7 @@ public sealed class MQClientInstance : IDisposable
         return addrs;
     }
 
-    // ---------------- 消息发送 ----------------
+    // ---------------- Message sending ----------------
 
     private static int ParseIntOrZero(string? value) =>
         TryParseInt(value) ?? 0;
@@ -1049,9 +1074,10 @@ public sealed class MQClientInstance : IDisposable
         int timeoutMillis = 3000, int sysFlag = 0, bool unitMode = false,
         string? createTopicKey = null, int? defaultTopicQueueNums = null)
     {
-        // 单向发送同样是写请求，地址口径与同步发送一致（只认 master + 同一处 VIP 改写）。
+        // A oneway send is a write request too; the address rule matches the synchronous send
+        // (master only plus the same VIP rewrite).
         string addr = VipAddr(PublishAddrFor(mq.BrokerName, mq.Topic));
-        // 单向发送同样补 UNIQ_KEY（与同步发送语义一致）
+        // A oneway send also fills in UNIQ_KEY (same semantics as the synchronous send)
         if (!msg.IsBatch)
         {
             MessageClientIDSetter.SetUniqId(msg);
@@ -1063,7 +1089,7 @@ public sealed class MQClientInstance : IDisposable
         _remotingClient.InvokeOneway(addr, request);
     }
 
-    // ---------------- 定时消息撤回 ----------------
+    // ---------------- Scheduled message recall ----------------
 
     public string RecallMessage(string addr, RecallMessageRequestHeader header,
         int timeoutMillis = 3000)
@@ -1080,10 +1106,10 @@ public sealed class MQClientInstance : IDisposable
         return respHeader.MsgId!;
     }
 
-    // ---------------- Request-Reply：接收 broker 推回的应答（326）----------------
+    // ---------------- Request-Reply: receiving broker-pushed responses (326)----------------
 
     /// <summary>
-    /// 处理 PUSH_REPLY_MESSAGE_TO_CLIENT(326)：把应答交给等待中的 Request()。
+    /// Handles PUSH_REPLY_MESSAGE_TO_CLIENT(326): hands the response to the waiting Request().
     public RemotingCommand? ProcessReplyMessage(RemotingCommand cmd, string addr)
     {
         var header = new ReplyMessageRequestHeader();
@@ -1147,14 +1173,15 @@ public sealed class MQClientInstance : IDisposable
         }
         catch (Exception e)
         {
-            // 解析失败绝不能让读线程崩：回 SYSTEM_ERROR（broker 侧记 warn 但不丢连接）。
+            // A parse failure must never take down the reader thread: reply SYSTEM_ERROR (the
+            // broker side logs a warn but does not drop the connection).
             ClientLog.Warn("unknown err when receiveReplyMsg: " + e.Message);
             return RemotingCommand.CreateResponseCommand(
                 ResponseCode.SystemError, "process reply message fail: " + e.Message);
         }
     }
 
-    // ---------------- 消息拉取 ----------------
+    // ---------------- Message pulling ----------------
 
     public PullResult PullMessage(string consumerGroup, MessageQueue mq,
         long queueOffset, int maxMsgNums, int sysFlag,
@@ -1257,7 +1284,8 @@ public sealed class MQClientInstance : IDisposable
             NextBeginOffset = respHeader.NextBeginOffset ?? 0,
             MinOffset = respHeader.MinOffset ?? 0,
             MaxOffset = respHeader.MaxOffset ?? 0,
-            // 透传给调用方，由它回写 pullFromWhichNodeTable（processPullResult:77）
+            // Passed through to the caller, which writes it back into pullFromWhichNodeTable
+            // (processPullResult:77)
             SuggestWhichBrokerId = respHeader.SuggestWhichBrokerId,
         };
         if (response.Body.Length > 0)
@@ -1273,13 +1301,14 @@ public sealed class MQClientInstance : IDisposable
         return result;
     }
 
-    // ---------------- POP（5.x 轻量消费） ----------------
+    // ---------------- POP (5.x lightweight consumption) ----------------
 
-    /// ⚠ 这是 POP 最容易踩的坑：**普通 topic 直连 POP 时 broker 不在消息上写 POP_CK**
-    /// （只有 retry topic 的重编码路径才写），而 ACK 必须要这个串，所以只能由客户端用
-    /// 响应头的 startOffsetInfo / msgOffsetInfo 反构出来。
+    /// Note: this is the pitfall POP is most often bitten by: when a plain topic is popped
+    /// directly, the broker does **not** write POP_CK on the message (only the retry
+    /// topic's re-encoding path does), yet the ACK requires that string, so the client has
+    /// to reconstruct it from the response header's startOffsetInfo / msgOffsetInfo.
     ///
-    /// 公开为 static 是为了单测能直接覆盖这段纯逻辑（不联网）。
+    /// It is public static so unit tests can cover this pure logic directly (no network).
     /// </summary>
     public static void StampPopCk(List<MessageExt> msgs, string brokerName,
         PopMessageResponseHeader respHeader)
@@ -1334,7 +1363,8 @@ public sealed class MQClientInstance : IDisposable
 
             foreach (MessageExt m in msgs)
             {
-                // retry topic 弹回来的消息 broker 已经写好 POP_CK，不能覆盖。
+                // Messages popped back from a retry topic already carry a POP_CK written by the
+                // broker; it must not be overwritten.
                 if (m.Properties.ContainsKey(MessageConst.PropertyPopCk))
                 {
                     continue;
@@ -1376,12 +1406,14 @@ public sealed class MQClientInstance : IDisposable
     }
 
     /// <summary>
-    /// POP_MESSAGE（200050）：从 broker 直接弹出消息，**不提交位点** —— 消费成功后必须
-    /// 显式 ACK，否则 invisibleTime 到期后 broker 会把消息复活重投到
-    /// %RETRY%&lt;group&gt;_&lt;topic&gt;（至少一次语义）。
+    /// POP_MESSAGE (200050): pops messages straight from the broker **without committing
+    /// an offset** -- after consuming successfully you must ACK explicitly, otherwise once
+    /// invisibleTime expires the broker revives the message and redelivers it to
+    /// %RETRY%&lt;group&gt;_&lt;topic&gt; (at-least-once semantics).
     ///
-    /// queueId = -1 表示弹该 topic 的所有队列。
-    /// initMode：0=MIN（从最小位点开始，消费历史），1=MAX（只取新消息）。
+    /// queueId = -1 means pop from all queues of that topic.
+    /// initMode: 0=MIN (start at the smallest offset, consuming history), 1=MAX (new
+    /// messages only).
     /// </summary>
     public PopResult PopMessage(string consumerGroup, string topic, int queueId,
         int maxMsgNums, long invisibleTime, long pollTime, int initMode,
@@ -1415,9 +1447,9 @@ public sealed class MQClientInstance : IDisposable
             InvisibleTime = invisibleTime,
             PollTime = pollTime,
 
-            // ⚠ 必须填当前毫秒时间戳：broker 校验 now - bornTime - pollTime > 500 会直接回
-            // POLLING_TIMEOUT(210)（PopMessageRequestHeader.isTimeoutTooMuch），
-            // 填 0 等于必定超时。
+            // Note: the current millisecond timestamp is mandatory: the broker checks
+            // now - bornTime - pollTime > 500 and replies POLLING_TIMEOUT(210) right away
+            // (PopMessageRequestHeader.isTimeoutTooMuch); leaving it 0 guarantees a timeout.
             BornTime = UtilAll.CurrentTimeMillis(),
             InitMode = initMode,
             Exp = expression,
@@ -1478,10 +1510,11 @@ public sealed class MQClientInstance : IDisposable
     }
 
     /// <summary>
-    /// ACK_MESSAGE（200051）：确认一条 POP 消息已消费完。
+    /// ACK_MESSAGE (200051): confirms that a POP message has been fully consumed.
     ///
-    /// ⚠ offset 是 **consumeQueue offset**（即 CK 串第 8 段 / msgQueueOffset），
-    /// 不是 commitlog offset。返回 broker 的响应码，SUCCESS 即成功。
+    /// Note: offset is the **consumeQueue offset** (i.e. the 8th segment of the CK string /
+    /// msgQueueOffset), not the commitlog offset. Returns the broker response code;
+    /// SUCCESS means it worked.
     /// </summary>
     public int AckMessage(string consumerGroup, string topic, int queueId,
         string extraInfo, long offset, int timeoutMillis = 3000,
@@ -1514,11 +1547,12 @@ public sealed class MQClientInstance : IDisposable
     }
 
     /// <summary>
-    /// CHANGE_MESSAGE_INVISIBLETIME（200053，注意不是 200052 —— 那是 PEEK）：
-    /// 延长一条 POP 消息的不可见时间。
+    /// CHANGE_MESSAGE_INVISIBLETIME (200053, note it is not 200052 -- that one is PEEK):
+    /// extends the invisible time of a POP message.
     ///
-    /// 响应给的是**新的** popTime/invisibleTime/reviveQid；成功时用它们 + 请求里的 offset
-    /// 重建一个 8 段 extraInfo（结果里的 ExtraInfo），**后续 ACK 必须用新串**。
+    /// The response carries the **new** popTime/invisibleTime/reviveQid; on success use
+    /// them plus the offset from the request to rebuild an 8-segment extraInfo (the
+    /// ExtraInfo in the result), and **later ACKs must use the new string**.
     /// </summary>
     public ChangeInvisibleTimeResult ChangeInvisibleTime(string consumerGroup, string topic,
         int queueId, string extraInfo, long offset, long invisibleTime,
@@ -1570,10 +1604,12 @@ public sealed class MQClientInstance : IDisposable
         return result;
     }
 
-    // ---------------- 消费位点 ----------------
+    // ---------------- Consumer offsets ----------------
 
-    /// 与管理侧 offset 查询（<see cref="PublishAddrInAdmin"/>）的差别只在最后那一步：
-    /// 管理 API 一律打主、主没了就报错；位点读取允许退到从节点。
+    /// The only difference from the admin-side offset query
+    /// (<see cref="PublishAddrInAdmin"/>) is that last step: the admin API always targets
+    /// the master and reports an error when there is none, while an offset read may fall
+    /// back to a slave.
     /// </summary>
     private string ConsumerOffsetAddrFor(MessageQueue mq)
     {
@@ -1657,7 +1693,8 @@ public sealed class MQClientInstance : IDisposable
         return arr;
     }
 
-    /// <summary>批量锁队列；返回 broker 确认锁定成功的队列集（lockOKMQSet）。</summary>
+    /// <summary>Locks queues in bulk; returns the set of queues the broker confirmed as
+    /// locked (lockOKMQSet).</summary>
     public List<MessageQueue> LockBatchMq(string consumerGroup, string clientId,
         IReadOnlyList<MessageQueue> mqs, int timeoutMillis = 5000)
     {
@@ -1690,7 +1727,7 @@ public sealed class MQClientInstance : IDisposable
             RemotingCommand response = InvokeSyncRaw(addr, RequestCode.LockBatchMq,
                 null, payload, true, timeoutMillis);
             CheckResponseCode(response);
-            // LockBatchResponseBody：{"lockOKMQSet":[{topic,brokerName,queueId}]}
+            // LockBatchResponseBody: {"lockOKMQSet":[{topic,brokerName,queueId}]}
             string text = Encoding.UTF8.GetString(response.Body ?? Array.Empty<byte>());
             if (!Json.TryParse(text, out JsonValue root, out string? error) || root is null)
             {
@@ -1717,7 +1754,7 @@ public sealed class MQClientInstance : IDisposable
         return lockOk;
     }
 
-    /// <summary>批量解锁队列（顺序消费清退时调用）。</summary>
+    /// <summary>Unlocks queues in bulk (called when an orderly consumer retires).</summary>
     public void UnlockBatchMq(string consumerGroup, string clientId,
         IReadOnlyList<MessageQueue> mqs, int timeoutMillis = 5000)
     {
@@ -1807,7 +1844,7 @@ public sealed class MQClientInstance : IDisposable
         return respHeader.Offset ?? 0;
     }
 
-    // ---------------- 心跳 / 注销 ----------------
+    // ---------------- Heartbeat / unregister ----------------
 
     public void SendHeartbeat(string addr, HeartbeatData heartbeatData, int timeoutMillis = 5000)
     {
@@ -1833,7 +1870,7 @@ public sealed class MQClientInstance : IDisposable
         CheckResponseCode(response);
     }
 
-    // ---------------- CHECK_CLIENT_CONFIG(46)：订阅表达式向 broker 求证 ----------------
+    // ---------------- CHECK_CLIENT_CONFIG(46): have the broker validate the subscription expression ----------------
 
     public const int MqClientApiTimeoutMillis = 3000;
 
@@ -1878,9 +1915,11 @@ public sealed class MQClientInstance : IDisposable
         }
     }
 
-    /// 为什么必须发：SQL92 表达式写错时 broker 的 ExpressionMessageFilter 在 ConsumeQueue
-    /// 阶段拿不到编译好的过滤数据会<b>直接放行全部消息</b>（返回 true），静默变成「订阅全部
-    /// 消息」、启动也不报错；这一调用把「写错的表达式」变成启动期一次显式失败。
+    /// Why it must be sent: when a SQL92 expression is wrong, the broker's
+    /// ExpressionMessageFilter cannot obtain the compiled filter data at the ConsumeQueue
+    /// stage and **lets every message through** (returns true), silently turning into
+    /// "subscribe to all messages" with no error at startup; this call turns "a wrong
+    /// expression" into one explicit failure at startup.
     public void CheckSubscriptionsInBroker(string group, IEnumerable<SubscriptionData> subs)
     {
         foreach (SubscriptionData? sub in subs)
@@ -1903,7 +1942,7 @@ public sealed class MQClientInstance : IDisposable
             }
             catch (MQClientException)
             {
-                throw;  // 已带 broker 响应码，原样上抛
+                throw;  // already carries the broker response code, rethrown as is
             }
             catch (Exception e)
             {
@@ -1917,15 +1956,16 @@ public sealed class MQClientInstance : IDisposable
         }
     }
 
-    // ---------------- 通用同步调用（管理端复用）----------------
+    // ---------------- Generic synchronous invocation (reused by the admin side)----------------
 
     /// <summary>
-    /// 下发任意 requestCode + extFields + body。languageOverride &gt;= 0 时覆盖请求的
-    /// language 字段：个别 RPC 会按它改变行为（INVOKE_BROKER_TO_RESET_OFFSET 对
-    /// CPP/PYTHON 才返回可解析的 offsetTable 响应体）。
+    /// Issues any requestCode + extFields + body. When languageOverride &gt;= 0 it overrides
+    /// the request's language field: a few RPCs change behaviour based on it
+    /// (INVOKE_BROKER_TO_RESET_OFFSET only returns a parseable offsetTable body for
+    /// CPP/PYTHON).
     ///
-    /// 不做响应码校验，留给调用方自己判断（管理端很多接口的"未找到"
-    /// 是正常分支，例如 QUERY_NOT_FOUND）。
+    /// The response code is not validated; that is left to the caller (for many admin
+    /// endpoints "not found" is a normal branch, e.g. QUERY_NOT_FOUND).
     /// </summary>
     public RemotingCommand InvokeSyncRaw(string addr, int code,
         PropertyMap? extFields = null, byte[]? body = null, bool hasBody = false,
@@ -1954,7 +1994,8 @@ public sealed class MQClientInstance : IDisposable
         return _remotingClient.InvokeSync(addr, request, timeoutMillis);
     }
 
-    /// <summary>invokeSyncRaw + 响应码校验（非 SUCCESS 抛 MQBrokerException）。</summary>
+    /// <summary>invokeSyncRaw plus response code validation (non-SUCCESS throws
+    /// MQBrokerException).</summary>
     public RemotingCommand InvokeSync(string addr, int code,
         PropertyMap? extFields = null, byte[]? body = null, bool hasBody = false,
         int timeoutMillis = 3000, int languageOverride = -1)
@@ -1964,7 +2005,7 @@ public sealed class MQClientInstance : IDisposable
         return response;
     }
 
-    // ---------------- 管理类 ----------------
+    // ---------------- Admin ----------------
 
     public void CreateTopicInBroker(string brokerAddr, string defaultTopic,
         string topic, int readQueueNums = 4,
@@ -2002,7 +2043,7 @@ public sealed class MQClientInstance : IDisposable
             }
             catch (MQBrokerException)
             {
-                // broker 明确拒绝（如 TOPIC_EXIST_ALREADY）不重试，直接上抛
+                // An explicit broker rejection (e.g. TOPIC_EXIST_ALREADY) is not retried, it is rethrown
                 throw;
             }
             catch (Exception e)
@@ -2080,7 +2121,7 @@ public sealed class MQClientInstance : IDisposable
         throw new MQClientException("Failed to delete topic " + topic + " in name server: " + lastError);
     }
 
-    // ---------------- 集群 / Topic / 消费者列表 ----------------
+    // ---------------- Cluster / topic / consumer lists ----------------
 
     public ClusterInfo GetBrokerClusterInfo(int timeoutMillis = 10000)
     {
@@ -2217,11 +2258,12 @@ public sealed class MQClientInstance : IDisposable
         }
     }
 
-    // ---------------- 按 Key / uniqKey 查消息 ----------------
+    // ---------------- Query messages by key / uniqKey ----------------
 
     /// <summary>
-    /// indexType 见 MessageConst.Index*Type；uniqKey 为 true 时额外下发
-    /// MixAll.UniqueMsgQueryFlag，命中后按 msgId == key 二次校验。
+    /// indexType see MessageConst.Index*Type; when uniqKey is true the request additionally
+    /// carries MixAll.UniqueMsgQueryFlag, and on a hit it is verified a second time with
+    /// msgId == key.
     /// </summary>
     public bool QueryMessage(string topic, string key, int maxNum,
         long beginTimestamp, long endTimestamp, out byte[] outBody,
@@ -2333,7 +2375,7 @@ public sealed class MQClientInstance : IDisposable
                     string keys = m.Keys;
                     if (keys.Length > 0)
                     {
-                        // KEYS 以空格（MessageConst.KEY_SEPARATOR）分隔
+                        // KEYS are separated by a space (MessageConst.KEY_SEPARATOR)
                         if (keys.Split(' ', StringSplitOptions.None).Any(piece => piece == key && m.Topic == topic))
                         {
                             messages.Add(m);
@@ -2352,5 +2394,5 @@ public sealed class MQClientInstance : IDisposable
         return messages;
     }
 
-    // ---------------- 工具 ----------------
+    // ---------------- Utilities ----------------
 }

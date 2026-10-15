@@ -4,8 +4,9 @@ using RocketMQ.Common;
 
 namespace RocketMQ.Client;
 
-/// 实现 MQFaultStrategy + LatencyFaultToleranceImpl（带 FaultItem）：追踪每个 broker 的
-/// 发送延迟，延迟过高或发生异常时<b>隔离</b>一段时间（不分配给新消息），默认关闭。
+/// Implements MQFaultStrategy + LatencyFaultToleranceImpl (with FaultItem): tracks each broker's
+/// send latency; when latency is too high or an exception occurs the broker is <b>isolated</b>
+/// for a while (not assigned to new messages). Disabled by default.
 public class FaultItem
 {
     public FaultItem(string name)
@@ -169,7 +170,7 @@ public class LatencyFaultToleranceImpl
         }
     }
 
-    /// <summary>供测试/诊断读取（不存在返回 null）。</summary>
+    /// <summary>Read for tests/diagnostics (returns null when absent).</summary>
     public FaultItem? GetFaultItem(string name)
     {
         lock (_lock)
@@ -289,11 +290,11 @@ public class LatencyFaultToleranceImpl
     }
 }
 
-/// 仅当 SendLatencyFaultEnable 为 true 时，发送选队列阶段会：
-///   1) 优先选 available（隔离期已过）的 broker；
-///   2) 否则选 reachable 的 broker；
-///   3) 否则退化为普通轮询。
-/// 发送结果/异常会回调 UpdateFaultItem 写延迟与隔离信息。
+/// Only when SendLatencyFaultEnable is true does the send queue-selection phase:
+///   1) prefer an available broker (isolation period expired);
+///   2) otherwise pick a reachable broker;
+///   3) otherwise fall back to plain round-robin.
+/// Send results/exceptions call back into UpdateFaultItem to record latency and isolation info.
 /// </summary>
 public class MQFaultStrategy
 {
@@ -337,7 +338,7 @@ public class MQFaultStrategy
                 tpInfo.ResetIndex();
             }
 
-            // 1) available：隔离期已过的 broker
+            // 1) available: brokers whose isolation period has expired
             MessageQueue? mq = tpInfo.SelectOneMessageQueue(
                 q => LatencyFaultTolerance.IsAvailable(q.BrokerName),
                 q => lastBrokerName == null || q.BrokerName != lastBrokerName);
@@ -346,7 +347,7 @@ public class MQFaultStrategy
                 return mq;
             }
 
-            // 2) reachable：隔离中但通道仍可达的 broker
+            // 2) reachable: brokers that are isolated but whose channel is still reachable
             mq = tpInfo.SelectOneMessageQueue(
                 q => LatencyFaultTolerance.IsReachable(q.BrokerName),
                 q => lastBrokerName == null || q.BrokerName != lastBrokerName);
@@ -355,11 +356,12 @@ public class MQFaultStrategy
                 return mq;
             }
 
-            // 3) 全部被隔离且不可达：退化为普通轮询
+            // 3) all isolated and unreachable: fall back to plain round-robin
             return tpInfo.SelectOneMessageQueue();
         }
 
-        // 关闭时退化为普通轮询（lastBrokerName 非空时避开它；全部同名时该重载内部已兜底）
+        // When disabled, falls back to plain round-robin (avoiding lastBrokerName
+        // when non-null; that overload already handles the all-same-name case)
         return tpInfo.SelectOneMessageQueue(lastBrokerName ?? "");
     }
 
@@ -376,7 +378,7 @@ public class MQFaultStrategy
         LatencyFaultTolerance.UpdateFaultItem(brokerName, currentLatency, duration, reachable);
     }
 
-    /// <summary>从表尾向首找第一个 latency &gt;= LatencyMax[i] 的档位；都不满足返回 0。</summary>
+    /// <summary>Finds, scanning from the tail toward the head, the first tier with latency &gt;= LatencyMax[i]; returns 0 if none matches.</summary>
     public long ComputeNotAvailableDuration(double currentLatency)
     {
         for (int i = LatencyMax.Length - 1; i >= 0; --i)

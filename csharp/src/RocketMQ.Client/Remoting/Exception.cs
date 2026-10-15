@@ -1,6 +1,6 @@
 namespace RocketMQ.Remoting;
 
-/// <summary>基础远程调用异常。</summary>
+/// <summary>Basic remoting exception.</summary>
 public class RemotingException : Exception
 {
     public RemotingException(string message) : base(message)
@@ -23,8 +23,9 @@ public class RemotingSendRequestException : RemotingException
 }
 
 /// <summary>
-/// 长轮询超时等「预期内」超时。上层把它当良性 DEBUG 处理——
-/// broker 会把下发的 suspend 钳制到自身 brokerSuspendMaxTimeMillis，空闲队列周期性超时是正常行为。
+/// "Expected" timeouts such as long-polling timeouts. Upper layers treat it as benign DEBUG —
+/// the broker clamps the issued suspend down to its own brokerSuspendMaxTimeMillis, so periodic
+/// timeouts on idle queues are normal behavior.
 /// </summary>
 public class RemotingTimeoutException : RemotingException
 {
@@ -33,7 +34,7 @@ public class RemotingTimeoutException : RemotingException
     }
 }
 
-/// <summary>帧/头部解码失败。</summary>
+/// <summary>Frame/header decode failure.</summary>
 public class RemotingCommandException : RemotingException
 {
     public RemotingCommandException(string message) : base(message)

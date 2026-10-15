@@ -1,14 +1,21 @@
-// 拉模式消费者心跳真机验证（#98），覆盖场景段 A0–A6。
-// 用法：rmq pull-heartbeat [namesrv] [masterAddr] [slaveAddr]
+// Real-machine verification of the pull-mode consumer heartbeat (#98), covering scenario
+// sections A0-A6.
+// Usage: rmq pull-heartbeat [namesrv] [masterAddr] [slaveAddr]
 //
-// 为什么必须真机：离线单测只证明「报文形状对」，证明不了 broker 的 ConsumerManager 真的把
-// 本组登记进 consumerTable（broker 是按台建表的），也证明不了 35 注销之后立刻摘除。
-//   * 203 examineConsumerConnectionInfo：组在不在、consumeType / consumeFromWhere /
-//     messageModel / subscriptionTable 是什么（AdminBrokerProcessor:1971 读的就是这些）；
-//   * 38 GET_CONSUMER_LIST_BY_GROUP：consumerTable 里的 clientId 列表（裸 RPC，组不在时
-//     broker 回 "no consumer for this group"，不是空列表）；
-//   * shutdown → 35 之后 203 是否立刻查不到（不必等 ~120s 通道扫描）。
-// 反面对照：从未心跳过的幽灵组必须查不到 —— 否则说明判据本身是空转的。
+// Why it must be a real machine: the offline unit tests only prove "the wire shape is
+// right", they cannot prove that the broker's ConsumerManager really registered this group
+// in consumerTable (the broker builds the table per instance), nor that the 35 unregister
+// removes it immediately.
+//   * 203 examineConsumerConnectionInfo: whether the group is there, and what
+//     consumeType / consumeFromWhere / messageModel / subscriptionTable are (these are
+//     exactly what AdminBrokerProcessor:1971 reads);
+//   * 38 GET_CONSUMER_LIST_BY_GROUP: the clientId list in consumerTable (a bare RPC; when
+//     the group is not there the broker replies "no consumer for this group", not an empty
+//     list);
+//   * after shutdown -> 35, whether a 203 stops finding it at once (without waiting out the
+//     ~120s channel scan).
+// The negative control: a ghost group that never heartbeated must not be findable --
+// otherwise the criterion itself is spinning on nothing.
 using System.Globalization;
 
 using RocketMQ.Client;
@@ -45,7 +52,8 @@ public static class LivePullHeartbeat
 
     private static long NowMs() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
-    // 203 的原始答案：在线返回 ConsumerConnection，不在线返回 null（异常一律当不在线）。
+    // 203's raw answer: ConsumerConnection when online, null when not (an exception always
+    // counts as not online).
     private static ConsumerConnection? GroupIsOnline(DefaultMQAdminExt admin, string group,
         string addr)
     {
@@ -59,7 +67,8 @@ public static class LivePullHeartbeat
         }
     }
 
-    // 38 的原始答案：组不在时 broker 抛 "no consumer for this group"，当空列表处理。
+    // 38's raw answer: when the group is not there the broker throws "no consumer for this
+    // group", which is treated as an empty list.
     private static List<string> ConsumerIds(DefaultMQAdminExt admin, string group, string addr)
     {
         try
@@ -102,10 +111,10 @@ public static class LivePullHeartbeat
         DefaultMQPullConsumer? consumer = null;
         try
         {
-            // ---------------- A0 建 topic ----------------
+            // ---------------- A0 create the topic ----------------
             admin.CreateTopicInBroker(master, Topic, 4, 4);
 
-            // ---------------- A1 起拉模式消费者并拉一轮 ----------------
+            // ---------------- A1 start the pull-mode consumer and pull one round ----------------
             consumer = new DefaultMQPullConsumer(Group);
             consumer.SetNamesrvAddr(namesrv);
             consumer.RegisterMessageQueueListener(Topic, new NoopListener());
@@ -126,64 +135,64 @@ public static class LivePullHeartbeat
                 pullStatus = e.GetType().Name + ": " + e.Message;
             }
 
-            Check("A1 拉模式消费者启动并成功拉取一轮",
+            Check("A1 the pull-mode consumer started and pulled one round successfully",
                 consumer.HeartbeatCount >= 1 && mqs.Count > 0
                     && (pullStatus == "Found" || pullStatus == "NoNewMsg"),
                 "queues=" + mqs.Count.ToString(CultureInfo.InvariantCulture) + " status=" + pullStatus
                     + " heartbeats=" + consumer.HeartbeatCount.ToString(CultureInfo.InvariantCulture));
 
-            // ---------------- A2 主节点 203 ----------------
+            // ---------------- A2 203 on the master ----------------
             ConsumerConnection? conn = GroupIsOnline(admin, Group, master);
-            Check("A2 主节点 203 查到本组（心跳已注册）", conn is not null,
+            Check("A2 the 203 on the master finds this group (the heartbeat registered it)", conn is not null,
                 "connections="
                     + (conn is null ? "-" : conn.ConnectionSet.Count.ToString(CultureInfo.InvariantCulture)));
-            Check("A2 消费类型是 CONSUME_ACTIVELY",
+            Check("A2 the consume type is CONSUME_ACTIVELY",
                 conn is not null && conn.ConsumeType == ConsumeType.ConsumeActively,
                 "consumeType=" + (conn?.ConsumeType ?? "-"));
-            Check("A2 消费位点是 CONSUME_FROM_LAST_OFFSET（:353）",
+            Check("A2 the consume-from-where is CONSUME_FROM_LAST_OFFSET (:353)",
                 conn is not null && conn.ConsumeFromWhere == ConsumeFromWhere.ConsumeFromLastOffset,
                 "consumeFromWhere=" + (conn?.ConsumeFromWhere ?? "-"));
-            Check("A2 广播/集群口径是 CLUSTERING",
+            Check("A2 the broadcasting/cluster rule is CLUSTERING",
                 conn is not null && conn.MessageModel == MessageModel.Clustering,
                 "messageModel=" + (conn?.MessageModel ?? "-"));
 
             string? subString = conn is null ? null : SubStringOf(conn, Topic);
-            Check("A2b 203 的订阅表带 registerTopics 的 topic 且 subString=*",
+            Check("A2b the 203 subscription table carries the topic from registerTopics and subString=*",
                 subString == "*",
                 "subscriptionTable=" + (conn?.SubscriptionTable.Dump() ?? "-"));
 
-            // ---------------- A3 38 主节点 ----------------
+            // ---------------- A3 38 on the master ----------------
             string clientId = consumer.ClientId;
             List<string> ids = ConsumerIds(admin, Group, master);
-            Check("A3 主节点 38 查到本 clientId", ids.Contains(clientId),
+            Check("A3 the 38 on the master finds this clientId", ids.Contains(clientId),
                 "ids=" + ids.Count.ToString(CultureInfo.InvariantCulture) + " clientId=" + clientId);
 
-            // ---------------- A4 从节点 ----------------
+            // ---------------- A4 the slave ----------------
             if (slave.Length > 0)
             {
                 ConsumerConnection? slaveConn = GroupIsOnline(admin, Group, slave);
-                Check("A4 从节点 203 也查到本组（心跳扇出到从节点）", slaveConn is not null,
+                Check("A4 the 203 on the slave finds this group too (the heartbeat fans out to the slave)", slaveConn is not null,
                     "slave=" + slave + " connections="
                         + (slaveConn is null
                             ? "-"
                             : slaveConn.ConnectionSet.Count.ToString(CultureInfo.InvariantCulture)));
                 List<string> slaveIds = ConsumerIds(admin, Group, slave);
-                Check("A4 从节点 38 也查到本 clientId", slaveIds.Contains(clientId),
+                Check("A4 the 38 on the slave finds this clientId too", slaveIds.Contains(clientId),
                     "ids=" + slaveIds.Count.ToString(CultureInfo.InvariantCulture));
             }
 
-            // ---------------- A5 对照：幽灵组（从未心跳）必须查不到 ----------------
+            // ---------------- A5 the control: a ghost group (never heartbeated) must not be findable ----------------
             ConsumerConnection? ghostConn = GroupIsOnline(admin, GhostGroup, master);
             List<string> ghostIds = ConsumerIds(admin, GhostGroup, master);
-            Check("A5 对照：未心跳的幽灵组 203 查不到", ghostConn is null,
+            Check("A5 control: a 203 for the never-heartbeated ghost group finds nothing", ghostConn is null,
                 "connections="
                     + (ghostConn is null
                         ? "-"
                         : ghostConn.ConnectionSet.Count.ToString(CultureInfo.InvariantCulture)));
-            Check("A5 对照：未心跳的幽灵组 38 空列表", ghostIds.Count == 0,
+            Check("A5 control: the 38 for the never-heartbeated ghost group is an empty list", ghostIds.Count == 0,
                 "ids=" + ghostIds.Count.ToString(CultureInfo.InvariantCulture));
 
-            // ---------------- A6 shutdown 立刻注销（35）----------------
+            // ---------------- A6 shutdown unregisters immediately (35)----------------
             consumer.Shutdown();
             consumer = null;
             bool gone = false;
@@ -199,11 +208,11 @@ public static class LivePullHeartbeat
                 Thread.Sleep(500);
             }
 
-            Check("A6 shutdown 后 203 立刻查不到本组（发过 35 注销）", gone, "clientId=" + clientId);
+            Check("A6 after shutdown a 203 stops finding this group at once (the 35 unregister was sent)", gone, "clientId=" + clientId);
         }
         catch (Exception e)
         {
-            Check("联调异常", false, e.ToString());
+            Check("the integration threw", false, e.ToString());
         }
         finally
         {
@@ -213,7 +222,7 @@ public static class LivePullHeartbeat
             }
             catch (Exception)
             {
-                // 清理路径，忽略
+                // the cleanup path, ignored
             }
 
             try
@@ -222,7 +231,7 @@ public static class LivePullHeartbeat
             }
             catch (Exception)
             {
-                // 清理路径，忽略
+                // the cleanup path, ignored
             }
 
             admin.Shutdown();

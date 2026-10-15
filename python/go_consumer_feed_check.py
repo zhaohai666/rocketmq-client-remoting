@@ -29,9 +29,10 @@ def check(name, ok, detail=""):
 
 
 def _admin():
-    # 注意 DefaultMQAdminExt 的第一个位置参数是 rpc_hook，不是 clientId / group！
-    # 传字符串进去会让每个请求在 `hook.do_before_request` 上炸 AttributeError，
-    # 而路由查询那层把异常吞掉、只表现为「topic not exist」，非常难查。
+    # Note: the first positional parameter of DefaultMQAdminExt is rpc_hook, not clientId / group!
+    # Passing a string there makes every request blow up with an AttributeError on
+    # `hook.do_before_request`, while the route query layer swallows the exception and only
+    # shows up as "topic not exist", which is very hard to diagnose.
     a = DefaultMQAdminExt()
     a.set_namesrv_addr(NAMESRV)
     a.start()
@@ -39,7 +40,7 @@ def _admin():
 
 
 def ensure_topic(admin, topic, queues):
-    """建 topic 并等路由可见；已存在则把队列数覆盖成我们想要的。"""
+    """Create the topic and wait until the route becomes visible; if it already exists, overwrite the queue count with the one we want."""
     admin.create_topic(MixAll.DEFAULT_TOPIC, topic, queues)
     deadline = time.time() + 20
     while time.time() < deadline:
@@ -50,7 +51,7 @@ def ensure_topic(admin, topic, queues):
         if route is not None:
             if len(route.get_all_subscribe_message_queue(topic)) == queues:
                 return True
-            # 路由在、队列数不对：覆盖一次再看。
+            # The route is there but the queue count is wrong: overwrite it once and look again.
             admin.create_topic(MixAll.DEFAULT_TOPIC, topic, queues)
         time.sleep(0.5)
     return False
@@ -64,9 +65,11 @@ def producer():
 
 
 def produce(topic, count, orderly_topic=None, orderly_count=0):
-    """主 topic：偶数号 TagA / 奇数号 TagB，body 里写明 tag 便于对拍。
+    """The main topic: TagA for even indices / TagB for odd ones, with the tag written into
+    the body to make the comparison easy.
 
-    顺序 topic：单队列，body 按序号递增，给 Go 的顺序消费用例对顺序用。
+    The orderly topic: a single queue whose body increases with the index, for the Go orderly
+    consumption test case to check ordering.
     """
     admin = _admin()
     try:
@@ -75,7 +78,7 @@ def produce(topic, count, orderly_topic=None, orderly_count=0):
             wanted.append((orderly_topic, ORDERLY_QUEUES))
         for name, queues in wanted:
             ok = ensure_topic(admin, name, queues)
-            check("建 topic %s（%d 队列）" % (name, queues), ok)
+            check("created topic %s (%d queues)" % (name, queues), ok)
     finally:
         admin.shutdown()
 
@@ -91,7 +94,7 @@ def produce(topic, count, orderly_topic=None, orderly_count=0):
                 sent += 1
             else:
                 print("send %d -> %s" % (i, r.send_status))
-        check("produce %d 条到 %s" % (count, topic), sent == count, "sent=%d" % sent)
+        check("produced %d messages to %s" % (count, topic), sent == count, "sent=%d" % sent)
         print("PRODUCED=%d" % sent)
 
         if orderly_topic and orderly_count:
@@ -101,7 +104,7 @@ def produce(topic, count, orderly_topic=None, orderly_count=0):
                 r = p.send(Message(topic=orderly_topic, body=body, tags="TagA"))
                 if r.send_status == SendStatus.SEND_OK:
                     osent += 1
-            check("produce %d 条到顺序 topic %s" % (orderly_count, orderly_topic),
+            check("produced %d messages to the orderly topic %s" % (orderly_count, orderly_topic),
                   osent == orderly_count, "sent=%d" % osent)
             print("PRODUCED_ORDERLY=%d" % osent)
     finally:
@@ -112,8 +115,9 @@ def produce(topic, count, orderly_topic=None, orderly_count=0):
 def verify(topic, group, count, unreg_group=None):
     admin = _admin()
     try:
-        # 消费侧要的是「读队列」（get_all_subscribe_message_queue），不是发布队列：
-        # 只读 topic、以及主掉线只剩从节点的路由上，两者给出的队列集合不同。
+        # The consumer side wants the "read queues" (get_all_subscribe_message_queue), not the
+        # publish queues: for a read-only topic, and for a route where the master is down and only
+        # the slave is left, the two yield different queue sets.
         queues = admin.examine_topic_route(topic).get_all_subscribe_message_queue(topic)
         total = 0
         per_queue = {}
@@ -125,28 +129,30 @@ def verify(topic, group, count, unreg_group=None):
             if off > 0:
                 total += off
         check(
-            "broker 上 %s 在 %s 的已提交位点合计 = %d" % (group, topic, count),
+            "the committed offsets of %s on %s on the broker add up to %d" % (group, topic, count),
             total == count,
             "total=%d per_queue=%s" % (total, sorted(per_queue.items())),
         )
 
         if unreg_group:
-            # 优雅注销：Go 侧 shutdown 发了 UNREGISTER_CLIENT，broker 的消费连接
-            # 列表里就不该再有它。组彻底下线时 broker 回 SUBSCRIPTION_NOT_EXIST
-            # ("not online")，客户端把它翻成 MQBrokerException —— 那正是要的结果。
-            # 注意 MQBrokerException 与 MQClientException 是**平级**的，只 catch
-            # 后者会让这条检查以异常收场（第一版就是这么挂的）。
+            # Graceful unregistration: the Go side sent UNREGISTER_CLIENT on shutdown, so it
+            # must no longer appear in the broker's consumer connection list. When the group is
+            # completely offline the broker replies SUBSCRIPTION_NOT_EXIST ("not online"), which
+            # the client turns into an MQBrokerException -- exactly the expected outcome.
+            # Note that MQBrokerException and MQClientException are **siblings**; catching only
+            # the latter makes this check end in an exception (that is exactly how the first
+            # version broke).
             try:
                 conn = admin.examine_consumer_connection_info(unreg_group)
                 ids = list(getattr(conn, "connection_set", []) or [])
-                check("停机后 broker 上无 %s 的残留连接" % unreg_group,
+                check("no leftover connections of %s on the broker after shutdown" % unreg_group,
                       len(ids) == 0, "connections=%d" % len(ids))
             except MQBrokerException as e:
                 text = str(e)
-                check("停机后 %s 已从 broker 注销（组不在线）" % unreg_group,
+                check("%s has been unregistered from the broker after shutdown (group not online)" % unreg_group,
                       "not online" in text, "code=%s %s" % (e.response_code, text))
             except MQClientException as e:
-                check("停机后 %s 已从 broker 注销（组不在线）" % unreg_group, True, str(e))
+                check("%s has been unregistered from the broker after shutdown (group not online)" % unreg_group, True, str(e))
     finally:
         admin.shutdown()
 

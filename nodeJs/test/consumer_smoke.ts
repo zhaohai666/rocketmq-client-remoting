@@ -100,7 +100,8 @@ console.log('== LocalFileOffsetStore ==');
   const mq = new MessageQueue('T', 'broker-a', 0);
   store.updateOffset(mq, 42, false);
   await store.persistAll([mq]);
-  // offsets 文件的键是紧凑的内联对象形态（键本身是 JSON 对象）。
+  // The keys of the offsets file are in the compact inline object shape (the key
+  // itself is a JSON object).
   const file = path.join(base, 'cid1', 'g1', 'offsets.json');
   const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
   const keys = Object.keys(raw.offsetTable);
@@ -146,7 +147,8 @@ console.log('== trace codec ==');
     decoded[0].traceType === 'Pub' && decoded[0].traceBeans[0].topic === 'T'
     && decoded[0].traceBeans[0].msgId === 'UNIQ_KEY_1');
 
-  // 不带 keys 的 SubBefore → 解码成 7 段的边界情况也必须能解出来。
+  // A SubBefore without keys -> the boundary case of decoding into 7 segments
+  // must decode as well.
   const sub = new TraceContext();
   sub.traceType = TraceType.SUB_BEFORE;
   sub.groupName = 'G';
@@ -158,7 +160,8 @@ console.log('== trace codec ==');
   sub.traceBeans = [subBean];
   const enc2 = EncodeTraceContext(sub);
   // Encoder always writes 8 fields (type..keys) → 7 `\x01` separators.
-  // "7 段"是解码侧的效应：split 丢弃尾部空段，只剩 7 段。
+  // "7 segments" is an effect on the decoding side: split discards trailing empty
+  // segments, leaving 7.
   const segs = enc2!.transData.split('\u0001').length;
   check('keys-less SubBefore emits 8 fields (7 separators)', segs === 8);
   const dec2 = DecodeTraceDataString(enc2!.transData);

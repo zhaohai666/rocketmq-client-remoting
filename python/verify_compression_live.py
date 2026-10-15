@@ -6,7 +6,7 @@ import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# Windows 控制台默认 GBK，docstring 里的 ⚠ 会让 print 直接抛 UnicodeEncodeError
+# The Windows console defaults to GBK, and the ⚠ in docstrings would make print raise UnicodeEncodeError directly
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(errors="replace")
 
@@ -43,7 +43,7 @@ def crc32(data):
 
 
 def recv_n(topic, group, n, timeout_sec=30):
-    """消费 n 条消息（CONSUME_FROM_FIRST_OFFSET），超时返回已收到的（可能不足 n）。"""
+    """Consume n messages (CONSUME_FROM_FIRST_OFFSET); on timeout return what has been received (possibly fewer than n)."""
     got = []
 
     def on_msg(msgs):
@@ -64,7 +64,7 @@ def recv_n(topic, group, n, timeout_sec=30):
 
 
 def recv_one(topic, group, timeout_sec=30):
-    """消费 1 条消息（CONSUME_FROM_FIRST_OFFSET），超时返回 None。"""
+    """Consume 1 message (CONSUME_FROM_FIRST_OFFSET); on timeout return None."""
     got = recv_n(topic, group, 1, timeout_sec)
     return got[0] if got else None
 
@@ -83,7 +83,7 @@ def do_send(topic, group, size, codec="zlib"):
     prod = DefaultMQProducer(group)
     prod.set_namesrv_addr(NAMESRV)
     prod.set_send_msg_timeout(10000)
-    # 阈值以下不会压缩，矩阵要的是「真的压过」，所以调用方给够载荷尺寸（默认阈值 4 KiB）。
+    # Below the threshold nothing is compressed; the matrix wants "really compressed", so the caller supplies a large enough payload (default threshold 4 KiB).
     prod.set_compress_type(ctype)
     prod.start()
     sr = prod.send(Message(topic, payload))
@@ -110,12 +110,12 @@ def selftest():
     stamp = int(time.time())
     topic = "CompressLivePy_%d" % stamp
     group = "CompressLivePyGroup_%d" % stamp
-    size = 8192  # 远超 compressMsgBodyOverHowmuch(4096)
+    size = 8192  # far above compressMsgBodyOverHowmuch(4096)
     payload = build_payload(size)
     payload_crc = crc32(payload)
-    print("payload len=%d crc32=%d（确定性载荷，crc32 与探针同算法）" % (size, payload_crc))
+    print("payload len=%d crc32=%d (deterministic payload, crc32 uses the same algorithm as the probe)" % (size, payload_crc))
 
-    # 1) 发出
+    # 1) send
     prod = DefaultMQProducer("CompressLivePyProducer_%d" % stamp)
     prod.set_namesrv_addr(NAMESRV)
     prod.set_send_msg_timeout(10000)
@@ -123,31 +123,31 @@ def selftest():
     sr = prod.send(Message(topic, payload))
     prod.shutdown()
     ok_send = sr.send_status.name == "SEND_OK"
-    check("发送 %dB 消息（触发自动压缩）" % size, ok_send, "msgId=%s" % sr.msg_id)
+    check("send a %dB message (trigger auto-compression)" % size, ok_send, "msgId=%s" % sr.msg_id)
 
-    # 2) 收回来，正文必须与原文逐字节一致（证明"压缩-存储-解压"闭环）
+    # 2) receive it back; the body must be byte-for-byte identical to the original (proving the "compress-store-decompress" loop)
     m = recv_one(topic, group)
     if m is None:
-        check("消费回压缩消息", False, "30s 超时")
+        check("consume the compressed message back", False, "30s timeout")
         return 1
     body = m.get_body()
     store_size = getattr(m, "store_size", 0)
-    check("消费回压缩消息", True, "len=%d storeSize=%d" % (len(body), store_size))
-    check("解压后正文与原文一致（len + CRC32）",
+    check("consume the compressed message back", True, "len=%d storeSize=%d" % (len(body), store_size))
+    check("decompressed body matches the original (len + CRC32)",
           len(body) == size and crc32(body) == payload_crc,
-          "期望 len=%d crc=%d 实际 len=%d crc=%d" % (size, payload_crc, len(body), crc32(body)))
+          "expected len=%d crc=%d actual len=%d crc=%d" % (size, payload_crc, len(body), crc32(body)))
 
-    # 3) broker 里存的确实是压缩体：storeSize 应远小于原文长度
-    check("broker 侧存储为压缩体（storeSize 远小于原文）",
+    # 3) the broker really stores a compressed body: storeSize should be far smaller than the original length
+    check("broker-side storage is a compressed body (storeSize far smaller than the original)",
           store_size > 0 and store_size < size // 2,
-          "storeSize=%d 原文=%d 压缩比=%d:1"
+          "storeSize=%d original=%d ratio=%d:1"
           % (store_size, size, size // (store_size if store_size else 1)))
 
     sys_flag = getattr(m, "sys_flag", 0)
-    check("解压后 COMPRESSED_FLAG 已清除",
+    check("COMPRESSED_FLAG is cleared after decompression",
           not MessageSysFlag.is_compressed(sys_flag), "sysFlag=%d" % sys_flag)
 
-    # 5) 小消息不应被压缩（阈值语义）
+    # 5) small messages must not be compressed (threshold semantics)
     small_topic = "CompressLivePySmall_%d" % stamp
     small_group = "CompressLivePySmallGroup_%d" % stamp
     small = b"tiny-payload-under-threshold"
@@ -158,22 +158,22 @@ def selftest():
     prod2.shutdown()
     sm = recv_one(small_topic, small_group, 20)
     if sm is not None:
-        check("小于阈值(4096)的消息不压缩",
+        check("messages below the threshold (4096) are not compressed",
               sm.get_body() == small and not MessageSysFlag.is_compressed(getattr(sm, "sys_flag", 0)),
               "len=%d storeSize=%s" % (len(sm.get_body()), getattr(sm, "store_size", "?")))
     else:
-        check("小于阈值(4096)的消息不压缩", False, "20s 未消费到")
+        check("messages below the threshold (4096) are not compressed", False, "not consumed within 20s")
 
-    # 6) 复现"线上带压缩标志"的编解码路径，确认标志位语义闭环
+    # 6) reproduce the codec path of a "wire message with the compression flag set", confirming the flag-bit semantics loop
     probe = MessageExt(topic, payload)
     probe.sys_flag = MessageSysFlag.set_compression_type(
         MessageSysFlag.COMPRESSED_FLAG, MessageSysFlag.ZLIB_TYPE)
     stored = encode_message_ext(probe, need_compress=True)
     raw = decode_message(stored, decompress_body=False)
     restored = decode_message(stored, decompress_body=True)
-    check("带压缩标志编码后存储体变小", len(stored) < size // 2,
-          "stored=%d 原文=%d" % (len(stored), size))
-    check("不解压解码拿到压缩字节、解压解码还原原文",
+    check("the stored body shrinks after encoding with the compression flag", len(stored) < size // 2,
+          "stored=%d original=%d" % (len(stored), size))
+    check("decoding without decompression yields compressed bytes, decoding with decompression restores the original",
           raw is not None and restored is not None
           and len(raw.get_body()) < size
           and restored.get_body() == payload
@@ -181,17 +181,17 @@ def selftest():
           "rawLen=%s restoredLen=%s"
           % (len(raw.get_body()) if raw else "?", len(restored.get_body()) if restored else "?"))
 
-    # 7) 另外两个后端各过一遍真机闭环：生产端压缩 → broker 存压缩体 → 消费端解压还原。
-    #    与 zlib 那条的区别在于「自己的发送路径真的用上了这个后端」；缺包时打 SKIP，
-    #    不算失败（message_decoder 在缺 lz4/zstandard 时是**明确抛错**的，不会静默透传）。
+    # 7) run the other two backends through the live loop as well: producer compression -> broker stores compressed body -> consumer decompresses back.
+    #    the difference from the zlib line is that "our own send path really used this backend"; print SKIP when the package is missing,
+    #    which does not count as failure (message_decoder explicitly raises when lz4/zstandard are missing, it never silently passes through).
     import importlib.util
     for backend_name, ctype, mod in (
             ("lz4", MessageSysFlag.LZ4_TYPE, "lz4.frame"),
             ("zstd", MessageSysFlag.ZSTD_TYPE, "zstandard"),
     ):
-        tag = "后端 %s 真机往返" % backend_name
+        tag = "live round trip for backend %s" % backend_name
         if importlib.util.find_spec(mod) is None:
-            print("[SKIP] %s  本 venv 没装 %s" % (tag, mod.split(".")[0]))
+            print("[SKIP] %s  %s is not installed in this venv" % (tag, mod.split(".")[0]))
             continue
         bt = "CompressLivePy_%s_%d" % (backend_name, stamp)
         bg = "CompressLivePyGroup_%s_%d" % (backend_name, stamp)
@@ -204,7 +204,7 @@ def selftest():
         bp.shutdown()
         bm = recv_one(bt, bg)
         if bm is None:
-            check(tag, False, "30s 未消费到")
+            check(tag, False, "not consumed within 30s")
             continue
         bbody = bm.get_body()
         bstore = getattr(bm, "store_size", 0) or 0
@@ -225,15 +225,15 @@ def selftest():
     after_first = reused.get_body()
     rp.send(reused)
     rp.shutdown()
-    check("复用同一条 Message：发送后调用方 body 未被就地改写（prevBody 还原）",
+    check("reusing one Message: the caller's body is not rewritten in place after sending (prevBody restored)",
           len(after_first) == size and crc32(after_first) == payload_crc,
-          "第一次发送后 len=%d crc=%d（失败=调用方拿到了压缩流）"
+          "after the first send len=%d crc=%d (failure=the caller got the compressed stream)"
           % (len(after_first), crc32(after_first)))
     rms = recv_n(reuse_topic, reuse_group, 2)
-    check("复用同一条 Message：两次真机往返都还原原文",
+    check("reusing one Message: both live round trips restore the original",
           len(rms) == 2 and all(
               len(x.get_body()) == size and crc32(x.get_body()) == payload_crc for x in rms),
-          "收到 %d 条 storeSize=%s len=%s"
+          "received %d storeSize=%s len=%s"
           % (len(rms), [getattr(x, "store_size", "?") for x in rms],
              [len(x.get_body()) for x in rms]))
 

@@ -2,19 +2,20 @@
 
 declare(strict_types=1);
 
-// 压缩矩阵腿：参数与退出码固定。
+// Compression matrix leg: fixed parameters and exit codes.
 //
 //   php examples/live_compression.php send <topic> <group> <size> <namesrv> [codec]
 //   php examples/live_compression.php recv <topic> <group> <size> <namesrv>
 //
 //
-// codec 面覆盖 zlib（gzcompress）+ lz4（CompressionCodec 的纯 PHP **LZ4 Frame**
-// 实现，frame 内部块就是 block-format）+ zstd（优先 `zstd` CLI，退回纯 PHP
-// Raw/RLE 帧）——见 2026-10-08。接收端按 sysFlag 类型位
-// 自动解压，所以「B 能解 A 压的」正是矩阵要证明的部分。
+// The codec surface covers zlib (gzcompress) + lz4 (a pure-PHP **LZ4 Frame** implementation in
+// CompressionCodec; the frame's inner chunks are the block format) + zstd (prefers the `zstd`
+// CLI, falls back to a pure-PHP Raw/RLE frame) — see 2026-10-08. The receiver auto-decompresses
+// by the sysFlag type bits, so "B can decompress what A compressed" is exactly what the matrix
+// is meant to prove.
 //
-// 退出码（矩阵脚本据此区分）：0 ok / 1 普通失败（含发送失败，
-// 不能占用 2）/ 2 坏 codec 或坏用法 / 3 recv 超时。
+// Exit codes (the matrix script keys off them): 0 ok / 1 ordinary failure (including send
+// failure; must not take 2) / 2 bad codec or bad usage / 3 recv timeout.
 require __DIR__ . '/../bootstrap.php';
 
 use RocketMQ\Client\DefaultMQProducer;
@@ -24,7 +25,7 @@ use RocketMQ\Client\SendStatus;
 use RocketMQ\Common\Message;
 use RocketMQ\Common\MessageSysFlag;
 
-// payloadLine 是矩阵的种子，任何端口都逐字节一致。
+// payloadLine is the matrix's seed; every port must be byte-for-byte identical.
 const PAYLOAD_LINE = "rocketmq-compress-interop-payload-line-0123456789\n";
 
 function build_payload(int $size): string
@@ -36,7 +37,7 @@ function build_payload(int $size): string
     return substr($out, 0, $size);
 }
 
-/** 标准 CRC-32（无符号十进制字符串），发送腿与接收腿用它对账正文。 */
+/** Standard CRC-32 (unsigned decimal string); the send and recv legs use it to reconcile the body. */
 function crc_u32(string $data): string
 {
     return sprintf('%u', crc32($data));
@@ -63,7 +64,7 @@ if ($argv0 === 'send') {
 
     $codecTypes = ['zlib' => MessageSysFlag::ZLIB_TYPE, 'lz4' => MessageSysFlag::LZ4_TYPE, 'zstd' => MessageSysFlag::ZSTD_TYPE];
     if (!isset($codecTypes[$codec])) {
-        // 2 严格留给"坏 codec / 坏用法"：普通发送失败绝不能报 2。
+        // 2 is strictly reserved for "bad codec / bad usage": an ordinary send failure must never report 2.
         echo "SEND_UNSUPPORTED codec=$codec (php port supports zlib|lz4|zstd)" . PHP_EOL;
         exit(2);
     }
@@ -75,7 +76,7 @@ if ($argv0 === 'send') {
         $p->sendMsgTimeout = 5000;
         $p->setCompressType($codecTypes[$codec]);
         $p->start();
-        // body >= compressMsgBodyOverHowmuch(4096) ⇒ 生产端自动压缩
+        // body >= compressMsgBodyOverHowmuch(4096) => the producer compresses automatically
         $r = $p->send(new Message($topic, $payload));
         $p->shutdown();
         if ($r->sendStatus !== SendStatus::SEND_OK) {
@@ -116,7 +117,7 @@ if ($argv0 === 'recv') {
                 $queues = $c->fetchSubscribeMessageQueues($topic);
             } catch (Throwable) {
                 usleep(500_000);
-                continue; // 路由还没出来
+                continue; // route not ready yet
             }
             foreach ($queues as $mq) {
                 $offset = 0;
@@ -127,7 +128,7 @@ if ($argv0 === 'recv') {
                     }
                     foreach ($r->msgFoundList as $m) {
                         $body = (string) $m->getBody();
-                        // 按 size 找目标载荷（同 topic 上可能混有其他腿的消息）
+                        // Locate the target payload by size (other legs may share this topic)
                         if (strlen($body) !== $size) {
                             continue;
                         }
@@ -137,7 +138,7 @@ if ($argv0 === 'recv') {
                             $c->shutdown();
                             exit(0);
                         }
-                        // 解出了消息但 CRC 不一致 = 静默数据损坏本体
+                        // Message decoded but CRC mismatch = the silent data corruption itself
                         echo "RECV_BAD match=0 crc=$got expect=$expect size=$size" . PHP_EOL;
                         $c->shutdown();
                         exit(1);

@@ -1,5 +1,6 @@
-// 公平性只保证「队列头部才可能拿到」，不保证拿到顺序严格等于到达顺序：超时的等待者会
-// 从队列里摘掉自己，摘除瞬间顺序由剩余等待者的到达顺序决定 —— 与 Semaphore(true) 一致。
+// Fairness only guarantees that "only the head of the queue may acquire"; it does not guarantee the acquisition order
+// strictly equals the arrival order: a timed-out waiter removes itself from the queue, and at that moment the order is
+// determined by the arrival order of the remaining waiters — consistent with Semaphore(true).
 namespace RocketMQ.Client;
 
 public sealed class FairSemaphore
@@ -8,7 +9,7 @@ public sealed class FairSemaphore
 
     public const long MinAsyncSendSize = 1024 * 1024;
 
-    // 一个还在排队的许可申请（只为让队首能被稳定识别，不代表已拿到许可）。
+    // A permit request still in the queue (only so the head can be stably identified; does not mean the permit is acquired).
     private sealed class Waiter
     {
         public Waiter(long permits) { Permits = permits; }
@@ -40,21 +41,21 @@ public sealed class FairSemaphore
                 {
                     _queue.Remove(node);
                     _free -= permits;
-                    Monitor.PulseAll(_sync);  // 队首换人，下一个人可能就够了
+                    Monitor.PulseAll(_sync);  // head changed, the next person may be enough
                     return true;
                 }
 
                 long remaining = deadline - Environment.TickCount64;
                 if (remaining <= 0)
                 {
-                    // 超时：把自己从队列里摘掉，别挡后面的人
+                    // Timed out: remove self from the queue, don't block those behind
                     _queue.Remove(node);
-                    Monitor.PulseAll(_sync);  // 同上：挡路的人走了
+                    Monitor.PulseAll(_sync);  // same as above: the blocker left
                     return false;
                 }
 
-                // Wait 的唤醒可能是假的（PulseAll 叫醒所有人，被叫醒的人可能仍排不到队首），
-                // 所以醒来后重新核对，不依赖返回值。
+                // A Wait wakeup may be spurious (PulseAll wakes everyone, a woken one may still not reach the head),
+                // so re-check after waking and do not rely on the return value.
                 Monitor.Wait(_sync, (int)Math.Min(remaining, int.MaxValue));
             }
         }
@@ -74,7 +75,7 @@ public sealed class FairSemaphore
         }
     }
 
-    /// <summary>当前空闲许可。可能为负（见 <see cref="SetTotalPermits" />）。</summary>
+    /// <summary>Current free permits. May be negative (see <see cref="SetTotalPermits" />).</summary>
     public long AvailablePermits()
     {
         lock (_sync)
@@ -103,7 +104,7 @@ public sealed class FairSemaphore
     {
         lock (_sync)
         {
-            // 差额全记在空闲许可上 ⇒ 在途份数 (total - free) 保持不变
+            // The whole delta is recorded on free permits => in-flight count (total - free) stays unchanged
             _free += total - _total;
             _total = total;
             Monitor.PulseAll(_sync);

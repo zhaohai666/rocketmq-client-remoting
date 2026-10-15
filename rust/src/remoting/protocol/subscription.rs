@@ -1,9 +1,9 @@
-//! 订阅组配置的报文模型：
+//! Packet models for subscription group configuration:
 //! [`SubscriptionGroupConfig`] / [`GroupRetryPolicy`] / [`SimpleSubscriptionData`] /
-//! [`SubscriptionGroupWrapper`]。admin（`examineSubscriptionGroupConfig` 等）与
-//! broker 侧返回体都走这里。
+//! [`SubscriptionGroupWrapper`]. Both admin commands (`examineSubscriptionGroupConfig` and friends) and
+//! broker-side response bodies go through here.
 //!
-//! ## 报文细节
+//! ## Wire details
 
 use serde_json::{Map, Value};
 
@@ -14,7 +14,7 @@ use super::serialize::RemotingSerializable;
 use crate::error::{Error, Result};
 use crate::remoting::protocol::ext_fields::StringMap;
 
-/// `MixAll.MASTER_ID`。
+/// Master broker id (protocol constant).
 pub const MASTER_ID: i32 = 0;
 
 pub mod group_retry_policy_type {
@@ -251,9 +251,9 @@ impl SubscriptionGroupConfig {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SubscriptionGroupWrapper {
-    /// 保序：`getAllSubscriptionGroup` 的返回表按 broker 顺序透传。
+    /// Order-preserving: the table returned by `getAllSubscriptionGroup` is passed through in broker order.
     pub subscription_group_table: Vec<(String, SubscriptionGroupConfig)>,
-    /// broker 侧为 `ConcurrentHashMap<String, ?>`，客户端只原样带出。
+    /// On the broker side this is a `ConcurrentHashMap<String, ?>`; the client just carries it through verbatim.
     pub forbidden_table: Value,
     pub data_version: Value,
 }
@@ -371,7 +371,7 @@ impl TopicQueueCountTable {
 mod tests {
     use super::*;
 
-    /// 默认订阅组配置（groupName=MyGroup）的紧凑 JSON 真值。
+    /// Compact JSON golden value for the default subscription group config (groupName=MyGroup).
     const GOLDEN_CONFIG: &str = r#"{"groupName":"MyGroup","consumeEnable":true,"consumeFromMinEnable":true,"consumeBroadcastEnable":true,"consumeMessageOrderly":false,"retryQueueNums":1,"retryMaxTimes":16,"groupRetryPolicy":{"type":"CUSTOMIZED"},"brokerId":0,"whichBrokerWhenConsumeSlowly":1,"notifyConsumerIdsChangedEnable":true,"groupSysFlag":0,"consumeTimeoutMinute":15,"attributes":{}}"#;
 
     #[test]
@@ -393,7 +393,7 @@ mod tests {
         let text = serde_json::to_string(&value).unwrap();
         assert!(
             text.ends_with(r#","subscriptionDataSet":[{"topic":"TopicTest","expressionType":"TAG","expression":"*||TagA","version":1234}]}"#),
-            "subscriptionDataSet 必须排在 attributes 之后，got {text}"
+            "subscriptionDataSet must come after attributes, got {text}"
         );
         let back = SubscriptionGroupConfig::from_json_value(&value).unwrap();
         assert_eq!(back, with_set);
@@ -467,14 +467,14 @@ mod tests {
         let text = String::from_utf8(encoded.clone()).unwrap();
         assert!(
             text.starts_with(r#"{"dataVersion":{"stateVersion":1,"timestamp":1700000000000,"counter":0},"forbiddenTable":{},"subscriptionGroupTable":{"GroupB":"#),
-            "顶层与表内键序必须稳定，got {text}"
+            "top-level and table key order must be stable, got {text}"
         );
         let back = SubscriptionGroupWrapper::decode(&encoded).unwrap();
         assert_eq!(back.subscription_group_table.len(), 2);
         assert_eq!(back.get("GroupA").unwrap().retry_max_times, 3);
         assert_eq!(back, wrapper);
 
-        // insert 覆盖同名项且不改变位置
+        // insert overwrites the entry with the same name and keeps its position
         let mut updated = SubscriptionGroupConfig::new("GroupA");
         updated.retry_max_times = 9;
         wrapper.insert(updated);

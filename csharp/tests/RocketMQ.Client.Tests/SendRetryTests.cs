@@ -1,6 +1,7 @@
-// 真集群造不出 SYSTEM_BUSY，也造不出「慢 broker 把总预算吃光」，而这两条恰好是这段
-// 内核的全部难点，所以这里用进程内假集群（MockCluster.cs：1 个 namesrv + N 个 broker，
-// 只说 remoting 协议），把每个 broker 的应答码和应答延迟脚本化。
+// A real cluster cannot produce SYSTEM_BUSY, and it cannot produce "a slow broker eats
+// the whole budget" either, yet those two are the entire difficulty of this kernel, so
+// an in-process fake cluster is used here (MockCluster.cs: 1 namesrv + N brokers, speaking
+// only the remoting protocol), scripting each broker's response code and response delay.
 using System.Diagnostics;
 using System.Globalization;
 using System.Net;
@@ -18,7 +19,7 @@ public class SendRetryTests
 {
     private const string Topic = "T1";
 
-    // ---------------------------------------------------------------- 用例
+    // ---------------------------------------------------------------- Cases
 
     private static DefaultMQProducer Started(MockCluster cluster, string group)
     {
@@ -49,18 +50,19 @@ public class SendRetryTests
             Assert.True(producer.IsRetryResponseCode(code), "code=" + code);
         }
 
-        // 没等到响应码（连接就没建立）等于不可重试；不在集合里的码也不可重试
+        // Never getting a response code (the connection was not even established) counts as non-retryable; a code not in the set is non-retryable too
         Assert.False(producer.IsRetryResponseCode(null));
         Assert.False(producer.IsRetryResponseCode(ResponseCode.MessageIllegal));
 
         producer.AddRetryResponseCode(ResponseCode.MessageIllegal);
         Assert.True(producer.IsRetryResponseCode(ResponseCode.MessageIllegal));
-        // RetryResponseCodes 给的是副本，改它不影响判定
+        // RetryResponseCodes hands out a copy, so mutating it does not affect the decision
         producer.RetryResponseCodes.Clear();
         Assert.True(producer.IsRetryResponseCode(ResponseCode.MessageIllegal));
     }
 
-    /// <summary>可重试的 broker 响应码：换一台重发，最终落在那台健康的 broker 上。</summary>
+    /// <summary>A retryable broker response code: resend to another broker and finally
+    /// land on that healthy broker.</summary>
     [Fact]
     public void RetryableBrokerCode_SwitchesToAnotherBroker()
     {
@@ -76,7 +78,8 @@ public class SendRetryTests
         producer.Shutdown();
     }
 
-    /// <summary>不可重试的响应码：一次都不该重试，异常原样抛给调用方。</summary>
+    /// <summary>A non-retryable response code: not one retry, the exception is thrown to
+    /// the caller as is.</summary>
     [Fact]
     public void NonRetryableBrokerCode_ThrowsAtOnce()
     {
@@ -91,7 +94,8 @@ public class SendRetryTests
         producer.Shutdown();
     }
 
-    /// <summary>加了RetryResponseCode 之后，原本不可重试的码也要换 broker。</summary>
+    /// <summary>After adding a RetryResponseCode, a code that was originally
+    /// non-retryable must also switch broker.</summary>
     [Fact]
     public void AddedRetryResponseCode_MakesCodeRetryable()
     {
@@ -107,7 +111,8 @@ public class SendRetryTests
         producer.Shutdown();
     }
 
-    /// <summary>重试耗尽：错误码取最后一次失败的 broker 响应码，文案带上打过交道的 broker 列表。</summary>
+    /// <summary>Retries exhausted: the error code is taken from the last failing broker's
+    /// response code, and the message lists the brokers it dealt with.</summary>
     [Fact]
     public void ExhaustedRetries_ReportBrokersSentAndCode()
     {
@@ -125,7 +130,8 @@ public class SendRetryTests
         producer.Shutdown();
     }
 
-    /// <summary>路由完全取不到：循环外就按 NOT_FOUND_TOPIC 定性，不把重试次数空转掉。</summary>
+    /// <summary>The route cannot be obtained at all: it is classified as NOT_FOUND_TOPIC
+    /// outside the loop, without burning the retry count.</summary>
     [Fact]
     public void MissingRoute_FailsFastWithNotFoundTopicCode()
     {
@@ -134,20 +140,22 @@ public class SendRetryTests
 
         MQClientException e = Assert.Throws<MQClientException>(() => producer.Send(Msg()));
         Assert.Equal(ClientErrorCode.NotFoundTopicException, e.ResponseCode);
-        // 一次 broker 都没联系过 —— 失败发生在选队列之前
+        // Not a single broker was contacted -- the failure happened before queue selection
         Assert.Equal(0, cluster.Requests(0));
         producer.Shutdown();
     }
 
-    /// 少了这一步，配错地址服务器的运维会去查 topic 存在不存在，方向完全错。
-    /// 这里在 Start 之后把实例的地址列表清空，模拟"跑着跑着地址没了"。
+    /// Without this step, whoever misconfigured the address server would go check whether
+    /// the topic exists, which is the completely wrong direction. Here the instance's
+    /// address list is emptied after Start to simulate "the addresses vanished while
+    /// running".
     /// </summary>
     [Fact]
     public void NoNameServerAddress_Reports10004NotMissingRoute()
     {
         using var cluster = MockCluster.Start(1, routeOk: false);
         DefaultMQProducer producer = Started(cluster, "GID_NoNamesrv");
-        // NameServerAddrs 暴露的是实例内部那个 List 本身，所以 Clear 就是改它
+        // NameServerAddrs exposes the instance's internal List itself, so Clear mutates it
         ((List<string>)producer.Client().NameServerAddrs).Clear();
 
         MQClientException e = Assert.Throws<MQClientException>(() => producer.Send(Msg()));
@@ -158,8 +166,9 @@ public class SendRetryTests
     }
 
     /// <summary>
-    /// 对照分支：地址在、只是这个 topic 拉不到路由 → 10004 不能把 10005 顶掉。
-    /// 与 <see cref="MissingRoute_FailsFastWithNotFoundTopicCode"/> 同一条检查的两面。
+    /// The contrasting branch: the addresses are there, only this topic's route cannot be
+    /// fetched -> 10004 must not be masked by 10005. This is the other side of the same
+    /// check as <see cref="MissingRoute_FailsFastWithNotFoundTopicCode"/>.
     /// </summary>
     [Fact]
     public void NameServerConfigured_KeepsThe10005NoRouteCode()
@@ -173,9 +182,11 @@ public class SendRetryTests
     }
 
     /// <summary>
-    /// ClientErrorCode 表一共七个常量，
-    /// 一个都不能少、一个都不能改值。10001~10005 是发送重试的定性；10006/10007 各有各的抛出点
-    /// （request-reply 超时、造应答消息失败），以前表里缺这两个，站点只能拿默认码 1 抛出去。
+    /// The ClientErrorCode table has exactly seven constants, none may be missing and
+    /// none may have its value changed. 10001~10005 classify send retries; 10006/10007
+    /// each have their own throw site (request-reply timeout, failure to build the reply
+    /// message) -- the table used to lack these two, so a site had to throw with the
+    /// default code 1.
     /// </summary>
     [Fact]
     public void ClientErrorCodeTable_MatchesLegacy()
@@ -202,11 +213,13 @@ public class SendRetryTests
         Assert.Equal(expected, got);
     }
 
-    /// <summary>连不上 broker：定性成 CONNECT_BROKER_EXCEPTION(10001)，而不是原样冒泡。</summary>
+    /// <summary>Cannot connect to the broker: classified as CONNECT_BROKER_EXCEPTION
+    /// (10001) instead of bubbling up as is.</summary>
     [Fact]
     public void ConnectFailure_IsQualifiedWith10001()
     {
-        // 借一个刚释放的本地端口当"死 broker"：路由有效，但三次尝试都连不上
+        // Borrows a just-released local port as a "dead broker": the route is valid but
+        // all three attempts fail to connect
         Socket probe = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
         probe.Bind(new IPEndPoint(IPAddress.Loopback, 0));
         string deadAddr = ((IPEndPoint)probe.LocalEndPoint!).ToString();
@@ -216,15 +229,17 @@ public class SendRetryTests
         DefaultMQProducer producer = Started(cluster, "GID_RetryConnect");
         producer.RetryTimesWhenSendFailed = 2;
 
-        // 本机回环对"刚释放端口"的拒绝可能被防火墙压到 ~2s 才回：默认 3s 预算撑不满
-        // 3 次尝试，会被判 callTimeout 抛超时；放宽让重试跑完，落进 10001。
+        // A local loopback rejection of a "just released port" can be stretched to ~2s by
+        // the firewall: the default 3s budget cannot cover 3 attempts and would be judged
+        // callTimeout and throw a timeout; relax it so the retries run out and land in 10001.
         MQClientException e = Assert.Throws<MQClientException>(() => producer.Send(Msg(), 30_000));
         Assert.Equal(ClientErrorCode.ConnectBrokerException, e.ResponseCode);
         Assert.Contains("Send [3] times, still failed", e.Message);
         producer.Shutdown();
     }
 
-    /// <summary>单次超时上限：慢 broker 不能把整个预算吃光，剩下的 broker 还有机会。</summary>
+    /// <summary>The per-attempt timeout cap: a slow broker must not eat the whole budget,
+    /// the remaining brokers still get a chance.</summary>
     [Fact]
     public void PerRequestTimeout_CapsSlowBrokerAndRetries()
     {
@@ -240,7 +255,7 @@ public class SendRetryTests
         watch.Stop();
 
         Assert.Equal(SendStatus.SendOk, result.SendStatus);
-        // 没有上限的话第一次就要等满 700ms 才返回；这里 150ms 就放弃了那台慢 broker
+        // Without the cap the first attempt would have to wait the full 700ms to return; here it gives up on that slow broker after 150ms
         Assert.True(watch.ElapsedMilliseconds < 500,
             "elapsed=" + watch.ElapsedMilliseconds.ToString(CultureInfo.InvariantCulture));
         Assert.Equal(1, cluster.Requests(1));
@@ -248,7 +263,8 @@ public class SendRetryTests
     }
 
     /// <summary>
-    /// 总预算用完：抛 RemotingTooMuchRequestException 而不是「重试耗尽」，且第二笔不许上线。
+    /// The whole budget is used up: throws RemotingTooMuchRequestException rather than
+    /// "retries exhausted", and the second send must not go on the wire.
     [Fact]
     public void ExhaustedBudget_ReportsCallTimeout()
     {
@@ -269,7 +285,8 @@ public class SendRetryTests
         producer.Shutdown();
     }
 
-    /// <summary>在 SendMessageBefore 里睡 fixed 毫秒：把耗时确定地加进发送路径本身。</summary>
+    /// <summary>Sleeps fixed milliseconds inside SendMessageBefore: adds a deterministic
+    /// amount of time to the send path itself.</summary>
     private sealed class SleepBeforeHook : ISendMessageHook
     {
         private readonly int _millis;
@@ -285,7 +302,8 @@ public class SendRetryTests
         }
     }
 
-    /// <summary>「存了但没存好」：默认原样返回，开了开关才换 broker。</summary>
+    /// <summary>"Stored but not stored well": returned as is by default, only switches
+    /// broker when the switch is on.</summary>
     [Fact]
     public void NotStoreOk_OnlySwitchesBrokerWhenConfigured()
     {
@@ -309,7 +327,8 @@ public class SendRetryTests
         on.Shutdown();
     }
 
-    /// <summary>故障规避打开时：失败的 broker 要被隔离（不可选），成功的那台要记下真实延迟。</summary>
+    /// <summary>With fault avoidance on: the failing broker must be isolated (not
+    /// selectable) and the successful one must record its real latency.</summary>
     [Fact]
     public void FailedBroker_IsIsolated_AndLatencyIsRecorded()
     {
@@ -323,10 +342,10 @@ public class SendRetryTests
         Assert.Equal(SendStatus.SendOk, result.SendStatus);
 
         LatencyFaultToleranceImpl tolerance = producer.MqFaultStrategy.LatencyFaultTolerance;
-        Assert.False(tolerance.IsAvailable("broker-0"), "回错误的 broker 必须被隔离");
+        Assert.False(tolerance.IsAvailable("broker-0"), "the broker that returned an error must be isolated");
         FaultItem? failed = tolerance.GetFaultItem("broker-0");
         Assert.NotNull(failed);
-        // 记的仍是真实延迟（~30ms），而不是隔离档位（10000ms）
+        // What is recorded is still the real latency (~30ms), not the isolation tier (10000ms)
         Assert.InRange(failed!.CurrentLatency, 10.0, 600.0);
         Assert.False(failed.IsReachable());
         FaultItem? ok = tolerance.GetFaultItem("broker-1");
@@ -336,14 +355,14 @@ public class SendRetryTests
         producer.Shutdown();
     }
 
-    // ------------------------------------------------------- 请求钩子真的写到 socket 上
+    // ------------------------------------------------------- The request hook really reaches the socket
 
     private const string WireSk = "SK_wire_12345678";
 
     [Fact]
     public void RequestHooksReachTheWire()
     {
-        // ---- ① 只有 ACL：签名字段在，ReqT 不在 ----
+        // ---- (1) ACL only: the signature fields are present, ReqT is not ----
         using (var cluster = MockCluster.Start(1))
         {
             DefaultMQProducer producer = StartedWithHook(cluster, "GID_HookAclOnly", false);
@@ -353,11 +372,11 @@ public class SendRetryTests
             Assert.NotNull(rec);
             Assert.Equal("AK_wire", rec!.Ext[SessionCredentials.AccessKeyField]);
             Assert.True(rec.Ext.ContainsKey(SessionCredentials.SignatureField));
-            Assert.False(rec.Ext.ContainsKey(MixAll.ReqT), "没开 stream 不该打 ReqT");
+            Assert.False(rec.Ext.ContainsKey(MixAll.ReqT), "ReqT must not be sent without stream enabled");
             producer.Shutdown();
         }
 
-        // ---- ② ACL + stream：ReqT 在签**之前**写入，所以算进签名 ----
+        // ---- (2) ACL + stream: ReqT is written **before** signing, so it counts towards the signature ----
         using (var cluster = MockCluster.Start(1))
         {
             DefaultMQProducer producer = StartedWithHook(cluster, "GID_HookStreamAcl", true);
@@ -365,26 +384,27 @@ public class SendRetryTests
 
             WireRecord rec = cluster.FirstSendRequest()!;
             Assert.Equal("0", rec.Ext[MixAll.ReqT]);
-            // broker 侧复算：拿抓到的报文（含 ReqT、排除 Signature）重算一遍签名
+            // Recomputed on the broker side: recompute the signature once over the captured
+            // request (including ReqT, excluding Signature)
             Assert.Equal(rec.Ext[SessionCredentials.SignatureField],
                 AclClientRPCHook.CalcSignature(WireSk, rec.ToCommand()));
             producer.Shutdown();
         }
 
-        // ---- ③ lite 消费者默认开 stream：路由 + 心跳都带标 ----
+        // ---- (3) a lite consumer enables stream by default: both the route and the heartbeat carry the flag ----
         using (var cluster = MockCluster.Start(1))
         {
             DefaultLitePullConsumer consumer = StartedLite(cluster, "GID_HookLite", stream: null);
             Assert.True(cluster.CountRequestsWith(RequestCode.GetRouteinfoByTopic,
-                MixAll.ReqT, "0") > 0, "路由请求要带 ReqT");
+                MixAll.ReqT, "0") > 0, "a route request must carry ReqT");
             Assert.Equal(cluster.CountRequests(RequestCode.GetRouteinfoByTopic),
                 cluster.CountRequestsWith(RequestCode.GetRouteinfoByTopic, MixAll.ReqT, "0"));
             Assert.True(cluster.CountRequestsWith(RequestCode.HeartBeat, MixAll.ReqT, "0") > 0,
-                "心跳要带 ReqT");
+                "a heartbeat must carry ReqT");
             consumer.Shutdown();
         }
 
-        // ---- ④ 显式关掉：一笔都不带，但请求确实发出去了 ----
+        // ---- (4) explicitly disabled: not one request carries it, but the request really went out ----
         using (var cluster = MockCluster.Start(1))
         {
             DefaultLitePullConsumer consumer = StartedLite(cluster, "GID_HookLiteOff", stream: false);
@@ -395,11 +415,14 @@ public class SendRetryTests
         }
     }
 
-    /// ⚠ 请求码与 V2 头的单字母键 <c>m</c>（batch）是两件事：broker 按 <c>m</c> 选
-    /// sendBatchMessage 还是单条写入（SendMessageProcessor:117 读 requestHeader.isBatch()），
-    /// 码只影响服务端按码归类（proxy AbstractRemotingActivity:69 与 auth
-    /// DefaultAuthorizationContextBuilder:230-240 都把 310/320 列在同一个 case 里）。
-    /// 所以两个都取证：只对码不对 <c>m</c>，批量 body 会被按单条解析。
+    /// Note: the request code and the single-letter key <c>m</c> (batch) of the V2 header
+    /// are two different things: the broker uses <c>m</c> to choose between
+    /// sendBatchMessage and a single write (SendMessageProcessor:117 reads
+    /// requestHeader.isBatch()), while the code only affects how the server categorises
+    /// by code (proxy AbstractRemotingActivity:69 and auth
+    /// DefaultAuthorizationContextBuilder:230-240 both list 310/320 in the same case).
+    /// So both are evidenced: matching the code but not <c>m</c> makes the batch body get
+    /// parsed as a single message.
     /// </summary>
     [Fact]
     public void SendRequestCodeFollowsLegacy()
@@ -420,7 +443,7 @@ public class SendRetryTests
         Assert.Equal(RequestCode.SendBatchMessage, batch.Code);
         Assert.Equal("true", batch.Ext["m"]);
 
-        // reply 判在 batch 之前：带 MSG_TYPE=reply 的批量仍然走 325。
+        // reply is judged before batch: a batch carrying MSG_TYPE=reply still goes to 325.
         cluster.ClearRequests();
         Message replyBatch = Msg();
         replyBatch.IsBatch = true;
@@ -433,14 +456,17 @@ public class SendRetryTests
         producer.Shutdown();
     }
 
-    /// <c>c</c>/<c>d</c> 是功能问题：broker 侧自动建 topic 时按这两个值决定队列数
-    /// （<c>AbstractSendMessageProcessor.createTopicInSendMessageMethod</c>），写死
-    /// TBW102/4 等于把 <c>CreateTopicKey</c> / <c>DefaultTopicQueueNums</c> 变成假 setter。
-    /// <c>n</c> 是线上报文对等：经典 broker 按连接地址寻址、不读它，proxy 与审计/轨迹侧读。
+    /// <c>c</c>/<c>d</c> are a functional matter: when the broker auto-creates a topic it
+    /// uses these two values to decide the queue count
+    /// (<c>AbstractSendMessageProcessor.createTopicInSendMessageMethod</c>), so hard-coding
+    /// TBW102/4 turns <c>CreateTopicKey</c> / <c>DefaultTopicQueueNums</c> into fake setters.
+    /// <c>n</c> is the on-the-wire peer of those: a classic broker addresses by connection
+    /// address and never reads it, while the proxy and the audit/trace side do.
     ///
-    /// 三种入口（同步 / 批量 320 / 单向）都要带同一份值，且 <c>d=0</c> 要原样上线 ——
-    /// 0 是「调用方明说的 0」，不是「没配」。异步入口的那一份见
-    /// ProducerAsyncTests.SendAsyncHeaderCarriesBrokerNameAndTopicKeys。
+    /// All three entry points (synchronous / batch 320 / oneway) must carry the same
+    /// values, and <c>d=0</c> must go on the wire verbatim -- 0 means "the caller explicitly
+    /// said 0", not "not configured". The async entry point's copy is covered by
+    /// ProducerAsyncTests.SendAsyncHeaderCarriesBrokerNameAndTopicKeys.
     /// </summary>
     [Fact]
     public void SendHeaderCarriesBrokerNameAndTopicKeys()
@@ -456,17 +482,17 @@ public class SendRetryTests
         Assert.Equal(MixAll.DefaultTopic, first.Ext["c"]);
         Assert.Equal("4", first.Ext["d"]);
 
-        // ---- ② c/d 跟着 producer 配置走；轮询换到 broker-1 时 n 也跟着换
+        // ---- (2) c/d follow the producer config; when round-robin moves to broker-1, n moves with it
         cluster.ClearRequests();
         producer.CreateTopicKey = "CreatedTopicKey";
         producer.DefaultTopicQueueNums = 9;
         Assert.Equal(SendStatus.SendOk, producer.Send(Msg()).SendStatus);
         WireRecord second = cluster.FirstSendRequest()!;
-        Assert.Equal("broker-1", second.Ext["n"]); // n 是这一笔选中的 broker，不是路由里的第一台
+        Assert.Equal("broker-1", second.Ext["n"]); // n is the broker this send selected, not the first one in the route
         Assert.Equal("CreatedTopicKey", second.Ext["c"]);
         Assert.Equal("9", second.Ext["d"]);
 
-        // ---- ③ 批量走同一个建头函数（码 320 与 m=true 由上一节负责）
+        // ---- (3) the batch goes through the same header-building function (the code 320 and m=true are covered by the previous section)
         cluster.ClearRequests();
         Assert.Equal(SendStatus.SendOk,
             producer.SendBatch(new List<Message> { Msg(), Msg() }).SendStatus);
@@ -474,18 +500,18 @@ public class SendRetryTests
         Assert.Equal(RequestCode.SendBatchMessage, batch.Code);
         Assert.Equal("CreatedTopicKey", batch.Ext["c"]);
         Assert.Equal("9", batch.Ext["d"]);
-        Assert.True(batch.Ext.ContainsKey("n"), "批量也要带 brokerName");
+        Assert.True(batch.Ext.ContainsKey("n"), "a batch must carry brokerName too");
 
-        // ---- ④ 单向：d=0 必须原样上线，不能被默认值 4 顶掉
+        // ---- (4) oneway: d=0 must go on the wire verbatim, it must not be overridden by the default 4
         cluster.ClearRequests();
         producer.DefaultTopicQueueNums = 0;
         producer.SendOneway(Msg());
-        Assert.True(WaitUntil(() => cluster.FirstSendRequest() != null, 3000), "单向请求要被抓到");
+        Assert.True(WaitUntil(() => cluster.FirstSendRequest() != null, 3000), "the oneway request must be captured");
         WireRecord oneway = cluster.FirstSendRequest()!;
-        // "0" 是调用方明说的 0，不能被默认值 4 顶掉
+        // "0" is the caller explicitly saying 0, it must not be overridden by the default 4
         Assert.Equal("0", oneway.Ext["d"]);
         Assert.Equal("CreatedTopicKey", oneway.Ext["c"]);
-        Assert.True(oneway.Ext.ContainsKey("n"), "单向也要带 brokerName");
+        Assert.True(oneway.Ext.ContainsKey("n"), "oneway must carry brokerName too");
 
         producer.Shutdown();
     }
@@ -521,12 +547,12 @@ public class SendRetryTests
         Assert.Equal(0, cluster.Requests(0));
         Assert.Null(cluster.FirstSendRequest());
 
-        // 同 topic 照发（守卫不能宽到误伤）
+        // The same topic still sends normally (the guard must not be so wide it hits valid sends)
         Assert.Equal(SendStatus.SendOk, producer
             .Send(Msg(), new MessageQueue(Topic, MockCluster.BrokerName(0), 0)).SendStatus);
         Assert.Equal(Topic, cluster.FirstSendRequest()!.Ext["b"]);
 
-        // 批量共用同一处守卫：不符即拒、零上线；同 topic 的批量照发
+        // A batch shares the same guard: a mismatch is rejected with zero on the wire; a batch with the same topic still sends
         int sent = cluster.Records().Count(r => IsSend(r.Code));
         Assert.Throws<MQClientException>(() => producer.SendBatch(
             new List<Message> { Msg(), Msg() }, new MessageQueue("T2", MockCluster.BrokerName(0), 0)));
@@ -550,9 +576,9 @@ public class SendRetryTests
         cluster.ClearRequests();
 
         producer.SendOneway(Msg(), new MessageQueue("T2", MockCluster.BrokerName(0), 3));
-        Assert.True(WaitUntil(() => cluster.FirstSendRequest() != null, 3000), "单向请求要被抓到");
+        Assert.True(WaitUntil(() => cluster.FirstSendRequest() != null, 3000), "the oneway request must be captured");
         WireRecord oneway = cluster.FirstSendRequest()!;
-        // 守卫若存在，这一笔会抛；发出来了且 b 是 msg 自己的 topic（不是队列的 T2）
+        // If a guard existed this send would throw; it went out and b is the msg's own topic (not the queue's T2)
         Assert.Equal(Topic, oneway.Ext["b"]);
         Assert.Equal("3", oneway.Ext["e"]);
         Assert.Equal(MockCluster.BrokerName(0), oneway.Ext["n"]);
@@ -560,8 +586,11 @@ public class SendRetryTests
     }
 
     /// <summary>
-    /// 命名空间下定点守卫比的是**各自包装之后**的资源名：队列 topic 已带前缀（真集群路由
-    /// 返回的就是这个形状）不能被误拒，裸名同样放行，跨命名空间的同名 topic 仍是不同资源。
+    /// Under a namespace the pinned guard compares the resource names **after each side
+    /// is wrapped**: a queue topic that already carries the prefix (exactly what a real
+    /// cluster's route returns) must not be rejected by mistake, a bare name is let
+    /// through too, and a same-named topic under a different namespace is still a
+    /// different resource.
     /// </summary>
     [Fact]
     public void PinnedSendComparesTopicsAfterNamespaceWrapping()
@@ -571,17 +600,17 @@ public class SendRetryTests
         producer.Namespace = "ns1";
         cluster.ClearRequests();
 
-        // ① 队列 topic 已带前缀
+        // (1) The queue topic already carries the prefix
         Assert.Equal(SendStatus.SendOk, producer
             .Send(Msg(), new MessageQueue("ns1%T1", MockCluster.BrokerName(0), 0)).SendStatus);
         Assert.Equal("ns1%T1", cluster.FirstSendRequest()!.Ext["b"]);
 
-        // ② 队列 topic 是裸名：两边包装后相等，同样放行
+        // (2) The queue topic is a bare name: equal after wrapping on both sides, so it is let through too
         Assert.Equal(SendStatus.SendOk, producer
             .Send(Msg(), new MessageQueue(Topic, MockCluster.BrokerName(0), 0)).SendStatus);
         Assert.Equal("ns1%T1", cluster.SendRequestAt(1)!.Ext["b"]);
 
-        // ③ 另一个命名空间下的同名 topic：要拒，且不多上线一笔
+        // (3) A same-named topic under another namespace: must be rejected, with not one extra send on the wire
         MQClientException e = Assert.Throws<MQClientException>(() => producer
             .Send(Msg(), new MessageQueue("ns2%T1", MockCluster.BrokerName(0), 0)));
         Assert.Equal("message's topic not equal mq's topic", e.Message);
@@ -606,12 +635,13 @@ public class SendRetryTests
         RemotingCommand without = inst.BuildSendRequest("PG_Header", noName,
             new MessageQueue(Topic, "", 0));
         without.MakeCustomHeaderToNet();
-        Assert.False(without.ExtFields.ContainsKey("n"), "空 brokerName 不该上线");
+        Assert.False(without.ExtFields.ContainsKey("n"), "an empty brokerName must not go on the wire");
         Assert.Equal(MixAll.DefaultTopic, without.ExtFields["c"]);
         Assert.Equal("4", without.ExtFields["d"]);
     }
 
-    /// <summary>轮询等待条件成立（单向发送没有应答可等）。</summary>
+    /// <summary>Polls until the condition holds (a oneway send has no response to wait
+    /// for).</summary>
     private static bool WaitUntil(Func<bool> cond, int millis)
     {
         Stopwatch watch = Stopwatch.StartNew();

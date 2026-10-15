@@ -7,24 +7,25 @@ namespace RocketMQ\Remoting\Protocol;
 use RocketMQ\Common\SubscriptionData;
 
 /**
- * 心跳数据：客户端向 broker 注册生产者 / 消费者及其订阅集合的线格式。
+ * Heartbeat data: the wire format with which the client registers producers / consumers and their
+ * subscription sets with the broker.
  */
 
-/** 消费方式（协议字段 consumeType 的枚举名）。 */
+/** The consume type (the enum name of the protocol field consumeType). */
 final class ConsumeType
 {
     public const CONSUME_ACTIVELY = 'CONSUME_ACTIVELY';
     public const CONSUME_PASSIVELY = 'CONSUME_PASSIVELY';
 }
 
-/** 消费模式（协议字段 messageModel 的枚举名）。 */
+/** The message model (the enum name of the protocol field messageModel). */
 final class MessageModel
 {
     public const CLUSTERING = 'CLUSTERING';
     public const BROADCASTING = 'BROADCASTING';
 }
 
-/** 起始消费位置（协议字段 consumeFromWhere 的枚举名）。 */
+/** The starting consumption position (the enum name of the protocol field consumeFromWhere). */
 final class ConsumeFromWhere
 {
     public const CONSUME_FROM_LAST_OFFSET = 'CONSUME_FROM_LAST_OFFSET';
@@ -53,7 +54,7 @@ final class ProducerData
 
 final class ConsumerData
 {
-    /** @var list<SubscriptionData> 集合语义：一个 topic 一条，调用方排序后填入；JSON 输出顺序即插入序 */
+    /** @var list<SubscriptionData> set semantics: one entry per topic, filled in by the caller after sorting; the JSON output order is the insertion order */
     public array $subscriptionDataSet = [];
     public bool $unitMode = false;
 
@@ -66,8 +67,8 @@ final class ConsumerData
     }
 
     /**
-     * 只输出 5.x broker 认识的 ConsumerData 字段（**不带** 4.x 的 consumeTimestamp /
-     * maxReconsumeTimes）；subscriptionDataSet 用 SubscriptionData.toDict()。
+     * Only emits the ConsumerData fields that a 5.x broker recognizes (**without** the 4.x
+     * consumeTimestamp / maxReconsumeTimes); subscriptionDataSet uses SubscriptionData.toDict().
      *
      * @return array<string, mixed>
      */
@@ -118,9 +119,11 @@ final class HeartbeatData
     }
 
     /**
-     * heartbeatFingerprint 故意留 0：broker 见到 0 走 V1 注册路径（用完整
-     * subscriptionDataSet 注册），最稳妥；非 0 才会进 heartBeatV2 优化。
-     * withoutSub 同理：协议里的布尔字段名就是 withoutSub，false 表示照常上报订阅集合。
+     * heartbeatFingerprint is deliberately left at 0: when the broker sees 0 it takes the V1 registration
+     * path (registering with the complete subscriptionDataSet), which is the safest; only a non-zero value
+     * enters the heartBeatV2 optimization.
+     * withoutSub for the same reason: the boolean field name in the protocol really is withoutSub, and
+     * false means the subscription set is reported as usual.
      *
      * @return array<string, mixed>
      */

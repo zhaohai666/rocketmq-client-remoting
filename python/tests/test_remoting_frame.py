@@ -44,7 +44,7 @@ class TestFrameLayout:
         assert header["remark"] == "hi"
         assert header["extFields"] == {"topic": "T"}
         assert header["language"] == LanguageCode.PYTHON
-        assert "body" not in header, "协议头声明 body 不参与序列化，帧里不该出现"
+        assert "body" not in header, "the protocol header declares that body is not serialized, so it must not appear in the frame"
 
     def test_null_remark_is_omitted(self):
         cmd = make_request()

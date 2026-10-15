@@ -25,38 +25,45 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update
-          # lz4 / zstd / openssl 与本机绿跑时的编译期后端保持一致：CI 少装一个，
-          # 就是换一条运行分支来测。
+          # lz4 / zstd / openssl match the compile-time backends used by the green local runs:
+          # dropping one from CI silently switches to a different runtime branch to test.
           sudo apt-get install -y cmake ninja-build zlib1g-dev g++ gdb \
             liblz4-dev libzstd-dev libssl-dev
 
-      # 放在编译之前：CI 的标准库裁剪了头文件间的传递包含，缺直接包含的文件会
-      # 「编到第 N 个目标才报错、一次只暴露一个」。这里静态扫一遍全部一次列出来。
+      # Run before compiling: CI's trimmed standard library removes transitive includes between
+      # headers, so a missing direct include surfaces as "fails at the Nth target, one at a time".
+      # This static scan lists them all in one pass.
       - name: Check direct standard-library includes
         run: python3 scripts/check_cpp_portable_includes.py cpp
 
       - name: Configure
-        # -g 只为运行时的可读栈：CI 是唯一能看见这类挂起的地方（本机是 macOS，
-        # POSIX 差异类挂起不复现），Optimized 行号能把停在哪个函数哪个字节说清楚。
-        # 优化级别仍由 CMAKE_BUILD_TYPE=Release 决定，这里只是追加调试信息。
+        # -g is only for readable runtime stacks: CI is the only place this class of hang is
+        # visible (the local box is macOS, where POSIX-divergence hangs do not reproduce).
+        # Optimized line numbers pinpoint exactly which function and which byte it parked on.
+        # The optimization level is still decided by CMAKE_BUILD_TYPE=Release; this only adds
+        # debug info.
         run: cmake -S cpp -B cpp/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS=-g
 
       - name: Build
         run: cmake --build cpp/build -j
 
-      # client_id / send_retry / producer_async / namespace_hook 曾经因偶发挂起被 -E 排除
-      # （2026-10-12 记录：死地址假 NS + 进程退出路径）。2026-10-14 定位到同一条链：
-      # 关 fd 唤不醒睡在 recv 里的读线程，退出路径的 join 于是无限等 —— 已在 closeSocket
-      # 里补 shutdown(SHUT_RDWR) 修掉，四条全部放回套件。若某条再挂，下面的看门狗会留下
-      # 全线程栈，按栈处理而不是重新排除。
-      # 失败用例名走 ::error:: 打印，在 Actions 页面顶部直接可读（匿名 API 拿不到日志）。
+      # client_id / send_retry / producer_async / namespace_hook were once excluded via -E for
+      # sporadic hangs (2026-10-12 record: dead-address fake NS + process exit path). On
+      # 2026-10-14 the same root chain was identified: closing an fd does not wake a reader
+      # thread sleeping in recv, so the exit-path join waits forever — fixed by adding
+      # shutdown(SHUT_RDWR) in closeSocket, and all four tests were restored to the suite.
+      # If any of them hangs again, the watchdog below leaves a full thread stack; act on the
+      # stack instead of re-excluding.
+      # Failing test names go through ::error:: annotations, readable at the top of the Actions
+      # page (anonymous API access cannot fetch logs).
       - name: Run ctest
         working-directory: cpp/build
         run: |
           set +e
-          # ctest 只会把卡住的用例在 120s 后杀掉，公开日志里剩一句 `***Timeout`，
-          # 既不知道停在哪个栈上，也不知道跑到第几段。这里配一个看门狗：活过 60s
-          # 的测试进程抓一份全线程栈，105s 再抓第二份（两份同帧=真 parked，不同帧=在磨）。
+          # ctest only kills a stuck test after 120s and leaves a bare `***Timeout` in the public
+          # log — no stack, no segment info. This watchdog kicks in: for a test process alive
+          # past 60s it grabs one full thread stack, then a second one at 105s (same frames in
+          # both = truly parked; different frames = still making progress).
           (
             dumped60=""
             dumped105=""
@@ -97,22 +104,25 @@ jobs:
             sed -n '/The following tests FAILED:/,$p' /tmp/ctest.log
           } | head -40 | while IFS= read -r line; do echo "::error::${line}"; done
           if grep -q '\*\*\*Timeout' /tmp/ctest.log; then
-            # 用例自己打的段进度（行首 `[`）指明停在第几段，栈指明哪一帧；两段都只在真
-            # 出现 Timeout 时才公开，绿跑不留噪声。
+            # The test's own segment progress lines (leading `[`) show which segment it stopped
+            # at, and the stack shows which frame; both are published only on a real Timeout,
+            # keeping green runs noise-free.
             grep -E '^\[' /tmp/ctest.log | tail -20 \
-              | while IFS= read -r line; do echo "::error::[段进度] ${line}"; done
+              | while IFS= read -r line; do echo "::error::[segment progress] ${line}"; done
             if [ -s /tmp/bt.log ]; then
               head -120 /tmp/bt.log | while IFS= read -r line; do echo "::error::${line}"; done
             else
-              echo "::error::看门狗没抓到栈：gdb 不可用或没有活过 60s 的测试进程"
+              echo "::error::watchdog captured no stack: gdb unavailable or no test process alive past 60s"
             fi
           fi
           exit $rc
 
-      # transport 曾经只在 ubuntu runner 上偶发整条挂死（run 13/15 停在 `***Timeout 120 sec`，
-      # run 12/16/17 全绿），本机 macOS 一次都不复现：Linux 关 fd 不会唤醒睡在 recv 里的线程。
-      # 单次跑是掷硬币，把 3 份并发 × 8 轮塞满 2 核 runner 才是可靠的复现，因此这里长期留着
-      # 当回归闸 —— 一旦复发，段进度 + wchan + 全线程栈会直接指出停在哪一帧。
+      # transport once hung wholesale only on ubuntu runners (run 13/15 stopped at
+      # `***Timeout 120 sec`, run 12/16/17 all green) and never reproduced on the local macOS
+      # box: on Linux, closing an fd does not wake a thread sleeping in recv. A single run is a
+      # coin flip; 3 concurrent x 8 rounds saturating a 2-core runner reproduces it reliably,
+      # so this stress step stays permanently as a regression gate — if it ever recurs, segment
+      # progress + wchan + full thread stacks point straight at the parked frame.
       - name: Stress transport for the Linux-only reader park
         if: always()
         working-directory: cpp/build
@@ -141,9 +151,9 @@ jobs:
               pid=${entry%%|*}
               log=${entry#*|}
               if kill -0 "${pid}" 2>/dev/null; then
-                echo "::error::transport 在第 ${round} 轮挂住：${log} (pid ${pid})"
-                grep -E '^\[' "${log}" | tail -8 | while IFS= read -r l; do echo "::error::[段进度] ${l}"; done
-                echo "=== 内核侧：哪些线程停在哪（无 gdb 时的兜底）"
+                echo "::error::transport hung in round ${round}: ${log} (pid ${pid})"
+                grep -E '^\[' "${log}" | tail -8 | while IFS= read -r l; do echo "::error::[segment progress] ${l}"; done
+                echo "=== kernel side: which threads are parked where (fallback when gdb is unavailable)"
                 for t in /proc/${pid}/task/*; do
                   echo "$(basename "${t}") $(cat "${t}/comm" 2>/dev/null) wchan=$(cat "${t}/wchan" 2>/dev/null) state=$(awk '{print $3}' "${t}/stat" 2>/dev/null)"
                 done
@@ -154,7 +164,7 @@ jobs:
                 wait "${pid}"
                 rc=$?
                 if [ "${rc}" -ne 0 ]; then
-                  echo "::error::transport 非零退出 rc=${rc}（${log}）"
+                  echo "::error::transport exited non-zero rc=${rc} (${log})"
                   tail -15 "${log}"
                   failed=1
                 fi
@@ -162,5 +172,5 @@ jobs:
             done
             [ "${failed}" -eq 1 ] && break
           done
-          echo "transport 压测：${rounds} 轮 × 3 并发，$([ "${failed}" -eq 0 ] && echo 全绿 || echo 有异常)"
+          echo "transport stress: ${rounds} rounds x 3 workers, $([ "${failed}" -eq 0 ] && echo all green || echo anomalies found)"
           exit "${failed}"

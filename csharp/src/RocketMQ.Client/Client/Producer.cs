@@ -1,9 +1,11 @@
-// 能力覆盖：同步发送（轮询选队列 / 定点发送）、按选择器发送（顺序消息）、
-// 异步发送、单向发送、批量发送、事务消息（两阶段：半消息 + 回查）、
-// 按 Key 查询、offset 查询、建 topic。
+// Capability coverage: synchronous send (round-robin queue selection / pinned send),
+// selector-based send (ordered messages), asynchronous send, oneway send, batch send,
+// transactional messages (two phases: half message + check-back), query by key,
+// offset query, topic creation.
 //
-// 按协议口径逐项实现：重试次数、队列选择、压缩判断阈值 4096、
-// 超时与异常映射都是协议行为，下面的中文注释一并保留。
+// Implemented item by item per the protocol convention: retry counts, queue selection,
+// the compression threshold 4096, and timeout/exception mapping are all protocol
+// behavior, documented in the comments below.
 using System.Globalization;
 using System.Threading;
 using RocketMQ.Common;
@@ -18,39 +20,42 @@ public class DefaultMQProducer
     private MQClientInstance? _mqClient;
     private bool _started;
 
-    /// <summary>已经调过 <see cref="Shutdown"/>：用来在「排空在途发送」这段时间里拒绝新请求，
-    /// 同时让 <see cref="GetClient"/> 报出 <c>SHUTDOWN_ALREADY</c> 文案。</summary>
+    /// <summary><see cref="Shutdown"/> has already been called: used to reject new requests while
+    /// "draining in-flight sends", and to make <see cref="GetClient"/> report the
+    /// <c>SHUTDOWN_ALREADY</c> message.</summary>
     private volatile bool _shutdownRequested;
 
     private string _producerGroup;
     private string _instanceName = MixAll.DefaultInstanceName;
     private string _clientId = string.Empty;
-    // 命名空间（多租户隔离）：非空前，发送时把 topic 拼成 "ns%topic" 发给 broker。
-    // 默认空 = 不加命名空间（与裸集群兼容，不破坏现有行为）。
+    // Namespace (multi-tenant isolation): when non-empty, sends wrap the topic as
+    // "ns%topic" to the broker. Default empty = no namespace (compatible with a bare
+    // cluster, does not break existing behavior).
     private string _namespace = string.Empty;
     private string _namespaceV2 = string.Empty;
-    // ACL 钩子，Start() 时绑定到 MQClientInstance 的传输层
+    // ACL hook, bound to MQClientInstance's transport layer in Start()
     private IRpcHook? _rpcHook;
-    // ClientConfig 的三个单元化/stream 开关（默认全关）
+    // ClientConfig's three unit/stream switches (all off by default)
     private string _unitName = string.Empty;
     private bool _unitMode;
     private bool _enableStreamRequestType;
-    // pollNameServerInterval 的默认值
+    // Default value of pollNameServerInterval
     private int _pollNameServerIntervalMillis = 30000;
     private string _createTopicKey = MixAll.DefaultTopic;
     private int _defaultTopicQueueNums = MixAll.DefaultTopicQueueNums;
     private int _sendMsgTimeout = 3000;
-    // TLS（开关名 tls.enable；缺省读 env ROCKETMQ_TLS_ENABLE）
-    // 注意必须在字段初始化时就取 env：往 MQClientInstance 传的是 bool（非 bool?），
-    // 传 false 会盖掉 RemotingClient 里的 env 兜底。
+    // TLS (switch name tls.enable; falls back to env ROCKETMQ_TLS_ENABLE)
+    // Note the env must be read at field-initialization time: MQClientInstance takes a bool
+    // (not bool?), and passing false would override RemotingClient's env fallback.
     private bool _tlsEnable = MQClientInstance.TlsEnabledFromEnv();
-    // W3C traceparent 透传（opt-in；缺省读 env ROCKETMQ_TRACE_CONTEXT_ENABLE）
+    // W3C traceparent propagation (opt-in; falls back to env ROCKETMQ_TRACE_CONTEXT_ENABLE)
     private bool _enableTraceContext;
     private int _retryTimesWhenSendFailed = 2;
-    // sendMsgMaxTimeoutPerRequest（默认 -1 = 不限制）：还有重试机会时，
-    // 单次请求超时被压到该值，把总预算的余量留给后面的 broker。
+    // sendMsgMaxTimeoutPerRequest (default -1 = unlimited): when retries remain, the
+    // per-request timeout is clamped to this value, leaving the rest of the total
+    // budget for later brokers.
     private int _sendMsgMaxTimeoutPerRequest = -1;
-    // 可重试的 broker 响应码（retryResponseCodes 的默认集合）
+    // Retryable broker response codes (the default set of retryResponseCodes)
     private readonly HashSet<int> _retryResponseCodes = new()
     {
         ResponseCode.SystemError, ResponseCode.SystemBusy,
@@ -58,21 +63,23 @@ public class DefaultMQProducer
         ResponseCode.TopicNotExist, ResponseCode.NoBuyerId,
         ResponseCode.NotInCurrentUnit, ResponseCode.GoAway,
     };
-    // retryAnotherBrokerWhenNotStoreOK：状态不是 SEND_OK 时是否也换一台 broker
+    // retryAnotherBrokerWhenNotStoreOK: whether to switch to another broker when the
+    // status is not SEND_OK
     private bool _retryAnotherBrokerWhenNotStoreOk;
-    // 发送延迟故障规避（MQFaultStrategy，默认关闭）
+    // Send latency fault avoidance (MQFaultStrategy, disabled by default)
     private readonly MQFaultStrategy _mqFaultStrategy = new(false);
     private int _maxMessageSize = 1024 * 1024 * 4;
-    // 压缩配置
+    // Compression config
     private int _compressMsgBodyOverHowmuch = 1024 * 4;
     private int _compressLevel = 5;
     private int _compressType = CompressionType.ZLIB;
-    // Request-Reply 默认等待应答超时（ms）：3000。
+    // Request-Reply default reply wait timeout (ms): 3000.
     private int _requestTimeout = 3000;
     private List<string> _nameServerAddrs = new();
-    // ---------------- 消息轨迹配置 ----------------
-    // 开启后 Start() 会建 AsyncTraceDispatcher 并注册 Send/EndTransaction 钩子；
-    // 内部轨迹生产者自身保持关闭（EnableTrace=false），否则无限递归。
+    // ---------------- Message trace config ----------------
+    // When enabled, Start() builds an AsyncTraceDispatcher and registers Send/EndTransaction
+    // hooks; the internal trace producer itself stays disabled (EnableTrace=false),
+    // otherwise infinite recursion.
     private bool _enableTrace;
     private string _traceTopic = MixAll.TraceTopic;
     private int _traceMsgBatchNum = 10;
@@ -80,43 +87,51 @@ public class DefaultMQProducer
     private readonly List<IEndTransactionHook> _endTransactionHooks = new();
     private readonly List<ICheckForbiddenHook> _checkForbiddenHooks = new();
     private AsyncTraceDispatcher? _traceDispatcher;
-    // ---------------- 异步发送池 ----------------
-    // AsyncSenderExecutor：把「拉路由、选队列、建请求、换 broker 重试」这些准备工作从调用方
-    // 线程挪走。core==max==CPU 核数、队列**有界**（LinkedBlockingQueue(50000) 规格）。
-    // NettyClientPublicExecutor：用户回调与 SendMessageHook.after 在这里跑，绝不让业务代码
-    // 占着连接的读线程或超时清理线程（executeInvokeCallback 一律 submit 给 publicExecutor）。
-    // 两个池都 keepAlive 60s 且 core==max，所以线程按需创建、创建后不退出。
+    // ---------------- Async send pool ----------------
+    // AsyncSenderExecutor: moves the preparation work (fetch routes, select queue, build
+    // request, retry on another broker) off the caller thread. core==max==CPU cores, and
+    // the queue is **bounded** (LinkedBlockingQueue(50000) spec).
+    // NettyClientPublicExecutor: user callbacks and SendMessageHook.after run here; business
+    // code must never occupy the connection read thread or the timeout-cleanup thread
+    // (executeInvokeCallback always submits to publicExecutor).
+    // Both pools keepAlive 60s with core==max, so threads are created on demand and never
+    // exit once created.
     private ConsumeExecutor? _asyncSenderExecutor;
-    /// <summary>内建池才由 <see cref="Shutdown"/> 负责排空（自带池生命周期归调用方）。</summary>
+    /// <summary>Only built-in pools are drained by <see cref="Shutdown"/> (a caller-supplied
+    /// pool's lifecycle belongs to the caller).</summary>
     private bool _asyncSenderExecutorOwned = true;
     private ConsumeExecutor? _callbackExecutor;
-    // 异步重试次数与发送队列容量
+    // Async retry count and send queue capacity
     private int _retryTimesWhenSendAsyncFailed = 2;
     private int _asyncSenderQueueCapacity = 50000;
-    // 回调池线程数，0 = 用 CPU 核数
+    // Callback pool thread count, 0 = use CPU core count
     private int _clientCallbackExecutorThreads;
-    // ---------------- 异步发送背压 ----------------
-    // 开关默认关闭。两个信号量在**构造**时建好（不是 Start()）：开关允许运行时
-    // 才打开，那时闸必须已经在了。
+    // ---------------- Async send backpressure ----------------
+    // The switch is off by default. The two semaphores are built at **construction** time
+    // (not Start()): the switch may be turned on at runtime, and by then the gates must
+    // already exist.
     private bool _enableBackpressureForAsyncMode;
     private int _backPressureForAsyncSendNum = 1024;
     private int _backPressureForAsyncSendSize = 100 * 1024 * 1024;
     private readonly FairSemaphore _semaphoreAsyncSendNum;
     private readonly FairSemaphore _semaphoreAsyncSendSize;
-    // ---------------- 自动攒批（ProduceAccumulator）----------------
-    // 打开后 Send(Message) 先按 AggregateKey 归并成 MessageBatch 再发（见 ProduceAccumulator.cs 头部）。
-    // 三个 -1 是「调用方没表态」的哨兵：InitProduceAccumulator() 里只把 > -1 的灌给累加器，
-    // 所以构造函数里设的值不会被默认值盖掉。
+    // ---------------- Auto-batching (ProduceAccumulator) ----------------
+    // When enabled, Send(Message) first merges messages into a MessageBatch by AggregateKey
+    // before sending (see the header of ProduceAccumulator.cs).
+    // The three -1s are "caller has not spoken" sentinels: InitProduceAccumulator() only
+    // feeds values > -1 to the accumulator, so values set in the constructor are not
+    // overwritten by defaults.
     private bool _autoBatch;
     private int _batchMaxDelayMs = -1;
     private long _batchMaxBytes = -1;
     private long _totalBatchMaxBytes = -1;
-    /// <summary>按 clientId 复用的累加器（getOrCreateProduceAccumulator）。</summary>
+    /// <summary>Accumulator reused by clientId (getOrCreateProduceAccumulator).</summary>
     private ProduceAccumulator? _produceAccumulator;
 
-    // 建背压信号量时的初始许可：配置**不高于**地板值时
-    // 用地板值，并记一条 info —— 分支是 `cfg > 10 ? new Semaphore(max(cfg, 10)) : new
-    // Semaphore(10)`，所以恰好等于地板值时也会打这条日志。
+    // Initial permits when building the backpressure semaphores: when the config is
+    // **not higher than** the floor, the floor is used and an info line is logged --
+    // the branch is `cfg > 10 ? new Semaphore(max(cfg, 10)) : new
+    // Semaphore(10)`, so exactly at the floor the log is also printed.
     private static long BackPressurePermits(int configured, long floor, string name)
     {
         if (configured > floor)
@@ -129,8 +144,9 @@ public class DefaultMQProducer
         return floor;
     }
 
-    // 扣多少「字节」许可（executeAsyncMessageSend 的口径
-    // `msg.getBody() == null ? 1 : msg.getBody().length`）：不给空 body 算 1 就等于不限流。
+    // How many "bytes" of permits to deduct (the convention of executeAsyncMessageSend
+    // `msg.getBody() == null ? 1 : msg.getBody().length`): not counting 1 for an empty
+    // body would mean no throttling at all.
     private static long BackPressureMsgLen(Message msg)
     {
         byte[] body = msg.Body;
@@ -145,18 +161,18 @@ public class DefaultMQProducer
         }
 
         _producerGroup = producerGroup;
-        // 两个公平信号量在实例创建时就建好
+        // The two fair semaphores are built when the instance is created
         _semaphoreAsyncSendNum = new FairSemaphore(
             BackPressurePermits(_backPressureForAsyncSendNum, FairSemaphore.MinAsyncSendNum,
                 "semaphoreAsyncSendNum"));
         _semaphoreAsyncSendSize = new FairSemaphore(
             BackPressurePermits(_backPressureForAsyncSendSize, FairSemaphore.MinAsyncSendSize,
                 "semaphoreAsyncSendSize"));
-        // opt-in；缺省读 env ROCKETMQ_TRACE_CONTEXT_ENABLE
+        // opt-in; falls back to env ROCKETMQ_TRACE_CONTEXT_ENABLE
         _enableTraceContext = TraceParentContext.EnabledFromEnv();
     }
 
-    /// <summary>析构：释放时兜底 shutdown。</summary>
+    /// <summary>Finalizer: shutdown as a fallback on release.</summary>
     ~DefaultMQProducer()
     {
         try
@@ -165,12 +181,12 @@ public class DefaultMQProducer
         }
         catch (Exception)
         {
-            // 析构不抛
+            // finalizer does not throw
         }
     }
 
-    // ---------------- 配置 ----------------
-    // 分号分隔的 nameServer 地址串，如 "127.0.0.1:9876"
+    // ---------------- Config ----------------
+    // Semicolon-separated nameServer address string, e.g. "127.0.0.1:9876"
     public string NamesrvAddr
     {
         get
@@ -205,7 +221,7 @@ public class DefaultMQProducer
         set => _sendMsgTimeout = value;
     }
 
-    /// <summary>TLS（开关名 tls.enable；缺省读 env ROCKETMQ_TLS_ENABLE）。</summary>
+    /// <summary>TLS (switch name tls.enable; falls back to env ROCKETMQ_TLS_ENABLE).</summary>
     public bool TlsEnable
     {
         get => _tlsEnable;
@@ -215,8 +231,8 @@ public class DefaultMQProducer
     private TlsOptions? _tlsOptions;
 
     /// <summary>
-    /// TLS 细项（CaCert=严格 CA 校验；ClientCert/ClientKey=mTLS；ServerName=主机名覆盖）。
-    /// 不设 CaCert = test-mode（信任自签）。
+    /// TLS details (CaCert=strict CA validation; ClientCert/ClientKey=mTLS; ServerName=hostname
+    /// override). Leaving CaCert unset = test-mode (trust self-signed).
     /// </summary>
     public TlsOptions? TlsOptions
     {
@@ -232,7 +248,7 @@ public class DefaultMQProducer
         set => _socksProxyConfig = value;
     }
 
-    /// <summary>W3C traceparent 透传（opt-in；缺省读 env ROCKETMQ_TRACE_CONTEXT_ENABLE）。</summary>
+    /// <summary>W3C traceparent propagation (opt-in; falls back to env ROCKETMQ_TRACE_CONTEXT_ENABLE).</summary>
     public bool EnableTraceContext
     {
         get => _enableTraceContext;
@@ -245,37 +261,41 @@ public class DefaultMQProducer
         set => _retryTimesWhenSendFailed = value;
     }
 
-    /// <summary><c>retryTimesWhenSendAsyncFailed</c>（默认 2）：
-    /// **异步**发送的重试次数，与同步那份分开配置。只在异步链里生效：换一台 broker、给同一个
-    /// 请求换新 opaque 再试，上限就是这个数（首次尝试不计）。异步发送**不看**
-    /// <see cref="RetryTimesWhenSendFailed"/>，也**不看** <c>RetryResponseCodes</c>
-    /// —— broker 明确回了错误码就不再换 broker（<c>onExceptionImpl</c> 的
-    /// <c>needRetry</c> 只在「没收到响应」时为真）。</summary>
+    /// <summary><c>retryTimesWhenSendAsyncFailed</c> (default 2):
+    /// the retry count for **async** sends, configured separately from the sync one. Only
+    /// effective on the async chain: switch to another broker and retry the same request
+    /// with a new opaque, capped at this number (the first attempt is not counted). Async
+    /// sends do **not** consult <see cref="RetryTimesWhenSendFailed"/> nor
+    /// <c>RetryResponseCodes</c> -- once the broker explicitly returns an error code, no
+    /// broker switch happens (<c>needRetry</c> in <c>onExceptionImpl</c> is true only
+    /// when "no response was received").</summary>
     public int RetryTimesWhenSendAsyncFailed
     {
         get => _retryTimesWhenSendAsyncFailed;
         set => _retryTimesWhenSendAsyncFailed = value;
     }
 
-    /// <summary>写死的 <c>LinkedBlockingQueue(50000)</c>：
-    /// 异步发送队列容量。只在 <see cref="Start"/> 读一次（构造时定死）。队列满了
-    /// <c>SendAsync</c> 向调用方抛 <c>MQClientException("executor rejected")</c>，开了背压则
-    /// 就地跑完那一笔。</summary>
+    /// <summary>The hard-wired <c>LinkedBlockingQueue(50000)</c>:
+    /// async send queue capacity. Read only once in <see cref="Start"/> (fixed at
+    /// construction). When the queue is full, <c>SendAsync</c> throws
+    /// <c>MQClientException("executor rejected")</c> to the caller; with backpressure
+    /// enabled, that one send runs to completion in place.</summary>
     public int AsyncSenderQueueCapacity
     {
         get => _asyncSenderQueueCapacity;
         set => _asyncSenderQueueCapacity = value;
     }
 
-    /// <summary><c>setAsyncSenderExecutor</c> + <c>getAsyncSenderExecutor</c> 的语义：自带异步发送池时
-    /// 内建池不再创建，<see cref="Shutdown"/> 也**不等它、不关它**（只
-    /// <c>defaultAsyncSenderExecutor.shutdown()</c>）—— 池的生命周期归调用方。
-    /// 必须在 <see cref="Start"/> 之前设（池在 Start 里定）。</summary>
+    /// <summary>Semantics of <c>setAsyncSenderExecutor</c> + <c>getAsyncSenderExecutor</c>:
+    /// when a caller-supplied async send pool is provided, the built-in pool is not
+    /// created, and <see cref="Shutdown"/> does **not** wait for it nor close it (only
+    /// <c>defaultAsyncSenderExecutor.shutdown()</c>) -- the pool's lifecycle belongs to
+    /// the caller. Must be set before <see cref="Start"/> (the pool is fixed in Start).</summary>
     public ConsumeExecutor? AsyncSenderExecutor { get; set; }
 
-    /// <summary>publicExecutor 线程数：
-    /// 用户回调与 after 钩子跑在几根线程上。0（默认）= CPU 核数；必须在
-    /// <see cref="Start"/> 之前设，池是启动时建的。</summary>
+    /// <summary>publicExecutor thread count:
+    /// how many threads user callbacks and after hooks run on. 0 (default) = CPU cores;
+    /// must be set before <see cref="Start"/>, the pool is built at startup.</summary>
     public int ClientCallbackExecutorThreads
     {
         get => _clientCallbackExecutorThreads;
@@ -283,9 +303,11 @@ public class DefaultMQProducer
     }
 
     /// <summary>
-    /// setSendMsgMaxTimeoutPerRequest。-1（默认）表示单次请求不设上限；
-    /// 设成有限值后，**还有重试机会**的那几次单次超时被压到该值 —— 否则一台慢
-    /// broker 就能把整个 SendMsgTimeout 预算吃光，剩下的 broker 一次都试不到。
+    /// setSendMsgMaxTimeoutPerRequest. -1 (default) means no cap on a single request;
+    /// after setting a finite value, the per-request timeouts of the attempts that
+    /// **still have retries left** are clamped to this value -- otherwise one slow
+    /// broker could eat the entire SendMsgTimeout budget, leaving the remaining
+    /// brokers untried.
     /// </summary>
     public int SendMsgMaxTimeoutPerRequest
     {
@@ -293,17 +315,19 @@ public class DefaultMQProducer
         set => _sendMsgMaxTimeoutPerRequest = value;
     }
 
-    /// <summary>retryAnotherBrokerWhenNotStoreOK（默认 false）。</summary>
+    /// <summary>retryAnotherBrokerWhenNotStoreOK (default false).</summary>
     public bool RetryAnotherBrokerWhenNotStoreOk
     {
         get => _retryAnotherBrokerWhenNotStoreOk;
         set => _retryAnotherBrokerWhenNotStoreOk = value;
     }
 
-    /// <summary>getRetryResponseCodes（返回副本，改集合要走 AddRetryResponseCode）。</summary>
+    /// <summary>getRetryResponseCodes (returns a copy; to modify the set use
+    /// AddRetryResponseCode).</summary>
     public HashSet<int> RetryResponseCodes => new(_retryResponseCodes);
 
-    /// <summary>addRetryResponseCode：broker 回了这些码才值得换一台重发。</summary>
+    /// <summary>addRetryResponseCode: only these broker response codes are worth
+    /// switching brokers to resend.</summary>
     public void AddRetryResponseCode(int responseCode)
     {
         lock (_retryResponseCodes)
@@ -313,7 +337,8 @@ public class DefaultMQProducer
     }
 
     /// <summary>
-    /// 响应码可重试判定：null（压根没等到响应码）等于不可重试。
+    /// Retryable response-code check: null (no response code received at all) means
+    /// not retryable.
     /// </summary>
     public bool IsRetryResponseCode(int? responseCode)
     {
@@ -328,37 +353,42 @@ public class DefaultMQProducer
         }
     }
 
-    // ---------------- 故障规避（sendLatencyFaultEnable，默认关闭）----------------
-    // 开启后发送选队列会按 broker 延迟/隔离状态过滤（MQFaultStrategy）；发送结果回写
-    // 容错表：成功记实测延迟（超阈值隔离该 broker 一段时间），异常记隔离 10000ms 档。
+    // ---------------- Fault avoidance (sendLatencyFaultEnable, off by default) ----------------
+    // When enabled, send queue selection filters by broker latency/isolation state
+    // (MQFaultStrategy); send results write back to the fault table: success records the
+    // measured latency (over-threshold isolates that broker for a while), exceptions
+    // record the 10000ms isolation tier.
     public bool SendLatencyFaultEnable
     {
         get => _mqFaultStrategy.IsSendLatencyFaultEnable();
         set => _mqFaultStrategy.SetSendLatencyFaultEnable(value);
     }
 
-    /// <summary><c>startDetectorEnable</c>（默认 false）：
-    /// 开启后 <see cref="Start"/> 会拉起 MQFaultStrategy 的可达性探测线程 —— 按每台 broker
-    /// 2s 一档的节奏做 TCP 连通探测（detectTimeout=200ms），故障 broker 恢复后可被提前
-    /// 拉回容错表（LatencyFaultTolerance）。</summary>
+    /// <summary><c>startDetectorEnable</c> (default false):
+    /// when enabled, <see cref="Start"/> starts MQFaultStrategy's reachability detector
+    /// thread -- TCP connectivity probes at a 2s-per-broker cadence (detectTimeout=200ms);
+    /// a recovered failed broker can be pulled back into the fault-tolerance table early
+    /// (LatencyFaultTolerance).</summary>
     public bool StartDetectorEnable
     {
         get => _mqFaultStrategy.IsStartDetectorEnable();
         set => _mqFaultStrategy.SetStartDetectorEnable(value);
     }
 
-    /// <summary><c>sendMessageWithVIPChannel</c>（默认 false）：
-    /// 开启后发送/请求的 broker 端口换 VIP 口（普通口 -2，见 <c>MixAll.BrokerVipChannel</c>）。
-    /// 消费者一路对应 <c>ClientConfig#vipChannelEnabled</c>（推送消费者
-    /// 经 <c>ClientConfig</c> 透传，默认同为 false）。</summary>
+    /// <summary><c>sendMessageWithVIPChannel</c> (default false):
+    /// when enabled, the broker port for sends/requests switches to the VIP port
+    /// (normal port -2, see <c>MixAll.BrokerVipChannel</c>).
+    /// The consumer side corresponds to <c>ClientConfig#vipChannelEnabled</c> (push
+    /// consumers pass it through via <c>ClientConfig</c>, also false by default).</summary>
     public bool SendMessageWithVIPChannel
     {
         get => _sendMessageWithVIPChannel;
         set
         {
             _sendMessageWithVIPChannel = value;
-            // 开关语义要求逐笔现读、立即生效；本端口的改写点在
-            // MQClientInstance 的发送地址上，所以 Start() 之后再改开关也要立刻生效。
+            // The switch semantics require per-message fresh reads and immediate effect;
+            // this port's rewrite point is on MQClientInstance's send address, so changing
+            // the switch after Start() must also take effect immediately.
             if (_mqClient is not null)
             {
                 _mqClient.VipChannelEnabled = value;
@@ -388,19 +418,21 @@ public class DefaultMQProducer
         set => _createTopicKey = value;
     }
 
-    // 命名空间（setNamespace）：非空时发送前把 topic
-    // 包装成 "ns%topic" 再发给 broker（%RETRY%/%DLQ% 前缀除外，系统资源不包装）。
+    // Namespace (setNamespace): when non-empty, wrap the topic as "ns%topic" before
+    // sending to the broker (except %RETRY%/%DLQ% prefixes; system resources are not
+    // wrapped).
     public string Namespace
     {
         get => _namespace;
         set => _namespace = value ?? string.Empty;
     }
 
-    /// <summary>5.x 新命名空间（namespaceV2）：非空时由
-    /// <see cref="NamespaceRpcHook"/>（钩子链首）给每笔请求加 <c>nsd=true</c> / <c>ns</c>
-    /// 扩展头，并随 <see cref="StartTraceDispatcher"/> 传导给轨迹分发器（对轨迹
-    /// 生产者同样 setNamespaceV2）。钩子每笔请求现读本属性，
-    /// 所以 Start() 之后设置也从下一笔请求起生效。</summary>
+    /// <summary>5.x new namespace (namespaceV2): when non-empty,
+    /// <see cref="NamespaceRpcHook"/> (head of the hook chain) adds <c>nsd=true</c> /
+    /// <c>ns</c> extension headers to every request, and it is propagated to the trace
+    /// dispatcher via <see cref="StartTraceDispatcher"/> (the trace producer likewise
+    /// gets setNamespaceV2). The hook reads this property fresh per request, so setting
+    /// it after Start() takes effect from the next request on.</summary>
     public string NamespaceV2
     {
         get => _namespaceV2;
@@ -408,9 +440,11 @@ public class DefaultMQProducer
     }
 
     // ---------------- unitName / unitMode / enableStreamRequestType ----------------
-    // 三个同名开关。⚠ 必须在 Start() 之前设置：unitName 与
-    // @STREAM 决定 clientId 的形状，stream 决定请求钩子链（ReqT 要进 ACL 签名内容）。
-    /// <summary>单元名：进 clientId 的 <c>@&lt;unitName&gt;</c> 段，也拼进动态取址 URL。</summary>
+    // Three same-named switches. ⚠ Must be set before Start(): unitName and
+    // @STREAM determine the shape of clientId, and stream determines the request hook
+    // chain (ReqT goes into the ACL signature content).
+    /// <summary>Unit name: goes into the <c>@&lt;unitName&gt;</c> segment of clientId, and is
+    /// also concatenated into the dynamic addressing URL.</summary>
     public string UnitName
     {
         get => _unitName;
@@ -418,11 +452,11 @@ public class DefaultMQProducer
     }
 
     /// <summary>
-    /// <c>isUnitMode()</c>。生产者这一路只落在一处：
+    /// <c>isUnitMode()</c>. On the producer path it lands in exactly one place:
     /// <c>requestHeader.setUnitMode(...)</c>
-    /// → SEND_MESSAGE_V2 的单字母键 <c>k</c>；broker 据此给自动建出来的 topic 打
-    /// UNIT(0x1) / UNIT_SUB(0x2) 系统标记。
-    /// 生产者从不主动置真，所以默认 false。
+    /// → the single-letter key <c>k</c> of SEND_MESSAGE_V2; the broker marks
+    /// auto-created topics with the UNIT(0x1) / UNIT_SUB(0x2) system flags accordingly.
+    /// The producer never sets it true on its own, so it defaults to false.
     /// </summary>
     public bool UnitMode
     {
@@ -431,8 +465,9 @@ public class DefaultMQProducer
     }
 
     /// <summary>
-    /// true 时每笔请求带 <c>ReqT=0</c>、clientId 末尾多一段 <c>@STREAM</c>。
-    /// 只有 pull / lite 消费者在构造里置真，生产者默认 false。
+    /// When true, every request carries <c>ReqT=0</c> and clientId gains a trailing
+    /// <c>@STREAM</c> segment. Only pull / lite consumers set it true in their
+    /// constructors; producers default to false.
     /// </summary>
     public bool EnableStreamRequestType
     {
@@ -441,8 +476,9 @@ public class DefaultMQProducer
     }
 
     /// <summary>
-    /// 默认 30000ms：在用 topic 的
-    /// 路由刷新周期，Start() 时透传给 MQClientInstance（之后改不重排已启动的周期任务）。
+    /// Default 30000ms: the route refresh period for in-use topics, passed through to
+    /// MQClientInstance at Start() (changing it afterwards does not reschedule the
+    /// already-started periodic task).
     /// </summary>
     public int PollNameServerIntervalMillis
     {
@@ -450,25 +486,28 @@ public class DefaultMQProducer
         set => _pollNameServerIntervalMillis = value;
     }
 
-    // ---------------- ACL 鉴权 ----------------
-    // 必须在 Start() 之前调用：钩子在 Start() 里绑定到 MQClientInstance（同一 clientId
-    // 复用实例时以先注册者为准）。
+    // ---------------- ACL authentication ----------------
+    // Must be called before Start(): the hook is bound to MQClientInstance in Start()
+    // (when the instance is reused for the same clientId, first registrant wins).
     public void SetRpcHook(IRpcHook hook) => _rpcHook = hook;
 
-    /// <summary>便捷入口：用 accessKey/secretKey（可选 securityToken）构造 AclClientRPCHook。</summary>
+    /// <summary>Convenience entry: build an AclClientRPCHook from accessKey/secretKey
+    /// (optional securityToken).</summary>
     public void SetCredentials(string accessKey, string secretKey, string securityToken = "")
         => _rpcHook = new AclClientRPCHook(new SessionCredentials(accessKey, secretKey, securityToken));
 
-    // ---------------- 消息轨迹配置（trace 相关属性）----------------
-    // 开启后 Start() 会建 AsyncTraceDispatcher 并注册 Send/EndTransaction 轨迹钩子；
-    // 内部分发器用的轨迹生产者自身保持 EnableTrace=false（见 AsyncTraceDispatcher），否则无限递归。
+    // ---------------- Message trace config (trace-related properties) ----------------
+    // When enabled, Start() builds an AsyncTraceDispatcher and registers Send/EndTransaction
+    // trace hooks; the trace producer used internally by the dispatcher itself stays
+    // EnableTrace=false (see AsyncTraceDispatcher), otherwise infinite recursion.
     public bool EnableTrace
     {
         get => _enableTrace;
         set => _enableTrace = value;
     }
 
-    /// <summary>自定义轨迹 topic（setTraceTopic）；空则回落系统默认 RMQ_SYS_TRACE_TOPIC。</summary>
+    /// <summary>Custom trace topic (setTraceTopic); empty falls back to the system default
+    /// RMQ_SYS_TRACE_TOPIC.</summary>
     public string TraceTopic
     {
         get => _traceTopic;
@@ -481,7 +520,7 @@ public class DefaultMQProducer
         set => _traceMsgBatchNum = value;
     }
 
-    /// <summary>注册发送钩子（registerSendMessageHook）。</summary>
+    /// <summary>Register a send hook (registerSendMessageHook).</summary>
     public void RegisterSendMessageHook(ISendMessageHook hook)
     {
         if (hook is not null)
@@ -492,7 +531,7 @@ public class DefaultMQProducer
 
     public bool HasSendMessageHook() => _sendMessageHooks.Count > 0;
 
-    /// <summary>注册发送前拦截钩子（registerCheckForbiddenHook）。</summary>
+    /// <summary>Register a pre-send interception hook (registerCheckForbiddenHook).</summary>
     public void RegisterCheckForbiddenHook(ICheckForbiddenHook hook)
     {
         if (hook is not null)
@@ -505,14 +544,17 @@ public class DefaultMQProducer
 
     public int CheckForbiddenHookCount() => _checkForbiddenHooks.Count;
 
-    /// <summary>是否需要走「带拦截/钩子」的发送内核（两者任一存在就得走）。</summary>
+    /// <summary>Whether the send kernel "with interception/hooks" must be used (either one
+    /// existing is enough).</summary>
     public bool HasSendInterceptors() => _sendMessageHooks.Count > 0 || _checkForbiddenHooks.Count > 0;
 
-    /// <summary>供单测/联调直接驱动钩子执行（不经过网络）。
+    /// <summary>For unit tests / integration debugging to drive hook execution directly
+    /// (without going through the network).
     ///
-    /// ⚠ 与 Send/Consume/EndTransaction 钩子<b>相反</b>：这里<b>不吞异常</b> ——
-    /// 钩子抛出的异常会原样传播出去（CheckForbiddenHook 的签名就是
-    /// <c>throws MQClientException</c>），这正是"禁止发送"的实现方式。
+    /// ⚠ **Opposite** of the Send/Consume/EndTransaction hooks: exceptions are
+    /// <b>not swallowed</b> here -- exceptions thrown by hooks propagate out as-is (the
+    /// CheckForbiddenHook signature is <c>throws MQClientException</c>); this is exactly
+    /// how "forbidden to send" is implemented.
     /// </summary>
     public void ExecuteCheckForbiddenHook(CheckForbiddenContext context)
     {
@@ -522,7 +564,7 @@ public class DefaultMQProducer
         }
     }
 
-    /// <summary>注册事务收尾钩子（registerEndTransactionHook）。</summary>
+    /// <summary>Register a transaction-finish hook (registerEndTransactionHook).</summary>
     public void RegisterEndTransactionHook(IEndTransactionHook hook)
     {
         if (hook is not null)
@@ -545,31 +587,32 @@ public class DefaultMQProducer
         }
     }
 
-    // 压缩配置
-    // body 长度 >= 该阈值时自动压缩（默认 4096）；批量消息永不压缩。
+    // Compression config
+    // Auto-compress when body length >= this threshold (default 4096); batch messages
+    // are never compressed.
     public int CompressMsgBodyOverHowmuch
     {
         get => _compressMsgBodyOverHowmuch;
         set => _compressMsgBodyOverHowmuch = value;
     }
 
-    // 压缩级别，仅 ZLIB 有意义（默认 5）
+    // Compression level, only meaningful for ZLIB (default 5)
     public int CompressLevel
     {
         get => _compressLevel;
         set => _compressLevel = value;
     }
 
-    // 压缩算法：CompressionType::ZLIB / LZ4 / ZSTD（默认 ZLIB）
+    // Compression algorithm: CompressionType::ZLIB / LZ4 / ZSTD (default ZLIB)
     public int CompressType
     {
         get => _compressType;
         set => _compressType = value;
     }
 
-    // ---------------- 异步发送背压 ----------------
-    // 开关默认关闭，而且**不是**启动期配置：跑到一半也能打开/关掉，
-    // 因为只有闸本身读它（见 SendAsync）。
+    // ---------------- Async send backpressure ----------------
+    // The switch is off by default and is **not** a startup-time config: it can be
+    // toggled mid-run, because only the gates themselves read it (see SendAsync).
     public bool EnableBackpressureForAsyncMode
     {
         get => _enableBackpressureForAsyncMode;
@@ -577,9 +620,11 @@ public class DefaultMQProducer
     }
 
     /// <summary>
-    /// 运行时改「在途条数」上限（setBackPressureForAsyncSendNum）。语义不是
-    /// 「设成 num」而是「总量变成 num、已经在途的那几份原样保留」，所以调小之后
-    /// <see cref="SemaphoreAsyncSendNumAvailablePermits" /> 可能为负。低于地板值 10 时夹到 10。
+    /// Change the "in-flight count" cap at runtime (setBackPressureForAsyncSendNum). The
+    /// semantics are not "set to num" but "the total becomes num, the already in-flight
+    /// ones are kept as-is", so after shrinking it
+    /// <see cref="SemaphoreAsyncSendNumAvailablePermits" /> may go negative. Clamped to
+    /// the floor value 10 when below it.
     /// </summary>
     public int BackPressureForAsyncSendNum
     {
@@ -591,7 +636,8 @@ public class DefaultMQProducer
         }
     }
 
-    /// <summary>在途字节数上限，地板值 1M，语义同 <see cref="BackPressureForAsyncSendNum" />。</summary>
+    /// <summary>In-flight byte cap, floor value 1M, same semantics as
+    /// <see cref="BackPressureForAsyncSendNum" />.</summary>
     public int BackPressureForAsyncSendSize
     {
         get => _backPressureForAsyncSendSize;
@@ -606,21 +652,24 @@ public class DefaultMQProducer
 
     public int GetBackPressureForAsyncSendSize() => _backPressureForAsyncSendSize;
 
-    /// <summary>观测用：当前空闲许可，负数表示在途超额。</summary>
+    /// <summary>For observation: currently available permits; negative means in-flight
+    /// overshoot.</summary>
     public long SemaphoreAsyncSendNumAvailablePermits => _semaphoreAsyncSendNum.AvailablePermits();
 
     public long SemaphoreAsyncSendSizeAvailablePermits => _semaphoreAsyncSendSize.AvailablePermits();
 
-    // Request-Reply：等待应答的超时（默认 3000ms）。
-    // 任何 <= 0 的值都回退到默认 3000，避免把发送路径的超时设成 0。
+    // Request-Reply: timeout for waiting for a reply (default 3000ms).
+    // Any value <= 0 falls back to the default 3000, avoiding setting the send-path
+    // timeout to 0.
     public int RequestTimeout
     {
         get => _requestTimeout;
         set => _requestTimeout = value > 0 ? value : 3000;
     }
 
-    /// <summary>本客户端标识（<c>buildMQClientId</c> 的结果）。可写：非空时
-    /// <see cref="Start"/> 不再自己拼，直接沿用（累加器就是按它复用的，测试要能各用各的）。</summary>
+    /// <summary>This client's identifier (the result of <c>buildMQClientId</c>). Writable:
+    /// when non-empty, <see cref="Start"/> no longer builds its own and reuses this
+    /// (the accumulator is reused by it, so tests can each have their own).</summary>
     public string ClientId
     {
         get => _clientId;
@@ -629,10 +678,12 @@ public class DefaultMQProducer
 
     public bool IsStarted => _started;
 
-    // ---------------- 自动攒批参数 ----------------
-    // ⚠ 四个 getter 在累加器还没建起来（= 没 Start 过）时都返回「没打开」的那一档：
-    //   getAutoBatch→false，三个字节/时延 getter→0，逐字语义如此，
-    //   所以 Start() 之前读到的值与设进去的值**无关**，别当配置回读用。
+    // ---------------- Auto-batching parameters ----------------
+    // ⚠ All four getters return the "not enabled" tier when the accumulator has not been
+    // built yet (= never Started):
+    //   getAutoBatch→false, the three byte/latency getters→0; the semantics are verbatim,
+    //   so values read before Start() are **unrelated** to what was set -- do not use
+    //   them as config readback.
     public bool AutoBatch
     {
         get => _produceAccumulator is not null && _autoBatch;
@@ -645,16 +696,18 @@ public class DefaultMQProducer
 
     public bool GetAutoBatch() => AutoBatch;
 
-    /// <summary>累加器实例（produceAccumulator）。正常由
-    /// <see cref="Start"/> 里的 <see cref="InitProduceAccumulator"/> 建立；可写是为了让测试
-    /// 能在不 Start 的情况下注一个进去（单测同样是直接怼字段）。</summary>
+    /// <summary>Accumulator instance (produceAccumulator). Normally established by
+    /// <see cref="InitProduceAccumulator"/> inside <see cref="Start"/>; it is writable so
+    /// tests can inject one without Start (unit tests likewise poke the field
+    /// directly).</summary>
     public ProduceAccumulator? ProduceAccumulator
     {
         get => _produceAccumulator;
         set => _produceAccumulator = value;
     }
 
-    /// <summary><c>batchMaxDelayMs(int)</c>：先记在本对象上，已是 Start 过的对象则立即同步给累加器。</summary>
+    /// <summary><c>batchMaxDelayMs(int)</c>: first record on this object; if it is an
+    /// already-Started object, sync to the accumulator immediately.</summary>
     public int BatchMaxDelayMs
     {
         get => _produceAccumulator is null ? 0 : _produceAccumulator.GetBatchMaxDelayMs();
@@ -694,10 +747,11 @@ public class DefaultMQProducer
         }
     }
 
-    /// <summary><c>initProduceAccumulator</c>：按 clientId 复用累加器，再把
-    /// 构造函数期间设下的三个 <c>&gt; -1</c> 阈值灌进去。upstream 在
-    /// <c>DefaultMQProducerImpl.start():256</c> 调用它 —— 必须早于本类的 <c>_started = true</c>，
-    /// 否则「start 之后立刻 send」会撞上空累加器。</summary>
+    /// <summary><c>initProduceAccumulator</c>: reuse the accumulator by clientId, then feed
+    /// in the three <c>&gt; -1</c> thresholds set during construction. Upstream calls it
+    /// at <c>DefaultMQProducerImpl.start():256</c> -- it must come before this class's
+    /// <c>_started = true</c>, otherwise "send immediately after start" would hit an
+    /// empty accumulator.</summary>
     public void InitProduceAccumulator()
     {
         _produceAccumulator = ProduceAccumulatorRegistry.GetOrCreate(
@@ -718,7 +772,7 @@ public class DefaultMQProducer
         }
     }
 
-    // ---------------- 生命周期 ----------------
+    // ---------------- Lifecycle ----------------
 
     public void Start()
     {
@@ -729,8 +783,9 @@ public class DefaultMQProducer
                 return;
             }
 
-            // checkConfig：组名合法性 + 保留默认组名。
-            // 排在 checkConfig 该在的位置——任何网络动作之前，非法配置在 Start() 当场失败。
+            // checkConfig: group-name legality + reserved default group name.
+            // Placed where checkConfig belongs -- before any network action, so invalid
+            // config fails on the spot in Start().
             Validators.CheckGroup(_producerGroup);
             if (_producerGroup == MixAll.DefaultProducerGroup)
             {
@@ -738,29 +793,34 @@ public class DefaultMQProducer
                                             + ", please specify another one.");
             }
 
-            // 静态地址与动态取址（ROCKETMQ_NAMESRV_DOMAIN）二选一必须可用
+            // Exactly one of static addresses and dynamic addressing
+            // (ROCKETMQ_NAMESRV_DOMAIN) must be usable
             if (_nameServerAddrs.Count == 0 && !DefaultTopAddressing.IsConfigured())
             {
-                // 码值用 10004（validateNameServerSetting 对同一个故障给的码）：
-                // 参照行为不在 start() 里查，故障要等第一次发送才以 10004 冒出来，本端口提前到
-                // Start（更可预期），但不能让调用方看到两种不同的码。
+                // Code value 10004 (the code validateNameServerSetting gives for the same
+                // fault): the reference behavior does not check in start(), and the fault
+                // only surfaces as 10004 on the first send; this port moves it earlier to
+                // Start (more predictable), but must not show the caller two different
+                // codes.
                 throw new MQClientException("name server address is not set",
                     ClientErrorCode.NoNameServerException);
             }
 
-            // Start()：非 inner 生产者无条件把默认的
-            // instanceName 换成 <pid>#<nanoTime>，再按 ClientConfig#buildMQClientId 拼 clientId。
-            // 就地写回字段，所以同一生产者 restart 后 clientId 不变（改了不回滚）。
+            // Start(): a non-inner producer unconditionally replaces the default
+            // instanceName with <pid>#<nanoTime>, then builds clientId per
+            // ClientConfig#buildMQClientId. Written back in place, so the same producer's
+            // clientId stays the same across restarts (changes are not rolled back).
             _instanceName = ClientIds.ChangeInstanceNameToPID(_instanceName);
             if (string.IsNullOrEmpty(_clientId))
             {
                 _clientId = ClientIds.Build(_instanceName, _unitName, _enableStreamRequestType);
             }
 
-            // 请求钩子（ACL 签名 / stream 的 ReqT）：绑定必须在 Start() 之前 ——
-            // rpcHook 是随 remoting 实例构造进去的，实例第一笔报文就带着它；
-            // 放在 Start() 之后，start 期间的动态取址/首包路由就是裸的。
-            // RequestHooks.Compose 还原 Namespace → stream → 用户钩子顺序（单槽传输层）。
+            // Request hooks (ACL signing / stream's ReqT): binding must happen before
+            // Start() -- rpcHook is constructed into the remoting instance, so the very
+            // first packet carries it; placed after Start(), the dynamic addressing /
+            // first route packet during start would be bare.
+            // RequestHooks.Compose restores the Namespace → stream → user-hook order (single-slot transport).
             IRpcHook? requestHook = RequestHooks.Compose(_enableStreamRequestType, _rpcHook, () => _namespaceV2);
             _mqClient = MQClientManager.Instance.GetOrCreateMQClientInstance(_clientId,
                 () => new MQClientInstance(_clientId, _nameServerAddrs,
@@ -779,36 +839,43 @@ public class DefaultMQProducer
             }
             catch
             {
-                // 起不来就把引用还回去：否则计数漏减，共享实例永远等不到归零收尾
+                // If it cannot start, hand the reference back: otherwise the refcount
+                // leaks and the shared instance never reaches zero for cleanup
                 MQClientManager.Instance.UnregisterMQClient(_clientId, _mqClient);
                 _mqClient = null;
                 throw;
             }
-            // 动态 name server：实例启动时可能已从地址服务器拿到地址，回填到本生产者
+            // Dynamic name server: the instance may already have fetched addresses from
+            // the address server at startup; backfill them into this producer
             if (_nameServerAddrs.Count == 0 && _mqClient.NameServerAddrs.Count > 0)
             {
                 _nameServerAddrs = new List<string>(_mqClient.NameServerAddrs);
             }
 
-            // 注册 broker 主动请求处理器：事务回查 CHECK_TRANSACTION_STATE(39)。
-            // 不注册的话回查会被传输层当成"未知请求"丢弃，事务消息永远停留在 Unknown。
-            // 走实例级多播（共享实例下多个生产者各登记各的，不互相顶掉）。
+            // Register broker-initiated request processor: transaction check-back
+            // CHECK_TRANSACTION_STATE(39). Without registration, check-backs would be
+            // dropped by the transport as "unknown request" and transactional messages
+            // would stay Unknown forever. Uses instance-level multicast (under a shared
+            // instance each producer registers its own, without clobbering others).
             _mqClient.RegisterFacadeProcessor(RequestCode.CheckTransactionState, CheckTransactionState);
 
-            // 累加器必须在 _started=true **之前**建好：AutoBatch 的 getter 见不到累加器就报
-            // "没打开"，start 之后立刻 send 的第一笔会绕过攒批直发（顺序与 impl.start() 一致：
-            // 也是这个次序）。按 clientId 复用，所以 restart 拿到的是同一个累加器。
+            // The accumulator must be built **before** _started=true: AutoBatch's getter
+            // reports "not enabled" when it cannot see the accumulator, so the first send
+            // right after start would bypass batching and go direct (same order as
+            // impl.start(): this is also the order there). Reused by clientId, so a
+            // restart gets the same accumulator.
             InitProduceAccumulator();
 
-            // 请求-Reply 等待槽的 TTL 扫描
-            //（RequestHouseKeepingService 线程，3s 首扫 / 1s 周期）。单例按引用计数共享，
-            // Shutdown 时最后一个 producer 退场才停。
+            // TTL sweep for Request-Reply waiting slots
+            // (RequestHouseKeepingService thread, 3s first scan / 1s period). Shared as a
+            // singleton by refcount, stopped only when the last producer exits at Shutdown.
             RequestFutureHolder.Instance.StartScheduledTask(this);
 
-            // MQFaultStrategy.startDetector（startDetectorEnable，
-            // 默认 false）：地址解析器给探测线程查 broker 名 → 地址；探测器用 TCP 连通
-            // 探测（默认的 ServiceDetector 是一发 getMaxOffset RPC，连通性等价，
-            // 但省一条协议栈路径；README 差异注已说明）。
+            // MQFaultStrategy.startDetector (startDetectorEnable,
+            // default false): the address resolver gives the detector thread broker
+            // name → address; the detector uses TCP connectivity probes (the default
+            // ServiceDetector is one getMaxOffset RPC, equivalent for connectivity, but
+            // saves a protocol-stack path; README difference note explains this).
             _mqFaultStrategy.LatencyFaultTolerance.SetResolver(
                 name => _mqClient?.FindBrokerAddressInPublish(name));
             _mqFaultStrategy.LatencyFaultTolerance.SetServiceDetector(new TcpServiceDetector());
@@ -818,37 +885,46 @@ public class DefaultMQProducer
             }
 
             _started = true;
-            // 允许 Shutdown 之后再 Start：Shutdown 的前半程里 _started 还是 true，靠 _shutdownRequested
-            // 挡住重复 Shutdown 与新请求，重新 Start 时这道闸必须复位（支持 start→shutdown→start）
+            // Allow Start after Shutdown: during the first half of Shutdown _started is
+            // still true, with _shutdownRequested blocking repeated Shutdown and new
+            // requests; this gate must reset on re-Start (supports start→shutdown→start)
             _shutdownRequested = false;
-            // 异步发送池（放在 Start 的锁内建）：
-            // 必须早于 _started=true 之后任何一次 SendAsync —— SendAsync 只在锁里取句柄。
+            // Async send pool (built inside Start's lock):
+            // must precede any SendAsync after _started=true -- SendAsync only takes the
+            // handle under the lock.
             CreateAsyncExecutors();
-            // 守卫线程同理放最后：它们是纯后台线程，早开晚会都不影响对外语义，
-            // 但必须在能进 Send 之前就位（否则攒批会一直等到第一个守卫轮次）。
+            // The guard threads likewise go last: they are pure background threads, so
+            // starting them earlier or later does not change external semantics, but they
+            // must be in place before Send can be entered (otherwise batching would wait
+            // for the first guard round).
             _produceAccumulator?.Start();
             ClientLog.Info("DefaultMQProducer[" + _producerGroup + "] started, clientId=" + _clientId);
 
-            // 心跳线程：周期性向 broker 注册 ProducerData。broker 的事务回查正是通过
-            // 这一步登记的 channel 反向联系生产者的；生产者不发心跳时 Commit/Rollback
-            // 仍能成功（客户端主动 END_TRANSACTION），但 Unknown 的半消息**永远不被回查**。
+            // Heartbeat thread: periodically registers ProducerData with brokers. The
+            // broker's transaction check-backs reach back to the producer through the
+            // channel registered in this step; when a producer sends no heartbeat,
+            // Commit/Rollback still succeed (the client actively sends END_TRANSACTION),
+            // but Unknown half messages are **never checked back**.
             _heartbeatRunning = true;
             _heartbeatThread = new Thread(HeartbeatLoop)
             { IsBackground = true, Name = "ProducerHeartbeatThread" };
             _heartbeatThread.Start();
         }
 
-        // 轨迹分发器在锁外启动：它会拉起内部生产者（各自加锁），锁内启动容易形成锁嵌套。
+        // The trace dispatcher starts outside the lock: it spins up internal producers
+        // (each taking their own locks); starting inside the lock risks lock nesting.
         StartTraceDispatcher();
     }
 
-    /// <summary>建异步发送链的两个池：异步发送池 + 客户端回调池。
-    /// 线程名形如 <c>AsyncSenderExecutor_1…</c> / <c>NettyClientPublicExecutor_1…</c>（序号从 1 起）。</summary>
+    /// <summary>Build the async send chain's two pools: the async send pool + the client
+    /// callback pool. Thread names look like <c>AsyncSenderExecutor_1…</c> /
+    /// <c>NettyClientPublicExecutor_1…</c> (indexes start at 1).</summary>
     private void CreateAsyncExecutors()
     {
         int cores = Math.Max(1, Environment.ProcessorCount);
-        // getAsyncSenderExecutor 的口径：
-        // 调用方给了自定义池就用它的，内建池只在没给的时候建。
+        // getAsyncSenderExecutor's convention:
+        // a caller-provided pool is used as-is; the built-in pool is only created when
+        // none was given.
         _asyncSenderExecutorOwned = AsyncSenderExecutor is null;
         _asyncSenderExecutor = AsyncSenderExecutor ?? new ConsumeExecutor(
             cores, cores, 60.0, "AsyncSenderExecutor",
@@ -856,7 +932,7 @@ public class DefaultMQProducer
         int callbackThreads = _clientCallbackExecutorThreads;
         if (callbackThreads <= 0)
         {
-            // 默认取 CPU 核数；显式配成 <=0 时兜到 4
+            // Default to CPU core count; an explicit <= 0 falls back to 4
             callbackThreads = cores;
         }
 
@@ -878,10 +954,12 @@ public class DefaultMQProducer
                 return;
             }
 
-            // ⚠ 这里**先不**把 _started 翻掉：排空发送池时还要跑准备段，而准备段要用客户端
-            //（GetClient / 建连 / 发请求）。提前翻掉会让排在队列里的任务统统变成
-            // "producer not started"，排空就成了走个形式。拒绝新请求由 _shutdownRequested
-            // 和置空的两个池负责，语义等价于 SHUTDOWN_ALREADY。
+            // ⚠ _started is deliberately **not** flipped here yet: draining the send pool
+            // still runs the preparation stage, which needs the client (GetClient / connect
+            // / send request). Flipping it early would turn every queued task into
+            // "producer not started", making the drain a formality. Rejecting new
+            // requests is handled by _shutdownRequested and the two nulled pools, which
+            // is semantically equivalent to SHUTDOWN_ALREADY.
             _shutdownRequested = true;
             sender = _asyncSenderExecutor;
             callback = _callbackExecutor;
@@ -889,16 +967,17 @@ public class DefaultMQProducer
             _asyncSenderExecutor = null;
             _callbackExecutor = null;
 
-            // 先停心跳线程（它内部持有 mqClient 引用）
+            // Stop the heartbeat thread first (it internally holds an mqClient reference)
             _heartbeatRunning = false;
             if (_heartbeatThread is { IsAlive: true })
             {
                 _heartbeatThread.Join(2000);
             }
 
-            // 对应 shutdown() 的 RequestFutureHolder.shutdown
-            // 与 MQFaultStrategy 关停：请求等待槽的 TTL 扫描按引用计数停（最后一个
-            // producer 退场才停），探测线程一并关闭。
+            // Corresponds to shutdown()'s RequestFutureHolder.shutdown
+            // and MQFaultStrategy teardown: the request waiting-slot TTL sweep stops by
+            // refcount (only when the last producer exits), and the detector thread is
+            // closed along with it.
             RequestFutureHolder.Instance.ShutdownScheduledTask(this);
             _mqFaultStrategy.Shutdown();
 
@@ -909,37 +988,48 @@ public class DefaultMQProducer
             }
         }
 
-        // 先回收异步发送池（它们内部持有 mqClient 引用），再关客户端：
-        // 排空（wait=true）而不是只 shutdown()。不等待的
-        // <c>defaultAsyncSenderExecutor.shutdown()</c> 会把
-        // 把队列里还没跑到的准备段连同任务一起丢掉；这里等到队列跑完，保证交进来的
-        // 每一笔都**跑完准备段并把报文交给传输层**。
-        // ⚠ 排空的只是准备段（含换 broker 重试的发起）：网络等待在传输层的线程上，不等。
-        // ⚠ 保证止于「交给传输层」：紧接着就要关客户端，broker 还没读走的**尾部**几帧会随
-        // 连接一起丢掉（离线跑整套用例时实测 32/36 上线、单跑稳定 36/36），响应没回来的那几笔
-        // 也拿不到终态回调 —— 关客户端会停掉超时清理并清空在途表，没人再
-        // 负责投递。调用方要确保每一笔都拿到回调，就得自己等回调再 Shutdown。
-        // 调用方自带的池（setAsyncSenderExecutor 传入的）不动它 —— 池归它自己管。
+        // Reclaim the async send pools first (they internally hold mqClient references),
+        // then close the client:
+        // drain (wait=true) rather than just shutdown(). A non-waiting
+        // <c>defaultAsyncSenderExecutor.shutdown()</c> would drop
+        // the queued preparation stages along with their tasks; here we wait for the
+        // queue to finish, guaranteeing that every submitted message **completes its
+        // preparation stage and hands the packet to the transport**.
+        // ⚠ Only the preparation stage is drained (including initiating broker-switch
+        // retries): network waits happen on transport threads and are not waited for.
+        // ⚠ The guarantee stops at "handed to the transport": the client is about to be
+        // closed right after, so the **tail** few frames the broker has not yet read are
+        // dropped along with the connection (measured 32/36 up when running the full
+        // suite offline, stable 36/36 when run alone), and the few whose responses never
+        // came back get no final callback either -- closing the client stops the timeout
+        // cleanup and clears the in-flight table, leaving nobody to deliver. Callers
+        // wanting a callback for every message must wait for callbacks before Shutdown.
+        // A caller-supplied pool (passed via setAsyncSenderExecutor) is left untouched --
+        // it manages its own lifecycle.
         if (senderOwned)
         {
             sender?.Shutdown(true);
         }
-        // 回调池同理：等已排队的回调跑完。响应在此之后才回来的那一笔，
-        // CompleteOnCallbackThread 见池已关就地转交用户回调。
+        // Same for the callback pool: wait for queued callbacks to finish. For a message
+        // whose response comes back after this, CompleteOnCallbackThread hands the user
+        // callback over in place when it sees the pool is closed.
         callback?.Shutdown(true);
 
-        // 准备段都跑完了才宣布「不再活着」：此后任何路径都拿不到客户端。
+        // Only after all preparation stages finish is "no longer alive" declared: from
+        // here on no path can obtain the client.
         lock (_lock)
         {
             _started = false;
         }
 
-        // 守卫线程跟着生产者一起停：累加器在
-        // impl.shutdown() **之后**才关。累加器本身留在按 clientId 的复用表里，
-        // 里面的表项不清：残留批次下次 start 后仍由新守卫线程处理。
+        // Guard threads stop with the producer: the accumulator is
+        // closed only **after** impl.shutdown(). The accumulator itself stays in the
+        // clientId reuse table, and its entries are not cleared: leftover batches are
+        // still handled by the new guard thread after the next start.
         _produceAccumulator?.Shutdown();
 
-        // 事务回查线程仍按老口径 join（它们也持有 mqClient 引用）
+        // Transaction check-back threads still join by the old convention (they also
+        // hold mqClient references)
         foreach (Thread t in threads)
         {
             try
@@ -948,18 +1038,21 @@ public class DefaultMQProducer
             }
             catch (Exception)
             {
-                // 忽略 join 过程中的异常（如线程尚未真正启动）
+                // Ignore exceptions during join (e.g. the thread has not truly started yet)
             }
         }
 
         if (_mqClient is not null)
         {
             // `shutdown()` → `unregisterProducer` →
-            // `unregisterClient(group, null)`：给 brokerAddrTable 里**每台 broker
-            // （含 slave）**同步发一发 UNREGISTER_CLIENT(35)，超时 getMqClientApiTimeout()（3000ms），
-            // 异常只 log.warn。少了这一发，broker 侧 ProducerManager 要等通道断开（或 120s 扫描）
-            // 才回收本组连接。35 必须走**还没关的那条连接**，所以只能排在 Shutdown() 之前；
-            // 心跳线程已在上面停掉，不会被重新注册回去。
+            // `unregisterClient(group, null)`: sends UNREGISTER_CLIENT(35) synchronously
+            // to **every broker (including slaves)** in brokerAddrTable, timing out at
+            // getMqClientApiTimeout() (3000ms), exceptions only log.warn. Without it, the
+            // broker-side ProducerManager waits for the channel to drop (or a 120s scan)
+            // before reclaiming this group's connection. 35 must travel over the
+            // **still-open** connection, so it can only be placed before Shutdown(); the
+            // heartbeat thread has already been stopped above, so it will not be
+            // re-registered.
             try
             {
                 _mqClient.UnregisterClientAllBrokers(_clientId, ProducerGroup, "");
@@ -969,16 +1062,18 @@ public class DefaultMQProducer
                 ClientLog.Debug("unregister producer on shutdown failed: " + e.Message);
             }
 
-            // 事务回查处理器是本生产者登记在**共享实例**上的：先摘掉，避免实例被别的
-            // 门面继续复用时，broker 的回查还打向一个已退出的生产者。
+            // The transaction check-back processor is registered by this producer on the
+            // **shared instance**: remove it first, so that when the instance is reused
+            // by another facade, broker check-backs do not still hit an exited producer.
             _mqClient.UnregisterFacadeProcessor(RequestCode.CheckTransactionState, CheckTransactionState);
 
             MQClientManager.Instance.UnregisterMQClient(_clientId, _mqClient);
             _mqClient = null;
         }
 
-        // 关停顺序：先关本生产者，再 flush 并关轨迹分发器
-        //（分发器用的是**自己的**内部生产者，与本客户端实例无关，所以关掉了照样能发完）
+        // Shutdown order: close this producer first, then flush and close the trace
+        // dispatcher (the dispatcher uses its **own** internal producer, unrelated to
+        // this client instance, so it can still finish sending after being closed)
         if (_traceDispatcher is not null)
         {
             try
@@ -992,15 +1087,16 @@ public class DefaultMQProducer
         }
     }
 
-    /// <summary>返回底层客户端实例。</summary>
+    /// <summary>Returns the underlying client instance.</summary>
     public MQClientInstance Client() => GetClient();
 
     private MQClientInstance GetClient()
     {
         if (!_started || _mqClient is null)
         {
-            // 分得清「没启动」和「已经关掉」：用 ServiceState 区分 CREATE_JUST 与
-            // SHUTDOWN_ALREADY，这里靠 _shutdownRequested 做到同一条判据。
+            // Distinguishes "not started" from "already shut down": ServiceState tells
+            // CREATE_JUST from SHUTDOWN_ALREADY; here _shutdownRequested provides the
+            // same single criterion.
             throw new MQClientException(_shutdownRequested
                 ? "producer already shutdown"
                 : "producer not started, call start() first");
@@ -1009,8 +1105,9 @@ public class DefaultMQProducer
         return _mqClient;
     }
 
-    // ---------------- 钩子执行（executeSendMessageHookBefore/After、executeEndTransactionHook）----------------
-    // 钩子抛出的异常一律吞掉并记 warn：轨迹出错绝不能影响正常收发。
+    // ---------------- Hook execution (executeSendMessageHookBefore/After, executeEndTransactionHook) ----------------
+    // Exceptions thrown by hooks are always swallowed and logged as warn: trace failures
+    // must never affect normal send/receive.
 
     private void ExecuteSendMessageHookBefore(SendMessageContext context)
     {
@@ -1057,10 +1154,12 @@ public class DefaultMQProducer
         }
     }
 
-    /// <summary>构造 SendMessageContext（对应发送内核里钩子上下文的全部字段）。
-    /// msgType 判定顺序照抄：TRAN_MSG=true → Trans；带任何延迟类属性 → Delay；否则 Normal。
-    /// ⚠ C# 的 <c>GetProperty</c> 对缺失键返回**空串**而非 null，
-    /// 所以延迟属性必须用 <c>Properties.ContainsKey</c> 判断，不能靠值判空。</summary>
+    /// <summary>Build the SendMessageContext (all fields of the hook context in the send
+    /// kernel). The msgType decision order is copied verbatim: TRAN_MSG=true → Trans; any
+    /// delay-type property present → Delay; otherwise Normal.
+    /// ⚠ C#'s <c>GetProperty</c> returns an **empty string** rather than null for a
+    /// missing key, so delay properties must be checked with <c>Properties.ContainsKey</c>,
+    /// not by null-checking the value.</summary>
     private SendMessageContext BuildSendContext(Message msg, MessageQueue mq, string brokerAddr)
     {
         var context = new SendMessageContext
@@ -1093,10 +1192,12 @@ public class DefaultMQProducer
         return context;
     }
 
-    /// <summary>对应 tryToFindTopicPublishInfo：
-    /// 先拉**真实**路由；只有确实拉不到（新 topic 尚未在 NameServer 注册）时，才按
-    /// 用默认 topic（TBW102）为该 topic 合成发布信息 —— 否则新 topic 的**首条**消息没有队列可选，
-    /// 直接抛 "Can not find Message Queue"。消费侧**不做**这个兜底。</summary>
+    /// <summary>Corresponds to tryToFindTopicPublishInfo:
+    /// first fetch the **real** route; only when it truly cannot be fetched (a new topic
+    /// not yet registered with the NameServer) is publish info synthesized for the topic
+    /// from the default topic (TBW102) -- otherwise the new topic's **first** message
+    /// would have no queue to select and would directly throw "Can not find Message
+    /// Queue". The consume side does **not** do this fallback.</summary>
     private TopicPublishInfo TryToFindTopicPublishInfo(MQClientInstance c, string topic)
     {
         try
@@ -1111,10 +1212,12 @@ public class DefaultMQProducer
             }
             catch (MQClientException)
             {
-                // 三条「拿不到路由」分支（sendDefaultImpl / sendSelectImpl /
-                // invokeMessageQueueSelector:716）都先 validateNameServerSetting() 再抛 no-route：
-                // 一个 name server 地址都没有（配了地址服务器却没返回地址也算）时报 10004，
-                // 而不是把寻址故障说成"这个 topic 没路由"。
+                // All three "cannot get route" branches (sendDefaultImpl / sendSelectImpl /
+                // invokeMessageQueueSelector:716) call validateNameServerSetting() first
+                // before throwing no-route: when there is not a single name server address
+                // (an address server configured but returning nothing also counts), 10004
+                // is reported instead of blaming "this topic has no route" for an
+                // addressing failure.
                 ValidateNameServerSetting(c);
                 throw;
             }
@@ -1122,16 +1225,21 @@ public class DefaultMQProducer
     }
 
     /// <summary>
-    /// 对应 <c>validateNameServerSetting</c>。
+    /// Corresponds to <c>validateNameServerSetting</c>.
     ///
-    /// 只在「拿不到路由」这条分支上跑，把两种完全不同的故障分开：
+    /// Runs only on the "cannot get route" branch, separating two completely different
+    /// faults:
     /// <list type="bullet">
-    /// <item>压根一个 name server 地址都没有（配了地址服务器却没返回地址也算）→ 10004。</item>
-    /// <item>地址有、只是这个 topic 没路由 → 让调用方原来那条异常照旧抛（10005 等）。</item>
+    /// <item>Not a single name server address at all (an address server configured but
+    /// returning nothing also counts) → 10004.</item>
+    /// <item>Addresses exist, just this topic has no route → let the caller's original
+    /// exception be thrown as before (10005 etc.).</item>
     /// </list>
-    /// 少了这一步，用户把地址服务器配错拿到空列表，看到的却是 "No route info of this topic"
-    /// ——那是"topic 不存在"的意思，把人往建 topic 的方向查，而真正坏的是寻址。
-    /// 协议文案后面原本拼了 <c>FAQUrl.suggestTodo(...)</c>，本仓库按约定不带后缀。
+    /// Without this step, a user who misconfigures the address server and gets an empty
+    /// list would see "No route info of this topic" -- which means "the topic does not
+    /// exist", pointing them toward creating a topic, when what is actually broken is
+    /// addressing. The protocol text originally concatenated <c>FAQUrl.suggestTodo(...)</c>;
+    /// this repo by convention carries no suffix.
     /// </summary>
     private void ValidateNameServerSetting(MQClientInstance? c)
     {
@@ -1142,21 +1250,25 @@ public class DefaultMQProducer
         }
     }
 
-    /// <summary>带 before/after 钩子的同步发送（对应 sendKernelImpl + sendDefaultImpl 的钩子点）。
-    /// 钩子只在**真正发起请求的那一次**执行（重试时每轮都重建 context）。
-    /// 无钩子时直通，不引入任何额外开销。
+    /// <summary>Synchronous send with before/after hooks (corresponds to the hook points of
+    /// sendKernelImpl + sendDefaultImpl). Hooks run only on the attempt that **actually
+    /// initiates the request** (each retry rebuilds the context).
+    /// With no hooks it passes straight through, adding no extra overhead.
     ///
-    /// 执行顺序严格照 sendKernelImpl 的步序：
-    ///   1. <b>CheckForbiddenHook</b>（每次尝试都跑；异常<b>不吞</b>，直接抛给重试链）
+    /// Execution order strictly follows sendKernelImpl's steps:
+    ///   1. <b>CheckForbiddenHook</b> (runs every attempt; exceptions are <b>not
+    ///      swallowed</b>, thrown straight into the retry chain)
     ///   2. SendMessageHook.before
-    ///   3. 发请求
-    ///   4. SendMessageHook.after（成功带 SendResult / 失败带 Exception）</summary>
+    ///   3. send the request
+    ///   4. SendMessageHook.after (with SendResult on success / Exception on failure)</summary>
     private SendResult SendWithHooks(MQClientInstance c, Message msg, MessageQueue mq,
         int timeout, int sysFlag, object? arg = null,
         CommunicationMode mode = CommunicationMode.Sync)
     {
-        // W3C traceparent 透传（opt-in）：没有就注入根上下文，已有值不覆盖。
-        // ⚠ 必须放在 HasSendInterceptors 早退之前，否则无钩子时注入被跳过。
+        // W3C traceparent propagation (opt-in): inject a root context when absent, never
+        // overwrite an existing value.
+        // ⚠ Must be placed before the HasSendInterceptors early-return, otherwise the
+        // injection is skipped when there are no hooks.
         if (_enableTraceContext)
         {
             TraceParentContext.Inject(msg);
@@ -1168,9 +1280,11 @@ public class DefaultMQProducer
                 _createTopicKey, _defaultTopicQueueNums);
         }
 
-        // 地址解析在钩子**之前**、且失败不吞：sendKernelImpl 的地址两步就在
-        // 钩子块外，拿不到照 :1100 抛「The broker[X] not exist」。旧行为（宽容查地址 + 吞异常）
-        // 会让主掉线时的第一次定点发送把请求打到从节点上白挨一轮 SYSTEM_BUSY(2)。
+        // Address resolution happens **before** the hooks and is not swallowed on failure:
+        // sendKernelImpl's two address steps are outside the hook block, and a failure
+        // throws "The broker[X] not exist" per :1100. The old behavior (lenient address
+        // lookup + swallowed exception) would let the first pinned send during a master
+        // outage hit a slave node and eat a pointless round of SYSTEM_BUSY(2).
         string brokerAddr = c.PublishAddrFor(mq.BrokerName, mq.Topic);
 
         RunCheckForbidden(msg, mq, brokerAddr, arg, mode);
@@ -1201,8 +1315,9 @@ public class DefaultMQProducer
         return result;
     }
 
-    /// <summary>构造 CheckForbiddenContext 并执行（每次发送尝试都会调一次，含重试）。
-    /// 异常不在这里捕获 —— 必须沿发送重试链向上传播。</summary>
+    /// <summary>Build the CheckForbiddenContext and execute it (called once per send
+    /// attempt, including retries). Exceptions are not caught here -- they must propagate
+    /// up along the send retry chain.</summary>
     private void RunCheckForbidden(Message msg, MessageQueue mq, string brokerAddr,
         object? arg, CommunicationMode mode)
     {
@@ -1220,16 +1335,17 @@ public class DefaultMQProducer
             BrokerAddr = brokerAddr,
             CommunicationMode = mode,
             Arg = arg,
-            // 鉴权上下文的 unitMode 取自 isUnitMode()（checkForbiddenContext.setUnitMode）
-            // —— 钩子据此判断这是不是单元化流量。
+            // The auth context's unitMode comes from isUnitMode() (checkForbiddenContext.setUnitMode)
+            // -- the hook uses it to judge whether this is unitized traffic.
             UnitMode = _unitMode,
         };
         ExecuteCheckForbiddenHook(context);
     }
 
-    /// <summary>对应 start() 的轨迹段：enableTrace=true 时建分发器
-    /// （Type=Produce）并注册 SendMessageTraceHook / EndTransactionTraceHook，随后 start 它。
-    /// 任何异常都只记日志 —— 轨迹挂了不能影响正常发送。</summary>
+    /// <summary>Corresponds to start()'s trace section: when enableTrace=true, build the
+    /// dispatcher (Type=Produce) and register SendMessageTraceHook / EndTransactionTraceHook,
+    /// then start it. Any exception is only logged -- trace failures must not affect
+    /// normal sends.</summary>
     private void StartTraceDispatcher()
     {
         if (_enableTrace)
@@ -1239,17 +1355,19 @@ public class DefaultMQProducer
                 var dispatcher = new AsyncTraceDispatcher(_producerGroup,
                     TraceDispatcherType.Produce, _traceMsgBatchNum, _traceTopic, _rpcHook);
                 dispatcher.SetHostProducer(this);
-                // namespaceV2 传导给分发器，
-                // 再由分发器 Start 时落到内部轨迹生产者上。
+                // namespaceV2 propagates to the dispatcher,
+                // which then lands it on the internal trace producer at Start.
                 dispatcher.NamespaceV2 = _namespaceV2;
                 _traceDispatcher = dispatcher;
                 RegisterSendMessageHook(new SendMessageTraceHook(dispatcher));
                 RegisterEndTransactionHook(new EndTransactionTraceHook(dispatcher));
 
-                // recall RPC 的轨迹钩子（IRpcHook，
-                // 在响应回来后记 TraceType.Recall）。本端口的钩子槽只有一个（first-wins），
-                // Start() 里已把 Namespace/Stream/ACL 组合钩子占住 —— 这里换成
-                // 「原钩子 + recall」的链重新注册；recall 追加在最后，保持注册顺序。
+                // recall RPC's trace hook (IRpcHook,
+                // records TraceType.Recall after the response comes back). This port's hook
+                // slot is single (first-wins), and Start() has already occupied it with the
+                // Namespace/Stream/ACL composite hook -- here it is re-registered as a
+                // "original hook + recall" chain; recall is appended last, preserving
+                // registration order.
                 var recallHook = new DefaultRecallMessageTraceHook(dispatcher);
                 IRpcHook? existing = _mqClient?.RemotingClient.CurrentHook();
                 if (existing is not null)
@@ -1284,24 +1402,26 @@ public class DefaultMQProducer
         }
     }
 
-    // ---------------- 校验 ----------------
+    // ---------------- Validation ----------------
 
-    // 对应 Validators.checkMessage：topic 合法性、禁发 topic、body 长度阈值、LMQ 路径。
-    // 本地先拦下来是因为 TOPIC_NOT_EXIST 属于可重试码，非法名字会把重试预算空转一遍。
+    // Corresponds to Validators.checkMessage: topic legality, forbidden topics, body
+    // length threshold, LMQ path. Intercepting locally is because TOPIC_NOT_EXIST is a
+    // retryable code, and an illegal name would spin the retry budget for nothing.
     private void CheckMessage(Message msg) => Validators.CheckMessage(msg, _maxMessageSize);
 
-    // 对应 tryToCompressMessage + sendKernelImpl 的 sysFlag 组装：
-    // 满足阈值且非批量时**就地压缩 msg.body**，返回应下发的 sysFlag
-    // （COMPRESSED_FLAG | 压缩类型位）；不压缩时返回 0。
+    // Corresponds to tryToCompressMessage + sendKernelImpl's sysFlag assembly:
+    // when the threshold is met and it is not a batch, **compress msg.body in place**,
+    // returning the sysFlag that should be sent (COMPRESSED_FLAG | compression-type
+    // bits); returns 0 when not compressing.
     private int PrepareForSend(Message msg)
     {
-        // 批量消息（MessageBatch）**永不压缩**
+        // Batch messages (MessageBatch) are **never compressed**
         if (msg.IsBatch)
         {
             return 0;
         }
 
-        // body 长度 >= compressMsgBodyOverHowmuch（默认 4096）才压缩
+        // Only compress when body length >= compressMsgBodyOverHowmuch (default 4096)
         if (msg.Body.Length < _compressMsgBodyOverHowmuch)
         {
             return 0;
@@ -1314,26 +1434,29 @@ public class DefaultMQProducer
         }
         catch (Exception e)
         {
-            // 压缩失败**降级为不压缩**并记日志，而不是让发送失败
+            // Compression failure **degrades to no compression** with a log, rather than
+            // failing the send
             ClientLog.Warn("tryToCompressMessage failed, send uncompressed: " + e.Message);
             return 0;
         }
 
-        // 压缩后不比较体积（即使压完更大也照发）
+        // Size is not compared after compression (sent as-is even if larger)
         if (compressed.Length == 0 && msg.Body.Length != 0)
         {
             return 0;
         }
 
-        // 压缩成功：就地替换 body，并打上压缩标志 + 压缩类型位
+        // Compression succeeded: replace the body in place and set the compression flag
+        // plus compression-type bits
         msg.Body = compressed;
         int sysFlag = MessageSysFlag.CompressedFlag;
         sysFlag |= CompressionType.GetCompressionFlag(_compressType);
         return sysFlag;
     }
 
-    // Message 是引用类型，发送语义要求压缩前先拷一份；
-    // 这里显式克隆，避免压缩就地改写调用方的原始消息 body。
+    // Message is a reference type and send semantics require a copy before compression;
+    // clone explicitly here, avoiding in-place rewriting of the caller's original
+    // message body.
     private static Message CloneMessage(Message src)
     {
         var copy = new Message
@@ -1349,8 +1472,8 @@ public class DefaultMQProducer
         return copy;
     }
 
-    // 发送前给 topic 套上 namespace 前缀（对应 withNamespace）。
-    // namespace 为空时仅克隆（不改变 topic）。
+    // Wrap the topic with the namespace prefix before sending (corresponds to
+    // withNamespace). When the namespace is empty, only clone (topic unchanged).
     private Message WithNamespace(Message msg)
     {
         Message outMsg = CloneMessage(msg);
@@ -1362,18 +1485,22 @@ public class DefaultMQProducer
         return outMsg;
     }
 
-    // 定点发送守卫的两处文案（同步路径、异步路径各一处），逐字保留：
-    // 两处文案本就不同，按入口取用。
+    // The two pinned-send guard messages (one on the sync path, one on the async path),
+    // preserved verbatim: the two texts were originally different, selected by entry point.
     private const string PinnedTopicMismatchSync = "message's topic not equal mq's topic";
     private const string PinnedTopicMismatchAsync =
         "Topic of the message does not match its target message queue";
 
-    /// <summary>定点发送（显式给了 mq）的 topic 一致性守卫（同步 / 异步各一处，两处文案不同，
-    /// 由调用方按入口传）。比的是<b>各自拼过命名空间之后</b>的名字 —— 公开入口先
-    /// <c>msg.setTopic(withNamespace(...))</c>、再把 mq 过 <c>ClientConfig.queueWithNamespace</c>，
-    /// 所以比的是同一命名空间下的两个资源名（WrapNamespace 幂等，已经带前缀的入参不会套两层）。
-    /// 少了这道守卫，topic 与目标队列不符的消息照样发得出去：broker 按请求里带的队列名写入，
-    /// SendResult 一切正常，消息却落进了<b>另一个 topic</b> 的分区，无人消费也无人报错。</summary>
+    /// <summary>Topic-consistency guard for pinned sends (explicit mq given) (one each on the
+    /// sync / async paths, with different texts, passed by the caller per entry point).
+    /// Compares the names **after each has been namespace-wrapped** -- public entries first
+    /// <c>msg.setTopic(withNamespace(...))</c>, then pass mq through
+    /// <c>ClientConfig.queueWithNamespace</c>, so what is compared is the two resource
+    /// names under the same namespace (WrapNamespace is idempotent, so an already-prefixed
+    /// argument is not wrapped twice). Without this guard, a message whose topic does not
+    /// match the target queue would still be sent: the broker writes by the queue name in
+    /// the request, SendResult looks normal, but the message lands in a partition of
+    /// <b>another topic</b>, consumed by nobody and reported by nobody.</summary>
     private void CheckPinnedTopic(string msgTopic, MessageQueue mq, string message)
     {
         if (NamespaceUtil.WrapNamespace(_namespace, msgTopic)
@@ -1383,10 +1510,11 @@ public class DefaultMQProducer
         }
     }
 
-    // ---------------- 同步发送 ----------------
+    // ---------------- Synchronous send ----------------
 
-    /// <summary>重试耗尽后给最后一次失败定性，决定最终 MQClientException 的错误码。
-    /// 等价于 lastExceptionType 判定（按异常类型分档）。</summary>
+    /// <summary>Qualify the final failure after retries are exhausted, deciding the error
+    /// code of the resulting MQClientException. Equivalent to the lastExceptionType
+    /// determination (tiered by exception type).</summary>
     private enum SendFailureCause
     {
         None,
@@ -1397,11 +1525,12 @@ public class DefaultMQProducer
         Other,
     }
 
-    // ---------------- 自动攒批的转发层（canBatch / sendDirect / sendByAccumulator）----------------
+    // ---------------- Auto-batching forwarding layer (canBatch / sendDirect / sendByAccumulator) ----------------
 
-    /// <summary><c>Message.getDelayTimeMs/Sec()</c> + <c>getDeliverTimeMs()</c> 的最大值
-    /// （缺省 0）。属性名逐字对齐 <c>MessageConst</c>；值非法时按
-    /// <c>Long.parseLong</c> 一样**直接抛**，不静默当 0。</summary>
+    /// <summary><c>Message.getDelayTimeMs/Sec()</c> + <c>getDeliverTimeMs()</c>'s maximum
+    /// (default 0). Property names align verbatim with <c>MessageConst</c>; on an illegal
+    /// value it **throws directly**, like <c>Long.parseLong</c>, rather than silently
+    /// treating it as 0.</summary>
     private static long MaxDelayValue(Message msg)
     {
         long result = msg.DelayTimeLevel;
@@ -1427,17 +1556,23 @@ public class DefaultMQProducer
         "TIMER_DELAY_MS", "TIMER_DELAY_SEC", "TIMER_DELIVER_MS",
     };
 
-    /// <summary><c>canBatch</c>。
+    /// <summary><c>canBatch</c>.
     ///
-    /// ⚠ 先过全局字节闸门 <see cref="ProduceAccumulator.TryAddMessage"/>：**放行即记账**，
-    /// 而后面三条「不能攒批」的判断只让调用方退回直发 —— 那条消息的字节数**不会被归还**
-    /// （上游遗漏，照抄；改掉就对不上线上口径了）。三条排除项：
-    ///   1. 延时/定时消息（DELAY / TIMER_DELAY_MS / TIMER_DELAY_SEC / TIMER_DELIVER_MS）
-    ///      任何一个 &gt; 0 都不攒批 —— 一个 MessageBatch 只能有一个延时属性；
-    ///   2. 重试 topic（<c>%RETRY%</c> 前缀）：重试消息的位点语义特殊；
-    ///   3. 已带 PGROUP 属性的消息（事务半消息那种）：broker 侧要按组找连接。
+    /// ⚠ The global byte gate <see cref="ProduceAccumulator.TryAddMessage"/> comes first:
+    /// **admittance books it**, while the three "cannot batch" checks that follow only
+    /// make the caller fall back to direct send -- that message's byte count is **not
+    /// refunded** (an upstream omission, copied verbatim; changing it would no longer
+    /// match the live convention). The three exclusions:
+    ///   1. Delayed/scheduled messages (any of DELAY / TIMER_DELAY_MS / TIMER_DELAY_SEC /
+    ///      TIMER_DELIVER_MS) &gt; 0 disables batching -- a MessageBatch can only carry one
+    ///      delay property;
+    ///   2. Retry topic (<c>%RETRY%</c> prefix): retry messages have special offset
+    ///      semantics;
+    ///   3. Messages already carrying the PGROUP property (the transactional half-message
+    ///      kind): the broker locates the connection by group.
     ///
-    /// 测试工程与本程序集没有 InternalsVisibleTo 关系，故用 public，勿用于业务代码。</summary>
+    /// The test project and this assembly have no InternalsVisibleTo relationship, hence
+    /// public; do not use in business code.</summary>
     public bool CanBatch(Message msg)
     {
         if (_produceAccumulator is null || !_produceAccumulator.TryAddMessage(msg))
@@ -1463,11 +1598,14 @@ public class DefaultMQProducer
         return true;
     }
 
-    /// <summary><c>sendDirect</c>：绕过累加器直发（同步或异步）。
-    /// 注意"直发"指的是**不经累加器**，内部照样走重试链。
-    /// ⚠ 必须落到 *Impl 变体（即 <c>DefaultMQProducerImpl.send*</c> 口径）：公开入口会再判
-    /// 一次 AutoBatch，而调用方进到这里恰恰是因为攒批被拒，绕回公开入口就是无限递归。
-    /// virtual 是为了测试能造一个"只记账不联网"的假生产者（MockMQProducer 口径）。</summary>
+    /// <summary><c>sendDirect</c>: direct send bypassing the accumulator (sync or async).
+    /// Note "direct" means **not via the accumulator**; internally it still goes through
+    /// the retry chain. ⚠ It must land on the *Impl variants (i.e. the
+    /// <c>DefaultMQProducerImpl.send*</c> convention): the public entries judge AutoBatch
+    /// again, and a caller arriving here is precisely because batching was rejected --
+    /// looping back to the public entry would be infinite recursion.
+    /// virtual exists so tests can build a fake producer that "only books without
+    /// networking" (the MockMQProducer convention).</summary>
     public virtual SendResult? SendDirect(Message msg, MessageQueue? mq, ISendCallback? sendCallback)
     {
         if (sendCallback is null)
@@ -1479,10 +1617,12 @@ public class DefaultMQProducer
         return null;
     }
 
-    /// <summary><c>sendByAccumulator</c>。
-    /// 不能攒批（见 <see cref="CanBatch"/>）→ 退回直发；否则先过 <c>Validators.checkMessage</c>
-    /// 再给本条消息打 UNIQ_KEY（批量消息的 ID 在编码成 body 前就得写好），然后交给累加器
-    /// （同步版返回本条自己的 SendResult，异步版立刻返回 null、结果走回调）。</summary>
+    /// <summary><c>sendByAccumulator</c>.
+    /// Cannot batch (see <see cref="CanBatch"/>) → fall back to direct send; otherwise
+    /// first <c>Validators.checkMessage</c>, then stamp UNIQ_KEY on this message (the
+    /// batch's IDs must be written before the body is encoded), then hand it to the
+    /// accumulator (the sync version returns this message's own SendResult; the async
+    /// version returns null immediately, results via callback).</summary>
     public SendResult? SendByAccumulator(Message msg, MessageQueue? mq, ISendCallback? sendCallback)
     {
         if (!CanBatch(msg))
@@ -1511,24 +1651,33 @@ public class DefaultMQProducer
         return null;
     }
 
-    // 不指定队列：按 broker 延迟/隔离状态选队列，失败按 retryTimesWhenSendFailed 重试。
-    // 逐条对齐 sendDefaultImpl：
-    //   * timesTotal = 1 + retryTimesWhenSendFailed（只有同步发送有重试）；
-    //   * 路由在循环**之外**只取一次，整条重试链共用；完全取不到时在循环外就按
-    //     NOT_FOUND_TOPIC 抛掉，不把重试次数空转掉；
-    //   * 每次尝试先算 costTime，总超时已用完则整体放弃（→ RemotingTooMuchRequestException）；
-    //     还剩重试机会时，单次请求超时被 SendMsgMaxTimeoutPerRequest 压住，把余量留给后面的 broker；
-    //   * 异常按类型分档写容错表，且只有 RetryResponseCodes 里的 broker 响应码才继续重试；
-    //   * 全部失败时把原因映射成 ClientErrorCode 塞进 MQClientException。
+    // No queue specified: select a queue by broker latency/isolation state, retrying on
+    // failure per retryTimesWhenSendFailed. Aligned item by item with sendDefaultImpl:
+    //   * timesTotal = 1 + retryTimesWhenSendFailed (only sync sends retry);
+    //   * the route is fetched only once **outside** the loop and shared by the whole
+    //     retry chain; when it cannot be fetched at all, NOT_FOUND_TOPIC is thrown
+    //     outside the loop rather than spinning the retries for nothing;
+    //   * each attempt first computes costTime; if the total timeout is used up, give up
+    //     entirely (→ RemotingTooMuchRequestException); when retries remain, the
+    //     per-request timeout is clamped by SendMsgMaxTimeoutPerRequest, leaving the rest
+    //     for later brokers;
+    //   * exceptions are tiered into the fault table by type, and only broker response
+    //     codes in RetryResponseCodes continue retrying;
+    //   * when all fail, the cause is mapped into a ClientErrorCode packed into the
+    //     MQClientException.
     public SendResult Send(Message msg, int timeoutMillis = -1)
     {
-        // 自动攒批分流（send(Message) 门面）。两个不分流的情况：
-        //   * **显式给了 timeout** 的重载（send(msg, timeout)）直接进 impl，不攒批；
-        //   * 批量消息被 `msg is not MessageBatch` 挡住 —— 那正是累加器自己发出去的东西，
-        //     不挡就会无限递归。
-        // 这里先过 namespace 再把**副本**交给累加器（若在入口就地 setTopic，之后每条
-        // 子消息的 topic 会逐条编码进批量 body，broker 落盘、消费侧看到的就是带前缀的；
-        // 本工程按既有口径不动调用方那份消息）。
+        // Auto-batching dispatch (the send(Message) facade). Two non-dispatch cases:
+        //   * the **explicit timeout** overload (send(msg, timeout)) goes straight to impl,
+        //     no batching;
+        //   * batch messages are blocked by `msg is not MessageBatch` -- that is exactly
+        //     what the accumulator itself sends out; without the block it would recurse
+        //     infinitely.
+        // Here namespace is applied first and the **copy** is handed to the accumulator
+        // (if the entry set the topic in place, each sub-message's topic would then be
+        // encoded one by one into the batch body, and the broker and consume side would
+        // see the prefixed one; this project leaves the caller's message alone per the
+        // existing convention).
         if (timeoutMillis < 0 && AutoBatch && msg is not MessageBatch)
         {
             return SendByAccumulator(WithNamespace(msg), null, null)!;
@@ -1537,18 +1686,21 @@ public class DefaultMQProducer
         return SendImpl(msg, timeoutMillis);
     }
 
-    /// <summary><c>DefaultMQProducerImpl.send(msg, timeout)</c> 的整条同步发送链
-    /// （"绕过累加器"的那一半）。<see cref="SendDirect"/> 必须走这里而不是公开的
-    /// <see cref="Send(Message,int)"/>：后者会再判一次 AutoBatch，攒批失败时两边互相调用，
-    /// 成了无限递归。</summary>
+    /// <summary>The whole synchronous send chain of <c>DefaultMQProducerImpl.send(msg, timeout)</c>
+    /// (the "bypassing the accumulator" half). <see cref="SendDirect"/> must come here
+    /// rather than the public <see cref="Send(Message,int)"/>: the latter judges AutoBatch
+    /// again, so when batching fails the two would call each other, becoming infinite
+    /// recursion.</summary>
     private SendResult SendImpl(Message msg, int timeoutMillis)
     {
         MQClientInstance c = GetClient();
         int timeout = timeoutMillis >= 0 ? timeoutMillis : _sendMsgTimeout;
         CheckMessage(msg);
         Message outbound = WithNamespace(msg);
-        // 在重试循环之外压缩一次：PrepareForSend 就地改写 body，循环内重复调用会把
-        // 已压缩的字节再压一遍（zlib(zlib(x))），消费端只解一层就拿到压缩流。
+        // Compress once outside the retry loop: PrepareForSend rewrites the body in
+        // place, and calling it repeatedly inside the loop would re-compress already
+        // compressed bytes (zlib(zlib(x))), leaving the consume side with a compressed
+        // stream after only one layer of decompression.
         int sysFlag = PrepareForSend(outbound);
 
         TopicPublishInfo publish;
@@ -1558,9 +1710,10 @@ public class DefaultMQProducer
         }
         catch (MQClientException e)
         {
-            // 路由拿不到 → 在循环外就抛 10005，不会把重试次数空转掉；
-            // 但 TryToFindTopicPublishInfo 里已经定过性的 10004（压根没配 name server）
-            // 必须原样透传，否则两种故障又被糊成同一条。
+            // Route lookup failed -> 10005 is thrown outside the loop, so the retry budget is not
+            // burned for nothing; but the already-decided 10004 from TryToFindTopicPublishInfo
+            // (no name server configured at all) must be propagated as is, otherwise the two distinct
+            // failures get blurred into one again.
             throw new MQClientException(e.Message,
                 e.ResponseCode == ClientErrorCode.NoNameServerException
                     ? e.ResponseCode
@@ -1568,12 +1721,14 @@ public class DefaultMQProducer
         }
 
         int timesTotal = _retryTimesWhenSendFailed + 1;
-        // 耗时用单调高精度钟：
-        // 墙钟毫秒粒度会把本地环回的亚毫秒往返量成 0，容错阈值就永远不生效。
+        // Elapsed time uses a monotonic high-resolution clock:
+        // wall-clock millisecond granularity would measure sub-millisecond local loopback
+        // round trips as 0, and the fault threshold would never take effect.
         double beginFirst = UtilAll.MonotonicMillis();
         var brokersSent = new List<string>();
         string lastBrokerName = string.Empty;
-        // 非 SEND_OK 且开了换 broker 时，把这个"存了但没存好"的结果留着：后面全失败就原样返回。
+        // Non-SEND_OK with broker-switch enabled: keep this "stored but not stored well"
+        // result; if everything later fails, return it as-is.
         SendResult? result = null;
         string lastError = string.Empty;
         var cause = SendFailureCause.None;
@@ -1582,9 +1737,11 @@ public class DefaultMQProducer
 
         for (int attempt = 0; attempt < timesTotal; ++attempt)
         {
-            // 故障规避：开启时按 broker 延迟/隔离状态选队列（MQFaultStrategy）；
-            // 关闭时退化为普通轮询（策略内部判断）。重试时 resetIndex 让轮询从头开始，
-            // 从而能避开 lastBrokerName 选到别的 broker。
+            // Fault avoidance: when enabled, select a queue by broker latency/isolation
+            // state (MQFaultStrategy); when disabled, degrade to plain round-robin (the
+            // strategy decides internally). On retry, resetIndex restarts round-robin from
+            // the beginning, so a different broker can be picked by avoiding
+            // lastBrokerName.
             MessageQueue selected;
             try
             {
@@ -1593,7 +1750,8 @@ public class DefaultMQProducer
             }
             catch (MQClientException e)
             {
-                // 选不到队列属客户端异常：此刻还没有目标 broker，容错表无从记起
+                // No selectable queue is a client-side exception: there is no target
+                // broker yet, so the fault table has nothing to record
                 lastError = e.Message;
                 cause = SendFailureCause.Client;
                 continue;
@@ -1603,8 +1761,9 @@ public class DefaultMQProducer
             brokersSent.Add(selected.BrokerName);
             double began = UtilAll.MonotonicMillis();
 
-            // 整体预算：timeout 是**这次调用**的总预算，已被前面的尝试吃掉的部分要扣掉，
-            // 否则 3 次重试各 3s 会变成最长 9s 才返回。
+            // Overall budget: timeout is **this call's** total budget, and the portion
+            // already eaten by earlier attempts must be deducted, otherwise 3 retries of
+            // 3s each would take up to 9s to return.
             long costTime = (long)(began - beginFirst);
             if (timeout < costTime)
             {
@@ -1612,7 +1771,8 @@ public class DefaultMQProducer
                 break;
             }
 
-            // costTime <= timeout（int），差值必在 int 范围内，窄化转换无损
+            // costTime <= timeout (int), so the difference is within int range; the
+            // narrowing conversion is lossless
             int curTimeout = (int)(timeout - costTime);
             bool canRetryAgain = attempt + 1 < timesTotal;
             if (_sendMsgMaxTimeoutPerRequest > -1 && canRetryAgain
@@ -1625,11 +1785,11 @@ public class DefaultMQProducer
             {
                 SendResult sent = SendWithHooks(c, outbound, selected, curTimeout, sysFlag);
                 result = sent;
-                // 记录发送延迟；超出阈值会把该 broker 隔离一段时间
+                // Record send latency; over-threshold isolates that broker for a while
                 _mqFaultStrategy.UpdateFaultItem(selected.BrokerName,
                     UtilAll.MonotonicMillis() - began, false, true);
-                // 非 SEND_OK 且开了 retryAnotherBrokerWhenNotStoreOK 才换 broker，
-                // 否则把这个"存了但没存好"的结果原样返回
+                // Non-SEND_OK with retryAnotherBrokerWhenNotStoreOK enabled switches
+                // brokers; otherwise return this "stored but not stored well" result as-is
                 if (sent.SendStatus != SendStatus.SendOk && _retryAnotherBrokerWhenNotStoreOk)
                 {
                     continue;
@@ -1639,7 +1799,8 @@ public class DefaultMQProducer
             }
             catch (MQBrokerException e)
             {
-                // broker 明确回了错误码：隔离该 broker（可达性不动），只有可重试码才换一台
+                // The broker explicitly returned an error code: isolate that broker (reachability is left
+                // alone), only a retryable code switches to another broker.
                 _mqFaultStrategy.UpdateFaultItem(selected.BrokerName,
                     UtilAll.MonotonicMillis() - began, true, false);
                 lastError = e.Message;
@@ -1659,8 +1820,8 @@ public class DefaultMQProducer
             }
             catch (RemotingException e)
             {
-                // 连不上/超时/发不出去：隔离该 broker。本项目无后台可达性探测线程，
-                // 所以 reachable=!isStartDetectorEnable() 恒为 true。
+                // Cannot connect / timeout / cannot send: isolate that broker. This project has no
+                // background reachability prober, so reachable=!isStartDetectorEnable() is always true.
                 _mqFaultStrategy.UpdateFaultItem(selected.BrokerName,
                     UtilAll.MonotonicMillis() - began, true, true);
                 lastError = e.Message;
@@ -1673,7 +1834,7 @@ public class DefaultMQProducer
             }
             catch (MQClientException e)
             {
-                // 客户端自己的问题（钩子拦截、路由没了…）：只记延迟、不隔离
+                // Client-side problems (hook interception, route gone...): record the latency only, no isolation
                 _mqFaultStrategy.UpdateFaultItem(selected.BrokerName,
                     UtilAll.MonotonicMillis() - began, false, true);
                 lastError = e.Message;
@@ -1708,11 +1869,11 @@ public class DefaultMQProducer
         throw new MQClientException(info, responseCode);
     }
 
-    // 定点发送到指定队列
+    // Pinned send to the specified queue
     public SendResult Send(Message msg, MessageQueue mq, int timeoutMillis = -1)
     {
-        // 与无 mq 的重载同一条分流：
-        // 指定队列与不指定队列归并键不同（AggregateKey.mq），但判据一样。
+        // Same dispatch as the overload without mq: a pinned queue and an unpinned one have
+        // different merge keys (AggregateKey.mq), but the criterion is the same.
         if (timeoutMillis < 0 && AutoBatch && msg is not MessageBatch)
         {
             return SendByAccumulator(WithNamespace(msg), mq, null)!;
@@ -1726,14 +1887,15 @@ public class DefaultMQProducer
         MQClientInstance c = GetClient();
         int timeout = timeoutMillis >= 0 ? timeoutMillis : _sendMsgTimeout;
         CheckMessage(msg);
-        // 顺序：Validators → 定点守卫 → sendKernelImpl（压缩在核里）→ 超时复检。
+        // Order: Validators -> pinned guard -> sendKernelImpl (compression happens in the kernel)
+        // -> timeout recheck.
         CheckPinnedTopic(msg.Topic, mq, PinnedTopicMismatchSync);
         Message outbound = WithNamespace(msg);
         int sysFlag = PrepareForSend(outbound);
         return SendWithHooks(c, outbound, mq, timeout, sysFlag);
     }
 
-    // 按选择器发送（顺序消息：同一 arg 落到同一队列）
+    // Send with a selector (ordered messages: the same arg maps to the same queue)
     public SendResult SendBySelector(Message msg, IMessageQueueSelector selector,
         string arg, int timeoutMillis = -1)
     {
@@ -1743,50 +1905,61 @@ public class DefaultMQProducer
         Message outbound = WithNamespace(msg);
         TopicPublishInfo publish = TryToFindTopicPublishInfo(c, outbound.Topic);
         MessageQueue selected = selector.Select(publish.MsgQueueList, msg, arg);
-        // 选择器用的是原始消息（topic/业务字段），压缩只影响 body
+        // The selector receives the original message (topic / business fields); compression only
+        // affects the body
         int sysFlag = PrepareForSend(outbound);
-        // arg 透传给 CheckForbiddenHook（CheckForbiddenContext.arg 就是它）
+        // arg is passed through to CheckForbiddenHook (CheckForbiddenContext.arg is exactly it)
         return SendWithHooks(c, outbound, selected, timeout, sysFlag, arg, CommunicationMode.Sync);
     }
 
-    // ---------------- 异步 / 单向 ----------------
+    // ---------------- Async / Oneway ----------------
 
-    /// <summary>异步发送（对应 <c>DefaultMQProducerImpl.send(msg, SendCallback, timeout)</c>
-    /// 的整条链，即 <c>send_async</c>）：<b>调用方立即返回</b>，四段逐段对齐：
+    /// <summary>Async send (the whole chain of
+    /// <c>DefaultMQProducerImpl.send(msg, SendCallback, timeout)</c>, i.e. <c>send_async</c>):
     ///
-    /// 1. 先过背压闸（<see cref="EnableBackpressureForAsyncMode"/>，即
-    ///    <c>executeAsyncMessageSend</c>）。这道闸<b>在调用方线程上等</b>，
-    ///    所以背压打满时「异步」会退化成「等满 timeout 再报错」。
-    /// 2. 任务投进 <c>AsyncSenderExecutor_N</c>（core==max==CPU 核数、队列有界
-    ///    <see cref="AsyncSenderQueueCapacity"/>，默认 50000，对应写死的
-    ///    <c>LinkedBlockingQueue(50000)</c>）。队满 ≡ <c>submit</c> 抛
-    ///    <c>RejectedExecutionException</c> → <c>MQClientException("executor rejected")</c>，
-    ///    <b>抛给调用方</b>而不走回调；只有开了背压才改走「就地跑完
-    ///    这一笔」—— 那边扣许可发生在入队<b>之前</b>，不跑完就要白等超时才归还。
-    /// 3. 出队之后才算真实耗时：预算被排队吃掉直接回调
-    ///    <c>RemotingTooMuchRequestException("DEFAULT ASYNC send call timeout")</c>，不再发请求。
-    /// 4. <c>sendKernelImpl</c> 的 ASYNC 分支（<see cref="SendKernelAsync"/>）：地址解析 →
-    ///    拦截钩子 → 建请求（<b>只建一次</b>）→ before 钩子 → <c>invokeAsync</c>。失败进
-    ///    <see cref="AsyncSendChain.OnException"/>（即 <c>onExceptionImpl</c>）：换一台 broker
-    ///    的队列、给<b>同一个请求</b>换新 opaque 再试，上限
-    ///    <see cref="RetryTimesWhenSendAsyncFailed"/>；超时预算是所有尝试<b>共享</b>的剩余时间。
-    ///    broker 明确回了错误码<b>不进</b>重试链（异步不看 <c>RetryResponseCodes</c>）。
+    /// 1. First the backpressure gate (<see cref="EnableBackpressureForAsyncMode"/>, i.e.
+    ///    <c>executeAsyncMessageSend</c>). This gate <b>waits on the caller's thread</b>, so
+    ///    when backpressure is saturated "async" degrades into "wait until the timeout expires
+    ///    and then report an error".
+    /// 2. The task is submitted to <c>AsyncSenderExecutor_N</c> (core==max==CPU core count,
+    ///    bounded queue <see cref="AsyncSenderQueueCapacity"/>, default 50000, matching the
+    ///    hard-coded <c>LinkedBlockingQueue(50000)</c>). A full queue means <c>submit</c>
+    ///    throws <c>RejectedExecutionException</c> ->
+    ///    <c>MQClientException("executor rejected")</c>, <b>thrown at the caller</b> instead of
+    ///    going through the callback; only when backpressure is enabled does it switch to "run
+    ///    this one inline" -- there the permit is taken <b>before</b> enqueueing, so not running
+    ///    it inline would idle until the timeout expires before the permit came back.
+    /// 3. Real elapsed time only counts after dequeue: if queueing ate the whole budget, the
+    ///    callback gets
+    ///    <c>RemotingTooMuchRequestException("DEFAULT ASYNC send call timeout")</c> and no
+    ///    request is sent.
+    /// 4. The ASYNC branch of <c>sendKernelImpl</c> (<see cref="SendKernelAsync"/>): address
+    ///    resolution -> interceptor hooks -> build the request (<b>exactly once</b>) -> before
+    ///    hooks -> <c>invokeAsync</c>. Failures enter
+    ///    <see cref="AsyncSendChain.OnException"/> (i.e. <c>onExceptionImpl</c>): pick another
+    ///    broker's queue, give the <b>same request</b> a new opaque and retry, up to
+    ///    <see cref="RetryTimesWhenSendAsyncFailed"/>; the timeout budget is the <b>shared</b>
+    ///    remaining time across all attempts. An explicit error code from the broker does
+    ///    <b>not</b> enter the retry chain (async never consults <c>RetryResponseCodes</c>).
     ///
-    /// 链的终点固定是 <see cref="CompleteAsync"/>：after 钩子 → 归还许可 → 用户回调，用户回调
-    /// <b>恰好一次</b>，且跑在 <c>NettyClientPublicExecutor_N</c> 上（<c>executeInvokeCallback</c>
-    /// 就是把回调 submit 给 publicExecutor，为的是不让业务代码占着
-    /// 连接的读线程或超时清理线程）。
+    /// The chain always ends at <see cref="CompleteAsync"/>: after hooks -> return the permit
+    /// -> the user callback, invoked <b>exactly once</b> and on <c>NettyClientPublicExecutor_N</c>
+    /// (<c>executeInvokeCallback</c> simply submits the callback to publicExecutor so business
+    /// code does not hold up the connection's reader thread or the timeout cleanup thread).
     ///
-    /// 两处有意差别：未 <see cref="Start"/> / 池已关时<b>同步抛</b>（若走回调，
-    /// 那样问题更难查）；批量消息没有异步内核可用，于是在池线程里同步发一批、
-    /// 回调照样转交（对调用方语义没差别）。
+    /// Two deliberate differences: when not <see cref="Start"/>ed or the pool is already closed
+    /// it throws <b>synchronously</b> (going through the callback would make the problem harder
+    /// to diagnose); batch messages have no async kernel available, so a batch is sent
+    /// synchronously on a pool thread and the callback is still handed off (no semantic
+    /// difference for the caller).
     /// </summary>
     public void SendAsync(Message msg, ISendCallback callback, int timeoutMillis = -1,
         MessageQueue? mq = null)
     {
-        // 自动攒批分流（send(msg, sendCallback) 门面）。在
-        // 同一个 try 里把两种分流的 **Throwable** 都交给 onException —— 攒批路径上的
-        // 「不合法消息 / 累加器参数非法」不能砸回调用方栈。
+        // Automatic batching dispatch (the send(msg, sendCallback) facade). Both dispatches'
+        // **Throwable** are routed to onException from the same try block -- an "invalid message
+        // / illegal accumulator argument" on the batching path must not be thrown back onto the
+        // caller's stack.
         if (timeoutMillis < 0 && AutoBatch && msg is not MessageBatch)
         {
             try
@@ -1807,24 +1980,31 @@ public class DefaultMQProducer
     private void SendAsyncImpl(Message msg, ISendCallback callback, int timeoutMillis,
         MessageQueue? mq)
     {
-        // 链上带的是**克隆**：压缩会就地改 body，不能改调用方那份。克隆在池线程上做（与批量
-        // 同一条前段），许可长度仍在**调用方线程**上按压缩前的 body 算 —— 就该在那儿算。
+        // The chain carries a **clone**: compression rewrites the body in place and must not touch
+        // the caller's copy. The clone is made on the pool thread (the same prologue as the batch
+        // path), while the permit length is still computed on the **caller thread** from the
+        // pre-compression body -- that is where it belongs.
         ExecuteAsyncSend(() => CloneMessage(msg), BackPressureMsgLen(msg), callback, timeoutMillis,
             mq);
     }
 
-    /// <summary>异步链的前段（<c>send_async</c> 的整体，即
-    /// <c>executeAsyncMessageSend</c> + <c>AsyncSenderExecutor.submit</c>）：过闸、投池、
-    /// 出队后复检预算，再把 <paramref name="prepare"/> 造出来的消息交给
-    /// <see cref="SendAsyncInner"/>。</summary>
-    /// <param name="prepare">在<b>池线程</b>上造出这一笔要发的消息。放在池线程上是必须的：
-    /// 批量入口在那里才会抛「空列表 / 子消息非法 / 不同质」，异常得进回调而不是砸回调用方
-    /// 的栈（批量分支同样在 runnable 里抛、由外层 catch 交给回调）。</param>
-    /// <param name="msgLen">扣多少「字节」许可，在调用方线程上算好。</param>
+    /// <summary>The prologue of the async chain (the whole of <c>send_async</c>, i.e.
+    /// <c>executeAsyncMessageSend</c> + <c>AsyncSenderExecutor.submit</c>): pass the gates,
+    /// submit to the pool, recheck the budget after dequeue, then hand the message produced by
+    /// <paramref name="prepare"/> to
+    /// <see cref="SendAsyncInner"/>.</summary>
+    /// <param name="prepare">Produces the message for this one send <b>on the pool thread</b>.
+    /// Having it on the pool thread is mandatory: the batch entry point throws "empty list /
+    /// illegal sub-message / inhomogeneous" there, and those exceptions must reach the callback
+    /// instead of the caller's stack (the batch branch likewise throws inside the runnable and
+    /// lets the outer catch hand them to the callback).</param>
+    /// <param name="msgLen">How many "byte" permits to take, computed on the caller
+    /// thread.</param>
     private void ExecuteAsyncSend(Func<Message> prepare, long msgLen, ISendCallback callback,
         int timeoutMillis, MessageQueue? mq)
     {
-        // 先确认已启动（未启动立即抛，而不是在后台线程里静默失败）
+        // Confirm started first (throw immediately when not started rather than failing silently
+        // on a background thread)
         _ = GetClient();
         ConsumeExecutor? executor;
         lock (_lock)
@@ -1843,8 +2023,9 @@ public class DefaultMQProducer
 
         if (_enableBackpressureForAsyncMode)
         {
-            // 两个许可**顺序**申请、都用「从 began 算起的剩余预算」去等（两处都是
-            // `timeout - costTime`），所以第一个闸就能把预算花光
+            // The two permits are taken **sequentially**, both waiting with the "remaining budget
+            // measured from began" (both use `timeout - costTime`), so the first gate alone can
+            // already consume the whole budget
             int numBudget = timeout - (int)(UtilAll.MonotonicMillis() - began);
             permits.NumAcquired = numBudget > 0 && _semaphoreAsyncSendNum.TryAcquire(1, numBudget);
             if (!permits.NumAcquired)
@@ -1861,7 +2042,7 @@ public class DefaultMQProducer
                                    && _semaphoreAsyncSendSize.TryAcquire(msgLen, sizeBudget);
             if (!permits.SizeAcquired)
             {
-                // 已经拿到的条数许可不能留在闸上（靠两个标记做到这一点）
+                // A count permit already acquired must not be left at the gate (two flags achieve this)
                 CompleteAsync(callback, null,
                     new RemotingTooMuchRequestException(
                         "send message tryAcquire semaphoreAsyncSize timeout"), null, permits,
@@ -1872,7 +2053,8 @@ public class DefaultMQProducer
 
         void Run()
         {
-            // 出队之后才算真实耗时（beginTimestampFirst 也是出队后取的）
+            // Real elapsed time only counts after dequeue (beginTimestampFirst is also taken after
+            // dequeue)
             long cost = (long)(UtilAll.MonotonicMillis() - began);
             if (timeout <= cost)
             {
@@ -1888,7 +2070,7 @@ public class DefaultMQProducer
             }
             catch (Exception e)
             {
-                // runnable 的 catch → newCallBack.onException(e)
+                // the runnable's catch -> newCallBack.onException(e)
                 CompleteAsync(callback, null, e, null, permits, onCallbackPool: false);
             }
         }
@@ -1901,8 +2083,9 @@ public class DefaultMQProducer
         {
             if (_enableBackpressureForAsyncMode)
             {
-                // 许可已经扣掉了，就地跑完这一笔（**阻塞调用方**），好让回调
-                // 把许可还回来；否则队列一满就直接抛，白扣的容量还得等超时才还得回来。
+                // The permit is already taken, so run this one inline (**blocks the caller**) to let the
+                // callback return the permit; otherwise a full queue throws right away and the wrongly
+                // taken capacity would only be returned when the timeout expires.
                 Run();
             }
             else
@@ -1912,21 +2095,24 @@ public class DefaultMQProducer
         }
     }
 
-    /// <summary>对应 <c>sendDefaultImpl(ASYNC)</c> 的准备工作（即
-    /// <c>_send_async_inner</c>）：校验、压缩、选队列。压缩在重试链<b>之外</b>做一次，
-    /// 否则每轮把已压缩的 body 再压一遍。<c>timesTotal</c> 固定为 1：
-    /// 换 broker 的重试全在 <c>onExceptionImpl</c> 里。</summary>
+    /// <summary>Preparation corresponding to <c>sendDefaultImpl(ASYNC)</c> (i.e.
+    /// <c>_send_async_inner</c>): validation, compression, queue selection. Compression is
+    /// done once <b>outside</b> the retry chain, otherwise each round would compress the
+    /// already compressed body again. <c>timesTotal</c> is fixed at 1: switching broker
+    /// retries all happen in <c>onExceptionImpl</c>.</summary>
     private void SendAsyncInner(Message msg, MessageQueue? mq, ISendCallback callback,
         AsyncSendPermits permits, int timeout)
     {
         MQClientInstance c = GetClient();
         if (msg.IsBatch)
         {
-            // 批量没有异步内核（本端口的批量只有同步内核）：在池线程里同步发一批，
-            // 结果照样从 CompleteAsync 走回调池转交。
-            // mq 非空时必须把它传下去，否则「定点批量异步」会退化成轮询选队列。
-            // 批量异步定点走 `impl.send(batch, mq, cb, timeout)`，守卫文案是**异步**
-            // 那一处（下面 Send→SendToMqImpl 里的同步文案只服务同步入口）。
+            // Batch has no async kernel (in this port batch only has the synchronous kernel): send the
+            // batch synchronously on a pool thread; the result still travels from CompleteAsync
+            // through the callback pool. When mq is non-null it must be passed down, otherwise "pinned
+            // batch async" degrades to round-robin queue selection. Pinned batch async goes through
+            // `impl.send(batch, mq, cb, timeout)`, so the guard message is the **async** one (the
+            // synchronous text further down in Send -> SendToMqImpl serves only the synchronous entry
+            // point).
             if (mq is not null)
             {
                 CheckPinnedTopic(msg.Topic, mq, PinnedTopicMismatchAsync);
@@ -1945,16 +2131,17 @@ public class DefaultMQProducer
         CheckMessage(msg);
         if (mq is not null)
         {
-            // 异步分支在同一位置用另一处文案抛，异常由 runnable 的 catch
-            // 转给 `newCallBack.onException`（这里由 ExecuteAsyncSend 的 Run 收口）。
+            // The async branch throws with a different message at the same place; the exception is
+            // routed by the runnable's catch to `newCallBack.onException` (here collected by
+            // ExecuteAsyncSend's Run).
             CheckPinnedTopic(msg.Topic, mq, PinnedTopicMismatchAsync);
         }
 
         int sysFlag = PrepareForSend(msg);
         if (mq is not null)
         {
-            // send(msg, mq, cb, timeout) → sendKernelImpl 定点发，传下去的
-            // topicPublishInfo 是 null，所以失败只会在**同一台 broker** 上换 opaque 重试。
+            // send(msg, mq, cb, timeout) -> pinned sendKernelImpl; the topicPublishInfo passed down is
+            // null, so a failure retries with a new opaque on **the same broker** only.
             SendKernelAsync(c, msg, mq, null, callback, permits, timeout, sysFlag);
             return;
         }
@@ -1966,9 +2153,10 @@ public class DefaultMQProducer
         }
         catch (MQClientException e)
         {
-            // 路由拿不到 → 在循环外就抛 10005，不会把重试次数空转掉；
-            // 但 TryToFindTopicPublishInfo 里已经定过性的 10004（压根没配 name server）
-            // 必须原样透传，否则两种故障又被糊成同一条。
+            // Route lookup failed -> 10005 is thrown outside the loop, so the retry budget is not
+            // burned for nothing; but the already-decided 10004 from TryToFindTopicPublishInfo (no name
+            // server configured at all) must be propagated as is, otherwise the two distinct failures
+            // get blurred into one again.
             throw new MQClientException(e.Message,
                 e.ResponseCode == ClientErrorCode.NoNameServerException
                     ? e.ResponseCode
@@ -1982,8 +2170,9 @@ public class DefaultMQProducer
         }
         catch (MQClientException e)
         {
-            // 选不到队列时报 `Send [0] times, still failed, Topic: …,
-            // BrokersSent: []`；这里的选队列是抛异常，原始原因拼进同一段文本。
+            // When no queue can be selected it reports `Send [0] times, still failed, Topic: ...,
+            // BrokersSent: []`; the queue selection here throws and appends the original reason to the
+            // same text.
             throw new MQClientException("Send [0] times, still failed, Topic: " + msg.Topic
                                         + ", BrokersSent: [], last error: " + e.Message);
         }
@@ -1992,24 +2181,28 @@ public class DefaultMQProducer
             publish, callback, permits, timeout, sysFlag);
     }
 
-    /// <summary><c>sendKernelImpl</c> 的 ASYNC 分支：地址解析 → 拦截钩子 → traceparent →
-    /// 建请求（一次）→ before 钩子 → 交给 <see cref="AsyncSendChain"/>。这一段上每个失败出口都
-    /// 要归还许可，所以统一走 <see cref="CompleteAsync"/>。</summary>
+    /// <summary>The ASYNC branch of <c>sendKernelImpl</c>: address resolution -> interceptor
+    /// hooks -> traceparent -> build the request (once) -> before hooks -> hand off to
+    /// <see cref="AsyncSendChain"/>. Every failure exit on this stage has to return the permit,
+    /// so they all go through <see cref="CompleteAsync"/>.</summary>
     private void SendKernelAsync(MQClientInstance c, Message msg, MessageQueue mq,
         TopicPublishInfo? publish, ISendCallback callback, AsyncSendPermits permits, int timeout,
         int sysFlag)
     {
         double began = UtilAll.MonotonicMillis();
-        // 地址解析两步（sendKernelImpl 口径）：先查已缓存的**发布**地址（只认
-        // master），查不到再按 topic 刷一次路由重查，仍查不到报「The broker[X] not exist」。
-        // 定点发送（调用方给了 mq）不会在 sendDefaultImpl 里取发布信息，这一步是它唯一的路由来源。
-        // 从节点不接 SEND_MESSAGE，所以这里不退回从节点地址（PublishAddrFor 失败即抛，
-        // 由 CompleteAsync 交给回调）。
+        // Address resolution in two steps (the sendKernelImpl rule): first look up the cached
+        // **publish** address (master only); on a miss, refresh the route once for the topic and
+        // look again, still missing means "The broker[X] not exist". A pinned send (the caller
+        // supplied an mq) does not fetch publish info inside sendDefaultImpl, so this is its only
+        // source of routing. Slaves do not accept SEND_MESSAGE, so no slave address is used as a
+        // fallback (a PublishAddrFor failure throws right away and CompleteAsync hands it to the
+        // callback).
         string addr;
         try
         {
-            // 与同步内核同口径：只认 master，拿到地址后按 sendKernelImpl 做 VIP 改写
-            // （异步的请求由本处 addr 直接交给发送链，不再经 SendMessage 二次解析）。
+            // Same rule as the synchronous kernel: master only, and once the address is obtained apply
+            // the VIP rewrite as sendKernelImpl does (the async request is handed to the send chain
+            // with the addr from here and is not resolved a second time via SendMessage).
             addr = c.VipAddr(c.PublishAddrFor(mq.BrokerName, mq.Topic));
         }
         catch (Exception e)
@@ -2024,8 +2217,9 @@ public class DefaultMQProducer
             TraceParentContext.Inject(msg);
         }
 
-        // 与同步内核同一口径：非批量消息在发请求之前补客户端唯一 ID，它决定
-        // SendResult.MsgId，也是重试链里 parseSendResponse 读的那一份。
+        // Same rule as the synchronous kernel: a non-batch message gets its unique client ID
+        // before the request is sent; it determines SendResult.MsgId and is the very value
+        // parseSendResponse reads in the retry chain.
         if (!msg.IsBatch)
         {
             MessageClientIDSetter.SetUniqId(msg);
@@ -2040,10 +2234,11 @@ public class DefaultMQProducer
             ExecuteSendMessageHookBefore(context);
         }
 
-        // ASYNC 分支自己的总闸 —— 钩子、压缩、路由都算耗时，
-        // 预算被它们吃光就不再发起请求。RemotingTooMuchRequestException 是 RemotingException 的
-        // 子类，所以要先跑 hook.after 再抛给回调，这里用 CompleteAsync 复刻同一
-        // 顺序（且**不重试**）。
+        // The ASYNC branch's own overall gate -- hooks, compression and routing all count as
+        // elapsed time; if they eat the whole budget no request is issued.
+        // RemotingTooMuchRequestException is a subclass of RemotingException, so hook.after has to
+        // run before it is thrown to the callback; CompleteAsync reproduces the same ordering here
+        // (and does **not** retry).
         long cost = (long)(UtilAll.MonotonicMillis() - began);
         if (timeout < cost)
         {
@@ -2057,13 +2252,16 @@ public class DefaultMQProducer
             addr, timeout - (int)cost).Attempt();
     }
 
-    /// <summary>链的终点（即 <c>_complete</c>）：先跑 after 钩子，再归还背压许可，最后把
-    /// 用户回调转交出去。<b>每个 AsyncSendChain 只走到一次</b>，所以用户回调恰好一次。
+    /// <summary>The end of the chain (i.e. <c>_complete</c>): run the after hooks, then return
+    /// the backpressure permit, then hand off the user callback.
+    /// <b>Every AsyncSendChain reaches this exactly once</b>, so the user callback runs exactly
+    /// once.
     ///
-    /// <paramref name="onCallbackPool"/> 是一处分岔：请求交给传输层<b>之前</b>的失败
-    /// （闸门、排队超预算、校验、broker 不存在）本来就是 <c>_complete</c> 就地调用，用户回调
-    /// 在当下这根线程上跑；只有**传输层带回来**的结果才 submit 给
-    /// <c>NettyClientPublicExecutor</c>（即 <c>executeInvokeCallback</c>）。</summary>
+    /// <paramref name="onCallbackPool"/> is one fork: failures that happen <b>before</b> the
+    /// request reaches the transport layer (gates, queueing over budget, validation, broker not
+    /// found) already invoke <c>_complete</c> in place, so the user callback runs on the current
+    /// thread; only results brought back <b>by the transport layer</b> are submitted to
+    /// <c>NettyClientPublicExecutor</c> (i.e. <c>executeInvokeCallback</c>).</summary>
     private void CompleteAsync(ISendCallback callback, SendResult? result, Exception? error,
         SendMessageContext? context, AsyncSendPermits permits, bool onCallbackPool = true)
     {
@@ -2081,8 +2279,9 @@ public class DefaultMQProducer
             ExecuteSendMessageHookAfter(context);
         }
 
-        // 先还许可再交给用户（BackpressureSendCallBack.semaphoreProcessor
-        // 就是这个顺序，且先 size 后 num），否则用户回调里再发一笔异步消息会多占一格。
+        // Return the permit before handing over to the user (BackpressureSendCallBack.
+        // semaphoreProcessor uses this order, size before num), otherwise sending another async
+        // message inside the user callback would occupy an extra slot.
         permits.Release();
         if (onCallbackPool)
         {
@@ -2093,8 +2292,9 @@ public class DefaultMQProducer
         InvokeSendCallback(callback, result, error);
     }
 
-    /// <summary>真正调用用户回调，并把回调自己抛的异常吞掉（两处都是
-    /// <c>catch (Throwable)</c>），否则它会带走回调池的 worker。</summary>
+    /// <summary>Actually invokes the user callback and swallows any exception the callback
+    /// itself throws (both places use <c>catch (Throwable)</c>), otherwise it would take down a
+    /// callback pool worker.</summary>
     private static void InvokeSendCallback(ISendCallback callback, SendResult? result,
         Exception? error)
     {
@@ -2106,8 +2306,9 @@ public class DefaultMQProducer
             }
             else
             {
-                // 异常对象原样交出去（`sendCallback.onException(e)`）；error 为空只可能
-                // 是内部约定被破坏，兜一个 MQClientException 而不是空引用。
+                // The exception object is handed over as is (`sendCallback.onException(e)`); a null error
+                // can only mean the internal contract was broken, so fall back to an MQClientException
+                // instead of a null reference.
                 callback.OnException(error ?? new MQClientException("unknown reason"));
             }
         }
@@ -2117,9 +2318,10 @@ public class DefaultMQProducer
         }
     }
 
-    /// <summary>把用户回调放到 <c>NettyClientPublicExecutor_N</c> 上跑（即
-    /// <c>NettyRemotingAbstract.executeInvokeCallback</c>）。池已关（正在 Shutdown）或投不进去时
-    /// 就地跑 —— 不能让回调因为关池而凭空消失。</summary>
+    /// <summary>Runs the user callback on <c>NettyClientPublicExecutor_N</c> (i.e.
+    /// <c>NettyRemotingAbstract.executeInvokeCallback</c>). When the pool is already closed
+    /// (shutting down) or the submission is rejected it runs inline -- a callback must never
+    /// vanish just because the pool is closing.</summary>
     private void CompleteOnCallbackThread(ISendCallback callback, SendResult? result,
         Exception? error)
     {
@@ -2145,9 +2347,9 @@ public class DefaultMQProducer
         }
     }
 
-    /// <summary>本次异步发送真正拿到的背压许可（对应
-    /// <c>isSemaphoreAsyncNumAcquired</c> / <c>isSemaphoreAsyncSizeAcquired</c> 两个标记）。
-    /// 归还幂等，所以链上任何一条出口都能安全调用。</summary>
+    /// <summary>The backpressure permits actually acquired for this async send (the
+    /// <c>isSemaphoreAsyncNumAcquired</c> / <c>isSemaphoreAsyncSizeAcquired</c> flags).
+    /// Returning them is idempotent, so any exit on the chain can safely call it.</summary>
     private sealed class AsyncSendPermits
     {
         private readonly FairSemaphore _num;
@@ -2175,7 +2377,7 @@ public class DefaultMQProducer
             set => Volatile.Write(ref _sizeAcquired, value ? 1 : 0);
         }
 
-        /// <summary>先还字节再还条数（semaphoreProcessor 的顺序）。</summary>
+        /// <summary>Returns bytes first, then the count (the order semaphoreProcessor uses).</summary>
         public void Release()
         {
             if (Interlocked.Exchange(ref _sizeAcquired, 0) != 0)
@@ -2190,16 +2392,18 @@ public class DefaultMQProducer
         }
     }
 
-    /// <summary>一次异步发送的重试链（<c>sendMessageAsync</c> +
-    /// <c>onExceptionImpl</c>）。请求<b>跨尝试复用同一个对象</b>、每轮换新 opaque，
-    /// 超时预算是<b>所有尝试共享</b>的剩余时间。</summary>
+    /// <summary>The retry chain of one async send (<c>sendMessageAsync</c> +
+    /// <c>onExceptionImpl</c>). The request <b>reuses the same object across attempts</b> and
+    /// gets a fresh opaque each round; the timeout budget is the <b>remaining time shared</b>
+    /// by all attempts.</summary>
     private sealed class AsyncSendChain
     {
         private readonly DefaultMQProducer _producer;
         private readonly MQClientInstance _client;
-        // 只给 ProcessSendResponse 读 UNIQ_KEY：body 已经编进 request 了
+        // Only ProcessSendResponse reads UNIQ_KEY: the body is already encoded into the request
         private readonly Message _msg;
-        /// <summary>null = 定点发送（调用方给了 mq）：重试不换 broker，只在原地换 opaque。</summary>
+        /// <summary>null = pinned send (the caller supplied an mq): retries do not switch broker,
+        /// they only get a new opaque in place.</summary>
         private readonly TopicPublishInfo? _publish;
         private readonly ISendCallback _callback;
         private readonly AsyncSendPermits _permits;
@@ -2229,13 +2433,15 @@ public class DefaultMQProducer
             _remaining = remaining;
         }
 
-        /// <summary><c>sendMessageAsync</c>：发出<b>本轮</b>尝试，结果由传输层回调带回。</summary>
+        /// <summary><c>sendMessageAsync</c>: issues <b>this round's</b> attempt, the result comes
+        /// back through the transport callback.</summary>
         public void Attempt()
         {
             if (_times > 0)
             {
-                // 换 broker 重试前 `request.setOpaque(createNewRequestId())`：
-                // 旧请求还挂在 responseTable 里等超时，复用 opaque 会把两次尝试的应答串台。
+                // Before retrying on another broker, `request.setOpaque(createNewRequestId())`: the old
+                // request is still sitting in responseTable waiting for its timeout, so reusing the opaque
+                // would cross-wire the responses of the two attempts.
                 _request.Opaque = RemotingCommand.NextOpaque();
             }
 
@@ -2246,18 +2452,20 @@ public class DefaultMQProducer
             }
             catch (Exception e)
             {
-                // sendMessageAsync 的外层 catch：传输层
-                // **就地**抛（连不上、写不出去）时异常**原样**传递、needRetry=true，且故障表记
-                // 的是 `reachable=false`（这条连接根本没建立，不是"慢"）。C# 的 InvokeAsync
-                // 在 SendRequest 抛掉之前已把 opaque 从在途表摘掉，所以本轮不会再有第二次回调。
+                // The outer catch of sendMessageAsync: when the transport layer throws **in place** (cannot
+                // connect, cannot write) the exception is propagated **as is** with needRetry=true, and the
+                // fault table records `reachable=false` (the connection was never established, it is not
+                // "slow"). C#'s InvokeAsync has already removed the opaque from the in-flight table before
+                // SendRequest throws, so this round will not get a second callback.
                 long cost = (long)(UtilAll.MonotonicMillis() - _attemptBegan);
                 _producer._mqFaultStrategy.UpdateFaultItem(_mq.BrokerName, cost, true, false);
                 OnException(e, true, cost);
             }
         }
 
-        /// <summary><c>operationSucceed</c> / <c>operationFail</c>（即
-        /// <c>_handle</c>）：记故障表，成功就收尾，失败交给重试判断。</summary>
+        /// <summary><c>operationSucceed</c> / <c>operationFail</c> (i.e.
+        /// <c>_handle</c>): record the fault table; on success wrap up, on failure hand over to the
+        /// retry decision.</summary>
         private void OnResponse(RemotingCommand? response, Exception? error)
         {
             long cost = (long)(UtilAll.MonotonicMillis() - _attemptBegan);
@@ -2286,14 +2494,16 @@ public class DefaultMQProducer
                 return;
             }
 
-            // updateFaultItem(…, isOver=true, …) 排在分类之前 —— 哪怕这一笔之后
-            // 不重试，这台 broker 也要被记一次失败延迟。
+            // updateFaultItem(..., isOver=true, ...) is ordered before the classification -- even if
+            // this send is not retried, that broker still has to be recorded once with a failure
+            // latency.
             _producer._mqFaultStrategy.UpdateFaultItem(_mq.BrokerName, cost, true, true);
             (Exception wrapped, bool needRetry) = ClassifyAsyncFailure(failure, cost);
             OnException(wrapped, needRetry, cost);
         }
 
-        /// <summary><c>onExceptionImpl</c>：还能试就换一台 broker、复用请求重试，否则收尾。</summary>
+        /// <summary><c>onExceptionImpl</c>: if another attempt is possible, switch broker and reuse
+        /// the request; otherwise wrap up.</summary>
         private void OnException(Exception error, bool needRetry, long cost)
         {
             _times++;
@@ -2304,8 +2514,9 @@ public class DefaultMQProducer
                 return;
             }
 
-            // 换目标：用 selectOneMessageQueue(tpInfo, brokerName, false) —— 第三参 false
-            // 表示按 lastBrokerName **避开**刚失败的那台；选不到就沿用当前目标。
+            // Pick a new target: selectOneMessageQueue(tpInfo, brokerName, false) -- the third argument
+            // false means to **avoid** the broker that just failed according to lastBrokerName; if none
+            // is found, keep the current target.
             string brokerName = _mq.BrokerName;
             if (_publish is not null)
             {
@@ -2318,12 +2529,13 @@ public class DefaultMQProducer
                 }
                 catch (MQClientException)
                 {
-                    // 选不到就留在原目标上重试
+                    // If no queue can be selected, stay on the current target and retry
                 }
             }
 
-            // 只查发布地址表（findBrokerAddressInPublish，只认 master）、
-            // **不刷路由**；查不到就带着 null 撞进 invokeAsync。这里就地终止，别让空地址传进传输层。
+            // Only the publish address table is consulted (findBrokerAddressInPublish, master only),
+            // **without refreshing the route**; when not found it goes into invokeAsync carrying null.
+            // Terminate right here so a null address never reaches the transport layer.
             string addr = _client.FindBrokerAddressInPublish(brokerName);
             if (addr.Length == 0)
             {
@@ -2339,25 +2551,29 @@ public class DefaultMQProducer
             Attempt();
         }
 
-        /// <summary>链的终点：交给 <see cref="DefaultMQProducer.CompleteAsync"/>。</summary>
+        /// <summary>The end of the chain: hands over to <see cref="DefaultMQProducer.CompleteAsync"/>.</summary>
         private void Finish(SendResult? result, Exception? error)
         {
             _producer.CompleteAsync(_callback, result, error, _context, _permits);
         }
 
-        /// <summary><c>_classify_async_failure</c>（即 <c>operationFail</c> 的三分支）：
-        /// 包装成 MQClientException 并判定能否换 broker 重试。
+        /// <summary><c>_classify_async_failure</c> (i.e. the three-way branch of
+        /// <c>operationFail</c>): wraps into an MQClientException and decides whether a broker
+        /// switch retry is allowed.
         ///
-        /// ⚠ 只有<b>没收到响应</b>的失败走这里的分类。<b>已经收到响应</b>但
-        /// <c>ProcessSendResponse</c> 判失败的 <see cref="MQBrokerException"/> 落在最后的
-        /// 分支 —— 那条路径传的就是 <c>needRetry=false</c> 且原样抛出。也就是说异步发送
-        /// <b>不看</b> RetryResponseCodes：broker 明确回了错就不会换 broker。别与同步语义混了。</summary>
+        /// Only failures where <b>no response was received</b> go through this classification. An
+        /// <see cref="MQBrokerException"/> that <b>did</b> receive a response but was judged failed
+        /// by <c>ProcessSendResponse</c> lands in the last branch -- that path passes
+        /// <c>needRetry=false</c> and rethrows as is. In other words an async send <b>ignores</b>
+        /// RetryResponseCodes: an explicit broker error never switches broker. Do not confuse this
+        /// with the synchronous semantics.</summary>
         private static (Exception, bool) ClassifyAsyncFailure(Exception err, long cost)
         {
-            // 文案与 cause 都按 `MQClientAPIImpl#operationFail`：
-            // `new MQClientException("send request failed", throwable)` 一类 —— **message 就是
-            // 这三个短语**（对账看的就是它），底层细节挂在 InnerException 上（即
-            // `cause` 同一条）。别把 err.Message 拼进 message：拼了就对不上逐字断言的用例。
+            // The message text and cause follow `MQClientAPIImpl#operationFail`:
+            // `new MQClientException("send request failed", throwable)` and friends -- **the message is
+            // exactly those three phrases** (that is what the tests assert on), with the low-level
+            // detail hanging off InnerException (i.e. the same `cause`). Never splice err.Message into
+            // the message: doing so breaks tests that assert on the text verbatim.
             switch (err)
             {
                 case RemotingSendRequestException:
@@ -2365,12 +2581,13 @@ public class DefaultMQProducer
                 case RemotingTimeoutException:
                     return (new MQClientException("wait response timeout, cost="
                         + cost.ToString(CultureInfo.InvariantCulture), err), true);
-                // 其余 RemotingException 都是「unknown reason」，但 TooMuchRequest 是「自己人太多」，
-                // 换 broker 也没用（属不可重试判据）。
+                // The remaining RemotingExceptions are "unknown reason", but TooMuchRequest means "too many
+                // of our own requests", which switching broker cannot fix (it is a non-retryable
+                // criterion).
                 case RemotingTooMuchRequestException:
                     return (new MQClientException("unknown reason", err), false);
-                // 连不上（RemotingConnectException）与编解码/命令错也属 RemotingException：
-                // 换一台有机会。
+                // Cannot connect (RemotingConnectException) as well as codec/command errors are
+                // RemotingExceptions: switching to another broker has a chance.
                 case RemotingConnectException:
                 case RemotingCommandException:
                 case RemotingException:
@@ -2389,12 +2606,13 @@ public class DefaultMQProducer
         TopicPublishInfo publish = TryToFindTopicPublishInfo(c, outbound.Topic);
         MessageQueue selected = publish.SelectOneMessageQueue();
         int sysFlag = PrepareForSend(outbound);
-        // 单向发送同样走 sendKernelImpl：地址先解析（只认 master，失败即抛，
-        // 不会打到从节点上），再跑 CheckForbiddenHook。
+        // Oneway send also goes through sendKernelImpl: the address is resolved first (master only,
+        // a failure throws immediately so the request never reaches a slave), then
+        // CheckForbiddenHook runs.
         string brokerAddr = c.PublishAddrFor(selected.BrokerName, selected.Topic);
 
         RunCheckForbidden(outbound, selected, brokerAddr, null, CommunicationMode.Oneway);
-        // W3C traceparent 透传（opt-in）：单向发送同样注入
+        // W3C traceparent propagation (opt-in): oneway send injects it too
         if (_enableTraceContext)
         {
             TraceParentContext.Inject(outbound);
@@ -2405,11 +2623,13 @@ public class DefaultMQProducer
     }
 
     /// <summary>
-    /// 定点单向（<c>sendOneway(Message, MessageQueue)</c>）。
-    /// <b>没有</b> topic 一致性守卫 —— sendOneway 有意不判：
-    /// 报文头里的 topic 取 <c>msg.getTopic()</c>、只有 queueId 来自 mq，所以 topic 写错时
-    /// 会落进另一条 topic 的同号队列且没有任何反馈。地址走客户端的路由缓存
-    /// （即 <c>findBrokerAddressInPublish</c>），所以必须先有过一次成功发送把缓存喂上。
+    /// Pinned oneway send (<c>sendOneway(Message, MessageQueue)</c>).
+    /// There is <b>no</b> topic consistency guard -- sendOneway deliberately does not check:
+    /// the topic in the request header comes from <c>msg.getTopic()</c> and only the queueId
+    /// comes from the mq, so a wrong topic lands in the same-numbered queue of another topic
+    /// with no feedback at all. The address comes from the client's route cache (i.e.
+    /// <c>findBrokerAddressInPublish</c>), so at least one successful send is required
+    /// beforehand to warm that cache.
     /// </summary>
     public void SendOneway(Message msg, MessageQueue mq)
     {
@@ -2417,7 +2637,8 @@ public class DefaultMQProducer
         CheckMessage(msg);
         Message outbound = WithNamespace(msg);
         int sysFlag = PrepareForSend(outbound);
-        // 同 SendOneway(msg)：地址只认 master，拿不到就抛（从节点不接 SEND_MESSAGE）。
+        // Same as SendOneway(msg): master-only address, throws when unavailable (slaves do not
+        // accept SEND_MESSAGE).
         string brokerAddr = c.PublishAddrFor(mq.BrokerName, mq.Topic);
 
         RunCheckForbidden(outbound, mq, brokerAddr, null, CommunicationMode.Oneway);
@@ -2430,7 +2651,7 @@ public class DefaultMQProducer
             _createTopicKey, _defaultTopicQueueNums);
     }
 
-    // ---------------- 批量 ----------------
+    // ---------------- Batch ----------------
 
     public SendResult SendBatch(List<Message> msgs, int timeoutMillis = -1)
     {
@@ -2440,29 +2661,34 @@ public class DefaultMQProducer
 
         TopicPublishInfo publish = TryToFindTopicPublishInfo(c, outbound.Topic);
         MessageQueue selected = publish.SelectOneMessageQueue();
-        // MessageBatch 的 isBatch 为 true，prepareForSend 会直接返回 0（不压缩）
+        // MessageBatch has isBatch = true, so prepareForSend returns 0 directly (no compression)
         int sysFlag = PrepareForSend(outbound);
         return SendWithHooks(c, outbound, selected, timeout, sysFlag);
     }
 
-    /// <summary>定点批量发送，对应 <c>send(Collection&lt;Message&gt;, MessageQueue,
-    /// long)</c>：组批后直接走 sendKernelImpl，不拉路由、不选队、不重试，整批落进指定队列。
-    /// 子消息校验、组批同质性与命名空间与轮询批量同一串动作。</summary>
+    /// <summary>Pinned batch send, corresponding to <c>send(Collection&lt;Message&gt;, MessageQueue,
+    /// long)</c>: after batching it goes straight to sendKernelImpl -- no route fetch, no queue
+    /// selection, no retry, the whole batch lands in the specified queue. Sub-message
+    /// validation, batch homogeneity and namespace are the same set of steps as the
+    /// round-robin batch path.</summary>
     public SendResult SendBatch(List<Message> msgs, MessageQueue mq, int timeoutMillis = -1)
     {
         MQClientInstance c = GetClient();
         int timeout = timeoutMillis >= 0 ? timeoutMillis : _sendMsgTimeout;
         Message outbound = BuildBatchOutbound(msgs);
-        // `send(Collection, MessageQueue, timeout)` → `impl.send(batch(msgs), mq, timeout)`，
-        // 与单条共用同一处同步守卫（MessageBatch extends Message）。
+        // `send(Collection, MessageQueue, timeout)` -> `impl.send(batch(msgs), mq, timeout)`,
+        // shares the same synchronous guard with the single-message path (MessageBatch extends
+        // Message).
         CheckPinnedTopic(outbound.Topic, mq, PinnedTopicMismatchSync);
         int sysFlag = PrepareForSend(outbound);
         return SendWithHooks(c, outbound, mq, timeout, sysFlag);
     }
 
-    /// <summary>批量公共前段：逐条 <c>Validators.CheckMessage</c> → <c>MessageBatch.GenerateFromList</c>
-    /// （查同质性、逐条补 UNIQ_KEY、整批编进 body）→ 整批再查一次 → 套命名空间。
-    /// 轮询与定点批量都必须过这里：绕过即绕过全部本地校验。</summary>
+    /// <summary>Common batch prologue: per-message <c>Validators.CheckMessage</c> ->
+    /// <c>MessageBatch.GenerateFromList</c> (homogeneity check, per-message UNIQ_KEY fill-in,
+    /// whole batch encoded into the body) -> one more check over the whole batch -> wrap the
+    /// namespace. Both the round-robin and the pinned batch path must go through here:
+    /// bypassing it bypasses every local check.</summary>
     private Message BuildBatchOutbound(List<Message> msgs)
     {
         if (msgs is null || msgs.Count == 0)
@@ -2470,8 +2696,9 @@ public class DefaultMQProducer
             throw new MQClientException("message list is empty");
         }
 
-        // 对应 batch()：**每条子消息**都过一遍 Validators.checkMessage，
-        // 少这一步等于批量路径绕过了所有本地校验——超长/空 body/非法 topic 都能发出去。
+        // Corresponds to batch(): **every sub-message** goes through Validators.checkMessage;
+        // skipping this step means the batch path bypasses all local validation -- an
+        // oversized/empty body or an illegal topic could be sent.
         foreach (Message m in msgs)
         {
             Validators.CheckMessage(m, _maxMessageSize);
@@ -2480,7 +2707,8 @@ public class DefaultMQProducer
         MessageBatch batch = MessageBatch.GenerateFromList(msgs);
         CheckMessage(batch);
         Message outbound = CloneMessage(batch);
-        // 对应 MessageBatch.generateFromList + withNamespace：批量 topic 也要套命名空间
+        // Corresponds to MessageBatch.generateFromList + withNamespace: a batch topic also needs
+        // the namespace applied
         if (_namespace.Length != 0)
         {
             outbound.Topic = NamespaceUtil.WrapNamespace(_namespace, batch.Topic);
@@ -2489,32 +2717,39 @@ public class DefaultMQProducer
     }
 
     /// <summary>
-    /// 批量异步发送：对应 <c>send(Collection&lt;Message&gt;, SendCallback,
-    /// timeout)</c> → <c>defaultMQProducerImpl.send(batch(msgs), sendCallback, timeout)</c>，
-    /// 也就是 <c>send_async</c> 收到 list 时走进的那个批量分支。
+    /// <summary>Batch asynchronous send: corresponds to <c>send(Collection&lt;Message&gt;, SendCallback,
+    /// timeout)</c> -> <c>defaultMQProducerImpl.send(batch(msgs), sendCallback, timeout)</c>,
+    /// i.e. the batch branch <c>send_async</c> enters when it receives a list.
     ///
-    /// 本端口的批量只有同步内核，所以「异步」= 在 <c>AsyncSenderExecutor_N</c> 线程里跑完
-    /// 同步批量内核、结果照样从 <c>NettyClientPublicExecutor_N</c> 交付回调。对调用方语义没
-    /// 差别：不阻塞提交线程、回调恰好一次、失败照样归还许可。
-    /// <see cref="SendAsync(Message,ISendCallback,int,MessageQueue?)"/> 的整段前段（排队、
-    /// 预算复检、背压两道闸）在这里全部生效，字节许可按<b>整批每条子消息</b>的 body 长度累加
-    /// （空 body 也算 1、空列表算 1，<c>_back_pressure_msg_len</c> 的 list 分支同一
-    /// 公式）—— 只按一条扣等于一批整体占 1 格，字节闸对批量形同虚设。
+    // In this port batch only has the synchronous kernel, so "async" = running the synchronous
+    // batch kernel on an <c>AsyncSenderExecutor_N</c> thread, with the result still delivered
+    // from <c>NettyClientPublicExecutor_N</c>. Semantically there is no difference for the
+    // caller: the submitting thread does not block, the callback runs exactly once, and
+    // failures still return the permit. The whole prologue of
+    // <see cref="SendAsync(Message,ISendCallback,int,MessageQueue?)"/> (queueing, budget
+    // recheck, both backpressure gates) is fully in effect here, and the byte permit is
+    // accumulated over the body length of <b>every sub-message in the whole batch</b> (an
+    // empty body counts as 1, an empty list counts as 1 -- the same formula as the list branch
+    // of <c>_back_pressure_msg_len</c>); charging a batch as if it were a single message would
+    // let the whole batch occupy one slot, making the byte gate useless for batches.
     ///
-    /// <paramref name="mq"/> 非空时整批定点落到该队列
-    /// <c>send(Collection, MessageQueue, SendCallback, timeout)</c>）。
+    /// <paramref name="mq"/> non-null means the whole batch is pinned to that queue
+    /// (<c>send(Collection, MessageQueue, SendCallback, timeout)</c>).
     ///
-    /// 与 <see cref="SendBatch"/> 一样，<b>每条子消息</b>先过 <c>Validators.CheckMessage</c>：
-    /// 直接把 <see cref="MessageBatch"/> 丢给 <see cref="SendAsync(Message,ISendCallback,int,MessageQueue?)"/>
-    /// 会漏掉这一步，等于批量路径绕过本地校验（超长 body、非法 topic 都能发出去）。
-    /// 校验/组批的失败（空列表、超长、不同质）一律**进回调**：它们发生在
-    /// 池线程上的组批步骤里，被异步链的外层 catch 接住。
+    /// Just like <see cref="SendBatch"/>, <b>every sub-message</b> first goes through
+    /// <c>Validators.CheckMessage</c>: handing the <see cref="MessageBatch"/> straight to
+    /// <see cref="SendAsync(Message,ISendCallback,int,MessageQueue?)"/> skips this step, which
+    /// means the batch path bypasses local validation (an oversized body or an illegal topic
+    /// could be sent). Validation/batching failures (empty list, oversized, inhomogeneous)
+    /// always go <b>into the callback</b>: they happen inside the batching step on the pool
+    /// thread and are caught by the outer catch of the async chain.
+    /// </summary>
     /// </summary>
     public void SendBatchAsync(List<Message> msgs, ISendCallback callback, int timeoutMillis = -1,
         MessageQueue? mq = null)
     {
-        // 许可份数在调用方线程上算（投队列前算好），批量场景的公式：逐条累加、
-        // 空 body 也算 1、空列表算 1
+        // The permit count is computed on the caller thread (before queueing); the batch formula:
+        // accumulate per message, an empty body counts as 1, an empty list counts as 1
         long msgLen = 0;
         if (msgs is not null)
         {
@@ -2532,9 +2767,12 @@ public class DefaultMQProducer
         ExecuteAsyncSend(() => BuildBatchMessage(msgs), msgLen, callback, timeoutMillis, mq);
     }
 
-    /// <summary>批量异步的组批步骤（在池线程上跑）：与 <see cref="SendBatch"/> 开头完全同一串
-    /// 动作 —— 逐条 <c>Validators.CheckMessage</c> → <c>GenerateFromList</c>（查同质性、逐条补
-    /// UNIQ_KEY、把整批编进 body）→ 整批再查一次。这里的异常由异步链外层交给回调。</summary>
+    /// <summary>The batching step of batch async (runs on the pool thread): exactly the same
+    /// sequence of actions as the opening of <see cref="SendBatch"/> -- per-message
+    /// <c>Validators.CheckMessage</c> -> <c>GenerateFromList</c> (homogeneity check,
+    /// per-message UNIQ_KEY fill-in, whole batch encoded into the body) -> one more check over
+    /// the whole batch. Exceptions here are handed to the callback by the async chain's outer
+    /// catch.</summary>
     private Message BuildBatchMessage(List<Message>? msgs)
     {
         if (msgs is null || msgs.Count == 0)
@@ -2552,27 +2790,34 @@ public class DefaultMQProducer
         return batch;
     }
 
-    // ---------------- Request-Reply（5.x）----------------
-    // facade 上的 6 个 request 重载，
-    // 实现在 DefaultMQProducerImpl：同步 3 形态（默认路由 / 选择器 / 指定队列，
-    // 发出后阻塞等应答）与异步 3 形态（同 3 种路由 × RequestCallback）。
-    // 请求方公共流程（prepareSendRequest）：
-    //   1. 给请求消息写上 CORRELATION_ID（随机 UUID）、REPLY_TO_CLIENT（本客户端 clientId）、
-    //      TTL（= timeout）；后两个是 broker 找回本连接、应答方原样带回的依据。
-    //   2. 把等待槽按 correlationId 登记到进程级的 RequestFutureHolder。
-    //   3. 同步形态发送后阻塞等待；异步形态立即返回。应答由 broker 经
-    //      PUSH_REPLY_MESSAGE_TO_CLIENT(326) 推回，由 MQClientInstance.ProcessReplyMessage
-    //      投递进等待槽；超时由 RequestFutureHolder 的 TTL 扫描兜底。
+    // ---------------- Request-Reply (5.x)----------------
+    // The 6 request overloads on the facade,
+    // implemented in DefaultMQProducerImpl: 3 synchronous shapes (default route /
+    // selector / specified queue, blocking for the response after sending) and 3 async
+    // shapes (the same 3 routes x RequestCallback).
+    // Common requester flow (prepareSendRequest):
+    //   1. Write CORRELATION_ID (a random UUID), REPLY_TO_CLIENT (this client's clientId)
+    //      and TTL (= timeout) onto the request message; the latter two are what the broker
+    //      uses to find this connection again and what the responder echoes back.
+    //   2. Register the waiting slot in the process-wide RequestFutureHolder under
+    //      correlationId.
+    //   3. The synchronous shape blocks after sending; the async shape returns immediately.
+    //      The response is pushed back by the broker via PUSH_REPLY_MESSAGE_TO_CLIENT(326)
+    //      and delivered into the waiting slot by MQClientInstance.ProcessReplyMessage;
+    //      TTL scanning in RequestFutureHolder is the backstop for timeouts.
     //
-    // 同步形态超时抛 RequestTimeoutException（消息已发出但没等到应答）；发送本身失败则抛
-    // MQClientException（带着底层 cause）。异步形态的失败走回调
-    // OnException —— 桥接回调只负责标记发送结果，用户回调必定恰好触发一次。
+    // The synchronous shape throws RequestTimeoutException on timeout (the message was sent
+    // but no response arrived); a failure of the send itself throws MQClientException
+    // (carrying the low-level cause). Failures of the async shape go to the callback's
+    // OnException -- the bridging callback only marks the send result, and the user callback
+    // is guaranteed to fire exactly once.
     //
-    // REPLY_TO_CLIENT 是 clientId —— broker 要靠它反查 channel，所以本生产者必须先发过
-    // 心跳（start() 已起心跳线程；这里也会补一次，对齐 prepareSendRequest 的
-    // sendHeartbeatToAllBrokerWithLock）。
+    // REPLY_TO_CLIENT is the clientId -- the broker looks the channel up by it, so this
+    // producer must have sent a heartbeat first (start() already starts the heartbeat thread;
+    // this also issues one, matching prepareSendRequest's
+    // sendHeartbeatToAllBrokerWithLock).
 
-    /// <summary>同步：默认路由（request(msg, timeout)）。</summary>
+    /// <summary>Synchronous: default route (request(msg, timeout)).</summary>
     public Message Request(Message msg, int timeoutMillis = -1)
     {
         int timeout = timeoutMillis >= 0 ? timeoutMillis : _requestTimeout;
@@ -2581,9 +2826,9 @@ public class DefaultMQProducer
         return RequestSyncCore(outbound, null, timeout);
     }
 
-    /// <summary>同步：选择器定队列（request(msg, selector, arg, timeout)）。
-    /// 选择器拿到的是**原始消息**（与顺序消息发送同一条规则），namespace 包装只发生在
-    /// 出站副本上。</summary>
+    /// <summary>Synchronous: selector picks the queue (request(msg, selector, arg, timeout)).
+    /// The selector receives the <b>original message</b> (the same rule as ordered message
+    /// sending), and the namespace wrapper is only applied to the outbound copy.</summary>
     public Message Request(Message msg, IMessageQueueSelector selector, string arg,
         int timeoutMillis = -1)
     {
@@ -2596,7 +2841,7 @@ public class DefaultMQProducer
         return RequestSyncCore(outbound, selected, timeout);
     }
 
-    /// <summary>同步：指定队列定点发送（request(msg, mq, timeout)）。</summary>
+    /// <summary>Synchronous: pinned send to the specified queue (request(msg, mq, timeout)).</summary>
     public Message Request(Message msg, MessageQueue mq, int timeoutMillis = -1)
     {
         int timeout = timeoutMillis >= 0 ? timeoutMillis : _requestTimeout;
@@ -2605,9 +2850,10 @@ public class DefaultMQProducer
         return RequestSyncCore(outbound, mq, timeout);
     }
 
-    /// <summary>异步：默认路由 + 回调（request(msg, callback, timeout)）。
-    /// 回调恰好触发一次：应答到达（PutResponse）、发送失败（RequestFail）或 TTL 超时
-    ///（RequestFutureHolder.ScanExpiredRequest）三者之一，永不重复。</summary>
+    /// <summary>Asynchronous: default route + callback (request(msg, callback, timeout)).
+    /// The callback fires exactly once: response arrival (PutResponse), send failure
+    /// (RequestFail) or TTL timeout (RequestFutureHolder.ScanExpiredRequest) -- one of the
+    /// three, never more than one.</summary>
     public void Request(Message msg, RequestCallback callback, int timeoutMillis = -1)
     {
         int timeout = timeoutMillis >= 0 ? timeoutMillis : _requestTimeout;
@@ -2616,7 +2862,7 @@ public class DefaultMQProducer
         RequestAsyncCore(outbound, null, timeout, callback);
     }
 
-    /// <summary>异步：选择器定队列 + 回调（request(msg, selector, arg, callback, timeout)）。</summary>
+    /// <summary>Asynchronous: selector picks the queue + callback (request(msg, selector, arg, callback, timeout)).</summary>
     public void Request(Message msg, IMessageQueueSelector selector, string arg,
         RequestCallback callback, int timeoutMillis = -1)
     {
@@ -2629,7 +2875,7 @@ public class DefaultMQProducer
         RequestAsyncCore(outbound, selected, timeout, callback);
     }
 
-    /// <summary>异步：指定队列定点发送 + 回调（request(msg, mq, callback, timeout)）。</summary>
+    /// <summary>Asynchronous: pinned send to the specified queue + callback (request(msg, mq, callback, timeout)).</summary>
     public void Request(Message msg, MessageQueue mq, RequestCallback callback,
         int timeoutMillis = -1)
     {
@@ -2639,8 +2885,9 @@ public class DefaultMQProducer
         RequestAsyncCore(outbound, mq, timeout, callback);
     }
 
-    /// <summary>同步核：登记等待槽 → 发送（失败标 !sendRequestOk 并就地唤醒）→ 等应答 →
-    /// finally 摘除。对应同步 request 的 try/finally 段。</summary>
+    /// <summary>Synchronous core: register the waiting slot -> send (on failure mark
+    /// !sendRequestOk and wake in place) -> wait for the response -> remove in finally.
+    /// Corresponds to the try/finally section of the synchronous request.</summary>
     private Message RequestSyncCore(Message outbound, MessageQueue? mq, int timeout)
     {
         MQClientInstance c = GetClient();
@@ -2650,8 +2897,10 @@ public class DefaultMQProducer
             long elapsed = UtilAll.CurrentTimeMillis() - future.BeginTimestamp;
             int remaining = (int)(timeout > elapsed ? timeout - elapsed : 0);
 
-            // 发送失败时把等待槽标成 !sendRequestOk 并立即唤醒（让 WaitRequestResponse 走失败分支）；
-            // 协议上无差别 —— 应答由 broker 经**另一条** 326 通道推回，与本次发送的 mode 无关。
+            // On a send failure mark the waiting slot !sendRequestOk and wake it immediately (so
+            // WaitRequestResponse takes the failure branch); there is no protocol difference -- the
+            // response is pushed back by the broker over **another** 326 channel, unrelated to the mode
+            // of this send.
             try
             {
                 if (mq is null)
@@ -2678,8 +2927,10 @@ public class DefaultMQProducer
         }
     }
 
-    /// <summary>异步核：登记等待槽 → 交给异步发送链，立即返回。**没有** finally 摘除：
-    /// 异步形态的等待槽由应答到达 / 发送失败 / TTL 扫描三方竞争摘除。</summary>
+    /// <summary>Asynchronous core: register the waiting slot -> hand off to the async send
+    /// chain, return immediately. There is **no** removal in finally: in the async shape the
+    /// waiting slot is removed by whichever of response arrival / send failure / TTL scan gets
+    /// there first.</summary>
     private void RequestAsyncCore(Message outbound, MessageQueue? mq, int timeout,
         RequestCallback callback)
     {
@@ -2689,16 +2940,19 @@ public class DefaultMQProducer
         long elapsed = UtilAll.CurrentTimeMillis() - future.BeginTimestamp;
         int remaining = (int)(timeout > elapsed ? timeout - elapsed : 0);
 
-        // 异步发送（request 系列在发送侧一律 ASYNC）：桥只标记发送结果，
-        // 用户回调交给应答到达（PutResponse）、超时扫描（ScanExpiredRequest）或
-        // 发送失败（RequestFail）触发 —— 在桥里直接调用户回调会提前 onSuccess(null)
-        // 并与后续回调重复（request 系列注释里点明的坑）。
+        // Async send (the request family is always ASYNC on the send side): the bridge only marks
+        // the send result;
+        // the user callback is triggered by response arrival (PutResponse), the timeout scan
+        // (ScanExpiredRequest) or a send failure (RequestFail) -- invoking the user callback inside
+        // the bridge would fire onSuccess(null) early and duplicate the later callback (the
+        // pitfall the request family comments call out).
         SendAsync(outbound, new RequestSendBridge(future), remaining, mq);
     }
 
-    /// <summary>对应 prepareSendRequest + 等待槽登记（request 系列重载的公共前段）：
-    /// 写 CORRELATION_ID / REPLY_TO_CLIENT / TTL，确保路由并补一次心跳，然后把 future
-    /// 按 correlationId 登记进进程级 RequestFutureHolder。</summary>
+    /// <summary>Corresponds to prepareSendRequest + waiting slot registration (the common
+    /// prologue of the request overloads): writes CORRELATION_ID / REPLY_TO_CLIENT / TTL,
+    /// makes sure the route is known and issues a heartbeat, then registers the future in the
+    /// process-wide RequestFutureHolder under correlationId.</summary>
     private RequestResponseFuture PrepareRequest(MQClientInstance c, Message outbound, int timeout,
         RequestCallback? callback)
     {
@@ -2708,8 +2962,9 @@ public class DefaultMQProducer
         outbound.PutProperty(MessageConst.PropertyMessageTTL,
             timeout.ToString(CultureInfo.InvariantCulture));
 
-        // 对齐 prepareSendRequest：确保路由已知，然后补一次心跳 ——
-        // 没在 broker 上登记为 producer，broker 就找不到 channel 把应答推回来。
+        // Matches prepareSendRequest: make sure the route is known, then issue one heartbeat --
+        // without registering as a producer on the broker, the broker cannot find the channel to
+        // push the response back to.
         try
         {
             c.GetTopicPublishInfo(outbound.Topic);
@@ -2725,8 +2980,10 @@ public class DefaultMQProducer
         return future;
     }
 
-    /// <summary>对应 requestFail(correlationId)：发送失败时摘除等待槽并以失败态触发
-    /// 回调（摘不到 = 应答/超时已抢先，直接忽略 —— remove-claims-ownership）。</summary>
+    /// <summary>Corresponds to requestFail(correlationId): on a send failure remove the
+    /// waiting slot and fire the callback in the failed state (if it cannot be removed the
+    /// response/timeout already got there first, so ignore it --
+    /// remove-claims-ownership).</summary>
     private static void RequestFail(string correlationId)
     {
         RequestResponseFuture? future = RequestFutureHolder.Instance.RemoveRequest(correlationId);
@@ -2748,8 +3005,9 @@ public class DefaultMQProducer
         }
     }
 
-    /// <summary>异步 request 的发送桥（request(...) 内嵌 SendCallback）：成功只标记
-    /// sendRequestOk；失败记 cause 并走 <see cref="RequestFail"/>。用户回调不在这里触发。</summary>
+    /// <summary>The send bridge of an async request (the SendCallback embedded in
+    /// request(...)): on success it only marks sendRequestOk; on failure it records the cause
+    /// and goes through <see cref="RequestFail"/>. The user callback is not fired here.</summary>
     private sealed class RequestSendBridge : ISendCallback
     {
         private readonly RequestResponseFuture _future;
@@ -2771,7 +3029,8 @@ public class DefaultMQProducer
         }
     }
 
-    /// <summary>对应 waitResponse：超时/发送失败分别抛不同异常。</summary>
+    /// <summary>Corresponds to waitResponse: timeout and send failure throw different
+    /// exceptions.</summary>
     private static Message WaitRequestResponse(Message msg, int timeout, RequestResponseFuture future)
     {
         long elapsed = UtilAll.CurrentTimeMillis() - future.BeginTimestamp;
@@ -2793,13 +3052,16 @@ public class DefaultMQProducer
         return response;
     }
 
-    // ---------------- 事务消息 ----------------
-    // 对齐 sendMessageInTransaction 的**两阶段**：
-    //   1) 半消息：给 msg 打 TRAN_MSG / PGROUP 属性，sysFlag 置 TRANSACTION_PREPARED_TYPE；
-    //   2) 本地事务：仅 SendOk 时执行；Flush* / SlaveNotAvailable -> Rollback；
-    //   3) EndTransaction：以 END_TRANSACTION(37, oneway) 告知 broker 提交 / 回滚 / 未知；
-    //   4) Unknow 时由 broker 回查 CHECK_TRANSACTION_STATE(39)，回调
-    //      listener.CheckLocalTransaction 后再发 END_TRANSACTION(FromTransactionCheck=true)。
+    // ---------------- Transactional messages ----------------
+    // Mirrors the **two phases** of sendMessageInTransaction:
+    //   1) Half message: set TRAN_MSG / PGROUP properties on msg, sysFlag gets
+    //      TRANSACTION_PREPARED_TYPE;
+    //   2) Local transaction: executed only on SendOk; Flush* / SlaveNotAvailable ->
+    //      Rollback;
+    //   3) EndTransaction: tells the broker commit / rollback / unknown via
+    //      END_TRANSACTION(37, oneway);
+    //   4) On Unknow the broker runs CHECK_TRANSACTION_STATE(39) and, after calling
+    //      listener.CheckLocalTransaction, sends END_TRANSACTION(FromTransactionCheck=true).
     public TransactionSendResult SendMessageInTransaction(Message msg, ITransactionListener listener,
         string arg = "")
     {
@@ -2808,9 +3070,11 @@ public class DefaultMQProducer
             throw new MQClientException("tranExecutor is null");
         }
 
-        // ensureNotDelayedForTransactional：事务消息不支持延迟投递。
-        // ⚠ C# 的 DelayTimeLevel 属性有默认值 0（getter 对缺失键返回 0），
-        // 必须判 properties 里是否真的设置了该键，不能只看属性值。
+        // ensureNotDelayedForTransactional: transactional messages do not support delayed
+        // delivery.
+        // Note: C#'s DelayTimeLevel property has a default value of 0 (the getter returns 0 for a
+        // missing key), so we must check whether the key is really present in properties -- the
+        // property value alone is not enough.
         if (msg.Properties.TryGetValue(MessageConst.PropertyDelayTimeLevel, out string? dl)
             && !string.IsNullOrEmpty(dl))
         {
@@ -2823,12 +3087,14 @@ public class DefaultMQProducer
         TopicPublishInfo publish = TryToFindTopicPublishInfo(c, outbound.Topic);
         MessageQueue selected = publish.SelectOneMessageQueue();
 
-        // 半消息标记：broker 据此把消息写入 RMQ_SYS_TRANS_HALF_TOPIC，等待 END_TRANSACTION
+        // Half-message marker: the broker writes the message to RMQ_SYS_TRANS_HALF_TOPIC on this
+        // basis and waits for END_TRANSACTION
         outbound.PutProperty(MessageConst.PropertyTransactionPrepared, "true");
         outbound.PutProperty(MessageConst.PropertyProducerGroup, _producerGroup);
         _txListener = listener;
 
-        // 压缩与普通发送一致；再叠加事务类型位（sendKernelImpl 检测 TRAN_MSG 后置 PREPARED）
+        // Compression is the same as for a normal send; the transaction type bit is then layered
+        // on (sendKernelImpl sets PREPARED once it sees TRAN_MSG)
         int sysFlag = PrepareForSend(outbound);
         sysFlag = MessageSysFlag.ResetTransactionValue(sysFlag, MessageSysFlag.TransactionPreparedType);
 
@@ -2882,7 +3148,8 @@ public class DefaultMQProducer
         }
         catch (Exception e)
         {
-            // end broker transaction 失败只 warn，不影响返回结果
+            // A failure to end the broker transaction is only warned about and does not affect the
+            // returned result
             ClientLog.Warn("local transaction execute " + state
                 + ", but end broker transaction failed: " + e.Message);
         }
@@ -2907,15 +3174,17 @@ public class DefaultMQProducer
         _ => MessageSysFlag.TransactionNotType,
     };
 
-    // ---------------- 心跳（broker 事务回查依赖它） ----------------
+    // ---------------- Heartbeat (broker transaction check depends on it) ----------------
 
     private void HeartbeatLoop()
     {
         ClientLog.SetThreadName("ProducerHeartbeatThread");
         int intervalMs = _heartbeatIntervalMillis;
-        // 固定速率：首跳立即（MQClientInstance 心跳任务 initialDelay=1s，本端口从旧行为
-        // 就是立刻发一次，保留），之后每 intervalMs 一跳且锚定计划时刻（见 Schedules）——
-        // 旧写法"干完再按 100ms 切片睡 30s"在 macOS 上要睡 30.6s，心跳周期被拉长 2%。
+        // Fixed rate: the first beat is immediate (MQClientInstance's heartbeat task has
+        // initialDelay=1s, and this port has always sent one right away from the old behaviour, so
+        // it is kept), then one beat every intervalMs anchored to the scheduled instant (see
+        // Schedules) -- the old "work, then sleep 30s in 100ms slices" form has to sleep 30.6s on
+        // macOS, stretching the heartbeat period by 2%.
         long next = Environment.TickCount64;
         while (_heartbeatRunning)
         {
@@ -2956,11 +3225,12 @@ public class DefaultMQProducer
             return 0;
         }
 
-        // 只带 ProducerData：对齐 MQClientInstance 里 producerTable 的注册内容。
-        // broker 会把该 group 登记到 ProducerManager（事务回查即通过该 channel 反向联系）。
+        // Only ProducerData is carried: matches the registration content of the producerTable in
+        // MQClientInstance. The broker registers that group in the ProducerManager (the transaction
+        // check reaches this producer through that channel).
         var hb = new HeartbeatData(_clientId ?? string.Empty)
         {
-            HeartbeatFingerprint = 0,  // 走 V1 注册路径，最稳妥
+            HeartbeatFingerprint = 0,  // take the V1 registration path, the safest
         };
         hb.AddProducerData(new ProducerData(_producerGroup));
 
@@ -2981,21 +3251,23 @@ public class DefaultMQProducer
         return okCount;
     }
 
-    // 心跳线程（定时心跳；间隔默认 30s）
+    // Heartbeat thread (periodic heartbeat; interval defaults to 30s)
     private Thread? _heartbeatThread;
     private volatile bool _heartbeatRunning;
     private readonly int _heartbeatIntervalMillis = 30000;
 
-    // 最近一次 SendMessageInTransaction 使用的监听器（broker 回查时回调它）。
-    // 引用语义：调用方需保证其生命周期覆盖事务回查（同 TransactionListener 的约定）。
+    // The listener used by the most recent SendMessageInTransaction (the broker calls it back
+    // during the transaction check). Reference semantics: the caller must guarantee that its
+    // lifetime covers the transaction check (the same contract as TransactionListener).
     private ITransactionListener? _txListener;
     private readonly List<Thread> _txThreads = new();
     private readonly object _txThreadsLock = new();
 
     /// <summary>
-    /// 以 END_TRANSACTION(37, oneway) 告知 broker 事务最终状态（对齐 endTransaction /
-    /// checkTransactionState）。fromCheck=true 表示这是**回查**的收尾，偏移等字段取自
-    /// broker 的回查 header（此时 sendResult 不可用）。
+    /// Tells the broker the final transaction state via END_TRANSACTION(37, oneway) (matching
+    /// endTransaction / checkTransactionState). fromCheck=true means this is the closing step
+    /// of a **check**, and fields such as the offsets come from the broker's check header
+    /// (sendResult is not available then).
     /// </summary>
     private void EndTransaction(Message msg, SendResult sendResult, LocalTransactionState state,
         string? localExceptionText, bool fromCheck,
@@ -3018,7 +3290,7 @@ public class DefaultMQProducer
             header.TranStateTableOffset = checkHeader.TranStateTableOffset;
             header.TransactionId = checkHeader.TransactionId;
             header.Bname = checkHeader.Bname;
-            // uniqueKey = msg 属性 UNIQ_KEY，取不到才用 msgId
+            // uniqueKey = the UNIQ_KEY property of msg, falling back to msgId only if absent
             string? uniqueKey = checkMsg?.GetProperty(MessageConst.PropertyUniqClientMessageIdKeyidx);
             header.MsgId = string.IsNullOrEmpty(uniqueKey) ? checkMsg?.MsgId : uniqueKey;
             addr = brokerAddr;
@@ -3036,9 +3308,9 @@ public class DefaultMQProducer
             header.TransactionId = sendResult.TransactionId;
             header.Bname = sendResult.MessageQueue?.BrokerName;
             header.MsgId = sendResult.MsgId;
-            // 这里用的也是 findBrokerAddressInPublish（只认 master），
-            // 且**不做 null 检查**就直接 oneway；这里保留提前报错的守卫（比空引用干净），
-            // 但地址来源必须同样是 master-only —— 从节点不接 END_TRANSACTION。
+            // This also uses findBrokerAddressInPublish (master only), and it oneways **without a null
+            // check**; an early guard is kept here (cleaner than a null reference), but the address
+            // source must likewise be master-only -- slaves do not accept END_TRANSACTION.
             addr = c.FindBrokerAddressInPublish(sendResult.MessageQueue?.BrokerName ?? string.Empty);
         }
 
@@ -3056,9 +3328,10 @@ public class DefaultMQProducer
 
         c.RemotingClient.InvokeOneway(addr, request);
 
-        // 事务收尾轨迹（对应 executeEndTransactionHook）。
-        // 必须在真正发出 END_TRANSACTION 之后调用，轨迹里的 transactionState 才是最终状态。
-        // 回查路径（fromCheck=true）的 msg 是 broker 带回来的 MessageExt，优先用它。
+        // Transaction closing trace (corresponds to executeEndTransactionHook).
+        // It must be called after END_TRANSACTION has really been sent, so that
+        // transactionState in the trace is the final state. On the check path (fromCheck=true) msg
+        // is the MessageExt the broker brought back, so prefer it.
         if (_endTransactionHooks.Count > 0)
         {
             ExecuteEndTransactionHook(new EndTransactionContext
@@ -3076,8 +3349,9 @@ public class DefaultMQProducer
     }
 
     /// <summary>
-    /// broker 主动发起的事务回查（CHECK_TRANSACTION_STATE=39）入口，由传输层回调。
-    /// 回查是 broker 用 invokeOneway 发的，不期待响应，故返回 null。
+    /// The entry point for a transaction check initiated by the broker
+    /// (CHECK_TRANSACTION_STATE=39), called back by the transport layer. The check is sent by
+    /// the broker with invokeOneway and expects no response, so null is returned.
     /// </summary>
     private RemotingCommand? CheckTransactionState(RemotingCommand cmd, string addr)
     {
@@ -3092,7 +3366,8 @@ public class DefaultMQProducer
             return null;
         }
 
-        // broker 把整条 MessageExt 编码后放在 body 里（Broker2Client.checkProducerTransactionState）
+        // The broker encodes the whole MessageExt into the body
+        // (Broker2Client.checkProducerTransactionState)
         MessageExt? msgExt = null;
         if (cmd.Body is { Length: > 0 }
             && MessageDecoder.DecodeMessage(cmd.Body, out MessageExt decoded, true, true, true, false))
@@ -3120,7 +3395,7 @@ public class DefaultMQProducer
             return null;
         }
 
-        // 在独立线程里执行回查回调，避免阻塞读线程
+        // Run the check callback on a separate thread so the reader thread is not blocked
         MessageExt captured = msgExt;
         CheckTransactionStateRequestHeader capturedHeader = header;
         var th = new Thread(() =>
@@ -3159,7 +3434,7 @@ public class DefaultMQProducer
         return null;
     }
 
-    // ---------------- 查询 / 管理 ----------------
+    // ---------------- Query / Admin ----------------
 
     public List<MessageExt> QueryMessage(string topic, string key, int maxNum, long beginTimestamp,
         long endTimestamp)
@@ -3182,17 +3457,22 @@ public class DefaultMQProducer
         return publish.MsgQueueList;
     }
 
-    /// <summary>撤回一条定时/延迟消息，返回被撤回消息的 uniqKey。
+    /// <summary>Recalls a scheduled/delayed message and returns the uniqKey of the recalled
+    /// message.
     ///
-    /// 校验顺序与 <c>recallMessage</c> 逐条对齐：
-    /// 状态 → checkTopic → 禁 retry/DLQ → 解句柄 → 预热路由 → 定位 broker → 发请求。
-    /// 前三步必须在打网络<b>之前</b>跑完，否则一个手滑的句柄就要耗掉一次 RPC 超时。
-    /// 句柄来自定时消息的 <see cref="SendResult.RecallHandle"/>，普通消息没有。</summary>
+    /// The validation order lines up with <c>recallMessage</c> step by step:
+    /// state -> checkTopic -> forbid retry/DLQ -> decode the handle -> warm up the route ->
+    /// locate the broker -> send the request. The first three steps must run <b>before</b> any
+    /// network call, otherwise a mistyped handle costs a full RPC timeout.
+    /// The handle comes from the scheduled message's <see cref="SendResult.RecallHandle"/>; a
+    /// normal message has none.</summary>
     /// <remarks>
-    /// 口径：协议侧 <c>findBrokerAddrByTopic</c> 返回该 topic 的<b>全部</b> broker
-    /// 地址再随机取一个，这里直接取路由里的第一个可用地址——单 broker 场景等价，多 broker
-    /// 场景两者都只会命中句柄里那个 broker 之外的地址，最终由 broker 用
-    /// <c>ILLEGAL_OPERATION</c>（brokerName 不匹配）拒绝，语义不变。
+    /// Semantics: on the protocol side <c>findBrokerAddrByTopic</c> returns <b>all</b> broker
+    /// addresses of that topic and then randomly picks one, whereas here the first usable
+    /// address in the route is taken -- equivalent for a single broker, and in a multi-broker
+    /// scenario both can only land on an address other than the one in the handle, so the broker
+    /// ultimately rejects it with <c>ILLEGAL_OPERATION</c> (brokerName mismatch) and the
+    /// semantics are unchanged.</summary>
     /// </remarks>
     public string RecallMessage(string topic, string recallHandle)
     {
@@ -3208,11 +3488,13 @@ public class DefaultMQProducer
 
         HandleV1 handle = RecallMessageHandle.DecodeHandle(recallHandle);
 
-        // 只是调用 tryToFindTopicPublishInfo 预热路由，返回值并不使用，但**异常照抛**
+        // This only calls tryToFindTopicPublishInfo to warm up the route; the return value is
+        // unused, but **exceptions are still propagated**
         TryToFindTopicPublishInfo(c, realTopic);
 
-        // findBrokerAddressInPublish(brokerName)（只认 master，不刷路由）→ 退化到
-        // findBrokerAddrByTopic(topic) —— 那条路走 SelectBrokerAddr()，**允许**落到从节点上。
+        // findBrokerAddressInPublish(brokerName) (master only, no route refresh) degrades to
+        // findBrokerAddrByTopic(topic) -- that path goes through SelectBrokerAddr() and **allows**
+        // landing on a slave.
         string addr = c.FindBrokerAddressInPublish(handle.BrokerName);
         if (addr.Length == 0)
         {
@@ -3241,7 +3523,8 @@ public class DefaultMQProducer
             ProducerGroup = _producerGroup,
             Topic = realTopic,
             RecallHandle = recallHandle,
-            // 继承字段的协议反射名就是 bname，写成 brokerName 会被 broker 静默丢掉。
+            // The protocol reflection name of the inherited field is bname; writing brokerName makes
+            // the broker silently drop it.
             Bname = handle.BrokerName,
         };
         return c.RecallMessage(addr, header, _sendMsgTimeout);
@@ -3251,10 +3534,12 @@ public class DefaultMQProducer
     {
         MQClientInstance c = GetClient();
         const int perm = 6; // PERM_READ | PERM_WRITE
-        // 对应 createTopic：先本地校验原始 topic 名，再查系统 topic
+        // Corresponds to createTopic: validate the raw topic name locally first, then look up the
+        // system topic
         Validators.CheckTopic(newTopic);
         Validators.IsSystemTopic(newTopic);
-        // createTopic 忽略 key 形参，统一走默认 topic（MixAll.DefaultTopic）建路由
+        // createTopic ignores the key argument and always creates the route with the default topic
+        // (MixAll.DefaultTopic)
         _ = key;
         string realTopic = _namespace.Length == 0
             ? newTopic
@@ -3269,7 +3554,7 @@ public class DefaultMQProducer
 
     public long MinOffset(MessageQueue mq) => GetClient().GetMinOffset(mq);
 
-    // ---------------- 内部工具：分号拆分 ----------------
+    // ---------------- Internal utility: split on semicolon ----------------
 
     private static List<string> SplitSemicolon(string addr)
     {
@@ -3294,7 +3579,8 @@ public class DefaultMQProducer
     }
 }
 
-// 事务生产者（TransactionMQProducer 口径）：可预设 TransactionListener
+// Transactional producer (the TransactionMQProducer contract): a TransactionListener can
+// be preset
 public class TransactionMQProducer : DefaultMQProducer
 {
     public TransactionMQProducer(string producerGroup = MixAll.DefaultProducerGroup)
@@ -3304,7 +3590,8 @@ public class TransactionMQProducer : DefaultMQProducer
 
     public ITransactionListener? TransactionListener { get; set; }
 
-    // 两阶段事务：使用预设 listener 执行本地事务（半消息 → 本地事务 → END_TRANSACTION → broker 回查）。
+    // Two-phase transaction: run the local transaction with the preset listener (half message
+    // -> local transaction -> END_TRANSACTION -> broker check).
     public TransactionSendResult SendMessageInTransaction(Message msg, string arg = "")
     {
         if (TransactionListener is null)

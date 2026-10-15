@@ -30,11 +30,11 @@ class FakePublishInfo:
 
 
 class FakeClient:
-    """只记 RPC、不碰网络；``broker_offsets`` 模拟 broker 上的已提交位点表。"""
+    """Only records RPCs, never touches the network; ``broker_offsets`` simulates the committed offset table on the broker."""
 
     def __init__(self, mqs):
         self.mqs = list(mqs)
-        self.offsets = []            # 每次 update_consumer_offset 的 (group, mq, off)
+        self.offsets = []            # (group, mq, off) of each update_consumer_offset
         self.broker_offsets = {}     # MessageQueue -> off
 
     def update_consumer_offset(self, group, mq, off):
@@ -58,10 +58,10 @@ class FakeClient:
 
 
 class Harness:
-    """不碰网络的 push consumer：分配、缓冲、位点、代号都手动搭。
+    """A push consumer that never touches the network: assignment, buffer, offsets, and epochs are all set up manually.
 
-    ``_do_rebalance`` 默认换成计数器（否则重置里会真的起拉取线程）；要跑真实重建就
-    显式调 ``rebuild()``。
+    ``_do_rebalance`` is replaced with a counter by default (otherwise the reset would really start pull threads); to run the real rebuild,
+    call ``rebuild()`` explicitly.
     """
 
     def __init__(self, queues=1, cluster_offset=7):
@@ -73,11 +73,11 @@ class Harness:
         self.keys = [self.c._mq_key(mq) for mq in self.mqs]
         self.client = FakeClient(self.mqs)
         self.c._mq_client = self.client
-        self.c._assigned = list(self.mqs)     # 真实状态：队列已分给本实例
+        self.c._assigned = list(self.mqs)     # real state: the queues have been assigned to this instance
         self.rebalances = 0
         self._real_rebalance = self.c._do_rebalance
         self.c._do_rebalance = self._count_rebalance
-        self.c._queue_pull_loop = lambda mq: None   # 重建起的循环不打网络
+        self.c._queue_pull_loop = lambda mq: None   # the restarted loop does not touch the network
         for mq, key in zip(self.mqs, self.keys):
             self.client.broker_offsets[mq] = cluster_offset
             with self.c._lock:
@@ -112,11 +112,11 @@ class Harness:
         self.c._advance_consume_offset(key or self.key, [msg(o) for o in offsets], epoch=epoch)
 
     def rebuild(self):
-        """重置之后的下一趟 rebalance（真实路径：_do_rebalance → _rebalance_pull_threads）。"""
+        """The next rebalance after the reset (real path: _do_rebalance -> _rebalance_pull_threads)."""
         self._real_rebalance()
 
 
-# ------------------------------------------------- 撤队列：在途/缓冲一起作废
+# ------------------------------------------------- Revoking queues: in-flight and buffered messages are voided together
 
 
 class TestRetire:
@@ -138,15 +138,15 @@ class TestRetire:
         assert h.epoch() == 1
 
     def test_stale_ack_cannot_undo_the_reset(self):
-        # 在途批次拿的是重置前的代号（0）：它的 ack 必须整批作废。修好之前这里会写回 8 ——
-        # 位点被判"重置过又退回旧位置"，重置只活到下一个周期落盘。
+        # the in-flight batch carries the pre-reset epoch (0): its ack must be voided as a whole. Before the fix this wrote back 8 --
+        # the offset was judged "reset then fell back to the old position", so the reset only survived until the next periodic persist.
         h = Harness()
         h.reset([3])
         h.ack([7], epoch=0)
         assert h.offset() is None
 
     def test_ack_after_rebuild_still_works(self):
-        # 负向对照：不是把这条队列永久冻死 —— 重建后的队列拿新代号，ack 恢复正常
+        # negative control: the queue is not permanently frozen -- after the rebuild the queue gets a new epoch and ack works normally
         h = Harness()
         h.reset([3])
         h.rebuild()
@@ -155,7 +155,7 @@ class TestRetire:
         assert h.offset() == 5
 
     def test_reset_only_touches_queues_in_the_offset_table(self):
-        # 负向对照：不在 220 队列表里的队列（同 topic 也）一根手指都不许碰
+        # negative control: queues not in the 220 queue table (even on the same topic) must not be touched at all
         h = Harness(queues=2)
         h.c._pending[h.keys[1]] = deque([msg(1)])
         h.reset([3])
@@ -182,7 +182,7 @@ class TestRetire:
         assert h.epoch() in (None, 0)
 
 
-# ------------------------------------------------- 立刻落盘 + 重建后从新位点拉
+# ------------------------------------------------- Persist immediately + pull from the new offset after rebuild
 
 
 class TestPersistAndRebuild:
@@ -202,7 +202,7 @@ class TestPersistAndRebuild:
         h.rebuild()
         assert h.key in h.c._mq_map
         assert h.key in h.c._queue_threads
-        assert h.key not in h.c._offset_table           # 旧游标随撤销一起没了
+        assert h.key not in h.c._offset_table           # the old cursor is gone along with the revocation
         sub = h.c.subscription_data[TOPIC]
         assert h.c._resolve_initial_offset(h.client, h.mq, sub) == 3
 
@@ -215,7 +215,7 @@ class TestPersistAndRebuild:
         assert h.c._resolve_initial_offset(h.client, h.mq, sub) == 0
 
 
-# ------------------------------------------------- 广播：位点只存本地，文件不能被抹掉
+# ------------------------------------------------- Broadcasting: offsets are stored locally only, the file must not be wiped
 
 
 class TestBroadcast:
@@ -232,8 +232,8 @@ class TestBroadcast:
         assert self._local_saved(h) == {h.key: 3}
 
     def test_plain_revoke_keeps_the_persisted_offset(self, tmp_path, monkeypatch):
-        # 一般情形（不是重置）：普通 rebalance 撤队列也要把位点留在文件里，
-        # 否则同名队列下次分回来时读不到位点、按 consumeFromWhere 重扫
+        # the general case (not a reset): a plain rebalance revoking queues must also keep the offsets in the file,
+        # otherwise when the same-named queue is assigned back next time the offset cannot be read and it rescans per consumeFromWhere
         monkeypatch.setenv("HOME", str(tmp_path))
         h = Harness()
         h.c.message_model = MessageModel.BROADCASTING

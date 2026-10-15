@@ -8,7 +8,7 @@ from typing import Optional
 
 from common.message import Message, MessageExt
 
-# W3C 键名（小写，与 OTel / HTTP 头一致）
+# W3C key names (lowercase, consistent with OTel / HTTP headers)
 TRACE_CONTEXT_PROPERTY = "traceparent"
 TRACE_STATE_PROPERTY = "tracestate"
 
@@ -20,12 +20,12 @@ def _hex(n: int) -> str:
 
 
 def generate_traceparent() -> str:
-    """生成合法的根 traceparent：``00-<32hex>-<16hex>-01``（记录采样）。"""
+    """Generate a valid root traceparent: ``00-<32hex>-<16hex>-01`` (records sampling)."""
     return "00-%s-%s-01" % (_hex(32), _hex(16))
 
 
 def is_valid_traceparent(value: Optional[str]) -> bool:
-    """按 W3C 语法与"不全 0"规则校验。宽松接受大写 hex（转发不重写）。"""
+    """Validate per W3C syntax and the "not all zeros" rule. Loosely accept uppercase hex (forwarding does not rewrite)."""
     if not value:
         return False
     parts = value.strip().split("-")
@@ -48,7 +48,7 @@ def is_valid_traceparent(value: Optional[str]) -> bool:
 
 
 def child_traceparent(parent: Optional[str]) -> Optional[str]:
-    """同一 trace-id 下生成子 span（换 parent-id）；parent 非法返回 None。"""
+    """Generate a child span under the same trace-id (swap parent-id); return None if parent is invalid."""
     if not is_valid_traceparent(parent):
         return None
     parts = parent.strip().split("-")
@@ -56,9 +56,10 @@ def child_traceparent(parent: Optional[str]) -> Optional[str]:
 
 
 def inject_trace_context(message: Message) -> str:
-    """消息没有 traceparent 属性时注入根上下文；返回（注入后的）值。
+    """Inject the root context when the message has no traceparent property; return the (injected) value.
 
-    已有值**不覆盖**——上游传播进来的上下文优先（对齐链路追踪的通用约定）。
+    An existing value is **not overwritten** -- context propagated from upstream takes priority
+    (aligning with common tracing conventions).
     """
     existing = message.get_property(TRACE_CONTEXT_PROPERTY)
     if existing:
@@ -69,11 +70,11 @@ def inject_trace_context(message: Message) -> str:
 
 
 def extract_traceparent(msg: MessageExt) -> Optional[str]:
-    """从消息属性里取出 traceparent（未注入/为空返回 None）。"""
+    """Read traceparent from the message property (return None if not injected / empty)."""
     return msg.get_property(TRACE_CONTEXT_PROPERTY) or None
 
 
 def trace_context_enabled_from_env() -> bool:
-    """env `ROCKETMQ_TRACE_CONTEXT_ENABLE`（对齐其它开关的 env 惯例）。"""
+    """env `ROCKETMQ_TRACE_CONTEXT_ENABLE` (aligning with the env convention of other switches)."""
     return os.environ.get("ROCKETMQ_TRACE_CONTEXT_ENABLE", "").strip().lower() in (
         "1", "true", "yes")

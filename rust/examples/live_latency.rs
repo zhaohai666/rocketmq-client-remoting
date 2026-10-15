@@ -1,16 +1,16 @@
-//! 发送延迟故障容错（sendLatencyFaultEnable）真机验证（覆盖 S1–S5 五场景）。
+//! Live verification of send-latency fault tolerance (sendLatencyFaultEnable) (covering the five scenarios S1-S5).
 //!
-//! 用法（先按 runbook 起本地单 broker 集群）：
+//! Usage (start the local single-broker cluster per the runbook first):
 //! ```text
 //! cargo run --example live_latency -- 127.0.0.1:9876
 //! ```
 //!
-//! 场景（单 broker broker-a / DefaultCluster）：
-//!   S1 默认关闭：发 10 条全 OK，容错表不记录
-//!   S2 开启故障规避：发 20 条全 OK（broker 健康，不触发隔离）
-//!   S3 成功发送后容错表有记录：current_latency > 0 且可用/可达
-//!   S4 手工注入隔离 → 单 broker 走 available→reachable→普通轮询 退化链仍全部发出
-//!   S5 隔离到期恢复（注入 2000ms，≈2s 后恢复可用、发送正常）
+//! Scenarios (single broker broker-a / DefaultCluster):
+//!   S1 off by default: send 10 messages, all OK, the fault table records nothing
+//!   S2 fault avoidance enabled: send 20 messages, all OK (broker healthy, no isolation triggered)
+//!   S3 after successful sends the fault table has an entry: current_latency > 0 and available/reachable
+//!   S4 manually injected isolation → single broker walks the available→reachable→plain round-robin degradation chain and still sends all
+//!   S5 isolation expires and recovers (inject 2000ms, available again and sending normally after ≈2s)
 
 use std::env;
 use std::process::ExitCode;
@@ -24,7 +24,7 @@ use rocketmq_client_remoting::common::topic_config::{TopicFilterType, DEFAULT_PE
 
 const QUEUE_NUMS: i32 = 4;
 
-// ------------------------------------------------------------------ 骨架
+// ------------------------------------------------------------------ Skeleton
 
 fn stamp() -> u128 {
     SystemTime::now()
@@ -55,7 +55,7 @@ impl Checker {
     }
 }
 
-/// 逐条同步发送，返回成功条数。
+/// Sends synchronously one by one, returns the count of successes.
 async fn send_ok(p: &DefaultMQProducer, topic: &str, count: usize, key: &str) -> usize {
     let mut ok = 0;
     for i in 0..count {
@@ -69,7 +69,7 @@ async fn send_ok(p: &DefaultMQProducer, topic: &str, count: usize, key: &str) ->
     ok
 }
 
-/// 从默认 topic 路由里取（brokerName, brokerAddr）——单 broker 集群只有一项。
+/// Takes (brokerName, brokerAddr) from the default topic route -- a single-broker cluster has exactly one entry.
 fn broker_of(
     route: &rocketmq_client_remoting::remoting::protocol::route::TopicRouteData,
 ) -> Option<(String, String)> {
@@ -78,26 +78,26 @@ fn broker_of(
     Some((bd.broker_name.clone(), addr))
 }
 
-// ------------------------------------------------------------------ 驱动
+// ------------------------------------------------------------------ Driver
 
 async fn run(namesrv: &str) -> Checker {
     let mut ck = Checker::new();
     let stamp = stamp();
     let topic = format!("LatencyRust{stamp}");
 
-    println!("== LatencyFaultTolerance 真机验证  namesrv={namesrv}  topic={topic} ==");
+    println!("== LatencyFaultTolerance live verification  namesrv={namesrv}  topic={topic} ==");
 
-    // 预建 topic（消费者/生产者都不做默认 topic 兜底，先建再发）。
+    // Pre-create the topic (neither consumer nor producer falls back to the default topic; create first, then send).
     let admin = MQClientInstance::new(&format!("rust-live-lat-admin-{stamp}"), vec![namesrv.to_string()]);
     if let Err(e) = admin.start().await {
-        ck.check("A0 admin 启动", false, &e.to_string());
+        ck.check("A0 admin start", false, &e.to_string());
         return ck;
     }
     let route = admin.get_topic_route_data(MixAll::DEFAULT_TOPIC).await;
     let (broker_name, broker_addr) = match route.as_ref().and_then(broker_of) {
         Some(v) => v,
         None => {
-            ck.check("A0 默认 topic 路由可取", false, "no route of TBW102");
+            ck.check("A0 default topic route fetchable", false, "no route of TBW102");
             return ck;
         }
     };
@@ -118,23 +118,23 @@ async fn run(namesrv: &str) -> Checker {
         )
         .await
     {
-        ck.check("A0 预建 topic", false, &e.to_string());
+        ck.check("A0 pre-create topic", false, &e.to_string());
         return ck;
     }
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    // ---------------- S1 默认关闭 ----------------
-    println!("\nS1 默认关闭：行为不变，不记录容错表");
+    // ---------------- S1 off by default ----------------
+    println!("\nS1 off by default: behavior unchanged, fault table not recorded");
     let p1 = match DefaultMQProducer::new(&format!("rust-live-lat-off-{stamp}")) {
         Ok(p) => p,
         Err(e) => {
-            ck.check("S1 构造", false, &e.to_string());
+            ck.check("S1 build", false, &e.to_string());
             return ck;
         }
     };
     p1.set_namesrv_addr(namesrv);
     ck.check(
-        "S1 默认 send_latency_fault_enable=false",
+        "S1 default send_latency_fault_enable=false",
         !p1.fault_strategy().is_send_latency_fault_enable(),
         "",
     );
@@ -143,9 +143,9 @@ async fn run(namesrv: &str) -> Checker {
         return ck;
     }
     let n = send_ok(&p1, &topic, 10, "off").await;
-    ck.check("S1 关闭时发 10 条全部成功", n == 10, &format!("ok={n}"));
+    ck.check("S1 with the flag off all 10 sends succeed", n == 10, &format!("ok={n}"));
     ck.check(
-        "S1 关闭时不记录容错表",
+        "S1 with the flag off the fault table records nothing",
         p1.fault_strategy()
             .latency_fault_tolerance()
             .get_fault_item(&broker_name)
@@ -154,19 +154,19 @@ async fn run(namesrv: &str) -> Checker {
     );
     p1.shutdown();
 
-    // ---------------- S2/S3 开启后健康路径 ----------------
-    println!("\nS2/S3 开启故障规避：健康 broker 正常发送并记录延迟");
+    // ---------------- S2/S3 healthy path with the flag on ----------------
+    println!("\nS2/S3 fault avoidance on: healthy broker sends normally and records latency");
     let p2 = match DefaultMQProducer::new(&format!("rust-live-lat-on-{stamp}")) {
         Ok(p) => p,
         Err(e) => {
-            ck.check("S2 构造", false, &e.to_string());
+            ck.check("S2 build", false, &e.to_string());
             return ck;
         }
     };
     p2.set_namesrv_addr(namesrv);
     p2.set_send_latency_fault_enable(true);
     ck.check(
-        "S2 开关生效",
+        "S2 the switch takes effect",
         p2.fault_strategy().is_send_latency_fault_enable(),
         "",
     );
@@ -175,62 +175,62 @@ async fn run(namesrv: &str) -> Checker {
         return ck;
     }
     let n = send_ok(&p2, &topic, 20, "on").await;
-    ck.check("S2 开启后发 20 条全部成功", n == 20, &format!("ok={n}"));
+    ck.check("S2 with the flag on all 20 sends succeed", n == 20, &format!("ok={n}"));
     let item = p2
         .fault_strategy()
         .latency_fault_tolerance()
         .get_fault_item(&broker_name);
-    ck.check("S3 容错表已记录 broker-a", item.is_some(), "");
+    ck.check("S3 fault table recorded broker-a", item.is_some(), "");
     if let Some(item) = item {
         ck.check(
-            "S3 记录的实测延迟 > 0",
+            "S3 the recorded measured latency is > 0",
             item.current_latency > 0,
             &format!("latency={}ms", item.current_latency),
         );
         ck.check(
-            "S3 健康 broker 仍可用",
+            "S3 the healthy broker is still available",
             p2.fault_strategy().latency_fault_tolerance().is_available(&broker_name)
                 && item.is_reachable(),
             "",
         );
         ck.check(
-            "S3 延迟低于第一档阈值（未触发隔离）",
+            "S3 latency below the first-tier threshold (no isolation triggered)",
             item.start_timestamp == 0,
             &format!("startTs={}", item.start_timestamp),
         );
     }
 
-    // ---------------- S4 注入隔离 → 退化链 ----------------
-    println!("\nS4 注入隔离：available→reachable→普通轮询 退化链仍能发出");
+    // ---------------- S4 injected isolation → degradation chain ----------------
+    println!("\nS4 injected isolation: the available→reachable→plain round-robin degradation chain still sends");
     p2.fault_strategy().update_fault_item(&broker_name, 99999, true, false);
     ck.check(
-        "S4 注入后 broker-a 不可用",
+        "S4 after injection broker-a is unavailable",
         !p2.fault_strategy().latency_fault_tolerance().is_available(&broker_name),
         "",
     );
     let n = send_ok(&p2, &topic, 5, "iso").await;
-    // 单 broker：三个过滤器都选不出 → 退化普通轮询，消息照发（不因隔离而丢发送能力）。
-    ck.check("S4 隔离中单 broker 退化轮询仍发出 5 条", n == 5, &format!("ok={n}"));
+    // Single broker: none of the three filters can pick one → fall back to plain round-robin and messages still go out (isolation does not lose the send capability).
+    ck.check("S4 under isolation the single broker's fallback round-robin still sends 5", n == 5, &format!("ok={n}"));
 
-    // ---------------- S5 隔离到期恢复 ----------------
-    println!("\nS5 隔离到期恢复（remove 后注入 2000ms）");
+    // ---------------- S5 recovery when isolation expires ----------------
+    println!("\nS5 recovery when isolation expires (after remove, inject 2000ms)");
     let tolerance = p2.fault_strategy().latency_fault_tolerance();
     tolerance.remove(&broker_name);
     tolerance.update_fault_item(&broker_name, 1, 2000, true);
     ck.check(
-        "S5 隔离期内不可用",
+        "S5 unavailable while isolated",
         !tolerance.is_available(&broker_name),
         "",
     );
     tokio::time::sleep(Duration::from_millis(2300)).await;
-    ck.check("S5 到期后恢复可用", tolerance.is_available(&broker_name), "");
+    ck.check("S5 available again after expiry", tolerance.is_available(&broker_name), "");
     let n = send_ok(&p2, &topic, 3, "after").await;
-    ck.check("S5 恢复后发送正常", n == 3, &format!("ok={n}"));
+    ck.check("S5 sending normal after recovery", n == 3, &format!("ok={n}"));
     p2.shutdown();
 
-    // 清理本次 topic（失败不改变结论，仅提示）。
+    // Clean up this topic (a failure does not change the verdict, notice only).
     if let Err(e) = admin.delete_topic_in_broker(&broker_addr, &topic, 5000).await {
-        println!("  [WARN] 删除 topic {topic} 失败: {e}");
+        println!("  [WARN] deleting topic {topic} failed: {e}");
     }
 
     ck

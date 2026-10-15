@@ -1,6 +1,6 @@
-//! 这些字符串就是 broker 与客户端之间的**协议字面量**（写进 17 段消息的第 17 项
-//! 属性区，也被 broker 侧过滤/轨迹/事务逻辑按名字读取），所以取值一个字符都不能改；
-//! 常量名保留 `PROPERTY_` 前缀（去掉会丢语义，故不改）。
+//! These strings are the **protocol literals** shared between broker and client: they go
+//! into the property section (item 17) of the 17-section message and broker-side filtering,
+//! trace and transaction logic read them by name, so no value may change; names keep
 
 /// `MessageConst.PROPERTY_KEYS`
 pub const PROPERTY_KEYS: &str = "KEYS";
@@ -20,9 +20,9 @@ pub const PROPERTY_TRANSFER_FLAG: &str = "TRANSFER_FLAG";
 pub const PROPERTY_CHECK_IMMUNITY_TIME_IN_SECONDS: &str = "CHECK_IMMUNITY_TIME_IN_SECONDS";
 pub const PROPERTY_RECONSUME_TIME: &str = "RECONSUME_TIME";
 pub const PROPERTY_MSG_REGION: &str = "MSG_REGION";
-/// 消息轨迹开关：broker 在 SEND 响应头里带回，消费侧从消息属性读同一个 key。
+/// Message trace switch: broker returns it in the SEND response header, and the consumer side reads the same key from message properties.
 pub const PROPERTY_TRACE_SWITCH: &str = "TRACE_ON";
-/// 客户端唯一 ID（`MessageClientIDSetter` 写入）。
+/// Client unique ID (written by `MessageClientIDSetter`).
 pub const PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX: &str = "UNIQ_KEY";
 pub const PROPERTY_MAX_RECONSUME_TIMES: &str = "MAX_RECONSUME_TIMES";
 pub const PROPERTY_CONSUME_START_TIMESTAMP: &str = "CONSUME_START_TIME";
@@ -38,7 +38,7 @@ pub const PROPERTY_WAIT_STORE_MSG_OK_PROP: &str = "WAIT_STORE_MSG_OK";
 pub const PROPERTY_INSTANCE_ID: &str = "INSTANCE_ID";
 pub const PROPERTY_CLUSTER: &str = "CLUSTER";
 pub const PROPERTY_MESSAGE_TYPE: &str = "MSG_TYPE";
-/// Request-Reply（5.x）：请求消息带 CORRELATION_ID / REPLY_TO_CLIENT / TTL。
+/// Request-Reply (5.x): request messages carry CORRELATION_ID / REPLY_TO_CLIENT / TTL.
 pub const PROPERTY_CORRELATION_ID: &str = "CORRELATION_ID";
 pub const PROPERTY_MESSAGE_REPLY_TO_CLIENT: &str = "REPLY_TO_CLIENT";
 pub const PROPERTY_MESSAGE_TTL: &str = "TTL";
@@ -118,8 +118,8 @@ pub const KEY_SEPARATOR_CHAR: &str = " ";
 pub const CHARACTER_MAX_LENGTH: i32 = 255;
 pub const MESSAGE_ID_PREFIX: &str = "MSGID-";
 
-/// 索引查询类型（`MessageConst.INDEX_KEY_TYPE` 等）：broker 的
-/// `QueryMessageRequestHeader.indexType` 取这三个值，为空时按 `"K"` 处理。
+/// Index query type (for `INDEX_KEY_TYPE` and friends): broker's
+/// `QueryMessageRequestHeader.indexType` takes these three values; when empty it is handled as `"K"`.
 pub const INDEX_KEY_TYPE: &str = "K";
 pub const INDEX_UNIQUE_TYPE: &str = "U";
 pub const INDEX_TAG_TYPE: &str = "T";
@@ -128,7 +128,7 @@ pub fn message_id_prefix() -> &'static str {
     MESSAGE_ID_PREFIX
 }
 
-/// 属性名是否属于系统属性（`STRING_ALL_PROPERTY`）。
+/// Whether the property name is a system property (per `STRING_ALL_PROPERTY`).
 pub fn is_system_property(name: &str) -> bool {
     STRING_ALL_PROPERTY.contains(&name)
 }
@@ -139,7 +139,7 @@ mod tests {
 
     #[test]
     fn property_literals_match_wire_names() {
-        // 这些是协议字面量，改动必然破坏与 broker 的兼容性
+        // These are protocol literals; changing any of them breaks broker compatibility
         assert_eq!(PROPERTY_KEYS, "KEYS");
         assert_eq!(PROPERTY_TAGS, "TAGS");
         assert_eq!(PROPERTY_WAIT_STORE_MSG_OK, "WAIT");
@@ -174,7 +174,7 @@ mod tests {
         sorted.sort_unstable();
         let before = sorted.len();
         sorted.dedup();
-        assert_eq!(before, sorted.len(), "STRING_ALL_PROPERTY 里有重复键");
+        assert_eq!(before, sorted.len(), "STRING_ALL_PROPERTY contains duplicate keys");
         for key in STRING_ALL_PROPERTY {
             assert!(is_system_property(key));
         }

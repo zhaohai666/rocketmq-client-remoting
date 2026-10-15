@@ -1,17 +1,23 @@
-// 极简 JSON 解析 / 生成（仅满足 RemotingSerializable 的需求，零第三方依赖）。
+// Minimal JSON parse/generate (only what RemotingSerializable needs, zero third-party
+// dependencies).
 //
-// 之所以自带实现而不用 System.Text.Json：RocketMQ 服务端（fastjson2）会写出
-// **不合法的 JSON**，标准解析器一律拒收，而管理端大量 body 恰恰是这些形状：
-//   - map 的 key 是对象：{"offsetTable":{{"brokerName":"b","queueId":3,"topic":"t"}:{...}}}
-//   - map 的 key 是裸数字：{"brokerAddrs":{0:"127.0.0.1"}}
-//   - NaN / Infinity / -Infinity 字面量
-//   - 尾随逗号
-// 另外数字必须区分 int64 与 double：long 型 timestamp 若被写成浮点，broker 侧字段就对不上。
+// Why a hand-rolled implementation instead of System.Text.Json: the RocketMQ server
+// (fastjson2) writes **invalid JSON** that standard parsers all reject, and many admin
+// bodies are exactly these shapes:
+//   - object keys for maps: {"offsetTable":{{"brokerName":"b","queueId":3,"topic":"t"}:{...}}}
+//   - bare numeric keys for maps: {"brokerAddrs":{0:"127.0.0.1"}}
+//   - NaN / Infinity / -Infinity literals
+//   - trailing commas
+// Also, int64 and double must be distinguished: if a long timestamp were written as a float,
+// the broker-side field would not line up.
 //
-// 按协议口径逐条实现（服务端 fastjson2 的输出形状决定了下面的行为）：
-//   - Object 保序：set() 覆盖同名键时**保留原位置**（按插入序，覆盖不重排）；
-//   - 字符串按 UTF-8 原样输出（不解码为 \uXXXX），解析时兼容 \uXXXX 与代理对；
-//   - 解析对 fastjson2 的非标准写法宽容。
+// Implemented item by item per the protocol (the server's fastjson2 output shape dictates the
+// behavior below):
+//   - Objects keep order: set() overwriting an existing key **keeps its original position**
+//     (insertion order; overwriting does not reorder);
+//   - Strings are output verbatim as UTF-8 (not decoded to \uXXXX); parsing accepts both
+//     \uXXXX and surrogate pairs;
+//   - Parsing is lenient toward fastjson2's non-standard forms.
 using System.Globalization;
 using System.Text;
 
@@ -70,7 +76,7 @@ public sealed class JsonValue
 
     public static JsonValue MakeObject() => new() { _type = JsonType.Object };
 
-    /// <summary>共享的 Null 实例（只读，勿 Set）。供链式取值回落用。</summary>
+    /// <summary>Shared Null instance (read-only, do not Set). For chained value fallback.</summary>
     public static JsonValue Null => NullInstance;
 
     public JsonType Type => _type;
@@ -104,7 +110,7 @@ public sealed class JsonValue
     }
 
     // ---- object ----
-    /// <summary>保序的键值对视图（供遍历；顺序与插入/解析顺序一致）。</summary>
+    /// <summary>Order-preserving key/value view (for iteration; order matches insertion/parse order).</summary>
     public IReadOnlyList<KeyValuePair<string, JsonValue>> ObjectItems() => _obj;
 
     public bool Contains(string key)
@@ -133,7 +139,7 @@ public sealed class JsonValue
         return null;
     }
 
-    /// <summary>找不到时返回共享 Null，便于链式取值。</summary>
+    /// <summary>Returns the shared Null when not found, for chained access.</summary>
     public JsonValue Get(string key) => Find(key) ?? NullInstance;
 
     public void Set(string key, JsonValue v)
@@ -143,7 +149,7 @@ public sealed class JsonValue
         {
             if (_obj[i].Key == key)
             {
-                // 覆盖式插入：保留原位置
+                // Overwrite-style insert: keep the original position
                 _obj[i] = new KeyValuePair<string, JsonValue>(key, v);
                 return;
             }
@@ -152,7 +158,7 @@ public sealed class JsonValue
         _obj.Add(new KeyValuePair<string, JsonValue>(key, v));
     }
 
-    // 便捷取值：key 存在且类型匹配才返回 true
+    // Convenience getters: return true only when the key exists and the type matches
     public bool TryGetString(string key, out string value)
     {
         JsonValue? p = Find(key);
@@ -216,7 +222,8 @@ public sealed class JsonValue
                 }
                 else if ((double)_intVal == _num)
                 {
-                    // double 恰好是整数值时按整数输出，避免 long 型字段收到浮点形状
+                    // double that happens to be integral is output as an integer, so long
+                    // fields never receive a float shape
                     sb.Append(_intVal.ToString(CultureInfo.InvariantCulture));
                 }
                 else
@@ -284,8 +291,9 @@ public sealed class JsonValue
                     }
                     else
                     {
-                        // 非 ASCII 直接按 UTF-16 char 输出（C# string 即 UTF-16，
-                        // 写文件/发网络时统一由 UTF-8 编码，原文保留、不做 ASCII 转义）
+                        // Non-ASCII is output directly as a UTF-16 char (C# string is UTF-16;
+                        // writing files / sending over the network uniformly uses UTF-8
+                        // encoding, preserving the original text with no ASCII escaping)
                         sb.Append(c);
                     }
 
@@ -300,15 +308,15 @@ public sealed class JsonValue
     {
         if (double.IsNaN(v) || double.IsInfinity(v))
         {
-            sb.Append("null"); // JSON 无 NaN/Inf
+            sb.Append("null"); // JSON has no NaN/Inf
             return;
         }
 
-        // G17 等价于 C 的 %.17g（17 位有效数字，往返无损）
+        // G17 is equivalent to C's %.17g (17 significant digits, lossless round-trip)
         string s = v.ToString("G17", CultureInfo.InvariantCulture);
         if (s.IndexOfAny(new[] { '.', 'e', 'E' }) < 0)
         {
-            s += ".0"; // 确保带小数/指数点，避免被当成整数解析
+            s += ".0"; // ensure a decimal/exponent point so it is not parsed as an integer
         }
 
         sb.Append(s);
@@ -318,8 +326,8 @@ public sealed class JsonValue
 public static class Json
 {
     /// <summary>
-    /// 解析失败返回 false，错误原因经可选的 out 参数输出。
-    /// 对 fastjson2 的非标准写法宽容，见类注释。
+    /// Returns false on parse failure, with the error reason written through the optional out
+    /// parameter. Lenient toward fastjson2's non-standard forms; see the class comment.
     /// </summary>
     public static bool TryParse(string text, out JsonValue value, out string? error)
     {
@@ -341,7 +349,7 @@ public static class Json
         return true;
     }
 
-    /// <summary>解析失败抛异常版本（内部便利方法）。</summary>
+    /// <summary>Throwing version of parse failure (internal convenience method).</summary>
     public static JsonValue Parse(string text)
     {
         if (!TryParse(text, out JsonValue v, out string? err))
@@ -417,8 +425,9 @@ public static class Json
                 case 't':
                 case 'f': return ParseLiteral(out value);
                 case 'n': return ParseNull(out value);
-                // fastjson2 在 WriteMapNullValue=false / 浮点越界时会写出这三种非标准字面量，
-                // 标准 JSON 没有它们。
+                // fastjson2 writes these three non-standard literals when
+                // WriteMapNullValue=false / floating point goes out of range; standard JSON
+                // has none of them.
                 case 'N': return ParseNonFinite(out value, "NaN", double.NaN);
                 case 'I': return ParseNonFinite(out value, "Infinity", double.PositiveInfinity);
                 case '-':
@@ -525,7 +534,7 @@ public static class Json
             return true;
         }
 
-        /// <summary>解析带引号字符串；\uXXXX 转 UTF-16（含代理对，C# string 天然是 UTF-16）。</summary>
+        /// <summary>Parses a quoted string; \uXXXX to UTF-16 (including surrogate pairs; a C# string is naturally UTF-16).</summary>
         private bool ParseString(out string value)
         {
             value = string.Empty;
@@ -573,7 +582,7 @@ public static class Json
                             return false;
                         }
 
-                        // 代理对处理
+                        // surrogate pair handling
                         if (cp >= 0xD800 && cp <= 0xDBFF && _pos + 2 <= _s.Length &&
                             _s[_pos] == '\\' && _s[_pos + 1] == 'u')
                         {
@@ -591,7 +600,7 @@ public static class Json
 
                         if (cp is >= 0xD800 and <= 0xDFFF)
                         {
-                            // 孤立代理：按原样放回（C# string 允许）
+                            // lone surrogate: put it back as-is (C# string allows it)
                             sb.Append(unchecked((char)cp));
                         }
                         else
@@ -641,10 +650,12 @@ public static class Json
         }
 
         /// <summary>
-        /// 宽容读取键名，覆盖 fastjson2 的两种非标准写法：
-        ///   1) 无引号数字键：{"offsetTable":{0:1,1:2}}；
-        ///   2) 对象/数组作为 map 键（非法 JSON，管理端必现）：MessageQueue 会被内联。
-        /// 内联键保留**原始 JSON 文本**作为键名，调用方再用 ParseMessageQueueKey() 还原。
+        /// Lenient key parsing, covering fastjson2's two non-standard forms:
+        ///   1) unquoted numeric keys: {"offsetTable":{0:1,1:2}};
+        ///   2) objects/arrays as map keys (invalid JSON, always present in admin bodies):
+        ///      MessageQueue is inlined.
+        /// Inline keys keep the **original JSON text** as the key name; callers restore it via
+        /// ParseMessageQueueKey().
         /// </summary>
         private bool ParseKey(out string key)
         {
@@ -668,7 +679,8 @@ public static class Json
                 return true;
             }
 
-            // 无引号：读到冒号或空白前（数字键 / true / false / null 等裸字面量）
+            // unquoted: read until a colon or whitespace (numeric keys / true / false / null
+            // and other bare literals)
             int keyStart = _pos;
             while (_pos < _s.Length)
             {
@@ -736,7 +748,7 @@ public static class Json
                     if (Peek == '}')
                     {
                         _pos++;
-                        return true; // 容忍尾随逗号
+                        return true; // tolerate a trailing comma
                     }
 
                     continue;
@@ -786,7 +798,7 @@ public static class Json
                     if (Peek == ']')
                     {
                         _pos++;
-                        return true; // 容忍尾随逗号
+                        return true; // tolerate a trailing comma
                     }
 
                     continue;

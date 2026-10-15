@@ -14,7 +14,7 @@ from client.top_addressing import DefaultTopAddressing, clear_new_line
 # ------------------------------------------------------------------ mock server
 
 class _MockAddrServer:
-    """极简地址服务器：可编程返回状态码与响应体。"""
+    """A minimal address server: returns a programmable status code and response body."""
 
     def __init__(self):
         self.status = 200
@@ -40,7 +40,7 @@ class _MockAddrServer:
                 self.end_headers()
                 self.wfile.write(body)
 
-            def log_message(self, *args):  # 静音
+            def log_message(self, *args):  # silence
                 pass
 
         return H
@@ -58,11 +58,11 @@ def addr_server():
 
 
 def _top_for(server: _MockAddrServer, **kw) -> DefaultTopAddressing:
-    """指向 mock server 的 TopAddressing（domain 带端口 → 不追加 :8080）。"""
+    """A TopAddressing pointing at the mock server (domain carries the port -> :8080 is not appended)."""
     return DefaultTopAddressing(domain="127.0.0.1:%d" % server.port, **kw)
 
 
-# ------------------------------------------------------------------ URL 构造
+# ------------------------------------------------------------------ URL construction
 
 class TestWsAddr:
     def test_default_port_appended(self):
@@ -121,14 +121,14 @@ class TestClearNewLine:
         assert clear_new_line("\r\n") == ""
 
 
-# ------------------------------------------------------------------ 取址行为
+# ------------------------------------------------------------------ Address-fetching behavior
 
 class TestFetchNsAddr:
     def test_200_returns_body(self, addr_server):
         addr_server.body = "10.0.0.1:9876;10.0.0.2:9876\nextra"
         ta = _top_for(addr_server)
         assert ta.fetch_ns_addr(verbose=False) == "10.0.0.1:9876;10.0.0.2:9876"
-        # URL 走的是 /rocketmq/<subgroup>
+        # the URL goes to /rocketmq/<subgroup>
         assert addr_server.hit_paths[0].startswith("/rocketmq/nsaddr")
 
     def test_non_200_returns_none(self, addr_server):
@@ -141,7 +141,7 @@ class TestFetchNsAddr:
         assert ta.fetch_ns_addr(verbose=False) is None
 
     def test_no_domain_means_disabled(self):
-        ta = DefaultTopAddressing()          # 未给 domain、env 未设
+        ta = DefaultTopAddressing()          # no domain given, env unset
         assert ta.ws_addr == ""
         assert ta.fetch_ns_addr() is None
 
@@ -153,10 +153,10 @@ class TestFetchNsAddr:
 class TestFetchAndApply:
     def test_applies_change_only(self, addr_server):
         ta = _top_for(addr_server)
-        assert ta.fetch_and_apply() == "127.0.0.1:9876"      # 第一次：变化 → 应用
-        assert ta.fetch_and_apply() is None                  # 第二次：相同 → 不应用
+        assert ta.fetch_and_apply() == "127.0.0.1:9876"      # first time: changed -> applied
+        assert ta.fetch_and_apply() is None                  # second time: same -> not applied
         addr_server.body = "10.0.0.9:9876"
-        assert ta.fetch_and_apply() == "10.0.0.9:9876"       # 变了 → 应用
+        assert ta.fetch_and_apply() == "10.0.0.9:9876"       # changed -> applied
 
     def test_blank_body_not_applied(self, addr_server):
         addr_server.body = "   "
@@ -164,7 +164,7 @@ class TestFetchAndApply:
         assert ta.fetch_and_apply() is None
 
 
-# ------------------------------------------------------------------ 实例集成
+# ------------------------------------------------------------------ Instance integration
 
 class TestMQClientInstanceIntegration:
     def test_start_with_static_addrs_never_fetches(self, addr_server):
@@ -173,7 +173,7 @@ class TestMQClientInstanceIntegration:
         mqc.top_addressing = ta
         mqc.start()
         try:
-            assert addr_server.hit_paths == []               # 配了静态地址就不该问地址服务器
+            assert addr_server.hit_paths == []               # with static addresses configured it must not ask the address server
         finally:
             mqc.shutdown()
 
@@ -208,13 +208,13 @@ class TestMQClientInstanceIntegration:
             mqc.shutdown()
 
 
-# ------------------------------------------------------------------ 消费者守卫
+# ------------------------------------------------------------------ Consumer guard
 
 class TestConsumerGuard:
     def test_empty_addrs_rejected_without_domain(self, monkeypatch):
         monkeypatch.delenv("ROCKETMQ_NAMESRV_DOMAIN", raising=False)
         c = DefaultMQPushConsumer("GID_DynNsUnit")
-        c.subscription_data = {"T": None}  # 只为让守卫先卡在地址上
+        c.subscription_data = {"T": None}  # only to make the guard trip on the address first
         with pytest.raises(Exception, match="name server address"):
             c.start()
 
@@ -222,7 +222,7 @@ class TestConsumerGuard:
         monkeypatch.setenv("ROCKETMQ_NAMESRV_DOMAIN", "127.0.0.1:%d" % addr_server.port)
         c = DefaultMQPushConsumer("GID_DynNsUnit")
         c.name_server_addrs = []
-        # 守卫放行后走到 MQClientInstance.start：地址服务器返回的地址可用 → 不抛
+        # after the guard lets it through it reaches MQClientInstance.start: the address returned by the address server is usable -> no throw
         mqc = MQClientInstance("c@guardenv", [])
         mqc.top_addressing = DefaultTopAddressing()
         mqc.start()

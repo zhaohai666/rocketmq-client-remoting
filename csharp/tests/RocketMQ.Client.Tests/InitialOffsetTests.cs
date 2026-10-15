@@ -1,9 +1,11 @@
-// 报文层面不取巧：进程内假 namesrv/broker 在**真 socket** 上回路由、回"没有已提交位点"、
-// 回拉取应答；「这个 RPC 到底发没发」全部从 socket 上取证。负控腿（LAST_OFFSET 那一支必须
-// 发 GET_MAX_OFFSET）证明这份请求日志不是哑的。
+// No cutting corners at the message level: in-process fake namesrv/broker answer routes,
+// "no committed offset" and pull responses over **real sockets**, and "was this RPC
+// actually sent" is evidenced off the socket throughout. The negative-control leg (the
+// LAST_OFFSET branch must send GET_MAX_OFFSET) proves this request log is not mute.
 //
-// 锁死这条不变式：lite 首偏移从 0 起且不发 GET_MIN_OFFSET；
-// push 那条腿在这里多补一份（订阅模式走的是 Consumer.cs 的 ResolveInitialOffset）。
+// This pins the invariant: the lite initial offset starts at 0 and sends no
+// GET_MIN_OFFSET; the push leg adds one more case here (subscription mode goes through
+// Consumer.cs's ResolveInitialOffset).
 using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
@@ -12,7 +14,7 @@ using RocketMQ.Common;
 using RocketMQ.Remoting;
 using RocketMQ.Remoting.Protocol;
 using Xunit;
-// PropertyMap 是 src 侧的 global using 别名（SortedDictionary<string,string>），测试项目要显式声明。
+// PropertyMap is a global using alias on the src side (SortedDictionary<string,string>), so the test project has to declare it explicitly.
 using PropertyMap = System.Collections.Generic.SortedDictionary<string, string>;
 
 namespace RocketMQ.Client.Tests;
@@ -25,23 +27,26 @@ public class InitialOffsetTests
 
     private static MessageQueue Queue0() => new(Topic, Broker, 0);
 
-    // ---------------------------------------------------------------- 假端点
+    // ---------------------------------------------------------------- Fake endpoints
 
-    /// <summary>一笔到达的请求：码 + extFields 快照。</summary>
+    /// <summary>An arriving request: the code plus an extFields snapshot.</summary>
     private sealed record WireReq(int Code, PropertyMap Ext);
 
     /// <summary>
-    /// 假 namesrv + 假 broker（同一具壳）：回路由、回"这位点没提交过"、回拉取应答，
-    /// 并把每一笔请求按到达顺序记账。GET_MIN_OFFSET / GET_MAX_OFFSET **照常应答**
-    /// —— 应答了才谈得上"客户端自己选择不发"，否则测的是"发了也没人理"。
+    /// A fake namesrv plus a fake broker (the same shell): answers routes, answers "this
+    /// offset was never committed" and answers pull requests, and records every request
+    /// in arrival order. GET_MIN_OFFSET / GET_MAX_OFFSET are **answered as usual** --
+    /// only after they are answered can one talk about "the client chose not to send it",
+    /// otherwise what is being measured is "it sent it and nobody cared".
     /// </summary>
     private sealed class OffsetEndpoint : IDisposable
     {
         private readonly object _gate = new();
         private readonly List<WireReq> _reqs = new();
         private readonly Socket _listener;
-        /// <summary>从心跳（34）body 里认下的 clientID。rebalance 要靠它把自己排进 cidAll，
-        /// 否则这台消费者一个队列都分不到、永远不会发拉取（pull 腿就白测了）。</summary>
+        /// <summary>The clientID recognised from the heartbeat (34) body. Rebalance needs
+        /// it to place itself in cidAll, otherwise this consumer gets not a single queue,
+        /// never pulls, and the pull leg would be testing nothing.</summary>
         private string _clientId = string.Empty;
 
         public string Addr { get; }
@@ -69,7 +74,8 @@ public class InitialOffsetTests
             }
         }
 
-        /// <summary>按到达顺序的全部请求码 —— 失败信息里带一份，省得为一个假端点再起一次调试。</summary>
+        /// <summary>All request codes in arrival order -- carried in the failure message so
+        /// there is no need to spin up another debug session for a fake endpoint.</summary>
         public List<int> Codes()
         {
             lock (_gate)
@@ -86,7 +92,7 @@ public class InitialOffsetTests
             }
             catch (Exception)
             {
-                // 关监听端口不需要处理异常
+                // Closing the listening port needs no exception handling
             }
         }
 
@@ -101,7 +107,7 @@ public class InitialOffsetTests
                 }
                 catch (Exception)
                 {
-                    return;  // Dispose 之后 Accept 必抛，正常收工
+                    return;  // after Dispose, Accept necessarily throws, this is a normal shutdown
                 }
 
                 new Thread(() =>
@@ -114,7 +120,7 @@ public class InitialOffsetTests
                         }
                         catch (Exception)
                         {
-                            // 半路断连 / 解码失败：丢掉这条连接即可
+                            // A mid-stream disconnect / decode failure: just drop this connection
                         }
                     }
                 })
@@ -154,7 +160,7 @@ public class InitialOffsetTests
                 RemotingCommand? resp = Respond(req);
                 if (resp is null)
                 {
-                    continue;  // oneway 没有应答可写
+                    continue;  // oneway has no response to write
                 }
 
                 byte[] wire = resp.Encode();
@@ -171,7 +177,7 @@ public class InitialOffsetTests
 
             if (req.Code == RequestCode.HeartBeat && req.Body.Length > 0)
             {
-                // 心跳 body 里的 clientID 就是这台消费者的身份：rebalance 拿它跟 cidAll 对齐
+                // The clientID in the heartbeat body is this consumer's identity: rebalance uses it to line up with cidAll
                 if (HeartbeatData.Decode(req.Body, out HeartbeatData hb) && hb.ClientId.Length > 0)
                 {
                     lock (_gate)
@@ -197,7 +203,7 @@ public class InitialOffsetTests
 
             if (req.Code == RequestCode.GetConsumerListByGroup && !req.IsOnewayRpc())
             {
-                // rebalance 的第一步：这台消费者必须在名单里，否则分不到队列、也就不会拉取
+                // The first step of rebalance: this consumer must be in the list, otherwise it gets no queues and never pulls
                 string clientId;
                 lock (_gate)
                 {
@@ -219,7 +225,7 @@ public class InitialOffsetTests
 
             if (req.Code == RequestCode.QueryConsumerOffset && !req.IsOnewayRpc())
             {
-                // 新组：broker 上没有已提交位点 —— 正是 FIRST_OFFSET 分支要处理的局面
+                // A new group: no committed offset on the broker -- exactly the situation the FIRST_OFFSET branch handles
                 return Echo(req, ResponseCode.QueryNotFound, "mock: no committed offset");
             }
 
@@ -231,12 +237,13 @@ public class InitialOffsetTests
                 return offsetResp;
             }
 
-            // lite 消费者的拉取走 361，经典拉取走 11（#107）；断言只挑 11，
-            // 所以这里两种码都必须答，否则 lite 的游标根本推不动。
+            // A lite consumer pulls with 361 and a classic pull with 11 (#107); the
+            // assertion only picks 11, so both codes must be answered here, otherwise the
+            // lite cursor cannot advance at all.
             if (req.Code is RequestCode.PullMessage or RequestCode.LitePullMessage
                 && !req.IsOnewayRpc())
             {
-                // 立刻回"这轮没有新消息"：断言只看请求头里的 queueOffset，不看应答语义。
+                // Immediately answers "no new messages this round": the assertion only looks at queueOffset in the request header, not at the response semantics.
                 RemotingCommand pullResp = Echo(req, ResponseCode.PullNotFound, null);
                 pullResp.AddExtField("nextBeginOffset", "0");
                 pullResp.AddExtField("minOffset", "0");
@@ -244,7 +251,7 @@ public class InitialOffsetTests
                 return pullResp;
             }
 
-            // 心跳 / 提交位点之类一律成功，别让后台线程卡在错误上
+            // Heartbeats / offset commits and the like always succeed, do not let the background thread get stuck on an error
             return req.IsOnewayRpc() ? null : Echo(req, ResponseCode.Success, null);
         }
 
@@ -260,7 +267,7 @@ public class InitialOffsetTests
         private static RemotingCommand Echo(RemotingCommand req, int code, string? remark)
         {
             var resp = RemotingCommand.CreateResponseCommand(code, remark);
-            // 客户端按 opaque 配对，串了的响应会被当噪声丢掉
+            // The client pairs by opaque, a cross-wired response is dropped as noise
             resp.Opaque = req.Opaque;
             resp.SerializeTypeCurrentRpc = req.SerializeTypeCurrentRpc;
             return resp;
@@ -314,14 +321,16 @@ public class InitialOffsetTests
             => ConsumeConcurrentlyStatus.ConsumeSuccess;
     }
 
-    // ---------------------------------------------------------------- 用例
+    // ---------------------------------------------------------------- Cases
 
     /// <summary>
-    /// 轻量拉取：FIRST_OFFSET 的起点是字面量 0，第一笔拉取就带着 queueOffset=0 上线，
-    /// 全程一个 GET_MIN_OFFSET 都不发。
+    /// Lite pull: the FIRST_OFFSET start is the literal 0, the very first pull goes on
+    /// the wire already carrying queueOffset=0, and not a single GET_MIN_OFFSET is sent
+    /// the whole way.
     ///
-    /// 负控腿是「LAST_OFFSET 要发 GET_MAX_OFFSET」：没有它，把整段分支删掉（改成起点恒 0
-    /// 且不查任何 offset）也能让主断言变绿。
+    /// The negative-control leg is "LAST_OFFSET must send GET_MAX_OFFSET": without it,
+    /// deleting that whole branch (making the start always 0 and querying no offset at
+    /// all) would still turn the main assertion green.
     /// </summary>
     [Fact]
     public void LitePullFirstOffsetStartsAtZeroWithoutAMinOffsetRpc()
@@ -336,7 +345,7 @@ public class InitialOffsetTests
         try
         {
             Assert.True(WaitFor(() => ep.Requests(RequestCode.LitePullMessage).Count > 0, TimeSpan.FromSeconds(5)),
-                "FIRST_OFFSET 的 lite-pull 必须真的发出第一笔拉取（LITE_PULL_MESSAGE=361）");
+                "the FIRST_OFFSET lite-pull must really send the first pull (LITE_PULL_MESSAGE=361)");
             List<WireReq> pulls = ep.Requests(RequestCode.LitePullMessage);
             Assert.Equal("0", pulls[0].Ext["queueOffset"]);
             Assert.Empty(ep.Requests(RequestCode.GetMinOffset));
@@ -346,7 +355,7 @@ public class InitialOffsetTests
             first.Shutdown();
         }
 
-        // 负控：默认的 LAST_OFFSET 走 maxOffset —— 证明这份请求日志不是哑的
+        // Negative control: the default LAST_OFFSET goes through maxOffset -- proving this request log is not mute
         var last = new DefaultLitePullConsumer("LitePG_InitLast");
         last.SetNamesrvAddr(ep.Addr);
         last.Assign(new[] { Queue0() });
@@ -354,7 +363,7 @@ public class InitialOffsetTests
         try
         {
             Assert.True(WaitFor(() => ep.Requests(RequestCode.GetMaxOffset).Count > 0, TimeSpan.FromSeconds(5)),
-                "LAST_OFFSET 的 lite-pull 必须发 GET_MAX_OFFSET");
+                "the LAST_OFFSET lite-pull must send GET_MAX_OFFSET");
         }
         finally
         {
@@ -365,8 +374,9 @@ public class InitialOffsetTests
     }
 
     /// <summary>
-    /// 推送消费者同形场景（订阅模式走的是 Consumer.cs 的 ResolveInitialOffset）：新组没有已提交
-    /// 位点时，起点 0 直接上线，不发 GET_MIN_OFFSET。
+    /// The same scenario for a push consumer (subscription mode goes through
+    /// Consumer.cs's ResolveInitialOffset): when a new group has no committed offset,
+    /// the start 0 goes on the wire directly and no GET_MIN_OFFSET is sent.
     /// </summary>
     [Fact]
     public void PushConsumerFirstOffsetStartsAtZeroWithoutAMinOffsetRpc()
@@ -384,7 +394,7 @@ public class InitialOffsetTests
         try
         {
             Assert.True(WaitFor(() => ep.Requests(RequestCode.PullMessage).Count > 0, TimeSpan.FromSeconds(10)),
-                "FIRST_OFFSET 的 push 消费者必须真的发出第一笔拉取；已到达的请求码："
+                "the FIRST_OFFSET push consumer must really send the first pull; request codes that arrived:"
                 + string.Join(",", ep.Codes()));
             List<WireReq> pulls = ep.Requests(RequestCode.PullMessage);
             Assert.Equal("0", pulls[0].Ext["queueOffset"]);
@@ -395,7 +405,7 @@ public class InitialOffsetTests
             first.Shutdown();
         }
 
-        // 负控：LAST_OFFSET 那一支该发 maxOffset
+        // Negative control: the LAST_OFFSET branch should send maxOffset
         var last = new DefaultMQPushConsumer("CG_InitLast");
         last.SetNamesrvAddr(ep.Addr);
         last.Subscribe(Topic, "*");
@@ -404,7 +414,7 @@ public class InitialOffsetTests
         try
         {
             Assert.True(WaitFor(() => ep.Requests(RequestCode.GetMaxOffset).Count > 0, TimeSpan.FromSeconds(10)),
-                "LAST_OFFSET 的 push 消费者必须发 GET_MAX_OFFSET");
+                "the LAST_OFFSET push consumer must send GET_MAX_OFFSET");
         }
         finally
         {

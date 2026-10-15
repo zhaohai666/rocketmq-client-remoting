@@ -1,11 +1,11 @@
-// 覆盖：
-// 1. 阈值表逐档映射（0→0、50→0、550→2000、1800→5000、5000→10000、15000→30000、10000→10000）；
-// 2. 隔离（isolation=true）固定按 10000ms 算档位；
-// 3. FaultItem.UpdateNotAvailableDuration 只延长不缩短；
-// 4. 容错表无记录 IsAvailable/IsReachable=true；隔离后 false、到期恢复；
-// 5. 策略关闭时不记录任何故障项；
-// 6. 策略开启：隔离 broker 后只选健康 broker；单 broker 注入隔离后退化为普通轮询仍能选出队列；
-// 7. ResetIndex；lastBrokerName 避开语义。
+// Covered:
+// 1. the threshold table's tier-by-tier mapping (0->0, 50->0, 550->2000, 1800->5000, 5000->10000, 15000->30000, 10000->10000);
+// 2. isolation (isolation=true) always computes its tier as 10000ms;
+// 3. FaultItem.UpdateNotAvailableDuration only extends, never shortens;
+// 4. no entry in the tolerance table means IsAvailable/IsReachable=true; after isolation false, recovered when due;
+// 5. when the strategy is off no fault item is recorded at all;
+// 6. strategy on: after isolating a broker only healthy brokers are chosen; with a single broker, injecting an isolation degrades to plain round-robin and a queue can still be selected;
+// 7. ResetIndex; the avoiding semantics of lastBrokerName.
 using RocketMQ.Common;
 using Xunit;
 
@@ -25,7 +25,7 @@ public class LatencyTests
         return tp;
     }
 
-    // ------------------------------------------------ 阈值表逐档映射
+    // ------------------------------------------------ The threshold table's tier-by-tier mapping
     [Theory]
     [InlineData(0, 0)]
     [InlineData(49.9, 0)]
@@ -54,7 +54,7 @@ public class LatencyTests
         FaultItem? item = s.LatencyFaultTolerance.GetFaultItem("broker-a");
         Assert.NotNull(item);
         Assert.Equal(12.0, item!.CurrentLatency);
-        // 隔离档位固定 10000ms -> startTimestamp = now + 10000，立即不可用
+        // the isolation tier is fixed at 10000ms -> startTimestamp = now + 10000, immediately unavailable
         Assert.False(s.LatencyFaultTolerance.IsAvailable("broker-a"));
         Assert.False(s.LatencyFaultTolerance.IsReachable("broker-a"));
     }

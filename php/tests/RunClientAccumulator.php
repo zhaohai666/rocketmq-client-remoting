@@ -2,18 +2,21 @@
 
 declare(strict_types=1);
 
-// 先装 autoloader，再判 SendResult 是否已由并行子任务落地 —— 顺序不能反，否则真实类缺席时
-// 会误判并声明替身，导致稍后真实文件被 require 时 "name is already in use"。
+// install the autoloader first, then check whether SendResult has already landed from the parallel
+// subtask — the order must not be reversed, otherwise a missing real class is misjudged and a stub
+// gets declared, causing "name is already in use" when the real file is required later.
 namespace {
     require_once __DIR__ . '/../bootstrap.php';
 }
 
 // ============================================================================================
-// SendResult 兜底定义（仅当并行子任务尚未落地 php/src/Client/SendResult.php 时生效）。
+// SendResult fallback definition (only effective while the parallel subtask has not yet landed php/src/Client/SendResult.php).
 //
-// 按约定本文件**不**创建 php/src/Client/SendResult.php：那是并行子任务的产物。这里只是在
-// 自测运行时，若真实类缺席，补一个同形状（构造器参数顺序 + camelCase 公有属性）的
-// 替身，好让本套件在当前工作区也能独立跑通；真实类一旦落地，class_exists 命中，本替身自动失效。
+// By convention this file does **not** create php/src/Client/SendResult.php: that belongs to the
+// parallel subtask. This only patches in a same-shaped stub (constructor parameter order + camelCase
+// public properties) at self-test runtime if the real class is absent, so the suite also runs
+// standalone in the current workspace; once the real class lands, class_exists hits and this stub
+// becomes inert automatically.
 // ============================================================================================
 namespace RocketMQ\Client {
     if (!class_exists(\RocketMQ\Client\SendResult::class)) {
@@ -70,12 +73,13 @@ namespace {
     use RocketMQ\Common\MessageQueue;
 
     /**
-     * ProduceAccumulator（自动攒批）纯 PHP assert 风格自测（不依赖 phpunit，不连真机）。
+     * ProduceAccumulator (auto batching) pure-PHP assert-style self test (no phpunit, no real cluster).
      *
-     * 运行：C:/Users/zhaoh/.workbuddy/binaries/php/versions/8.3/php.exe tests/RunClientAccumulator.php
-     * 全部通过输出 "ALL TESTS PASSED (N checks)"，任一失败列出明细并以非零码退出。
+     * Run: C:/Users/zhaoh/.workbuddy/binaries/php/versions/8.3/php.exe tests/RunClientAccumulator.php
+     * On success prints "ALL TESTS PASSED (N checks)"; any failure lists details and exits non-zero.
      *
-     * 单线程适配：后台守卫线程 → 显式 pump（tick/flush/flushAll）；"当前时间"与发送函数都注入。
+     * Single-thread adaptation: background guard thread -> explicit pump (tick/flush/flushAll);
+     * "current time" and the send function are both injected.
      */
     final class RunClientAccumulator
     {
@@ -146,7 +150,7 @@ namespace {
                 : null;
         }
 
-        /** 注入的假发送函数：记账 + 按配置回一份批量 SendResult（含可选的失败） */
+        /** Injected fake send function: bookkeeping + returns a batch SendResult per config (with optional failure) */
         private function fakeSender(
             string $msgIds = 'single-id',
             string $offsetIds = 'off-single',
@@ -161,7 +165,7 @@ namespace {
             return fn(): int => $this->now;
         }
 
-        // ==================================================================== 归并键
+        // ==================================================================== aggregate key
 
         private function testAggregateKeyEqualityAndHash(): void
         {
@@ -170,138 +174,138 @@ namespace {
 
             $k1 = AggregateKey::ofMessage($m);
             $k2 = AggregateKey::ofMessage($same);
-            $this->check($k1->equals($k2), 'AggregateKey: 同 topic/tag 相等');
-            $this->checkSame($k1->keyString(), $k2->keyString(), 'AggregateKey: 相等的键 keyString 相同');
+            $this->check($k1->equals($k2), 'AggregateKey: same topic/tag are equal');
+            $this->checkSame($k1->keyString(), $k2->keyString(), 'AggregateKey: equal keys have the same keyString');
 
             $otherTag = AggregateKey::ofMessage(new Message('TopicA', 'y', 'TagB'));
-            $this->check(!$k1->equals($otherTag), 'AggregateKey: tag 不同不相等');
-            $this->check($k1->keyString() !== $otherTag->keyString(), 'AggregateKey: tag 不同 keyString 不同');
+            $this->check(!$k1->equals($otherTag), 'AggregateKey: different tag not equal');
+            $this->check($k1->keyString() !== $otherTag->keyString(), 'AggregateKey: different tag different keyString');
 
             $otherTopic = AggregateKey::ofMessage(new Message('TopicB', 'y', 'TagA'));
-            $this->check(!$k1->equals($otherTopic), 'AggregateKey: topic 不同不相等');
-            $this->check($k1->keyString() !== $otherTopic->keyString(), 'AggregateKey: topic 不同 keyString 不同');
+            $this->check(!$k1->equals($otherTopic), 'AggregateKey: different topic not equal');
+            $this->check($k1->keyString() !== $otherTopic->keyString(), 'AggregateKey: different topic different keyString');
 
-            // 指定 mq 与不指定 mq 不合并
+            // specifying mq vs not specifying mq does not merge
             $mq = new MessageQueue('TopicA', 'broker-a', 0);
             $withMq = AggregateKey::ofMessageWithMq($m, $mq);
-            $this->check(!$k1->equals($withMq), 'AggregateKey: 带 mq 与不带 mq 不相等');
-            $this->check($k1->keyString() !== $withMq->keyString(), 'AggregateKey: 带/不带 mq keyString 不同');
+            $this->check(!$k1->equals($withMq), 'AggregateKey: with mq and without mq not equal');
+            $this->check($k1->keyString() !== $withMq->keyString(), 'AggregateKey: with/without mq different keyString');
             $withMq2 = AggregateKey::ofMessageWithMq($same, new MessageQueue('TopicA', 'broker-a', 0));
-            $this->check($withMq->equals($withMq2), 'AggregateKey: 同 mq 相等（MessageQueue.equals）');
-            $this->checkSame($withMq->keyString(), $withMq2->keyString(), 'AggregateKey: 同 mq keyString 相同');
-            $this->check(!$withMq->equals(AggregateKey::ofMessageWithMq($m, new MessageQueue('TopicA', 'broker-a', 1))), 'AggregateKey: queueId 不同不相等');
+            $this->check($withMq->equals($withMq2), 'AggregateKey: same mq equal (MessageQueue.equals)');
+            $this->checkSame($withMq->keyString(), $withMq2->keyString(), 'AggregateKey: same mq same keyString');
+            $this->check(!$withMq->equals(AggregateKey::ofMessageWithMq($m, new MessageQueue('TopicA', 'broker-a', 1))), 'AggregateKey: different queueId not equal');
 
-            // 空 tag（""）与缺省 tag（null）不是一回事（构造器会把 "" 折叠成缺省，故显式 setTags("")）
+            // empty tag ("") and absent tag (null) are not the same thing (the constructor folds "" into absent, hence the explicit setTags(""))
             $nullTag = AggregateKey::ofMessage(new Message('TopicA', 'x'));
             $emptyMsg = new Message('TopicA', 'x');
             $emptyMsg->setTags('');
             $emptyTag = AggregateKey::ofMessage($emptyMsg);
-            $this->check(!$nullTag->equals($emptyTag), 'AggregateKey: tag=null 与 tag="" 不相等');
-            $this->check($nullTag->keyString() !== $emptyTag->keyString(), 'AggregateKey: tag=null 与 tag="" keyString 不同');
+            $this->check(!$nullTag->equals($emptyTag), 'AggregateKey: tag=null and tag="" not equal');
+            $this->check($nullTag->keyString() !== $emptyTag->keyString(), 'AggregateKey: tag=null and tag="" different keyString');
 
-            // waitStoreMsgOK 参与分区；且"没设过 WAIT"缺省即 true
+            // waitStoreMsgOK participates in partitioning; and "WAIT never set" defaults to true
             $w = new Message('TopicA', 'x', 'TagA');
             $w->setWaitStoreMsgOk(false);
             $kW = AggregateKey::ofMessage($w);
-            $this->check(!$k1->equals($kW), 'AggregateKey: waitStoreMsgOK 不同不相等');
+            $this->check(!$k1->equals($kW), 'AggregateKey: different waitStoreMsgOK not equal');
             $plain = new Message('TopicA', 'x', 'TagA');
-            $this->checkSame(null, $plain->getWaitStoreMsgOk(), '普通消息未写 WAIT 属性');
-            $this->checkSame(true, AggregateKey::ofMessage($plain)->waitStoreMsgOk, 'AggregateKey: WAIT 缺省即 true');
-            $this->checkSame(true, AggregateKey::ofMessageWithMq($plain, $mq)->waitStoreMsgOk, 'ofMessageWithMq 的 WAIT 缺省即 true');
+            $this->checkSame(null, $plain->getWaitStoreMsgOk(), 'normal message has no WAIT property written');
+            $this->checkSame(true, AggregateKey::ofMessage($plain)->waitStoreMsgOk, 'AggregateKey: WAIT defaults to true');
+            $this->checkSame(true, AggregateKey::ofMessageWithMq($plain, $mq)->waitStoreMsgOk, 'ofMessageWithMq WAIT defaults to true');
         }
 
-        // ==================================================================== 参数与闸门
+        // ==================================================================== params and byte gate
 
         private function testParamsAndByteGate(): void
         {
             $acc = new ProduceAccumulator('params', $this->fakeSender(), $this->clock());
-            $this->checkSame(10, $acc->getBatchMaxDelayMs(), '默认 holdMs=10');
-            $this->checkSame(32 * 1024, $acc->getBatchMaxBytes(), '默认 holdSize=32KB');
-            $this->checkSame(32 * 1024 * 1024, $acc->getTotalHoldSize(), '默认 totalHoldSize=32MB');
-            // getTotalBatchMaxBytes 实际返回 holdSize（沿用这一已知行为，勿改）
-            $this->checkSame(32 * 1024, $acc->getTotalBatchMaxBytes(), 'getTotalBatchMaxBytes 返回 holdSize');
-            $this->checkSame(0, $acc->currentlyHoldSize(), '初始 currentlyHoldSize=0');
+            $this->checkSame(10, $acc->getBatchMaxDelayMs(), 'default holdMs=10');
+            $this->checkSame(32 * 1024, $acc->getBatchMaxBytes(), 'default holdSize=32KB');
+            $this->checkSame(32 * 1024 * 1024, $acc->getTotalHoldSize(), 'default totalHoldSize=32MB');
+            // getTotalBatchMaxBytes actually returns holdSize (keep this known behavior, do not change)
+            $this->checkSame(32 * 1024, $acc->getTotalBatchMaxBytes(), 'getTotalBatchMaxBytes returns holdSize');
+            $this->checkSame(0, $acc->currentlyHoldSize(), 'initial currentlyHoldSize=0');
 
             $acc->batchMaxDelayMs(1);
-            $this->checkSame(1, $acc->getBatchMaxDelayMs(), 'batchMaxDelayMs 下界 1 生效');
+            $this->checkSame(1, $acc->getBatchMaxDelayMs(), 'batchMaxDelayMs lower bound 1 effective');
             $acc->batchMaxDelayMs(30 * 1000);
-            $this->checkSame(30 * 1000, $acc->getBatchMaxDelayMs(), 'batchMaxDelayMs 上界 30s 生效');
-            $this->checkThrows(fn() => $acc->batchMaxDelayMs(0), \InvalidArgumentException::class, 'batchMaxDelayMs(0) 抛异常');
-            $this->checkThrows(fn() => $acc->batchMaxDelayMs(30 * 1000 + 1), \InvalidArgumentException::class, 'batchMaxDelayMs(>30s) 抛异常');
+            $this->checkSame(30 * 1000, $acc->getBatchMaxDelayMs(), 'batchMaxDelayMs upper bound 30s effective');
+            $this->checkThrows(fn() => $acc->batchMaxDelayMs(0), \InvalidArgumentException::class, 'batchMaxDelayMs(0) throws');
+            $this->checkThrows(fn() => $acc->batchMaxDelayMs(30 * 1000 + 1), \InvalidArgumentException::class, 'batchMaxDelayMs(>30s) throws');
 
             $acc->batchMaxBytes(1);
             $acc->batchMaxBytes(2 * 1024 * 1024);
-            $this->checkSame(2 * 1024 * 1024, $acc->getBatchMaxBytes(), 'batchMaxBytes 上界 2MB 生效');
-            $this->checkThrows(fn() => $acc->batchMaxBytes(0), \InvalidArgumentException::class, 'batchMaxBytes(0) 抛异常');
-            $this->checkThrows(fn() => $acc->batchMaxBytes(2 * 1024 * 1024 + 1), \InvalidArgumentException::class, 'batchMaxBytes(>2MB) 抛异常');
+            $this->checkSame(2 * 1024 * 1024, $acc->getBatchMaxBytes(), 'batchMaxBytes upper bound 2MB effective');
+            $this->checkThrows(fn() => $acc->batchMaxBytes(0), \InvalidArgumentException::class, 'batchMaxBytes(0) throws');
+            $this->checkThrows(fn() => $acc->batchMaxBytes(2 * 1024 * 1024 + 1), \InvalidArgumentException::class, 'batchMaxBytes(>2MB) throws');
 
             $acc->totalBatchMaxBytes(1);
-            $this->checkSame(1, $acc->getTotalHoldSize(), 'totalBatchMaxBytes 生效');
-            $this->checkThrows(fn() => $acc->totalBatchMaxBytes(0), \InvalidArgumentException::class, 'totalBatchMaxBytes(0) 抛异常');
+            $this->checkSame(1, $acc->getTotalHoldSize(), 'totalBatchMaxBytes effective');
+            $this->checkThrows(fn() => $acc->totalBatchMaxBytes(0), \InvalidArgumentException::class, 'totalBatchMaxBytes(0) throws');
 
-            // 全局字节闸门
+            // global byte gate
             $acc->totalBatchMaxBytes(10);
-            $msg10 = new Message('T', '1234567890'); // 10 字节
-            $this->check($acc->tryAddMessage($msg10), '闸门：额度内放行');
-            $this->checkSame(10, $acc->currentlyHoldSize(), '闸门：放行即记账');
-            $this->check(!$acc->tryAddMessage(new Message('T', 'x')), '闸门：额度满拒绝');
-            $this->checkSame(10, $acc->currentlyHoldSize(), '闸门：拒绝后额度不变');
+            $msg10 = new Message('T', '1234567890'); // 10 bytes
+            $this->check($acc->tryAddMessage($msg10), 'gate: within quota accepted');
+            $this->checkSame(10, $acc->currentlyHoldSize(), 'gate: acceptance records the bytes');
+            $this->check(!$acc->tryAddMessage(new Message('T', 'x')), 'gate: quota full rejects');
+            $this->checkSame(10, $acc->currentlyHoldSize(), 'gate: quota unchanged after rejection');
             $acc->releaseHold(10);
-            $this->checkSame(0, $acc->currentlyHoldSize(), '闸门：归还后额度为 0');
-            $this->check($acc->tryAddMessage(new Message('T', 'x')), '闸门：归还后可再放行');
+            $this->checkSame(0, $acc->currentlyHoldSize(), 'gate: quota 0 after release');
+            $this->check($acc->tryAddMessage(new Message('T', 'x')), 'gate: accepted again after release');
             $acc->releaseHold(1);
             $acc->totalBatchMaxBytes(5);
-            $this->check($acc->tryAddMessage(new Message('T', '')), '闸门：空 body 放行');
-            $this->checkSame(0, $acc->currentlyHoldSize(), '闸门：空 body 不记账');
+            $this->check($acc->tryAddMessage(new Message('T', '')), 'gate: empty body accepted');
+            $this->checkSame(0, $acc->currentlyHoldSize(), 'gate: empty body records nothing');
         }
 
-        // ==================================================================== 阈值触发 flush
+        // ==================================================================== threshold-triggered flush
 
         /**
-         * 累积到 holdSize 阈值触发 flush。
+         * Accumulation up to the holdSize threshold triggers flush.
          *
-         * ⚠ 累积器**没有** MaxMessageNum / 条数阈值，只有两条判据：
-         * `messagesSize > holdSize`（本批字节）与 `now >= createTime + holdMs`（时间闸门）。
-         * 因此本套件一律按 holdSize（字节闸门）设期望值，不按条数。
+         * ⚠ The accumulator has **no** MaxMessageNum / count threshold, only two criteria:
+         * `messagesSize > holdSize` (batch bytes) and `now >= createTime + holdMs` (time gate).
+         * So this suite always sets expectations by holdSize (the byte gate), never by count.
          */
         private function testAccumulateToHoldSizeThresholdTriggersFlush(): void
         {
             $sender = $this->fakeSender('id-0,id-1,id-2,id-3', 'off-0,off-1,off-2,off-3', 100);
             $acc = new ProduceAccumulator('threshold', $sender, $this->clock());
-            $acc->batchMaxBytes(16); // 严格大于才 ready：16 不触发，>16 触发
+            $acc->batchMaxBytes(16); // ready only when strictly greater: 16 does not trigger, >16 does
 
             $key = new AggregateKey('T', null, true, null);
             $batch = $acc->getOrCreateSyncBatch($key);
             $msgs = [];
             for ($i = 0; $i < 4; $i++) {
-                $msgs[] = new Message('T', str_repeat('x', 5)); // 每条 5 字节
+                $msgs[] = new Message('T', str_repeat('x', 5)); // 5 bytes each
                 $batch->add($msgs[$i]);
             }
-            // 3 条 15 字节 < 16，不 ready；第 4 条 20 > 16，ready
-            $this->checkSame(20, $batch->messagesSize, '累积后 messagesSize 记账');
-            $this->check($batch->readyToSend(), 'messagesSize > holdSize 触发 readyToSend');
+            // 3 messages 15 bytes < 16, not ready; the 4th makes 20 > 16, ready
+            $this->checkSame(20, $batch->messagesSize, 'messagesSize recorded after accumulation');
+            $this->check($batch->readyToSend(), 'messagesSize > holdSize triggers readyToSend');
 
-            $this->checkSame(0, count($sender->sent), 'tick 前未发送');
+            $this->checkSame(0, count($sender->sent), 'nothing sent before tick');
             $acc->tick();
-            $this->checkSame(1, count($sender->sent), 'tick 触发 flush');
-            $this->check($batch->closed, 'flush 后批次置 closed');
-            $this->checkSame(4, $batch->count, '批次含 4 条消息');
-            $this->checkSame(100, $batch->sendResultAt(0)->queueOffset, '拆条 queueOffset 起点');
-            $this->checkSame(103, $batch->sendResultAt(3)->queueOffset, '拆条 queueOffset 递增');
+            $this->checkSame(1, count($sender->sent), 'tick triggers flush');
+            $this->check($batch->closed, 'batch closed after flush');
+            $this->checkSame(4, $batch->count, 'batch contains 4 messages');
+            $this->checkSame(100, $batch->sendResultAt(0)->queueOffset, 'split queueOffset starting point');
+            $this->checkSame(103, $batch->sendResultAt(3)->queueOffset, 'split queueOffset increments');
 
-            // 未达阈值时不 ready 也不 flush
+            // below threshold: neither ready nor flushed
             $sender2 = $this->fakeSender('z', 'zo', 0);
             $acc2 = new ProduceAccumulator('threshold-2', $sender2, $this->clock());
             $acc2->batchMaxBytes(1000);
             $b2 = $acc2->getOrCreateSyncBatch($key);
             $b2->add(new Message('T', str_repeat('y', 5)));
-            $this->check(!$b2->readyToSend(), '未达 holdSize 且未到 HoldMs → 不 ready');
+            $this->check(!$b2->readyToSend(), 'below holdSize and before HoldMs -> not ready');
             $acc2->tick();
-            $this->checkSame(0, count($sender2->sent), '未就绪 tick 不发送');
-            $this->checkSame(1, count($acc2->syncSendBatchesSnapshot()), '未就绪批次仍留在表内');
+            $this->checkSame(0, count($sender2->sent), 'not-ready tick sends nothing');
+            $this->checkSame(1, count($acc2->syncSendBatchesSnapshot()), 'not-ready batch stays in the table');
         }
 
-        // ==================================================================== HoldMs 到期
+        // ==================================================================== HoldMs expiry
 
         private function testTickFlushesOnHoldMsExpiry(): void
         {
@@ -313,19 +317,19 @@ namespace {
             $key = new AggregateKey('T', null, true, null);
             $batch = $acc->getOrCreateSyncBatch($key);
             $batch->add(new Message('T', 'zz'));
-            $this->checkSame(2_000_000, $batch->createTime, 'accumulation.createTime 取自注入时钟');
+            $this->checkSame(2_000_000, $batch->createTime, 'accumulation.createTime taken from the injected clock');
 
-            $this->check(!$batch->readyToSend(), '刚入队未到期');
-            $this->check(!$batch->readyToSend(2_000_049), '差 1ms 未到期');
-            $this->check($batch->readyToSend(2_000_050), '到 HoldMs 边界即 ready');
+            $this->check(!$batch->readyToSend(), 'not due right after enqueue');
+            $this->check(!$batch->readyToSend(2_000_049), '1ms short of due');
+            $this->check($batch->readyToSend(2_000_050), 'ready exactly at the HoldMs boundary');
 
             $acc->tick();
-            $this->checkSame(0, count($sender->sent), 'tick(未到点) 不发送');
+            $this->checkSame(0, count($sender->sent), 'tick (not yet due) sends nothing');
             $this->now = 2_000_050;
             $acc->tick();
-            $this->checkSame(1, count($sender->sent), 'tick(到点) 发送');
+            $this->checkSame(1, count($sender->sent), 'tick (due) sends');
 
-            // 显式 tick($nowMs) 覆盖时钟
+            // explicit tick($nowMs) overrides the clock
             $sender2 = $this->fakeSender('h2', 'o2', 2);
             $acc2 = new ProduceAccumulator('holdms-2', $sender2, $this->clock());
             $acc2->batchMaxDelayMs(30);
@@ -333,39 +337,39 @@ namespace {
             $b2 = $acc2->getOrCreateSyncBatch($key2);
             $b2->add(new Message('T', 'q'));
             $acc2->tick($b2->createTime + 30);
-            $this->checkSame(1, count($sender2->sent), 'tick($nowMs) 显式到期触发');
+            $this->checkSame(1, count($sender2->sent), 'tick($nowMs) explicit expiry triggers');
         }
 
-        // ==================================================================== 超大单条消息
+        // ==================================================================== oversized single message
 
         private function testOversizedSingleMessage(): void
         {
-            // 单条 body > holdSize → 立即 readyToSend，作为单条批次发出
+            // single body > holdSize -> immediately readyToSend, sent as a single-message batch
             $sender = $this->fakeSender('big', 'big-off', 7);
             $acc = new ProduceAccumulator('oversize', $sender, $this->clock());
             $acc->batchMaxBytes(8);
             $key = new AggregateKey('T', null, true, null);
             $batch = $acc->getOrCreateSyncBatch($key);
             $batch->add(new Message('T', str_repeat('b', 100)));
-            $this->check($batch->readyToSend(), '单条超 holdSize → readyToSend');
+            $this->check($batch->readyToSend(), 'single over holdSize -> readyToSend');
             $acc->tick();
-            $this->checkSame(1, count($sender->sent), '超大单条消息单独成批发出');
-            $this->checkSame(1, count($sender->sent[0][0]->getMessages()), '该批仅含 1 条子消息');
+            $this->checkSame(1, count($sender->sent), 'oversized single message sent as its own batch');
+            $this->checkSame(1, count($sender->sent[0][0]->getMessages()), 'the batch contains exactly 1 sub-message');
 
-            // 全局闸门：超大消息只被放行一次
+            // global gate: the oversized message is admitted only once
             $gate = new ProduceAccumulator('oversize-gate', $this->fakeSender(), $this->clock());
             $gate->totalBatchMaxBytes(64);
             $big = new Message('T', str_repeat('c', 100));
-            $this->check($gate->tryAddMessage($big), '超大消息首次放行（quota 尚空）');
-            $this->checkSame(100, $gate->currentlyHoldSize(), '超大消息按实际字节记账');
-            $this->check(!$gate->tryAddMessage(new Message('T', 'x')), '额度已被占满 → 后续拒绝（退回直发）');
+            $this->check($gate->tryAddMessage($big), 'oversized message admitted the first time (quota still empty)');
+            $this->checkSame(100, $gate->currentlyHoldSize(), 'oversized message recorded at actual bytes');
+            $this->check(!$gate->tryAddMessage(new Message('T', 'x')), 'quota already full -> later attempts rejected (fall back to direct send)');
         }
 
-        // ==================================================================== 批量拆条映射
+        // ==================================================================== batch split-result mapping
 
         private function testSplitSendResultsMapping(): void
         {
-            // 一个 batch 一份结果 → 拆回每条消息各自的 SendResult（含 queueOffset 递增）
+            // one batch one result -> split back into per-message SendResults (with queueOffset increments)
             $sender = $this->fakeSender('id-0,id-1,id-2,id-3,id-4', 'off-0,off-1,off-2,off-3,off-4', 100);
             $acc = new ProduceAccumulator('split', $sender, $this->clock());
             $key = new AggregateKey('T', null, true, null);
@@ -376,29 +380,29 @@ namespace {
                 $batch->add($msgs[$i]);
             }
             $batch->sendSync();
-            $this->checkSame(1, count($sender->sent), '同步：5 条同键合成 1 批');
+            $this->checkSame(1, count($sender->sent), 'sync: 5 same-key messages form 1 batch');
 
             $sentBatch = $sender->sent[0][0];
-            $this->check($sentBatch instanceof MessageBatch, '发出的是 MessageBatch');
-            $this->checkSame(null, $sender->sent[0][1], '未指定 mq → 透传 null（由 producer 选队列）');
-            $this->checkSame(null, $sender->sent[0][2], '同步路径无回调');
-            // 单线程顺序确定 → 批 body 与 reference 逐字节一致
-            $this->checkSame(MessageBatch::generateFromList($msgs)->encode(), $sentBatch->getBody(), '批 body 与 reference 一致');
-            $this->checkSame('', $sentBatch->getKeys(), '同步无 keys → 批级 KEYS=""');
+            $this->check($sentBatch instanceof MessageBatch, 'what goes out is a MessageBatch');
+            $this->checkSame(null, $sender->sent[0][1], 'no mq specified -> null passed through (producer picks the queue)');
+            $this->checkSame(null, $sender->sent[0][2], 'sync path has no callback');
+            // single-threaded order is deterministic -> batch body byte-identical to the reference
+            $this->checkSame(MessageBatch::generateFromList($msgs)->encode(), $sentBatch->getBody(), 'batch body identical to the reference');
+            $this->checkSame('', $sentBatch->getKeys(), 'sync without keys -> batch-level KEYS=""');
 
             $prev = null;
             for ($i = 0; $i < 5; $i++) {
                 $r = $batch->sendResultAt($i);
-                $this->checkSame("id-$i", $r->msgId, "拆条 msgId[$i]");
-                $this->checkSame("off-$i", $r->offsetMsgId, "拆条 offsetMsgId[$i]");
-                $this->checkSame(100 + $i, $r->queueOffset, "拆条 queueOffset=100+$i");
+                $this->checkSame("id-$i", $r->msgId, "split msgId[$i]");
+                $this->checkSame("off-$i", $r->offsetMsgId, "split offsetMsgId[$i]");
+                $this->checkSame(100 + $i, $r->queueOffset, "split queueOffset=100+$i");
                 if ($prev !== null) {
-                    $this->check($r !== $prev, "拆条 $i 是独立对象（非共享）");
+                    $this->check($r !== $prev, "split $i is an independent object (not shared)");
                 }
                 $prev = $r;
             }
 
-            // 不含逗号：所有下标共享同一个 SendResult 对象（就地共享，不复制）
+            // no commas: all indexes share the same SendResult object (shared in place, not copied)
             $sharedSender = $this->fakeSender('single-only', 'off-single', 9);
             $acc2 = new ProduceAccumulator('shared', $sharedSender, $this->clock());
             $b2 = $acc2->getOrCreateSyncBatch(new AggregateKey('T', null, true, null));
@@ -406,29 +410,29 @@ namespace {
                 $b2->add(new Message('T', 's'));
             }
             $b2->sendSync();
-            $this->check($b2->sendResultAt(0) === $b2->sendResultAt(1) && $b2->sendResultAt(1) === $b2->sendResultAt(2), '不含逗号：所有下标共享同一对象');
-            $this->checkSame(9, $b2->sendResultAt(0)->queueOffset, '共享对象 queueOffset 不递增');
+            $this->check($b2->sendResultAt(0) === $b2->sendResultAt(1) && $b2->sendResultAt(1) === $b2->sendResultAt(2), 'no commas: all indexes share one object');
+            $this->checkSame(9, $b2->sendResultAt(0)->queueOffset, 'shared object queueOffset does not increment');
 
-            // 条数对不上 → InvalidArgumentException("sendResult is illegal")
+            // count mismatch -> InvalidArgumentException("sendResult is illegal")
             $badSender = $this->fakeSender('a,b', 'x,y', 0);
             $acc3 = new ProduceAccumulator('illegal', $badSender, $this->clock());
             $b3 = $acc3->getOrCreateSyncBatch(new AggregateKey('T', null, true, null));
-            // 真实调用链里是 producer 先 tryAddMessage 记额度、批次发完再归还；这里补上记账。
-            $acc3->tryAddMessage(new Message('T', 'kkkkk')); // 记 5 字节
+            // in the real call chain the producer records the quota via tryAddMessage first and the batch returns it after sending; record it here too.
+            $acc3->tryAddMessage(new Message('T', 'kkkkk')); // records 5 bytes
             for ($i = 0; $i < 5; $i++) {
-                $b3->add(new Message('T', 'k')); // 5×1 = 5 字节
+                $b3->add(new Message('T', 'k')); // 5x1 = 5 bytes
             }
-            $this->checkThrows(fn() => $b3->sendSync(), \InvalidArgumentException::class, '拆条条数不符抛异常');
-            $this->checkSame(0, $acc3->currentlyHoldSize(), '拆条异常仍归还全局额度（finally）');
+            $this->checkThrows(fn() => $b3->sendSync(), \InvalidArgumentException::class, 'split count mismatch throws');
+            $this->checkSame(0, $acc3->currentlyHoldSize(), 'split exception still returns the global quota (finally)');
 
-            // null 结果
+            // null result
             $acc4 = new ProduceAccumulator('null-result', $this->fakeSender(), $this->clock());
             $b4 = $acc4->getOrCreateSyncBatch(new AggregateKey('T', null, true, null));
             $b4->add(new Message('T', 'n'));
-            $this->checkThrows(fn() => $b4->splitSendResults(null), \InvalidArgumentException::class, 'sendResult 为 null 抛异常');
+            $this->checkThrows(fn() => $b4->splitSendResults(null), \InvalidArgumentException::class, 'null sendResult throws');
         }
 
-        // ==================================================================== 异步路径
+        // ==================================================================== async path
 
         private function testAsyncBatchAndCallbackOrder(): void
         {
@@ -443,32 +447,32 @@ namespace {
             for ($i = 0; $i < 5; $i++) {
                 $msg = new Message('T', str_repeat('a', $i + 1));
                 $msgs[] = $msg;
-                $this->check($acc->tryAddMessage($msg), "异步闸门放行 $i");
+                $this->check($acc->tryAddMessage($msg), "async gate admits $i");
                 $acc->sendAsync($msg, function (?SendResult $r, ?\Throwable $e) use (&$results, $i): void {
                     $results[$i] = [$r, $e];
                 });
             }
-            $this->checkSame(0, count($sender->sent), '异步未就绪不发送');
+            $this->checkSame(0, count($sender->sent), 'async not ready sends nothing');
 
             $this->now += 50;
             $acc->tick();
-            $this->checkSame(1, count($sender->sent), 'tick 触发异步 flush');
-            $this->checkSame(5, count($results), '5 个回调各被触发一次');
+            $this->checkSame(1, count($sender->sent), 'tick triggers async flush');
+            $this->checkSame(5, count($results), '5 callbacks each fired once');
             $this->checkSame(
                 ['a', 'b', 'c', 'd', 'e'],
                 array_map(static fn(array $x): ?string => $x[0]?->msgId, array_values($results)),
-                '异步回调按入队顺序拿到各自 msgId'
+                'async callbacks receive their own msgId in enqueue order'
             );
             $this->checkSame(
                 [7, 8, 9, 10, 11],
                 array_map(static fn(array $x): int => $x[0]->queueOffset, array_values($results)),
-                '异步回调 queueOffset 递增'
+                'async callbacks queueOffset increments'
             );
-            $this->check(array_reduce($results, static fn(bool $c, array $x): bool => $c && $x[1] === null, true), '异步无错误回调');
-            $this->checkSame('', $sender->sent[0][0]->getKeys(), '异步批不收集 keys → KEYS=""');
-            $this->checkSame(0, $acc->currentlyHoldSize(), '异步发完归还额度');
+            $this->check(array_reduce($results, static fn(bool $c, array $x): bool => $c && $x[1] === null, true), 'async has no error callbacks');
+            $this->checkSame('', $sender->sent[0][0]->getKeys(), 'async batch does not collect keys -> KEYS=""');
+            $this->checkSame(0, $acc->currentlyHoldSize(), 'async returns the quota after sending');
 
-            // 批量应答含逗号但条数对不上 → onSuccess 内部抛错转全体回调 onException
+            // batch reply contains commas but the count mismatches -> onSuccess throws internally, converted to onException for every callback
             $badSender = $this->fakeSender('a,b', 'x,y', 0);
             $acc2 = new ProduceAccumulator('async-illegal', $badSender, $this->clock());
             $errs = [];
@@ -478,48 +482,48 @@ namespace {
                 });
             }
             $acc2->flushAll();
-            $this->checkSame(3, count($errs), '拆条非法：3 个回调都被触发');
-            $this->check(array_reduce($errs, static fn(bool $c, ?\Throwable $e): bool => $c && $e instanceof \InvalidArgumentException, true), '拆条非法：回调收到 InvalidArgumentException');
+            $this->checkSame(3, count($errs), 'illegal split: all 3 callbacks fired');
+            $this->check(array_reduce($errs, static fn(bool $c, ?\Throwable $e): bool => $c && $e instanceof \InvalidArgumentException, true), 'illegal split: callbacks receive InvalidArgumentException');
 
-            // 发送本身抛异常（发起阶段）→ 全体回调 onException，且**不归还**额度（沿用这一已知行为）
+            // the send itself throws (initiation phase) -> all callbacks onException, and the quota is **not** returned (keep this known behavior)
             $throwSender = new FakeSender('x', 'y', 0, 0, $this->sendOkStatus(), true);
             $acc3 = new ProduceAccumulator('async-throw', $throwSender, $this->clock());
             $msg3 = new Message('T', 'zzz');
-            $this->check($acc3->tryAddMessage($msg3), '发起异常用例：先记额度');
+            $this->check($acc3->tryAddMessage($msg3), 'initiation-exception case: record quota first');
             $holdBefore = $acc3->currentlyHoldSize();
             $err3 = null;
             $acc3->sendAsync($msg3, function (?SendResult $r, ?\Throwable $e = null) use (&$err3): void {
                 $err3 = $e;
             });
             $acc3->flushAll();
-            $this->check($err3 instanceof \Throwable, '发起阶段异常 → 回调 onException');
-            $this->checkSame($holdBefore, $acc3->currentlyHoldSize(), '发起阶段异常**不**归还额度（已知行为）');
+            $this->check($err3 instanceof \Throwable, 'initiation-phase exception -> callback onException');
+            $this->checkSame($holdBefore, $acc3->currentlyHoldSize(), 'initiation-phase exception does **not** return the quota (known behavior)');
         }
 
-        // ==================================================================== 守卫防重入
+        // ==================================================================== guard prevents re-entry
 
         private function testGuardPreventsReentry(): void
         {
             $acc = new ProduceAccumulator('guard', $this->fakeSender(), $this->clock());
             $g = $acc->guardSync;
 
-            $this->check($g->tryEnter('k'), 'guard：首次进入成功');
-            $this->check(!$g->tryEnter('k'), 'guard：同 key 在途时拒绝进入（防重入）');
-            $this->check($g->isInFlight('k'), 'guard：isInFlight 为真');
+            $this->check($g->tryEnter('k'), 'guard: first enter succeeds');
+            $this->check(!$g->tryEnter('k'), 'guard: same key in flight is rejected (re-entry prevention)');
+            $this->check($g->isInFlight('k'), 'guard: isInFlight true');
             $g->leave('k');
-            $this->check($g->tryEnter('k'), 'guard：leave 后可再次进入');
+            $this->check($g->tryEnter('k'), 'guard: can enter again after leave');
             $g->leave('k');
 
-            $this->checkSame('Client_guard_GuardForSyncSend', $acc->guardSync->name, 'sync 守卫名');
-            $this->checkSame('Client_guard_GuardForAsyncSend', $acc->guardAsync->name, 'async 守卫名');
+            $this->checkSame('Client_guard_GuardForSyncSend', $acc->guardSync->name, 'sync guard name');
+            $this->checkSame('Client_guard_GuardForAsyncSend', $acc->guardAsync->name, 'async guard name');
 
-            // 发送回调里重入 flush(同 key)：在途集合挡住，不会二次触发
+            // re-enter flush (same key) from within the send callback: the in-flight set blocks it, no second trigger
             $reentered = 0;
             $acc2 = null;
             $key2 = null;
             $sender2 = function (MessageBatch $batch, ?MessageQueue $mq, ?InternalSendCallback $cb) use (&$acc2, &$key2, &$reentered): ?SendResult {
                 $reentered++;
-                $acc2->flush($key2); // 同 key 重入
+                $acc2->flush($key2); // same-key re-entry
                 $r = new SendResult($this->sendOkStatus(), 'single', $mq, 0, null, 'o', null);
                 if ($cb !== null) {
                     $cb->onSuccess($r);
@@ -530,81 +534,81 @@ namespace {
             $key2 = new AggregateKey('T', null, true, null);
             $acc2->getOrCreateSyncBatch($key2)->add(new Message('T', 'r'));
             $acc2->flush($key2);
-            $this->checkSame(1, $reentered, '同 key 重入 flush 被守卫挡住，发送仅 1 次');
+            $this->checkSame(1, $reentered, 'same-key re-entrant flush blocked by the guard, send happens exactly once');
         }
 
-        // ==================================================================== 空批次清理 / 表内留存
+        // ==================================================================== empty-batch cleanup / table retention
 
         private function testGuardCleanupAndTableRetention(): void
         {
-            // 空批次（无人 add）：tick 直接置 closed + 摘表，不发任何东西
+            // empty batch (nobody adds): tick marks it closed + removes it from the table, sends nothing
             $sender = $this->fakeSender();
             $acc = new ProduceAccumulator('cleanup', $sender, $this->clock());
             $key = new AggregateKey('T', null, true, null);
             $empty = $acc->getOrCreateSyncBatch($key);
-            $this->checkSame(1, count($acc->syncSendBatchesSnapshot()), '空批次已在表内');
+            $this->checkSame(1, count($acc->syncSendBatchesSnapshot()), 'empty batch is in the table');
             $acc->tick();
-            $this->check($empty->closed, 'tick 后空批次置 closed');
-            $this->checkSame(0, count($acc->syncSendBatchesSnapshot()), 'tick 摘除空批次');
-            $this->checkSame(0, count($sender->sent), '空批次不发送');
+            $this->check($empty->closed, 'empty batch closed after tick');
+            $this->checkSame(0, count($acc->syncSendBatchesSnapshot()), 'tick removes the empty batch');
+            $this->checkSame(0, count($sender->sent), 'empty batch sends nothing');
 
-            // 发完的批次 messagesSize>0 → 留在表里，直到下一次同键 send 拿它并 add 返回 -1 才摘
+            // sent batches with messagesSize>0 -> stay in the table until the next same-key send takes it and add returns -1
             $acc2 = new ProduceAccumulator('retain', $this->fakeSender('one', 'o1', 3), $this->clock());
             $r1 = $acc2->send(new Message('T', 'a'));
-            $this->checkSame('one', $r1->msgId, 'send 返回本条自己的结果');
-            $this->checkSame(1, count($acc2->syncSendBatchesSnapshot()), '发完的批次留在表里');
-            $this->check($acc2->syncSendBatchesSnapshot()[0]->closed, '留表的批次是 closed');
+            $this->checkSame('one', $r1->msgId, 'send returns this message own result');
+            $this->checkSame(1, count($acc2->syncSendBatchesSnapshot()), 'sent batch stays in the table');
+            $this->check($acc2->syncSendBatchesSnapshot()[0]->closed, 'the retained batch is closed');
             $oldBatch = $acc2->syncSendBatchesSnapshot()[0];
             $acc2->tick();
-            $this->checkSame(1, count($acc2->syncSendBatchesSnapshot()), 'tick 不摘除已发送（size>0）的批次');
+            $this->checkSame(1, count($acc2->syncSendBatchesSnapshot()), 'tick does not remove already-sent (size>0) batches');
 
-            // 下一次同键 send：摘掉 closed → 新建 → 再发一批
+            // next same-key send: closed removed -> fresh one created -> another batch sent
             $acc2->send(new Message('T', 'b'));
             $snap = $acc2->syncSendBatchesSnapshot();
-            $this->checkSame(1, count($snap), '二次 send 后该 key 仍只占 1 个表项');
-            $this->check($snap[0] !== $oldBatch, '二次 send 换成了新的 accumulation 对象');
-            $this->check($snap[0]->closed, '二次 send 的新批次也已 closed');
+            $this->checkSame(1, count($snap), 'after the second send the key still occupies 1 table entry');
+            $this->check($snap[0] !== $oldBatch, 'the second send swapped in a new accumulation object');
+            $this->check($snap[0]->closed, 'the new batch from the second send is also closed');
         }
 
-        // ==================================================================== 同步入口 / 指定 mq / keys
+        // ==================================================================== sync entry / explicit mq / keys
 
         private function testSyncEntryAndKeys(): void
         {
             $sender = $this->fakeSender('one', 'o1', 5);
             $acc = new ProduceAccumulator('sync-entry', $sender, $this->clock());
             $r = $acc->send(new Message('T', 'hello'));
-            $this->checkSame('one', $r->msgId, '同步 send msgId');
-            $this->checkSame('o1', $r->offsetMsgId, '同步 send offsetMsgId');
-            $this->checkSame(5, $r->queueOffset, '同步 send queueOffset');
-            $this->checkSame(1, count($sender->sent), '同步 send 发出一批');
+            $this->checkSame('one', $r->msgId, 'sync send msgId');
+            $this->checkSame('o1', $r->offsetMsgId, 'sync send offsetMsgId');
+            $this->checkSame(5, $r->queueOffset, 'sync send queueOffset');
+            $this->checkSame(1, count($sender->sent), 'sync send sends one batch');
 
-            // 指定 mq 原样透传
+            // explicit mq passed through as-is
             $mq = new MessageQueue('T', 'broker-pinned', 2);
             $acc->sendWithMq(new Message('T', 'hi'), $mq);
-            $this->checkSame(2, count($sender->sent), 'sendWithMq 单独成批（mq 参与 key）');
-            $this->check($sender->sent[1][1] === $mq, 'sendWithMq 把 mq 透传给 sender');
+            $this->checkSame(2, count($sender->sent), 'sendWithMq forms its own batch (mq joins the key)');
+            $this->check($sender->sent[1][1] === $mq, 'sendWithMq passes mq through to the sender');
 
-            // 同步批次收集子消息 keys 的并集（空格 join）
+            // sync batches collect the union of sub-message keys (space-joined)
             $kSender = $this->fakeSender('kk', 'koff', 0);
             $acc3 = new ProduceAccumulator('keys', $kSender, $this->clock());
             $key = new AggregateKey('T', null, true, null);
             $b = $acc3->getOrCreateSyncBatch($key);
             $b->add(new Message('T', 'aa', null, 'k1 k2'));
             $b->add(new Message('T', 'bbb', null, 'k2 k3'));
-            $b->add(new Message('T', 'c', null, 'k4 ')); // 尾随空格 → 尾部空段被丢弃
+            $b->add(new Message('T', 'c', null, 'k4 ')); // trailing space -> trailing empty segment dropped
             $acc3->flush($key);
             $keys = explode(' ', $kSender->sent[0][0]->getKeys());
             sort($keys);
-            $this->checkSame(['k1', 'k2', 'k3', 'k4'], $keys, '同步批 KEYS = 子消息 keys 并集（空格 join，尾空段丢弃）');
+            $this->checkSame(['k1', 'k2', 'k3', 'k4'], $keys, 'sync batch KEYS = union of sub-message keys (space-joined, trailing empty dropped)');
 
-            // tag 透传到批
+            // tag passed through to the batch
             $tSender = $this->fakeSender('t', 'to', 0);
             $accT = new ProduceAccumulator('tag', $tSender, $this->clock());
             $accT->send(new Message('T', 'x', 'TagX'));
-            $this->checkSame('TagX', $tSender->sent[0][0]->getTags(), 'tag 透传到 MessageBatch.TAGS');
+            $this->checkSame('TagX', $tSender->sent[0][0]->getTags(), 'tag passed through to MessageBatch.TAGS');
         }
 
-        // ==================================================================== 进程级复用 / 重启
+        // ==================================================================== process-level reuse / restart
 
         private function testReuseAndRestart(): void
         {
@@ -612,25 +616,25 @@ namespace {
             $a = ProduceAccumulator::getOrCreateProduceAccumulator('cid-accum-1');
             $b = ProduceAccumulator::getOrCreateProduceAccumulator('cid-accum-1');
             $c = ProduceAccumulator::getOrCreateProduceAccumulator('cid-accum-2');
-            $this->check($a === $b, '同 clientId 复用同一累加器');
-            $this->check($a !== $c, '不同 clientId 得到不同累加器');
+            $this->check($a === $b, 'same clientId reuses the same accumulator');
+            $this->check($a !== $c, 'different clientIds get different accumulators');
             $this->checkSame('cid-accum-1', $a->instanceName, 'instanceName = clientId');
             ProduceAccumulator::clearSharedInstances();
 
-            // start → shutdown → start 幂等可重复
+            // start -> shutdown -> start idempotently repeatable
             $acc = new ProduceAccumulator('restart', $this->fakeSender('r', 'ro', 0), $this->clock());
             $acc->start();
-            $this->check($acc->isStarted(), 'start 后 isStarted');
+            $this->check($acc->isStarted(), 'isStarted after start');
             $acc->shutdown();
-            $this->check(!$acc->isStarted(), 'shutdown 后未 started');
+            $this->check(!$acc->isStarted(), 'not started after shutdown');
             $acc->start();
-            $this->check($acc->isStarted(), '可重复 start');
+            $this->check($acc->isStarted(), 'can start again');
             $r = $acc->send(new Message('T', 'r'));
-            $this->checkSame('r', $r->msgId, '重启后仍能发送');
-            $this->checkSame(max(1, intdiv(10, 2)), $acc->guardSync->sleepTimeMs(), '守卫轮询间隔 = max(1, holdMs/2)');
+            $this->checkSame('r', $r->msgId, 'still sends after restart');
+            $this->checkSame(max(1, intdiv(10, 2)), $acc->guardSync->sleepTimeMs(), 'guard poll interval = max(1, holdMs/2)');
         }
 
-        // ==================================================================== 分区隔离
+        // ==================================================================== partition isolation
 
         private function testDifferentTagsDoNotMerge(): void
         {
@@ -641,16 +645,16 @@ namespace {
             $kB = AggregateKey::ofMessage(new Message('T', 'bb', 'TagB'));
             $bA = $acc->getOrCreateSyncBatch($kA);
             $bB = $acc->getOrCreateSyncBatch($kB);
-            $this->check($bA !== $bB, '不同 tag → 不同 accumulation');
+            $this->check($bA !== $bB, 'different tags -> different accumulations');
             $bA->add(new Message('T', 'aa', 'TagA'));
             $bB->add(new Message('T', 'bb', 'TagB'));
-            $this->checkSame(2, count($acc->syncSendBatchesSnapshot()), '两张表项并存');
+            $this->checkSame(2, count($acc->syncSendBatchesSnapshot()), 'two table entries coexist');
             $acc->flush($kA);
             $acc->flush($kB);
-            $this->checkSame(2, count($sender->sent), '不同 tag 各发一批');
+            $this->checkSame(2, count($sender->sent), 'different tags each send one batch');
             $tags = array_map(static fn(array $x): ?string => $x[0]->getTags(), $sender->sent);
             sort($tags);
-            $this->checkSame(['TagA', 'TagB'], $tags, '两批各自的 TAGS 正确');
+            $this->checkSame(['TagA', 'TagB'], $tags, 'each batch carries its own TAGS');
         }
 
         public function run(): int
@@ -671,7 +675,7 @@ namespace {
         }
     }
 
-    /** 注入用的假发送函数：只记账 + 回一份可控的批量 SendResult。 */
+    /** Fake send function for injection: bookkeeping only + returns a controllable batch SendResult. */
     final class FakeSender
     {
         /** @var list<array{0: MessageBatch, 1: ?MessageQueue, 2: ?InternalSendCallback}> */
@@ -693,7 +697,7 @@ namespace {
             $index = count($this->sent) - 1;
 
             if ($this->throwOnSend) {
-                // 模拟 sendDirect 在发起阶段就抛（还没回调）——外层 catch 只通知回调、不归还额度
+                // simulate sendDirect throwing at the initiation phase (before any callback) — the outer catch only notifies callbacks, does not return the quota
                 throw new \RuntimeException('fake sendDirect threw');
             }
             if ($this->failAt >= 0 && $index === $this->failAt) {

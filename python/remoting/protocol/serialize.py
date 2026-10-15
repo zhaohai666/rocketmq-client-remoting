@@ -6,9 +6,10 @@ import re
 import struct
 from typing import Any, Dict, List, Optional
 
-# FastJSON（RocketMQ 5.x 默认 JSON 实现）会把 Map 的数字键写成不带引号的形式，
-# 例如 {"brokerAddrs":{0:"127.0.0.1:10911}}，这不是标准 JSON。
-# 这里做兼容：匹配 "{ 或 , 之后紧跟的数字键并补上引号。
+# FastJSON (the default JSON implementation of RocketMQ 5.x) writes the numeric keys
+# of a Map without quotes, e.g. {"brokerAddrs":{0:"127.0.0.1:10911"}}, which is not
+# standard JSON. Compatibility is handled here: a numeric key that directly follows
+# "{" or "," is matched and the quotes are added back.
 _ESCAPES = {'"': '"', '\\': '\\', '/': '/', 'b': '\b', 'f': '\f',
             'n': '\n', 'r': '\r', 't': '\t'}
 _WS = ' \t\r\n'
@@ -19,25 +20,29 @@ class FastJsonDecodeError(ValueError):
     pass
 
 
-# FastJSON2（RocketMQ 5.x 默认 JSON 实现）的输出**不是**严格 JSON，仅靠 json.loads 无法解析：
-#  1) Map 的数字键不带引号：{"brokerAddrs":{0:"127.0.0.1:10911"}}
-#  2) Map 的对象键直接内联成 JSON 对象（这是**非法 JSON**），管理端必然遇到：
-#     TopicStatsTable / ConsumeStats 的 offsetTable 以 MessageQueue 为键 →
+# The output of FastJSON2 (the default JSON implementation of RocketMQ 5.x) is **not**
+# strict JSON, so json.loads alone cannot parse it:
+#  1) numeric Map keys are unquoted: {"brokerAddrs":{0:"127.0.0.1:10911"}}
+#  2) object Map keys are inlined directly as JSON objects (that is **invalid JSON**),
+#     and the admin side inevitably runs into it:
+#     TopicStatsTable / ConsumeStats use MessageQueue as the offsetTable key ->
 #       {"offsetTable":{{"brokerName":"b","queueId":3,"topic":"t"}:{...}}}
-#  3) 特殊浮点：NaN / Infinity / -Infinity
-# 因此需要一个容忍「非字符串键」的小型解析器，而不是事后补引号。
+#  3) special floats: NaN / Infinity / -Infinity
+# Therefore a small parser that tolerates "non-string keys" is needed, rather than
+# patching in the quotes afterwards.
 _UNQUOTED_NUM_KEY_RE = re.compile(r'([{,]\s*)(-?\d+(?:\.\d+)?)\s*(:)')
 
 
 class _FastJsonParser:
-    """容忍「对象/数组作为 map 键」的 JSON 解析器（fastjson2 兼容子集）。"""
+    """A JSON parser that tolerates "an object/array used as a map key" (a
+    fastjson2-compatible subset)."""
 
     def __init__(self, text: str):
         self.text = text
         self.pos = 0
         self.size = len(text)
 
-    # ---------------- 基础设施 ----------------
+    # ---------------- infrastructure ----------------
     def _skip_ws(self) -> None:
         while self.pos < self.size and self.text[self.pos] in _WS:
             self.pos += 1
@@ -47,7 +52,7 @@ class _FastJsonParser:
             raise FastJsonDecodeError("unexpected end of input at offset %d" % self.pos)
         return self.text[self.pos]
 
-    # ---------------- 各类型 ----------------
+    # ---------------- each type ----------------
     def parse(self):
         value = self._value()
         self._skip_ws()
@@ -67,7 +72,7 @@ class _FastJsonParser:
         return self._literal()
 
     def _object(self) -> Dict[str, Any]:
-        self.pos += 1  # 吃掉 '{'
+        self.pos += 1  # consume '{'
         result: Dict[str, Any] = {}
         self._skip_ws()
         if self._peek() == '}':
@@ -85,7 +90,7 @@ class _FastJsonParser:
             if c == ',':
                 self.pos += 1
                 self._skip_ws()
-                if self._peek() == '}':  # 容忍尾随逗号
+                if self._peek() == '}':  # tolerate a trailing comma
                     self.pos += 1
                     return result
                 continue
@@ -95,7 +100,7 @@ class _FastJsonParser:
             raise FastJsonDecodeError("expected ',' or '}' at offset %d" % self.pos)
 
     def _array(self) -> List[Any]:
-        self.pos += 1  # 吃掉 '['
+        self.pos += 1  # consume '['
         items: List[Any] = []
         self._skip_ws()
         if self._peek() == ']':
@@ -118,14 +123,15 @@ class _FastJsonParser:
             raise FastJsonDecodeError("expected ',' or ']' at offset %d" % self.pos)
 
     def _key(self):
-        """键：字符串 / 内联对象 / 内联数组 / 裸字面量（数字、true、false、null）。"""
+        """The key: a string / an inline object / an inline array / a bare literal (number, true, false, null)."""
         self._skip_ws()
         c = self._peek()
         if c == '"':
             return self._string()
         if c in '{[':
-            # fastjson2 把非字符串 map 键（如 MessageQueue）原样写成 JSON。
-            # 保留原始文本，调用方可用 decode_message_queue_key() 再解析。
+            # fastjson2 writes a non-string map key (such as MessageQueue) as-is in
+            # JSON. The raw text is preserved so that callers can parse it again with
+            # decode_message_queue_key().
             start = self.pos
             self._value()
             return self.text[start:self.pos]
@@ -135,7 +141,7 @@ class _FastJsonParser:
         return self.text[start:self.pos]
 
     def _string(self) -> str:
-        self.pos += 1  # 吃掉开引号
+        self.pos += 1  # consume the opening quote
         out: List[str] = []
         while True:
             if self.pos >= self.size:
@@ -169,7 +175,7 @@ class _FastJsonParser:
                              ("-Infinity", float("-inf"))):
             if rest.startswith(token):
                 tail = rest[len(token):len(token) + 1]
-                # 不能把 "nullish" 之类误判成 null
+                # must not mistake things like "nullish" for null
                 if tail == "" or tail in ',}]' + _WS:
                     self.pos += len(token)
                     return value
@@ -185,14 +191,14 @@ class _FastJsonParser:
 
 
 def fastjson_loads(text: str) -> Any:
-    """解析 fastjson2 输出（含非字符串 map 键）。失败抛 FastJsonDecodeError。"""
+    """Parse fastjson2 output (including non-string map keys). Raises FastJsonDecodeError on failure."""
     return _FastJsonParser(text).parse()
 
 
 def decode_message_queue_key(key: str) -> Optional[Dict[str, Any]]:
-    """把 fastjson2 写出的 MessageQueue 内联对象键还原成 dict。
+    """Turn a MessageQueue inline object key written by fastjson2 back into a dict.
 
-    返回 None 表示这个键不是内联对象（例如普通字符串键）。
+    Returning None means the key is not an inline object (an ordinary string key, for example).
     """
     text = key.strip()
     if not text.startswith('{'):
@@ -211,7 +217,8 @@ def _tolerant_json_loads(text: str) -> Any:
     try:
         return fastjson_loads(text)
     except FastJsonDecodeError:
-        # 兜底：老路径（只补数字键引号）。再失败则让异常冒泡，避免静默返回错数据。
+        # Fallback: the legacy path (only patch in quotes for numeric keys). If that
+        # still fails, let the exception bubble up instead of silently returning bad data.
         fixed = _UNQUOTED_NUM_KEY_RE.sub(
             lambda m: '%s"%s"%s' % (m.group(1), m.group(2), m.group(3)), text)
         return json.loads(fixed)
@@ -265,7 +272,7 @@ def _json_default(obj: Any):
 
 
 class RocketMQSerializable:
-    """RocketMQ 4.x 私有二进制协议：code(2) + language(1) + version(2) + opaque(4) + flag(4) + remark(int+utf8) + extFields(int + key(short+utf8)/value(int+utf8))。"""
+    """The RocketMQ 4.x private binary protocol: code(2) + language(1) + version(2) + opaque(4) + flag(4) + remark(int+utf8) + extFields(int + key(short+utf8)/value(int+utf8))."""
 
     @staticmethod
     def write_decimal_long(buf: bytearray, value: int) -> None:

@@ -3,7 +3,7 @@ name = "rocketmq-client-remoting"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Apache RocketMQ 经典 remoting 协议客户端（Rust / tokio）"
+description = "Apache RocketMQ classic remoting protocol client (Rust / tokio)"
 
 [lib]
 name = "rocketmq_client_remoting"

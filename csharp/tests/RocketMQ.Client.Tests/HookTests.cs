@@ -1,4 +1,4 @@
-// 钩子单测：CheckForbiddenHook（发送前拦截）与 FilterMessageHook（投递前过滤）。
+// Hook unit tests: CheckForbiddenHook (interception before sending) and FilterMessageHook (filtering before delivery).
 using System;
 using System.Collections.Generic;
 
@@ -35,7 +35,7 @@ public class HookTests
 
     private static string BodyOf(MessageExt m) => System.Text.Encoding.UTF8.GetString(m.Body);
 
-    // ---- CheckForbiddenHook：记录调用与上下文，可选抛异常 ----
+    // ---- CheckForbiddenHook: records the call and the context, optionally throwing ----
     private sealed class ForbidHook : ICheckForbiddenHook
     {
         private readonly bool _forbid;
@@ -79,7 +79,7 @@ public class HookTests
         }
     }
 
-    // ---- FilterMessageHook：按 body 前缀丢消息 ----
+    // ---- FilterMessageHook: drops messages by body prefix ----
     private sealed class DropHook : IFilterMessageHook
     {
         private readonly string _prefix;
@@ -190,7 +190,7 @@ public class HookTests
             () => producer.ExecuteCheckForbiddenHook(ctx));
         Assert.Equal("forbidden by unit hook", ex.Message);
         Assert.Equal(1, strict.Calls);
-        // 异常抛出后，**后面的钩子不再执行** —— 这正是"拦截"的语义（发送已被中止）
+        // after the exception is thrown, **the later hooks do not run** -- that is exactly what "interception" means (the send was already aborted)
         Assert.Equal(0, after.Calls);
     }
 
@@ -273,7 +273,7 @@ public class HookTests
         List<MessageExt> kept = consumer.FilterMessagesForDelivery(mq, sub, mixed);
         Assert.Single(kept);
         Assert.Equal("M1", kept[0].MsgId);
-        // 钩子只看到 tag 匹配后的 2 条 —— 证明 tag 过滤在钩子之前
+        // the hook only sees the 2 messages that matched the tag -- proving tag filtering happens before the hook
         Assert.Single(drop.SeenCounts);
         Assert.Equal(2, drop.SeenCounts[0]);
     }
@@ -302,7 +302,7 @@ public class HookTests
     [Fact]
     public void FilterMessageHook_ExceptionIsSwallowed()
     {
-        // 与 CheckForbiddenHook 相反：过滤钩子的异常被吞掉，且**后续钩子照常执行**
+        // the opposite of CheckForbiddenHook: a filter hook's exception is swallowed and **the later hooks still run**
         var consumer = new DefaultMQPushConsumer(Group + "Boom");
         var boom = new BoomHook();
         var drop = new DropHook("drop-");
@@ -337,7 +337,7 @@ public class HookTests
     [Fact]
     public void DroppedMessages_ComputesDifference()
     {
-        // POP 路径要给被摘掉的消息补 ack，因此差集必须精确
+        // the POP path has to ack the messages it dropped, so the difference must be exact
         var a = MakeMsg("A", "keep");
         var b = MakeMsg("B", "drop");
         var c = MakeMsg("C", "keep2");

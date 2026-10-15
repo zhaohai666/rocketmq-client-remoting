@@ -234,7 +234,7 @@ class SelectMessageQueueByMachineRoom(MessageQueueSelector):
         for mq in mqs:
             if mq.broker_name.startswith(room):
                 return mq
-        # 无匹配则回退首个
+        # Fall back to the first when there is no match
         return mqs[0]
 
 
@@ -298,10 +298,10 @@ class DefaultMQProducer:
             raise MQClientException("producerGroup is empty")
         self.producer_group = str(producer_group)
         self.tls_enable: Optional[bool] = tls_enable
-        # TLS 细项（caCert=严格 CA 校验；clientCert/clientKey=mTLS；serverName=主机名覆盖）
+        # TLS details (caCert = strict CA validation; clientCert/clientKey = mTLS; serverName = hostname override)
         self.tls_options: Optional[Dict[str, str]] = tls_options
         self.socks_proxy_config: Optional[SocksProxyConfig] = socks_proxy_config
-        # W3C traceparent 透传（opt-in；None = 交给 env ROCKETMQ_TRACE_CONTEXT_ENABLE）
+        # W3C traceparent pass-through (opt-in; None = defer to the env ROCKETMQ_TRACE_CONTEXT_ENABLE)
         if enable_trace_context is None:
             enable_trace_context = trace_context_enabled_from_env()
         self.enable_trace_context: bool = bool(enable_trace_context)
@@ -335,7 +335,7 @@ class DefaultMQProducer:
         self._mq_client: Optional[MQClientInstance] = None
         self._started = False
         self._lock = threading.Lock()
-        # 当前事务监听器（send_message_in_transaction 时记录，供 broker 回查调用）
+        # The current transaction listener (recorded on send_message_in_transaction, for broker check callbacks)
         self._transaction_listener: Optional[TransactionListener] = None
         self._heartbeat_running = False
         self.heartbeat_interval_millis = 30000
@@ -351,13 +351,13 @@ class DefaultMQProducer:
         self.total_batch_max_bytes = -1
         self.produce_accumulator: Optional[ProduceAccumulator] = None
         self.enable_trace = False
-        self.trace_topic: Optional[str] = None      # None → 用 RMQ_SYS_TRACE_TOPIC
+        self.trace_topic: Optional[str] = None      # None -> use RMQ_SYS_TRACE_TOPIC
         self.trace_msg_batch_num = 10
         self.send_message_hook_list: List["SendMessageHook"] = []
         self.end_transaction_hook_list: List["EndTransactionHook"] = []
         self.check_forbidden_hook_list: List["CheckForbiddenHook"] = []
         self.trace_dispatcher = None
-        # 基础客户端指标（send/consume RT 与计数）
+        # Basic client metrics (send/consume RT and counts)
         self.metrics = ClientMetrics()
         self.request_timeout = DEFAULT_REQUEST_TIMEOUT_MILLIS
         self.async_sender_queue_capacity = 50000
@@ -374,7 +374,7 @@ class DefaultMQProducer:
             _back_pressure_permits(self.back_pressure_for_async_send_size,
                                    MIN_ASYNC_SEND_SIZE, "semaphoreAsyncSendSize"))
 
-    # ---------------- 配置 ----------------
+    # ---------------- Config ----------------
     def set_namesrv_addr(self, addr: str) -> None:
         self.name_server_addrs = [a.strip() for a in addr.split(";") if a.strip()]
 
@@ -456,7 +456,7 @@ class DefaultMQProducer:
         return self.back_pressure_for_async_send_num
 
     def set_back_pressure_for_async_send_size(self, size: int) -> None:
-        """运行时改「在途字节数」上限，语义与 ``set_back_pressure_for_async_send_num`` 相同。"""
+        """Change the "in-flight bytes" cap at runtime; same semantics as ``set_back_pressure_for_async_send_num``."""
         size = max(size, MIN_ASYNC_SEND_SIZE)
         self.back_pressure_for_async_send_size = size
         self._semaphore_async_send_size.set_total_permits(size)
@@ -528,7 +528,7 @@ class DefaultMQProducer:
         return self.detect_interval_millis
 
     def set_request_timeout(self, timeout_millis: int) -> None:
-        """设置 Request-Reply 的默认超时（不传 timeout 给 request() 时用它）。"""
+        """Set the default Request-Reply timeout (used by request() when no timeout is passed)."""
         self.request_timeout = timeout_millis
 
     def set_auto_batch(self, auto_batch: bool) -> None:
@@ -577,7 +577,7 @@ class DefaultMQProducer:
         return self.produce_accumulator.get_total_batch_max_bytes()
 
     def get_metrics(self) -> ClientMetrics:
-        """返回本生产者的基础指标计数器（send/consume RT 与计数）。"""
+        """Return this producer's basic metrics counters (send/consume RT and counts)."""
         return self.metrics
 
     def set_enable_trace(self, enable: bool) -> None:
@@ -611,7 +611,7 @@ class DefaultMQProducer:
         return len(self.check_forbidden_hook_list) > 0
 
     def _has_send_interceptors(self) -> bool:
-        """是否需要走「带拦截/钩子」的发送内核（两者任一存在就得走）。"""
+        """Whether the send kernel must run with interceptors/hooks (either being present requires it)."""
         return bool(self.send_message_hook_list) or bool(self.check_forbidden_hook_list)
 
     def execute_check_forbidden_hook(self, context: "CheckForbiddenContext") -> None:
@@ -672,7 +672,7 @@ class DefaultMQProducer:
     def _execute_check_forbidden(self, msg: Message, mq: MessageQueue, broker_addr: str,
                                  arg=None,
                                  communication_mode: str = CommunicationMode.SYNC) -> None:
-        """构造 CheckForbiddenContext 并执行（异常**不吞**，见 execute_check_forbidden_hook）。"""
+        """Build a CheckForbiddenContext and execute it (exceptions are **not** swallowed; see execute_check_forbidden_hook)."""
         context = CheckForbiddenContext()
         context.name_srv_addr = self.get_namesrv_addr()
         context.group = self.producer_group
@@ -699,7 +699,7 @@ class DefaultMQProducer:
         broker_addr = client.publish_addr_for(mq_sel.broker_name, mq_sel.topic)
         if self.has_check_forbidden_hook():
             self._execute_check_forbidden(msg, mq_sel, broker_addr, arg, communication_mode)
-        # W3C traceparent 透传（opt-in）：没有就注入根上下文，已有值不覆盖
+        # W3C traceparent pass-through (opt-in): inject a root context when absent; never overwrite an existing value
         if self.enable_trace_context:
             inject_trace_context(msg)
         if not self.send_message_hook_list:
@@ -718,7 +718,7 @@ class DefaultMQProducer:
         self.execute_send_message_hook_after(context)
         return result
 
-    # ---------------- 生命周期 ----------------
+    # ---------------- Lifecycle ----------------
     def start(self) -> None:
         with self._lock:
             if self._started:
@@ -757,10 +757,10 @@ class DefaultMQProducer:
             try:
                 self._mq_client.start()
             except Exception:
-                # 启动失败不能留下悬空的引用计数（实例自己也会把自己从缓存摘掉）。
+                # Startup failure must not leave a dangling reference count (the instance also removes itself from the cache).
                 manager.unregister_client(self.client_id, self._mq_client)
                 raise
-            # 动态 name server：实例启动时可能已从地址服务器拿到地址，回填到本生产者
+            # Dynamic name server: the instance may already have addresses from the addressing server on startup; back-fill this producer
             if not self.name_server_addrs and self._mq_client.name_server_addrs:
                 self.name_server_addrs = list(self._mq_client.name_server_addrs)
             self._mq_client.register_transaction_check_handler(
@@ -772,10 +772,10 @@ class DefaultMQProducer:
             self._started = True
             if self.produce_accumulator is not None:
                 self.produce_accumulator.start()
-            # 心跳线程：周期性向 broker 注册 ProducerData。
-            # broker 的事务回查正是通过这一步登记的 channel 反向联系生产者的；
-            # 生产者不发心跳时 COMMIT/ROLLBACK 仍能成功（客户端主动 END_TRANSACTION），
-            # 但 UNKNOW 的半消息会**永远不被回查**。
+            # Heartbeat thread: periodically register ProducerData with the broker.
+            # The broker's transaction check callback reaches the producer through the channel registered here;
+            # without a producer heartbeat COMMIT/ROLLBACK still succeed (the client sends END_TRANSACTION itself),
+            # but half-messages in UNKNOW state would **never be checked back**.
             self._heartbeat_running = True
             threading.Thread(target=self._heartbeat_loop, name="ProducerHeartbeatThread",
                              daemon=True).start()
@@ -851,7 +851,7 @@ class DefaultMQProducer:
                         self.client_id or "", self.producer_group, "")
                 except Exception as e:  # noqa: BLE001
                     logger.debug("unregister on shutdown failed: %s", e)
-                # 摘掉本生产者的 39 处理器（替身实例没有该接口时跳过）。
+                # Detach this producer's handler for request code 39 (CHECK_TRANSACTION_STATE; skipped when the shadow instance has no such interface).
                 unregister_handler = getattr(self._mq_client,
                                              "unregister_transaction_check_handler", None)
                 if unregister_handler is not None:
@@ -892,9 +892,9 @@ class DefaultMQProducer:
             return 0
         hb = HeartbeatData(self.client_id or "")
         pd = ProducerData(self.producer_group)
-        # ⚠ Python 的 HeartbeatData 没有 heartbeatFingerprint / withoutSub 字段
-        # （已知缺陷，见项目记忆）。缺失时 broker 反序列化为 0，等价于走 V1 注册路径；
-        # 显式置 0 与不置的效果相同，保持现状。
+        # WARNING: the Python HeartbeatData has no heartbeatFingerprint / withoutSub fields
+        # (known gap, see project memory). When absent, the broker deserializes them as 0, which is equivalent to the V1 registration path;
+        # explicitly setting 0 has the same effect as omitting it, so the status quo is kept.
         hb.producer_data_set.add(pd)
         ok_count = 0
         for addr in addrs:
@@ -961,18 +961,18 @@ class DefaultMQProducer:
 
     def _update_fault_item(self, selected, began: float, isolation: bool,
                            reachable: bool) -> None:
-        """容错表记一次尝试的延迟。延迟必须用单调钟量：本地亚毫秒往返用毫秒墙钟差
-        会记成 0，那样延迟阈值永远不会生效。"""
+        """Record one attempt's latency in the fault table. The latency must be measured with a monotonic clock: a sub-millisecond
+        local round trip computed from a millisecond wall-clock difference would be recorded as 0, so the latency threshold would never take effect."""
         if selected is None:
             return
         self._mq_fault_strategy.update_fault_item(
             selected.broker_name, (time.monotonic() - began) * 1000.0, isolation, reachable)
 
-    # ---------------- 正常发送 ----------------
+    # ---------------- Normal sending ----------------
     @_restores_caller_message
     def send(self, msg: Message, timeout_millis: Optional[int] = None,
              mq: Optional[MessageQueue] = None) -> SendResult:
-        """同步发送：msg 或 Collection；指定 mq 走定点发送，否则轮询选择。"""
+        """Synchronous send: a single msg or a Collection; a specified mq goes to a pinned send, otherwise round-robin selection is used."""
         if (timeout_millis is None and self.get_auto_batch()
                 and not isinstance(msg, (list, tuple))
                 and not isinstance(msg, MessageBatch)):
@@ -1027,18 +1027,18 @@ class DefaultMQProducer:
                 send_start = self.metrics.record_send_start()
                 try:
                     result = self._send_with_hooks(client, msg, mq_sel, cur_timeout, sys_flag)
-                except Exception:  # noqa: BLE001 — 指标记账后按原异常分类处理
+                except Exception:  # noqa: BLE001 — re-raise as the original exception after metric accounting
                     self.metrics.record_send_failure(send_start)
                     raise
                 self.metrics.record_send_success(send_start)
-                # 记录发送延迟；超出阈值会把该 broker 隔离一段时间
+                # Record the send latency; exceeding the threshold isolates that broker for a while
                 self._update_fault_item(selected, began, False, True)
                 if (result is not None and result.send_status != SendStatus.SEND_OK
                         and self.retry_another_broker_when_not_store_ok):
                     continue
                 return result
             except MQBrokerException as e:
-                # broker 明确回了错误码：隔离该 broker（可达性不动），只有可重试码才换一台
+                # The broker returned an explicit error code: isolate that broker (reachability unchanged); only a retryable code switches to another broker
                 self._update_fault_item(selected, began, True, False)
                 last_exc = e
                 if self.is_retry_response_code(e.response_code):
@@ -1094,7 +1094,7 @@ class DefaultMQProducer:
         try:
             self._topic_publish_info(msg.topic)
             self._send_heartbeat_to_all_broker()
-        except Exception:  # noqa: BLE001 — 拿不到路由就让下面的发送路径自己报错
+        except Exception:  # noqa: BLE001 — when the route is unavailable, let the send path below report the error itself
             logger.debug("request: prepare route/heartbeat failed", exc_info=True)
 
         future = RequestResponseFuture(correlation_id, timeout)
@@ -1141,7 +1141,7 @@ class DefaultMQProducer:
         try:
             self._topic_publish_info(msg.topic)
             self._send_heartbeat_to_all_broker()
-        except Exception:  # noqa: BLE001 — 与同步 request 同款：让发送路径自己报错
+        except Exception:  # noqa: BLE001 — same as the synchronous request: let the send path report the error itself
             logger.debug("request_async: prepare route/heartbeat failed", exc_info=True)
 
         future = RequestResponseFuture(correlation_id, timeout, callback)
@@ -1208,8 +1208,8 @@ class DefaultMQProducer:
                 return
             try:
                 if selector is None:
-                    # 常规路径保持旧的调用形状（selector/arg 省略），不破坏按位置
-                    # 捕获 inner 的既有测试桩
+                    # The regular path keeps the old call shape (selector/arg omitted), so positional
+                    # capture of inner by existing test stubs does not break
                     self._send_async_inner(msg, mq, gated, timeout - cost)
                 else:
                     self._send_async_inner(msg, mq, gated, timeout - cost,
@@ -1268,7 +1268,7 @@ class DefaultMQProducer:
         msg.topic = self._with_namespace(msg.topic)
         self._check_message(msg)
         if selector is not None:
-            # sendSelectImpl ASYNC：选择器拿到的是路由里的**原始**队列列表
+            # sendSelectImpl ASYNC: the selector receives the **raw** queue list from the route
             publish = self._topic_publish_info(msg.topic)
             selected = selector.select(publish.msg_queue_list, msg, arg)
             if selected is None:
@@ -1280,7 +1280,7 @@ class DefaultMQProducer:
             return
         if mq is not None:
             self._check_pinned_topic(msg.topic, mq, _PINNED_TOPIC_MISMATCH_ASYNC)
-        # 与同步发送同理：压缩在重试链之外做一次，避免重试时把已压缩的 body 再压一遍
+        # Same as the synchronous send: compression happens once outside the retry chain, so a retry does not compress an already-compressed body again
         sys_flag = self.try_to_compress_message(msg)
         if mq is not None:
             self._send_kernel_async(client, msg, mq, callback, timeout, sys_flag, None)
@@ -1288,7 +1288,7 @@ class DefaultMQProducer:
         try:
             publish = self._topic_publish_info(msg.topic)
         except MQClientException as e:
-            # 同同步发送：10004 原样透传，其余按 10005 定性
+            # Same as the synchronous send: 10004 is passed through as-is, everything else is classified as 10005
             raise MQClientException(str(e),
                                     e.response_code or ClientErrorCode.NOT_FOUND_TOPIC_EXCEPTION)
         selected = self._mq_fault_strategy.select_one_message_queue(publish, None, False)
@@ -1379,7 +1379,7 @@ class DefaultMQProducer:
                 return
             logger.warning("async send msg by retry %d times. topic=%s, brokerAddr=%s, "
                            "brokerName=%s: %s", attempt, msg.topic, addr, retry_broker, error)
-            # 换新 opaque：旧请求还挂在 responseTable 里等超时，复用会把两次尝试的应答串台
+            # Use a new opaque: the old request is still sitting in responseTable waiting to time out, and reusing it would cross the two attempts' replies
             request.opaque = RemotingCommand.create_new_request_id()
             self._send_message_async(client, addr, retry_broker, retry_mq, msg, request, timeout,
                                      callback, publish, context, times)
@@ -1449,7 +1449,7 @@ class DefaultMQProducer:
         publish = self._topic_publish_info(msg.topic)
         selected = selector.select(publish.msg_queue_list, msg, arg)
         mq_sel = MessageQueue(msg.topic, selected.broker_name, selected.queue_id)
-        # 选择器用的是原始消息（topic/业务字段），压缩只影响 body
+        # The selector uses the original message (topic/business fields); compression only affects the body
         self._check_message(msg)
         sys_flag = self.try_to_compress_message(msg)
         if self._has_send_interceptors():
@@ -1469,8 +1469,8 @@ class DefaultMQProducer:
             if m.topic != topic:
                 raise MQClientException(
                     "all messages in one batch must have the same topic")
-        # 与 send_by_selector 同序：先拼命名空间再查发布信息（_send_batch 里每条消息
-        # 的 wrap_namespace 是幂等的，重复包装无害）
+        # Same order as send_by_selector: append the namespace first, then look up publish info (wrap_namespace per message
+        # inside _send_batch is idempotent, so double-wrapping is harmless)
         topic = self._with_namespace(topic)
         publish = self._topic_publish_info(topic)
         selected = selector.select(publish.msg_queue_list, msgs, arg)
@@ -1555,7 +1555,7 @@ class DefaultMQProducer:
             self.produce_accumulator.send_async_with_mq(msg, mq, send_callback, self)
         return None
 
-    # ---------------- 批量发送 ----------------
+    # ---------------- Batch sending ----------------
     def _send_batch(self, msgs: List[Message], mq: Optional[MessageQueue] = None,
                     timeout_millis: Optional[int] = None,
                     pinned_guard_message: str = _PINNED_TOPIC_MISMATCH_SYNC) -> SendResult:
@@ -1572,7 +1572,7 @@ class DefaultMQProducer:
         batch.set_body(batch.encode())
         if mq is not None:
             self._check_pinned_topic(batch.topic, mq, pinned_guard_message)
-        # MessageBatch 会被 try_to_compress_message 直接跳过（返回 0），批量消息永不压缩
+        # A MessageBatch is skipped by try_to_compress_message directly (it returns 0); batch messages are never compressed
         sys_flag = self.try_to_compress_message(batch)
         if mq is not None:
             if self._has_send_interceptors():
@@ -1595,7 +1595,7 @@ class DefaultMQProducer:
             return MessageSysFlag.TRANSACTION_COMMIT_TYPE      # 0x2 << 2 = 8
         if state == LocalTransactionState.ROLLBACK_MESSAGE:
             return MessageSysFlag.TRANSACTION_ROLLBACK_TYPE    # 0x3 << 2 = 12
-        return MessageSysFlag.TRANSACTION_NOT_TYPE             # 0（UNKNOW）
+        return MessageSysFlag.TRANSACTION_NOT_TYPE             # 0 (UNKNOW)
 
     def send_message_in_transaction(self, msg: Message,
                                     listener: TransactionListener,
@@ -1618,10 +1618,10 @@ class DefaultMQProducer:
         client = self._require_client()
         self._check_message(msg)
 
-        # 半消息标记（broker 侧据此把消息写入 RMQ_SYS_TRANS_HALF_TOPIC）
+        # Half-message marker (the broker writes such messages to RMQ_SYS_TRANS_HALF_TOPIC based on it)
         msg.put_property(MessageConst.PROPERTY_TRANSACTION_PREPARED, "true")
         msg.put_property(MessageConst.PROPERTY_PRODUCER_GROUP, self.producer_group)
-        # 回查时按此 listener 回调（broker 通过 PGROUP 属性定位到本生产者）
+        # The callback on check uses this listener (the broker locates this producer via the PGROUP property)
         self._transaction_listener = listener
 
         publish = self._topic_publish_info(msg.topic)
@@ -1633,8 +1633,8 @@ class DefaultMQProducer:
             sys_flag, MessageSysFlag.TRANSACTION_PREPARED_TYPE)
 
         try:
-            # 事务发送同样走 sendKernelImpl（→ 同样触发发送钩子），
-            # 所以开启轨迹后事务消息会先落一条 Pub（Trans_Msg_Half）轨迹
+            # The transactional send also goes through sendKernelImpl (→ send hooks fire too),
+            # so with tracing enabled a transactional message first lands a Pub (Trans_Msg_Half) trace
             send_result = self._send_with_hooks(client, msg, mq_sel,
                                                self.send_msg_timeout, sys_flag)
         except Exception as e:  # noqa: BLE001
@@ -1682,7 +1682,7 @@ class DefaultMQProducer:
         header = EndTransactionRequestHeader()
 
         if from_transaction_check:
-            # 回收时 broker 会把 COMPRESSED/事务相关信息放在回查请求里
+            # On a check, the broker carries COMPRESSED/transaction-related information in the check request
             header.commit_log_offset = check_header.commit_log_offset
             header.tran_state_table_offset = check_header.tran_state_table_offset
             header.transaction_id = check_header.transaction_id
@@ -1773,7 +1773,7 @@ class DefaultMQProducer:
         t = threading.Thread(target=_run, name="TransactionCheckThread", daemon=True)
         t.start()
 
-    # ---------------- 管理能力 ----------------
+    # ---------------- Admin capabilities ----------------
     def fetch_publish_message_queues(self, topic: str) -> List[MessageQueue]:
         client = self._require_client()
         publish = client.get_topic_publish_info(topic)
@@ -1825,7 +1825,7 @@ class DefaultMQProducer:
     def view_message(self, topic: str, msg_id: str):
         raise MQClientException("viewMessage by msgId is not supported in Python edition")
 
-    # ---------------- 辅助 ----------------
+    # ---------------- Helpers ----------------
     def _check_message(self, msg: Message) -> None:
         pass
         validators.check_message(msg, self.max_message_size)
@@ -1862,7 +1862,7 @@ class TransactionMQProducer(DefaultMQProducer):
 
 
 class SendCallbackImpl(SendCallback):
-    """便捷回调包装：把 on_success / on_exception 转成普通函数。"""
+    """Convenience callback wrapper: turn on_success / on_exception into plain functions."""
 
     def __init__(self, success_fn: Optional[Callable[[SendResult], None]] = None,
                  exception_fn: Optional[Callable[[Exception], None]] = None):

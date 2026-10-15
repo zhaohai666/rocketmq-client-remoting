@@ -1,7 +1,7 @@
-// 发送头三个字段（defaultTopic / defaultTopicQueueNums / brokerName）真机联调（场景段 H0–H5）。
+// Real-machine integration of the three send header fields (defaultTopic / defaultTopicQueueNums / brokerName) (scenario sections H0-H5).
 //
 //
-// 用法：rmq send-header [namesrv]（需本地 5.5.1 集群，autoCreateTopicEnable=true）
+// Usage: rmq send-header [namesrv] (needs a local 5.5.1 cluster, autoCreateTopicEnable=true)
 using System.Text;
 
 using RocketMQ.Client;
@@ -50,7 +50,7 @@ public static class LiveSendHeader
         }
     }
 
-    /// <summary>按 stamp 隔离的一组 topic；跑完 Cleanup 扫干净。</summary>
+    /// <summary>A group of topics isolated by stamp; Cleanup sweeps them afterwards.</summary>
     private static readonly List<string> Topics = new();
 
     private static string Topic(string kind)
@@ -60,7 +60,7 @@ public static class LiveSendHeader
         return t;
     }
 
-    /// <summary>一次异步发送的终态。</summary>
+    /// <summary>The terminal state of one async send.</summary>
     private sealed class Latch : ISendCallback
     {
         private readonly object _lk = new();
@@ -95,8 +95,9 @@ public static class LiveSendHeader
     }
 
     /// <summary>
-    /// 配好并启动一个生产者。instanceName 显式给定，clientId 才可预测；c/d 两个旋钮
-    /// 传 null 表示保持默认（H1 就是拿默认值当基线的）。
+    /// Configures and starts a producer. instanceName is given explicitly so that the
+    /// clientId is predictable; passing null for the two knobs c/d means keeping the
+    /// defaults (H1 uses the defaults as its baseline).
     /// </summary>
     private sealed class ScopedProducer : IDisposable
     {
@@ -137,7 +138,8 @@ public static class LiveSendHeader
         }
     }
 
-    /// <summary>读回 broker 上该 topic 的 (read, write) 队列数；还不存在返回 null。</summary>
+    /// <summary>Reads back the (read, write) queue count of that topic on the broker; returns
+    /// null when it does not exist yet.</summary>
     private static (int Read, int Write)? QueueNums(string topic)
     {
         try
@@ -151,14 +153,16 @@ public static class LiveSendHeader
         }
     }
 
-    /// <summary>等 topic 在 broker 上出现（自动建 topic 在发送链路里同步做，落地要一点时间）。</summary>
+    /// <summary>Waits for the topic to appear on the broker (auto topic creation happens
+    /// synchronously in the send path and takes a moment to land).</summary>
     private static (int Read, int Write) WaitForTopic(string topic)
     {
         WaitUntil(() => QueueNums(topic) is not null, 10);
         return QueueNums(topic) ?? (-1, -1);
     }
 
-    /// <summary>该 topic 全 broker 的落库条数（新 topic 的 minOffset 恒为 0）；读不到返回 -1。</summary>
+    /// <summary>The number of stored messages of that topic across all brokers (a new
+    /// topic's minOffset is always 0); returns -1 when it cannot be read.</summary>
     private static long TotalMessages(string topic)
     {
         try
@@ -177,45 +181,46 @@ public static class LiveSendHeader
         }
     }
 
-    // ------------------------------------------------- H0/H1/H2/H3 队列数
+    // ------------------------------------------------- H0/H1/H2/H3 queue counts
     private static void H0ToH3QueueNums()
     {
-        // H0：TBW102 是这个 broker 上真正的「模板 topic」，H2/H3 的判据都依赖它的队列数
+        // H0: TBW102 is this broker's real "template topic", and the criteria of H2/H3 both depend on its queue count
         (int Read, int Write)? tbw = QueueNums(MixAll.DefaultTopic);
         if (tbw is null || tbw.Value.Write <= 0)
         {
-            Check("H0 TBW102 模板可读", false, "examineTopicConfig(TBW102) 读不到");
+            Check("H0 the TBW102 template is readable", false, "examineTopicConfig(TBW102) cannot be read");
             return;
         }
-        Check("H0 TBW102 模板可读", true, "read=" + tbw.Value.Read + " write=" + tbw.Value.Write);
+        Check("H0 the TBW102 template is readable", true, "read=" + tbw.Value.Read + " write=" + tbw.Value.Write);
 
-        // H1：什么都不设，d 走 MixAll.DefaultTopicQueueNums(4)
+        // H1: set nothing, d goes with MixAll.DefaultTopicQueueNums(4)
         string t1 = Topic("Def");
         using (ScopedProducer p1 = new("h1"))
         {
             SendResult r1 = p1.Send(t1, "h1");
-            Check("H1 默认配置发送成功", r1.SendStatus == SendStatus.SendOk,
+            Check("H1 the send with the default config succeeded", r1.SendStatus == SendStatus.SendOk,
                 "msgId=" + r1.MsgId + " broker=" + r1.MessageQueue.BrokerName);
         }
         (int Read, int Write) n1 = WaitForTopic(t1);
         int want1 = Math.Min(MixAll.DefaultTopicQueueNums, tbw.Value.Write);
-        Check("H1 默认 d=4 建的 topic 队列数=min(4, TBW102)",
+        Check("H1 a topic created with the default d=4 has min(4, TBW102) queues",
             n1.Write == want1 && n1.Read == n1.Write,
             "read=" + n1.Read + " write=" + n1.Write + " (TBW102=" + tbw.Value.Write + ")");
 
-        // H2：d=2 必须把队列数带下去——修之前这里写死 4
+        // H2: d=2 must carry the queue count down -- before the fix it was hard-coded to 4
         string t2 = Topic("Nums");
         using (ScopedProducer p2 = new("h2", null, 2))
         {
             p2.Send(t2, "h2");
         }
         (int Read, int Write) n2 = WaitForTopic(t2);
-        Check("H2 DefaultTopicQueueNums=2 建的 topic 只有 2 条队列",
+        Check("H2 a topic created with DefaultTopicQueueNums=2 has only 2 queues",
             n2.Write == Math.Min(2, tbw.Value.Write) && n2.Read == n2.Write,
-            "read=" + n2.Read + " write=" + n2.Write + "（写死 4 的旧行为会是 " + n1.Write + "）");
+            "read=" + n2.Read + " write=" + n2.Write + " (the old hard-coded-4 behaviour would be " + n1.Write + ")");
 
-        // H3：c 指向自己的模板 topic。模板必须带 PERM_INHERIT，否则 TopicConfigManager:286
-        // 的 isInherited 不通过，broker 直接拒绝自动建 topic
+        // H3: c points at its own template topic. The template must carry PERM_INHERIT,
+        // otherwise isInherited at TopicConfigManager:286 fails and the broker refuses to
+        // auto-create the topic
         string src = Topic("Src");
         try
         {
@@ -224,11 +229,11 @@ public static class LiveSendHeader
         }
         catch (Exception e)
         {
-            Check("H3 模板 topic 创建", false, e.Message);
+            Check("H3 the template topic was created", false, e.Message);
             return;
         }
         (int Read, int Write) nsrc = WaitForTopic(src);
-        Check("H3 模板 topic 建好（3 条队列、带 INHERIT）",
+        Check("H3 the template topic is built (3 queues, with INHERIT)",
             nsrc.Write == 3 && !(nsrc.Read == tbw.Value.Read && nsrc.Write == tbw.Value.Write),
             "src=(" + nsrc.Read + "," + nsrc.Write + ") tbw102=(" + tbw.Value.Read + "," +
             tbw.Value.Write + ")");
@@ -239,12 +244,12 @@ public static class LiveSendHeader
             p3.Send(t3, "h3");
         }
         (int Read, int Write) n3 = WaitForTopic(t3);
-        Check("H3 createTopicKey=模板 topic 时被继承（min(8,3)=3 而不是 TBW102 的 " +
-            tbw.Value.Write + "）", n3.Write == 3 && n3.Read == 3,
+        Check("H3 createTopicKey=the template topic is inherited (min(8,3)=3 rather than TBW102's " +
+            tbw.Value.Write + ")", n3.Write == 3 && n3.Read == 3,
             "read=" + n3.Read + " write=" + n3.Write);
     }
 
-    // ------------------------------------------------------------- H4 五种入口
+    // ------------------------------------------------------------- H4 five entry points
     private static void H4SendEntries()
     {
         string t4 = Topic("Entries");
@@ -255,7 +260,7 @@ public static class LiveSendHeader
             SendResult rs = p.Send(t4, "h4-sync");
             landed["sync"] = rs.SendStatus == SendStatus.SendOk ? "" : "status=" + rs.SendStatus;
 
-            // 定点发送：显式给 mq，落在另一条调用链上（broker 名由调用方给）
+            // pinned send: mq given explicitly, landing on a different call chain (the broker name comes from the caller)
             MessageQueue mq = rs.MessageQueue;
             SendResult rb = p.Producer.Send(new Message(t4, Bytes("h4-pinned")), mq, 5000);
             landed["pinned"] = rb.SendStatus == SendStatus.SendOk
@@ -265,7 +270,7 @@ public static class LiveSendHeader
             try
             {
                 p.Producer.SendOneway(new Message(t4, Bytes("h4-oneway")));
-                landed["oneway"] = "";  // 单向没有应答，只能靠后面的总数兜底
+                landed["oneway"] = "";  // oneway has no response, so only the later total can back it up
             }
             catch (Exception e)
             {
@@ -279,17 +284,17 @@ public static class LiveSendHeader
 
             p.Producer.SendAsync(new Message(t4, Bytes("h4-async")), latch, 5000);
             landed["async"] = latch.WaitDone(10000) && latch.FirstOk()
-                ? "" : "回调没拿到唯一的 SEND_OK：" + latch.Errors();
+                ? "" : "the callback did not get a unique SEND_OK: " + latch.Errors();
         }
 
         foreach (string entry in new[] { "sync", "pinned", "oneway", "batch", "async" })
         {
-            string why = landed.TryGetValue(entry, out string? v) ? v : "该入口没有记录";
-            Check("H4 " + entry + " 入口发送成功", why.Length == 0, why);
+            string why = landed.TryGetValue(entry, out string? v) ? v : "that entry point recorded nothing";
+            Check("H4 the " + entry + " entry point sent successfully", why.Length == 0, why);
         }
-        // 1 同步 + 1 定点 + 1 单向 + 3 批量 + 1 异步 = 7 条
+        // 1 synchronous + 1 pinned + 1 oneway + 3 batch + 1 async = 7 messages
         bool got = WaitUntil(() => TotalMessages(t4) >= 7, 20);
-        Check("H4 七条消息逐条落库（批量按子消息计）", got && TotalMessages(t4) == 7,
+        Check("H4 all seven messages landed one by one (a batch counts per sub-message)", got && TotalMessages(t4) == 7,
             "total=" + TotalMessages(t4));
     }
 
@@ -302,9 +307,9 @@ public static class LiveSendHeader
         {
             r5 = p.Send(t5, "h5");
         }
-        Check("H5 落点 broker 名与路由一致（n 就是它）",
+        Check("H5 the landing broker name matches the route (n is it)",
             r5.SendStatus == SendStatus.SendOk && r5.MessageQueue.BrokerName == _brokerName,
-            "落点=" + r5.MessageQueue.BrokerName + " 路由=" + _brokerName);
+            "landed on=" + r5.MessageQueue.BrokerName + " route=" + _brokerName);
     }
 
     private static void Cleanup()
@@ -335,7 +340,7 @@ public static class LiveSendHeader
 
         try
         {
-            // 集群探活：拿 broker 地址，并反查它的 brokerName（H5 的判据）
+            // cluster liveness: take the broker address and look its brokerName back up (the criterion of H5)
             ClusterInfo? cluster = null;
             WaitUntil(() =>
             {
@@ -351,7 +356,7 @@ public static class LiveSendHeader
             }, 30);
             if (cluster is null || cluster.BrokerAddrTable.Count == 0)
             {
-                Check("集群探活", false, "nameServer 无 broker 注册");
+                Check("the cluster liveness probe", false, "the nameServer has no broker registered");
             }
             else
             {
@@ -361,7 +366,7 @@ public static class LiveSendHeader
                     _brokerName = kv.Key;
                     break;
                 }
-                Check("集群探活", _brokerAddr.Length > 0,
+                Check("the cluster liveness probe", _brokerAddr.Length > 0,
                     "broker=" + _brokerAddr + " name=" + _brokerName);
 
                 H0ToH3QueueNums();
@@ -371,7 +376,7 @@ public static class LiveSendHeader
         }
         catch (Exception e)
         {
-            Check("联调异常", false, e.Message);
+            Check("the integration threw", false, e.Message);
         }
 
         Cleanup();

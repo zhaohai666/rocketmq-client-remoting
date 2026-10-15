@@ -18,7 +18,7 @@ from common.util_all import utf16_int32_hash
 MQ = MessageQueue("TopicTest", "broker-a", 0)
 
 
-# ---------------------------------------------------------------- 订阅语义对拍
+# ---------------------------------------------------------------- Subscription semantics cross-check
 def test_sub_all_leaves_tags_and_codes_empty():
     for raw in ("*", None, ""):
         sub = FilterAPI.build_subscription_data("T", raw)
@@ -69,7 +69,7 @@ def test_split_error_raises_on_an_empty_tag_list():
 
 
 def test_tag_hash_vectors():
-    # 向量由本地探针程序打印
+    # Vectors printed by a local probe program
     assert utf16_int32_hash("TagA") == 2598919
     assert utf16_int32_hash("TagB") == 2598920
     assert utf16_int32_hash("P") == 80
@@ -98,7 +98,7 @@ class _RecordingForbidden(CheckForbiddenHook):
 
 
 class _FakeClient:
-    """最小可用的 MQClientInstance 替身：只覆盖 send() 会碰到的接口。"""
+    """Minimal usable MQClientInstance double: only covers the interfaces send() touches."""
 
     def __init__(self):
         self.sends = 0
@@ -141,7 +141,7 @@ def test_register_and_has():
     assert p.has_check_forbidden_hook() is False
     p.register_check_forbidden_hook(_RecordingForbidden())
     assert p.has_check_forbidden_hook() is True
-    p.register_check_forbidden_hook(None)          # None 忽略
+    p.register_check_forbidden_hook(None)          # None ignored
     assert len(p.check_forbidden_hook_list) == 1
 
 
@@ -158,12 +158,12 @@ def test_context_fields_match_the_rpc_contract():
     assert ctx.mq is MQ
     assert ctx.arg == {"biz": 1}
     assert ctx.unit_mode is False
-    assert ctx.send_result is None                 # 此刻还没发（与 SendMessageContext 的差别）
+    assert ctx.send_result is None                 # not sent yet (the difference from SendMessageContext)
 
 
 def test_exception_is_not_swallowed():
-    """CheckForbiddenHook 的异常必须向上抛（这是"拦截"的实现方式），
-    对比 send/consume 钩子的异常一律吞掉。"""
+    """Exceptions from CheckForbiddenHook must propagate upward (this is how "interception" is implemented),
+    in contrast to send/consume hooks whose exceptions are always swallowed."""
     p = _producer_with_fake_client([_RecordingForbidden(forbid=True)])
     with pytest.raises(MQClientException):
         p._execute_check_forbidden(Message("TopicTest", b"x"), MQ, "addr")
@@ -174,8 +174,8 @@ def test_send_is_blocked_and_hook_runs_per_attempt():
     p = _producer_with_fake_client([hook], retry=2)
     with pytest.raises(MQClientException):
         p.send(Message("TopicTest", b"hello"))
-    assert len(hook.calls) == 3, "retryTimesWhenSendFailed=2 → 共 3 次尝试，每次都要过钩子"
-    assert p._mq_client.sends == 0, "被拦截的发送不能真的发出去"
+    assert len(hook.calls) == 3, "retryTimesWhenSendFailed=2 → 3 attempts total, each must pass the hook"
+    assert p._mq_client.sends == 0, "an intercepted send must not actually go out"
 
 
 def test_send_passes_when_hook_allows():
@@ -241,7 +241,7 @@ def _msgs(*tags_bodies):
 
 
 def test_client_side_tag_filter_skips_sub_all():
-    """订阅 "*" 时 tags_set 为空 → 不过滤（这正是 SUB_ALL 必须留空的原因）。"""
+    """With subscription "*" tags_set is empty → no filtering (this is why SUB_ALL must stay empty)."""
     msgs = _msgs(("TagA", b"a"), ("TagB", b"b"))
     sub_all = FilterAPI.build_subscription_data("TopicTest", "*")
     assert client_side_tag_filter(sub_all, msgs) == msgs
@@ -302,7 +302,7 @@ def test_pull_consumer_registers_filter_hook():
     c.register_filter_message_hook(_DroppingFilter())
     kept = c._filter_messages_for_delivery(MQ, _msgs(("T", b"drop"), ("T", b"keep")))
     assert [m.body for m in kept] == [b"keep"]
-    # 无钩子时原样返回
+    # Returned as-is when there is no hook
     c2 = DefaultMQPullConsumer("GID_test2")
     msgs = _msgs(("T", b"drop"))
     assert c2._filter_messages_for_delivery(MQ, msgs) == msgs

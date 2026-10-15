@@ -1,8 +1,9 @@
-// 定时消息撤回（RecallMessage 370）的离线单测：编解码、报文键名与本地校验顺序。
+// Offline unit tests for scheduled message recall (RecallMessage 370): codec, wire key
+// names and the local validation order.
 using System.Diagnostics;
 using RocketMQ.Remoting.Protocol;
 using Xunit;
-// 与 src 侧的 global using 保持一致（测试项目没有该全局别名）
+// Kept consistent with the global usings on the src side (the test project does not have that global alias)
 using PropertyMap = System.Collections.Generic.SortedDictionary<string, string>;
 
 namespace RocketMQ.Client.Tests;
@@ -17,7 +18,7 @@ public class RecallMessageTests
     private const string LegacyVector =
         "djEgVG9waWNBIGJyb2tlci1hIDE3MDAwMDAwMDAwMDAgMDEyMzQ1Njc4OUFCQ0RFRjAxMjM0NTY3ODlhYmNkZWY=";
 
-    // ---------------------------------------------------------------- 句柄编解码
+    // ---------------------------------------------------------------- Handle codec
 
     [Fact]
     public void BuildHandleMatchesLegacyVector()
@@ -58,11 +59,11 @@ public class RecallMessageTests
     [InlineData("   ")]
     [InlineData("not-a-handle")]
     [InlineData("!!!!")]
-    // v2：版本段不认识就拒，避免把新格式当成 v1 解出错位字段
+    // v2: an unrecognised version segment is rejected, so a new format is not decoded as a v1 with misaligned fields
     [InlineData("djIgVG9waWNBIGIgMSBpZA==")]
-    // 只有 4 段：缺 messageId
+    // only 4 segments: messageId is missing
     [InlineData("djEgVG9waWNBIGIgMQ==")]
-    // 合法 base64、非法 utf-8
+    // legal base64, invalid utf-8
     [InlineData("__4gYmFkIHV0Zjg=")]
     public void InvalidHandlesFailWithLegacyMessage(string handle)
     {
@@ -71,7 +72,7 @@ public class RecallMessageTests
         Assert.Equal(RecallMessageHandle.InvalidHandle, e.Message);
     }
 
-    // ---------------------------------------------------------------- 协议头字段名
+    // ---------------------------------------------------------------- Protocol header field names
 
     [Fact]
     public void RecallRequestHeaderUsesLegacyKeys()
@@ -111,7 +112,7 @@ public class RecallMessageTests
     [Fact]
     public void SendResponseHeaderParsesRecallHandle()
     {
-        // broker 只对定时消息挂 recallHandle；普通消息不带这个键，解出来必须是 null。
+        // The broker only attaches a recallHandle to scheduled messages; a normal message does not carry that key and must decode to null.
         var ext = new PropertyMap
         {
             ["msgId"] = UniqKey,
@@ -135,7 +136,7 @@ public class RecallMessageTests
         Assert.Equal(370, RequestCode.RecallMessage);
     }
 
-    // ---------------------------------------------------------------- 本地校验顺序
+    // ---------------------------------------------------------------- Local validation order
 
     [Fact]
     public void RecallBeforeStartIsRejected()
@@ -149,8 +150,8 @@ public class RecallMessageTests
     [Fact]
     public void LocalValidationRunsBeforeAnyNetworkCall()
     {
-        // 名字服务器指向必然被拒绝的端口：本地校验若在打网络之前跑完，就必须秒回，
-        // 且抛的是**校验**错误而不是 RPC 超时。
+        // the name server points at a port that is guaranteed to be refused: if the local validation runs before any network access it must come back instantly,
+        // and what it throws must be a **validation** error rather than an RPC timeout.
         var p = new DefaultMQProducer("PG_recall_unit") { NamesrvAddr = "127.0.0.1:1" };
         p.Start();
         try
@@ -165,7 +166,7 @@ public class RecallMessageTests
             string corrupt = RecallMessageThrows(p, Topic, "not-a-handle") ?? string.Empty;
             double costMs = Stopwatch.GetElapsedTime(began).TotalMilliseconds;
             Assert.Equal(RecallMessageHandle.InvalidHandle, corrupt);
-            Assert.True(costMs < 200, "非法句柄必须不打网络，实际 " + costMs + "ms");
+            Assert.True(costMs < 200, "an illegal handle must not touch the network, actually " + costMs + "ms");
 
             Assert.Equal("Can not find Message Queue for topic: " + Topic,
                 RecallMessageThrows(p, Topic, LegacyVector));

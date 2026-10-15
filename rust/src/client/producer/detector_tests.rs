@@ -1,7 +1,7 @@
-//! 真集群造不出「探测超时」也观察不到「探测恢复放行」的时序，所以这里在进程内
-//! 起一个假集群（1 个 namesrv + 1 个 broker，只说 remoting 协议），broker 的
-//! `GET_MAX_OFFSET(30)` 应答可脚本化（即时 SUCCESS / 延迟超过 detectTimeout /
-//! 回业务错误码），探测是否真的发过请求靠请求计数断言。
+//! A real cluster cannot produce the "probe times out" timing nor expose the "probe recovery
+//! releases the broker" timing, so this module stands up an in-process fake cluster (1 namesrv +
+//! 1 broker, speaking only the remoting protocol) whose `GET_MAX_OFFSET(30)` response is
+//! scriptable (immediate SUCCESS / delay beyond detectTimeout / business error code); whether probing actually sent requests is asserted via the request counter.
 
 #![cfg(test)]
 
@@ -17,20 +17,20 @@ use crate::remoting::protocol::route::{BrokerData, QueueData, TopicRouteData};
 
 const MAX_FRAME: i32 = 20 * 1024 * 1024;
 
-// ---------------------------------------------------------------- 假集群
+// ---------------------------------------------------------------- fake cluster
 
-/// broker 的 `GET_MAX_OFFSET` 行为开关（探测之外的请求一律即时 SUCCESS）。
+/// Behavior switches for the broker's `GET_MAX_OFFSET` (requests other than probes always get immediate SUCCESS).
 struct DetectState {
-    /// GET_MAX_OFFSET 应答前 sleep 的毫秒数（> detectTimeout ⇒ 探测超时）。
+    /// Milliseconds to sleep before answering GET_MAX_OFFSET (> detectTimeout ⇒ probe timeout).
     max_offset_delay_ms: AtomicU64,
-    /// GET_MAX_OFFSET 是否回 SUCCESS；false ⇒ SYSTEM_ERROR。
+    /// Whether GET_MAX_OFFSET answers SUCCESS; false ⇒ SYSTEM_ERROR.
     max_offset_ok: AtomicBool,
-    /// 收到的 GET_MAX_OFFSET 请求数（探测是否真发过、是否周期发的唯一观察点）。
+    /// Number of GET_MAX_OFFSET requests received (the only observation point for whether probes were sent and whether they are periodic).
     max_offset_requests: AtomicUsize,
 }
 
-/// 进程内假集群：1 个 namesrv（只答路由）+ 1 个 broker（broker-0）。
-/// spawn 出的任务句柄就地丢弃（detach）：任务跟着测试运行时走，运行时结束即被回收。
+/// In-process fake cluster: 1 namesrv (answers routes only) + 1 broker (broker-0).
+/// Spawned task handles are dropped on the spot (detach): the tasks follow the test runtime and are reaped when it ends.
 struct DetectCluster {
     namesrv_addr: String,
     state: Arc<DetectState>,
@@ -43,25 +43,25 @@ impl DetectCluster {
         let namesrv = TcpListener::bind("127.0.0.1:0").await.expect("bind mock namesrv");
         let namesrv_addr = namesrv.local_addr().expect("mock namesrv addr").to_string();
         let state = Arc::new(DetectState {
-            // 默认即时 SUCCESS：healthy broker 的形状
+            // default: immediate SUCCESS, the shape of a healthy broker
             max_offset_delay_ms: AtomicU64::new(0),
             max_offset_ok: AtomicBool::new(true),
             max_offset_requests: AtomicUsize::new(0),
         });
-        // 句柄直接 detach：与 send_retry_tests 的「只持有、不等待」同效，
-        // 测试运行时 drop 时这些任务一并被 abort。
+        // Handles are detached directly: same effect as send_retry_tests' "hold but do not await";
+        // the tasks are aborted together when the test runtime drops.
         let _namesrv_task = spawn_namesrv(namesrv, broker_addr.clone());
         let _broker_task = spawn_broker(broker, state.clone());
         DetectCluster { namesrv_addr, state }
     }
 
-    /// 脚本化探测应答：是否 SUCCESS、应答前延迟多少毫秒。
+    /// Script the probe response: whether SUCCESS and how many milliseconds to delay before answering.
     fn set_probe(&self, ok: bool, delay_ms: u64) {
         self.state.max_offset_ok.store(ok, Ordering::SeqCst);
         self.state.max_offset_delay_ms.store(delay_ms, Ordering::SeqCst);
     }
 
-    /// broker 已收到的 GET_MAX_OFFSET 请求数。
+    /// Number of GET_MAX_OFFSET requests the broker has received.
     fn requests(&self) -> usize {
         self.state.max_offset_requests.load(Ordering::SeqCst)
     }
@@ -86,7 +86,7 @@ async fn write_frame(stream: &mut TcpStream, response: &mut RemotingCommand) {
     let _ = stream.flush().await;
 }
 
-/// 带请求 `opaque` 的响应（客户端按 opaque 配对，串了就当噪声丢掉）。
+/// Response carrying the request's `opaque` (the client pairs by opaque; a mismatched one is dropped as noise).
 fn response_for(request: &RemotingCommand, code: i32) -> RemotingCommand {
     let mut response = RemotingCommand::create_response(code, Some("mock failure".to_string()));
     response.opaque = request.opaque;
@@ -111,10 +111,10 @@ fn route_json(broker_addr: &str) -> Vec<u8> {
         )],
         ..Default::default()
     };
-    serde_json::to_vec(&route.to_json_value()).expect("路由可序列化")
+    serde_json::to_vec(&route.to_json_value()).expect("route is serializable")
 }
 
-/// namesrv：对任何 topic 都回同一份路由（broker-0 → 固定地址），其余 SUCCESS。
+/// namesrv: answers every topic with the same route (broker-0 → fixed address), everything else SUCCESS.
 fn spawn_namesrv(listener: TcpListener, broker_addr: String) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -137,7 +137,7 @@ fn spawn_namesrv(listener: TcpListener, broker_addr: String) -> JoinHandle<()> {
     })
 }
 
-/// broker：GET_MAX_OFFSET 按 `DetectState` 脚本应答，SEND 回 SUCCESS，其余即时 SUCCESS。
+/// broker: answers GET_MAX_OFFSET per the `DetectState` script, SEND with SUCCESS, everything else immediate SUCCESS.
 fn spawn_broker(listener: TcpListener, state: Arc<DetectState>) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -195,10 +195,10 @@ fn is_send_code(code: i32) -> bool {
     )
 }
 
-// ---------------------------------------------------------------- 夹具
+// ---------------------------------------------------------------- fixtures
 
-/// 起一个指向假集群、按给定参数开启探测的生产者。`instance` 必须唯一：
-/// 同 clientId 会共享 [`MQClientInstance`]（连带路由表）。
+/// Starts a producer pointed at the fake cluster with probing enabled per the given parameters. `instance` must be unique:
+/// the same clientId shares one [`MQClientInstance`] (route table included).
 async fn started(
     instance: &str,
     cluster: &DetectCluster,
@@ -206,7 +206,7 @@ async fn started(
     detect_timeout: i64,
     detect_interval: i64,
 ) -> DefaultMQProducer {
-    let producer = DefaultMQProducer::new("GID_fault_detector").expect("组名合法");
+    let producer = DefaultMQProducer::new("GID_fault_detector").expect("group name is valid");
     producer.set_instance_name(instance);
     producer.set_namesrv_addr(&cluster.namesrv_addr);
     producer.set_send_latency_fault_enable(true);
@@ -216,40 +216,40 @@ async fn started(
     assert_eq!(producer.is_start_detector_enable(), detector_enable);
     assert_eq!(producer.get_detect_timeout(), detect_timeout);
     assert_eq!(producer.get_detect_interval(), detect_interval);
-    producer.start().await.expect("假集群里 start 应当成功");
+    producer.start().await.expect("start should succeed against the fake cluster");
     producer
 }
 
-/// 发一笔消息把路由种进客户端实例：探测的 `Resolver`（broker 地址表）与
-/// `pickTopic`（路由表）都靠它，没有这一步探测无从下手。
+/// Sends one message to seed the route into the client instance: the detector's `Resolver`
+/// (broker address table) and `pickTopic` (route table) both depend on it; without this step probing has nothing to work with.
 async fn seed_route(producer: &DefaultMQProducer) {
     let mut msg = Message::new("T1", Some(b"body"));
     producer
         .send(&mut msg, Some(30_000), None)
         .await
-        .expect("假集群里发送应当成功");
+        .expect("send should succeed against the fake cluster");
 }
 
-/// 轮询等待 `cond` 成立（探测 3s 一轮，预算按 20s 给足，避免环境慢导致的抖动）。
+/// Polls until `cond` holds (probes run every 3s; the budget is a generous 20s to avoid flakiness on slow environments).
 async fn wait_for(cond: impl Fn() -> bool, what: &str) {
     let deadline = Instant::now() + Duration::from_secs(20);
     while !cond() {
-        assert!(Instant::now() < deadline, "20s 内没有等到：{what}");
+        assert!(Instant::now() < deadline, "not reached within 20s: {what}");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
-// ---------------------------------------------------------------- 用例
+// ---------------------------------------------------------------- cases
 
 #[test]
 fn detector_config_defaults_match_golden_config() {
     let cfg = ProducerConfig::default();
-    assert!(!cfg.start_detector_enable, "startDetectorEnable 默认 false");
+    assert!(!cfg.start_detector_enable, "startDetectorEnable defaults to false");
     assert_eq!(cfg.detect_timeout, 200);
     assert_eq!(cfg.detect_interval, 2 * 1000);
 
-    // setter/getter 往返
-    let producer = DefaultMQProducer::new("GID_fault_detector").expect("组名合法");
+    // setter/getter round trip
+    let producer = DefaultMQProducer::new("GID_fault_detector").expect("group name is valid");
     assert!(!producer.is_start_detector_enable());
     producer.set_start_detector_enable(true);
     assert!(producer.is_start_detector_enable());
@@ -259,7 +259,7 @@ fn detector_config_defaults_match_golden_config() {
     assert_eq!(producer.get_detect_interval(), 4_000);
 }
 
-/// 开关默认关：故障表里哪怕有不可达的 broker，也不该有任何探测流量。
+/// The switch defaults to off: even with an unreachable broker in the fault table, there must be no probe traffic at all.
 #[tokio::test]
 async fn detector_disabled_by_default_sends_no_probes() {
     let cluster = DetectCluster::start().await;
@@ -272,21 +272,21 @@ async fn detector_disabled_by_default_sends_no_probes() {
         .latency_fault_tolerance()
         .is_reachable("broker-0"));
 
-    // 探测任务确实在跑（3s 首轮），但开关关着不该发任何 GET_MAX_OFFSET
+    // the probe task is indeed running (first round after 3s), but with the switch off no GET_MAX_OFFSET may be sent
     tokio::time::sleep(Duration::from_secs(7)).await;
-    assert_eq!(cluster.requests(), 0, "探测关着不该有探测流量");
+    assert_eq!(cluster.requests(), 0, "no probe traffic while the detector is off");
     assert!(
         !producer
             .fault_strategy()
             .latency_fault_tolerance()
             .is_reachable("broker-0"),
-        "没人探测，broker 维持不可达"
+        "nobody probes, the broker stays unreachable"
     );
     producer.shutdown();
 }
 
-/// 核心场景：发送链路记坏可达性之后，探测周期发 `GET_MAX_OFFSET`，
-/// 探活成功把 broker 放回（恢复放行），且之后仍按周期继续探。
+/// Core scenario: after the send path marks the reachability bad, the detector periodically
+/// sends `GET_MAX_OFFSET`; a successful probe puts the broker back (recovery release), and probing keeps running on schedule afterwards.
 #[tokio::test]
 async fn detector_restores_unreachable_broker_and_keeps_probing() {
     let cluster = DetectCluster::start().await;
@@ -299,16 +299,16 @@ async fn detector_restores_unreachable_broker_and_keeps_probing() {
 
     wait_for(
         || tolerance.is_reachable("broker-0"),
-        "探测成功后 broker-0 应回到可达",
+        "broker-0 should be reachable again after a successful probe",
     )
     .await;
-    assert!(cluster.requests() >= 1, "探测必须真的发过 GET_MAX_OFFSET(30)");
+    assert!(cluster.requests() >= 1, "the detector must actually have sent GET_MAX_OFFSET(30)");
 
-    // 周期触发：恢复后故障项仍在表里，后续轮次继续探（请求计数继续涨）
+    // periodic triggering: after recovery the fault item stays in the table and later rounds keep probing (the request counter keeps rising)
     let seen = cluster.requests();
     wait_for(
         || cluster.requests() > seen,
-        "探测应按 3s 周期继续发起 GET_MAX_OFFSET",
+        "the detector should keep sending GET_MAX_OFFSET on the 3s period",
     )
     .await;
     assert!(tolerance.is_reachable("broker-0"));
@@ -316,12 +316,12 @@ async fn detector_restores_unreachable_broker_and_keeps_probing() {
     producer.shutdown();
 }
 
-/// 超时路径：应答延迟超过 `detectTimeout` ⇒ 每轮探测都失败 ⇒ broker 维持不可达；
-/// broker 恢复即时应答后，下一轮探测把它放回来。
+/// Timeout path: a response delay beyond `detectTimeout` ⇒ every probe round fails ⇒ the broker stays unreachable;
+/// once the broker answers immediately again, the next probe round releases it.
 #[tokio::test]
 async fn detect_timeout_keeps_broker_unreachable_until_it_recovers() {
     let cluster = DetectCluster::start().await;
-    // 应答 800ms > detectTimeout=200ms ⇒ 探测必超时（走协议层超时，不碰 dead port）
+    // response 800ms > detectTimeout=200ms ⇒ the probe must time out (via the protocol-layer timeout, not a dead port)
     cluster.set_probe(true, 800);
     let producer = started("detector_timeout", &cluster, true, 200, 300).await;
     seed_route(&producer).await;
@@ -332,19 +332,19 @@ async fn detect_timeout_keeps_broker_unreachable_until_it_recovers() {
 
     wait_for(
         || cluster.requests() >= 2,
-        "12s 内应发生至少两轮探测（3s 首轮 + 3s 周期）",
+        "at least two probe rounds should happen within 12s (3s first round + 3s period)",
     )
     .await;
     assert!(
         !tolerance.is_reachable("broker-0"),
-        "探测超时不能把 broker 探回来"
+        "a probe timeout must not mark the broker reachable"
     );
 
-    // broker 恢复即时应答 ⇒ 下一轮探测放行
+    // the broker answers immediately again ⇒ the next probe round releases it
     cluster.set_probe(true, 0);
     wait_for(
         || tolerance.is_reachable("broker-0"),
-        "broker 恢复后下一轮探测应把 broker-0 放回",
+        "after the broker recovers, the next probe round should put broker-0 back",
     )
     .await;
 

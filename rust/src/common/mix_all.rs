@@ -1,5 +1,5 @@
-//! `PermName` 唯一定义在 [`crate::common::sysflag::PermName`]，此处只做 re-export（见
-//! 下一行），避免两处定义漂移。
+//! `PermName` is defined only once, in [`crate::common::sysflag::PermName`]; this module only
+//! re-exports it (see the next line), so the two definitions cannot drift apart.
 
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::OnceLock;
@@ -42,9 +42,9 @@ impl MixAll {
     pub const RETRY_GROUP_TOPIC_PREFIX: &'static str = "%RETRY%";
     pub const DLQ_GROUP_TOPIC_PREFIX: &'static str = "%DLQ%";
     pub const REPLY_TOPIC_PREFIX: &'static str = "%REPLY%";
-    /// Request-Reply：应答 topic 名 = `<cluster>_REPLY_TOPIC`。
+    /// Request-Reply: the reply topic name = `<cluster>_REPLY_TOPIC`.
     pub const REPLY_TOPIC_POSTFIX: &'static str = "REPLY_TOPIC";
-    /// Request-Reply：应答消息的 `MSG_TYPE` 属性值。
+    /// Request-Reply: the `MSG_TYPE` property value of the reply message.
     pub const REPLY_MESSAGE_FLAG: &'static str = "reply";
     pub const SYSTEM_TOPIC_PREFIX: &'static str = "rmq_sys_";
     pub const TOOLS_CONSUMER_GROUP: &'static str = "TOOLS_CONSUMER";
@@ -56,7 +56,7 @@ impl MixAll {
     pub const UNIQUE_MSG_QUERY_FLAG: &'static str = "_UNIQUE_KEY_QUERY";
     pub const TRACE_TOPIC: &'static str = "RMQ_SYS_TRACE_TOPIC";
     pub const REAL_TRACE_TOPIC: &'static str = "rmq_sys_TRACE_DATA";
-    /// 轨迹里的 region 占位值：SEND 响应头没带 MSG_REGION 时用它。
+    /// Placeholder region value in trace data: used when the SEND response header carries no MSG_REGION.
     pub const DEFAULT_TRACE_REGION_ID: &'static str = "DefaultRegion";
     pub const TRANS_STAT_PROGRESS_TOPIC: &'static str = "RMQ_SYS_TRANS_OP_HALF_TOPIC";
     pub const RMQ_SYS_TRANS_HALF_TOPIC: &'static str = "RMQ_SYS_TRANS_HALF_TOPIC";
@@ -123,7 +123,7 @@ impl MixAll {
         }
     }
 
-    /// 这**不是**控制台里那个 `%REPLY%<topic>` 前缀（那是另一套东西），只用于 request-reply。
+    /// This is **not** the `%REPLY%<topic>` prefix used by the console (that is a different mechanism); only for request-reply.
     pub fn get_reply_topic(cluster_name: &str) -> String {
         format!("{}_{}", cluster_name, Self::REPLY_TOPIC_POSTFIX)
     }
@@ -180,8 +180,8 @@ impl MixAll {
         ]
     }
 
-    /// 已知系统 topic（admin 过滤用户 topic 时用；broker 侧真值以
-    /// `GET_SYSTEM_TOPIC_LIST` 返回为准，用户 topic 过滤走 broker + 本地两路）。
+    /// Known system topics (used when admin filters user topics; the broker-side source of truth is
+    /// whatever `GET_SYSTEM_TOPIC_LIST` returns, and user-topic filtering goes through both broker and local paths).
     pub fn system_topic_set() -> &'static [&'static str] {
         &[
             Self::DEFAULT_TOPIC,
@@ -196,7 +196,7 @@ impl MixAll {
         ]
     }
 
-    /// 系统 topic：显式名单 + `rmq_sys_` 前缀 + `%RETRY%` / `%DLQ%`。
+    /// System topics: explicit list + `rmq_sys_` prefix + `%RETRY%` / `%DLQ%`.
     pub fn is_system_topic(topic: &str) -> bool {
         Self::system_topic_set().contains(&topic)
             || Self::is_sys_topic(Some(topic))
@@ -246,7 +246,7 @@ impl MixAll {
         )
     }
 
-    /// 探测本机出口 IP，失败回落 `127.0.0.1`。
+    /// Probes the local egress IP; falls back to `127.0.0.1` on failure.
     pub fn get_ip_str() -> String {
         util_all::local_ip()
     }
@@ -317,8 +317,8 @@ impl MixAll {
         )
     }
 
-    /// 未显式配置 clientId 时的默认值：
-    /// `<本机 IP>@<pid>#<nanoTime>[@unitName][@STREAM]`。
+    /// Default value when clientId is not explicitly configured:
+    /// `<local IP>@<pid>#<nanoTime>[@unitName][@STREAM]`.
     pub fn client_id_for(
         instance_name: &str,
         unit_name: Option<&str>,
@@ -406,7 +406,7 @@ impl MixAll {
         const PROP_WS: &[char] = &[' ', '\t', '\u{c}'];
         let mut result = StringMap::new();
 
-        // 先把续行合并成逻辑行
+        // First merge continuation lines into logical lines
         let mut logical: Vec<String> = Vec::new();
         let mut pending: Option<String> = None;
         for raw in text.split('\n') {
@@ -462,10 +462,10 @@ impl MixAll {
     }
 }
 
-/// 按 key 查消息的三种模式（对应 tools 的
-/// `QueryMsgByKeySubCommand.QueryMsgType`）。
+/// The three modes of querying messages by key (the 0/1/2 ordinals are the
+/// `QueryMsgByKeySubCommand.QueryMsgType` values the server expects).
 ///
-/// 与 `MixAll.UNIQUE_MSG_QUERY_FLAG` 不是一个东西：后者是 extFields 里的**键名**。
+/// Not the same thing as `MixAll.UNIQUE_MSG_QUERY_FLAG`: the latter is a **key name** in extFields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueryMsgType;
 
@@ -591,7 +591,7 @@ mod tests {
         assert!(a.starts_with("PID-"));
         let tail = &a["PID-".len()..];
         assert_eq!(tail.len(), 32);
-        // 后缀固定为 32 位**小写**十六进制（uuid4 hex 形式）
+        // The suffix is fixed at 32 **lowercase** hex digits (uuid4 hex form)
         assert!(tail
             .chars()
             .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)));
@@ -638,15 +638,15 @@ mod tests {
         let id = MixAll::build_default_client_id("inst", None, false);
         assert!(id.ends_with("@inst"), "{id}");
 
-        // changeInstanceNameToPID 只改默认名，显式设置的名字原样保留。
+        // changeInstanceNameToPID only rewrites the default name; an explicitly set name is kept as-is.
         assert_eq!(MixAll::change_instance_name_to_pid("inst"), "inst");
         let pid_prefix = format!("{}#", MixAll::cached_pid());
         let rewritten = MixAll::change_instance_name_to_pid("DEFAULT");
         assert!(rewritten.starts_with(&pid_prefix), "{rewritten}");
         assert_eq!(MixAll::change_instance_name_to_pid(&rewritten), rewritten);
 
-        // 默认 clientId = 本机 IP + '@' + 改写后的 instanceName；同进程两次调用
-        // 必须给出不同结果，否则两个客户端会共用一份 MQClientInstance。
+        // Default clientId = local IP + '@' + rewritten instanceName; two calls in the same
+        // process must produce different results, otherwise two clients would share one MQClientInstance.
         let first = MixAll::client_id_for("DEFAULT", None, false);
         assert!(first.contains(&format!("@{pid_prefix}")), "{first}");
         assert_ne!(
@@ -712,12 +712,12 @@ mod tests {
         assert_eq!(props.get("a"), Some("b"));
         assert_eq!(props.get("onlykey"), Some(""));
         assert_eq!(props.get("k"), Some("v"));
-        // 空白分隔时，值里的 '=' 原样保留
+        // With whitespace separators, '=' inside the value is kept verbatim
         assert_eq!(
             MixAll::string_to_properties("a b=c=d\n").get("a"),
             Some("b=c=d")
         );
-        // 有 '=' 时 '=' 优先于空白成为分隔符（值里的空格保留）
+        // When '=' is present it takes precedence over whitespace as the separator (spaces in the value are preserved)
         assert_eq!(
             MixAll::string_to_properties("messageDelayLevel=1s 5s 10s\n").get("messageDelayLevel"),
             Some("1s 5s 10s")

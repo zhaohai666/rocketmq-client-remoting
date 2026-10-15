@@ -12,20 +12,22 @@ use RocketMQ\Common\MessageConst;
 use RocketMQ\Common\MixAll;
 
 /**
- * Request-Reply（5.x）客户端侧支撑：请求等待槽、correlationId 全局表、
- * 应答消息派生与接收分发。
+ * Request-Reply (5.x) client-side support: request wait slots, correlationId global table,
+ * reply message derivation and receive dispatch.
  *
- * 协议回顾：
- *   请求方（producer.request）：msg.properties[CORRELATION_ID]=uuid /
- *   [REPLY_TO_CLIENT]=clientId / [TTL]=timeoutMillis；应答方 createReplyMessage 派生一条
- *   topic=<CLUSTER>_REPLY_TOPIC、MSG_TYPE="reply" 的消息，broker 按 REPLY_TO_CLIENT
- *   找到请求方连接把应答推回（PUSH_REPLY_MESSAGE_TO_CLIENT 326）。
+ * Protocol recap:
+ *   Requester (producer.request): msg.properties[CORRELATION_ID]=uuid /
+ *   [REPLY_TO_CLIENT]=clientId / [TTL]=timeoutMillis; the responder's createReplyMessage
+ *   derives a message with topic=<CLUSTER>_REPLY_TOPIC, MSG_TYPE="reply", and the broker
+ *   finds the requester connection by REPLY_TO_CLIENT and pushes the reply back
+ *   (PUSH_REPLY_MESSAGE_TO_CLIENT 326).
  *
- * 两个关键点：应答必须带 MSG_TYPE=="reply"（发送据此换码为 SEND_REPLY_MESSAGE_V2(325)）；
- * REPLY_TO_CLIENT 是**请求方的 clientId**，所以请求方必须发过心跳注册为 producer。
+ * Two key points: the reply must carry MSG_TYPE=="reply" (sending then swaps the code to
+ * SEND_REPLY_MESSAGE_V2(325)); REPLY_TO_CLIENT is the **requester's clientId**, so the
+ * requester must have sent a heartbeat registered as a producer.
  */
 
-/** request 的异步回调接口。 */
+/** The async callback interface for a request. */
 interface RequestCallback
 {
     public function onSuccess(?Message $responseMessage): void;
@@ -34,14 +36,16 @@ interface RequestCallback
 }
 
 /**
- * 一次 request 的等待槽。
+ * A wait slot for one request.
  *
- * 超时清理（有意）：不设后台定时扫描线程；由 ``request()`` 的 ``finally`` 保证移除，
- * 兜底清扫走 {@see RequestFutureHolder::scanExpiredRequest()}。
+ * Timeout cleanup (deliberate): no background periodic scan thread; removal is guaranteed
+ * by ``request()``'s ``finally``, with a fallback sweep via
+ * {@see RequestFutureHolder::scanExpiredRequest()}.
  *
- * PHP 单线程适配：进程内没有别的线程能在此调用内投递应答，因此 ``waitResponseMessage``
- * 只返回**当前**已到达的应答（可能为 null）——真实的"等待"由上层生产者驱动 remoting 层
- * pump 后再取。
+ * PHP single-threaded adaptation: no other thread in the process can deliver a reply
+ * during this call, so ``waitResponseMessage`` only returns the reply **already** arrived
+ * (possibly null) -- the real "waiting" is driven by the upper-layer producer pumping the
+ * remoting layer before fetching again.
  */
 class RequestResponseFuture
 {
@@ -62,13 +66,13 @@ class RequestResponseFuture
         $this->beginTimestamp = (int) (microtime(true) * 1000.0);
     }
 
-    /** 取应答（单线程：返回当前应答，不阻塞）。 */
+    /** Take the reply (single-threaded: returns the current reply, non-blocking). */
     public function waitResponseMessage(int $timeoutMillis): ?Message
     {
         return $this->responseMsg;
     }
 
-    /** 写入应答（允许多次调用，以最后一次为准）。 */
+    /** Write the reply (multiple calls allowed; the last one wins). */
     public function putResponseMessage(?Message $responseMsg): void
     {
         $this->responseMsg = $responseMsg;
@@ -79,13 +83,13 @@ class RequestResponseFuture
         return (int) (microtime(true) * 1000.0) - $this->beginTimestamp > $this->timeoutMillis;
     }
 
-    /** 记录失败原因。 */
+    /** Record the failure cause. */
     public function setCause(?\Throwable $cause): void
     {
         $this->cause = $cause;
     }
 
-    /** 触发回调：只允许触发一次。 */
+    /** Fire the callback: allowed to fire only once. */
     public function executeRequestCallback(): void
     {
         if ($this->requestCallback === null) {
@@ -214,7 +218,7 @@ final class MessageUtil
         return $reply;
     }
 
-    /** MSG_TYPE == "reply" 的发送要走 SEND_REPLY_MESSAGE_V2(325)。 */
+    /** Sending with MSG_TYPE == "reply" must go through SEND_REPLY_MESSAGE_V2(325). */
     public static function isReplyMessage(Message $msg): bool
     {
         return $msg->getProperty(MessageConst::PROPERTY_MESSAGE_TYPE) === MixAll::REPLY_MESSAGE_FLAG;
@@ -235,11 +239,11 @@ final class MessageUtil
     }
 }
 
-/** Request-Reply 的若干便利函数（模块级 helper）。 */
+/** A few convenience functions for Request-Reply (module-level helpers). */
 final class RequestReply
 {
     /**
-     * （可选）把回调适配成 ``(response, cause)`` 形式，便于脚本使用。
+     * (Optional) Adapt the callback into the ``(response, cause)`` form for script use.
      *
      * @param (callable(?Message, ?\Throwable): void)|null $callback
      */

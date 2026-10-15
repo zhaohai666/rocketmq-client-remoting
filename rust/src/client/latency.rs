@@ -1,6 +1,6 @@
-//! 实现 [`MQFaultStrategy`] + [`LatencyFaultToleranceImpl`]（带 [`FaultItem`]）：
-//! 追踪每个 broker 的发送延迟，延迟过高或发生异常时**隔离**一段时间
-//! （不分配给新消息），默认关闭。
+//! Implements [`MQFaultStrategy`] + [`LatencyFaultToleranceImpl`] (with [`FaultItem`]):
+//! tracks each broker's send latency and **isolates** it for a while when the latency is too high or an exception occurs
+//! (no new messages are assigned to it), off by default.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -13,17 +13,17 @@ use crate::common::message::MessageQueue;
 use crate::common::util_all::current_time_millis;
 use crate::error::{Error, Result};
 
-/// 可注入时钟。签名固定为无参函数指针，便于 `Default` 与 `Clone`。
+/// An injectable clock. The signature is fixed as a zero-argument function pointer, so `Default` and `Clone` stay easy.
 pub type NowFn = fn() -> i64;
 
 pub type QueueFilter<'a> = dyn Fn(&MessageQueue) -> bool + 'a;
 
-/// 发布信息的选队列接口面（`reset_index` 与 `select_one_message_queue` 两个方法）。
+/// The queue-selection interface surface of publish info (the `reset_index` and `select_one_message_queue` methods).
 pub trait PublishInfo: Send + Sync {
-    /// 把游标清零。
+    /// Resets the cursor to zero.
     fn reset_index(&self);
 
-    /// 带过滤器选出一条队列。
+    /// Selects one queue with filters applied.
     fn select_one_message_queue(&self, filters: &[&QueueFilter<'_>]) -> Result<Option<MessageQueue>>;
 }
 
@@ -31,18 +31,18 @@ pub trait PublishInfo: Send + Sync {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FaultItem {
-    /// broker 名字。
+    /// The broker name.
     pub name: String,
-    /// 最近一次上报的发送延迟（毫秒）。
+    /// The most recently reported send latency (milliseconds).
     pub current_latency: i64,
-    /// 隔离结束时间点（毫秒）；`now >= start_timestamp` 才算可用。
+    /// The isolation end time (milliseconds); available only once `now >= start_timestamp`.
     pub start_timestamp: i64,
     pub check_stamp: i64,
     pub reachable_flag: bool,
 }
 
 impl FaultItem {
-    /// 新建项：延迟 0、隔离窗口 0、**可达 = true**。
+    /// Creates an item: latency 0, isolation window 0, **reachable = true**.
     pub fn new(name: &str) -> FaultItem {
         FaultItem {
             name: name.to_string(),
@@ -81,8 +81,8 @@ impl FaultItem {
 }
 
 impl fmt::Display for FaultItem {
-    /// 固定展示格式
-    /// （`FaultItem{name=broker-a, latency=123, startTs=1700000000123, reachable=true}`）。
+    /// Fixed display format
+    /// (`FaultItem{name=broker-a, latency=123, startTs=1700000000123, reachable=true}`).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -92,7 +92,7 @@ impl fmt::Display for FaultItem {
     }
 }
 
-// ------------------------------------------------------------ 可达性探测
+// ------------------------------------------------------------ reachability probing
 
 pub trait Resolver: Send + Sync {
     fn resolve(&self, broker_name: &str) -> Option<String>;
@@ -111,9 +111,9 @@ pub trait ServiceDetector: Send + Sync {
 
 #[derive(Debug)]
 pub struct LatencyFaultToleranceImpl {
-    /// broker 名 -> FaultItem 表。
+    /// broker name -> FaultItem table.
     fault_item_table: RwLock<HashMap<String, FaultItem>>,
-    /// 时钟注入点（单测用假时钟 pin 隔离窗口）。
+    /// Clock injection point (tests pin the isolation window with a fake clock).
     now_millis: NowFn,
 }
 
@@ -128,7 +128,7 @@ impl LatencyFaultToleranceImpl {
         LatencyFaultToleranceImpl::with_clock(current_time_millis)
     }
 
-    /// 用指定时钟构造（测试可注入假时钟；生产走 [`LatencyFaultToleranceImpl::new`]）。
+    /// Builds with a given clock (tests can inject a fake one; production uses [`LatencyFaultToleranceImpl::new`]).
     pub fn with_clock(now_millis: NowFn) -> LatencyFaultToleranceImpl {
         LatencyFaultToleranceImpl {
             fault_item_table: RwLock::new(HashMap::new()),
@@ -136,13 +136,13 @@ impl LatencyFaultToleranceImpl {
         }
     }
 
-    /// 当前毫秒（暴露给上层，便于 `select` 之后复用同一时刻）。
+    /// Current milliseconds (exposed so upper layers can reuse the same moment after `select`).
     pub fn now_millis(&self) -> i64 {
         (self.now_millis)()
     }
 
-    /// 建新项与更新旧项的三步赋值顺序一致，
-    /// 所以这里用 entry-or-insert 后统一改字段。
+    /// Creating a new item and updating an old one share the same three-step assignment order,
+    /// so entry-or-insert followed by uniform field writes is used here.
     pub fn update_fault_item(
         &self,
         name: &str,
@@ -179,12 +179,12 @@ impl LatencyFaultToleranceImpl {
         write_guard(&self.fault_item_table).remove(name);
     }
 
-    /// 按名查找，返回**快照副本**（读锁守卫不能逃出函数，只能 clone 出来）。
+    /// Looks up by name and returns a **snapshot copy** (a read-lock guard cannot escape the function, so only a clone can).
     pub fn get_fault_item(&self, name: &str) -> Option<FaultItem> {
         read_guard(&self.fault_item_table).get(name).cloned()
     }
 
-    /// 表里当前记录了哪些 broker（仅供排错）。
+    /// Which brokers the table currently records (for troubleshooting only).
     pub fn fault_item_names(&self) -> Vec<String> {
         let mut names: Vec<String> = read_guard(&self.fault_item_table)
             .keys()
@@ -194,7 +194,7 @@ impl LatencyFaultToleranceImpl {
         names
     }
 
-    /// 锁纪律：`RwLock` 的守卫绝不跨 `.await` 持有（写表的三段各自成对）。
+    /// Lock discipline: `RwLock` guards are never held across `.await` (the three table-writing stretches each open and close their own).
     pub async fn detect_by_one_round(
         &self,
         resolver: &dyn Resolver,
@@ -218,7 +218,7 @@ impl LatencyFaultToleranceImpl {
                     Some(item) if now >= item.check_stamp => {
                         item.check_stamp = now + detect_interval;
                     }
-                    // 轮内已被移除/更新过：跳过（单任务轮里只是防御）。
+                    // already removed/updated within the round: skip (purely defensive in a single-task round).
                     _ => continue,
                 }
             }
@@ -244,22 +244,22 @@ pub const LATENCY_MAX: [i64; 7] = [50, 100, 550, 1800, 3000, 5000, 15000];
 pub const NOT_AVAILABLE_DURATION: [i64; 7] = [0, 0, 2000, 5000, 6000, 10000, 30000];
 pub const ISOLATION_LATENCY: i64 = 10000;
 
-/// 仅当 `send_latency_fault_enable` 为 true 时，发送选队列阶段才会：
-/// 1. 先选 available（隔离期已过）的 broker；
-/// 2. 否则选 reachable 的 broker；
-/// 3. 否则退化为普通轮询。
+/// Only when `send_latency_fault_enable` is true does the send queue-selection stage:
+/// 1. pick available brokers first (isolation period elapsed);
+/// 2. otherwise pick reachable brokers;
+/// 3. otherwise degrade to plain round-robin.
 #[derive(Debug)]
 pub struct MQFaultStrategy {
     send_latency_fault_enable: AtomicBool,
     latency_fault_tolerance: LatencyFaultToleranceImpl,
-    /// 延迟档位表（可直接改，故留 `pub`）。
+    /// The latency threshold table (public because it is meant to be mutable).
     pub latency_max: Vec<i64>,
-    /// 隔离时长档位表。
+    /// The isolation-duration threshold table.
     pub not_available_duration: Vec<i64>,
 }
 
 impl Default for MQFaultStrategy {
-    /// 默认：延迟容错关闭。
+    /// Default: latency fault tolerance off.
     fn default() -> MQFaultStrategy {
         MQFaultStrategy::new(false)
     }
@@ -270,7 +270,7 @@ impl MQFaultStrategy {
         MQFaultStrategy::with_clock(send_latency_fault_enable, current_time_millis)
     }
 
-    /// 带假时钟的构造口（单测 pin 隔离窗口用）。
+    /// Constructor with a fake clock (tests pin the isolation window with it).
     pub fn with_clock(
         send_latency_fault_enable: bool,
         now_millis: NowFn,
@@ -303,9 +303,9 @@ impl MQFaultStrategy {
         self.latency_fault_tolerance.is_reachable(mq.get_broker_name())
     }
 
-    /// `broker_filter` 的语义：`last_broker_name` 为 `None` 时**全部通过**，
-    /// 否则排除上一轮用过的那个 broker。退化路径（最后一档无过滤器）永不返回 `None`，
-    /// 所以只有「路由里一个队列都没有」才会 `Err`。
+    /// Semantics of `broker_filter`: when `last_broker_name` is `None`, **everything passes**;
+    /// otherwise the broker used in the previous round is excluded. The degraded path (the last tier, no filters) never returns `None`,
+    /// so `Err` happens only when "the route has not a single queue".
     pub fn select_one_message_queue(
         &self,
         tp_info: &dyn PublishInfo,
@@ -355,8 +355,8 @@ impl MQFaultStrategy {
             .update_fault_item(broker_name, current_latency, duration, reachable);
     }
 
-    /// 档位表按下标直接索引，两表长度不一致时会越界；
-    /// 这里按「越界的档位等于 0」处理，以免配置写歪时把发送线程搞崩。
+    /// The threshold tables are indexed directly by subscript, so mismatched lengths would go out of bounds;
+    /// a missing tier is treated as 0 here, so a misconfigured table cannot crash the sending threads.
     fn compute_not_available_duration(&self, current_latency: i64) -> i64 {
         let latency_max = &self.latency_max;
         for i in (0..latency_max.len()).rev() {
@@ -368,9 +368,9 @@ impl MQFaultStrategy {
     }
 }
 
-/// 最后一档是无过滤器的选择：**永不返回 None**
-/// （队列为空时直接报 MQClientException）。这里把「实现方违约返回 None」
-/// 兜成同一句错误文案，绝不 panic。
+/// The last tier is the unfiltered selection: **never returns None**
+/// (an empty queue reports MQClientException directly). Here a "contract-violating None from the implementation"
+/// is folded into the same error text, never a panic.
 fn select_unfiltered(tp_info: &dyn PublishInfo) -> Result<MessageQueue> {
     match tp_info.select_one_message_queue(&[])? {
         Some(mq) => Ok(mq),
@@ -378,7 +378,7 @@ fn select_unfiltered(tp_info: &dyn PublishInfo) -> Result<MessageQueue> {
     }
 }
 
-/// 锁毒化时继续用（故障表宁可带着旧数据跑，也不能让发送链路 panic）。
+/// Keep going on lock poisoning (a stale fault table beats a panicking send path).
 fn read_guard<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
     lock.read().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -392,15 +392,15 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
-    /// 假时钟：固定时刻，隔离窗口才可断言。
+    /// Fake clock: a fixed instant, so the isolation window can be asserted.
     const NOW: i64 = 1_700_000_000_000;
 
     fn fixed_now() -> i64 {
         NOW
     }
 
-    /// [`PublishInfo`] 的测试替身：语义逐条锁定
-    /// （空表报错、无过滤器永不返回 None、带过滤器最多试 n 个且每次都推进游标）。
+    /// Test double for [`PublishInfo`]: its semantics are pinned item by item
+    /// (an empty table errors, the unfiltered call never returns None, and a filtered call tries at most n queues while advancing the cursor each time).
     #[derive(Debug, Default)]
     struct FakePublishInfo {
         queues: Vec<MessageQueue>,
@@ -497,12 +497,12 @@ mod tests {
         assert_eq!(item.start_timestamp, NOW + 30_000);
         item.update_not_available_duration(2_000, NOW);
         assert_eq!(item.start_timestamp, NOW + 30_000);
-        // 0 与负数一律忽略
+        // zero and negatives are ignored outright
         item.update_not_available_duration(0, NOW);
         assert_eq!(item.start_timestamp, NOW + 30_000);
         item.update_not_available_duration(-5, NOW);
         assert_eq!(item.start_timestamp, NOW + 30_000);
-        // 边界：now == start_timestamp 时仍然「可用」（>= 判定）
+        // boundary: at now == start_timestamp the item is still "available" (>= check)
         assert!(item.is_available(NOW + 30_000));
         assert!(!item.is_available(NOW + 29_999));
     }
@@ -518,7 +518,7 @@ mod tests {
         tolerance.update_fault_item("broker-a", 20, 0, false);
         let item = tolerance.get_fault_item("broker-a").unwrap();
         assert_eq!(item.current_latency, 20);
-        // duration 0 ⇒ 不建隔离窗口，仍然 available；但 reachable 被写成了 false
+        // duration 0 ⇒ no isolation window, still available; but reachable was written as false
         assert!(tolerance.is_available("broker-a"));
         assert!(!tolerance.is_reachable("broker-a"));
         assert_eq!(item.start_timestamp, 0);
@@ -538,12 +538,12 @@ mod tests {
         );
         tolerance.update_fault_item("x", 600, 2_000, false);
         let item = tolerance.get_fault_item("x").unwrap();
-        // 延迟被覆盖、窗口保持更长的那个、reachable 一定被覆盖
+        // latency is overwritten, the window keeps the longer one, reachable is always overwritten
         assert_eq!(item.current_latency, 600);
         assert_eq!(item.start_timestamp, NOW + 30_000);
         assert!(!item.reachable_flag);
         assert!(!tolerance.is_available("x"));
-        // 建新项与更新旧项的三步赋值等价
+        // the three-step assignment is equivalent for creating a new item and updating an old one
         assert_eq!(item.get_current_latency(), 600);
         assert_eq!(item.get_start_timestamp(), NOW + 30_000);
     }
@@ -551,7 +551,7 @@ mod tests {
     #[test]
     fn compute_not_available_duration_threshold_table() {
         let strategy = MQFaultStrategy::new(true);
-        // 档位→隔离时长的固定金标向量
+        // fixed golden vector of threshold -> isolation duration
         for (latency, duration) in [
             (0, 0),
             (49, 0),
@@ -596,13 +596,13 @@ mod tests {
         assert!(!item.reachable_flag);
         assert!(!strategy.latency_fault_tolerance().is_available("broker-a"));
 
-        // 非隔离：按真实延迟查档位
+        // non-isolation: the tier is looked up by the real latency
         strategy.update_fault_item("broker-b", 7_000, false, true);
         assert_eq!(
             strategy.latency_fault_tolerance().get_fault_item("broker-b").unwrap().start_timestamp,
             NOW + 10_000
         );
-        // 低延迟不建窗口
+        // low latency builds no window
         strategy.update_fault_item("broker-c", 10, false, true);
         assert_eq!(
             strategy.latency_fault_tolerance().get_fault_item("broker-c").unwrap().start_timestamp,
@@ -646,7 +646,7 @@ mod tests {
 
     #[test]
     fn select_disabled_with_last_broker_same_single_broker_degrades() {
-        // 单 broker 多队列：broker_filter 一轮全灭 ⇒ 退化普通轮询（每次推进 2+1 步）
+        // single broker, multiple queues: broker_filter rejects everything in one round ⇒ degrade to plain round-robin (each call advances 2+1 steps)
         let strategy = MQFaultStrategy::new(false);
         let tp = FakePublishInfo::new(vec![
             MessageQueue::new("T", "broker-a", 0),
@@ -672,7 +672,7 @@ mod tests {
         let seq: Vec<(String, i32)> = (0..3)
             .map(|_| short(&strategy.select_one_message_queue(&tp, None, false).unwrap()))
             .collect();
-        // available 档：a 的两个队列被拒（各推进 1 步），第 3 步命中 b ⇒ 共 3 步/次
+        // available tier: both queues of a are rejected (1 step each), the 3rd step hits b ⇒ 3 steps per call
         assert_eq!(
             seq,
             vec![
@@ -726,7 +726,7 @@ mod tests {
         let seq: Vec<(String, i32)> = (0..4)
             .map(|_| short(&strategy.select_one_message_queue(&tp, None, false).unwrap()))
             .collect();
-        // available 档 3 步全灭 + reachable 档 3 步全灭 + 无过滤器 1 步 ⇒ 每次 7 步
+        // available tier exhausts 3 steps + reachable tier exhausts 3 steps + unfiltered 1 step ⇒ 7 steps per call
         assert_eq!(
             seq,
             vec![
@@ -760,7 +760,7 @@ mod tests {
             ("broker-a".into(), 0)
         );
         assert_eq!(tp.index(), 1);
-        // 关闭时连 reset_index 都不执行（那个分支整体在 enable 判断内）
+        // when disabled even reset_index does not run (that whole branch sits inside the enable check)
         let off = MQFaultStrategy::new(false);
         let tp2 = FakePublishInfo::new(queues());
         off.select_one_message_queue(&tp2, None, false).unwrap();
@@ -774,7 +774,7 @@ mod tests {
         let tp = FakePublishInfo::new(Vec::new());
         let err = strategy.select_one_message_queue(&tp, None, false).err().unwrap();
         assert_eq!(err.to_string(), "MQClientException: no message queue for publish info");
-        // 关闭时同样报错
+        // the same error when disabled
         let off = MQFaultStrategy::new(false);
         assert!(off.select_one_message_queue(&tp, None, false).is_err());
     }
@@ -787,14 +787,14 @@ mod tests {
         strategy.not_available_duration = vec![0, 1, 2, 3, 4, 5, 6];
         assert_eq!(strategy.compute_not_available_duration(100), 1);
         assert_eq!(strategy.compute_not_available_duration(550), 2);
-        // 另一实例仍是默认表（档位表是实例副本，不共享）
+        // another instance still has the default table (threshold tables are per-instance copies, not shared)
         let other = MQFaultStrategy::new(true);
         assert_eq!(other.compute_not_available_duration(100), 0);
     }
 
     #[test]
     fn mismatched_table_length_yields_zero_instead_of_panicking() {
-        // 两表长度不齐会越界；这里按「档位缺失 = 0」处理（见方法文档）
+        // mismatched table lengths would go out of bounds; a missing tier is treated as 0 here (see the method docs)
         let mut strategy = MQFaultStrategy::new(true);
         strategy.latency_max = vec![10, 20, 30];
         strategy.not_available_duration = vec![100];
@@ -808,7 +808,7 @@ mod tests {
 
     // ------------------------------------------------ detect_by_one_round
 
-    /// 查表式 `Resolver`：表里没有的 broker 名返回 `None`。
+    /// A table-driven `Resolver`: returns `None` for broker names not in the table.
     struct MapResolver(Vec<(String, String)>);
 
     impl Resolver for MapResolver {
@@ -820,7 +820,7 @@ mod tests {
         }
     }
 
-    /// 计数的 `ServiceDetector`：每次探测计数 +1，按开关返回成功/失败。
+    /// A counting `ServiceDetector`: +1 per probe, returns success/failure per the switch.
     struct ScriptedDetector {
         ok: AtomicBool,
         calls: AtomicUsize,
@@ -852,7 +852,7 @@ mod tests {
     #[tokio::test]
     async fn detect_round_restores_reachable_and_stamps_check_stamp() {
         let tolerance = LatencyFaultToleranceImpl::with_clock(fixed_now);
-        // 发送链路写坏的形状：不可达 + 10s 隔离窗
+        // the shape the send path writes: unreachable + 10s isolation window
         tolerance.update_fault_item("broker-a", 123, 10_000, false);
         let detector = ScriptedDetector::new(true);
         let resolver = MapResolver(vec![("broker-a".into(), "127.0.0.1:1".into())]);
@@ -862,23 +862,23 @@ mod tests {
             .await;
 
         let item = tolerance.get_fault_item("broker-a").unwrap();
-        assert!(item.is_reachable(), "探测成功要把 broker 探回来");
-        assert_eq!(item.check_stamp, NOW + 2_000, "开工即落 check_stamp");
+        assert!(item.is_reachable(), "a successful probe must bring the broker back");
+        assert_eq!(item.check_stamp, NOW + 2_000, "check_stamp is stamped as soon as work starts");
         assert_eq!(detector.calls(), 1);
-        // 隔离窗口是发送链路的事，探测不动它
+        // the isolation window belongs to the send path; probing does not touch it
         assert_eq!(item.start_timestamp, NOW + 10_000);
 
-        // check_stamp 去重：窗口内再跑一轮不会再探测
+        // check_stamp dedup: another round inside the window probes nothing
         tolerance
             .detect_by_one_round(&resolver, &detector, 200, 2_000)
             .await;
-        assert_eq!(detector.calls(), 1, "detect_interval 内不得重复探测");
+        assert_eq!(detector.calls(), 1, "no repeated probing within detect_interval");
     }
 
     #[tokio::test]
     async fn detect_failure_writes_nothing_and_keeps_reachable_items() {
         let tolerance = LatencyFaultToleranceImpl::with_clock(fixed_now);
-        // broker-a：发送链路记成不可达；broker-b：可达的正常项
+        // broker-a: recorded unreachable by the send path; broker-b: a normal reachable item
         tolerance.update_fault_item("broker-a", 123, 10_000, false);
         tolerance.update_fault_item("broker-b", 10, 0, true);
         let detector = ScriptedDetector::new(false);
@@ -891,19 +891,19 @@ mod tests {
             .detect_by_one_round(&resolver, &detector, 200, 2_000)
             .await;
 
-        assert_eq!(detector.calls(), 2, "所有到期项都要探（与可达性无关）");
+        assert_eq!(detector.calls(), 2, "every due item must be probed (regardless of reachability)");
         assert!(
             !tolerance.is_reachable("broker-a"),
-            "探测失败不写表：broker-a 维持不可达"
+            "a failed probe writes nothing: broker-a stays unreachable"
         );
         assert!(
             tolerance.is_reachable("broker-b"),
-            "探测失败不能把可达的 broker 探成不可达"
+            "a failed probe must not flip a reachable broker to unreachable"
         );
         let item = tolerance.get_fault_item("broker-a").unwrap();
         assert_eq!(item.check_stamp, NOW + 2_000);
-        assert_eq!(item.start_timestamp, NOW + 10_000, "隔离窗不受探测影响");
-        assert_eq!(item.current_latency, 123, "延迟字段不受探测影响");
+        assert_eq!(item.start_timestamp, NOW + 10_000, "the isolation window is untouched by probing");
+        assert_eq!(item.current_latency, 123, "the latency field is untouched by probing");
     }
 
     #[tokio::test]
@@ -911,7 +911,7 @@ mod tests {
         let tolerance = LatencyFaultToleranceImpl::with_clock(fixed_now);
         tolerance.update_fault_item("broker-gone", 123, 10_000, false);
         let detector = ScriptedDetector::new(true);
-        // resolver 里没有 broker-gone：路由已经不认识它了
+        // broker-gone is absent from the resolver: the route no longer knows it
         let resolver = MapResolver(vec![("broker-a".into(), "127.0.0.1:1".into())]);
 
         tolerance
@@ -920,12 +920,12 @@ mod tests {
 
         assert!(
             tolerance.get_fault_item("broker-gone").is_none(),
-            "路由里没有的 broker 要连故障项一起清掉（faultItemTable.remove 语义）"
+            "a broker absent from the route must have its fault item removed with it (faultItemTable.remove semantics)"
         );
-        assert_eq!(detector.calls(), 0, "resolve 不到地址就直接 continue，不探测");
+        assert_eq!(detector.calls(), 0, "an unresolvable address continues directly, no probing");
         assert!(tolerance.fault_item_names().is_empty());
 
-        // 空表空转：不探测、不报错
+        // an empty table idles: no probing, no error
         tolerance
             .detect_by_one_round(&resolver, &detector, 200, 2_000)
             .await;

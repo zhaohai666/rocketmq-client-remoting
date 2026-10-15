@@ -1,17 +1,24 @@
 #!/bin/bash
-# Go 生产者的真机验证（跑 Go 发 → 用**已验证的 Python 客户端**回读对拍）。
+# Live verification of the Go producer (Go sends -> a **verified Python client**
+# reads back for cross-checking).
 #
-# 用法: bash scripts/run_go_producer_live.sh [namesrv]      （默认 127.0.0.1:9876）
+# Usage: bash scripts/run_go_producer_live.sh [namesrv]      (default 127.0.0.1:9876)
 #
-# 为什么必须两个语言一起跑：Go 侧只能证明 broker 收下了（SEND_OK）。报文编码错了
-# 照样能拿 SEND_OK —— V2 短键头（a..n）写错键名、批量 6 段轻量帧拼错、zlib 压缩位漏置、
-# 事务半消息缺 TRAN_MSG/PGROUP，broker 都可能回成功，而消费端拿到的是坏消息。所以
-# 判定标准是「另一个实现能不能正确读回来」。
+# Why two languages must run together: the Go side can only prove the broker
+# accepted the messages (SEND_OK). A malformed wire encoding still gets SEND_OK
+# -- wrong V2 short-key header (a..n) key names, a broken 6-section lightweight
+# batch frame, a missing zlib compression flag, a transaction half message
+# without TRAN_MSG/PGROUP -- the broker may still return success while the
+# consumer receives a corrupt message. So the criterion is "can another
+# implementation read it back correctly".
 #
-# 集群：默认假定已经在跑（scripts/rmq_test_broker.sh 那套）。端口探测失败会自动
-# `rmq_test_broker.sh start`，并在收工时只停自己起来的那一次；已经在跑的不碰。
+# Cluster: assumed to be already running by default (the scripts/rmq_test_broker.sh
+# setup). If the port probe fails, `rmq_test_broker.sh start` is run automatically,
+# and only the instance started here is stopped at cleanup; anything already
+# running is left untouched.
 #
-# ⚠ 集群 start + 等端口 + 跑验证 + kill 必须都在本脚本内串完：前台返回会回收后台 JVM。
+# Note: cluster start + port wait + verification + kill must all be completed
+# serially inside this script: returning to the foreground reaps background JVMs.
 set -u
 
 NS=${1:-${ROCKETMQ_NAMESRV:-127.0.0.1:9876}}
@@ -30,27 +37,31 @@ port_open() {
 STARTED_BROKER=0
 cleanup() {
     if [ "$STARTED_BROKER" = "1" ]; then
-        echo "--- 收工：停掉本脚本起的 broker ---"
+        echo "--- cleanup: stopping the broker started by this script ---"
         sh "$ROOT/scripts/rmq_test_broker.sh" stop || true
     fi
 }
 trap cleanup EXIT
 
 if ! port_open "$BROKER_PORT"; then
-    echo "=== broker 未监听 ${BROKER_PORT}，拉起本地测试集群 ==="
-    sh "$ROOT/scripts/rmq_test_broker.sh" start || { echo "broker 起不来"; exit 1; }
+    echo "=== broker not listening on ${BROKER_PORT}, starting local test cluster ==="
+    sh "$ROOT/scripts/rmq_test_broker.sh" start || { echo "failed to start broker"; exit 1; }
     STARTED_BROKER=1
-    # 端口先于「向 namesrv 注册路由」就绪，不等就会拿不到 TBW102 路由而假失败。
+    # The port is ready before the broker registers its route with the
+    # namesrv; not waiting means the TBW102 route is missing and the run
+    # false-fails.
     sleep 12
 fi
-port_open 9876 || { echo "nameserver 9876 没监听，先起 namesrv"; exit 1; }
+port_open 9876 || { echo "nameserver 9876 not listening, start namesrv first"; exit 1; }
 
 echo ""
 echo "=== [1/2] Go producer live (topic=${TOPIC} group=${GROUP}) ==="
 cd "$ROOT/go" || exit 1
 GO_LOG=$(mktemp -t go_live_producer.XXXXXX)
-# 回读的期望条数取自 Go 侧自己报的 `SENT=<n>`，不写死：往 live_producer 里加一个
-# 检查就会让写死的期望值悄悄失准（少要几条 → 假绿）。
+# The expected count for read-back comes from the Go side's own `SENT=<n>`
+# report instead of being hardcoded: adding one check to live_producer would
+# silently invalidate a hardcoded expectation (fewer messages requested ->
+# false green).
 set -o pipefail
 "$GO" run ./examples/live_producer -ns "$NS" -topic "$TOPIC" -group "$GROUP" 2>&1 | tee "$GO_LOG"
 GO_RC=$?
@@ -58,14 +69,14 @@ set +o pipefail
 echo "--- go exit=$GO_RC ---"
 EXPECT=$(sed -n 's/^PASS=[0-9]* FAIL=[0-9]* SENT=\([0-9][0-9]*\)$/\1/p' "$GO_LOG" | tail -1)
 if [ -n "$EXPECT" ]; then
-    echo "--- Go 报称已写入 $EXPECT 条，按此数目回读对拍 ---"
+    echo "--- Go reported $EXPECT messages sent; reading back that many for cross-check ---"
 else
     EXPECT=8
-    echo "--- 没读到 SENT，回退到旧口径 8 条 ---"
+    echo "--- SENT not found, falling back to the legacy count of 8 ---"
 fi
 
 echo ""
-echo "=== [2/2] Python 客户端回读对拍 ==="
+echo "=== [2/2] Python client read-back cross-check ==="
 cd "$ROOT/python" || exit 1
 "$PY" go_producer_consume_check.py "$TOPIC" "$EXPECT" "GID_PyReadGo_$STAMP" 2>&1 | grep -E "^(PASS|FAIL|[0-9]+$|PASS=)"
 PY_RC=${PIPESTATUS[0]}
@@ -73,8 +84,8 @@ echo "--- python exit=$PY_RC ---"
 
 echo ""
 if [ "$GO_RC" -eq 0 ] && [ "$PY_RC" -eq 0 ]; then
-    echo "结果: 全部通过 (topic=$TOPIC)"
+    echo "RESULT: all passed (topic=$TOPIC)"
     exit 0
 fi
-echo "结果: 有失败 (go=$GO_RC python=$PY_RC topic=$TOPIC)"
+echo "RESULT: failures present (go=$GO_RC python=$PY_RC topic=$TOPIC)"
 exit 1

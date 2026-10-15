@@ -1,10 +1,12 @@
-// 定时消息撤回（recallMessage 370）真机验证。
-// 用法：rmq recall [namesrv]
+// Real-machine verification of scheduled message recall (recallMessage 370).
+// Usage: rmq recall [namesrv]
 //
-// 为什么必须真机：句柄不是客户端能自己拼出来的。只有 broker 在
-// SendMessageProcessor#attachRecallHandle 里（且仅当消息带 TIMER_* 延迟属性）才会把句柄
-// 挂回 SEND 响应头；撤回是否真的生效也只能靠「到点没投递」来证明。
-// 离线单测（tests/RecallMessageTests.cs）锁的是编解码、报文键名和本地校验顺序，证不了语义。
+// Why it must be a real machine: the handle cannot be assembled by the client itself. Only
+// the broker inside SendMessageProcessor#attachRecallHandle (and only when the message
+// carries TIMER_* delay properties) attaches the handle back to the SEND response header;
+// and whether the recall really took effect can only be proven by "it was not delivered at
+// the due time". The offline unit tests (tests/RecallMessageTests.cs) pin the codec, the
+// wire key names and the local validation order, which cannot prove the semantics.
 using System.Diagnostics;
 using System.Text;
 
@@ -92,9 +94,9 @@ public static class LiveRecall
         {
             string addr = BrokerAddr(producer);
 
-            // ---- R0 撤回开关：读得到 + 临时打开 ----
+            // ---- R0 the recall switch: readable + temporarily enabled ----
             original = ReadFlag(admin, addr);
-            Check("R0 能读到 broker 的 " + ConfigKey, original is not null, "value=" + original);
+            Check("R0 can read the broker's " + ConfigKey, original is not null, "value=" + original);
             if (original != "true")
             {
                 WriteFlag(admin, addr, "true");
@@ -102,11 +104,11 @@ public static class LiveRecall
 
             if (ReadFlag(admin, addr) != "true")
             {
-                Check("R0 recall 未在 broker 上开启，后续检查无意义", false);
+                Check("R0 recall is not enabled on the broker, so the later checks are meaningless", false);
                 return 1;
             }
 
-            // ---- R1/R2 定时消息才带句柄，且内容与发送结果一致 ----
+            // ---- R1/R2 only a scheduled message carries a handle, and its content matches the send result ----
             Message toRecall = Timer("to-recall");
             Message control = Timer("control");
             var plain = new Message(_topic, Bytes("plain"));
@@ -115,50 +117,50 @@ public static class LiveRecall
             SendResult rControl = producer.Send(control);
             SendResult rPlain = producer.Send(plain);
             string? handle = rRecall.RecallHandle;
-            Check("R1 定时消息带回 recallHandle", !string.IsNullOrEmpty(handle), "handle=" + handle);
-            Check("R1 普通消息不带 recallHandle", rPlain.RecallHandle is null);
-            Check("R1 两条定时消息的句柄不同",
+            Check("R1 the scheduled message brings back a recallHandle", !string.IsNullOrEmpty(handle), "handle=" + handle);
+            Check("R1 a normal message carries no recallHandle", rPlain.RecallHandle is null);
+            Check("R1 the two scheduled messages have different handles",
                 !string.IsNullOrEmpty(handle) && rControl.RecallHandle != handle);
 
             try
             {
                 HandleV1 parsed = RecallMessageHandle.DecodeHandle(handle);
-                Check("R2 broker 的句柄能被我们的编解码器解开", true);
-                Check("R2 句柄里的 topic/brokerName 与发送目标一致",
+                Check("R2 the broker's handle can be decoded by our codec", true);
+                Check("R2 the topic/brokerName in the handle match the send target",
                     parsed.Topic == _topic && parsed.BrokerName == Broker,
                     "topic=" + parsed.Topic + " broker=" + parsed.BrokerName);
-                Check("R2 句柄里的 uniqKey 就是这条消息的 UNIQ_KEY",
+                Check("R2 the uniqKey in the handle is this message's UNIQ_KEY",
                     parsed.MessageId == rRecall.MsgId,
                     "handle=" + parsed.MessageId + " send=" + rRecall.MsgId);
             }
             catch (Exception e)
             {
-                Check("R2 broker 的句柄能被我们的编解码器解开", false, e.Message);
+                Check("R2 the broker's handle can be decoded by our codec", false, e.Message);
             }
 
-            // ---- R4/R5 本地校验必须在打网络之前跑完 ----
-            Check("R4 %RETRY% topic 被拒",
+            // ---- R4/R5 the local validation must complete before any network access ----
+            Check("R4 a %RETRY% topic is rejected",
                 Recall(producer, "%RETRY%" + _group, handle ?? string.Empty) == "topic is not supported");
-            Check("R4 %DLQ% topic 被拒",
+            Check("R4 a %DLQ% topic is rejected",
                 Recall(producer, "%DLQ%" + _group, handle ?? string.Empty) == "topic is not supported");
 
             var began = Stopwatch.GetTimestamp();
             string corrupt = Recall(producer, _topic, "not-a-handle");
             double costMs = Stopwatch.GetElapsedTime(began).TotalMilliseconds;
-            Check("R5 非法句柄本地即拒", corrupt == RecallMessageHandle.InvalidHandle,
+            Check("R5 an illegal handle is rejected locally", corrupt == RecallMessageHandle.InvalidHandle,
                 corrupt + " (" + costMs.ToString("F3", CultureInfo.InvariantCulture) + "ms)");
-            Check("R5 非法句柄是秒回的（没打网络）", costMs < 200, Num((int)costMs) + "ms");
+            Check("R5 an illegal handle comes back instantly (no network access)", costMs < 200, Num((int)costMs) + "ms");
 
-            // ---- R3/R6 真的撤掉了，且没牵连对照消息 ----
+            // ---- R3/R6 it really was recalled, and the control message was not dragged in ----
             string recalled = Recall(producer, _topic, handle ?? string.Empty);
-            Check("R3 RecallMessage 返回被撤回消息的 uniqKey",
+            Check("R3 RecallMessage returns the uniqKey of the recalled message",
                 recalled == rRecall.MsgId, "resp=" + recalled + " send=" + rRecall.MsgId);
 
             List<string> got = ConsumeFor(DelaySec + 20);
             var bodies = new HashSet<string>(got);
-            Check("R6 对照定时消息按时投递", bodies.Contains("control"), "got=" + Sorted(bodies));
-            Check("R6 普通消息已投递", bodies.Contains("plain"));
-            Check("R6 被撤回的定时消息永远没投递", !bodies.Contains("to-recall"),
+            Check("R6 the control scheduled message is delivered on time", bodies.Contains("control"), "got=" + Sorted(bodies));
+            Check("R6 the normal message was delivered", bodies.Contains("plain"));
+            Check("R6 the recalled scheduled message was never delivered", !bodies.Contains("to-recall"),
                 "got=" + Sorted(bodies));
         }
         finally
@@ -177,7 +179,7 @@ public static class LiveRecall
                 }
             }
 
-            Check("R7 broker 的 " + ConfigKey + " 已还原为 " + original, restored);
+            Check("R7 the broker's " + ConfigKey + " has been restored to " + original, restored);
             admin.Shutdown();
             producer.Shutdown();
         }
@@ -197,7 +199,8 @@ public static class LiveRecall
     private static string Sorted(IEnumerable<string> items) =>
         string.Join(",", items.OrderBy(s => s, StringComparer.Ordinal));
 
-    /// <summary>撤回并把异常文案当返回值给检查用（正常路径返回 broker 给的 uniqKey）。</summary>
+    /// <summary>Recalls and returns the exception text as the return value for the checks
+    /// (the normal path returns the uniqKey the broker gave).</summary>
     private static string Recall(DefaultMQProducer producer, string topic, string handle)
     {
         try
@@ -243,9 +246,11 @@ public static class LiveRecall
         }
     }
 
-    /// <summary>从 0 位点收满一个时间窗，返回收到的 body 列表。
-    /// 窗口必须 &gt; 延迟：对照消息要等到点才出现，被撤回的那条则要「整个窗口都不出现」
-    /// 才算撤回成功。</summary>
+    /// <summary>Collects a whole time window starting from offset 0 and returns the list of
+    /// bodies received.
+    /// The window must be &gt; the delay: the control message only appears once it is due,
+    /// while the recalled one has to "not appear for the entire window" for the recall to
+    /// count as successful.</summary>
     private static List<string> ConsumeFor(int windowSec)
     {
         var received = new Collector();

@@ -7,7 +7,7 @@ from client.exception import MQClientException
 
 GROUP = "CID_check_config_py"
 TOPIC = "CheckConfigPyTopic"
-# 不可达地址：闸门必须在这之前就把配置判完，所以这条断言顺带证明"没碰网络"。
+# Unreachable address: the gates must finish judging the config before this, so this assertion incidentally proves "no network was touched".
 NAMESRV = "127.0.0.1:1"
 
 
@@ -16,7 +16,7 @@ def _listener(_msgs):
 
 
 def _consumer(**overrides):
-    """装配到"只差数值闸门"为止的消费者：组名/地址/订阅/listener 全合法。"""
+    """A consumer assembled up to "only the numeric gates remain": group name / address / subscription / listener are all valid."""
     c = DefaultMQPushConsumer(GROUP)
     c.set_namesrv_addr(NAMESRV)
     c.subscribe(TOPIC)
@@ -48,17 +48,17 @@ GATES = [
 
 TOPIC_SENTINELS = ["pull_threshold_for_topic", "pull_threshold_size_for_topic"]
 
-# 下界不是 0、且没有 -1 哨兵的闸门：写 0 必须在启动期报错。
+# Gates whose lower bound is not 0 and which have no -1 sentinel: writing 0 must error at startup.
 ZERO_ILLEGAL = [f for f, lo, *_ in GATES if lo != 0 and f not in TOPIC_SENTINELS]
 
 
 class TestDefaultsPass:
     def test_default_config_clears_every_gate(self):
-        """默认值必须过闸门：闸门收紧后最容易伤到的就是不改配置的正常使用方。
+        """Defaults must clear every gate: after gates are tightened, the easiest casualties are normal users who do not change config.
 
-        这里**不**调 ``start()`` —— 离线环境连不上 name server，``start()`` 会在
-        建连那步抛 ``RemotingConnectException``，跟闸门无关。"边界值真机能启动并消费"
-        由 ../verify_flow_control_live.py 的 S5 在真集群上锁。
+        ``start()`` is deliberately **not** called here — an offline environment cannot reach the name server, and ``start()`` would
+        throw ``RemotingConnectException`` at the connection step, which is unrelated to the gates. "Boundary values can really start and consume"
+        is locked by S5 of ../verify_flow_control_live.py on a real cluster.
         """
         c = _consumer()
         c._check_config_ranges()
@@ -71,11 +71,11 @@ class TestDefaultsPass:
 
     @pytest.mark.parametrize("field,lo,hi,_msg", GATES)
     def test_both_bounds_are_inclusive(self, field, lo, hi, _msg):
-        """下界与上界**本身**合法：把 ``< lo`` 写成 ``<= lo`` 只有这一格能抓到。
+        """The lower and upper bounds **themselves** are legal: writing ``< lo`` as ``<= lo`` is only catchable in this cell.
 
-        ``consume_thread_*`` 要把 min/max 一起放到各自的极值上：默认 (20, 20) 下
-        单独抬 min 到 1000 或压 max 到 1 都会先撞上"min 不能大于 max"那道门，
-        区间边界这一格就没测到。
+        ``consume_thread_*`` must place min/max at their respective extremes together: under the default (20, 20),
+        raising min alone to 1000 or pushing max alone to 1 would first hit the "min must not exceed max" gate,
+        and this range-boundary cell would go untested.
         """
         base = ({"consume_thread_min": 1, "consume_thread_max": 1000}
                 if field.startswith("consume_thread") else {})
@@ -113,7 +113,7 @@ class TestOutOfRangeRejected:
 
     @pytest.mark.parametrize("field", TOPIC_SENTINELS)
     def test_minus_two_is_not_a_sentinel(self, field):
-        """只有 -1 是哨兵：-2 落到区间判断里必须被拒（把守卫写成 ``< 0`` 就在这里变红）。"""
+        """Only -1 is a sentinel: -2 must be rejected by the range check (writing the guard as ``< 0`` turns red right here)."""
         with pytest.raises(MQClientException):
             _consumer(**{field: -2})._check_config_ranges()
 
@@ -132,7 +132,7 @@ class TestThreadMinNotLargerThanMax:
         _consumer(consume_thread_min=32, consume_thread_max=32)._check_config_ranges()
 
     def test_the_rule_is_checked_after_both_ranges(self):
-        """min 自身越界时报 min 的区间，而不是把两个数字塞进 "is larger than" 文案。"""
+        """When min itself is out of range, report min's range instead of stuffing both numbers into the "is larger than" message."""
         c = _consumer(consume_thread_min=2000, consume_thread_max=1)
         with pytest.raises(MQClientException) as ei:
             c._check_config_ranges()
@@ -141,7 +141,7 @@ class TestThreadMinNotLargerThanMax:
 
 class TestGateIsLocalAndOrdered:
     def test_no_instance_is_created_when_config_is_bad(self):
-        """闸门必须在建 MQClientInstance **之前**：起了后台线程再抛错就泄漏线程了。"""
+        """The gates must run **before** building MQClientInstance: throwing after background threads start would leak threads."""
         c = _consumer(pull_batch_size=1025)
         with pytest.raises(MQClientException):
             c.start()
@@ -167,7 +167,7 @@ class TestGateIsLocalAndOrdered:
         assert "group" in str(ei.value).lower()
 
     def test_fixing_the_number_lets_the_same_object_start(self):
-        """改回合法值后同一个实例仍然能过闸门：拒绝启动不能把对象写坏或留下半启动状态。"""
+        """After fixing back to a legal value, the same instance still clears the gates: refusing to start must not corrupt the object or leave a half-started state."""
         c = _consumer(pop_batch_nums=33)
         with pytest.raises(MQClientException):
             c.start()

@@ -105,7 +105,7 @@ class Message:
             self.properties["KEYS"] = keys
         self.transaction_id: Optional[str] = None
 
-    # ---- 属性 ----
+    # ---- properties ----
     def set_tags(self, tags: str) -> None:
         self.properties["TAGS"] = tags
 

@@ -1,42 +1,42 @@
-//! POP 模式的 extraInfo（俗称 CK 串）编解码。
+//! Encoding/decoding of the POP-mode extraInfo (colloquially the CK string).
 //!
 //!
-//! CK 串是 POP 模式的核心凭据：broker 在 POP 响应里**不**给普通 topic 的消息写
-//! `POP_CK` 属性（只在 retry topic 重编码路径写），客户端必须自己用响应头的
-//! `startOffsetInfo` / `msgOffsetInfo` 反构出这个串，再作为 ACK /
-//! CHANGE_MESSAGE_INVISIBLETIME 的 `extraInfo` 回传。格式是 7~8 段、**空格**分隔：
+//! The CK string is the core ticket of POP mode: the broker does **not** write the `POP_CK`
+//! property on ordinary-topic messages in POP responses (only the retry-topic re-encode path
+//! writes it), so the client must reconstruct the string itself from the response headers'
+//! `startOffsetInfo` / `msgOffsetInfo` and send it back as the `extraInfo` of ACK / CHANGE_MESSAGE_INVISIBLETIME. The format is 7~8 segments, **space**-separated:
 //!
 //! ```text
 //! ckQueueOffset popTime invisibleTime reviveQid retryFlag brokerName queueId [msgQueueOffset]
 //! ```
 //!
-//! 分隔符是空格而不是逗号 —— 用错会让 broker **静默**解析失败。
-//! `retryFlag` 不是 topic 原文，而是 [`retry_of_topic`] 算出的 `"0"/"1"/"2"`。
+//! The separator is a space, not a comma -- getting it wrong makes the broker fail parsing **silently**.
+//! `retryFlag` is not the topic text itself but the `"0"/"1"/"2"` computed by [`retry_of_topic`].
 
 use crate::common::mix_all::MixAll;
 use crate::error::{Error, Result};
 
 pub const KEY_SEPARATOR: &str = " ";
-/// 队列之间的分隔符（`startOffsetInfo` / `msgOffsetInfo` / `orderCountInfo`）。
+/// Separator between queues (`startOffsetInfo` / `msgOffsetInfo` / `orderCountInfo`).
 pub const QUEUE_SEPARATOR: &str = ";";
-/// `msgOffsetInfo` 里同一队列多条 offset 的分隔符。
+/// Separator between multiple offsets of the same queue inside `msgOffsetInfo`.
 pub const OFFSET_SEPARATOR: &str = ",";
 
-/// `retryFlag`：普通 topic。
+/// `retryFlag`: ordinary topic.
 pub const NORMAL_TOPIC: &str = "0";
-/// `retryFlag`：V1 retry topic（`%RETRY%<cid>_<topic>`）。
+/// `retryFlag`: V1 retry topic (`%RETRY%<cid>_<topic>`).
 pub const RETRY_TOPIC: &str = "1";
-/// `retryFlag`：V2 retry topic（`%RETRY%<cid>+<topic>`）。
+/// `retryFlag`: V2 retry topic (`%RETRY%<cid>+<topic>`).
 pub const RETRY_TOPIC_V2: &str = "2";
 pub const QUEUE_OFFSET: &str = "qo";
 
 pub const POP_ORDER_REVIVE_QUEUE: i32 = 999;
 
 const POP_RETRY_SEPARATOR_V1: &str = "_";
-/// V2 retry topic 的 topic/cid 连接符。
+/// topic/cid joiner of the V2 retry topic.
 const POP_RETRY_SEPARATOR_V2: &str = "+";
 
-// ---------------------------------------------------------------- retry topic 命名
+// ---------------------------------------------------------------- retry topic naming
 
 pub fn build_pop_retry_topic_v1(topic: &str, cid: &str) -> String {
     format!(
@@ -66,7 +66,7 @@ pub fn build_pop_retry_topic(topic: &str, cid: &str, enable_retry_v2: bool) -> S
     }
 }
 
-/// 只看含 `+` 不够：普通 topic 名里也可能有 `+`，那样会被误判成 retry V2。
+/// Checking for `+` alone is not enough: an ordinary topic name may also contain `+`, which would be misjudged as retry V2.
 pub fn is_pop_retry_topic_v2(retry_topic: Option<&str>) -> bool {
     match retry_topic {
         None => false,
@@ -78,8 +78,8 @@ pub fn is_pop_retry_topic_v2(retry_topic: Option<&str>) -> bool {
     }
 }
 
-/// 顺序很重要：先判 V2（含 `+`），再判 `%RETRY%` 前缀（V1），否则普通 topic
-/// 一律是 `"0"`。
+/// Order matters: test V2 (contains `+`) first, then the `%RETRY%` prefix (V1); otherwise an ordinary topic
+/// would always be `"0"`.
 pub fn retry_of_topic(topic: &str) -> &'static str {
     if is_pop_retry_topic_v2(Some(topic)) {
         RETRY_TOPIC_V2
@@ -90,7 +90,7 @@ pub fn retry_of_topic(topic: &str) -> &'static str {
     }
 }
 
-/// 未知 flag 报错而不是回退到 `topic`：回退会把 retry 消息当普通消息确认掉。
+/// An unknown flag errors out instead of falling back to `topic`: falling back would ack a retry message as an ordinary one.
 pub fn get_real_topic(topic: &str, cid: &str, retry: &str) -> Result<String> {
     if retry == NORMAL_TOPIC {
         Ok(topic.to_string())
@@ -103,7 +103,7 @@ pub fn get_real_topic(topic: &str, cid: &str, retry: &str) -> Result<String> {
     }
 }
 
-// ---------------------------------------------------------------- CK 串切分与取值
+// ---------------------------------------------------------------- CK string splitting and getters
 
 fn split_drop_trailing(value: &str, sep: &str) -> Vec<String> {
     let mut parts: Vec<String> = value.split(sep).map(str::to_string).collect();
@@ -127,7 +127,7 @@ fn require(segments: &[String], need: usize, what: &str) -> Result<()> {
     Ok(())
 }
 
-/// 取某一段并按 long 解析（`Long.valueOf` / `Integer.parseInt` 的失败口径）。
+/// Takes one segment and parses it as a long; a non-numeric value is an error, not a silent default.
 fn segment_as(segments: &[String], index: usize, need: usize, what: &str) -> Result<i64> {
     require(segments, need, what)?;
     let raw = &segments[index];
@@ -138,44 +138,44 @@ fn segment_as(segments: &[String], index: usize, need: usize, what: &str) -> Res
     })
 }
 
-/// `segments[0]`：本条消息在队列里的 ckQueueOffset。
+/// `segments[0]`: the ckQueueOffset of this message within its queue.
 pub fn get_ck_queue_offset(segments: &[String]) -> Result<i64> {
     segment_as(segments, 0, 1, "getCkQueueOffset")
 }
 
-/// `segments[1]`：POP 时刻（毫秒）。
+/// `segments[1]`: POP time (milliseconds).
 pub fn get_pop_time(segments: &[String]) -> Result<i64> {
     segment_as(segments, 1, 2, "getPopTime")
 }
 
-/// `segments[2]`：不可见时间（毫秒）。
+/// `segments[2]`: invisible time (milliseconds).
 pub fn get_invisible_time(segments: &[String]) -> Result<i64> {
     segment_as(segments, 2, 3, "getInvisibleTime")
 }
 
-/// `segments[3]`：revive 队列号；[`POP_ORDER_REVIVE_QUEUE`] 表示顺序消费。
+/// `segments[3]`: revive queue id; [`POP_ORDER_REVIVE_QUEUE`] means ordered consumption.
 pub fn get_revive_qid(segments: &[String]) -> Result<i32> {
     Ok(segment_as(segments, 3, 4, "getReviveQid")? as i32)
 }
 
-/// `segments[4]`：`retryFlag` 原文（`"0"/"1"/"2"`）。
+/// `segments[4]`: the `retryFlag` text (`"0"/"1"/"2"`).
 pub fn get_retry(segments: &[String]) -> Result<String> {
     require(segments, 5, "getRetry")?;
     Ok(segments[4].clone())
 }
 
-/// `segments[5]`：broker 名。
+/// `segments[5]`: broker name.
 pub fn get_broker_name(segments: &[String]) -> Result<String> {
     require(segments, 6, "getBrokerName")?;
     Ok(segments[5].clone())
 }
 
-/// `segments[6]`：队列号。
+/// `segments[6]`: queue id.
 pub fn get_queue_id(segments: &[String]) -> Result<i32> {
     Ok(segment_as(segments, 6, 7, "getQueueId")? as i32)
 }
 
-/// `segments[7]`：消息在队列里的 offset（只有 8 段串存在）。
+/// `segments[7]`: the message offset within the queue (only present in 8-segment strings).
 pub fn get_queue_offset(segments: &[String]) -> Result<i64> {
     segment_as(segments, 7, 8, "getQueueOffset")
 }
@@ -184,7 +184,7 @@ pub fn is_order(segments: &[String]) -> Result<bool> {
     Ok(get_revive_qid(segments)? == POP_ORDER_REVIVE_QUEUE)
 }
 
-// ---------------------------------------------------------------- CK 串拼装
+// ---------------------------------------------------------------- CK string assembly
 
 #[allow(clippy::too_many_arguments)]
 pub fn build_extra_info(
@@ -212,7 +212,7 @@ pub fn build_extra_info(
     parts.join(KEY_SEPARATOR)
 }
 
-/// `out` 非空时先补 `;`，所以调用方按队列顺序连续 append 即可。
+/// Prepends `;` when `out` is non-empty, so callers can simply append queue after queue in order.
 pub fn build_start_offset_info(out: &mut String, topic: &str, queue_id: i32, start_offset: i64) {
     append_queue_segment(
         out,
@@ -269,7 +269,7 @@ pub fn build_msg_offset_info(out: &mut String, topic: &str, queue_id: i32, msg_o
     );
 }
 
-/// 三段一组地追加：段内空格分隔、组间 `;` 分隔。
+/// Appends one three-segment group: segments joined by spaces, groups joined by `;`.
 fn append_queue_segment(out: &mut String, segments: &[&str]) {
     if !out.is_empty() {
         out.push_str(QUEUE_SEPARATOR);
@@ -277,9 +277,9 @@ fn append_queue_segment(out: &mut String, segments: &[&str]) {
     out.push_str(&segments.join(KEY_SEPARATOR));
 }
 
-// ---------------------------------------------------------------- 响应头信息表解析
+// ---------------------------------------------------------------- response header info table parsing
 
-/// 响应头 map 的通用形状：`"<retryFlag> <queueKey> <value>"`，多条用 `;` 连接。
+/// Common shape of the response header map: `"<retryFlag> <queueKey> <value>"`, multiple entries joined by `;`.
 fn split_queue_segments(value: &str) -> Vec<String> {
     if value.contains(QUEUE_SEPARATOR) {
         split_drop_trailing(value, QUEUE_SEPARATOR)
@@ -288,10 +288,10 @@ fn split_queue_segments(value: &str) -> Vec<String> {
     }
 }
 
-/// 解析单组并返回 `(key, third)`；key 是 `"<retryFlag>@<queueKey>"`。
+/// Parses a single group and returns `(key, third)`; the key is `"<retryFlag>@<queueKey>"`.
 ///
-/// 泛型 `T`：三个 `parse*Info` 的 value 类型不同（long / long 列表 / int 计数），
-/// 这里只用 `out` 做重复键检查，所以不关心 `T` 具体是什么。
+/// Generic `T`: the three `parse*Info` functions have different value types (long / long list / int count),
+/// and only `out` is used here for duplicate-key checks, so the concrete `T` does not matter.
 fn one_segment<T>(
     one: &str,
     raw: &str,
@@ -311,7 +311,7 @@ fn one_segment<T>(
     Ok((key, parts[2].to_string()))
 }
 
-/// 解析 `startOffsetInfo`，形如 `"0 3 0;0 2 1"`。
+/// Parses `startOffsetInfo`, shaped like `"0 3 0;0 2 1"`.
 pub fn parse_start_offset_info(
     start_offset_info: Option<&str>,
 ) -> Result<Option<Vec<(String, i64)>>> {
@@ -332,12 +332,12 @@ pub fn parse_start_offset_info(
     Ok(Some(out))
 }
 
-/// `msgOffsetInfo` 解析结果：按插入顺序的 `("<retryFlag>@<queueKey>", offsets)`。
+/// `msgOffsetInfo` parse result: `("<retryFlag>@<queueKey>", offsets)` in insertion order.
 pub type MsgOffsetTable = Vec<(String, Vec<i64>)>;
 
-/// 解析 `msgOffsetInfo`，形如 `"0 3 0,1,2;1 2 5"`。
+/// Parses `msgOffsetInfo`, shaped like `"0 3 0,1,2;1 2 5"`.
 ///
-/// key 同 [`parse_start_offset_info`]，value 是该队列本次弹出的各条消息 offset 列表。
+/// Same key as [`parse_start_offset_info`]; the value is the list of offsets of the messages popped from that queue this time.
 pub fn parse_msg_offset_info(msg_offset_info: Option<&str>) -> Result<Option<MsgOffsetTable>> {
     let raw = match msg_offset_info {
         None | Some("") => return Ok(None),
@@ -358,7 +358,7 @@ pub fn parse_msg_offset_info(msg_offset_info: Option<&str>) -> Result<Option<Msg
     Ok(Some(out))
 }
 
-/// 解析 `orderCountInfo`（顺序消费用），第三段是计数（int）。
+/// Parses `orderCountInfo` (used by ordered consumption); the third segment is the count (int).
 pub fn parse_order_count_info(
     order_count_info: Option<&str>,
 ) -> Result<Option<Vec<(String, i32)>>> {
@@ -379,7 +379,7 @@ pub fn parse_order_count_info(
     Ok(Some(out))
 }
 
-// ---------------------------------------------------------------- 查表键
+// ---------------------------------------------------------------- lookup keys
 
 pub fn get_start_offset_info_map_key(topic: &str, key: i64) -> String {
     format!("{}@{}", retry_of_topic(topic), key)
@@ -401,7 +401,7 @@ pub fn get_queue_offset_map_key(topic: &str, queue_id: i64, queue_offset: i64) -
 mod tests {
     use super::*;
 
-    /// 额外信息串（空格分隔字段）的线上记录真值。
+    /// Wire-record ground truth of the extra-info string (space-separated fields).
     const CK_NORMAL: &str = "12345 1700000000000 60000 0 0 broker-a 3";
     const CK_WITH_OFFSET: &str = "12345 1700000000000 60000 0 0 broker-a 3 67890";
     const CK_RETRY_V1: &str = "1 2 3 4 1 broker-a 0";
@@ -434,7 +434,7 @@ mod tests {
             ),
             CK_WITH_OFFSET
         );
-        // 第 5 段是 retryFlag，不是 topic
+        // the 5th segment is the retryFlag, not the topic
         let v1 = build_pop_retry_topic_v1(TOPIC, GROUP);
         let v2 = build_pop_retry_topic_v2(TOPIC, GROUP);
         assert_eq!(v1, "%RETRY%GID_BodyGolden_BodyGoldenTopic");
@@ -462,7 +462,7 @@ mod tests {
             ),
             CK_ORDER
         );
-        // 7 段与 8 段的段数差就是 msgQueueOffset 的有无
+        // the segment-count difference between 7 and 8 is exactly the presence of msgQueueOffset
         assert_eq!(split(CK_NORMAL).unwrap().len(), 7);
         assert_eq!(split(CK_WITH_OFFSET).unwrap().len(), 8);
     }
@@ -491,12 +491,12 @@ mod tests {
             err.contains("getQueueOffset fail, extraInfoStrs length 7"),
             "{err}"
         );
-        // 少于 5 段时连 retry 也取不到
+        // with fewer than 5 segments even retry cannot be read
         assert!(get_retry(&["1".to_string()])
             .unwrap_err()
             .to_string()
             .contains("getRetry fail, extraInfoStrs length 1"));
-        // 非数字段不 panic，报 Decode
+        // a non-numeric segment does not panic; it reports Decode
         let junk = segments("abc 2 3 4 0 broker-a 1 5");
         assert!(matches!(get_ck_queue_offset(&junk), Err(Error::Decode(_))));
     }
@@ -520,7 +520,7 @@ mod tests {
         let out = parse_start_offset_info(Some("0 3 0;0 2 1"))
             .unwrap()
             .unwrap();
-        // 键序按报文出现顺序保留：{"0@3": 0, "0@2": 1}
+        // key order preserved as in the wire payload: {"0@3": 0, "0@2": 1}
         assert_eq!(
             out,
             vec![("0@3".to_string(), 0i64), ("0@2".to_string(), 1i64)]
@@ -529,7 +529,7 @@ mod tests {
             parse_start_offset_info(Some("1 5 12")).unwrap().unwrap(),
             vec![("1@5".to_string(), 12i64)]
         );
-        // 只有 retryFlag 2（V2 retry）也照样能拼出查询键
+        // retryFlag 2 alone (V2 retry) still assembles the lookup key
         assert_eq!(
             get_start_offset_info_map_key(&build_pop_retry_topic_v2(TOPIC, GROUP), 3),
             "2@3"
@@ -537,7 +537,7 @@ mod tests {
         assert_eq!(get_start_offset_info_map_key(TOPIC, 3), "0@3");
         assert!(parse_start_offset_info(None).unwrap().is_none());
         assert!(parse_start_offset_info(Some("")).unwrap().is_none());
-        // 段数不对 / 重复键 -> Decode
+        // wrong segment count / duplicate key -> Decode
         assert!(matches!(
             parse_start_offset_info(Some("0 3")),
             Err(Error::Decode(_))
@@ -560,7 +560,7 @@ mod tests {
         let out = parse_msg_offset_info(Some("0 3 0,1,2;1 2 5"))
             .unwrap()
             .unwrap();
-        // 顺序按报文原样保留：{"0@3": [0,1,2], "1@2": [5]}
+        // order preserved exactly as in the wire payload: {"0@3": [0,1,2], "1@2": [5]}
         assert_eq!(
             out,
             vec![
@@ -650,13 +650,13 @@ mod tests {
         let mut by_offset = String::new();
         build_queue_offset_order_count_info(&mut by_offset, TOPIC, 3, 67890, 4);
         assert_eq!(by_offset, "0 qo3%67890 4");
-        // 与 parse_* 的键完全对得上，这正是 POP 顺序消费找回计数的路径
+        // matches the parse_* keys exactly; this is exactly the path POP ordered consumption uses to find the count back
         assert_eq!(get_queue_offset_map_key(TOPIC, 3, 67890), "0@qo3%67890");
     }
 
     #[test]
     fn round_trip_recovers_the_full_ack_ticket() {
-        // 从 POP 响应头反构 CK 串，再把每一段读回来（ACK / 改不可见时间的入参）
+        // reconstruct the CK string from the POP response headers, then read every segment back (the inputs of ACK / change-invisible-time)
         let start = parse_start_offset_info(Some("0 3 100")).unwrap().unwrap();
         let offsets = parse_msg_offset_info(Some("0 3 100,101")).unwrap().unwrap();
         let (queue_key, start_offset) = &start[0];
@@ -693,7 +693,7 @@ mod tests {
             retry_of_topic(&build_pop_retry_topic_v2(TOPIC, GROUP)),
             RETRY_TOPIC_V2
         );
-        // 普通 topic 名里带 `+` 不算 V2（必须同时有 %RETRY% 前缀）
+        // an ordinary topic name containing `+` does not count as V2 (the %RETRY% prefix must be present too)
         assert_eq!(retry_of_topic("Topic+With+Plus"), NORMAL_TOPIC);
         assert!(!is_pop_retry_topic_v2(None));
         assert!(!is_pop_retry_topic_v2(Some("")));

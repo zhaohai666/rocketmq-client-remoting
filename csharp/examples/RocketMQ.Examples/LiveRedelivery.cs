@@ -34,9 +34,11 @@ public static class LiveRedelivery
 
     private static long NowMs() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
-    /// <summary>轮询到条件成立为止，返回是否在窗口内成立。
-    /// 真机断言一律用它而不是固定 sleep：几套 live 并发跑时 broker 会拖慢，
-    /// 固定 sleep 测出的是假失败（同一份代码复跑即绿）。</summary>
+    /// <summary>Polls until the condition holds and returns whether it held within the
+    /// window.
+    /// Real-machine assertions use this instead of a fixed sleep: when several live suites
+    /// run concurrently the broker gets slower, and a fixed sleep measures a false failure
+    /// (the same code turns green on a re-run).</summary>
     private static bool WaitUntil(Func<bool> pred, int timeoutMs)
     {
         long deadline = NowMs() + timeoutMs;
@@ -111,13 +113,16 @@ public static class LiveRedelivery
         return c;
     }
 
-    /// <summary>队列 key（与消费者内部 OffsetKey 一致）：topic + brokerName + queueId。</summary>
+    /// <summary>The queue key (identical to the consumer's internal OffsetKey): topic +
+    /// brokerName + queueId.</summary>
     private static string Key(MessageQueue mq) =>
         mq.Topic + mq.BrokerName + mq.QueueId.ToString(CultureInfo.InvariantCulture);
 
-    /// <summary>按真实用法先把 topic 建出来，再启动消费者。
-    /// 真实环境里 topic 由管理员或首次发送预先创建；消费者不做默认 topic 兜底，
-    /// topic 不存在时拿不到路由、不分配队列。</summary>
+    /// <summary>Creates the topic first the way real usage does, then starts the
+    /// consumer.
+    /// In a real environment the topic is pre-created by an administrator or by the first
+    /// send; the consumer does no default-topic fallback, so when the topic does not exist
+    /// it gets no route and is assigned no queues.</summary>
     private static void PrepareTopic(DefaultMQProducer producer, string topic, int queues = 4)
     {
         try
@@ -126,14 +131,14 @@ public static class LiveRedelivery
         }
         catch (Exception e)
         {
-            Console.WriteLine("  预建 topic " + topic + " 失败（改用自动创建）: " + e.Message);
+            Console.WriteLine("  pre-creating topic " + topic + " failed (falling back to auto-creation): " + e.Message);
         }
 
-        // 等 NameServer 路由传播，否则消费者首轮 rebalance 仍查不到
+        // Wait for the NameServer route to propagate, otherwise the consumer's first rebalance round still finds nothing
         Thread.Sleep(3000);
     }
 
-    // ---------------- S1 回投 ----------------
+    // ---------------- S1 Resend ----------------
     private sealed class RetryListener : IMessageListenerConcurrently
     {
         public readonly object Lock = new();
@@ -162,7 +167,7 @@ public static class LiveRedelivery
                 }
             }
 
-            // retry-me 首次投递失败，重投后成功（重投次数走 MessageExt 第 13 字段）
+            // retry-me fails on the first delivery and succeeds after the resend (the resend count goes through field 13 of MessageExt)
             return needRetry ? ConsumeConcurrentlyStatus.ReconsumeLater
                 : ConsumeConcurrentlyStatus.ConsumeSuccess;
         }
@@ -180,7 +185,7 @@ public static class LiveRedelivery
         Thread.Sleep(3000);
         producer.Send(new Message(topic, Str2Bytes("retry-me")));
         producer.Send(new Message(topic, Str2Bytes("normal-1")));
-        Console.WriteLine("S1: 已发送，等待回投（延迟梯度 level3≈10s）...");
+        Console.WriteLine("S1: sent, waiting for the resend (delay tier level3~10s)...");
         Thread.Sleep(22000);
         consumer.Shutdown();
 
@@ -190,26 +195,26 @@ public static class LiveRedelivery
         retryArrivals = snap.Where(a => a.Body == "retry-me").ToList();
         normalCount = snap.Count(a => a.Body == "normal-1");
 
-        Check("S1-retry-me 被投递多次", retryArrivals.Count >= 2,
+        Check("S1-retry-me was delivered more than once", retryArrivals.Count >= 2,
             "arrivals=" + retryArrivals.Count.ToString(CultureInfo.InvariantCulture));
         bool fromRetry = retryArrivals.Any(a => a.ReconsumeTimes >= 1 || a.Topic.StartsWith("%RETRY%", StringComparison.Ordinal));
-        Check("S1-重投来自 %RETRY%/reconsumeTimes", fromRetry);
+        Check("S1-the resend came from %RETRY%/reconsumeTimes", fromRetry);
         if (retryArrivals.Count >= 2)
         {
             double gapSec = (retryArrivals[^1].Ts - retryArrivals[0].Ts) / 1000.0;
-            Check("S1-回投有延迟梯度(>=8s)", gapSec >= 8.0,
+            Check("S1-the resend has a delay tier (>=8s)", gapSec >= 8.0,
                 "gap=" + gapSec.ToString("F1", CultureInfo.InvariantCulture) + "s");
         }
         else
         {
-            Check("S1-回投有延迟梯度(>=8s)", false, "不足两次投递");
+            Check("S1-the resend has a delay tier (>=8s)", false, "fewer than two deliveries");
         }
 
-        Check("S1-正常消息只投一次", normalCount == 1,
+        Check("S1-a normal message is delivered only once", normalCount == 1,
             "arrivals=" + normalCount.ToString(CultureInfo.InvariantCulture));
     }
 
-    // ---------------- S2 位点持久化 ----------------
+    // ---------------- S2 Offset persistence ----------------
     private static void ScenarioOffsetPersist(DefaultMQProducer producer)
     {
         string topic = _gPrefix + "_Offset";
@@ -229,11 +234,11 @@ public static class LiveRedelivery
         }
 
         Thread.Sleep(8000);
-        c1.Shutdown();  // shutdown 持久化位点
+        c1.Shutdown();  // shutdown persists the offsets
         round1 = l1.Snapshot();
 
         int gotFirst = Enumerable.Range(0, 3).Count(i => round1.Contains("persist-" + i.ToString(CultureInfo.InvariantCulture)));
-        Check("S2-首轮消费 3 条", gotFirst == 3, "got=" + gotFirst.ToString(CultureInfo.InvariantCulture));
+        Check("S2-the first round consumed 3", gotFirst == 3, "got=" + gotFirst.ToString(CultureInfo.InvariantCulture));
 
         var c2 = NewConsumer(group);
         var l2 = new CollectingListenerConcurrently();
@@ -248,12 +253,12 @@ public static class LiveRedelivery
         List<string> round2 = l2.Snapshot();
         bool newSeen = round2.Contains("persist-new");
         int oldResent = round2.Count(b => b.StartsWith("persist-", StringComparison.Ordinal) && b != "persist-new");
-        Check("S2-重启后新消息继续投递", newSeen, newSeen ? "" : "未收到");
-        Check("S2-重启不重复消费旧消息", oldResent == 0,
-            "重复=" + oldResent.ToString(CultureInfo.InvariantCulture));
+        Check("S2-after the restart new messages keep being delivered", newSeen, newSeen ? "" : "nothing received");
+        Check("S2-the restart does not re-consume old messages", oldResent == 0,
+            "duplicates=" + oldResent.ToString(CultureInfo.InvariantCulture));
     }
 
-    // ---------------- S3 顺序消费 + broker 锁 ----------------
+    // ---------------- S3 Orderly consumption + broker locks ----------------
     private sealed class CountingOrderlyListener : IMessageListenerOrderly
     {
         private int _got;
@@ -278,7 +283,7 @@ public static class LiveRedelivery
         consumer.SetMessageListener(listener);
         consumer.Subscribe(topic, "*");
         consumer.Start();
-        Thread.Sleep(5000);  // 等 LOCK_BATCH_MQ 首轮生效
+        Thread.Sleep(5000);  // wait for the first LOCK_BATCH_MQ round to take effect
         for (int i = 0; i < 4; ++i)
         {
             producer.Send(new Message(topic, Str2Bytes("orderly-" + i.ToString(CultureInfo.InvariantCulture))));
@@ -286,12 +291,12 @@ public static class LiveRedelivery
 
         Thread.Sleep(8000);
         consumer.Shutdown();
-        Check("S3-顺序消费收全", listener.Got == 4,
+        Check("S3-orderly consumption received everything", listener.Got == 4,
             "got=" + listener.Got.ToString(CultureInfo.InvariantCulture));
-        Check("S3-顺序消费链路存活", listener.Got > 0);
+        Check("S3-the orderly consumption path is alive", listener.Got > 0);
     }
 
-    // ---------------- S4 广播模式 ----------------
+    // ---------------- S4 Broadcasting mode ----------------
     private static void ScenarioBroadcast(DefaultMQProducer producer)
     {
         string topic = _gPrefix + "_Bc";
@@ -323,13 +328,13 @@ public static class LiveRedelivery
         Thread.Sleep(8000);
         ca.Shutdown();
         cb.Shutdown();
-        Check("S4-广播消费者 A 收全", la.Snapshot().Count == 3,
+        Check("S4-broadcasting consumer A received everything", la.Snapshot().Count == 3,
             "got=" + la.Snapshot().Count.ToString(CultureInfo.InvariantCulture));
-        Check("S4-广播消费者 B 收全", lb.Snapshot().Count == 3,
+        Check("S4-broadcasting consumer B received everything", lb.Snapshot().Count == 3,
             "got=" + lb.Snapshot().Count.ToString(CultureInfo.InvariantCulture));
     }
 
-    // ---------------- S5 流控 ----------------
+    // ---------------- S5 Flow control ----------------
     private sealed class SlowListener : IMessageListenerConcurrently
     {
         private int _got;
@@ -363,18 +368,20 @@ public static class LiveRedelivery
             producer.Send(new Message(topic, Str2Bytes("flow-" + i.ToString(CultureInfo.InvariantCulture))));
         }
 
-        // 阈值 2 + 每条睡 300ms：全部落袋才说明「流控只是暂停拉取，不丢消息」。
-        // 固定 sleep 在机器忙时会测出 got=7/10 的假失败（同一份代码复跑即绿）。
+        // A threshold of 2 plus 300ms of sleep per message: only everything landing proves
+        // that "flow control just pauses pulling, it does not drop messages". A fixed sleep
+        // on a busy machine measures a false failure of got=7/10 (the same code turns green
+        // on a re-run).
         bool allArrived = WaitUntil(() => listener.Got >= 10, 45000);
         long fc = consumer.FlowControlTriggered;
         consumer.Shutdown();
-        Check("S5-慢消费下消息全部到达", allArrived && listener.Got == 10,
+        Check("S5-all messages arrive under slow consumption", allArrived && listener.Got == 10,
             "got=" + listener.Got.ToString(CultureInfo.InvariantCulture));
-        Check("S5-流控触发计数>0", fc > 0,
+        Check("S5-the flow control trigger count is >0", fc > 0,
             "triggered=" + fc.ToString(CultureInfo.InvariantCulture));
     }
 
-    // ---------------- S6 集群多实例 rebalance（队列分配） ----------------
+    // ---------------- S6 Cluster multi-instance rebalance (queue assignment) ----------------
     private static void ScenarioRebalance(DefaultMQProducer producer)
     {
         string topic = _gPrefix + "_Rebalance";
@@ -395,14 +402,14 @@ public static class LiveRedelivery
         cb.Subscribe(topic, "*");
         cb.Start();
 
-        // 主 topic 的全部队列（期望被两实例完整覆盖）
+        // all the queues of the main topic (expected to be fully covered by the two instances)
         var expectedKeys = new HashSet<string>(StringComparer.Ordinal);
         foreach (MessageQueue mq in ca.FetchSubscribeMessageQueues(topic))
         {
             expectedKeys.Add(Key(mq));
         }
 
-        // 等分配稳定：交集为空 + 两边都非空 + 主 topic 队列被完整覆盖（最多等 45s）
+        // wait for the assignment to settle: empty intersection + both non-empty + the main topic's queues fully covered (at most 45s)
         List<string> keysA = new();
         List<string> keysB = new();
         long deadline = NowMs() + 45000;
@@ -441,14 +448,14 @@ public static class LiveRedelivery
         all.AddRange(gotB);
         var uniq = new HashSet<string>(all, StringComparer.Ordinal);
         int dup = all.Count - uniq.Count;
-        // broker 在组成员变化时沿长连接反向推 40；反向请求用例注入不了，所以计数是
-        // 唯一能证明「实例级 40 处理器真的跑过」的落点（必须在 Shutdown 之前取样）。
+        // the broker reverse-pushes 40 over the long connection when the group membership changes; a reverse request case cannot inject it, so the
+        // counter is the only landing point that can prove "the instance-level 40 handler really ran" (it must be sampled before Shutdown).
         long notifiedA = ca.Client().ConsumerIdsChangedCount;
         long notifiedB = cb.Client().ConsumerIdsChangedCount;
         ca.Shutdown();
         cb.Shutdown();
 
-        Check("S6-消费者已心跳注册", hbA > 0 && cidList.Count == 2,
+        Check("S6-the consumer registered via heartbeat", hbA > 0 && cidList.Count == 2,
             "heartbeats=" + hbA.ToString(CultureInfo.InvariantCulture)
                 + " brokerCids=" + cidList.Count.ToString(CultureInfo.InvariantCulture));
 
@@ -458,29 +465,31 @@ public static class LiveRedelivery
         var cover = new HashSet<string>(sa, StringComparer.Ordinal);
         cover.UnionWith(sb);
         cover.IntersectWith(expectedKeys);
-        Check("S6-队列不重不漏(a=" + keysA.Count.ToString(CultureInfo.InvariantCulture)
+        Check("S6-no queue missing and none duplicated (a=" + keysA.Count.ToString(CultureInfo.InvariantCulture)
               + ",b=" + keysB.Count.ToString(CultureInfo.InvariantCulture)
-              + ",交集=" + cross.ToString(CultureInfo.InvariantCulture)
-              + ",覆盖=" + cover.Count.ToString(CultureInfo.InvariantCulture)
+              + ",intersection=" + cross.ToString(CultureInfo.InvariantCulture)
+              + ",covered=" + cover.Count.ToString(CultureInfo.InvariantCulture)
               + "/" + expectedKeys.Count.ToString(CultureInfo.InvariantCulture) + ")",
             keysA.Count > 0 && keysB.Count > 0 && cross == 0 && expectedKeys.Count > 0
                 && cover.Count == expectedKeys.Count);
-        Check("S6-消息无重复消费", dup == 0 && all.Count == total,
+        Check("S6-no message consumed twice", dup == 0 && all.Count == total,
             "got=" + all.Count.ToString(CultureInfo.InvariantCulture)
                 + "/" + total.ToString(CultureInfo.InvariantCulture)
                 + " dup=" + dup.ToString(CultureInfo.InvariantCulture));
-        Check("S6-成员变化时收到 broker 的 NOTIFY_CONSUMER_IDS_CHANGED(40)",
+        Check("S6-on a membership change the broker's NOTIFY_CONSUMER_IDS_CHANGED(40) is received",
             notifiedA > 0 && notifiedB > 0,
             "a=" + notifiedA.ToString(CultureInfo.InvariantCulture)
                 + " b=" + notifiedB.ToString(CultureInfo.InvariantCulture)
-                + "（0 表示实例级处理器没收到过反向通知）");
+                + " (0 means the instance-level handler never received a reverse notification)");
     }
 
-    // ---------------- S7 优雅注销 ----------------
+    // ---------------- S7 Graceful unregister ----------------
     private static void ScenarioUnregister()
     {
-        // 复用 S6 建的 8 队列 topic；shutdown 时应发 UNREGISTER_CLIENT，broker 端立刻摘除，
-        // 不必等心跳超时（~120s）。查询用独立的探针客户端（消费者 shutdown 后其内部客户端已关闭）。
+        // Reuses the 8-queue topic built in S6; shutdown should send UNREGISTER_CLIENT and
+        // the broker removes it immediately, with no need to wait for the heartbeat timeout
+        // (~120s). The query uses an independent probe client (after the consumer shuts down
+        // its internal client is already closed).
         string topic = _gPrefix + "_Rebalance";
         string group = _gPrefix + "_g7";
         var probe = new MQClientInstance(
@@ -503,13 +512,13 @@ public static class LiveRedelivery
         List<string> after = probe.GetConsumerIdListByGroup(topic, group) ?? new List<string>();
         probe.Shutdown();
 
-        Check("S7-shutdown 已注销 clientId",
+        Check("S7-shutdown unregistered the clientId",
             before.Contains(cid) && !after.Contains(cid),
             "before=" + before.Count.ToString(CultureInfo.InvariantCulture)
                 + " after=" + after.Count.ToString(CultureInfo.InvariantCulture));
     }
 
-    // ---------------- S8 命名空间（多租户隔离）----------------
+    // ---------------- S8 Namespace (multi-tenant isolation)----------------
     private static void ScenarioNamespace()
     {
         string ns = "NSDotnet" + (NowMs() % 100000).ToString(CultureInfo.InvariantCulture);
@@ -519,7 +528,7 @@ public static class LiveRedelivery
         nsProducer.NamesrvAddr = _namesrv;
         nsProducer.Namespace = ns;
         nsProducer.Start();
-        // CreateTopic 也走 namespace 包装：真实建出来的是 "<ns>%<topic>"
+        // CreateTopic also goes through the namespace wrapping: what really gets created is "<ns>%<topic>"
         PrepareTopic(nsProducer, topic);
 
         var nsListener = new CollectingListenerConcurrently();
@@ -538,10 +547,10 @@ public static class LiveRedelivery
         Thread.Sleep(8000);
         nsConsumer.Shutdown();
         List<string> nsGot = nsListener.Snapshot();
-        Check("S8-带 namespace 生产/消费收全", nsGot.Count == 3,
+        Check("S8-production/consumption with a namespace received everything", nsGot.Count == 3,
             "got=" + nsGot.Count.ToString(CultureInfo.InvariantCulture));
 
-        // 不带 namespace 的消费者订阅同一个裸 topic → 收不到（证明真实 topic 是 ns%topic）
+        // a consumer without a namespace subscribing to the same bare topic -> receives nothing (proving the real topic is ns%topic)
         var plainListener = new CollectingListenerConcurrently();
         try
         {
@@ -555,17 +564,17 @@ public static class LiveRedelivery
         }
         catch (Exception e)
         {
-            Console.WriteLine("  (无 ns 消费者异常，符合隔离预期: " + e.Message + ")");
+            Console.WriteLine("  (the no-ns consumer threw, as isolation requires: " + e.Message + ")");
         }
 
         List<string> plainGot = plainListener.Snapshot();
-        Check("S8-无 namespace 消费者收不到(隔离)", plainGot.Count == 0,
+        Check("S8-a consumer without a namespace receives nothing (isolation)", plainGot.Count == 0,
             "got=" + plainGot.Count.ToString(CultureInfo.InvariantCulture));
 
         nsProducer.Shutdown();
     }
 
-    // ---------------- S9 死信终态（%DLQ%） ----------------
+    // ---------------- S9 Dead letter terminal state (%DLQ%) ----------------
     private sealed class AlwaysFailListener : IMessageListenerConcurrently
     {
         public readonly object Lock = new();
@@ -613,53 +622,55 @@ public static class LiveRedelivery
         Thread.Sleep(3000);
         producer.Send(new Message(topic, Str2Bytes("dlq-me")));
 
-        // 回投档位 = 3 + reconsumeTimes ⇒ level3(10s) + level4(30s)，再留投递余量。
-        // 150s 而不是 100s：整机并发跑其它套件时 broker 的定时服务会拖档，第三次投递
-        // 实测能晚到 60s+，卡 100s 是假失败。
+        // resend tier = 3 + reconsumeTimes => level3(10s) + level4(30s), plus some delivery slack.
+        // 150s rather than 100s: when the whole machine runs the other suites concurrently
+        // the broker's timer service delays the tiers, and the third delivery has been
+        // measured arriving 60s+ late, so cutting at 100s is a false failure.
         long deadline = NowMs() + 150000;
         while (NowMs() < deadline && listener.Snapshot().Count < 3) Thread.Sleep(2000);
         List<(string Body, string Topic, int ReconsumeTimes)> firstThree =
             listener.Snapshot().Where(a => a.Body == "dlq-me").ToList();
-        Thread.Sleep(15000);  // 反证：不该有第 4 次投递
+        Thread.Sleep(15000);  // counter-proof: there must be no 4th delivery
         List<(string Body, string Topic, int ReconsumeTimes)> finalSeen =
             listener.Snapshot().Where(a => a.Body == "dlq-me").ToList();
         consumer.Shutdown();
 
         string times = string.Join(",", firstThree.Select(a => a.ReconsumeTimes
             .ToString(CultureInfo.InvariantCulture)));
-        Check("S9-maxReconsumeTimes=2 ⇒ 投递 3 次（reconsumeTimes 0/1/2）",
+        Check("S9-maxReconsumeTimes=2 => delivered 3 times (reconsumeTimes 0/1/2)",
             firstThree.Count >= 3 && firstThree[0].ReconsumeTimes == 0
                 && firstThree[1].ReconsumeTimes == 1 && firstThree[2].ReconsumeTimes == 2,
             "times=[" + times + "]");
-        Check("S9-用尽后不再投递（观察窗口内只有 3 次）", finalSeen.Count == 3,
+        Check("S9-after it is used up there are no more deliveries (only 3 within the observation window)", finalSeen.Count == 3,
             "arrivals=" + finalSeen.Count.ToString(CultureInfo.InvariantCulture));
-        Check("S9-重投期间 listener 看到业务 topic（不是 %RETRY%）",
+        Check("S9-during the resend the listener sees the business topic (not %RETRY%)",
             firstThree.All(a => a.Topic == topic));
 
-        // %DLQ%<group> 由 broker 在转死信那一刻才建出来并注册到 namesrv
+        // %DLQ%<group> is only created by the broker at the moment it moves the dead letter and registers it with the namesrv
         string dlqTopic = MixAll.GetDlqTopic(group);
         (bool routeFound, List<MessageExt> dlqMsgs) = ReadDlq(group, _gPrefix + "_g9dlq", 30000);
-        Check("S9-broker 自动创建并注册了 %DLQ%<group> 路由", routeFound, "dlq=" + dlqTopic);
+        Check("S9-the broker auto-created and registered the %DLQ%<group> route", routeFound, "dlq=" + dlqTopic);
 
         bool one = dlqMsgs.Count == 1 && Body(dlqMsgs[0]) == "dlq-me";
-        Check("S9-消息落在 %DLQ%<group>", one,
+        Check("S9-the message landed in %DLQ%<group>", one,
             "n=" + dlqMsgs.Count.ToString(CultureInfo.InvariantCulture));
         if (one)
         {
             MessageExt d = dlqMsgs[0];
-            Check("S9-死信 reconsumeTimes = maxReconsumeTimes + 1（broker 存储时 +1）",
+            Check("S9-the dead letter's reconsumeTimes = maxReconsumeTimes + 1 (+1 as the broker stores it)",
                 d.ReconsumeTimes == maxReconsume + 1,
                 "reconsumeTimes=" + d.ReconsumeTimes.ToString(CultureInfo.InvariantCulture));
             bool retryKept = d.Properties.TryGetValue("RETRY_TOPIC", out string? origin)
                 && origin == topic && d.Topic == dlqTopic;
-            Check("S9-死信保留 RETRY_TOPIC=业务 topic，topic 已是 %DLQ%<group>", retryKept,
+            Check("S9-the dead letter keeps RETRY_TOPIC=the business topic while the topic is already %DLQ%<group>", retryKept,
                 "retryTopic=" + (d.Properties.TryGetValue("RETRY_TOPIC", out string? o)
                     ? o : "<missing>"));
         }
     }
 
-    // ---------------- S10 部分 ack（ackIndex） ----------------
-    /// <summary>记录每条投递，并（可选）只在**首批**把 ctx.AckIndex 收窄。</summary>
+    // ---------------- S10 Partial ack (ackIndex) ----------------
+    /// <summary>Records every delivery and (optionally) narrows ctx.AckIndex on the
+    /// **first batch only**.</summary>
     private sealed class PartialAckListener : IMessageListenerConcurrently
     {
         private readonly object _lk = new();
@@ -692,8 +703,10 @@ public static class LiveRedelivery
             {
                 foreach (MessageExt m in msgs) _seen.Add((Body(m), m.Topic, m.ReconsumeTimes));
                 _batchSizes.Add(msgs.Count);
-                // 只收窄首批：后续批次必须整批认可，否则那条尾巴永远回投不完，
-                // 「已认可前缀只投一次」的计数器也会被后续批次污染。
+                // Only the first batch is narrowed: later batches must acknowledge the whole
+                // batch, otherwise that tail is never finished being resent and the
+                // "the acknowledged prefix is delivered once" counter is polluted by the
+                // later batches.
                 narrow = _ackFirst >= 0 && _batchSizes.Count == 1;
             }
 
@@ -705,7 +718,7 @@ public static class LiveRedelivery
     private static void ScenarioPartialAck(DefaultMQProducer producer)
     {
         string topic = _gPrefix + "_AckIndex";
-        // 1 队列：一批 3 条才连续且有序，尾巴才是真尾巴
+        // 1 queue: only a batch of 3 is contiguous and ordered, so the tail is a real tail
         PrepareTopic(producer, topic, 1);
         string group = _gPrefix + "_g10";
         string controlGroup = _gPrefix + "_g10ctrl";
@@ -714,16 +727,19 @@ public static class LiveRedelivery
         var control = new PartialAckListener(-1);
         var pc = NewConsumer(group);
         var cc = NewConsumer(controlGroup);
-        // 默认一批 1 条，不收窄到 3 根本没有「部分」可言
+        // the default batch is 1 message, so without narrowing to 3 there is no "partial" at all
         pc.ConsumeMessageBatchMaxSize = 3;
         cc.ConsumeMessageBatchMaxSize = 3;
         pc.SetMessageListener(partial);
         cc.SetMessageListener(control);
         pc.Subscribe(topic, "*");
         cc.Subscribe(topic, "*");
-        // 先把 3 条放上去再起消费者：批次怎么切由拉取时机决定，队列里已经躺着 3 条时第一次
-        // 拉取才会正好是「一整批 3 条」，否则首批可能只有 1~2 条，ackIndex=0 划出的
-        // 前缀/后缀就不确定了。新组在 LAST_OFFSET 下会从分配时刻的最新位点开始，故显式从 0 起消。
+        // Put the 3 messages in place before starting the consumer: how a batch is cut is
+        // decided by the pull timing, and only when the queue already holds the 3 messages
+        // is the very first pull exactly "one whole batch of 3", otherwise the first batch
+        // could be 1~2 messages and the prefix/suffix cut by ackIndex=0 would be
+        // undetermined. A new group under LAST_OFFSET starts from the newest offset at
+        // assignment time, hence the explicit consumption from 0.
         pc.ConsumeFromWhere = ConsumeFromWhere.ConsumeFromFirstOffset;
         cc.ConsumeFromWhere = ConsumeFromWhere.ConsumeFromFirstOffset;
         for (int i = 0; i < 3; ++i)
@@ -749,33 +765,33 @@ public static class LiveRedelivery
             return hit;
         }
 
-        // 尾巴要经 %RETRY%（延迟 level 3≈10s）+ 重试 topic 的路由注册 + 下一轮 rebalance
+        // the tail has to go through %RETRY% (delay level 3~10s) + route registration of the retry topic + the next rebalance round
         bool tailBack = WaitUntil(() => Redelivered(partial) == tail.Length, 150000);
-        Thread.Sleep(10000);  // 反证窗口：多余的重复投递会露出来
+        Thread.Sleep(10000);  // counter-proof window: a redundant duplicate delivery shows up here
         List<(string Body, string Topic, int ReconsumeTimes)> seenFinal = partial.Snapshot();
 
-        Check("S10-首批确实拿到 3 条（ackIndex=0 才有「部分」可言）",
+        Check("S10-the first batch really got 3 messages (only ackIndex=0 makes a 'partial' meaningful)",
             partial.FirstBatchSize == 3,
             "firstBatch=" + partial.FirstBatchSize.ToString(CultureInfo.InvariantCulture));
-        Check("S10-未认可的尾巴从 %RETRY% 回来（reconsumeTimes>=1 且 topic 是业务 topic）",
+        Check("S10-the unacknowledged tail comes back from %RETRY% (reconsumeTimes>=1 and the topic is the business topic)",
             tailBack,
             "redelivered=" + Redelivered(partial).ToString(CultureInfo.InvariantCulture) + "/2");
         int ackedHits = seenFinal.Count(r => r.Body == "ack-0");
-        Check("S10-已认可的那条整个窗口只投一次（没有把前缀也回投）", ackedHits == 1,
+        Check("S10-the acknowledged one is delivered only once in the whole window (the prefix was not resent either)", ackedHits == 1,
             "arrivals=" + ackedHits.ToString(CultureInfo.InvariantCulture));
-        Check("S10-3 条最终全部消费（不丢）",
+        Check("S10-all 3 are eventually consumed (nothing is lost)",
             seenFinal.Select(r => r.Body).Distinct().Count() == 3,
             "distinct=" + seenFinal.Select(r => r.Body).Distinct().Count()
                 .ToString(CultureInfo.InvariantCulture));
 
         List<(string Body, string Topic, int ReconsumeTimes)> ctrl = control.Snapshot();
-        Check("S10-对照组默认 ackIndex(MAX_VALUE)：一条都不回投",
+        Check("S10-the control group's default ackIndex(MAX_VALUE): nothing is resent",
             ctrl.Count == 3 && ctrl.All(r => r.ReconsumeTimes == 0),
             "deliveries=" + ctrl.Count.ToString(CultureInfo.InvariantCulture)
             + " retried=" + ctrl.Count(r => r.ReconsumeTimes >= 1).ToString(CultureInfo.InvariantCulture));
 
-        // broker 侧口径：两个组的业务队列位点都必须整批提交到 3（部分 ack 不是「少提交」，
-        // 尾巴已交给 broker 重投，本队列没有欠账）
+        // The broker's rule: the business queue offsets of both groups must be committed as a whole to 3 (a partial ack is not
+        // "committing less", the tail has been handed to the broker for resending so this queue owes nothing)
         var admin = new DefaultMQAdminExt();
         admin.SetNamesrvAddr(_namesrv);
         admin.SetTimeoutMillis(10000);
@@ -783,12 +799,12 @@ public static class LiveRedelivery
         {
             admin.Start();
             List<MessageQueue> queues = pc.FetchSubscribeMessageQueues(topic);
-            Check("S10-业务 topic 有队列可查位点", queues.Count > 0,
+            Check("S10-the business topic has a queue whose offset can be queried", queues.Count > 0,
                 "queues=" + queues.Count.ToString(CultureInfo.InvariantCulture));
             if (queues.Count > 0)
             {
                 MessageQueue mq = queues[0];
-                // -1 = broker 还没有该组的位点（QUERY_NOT_FOUND）
+                // -1 = the broker has no offset for that group yet (QUERY_NOT_FOUND)
                 long ReadOffset(string g)
                 {
                     try
@@ -802,16 +818,16 @@ public static class LiveRedelivery
                 }
 
                 bool p = WaitUntil(() => ReadOffset(group) == 3, 30000);
-                Check("S10-部分 ack 后业务队列位点仍整批前进到 3", p,
+                Check("S10-after a partial ack the business queue's offset still advances as a whole to 3", p,
                     "committed=" + ReadOffset(group).ToString(CultureInfo.InvariantCulture));
                 bool c = WaitUntil(() => ReadOffset(controlGroup) == 3, 30000);
-                Check("S10-对照组业务队列位点同样到 3", c,
+                Check("S10-the control group's business queue offset also reaches 3", c,
                     "committed=" + ReadOffset(controlGroup).ToString(CultureInfo.InvariantCulture));
             }
         }
         catch (Exception e)
         {
-            Check("S10-位点查询可用", false, e.Message);
+            Check("S10-the offset query is usable", false, e.Message);
         }
 
         admin.Shutdown();
@@ -824,7 +840,7 @@ public static class LiveRedelivery
     {
         string topic = _gPrefix + "_Heal";
         string group = _gPrefix + "_g11";
-        // 1 队列：只有一路循环，注入点唯一，位点判据也唯一（多队列会被分摊，撤走的不一定是注入那把）
+        // 1 queue: only one loop exists, the injection point is unique and so is the offset criterion (multiple queues get shared out, and the one withdrawn is not necessarily the injected one)
         PrepareTopic(producer, topic, 1);
 
         var admin = new DefaultMQAdminExt();
@@ -846,7 +862,7 @@ public static class LiveRedelivery
                 queues = c.FetchSubscribeMessageQueues(topic);
                 return queues.Count == 1 && c.AssignedQueueKeys().Contains(Key(queues[0]));
             }, 30000);
-            Check("S11-单队列已分到本实例", queues.Count == 1 && c.AssignedQueueKeys().Contains(Key(queues[0])),
+            Check("S11-the single queue is assigned to this instance", queues.Count == 1 && c.AssignedQueueKeys().Contains(Key(queues[0])),
                 "queues=" + queues.Count.ToString(CultureInfo.InvariantCulture)
                 + " assigned=" + string.Join(",", c.AssignedQueueKeys()));
             if (queues.Count != 1)
@@ -869,36 +885,36 @@ public static class LiveRedelivery
                 }
             }
 
-            // ---- H1 基线：3 条消费掉，位点提交到 3，拉取时钟是真值 ----
+            // ---- H1 baseline: 3 consumed, the offset committed to 3, the pull clock is real ----
             for (int i = 0; i < 3; ++i)
             {
                 producer.Send(new Message(topic, Str2Bytes("heal-1-" + i.ToString(CultureInfo.InvariantCulture))));
             }
 
-            Check("S11-H1 基线：3 条被消费",
+            Check("S11-H1 baseline: 3 were consumed",
                 WaitUntil(() => listener.Snapshot().Count >= 3, 30000),
                 "arrivals=" + listener.Snapshot().Count.ToString(CultureInfo.InvariantCulture));
-            Check("S11-H1 基线：位点提交到 broker（撤走重建全靠它续拉）",
+            Check("S11-H1 baseline: the offset is committed to the broker (the withdraw/rebuild resume relies on it)",
                 WaitUntil(() => Committed() == 3, 30000),
                 "committed=" + Committed().ToString(CultureInfo.InvariantCulture));
 
             long stamp = c.LastPullAt(key);
-            Check("S11-H1 循环在发起拉取时盖章", stamp > 0 && NowMs() - stamp < 60000,
+            Check("S11-H1 the loop stamps when it starts a pull", stamp > 0 && NowMs() - stamp < 60000,
                 "lastPullAt=" + stamp.ToString(CultureInfo.InvariantCulture));
-            Check("S11-H1 进程内已消费位点是 3（自愈时要带着它去持久化）",
+            Check("S11-H1 the in-process consumed offset is 3 (self-healing has to carry it to persistence)",
                 c.ConsumeOffsetForTest(key) == 3,
                 "consumeOffset=" + (c.ConsumeOffsetForTest(key) ?? -1).ToString(CultureInfo.InvariantCulture));
 
-            // ---- H2 循环被异常打穿 → 同一趟 rebalance 撤掉重建 ----
+            // ---- H2 the loop is broken through by an exception -> the same rebalance round withdraws and rebuilds it ----
             c.RegisterLoopForTest(key, alive: false);
-            Check("S11-H2 线程已退出即刻判停摆（不必等满 120s）", c.PullStalled(key), "key=" + key);
+            Check("S11-H2 the thread has exited so it is judged stalled at once (no need to wait out the full 120s)", c.PullStalled(key), "key=" + key);
             c.WakeupRebalanceForTest();
-            // 只有"登记条目被换成一条真活着的线程"才会让 PullStalled 变 false：
-            // 注入的占位线程永远不会 alive，所以这一条断言就等价于"确实撤掉并重建了"。
-            Check("S11-H2 停摆队列被撤掉重建（新循环接管并重新盖章）",
+            // Only "the registered entry was replaced by a genuinely live thread" makes PullStalled go false: the injected
+            // placeholder thread is never alive, so this assertion is equivalent to "it really was withdrawn and rebuilt".
+            Check("S11-H2 the stalled queue was withdrawn and rebuilt (a new loop took over and stamped again)",
                 WaitUntil(() => !c.PullStalled(key), 30000),
                 "lastPullAt=" + c.LastPullAt(key).ToString(CultureInfo.InvariantCulture));
-            Check("S11-H2 重建没有把位点写回去退", Committed() >= 3,
+            Check("S11-H2 the rebuild did not write the offset back (no rollback)", Committed() >= 3,
                 "committed=" + Committed().ToString(CultureInfo.InvariantCulture));
 
             for (int i = 0; i < 3; ++i)
@@ -906,18 +922,20 @@ public static class LiveRedelivery
                 producer.Send(new Message(topic, Str2Bytes("heal-2-" + i.ToString(CultureInfo.InvariantCulture))));
             }
 
-            Check("S11-H2 自愈后同一个队列继续消费（累计 6 条）",
+            Check("S11-H2 after self-healing the same queue keeps being consumed (6 in total)",
                 WaitUntil(() => listener.Snapshot().Count >= 6, 30000) && WaitUntil(() => Committed() == 6, 30000),
                 "arrivals=" + listener.Snapshot().Count.ToString(CultureInfo.InvariantCulture)
                 + " committed=" + Committed().ToString(CultureInfo.InvariantCulture));
 
-            // ---- H3 盖章超出 120s（线程还活着）----
+            // ---- H3 the stamp goes past 120s (the thread is still alive)----
             long injected = NowMs() - DefaultMQPushConsumer.PullMaxIdleTimeMillis - 5000;
             string want = "\"lastPullTimestamp\":" + injected.ToString(CultureInfo.InvariantCulture);
             bool reported = false;
             bool expired = false;
-            // 重拨而不是只拨一次：真循环每发起一轮就会自己刷新这个时刻，撞上一次的概率很低
-            // 但不为零（长轮询刚好在这几毫秒里返回），重拨一次就能同时观察到判据和报文。
+            // Re-set rather than set once: a real loop refreshes this instant itself on every
+            // round, so hitting the previous one is very unlikely but not impossible (a long
+            // poll returning right in those milliseconds), and setting it twice lets both the
+            // criterion and the message be observed at once.
             for (int attempt = 0; attempt < 5 && !(reported && expired); ++attempt)
             {
                 c.SetLastPullAt(key, injected);
@@ -925,10 +943,10 @@ public static class LiveRedelivery
                 reported = Encoding.UTF8.GetString(c.BuildConsumerRunningInfo().Encode()).Contains(want);
             }
 
-            Check("S11-H3 倒拨超过 120s 即判停摆", expired, "injected=" + injected);
-            Check("S11-H3 运行信息把 lastPullTimestamp 报成盖章的那个值", reported, "want=" + want);
+            Check("S11-H3 rewinding past 120s is judged stalled", expired, "injected=" + injected);
+            Check("S11-H3 the running info reports lastPullTimestamp as the stamped value", reported, "want=" + want);
             c.WakeupRebalanceForTest();
-            Check("S11-H3 停摆分支被处理（这一路重新盖章或换上了新循环）",
+            Check("S11-H3 the stalled branch was handled (this path re-stamped or a new loop was put in place)",
                 WaitUntil(() => c.LastPullAt(key) > injected, 30000),
                 "lastPullAt=" + c.LastPullAt(key).ToString(CultureInfo.InvariantCulture));
 
@@ -937,22 +955,22 @@ public static class LiveRedelivery
                 producer.Send(new Message(topic, Str2Bytes("heal-3-" + i.ToString(CultureInfo.InvariantCulture))));
             }
 
-            Check("S11-H3 之后仍然照常消费（累计 9 条、位点到 9）",
+            Check("S11-H3 consumption still works as usual afterwards (9 in total, the offset at 9)",
                 WaitUntil(() => listener.Snapshot().Count >= 9, 30000) && WaitUntil(() => Committed() == 9, 30000),
                 "arrivals=" + listener.Snapshot().Count.ToString(CultureInfo.InvariantCulture)
                 + " committed=" + Committed().ToString(CultureInfo.InvariantCulture));
 
-            // 留一个窗口给"重建时拿陈旧游标回退位点"这类错误显形：整把队列重投会在这里露出来
+            // Leave a window for errors like "a rebuild rolls the offset back with a stale cursor": a wholesale resend of the queue shows up here
             Thread.Sleep(8000);
             List<(string Body, string Topic, int ReconsumeTimes, long Ts)> seen = listener.Snapshot();
             int distinct = seen.Select(r => r.Body).Distinct().Count();
             int redelivered = seen.Count(r => r.ReconsumeTimes != 0);
-            Check("S11-9 条各只投一次（撤走前持久化了位点，重建后从 broker 位点续拉）",
+            Check("S11-each of the 9 is delivered exactly once (the offset was persisted before the withdrawal and the rebuild resumes from the broker's offset)",
                 distinct == 9 && redelivered == 0 && seen.Count == 9,
                 "arrivals=" + seen.Count.ToString(CultureInfo.InvariantCulture)
                 + " distinct=" + distinct.ToString(CultureInfo.InvariantCulture)
                 + " redelivered=" + redelivered.ToString(CultureInfo.InvariantCulture));
-            Check("S11-自愈之后拉取时钟恢复新鲜（判据不再报警）",
+            Check("S11-after self-healing the pull clock is fresh again (the criterion stops complaining)",
                 !c.PullStalled(key) && NowMs() - c.LastPullAt(key) < 60000,
                 "age=" + (NowMs() - c.LastPullAt(key)).ToString(CultureInfo.InvariantCulture));
         }
@@ -964,9 +982,10 @@ public static class LiveRedelivery
         }
     }
 
-    // ---------------- S12 顺序消费毒消息：本地计数 → 交 broker → %DLQ% ----------------
+    // ---------------- S12 Orderly-consumption poison message: local counting -> handing it to the broker -> %DLQ% ----------------
 
-    /// <summary>命中指定 body 的每次顺序投递都挂起当前队列（其余照常成功）。</summary>
+    /// <summary>Suspends the current queue on every orderly delivery matching the given
+    /// body (everything else succeeds as usual).</summary>
     private sealed class PoisonOrderlyListener : IMessageListenerOrderly
     {
         private readonly string _poison;
@@ -1014,7 +1033,7 @@ public static class LiveRedelivery
         const string poison = "ord-poison";
         string topic = _gPrefix + "_OrdDlq";
         string group = _gPrefix + "_g12";
-        // 1 队列 + 每批 1 条：ord-after 必须排在毒消息后面，挂起也不会牵连别的路径
+        // 1 queue + 1 message per batch: ord-after must be ordered behind the poison message, and suspending it does not drag anything else in
         PrepareTopic(producer, topic, 1);
 
         var listener = new PoisonOrderlyListener(poison);
@@ -1029,39 +1048,41 @@ public static class LiveRedelivery
         producer.Send(new Message(topic, Str2Bytes(poison)));
         producer.Send(new Message(topic, Str2Bytes("ord-after")));
 
-        Check("S12-毒消息恰好投 3 次（每次由客户端自己 +1：reconsumeTimes 0/1/2）",
+        Check("S12-the poison message is delivered exactly 3 times (each time the client itself does +1: reconsumeTimes 0/1/2)",
             WaitUntil(() => listener.CountOf(poison) >= 3, 60000)
             && LadderOf(listener, poison),
             "times=[" + TimesOf(listener, poison) + "]");
-        Check("S12-交给 broker 后业务队列继续前进（后一条被消费）",
+        Check("S12-after handing it to the broker the business queue keeps advancing (the next message is consumed)",
             WaitUntil(() => listener.CountOf("ord-after") >= 1, 60000),
             "after=" + listener.CountOf("ord-after").ToString(CultureInfo.InvariantCulture));
-        Thread.Sleep(15000);  // 反证：不该有第 4 次
-        Check("S12-用尽后不再原地挂起（观察窗口内毒消息只投了 3 次）",
+        Thread.Sleep(15000);  // counter-proof: there must be no 4th time
+        Check("S12-after it is used up it is no longer suspended in place (the poison message was only delivered 3 times in the window)",
             listener.CountOf(poison) == 3,
             "arrivals=" + listener.CountOf(poison).ToString(CultureInfo.InvariantCulture));
-        Check("S12-挂起期间 listener 始终看到业务 topic（本地重投不换 topic）",
+        Check("S12-during the suspension the listener always sees the business topic (a local resend does not change the topic)",
             listener.Snapshot().Where(a => a.Body == poison).All(a => a.Topic == topic));
         consumer.Shutdown();
 
         string dlqTopic = MixAll.GetDlqTopic(group);
         (bool routeFound, List<MessageExt> dlqMsgs) = ReadDlq(group, _gPrefix + "_g12dlq", 40000);
-        Check("S12-broker 自动创建并注册了 %DLQ%<group> 路由", routeFound, "dlq=" + dlqTopic);
-        // 顺序回投落进死信而不是退回 %RETRY% 重投，本身就是 broker 认定「本组 rebalance 锁
-        // 还没过期」⇒ 这个实例真的握着 LOCK_BATCH_MQ（handleRetryAndDLQ:202-207）。
+        Check("S12-the broker auto-created and registered the %DLQ%<group> route", routeFound, "dlq=" + dlqTopic);
+        // An orderly resend landing in the dead letter instead of going back to %RETRY% is
+        // itself the broker deciding "this group's rebalance lock has not expired yet" =>
+        // this instance really holds LOCK_BATCH_MQ (handleRetryAndDLQ:202-207).
         bool one = dlqMsgs.Count == 1 && Body(dlqMsgs[0]) == poison;
-        Check("S12-毒消息落在 %DLQ%<group>（回投走 rebalance 锁，立刻进死信）",
+        Check("S12-the poison message landed in %DLQ%<group> (the resend goes through the rebalance lock and enters the dead letter at once)",
             one, "n=" + dlqMsgs.Count.ToString(CultureInfo.InvariantCulture));
         if (one)
         {
             MessageExt d = dlqMsgs[0];
-            // 3 = 客户端在 RECONSUME_TIME 上写的 +1，经 V2 头 j 落成存储值；漏填 j 的话
-            // broker 按订阅组默认 16 判，这条永远进不了死信。
-            Check("S12-死信 reconsumeTimes = maxReconsumeTimes + 1",
+            // 3 = the +1 the client wrote on RECONSUME_TIME, which becomes the stored value
+            // through the V2 header's j; if j were left out the broker would judge by the
+            // subscription group's default of 16 and this message would never reach the dead letter.
+            Check("S12-the dead letter's reconsumeTimes = maxReconsumeTimes + 1",
                 d.ReconsumeTimes == maxReconsume + 1,
                 "reconsumeTimes=" + d.ReconsumeTimes.ToString(CultureInfo.InvariantCulture));
             bool hasRetryTopic = d.Properties.TryGetValue("RETRY_TOPIC", out string? retryTopic);
-            Check("S12-死信保留 RETRY_TOPIC=业务 topic，topic 已是 %DLQ%<group>",
+            Check("S12-the dead letter keeps RETRY_TOPIC=the business topic while the topic is already %DLQ%<group>",
                 hasRetryTopic && retryTopic == topic && d.Topic == dlqTopic,
                 "retryTopic=" + (hasRetryTopic ? retryTopic : "<missing>"));
         }
@@ -1078,7 +1099,7 @@ public static class LiveRedelivery
         var consumer = NewConsumer(group);
         consumer.ConsumeMessageBatchMaxSize = 1;
         consumer.SuspendCurrentQueueTimeMillis = 200;
-        // 显式不设上限（默认就是 -1，写出来是为了让「默认」这条断言有出处）
+        // Explicitly setting no cap (the default is -1; writing it out gives the "default" assertion a source)
         consumer.MaxReconsumeTimes = -1;
         consumer.SetMessageListener(listener);
         consumer.Subscribe(topic, "*");
@@ -1086,9 +1107,11 @@ public static class LiveRedelivery
         Thread.Sleep(3000);
         producer.Send(new Message(topic, Str2Bytes(poison)));
 
-        // 只要越过并发侧的 16 就能证明没用错常量。窗口给到 90s：走错的话第 17 次的延迟档位
-        // 是 level20（2h），一旦投出去就再也回不来，只能靠「本地投了多少次 + %DLQ% 空」两头夹住。
-        Check("S12b-maxReconsumeTimes=-1 时顺序消费不设上限（投过 >=18 次，16 不生效）",
+        // Going past the concurrency side's 16 is enough to prove the wrong constant was not used. The window is
+        // 90s: if it were wrong the 17th delivery's delay tier would be level20 (2h), and
+        // once it goes out it never comes back, so it has to be pinned from both ends, "how
+        // many times the client delivered locally" plus "an empty %DLQ%".
+        Check("S12b-with maxReconsumeTimes=-1 orderly consumption sets no cap (delivered >=18 times, the 16 does not apply)",
             WaitUntil(() => listener.CountOf(poison) >= 18, 90000)
             && listener.Snapshot().Where(a => a.Body == poison).Max(a => a.ReconsumeTimes) >= 17,
             "arrivals=" + listener.CountOf(poison).ToString(CultureInfo.InvariantCulture)
@@ -1096,13 +1119,14 @@ public static class LiveRedelivery
         consumer.Shutdown();
 
         (bool routeFound, List<MessageExt> dlqMsgs) = ReadDlq(group, _gPrefix + "_g12bdlq", 20000);
-        Check("S12b-没到阈值就不该有死信（broker 侧连 %DLQ% topic 都不必建）",
+        Check("S12b-before the threshold is reached there must be no dead letter (the broker need not even create the %DLQ% topic)",
             dlqMsgs.Count == 0,
             "routeFound=" + (routeFound ? "true" : "false")
             + " n=" + dlqMsgs.Count.ToString(CultureInfo.InvariantCulture));
     }
 
-    /// <summary>命中毒消息时，把 context 上的挂起时长设成指定值并记下本次投递时刻。</summary>
+    /// <summary>On hitting the poison message, sets the suspend duration on the context to
+    /// the given value and records this delivery's instant.</summary>
     private sealed class SuspendTimingOrderlyListener : IMessageListenerOrderly
     {
         private readonly string _poison;
@@ -1142,7 +1166,7 @@ public static class LiveRedelivery
             bool hit = msgs.Any(m => Body(m) == _poison);
             if (!hit) return ConsumeOrderlyStatus.Success;
             lock (_gate) _stampsMs.Add(NowMs());
-            // 默认 -1；只有显式赋值才走 context 这一支（-1 表示回落消费者配置）
+            // -1 by default; only an explicit assignment takes the context branch (-1 means falling back to the consumer config)
             ctx.SuspendCurrentQueueTimeMillis = _askedMs;
             return ConsumeOrderlyStatus.SuspendCurrentQueueAMoment;
         }
@@ -1161,13 +1185,13 @@ public static class LiveRedelivery
     {
         SuspendProbe(producer, "OrdSusp", "g12c", configMs: 900, askedMs: 70, poison: "ord-susp-poison",
             need: 9, minGaps: 6, timeoutMs: 25000, lo: 0.03, hi: 0.4,
-            name: "S12c-context 的 70ms 生效（不是消费者配置的 900ms）");
+            name: "S12c-the context's 70ms takes effect (not the consumer config's 900ms)");
         SuspendProbe(producer, "OrdSuspCfg", "g12ccfg", configMs: 400, askedMs: -1, poison: "ord-susp-cfg",
             need: 6, minGaps: 4, timeoutMs: 25000, lo: 0.25, hi: 0.75,
-            name: "S12c-context 保持 -1 时回落消费者配置的 400ms");
+            name: "S12c-when the context stays at -1 it falls back to the consumer config's 400ms");
         SuspendProbe(producer, "OrdSuspFloor", "g12cfloor", configMs: 0, askedMs: 1, poison: "ord-susp-floor",
             need: 9, minGaps: 6, timeoutMs: 20000, lo: 0.009, hi: 10.0,
-            name: "S12c-钳位下限：context 1ms / 配置 0 时不忙等（间隔 >= 10ms）");
+            name: "S12c-clamped lower bound: with context 1ms / config 0 there is no busy wait (interval >= 10ms)");
     }
 
     private static void SuspendProbe(DefaultMQProducer producer, string suffix, string groupSuffix,
@@ -1176,17 +1200,17 @@ public static class LiveRedelivery
     {
         string topic = _gPrefix + "_" + suffix;
         string group = _gPrefix + "_" + groupSuffix;
-        PrepareTopic(producer, topic, 1);  // 1 队列：同一队列的顺序重投才有可比间隔
+        PrepareTopic(producer, topic, 1);  // 1 queue: only an orderly resend on the same queue gives comparable intervals
 
         var listener = new SuspendTimingOrderlyListener(poison, askedMs);
         var consumer = NewConsumer(group);
         consumer.ConsumeMessageBatchMaxSize = 1;
-        consumer.MaxReconsumeTimes = -1;  // 顺序侧不设上限，才够采到足够多的间隔
+        consumer.MaxReconsumeTimes = -1;  // no cap on the orderly side, otherwise enough intervals cannot be collected
         consumer.SuspendCurrentQueueTimeMillis = configMs;
         consumer.SetMessageListener(listener);
         consumer.Subscribe(topic, "*");
         consumer.Start();
-        // 等首轮 LOCK_BATCH_MQ：没拿到队列锁时 broker 会把顺序重投直接改投死信，间隔就没了
+        // Wait for the first LOCK_BATCH_MQ round: without the queue lock the broker turns an orderly resend straight into the dead letter and the intervals are gone
         Thread.Sleep(4000);
         producer.Send(new Message(topic, Str2Bytes(poison)));
         WaitUntil(() => listener.Count() >= need, timeoutMs);
@@ -1198,13 +1222,13 @@ public static class LiveRedelivery
         consumer.Shutdown();
     }
 
-    // ---------------- S13 顺序侧显式批量 ack（COMMIT）/ 显式回滚（ROLLBACK）----------------
+    // ---------------- S13 Explicit batch ack (COMMIT) / explicit rollback (ROLLBACK) on the orderly side ----------------
 
     private enum ManualMode
     {
-        CommitOnce,          // autoCommit=false + COMMIT：显式整批认可
-        RollbackThenCommit,  // autoCommit=false + ROLLBACK：退回本地重投若干次，再整批认可
-        IllegalRollback,     // autoCommit 保持 true 却返回 ROLLBACK：非法用法，按 ack 处理
+        CommitOnce,          // autoCommit=false + COMMIT: explicit whole-batch acknowledgement
+        RollbackThenCommit,  // autoCommit=false + ROLLBACK: roll back to a few local resends, then acknowledge the whole batch
+        IllegalRollback,     // autoCommit stays true but ROLLBACK is returned: illegal usage, treated as an ack
     }
 
     private sealed class ManualOrderlyListener : IMessageListenerOrderly
@@ -1299,7 +1323,7 @@ public static class LiveRedelivery
                     : ConsumeOrderlyStatus.Commit;
             }
 
-            // 非法用法：不碰 AutoCommit（保持默认 true），只改返回值
+            // illegal usage: AutoCommit is not touched (stays at the default true), only the return value changes
             return ConsumeOrderlyStatus.Rollback;
         }
     }
@@ -1332,8 +1356,9 @@ public static class LiveRedelivery
         var listener = new ManualOrderlyListener(ManualMode.CommitOnce, "cm-none", 0);
         var c = NewConsumer(group);
         c.ConsumeMessageBatchMaxSize = 3;
-        // 新组 LAST_OFFSET 会从分配时刻起算，先放 3 条再起消费者 + 显式从 0 起消，
-        // 首次拉取才正好是「一整批 3 条」（同 S10 的口径）
+        // A new group under LAST_OFFSET counts from the assignment instant, so put 3 messages
+        // in place before starting the consumer and consume explicitly from 0, only then is
+        // the very first pull exactly "one whole batch of 3" (the same rule as S10)
         c.ConsumeFromWhere = ConsumeFromWhere.ConsumeFromFirstOffset;
         c.SetMessageListener(listener);
         c.Subscribe(topic, "*");
@@ -1344,16 +1369,16 @@ public static class LiveRedelivery
 
         c.Start();
         WaitUntil(() => listener.Batches().Count >= 1, 30000);
-        Thread.Sleep(6000);  // 反证窗口：COMMIT 若被当成"不提交"，200ms 挂起节奏下 6s 会重投 ~30 次
+        Thread.Sleep(6000);  // counter-proof window: if COMMIT were treated as "do not commit", the 200ms suspend cadence would resend ~30 times in 6s
         List<List<string>> batches = listener.Batches();
         bool firstBatch3 = batches.Count > 0 && batches[0].Count == 3;
-        Check("S13a-首批就是整批 3 条（COMMIT 一次认可整批）",
+        Check("S13a-the first batch is the whole batch of 3 (one COMMIT acknowledges the whole batch)",
             firstBatch3,
             "firstBatch=" + (batches.Count > 0 ? batches[0].Count.ToString(CultureInfo.InvariantCulture) : "none"));
-        Check("S13a-6 秒里只投了这一批（COMMIT 不是被当成 SUCCESS 的不提交）",
+        Check("S13a-only this batch was delivered in those 6 seconds (COMMIT is not treated as SUCCESS's do-not-commit)",
             batches.Count == 1,
             "batches=" + batches.Count.ToString(CultureInfo.InvariantCulture));
-        Check("S13a-3 条各只投一次（整批 ack 未回投）",
+        Check("S13a-each of the 3 is delivered exactly once (the whole-batch ack was not resent)",
             listener.Count("cm-0") == 1 && listener.Count("cm-1") == 1 && listener.Count("cm-2") == 1,
             "deliveries=" + (listener.Count("cm-0") + listener.Count("cm-1") + listener.Count("cm-2"))
                 .ToString(CultureInfo.InvariantCulture));
@@ -1370,18 +1395,18 @@ public static class LiveRedelivery
             {
                 MessageQueue mq = queues[0];
                 WaitUntil(() => ReadCommitted(admin, mq, group) == 3, 30000);
-                Check("S13a-broker 位点一次前进到批尾 3（整批 ack，不是卡在 0）",
+                Check("S13a-the broker's offset advances in one go to the batch tail 3 (whole-batch ack, not stuck at 0)",
                     ReadCommitted(admin, mq, group) == 3,
                     "committed=" + ReadCommitted(admin, mq, group).ToString(CultureInfo.InvariantCulture));
             }
             else
             {
-                Check("S13a-业务 topic 有队列可查位点", false, "queues=0");
+                Check("S13a-the business topic has a queue whose offset can be queried", false, "queues=0");
             }
         }
         catch (Exception e)
         {
-            Check("S13a-位点查询可用", false, e.Message);
+            Check("S13a-the offset query is usable", false, e.Message);
         }
 
         admin.Shutdown();
@@ -1396,23 +1421,23 @@ public static class LiveRedelivery
         var listener = new ManualOrderlyListener(ManualMode.RollbackThenCommit, "rb-head", 6);
         var c = NewConsumer(group);
         c.ConsumeMessageBatchMaxSize = 1;
-        c.MaxReconsumeTimes = -1;  // 顺序侧不设上限，免得本地重投被判成毒消息
+        c.MaxReconsumeTimes = -1;  // no cap on the orderly side, so a local resend is not judged to be a poison message
         c.SuspendCurrentQueueTimeMillis = 200;
         c.SetMessageListener(listener);
         c.Subscribe(topic, "*");
         c.Start();
-        // 等首轮 LOCK_BATCH_MQ：没拿到队列锁时 broker 会把顺序重投直接改投死信
+        // Wait for the first LOCK_BATCH_MQ round: without the queue lock the broker turns an orderly resend straight into the dead letter
         Thread.Sleep(4000);
         producer.Send(new Message(topic, Str2Bytes("rb-head")));
         producer.Send(new Message(topic, Str2Bytes("rb-next")));
 
         bool arrived = WaitUntil(() => listener.Count("rb-head") >= 7 && listener.FirstIndex("rb-next") >= 0, 45000);
-        Thread.Sleep(2000);  // 反证窗口：退回重投只该按提交次数收尾，多余的投递会露出来
+        Thread.Sleep(2000);  // counter-proof window: a rollback should only wind up after the commit count, a redundant delivery shows up here
         List<double> gaps = listener.HeadGaps("rb-head");
         double med = Median(gaps);
         double worst = gaps.Count > 0 ? gaps.Max() : 0;
         var headRecords = listener.Snapshot().Where(r => r.Body == "rb-head").ToList();
-        // 第 7 次投递在整条序列里的下标（idx7 之前的 head 投递都不算数）
+        // The index of the 7th delivery in the whole sequence (the head deliveries before idx7 do not count)
         int idx7 = -1;
         int seenHead = 0;
         List<(string Body, int ReconsumeTimes, string Topic, long Ts)> all = listener.Snapshot();
@@ -1427,23 +1452,23 @@ public static class LiveRedelivery
 
         int idxNext = listener.FirstIndex("rb-next");
 
-        Check("S13b-显式回滚把同一批退回重投（head 投递 7 次 = 6 次回滚 + 1 次提交）",
+        Check("S13b-the explicit rollback pushed the same batch back for resending (7 head deliveries = 6 rollbacks + 1 commit)",
             arrived && listener.Count("rb-head") == 7,
             "deliveries=" + listener.Count("rb-head").ToString(CultureInfo.InvariantCulture));
-        Check("S13b-本地重投不过 broker：相邻间隔贴着 200ms 挂起（%RETRY% 最快 10s 档）",
+        Check("S13b-a local resend does not go through the broker: the adjacent interval hugs the 200ms suspend (the fastest %RETRY% tier is 10s)",
             gaps.Count >= 5 && med < 1.0 && worst < 5.0,
             "n=" + gaps.Count.ToString(CultureInfo.InvariantCulture)
             + " median=" + med.ToString("F3", CultureInfo.InvariantCulture)
             + "s max=" + worst.ToString("F3", CultureInfo.InvariantCulture) + "s");
-        Check("S13b-本地重投不动 reconsumeTimes、不换 topic（没有走 %RETRY%）",
+        Check("S13b-a local resend does not touch reconsumeTimes and does not change the topic (it did not go through %RETRY%)",
             headRecords.Count > 0 && headRecords.All(r => r.ReconsumeTimes == 0 && r.Topic == topic),
             "times=" + string.Join(",",
                 headRecords.Select(r => r.ReconsumeTimes.ToString(CultureInfo.InvariantCulture))));
-        Check("S13b-已提交前 next 不越位（回滚期间后面的消息不放行）",
+        Check("S13b-next does not advance before the commit (during the rollback the later message is not let through)",
             idx7 >= 0 && idxNext > idx7,
             "idx7=" + idx7.ToString(CultureInfo.InvariantCulture)
             + " idxNext=" + idxNext.ToString(CultureInfo.InvariantCulture));
-        Check("S13b-收尾后 head 恰好 7 次、next 恰好 1 次",
+        Check("S13b-after winding up, head is exactly 7 times and next exactly 1 time",
             listener.Count("rb-head") == 7 && listener.Count("rb-next") == 1,
             "head=" + listener.Count("rb-head").ToString(CultureInfo.InvariantCulture)
             + " next=" + listener.Count("rb-next").ToString(CultureInfo.InvariantCulture));
@@ -1460,18 +1485,18 @@ public static class LiveRedelivery
             {
                 MessageQueue mq = queues[0];
                 WaitUntil(() => ReadCommitted(admin, mq, group) == 2, 30000);
-                Check("S13b-回滚不提前提交位点，提交后位点到 2",
+                Check("S13b-the rollback does not commit the offset early, and after the commit the offset is at 2",
                     ReadCommitted(admin, mq, group) == 2,
                     "committed=" + ReadCommitted(admin, mq, group).ToString(CultureInfo.InvariantCulture));
             }
             else
             {
-                Check("S13b-业务 topic 有队列可查位点", false, "queues=0");
+                Check("S13b-the business topic has a queue whose offset can be queried", false, "queues=0");
             }
         }
         catch (Exception e)
         {
-            Check("S13b-位点查询可用", false, e.Message);
+            Check("S13b-the offset query is usable", false, e.Message);
         }
 
         admin.Shutdown();
@@ -1495,11 +1520,11 @@ public static class LiveRedelivery
         producer.Send(new Message(topic, Str2Bytes("il-next")));
 
         WaitUntil(() => listener.FirstIndex("il-next") >= 0, 30000);
-        Thread.Sleep(2500);  // 反证窗口：真按回滚办的话这 2.5s 里 head 会被重投 ~10 次
-        Check("S13c-autoCommit=true 时 ROLLBACK 按 ack 处理：head 只投一次",
+        Thread.Sleep(2500);  // counter-proof window: if the rollback were really honoured, head would be resent ~10 times in these 2.5s
+        Check("S13c-with autoCommit=true a ROLLBACK is treated as an ack: head is delivered only once",
             listener.Count("il-head") == 1,
             "head=" + listener.Count("il-head").ToString(CultureInfo.InvariantCulture));
-        Check("S13c-非法 ROLLBACK 不阻塞队列：next 立刻被消费",
+        Check("S13c-an illegal ROLLBACK does not block the queue: next is consumed at once",
             listener.FirstIndex("il-next") >= 0,
             "idxNext=" + listener.FirstIndex("il-next").ToString(CultureInfo.InvariantCulture)
             + " next=" + listener.Count("il-next").ToString(CultureInfo.InvariantCulture));
@@ -1516,24 +1541,24 @@ public static class LiveRedelivery
             {
                 MessageQueue mq = queues[0];
                 WaitUntil(() => ReadCommitted(admin, mq, group) == 2, 30000);
-                Check("S13c-broker 位点前进到 2（非法用法按成功 ack）",
+                Check("S13c-the broker's offset advances to 2 (the illegal usage counts as a successful ack)",
                     ReadCommitted(admin, mq, group) == 2,
                     "committed=" + ReadCommitted(admin, mq, group).ToString(CultureInfo.InvariantCulture));
             }
             else
             {
-                Check("S13c-业务 topic 有队列可查位点", false, "queues=0");
+                Check("S13c-the business topic has a queue whose offset can be queried", false, "queues=0");
             }
         }
         catch (Exception e)
         {
-            Check("S13c-位点查询可用", false, e.Message);
+            Check("S13c-the offset query is usable", false, e.Message);
         }
 
         admin.Shutdown();
     }
 
-    // ---------------- S14 correctTagsOffset（空应答修正已消费位点）----------------
+    // ---------------- S14 correctTagsOffset (an empty response corrects the consumed offset)----------------
 
     private static void ScenarioCorrectTagsOffset(DefaultMQProducer producer)
     {
@@ -1547,7 +1572,7 @@ public static class LiveRedelivery
         admin.SetTimeoutMillis(10000);
         admin.Start();
 
-        // ---------- S14a 对照组：消息确实在，且常规消费的落点就是各队列 maxOffset ----------
+        // ---------- S14a control group: the messages really are there, and normal consumption lands exactly on each queue's maxOffset ----------
         var ctrlListener = new CollectingListenerConcurrently();
         var ctrl = NewConsumer(ctrlGroup);
         ctrl.ConsumeMessageBatchMaxSize = 3;
@@ -1556,7 +1581,7 @@ public static class LiveRedelivery
         ctrl.Subscribe(topic, "TagA");
         ctrl.Start();
         List<MessageQueue> mainQueues = ctrl.FetchSubscribeMessageQueues(topic);
-        Check("S14a-业务 topic 有 4 个队列可查位点", mainQueues.Count == 4,
+        Check("S14a-the business topic has 4 queues whose offsets can be queried", mainQueues.Count == 4,
             "queues=" + mainQueues.Count.ToString(CultureInfo.InvariantCulture));
         Thread.Sleep(2000);
         for (int i = 0; i < 5; ++i)
@@ -1566,11 +1591,11 @@ public static class LiveRedelivery
         }
 
         bool ctrlOk = WaitUntil(() => ctrlListener.Snapshot().Count >= 5, 30000);
-        Check("S14a-对照组（TagA）收齐 5 条 —— 消息确实在队列里",
+        Check("S14a-the control group (TagA) received all 5 -- the messages really are in the queues",
             ctrlOk && ctrlListener.Snapshot().Count == 5,
             "arrivals=" + ctrlListener.Snapshot().Count.ToString(CultureInfo.InvariantCulture));
 
-        // committed 用 -1 表示 broker 查无记录（QUERY_NOT_FOUND），0 是合法位点，两者不能混同
+        // committed uses -1 to mean the broker found no record (QUERY_NOT_FOUND); 0 is a legal offset and the two must not be conflated
         List<(int QueueId, long Max, long Committed)> Snap(List<MessageQueue> qs, string group)
         {
             var rows = new List<(int, long, long)>();
@@ -1612,34 +1637,34 @@ public static class LiveRedelivery
 
         WaitUntil(() => Matches(mainQueues, ctrlGroup), 25000);
         List<(int QueueId, long Max, long Committed)> ctrlRows = Snap(mainQueues, ctrlGroup);
-        Check("S14a-对照组的已提交位点 == 各队列 maxOffset（数值口径）",
+        Check("S14a-the control group's committed offset == each queue's maxOffset (the numeric rule)",
             Matches(mainQueues, ctrlGroup), Text(ctrlRows));
-        Check("S14a-对照组确实把消息推进了队列（maxOffset 总和 > 0）",
+        Check("S14a-the control group really advanced the queues (the maxOffset total is > 0)",
             ctrlRows.Sum(r => r.Max) > 0,
             "maxSum=" + ctrlRows.Sum(r => r.Max).ToString(CultureInfo.InvariantCulture));
         ctrl.Shutdown();
 
-        // ---------- S14b NO_MATCHED_MSG：永不匹配的订阅，零投递但位点要走 ----------
+        // ---------- S14b NO_MATCHED_MSG: a subscription that never matches, zero deliveries but the offset still has to move ----------
         var testListener = new CollectingListenerConcurrently();
         var test = NewConsumer(testGroup);
         test.ConsumeMessageBatchMaxSize = 3;
         test.SetMessageListener(testListener);
         test.Subscribe(topic, "TagB");
         test.Start();
-        // 首跳 10s + 周期 5s 的位点持久化节拍，窗口给足
+        // the 10s first hop plus the 5s offset-persistence cadence, so give the window enough room
         WaitUntil(() => Matches(mainQueues, testGroup), 40000);
         List<(int QueueId, long Max, long Committed)> testRows = Snap(mainQueues, testGroup);
-        Check("S14b-零投递（listener 一条都没收到）",
+        Check("S14b-zero deliveries (the listener received nothing at all)",
             testListener.Snapshot().Count == 0,
             "arrivals=" + testListener.Snapshot().Count.ToString(CultureInfo.InvariantCulture));
-        Check("S14b-每条队列的已提交位点都 == 该队列 maxOffset（空应答修正生效）",
+        Check("S14b-every queue's committed offset == that queue's maxOffset (the empty-response correction took effect)",
             Matches(mainQueues, testGroup), Text(testRows));
-        Check("S14b-修正后的位点总和 == 对照组（同一条队列的最大位点）",
+        Check("S14b-the sum of the corrected offsets == the control group's (the same queue's max offset)",
             testRows.Sum(r => r.Committed) == ctrlRows.Sum(r => r.Max),
             "test=" + testRows.Sum(r => r.Committed).ToString(CultureInfo.InvariantCulture)
             + " ctrl=" + ctrlRows.Sum(r => r.Max).ToString(CultureInfo.InvariantCulture));
 
-        // ---------- S14c NO_NEW_MSG：%RETRY%<group> 空队列也要留下位点记录 ----------
+        // ---------- S14c NO_NEW_MSG: %RETRY%<group> empty queues must also leave an offset record ----------
         string retryTopic = MixAll.GetRetryTopic(testGroup);
         var probe = new MQClientInstance("ctoprobe-" + NowMs().ToString(CultureInfo.InvariantCulture),
             new List<string> { _namesrv });
@@ -1662,16 +1687,16 @@ public static class LiveRedelivery
             return retryQueues.Count > 0 && Matches(retryQueues, testGroup);
         }, 40000);
         List<(int QueueId, long Max, long Committed)> retryRows = Snap(retryQueues, testGroup);
-        Check("S14c-" + retryTopic + " 上出现位点记录且等于 maxOffset",
+        Check("S14c-an offset record appears on " + retryTopic + " and equals maxOffset",
             retryQueues.Count > 0 && Matches(retryQueues, testGroup), Text(retryRows));
-        Check("S14c-该位点确实是 0（空队列的 nextBeginOffset）",
+        Check("S14c-that offset really is 0 (the empty queue's nextBeginOffset)",
             retryRows.Count > 0 && retryRows.All(r => r.Committed == 0),
             "offsets=" + string.Join(",",
                 retryRows.Select(r => r.Committed.ToString(CultureInfo.InvariantCulture))));
 
-        // 再等一个静默窗口：修正只抬位点、不该投递任何东西
+        // Wait through another quiet window: the correction only raises the offset and must not deliver anything
         Thread.Sleep(6000);
-        Check("S14c-整轮下来 listener 依旧是 0 条（修正不会凭空投递）",
+        Check("S14c-over the whole round the listener is still at 0 (the correction does not conjure deliveries)",
             testListener.Snapshot().Count == 0,
             "arrivals=" + testListener.Snapshot().Count.ToString(CultureInfo.InvariantCulture));
 
@@ -1692,10 +1717,13 @@ public static class LiveRedelivery
             .Where(a => a.Body == body).Select(a => a.ReconsumeTimes.ToString(CultureInfo.InvariantCulture)));
 
     /// <summary>
-    /// %DLQ%&lt;group&gt; 现场取证：先用一次性 probe 等 broker 把死信 topic 注册进路由，
-    /// 再用**独立消费组 + FirstOffset** 把已有的死信读出来（新组 + LAST 会从队尾开始，
-    /// 把已经落在死信里的那条直接跳过 ⇒ 假失败）。routeFound 单独返回：负向用例里
-    /// 「broker 压根没建死信 topic」本身就是正确结论，不能和「等不到路由」混成同一个空结果。
+    /// Live forensics on %DLQ%&lt;group&gt;: first a one-shot probe waits for the broker to
+    /// register the dead letter topic in the route, then an **independent consumer group +
+    /// FirstOffset** reads out the existing dead letters (a new group with LAST would start
+    /// at the tail and skip the one that already landed in the dead letter => a false
+    /// failure). routeFound is returned separately: in a negative case "the broker never
+    /// created the dead letter topic at all" is itself the correct conclusion and must not be
+    /// merged with "the route never arrived" into one empty result.
     /// </summary>
     private static (bool RouteFound, List<MessageExt> Msgs) ReadDlq(string group, string readerGroup,
         int timeoutMs)
@@ -1734,10 +1762,12 @@ public static class LiveRedelivery
         reader.Assign(queues);
         reader.Start();
         foreach (MessageQueue mq in queues) reader.SeekToBegin(mq);
-        // SeekToBegin 必须在 Start 之后（未 Start 会抛），它把拉取游标拨回最小位点；
-        // 若拉取循环抢先把同一格拉进了本地缓冲，Seek 只丢「offset 之前」的副本，同一个
-        // 消息会以同一 (QueueId, QueueOffset) 交付两次。按存储位置去重：真有一式两份
-        // 入死信，副本落在不同的 QueueOffset 上，不会被吃掉。
+        // SeekToBegin must happen after Start (it throws while not Started), and it moves the
+        // pull cursor back to the smallest offset; if the pull loop had already pulled that
+        // same queue into the local buffer, Seek only drops the copies "before the offset",
+        // and the same message gets delivered twice with the same (QueueId, QueueOffset).
+        // Deduplicate by storage position: if there really were two copies in the dead letter
+        // they would land on different QueueOffsets and would not be eaten.
         var seenAt = new HashSet<(int QueueId, long QueueOffset)>();
         void Collect(IEnumerable<MessageExt> batch)
         {
@@ -1752,8 +1782,10 @@ public static class LiveRedelivery
         {
             Collect(reader.Poll(1000));
             if (msgs.Count == 0) continue;
-            // 收到后再排空几趟：断言「死信里只有这一条」要求把后面的也看见，
-            // 但总窗口必须有界，否则正向用例每次都要白等满 timeoutMs。
+            // After receiving, drain a few more rounds: asserting "there is only this one in
+            // the dead letter" requires seeing the ones behind it too, but the total window
+            // has to stay bounded, otherwise every positive case has to sit out the full
+            // timeoutMs for nothing.
             long drainTo = NowMs() + 3000;
             while (NowMs() < drainTo) Collect(reader.Poll(500));
             break;

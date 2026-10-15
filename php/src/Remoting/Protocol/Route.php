@@ -9,8 +9,8 @@ use RocketMQ\Common\MixAll;
 use RocketMQ\Common\PermName;
 
 /**
- * Topic 路由数据：namesrv 回包里的 queueDatas / brokerDatas / filterServerTable 三张表，
- * 发布侧与订阅侧的队列集合都从它组装。
+ * Topic route data: the queueDatas / brokerDatas / filterServerTable three tables from the
+ * namesrv response; both the publish-side and subscribe-side queue sets are assembled from it.
  */
 
 final class QueueData
@@ -126,7 +126,7 @@ final class BrokerData
         return [
             'cluster' => $this->cluster,
             'brokerName' => $this->brokerName,
-            // fastjson2 把数字键写成对象：{"0":"addr"}，这里用 object 强制输出对象
+            // fastjson2 writes numeric keys as an object: {"0":"addr"}; cast to object here to force object output
             'brokerAddrs' => (object)$this->brokerAddrs,
             'zoneName' => $this->zoneName,
             'enableActingMaster' => $this->enableActingMaster,
@@ -181,19 +181,25 @@ final class TopicRouteData
     }
 
     /**
-     * 根据 queueDatas + brokerDatas 组装全部可写 MessageQueue。
+     * Assembles all writable MessageQueues from queueDatas + brokerDatas.
      *
-     * topic 要回填到每个 MessageQueue（必须是真实 topic，不能留空串），否则后续
-     * send/pull 用 mq.topic 回查路由时会查不到。
+     * The topic must be backfilled into every MessageQueue (it must be the real topic, never an
+     * empty string), otherwise a later send/pull that re-resolves the route via mq.topic will
+     * find nothing.
      *
-     * 两条跳过条件是路由语义的硬要求：路由里查不到同名 broker，**或者**该 broker
-     * 的 brokerAddrs 里没有 ``MASTER_ID``，任一命中就整台跳过。
-     * 后者不是冗余判断：从节点自己也会注册进 namesrv，且默认配置下它照样带写位
-     * （namesrv 只在「prime slave 且 enableActingMaster」时才抹掉 WRITE）—— master
-     * 一旦掉线，路由里同一个 brokerName 就只剩 brokerId=1，写位还在。
-     * 漏判这条，生产者会挑中这台队列并把消息发到从节点上，而从节点对发送请求是
-     * ``rejectRequest`` ⇒ SYSTEM_BUSY，还是个可重试码，于是白烧一轮超时；
-     * 正确做法是让这种队列压根进不了发布信息，发送直接当无路由处理。
+     * The two skip conditions are hard requirements of the route semantics: the broker is not
+     * found in the route, **or** the broker's brokerAddrs lacks ``MASTER_ID``; either match
+     * skips the whole broker.
+     * The latter is not a redundant check: slaves also register themselves into the namesrv, and
+     * under the default configuration they still carry the write permission (the namesrv only
+     * strips WRITE for "prime slave with enableActingMaster") — once the master goes offline,
+     * the route for the same brokerName is left with only brokerId=1 and the write permission
+     * remains.
+     * Missing this check makes the producer pick such a queue and send the message to the slave,
+     * which answers send requests with ``rejectRequest`` => SYSTEM_BUSY — and a retryable code at
+     * that — burning a whole round of timeouts for nothing;
+     * the right fix is to keep such queues out of the publish info entirely and treat the send as
+     * having no route.
      *
      * @return list<MessageQueue>
      */
@@ -225,12 +231,14 @@ final class TopicRouteData
     }
 
     /**
-     * 按 queueDatas 组装全部**可读** MessageQueue。
+     * Assembles all **readable** MessageQueues from queueDatas.
      *
-     * 与 getAllMessageQueue()（发布侧）有两处刻意的不同：
-     * ①只看**读**位与 ``readQueueNums``（perm=4 的只读 topic 照样能被消费）；
-     * ②**不要求 broker 有 master** —— 主挂掉后从节点仍要能被拉取，订阅侧的 broker
-     * 地址选择正是为此才带从节点回退。只有发布信息需要 master。
+     * Two deliberate differences from getAllMessageQueue() (publish side):
+     * 1. Only the **read** permission and ``readQueueNums`` matter (a read-only topic with
+     *    perm=4 can still be consumed);
+     * 2. The broker is **not required to have a master** — after the master dies, slaves must
+     *    still be pullable, which is exactly why the subscribe-side broker address selection
+     *    carries the slave fallback. Only the publish info needs a master.
      *
      * @return list<MessageQueue>
      */

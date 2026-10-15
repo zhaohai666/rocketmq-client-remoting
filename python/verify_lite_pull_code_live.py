@@ -1,27 +1,27 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""lite-pull **请求码 / broker 开关**真机验证（#107）。
+"""Live verification of the lite-pull request code / broker switch (#107).
 
-用法（需本地 RocketMQ 5.5.1 集群）：
+Usage (requires a local RocketMQ 5.5.1 cluster):
     .venv/bin/python verify_lite_pull_code_live.py 127.0.0.1:9876
 
-为什么必须真机：`FLAG_LITE_PULL_MESSAGE(0x10)` + `LITE_PULL_MESSAGE(361)` 这条链在
-离线 mock 上永远是绿的 —— 少了位、码还是 11 时，报文依然是一个完全合法的 pull，
-broker 照常回消息。能把它区分出来的只有 broker 的 `litePullMessageEnable` 开关
-（`PullMessageProcessor:325-331` **只拦 361**）：把开关在运行时翻成 false
-（UPDATE_BROKER_CONFIG，无需重启）：
+Why it must be live: the `FLAG_LITE_PULL_MESSAGE(0x10)` + `LITE_PULL_MESSAGE(361)` chain is
+always green on an offline mock -- even with the bit missing and the code still 11, the message is still a perfectly legal pull,
+and the broker replies with messages as usual. The only thing that can distinguish it is the broker's `litePullMessageEnable` switch
+(`PullMessageProcessor:325-331` blocks only 361): flip the switch to false at runtime
+(UPDATE_BROKER_CONFIG, no restart needed):
 
-  S1 开关默认 true：lite pull 全链路正常（基线）。
-  S2 开关 false：
-     S2a 裸 361 请求 → NO_PERMISSION(16) + "…for lite pull consumer is forbidden"；
-     S2b 同队列同一位点的裸 11 请求 → 照常 SUCCESS 且拿到消息（**对照**：开关只管
-         lite，普通 pull 不受影响 —— 没有这条腿，S2a 的失败可能只是 broker 坏了）；
-     S2c lite 消费者安静饿死：消息明明在，poll 一条不来、拉取游标纹丝不动
-         （旧实现位不置/码为 11，这条腿会收到消息 → 判别器变红）；
-     S2d push 消费者照常消费（**对照**：整条消费链路没坏）。
-  S3 开关还原 true：lite pull 立即恢复。
+  S1 the switch defaults to true: the whole lite pull path works (baseline).
+  S2 the switch false:
+     S2a a bare 361 request -> NO_PERMISSION(16) + "…for lite pull consumer is forbidden";
+     S2b a bare 11 request on the same queue at the same offset -> SUCCESS as usual and gets messages (control: the switch only governs
+         lite, ordinary pull is unaffected -- without this leg, S2a's failure could just be a broken broker);
+     S2c the lite consumer starves quietly: the messages are there, but poll returns nothing and the pull cursor does not budge
+         (the old impl leaves the bit unset/code 11, so this leg would receive messages -> the discriminator turns red);
+     S2d the push consumer consumes as usual (control: the whole consume path is not broken).
+  S3 restore the switch to true: lite pull recovers immediately.
 
-退出前**无条件**把 `litePullMessageEnable` 改回原值（与 verify_recall_live.py 同款）。
+Before exiting, unconditionally restore `litePullMessageEnable` to its original value (same as verify_recall_live.py).
 """
 from __future__ import annotations
 
@@ -68,7 +68,7 @@ def lite_flag() -> int:
 
 
 def classic_flag() -> int:
-    # DefaultMQPullConsumerImpl.pullSyncImpl:248 的 4 参版本，lite 位必须为 0
+    # the 4-arg version of DefaultMQPullConsumerImpl.pullSyncImpl:248, the lite bit must be 0
     return PullSysFlag.build_sys_flag(commit_offset=False, suspend=False,
                                       subscription=True, class_filter=False)
 
@@ -121,16 +121,16 @@ def main() -> int:
 
     try:
         original = read_flag(admin, addr)
-        check("R0 能读到 broker 的 %s" % CONFIG_KEY, original is not None,
+        check("R0 can read the broker's %s" % CONFIG_KEY, original is not None,
               "value=%s" % original)
         if original != "true":
-            check("R0 已临时打开 %s" % CONFIG_KEY, set_flag(admin, addr, "true"))
+            check("R0 temporarily enabled %s" % CONFIG_KEY, set_flag(admin, addr, "true"))
         if read_flag(admin, addr) != "true":
-            check("R0 开关不在 true，后续检查无意义", False)
+            check("R0 the switch is not true, the following checks are meaningless", False)
             return 1
 
-        # ---------- S1 基线：开关 true，lite 正常 ----------
-        print("\nS1 开关 true：lite pull 基线")
+        # ---------- S1 baseline: switch true, lite works ----------
+        print("\nS1 switch true: lite pull baseline")
         m_s1 = Message(TOPIC, b"lite-code-s1")
         producer.send(m_s1, mq=MessageQueue(TOPIC, BROKER, 0))
         c1 = new_lite("LiteCodeLive_g1_%d" % STAMP)
@@ -140,19 +140,19 @@ def main() -> int:
         while not got and time.time() < deadline:
             got.extend(c1.poll(timeout=500))
         bodies = {bytes(m.body) for m in got}
-        check("S1 lite 消费者收到消息", b"lite-code-s1" in bodies,
+        check("S1 the lite consumer received the message", b"lite-code-s1" in bodies,
               "got=%s" % sorted(bodies))
         q0 = MessageQueue(TOPIC, BROKER, 0)
-        check("S1 拉取游标已推进", c1.pull_cursor_of(q0) >= 1,
+        check("S1 the pull cursor has advanced", c1.pull_cursor_of(q0) >= 1,
               "cursor=%s" % c1.pull_cursor_of(q0))
 
-        # ---------- S2 开关 false ----------
-        print("\nS2 运行时关闭 %s（UPDATE_BROKER_CONFIG，不重启 broker）" % CONFIG_KEY)
-        check("S2 开关已改为 false", set_flag(admin, addr, "false"))
-        check("S2 开关读回确认", read_flag(admin, addr) == "false",
+        # ---------- S2 switch false ----------
+        print("\nS2 turn %s off at runtime (UPDATE_BROKER_CONFIG, no broker restart)" % CONFIG_KEY)
+        check("S2 the switch has been changed to false", set_flag(admin, addr, "false"))
+        check("S2 the switch reads back confirmed", read_flag(admin, addr) == "false",
               "value=%s" % read_flag(admin, addr))
 
-        # S2a：裸 361 → NO_PERMISSION + 固定 remark
+        # S2a: bare 361 -> NO_PERMISSION + fixed remark
         m_s2 = Message(TOPIC, b"lite-code-s2")
         producer.send(m_s2, mq=q0)
         denied_code = None
@@ -160,39 +160,39 @@ def main() -> int:
         try:
             setup.pull_message("LiteCodeLive_g1_%d" % STAMP, q0, 0, 32, lite_flag(), 0,
                                "*", 0, "TAG", addr=addr)
-            check("S2a 裸 361 被开关拒绝", False, "竟然 SUCCESS —— lite 位/码没生效")
+            check("S2a the bare 361 is rejected by the switch", False, "unexpectedly SUCCESS -- the lite bit/code did not take effect")
         except MQBrokerException as e:
             denied_code, denied_remark = e.response_code, str(e)
-            check("S2a 裸 361 被开关拒绝（NO_PERMISSION=16）", e.response_code == 16,
+            check("S2a the bare 361 is rejected by the switch (NO_PERMISSION=16)", e.response_code == 16,
                   "code=%s remark=%s" % (e.response_code, e))
-            check("S2a 拒绝理由正是 lite 开关", DENY_REMARK in str(e), str(e))
+            check("S2a the rejection reason is exactly the lite switch", DENY_REMARK in str(e), str(e))
         except Exception as e:  # noqa: BLE001
-            check("S2a 裸 361 被开关拒绝", False, repr(e))
+            check("S2a the bare 361 is rejected by the switch", False, repr(e))
 
-        # S2b：同一队列同一位点的裸 11 → 照常拿消息（对照组）
+        # S2b: a bare 11 on the same queue at the same offset -> gets messages as usual (control)
         try:
             r = setup.pull_message("LiteCodeLive_g1_%d" % STAMP, q0, 0, 32,
                                    classic_flag(), 0, "*", 0, "TAG", addr=addr)
             got11 = {bytes(m.body) for m in r.msg_found_list}
-            check("S2b 对照组：裸 11 不受开关影响，照常拿消息",
+            check("S2b control: the bare 11 is unaffected by the switch and gets messages as usual",
                   b"lite-code-s1" in got11 or b"lite-code-s2" in got11,
                   "status=%s got=%s" % (r.status, sorted(got11)))
         except Exception as e:  # noqa: BLE001
-            check("S2b 对照组：裸 11 不受开关影响", False, repr(e))
+            check("S2b control: the bare 11 is unaffected by the switch", False, repr(e))
 
-        # S2c：lite 消费者安静饿死（消息在，但一条不来；游标不动）
+        # S2c: the lite consumer starves quietly (the messages are there, but nothing comes; the cursor does not move)
         c2 = new_lite("LiteCodeLive_g2_%d" % STAMP)
         consumers.append(c2)
         starved = []
         deadline = time.time() + 8
         while time.time() < deadline:
             starved.extend(c2.poll(timeout=500))
-        check("S2c 开关关闭期间 lite 消费者一条都收不到", not starved,
+        check("S2c the lite consumer receives nothing while the switch is off", not starved,
               "got=%d" % len(starved))
-        check("S2c 拉取游标纹丝不动", c2.pull_cursor_of(q0) == 0,
+        check("S2c the pull cursor does not budge", c2.pull_cursor_of(q0) == 0,
               "cursor=%s" % c2.pull_cursor_of(q0))
 
-        # S2d：push 消费者照常消费（对照组）
+        # S2d: the push consumer consumes as usual (control)
         collected: list = []
 
         class PushCollector(SimpleMessageListener):
@@ -215,12 +215,12 @@ def main() -> int:
         deadline = time.time() + 20
         while b"lite-code-s2d" not in collected and time.time() < deadline:
             time.sleep(0.5)
-        check("S2d 对照组：push 消费者照常收到消息（开关只管 lite）",
+        check("S2d control: the push consumer receives messages as usual (the switch only governs lite)",
               b"lite-code-s2d" in collected, "got=%s" % sorted(set(collected)))
 
-        # ---------- S3 还原 ----------
-        print("\nS3 开关还原 true：lite 恢复")
-        check("S3 开关已还原", set_flag(admin, addr, "true"))
+        # ---------- S3 restore ----------
+        print("\nS3 restore the switch to true: lite recovers")
+        check("S3 the switch has been restored", set_flag(admin, addr, "true"))
         m_s3 = Message(TOPIC, b"lite-code-s3")
         producer.send(m_s3, mq=q0)
         c3 = new_lite("LiteCodeLive_g3_%d" % STAMP)
@@ -230,7 +230,7 @@ def main() -> int:
         while not got3 and time.time() < deadline:
             got3.extend(c3.poll(timeout=500))
         bodies3 = {bytes(m.body) for m in got3}
-        check("S3 还原后 lite 消费者立即恢复", bool(bodies3),
+        check("S3 the lite consumer recovers immediately after restoration", bool(bodies3),
               "got=%s" % sorted(bodies3))
     finally:
         for c in consumers:

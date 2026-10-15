@@ -2,13 +2,14 @@
 
 declare(strict_types=1);
 
-// 集群就绪探测：端口通了 ≠ broker 已把路由注册进 nameserver（broker 启动后
-// 才注册，实测可达 30s+）。此前的真机脚本只等端口，跑下去全部死于
-// "No route info of default topic TBW102"——那是时序问题，不是客户端 bug。
+// Cluster readiness probe: port open does not mean the broker has registered its route into the
+// nameserver (registration happens after broker startup; measured up to 30s+). Earlier live
+// scripts only waited for the port and then all died with
+// "No route info of default topic TBW102" — a timing issue, not a client bug.
 //
 //   php examples/wait_broker_route.php [namesrv] [timeoutSec]
 //
-// 就绪输出 REGISTERED 并 exit 0；超时输出 ROUTE_WAIT_TIMEOUT 并 exit 1。
+// Ready output REGISTERED and exit 0; timeout output ROUTE_WAIT_TIMEOUT and exit 1.
 require __DIR__ . '/../bootstrap.php';
 
 use RocketMQ\Client\DefaultMQAdminExt;
@@ -33,7 +34,7 @@ for ($i = 0; $i < $timeoutSec; $i++) {
             exit(0);
         }
     } catch (Throwable) {
-        // nameserver 未起 / 未注册，继续等
+        // nameserver not up / not registered yet, keep waiting
     }
     sleep(1);
 }

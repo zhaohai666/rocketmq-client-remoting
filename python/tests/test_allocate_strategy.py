@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
-"""队列分配策略单测（不需要集群）。
+"""Unit tests for queue allocation strategies (no cluster needed).
 
-期望结果由静态分区表逐值钉死：同一张表、同一组入参，结果必须逐值相同。
+Expected results are pinned value-by-value against static partition tables: the same
+table with the same inputs must produce identical results.
 
-覆盖：AVG / AVG_BY_CIRCLE 的不整除切分、守卫（非法入参返回空列表而不是抛
-``IllegalArgumentException``）、CONFIG 忽略守卫且返回副本、``get_name()`` 与经典
-remoting 协议里的策略名逐字一致（AVG / AVG_BY_CIRCLE / CONFIG）、分区完整性与确定性、
-以及 push / lite 两个消费者对策略的暴露（默认 AVG、可替换、置 None 时 ``start()``
-本地校验拒绝）。
+Covers: AVG / AVG_BY_CIRCLE uneven splits, guards (invalid inputs return an empty list
+instead of raising ``IllegalArgumentException``), CONFIG ignoring guards and returning a
+copy, ``get_name()`` matching the strategy names in the classic remoting protocol
+verbatim (AVG / AVG_BY_CIRCLE / CONFIG), partition completeness and determinism,
+and the strategy exposure of the push / lite consumers (default AVG, replaceable,
+rejected by ``start()`` local validation when set to None).
 """
 from __future__ import annotations
 
@@ -37,12 +39,12 @@ from common.message import MessageQueue
 
 
 def _queues(size: int) -> List[MessageQueue]:
-    """构造 size 条固定队列：topic / brokerName / 0..size-1。"""
+    """Build `size` fixed queues: topic / brokerName / 0..size-1."""
     return [MessageQueue("topic", "brokerName", i) for i in range(size)]
 
 
 def _cids(size: int) -> List[str]:
-    """构造 size 个固定消费者 id：CID_PREFIX + i。"""
+    """Build `size` fixed consumer ids: CID_PREFIX + i."""
     return ["CID_PREFIX%d" % i for i in range(size)]
 
 
@@ -56,14 +58,14 @@ def _allocate(strategy: AllocateMessageQueueStrategy, mq_size: int, cid_size: in
     return _ids(strategy.allocate("ConsumerGroupTest", cid_all[index], mq_all, cid_all))
 
 
-# (队列数, 消费者数, 逐个消费者按 CID_PREFIX0..N 顺序的期望队列下标)
+# (queue count, consumer count, expected queue indexes per consumer in CID_PREFIX0..N order)
 AVERAGELY_CASES = [
-    # 10 / 4 → size {3,3,2,2}
+    # 10 / 4 → sizes {3,3,2,2}
     (10, 4, [[0, 1, 2], [3, 4, 5], [6, 7], [8, 9]]),
     (8, 3, [[0, 1, 2], [3, 4, 5], [6, 7]]),
     (9, 3, [[0, 1, 2], [3, 4, 5], [6, 7, 8]]),
     (4, 4, [[0], [1], [2], [3]]),
-    # 队列比消费者少：只有前 N 个各 1 条，其余空
+    # Fewer queues than consumers: only the first N get one each, the rest are empty
     (2, 4, [[0], [1], [], []]),
     (1, 3, [[0], [], []]),
     (3, 1, [[0, 1, 2]]),
@@ -88,7 +90,7 @@ CIRCLE_CASES = [
     (AllocateMessageQueueAveragelyByCircle(), CIRCLE_CASES),
 ])
 def test_partition_table(strategy, cases):
-    """分区表逐值钉死：同表同入参，结果必须逐值相同。"""
+    """Partition table pinned value-by-value: same table, same inputs, results must match exactly."""
     for mq_size, cid_size, expect in cases:
         assert len(expect) == cid_size
         for index, expected in enumerate(expect):
@@ -98,13 +100,13 @@ def test_partition_table(strategy, cases):
 
 
 def test_averagely_produces_the_expected_sizes():
-    """AVG 的 size 断言：10 / 4 → {3,3,2,2}。"""
+    """AVG size assertion: 10 / 4 → {3,3,2,2}."""
     strategy = AllocateMessageQueueAveragely()
     assert [len(_allocate(strategy, 10, 4, i)) for i in range(4)] == [3, 3, 2, 2]
 
 
 def test_circle_not_in_cid_all():
-    """AVG_BY_CIRCLE：currentCID 不在 cidAll → 空。"""
+    """AVG_BY_CIRCLE: currentCID not in cidAll → empty."""
     got = AllocateMessageQueueAveragelyByCircle().allocate(
         "G", "CID_PREFIX", _queues(10), _cids(4))
     assert got == []
@@ -117,14 +119,14 @@ def test_circle_not_in_cid_all():
     ("CID_NOT_IN_LIST", 4, 2),
 ])
 def test_guards_return_empty_result(current_cid, mq_size, cid_size):
-    """守卫：非法入参一律返回空列表，不抛 ``IllegalArgumentException``。"""
+    """Guards: invalid inputs always return an empty list, never raise ``IllegalArgumentException``."""
     mq_all, cid_all = _queues(mq_size), _cids(cid_size)
     for strategy in (AllocateMessageQueueAveragely(), AllocateMessageQueueAveragelyByCircle()):
         assert strategy.allocate("G", current_cid, mq_all, cid_all) == [], strategy.get_name()
 
 
 def test_by_config_produces_the_expected_assignment():
-    """CONFIG：4 个队列，2 个消费者都拿到 [0,1,2,3]。"""
+    """CONFIG: 4 queues, both consumers get [0,1,2,3]."""
     mq_all, cid_all = _queues(4), _cids(2)
     strategy = AllocateMessageQueueByConfig()
     strategy.message_queue_list = list(mq_all)
@@ -138,14 +140,14 @@ def test_by_config_produces_the_expected_assignment():
     ("CID_NOT_IN_LIST", 4, 2),
 ])
 def test_by_config_ignores_all_guards(current_cid, mq_size, cid_size):
-    """ByConfig **不**做入参检查：守卫场景照样返回配置值。"""
+    """ByConfig does **not** validate inputs: guard scenarios still return the configured values."""
     strategy = AllocateMessageQueueByConfig(_queues(2))
     got = strategy.allocate("G", current_cid, _queues(mq_size), _cids(cid_size))
     assert _ids(got) == [0, 1]
 
 
 def test_by_config_defaults_empty_and_returns_copy():
-    """未配置 = 空列表；allocate 给副本，改配置不影响已拿到的结果。"""
+    """Unconfigured = empty list; allocate returns a copy, so changing the config does not affect already-obtained results."""
     strategy = AllocateMessageQueueByConfig()
     assert strategy.allocate("G", "c", _queues(2), ["c"]) == []
     mq_all = _queues(2)
@@ -153,13 +155,13 @@ def test_by_config_defaults_empty_and_returns_copy():
     got = strategy.allocate("G", "c", _queues(2), ["c"])
     got.append(MessageQueue("topic", "brokerName", 99))
     assert _ids(strategy.allocate("G", "c", mq_all, ["c"])) == [0, 1]
-    # 构造时同样取副本：外部列表后来被改，不影响策略
+    # The copy is taken at construction time too: later mutation of the external list does not affect the strategy
     mq_all.append(MessageQueue("topic", "brokerName", 99))
     assert _ids(strategy.allocate("G", "c", mq_all, ["c"])) == [0, 1]
 
 
 def test_strategy_names_match_the_wire_values():
-    """``get_name()`` 返回经典 remoting 协议里的固定策略名，逐字一致。"""
+    """``get_name()`` returns the fixed strategy names from the classic remoting protocol, verbatim."""
     assert AllocateMessageQueueAveragely().get_name() == "AVG"
     assert AllocateMessageQueueAveragelyByCircle().get_name() == "AVG_BY_CIRCLE"
     assert AllocateMessageQueueByConfig().get_name() == "CONFIG"
@@ -167,7 +169,7 @@ def test_strategy_names_match_the_wire_values():
 
 
 def test_interface_methods_not_implemented():
-    """接口本身只声明契约：``allocate`` / ``get_name`` 都抛 NotImplementedError。"""
+    """The interface itself only declares the contract: both ``allocate`` and ``get_name`` raise NotImplementedError."""
     strategy = AllocateMessageQueueStrategy()
     with pytest.raises(NotImplementedError):
         strategy.allocate("G", "c", _queues(1), ["c"])
@@ -176,7 +178,7 @@ def test_interface_methods_not_implemented():
 
 
 def test_strategy_name_falls_back_for_duck_typed_strategy():
-    """业务方可以只实现 ``allocate``（Python 是鸭子类型）：日志取名时退化成类名。"""
+    """Callers may implement only ``allocate`` (Python is duck-typed): the log name falls back to the class name."""
     class _Custom(object):
         def allocate(self, consumer_group, current_cid, mq_all, cid_all):
             return list(mq_all)
@@ -186,7 +188,7 @@ def test_strategy_name_falls_back_for_duck_typed_strategy():
 
 @pytest.mark.parametrize("mq_size,cid_size", list(itertools.product(range(0, 8), range(1, 6))))
 def test_partition_covers_every_queue_exactly_once(mq_size, cid_size):
-    """两个策略都必须划分全集：并集 = 全部队列且互不重叠（除 CONFIG）。"""
+    """Both strategies must partition the full set: union = all queues and no overlap (except CONFIG)."""
     for strategy in (AllocateMessageQueueAveragely(), AllocateMessageQueueAveragelyByCircle()):
         all_ids = list(range(mq_size))
         parts = [_allocate(strategy, mq_size, cid_size, i) for i in range(cid_size)]
@@ -196,7 +198,7 @@ def test_partition_covers_every_queue_exactly_once(mq_size, cid_size):
 
 
 def test_allocate_is_order_preserving_and_deterministic():
-    """输出是输入的一个有序子序列，且同一入参重复调用结果相同（rebalance 依赖这一点）。"""
+    """The output is an ordered subsequence of the input, and repeated calls with the same inputs return the same result (rebalance depends on this)."""
     mq_all, cid_all = _queues(7), _cids(3)
     for strategy in (AllocateMessageQueueAveragely(), AllocateMessageQueueAveragelyByCircle()):
         for index in range(3):
@@ -208,7 +210,7 @@ def test_allocate_is_order_preserving_and_deterministic():
 
 
 def test_allocate_real_queues_from_multiple_brokers():
-    """真实队列（同 topic 挂多个 brokerName）也一律按下标切分。"""
+    """Real queues (same topic spread across multiple brokerNames) are also split purely by index."""
     layout = [("broker-a", 0), ("broker-a", 1), ("broker-b", 0), ("broker-b", 1), ("broker-c", 0)]
     mq_all = [MessageQueue("TopicTest", broker, qid) for broker, qid in layout]
     cid_all = _cids(2)
@@ -220,7 +222,7 @@ def test_allocate_real_queues_from_multiple_brokers():
 
 
 def test_push_consumer_exposes_strategy():
-    """push：默认 AVG、可替换；置 None 由 start() 本地校验拒绝。"""
+    """push: default AVG, replaceable; None is rejected by start() local validation."""
     consumer = DefaultMQPushConsumer("G_test")
     assert consumer.allocate_strategy.get_name() == "AVG"
     consumer.set_allocate_message_queue_strategy(AllocateMessageQueueAveragelyByCircle())
@@ -228,7 +230,7 @@ def test_push_consumer_exposes_strategy():
     consumer.allocate_strategy = None
     consumer.set_namesrv_addr("127.0.0.1:1")
     consumer.subscribe("TopicTest", "*")
-    # start() 的守卫是顺序式的：先订阅 / 监听器，再到策略（校验全在本地，不建连）
+    # start()'s guards are ordered: subscription / listener first, then the strategy (all validation is local, no connection is made)
     consumer.set_message_listener(lambda msgs: ConsumeConcurrentlyStatus.CONSUME_SUCCESS)
     with pytest.raises(MQClientException) as info:
         consumer.start()
@@ -236,7 +238,7 @@ def test_push_consumer_exposes_strategy():
 
 
 def test_lite_consumer_exposes_strategy():
-    """lite：默认 AVG、可替换；置 None 由 start() 本地校验拒绝。"""
+    """lite: default AVG, replaceable; None is rejected by start() local validation."""
     consumer = DefaultLitePullConsumer("G_test")
     assert consumer.allocate_message_queue_strategy.get_name() == "AVG"
     by_config = AllocateMessageQueueByConfig(_queues(2))
@@ -252,7 +254,7 @@ def test_lite_consumer_exposes_strategy():
 
 
 def test_lite_rebalance_keeps_current_assignment_when_strategy_raises():
-    """策略抛异常 → 本轮跳过该 topic（保留当前分配），不因瞬时异常撤掉队列。"""
+    """Strategy raises → this round skips the topic (keeping the current assignment); queues are not dropped due to a transient error."""
     consumer = DefaultLitePullConsumer("G_test")
     held = MessageQueue("TopicTest", "broker-a", 3)
     consumer._assigned = {held}
@@ -271,7 +273,7 @@ def test_lite_rebalance_keeps_current_assignment_when_strategy_raises():
             return _Info()
 
         def get_topic_subscribe_info(self, topic):
-            # rebalance 取的是订阅信息
+            # rebalance takes the subscription info
             return _queues(4)
 
         def get_consumer_id_list_by_group(self, topic, consumer_group, timeout_millis=5000):
@@ -288,8 +290,8 @@ def test_lite_rebalance_keeps_current_assignment_when_strategy_raises():
 
 
 def test_pull_consumer_exposes_strategy():
-    """拉模式同样带这份配置：默认策略字段 + 读写口，start() 校验拒绝 null。
-    本端口拉模式不做 rebalance，所以它只是配置面。"""
+    """The pull mode carries the same configuration: a default strategy field plus read/write accessors, and start() rejects null.
+    This port's pull mode does not rebalance, so it is only a configuration surface."""
     consumer = DefaultMQPullConsumer("G_test")
     assert consumer.allocate_message_queue_strategy.get_name() == "AVG"
     by_config = AllocateMessageQueueByConfig(_queues(2))
@@ -304,13 +306,12 @@ def test_pull_consumer_exposes_strategy():
     assert "allocateMessageQueueStrategy is null" in str(info.value)
 
 
-# ------------------------------------------------- 一致性哈希（CONSISTENT_HASH）
+# ------------------------------------------------- Consistent hashing (CONSISTENT_HASH)
 #
-# 用 ``AllocateMessageQueueConsistentHash(3)`` 覆盖固定规模与随机规模，断言三件事：
-# ①全员分配 = 全集，②摘掉一个消费者后**别人的**队列不换主，③加一个消费者后
-# 只有新来者抢到的那些换主。
+# Use ``AllocateMessageQueueConsistentHash(3)`` to cover fixed and random scales, asserting three things:
+# ① the full assignment = the whole set, ② after removing one consumer the **others'** queues do not change owner, ③ after adding one consumer only the queues won by the newcomer change owner.
 
-# (队列数, 消费者数, 逐个 CID-0..N 的期望队列下标)：由 MD5 环算出，逐值钉死
+# (queue count, consumer count, expected queue indexes per CID-0..N): computed from the MD5 ring, pinned value-by-value
 CONSISTENT_HASH_CASES = [
     (6, 2, [[2], [0, 1, 3, 4, 5]]),
     (6, 3, [[2], [1, 5], [0, 3, 4]]),
@@ -319,7 +320,7 @@ CONSISTENT_HASH_CASES = [
                [13, 18], [16], [0, 3, 4, 19]]),
 ]
 
-# 默认 virtualNodeCnt=10（无参构造）
+# Default virtualNodeCnt=10 (no-arg constructor)
 CONSISTENT_HASH_DEFAULT_VC_CASES = [
     (4, 2, [[0, 2], [1, 3]]),
     (8, 3, [[0, 2, 4], [3, 5, 6, 7], [1]]),
@@ -327,19 +328,19 @@ CONSISTENT_HASH_DEFAULT_VC_CASES = [
 
 
 def _ch_queues(size: int) -> List[MessageQueue]:
-    """固定队列集：topic / brokerName / 0..N。"""
+    """Fixed queue set: topic / brokerName / 0..N."""
     return [MessageQueue("topic", "brokerName", i) for i in range(size)]
 
 
 def _ch_cids(size: int) -> List[str]:
-    """固定消费者 id：``CID-`` + i（与 AVG 用例的 CID_PREFIX 不同）。"""
+    """Fixed consumer ids: ``CID-`` + i (different from the CID_PREFIX used in the AVG cases)."""
     return ["CID-%d" % i for i in range(size)]
 
 
 @pytest.mark.parametrize("mq_size,cid_size,expect",
                          CONSISTENT_HASH_CASES + CONSISTENT_HASH_DEFAULT_VC_CASES)
 def test_consistent_hash_matches_the_virtual_node_ring(mq_size, cid_size, expect):
-    """落点由 MD5(摘要前 4 字节、大端拼数) 的一致性哈希环决定：虚拟节点数 3 与默认 10 各钉一张表。"""
+    """Placement is decided by the MD5 consistent-hash ring (first 4 digest bytes, big-endian): virtual node counts 3 and the default 10 each pin one table."""
     vc = 3 if (mq_size, cid_size) in [(c[0], c[1]) for c in CONSISTENT_HASH_CASES] else 10
     strategy = AllocateMessageQueueConsistentHash(vc)
     mq_all, cid_all = _ch_queues(mq_size), _ch_cids(cid_size)
@@ -350,14 +351,14 @@ def test_consistent_hash_matches_the_virtual_node_ring(mq_size, cid_size, expect
 
 
 def test_md5_hash_takes_the_first_four_bytes():
-    """``MD5Hash`` 只取摘要前 4 字节按大端拼数：换取法就不是同一个环。"""
-    # md5("") = d41d8cd9...，md5("abc") = 90015098...
+    """``MD5Hash`` takes only the first 4 digest bytes as a big-endian number: a different extraction would not be the same ring."""
+    # md5("") = d41d8cd9..., md5("abc") = 90015098...
     assert MD5Hash().hash("") == 0xD41D8CD9
     assert MD5Hash().hash("abc") == 0x90015098
 
 
 def test_consistent_hash_allocates_every_queue_once():
-    """任意规模下并集 = 全集且不重叠。"""
+    """At any scale, union = the whole set with no overlap."""
     strategy = AllocateMessageQueueConsistentHash(3)
     for mq_size in range(1, 12):
         for cid_size in range(1, 8):
@@ -368,7 +369,7 @@ def test_consistent_hash_allocates_every_queue_once():
 
 
 def test_consistent_hash_is_stable_when_membership_changes():
-    """一致性哈希的全部意义：成员变化只动涉及的那段弧，别的消费者队列不换主。"""
+    """The whole point of consistent hashing: membership changes only move the affected arc; other consumers' queues do not change owner."""
     strategy = AllocateMessageQueueConsistentHash(3)
     mq_all = _ch_queues(9)
     cid_all = _ch_cids(4)
@@ -376,35 +377,35 @@ def test_consistent_hash_is_stable_when_membership_changes():
                 for m in strategy.allocate("g", cid, mq_all, cid_all)}
     assert sorted(owner_of) == list(range(9))
 
-    # 摘掉 CID-0：原先属于别人的队列必须还在别人手里
+    # Remove CID-0: queues that belonged to others must still be with others
     remaining = cid_all[1:]
     after_remove = {m.queue_id: cid for cid in remaining
                     for m in strategy.allocate("g", cid, mq_all, remaining)}
     for qid, owner in owner_of.items():
         if owner != "CID-0":
-            assert after_remove[qid] == owner, "摘队时 qid=%d 不该换主" % qid
+            assert after_remove[qid] == owner, "qid=%d must not change owner on removal" % qid
 
-    # 加回一个新消费者：只有分给它的队列是新增的
+    # Add a new consumer back: only the queues assigned to it are new
     joined = remaining + ["CID-NEW"]
     after_add = {m.queue_id: cid for cid in joined
                  for m in strategy.allocate("g", cid, mq_all, joined)}
     for qid, owner in after_add.items():
         if owner != "CID-NEW":
-            assert owner_of[qid] == owner, "加人时 qid=%d 不该换主" % qid
+            assert owner_of[qid] == owner, "qid=%d must not change owner on join" % qid
 
 
 def test_consistent_hash_rejects_negative_virtual_node_cnt():
-    """构造函数就拒绝负数虚拟节点数，抛 IllegalArgumentException("illegal virtualNodeCnt :")。"""
+    """The constructor rejects a negative virtual node count with IllegalArgumentException("illegal virtualNodeCnt :")."""
     with pytest.raises(ValueError) as info:
         AllocateMessageQueueConsistentHash(-1)
     assert "illegal virtualNodeCnt" in str(info.value)
-    # 0 是合法的（只挡 <0）：环上没有虚拟节点 ⇒ 一条都分不到
+    # 0 is legal (only <0 is blocked): no virtual nodes on the ring => nothing can be assigned
     assert AllocateMessageQueueConsistentHash(0).allocate(
         "g", "CID-0", _ch_queues(4), _ch_cids(2)) == []
 
 
 def test_custom_hash_function_is_injected():
-    """支持注入自定义哈希函数；策略必须真的用它建环。"""
+    """Supports injecting a custom hash function; the strategy must really use it to build the ring."""
     class _FirstByte(object):
         def __init__(self):
             self.calls = 0
@@ -417,15 +418,15 @@ def test_custom_hash_function_is_injected():
     strategy = AllocateMessageQueueConsistentHash(2, fn)
     strategy.allocate("g", "CID-0", _ch_queues(4), _ch_cids(2))
     assert fn.calls > 0
-    # 同场景真值：两个 cid 的虚拟节点 key（"CID-0-0"…）
-    # 首字符都是 'C' ⇒ 哈希相同 ⇒ 建环时同 key 后者覆盖前者，
-    # 环上只剩 CID-1，所以全部队列都归它。用默认 MD5Hash 绝不会是这个形状。
+    # Same-scenario ground truth: the virtual node keys of the two cids ("CID-0-0"...)
+    # all start with 'C' => same hash => when building the ring, the later one overwrites the former for the same key,
+    # leaving only CID-1 on the ring, so all queues go to it. The default MD5Hash would never produce this shape.
     assert _ids(strategy.allocate("g", "CID-0", _ch_queues(4), _ch_cids(2))) == []
     assert _ids(strategy.allocate("g", "CID-1", _ch_queues(4), _ch_cids(2))) == [0, 1, 2, 3]
 
 
 def test_consistent_hash_guard_returns_empty_like_other_strategies():
-    """守卫口径与其它策略一致：非法入参返回空，不抛 IllegalArgumentException。"""
+    """Guard semantics consistent with the other strategies: invalid inputs return empty, never raise IllegalArgumentException."""
     strategy = AllocateMessageQueueConsistentHash()
     assert strategy.allocate("g", "CID-NOT-HERE", _ch_queues(4), _ch_cids(2)) == []
     assert strategy.allocate("g", "", _ch_queues(4), _ch_cids(2)) == []
@@ -433,13 +434,13 @@ def test_consistent_hash_guard_returns_empty_like_other_strategies():
     assert strategy.allocate("g", "CID-0", _ch_queues(4), []) == []
 
 
-# ----------------------------------------------------- 机房策略（MACHINE_ROOM）
+# ----------------------------------------------------- Machine room strategy (MACHINE_ROOM)
 
 def test_by_machine_room_produces_the_expected_assignment():
-    """MACHINE_ROOM：10 队列（0..4 在 room1）+
-    consumeridcs={room1} + 2 消费者 → {0,1,4} / {2,3}。
+    """MACHINE_ROOM: 10 queues (0..4 in room1) +
+    consumeridcs={room1} + 2 consumers → {0,1,4} / {2,3}.
 
-    余数队列给**前 rem 个**消费者（``rem > currentIndex``），所以第 3 条落 CID_PREFIX0。
+    Remainder queues go to the **first rem** consumers (``rem > currentIndex``), so the third one lands on CID_PREFIX0.
     """
     mq_all = [MessageQueue("topic", "room1@broker-a" if i < 5 else "room2@broker-b", i)
               for i in range(10)]
@@ -451,7 +452,7 @@ def test_by_machine_room_produces_the_expected_assignment():
 
 
 def test_by_machine_room_only_accepts_the_two_segment_broker_name():
-    """broker 名必须是 ``机房@名字``：没有 @ 或多一段都不参与分配。"""
+    """The broker name must be ``room@name``: no @ or an extra segment means no allocation."""
     cid_all = _cids(1)
     strategy = AllocateMessageQueueByMachineRoom({"room1"})
     assert strategy.allocate("G", "CID_PREFIX0",
@@ -460,53 +461,53 @@ def test_by_machine_room_only_accepts_the_two_segment_broker_name():
                              [MessageQueue("topic", "broker-a", 0)], cid_all) == []
     assert strategy.allocate("G", "CID_PREFIX0",
                              [MessageQueue("topic", "room1@broker@a", 0)], cid_all) == []
-    # 机房不在白名单里也不分
+    # A room not in the whitelist is not allocated either
     assert _ids(strategy.allocate("G", "CID_PREFIX0",
                                   [MessageQueue("topic", "room9@b", 0)], cid_all)) == []
-    # 默认没配机房 = 一条都不分
+    # No room configured by default = nothing is allocated
     assert AllocateMessageQueueByMachineRoom().allocate(
         "G", "CID_PREFIX0", [MessageQueue("topic", "room1@b", 0)], cid_all) == []
 
 
 @pytest.mark.parametrize("broker_name,expected_parts", [
     ("room1@broker-a", ["room1", "broker-a"]),
-    ("room1@", ["room1"]),           # 尾空段丢掉 → 1 段，不参与分配
-    ("room1@b@", ["room1", "b"]),    # 丢掉尾空段后仍是 2 段 → 参与
-    ("@room1", ["", "room1"]),       # 前导空段保留
+    ("room1@", ["room1"]),           # trailing empty segment dropped → 1 segment, no allocation
+    ("room1@b@", ["room1", "b"]),    # still 2 segments after dropping the trailing empty → participates
+    ("@room1", ["", "room1"]),       # leading empty segment kept
     ("room1@broker@a", ["room1", "broker", "a"]),
     ("@", []),
-    ("broker-a", ["broker-a"]),      # 无分隔符命中：原样返回整串
-    ("", [""]),                      # 同上，哪怕整串是空
+    ("broker-a", ["broker-a"]),      # no separator hit: the whole string returned as-is
+    ("", [""]),                      # same as above, even when the whole string is empty
 ])
 def test_split_drops_trailing_empty_segments(broker_name, expected_parts):
-    """按分隔符切分会丢掉尾部空段（``a@b@`` → 2 段），Python 原生 split 不丢。
+    """Splitting on the separator drops trailing empty segments (``a@b@`` → 2 segments), which native Python split does not.
 
-    ``AllocateMessageQueueByMachineRoom`` 按 ``length == 2`` 判合法，所以这条差异会直接
-    改变一条队列参不参与分配 —— 必须按丢尾空段的口径来。
+    ``AllocateMessageQueueByMachineRoom`` judges validity by ``length == 2``, so this difference directly
+    changes whether a queue participates in allocation — it must follow the drop-trailing-empty rule.
     """
     assert _split_dropping_trailing_empty(broker_name, "@") == expected_parts
 
 
 def test_by_machine_room_uses_the_trailing_empty_split_on_the_broker_name():
-    """``room1@`` 不算两段（不参与）、``room1@b@`` 算两段（参与）。"""
+    """``room1@`` does not count as two segments (no allocation); ``room1@b@`` counts as two (participates)."""
     cid_all = _cids(1)
     strategy = AllocateMessageQueueByMachineRoom({"room1"})
     assert _ids(strategy.allocate("G", "CID_PREFIX0",
                                   [MessageQueue("topic", "room1@", 0)], cid_all)) == []
     assert _ids(strategy.allocate("G", "CID_PREFIX0",
                                   [MessageQueue("topic", "room1@b@", 0)], cid_all)) == [0]
-    # "@room1" 是两段，但机房是空串、不在白名单
+    # "@room1" is two segments, but the room is an empty string and not in the whitelist
     assert _ids(strategy.allocate("G", "CID_PREFIX0",
                                   [MessageQueue("topic", "@room1", 0)], cid_all)) == []
-    # "@" 切分后是 0 段
+    # "@" splits into 0 segments
     assert _ids(strategy.allocate("G", "CID_PREFIX0",
                                   [MessageQueue("topic", "@", 0)], cid_all)) == []
 
 
-# --------------------------------------------- 机房就近代理（MACHINE_ROOM_NEARBY）
+# --------------------------------------------- Machine room nearby proxy (MACHINE_ROOM_NEARBY)
 
 class _DashRoom(object):
-    """测试用 resolver：broker ``IDCx-brokerName`` / 消费者 ``IDCx-CID-i`` 按 '-' 取前段。"""
+    """Test resolver: broker ``IDCx-brokerName`` / consumer ``IDCx-CID-i`` take the segment before '-'."""
 
     def broker_deploy_in(self, message_queue):
         return message_queue.broker_name.split("-")[0]
@@ -531,8 +532,8 @@ def _nearby_cids(idc_size, consumer_size):
 ])
 def test_nearby_allocates_same_room_only_and_covers_everything(idc_size, queue_size,
                                                                consumer_size):
-    """机房数相等时，每个消费者只能拿到**同机房**的队列，
-    且全员并集恰好是全集（不重不漏）。"""
+    """With equal room counts, each consumer can only get queues in the **same room**,
+    and the union of everyone is exactly the whole set (no overlap, no omission)."""
     strategy = AllocateMachineRoomNearby(AllocateMessageQueueAveragely(), _DashRoom())
     mq_all, cid_all = _nearby_mq(idc_size, queue_size), _nearby_cids(idc_size, consumer_size)
     flat = []
@@ -546,24 +547,24 @@ def test_nearby_allocates_same_room_only_and_covers_everything(idc_size, queue_s
 
 
 def test_nearby_lets_other_rooms_share_queues_with_no_consumer():
-    """broker 机房比消费者机房多时，那些**没有活消费者**
-    的机房队列要交给全部消费者共享，否则没人消费；有消费者的机房仍然只给自己的消费者。"""
+    """When broker rooms outnumber consumer rooms, the queues of rooms with **no live consumer**
+    must be shared among all consumers, otherwise nobody consumes them; rooms with consumers still only serve their own consumers."""
     strategy = AllocateMachineRoomNearby(AllocateMessageQueueAveragely(), _DashRoom())
-    mq_all = _nearby_mq(5, 4)                       # IDC1..IDC5 各 4 条
-    cid_all = _nearby_cids(2, 3)                    # 只有 IDC1、IDC2 有消费者
+    mq_all = _nearby_mq(5, 4)                       # 4 queues each in IDC1..IDC5
+    cid_all = _nearby_cids(2, 3)                    # consumers only in IDC1 and IDC2
     healthy = {"IDC1", "IDC2"}
-    # 队列 id 在各机房之间会重名，所以用 (broker, qid) 当身份
+    # Queue ids repeat across rooms, so use (broker, qid) as the identity
     key = lambda mq: (mq.broker_name, mq.queue_id)  # noqa: E731
     allocated = {key(mq): cid for cid in cid_all
                  for mq in strategy.allocate("Test-C-G", cid, mq_all, cid_all)}
-    assert set(allocated) == {key(mq) for mq in mq_all}, "每条队列都得有人消费"
+    assert set(allocated) == {key(mq) for mq in mq_all}, "every queue must have a consumer"
     for mq in mq_all:
         room = _DashRoom().broker_deploy_in(mq)
-        if room in healthy:  # 健康机房不共享：只分给同机房的消费者
+        if room in healthy:  # healthy rooms do not share: only same-room consumers
             assert _DashRoom().consumer_deploy_in(allocated[key(mq)]) == room, mq
-        else:                # 空机房的队列落在两个机房之间
+        else:                # queues of empty rooms fall between the two rooms
             assert _DashRoom().consumer_deploy_in(allocated[key(mq)]) in healthy, mq
-    # 本机房消费者把自己机房的队列收全
+    # Same-room consumers collect all queues of their own room
     for room in healthy:
         mine = {key(mq) for mq, cid in
                 ((m, c) for c in cid_all
@@ -573,11 +574,11 @@ def test_nearby_lets_other_rooms_share_queues_with_no_consumer():
 
 
 def test_nearby_shares_a_dead_room_queues_in_a_stable_order():
-    """两机房小场景：``IDC2`` 4 条 + ``IDC1`` 2 条、``IDC1`` 两个消费者 →
-    CID-0 拿 ``[IDC1#0, IDC2#0, IDC2#1]``、CID-1 拿 ``[IDC1#1, IDC2#2, IDC2#3]``。
+    """Two-room small scenario: 4 queues in ``IDC2`` + 2 in ``IDC1``, two consumers in ``IDC1`` →
+    CID-0 gets ``[IDC1#0, IDC2#0, IDC2#1]``, CID-1 gets ``[IDC1#1, IDC2#2, IDC2#3]``.
 
-    顺序也要钉住：先分配**本机房**的队列，再把
-    "没有活消费者"的机房按机房名字典序补上，所以同机房的队列一定排在前面。
+    The order is pinned too: **same-room** queues are allocated first, then rooms
+    with "no live consumers" are appended in lexicographic room-name order, so same-room queues always come first.
     """
     strategy = AllocateMachineRoomNearby(AllocateMessageQueueAveragely(), _DashRoom())
     mq_all = [MessageQueue("topic", "IDC2-brokerName", q) for q in range(4)] \
@@ -594,7 +595,7 @@ def test_nearby_shares_a_dead_room_queues_in_a_stable_order():
 
 
 def test_nearby_name_exposes_the_inner_strategy():
-    """``get_name()`` = ``MACHINE_ROOM_NEARBY-<内层策略名>``。"""
+    """``get_name()`` = ``MACHINE_ROOM_NEARBY-<inner strategy name>``."""
     assert AllocateMachineRoomNearby(
         AllocateMessageQueueAveragely(), _DashRoom()).get_name() == "MACHINE_ROOM_NEARBY-AVG"
     assert AllocateMachineRoomNearby(
@@ -607,14 +608,14 @@ def test_nearby_name_exposes_the_inner_strategy():
 
 @pytest.mark.parametrize("inner,resolver", [(None, _DashRoom()), (AllocateMessageQueueAveragely(), None)])
 def test_nearby_rejects_null_arguments(inner, resolver):
-    """非法参数在构造期就抛 NullPointerException（不是 rebalance 期的守卫，照抛）。"""
+    """Illegal arguments raise NullPointerException at construction time (not a rebalance-time guard; they are raised as-is)."""
     with pytest.raises(ValueError):
         AllocateMachineRoomNearby(inner, resolver)
 
 
 def test_nearby_raises_when_a_room_is_unknown():
-    """resolver 给出空机房时必须抛 IllegalArgumentException：**不能**静默返回空列表，
-    那等于把整个 topic 的队列撤走；抛出去由 rebalance 兜住并保持现有分配。"""
+    """When the resolver reports an empty room, IllegalArgumentException must be raised: it must **not** silently return an empty list,
+    which would amount to revoking the entire topic's queues; the throw is caught by rebalance, which keeps the existing assignment."""
     class _BlankRoom(object):
         def broker_deploy_in(self, mq):
             return ""
@@ -634,7 +635,7 @@ def test_new_strategy_names_match_the_wire_values():
 
 
 def test_consistent_hash_drives_rebalance():
-    """换上一致性哈希后，消费者的 rebalance 必须真的用它（策略不是摆设）。"""
+    """After switching to consistent hashing, the consumer's rebalance must really use it (the strategy is not a decoration)."""
     class _Client(object):
         def get_topic_publish_info(self, topic):
             class _Info(object):
@@ -642,7 +643,7 @@ def test_consistent_hash_drives_rebalance():
             return _Info()
 
         def get_topic_subscribe_info(self, topic):
-            # rebalance 取的是订阅信息
+            # rebalance takes the subscription info
             return _queues(4)
 
         def get_consumer_id_list_by_group(self, topic, consumer_group, timeout_millis=5000):
@@ -654,6 +655,6 @@ def test_consistent_hash_drives_rebalance():
     consumer._mq_client = _Client()
     consumer.allocate_message_queue_strategy = AllocateMessageQueueConsistentHash(3)
     consumer._rebalance()
-    # 单消费者 + 哈希环：4 条队列全落在自己身上
+    # Single consumer + hash ring: all 4 queues land on itself
     assert _ids(sorted(consumer._assigned, key=lambda m: m.queue_id)) == [0, 1, 2, 3]
     assert consumer.allocate_message_queue_strategy.get_name() == "CONSISTENT_HASH"

@@ -34,7 +34,7 @@ def main():
         ci = admin.fetch_broker_cluster_info()
         master = None
         for addrs in ci.broker_addr_table.values():
-            # broker_addr_table: {brokerName: {brokerId: addr}}，0 = MASTER
+            # broker_addr_table: {brokerName: {brokerId: addr}}, 0 = MASTER
             if 0 in addrs and addrs[0]:
                 master = addrs[0]
                 break
@@ -43,14 +43,14 @@ def main():
             return 2
         print("master=%s\n" % master)
 
-        # ---- 1. 批量建 topic(18) ------------------------------------------
+        # ---- 1. batch-create topic(18) ------------------------------------------
         cfg_a = TopicConfig(TOPIC_A, 4, 4)
         cfg_b = TopicConfig(TOPIC_B, 6, 6)
         try:
             admin.create_and_update_topic_config_list(master, [cfg_a, cfg_b])
-            check("批量建 topic(18) 请求", True)
+            check("batch-create topic(18) request", True)
         except Exception as e:  # noqa: BLE001
-            check("批量建 topic(18) 请求", False, repr(e))
+            check("batch-create topic(18) request", False, repr(e))
 
         ok, detail = True, ""
         for cfg in (cfg_a, cfg_b):
@@ -65,18 +65,18 @@ def main():
             except Exception as e:  # noqa: BLE001
                 ok, detail = False, "%s: %r" % (cfg.topic_name, e)
                 break
-        check("批量建 topic(18) 生效且队列数正确", ok, detail)
+        check("batch-create topic(18) took effect with correct queue counts", ok, detail)
 
-        # ---- 2. 批量建订阅组(225) ----------------------------------------
+        # ---- 2. batch-create subscription group(225) ----------------------------------------
         grp_a = SubscriptionGroupConfig(GROUP_A)
         grp_a.retry_queue_nums = 3
         grp_b = SubscriptionGroupConfig(GROUP_B)
         grp_b.retry_max_times = 5
         try:
             admin.create_and_update_subscription_group_config_list(master, [grp_a, grp_b])
-            check("批量建订阅组(225) 请求", True)
+            check("batch-create subscription group(225) request", True)
         except Exception as e:  # noqa: BLE001
-            check("批量建订阅组(225) 请求", False, repr(e))
+            check("batch-create subscription group(225) request", False, repr(e))
 
         ok, detail = True, ""
         for grp, field, want in ((grp_a, "retry_queue_nums", 3),
@@ -91,128 +91,128 @@ def main():
             except Exception as e:  # noqa: BLE001
                 ok, detail = False, "%s: %r" % (grp.group_name, e)
                 break
-        check("批量建订阅组(225) 生效且字段正确", ok, detail)
+        check("batch-create subscription group(225) took effect with correct fields", ok, detail)
 
-        # ---- 3. 读禁配(353) -----------------------------------------------
+        # ---- 3. read-forbidden config(353) -----------------------------------------------
         try:
             fb = admin.update_and_get_group_read_forbidden(master, GROUP_A, TOPIC_A, False)
-            check("消费组读禁配(353) 设置禁读",
+            check("consumer group read-forbidden(353) set read-forbidden",
                   isinstance(fb, dict) and fb.get("readable") is False, repr(fb))
         except Exception as e:  # noqa: BLE001
-            check("消费组读禁配(353) 设置禁读", False, repr(e))
+            check("consumer group read-forbidden(353) set read-forbidden", False, repr(e))
 
         try:
             fb = admin.update_and_get_group_read_forbidden(master, GROUP_A, TOPIC_A, None)
-            check("消费组读禁配(353) 仅查询不改动",
+            check("consumer group read-forbidden(353) query-only does not change",
                   isinstance(fb, dict) and fb.get("readable") is False,
-                  "禁读状态被查询调用改掉: %r" % (fb,))
+                  "the read-forbidden state was changed by the query call: %r" % (fb,))
         except Exception as e:  # noqa: BLE001
-            check("消费组读禁配(353) 仅查询不改动", False, repr(e))
+            check("consumer group read-forbidden(353) query-only does not change", False, repr(e))
 
         try:
             fb = admin.update_and_get_group_read_forbidden(master, GROUP_A, TOPIC_A, True)
-            check("消费组读禁配(353) 恢复可读",
+            check("consumer group read-forbidden(353) restore readability",
                   isinstance(fb, dict) and fb.get("readable") is True, repr(fb))
         except Exception as e:  # noqa: BLE001
-            check("消费组读禁配(353) 恢复可读", False, repr(e))
+            check("consumer group read-forbidden(353) restore readability", False, repr(e))
 
-        check("消费组读禁配(353) 回包含 group/topic",
+        check("consumer group read-forbidden(353) response contains group/topic",
               isinstance(fb, dict) and fb.get("group") == GROUP_A and fb.get("topic") == TOPIC_A,
               repr(fb))
 
-        # ---- 4. 恢复半消息(323) -------------------------------------------
+        # ---- 4. resume half message(323) -------------------------------------------
         try:
             resumed = admin.resume_check_half_message(
                 master, TOPIC_A, "0A0F0000000000000000000000000000000000")
-            check("恢复半消息(323) 非半消息返回 False 而非报错", resumed is False,
-                  "resumed=%r，对非半消息竟返回 True" % resumed)
+            check("resume half message(323) returns False rather than erroring on a non-half message", resumed is False,
+                  "resumed=%r, returned True on a non-half message" % resumed)
         except Exception as e:  # noqa: BLE001
-            check("恢复半消息(323) 非半消息返回 False 而非报错", False, repr(e))
+            check("resume half message(323) returns False rather than erroring on a non-half message", False, repr(e))
 
         try:
             admin.resume_check_half_message(master, "", "x")
-            check("恢复半消息(323) 缺 topic 被本地拒绝", False, "空 topic 竟被放行发出")
+            check("resume half message(323) missing topic is rejected locally", False, "an empty topic was allowed through")
         except MQClientException:
-            check("恢复半消息(323) 缺 topic 被本地拒绝", True)
+            check("resume half message(323) missing topic is rejected locally", True)
         except Exception as e:  # noqa: BLE001
-            check("恢复半消息(323) 缺 topic 被本地拒绝", False,
-                  "应抛 MQClientException，实际 %r" % e)
+            check("resume half message(323) missing topic is rejected locally", False,
+                  "expected MQClientException, got %r" % e)
 
-        # ---- 5. 顺序 topic 配置（nameserver KV） --------------------------
+        # ---- 5. order topic config (nameserver KV) --------------------------
         try:
             admin.create_or_update_order_conf(ORDER_KEY, "%s:5" % TOPIC_A, False)
             admin.create_or_update_order_conf(ORDER_KEY, "%s:8" % TOPIC_B, False)
             stored = admin.get_kv_config(NAMESPACE_ORDER_TOPIC_CONFIG, ORDER_KEY) or ""
-            check("顺序 topic 配置 合并两条而非覆盖",
+            check("order topic config merges the two entries instead of overwriting",
                   ("%s:5" % TOPIC_A) in stored and ("%s:8" % TOPIC_B) in stored,
                   "stored=%r" % stored)
         except Exception as e:  # noqa: BLE001
-            check("顺序 topic 配置 合并两条而非覆盖", False, repr(e))
+            check("order topic config merges the two entries instead of overwriting", False, repr(e))
 
         try:
             admin.create_or_update_order_conf(ORDER_KEY, "%s:6" % TOPIC_A, False)
             stored = admin.get_kv_config(NAMESPACE_ORDER_TOPIC_CONFIG, ORDER_KEY) or ""
-            check("顺序 topic 配置 同 key 覆盖旧值",
+            check("order topic config overwrites the old value on the same key",
                   ("%s:6" % TOPIC_A) in stored and ("%s:5" % TOPIC_A) not in stored,
                   "stored=%r" % stored)
         except Exception as e:  # noqa: BLE001
-            check("顺序 topic 配置 同 key 覆盖旧值", False, repr(e))
+            check("order topic config overwrites the old value on the same key", False, repr(e))
 
-        # ---- 6. 清理类 ----------------------------------------------------
+        # ---- 6. cleanup APIs ----------------------------------------------------
         try:
             admin.clean_expired_consumer_queue(master, 24 * 365)
-            check("清理过期消费队列(306)", True)
+            check("clean expired consumer queues(306)", True)
         except Exception as e:  # noqa: BLE001
-            check("清理过期消费队列(306)", False, repr(e))
+            check("clean expired consumer queues(306)", False, repr(e))
 
         failed = admin.clean_expired_consumer_queue_by_addr([master], 24 * 365)
-        check("清理过期消费队列(306) ByAddr", not failed, "failed=%r" % failed)
+        check("clean expired consumer queues(306) ByAddr", not failed, "failed=%r" % failed)
 
         try:
             admin.delete_expired_commit_log(master, 24 * 365)
-            check("删除过期 commitlog(329)", True)
+            check("delete expired commitlog(329)", True)
         except Exception as e:  # noqa: BLE001
-            check("删除过期 commitlog(329)", False, repr(e))
+            check("delete expired commitlog(329)", False, repr(e))
 
         failed = admin.delete_expired_commit_log_by_addr([master], 24 * 365)
-        check("删除过期 commitlog(329) ByAddr", not failed, "failed=%r" % failed)
+        check("delete expired commitlog(329) ByAddr", not failed, "failed=%r" % failed)
 
         failed = admin.delete_expired_commit_log_by_addr(["127.0.0.1:1"], 1)
-        check("清理类 ByAddr 报告失败地址", failed == ["127.0.0.1:1"],
+        check("cleanup APIs ByAddr report failed addresses", failed == ["127.0.0.1:1"],
               "dead addr should be reported, got %r" % failed)
 
-        # ---- 7. 清理未使用 topic(316) -------------------------------------
+        # ---- 7. clean unused topic(316) -------------------------------------
         try:
             admin.clean_unused_topic_by_addr(master)
-            check("清理未使用 topic(316)", True)
+            check("clean unused topic(316)", True)
         except Exception as e:  # noqa: BLE001
-            check("清理未使用 topic(316)", False, repr(e))
+            check("clean unused topic(316)", False, repr(e))
 
-        # ---- 8. 消费时间跨度(303) -----------------------------------------
+        # ---- 8. consume time span(303) -----------------------------------------
         try:
             spans = admin.query_consume_time_span(TOPIC_A, GROUP_A)
-            check("消费时间跨度(303) 路由扇出聚合", isinstance(spans, list),
-                  "spans=%d 条（空组返回空列表属正常）" % len(spans))
+            check("consume time span(303) route fan-out aggregation", isinstance(spans, list),
+                  "spans=%d entries (an empty group returning an empty list is normal)" % len(spans))
         except Exception as e:  # noqa: BLE001
-            check("消费时间跨度(303) 路由扇出聚合", False, repr(e))
+            check("consume time span(303) route fan-out aggregation", False, repr(e))
 
-        # ---- 9. nameserver 配置(318/319) ----------------------------------
-        # namesrv 的 Configuration.update 只认真实字段：未知键被**静默丢弃**（真机
-        # 实测确认），所以必须用 orderMessageEnable
-        # 这个真实字段做写读回环，测完还原为默认值 false。
+        # ---- 9. nameserver config(318/319) ----------------------------------
+        # namesrv's Configuration.update only accepts real fields: unknown keys are silently dropped
+        # (confirmed on live hardware), so the write-read loop must use orderMessageEnable
+        # this real field, and restore the default false afterwards.
         try:
             before = admin.get_name_server_config()
             old_val = (before or {}).get(NAMESRV, {}).get("orderMessageEnable", "false")
             admin.update_name_server_config({"orderMessageEnable": "true"})
             got = admin.get_name_server_config()
             val = (got or {}).get(NAMESRV, {}).get("orderMessageEnable")
-            check("nameserver 配置(318/319) 写读回环", val == "true",
+            check("nameserver config(318/319) write-read loop", val == "true",
                   "got=%r want='true'" % val)
             admin.update_name_server_config({"orderMessageEnable": old_val})
         except Exception as e:  # noqa: BLE001
-            check("nameserver 配置(318/319) 写读回环", False, repr(e))
+            check("nameserver config(318/319) write-read loop", False, repr(e))
 
-        # ---- 清理 ---------------------------------------------------------
+        # ---- cleanup ---------------------------------------------------------
         for t in (TOPIC_A, TOPIC_B):
             try:
                 admin.delete_topic_in_broker(master, t)

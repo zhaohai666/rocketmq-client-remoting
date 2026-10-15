@@ -1,15 +1,17 @@
 # -*- coding: utf-8 -*-
-"""用**已验证的 Python 客户端**回读 Go autoBatch（ProduceAccumulator）写进真实
-broker 的消息。
+"""Read back, with the **already verified Python client**, the messages that Go autoBatch
+(ProduceAccumulator) wrote into a real broker.
 
-为什么需要：autoBatch 攒批后走 SEND_BATCH_MESSAGE 帧发送，帧拼错时 broker 照样回
-SEND_OK —— 拆批错误（成员体错乱、TAGS/KEYS 丢失、UNIQ_KEY 缺失）只有另一个语言
-的消费端能读出来。这里逐条校验：条数、每条消息的 body 前缀、TAGS、KEYS、UNIQ_KEY。
+Why it is needed: after autoBatch accumulates a batch it is sent as a SEND_BATCH_MESSAGE
+frame, and when the frame is built wrongly the broker still replies SEND_OK -- batch
+splitting errors (mismatched member bodies, lost TAGS/KEYS, missing UNIQ_KEY) can only be
+picked up by a consumer written in another language. This script validates them one by one:
+the count, the body prefix of every message, TAGS, KEYS and UNIQ_KEY.
 
-用法: python go_autobatch_consume_check.py <topic> [expect] [group]
+Usage: python go_autobatch_consume_check.py <topic> [expect] [group]
 
-expect 由调用方从 Go 侧的 `SENT=<n>` 行取（见 scripts/run_go_autobatch_live.sh），
-别写死。
+expect is taken by the caller from the `SENT=<n>` line on the Go side (see
+scripts/run_go_autobatch_live.sh); do not hardcode it.
 """
 import os
 import sys
@@ -60,33 +62,33 @@ def main():
     group = sys.argv[3] if len(sys.argv) > 3 else "GID_PyReadGoAutoBatch_%d" % int(time.time())
 
     msgs = consume(topic, group, expect)
-    check("回读到 %d 条消息" % expect, len(msgs) >= expect, "got=%d" % len(msgs))
+    check("read back %d messages" % expect, len(msgs) >= expect, "got=%d" % len(msgs))
 
-    # 攒批最容易丢的就是成员属性：TAGS/KEYS/UNIQ_KEY 必须逐条健在。
+    # The member attributes are what batching most easily loses: TAGS/KEYS/UNIQ_KEY must survive every single message.
     by_body = {}
     for m in msgs:
         by_body[m.body] = m
 
     prefixes = (b"autobatch-sync-", b"autobatch-tail-", b"autobatch-async-")
     matched = sum(1 for body in by_body if any(body.startswith(p) for p in prefixes))
-    check("全部消息都是 autoBatch 例子的 body", matched == min(expect, len(by_body)),
+    check("every message has a body from the autoBatch sample", matched == min(expect, len(by_body)),
           "matched=%d" % matched)
 
     sync = by_body.get(b"autobatch-sync-00-0123456789abcdef")
     if sync is not None:
-        check("攒批成员 TAGS=autoBatch", sync.get_property("TAGS") == "autoBatch",
+        check("batched member TAGS=autoBatch", sync.get_property("TAGS") == "autoBatch",
               "tags=%r" % sync.get_property("TAGS"))
-        check("攒批成员 KEYS=auto-batch-key-0", sync.get_property("KEYS") == "auto-batch-key-0",
+        check("batched member KEYS=auto-batch-key-0", sync.get_property("KEYS") == "auto-batch-key-0",
               "keys=%r" % sync.get_property("KEYS"))
-        check("攒批成员带 UNIQ_KEY", bool(sync.get_property("UNIQ_KEY")),
+        check("batched member carries UNIQ_KEY", bool(sync.get_property("UNIQ_KEY")),
               "uniq=%r" % sync.get_property("UNIQ_KEY"))
-        check("攒批成员 msg_id 非空", bool(sync.msg_id), "msg_id=%r" % sync.msg_id)
+        check("batched member msg_id is not empty", bool(sync.msg_id), "msg_id=%r" % sync.msg_id)
     else:
-        check("收到攒批成员 autobatch-sync-00", False)
+        check("received the batched member autobatch-sync-00", False)
 
-    # 12 条消息的 UNIQ_KEY 必须两两不同（攒批绝不共享成员 id）
+    # The UNIQ_KEY of the 12 messages must be pairwise different (batching never shares member ids)
     uniqs = [m.get_property("UNIQ_KEY") for m in msgs]
-    check("成员 UNIQ_KEY 互不相同", len(set(uniqs)) == len(uniqs),
+    check("member UNIQ_KEY values are all different", len(set(uniqs)) == len(uniqs),
           "distinct=%d total=%d" % (len(set(uniqs)), len(uniqs)))
 
     print("PASS=%d FAIL=%d" % (sum(1 for r in results if r), sum(1 for r in results if not r)))

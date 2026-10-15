@@ -29,9 +29,9 @@ class _FakeRemoting:
 
 
 class _RecordingClient:
-    """MQClientInstance 替身：只记录「上线时 broker 看到的 topic」，不碰网络。
+    """MQClientInstance double: only records "the topic the broker sees at registration", never touches the network.
 
-    守卫必须排在真正建请求之前，所以被拒绝的那次发送在这份记录里必须**什么都没有**。
+    The guard must run before the request is actually built, so the rejected send must leave **nothing** in this record.
     """
 
     def __init__(self):
@@ -99,7 +99,7 @@ def _producer(namespace: Optional[str] = None) -> DefaultMQProducer:
     p.set_namesrv_addr("127.0.0.1:9876")
     p.set_retry_times_when_send_failed(0)
     p.retry_times_when_send_async_failed = 0
-    # start() 会建真实客户端，这里只补齐发送链需要的：started 标记 + 两个池
+    # start() builds a real client; here only what the send chain needs is filled in: the started marker + two pools
     p._create_async_executors()
     p._mq_client = _RecordingClient()
     p._started = True
@@ -110,10 +110,10 @@ def _wait_done(cb: _RecordingCallback, timeout: float = 5.0) -> None:
     deadline = time.monotonic() + timeout
     while not cb.done and time.monotonic() < deadline:
         time.sleep(0.005)
-    assert cb.done, "回调没在超时内跑完"
+    assert cb.done, "the callback did not finish within the timeout"
 
 
-# ---------------------------------------------------------------- 同步
+# ---------------------------------------------------------------- Sync
 def test_sync_pinned_send_rejects_a_mismatched_topic():
     p = _producer()
     client = p._mq_client
@@ -124,12 +124,12 @@ def test_sync_pinned_send_rejects_a_mismatched_topic():
 
     assert str(ei.value) == SYNC_WORDING
     assert ei.value.response_code is None
-    assert client.topics == [], "被拒绝的发送不该碰到网络"
+    assert client.topics == [], "a rejected send must not touch the network"
     assert msg.topic == "TopicTest" and msg.body == b"x"
 
 
 def test_sync_pinned_send_accepts_a_matching_topic():
-    """负向对照：topic 一致（不设命名空间）必须照常发出。"""
+    """Negative control: matching topics (no namespace set) must be sent as usual."""
     p = _producer()
     client = p._mq_client
     msg = Message("TopicTest", b"x")
@@ -141,9 +141,9 @@ def test_sync_pinned_send_accepts_a_matching_topic():
 
 
 def test_namespace_does_not_false_reject_the_pinned_send():
-    """带命名空间时两边分别被包一层，比的仍是同一对资源名。
+    """With a namespace, each side is wrapped separately, but it is still the same pair of resource names being compared.
 
-    三种入参组合都要放行：队列 topic 是裸名、已经带前缀、以及路由里拿到的带前缀队列。
+    All three input combinations must pass: a bare queue topic, an already-prefixed one, and a prefixed queue obtained from the route.
     """
     p = _producer(NS)
     client = p._mq_client
@@ -163,7 +163,7 @@ def test_namespace_does_not_false_reject_the_pinned_send():
 
 
 def test_namespaced_message_topic_still_must_match():
-    """消息 topic 与队列 topic 在不同的命名空间下同样不一致（不是"有前缀就放行"）。"""
+    """The message topic and the queue topic are equally mismatched under different namespaces (not "anything prefixed passes")."""
     p = _producer(NS)
     msg = Message("TopicTest", b"x")
 
@@ -173,7 +173,7 @@ def test_namespaced_message_topic_still_must_match():
     assert str(ei.value) == SYNC_WORDING
 
 
-# ---------------------------------------------------------------- 批量
+# ---------------------------------------------------------------- Batch
 def test_batch_pinned_send_rejects_a_mismatched_topic():
     p = _producer()
     client = p._mq_client
@@ -197,7 +197,7 @@ def test_batch_pinned_send_accepts_a_matching_topic():
     assert client.topics == ["%s%%TopicTest" % NS]
 
 
-# ---------------------------------------------------------------- 异步
+# ---------------------------------------------------------------- Async
 def test_async_pinned_send_reports_the_protocol_wording_through_the_callback():
     p = _producer()
     client = p._mq_client
@@ -211,7 +211,7 @@ def test_async_pinned_send_reports_the_protocol_wording_through_the_callback():
     assert len(cb.errors) == 1
     assert isinstance(cb.errors[0], MQClientException)
     assert str(cb.errors[0]) == ASYNC_WORDING
-    assert client.topics == [], "被拒绝的发送不该碰到网络"
+    assert client.topics == [], "a rejected send must not touch the network"
 
 
 def test_async_pinned_send_accepts_a_matching_topic():

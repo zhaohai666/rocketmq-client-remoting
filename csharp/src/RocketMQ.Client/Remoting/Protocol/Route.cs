@@ -1,12 +1,13 @@
-// 用途：客户端向 NameServer 发 GET_ROUTEINFO_BY_TOPIC，响应 body 即 TopicRouteData
-// 的 JSON。据此得知集群里 broker 的地址（brokerDatas）与每个 topic 的读写队列数
-// （queueDatas），进而组装出可发送/可拉取的 MessageQueue 列表。
+// Purpose: the client sends GET_ROUTEINFO_BY_TOPIC to the NameServer, and the response body
+// is the JSON of TopicRouteData. From it the client learns the cluster's broker addresses
+// (brokerDatas) and each topic's read/write queue counts (queueDatas), then assembles the
+// list of MessageQueues that can be sent to / pulled from.
 //
-// JSON 字段（与 fastjson2 一致，键按字母序）：
+// JSON fields (consistent with fastjson2, keys in alphabetical order):
 //   QueueData      : brokerName | perm | readQueueNums | topicSysFlag | writeQueueNums
 //   BrokerData     : brokerAddrs | brokerName | cluster | enableActingMaster | zoneName
 //   TopicRouteData : brokerDatas | filterServerTable | orderTopicConf | queueDatas
-//                    （+ topicQueueMappingByBroker，非空时才输出）
+//                    (+ topicQueueMappingByBroker, output only when non-null)
 using System.Globalization;
 using RocketMQ.Common;
 
@@ -131,7 +132,7 @@ public sealed class BrokerData : IComparable<BrokerData>
     public string Cluster { get; set; } = string.Empty;
     public string BrokerName { get; set; } = string.Empty;
 
-    // brokerId -> 地址。brokerId=0 是 master（MixAll.MASTER_ID）
+    // brokerId -> address. brokerId=0 is the master (MixAll.MASTER_ID)
     public SortedDictionary<long, string> BrokerAddrs { get; set; } = new();
 
     public string ZoneName { get; set; } = string.Empty;
@@ -156,7 +157,8 @@ public sealed class BrokerData : IComparable<BrokerData>
     }
 
     /// <summary>
-    /// 优先返回 brokerId=0（master）；否则随机取一个从节点地址。无可用地址时返回空串。
+    /// Prefers brokerId=0 (master); otherwise takes a random slave address. Returns an empty
+    /// string when no address is available.
     /// </summary>
     public string SelectBrokerAddr()
     {
@@ -183,8 +185,9 @@ public sealed class BrokerData : IComparable<BrokerData>
         return BrokerAddrs.Values.First();
     }
 
-    // fastjson2 的 brokerAddrs 是 HashMap<Long,String>，键为数字。
-    // 我们输出为合法 JSON 的字符串键（"0"），语义等价且任何解析器都能读。
+    // fastjson2's brokerAddrs is a HashMap<Long,String> with numeric keys.
+    // We output string keys ("0") as valid JSON — semantically equivalent and readable by
+    // any parser.
     private static JsonValue AddrsToJson(SortedDictionary<long, string> addrs)
     {
         var o = JsonValue.MakeObject();
@@ -206,14 +209,14 @@ public sealed class BrokerData : IComparable<BrokerData>
 
         foreach (var kv in v.ObjectItems())
         {
-            // 键可能是 "0"（标准 JSON）或 0（fastjson 裸数字键被解析成字符串）
+            // The key may be "0" (standard JSON) or 0 (a fastjson bare numeric key parsed as a string)
             long id = 0;
             if (kv.Key.Length > 0)
             {
                 bool numeric = kv.Key.All(c => c is >= '0' and <= '9');
                 if (!numeric)
                 {
-                    continue; // 非数字键（异常数据）跳过
+                    continue; // non-numeric key (bad data) is skipped
                 }
 
                 id = long.Parse(kv.Key, CultureInfo.InvariantCulture);
@@ -304,7 +307,7 @@ public sealed class BrokerData : IComparable<BrokerData>
         long result = 1;
         result = 31 * result + LegacyHash.StringHash(Cluster);
         result = 31 * result + LegacyHash.StringHash(BrokerName);
-        // Map.hashCode = 各 entry 的 (keyHash ^ valueHash) 之和
+        // Map.hashCode = sum of (keyHash ^ valueHash) over entries
         long mapHash = 0;
         foreach (var kv in BrokerAddrs)
         {
@@ -346,14 +349,15 @@ public sealed class TopicRouteData
     public List<BrokerData> BrokerDatas { get; set; } = new();
     public SortedDictionary<string, List<string>> FilterServerTable { get; set; } = new();
 
-    // 透传：不建模 TopicQueueMappingInfo，原样保留 JSON 以免丢字段。
-    // IsNull() 表示该字段不存在。
+    // pass-through: TopicQueueMappingInfo is not modeled; the JSON is kept verbatim to avoid
+    // dropping fields. IsNull() means the field is absent.
     public JsonValue TopicQueueMappingByBroker { get; set; } = JsonValue.Null;
 
     /// <summary>
-    /// 按 queueDatas + brokerDatas 组装全部**可写** MessageQueue
-    /// （对应 MQClientInstance.topicRouteData2TopicPublishInfo 的组装逻辑）。
-    /// topic 会回填进每个 MessageQueue，否则后续按 mq.topic 回查路由会查不到。
+    /// Assembles all **writable** MessageQueues from queueDatas + brokerDatas
+    /// (corresponds to the assembly logic of MQClientInstance.topicRouteData2TopicPublishInfo).
+    /// topic is backfilled into every MessageQueue; otherwise later route lookups by mq.topic
+    /// would find nothing.
     public List<MessageQueue> GetAllMessageQueue(string topic)
     {
         var mqs = new List<MessageQueue>();
@@ -534,7 +538,7 @@ public sealed class TopicRouteData
 
     private int BrokerNameHash() => LegacyHash.StringHash(OrderTopicConf);
 
-    // RemotingSerializable.encode / decode 的等价物
+    // equivalent of RemotingSerializable.encode / decode
     public byte[] Encode() => RemotingSerializable.Encode(ToJson());
 
     public static bool Decode(byte[] data, out TopicRouteData @out)
@@ -555,7 +559,7 @@ public sealed class TopicRouteData
         + ", brokerDatas=" + BrokerDatas.Count.ToString(CultureInfo.InvariantCulture) + "]";
 }
 
-/// <summary>轻量线程安全随机源：每线程独立随机源的使用场景。</summary>
+/// <summary>Lightweight thread-safe random source: for use cases needing an independent source per thread.</summary>
 internal static class ThreadLocalRandom
 {
     private static readonly ThreadLocal<Random> Rng = new(() => new Random(Interlocked.Increment(ref _seed) ^ Environment.TickCount));

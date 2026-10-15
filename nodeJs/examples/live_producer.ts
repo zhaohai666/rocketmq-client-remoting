@@ -191,8 +191,10 @@ async function main(): Promise<void> {
     const halfMsg = new Message(TOPIC, Buffer.from('tx-unknow-0'), 'TagTx', 'ktx2');
     halfMsg.putProperty('trans', 'unknow');
     await tx.sendMessageInTransaction(halfMsg, null);
-    // broker 巡检半消息的周期是 BrokerConfig#transactionCheckInterval（5.5.1 默认
-    // 30s），8s 的固定等待必然早于首次回查。改成等"回查发生"事件，最多 90s。
+    // The broker's half-message inspection period is
+    // BrokerConfig#transactionCheckInterval (30s by default on 5.5.1), so a
+    // fixed 8s wait necessarily fires before the first check-back. Wait for
+    // the "check-back happened" event instead, at most 90s.
     const deadline = Date.now() + 90_000;
     while (listener.checkRun === 0 && Date.now() < deadline) await sleep(1000);
     check('transaction check-back ran', listener.checkRun > 0, `checks=${listener.checkRun}`);

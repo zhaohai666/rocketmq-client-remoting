@@ -46,7 +46,7 @@ STAMP = int(time.time() * 1000)
 TOPIC = "TlsLive_%s_%d" % (LEG, STAMP)
 GROUP = "GID_TlsLive_%s_%d" % (LEG, STAMP)
 MSG_NUM = 8
-# 首包预算：真机 loopback 上 TLS 往返是个位数毫秒，等满 invoke 超时（5s）就是要抓的故障
+# First-packet budget: a TLS round trip over loopback on real hardware is single-digit ms; waiting out the full invoke timeout (5s) is the fault we are hunting
 FIRST_PACKET_BUDGET_MS = 1500.0
 ROUNDS = 30
 
@@ -72,7 +72,7 @@ def route_request(topic: str) -> rc_mod.RemotingCommand:
 
 
 def instrument_tls() -> list:
-    """记录每一次真实建立的连接是不是 TLS，返回观测列表。"""
+    """Record whether each really-established connection is TLS, return the observation list."""
     observed = []
     orig = RemotingClient._create_conn
 
@@ -102,39 +102,39 @@ def wait_route(prod: DefaultMQProducer, topic: str, min_queues: int,
 def main() -> int:
     observed = instrument_tls()
 
-    # ---------------- S1 逐轮新建 TLS 连接打首包 ----------------
-    print("=== S1 nameServer TLS 首包（%d 轮，每轮新连接，leg=%s）===" % (ROUNDS, LEG))
+    # ---------------- S1 a new TLS connection per round, hit the first packet ----------------
+    print("=== S1 nameServer TLS first packet (%d rounds, a new connection per round, leg=%s) ===" % (ROUNDS, LEG))
     lost = 0
     worst_ms = 0.0
     for i in range(ROUNDS):
         client = RemotingClient(tls_enable=True, tls_options=TLS_OPTIONS)
         began = time.monotonic()
         try:
-            # 新 topic 不存在时 nameServer 回 TOPIC_NOT_EXIST(17) —— 那也是**真应答**，
-            # 首包已经落地；只有拿不到应答（超时/断连）才算丢。
+            # When a new topic does not exist the nameServer returns TOPIC_NOT_EXIST(17) -- that is still a real reply,
+            # the first packet has landed; only failing to get any reply (timeout/disconnect) counts as lost.
             client.invoke_sync(NAMESRV, route_request("%s_%d" % (TOPIC, i)), 5000)
             elapsed = (time.monotonic() - began) * 1000.0
             worst_ms = max(worst_ms, elapsed)
         except Exception as e:  # noqa: BLE001
             lost += 1
-            print("  round %02d 首包失败 %s: %s (%.0fms)"
+            print("  round %02d first-packet failure %s: %s (%.0fms)"
                   % (i, type(e).__name__, e, (time.monotonic() - began) * 1000.0))
         finally:
             client.shutdown()
-    check("S1a %d 轮新建 TLS 连接首包全部落地" % ROUNDS, lost == 0,
+    check("S1a %d rounds of new TLS connections all landed the first packet" % ROUNDS, lost == 0,
           "lost=%d worst=%.0fms" % (lost, worst_ms))
-    check("S1b 首包耗时远离 invoke 超时", worst_ms < FIRST_PACKET_BUDGET_MS,
+    check("S1b first-packet time well away from the invoke timeout", worst_ms < FIRST_PACKET_BUDGET_MS,
           "worst=%.0fms budget=%.0fms" % (worst_ms, FIRST_PACKET_BUDGET_MS))
 
-    # ---------------- S2 端到端 TLS 收发 ----------------
-    print("=== S2 producer + push consumer 全程 TLS ===")
+    # ---------------- S2 end-to-end TLS send/receive ----------------
+    print("=== S2 producer + push consumer over TLS throughout ===")
     prod = DefaultMQProducer(GROUP + "_P", tls_enable=True, tls_options=TLS_OPTIONS)
     prod.set_namesrv_addr(NAMESRV)
     prod.start()
     consumer = None
     try:
         prod.create_topic("TBW102", TOPIC, 4)
-        check("S2a TLS 下 topic 路由可用", wait_route(prod, TOPIC, 4), "topic=%s" % TOPIC)
+        check("S2a topic route works under TLS", wait_route(prod, TOPIC, 4), "topic=%s" % TOPIC)
 
         received = []
         consumer = DefaultMQPushConsumer(GROUP, tls_enable=True, tls_options=TLS_OPTIONS)
@@ -147,7 +147,7 @@ def main() -> int:
 
         consumer.set_message_listener(SimpleMessageListener(_collect))
         consumer.start()
-        # 新组从 LAST_OFFSET 起消费，消费者没起稳就发会漏
+        # A new group consumes from LAST_OFFSET; sending before the consumer is stable will miss messages.
         time.sleep(3.0)
 
         keys = []
@@ -160,31 +160,31 @@ def main() -> int:
             r = prod.send(msg, 5000)
             if r.send_status == SendStatus.SEND_OK:
                 send_ok += 1
-        check("S2b TLS 发送 %d 条全部 SEND_OK" % MSG_NUM, send_ok == MSG_NUM,
+        check("S2b TLS sent %d messages all SEND_OK" % MSG_NUM, send_ok == MSG_NUM,
               "send_ok=%d" % send_ok)
 
         deadline = time.time() + 60
         while time.time() < deadline and len(set(received) & set(keys)) < MSG_NUM:
             time.sleep(0.5)
         got = set(received) & set(keys)
-        check("S2c TLS 消费收齐 %d 条" % MSG_NUM, len(got) == MSG_NUM,
+        check("S2c TLS consumption received all %d messages" % MSG_NUM, len(got) == MSG_NUM,
               "got=%d/%d" % (len(got), MSG_NUM))
     finally:
         if consumer is not None:
             consumer.shutdown()
         prod.shutdown()
 
-    # ---------------- S3 确认真的在跑 TLS，且没留读线程 ----------------
-    print("=== S3 连接口径 ===")
+    # ---------------- S3 confirm TLS is really in use, and no read threads are left ----------------
+    print("=== S3 connection accounting ===")
     tls_addrs = sorted({a for a, is_tls in observed if is_tls})
     plain_addrs = sorted({a for a, is_tls in observed if not is_tls})
-    check("S3a 端到端链路确实建了 TLS 连接", bool(tls_addrs), "tls=%s" % tls_addrs)
-    check("S3b 没有连接悄悄退回明文", not plain_addrs, "plain=%s" % plain_addrs)
+    check("S3a the end-to-end path really established TLS connections", bool(tls_addrs), "tls=%s" % tls_addrs)
+    check("S3b no connection quietly fell back to plaintext", not plain_addrs, "plain=%s" % plain_addrs)
     leftover = [t for t in threading.enumerate() if t.name.startswith("rmq-read-")]
-    check("S3c shutdown 后没有残留读线程", not leftover,
+    check("S3c no leftover read threads after shutdown", not leftover,
           "leftover=%s" % [t.name for t in leftover])
 
-    print("\nTLS 真机验证: %d PASS / %d FAIL" % (PASS, FAIL))
+    print("\nTLS live verification: %d PASS / %d FAIL" % (PASS, FAIL))
     return 1 if FAIL else 0
 
 

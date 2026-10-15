@@ -1,16 +1,16 @@
-//! SQL92 过滤 + `CHECK_CLIENT_CONFIG(46)` 对**真实 5.5.1 集群**的联调验证。
+//! SQL92 filtering + `CHECK_CLIENT_CONFIG(46)` integration-verified against a **real 5.5.1 cluster**.
 //!
-//! 逐项真机断言。
+//! Assertions item by item on a real cluster.
 //!
-//! 为什么必须在真集群上跑：SQL92 这条链路最容易「静默失效」。broker 的
-//! `ExpressionMessageFilter` 在 ConsumeQueue 阶段拿不到编译好的过滤数据时**直接放行全部
-//! 消息**（`return true`），于是两种错都表现为「消费者正常启动、消息也都收到了」：
-//! broker 没开 `enablePropertyFilter`（表达式根本没被编译）、表达式语法错。
-//! 离线单测（`src/client/mq_client.rs` 的 `mod tests`）锁得住协议形状，锁不住 broker
-//! 真的按属性过滤了。所以这里四段都验：
+//! Why this must run on a real cluster: the SQL92 path is the easiest one to fail silently. When the broker's
+//! `ExpressionMessageFilter` cannot get the compiled filter data at the ConsumeQueue stage it **admits all
+//! messages** (`return true`), so both errors show up as "the consumer starts normally and all messages arrive":
+//! the broker has `enablePropertyFilter` off (the expression is never compiled), or the expression has a syntax error.
+//! Offline unit tests (`mod tests` in `src/client/mq_client.rs`) can pin the protocol shape but cannot prove the broker
+//! really filters by property. So all four sections verify here:
 //!
 //!
-//! 用法（先按项目记忆里记的 runbook 起本地集群，broker 需 `enablePropertyFilter=true`）：
+//! Usage (start the local cluster per the recorded runbook first; the broker needs `enablePropertyFilter=true`):
 //! ```text
 //! cargo run --example live_sql92 -- 127.0.0.1:9876
 //! ```
@@ -40,14 +40,14 @@ use rocketmq_client_remoting::remoting::protocol::heartbeat::ConsumeFromWhere;
 use rocketmq_client_remoting::remoting::protocol::remoting_command::RemotingCommand;
 use rocketmq_client_remoting::remoting::rpchook::RPCHook;
 
-/// 本例子建的 topic 队列数（够 broker 分摊，也让路由就绪判定有意义）。
+/// Queue count of the topic created by this example (enough for the broker to spread across, and makes the route-ready check meaningful).
 const QUEUE_NUMS: i32 = 4;
-/// 每种颜色发几条。
+/// How many messages to send per color.
 const PER_COLOR: usize = 3;
-/// 等消息投递到位的兜底秒数（含重平衡 + 长轮询 + 位点周期）。
+/// Fallback seconds to wait for deliveries to settle (includes rebalance + long polling + the offset period).
 const WAIT_SECONDS: u64 = 25;
 
-// ------------------------------------------------------------------ 骨架
+// ------------------------------------------------------------------ Skeleton
 
 struct Checker {
     passed: u32,
@@ -86,7 +86,7 @@ fn stamp() -> String {
     }
 }
 
-/// 轮询到条件成立或超时（真机的一切都是异步到位的，不能睡固定值赌）。
+/// Polls until the condition holds or the timeout hits (everything on a real cluster lands asynchronously; never bet on a fixed sleep).
 async fn poll_until(mut pred: impl FnMut() -> bool, secs: u64) -> bool {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
@@ -100,7 +100,7 @@ async fn poll_until(mut pred: impl FnMut() -> bool, secs: u64) -> bool {
     }
 }
 
-/// `Error::Client` 的 response_code；其它变体返回 None。
+/// The response_code of `Error::Client`; other variants return None.
 fn client_code(e: &Error) -> Option<i32> {
     match e {
         Error::Client { response_code, .. } => *response_code,
@@ -108,9 +108,9 @@ fn client_code(e: &Error) -> Option<i32> {
     }
 }
 
-// ------------------------------------------------- 46 号请求的线上取证钩子
+// -------------------------------------------- on-line evidence hook for request code 46
 
-/// 钩在 transport 上，抓启动期真正发出去的 46 号请求（含 body）。
+/// Hooks into the transport and captures the request-46 calls actually sent at startup (with body).
 #[derive(Default)]
 struct CheckConfigProbe {
     codes: Mutex<Vec<i32>>,
@@ -152,11 +152,11 @@ impl RPCHook for CheckConfigProbe {
     }
 }
 
-// ---------------------------------------------------------------- 投递收集
+// ---------------------------------------------------------------- Delivery collection
 
 #[derive(Default)]
 struct Inbox {
-    /// (body, 属性 color)
+    /// (body, property color)
     items: Mutex<Vec<(String, Option<String>)>>,
 }
 
@@ -202,7 +202,7 @@ impl MessageListenerConcurrently for CollectingListener {
     }
 }
 
-// ------------------------------------------------------------------ 环境
+// ------------------------------------------------------------------ Environment
 
 struct Env {
     namesrv: String,
@@ -250,7 +250,7 @@ impl Env {
         Ok(())
     }
 
-    /// 本 topic 在路由里实际带了多少个队列（拉不到路由算 0）。
+    /// How many queues this topic actually carries in the route (0 if the route cannot be fetched).
     async fn route_queue_count(&self) -> i32 {
         match self.admin.examine_topic_route(&self.topic).await {
             Ok(route) => route
@@ -263,7 +263,7 @@ impl Env {
         }
     }
 
-    /// 起一个订阅本 topic 的 push 消费者（`selector` 为 None 时按 `expression` 走 TAG）。
+    /// Starts a push consumer subscribed to this topic (when `selector` is None, `expression` falls back to TAG).
     fn consumer(
         &self,
         suffix: &str,
@@ -276,8 +276,8 @@ impl Env {
             consumer_group: group,
             name_server_addrs: vec![self.namesrv.clone()],
             instance_name: format!("live-sql92-{suffix}-{}", self.stamp),
-            // 先起来再发消息，这里保持默认的 CONSUME_FROM_LAST_OFFSET 才有意义：
-            // 若误成 FIRST，S2/S3 会把历史消息也捞进来，断言就失去区分度。
+            // Messages are sent only after startup, so keeping the default CONSUME_FROM_LAST_OFFSET here is what makes it meaningful:
+            // if it were FIRST, S2/S3 would sweep in historical messages too and the assertions would lose discrimination.
             consume_from_where: ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET.to_string(),
             ..Default::default()
         })
@@ -293,7 +293,7 @@ impl Env {
         Ok((consumer, inbox))
     }
 
-    /// 发 `PER_COLOR` 条带 `color=<color>` 属性的消息。
+    /// Sends `PER_COLOR` messages carrying the `color=<color>` property.
     async fn produce(&self, color: &str) -> Vec<String> {
         let mut bodies = Vec::new();
         for i in 0..PER_COLOR {
@@ -311,10 +311,10 @@ impl Env {
     }
 }
 
-// ------------------------------------------------------------------ 场景
+// ------------------------------------------------------------------ Scenarios
 
 async fn s1_wire_evidence(env: &Env, ck: &mut Checker) {
-    println!("\n---------- S1 启动期的 46 号请求 ----------");
+    println!("\n---------- S1 request code 46 sent at startup ----------");
     let probe = CheckConfigProbe::new();
     let (consumer, _inbox) = match env.consumer(
         "SQL",
@@ -332,7 +332,7 @@ async fn s1_wire_evidence(env: &Env, ck: &mut Checker) {
         }
     }
     ck.check(
-        "SQL92 订阅触发恰好一笔 CHECK_CLIENT_CONFIG(46)",
+        "SQL92 subscription triggers exactly one CHECK_CLIENT_CONFIG(46)",
         probe.check_count() == 1,
         &format!("codes={:?}", probe.codes()),
     );
@@ -340,7 +340,7 @@ async fn s1_wire_evidence(env: &Env, ck: &mut Checker) {
     let sd = body.get("subscriptionData").cloned().unwrap_or(JsonValue::Null);
     let want_group = format!("{}_SQL", env.group);
     ck.check(
-        "body 是 CheckClientRequestBody（clientId / group / subscriptionData）",
+        "body is CheckClientRequestBody (clientId / group / subscriptionData)",
         body.get("group").and_then(JsonValue::as_str) == Some(want_group.as_str())
             && body.get("clientId").and_then(JsonValue::as_str)
                 == Some(consumer.client_id().as_str())
@@ -365,7 +365,7 @@ async fn s1_wire_evidence(env: &Env, ck: &mut Checker) {
         return;
     }
     ck.check(
-        "纯 TAG 订阅一笔 46 都不发（isTagType 短路）",
+        "a pure TAG subscription sends no 46 at all (isTagType short-circuit)",
         tag_probe.check_count() == 0,
         &format!("codes={:?}", tag_probe.codes()),
     );
@@ -373,7 +373,7 @@ async fn s1_wire_evidence(env: &Env, ck: &mut Checker) {
 }
 
 async fn s2_s3_real_filtering(env: &Env, ck: &mut Checker) {
-    println!("\n---------- S2 broker 按属性过滤 / S3 永不匹配的表达式 ----------");
+    println!("\n---------- S2 broker filters by property / S3 never-matching expression ----------");
     let built = [
         ("FILTER", Some(MessageSelector::by_sql("color = 'red'"))),
         ("NONE", Some(MessageSelector::by_sql("color = 'green'"))),
@@ -393,7 +393,7 @@ async fn s2_s3_real_filtering(env: &Env, ck: &mut Checker) {
             }
         }
     }
-    // 顺序：**先全部 start，再发消息**。
+    // Ordering: **start all consumers first, then send messages**.
     for c in &consumers {
         if let Err(e) = c.start().await {
             ck.abort("S2 consumer start", &e.to_string());
@@ -403,14 +403,14 @@ async fn s2_s3_real_filtering(env: &Env, ck: &mut Checker) {
     let red = env.produce("red").await;
     let blue = env.produce("blue").await;
     ck.check(
-        "6 条消息全部 SEND_OK",
+        "all 6 messages SEND_OK",
         red.len() == PER_COLOR && blue.len() == PER_COLOR,
         &format!("red={} blue={}", red.len(), blue.len()),
     );
 
     let all_inbox = Arc::clone(&inboxes[2]);
     poll_until(|| all_inbox.count() >= 2 * PER_COLOR, WAIT_SECONDS).await;
-    // green 那一腿是「不该收到」，只能等满窗口；这里额外等一会，排除「来得晚」。
+    // The green leg is the "should not receive" one and can only wait out the full window; wait a bit longer here to rule out "arriving late".
     tokio::time::sleep(Duration::from_secs(4)).await;
 
     let red_bodies = inboxes[0].bodies();
@@ -420,27 +420,27 @@ async fn s2_s3_real_filtering(env: &Env, ck: &mut Checker) {
     let mut want_all: Vec<String> = red.iter().chain(blue.iter()).cloned().collect();
     want_all.sort();
     ck.check(
-        "SQL92(color=red) 收到 3 条，且正好是发出去的那 3 条",
+        "SQL92(color=red) receives 3 messages, and exactly the 3 that were sent",
         red_bodies == want_red,
         &format!("{red_bodies:?}"),
     );
     ck.check(
-        "TAG '*' 对照组收到 6 条（红+蓝全在）",
+        "the TAG '*' control group receives all 6 (red+blue all present)",
         all_bodies == want_all,
         &format!("{all_bodies:?}"),
     );
     ck.check(
-        "blue 的 3 条没漏进 SQL92 消费者（证明 broker 真在过滤）",
+        "none of the 3 blue messages leaks into the SQL92 consumer (proves the broker really filters)",
         blue.iter().all(|b| !red_bodies.contains(b)),
         &format!("{red_bodies:?}"),
     );
     ck.check(
-        "收到的消息属性 color 可读且都是 red",
+        "the color property of received messages is readable and all red",
         inboxes[0].colors() == BTreeSet::from(["red".to_string()]),
         &format!("{:?}", inboxes[0].colors()),
     );
     ck.check(
-        "订阅永不匹配的 color='green' ⇒ 一条都没收到",
+        "subscribing to never-matching color='green' ⇒ zero messages received",
         inboxes[1].count() == 0,
         &format!("{:?}", inboxes[1].bodies()),
     );
@@ -450,7 +450,7 @@ async fn s2_s3_real_filtering(env: &Env, ck: &mut Checker) {
 }
 
 async fn s4_bad_expression_fails_start(env: &Env, ck: &mut Checker) {
-    println!("\n---------- S4 非法表达式在启动期失败 ----------");
+    println!("\n---------- S4 illegal expression fails at startup ----------");
     let (consumer, _inbox) = match env.consumer("BAD", Some(MessageSelector::by_sql("color ==")), None)
     {
         Ok(pair) => pair,
@@ -460,23 +460,23 @@ async fn s4_bad_expression_fails_start(env: &Env, ck: &mut Checker) {
     let err = consumer.start().await.err();
     let cost = began.elapsed().as_secs_f64();
     match &err {
-        None => ck.check("start() 抛出错误", false, "非法表达式竟然启动成功"),
+        None => ck.check("start() returns an error", false, "the illegal expression actually started successfully"),
         Some(e) => {
-            ck.check("start() 抛出 MQClientException", client_code(e).is_some(), &e.to_string());
+            ck.check("start() returns a client error", client_code(e).is_some(), &e.to_string());
             ck.check(
-                "错误码是 broker 的 SUBSCRIPTION_PARSE_FAILED(23)",
+                "the error code is the broker's SUBSCRIPTION_PARSE_FAILED(23)",
                 client_code(e) == Some(response_code::SUBSCRIPTION_PARSE_FAILED),
                 &format!("code={:?} err={e}", client_code(e)),
             );
         }
     }
-    ck.check("失败后消费者没留在已启动状态", !consumer.is_started(), "仍留在 started=true");
+    ck.check("the consumer is not left in the started state after the failure", !consumer.is_started(), "still left at started=true");
     ck.check(
-        "非法表达式立刻失败（<5s，不是等超时兜底）",
+        "the illegal expression fails immediately (<5s, not by waiting out the timeout fallback)",
         cost < 5.0,
         &format!("{cost:.2}s"),
     );
-    // 回滚干净了？同一个对象换个合法表达式应当能重新 start。
+    // Rollback clean? The same object with a corrected expression should be able to start again.
     let retry = async {
         consumer
             .subscribe_with_selector(&env.topic, &MessageSelector::by_sql("color = 'blue'"))
@@ -485,7 +485,7 @@ async fn s4_bad_expression_fails_start(env: &Env, ck: &mut Checker) {
     }
     .await;
     ck.check(
-        "失败后修正表达式可重新 start（启动已就地回滚）",
+        "after the failure a corrected expression can start again (startup was rolled back in place)",
         retry.is_ok(),
         retry.as_ref().err().map(String::as_str).unwrap_or(""),
     );
@@ -510,7 +510,7 @@ async fn run(namesrv: &str) -> Checker {
         ck.abort("env start", &e);
         return ck;
     }
-    // 路由要真的带上 4 个队列才算就绪（broker 建 topic 后异步刷到 namesrv）。
+    // The route must really carry 4 queues to count as ready (the broker refreshes the topic to the name server asynchronously after creating it).
     let began = Instant::now();
     let mut ready = false;
     while began.elapsed() < Duration::from_secs(20) {
@@ -520,13 +520,13 @@ async fn run(namesrv: &str) -> Checker {
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    ck.check("T0 topic 路由就绪（4 队列）", ready, "examine_topic_route 拿不到队列");
+    ck.check("T0 topic route ready (4 queues)", ready, "examine_topic_route cannot get the queues");
 
     s1_wire_evidence(&env, &mut ck).await;
     s2_s3_real_filtering(&env, &mut ck).await;
     s4_bad_expression_fails_start(&env, &mut ck).await;
 
-    // 清理：topic + 重试组（消费者组本身不需要显式删）。
+    // Cleanup: topic + retry group (the consumer group itself needs no explicit deletion).
     let retry_topic = format!("{}{}", MixAll::RETRY_GROUP_TOPIC_PREFIX, env.group);
     let _ = env.admin.delete_topic(&env.topic, None).await;
     let _ = env.admin.delete_topic(&retry_topic, None).await;

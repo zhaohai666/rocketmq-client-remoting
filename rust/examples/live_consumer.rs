@@ -1,12 +1,13 @@
-//! `DefaultMQPushConsumer` 对**真实 5.5.1 broker** 的联调验证。
+//! Live validation of [`DefaultMQPushConsumer`] against a **real 5.5.1 broker**.
 //!
-//! 离线单测（`src/client/consumer.rs` 的 `mod tests`）只能覆盖纯逻辑：阈值算术、
-//! CK 解析、返回类型判定。这里补上必须真收发才能证明的部分：长轮询投递、tag 过滤、
-//! 失败重投与 `%RETRY%` 主题还原、POP + ack、广播位点落盘、顺序消费的 broker 锁、
-//! 多实例分摊与撤位、位点持久化到 broker、以及运维接口读到的运行时状态。
+//! Offline unit tests (the `mod tests` in `src/client/consumer.rs`) can only cover pure logic: threshold
+//! arithmetic, CK parsing, return-type decisions. What only real send/receive can prove lives here:
+//! long-poll delivery, tag filtering, failed-message redelivery with `%RETRY%` topic reset, POP + ack,
+//! broadcast offsets written to disk, orderly consumption's broker lock, multi-instance queue sharing and
+//! revocation, offsets persisted to the broker, and the runtime state read back through the admin interfaces.
 //!
 //!
-//! 用法（先按项目记忆里记的 runbook 起本地集群）：
+//! Usage (start a local cluster first, per the runbook recorded in the project knowledge):
 //! ```text
 //! cargo run --example live_consumer -- 127.0.0.1:9876
 //! ```
@@ -51,14 +52,14 @@ use rocketmq_client_remoting::remoting::protocol::heartbeat::{
 use rocketmq_client_remoting::remoting::protocol::route::TopicRouteData;
 use rocketmq_client_remoting::remoting::rpchook::{AclClientRPCHook, RPCHook, SessionCredentials};
 
-/// 每个测试 topic 的默认队列数（够 C8 做「4 队列分给 2 实例」）。
+/// Default queue count per test topic (enough for C8 to hand "4 queues to 2 instances").
 const QUEUE_NUMS: i32 = 4;
-/// 等消息投递到位的最长秒数（含重平衡、长轮询挂起、5s 位点刷新周期）。
+/// Max seconds to wait for delivery (covers rebalance, long-poll suspension, and the 5s offset persist cycle).
 const WAIT_SECONDS: u64 = 30;
-/// 位点持久化周期是 5s，这里留两个周期的余量。
+/// The offset persist cycle is 5s; this leaves a two-cycle margin.
 const PERSIST_SECONDS: u64 = 12;
 
-// ------------------------------------------------------------------ 骨架
+// ------------------------------------------------------------------ skeleton
 
 fn stamp() -> String {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -74,7 +75,7 @@ fn now_ms() -> i64 {
     }
 }
 
-/// 断言累积器：一次跑完所有场景再汇总，首个失败不提前退出。
+/// Assertion accumulator: run all scenarios once, then summarize; the first failure does not exit early.
 struct Checker {
     passed: u32,
     failed: Vec<String>,
@@ -108,20 +109,20 @@ impl Checker {
     }
 }
 
-/// 锁中毒时照常取内值（listener 里的一次 panic 不该让整轮验证连锁崩）。
+/// On a poisoned lock, still take the inner value (one panic inside a listener must not cascade into a whole-run failure).
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-// ------------------------------------------------------------------ ACL 凭据
+// ------------------------------------------------------------------ ACL credentials
 
-/// broker 侧所有鉴权失败都收敛成 NO_PERMISSION(16)。
+/// Every auth failure on the broker side collapses into NO_PERMISSION(16).
 const NO_PERMISSION: i32 = 16;
 
-/// 可选的 ACL 凭据：命令行后两个参数都非空才算「带凭据」。
+/// Optional ACL credentials: "with credentials" only when both trailing CLI arguments are non-empty.
 ///
-/// 空的时候 [`Creds::hook`] 恒回 `None`，各客户端拿到 `None` 就是不装钩子 ——
-/// 与普通集群（没开 `authenticationEnabled`）上的行为逐字节一致，harness 照常跑。
+/// When empty, [`Creds::hook`] always returns `None`, and a client handed `None` installs no hook --
+/// byte-identical to behaviour on a plain cluster (no `authenticationEnabled`), so the harness runs as usual.
 #[derive(Clone)]
 struct Creds {
     access_key: String,
@@ -140,7 +141,7 @@ impl Creds {
         !self.access_key.is_empty() && !self.secret_key.is_empty()
     }
 
-    /// 装到每个客户端上的签名钩子；不带凭据时是 `None`。
+    /// The signing hook installed on each client; `None` when no credentials are given.
     fn hook(&self) -> Option<Arc<dyn RPCHook>> {
         if self.enabled() {
             Some(Arc::new(AclClientRPCHook::new(SessionCredentials::new(
@@ -153,7 +154,7 @@ impl Creds {
     }
 }
 
-/// 拒绝类断言：必须是 broker 回的 NO_PERMISSION，而不是连不上 / 超时。
+/// Rejection assertion: must be a broker-returned NO_PERMISSION, not a connect failure / timeout.
 fn denied(err: &Error) -> bool {
     err.response_code() == Some(NO_PERMISSION)
 }
@@ -165,56 +166,56 @@ fn code_of(err: &Error) -> String {
     }
 }
 
-/// 反向对照：**不带凭据**的消费者起不来或被 broker 拒掉，必须报 16。
+/// Reverse control: a consumer **without credentials** must fail to start or be rejected by the broker with code 16.
 ///
-/// 没有这条，「带凭据全绿」在鉴权其实没开起来的集群上，与「签名被 accepted」长得
-/// 一模一样，是一次假通过。它必须抢在本示例任何客户端**之前**跑：这个端口按 clientId
-/// 在进程内共享 [`MQClientInstance`]，钩子注册在实例的 remoting 通道上，探针若与
-/// 后面的签名客户端共用通道，就会被顺手签掉，「被拒」当场消失。
+/// Without it, "all green with credentials" on a cluster where auth was never enabled looks exactly
+/// like "the signature was accepted" -- a false pass. It must run **before** any other client in this
+/// example: this port shares one [`MQClientInstance`] per clientId in-process and the hook lives on
+/// the instance's remoting channel, so a probe sharing the signed clients' channel gets signed along and the rejection disappears.
 async fn anon_probe(namesrv: &str, run: &str, ck: &mut Checker) {
-    println!("-- 反向对照：不带凭据的注册/拉取必须被 broker 拒绝（NO_PERMISSION=16）");
+    println!("-- reverse control: register/pull without credentials must be rejected by the broker (NO_PERMISSION=16)");
     let group = format!("rust-live-consumer-anon-{run}");
     let anon = match DefaultMQProducer::with_rpc_hook(&group, None) {
         Ok(p) => p,
         Err(e) => {
-            ck.abort("探针构造", &format!("{e}"));
+            ck.abort("probe build", &format!("{e}"));
             return;
         }
     };
     anon.set_namesrv_addr(namesrv);
-    // 独立 instanceName ⇒ 独立 clientId ⇒ 独立通道：钩子拦不到别人身上。
+    // Independent instanceName ⇒ independent clientId ⇒ independent channel: the hook cannot intercept anyone else.
     anon.set_instance_name(&format!("live-anon-{run}"));
     if let Err(e) = anon.start().await {
         ck.check(
-            "探针无凭据 start 被拒",
+            "probe start without credentials is rejected",
             denied(&e),
             &format!("{} {e}", code_of(&e)),
         );
         return;
     }
-    // 探针发一个只属于本次运行的新 topic：靠 autoCreateTopicEnable 的路由兜底走到 broker，
-    // 在 broker 的鉴权闸上被拦下 —— 这才是「请求原样发出去了」的证据。
+    // The probe sends a new topic unique to this run: routing falls back via autoCreateTopicEnable and
+    // reaches the broker, where the auth gate blocks it -- that is the proof the request went out unchanged.
     let probe_topic = format!("RustLiveConsumerAnon{run}");
     let mut m = Message::new(&probe_topic, Some(b"should-not-be-accepted"));
     match anon.send(&mut m, Some(5000), None).await {
         Ok(r) => ck.check(
-            "探针无凭据发送被 broker 拒绝",
+            "probe send without credentials is rejected by the broker",
             false,
-            &format!("broker 竟然收了匿名请求：{r:?}（多半是 authenticationEnabled 没开）"),
+            &format!("the broker actually accepted an anonymous request: {r:?} (most likely authenticationEnabled is off)"),
         ),
         Err(e) => ck.check(
-            "探针无凭据发送被 broker 拒绝",
+            "probe send without credentials is rejected by the broker",
             denied(&e),
             &format!("{} {e}", code_of(&e)),
         ),
     }
     anon.shutdown();
     drop(anon);
-    // 等它的实例彻底释放，再让签名客户端建自己的通道。
+    // Wait for its instance to be fully released before the signed clients build their own channels.
     tokio::time::sleep(Duration::from_secs(1)).await;
 }
 
-/// 轮询到条件成立或超时（真机的一切都是异步到位的，不能 sleep 一个固定值赌）。
+/// Poll until the condition holds or time runs out (everything on a live broker lands asynchronously; never bet on a fixed sleep).
 async fn poll_until(mut pred: impl FnMut() -> bool, secs: u64) -> bool {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
@@ -228,8 +229,8 @@ async fn poll_until(mut pred: impl FnMut() -> bool, secs: u64) -> bool {
     }
 }
 
-/// 本实例收到过多少次 broker 的 `NOTIFY_CONSUMER_IDS_CHANGED(40)`；实例已被回收
-/// 时返回 0（40 是 broker 推给长连接的，本端只能靠计数证明它落地了）。
+/// How many times this instance received the broker's `NOTIFY_CONSUMER_IDS_CHANGED(40)`; once the
+/// instance has been reclaimed it returns 0 (40 is pushed by the broker over the long connection, so counting is the only way to prove it landed).
 fn ids_changed_count(client_id: &str) -> usize {
     MQClientInstance::find_instance(client_id)
         .map(|i| i.consumer_ids_changed_count())
@@ -243,9 +244,9 @@ fn main_queues(keys: &[String]) -> Vec<String> {
         .collect()
 }
 
-// ------------------------------------------------------ 投递记录与 listener
+// ------------------------------------------------------ delivery records and listener
 
-/// 一条投递到 listener 的消息的观测值（全部取自 broker 真实写回的字段）。
+/// Observed values of one message delivered to the listener (all taken from fields the broker actually wrote back).
 #[derive(Debug, Clone)]
 struct Delivered {
     body: String,
@@ -255,7 +256,7 @@ struct Delivered {
     queue_offset: i64,
     reconsume_times: i32,
     msg_id: String,
-    /// 生产者 `SendResult.msgId` 就是这个客户端唯一 ID；`msg_id` 不是它。
+    /// The producer's `SendResult.msgId` is this client-side unique ID; `msg_id` is not it.
     uniq_key: String,
     offset_msg_id: String,
     retry_topic_prop: Option<String>,
@@ -285,7 +286,7 @@ impl Delivered {
     }
 }
 
-/// listener 侧的收集器。
+/// Collector on the listener side.
 #[derive(Default)]
 struct Inbox {
     items: Mutex<Vec<Delivered>>,
@@ -313,20 +314,20 @@ impl Inbox {
     }
 }
 
-/// 并发 listener：记录投递，可选「指定 body 第一次到达时判失败」、可选拖慢每批。
+/// Concurrent listener: records deliveries, optionally fails the first arrival of a given body, optionally slows each batch.
 struct LiveListener {
     inbox: Arc<Inbox>,
-    /// 命中该 body 的**第一次**投递返回 RECONSUME_LATER（C4 重投验证）。
+    /// The **first** delivery matching this body returns RECONSUME_LATER (C4 redelivery check).
     fail_once: Option<String>,
-    /// true 时每次命中都判失败（C4b 要把重试次数耗尽到死信）。
+    /// When true, every match fails (C4b needs retries exhausted down to the dead letter).
     fail_always: bool,
-    /// 每批固定耗时（C9 用来制造待消费积压以触发流控）。
+    /// Fixed cost per batch (C9 uses it to build a backlog that triggers flow control).
     batch_cost: Duration,
     suspend_body: Option<String>,
     orderly: Arc<OrderlyState>,
 }
 
-/// 顺序消费的违序计数器（listener 内自持，便于外部读取）。
+/// Out-of-order counter for orderly consumption (kept inside the listener for easy external reads).
 #[derive(Default)]
 struct OrderlyState {
     last_offset: Mutex<BTreeMap<i32, i64>>,
@@ -356,7 +357,7 @@ impl LiveListener {
         })
     }
 
-    /// 命中该 body 的**每一次**投递都判失败：用来把重试次数跑到上限。
+    /// **Every** delivery matching this body fails: used to drive retries to the cap.
     fn failing_always(inbox: Arc<Inbox>, body: &str) -> Arc<LiveListener> {
         Arc::new(LiveListener {
             inbox,
@@ -379,7 +380,7 @@ impl LiveListener {
         })
     }
 
-    /// 命中该 body 的**每一次**顺序投递都挂起当前队列（C12 的毒消息）。
+    /// **Every** orderly delivery matching this body suspends the current queue (C12's poison message).
     fn orderly_suspending_always(inbox: Arc<Inbox>, body: &str) -> Arc<LiveListener> {
         Arc::new(LiveListener {
             inbox,
@@ -419,7 +420,7 @@ impl LiveListener {
         out_of_order == 0
     }
 
-    /// 指定 body 是否第一次出现（出现即记失败一次的依据）。
+    /// Whether the given body has been seen at most once (the basis for failing it exactly once).
     fn is_first_seen(&self, body: &str) -> bool {
         lock(&self.inbox.items)
             .iter()
@@ -468,22 +469,22 @@ fn is_body(msg: &MessageExt, want: &str) -> bool {
     String::from_utf8_lossy(msg.get_body()) == want
 }
 
-// ------------------------------------------------------------------ 夹具
+// ------------------------------------------------------------------ fixture
 
 struct Fixture {
     namesrv: String,
     stamp: String,
-    /// ACL 凭据：非空时本夹具起出来的每个客户端都装签名钩子，空时一个都不装。
+    /// ACL credentials: when non-empty every client this fixture starts gets the signing hook; when empty none do.
     creds: Creds,
     producer_group: String,
     producer: DefaultMQProducer,
-    /// 本例子自建的「运维」实例：建/删 topic、读 broker 位点与存量。
+    /// The dedicated "ops" instance built by this example: create/delete topics, read broker offsets and backlog.
     admin: MQClientInstance,
     broker_name: String,
     broker_addr: String,
-    /// 本次建过的 topic，C10 统一删掉。
+    /// Topics created during this run; C10 deletes them all.
     topics: Mutex<Vec<String>>,
-    /// 广播模式写到 $HOME 下的位点目录，C10 统一删掉。
+    /// Broadcasting writes offset dirs under $HOME; C10 removes them all.
     offset_dirs: Mutex<Vec<PathBuf>>,
 }
 
@@ -493,8 +494,8 @@ impl Fixture {
         let mut producer = DefaultMQProducer::new(&producer_group)
             .map_err(|e| format!("producer build failed: {e}"))?;
         producer.set_namesrv_addr(namesrv);
-        // 钩子在 start() 里注册到实例的 remoting 通道上：本夹具的生产者、admin 实例、
-        // 每个消费者都各走一次，不带凭据时这里是 None（＝不装钩子）。
+        // The hook is registered onto the instance's remoting channel inside start(): this fixture's producer,
+        // admin instance, and every consumer each pass through it once; with no credentials this is None (= no hook).
         producer.set_rpc_hook(creds.hook());
         let _ = &mut producer;
         let admin_id = format!("rust-live-consumer-admin-{stamp}");
@@ -525,7 +526,7 @@ impl Fixture {
             .start()
             .await
             .map_err(|e| format!("producer start failed: {e}"))?;
-        // 用 TBW102 的路由找一台可建 topic 的 broker（与 live_protocol.rs 同一做法）
+        // Use the TBW102 route to find a broker that can host topics (same approach as live_protocol.rs)
         let route = self
             .admin
             .get_topic_route_data(MixAll::DEFAULT_TOPIC)
@@ -537,7 +538,7 @@ impl Fixture {
         Ok(())
     }
 
-    /// 显式建 topic（不靠 `autoCreateTopicEnable`，这样队列数确定，C8 才能分摊）。
+    /// Create the topic explicitly (not via `autoCreateTopicEnable`, so the queue count is deterministic and C8 can split it).
     async fn create_topic(&self, topic: &str, queues: i32) -> Result<(), String> {
         self.admin
             .create_topic_in_broker(
@@ -578,7 +579,7 @@ impl Fixture {
         }
     }
 
-    /// 起一个已订阅、已设并发 listener 的消费者（广播位点目录顺手登记待清理）。
+    /// Start a consumer that is subscribed and has a concurrent listener set (also registers the broadcast offset dir for cleanup).
     fn consumer(
         &self,
         group: &str,
@@ -594,14 +595,14 @@ impl Fixture {
         Ok(consumer)
     }
 
-    /// 只按组名建消费者（未订阅、未设 listener），C1 的校验分支要用。
+    /// Build a consumer from the group name only (no subscription, no listener); used by C1's validation branches.
     fn plain_consumer(&self, group: &str) -> Result<DefaultMQPushConsumer, String> {
         let cfg = self.base_config(group);
         self.push(cfg)
     }
 
-    /// 建 push 消费者并装上钩子：本示例所有消费者都从这儿出来，
-    /// 免得上鉴权集群时漏掉某一个客户端。
+    /// Build a push consumer and install the hook: every consumer in this example comes from here,
+    /// so none is missed when running against an auth-enabled cluster.
     fn push(&self, cfg: ConsumerConfig) -> Result<DefaultMQPushConsumer, String> {
         let consumer =
             DefaultMQPushConsumer::with_config(cfg).map_err(|e| format!("build failed: {e}"))?;
@@ -609,7 +610,7 @@ impl Fixture {
         Ok(consumer)
     }
 
-    /// 建 lite pull 消费者并装上钩子。
+    /// Build a lite pull consumer and install the hook.
     fn lite(&self, cfg: LitePullConsumerConfig) -> Result<DefaultLitePullConsumer, String> {
         let consumer = DefaultLitePullConsumer::with_config(cfg)
             .map_err(|e| format!("build lite pull failed: {e}"))?;
@@ -617,14 +618,14 @@ impl Fixture {
         Ok(consumer)
     }
 
-    /// 建独立 admin 并装上钩子（admin 的 RPC 也要签名：307 转发、查位点、建 topic）。
+    /// Build a standalone admin and install the hook (the admin's RPCs must be signed too: 307 forwarding, offset queries, topic creation).
     fn admin_ext(&self, cfg: AdminConfig) -> DefaultMQAdminExt {
         let admin = DefaultMQAdminExt::with_config(cfg);
         admin.set_rpc_hook(self.creds.hook());
         admin
     }
 
-    /// 发到指定 topic（可钉队列）。SendResult 的 status 必须是 SEND_OK。
+    /// Send to the given topic (optionally pinned to a queue). SendResult's status must be SEND_OK.
     async fn produce(&self, topic: &str, tag: &str, n: usize, queue: Option<i32>) -> Vec<(String, i32, i64)> {
         let mut out = Vec::new();
         for i in 0..n {
@@ -658,7 +659,7 @@ impl Fixture {
             .collect()
     }
 
-    /// 该 topic 全部队列的 maxOffset 之和 == broker 侧真实存量。
+    /// Sum of maxOffset over all queues of the topic == the broker's real backlog.
     async fn broker_total(&self, topic: &str, nums: i32) -> i64 {
         let mut total = 0;
         for mq in self.queues(topic, nums) {
@@ -674,7 +675,7 @@ impl Fixture {
         total
     }
 
-    /// 读 broker 上该组对该 topic 的已提交位点之和（`QUERY_CONSUMER_OFFSET`）。
+    /// Sum of the offsets this group committed on the broker for the topic (`QUERY_CONSUMER_OFFSET`).
     async fn committed_total(&self, group: &str, topic: &str, nums: i32) -> i64 {
         let mut total = 0;
         for mq in self.queues(topic, nums) {
@@ -691,7 +692,7 @@ impl Fixture {
         total
     }
 
-    /// 等位点刷到 broker（5s 周期，最长 PERSIST_SECONDS）。
+    /// Wait for offsets to be flushed to the broker (5s cycle, at most PERSIST_SECONDS).
     async fn wait_committed(&self, group: &str, topic: &str, nums: i32, want: i64) -> i64 {
         let deadline = Instant::now() + Duration::from_secs(PERSIST_SECONDS);
         loop {
@@ -703,7 +704,7 @@ impl Fixture {
         }
     }
 
-    /// broker 侧该组的消费者列表（经共享实例查，重平衡的输入就是它）。
+    /// The broker-side consumer list of the group (queried through the shared instance; it is the rebalance input).
     async fn consumer_ids(&self, client_id: &str, topic: &str, group: &str) -> Vec<String> {
         match MQClientInstance::find_instance(client_id) {
             Some(instance) => instance
@@ -738,8 +739,8 @@ fn broker_of(route: &TopicRouteData) -> Result<(String, String), String> {
     Ok((bd.broker_name.clone(), addr))
 }
 
-/// 把 runningInfo 的队列表（mqTable / mqPopTable）摊平成
-/// `topic+broker+queueId -> ProcessQueueInfo JSON`。
+/// Flatten the runningInfo queue tables (mqTable / mqPopTable) into
+/// `topic+broker+queueId -> ProcessQueueInfo JSON`.
 fn table_of(entries: &[(MessageQueueKey, JsonValue)]) -> BTreeMap<String, JsonValue> {
     entries
         .iter()
@@ -763,7 +764,7 @@ fn table_sum(table: &BTreeMap<String, JsonValue>, field: &str) -> i64 {
         .sum()
 }
 
-/// 运行信息里业务那一路的拉取时钟距今多少毫秒（没有记录时 `None`，调用方直接判失败）。
+/// Age in milliseconds of the business queue's pull clock in the running info (`None` when nothing recorded; the caller treats that as failure).
 fn pull_clock_age_ms(info: &ConsumerRunningInfo) -> Option<i64> {
     let table = running_table(info);
     let stamp = table
@@ -777,10 +778,10 @@ fn pull_clock_age_ms(info: &ConsumerRunningInfo) -> Option<i64> {
     Some(now_ms() - stamp)
 }
 
-// --------------------------------------------------------------- C1 启动校验
+// --------------------------------------------------------------- C1 lifecycle checks
 
 async fn c1_lifecycle(ck: &mut Checker, fx: &Fixture) {
-    println!("-- C1 构造与 start()/shutdown() 校验");
+    println!("-- C1 construction and start()/shutdown() checks");
 
     for group in ["", "   "] {
         ck.check(
@@ -842,7 +843,7 @@ async fn c1_lifecycle(ck: &mut Checker, fx: &Fixture) {
         "is_started() was true",
     );
 
-    // 正常起：首轮心跳 + 首轮重平衡都在 start() 返回前完成
+    // Normal start: the first heartbeat + the first rebalance both complete before start() returns
     let inbox = Arc::new(Inbox::default());
     c.set_message_listener_concurrently(LiveListener::collecting(inbox.clone()));
     if let Err(e) = c.start().await {
@@ -941,10 +942,10 @@ async fn c1_lifecycle(ck: &mut Checker, fx: &Fixture) {
     );
 }
 
-// --------------------------------------------------- C2 长轮询消费 + 位点持久化
+// --------------------------------------------------- C2 long-poll consumption + offset persistence
 
 async fn c2_pull_consume_and_offset_persist(ck: &mut Checker, fx: &Fixture) {
-    println!("-- C2 长轮询消费 24 条 + 位点刷到 broker");
+    println!("-- C2 long-poll consumption of 24 messages + offsets flushed to the broker");
     let topic = fx.topic_name("Pull");
     let group = fx.group_name("pull");
     if let Err(e) = fx.create_topic(&topic, QUEUE_NUMS).await {
@@ -1089,10 +1090,10 @@ async fn c2_pull_consume_and_offset_persist(ck: &mut Checker, fx: &Fixture) {
     c.shutdown();
 }
 
-// ------------------------------------------------------------- C3 表达式过滤
+// ------------------------------------------------------------- C3 expression filtering
 
 async fn c3_tag_filter(ck: &mut Checker, fx: &Fixture) {
-    println!("-- C3 只消费订阅的 tag");
+    println!("-- C3 consume only the subscribed tag");
     let topic = fx.topic_name("Tag");
     let group = fx.group_name("tag");
     if let Err(e) = fx.create_topic(&topic, QUEUE_NUMS).await {
@@ -1110,7 +1111,7 @@ async fn c3_tag_filter(ck: &mut Checker, fx: &Fixture) {
     let _ = fx.produce(&topic, "TagB", 10, None).await;
 
     let settled = poll_until(|| inbox.count() >= 10, WAIT_SECONDS).await;
-    // 再等一会儿，确认没有「多余」的 TagB 漏进来
+    // Wait a bit longer to confirm no extra TagB leaks in
     tokio::time::sleep(Duration::from_secs(3)).await;
     let got = inbox.snapshot();
     ck.check(
@@ -1133,10 +1134,10 @@ async fn c3_tag_filter(ck: &mut Checker, fx: &Fixture) {
     c.shutdown();
 }
 
-// --------------------------------------------------------- C4 失败重投与还原
+// --------------------------------------------------------- C4 failed redelivery and topic reset
 
 async fn c4_retry_and_topic_reset(ck: &mut Checker, fx: &Fixture) {
-    println!("-- C4 RECONSUME_LATER → broker 重投 + %RETRY% topic 还原");
+    println!("-- C4 RECONSUME_LATER → broker redelivery + %RETRY% topic reset");
     let topic = fx.topic_name("Retry");
     let group = fx.group_name("retry");
     if let Err(e) = fx.create_topic(&topic, 1).await {
@@ -1189,7 +1190,7 @@ async fn c4_retry_and_topic_reset(ck: &mut Checker, fx: &Fixture) {
             &format!("first={first:?} second={second:?}"),
         );
     }
-    // 判成功的那两条不该被重投
+    // The two messages judged successful must not be redelivered
     let distinct = inbox.bodies().len();
     ck.check(
         "C4 only the failed message is redelivered; the succeeded ones are not",
@@ -1205,14 +1206,14 @@ async fn c4_retry_and_topic_reset(ck: &mut Checker, fx: &Fixture) {
     c.shutdown();
 }
 
-// ------------------------------- C4c 部分 ack（ConsumeConcurrentlyContext.ackIndex）
+// ------------------------------- C4c partial ack (ConsumeConcurrentlyContext.ackIndex)
 
-/// 只在**首批**把 ackIndex 收窄的并发 listener。
+/// Concurrent listener that narrows ackIndex on the **first batch** only.
 ///
-/// 后续批次必须整批认可，否则尾巴会永远回投不完，收敛不了。
+/// Later batches must accept the whole batch, otherwise the tail never finishes redelivering and never converges.
 struct PartialAckListener {
     inbox: Arc<Inbox>,
-    /// 首批要 ack 到的下标（含自身）；`None` = 完全不碰 ackIndex（对照腿）。
+    /// Index to ack up to in the first batch (inclusive); `None` = leave ackIndex untouched (control leg).
     ack_index_first_batch: Option<i32>,
     first_batch: Mutex<Vec<String>>,
 }
@@ -1244,23 +1245,24 @@ impl MessageListenerConcurrently for PartialAckListener {
     }
 }
 
-/// `ackIndex` 的部分 ack：为什么只能真机验。
+/// Partial ack via `ackIndex`: why it can only be verified against a live broker.
 ///
-/// 离线单测（`consumer.rs` 的 `mod tests`）能锁住「尾巴回投**失败**时位点不越过它」，
-/// 但回投**成功**时的语义 —— 未认可的条目真的被 broker 收下并重新投递、已 ack 的那条
-/// 整个窗口只投一次、业务队列位点仍然整批前进 —— 只有真 broker 说得了算得了。
-/// 写错的两种形态在离线都看不出差别：忘记回投（尾巴静默丢失，收到的条数照样对）、
-/// 或者把已 ack 的前缀也回投（消息重复投递，看起来"没丢"）。
-/// 造一个「一批 3 条 + 可选收窄 ackIndex」的 push consumer。
+/// Offline unit tests (the `mod tests` in `consumer.rs`) can pin down "the offset never passes the tail when
+/// the tail's send-back **fails**", but the semantics when the send-back **succeeds** -- the unacked entries really
+/// are taken by the broker and redelivered, the acked entry is delivered exactly once across the whole window,
+/// and the business queue offset still advances past the whole batch -- only a real broker can rule on that.
+/// Both wrong shapes look identical offline: forgetting the send-back (the tail is silently lost, the received count is still right),
+/// or sending back the acked prefix too (duplicate deliveries that look like "nothing was lost").
+/// Builds a push consumer with "one batch of 3 + optionally narrowed ackIndex".
 fn partial_ack_consumer(
     fx: &Fixture,
     topic: &str,
     group: &str,
     listener: Arc<PartialAckListener>,
 ) -> Result<DefaultMQPushConsumer, String> {
-    // consumeMessageBatchMaxSize 默认 1，不收窄到 3 就根本没有「部分」可言。
-    // 用例是「先把 3 条放上去、再起消费者」，所以新组必须从 FIRST_OFFSET 起消：
-    // LAST_OFFSET 下新组会从分配时刻的最新位点开始，先发的那 3 条会被直接跳过。
+    // consumeMessageBatchMaxSize defaults to 1; without narrowing to 3 there is no "partial" at all.
+    // The scenario sends the 3 messages first and starts the consumer after, so the new group must consume from FIRST_OFFSET:
+    // with LAST_OFFSET a new group starts at the latest offset at assignment time and the 3 pre-sent messages are skipped outright.
     let cfg = ConsumerConfig {
         consume_message_batch_max_size: 3,
         consume_from_where: ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET.to_string(),
@@ -1274,7 +1276,7 @@ fn partial_ack_consumer(
 }
 
 async fn c4c_partial_ack(ck: &mut Checker, fx: &Fixture) {
-    println!("-- C4c CONSUME_SUCCESS + ackIndex 部分 ack → 尾巴经 %RETRY% 重投");
+    println!("-- C4c CONSUME_SUCCESS + ackIndex partial ack → tail redelivered via %RETRY%");
     let topic = fx.topic_name("PartialAck");
     let group = fx.group_name("partial-ack");
     let control_group = fx.group_name("full-ack-control");
@@ -1301,8 +1303,8 @@ async fn c4c_partial_ack(ck: &mut Checker, fx: &Fixture) {
         }
     }
     let (c, control) = (pairs.remove(0), pairs.remove(0));
-    // 先发再起消费者：批次怎么切由拉取时机决定，队列里已经躺着 3 条时第一次拉取才会
-    // 正好是「一整批 3 条」，否则首批可能是 1~2 条，ackIndex=0 划出的前缀/后缀就不确定了。
+    // Produce first, start the consumer after: how the batch is cut depends on pull timing, and only when
+    // 3 messages already sit in the queue is the first pull exactly "one full batch of 3"; otherwise the first batch may be 1-2 messages and the prefix/suffix carved by ackIndex=0 is undefined.
     fx.produce(&topic, "TagA", 3, None).await;
     if let Err(e) = c.start().await {
         return ck.abort("C4c start", &format!("{e}"));
@@ -1311,7 +1313,7 @@ async fn c4c_partial_ack(ck: &mut Checker, fx: &Fixture) {
         return ck.abort("C4c control start", &format!("{e}"));
     }
 
-    // 首批必须正好 3 条，否则 ackIndex=0 划出来的「前缀/后缀」根本不确定
+    // The first batch must be exactly 3 messages, otherwise the prefix/suffix carved by ackIndex=0 is undefined
     let first = poll_until(|| !lock(&listener.first_batch).is_empty(), WAIT_SECONDS).await;
     let first_batch = lock(&listener.first_batch).clone();
     ck.check(
@@ -1358,7 +1360,7 @@ async fn c4c_partial_ack(ck: &mut Checker, fx: &Fixture) {
         committed == 3,
         &format!("committed={committed}"),
     );
-    // 对照腿：不碰 ackIndex ⇒ 一条都不该回投
+    // Control leg: ackIndex untouched ⇒ nothing may be sent back
     let control_seen = poll_until(|| control_inbox.count() >= 3, WAIT_SECONDS).await;
     let control_deliveries = control_inbox.snapshot();
     ck.check(
@@ -1385,13 +1387,13 @@ async fn c4c_partial_ack(ck: &mut Checker, fx: &Fixture) {
     control.shutdown();
 }
 
-// --------------------------------------------- C4b 重试耗尽 → %DLQ% 终态
+// --------------------------------------------- C4b retries exhausted → %DLQ% terminal state
 
-/// `%DLQ%<group>` 现场取证：等 broker 把死信 topic 建出来并注册进路由，再用**独立消费组
-/// + `seek_to_begin`** 把已有的死信读出来（新组从队尾开始会把那条死信直接跳过 ⇒ 假失败）。
+/// `%DLQ%<group>` forensics: wait for the broker to create the dead-letter topic and register it in routing, then read
+/// the existing dead letters with an **independent consumer group + `seek_to_begin`** (a new group starting at the queue tail would skip that dead letter outright ⇒ false failure).
 ///
-/// 返回 `(是否有路由, 死信消息)`：负向用例里「broker 压根没建死信 topic」本身就是正确
-/// 结论，不能和「等不到路由」混成同一个空结果。
+/// Returns `(has route, dead letters)`: in the negative case "the broker never created the DLQ topic" is itself the
+/// correct conclusion, so it must not be merged into the same empty result as "route never showed up".
 async fn read_dlq(fx: &Fixture, group: &str, reader_kind: &str, wait_secs: u64) -> Result<(bool, Vec<Delivered>), String> {
     let dlq_topic = MixAll::get_dlq_topic(group);
     let mut route = None;
@@ -1408,8 +1410,8 @@ async fn read_dlq(fx: &Fixture, group: &str, reader_kind: &str, wait_secs: u64) 
     let Some(r) = route else {
         return Ok((false, Vec::new()));
     };
-    // 队列数取 broker 建出来的那份路由（`DLQ_NUMS_PER_GROUP` 在 5.5.1 是 1，
-    // 但这是 broker 侧常量，别在测试里复述它）
+    // Queue count comes from the route the broker actually created (`DLQ_NUMS_PER_GROUP` is 1 in 5.5.1,
+    // but that is a broker-side constant; do not restate it in the test)
     let nums = r
         .queue_datas
         .iter()
@@ -1425,7 +1427,7 @@ async fn read_dlq(fx: &Fixture, group: &str, reader_kind: &str, wait_secs: u64) 
         ..Default::default()
     })
     .map_err(|e| format!("build lite pull failed: {e}"))?;
-    // assign 必须在 start 之前：start 之后那次 rebalance 只认订阅，会把分配算空
+    // assign must happen before start: the rebalance right after start only honors subscriptions and would compute an empty assignment
     lite.assign(&mqs);
     lite.start()
         .await
@@ -1436,10 +1438,10 @@ async fn read_dlq(fx: &Fixture, group: &str, reader_kind: &str, wait_secs: u64) 
             .map_err(|e| format!("seek_to_begin failed: {e}"))?;
     }
     let mut msgs: Vec<Delivered> = Vec::new();
-    // seek_to_begin 必须在 start 之后（未 start 会报错），它把拉取游标拨回最小位点；
-    // 若拉取循环抢先把同一格拉进了本地缓冲，seek 只丢「offset 之前」的副本，同一个消息
-    // 会以同一 (queue_id, queue_offset) 交付两次。按存储位置去重：真有一式两份入死信，
-    // 副本落在不同的 queue_offset 上，不会被吃掉。
+    // seek_to_begin must run after start (it errors otherwise) and rewinds the pull cursor to the minimum offset;
+    // if the pull loop has already buffered the same batch locally, seek only drops copies "before the offset",
+    // so the same message is delivered twice with the same (queue_id, queue_offset). Dedup by storage position:
+    // if the message truly entered the DLQ twice, the copies sit at different queue_offsets and are not eaten.
     let mut seen_at: BTreeSet<(i32, i64)> = BTreeSet::new();
     let deadline = Instant::now() + Duration::from_secs(wait_secs);
     while Instant::now() < deadline {
@@ -1452,8 +1454,8 @@ async fn read_dlq(fx: &Fixture, group: &str, reader_kind: &str, wait_secs: u64) 
         if msgs.is_empty() {
             continue;
         }
-        // 收到后再排空几趟：断言「死信里只有这一条」要求把后面的也看见，
-        // 但总窗口必须有界，否则正向用例每次都要白等满 wait_secs。
+        // After the first arrival, drain a few more rounds: the assertion "the DLQ holds only this one" requires
+        // seeing what comes after, but the total window must stay bounded or every positive case waits out wait_secs for nothing.
         let drain_to = Instant::now() + Duration::from_secs(3);
         while Instant::now() < drain_to {
             for m in lite.poll(Some(500)).await {
@@ -1469,15 +1471,15 @@ async fn read_dlq(fx: &Fixture, group: &str, reader_kind: &str, wait_secs: u64) 
     Ok((true, msgs))
 }
 
-/// 死信终态：为什么只能真机验。
+/// Dead-letter terminal state: why it can only be verified against a live broker.
 ///
 ///
-/// 这里用 `maxReconsumeTimes=2` 把终态压到几十秒内，逐条钉住：
-/// 投递恰为 3 次（reconsumeTimes 0/1/2）、第 3 次回投后原组不再有第 4 次、
-/// 死信 topic 由 broker 自动建并注册路由、`%DLQ%` 里那条的 reconsumeTimes=3、
-/// `RETRY_TOPIC` 仍是业务原始 topic、且只有 1 条。
+/// `maxReconsumeTimes=2` compresses the terminal state into a few tens of seconds and pins each item:
+/// exactly 3 deliveries (reconsumeTimes 0/1/2), no 4th delivery to the original group after the 3rd send-back,
+/// the DLQ topic auto-created by the broker and registered in routing, the `%DLQ%` copy's reconsumeTimes=3,
+/// `RETRY_TOPIC` still the original business topic, and exactly 1 message.
 async fn c4b_dlq_terminal(ck: &mut Checker, fx: &Fixture) {
-    println!("-- C4b maxReconsumeTimes 用尽 → %DLQ%<group> 终态");
+    println!("-- C4b maxReconsumeTimes exhausted → %DLQ%<group> terminal state");
     const MAX_RECONSUME: i32 = 2;
     let topic = fx.topic_name("Dlq");
     let group = fx.group_name("dlq");
@@ -1500,67 +1502,67 @@ async fn c4b_dlq_terminal(ck: &mut Checker, fx: &Fixture) {
         return ck.abort("C4b start", &format!("{e}"));
     }
     let sent = fx.produce(&topic, "TagA", 1, None).await;
-    // 回投档位 = 3 + reconsumeTimes ⇒ level3(10s) + level4(30s)，再加投递余量。
-    // 150s 而不是 100s：整机并发跑其它套件时 broker 的定时服务会拖档，实测第三次
-    // 投递能晚到 60s+，卡 100s 是假失败。
+    // Send-back delay level = 3 + reconsumeTimes ⇒ level3(10s) + level4(30s), plus delivery margin.
+    // 150s instead of 100s: when other suites run concurrently on the same machine the broker's timer service slips;
+    // the 3rd delivery was observed arriving 60s+ late, and a hard 100s cap is a false failure.
     let arrived = poll_until(|| inbox.matching(&victim).len() >= 3, 150).await;
     let seen = inbox.matching(&victim);
     let times: Vec<i32> = seen.iter().map(|d| d.reconsume_times).collect();
     ck.check(
-        "C4b maxReconsumeTimes=2 ⇒ 投递 3 次，reconsumeTimes 依次是 0/1/2",
+        "C4b maxReconsumeTimes=2 ⇒ exactly 3 deliveries, reconsumeTimes 0/1/2 in order",
         arrived && times.starts_with(&[0, 1, 2]),
         &format!("times={times:?}"),
     );
-    // 反证：死信之后原组不会再收到第 4 次投递（`>=` 写成 `>` 会在这里露馅）
+    // Counter-proof: after the DLQ the original group gets no 4th delivery (writing `>` instead of `>=` would show here)
     tokio::time::sleep(Duration::from_secs(15)).await;
     let final_times: Vec<i32> = inbox.matching(&victim).iter().map(|d| d.reconsume_times).collect();
     ck.check(
-        "C4b 用尽之后不再投递（观察窗口内只有 3 次）",
+        "C4b no delivery after exhaustion (only 3 within the observation window)",
         final_times.len() == 3,
         &format!("deliveries={} times={final_times:?}", final_times.len()),
     );
     c.shutdown();
 
-    // %DLQ%<group> 由 broker 在转死信那一刻才建出来并注册到 namesrv
+    // %DLQ%<group> is created by the broker and registered to the name server only at the moment of dead-lettering
     let dlq_topic = MixAll::get_dlq_topic(&group);
     let (has_route, dlq_msgs) = match read_dlq(fx, &group, "dlqread", 30).await {
         Ok(v) => v,
-        Err(e) => return ck.abort("C4b 读 %DLQ%", &e),
+        Err(e) => return ck.abort("C4b read %DLQ%", &e),
     };
     ck.check(
-        "C4b broker 自动创建并注册了 %DLQ%<group> 的路由",
+        "C4b broker auto-created and registered the %DLQ%<group> route",
         has_route,
         &format!("dlq={dlq_topic}"),
     );
     if has_route {
         ck.check(
-            "C4b %DLQ%<group> 只有那一条死信",
+            "C4b %DLQ%<group> holds exactly that one dead letter",
             dlq_msgs.len() == 1 && dlq_msgs[0].body == victim,
             &format!("{dlq_msgs:?}"),
         );
     }
     if let Some(d) = dlq_msgs.first() {
-        // broker 存储时 +1（AbstractSendMessageProcessor:226）⇒ 2 次重投后为 3
+        // the broker adds +1 at storage time (AbstractSendMessageProcessor:226) ⇒ 3 after 2 redeliveries
         ck.check(
-            "C4b 死信消息的 reconsumeTimes = maxReconsumeTimes + 1",
+            "C4b the dead letter's reconsumeTimes = maxReconsumeTimes + 1",
             d.reconsume_times == MAX_RECONSUME + 1,
             &format!("reconsumeTimes={}", d.reconsume_times),
         );
         ck.check(
-            "C4b 死信消息保留 RETRY_TOPIC=业务原始 topic，且 topic 已是 %DLQ%<group>",
+            "C4b the dead letter keeps RETRY_TOPIC=the original business topic, and topic is now %DLQ%<group>",
             d.retry_topic_prop.as_deref() == Some(topic.as_str()) && d.topic == dlq_topic,
             &format!("topic={} retryTopic={:?}", d.topic, d.retry_topic_prop),
         );
-        // 重投过程中 properties 是整份搬过去的 ⇒ 唯一 ID 不会被改写
+        // properties are carried over wholesale during redelivery ⇒ the unique ID is not rewritten
         let origin = sent.first().map(|s| s.0.clone()).unwrap_or_default();
         ck.check(
-            "C4b 死信消息的 UNIQ_KEY 仍是最初那条的 msgId",
+            "C4b the dead letter's UNIQ_KEY is still the original message's msgId",
             !origin.is_empty() && d.uniq_key == origin,
             &format!("sent={origin} dlqUniq={}", d.uniq_key),
         );
     }
     if has_route {
-        // 交给 C10 一起删掉，别在 broker 上留 %DLQ%/%RETRY% 垃圾
+        // Hand to C10 for deletion; do not leave %DLQ%/%RETRY% litter on the broker
         lock(&fx.topics).push(dlq_topic.clone());
         lock(&fx.topics).push(MixAll::get_retry_topic(&group));
     }
@@ -1569,7 +1571,7 @@ async fn c4b_dlq_terminal(ck: &mut Checker, fx: &Fixture) {
 // ------------------------------------------------------------- C5 POP + ack
 
 async fn c5_pop_mode(ck: &mut Checker, fx: &Fixture) {
-    println!("-- C5 POP 模式：弹出带 CK、ack 后不再复活");
+    println!("-- C5 POP mode: popped messages carry CK and do not revive after ack");
     let topic = fx.topic_name("Pop");
     let group = fx.group_name("pop");
     if let Err(e) = fx.create_topic(&topic, 2).await {
@@ -1607,7 +1609,7 @@ async fn c5_pop_mode(ck: &mut Checker, fx: &Fixture) {
         drained,
         &format!("wait_ack_count={}", c.wait_ack_count()),
     );
-    // ack 生效的直接证据：等过一个 invisibleTime 窗口后 broker 没把消息复活重投
+    // Direct evidence the ack worked: after one invisibleTime window the broker did not revive and redeliver the message
     tokio::time::sleep(Duration::from_secs(8)).await;
     let after = inbox.count();
     ck.check(
@@ -1642,14 +1644,14 @@ async fn c5_pop_mode(ck: &mut Checker, fx: &Fixture) {
     c.shutdown();
 }
 
-// ------------------------------------------- C5b POP 路径的拉取统计（307 statusTable）
+// ------------------------------------------- C5b pull stats of the POP path (307 statusTable)
 
-/// ⚠ 采样器每 10s 落一个 minute 点、快照取首尾差分，所以流量必须**持续**跨过两个采样点
-///   （这里 13 轮 × 2s ≈ 26s），否则 `pullTPS` 仍是 0 —— 那是夹具不够长，不是判据错。
-/// ⚠ 读的是 admin 侧的 307（经 broker 转发回本实例），不是进程内自查：序列化与转发那两段
-///   也在这条链路上，本进程读表看不到。
+/// ⚠ The sampler drops a minute point every 10s and the snapshot takes a first-to-last delta, so traffic must
+///   **persistently** span two sample points (here 13 rounds × 2s ≈ 26s), or `pullTPS` stays 0 -- a too-short fixture, not a wrong criterion.
+/// ⚠ Read from the admin side (307 forwarded by the broker back to this instance), not by in-process self-inspection:
+///   serialization and forwarding are on that path too, invisible when the process reads its own table.
 async fn c5b_pop_pull_stats(ck: &mut Checker, fx: &Fixture) {
-    println!("-- C5b POP 循环把 pullRT/pullTPS 写进 307 状态表");
+    println!("-- C5b the POP loop writes pullRT/pullTPS into the 307 status table");
     let topic = fx.topic_name("PopStats");
     let group = fx.group_name("popstats");
     if let Err(e) = fx.create_topic(&topic, 2).await {
@@ -1673,8 +1675,8 @@ async fn c5b_pop_pull_stats(ck: &mut Checker, fx: &Fixture) {
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
     let client_id = c.client_id();
-    // 独立的 admin 实例：307 是「admin → broker → 目标客户端」的转发链，
-    // 用消费者自己的实例查自己等于跳过整条链路。
+    // A separate admin instance: 307 is the "admin → broker → target client" forwarding chain,
+    // and querying yourself with the consumer's own instance skips the entire chain.
     let admin = fx.admin_ext(AdminConfig {
         instance_name: format!("ADMIN-C5B-{}", fx.stamp),
         name_server_addrs: vec![fx.namesrv.clone()],
@@ -1723,14 +1725,14 @@ async fn c5b_pop_pull_stats(ck: &mut Checker, fx: &Fixture) {
         cs.pull_tps > 0.0,
         &format!("pullTPS={}", cs.pull_tps),
     );
-    // 两格各自独立：只有 consumeOKTPS 有值而 pull* 全 0，正是 POP 循环漏记拉取统计的形状。
+    // The two counters are independent: consumeOKTPS non-zero while all pull* are 0 is exactly the shape of a POP loop that fails to record pull stats.
     ck.check(
         "C5b consumeOKTPS is non-zero as well (pull side and consume side report separately)",
         cs.consume_ok_tps > 0.0,
         &format!("consumeOKTPS={}", cs.consume_ok_tps),
     );
-    // 状态表非 0 只说明"计数被调过"；还得确认这背后的流量真被消费掉 —— 否则 pullTPS
-    // 可以靠一直接触到从未 ack 完的消息刷高，看板上好看、实际在打转。
+    // A non-zero status table only proves "the counter was called"; the traffic behind it must also really be
+    // consumed -- otherwise pullTPS can be inflated by repeatedly touching messages that never fully ack: good on the dashboard, going in circles in reality.
     let consumed = poll_until(|| inbox.count() >= sent, 20).await;
     let got = inbox.count();
     ck.check(
@@ -1742,10 +1744,10 @@ async fn c5b_pop_pull_stats(ck: &mut Checker, fx: &Fixture) {
     c.shutdown();
 }
 
-// ------------------------------------------------------- C6 广播 + 本地位点文件
+// ------------------------------------------------------- C6 broadcasting + local offset files
 
 async fn c6_broadcasting_and_local_offsets(ck: &mut Checker, fx: &Fixture) {
-    println!("-- C6 BROADCASTING：各自全量消费 + 位点落本地文件");
+    println!("-- C6 BROADCASTING: each instance consumes everything + offsets land in a local file");
     let topic = fx.topic_name("Bcast");
     let group = fx.group_name("bcast");
     if let Err(e) = fx.create_topic(&topic, 2).await {
@@ -1791,7 +1793,7 @@ async fn c6_broadcasting_and_local_offsets(ck: &mut Checker, fx: &Fixture) {
         &a.message_model(),
     );
 
-    // 同组第二个广播实例必须拿到全量（广播不分摊队列）
+    // A second broadcasting instance of the same group must get everything (broadcasting never splits queues)
     let inbox_b = Arc::new(Inbox::default());
     let client_b = format!("live-bcast-b-{}", fx.stamp);
     let mut cfg_b = cfg_a.clone();
@@ -1825,7 +1827,7 @@ async fn c6_broadcasting_and_local_offsets(ck: &mut Checker, fx: &Fixture) {
         ),
     );
 
-    // 本地位点文件：shutdown 时 save_local_offsets 先写 .tmp 再 rename
+    // Local offset file: on shutdown save_local_offsets writes .tmp first, then renames
     a.shutdown();
     b.shutdown();
     let home = env::var("HOME").unwrap_or_default();
@@ -1893,7 +1895,7 @@ async fn c6_broadcasting_and_local_offsets(ck: &mut Checker, fx: &Fixture) {
     }
 }
 
-/// 从 `{"offsetTable":{{...}:7,{...}:9}}` 抽出位点列表；格式不对返回 `None`。
+/// Extract the offset list from `{"offsetTable":{{...}:7,{...}:9}}`; returns `None` on a malformed format.
 fn canonical_format_offsets(text: &str) -> Option<Vec<i64>> {
     let body = text.strip_prefix("{\"offsetTable\":{")?.strip_suffix("}}")?;
     let mut offs = Vec::new();
@@ -1911,10 +1913,10 @@ fn canonical_format_offsets(text: &str) -> Option<Vec<i64>> {
     Some(offs)
 }
 
-// --------------------------------------------------------------- C7 顺序消费
+// --------------------------------------------------------------- C7 orderly consumption
 
 async fn c7_orderly_and_lock(ck: &mut Checker, fx: &Fixture) {
-    println!("-- C7 Orderly listener：LOCK_BATCH_MQ + 队列内严格递增");
+    println!("-- C7 Orderly listener: LOCK_BATCH_MQ + strictly increasing offsets inside a queue");
     let topic = fx.topic_name("Order");
     let group = fx.group_name("order");
     if let Err(e) = fx.create_topic(&topic, 2).await {
@@ -1935,7 +1937,7 @@ async fn c7_orderly_and_lock(ck: &mut Checker, fx: &Fixture) {
     if let Err(e) = c.start().await {
         return ck.abort("C7 start", &format!("{e}"));
     }
-    // 钉死两个队列各 6 条，这样「队列内递增」才有对照（并发模式不保证顺序）
+    // Pin 6 messages into each of the two queues so "in-queue ordering" has something to check (concurrent mode guarantees no order)
     let _ = fx.produce(&topic, "TagA", 6, Some(0)).await;
     let _ = fx.produce(&topic, "TagA", 6, Some(1)).await;
 
@@ -1953,9 +1955,9 @@ async fn c7_orderly_and_lock(ck: &mut Checker, fx: &Fixture) {
             listener.orderly.violations.load(Ordering::SeqCst)
         ),
     );
-    // 顺序拉取遇到没锁的队列直接跳过（`queue_pull_loop` 查 `lock_ok`），所以上面能
-    // 收满 12 条已经说明锁拿到了；这里再直读一次锁状态。
-    // runningInfo 的 ProcessQueueInfo.locked 四个移植版都不回填，观测点只有锁表。
+    // Orderly pulls skip queues that are not locked (`queue_pull_loop` checks `lock_ok`), so collecting all
+    // 12 above already proves the lock was taken; here the lock state is read directly once more.
+    // ProcessQueueInfo.locked in runningInfo is not backfilled on any port, so the lock table is the only observation point.
     let locked = poll_until(|| main_queues(&c.locked_queue_keys()).len() == 2, 25).await;
     ck.check(
         "C7 the lock loop holds every assigned queue (LOCK_BATCH_MQ accepted by the 5.5.1 broker)",
@@ -1964,9 +1966,9 @@ async fn c7_orderly_and_lock(ck: &mut Checker, fx: &Fixture) {
     );
 
     c.shutdown();
-    // 撤位验证：换一个 clientId 的实例接手同组同 topic。broker 的 RebalanceLockManager
-    // 只在「同一个 clientId」或「锁过期（60s）」时放行，所以 B 能立刻锁上并消费，
-    // 就是 A 退出时 UNLOCK_BATCH_MQ 真把锁还了的直接证据。
+    // Lock-release check: a different instance (new clientId) takes over the same group and topic. The broker's
+    // RebalanceLockManager only lets a lock through for "the same clientId" or "lock expired (60s)", so B locking
+    // and consuming immediately is direct evidence that A's shutdown really returned the locks via UNLOCK_BATCH_MQ.
     let client_b = format!("live-order-b-{}", fx.stamp);
     let mut cfg_b = fx.base_config(&group);
     cfg_b.instance_name = client_b.clone();
@@ -2009,10 +2011,10 @@ async fn c7_orderly_and_lock(ck: &mut Checker, fx: &Fixture) {
     b.shutdown();
 }
 
-// ----------------------------------------------------- C8 多实例分摊与撤位
+// ----------------------------------------------------- C8 multi-instance sharing and scale-in
 
 async fn c8_scale_in_and_takeover(ck: &mut Checker, fx: &Fixture) {
-    println!("-- C8 同组两实例分摊 4 队列，撤一个后另一个接管全部");
+    println!("-- C8 two instances of one group split 4 queues; after one leaves the other takes over everything");
     let topic = fx.topic_name("Scale");
     let group = fx.group_name("scale");
     if let Err(e) = fx.create_topic(&topic, QUEUE_NUMS).await {
@@ -2042,8 +2044,8 @@ async fn c8_scale_in_and_takeover(ck: &mut Checker, fx: &Fixture) {
         a.shutdown();
         return ck.abort("C8 start B", &format!("{e}"));
     }
-    // 双方都要在 broker 的成员列表里看到对方，否则重平衡各拿全部 → 重复消费。
-    // 这条断言要打网络，不能用同步的 `poll_until`。
+    // Both sides must see each other in the broker's member list, or rebalance gives each everything → duplicate consumption.
+    // This assertion hits the network, so the synchronous `poll_until` cannot be used.
     let ids = {
         let deadline = Instant::now() + Duration::from_secs(WAIT_SECONDS);
         loop {
@@ -2082,11 +2084,11 @@ async fn c8_scale_in_and_takeover(ck: &mut Checker, fx: &Fixture) {
         &format!("A={ma:?} B={mb:?}"),
     );
 
-    // 反向推送只有 broker 发得出来，测试无法注入，所以这里是全链路唯一的观测点：
-    // B 注册进组后，broker 沿 A 的长连接推 `NOTIFY_CONSUMER_IDS_CHANGED(40)`，
-    // 实例级处理器把它记成一个计数并叫醒 A 的重平衡。
-    // 断言的不是数值（通知可能来 0~N 次），而是「本端确实收到并处理过」——
-    // 处理器没注册时这里会一直超时，而 remoting 层会打 WARN。
+    // Only the broker can originate the push notification and the test cannot inject it, so this is the sole observation
+    // point on the whole path: after B joins the group, the broker pushes `NOTIFY_CONSUMER_IDS_CHANGED(40)` down
+    // A's long connection, and the instance-level handler records a count and wakes A's rebalance.
+    // What is asserted is not the number (the notification may arrive 0..N times) but "this side really received and
+    // processed it" -- with the handler unregistered this keeps timing out while the remoting layer logs a WARN.
     let id_a = a.client_id();
     let notified = poll_until(|| ids_changed_count(&id_a) > 0, WAIT_SECONDS).await;
     ck.check(
@@ -2113,7 +2115,7 @@ async fn c8_scale_in_and_takeover(ck: &mut Checker, fx: &Fixture) {
         ),
     );
 
-    // 撤掉 A：broker 的成员列表变化后经 40 通知（或 20s 定时）让 B 接管
+    // Remove A: once the broker's member list changes it notifies via 40 (or the 20s timer) so B takes over
     let id_b = b.client_id();
     let b_before = ids_changed_count(&id_b);
     a.shutdown();
@@ -2127,7 +2129,7 @@ async fn c8_scale_in_and_takeover(ck: &mut Checker, fx: &Fixture) {
         took_over,
         &format!("B assigned={:?}", main_queues(&b.assigned_queue_keys())),
     );
-    // 接管不该只能等 20s 定时重平衡：A 的连接断开时 broker 会给 B 长连接推 40。
+    // The takeover must not depend only on the 20s timed rebalance: when A's connection drops the broker pushes 40 down B's long connection.
     let survivor_notified =
         poll_until(|| ids_changed_count(&id_b) > b_before, WAIT_SECONDS).await;
     ck.check(
@@ -2158,10 +2160,10 @@ async fn c8_scale_in_and_takeover(ck: &mut Checker, fx: &Fixture) {
     b.shutdown();
 }
 
-// ----------------------------------------------------- C9 运维接口与背压
+// ----------------------------------------------------- C9 admin interfaces and backpressure
 
 async fn c9_admin_and_flow_control(ck: &mut Checker, fx: &Fixture) {
-    println!("-- C9 运维接口 / 流控背压 / 手工触发");
+    println!("-- C9 admin interfaces / flow-control backpressure / manual triggers");
     let topic = fx.topic_name("Admin");
     let group = fx.group_name("admin");
     if let Err(e) = fx.create_topic(&topic, QUEUE_NUMS).await {
@@ -2229,7 +2231,7 @@ async fn c9_admin_and_flow_control(ck: &mut Checker, fx: &Fixture) {
         &format!("core={}", c.get_core_pool_size()),
     );
 
-    // 手工触发：心跳 / 订阅队列查询 / 立即重平衡
+    // Manual triggers: heartbeat / subscribed queue query / immediate rebalance
     let hb = c.send_heartbeat_to_all_broker().await;
     ck.check(
         "C9 a manual heartbeat reaches at least one broker",
@@ -2275,12 +2277,12 @@ async fn c9_admin_and_flow_control(ck: &mut Checker, fx: &Fixture) {
     c.shutdown();
 }
 
-// ------------------------------------------------- C11 拉取停摆自愈（isPullExpired）
+// ------------------------------------------------- C11 pull-stall self-heal (isPullExpired)
 
-/// 用调用方给定的 body 发送，绕开 `produce` 的 `topic-00i` 编号。
+/// Send with caller-supplied bodies, bypassing `produce`'s `topic-00i` numbering.
 ///
-/// 自愈场景必须"每一批 body 都不重名"，否则"撤走重建有没有把老消息重投一遍"这件事
-/// 会被编号撞车掩盖掉 —— `produce` 每轮都从 000 开始，两批之间天然重叠。
+/// The self-heal scenario needs "every batch's bodies uniquely named", otherwise "did the retire-and-rebuild
+/// redeliver old messages" is masked by numbering collisions -- `produce` restarts at 000 every round, so batches overlap by construction.
 async fn send_bodies(fx: &Fixture, topic: &str, bodies: &[String]) -> usize {
     let mut sent = 0usize;
     for body in bodies {
@@ -2298,11 +2300,11 @@ fn batch(prefix: &str, n: usize) -> Vec<String> {
     (0..n).map(|i| format!("{prefix}-{i}")).collect()
 }
 
-/// 注入一次停摆并走**生产路径**自愈，返回是否成功自愈。
+/// Inject one stall and self-heal through the **production path**; returns whether the heal succeeded.
 ///
-/// 为什么允许重试：盖章只发生在**发起**拉取的那一刻，而真循环多半正挂在 30s 长轮询上，
-/// 所以倒拨之后基本第一次就能被判停摆。极少数情况下旧的拉取请求刚好回来并重新盖章，
-/// 这一趟判据就不成立了（不是 bug），重试比 sleep 满 120s 赌一次可靠。
+/// Why retries are allowed: the stamp is only taken at the moment a pull is **initiated**, and the real loop is
+/// usually parked inside the 30s long poll, so after rewinding the clock the first pass almost always reads as stalled.
+/// In rare cases the old pull request returns right away and re-stamps, invalidating this pass (not a bug); retrying beats one gamble after a full 120s sleep.
 async fn heal_once(c: &DefaultMQPushConsumer, key: &str) -> bool {
     let injected = now_ms() - PULL_MAX_IDLE_TIME - 5_000;
     for _ in 0..20 {
@@ -2311,7 +2313,7 @@ async fn heal_once(c: &DefaultMQPushConsumer, key: &str) -> bool {
             tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         }
-        // 撤走 + 重建都在这一次同步里完成，重建时会立刻把章盖成"现在"。
+        // Retire and rebuild both complete inside this one sync; the rebuild immediately re-stamps to "now".
         c.sync_pull_threads().await;
         if c.last_pull_at(key).is_some_and(|t| t > injected + 60_000) {
             return true;
@@ -2322,7 +2324,7 @@ async fn heal_once(c: &DefaultMQPushConsumer, key: &str) -> bool {
 }
 
 async fn c11_pull_stall_self_heal(ck: &mut Checker, fx: &Fixture) {
-    println!("-- C11 拉取循环停摆 → 同一趟 rebalance 撤掉重建，消息不重不丢");
+    println!("-- C11 pull loop stalls → one rebalance retires and rebuilds it, no duplicates no losses");
     let topic = fx.topic_name("Heal");
     let group = fx.group_name("heal");
     if let Err(e) = fx.create_topic(&topic, 1).await {
@@ -2336,7 +2338,7 @@ async fn c11_pull_stall_self_heal(ck: &mut Checker, fx: &Fixture) {
     if let Err(e) = c.start().await {
         return ck.abort("C11 start", &format!("{e}"));
     }
-    // 1 队列：循环只有一条，注入点唯一，位点判据也唯一（多队列会被分摊到别的实例）
+    // 1 queue: exactly one loop, a unique injection point, and a unique offset criterion (multiple queues would be shared out to other instances)
     let assigned = poll_until(|| main_queues(&c.assigned_queue_keys()).len() == 1, WAIT_SECONDS).await;
     let key = main_queues(&c.assigned_queue_keys())
         .first()
@@ -2348,7 +2350,7 @@ async fn c11_pull_stall_self_heal(ck: &mut Checker, fx: &Fixture) {
         return ck.abort("C11 assign", "no queue was assigned to this consumer");
     }
 
-    // ---- 基线：3 条被消费，位点提交到 3，运行信息里的拉取时钟是真值 ----
+    // ---- baseline: 3 messages consumed, offset committed to 3, the running info's pull clock is real ----
     let b1 = batch("heal-base", 3);
     let sent = send_bodies(fx, &topic, &b1).await;
     let got = poll_until(|| inbox.count() >= 3, WAIT_SECONDS).await;
@@ -2374,7 +2376,7 @@ async fn c11_pull_stall_self_heal(ck: &mut Checker, fx: &Fixture) {
         &format!("key={key} lastPullAt={fresh}"),
     );
 
-    // ---- 自愈之后这把队列必须照常消费，而且不能把老消息重投 ----
+    // ---- after the heal this queue must keep consuming normally and must not redeliver old messages ----
     let b2 = batch("heal-post", 3);
     let sent2 = send_bodies(fx, &topic, &b2).await;
     let got2 = poll_until(|| inbox.count() >= 6, WAIT_SECONDS).await;
@@ -2402,7 +2404,7 @@ async fn c11_pull_stall_self_heal(ck: &mut Checker, fx: &Fixture) {
             retried
         ),
     );
-    // 留一个窗口给"新循环用陈旧游标回退位点"这类错误显形
+    // Leave a window for errors like "the new loop rewinds the offset with a stale cursor" to surface
     tokio::time::sleep(Duration::from_secs(6)).await;
     let committed3 = fx.committed_total(&group, &topic, 1).await;
     let dup = inbox.count();
@@ -2414,24 +2416,24 @@ async fn c11_pull_stall_self_heal(ck: &mut Checker, fx: &Fixture) {
     c.shutdown();
 }
 
-// ---------------------------------------------------------------- C12 顺序消费毒消息
+// ---------------------------------------------------------------- C12 orderly poison message
 
-/// 顺序消费的毒消息终态：为什么只能真机验。
+/// Orderly-consumption poison-message terminal state: why it can only be verified against a live broker.
 ///
 ///
-/// 三种写错在客户端本地都表现为「看起来正常」：少 +1 ⇒ 毒消息原地转到天荒地老且永远不进死信；
-/// 把 `-1` 读成并发侧的 16 ⇒ 顺序消费凭空多出死信；回投成功后仍挂起 ⇒ 队列永久卡死，
-/// 与消费者进程死掉一模一样。离线单测只能锁「回投失败」那一半（未 `start()` 的内部生产者必败），
-/// 「回投成功 ⇒ 位点前进、`%DLQ%` 出现、锁真的握着」只有真 broker 说得了。
+/// All three wrong shapes look "normal" locally: missing the +1 ⇒ the poison message spins forever in place and never reaches the DLQ;
+/// reading `-1` as the concurrent side's 16 ⇒ orderly consumption grows phantom dead letters; still suspending after a successful send-back ⇒
+/// the queue is stuck forever, indistinguishable from a dead consumer process. Offline tests can only pin the "send-back failed" half (the internal producer that never `start()`ed must fail);
+/// "send-back succeeded ⇒ offset advances, `%DLQ%` appears, the lock is really held" only a real broker can rule on.
 async fn c12_orderly_dlq(ck: &mut Checker, fx: &Fixture) {
-    println!("-- C12 顺序消费毒消息：本地计数 → 交 broker → %DLQ%<group>");
+    println!("-- C12 orderly poison message: local counting → handed to the broker → %DLQ%<group>");
     const MAX_RECONSUME: i32 = 2;
     let topic = fx.topic_name("OrdDlq");
     let group = fx.group_name("orddlq");
     if let Err(e) = fx.create_topic(&topic, 1).await {
         return ck.abort("C12 create topic", &e);
     }
-    // 1 队列 + 每批 1 条：毒消息后面那条必须排在它后面，且挂起不会连带别的路径
+    // 1 queue + 1 message per batch: the message after the poison must queue behind it, and the suspend must not drag in other paths
     let poison = format!("{topic}-000");
     let inbox = Arc::new(Inbox::default());
     let mut cfg = fx.base_config(&group);
@@ -2457,26 +2459,26 @@ async fn c12_orderly_dlq(ck: &mut Checker, fx: &Fixture) {
     let three = poll_until(|| inbox.matching(&poison).len() >= 3, 60).await;
     let times: Vec<i32> = inbox.matching(&poison).iter().map(|d| d.reconsume_times).collect();
     ck.check(
-        "C12 毒消息恰好投 3 次（每次由客户端自己 +1：reconsumeTimes 0/1/2）",
+        "C12 the poison message is delivered exactly 3 times (each +1 done client-side: reconsumeTimes 0/1/2)",
         three && times.starts_with(&[0, 1, 2]),
         &format!("times={times:?}"),
     );
     let after = format!("{topic}-001");
     let handed = poll_until(|| !inbox.matching(&after).is_empty(), 60).await;
     ck.check(
-        "C12 交给 broker 后业务队列继续前进（后一条被消费）",
+        "C12 after handing over to the broker the business queue keeps advancing (the next message is consumed)",
         handed,
         &format!("after={after} arrivals={}", inbox.matching(&after).len()),
     );
     tokio::time::sleep(Duration::from_secs(15)).await;
     let seen = inbox.matching(&poison);
     ck.check(
-        "C12 用尽后不再原地挂起（观察窗口内毒消息只投了 3 次）",
+        "C12 no more in-place suspension after exhaustion (the poison message was delivered only 3 times in the observation window)",
         seen.len() == 3,
         &format!("arrivals={}", seen.len()),
     );
     ck.check(
-        "C12 挂起期间 listener 始终看到业务 topic（本地重投不换 topic）",
+        "C12 during suspension the listener always sees the business topic (local redelivery never changes the topic)",
         seen.iter().all(|d| d.topic == topic),
         &format!("topics={:?}", seen.iter().map(|d| d.topic.clone()).collect::<Vec<_>>()),
     );
@@ -2485,44 +2487,44 @@ async fn c12_orderly_dlq(ck: &mut Checker, fx: &Fixture) {
     let dlq_topic = MixAll::get_dlq_topic(&group);
     let (has_route, dlq_msgs) = match read_dlq(fx, &group, "orddlqread", 40).await {
         Ok(v) => v,
-        Err(e) => return ck.abort("C12 读 %DLQ%", &e),
+        Err(e) => return ck.abort("C12 read %DLQ%", &e),
     };
     ck.check(
-        "C12 broker 自动创建并注册了 %DLQ%<group> 的路由",
+        "C12 broker auto-created and registered the %DLQ%<group> route",
         has_route,
         &format!("dlq={dlq_topic}"),
     );
-    // 顺序回投落进死信而不是退回 `%RETRY%` 重投，本身就是 broker 认定「本组 rebalance 锁
-    // 还没过期」⇒ 这个实例真的握着 LOCK_BATCH_MQ（handleRetryAndDLQ:202-207）。
+    // An orderly send-back landing in the DLQ instead of returning to `%RETRY%` for redelivery is itself the broker
+    // deciding "this group's rebalance lock has not expired" ⇒ this instance really holds LOCK_BATCH_MQ (handleRetryAndDLQ:202-207).
     if has_route {
         ck.check(
-            "C12 毒消息落在 %DLQ%<group>（回投走 rebalance 锁，立刻进死信）",
+            "C12 the poison message lands in %DLQ%<group> (the send-back takes the rebalance lock and dead-letters immediately)",
             dlq_msgs.len() == 1 && dlq_msgs[0].body == poison,
             &format!("{dlq_msgs:?}"),
         );
     }
     if let Some(d) = dlq_msgs.first() {
-        // 3 = 客户端在 RECONSUME_TIME 上写的 +1，经 V2 头 j 落成存储值；漏填 j 的话
-        // broker 按订阅组默认 16 判，这条永远进不了死信。
+        // 3 = the client's +1 written on RECONSUME_TIME, landing as the stored value via the V2 header flag j; if j is omitted
+        // the broker judges by the subscription group's default of 16 and this message never reaches the DLQ.
         ck.check(
-            "C12 死信 reconsumeTimes = maxReconsumeTimes + 1",
+            "C12 dead letter reconsumeTimes = maxReconsumeTimes + 1",
             d.reconsume_times == MAX_RECONSUME + 1,
             &format!("reconsumeTimes={}", d.reconsume_times),
         );
         ck.check(
-            "C12 死信保留 RETRY_TOPIC=业务 topic，且 topic 已是 %DLQ%<group>",
+            "C12 the dead letter keeps RETRY_TOPIC=the business topic, and topic is now %DLQ%<group>",
             d.retry_topic_prop.as_deref() == Some(topic.as_str()) && d.topic == dlq_topic,
             &format!("topic={} retryTopic={:?}", d.topic, d.retry_topic_prop),
         );
     }
-    // 交给 C10 一起删掉，别在 broker 上留 %DLQ%/%RETRY% 垃圾
+    // Hand to C10 for deletion; do not leave %DLQ%/%RETRY% litter on the broker
     lock(&fx.topics).push(dlq_topic.clone());
     lock(&fx.topics).push(MixAll::get_retry_topic(&group));
 }
 
-/// 顺序侧的 `-1` 是**不设上限**，不是并发侧的 16。
+/// On the orderly side `-1` means **no cap**, not the concurrent side's 16.
 async fn c12b_orderly_no_cap(ck: &mut Checker, fx: &Fixture) {
-    println!("-- C12b maxReconsumeTimes=-1 时顺序消费不设上限（不是并发侧的 16）");
+    println!("-- C12b maxReconsumeTimes=-1 means no cap for orderly consumption (not the concurrent side's 16)");
     let topic = fx.topic_name("OrdNoCap");
     let group = fx.group_name("ordnocap");
     if let Err(e) = fx.create_topic(&topic, 1).await {
@@ -2531,7 +2533,7 @@ async fn c12b_orderly_no_cap(ck: &mut Checker, fx: &Fixture) {
     let poison = format!("{topic}-000");
     let inbox = Arc::new(Inbox::default());
     let mut cfg = fx.base_config(&group);
-    // 显式不设上限（base_config 的默认就是 -1，写出来是为了让「默认」这条断言有出处）
+    // Explicitly no cap (base_config's default is already -1; spelling it out gives the "default" assertion a source)
     cfg.max_reconsume_times = -1;
     cfg.consume_message_batch_max_size = 1;
     cfg.suspend_current_queue_time_millis = 200;
@@ -2550,23 +2552,23 @@ async fn c12b_orderly_no_cap(ck: &mut Checker, fx: &Fixture) {
         return ck.abort("C12b start", &format!("{e}"));
     }
     fx.produce(&topic, "TagA", 1, Some(0)).await;
-    // 只要越过并发侧的 16 就能证明没用错常量。窗口给到 90s：走错的话第 17 次的延迟档位
-    // 是 level20（2h），一旦投出去就再也回不来，只能靠「本地投了多少次 + %DLQ% 空」两头夹住。
+    // Surpassing the concurrent side's 16 is enough to prove the right constant is used. The window is 90s: on the wrong
+    // path the 17th attempt's delay level is level20 (2h) and once sent it never comes back, so the only grip is "local delivery count + empty %DLQ%" clamping from both ends.
     let uncapped = poll_until(|| inbox.matching(&poison).len() >= 18, 90).await;
     let times: Vec<i32> = inbox.matching(&poison).iter().map(|d| d.reconsume_times).collect();
     let max_times = times.iter().copied().max().unwrap_or(-1);
     ck.check(
-        "C12b -1 时顺序消费不设上限（投过 >=18 次，16 不生效）",
+        "C12b -1 means no cap for orderly consumption (delivered >=18 times, the 16 cap did not apply)",
         uncapped && max_times >= 17,
         &format!("arrivals={} maxTimes={max_times}", times.len()),
     );
     c.shutdown();
     let (has_route, dlq_msgs) = match read_dlq(fx, &group, "ordnocapread", 20).await {
         Ok(v) => v,
-        Err(e) => return ck.abort("C12b 读 %DLQ%", &e),
+        Err(e) => return ck.abort("C12b read %DLQ%", &e),
     };
     ck.check(
-        "C12b 没到阈值就不该有死信（broker 侧连 %DLQ% topic 都不必建）",
+        "C12b no dead letter before the threshold (the broker need not even create the %DLQ% topic)",
         dlq_msgs.is_empty(),
         &format!("routeFound={has_route} n={}", dlq_msgs.len()),
     );
@@ -2575,8 +2577,8 @@ async fn c12b_orderly_no_cap(ck: &mut Checker, fx: &Fixture) {
     }
 }
 
-/// 观测顺序挂起时长的 listener：命中 `poison` 时把 context 的挂起时长设成 `asked_ms`，
-/// 并记下每次投递的时刻（相邻两次的间隔 = 挂起时长 + 分发循环的 50ms 节拍）。
+/// Listener that observes the orderly suspend duration: on a `poison` hit it sets the context's suspend duration to
+/// `asked_ms` and records each delivery time (the gap between neighbours = suspend duration + the dispatch loop's 50ms beat).
 struct SuspendTimingListener {
     poison: String,
     asked_ms: i64,
@@ -2616,18 +2618,18 @@ impl MessageListenerOrderly for SuspendTimingListener {
     }
 }
 
-/// C13 用的顺序 listener：显式提交 / 显式回滚 / 非法回滚三种姿态。
+/// The orderly listener used by C13: explicit commit / explicit rollback / illegal rollback, three postures.
 ///
-/// 与 `LiveListener` 分开的原因：这里的判据是**返回值与 autoCommit 的交互本身**，
-/// 而不是消息内容；三档共用一份投递流水，比较「同一批投了几次、间隔多长、topic 变没变」。
+/// Kept separate from `LiveListener` because the criterion here is **the interaction between the return value and autoCommit itself**,
+/// not the message content; all three modes share one delivery log, comparing "how many times this batch was delivered, at what intervals, whether the topic changed".
 struct OrderlyManualListener {
     mode: ManualMode,
     head: String,
     rollback_calls: usize,
     head_calls: AtomicUsize,
-    /// [(body, reconsumeTimes, topic, at)]，按投递顺序累积。
+    /// [(body, reconsumeTimes, topic, at)], accumulated in delivery order.
     records: Mutex<Vec<(String, i32, String, Instant)>>,
-    /// 每次 listener 调用记一条（元素 = 这一批的 body 列表）。
+    /// One entry per listener call (element = the body list of that batch).
     batches: Mutex<Vec<Vec<String>>>,
 }
 
@@ -2743,13 +2745,13 @@ fn median(xs: &[f64]) -> f64 {
     }
 }
 
-/// #74：`suspendCurrentQueueTimeMillis` 在 context 上优先于消费者配置。
+/// #74: `suspendCurrentQueueTimeMillis` on the context takes precedence over the consumer config.
 ///
 ///
-/// 钳位的两个端点用同一条链路的间隔只能兜「不忙等」（`>= 10ms`）：分发循环本身有 50ms 固定
-/// 节拍，间隔法分不出 10ms 与 1ms —— 精确值由 `orderly_suspend_millis` 的离线矩阵锁死。
+/// For the two clamping endpoints, gap-based timing on the same chain can only cover "no busy-wait" (`>= 10ms`):
+/// the dispatch loop itself has a fixed 50ms beat and gaps cannot tell 10ms from 1ms -- the exact values are pinned by the `orderly_suspend_millis` offline matrix.
 async fn c12c_orderly_suspend_millis(ck: &mut Checker, fx: &Fixture) {
-    println!("-- C12c context 上的挂起时长优先于消费者配置（submitConsumeRequestLater 语义）");
+    println!("-- C12c the context's suspend duration takes precedence over the consumer config (submitConsumeRequestLater semantics)");
     let topic = fx.topic_name("OrdSuspend");
     let group = fx.group_name("ordsusp");
     if let Err(e) = fx.create_topic(&topic, 1).await {
@@ -2772,14 +2774,14 @@ async fn c12c_orderly_suspend_millis(ck: &mut Checker, fx: &Fixture) {
     if let Err(e) = c.start().await {
         return ck.abort("C12c start", &format!("{e}"));
     }
-    // 等首轮 LOCK_BATCH_MQ：没有队列锁时 broker 会把顺序重投直接改投死信，间隔就没意义了
+    // Wait for the first LOCK_BATCH_MQ: without a queue lock the broker diverts orderly redeliveries straight to the DLQ, making the gaps meaningless
     tokio::time::sleep(Duration::from_secs(4)).await;
     fx.produce(&topic, "TagA", 1, Some(0)).await;
     let _ = poll_until(|| lock(&listener.times).len() >= 9, 25).await;
     let gaps = listener.gaps();
     let med = median(&gaps);
     ck.check(
-        "C12c context 的 70ms 生效（不是消费者配置的 900ms）",
+        "C12c the context's 70ms takes effect (not the consumer config's 900ms)",
         gaps.len() >= 6 && (0.03..=0.4).contains(&med),
         &format!(
             "n={} median={med:.3}s gaps={:?}",
@@ -2792,7 +2794,7 @@ async fn c12c_orderly_suspend_millis(ck: &mut Checker, fx: &Fixture) {
     );
     c.shutdown();
 
-    // 钳位下限：context 1ms + 配置 0（两个非法值）都必须按 10ms 走，不能变成忙等
+    // Clamp floor: context 1ms + config 0 (both illegal) must both behave as 10ms, never a busy-wait
     let topic_b = fx.topic_name("OrdSuspendFloor");
     let group_b = fx.group_name("ordsuspfloor");
     if let Err(e) = fx.create_topic(&topic_b, 1).await {
@@ -2820,20 +2822,20 @@ async fn c12c_orderly_suspend_millis(ck: &mut Checker, fx: &Fixture) {
     let _ = poll_until(|| lock(&listener_b.times).len() >= 9, 20).await;
     let gaps_b = listener_b.gaps();
     ck.check(
-        "C12c 钳位下限：context 1ms / 配置 0 时不忙等（间隔 ≥ 10ms）",
+        "C12c clamp floor: no busy-wait with context 1ms / config 0 (gap >= 10ms)",
         gaps_b.len() >= 6 && median(&gaps_b) >= 0.009,
         &format!("n={} median={:.4}s", gaps_b.len(), median(&gaps_b)),
     );
     cb.shutdown();
 }
 
-/// 三条腿的差别只在**返回值**与 **autoCommit 这一个布尔位**，但真机行为完全可分：
+/// The three legs differ only in the **return value** and the single **autoCommit** boolean, yet live behaviour separates them completely:
 async fn c13_orderly_explicit_commit_rollback(ck: &mut Checker, fx: &Fixture) {
-    println!("-- C13 顺序消费的显式批量 ack / 显式回滚（立即重投）/ 非法用法");
+    println!("-- C13 orderly explicit batch ack / explicit rollback (immediate redelivery) / illegal usage");
 
-    // ---- C13a autoCommit=false + COMMIT：显式批量 ack ----
-    // 三条**先发后起**（新组显式从队首，与 C4c 的部分 ack 同约定）+ 批量上限 3：
-    // 首批必然是完整的三条，"整批一次认可"才有确定性的观察面。
+    // ---- C13a autoCommit=false + COMMIT: explicit batch ack ----
+    // Three messages **sent before the consumer starts** (a new group starts explicitly at the queue head, same convention as C4c's partial ack) + batch cap 3:
+    // the first batch is then necessarily the complete three, giving "accept the whole batch at once" a deterministic observation surface.
     let topic = fx.topic_name("OrdCommit");
     let group = fx.group_name("ordcommit");
     if let Err(e) = fx.create_topic(&topic, 1).await {
@@ -2857,28 +2859,28 @@ async fn c13_orderly_explicit_commit_rollback(ck: &mut Checker, fx: &Fixture) {
         return ck.abort("C13a start", &format!("{e}"));
     }
     let arrived = poll_until(|| !listener.batches().is_empty(), 30).await;
-    tokio::time::sleep(Duration::from_secs(6)).await; // 反证窗口：当"不提交"办会被重投 ~30 次
+    tokio::time::sleep(Duration::from_secs(6)).await; // counter-proof window: treated as "not committed", it would be redelivered ~30 times
     c.shutdown();
     let batches = listener.batches();
     ck.check(
-        "C13a 首批是完整的三元素批次（先发后起 + 批量上限 3）",
+        "C13a the first batch is a complete 3-element batch (send first, start later + batch cap 3)",
         arrived && batches.len() == 1 && batches[0].len() == 3,
         &format!("batches={batches:?} sent={}", sent.len()),
     );
     ck.check(
-        "C13a 显式 COMMIT 整批认可：只投一次、三条都不重投",
+        "C13a explicit COMMIT accepts the whole batch: delivered once, none of the three redelivered",
         batches == vec![want.clone()],
         &format!("batches={batches:?}"),
     );
     let committed = fx.wait_committed(&group, &topic, 1, 3).await;
     ck.check(
-        "C13a broker 位点一次前进到 3（整批 ack，不是卡在 0）",
+        "C13a the broker offset advances straight to 3 (whole-batch ack, not stuck at 0)",
         committed == 3,
         &format!("committed={committed}"),
     );
 
-    // ---- C13b autoCommit=false + ROLLBACK：显式回滚、本地立即重投 ----
-    // 回滚 6 次后显式提交：前 6 次每次把这条退回来，且**不走 broker**。
+    // ---- C13b autoCommit=false + ROLLBACK: explicit rollback, immediate local redelivery ----
+    // Roll back 6 times, then commit explicitly: the first 6 passes each return this message, and **the broker is not involved**.
     let topic = fx.topic_name("OrdRollback");
     let group = fx.group_name("ordrollback");
     if let Err(e) = fx.create_topic(&topic, 1).await {
@@ -2901,7 +2903,7 @@ async fn c13_orderly_explicit_commit_rollback(ck: &mut Checker, fx: &Fixture) {
     if let Err(e) = c.start().await {
         return ck.abort("C13b start", &format!("{e}"));
     }
-    tokio::time::sleep(Duration::from_secs(4)).await; // 等首轮 LOCK_BATCH_MQ
+    tokio::time::sleep(Duration::from_secs(4)).await; // wait for the first LOCK_BATCH_MQ
     fx.produce(&topic, "T13b", 2, Some(0)).await;
     let ok = poll_until(
         || listener.first_index(&next) >= 0 && listener.head_calls.load(Ordering::SeqCst) >= 7,
@@ -2915,12 +2917,12 @@ async fn c13_orderly_explicit_commit_rollback(ck: &mut Checker, fx: &Fixture) {
     let idx7 = listener.nth_index(&head, 6);
     let idx_next = listener.first_index(&next);
     ck.check(
-        "C13b 显式回滚把同一批退回重投（head 投递 7 次 = 6 次回滚 + 1 次提交）",
+        "C13b explicit rollback returns the same batch for redelivery (head delivered 7 times = 6 rollbacks + 1 commit)",
         ok && head_at.len() >= 7,
         &format!("deliveries={}", head_at.len()),
     );
     ck.check(
-        "C13b 本地重投不过 broker：相邻间隔贴着 200ms 挂起（%RETRY% 最快 10s 档）",
+        "C13b local redelivery bypasses the broker: adjacent gaps hug the 200ms suspend (the fastest %RETRY% level is 10s)",
         gaps.len() >= 5 && med < 1.0 && worst < 5.0,
         &format!(
             "n={} median={med:.3}s max={worst:.3}s gaps={:?}",
@@ -2929,7 +2931,7 @@ async fn c13_orderly_explicit_commit_rollback(ck: &mut Checker, fx: &Fixture) {
         ),
     );
     ck.check(
-        "C13b 本地重投不动 reconsumeTimes（全 0）且不换 topic",
+        "C13b local redelivery leaves reconsumeTimes untouched (all 0) and keeps the topic",
         !head_at.is_empty()
             && head_at.iter().all(|r| r.1 == 0)
             && head_at.iter().all(|r| r.2 == topic),
@@ -2940,13 +2942,13 @@ async fn c13_orderly_explicit_commit_rollback(ck: &mut Checker, fx: &Fixture) {
         ),
     );
     ck.check(
-        "C13b 回滚期间后面的消息不越位（next 首次出现在第 7 次投递之后）",
+        "C13b during rollbacks the following message never jumps the queue (next first appears after the 7th delivery)",
         idx7 >= 0 && idx_next > idx7,
         &format!("idx7={idx7} idxNext={idx_next}"),
     );
-    tokio::time::sleep(Duration::from_secs(2)).await; // 反证窗口：提交后 head 不该再回来
+    tokio::time::sleep(Duration::from_secs(2)).await; // counter-proof window: after the commit head must not come back
     ck.check(
-        "C13b 显式提交后各投一次（提交真的把 head 放掉了）",
+        "C13b one delivery each after the explicit commit (the commit really released head)",
         listener.count(&head) == 7 && listener.count(&next) == 1,
         &format!(
             "head={} next={}",
@@ -2957,12 +2959,12 @@ async fn c13_orderly_explicit_commit_rollback(ck: &mut Checker, fx: &Fixture) {
     c.shutdown();
     let committed = fx.wait_committed(&group, &topic, 1, 2).await;
     ck.check(
-        "C13b broker 位点前进到 2（两条都 ack 完）",
+        "C13b the broker offset advances to 2 (both messages fully acked)",
         committed == 2,
         &format!("committed={committed}"),
     );
 
-    // ---- C13c autoCommit=true（默认）+ ROLLBACK：非法用法，按 ack 处理 ----
+    // ---- C13c autoCommit=true (default) + ROLLBACK: illegal usage, treated as ack ----
     let topic = fx.topic_name("OrdIllegal");
     let group = fx.group_name("ordillegal");
     if let Err(e) = fx.create_topic(&topic, 1).await {
@@ -2988,29 +2990,29 @@ async fn c13_orderly_explicit_commit_rollback(ck: &mut Checker, fx: &Fixture) {
     tokio::time::sleep(Duration::from_secs(4)).await;
     fx.produce(&topic, "T13c", 2, Some(0)).await;
     let ok = poll_until(|| listener.first_index(&next) >= 0, 30).await;
-    tokio::time::sleep(Duration::from_millis(2500)).await; // 反证窗口：真回滚的话会重投 ~10 次
+    tokio::time::sleep(Duration::from_millis(2500)).await; // counter-proof window: a real rollback would redeliver ~10 times
     ck.check(
-        "C13c autoCommit=true 时 ROLLBACK 按 ack 处理：head 只投一次",
+        "C13c with autoCommit=true ROLLBACK is treated as ack: head is delivered only once",
         listener.count(&head) == 1,
         &format!("head={}", listener.count(&head)),
     );
     ck.check(
-        "C13c 非法 ROLLBACK 不阻塞队列：next 被消费",
+        "C13c the illegal ROLLBACK does not block the queue: next is consumed",
         ok && listener.count(&next) == 1,
         &format!("next={}", listener.count(&next)),
     );
     c.shutdown();
     let committed = fx.wait_committed(&group, &topic, 1, 2).await;
     ck.check(
-        "C13c broker 位点前进到 2（非法用法按成功 ack）",
+        "C13c the broker offset advances to 2 (illegal usage lands as a successful ack)",
         committed == 2,
         &format!("committed={committed}"),
     );
 }
 
-// ---------------------------------------------------------------- C10 清理
+// ---------------------------------------------------------------- C10 cleanup
 async fn c10_cleanup(ck: &mut Checker, fx: &mut Fixture) {
-    println!("-- C10 清理");
+    println!("-- C10 cleanup");
     let topics: Vec<String> = lock(&fx.topics).clone();
     let mut ok = 0usize;
     for topic in &topics {
@@ -3067,12 +3069,12 @@ async fn run(namesrv: &str, creds: Creds) -> Checker {
         if creds.enabled() {
             format!("ak={}", creds.access_key)
         } else {
-            "未带凭据（普通集群口径，不装钩子）".to_string()
+            "no credentials (plain cluster, no hook installed)".to_string()
         }
     );
 
     let mut ck = Checker::new();
-    // 反向对照必须抢在任何客户端之前：见 [`anon_probe`] 的说明。
+    // The reverse control must run before any other client: see the [`anon_probe`] notes.
     if creds.enabled() {
         anon_probe(namesrv, &stamp_s, &mut ck).await;
     }
@@ -3131,7 +3133,7 @@ async fn main() -> ExitCode {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "127.0.0.1:9876".to_string());
-    // 后两个参数可选：`[access_key] [secret_key]`，都非空才装 ACL 签名钩子。
+    // The two trailing arguments are optional: `[access_key] [secret_key]`; the ACL signing hook is installed only when both are non-empty.
     let creds = Creds::from_args(
         argv.get(1).map(|s| s.as_str()).unwrap_or_default(),
         argv.get(2).map(|s| s.as_str()).unwrap_or_default(),

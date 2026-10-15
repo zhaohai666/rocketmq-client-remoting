@@ -39,7 +39,7 @@ def _read_frame(sock):
 
 
 class GoAwayServer:
-    """前 ``go_away_conns`` 条连接一律回 GO_AWAY，之后的连接回 SUCCESS。"""
+    """The first ``go_away_conns`` connections all reply GO_AWAY; subsequent connections reply SUCCESS."""
 
     def __init__(self, go_away_conns):
         self.go_away_conns = go_away_conns
@@ -118,10 +118,10 @@ def test_go_away_reconnects_and_retries_once():
     try:
         req = rc_mod.RemotingCommand.create_request_command(RequestCode.SEND_MESSAGE_V2)
         resp = client.invoke_sync(server.addr, req, 5000)
-        assert resp.code == ResponseCode.SUCCESS, "重发必须拿到真应答"
-        assert server.conns == 2, "GO_AWAY 之后必须换新连接"
+        assert resp.code == ResponseCode.SUCCESS, "the resend must get a real response"
+        assert server.conns == 2, "a new connection must be made after GO_AWAY"
         assert server.requests == 2
-        assert len(set(server.opaques)) == 2, "重发必须用新 opaque，否则响应会错配"
+        assert len(set(server.opaques)) == 2, "the resend must use a new opaque, otherwise responses would be mismatched"
         assert not client._response_table
     finally:
         client.shutdown()
@@ -136,7 +136,7 @@ def test_second_go_away_fails_instead_of_looping():
         with pytest.raises(RemotingSendRequestException) as caught:
             client.invoke_sync(server.addr, req, 5000)
         assert "GO_AWAY twice" in str(caught.value)
-        assert server.conns == 2, "只重发一次，不能无限重连"
+        assert server.conns == 2, "resend only once, no infinite reconnecting"
         assert not client._response_table
     finally:
         client.shutdown()
@@ -151,7 +151,7 @@ def test_go_away_without_reconnect_flag_surfaces_error():
         with pytest.raises(RemotingSendRequestException) as caught:
             client.invoke_sync(server.addr, req, 5000)
         assert "Receive GO_AWAY from channel" in str(caught.value)
-        assert server.conns == 1, "关掉开关就不该重连"
+        assert server.conns == 1, "with the switch off, no reconnect should happen"
         assert not client._response_table
     finally:
         client.shutdown()
@@ -166,9 +166,9 @@ def test_async_go_away_retries_via_callback():
         req = rc_mod.RemotingCommand.create_request_command(RequestCode.SEND_MESSAGE_V2)
         calls = []
         client.invoke_async(server.addr, req, lambda resp, err: calls.append((resp, err)), 5000)
-        assert _wait_until(lambda: len(calls) == 1), "回调未触发: %r" % (calls,)
+        assert _wait_until(lambda: len(calls) == 1), "callback not fired: %r" % (calls,)
         resp, err = calls[0]
-        assert err is None, "重发成功就不该把错误交给回调: %r" % err
+        assert err is None, "a successful resend must not hand an error to the callback: %r" % err
         assert resp.code == ResponseCode.SUCCESS
         assert server.conns == 2
         assert _wait_until(lambda: server.requests == 2)
@@ -184,7 +184,7 @@ def test_async_second_go_away_reports_error():
         req = rc_mod.RemotingCommand.create_request_command(RequestCode.SEND_MESSAGE_V2)
         calls = []
         client.invoke_async(server.addr, req, lambda resp, err: calls.append((resp, err)), 5000)
-        assert _wait_until(lambda: len(calls) == 1), "回调未触发: %r" % (calls,)
+        assert _wait_until(lambda: len(calls) == 1), "callback not fired: %r" % (calls,)
         resp, err = calls[0]
         assert resp is None
         assert isinstance(err, RemotingSendRequestException)

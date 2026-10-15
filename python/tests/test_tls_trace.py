@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""TLS 传输层 + W3C traceparent 透传离线单测。
+"""Offline unit tests for the TLS transport layer + W3C traceparent propagation.
 
-TLS：进程内起一个 ssl 包裹的 TCP 服务端（自签证书），验证
-RemotingClient(tls_enable=True) 能完成握手并按 RocketMQ 帧收发；
-以及 TLS 客户端打到明文端口必须报 RemotingConnectException。
+TLS: start an ssl-wrapped TCP server in-process (self-signed certificate), verifying
+RemotingClient(tls_enable=True) can complete the handshake and send/receive RocketMQ frames;
+and that a TLS client hitting a plaintext port must report RemotingConnectException.
 """
 import os
 import shutil
@@ -42,21 +42,21 @@ def test_generate_traceparent_shape():
 def test_validate_traceparent():
     good = generate_traceparent()
     assert is_valid_traceparent(good)
-    assert is_valid_traceparent(good.upper())          # 宽松：大写也认
-    assert not is_valid_traceparent("")                # 空
-    assert not is_valid_traceparent("00-abc-def-01")   # 段长不对
-    assert not is_valid_traceparent("00-%s-%s-01" % ("0" * 32, "1" * 16))   # trace-id 全 0
-    assert not is_valid_traceparent("00-%s-%s-01" % ("1" * 32, "0" * 16))   # parent-id 全 0
+    assert is_valid_traceparent(good.upper())          # lenient: uppercase also accepted
+    assert not is_valid_traceparent("")                # empty
+    assert not is_valid_traceparent("00-abc-def-01")   # wrong segment length
+    assert not is_valid_traceparent("00-%s-%s-01" % ("0" * 32, "1" * 16))   # trace-id all zeros
+    assert not is_valid_traceparent("00-%s-%s-01" % ("1" * 32, "0" * 16))   # parent-id all zeros
     assert not is_valid_traceparent("ff-%s-%s-01" % ("1" * 32, "1" * 16))   # version ff
-    assert not is_valid_traceparent("zz-%s-%s-01" % ("1" * 32, "1" * 16))   # version 非 hex
+    assert not is_valid_traceparent("zz-%s-%s-01" % ("1" * 32, "1" * 16))   # version non-hex
 
 
 def test_child_traceparent_keeps_trace_id():
     parent = generate_traceparent()
     child = child_traceparent(parent)
     assert child is not None and is_valid_traceparent(child)
-    assert child.split("-")[1] == parent.split("-")[1]   # trace-id 不变
-    assert child.split("-")[2] != parent.split("-")[2]   # parent-id 换新
+    assert child.split("-")[1] == parent.split("-")[1]   # trace-id unchanged
+    assert child.split("-")[2] != parent.split("-")[2]   # parent-id renewed
     assert child_traceparent("garbage") is None
 
 
@@ -64,7 +64,7 @@ def test_inject_does_not_overwrite_and_extract_roundtrip():
     msg = Message(topic="t", body=b"x")
     tp1 = inject_trace_context(msg)
     assert msg.get_property(TRACE_CONTEXT_PROPERTY) == tp1
-    tp2 = inject_trace_context(msg)                      # 已有值不覆盖
+    tp2 = inject_trace_context(msg)                      # an existing value is not overwritten
     assert tp2 == tp1
 
     ext = MessageExt()
@@ -77,7 +77,7 @@ def test_inject_does_not_overwrite_and_extract_roundtrip():
 
 @pytest.fixture(scope="module")
 def tls_cert():
-    """用 openssl CLI 生成一张自签证书（server 侧用）。"""
+    """Generate a self-signed certificate with the openssl CLI (used on the server side)."""
     exe = shutil.which("openssl")
     if exe is None:
         exe = next((p for p in ("/usr/local/bin/openssl", "/usr/bin/openssl")
@@ -95,7 +95,7 @@ def tls_cert():
 
 
 class TlsFrameServer:
-    """ssl 包裹的帧回显服务端：收请求帧 → 回 SUCCESS 响应（同 opaque）。"""
+    """An ssl-wrapped frame echo server: receives request frames -> replies with a SUCCESS response (same opaque)."""
 
     def __init__(self, cert, key):
         self._ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -108,11 +108,11 @@ class TlsFrameServer:
         self._thread.start()
 
     def _loop(self):
-        """accept 循环：握手与收发都在连接线程里做。
+        """The accept loop: handshake and send/receive both happen in the connection thread.
 
-        握手不能留在 accept 线程里内联执行：一条对端已经消失的半开连接会把 accept
-        线程卡在 ``wrap_socket`` 上，而 Windows 下 connect() 打进 backlog 是成功的——
-        真正的客户端只会等满超时（本用例原先 15s 就是这么挂的）。
+        The handshake must not be executed inline in the accept thread: a half-open connection whose peer has already vanished would stick the accept
+        thread on ``wrap_socket``, while on Windows connect() into the backlog succeeds --
+        the real client would only wait out the full timeout (this test used to hang at 15s exactly this way).
         """
         try:
             while True:
@@ -120,7 +120,7 @@ class TlsFrameServer:
                 threading.Thread(target=self._handshake_and_serve, args=(conn,),
                                  daemon=True).start()
         except OSError:
-            pass  # stop() 关掉监听套接字
+            pass  # stop() closes the listening socket
 
     def _handshake_and_serve(self, conn):
         try:
@@ -153,11 +153,11 @@ class TlsFrameServer:
 
     @staticmethod
     def _close_tls(tls):
-        """先 close_notify 再关：与 Netty 的 SslHandler 关闭行为一致。
+        """close_notify first, then close: consistent with Netty's SslHandler shutdown behavior.
 
-        直接 closesocket 时若内核接收缓冲里还留着没读走的 TLS 1.3 NewSessionTicket，
-        Windows 会发 RST 而不是 FIN；这条 RST 能打到下一条复用同一 4 元组的新连接上，
-        把它的第一个请求静默吞掉。
+        When closing the socket directly, if the kernel receive buffer still holds an unread TLS 1.3 NewSessionTicket,
+        Windows sends RST instead of FIN; this RST can hit the next new connection reusing the same 4-tuple,
+        silently swallowing its first request.
         """
         try:
             tls.settimeout(2.0)
@@ -213,20 +213,20 @@ def test_invoke_sync_over_tls(tls_cert):
 
 
 def test_tls_reconnect_cycles_every_request_round_trips(tls_cert):
-    """反复建/断 TLS 连接：每条新连接的第一个请求都必须送达。
+    """Repeatedly building/dropping TLS connections: the first request of every new connection must be delivered.
 
-    盯的是两处本机实测过的坑：
+    Two pitfalls measured on a real machine are being watched:
 
-    1. 关闭路径。上一轮连接若是硬关（没发 close_notify），内核接收缓冲里还留着对端
-       TLS 1.3 的 NewSessionTicket 没读走，就会发 RST 而不是 FIN；这条 RST 打到复用同
-       一 4 元组的下一条新连接上，新连接的第一个请求被静默吞掉。
-    2. 读线程起得太早。握手刚完成就让读线程进 OpenSSL，紧跟着写出去的 TLS 1.3 首个
-       记录有约 3~5% 根本到不了对端（对端 TLS 读一直等到超时），调用方只能等满 invoke
-       超时；明文连接没有这个现象。所以 TLS 连接把读线程推迟到第一个记录写出去之后再
-       起（见 RemotingClient._write）。
+    1. The shutdown path. If the previous round's connection was closed hard (no close_notify sent), the kernel receive buffer still holds the peer's
+       unread TLS 1.3 NewSessionTicket, so RST is sent instead of FIN; this RST hits the next new connection reusing the same
+       4-tuple, and the new connection's first request is silently swallowed.
+    2. The read thread starts too early. Letting the read thread enter OpenSSL right after the handshake, the TLS 1.3 first
+       record written immediately after has about a 3~5% chance of never reaching the peer (the peer's TLS read waits until timeout), and the caller can only wait out the invoke
+       timeout; plaintext connections do not show this. So TLS connections defer the read thread until after the first record is written
+       (see RemotingClient._write).
 
-    改前本机 loopback 每轮新建连接约 25~30% 挂一次，两处都修完必须 0 次。30 轮而不止
-    12 轮：5% 的单轮概率下 12 轮只有约一半的把握能抓到回归。
+    Before the fix, each new loopback connection hung about 25~30% of the time; with both fixes it must be 0 times. 30 rounds and not just
+    12: at a 5% per-round probability, 12 rounds only gives about a coin-flip chance of catching the regression.
     """
     server = TlsFrameServer(*tls_cert)
     addr = "127.0.0.1:%d" % server.port
@@ -234,8 +234,8 @@ def test_tls_reconnect_cycles_every_request_round_trips(tls_cert):
         for _ in range(30):
             client = RemotingClient(tls_enable=True)
             try:
-                # 10s 而不是 3s：这里断言的是「请求必须送达」，不是延迟。整套用例并发跑时
-                # Windows 上的 TLS 握手会偶发超过 3s，会被误判成首包被吞。
+                # 10s instead of 3s: what is asserted here is "the request must be delivered", not latency. When the whole suite runs concurrently
+                # the TLS handshake on Windows occasionally exceeds 3s, which would be misjudged as the first packet being swallowed.
                 resp = client.invoke_sync(addr, _route_request(), 10000)
                 assert resp.code == ResponseCode.SUCCESS
             finally:
@@ -245,7 +245,7 @@ def test_tls_reconnect_cycles_every_request_round_trips(tls_cert):
 
 
 def test_tls_reader_starts_only_after_the_first_record(tls_cert):
-    """TLS 连接的读线程必须在第一个记录写出去之后才起；明文连接照旧立刻起。"""
+    """A TLS connection's read thread must start only after the first record is written; plaintext connections still start immediately."""
     server = TlsFrameServer(*tls_cert)
     addr = "127.0.0.1:%d" % server.port
     try:
@@ -254,11 +254,11 @@ def test_tls_reader_starts_only_after_the_first_record(tls_cert):
             sock = client._get_or_create_conn(addr)
             assert isinstance(sock, ssl.SSLSocket)
             assert client._reader_threads.get(addr) is None, \
-                "TLS 读线程在建连接时就起了，首包会被它和写路径抢 OpenSSL"
+                "the TLS read thread started when the connection was built, so the first packet would race with the write path for OpenSSL"
             assert client.invoke_sync(addr, _route_request(), 5000).code == ResponseCode.SUCCESS
             reader = client._reader_threads.get(addr)
             assert reader is not None and reader.is_alive()
-            # 第二条请求复用同一条连接：读线程已经在跑，不受影响
+            # the second request reuses the same connection: the read thread is already running, unaffected
             assert client.invoke_sync(addr, _route_request(), 5000).code == ResponseCode.SUCCESS
         finally:
             client.shutdown()
@@ -268,7 +268,7 @@ def test_tls_reader_starts_only_after_the_first_record(tls_cert):
 
 
 def test_tls_shutdown_leaves_no_reader_threads(tls_cert):
-    """shutdown() 必须等读线程退干净：套接字由读线程自己关，别人抢着关不安全。"""
+    """shutdown() must wait for the read threads to exit cleanly: the socket is closed by the read thread itself, and someone else grabbing the close is unsafe."""
     server = TlsFrameServer(*tls_cert)
     addr = "127.0.0.1:%d" % server.port
     before = {t.name for t in threading.enumerate()}
@@ -286,7 +286,7 @@ def test_tls_shutdown_leaves_no_reader_threads(tls_cert):
 
 
 def test_tls_client_to_plaintext_server_fails():
-    """TLS 客户端打到明文端口：握手必失败（收到的响应不是 TLS 握手）。"""
+    """A TLS client hitting a plaintext port: the handshake must fail (the response received is not a TLS handshake)."""
     listen = socket.socket()
     listen.bind(("127.0.0.1", 0))
     listen.listen(4)
@@ -295,7 +295,7 @@ def test_tls_client_to_plaintext_server_fails():
         try:
             while True:
                 conn, _ = listen.accept()
-                conn.close()   # 直接关：TLS 握手必然失败
+                conn.close()   # close directly: the TLS handshake must fail
         except OSError:
             pass
 

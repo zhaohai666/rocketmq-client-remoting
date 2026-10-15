@@ -21,7 +21,7 @@ def check(name, ok, detail=""):
 
 
 def wait_queues(consumer, topic, expect, budget=20):
-    """等路由可查（Go 侧刚建的 topic，broker -> nameserver 注册是异步的）。"""
+    """Wait until the route can be queried (the topic was just created on the Go side; the broker -> nameserver registration is asynchronous)."""
     deadline = time.time() + budget
     queues = []
     while time.time() < deadline:
@@ -64,58 +64,58 @@ def main():
     admin.set_namesrv_addr(NAMESRV)
     admin.start()
     try:
-        # ---- S1 Go 建的 topic 只有一个队列 -----------------------------------------
+        # ---- S1 the topic created by Go has exactly one queue ---------------------------
         queues = wait_queues(consumer, topic, 1)
-        check("S1 Go 建的 topic 有 1 个读队列", len(queues) == 1, "got=%d" % len(queues))
+        check("S1 the topic created by Go has 1 read queue", len(queues) == 1, "got=%d" % len(queues))
         if len(queues) != 1:
             return 1
         q0 = queues[0]
-        check("S1 队列号是 0 且 broker 名非空",
+        check("S1 the queue id is 0 and the broker name is not empty",
               q0.queue_id == 0 and bool(q0.broker_name),
               "broker=%s queue=%d" % (q0.broker_name, q0.queue_id))
 
-        # ---- S2 独立数一遍条数 -----------------------------------------------------
+        # ---- S2 count the messages independently ---------------------------------------
         hi = consumer.max_offset(q0)
         lo = consumer.min_offset(q0)
-        check("S2 max_offset == Go 报的总条数", hi == total, "max=%d want=%d" % (hi, total))
+        check("S2 max_offset == the total count reported by Go", hi == total, "max=%d want=%d" % (hi, total))
         check("S2 min_offset == 0", lo == 0, "min=%d" % lo)
 
         got = admin.examine_consumer_offset(go_group, q0)
-        check("S3 broker 上 Go 组的已提交位点 == COMMITTED", got == committed,
+        check("S3 the committed offset of the Go group on the broker == COMMITTED", got == committed,
               "broker=%r committed=%d" % (got, committed))
-        check("S3 COMMITTED 是部分位点（不是「全消费完」的巧合值）", committed < total,
+        check("S3 COMMITTED is a partial offset (not a coincidental \"everything consumed\" value)", committed < total,
               "committed=%d total=%d" % (committed, total))
 
-        # ---- S4 用 Python 的拉取读同一段 log，内容与顺序必须与 Go 侧一致 -----------
+        # ---- S4 read the same stretch of log with the Python pull; content and order must match Go ---
         result, err = safe_pull(consumer, q0, committed)
         if result is None:
-            check("S4 从 COMMITTED 拉起（Python 侧）", False, err)
+            check("S4 pulled from COMMITTED (Python side)", False, err)
         else:
             bodies = [bytes(m.body) for m in result.msg_found_list]
             expect_bodies = [b"go-pull-seed-%d" % i for i in range(committed + 1, 6)] + \
                             [b"go-pull-wake"]
-            check("S4 从 COMMITTED 拉起（Python 侧）= FOUND",
+            check("S4 pulled from COMMITTED (Python side) = FOUND",
                   result.status == PullStatus.FOUND,
                   "status=%s n=%d" % (result.status, len(result.msg_found_list)))
-            check("S4 条数 == TOTAL - COMMITTED", len(bodies) == total - committed,
+            check("S4 count == TOTAL - COMMITTED", len(bodies) == total - committed,
                   "n=%d want=%d" % (len(bodies), total - committed))
-            check("S4 正文与顺序完全一致（位点语义对齐）", bodies == expect_bodies,
+            check("S4 bodies and order match exactly (offset semantics aligned)", bodies == expect_bodies,
                   "got=%s" % [b.decode() for b in bodies])
-            # 位点是从 1 开始数的"下一条"，第 committed 条正是 seed-(committed+1)
-            check("S4 COMMITTED 指向第 %d 条消息" % (committed + 1),
+            # The offset counts the "next" entry starting at 1, so the committed-th message is exactly seed-(committed+1)
+            check("S4 COMMITTED points at message number %d" % (committed + 1),
                   bool(bodies) and bodies[0] == b"go-pull-seed-%d" % (committed + 1),
                   "head=%r" % (bodies[0] if bodies else b""))
             if result.msg_found_list:
                 m = result.msg_found_list[0]
-                check("S4 属性段可解析（KEYS）",
+                check("S4 the property segment is parseable (KEYS)",
                       m.get_property("KEYS") == "go-pull-key-%d" % (committed + 1),
                       "keys=%r" % m.get_property("KEYS"))
-                check("S4 带 UNIQ_KEY", bool(m.get_property("UNIQ_KEY")),
+                check("S4 carries UNIQ_KEY", bool(m.get_property("UNIQ_KEY")),
                       "uniq=%r" % m.get_property("UNIQ_KEY"))
 
-        # ---- S5 sendMessageBack 必须落在 %RETRY%<go_group> -------------------------
-        # Go 侧回投的是队头那条（go-pull-seed-1），delayLevel=1 → 约 1s 后由投递服务
-        # 放回重试队列。
+        # ---- S5 sendMessageBack must land in %RETRY%<go_group> ---------------------------
+        # The Go side sends back the head entry (go-pull-seed-1) with delayLevel=1, so the
+        # delivery service puts it back into the retry queue after roughly 1s.
         retry_topic = "%RETRY%" + go_group
         found = False
         detail = "retry topic never became routable"
@@ -150,13 +150,13 @@ def main():
                     break
             if not found:
                 time.sleep(1)
-        check("S5 %RETRY%<group> 拉到了被回投的消息", found, detail)
+        check("S5 %RETRY%<group> pulled the message that was sent back", found, detail)
         if found:
-            check("S5 回投的是队头那条（go-pull-seed-1）", "go-pull-seed-1" in detail, detail)
-            check("S5 reconsumeTimes 已自增到 1（broker 走了重投路径）",
+            check("S5 the message sent back is the head entry (go-pull-seed-1)", "go-pull-seed-1" in detail, detail)
+            check("S5 reconsumeTimes has been incremented to 1 (the broker took the redelivery path)",
                   "reconsumeTimes=1" in detail, detail)
 
-        # ---- S6 %DLQ% 必须是空的：maxReconsumeTimes=16 而不是 push 的 -1 -----------
+        # ---- S6 %DLQ% must be empty: maxReconsumeTimes=16 instead of the push default -1 ---------
         dlq_topic = "%DLQ%" + go_group
         dlq_msgs = []
         try:
@@ -173,9 +173,9 @@ def main():
                 if r is not None:
                     dlq_msgs.extend(bytes(m.body) for m in r.msg_found_list)
         except BaseException:  # noqa: BLE001
-            # 路由不存在 = broker 从没建过这个 DLQ topic，正是期望结果
+            # No route means the broker never created this DLQ topic, which is exactly the expected outcome
             dlq_msgs = []
-        check("S6 %DLQ%<group> 是空的（没有直奔死信队列）", not dlq_msgs,
+        check("S6 %DLQ%<group> is empty (nothing went straight to the dead-letter queue)", not dlq_msgs,
               "dlq=%s" % dlq_msgs)
     finally:
         try:

@@ -13,8 +13,8 @@ NS = "127.0.0.1:19876"
 
 
 def _fresh_manager() -> MQClientManager:
-    # 用进程级单例：MQClientInstance.start 失败时的自摘除、门面的 register/unregister
-    # 都发生在单例上，断言必须看同一张表（autouse fixture 负责用例间清表）。
+    # Uses the process-level singleton: both MQClientInstance.start-failure self-removal and the facade's register/unregister
+    # happen on the singleton, so assertions must look at the same table (the autouse fixture clears the table between tests).
     return MQClientManager.get_instance()
 
 
@@ -30,17 +30,17 @@ def _cleanup():
     MQClientInstance.INSTANCE_MAP.clear()
 
 
-# ---------------------------------------------------------------- 缓存与创建
+# ---------------------------------------------------------------- Cache and creation
 
 def test_same_client_id_reuses_instance():
-    """同 clientId：第二次 get_or_create 返回同一实例，created=False。"""
+    """Same clientId: the second get_or_create returns the same instance, created=False."""
     mgr = _fresh_manager()
     inst, created = mgr.get_or_create_mq_client_instance("a@b", lambda: _make_instance("a@b"))
     assert created is True
     again, created2 = mgr.get_or_create_mq_client_instance("a@b", lambda: _make_instance("a@b"))
     assert created2 is False
     assert again is inst
-    # factory 未命中缓存时才该被调用 —— 上面第二次没建新实例
+    # The factory should only be called on a cache miss — the second call above did not build a new instance
     assert mgr.get_client_factory("a@b") is inst
 
 
@@ -53,7 +53,7 @@ def test_different_client_ids_do_not_share():
 
 
 def test_concurrent_get_or_create_creates_exactly_one():
-    """并发 get_or_create 同一 clientId：只有一个赢家，其余拿到缓存实例。"""
+    """Concurrent get_or_create of the same clientId: only one winner, the rest get the cached instance."""
     mgr = _fresh_manager()
     built = []
 
@@ -74,33 +74,33 @@ def test_concurrent_get_or_create_creates_exactly_one():
         t.start()
     for t in threads:
         t.join()
-    # 全部拿到同一实例；只有落表的那一个（≤1 个）看到 created=True
+    # All get the same instance; only the one that landed in the table (at most 1) sees created=True
     assert all(r[0] is results[0][0] for r in results)
     assert len([r for r in results if r[1] is True]) <= 1
     assert mgr.get_client_factory("race@id") is results[0][0]
 
 
-# ---------------------------------------------------------------- 引用计数生命周期
+# ---------------------------------------------------------------- Reference count lifecycle
 
 def test_refcount_two_facades_share_then_survive_then_close():
-    """同 clientId 两门面共享（计数 2）→ 先关一个仍存活 → 全关才关闭。"""
+    """Two facades sharing one clientId (count 2) → closing one still leaves it alive → all closed before shutdown."""
     mgr = _fresh_manager()
     inst, _ = mgr.get_or_create_mq_client_instance("life@id", lambda: _make_instance("life@id"))
     mgr.register_client("life@id", inst)
     mgr.register_client("life@id", inst)
     assert mgr.refcount_of("life@id") == 2
 
-    # 第一个门面 shutdown：实例仍存活、仍在缓存、连接未关
+    # First facade shutdown: the instance is still alive, still cached, connection not closed
     mgr.unregister_client("life@id", inst)
     assert mgr.refcount_of("life@id") == 1
     assert mgr.get_client_factory("life@id") is inst
     assert inst.remoting_client._closed is False
 
-    # 复用方仍能拿到同一实例
+    # A reuser can still get the same instance
     again, created = mgr.get_or_create_mq_client_instance("life@id", lambda: _make_instance("life@id"))
     assert created is False and again is inst
 
-    # 第二个门面 shutdown：计数归零 → 真正关闭 + 摘表
+    # Second facade shutdown: count drops to zero → real shutdown + removal from table
     mgr.unregister_client("life@id", inst)
     assert mgr.refcount_of("life@id") == 0
     assert mgr.get_client_factory("life@id") is None
@@ -108,8 +108,8 @@ def test_refcount_two_facades_share_then_survive_then_close():
 
 
 def test_unregister_unknown_instance_shuts_it_down_directly():
-    """不在缓存里的实例（测试替身 / 旧调用方直接构造的）：按旧语义直接关，
-    且不影响缓存中可能存在的同键条目。"""
+    """An instance not in the cache (a test double / directly constructed by an old caller): shut down directly per the old semantics,
+    without affecting the same-key entry that may exist in the cache."""
     mgr = _fresh_manager()
     cached, _ = mgr.get_or_create_mq_client_instance("mix@id", lambda: _make_instance("mix@id"))
     mgr.register_client("mix@id", cached)
@@ -124,13 +124,13 @@ def test_unregister_unknown_instance_shuts_it_down_directly():
     fake = _Fake()
     mgr.unregister_client("mix@id", fake)
     assert fake.shutdown_called is True
-    # 缓存条目原封不动
+    # The cache entry is untouched
     assert mgr.get_client_factory("mix@id") is cached
     assert mgr.refcount_of("mix@id") == 1
 
 
 def test_register_client_registers_unmanaged_instance():
-    """未经 get_or_create 的实例 register 后正常进入引用计数闭环。"""
+    """An instance not created via get_or_create enters the reference-count loop properly after register."""
     mgr = _fresh_manager()
     inst = _make_instance("unmanaged@id")
     mgr.register_client("unmanaged@id", inst)
@@ -148,13 +148,13 @@ def test_remove_client_factory_drops_entry_without_shutdown():
     mgr.remove_client_factory("drop@id", inst)
     assert mgr.get_client_factory("drop@id") is None
     assert inst.remoting_client._closed is False
-    # 不属于自己（identity 不符）的条目不能误删
+    # An entry that is not one's own (identity mismatch) must not be deleted by mistake
     other, _ = mgr.get_or_create_mq_client_instance("keep@id", lambda: _make_instance("keep@id"))
-    mgr.remove_client_factory("keep@id", inst)  # 传的是别人的实例
+    mgr.remove_client_factory("keep@id", inst)  # passing someone else's instance
     assert mgr.get_client_factory("keep@id") is other
 
 
-# ---------------------------------------------------------------- 实例生命周期幂等
+# ---------------------------------------------------------------- Instance lifecycle idempotence
 
 def test_instance_start_is_idempotent():
     pass
@@ -175,7 +175,7 @@ def test_instance_start_is_idempotent():
 def test_instance_start_failure_removes_itself_from_cache(monkeypatch):
     pass
     mgr = _fresh_manager()
-    # 空 name server + 动态取址失败 → _start_locked 在 dynamic 分支抛 10004
+    # Empty name server + dynamic address fetch failure → _start_locked throws 10004 in the dynamic branch
     inst, created = mgr.get_or_create_mq_client_instance(
         "fail@id", lambda: MQClientInstance("fail@id", []))
     assert created is True
@@ -191,17 +191,17 @@ def test_instance_start_failure_removes_itself_from_cache(monkeypatch):
     assert mgr.get_client_factory("fail@id") is None
 
 
-# ---------------------------------------------------------------- 39 事务回查分派
+# ---------------------------------------------------------------- 39 transaction check dispatch
 
 def test_transaction_check_handlers_register_dispatch_unregister():
-    """39 实例级分派器：逐个扇给登记的处理器、去重、注销摘除。"""
+    """The 39 instance-level dispatcher: fans out to registered handlers one by one, dedupes, and removes on unregister."""
     inst = _make_instance("tx@id")
     calls = []
     h1 = lambda cmd, addr: calls.append(("h1", addr))  # noqa: E731
     h2 = lambda cmd, addr: calls.append(("h2", addr))  # noqa: E731
 
     inst.register_transaction_check_handler(h1)
-    inst.register_transaction_check_handler(h1)  # 幂等：重复登记不叠加
+    inst.register_transaction_check_handler(h1)  # idempotent: repeated registration does not stack
     inst.register_transaction_check_handler(h2)
 
     inst._dispatch_check_transaction_state(None, "broker-addr")
@@ -211,7 +211,7 @@ def test_transaction_check_handlers_register_dispatch_unregister():
     calls.clear()
     inst._dispatch_check_transaction_state(None, "b")
     assert calls == [("h2", "b")]
-    # 注销未登记的处理器是 no-op
+    # Unregistering an unregistered handler is a no-op
     inst.unregister_transaction_check_handler(h1)
 
 
@@ -229,11 +229,11 @@ def test_transaction_check_dispatch_swallows_handler_exception():
     assert calls == ["addr-x"]
 
 
-# ---------------------------------------------------------------- 门面级共享（真实 producer）
+# ---------------------------------------------------------------- Facade-level sharing (real producer)
 
 def test_two_producers_share_instance_and_refcount_survives_partial_shutdown():
-    """门面级：同进程两个生产者（同 instanceName → 同 clientId）共享实例；
-    先关一个实例仍存活，全关后才真正关闭。"""
+    """Facade level: two producers in the same process (same instanceName → same clientId) share the instance;
+    closing one leaves the instance alive; only after all are closed is it really shut down."""
     from client.mq_client_manager import MQClientManager as Mgr
 
     mgr = Mgr.get_instance()
@@ -252,23 +252,23 @@ def test_two_producers_share_instance_and_refcount_survives_partial_shutdown():
             assert client_id == p2.client_id
             assert mgr.refcount_of(client_id) == 2
             inst = p1._mq_client
-            # 先关一个：实例与它的实例级后台线程继续存活
+            # Close one first: the instance and its instance-level background threads keep running
             p1.shutdown()
             assert mgr.refcount_of(client_id) == 1
             assert mgr.get_client_factory(client_id) is inst
             assert inst.remoting_client._closed is False
         finally:
             p2.shutdown()
-        # 全关：实例关闭并从缓存摘除
+        # All closed: the instance shuts down and is removed from the cache
         assert mgr.refcount_of(client_id) == 0
         assert mgr.get_client_factory(client_id) is None
         assert inst.remoting_client._closed is True
-        # 关掉实例后 p2 侧不该有残留的可发送状态混乱 —— _require_client 会拒
+        # After the instance is closed, the p2 side should not have leftover sendable-state confusion — _require_client will reject
         from client.exception import MQClientException
         with pytest.raises(MQClientException):
             p2._require_client()
     finally:
-        # 防御：万一上面断言失败，把还在跑的门面收掉
+        # Defensive: in case an assertion above fails, shut down the still-running facades
         if p1._started:
             p1.shutdown()
         if p2._started:
@@ -276,7 +276,7 @@ def test_two_producers_share_instance_and_refcount_survives_partial_shutdown():
 
 
 def test_producers_with_different_instance_names_do_not_share():
-    """门面级：instanceName 不同 → clientId 不同 → 实例不共享。"""
+    """Facade level: different instanceName → different clientId → instances are not shared."""
     mgr = MQClientManager.get_instance()
     p1 = DefaultMQProducer("MgrDiffPG")
     p1.set_namesrv_addr(NS)

@@ -1,16 +1,19 @@
 # -*- coding: utf-8 -*-
-"""RPC 钩子基类与实现。
+"""The RPC hook base class and its implementations.
 
-AclClientRPCHook：基于 accessKey/secretKey 计算签名并注入 extFields
-（AccessKey / Signature / SecurityToken）。签名算法与 broker 侧 acl 模块的
-验签口径**逐字节一致**（combineRequestContent + calSignature）：
+AclClientRPCHook: computes a signature from accessKey/secretKey and injects it into
+extFields (AccessKey / Signature / SecurityToken). The signature algorithm is
+**byte-for-byte identical** to the verification on the broker side's acl module
+(combineRequestContent + calSignature):
 
-签名内容：按 key 字典序取 extFields 的**全部** value（排除 Signature 键自身；
-只有 value，不带 key、不带 `=`/`&` 之类分隔符）按 UTF-8 拼接，再拼上 body 原始字节。
-签名值：标准 Base64( HMAC-SHA1(key = secretKey, data = 上述内容) )。
+Signed content: take the **all** values of extFields in key lexicographic order (excluding
+the Signature key itself; only the values, without the keys and without separators such
+as `=`/`&`), concatenate them as UTF-8, then append the raw body bytes.
+Signature value: standard Base64( HMAC-SHA1(key = secretKey, data = the content above) ).
 
-注意两处顺序：AccessKey / SecurityToken 必须在算 content **之前**写入 extFields
-（它们参与签名）；Signature 最后写入（它自己不参与签名）。
+Note the two ordering rules: AccessKey / SecurityToken must be written into extFields
+**before** the content is computed (they take part in the signature); Signature is written
+last (it does not take part in the signature itself).
 """
 from __future__ import annotations
 
@@ -25,7 +28,7 @@ from .protocol.remoting_command import RemotingCommand
 
 
 class RPCHook:
-    """RPC 钩子基类：发送前 / 收到响应后的拦截点。"""
+    """The RPC hook base class: the interception points before sending / after receiving a response."""
 
     def do_before_request(self, remote_addr: str, request: RemotingCommand) -> None:
         pass
@@ -36,7 +39,7 @@ class RPCHook:
 
 
 class SessionCredentials:
-    """ACL 会话凭据：AccessKey / SecretKey / SecurityToken。"""
+    """ACL session credentials: AccessKey / SecretKey / SecurityToken."""
 
     CHARSET = "utf-8"
     ACCESS_KEY = "AccessKey"
@@ -51,7 +54,7 @@ class SessionCredentials:
 
 
 class AclClientRPCHook(RPCHook):
-    """ACL 签名钩子：用 SessionCredentials 给请求加签。"""
+    """The ACL signature hook: signs requests with SessionCredentials."""
 
     ACCESS_KEY = SessionCredentials.ACCESS_KEY
     SIGNATURE = SessionCredentials.SIGNATURE
@@ -61,8 +64,9 @@ class AclClientRPCHook(RPCHook):
         self.credentials = credentials
 
     def do_before_request(self, remote_addr: str, request: RemotingCommand) -> None:
-        # 顺序不可变：先写 AccessKey/SecurityToken（参与签名），
-        # 再算签名，最后写 Signature（自身不参与签名）。
+        # The order is fixed: write AccessKey/SecurityToken first (they take part in
+        # the signature), then compute the signature, then write Signature last (it
+        # does not take part in the signature itself).
         request.add_ext_field(self.ACCESS_KEY, self.credentials.access_key)
         if self.credentials.security_token:
             request.add_ext_field(self.SECURITY_TOKEN, self.credentials.security_token)
@@ -71,11 +75,12 @@ class AclClientRPCHook(RPCHook):
 
     @staticmethod
     def build_request_content(request: RemotingCommand) -> bytes:
-        """拼出 ACL 待签内容（与 broker 侧 combineRequestContent 的口径一致）。
+        """Build the ACL content to be signed (matching the broker side's combineRequestContent).
 
-        验签侧会先 request.makeCustomHeaderToNet() 把 customHeader 的字段落进
-        extFields，再按 TreeMap（key 字典序）取全部 value。
-        这里等价：先 make_custom_header_to_net()，再对 ext_fields 排序。
+        The verifying side first calls request.makeCustomHeaderToNet() to put the
+        customHeader fields into extFields, then takes all values in a TreeMap
+        (key lexicographic order).
+        The equivalent here: call make_custom_header_to_net() first, then sort ext_fields.
         """
         request.make_custom_header_to_net()
         fields = request.ext_fields or {}
@@ -94,35 +99,38 @@ class AclClientRPCHook(RPCHook):
 
     @staticmethod
     def calc_signature(secret_key: str, request: RemotingCommand) -> str:
-        """计算签名：HmacSHA1 + 标准 Base64（带 `=` 填充），与 broker 验签一致。"""
+        """Compute the signature: HmacSHA1 + standard Base64 (with `=` padding), identical to the broker-side verification."""
         data = AclClientRPCHook.build_request_content(request)
         digest = _hmac.new(secret_key.encode(SessionCredentials.CHARSET), data,
                            hashlib.sha1).digest()
         return base64.b64encode(digest).decode(SessionCredentials.CHARSET)
 
 
-# 兼容旧名（最初写作 AclRPCHook）
+# Kept for the old name (originally spelled AclRPCHook)
 AclRPCHook = AclClientRPCHook
 
 
 class NamespaceRpcHook(RPCHook):
-    """namespaceV2 请求头钩子。
+    """The namespaceV2 request header hook.
 
-    `do_before_request` 只有一个非空守卫：namespaceV2
-    非空时给每笔请求加两个扩展字段::
+    `do_before_request` has a single non-empty guard: when namespaceV2 is not empty it
+    adds two extra fields to every request::
 
         nsd = "true"            （MixAll.RPC_REQUEST_HEADER_NAMESPACED_FIELD）
         ns  = <namespaceV2>     （MixAll.RPC_REQUEST_HEADER_NAMESPACE_FIELD）
 
-    这是 5.x 的**服务端**命名空间机制（阿里云 serverless 实例 id 之类，broker 据
-    请求头解析真实 topic），与旧 `namespace` 字段在本客户端拼 topic 名的机制无关。
+    This is the **server-side** namespace mechanism of 5.x (an Alibaba Cloud serverless
+    instance id and the like, with the broker resolving the real topic from the request
+    header); it is unrelated to the old `namespace` field that this client uses to build
+    topic names.
 
-    未配置时**什么都不做**：不得创建空的 extFields（extFields 必须保持为 null，
-    这是 `tests/test_namespace_rpc_hook.py` 钉住的契约）。`do_after_response` 是空实现。
+    When it is not configured it **does nothing at all**: it must not create an empty
+    extFields (extFields has to stay null -- that is the contract pinned by
+    `tests/test_namespace_rpc_hook.py`). `do_after_response` is an empty implementation.
 
-    ⚠ 注册顺序见 `client/mq_client.py` 的 `MQClientInstance.__init__`：本钩子必须
-    排在 Stream 钩子与用户钩子（ACL 签名）**之前**，
-    这样 `nsd`/`ns` 才会被算进 ACL 签名内容。
+    CAUTION about the registration order (see `MQClientInstance.__init__` in
+    `client/mq_client.py`): this hook must be registered **before** the Stream hook and
+    the user hook (the ACL signature), so that `nsd`/`ns` end up in the ACL signed content.
     """
 
     def __init__(self, namespace_v2: Optional[str] = None):
@@ -137,15 +145,17 @@ class NamespaceRpcHook(RPCHook):
 
 
 class StreamTypeRPCHook(RPCHook):
-    """给每个请求打上请求类型标记（Stream 类型）。
+    """Tag every request with its request type marker (the Stream type).
 
-    `do_before_request` 只有一行：
+    `do_before_request` is a single line:
     `request.addExtField(MixAll.REQ_T, String.valueOf(RequestType.STREAM.getCode()))`，
-    即 `ReqT = "0"`（`RequestType` 目前只有 STREAM 一个枚举项，code 为 `(byte) 0`）。
+    that is, `ReqT = "0"` (`RequestType` currently has only the single enum entry STREAM,
+    whose code is `(byte) 0`).
 
-    ⚠ 注册顺序有意义：Stream 钩子必须注册在
-    用户的 rpcHook（通常是 ACL 签名钩子）**之前**，这样 ReqT 才会被算进签名内容，
-    broker 侧才不会因为多出一个未签名字段而拒签。
+    CAUTION: the registration order matters -- the Stream hook must be registered
+    **before** the user's rpcHook (usually the ACL signature hook), so that ReqT ends up
+    in the signed content; otherwise the broker side rejects the signature because of an
+    extra unsigned field.
     """
 
     def do_before_request(self, remote_addr: str, request: RemotingCommand) -> None:

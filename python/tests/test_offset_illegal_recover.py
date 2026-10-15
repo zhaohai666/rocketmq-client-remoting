@@ -23,7 +23,7 @@ def msg(queue_offset: int) -> MessageExt:
 
 
 class FakeClient:
-    """只记 RPC，不碰网络（``_on_queues_revoked`` 的落盘走它）。"""
+    """Only records RPC, never touches the network (``_on_queues_revoked``'s persistence goes through it)."""
 
     def __init__(self):
         self.offsets = []
@@ -42,7 +42,7 @@ class FakeListener:
 
 
 class Harness:
-    """一个不碰网络的 push consumer：缓冲/位点/代号都手动搭。"""
+    """A push consumer that never touches the network: buffer / offset / key are all set up manually."""
 
     def __init__(self, assigned: bool = True, epoch: int = 0):
         self.c = DefaultMQPushConsumer(GROUP)
@@ -59,7 +59,7 @@ class Harness:
                 self.c._queue_epoch[self.key] = epoch
 
     def freeze(self, off: int) -> None:
-        """模拟拉取回调里 OFFSET_ILLEGAL 的锁内动作（游标 + 冻结 + 修正值）。"""
+        """Simulate the in-lock actions of OFFSET_ILLEGAL in the pull callback (cursor + freeze + corrected value)."""
         with self.c._lock:
             self.c._offset_table[self.key] = off
             self.c._frozen_offsets.add(self.key)
@@ -80,7 +80,7 @@ class Harness:
         self.c._advance_consume_offset(self.key, [msg(o) for o in offsets], epoch=epoch)
 
 
-# ------------------------------------------------- 纠错 = 冻结 + 丢队列 + 立刻落盘
+# ------------------------------------------------- Correction = freeze + drop queue + persist immediately
 
 
 class TestRecover:
@@ -90,7 +90,7 @@ class TestRecover:
         h.c._msg_queue_inflight[h.key] = 1
         h.freeze(0)
         h.recover()
-        # 队列的本地状态全部作废：缓冲、游标、已消费位点、线程表、分配表
+        # All local state of the queue is voided: buffer, cursor, consumed offset, thread table, assignment table
         assert h.key not in h.c._pending
         assert h.key not in h.c._offset_table
         assert h.key not in h.c._consume_offsets
@@ -104,7 +104,7 @@ class TestRecover:
         assert h.client.offsets == [(GROUP, h.mq, 0)]
 
     def test_recover_wakes_the_rebalance_loop(self):
-        # removeProcessQueue 之后靠 rebalanceImmediately 重建这条队列
+        # After removeProcessQueue, the queue is rebuilt via rebalanceImmediately
         h = Harness()
         h.freeze(0)
         assert not h.c._rebalance_now.is_set()
@@ -118,21 +118,21 @@ class TestRecover:
         assert h.epoch == 1
 
     def test_recover_without_a_queue_is_a_noop(self):
-        # 队列已经不在本实例名下（并发撤销）：没有 mq 就没有可落盘的对象，不能凭空造一条
+        # The queue is no longer under this instance (concurrent revoke): with no mq there is nothing to persist, and none can be conjured up
         h = Harness(assigned=False)
         h.recover()
         assert h.client.offsets == []
         assert h.c._rebalance_now.is_set()
 
 
-# ------------------------------------------------- 冻结：修正值不被在途 ack 推翻
+# ------------------------------------------------- Freeze: the corrected value is not overturned by in-flight acks
 
 
 class TestFreeze:
     def test_frozen_offset_ignores_ack(self):
         h = Harness()
         h.freeze(0)
-        # 旧批次（offset 2 已消费）迟到的 ack：把位点推回 3 就是弹跳现场
+        # A late ack from the old batch (offset 2 already consumed): pushing the offset back to 3 is the bounce scenario
         h.ack([0, 1, 2], epoch=0)
         assert h.offset == 0
 
@@ -153,14 +153,14 @@ class TestFreeze:
         h = Harness()
         h.freeze(0)
         h.recover()
-        # 重建：把队列重新划给自己（_rebalance_pull_threads 的 add 分支）
-        h.c._queue_pull_loop = lambda mq: None     # 线程里什么都不做
+        # Rebuild: reassign the queue to oneself (the add branch of _rebalance_pull_threads)
+        h.c._queue_pull_loop = lambda mq: None     # the thread does nothing
         h.c._assigned = [h.mq]
         h.c._started = True
         h.c.subscription_data[TOPIC] = SubscriptionData(topic=TOPIC, sub_string="*")
         h.c._rebalance_pull_threads()
         assert h.key not in h.c._frozen_offsets
-        # 重建后 ack 恢复正常
+        # After the rebuild, acks work normally
         h.ack([0, 1])
         assert h.offset == 2
 
@@ -169,7 +169,7 @@ class TestFreeze:
 
 class TestDroppedBatch:
     def test_stale_epoch_ack_is_dropped(self):
-        # 队列被撤销/重建（代号 0 → 1）后，旧批次迟到的 ack 不能再动位点
+        # After the queue is revoked/rebuilt (epoch 0 → 1), a late ack from the old batch must not move the offset again
         h = Harness(epoch=1)
         h.c._consume_offsets[h.key] = 0
         h.ack([0, 1, 2], epoch=0)

@@ -11,7 +11,7 @@ TOPIC = "SubAfterStartTopic"
 
 
 class FakeClient:
-    """只实现心跳路径要用的两个方法：截报文体 + 记录路由登记。"""
+    """Implements only the two methods needed by the heartbeat path: intercepting the report body + recording route registration."""
 
     def __init__(self) -> None:
         self.heartbeats: List[HeartbeatData] = []
@@ -21,9 +21,9 @@ class FakeClient:
         return ["127.0.0.1:10911"]
 
     def get_all_broker_addrs(self) -> List[str]:
-        # 消费者心跳取的是「每个 brokerId 一台」的地址表（主 + 从）。这个替身只有一台，
-        # 两份地址表内容相同；扇出是否真的覆盖从节点由
-        # test_producer_unregister.test_consumer_heartbeat_fans_out_to_slaves_... 锁。
+        # the consumer heartbeat takes the "one per brokerId" address table (master + slaves). This stand-in has only one machine,
+        # so the two address tables have the same contents; whether the fan-out really covers slaves is locked by
+        # test_producer_unregister.test_consumer_heartbeat_fans_out_to_slaves_...
         return self.get_route_of_all_brokers()
 
     def send_heartbeat(self, addr: str, hb: HeartbeatData, timeout_millis: int) -> None:
@@ -34,7 +34,7 @@ class FakeClient:
 
 
 def started(group: str = "GID_SubAfterStart"):
-    """造一个「已启动」的消费者，client 是替身，心跳报文可截获。"""
+    """Build a "started" consumer whose client is a stand-in and whose heartbeat reports can be intercepted."""
     c = DefaultMQPushConsumer(group)
     fake = FakeClient()
     c._mq_client = fake
@@ -43,7 +43,7 @@ def started(group: str = "GID_SubAfterStart"):
 
 
 def subs_of(hb: HeartbeatData):
-    """心跳体里那一份 ConsumerData 的订阅表（topic → SubscriptionData）。"""
+    """The subscription table of the ConsumerData in the heartbeat body (topic -> SubscriptionData)."""
     cd = list(hb.consumer_data_set)[0]
     return {s.topic: s for s in cd.subscription_data_set}
 
@@ -54,9 +54,9 @@ def test_subscribe_after_start_reaches_the_live_table_and_pushes_one_heartbeat()
 
     c.subscribe(TOPIC, "TagA||TagB")
 
-    assert len(fake.heartbeats) == 1, "一次 subscribe 恰好一轮心跳"
+    assert len(fake.heartbeats) == 1, "one subscribe triggers exactly one heartbeat"
     body = subs_of(fake.heartbeats[0])
-    assert TOPIC in body, "心跳报文必须带新订阅（否则 broker 记不到 topicGroupTable）"
+    assert TOPIC in body, "the heartbeat report must carry the new subscription (otherwise the broker cannot record it in topicGroupTable)"
     assert body[TOPIC].sub_string == "TagA||TagB"
     assert body[TOPIC].tags_set == {"TagA", "TagB"}
     assert fake.topics_in_use == [TOPIC]
@@ -72,7 +72,7 @@ def test_selector_subscribe_after_start_keeps_expression_type_in_the_body():
     body = subs_of(fake.heartbeats[0])
     assert body[TOPIC].expression_type == ExpressionType.SQL92
     assert body[TOPIC].sub_string == "a > 1"
-    assert not body[TOPIC].tags_set, "SQL92 不带 tagsSet"
+    assert not body[TOPIC].tags_set, "SQL92 carries no tagsSet"
 
     c2, fake2 = started("GID_SubAfterStart2")
     c2.subscribe_with_selector(TOPIC, MessageSelector.by_tag("X||Y"))
@@ -104,7 +104,7 @@ def test_unsubscribe_does_not_push_a_heartbeat():
 
     c.unsubscribe(TOPIC)
 
-    assert len(fake.heartbeats) == 1, "unsubscribe 不发心跳"
+    assert len(fake.heartbeats) == 1, "unsubscribe does not push a heartbeat"
     assert c.subscriptions() == []
 
 
@@ -118,7 +118,7 @@ def test_every_heartbeat_is_rebuilt_from_the_live_table():
     c._send_heartbeat_to_all_broker()
 
     latest = subs_of(fake.heartbeats[-1])
-    assert set(latest) == {"T_B"}, "撤掉的 T_A 不能再出现在报文里"
+    assert set(latest) == {"T_B"}, "the revoked T_A must no longer appear in the report"
     assert set(subs_of(fake.heartbeats[0])) == {"T_A"}
 
 
@@ -131,4 +131,4 @@ def test_resubscribe_same_topic_replaces_and_heartbeats_again():
     assert len(fake.heartbeats) == 2
     assert subs_of(fake.heartbeats[-1])[TOPIC].sub_string == "B"
     cd = list(fake.heartbeats[-1].consumer_data_set)[0]
-    assert len(cd.subscription_data_set) == 1, "同一 topic 覆盖，不是两条"
+    assert len(cd.subscription_data_set) == 1, "the same topic is replaced, not two entries"

@@ -466,34 +466,35 @@ func main() {
 	}
 
 	fmt.Printf("=== Go shutdown-race live: ns=%s tag=%s ===\n", *ns, tag)
-	fmt.Println("每个阶段都跑在独立进程里，Shutdown() 之后立刻 os.Exit —— 进程退出会掐断所有还在飞的 goroutine，")
-	fmt.Println("这正是被测的契约（单进程版会在退出前把没 join 的 goroutine 跑完，从而假绿）。")
+	fmt.Println("Every phase runs in its own process; Shutdown() is followed by an immediate os.Exit — the process exit")
+	fmt.Println("kills every goroutine still in flight, which is exactly the contract under test (a single-process version")
+	fmt.Println("would let un-joined goroutines finish before exit, producing a false green).")
 
 	// ---------------------------------------------------------------- S1
 	if want("s1") {
 		res := runChild(*ns, tag, "s1a", "")
-		check("S1-A 20 条整批投到 listener（整批回投在飞，立即退进程）",
+		check("S1-A 20 messages delivered to the listener in one batch (whole-batch send-back in flight, process exits immediately)",
 			atoi(res["delivered"]) == msgCount, "delivered="+res["delivered"])
 
 		res = runChild(*ns, tag, "s1b", "")
-		check("S1-A 关停返回前 send-back 已落地：%RETRY% 收齐 20 条原文",
+		check("S1-A send-backs landed before Shutdown() returned: %RETRY% holds all 20 original bodies",
 			atoi(res["retry"]) == msgCount, "retry="+res["retry"])
 
 		res = runChild(*ns, tag, "s1c", "")
-		check("S1-B 关停返回前 DLQ 回投已落地：%DLQ% 收齐 20 条原文",
+		check("S1-B DLQ send-backs landed before Shutdown() returned: %DLQ% holds all 20 original bodies",
 			atoi(res["dlq"]) == msgCount, "dlq="+res["dlq"])
 	}
 
 	// ---------------------------------------------------------------- S2
 	if want("s2") {
 		res := runChild(*ns, tag, "s2a", "")
-		check("S2-A 顺序消费挂起轮次已起（触发立即关停）",
+		check("S2-A orderly consumption suspension rounds under way (triggers the immediate shutdown)",
 			atoi(res["deliveries"]) >= orderlySuspendTrigger, "deliveries="+res["deliveries"])
 
 		res = runChild(*ns, tag, "s2b", "")
-		check("S2 立即退进程后 20 条原文全部重现（topic∪RETRY∪DLQ）",
+		check("S2 all 20 original bodies reappear after the immediate exit (topic UNION RETRY UNION DLQ)",
 			atoi(res["all"]) == msgCount, "all="+res["all"])
-		check("S2 顺序回投链路已落地 %DLQ%（越过本地重试上限的条目）",
+		check("S2 orderly send-back chain has landed in %DLQ% (entries past the local retry ceiling)",
 			atoi(res["dlq"]) >= 1, "dlq="+res["dlq"])
 	}
 
@@ -505,22 +506,22 @@ func main() {
 		if ids != "" {
 			sent = len(strings.Split(ids, ","))
 		}
-		check("T-A 6 条发送成功（轨迹生产者，发完立即退进程）", sent == traceCount,
+		check("T-A 6 messages sent successfully (traced producer, process exits immediately after sending)", sent == traceCount,
 			fmt.Sprintf("sent=%d", sent))
 
 		if sent == traceCount {
 			res = runChild(*ns, tag, "tb", ids)
-			check("T 立即退进程后最后一批 6 条 Pub 轨迹全部可读（shutdown 返回即已落 broker）",
+			check("T the last batch of 6 Pub traces all readable after the immediate exit (already on the broker once shutdown returns)",
 				res["matched"] == "1" && atoi(res["pubs"]) >= traceCount,
 				fmt.Sprintf("pubs=%s seen=%s", res["pubs"], res["seen"]))
 		} else {
-			check("T 立即退进程后最后一批 6 条 Pub 轨迹全部可读（shutdown 返回即已落 broker）",
-				false, "上游阶段没发出 6 条，无法判定")
+			check("T the last batch of 6 Pub traces all readable after the immediate exit (already on the broker once shutdown returns)",
+				false, "the upstream phase did not send 6 messages, cannot judge")
 		}
 	}
 
 	// ---------------------------------------------------------------- cleanup
-	fmt.Println("\n--- 清理 ---")
+	fmt.Println("\n--- cleanup ---")
 	admin := newAdmin(*ns, "ADMIN-shdn-race-"+tag)
 	if err := admin.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "admin start: %v\n", err)
@@ -560,9 +561,9 @@ func runChild(ns, tag, phase, msgids string) map[string]string {
 	var buf bytes.Buffer
 	cmd.Stdout = io.MultiWriter(os.Stdout, &buf)
 	cmd.Stderr = os.Stderr
-	fmt.Printf("\n--- phase %s：独立子进程（阶段结束 = 进程退出）---\n", phase)
+	fmt.Printf("\n--- phase %s: separate child process (phase end = process exit) ---\n", phase)
 	if err := cmd.Run(); err != nil {
-		fmt.Printf("--- phase %s 子进程非 0 退出: %v\n", phase, err)
+		fmt.Printf("--- phase %s child exited non-zero: %v\n", phase, err)
 	}
 	return parseResults(buf.String())
 }
@@ -644,10 +645,10 @@ func phaseS1A(ns string, n names) {
 	select {
 	case <-fa.full:
 	case <-time.After(firstDeliveryWindow):
-		fmt.Fprintf(os.Stderr, "s1a: 等不到整批投递（%d 条）\n", msgCount)
+		fmt.Fprintf(os.Stderr, "s1a: whole-batch delivery (%d messages) never arrived\n", msgCount)
 	}
 	fmt.Printf("RESULT delivered=%d\n", box.distinct(n.s1Topic))
-	fmt.Printf("  20 条整批已投到 listener（%v），此刻整批 send-back RPC 正在飞 → shutdown + 立刻退进程\n", box.distinct(n.s1Topic))
+	fmt.Printf("  20 messages delivered to the listener in one batch (%v); the whole-batch send-back RPCs are in flight now -> shutdown + immediate process exit\n", box.distinct(n.s1Topic))
 	c.Shutdown()
 	killNow()
 }
@@ -671,9 +672,9 @@ func phaseS1B(ns string, n names) {
 	box.waitDistinct("", msgCount, roundTripWindow)
 	got := box.distinct("")
 	fmt.Printf("RESULT retry=%d\n", got)
-	fmt.Printf("  %s 收到 %d/%d 条原文（判据：A 轮在途 send-back 已在关停返回前落地）\n",
+	fmt.Printf("  %s received %d/%d original bodies (criterion: round A's in-flight send-backs landed before shutdown returned)\n",
 		retryTopic, got, msgCount)
-	fmt.Printf("  listener 看到的主题分布：%s\n", box.topicSummary())
+	fmt.Printf("  topic distribution seen by the listener: %s\n", box.topicSummary())
 	c.Shutdown()
 	killNow()
 }
@@ -698,7 +699,7 @@ func phaseS1C(ns string, n names) {
 	box.waitDistinct(dlqTopic, msgCount, collectWindow)
 	got := box.distinct(dlqTopic)
 	fmt.Printf("RESULT dlq=%d\n", got)
-	fmt.Printf("  %s 收到 %d/%d 条原文；listener 主题分布：%s\n", dlqTopic, got, msgCount, box.topicSummary())
+	fmt.Printf("  %s received %d/%d original bodies; listener topic distribution: %s\n", dlqTopic, got, msgCount, box.topicSummary())
 	c.Shutdown()
 	killNow()
 }
@@ -745,7 +746,7 @@ func phaseS2A(ns string, n names) {
 	}
 	seen := atomic.LoadInt64(&deliveries)
 	fmt.Printf("RESULT deliveries=%d\n", seen)
-	fmt.Printf("  顺序投递轮次 %d（阈值 %d）：前几条已越过重试上限、顺序回投正在跑 → shutdown + 立刻退进程\n",
+	fmt.Printf("  orderly delivery round %d (threshold %d): leading messages already passed the retry limit, orderly redelivery in flight -> shutdown + exit process immediately\n",
 		seen, orderlySuspendTrigger)
 	c.Shutdown()
 	killNow()
@@ -801,7 +802,7 @@ func phaseTraceSend(ns string, n names) {
 		ids = append(ids, id)
 	}
 	fmt.Printf("RESULT msgids=%s\n", strings.Join(ids, ","))
-	fmt.Printf("  已发 %d 条，flush 周期（5s）没到 → shutdown + 立刻退进程\n", len(ids))
+	fmt.Printf("  sent %d messages, flush interval (5s) not reached -> shutdown + exit process immediately\n", len(ids))
 	p.Shutdown()
 	killNow()
 }
@@ -888,7 +889,7 @@ func phaseTraceRead(ns string, n names, msgIDs string) {
 			}
 		}
 	}
-	fmt.Printf("  RMQ_SYS_TRACE_TOPIC 读到 %d 条轨迹消息，其中 %d 条 Pub 命中本次 6 个 msgId\n",
+	fmt.Printf("  read %d trace messages from RMQ_SYS_TRACE_TOPIC, of which %d Pub messages matched this run's 6 msgIds\n",
 		len(seenBodies), pubs)
 	emit(pubs, len(seenBodies))
 	reader.Shutdown()

@@ -498,24 +498,24 @@ func cleanup(ns, prefix string, topics map[string]string) {
 // S1: the ACK really lands. Everything here is a timed window, because a POP
 // returns SUCCESS whether or not the broker could match the checkpoint.
 func runS1(ns, prefix string, topics map[string]string) {
-	fmt.Println("\n--- S1 基础：POP 消费 + ACK 真的生效（窗口内无重投）+ 不提交位点 ---")
+	fmt.Println("\n--- S1 basics: POP consumption + ACK really lands (no redelivery in the window) + no offset commit ---")
 	topic := prefix + "_Basic"
 	topics["s1"] = topic
 	group := "GID_" + prefix + "_s1"
 	const invisible = 5000
 
 	if err := ensureTopic(ns, "go-pop-s1-"+prefix, topic, 1); err != nil {
-		check("S1 建 topic", false, err.Error())
+		check("S1 create topic", false, err.Error())
 		return
 	}
 	brokerName, err := brokerNameOf(ns, "go-pop-s1-"+prefix, topic)
 	if err != nil {
-		check("S1 取路由", false, err.Error())
+		check("S1 fetch route", false, err.Error())
 		return
 	}
 	p, err := startProducer(ns, "GID_"+prefix+"_s1_prod", "go-pop-s1-prod-"+prefix)
 	if err != nil {
-		check("S1 构造生产者", false, err.Error())
+		check("S1 build producer", false, err.Error())
 		return
 	}
 	defer p.shutdown()
@@ -526,7 +526,7 @@ func runS1(ns, prefix string, topics map[string]string) {
 		invisible: invisible, popBatch: 32, batchMax: 5, popMode: true,
 	}, topic)
 	if err != nil {
-		check("S1 起 POP 消费者", false, err.Error())
+		check("S1 start POP consumer", false, err.Error())
 		return
 	}
 
@@ -538,7 +538,7 @@ func runS1(ns, prefix string, topics map[string]string) {
 			break
 		}
 	}
-	check("S1 发送 6 条", sendErr == "", sendErr)
+	check("S1 send 6 messages", sendErr == "", sendErr)
 
 	// A POP consumer rebalances like a pull consumer (the broker's request mode
 	// only decides which protocol serves the group), so it must have assigned
@@ -560,13 +560,13 @@ func runS1(ns, prefix string, topics map[string]string) {
 		}
 		return bizQ == 1
 	})
-	check("S1 分配到业务 topic 的 1 条队列（+ 隐式 %RETRY%<group>）", assigned && retryQ == 1,
+	check("S1 assigned 1 queue of the business topic (+ implicit %RETRY%<group>)", assigned && retryQ == 1,
 		fmt.Sprintf("biz=%d retry=%d total=%d popQueues=%d", bizQ, retryQ, totalQ, c.PopProcessQueueCount()))
 
 	gotAll := waitUntil(40*time.Second, func() bool {
 		return len(b.summary()) > 0 && strings.Count(b.summary(), "=") == len(bodies)
 	})
-	check("S1 6 条都被 POP 到", gotAll, b.summary())
+	check("S1 all 6 messages popped", gotAll, b.summary())
 
 	// Every delivered message must carry a checkpoint the ACK can use: eight
 	// segments, segment 0 is the batch start, segment 7 is THIS message's
@@ -586,7 +586,7 @@ func runS1(ns, prefix string, topics map[string]string) {
 				s.queueID == 0 && s.invisible == invisible && s.popTime > 0
 		}
 	}
-	check("S1 POP_CK 形状：8 段 / ackOffset==msgQueueOffset / marker=0 / 逻辑 broker 名", shapeOK, shape)
+	check("S1 POP_CK shape: 8 segments / ackOffset==msgQueueOffset / marker=0 / logical broker name", shapeOK, shape)
 
 	firstPopOK := false
 	if recs := b.all(); len(recs) > 0 {
@@ -594,7 +594,7 @@ func runS1(ns, prefix string, topics map[string]string) {
 		s, err := parseCk(r.ck)
 		firstPopOK = err == nil && r.firstPop == fmt.Sprint(s.popTime)
 	}
-	check("S1 1ST_POP_TIME == 本次 popTime", firstPopOK, firstDeliveryDetail(b))
+	check("S1 1ST_POP_TIME == this popTime", firstPopOK, firstDeliveryDetail(b))
 
 	// The topic handed to the listener is the requested one, not the physical
 	// pop topic (the broker rewrites it on the retry path; here they are equal).
@@ -602,10 +602,10 @@ func runS1(ns, prefix string, topics map[string]string) {
 	if recs := b.all(); len(recs) > 0 {
 		listenerTopicOK = recs[0].topic == topic
 	}
-	check("S1 listener 看到的是业务 topic", listenerTopicOK, topicOfFirst(b))
+	check("S1 listener sees the business topic", listenerTopicOK, topicOfFirst(b))
 
 	// The ACK debt must return to zero: every popped message was answered.
-	check("S1 ACK 债务归零", waitUntil(5*time.Second, func() bool { return c.PopWaitAckCount() == 0 }),
+	check("S1 ACK debt back to zero", waitUntil(5*time.Second, func() bool { return c.PopWaitAckCount() == 0 }),
 		fmt.Sprintf("waitAck=%d debt", c.PopWaitAckCount()))
 
 	// THE central assertion. If the ACK were a no-op the broker would revive the
@@ -614,13 +614,13 @@ func runS1(ns, prefix string, topics map[string]string) {
 	// back" is deliberate: the broker answers SUCCESS to a POP_ACK whose
 	// checkpoint it cannot find.
 	time.Sleep(time.Duration(invisible*5/2) * time.Millisecond)
-	check("S1 2.5x 不可见窗口内无重复投递（ACK 落到 broker）", b.noDupes(), fmt.Sprintf("dup=%q all=%s", b.dupes(), b.summary()))
+	check("S1 no duplicate delivery inside the 2.5x invisibility window (ACK reached the broker)", b.noDupes(), fmt.Sprintf("dup=%q all=%s", b.dupes(), b.summary()))
 
 	// POP keeps no client-side cursor: the broker's revive queue IS the cursor,
 	// so the consumer's own offset table must stay empty. A pull consumer would
 	// have one entry per assigned queue here, written when the assignment was
 	// first resolved.
-	check("S1 POP 模式下客户端不持有位点表", c.LocalOffsetCount() == 0,
+	check("S1 in POP mode the client holds no offset table", c.LocalOffsetCount() == 0,
 		fmt.Sprintf("localOffsets=%d", c.LocalOffsetCount()))
 
 	// Read the broker's offset back for INFORMATION ONLY — and note it is
@@ -631,7 +631,7 @@ func runS1(ns, prefix string, topics map[string]string) {
 	// self-heals it. Asserting "no offset on the broker" would therefore be
 	// wrong — the client-side table above is where the real contract lives.
 	if off, found := consumedOffset(ns, "go-pop-s1-"+prefix, group, topic, brokerName); found {
-		fmt.Printf("     (broker 侧 pop 游标 offset=%d，由 broker 自己提交，非客户端)\n", off)
+		fmt.Printf("     (broker-side pop cursor offset=%d, committed by the broker itself, not the client)\n", off)
 	}
 
 	c.Shutdown()
@@ -642,7 +642,7 @@ func runS1(ns, prefix string, topics map[string]string) {
 // S2: the retry path — changePopInvisibleTime, the POP retry topic, and the
 // checkpoint marker that makes the later ACK resolve to it.
 func runS2(ns, prefix string, topics map[string]string) {
-	fmt.Println("\n--- S2 失败退避：改不可见时间 → %RETRY%<group>_<topic> → 重投 + 1ST_POP_TIME 稳定 ---")
+	fmt.Println("\n--- S2 failure backoff: change invisible time -> %RETRY%<group>_<topic> -> redelivery + stable 1ST_POP_TIME ---")
 	topic := prefix + "_Retry"
 	topics["s2"] = topic
 	group := "GID_" + prefix + "_s2"
@@ -651,17 +651,17 @@ func runS2(ns, prefix string, topics map[string]string) {
 	const invisible = 5000
 
 	if err := ensureTopic(ns, "go-pop-s2-"+prefix, topic, 1); err != nil {
-		check("S2 建 topic", false, err.Error())
+		check("S2 create topic", false, err.Error())
 		return
 	}
 	brokerName, err := brokerNameOf(ns, "go-pop-s2-"+prefix, topic)
 	if err != nil {
-		check("S2 取路由", false, err.Error())
+		check("S2 fetch route", false, err.Error())
 		return
 	}
 	p, err := startProducer(ns, "GID_"+prefix+"_s2_prod", "go-pop-s2-prod-"+prefix)
 	if err != nil {
-		check("S2 构造生产者", false, err.Error())
+		check("S2 build producer", false, err.Error())
 		return
 	}
 	defer p.shutdown()
@@ -676,7 +676,7 @@ func runS2(ns, prefix string, topics map[string]string) {
 		invisible: invisible, popBatch: 32, batchMax: 1, maxRecon: 16, popMode: true,
 	}, topic)
 	if err != nil {
-		check("S2 起 POP 消费者", false, err.Error())
+		check("S2 start POP consumer", false, err.Error())
 		return
 	}
 	defer c.Shutdown()
@@ -688,17 +688,17 @@ func runS2(ns, prefix string, topics map[string]string) {
 			break
 		}
 	}
-	check("S2 发送 3 条", sendErr == "", sendErr)
+	check("S2 send 3 messages", sendErr == "", sendErr)
 
 	firstArrived := waitUntil(40*time.Second, func() bool { return b.countOf(poison) >= 1 })
 	// The queue count is 2 for the same reason as S1 (business topic + the
 	// implicit %RETRY%<group>), so it is reported rather than asserted here.
-	check("S2 首投 3 条", firstArrived, fmt.Sprintf("%s popQueues=%d", b.summary(), c.PopProcessQueueCount()))
+	check("S2 first delivery of 3 messages", firstArrived, fmt.Sprintf("%s popQueues=%d", b.summary(), c.PopProcessQueueCount()))
 	if !firstArrived {
 		return
 	}
 	first := b.ofBody(poison)[0]
-	check("S2 首投 recon=0 且 marker=0（来自业务 topic）", first.recon == 0 && markerOf(first) == "0",
+	check("S2 first delivery recon=0 and marker=0 (from the business topic)", first.recon == 0 && markerOf(first) == "0",
 		fmt.Sprintf("recon=%d marker=%q ck=%q", first.recon, markerOf(first), first.ck))
 
 	// The failed message is re-hidden, not sent back: changePopInvisibleTime
@@ -708,21 +708,21 @@ func runS2(ns, prefix string, topics map[string]string) {
 	// the retry topic is consulted, and the broker also consults it whenever the
 	// normal topic came up short, so this lands in tens of seconds.
 	redelivered := waitUntil(120*time.Second, func() bool { return b.countOf(poison) >= 2 })
-	check("S2 失败消息被重投（改不可见时间 + revive 生效）", redelivered, b.summary())
+	check("S2 failed message redelivered (change invisible time + revive in effect)", redelivered, b.summary())
 	if !redelivered {
 		return
 	}
 	second := b.ofBody(poison)[1]
-	check("S2 重投 recon 递增", second.recon >= 1,
+	check("S2 redelivery recon incremented", second.recon >= 1,
 		fmt.Sprintf("recon %d -> %d", first.recon, second.recon))
 	// THE marker assertion: "1" means the message was popped from
 	// %RETRY%<group>_<topic>, which is simultaneously
 	//   (a) proof the revive put it there, and
 	//   (b) the reason the ACK must be addressed to that retry topic — the broker
 	//       holds the checkpoint under the retry topic, not the business one.
-	check("S2 重投 marker=1（来自 POP 重试 topic，ACK 必须发回那里）", markerOf(second) == "1",
+	check("S2 redelivery marker=1 (from the POP retry topic, the ACK must go back there)", markerOf(second) == "1",
 		fmt.Sprintf("marker=%q ck=%q", markerOf(second), second.ck))
-	check("S2 重投 listener 看到的仍是业务 topic",
+	check("S2 redelivery still shows the business topic to the listener",
 		second.topic == topic && first.topic == topic,
 		fmt.Sprintf("first=%q second=%q want=%q", first.topic, second.topic, topic))
 	// It is deliberately NOT asserted to be byte-identical to the first
@@ -733,18 +733,18 @@ func runS2(ns, prefix string, topics map[string]string) {
 	// half only.
 	secondShape, shapeErr := parseCk(second.ck)
 	keptBrokerValue := shapeErr == nil && second.firstPop != "" && second.firstPop != fmt.Sprint(secondShape.popTime)
-	check("S2 1ST_POP_TIME 不被客户端改写（保留 broker 的值）", keptBrokerValue,
+	check("S2 1ST_POP_TIME not rewritten by the client (the broker's value is kept)", keptBrokerValue,
 		fmt.Sprintf("first=%q second=%q secondPopTime=%d", first.firstPop, second.firstPop, secondShape.popTime))
 
 	// Only the poison message may be delivered twice.
-	check("S2 其余消息只投一次", b.countOf("keep-1") == 1 && b.countOf("keep-2") == 1, b.summary())
+	check("S2 the other messages delivered exactly once", b.countOf("keep-1") == 1 && b.countOf("keep-2") == 1, b.summary())
 
 	// The retry topic is created by the revive service, so its route appearing is
 	// an independent, broker-side confirmation of the whole path.
-	check("S2 %RETRY%<group>_<topic> 路由出现", topicRoutable(ns, "go-pop-s2-route-"+prefix, retryTopic, 45*time.Second), retryTopic)
+	check("S2 %RETRY%<group>_<topic> route appears", topicRoutable(ns, "go-pop-s2-route-"+prefix, retryTopic, 45*time.Second), retryTopic)
 
 	// The redelivery was ACKed too, so the debt settles again.
-	check("S2 ACK 债务归零", waitUntil(10*time.Second, func() bool { return c.PopWaitAckCount() == 0 }),
+	check("S2 ACK debt back to zero", waitUntil(10*time.Second, func() bool { return c.PopWaitAckCount() == 0 }),
 		fmt.Sprintf("waitAck=%d", c.PopWaitAckCount()))
 
 	_ = brokerName

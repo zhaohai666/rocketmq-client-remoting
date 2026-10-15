@@ -126,12 +126,12 @@ func main() {
 		os.Exit(1)
 	}
 	defer c.Shutdown()
-	check("消费者 clientId 带 @STREAM", strings.Contains(c.ClientID(), "@STREAM"), "clientId="+c.ClientID())
+	check("consumer clientId carries @STREAM", strings.Contains(c.ClientID(), "@STREAM"), "clientId="+c.ClientID())
 
 	if err := c.CreateTopic(common.DefaultTopic, topicName, 1, 0); err != nil {
-		check("建 Topic", false, err.Error())
+		check("create Topic", false, err.Error())
 	} else {
-		check("建 Topic 成功（1 个读写队列）", true, "")
+		check("create Topic succeeded (1 read/write queue)", true, "")
 	}
 	var queues []common.MessageQueue
 	deadline := time.Now().Add(15 * time.Second)
@@ -146,19 +146,19 @@ func main() {
 		time.Sleep(300 * time.Millisecond)
 	}
 	if len(queues) != 1 {
-		check("FetchSubscribeMessageQueues 返回 1 个队列", false, fmt.Sprintf("got=%d err=%v", len(queues), err))
+		check("FetchSubscribeMessageQueues returns 1 queue", false, fmt.Sprintf("got=%d err=%v", len(queues), err))
 		fmt.Printf("\nPASS=%d FAIL=%d COMMITTED=%d TOTAL=%d\n", passCount, failCount, committedOffset, totalCount())
 		os.Exit(1)
 	}
-	check("FetchSubscribeMessageQueues 返回 1 个队列", queues[0].QueueID == 0,
+	check("FetchSubscribeMessageQueues returns 1 queue", queues[0].QueueID == 0,
 		fmt.Sprintf("queue=%v", queues[0]))
 	q0 := queues[0]
 
 	published, err := c.FetchPublishMessageQueues(topicName)
 	if err != nil || len(published) != 1 {
-		check("FetchPublishMessageQueues 返回 1 个写队列", false, fmt.Sprintf("got=%d err=%v", len(published), err))
+		check("FetchPublishMessageQueues returns 1 write queue", false, fmt.Sprintf("got=%d err=%v", len(published), err))
 	} else {
-		check("FetchPublishMessageQueues 返回 1 个写队列", published[0].QueueID == 0,
+		check("FetchPublishMessageQueues returns 1 write queue", published[0].QueueID == 0,
 			fmt.Sprintf("queue=%v", published[0]))
 	}
 
@@ -175,14 +175,14 @@ func main() {
 		time.Sleep(500 * time.Millisecond)
 	}
 	if err != nil {
-		check("FetchMessageQueuesInBalance 可用", false, err.Error())
+		check("FetchMessageQueuesInBalance usable", false, err.Error())
 	} else {
-		check("FetchMessageQueuesInBalance 独占分组时拿到这 1 个队列",
+		check("FetchMessageQueuesInBalance returns this 1 queue in an exclusive group",
 			len(balanced) == 1 && balanced[0].QueueID == 0,
-			fmt.Sprintf("got=%d queues=%v（没拉取过任何队列，非空只可能来自路由+38）", len(balanced), balanced))
+			fmt.Sprintf("got=%d queues=%v (no queue was ever pulled; a non-empty result can only come from route+38)", len(balanced), balanced))
 	}
 	emptyView, err := c.FetchMessageQueuesInBalance(topicName + "_NotCreated")
-	check("未建过的 topic 不抛、返回空份额而不是吞下全部队列",
+	check("a never-created topic does not throw: an empty share is returned instead of swallowing all queues",
 		err == nil && len(emptyView) == 0, fmt.Sprintf("err=%v got=%d", err, len(emptyView)))
 
 	// ---- 2. seed the topic --------------------------------------------------------
@@ -197,7 +197,7 @@ func main() {
 		seeded++
 		bump(1)
 	}
-	check(fmt.Sprintf("%d 条种子消息全部写入", seedBodies), seeded == seedBodies,
+	check(fmt.Sprintf("all %d seed messages written", seedBodies), seeded == seedBodies,
 		fmt.Sprintf("seeded=%d", seeded))
 
 	// ---- 3. min / max offset ------------------------------------------------------
@@ -218,26 +218,26 @@ func main() {
 		time.Sleep(300 * time.Millisecond)
 	}
 	if err != nil {
-		check("MaxOffset 可用", false, err.Error())
+		check("MaxOffset usable", false, err.Error())
 	} else {
-		check("MaxOffset == 种子条数", maxOffset == int64(seedBodies),
+		check("MaxOffset == seed count", maxOffset == int64(seedBodies),
 			fmt.Sprintf("max=%d want=%d", maxOffset, seedBodies))
 	}
 	minOffset, err := c.MinOffset(q0)
 	if err != nil {
-		check("MinOffset 可用", false, err.Error())
+		check("MinOffset usable", false, err.Error())
 	} else {
 		check("MinOffset == 0", minOffset == 0, fmt.Sprintf("min=%d", minOffset))
 	}
 	if _, err := c.SearchOffset(q0, common.CurrentTimeMillis()); err != nil {
-		check("SearchOffset 可用", false, err.Error())
+		check("SearchOffset usable", false, err.Error())
 	} else {
-		check("SearchOffset 可用", true, "")
+		check("SearchOffset usable", true, "")
 	}
 	if _, err := c.EarliestMsgStoreTime(q0); err != nil {
-		check("EarliestMsgStoreTime 可用", false, err.Error())
+		check("EarliestMsgStoreTime usable", false, err.Error())
 	} else {
-		check("EarliestMsgStoreTime 可用", true, "")
+		check("EarliestMsgStoreTime usable", true, "")
 	}
 
 	// ---- 4. the short poll at the head: everything, quickly -----------------------
@@ -245,15 +245,15 @@ func main() {
 	head, err := c.Pull(q0, "*", 0, 32)
 	shortElapsed := time.Since(begin)
 	if err != nil {
-		check("Pull 队头短轮询返回", false, err.Error())
+		check("Pull short poll at the queue head returns", false, err.Error())
 	} else {
-		check("Pull 队头短轮询返回 FOUND", head.PullStatus == client.PullFound,
+		check("Pull short poll at the queue head returns FOUND", head.PullStatus == client.PullFound,
 			fmt.Sprintf("status=%v msgs=%d", head.PullStatus, len(head.MsgFoundList)))
-		check(fmt.Sprintf("拉到 %d 条种子消息", seedBodies), len(head.MsgFoundList) == seedBodies,
+		check(fmt.Sprintf("pulled %d seed messages", seedBodies), len(head.MsgFoundList) == seedBodies,
 			fmt.Sprintf("got=%d", len(head.MsgFoundList)))
-		check("NextBeginOffset == 种子条数", head.NextBeginOffset == int64(seedBodies),
+		check("NextBeginOffset == seed count", head.NextBeginOffset == int64(seedBodies),
 			fmt.Sprintf("next=%d", head.NextBeginOffset))
-		check("短轮询耗时远小于挂起预算", shortElapsed < *suspend/2,
+		check("short poll takes far less than the suspend budget", shortElapsed < *suspend/2,
 			fmt.Sprintf("elapsed=%v suspend=%v", shortElapsed, *suspend))
 		okBodies, okKeys := true, true
 		for i, msg := range head.MsgFoundList {
@@ -266,8 +266,8 @@ func main() {
 				okKeys = false
 			}
 		}
-		check("正文按队列顺序完整", okBodies, "")
-		check("KEYS 属性原样保留", okKeys, "")
+		check("bodies complete in queue order", okBodies, "")
+		check("KEYS property preserved as-is", okKeys, "")
 	}
 
 	// ---- 5. THE guard: a short poll at an IDLE tail must not suspend --------------
@@ -279,10 +279,10 @@ func main() {
 	tail, err := c.Pull(q0, "*", int64(seedBodies), 32)
 	idleElapsed := time.Since(idleBegin)
 	if err != nil {
-		check("空队尾短轮询返回（SUSPEND 位必须为 0）", false, err.Error())
+		check("short poll at an idle tail returns (the SUSPEND bit must be 0)", false, err.Error())
 	} else {
-		check("空队尾短轮询 = NO_NEW_MSG", tail.PullStatus == client.PullNoNewMsg, "status="+tail.PullStatus.String())
-		check("空队尾短轮询没有挂起", idleElapsed < *suspend/2,
+		check("short poll at an idle tail = NO_NEW_MSG", tail.PullStatus == client.PullNoNewMsg, "status="+tail.PullStatus.String())
+		check("short poll at an idle tail did not suspend", idleElapsed < *suspend/2,
 			fmt.Sprintf("elapsed=%v suspend=%v", idleElapsed, *suspend))
 	}
 
@@ -298,23 +298,23 @@ func main() {
 	woken, err := c.PullBlockIfNotFound(q0, "*", int64(seedBodies), 32)
 	wakeElapsed := time.Since(wakeBegin)
 	if sendErr := <-wakeErr; sendErr != nil {
-		check("唤醒用的消息写入成功", false, sendErr.Error())
+		check("wake-up message written successfully", false, sendErr.Error())
 	} else {
 		bump(1)
-		check("唤醒用的消息写入成功", true, "")
+		check("wake-up message written successfully", true, "")
 	}
 	if err != nil {
-		check("长轮询被新消息唤醒", false, err.Error())
+		check("long poll woken by the new message", false, err.Error())
 	} else {
-		check("长轮询被新消息唤醒", woken.PullStatus == client.PullFound && len(woken.MsgFoundList) == 1,
+		check("long poll woken by the new message", woken.PullStatus == client.PullFound && len(woken.MsgFoundList) == 1,
 			fmt.Sprintf("status=%v msgs=%d", woken.PullStatus, len(woken.MsgFoundList)))
 		if len(woken.MsgFoundList) == 1 {
-			check("唤醒消息正文正确", string(woken.MsgFoundList[0].Body) == wakeBody,
+			check("wake-up message body correct", string(woken.MsgFoundList[0].Body) == wakeBody,
 				fmt.Sprintf("body=%q", woken.MsgFoundList[0].Body))
 		}
-		check("长轮询确实等待过（不是立刻返回）", wakeElapsed >= 500*time.Millisecond,
+		check("the long poll really waited (did not return immediately)", wakeElapsed >= 500*time.Millisecond,
 			fmt.Sprintf("elapsed=%v", wakeElapsed))
-		check("长轮询在挂起预算内提前返回", wakeElapsed < *suspend,
+		check("the long poll returned early, within the suspend budget", wakeElapsed < *suspend,
 			fmt.Sprintf("elapsed=%v suspend=%v", wakeElapsed, *suspend))
 	}
 
@@ -328,37 +328,37 @@ func main() {
 	expired, err := c.PullBlockIfNotFound(q0, "*", int64(seedBodies+1), 32)
 	expireElapsed := time.Since(expireBegin)
 	if err != nil {
-		check("空闲队尾长轮询返回", false, err.Error())
+		check("long poll at an idle tail returns", false, err.Error())
 	} else {
-		check("空闲队尾长轮询 = NO_NEW_MSG（挂起到期）", expired.PullStatus == client.PullNoNewMsg,
+		check("long poll at an idle tail = NO_NEW_MSG (suspend expired)", expired.PullStatus == client.PullNoNewMsg,
 			"status="+expired.PullStatus.String())
 	}
-	check("空闲队尾长轮询真的挂起了", expireElapsed >= (*suspend)*7/10,
+	check("the long poll at an idle tail really suspended", expireElapsed >= (*suspend)*7/10,
 		fmt.Sprintf("elapsed=%v suspend=%v", expireElapsed, *suspend))
 
 	// ---- 8. the caller owns the cursor -------------------------------------------
 	// Pull() must NOT commit anything: the caller decides when the work is done.
 	if _, err := c.Pull(q0, "*", 0, 1); err != nil {
-		check("重拉队头用于位点检查", false, err.Error())
+		check("re-pull the queue head for the offset check", false, err.Error())
 	} else {
-		check("重拉队头用于位点检查", true, "")
+		check("re-pull the queue head for the offset check", true, "")
 	}
 	// A fresh group has no record yet: the broker answers QUERY_NOT_FOUND, which
 	// the store reports as -1. Either way it must not be the value we are about to
 	// commit — that is the observable half of "Pull() does not commit".
 	before, beforeErr := c.FetchConsumeOffset(q0, true)
-	check("Pull 未提交任何位点（调用方持有游标）", beforeErr == nil && before != int64(committedOffset),
+	check("Pull committed no offset (the caller owns the cursor)", beforeErr == nil && before != int64(committedOffset),
 		fmt.Sprintf("broker offset=%d err=%v", before, beforeErr))
 
 	if err := c.UpdateConsumeOffset(q0, committedOffset); err != nil {
-		check("UpdateConsumeOffset 入本地位点表", false, err.Error())
+		check("UpdateConsumeOffset enters the local offset table", false, err.Error())
 	} else {
-		check("UpdateConsumeOffset 入本地位点表", true, "")
+		check("UpdateConsumeOffset enters the local offset table", true, "")
 	}
 	if got, err := c.FetchConsumeOffset(q0, false); err != nil || got != committedOffset {
-		check("本地读回刚才写入的位点", false, fmt.Sprintf("got=%d err=%v", got, err))
+		check("just-written offset read back locally", false, fmt.Sprintf("got=%d err=%v", got, err))
 	} else {
-		check("本地读回刚才写入的位点", true, fmt.Sprintf("offset=%d", got))
+		check("just-written offset read back locally", true, fmt.Sprintf("offset=%d", got))
 	}
 	if err := c.PersistConsumerOffset(); err != nil {
 		check("PersistConsumerOffset", false, err.Error())
@@ -369,9 +369,9 @@ func main() {
 	// left the process (the external read-back then confirms the same value
 	// from its own connection).
 	if got, err := c.FetchConsumeOffset(q0, true); err != nil || got != committedOffset {
-		check("从 broker 读回位点", false, fmt.Sprintf("got=%d err=%v", got, err))
+		check("offset read back from the broker", false, fmt.Sprintf("got=%d err=%v", got, err))
 	} else {
-		check("从 broker 读回位点", true, fmt.Sprintf("offset=%d", got))
+		check("offset read back from the broker", true, fmt.Sprintf("offset=%d", got))
 	}
 	if err := c.UpdateConsumeOffsetToBroker(q0, committedOffset); err != nil {
 		check("UpdateConsumeOffsetToBroker", false, err.Error())
@@ -385,19 +385,19 @@ func main() {
 	// read-back checks %RETRY%<group> and asserts the body is there — and that
 	// %DLQ%<group> is not.
 	if bounced, err := c.Pull(q0, "*", 0, 1); err != nil {
-		check("取一条消息用于回投", false, err.Error())
+		check("take one message for the send-back", false, err.Error())
 	} else if len(bounced.MsgFoundList) == 0 {
-		check("取一条消息用于回投", false, "no message")
+		check("take one message for the send-back", false, "no message")
 	} else {
-		check("取一条消息用于回投", true, "")
+		check("take one message for the send-back", true, "")
 		msg := bounced.MsgFoundList[0]
 		// delayLevel 1 == 1s in the default messageDelayLevel table: the retry topic
 		// only sees it after the schedule service releases it, and 3 (=10s) would
 		// just add wall time to the run.
 		if err := c.SendMessageBack(msg, 1, q0.BrokerName); err != nil {
-			check("sendMessageBack 被 broker 接受", false, err.Error())
+			check("sendMessageBack accepted by the broker", false, err.Error())
 		} else {
-			check("sendMessageBack 被 broker 接受", true, fmt.Sprintf("body=%q delay=1", msg.Body))
+			check("sendMessageBack accepted by the broker", true, fmt.Sprintf("body=%q delay=1", msg.Body))
 		}
 	}
 

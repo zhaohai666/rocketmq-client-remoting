@@ -1,8 +1,8 @@
-//! 线上形态：编码结果作为消息 body 发到轨迹 topic —— 默认
-//! [`MixAll::TRACE_TOPIC`]（`RMQ_SYS_TRACE_TOPIC`），`AccessChannel::Cloud` 下改用
-//! [`TraceConstants::TRACE_TOPIC_PREFIX`] + regionId；轨迹消息的 KEYS 属性由各记录的
-//! `trans_key` 拼成，控制台按它反查轨迹。攒批与发送由 `client::trace_dispatcher` 负责，
-//! 各字段的填充由 `client::trace_hook` 负责。
+//! Wire shape: the encoded result is sent as the message body to the trace topic -- by default
+//! [`MixAll::TRACE_TOPIC`] (`RMQ_SYS_TRACE_TOPIC`), or [`TraceConstants::TRACE_TOPIC_PREFIX`] +
+//! regionId under `AccessChannel::Cloud`; the KEYS property of a trace message is composed from
+//! each record's `trans_key`, which the console uses to look traces up. Batching and sending are handled by `client::trace_dispatcher`,
+//! and filling each field is handled by `client::trace_hook`.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -21,13 +21,13 @@ use crate::rmq_warn;
 pub struct TraceConstants;
 
 impl TraceConstants {
-    /// 内部轨迹生产者的组名前缀（分发器拼 `<前缀>-<group>-<PRODUCE|CONSUME>-<N>`）。
+    /// Group-name prefix of the internal trace producer (the dispatcher composes `<prefix>-<group>-<PRODUCE|CONSUME>-<N>`).
     pub const GROUP_NAME_PREFIX: &'static str = "_INNER_TRACE_PRODUCER";
-    /// 一条记录内字段之间的分隔符（SOH，`\x01`）。
+    /// Separator between fields within one record (SOH, `\x01`).
     pub const CONTENT_SPLITOR: char = '\u{1}';
-    /// 记录之间的分隔符（STX，`\x02`）。
+    /// Separator between records (STX, `\x02`).
     pub const FIELD_SPLITOR: char = '\u{2}';
-    /// 内部轨迹生产者的 instanceName 前缀。
+    /// instanceName prefix of the internal trace producer.
     pub const TRACE_INSTANCE_NAME: &'static str = "PID_CLIENT_INNER_TRACE_PRODUCER";
     pub const TRACE_TOPIC_PREFIX: &'static str = "rmq_sys_TRACE_DATA_";
     pub const TO_PREFIX: &'static str = "To_";
@@ -41,14 +41,14 @@ impl TraceConstants {
     pub const ROCKETMQ_STORE_HOST: &'static str = "rocketmq.store_host";
     pub const ROCKETMQ_BODY_LENGTH: &'static str = "rocketmq.body_length";
     pub const ROCKETMQ_MSG_ID: &'static str = "rocketmq.mgs_id";
-    /// ⚠ 同上，`mgs_type` 为线上字面量。
+    /// ⚠ Same as above, `mgs_type` is the wire literal.
     pub const ROCKETMQ_MSG_TYPE: &'static str = "rocketmq.mgs_type";
     pub const ROCKETMQ_REGION_ID: &'static str = "rocketmq.region_id";
     pub const ROCKETMQ_TRANSACTION_ID: &'static str = "rocketmq.transaction_id";
     pub const ROCKETMQ_TRANSACTION_STATE: &'static str = "rocketmq.transaction_state";
     pub const ROCKETMQ_IS_FROM_TRANSACTION_CHECK: &'static str =
         "rocketmq.is_from_transaction_check";
-    /// ⚠ 同上，这个键名线上就是复数 `retry_times`。
+    /// ⚠ Same as above, the key name is plural `retry_times` on the wire.
     pub const ROCKETMQ_RETRY_TIMERS: &'static str = "rocketmq.retry_times";
 }
 
@@ -102,10 +102,10 @@ impl fmt::Display for TraceType {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum AccessChannel {
-    /// 连自建 IDC 集群。
+    /// Connects to a self-hosted IDC cluster.
     #[default]
     Local = 0,
-    /// 连云上集群。
+    /// Connects to a cloud-hosted cluster.
     Cloud = 1,
 }
 
@@ -128,10 +128,10 @@ impl fmt::Display for AccessChannel {
     }
 }
 
-/// Rust 的 `split` 会保留末尾空串，而编码结果末尾正好补了
-/// FIELD_SPLITOR，所以直接用 `str::split` 会多出一段空记录；对内容段
-/// （CONTENT_SPLITOR）同理 —— SubBefore 无 keys 时字段会整体错位。
-/// 这条差异是真金白银踩过的坑，勿改成 `str::split`。
+/// Rust's `split` keeps the trailing empty string, and the encoded result happens to end with
+/// FIELD_SPLITOR, so using `str::split` directly would yield one extra empty record; the same
+/// applies to content segments (CONTENT_SPLITOR) -- when SubBefore has no keys the fields would
+/// shift wholesale. This difference was a costly pitfall; do not change it to `str::split`.
 pub fn java_split(value: &str, sep: char) -> Vec<&str> {
     let mut parts: Vec<&str> = value.split(sep).collect();
     while parts.last() == Some(&"") {
@@ -162,7 +162,7 @@ fn compute_local_address() -> String {
             }
             out
         }
-        // 解析不了（例如宿主返回了主机名）就原样用，不报错
+        // If it cannot be parsed (e.g. the host returned a hostname), use it as is without erroring
         _ => ip,
     }
 }
@@ -211,7 +211,7 @@ impl TraceBean {
         Self::default()
     }
 
-    /// 发送钩子的 `EndTransactionContext#transactionState` 就是这个枚举。
+    /// The send hook's `EndTransactionContext#transactionState` is exactly this enum.
     pub fn set_transaction_state(&mut self, state: LocalTransactionState) {
         self.transaction_state = Some(state.to_string());
     }
@@ -277,9 +277,9 @@ impl fmt::Display for TraceContext {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TraceTransferBean {
-    /// 攒好的一批记录（每条以 [`TraceConstants::FIELD_SPLITOR`] 结尾）。
+    /// The accumulated batch of records (each one ends with [`TraceConstants::FIELD_SPLITOR`]).
     pub trans_data: String,
-    /// 原始消息 msgId + 按 [`KEY_SEPARATOR`] 拆开的业务 keys。
+    /// Original message msgId + business keys split by [`KEY_SEPARATOR`].
     pub trans_key: BTreeSet<String>,
 }
 
@@ -311,7 +311,7 @@ impl TraceDataEncoder {
         res
     }
 
-    /// 解一条轨迹记录（一段 FIELD_SPLITOR 之内）。类型无法识别时返回 `None`。
+    /// Decodes one trace record (within one FIELD_SPLITOR segment). Returns `None` when the type is unrecognized.
     fn decode_context(context: &str) -> Result<Option<TraceContext>> {
         let line = java_split(context, TraceConstants::CONTENT_SPLITOR);
         if line.is_empty() {
@@ -330,8 +330,8 @@ impl TraceDataEncoder {
         Ok(Some(ctx))
     }
 
-    /// Pub：`Pub ts region group topic msgId tags keys storeHost bodyLength costTime
-    /// msgType [offsetMsgId] success [clientHost]`。
+    /// Pub: `Pub ts region group topic msgId tags keys storeHost bodyLength costTime
+    /// msgType [offsetMsgId] success [clientHost]`.
     fn decode_pub(line: &[&str]) -> Result<TraceContext> {
         let mut ctx = TraceContext::new();
         ctx.trace_type = Some(TraceType::Pub);
@@ -348,7 +348,7 @@ impl TraceDataEncoder {
         ctx.cost_time = parse_int(line, 10)?;
         bean.msg_type = parse_msg_type(line, 11)?;
         match line.len() {
-            // 老版本：没有 offsetMsgId
+            // Legacy version: no offsetMsgId
             13 => ctx.is_success = parse_bool(line, 12)?,
             14 => {
                 bean.offset_msg_id = field(line, 12)?.to_string();
@@ -365,7 +365,7 @@ impl TraceDataEncoder {
         Ok(ctx)
     }
 
-    /// SubBefore：`SubBefore ts region group requestId msgId retryTimes [keys]`。
+    /// SubBefore: `SubBefore ts region group requestId msgId retryTimes [keys]`.
     fn decode_sub_before(line: &[&str]) -> Result<TraceContext> {
         let mut ctx = TraceContext::new();
         ctx.trace_type = Some(TraceType::SubBefore);
@@ -381,7 +381,7 @@ impl TraceDataEncoder {
         Ok(ctx)
     }
 
-    /// SubAfter：`SubAfter requestId msgId costTime success keys [contextCode [ts group]]`。
+    /// SubAfter: `SubAfter requestId msgId costTime success keys [contextCode [ts group]]`.
     fn decode_sub_after(line: &[&str]) -> Result<TraceContext> {
         let mut ctx = TraceContext::new();
         ctx.trace_type = Some(TraceType::SubAfter);
@@ -396,15 +396,15 @@ impl TraceDataEncoder {
             ctx.context_code = parse_int(line, 6)?;
         }
         if line.len() >= 9 {
-            // 兼容老版本：只有非 CLOUD 通道编码时才有这两段
+            // Legacy compatibility: these two segments exist only when encoding on a non-CLOUD channel
             ctx.time_stamp = parse_long(line, 7)?;
             ctx.group_name = field(line, 8)?.to_string();
         }
         Ok(ctx)
     }
 
-    /// EndTransaction：`EndTransaction ts region group topic msgId tags keys storeHost
-    /// msgType transactionId transactionState fromTransactionCheck`。
+    /// EndTransaction: `EndTransaction ts region group topic msgId tags keys storeHost
+    /// msgType transactionId transactionState fromTransactionCheck`.
     fn decode_end_transaction(line: &[&str]) -> Result<TraceContext> {
         let mut ctx = TraceContext::new();
         ctx.trace_type = Some(TraceType::EndTransaction);
@@ -425,7 +425,7 @@ impl TraceDataEncoder {
         Ok(ctx)
     }
 
-    /// Recall：`Recall ts region group topic msgId success`。
+    /// Recall: `Recall ts region group topic msgId success`.
     fn decode_recall(line: &[&str]) -> Result<TraceContext> {
         let mut ctx = TraceContext::new();
         ctx.trace_type = Some(TraceType::Recall);
@@ -549,7 +549,7 @@ impl TraceDataEncoder {
     }
 }
 
-/// `SOH.join(fields) + STX`：一条记录内字段用 CONTENT_SPLITOR 相连，末尾补 FIELD_SPLITOR。
+/// `SOH.join(fields) + STX`: fields within one record are joined by CONTENT_SPLITOR, and FIELD_SPLITOR is appended at the end.
 fn join_record(fields: &[String]) -> String {
     let mut out = String::with_capacity(256);
     for (i, value) in fields.iter().enumerate() {
@@ -579,7 +579,7 @@ fn field<'a>(line: &[&'a str], index: usize) -> Result<&'a str> {
     })
 }
 
-/// 按下标取段，越界返回 `None`（只用于 SubBefore 的 keys 那一处兜底）。
+/// Fetches a segment by index, returning `None` when out of bounds (only used as the fallback for SubBefore's keys).
 fn opt_field<'a>(line: &[&'a str], index: usize) -> Option<&'a str> {
     line.get(index).copied()
 }
@@ -840,7 +840,7 @@ mod tests {
     #[test]
     fn encode_null_and_degenerate_inputs() {
         assert!(TraceDataEncoder::encoder_from_context_bean(None).is_none());
-        // 无 trace_type / 无 bean：编出空串而不是 panic
+        // No trace_type / no bean: encodes an empty string instead of panicking
         let bare = TraceContext::new();
         let tb = TraceDataEncoder::encoder_from_context_bean(Some(&bare)).unwrap();
         assert_eq!(tb.trans_data, "");
@@ -854,7 +854,7 @@ mod tests {
         );
     }
 
-    // ---------------- 解码 ----------------
+    // ---------------- decode ----------------
 
     #[test]
     fn trace_data_split_drops_trailing_empty() {
@@ -862,7 +862,7 @@ mod tests {
         assert_eq!(java_split("\u{2}", STX), Vec::<&str>::new());
         assert_eq!(java_split("a\u{2}b\u{2}", STX), vec!["a", "b"]);
         assert_eq!(java_split("a\u{1}\u{1}b", SOH), vec!["a", "", "b"]);
-        // 原生 split 会保留末尾空串 —— 这正是不能直接用它的原因
+        // Native split keeps the trailing empty string -- exactly why it cannot be used directly
         assert_eq!("a\u{2}".split(STX).collect::<Vec<_>>(), vec!["a", ""]);
     }
 
@@ -961,7 +961,7 @@ mod tests {
 
     #[test]
     fn decode_sub_before_without_keys_does_not_break() {
-        // keys 为空 => java_split 会连末尾 CONTENT_SPLITOR 一起丢掉，只剩 7 段
+        // Empty keys => java_split drops the trailing CONTENT_SPLITOR too, leaving only 7 segments
         let mut ctx = ctx_of(TraceType::SubBefore, vec![bean(MSG_ID_1, "", 0)]);
         for b in &mut ctx.trace_beans {
             b.keys = String::new();
@@ -995,11 +995,11 @@ mod tests {
         assert_eq!(got.time_stamp, TS);
         assert_eq!(got.group_name, "CID_test");
 
-        // 老版本只有 7 段：不该读到 timestamp / group
+        // Legacy has only 7 segments: timestamp / group must not be read
         let legacy = expect(&["SubAfter", "REQ", MSG_ID_1, "5", "true", "KeyA", "0"]);
         let got = &TraceDataEncoder::decoder_from_trace_data_string(Some(&legacy))[0];
         assert_eq!(got.context_code, 0);
-        assert!(got.time_stamp > TS, "落到 TraceContext::new() 的当前时间");
+        assert!(got.time_stamp > TS, "falls back to the current time from TraceContext::new()");
         assert_eq!(got.group_name, "");
     }
 
@@ -1037,7 +1037,7 @@ mod tests {
             TraceDataEncoder::decoder_from_trace_data_string(Some(&format!("Bogus{SOH}1{STX}")))
                 .is_empty()
         );
-        // 未知 msgType 越界 => 整条记录跳过
+        // Unknown out-of-range msgType => the whole record is skipped
         let bad_type = expect(&[
             "Pub",
             "1700000000000",
@@ -1055,7 +1055,7 @@ mod tests {
             "true",
         ]);
         assert!(TraceDataEncoder::decoder_from_trace_data_string(Some(&bad_type)).is_empty());
-        // 时间戳不是数字 => 跳过
+        // Timestamp is not a number => skipped
         let bad_ts = expect(&[
             "Pub",
             "not-a-number",
@@ -1107,7 +1107,7 @@ mod tests {
         assert_eq!(decoded[1].trace_type, Some(TraceType::Recall));
     }
 
-    // ---------------- 常量与辅助类型 ----------------
+    // ---------------- constants and helper types ----------------
 
     #[test]
     fn trace_constants_match_wire_contract() {
@@ -1160,18 +1160,18 @@ mod tests {
         let ctx = TraceContext::new();
         assert_eq!(ctx.trace_type, None);
         assert!(ctx.time_stamp > 0);
-        assert!(ctx.is_success, "isSuccess 默认 true");
+        assert!(ctx.is_success, "isSuccess defaults to true");
         assert_eq!(ctx.cost_time, 0);
         assert_eq!(ctx.context_code, 0);
         assert_eq!(ctx.access_channel, None);
         assert!(ctx.trace_beans.is_empty());
-        // requestId 32 位大写 hex，两次调用不重复
+        // requestId is 32 chars of uppercase hex, two calls never repeat
         assert_eq!(ctx.request_id.len(), 32);
         assert!(ctx.request_id.bytes().all(|b| b.is_ascii_hexdigit()));
         assert_eq!(
             ctx.request_id,
             ctx.request_id.to_ascii_uppercase(),
-            "requestId 是大写 hex"
+            "requestId is uppercase hex"
         );
         assert_ne!(ctx.request_id, TraceContext::new().request_id);
     }
@@ -1193,7 +1193,7 @@ mod tests {
     fn local_address_looks_like_an_address() {
         let addr = local_address();
         assert!(!addr.is_empty());
-        // IPv4 点分十进制，或摊平后的 8 组 IPv6
+        // IPv4 dotted decimal, or flattened 8-group IPv6
         let groups = addr.split(':').count();
         assert!(
             groups == 1 || groups == 8,
@@ -1202,7 +1202,7 @@ mod tests {
         if groups == 8 {
             assert!(addr.chars().all(|c| c.is_ascii_hexdigit() || c == ':'));
         }
-        assert_eq!(addr, local_address(), "必须进程内缓存（OnceLock）");
+        assert_eq!(addr, local_address(), "must be cached in-process (OnceLock)");
     }
 
     #[test]
@@ -1225,7 +1225,7 @@ mod tests {
 
     #[test]
     fn encoder_uses_only_ordinary_fields_in_trans_key() {
-        // 连续空格切出的空串会进集合，分发器拼 KEYS 时才过滤
+        // Empty strings split from consecutive spaces do enter the set; the dispatcher filters them when composing KEYS
         let ctx = ctx_of(TraceType::Recall, vec![bean(MSG_ID_1, "A  B", 0)]);
         let tb = TraceDataEncoder::encoder_from_context_bean(Some(&ctx)).unwrap();
         assert!(tb.trans_key.contains("A"));

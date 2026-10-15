@@ -1,25 +1,32 @@
 # -*- coding: utf-8 -*-
-"""unitName / unitMode / enableStreamRequestType 真机验证。
+"""Verification of unitName / unitMode / enableStreamRequestType against a real machine.
 
-对应用户要求"基于真实集群测试是否正常"：这三项里 unitName 与 unitMode 都不是
-只在客户端自 high 的字段，broker 侧有可观测后果，所以全部用真机断言：
+This answers the user request to "test against a real cluster whether it works": of these three,
+unitName and unitMode are not fields that only live on the client, they have observable
+consequences on the broker side, so everything is asserted on a real machine:
 
-  U1  unitName 进 clientId（`ip@instanceName@unitName`），生产者发送链路不受影响。
-  U2  消费者带 unitName + @STREAM 后缀时，**broker 看到的 clientId 就是这个值**
-      （GET_CONSUMER_CONNECTION_LIST 回读），证明后缀没被客户端单方面加工。
-  U3  unitMode=true 发到新 topic：broker 走
-      `AbstractSendMessageProcessor:485-497` 的 `buildSysFlag(true, false)`，
-      自动建出来的 topic sysFlag 带 UNIT 位（0x1）；unitMode=false 的对照组不带。
-      —— 这是 unitMode 真正上线的唯一证据。
-  U4  unitMode=true 的消费者心跳：`ClientManageProcessor:111-116` 用
-      `buildSysFlag(false, true)` 建 %RETRY% topic，sysFlag 带 UNIT_SUB 位（0x2）。
-  U5  enableStreamRequestType=true：每个请求都带 `ReqT=0` 扩展字段，broker 照常处理
-      （发送 + 拉取都成功）。该字段是给 proxy/stream 用的类型标记，普通 broker 忽略它。
+  U1  unitName goes into the clientId (`ip@instanceName@unitName`), and the producer send path is
+      unaffected.
+  U2  When a consumer carries unitName plus the @STREAM suffix, **the clientId the broker sees is
+      exactly this value** (read back via GET_CONSUMER_CONNECTION_LIST), proving the suffix was not
+      reshaped on the client side.
+  U3  Sending with unitMode=true to a new topic: the broker goes through
+      `buildSysFlag(true, false)` at `AbstractSendMessageProcessor:485-497`, so the auto-created
+      topic carries the UNIT bit (0x1) in its sysFlag; the control group with unitMode=false does
+      not.
+      -- this is the only evidence that unitMode really went live.
+  U4  The heartbeat of a consumer with unitMode=true: `ClientManageProcessor:111-116` uses
+      `buildSysFlag(false, true)` to create the %RETRY% topic, whose sysFlag carries the UNIT_SUB
+      bit (0x2).
+  U5  enableStreamRequestType=true: every request carries the `ReqT=0` extra field and the broker
+      handles it as usual (both sending and pulling succeed). This field is the type marker used
+      by proxy/stream; an ordinary broker ignores it.
 
-前置：NameServer + Broker 已起，且 `autoCreateTopicEnable=true`、
-`autoCreateSubscriptionGroup=true`（本仓库的 /tmp/rmq_rust_live/broker.conf 都是默认值）。
+Prerequisites: NameServer + Broker are running with `autoCreateTopicEnable=true` and
+`autoCreateSubscriptionGroup=true` (the /tmp/rmq_rust_live/broker.conf of this repository keeps the
+defaults).
 
-用法：.venv/bin/python verify_unit_config_live.py [127.0.0.1:9876]
+Usage: .venv/bin/python verify_unit_config_live.py [127.0.0.1:9876]
 """
 from __future__ import annotations
 
@@ -89,8 +96,8 @@ def _producer(group, unit_name=None, unit_mode=False, instance_name=None, stream
 
 
 def _route_visible(admin, topic):
-    """新 topic 要等 broker 把它注册到 namesrv（默认 30s 一轮）才有独立路由；
-    路由可见之后客户端的心跳才会覆盖到这个 broker。"""
+    """A new topic only gets its own route once the broker registers it with namesrv (every 30s by
+    default); only after the route becomes visible does the client heartbeat reach this broker."""
     try:
         route = admin.examine_topic_route(topic)
     except Exception:  # noqa: BLE001
@@ -99,11 +106,11 @@ def _route_visible(admin, topic):
 
 
 def _sys_flag(admin, broker_addr, topic):
-    """读回 broker 上该 topic 的 sysFlag；不存在返回 None。"""
+    """Read back the sysFlag of that topic on the broker; returns None when it does not exist."""
     try:
         return admin.examine_topic_config(broker_addr, topic).topic_sys_flag
     except Exception as e:  # noqa: BLE001
-        print("    (examine_topic_config(%s) 失败: %s)" % (topic, e))
+        print("    (examine_topic_config(%s) failed: %s)" % (topic, e))
         return None
 
 
@@ -124,16 +131,16 @@ def main():
             pass
         time.sleep(1)
     if cluster is None:
-        check("集群探活", False, "nameServer 无 broker 注册")
+        check("cluster liveness", False, "no broker registered on the nameServer")
         admin.shutdown()
         return 1
     broker_addr = cluster.get_broker_addrs()[0]
-    check("集群探活", True, "broker=%s" % broker_addr)
+    check("cluster liveness", True, "broker=%s" % broker_addr)
 
     ip = MixAll.cached_ip_str()
     topics, groups = [], []
 
-    # ---------------- U1 unitName 进 clientId ----------------
+    # ---------------- U1 unitName goes into the clientId ----------------
     t1 = "UnitCfgSend_%d" % STAMP
     topics.append(t1)
     p1 = _producer("PID_unit_cfg_%d" % STAMP, unit_name="unitA",
@@ -141,23 +148,23 @@ def main():
     p1.start()
     try:
         expect = "%s@unitcfg-u1-%d@unitA" % (ip, STAMP)
-        check("U1 producer clientId 带 unitName", p1.client_id == expect,
-              "%s (期望 %s)" % (p1.client_id, expect))
+        check("U1 the producer clientId carries the unitName", p1.client_id == expect,
+              "%s (expected %s)" % (p1.client_id, expect))
         r = p1.send(Message(t1, b"u1-body"))
-        check("U1 unitName 客户端发送成功", r.msg_id != "", "msgId=%s" % r.msg_id)
+        check("U1 the client with a unitName sent successfully", r.msg_id != "", "msgId=%s" % r.msg_id)
     finally:
         p1.shutdown()
 
-    # 对照：不设 unitName 时 clientId 不能凭空多出一段
+    # The control: without a unitName the clientId must not grow an extra segment out of thin air
     p0 = _producer("PID_unit_cfg_%d" % STAMP, instance_name="unitcfg-u1b-%d" % STAMP)
     p0.start()
     try:
-        check("U1 对照：无 unitName 不拼后缀",
+        check("U1 control: with no unitName no suffix is appended",
               p0.client_id == "%s@unitcfg-u1b-%d" % (ip, STAMP), p0.client_id)
     finally:
         p0.shutdown()
 
-    # ---------------- U2 broker 侧看到 @unitName@STREAM ----------------
+    # ---------------- U2 the broker side sees @unitName@STREAM ----------------
     t2 = "UnitCfgConn_%d" % STAMP
     g2 = "GID_unit_cfg_conn_%d" % STAMP
     topics.append(t2)
@@ -166,7 +173,7 @@ def main():
     push.set_namesrv_addr(NAMESRV)
     push.set_instance_name("unitcfg-u2-%d" % STAMP)
     push.set_unit_name("unitA")
-    push.set_enable_stream_request_type(True)   # 推送消费者默认关，这里显式开
+    push.set_enable_stream_request_type(True)   # a push consumer has it off by default, turn it on explicitly here
     push.set_consume_from_where(ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET)
     push.subscribe(t2, "*")
     collector = _Collector()
@@ -178,13 +185,13 @@ def main():
         _wait_until(lambda: _route_visible(admin, t2), 30)
         push.start()
         expect2 = "%s@unitcfg-u2-%d@unitA@STREAM" % (ip, STAMP)
-        check("U2 本地 clientId", push.client_id == expect2,
-              "%s (期望 %s)" % (push.client_id, expect2))
+        check("U2 the local clientId", push.client_id == expect2,
+              "%s (expected %s)" % (push.client_id, expect2))
         prod.send(Message(t2, b"u2-body"))
         _wait_until(lambda: collector.bodies().count(b"u2-body") >= 1, 20)
-        check("U2 带 @STREAM 后缀的消费者能收到消息",
+        check("U2 the consumer with the @STREAM suffix can receive messages",
               collector.bodies().count(b"u2-body") >= 1, "got=%s" % collector.bodies())
-        # broker 回读：clientId 是心跳里带上来的原值，没有加工
+        # Read back from the broker: the clientId is the raw value carried by the heartbeat, not reshaped
         conn = None
         for _ in range(20):
             try:
@@ -195,13 +202,13 @@ def main():
                 pass
             time.sleep(0.5)
         ids = sorted({c.client_id for c in conn.connection_set}) if conn else []
-        check("U2 broker 看到的 clientId 含 @unitA@STREAM",
+        check("U2 the clientId the broker sees contains @unitA@STREAM",
               any(i.endswith("@unitA@STREAM") for i in ids), "brokerIds=%s" % ids)
     finally:
         prod.shutdown()
         push.shutdown()
 
-    # ---------------- U3 unitMode → 自动建 topic 带 UNIT 位 ----------------
+    # ---------------- U3 unitMode => the auto-created topic carries the UNIT bit ----------------
     t_on = "UnitCfgOn_%d" % STAMP
     t_off = "UnitCfgOff_%d" % STAMP
     topics += [t_on, t_off]
@@ -219,14 +226,14 @@ def main():
     finally:
         poff.shutdown()
 
-    # 建 topic 是发送链路里同步做的，但路由/配置落地要一点点时间
+    # Creating the topic happens synchronously in the send path, but the route/configuration needs a moment to land
     _wait_until(lambda: _sys_flag(admin, broker_addr, t_on) is not None, 10)
     flag_on = _sys_flag(admin, broker_addr, t_on)
     flag_off = _sys_flag(admin, broker_addr, t_off)
-    check("U3 unitMode=true 建的 topic 带 UNIT 位",
+    check("U3 the topic created with unitMode=true carries the UNIT bit",
           flag_on is not None and (flag_on & FLAG_UNIT) == FLAG_UNIT,
           "sysFlag=%s" % flag_on)
-    check("U3 unitMode=false 的对照 topic 不带 UNIT 位",
+    check("U3 the control topic created with unitMode=false does not carry the UNIT bit",
           flag_off is not None and not (flag_off & FLAG_UNIT),
           "sysFlag=%s" % flag_off)
 
@@ -250,10 +257,10 @@ def main():
     push4.set_message_listener(_Collector())
     push4.start()
     try:
-        # 心跳在 start() 里同步发一次；失败会被 debug 吞掉，所以只能靠 broker 侧结果判断
+        # The heartbeat is sent once synchronously inside start(); a failure is swallowed by debug, so only the broker-side result can tell
         found = _wait_until(
             lambda: (_sys_flag(admin, broker_addr, retry_topic) or 0) & FLAG_UNIT_SUB, 30)
-        check("U4 unitMode=true 的 %RETRY% topic 带 UNIT_SUB 位", found,
+        check("U4 the %RETRY% topic of a consumer with unitMode=true carries the UNIT_SUB bit", found,
               "sysFlag=%s" % _sys_flag(admin, broker_addr, retry_topic))
     finally:
         push4.shutdown()
@@ -267,7 +274,7 @@ def main():
     prod5.start()
     bodies = []
     try:
-        check("U5 开启 stream 的 producer clientId",
+        check("U5 the producer clientId with stream enabled",
               prod5.client_id.endswith("@STREAM"), prod5.client_id)
         for i in range(3):
             prod5.send(Message(t5, ("u5-%d" % i).encode()))
@@ -281,7 +288,7 @@ def main():
     lite.subscribe(t5, "*")
     lite.start()
     try:
-        check("U5 轻量消费者 clientId 默认带 @STREAM",
+        check("U5 the clientId of a lite consumer carries @STREAM by default",
               lite.client_id.endswith("@STREAM"), lite.client_id)
 
         def _drain():
@@ -289,25 +296,25 @@ def main():
             return len(bodies) >= 3
 
         got = _wait_until(_drain, 30)
-        check("U5 每个请求都带 ReqT=0 时发送+拉取仍正常", got, "bodies=%s" % bodies)
+        check("U5 sending + pulling still work normally when every request carries ReqT=0", got, "bodies=%s" % bodies)
     finally:
         lite.shutdown()
 
-    # ---------------- 清理 ----------------
+    # ---------------- cleanup ----------------
     for t in topics:
         try:
             admin.delete_topic(t)
         except Exception as e:  # noqa: BLE001
-            print("    (delete_topic(%s) 失败: %s)" % (t, e))
+            print("    (delete_topic(%s) failed: %s)" % (t, e))
     for g in groups:
         try:
             admin.delete_subscription_group(broker_addr, g, remove_offset=True)
         except Exception as e:  # noqa: BLE001
-            print("    (delete_subscription_group(%s) 失败: %s)" % (g, e))
+            print("    (delete_subscription_group(%s) failed: %s)" % (g, e))
     admin.shutdown()
 
     passed = sum(1 for _, ok, _ in results if ok)
-    print("\n== 结果: %d/%d 通过 ==" % (passed, len(results)))
+    print("\n== Result: %d/%d passed ==" % (passed, len(results)))
     return 0 if passed == len(results) else 1
 
 

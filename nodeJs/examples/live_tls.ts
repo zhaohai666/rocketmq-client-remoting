@@ -1,7 +1,7 @@
 // live_tls verifies the TLS transport against a broker started with
 // `-Dtls.enable=true`. Three legs:
 //   plain_tls : tlsEnable only — trust the broker's self-signed cert
-//               (test-mode 语义，不校验链与主机名)
+//               (test-mode semantics: no chain or hostname verification)
 //   ca_verify : + setTlsOptions({caCert, serverName}) — STRICT verification:
 //               the broker cert must chain to the CA and the hostname/SAN
 //               must match

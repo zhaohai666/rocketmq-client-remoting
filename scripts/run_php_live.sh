@@ -1,32 +1,36 @@
 #!/bin/bash
-# PHP 端的真机验证入口（对照 run_go_*_live.sh / run_node_live.sh 的口径）。
+# Live verification entry point for the PHP client (mirrors the approach of run_go_*_live.sh / run_node_live.sh).
 #
-# 用法: bash scripts/run_php_live.sh redelivery|admin|compression|pop|tls|request_reply|pull|lite_qc [namesrv]
-#   redelivery   php/examples/live_redelivery.php  （可选第三参 legs=all|s1,s2,s3,s4）
+# Usage: bash scripts/run_php_live.sh redelivery|admin|compression|pop|tls|request_reply|pull|lite_qc [namesrv]
+#   redelivery   php/examples/live_redelivery.php  (optional third arg legs=all|s1,s2,s3,s4)
 #   admin        php/examples/live_admin.php
-#   pull         php/examples/live_pull.php        （可选第三参 legs=all|s1,s2,s3；
-#                 拉模式消费者：队列 / 平衡视图 fetchMessageQueuesInBalance / 手动拉取 /
-#                 位点提交回读）
+#   pull         php/examples/live_pull.php        (optional third arg legs=all|s1,s2,s3;
+#                 pull consumer: queues / balanced view fetchMessageQueuesInBalance / manual pull /
+#                 offset commit read-back)
 #   lite_qc      php/examples/live_lite_topic_queue_change.php
-#                 （LitePull topic 队列集合变更监听：检查周期压到 1s + 真实扩缩容 ⇒
-#                  证明比对趟次现查路由；PHP 无线程，主循环每轮 tick()+poll() 驱动）
-#   compression  php/examples/live_compression.php （仅 smoke：php→php 一条腿；
-#                 跨语言矩阵走 scripts/compression_matrix.sh 的 php_* 腿）
-#   request_reply php/examples/live_request_reply.php（326 请求-Reply：应答方 + 发起方往返）
-#   pop          php/examples/live_pop.php         （可选第三参 legs=all|s1,s2；
-#                 **必须独占集群**：要求 POP 专用 broker.conf 四件配置，见下）
-#   tls          php/examples/live_tls.php         （三腿 plain_tls/ca_verify/mtls；
-#                 **必须独占集群**：namesrv+broker 都要 -Dtls.enable=true——PHP 端
-#                 PHP 的 tlsEnable 同样是进程级全局开关，namesrv 连接也走
-#                 TLS；脚本自带 openssl 生成 CA/server(SAN:IP:127.0.0.1,DNS:localhost)
-#                 /client 证书，leg1+2 一轮 broker，leg3 重启加 tls.client.authServer=true）
+#                 (LitePull topic queue-set change listener: check period tightened to 1s + real
+#                  scale-up/down => proves each comparison round queries routes on the fly; PHP has
+#                  no threads, the main loop is driven by tick()+poll() each round)
+#   compression  php/examples/live_compression.php (smoke only: a single php->php leg;
+#                 the cross-language matrix goes through the php_* legs of scripts/compression_matrix.sh)
+#   request_reply php/examples/live_request_reply.php (326 request-reply: responder + requester round trip)
+#   pop          php/examples/live_pop.php         (optional third arg legs=all|s1,s2;
+#                 **requires an exclusive cluster**: needs the four POP-specific broker.conf
+#                 settings, see below)
+#   tls          php/examples/live_tls.php         (three legs plain_tls/ca_verify/mtls;
+#                 **requires an exclusive cluster**: namesrv+broker both need -Dtls.enable=true —
+#                 tlsEnable on PHP is a process-wide global switch too, so the namesrv connection
+#                 also goes through TLS; the script generates CA/server(SAN:IP:127.0.0.1,DNS:localhost)
+#                 /client certs via openssl, leg1+2 use one broker round, leg3 restarts with
+#                 tls.client.authServer=true)
 #
-# ⚠ 与 run_node_live.sh 的差异：**不能**用 rmq_test_broker.sh——它靠 /bin/ps 找
-#   pid，本环境 /bin/ps 被沙箱禁用。这里自己起集群、用 jps 找 pid 收尾，只停
-#   自己起来的那一次；已经在跑的集群不碰。
+# ⚠ Difference from run_node_live.sh: rmq_test_broker.sh **cannot** be used — it locates
+#   pids via /bin/ps, and /bin/ps is disabled by the sandbox in this environment. This script
+#   starts the cluster itself and finds pids with jps to clean up, stopping only the instance
+#   it started; any already-running cluster is left untouched.
 #
-# ⚠ 集群 start + 等端口 + 跑验证 + kill 必须都在本脚本内串完：沙箱前台命令返回
-#   会回收后台 JVM。
+# ⚠ Cluster start + waiting for ports + running verification + kill must all be chained inside
+#   this script: when a sandboxed foreground command returns, the background JVMs are reaped.
 set -u
 
 WHICH=${1:-admin}
@@ -60,7 +64,7 @@ port_open() {
 STARTED=0
 cleanup() {
     if [ "$STARTED" = "1" ]; then
-        echo "--- 收工：停掉本脚本起的集群（jps 找 pid） ---"
+        echo "--- Done: stopping the cluster started by this script (finding pids via jps) ---"
         local pids
         pids=$(jps -l 2>/dev/null | awk '/NamesrvStartup|BrokerStartup/ {print $1}')
         if [ -n "$pids" ]; then
@@ -77,20 +81,20 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# ---------------------------------------------------------------- tls 分支（自管两轮 broker）
-# PHP 的 tlsEnable 是**进程级全局**开关：namesrv 连接也走 TLS，
-# 所以 namesrv+broker 都要 -Dtls.enable=true + 同一套 server 证书（permissive）。
+# ---------------------------------------------------------------- tls branch (self-managed two broker rounds)
+# tlsEnable on PHP is a **process-wide global** switch: the namesrv connection also goes
+# through TLS, so namesrv+broker both need -Dtls.enable=true + the same server certificate (permissive).
 if [ "$WHICH" = "tls" ]; then
     if port_open x "$NS_PORT" || port_open x "$BROKER_PORT"; then
-        echo "=== tls 分支需要 TLS 专用集群，但 ${NS_PORT}/${BROKER_PORT} 已有集群在跑" >&2
-        echo "    （多半是明文，TLS 客户端握手必失败）。请先停掉它再跑 tls。 ===" >&2
+        echo "=== the tls branch needs a TLS-dedicated cluster, but a cluster is already running on ${NS_PORT}/${BROKER_PORT}" >&2
+        echo "    (most likely plaintext; the TLS client handshake would surely fail). Stop it first before running tls. ===" >&2
         exit 2
     fi
-    command -v openssl >/dev/null 2>&1 || { echo "openssl 不可用" >&2; exit 2; }
+    command -v openssl >/dev/null 2>&1 || { echo "openssl is not available" >&2; exit 2; }
     TWORK=/tmp/rmq_php_live_tls
     rm -rf "$TWORK"
     mkdir -p "$TWORK/store"
-    echo "=== 生成测试证书（CA / server(SAN: IP:127.0.0.1,DNS:localhost) / client） ==="
+    echo "=== generating test certificates (CA / server(SAN: IP:127.0.0.1,DNS:localhost) / client) ==="
     (cd "$TWORK" \
         && openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 2 -subj "/CN=rmq-php-test-ca" >/dev/null 2>&1 \
         && openssl req -newkey rsa:2048 -nodes -keyout server.key -out server.csr -subj "/CN=127.0.0.1" >/dev/null 2>&1 \
@@ -98,9 +102,9 @@ if [ "$WHICH" = "tls" ]; then
         && openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 2 -extfile server.ext >/dev/null 2>&1 \
         && openssl req -newkey rsa:2048 -nodes -keyout client.key -out client.csr -subj "/CN=rmq-php-test-client" >/dev/null 2>&1 \
         && openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out client.crt -days 2 >/dev/null 2>&1) \
-        || { echo "证书生成失败" >&2; exit 2; }
-    # RocketMQ 的 PemReader 只吃 PKCS#8（"BEGIN PRIVATE KEY"）；老 LibreSSL 默认吐
-    # PKCS#1（"BEGIN RSA PRIVATE KEY"）时显式转一道。
+        || { echo "certificate generation failed" >&2; exit 2; }
+    # RocketMQ's PemReader only accepts PKCS#8 ("BEGIN PRIVATE KEY"); when an older LibreSSL
+    # emits PKCS#1 ("BEGIN RSA PRIVATE KEY") by default, convert it explicitly.
     srv_hdr=$(head -1 "$TWORK/server.key")
     case "$srv_hdr" in
         *"BEGIN PRIVATE KEY"*) : ;;
@@ -121,10 +125,11 @@ storePathRootDir = $TWORK/store
 autoCreateTopicEnable = true
 EOF
     export ROCKETMQ_HOME="$DIST"
-    # leg1+2：namesrv+broker 双双 permissive TLS（无客户端证书要求）。
-    # ⚠ tls.test.mode.enable 默认 true 时服务端**无视 certPath**、现场生成临时自签
-    #   证书——leg1（信任一切）能过，leg2 的 CA 校验必挂。必须显式关掉测试模式，
-    #   服务端才会加载 server.crt/keyPath。
+    # leg1+2: namesrv+broker both run permissive TLS (no client certificate requirement).
+    # ⚠ When tls.test.mode.enable stays at its default true, the server **ignores certPath** and
+    #   generates a temporary self-signed certificate on the fly — leg1 (trusts everything) passes,
+    #   but leg2's CA verification always fails. Test mode must be explicitly disabled so the
+    #   server loads server.crt/keyPath.
     export JAVA_OPT_EXT="-Xms1g -Xmx2g -Xmn768m -Dtls.enable=true -Dtls.test.mode.enable=false -Dtls.server.certPath=$TWORK/server.crt -Dtls.server.keyPath=$TWORK/server.key"
     nohup "$DIST/bin/mqnamesrv" > "$TWORK/ns.log" 2>&1 &
     nohup "$DIST/bin/mqbroker" -c "$TWORK/broker.conf" > "$TWORK/broker.log" 2>&1 &
@@ -136,23 +141,23 @@ EOF
         fi
         sleep 1
         if [ "$i" = "60" ]; then
-            echo "=== TLS 集群 60s 未就绪（见 $TWORK/ns.log / $TWORK/broker.log） ===" >&2
+            echo "=== TLS cluster not ready within 60s (see $TWORK/ns.log / $TWORK/broker.log) ===" >&2
             exit 2
         fi
     done
     if ! "$PHP_BIN" "$ROOT/php/examples/wait_broker_route.php" "127.0.0.1:$NS_PORT" 60; then
-        echo "=== broker 60s 未注册进 nameserver ===" >&2
+        echo "=== broker not registered into nameserver within 60s ===" >&2
         exit 2
     fi
 
     cd "$ROOT/php" || exit 1
     RC=0
-    echo "=== [leg 1/3] plain_tls（test-mode：信任自签） ==="
+    echo "=== [leg 1/3] plain_tls (test-mode: trust self-signed) ==="
     "$PHP_BIN" "$EXAMPLE" "$NS" plain_tls "$TWORK/ca.crt" 127.0.0.1 || RC=1
-    echo "=== [leg 2/3] ca_verify（真校验证书链 + 主机名 SAN） ==="
+    echo "=== [leg 2/3] ca_verify (verify certificate chain + hostname SAN) ==="
     "$PHP_BIN" "$EXAMPLE" "$NS" ca_verify "$TWORK/ca.crt" 127.0.0.1 || RC=1
 
-    echo "=== 重启 broker（追加 -Dtls.client.authServer=true → mTLS） ==="
+    echo "=== restarting broker (adding -Dtls.client.authServer=true → mTLS) ==="
     pids=$(jps -l 2>/dev/null | awk '/BrokerStartup/ {print $1}')
     # shellcheck disable=SC2086
     [ -n "$pids" ] && kill $pids 2>/dev/null
@@ -166,10 +171,10 @@ EOF
             sleep 2
         fi
     done
-    # mTLS：broker（server 侧）要求客户端出示证书 → 正确开关是
-    # tls.server.authClient（tls.client.authServer 是「client 认证 server」，
-    # 写它会毒到 broker→namesrv 的注册通道，broker 注册直接失败）；
-    # trustCertPath 指向签发 client 证书的 CA。
+    # mTLS: for the broker (server side) to require a client certificate, the correct switch is
+    # tls.server.authClient (tls.client.authServer means "client authenticates the server";
+    # setting it poisons the broker→namesrv registration channel and broker registration fails
+    # outright); trustCertPath points at the CA that issued the client certificate.
     export JAVA_OPT_EXT="-Xms1g -Xmx2g -Xmn768m -Dtls.enable=true -Dtls.test.mode.enable=false -Dtls.server.certPath=$TWORK/server.crt -Dtls.server.keyPath=$TWORK/server.key -Dtls.server.authClient=true -Dtls.server.trustCertPath=$TWORK/ca.crt"
     nohup "$DIST/bin/mqbroker" -c "$TWORK/broker.conf" > "$TWORK/broker2.log" 2>&1 &
     for i in $(seq 1 60); do
@@ -179,27 +184,28 @@ EOF
         fi
         sleep 1
         if [ "$i" = "60" ]; then
-            echo "=== mTLS broker 60s 未就绪（见 $TWORK/broker2.log） ===" >&2
+            echo "=== mTLS broker not ready within 60s (see $TWORK/broker2.log) ===" >&2
             exit 2
         fi
     done
     if ! "$PHP_BIN" "$ROOT/php/examples/wait_broker_route.php" "127.0.0.1:$NS_PORT" 60; then
-        echo "=== mTLS broker 60s 未注册进 nameserver ===" >&2
+        echo "=== mTLS broker not registered into nameserver within 60s ===" >&2
         exit 2
     fi
-    echo "=== [leg 3/3] mtls（出示客户端证书，双向认证） ==="
+    echo "=== [leg 3/3] mtls (present client certificate, mutual authentication) ==="
     "$PHP_BIN" "$EXAMPLE" "$NS" mtls "$TWORK/ca.crt" 127.0.0.1 "$TWORK/client.crt" "$TWORK/client.key" || RC=1
 
     echo "=== exit=$RC ==="
     exit $RC
 fi
 
-# ---------------------------------------------------------------- pop 分支独占检查
-# POP 要求 broker.conf 四件硬配置（timerWheelEnable 等）。已在跑的集群多半是普通
-# conf，静默复用必然硬失败在 S1——直接拒绝比错配好。
+# ---------------------------------------------------------------- pop branch exclusive-cluster check
+# POP requires four hard broker.conf settings (timerWheelEnable etc.). An already-running
+# cluster is mostly plain conf; silently reusing it would always hard-fail at S1 — rejecting
+# outright beats a mismatched run.
 if [ "$WHICH" = "pop" ] && { port_open x "$NS_PORT" || port_open x "$BROKER_PORT"; }; then
-    echo "=== pop 分支需要 POP 专用集群（timerWheelEnable=true 等四件配置），" >&2
-    echo "    但 ${NS_PORT}/${BROKER_PORT} 已有集群在跑。请先停掉它再跑 pop。 ===" >&2
+    echo "=== the pop branch needs a POP-dedicated cluster (timerWheelEnable=true and three more settings)," >&2
+    echo "    but a cluster is already running on ${NS_PORT}/${BROKER_PORT}. Stop it first before running pop. ===" >&2
     exit 2
 fi
 if [ "$WHICH" = "pop" ]; then
@@ -207,9 +213,9 @@ if [ "$WHICH" = "pop" ]; then
 fi
 
 if ! port_open x "$NS_PORT" || ! port_open x "$BROKER_PORT"; then
-    echo "=== 集群未监听（${NS_PORT}/${BROKER_PORT}），拉起本地测试集群 ==="
+    echo "=== cluster not listening (${NS_PORT}/${BROKER_PORT}), starting a local test cluster ==="
     if [ ! -d "$DIST" ]; then
-        echo "找不到 RocketMQ 分发目录: ${DIST}（用 ROCKETMQ_DIST 覆盖）" >&2
+        echo "RocketMQ distribution directory not found: ${DIST} (override with ROCKETMQ_DIST)" >&2
         exit 2
     fi
     mkdir -p "$WORK/store"
@@ -229,7 +235,7 @@ EOF
     if [ "$WHICH" = "pop" ]; then
         cat >> "$WORK/broker.conf" <<EOF
 
-# POP 硬前提（broker.conf 需要这三项才能跑 POP 链路）
+# POP hard prerequisites (broker.conf needs these for the POP path to run)
 timerWheelEnable = true
 defaultMessageRequestMode = PULL
 popResponseReturnActualRetryTopic = false
@@ -244,20 +250,20 @@ EOF
 
     for i in $(seq 1 60); do
         if port_open x "$NS_PORT" && port_open x "$BROKER_PORT"; then
-            echo "=== 集群就绪（等待 ${i}x1s） ==="
+            echo "=== cluster ready (waited ${i}x1s) ==="
             sleep 2
             break
         fi
         sleep 1
         if [ "$i" = "60" ]; then
-            echo "=== 集群 60s 未就绪，放弃（见 $WORK/ns.log / $WORK/broker.log） ===" >&2
+            echo "=== cluster not ready within 60s, giving up (see $WORK/ns.log / $WORK/broker.log) ===" >&2
             exit 2
         fi
     done
-    # 端口通了 ≠ 路由已注册：TBW102 没进 nameserver 之前一切 createTopic/send 都会
-    # 死于 "No route info of default topic TBW102"，所以必须再等 broker 注册。
+    # Port open ≠ route registered: before TBW102 reaches the nameserver, every createTopic/send
+    # dies with "No route info of default topic TBW102", so we must also wait for broker registration.
     if ! "$PHP_BIN" "$ROOT/php/examples/wait_broker_route.php" "127.0.0.1:$NS_PORT" 60; then
-        echo "=== broker 60s 未注册进 nameserver，放弃 ===" >&2
+        echo "=== broker not registered into nameserver within 60s, giving up ===" >&2
         exit 2
     fi
 fi
@@ -267,8 +273,9 @@ cd "$ROOT/php" || exit 1
 if [ "$WHICH" = "redelivery" ] || [ "$WHICH" = "pop" ] || [ "$WHICH" = "pull" ]; then
     "$PHP_BIN" "$EXAMPLE" "$NS" "$LEGS"
 elif [ "$WHICH" = "request_reply" ]; then
-    # 双进程编排：responder（consumer + producer.reply）后台起，等 READY 后跑
-    # requester（producer.request）。responder 收满 expect 条自行退出。
+    # Two-process orchestration: the responder (consumer + producer.reply) starts in the
+    # background; once READY is seen, run the requester (producer.request). The responder
+    # exits on its own after receiving expect messages.
     RR_TOPIC="PhpReqRep_${STAMP}"
     RR_EXPECT=${RR_EXPECT:-3}
     "$PHP_BIN" "$EXAMPLE" responder "$NS" "$RR_TOPIC" "$RR_EXPECT" > "$WORK/rr_responder.log" 2>&1 &
@@ -285,7 +292,7 @@ elif [ "$WHICH" = "request_reply" ]; then
         sleep 1
     done
     if [ "$RESPONDER_OK" != "1" ]; then
-        echo "=== responder 40s 未就绪（见 $WORK/rr_responder.log） ===" >&2
+        echo "=== responder not ready within 40s (see $WORK/rr_responder.log) ===" >&2
         kill "$RESPONDER_PID" 2>/dev/null || true
         cat "$WORK/rr_responder.log"
         exit 2
@@ -293,7 +300,7 @@ elif [ "$WHICH" = "request_reply" ]; then
     "$PHP_BIN" "$EXAMPLE" requester "$NS" "$RR_TOPIC" "$RR_EXPECT"
     RC=$?
     wait "$RESPONDER_PID" || true
-    echo "--- responder 输出（$WORK/rr_responder.log） ---"
+    echo "--- responder output ($WORK/rr_responder.log) ---"
     cat "$WORK/rr_responder.log"
     exit $RC
 elif [ "$WHICH" = "compression" ]; then

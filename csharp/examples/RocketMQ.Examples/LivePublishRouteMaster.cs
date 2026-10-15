@@ -1,12 +1,14 @@
-// 前置：namesrv + master + slave 都在跑（按本地集群 runbook）；脚本自己**只停一次 master**
-// （scripts/rmq_test_broker.sh 只认 master 的 java 进程），收尾无条件把它拉回来。
+// Prerequisite: namesrv + master + slave are all running (following the local cluster
+// runbook); the script **only stops the master once** (scripts/rmq_test_broker.sh only
+// recognises the master's java process), and the cleanup unconditionally brings it back up.
 //
 //
-// 离线单测（tests/RouteHeartbeatTests.cs）锁的是判据；真机锁的是判据作用在真实路由形状上的
-// 结果 —— 名字服务里 broker-a 真的只剩 {1: slave}。
+// The offline unit tests (tests/RouteHeartbeatTests.cs) pin the criteria; the real machine
+// pins the result of those criteria acting on a real route shape -- where broker-a really
+// only has {1: slave} left in the name server.
 //
 //
-// 用法：rmq publish-route-master [namesrv] [master] [slave]
+// Usage: rmq publish-route-master [namesrv] [master] [slave]
 using System.Diagnostics;
 using System.Globalization;
 using System.Text;
@@ -22,7 +24,8 @@ public static class LivePublishRouteMaster
     private const int Queues = 4;
     private const string BrokerName = "broker-a";
 
-    /// <summary>本端失败上界：发布信息为空时压根没有 broker wire 调用，真机给 500ms 已留量级余量。</summary>
+    /// <summary>The upper bound for a local failure: when the publish info is empty there is
+    /// no broker wire call at all, so 500ms already leaves an order of magnitude of slack.</summary>
     private const double LocalBudgetMs = 500.0;
 
     private static int _pass;
@@ -51,8 +54,10 @@ public static class LivePublishRouteMaster
     }
 
     /// <summary>
-    /// 跑 scripts/rmq_test_broker.sh（**只碰 master**，四个语言的 live 用例共用）。
-    /// 输出走**文件**而不是管道：start 会把 broker 拉成常驻进程，谁继承它的写端谁就等不到 EOF。
+   /// Runs scripts/rmq_test_broker.sh (**only touches the master**; the live cases of all
+   /// four languages share it).
+   /// The output goes to a **file** rather than a pipe: start turns the broker into a
+    /// resident process, and whoever inherits its write end never sees EOF.
     /// </summary>
     private static (bool Ok, string Out) BrokerCtl(string script, string action)
     {
@@ -76,7 +81,9 @@ public static class LivePublishRouteMaster
         }
     }
 
-    /// <summary>真机投递/复制受 broker 长轮询与同机负载影响，固定 sleep 会把「实现没问题」测成假失败。</summary>
+   /// <summary>Real-machine delivery/replication is affected by the broker's long polling and
+    /// by load on the same machine, so a fixed sleep turns "the implementation is fine" into a
+    /// false failure.</summary>
     private static bool WaitUntil(Func<bool> pred, int timeoutMs, int intervalMs = 500)
     {
         var sw = Stopwatch.StartNew();
@@ -102,7 +109,8 @@ public static class LivePublishRouteMaster
     private static string FmtOffsets(List<(int QueueId, long Offset)> rows) =>
         "[" + string.Join(", ", rows.Select(r => "q" + r.QueueId + "=" + r.Offset)) + "]";
 
-    /// <summary>只收 body：这一趟关心的是「从节点上的 4 条能不能收齐」，不关心位点与顺序。</summary>
+   /// <summary>Only collects the bodies: what this round cares about is "can the 4 messages
+   /// on the slave all be received", not offsets or order.</summary>
     private sealed class Sink
     {
         private readonly object _lock = new();
@@ -177,7 +185,8 @@ public static class LivePublishRouteMaster
             Producer.Start();
         }
 
-        /// <summary>broker-a 当前的 brokerAddrs（每次调用都强制刷一次路由，等停/恢复靠轮询它）。</summary>
+        /// <summary>broker-a's current brokerAddrs (every call forces one route refresh; the
+    /// wait for stop/recovery polls this).</summary>
         public SortedDictionary<long, string> RouteAddrs()
         {
             Admin.Client().UpdateTopicRouteInfoFromNameServer(Topic, false, 5000);
@@ -206,7 +215,8 @@ public static class LivePublishRouteMaster
             return c;
         }
 
-        /// <summary>收尾：先把 master 拉回来（start 幂等），再删 topic、关客户端 —— 不能留一份孤儿配置。</summary>
+        /// <summary>Cleanup: first bring the master back up (start is idempotent), then
+    /// delete the topic and close the clients -- no orphan config may be left behind.</summary>
         public void Cleanup(string script)
         {
             BrokerCtl(script, "start");
@@ -218,7 +228,7 @@ public static class LivePublishRouteMaster
                 }
                 catch (Exception e)
                 {
-                    Console.WriteLine("    (delete topic on " + addr + " 失败: " + e.Message + ")");
+           Console.WriteLine("    (delete topic on " + addr + " failed: " + e.Message + ")");
                 }
             }
 
@@ -228,7 +238,7 @@ public static class LivePublishRouteMaster
             }
             catch (Exception e)
             {
-                Console.WriteLine("    (delete topic in namesrv 失败: " + e.Message + ")");
+         Console.WriteLine("    (delete topic in namesrv failed: " + e.Message + ")");
             }
 
             try
@@ -237,7 +247,7 @@ public static class LivePublishRouteMaster
             }
             catch (Exception)
             {
-                // 收尾失败不该掩盖用例结论
+    // a cleanup failure must not mask the conclusion of the case
             }
 
             try
@@ -246,7 +256,7 @@ public static class LivePublishRouteMaster
             }
             catch (Exception)
             {
-                // 同上
+   // same
             }
 
             try
@@ -255,18 +265,19 @@ public static class LivePublishRouteMaster
             }
             catch (Exception)
             {
-                // 同上
+   // same
             }
         }
     }
 
-    /// <summary>发布信息为空 ⇒ GetTopicPublishInfo 抛「Can not find Message Queue for topic」。</summary>
+    /// <summary>Empty publish info => GetTopicPublishInfo throws "Can not find Message Queue
+    /// for topic".</summary>
     private static bool PublishInfoEmpty(MQClientInstance client, string topic, out string detail)
     {
         try
         {
             TopicPublishInfo info = client.GetTopicPublishInfo(topic, false);
-            detail = "意外拿到 " + info.MsgQueueList.Count + " 条队列";
+    detail = "unexpectedly got " + info.MsgQueueList.Count + " queues";
             return false;
         }
         catch (MQClientException e)
@@ -280,26 +291,26 @@ public static class LivePublishRouteMaster
     {
         string topic = fx.Topic;
 
-        // ---------- S0 控制腿 ----------
-        Console.WriteLine("S0 控制腿（master 在）：路由 {0: master, 1: slave}、发布/订阅各 " + Queues + " 条");
+        // ---------- S0 the control leg ----------
+        Console.WriteLine("S0 the control leg (master up): the route {0: master, 1: slave}, " + Queues + " queues each for publish/subscribe");
         try
         {
             fx.Admin.Client().CreateTopicInRoute(topic, Queues, Queues, MixAll.ReadPermByDefault, 5000);
         }
         catch (Exception e)
         {
-            Check("S0 建 topic（master）", false, e.Message);
+     Check("S0 created the topic (master)", false, e.Message);
             return;
         }
 
-        // 从节点也直建一份，不赌 SlaveSynchronize 的 5s 周期
+        // Creating one directly on the slave too, not betting on SlaveSynchronize's 5s period
         try
         {
             fx.Admin.CreateTopicInBroker(fx.Slave, topic, Queues, Queues, MixAll.ReadPermByDefault);
         }
         catch (Exception e)
         {
-            Console.WriteLine("    (从节点建 topic 失败: " + e.Message + ")");
+       Console.WriteLine("    (creating the topic on the slave failed: " + e.Message + ")");
         }
 
         SortedDictionary<long, string> addrs = new();
@@ -308,14 +319,14 @@ public static class LivePublishRouteMaster
             addrs = fx.RouteAddrs();
             return addrs.ContainsKey(0) && addrs.ContainsKey(1);
         }, 30000);
-        Check("S0 路由含 {0: master, 1: slave}", routeUp, "broker_addrs=" + FmtAddrs(addrs));
+ Check("S0 the route contains {0: master, 1: slave}", routeUp, "broker_addrs=" + FmtAddrs(addrs));
         if (!routeUp)
         {
             return;
         }
 
         string routeSlave = addrs.TryGetValue(1, out string? s1) ? s1 : string.Empty;
-        Check("S0 从节点地址与参数一致", routeSlave == fx.Slave,
+   Check("S0 the slave address matches the parameter", routeSlave == fx.Slave,
             "route=" + routeSlave + " argv=" + fx.Slave);
 
         List<MessageQueue> queues;
@@ -325,23 +336,23 @@ public static class LivePublishRouteMaster
         }
         catch (Exception e)
         {
-            Check("S0 发布队列 " + Queues + "（控制）", false, e.Message);
+   Check("S0 the publish queues " + Queues + " (control)", false, e.Message);
             return;
         }
 
         queues = queues.OrderBy(q => q.QueueId).ToList();
-        Check("S0 发布队列 " + Queues + "（控制）", queues.Count == Queues,
+   Check("S0 the publish queues " + Queues + " (control)", queues.Count == Queues,
             "queues=" + FmtQueues(queues));
         List<MessageQueue> subs = fx.Admin.Client().GetTopicSubscribeInfo(topic);
-        Check("S0 订阅队列 " + Queues + "（控制）", subs.Count == Queues, "queues=" + FmtQueues(subs));
+ Check("S0 the subscribe queues " + Queues + " (control)", subs.Count == Queues, "queues=" + FmtQueues(subs));
         if (queues.Count != Queues)
         {
             return;
         }
 
-        // ---------- S1 预埋 ----------
+        // ---------- S1 seeding ----------
         Console.WriteLine();
-        Console.WriteLine("S1 预埋 " + Queues + " 条（每队列定点一条）并等从节点 store 追上");
+        Console.WriteLine("S1 seeding " + Queues + " messages (one pinned per queue) and waiting for the slave's store to catch up");
         var seeded = new List<string>();
         for (int i = 0; i < queues.Count; i++)
         {
@@ -356,16 +367,16 @@ public static class LivePublishRouteMaster
                 }
                 else
                 {
-                    Check("S1 第 " + i + " 条预埋 SEND_OK", false, "status=" + r.SendStatus);
+       Check("S1 seeding message number " + i + " SEND_OK", false, "status=" + r.SendStatus);
                 }
             }
             catch (Exception e)
             {
-                Check("S1 第 " + i + " 条预埋 SEND_OK", false, e.Message);
+            Check("S1 seeding message number " + i + " SEND_OK", false, e.Message);
             }
         }
 
-        Check("S1 " + Queues + " 条预埋全部 SEND_OK", seeded.Count == Queues, "seeded=" + seeded.Count);
+        Check("S1 all " + Queues + " seeded messages are SEND_OK", seeded.Count == Queues, "seeded=" + seeded.Count);
         if (seeded.Count != Queues)
         {
             return;
@@ -380,7 +391,7 @@ public static class LivePublishRouteMaster
             }
             catch (Exception e)
             {
-                Console.WriteLine("    (master maxOffset 查询失败: " + e.Message + ")");
+      Console.WriteLine("    (the master's maxOffset query failed: " + e.Message + ")");
             }
         }
 
@@ -400,21 +411,21 @@ public static class LivePublishRouteMaster
                 }
                 catch (Exception e)
                 {
-                    Console.WriteLine("    (从节点取 maxOffset 失败: " + e.Message + ")");
+  Console.WriteLine("    (getting maxOffset from the slave failed: " + e.Message + ")");
                     return false;
                 }
             }
 
             return masterMax.All(m => slaveMax.Any(s => s.QueueId == m.QueueId && s.Offset >= m.Offset));
         }, 30000);
-        Check("S1 " + Queues + " 条已复制到从节点 store", caughtUp,
+        Check("S1 the " + Queues + " messages have been replicated to the slave's store", caughtUp,
             "master=" + FmtOffsets(masterMax));
 
-        // ---------- S2 停 master ----------
+        // ---------- S2 stopping the master ----------
         Console.WriteLine();
-        Console.WriteLine("S2 停 master（scripts/rmq_test_broker.sh stop），等路由只剩从节点");
+        Console.WriteLine("S2 stopping the master (scripts/rmq_test_broker.sh stop) and waiting for the route to be left with only the slave");
         (bool stopped, string stopOut) = BrokerCtl(script, "stop");
-        Check("S2 master 已优雅停机", stopped, stopOut);
+        Check("S2 the master stopped gracefully", stopped, stopOut);
 
         SortedDictionary<long, string> downAddrs = new();
         bool masterless = WaitUntil(() =>
@@ -422,30 +433,33 @@ public static class LivePublishRouteMaster
             downAddrs = fx.RouteAddrs();
             return !downAddrs.ContainsKey(0) && downAddrs.ContainsKey(1);
         }, 60000);
-        Check("S2 路由里 broker-a 只剩 {1: slave}", masterless, "broker_addrs=" + FmtAddrs(downAddrs));
+   Check("S2 broker-a only has {1: slave} left in the route", masterless, "broker_addrs=" + FmtAddrs(downAddrs));
         if (!masterless)
         {
             return;
         }
 
-        // ---------- S3 (A) 发布信息组不出队列 ----------
+   // ---------- S3 (A) the publish info group produces no queues ----------
         Console.WriteLine();
-        Console.WriteLine("S3 (A) 发布信息跳过没有 master 的 broker");
+        Console.WriteLine("S3 (A) the publish info skips a broker with no master");
         bool s3 = PublishInfoEmpty(fx.Admin.Client(), topic, out string s3Detail);
-        Check("S3 停 master 后发布队列 == 0（访问器本端抛「选不到队列」）", s3, s3Detail);
+        Check("S3 after the master stops the publish queues == 0 (the accessor throws \"cannot select a queue\" locally)", s3, s3Detail);
 
-        // ---------- S4 (C) 订阅队列 ----------
+        // ---------- S4 (C) the subscribe queues ----------
         List<MessageQueue> subsDown = fx.Admin.Client().GetTopicSubscribeInfo(topic);
-        Check("S4 (C) 订阅队列仍是 " + Queues + "、且都在 " + BrokerName + "（消费侧不看 master）",
+     Check("S4 (C) the subscribe queues are still " + Queues + " and all on " + BrokerName + " (the consume side does not look at the master)",
             subsDown.Count == Queues && subsDown.All(q => q.BrokerName == BrokerName),
             "queues=" + FmtQueues(subsDown));
 
-        // ---------- S5 (A 定型) 发送快速失败 ----------
-        // 分两段看：**缓存还没刷**时（现实中 30s 周期任务未到）发送实例手里还是停前的旧路由，
-        // 地址解析落在死掉的 master 上，快速失败、绝不静默改发从节点；**路由刷成停后形状**后
-        // （周期任务 / 显式刷新），(A) 生效：发布队列为空，发送连一条 broker wire 都不发。
+        // ---------- S5 (A manifesting) the send fails fast ----------
+        // Seen in two stages: while **the cache has not been refreshed** (in reality the 30s
+        // periodic task has not fired yet) the sending instance still holds the pre-stop
+   // route, the address resolution lands on the dead master, it fails fast and never
+        // silently switches to the slave; once **the route has been refreshed to the
+   // post-stop shape** (the periodic task / an explicit refresh), (A) takes effect: the
+        // publish queues are empty and the send does not put a single broker wire out.
         Console.WriteLine();
-        Console.WriteLine("S5 不指定队列的同步发送：旧缓存快速失败 → 刷新后本端快速失败");
+        Console.WriteLine("S5 a synchronous send with no queue specified: stale cache fails fast -> after the refresh it fails fast locally");
         var sw = Stopwatch.StartNew();
         string staleText;
         bool staleFailed;
@@ -462,13 +476,15 @@ public static class LivePublishRouteMaster
         }
 
         double staleMs = sw.Elapsed.TotalMilliseconds;
-        // 这一腿是机会腿：周期刷新是否已经跑过不由本脚本定。两条腿的共同判据是
-        // "快速失败 + 绝不落到从节点地址上"（旧缓存腿打的是死掉的 master）。
-        Check("S5 发送快速失败，且报错里没有从节点地址（绝不改发从节点）",
+        // This leg is the opportunistic one: whether the periodic refresh has already run is
+        // not decided by this script. The criterion common to both legs is "fails fast +
+      // never lands on the slave address" (the stale-cache leg hits the dead master).
+        Check("S5 the send fails fast and the error mentions no slave address (it never switches to the slave)",
             staleFailed && staleMs < LocalBudgetMs && !staleText.Contains(fx.Slave, StringComparison.Ordinal),
             staleMs.ToString("F0", CultureInfo.InvariantCulture) + "ms " + staleText);
 
-        // 让发送实例自己的路由缓存刷成停后形状（与 30s 周期任务同一条代码路径）
+  // Make the sending instance's own route cache refresh to the post-stop shape (the very
+    // same code path as the 30s periodic task)
         MQClientInstance pcli;
         try
         {
@@ -476,7 +492,7 @@ public static class LivePublishRouteMaster
         }
         catch (Exception e)
         {
-            Check("S5b 拿到发送实例", false, e.Message);
+            Check("S5b got the sending instance", false, e.Message);
             return;
         }
 
@@ -486,11 +502,11 @@ public static class LivePublishRouteMaster
         }
         catch (Exception e)
         {
-            Console.WriteLine("    (发送实例路由刷新失败: " + e.Message + ")");
+            Console.WriteLine("    (the sending instance's route refresh failed: " + e.Message + ")");
         }
 
         bool s5b = PublishInfoEmpty(pcli, topic, out string s5bDetail);
-        Check("S5b 发送实例的发布队列也 == 0（(A) 就作用在这里）", s5b, s5bDetail);
+      Check("S5b the sending instance's publish queues are == 0 too (this is where (A) acts)", s5b, s5bDetail);
 
         sw.Restart();
         string freshText;
@@ -514,7 +530,7 @@ public static class LivePublishRouteMaster
         }
 
         double freshMs = sw.Elapsed.TotalMilliseconds;
-        Check("S5c 刷新后：本端 10005 抛「选不到队列」，无 wire 调用（无 BrokersSent）",
+        Check("S5c after the refresh: locally 10005 throws \"cannot select a queue\", no wire call (no BrokersSent)",
             freshFailed
             && freshCode == ClientErrorCode.NotFoundTopicException
             && freshText.Contains("Can not find Message Queue for topic", StringComparison.Ordinal)
@@ -523,7 +539,7 @@ public static class LivePublishRouteMaster
             freshMs.ToString("F0", CultureInfo.InvariantCulture) + "ms code=" + freshCode + ": " + freshText);
 
         Console.WriteLine();
-        Console.WriteLine("S5d (B) 对照：定点发到该队列 → 本端报 broker 不存在（不发 wire）");
+     Console.WriteLine("S5d (B) the control: a pinned send to that queue -> locally reports the broker does not exist (no wire)");
         var mq0 = new MessageQueue(topic, BrokerName, 0);
         int pinnedCode = -1;
         bool pinnedFailed = false;
@@ -537,7 +553,8 @@ public static class LivePublishRouteMaster
         }
         catch (MQClientException e)
         {
-            // MQBrokerException 不继承 MQClientException：这里能进来说明不是 broker 回的码
+    // MQBrokerException does not inherit MQClientException: getting in here proves it is
+    // not a code the broker returned
             pinnedFailed = true;
             pinnedIsClientError = true;
             pinnedCode = e.ResponseCode;
@@ -550,8 +567,8 @@ public static class LivePublishRouteMaster
         }
 
         double pinnedMs = sw.Elapsed.TotalMilliseconds;
-        Check("S5d 定点发送本端报「The broker[" + BrokerName + "] not exist」，无 wire"
-              + "（不是从节点回的 SYSTEM_BUSY(2)）",
+       Check("S5d the pinned send locally reports \"The broker[" + BrokerName + "] not exist\", with no wire"
+          + " (not a SYSTEM_BUSY(2) returned by the slave)",
             pinnedFailed && pinnedIsClientError && pinnedCode == -1
             && pinnedText == "The broker[" + BrokerName + "] not exist"
             && pinnedMs < LocalBudgetMs,
@@ -559,7 +576,7 @@ public static class LivePublishRouteMaster
             + ": " + pinnedText);
 
         Console.WriteLine();
-        Console.WriteLine("S5e (D) 顺序锁：停窗口内整台跳过（不刷路由、不发 wire）");
+        Console.WriteLine("S5e (D) orderly locks: the whole machine is skipped inside the stop window (no route refresh, no wire)");
         string group = "GID_PrMasterCs_" + fx.Stamp;
         string clientId = "pr_master_cs_lock_" + fx.Stamp;
         var lockMqs = new List<MessageQueue> { new(topic, BrokerName, 0) };
@@ -571,15 +588,16 @@ public static class LivePublishRouteMaster
         }
         catch (Exception e)
         {
-            Console.WriteLine("    (LockBatchMq 抛异常: " + e.Message + ")");
+  Console.WriteLine("    (LockBatchMq threw: " + e.Message + ")");
         }
 
         double lockMs = sw.Elapsed.TotalMilliseconds;
-        Check("S5e 只剩从节点时一台都锁不上（旧口径会退到从节点上锁）",
+      Check("S5e not a single one can be locked when only the slave is left (the old rule fell back to locking on the slave)",
             locks.Count == 0 && lockMs < LocalBudgetMs,
             lockMs.ToString("F0", CultureInfo.InvariantCulture) + "ms locked=" + FmtQueues(locks));
 
-        // 对照腿：同一份报文直接点名从节点 —— 从节点**本来**就会把锁发出来
+     // The control leg: the same request naming the slave directly -- the slave **does**
+  // hand out a lock for it
         JsonValue lockBody = JsonValue.MakeObject();
         lockBody.Set("consumerGroup", JsonValue.MakeString(group));
         lockBody.Set("clientId", JsonValue.MakeString(clientId));
@@ -608,13 +626,14 @@ public static class LivePublishRouteMaster
         }
         catch (Exception e)
         {
-            Console.WriteLine("    (从节点锁请求抛异常: " + e.Message + ")");
+    Console.WriteLine("    (the slave's lock request threw: " + e.Message + ")");
         }
 
-        Check("S5e2 对照：点名从节点时锁发得出来（空集不是 broker 拒绝）", slaveOk == 1,
+    Check("S5e2 control: naming the slave hands the lock out (an empty set is not the broker refusing)", slaveOk == 1,
             "slave lockOKMQSet=" + slaveOk);
 
-        // 对照腿锁上的那把要还回去（从节点的锁管理器不会有人来解）
+        // The lock taken by the control leg has to be given back (nobody will release it in
+        // the slave's lock manager)
         try
         {
             fx.Admin.Client().InvokeSyncRaw(fx.Slave, RequestCode.UnlockBatchMq,
@@ -622,7 +641,7 @@ public static class LivePublishRouteMaster
         }
         catch (Exception)
         {
-            // 释放失败不影响断言
+            // a release failure does not affect the assertions
         }
 
         sw.Restart();
@@ -632,15 +651,15 @@ public static class LivePublishRouteMaster
         }
         catch (Exception e)
         {
-            Console.WriteLine("    (UnlockBatchMq 抛异常: " + e.Message + ")");
+         Console.WriteLine("    (UnlockBatchMq threw: " + e.Message + ")");
         }
 
         double unlockMs = sw.Elapsed.TotalMilliseconds;
-        Check("S5e3 解锁同样安静跳过（不抛、不发）", unlockMs < LocalBudgetMs,
+        Check("S5e3 unlocking is skipped just as quietly (no throw, nothing sent)", unlockMs < LocalBudgetMs,
             unlockMs.ToString("F0", CultureInfo.InvariantCulture) + "ms");
 
         Console.WriteLine();
-        Console.WriteLine("S5f (E) POP 拉取：本端报「The broker[" + BrokerName + "] not exist」（不发 wire）");
+     Console.WriteLine("S5f (E) POP pull: locally reports \"The broker[" + BrokerName + "] not exist\" (no wire)");
         string popText;
         bool popFailed = false;
         bool popIsClientError = false;
@@ -663,14 +682,14 @@ public static class LivePublishRouteMaster
         }
 
         double popMs = sw.Elapsed.TotalMilliseconds;
-        Check("S5f 停窗口内 POP 本端报「The broker[" + BrokerName + "] not exist」（不是从节点回的错）",
+        Check("S5f inside the stop window the POP locally reports \"The broker[" + BrokerName + "] not exist\" (not an error returned by the slave)",
             popFailed && popIsClientError
             && popText == "The broker[" + BrokerName + "] not exist"
             && popMs < LocalBudgetMs,
             popMs.ToString("F0", CultureInfo.InvariantCulture) + "ms " + popText);
 
         Console.WriteLine();
-        Console.WriteLine("S5g (F) 位点读取：冷实例刷一次路由后放宽到从节点");
+   Console.WriteLine("S5g (F) offset read: a cold instance refreshes the route once and then relaxes to the slave");
         var cold = new MQClientInstance("pr_master_cs_cold_" + fx.Stamp,
             new List<string> { fx.Namesrv });
         try
@@ -691,16 +710,16 @@ public static class LivePublishRouteMaster
                 coldDetail = e.GetType().Name + ": " + e.Message;
             }
 
-            Check("S5g 冷实例位点读取不报错：刷路由 → 退到从节点由 broker 答复", coldOk, coldDetail);
+   Check("S5g a cold instance's offset read does not error: refresh the route -> fall back to the slave and let the broker answer", coldOk, coldDetail);
         }
         finally
         {
             cold.Shutdown();
         }
 
-        // ---------- S6 (C 端到端) 停窗口内消费 ----------
+        // ---------- S6 (C end to end) consuming inside the stop window ----------
         Console.WriteLine();
-        Console.WriteLine("S6 停窗口内新起的 push 消费者：" + Queues + " 条队列 + 从从节点收齐预埋的 " + Queues + " 条");
+        Console.WriteLine("S6 a push consumer started inside the stop window: " + Queues + " queues + receiving the " + Queues + " seeded messages from the slave");
         var sink = new Sink();
         DefaultMQPushConsumer consumer = fx.BuildConsumer(group, sink);
         try
@@ -717,12 +736,12 @@ public static class LivePublishRouteMaster
         try
         {
             List<MessageQueue> subsInWindow = consumer.Client().GetTopicSubscribeInfo(topic);
-            Check("S6a 窗口内消费者自己的订阅信息也是 " + Queues + " 条", subsInWindow.Count == Queues,
+     Check("S6a the consumer started inside the window also has " + Queues + " queues in its own subscribe info", subsInWindow.Count == Queues,
                 "queues=" + FmtQueues(subsInWindow));
         }
         catch (Exception e)
         {
-            Check("S6a 窗口内消费者自己的订阅信息也是 " + Queues + " 条", false, e.Message);
+         Check("S6a the consumer started inside the window also has " + Queues + " queues in its own subscribe info", false, e.Message);
         }
 
         var expected = new List<string>(seeded);
@@ -733,16 +752,16 @@ public static class LivePublishRouteMaster
             got.Sort();
             return got.SequenceEqual(expected);
         }, 60000);
-        Check("S6 停 master 期间从从节点收齐 " + Queues + " 条", gotAll,
+      Check("S6 all " + Queues + " received from the slave while the master is stopped", gotAll,
             "got=[" + string.Join(", ", sink.Bodies()) + "]");
 
-        // ---------- S7 负控（先把 master 拉回来） ----------
+        // ---------- S7 the negative control (bring the master back first) ----------
         Console.WriteLine();
-        Console.WriteLine("S7 负控：master 拉回后发布队列恢复、发送恢复");
+        Console.WriteLine("S7 negative control: once the master is back the publish queues recover and sending recovers");
         (bool restarted, string startOut) = BrokerCtl(script, "start");
         if (!restarted)
         {
-            Check("S7 master 复位", false, startOut);
+       Check("S7 the master came back", false, startOut);
         }
 
         List<MessageQueue> queuesBack = new();
@@ -759,14 +778,15 @@ public static class LivePublishRouteMaster
             }
             catch (Exception)
             {
-                // 还没恢复：继续等
+                // not recovered yet: keep waiting
             }
 
             return false;
         }, 60000);
-        Check("S7 发布队列恢复 " + Queues, back, "queues=" + FmtQueues(queuesBack));
+     Check("S7 the publish queues recovered to " + Queues, back, "queues=" + FmtQueues(queuesBack));
 
-        // 两条失败发送都没在 broker 上留下消息：每条预埋队列的 maxOffset 仍是 1
+        // Neither failed send left a message on the broker: each seeded queue's maxOffset is
+   // still 1
         var after = new List<(int QueueId, long Offset)>();
         foreach (MessageQueue mq in back ? queuesBack : queues)
         {
@@ -776,11 +796,11 @@ public static class LivePublishRouteMaster
             }
             catch (Exception e)
             {
-                Console.WriteLine("    (maxOffset 查询失败: " + e.Message + ")");
+        Console.WriteLine("    (the maxOffset query failed: " + e.Message + ")");
             }
         }
 
-        Check("S7b 两条失败发送没留下消息（maxOffset 仍是 1）",
+     Check("S7b the two failed sends left no messages (maxOffset is still 1)",
             after.Count > 0 && after.All(r => r.Offset == 1), "maxOffset=" + FmtOffsets(after));
 
         string backText;
@@ -796,7 +816,7 @@ public static class LivePublishRouteMaster
             backText = e.GetType().Name + ": " + e.Message;
         }
 
-        Check("S7c 发送恢复 SEND_OK", backOk, backText);
+      Check("S7c sending recovered with SEND_OK", backOk, backText);
     }
 
     public static int Run(string[] args)
@@ -811,8 +831,8 @@ public static class LivePublishRouteMaster
         (bool up, string upOut) = BrokerCtl(script, "status");
         if (!up)
         {
-            Console.WriteLine("master 没在跑：先按本地集群 runbook 起 namesrv + master + slave（" + upOut + "）");
-            Check("前置 master UP", false, upOut);
+  Console.WriteLine("the master is not running: start namesrv + master + slave first following the local cluster runbook (" + upOut + ")");
+       Check("the precondition master is UP", false, upOut);
             return Report();
         }
 
@@ -824,7 +844,7 @@ public static class LivePublishRouteMaster
         }
         catch (Exception e)
         {
-            Check("联调过程中出现未预期异常", false, e.ToString());
+       Check("an unexpected exception occurred during the integration", false, e.ToString());
         }
         finally
         {

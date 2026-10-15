@@ -9,19 +9,19 @@ use RocketMQ\Common\MessageExt;
 
 final class TraceContextPropagator
 {
-    /** W3C 键名（小写，与 OTel / HTTP 头一致） */
+    /** W3C key names (lowercase, consistent with OTel / HTTP headers) */
     public const TRACE_CONTEXT_PROPERTY = 'traceparent';
     public const TRACE_STATE_PROPERTY = 'tracestate';
 
     private const ALL_HEX = '0123456789abcdef';
 
-    /** 生成合法的根 traceparent：``00-<32hex>-<16hex>-01``（记录采样）。 */
+    /** Generate a valid root traceparent: ``00-<32hex>-<16hex>-01`` (record sampled). */
     public static function generateTraceparent(): string
     {
         return sprintf('00-%s-%s-01', self::hex(32), self::hex(16));
     }
 
-    /** 按 W3C 语法与"不全 0"规则校验。宽松接受大写 hex（转发不重写）。 */
+    /** Validate per W3C syntax and the "not all zeros" rule. Accepts uppercase hex loosely (forwarding does not rewrite). */
     public static function isValidTraceparent(?string $value): bool
     {
         if ($value === null || $value === '') {
@@ -54,7 +54,7 @@ final class TraceContextPropagator
         return true;
     }
 
-    /** 同一 trace-id 下生成子 span（换 parent-id）；parent 非法返回 null。 */
+    /** Generate a child span under the same trace-id (swap the parent-id); returns null if the parent is invalid. */
     public static function childTraceparent(?string $parent): ?string
     {
         if (!self::isValidTraceparent($parent)) {
@@ -65,9 +65,10 @@ final class TraceContextPropagator
     }
 
     /**
-     * 消息没有 traceparent 属性时注入根上下文；返回（注入后的）值。
+     * Inject the root context when the message has no traceparent property; returns the
+     * (injected) value.
      *
-     * 已有值**不覆盖**——上游传播进来的上下文优先。
+     * An existing value is **not** overwritten -- the context propagated from upstream wins.
      */
     public static function injectTraceContext(Message $message): string
     {
@@ -80,14 +81,14 @@ final class TraceContextPropagator
         return $tp;
     }
 
-    /** 从消息属性里取出 traceparent（未注入/为空返回 null）。 */
+    /** Take the traceparent from the message properties (null when not injected / empty). */
     public static function extractTraceparent(MessageExt $msg): ?string
     {
         $value = $msg->getProperty(self::TRACE_CONTEXT_PROPERTY);
         return ($value !== null && $value !== '') ? $value : null;
     }
 
-    /** env ``ROCKETMQ_TRACE_CONTEXT_ENABLE``（对齐其它开关的 env 惯例）。 */
+    /** env ``ROCKETMQ_TRACE_CONTEXT_ENABLE`` (follows the env convention of the other switches). */
     public static function traceContextEnabledFromEnv(): bool
     {
         $raw = getenv('ROCKETMQ_TRACE_CONTEXT_ENABLE');
@@ -97,7 +98,7 @@ final class TraceContextPropagator
         return in_array(strtolower(trim((string) $raw)), ['1', 'true', 'yes'], true);
     }
 
-    /** 生成 n 位十六进制随机串。 */
+    /** Generate an n-digit hex random string. */
     private static function hex(int $n): string
     {
         return bin2hex(random_bytes(intdiv($n, 2)));

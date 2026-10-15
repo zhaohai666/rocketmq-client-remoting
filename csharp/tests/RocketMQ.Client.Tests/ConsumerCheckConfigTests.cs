@@ -1,4 +1,4 @@
-// 与 src 侧的取值范围检查一一对应：同一张闸门表、同一段检查顺序、同一条文案。
+// One to one with the src side's range checks: the same gate table, the same check order, the same message text.
 using RocketMQ.Client;
 using RocketMQ.Common;
 
@@ -60,12 +60,15 @@ public class ConsumerCheckConfigTests
             (c, v) => c.PopBatchNums = (int)v, false, false),
     };
 
-    /// <summary>只带数值配置的实例：CheckConfigRanges 是纯逻辑，不需要 listener/路由。</summary>
+    /// <summary>An instance with only the numeric config: CheckConfigRanges is pure logic
+    /// and needs no listener/route.</summary>
     private static DefaultMQPushConsumer New() => new(Group);
 
-    /// <summary>配好某一条闸门取值的实例。线程两条闸门互斥（min 不能大于 max），默认
-    /// min=20/max=64 会把"改 max 到个位数"顶成 min&gt;max 错，所以先把这一对挪到合法
-    /// 区间两端（1 / 1000），保证报出来的一定是被测那条闸门。</summary>
+    /// <summary>An instance with one gate value configured. The two thread gates are
+    /// mutually exclusive (min must not exceed max), and the default min=20/max=64 would
+    /// turn "change max to a single digit" into a min&gt;max error, so that pair is first
+    /// moved to legal ends of the range (1 / 1000) to guarantee that what gets reported is
+    /// the gate under test.</summary>
     private static DefaultMQPushConsumer Broke(Gate gate, long value)
     {
         DefaultMQPushConsumer c = New();
@@ -104,14 +107,14 @@ public class ConsumerCheckConfigTests
             set(c);
         }
 
-        // 不抛即通过；抛了让 xUnit 把异常原文带出来
+        // not throwing means passing; if it throws, xUnit will surface the exception verbatim
         c.CheckConfigRanges();
     }
 
     [Fact]
     public void DefaultConfigurationPassesTheGate()
     {
-        // 默认值必须合法，否则这条改动会把所有不改配置的现网用户挡在门外。
+        // The default must be legal, otherwise this change would lock out every production user who does not touch the config.
         ExpectAccepted();
     }
 
@@ -131,8 +134,8 @@ public class ConsumerCheckConfigTests
         {
             if (gate.LowerBoundClampedBySetter)
             {
-                // 这三条的下界被 setter 的 Math.Max(1, n) 抬掉了，从公开 API 走不到，
-                // 由 SetterClampKeepsThreadAndBatchLowerBoundsReachable 单独锁兜底本身。
+                // The lower bounds of these three are lifted by the setter's Math.Max(1, n), so they are unreachable through
+                // the public API; SetterClampKeepsThreadAndBatchLowerBoundsReachable pins that clamp itself separately.
                 continue;
             }
 
@@ -243,9 +246,11 @@ public class ConsumerCheckConfigTests
     [Fact]
     public void StartRejectsBadConfigBeforeTouchingTheNetwork()
     {
-        // 校验点必须领先于任何建连/注册：坏配置起不来是常态，最怕的是"起来了但留了
-        // 半启动实例"。这里把闸门配坏 + 指向一个没人监听的 nameServer，要求报的是
-        // **配置**错而不是连接错，且 IsStarted 仍为 false。
+        // The validation point must precede any connecting/registering: a bad config failing
+        // to start is normal, and what is feared most is "it started but left a
+        // half-started instance behind". Here the gate is made bad and it points at a
+        // nameServer nobody listens on, and what is required is a **config** error rather
+        // than a connection error, with IsStarted still false.
         DefaultMQPushConsumer c = New();
         c.SetNamesrvAddr("127.0.0.1:1");
         c.InstanceName = "net_check_config_bad";

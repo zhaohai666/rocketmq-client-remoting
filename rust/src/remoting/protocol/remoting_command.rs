@@ -1,8 +1,8 @@
-//! `RemotingCommand`：RocketMQ 远程命令。
+//! `RemotingCommand`: a RocketMQ remoting command.
 //!
-//! 线格式：`totalLength(4) | headerLength(高 8 位为序列化类型, 4) | header | body`
-//! - JSON header：`RemotingSerializable` 的 JSON 编码
-//! - ROCKETMQ header：`code(2) language(1) version(2) opaque(4) flag(4) remark(int+utf8) extFields(int + key(short+utf8) value(int+utf8))`
+//! Wire format: `totalLength(4) | headerLength(top 8 bits are the serialize type, 4) | header | body`
+//! - JSON header: the JSON encoding of `RemotingSerializable`
+//! - ROCKETMQ header: `code(2) language(1) version(2) opaque(4) flag(4) remark(int+utf8) extFields(int + key(short+utf8) value(int+utf8))`
 
 use std::any::Any;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -24,11 +24,11 @@ pub const RPC_ONEWAY: i32 = 1;
 
 pub const REMOTING_VERSION_KEY: &str = "rocketmq.remoting.version";
 
-/// 这个值不只是好看：broker 用它决定能不能把管理请求转发回客户端——
-/// `AdminBrokerProcessor#callConsumer` 要求 ≥ `V3_1_8_SNAPSHOT`（ordinal 62），
-/// `Broker2Client#getConsumeStatus` 要求 ≥ `V3_0_7_SNAPSHOT`（ordinal 28）。
-/// 之前默认 0（= `V3_0_0_SNAPSHOT`），于是 `examineConsumerRunningInfo` /
-/// `getConsumeStatus` 一律回 `code=1 too low to finish`。
+/// This value is not just cosmetic: the broker uses it to decide whether it may forward an admin
+/// request back to the client -- the `callConsumer` path requires >= `V3_1_8_SNAPSHOT` (ordinal 62),
+/// `getConsumeStatus` requires >= `V3_0_7_SNAPSHOT` (ordinal 28).
+/// With the old default of 0 (= `V3_0_0_SNAPSHOT`), `examineConsumerRunningInfo` /
+/// `getConsumeStatus` would always reply `code=1 too low to finish`.
 pub const CURRENT_VERSION: i32 = 515;
 
 static REQUEST_ID: AtomicI32 = AtomicI32::new(0);
@@ -132,7 +132,7 @@ impl RemotingCommand {
             .unwrap_or(CURRENT_VERSION);
     }
 
-    // ---------------- 标志位 ----------------
+    // ---------------- flag bits ----------------
     pub fn mark_response_type(&mut self) {
         self.flag |= 1 << RPC_TYPE;
     }
@@ -157,7 +157,7 @@ impl RemotingCommand {
         }
     }
 
-    // ---------------- 字段访问 ----------------
+    // ---------------- field accessors ----------------
     pub fn ext_fields(&self) -> &ExtFields {
         &self.ext_fields
     }
@@ -204,7 +204,7 @@ impl RemotingCommand {
         }
     }
 
-    /// 从 extFields 还原 header 对象。优先走 `from_ext_fields`（含 V2 短字段名映射）。
+    /// Restores the header object from extFields. Prefers `from_ext_fields` (which includes the V2 short field-name mapping).
     pub fn decode_command_custom_header<T>(&self) -> Result<T>
     where
         T: CustomHeader + Default + Any,
@@ -227,7 +227,7 @@ impl RemotingCommand {
         }
     }
 
-    // ---------------- 编解码 ----------------
+    // ---------------- encode / decode ----------------
     pub fn header_encode(&mut self) -> Vec<u8> {
         self.make_custom_header_to_net();
         if self.serialize_type_current_rpc == serialize_type::ROCKETMQ {
@@ -236,7 +236,7 @@ impl RemotingCommand {
         RemotingSerializable::encode(&self.to_json_value())
     }
 
-    /// 整帧编码（含 4 字节 totalLength）。
+    /// Encodes the whole frame (including the 4-byte totalLength).
     pub fn encode(&mut self) -> Vec<u8> {
         let header_data = self.header_encode();
         let mut out = Vec::with_capacity(8 + header_data.len() + self.body.as_ref().map_or(0, Vec::len));
@@ -266,7 +266,7 @@ impl RemotingCommand {
         out
     }
 
-    /// 解码整帧（`data` 从 totalLength 开始）。
+    /// Decodes the whole frame (`data` starts at totalLength).
     pub fn decode(data: &[u8]) -> Result<RemotingCommand> {
         let mut r = crate::common::buffer::Reader::new(data);
         let total_length = r.i32()?;

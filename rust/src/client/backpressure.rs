@@ -1,13 +1,13 @@
-//! * `semaphoreAsyncSendNum` —— 在途**条数**，`back_pressure_for_async_send_num` 默认 1024，
-//!   地板 10；
-//! * `semaphoreAsyncSendSize` —— 在途**字节数**，`back_pressure_for_async_send_size` 默认 100M，
-//!   地板 1M，一笔消息扣掉 `body.len()` 个许可（body 为空按 1 算）。
+//! * `semaphoreAsyncSendNum` -- in-flight **message count**, `back_pressure_for_async_send_num` defaults to 1024,
+//!   floor 10;
+//! * `semaphoreAsyncSendSize` -- in-flight **byte count**, `back_pressure_for_async_send_size` defaults to 100M,
+//!   floor 1M, one message deducts `body.len()` permits (an empty body counts as 1).
 //!
-//! 两个许可都用**整个剩余预算**去等，等不到就直接回调
+//! Both permits are waited for with the **entire remaining budget**; if the wait fails the callback is
 //! `Error::TooMuchRequest("send message tryAcquire semaphoreAsyncNum timeout")`
-//! （第二个是 `...semaphoreAsyncSize timeout`），一次请求都不会发出去。
+//! (the second one is `...semaphoreAsyncSize timeout`), and not a single request goes out.
 //!
-//! # FairSemaphore 的两处设计取舍
+//! # Two design trade-offs in FairSemaphore
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,10 +19,10 @@ use crate::rmq_info;
 pub const MIN_ASYNC_SEND_NUM: i64 = 10;
 pub const MIN_ASYNC_SEND_SIZE: i64 = 1024 * 1024;
 
-/// 一个还在排队的许可申请（只为让队首能被稳定识别，不代表已拿到许可）。
+/// A permit request still in the queue (exists only so the head can be identified stably; it does not mean the permit is held).
 ///
-/// 这里不存 `permits`：等待者每次醒来都带着自己那份申请量来看队列（`grant_if_head`
-/// 的入参），票据只需要能被认出来。
+/// `permits` is deliberately not stored here: every time a waiter wakes it brings its own requested amount to
+/// inspect the queue (the input of `grant_if_head`), so a ticket only needs to be recognizable.
 struct Pending {
     id: u64,
 }
@@ -37,12 +37,12 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// * 不需要那层自旋读写锁 —— 改容量与拿/还许可在对象内部天然互斥；
-/// * 改容量不会把等待者丢在旧对象上，改完它们会带着新容量继续等。
+/// * no extra spin rwlock layer is needed -- resizing capacity and taking/releasing permits are mutually exclusive inside the object;
+/// * a capacity change never strands waiters on the old object; after the change they keep waiting under the new capacity.
 pub struct FairSemaphore {
     state: Mutex<State>,
-    /// 条件变量式的唤醒：「广播」= `notify_waiters`，
-    /// 每个等待者被叫醒后自己重看队列（只有队首能过）。
+    /// Condition-variable style wakeup: "broadcast" = `notify_waiters`,
+    /// each waiter re-inspects the queue itself after being woken (only the head can pass).
     wake: tokio::sync::Notify,
     next_id: AtomicU64,
 }
@@ -60,17 +60,17 @@ impl FairSemaphore {
         }
     }
 
-    /// ⚠ 拿到许可和**放弃排队**这两个出口都必须再叫醒一次：公平模式下只有队首能拿，
-    /// 队首一换人，后面的申请就可能从「轮不到我」变成「该我了」，而它的 `permits` 数量
-    /// 未必被前一个人的动作影响（队首要 5 个、空闲 6 个时，队首拿走 5 个后剩下 1 个，
-    /// 正好够排在第二的那 1 个 —— 但 `release` 早就跑完了，没人为它叫醒）。
-    /// 少叫醒这一次，那个人就会一直睡到自己的超时：真机上是 5 秒死等，不是丢一条消息。
+    /// ⚠ Both exits -- taking the permit and **abandoning the queue** -- must notify once more: in fair mode only the head can take,
+    /// once the head changes, a later request can flip from "not my turn" to "my turn", and its `permits` amount
+    /// was not necessarily affected by the previous holder's action (head wants 5 with 6 free: the head takes 5 leaving 1,
+    /// exactly enough for the second waiter wanting 1 -- but `release` had already run, nobody wakes it for that).
+    /// Miss this one wakeup and that waiter sleeps until its own timeout: in the field a 5-second dead wait, not a dropped message.
     pub async fn try_acquire(&self, permits: i64, timeout_millis: i64) -> bool {
         let budget = u64::try_from(timeout_millis.max(0)).unwrap_or(u64::MAX);
         let deadline = Instant::now() + Duration::from_millis(budget);
         let _ticket = Ticket::new(self);
         loop {
-            // 先登记唤醒凭据、再看队列：`notify_waiters` 只叫醒当时已在等的人
+            // Register the wake-up credential first, then inspect the queue: `notify_waiters` only wakes those already waiting at that moment
             let notified = self.wake.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
@@ -80,17 +80,17 @@ impl FairSemaphore {
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                // 预算用尽：票据 Drop 时把自己从队列里摘掉，别挡后面的人
+                // Budget exhausted: the ticket removes itself from the queue on Drop so it does not block those behind
                 return false;
             }
             if tokio::time::timeout(remaining, notified).await.is_err() {
                 return false;
             }
-            // 被叫醒：回到循环顶重看队列（也可能是假醒，重看自然再睡回去）
+            // Woken: loop back to the top and re-inspect the queue (possibly a spurious wake; re-inspecting just sleeps again)
         }
     }
 
-    /// 队首且空闲许可够，才算拿到；拿到时顺手叫醒后面的人。
+    /// The permit is granted only when the caller is the head and the free permits suffice; on grant it also wakes those behind.
     fn grant_if_head(&self, id: u64, permits: i64) -> bool {
         let granted = {
             let mut state = lock(&self.state);
@@ -122,12 +122,12 @@ impl FairSemaphore {
         self.wake.notify_waiters();
     }
 
-    /// 当前空闲许可（可能是负数，见 [`set_total_permits`](Self::set_total_permits)）。
+    /// Currently free permits (may be negative, see [`set_total_permits`](Self::set_total_permits)).
     pub fn available_permits(&self) -> i64 {
         lock(&self.state).free
     }
 
-    /// 当前总容量。
+    /// Current total capacity.
     pub fn total_permits(&self) -> i64 {
         lock(&self.state).total
     }
@@ -146,10 +146,10 @@ impl FairSemaphore {
     }
 }
 
-/// 排队票据：`Drop` 负责在等待方**没有**拿到许可时把自己摘出去并叫醒后面的人。
+/// Queuing ticket: `Drop` removes the waiter from the queue -- when it did **not** get the permit -- and wakes those behind.
 ///
-/// 拿到许可时票据已被 `grant_if_head` 弹出，Drop 什么都找不到 —— 不需要额外的
-///「已成交」标记，也因此不存在「忘记 disarm 就把队首空掉」这类 bug。
+/// When the permit was granted the ticket was already popped by `grant_if_head`, so Drop finds nothing -- no extra
+/// "already granted" flag is needed, hence bugs like "forgot to disarm and emptied the head slot" cannot exist.
 struct Ticket<'a> {
     sem: &'a FairSemaphore,
     id: u64,
@@ -176,7 +176,7 @@ impl Drop for Ticket<'_> {
             }
         };
         if removed {
-            // 挡路的人走了：队首换人，下一个人可能就够了
+            // The blocker is gone: the head changed, and the next waiter may already have enough
             self.sem.wake.notify_waiters();
         }
     }
@@ -201,10 +201,10 @@ mod tests {
         Arc::new(FairSemaphore::new(permits))
     }
 
-    /// 轮询等待条件成立（最多约 1s）。
+    /// Poll until the condition holds (roughly 1s at most).
     ///
-    /// 只用 `yield_now` 不行：单线程运行时里它会让出调度但不放时间，几个任务互相
-    /// 等对方先把票据排进队列时就会转成死循环（本模块第一版就死在这里）。
+    /// `yield_now` alone does not work: on a single-threaded runtime it yields scheduling but never advances time, so a few
+    /// tasks waiting for each other to enqueue their tickets first spin into a deadlock (the first version of this module died right here).
     async fn wait_until<F: Fn() -> bool>(cond: F) -> bool {
         for _ in 0..500 {
             if cond() {
@@ -215,16 +215,16 @@ mod tests {
         cond()
     }
 
-    /// 等到队列里恰好有 `n` 张票 —— 公平性用例要靠它把「到达顺序」钉住。
+    /// Wait until the queue holds exactly `n` tickets -- the fairness cases rely on it to pin the arrival order.
     async fn wait_queue_len(sem: &FairSemaphore, n: usize) {
         assert!(
             wait_until(|| sem.waiting_count() == n).await,
-            "第 {n} 个申请人没能排上队（当前 {}）",
+            "applicant #{n} never joined the queue (currently {})",
             sem.waiting_count()
         );
     }
 
-    /// 在后台跑一次 `try_acquire`，返回是否拿到、等了多久（真实时钟）。
+    /// Runs one `try_acquire` in the background, returning whether it got the permit and how long it waited (real clock).
     fn acquire_in_background(
         sem: &Arc<FairSemaphore>,
         permits: i64,
@@ -266,9 +266,9 @@ mod tests {
         assert_eq!(sem.available_permits(), 0);
 
         let late = acquire_in_background(&sem, 1, 50);
-        // 等 late 真的排上了，否则下面的判定只是运气
+        // Wait until late has really queued up, otherwise the verdict below is just luck
         wait_queue_len(&sem, 1).await;
-        // 队首要 1 个、空闲 0 个：插不上队
+        // The head wants 1 while 0 are free: nothing can cut in
         let (got, _) = late.await.unwrap();
         assert!(!got);
         assert_eq!(sem.available_permits(), 0);
@@ -290,14 +290,14 @@ mod tests {
                 }
                 got
             }));
-            // 一个一个钉住到达顺序：第 i 个人排上队之后才放第 i+1 个人
+            // Pin the arrival order one by one: only after applicant i queues up is applicant i+1 released
             wait_queue_len(&sem, i + 1).await;
         }
         sem.release(3);
         for h in handles {
             assert!(h.await.unwrap());
         }
-        // 公平 = 严格按到达顺序放行，不是「谁先被叫醒谁先拿」
+        // Fair = released strictly in arrival order, not "whoever is woken first wins"
         assert_eq!(*order.lock().unwrap(), vec![0, 1, 2]);
         assert_eq!(sem.available_permits(), 0);
     }
@@ -328,24 +328,24 @@ mod tests {
         assert_eq!(sem.available_permits(), 0);
     }
 
-    /// 空闲 6、队首要 5、第二个人要 1：两个人都该拿到，且都不该等到超时。
-    /// 锁的是「队首离场时也必须叫醒后面的人」——`release` 早就跑完了，没人再喊第二
-    /// 个人的话，他明明够用却能睡满 3000ms。
+    /// 6 free, the head wants 5, the second wants 1: both should get their permits, and neither should wait until timeout.
+    /// Guards "when the head leaves it must also wake those behind" -- `release` had long finished; if nobody
+    /// shouts at the second waiter again, he plainly has enough yet could sleep the full 3000ms.
     #[tokio::test]
     async fn a_granted_head_still_feeds_the_waiter_behind_it() {
         let sem = semaphore(6);
-        assert!(sem.try_acquire(5, 0).await); // 在途 5，空闲 1
+        assert!(sem.try_acquire(5, 0).await); // 5 in flight, 1 free
         let head = acquire_in_background(&sem, 5, 3000);
         wait_queue_len(&sem, 1).await;
-        // 空闲 1 个就够第二个人 —— 但公平模式下他必须等队首先走
+        // 1 free is enough for the second waiter -- but in fair mode he must wait for the head to leave first
         let second = acquire_in_background(&sem, 1, 3000);
         wait_queue_len(&sem, 2).await;
-        sem.release(5); // 空闲 1 → 6：队首这就够了
+        sem.release(5); // free 1 -> 6: enough for the head right now
 
         let (head_got, _) = head.await.unwrap();
         let (second_got, second_waited) = second.await.unwrap();
         assert!(head_got);
-        assert!(second_got, "队首拿走许可后，第二个人被丢下了（丢唤醒）");
+        assert!(second_got, "the second waiter was left behind after the head took the permits (lost wakeup)");
         assert!(
             second_waited < Duration::from_millis(2000),
             "second waited {second_waited:?}"
@@ -353,23 +353,23 @@ mod tests {
         assert_eq!(sem.available_permits(), 0); // 6 - 5 - 1
     }
 
-    /// 丢唤醒的回归守卫：队首要的比总容量还多，永远拿不到，只能等满自己的预算走人 ——
-    /// 他离场时必须叫醒后面的人，否则第二个人明明能过却要睡满 3000ms。真机上的表现是
-    /// 异步发送白等满预算，再回调一个 `semaphoreAsyncNum timeout`，而许可早就空了。
+    /// Lost-wakeup regression guard: the head wants more than the total capacity and can never get it, so it must wait out its own budget and leave --
+    /// when it departs it must wake those behind, otherwise the second waiter could pass yet sleeps the full 3000ms. In the field the symptom is
+    /// async sends burning the whole budget for nothing, then calling back a `semaphoreAsyncNum timeout` while the permits were free long ago.
     #[tokio::test]
     async fn a_timed_out_head_wakes_the_waiter_behind_it() {
         let sem = semaphore(3);
-        assert!(sem.try_acquire(3, 0).await); // 掏空
-        let head = acquire_in_background(&sem, 4, 200); // 要的比总量还多
+        assert!(sem.try_acquire(3, 0).await); // drained empty
+        let head = acquire_in_background(&sem, 4, 200); // wants more than the total
         wait_queue_len(&sem, 1).await;
         let second = acquire_in_background(&sem, 1, 3000);
         wait_queue_len(&sem, 2).await;
-        sem.release(3); // 够 second，但队首是那个贪心的
+        sem.release(3); // enough for second, but the head is the greedy one
 
         let (head_got, _) = head.await.unwrap();
         let (second_got, second_waited) = second.await.unwrap();
-        assert!(!head_got, "要得比总量还多，本该拿不到");
-        assert!(second_got, "队首退出后没被叫醒（丢唤醒）");
+        assert!(!head_got, "asking for more than the total must not get a permit");
+        assert!(second_got, "not woken after the head exited (lost wakeup)");
         assert!(
             second_waited < Duration::from_millis(2000),
             "second waited {second_waited:?}"
@@ -378,7 +378,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_dropped_waiter_leaves_no_ghost_ticket() {
-        // 取消安全：等待方半路被丢弃（任务 abort / select! 落败）不能把队首永久堵死。
+        // Cancellation safety: a waiter dropped mid-flight (task abort / losing a select!) must not jam the head forever.
         let sem = semaphore(1);
         assert!(sem.try_acquire(1, 0).await);
         let ghost = acquire_in_background(&sem, 1, 5000);
@@ -390,19 +390,19 @@ mod tests {
         wait_queue_len(&sem, 1).await;
         sem.release(1);
         let (got, _) = next.await.unwrap();
-        assert!(got, "幽灵票据把队首堵死了");
+        assert!(got, "a ghost ticket jammed the head");
     }
 
     #[tokio::test]
     async fn an_expired_budget_grants_only_when_the_head_is_clear() {
         let sem = semaphore(2);
-        // 预算 0 但队首无人、许可够：仍然给（先看队列再看时限）
+        // Budget 0 but the queue has nobody at the head and permits suffice: still granted (queue checked before the deadline)
         assert!(sem.try_acquire(1, 0).await);
         assert!(sem.try_acquire(1, 0).await);
-        // 此时空闲 0：0 预算立刻失败
+        // Now free is 0: a 0 budget fails immediately
         assert!(!sem.try_acquire(1, 0).await);
         assert!(!sem.try_acquire(1, -5).await);
-        assert_eq!(sem.waiting_count(), 0, "拿不到也不该留下票据");
+        assert_eq!(sem.waiting_count(), 0, "failing to acquire must not leave a ticket behind");
     }
 
     #[tokio::test]

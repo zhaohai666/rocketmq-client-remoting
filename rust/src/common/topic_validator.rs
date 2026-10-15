@@ -2,7 +2,7 @@
 use std::collections::HashSet;
 
 pub const TOPIC_MAX_LENGTH: i32 = 127;
-/// group 名要参与拼 `%RETRY%group_topic` / `%DLQ%group_topic`，所以比 topic 更短。
+/// Group names are used to build `%RETRY%group_topic` / `%DLQ%group_topic`, so they are shorter than topics.
 pub const GROUP_MAX_LENGTH: i32 = 120;
 pub const RETRY_OR_DLQ_TOPIC_MAX_LENGTH: i32 = 255;
 
@@ -95,7 +95,7 @@ mod tests {
             "TOPIC_with_9_digits",
             "CID_ONS-HTTP-PROXY",
         ] {
-            assert!(!is_topic_or_group_illegal(legal), "{legal} 应当合法");
+            assert!(!is_topic_or_group_illegal(legal), "{legal} should be legal");
         }
         for illegal in [
             "topic.name",
@@ -108,19 +108,19 @@ mod tests {
             "tab\there",
             "line\nbreak",
         ] {
-            assert!(is_topic_or_group_illegal(illegal), "{illegal} 应当非法");
+            assert!(is_topic_or_group_illegal(illegal), "{illegal} should be illegal");
         }
     }
 
     #[test]
     fn empty_is_legal_and_code_point_boundary_is_byte_exact() {
-        // 空由 is_blank 管；这里只查字符表
+        // Empty is handled by is_blank; here only the character set is checked
         assert!(!is_topic_or_group_illegal(""));
-        // DEL(0x7f) 在位表范围内但未置位 => 非法；0x80 起越界 => 非法
+        // DEL(0x7f) is within the bit-table range but unset => illegal; from 0x80 on it is out of range => illegal
         assert!(is_topic_or_group_illegal("\u{7f}"));
         assert!(is_topic_or_group_illegal("\u{80}"));
         assert!(is_topic_or_group_illegal("topic\u{e9}"));
-        // '~'(0x7e) 紧挨着边界但不在白名单
+        // '~'(0x7e) sits right at the boundary but is not in the whitelist
         assert!(is_topic_or_group_illegal("topic~"));
     }
 
@@ -136,14 +136,14 @@ mod tests {
             "CHECKPOINT_TOPIC",
             "OFFSET_MOVED_EVENT",
         ] {
-            assert!(is_system_topic(t), "{t} 是系统 topic");
+            assert!(is_system_topic(t), "{t} is a system topic");
         }
-        // 前缀命中即算系统 topic；大小写敏感的 RMQ_SYS_ 前缀不走这条规则
+        // A prefix hit counts as a system topic; the case-sensitive RMQ_SYS_ prefix does not go through this rule
         assert!(is_system_topic("rmq_sys_anything"));
         assert!(!is_system_topic("RMQ_SYS_TRACE_TOPIC_X"));
         assert!(!is_system_topic("MyBusinessTopic"));
 
-        // 8 个禁发名单；TBW102 是系统 topic 但**允许**发（建路由要用它）
+        // The 8-entry forbidden-send list; TBW102 is a system topic but sending to it is **allowed** (route creation needs it)
         for t in [
             "SCHEDULE_TOPIC_XXXX",
             "RMQ_SYS_TRANS_HALF_TOPIC",
@@ -154,10 +154,10 @@ mod tests {
             "RMQ_SYS_ROCKSDB_TRANS_HALF_TOPIC",
             "RMQ_SYS_ROCKSDB_TRANS_OP_HALF_TOPIC",
         ] {
-            assert!(is_not_allowed_send_topic(t), "{t} 禁止直发");
+            assert!(is_not_allowed_send_topic(t), "{t} must not be sent to directly");
         }
         assert!(!is_not_allowed_send_topic("TBW102"));
-        // 重投链路的目标 topic 绝不能被禁
+        // Target topics of the redelivery path must never be forbidden
         assert!(!is_not_allowed_send_topic("%RETRY%myGroup"));
     }
 }

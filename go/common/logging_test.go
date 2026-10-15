@@ -9,21 +9,28 @@ import (
 	"testing"
 )
 
-// 日志落盘与轮转的离线单测。
+// Offline unit tests for log persistence and rotation.
 //
-// 为什么必须单测：文件必须真的写出、并按大小轮转。真机脚本里最多验证
-// 「有没有文件」，轮转窗口
-// 要写满 64MB 才看得见 —— 只能离线用小上限造出来。
+// Why they must be unit-tested: the file must actually be written and rotated by
+// size. A live script can at most verify "a file exists"; the rotation window
+// only becomes visible after filling 64MB — so it can only be reproduced offline
+// with a small cap.
 //
-// 三条判据：
-//  1. 默认文件名是本端专属的 rocketmq_go_client.log，**不用**通用的
-//     rocketmq_client.log（同机两个客户端进程共用一个文件时会互相插行、并把
-//     对方的文件轮走，之后各自写进已 unlink 的 inode）；
-//  2. OFF / NONE / 空串关掉文件落盘（只剩 stderr），USE_STDOUT 优先；
-//  3. 到大小就轮转，备份是固定窗口 <file>.1 … <file>.N，最老的一份被丢掉。
+// Three criteria:
+//  1. The default file name is this-client-specific: rocketmq_go_client.log, and
+//     does **not** use the generic rocketmq_client.log (two client processes on
+//     the same machine sharing one file would interleave their lines and rotate
+//     each other's file away, after which each writes into an already-unlinked
+//     inode);
+//  2. OFF / NONE / empty string turn off file persistence (only stderr remains),
+//     with USE_STDOUT taking precedence;
+//  3. rotation happens at the size cap; backups use a fixed window <file>.1 …
+//     <file>.N, dropping the oldest.
 
-// resetSink 把包级日志状态恢复成「还没开过文件」，并让环境变量重新生效。
-// 同包测试可以直接改这些内部状态，无需为此导出任何测试专用 API。
+// resetSink restores the package-level logging state to "never opened a file"
+// and makes the environment variables take effect again.
+// Tests in the same package can mutate these internal states directly, without
+// exporting any test-only API for it.
 func resetSink(t *testing.T, dir, name string, maxSize, maxIndex int) string {
 	t.Helper()
 	logMu.Lock()
@@ -41,13 +48,15 @@ func resetSink(t *testing.T, dir, name string, maxSize, maxIndex int) string {
 		t.Setenv("ROCKETMQ_CLIENT_LOG_DIR", "")
 		os.Unsetenv("ROCKETMQ_CLIENT_LOG_DIR")
 	}
-	// t.Setenv 而非 os.Setenv：清空也要保持「变量存在但取值为空」这一状态，
-	// 端口间的约定是空串 = 关闭文件落盘，与「未设置 = 用默认文件名」是两回事。
+	// t.Setenv instead of os.Setenv: clearing must also keep the "variable
+	// exists but is empty" state, because the cross-port contract is that an
+	// empty string = file persistence off, which differs from "unset = use the
+	// default file name".
 	t.Setenv("ROCKETMQ_CLIENT_LOG_FILE", name)
 	os.Unsetenv("ROCKETMQ_CLIENT_LOG_USE_STDOUT")
 	t.Setenv("ROCKETMQ_CLIENT_LOG_FILE_MAX_SIZE", fmt.Sprintf("%d", maxSize))
 	t.Setenv("ROCKETMQ_CLIENT_LOG_FILE_MAX_INDEX", fmt.Sprintf("%d", maxIndex))
-	// 包级 var 在进程启动时就读过一次环境变量，这里按同一口径重算。
+	// Package-level vars are read once at process start; recompute them on the same basis here.
 	logMaxSize = int64(maxSize)
 	logMaxIndex = maxIndex
 	return filepath.Join(dir, defaultLogFile)
@@ -56,7 +65,7 @@ func resetSink(t *testing.T, dir, name string, maxSize, maxIndex int) string {
 func TestLogDefaultsToPortSpecificFileName(t *testing.T) {
 	dir := t.TempDir()
 	resetSink(t, dir, "anything", 0, 0)
-	// 「未设置」与「设为空串」是两种状态：只有前者才落到本端默认文件名
+	// "unset" and "set to empty string" are two different states: only the former falls back to the client-specific default file name
 	os.Unsetenv("ROCKETMQ_CLIENT_LOG_FILE")
 
 	LogInfof("hello %s", "default")
@@ -75,7 +84,7 @@ func TestLogDefaultsToPortSpecificFileName(t *testing.T) {
 	if !strings.Contains(string(data), "hello default") {
 		t.Fatalf("log line missing from %q: %q", got, data)
 	}
-	// 行格式：时间戳 + 级别 + 消息
+	// Line format: timestamp + level + message
 	if !strings.Contains(string(data), " INFO ") {
 		t.Fatalf("level token missing: %q", data)
 	}
@@ -113,8 +122,8 @@ func TestLogUseStdoutWinsOverFile(t *testing.T) {
 
 func TestLogFilePathWithSeparatorIsFullPath(t *testing.T) {
 	dir := t.TempDir()
-	// 带路径分隔符的 ROCKETMQ_CLIENT_LOG_FILE 当整路径处理，
-	// 否则用户没法把日志放到 LOG_DIR 之外。
+	// A ROCKETMQ_CLIENT_LOG_FILE containing a path separator is treated as a full
+	// path, otherwise the user cannot place the log outside LOG_DIR.
 	full := filepath.Join(dir, "nested", "deep", "rmq.log")
 	resetSink(t, dir, full, 0, 0)
 
@@ -130,7 +139,7 @@ func TestLogFilePathWithSeparatorIsFullPath(t *testing.T) {
 
 func TestLogRotatesWithFixedBackupWindow(t *testing.T) {
 	dir := t.TempDir()
-	// 每行约 40B，上限 100B ⇒ 约每 2~3 行轮一次
+	// ~40B per line and a 100B cap ⇒ a rotation roughly every 2~3 lines
 	resetSink(t, dir, "rotate.log", 100, 3)
 	path := filepath.Join(dir, "rotate.log")
 
@@ -150,7 +159,7 @@ func TestLogRotatesWithFixedBackupWindow(t *testing.T) {
 		t.Fatalf("window must drop the oldest backup, .4 exists")
 	}
 
-	// 窗口里最新的一份（.1）必须比当前文件「老」：当前文件只剩最后几行
+	// The newest in the window (.1) must be "older" than the current file: the current file holds only the last few lines
 	cur, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -186,7 +195,7 @@ func TestLogMaxIndexZeroTruncatesInPlace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 文件仍在写，但大小被压回上限附近（原地截断）
+	// The file is still being written, but its size is clamped near the cap (truncated in place)
 	if st.Size() > 200 {
 		t.Fatalf("file grew past the cap without rotation: %d B", st.Size())
 	}

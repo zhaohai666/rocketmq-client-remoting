@@ -487,17 +487,17 @@ func cleanup(ns, prefix string, topics map[string]string) {
 // once, and the retry delivery shows the BUSINESS topic (the client restores it
 // before the listener; a harness that books by the physical topic reads zero).
 func runS1(ns, prefix string, topics map[string]string) {
-	fmt.Println("\n--- S1 回投：%RETRY% 二次投递 + 延迟梯度 + topic 还原 ---")
+	fmt.Println("\n--- S1 send-back: second delivery via %RETRY% + delay ladder + topic restore ---")
 	topic := prefix + "_Retry"
 	topics["s1"] = topic
 	group := "GID_" + prefix + "_s1"
 	if err := ensureTopic(ns, "go-rd-s1-"+prefix, topic, 1); err != nil {
-		check("S1 建 topic", false, err.Error())
+		check("S1 create topic", false, err.Error())
 		return
 	}
 	p, err := startProducer(ns, "GID_"+prefix+"_s1_prod", "go-rd-s1-prod-"+prefix)
 	if err != nil {
-		check("S1 构造生产者", false, err.Error())
+		check("S1 build producer", false, err.Error())
 		return
 	}
 	defer p.shutdown()
@@ -508,14 +508,14 @@ func runS1(ns, prefix string, topics map[string]string) {
 		listener: &retryOnce{box: b, target: "retry-me"},
 	}, topic)
 	if err != nil {
-		check("S1 构造/订阅/启动消费者", false, err.Error())
+		check("S1 build/subscribe/start consumer", false, err.Error())
 		return
 	}
 	defer c.Shutdown()
 
 	for _, body := range []string{"retry-me", "normal-1"} {
 		if err := p.send(topic, body); err != nil {
-			check("S1 发送 "+body, false, err.Error())
+			check("S1 send "+body, false, err.Error())
 			return
 		}
 	}
@@ -527,13 +527,13 @@ func runS1(ns, prefix string, topics map[string]string) {
 
 	retry := b.ofBody("retry-me")
 	normal := b.ofBody("normal-1")
-	check("S1 retry-me 被投递多次（>=2）", len(retry) >= 2, fmt.Sprintf("arrivals=%d", len(retry)))
+	check("S1 retry-me delivered multiple times (>=2)", len(retry) >= 2, fmt.Sprintf("arrivals=%d", len(retry)))
 	if len(retry) >= 2 {
 		gap := retry[len(retry)-1].at.Sub(retry[0].at)
-		check("S1 回投有延迟梯度（level3≈10s，>=8s）", gap >= 8*time.Second,
+		check("S1 send-back has a delay ladder (level3~10s, >=8s)", gap >= 8*time.Second,
 			fmt.Sprintf("gap=%.1fs", gap.Seconds()))
 	} else {
-		check("S1 回投有延迟梯度（level3≈10s，>=8s）", false, "不足两次投递")
+		check("S1 send-back has a delay ladder (level3~10s, >=8s)", false, "fewer than two deliveries")
 	}
 	redelivered := make([]rec, 0, 2)
 	for _, r := range retry {
@@ -541,7 +541,7 @@ func runS1(ns, prefix string, topics map[string]string) {
 			redelivered = append(redelivered, r)
 		}
 	}
-	check("S1 二次投递带 RECONSUME_TIMES>=1", len(redelivered) >= 1,
+	check("S1 second delivery carries RECONSUME_TIMES>=1", len(redelivered) >= 1,
 		fmt.Sprintf("times=%s", reconList(retry)))
 	ok := len(redelivered) >= 1
 	for _, r := range redelivered {
@@ -549,8 +549,8 @@ func runS1(ns, prefix string, topics map[string]string) {
 			ok = false
 		}
 	}
-	check("S1 重投消息 topic 还原为业务 topic", ok, "listener 主题分布="+b.topicSummary())
-	check("S1 正常消息只投一次", len(normal) == 1, fmt.Sprintf("arrivals=%d", len(normal)))
+	check("S1 redelivered message's topic restored to the business topic", ok, "listener topic distribution="+b.topicSummary())
+	check("S1 normal message delivered exactly once", len(normal) == 1, fmt.Sprintf("arrivals=%d", len(normal)))
 }
 
 // ------------------------------------------------------------------ S2
@@ -558,7 +558,7 @@ func runS1(ns, prefix string, topics map[string]string) {
 // S2: maxReconsumeTimes=2 -> exactly 3 client deliveries (0/1/2) and then the
 // broker dead-letters it (reconsumeTimes=3, RETRY_TOPIC kept).
 func runS2(ns, prefix string, topics map[string]string) {
-	fmt.Println("\n--- S2 死信终态：maxReconsumeTimes=2 ⇒ 3 次投递后进 %DLQ% ---")
+	fmt.Println("\n--- S2 dead-letter terminal: maxReconsumeTimes=2 => into %DLQ% after 3 deliveries ---")
 	topic := prefix + "_Dlq"
 	topics["s2"] = topic
 	group := "GID_" + prefix + "_s2"
@@ -566,12 +566,12 @@ func runS2(ns, prefix string, topics map[string]string) {
 	topics["s2_retry"] = common.GetRetryTopic(group)
 	topics["s2_dlq"] = dlqTopic
 	if err := ensureTopic(ns, "go-rd-s2-"+prefix, topic, 1); err != nil {
-		check("S2 建 topic", false, err.Error())
+		check("S2 create topic", false, err.Error())
 		return
 	}
 	p, err := startProducer(ns, "GID_"+prefix+"_s2_prod", "go-rd-s2-prod-"+prefix)
 	if err != nil {
-		check("S2 构造生产者", false, err.Error())
+		check("S2 build producer", false, err.Error())
 		return
 	}
 	defer p.shutdown()
@@ -582,12 +582,12 @@ func runS2(ns, prefix string, topics map[string]string) {
 		listener: &alwaysFail{box: b}, maxRecon: 2,
 	}, topic)
 	if err != nil {
-		check("S2 构造/订阅/启动消费者", false, err.Error())
+		check("S2 build/subscribe/start consumer", false, err.Error())
 		return
 	}
 	if err := p.send(topic, "dlq-me"); err != nil {
 		c.Shutdown()
-		check("S2 发送 dlq-me", false, err.Error())
+		check("S2 send dlq-me", false, err.Error())
 		return
 	}
 	// Delay levels 3 (10s) and 4 (30s) mean the third delivery lands ~40s after
@@ -598,8 +598,8 @@ func runS2(ns, prefix string, topics map[string]string) {
 	all := b.ofBody("dlq-me")
 	times := reconList(all)
 	seqOK := len(all) >= 3 && all[0].recon == 0 && all[1].recon == 1 && all[2].recon == 2
-	check("S2 恰好投递 3 次且 RECONSUME_TIMES 为 0/1/2", seqOK, "times="+times)
-	check("S2 用尽后不再投递（观察窗口内只有 3 次）", len(all) == 3,
+	check("S2 delivered exactly 3 times with RECONSUME_TIMES 0/1/2", seqOK, "times="+times)
+	check("S2 no delivery after the ladder is exhausted (only 3 in the observation window)", len(all) == 3,
 		fmt.Sprintf("arrivals=%d times=%s", len(all), times))
 	topicOK := len(all) >= 3
 	for _, r := range all[:min(3, len(all))] {
@@ -607,27 +607,27 @@ func runS2(ns, prefix string, topics map[string]string) {
 			topicOK = false
 		}
 	}
-	check("S2 重投期间 topic 还原为业务 topic", topicOK, "listener 主题分布="+b.topicSummary())
+	check("S2 topic restored to the business topic during redelivery", topicOK, "listener topic distribution="+b.topicSummary())
 	c.Shutdown()
 
 	// The broker creates and registers %DLQ%<group> only when the first message
 	// lands in it.
-	check("S2 broker 自动创建并注册 %DLQ% 路由",
+	check("S2 broker auto-creates and registers the %DLQ% route",
 		waitTopicRoute(ns, "go-rd-s2-route-"+prefix, dlqTopic, 30*time.Second), "dlq="+dlqTopic)
 
 	got, _, err := readTopicFromHead(ns, dlqTopic, "GID_"+prefix+"_s2probe", "go-rd-s2-probe-"+prefix, 25*time.Second)
 	if err != nil {
-		check("S2 读 %DLQ%（队首）", false, err.Error())
+		check("S2 read %DLQ% (from the head)", false, err.Error())
 		return
 	}
-	check("S2 消息落在 %DLQ%<group>",
+	check("S2 message landed in %DLQ%<group>",
 		len(got) >= 1 && got[0].body == "dlq-me",
 		fmt.Sprintf("got=%s", recSummary(got)))
 	// The broker stores reconsumeTimes+1 when it dead-letters, so 2 -> 3.
-	check("S2 DLQ 消息 RECONSUME_TIMES=3（第 3 次回投转死信）",
+	check("S2 DLQ message RECONSUME_TIMES=3 (dead-lettered after the 3rd send-back)",
 		len(got) == 1 && got[0].recon == 3, fmt.Sprintf("got=%s", recSummary(got)))
-	check("S2 DLQ 消息 topic 就是 %DLQ%<group>",
-		len(got) == 1 && got[0].topic == dlqTopic, "listener 主题分布="+topicSummaryOf(got))
+	check("S2 DLQ message's topic is %DLQ%<group>",
+		len(got) == 1 && got[0].topic == dlqTopic, "listener topic distribution="+topicSummaryOf(got))
 }
 
 // ------------------------------------------------------------------ S3
@@ -635,19 +635,19 @@ func runS2(ns, prefix string, topics map[string]string) {
 // S3: the orderly retry path (a PLAIN send to %RETRY%) has its own ceiling and
 // its own dead-letter route via the queue lock.
 func runS3(ns, prefix string, topics map[string]string) {
-	fmt.Println("\n--- S3 顺序毒消息：Suspend 到本地上限 → 顺序回投 → %DLQ% ---")
+	fmt.Println("\n--- S3 orderly poison message: Suspend to the local ceiling -> orderly send-back -> %DLQ% ---")
 	topic := prefix + "_OrderlyDlq"
 	topics["s3"] = topic
 	group := "GID_" + prefix + "_s3"
 	dlqTopic := common.GetDLQTopic(group)
 	topics["s3_dlq"] = dlqTopic
 	if err := ensureTopic(ns, "go-rd-s3-"+prefix, topic, 1); err != nil {
-		check("S3 建 topic", false, err.Error())
+		check("S3 create topic", false, err.Error())
 		return
 	}
 	p, err := startProducer(ns, "GID_"+prefix+"_s3_prod", "go-rd-s3-prod-"+prefix)
 	if err != nil {
-		check("S3 构造生产者", false, err.Error())
+		check("S3 build producer", false, err.Error())
 		return
 	}
 	defer p.shutdown()
@@ -660,12 +660,12 @@ func runS3(ns, prefix string, topics map[string]string) {
 		batchMax: 1, maxRecon: 2, suspendMS: 50,
 	}, topic)
 	if err != nil {
-		check("S3 构造/订阅/启动消费者", false, err.Error())
+		check("S3 build/subscribe/start consumer", false, err.Error())
 		return
 	}
 	if err := p.send(topic, "orderly-poison"); err != nil {
 		c.Shutdown()
-		check("S3 发送 orderly-poison", false, err.Error())
+		check("S3 send orderly-poison", false, err.Error())
 		return
 	}
 	waitUntil(60*time.Second, func() bool { return len(b.ofBody("orderly-poison")) >= 3 })
@@ -673,21 +673,21 @@ func runS3(ns, prefix string, topics map[string]string) {
 	all := b.ofBody("orderly-poison")
 	times := reconList(all)
 	seqOK := len(all) >= 3 && all[0].recon == 0 && all[1].recon == 1 && all[2].recon == 2
-	check("S3 顺序侧本地恰好投递 3 次（0/1/2）", seqOK, "times="+times)
+	check("S3 orderly side delivered exactly 3 times locally (0/1/2)", seqOK, "times="+times)
 	// After the third attempt the message is handed to the broker and the queue
 	// offset advances, so a 4th delivery would mean the ceiling was not applied.
-	check("S3 交 broker 后不再投递（观察窗口内只有 3 次）", len(all) == 3,
+	check("S3 no delivery after hand-off to the broker (only 3 in the observation window)", len(all) == 3,
 		fmt.Sprintf("arrivals=%d times=%s", len(all), times))
 	c.Shutdown()
 
-	check("S3 broker 自动创建并注册 %DLQ% 路由",
+	check("S3 broker auto-creates and registers the %DLQ% route",
 		waitTopicRoute(ns, "go-rd-s3-route-"+prefix, dlqTopic, 30*time.Second), "dlq="+dlqTopic)
 	got, _, err := readTopicFromHead(ns, dlqTopic, "GID_"+prefix+"_s3probe", "go-rd-s3-probe-"+prefix, 25*time.Second)
 	if err != nil {
-		check("S3 读 %DLQ%（队首）", false, err.Error())
+		check("S3 read %DLQ% (from the head)", false, err.Error())
 		return
 	}
-	check("S3 顺序回投的消息落在 %DLQ%（组仍持队列锁）",
+	check("S3 orderly send-back message landed in %DLQ% (the group still holds the queue lock)",
 		len(got) >= 1 && got[0].body == "orderly-poison",
 		fmt.Sprintf("got=%s", recSummary(got)))
 	// The orderly send-back writes msg.getReconsumeTimes() + 1 into
@@ -695,10 +695,10 @@ func runS3(ns, prefix string, topics map[string]string) {
 	// the ceiling at 2 reaches the DLQ as 3. The +1 is easy to drop — the
 	// concurrent path gets its +1 from the BROKER instead (see S2) — and the
 	// result would look plausible in every other observable.
-	check("S3 DLQ 消息 RECONSUME_TIMES=3（客户端侧 +1）",
+	check("S3 DLQ message RECONSUME_TIMES=3 (the +1 comes from the client side)",
 		len(got) == 1 && got[0].recon == 3, fmt.Sprintf("got=%s", recSummary(got)))
-	check("S3 DLQ 消息 topic 就是 %DLQ%<group>",
-		len(got) == 1 && got[0].topic == dlqTopic, "listener 主题分布="+topicSummaryOf(got))
+	check("S3 DLQ message's topic is %DLQ%<group>",
+		len(got) == 1 && got[0].topic == dlqTopic, "listener topic distribution="+topicSummaryOf(got))
 }
 
 // ------------------------------------------------------------------ S4
@@ -707,7 +707,7 @@ func runS3(ns, prefix string, topics map[string]string) {
 // tail comes back through %RETRY% while the acked one never does, and the
 // business offset still commits as a whole batch.
 func runS4(ns, prefix string, topics map[string]string) {
-	fmt.Println("\n--- S4 部分 ack（ackIndex=0）：尾巴 2 条回投、已 ack 的不回投 ---")
+	fmt.Println("\n--- S4 partial ack (ackIndex=0): the tail 2 sent back, the acked one not ---")
 	topic := prefix + "_AckIndex"
 	ctrlTopic := prefix + "_AckControl"
 	topics["s4"] = topic
@@ -719,13 +719,13 @@ func runS4(ns, prefix string, topics map[string]string) {
 
 	for _, t := range []string{topic, ctrlTopic} {
 		if err := ensureTopic(ns, "go-rd-s4-"+prefix, t, 1); err != nil {
-			check("S4 建 topic", false, err.Error())
+			check("S4 create topic", false, err.Error())
 			return
 		}
 	}
 	p, err := startProducer(ns, "GID_"+prefix+"_s4_prod", "go-rd-s4-prod-"+prefix)
 	if err != nil {
-		check("S4 构造生产者", false, err.Error())
+		check("S4 build producer", false, err.Error())
 		return
 	}
 	defer p.shutdown()
@@ -737,7 +737,7 @@ func runS4(ns, prefix string, topics map[string]string) {
 	for _, t := range []string{topic, ctrlTopic} {
 		for _, body := range bodies {
 			if err := p.send(t, body); err != nil {
-				check("S4 发送 "+body, false, err.Error())
+				check("S4 send "+body, false, err.Error())
 				return
 			}
 		}
@@ -749,7 +749,7 @@ func runS4(ns, prefix string, topics map[string]string) {
 		listener: &partialAckTo0{box: b}, batchMax: len(bodies),
 	}, topic)
 	if err != nil {
-		check("S4 构造/订阅/启动消费者", false, err.Error())
+		check("S4 build/subscribe/start consumer", false, err.Error())
 		return
 	}
 	// The unacked tail goes back with delay level 3 = 10s.
@@ -768,7 +768,7 @@ func runS4(ns, prefix string, topics map[string]string) {
 	c.Shutdown()
 
 	first := b.ofBody(bodies[0])
-	check("S4 已 ack 的首条整个窗口只投一次", len(first) == 1,
+	check("S4 the acked first message delivered exactly once across the whole window", len(first) == 1,
 		fmt.Sprintf("arrivals=%d", len(first)))
 	redelivered := 0
 	tailDetail := make([]string, 0, 2)
@@ -785,14 +785,14 @@ func runS4(ns, prefix string, topics map[string]string) {
 		}
 		tailDetail = append(tailDetail, fmt.Sprintf("%s=%s", body, reconList(rs)))
 	}
-	check("S4 未 ack 的尾巴 2 条经 %RETRY% 回投", redelivered == 2, strings.Join(tailDetail, " "))
-	check("S4 3 条最终全部消费完", len(b.distinctBodies()) == len(bodies),
+	check("S4 the unacked tail 2 sent back through %RETRY%", redelivered == 2, strings.Join(tailDetail, " "))
+	check("S4 all 3 messages eventually consumed", len(b.distinctBodies()) == len(bodies),
 		fmt.Sprintf("bodies=%v", b.distinctBodies()))
 
 	// The whole batch is still committed, ackIndex notwithstanding: the tail was
 	// handed to the broker via send-back, so the offset is free to advance.
 	offset, found := consumedOffset(ns, "go-rd-s4-off-"+prefix, group, topic)
-	check("S4 业务队列位点仍整批提交到 3", found && offset == int64(len(bodies)),
+	check("S4 business queue offset still committed as a whole batch (3)", found && offset == int64(len(bodies)),
 		fmt.Sprintf("offset=%d found=%v", offset, found))
 
 	// Control: the same three messages, no ackIndex manipulation -> no
@@ -804,14 +804,14 @@ func runS4(ns, prefix string, topics map[string]string) {
 		listener: &collect{box: cb}, batchMax: len(bodies),
 	}, ctrlTopic)
 	if err != nil {
-		check("S4 对照组构造/启动", false, err.Error())
+		check("S4 control group build/start", false, err.Error())
 		return
 	}
 	waitUntil(30*time.Second, func() bool { return len(cb.distinctBodies()) == len(bodies) })
 	time.Sleep(12 * time.Second) // a redelivery would need level 3 = 10s to show up
 	cc.Shutdown()
 	ctrlOK := len(cb.distinctBodies()) == len(bodies) && len(cb.all()) == len(bodies)
-	check("S4 对照组（不碰 ackIndex）一条都不回投", ctrlOK,
+	check("S4 control group (ackIndex untouched) redelivers nothing", ctrlOK,
 		fmt.Sprintf("deliveries=%d bodies=%v", len(cb.all()), cb.distinctBodies()))
 }
 

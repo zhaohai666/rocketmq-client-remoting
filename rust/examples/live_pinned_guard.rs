@@ -1,9 +1,9 @@
-//! 定点队列守卫（pinned guard）真机验证（S1..S6）。
+//! Live verification of the pinned-queue guard (S1..S6).
 //!
-//! 前置：NameServer + Broker 已起，`autoCreateTopicEnable=true`。
+//! Prerequisite: a NameServer and a Broker are running with `autoCreateTopicEnable=true`.
 //!
 //!
-//! 用法：
+//! Usage:
 //! ```text
 //! cargo run --example live_pinned_guard -- 127.0.0.1:9876
 //! ```
@@ -29,7 +29,7 @@ use rocketmq_client_remoting::error::Error;
 use rocketmq_client_remoting::remoting::protocol::heartbeat::ConsumeFromWhere;
 
 const WAIT_SECONDS: u64 = 20;
-/// 反腿的耗时上界：守卫是纯字符串比较，真机给 50ms 已留两个数量级余量。
+/// Upper bound for the counter-leg's elapsed time: the guard is a pure string comparison, so 50ms on a live cluster leaves two orders of magnitude of headroom.
 const LOCAL_BUDGET_MS: f64 = 50.0;
 const SYNC_WORDING: &str = "message's topic not equal mq's topic";
 const ASYNC_WORDING: &str = "Topic of the message does not match its target message queue";
@@ -38,7 +38,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 断言累积器：跑完全部场景再汇总，首个失败不提前退出。
+/// Assertion accumulator: every scenario runs to completion before the summary; the first failure does not exit early.
 struct Checker {
     passed: u32,
     failed: Vec<String>,
@@ -65,7 +65,7 @@ impl Checker {
     }
 }
 
-/// 一次异步发送的终态。
+/// Terminal state of one async send.
 #[derive(Default)]
 struct Latch {
     oks: AtomicUsize,
@@ -101,7 +101,7 @@ impl Latch {
         }
     }
 
-    /// 终态到达数（成功 + 异常都算）。
+    /// Number of terminal states reached (success and exception both count).
     fn done(&self) -> usize {
         self.done.load(Ordering::SeqCst)
     }
@@ -122,7 +122,7 @@ impl SendCallback for Latch {
     }
 }
 
-/// 消费到的 keys 收集器。
+/// Collector for consumed keys.
 struct KeySink {
     keys: Mutex<Vec<String>>,
 }
@@ -204,12 +204,12 @@ impl Env {
             if let Ok(info) = self.admin.fetch_broker_cluster_info().await {
                 if let Some(addr) = info.get_broker_addrs().first() {
                     *lock(&self.broker_addr) = addr.clone();
-                    ck.check("集群探活", true, &format!("broker={addr}"));
+                    ck.check("cluster probe", true, &format!("broker={addr}"));
                     return true;
                 }
             }
             if Instant::now() >= deadline {
-                ck.abort("集群探活", "nameServer 在预算内没有返回任何 broker");
+                ck.abort("cluster probe", "nameServer returned no broker within the budget");
                 return false;
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -236,7 +236,7 @@ impl Env {
                 println!("  [WARN] delete_topic({topic}) failed: {e}");
             }
         }
-        ck.check("清理本次的 topic", true, "");
+        ck.check("cleanup of this run's topics", true, "");
     }
 }
 
@@ -260,7 +260,7 @@ async fn queue_zero(producer: &DefaultMQProducer, topic: &str) -> Result<Message
     queues
         .into_iter()
         .find(|q| q.queue_id == 0)
-        .ok_or_else(|| format!("{topic} 没有 queue 0"))
+        .ok_or_else(|| format!("{topic} has no queue 0"))
 }
 
 async fn wait_route(producer: &DefaultMQProducer, topic: &str) -> Result<MessageQueue, String> {
@@ -278,7 +278,7 @@ async fn wait_route(producer: &DefaultMQProducer, topic: &str) -> Result<Message
     }
 }
 
-/// 等 maxOffset 涨到 want 再返回（broker 的 ConsumeQueue 派发比 SEND 回包慢几毫秒）。
+/// Waits until maxOffset reaches `want` before returning (the broker's ConsumeQueue dispatch lags the SEND response by a few milliseconds).
 async fn wait_offset(producer: &DefaultMQProducer, mq: &MessageQueue, want: i64) -> i64 {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -308,46 +308,46 @@ async fn run(namesrv: &str) -> Checker {
     let producer = match producer_config(&env, "sync", "") {
         Ok(p) => p,
         Err(e) => {
-            ck.abort("生产者构造", &e);
+            ck.abort("producer construction", &e);
             return ck;
         }
     };
     if let Err(e) = producer.start().await {
-        ck.abort("生产者 start", &e.to_string());
+        ck.abort("producer start", &e.to_string());
         return ck;
     }
 
-    // ---------------- S0 两条 topic 的路由都注册好 + 消费者就位 ----------------
-    println!("\n-- S0 fixture: 路由与消费者 --");
+    // ---------------- S0 routes of both topics registered + consumer in place ----------------
+    println!("\n-- S0 fixture: routes and consumer --");
     if let Err(e) = env.create_topic(&topic_a, 4).await {
-        ck.abort("创建 A", &e);
+        ck.abort("create A", &e);
         return ck;
     }
     if let Err(e) = env.create_topic(&topic_b, 4).await {
-        ck.abort("创建 B", &e);
+        ck.abort("create B", &e);
         return ck;
     }
     let mq_a = match wait_route(&producer, &topic_a).await {
         Ok(mq) => mq,
         Err(e) => {
-            ck.abort("S0 A 路由", &e);
+            ck.abort("S0 A route", &e);
             return ck;
         }
     };
     let mq_b = match wait_route(&producer, &topic_b).await {
         Ok(mq) => mq,
         Err(e) => {
-            ck.abort("S0 B 路由", &e);
+            ck.abort("S0 B route", &e);
             return ck;
         }
     };
     ck.check(
-        "S0 两条 topic 的路由都可用（反腿用真队列，拒的才一定是 topic 而不是地址）",
+        "S0 routes of both topics usable (counter-leg uses a real queue, so a refusal must be about the topic, not the address)",
         mq_a.broker_name == mq_b.broker_name,
         &format!("A={}/{} B={}/{}", mq_a.broker_name, mq_a.queue_id, mq_b.broker_name, mq_b.queue_id),
     );
 
-    // 消费者先起、CONSUME_FROM_FIRST_OFFSET：不和发送抢 rebalance 的时间点
+    // Consumer starts first with CONSUME_FROM_FIRST_OFFSET: it does not race the send for the rebalance timing
     let sink = KeySink::new();
     let consumer = match DefaultMQPushConsumer::with_config(ConsumerConfig {
         consumer_group: format!("pin-guard-live-{stamp}"),
@@ -358,22 +358,22 @@ async fn run(namesrv: &str) -> Checker {
     }) {
         Ok(c) => c,
         Err(e) => {
-            ck.abort("消费者构造", &e.to_string());
+            ck.abort("consumer construction", &e.to_string());
             return ck;
         }
     };
     if let Err(e) = consumer.subscribe(&topic_a, "*") {
-        ck.abort("消费者 subscribe", &e.to_string());
+        ck.abort("consumer subscribe", &e.to_string());
         return ck;
     }
     consumer.set_message_listener_concurrently(Arc::new(KeyListener { sink: sink.clone() }));
     if let Err(e) = consumer.start().await {
-        ck.abort("消费者 start", &e.to_string());
+        ck.abort("consumer start", &e.to_string());
         return ck;
     }
 
-    // ---------------- S1 正腿：真路由队列上的定点发送 ----------------
-    println!("\n-- S1 真实路由队列上的定点发送 --");
+    // ---------------- S1 positive leg: pinned send on a real routed queue ----------------
+    println!("\n-- S1 pinned send on a real routed queue --");
     let k_single = format!("pinned-single-{stamp}");
     let mut m1 = Message::new(&topic_a, Some(b"s1-single"));
     m1.set_keys(&k_single);
@@ -385,12 +385,12 @@ async fn run(namesrv: &str) -> Checker {
                 .map(|q| q.queue_id == mq_a.queue_id && q.topic == topic_a)
                 .unwrap_or(false);
             ck.check(
-                "S1a 同步单条定点 SEND_OK 且落在 queue 0",
+                "S1a sync single pinned send returns SEND_OK and lands on queue 0",
                 r.status == SendStatus::SendOk && same,
                 &format!("status={:?} mq={:?}", r.status, r.message_queue),
             );
         }
-        Err(e) => ck.abort("S1a 同步单条定点发送", &e.to_string()),
+        Err(e) => ck.abort("S1a sync single pinned send", &e.to_string()),
     }
 
     let k_b1 = format!("pinned-b1-{stamp}");
@@ -407,23 +407,23 @@ async fn run(namesrv: &str) -> Checker {
                 .map(|q| q.queue_id == mq_a.queue_id)
                 .unwrap_or(false);
             ck.check(
-                "S1b 同步批量定点 SEND_OK 且同一队列",
+                "S1b sync batch pinned send returns SEND_OK on the same queue",
                 r.status == SendStatus::SendOk && same,
                 &format!("status={:?} mq={:?}", r.status, r.message_queue),
             );
         }
-        Err(e) => ck.abort("S1b 同步批量定点发送", &e.to_string()),
+        Err(e) => ck.abort("S1b sync batch pinned send", &e.to_string()),
     }
-    // 批量在消费队列上按**子消息**逐条落位（broker 收到 inner-batch 后拆开写）⇒ 2 条子消息涨 2
+    // A batch lands in the consume queue entry by entry as **sub-messages** (the broker splits the inner-batch on receipt) ⇒ 2 sub-messages raise the offset by 2
     let off_after_s1 = wait_offset(&producer, &mq_a, 3).await;
     ck.check(
-        "S1c 三笔子消息都真落库（maxOffset = 单条 1 + 批量子消息 2）",
+        "S1c all three sub-messages truly persisted (maxOffset = 1 single + 2 batch sub-messages)",
         off_after_s1 == 3,
         &format!("maxOffset={off_after_s1}"),
     );
 
-    // ---------------- S2 反腿：同步拒绝，本端、无痕 ----------------
-    println!("\n-- S2 topic 不符：本端亚毫秒拒，broker 上无痕 --");
+    // ---------------- S2 counter-leg: sync refusal, local, leaves no trace ----------------
+    println!("\n-- S2 topic mismatch: sub-millisecond local refusal, no trace on the broker --");
     let mut r1 = Message::new(&topic_a, Some(b"refused"));
     r1.set_keys(&format!("pinned-refused-{stamp}"));
     let began = Instant::now();
@@ -431,12 +431,12 @@ async fn run(namesrv: &str) -> Checker {
     let single_ms = began.elapsed().as_secs_f64() * 1000.0;
     let single_msg = single.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
     ck.check(
-        "S2a 同步单条拒（文案逐字一致）",
+        "S2a sync single refusal (message text matches verbatim)",
         single.is_err() && single_msg.contains(SYNC_WORDING),
         &format!("{single_ms:.2}ms {single_msg}"),
     );
     ck.check(
-        "S2b 拒在本端：亚毫秒（不是超时、不是 broker remark）",
+        "S2b refusal is local: sub-millisecond (not a timeout, not a broker remark)",
         single.is_err() && single_ms < LOCAL_BUDGET_MS,
         &format!("{single_ms:.2}ms"),
     );
@@ -447,41 +447,41 @@ async fn run(namesrv: &str) -> Checker {
     let batch_ms = began.elapsed().as_secs_f64() * 1000.0;
     let batch_msg = batch.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
     ck.check(
-        "S2c 同步批量共用同一处守卫与同一句文案",
+        "S2c sync batch shares the same guard and the same message text",
         batch.is_err() && batch_msg.contains(SYNC_WORDING) && batch_ms < LOCAL_BUDGET_MS,
         &format!("{batch_ms:.2}ms {batch_msg}"),
     );
     let a_now = offset_of(&producer, &mq_a).await;
     let b_now = offset_of(&producer, &mq_b).await;
     ck.check(
-        "S2d wire 反证：A 的 maxOffset 一动没动，B 上一条都没有",
+        "S2d wire counter-evidence: A's maxOffset untouched and B does not hold a single message",
         a_now == off_after_s1 && b_now == 0,
         &format!("A={a_now} B={b_now}"),
     );
 
-    // ---------------- S3 命名空间：wrap 幂等，只拒真的不同名 ----------------
-    println!("\n-- S3 命名空间下的比较（ns%topic 与裸 topic 都不误拒）--");
+    // ---------------- S3 namespace: wrap is idempotent, only a genuinely different name is refused ----------------
+    println!("\n-- S3 comparison under a namespace (neither ns%topic nor the bare topic is falsely refused) --");
     let w_topic = format!("ns1%{topic_a}");
     lock(&env.topics).push(w_topic.clone());
     if let Err(e) = env.create_topic(&w_topic, 4).await {
-        ck.abort("S3 创建 ns1%topic", &e);
+        ck.abort("S3 create ns1%topic", &e);
         return ck;
     }
     let nsprod = match producer_config(&env, "ns", "ns1") {
         Ok(p) => p,
         Err(e) => {
-            ck.abort("S3 命名空间生产者构造", &e);
+            ck.abort("S3 namespace producer construction", &e);
             return ck;
         }
     };
     if let Err(e) = nsprod.start().await {
-        ck.abort("S3 命名空间生产者 start", &e.to_string());
+        ck.abort("S3 namespace producer start", &e.to_string());
         return ck;
     }
     let mqw = match wait_route(&nsprod, &w_topic).await {
         Ok(mq) => mq,
         Err(e) => {
-            ck.abort("S3 带前缀 topic 的路由", &e);
+            ck.abort("S3 route of the prefixed topic", &e);
             return ck;
         }
     };
@@ -489,21 +489,21 @@ async fn run(namesrv: &str) -> Checker {
     n1.set_keys(&format!("pinned-ns-q-{stamp}"));
     match nsprod.send(&mut n1, Some(5_000), Some(&mqw)).await {
         Ok(r) => ck.check(
-            "S3b 队列 topic 已带 ns 前缀：wrap 幂等，不误拒",
+            "S3b queue topic already carries the ns prefix: wrap is idempotent, no false refusal",
             r.status == SendStatus::SendOk,
             &format!("status={:?}", r.status),
         ),
-        Err(e) => ck.abort("S3b 队列 topic 已带前缀的发送", &e.to_string()),
+        Err(e) => ck.abort("S3b send with a prefixed queue topic", &e.to_string()),
     }
     let mut n2 = Message::new(&w_topic, Some(b"ns-wrapped-message"));
     n2.set_keys(&format!("pinned-ns-m-{stamp}"));
     match nsprod.send(&mut n2, Some(5_000), Some(&mqw)).await {
         Ok(r) => ck.check(
-            "S3c 消息 topic 自己已带前缀同样放行",
+            "S3c message topic carrying its own prefix is likewise allowed",
             r.status == SendStatus::SendOk,
             &format!("status={:?}", r.status),
         ),
-        Err(e) => ck.abort("S3c 消息 topic 已带前缀的发送", &e.to_string()),
+        Err(e) => ck.abort("S3c send with a prefixed message topic", &e.to_string()),
     }
     let ns2_mq = MessageQueue::new(&format!("ns2%{topic_a}"), &mqw.broker_name, 0);
     let mut n3 = Message::new(&topic_a, Some(b"ns2-refused"));
@@ -512,35 +512,35 @@ async fn run(namesrv: &str) -> Checker {
     let ns2_ms = began.elapsed().as_secs_f64() * 1000.0;
     let ns2_msg = ns2.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
     ck.check(
-        "S3d 换成 ns2% 前缀才拒（对照腿：拒的是名字，不是「有前缀」）",
+        "S3d refused only when the prefix changes to ns2% (control leg: what is refused is the name, not merely having a prefix)",
         ns2.is_err() && ns2_msg.contains(SYNC_WORDING) && ns2_ms < LOCAL_BUDGET_MS,
         &format!("{ns2_ms:.2}ms {ns2_msg}"),
     );
     let ns_off = wait_offset(&nsprod, &mqw, 2).await;
     ck.check(
-        "S3e 两条放行腿真落进 ns1%topic（maxOffset=2）",
+        "S3e both allowed sends truly land in ns1%topic (maxOffset=2)",
         ns_off == 2,
         &format!("maxOffset={ns_off}"),
     );
 
-    // ---------------- S4 异步：回调里是异步那处文案 ----------------
-    println!("\n-- S4 异步单条/批量：拒绝走回调，放行走内核 --");
+    // ---------------- S4 async: the callback carries the async message text ----------------
+    println!("\n-- S4 async single/batch: refusals go through the callback, allowed sends go on the wire --");
     let refused_latch = Latch::new();
     let mut ar = Message::new(&topic_a, Some(b"async-refused"));
     ar.set_keys(&format!("pinned-async-refused-{stamp}"));
     if let Err(e) = producer.send_async(ar, refused_latch.clone(), Some(5_000), Some(mq_b.clone())) {
-        ck.abort("S4a 异步调用本身不该抛", &e.to_string());
+        ck.abort("S4a the async call itself must not throw", &e.to_string());
     }
     let got = refused_latch.wait(10).await;
     let errs = refused_latch.errors();
     ck.check(
-        "S4a 单条异步拒绝走回调、文案是异步那处",
+        "S4a single async refusal goes through the callback with the async message text",
         got && errs.len() == 1 && errs[0].contains(ASYNC_WORDING),
         &format!("errors={errs:?}"),
     );
     let a_now = offset_of(&producer, &mq_a).await;
     ck.check(
-        "S4b 拒后 maxOffset 仍不动（异步也没偷发）",
+        "S4b maxOffset still unchanged after the refusal (async does not sneak a send either)",
         a_now == off_after_s1,
         &format!("maxOffset={a_now}"),
     );
@@ -554,12 +554,12 @@ async fn run(namesrv: &str) -> Checker {
         Some(5_000),
         Some(mq_b.clone()),
     ) {
-        ck.abort("S4c 批量异步调用本身不该抛", &e.to_string());
+        ck.abort("S4c the batch async call itself must not throw", &e.to_string());
     }
     let got = batch_refused.wait(10).await;
     let errs = batch_refused.errors();
     ck.check(
-        "S4c 批量异步共用同一处文案与同一条拒绝路径",
+        "S4c batch async shares the same message text and the same refusal path",
         got && errs.len() == 1 && errs[0].contains(ASYNC_WORDING),
         &format!("errors={errs:?}"),
     );
@@ -568,7 +568,7 @@ async fn run(namesrv: &str) -> Checker {
     let mut okm = Message::new(&topic_a, Some(b"async-ok"));
     okm.set_keys(&format!("pinned-async-single-{stamp}"));
     if let Err(e) = producer.send_async(okm, single_ok.clone(), Some(5_000), Some(mq_a.clone())) {
-        ck.abort("S4d 异步放行调用失败", &e.to_string());
+        ck.abort("S4d async allowed call failed", &e.to_string());
     }
     let batch_ok = Latch::new();
     let mut bk1 = Message::new(&topic_a, Some(b"ab1"));
@@ -581,12 +581,12 @@ async fn run(namesrv: &str) -> Checker {
         Some(5_000),
         Some(mq_a.clone()),
     ) {
-        ck.abort("S4e 批量异步放行调用失败", &e.to_string());
+        ck.abort("S4e batch async allowed call failed", &e.to_string());
     }
     let ok_ok = single_ok.wait(10).await;
     let ok_batch = batch_ok.wait(10).await;
     ck.check(
-        "S4d 两条放行腿都 SEND_OK",
+        "S4d both allowed legs return SEND_OK",
         ok_ok
             && single_ok.oks() == 1
             && single_ok.first_status() == Some(SendStatus::SendOk)
@@ -601,34 +601,34 @@ async fn run(namesrv: &str) -> Checker {
     );
     let off_after_async = wait_offset(&producer, &mq_a, off_after_s1 + 3).await;
     ck.check(
-        "S4e 异步放行腿同样真落库（单条 1 + 批量子消息 2，maxOffset 再涨 3）",
+        "S4e async allowed legs truly persist too (1 single + 2 batch sub-messages, maxOffset rises by another 3)",
         off_after_async == off_after_s1 + 3,
         &format!("maxOffset={off_after_async}"),
     );
 
-    println!("\n-- S5 单向定点没有守卫：msg 自己的 topic 说了算 --");
+    println!("\n-- S5 oneway pinned send has no guard: the message's own topic decides --");
     let k_ow = format!("pinned-oneway-{stamp}");
     let mut ow = Message::new(&topic_a, Some(b"oneway"));
     ow.set_keys(&k_ow);
     match producer.send_oneway(&mut ow, Some(&mq_b)).await {
         Ok(()) => {}
-        Err(e) => ck.abort("S5 单向发送本身不该失败", &e.to_string()),
+        Err(e) => ck.abort("S5 the oneway send itself must not fail", &e.to_string()),
     }
     let off_after_ow = wait_offset(&producer, &mq_a, off_after_async + 1).await;
     ck.check(
-        "S5a 单向定点没有守卫：报文按 msg 自己的 topic 落进 A",
+        "S5a oneway pinned send has no guard: the packet lands in A under the message's own topic",
         off_after_ow == off_after_async + 1,
         &format!("A maxOffset={off_after_ow}"),
     );
     let b_now = offset_of(&producer, &mq_b).await;
     ck.check(
-        "S5b 目标队列所在的 B 一条都没有（是本端设计使然，不是漏发）",
+        "S5b B, where the target queue lives, holds not a single message (by local design, not a missed send)",
         b_now == 0,
         &format!("B maxOffset={b_now}"),
     );
 
-    // ---------------- S6 正腿收尾：消息一条不少 ----------------
-    println!("\n-- S6 push 消费者收齐正腿消息 --");
+    // ---------------- S6 positive-leg wrap-up: not one message missing ----------------
+    println!("\n-- S6 push consumer receives all positive-leg messages --");
     let expected = [
         k_single.clone(),
         k_b1.clone(),
@@ -646,7 +646,7 @@ async fn run(namesrv: &str) -> Checker {
     }
     let missing: Vec<&String> = expected.iter().filter(|k| !got.contains(k)).collect();
     ck.check(
-        "S6 正腿消息一条不少地被消费到",
+        "S6 every positive-leg message is consumed",
         missing.is_empty(),
         &format!("received={got:?} missing={missing:?}"),
     );
@@ -668,7 +668,7 @@ fn stamp() -> String {
 
 fn report(ck: &mut Checker) {
     println!(
-        "== 结果: {}/{} 通过 ==",
+        "== result: {}/{} passed ==",
         ck.passed,
         ck.passed as usize + ck.failed.len()
     );

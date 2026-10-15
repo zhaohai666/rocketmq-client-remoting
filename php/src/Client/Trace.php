@@ -64,7 +64,7 @@ final class TraceBean
     public int $retryTimes = 0;
     public int $bodyLength = 0;
     public ?MessageType $msgType = null;
-    /** LocalTransactionState（枚举或裸串）；编码时取其 name（见 encoder）。 */
+    /** LocalTransactionState (enum or bare string); take its name when encoding (see encoder). */
     public mixed $transactionState = null;
     public ?string $transactionId = null;
     public bool $fromTransactionCheck = false;
@@ -186,7 +186,7 @@ final class TraceDataEncoder
         return $res;
     }
 
-    /** 解一条轨迹记录（一段 FIELD_SPLITOR 之内）。无法识别时返回 null。 */
+    /** Decode one trace record (within one FIELD_SPLITOR segment). Returns null when unrecognizable. */
     private static function decodeContext(string $context): ?TraceContext
     {
         $line = self::wireSplit($context, TraceConstants::CONTENT_SPLITOR);
@@ -208,17 +208,17 @@ final class TraceDataEncoder
             $bean->storeHost = self::at($line, 8);
             $bean->bodyLength = (int) self::at($line, 9);
             $ctx->costTime = (int) self::at($line, 10);
-            // MessageType::from 对越界值抛 ValueError，
-            // 由 decoderFromTraceDataString 捕获后跳过该条记录。
+            // MessageType::from throws ValueError on out-of-range values;
+            // caught by decoderFromTraceDataString, which then skips this record.
             $bean->msgType = MessageType::from((int) self::at($line, 11));
             $n = count($line);
-            if ($n === 13) {                                        // 老版本：无 offsetMsgId
+            if ($n === 13) {                                        // old version: no offsetMsgId
                 $ctx->isSuccess = self::at($line, 12) === 'true';
             } elseif ($n === 14) {
                 $bean->offsetMsgId = self::at($line, 12);
                 $ctx->isSuccess = self::at($line, 13) === 'true';
             }
-            if ($n >= 15) {                                         // 兼容更老版本
+            if ($n >= 15) {                                         // compatible with older versions
                 $bean->offsetMsgId = self::at($line, 12);
                 $ctx->isSuccess = self::at($line, 13) === 'true';
                 $bean->clientHost = self::at($line, 14);
@@ -236,7 +236,7 @@ final class TraceDataEncoder
             $bean = new TraceBean();
             $bean->msgId = self::at($line, 5);
             $bean->retryTimes = (int) self::at($line, 6);
-            // 无 keys 的消息会缺这段，见 atOr() 注释
+            // Messages without keys lack this segment; see the atOr() comment
             $bean->keys = self::atOr($line, 7);
             $ctx->traceBeans = [$bean];
             return $ctx;
@@ -255,7 +255,7 @@ final class TraceDataEncoder
             if ($n >= 7) {
                 $ctx->contextCode = (int) self::at($line, 6);
             }
-            if ($n >= 9) {                                          // 兼容老版本
+            if ($n >= 9) {                                          // compatible with older versions
                 $ctx->timeStamp = (int) self::at($line, 7);
                 $ctx->groupName = self::at($line, 8);
             }

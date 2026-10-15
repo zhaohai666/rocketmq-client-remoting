@@ -37,16 +37,17 @@ def _wait_until(pred, timeout_sec=20.0, interval=0.3):
 
 
 class UnregisterProbe(RPCHook):
-    """记录每一个 ``UNREGISTER_CLIENT``(35) 请求及其响应码。
+    """Record every ``UNREGISTER_CLIENT``(35) request together with its response code.
 
-    钩子挂在传输层（``register_rpc_hook``），编码前调用，所以抓到的就是上线的那份 extFields。
+    The hook hangs on the transport layer (``register_rpc_hook``) and is called before encoding, so
+    what it captures is exactly the extFields that go on the wire.
     """
 
     def __init__(self):
         self.lock = threading.Lock()
-        self.requests = []     # [(remote_addr, ext_fields 快照)]
-        self.responses = []    # [(remote_addr, response_code 或 None)]
-        self.codes = []        # 按顺序记录所有请求码，用于确认 35 排在发送之后
+        self.requests = []     # [(remote_addr, ext_fields snapshot)]
+        self.responses = []    # [(remote_addr, response_code or None)]
+        self.codes = []        # Record all request codes in order, to confirm that 35 comes after the sends
 
     def do_before_request(self, remote_addr: str, request: RemotingCommand) -> None:
         ext = dict(request.ext_fields or {})
@@ -76,7 +77,7 @@ def _producer(group, instance_name):
 
 
 def _connection_client_ids(admin, broker_addr, group):
-    """204 看到的 clientId 列表；broker 说「组不存在」时回 None。"""
+    """The clientId list that 204 sees; returns None when the broker says the group does not exist."""
     try:
         pc = admin.examine_producer_connection_info(group, broker_addr)
     except Exception as e:  # noqa: BLE001
@@ -103,15 +104,15 @@ def main():
             pass
         time.sleep(1)
     if cluster is None:
-        check("集群探活", False, "nameServer 无 broker 注册")
+        check("cluster liveness", False, "no broker registered on the nameServer")
         admin.shutdown()
         return 1
-    # 已知 broker：主从都算，35 必须每台各一发
+    # All known brokers count, master and slave alike: 35 must be sent to each one
     all_addrs = []
     for ids in cluster.broker_addr_table.values():
         all_addrs.extend(ids.values())
     broker_addr = all_addrs[0]
-    check("集群探活", True, "brokers=%s" % ",".join(all_addrs))
+    check("cluster liveness", True, "brokers=%s" % ",".join(all_addrs))
 
     topic = "Unreg_%d" % STAMP
     group = "PID_unreg_%d" % STAMP
@@ -126,7 +127,7 @@ def main():
 
     try:
         r = p.send(Message(topic, b"unreg-probe"))
-        check("U1 生产者发送成功", r.send_status == SendStatus.SEND_OK,
+        check("U1 the producer sent successfully", r.send_status == SendStatus.SEND_OK,
               "msgId=%s" % r.msg_id)
         peer.send(Message(topic, b"peer"))
 
@@ -138,20 +139,20 @@ def main():
             if seen and client_id in seen:
                 break
             time.sleep(1)
-        check("U2 心跳后 204 能看到本 clientId", bool(seen) and client_id in seen,
-              "clientId=%s 当前=%s" % (client_id, seen))
+        check("U2 after the heartbeat 204 can see this clientId", bool(seen) and client_id in seen,
+              "clientId=%s current=%s" % (client_id, seen))
         peer_seen = _connection_client_ids(admin, broker_addr, peer_group)
-        check("U2b 对照组注册可见（说明 204 这条判据本身有效）",
-              bool(peer_seen) and peer.client_id in peer_seen, "当前=%s" % peer_seen)
+        check("U2b the control group registration is visible (showing the 204 criterion itself is valid)",
+              bool(peer_seen) and peer.client_id in peer_seen, "current=%s" % peer_seen)
 
         requests, responses, codes = probe.snapshot()
-        check("U3 前置：还没退出时不应有 35", not requests,
+        check("U3 precondition: there should be no 35 before exiting", not requests,
               "count=%d" % len(requests))
 
         p.shutdown()
         requests, responses, codes = probe.snapshot()
 
-        check("U3 shutdown 发了 code 35（每台已知 broker 各一发）",
+        check("U3 shutdown sent code 35 (one to each known broker)",
               len(requests) == len(all_addrs),
               "count=%d brokers=%d" % (len(requests), len(all_addrs)))
         shape_ok = bool(requests)
@@ -162,38 +163,38 @@ def main():
                 shape_ok = False
             if addr not in all_addrs:
                 shape_ok = False
-        check("U3b 35 的头是 clientID + producerGroup，consumerGroup 不上线（留空）",
+        check("U3b the header of 35 is clientID + producerGroup, consumerGroup does not go on the wire (left empty)",
               shape_ok, "ext=%s" % (requests[0][1] if requests else None))
         all_ok = bool(responses) and all(addr in all_addrs for addr, _ in requests) \
             and all(rc == RemotingSysResponseCode.SUCCESS for _, rc in responses)
-        check("U4 每一发 35 都回 SUCCESS（走的是还开着的连接）",
+        check("U4 every 35 is answered with SUCCESS (it goes over a connection that is still open)",
               all_ok and len(responses) == len(requests),
               "responses=%s" % responses)
-        # 顺序：35 必须排在业务发送之后（否则注销的是没建起来的注册）
+        # The order: 35 must come after the business sends (otherwise it would unregister a registration that was never established)
         last_send = max((i for i, c in enumerate(codes)
                          if c in (RequestCode.SEND_MESSAGE, RequestCode.SEND_MESSAGE_V2)),
                         default=-1)
         first_unreg = next((i for i, c in enumerate(codes)
                             if c == RequestCode.UNREGISTER_CLIENT), -1)
-        check("U4b 35 排在业务发送之后", last_send >= 0 and first_unreg > last_send,
+        check("U4b 35 comes after the business sends", last_send >= 0 and first_unreg > last_send,
               "last_send=%d first_unreg=%d" % (last_send, first_unreg))
 
         gone = _wait_until(lambda: _connection_client_ids(admin, broker_addr, group) is None, 10)
-        check("U5 退出后 204 查不到这个组（broker 回 not exist）", gone,
-              "当前=%s" % _connection_client_ids(admin, broker_addr, group))
+        check("U5 after exiting, 204 cannot find this group (the broker replies not exist)", gone,
+              "current=%s" % _connection_client_ids(admin, broker_addr, group))
         peer_after = _connection_client_ids(admin, broker_addr, peer_group)
-        check("U6 对照组仍在（排除 broker 全清这种假阳性）",
-              bool(peer_after) and peer.client_id in peer_after, "当前=%s" % peer_after)
+        check("U6 the control group is still there (ruling out a false positive from the broker clearing everything)",
+              bool(peer_after) and peer.client_id in peer_after, "current=%s" % peer_after)
     finally:
         peer.shutdown()
         try:
             admin.delete_topic(topic)
         except Exception as e:  # noqa: BLE001
-            print("    (delete_topic(%s) 失败: %s)" % (topic, e))
+            print("    (delete_topic(%s) failed: %s)" % (topic, e))
         admin.shutdown()
 
     passed = sum(1 for _, ok, _ in results if ok)
-    print("\n== 结果: %d/%d 通过 ==" % (passed, len(results)))
+    print("\n== Result: %d/%d passed ==" % (passed, len(results)))
     return 0 if passed == len(results) else 1
 
 

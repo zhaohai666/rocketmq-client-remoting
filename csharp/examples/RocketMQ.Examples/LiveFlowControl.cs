@@ -1,20 +1,25 @@
-// 离线单测（tests/FlowControlTests.cs）锁的是**判据本身**；这里锁真机上两件离线永远
-// 锁不住的事：
-//   A 闸门在真实 broker 上**确实会命中**。单位错一位、阈值读错一个字段，离线拿预置
-//     缓冲照样"能命中"，真机上却永远不命中（或永远命中）。把 topic 级闸门误接成
-//     队列级开关这类错位，离线照样全绿。
-//   B 命中之后**一条消息都不许丢**。流控只是"暂停拉取"，不是"丢弃/跳过"：暂停期间
-//     位点不许越过还没消费完的消息，恢复后同一个队列必须继续消费到末尾。写成"命中就
-//     丢批 / 退出循环"在十几秒窗口里完全看不出来，只有把全部消息数完才暴露。
+// The offline unit tests (tests/FlowControlTests.cs) pin the **criteria themselves**; what
+// is pinned here are the two things offline can never pin:
+//   A The gate **really does hit** on a real broker. A unit off by one place or a threshold
+//     read from the wrong field still "hits" offline against a seeded buffer, while on a
+//     real machine it never hits (or always hits). A misalignment like wiring the topic-level
+//     gate to the queue-level switch stays entirely green offline.
+//   B After a hit, **not one message may be lost**. Flow control only "pauses pulling", it
+//     does not "drop/skip": while paused the offset must not pass a message that has not been
+//     consumed, and after resuming the same queue must keep consuming to the end. Writing it
+//     as "drop the batch / leave the loop on a hit" is invisible in a ten-second window and
+//     only shows up once every message has been counted.
 //
 //
-// ⚠ 大消息必须**不可压缩**：生产者对超过压缩阈值的 body 先试压，全同字节的 payload 会被
-//   压到几百字节，broker 落盘的 StoreSize 跟着变几百字节 —— "size 闸门永不命中"就成了
-//   夹具问题（真机首轮最容易这么踩到）。
-// ⚠ S1/S4 的 topic 必须只有 **1 条队列**：8 条 400KB 摊到 4 条队列上每条才 800KB，
-//   永远够不到 1MiB 这道**队列级**闸门。
+// Note: large messages must be **incompressible**: the producer tries to compress bodies
+//   over the compression threshold first, and an all-identical-byte payload compresses down
+//   to a few hundred bytes, which changes the StoreSize the broker persists by the same
+//   amount -- "the size gate never hits" then becomes a fixture problem (this is the easiest
+//   one to hit on a real machine's first round).
+// Note: the topics of S1/S4 must have **exactly 1 queue**: spreading 8 x 400KB over 4 queues
+//   gives only 800KB each, which never reaches the 1MiB **queue-level** gate.
 //
-// 用法：rmq flow-control [namesrv]（需本地 5.5.1 集群）
+// Usage: rmq flow-control [namesrv] (needs a local 5.5.1 cluster)
 using System.Security.Cryptography;
 using System.Text;
 
@@ -35,7 +40,7 @@ public static class LiveFlowControl
 
     private const int Huge = 65535;
 
-    /// <summary>字节闸门"关闭"的写法同上：pullThresholdSizeForQueue 合法域 [1, 1024] MiB。</summary>
+   /// <summary>How the byte gate is "switched off" is the same: pullThresholdSizeForQueue's legal range is [1, 1024] MiB.</summary>
     private const int HugeSizeMiB = 1024;
 
     private const int KiB = 1024;
@@ -71,7 +76,8 @@ public static class LiveFlowControl
 
     private static string Group(string kind) => "fc_cs_" + _stamp + "_g" + kind;
 
-    /// <summary>显式建 topic（不靠 autoCreateTopicEnable，队列数才确定 —— S1 依赖"就是 1 条队列"）。</summary>
+  /// <summary>Explicitly creates the topic (not relying on autoCreateTopicEnable, so the queue
+  /// count is certain -- S1 relies on "it is exactly 1 queue").</summary>
     private static void PrepareTopic(DefaultMQProducer producer, string topic, int queues)
     {
         try
@@ -80,14 +86,14 @@ public static class LiveFlowControl
         }
         catch (Exception e)
         {
-            Console.WriteLine("  预建 topic " + topic + " 失败（改用自动创建）: " + e.Message);
+       Console.WriteLine("  pre-creating topic " + topic + " failed (falling back to auto-creation): " + e.Message);
         }
 
-        // 等 NameServer 路由传播，否则消费者首轮 rebalance 仍查不到
+        // Wait for the NameServer route to propagate, otherwise the consumer's first rebalance round still finds nothing
         Sleep(3000);
     }
 
-    /// <summary>400KB **不可压缩**消息体：前缀 + 随机尾巴（前缀只便于日志辨认，判据一律用条数）。</summary>
+   /// <summary>A 400KB **incompressible** message body: a prefix plus a random tail (the prefix only makes it recognisable in logs, the criteria always use counts).</summary>
     private static byte[] BigBody(int tag)
     {
         byte[] body = new byte[400 * KiB];
@@ -97,7 +103,8 @@ public static class LiveFlowControl
         return body;
     }
 
-    /// <summary>收消息用：记录 body，可选地每批睡 slowMs（制造"已拉未消费"的堆积）。</summary>
+    /// <summary>Used for consuming: records the body and optionally sleeps slowMs per batch
+    /// (to create a "pulled but not consumed" backlog).</summary>
     private sealed class Sink : IMessageListenerConcurrently
     {
         private readonly int _slowMs;
@@ -117,7 +124,7 @@ public static class LiveFlowControl
             {
                 foreach (MessageExt m in msgs)
                 {
-                    // 用长度 + 前缀当键：400KB 的整份 body 进 HashSet 只是白占内存
+           // use length + prefix as the key: putting a whole 400KB body into a HashSet only wastes memory
                     _bodies.Add(m.Body.Length + ":" + Encoding.UTF8.GetString(m.Body, 0,
                         Math.Min(m.Body.Length, 16)));
                     ++_got;
@@ -171,7 +178,7 @@ public static class LiveFlowControl
         }
     }
 
-    // ------------------------------------------------ S0 默认闸门 + 快消费
+      // ------------------------------------------------ S0 the default gates + fast consumption
     private static void S0Defaults(DefaultMQProducer producer)
     {
         string topic = Topic("Defaults");
@@ -183,12 +190,12 @@ public static class LiveFlowControl
         bool all = WaitUntil(() => c.Sink.Got() >= 12, 30000);
         long fc = c.Consumer.FlowControlTriggered;
         c.Consumer.Shutdown();
-        Check("S0-默认闸门不命中", fc == 0, "triggered=" + fc);
-        Check("S0-默认闸门下全部到达", all && c.Sink.Got() == 12, "got=" + c.Sink.Got());
-        Check("S0-一条不重不丢", c.Sink.Distinct() == 12, "distinct=" + c.Sink.Distinct());
+        Check("S0-the default gates do not hit", fc == 0, "triggered=" + fc);
+      Check("S0-under the default gates everything arrives", all && c.Sink.Got() == 12, "got=" + c.Sink.Got());
+        Check("S0-nothing duplicated and nothing lost", c.Sink.Distinct() == 12, "distinct=" + c.Sink.Distinct());
     }
 
-    // ------------------------------ S1 队列级字节闸门（topic 必须单队列）
+  // ------------------------------ S1 the queue-level byte gate (the topic must be single-queue)
     private static void S1SizeGate(DefaultMQProducer producer)
     {
         string topic = Topic("Size");
@@ -204,13 +211,13 @@ public static class LiveFlowControl
         bool all = WaitUntil(() => c.Sink.Got() >= 8, 40000);
         long fc = c.Consumer.FlowControlTriggered;
         c.Consumer.Shutdown();
-        Check("S1-队列级字节闸门真机命中", hit, "triggered=" + fc);
-        Check("S1-大消息一条不丢", all && c.Sink.Got() == 8, "got=" + c.Sink.Got());
-        Check("S1-8 条 400KB 消息全不重复", c.Sink.Distinct() == 8,
+     Check("S1-the queue-level byte gate really hits on a real machine", hit, "triggered=" + fc);
+        Check("S1-no large message is lost", all && c.Sink.Got() == 8, "got=" + c.Sink.Got());
+        Check("S1-the 8 400KB messages are all distinct", c.Sink.Distinct() == 8,
             "distinct=" + c.Sink.Distinct());
     }
 
-    // ------------------------------------------------------ S2 位点跨度闸门
+      // ------------------------------------------------------ S2 the offset span gate
     private static void S2SpanGate(DefaultMQProducer producer)
     {
         string topic = Topic("Span");
@@ -226,11 +233,11 @@ public static class LiveFlowControl
         bool all = WaitUntil(() => c.Sink.Got() >= 14, 40000);
         long fc = c.Consumer.FlowControlTriggered;
         c.Consumer.Shutdown();
-        Check("S2-跨度闸门真机命中", hit, "triggered=" + fc);
-        Check("S2-跨度过限后仍全部消费", all && c.Sink.Got() == 14, "got=" + c.Sink.Got());
+        Check("S2-the span gate really hits on a real machine", hit, "triggered=" + fc);
+        Check("S2-everything is still consumed after the span limit", all && c.Sink.Got() == 14, "got=" + c.Sink.Got());
     }
 
-    // -------------------------------------------------- S3 topic 级条数闸门
+      // -------------------------------------------------- S3 the topic-level count gate
     private static void S3TopicGate(DefaultMQProducer producer)
     {
         string topic = Topic("TopicCount");
@@ -247,14 +254,14 @@ public static class LiveFlowControl
         bool all = WaitUntil(() => c.Sink.Got() >= 16, 40000);
         long fc = c.Consumer.FlowControlTriggered;
         c.Consumer.Shutdown();
-        Check("S3-topic 级条数闸门真机命中", hit, "triggered=" + fc);
-        Check("S3-跨队列累计后仍全部消费", all && c.Sink.Got() == 16, "got=" + c.Sink.Got());
+   Check("S3-the topic-level count gate really hits on a real machine", hit, "triggered=" + fc);
+        Check("S3-everything is still consumed after accumulating across queues", all && c.Sink.Got() == 16, "got=" + c.Sink.Got());
     }
 
-    // ------------------------------------- S4 命中之后恢复（复用 S1 的组与 topic）
+    // ------------------------------------- S4 recovery after a hit (reusing S1's group and topic)
     private static void S4Recovery(DefaultMQProducer producer)
     {
-        // 位点已由 S1 提交到 broker 末尾，这里只会收到新的一批。
+   // The offset was already committed to the broker's tail by S1, so only a new batch arrives here.
         string topic = Topic("Size");
         Case c = StartConsumer("1", topic, 300);
         c.Consumer.PullThresholdForQueue = Huge;
@@ -267,10 +274,10 @@ public static class LiveFlowControl
         bool hit = WaitUntil(() => c.Consumer.FlowControlTriggered > 0, 30000);
         long fc = c.Consumer.FlowControlTriggered;
         c.Consumer.Shutdown();
-        Check("S4-触发过流控的队列恢复后继续消费", all && c.Sink.Got() == 6,
+      Check("S4-a queue that triggered flow control keeps consuming after recovery", all && c.Sink.Got() == 6,
             "got=" + c.Sink.Got());
-        Check("S4-恢复批次仍然命中流控（闸门不会命中一次后失效）", hit, "triggered=" + fc);
-        Check("S4-恢复批次不重复", c.Sink.Distinct() == 6, "distinct=" + c.Sink.Distinct());
+    Check("S4-the recovery batch still hits flow control (the gate does not become ineffective after one hit)", hit, "triggered=" + fc);
+        Check("S4-the recovery batch has no duplicates", c.Sink.Distinct() == 6, "distinct=" + c.Sink.Distinct());
     }
 
     private static void S5CheckConfig(DefaultMQProducer producer)
@@ -301,12 +308,12 @@ public static class LiveFlowControl
         catch (Exception e)
         {
             started = false;
-            Check("S5-边界值配置能启动", false, e.Message);
+     Check("S5-the boundary-value configuration starts", false, e.Message);
         }
 
         if (started)
         {
-            Check("S5-边界值配置能启动", true, "IsStarted=" + c.Consumer.IsStarted);
+  Check("S5-the boundary-value configuration starts", true, "IsStarted=" + c.Consumer.IsStarted);
             Sleep(3000);
             for (int i = 0; i < 10; ++i)
             {
@@ -314,7 +321,7 @@ public static class LiveFlowControl
             }
 
             bool all = WaitUntil(() => c.Sink.Got() >= 10, 30000);
-            Check("S5-边界值配置下 10 条全到达",
+     Check("S5-all 10 arrive under the boundary-value configuration",
                 all && c.Sink.Got() == 10 && c.Sink.Distinct() == 10,
                 "got=" + c.Sink.Got() + " distinct=" + c.Sink.Distinct());
         }
@@ -348,7 +355,7 @@ public static class LiveFlowControl
             try
             {
                 badConsumer.Start();
-                actual = "Start() 居然成功了";
+     actual = "Start() unexpectedly succeeded";
                 badConsumer.Shutdown();
             }
             catch (MQClientException e)
@@ -358,11 +365,11 @@ public static class LiveFlowControl
             }
             catch (Exception e)
             {
-                actual = "别的异常: " + e.Message;
+       actual = "a different exception: " + e.Message;
             }
 
-            Check("S5-越界配置被拒: " + want, rejected && actual == want, "实际=" + actual);
-            Check("S5-越界配置没留下半启动实例: " + want, !badConsumer.IsStarted);
+          Check("S5-the out-of-range configuration is rejected: " + want, rejected && actual == want, "actually=" + actual);
+          Check("S5-the out-of-range configuration left no half-started instance: " + want, !badConsumer.IsStarted);
         }
 
         if (!started)
@@ -370,22 +377,25 @@ public static class LiveFlowControl
             return;
         }
 
-        // broker 侧反证：被拒的组查不到、边界值组查得到。
-        // 必须用**裸**的 GetConsumerListByGroup —— GetConsumerIdListByGroup 内部吞异常
-        // 返回 null，"被拒绝"与"没注册"在调用方看来一模一样（LiveAcl.cs 的 S6 同注）。
+        // The broker-side counter-proof: the rejected group is not findable while the
+        // boundary-value group is. It has to use the **bare** GetConsumerListByGroup --
+    // GetConsumerIdListByGroup swallows the exception internally and returns null, which
+        // makes "rejected" and "not registered" look identical to the caller (the same note
+        // in S6 of LiveAcl.cs).
         var probe = new MQClientInstance("FC_CS_PROBE_" + _stamp, new List<string> { _namesrv });
         probe.Start();
         try
         {
             string addr = probe.BrokerAddrForTopic(topic);
-            Check("S5-拿到 broker 地址用于查消费组", addr.Length > 0, "addr=" + addr);
+        Check("S5-got a broker address for querying the consumer group", addr.Length > 0, "addr=" + addr);
             if (addr.Length == 0)
             {
                 return;
             }
 
-            // 从未注册过的组：broker 不回空列表，而是直接甩 code=1
-            // "no consumer for this group"。两种形态都算"查无此组"，但绝不能带 clientId。
+      // A group that never registered: the broker does not reply with an empty list but
+        // throws code=1 "no consumer for this group" straight away. Both shapes count as
+    // "no such group", but it must never carry a clientId.
             bool absent;
             string detail;
             try
@@ -397,15 +407,15 @@ public static class LiveFlowControl
             catch (MQBrokerException e)
             {
                 absent = true;
-                detail = "broker 直接拒绝: code=" + e.ResponseCode + " " + e.ResponseMessage;
+     detail = "the broker refused straight away: code=" + e.ResponseCode + " " + e.ResponseMessage;
             }
             catch (Exception e)
             {
                 absent = false;
-                detail = "探测请求失败: " + e.Message;
+         detail = "the probe request failed: " + e.Message;
             }
 
-            Check("S5-broker 侧不知道被拒的消费组", absent, detail);
+            Check("S5-the broker side does not know the rejected consumer group", absent, detail);
 
             int goodN = 0;
             string goodDetail = string.Empty;
@@ -415,10 +425,10 @@ public static class LiveFlowControl
             }
             catch (Exception e)
             {
-                goodDetail = "探测失败: " + e.Message;
+     goodDetail = "the probe failed: " + e.Message;
             }
 
-            Check("S5-broker 侧认下了边界值消费者", goodN == 1,
+      Check("S5-the broker side accepted the boundary-value consumer", goodN == 1,
                 "n=" + goodN + (goodDetail.Length > 0 ? " " + goodDetail : ""));
         }
         finally
@@ -447,7 +457,7 @@ public static class LiveFlowControl
     {
         _namesrv = args.Length > 0 ? args[0] : "127.0.0.1:9876";
         _stamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString();
-        Console.WriteLine("== 流控真机验证：" + _namesrv + " stamp=" + _stamp + " ==");
+  Console.WriteLine("== flow control real-machine verification: " + _namesrv + " stamp=" + _stamp + " ==");
 
         var producer = new DefaultMQProducer("PID_fc_cs_" + _stamp)
         {
@@ -463,7 +473,8 @@ public static class LiveFlowControl
 
         try
         {
-            // 集群探活：拿不到 broker 注册就别往下跑，否则每条判据都只是在等超时
+     // cluster liveness: without a broker registration do not go any further, otherwise every
+       // criterion is just waiting out a timeout
             bool alive = WaitUntil(() =>
             {
                 try
@@ -477,11 +488,11 @@ public static class LiveFlowControl
             }, 30000);
             if (!alive)
             {
-                Check("集群探活", false, "nameServer 上没有 " + MixAll.DefaultTopic + " 的路由");
+     Check("the cluster liveness probe", false, "the nameServer has no route for " + MixAll.DefaultTopic);
             }
             else
             {
-                Check("集群探活", true, "broker 队列数=" +
+   Check("the cluster liveness probe", true, "the broker's queue count=" +
                     producer.FetchPublishMessageQueues(MixAll.DefaultTopic).Count);
                 S0Defaults(producer);
                 S1SizeGate(producer);
@@ -493,7 +504,7 @@ public static class LiveFlowControl
         }
         catch (Exception e)
         {
-            Check("联调异常", false, e.Message);
+            Check("the integration threw", false, e.Message);
         }
 
         Cleanup();

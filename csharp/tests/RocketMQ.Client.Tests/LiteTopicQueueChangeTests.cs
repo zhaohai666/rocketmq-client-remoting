@@ -1,19 +1,32 @@
-// LitePull 消费者的 topic 队列集合变更监听（registerTopicMessageQueueChangeListener）。
+// The topic queue set change listener of the LitePull consumer
+// (registerTopicMessageQueueChangeListener).
 //
-// 这条能力的契约（逐条钉住，勿凭印象改）：
-//  1. 入参守卫：topic 为空或 listener 为 null → MQClientException("Topic or listener is null")；
-//  2. 同一 topic 重复注册 → warn 一条并覆盖旧监听器，旧监听器此后不再收到任何回调；
-//  3. 快照时机：只有**运行中**注册才立刻记一版当前队列集合；未启动时注册没有快照，
-//     于是首轮比对一定回调一次（"当下这套队列"要被认成变化，这是契约不是 bug）；
-//  4. 集合相等判定：数量不等或元素不属于旧集都算变化；没快照 ≡ 不相等；
-//  5. 变化才回调、回调后快照跟着推进，队列不动时不得反复打扰监听器；
-//  6. 单个 topic 取不到队列只跳过它，本轮其余 topic 继续比对（有意偏差：把 catch 收进
-//     循环体，免得一个长期无路由的 topic 永久饿死排在它后面的监听器）；
-//  7. 取队列每轮现问 nameserver，且空队列集按"查不到"抛错 —— 否则扩容要等满一次路由
-//     轮询才看得见，而 nameserver 抖动会被误报成"这个 topic 缩到 0 队列"的假缩容；
-//  8. 监听器表的键是**套好命名空间**的全名，回调收到的也是它；重注册/再取队列都不会
-//     二次拼接前缀（WrapNamespace 幂等）；
-//  9. 检查周期默认 30s、下限 1s（0 会让定时任务直接起不来），后台线程真的在按周期比对。
+// The contract of this capability (pinned item by item, do not change it from memory):
+//  1. Argument guards: a null topic or listener -> MQClientException("Topic or listener is null");
+//  2. Registering the same topic again -> warn once and overwrite the old listener; the
+//     old listener never receives another callback afterwards;
+//  3. Snapshot timing: only a registration **while running** immediately records a
+//     version of the current queue set; registering before startup has no snapshot, so
+//     the first comparison always fires a callback ("the queues as they are right now"
+//     must be recognised as a change -- that is the contract, not a bug);
+//  4. Set equality: a differing count or an element not in the old set both count as a
+//     change; having no snapshot is equivalent to not equal;
+//  5. Only a change fires the callback, and the snapshot advances after the callback, so
+//     an unmoving queue must not keep pestering the listener;
+//  6. Failing to get the queues of a single topic only skips that topic; the remaining
+//     topics of that round keep being compared (a deliberate deviation: the catch is
+//     pulled into the loop body so a topic that never has a route cannot permanently
+//     starve the listeners queued behind it);
+//  7. The queues are asked from the nameserver afresh each round, and an empty queue set
+//     is treated as "not found" and throws -- otherwise a scale-up would only become
+//     visible after a full route poll interval, and nameserver jitter would be misreported
+//     as a fake scale-down to 0 queues;
+//  8. The key of the listener table is the **namespace-wrapped** full name, and that is
+//     what the callback receives too; neither re-registering nor fetching the queues
+//     prepends the prefix a second time (WrapNamespace is idempotent);
+//  9. The check interval defaults to 30s with a lower bound of 1s (0 would make the
+//     timer task fail to start at all), and the background thread really does compare
+//     on that period.
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -35,7 +48,8 @@ public class LiteTopicQueueChangeTests
     private static void Eq(long expected, long actual, string because) =>
         Assert.True(actual == expected, $"expected {expected}, actual {actual}, because {because}");
 
-    /// <summary>只记回调，不改状态；后台线程也会调它，所以自带锁。</summary>
+    /// <summary>Only records callbacks, does not change state; the background thread
+    /// calls it too, so it brings its own lock.</summary>
     private sealed class Recorder : ITopicMessageQueueChangeListener
     {
         private readonly object _gate = new();
@@ -61,8 +75,9 @@ public class LiteTopicQueueChangeTests
         public int Count => Events().Count;
     }
 
-    /// <summary>一个可读队列数可变的 fake 集群：路由由 <paramref name="queueNums" /> 现算，
-    /// 所以测试能在消费者跑起来之后把 topic 扩容/缩容。</summary>
+    /// <summary>A fake cluster whose readable queue count can change: the route is
+    /// computed on the fly from <paramref name="queueNums" />, so a test can scale the
+    /// topic up/down after the consumer has started.</summary>
     private sealed class Fixture : IDisposable
     {
         public readonly MockCluster Cluster;
@@ -84,7 +99,7 @@ public class LiteTopicQueueChangeTests
                     route.QueueDatas.Add(new QueueData(_broker, queueNums, queueNums,
                         PermName.PermRead | PermName.PermWrite, 0));
                 }
-                // Ghost 一个队列都不给：等价于「这个 topic 查不到队列」。
+                // A Ghost that gives not a single queue: equivalent to "no queues found for this topic".
                 route.BrokerDatas.Add(new BrokerData("MockCluster", _broker,
                     new SortedDictionary<long, string> { { MixAll.MasterId, Cluster.BrokerAddrs[0] } }));
                 return route.Encode();
@@ -106,7 +121,7 @@ public class LiteTopicQueueChangeTests
         public void Dispose() => Cluster.Dispose();
     }
 
-    // ------------------------------------------------------------ 1. 入参守卫与周期
+    // ------------------------------------------------------------ 1. Argument guards and the interval
 
     [Fact]
     public void NullTopicOrNullListener_IsRejected()
@@ -129,16 +144,16 @@ public class LiteTopicQueueChangeTests
     public void CheckInterval_DefaultsTo30s_AndFloorsToOneSecond()
     {
         var consumer = new DefaultLitePullConsumer("GID_lite_qc_interval");
-        Eq(30000, consumer.TopicMetadataCheckIntervalMillis, "默认周期");
+        Eq(30000, consumer.TopicMetadataCheckIntervalMillis, "the default interval");
         consumer.SetTopicMetadataCheckIntervalMillis(0);
-        Eq(1000, consumer.TopicMetadataCheckIntervalMillis, "0 会被定时任务拒掉，必须夹到 1s");
+        Eq(1000, consumer.TopicMetadataCheckIntervalMillis, "0 is rejected by the timer task and must be clamped to 1s");
         consumer.SetTopicMetadataCheckIntervalMillis(-5);
-        Eq(1000, consumer.TopicMetadataCheckIntervalMillis, "负数同样夹到 1s");
+        Eq(1000, consumer.TopicMetadataCheckIntervalMillis, "a negative value is clamped to 1s too");
         consumer.SetTopicMetadataCheckIntervalMillis(5000);
-        Eq(5000, consumer.TopicMetadataCheckIntervalMillis, "合法值原样保留");
+        Eq(5000, consumer.TopicMetadataCheckIntervalMillis, "a legal value is kept as is");
     }
 
-    // ---------------------------------------------- 2. 未启动注册：首轮一定回调一次
+    // ---------------------------------------------- 2. Registering while not started: the first round always fires once
 
     [Fact]
     public void RegisterBeforeStart_HasNoSnapshot_FirstRoundFiresOnce()
@@ -153,21 +168,21 @@ public class LiteTopicQueueChangeTests
         consumer.Subscribe(Topic, "*");
         var rec = new Recorder();
         consumer.RegisterTopicMessageQueueChangeListener(Topic, rec);
-        Eq(0, rec.Count, "未启动时注册不该立刻回调");
+        Eq(0, rec.Count, "registering while not started must not fire immediately");
 
         consumer.Start();
-        Eq(1, consumer.FetchTopicMessageQueuesAndCompare(), "没有快照 ⇒ 首轮必须回调一次");
+        Eq(1, consumer.FetchTopicMessageQueuesAndCompare(), "no snapshot => the first round must fire once");
         List<(string Topic, List<int> QueueIds)> events = rec.Events();
-        Eq(1, events.Count, "回调一次");
+        Eq(1, events.Count, "fired once");
         Assert.Equal(new[] { 0, 1 }, events[0].QueueIds.ToArray());
         Assert.Equal(Topic, events[0].Topic);
 
-        Eq(0, consumer.FetchTopicMessageQueuesAndCompare(), "队列没动就不该再打扰");
-        Eq(1, rec.Count, "第二轮没有新回调");
+        Eq(0, consumer.FetchTopicMessageQueuesAndCompare(), "the queues did not move so it must not pester again");
+        Eq(1, rec.Count, "no new callback in the second round");
         consumer.Shutdown();
     }
 
-    // ------------------------------------ 3. 运行中注册：快照吃掉"当下这套队列"
+    // ------------------------------------ 3. Registering while running: the snapshot absorbs "the queues as they are right now"
 
     [Fact]
     public void RegisterWhileRunning_SnapshotsAndReportsOnlyRealChanges()
@@ -177,23 +192,23 @@ public class LiteTopicQueueChangeTests
         var rec = new Recorder();
         consumer.RegisterTopicMessageQueueChangeListener(Topic, rec);
 
-        Eq(0, consumer.FetchTopicMessageQueuesAndCompare(), "运行中注册已有快照 ⇒ 首轮不回调");
-        Eq(0, rec.Count, "不该把当下队列当成变化");
+        Eq(0, consumer.FetchTopicMessageQueuesAndCompare(), "registering while running already has a snapshot => the first round does not fire");
+        Eq(0, rec.Count, "the current queues must not be treated as a change");
 
         f.Scale(4);
-        Eq(1, consumer.FetchTopicMessageQueuesAndCompare(), "扩容回调一次");
+        Eq(1, consumer.FetchTopicMessageQueuesAndCompare(), "a scale-up fires once");
         Assert.Equal(new[] { 0, 1, 2, 3 }, rec.Events()[0].QueueIds.ToArray());
 
-        Eq(0, consumer.FetchTopicMessageQueuesAndCompare(), "同一集合不重复回调");
-        Eq(1, rec.Count, "仍然只有一条");
+        Eq(0, consumer.FetchTopicMessageQueuesAndCompare(), "an identical set does not fire again");
+        Eq(1, rec.Count, "still only one");
 
         f.Scale(1);
-        Eq(1, consumer.FetchTopicMessageQueuesAndCompare(), "缩容同样要回调");
+        Eq(1, consumer.FetchTopicMessageQueuesAndCompare(), "a scale-down must fire as well");
         Assert.Equal(new[] { 0 }, rec.Events()[1].QueueIds.ToArray());
         consumer.Shutdown();
     }
 
-    // ------------------------------------------- 4. 重复注册覆盖旧监听器
+    // ------------------------------------------- 4. Re-registering overwrites the old listener
 
     [Fact]
     public void ReRegisterOverwritesTheOldListener()
@@ -206,13 +221,13 @@ public class LiteTopicQueueChangeTests
         consumer.RegisterTopicMessageQueueChangeListener(Topic, second);
 
         f.Scale(3);
-        Eq(1, consumer.FetchTopicMessageQueuesAndCompare(), "覆盖后只剩一个监听器要回调");
-        Eq(1, second.Count, "新监听器收到回调");
-        Eq(0, first.Count, "旧监听器不再被通知");
+        Eq(1, consumer.FetchTopicMessageQueuesAndCompare(), "after overwriting only one listener is left to fire");
+        Eq(1, second.Count, "the new listener got the callback");
+        Eq(0, first.Count, "the old listener is no longer notified");
         consumer.Shutdown();
     }
 
-    // ------------------------------- 5. 一个 topic 查不到队列不打断本轮其余 topic
+    // ------------------------------- 5. One topic with no queues does not interrupt the rest of the round
 
     [Fact]
     public void UnroutableTopic_DoesNotAbortTheRound()
@@ -225,13 +240,13 @@ public class LiteTopicQueueChangeTests
         consumer.RegisterTopicMessageQueueChangeListener(Topic, healthy);
 
         f.Scale(3);
-        Eq(1, consumer.FetchTopicMessageQueuesAndCompare(), "坏 topic 不能带走整轮");
-        Eq(0, ghost.Count, "查不到队列的 topic 不回调（也不能回调一个空集）");
+        Eq(1, consumer.FetchTopicMessageQueuesAndCompare(), "a bad topic must not take the whole round down");
+        Eq(0, ghost.Count, "a topic whose queues cannot be found does not fire (nor does it fire with an empty set)");
         Assert.Equal(new[] { 0, 1, 2 }, healthy.Events()[0].QueueIds.ToArray());
         consumer.Shutdown();
     }
 
-    // ------------------------ 6. 每轮现问 nameserver：不读 30s 轮询的缓存，也不二次套前缀
+    // ------------------------ 6. Asking the nameserver afresh each round: no reading of the 30s poll cache, and no second prefix
 
     [Fact]
     public void EachRoundRequeriesTheNameServer_WithTheFullTopicName()
@@ -246,7 +261,7 @@ public class LiteTopicQueueChangeTests
         consumer.FetchTopicMessageQueuesAndCompare();
         int afterSecond = f.Cluster.CountRequests(RequestCode.GetRouteinfoByTopic);
         Assert.True(afterSecond > afterFirst,
-            "每轮都要现查路由，否则扩容要等满一次路由轮询才看得见");
+            "the route must be queried afresh each round, otherwise a scale-up only becomes visible after a full route poll interval");
 
         consumer.Shutdown();
     }
@@ -262,10 +277,10 @@ public class LiteTopicQueueChangeTests
         f.Scale(3);
         consumer.FetchTopicMessageQueuesAndCompare();
         List<(string Topic, List<int> QueueIds)> events = rec.Events();
-        Eq(1, events.Count, "配了命名空间也要回调");
+        Eq(1, events.Count, "it must fire even with a namespace configured");
         Assert.Equal("ns1%" + Topic, events[0].Topic);
 
-        // 表里的键已是全名，取队列时不能被再套一次（ns1%ns1%Topic 是查不到的路由）。
+        // The key in the table is already the full name; fetching the queues must not wrap it again (ns1%ns1%Topic is a route that cannot be found).
         Assert.DoesNotContain(f.Cluster.Records()
             .Where(r => r.Code == RequestCode.GetRouteinfoByTopic)
             .Select(r => r.Ext.TryGetValue("topic", out string? t) ? t : ""),
@@ -273,7 +288,7 @@ public class LiteTopicQueueChangeTests
         consumer.Shutdown();
     }
 
-    // ------------------------------------- 7. 后台线程按周期真的在比对
+    // ------------------------------------- 7. The background thread really compares on the interval
 
     [Fact]
     public void MetadataLoop_ActuallyComparesOnItsPeriod()
@@ -284,7 +299,7 @@ public class LiteTopicQueueChangeTests
         consumer.RegisterTopicMessageQueueChangeListener(Topic, rec);
         f.Scale(3);
 
-        // 首查延迟用参数缩短（默认仍是 10s），周期给 50ms。
+        // The first-lookup delay is shortened via the parameter (10s by default), the interval is 50ms.
         var loop = new Thread(() => consumer.MetadataLoop(20, 50))
         {
             IsBackground = true,
@@ -297,7 +312,7 @@ public class LiteTopicQueueChangeTests
         }
 
         loop.Join(2000);
-        Assert.True(rec.Count >= 1, "后台循环没有在比对队列集合");
+        Assert.True(rec.Count >= 1, "the background loop is not comparing the queue sets");
         Assert.Equal(new[] { 0, 1, 2 }, rec.Events()[0].QueueIds.ToArray());
         consumer.Shutdown();
     }

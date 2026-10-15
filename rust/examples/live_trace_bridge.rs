@@ -1,28 +1,28 @@
-//! 轨迹 dispatcher **自动桥接**对真实 5.5.1 broker 的联调验证。
+//! Integration verification of the trace dispatcher **auto-bridging** against a real 5.5.1 broker.
 //!
-//! 与 `live_rebalance_and_trace.rs`（R3：手工构造 TraceContext + 手工挂钩子）和
-//! `live_producer.rs`（P4：调用方注入 dispatcher）互补：这里验证的是
-//! **`enable_trace=true` 且什么都不注入**时 —— 生产者 / 消费者的 `start()` 自动建
-//! `AsyncTraceDispatcher`（含真实内部生产者，组名 `_INNER_TRACE_PRODUCER-...`）、
-//! 自动挂轨迹钩子、自动 start —— 轨迹记录真的落到 `RMQ_SYS_TRACE_TOPIC`
-//! 并能被读回来解码。此前这条路径默认 `DisabledTraceProducer`，轨迹完全发不出去。
+//! Complementary to `live_rebalance_and_trace.rs` (R3: hand-built TraceContext + manually attached hooks) and
+//! `live_producer.rs` (P4: caller-injected dispatcher): what is verified here is that when
+//! **`enable_trace=true` and nothing is injected**, the producer's / consumer's `start()` automatically builds
+//! an `AsyncTraceDispatcher` (with a real inner producer, group name `_INNER_TRACE_PRODUCER-...`),
+//! attaches the trace hooks and starts it automatically, so trace records really land on `RMQ_SYS_TRACE_TOPIC`
+//! and can be read back and decoded. Previously this path defaulted to `DisabledTraceProducer` and traces could not be sent at all.
 //!
-//! 场景：
-//! - B1 自动桥接的形状：`start()` 后 `trace_dispatcher()` 是 Some，且指向系统轨迹
-//!   topic；关闭 trace 的对照生产者 `trace_dispatcher()` 仍是 None。
-//! - B2 生产侧端到端：trace 生产者发 3 条，trace reader（订阅 RMQ_SYS_TRACE_TOPIC
-//!   的独立 push consumer）读到含这 3 个 msgId 的轨迹文本，解码出 3 条 Pub
-//!   （success、msgId 命中）。
-//! - B3 消费侧端到端：trace 消费者把这 3 条消费掉，轨迹里出现 ≥3 条 SubBefore +
-//!   ≥3 条 SubAfter，组名都是业务消费组，SubBefore↔SubAfter 按 requestId 配对。
-//! - B4 对照：`enable_trace=false` 的生产者发的 2 条**没有** Pub 记录（它们的
-//!   msgId 不出现在轨迹文本里）—— 证明轨迹确实来自自动桥接，不是别的通道。
-//! - 清理：删业务 topic（RMQ_SYS_TRACE_TOPIC 是系统 topic，保留）。
+//! Scenarios:
+//! - B1 the shape of the auto-bridging: after `start()`, `trace_dispatcher()` is Some and points at the system
+//!   trace topic; the trace-off control producer's `trace_dispatcher()` stays None.
+//! - B2 producer-side end to end: the trace producer sends 3 messages; the trace reader (an independent push consumer
+//!   subscribed to RMQ_SYS_TRACE_TOPIC) reads trace text containing these 3 msgIds and decodes 3 Pub entries
+//!   (success, msgId hit).
+//! - B3 consumer-side end to end: the trace consumer consumes these 3 messages; the traces show ≥3 SubBefore +
+//!   ≥3 SubAfter entries, all carrying the business consumer group, with SubBefore↔SubAfter paired by requestId.
+//! - B4 control: the 2 messages sent by the `enable_trace=false` producer have **no** Pub records (their
+//!   msgIds do not appear in the trace text) -- proving the traces really come from the auto-bridging, not another channel.
+//! - Cleanup: delete the business topic (RMQ_SYS_TRACE_TOPIC is a system topic, kept).
 //!
-//! 前置：broker 配置 `traceTopicEnable=true`（否则 RMQ_SYS_TRACE_TOPIC 不预建，
-//! 系统 topic 也无法经 admin 创建）。
+//! Precondition: broker configured with `traceTopicEnable=true` (otherwise RMQ_SYS_TRACE_TOPIC is not pre-created,
+//! and system topics cannot be created via admin either).
 //!
-//! 用法：
+//! Usage:
 //! ```text
 //! cargo run --example live_trace_bridge -- 127.0.0.1:9876
 //! ```
@@ -76,7 +76,7 @@ impl Inbox {
     }
 }
 
-/// 业务消息 listener：全部认成功。
+/// Business message listener: acknowledges everything as success.
 struct BizListener;
 
 impl MessageListenerConcurrently for BizListener {
@@ -89,7 +89,7 @@ impl MessageListenerConcurrently for BizListener {
     }
 }
 
-/// trace topic reader：把每条轨迹消息的 body 文本原样收进 Inbox。
+/// Trace topic reader: collects each trace message's body text verbatim into the Inbox.
 struct TraceReaderListener {
     inbox: Arc<Inbox>,
 }
@@ -143,7 +143,7 @@ async fn main() -> ExitCode {
         };
     }
 
-    // ---------- B1 自动桥接的形状 ----------
+    // ---------- B1 the shape of the auto-bridging ----------
     let producer = DefaultMQProducer::with_config(ProducerConfig {
         producer_group: format!("GID_trace_bridge_producer_{stamp}"),
         name_server_addrs: vec![namesrv.clone()],
@@ -156,13 +156,13 @@ async fn main() -> ExitCode {
     producer.create_topic(&topic, 1, 0).await.unwrap();
 
     let bridged = producer.trace_dispatcher();
-    check!("B1 enable_trace 生产者 start 后自动带 dispatcher", bridged.is_some());
+    check!("B1 enable_trace producer automatically carries a dispatcher after start", bridged.is_some());
     let inner_topic = bridged
         .as_ref()
         .map(|d| d.trace_topic_name())
         .unwrap_or_default();
     check!(
-        "B1 内部 dispatcher 指向系统轨迹 topic",
+        "B1 the inner dispatcher points at the system trace topic",
         inner_topic == MixAll::TRACE_TOPIC,
         "trace_topic={inner_topic}"
     );
@@ -177,13 +177,13 @@ async fn main() -> ExitCode {
     .unwrap();
     notrace.start().await.unwrap();
     check!(
-        "B1 enable_trace=false 的生产者仍无 dispatcher",
+        "B1 the enable_trace=false producer still has no dispatcher",
         notrace.trace_dispatcher().is_none()
     );
 
-    // ---------- B2/B4 生产 ----------
-    // create_topic 写 broker 成功后，broker 还要把路由注册到 namesrv（周期可达 30s），
-    // 期间发送按 10005 客户端错误重试等路由。
+    // ---------- B2/B4 produce ----------
+    // After create_topic succeeds on the broker, the broker still has to register the route with the namesrv (period up to 30s);
+    // meanwhile sends retry on the 10005 client error while waiting for the route.
     let mut traced_ids = Vec::new();
     for i in 0..3 {
         let body = format!("trace-bridge-{stamp}-{i}");
@@ -206,8 +206,8 @@ async fn main() -> ExitCode {
                 }
             }
         }
-        let sr = sr.unwrap_or_else(|| panic!("等 60s 仍发不出去, last_err={last_err}"));
-        check!("B2 消息 SEND_OK", sr.status == SendStatus::SendOk, "i={i}");
+        let sr = sr.unwrap_or_else(|| panic!("still unsent after waiting 60s, last_err={last_err}"));
+        check!("B2 message SEND_OK", sr.status == SendStatus::SendOk, "i={i}");
         traced_ids.push(sr.msg_id.unwrap_or_default());
     }
 
@@ -220,7 +220,7 @@ async fn main() -> ExitCode {
         untraced_ids.push(sr.msg_id.unwrap_or_default());
     }
 
-    // ---------- 消费者（业务 + trace reader）----------
+    // ---------- Consumers (business + trace reader) ----------
     let biz = DefaultMQPushConsumer::with_config(ConsumerConfig {
         consumer_group: biz_group.clone(),
         name_server_addrs: vec![namesrv.clone()],
@@ -234,7 +234,7 @@ async fn main() -> ExitCode {
     biz.set_message_listener_concurrently(Arc::new(BizListener));
     biz.start().await.unwrap();
     check!(
-        "B3 enable_trace 消费者 start 后自动带 dispatcher",
+        "B3 enable_trace consumer automatically carries a dispatcher after start",
         biz.trace_dispatcher().is_some()
     );
 
@@ -256,18 +256,18 @@ async fn main() -> ExitCode {
     }));
     reader.start().await.unwrap();
 
-    // 等 reader 拉到含全部 3 个 msgId 的轨迹（flush 周期 5s + reader 首轮 rebalance）
+    // Wait for the reader to pull traces containing all 3 msgIds (flush period 5s + the reader's first rebalance round)
     let deadline = Instant::now() + Duration::from_secs(120);
     let got_all = reader_inbox.wait_for(deadline, |texts| {
         let corpus = texts.join("");
         traced_ids.iter().all(|id| !id.is_empty() && corpus.contains(id))
     });
     check!(
-        "B2 轨迹文本含全部 3 个业务 msgId（生产侧轨迹真的离开进程落到 broker）",
+        "B2 the trace text contains all 3 business msgIds (producer-side traces really leave the process and land on the broker)",
         got_all
     );
 
-    // 解码核对 Pub / SubBefore / SubAfter
+    // Decode and verify Pub / SubBefore / SubAfter
     let texts = reader_inbox.items.lock().unwrap().clone();
     let corpus = texts.join("");
     let mut pub_hits = 0usize;
@@ -306,24 +306,24 @@ async fn main() -> ExitCode {
         .filter(|id| after_ids.contains(id))
         .count();
     check!(
-        "B2 解码出 3 条 Pub 且 success",
+        "B2 decodes 3 Pub entries, all success",
         pub_hits == 3 && pub_ok == 3,
         "pub_hits={pub_hits} pub_ok={pub_ok}"
     );
     check!(
-        "B3 SubBefore/SubAfter 各 ≥3 条且 requestId 配对",
+        "B3 SubBefore/SubAfter ≥3 each and requestId-paired",
         sub_before >= 3 && sub_after >= 3 && paired >= 3,
         "before={sub_before} after={sub_after} paired={paired}"
     );
 
     check!(
-        "B4 对照：enable_trace=false 的消息没有 Pub 记录",
+        "B4 control: the enable_trace=false messages have no Pub records",
         untraced_ids
             .iter()
             .all(|id| id.is_empty() || !corpus.contains(id))
     );
 
-    // ---------- 清理 ----------
+    // ---------- Cleanup ----------
     let admin = DefaultMQAdminExt::with_config(AdminConfig {
         instance_name: format!("ADMIN-trace-bridge-{stamp}"),
         name_server_addrs: vec![namesrv.clone()],

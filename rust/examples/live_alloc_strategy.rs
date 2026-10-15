@@ -1,9 +1,9 @@
-//! ⚠ A2 依赖「订阅在首个心跳前就已注册 broker」：lite 的心跳只发给实例路由表里
-//! 已知的 broker，所以 `start()` 会先把订阅 topic 的路由拉进来（见
-//! `pull_consumer.rs` 的 `refresh_route_for_heartbeat`）。少了那一步，同组对端要等
-//! 一个心跳周期（5s）才互相看得见，首轮 rebalance 会各自独占全部队列。
+//! ⚠ A2 depends on "the subscription already being registered on the broker before the first heartbeat": the lite heartbeat only
+//! goes to brokers known to the instance's route table, so `start()` first pulls in the route of the subscribed topic
+//! (see `refresh_route_for_heartbeat` in `pull_consumer.rs`). Without that step the same-group peers would wait a
+//! full heartbeat period (5s) to see each other, and the first rebalance would hand each side all queues.
 //!
-//! 用法（先按项目记忆里记的 runbook 起本地集群）：
+//! Usage (start the local cluster first, per the runbook recorded in the project knowledge):
 //! ```text
 //! cargo run --example live_alloc_strategy -- 127.0.0.1:9876
 //! ```
@@ -32,10 +32,10 @@ use rocketmq_client_remoting::remoting::protocol::route::TopicRouteData;
 
 const QUEUE_NUMS: i32 = 4;
 const N_MSG: usize = 12;
-/// 等分配收敛的最长秒数。两边要各跑一轮心跳（5s）+ 一轮重平衡（20s），留足一倍余量。
+/// Max seconds to wait for allocation convergence. Each side needs one heartbeat round (5s) + one rebalance round (20s), with a full margin to spare.
 const WAIT_SECONDS: u64 = 45;
 
-// ------------------------------------------------------------------ 骨架
+// ------------------------------------------------------------------ skeleton
 
 fn stamp() -> String {
     let ms = SystemTime::now()
@@ -67,7 +67,7 @@ impl Checker {
     }
 
     fn abort(&mut self, name: &str, detail: &str) {
-        self.failed.push(format!("{name}（前置失败）: {detail}"));
+        self.failed.push(format!("{name} (prerequisite failed): {detail}"));
         println!("  [ABORT] {name}: {detail}");
     }
 }
@@ -83,7 +83,7 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// 队列 key 集合（`brokerName#queueId`），分配结果按它比对。
+/// Set of queue keys (`brokerName#queueId`); allocation results are compared by it.
 fn queue_keys(mqs: &[MessageQueue]) -> BTreeSet<String> {
     mqs.iter()
         .map(|mq| format!("{}#{}", mq.get_broker_name(), mq.get_queue_id()))
@@ -100,7 +100,7 @@ fn bodies(msgs: &[MessageExt]) -> BTreeSet<String> {
         .collect()
 }
 
-/// 只统计来自 `on_queues`（`brokerName#queueId` 集合）那部分消息的 body。
+/// Counts only the bodies of messages that came from `on_queues` (a set of `brokerName#queueId`).
 fn bodies_on(msgs: &[MessageExt], on_queues: &BTreeSet<String>) -> BTreeSet<String> {
     msgs.iter()
         .filter(|m| {
@@ -110,7 +110,7 @@ fn bodies_on(msgs: &[MessageExt], on_queues: &BTreeSet<String>) -> BTreeSet<Stri
         .collect()
 }
 
-/// 按**时间**排空缓冲：策略只分到部分队列时收条数未知，不能按条数等。
+/// Drains the buffer by **time**: when a strategy owns only part of the queues the received count is unknown, so waiting by count is impossible.
 async fn drain_for(c: &DefaultLitePullConsumer, secs: u64) -> Vec<MessageExt> {
     let mut got = Vec::new();
     let deadline = now_ms() + (secs as i64) * 1000;
@@ -129,7 +129,7 @@ fn sorted_queues(mut mqs: Vec<MessageQueue>) -> Vec<MessageQueue> {
     mqs
 }
 
-/// 等两个实例把队列**分完**（分配收敛要两边各跑一轮心跳 + rebalance）。
+/// Waits until both instances have **split up all** queues (allocation convergence needs one heartbeat + rebalance round on each side).
 async fn wait_split_assignment(
     a: &DefaultLitePullConsumer,
     b: &DefaultLitePullConsumer,
@@ -154,7 +154,7 @@ async fn wait_split_assignment(
     }
 }
 
-/// 等首轮重平衡把队列分下来（lite 的 `start()` 不同步重平衡，由后台循环触发）。
+/// Waits for the first rebalance to hand out queues (the lite `start()` does not rebalance synchronously; a background loop triggers it).
 async fn wait_assignment(c: &DefaultLitePullConsumer, secs: u64) -> Vec<MessageQueue> {
     let deadline = now_ms() + (secs as i64) * 1000;
     loop {
@@ -166,7 +166,7 @@ async fn wait_assignment(c: &DefaultLitePullConsumer, secs: u64) -> Vec<MessageQ
     }
 }
 
-// ------------------------------------------------------------------ 夹具
+// ------------------------------------------------------------------ fixture
 
 struct Fixture {
     namesrv: String,
@@ -226,7 +226,7 @@ impl Fixture {
         format!("rust-live-alloc-{kind}-{}", self.stamp)
     }
 
-    /// 显式建 topic（不靠 `autoCreateTopicEnable`，队列数才确定）。
+    /// Creates the topic explicitly (not relying on `autoCreateTopicEnable`, so the queue count is deterministic).
     async fn create_topic(&self, topic: &str, queues: i32) -> Result<(), String> {
         self.admin
             .create_topic_in_broker(
@@ -249,7 +249,7 @@ impl Fixture {
         Ok(())
     }
 
-    /// 按组名 + 实例名建 lite 消费者（未订阅、未 start）。
+    /// Builds a lite consumer from group name + instance name (not subscribed, not started).
     fn consumer(&self, group_kind: &str, instance: &str) -> Result<DefaultLitePullConsumer, String> {
         let cfg = LitePullConsumerConfig {
             consumer_group: self.group_name(group_kind),
@@ -261,7 +261,7 @@ impl Fixture {
         DefaultLitePullConsumer::with_config(cfg).map_err(|e| format!("{instance} build failed: {e}"))
     }
 
-    /// 交替发 TagA/TagB（偶数下标 TagA），body = `<topic>-<i:02>`。
+    /// Sends TagA/TagB alternately (even indices TagA), body = `<topic>-<i:02>`.
     async fn produce_alternating(&self, topic: &str) -> usize {
         let mut ok = 0;
         for i in 0..N_MSG {
@@ -289,7 +289,7 @@ impl Fixture {
             }
         }
         ck.check(
-            "A9 删除本次建的 topic",
+            "A9 delete the topics created by this run",
             failed.is_empty(),
             &format!("{failed:?}"),
         );
@@ -307,7 +307,7 @@ fn broker_of(route: &TopicRouteData) -> Result<(String, String), String> {
     Ok((bd.broker_name.clone(), addr))
 }
 
-/// 业务 topic 的全部队列（走运维实例的路由，不依赖消费者）。
+/// All queues of the business topic (via the admin instance's route, not depending on the consumers).
 async fn route_queues(fx: &Fixture, topic: &str) -> Vec<MessageQueue> {
     fx.admin
         .get_topic_publish_info(topic, false)
@@ -320,9 +320,9 @@ fn expected_bodies(topic: &str) -> BTreeSet<String> {
     (0..N_MSG).map(|i| format!("{topic}-{i:02}")).collect()
 }
 
-// ------------------------------------------------------------------ 共用骨架
+// ------------------------------------------------------------------ shared skeleton
 
-/// 造同组两实例、各装一个策略并订阅（未 start）。
+/// Builds two instances of the same group, each with a strategy installed, and subscribes them (not started).
 fn pair_with_strategy(
     fx: &Fixture,
     kind: &str,
@@ -333,20 +333,20 @@ fn pair_with_strategy(
     let cb = fx.consumer(kind, &format!("{kind}-b"))?;
     for (c, strategy) in [(&ca, &strategies[0]), (&cb, &strategies[1])] {
         c.set_allocate_message_queue_strategy(strategy.clone());
-        // 存量消息在 A0 就发完了，新组默认 LAST 会跳过它们 → 收不到任何一条。
-        // 这里要验的是「策略真的驱动了收发」，所以从队首起消费。
+        // The pre-existing messages were all sent during A0; a new group defaulting to LAST would skip them → nothing received.
+        // What is verified here is "the strategy really drives send/receive", so consumption starts from the queue head.
         c.set_consume_from_where(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
         c.subscribe(topic, "*");
     }
     Ok((ca, cb))
 }
 
-/// 用**真实**输入（路由给的 mqAll + cid_members 的真实 clientId 当 cidAll）离线跑策略，
-/// 并**等线上 `assignment()` 收敛到这份预测**。
+/// Runs the strategy offline with **real** inputs (mqAll from the route + the real clientIds of cid_members as cidAll),
+/// and **waits for the live `assignment()` to converge to that prediction**.
 ///
-/// 为什么以预测为收敛条件，而不是「先等不重不漏、再比预测」：哈希环完全可能把 4 个
-/// 队列全分给一个实例，另一边在首轮重平衡之前 `assignment()` 本来就是空 —— 那种初始态
-/// 同样满足「不重不漏」，比出来的其实是「一边还没算」的快照。（第一版就在这里翻车。）
+/// Why measure convergence against the prediction instead of "first wait for no overlap/no gap, then compare the
+/// prediction": the hash ring can easily give all 4 queues to one instance, and the other side's `assignment()` is
+/// empty by design before the first rebalance -- that initial state also satisfies "no overlap no gap", so the comparison would really be a snapshot of "one side has not computed yet". (The first version tripped exactly here.)
 async fn wait_until_prediction_converged(
     group: &str,
     all: &[MessageQueue],
@@ -361,7 +361,7 @@ async fn wait_until_prediction_converged(
     for (c, strategy) in asserted.iter().zip(strategies) {
         match strategy.allocate(group, &c.client_id(), all, &cid_all) {
             Ok(v) => expected.push(queue_keys(&v)),
-            Err(e) => return (false, format!("离线预测失败: {e}")),
+            Err(e) => return (false, format!("offline prediction failed: {e}")),
         }
     }
     let deadline = now_ms() + (secs as i64) * 1000;
@@ -389,11 +389,11 @@ async fn wait_until_prediction_converged(
     }
 }
 
-/// NEARBY 的落点：真实集群只有一个 broker，把队列和客户端都记成同一个机房，
-/// 于是 NEARBY 必定走「自己机房」那条分支、等价于内层策略。
+/// Where NEARBY lands: the real cluster has a single broker, so queues and clients are all recorded in the same
+/// machine room; NEARBY then always takes the "own machine room" branch, equivalent to the inner strategy.
 ///
-/// 同时留调用记录 —— 用来证明 rebalance 真的逐个问过队列和客户端的机房，
-/// 而不是策略对象换了个名字却没参与分配。
+/// It also keeps a call log -- proving that rebalance really asked the machine room of each queue and each client
+/// in turn, rather than the strategy object being renamed without participating in the allocation.
 const ROOM: &str = "room1";
 
 struct OneRoom {
@@ -422,18 +422,18 @@ impl MachineRoomResolver for OneRoom {
     }
 }
 
-// ------------------------------------------------------------------ A1 配置面
+// ------------------------------------------------------------------ A1 config surface
 
 async fn a1_default_strategy(ck: &mut Checker, fx: &Fixture) {
     let c = match fx.consumer("probe", "probe") {
         Ok(c) => c,
         Err(e) => {
-            ck.abort("A1 构造", &e);
+            ck.abort("A1 build", &e);
             return;
         }
     };
     ck.check(
-        "A1 默认策略名 = AVG（字段初值）",
+        "A1 default strategy name = AVG (field initial value)",
         c.allocate_message_queue_strategy().get_name() == "AVG",
         c.allocate_message_queue_strategy().get_name(),
     );
@@ -441,13 +441,13 @@ async fn a1_default_strategy(ck: &mut Checker, fx: &Fixture) {
         std::sync::Arc::new(AllocateMessageQueueAveragelyByCircle);
     c.set_allocate_message_queue_strategy(circle);
     ck.check(
-        "A1 setter 换掉的策略能读回 AVG_BY_CIRCLE",
+        "A1 the strategy swapped in by the setter reads back AVG_BY_CIRCLE",
         c.allocate_message_queue_strategy().get_name() == "AVG_BY_CIRCLE",
         c.allocate_message_queue_strategy().get_name(),
     );
 }
 
-// ------------------------------------------------------------------ A2 同组交叉切分
+// ------------------------------------------------------------------ A2 same-group circle split
 
 async fn a2_circle_split(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[MessageQueue]) {
     let (ca, cb) = match (
@@ -457,7 +457,7 @@ async fn a2_circle_split(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[Mes
         (Ok(a), Ok(b)) => (a, b),
         (a, b) => {
             let e = a.err().or_else(|| b.err());
-            ck.abort("A2 构造", &e.unwrap_or_else(|| "unknown".to_string()));
+            ck.abort("A2 build", &e.unwrap_or_else(|| "unknown".to_string()));
             return;
         }
     };
@@ -465,8 +465,8 @@ async fn a2_circle_split(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[Mes
         std::sync::Arc::new(AllocateMessageQueueAveragelyByCircle);
     for c in [&ca, &cb] {
         c.set_allocate_message_queue_strategy(circle.clone());
-        // 存量消息在 A0 就发完了，新组默认 LAST 会跳过它们 → 收不到任何一条。
-        // 这里要验的是「交叉切分真的驱动了收发」，所以从队首起消费。
+        // The pre-existing messages were all sent during A0; a new group defaulting to LAST would skip them → nothing received.
+        // What is verified here is "the circle split really drives send/receive", so consumption starts from the queue head.
         c.set_consume_from_where(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
         c.subscribe(topic, "*");
     }
@@ -485,17 +485,17 @@ async fn a2_circle_split(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[Mes
     let overlap: BTreeSet<String> = ka.intersection(&kb).cloned().collect();
     let union: BTreeSet<String> = ka.union(&kb).cloned().collect();
     ck.check(
-        "A2 两实例分配无交集（broker 认到两个 clientId）",
+        "A2 the two instances' allocations do not overlap (the broker sees two clientIds)",
         overlap.is_empty(),
         &format!("overlap=[{}]", key_set_text(&overlap)),
     );
     ck.check(
-        &format!("A2 并集覆盖全部 {} 个队列", all.len()),
+        &format!("A2 union covers all {} queues", all.len()),
         union == queue_keys(all),
         &format!("a={} b={}", ka.len(), kb.len()),
     );
-    // 环形分配的签名：拿到的是「按下标取模」的交叉队列而非连续段
-    // （4 队列 / 2 实例 → 各 2 条且下标步长为 2；AVG 会给连续两段）。
+    // Signature of circle allocation: what each side gets is the "index modulo" alternating
+    // queues, not contiguous segments (4 queues / 2 instances → 2 each with index stride 2; AVG would give two contiguous segments).
     let pos_a: Vec<usize> = all
         .iter()
         .enumerate()
@@ -507,11 +507,11 @@ async fn a2_circle_split(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[Mes
             .windows(2)
             .all(|w| (w[1] - w[0]) % 2 == 0);
     ck.check(
-        "A2 分配形状是交叉（步长 2），不是 AVG 的连续段",
+        "A2 allocation shape is alternating (stride 2), not AVG's contiguous segments",
         all.len() != 4 || circle_shape,
         &format!("posA={pos_a:?}"),
     );
-    // 交叉切分后两边各自收自己那半边，合起来覆盖全部 12 条。
+    // After the circle split each side receives its own half; together they cover all 12 messages.
     let ga = drain_for(&ca, 8).await;
     let gb = drain_for(&cb, 8).await;
     let ba = bodies(&ga);
@@ -519,10 +519,10 @@ async fn a2_circle_split(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[Mes
     let joined: BTreeSet<String> = ba.union(&bb).cloned().collect();
     let shared: BTreeSet<String> = ba.intersection(&bb).cloned().collect();
     ck.check(
-        &format!("A2 两实例合起来收到全部 {N_MSG} 条"),
+        &format!("A2 the two instances together receive all {N_MSG} messages"),
         joined == expected_bodies(topic) && !ba.is_empty() && !bb.is_empty(),
         &format!(
-            "a={} b={} union={} 撤队前抢到的重叠={}",
+            "a={} b={} union={} overlap grabbed before queue revocation={}",
             ba.len(),
             bb.len(),
             joined.len(),
@@ -533,7 +533,7 @@ async fn a2_circle_split(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[Mes
     cb.shutdown();
 }
 
-// ------------------------------------------------------------------ A3 CONFIG 驱动收发
+// ------------------------------------------------------------------ A3 CONFIG-driven send/receive
 
 async fn a3_config_halves(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[MessageQueue]) {
     let half = all.len() / 2;
@@ -545,7 +545,7 @@ async fn a3_config_halves(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[Me
         (Ok(a), Ok(b)) => (a, b),
         (a, b) => {
             let e = a.err().or_else(|| b.err());
-            ck.abort("A3 构造", &e.unwrap_or_else(|| "unknown".to_string()));
+            ck.abort("A3 build", &e.unwrap_or_else(|| "unknown".to_string()));
             return;
         }
     };
@@ -567,7 +567,7 @@ async fn a3_config_halves(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[Me
     let a_assigned = wait_assignment(&ca, WAIT_SECONDS).await;
     let b_assigned = wait_assignment(&cb, WAIT_SECONDS).await;
     ck.check(
-        "A3 CONFIG 只给配置进去的队列（无视 mqAll/cidAll）",
+        "A3 CONFIG hands out only the configured queues (ignoring mqAll/cidAll)",
         queue_keys(&a_assigned) == queue_keys(&half_a)
             && queue_keys(&b_assigned) == queue_keys(&half_b),
         &format!(
@@ -585,7 +585,7 @@ async fn a3_config_halves(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[Me
     let on_a = bodies_on(&ga, &keys_a);
     let on_b = bodies_on(&gb, &keys_b);
     ck.check(
-        "A3 CONFIG 消费者只收到自己配置队列里的消息",
+        "A3 CONFIG consumer receives only messages from its configured queues",
         all_a == on_a && all_b == on_b,
         &format!(
             "a={} aOnCfg={} b={} bOnCfg={}",
@@ -598,7 +598,7 @@ async fn a3_config_halves(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[Me
     let union: BTreeSet<String> = all_a.union(&all_b).cloned().collect();
     let inter: BTreeSet<String> = all_a.intersection(&all_b).cloned().collect();
     ck.check(
-        &format!("A3 两半合起来恰好覆盖全部 {N_MSG} 条且互不重叠"),
+        &format!("A3 the two halves together cover exactly all {N_MSG} messages with no overlap"),
         union == expected_bodies(topic) && inter.is_empty(),
         &format!("union={} inter={}", union.len(), inter.len()),
     );
@@ -606,7 +606,7 @@ async fn a3_config_halves(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[Me
     cb.shutdown();
 }
 
-// ------------------------------------------------------------------ A4 一致性哈希环
+// ------------------------------------------------------------------ A4 consistent hash ring
 
 async fn a4_consistent_hash(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[MessageQueue]) {
     let ch = std::sync::Arc::new(AllocateMessageQueueConsistentHash::new());
@@ -615,13 +615,13 @@ async fn a4_consistent_hash(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[
     {
         Ok(p) => p,
         Err(e) => {
-            ck.abort("A4 构造", &e);
+            ck.abort("A4 build", &e);
             return;
         }
     };
     let got = ca.allocate_message_queue_strategy();
     ck.check(
-        "A4 替换后策略名 = CONSISTENT_HASH",
+        "A4 strategy name after replacement = CONSISTENT_HASH",
         got.get_name() == "CONSISTENT_HASH",
         got.get_name(),
     );
@@ -634,7 +634,7 @@ async fn a4_consistent_hash(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[
         ck.abort("A4 cb start", &e.to_string());
         return;
     }
-    // 以「线上分配 == 真实输入下的离线预测」为收敛条件（详见 helper 的注释）。
+    // Convergence condition: "live allocation == offline prediction under the real inputs" (see the helper's comment).
     let (matched, detail) = wait_until_prediction_converged(
         &fx.group_name("chash"),
         all,
@@ -644,7 +644,7 @@ async fn a4_consistent_hash(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[
         WAIT_SECONDS,
     )
     .await;
-    ck.check("A4 线上分配收敛到一致性环的离线预测", matched, &detail);
+    ck.check("A4 live allocation converges to the consistent-hash ring's offline prediction", matched, &detail);
     let qa = ca.assignment();
     let qb = cb.assignment();
     let ka = queue_keys(&qa);
@@ -652,21 +652,21 @@ async fn a4_consistent_hash(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[
     let overlap: BTreeSet<String> = ka.intersection(&kb).cloned().collect();
     let union: BTreeSet<String> = ka.union(&kb).cloned().collect();
     ck.check(
-        "A4 两实例分配无交集",
+        "A4 the two instances' allocations do not overlap",
         overlap.is_empty(),
         &format!("overlap=[{}]", key_set_text(&overlap)),
     );
     ck.check(
-        &format!("A4 并集覆盖全部 {} 个队列", all.len()),
+        &format!("A4 union covers all {} queues", all.len()),
         union == queue_keys(all),
         &format!("a={} b={}", ka.len(), kb.len()),
     );
-    // 端到端：不管环怎么偏，两边合起来要把 12 条收全。
+    // End to end: no matter how the ring skews, the two sides together must receive all 12 messages.
     let ga = drain_for(&ca, 8).await;
     let gb = drain_for(&cb, 8).await;
     let joined: BTreeSet<String> = bodies(&ga).union(&bodies(&gb)).cloned().collect();
     ck.check(
-        &format!("A4 两实例合起来收到全部 {N_MSG} 条（环真的在驱动收发）"),
+        &format!("A4 the two instances together receive all {N_MSG} messages (the ring really drives send/receive)"),
         joined == expected_bodies(topic),
         &format!("union={}", joined.len()),
     );
@@ -674,7 +674,7 @@ async fn a4_consistent_hash(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[
     cb.shutdown();
 }
 
-// ------------------------------------------------------------------ A5 NEARBY 包环
+// ------------------------------------------------------------------ A5 NEARBY wrapping the ring
 
 async fn a5_nearby(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[MessageQueue]) {
     let inner: std::sync::Arc<dyn AllocateMessageQueueStrategy> =
@@ -685,13 +685,13 @@ async fn a5_nearby(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[MessageQu
     let (ca, cb) = match pair_with_strategy(fx, "nearby", &[nearby.clone(), nearby.clone()], topic) {
         Ok(p) => p,
         Err(e) => {
-            ck.abort("A5 构造", &e);
+            ck.abort("A5 build", &e);
             return;
         }
     };
     let got = ca.allocate_message_queue_strategy();
     ck.check(
-        "A5 装饰后的策略名 = MACHINE_ROOM_NEARBY-CONSISTENT_HASH",
+        "A5 strategy name after decoration = MACHINE_ROOM_NEARBY-CONSISTENT_HASH",
         got.get_name() == "MACHINE_ROOM_NEARBY-CONSISTENT_HASH",
         got.get_name(),
     );
@@ -704,8 +704,8 @@ async fn a5_nearby(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[MessageQu
         ck.abort("A5 cb start", &e.to_string());
         return;
     }
-    // 单机房 ⇒ NEARBY 与内层环的结果**一字不差**，所以直接以内层策略的离线预测当收敛条件：
-    // 收敛了就等于「装饰器原样透传了内层切分，且真的驱动了 rebalance」。
+    // Single machine room ⇒ NEARBY's result matches the inner ring **byte for byte**, so the inner strategy's offline prediction serves directly as the convergence condition:
+    // convergence means "the decorator passes the inner split through unchanged and it really drives the rebalance".
     let (matched, detail) = wait_until_prediction_converged(
         &fx.group_name("nearby"),
         all,
@@ -715,30 +715,30 @@ async fn a5_nearby(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[MessageQu
         WAIT_SECONDS,
     )
     .await;
-    ck.check("A5 NEARBY 的线上分配 == 内层环的离线预测", matched, &detail);
+    ck.check("A5 NEARBY's live allocation == the inner ring's offline prediction", matched, &detail);
     let ka = queue_keys(&ca.assignment());
     let kb = queue_keys(&cb.assignment());
     let overlap: BTreeSet<String> = ka.intersection(&kb).cloned().collect();
     let union: BTreeSet<String> = ka.union(&kb).cloned().collect();
     ck.check(
-        "A5 NEARBY 两实例分配无交集且不漏",
+        "A5 NEARBY: the two instances' allocations do not overlap and miss nothing",
         overlap.is_empty() && union == queue_keys(all),
         &format!("a={} b={} overlap={}", ka.len(), kb.len(), overlap.len()),
     );
-    // resolver 真的被 rebalance 调用过，且看到的是真实 brokerName + 两个真实 clientId。
+    // The resolver was really called by the rebalance, and it saw real brokerNames plus the two real clientIds.
     let broker_calls = lock(&resolver.broker_calls).clone();
     let consumer_calls = lock(&resolver.consumer_calls).clone();
     let seen: BTreeSet<String> = broker_calls.iter().cloned().collect();
     let real_brokers: BTreeSet<String> = all.iter().map(|m| m.broker_name.clone()).collect();
     ck.check(
-        &format!("A5 resolver 被逐个队列问过机房（{} 次）", broker_calls.len()),
+        &format!("A5 resolver was asked for the machine room per queue ({} calls)", broker_calls.len()),
         !broker_calls.is_empty() && seen == real_brokers,
         &format!("brokers={seen:?}"),
     );
     let both_cids = consumer_calls.contains(&ca.client_id())
         && consumer_calls.contains(&cb.client_id());
     ck.check(
-        "A5 resolver 被问过两个真实 clientId",
+        "A5 resolver was asked about both real clientIds",
         both_cids,
         &format!("calls={consumer_calls:?}"),
     );
@@ -746,12 +746,12 @@ async fn a5_nearby(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[MessageQu
     cb.shutdown();
 }
 
-// ------------------------------------------------------------------ A6 机房配错
+// ------------------------------------------------------------------ A6 machine room mismatch
 
 async fn a6_machine_room_starved(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[MessageQueue]) {
     let room_strategy = AllocateMessageQueueByMachineRoom::new([ROOM]);
     ck.check(
-        "A6 策略名 = MACHINE_ROOM 且白名单能读回",
+        "A6 strategy name = MACHINE_ROOM and the whitelist reads back",
         room_strategy.get_name() == "MACHINE_ROOM" && room_strategy.get_consumeridcs().contains(ROOM),
         format!("idcs={:?}", room_strategy.get_consumeridcs()).as_str(),
     );
@@ -761,7 +761,7 @@ async fn a6_machine_room_starved(ck: &mut Checker, fx: &Fixture, topic: &str, al
     let (ca, cb) = match pair_with_strategy(fx, "room", &[room.clone(), avg.clone()], topic) {
         Ok(p) => p,
         Err(e) => {
-            ck.abort("A6 构造", &e);
+            ck.abort("A6 build", &e);
             return;
         }
     };
@@ -776,13 +776,13 @@ async fn a6_machine_room_starved(ck: &mut Checker, fx: &Fixture, topic: &str, al
     }
     let ctrl = wait_assignment(&cb, WAIT_SECONDS).await;
     ck.check(
-        "A6 同组对照组（AVG）正常分到队列",
+        "A6 the same-group control (AVG) gets queues as normal",
         !ctrl.is_empty(),
         &format!("ctrl=[{}]", key_set_text(&queue_keys(&ctrl))),
     );
     let starved = ca.assignment();
     ck.check(
-        "A6 机房不匹配真实 brokerName → 一条都不分（不报错也不误吃）",
+        "A6 machine room not matching real brokerName → zero queues allocated (no error, no wrongful consumption)",
         starved.is_empty(),
         &format!("assignment=[{}]", key_set_text(&queue_keys(&starved))),
     );
@@ -795,10 +795,10 @@ async fn a6_machine_room_starved(ck: &mut Checker, fx: &Fixture, topic: &str, al
         WAIT_SECONDS,
     )
     .await;
-    ck.check("A6 两边线上分配各自收敛到自己策略的离线预测", matched, &detail);
+    ck.check("A6 both sides' live allocations each converge to their own strategy's offline prediction", matched, &detail);
     let ga = drain_for(&ca, 5).await;
     ck.check(
-        "A6 被饿死的一方 poll 不到消息也不抛错",
+        "A6 the starved side polls no messages and raises no error",
         bodies(&ga).is_empty(),
         &format!("got={}", ga.len()),
     );
@@ -806,7 +806,7 @@ async fn a6_machine_room_starved(ck: &mut Checker, fx: &Fixture, topic: &str, al
     cb.shutdown();
 }
 
-// ------------------------------------------------------------------ 驱动
+// ------------------------------------------------------------------ driver
 
 async fn run(namesrv: &str) -> Checker {
     let mut ck = Checker::new();
@@ -814,12 +814,12 @@ async fn run(namesrv: &str) -> Checker {
     let mut fx = match Fixture::new(namesrv, &stamp) {
         Ok(fx) => fx,
         Err(e) => {
-            ck.abort("夹具构造", &e);
+            ck.abort("fixture build", &e);
             return ck;
         }
     };
     if let Err(e) = fx.start().await {
-        ck.abort("夹具启动", &e);
+        ck.abort("fixture start", &e);
         return ck;
     }
     println!("== live allocation-strategy check, namesrv={namesrv} stamp={stamp} ==");
@@ -828,18 +828,18 @@ async fn run(namesrv: &str) -> Checker {
 
     let topic = fx.topic_name();
     if let Err(e) = fx.create_topic(&topic, QUEUE_NUMS).await {
-        ck.abort("建 topic", &e);
+        ck.abort("create topic", &e);
         return ck;
     }
     let all = sorted_queues(route_queues(&fx, &topic).await);
     if all.len() != QUEUE_NUMS as usize {
-        ck.abort("路由队列不足", &format!("got {}", all.len()));
+        ck.abort("route has fewer queues than expected", &format!("got {}", all.len()));
         fx.cleanup(&mut ck).await;
         return ck;
     }
     let sent = fx.produce_alternating(&topic).await;
     ck.check(
-        &format!("A0 生产 {N_MSG} 条成功"),
+        &format!("A0 produced all {N_MSG} messages successfully"),
         sent == N_MSG,
         &format!("sentOk={sent}"),
     );

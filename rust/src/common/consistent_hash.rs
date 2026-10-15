@@ -1,4 +1,4 @@
-//! ## 为什么整套照搬而不是"等价改写"
+//! ## Why the whole thing is ported as-is instead of an "equivalent rewrite"
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -13,7 +13,7 @@ pub trait HashFunction: Send + Sync {
 pub struct Md5Hash;
 
 impl HashFunction for Md5Hash {
-    /// 只取摘要前 4 字节、大端拼接（见模块头第 1 点）。结果因此恒在 `0..=0xFFFFFFFF`。
+    /// Takes only the first 4 bytes of the digest, concatenated big-endian (see point 1 of the module header). The result therefore always lies in `0..=0xFFFFFFFF`.
     fn hash(&self, key: &str) -> i64 {
         let digest = md5(key.as_bytes());
         let mut value: i64 = 0;
@@ -72,8 +72,8 @@ pub struct ConsistentHashRouter {
     hash_function: Arc<dyn HashFunction>,
 }
 
-/// 手写而不是 `#[derive(Debug)]`：`Arc<dyn HashFunction>` 没有 `Debug`，派生会因它失败。
-/// 环里存的是 hash → 虚拟节点，打印时只列 hash 与虚拟节点 key，不外泄业务节点对象。
+/// Hand-written instead of `#[derive(Debug)]`: `Arc<dyn HashFunction>` has no `Debug`, so the derive would fail on it.
+/// The ring stores hash → virtual node; printing lists only hashes and virtual-node keys, without leaking business node objects.
 impl std::fmt::Debug for ConsistentHashRouter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let ring: Vec<(i64, String)> = self
@@ -157,14 +157,14 @@ impl ConsistentHashRouter {
     }
 }
 
-/// `add_node` 吃 `&dyn Node`（方便测试与内部复用），环里却要存 `Arc<dyn Node>`。
+/// `add_node` takes `&dyn Node` (handy for tests and internal reuse), while the ring must store `Arc<dyn Node>`.
 fn shared_node_of(p_node: &dyn Node) -> Arc<dyn Node> {
     Arc::new(ClientNode::new(p_node.get_key()))
 }
 
 // ------------------------------------------------------------------ MD5
 
-/// MD5 的 64 轮位移量（RFC 1321 §3.4）。
+/// The 64 round shift amounts of MD5 (RFC 1321 §3.4).
 const MD5_SHIFTS: [u32; 64] = [
     7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, //
     5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, //
@@ -172,7 +172,7 @@ const MD5_SHIFTS: [u32; 64] = [
     6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, //
 ];
 
-/// `K[i] = floor(abs(sin(i + 1)) * 2^32)`（RFC 1321 §3.4 的表）。
+/// `K[i] = floor(abs(sin(i + 1)) * 2^32)` (the table from RFC 1321 §3.4).
 const MD5_K: [u32; 64] = [
     0xd76a_a478, 0xe8c7_b756, 0x2420_70db, 0xc1bd_ceee, //
     0xf57c_0faf, 0x4787_c62a, 0xa830_4613, 0xfd46_9501, //
@@ -200,7 +200,7 @@ fn md5(input: &[u8]) -> [u8; 16] {
         0x1032_5476,
     ];
 
-    // 填充：0x80 + 若干 0x00 把长度顶到 ≡56 (mod 64)，再挂 8 字节小端 bit 长度。
+    // Padding: 0x80 + some 0x00 bytes to bring the length to ≡56 (mod 64), then append the 8-byte little-endian bit length.
     let bit_len = (input.len() as u64).wrapping_mul(8);
     let mut padded = input.to_vec();
     padded.push(0x80);
@@ -218,7 +218,7 @@ fn md5(input: &[u8]) -> [u8; 16] {
 
         let [mut a, mut b, mut c, mut d] = state;
         for i in 0..64 {
-            // 四轮的非线性函数与消息字下标（RFC 1321 §3.4）。
+            // The four rounds' nonlinear functions and message-word indices (RFC 1321 §3.4).
             let (f, g) = match i {
                 0..=15 => ((b & c) | ((!b) & d), i),
                 16..=31 => ((d & b) | ((!d) & c), (5 * i + 1) % 16),
@@ -251,12 +251,12 @@ fn md5(input: &[u8]) -> [u8; 16] {
 mod tests {
     use super::*;
 
-    /// MD5 摘要的小写十六进制串（只做测试里的逐字节比对用，故不放进生产代码里）。
+    /// Lowercase hex string of the MD5 digest (only for byte-wise comparison in tests, hence kept out of production code).
     fn md5_hex(input: &[u8]) -> String {
         md5(input).iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    /// RFC 1321 附录 A 的官方测试向量（另加一条长输入向量）。
+    /// The official test vectors from RFC 1321 Appendix A (plus one long-input vector).
     #[test]
     fn md5_matches_the_reference_vectors() {
         assert_eq!(md5_hex(b""), "d41d8cd98f00b204e9800998ecf8427e");
@@ -271,7 +271,7 @@ mod tests {
             md5_hex(b"The quick brown fox jumps over the lazy dog"),
             "9e107d9d372bb6826bd81d3542a419d6"
         );
-        // 跨块 + 正好落在填充边界的几种长度（55/56/57），参考值按 MD5 定义算出
+        // Several lengths (55/56/57) spanning blocks + landing exactly on the padding boundary; reference values computed per the MD5 definition
         for (len, expected) in [
             (55usize, "04364420e25c512fd958a70738aa8f72"),
             (56, "668a72d5ba17f08e62dabcafad6db14b"),
@@ -288,7 +288,7 @@ mod tests {
     fn ring_md5_hash_takes_only_the_first_four_bytes() {
         assert_eq!(Md5Hash.hash(""), 0xd41d_8cd9);
         assert_eq!(Md5Hash.hash("abc"), 0x9001_5098);
-        assert_eq!(Md5Hash.hash("abc") >> 32, 0, "结果必须在 32 位内（只取 4 个字节）");
+        assert_eq!(Md5Hash.hash("abc") >> 32, 0, "the result must fit in 32 bits (only 4 bytes taken)");
     }
 
     #[test]
@@ -296,14 +296,14 @@ mod tests {
         let nodes: Vec<Arc<dyn Node>> =
             vec![Arc::new(ClientNode::new("n0")), Arc::new(ClientNode::new("n1"))];
         let router = ConsistentHashRouter::new(&nodes, 5).unwrap();
-        // 同一个 key 永远落在同一个节点上（策略的稳定性前提）
+        // The same key always lands on the same node (the stability premise of the strategy)
         for key in ["MessageQueue [topic=t, brokerName=b, queueId=0]", "k", "另一个"] {
             let first = router.route_node(key).unwrap().get_key().to_string();
             for _ in 0..3 {
                 assert_eq!(router.route_node(key).unwrap().get_key(), first, "{key}");
             }
         }
-        // 回绕分支：环上一定取得到节点，且两个节点都被路由到（10 个虚拟节点足够密）
+        // Wrap-around branch: a node must always be found on the ring, and both nodes get routed to (10 virtual nodes are dense enough)
         let mut seen: Vec<String> = Vec::new();
         for i in 0..64 {
             let routed = router.route_node(&format!("queue-{i}")).unwrap().get_key().to_string();
@@ -311,7 +311,7 @@ mod tests {
                 seen.push(routed);
             }
         }
-        assert_eq!(seen.len(), 2, "两个物理节点都得被路由到: {seen:?}");
+        assert_eq!(seen.len(), 2, "both physical nodes must be routed to: {seen:?}");
     }
 
     #[test]
@@ -323,8 +323,8 @@ mod tests {
     #[test]
     fn negative_virtual_node_count_is_rejected() {
         let nodes: Vec<Arc<dyn Node>> = vec![Arc::new(ClientNode::new("a"))];
-        assert!(ConsistentHashRouter::new(&[], -1).is_ok(), "空节点集不触发检查");
-        let err = ConsistentHashRouter::new(&nodes, -1).expect_err("必须拒绝");
+        assert!(ConsistentHashRouter::new(&[], -1).is_ok(), "an empty node set does not trigger the check");
+        let err = ConsistentHashRouter::new(&nodes, -1).expect_err("must be rejected");
         assert!(
             err.to_string().contains("illegal virtual node counts :-1"),
             "{err}"
@@ -339,7 +339,7 @@ mod tests {
         assert_eq!(router.get_existing_replicas(&node), 3);
         router.add_node(&node, 2).unwrap();
         assert_eq!(router.get_existing_replicas(&node), 5);
-        assert_eq!(router.ring.len(), 5, "5 个虚拟节点必须占 5 个不同的 hash");
+        assert_eq!(router.ring.len(), 5, "5 virtual nodes must occupy 5 distinct hashes");
     }
 
     #[test]
@@ -357,7 +357,7 @@ mod tests {
 
     #[test]
     fn custom_hash_function_is_used_for_every_lookup() {
-        // 只用首字符的哈希：环上落点完全由 key 的第一个字节决定
+        // A hash using only the first character: the landing spot on the ring is determined entirely by the key's first byte
         struct FirstByte;
         impl HashFunction for FirstByte {
             fn hash(&self, key: &str) -> i64 {
@@ -368,7 +368,7 @@ mod tests {
             vec![Arc::new(ClientNode::new("aaa")), Arc::new(ClientNode::new("bbb"))];
         let router =
             ConsistentHashRouter::with_hash_function(&nodes, 1, Arc::new(FirstByte)).unwrap();
-        // "a"(97) 与 "b"(98) 各占一个位置；"c"(99) 越过末尾 → 回绕到最小 hash 的节点
+        // "a"(97) and "b"(98) each take one slot; "c"(99) goes past the end → wraps to the node with the smallest hash
         assert_eq!(router.route_node("a!").unwrap().get_key(), "aaa");
         assert_eq!(router.route_node("b!").unwrap().get_key(), "bbb");
         assert_eq!(router.route_node("c!").unwrap().get_key(), "aaa");

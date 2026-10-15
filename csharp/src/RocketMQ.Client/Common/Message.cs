@@ -83,7 +83,7 @@ public class Message
     public byte[] Body
     {
         get => _body;
-        // setBody 语义：设置 body 同时把 hasBody 置 true。
+        // setBody semantics: sets the body and also sets hasBody to true.
         set
         {
             _body = value;
@@ -94,11 +94,11 @@ public class Message
     public bool HasBody { get; set; } = true;
     public string TransactionId { get; set; } = string.Empty;
 
-    // 是否为批量消息体（由 MessageBatch.GenerateFromList 置位）。
-    // 发送时映射到 SendMessageRequestHeader.batch —— broker 端
-    // SendMessageProcessor 用 requestHeader.isBatch() 决定走 sendBatchMessage
-    // 还是 sendMessage，所以这个标志是必须的。
-    // 说明：不用类型判断是因为 Message 非多态类型（无虚函数），RTTI 不可用。
+    // Whether this is a batch message body (set by MessageBatch.GenerateFromList).
+    // At send time it maps to SendMessageRequestHeader.batch —— on the broker side
+    // SendMessageProcessor uses requestHeader.isBatch() to decide whether to go through sendBatchMessage
+    // or sendMessage, so this flag is required.
+    // Note: type checks are not used because Message is a non-polymorphic type (no virtual methods), so RTTI is unavailable.
     public bool IsBatch { get; set; }
 
     public Message()
@@ -126,7 +126,7 @@ public class Message
         }
     }
 
-    // ---- 属性快捷方式 ----
+    // ---- Property shortcuts ----
     public string Tags
     {
         get => Properties.TryGetValue(MessageConst.PropertyTags, out var v) ? v : string.Empty;
@@ -350,14 +350,14 @@ public class MessageBatch : Message
 
         MessageClientIDSetter.SetUniqId(batch);
         batch.Body = batch.Encode();
-        batch.IsBatch = true; // 让发送侧把 SendMessageRequestHeader.batch 置 true
+        batch.IsBatch = true; // make the send side set SendMessageRequestHeader.batch to true
         return batch;
     }
 }
 
 public static class MessageClientIDSetter
 {
-    /// <summary>UNIQ_KEY 缺失时写入一个 32 位十六进制唯一 ID（幂等）。</summary>
+    /// <summary>When UNIQ_KEY is missing, write a 32-bit hex unique ID (idempotent).</summary>
     public static void SetUniqId(Message msg)
     {
         if (string.IsNullOrEmpty(msg.GetProperty(MessageConst.PropertyUniqClientMessageIdKeyidx)))

@@ -7,13 +7,16 @@ namespace RocketMQ\Remoting\Protocol;
 use RocketMQ\Common\BoundaryType;
 
 /**
- * 全部请求/响应头：一个 request code 一种 header 形状，键名即协议字段名。
+ * All request/response headers: one header shape per request code, the key names are the protocol field
+ * names.
  *
- * 每个 header 提供 toExtFields()（只输出非 null 字段——header 编码本来就是按 null
- * 跳键）和 fromExtFields()（把 ext_fields 映射回字段）。
+ * Every header offers toExtFields() (emits only the non-null fields — the header encoding skips keys on
+ * null anyway) and fromExtFields() (maps ext_fields back to the fields).
  *
- * ⚠ ext key 必须逐字等于协议字段名：broker 侧按属性名做容错反序列化，
- * 认不出来的键不报错、直接当不存在，于是**静默丢字段**、行为静默退化。
+ * ⚠ An ext key must equal the protocol field name character for character: the broker side performs a
+ * fault-tolerant deserialization by property name and does not complain about keys it cannot recognize, it
+ * simply treats them as absent, which means **fields are silently dropped** and the behaviour silently
+ * degrades.
  */
 abstract class CommandCustomHeader
 {
@@ -25,11 +28,12 @@ abstract class CommandCustomHeader
     }
 
     /**
-     * 过滤 null，并把 bool 规范成小写的 ``"true"`` / ``"false"``。
+     * Filters out null and normalizes bool into the lower-case ``"true"`` / ``"false"``.
      *
-     * 为什么必须显式转换：``RemotingCommand`` 落 ext_fields 时统一走 ``str(v)``，
-     * PHP 的 ``str(false)`` 是空串、``str(true)`` 是 ``"1"``，而 broker 按忽略
-     * 大小写的 ``"true"`` 判真——不转换等于这个字段永远读不回来。
+     * Why the explicit conversion is mandatory: ``RemotingCommand`` uniformly applies ``str(v)`` when
+     * filling ext_fields; in PHP ``str(false)`` is an empty string and ``str(true)`` is ``"1"``, while the
+     * broker judges truth by a case-insensitive ``"true"`` — without the conversion the field can never be
+     * read back.
      *
      * @param array<string, mixed> $fields
      * @return array<string, mixed>
@@ -65,7 +69,7 @@ abstract class CommandCustomHeader
     }
 }
 
-// ---------------- 发送消息 ----------------
+// ---------------- send message ----------------
 
 final class SendMessageRequestHeader extends CommandCustomHeader
 {
@@ -125,7 +129,7 @@ final class SendMessageRequestHeader extends CommandCustomHeader
     }
 }
 
-/** V2 短字段名编码（producerGroup->a ...）：短键名也是协议规定的，不能换成全名。 */
+/** The V2 short field name encoding (producerGroup->a ...): the short key names are also fixed by the protocol and must not be replaced with the full names. */
 final class SendMessageRequestHeaderV2 extends CommandCustomHeader
 {
     public function __construct(
@@ -142,7 +146,7 @@ final class SendMessageRequestHeaderV2 extends CommandCustomHeader
         public ?bool $unitMode = null,
         public ?int $maxReconsumeTimes = null,
         public ?bool $batch = null,
-        // 协议里这个短形状还带一个 n 键，承载的就是 brokerName
+        // This short shape in the protocol also carries an n key, which holds the brokerName
         public ?string $brokerName = null,
     ) {
     }
@@ -189,10 +193,11 @@ final class SendMessageRequestHeaderV2 extends CommandCustomHeader
 }
 
 /**
- * broker → 请求方 的 PUSH_REPLY_MESSAGE_TO_CLIENT(326) 请求头。
+ * The broker -> requester PUSH_REPLY_MESSAGE_TO_CLIENT(326) request header.
  *
- * 字段与 SendMessageRequestHeader 高度重合，但多了 bornHost/storeHost/storeTimestamp。
- * 请求方收到后据此 + body 还原出真正的应答 MessageExt。
+ * The fields overlap heavily with SendMessageRequestHeader, but additionally carry
+ * bornHost/storeHost/storeTimestamp.
+ * Upon receiving it, the requester reconstructs the real response MessageExt from these plus the body.
  */
 final class ReplyMessageRequestHeader extends CommandCustomHeader
 {
@@ -263,8 +268,9 @@ final class SendMessageResponseHeader extends CommandCustomHeader
         public ?int $queueOffset = null,
         public ?string $transactionId = null,
         public ?string $batchUniqId = null,
-        // 只给定时/延迟消息：broker 的 SendMessageProcessor#attachRecallHandle 看到
-        // TIMER_OUT_MS + REAL_TOPIC 才挂上，普通消息恒为 null。
+        // Only for scheduled / delayed messages: the broker's SendMessageProcessor#attachRecallHandle
+        // attaches it only when it sees TIMER_OUT_MS + REAL_TOPIC; it is always null for ordinary
+        // messages.
         public ?string $recallHandle = null,
     ) {
     }
@@ -295,10 +301,10 @@ final class SendMessageResponseHeader extends CommandCustomHeader
 }
 
 /**
- * 撤回定时消息的请求头。
+ * The request header for recalling a scheduled message.
  *
- * ⚠ 它走 TopicRequestHeader → RpcRequestHeader 那层继承，brokerName 的**协议键名
- * 就是 ``bname``**：写成 ``brokerName`` 会被 broker 静默丢掉。
+ * ⚠ It goes through the TopicRequestHeader → RpcRequestHeader inheritance chain, and the **protocol key
+ * name of brokerName is ``bname``**: writing ``brokerName`` instead makes the broker silently drop it.
  */
 final class RecallMessageRequestHeader extends CommandCustomHeader
 {
@@ -331,7 +337,7 @@ final class RecallMessageRequestHeader extends CommandCustomHeader
     }
 }
 
-/** 撤回响应头：只有一个字段 ``msgId``。 */
+/** The recall response header: it has a single field ``msgId``. */
 final class RecallMessageResponseHeader extends CommandCustomHeader
 {
     public function __construct(public ?string $msgId = null)
@@ -351,7 +357,7 @@ final class RecallMessageResponseHeader extends CommandCustomHeader
     }
 }
 
-// ---------------- 拉取消息 ----------------
+// ---------------- pull message ----------------
 
 final class PullMessageRequestHeader extends CommandCustomHeader
 {
@@ -460,7 +466,7 @@ final class PullMessageResponseHeader extends CommandCustomHeader
     }
 }
 
-// ---------------- 偏移量 ----------------
+// ---------------- offsets ----------------
 
 final class QueryConsumerOffsetRequestHeader extends CommandCustomHeader
 {
@@ -650,8 +656,9 @@ final class SearchOffsetRequestHeader extends CommandCustomHeader
         public ?string $topic = null,
         public ?int $queueId = null,
         public ?int $timestamp = null,
-        // 该字段可空：为 null 时**不写键**（不带边界的老式 searchOffset 请求
-        // 就是这种形状，broker 必须能处理缺键的包）。
+        // This field may be null: when it is null **no key is written** (the old-style searchOffset
+        // requests without boundaries have exactly that shape, and the broker must handle packets with
+        // a missing key).
         public ?BoundaryType $boundaryType = null,
     ) {
     }
@@ -663,8 +670,8 @@ final class SearchOffsetRequestHeader extends CommandCustomHeader
             'topic' => $this->topic,
             'queueId' => $this->queueId,
             'timestamp' => $this->timestamp,
-            // 入网文本是枚举名大写（header 编码输出的是枚举名本身），
-            // 不是 lowercaseName() 的小写名。
+            // The text that goes on the wire is the UPPER-case enum name (the header encoding emits the
+            // enum name itself), not the lower-case name of lowercaseName().
             'boundaryType' => $this->boundaryType?->value,
         ]);
     }
@@ -676,8 +683,8 @@ final class SearchOffsetRequestHeader extends CommandCustomHeader
         $this->queueId = self::i($ext['queueId'] ?? null);
         $this->timestamp = self::l($ext['timestamp'] ?? null);
         $value = $ext['boundaryType'] ?? null;
-        // 缺键 ⇒ null（由 broker 侧回落 LOWER）；
-        // 有键但值不认识 ⇒ 按 broker 的宽松语义给 LOWER。
+        // A missing key ⇒ null (the broker side falls back to LOWER);
+        // a key whose value is not recognized ⇒ LOWER, following the broker's lenient semantics.
         $this->boundaryType = $value !== null ? BoundaryType::getType((string)$value) : null;
     }
 }
@@ -742,13 +749,14 @@ final class GetEarliestMsgStoretimeResponseHeader extends CommandCustomHeader
     }
 }
 
-// ---------------- 查询消息 ----------------
+// ---------------- query message ----------------
 
 /**
- * 按 key / uniqueKey / tag 查消息的请求头。
+ * The request header for querying messages by key / uniqueKey / tag.
  *
- * ``indexType`` 取 MessageConst.INDEX_KEY_TYPE("K") / INDEX_UNIQUE_TYPE("U") /
- * INDEX_TAG_TYPE("T")；broker 侧为空时默认按 "K"（普通 key 索引）查。
+ * ``indexType`` takes MessageConst.INDEX_KEY_TYPE("K") / INDEX_UNIQUE_TYPE("U") /
+ * INDEX_TAG_TYPE("T"); when it is empty the broker side queries by "K" (the ordinary key index) by
+ * default.
  */
 final class QueryMessageRequestHeader extends CommandCustomHeader
 {
@@ -842,7 +850,7 @@ final class ViewMessageResponseHeader extends CommandCustomHeader
     }
 }
 
-// ---------------- 心跳 / 注销 ----------------
+// ---------------- heartbeat / unregister ----------------
 
 final class HeartbeatRequestHeader extends CommandCustomHeader
 {
@@ -891,7 +899,7 @@ final class UnregisterClientRequestHeader extends CommandCustomHeader
     }
 }
 
-// ---------------- 消费管理 ----------------
+// ---------------- consumer management ----------------
 
 final class ConsumerSendMsgBackRequestHeader extends CommandCustomHeader
 {
@@ -1004,7 +1012,7 @@ final class GetConsumerConnectionListRequestHeader extends CommandCustomHeader
     }
 }
 
-/** GET_CONSUMER_STATUS_FROM_CLIENT(221) 的请求头。 */
+/** The request header of GET_CONSUMER_STATUS_FROM_CLIENT(221). */
 final class GetConsumerStatusRequestHeader extends CommandCustomHeader
 {
     public function __construct(
@@ -1119,7 +1127,7 @@ final class ResetOffsetRequestHeader extends CommandCustomHeader
     }
 }
 
-// ---------------- 锁 ----------------
+// ---------------- lock ----------------
 
 final class LockBatchMqRequestHeader extends CommandCustomHeader
 {
@@ -1165,13 +1173,14 @@ final class UnlockBatchMqRequestHeader extends CommandCustomHeader
     }
 }
 
-// ---------------- 事务 ----------------
+// ---------------- transaction ----------------
 
 /**
- * 提交 / 回滚二阶段消息的请求头。
+ * The request header for committing / rolling back a half (second-phase) message.
  *
- * ⚠ 继承 RpcRequestHeader 的 brokerName 字段，**协议键名是 ``bname``**
- * （属性名是 brokerName，上报的键是 bname）。写错键 broker 会静默丢字段。
+ * ⚠ It inherits the brokerName field of RpcRequestHeader, whose **protocol key name is ``bname``**
+ * (the property name is brokerName, the key reported on the wire is bname). Writing the wrong key makes
+ * the broker silently drop the field.
  */
 final class EndTransactionRequestHeader extends CommandCustomHeader
 {
@@ -1242,9 +1251,9 @@ final class EndTransactionResponseHeader extends CommandCustomHeader
 }
 
 /**
- * broker 回查事务状态时下行的请求头。
+ * The request header pushed down when the broker queries back the transaction state.
  *
- * ⚠ 同样继承 RpcRequestHeader：brokerName 的协议键名是 ``bname``。
+ * ⚠ It likewise inherits RpcRequestHeader: the protocol key name of brokerName is ``bname``.
  */
 final class CheckTransactionStateRequestHeader extends CommandCustomHeader
 {
@@ -1314,7 +1323,7 @@ final class CheckTransactionStateResponseHeader extends CommandCustomHeader
     }
 }
 
-// ---------------- 管理 / 查询 ----------------
+// ---------------- admin / query ----------------
 
 final class GetAllTopicConfigRequestHeader extends CommandCustomHeader
 {
@@ -1369,12 +1378,12 @@ final class GetTopicConfigRequestHeader extends CommandCustomHeader
 }
 
 /**
- * 创建 topic 的请求头。
+ * The request header for creating a topic.
  *
- * ⚠ broker 的字段校验会把 ``topicFilterType`` 解析成枚举，**为空直接回
- * RemotingCommandException("topicFilterType = [null] value invalid")**
- * （这条文案是 broker 返回的，调用方按字面匹配，别改写），所以哪怕只想建普通
- * topic，也必须显式下发 topicFilterType。
+ * ⚠ The field validation of the broker parses ``topicFilterType`` into an enum and **answers
+ * RemotingCommandException("topicFilterType = [null] value invalid") directly when it is empty**
+ * (this message is returned by the broker and callers match it literally, so do not reword it), hence
+ * even for an ordinary topic topicFilterType has to be sent explicitly.
  */
 final class CreateTopicRequestHeader extends CommandCustomHeader
 {
@@ -1387,7 +1396,7 @@ final class CreateTopicRequestHeader extends CommandCustomHeader
         public ?string $topicFilterType = null,
         public ?int $topicSysFlag = null,
         public ?bool $order = null,
-        // AttributeParser.parseToString 格式："k1=v1,k2" （值为空时只留 key）
+        // The AttributeParser.parseToString format: "k1=v1,k2" (when the value is empty only the key is kept)
         public ?string $attributes = null,
         public ?bool $force = null,
     ) {
@@ -2114,13 +2123,13 @@ final class QueryDataVersionResponseHeader extends CommandCustomHeader
     }
 }
 
-// ---------------- POP 模式（5.x 轻量消费） ----------------
+// ---------------- POP mode (5.x lightweight consumption) ----------------
 //
-// 另外注意 `order` / `suspend` 这两个字段协议里是**非空**布尔（默认 false），
-// 而 header 编码只跳过 null，所以它们**总是**出现在报文里 —— 这里也不做 null 过滤，
-// 省掉任何一个都会让 broker 用不上该字段。
+// Note as well that the `order` / `suspend` fields are **non-null** booleans in the protocol (default
+// false), while the header encoding only skips null, so they **always** appear on the wire — no null
+// filtering is done here either, dropping either one would leave the broker unable to use the field.
 
-/** POP 拉消息请求头（RequestCode.POP_MESSAGE = 200050）。 */
+/** The POP pull message request header (RequestCode.POP_MESSAGE = 200050). */
 final class PopMessageRequestHeader extends CommandCustomHeader
 {
     public bool $order = false;
@@ -2132,10 +2141,11 @@ final class PopMessageRequestHeader extends CommandCustomHeader
         public ?int $maxMsgNums = null,
         public ?int $invisibleTime = null,
         public ?int $pollTime = null,
-        // bornTime 必须是**当前毫秒时间戳**：broker 校验
-        // `now - bornTime - pollTime > 500` 就直接回 POLLING_TIMEOUT(210)。
+        // bornTime must be the **current millisecond timestamp**: the broker answers
+        // POLLING_TIMEOUT(210) directly whenever it verifies `now - bornTime - pollTime > 500`.
         public ?int $bornTime = null,
-        // 0 = MIN（从最小位点开始，能消费历史），1 = MAX（只拿新消息）
+        // 0 = MIN (starting from the minimum offset, so history can be consumed), 1 = MAX (only new
+        // messages)
         public ?int $initMode = null,
         public ?string $expType = null,
         public ?string $exp = null,
@@ -2164,10 +2174,10 @@ final class PopMessageRequestHeader extends CommandCustomHeader
 }
 
 /**
- * POP 拉消息响应头。
+ * The POP pull message response header.
  *
- * ``startOffsetInfo`` / ``msgOffsetInfo`` / ``orderCountInfo`` 是编码过的
- * 字符串（空格做字段分隔、分号做队列分隔），用 ExtraInfoUtil 解析。
+ * ``startOffsetInfo`` / ``msgOffsetInfo`` / ``orderCountInfo`` are encoded strings (spaces separate the
+ * fields, semicolons separate the queues), parsed with ExtraInfoUtil.
  */
 final class PopMessageResponseHeader extends CommandCustomHeader
 {
@@ -2210,10 +2220,10 @@ final class PopMessageResponseHeader extends CommandCustomHeader
 }
 
 /**
- * POP ACK 请求头（RequestCode.ACK_MESSAGE = 200051）。
+ * The POP ACK request header (RequestCode.ACK_MESSAGE = 200051).
  *
- * ``offset`` 是 **consumeQueue offset**（即 CK 串第 8 段 / msgQueueOffset），
- * 不是 commitlog offset —— 传错会被 broker 回 NO_MESSAGE。
+ * ``offset`` is the **consumeQueue offset** (that is, the 8th segment of the CK string / msgQueueOffset),
+ * not the commitlog offset — passing the wrong one makes the broker answer NO_MESSAGE.
  */
 final class AckMessageRequestHeader extends CommandCustomHeader
 {
@@ -2241,7 +2251,7 @@ final class AckMessageRequestHeader extends CommandCustomHeader
     }
 }
 
-/** 改不可见时长请求头（CHANGE_MESSAGE_INVISIBLETIME = 200053）。 */
+/** The change invisible time request header (CHANGE_MESSAGE_INVISIBLETIME = 200053). */
 final class ChangeInvisibleTimeRequestHeader extends CommandCustomHeader
 {
     public bool $suspend = false;
@@ -2274,10 +2284,10 @@ final class ChangeInvisibleTimeRequestHeader extends CommandCustomHeader
 }
 
 /**
- * 改不可见时长响应头。
+ * The change invisible time response header.
  *
- * 返回的是**新的** ``invisibleTime`` / ``popTime`` / ``reviveQid``；
- * 客户端要用它们重建 extraInfo 供后续 ACK 使用。
+ * It returns the **new** ``invisibleTime`` / ``popTime`` / ``reviveQid``; the client has to use them to
+ * rebuild extraInfo for the subsequent ACK.
  */
 final class ChangeInvisibleTimeResponseHeader extends CommandCustomHeader
 {

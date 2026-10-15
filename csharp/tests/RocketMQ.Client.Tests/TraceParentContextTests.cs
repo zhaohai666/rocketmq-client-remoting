@@ -1,4 +1,5 @@
-// W3C traceparent 透传单测：生成/校验/子 span/注入不覆盖/属性提取。
+// Unit tests for W3C traceparent propagation: generation / validation / child spans /
+// inject-without-overwrite / property extraction.
 using RocketMQ.Common;
 using Xunit;
 
@@ -24,18 +25,18 @@ public class TraceParentContextTests
         Assert.True(TraceParentContext.IsValid(
             "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"));
         Assert.True(TraceParentContext.IsValid(
-            "00-4BF92F3577B34DA6A3CE929D0E0E4736-00F067AA0BA902B7-00"));   // 大写宽松
+            "00-4BF92F3577B34DA6A3CE929D0E0E4736-00F067AA0BA902B7-00"));   // uppercase is tolerated
         Assert.False(TraceParentContext.IsValid(null));
         Assert.False(TraceParentContext.IsValid(""));
         Assert.False(TraceParentContext.IsValid(
-            "00-00000000000000000000000000000000-00f067aa0ba902b7-01"));  // 全 0 trace-id
+            "00-00000000000000000000000000000000-00f067aa0ba902b7-01"));  // an all-zero trace-id
         Assert.False(TraceParentContext.IsValid(
-            "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01"));  // 全 0 parent-id
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01"));  // an all-zero parent-id
         Assert.False(TraceParentContext.IsValid("00-4bf92f-00f067aa0ba902b7-01"));
         Assert.False(TraceParentContext.IsValid(
             "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-zz"));
         Assert.False(TraceParentContext.IsValid(
-            "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"));  // 版本 ff
+            "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"));  // version ff
     }
 
     [Fact]
@@ -60,14 +61,14 @@ public class TraceParentContextTests
         Assert.True(TraceParentContext.IsValid(injected));
         Assert.Equal(injected, TraceParentContext.Extract(new MessageExt(msg)));
 
-        // 已有值不覆盖
+        // an existing value is not overwritten
         var msg2 = new Message();
         msg2.PutProperty(TraceParentContext.TraceContextProperty,
             "00-11111111111111111111111111111111-2222222222222222-01");
         Assert.Equal("00-11111111111111111111111111111111-2222222222222222-01",
             TraceParentContext.Inject(msg2));
 
-        // 未注入返回 null
+        // returns null when nothing was injected
         var msg3 = new Message();
         Assert.Null(TraceParentContext.Extract(new MessageExt(msg3)));
     }

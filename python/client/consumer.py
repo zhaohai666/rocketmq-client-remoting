@@ -53,44 +53,44 @@ from .trace_hook import ConsumeMessageTraceHook
 
 logger = get_logger()
 
-# POP 消费失败的延迟梯度（秒）：按重试次数逐级递增，最长 2 小时。
+# POP consumption failure delay gradient (seconds): increases step by step with retry count, up to 2 hours max.
 POP_DELAY_LEVEL = (10, 30, 60, 120, 180, 240, 300, 360, 420, 480, 540, 600,
                    1200, 1800, 3600, 7200)
 
-# POP invisibleTime 的合法区间（毫秒）：超出范围一律回落到 60000。
+# Valid range for POP invisibleTime (ms): anything out of range falls back to 60000.
 MIN_POP_INVISIBLE_TIME = 5000
 MAX_POP_INVISIBLE_TIME = 300000
 
-# broker 侧 POP 的初始位点模式：0=从最小位点开始，1=从最大位点开始。
+# Broker-side initial offset mode for POP: 0=start from min offset, 1=start from max offset.
 CONSUME_INIT_MODE_MIN = 0
 CONSUME_INIT_MODE_MAX = 1
 
-# 32 位有符号整数上限：顺序消费"重试次数用尽"判据的默认值
-# （配置 -1 在这条链路上读成它，语义是"不设上限"）。
+# Upper bound of a 32-bit signed int: the default value for the orderly-consumption "retry count exhausted" criterion
+# (config -1 is read as this on this path, meaning "no upper limit").
 _INT32_MAX = 0x7FFFFFFF
 
-# 顺序消费的全部合法返回值：SUCCESS/ROLLBACK/COMMIT/挂起。
-# listener 只允许返回这四个之一：null 兜成挂起，未知值在动态类型下
-# 也得走同一条兜底，否则会被当成 SUCCESS 静默 ack。
+# All valid return values for orderly consumption: SUCCESS/ROLLBACK/COMMIT/suspend.
+# The listener may only return one of these four: null is treated as suspend, and an unknown value under
+# dynamic typing must take the same fallback, otherwise it would be silently acked as SUCCESS.
 _ORDERLY_STATUSES = (ConsumeOrderlyStatus.SUCCESS, ConsumeOrderlyStatus.ROLLBACK,
                      ConsumeOrderlyStatus.COMMIT,
                      ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT)
 
-# 拉取空闲上限（`rocketmq.client.pull.pullMaxIdleTime`，默认 120000ms）：
-# 一个仍归本实例的队列如果超过这么久没发起过任何拉取/弹出，说明它的循环死了（或卡住了），
-# 重平衡按这个判据把它撤掉重建。
+# Pull idle upper bound (`rocketmq.client.pull.pullMaxIdleTime`, default 120000ms):
+# if a queue still owned by this instance hasn't started any pull/pop for longer than this, its loop is
+# dead (or stuck), and rebalance removes and rebuilds it by this criterion.
 PULL_MAX_IDLE_TIME = 120.0
 
-# 挂起时每轮退避时长（默认 1000ms）：
-# suspend() 之后，拉取/弹出循环不退出，只是每轮退避这么久再回头看闸门。
+# Per-round backoff while suspended (default 1000ms):
+# after suspend(), the pull/pop loop does not exit; it just backs off this long each round before checking the gate again.
 PULL_TIME_DELAY_WHEN_SUSPEND = 1.0
 
 
 def _mq_sort_key(mq: MessageQueue):
-    """队列排序键，比较语义：topic → brokerName → queueId。
+    """Queue sort key, comparison semantics: topic -> brokerName -> queueId.
 
-    重平衡会先把 mqAll/cidAll 排序再分配；顺序不一致会让不同实例算出
-    不同的分配结果（同一队列被两个实例同时消费）。
+    Rebalance sorts mqAll/cidAll before allocating; inconsistent ordering makes different instances compute
+    different allocation results (the same queue consumed by two instances at once).
     """
     return (mq.topic, mq.broker_name, mq.queue_id)
 
@@ -104,12 +104,12 @@ def _safe_hook_name(hook) -> str:
 
 def client_side_tag_filter(sub: Optional[SubscriptionData],
                            msgs: List[MessageExt]) -> List[MessageExt]:
-    """客户端二次 tag 过滤。
+    """Client-side second-pass tag filtering.
 
-    broker 侧是按 tag 的**哈希（codeSet）**过滤的，存在哈希碰撞误放，所以客户端
-    还要再按字符串核一遍。守卫 `!tagsSet.isEmpty() && !isClassFilterMode` 意味着：
-    订阅 `"*"`（SUB_ALL）时不过滤 —— 所以 `FilterAPI.build_subscription_data`
-    对 SUB_ALL 必须保持 tags_set 为空（那里有详细注释）。
+    The broker filters by the tag's **hash (codeSet)**, which can have collisions and let extra messages
+    through, so the client must verify again by string. The guard `!tagsSet.isEmpty() && !isClassFilterMode`
+    means: when subscribing `"*"` (SUB_ALL) no filtering applies -- so `FilterAPI.build_subscription_data`
+    must keep tags_set empty for SUB_ALL (detailed comment there).
     """
     if not msgs or sub is None or not sub.tags_set or sub.class_filter_mode:
         return msgs
@@ -117,9 +117,9 @@ def client_side_tag_filter(sub: Optional[SubscriptionData],
 
 
 def execute_filter_hooks(hook_list: List["FilterMessageHook"], context: FilterMessageContext) -> None:
-    """依次执行过滤钩子，**异常一律吞掉**并记 error。
+    """Execute the filter hooks in order; **all exceptions are swallowed** and logged as errors.
 
-    与 send/consume 钩子不同：过滤钩子失败不能影响消费，只是该次过滤不生效。
+    Unlike send/consume hooks: a failing filter hook must not affect consumption, it only means that particular filtering does not apply.
     """
     for hook in hook_list:
         try:
@@ -132,11 +132,11 @@ def filter_messages_for_delivery(consumer_group: str, hook_list: List["FilterMes
                                  mq: MessageQueue, sub: Optional[SubscriptionData],
                                  msgs: List[MessageExt],
                                  unit_mode: bool = False) -> List[MessageExt]:
-    """投递前过滤 = 客户端二次 tag 过滤 + FilterMessageHook（拉取/POP/pull 三处共用）。
+    """Pre-delivery filtering = client-side second-pass tag filtering + FilterMessageHook (shared by pull/POP paths).
 
-    钩子拿到的是**可变的** ``msg_list``；被摘掉的消息由调用方决定处置方式：
-    拉取路径 = 静默跳过（位点照常推进，不 ack）；
-    POP 路径 = 必须立刻 ack，否则 invisibleTime 到期后会复活重投。
+    The hook receives the **mutable** ``msg_list``; how dropped messages are handled is decided by the caller:
+    pull path = silently skipped (the offset still advances, no ack);
+    POP path = must be acked immediately, otherwise the message is revived and redelivered once invisibleTime expires.
     """
     out = client_side_tag_filter(sub, list(msgs))
     if out and hook_list:
@@ -148,7 +148,7 @@ def filter_messages_for_delivery(consumer_group: str, hook_list: List["FilterMes
 
 
 class MessageSelector:
-    """消息选择器：按 tag 或 SQL92 表达式筛选。"""
+    """Message selector: filters by tag or SQL92 expression."""
 
     def __init__(self, selector_type: str = ExpressionType.TAG, expression: str = "*"):
         self.type = selector_type
@@ -164,7 +164,7 @@ class MessageSelector:
 
 
 class MessageQueueListener:
-    """队列变更监听器：分配结果变化时收到本实例分到的队列集合。"""
+    """Queue change listener: receives the set of queues assigned to this instance when the allocation result changes."""
 
     def message_queue_changed(self, topic: str, mq_all: Set[MessageQueue],
                               mq_divided: Set[MessageQueue]) -> None:
@@ -172,10 +172,10 @@ class MessageQueueListener:
 
 
 class TopicMessageQueueChangeListener:
-    """topic 队列集合变更监听器。
+    """Topic queue set change listener.
 
-    回调签名 ``on_changed(topic, message_queues)``：队列数**扩/缩容**后
-    集合相对上一次快照有变化才回调，由后台周期比对触发。
+    Callback signature ``on_changed(topic, message_queues)``: after the queue count is **scaled up/down**,
+    the callback fires only if the set changed relative to the previous snapshot, triggered by a periodic background comparison.
     """
 
     def on_changed(self, topic: str, message_queues: Set[MessageQueue]) -> None:
@@ -183,10 +183,10 @@ class TopicMessageQueueChangeListener:
 
 
 class AllocateMessageQueueStrategy:
-    """队列分配策略接口。
+    """Queue allocation strategy interface.
 
-    契约：入参非法时**一律返回空列表**而不抛异常——rebalance 是后台周期任务，
-    一条脏入参不该把消费者打挂。
+    Contract: on invalid input, **always return an empty list** instead of raising -- rebalance is a periodic background task,
+    and one bad input should not take the consumer down.
     """
 
     def allocate(self, consumer_group: str, current_cid: str, mq_all: List[MessageQueue],
@@ -194,33 +194,33 @@ class AllocateMessageQueueStrategy:
         raise NotImplementedError
 
     def get_name(self) -> str:
-        """算法名（AVG 等），用于日志与运维识别。"""
+        """Algorithm name (AVG, etc.), used for logging and operational identification."""
         raise NotImplementedError
 
 
 def _strategy_name(strategy: AllocateMessageQueueStrategy) -> str:
-    """取策略名用于日志。
+    """Get the strategy name for logging.
 
-    业务方可以鸭子类型地传入一个只有 ``allocate`` 的自定义策略对象，
-    所以缺 ``get_name`` 时退化成类名而不是抛 AttributeError。
+    Callers may duck-type in a custom strategy object that only has ``allocate``,
+    so when ``get_name`` is missing this degrades to the class name instead of raising AttributeError.
     """
     getter = getattr(strategy, "get_name", None)
     if callable(getter):
         try:
             return str(getter())
-        except Exception:  # noqa: BLE001 - 日志取值不该影响 rebalance
+        except Exception:  # noqa: BLE001 - logging a value must not affect rebalance
             pass
     return strategy.__class__.__name__
 
 
 class AllocateMessageQueueAveragely(AllocateMessageQueueStrategy):
-    """平均分配：把队列按顺序切成连续几段，逐个消费者分一段。"""
+    """Average allocation: splits the queues into consecutive segments, one segment per consumer."""
 
     def allocate(self, consumer_group: str, current_cid: str, mq_all: List[MessageQueue],
                  cid_all: List[str]) -> List[MessageQueue]:
-        # 守卫顺序：currentCID → mqAll → cidAll。三种情况都只返回空列表而不抛
-        # （rebalance 是后台周期任务，脏入参不该把消费者打挂）；
-        # currentCID 不在 cidAll 时留一条 [BUG] info 日志。
+        # Guard order: currentCID -> mqAll -> cidAll. All three cases only return an empty list without raising
+        # (rebalance is a periodic background task, bad input should not take the consumer down);
+        # when currentCID is not in cidAll, leave a [BUG] info log.
         if not current_cid or not mq_all or not cid_all:
             return []
         if current_cid not in cid_all:
@@ -248,11 +248,11 @@ class AllocateMessageQueueAveragely(AllocateMessageQueueStrategy):
 
 
 class AllocateMessageQueueAveragelyByCircle(AllocateMessageQueueStrategy):
-    """环形平均分配：按消费者序号轮转取队列，每人隔 ``len(cid_all)`` 取一个。"""
+    """Round-robin average allocation: takes queues by consumer index, one per ``len(cid_all)`` step."""
 
     def allocate(self, consumer_group: str, current_cid: str, mq_all: List[MessageQueue],
                  cid_all: List[str]) -> List[MessageQueue]:
-        # 守卫与 Averagely 同款，同样只返回空列表。
+        # Same guard as Averagely, also only returns an empty list.
         if not current_cid or not mq_all or not cid_all:
             return []
         if current_cid not in cid_all:
@@ -270,10 +270,10 @@ class AllocateMessageQueueAveragelyByCircle(AllocateMessageQueueStrategy):
 
 
 class AllocateMessageQueueByConfig(AllocateMessageQueueStrategy):
-    """按显式配置分配：无视 mqAll/cidAll，直接返回配好的队列列表。
+    """Allocation by explicit config: ignores mqAll/cidAll and directly returns the configured queue list.
 
-    __init__ 把 None 规整成空列表、allocate 返回列表副本，避免调用方改到内部状态。
-    ``allocate`` **不**做入参校验，所以空 group / 空 cid_all 也照样返回配置值。
+    __init__ normalizes None into an empty list, and allocate returns a copy of the list so callers cannot mutate internal state.
+    ``allocate`` does **not** validate input, so an empty group / empty cid_all still returns the configured value.
     """
 
     def __init__(self, message_queue_list: Optional[List[MessageQueue]] = None):
@@ -287,24 +287,24 @@ class AllocateMessageQueueByConfig(AllocateMessageQueueStrategy):
         return "CONFIG"
 
 
-# ------------------------------------------------------ 一致性哈希环
+# ------------------------------------------------------ Consistent hash ring
 #
-# 只有 AllocateMessageQueueConsistentHash 用它，但整套按固定形态实现而不做"等价改写"：
-# 环上的落点由 MD5 取字节的方式、虚拟节点命名、tailMap 含端点这三处细节共同决定，
-# 任何一处不同都会让全体队列换主，与其它一致性哈希客户端混跑时表现为重复/漏消费。
+# Only AllocateMessageQueueConsistentHash uses it, but the whole thing is implemented in a fixed form rather than as an "equivalent rewrite":
+# the ring positions are jointly determined by three details -- how MD5 takes bytes, virtual node naming, and whether tailMap includes endpoints --
+# any difference would move every queue to a different owner, which shows up as duplicate/missed consumption when mixed with other consistent-hash clients.
 
 
 class HashFunction:
-    """哈希函数接口：把环上的 key 映射成整数。自定义哈希用它注入策略。"""
+    """Hash function interface: maps a key on the ring to an integer. Use it to inject a custom hash strategy."""
 
     def hash(self, key: str) -> int:
         raise NotImplementedError
 
 
 class MD5Hash(HashFunction):
-    """默认哈希：MD5 摘要的**前 4 字节**按大端拼成整数。
+    """Default hash: the **first 4 bytes** of the MD5 digest concatenated big-endian into an integer.
 
-    ⚠ 只取前 4 字节（不是完整 128 bit），换成其它取法就不是同一个环。
+    WARNING: only the first 4 bytes are taken (not the full 128 bits); any other way of taking them yields a different ring.
     """
 
     def hash(self, key: str) -> int:
@@ -316,14 +316,14 @@ class MD5Hash(HashFunction):
 
 
 class Node:
-    """环上可寻址的节点，物理或虚拟都行；`get_key` 给出被哈希的字符串。"""
+    """An addressable node on the ring, physical or virtual; `get_key` provides the string to be hashed."""
 
     def get_key(self) -> str:
         raise NotImplementedError
 
 
 class ClientNode(Node):
-    """一致性哈希的物理节点：key 就是 clientId。"""
+    """Physical node of the consistent hash: the key is the clientId."""
 
     def __init__(self, client_id: str):
         self.client_id = client_id
@@ -333,7 +333,7 @@ class ClientNode(Node):
 
 
 class VirtualNode(Node):
-    """虚拟节点：key = 物理节点 key + "-" + 副本序号。"""
+    """Virtual node: key = physical node key + "-" + replica index."""
 
     def __init__(self, physical_node: Node, replica_index: int):
         self.physical_node = physical_node
@@ -350,10 +350,10 @@ class VirtualNode(Node):
 
 
 class ConsistentHashRouter:
-    """一致性哈希路由器：把节点哈希成环，路由到顺时针最近的物理节点。
+    """Consistent hash router: hashes nodes into a ring and routes to the nearest physical node clockwise.
 
-    用「升序 key 列表 + dict」实现。查找语义是"取 >= hash 的第一个键"（含端点，
-    相等的 hash 归自己），所以用 `bisect_left`；环空或越过末尾时回绕到首节点。
+    Implemented with "an ascending key list + dict". The lookup semantics are "take the first key >= hash" (endpoint included,
+    an equal hash belongs to itself), hence `bisect_left`; when the ring is empty or past the end, it wraps around to the first node.
     """
 
     def __init__(self, p_nodes: Optional[List[Node]] = None, v_node_count: int = 0,
@@ -368,8 +368,8 @@ class ConsistentHashRouter:
                 self.add_node(p_node, v_node_count)
 
     def add_node(self, p_node: Node, v_node_count: int) -> None:
-        # 已有副本要接着编号，否则同一个物理节点的 v 个虚拟节点
-        # 会全落在同一个 hash 上（分两次 addNode 时靠 i + existingReplicas 区分）。
+        # Existing replicas must continue the numbering, otherwise the v virtual nodes of the same
+        # physical node would all land on the same hash (when addNode is called twice, i + existingReplicas distinguishes them).
         if v_node_count < 0:
             raise ValueError("illegal virtual node counts :%d" % v_node_count)
         existing_replicas = self.get_existing_replicas(p_node)
@@ -378,7 +378,7 @@ class ConsistentHashRouter:
             key = self.hash_function.hash(v_node.get_key())
             if key not in self._ring:
                 bisect.insort(self._keys, key)
-            # 同 hash 时后来者覆盖，环上位置不变
+            # On the same hash the later one overwrites; the ring position stays unchanged
             self._ring[key] = v_node
 
     def remove_node(self, p_node: Node) -> None:
@@ -392,7 +392,7 @@ class ConsistentHashRouter:
             return None
         index = bisect.bisect_left(self._keys, self.hash_function.hash(object_key))
         if index == len(self._keys):
-            index = 0  # 越过环的末尾 → 回绕到第一个
+            index = 0  # Past the end of the ring -> wrap around to the first
         return self._ring[self._keys[index]].get_physical_node()
 
     def get_existing_replicas(self, p_node: Node) -> int:
@@ -400,54 +400,53 @@ class ConsistentHashRouter:
 
 
 def _message_queue_ring_key(mq: MessageQueue) -> str:
-    """一致性哈希的环键（哈希的是**它**，不是 repr）。
+    """The ring key of the consistent hash (**it** is hashed, not the repr).
 
-    ⚠ 必须逐字符等于 `"MessageQueue [topic=.., brokerName=.., queueId=..]"`：
-    Python 自己的 `__repr__` 是另一种写法，拿它去哈希会得到完全不同的环，
-    全体队列都会换主。改动这个格式会破坏兼容。
+    WARNING: must equal `"MessageQueue [topic=.., brokerName=.., queueId=..]"` character for character:
+    Python's own `__repr__` is a different format; hashing with it yields a completely different ring,
+    moving every queue to a different owner. Changing this format breaks compatibility.
     """
     return "MessageQueue [topic=%s, brokerName=%s, queueId=%d]" % (
         mq.topic, mq.broker_name, mq.queue_id)
 
 
 def _split_dropping_trailing_empty(text: str, sep: str) -> List[str]:
-    """按分隔符切分并**丢掉末尾的空段**。
+    """Splits by the separator and **drops trailing empty segments**.
 
-    Python 的 `str.split` 保留尾空段，两种切法对 broker 名的结果不同，而
-    `AllocateMessageQueueByMachineRoom` 恰好按 `len(...) == 2` 判合法，差异会直接改变
-    一条队列参不参与分配：
+    Python's `str.split` keeps trailing empty segments, and the two splits differ in the result for broker names, while
+    `AllocateMessageQueueByMachineRoom` judges validity exactly by `len(...) == 2`, so the difference directly changes
+    whether a queue participates in the allocation:
 
-    | 输入 | 本函数 | Python 原生 `str.split` |
+    | Input | This function | Python native `str.split` |
     |---|---|---|
-    | `"room1@"` | `["room1"]`（1 段，剔除） | `["room1", ""]`（2 段，误收） |
-    | `"room1@b@"` | `["room1", "b"]`（2 段，收） | `["room1", "b", ""]`（3 段，误剔） |
+    | `"room1@"` | `["room1"]` (1 segment, rejected) | `["room1", ""]` (2 segments, wrongly accepted) |
+    | `"room1@b@"` | `["room1", "b"]` (2 segments, accepted) | `["room1", "b", ""]` (3 segments, wrongly rejected) |
     | `"@"` | `[]` | `["", ""]` |
-    | `""` / `"broker-a"` | 无分隔符命中时**整串原样返回**，哪怕是空串 | 同 |
+    | `""` / `"broker-a"` | When no separator matches, the **whole string is returned as-is**, even if empty | Same |
 
-    最后一行的早返回不能省：无命中时不能无条件裁尾（否则 `""` 会变成 `[]`）。
+    The early return on the last line must not be dropped: on no match, trailing empties must not be trimmed unconditionally (otherwise `""` would become `[]`).
     """
     parts = text.split(sep)
     if len(parts) == 1:
-        return parts  # 没命中分隔符：原样返回整串
+        return parts  # No separator matched: return the whole string as-is
     while parts and parts[-1] == "":
         parts.pop()
     return parts
 
 
 class AllocateMessageQueueConsistentHash(AllocateMessageQueueStrategy):
-    """一致性哈希分配，`get_name()` 为 `CONSISTENT_HASH`。
+    """Consistent-hash allocation, `get_name()` is `CONSISTENT_HASH`.
 
-    与 AVG / AVG_BY_CIRCLE 的差别不是"分得均不均"，而是**稳定性**：队列数或消费者数变化时，
-    只有落在新增/移除节点之间弧段上的队列会换主，AVG 则会把所有人的分界整体挪掉。
+    The difference from AVG / AVG_BY_CIRCLE is not "evenness of the split" but **stability**: when the number of queues or consumers changes,
+    only the queues whose hash falls on the arc between the added/removed nodes move to another owner, whereas AVG shifts everyone's boundaries wholesale.
 
-    守卫口径同其它策略：入参非法一律返回空列表。
-    唯一保留抛的是构造函数里的 `virtual_node_cnt < 0`（属于显式配置错误，不在 rebalance
-    后台路径上）。
+    Same guard policy as the other strategies: invalid input always returns an empty list.
+    The only remaining raise is `virtual_node_cnt < 0` in the constructor (an explicit config error, not on the rebalance background path).
     """
 
     def __init__(self, virtual_node_cnt: int = 10,
                  custom_hash_function: Optional[HashFunction] = None):
-        # 默认 10 个虚拟节点、默认 MD5Hash
+        # Default 10 virtual nodes, default MD5Hash
         if virtual_node_cnt < 0:
             raise ValueError("illegal virtualNodeCnt :%d" % virtual_node_cnt)
         self.virtual_node_cnt = virtual_node_cnt
@@ -479,17 +478,17 @@ class AllocateMessageQueueConsistentHash(AllocateMessageQueueStrategy):
 
 
 class AllocateMessageQueueByMachineRoom(AllocateMessageQueueStrategy):
-    """按机房分配，`get_name()` 为 `MACHINE_ROOM`（场景是多逻辑机房部署）。
+    """Allocation by machine room, `get_name()` is `MACHINE_ROOM` (scenario: multi logical machine room deployment).
 
-    约定 broker 名写成 `<机房>@<brokerName>`，只有前缀落在 `consumeridcs` 里的队列参与
-    分配，然后在这些队列内部再做一次"平均分配"（分片算法与 AVG 逐行相同，但 rem 的归属
-    判据是 `rem > currentIndex`，即余数队列发给前 rem 个消费者）。
+    Convention: broker names are written as `<room>@<brokerName>`, only queues whose prefix falls in `consumeridcs` participate
+    in the allocation, and then an "average allocation" runs among those queues (the sharding algorithm is line-by-line identical to AVG, but the ownership criterion for rem
+    is `rem > currentIndex`, i.e. the remainder queues go to the first rem consumers).
 
-    ⚠ broker 名的切分走 [`_split_dropping_trailing_empty`]，不是 Python 原生 `split`：
-    裁尾切法下 `"room1@"` 是 1 段（不参与分配）、`"room1@b@"` 是 2 段（参与）。
+    WARNING: broker names are split via [`_split_dropping_trailing_empty`], not Python native `split`:
+    under the trailing-trimming split, `"room1@"` is 1 segment (does not participate) and `"room1@b@"` is 2 segments (participates).
 
-    ⚠ `consumeridcs` 默认空集合，表现为"一条都不分"，与分配策略一贯的
-    "守卫返回空结果"口径一致。
+    WARNING: `consumeridcs` defaults to an empty set, which behaves as "allocate nothing", consistent with the
+    allocation strategy's usual "guard returns an empty result" policy.
     """
 
     def __init__(self, consumeridcs: Optional[Set[str]] = None):
@@ -531,9 +530,9 @@ class AllocateMessageQueueByMachineRoom(AllocateMessageQueueStrategy):
 
 
 class MachineRoomResolver:
-    """机房解析器：告诉策略"谁在哪个机房"。
+    """Machine room resolver: tells the strategy "who is in which room".
 
-    两个方法**都不能返回 None**（否则该机房视为空，队列会被撤走）。
+    Neither method **may return None** (otherwise that room is treated as empty and its queues are taken away).
     """
 
     def broker_deploy_in(self, message_queue: MessageQueue) -> str:
@@ -544,18 +543,18 @@ class MachineRoomResolver:
 
 
 class AllocateMachineRoomNearby(AllocateMessageQueueStrategy):
-    """机房就近分配：内层策略之上套一层按机房分组。
+    """Machine room nearby allocation: a layer of room grouping on top of the inner strategy.
 
-    代理模式：先按机房把队列和消费者各自分组，
-    1. 本消费者所在机房的队列只分给**同机房**的消费者（用内层策略）；
-    2. 那些**机房里没有任何活消费者**的队列，交给所有消费者按内层策略瓜分——
-       否则它们就没人消费了。
+    Proxy mode: first group the queues and the consumers by room,
+    1. queues in this consumer's room are only allocated to consumers in the **same room** (using the inner strategy);
+    2. queues in rooms that have **no live consumer** are shared by all consumers via the inner strategy --
+       otherwise nobody would consume them.
 
-    `get_name()` 是 `"MACHINE_ROOM_NEARBY" + "-" + 内层策略名`，因为日志里
-    必须能看出实际用的是哪个分配算法。
+    `get_name()` is `"MACHINE_ROOM_NEARBY" + "-" + inner strategy name`, because the logs
+    must show which allocation algorithm is actually in use.
 
-    两个构造参数缺失、以及 resolver 给出空机房时都**照抛**（`ValueError`）：
-    静默返回空列表等于把整个 topic 的队列撤走，而 rebalance 抓住异常时反而会保住现有分配。
+    Both missing constructor arguments, and an empty room from the resolver, **raise** (`ValueError`):
+    silently returning an empty list would take away the queues of the whole topic, whereas rebalance catching the exception preserves the existing allocation.
     """
 
     def __init__(self, allocate_message_queue_strategy: AllocateMessageQueueStrategy,
@@ -576,8 +575,8 @@ class AllocateMachineRoomNearby(AllocateMessageQueueStrategy):
                         consumer_group, current_cid, cid_all)
             return []
 
-        # 按机房分组时按机房名**字典序**遍历，否则同名机房的处理顺序会随插入顺序变
-        # （结果集是并集，顺序也会进日志/断言）。
+        # When grouping by room, iterate in **lexicographic order** of room names, otherwise the processing order
+        # of same-named rooms would follow insertion order (the result set is a union, and the order also enters logs/assertions).
         mr_2_mq: Dict[str, List[MessageQueue]] = {}
         for mq in mq_all:
             room = self.machine_room_resolver.broker_deploy_in(mq)
@@ -595,7 +594,7 @@ class AllocateMachineRoomNearby(AllocateMessageQueueStrategy):
                 raise ValueError("Machine room is null for consumer id %s" % cid)
 
         allocate_results: List[MessageQueue] = []
-        # 1. 本消费者所在机房的队列：只在同机房消费者之间分
+        # 1. Queues in this consumer's room: only distributed among consumers in the same room
         current_machine_room = self.machine_room_resolver.consumer_deploy_in(current_cid)
         mq_in_this_machine_room = mr_2_mq.pop(current_machine_room, None)
         consumer_in_this_machine_room = mr_2_c.get(current_machine_room)
@@ -603,7 +602,7 @@ class AllocateMachineRoomNearby(AllocateMessageQueueStrategy):
             allocate_results += self.allocate_message_queue_strategy.allocate(
                 consumer_group, current_cid, mq_in_this_machine_room,
                 consumer_in_this_machine_room)
-        # 2. 没有活消费者的机房：队列不能没人消费，交给全部消费者
+        # 2. Rooms with no live consumer: queues must not be left unconsumed, hand them to all consumers
         for room in sorted(mr_2_mq):
             if room not in mr_2_c:
                 allocate_results += self.allocate_message_queue_strategy.allocate(
@@ -615,17 +614,17 @@ class AllocateMachineRoomNearby(AllocateMessageQueueStrategy):
             self.allocate_message_queue_strategy)
 
 
-# ---------------- 本地位点文件格式 ----------------
-# 落盘的 `offsetTable` 把 MessageQueue 对象**直接当 JSON key** 写出 —— 严格 JSON 非法，
-# 但本客户端自产自销能读回。字段序固定为 brokerName/queueId/topic（字母序）。
-# 队列 key 仍用 topic+broker+queueId 拼接。写盘格式改动会让历史位点文件读不出来。
+# ---------------- Local offset file format ----------------
+# The on-disk `offsetTable` writes the MessageQueue object **directly as a JSON key** -- strictly invalid JSON,
+# but this client produces and consumes it itself and can read it back. The field order is fixed as brokerName/queueId/topic (alphabetical).
+# Queue keys are still concatenated as topic+broker+queueId. Changing the on-disk format would make historical offset files unreadable.
 def _build_local_offsets_json(items: Dict[str, int],
                               mq_map: Dict[str, MessageQueue]) -> str:
     parts = []
     for key, off in items.items():
         mq = mq_map.get(key)
         if mq is None:
-            # 只写仍持有队列信息的条目
+            # Only write entries that still carry queue info
             continue
         obj = json.dumps({"brokerName": mq.broker_name, "queueId": int(mq.queue_id),
                           "topic": mq.topic}, separators=(",", ":"))
@@ -637,8 +636,8 @@ def _parse_local_offsets_json(text: str) -> Optional[Dict[str, int]]:
     if not text or not text.strip():
         return None
     stripped = text.strip()
-    # 先按严格 JSON 解析（历史版本写过的扁平 map）；"对象作 key"那套格式
-    # 对严格解析必然失败（含 pretty 版），落进下面的容忍扫描器。
+    # First parse as strict JSON (the flat map written by historical versions); the "object-as-key" format
+    # always fails strict parsing (including the pretty version) and falls through to the tolerant scanner below.
     try:
         return {k: int(v) for k, v in json.loads(stripped).items()}
     except (ValueError, AttributeError):
@@ -651,7 +650,7 @@ def _parse_local_offsets_json(text: str) -> Optional[Dict[str, int]]:
 
 
 def _scan_offset_table_body(text: str) -> Optional[list]:
-    """容忍解析 {"offsetTable":{{..}:off,{..}:off}}；失败返回 None。"""
+    """Tolerantly parse {"offsetTable":{{..}:off,{..}:off}}; returns None on failure."""
     m = re.match(r'^\{\s*"offsetTable"\s*:\s*\{(.*)\}\s*\}\s*$', text, re.S)
     if not m:
         return None
@@ -688,14 +687,14 @@ _FIELD_RE = re.compile(r'"(\w+)"\s*:\s*("(?:[^"\\]|\\.)*"|-?\d+)')
 
 
 class PopProcessQueue:
-    """POP 模式的队列状态。
+    """Queue state in POP mode.
 
-    与 pull 模式的 ProcessQueue 不同，POP **没有"已拉未消费"缓冲**：消息一弹出就交给
-    消费线程，确认靠 ack。这里只跟踪两件事：
+    Unlike pull mode's ProcessQueue, POP **has no "pulled but not consumed" buffer**: once a message is popped it goes to the
+    consume thread, and confirmation is by ack. Only two things are tracked here:
 
-    - ``wait_ack_counter``：已弹出但还没 ack / 还没延长不可见时间的条数，用于流控；
-    - ``dropped``：队列是否已被 rebalance 撤走（撤走后本批消息不再消费、也不 ack，
-      交给 invisibleTime 到期后 broker 自动复活重投）。
+    - ``wait_ack_counter``: the count of popped messages not yet acked / with unextended invisibility, used for flow control;
+    - ``dropped``: whether the queue has already been taken away by rebalance (once dropped, this batch is neither consumed nor acked,
+      leaving it to the broker to automatically revive and redeliver once invisibleTime expires).
     """
 
     def __init__(self) -> None:
@@ -709,7 +708,7 @@ class PopProcessQueue:
             self._wait_ack_counter += count
 
     def dec_found_msg(self, count: int) -> None:
-        """入参是**带符号的增量**（调用方传 `-len(msgs)`），这里只做加法。"""
+        """The input is a **signed delta** (the caller passes `-len(msgs)`); only addition happens here."""
         with self._lock:
             self._wait_ack_counter += count
 
@@ -730,15 +729,15 @@ class PopProcessQueue:
 
 
 class DefaultMQPushConsumer:
-    """推模式消费者：订阅表 + 后台拉取/POP + 监听器回调。"""
+    """Push-mode consumer: subscription table + background pull/POP + listener callbacks."""
 
-    # ---------------- POP 模式（5.x 轻量消费）配置 ----------------
+    # ---------------- POP mode (5.x lightweight consumption) config ----------------
     #
-    # POP 的队列来源有两种：broker 侧分配（QUERY_ASSIGNMENT(400) 返回
-    # MessageQueueAssignment(mode=POP)，客户端不做 rebalance），或客户端 rebalance。
-    # 本端口走**客户端 rebalance**（见 _rebalance_pull_threads）：队列由本地按分配策略
-    # 算出，然后每队列独立 POP —— 每队列一个 POP 循环 + ack 确认。
-    # 差别只在于"谁决定分哪些队列"，改动前请先读本段注释。
+    # POP has two sources of queues: broker-side allocation (QUERY_ASSIGNMENT(400) returns
+    # MessageQueueAssignment(mode=POP), no client-side rebalance), or client rebalance.
+    # This port uses **client rebalance** (see _rebalance_pull_threads): queues are computed locally per the allocation
+    # strategy, then each queue is POPped independently -- one POP loop per queue + ack confirmation.
+    # The only difference is "who decides which queues are allocated"; read this comment block before changing it.
 
     def __init__(self, consumer_group: str = MixAll.DEFAULT_CONSUMER_GROUP,
                  rpc_hook: Optional[RPCHook] = None, namespace: str = "",
@@ -746,50 +745,50 @@ class DefaultMQPushConsumer:
         if consumer_group is None or not str(consumer_group).strip():
             raise MQClientException("consumerGroup is empty")
         self.consumer_group = str(consumer_group)
-        # TLS 开关（None = 交给 env ROCKETMQ_TLS_ENABLE 决定）
+        # TLS switch (None = defer to the env ROCKETMQ_TLS_ENABLE)
         self.tls_enable: Optional[bool] = kwargs.pop("tls_enable", None)
-        # TLS 细项（caCert=严格 CA 校验；clientCert/clientKey=mTLS；serverName=主机名覆盖）
+        # TLS details (caCert = strict CA validation; clientCert/clientKey = mTLS; serverName = hostname override)
         self.tls_options: Optional[Dict[str, str]] = kwargs.pop("tls_options", None)
         self.socks_proxy_config: Optional[SocksProxyConfig] = kwargs.pop("socks_proxy_config", None)
         self.namespace = namespace
         self.instance_name = MixAll.DEFAULT_INSTANCE_NAME
         self.client_id: Optional[str] = None
-        # ---- unit / stream 配置 ----
-        # unitName 参与 clientId 的 `@<unitName>` 后缀与动态取址 URL；unitMode 随
-        # ConsumerData 心跳、消息回投请求头和过滤钩子上报给 broker；
-        # enableStreamRequestType 既给 clientId 加 `@STREAM` 后缀（为了
-        # "prevent unexpected reuses of MQClientInstance"），也给每个请求加
-        # `ReqT=0` 扩展字段。推送消费者与 producer 一样默认关闭。
+        # ---- unit / stream config ----
+        # unitName takes part in the clientId's `@<unitName>` suffix and the dynamic addressing URL; unitMode is
+        # reported to the broker along with the ConsumerData heartbeat, message redelivery request header and filter hooks;
+        # enableStreamRequestType both appends the `@STREAM` suffix to clientId (to
+        # "prevent unexpected reuses of MQClientInstance") and adds
+        # the `ReqT=0` extension field to every request. Like the producer, push consumers default to off.
         self.unit_name: Optional[str] = None
         self.unit_mode = False
         self.enable_stream_request_type = False
-        # namespaceV2（5.x 服务端命名空间）：非空时每笔请求带
-        # nsd=true / ns=<值>，见 remoting/rpchook.py 的 NamespaceRpcHook。
+        # namespaceV2 (5.x server-side namespace): when non-empty, every request carries
+        # nsd=true / ns=<value>, see the NamespaceRpcHook in remoting/rpchook.py.
         self.namespace_v2 = ""
         self.message_model = message_model
         self.consume_from_where = ConsumeFromWhere.CONSUME_FROM_LAST_OFFSET
         self.consume_timestamp = time.strftime("%Y%m%d%H%M%S", time.localtime(time.time() - 30 * 60))
-        # ---- 消费线程池 ----
-        # 默认 min=20 **且** max=20 —— 两侧同为 20（早年的 min=20/max=64 是上一代默认值）。
-        # **拉取**路径是"每队列一个拉取线程"（不是共享线程池），只有 **POP**
-        # 路径才真正建线程池。
-        # 两个值同时是"声明值"：consume_thread_max 既是 POP 线程池的 max，也是
-        # update_core_pool_size 的上界（守卫 n < consume_thread_max）。
-        # 因为线程池用**无界**队列（真实并发度 == core），默认配置下 core 只能往**下**
-        # 调（n < 20）—— 这是线程池模型的既有行为，不是额外的限制。
+        # ---- Consume thread pool ----
+        # Default min=20 **and** max=20 -- both sides are 20 (the early min=20/max=64 was the previous generation's default).
+        # The **pull** path is "one pull thread per queue" (not a shared thread pool); only the **POP**
+        # path really creates a thread pool.
+        # Both values are simultaneously "declared values": consume_thread_max is both the POP thread pool's max and the
+        # upper bound of update_core_pool_size (the guard is n < consume_thread_max).
+        # Because the thread pool uses an **unbounded** queue (real concurrency == core), under the default config core can only go **down**
+        # (n < 20) -- this is pre-existing thread-pool model behavior, not an extra restriction.
         self.consume_thread_min = 20
         self.consume_thread_max = 20
-        # 自动弹性阈值（积压条数超过它就尝试调整并发度，默认 100000）。
-        # ⚠ 自动 inc/dec 是**空实现**，见 adjust_thread_pool()：
-        # 保留计算与配置是为了可观测，不要"顺手修好"。
+        # Auto-elastic threshold (when the backlog count exceeds it, concurrency adjustment is attempted; default 100000).
+        # WARNING: the automatic inc/dec is a **no-op**, see adjust_thread_pool():
+        # the computation and config are kept for observability, do not "fix it while you are at it".
         self.adjust_thread_pool_nums_threshold = 100000
-        # 声明式 core pool size，默认 = consume_thread_min
+        # Declarative core pool size, default = consume_thread_min
         self._core_pool_size = self.consume_thread_min
-        # 是否自建执行器：本实现不支持外部注入执行器，故恒为 True
-        # —— update_core_pool_size 的这道守卫恒满足。
+        # Whether the executor is self-built: this implementation does not support externally injected executors, so it is always True
+        # -- the guard of update_core_pool_size therefore always holds.
         self._owns_consume_executor = True
-        # ProcessQueue.msgAccCnt（按队列 key）：最近一次拉取算出的"积压条数"
-        # = 消息上的 MAX_OFFSET 属性 - 该消息的 queueOffset（>0 才更新）
+        # ProcessQueue.msgAccCnt (by queue key): the "backlog count" computed by the most recent pull
+        # = the MAX_OFFSET property on the message - that message's queueOffset (updated only when > 0)
         self._msg_acc_cnt_table: Dict[str, int] = {}
         self.consume_concurrently_max_span = 2000
         self.pull_threshold_for_queue = 1000
@@ -798,16 +797,16 @@ class DefaultMQPushConsumer:
         self.pull_threshold_size_for_topic = -1
         self.pull_interval = 0
         self.pull_timeout_millis = 30000
-        # 长轮询的 suspend 时长（brokerSuspendMaxTimeMillis 默认 20000）。
-        # 注意：这个属性必须在这里初始化——pull 循环会读它，缺了就会每轮抛
-        # AttributeError 并被 _consume_loop 的兜底 except 吞掉，表现为"消费端一条都收不到"。
+        # The suspend duration of long polling (brokerSuspendMaxTimeMillis defaults to 20000).
+        # Note: this property must be initialized here -- the pull loop reads it, and if missing it throws
+        # AttributeError every round and is swallowed by the fallback except of _consume_loop, presenting as "the consumer receives nothing at all".
         self.pull_suspend_timeout_millis = 20000
         self.consume_message_batch_max_size = 1
         self.pull_batch_size = 32
         self.pull_batch_size_in_bytes = 256 * 1024
-        # 默认 false：
-        # true 时每次拉取把订阅表达式放进请求头的 subscription 字段（broker 侧过滤）。
-        # 默认不发 —— broker 不过滤，由客户端的 tag 过滤兜底。
+        # Default false:
+        # when true, every pull puts the subscription expression into the request header's subscription field (broker-side filtering).
+        # Not sent by default -- the broker does not filter, the client's tag filtering is the fallback.
         self.post_subscription_when_pull = False
         self.max_reconsume_times = -1
         self.suspend_current_queue_time_millis = 1000
@@ -816,7 +815,7 @@ class DefaultMQPushConsumer:
         self.name_server_addrs: List[str] = []
         self.rpc_hook = rpc_hook
         self.allocate_strategy: AllocateMessageQueueStrategy = AllocateMessageQueueAveragely()
-        # 订阅表 topic -> SubscriptionData
+        # Subscription table topic -> SubscriptionData
         self.subscription_data: Dict[str, SubscriptionData] = {}
         self.message_listener: Optional[MessageListener] = None
         self._mq_client: Optional[MQClientInstance] = None
@@ -824,34 +823,34 @@ class DefaultMQPushConsumer:
         self._pulling = False
         self._lock = threading.RLock()
         self._consume_threads: List[threading.Thread] = []
-        # 在途批次计数（缓冲里**正在被 listener 消费**的那部分）：
-        # _dispatch_loop 取走批次时 +1、消费收尾（含异常回塞）时 -1。
-        # _pending 与它合起来才是"队列在持消息数"，correctTagsOffset 的闸门两个都要看。
+        # In-flight batch count (the part in the buffer **currently being consumed by the listener**):
+        # +1 when _dispatch_loop takes a batch, -1 at consumption completion (including exception re-enqueue).
+        # _pending together with it is the "queue-held message count"; correctTagsOffset's gate watches both.
         self._msg_queue_inflight: Dict[str, int] = {}
-        # 在途批次的**消息本体**（key → 列表，取走批次时登记、消费收尾时摘除）。
-        # 对应"已分发给 listener、还没 ack"的那部分：
-        # _pending（已拉未分发）∪ _inflight_msgs（已分发未落定）= 队列在持消息全集。
-        # cleanExpiredMsg 的"只看队首（最小位点）"判据在这个并集上取第一条。
+        # The **message bodies** of in-flight batches (key -> list, registered when a batch is taken, removed at consumption completion).
+        # Corresponds to the part "dispatched to the listener but not yet acked":
+        # _pending (pulled but not dispatched) union _inflight_msgs (dispatched but not settled) = the full set of queue-held messages.
+        # cleanExpiredMsg's "only look at the head (minimum offset)" criterion takes the first entry of this union.
         self._inflight_msgs: Dict[str, List[MessageExt]] = {}
         self._offset_table: Dict[str, int] = {}
         self._stop = threading.Event()
-        # ---- 消费进度 / 缓冲 / 锁状态 ----
-        # _offset_table 是"拉取游标"（nextBeginOffset）；_consume_offsets 是
-        # "已消费位点"（批次消费完后的 commitOffset），
-        # 周期持久化到 broker 的是后者。_pending 是已拉未消费缓冲。
+        # ---- Consume progress / buffer / lock state ----
+        # _offset_table is the "pull cursor" (nextBeginOffset); _consume_offsets is
+        # "consumed offset" (the commitOffset after a batch finishes consuming),
+        # and it is the latter that is periodically persisted to the broker. _pending is the pulled-but-unconsumed buffer.
         self._pending: Dict[str, Deque[MessageExt]] = {}
         self._mq_map: Dict[str, MessageQueue] = {}
         self._consume_offsets: Dict[str, int] = {}
-        # 被冻结的位点（allowToUpdate=false）：OFFSET_ILLEGAL 纠错把
-        # 修正值写进 _consume_offsets 后，在途 ack / correctTagsOffset 都不得再改动它，
-        # 直到这条队列按修正位点重建（_rebalance_pull_threads 建新循环时解冻）。
+        # Frozen offsets (allowToUpdate=false): after OFFSET_ILLEGAL correction writes the
+        # corrected value into _consume_offsets, in-flight ack / correctTagsOffset must not change it again,
+        # until this queue is rebuilt at the corrected offset (unfrozen when _rebalance_pull_threads creates a new loop).
         self._frozen_offsets: Set[str] = set()
-        # 每条队列「ProcessQueue 的代号」：队列被撤销（dropped）时 +1。
-        # _dispatch_loop 取批次时连同代号一起取走，ack 前比对——不一致说明这批消息属于
-        # 已被丢弃的旧 ProcessQueue，必须整批作废（少了它，旧批次的 ack 会把刚被 broker
-        # 纠正的位点又推回非法值，客户端与 broker 之间来回弹跳）。
+        # The "ProcessQueue epoch" of each queue: incremented when the queue is revoked (dropped).
+        # _dispatch_loop takes the epoch along with the batch and compares before acking -- a mismatch means this batch belongs
+        # to an already discarded old ProcessQueue and must be voided as a whole (without it, the old batch's ack would push the offset
+        # just corrected by the broker back to an illegal value, bouncing back and forth between client and broker).
         self._queue_epoch: Dict[str, int] = {}
-        # 顺序消费：broker LOCK_BATCH_MQ(41) 确认锁定成功的队列 key 集
+        # Ordered consumption: the set of queue keys that broker LOCK_BATCH_MQ(41) confirmed as locked
         self._lock_ok: Set[str] = set()
         self._flow_control_triggered = 0
         self._dispatch_thread: Optional[threading.Thread] = None
@@ -860,72 +859,72 @@ class DefaultMQPushConsumer:
         self._lock_thread: Optional[threading.Thread] = None
         self._rebalance_thread: Optional[threading.Thread] = None
         self._queue_threads: Dict[str, threading.Thread] = {}
-        # 每队列最近一次"发起拉取/弹出"的时刻。
-        # rebalance 用它判拉取是否停摆（PULL_MAX_IDLE_TIME）。
+        # The most recent moment of "initiating a pull/pop" per queue.
+        # rebalance uses it to judge whether pulling has stalled (PULL_MAX_IDLE_TIME).
         self._last_pull_table: Dict[str, float] = {}
-        # **整个消费者**级别的挂起开关（suspend()/resume() 翻动），与逐队列的 _lock_ok/流控
-        # 无关。循环线程要立即可见，这里靠 CPython 的属性读写出原子性。
+        # The **whole-consumer**-level suspend switch (flipped by suspend()/resume()), unrelated to per-queue _lock_ok/flow control.
+        # Loop threads must see it immediately; here this relies on CPython's attribute read/write atomicity.
         self._paused = False
-        # MessageQueue → 下一轮
-        # 拉取应选的 brokerId（由应答头 suggestWhichBrokerId 驱动，默认主节点 0）
+        # MessageQueue -> which brokerId the next
+        # pull should pick (driven by the response header suggestWhichBrokerId, master 0 by default)
         self._pull_from_which_node: Dict[MessageQueue, int] = {}
-        # ---- 真实 rebalance ----
-        # _assigned 是"当前分给本实例的队列集"，
-        # 由 _do_rebalance() 按分配策略计算；_rebalance_now 用于
-        # NOTIFY_CONSUMER_IDS_CHANGED(40) 触发的即时 rebalance。
+        # ---- Real rebalance ----
+        # _assigned is "the set of queues currently assigned to this instance",
+        # computed by _do_rebalance() per the allocation strategy; _rebalance_now is used for
+        # the immediate rebalance triggered by NOTIFY_CONSUMER_IDS_CHANGED(40).
         self._assigned: List[MessageQueue] = []
         self._rebalance_now = threading.Event()
-        # start() 时刻：rebalance 循环在启动阶段用更短的间隔重试（见 _rebalance_loop）
+        # start() moment: the rebalance loop retries with a shorter interval during startup (see _rebalance_loop)
         self._start_time = time.time()
-        # ---- 消费者心跳（heartbeatBrokerInterval 默认 30s）----
-        # 必需：broker 的 ConsumerManager 只有收到心跳才记录消费组里的 clientId，
-        # rebalance 的 GET_CONSUMER_LIST_BY_GROUP 才有返回。
+        # ---- Consumer heartbeat (heartbeatBrokerInterval defaults to 30s) ----
+        # Required: the broker's ConsumerManager only records the group's clientId after receiving a heartbeat,
+        # otherwise rebalance's GET_CONSUMER_LIST_BY_GROUP has no return.
         self.heartbeat_enabled = True
         self.heartbeat_interval_millis = 30000
-        # 路由刷新周期（pollNameServerInterval 默认 30000ms）。
-        # 只在 start() 建 MQClientInstance 时透传一次，之后修改不生效
-        # （后台调度按启动时的周期排定）。
+        # Route refresh interval (pollNameServerInterval defaults to 30000ms).
+        # Only passed through once when start() builds the MQClientInstance; later changes take no effect
+        # (the background scheduling is arranged with the interval at startup).
         self.poll_name_server_interval = 30000
-        # 已消费位点落盘周期（persistConsumerOffsetInterval 默认 5000ms；
-        # 首次延迟 1000 * 10，此后按本值周期执行）。
-        # 同样只在 start() 时被 ``_offset_persist_loop`` 读一次。
+        # Persist interval for consumed offsets (persistConsumerOffsetInterval defaults to 5000ms;
+        # first delay 1000 * 10, then periodic at this value).
+        # Also read only once by ``_offset_persist_loop`` at start().
         self.persist_consumer_offset_interval = 5000
         self._heartbeat_count = 0
         self._heartbeat_thread: Optional[threading.Thread] = None
-        # ---- POP 模式（5.x 轻量消费）----
-        # 关掉时完全走原来的 pull 长轮询路径，行为与改动前一致。
+        # ---- POP mode (5.x lightweight consumption) ----
+        # When off, it goes entirely through the original pull long-polling path, with behavior identical to before the change.
         self.pop_mode = False
-        # 弹出后对其它实例不可见的时长（popInvisibleTime 默认 60000）
+        # The duration the message stays invisible to other instances after being popped (popInvisibleTime defaults to 60000)
         self.pop_invisible_time = 60000
-        # 单次 POP 的最大条数（popBatchNums 默认 32；broker 侧 >32 会拒）
+        # Max messages per POP (popBatchNums defaults to 32; the broker rejects >32)
         self.pop_batch_nums = 32
-        # 本队列"已弹未 ack"计数器上限，超过就暂停 POP（popThresholdForQueue 默认 96）
+        # Upper bound of this queue's "popped but not acked" counter; POP is paused when exceeded (popThresholdForQueue defaults to 96)
         self.pop_threshold_for_queue = 96
-        # 消费失败时延长不可见时间的梯度（秒）
+        # The delay levels (in seconds) for extending invisibility time on consume failure
         self.pop_delay_level = list(POP_DELAY_LEVEL)
-        # POP 长轮询挂起时长。0 = 短轮询（broker 立即返回或 NO_NEW_MSG）。
-        # ⚠ 非 0 时请求超时必须 > 它，否则客户端先超时。
+        # POP long-polling suspend duration. 0 = short polling (the broker returns immediately or NO_NEW_MSG).
+        # WARNING: when non-0, the request timeout must be greater than it, otherwise the client times out first.
         self.pop_poll_time_millis = 15000
         self.pop_timeout_millis = 25000
-        # 队列 key -> PopProcessQueue（已弹未 ack 计数 + 是否已被 rebalance 撤销）
+        # Queue key -> PopProcessQueue (popped-but-unacked count + whether it has been revoked by rebalance)
         self._pop_queues: Dict[str, PopProcessQueue] = {}
         self._pop_executor: Optional[ConsumeExecutor] = None
-        # POP 顺序请求去重集，相等性 =
-        # (shardingKeyIndex, pq 引用, mq)；shardingKeyIndex 恒 0，pq 用对象身份
+        # POP ordered-request dedup set, equality =
+        # (shardingKeyIndex, pq reference, mq); shardingKeyIndex is always 0, pq uses object identity
         self._pop_orderly_requests: set = set()
-        # ---- 消息轨迹（enableTrace / traceTopic）----
-        # 开启后 start() 注册 ConsumeMessageTraceHook，落 SubBefore/SubAfter 两段轨迹
+        # ---- Message trace (enableTrace / traceTopic) ----
+        # When enabled, start() registers ConsumeMessageTraceHook, recording two trace segments SubBefore/SubAfter
         self.enable_trace = False
-        self.trace_topic: Optional[str] = None      # None → 用 RMQ_SYS_TRACE_TOPIC
-        # 消费统计，start() 时绑定到实例的 manager
+        self.trace_topic: Optional[str] = None      # None -> use RMQ_SYS_TRACE_TOPIC
+        # Consumption stats, bound to the instance's manager at start()
         self._stats_manager: Optional[ConsumerStatsManager] = None
         self.trace_msg_batch_num = 10
         self.consume_message_hook_list: List[ConsumeMessageHook] = []
-        # 投递前过滤钩子
+        # Pre-delivery filter hooks
         self.filter_message_hook_list: List[FilterMessageHook] = []
         self.trace_dispatcher = None
 
-    # ---------------- 配置 ----------------
+    # ---------------- Config ----------------
     def set_namesrv_addr(self, addr: str) -> None:
         self.name_server_addrs = [a.strip() for a in addr.split(";") if a.strip()]
 
@@ -936,25 +935,25 @@ class DefaultMQPushConsumer:
         self.instance_name = name
 
     def set_unit_name(self, unit_name: Optional[str]) -> None:
-        """设置单元名：影响 clientId 后缀与动态取址 URL。"""
+        """Set the unit name: affects the clientId suffix and the dynamic addressing URL."""
         self.unit_name = unit_name
 
     def get_unit_name(self) -> Optional[str]:
         return self.unit_name
 
     def set_unit_mode(self, unit_mode: bool) -> None:
-        """设置单元化模式：随心跳/请求头透传给 broker。"""
+        """Set unit mode: passed through to the broker with the heartbeat/request headers."""
         self.unit_mode = bool(unit_mode)
 
     def is_unit_mode(self) -> bool:
         return self.unit_mode
 
     def set_enable_stream_request_type(self, enable: bool) -> None:
-        """开关 stream 请求类型：影响 clientId 后缀与每笔请求的 ReqT 扩展字段。"""
+        """Toggle the stream request type: affects the clientId suffix and every request's ReqT extension field."""
         self.enable_stream_request_type = bool(enable)
 
     def set_namespace_v2(self, namespace_v2: Optional[str]) -> None:
-        """设置 5.x 服务端命名空间：非空时每笔请求带 nsd=true / ns=<值>。"""
+        """Set the 5.x server-side namespace: when non-empty, every request carries nsd=true / ns=<value>."""
         self.namespace_v2 = namespace_v2
 
     def get_namespace_v2(self) -> Optional[str]:
@@ -974,15 +973,15 @@ class DefaultMQPushConsumer:
         self.consume_from_where = where
 
     def set_consume_timestamp(self, timestamp: str) -> None:
-        """设置 CONSUME_FROM_TIMESTAMP 的起点时间。
+        """Set the start time of CONSUME_FROM_TIMESTAMP.
 
-        格式 ``yyyyMMddHHmmss``（14 位本地时间），默认 30 分钟前。
+        Format ``yyyyMMddHHmmss`` (14-digit local time), default 30 minutes ago.
         """
         self.consume_timestamp = timestamp
 
     def _consume_timestamp_millis(self) -> int:
-        # 解析不了必须硬失败——静默回落到「现在 - 30 分钟」
-        # 会让起点错位无人察觉；start() 也会无条件校验这个字段。
+        # Failure to parse must be a hard failure -- silently falling back to "now - 30 minutes"
+        # would leave the start point misaligned unnoticed; start() also unconditionally validates this field.
         try:
             if len(str(self.consume_timestamp)) != 14:
                 raise ValueError(self.consume_timestamp)
@@ -993,10 +992,10 @@ class DefaultMQPushConsumer:
                 % self.consume_timestamp)
 
     def set_consume_thread_nums(self, n: int) -> None:
-        """便捷方法：min 与 max 一起设。
+        """Convenience method: sets min and max together.
 
-        更细的调节用 ``set_consume_thread_min`` / ``set_consume_thread_max``；
-        本方法保留是为了兼容既有调用点。
+        For finer adjustment use ``set_consume_thread_min`` / ``set_consume_thread_max``;
+        this method is kept for compatibility with existing call sites.
         """
         n = max(1, int(n))
         self.consume_thread_min = n
@@ -1019,25 +1018,25 @@ class DefaultMQPushConsumer:
         return self.consume_thread_max
 
     def set_adjust_thread_pool_nums_threshold(self, value: int) -> None:
-        """设置自动弹性的积压阈值。"""
+        """Set the backlog threshold for auto-elasticity."""
         self.adjust_thread_pool_nums_threshold = int(value)
 
     def get_adjust_thread_pool_nums_threshold(self) -> int:
         return self.adjust_thread_pool_nums_threshold
 
-    # ---------------- 线程弹性 ----------------
+    # ---------------- Thread elasticity ----------------
 
     def update_core_pool_size(self, core_pool_size: int) -> bool:
-        """运行时调整消费并发度。
+        """Adjust the consume concurrency at runtime.
 
-        守卫::
+        Guard::
 
             owns_consume_executor && core_pool_size > 0
-                && core_pool_size <= 32767（Short.MAX_VALUE）
+                && core_pool_size <= 32767 (Short.MAX_VALUE)
                 && core_pool_size < consume_thread_max
 
-        任一条不满足就**静默忽略**，不抛异常。
-        返回值表示"是否真的生效"，便于调用方与测试断言。
+        Any unsatisfied condition is **silently ignored** without raising.
+        The return value means "whether it actually took effect", for callers and test assertions.
         """
         if not self._owns_consume_executor:
             return False
@@ -1050,7 +1049,7 @@ class DefaultMQPushConsumer:
         return True
 
     def get_core_pool_size(self) -> int:
-        """当前 core pool size；非自建执行器时返回 -1。"""
+        """Current core pool size; returns -1 when the executor is not self-built."""
         if not self._owns_consume_executor:
             return -1
         if self._pop_executor is not None:
@@ -1058,36 +1057,36 @@ class DefaultMQPushConsumer:
         return self._core_pool_size
 
     def _apply_core_pool_size(self) -> None:
-        """把声明的 core size 落到真实执行器上（没有执行器时只记声明值）。"""
+        """Apply the declared core size to the real executor (only records the declared value when there is no executor)."""
         if self._pop_executor is not None and self._owns_consume_executor:
             self._pop_executor.set_core_pool_size(self._core_pool_size)
 
     def compute_accumulation_total(self) -> int:
-        """全部队列的积压条数总和。
+        """The total backlog count across all queues.
 
-        即所有 ``msgAccCnt`` 之和：按"每队列"记录最近一次
-        拉取算出的积压条数（见 ``_update_msg_acc_cnt``）。
+        That is, the sum of all ``msgAccCnt``: the backlog count from the most recent
+        pull recorded "per queue" (see ``_update_msg_acc_cnt``).
         """
         with self._lock:
             return sum(self._msg_acc_cnt_table.values())
 
     def adjust_thread_pool(self) -> None:
-        """按积压阈值尝试调整并发度（每分钟调度一次）。
+        """Attempt to adjust concurrency per the backlog threshold (scheduled once per minute).
 
-        ⚠ **这是 no-op**：底层的 ``inc_core_pool_size()`` / ``dec_core_pool_size()``
-        是**空方法体**。这里保留阈值比较与日志，仅为让 ``msgAccCnt`` / 阈值配置
-        可观测、可断言；**不要"修好"它** —— 真正生效的是显式的 ``update_core_pool_size()``。
+        WARNING **this is a no-op**: the underlying ``inc_core_pool_size()`` / ``dec_core_pool_size()``
+        are **empty method bodies**. The threshold comparison and logging are kept here only to make ``msgAccCnt`` / threshold config
+        observable and assertable; **do not "fix" it** -- what actually takes effect is the explicit ``update_core_pool_size()``.
         """
         acc_total = self.compute_accumulation_total()
         threshold = self.adjust_thread_pool_nums_threshold
         inc_threshold = threshold * 1.0
         dec_threshold = threshold * 0.8
         if acc_total >= inc_threshold:
-            # inc_core_pool_size() 是空实现
+            # inc_core_pool_size() is a no-op
             logger.debug("adjustThreadPool: acc=%d >= incThreshold=%d (inc is a no-op upstream)",
                          acc_total, int(inc_threshold))
         if acc_total < dec_threshold:
-            # dec_core_pool_size() 是空实现
+            # dec_core_pool_size() is a no-op
             logger.debug("adjustThreadPool: acc=%d < decThreshold=%d (dec is a no-op upstream)",
                          acc_total, int(dec_threshold))
 
@@ -1095,7 +1094,7 @@ class DefaultMQPushConsumer:
         self.pull_suspend_timeout_millis = int(millis)
 
     def set_post_subscription_when_pull(self, enable: bool) -> None:
-        """开关"拉取时把订阅表达式带进请求头"。"""
+        """Toggle "bring the subscription expression into the request header when pulling"."""
         self.post_subscription_when_pull = bool(enable)
 
     def set_message_listener(self, listener) -> None:
@@ -1104,9 +1103,9 @@ class DefaultMQPushConsumer:
     def set_allocate_message_queue_strategy(self, strategy: AllocateMessageQueueStrategy) -> None:
         self.allocate_strategy = strategy
 
-    # ---------------- 消息轨迹 ----------------
+    # ---------------- Message trace ----------------
     def set_enable_msg_trace(self, enable: bool) -> None:
-        """开关消费侧消息轨迹（等价于构造参数 enableMsgTrace）。"""
+        """Toggle consumer-side message tracing (equivalent to the constructor parameter enableMsgTrace)."""
         self.enable_trace = enable
 
     def set_enable_trace(self, enable: bool) -> None:
@@ -1116,7 +1115,7 @@ class DefaultMQPushConsumer:
         return self.enable_trace
 
     def set_customized_trace_topic(self, trace_topic: Optional[str]) -> None:
-        """自定义轨迹 topic；空则用系统默认 RMQ_SYS_TRACE_TOPIC。"""
+        """Custom trace topic; empty means use the system default RMQ_SYS_TRACE_TOPIC."""
         self.trace_topic = trace_topic
 
     def set_trace_topic(self, trace_topic: Optional[str]) -> None:
@@ -1126,16 +1125,16 @@ class DefaultMQPushConsumer:
         self.trace_msg_batch_num = n
 
     def register_consume_message_hook(self, hook: ConsumeMessageHook) -> None:
-        """注册消费钩子（before/after 回调，用于轨迹与审计）。"""
+        """Register a consume hook (before/after callbacks, for tracing and auditing)."""
         if hook is not None:
             self.consume_message_hook_list.append(hook)
 
     def has_consume_message_hook(self) -> bool:
         return len(self.consume_message_hook_list) > 0
 
-    # ---------------- 投递前过滤钩子 ----------------
+    # ---------------- Pre-delivery filter hooks ----------------
     def register_filter_message_hook(self, hook: FilterMessageHook) -> None:
-        """注册投递前过滤钩子：可在消息交给 listener 前摘掉若干条。"""
+        """Register a pre-delivery filter hook: can drop some messages before they go to the listener."""
         if hook is not None:
             self.filter_message_hook_list.append(hook)
 
@@ -1143,12 +1142,12 @@ class DefaultMQPushConsumer:
         return len(self.filter_message_hook_list) > 0
 
     def execute_filter_message_hook(self, context: FilterMessageContext) -> None:
-        """钩子异常一律吞掉并记 error。"""
+        """Hook exceptions are always swallowed and logged as errors."""
         execute_filter_hooks(self.filter_message_hook_list, context)
 
     def _filter_messages_for_delivery(self, mq: MessageQueue, sub: Optional[SubscriptionData],
                                       msgs: List[MessageExt]) -> List[MessageExt]:
-        """投递前过滤（见模块级 filter_messages_for_delivery 的说明）。"""
+        """Pre-delivery filtering (see the module-level filter_messages_for_delivery for details)."""
         return filter_messages_for_delivery(self.consumer_group, self.filter_message_hook_list,
                                             mq, sub, msgs, self.unit_mode)
 
@@ -1168,7 +1167,7 @@ class DefaultMQPushConsumer:
 
     def _build_consume_hook_context(self, msgs: List[MessageExt],
                                     mq: MessageQueue) -> ConsumeMessageContext:
-        """构造消费钩子上下文：success=False、props 为空字典、access_channel=LOCAL。"""
+        """Build the consume hook context: success=False, props is an empty dict, access_channel=LOCAL."""
         context = ConsumeMessageContext(self.consumer_group, msgs, mq)
         context.success = False
         context.props = {}
@@ -1177,12 +1176,12 @@ class DefaultMQPushConsumer:
 
     def _consume_return_type(self, status, has_exception: bool, consume_rt_ms: float,
                              failed: bool, succeeded: bool) -> ConsumeReturnType:
-        """returnType 判定（决定轨迹的 contextCode）。
+        """returnType determination (decides the trace's contextCode).
 
-        判定顺序：status == null → EXCEPTION/RETURNNULL；RT >= consumeTimeout
-        （分钟）→ TIME_OUT；RECONSUME_LATER → FAILED；CONSUME_SUCCESS → SUCCESS。
-        顺序消费把「挂起」等价于 FAILED、成功等价于 SUCCESS，由调用方用
-        failed/succeeded 两个标志传入。
+        Order of determination: status == null -> EXCEPTION/RETURNNULL; RT >= consumeTimeout
+        (minutes) -> TIME_OUT; RECONSUME_LATER -> FAILED; CONSUME_SUCCESS -> SUCCESS.
+        For ordered consumption, "suspend" is equivalent to FAILED and success is equivalent to SUCCESS, passed in by the caller via
+        the two flags failed/succeeded.
         """
         if status is None:
             return ConsumeReturnType.EXCEPTION if has_exception else ConsumeReturnType.RETURNNULL
@@ -1195,10 +1194,10 @@ class DefaultMQPushConsumer:
         return ConsumeReturnType.SUCCESS
 
     def _record_consume_rt(self, topic: str, begin_ms: float) -> None:
-        """消费耗时记数：每个批次**无条件**记一次。
+        """Consume RT counting: once per batch, **unconditionally**.
 
-        与 ok/failed 计数分开：RT 直方图每次消费都记，而 TPS 只在结果落在某个分支时才记
-        （顺序消费的 ``COMMIT``/``ROLLBACK`` 分支一个 TPS 都不加，但 RT 照记）。
+        Separate from the ok/failed counts: the RT histogram is recorded on every consume, while TPS is only recorded when the result falls into some branch
+        (ordered consumption's ``COMMIT``/``ROLLBACK`` branches add no TPS at all, but RT is still recorded).
         """
         if self._stats_manager is None:
             return
@@ -1207,10 +1206,10 @@ class DefaultMQPushConsumer:
 
     def _record_consume_stats(self, topic: str, msg_count: int, begin_ms: float,
                               failed: bool, ack_count: Optional[int] = None) -> None:
-        """消费侧 TPS 记数：OK / FAILED 两个计数。
+        """Consumer-side TPS counting: the two counts OK / FAILED.
 
-        ``ack_count`` 就是 ``ok = ackIndex + 1``：
-        部分 ack 时前缀算 OK、尾巴算 FAILED。不传则按整批算（顺序/POP 路径的旧口径）。
+        ``ack_count`` is simply ``ok = ackIndex + 1``:
+        on partial ack the prefix counts as OK and the tail counts as FAILED. If not passed, the whole batch is counted (the old policy for ordered/POP paths).
         """
         if self._stats_manager is None:
             return
@@ -1227,13 +1226,13 @@ class DefaultMQPushConsumer:
     def _finish_consume_hook(self, hook_ctx: Optional[ConsumeMessageContext], status,
                              has_exception: bool, begin_ms: float, failed: bool,
                              succeeded: bool, hook_status=None) -> None:
-        """把 returnType/status/success 写回上下文并触发 after 钩子。
+        """Write returnType/status/success back into the context and trigger the after hook.
 
-        ``status`` 是决定 returnType 的那一个；``hook_status`` 是写进上下文的那个 ——
-        这两步用的**不是同一个值**：returnType 在 status 归一化（null →
-        RECONSUME_LATER / 挂起）**之前**算好，而
-        context.status 拿的是归一化**之后**的值。
-        不传 ``hook_status`` 时两者相同。
+        ``status`` is the one that decides returnType; ``hook_status`` is the one written into the context --
+        these two steps do **not** use the same value: returnType is computed **before** status normalization (null ->
+        RECONSUME_LATER / suspend), while
+        context.status takes the value **after** normalization.
+        When ``hook_status`` is not passed, the two are the same.
         """
         if hook_ctx is None:
             return
@@ -1248,18 +1247,18 @@ class DefaultMQPushConsumer:
         return self.consumer_group
 
     def subscriptions(self) -> List[SubscriptionData]:
-        """本消费者当前的订阅集合。
+        """The consumer's current subscription set.
 
-        给 ``MQClientInstance#check_client_in_broker`` 用（它按实例遍历，不看具体消费者类型）。
+        Used by ``MQClientInstance#check_client_in_broker`` (it iterates by instance and does not look at the specific consumer type).
         """
         return list(self.subscription_data.values())
 
-    # ---------------- 订阅 ----------------
+    # ---------------- Subscription ----------------
     def subscribe(self, topic: str, sub_expression: str = "*") -> None:
-        """订阅 topic。
+        """Subscribe to a topic.
 
-        ``start()`` 之后**仍可**调用：订阅表是活的（心跳与重平衡每轮都重读它），
-        put 进去之后立即发一次心跳（见 ``_notify_subscription_changed``）。
+        Can **still** be called after ``start()``: the subscription table is live (the heartbeat and rebalance re-read it every round),
+        and an immediate heartbeat is sent once it is put in (see ``_notify_subscription_changed``).
         """
         topic = self._with_namespace(topic)
         sub = FilterAPI.build_subscription_data(topic, sub_expression)
@@ -1268,14 +1267,14 @@ class DefaultMQPushConsumer:
         self._notify_subscription_changed(topic)
 
     def subscribe_with_selector(self, topic: str, selector: MessageSelector) -> None:
-        """按选择器订阅 topic（tag / SQL92 / 类过滤）。
+        """Subscribe to a topic by selector (tag / SQL92 / class filter).
 
-        同 ``subscribe``：start() 之后可调用，并立即发一次心跳。
+        Same as ``subscribe``: callable after start(), and an immediate heartbeat is sent.
         """
         topic = self._with_namespace(topic)
-        # 按表达式类型构建订阅数据（FilterAPI.build 口径）：
-        #   TAG（或 type 为空）→ 走 buildSubscriptionData（填 tagsSet + codeSet）
-        #   其它（SQL92 / CLASS_FILTER）→ 只设 topic/subString/expressionType，两个集合留空
+        # Build the subscription data by expression type (FilterAPI.build policy):
+        #   TAG (or empty type) -> buildSubscriptionData (fills tagsSet + codeSet)
+        #   others (SQL92 / CLASS_FILTER) -> only set topic/subString/expressionType, leaving both sets empty
         if selector.type == ExpressionType.TAG:
             sub = FilterAPI.build_subscription_data(topic, selector.expression)
             sub.expression_type = selector.type
@@ -1289,24 +1288,24 @@ class DefaultMQPushConsumer:
         self._notify_subscription_changed(topic)
 
     def unsubscribe(self, topic: str) -> None:
-        """取消订阅：**只删表项、不发心跳**。
+        """Unsubscribe: **only removes the table entry, no heartbeat**.
 
-        后一轮心跳自然带出新订阅集，所以本方法
-        不调 ``_notify_subscription_changed``，只有 ``subscribe`` 会立即推心跳。
+        The next heartbeat round naturally carries the new subscription set, so this method
+        does not call ``_notify_subscription_changed``; only ``subscribe`` pushes a heartbeat immediately.
         """
         with self._lock:
             self.subscription_data.pop(self._with_namespace(topic), None)
 
     def _notify_subscription_changed(self, topic: str) -> None:
-        """订阅表新增/更新后的立即动作：同步推一轮心跳 + 登记 topic 在用。
+        """Immediate actions after the subscription table is added/updated: synchronously push one heartbeat round + register the topic as in use.
 
-        为什么必须立即推：broker 的 ``ConsumerManager`` 只在收到心跳时才把 topic→group 记进
-        **它自己那张** topicGroupTable（ClientManageProcessor → registerConsumer），而
-        ``QUERY_TOPIC_CONSUME_BY_WHO(300)`` 读的正是这张表；晚一轮就是默认 30s 的空窗。
+        Why it must be pushed immediately: the broker's ``ConsumerManager`` only records topic->group into
+        **its own** topicGroupTable when a heartbeat is received (ClientManageProcessor -> registerConsumer), and
+        ``QUERY_TOPIC_CONSUME_BY_WHO(300)`` reads exactly that table; one round late is a 30s blind spot by default.
 
-        另外把新 topic 登记为「在用」，让后台路由刷新任务覆盖到它 ——
-        刷新的 topic 集合来自消费者的**当前**订阅表，而不是启动时的快照。
-        未启动时没有 client 实例，只落订阅表。
+        Also register the new topic as "in use" so the background route refresh task covers it --
+        the refreshed topic set comes from the consumer's **current** subscription table, not a snapshot from startup.
+        When not started there is no client instance, and only the subscription table is updated.
         """
         if not self._started or self._mq_client is None:
             return
@@ -1317,26 +1316,26 @@ class DefaultMQPushConsumer:
             logger.debug("immediate heartbeat after subscribe(%s) failed: %s", topic, e)
 
     def _with_namespace(self, topic: str) -> str:
-        """topic 拼命名空间前缀；未配命名空间时原样返回。"""
+        """Prefix the topic with the namespace; returns as-is when no namespace is configured."""
         if not self.namespace:
             return topic
         return NamespaceUtil.wrap_namespace(self.namespace, topic)
 
-    # ---------------- 配置数值闸门 ----------------
+    # ---------------- Config value gates ----------------
     def _check_config_ranges(self) -> None:
-        """配置数值闸门：逐项校验区间。
+        """Config value gates: validates the ranges item by item.
 
-        顺序、区间和文案都是刻意定的（错误串按约定不带 FAQ 后缀）。
-        比较一律是 ``< lo || > hi`` 严格不等 —— ``pop_batch_nums`` 那条写的是 ``<= 0``，
-        对整数等价于 ``< 1``。
+        The order, ranges, and wording are all deliberate (error strings by convention carry no FAQ suffix).
+        Comparisons are always the strict inequality ``< lo || > hi`` -- the ``pop_batch_nums`` one is written as ``<= 0``,
+        which for integers is equivalent to ``< 1``.
 
-        为什么要在 ``start()`` 拦：这些值直接决定缓冲水位与线程池规模。写成 0 或
-        ``2**31-1`` 时**没有一道闸门**的话，要么每轮拉取都被 ``threshold <= 0`` 判成
-        积压而永久停拉（消费端静默收不到消息），要么整数溢出把 drop/流控判断整个绕开。
-        到 broker 侧再报错已经晚了几拍，且错误信息只到日志里。
+        Why gate it in ``start()``: these values directly determine buffer levels and thread pool size. Without **any gate**,
+        writing 0 or ``2**31-1`` would either have every pull judged as backlog by ``threshold <= 0`` and stop pulling forever
+        (the consumer silently receives no messages), or integer overflow would bypass the drop/flow-control checks entirely.
+        Reporting the error on the broker side is already several beats late, and the error message only reaches the logs.
 
-        注意：``pull_threshold_for_topic`` / ``pull_threshold_size_for_topic`` 的 ``-1`` 是
-        "未设置，用 queue 级阈值"哨兵，**不**在区间内也**不**报错。
+        Note: the ``-1`` of ``pull_threshold_for_topic`` / ``pull_threshold_size_for_topic`` is
+        a "not set, use the queue-level threshold" sentinel, which is **not** in range and also does **not** error.
         """
         # consumeThreadMin
         if self.consume_thread_min < 1 or self.consume_thread_min > 1000:
@@ -1384,42 +1383,42 @@ class DefaultMQPushConsumer:
         if self.pop_batch_nums <= 0 or self.pop_batch_nums > 32:
             raise MQClientException("popBatchNums Out of range [1, 32]")
 
-    # ---------------- 生命周期 ----------------
+    # ---------------- Lifecycle ----------------
     def start(self) -> None:
         with self._lock:
             if self._started:
                 return
-            # 消费组也拼命名空间（setConsumerGroup(withNamespace(consumerGroup))）。
-            # 必须在算重试主题之前：重试主题 = %RETRY% + 带前缀的组名。
+            # The consumer group is also namespaced (setConsumerGroup(withNamespace(consumerGroup))).
+            # Must happen before computing the retry topic: retry topic = %RETRY% + the prefixed group name.
             if self.namespace:
                 self.consumer_group = NamespaceUtil.wrap_namespace(self.namespace, self.consumer_group)
-            # 先 validators.check_group（blank / 120 长度 / 字符表），再挡 DEFAULT_CONSUMER
-            # —— 共用默认组会让 broker 侧的订阅关系判定把两组混在一起，回投与重平衡都错乱。
-            # 组名校验排在订阅/地址检查之前。
+            # First validators.check_group (blank / 120 length / character table), then block DEFAULT_CONSUMER
+            # -- sharing the default group would make the broker's subscription judgment mix the two groups, scrambling redelivery and rebalance.
+            # Group name validation comes before the subscription/address checks.
             validators.check_group(self.consumer_group)
             if self.consumer_group == MixAll.DEFAULT_CONSUMER_GROUP:
                 raise MQClientException(
                     "consumerGroup can not equal %s, please specify another one."
                     % MixAll.DEFAULT_CONSUMER_GROUP)
             if not self.name_server_addrs and not DefaultTopAddressing.is_configured():
-                # 静态地址与动态取址（ROCKETMQ_NAMESRV_DOMAIN）二选一必须可用
+                # Static addresses and dynamic addressing (ROCKETMQ_NAMESRV_DOMAIN): one of the two must be available
                 raise MQClientException("name server address is not set")
             if not self.subscription_data:
                 raise MQClientException("subscription is not set, call subscribe() first")
             if self.message_listener is None:
                 raise MQClientException("message listener is not set")
-            # 启动即无条件校验起点时间，
-            # 而不是等到 rebalance 里抛错、被 compute_pull_from_where 的兜底吞掉。
+            # The start time is unconditionally validated at startup,
+            # rather than waiting for rebalance to throw and be swallowed by compute_pull_from_where's fallback.
             self._consume_timestamp_millis()
-            # 分配策略为 None 直接拒绝启动。
+            # A None allocation strategy rejects startup directly.
             if self.allocate_strategy is None:
                 raise MQClientException("allocateMessageQueueStrategy is null")
-            # 数值闸门排在所有 null 检查之后、任何网络动作之前：坏配置必须在建 MQClientInstance
-            # 之前失败，否则起了后台线程再抛错就泄漏线程了。
+            # The value gates run after all null checks and before any network action: bad config must fail
+            # before the MQClientInstance is built, otherwise background threads would be started and then leak on error.
             self._check_config_ranges()
-            # 只有 CLUSTERING 才把 instanceName 改成 PID（BROADCASTING 保持 "DEFAULT"，
-            # 这样同进程的广播消费者能复用同一份客户端实例），再由
-            # ``MixAll.client_id_for`` 拼 `<本机 IP>@<instanceName>[@<unitName>][@STREAM]`。
+            # Only CLUSTERING renames instanceName to the PID (BROADCASTING keeps "DEFAULT",
+            # so broadcasting consumers in the same process can reuse the same client instance), then
+            # ``MixAll.client_id_for`` builds `<local IP>@<instanceName>[@<unitName>][@STREAM]`.
             if self.message_model == MessageModel.CLUSTERING:
                 self.instance_name = MixAll.change_instance_name_to_pid(self.instance_name)
             if self.client_id is None:
@@ -1445,50 +1444,50 @@ class DefaultMQPushConsumer:
             try:
                 self._mq_client.start()
             except Exception:
-                # 启动失败不能留下悬空的引用计数（实例自己也会把自己从缓存摘掉）。
+                # Startup failure must not leave a dangling reference count (the instance also removes itself from the cache).
                 manager.unregister_client(self.client_id, self._mq_client)
                 raise
-            # 动态 name server：实例启动时可能已从地址服务器拿到地址，回填到本消费者，
-            # 让 consumerRunningInfo 等处能看到。
+            # Dynamic name server: the instance may have already obtained addresses from the address server at startup; backfill them into this consumer
+            # so consumerRunningInfo and other places can see them.
             if not self.name_server_addrs and self._mq_client.name_server_addrs:
                 self.name_server_addrs = list(self._mq_client.name_server_addrs)
-            # 消费统计（实例级共享）
+            # Consumption stats (shared at the instance level)
             self._stats_manager = self._mq_client.consumer_stats_manager
             self._mq_client.register_consumer(self.consumer_group, self)
             self._started = True
             self._start_time = time.time()
             self._stop.clear()
-            # 集群模式自动订阅重试 topic（retryTopic = MixAll.get_retry_topic(consumer_group)），
-            # broker 重投的消息写到这里
+            # In cluster mode, automatically subscribe to the retry topic (retryTopic = MixAll.get_retry_topic(consumer_group)),
+            # where broker-redelivered messages are written
             if self.message_model != MessageModel.BROADCASTING:
                 retry_topic = MixAll.get_retry_topic(self.consumer_group)
                 if retry_topic not in self.subscription_data:
-                    # 重试 topic 用 SUB_ALL 建订阅：
-                    # SUB_ALL 下 tagsSet / codeSet 都为**空**（不是 {"*"}），见 subscription_data.FilterAPI
+                # The retry topic subscription is built with SUB_ALL:
+                # under SUB_ALL tagsSet / codeSet are both **empty** (not {"*"}), see subscription_data.FilterAPI
                     sub = FilterAPI.build_subscription_data(retry_topic, "*")
                     self.subscription_data[retry_topic] = sub
-            # broker 主动通知 40（消费者上下线 → 立即重算）**不**在这里注册处理器：
-            # 它注册在实例级（MQClientInstance），一个 code 只有一个处理器，
-            # 每个消费者各自注册会互相覆盖。收到后扇给
-            # 已登记的每个消费者（见 ``rebalance_immediately``）。
-        # POP 模式的消费线程池必须在 rebalance 之前建好：rebalance 会立刻起每队列的 POP
-        # 循环，而循环拿到消息后要投递到这里。
+            # Broker notification 40 (consumer up/down -> immediate recompute) is **not** registered with a handler here:
+            # it is registered at the instance level (MQClientInstance), where one code has only one handler,
+            # and each consumer registering its own would overwrite the others. On receipt it is fanned out to
+            # each registered consumer (see ``rebalance_immediately``).
+        # The POP mode consume thread pool must be built before rebalance: rebalance immediately starts each queue's POP
+        # loop, and the loop delivers fetched messages here.
         if self.pop_mode:
-            # core=consumeThreadMin、max=consumeThreadMax、队列无界
-            # （因此**真实并发度 == core**）。为了拿到 core/max 两档语义，这里用自实现的
-            # ConsumeExecutor（标准库 ThreadPoolExecutor 只有 max 一个上限）。
+            # core=consumeThreadMin, max=consumeThreadMax, unbounded queue
+            # (hence **real concurrency == core**). To get the two-tier core/max semantics, the self-implemented
+            # ConsumeExecutor is used here (the standard library's ThreadPoolExecutor has only a max cap).
             self._pop_executor = ConsumeExecutor(
                 core_pool_size=max(1, self._core_pool_size),
                 maximum_pool_size=max(1, self.consume_thread_max),
                 thread_name_prefix="rmq-popconsume-%s" % self.consumer_group)
-        # start 的顺序：
-        # 拉一次路由 → 发心跳（broker 先认识本消费者）→ 立即 rebalance → 起消费线程。
-        # 心跳必须在 rebalance 之前：rebalance 要向 broker 查消费者列表。
+        # The order of start:
+        # refresh routes once -> send a heartbeat (so the broker knows this consumer) -> rebalance immediately -> start consume threads.
+        # The heartbeat must come before rebalance: rebalance queries the broker for the consumer list.
         self._refresh_routes()
-        # 路由到手之后、心跳之前，把非 TAG 订阅发给 broker 校验
-        # （CHECK_CLIENT_CONFIG 46）。SQL92 写错时 broker 的过滤层
-        # 拿不到编译数据会**静默放行全部消息**，只有这一步能让它变成启动期错误；
-        # 这一步失败时 shutdown() 并把异常抛给调用方。
+        # After routes arrive and before the heartbeat, send non-TAG subscriptions to the broker for validation
+        # (CHECK_CLIENT_CONFIG 46). When SQL92 is wrong, the broker's filter layer
+        # cannot get the compiled data and **silently passes all messages**; only this step can turn that into a startup error;
+        # if this step fails, shutdown() is called and the exception is re-raised to the caller.
         try:
             self._mq_client.check_client_in_broker()
         except Exception:
@@ -1498,7 +1497,7 @@ class DefaultMQPushConsumer:
             self._send_heartbeat_to_all_broker()
         except Exception as e:  # noqa: BLE001
             logger.debug("initial heartbeat failed: %s", e)
-        # 首轮分配必须同步完成：否则拉取线程会在空分配集上白转，直到第一轮 rebalance 才生效
+        # The first allocation round must complete synchronously: otherwise pull threads spin on an empty allocation set until the first rebalance round takes effect
         try:
             self._do_rebalance()
         except Exception as e:  # noqa: BLE001
@@ -1506,8 +1505,8 @@ class DefaultMQPushConsumer:
         self._start_heartbeat_loop()
         self._start_pull_loop()
         self._start_dispatch_loop()
-        # 挂起 listener 的清扫调度只在**经典并发**路径存在：
-        # 顺序消费的清理入口本来就直接返回，POP 路径也没有对应的调度。
+        # The suspended listener's cleanup scheduling exists only on the **classic concurrent** path:
+        # ordered consumption's cleanup entry simply returns, and the POP path has no corresponding scheduling.
         if not self._is_orderly() and not self.pop_mode:
             self._start_clean_expire_loop()
         self._start_offset_persist_loop()
@@ -1516,19 +1515,19 @@ class DefaultMQPushConsumer:
                              name="rmq-rebalance-%s" % self.consumer_group)
         t.start()
         self._rebalance_thread = t
-        # 消息轨迹分发器：
-        # 放在消费循环全部起来之后，避免轨迹生产者的初始化拖慢首次 rebalance。
+        # Message trace dispatcher:
+        # started after all consume loops are up, to avoid the trace producer's initialization slowing the first rebalance.
         self._start_trace_dispatcher()
 
     def _start_trace_dispatcher(self) -> None:
-        """enable_trace=true 时建 AsyncTraceDispatcher（Type=CONSUME）并注册消费钩子。"""
+        """When enable_trace=true, build an AsyncTraceDispatcher (Type=CONSUME) and register a consume hook."""
         if self.enable_trace:
             try:
                 dispatcher = AsyncTraceDispatcher(
                     self.consumer_group, TraceDispatcherType.CONSUME,
                     self.trace_msg_batch_num, self.trace_topic, self.rpc_hook)
                 dispatcher.set_host_consumer(self)
-                # 轨迹生产者也要带上 5.x 命名空间。
+                # The trace producer also needs the 5.x namespace.
                 dispatcher.set_namespace_v2(self.namespace_v2)
                 self.trace_dispatcher = dispatcher
                 self.register_consume_message_hook(ConsumeMessageTraceHook(dispatcher))
@@ -1545,7 +1544,7 @@ class DefaultMQPushConsumer:
             if not self._started:
                 return
             self._stop.set()
-            # POP：把所有队列标成 dropped，在途批次不再 ack（交给 broker 复活重投）
+            # POP: mark all queues as dropped, in-flight batches are no longer acked (leave them to the broker to revive and redeliver)
             if self.pop_mode:
                 for pq in self._pop_queues.values():
                     pq.set_dropped(True)
@@ -1553,15 +1552,15 @@ class DefaultMQPushConsumer:
                 if self._pop_executor is not None:
                     self._pop_executor.shutdown(wait=False)
                     self._pop_executor = None
-        # 退出前把已消费位点持久化一次（按当下持有的队列全量落盘）。
-        # 注意必须在 _started=False 之前调（_require_client）。
+        # Persist consumed offsets once before exiting (a full flush of the currently held queues).
+        # Must be called before _started=False (_require_client).
         try:
             self._persist_offsets_once()
         except Exception as e:  # noqa: BLE001
             logger.debug("persist offsets on shutdown failed: %s", e)
-        # 顺序消费清退时解锁队列（unlockAll）。
-        # POP 顺序服务走同一个入口，而它只读 processQueueTable —— POP 模式下是空表，
-        # 所以不发报文。
+        # Ordered consumption unlocks queues on shutdown (unlockAll).
+        # The POP ordered service goes through the same entry point, and it only reads processQueueTable -- an empty table in POP mode,
+        # so no message is sent.
         if self._is_orderly() and not self.pop_mode \
                 and self.message_model != MessageModel.BROADCASTING:
             try:
@@ -1570,9 +1569,9 @@ class DefaultMQPushConsumer:
                     self._require_client().unlock_batch_mq(self.consumer_group, self.client_id or "", mqs)
             except Exception as e:  # noqa: BLE001
                 logger.debug("unlock on shutdown failed: %s", e)
-        # 优雅注销：立刻从各 broker 的 ConsumerManager 摘除本组，
-        # 不必等心跳超时（默认 ~120s）——否则这段时间内
-        # 消费者变更通知/事务回查仍可能发往本已退出的实例。
+        # Graceful unregister: immediately remove this group from each broker's ConsumerManager,
+        # without waiting for heartbeat timeout (default ~120s) -- otherwise during that window
+        # consumer change notifications / transaction checks may still be sent to this already-exited instance.
         try:
             self._require_client().unregister_client_all_brokers(
                 self.client_id or "", "", self.consumer_group)
@@ -1603,7 +1602,7 @@ class DefaultMQPushConsumer:
             if t.is_alive():
                 t.join(timeout=2)
         self._consume_threads.clear()
-        # 轨迹分发器最后关（flush 剩余轨迹）
+        # The trace dispatcher is closed last (flushing the remaining traces)
         if self.trace_dispatcher is not None:
             try:
                 self.trace_dispatcher.shutdown()
@@ -1611,25 +1610,25 @@ class DefaultMQPushConsumer:
                 logger.warning("trace dispatcher shutdown failed: %s", e)
 
     def suspend(self) -> None:
-        """挂起本消费者。
+        """Suspend this consumer.
 
-        只翻一个布尔：拉取/弹出循环每轮在挂起闸门处退避
-        ``PULL_TIME_DELAY_WHEN_SUSPEND``（1000ms）后重试，**不会退出**，
-        也仍然继续为 lastPullTimestamp 盖章，所以挂起不等于停摆、分配不会被 rebalance 摘走。
-        已拉到本地的消息照常消费（闸门只管发起下一轮拉取）。
+        Only flips one boolean: the pull/pop loop backs off at the suspend gate each round
+        ``PULL_TIME_DELAY_WHEN_SUSPEND`` (1000ms) and retries, **without exiting**,
+        and still stamps lastPullTimestamp, so suspending is not stalling and the allocation is not taken away by rebalance.
+        Messages already fetched locally are consumed as usual (the gate only governs initiating the next pull).
         """
         self._paused = True
         logger.info("suspend this consumer, %s", self.consumer_group)
 
     def resume(self) -> None:
-        """解除挂起：置回 false 并立刻触发一次重平衡。"""
+        """Resume from suspension: set back to false and trigger one rebalance immediately."""
         self._paused = False
-        # 挂起期间可能有队列变更没被处理：resume 里主动触发一次重平衡。
+        # Queue changes during suspension may have gone unprocessed: resume actively triggers one rebalance.
         self.rebalance_immediately()
         logger.info("resume this consumer, %s", self.consumer_group)
 
     def is_paused(self) -> bool:
-        """当前是否处于挂起态。"""
+        """Whether the consumer is currently suspended."""
         return self._paused
 
     def _require_client(self) -> MQClientInstance:
@@ -1637,13 +1636,13 @@ class DefaultMQPushConsumer:
             raise MQClientException("consumer not started, call start() first")
         return self._mq_client
 
-    # ---------------- 心跳（消费者注册） ----------------
+    # ---------------- Heartbeat (consumer registration) ----------------
     def _refresh_routes(self) -> None:
-        """订阅 topic 的路由拉一遍，顺带把 broker 地址表填上（心跳要靠它）。
+        """Pull the routes of subscribed topics once, and fill in the broker address table along the way (the heartbeat relies on it).
 
-        同时把订阅 topic 登记为「在用」，交给 MQClientInstance 的后台任务周期刷新路由
-        （``subscriptions()`` → 逐个 topic 刷路由）。
-        这样新 topic 被 broker 创建、队列扩容等变化无需等下一次 rebalance 才发现。
+        Also register the subscribed topics as "in use", handing them to MQClientInstance's background task for periodic route refresh
+        (``subscriptions()`` -> refresh the routes topic by topic).
+        This way changes like a new topic being created by the broker or queue scaling are discovered without waiting for the next rebalance.
         """
         client = self._require_client()
         with self._lock:
@@ -1659,9 +1658,9 @@ class DefaultMQPushConsumer:
         hb = HeartbeatData(self.client_id or "")
         cd = ConsumerData(self.consumer_group, ConsumeType.CONSUME_PASSIVELY,
                           self.message_model, self.consume_from_where)
-        # unitMode 要写进 ConsumerData：
-        # broker 端据此给自动建出来的 %RETRY% topic 打 UNIT 系统标志
-        # （ClientManageProcessor 注册消费者时判）。
+        # unitMode must be written into ConsumerData:
+        # the broker uses it to stamp the UNIT system flag on the auto-created %RETRY% topic
+        # (judged in ClientManageProcessor when registering the consumer).
         cd.unit_mode = self.unit_mode
         with self._lock:
             subs = list(self.subscription_data.values())
@@ -1671,23 +1670,23 @@ class DefaultMQPushConsumer:
         return hb
 
     def _send_heartbeat_to_all_broker(self) -> int:
-        """向所有已知 broker 发心跳。
+        """Send a heartbeat to all known brokers.
 
-        消费者**必须**注册到 broker：broker 的 ConsumerManager 只有收到心跳才知道
-        消费组里有哪些 clientId，rebalance 的 GET_CONSUMER_LIST_BY_GROUP 才有返回。
-        本实现此前从未发消费者心跳（订阅靠 pull 请求里的 subscription 属性带过去），
-        因为当时队列分配是"全给自己"所以没暴露；一旦做真实 rebalance，
-        消费者列表为空就分不到任何队列。返回成功台数，供真机验证断言。
+        The consumer **must** register with the broker: the broker's ConsumerManager only learns
+        which clientIds are in the consume group after receiving a heartbeat, otherwise rebalance's GET_CONSUMER_LIST_BY_GROUP has no return.
+        This implementation previously never sent consumer heartbeats (subscriptions rode along in the pull request's subscription property),
+        because at the time queue allocation was "all to self" so it was not exposed; once real rebalance is done,
+        an empty consumer list means no queues can be allocated. Returns the number of successful sends, for live verification assertions.
 
-        收件人取路由里的**每一台**（主 + 从，`get_all_broker_addrs`）：
-        遍历路由里的每个 brokerId，仅当 `id != MASTER_ID && consumerEmpty` 才跳过；
-        本心跳必带 ConsumerData（consumerEmpty=false），故从节点不跳。从节点漏发不是"少一发冗余"：
-        broker 的 `ConsumerManager` 是**每台各自一份**状态，而从节点收不到心跳时，
-        它会给指向自己的拉取回 `SUBSCRIPTION_NOT_EXIST`
-        （对端 `PullMessageProcessor` 的 else 分支要求该 broker 自己认识这个消费组；
-        默认 `post_subscription_when_pull=false` 的拉取不带订阅标志，走的正是这条）。
-        生产者侧相反：`producer.py::_send_heartbeat_to_all_broker` 只带 ProducerData，
-        对应 `consumerEmpty=true`，那时只需发 master。
+        Recipients take **every** broker in the route (master + slave, `get_all_broker_addrs`):
+        iterate each brokerId in the route, skipping only when `id != MASTER_ID && consumerEmpty`;
+        this heartbeat always carries ConsumerData (consumerEmpty=false), so slaves are not skipped. Skipping slaves is not "one redundant send fewer":
+        the broker's `ConsumerManager` keeps **per-broker** state, and when a slave receives no heartbeat,
+        it returns `SUBSCRIPTION_NOT_EXIST` to pulls directed at it
+        (the peer `PullMessageProcessor`'s else branch requires that broker itself to know this consume group;
+        pulls with the default `post_subscription_when_pull=false` carry no subscription flag and take exactly this path).
+        The producer side is the opposite: `producer.py::_send_heartbeat_to_all_broker` only carries ProducerData,
+        corresponding to `consumerEmpty=true`, in which case only the master needs the heartbeat.
         """
         client = self._require_client()
         hb = self._build_heartbeat()
@@ -1703,15 +1702,15 @@ class DefaultMQPushConsumer:
         return ok
 
     def heartbeat_count(self) -> int:
-        """心跳成功轮数（真机验证用）。"""
+        """Number of successful heartbeat rounds (for live verification)."""
         return self._heartbeat_count
 
     def assigned_queue_count(self) -> int:
-        """当前分给本实例的队列数（真机验证多实例分配用）。"""
+        """Number of queues currently assigned to this instance (for live verification of multi-instance allocation)."""
         return len(self._assigned_queues())
 
     def assigned_queue_keys(self) -> List[str]:
-        """当前分配队列的 key 列表（真机验证"同组两实例不重不漏"用）。"""
+        """Key list of the currently assigned queues (for live verification that "two instances in the same group are disjoint and complete")."""
         return sorted(self._mq_key(mq) for mq in self._assigned_queues())
 
     def _start_heartbeat_loop(self) -> None:
@@ -1731,62 +1730,62 @@ class DefaultMQPushConsumer:
             except Exception as e:  # noqa: BLE001
                 logger.debug("heartbeat loop error: %s", e)
 
-    # ---------------- 消费循环 ----------------
+    # ---------------- Consume loops ----------------
     def _start_pull_loop(self) -> None:
         self._pulling = True
-        # 并发长轮询语义：broker 会为每个队列挂起
-        # 长轮询请求，消息到达立即返回——因此每个队列必须各有一个拉取线程，
-        # 否则一个空队列的长轮询（~15s suspend）会阻塞其余队列的投递。
+        # Concurrent long-polling semantics: the broker suspends a
+        # long-poll request per queue and returns immediately once a message arrives -- so each queue must have its own pull thread,
+        # otherwise one empty queue's long poll (~15s suspend) would block the delivery of the other queues.
         self._rebalance_pull_threads()
 
     def _rebalance_pull_threads(self) -> None:
-        """按当前分配的队列同步拉取线程集，并清理被撤销/已停摆队列的状态。
+        """Sync the pull thread set per the current queue allocation, and clean up state for revoked/stalled queues.
 
-        队列被撤走时必须
-        ①persist 该队列**已消费**位点 ②丢弃 ProcessQueue（在途消息不再消费，交新属主重投）
-        ③顺序消费集群模式还要 UNLOCK_BATCH_MQ(42)。少任何一步，被撤销队列里的在途消息都会被
-        **旧实例继续消费**，与新属主重复（真机 S6 多出重复消息的根因）。
+        When a queue is taken away, one must
+        (1) persist that queue's **consumed** offset, (2) discard the ProcessQueue (in-flight messages are no longer consumed, left to the new owner to redeliver),
+        (3) for ordered consumption in cluster mode also UNLOCK_BATCH_MQ(42). Missing any step means in-flight messages in a revoked queue are
+        **still consumed by the old instance**, duplicating the new owner (the root cause of the extra duplicate messages in live test S6).
 
-        同一趟里还做**自愈**：仍归本实例、但拉取停摆超过 ``PULL_MAX_IDLE_TIME`` 的
-        队列也按撤走处理，紧接着用新的 ProcessQueue 重建拉取，从而把死掉/卡住的消费循环救回来。
+        The same pass also performs **self-healing**: queues still owned by this instance but whose pull has stalled beyond ``PULL_MAX_IDLE_TIME``
+        are treated as revoked, immediately followed by rebuilding the pull with a new ProcessQueue, thereby rescuing dead/stuck consume loops.
 
-        **先撤后建**的顺序是刻意的，撤的收尾（持久化位点 / UNLOCK）必须在
-        建线程**之前**：反过来会让新循环拿旧位点起拉、又把更小的位点写回去，白增重复投递。
+        The **revoke first, then build** order is deliberate: the revoke's cleanup (persist offsets / UNLOCK) must happen
+        **before** building threads; the reverse would have new loops start pulling at old offsets and write even smaller offsets back, adding duplicate deliveries for nothing.
         """
         current = {self._mq_key(mq): mq for mq in self._assigned_queues()}
         retired: List[Tuple[MessageQueue, Optional[int]]] = []
         pop = self.pop_mode
         with self._lock:
-            # ①撤：被分走的 + 拉取停摆的
+            # (1) Revoke: taken away + pull stalled
             for key in list(self._queue_threads.keys()):
                 if key not in current:
                     self._retire_queue_locked(key, None, retired)
                     continue
                 if self._started and self._pull_stalled_locked(key):
-                    # 文案是排查"消费停摆被自愈"现场的关键字，日志检索按此匹配，改动会破坏兼容
+                    # The wording is the keyword for diagnosing "consumption stall self-healed" on site; log search matches on it, changing it breaks compatibility
                     logger.error("[BUG]doRebalance, %s, try remove unnecessary mq, %s, "
                                  "because pull is pause, so try to fixed it",
                                  self.consumer_group, key)
                     self._retire_queue_locked(key, current[key], retired)
-        # 收尾在锁外做（网络 RPC），且必须早于 ②建
+        # The cleanup is done outside the lock (network RPC), and must come before (2) build
         if retired:
             self._on_queues_revoked(retired)
         with self._lock:
-            # ②建：为缺失的队列起循环
+            # (2) Build: start loops for missing queues
             for key, mq in current.items():
                 if key in self._queue_threads:
                     continue
                 if pop and key not in self._pop_queues:
                     self._pop_queues[key] = PopProcessQueue()
-                # 新 ProcessQueue 就位 ⇒ 解冻：
-                # 重建后的队列按修正位点重新开始推进
+                # New ProcessQueue in place => unfreeze:
+                # the rebuilt queue resumes advancing at the corrected offset
                 self._frozen_offsets.discard(key)
-                # 线程刚建、循环还没跑到盖章处，先用当前时刻占位，避免下一趟误判停摆
+                # The thread was just created and the loop has not reached the stamping point yet; use the current time as a placeholder to avoid a false stall verdict on the next pass
                 self._last_pull_table[key] = time.time()
-                # 队列一旦分配就进 _mq_map（它就是"已分配"的权威视图），
-                # 不等第一条消息：位点持久化、307 运行信息、220 重置都靠这份映射。
+                # Once a queue is allocated it enters _mq_map (which is the authoritative view of "assigned"),
+                # without waiting for the first message: offset persistence, 307 runtime info, and 220 reset all rely on this mapping.
                 self._mq_map[key] = mq
-                # POP 模式：每队列起一个 POP 循环（不拉位点、不建拉取缓冲区）
+                # POP mode: one POP loop per queue (no offset pull, no pull buffer built)
                 target = self._queue_pop_loop if pop else self._queue_pull_loop
                 t = threading.Thread(target=target, args=(mq,), daemon=True,
                                      name="rmq-%s-%s-%s" % ("pop" if pop else "pull",
@@ -1796,27 +1795,27 @@ class DefaultMQPushConsumer:
 
     def _retire_queue_locked(self, key: str, fallback_mq: Optional[MessageQueue],
                              retired: List[Tuple[MessageQueue, Optional[int]]]) -> None:
-        """丢弃一个队列的全部本地状态（调用方须持锁），位点交给调用方在锁外持久化。
+        """Discard all local state of a queue (the caller must hold the lock); the offset is persisted by the caller outside the lock.
 
-        线程表里的条目一删，原循环线程下一轮 ``_owns_queue`` 即失败并自行退出；
-        ``_last_pull_table`` 一并清掉，避免同名队列复用线程时继承旧时刻。
-        ``fallback_mq`` 用于自愈分支：停摆队列可能一条消息都没拉过，_mq_map 里还没有条目，
-        但它的已消费位点是真实的，漏 persist 就会让新属主从头重投。
+        Once the entry in the thread table is deleted, the original loop thread's next ``_owns_queue`` fails and it exits by itself;
+        ``_last_pull_table`` is cleared as well, to avoid inheriting the old timestamp when the same-named queue reuses a thread.
+        ``fallback_mq`` is used by the self-healing branch: a stalled queue may have never pulled a message, so _mq_map may have no entry,
+        but its consumed offset is real; missing the persist would make the new owner redeliver from the beginning.
         """
-        self._queue_threads.pop(key, None)  # 循环内检测到退出
+        self._queue_threads.pop(key, None)  # The loop detects this and exits
         self._last_pull_table.pop(key, None)
         mq = self._mq_map.pop(key, fallback_mq)
         self._pending.pop(key, None)
-        # 在途登记一并作废：队列已从本地队列表摘除，清扫任务（只遍历本地队列表）
-        # 不会再碰它，这里也不能让旧批次的引用留在登记里。
+        # The in-flight registration is voided as well: the queue has been removed from the local queue table, the cleanup task (which only iterates the local queue table)
+        # will not touch it again, and old batch references must not be left in the registration here either.
         self._inflight_msgs.pop(key, None)
         self._lock_ok.discard(key)
-        # 代号 +1 ⇒ 在途批次的 ack 全部失效；冻结标记**保留**到
-        # 队列重建为止（_rebalance_pull_threads 解冻），避免纠错后的位点被旧 ack 覆盖。
+        # Epoch +1 => all in-flight batches' acks are voided; the frozen flag is **kept** until
+        # the queue is rebuilt (_rebalance_pull_threads unfreezes), to prevent the corrected offset from being overwritten by an old ack.
         self._queue_epoch[key] = self._queue_epoch.get(key, 0) + 1
         off = self._consume_offsets.pop(key, None)
         self._offset_table.pop(key, None)
-        # POP：标记 dropped，在途批次不再消费也不 ack（交给 broker 复活）
+        # POP: mark as dropped, in-flight batches are neither consumed nor acked (leave them to the broker to revive)
         pq = self._pop_queues.pop(key, None)
         if pq is not None:
             pq.set_dropped(True)
@@ -1824,10 +1823,10 @@ class DefaultMQPushConsumer:
             retired.append((mq, off))
 
     def _pull_stalled_locked(self, key: str) -> bool:
-        """该队列的拉取/弹出循环是否已停摆。须持锁调用。
+        """Whether this queue's pull/pop loop has stalled. Must be called while holding the lock.
 
-        两个判据都算死：线程已退出（异常穿透），或线程还在但超过 ``PULL_MAX_IDLE_TIME``
-        没发起过任何一次拉取（卡在锁/流控/网络之外的地方）。从未盖过章的新循环不算。
+        Both criteria count as dead: the thread has exited (an exception broke through), or the thread is alive but has not initiated any pull for longer than ``PULL_MAX_IDLE_TIME``
+        (stuck somewhere other than the lock/flow control/network). A new loop that has never stamped is not counted.
         """
         t = self._queue_threads.get(key)
         if t is not None and not t.is_alive():
@@ -1838,12 +1837,12 @@ class DefaultMQPushConsumer:
         return time.time() - began > PULL_MAX_IDLE_TIME
 
     def _on_queues_revoked(self, revoked: List[Tuple[MessageQueue, Optional[int]]]) -> None:
-        """被撤销队列的收尾：持久化位点 + 顺序消费解锁。"""
+        """Cleanup for revoked queues: persist offsets + unlock for ordered consumption."""
         broadcast = self.message_model == MessageModel.BROADCASTING
         if broadcast:
-            # 广播模式位点只存本地。撤下来的位点必须连同队列信息**先写回文件**、
-            # 再摘内存条目（文件里的值留着）；
-            # 少了这一步，队列重建时读不到旧位点，会按 consume_from_where 从头/从尾重扫。
+            # Broadcast mode offsets are stored locally only. Revoked offsets must be written back to the file together with the queue info **first**,
+            # and only then removed from the in-memory entries (the values stay in the file);
+            # without this step, the queue rebuild cannot read the old offset and would rescan from the start/end per consume_from_where.
             self._save_local_offsets(extra=revoked)
             return
         client = self._mq_client
@@ -1855,10 +1854,10 @@ class DefaultMQPushConsumer:
                     client.update_consumer_offset(self.consumer_group, mq, off)
                 except Exception as e:  # noqa: BLE001
                     logger.debug("persist offset on revoke failed for %s: %s", mq, e)
-            # 撤队列时的单队列解锁只属于 classic 顺序：它拿的是本地队列表里的
-            # ProcessQueue —— POP 模式下那张表是空的，这条路径根本不会跑。
+            # The per-queue unlock on revoke belongs only to classic ordered: it reads the
+            # ProcessQueue from the local queue table -- in POP mode that table is empty, so this path never runs.
             if self._is_orderly() and not self.pop_mode:
-                # 顺序消费：释放 broker 队列锁，新属主才能立刻接上
+                # Ordered consumption: release the broker queue lock so the new owner can take over immediately
                 try:
                     client.unlock_batch_mq(self.consumer_group, self.client_id or "", [mq])
                 except Exception as e:  # noqa: BLE001
@@ -1866,7 +1865,7 @@ class DefaultMQPushConsumer:
         logger.info("queues revoked, group=%s count=%d", self.consumer_group, len(revoked))
 
     def _owns_queue(self, key: str) -> bool:
-        """本线程是否仍持有该队列（rebalance 撤走或换了拉取线程后即失效）。"""
+        """Whether this thread still owns the queue (invalid once rebalance takes it away or the pull thread changes)."""
         with self._lock:
             return self._queue_threads.get(key) is threading.current_thread()
 
@@ -1875,11 +1874,11 @@ class DefaultMQPushConsumer:
         return "%s%s%d" % (mq.topic, mq.broker_name, mq.queue_id)
 
     def _all_queues_of_topic(self, topic: str) -> List[MessageQueue]:
-        """topic 的全部队列（订阅信息视图）。
+        """All queues of a topic (the subscription info view).
 
-        取自**订阅信息**（``topicRouteData2TopicSubscribeInfo``：读位 + readQueueNums、
-        不筛 master），不是发布信息 —— 两者在「perm=4 的只读 topic」与「master 掉线只剩
-        从节点」两种路由上答案不同，消费侧必须用宽的这一份（发布信息只服务生产者选队）。
+        Taken from the **subscription info** (``topicRouteData2TopicSubscribeInfo``: read perm + readQueueNums,
+        no master filtering), not the publish info -- the two differ on the routes "read-only topic with perm=4" and "master down, only slaves left",
+        and the consume side must use the wider of the two (publish info only serves producer queue selection).
         """
         client = self._require_client()
         queues = client.get_topic_subscribe_info(topic)
@@ -1888,17 +1887,17 @@ class DefaultMQPushConsumer:
         return queues
 
     def _assigned_queues(self) -> List[MessageQueue]:
-        """当前分给本实例的队列集（由 _do_rebalance 计算）。"""
+        """The set of queues currently assigned to this instance (computed by _do_rebalance)."""
         with self._lock:
             return list(self._assigned)
 
     def _do_rebalance(self) -> None:
-        """计算本实例的队列分配，再同步拉取线程集。
+        """Compute this instance's queue allocation, then sync the pull thread set.
 
-        BROADCASTING：全部队列都归自己（不做 broker 协调）。
-        CLUSTERING：查 broker 上的消费者列表 → 排序 → 分配策略 → 取本实例那一份。
-        查不到消费者列表时**保留现有分配**，只告警；绝不回退成"独占全部队列"，
-        否则同组多实例会互相重复消费。
+        BROADCASTING: all queues belong to self (no broker coordination).
+        CLUSTERING: query the broker's consumer list -> sort -> allocation strategy -> take this instance's share.
+        When the consumer list cannot be found, **keep the existing allocation** and only warn; never fall back to "owning all queues",
+        otherwise multiple instances in the same group would consume each other's messages.
         """
         client = self._require_client()
         was = {self._mq_key(mq) for mq in self._assigned_queues()}
@@ -1933,9 +1932,9 @@ class DefaultMQPushConsumer:
         if now != was:
             logger.info("rebalance result changed, group=%s clientId=%s assigned=%d",
                         self.consumer_group, self.client_id, len(assigned))
-        # 新分配的队列**立刻**解析初始位点（清脏位点 → 按 consume_from_where 算起点 → 写进位点表）。
-        # 不能留到第一次拉取时才惰性解析：CONSUME_FROM_LAST_OFFSET 的语义是"分配时刻的最新位点"，
-        # 惰性解析会把「分配之后、首次拉取之前」新产生的消息一并跳过（真机上表现为消费者一直收不到）。
+        # Newly assigned queues resolve their initial offset **immediately** (clear the dirty offset -> compute the start per consume_from_where -> write into the offset table).
+        # It cannot be left to lazy resolution at first pull: CONSUME_FROM_LAST_OFFSET's semantics are "the latest offset at the allocation moment",
+        # and lazy resolution would skip all messages produced between "after allocation" and "before first pull" (on live systems this presents as the consumer never receiving anything).
         for mq in assigned:
             key = self._mq_key(mq)
             if key in was:
@@ -1956,20 +1955,20 @@ class DefaultMQPushConsumer:
         self._rebalance_pull_threads()
 
     def rebalance_immediately(self) -> None:
-        """实例收到 broker 的 40 通知后叫醒本消费者的重平衡循环。
+        """Wake this consumer's rebalance loop after the instance receives the broker's 40 notification.
 
-        只置一个事件叫醒后台重平衡循环，不在通知线程里直接算分配。
+        Only sets an event to wake the background rebalance loop; does not compute the allocation directly in the notification thread.
         """
         self._rebalance_now.set()
 
     def _rebalance_loop(self) -> None:
-        """周期重算分配（默认 20s），或被通知时立即重算。
+        """Recompute the allocation periodically (default 20s), or immediately when notified.
 
-        启动阶段且**当前没有任何分配**时缩短为 2s 重试：消费者可能先于 topic 被创建启动
-        （``autoCreateTopicEnable`` 下 broker 由生产者的首次发送建 topic），此时真实路由还
-        拉不到——消费端不做默认 topic 兜底（见 MQClientInstance.update_topic_route_info_
-        from_name_server），死等 20s 会长时间不消费。该快速重试只在启动后 60s 内生效，
-        避免长期订阅了不存在 topic 的客户端持续高频打 NameServer。
+        During startup and when **there is currently no allocation at all**, shorten to a 2s retry: the consumer may start before the topic is created
+        (under ``autoCreateTopicEnable`` the broker creates the topic on the producer's first send), in which case the real route cannot yet be
+        pulled -- the consumer does no default-topic fallback (see MQClientInstance.update_topic_route_info_
+        from_name_server), and waiting 20s would mean not consuming for a long time. The fast retry only takes effect within 60s of startup,
+        to avoid clients that long-term subscribe to a nonexistent topic hammering the NameServer at high frequency.
         """
         while not self._stop.is_set():
             starting_up = (time.time() - self._start_time) < 60.0
@@ -1984,22 +1983,22 @@ class DefaultMQPushConsumer:
                 logger.debug("rebalance error: %s", e)
 
     def _queue_pull_loop(self, mq: MessageQueue) -> None:
-        """单队列拉取循环：长轮询拉取 → 推入待消费缓冲。"""
+        """Single-queue pull loop: long-poll pull -> push into the pending buffer."""
         client = self._require_client()
         orderly = self._is_orderly()
         key = self._mq_key(mq)
         while not self._stop.is_set() and self._started:
             if not self._owns_queue(key):
                 return
-            # 每次**发起**拉取就盖时刻，
-            # 在流控/锁判定之前：判据是"这条循环还在跑"，不是"这轮真的打了网络"。
+            # Stamp the time on every pull **initiation**,
+            # before the flow-control/lock checks: the criterion is "this loop is still running", not "this round really hit the network".
             with self._lock:
                 self._last_pull_table[key] = time.time()
-            # 挂起闸门。
-            # ⚠ 顺序要紧：闸门必须在**盖章之后**。放在盖章之前，一个只是被 suspend()
-            # 暂停的消费者会因为超过 PULL_MAX_IDLE_TIME 没发起拉取，被停摆判据
-            # （_pull_stalled_locked）当成死循环，
-            # rebalance 会直接把分配摘掉重建 —— 所以 pause 检查必须排在盖章之后。
+            # Suspend gate.
+            # WARNING: order matters: the gate must come **after stamping**. Placed before stamping, a consumer that is merely
+            # suspended by suspend() would, having not initiated a pull for longer than PULL_MAX_IDLE_TIME, be treated as a dead loop
+            # by the stall criterion (_pull_stalled_locked),
+            # and rebalance would take the allocation away and rebuild it directly -- so the pause check must come after stamping.
             if self._paused:
                 time.sleep(PULL_TIME_DELAY_WHEN_SUSPEND)
                 continue
@@ -2007,12 +2006,12 @@ class DefaultMQPushConsumer:
                 sub = self.subscription_data.get(mq.topic)
             if sub is None:
                 return
-            # 顺序消费：broker 未确认锁定（LOCK_BATCH_MQ）的队列不拉取
+            # Ordered consumption: queues not confirmed locked by the broker (LOCK_BATCH_MQ) are not pulled
             if orderly and key not in self._lock_ok:
                 time.sleep(0.2)
                 continue
-            # 流控：条数 / 字节数 / topic 级累计 / 并发跨度
-            # 任一超限就暂停本队列拉取
+            # Flow control: count / bytes / topic-level accumulation / concurrency span
+            # pause this queue's pull when any limit is exceeded
             if self._flow_control_hit(mq, key):
                 time.sleep(0.1)
                 continue
@@ -2026,15 +2025,15 @@ class DefaultMQPushConsumer:
                     continue
                 self._offset_table[key] = offset
             try:
-                # 仅当 post_subscription_when_pull 打开且非类过滤模式时才把订阅表达式
-                # 发给 broker；默认不发，过滤由客户端的 tag 过滤兜底。
+                # Only when post_subscription_when_pull is on and not class-filter mode is the subscription expression
+                # sent to the broker; not sent by default, with filtering falling back to the client's tag filtering.
                 sub_expression = sub.sub_string if (
                     self.post_subscription_when_pull and not sub.class_filter_mode) else None
                 sys_flag = PullSysFlag.build_sys_flag(commit_offset=False,
                                                       suspend=True,
                                                       subscription=sub_expression is not None,
                                                       class_filter=False)
-                # 按上轮应答的 suggestWhichBrokerId 选主/从节点拉取
+                # Choose the master/slave node to pull from per the previous round's suggestWhichBrokerId
                 broker_id = self._pull_from_which_node.get(mq, MixAll.MASTER_ID)
                 pull_began = time.time()
                 result = client.pull_message(self.consumer_group, mq, offset,
@@ -2045,11 +2044,11 @@ class DefaultMQPushConsumer:
                                              max_msg_bytes=self.pull_batch_size_in_bytes,
                                              suspend_timeout_millis=self.pull_suspend_timeout_millis,
                                              broker_id=broker_id)
-                # 每轮应答都更新 pullFromWhichNode：
-                # 应答里没有 suggestWhichBrokerId 时缺省当作 master=0
+                # Update pullFromWhichNode on every response:
+                # when the response has no suggestWhichBrokerId, default to master=0
                 self._pull_from_which_node[mq] = result.suggest_which_broker_id \
                     if result.suggest_which_broker_id is not None else MixAll.MASTER_ID
-                # 消费统计：拉取 RT 每次都记，TPS 只在有消息时记
+                # Consumption stats: pull RT is recorded every time, TPS only when there are messages
                 if self._stats_manager is not None:
                     self._stats_manager.inc_pull_rt(self.consumer_group, mq.topic,
                                                     int((time.time() - pull_began) * 1000))
@@ -2057,30 +2056,30 @@ class DefaultMQPushConsumer:
                         self._stats_manager.inc_pull_tps(self.consumer_group, mq.topic,
                                                          len(result.msg_found_list))
             except RemotingTimeoutException as e:
-                # 长轮询在 suspend 期间无新消息触发客户端超时属正常行为：broker 将
-                # suspend 时间钳制为其自身 brokerSuspendMaxTimeMillis（默认 ~15s），
-                # 忽略客户端下发的 suspend_timeout_millis，故空闲队列会周期性超时。
-                # 这不是错误，仅 debug 级别，避免污染客户端运行日志（见 logging.py）。
+                # A long poll timing out with no new message during suspend is normal behavior: the broker
+                # clamps the suspend time to its own brokerSuspendMaxTimeMillis (default ~15s),
+                # ignoring the client's suspend_timeout_millis, so idle queues time out periodically.
+                # This is not an error, debug level only, to avoid polluting the client's runtime logs (see logging.py).
                 logger.debug("pull long-poll timeout for %s (benign, will retry): %s", mq, e)
                 continue
             except Exception as e:  # noqa: BLE001
-                # broker 侧非 SUCCESS 码（TOPIC_NOT_EXIST / PULL_NOT_FOUND 等）或其他错误：
-                # 多为 topic 尚未创建等预期路径，debug + 短暂退避，避免热循环
+                # Broker-side non-SUCCESS codes (TOPIC_NOT_EXIST / PULL_NOT_FOUND, etc.) or other errors:
+                # mostly expected paths like a topic not yet being created; debug + brief backoff to avoid a hot loop
                 logger.debug("pull error for %s: %s: %s", mq, type(e).__name__, e)
                 time.sleep(0.5)
                 continue
 
-            # 投递前的客户端侧过滤：
-            # 先二次 tag 过滤，再跑 FilterMessageHook。**必须在拿 _lock 之前做** ——
-            # 钩子是用户代码，可能阻塞，不能压在入队的临界区里。
-            # 拉取路径被摘掉的消息不 ack：位点照常推进 = 静默跳过。
+            # Client-side filtering before delivery:
+            # first second-pass tag filtering, then run FilterMessageHook. **Must be done before taking _lock** --
+            # hooks are user code and may block, so they must not be pressed into the enqueue critical section.
+            # Messages dropped on the pull path are not acked: the offset advances as usual = silently skipped.
             if result.status == PullStatus.FOUND and result.msg_found_list:
                 result.msg_found_list = self._filter_messages_for_delivery(
                     mq, sub, result.msg_found_list)
 
-            # 入队与"是否仍持有该队列"的判断必须原子：长轮询期间被 rebalance 撤走的队列，
-            # 这批消息**直接丢弃**——不消费、不推进位点，
-            # 由新属主从我们最后持久化的位点重投，否则两实例会重复消费同一条消息。
+            # The enqueue and the "does this thread still own the queue" check must be atomic: queues taken away by rebalance during the long poll
+            # have this batch **discarded directly** -- not consumed, offset not advanced,
+            # left to the new owner to redeliver from our last persisted offset, otherwise the two instances would consume the same message.
             illegal = False
             with self._lock:
                 if self._queue_threads.get(key) is not threading.current_thread():
@@ -2093,32 +2092,32 @@ class DefaultMQPushConsumer:
                 if result.status == PullStatus.FOUND and result.msg_found_list:
                     self._pending[key].extend(result.msg_found_list)
                     self._update_msg_acc_cnt(key, result.msg_found_list)
-                # 拉取游标推进到 nextBeginOffset；"已消费位点"由 _consume_offsets 单独跟踪并持久化
+                # The pull cursor advances to nextBeginOffset; the "consumed offset" is tracked and persisted separately by _consume_offsets
                 if result.next_begin_offset is not None:
                     self._offset_table[key] = result.next_begin_offset
                     if result.status == PullStatus.OFFSET_ILLEGAL:
-                        # 位点被 broker 纠正
-                        # 时必须连纠错带重建一起做，见 _offset_illegal_recover。
-                        # 冻结在锁内先行（等价回调里同步执行的 updateAndFreezeOffset），
-                        # 撤队列与落盘的 RPC 放锁外。
+                        # When the offset is corrected by the broker
+                        # correction and rebuild must be done together, see _offset_illegal_recover.
+                        # Freezing happens first inside the lock (equivalent to updateAndFreezeOffset executed synchronously in the callback),
+                        # with the queue-revoke and disk-persist RPCs moved outside the lock.
                         self._frozen_offsets.add(key)
                         self._consume_offsets[key] = int(result.next_begin_offset)
                         illegal = True
                     else:
-                        # 空应答（NO_NEW_MSG /
-                        # NO_MATCHED_MSG）时修正"已消费位点"，见 _correct_tags_offset_locked
+                        # On an empty response (NO_NEW_MSG /
+                        # NO_MATCHED_MSG), correct the "consumed offset", see _correct_tags_offset_locked
                         self._correct_tags_offset_locked(key, result.status,
                                                          result.next_begin_offset)
             if illegal:
                 self._offset_illegal_recover(key)
 
     def _update_msg_acc_cnt(self, key: str, msgs: List[MessageExt]) -> None:
-        """``msgAccCnt``（积压条数）的计算。
+        """The computation of ``msgAccCnt`` (backlog count).
 
-            accTotal = MAX_OFFSET 属性 - 该条消息的 queueOffset
+            accTotal = MAX_OFFSET property - this message's queueOffset
             if (accTotal > 0) msgAccCnt = accTotal
 
-        取的是**本批最后一条**消息；用来喂 ``adjust_thread_pool`` 的阈值比较。
+        Takes the **last message of this batch**; feeds the threshold comparison of ``adjust_thread_pool``.
         """
         if not msgs:
             return
@@ -2135,30 +2134,30 @@ class DefaultMQPushConsumer:
                 self._msg_acc_cnt_table[key] = acc_total
 
     def msg_acc_cnt(self, key: Optional[str] = None) -> int:
-        """读 ``msgAccCnt``：给 key 读单队列，不给则求和。"""
+        """Read ``msgAccCnt``: reads a single queue when a key is given, sums otherwise."""
         with self._lock:
             if key is None:
                 return sum(self._msg_acc_cnt_table.values())
             return int(self._msg_acc_cnt_table.get(key, 0))
 
-    # ---------------------------------------------------------------- POP 消费循环
+    # ---------------------------------------------------------------- POP consume loop
 
     def _queue_pop_loop(self, mq: MessageQueue) -> None:
-        """单队列 POP 循环：弹出 → 投递 → ack 确认。
+        """Single-queue POP loop: pop -> deliver -> ack confirmation.
 
-        与 pull 循环的关键差别：
-          - **不查、不提交消费位点**：进度由 broker 侧的 checkpoint 跟踪，确认只靠 ack；
-          - 弹出即投递给消费线程，本轮循环立刻继续（不等消费结果）；
-          - ``POLLING_NOT_FOUND``（队列暂时没消息）是**正常态**，直接下一轮，不算错误。
+        Key differences from the pull loop:
+          - **Does not query or commit consume offsets**: progress is tracked by the broker-side checkpoint, confirmation is by ack only;
+          - pops are delivered to consume threads immediately, and the loop continues this round (without waiting for the consume result);
+          - ``POLLING_NOT_FOUND`` (the queue has no messages for now) is a **normal state**, go to the next round directly, not an error.
         """
         client = self._require_client()
         key = self._mq_key(mq)
         invisible = self.pop_invisible_time
         if invisible < MIN_POP_INVISIBLE_TIME or invisible > MAX_POP_INVISIBLE_TIME:
-            # 钳制：超出 [5s, 300s] 一律回落到 60s
+            # Clamp: anything outside [5s, 300s] falls back to 60s
             invisible = 60000
-        # 默认是 ConsumeInitMode.MAX（从尾部开始）；这里按 consume_from_where 映射，
-        # 让"从头消费"的语义在 POP 模式下也成立。
+        # The default is ConsumeInitMode.MAX (start at the tail); here it maps per consume_from_where,
+        # so the "consume from the beginning" semantics hold in POP mode too.
         init_mode = (CONSUME_INIT_MODE_MIN
                      if self.consume_from_where == ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET
                      else CONSUME_INIT_MODE_MAX)
@@ -2168,15 +2167,15 @@ class DefaultMQPushConsumer:
             pq = self._pop_queues.get(key)
             if pq is None or pq.is_dropped():
                 return
-            # 停摆判据读的是 lastPopTimestamp，而它在**发起**弹出时
-            # 就被盖章（循环入口）：流控/长轮询挂起都不该
-            # 让一条还在跑的循环被判成停摆。
+            # The stall criterion reads lastPopTimestamp, which is stamped at pop **initiation**
+            # (the loop entry): flow control / long-poll suspension must not
+            # make a still-running loop be judged as stalled.
             with self._lock:
                 now = time.time()
                 self._last_pull_table[key] = now
             pq.last_pop_timestamp = now
-            # POP 模式受同一个挂起闸门约束，
-            # 且同样落在盖章之后（理由见 _queue_pull_loop 的注释）。
+            # POP mode is subject to the same suspend gate,
+            # and likewise falls after stamping (see the comment in _queue_pull_loop).
             if self._paused:
                 time.sleep(PULL_TIME_DELAY_WHEN_SUSPEND)
                 continue
@@ -2184,7 +2183,7 @@ class DefaultMQPushConsumer:
                 sub = self.subscription_data.get(mq.topic)
             if sub is None:
                 return
-            # 流控：已弹未 ack 太多就先缓一缓（pop_threshold_for_queue）
+            # Flow control: too many popped-but-unacked, back off first (pop_threshold_for_queue)
             if pq.wait_ack_count() > self.pop_threshold_for_queue:
                 time.sleep(0.05)
                 continue
@@ -2202,7 +2201,7 @@ class DefaultMQPushConsumer:
                     broker_name=mq.broker_name,
                 )
             except RemotingTimeoutException:
-                # 长轮询挂起期间没有消息 → 客户端先超时，属正常行为，直接下一轮
+                # No message during long-poll suspension -> the client times out first; normal behavior, go to the next round directly
                 logger.debug("pop long-poll timeout for %s (benign, will retry)", mq)
                 continue
             except Exception as e:  # noqa: BLE001
@@ -2210,20 +2209,20 @@ class DefaultMQPushConsumer:
                 time.sleep(0.5)
                 continue
 
-            # 弹出后队列被 rebalance 撤走：这一批**既不消费也不 ack**
-            # （队列已 dropped），交给 invisibleTime 到期后
-            # broker 自动复活重投给新属主。
+            # The queue is revoked by rebalance after popping: this batch is **neither consumed nor acked**
+            # (the queue is already dropped), leaving it to the broker to
+            # automatically revive and redeliver to the new owner once invisibleTime expires.
             if not self._owns_queue(key) or pq.is_dropped():
                 logger.debug("queue %s revoked during pop, discard %d messages un-acked",
                              mq, len(result.msg_found_list or ()))
                 return
             found = result.status == PopStatus.FOUND
             if found:
-                # 消费统计：POP 路径
-                # 与 pull 路径一样要把 RT/TPS 记进状态表，否则 POP 消费者的
-                # consumerRunningInfo() 里 pull 侧永远是 0 —— 运维看板上"这个消费者没在
-                # 拉取"和"这个消费者根本没起来"就分不出来了。RT 在 FOUND 分支入口就记
-                # （判空之前就记），TPS 只按真正弹到的条数记。
+                # Consumption stats: POP path
+                # like the pull path, RT/TPS must be recorded into the stats table, otherwise the POP consumer's
+                # consumerRunningInfo() would always show 0 on the pull side -- on ops dashboards "this consumer is not
+                # pulling" and "this consumer did not start at all" would be indistinguishable. RT is recorded at the FOUND branch entry
+                # (before the null check), TPS only by the number actually popped.
                 if self._stats_manager is not None:
                     self._stats_manager.inc_pull_rt(self.consumer_group, mq.topic,
                                                     int((time.time() - began) * 1000))
@@ -2232,8 +2231,8 @@ class DefaultMQPushConsumer:
                                                          len(result.msg_found_list))
             if found and result.msg_found_list:
                 pq.inc_found_msg(len(result.msg_found_list))
-                # 投递前过滤：POP 路径**必须 ack 被摘掉的**，
-                # 否则 invisibleTime 到期后 broker 会复活重投 —— 表现为"过滤没生效"。
+                # Pre-delivery filtering: the POP path **must ack the dropped ones**,
+                # otherwise the broker would revive and redeliver them once invisibleTime expires -- presenting as "filtering not in effect".
                 kept = self._filter_messages_for_delivery(mq, sub, result.msg_found_list)
                 if len(kept) != len(result.msg_found_list):
                     kept_ids = {id(m) for m in kept}
@@ -2247,22 +2246,22 @@ class DefaultMQPushConsumer:
                 if kept:
                     self._submit_pop_consume_request(kept, pq, mq)
             else:
-                # 空结果：若 broker 没按 poll_time 挂起（立即返回）就会变成热循环，
-                # 这里按"本轮耗时过短"兜底退避，避免打爆 broker。
+                # Empty result: if the broker did not suspend per poll_time (returns immediately) this becomes a hot loop;
+                # back off here per "this round was too short" to avoid hammering the broker.
                 if (time.time() - began) * 1000.0 < 200:
                     time.sleep(0.2)
-            # NO_NEW_MSG / POLLING_NOT_FOUND / POLLING_FULL 都直接进下一轮
+            # NO_NEW_MSG / POLLING_NOT_FOUND / POLLING_FULL all go directly to the next round
 
     def _submit_pop_consume_request(self, msgs: List[MessageExt], pq: PopProcessQueue,
                                     mq: MessageQueue) -> None:
-        """按 listener 类型选服务：顺序监听器 + POP 走 POP 顺序路径。
+        """Select the service by listener type: orderly listener + POP goes through the POP orderly path.
 
-        这条路径是**未完成骨架**：请求去重入队后 run() 拿到队列锁就返回 —— 消息
-        **不消费、不 ack**，invisibleTime 到期由 broker 复活重投，宏观表现是
-        「顺序 + POP 收不到消息且积压不消」。保持这个行为，别"修好"：POP 路径的顺序语义
-        （队列锁、COMMIT/ROLLBACK）尚未定论。msgs 在这条路径被忽略（请求只带 pq + mq）。
+        This path is an **incomplete skeleton**: after the request is deduplicated and enqueued, run() returns as soon as it gets the queue lock -- the messages
+        are **neither consumed nor acked**, and invisibleTime expiry leaves them to the broker to revive and redeliver, presenting macroscopically as
+        "orderly + POP receives no messages and the backlog never clears". Keep this behavior, do not "fix" it: the orderly semantics of the POP path
+        (queue lock, COMMIT/ROLLBACK) are not yet settled. msgs are ignored on this path (the request carries only pq + mq).
 
-        并发监听器走 ``_consume_pop_batch``（见下）。
+        Concurrent listeners go through ``_consume_pop_batch`` (see below).
         """
         if self._is_orderly():
             self._submit_pop_orderly_request(pq, mq)
@@ -2275,14 +2274,14 @@ class DefaultMQPushConsumer:
             if self._pop_executor is not None:
                 self._pop_executor.submit(self._consume_pop_batch, batch, pq, mq)
             else:
-                # 未起线程池（单测或未 start）：同步执行
+                # Executor not started (unit test or not started): execute synchronously
                 self._consume_pop_batch(batch, pq, mq)
 
     def _submit_pop_orderly_request(self, pq: PopProcessQueue, mq: MessageQueue,
                                     force: bool = False) -> None:
-        """提交 POP 顺序请求：锁下去重，新请求才投执行器。
+        """Submit a POP orderly request: deduplicate under the lock, only new requests go to the executor.
 
-        每 key 锁折进 self._lock：临界区只有一次集合操作。
+        Each key's lock is folded into self._lock: the critical section is only a single set operation.
         """
         with self._lock:
             is_new = (pq, mq) not in self._pop_orderly_requests
@@ -2294,16 +2293,16 @@ class DefaultMQPushConsumer:
             try:
                 self._pop_executor.submit(self._run_pop_orderly_request, pq, mq)
             except Exception as e:  # noqa: BLE001
-                # 提交失败只打日志，请求留在集合里（不会自动重投）。
+                # Submission failure only logs; the request stays in the set (not auto-redelivered).
                 logger.error("error submit pop orderly request: %s, mq: %s", e, mq)
         else:
-            # 未起线程池（单测或未 start）：同步执行
+            # No executor started (unit test or not started): execute synchronously
             self._run_pop_orderly_request(pq, mq)
 
     def _run_pop_orderly_request(self, pq: PopProcessQueue, mq: MessageQueue) -> None:
-        """POP 顺序请求的执行体（骨架到此为止）：
-        pq 被撤销才摘请求并记一条 warn；
-        否则拿到队列锁就**什么都不做**。去重集就是"同一请求不重复处理"的载体。
+        """The execution body of a POP orderly request (the skeleton ends here):
+        remove the request and log a warning only when pq is revoked;
+        otherwise get the queue lock and **do nothing**. The dedup set is the vehicle for "the same request is not processed twice".
         """
         if pq.is_dropped():
             logger.warning("run, message queue not be able to consume, because it's dropped. %s",
@@ -2313,15 +2312,15 @@ class DefaultMQPushConsumer:
             return
 
     def pop_orderly_request_count(self) -> int:
-        """请求集条数（去重行为要能离线锁死）。"""
+        """Number of entries in the request set (the dedup behavior must be locked down offline)."""
         with self._lock:
             return len(self._pop_orderly_requests)
 
     def _consume_pop_batch(self, msgs: List[MessageExt], pq: PopProcessQueue,
                            mq: MessageQueue) -> None:
-        """消费一个 POP 批次并按结果 ack / 延长不可见时间。
+        """Consume one POP batch and ack / extend invisibility per the result.
 
-        这是 POP 并发路径的消费入口。
+        This is the consume entry point of the POP concurrent path.
         """
         if pq.is_dropped() or not msgs:
             return
@@ -2335,7 +2334,7 @@ class DefaultMQPushConsumer:
             logger.debug("parse pop ck failed for %s, treat as not timed out", mq)
 
         if self._is_pop_timeout(msgs, pop_time, invisible):
-            # 已经超过 invisibleTime：ack 也不会被承认，直接放弃本批（等 broker 复活重投）
+            # Already past invisibleTime: the ack would not be accepted either; give up this batch directly (wait for the broker to revive and redeliver)
             logger.debug("pop timeout, abort consume for %s: popTime=%s invisible=%s",
                          mq, pop_time, invisible)
             pq.dec_found_msg(-len(msgs))
@@ -2343,10 +2342,10 @@ class DefaultMQPushConsumer:
 
         self._reset_retry_topic_and_namespace(msgs)
         context = ConsumeConcurrentlyContext(mq)
-        # ackIndex 的默认值是 Integer.MAX_VALUE（本端口的默认值
-        # 已经是它，这里显式钳成 size-1 只是省掉一次 clamp）：CONSUME_SUCCESS 默认全部 ack。
-        # 若这里写成 -1，一条都不会 ack，消息在 invisibleTime 到期后被 broker 复活重投 ——
-        # 短观测窗口下会伪装成通过。
+        # ackIndex's default value is Integer.MAX_VALUE (this port's default
+        # already is it; explicitly clamping to size-1 here only saves one clamp): CONSUME_SUCCESS acks everything by default.
+        # If written as -1 here, nothing would be acked, and the messages would be revived and redelivered by the broker once invisibleTime expires --
+        # under a short observation window it would masquerade as a pass.
         context.ack_index = len(msgs) - 1
         hook_ctx = None
         if self.consume_message_hook_list:
@@ -2355,21 +2354,21 @@ class DefaultMQPushConsumer:
         begin_ms = time.time() * 1000
         has_exception = False
         try:
-            # POP 并发路径同样在
-            # 交给 listener 前逐条盖 CONSUME_START_TIME（POP 没有 cleanExpiredMsg 清扫，
-            # 但这条属性对 listener/轨迹可见，口径要与经典并发一致）
+            # The POP concurrent path likewise stamps CONSUME_START_TIME on each message
+            # before handing to the listener (POP has no cleanExpiredMsg cleanup,
+            # but this property is visible to the listener/trace; the policy must match classic concurrent)
             for m in msgs:
                 MessageAccessor.set_consume_start_timestamp(m, int(time.time() * 1000))
             status = self.message_listener.consume_message(msgs, context)
         except Exception as e:  # noqa: BLE001
-            # 消费抛异常按 RECONSUME_LATER 处理
+            # An exception from consumption is treated as RECONSUME_LATER
             logger.debug("pop listener error, treat as RECONSUME_LATER: %s", e)
             status = ConsumeConcurrentlyStatus.RECONSUME_LATER
             has_exception = True
-        # listener 返回 null 同样按 RECONSUME_LATER 处理（与经典并发同一套归一化）。
-        # 归一化**前**的 status 留给 returnType（返回 null 记 RETURNNULL，
-        # 不是 FAILED）；TPS 与钩子上下文都用归一化**后**的值
-        # —— 返回 null 的 listener 算**失败**，不是成功
+        # A listener returning null is likewise treated as RECONSUME_LATER (the same normalization as classic concurrent).
+        # The status **before** normalization is left to returnType (returning null records RETURNNULL,
+        # not FAILED); TPS and the hook context both use the **post**-normalization value
+        # -- a listener returning null counts as **failed**, not successful
         raw_status = status
         if status is None:
             logger.warning("consumeMessage return null, Group: %s Msgs: %d MQ: %s",
@@ -2384,14 +2383,14 @@ class DefaultMQPushConsumer:
             hook_status=status)
 
         if pq.is_dropped() or self._is_pop_timeout(msgs, pop_time, invisible):
-            # 消费期间队列被撤走或已超时：结果不再处理
+            # The queue was revoked during consumption or has timed out: the result is no longer processed
             pq.dec_found_msg(-len(msgs))
             return
         self._process_pop_consume_result(status, context, msgs, pq, mq)
 
     @staticmethod
     def _is_pop_timeout(msgs: List[MessageExt], pop_time: int, invisible: int) -> bool:
-        """不能解析出 popTime/invisibleTime 时按超时处理。"""
+        """Treated as timed out when popTime/invisibleTime cannot be parsed."""
         if not msgs or pop_time <= 0 or invisible <= 0:
             return True
         return int(time.time() * 1000) - pop_time >= invisible
@@ -2399,13 +2398,13 @@ class DefaultMQPushConsumer:
     def _process_pop_consume_result(self, status, context: ConsumeConcurrentlyContext,
                                     msgs: List[MessageExt], pq: PopProcessQueue,
                                     mq: MessageQueue) -> None:
-        """按 ackIndex 决定 ack 到哪一条，其余延长不可见时间或丢弃。"""
+        """Decide by ackIndex which message to ack up to; the rest have their invisibility extended or are dropped."""
         ack_index = context.ack_index
         if status == ConsumeConcurrentlyStatus.CONSUME_SUCCESS:
             if ack_index >= len(msgs):
                 ack_index = len(msgs) - 1
         else:
-            # RECONSUME_LATER：一条都不 ack
+            # RECONSUME_LATER: ack nothing
             ack_index = -1
 
         for i in range(0, ack_index + 1):
@@ -2415,18 +2414,18 @@ class DefaultMQPushConsumer:
         for i in range(ack_index + 1, len(msgs)):
             pq.ack()
             msg = msgs[i]
-            # 超过最大重试次数：走 _check_need_ack_or_delay（太老就直接 ack 丢弃，
-            # 否则按消息已存活时间选一个延迟档位）
+            # Exceeding the max retry count: go through _check_need_ack_or_delay (too old -> ack and drop directly,
+            # otherwise pick a delay level per the message's lifetime)
             if self.max_reconsume_times >= 0 and msg.reconsume_times >= self.max_reconsume_times:
                 self._check_need_ack_or_delay(msg)
                 continue
             self._change_pop_invisible_time(msg, context.delay_level_when_next_consume)
 
     def _check_need_ack_or_delay(self, msg: MessageExt) -> None:
-        """重试次数用尽后的兜底。
+        """The fallback after retries are exhausted.
 
-        消息存活时间已经超过最大延迟档位的 2 倍 → 直接 ack 丢弃（不再无限重试）；
-        否则按存活时间选一个档位继续延长不可见时间。
+        If the message lifetime already exceeds twice the max delay level -> ack and drop directly (no infinite retries);
+        otherwise pick a level per the lifetime to keep extending invisibility.
         """
         table = self.pop_delay_level
         msg_delay_time = int(time.time() * 1000) - msg.born_timestamp
@@ -2443,13 +2442,13 @@ class DefaultMQPushConsumer:
         self._change_pop_invisible_time(msg, level)
 
     def _pop_ck_target(self, msg: MessageExt) -> Optional[Tuple[str, str, int, int, str]]:
-        """从 POP_CK 解出 ack/延长不可见时间需要的 (topic, brokerName, queueId, offset, ck)。
+        """Resolve (topic, brokerName, queueId, offset, ck) from POP_CK for ack/extending invisibility.
 
-        ⚠ 两处都不能想当然：
-          1. topic 要用 ``ExtraInfoUtil.getRealTopic`` 按 CK 的 retryFlag 还原 —— 复活消息
-             （retryFlag=1）的真实 topic 是 ``%RETRY%<group>_<topic>``，**不是**消息上的 topic；
-          2. 地址要按 CK 里的 brokerName 反查，不能按 topic 查路由 —— retry topic 通常没有
-             独立路由表项，按 topic 查会失败，必须走订阅/发布地址表反查。
+        WARNING: neither place can be taken for granted:
+          1. topic must be restored by ``ExtraInfoUtil.getRealTopic`` per the CK's retryFlag -- the real topic of a revived message
+             (retryFlag=1) is ``%RETRY%<group>_<topic>``, **not** the topic on the message;
+          2. the address must be reverse-looked-up by the CK's brokerName, not by the topic's route -- the retry topic usually has no
+             independent route entry, so looking up by topic would fail; it must go through the subscribe/publish address tables.
         """
         ck = msg.get_property(MessageConst.PROPERTY_POP_CK)
         if not ck:
@@ -2468,28 +2467,28 @@ class DefaultMQPushConsumer:
         return topic, broker_name, queue_id, offset, ck
 
     def _ack_pop_msg(self, msg: MessageExt) -> None:
-        """单条 ack：按 POP_CK 定位 broker 后发 ACK_MESSAGE(200051) 请求。"""
+        """Single ack: locate the broker by POP_CK, then send an ACK_MESSAGE(200051) request."""
         target = self._pop_ck_target(msg)
         if target is None:
             return
         topic, broker_name, queue_id, offset, ck = target
         try:
             client = self._require_client()
-            # 地址解析是 (brokerName, MASTER_ID, 允许刷路由)：
-            # **只要主**，刷一次路由仍拿不到就抛「The broker[X] not exist」。
-            # 静态主题：mock broker 名先经 topicEndPointsTable 重写成真实承载者
-            # （用 checkpoint 自己的 queueId —— 各 globalId 可能落在不同 broker）。
+            # Address resolution is (brokerName, MASTER_ID, allow route refresh):
+            # **master only**; if one route refresh still cannot get it, throw "The broker[X] not exist".
+            # Static topic: the mock broker name is first rewritten by topicEndPointsTable to the real carrier
+            # (using the checkpoint's own queueId -- each globalId may land on a different broker).
             client.ack_message(self.consumer_group, topic, queue_id, ck, offset,
                                broker_name=broker_name,
                                addr=client.pop_ack_addr(broker_name, topic, queue_id))
         except Exception as e:  # noqa: BLE001
-            # ack 失败不致命：消息会在 invisibleTime 到期后被 broker 复活重投
+            # A failed ack is not fatal: the message will be revived and redelivered by the broker once invisibleTime expires
             logger.debug("ack failed for %s: %s", msg.msg_id, e)
 
     def _change_pop_invisible_time(self, msg: MessageExt, delay_level: int) -> None:
-        """延长不可见时间。
+        """Extend the invisibility time.
 
-        ``delay_level == 0`` 时用消息已重试次数当档位；档位表是**秒**，接口要毫秒。
+        When ``delay_level == 0``, use the message's retry count as the level; the level table is in **seconds**, the interface takes milliseconds.
         """
         target = self._pop_ck_target(msg)
         if target is None:
@@ -2501,8 +2500,8 @@ class DefaultMQPushConsumer:
         delay_second = table[-1] if delay_level >= len(table) else table[max(0, delay_level)]
         try:
             client = self._require_client()
-            # 同样是「只要主」+ 刷一次路由
-            # mock 名重写同 ack 路径。
+            # Same "master only" + one route refresh
+            # mock name rewriting is the same as the ack path.
             client.change_invisible_time(self.consumer_group, topic, queue_id, ck, offset,
                                          delay_second * 1000,
                                          broker_name=broker_name,
@@ -2511,13 +2510,13 @@ class DefaultMQPushConsumer:
             logger.debug("change invisible time failed for %s: %s", msg.msg_id, e)
 
     def _flow_control_hit(self, mq: MessageQueue, key: str) -> bool:
-        """是否触发流控（五个阈值检查，任一命中就暂停本队列拉取）。
+        """Whether flow control is triggered (five threshold checks; any hit pauses this queue's pull).
 
-        - ``pull_threshold_for_queue``：本队列已拉未消费**条数**（默认 1000）
-        - ``pull_threshold_size_for_queue``：本队列已拉未消费**字节数 MB**（默认 100）
-        - ``pull_threshold_for_topic`` / ``pull_threshold_size_for_topic``：同 topic 全部队列累计（-1 关闭）
-        - ``consume_concurrently_max_span``：已拉未消费消息 queueOffset 的**跨度**（默认 2000，
-          防止"某条消息一直消费失败、后面的堆着"导致位点跨度失控）
+        - ``pull_threshold_for_queue``: this queue's pulled-but-unconsumed **count** (default 1000)
+        - ``pull_threshold_size_for_queue``: this queue's pulled-but-unconsumed **bytes in MB** (default 100)
+        - ``pull_threshold_for_topic`` / ``pull_threshold_size_for_topic``: accumulation across all queues of the same topic (-1 disables)
+        - ``consume_concurrently_max_span``: the **span** of queueOffsets of pulled-but-unconsumed messages (default 2000,
+          prevents "one message keeps failing while the rest pile up" from making the offset span run away)
         """
         with self._lock:
             dq = list(self._pending.get(key, ()))
@@ -2557,21 +2556,21 @@ class DefaultMQPushConsumer:
     def _resolve_initial_offset(self, client: MQClientInstance, mq: MessageQueue,
                                 sub: SubscriptionData) -> int:
         if sub.expression_type == ExpressionType.SQL92:
-            # SQL 过滤无 offset 语义，默认最新
+            # SQL filtering has no offset semantics; default to the latest
             return client.get_max_offset(mq)
         if self.message_model == MessageModel.BROADCASTING:
-            # 广播模式：offset 只存本地文件
+            # Broadcast mode: offsets are stored in the local file only
             stored = self._load_local_offsets()
             key = "%s%s%d" % (mq.topic, mq.broker_name, mq.queue_id)
             if key in stored:
                 return stored[key]
             if self.consume_from_where == ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET:
-                # FIRST_OFFSET 且本地没有位点时直接给 0
-                # （本地文件与 broker 两条路径同一个分支），真正的起点由 OFFSET_ILLEGAL
-                # 纠错按 broker 回的 nextBeginOffset 落定。
+                # FIRST_OFFSET with no local offset: give 0 directly
+                # (the local file and broker paths share this branch); the real start is settled by OFFSET_ILLEGAL
+                # correction per the broker's returned nextBeginOffset.
                 return 0
             return client.get_max_offset(mq)
-        # 集群模式：先查 broker 上已提交的位点
+        # Cluster mode: first query the committed offset on the broker
         try:
             stored = client.query_consumer_offset(self.consumer_group, mq, set_zero_if_not_found=False)
             if stored is not None and stored >= 0:
@@ -2579,23 +2578,23 @@ class DefaultMQPushConsumer:
         except Exception as e:  # noqa: BLE001
             logger.debug("query consumer offset for %s not found: %s", mq, e)
         if self.consume_from_where == ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET:
-            # FIRST_OFFSET 且 broker 上无已提交位点时直接给 0
-            # （注释口径是 "the offset will be fixed by the OFFSET_ILLEGAL process"）：
-            # **不**发 minOffset 查询。多打这一枪的代价不只是慢：
-            # minOffset 是 MQAdminImpl 口径（只认 master），主掉线期间恰好是「新起的消费者
-            # 一条都拉不到」——而从节点本来就能按 0 起拉、越界时由 broker 用
-            # PULL_OFFSET_MOVED 把位点纠回来（_offset_illegal_recover）。
+            # FIRST_OFFSET with no committed offset on the broker: give 0 directly
+            # (the comment policy is "the offset will be fixed by the OFFSET_ILLEGAL process"):
+            # **do not** send a minOffset query. The cost of this extra shot is not just slowness:
+            # minOffset is the MQAdminImpl policy (master only), and while the master is down it is exactly "a newly started consumer
+            # cannot pull anything" -- while slaves could already start pulling at 0, with the broker using
+            # PULL_OFFSET_MOVED to correct the offset when out of bounds (_offset_illegal_recover).
             return 0
         if self.consume_from_where == ConsumeFromWhere.CONSUME_FROM_TIMESTAMP:
             return client.search_offset_by_timestamp(mq, self._consume_timestamp_millis())
         if NamespaceUtil.is_retry_topic(mq.topic):
-            # 首次消费且无已提交位点时，%RETRY% 主题从 0 开始
-            # （重试消息要全量重试），而不是从最大位点跳过
+            # First consume with no committed offset: the %RETRY% topic starts at 0
+            # (retry messages must be fully retried), instead of skipping from the max offset
             return 0
-        # 默认 CONSUME_FROM_LAST_OFFSET
+        # Default CONSUME_FROM_LAST_OFFSET
         return client.get_max_offset(mq)
 
-    # ---------------- 分发消费 ----------------
+    # ---------------- Dispatch and consume ----------------
     def _start_dispatch_loop(self) -> None:
         t = threading.Thread(target=self._dispatch_loop, daemon=True,
                              name="rmq-dispatch-%s" % self.consumer_group)
@@ -2610,8 +2609,8 @@ class DefaultMQPushConsumer:
             for key in keys:
                 if self._stop.is_set() or not self._started:
                     return
-                # 取值与"是否仍持有该队列"必须同一把锁内完成：key 是本轮开始时的快照，
-                # 队列可能已被 rebalance 撤走（那时缓冲已被清理，不能再消费）
+                # Taking the value and "does this thread still own the queue" must complete within the same lock: key is a snapshot from the start of this round,
+                # and the queue may already have been taken away by rebalance (in which case the buffer has been cleaned and it must not be consumed)
                 with self._lock:
                     mq = self._mq_map.get(key)
                     dq = self._pending.get(key)
@@ -2619,11 +2618,11 @@ class DefaultMQPushConsumer:
                         continue
                     n = min(len(dq), max(1, self.consume_message_batch_max_size))
                     batch = [dq.popleft() for _ in range(n)]
-                    # 与"取走批次"同一临界区登记在途：_correct_tags_offset_locked 的闸门
-                    # 靠它区分"消息还在缓冲里"和"消息在 listener 手里"——两个都不算空。
+                    # Register in-flight in the same critical section as "taking the batch": _correct_tags_offset_locked's gate
+                    # relies on it to distinguish "the message is still in the buffer" and "the message is in the listener's hands" -- neither counts as empty.
                     self._msg_queue_inflight[key] = self._msg_queue_inflight.get(key, 0) + 1
-                    # 连同这批消息所属的 ProcessQueue 代号一起取走：消费/ack 前比对，
-                    # 不一致整批作废
+                    # Take the epoch of the ProcessQueue this batch belongs to along with it: compare before consuming/acking,
+                    # and void the whole batch on mismatch
                     epoch = self._queue_epoch.get(key, 0)
                 if not batch:
                     continue
@@ -2631,7 +2630,7 @@ class DefaultMQPushConsumer:
                     done = self._consume_batch(key, mq, batch, epoch)
                     progressed = progressed or done
                 except Exception as e:  # noqa: BLE001
-                    # 分发路径意外异常：批次塞回队首，稍后重试（不要让它杀死分发线程）
+                    # Unexpected exception on the dispatch path: push the batch back to the head of the queue and retry shortly (do not let it kill the dispatch thread)
                     logger.error("dispatch batch error (will retry): %s: %s", type(e).__name__, e)
                     with self._lock:
                         dq2 = self._pending.get(key)
@@ -2650,11 +2649,11 @@ class DefaultMQPushConsumer:
                 time.sleep(0.05)
 
     def _reset_retry_topic_and_namespace(self, msgs: List[MessageExt]) -> None:
-        """还原重试 topic 与命名空间（分发前调用）。
+        """Restore the retry topic and namespace (called before dispatch).
 
-        重投消息实际存在 ``%RETRY%consumerGroup`` 下，broker 会把原始 topic 写进
-        ``RETRY_TOPIC`` 属性。必须在交给 listener **之前**用它把 topic 还原，
-        listener 才能看到业务原始 topic；不做的话用户按 topic 分支的代码会走错。
+        Redelivered messages actually live under ``%RETRY%consumerGroup``, and the broker writes the original topic into
+        the ``RETRY_TOPIC`` property. It must be used to restore the topic **before** handing to the listener,
+        so the listener sees the business's original topic; without it, user code branching on topic goes wrong.
         """
         group_topic = MixAll.get_retry_topic(self.consumer_group)
         for msg in msgs:
@@ -2664,22 +2663,22 @@ class DefaultMQPushConsumer:
             if self.namespace:
                 msg.topic = NamespaceUtil.without_namespace(msg.topic, self.namespace)
 
-    # ---------------- broker 主动请求：220 / 221 / 307 / 309 ----------------
-    # 这四个请求由 broker（或 mqadmin 经 broker）反向打给客户端。
-    # 处理入口注册在 MQClientInstance 上（见
-    # mq_client.py），因为它要按 consumerGroup 找到**对应的**消费者实例，而不是
-    # 每个消费者各注册一次（那样同一进程里多消费组时只有最后一个生效）。
+    # ---------------- Broker-initiated requests: 220 / 221 / 307 / 309 ----------------
+    # These four requests are sent by the broker (or mqadmin via the broker) back to the client.
+    # The handling entries are registered on MQClientInstance (see
+    # mq_client.py), because it must find the **corresponding** consumer instance by consumerGroup, rather than
+    # each consumer registering once (in which case, with multiple consume groups in the same process, only the last one takes effect).
 
     def reset_offset(self, topic: str, offset_table: Dict[MessageQueue, int]) -> None:
-        """RESET_CONSUMER_CLIENT_OFFSET(220) 的处理逻辑：把 broker 下发的新位点落到本实例。
+        """The handling logic of RESET_CONSUMER_CLIENT_OFFSET(220): land the broker-issued new offset on this instance.
 
-        需要的四步：①作废该队列（在途批次的 ack 与缓冲一起作废）
-        ②等非顺序消费的在途批次跑完 ③写入新位点并立刻落盘、顺序解锁
-        ④把队列从本地队列表摘掉，rebalance 按新位点重建。
+        Four steps needed: (1) void this queue (in-flight batches' acks and buffer voided together)
+        (2) wait for non-orderly in-flight batches to finish (3) write the new offset and persist immediately, orderly unlock
+        (4) remove the queue from the local queue table, and rebalance rebuilds at the new offset.
 
-        本端口的实现：新位点先落进表，再走统一撤销路径（``_retire_queue_locked`` 代号 +1
-        即作废，清缓冲、摘拉取线程），撤销收尾把**新位点**持久化，最后 rebalance 重建。
-        等待取 0.2 秒：代号已让在途 ack 全部失效，不靠"等"避竞争。
+        This port's implementation: the new offset lands in the table first, then goes through the unified revoke path (``_retire_queue_locked`` epoch +1
+        voids, clears the buffer, removes pull threads), the revoke's cleanup persists the **new offset**, and rebalance rebuilds last.
+        The wait takes 0.2 seconds: the epoch has already voided all in-flight acks; it does not rely on "waiting" to avoid races.
         """
         if topic is None or not offset_table:
             return
@@ -2691,8 +2690,8 @@ class DefaultMQPushConsumer:
                 off = offset_table.get(mq)
                 if off is None:
                     continue
-                # 新位点先写进表：撤销会把**它**交给 _on_queues_revoked 落盘
-                #（写位点后必须紧跟着一次 persist）
+                # The new offset goes into the table first: revoke hands **it** to _on_queues_revoked for persistence
+                # (a persist must immediately follow writing the offset)
                 self._consume_offsets[key] = int(off)
                 self._retire_queue_locked(key, mq, retired)
         if not retired:
@@ -2707,10 +2706,10 @@ class DefaultMQPushConsumer:
                     self.consumer_group, topic, len(retired))
 
     def get_consumer_status(self, topic: str) -> Dict[MessageQueue, int]:
-        """GET_CONSUMER_STATUS_FROM_CLIENT(221) 的应答数据源。
+        """The response data source of GET_CONSUMER_STATUS_FROM_CLIENT(221).
 
-        应答带的是**已消费位点**表的快照
-        （不是拉取游标）。
+        The response carries a snapshot of the **consumed offsets** table
+        (not the pull cursor).
         """
         out: Dict[MessageQueue, int] = {}
         with self._lock:
@@ -2723,7 +2722,7 @@ class DefaultMQPushConsumer:
         return out
 
     def consumer_running_info(self) -> ConsumerRunningInfo:
-        """GET_CONSUMER_RUNNING_INFO(307) 的应答：拼装运行信息。"""
+        """The response of GET_CONSUMER_RUNNING_INFO(307): assemble the runtime info."""
         info = ConsumerRunningInfo()
         info.properties = {
             ConsumerRunningInfo.PROP_NAMESERVER_ADDR: ";".join(self.name_server_addrs) + ";",
@@ -2735,11 +2734,11 @@ class DefaultMQPushConsumer:
         }
         with self._lock:
             subs = list(self.subscription_data.values())
-            # POP 模式下弹出去 pop_queues，classic 的本地队列表是空的
-            # —— 两把表互斥，307 的应答里也互斥：同一把队列
-            # 既出现在 mqTable 又出现在 mqPopTable 会让控制台把一路消费数成两路。
-            # _mq_map 是"已分配"注册表（停摆自愈、位点持久化、220 重置都靠它），两种模式都写，
-            # 所以这里按模式过滤而不是不写。
+            # In POP mode, popped messages go to pop_queues; the classic local queue table is empty
+            # -- the two tables are mutually exclusive, and so are they in the 307 response: the same queue
+            # appearing in both mqTable and mqPopTable would make the console count one consume stream as two.
+            # _mq_map is the "assigned" registry (stall self-healing, offset persistence, and 220 reset all rely on it), written in both modes,
+            # so it is filtered by mode here rather than not written.
             pop_keys = set(self._pop_queues or ()) if self.pop_mode else ()
             for key, mq in self._mq_map.items():
                 if key in pop_keys:
@@ -2748,8 +2747,8 @@ class DefaultMQPushConsumer:
                 pqi.commit_offset = int(self._consume_offsets.get(key, 0))
                 pqi.cached_msg_count = len(self._pending.get(key) or ())
                 pqi.droped = False
-                # 运维看的就是这个时刻；
-                # 写死 0 会让"这一路有没有停摆"在 307 应答里完全看不出来。
+                # This is the moment ops looks at;
+                # hardcoding 0 would make "whether this stream has stalled" completely invisible in the 307 response.
                 pqi.last_pull_timestamp = int(self._last_pull_table.get(key, 0) * 1000)
                 info.mq_table[mq] = pqi.to_dict()
             if self.pop_mode:
@@ -2760,13 +2759,13 @@ class DefaultMQPushConsumer:
                     pqi = ProcessQueueInfo()
                     pqi.cached_msg_count = pq.wait_ack_count()
                     pqi.droped = pq.is_dropped()
-                    # POP 队列用 lastPopTimestamp 顶替 lastPullTimestamp
-                    # 判停摆（isPullExpired:74），这里填同一个时刻保持可比。
+                    # POP queues use lastPopTimestamp in place of lastPullTimestamp
+                    # for stall detection (isPullExpired:74); the same timestamp is filled here to stay comparable.
                     pqi.last_pull_timestamp = int(pq.last_pop_timestamp * 1000)
                     info.mq_pop_table[mq] = pqi.to_dict()
         info.subscription_set = [s.to_dict() if hasattr(s, "to_dict") else dict(s.__dict__)
                                  for s in subs]
-        # statusTable：consumeStatus(group, topic) 的 minute 快照
+        # statusTable: the minute snapshot of consumeStatus(group, topic)
         for s in subs:
             if self._stats_manager is not None:
                 info.status_table[s.topic] = self._stats_manager.consume_status(
@@ -2777,11 +2776,11 @@ class DefaultMQPushConsumer:
 
     def consume_message_directly(self, msg: MessageExt,
                                  broker_name: Optional[str]) -> ConsumeMessageDirectlyResult:
-        """CONSUME_MESSAGE_DIRECTLY(309)：把一条消息直接交给本实例的 listener。
+        """CONSUME_MESSAGE_DIRECTLY(309): hand a message directly to this instance's listener.
 
-        由管理端触发，应答里的 ``order`` 标志区分消费模式（broker 侧按它选 DLQ 口径）。
-        顺序侧的映射比并发侧多两个成员：COMMIT → ``CR_COMMIT``、ROLLBACK →
-        ``CR_ROLLBACK``；并发侧返回它们只会落到 ``default:``。
+        Triggered from the admin side; the ``order`` flag in the response distinguishes consume modes (the broker picks the DLQ policy by it).
+        The orderly side's mapping has two more members than the concurrent side: COMMIT -> ``CR_COMMIT``, ROLLBACK ->
+        ``CR_ROLLBACK``; returning them on the concurrent side only falls into ``default:``.
         """
         result = ConsumeMessageDirectlyResult()
         orderly = self._is_orderly()
@@ -2815,21 +2814,21 @@ class DefaultMQPushConsumer:
         except Exception as e:  # noqa: BLE001
             result.consume_result = CMResult.CR_THROW_EXCEPTION
             result.remark = "%s: %s" % (type(e).__name__, e)
-        # 顺序消费的 autoCommit 读的是 **listener 跑完之后**的上下文值（放在
-        # try/catch 之外、异常路径同样读）。listener 里置 false 的 binlog 用法靠这条
-        # 回传让 broker 知道「这条直接消费没提交」；提前读初值等于把它吞掉，
-        # 真机上只表现为 mqadmin 返回的 autoCommit 恒为 true。
+        # Ordered consumption's autoCommit reads the context value **after the listener finishes** (placed
+        # outside try/catch, and also read on the exception path). The binlog usage of setting false inside the listener relies on this
+        # feedback to let the broker know "this direct consume did not commit"; reading the initial value early would swallow it,
+        # presenting on live systems only as mqadmin's returned autoCommit always being true.
         result.auto_commit = context.auto_commit if orderly else True
         result.spent_time_mills = int(time.time() * 1000) - begin
         return result
 
     def _requeue_pending(self, key: str, batch: List[MessageExt]) -> None:
-        """把这一批塞回本地队列队首（原地重试 / rollback 的等价动作）。
+        """Push this batch back to the head of the local queue (the equivalent of in-place retry / rollback).
 
-        待消费缓冲是 ``_pending`` 双端队列，批次在分发给 listener **之前**就被
-        弹出队首了；而拉取游标（``_offset_table``）在拉取那一刻已经推到 ``nextBeginOffset``，
-        所以"位点不前进"并不会让 broker 把这几条再发一遍 —— 想让它们原地重试就必须显式
-        放回去。
+        The pending buffer is the ``_pending`` deque, and the batch is popped from the head **before** being dispatched to the listener;
+        while the pull cursor (``_offset_table``) has already advanced to ``nextBeginOffset`` at the moment of pulling,
+        so "the offset not advancing" does not make the broker send these messages again -- to retry them in place they must be explicitly
+        put back.
         """
         with self._lock:
             dq = self._pending.get(key)
@@ -2838,7 +2837,7 @@ class DefaultMQPushConsumer:
                     dq.appendleft(m)
 
     def _deregister_inflight_locked(self, key: str, batch: List[MessageExt]) -> None:
-        """把这批消息从"在 listener 手里"的登记里摘除（按对象身份，幂等）。须持锁调用。"""
+        """Remove this batch from the "in the listener's hands" registration (by object identity, idempotent). Must be called while holding the lock."""
         bucket = self._inflight_msgs.get(key)
         if not bucket:
             return
@@ -2848,10 +2847,10 @@ class DefaultMQPushConsumer:
             self._inflight_msgs.pop(key, None)
 
     def _process_queue_entries_locked(self, key: str) -> List[MessageExt]:
-        """该队列"在持消息"全集视图：在途（已分发未落定）∪ 已拉未分发。
+        """This queue's full "held messages" view: in-flight (dispatched but not settled) union pulled-but-not-dispatched.
 
-        配对操作（登记/摘除、塞回缓冲）都在 ``self._lock`` 内成对完成，一条消息在同一
-        瞬间只会出现在一边；这里按对象身份再去一次重只为防御未来新调用点写出重叠。
+        Pairing operations (register/remove, push back to buffer) all complete in pairs within ``self._lock``, and a message appears
+        in only one side at any instant; the extra dedup by object identity here only guards against future new call sites writing overlaps.
         """
         out: List[MessageExt] = []
         seen: Set[int] = set()
@@ -2862,16 +2861,16 @@ class DefaultMQPushConsumer:
         return out
 
     def _process_queue_first_entry_locked(self, key: str) -> Optional[MessageExt]:
-        """队首 = 最小 ``queueOffset`` 的那条。"""
+        """The head of the queue = the entry with the smallest ``queueOffset``."""
         entries = self._process_queue_entries_locked(key)
         if not entries:
             return None
         return min(entries, key=lambda m: m.queue_offset or 0)
 
     def _process_queue_contains_locked(self, key: str, msg: MessageExt) -> bool:
-        """这条消息还挂在队列上吗（在途登记或待消费缓冲里）。
+        """Is this message still attached to the queue (in the in-flight registration or the pending buffer).
 
-        被 cleanExpiredMsg 清扫掉的不算（它已经在回 broker 的路上）。
+        Messages swept away by cleanExpiredMsg do not count (they are already on their way back to the broker).
         """
         for m in self._inflight_msgs.get(key) or ():
             if m is msg:
@@ -2882,21 +2881,21 @@ class DefaultMQPushConsumer:
         return False
 
     def _remove_process_queue_entry_locked(self, key: str, msg: MessageExt) -> None:
-        """摘除刚清扫过的那条（须持锁；调用方已确认它就是队首）。
+        """Remove the just-swept entry (must hold the lock; the caller has confirmed it is the head).
 
-        两边都摘：正常情况下它只在一边；并发路径"回投失败塞回缓冲"与"方法收尾摘除登记"
-        之间有一瞬两边都在，从两处一起摘掉才能保证下轮清扫不会再看见它。
+        Remove from both sides: normally it is in only one; between the concurrent path's "failed redelivery pushed back to the buffer" and "method cleanup removes the registration"
+        there is an instant when it is in both, and removing from both places ensures the next sweep round does not see it again.
         """
         self._deregister_inflight_locked(key, [msg])
         dq = self._pending.get(key)
         if dq and dq[0] is msg:
             dq.popleft()
 
-    # ---------------- cleanExpiredMsg：挂起 listener 的逃生口 ----------------
-    # 这是"listener 卡死不返回"时唯一的回收
-    # 机制：把在手里超过 consumeTimeout 分钟的消息发回 broker（delayLevel=3），走 %RETRY%
-    # 重新投递。少了它，一条卡住的消息会让该队列的位点永久停住，broker 侧只能等下一次
-    # 客户端重启 —— 真机上表现为"消息明明投出去了却永远收不到第二次"，没有任何异常可看。
+    # ---------------- cleanExpiredMsg: the escape hatch for suspended listeners ----------------
+    # This is the only recovery
+    # mechanism for "the listener hangs and never returns": messages held longer than consumeTimeout minutes are sent back to the broker (delayLevel=3), going through %RETRY%
+    # for redelivery. Without it, one stuck message would stop that queue's offset forever, with the broker side only able to wait for the next
+    # client restart -- on live systems this presents as "the message was clearly sent but is never received a second time", with no exception to look at.
 
     def _start_clean_expire_loop(self) -> None:
         t = threading.Thread(target=self._clean_expire_loop, daemon=True,
@@ -2905,10 +2904,10 @@ class DefaultMQPushConsumer:
         self._clean_expire_thread = t
 
     def _clean_expire_loop(self) -> None:
-        # initialDelay 与 period 同值（都是 consumeTimeout 分钟），所以首轮清扫也要等满一个周期 ——
-        # 立刻扫会把刚开始消费、还没超时的消息全看一遍（虽然不会误伤，但完全没必要）。
+        # initialDelay equals period (both are consumeTimeout minutes), so the first sweep round also waits a full period --
+        # sweeping immediately would look through all just-started, not-yet-timed-out messages (harmless, but entirely unnecessary).
         period = max(1, self.consume_timeout) * 60.0
-        if self._stop.wait(period):                # initialDelay = consumeTimeout 分钟
+        if self._stop.wait(period):                # initialDelay = consumeTimeout minutes
             return
         while True:
             if not self._started:
@@ -2916,45 +2915,45 @@ class DefaultMQPushConsumer:
             try:
                 self._clean_expired_msg_once()
             except Exception as e:  # noqa: BLE001
-                # 调度壳子兜住一切异常：单轮清扫出错不能打死调度
+                # The scheduler shell catches all exceptions: an error in a single sweep round must not kill the schedule
                 logger.error("scheduleAtFixedRate cleanExpireMsg exception: %s", e)
-            if self._stop.wait(period):            # 周期 = consumeTimeout 分钟
+            if self._stop.wait(period):            # period = consumeTimeout minutes
                 return
 
     def _clean_expired_msg_once(self) -> None:
-        """遍历当前持有的队列逐个清扫。"""
+        """Sweep the currently held queues one by one."""
         with self._lock:
             keys = list(self._mq_map.keys())
         for key in keys:
             self._clean_expired_queue(key)
 
     def _clean_expired_queue(self, key: str) -> None:
-        """清扫单个队列里超时的消息。
+        """Sweep timed-out messages in a single queue.
 
-        语义三件套：只看队首（最小位点）、单条判定严格大于 consumeTimeout、每轮最多 16 条。
+        The semantic trio: only look at the head (smallest offset), per-message judgment strictly greater than consumeTimeout, at most 16 messages per round.
         """
         if self._is_orderly():
-            # 顺序消费没有这条路径（消息本来就要原地重试，回投会乱序）
+            # Ordered consumption has no such path (messages are to be retried in place anyway; redelivery would reorder)
             return
         with self._lock:
-            loop = min(len(self._process_queue_entries_locked(key)), 16)  # 每轮最多 16 条
+            loop = min(len(self._process_queue_entries_locked(key)), 16)  # At most 16 messages per round
         for _ in range(loop):
             msg = None
             with self._lock:
                 first = self._process_queue_first_entry_locked(key)
                 if first is not None:
                     stamp = MessageAccessor.get_consume_start_timestamp(first)
-                    # 没盖过章（还没进过 listener 的缓冲消息）直接当成未过期；
-                    # 过期判据是**严格**大于（等于阈值不动手）
+                    # Never stamped (buffered messages that have not yet entered the listener) are treated as not expired directly;
+                    # the expiry criterion is **strictly** greater (equal to the threshold does nothing)
                     if stamp and (time.time() * 1000 - float(stamp)) > self.consume_timeout * 60 * 1000:
                         msg = first
             if msg is None:
-                break                          # 队首没过期，后面的更不可能过期
+                break                          # The head is not expired; the ones behind it cannot be either
             try:
-                self.send_message_back(msg, 3)  # delayLevel 固定 3（延迟约 10s）
+                self.send_message_back(msg, 3)  # delayLevel is fixed at 3 (delay ~10s)
             except Exception as e:  # noqa: BLE001
-                # 回投失败只记日志：消息留在原地，下一轮（或本轮的下一圈）
-                # 再试；绝不摘除（摘了就真丢了）
+                # Redelivery failure only logs: the message stays put and is
+                # retried on the next round (or the next pass of this round); never removed (removed means truly lost)
                 logger.error("send expired msg exception: %s", e)
                 continue
             logger.info("send expire msg back. topic=%s, msgId=%s, storeHost=%s, "
@@ -2962,18 +2961,18 @@ class DefaultMQPushConsumer:
                         msg.topic, msg.msg_id, msg.get_store_host_string(),
                         msg.queue_id, msg.queue_offset)
             with self._lock:
-                # 只有它**仍是**队首时才摘除：listener 恰好在此期间正常
-                # 收尾（或前面冒出了更小的位点）就让位给正常路径，别抢
+                # Only remove when it is **still** the head: if the listener happens to finish normally
+                # during this time (or a smaller offset appears ahead), yield to the normal path, do not grab
                 if self._process_queue_first_entry_locked(key) is msg:
                     self._remove_process_queue_entry_locked(key, msg)
 
     def _consume_batch(self, key: str, mq: MessageQueue, batch: List[MessageExt],
                        epoch: Optional[int] = None) -> bool:
-        """消费一个批次并处理回投/挂起。返回消费位点是否前进。
+        """Consume one batch and handle redelivery/suspension. Returns whether the consume offset advanced.
 
-        ``epoch``：这批消息所属的 ProcessQueue 代号（见 ``_queue_epoch``）。队列在本批次
-        排队期间被丢弃（rebalance 撤走 / OFFSET_ILLEGAL 纠错 / 停摆自愈）时，这批消息
-        **不能再消费也不能 ack** —— 对应 ``isDropped()`` 短路，并发和顺序两条路径同口径。
+        ``epoch``: the epoch of the ProcessQueue this batch belongs to (see ``_queue_epoch``). When the queue is dropped while this batch
+        was queuing (rebalance revoke / OFFSET_ILLEGAL correction / stall self-healing), these messages
+        **must not be consumed nor acked** -- corresponding to the ``isDropped()`` short circuit, with the concurrent and orderly paths sharing the same policy.
         """
         if epoch is not None and epoch != self._queue_epoch.get(key, 0):
             dropped = self._queue_epoch.get(key, 0)
@@ -2984,7 +2983,7 @@ class DefaultMQPushConsumer:
         listener = self.message_listener
         broadcast = self.message_model == MessageModel.BROADCASTING
         self._reset_retry_topic_and_namespace(batch)
-        # ---- 顺序消费 ----
+        # ---- Ordered consumption ----
         if self._is_orderly():
             ocontext = ConsumeOrderlyContext(mq)
             ohook_ctx = None
@@ -2996,43 +2995,43 @@ class DefaultMQPushConsumer:
             try:
                 status = listener.consume_message(batch, ocontext)
             except Exception as e:  # noqa: BLE001
-                # 异常只置 hasException，status 留 null，由下面统一
-                # 变成挂起：顺序消费永远没有"异常即 ack"这条路
+                # The exception only sets hasException, leaving status null, uniformly
+                # turned into suspension below: ordered consumption never has the "exception means ack" path
                 logger.debug("orderly listener error (retry in place): %s", e)
                 status = None
                 ohas_exception = True
-            # null / ROLLBACK / 挂起都要留一条 warn
+            # null / ROLLBACK / suspend all leave a warn
             if (status is None or status == ConsumeOrderlyStatus.ROLLBACK
                     or status == ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT):
                 logger.warning("consumeMessage Orderly return not OK, Group: %s Msgs: %d MQ: %s",
                                self.consumer_group, len(batch), mq)
             raw_status = status
             if status is None or status not in _ORDERLY_STATUSES:
-                # null 在钩子之前就按挂起处理。静态类型里
-                # status 只能是枚举成员，动态类型下"返回了别的东西"走同一条兜底：
-                # 否则它会一路落进 SUCCESS 分支，把没消费成功的消息静默 ack 掉。
+                # null is treated as suspension before the hook. In the static type
+                # status can only be an enum member; under dynamic types "returned something else" takes the same fallback:
+                # otherwise it would fall all the way into the SUCCESS branch, silently acking messages that were not consumed successfully.
                 status = ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT
-            # 钩子拿**归一化后**的 status，success 判据是 SUCCESS||COMMIT，
-            # 而 returnType 用归一化**前**的
+            # The hook gets the **post**-normalization status, the success criterion is SUCCESS||COMMIT,
+            # while returnType uses the **pre**-normalization one
             self._finish_consume_hook(
                 ohook_ctx, raw_status, ohas_exception, obegin_ms,
                 failed=status == ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT,
                 succeeded=status in (ConsumeOrderlyStatus.SUCCESS, ConsumeOrderlyStatus.COMMIT),
                 hook_status=status)
             if ocontext.auto_commit:
-                # ---- 顺序消费的 autoCommit=True 分支 ----
+                # ---- Ordered consumption's autoCommit=True branch ----
                 if status in (ConsumeOrderlyStatus.COMMIT, ConsumeOrderlyStatus.ROLLBACK):
-                    # autoCommit=true 时 COMMIT/ROLLBACK 是非法用法
-                    # （只给 binlog 消费用），这里只警告、**不提前返回**，顺势落进
-                    # SUCCESS 分支：消息照 ack，不当成回滚
+                    # COMMIT/ROLLBACK with autoCommit=true is an illegal usage
+                    # (only for binlog consumption); here it only warns and **does not return early**, falling through
+                    # into the SUCCESS branch: the message is acked as usual, not treated as a rollback
                     logger.warning("the message queue consume result is illegal, "
                                    "we think you want to ack these message %s", mq)
                     status = ConsumeOrderlyStatus.SUCCESS
                 if status == ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT:
                     self._record_consume_stats(mq.topic, len(batch), obegin_ms, failed=True)
-                    # 挂起之前先过 _check_reconsume_times：只有"还在重试
-                    # 次数内 / 回投失败"才原地重试；已经交给 broker 的（回投成功）要
-                    # 前进位点，否则一条毒消息永久占住这条队列
+                    # Before suspending, first pass _check_reconsume_times: only "still within the retry
+                    # count / redelivery failed" retries in place; those already handed to the broker (redelivery succeeded) must
+                    # advance the offset, otherwise one poison message permanently occupies this queue
                     if self._check_orderly_reconsume_times(batch):
                         self._requeue_pending(key, batch)
                         time.sleep(self._orderly_suspend_millis(ocontext) / 1000.0)
@@ -3041,14 +3040,14 @@ class DefaultMQPushConsumer:
                     self._record_consume_stats(mq.topic, len(batch), obegin_ms, failed=False)
                 self._advance_consume_offset(key, batch, epoch=epoch)
                 return True
-            # ---- autoCommit=False（binlog 消费场景）----
+            # ---- autoCommit=False (binlog consumption scenario) ----
             if status == ConsumeOrderlyStatus.COMMIT:
-                # 显式提交：位点前进，**不记 TPS**（RT 在分支外照记）
+                # Explicit commit: the offset advances, **no TPS recorded** (RT is still recorded outside the branch)
                 self._record_consume_rt(mq.topic, obegin_ms)
                 self._advance_consume_offset(key, batch, epoch=epoch)
                 return True
             if status == ConsumeOrderlyStatus.ROLLBACK:
-                # rollback：把消息退回待消费缓冲并延后重试
+                # rollback: push messages back to the pending buffer and retry later
                 self._record_consume_rt(mq.topic, obegin_ms)
                 self._requeue_pending(key, batch)
                 time.sleep(self._orderly_suspend_millis(ocontext) / 1000.0)
@@ -3058,76 +3057,76 @@ class DefaultMQPushConsumer:
                 if self._check_orderly_reconsume_times(batch):
                     self._requeue_pending(key, batch)
                     time.sleep(self._orderly_suspend_millis(ocontext) / 1000.0)
-                # 与自动提交分支的差别：毒消息交给 broker 后**不 commit**，
-                # 位点前不前进由 binlog 消费方自己拿主意
+                # Difference from the auto-commit branch: a poison message handed to the broker is **not committed**,
+                # and whether the offset advances is up to the binlog consumer itself
                 return False
-            # SUCCESS + autoCommit=False：只记 OK TPS、不提交。
-            # 本端口没把 ProcessQueue 暴露给 listener（没有 commit 的口子），
-            # 所以不维护"正在消费"的子表等显式 commit()；
-            # 什么都不做会让这批消息被分发线程吞掉而位点又没动。这里等价地塞回
-            # 队首并等一个挂起周期：位点同样不前进、消息不丢，也不会把消费线程变成忙等
-            # （不 sleep 的话下一轮立刻又拿到同一批，DEFAULT 配置下就是 100% CPU 空转）。
+            # SUCCESS + autoCommit=False: only record OK TPS, do not commit.
+            # This port does not expose ProcessQueue to the listener (there is no commit opening),
+            # so it does not maintain an explicit commit() subtable like "currently consuming";
+            # doing nothing would let this batch be swallowed by the dispatch thread with the offset unmoved. Equivalently here it pushes back to
+            # the head and waits one suspend period: the offset likewise does not advance, no messages are lost, and the consume thread is not turned into a busy wait
+            # (without sleep, the next round would get the same batch immediately, which under the DEFAULT config is 100% CPU spinning).
             self._record_consume_stats(mq.topic, len(batch), obegin_ms, failed=False)
             self._requeue_pending(key, batch)
             time.sleep(self._orderly_suspend_millis(ocontext) / 1000.0)
             return False
-        # ---- 并发消费 ----
-        # 登记在途消息：并发路径下消息被批次持有期间**仍留在**
-        # 在持消息表里（直到消费结果处理完才摘除），
-        # 超时清扫的"队首"判据与"这条还在队列上吗"判据都看它。顺序路径相反
-        # （批次被取走后就不在待消费缓冲里，而清扫对顺序直接早退），
-        # 所以只登记并发批次。
+        # ---- Concurrent consumption ----
+        # Register in-flight messages: on the concurrent path, messages **remain in** the
+        # held messages table while held by a batch (removed only after the consume result is processed),
+        # and the timeout sweep's "head" criterion and "is this still on the queue" criterion both look at it. The orderly path is the opposite
+        # (once a batch is taken it is no longer in the pending buffer, while the sweep exits early for orderly),
+        # so only concurrent batches are registered.
         with self._lock:
             self._inflight_msgs.setdefault(key, []).extend(batch)
         try:
             return self._consume_concurrent_batch(key, mq, batch, epoch, listener, broadcast)
         finally:
-            # 正常收尾（含回投失败回塞、被清扫摘除）后这批不再"在 listener 手里"；
-            # 被清扫/回塞提前摘过的条目在这里是幂等的。
+            # After normal completion (including failed-redelivery re-enqueue and sweep removal) this batch is no longer "in the listener's hands";
+            # entries removed early by sweep/re-enqueue are idempotent here.
             with self._lock:
                 self._deregister_inflight_locked(key, batch)
 
     def _consume_concurrent_batch(self, key: str, mq: MessageQueue, batch: List[MessageExt],
                                   epoch: Optional[int], listener, broadcast: bool) -> bool:
-        """并发消费一个批次。"""
+        """Consume one batch concurrently."""
         context = ConsumeConcurrentlyContext(mq)
         hook_ctx = None
         if self.consume_message_hook_list:
-            # before 钩子在 listener **之前**（用于生成 SubBefore 轨迹），
-            # after 在拿到 status 之后（生成 SubAfter，带 contextCode）
+            # before hook **before** the listener (for generating SubBefore traces),
+            # after after getting the status (generates SubAfter, with contextCode)
             hook_ctx = self._build_consume_hook_context(batch, mq)
             self.execute_consume_hook_before(hook_ctx)
         begin_ms = time.time() * 1000
         has_exception = False
         try:
-            # 交给 listener **之前**逐条盖 CONSUME_START_TIME，每次投递
-            # （含重试）重新盖。cleanExpiredMsg 的挂起逃生口靠它判"这条在手里挂了多久"。
+            # Stamp CONSUME_START_TIME on each message **before** handing to the listener, restamping on every delivery
+            # (including retries). cleanExpiredMsg's suspend escape hatch relies on it to judge "how long this one has been held".
             for m in batch:
                 MessageAccessor.set_consume_start_timestamp(m, int(time.time() * 1000))
             status = listener.consume_message(batch, context)
         except Exception as e:  # noqa: BLE001
-            # 消费抛异常按 RECONSUME_LATER 处理
+            # An exception from consumption is treated as RECONSUME_LATER
             logger.debug("listener error, treat as RECONSUME_LATER: %s", e)
             status = ConsumeConcurrentlyStatus.RECONSUME_LATER
             has_exception = True
-        # listener 返回 null 同样按 RECONSUME_LATER 处理（默认的 ackIndex
-        # 只对 CONSUME_SUCCESS 有意义，null 落到下面就是整批回投）。归一化前的 status 要
-        # 留给 returnType（返回 null 记 RETURNNULL，不是 FAILED）
+        # A listener returning null is likewise treated as RECONSUME_LATER (the default ackIndex
+        # only matters for CONSUME_SUCCESS; null falling through below means whole-batch redelivery). The pre-normalization status must
+        # be left to returnType (returning null records RETURNNULL, not FAILED)
         raw_status = status
         if status is None:
             logger.warning("consumeMessage return null, Group: %s Msgs: %d MQ: %s",
                            self.consumer_group, len(batch), mq)
             status = ConsumeConcurrentlyStatus.RECONSUME_LATER
-        # CONSUME_SUCCESS 用 listener 设的 ackIndex
-        # 划分「已认可前缀 / 待回投后缀」（默认 Integer.MAX_VALUE，钳到 size-1 即整批认可）；
-        # RECONSUME_LATER 强制 ackIndex=-1，整批回投。
+        # CONSUME_SUCCESS uses the listener-set ackIndex
+        # to divide "acknowledged prefix / pending-redelivery suffix" (default Integer.MAX_VALUE, clamped to size-1 means the whole batch is acknowledged);
+        # RECONSUME_LATER forces ackIndex=-1, whole-batch redelivery.
         ack_index = context.ack_index
         if status == ConsumeConcurrentlyStatus.CONSUME_SUCCESS:
             if ack_index >= len(batch):
                 ack_index = len(batch) - 1
         else:
             ack_index = -1
-        # 统计口径同 ok/failed 计数：部分 ack 时尾巴算 failed
+        # Stats policy same as the ok/failed counts: on partial ack the tail counts as failed
         self._record_consume_stats(mq.topic, len(batch), begin_ms,
                                    failed=status == ConsumeConcurrentlyStatus.RECONSUME_LATER,
                                    ack_count=ack_index + 1)
@@ -3137,8 +3136,8 @@ class DefaultMQPushConsumer:
             succeeded=status == ConsumeConcurrentlyStatus.CONSUME_SUCCESS,
             hook_status=status)
         if broadcast:
-            # 广播模式不回投：未认可的尾巴只打一条 warn 就丢掉，
-            # 整批位点照样前进（:266 的 removeMessage 拿到的就是整批）
+            # Broadcast mode does not redeliver: the unacknowledged tail is only logged as a warn before being dropped,
+            # while the whole batch's offset still advances (:266's removeMessage gets the whole batch)
             dropped = len(batch) - ack_index - 1
             if dropped > 0:
                 logger.warning("BROADCASTING, the message consume failed, drop it: %d msgs in %s",
@@ -3146,14 +3145,14 @@ class DefaultMQPushConsumer:
             self._advance_consume_offset(key, batch, epoch=epoch)
             return True
         if ack_index + 1 >= len(batch):
-            # 整批认可（默认路径）：什么都不用回投，位点直接前进
+            # Whole batch acknowledged (default path): nothing to redeliver, the offset advances directly
             self._advance_consume_offset(key, batch, epoch=epoch)
             return True
-        # 集群模式：未认可的 [ack_index+1, size) 逐条回投 %RETRY%topic（延迟梯度
-        # 3+reconsumeTimes；超过 maxReconsumeTimes 由 broker 自动转 %DLQ%）
+        # Cluster mode: redeliver the unacknowledged [ack_index+1, size) one by one to the %RETRY% topic (delay gradient
+        # 3+reconsumeTimes; exceeding maxReconsumeTimes is auto-moved to %DLQ% by the broker)
         msg_back_failed = self._send_back_batch(key, batch[ack_index + 1:], context)
-        # 回投失败的那几条从本批摘掉后延后重投，
-        # 这里等价地塞回队首稍后再消费
+        # Those whose redelivery failed are removed from this batch and retried later;
+        # here equivalently pushed back to the head of the queue for consumption shortly
         if msg_back_failed:
             with self._lock:
                 dq = self._pending.get(key)
@@ -3162,8 +3161,8 @@ class DefaultMQPushConsumer:
                         dq.appendleft(m)
             time.sleep(0.2)
         failed_ids = {id(m) for m in msg_back_failed}
-        # 提交的是「本批已处理条目里最大的 queueOffset + 1」，且不能越过
-        # 仍留在 ProcessQueue 里的那几条（removeMessage 这时返回它们的最小 offset）
+        # What is committed is "the largest queueOffset + 1 among this batch's processed entries", and must not pass over
+        # those still left in the ProcessQueue (removeMessage returns their smallest offset at this point)
         self._advance_consume_offset(
             key, [m for m in batch if id(m) not in failed_ids],
             floor=min((m.queue_offset or 0) for m in msg_back_failed) if msg_back_failed else None,
@@ -3172,30 +3171,30 @@ class DefaultMQPushConsumer:
 
     def _send_back_batch(self, key: str, batch: List[MessageExt],
                          context: ConsumeConcurrentlyContext) -> List[MessageExt]:
-        """把未认可的条目逐条回投 broker，返回回投失败的那些。
+        """Redeliver the unacknowledged entries to the broker one by one, returning those that failed.
 
-        失败条目就地 ``reconsume_times + 1`` —— broker 那边没记上这次数，
-        客户端不补就永远进不了 DLQ。
+        Failed entries get ``reconsume_times + 1`` in place -- the broker did not record that count,
+        and without the client making it up they would never reach the DLQ.
         """
         failed: List[MessageExt] = []
         for msg in batch:
             with self._lock:
                 present = self._process_queue_contains_locked(key, msg)
             if not present:
-                # 已被超时清扫（或队列已撤销）的条目跳过
-                # 回投：它已经在回 broker 的路上了，再发一次就是重复消息
+                # Skip entries already swept by timeout (or whose queue is revoked)
+                # redelivery: they are already on their way back to the broker, and sending again is a duplicate message
                 logger.info("Message is not found in its process queue; skip send-back-procedure, "
                             "topic=%s, brokerName=%s, queueId=%s, queueOffset=%s",
                             msg.topic, msg.broker_name, msg.queue_id, msg.queue_offset)
                 continue
             try:
-                # 重投次数在 MessageExt 线上格式第 13 字段，
-                # broker 重投时会 +1；不是 properties 键（PROPERTY_RECONSUME_TIME
-                # 的实际值是 "RECONSUME_TIME"，仅由 MessageAccessor.set_reconsume_time 写入，
-                # 对端与调用方按此匹配，改动会破坏兼容）
+                # The retry count is field 13 of MessageExt's wire format,
+                # which the broker increments on redelivery; it is not a properties key (PROPERTY_RECONSUME_TIME
+                # 's actual value is "RECONSUME_TIME", written only by MessageAccessor.set_reconsume_time,
+                # which the peer and callers match on; changing it breaks compatibility)
                 delay_level = context.delay_level_when_next_consume
                 if not delay_level:
-                    # delay_level_when_next_consume == 0 → 3 + reconsume_times
+                    # delay_level_when_next_consume == 0 -> 3 + reconsume_times
                     delay_level = 3 + msg.get_reconsume_times()
                 self.send_message_back(msg, delay_level)
             except Exception as e:  # noqa: BLE001
@@ -3204,18 +3203,18 @@ class DefaultMQPushConsumer:
                 failed.append(msg)
         return failed
 
-    # ---------------- 顺序消费的重试计数与回投 ----------------
-    # 顺序侧重试计数与回投，与上面并发那一套**不是同一条链路**，两处差异都要守住：
-    #   1. `-1` 在顺序侧是「不设限」（Integer.MAX_VALUE），在并发侧才是 16；
-    #   2. 顺序侧的回投是**普通消息发送**（发到 %RETRY%<group>），不是 CONSUMER_SEND_MSG_BACK(3)。
+    # ---------------- Ordered consumption's retry count and redelivery ----------------
+    # The orderly-side retry count and redelivery are **not the same link** as the concurrent set above; both differences must be held:
+    #   1. `-1` on the orderly side means "unlimited" (Integer.MAX_VALUE), while 16 only applies on the concurrent side;
+    #   2. the orderly side's redelivery is a **normal message send** (sent to %RETRY%<group>), not CONSUMER_SEND_MSG_BACK(3).
 
     def _orderly_suspend_millis(self, context: ConsumeOrderlyContext) -> int:
-        """挂起本队列多久后重试。
+        """How long to suspend this queue before retrying.
 
-        先解析 ``-1``（``ConsumeOrderlyContext.suspend_current_queue_time_millis`` 的默认值，
-        意思是"没指定"）→ 回落到消费者配置 ``suspend_current_queue_time_millis``（默认 1000），
-        再把结果**钳到 [10, 30000]**。这个钳位不是装饰：listener 传 0 时仍然等 10ms
-        （否则一个返回挂起的 listener 会把消费线程变成忙等），传 1 小时也只等 30s。
+        First resolve ``-1`` (the default of ``ConsumeOrderlyContext.suspend_current_queue_time_millis``,
+        meaning "not specified") -> fall back to the consumer config ``suspend_current_queue_time_millis`` (default 1000),
+        then **clamp the result to [10, 30000]**. This clamp is not decoration: a listener passing 0 still waits 10ms
+        (otherwise a listener returning suspend would turn the consume thread into a busy wait), and passing 1 hour only waits 30s.
         """
         ms = context.suspend_current_queue_time_millis
         if ms == -1:
@@ -3227,26 +3226,26 @@ class DefaultMQPushConsumer:
         return ms
 
     def _orderly_max_reconsume_times(self) -> int:
-        """顺序消费的最大重试次数。
+        """The max retry count for ordered consumption.
 
-        顺序消费没有 broker 侧的重投计数（消息一直停在本地队列里原地重试），所以默认
-        就该一直重试到成功为止 —— `-1` 在这里读成 `Integer.MAX_VALUE`。并发消费的
-        `-1 → 16` 是另一套语义：那边每轮回投都要过一遍 broker，16 是 broker 的默认
-        retryMaxTimes。把两者并成一个常量，等于要么给顺序消费凭空造出死信，
-        要么让并发消息无限重投。
+        Ordered consumption has no broker-side redelivery count (messages keep retrying in place in the local queue), so by default
+        it should keep retrying until success -- `-1` reads as `Integer.MAX_VALUE` here. The concurrent consumption's
+        `-1 -> 16` is a different set of semantics: there every round of redelivery goes through the broker, and 16 is the broker's default
+        retryMaxTimes. Merging the two into one constant would either invent dead letters for ordered consumption out of thin air,
+        or make concurrent messages retry infinitely.
         """
         if self.max_reconsume_times == -1:
             return _INT32_MAX
         return self.max_reconsume_times
 
     def _check_orderly_reconsume_times(self, msgs: Optional[List[MessageExt]]) -> bool:
-        """检查顺序批次的重试次数是否用尽。
+        """Check whether the orderly batch's retries are exhausted.
 
-        返回「这一批是否还要原地挂起重试」。逐条两种走法：
-          - 次数没用尽：本地 `reconsumeTimes + 1`（broker 那边压根没记，客户端不补就
-            永远到不了阈值），继续挂起；
-          - 次数已用尽：交给 broker 回投。**回投成功就不再挂起**（此时提交位点，
-            毒消息让路，队列继续往前），回投失败才 +1 并挂起。
+        Returns "whether this batch should still suspend and retry in place". Two paths per message:
+          - retries not exhausted: local `reconsumeTimes + 1` (the broker did not record it at all; without the client making it up
+            the threshold would never be reached), keep suspending;
+          - retries exhausted: hand to the broker for redelivery. **Successful redelivery means no more suspending** (commit the offset at this point,
+            the poison message gives way and the queue moves on), and only failed redelivery increments and suspends.
         """
         suspend = False
         max_times = self._orderly_max_reconsume_times()
@@ -3262,16 +3261,16 @@ class DefaultMQPushConsumer:
         return suspend
 
     def _orderly_send_message_back(self, msg: MessageExt) -> bool:
-        """顺序消费的回投：用内部生产者把消息转投重试主题。
+        """Ordered consumption's redelivery: use the internal producer to forward the message to the retry topic.
 
-        拿实例自带的内部生产者，把这条消息**当普通消息**发到 `%RETRY%<group>`：
-        broker 的 `handleRetryAndDLQ`（`SendMessageProcessor`）见该组还持有未过期的
-        队列锁（正是顺序消费组的特征），直接把它改投 `%DLQ%<group>`。属性置法里
-        `RECONSUME_TIME` / `MAX_RECONSUME_TIMES` 会被发送侧抬进请求头
-        （见 `mq_client._build_send_request`）；这几个头对端按此匹配，改动会破坏兼容。
+        Take the instance's built-in internal producer and send this message **as a normal message** to `%RETRY%<group>`:
+        the broker's `handleRetryAndDLQ` (`SendMessageProcessor`), seeing that the group still holds an unexpired
+        queue lock (a characteristic of ordered consumption groups), directly redirects it to `%DLQ%<group>`. Among the property settings,
+        `RECONSUME_TIME` / `MAX_RECONSUME_TIMES` are lifted into the request header by the send side
+        (see `mq_client._build_send_request`); the peer matches on these headers, and changing them breaks compatibility.
 
-        失败只返回 false、绝不抛：整段兜住异常，抛给消费线程等于这条既没
-        ack 也没回投，只能等锁超时。
+        Failure only returns false, never throws: the whole block catches exceptions; throwing to the consume thread would leave this one neither
+        acked nor redelivered, only able to wait for the lock to time out.
         """
         try:
             client = self._require_client()
@@ -3285,7 +3284,7 @@ class DefaultMQPushConsumer:
             MessageAccessor.set_reconsume_time(new_msg, msg.get_reconsume_times() + 1)
             MessageAccessor.set_max_reconsume_times(new_msg,
                                                     self._orderly_max_reconsume_times())
-            # 半消息标记必须清掉，否则 broker 会把它再当事务回查消息处理
+            # The half-message flag must be cleared, otherwise the broker would treat it as a transaction-check message again
             MessageAccessor.clear_property(new_msg,
                                            MessageConst.PROPERTY_TRANSACTION_PREPARED)
             new_msg.set_delay_time_level(3 + msg.get_reconsume_times())
@@ -3293,8 +3292,8 @@ class DefaultMQPushConsumer:
             mq = publish.select_one_message_queue() if publish is not None else None
             if mq is None:
                 raise MQClientException("no writable queue for retry topic %s" % new_msg.topic)
-            # unitMode 跟着消费者：内部生产者复用消费者的客户端配置，
-            # 不带的话重投出去的消息会丢单元标记。
+            # unitMode follows the consumer: the internal producer reuses the consumer's client config,
+            # and without it the redelivered messages would lose the unit flag.
             client.send_message(MixAll.CLIENT_INNER_PRODUCER_GROUP, new_msg, mq, 3000,
                                 unit_mode=self.unit_mode)
             return True
@@ -3306,17 +3305,17 @@ class DefaultMQPushConsumer:
     def _advance_consume_offset(self, key: str, batch: List[MessageExt],
                                 floor: Optional[int] = None,
                                 epoch: Optional[int] = None) -> None:
-        """推进"已消费位点"。
+        """Advance the "consumed offset".
 
-        ``epoch`` 是取这批消息时那条 ProcessQueue 的代号：与当前代号不一致说明队列已被
-        撤销/重建（等价于 ``isDropped()`` 闸门），**整批 ack 作废**。
-        ``_frozen_offsets`` 里的是被 OFFSET_ILLEGAL 纠错冻结的位点，同样不许改。
+        ``epoch`` is the epoch of the ProcessQueue when this batch was taken: a mismatch with the current epoch means the queue has been
+        revoked/rebuilt (equivalent to the ``isDropped()`` gate), voiding the **whole batch's acks**.
+        Entries in ``_frozen_offsets`` are offsets frozen by OFFSET_ILLEGAL correction, which likewise must not be changed.
 
-        两个判据与写入必须在**同一临界区**：撤销/重置（220）是在锁内把代号 +1 的，
-        若先在锁外读代号、再进锁写位点，在途批次的 ack 就能挤在中间把重置后的位点推回去。
+        The two criteria and the write must be in the **same critical section**: revoke/reset (220) increments the epoch inside the lock,
+        so if the epoch were read outside the lock first and then the offset written inside, an in-flight batch's ack could squeeze in between and push the reset offset back.
         """
         if not batch:
-            # 整批回投都失败时没有任何条目被认可，位点原地不动
+            # When the whole batch's redelivery fails, no entry is acknowledged and the offset stays put
             return
         next_off = max((m.queue_offset or 0) for m in batch) + 1
         if floor is not None:
@@ -3333,32 +3332,32 @@ class DefaultMQPushConsumer:
 
     def _correct_tags_offset_locked(self, key: str, status: PullStatus,
                                     next_off: Optional[int]) -> None:
-        """空应答时把"已消费位点"跟着拉取游标推进（correctTagsOffset）。须持锁调用。
+        """On an empty response, advance the "consumed offset" along with the pull cursor (correctTagsOffset). Must be called while holding the lock.
 
-        拉取应答是 ``NO_NEW_MSG``（队列里真没消息）或 ``NO_MATCHED_MSG``（broker 侧按订阅
-        表达式过完一轮、一条都没匹配上；broker 回的
-        ``PULL_RETRY_IMMEDIATELY`` 在解应答时映射成它）时，这条队列的"已消费位点"必须跟着拉取游标
-        走，否则会**永久卡死**：没人 ack 的消息不属于任何人（broker 侧被过滤掉的不在应答里，
-        客户端二次 tag 过滤摘掉的又明确不 ack），位点不动就永远停在原地，重投/重启后
-        再把这批没人要的消息从头扫一遍。
+        When the pull response is ``NO_NEW_MSG`` (the queue really has no messages) or ``NO_MATCHED_MSG`` (the broker went a full round per the subscription
+        expression and matched nothing; the broker's returned
+        ``PULL_RETRY_IMMEDIATELY`` is mapped into it when parsing the response), this queue's "consumed offset" must follow the pull cursor,
+        otherwise it would **deadlock permanently**: messages nobody acks belong to nobody (those filtered on the broker side are not in the response,
+        and those dropped by the client's second-pass tag filtering are explicitly not acked), and an unmoving offset stays put forever, with redelivery/restart
+        sweeping this unwanted batch from the beginning again.
 
-        更新是 ``updateOffset(mq, nextOffset, increaseOnly=true)``
-        （只前进不回退），且有一道闸：队列的在持消息数必须为 0。它数的是**仍在队列里**的
-        消息 —— 并发消费的收尾摘除要等 listener 返回之后才做，所以在途批次
-        也算数；不等它落定就抬位点，进程崩溃时这批消息会被静默跳过。本端口把
-        ``_pending`` 为空与 ``_msg_queue_inflight`` 为 0 合成同一判据，后者的登记与
-        "取走批次"在 ``_dispatch_loop`` 的同一把锁里完成。
+        The update is ``updateOffset(mq, nextOffset, increaseOnly=true)``
+        (only moves forward, never back), and has one gate: the queue's held message count must be 0. It counts messages **still in the queue** --
+        concurrent consumption's cleanup removal happens only after the listener returns, so in-flight batches
+        count too; raising the offset without waiting for them to settle would have this batch silently skipped on process crash. This port combines
+        ``_pending`` being empty with ``_msg_queue_inflight`` being 0 into the same criterion, with the latter's registration and
+        "taking the batch" completed within the same lock in ``_dispatch_loop``.
 
-        状态判据也收进了本函数（不放在应答回调的分支里），
-        这样离线单测一次就能锁死「哪些状态要修正 + 何时允许修正」两件事。
+        The status criteria are also folded into this function (not placed in the response callback's branches),
+        so offline unit tests can lock down "which statuses to correct + when correction is allowed" in one go.
         """
         if status not in (PullStatus.NO_NEW_MSG, PullStatus.NO_MATCHED_MSG):
             return
         if next_off is None:
             return
         if key in self._frozen_offsets:
-            # 位点已被 OFFSET_ILLEGAL 纠错冻结（allowToUpdate=false 时
-            # 一律丢弃更新），这条路径同样不许改
+            # The offset is already frozen by OFFSET_ILLEGAL correction (updates
+            # are discarded unconditionally when allowToUpdate=false), and this path likewise must not change it
             return
         if self._pending.get(key) or self._msg_queue_inflight.get(key):
             return
@@ -3367,31 +3366,31 @@ class DefaultMQPushConsumer:
             self._consume_offsets[key] = next_off
 
     def _offset_illegal_recover(self, key: str) -> None:
-        """OFFSET_ILLEGAL 应答的纠错重建路径。
+        """The correction-rebuild path for an OFFSET_ILLEGAL response.
 
-        broker 说"你请求的位点非法"（队列被截断、commitlog 过期或被服务端重置：
-        对端 ``PullMessageProcessor`` 对 OFFSET_OVERFLOW_BADLY / NO_MESSAGE_IN_QUEUE /
-        OFFSET_RESET 一律回 ``PULL_OFFSET_MOVED``，客户端解应答时映射成本状态），
-        并把修正值放在 ``nextBeginOffset`` 里。纠错不只是把游标拨过去：
-        这条队列上**已经取回、还没消费/没 ack 的消息全部作废**（它们落在被跳过的区间里，
-        ack 它们会把位点推回非法值），然后按修正位点把这条队列重建。
+        The broker says "the offset you requested is illegal" (the queue was truncated, the commitlog expired, or it was reset server-side:
+        the peer ``PullMessageProcessor`` returns ``PULL_OFFSET_MOVED`` for OFFSET_OVERFLOW_BADLY / NO_MESSAGE_IN_QUEUE /
+        OFFSET_RESET uniformly, which is mapped into this status when the client parses the response),
+        and puts the corrected value in ``nextBeginOffset``. Correction is not just moving the cursor over:
+        all messages on this queue **already fetched but not consumed/acked are voided** (they fall in the skipped range,
+        and acking them would push the offset back to an illegal value), then the queue is rebuilt at the corrected offset.
 
-        纠错的四步：置新位点 → 作废该队列 → { 冻结位点; 落盘; 摘除队列 } → 立刻重平衡。
-        本端口的对应物：置位点 + 冻结（在回调的临界区里）→ 撤队列
-        （``_retire_queue_locked`` 清缓冲/线程表并**代号 +1**）→
-        锁外把修正位点推给 broker → 叫醒 rebalance 重建。
+        The four correction steps: set the new offset -> void this queue -> { freeze the offset; persist; remove the queue } -> rebalance immediately.
+        This port's counterpart: set the offset + freeze (in the callback's critical section) -> revoke the queue
+        (``_retire_queue_locked`` clears the buffer/thread table and **increments the epoch**) ->
+        push the corrected offset to the broker outside the lock -> wake rebalance to rebuild.
 
-        须在锁外调用：里面要做网络 RPC。
+        Must be called outside the lock: it does network RPCs inside.
         """
         with self._lock:
             retired: List[Tuple[MessageQueue, Optional[int]]] = []
             self._retire_queue_locked(key, None, retired)
-        # persist：把修正后的位点立刻写回 broker（显式一次，不等周期落盘）
+        # persist: write the corrected offset back to the broker immediately (explicitly once, without waiting for the periodic persist)
         self._on_queues_revoked(retired)
         self.rebalance_immediately()
         logger.warning("the pull request offset illegal, fix it, queue=%s", key)
 
-    # ---------------- 位点持久化 ----------------
+    # ---------------- Offset persistence ----------------
     def _start_offset_persist_loop(self) -> None:
         t = threading.Thread(target=self._offset_persist_loop, daemon=True,
                              name="rmq-offset-persist-%s" % self.consumer_group)
@@ -3399,13 +3398,13 @@ class DefaultMQPushConsumer:
         self._persist_thread = t
 
     def _offset_persist_loop(self) -> None:
-        # 位点落盘节奏：initialDelay = 1000 * 10，
-        # 周期取 persist_consumer_offset_interval（默认 5s）。
-        # 这两步都只在 start() 时读一次，运行期改值不改变已排定的节奏。
+        # Offset persistence cadence: initialDelay = 1000 * 10,
+        # the period takes persist_consumer_offset_interval (default 5s).
+        # Both steps are read only once at start(); runtime changes do not alter the already-scheduled cadence.
         if self._stop.wait(10.0):    # initialDelay = 1000 * 10
             return
-        # 周期在循环入口取一次（排定的是固定周期，运行期改字段不改变已排定的任务）。
-        # 首笔落盘发生在 initialDelay 之后，而不是 initialDelay + 一个周期后。
+        # The period is taken once at the loop entry (a fixed period is scheduled; runtime field changes do not alter the already-scheduled task).
+        # The first persist happens after initialDelay, not after initialDelay + one period.
         period = self.persist_consumer_offset_interval / 1000.0
         while True:
             try:
@@ -3432,18 +3431,18 @@ class DefaultMQPushConsumer:
                 logger.debug("update consumer offset failed for %s: %s", mq, e)
 
     def _local_offset_path(self) -> str:
-        # 本地位点文件路径：$HOME/.rocketmq_offsets/<clientId>/<group>/offsets.json
+        # Local offset file path: $HOME/.rocketmq_offsets/<clientId>/<group>/offsets.json
         base = os.path.join(os.path.expanduser("~"), ".rocketmq_offsets",
                             self.client_id or "DEFAULT", self.consumer_group)
         return os.path.join(base, "offsets.json")
 
     def _save_local_offsets(self,
                             extra: Optional[Iterable[Tuple[MessageQueue, Optional[int]]]] = None) -> None:
-        """把本地位点表写盘。
+        """Write the local offset table to disk.
 
-        ``extra`` 是刚被撤下来、已经不在 ``_consume_offsets``/``_mq_map`` 里的队列位点：
-        顺序必须是先写文件、后摘内存条目，文件里的值
-        要留着，重建后的队列才能从它续上（见 ``_on_queues_revoked`` 广播分支）。
+        ``extra`` is the offsets of queues just revoked and no longer in ``_consume_offsets``/``_mq_map``:
+        the order must be write the file first, then remove the in-memory entries, with the values in the file
+        kept so the rebuilt queue can resume from them (see the broadcast branch of ``_on_queues_revoked``).
         """
         with self._lock:
             items = dict(self._consume_offsets)
@@ -3457,7 +3456,7 @@ class DefaultMQPushConsumer:
         path = self._local_offset_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         text = _build_local_offsets_json(items, mq_map)
-        # 旧内容先滚到 .bak 再写新文件
+        # The old content rolls to .bak first, then the new file is written
         try:
             with open(path, "r", encoding="utf-8") as f:
                 prev = f.read()
@@ -3472,7 +3471,7 @@ class DefaultMQPushConsumer:
         os.replace(tmp, path)
 
     def _load_local_offsets(self) -> Dict[str, int]:
-        # 主文件缺失/为空/解析失败 → 退回 .bak
+        # Main file missing/empty/parse failed -> fall back to .bak
         for path in (self._local_offset_path(), self._local_offset_path() + ".bak"):
             try:
                 with open(path, "r", encoding="utf-8") as f:
@@ -3484,7 +3483,7 @@ class DefaultMQPushConsumer:
                 return parsed
         return {}
 
-    # ---------------- 顺序消费队列锁 ----------------
+    # ---------------- Ordered consumption queue locks ----------------
     def _start_lock_loop(self) -> None:
         if not self._is_orderly() or self.message_model == MessageModel.BROADCASTING:
             return
@@ -3495,12 +3494,12 @@ class DefaultMQPushConsumer:
 
     def _lock_loop(self) -> None:
         client = self._require_client()
-        # 每 20s 批量锁分到的队列；
-        # 启动时立刻尝试一次，避免首个 20s 空转
+        # Batch-lock the assigned queues every 20s;
+        # try once immediately at startup to avoid the first 20s spinning idle
         while not self._stop.is_set():
-            # POP 顺序同样跑这个 20s
-            # 定时器，但加锁只遍历 classic 拉取表 —— POP 模式下
-            # 队列登记在 pop_queues，那张表是空的 ⇒ 定时器在转、一次网络都不发。
+            # POP orderly also runs this 20s
+            # timer, but locking only iterates the classic pull table -- in POP mode
+            # queues are registered in pop_queues, and that table is empty => the timer spins without a single network call.
             if not self.pop_mode:
                 try:
                     mqs = self._assigned_queues()
@@ -3517,29 +3516,29 @@ class DefaultMQPushConsumer:
     def _is_orderly(self) -> bool:
         return isinstance(self.message_listener, MessageListenerOrderly)
 
-    # ---------------- 管理能力 ----------------
+    # ---------------- Management capabilities ----------------
     def fetch_subscribe_message_queues(self, topic: str) -> List[MessageQueue]:
         client = self._require_client()
-        # 读的是订阅信息表（读位、不筛 master），不是发布信息；
-        # 推送与拉取两个消费者共用同一份口径。
+        # What is read is the subscription info table (read perm, no master filtering), not the publish info;
+        # push and pull consumers share the same policy.
         return client.get_topic_subscribe_info(topic)
 
     def send_message_back(self, msg: MessageExt, delay_level: int,
                           broker_name: Optional[str] = None) -> None:
-        """消息重投：发 CONSUMER_SEND_MSG_BACK(36) 让 broker 转投重试主题。"""
+        """Message redelivery: send CONSUMER_SEND_MSG_BACK(36) to have the broker redirect it to the retry topic."""
         client = self._require_client()
         from remoting.protocol.codes import RequestCode
         from remoting.protocol.headers import ConsumerSendMsgBackRequestHeader
         from remoting.protocol.remoting_command import RemotingCommand
         if broker_name is None:
             broker_name = msg.broker_name
-        # 地址走 find_broker_address_in_publish（只认 master），
-        # 拿不到就报「Broker[X] master node does not exist」（错误串由调用方匹配）；
-        # 从节点不接 CONSUMER_SEND_MSG_BACK。
+        # The address goes through find_broker_address_in_publish (master only),
+        # and failure reports "Broker[X] master node does not exist" (the error string is matched by callers);
+        # slaves do not accept CONSUMER_SEND_MSG_BACK.
         addr = client.find_broker_address_in_publish(broker_name)
         if addr is None:
             raise MQClientException("Broker[%s] master node does not exist" % broker_name)
-        # max_reconsume_times == -1 时按 16 传给 broker（超限由 broker 转 %DLQ%）
+        # When max_reconsume_times == -1, pass 16 to the broker (exceeding the limit is moved to %DLQ% by the broker)
         max_reconsume = 16 if self.max_reconsume_times == -1 else self.max_reconsume_times
         header = ConsumerSendMsgBackRequestHeader()
         header.offset = msg.commit_log_offset
@@ -3577,42 +3576,42 @@ class DefaultMQPullConsumer:
         self.namespace = namespace
         self.instance_name = MixAll.DEFAULT_INSTANCE_NAME
         self.client_id: Optional[str] = None
-        # ---- unit / stream 配置 ----
-        # unitName 参与 clientId 的 `@<unitName>` 后缀与动态取址 URL；unitMode 随
-        # ConsumerData 心跳、消息回投请求头和过滤钩子上报给 broker；
-        # enableStreamRequestType 既给 clientId 加 `@STREAM` 后缀（为了
-        # "prevent unexpected reuses of MQClientInstance"），也给每个请求加
-        # `ReqT=0` 扩展字段。拉模式消费者默认打开（每个构造函数都置 true）。
+        # ---- unit / stream config ----
+        # unitName takes part in the clientId's `@<unitName>` suffix and the dynamic addressing URL; unitMode is
+        # reported to the broker along with the ConsumerData heartbeat, message redelivery request header and filter hooks;
+        # enableStreamRequestType both appends the `@STREAM` suffix to clientId (to
+        # "prevent unexpected reuses of MQClientInstance") and adds
+        # the `ReqT=0` extension field to every request. Pull-mode consumers default to on (every constructor sets true).
         self.unit_name: Optional[str] = None
         self.unit_mode = False
         self.enable_stream_request_type = True
-        # namespaceV2（5.x 服务端命名空间）：非空时每笔请求带
-        # nsd=true / ns=<值>，见 remoting/rpchook.py 的 NamespaceRpcHook。
+        # namespaceV2 (5.x server-side namespace): when non-empty, every request carries
+        # nsd=true / ns=<value>, see the NamespaceRpcHook in remoting/rpchook.py.
         self.namespace_v2 = ""
         self.message_model = message_model
         self.broker_suspend_max_time_millis = 20000
         self.socks_proxy_config: Optional[SocksProxyConfig] = socks_proxy_config
         self.consumer_pull_timeout_millis = 10000
         self.consumer_timeout_millis_when_suspend = 30000
-        # 路由刷新周期，默认 30000ms；只在 start() 建 MQClientInstance 时透传一次。
+        # Route refresh interval, default 30000ms; only passed through once when start() builds the MQClientInstance.
         self.poll_name_server_interval = 30000
         self.name_server_addrs: List[str] = []
         self.rpc_hook = rpc_hook
         self.register_topics: Set[str] = set()
         self.message_queue_lists: List[MessageQueue] = []
         self.message_queue_listener: Optional[MessageQueueListener] = None
-        # 队列分配策略（默认 AllocateMessageQueueAveragely）。
-        # 拉模式由调用方自己管队列、没有后台重平衡，
-        # 所以它只作为配置存在并被 start() 校验。
+        # Queue allocation strategy (default AllocateMessageQueueAveragely).
+        # Pull mode manages queues itself and has no background rebalance,
+        # so it exists only as config and is validated by start().
         self.allocate_message_queue_strategy: Optional[AllocateMessageQueueStrategy] = \
             AllocateMessageQueueAveragely()
-        # 投递前过滤钩子：start() 时挂到拉取结果的解包路径上
+        # Pre-delivery filter hooks: attached to the pull result unpacking path at start()
         self.filter_message_hook_list: List[FilterMessageHook] = []
-        # 拉取节点建议表：MessageQueue → 下一轮应选的 brokerId
+        # Pull node suggestion table: MessageQueue -> the brokerId to pick next round
         self._pull_from_which_node: Dict[MessageQueue, int] = {}
-        # ---- 消费者心跳（heartbeatBrokerInterval 默认 30s）----
-        # 拉模式消费者同样要登记进 broker 的 ConsumerManager；本端口按既有分工
-        # （心跳循环在消费者内）自己发一份带 CONSUME_ACTIVELY 的 ConsumerData。
+        # ---- Consumer heartbeat (heartbeatBrokerInterval defaults to 30s) ----
+        # Pull-mode consumers must also register with the broker's ConsumerManager; this port follows the existing division of labor
+        # (the heartbeat loop lives inside the consumer) and sends its own ConsumerData carrying CONSUME_ACTIVELY.
         self.heartbeat_enabled = True
         self.heartbeat_interval_millis = 30000
         self._heartbeat_count = 0
@@ -3627,9 +3626,9 @@ class DefaultMQPullConsumer:
         self._async_pull_lock = threading.Lock()
         self._pull_executors_closed = False
 
-    # ---------------- 投递前过滤钩子 ----------------
+    # ---------------- Pre-delivery filter hooks ----------------
     def register_filter_message_hook(self, hook: FilterMessageHook) -> None:
-        """注册投递前过滤钩子。"""
+        """Register a pre-delivery filter hook."""
         if hook is not None:
             self.filter_message_hook_list.append(hook)
 
@@ -3640,10 +3639,10 @@ class DefaultMQPullConsumer:
         execute_filter_hooks(self.filter_message_hook_list, context)
 
     def _filter_messages_for_delivery(self, mq: MessageQueue, msgs: List[MessageExt]) -> List[MessageExt]:
-        """拉模式也要过过滤钩子。
+        """Pull mode also goes through the filter hooks.
 
-        拉模式的 tag 过滤交给调用方（pull 接口不传订阅数据时
-        tagsSet 为空 → 不筛），这里只跑钩子。
+        Pull mode's tag filtering is left to the caller (when the pull interface passes no subscription data,
+        tagsSet is empty -> no filtering); only hooks run here.
         """
         if not msgs or not self.filter_message_hook_list:
             return msgs
@@ -3652,7 +3651,7 @@ class DefaultMQPullConsumer:
         self.execute_filter_message_hook(context)
         return list(context.msg_list)
 
-    # ---------------- 配置 ----------------
+    # ---------------- Config ----------------
     def set_namesrv_addr(self, addr: str) -> None:
         self.name_server_addrs = [a.strip() for a in addr.split(";") if a.strip()]
 
@@ -3663,25 +3662,25 @@ class DefaultMQPullConsumer:
         self.instance_name = name
 
     def set_unit_name(self, unit_name: Optional[str]) -> None:
-        """设置单元名：影响 clientId 后缀与动态取址 URL。"""
+        """Set the unit name: affects the clientId suffix and the dynamic addressing URL."""
         self.unit_name = unit_name
 
     def get_unit_name(self) -> Optional[str]:
         return self.unit_name
 
     def set_unit_mode(self, unit_mode: bool) -> None:
-        """设置单元化模式：随心跳/请求头透传给 broker。"""
+        """Set unit mode: passed through to the broker with the heartbeat/request headers."""
         self.unit_mode = bool(unit_mode)
 
     def is_unit_mode(self) -> bool:
         return self.unit_mode
 
     def set_enable_stream_request_type(self, enable: bool) -> None:
-        """开关 stream 请求类型：影响 clientId 后缀与每笔请求的 ReqT 扩展字段。"""
+        """Toggle the stream request type: affects the clientId suffix and every request's ReqT extension field."""
         self.enable_stream_request_type = bool(enable)
 
     def set_namespace_v2(self, namespace_v2: Optional[str]) -> None:
-        """设置 5.x 服务端命名空间：非空时每笔请求带 nsd=true / ns=<值>。"""
+        """Set the 5.x server-side namespace: when non-empty, every request carries nsd=true / ns=<value>."""
         self.namespace_v2 = namespace_v2
 
     def get_namespace_v2(self) -> Optional[str]:
@@ -3702,21 +3701,21 @@ class DefaultMQPullConsumer:
 
     def set_allocate_message_queue_strategy(
             self, strategy: Optional[AllocateMessageQueueStrategy]) -> None:
-        """设置队列分配策略：setter 不校验，置 None 由 start() 拒绝。"""
+        """Set the queue allocation strategy: the setter does not validate; setting None is rejected by start()."""
         self.allocate_message_queue_strategy = strategy
 
     def get_register_topics(self) -> Set[str]:
         return self.register_topics
 
-    # ---------------- 心跳（把消费组注册给 broker） ----------------
+    # ---------------- Heartbeat (register the consume group with the broker) ----------------
     def _refresh_route_for_heartbeat(self) -> None:
-        """为心跳准备 broker 地址：把 registerTopics 的路由拉一遍并登记为「在用」。
+        """Prepare broker addresses for the heartbeat: pull the routes of registerTopics once and register them as "in use".
 
-        这条链路是间接的：`subscriptions()` 返回的就是 `registerTopics` 构出来的订阅集，
-        据此刷路由 → `brokerAddrTable`
-        有地址 → 心跳才发得出去。心跳循环在消费者内（与推送/轻量消费者同一分工），
-        所以在 start 里显式刷一遍，并把 topic 交给
-        `MQClientInstance` 的后台刷新任务保持新鲜。
+        This chain is indirect: what `subscriptions()` returns is the subscription set built from `registerTopics`,
+        which drives route refresh -> `brokerAddrTable`
+        having addresses -> the heartbeat can be sent. The heartbeat loop lives inside the consumer (the same division of labor as the push/lite consumers),
+        so start explicitly refreshes once and hands the topic to
+        MQClientInstance's background refresh task to keep it fresh.
         """
         client = self._require_client()
         for topic in sorted(self.register_topics):
@@ -3727,19 +3726,19 @@ class DefaultMQPullConsumer:
                 logger.debug("refresh route for %s failed: %s", topic, e)
 
     def _build_heartbeat(self) -> HeartbeatData:
-        """拉模式消费者组的心跳数据。
+        """The heartbeat data of a pull-mode consumer group.
 
-        `consumeType` 恒为 `CONSUME_ACTIVELY`、
-        `consumeFromWhere` 恒为 `CONSUME_FROM_LAST_OFFSET` —— 与推送消费者的
-        PASSIVELY 是两个口径，broker 侧两项都不是摆设：
-        `consumerConnection` 按 consumeType 显示消费类型；
-        开了 `rejectPullConsumerEnabled` 的 broker 会**跳过** ACTIVELY 心跳
-        并在拉取时拒绝没注册过的拉模式组。
+        `consumeType` is always `CONSUME_ACTIVELY`,
+        `consumeFromWhere` is always `CONSUME_FROM_LAST_OFFSET` -- the push consumer's
+        PASSIVELY is a different policy, and neither broker-side field is for show:
+        `consumerConnection` shows the consume type per consumeType;
+        a broker with `rejectPullConsumerEnabled` **skips** ACTIVELY heartbeats
+        and rejects unregistered pull-mode groups at pull time.
 
-        订阅集取 `subscriptions()`：逐条
-        `build_subscription_data(topic, "*")`，并显式把 **subVersion 置 0**
-        —— 拉模式没有"订阅版本"语义，带上当前时间戳
-        会让 broker 每次心跳都认为订阅变了。⚠ 订阅集只从 `registerTopics` 来。
+        The subscription set takes `subscriptions()`, building each with
+        `build_subscription_data(topic, "*")`, and explicitly sets **subVersion to 0**
+        -- pull mode has no "subscription version" semantics, and carrying the current timestamp
+        would make the broker think the subscription changed on every heartbeat. WARNING: the subscription set comes only from `registerTopics`.
         """
         hb = HeartbeatData(self.client_id or "")
         cd = ConsumerData(self.consumer_group, ConsumeType.CONSUME_ACTIVELY,
@@ -3753,10 +3752,10 @@ class DefaultMQPullConsumer:
         return hb
 
     def _send_heartbeat_to_all_broker(self) -> int:
-        """向所有已知 broker（含从节点）发一次本组心跳，返回成功台数。
+        """Send one round of this group's heartbeat to all known brokers (including slaves), returning the number of successes.
 
-        收件人取 `get_all_broker_addrs`，理由与推送消费者同名方法一致
-        （只有 `consumerEmpty` 时才跳从节点）。
+        Recipients take `get_all_broker_addrs`, for the same reason as the push consumer's method of the same name
+        (slaves are skipped only when `consumerEmpty`).
         """
         client = self._require_client()
         hb = self._build_heartbeat()
@@ -3772,7 +3771,7 @@ class DefaultMQPullConsumer:
         return ok
 
     def heartbeat_count(self) -> int:
-        """心跳成功轮数（真机验证用）。"""
+        """Number of successful heartbeat rounds (for live verification)."""
         return self._heartbeat_count
 
     def _start_heartbeat_loop(self) -> None:
@@ -3792,11 +3791,11 @@ class DefaultMQPullConsumer:
             except Exception as e:  # noqa: BLE001
                 logger.debug("heartbeat loop error: %s", e)
 
-    # ---------------- 生命周期 ----------------
+    # ---------------- Lifecycle ----------------
     def start(self) -> None:
         if self._started:
             return
-        # 纯本地校验，排在建立客户端实例之前，非法组名不需要等到连不上才报。
+        # Purely local validation, placed before building the client instance; an illegal group name should not have to wait until a connection failure to be reported.
         validators.check_group(self.consumer_group)
         if self.consumer_group == MixAll.DEFAULT_CONSUMER_GROUP:
             raise MQClientException(
@@ -3804,11 +3803,11 @@ class DefaultMQPullConsumer:
                 % MixAll.DEFAULT_CONSUMER_GROUP)
         if not self.name_server_addrs:
             raise MQClientException("name server address is not set")
-        # 策略为 None 直接拒绝启动。
+        # A None strategy rejects startup directly.
         if self.allocate_message_queue_strategy is None:
             raise MQClientException("allocateMessageQueueStrategy is null")
-        # CLUSTERING 才改写 instanceName；clientId 口径是
-        # `<本机 IP>@<instanceName>[@<unitName>][@STREAM]`。
+        # Only CLUSTERING rewrites instanceName; the clientId policy is
+        # `<local IP>@<instanceName>[@<unitName>][@STREAM]`.
         if self.message_model == MessageModel.CLUSTERING:
             self.instance_name = MixAll.change_instance_name_to_pid(self.instance_name)
         if self.client_id is None:
@@ -3833,9 +3832,9 @@ class DefaultMQPullConsumer:
             manager.unregister_client(self.client_id, self._mq_client)
             raise
         self._started = True
-        # 心跳：先刷 registerTopics 的路由（没地址就没人可发），再同步发一轮让 broker
-        # 立刻认识本组，然后交给后台循环。顺序与轻量拉取消费者 start 一致：
-        # 注册之后立刻发，不等周期任务的首个 1s。
+        # Heartbeat: first refresh the routes of registerTopics (no addresses means nobody to send to), then synchronously send one round so the broker
+        # immediately knows this group, then hand off to the background loop. The order matches the lite pull consumer's start:
+        # send immediately after registration, without waiting for the periodic task's first 1s.
         self._refresh_route_for_heartbeat()
         try:
             self._send_heartbeat_to_all_broker()
@@ -3850,8 +3849,8 @@ class DefaultMQPullConsumer:
         self._heartbeat_stop.set()
         if self._heartbeat_thread is not None and self._heartbeat_thread.is_alive():
             self._heartbeat_thread.join(timeout=2.0)
-        # 异步拉取双池：停收新任务并让在途任务跑完（队列排空即线程自然退出，
-        # 与本端 producer.shutdown 关异步池的做法一致）。
+        # Async pull dual pool: stop accepting new tasks and let in-flight tasks finish (the queue draining means threads exit naturally,
+        # consistent with this repo's producer.shutdown approach of closing async pools).
         with self._async_pull_lock:
             self._pull_executors_closed = True
             if self._async_pull_executor is not None:
@@ -3867,8 +3866,8 @@ class DefaultMQPullConsumer:
                                                      self.consumer_group)
             except Exception as e:  # noqa: BLE001
                 logger.debug("unregister on shutdown failed: %s", e)
-            # 引用计数语义：同 clientId 还有别的门面在用时实例继续存活，
-            # 归零才真正 shutdown。
+            # Reference-count semantics: while another facade with the same clientId is still in use the instance stays alive,
+            # and only shutdown when the count reaches zero.
             MQClientManager.get_instance().unregister_client(self.client_id or "", client)
 
     def _require_client(self) -> MQClientInstance:
@@ -3876,33 +3875,33 @@ class DefaultMQPullConsumer:
             raise MQClientException("consumer not started, call start() first")
         return self._mq_client
 
-    # ---------------- 拉取 ----------------
+    # ---------------- Pull ----------------
     def fetch_subscribe_message_queues(self, topic: str) -> List[MessageQueue]:
         client = self._require_client()
-        # 读的是订阅信息表（读位、不筛 master），不是发布信息；
-        # 推送与拉取两个消费者共用同一份口径。
+        # What is read is the subscription info table (read perm, no master filtering), not the publish info;
+        # push and pull consumers share the same policy.
         return client.get_topic_subscribe_info(topic)
 
     def fetch_message_queues_in_balance(self, topic: str) -> List[MessageQueue]:
-        """本实例「平衡后」应负责的队列：调用方的拉取循环就靠它决定去拉哪些队列。
+        """The queues this instance should be responsible for "after balancing": the caller's pull loop relies on it to decide which queues to pull.
 
-        常见实现是直接读 `rebalanceImpl.processQueueTable` 的键——那张表是后台 rebalance
-        的**产物**。本端口的拉模式不装后台重平衡（队列由调用方自己管，见类注释），
-        所以这里按 `RebalanceImpl.rebalanceByTopic` 的**同一条分配公式**当场算一遍：
-        BROADCASTING 全给；CLUSTERING 取订阅信息（读位口径，与
-        `fetch_subscribe_message_queues` 同源）作 mqAll、查 `GET_CONSUMER_LIST_BY_GROUP`
-        作 cidAll，再交给本实例配置的分配策略。公式与推送消费者的 `_rebalance` 共用一份
-        口径，两处若分叉就会导致同一队列被两个实例认领。
+        A common implementation reads the keys of `rebalanceImpl.processQueueTable` directly -- that table is the **product** of the background rebalance.
+        This port's pull mode does not install a background rebalance (queues are managed by the caller, see the class comment),
+        so it computes on the spot using the **same allocation formula** as `RebalanceImpl.rebalanceByTopic`:
+        BROADCASTING gives all; CLUSTERING takes the subscription info (read perm policy, same source as
+        `fetch_subscribe_message_queues`) as mqAll, queries `GET_CONSUMER_LIST_BY_GROUP`
+        as cidAll, then hands them to this instance's configured allocation strategy. The formula shares the same
+        policy as the push consumer's `_rebalance`, and if the two diverge the same queue would be claimed by two instances.
 
-        拿不到路由或消费组列表时（离线、broker 未答）**退回本地
-        `pullFromWhichNodeTable` 的键集**（见 `pull`）——即"保留现有分配"：
-        本实例实际在拉的队列就是它事实上的分配。绝不能回退成"独占全部队列"，
-        否则同组多实例互相重复消费（与推送消费者同一条铁律）。返回值按 house 排序
-        口径给出，保证多次调用顺序稳定。
+        When the route or consumer group list cannot be obtained (offline, broker not responding) **fall back to the key set of the local
+        `pullFromWhichNodeTable`** (see `pull`) -- i.e. "keep the existing allocation":
+        the queues this instance is actually pulling are its de facto allocation. It must never fall back to "owning all queues",
+        otherwise multiple instances in the same group would consume each other's messages (the same iron law as the push consumer). The return value is given in the house sort
+        order, ensuring stable ordering across calls.
         """
-        client = self._require_client()  # 未启动直接抛 MQClientException
+        client = self._require_client()  # Not started throws MQClientException directly
         if topic is None:
-            # 文案是调用方按异常消息匹配的关键字，改动会破坏兼容。
+            # The wording is the keyword callers match on the exception message; changing it breaks compatibility.
             raise ValueError("topic is null")
         pulled = [mq for mq in self._pull_from_which_node if mq.topic == topic]
         if self.message_model == MessageModel.BROADCASTING:
@@ -3921,10 +3920,10 @@ class DefaultMQPullConsumer:
                 logger.debug("fetchMessageQueuesInBalance: no route/consumer list for %s/%s, "
                              "keep current assignment", self.consumer_group, topic)
                 allocated = pulled
-        # 把带命名空间的 topic 还原成用户侧的裸名：
-        # 本端口拉模式全程不改写资源名（见 namespace 字段注释），这里等价于原样返回。
-        # 末尾再按 topic 收一次口——逐个比 topic，
-        # 别让分配策略的意外返回值把别的 topic 混进调用方的拉取循环。
+        # Restore the namespaced topic to the caller-side bare name:
+        # this port's pull mode never rewrites resource names (see the namespace field comment); here it is equivalent to returning as-is.
+        # Tighten by topic once more at the end -- compare topic by topic,
+        # and do not let the allocation strategy's unexpected return value mix other topics into the caller's pull loop.
         return sorted([mq for mq in (allocated or []) if mq.topic == topic], key=_mq_sort_key)
 
     def pull(self, mq: MessageQueue, sub_expression: str = "*", offset: int = 0,
@@ -3932,17 +3931,17 @@ class DefaultMQPullConsumer:
         client = self._require_client()
         timeout = timeout_millis if timeout_millis is not None else self.consumer_pull_timeout_millis
         sub = FilterAPI.build_subscription_data(mq.topic, sub_expression)
-        # sysFlag 的四个开关位：
+        # The four switch bits of sysFlag:
         #   sysFlag = PullSysFlag.buildSysFlag(false, block, true, false)
-        # 即 commit_offset=False、suspend=block。**pull() 的 block=false** ——
-        # 位点由调用方自己 update_consume_offset 提交，且这是**短轮询**不挂起。
-        # ⚠ 曾在这里写成 suspend=True：broker 在队尾会挂起到 brokerSuspendMaxTimeMillis
-        # （默认 20s），而客户端 5s 就超时 → RemotingTimeoutException（真机必现）。
+        # i.e. commit_offset=False, suspend=block. **pull()'s block=false** --
+        # the offset is committed by the caller via update_consume_offset, and this is a **short poll** that does not suspend.
+        # WARNING: this was once written as suspend=True: the broker would suspend to brokerSuspendMaxTimeMillis at the end of the queue
+        # (default 20s), while the client times out in 5s -> RemotingTimeoutException (always reproduced on live systems).
         sys_flag = PullSysFlag.build_sys_flag(commit_offset=False, suspend=False,
                                               subscription=True, class_filter=False)
         result = client.pull_message(self.consumer_group, mq, offset, max_nums,
                                      sys_flag, 0, sub.sub_string or "*",
-                                     # TAG 类型时 subVersion 传 0（isTagType ? 0L : subVersion）
+                                     # subVersion passes 0 for TAG type (isTagType ? 0L : subVersion)
                                      0,
                                      ExpressionType.TAG, timeout_millis=timeout,
                                      max_msg_bytes=-1, suspend_timeout_millis=15000,
@@ -3956,11 +3955,11 @@ class DefaultMQPullConsumer:
 
     def pull_block_if_not_found(self, mq: MessageQueue, sub_expression: str, offset: int,
                                 max_nums: int) -> PullResult:
-        """长轮询拉取：block=true → 挂起等消息。"""
+        """Long-poll pull: block=true -> suspend waiting for a message."""
         client = self._require_client()
         sub = FilterAPI.build_subscription_data(mq.topic, sub_expression)
-        # block=true：suspend=True 让 broker 挂起到有消息；超时用
-        # consumer_timeout_millis_when_suspend（挂起等消息时才用这个更长的超时）。
+        # block=true: suspend=True lets the broker suspend until a message arrives; the timeout uses
+        # consumer_timeout_millis_when_suspend (this longer timeout is used only when suspending to wait for a message).
         sys_flag = PullSysFlag.build_sys_flag(commit_offset=False, suspend=True,
                                               subscription=True, class_filter=False)
         result = client.pull_message(self.consumer_group, mq, offset, max_nums,
@@ -3977,9 +3976,9 @@ class DefaultMQPullConsumer:
             result.msg_found_list = self._filter_messages_for_delivery(mq, result.msg_found_list)
         return result
 
-    # ---------------- 异步拉取 ----------------
+    # ---------------- Async pull ----------------
     def _ensure_async_pull_executors(self) -> Tuple[ConsumeExecutor, ConsumeExecutor]:
-        """惰性建 pull_async 的双池（名字/参数对齐 producer 的 ``_create_async_executors``）。"""
+        """Lazily build the dual pool of pull_async (names/parameters aligned with the producer's ``_create_async_executors``)."""
         with self._async_pull_lock:
             if self._pull_executors_closed:
                 raise MQClientException("consumer already shutdown")
@@ -4004,7 +4003,7 @@ class DefaultMQPullConsumer:
                    max_nums: int = 32, callback: Optional[PullCallback] = None,
                    timeout_millis: Optional[int] = None) -> None:
         pass
-        self._require_client()  # 未启动同步抛，不等回调（排查友好，同 send_async）
+        self._require_client()  # Not started throws synchronously, without waiting for the callback (debug-friendly, same as send_async)
         if callback is None:
             raise MQClientException("callback is required for pull_async")
         timeout = timeout_millis if timeout_millis is not None else self.consumer_pull_timeout_millis
@@ -4017,14 +4016,14 @@ class DefaultMQPullConsumer:
                     callback.on_success(result)
                 else:
                     callback.on_exception(error)
-            except BaseException:  # noqa: BLE001 —— 用户回调异常不能杀回调线程
+            except BaseException:  # noqa: BLE001 -- a user callback exception must not kill the callback thread
                 logger.exception("pull_async callback raised, mq=%s", mq)
 
         def _dispatch(result: Optional[PullResult], error: Optional[BaseException]) -> None:
             try:
                 callback_executor.submit(_deliver, result, error)
             except RejectedExecutionError:
-                # 池已关（shutdown 与在途任务竞到的窗口）：就地投递，保证恰好一次。
+                # The pool is closed (the window where shutdown raced an in-flight task): deliver in place to guarantee exactly once.
                 _deliver(result, error)
 
         def _run() -> None:
@@ -4034,7 +4033,7 @@ class DefaultMQPullConsumer:
                 return
             try:
                 result = self.pull(mq, sub_expression, offset, max_nums, timeout - cost)
-            except BaseException as e:  # noqa: BLE001 —— RPC 失败只能进回调
+            except BaseException as e:  # noqa: BLE001 -- RPC failure can only go into the callback
                 _dispatch(None, e)
                 return
             _dispatch(result, None)
@@ -4044,7 +4043,7 @@ class DefaultMQPullConsumer:
         except RejectedExecutionError as e:
             raise MQClientException("executor rejected", None, e) from e
 
-    # ---------------- Offset 管理 ----------------
+    # ---------------- Offset management ----------------
     def fetch_consume_offset(self, mq: MessageQueue) -> Optional[int]:
         return self._require_client().query_consumer_offset(self.consumer_group, mq)
 
@@ -4066,8 +4065,8 @@ class DefaultMQPullConsumer:
         from remoting.protocol.headers import (GetEarliestMsgStoretimeRequestHeader,
                                                  GetEarliestMsgStoretimeResponseHeader)
         from remoting.protocol.remoting_command import RemotingCommand
-        # 与 max/min/search 同一个形状 —— 只认 master，刷一次路由重查，仍拿不到抛「The broker[X] not exist」。
-        # 「The broker[X] not exist」是调用方按此匹配的报错文案，改动会破坏兼容。
+        # Same shape as max/min/search -- master only, one route refresh to re-query, and "The broker[X] not exist" is thrown if still unavailable.
+        # "The broker[X] not exist" is the error wording callers match on; changing it breaks compatibility.
         addr = client._publish_addr_in_admin(mq)
         header = GetEarliestMsgStoretimeRequestHeader()
         header.topic = mq.topic
@@ -4080,20 +4079,20 @@ class DefaultMQPullConsumer:
         return resp_header.timestamp or 0
 
     def send_message_back(self, msg: MessageExt, delay_level: int) -> None:
-        """消息回投（CONSUMER_SEND_MSG_BACK 36）。
+        """Message redelivery (CONSUMER_SEND_MSG_BACK 36).
 
-        注意两点（真机踩过）：
-        1. 地址靠 `find_broker_address_in_publish(msg.broker_name)` 反查**发布地址表**
-           （只认 master），所以调用方必须先用本 consumer 访问过该 topic。
-        2. 失败**不做静默兜底**：有些实现会在回投失败时吞掉异常、改用内部默认生产者把消息
-           直接发到 `%RETRY%group`。本端口不回退成那条路径 —— 回投失败就抛，让调用方看见，
-           而不是换一条路径静默重发。
+        Two points to note (stepped on live systems):
+        1. The address is reverse-looked-up via `find_broker_address_in_publish(msg.broker_name)` in the **publish address table**
+           (master only), so the caller must have accessed that topic with this consumer first.
+        2. On failure, **no silent fallback**: some implementations swallow the exception on redelivery failure and use the internal default producer to send the message
+           directly to `%RETRY%group`. This port does not fall back to that path -- on redelivery failure it throws, letting the caller see it,
+           rather than silently resending via a different path.
         """
         client = self._require_client()
         from remoting.protocol.codes import RequestCode
         from remoting.protocol.headers import ConsumerSendMsgBackRequestHeader
         from remoting.protocol.remoting_command import RemotingCommand
-        # 从节点不接 CONSUMER_SEND_MSG_BACK（master 专属），所以这里只认 brokerId=0
+        # Slaves do not accept CONSUMER_SEND_MSG_BACK (master only), so only brokerId=0 is recognized here
         addr = client.find_broker_address_in_publish(msg.broker_name or "")
         if addr is None:
             raise MQClientException("Broker[%s] master node does not exist" % msg.broker_name)
@@ -4104,10 +4103,10 @@ class DefaultMQPullConsumer:
         header.origin_msg_id = msg.msg_id
         header.origin_topic = msg.topic
         header.unit_mode = self.unit_mode
-        # ⚠ 这里**不能**直接传配置里的 max_reconsume_times（默认 -1）：
-        # 客户端版本 ≥ V3_4_9 后 broker 会无条件采用该字段，-1 会让
-        # reconsumeTimes(0) >= -1 成立、消息直接进 %DLQ%。留 None 交给订阅组的
-        # retryMaxTimes 判定。
+        # WARNING: the configured max_reconsume_times (default -1) **cannot** be passed directly here:
+        # after client version >= V3_4_9 the broker adopts that field unconditionally, and -1 would make
+        # reconsumeTimes(0) >= -1 hold, putting the message directly into %DLQ%. Leave None to the subscription group's
+        # retryMaxTimes judgment.
         header.max_reconsume_times = None
         request = RemotingCommand.create_request_command(RequestCode.CONSUMER_SEND_MSG_BACK, header)
         response = client._invoke_sync(addr, request, 5000)
@@ -4120,24 +4119,24 @@ class DefaultMQPullConsumer:
 
 
 class DefaultLitePullConsumer:
-    """轻量拉取消费者。
+    """Lite pull consumer.
 
-    与 DefaultMQPullConsumer 的本质区别：
-    - DefaultMQPullConsumer：调用方自己 ``pull(mq, offset)`` 逐队列拉、自己管位点；没有本地缓冲、
-      没有后台拉取线程、不做 rebalance。
-    - DefaultLitePullConsumer：支持两种模式——
-      * **subscribe 模式**：登记订阅后自动 rebalance 分配队列（与 push 一致），后台拉取线程把
-        消息灌进**本地缓冲**；``poll()`` 只从本地缓冲取消息，不用调用方管位点；
-      * **assign 模式**：调用方 ``assign([mq...])`` 显式指定队列，不走 rebalance，同样后台灌本地缓冲。
-    两种模式都用 ``poll(timeout)`` 取批量消息；位点默认 autoCommit（拉完即向 broker 提交）。
+    Essential differences from DefaultMQPullConsumer:
+    - DefaultMQPullConsumer: the caller pulls queue by queue itself with ``pull(mq, offset)`` and manages offsets itself; no local buffer,
+      no background pull threads, no rebalance.
+    - DefaultLitePullConsumer: supports two modes --
+      * **subscribe mode**: after registering subscriptions it automatically rebalances and allocates queues (same as push), with background pull threads feeding
+        messages into a **local buffer**; ``poll()`` only takes messages from the local buffer, with no need for the caller to manage offsets;
+      * **assign mode**: the caller explicitly specifies queues with ``assign([mq...])``, no rebalance, likewise feeding a local buffer in the background.
+    Both modes take batches with ``poll(timeout)``; offsets default to autoCommit (committed to the broker once pulled).
 
-    设计取舍：
-    - 后台**单个** pull 服务线程顺序遍历所有已分配队列做短轮询（suspend=False），把消息塞进
-      一个线程安全的本地缓冲 ``_local_buffer``；``poll()`` 用 Condition 等待并 drain 该缓冲。
-      不按队列起独立线程（语义等价：本地缓冲 + poll）。
-    - subscribe 模式的 rebalance 复用既有 ``get_consumer_id_list_by_group`` + ``AllocateMessageQueueAveragely``，
-      与 push 消费者同一套分配算法；查询不到消费组列表时「保留当前分配」，不回退独占。
-    - 不做 POP / 推模式；不做 broker 主动请求（309/313）处理（那是 push 消费者的职责）。
+    Design trade-offs:
+    - A background **single** pull service thread sequentially iterates all assigned queues doing short polls (suspend=False), stuffing messages into
+      a thread-safe local buffer ``_local_buffer``; ``poll()`` waits with a Condition and drains that buffer.
+      Independent threads are not started per queue (semantically equivalent: local buffer + poll).
+    - The subscribe mode's rebalance reuses the existing ``get_consumer_id_list_by_group`` + ``AllocateMessageQueueAveragely``,
+      the same allocation algorithm as push consumers; when the consumer group list cannot be queried it "keeps the current allocation", never falling back to exclusive ownership.
+    - No POP / push mode; no broker-initiated request (309/313) handling (that is the push consumer's responsibility).
     """
 
     def __init__(self, consumer_group: str = MixAll.DEFAULT_CONSUMER_GROUP,
@@ -4150,96 +4149,96 @@ class DefaultLitePullConsumer:
         self.namespace = namespace
         self.instance_name = MixAll.DEFAULT_INSTANCE_NAME
         self.client_id: Optional[str] = None
-        # ---- unit / stream 配置 ----
-        # unitName 参与 clientId 的 `@<unitName>` 后缀与动态取址 URL；unitMode 随
-        # ConsumerData 心跳、消息回投请求头和过滤钩子上报给 broker；
-        # enableStreamRequestType 既给 clientId 加 `@STREAM` 后缀
-        # （为了 prevent unexpected reuses of MQClientInstance），也给每个请求加
-        # `ReqT=0` 扩展字段。三个构造函数默认都置 true。
+        # ---- unit / stream config ----
+        # unitName takes part in the clientId's `@<unitName>` suffix and the dynamic addressing URL; unitMode is
+        # reported to the broker along with the ConsumerData heartbeat, message redelivery request header and filter hooks;
+        # enableStreamRequestType both appends the `@STREAM` suffix to clientId
+        # (to prevent unexpected reuses of MQClientInstance) and adds
+        # the `ReqT=0` extension field to every request. All three constructors default to true.
         self.unit_name: Optional[str] = None
         self.unit_mode = False
         self.enable_stream_request_type = True
-        # namespaceV2（5.x 服务端命名空间）：非空时每笔请求带
-        # nsd=true / ns=<值>，见 remoting/rpchook.py 的 NamespaceRpcHook。
+        # namespaceV2 (5.x server-side namespace): when non-empty, every request carries
+        # nsd=true / ns=<value>, see the NamespaceRpcHook in remoting/rpchook.py.
         self.namespace_v2 = ""
         self.message_model = message_model
         self.socks_proxy_config: Optional[SocksProxyConfig] = socks_proxy_config
         self.name_server_addrs: List[str] = []
         self.rpc_hook = rpc_hook
 
-        # subscribe 模式的订阅表（topic -> sub_expression）
+        # The subscribe mode's subscription table (topic -> sub_expression)
         self.subscription: Dict[str, str] = {}
-        # 订阅对应的 SubscriptionData（带 tagsSet），用于发给 broker 的心跳做 tag 过滤注册
+        # The SubscriptionData for subscriptions (with tagsSet), used for the heartbeat sent to the broker for tag filter registration
         self.subscription_data: Dict[str, SubscriptionData] = {}
-        # assign 模式：调用方显式指定队列时的 tag 过滤表达式（透传给 pull）
+        # assign mode: the tag filter expression when the caller explicitly specifies queues (passed through to pull)
         self._assign_sub_expr: Dict[str, str] = {}
         self._assign_mode = False
         self._assigned: Set[MessageQueue] = set()
 
-        # rebalance 算法（subscribe 模式）
+        # The rebalance algorithm (subscribe mode)
         self.allocate_message_queue_strategy = AllocateMessageQueueAveragely()
 
-        # 拉取 / poll 配置
+        # Pull / poll config
         self.consume_from_where = ConsumeFromWhere.CONSUME_FROM_LAST_OFFSET
-        # consume_timestamp 字段初值：now - 30 分钟。
-        # 留空会让 CONSUME_FROM_TIMESTAMP 退化成「从当前时刻起消费」。
+        # The initial value of the consume_timestamp field: now - 30 minutes.
+        # Leaving it empty would degrade CONSUME_FROM_TIMESTAMP into "consume from the current moment".
         self.consume_timestamp = time.strftime(
             "%Y%m%d%H%M%S", time.localtime(time.time() - 30 * 60))
         self.pull_batch_size = 32
         self.poll_timeout_millis = 5000
-        # 路由刷新周期，默认 30000ms；只在 start() 建 MQClientInstance 时透传一次。
+        # Route refresh interval, default 30000ms; only passed through once when start() builds the MQClientInstance.
         self.poll_name_server_interval = 30000
         self.auto_commit = True
         self.auto_commit_interval_millis = 5000
         self.consumer_timeout_millis_when_suspend = 30000
         self.broker_suspend_max_time_millis = 20000
-        self.pull_interval_millis = 50  # 队尾空轮询时的退避，避免空转打爆 broker
+        self.pull_interval_millis = 50  # Backoff on empty polls at the queue tail, to avoid idle spinning hammering the broker
         self.pull_thread_nums = 1
-        # 后台比对 register_topic_message_queue_change_listener 注册 topic 的队列集合的周期，默认 30s。
+        # The period of the background comparison of the queue sets of topics registered with register_topic_message_queue_change_listener, default 30s.
         self.topic_metadata_check_interval_millis = 30 * 1000
 
-        # 运行状态
+        # Runtime state
         self._mq_client: Optional[MQClientInstance] = None
         self._started = False
         self._running = False
         self._pull_thread: Optional[threading.Thread] = None
         self._heartbeat_thread: Optional[threading.Thread] = None
 
-        # 本地缓冲 + 位点游标
+        # Local buffer + offset cursor
         self._local_buffer: Deque[MessageExt] = deque()
         self._buffer_lock = threading.Lock()
         self._buffer_cond = threading.Condition(self._buffer_lock)
-        # 拉取游标：只表示"已经取到本地缓冲的最后一条之后"，由 _pull_one 前进。
+        # Pull cursor: only means "after the last one already fetched into the local buffer", advanced by _pull_one.
         self._next_offset: Dict[MessageQueue, int] = {}
-        # 已消费游标：只有 poll() 把消息真交到调用方手上才前进
-        # （交给调用方时才 assignedMessageQueue.updateConsumeOffset(mq, removeMessage(msgs))）。
-        # 与拉取游标分成两张表，才谈得上 commit(Map, persist)：调用方指定"提交到哪"时
-        # 绝不能顺手改掉"下次从哪拉"。
+        # Consumed cursor: advances only when poll() really hands messages to the caller
+        # (assignedMessageQueue.updateConsumeOffset(mq, removeMessage(msgs)) at handoff time).
+        # Only by splitting it from the pull cursor into two tables can commit(Map, persist) make sense: when the caller specifies "where to commit to"
+        # it must never casually change "where to pull from next".
         self._consume_offset: Dict[MessageQueue, int] = {}
-        # 提交落点：内存位点表（RemoteBrokerOffsetStore.offsetTable）。
-        # commit* 三个入口都先写这张表，persist=true 才把它发给 broker；committed() 也先读它，
-        # 即 ReadOffsetType.MEMORY_FIRST_THEN_STORE。
+        # Commit landing: the in-memory offset table (RemoteBrokerOffsetStore.offsetTable).
+        # All three commit* entry points write this table first, sending it to the broker only when persist=true; committed() also reads it first,
+        # i.e. ReadOffsetType.MEMORY_FIRST_THEN_STORE.
         self._offset_table: Dict[MessageQueue, int] = {}
         self._seek_offset: Dict[MessageQueue, int] = {}
-        # topic 队列集合变更监听器（topicMessageQueueChangeListenerMap + messageQueuesForTopic）：
-        # 键是**已套命名空间**的 topic（withNamespace(topic)），回调也收到这个键。
+        # Topic queue set change listener (topicMessageQueueChangeListenerMap + messageQueuesForTopic):
+        # the key is the **namespaced** topic (withNamespace(topic)), and the callback also receives this key.
         self._topic_change_listeners: Dict[str, TopicMessageQueueChangeListener] = {}
         self._message_queues_for_topic: Dict[str, Set[MessageQueue]] = {}
         self._topic_listener_lock = threading.Lock()
         self._metadata_thread: Optional[threading.Thread] = None
-        # nextAutoCommitDeadline：初值 -1 ⇒ 第一次 poll 就提交一次。
+        # nextAutoCommitDeadline: initial value -1 => commit once on the first poll.
         self._next_auto_commit_deadline = -1
         self._paused: Set[MessageQueue] = set()
         self._message_queue_listener = None
         self._last_rebalance_ts = 0
 
-    # ---------------- 命名空间 ----------------
+    # ---------------- Namespace ----------------
     def _with_namespace(self, topic: str) -> str:
         if self.namespace and not topic.startswith(self.namespace + "%"):
             return self.namespace + "%" + topic
         return topic
 
-    # ---------------- 配置 ----------------
+    # ---------------- Config ----------------
     def set_namesrv_addr(self, addr: str) -> None:
         self.name_server_addrs = [a.strip() for a in addr.split(";") if a.strip()]
 
@@ -4250,25 +4249,25 @@ class DefaultLitePullConsumer:
         self.instance_name = name
 
     def set_unit_name(self, unit_name: Optional[str]) -> None:
-        """设置单元名：影响 clientId 后缀与动态取址 URL。"""
+        """Set the unit name: affects the clientId suffix and the dynamic addressing URL."""
         self.unit_name = unit_name
 
     def get_unit_name(self) -> Optional[str]:
         return self.unit_name
 
     def set_unit_mode(self, unit_mode: bool) -> None:
-        """设置单元化模式：随心跳/请求头透传给 broker。"""
+        """Set unit mode: passed through to the broker with the heartbeat/request headers."""
         self.unit_mode = bool(unit_mode)
 
     def is_unit_mode(self) -> bool:
         return self.unit_mode
 
     def set_enable_stream_request_type(self, enable: bool) -> None:
-        """开关 stream 请求类型：影响 clientId 后缀与每笔请求的 ReqT 扩展字段。"""
+        """Toggle the stream request type: affects the clientId suffix and every request's ReqT extension field."""
         self.enable_stream_request_type = bool(enable)
 
     def set_namespace_v2(self, namespace_v2: Optional[str]) -> None:
-        """设置 5.x 服务端命名空间：非空时每笔请求带 nsd=true / ns=<值>。"""
+        """Set the 5.x server-side namespace: when non-empty, every request carries nsd=true / ns=<value>."""
         self.namespace_v2 = namespace_v2
 
     def get_namespace_v2(self) -> Optional[str]:
@@ -4318,8 +4317,8 @@ class DefaultLitePullConsumer:
         self.pull_interval_millis = max(0, int(ms))
 
     def set_topic_metadata_check_interval_millis(self, ms: int) -> None:
-        # 下限 1s：配置本身没有下限，但 0/负数会让固定速率调度直接抛错，
-        # 这里退化成最快 1s 一趟。
+        # Lower bound 1s: the config itself has no lower bound, but 0/negative would make the fixed-rate scheduling throw directly;
+        # here it degrades to the fastest one trip per 1s.
         self.topic_metadata_check_interval_millis = max(1000, int(ms))
 
     def get_topic_metadata_check_interval_millis(self) -> int:
@@ -4331,19 +4330,19 @@ class DefaultLitePullConsumer:
     def set_message_queue_listener(self, listener) -> None:
         self._message_queue_listener = listener
 
-    # ---------------- 订阅 / 分配 ----------------
+    # ---------------- Subscription / allocation ----------------
     def subscribe(self, topic: str, sub_expression: str = "*") -> None:
         self._assign_mode = False
         ns = self._with_namespace(topic)
         self.subscription[ns] = sub_expression
-        # 同步构建 SubscriptionData，供心跳把 tag 订阅注册给 broker（否则 broker 不认 tag 过滤）
+        # Build the SubscriptionData synchronously, so the heartbeat registers the tag subscription with the broker (otherwise the broker does not recognize tag filtering)
         try:
             self.subscription_data[ns] = FilterAPI.build_subscription_data(ns, sub_expression)
         except Exception:
             self.subscription_data.pop(ns, None)
 
     def subscribe_with_selector(self, topic: str, selector) -> None:
-        # Lite 仅支持 tag 表达式订阅；MessageSelector 一律按 tag 处理
+        # Lite supports tag-expression subscriptions only; MessageSelector is always treated as a tag
         self.subscribe(topic, getattr(selector, "expression", "*"))
 
     def unsubscribe(self, topic: str) -> None:
@@ -4352,9 +4351,9 @@ class DefaultLitePullConsumer:
         self.subscription_data.pop(ns, None)
 
     def set_sub_expression_for_assign(self, topic: str, sub_expression: str) -> None:
-        """assign 模式下给某个 topic 的队列指定 tag 过滤表达式（setSubExpressionForAssign）。
+        """Specify a tag filter expression for a topic's queues in assign mode (setSubExpressionForAssign).
 
-        同时构建 SubscriptionData 注册到心跳，使 broker 按该 tag 过滤（assign 模式 broker 也需要订阅）。
+        Also builds the SubscriptionData registered with the heartbeat, so the broker filters by that tag (assign mode also needs the broker to know the subscription).
         """
         ns = self._with_namespace(topic)
         self._assign_sub_expr[ns] = sub_expression
@@ -4366,10 +4365,10 @@ class DefaultLitePullConsumer:
     def assign(self, message_queues) -> None:
         self._assign_mode = True
         queues = set(message_queues)
-        # updateAssignedMessageQueue：撤掉的队列连着整份 MessageQueueState 丢掉
-        # （拉取游标与已消费游标一起消失）。**不**动 offsetStore 的
-        # 内存位点表——那份清理挂在 rebalance 的 removeUnnecessaryMessageQueue 上，
-        # assign 模式不走 rebalance，所以 persist 也不发生在这里。
+        # updateAssignedMessageQueue: revoked queues are dropped along with the whole MessageQueueState
+        # (the pull cursor and consumed cursor disappear together). Does **not** touch the offsetStore's
+        # in-memory offset table -- that cleanup hangs off rebalance's removeUnnecessaryMessageQueue,
+        # and assign mode does not go through rebalance, so persist does not happen here either.
         for mq in self._assigned - queues:
             self._next_offset.pop(mq, None)
             self._consume_offset.pop(mq, None)
@@ -4381,7 +4380,7 @@ class DefaultLitePullConsumer:
                 except Exception:
                     logger.debug("assign: resolve initial offset failed for %s", mq)
 
-    # ---------------- 生命周期 ----------------
+    # ---------------- Lifecycle ----------------
     def _create_client(self) -> MQClientInstance:
         return MQClientInstance(self.client_id, self.name_server_addrs,
                                 socks_proxy_config=self.socks_proxy_config,
@@ -4393,7 +4392,7 @@ class DefaultLitePullConsumer:
     def start(self) -> None:
         if self._started:
             return
-        # 纯本地校验，最先做
+        # Purely local validation, done first
         validators.check_group(self.consumer_group)
         if self.consumer_group == MixAll.DEFAULT_CONSUMER_GROUP:
             raise MQClientException(
@@ -4403,15 +4402,15 @@ class DefaultLitePullConsumer:
             raise MQClientException("name server address is not set")
         if not self.subscription and not self._assign_mode:
             raise MQClientException("subscription is not set, call subscribe() or assign() first")
-        # 启动即无条件校验：
-        # 下面解析初始位点的循环会吞异常，晚抛等于静默退化成从 max offset 消费。
+        # Unconditionally validated at startup:
+        # the loop below resolving initial offsets swallows exceptions; throwing late would be a silent degradation to consuming from max offset.
         self._parse_consume_timestamp(self.consume_timestamp)
-        # 策略为 None 直接拒绝启动，
-        # 而不是等 rebalance 里 None.allocate 抛 AttributeError 被静默吞掉。
+        # A None strategy rejects startup directly,
+        # rather than waiting for None.allocate in rebalance to throw AttributeError and be silently swallowed.
         if self.allocate_message_queue_strategy is None:
             raise MQClientException("allocateMessageQueueStrategy is null")
-        # CLUSTERING 才改写 instanceName；clientId 口径是
-        # `<本机 IP>@<instanceName>[@<unitName>][@STREAM]`。
+        # Only CLUSTERING rewrites instanceName; the clientId policy is
+        # `<local IP>@<instanceName>[@<unitName>][@STREAM]`.
         if self.message_model == MessageModel.CLUSTERING:
             self.instance_name = MixAll.change_instance_name_to_pid(self.instance_name)
         if self.client_id is None:
@@ -4428,7 +4427,7 @@ class DefaultLitePullConsumer:
         except Exception:
             manager.unregister_client(self.client_id, self._mq_client)
             raise
-        # assign 模式在 start 时解析初始位点
+        # assign mode resolves initial offsets at start
         if self._assign_mode:
             for mq in list(self._assigned):
                 if mq not in self._next_offset:
@@ -4436,11 +4435,11 @@ class DefaultLitePullConsumer:
                         self._next_offset[mq] = self._resolve_initial_offset(mq)
                     except Exception:
                         logger.debug("start: resolve initial offset failed for %s", mq)
-        # 先把 tag 订阅注册给 broker（心跳），再启动后台拉取，避免首轮拉取因 broker 不认订阅而丢消息。
-        # 心跳要靠「已知 broker 列表」发送，而该列表只来自 topic 路由表：start 时先把订阅/指派的
-        # topic 拉一遍路由并登记为「在用」（发心跳之前必然先 updateTopicRouteInfoFromNameServer）。
-        # 少了这步，首轮心跳因为没有 broker 而静默不发 ⇒
-        # broker 侧看不到本实例 ⇒ 多实例 rebalance 各自独占全部队列（互相重复消费）。
+        # First register the tag subscriptions with the broker (heartbeat), then start the background pull, so the first pull round does not lose messages because the broker does not recognize the subscription.
+        # The heartbeat relies on the "known broker list" to be sent, and that list comes only from the topic route table: at start, first pull the routes of subscribed/assigned
+        # topics once and register them as "in use" (updateTopicRouteInfoFromNameServer necessarily happens before sending the heartbeat).
+        # Without this step, the first heartbeat is silently not sent for lack of brokers =>
+        # the broker side cannot see this instance => multi-instance rebalance each exclusively owns all queues (consuming each other's messages).
         self._refresh_route_for_heartbeat()
         self._running = True
         self._send_heartbeat_to_all_broker()
@@ -4450,15 +4449,15 @@ class DefaultLitePullConsumer:
             target=self._pull_service_loop, daemon=True,
             name="rmq-lite-pull-%s" % self.consumer_group)
         self._pull_thread.start()
-        # startScheduleTask()：队列集合变更的周期比对线程，
-        # 与有没有注册监听器无关（照样起）。
+        # startScheduleTask(): the periodic comparison thread for queue set changes,
+        # regardless of whether a listener is registered (it is started anyway).
         self._metadata_thread = threading.Thread(
             target=self._metadata_loop, daemon=True,
             name="rmq-lite-metadata-%s" % self.consumer_group)
         self._metadata_thread.start()
 
     def _refresh_route_for_heartbeat(self) -> None:
-        """为心跳准备 broker 地址：拉取并登记本实例关注的 topic 路由。"""
+        """Prepare broker addresses for the heartbeat: pull and register the routes of the topics this instance cares about."""
         topics = list(self.subscription.keys())
         topics += [mq.topic for mq in self._assigned if mq.topic not in topics]
         for topic in topics:
@@ -4473,10 +4472,10 @@ class DefaultLitePullConsumer:
             return
         self._started = False
         self._running = False
-        # shutdown 走 persistConsumerOffset()：把内存位点表按当下持有的队列刷一遍，
-        # 与 auto_commit 无关（手动模式用 persist=False 攒下的值同样要落盘）。
-        # 自动提交模式再多走一步 commit()：本端口没有那份 5s 定时器，
-        # "poll 交出去但还没到截止时刻"的位点得在这里补上，否则重启后从上一格重投。
+        # shutdown goes through persistConsumerOffset(): flush the in-memory offset table once per the currently held queues,
+        # regardless of auto_commit (values accumulated with persist=False in manual mode must also be persisted).
+        # Auto-commit mode takes one more step, commit(): this port does not have that 5s timer,
+        # so offsets "handed out by poll but not yet at the deadline" must be made up here, otherwise they would be redelivered from the previous slot after restart.
         try:
             if self.auto_commit:
                 self.commit()
@@ -4484,7 +4483,7 @@ class DefaultLitePullConsumer:
                 self._persist_offset_table(self._assigned)
         except Exception:  # noqa: BLE001
             logger.debug("shutdown commit failed")
-        # 唤醒可能的 poll() 等待，让其在关闭后尽快返回
+        # Wake any waiting poll() so it returns as soon as possible after shutdown
         with self._buffer_cond:
             self._buffer_cond.notify_all()
         if self._pull_thread is not None:
@@ -4494,24 +4493,24 @@ class DefaultLitePullConsumer:
         if self._heartbeat_thread is not None:
             self._heartbeat_thread.join(timeout=2.0)
         if self._mq_client is not None:
-            # 引用计数语义：同 clientId 还有别的门面在用时实例继续存活，
-            # 归零才真正 shutdown。
+            # Reference-count semantics: while another facade with the same clientId is still in use the instance stays alive,
+            # and only shutdown when the count reaches zero.
             MQClientManager.get_instance().unregister_client(
                 self.client_id or "", self._mq_client)
 
     def is_running(self) -> bool:
         return self._running
 
-    # ---------------- 心跳（把 tag 订阅注册给 broker）----------------
+    # ---------------- Heartbeat (register the tag subscriptions with the broker) ----------------
     def _build_heartbeat(self) -> HeartbeatData:
         hb = HeartbeatData(self.client_id or "")
         cd = ConsumerData(self.consumer_group, ConsumeType.CONSUME_ACTIVELY,
                           self.message_model, self.consume_from_where)
-        # consumeType 是 CONSUME_ACTIVELY 而**不是**推送消费者的 PASSIVELY，
-        # broker 侧按它分流：`rejectPullConsumerEnabled=true` 的 broker 跳过 ACTIVELY
-        # 心跳并拒绝未注册的拉取组；冷数据流控也按 PASSIVELY/ACTIVELY 走两条不同的分支。
-        # 写成 PASSIVELY 时两处全错位。
-        # 见推送消费者 _build_heartbeat 的同名注释
+        # consumeType is CONSUME_ACTIVELY and **not** the push consumer's PASSIVELY,
+        # and the broker side splits by it: a broker with `rejectPullConsumerEnabled=true` skips ACTIVELY
+        # heartbeats and rejects unregistered pull groups; cold-data flow control also takes two different branches per PASSIVELY/ACTIVELY.
+        # Writing PASSIVELY would misalign both.
+        # See the same-named comment on the push consumer's _build_heartbeat
         cd.unit_mode = self.unit_mode
         for sub in self.subscription_data.values():
             cd.subscription_data_set.add(sub)
@@ -4523,8 +4522,8 @@ class DefaultLitePullConsumer:
             return 0
         hb = self._build_heartbeat()
         ok = 0
-        # 每台都发（主 + 从）：与推送消费者 `DefaultMQPushConsumer._send_heartbeat_to_all_broker`
-        # 同一条依据 —— 只有 consumerEmpty 才跳从节点，拉模式带订阅集，从节点也要注册。
+        # Sent to every broker (master + slave): same rationale as the push consumer's `DefaultMQPushConsumer._send_heartbeat_to_all_broker`
+        # -- slaves are skipped only when consumerEmpty; pull mode carries a subscription set, so slaves must be registered too.
         for addr in self._mq_client.get_all_broker_addrs():
             try:
                 self._mq_client.send_heartbeat(addr, hb, 5000)
@@ -4545,13 +4544,13 @@ class DefaultLitePullConsumer:
                 self._send_heartbeat_to_all_broker()
             except Exception:  # noqa: BLE001
                 logger.debug("lite heartbeat loop error")
-            # 5s 心跳间隔（与 push 消费者一致）
+            # 5s heartbeat interval (same as the push consumer)
             for _ in range(50):
                 if not self._running:
                     break
                 time.sleep(0.1)
 
-    # ---------------- 拉取服务 ----------------
+    # ---------------- Pull service ----------------
     def _pull_service_loop(self) -> None:
         while self._running:
             try:
@@ -4571,7 +4570,7 @@ class DefaultLitePullConsumer:
                         got_any = True
             except Exception as e:  # noqa: BLE001
                 logger.debug("lite pull service error: %s", e)
-            # 退避：轮询空时放慢，避免打爆 broker；有消息则尽快回填缓冲
+            # Backoff: slow down on empty polls to avoid hammering the broker; when there are messages, refill the buffer as soon as possible
             time.sleep(self.pull_interval_millis / 1000.0 if not got_any else 0.005)
 
     def _subscription_for(self, topic: str) -> str:
@@ -4587,10 +4586,10 @@ class DefaultLitePullConsumer:
             offset = self._resolve_initial_offset(mq)
             self._next_offset[mq] = offset
         sub = self._subscription_for(mq.topic) or "*"
-        # 短轮询（suspend=False），位点由 auto-commit 单独提交，不随拉取请求带上去。
-        # lite_pull=True 置 FLAG_LITE_PULL_MESSAGE（buildSysFlag(false, block, true, false, true)），
-        # 该标志位决定请求码切成 LITE_PULL_MESSAGE(361)：broker 按这个码区分拉模式订阅语义，
-        # 发错会按消费组的订阅关系过滤，assign 模式下 broker 侧根本没有这份订阅。
+        # Short poll (suspend=False), with offsets committed separately by auto-commit, not carried along on the pull request.
+        # lite_pull=True sets FLAG_LITE_PULL_MESSAGE (buildSysFlag(false, block, true, false, true)),
+        # and that flag decides the request code switches to LITE_PULL_MESSAGE(361): the broker distinguishes pull-mode subscription semantics by this code,
+        # and sending the wrong one would filter per the consume group's subscription, which in assign mode the broker side simply does not have.
         sys_flag = PullSysFlag.build_sys_flag(commit_offset=False, suspend=False,
                                               subscription=True, class_filter=False,
                                               lite_pull=True)
@@ -4603,15 +4602,15 @@ class DefaultLitePullConsumer:
         except Exception as e:  # noqa: BLE001
             logger.debug("lite pull_one failed for %s@%d: %s", mq.topic, mq.queue_id, e)
             return False
-        # 一轮拉取回来之后：
-        # 无论 FOUND / NO_NEW_MSG / NO_MATCHED_MSG / OFFSET_ILLEGAL，都把拉取游标推进到
-        # broker 给的 nextBeginOffset —— NO_MATCHED_MSG 的 nextBeginOffset 已越过本轮扫过
-        # 的整段不匹配区间（不跟就会每轮把同一段重扫一遍），OFFSET_ILLEGAL 的
-        # nextBeginOffset 是 broker 的纠正位点（越界自愈也靠这一步）。
-        # 刹车只有一只：**在途请求的结果不许盖掉这轮里刚 seek / 刚被撤走的位点**。
-        # 本端 seek() 直接改写 _next_offset、撤队列直接 pop 掉条目，
-        # 所以用「游标还是不是我发请求时的那个值」来判断。
-        # 同一条刹车也管着 FOUND 分支的入缓冲。
+        # After a pull round comes back:
+        # regardless of FOUND / NO_NEW_MSG / NO_MATCHED_MSG / OFFSET_ILLEGAL, advance the pull cursor to
+        # the broker's nextBeginOffset -- NO_MATCHED_MSG's nextBeginOffset has already passed the entire unmatched range swept this
+        # round (not following it would re-sweep the same range every round), and OFFSET_ILLEGAL's
+        # nextBeginOffset is the broker's corrected offset (out-of-bounds self-healing relies on this step too).
+        # There is only one brake: **the result of an in-flight request must not overwrite the offsets just seeked / just revoked in this round**.
+        # This port's seek() rewrites _next_offset directly, and revoking a queue pops the entry directly,
+        # so "is the cursor still the value it was when I sent the request" is used to judge.
+        # The same brake also governs the FOUND branch's enqueueing into the buffer.
         intact = self._next_offset.get(mq) == offset
         if intact:
             self._next_offset[mq] = result.next_begin_offset
@@ -4633,8 +4632,8 @@ class DefaultLitePullConsumer:
             return msgs
         kept = []
         for m in msgs:
-            # 注意：真实拉取回来的 MessageExt 把 tag 放在 properties["TAGS"]（get_tags() 读它），
-            # 实例属性 .tags 为 None；单元测试里会显式 set_tags，这里两种来源都兼容。
+            # Note: the really pulled-back MessageExt puts the tag in properties["TAGS"] (which get_tags() reads),
+            # and the instance attribute .tags is None; unit tests explicitly set_tags, so both sources are supported here.
             tag = getattr(m, "tags", None) or m.get_tags()
             if tag in sub_data.tags_set:
                 kept.append(m)
@@ -4646,15 +4645,15 @@ class DefaultLitePullConsumer:
             self._buffer_cond.notify_all()
 
     def _maybe_auto_commit(self) -> None:
-        """到点提交**全部**已分配队列（maybeAutoCommit）。
+        """Commit **all** assigned queues when the time comes (maybeAutoCommit).
 
-        调用点只有 ``poll()`` 开头一处（外加 ``shutdown()`` 的兜底提交）：
-        空闲消费者即使有每 5s 的 ``persistConsumerOffset`` 定时器，它刷的也是**内存位点表**，
-        而那张表只有 ``commit`` 路径会写，所以停掉 poll 之后并不会往前推进 broker 位点。
-        这里若把自动提交放到拉取循环里查，就成了"没人 poll 也提交"，比应有的语义激进，故不放。
+        The only call site is the start of ``poll()`` (plus ``shutdown()``'s fallback commit):
+        an idle consumer, even with the 5s ``persistConsumerOffset`` timer, has it flushing the **in-memory offset table**,
+        and that table is written only by the ``commit`` path, so stopping poll does not advance the broker offset.
+        Checking the auto-commit inside the pull loop here would become "committing even when nobody polls", which is more aggressive than the semantics should be, so it is not placed there.
 
-        提交的是"已消费游标"而不是拉取游标——缓冲里还没交给调用方的消息不算已消费，
-        口径与 ``processQueue.removeMessage`` 只在 poll 里前进 consumeOffset 一致。
+        What is committed is the "consumed cursor" rather than the pull cursor -- messages in the buffer not yet handed to the caller do not count as consumed,
+        the same policy as ``processQueue.removeMessage`` advancing consumeOffset only in poll.
         """
         now = time.time() * 1000.0
         if now < self._next_auto_commit_deadline:
@@ -4666,12 +4665,12 @@ class DefaultLitePullConsumer:
         if mq in self._seek_offset:
             return self._seek_offset[mq]
         if self._mq_client is None:
-            # assign/seek 一般都先 checkServiceState()，没启动就拒绝。本端口允许先 assign
-            # 再 start，但**不能**在没问过 broker 的情况下给出 0 —— assign 会把结果存进
-            # _next_offset，存进去就不会再解析（拉取循环只在缺值时补解析），起点会被永久
-            # 钉死在 0。抛出去让调用方记一笔，真正的解析留给 start 后的拉取循环。
+            # assign/seek usually checkServiceState() first, rejecting when not started. This port allows assign
+            # first then start, but **cannot** give 0 without having asked the broker -- assign stores the result into
+            # _next_offset, and once stored it is never resolved again (the pull loop only backfills on missing values), pinning the start
+            # permanently at 0. Throw to let the caller take note; the real resolution is left to the pull loop after start.
             raise MQClientException("The lite pull consumer is not running")
-        # 有已提交位点则沿用（保证重启续消费）
+        # Use the committed offset if there is one (to guarantee resuming consumption after restart)
         try:
             off = self._mq_client.query_consumer_offset(self.consumer_group, mq)
             if off is not None:
@@ -4679,10 +4678,10 @@ class DefaultLitePullConsumer:
         except Exception:
             pass
         if self.consume_from_where == ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET:
-            # FIRST_OFFSET 分支与 push 同形（直接取 0），
-            # 不发 minOffset 查询 —— minOffset 是管理侧口径（只认 master），
-            # 主掉线期间会让新起的 lite-pull 一条都拉不到；越界由 broker 的
-            # PULL_OFFSET_MOVED 纠正（_offset_illegal_recover）。
+            # The FIRST_OFFSET branch is the same shape as push (take 0 directly),
+            # and no minOffset query is sent -- minOffset is the admin-side policy (master only),
+            # which while the master is down would leave a newly started lite-pull unable to pull anything; out-of-bounds is corrected by the broker's
+            # PULL_OFFSET_MOVED (_offset_illegal_recover).
             return 0
         if self.consume_from_where == ConsumeFromWhere.CONSUME_FROM_TIMESTAMP:
             ts = self._parse_consume_timestamp(self.consume_timestamp)
@@ -4690,9 +4689,9 @@ class DefaultLitePullConsumer:
         return self._mq_client.get_max_offset(mq)
 
     def _parse_consume_timestamp(self, ts: str) -> int:
-        # consumeTimestamp 该字段**只**是 14 位本地墙钟日期（yyyyMMddHHmmss）。
-        # 旧实现先走 isdigit() 分支把纯数字当 epoch 秒/毫秒，"20230101000000"
-        # 因此被解释成公元 2611 年，而下面的 strptime 分支永远不可达。
+        # The consumeTimestamp field is **only** a 14-digit local wall-clock date (yyyyMMddHHmmss).
+        # The old implementation first went through an isdigit() branch treating pure digits as epoch seconds/millis, so "20230101000000"
+        # was therefore interpreted as the year 2611 AD, while the strptime branch below was never reachable.
         try:
             if len(str(ts)) != 14:
                 raise ValueError(ts)
@@ -4701,15 +4700,15 @@ class DefaultLitePullConsumer:
             raise MQClientException(
                 "consumeTimestamp is invalid, the valid format is yyyyMMddHHmmss,but received %s" % ts)
 
-    # ---------------- rebalance（subscribe 模式）----------------
+    # ---------------- rebalance (subscribe mode) ----------------
     def _rebalance(self) -> None:
-        # 走的是与 push **完全相同**的 rebalanceByTopic 路径，所以 mqAll / cidAll 都要先排序。
-        # 顺序不一致会让同组不同实例算出互相冲突的分配（同一队列被两个实例同时消费）。
+        # It goes through the **exactly identical** rebalanceByTopic path as push, so mqAll / cidAll must both be sorted first.
+        # Inconsistent ordering would make different instances in the same group compute conflicting allocations (the same queue consumed by two instances simultaneously).
         new_set: Set[MessageQueue] = set()
         for topic in list(self.subscription.keys()):
             try:
-                # 与 push 的 rebalance 同源：同一个 RebalanceImpl，
-                # mqAll 来自订阅信息（读位、不筛 master）。
+                # Same source as push's rebalance: the same RebalanceImpl,
+                # with mqAll coming from the subscription info (read perm, no master filtering).
                 mq_all = sorted(self._mq_client.get_topic_subscribe_info(topic),
                                 key=_mq_sort_key)
             except Exception:
@@ -4721,8 +4720,8 @@ class DefaultLitePullConsumer:
                 allocated = self.allocate_message_queue_strategy.allocate(
                     self.consumer_group, self.client_id, mq_all, cid_all)
             except Exception as e:  # noqa: BLE001
-                # 与 rebalanceByTopic 的 catch (Throwable) 同口径：只记日志、
-                # 本轮跳过该 topic（保留它当前的分配），绝不能因为一次策略异常就把队列撤走。
+                # Same policy as rebalanceByTopic's catch (Throwable): only log --
+                # skip this topic this round (keeping its current allocation), and never take the queue away because of one strategy exception.
                 logger.error("allocate message queue exception, strategy=%s: %s",
                              _strategy_name(self.allocate_message_queue_strategy), e)
                 new_set |= {mq for mq in self._assigned if mq.topic == topic}
@@ -4738,15 +4737,15 @@ class DefaultLitePullConsumer:
                     except Exception:
                         logger.debug("rebalance: resolve offset failed for %s", mq)
             for mq in (old - new_set):
-                # removeUnnecessaryMessageQueue：先 persist(mq) 再 removeOffset(mq)——
-                # 撤手之前把最后一次提交的位点补发出去，
-                # 别让已经消费过的队列从上一个 5s 窗口起重新投一遍。
+                # removeUnnecessaryMessageQueue: persist(mq) first, then removeOffset(mq) --
+                # send out the last committed offset before letting go,
+                # so an already consumed queue is not redelivered from the previous 5s window.
                 self._persist_offset(mq)
                 self._next_offset.pop(mq, None)
-                # AssignedMessageQueue 的条目也一起丢掉：撤队列时 removeAssignMessageQueue
-                # 丢掉的是**整份 MessageQueueState**（pullOffset / consumeOffset / seekOffset），
-                # 留着 seekOffset 就是让这条队列哪天回到本实例时静默跳回用户很久以前
-                # 手动钉过的位置。offsetStore 的那一格上面 persist 已经清掉了。
+                # The AssignedMessageQueue entries are dropped too: on queue revoke, removeAssignMessageQueue
+                # drops the **entire MessageQueueState** (pullOffset / consumeOffset / seekOffset),
+                # and keeping seekOffset would let this queue silently jump back to a position the user manually
+                # pinned long ago should it return to this instance someday. That offsetStore slot was already cleared by the persist above.
                 self._consume_offset.pop(mq, None)
                 self._offset_table.pop(mq, None)
                 self._seek_offset.pop(mq, None)
@@ -4756,7 +4755,7 @@ class DefaultLitePullConsumer:
                 except Exception:
                     pass
 
-    # ---------------- poll / 位点 ----------------
+    # ---------------- poll / offsets ----------------
     def poll(self, timeout: Optional[int] = None) -> List[MessageExt]:
         if timeout is None:
             timeout = self.poll_timeout_millis
@@ -4801,21 +4800,21 @@ class DefaultLitePullConsumer:
         self.seek(mq, self._mq_client.get_max_offset(mq))
 
     def pull_cursor_of(self, mq: MessageQueue) -> int:
-        """拉取游标（观测点：真机对拍要看的正是"拉了多少"与"交了多少"这两格的差）。"""
+        """The pull cursor (observation point: what a live comparison looks at is exactly the difference between "how much was pulled" and "how much was handed out")."""
         return self._next_offset.get(mq, -1)
 
     def consume_cursor_of(self, mq: MessageQueue) -> int:
-        """已消费游标（``poll()`` 交出去的那一格）。"""
+        """The consumed cursor (the slot ``poll()`` hands out)."""
         return self._consume_offset.get(mq, -1)
 
     def pending_commit_of(self, mq: MessageQueue) -> int:
-        """内存位点表里那一格（``persist=False`` 提交但还没落盘的值就在这）。"""
+        """The slot in the in-memory offset table (where values committed with ``persist=False`` but not yet persisted sit)."""
         return self._offset_table.get(mq, -1)
 
     def committed(self, mq: MessageQueue) -> Optional[int]:
-        """``committed()`` 走 ``offsetStore.readOffset(MEMORY_FIRST_THEN_STORE)``：
-        先看内存位点表（``persist=False`` 刚提交、还没发给 broker 的值也算数），
-        再问 broker，并把 broker 的值回填进表里。"""
+        """``committed()`` goes through ``offsetStore.readOffset(MEMORY_FIRST_THEN_STORE)``:
+        look at the in-memory offset table first (values just committed with ``persist=False`` but not yet sent to the broker also count),
+        then ask the broker, and backfill the broker's value into the table."""
         cached = self._offset_table.get(mq)
         if cached is not None:
             return cached
@@ -4825,7 +4824,7 @@ class DefaultLitePullConsumer:
         return broker_offset
 
     def _persist_offset(self, mq: MessageQueue) -> None:
-        """``OffsetStore#persist(mq)``：只把这一条队列的内存位点发给 broker，不做清理。"""
+        """``OffsetStore#persist(mq)``: only sends this queue's in-memory offset to the broker, with no cleanup."""
         offset = self._offset_table.get(mq)
         if offset is None:
             return
@@ -4835,12 +4834,12 @@ class DefaultLitePullConsumer:
             logger.debug("lite persist failed for %s: %s", mq, e)
 
     def _persist_offset_table(self, mqs) -> None:
-        """``RemoteBrokerOffsetStore#persistAll(Set)``：内存位点表里落在 ``mqs`` 上的
-        那部分写给 broker，**不在**其中的条目顺手从表里删掉（日志里那句 ``remove unused mq``）。
+        """``RemoteBrokerOffsetStore#persistAll(Set)``: the part of the in-memory offset table falling on ``mqs``
+        is written to the broker, and entries **not** in it are deleted from the table on the way (the ``remove unused mq`` line in the logs).
 
-        后半句是这张表的真实语义：它只服务于当下持有的队列，撤走的队列留在表里没人再
-        提交，persistAll 一路扫过去就清掉。代价是 ``commit(部分队列, persist=True)`` 会把其余
-        队列**尚未落盘**的内存值一起丢掉——要提交谁就一次给全，别指望上一轮的其余队列还在表里。
+        The second half is this table's real semantics: it only serves the currently held queues, and revoked queues left in the table would never be
+        committed again, so persistAll sweeps them away as it goes. The cost is that ``commit(some queues, persist=True)`` drops the other
+        queues' **not yet persisted** in-memory values along with them -- whoever is to be committed must be given in full, and do not expect the other queues from the previous round to still be in the table.
         """
         wanted = set(mqs)
         if not wanted:
@@ -4852,26 +4851,26 @@ class DefaultLitePullConsumer:
             self._persist_offset(mq)
 
     def commit(self, offsets=None, persist: bool = True) -> None:
-        """提交消费位点。三个入口对位 ``DefaultLitePullConsumer`` 的三个重载：
+        """Commit consume offsets. The three entry points correspond to ``DefaultLitePullConsumer``'s three overloads:
 
-        - ``commit()``                       → ``commitAll()``：按"已消费游标"提交所有已分配队列
-        - ``commit({MessageQueue: offset})`` → ``commit(Map, persist)``：调用方指定位点
-        - ``commit([MessageQueue, ...])``     → ``commit(Set, persist)``：只提交这几条队列
+        - ``commit()``                       -> ``commitAll()``: commit all assigned queues by the "consumed cursor"
+        - ``commit({MessageQueue: offset})`` -> ``commit(Map, persist)``: the caller specifies offsets
+        - ``commit([MessageQueue, ...])``     -> ``commit(Set, persist)``: commit only these queues
 
-        指定位点**只改提交位置，不改拉取游标**：缓冲里已有的消息照旧交给调用方，下一轮
-        ``commit()`` 又会按游标把表覆盖回去（同一处就是这个次序：Map 走
-        ``updateConsumeOffset`` 只写 offsetStore，``commitAll`` 每次重新从
-        ``assignedMessageQueue.getConsumerOffset`` 取数）。
+        Specifying offsets **only changes the commit position, not the pull cursor**: messages already in the buffer are still handed to the caller, and the next round's
+        ``commit()`` overwrites the table back per the cursor (the order at the same place is exactly this: Map goes through
+        ``updateConsumeOffset`` writing only offsetStore, while ``commitAll`` each time re-reads from
+        ``assignedMessageQueue.getConsumerOffset``).
 
-        两处已知的偏离，都在这条链路上：
-        ① ``commitAll()`` 本身只写内存表，真正发给 broker 靠 MQClientInstance 每
-           ``persistConsumerOffsetInterval``（5s）一次的 ``persistConsumerOffset()``；本端口的
-           lite 消费者没挂那个定时器，所以 ``persist=True``（默认）就地发出去。
-        ② ``persistAll`` 常见做法是 oneway（``updateConsumeOffsetToBroker(mq, offset)`` 那个
-           ``isOneway=true`` 的重载）、异常只记日志；这里发同步带应答，坏位点当场就能从日志看到。
+        Two known deviations, both on this chain:
+        1. ``commitAll()`` itself writes only the in-memory table; actually sending to the broker relies on MQClientInstance's every
+           ``persistConsumerOffsetInterval`` (5s) ``persistConsumerOffset()``; this port's
+           lite consumer does not attach that timer, so ``persist=True`` (the default) sends it in place.
+        2. ``persistAll`` is commonly done oneway (the ``updateConsumeOffsetToBroker(mq, offset)`` overload with
+           ``isOneway=true``), with exceptions only logged; here it is sent synchronously with a response, so bad offsets can be seen in the logs right away.
         """
         if offsets is None:
-            # commitAll()：只遍历当下持有的队列
+            # commitAll(): only iterate the currently held queues
             targets = {mq: self._consume_offset.get(mq, -1) for mq in self._assigned}
             scope = self._assigned
         elif isinstance(offsets, dict):
@@ -4892,8 +4891,8 @@ class DefaultLitePullConsumer:
                 logger.error("consumerOffset is -1 in messageQueue [%s].", mq)
                 continue
             if mq not in self._assigned:
-                # processQueue != null && !isDropped() 守卫：不是本实例持有的队列
-                # 一律不替它提交，静默跳过（这里连日志都不打）。
+                # The processQueue != null && !isDropped() guard: queues not held by this instance
+                # are never committed on its behalf, and are silently skipped (not even a log here).
                 continue
             self._offset_table[mq] = offset
 
@@ -4932,7 +4931,7 @@ class DefaultLitePullConsumer:
     def resume(self, message_queues) -> None:
         self._paused -= set(message_queues)
 
-    # ---------------- topic 队列集合变更监听 ----------------
+    # ---------------- Topic queue set change listeners ----------------
     def register_topic_message_queue_change_listener(
             self, topic: str, listener: TopicMessageQueueChangeListener) -> None:
         pass
@@ -4993,7 +4992,7 @@ class DefaultLitePullConsumer:
 
 
 class SimpleMessageListener(MessageListenerConcurrently):
-    """便捷监听器包装：把消费逻辑转成纯函数。"""
+    """Convenience listener wrapper: turns the consume logic into a pure function."""
 
     def __init__(self, fn: Callable[[List[MessageExt]], ConsumeConcurrentlyStatus]):
         self.fn = fn

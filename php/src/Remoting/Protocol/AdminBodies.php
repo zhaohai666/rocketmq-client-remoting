@@ -8,25 +8,28 @@ use RocketMQ\Common\MessageQueue;
 use RocketMQ\Common\TopicConfig;
 
 /**
- * 管理端专用响应体（协议里的管理类结构）：
+ * Response bodies dedicated to the admin side (the management structures in the protocol):
  *
  * TopicStatsTable / TopicOffset / ConsumeStats / OffsetWrapper /
- * TopicConfigSerializeWrapper / ConsumeQueueData / QueryConsumeQueueResponseBody。
+ * TopicConfigSerializeWrapper / ConsumeQueueData / QueryConsumeQueueResponseBody.
  *
- * ⚠ 关键坑：这几个类的 Map 键是 **MessageQueue**，broker 侧序列化会把键直接内联成 JSON 对象，
- * 产出**非法 JSON**，例如：
+ * ⚠ The key trap: the Map keys of these classes are **MessageQueue**, and the broker-side serializer
+ * inlines the keys directly as JSON objects, producing **illegal JSON**, for example:
  *     {"offsetTable":{{"brokerName":"broker-a","queueId":3,"topic":"MyTopic"}:{...}}}
- * 所以必须用 RemotingSerializable::fastjsonLoads() 解析，再把字符串键还原成 MessageQueue。
- * 字段名与结构均按真机回包实测确认，别凭记忆改。
+ * So they must be parsed with RemotingSerializable::fastjsonLoads(), and then the string keys have to be
+ * restored into MessageQueue. The field names and structures were all confirmed by measuring real
+ * responses — do not change them from memory.
  *
- * PHP 无法用对象做数组键：以 MessageQueue 为键的 map 统一存成
- * ``list<array{mq: MessageQueue, value: mixed}>``，JSON 输出仍用 messageQueueKey() 内联对象键。
+ * PHP cannot use objects as array keys: every map keyed by MessageQueue is stored uniformly as
+ * ``list<array{mq: MessageQueue, value: mixed}>``, while the JSON output still uses messageQueueKey() to
+ * inline the object keys.
  */
 
 /**
- * 把 broker 写出的 MessageQueue 内联对象键还原成 MessageQueue。
+ * Restores the MessageQueue from the MessageQueue inline object key written by the broker.
  *
- * 返回 null 表示这个键不是内联对象（例如 ``"0"``、``"G1"`` 这类普通字符串键）。
+ * Returning null means that this key is not an inline object (for instance an ordinary string key such as
+ * ``"0"`` or ``"G1"``).
  */
 function parse_message_queue_key(string $key): ?MessageQueue
 {
@@ -41,15 +44,15 @@ function parse_message_queue_key(string $key): ?MessageQueue
     );
 }
 
-/** 把 MessageQueue 序列化成 fastjson2 风格的内联对象键（键按字母序）。 */
+/** Serializes a MessageQueue into a fastjson2-style inline object key (the keys in alphabetical order). */
 function message_queue_key(MessageQueue $mq): string
 {
     return sprintf('{"brokerName":"%s","queueId":%d,"topic":"%s"}', $mq->brokerName, $mq->queueId, $mq->topic);
 }
 
 /**
- * 通用：解析以 MessageQueue 为键的 map（fastjson2 非字符串键）。
- * 只有能还原成 MessageQueue 的键才收进来。
+ * Generic: parses a map keyed by MessageQueue (fastjson2 non-string keys).
+ * Only the keys that can be restored into a MessageQueue are taken in.
  *
  * @return list<array{mq: MessageQueue, value: mixed}>
  */
@@ -67,7 +70,7 @@ function decode_message_queue_map(?array $raw): array
 
 // ---------------------------------------------------------------- TopicStatsTable
 
-/** 一个 topic 的最小 / 最大位点。 */
+/** The minimum / maximum offset of one topic. */
 final class TopicOffset
 {
     public function __construct(
@@ -99,9 +102,9 @@ final class TopicOffset
 }
 
 /**
- * topic 的逐队列收发统计表。
+ * The per-queue send/receive statistics table of a topic.
  *
- * 探针输出：{"offsetTable":{<MessageQueue>:{...}},"topicPutTps":0.0}
+ * Probe output: {"offsetTable":{<MessageQueue>:{...}},"topicPutTps":0.0}
  */
 final class TopicStatsTable
 {
@@ -117,7 +120,7 @@ final class TopicStatsTable
             $table[message_queue_key($mq)] = $v->toDict();
         }
         return [
-            // 内联对象键不是合法 JSON，必须走 fastjson 兼容路径
+            // An inline object key is not legal JSON, so the fastjson compatible path is mandatory
             'offsetTable' => (object)$table,
             'topicPutTps' => $this->topicPutTps,
         ];
@@ -148,7 +151,7 @@ final class TopicStatsTable
 
 // ---------------------------------------------------------------- ConsumeStats
 
-/** 单队列的 broker / consumer 位点与最后更新时间。 */
+/** The broker / consumer offsets of a single queue plus the last update time. */
 final class OffsetWrapper
 {
     public function __construct(
@@ -159,7 +162,7 @@ final class OffsetWrapper
     ) {
     }
 
-    /** 滞后量：brokerOffset - consumerOffset。 */
+    /** The lag: brokerOffset - consumerOffset. */
     public function lag(): int
     {
         return $this->brokerOffset - $this->consumerOffset;
@@ -189,9 +192,9 @@ final class OffsetWrapper
 }
 
 /**
- * 消费组的整体消费统计。
+ * The overall consumption statistics of a consumer group.
  *
- * 探针输出：{"consumeTps":1.5,"offsetTable":{<MessageQueue>:<OffsetWrapper>}}
+ * Probe output: {"consumeTps":1.5,"offsetTable":{<MessageQueue>:<OffsetWrapper>}}
  */
 final class ConsumeStats
 {
@@ -247,9 +250,9 @@ final class ConsumeStats
 // ---------------------------------------------------------------- TopicConfigSerializeWrapper
 
 /**
- * broker 上的全量 topic 配置表 + 数据版本。
+ * The full topic configuration table on the broker plus the data version.
  *
- * 探针输出：{"dataVersion":{...},"topicConfigTable":{"Topic":{"attributes":{},...}}}
+ * Probe output: {"dataVersion":{...},"topicConfigTable":{"Topic":{"attributes":{},...}}}
  */
 final class TopicConfigSerializeWrapper
 {
@@ -293,9 +296,9 @@ final class TopicConfigSerializeWrapper
 // ---------------------------------------------------------------- QueryConsumeQueue
 
 /**
- * 一条 ConsumeQueue 记录的原始内容（排障时直接读出来的）。
+ * The raw content of one ConsumeQueue entry (read out directly when troubleshooting).
  *
- * 探针/源码字段：physicOffset, physicSize, tagsCode, extendDataJson, bitMap, eval, msg
+ * Probe / source fields: physicOffset, physicSize, tagsCode, extendDataJson, bitMap, eval, msg
  */
 final class ConsumeQueueData
 {
@@ -320,7 +323,7 @@ final class ConsumeQueueData
             'eval' => $this->eval,
             'bitMap' => $this->bitMap,
         ];
-        // null 字段不序列化：写了 null 键会改变 broker 侧的缺省解释
+        // null fields are not serialized: writing a null key would change how the broker interprets the default
         if ($this->extendDataJson !== null) {
             $d['extendDataJson'] = $this->extendDataJson;
         }
@@ -346,10 +349,10 @@ final class ConsumeQueueData
 }
 
 /**
- * 直接查 ConsumeQueue 的应答内容。
+ * The response content of a direct ConsumeQueue query.
  *
- * 探针输出：{"filterData":"*","maxQueueIndex":88,"minQueueIndex":1,"subscriptionData":{...}}
- * （queueData 为 null 时不出现）
+ * Probe output: {"filterData":"*","maxQueueIndex":88,"minQueueIndex":1,"subscriptionData":{...}}
+ * (queueData does not appear when it is null)
  */
 final class QueryConsumeQueueResponseBody
 {

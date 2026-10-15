@@ -3,10 +3,10 @@
 declare(strict_types=1);
 
 /**
- * Common 层纯 PHP assert 风格自测（不依赖 phpunit）。
+ * Common layer pure PHP assert-style self-test (no phpunit dependency).
  *
- * 运行：C:/Users/zhaoh/.workbuddy/binaries/php/versions/8.3/php.exe tests/RunCommon.php
- * 全部通过输出 "ALL TESTS PASSED (N checks)"，任一失败列出明细并以非零码退出。
+ * Run: php tests/RunCommon.php
+ * On full success prints "ALL TESTS PASSED (N checks)"; any failure lists details and exits non-zero.
  */
 
 require_once __DIR__ . '/../bootstrap.php';
@@ -101,18 +101,18 @@ $T->checkSame(42, UtilAll::wireStringHash('*'), 'wireStringHash *=42');
 $T->checkSame(0, UtilAll::wireStringHash(''), 'wireStringHash ""=0');
 
 $hex = UtilAll::bytes2String("\xde\xad\xbe\xef");
-$T->checkSame('DEADBEEF', $hex, 'bytes2String 大写十六进制');
-$T->checkSame("\xde\xad\xbe\xef", UtilAll::string2Bytes('deadBEEF'), 'string2Bytes 大小写不敏感');
+$T->checkSame('DEADBEEF', $hex, 'bytes2String uppercase hex');
+$T->checkSame("\xde\xad\xbe\xef", UtilAll::string2Bytes('deadBEEF'), 'string2Bytes case-insensitive');
 $T->checkSame(null, UtilAll::string2Bytes(''), 'string2Bytes("")=null');
 $T->checkSame(null, UtilAll::string2Bytes(null), 'string2Bytes(null)=null');
-$T->checkSame(20, strlen(UtilAll::offset2Filename(123)), 'offset2Filename 长度 20');
-$T->checkSame('00000000000000000123', UtilAll::offset2Filename(123), 'offset2Filename 补零');
+$T->checkSame(20, strlen(UtilAll::offset2Filename(123)), 'offset2Filename length 20');
+$T->checkSame('00000000000000000123', UtilAll::offset2Filename(123), 'offset2Filename zero-padded');
 $T->checkSame('-', UtilAll::timeToHumanString(0), 'timeToHumanString(0)="-"');
 $T->check(UtilAll::isBlank(null) && UtilAll::isBlank('  ') && !UtilAll::isBlank('x') && !UtilAll::isNotBlank(' '), 'isBlank/isNotBlank');
 $T->check(UtilAll::isIpv4('10.0.0.1') && !UtilAll::isIpv4('::1') && !UtilAll::isIpv4('999.1.1.1'), 'isIpv4');
-$T->check(UtilAll::crc32('hello') === crc32('hello'), 'crc32 与内置一致');
-$T->check(UtilAll::currentTimeMillis() > 1600000000000, 'currentTimeMillis 毫秒量级');
-$T->checkSame('127.0.0.1', UtilAll::string2UnicodeShift('127.0.0.1', 3), 'string2UnicodeShift 原样返回');
+$T->check(UtilAll::crc32('hello') === crc32('hello'), 'crc32 matches the built-in');
+$T->check(UtilAll::currentTimeMillis() > 1600000000000, 'currentTimeMillis is in milliseconds');
+$T->checkSame('127.0.0.1', UtilAll::string2UnicodeShift('127.0.0.1', 3), 'string2UnicodeShift returns as-is');
 
 // ============================================================ MixAll
 $T->checkSame('%RETRY%G1', MixAll::getRetryTopic('G1'), 'getRetryTopic');
@@ -120,10 +120,10 @@ $T->check(MixAll::isRetryTopic('%RETRY%G1') && !MixAll::isRetryTopic('T'), 'isRe
 $T->checkSame('%DLQ%G1', MixAll::getDlqTopic('G1'), 'getDlqTopic');
 $T->checkSame('T', MixAll::resetRetryAndDlqTopic('%RETRY%T'), 'resetRetryAndDlqTopic retry');
 $T->checkSame('T', MixAll::resetRetryAndDlqTopic('%DLQ%T'), 'resetRetryAndDlqTopic dlq');
-$T->checkSame('T', MixAll::resetRetryAndDlqTopic('T'), 'resetRetryAndDlqTopic 原样');
+$T->checkSame('T', MixAll::resetRetryAndDlqTopic('T'), 'resetRetryAndDlqTopic unchanged');
 $T->checkSame('b1:10909', MixAll::brokerVipChannel(true, 'b1:10911'), 'brokerVipChannel -2');
-$T->checkSame('b1:10911', MixAll::brokerVipChannel(false, 'b1:10911'), 'brokerVipChannel 关闭');
-$T->checkSame('no-port', MixAll::brokerVipChannel(true, 'no-port'), 'brokerVipChannel 无端口原样');
+$T->checkSame('b1:10911', MixAll::brokerVipChannel(false, 'b1:10911'), 'brokerVipChannel off');
+$T->checkSame('no-port', MixAll::brokerVipChannel(true, 'no-port'), 'brokerVipChannel no port unchanged');
 $T->checkSame('cluster_REPLY_TOPIC', MixAll::getReplyTopic('cluster'), 'getReplyTopic');
 $T->check(MixAll::isSysTopic('rmq_sys_x') && !MixAll::isSysTopic('x'), 'isSysTopic');
 $T->check(MixAll::isLmq('%LMQ%t') && !MixAll::isLmq('t'), 'isLmq');
@@ -131,51 +131,51 @@ $T->check(MixAll::isSysConsumerGroup('CID_RMQ_SYS_x') && !MixAll::isSysConsumerG
 $T->check(MixAll::isPredefinedGroup('DEFAULT_CONSUMER') && !MixAll::isPredefinedGroup('G'), 'isPredefinedGroup');
 $T->checkSame('ip@inst@unit', MixAll::buildMqClientId('ip', 'inst', 'unit'), 'buildMqClientId unit');
 $T->checkSame('ip@inst@unit@STREAM', MixAll::buildMqClientId('ip', 'inst', 'unit', true), 'buildMqClientId STREAM');
-$T->checkSame('ip@inst', MixAll::buildMqClientId('ip', 'inst'), 'buildMqClientId 最简');
-$T->check(MixAll::changeInstanceNameToPid('DEFAULT') !== 'DEFAULT', 'changeInstanceNameToPid DEFAULT 会换 pid#nano');
-$T->checkSame('myinst', MixAll::changeInstanceNameToPid('myinst'), 'changeInstanceNameToPid 非 DEFAULT 原样');
+$T->checkSame('ip@inst', MixAll::buildMqClientId('ip', 'inst'), 'buildMqClientId minimal');
+$T->check(MixAll::changeInstanceNameToPid('DEFAULT') !== 'DEFAULT', 'changeInstanceNameToPid DEFAULT swaps in pid#nano');
+$T->checkSame('myinst', MixAll::changeInstanceNameToPid('myinst'), 'changeInstanceNameToPid non-DEFAULT unchanged');
 $T->checkSame('%ns%%inst', MixAll::compareAndIncreaseNamespace('inst', 'ns'), 'compareAndIncreaseNamespace');
-$T->checkSame('%ns%%inst', MixAll::compareAndIncreaseNamespace('%ns%%inst', 'ns'), 'compareAndIncreaseNamespace 幂等');
+$T->checkSame('%ns%%inst', MixAll::compareAndIncreaseNamespace('%ns%%inst', 'ns'), 'compareAndIncreaseNamespace idempotent');
 $T->check(str_starts_with(MixAll::createUniqName('p'), 'p') && strlen(MixAll::createUniqName('p')) === 33, 'createUniqName 32hex');
 
-// properties <-> string 往返（含 null 值跳过与排序）
+// properties <-> string round-trip (null values skipped, ordering)
 $props = ['b' => '2', 'a' => '1', 'c' => null];
-$T->checkSame("b=2\na=1\n", MixAll::properties2String($props), 'properties2String null 值跳过且保持顺序');
-$T->checkSame("a=1\nb=2\n", MixAll::properties2String($props, true), 'properties2String 排序');
+$T->checkSame("b=2\na=1\n", MixAll::properties2String($props), 'properties2String skips null values and keeps order');
+$T->checkSame("a=1\nb=2\n", MixAll::properties2String($props, true), 'properties2String sorted');
 $roundtrip = MixAll::string2Properties(MixAll::properties2String(['k1' => 'v1', 'k2' => 'v 2', 'k3' => 'x=y']));
-$T->checkSame(['k1' => 'v1', 'k2' => 'v 2', 'k3' => 'x=y'], $roundtrip, 'properties 往返');
-// properties 文本解析语义（注释行 / 分隔符 / 续行 / 空白）
-$T->checkSame(['a' => '1', 'b' => '2'], MixAll::string2Properties("# comment\n!bang\na=1\n\nb=2"), '注释行与空行跳过');
-$T->checkSame(['key' => 'va lue'], MixAll::string2Properties("key: va lue"), ': 分隔符');
-$T->checkSame(['key' => 'value'], MixAll::string2Properties("key value"), '空白分隔符');
-$T->checkSame(['a' => '1', 'b' => '2'], MixAll::string2Properties("a=\\\n  1\nb=2"), '行尾反斜杠续行');
-$T->checkSame(['a' => 'tail '], MixAll::string2Properties("a= tail "), '值尾部空白保留');
+$T->checkSame(['k1' => 'v1', 'k2' => 'v 2', 'k3' => 'x=y'], $roundtrip, 'properties round-trip');
+// properties text parsing semantics (comment lines / separators / continuations / whitespace)
+$T->checkSame(['a' => '1', 'b' => '2'], MixAll::string2Properties("# comment\n!bang\na=1\n\nb=2"), 'comment lines and blank lines skipped');
+$T->checkSame(['key' => 'va lue'], MixAll::string2Properties("key: va lue"), ': separator');
+$T->checkSame(['key' => 'value'], MixAll::string2Properties("key value"), 'whitespace separator');
+$T->checkSame(['a' => '1', 'b' => '2'], MixAll::string2Properties("a=\\\n  1\nb=2"), 'trailing-backslash line continuation');
+$T->checkSame(['a' => 'tail '], MixAll::string2Properties("a= tail "), 'trailing whitespace in value kept');
 $T->checkSame([], MixAll::string2Properties(null), 'string2Properties(null)');
 
-// ============================================================ Message / 属性 / 延迟等级
+// ============================================================ Message / properties / delay level
 $msg = new Message('TopicTest', 'body-bytes', 'TagA', 'key-1', 7);
 $T->checkSame('TopicTest', $msg->getTopic(), 'Message topic');
 $T->checkSame('body-bytes', $msg->getBody(), 'Message body');
-$T->checkSame('TagA', $msg->getTags(), 'Message 构造写 TAGS');
-$T->checkSame('key-1', $msg->getKeys(), 'Message 构造写 KEYS');
+$T->checkSame('TagA', $msg->getTags(), 'Message constructor writes TAGS');
+$T->checkSame('key-1', $msg->getKeys(), 'Message constructor writes KEYS');
 $T->checkSame(7, $msg->getFlag(), 'Message flag');
-$T->checkSame('', (new Message('t'))->getBody(), 'Message body 缺省空串');
-$T->checkSame(null, (new Message('t'))->getTags(), 'Message tags 缺省 null');
+$T->checkSame('', (new Message('t'))->getBody(), 'Message body defaults to empty string');
+$T->checkSame(null, (new Message('t'))->getTags(), 'Message tags default to null');
 
 $msg->setDelayTimeLevel(3);
-$T->checkSame('3', $msg->getDelayTimeLevel(), 'delayTimeLevel 存为字符串 "3"');
-$T->checkSame('3', $msg->getProperty(MessageConst::PROPERTY_DELAY_TIME_LEVEL), 'DELAY 属性键');
+$T->checkSame('3', $msg->getDelayTimeLevel(), 'delayTimeLevel stored as string "3"');
+$T->checkSame('3', $msg->getProperty(MessageConst::PROPERTY_DELAY_TIME_LEVEL), 'DELAY property key');
 $msg->setWaitStoreMsgOk(false);
 $T->checkSame('false', $msg->getWaitStoreMsgOk(), 'WAIT=false');
-$T->check(!Message::isWaitStoreMsgOk($msg), 'isWaitStoreMsgOk 显式 false');
-$T->check(Message::isWaitStoreMsgOk(new Message('t')), 'isWaitStoreMsgOk 缺省即 true');
+$T->check(!Message::isWaitStoreMsgOk($msg), 'isWaitStoreMsgOk explicit false');
+$T->check(Message::isWaitStoreMsgOk(new Message('t')), 'isWaitStoreMsgOk defaults to true');
 $msg->setUserProperty('u1', 'v1');
 $T->checkSame('v1', $msg->getUserProperty('u1'), 'userProperty');
 $T->checkSame('v1', $msg->getProperty('u1'), 'getProperty');
 $msg->removeProperty('u1');
 $T->checkSame(null, $msg->getProperty('u1'), 'removeProperty');
 $msg->clearProperty();
-$T->checkSame([], $msg->getProperties(), 'clearProperty 清空');
+$T->checkSame([], $msg->getProperties(), 'clearProperty empties');
 $msg->putProperty('p', '1');
 $T->checkSame('1', $msg->getProperty('p'), 'putProperty');
 $msg->setTransactionId('tid');
@@ -185,46 +185,46 @@ $T->checkSame('tid', $msg->getTransactionId(), 'transactionId');
 $mq = new MessageQueue('TopicTest', 'broker-a', 3);
 $T->checkSame('3', $mq->getQueueIdStr(), 'MessageQueue.getQueueIdStr');
 $T->check($mq->equals(new MessageQueue('TopicTest', 'broker-a', 3)), 'MessageQueue.equals');
-$T->check(!$mq->equals(new MessageQueue('TopicTest', 'broker-a', 4)), 'MessageQueue.equals 不等');
-$T->check(MessageQueue::wrapInt32(0x7FFFFFFF) === 2147483647 && MessageQueue::wrapInt32(0x80000000) === -2147483648, 'wrapInt32 32位回绕');
+$T->check(!$mq->equals(new MessageQueue('TopicTest', 'broker-a', 4)), 'MessageQueue.equals not equal');
+$T->check(MessageQueue::wrapInt32(0x7FFFFFFF) === 2147483647 && MessageQueue::wrapInt32(0x80000000) === -2147483648, 'wrapInt32 32-bit wraparound');
 
 // ============================================================ MessageClientIdSetter
 $u1 = new Message('t');
 MessageClientIdSetter::setUniqId($u1);
 $uniq1 = $u1->getProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX);
-$T->check(is_string($uniq1) && strlen($uniq1) === 32, 'uniqId 为 32 位十六进制');
-$T->checkSame($uniq1, MessageClientIdSetter::getUniqId($u1), 'set/get uniqId 一致');
+$T->check(is_string($uniq1) && strlen($uniq1) === 32, 'uniqId is 32 hex chars');
+$T->checkSame($uniq1, MessageClientIdSetter::getUniqId($u1), 'set/get uniqId consistent');
 $u2 = new Message('t');
 MessageClientIdSetter::setUniqId($u2);
-MessageClientIdSetter::setUniqId($u2); // 幂等：已有则不覆盖
+MessageClientIdSetter::setUniqId($u2); // idempotent: existing value is not overwritten
 $uniq2 = $u2->getProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX);
-$T->check($uniq1 !== $uniq2, '两次生成的 uniqId 互不相同（唯一性）');
+$T->check($uniq1 !== $uniq2, 'two generated uniqIds differ (uniqueness)');
 MessageClientIdSetter::setUniqId($u2);
-$T->checkSame($uniq2, $u2->getProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX), 'setUniqId 已存在不覆盖');
+$T->checkSame($uniq2, $u2->getProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX), 'setUniqId does not overwrite an existing value');
 $T->checkSame(null, MessageClientIdSetter::getUniqId(null), 'getUniqId(null)');
-MessageClientIdSetter::setUniqId(null); // 不应抛异常
-$T->checkSame(32, strlen(InnerIdGenerator::createUniqId()), 'InnerIdGenerator 直接生成 32 位');
-$T->check(ctype_xdigit(MessageClientIdSetter::createUniqId()), 'uniqId 全为十六进制字符');
+MessageClientIdSetter::setUniqId(null); // must not throw
+$T->checkSame(32, strlen(InnerIdGenerator::createUniqId()), 'InnerIdGenerator generates 32 chars directly');
+$T->check(ctype_xdigit(MessageClientIdSetter::createUniqId()), 'uniqId is all hex characters');
 
-// ============================================================ MessageDecoder：msgId 编码往返
+// ============================================================ MessageDecoder: msgId encode/decode round-trip
 $addrBytes = inet_pton('192.168.1.10') . pack('N', 10911);
 $offset = 123456789;
 $msgId = MessageDecoder::createMessageId($addrBytes, $offset);
-$T->checkSame('C0A8010A00002A9F' . sprintf('%016X', $offset), $msgId, 'createMessageId 32 位十六进制');
+$T->checkSame('C0A8010A00002A9F' . sprintf('%016X', $offset), $msgId, 'createMessageId 32 hex chars');
 [$ip, $port, $off] = MessageDecoder::decodeMessageId($msgId);
 $T->checkSame('192.168.1.10', $ip, 'decodeMessageId ip');
 $T->checkSame(10911, $port, 'decodeMessageId port');
 $T->checkSame(123456789, $off, 'decodeMessageId offset');
 
-// UtilAll HEX 往返
-$T->checkSame('DEADBEEF0102', UtilAll::bytes2String(UtilAll::string2Bytes('deadbeef0102')), 'UtilAll hex 往返');
+// UtilAll HEX round-trip
+$T->checkSame('DEADBEEF0102', UtilAll::bytes2String(UtilAll::string2Bytes('deadbeef0102')), 'UtilAll hex round-trip');
 
-// 属性串 <-> map
+// property string <-> map
 $T->checkSame(['A' => '1', 'B' => '2'], MessageDecoder::string2MessageProperties("A\x011\x02B\x012\x02"), 'string2MessageProperties');
 $T->checkSame("A\x011\x02B\x012\x02", MessageDecoder::messageProperties2String(['A' => '1', 'B' => '2']), 'messageProperties2String');
-$T->checkSame([], MessageDecoder::string2MessageProperties(''), '空属性串 -> 空 map');
+$T->checkSame([], MessageDecoder::string2MessageProperties(''), 'empty property string -> empty map');
 
-// 17 段格式：encodeMessageExt -> decodeMessage 全字段往返
+// 17-segment format: encodeMessageExt -> decodeMessage full-field round-trip
 $ext = new MessageExt('TopicTest', 'hello world', 'TagA', 'k1');
 $ext->setQueueId(2);
 $ext->setQueueOffset(1000);
@@ -245,7 +245,7 @@ MessageAccessor::putProperty($ext, 'user.key', 'user.value');
 
 $encoded = MessageDecoder::encodeMessageExt($ext);
 $decoded = MessageDecoder::decodeMessage($encoded);
-$T->check($decoded !== null, 'decodeMessage 返回非 null');
+$T->check($decoded !== null, 'decodeMessage returns non-null');
 if ($decoded !== null) {
     $T->checkSame('TopicTest', $decoded->getTopic(), 'decode topic');
     $T->checkSame('hello world', $decoded->getBody(), 'decode body');
@@ -261,72 +261,72 @@ if ($decoded !== null) {
     $T->checkSame('10.0.0.3', $decoded->getStoreHost(), 'decode storeHost');
     $T->checkSame(1, $decoded->getReconsumeTimes(), 'decode reconsumeTimes');
     $T->checkSame(9, $decoded->getFlag(), 'decode flag');
-    $T->checkSame('user.value', $decoded->getUserProperty('user.key'), 'decode 用户属性');
-    // msgId = storeHost(ip+port) + commitLogOffset，且 isClient 时 offsetMsgId 与之相等
+    $T->checkSame('user.value', $decoded->getUserProperty('user.key'), 'decode user property');
+    // msgId = storeHost(ip+port) + commitLogOffset, and with isClient the offsetMsgId equals it
     $expectedMsgId = MessageDecoder::createMessageId(inet_pton('10.0.0.3') . pack('N', 10911), 77777);
     $T->checkSame($expectedMsgId, $decoded->getMsgId(), 'decode msgId = storeHost+offset');
-    $T->checkSame($expectedMsgId, $decoded->getOffsetMsgId(), 'offsetMsgId 与 msgId 相同（isClient）');
+    $T->checkSame($expectedMsgId, $decoded->getOffsetMsgId(), 'offsetMsgId equals msgId (isClient)');
     [$dip, $dport, $doff] = MessageDecoder::decodeMessageId((string) $decoded->getMsgId());
-    $T->checkSame(['10.0.0.3', 10911, 77777], [$dip, $dport, $doff], 'offsetMsgId parseAddr/parseOffset 往返');
-    $T->checkSame(3668123815, MessageDecoder::crc32($decoded->getBody()) === $decoded->getBodyCrc() ? 3668123815 : 0, 'bodyCrc 校验一致');
+    $T->checkSame(['10.0.0.3', 10911, 77777], [$dip, $dport, $doff], 'offsetMsgId parseAddr/parseOffset round-trip');
+    $T->checkSame(3668123815, MessageDecoder::crc32($decoded->getBody()) === $decoded->getBodyCrc() ? 3668123815 : 0, 'bodyCrc verifies consistent');
 }
 
-// 未知魔数 -> null（decode 返回 null 语义）
+// Unknown magic -> null (decode-returns-null semantics)
 $bad = $encoded;
 $bad[5] = "\x00";
-$T->checkSame(null, MessageDecoder::decodeMessage($bad), '未知魔数 decode 返回 null');
+$T->checkSame(null, MessageDecoder::decodeMessage($bad), 'unknown magic decodes to null');
 
-// 截断缓冲 -> null（异常吞掉返回 null）
-$T->checkSame(null, MessageDecoder::decodeMessage(substr($encoded, 0, 30)), '截断输入 decode 返回 null');
+// Truncated buffer -> null (exception swallowed, returns null)
+$T->checkSame(null, MessageDecoder::decodeMessage(substr($encoded, 0, 30)), 'truncated input decodes to null');
 
-// readBody=false -> body 为 null
-$T->checkSame(null, MessageDecoder::decodeMessage($encoded, readBody: false)?->getBody(), 'readBody=false body 为 null');
+// readBody=false -> body is null
+$T->checkSame(null, MessageDecoder::decodeMessage($encoded, readBody: false)?->getBody(), 'readBody=false yields null body');
 
-// 6 段轻量格式：批量
+// 6-segment lightweight format: batch
 $bmsgs = [new Message('T', 'b1', 'TagA'), new Message('T', 'b2', null, 'k2')];
 $bmsgs[0]->setFlag(3);
 $batchBody = MessageDecoder::encodeMessages($bmsgs);
 $roundtripMsgs = MessageDecoder::decodeBatchMessages($batchBody);
-$T->checkSame(2, count($roundtripMsgs), 'decodeBatchMessages 条数');
-$T->checkSame('b1', $roundtripMsgs[0]->getBody() ?? null, '批量第一条 body');
-$T->checkSame('TagA', $roundtripMsgs[0]->getTags(), '批量第一条 TAGS');
-$T->checkSame(3, $roundtripMsgs[0]->getFlag(), '批量第一条 flag');
-$T->checkSame('k2', $roundtripMsgs[1]->getKeys(), '批量第二条 KEYS');
+$T->checkSame(2, count($roundtripMsgs), 'decodeBatchMessages count');
+$T->checkSame('b1', $roundtripMsgs[0]->getBody() ?? null, 'batch first message body');
+$T->checkSame('TagA', $roundtripMsgs[0]->getTags(), 'batch first message TAGS');
+$T->checkSame(3, $roundtripMsgs[0]->getFlag(), 'batch first message flag');
+$T->checkSame('k2', $roundtripMsgs[1]->getKeys(), 'batch second message KEYS');
 $T->checkSame(2, MessageDecoder::countInnerMsgNum($batchBody), 'countInnerMsgNum');
 
 // MessageBatch.generateFromList
 $batch = MessageBatch::generateFromList($bmsgs);
-$T->checkSame('T', $batch->getTopic(), 'MessageBatch topic 取第一条');
-$T->check(MessageBatch::isWaitStoreMsgOk($batch), 'MessageBatch WAIT 缺省即 true');
-$T->checkSame($batchBody, $batch->getBody(), 'MessageBatch body 即 encodeMessages 结果');
+$T->checkSame('T', $batch->getTopic(), 'MessageBatch topic takes the first message');
+$T->check(MessageBatch::isWaitStoreMsgOk($batch), 'MessageBatch WAIT defaults to true');
+$T->checkSame($batchBody, $batch->getBody(), 'MessageBatch body is the encodeMessages result');
 $T->checkThrows(
     static fn () => MessageBatch::generateFromList([new Message('%RETRY%G'), new Message('%RETRY%G')]),
     \InvalidArgumentException::class,
-    '批量不支持重试 topic'
+    'batch rejects retry topics'
 );
 $T->checkThrows(
     static fn () => MessageBatch::generateFromList([]),
     \InvalidArgumentException::class,
-    '批量不允许为空'
+    'batch rejects an empty list'
 );
 $delayed = new Message('T');
 $delayed->setDelayTimeLevel(1);
 $T->checkThrows(
     static fn () => MessageBatch::generateFromList([$delayed]),
     \InvalidArgumentException::class,
-    '批量不允许延时消息'
+    'batch rejects delayed messages'
 );
 
-// zlib 压缩路径：类型位 0 按老版本语义归一化为 ZLIB
+// zlib compression path: type bits 0 normalized to ZLIB per the legacy semantics
 $compressed = MessageDecoder::decompressBody(gzcompress('payload-data'), 0);
 $T->checkSame('payload-data', $compressed, 'normalizeCompressionType 0 -> ZLIB');
-$T->checkSame('xyz', MessageDecoder::decompressBody(gzcompress('xyz'), MessageSysFlag::ZLIB_TYPE), 'ZLIB 解压');
+$T->checkSame('xyz', MessageDecoder::decompressBody(gzcompress('xyz'), MessageSysFlag::ZLIB_TYPE), 'ZLIB decompression');
 $T->checkThrows(
     static fn () => MessageDecoder::decompressBody('x', 5),
     \RuntimeException::class,
-    '未知压缩类型抛 RuntimeException'
+    'unknown compression type throws RuntimeException'
 );
-// 压缩消息 decode：sysFlag 置 COMPRESSED + ZLIB 类型位
+// Compressed-message decode: sysFlag carries COMPRESSED + ZLIB type bits
 $cext = new MessageExt('TopicC', 'plain', 'TagC');
 $cext->setSysFlag(MessageSysFlag::setCompressionType(
     MessageSysFlag::COMPRESSED_FLAG,
@@ -334,130 +334,134 @@ $cext->setSysFlag(MessageSysFlag::setCompressionType(
 ));
 $cenc = MessageDecoder::encodeMessageExt($cext, true);
 $cdec = MessageDecoder::decodeMessage($cenc);
-$T->check($cdec !== null && $cdec->getBody() === 'plain', '压缩消息解码还原正文');
-$T->check($cdec !== null && MessageSysFlag::isCompressed($cdec->getSysFlag()) === false, '解码后清掉 COMPRESSED_FLAG');
+$T->check($cdec !== null && $cdec->getBody() === 'plain', 'compressed message decodes back to the original body');
+$T->check($cdec !== null && MessageSysFlag::isCompressed($cdec->getSysFlag()) === false, 'COMPRESSED_FLAG cleared after decode');
 
-// LZ4 Frame（标准 LZ4 Frame 规范；block 层是它的内部）：
-// xxhash32 标准向量锚定 + 外部标准 LZ4 实现产出的完整帧 + Frame 往返 + 重叠 match
-$T->checkSame(0x02CC5D05, CompressionCodec::xxh32(''), 'xxh32("") 官方向量');
-$T->checkSame(0x32D153FF, CompressionCodec::xxh32('abc'), 'xxh32("abc") 官方向量');
-// 外部标准 LZ4 Frame 实现产出的帧（解压锚点；HC=xxh32(header)>>8 的第二字节）：
-//   'abc' → magic|FLG=0x68|BD=0x40|C.Size=3|HC=0x87|raw块(0x80000003)|'abc'|EndMark
+// LZ4 Frame (standard LZ4 Frame spec; the block layer is its inner layer):
+// xxhash32 official-vector anchoring + complete frames produced by an external standard
+// LZ4 implementation + Frame round-trips + overlapping matches
+$T->checkSame(0x02CC5D05, CompressionCodec::xxh32(''), 'xxh32("") official vector');
+$T->checkSame(0x32D153FF, CompressionCodec::xxh32('abc'), 'xxh32("abc") official vector');
+// Frames produced by an external standard LZ4 Frame implementation (decompression anchor;
+// HC is byte two of xxh32(header)>>8):
+//   'abc' => magic|FLG=0x68|BD=0x40|C.Size=3|HC=0x87|raw block(0x80000003)|'abc'|EndMark
 $lz4framePy = hex2bin('04224d1868400300000000000000870300008061626300000000');
-$T->checkSame('abc', CompressionCodec::lz4DecompressFrame($lz4framePy), 'LZ4 Frame 外部实现产帧解压');
-// 'hello world '×40：compressed 块（裸 block 形状，同输入的确定性编码）
+$T->checkSame('abc', CompressionCodec::lz4DecompressFrame($lz4framePy), 'LZ4 Frame from external implementation decompresses');
+// 'hello world ' x40: compressed block (bare block shape, deterministic encoding of the same input)
 $lz4framePy2 = hex2bin('04224d186840e0010000000000009b17000000cf68656c6c6f20776f726c64200c00ffbd506f726c642000000000');
-$T->checkSame(str_repeat('hello world ', 40), CompressionCodec::lz4DecompressBlock(hex2bin('cf68656c6c6f20776f726c64200c00ffbd506f726c6420')), 'LZ4 裸 block 长串解压');
-$T->checkSame(str_repeat('hello world ', 40), CompressionCodec::lz4DecompressFrame($lz4framePy2), 'LZ4 Frame 外部实现长串帧解压');
-// Frame 往返（含 >64KB 多块、RLE、raw 块兜底）
+$T->checkSame(str_repeat('hello world ', 40), CompressionCodec::lz4DecompressBlock(hex2bin('cf68656c6c6f20776f726c64200c00ffbd506f726c6420')), 'LZ4 bare block long-string decompression');
+$T->checkSame(str_repeat('hello world ', 40), CompressionCodec::lz4DecompressFrame($lz4framePy2), 'LZ4 Frame long string from external implementation decompresses');
+// Frame round-trips (covering >64KB multi-block, RLE, raw-block fallback)
 $lz4FrameSamples = [
     '', 'a', 'abcabcabcabc',
     str_repeat('hello world ', 40),
-    str_repeat('x', 300000),                       // RLE 型，块压缩得动
-    str_repeat('0123456789', 8192) . 'tail',       // 80KB+ → 多块
+    str_repeat('x', 300000),                       // RLE-shaped, block compression handles it
+    str_repeat('0123456789', 8192) . 'tail',       // 80KB+ => multi-block
 ];
 foreach ($lz4FrameSamples as $idx => $sample) {
     $enc = CompressionCodec::lz4CompressFrame($sample);
-    $T->checkSame($sample, CompressionCodec::lz4DecompressFrame($enc), "LZ4 Frame 往返 #$idx (len=" . strlen($sample) . ')');
+    $T->checkSame($sample, CompressionCodec::lz4DecompressFrame($enc), "LZ4 Frame round-trip #$idx (len=" . strlen($sample) . ')');
 }
-// 坏 HC 必须抛（防止把别的字节流误当 LZ4 Frame 解）
+// Bad HC must throw (prevents misreading other byte streams as an LZ4 Frame)
 $T->checkThrows(
     static fn () => CompressionCodec::lz4DecompressFrame(hex2bin('04224d1868400300000000000000880300008061626300000000')),
     \RuntimeException::class,
-    'LZ4 Frame 坏 HC 抛异常'
+    'LZ4 Frame bad HC throws'
 );
 $lz4samples = [
     '',
     'a',
     'ab',
     str_repeat('hello world ', 40),
-    str_repeat('x', 300000),            // 长 RLE（跨多段字面量扩展）
-    str_repeat('0123456789', 8192) . uniqid('', true), // 高重复 + 唯一尾巴
+    str_repeat('x', 300000),            // long RLE (spanning multiple literal-run expansions)
+    str_repeat('0123456789', 8192) . uniqid('', true), // high repetition + unique tail
     random_bytes_wellknown(),
 ];
-/** 确定性伪随机（避免 random_bytes 逐次变化） */
+/** Deterministic pseudo-random (avoids random_bytes changing each call) */
 function random_bytes_wellknown(): string
 {
     $out = '';
     $s = 12345;
     for ($i = 0; $i < 100000; $i++) {
         $s = ($s * 1103515245 + 12345) & 0x7FFFFFFF;
-        $out .= chr(0x20 + ($s % 96)); // 可打印域，制造可匹配的重复
+        $out .= chr(0x20 + ($s % 96)); // printable range, creating matchable repetition
     }
     return $out;
 }
 foreach ($lz4samples as $idx => $sample) {
     $enc = CompressionCodec::lz4CompressBlock($sample);
-    $T->checkSame($sample, CompressionCodec::lz4DecompressBlock($enc), "LZ4 往返 #$idx (len=" . strlen($sample) . ')');
+    $T->checkSame($sample, CompressionCodec::lz4DecompressBlock($enc), "LZ4 round-trip #$idx (len=" . strlen($sample) . ')');
 }
-// 重叠 match（off < matchLen，LZ4 的经典 RLE 场景）：解压必须逐字节拷贝
-// token 0x1F: litLen=1 'A'，off=1，ml 位=15+扩展 0 → matchLen=19
+// Overlapping match (off < matchLen, LZ4's classic RLE scenario): decompression must copy byte by byte
+// token 0x1F: litLen=1 'A', off=1, ml bits=15+extension 0 => matchLen=19
 $overlap = CompressionCodec::lz4DecompressBlock(hex2bin('1F4101000'. '0'));
-$T->checkSame(str_repeat('A', 20), $overlap, 'LZ4 重叠 match 解压');
+$T->checkSame(str_repeat('A', 20), $overlap, 'LZ4 overlapping match decompression');
 $T->checkThrows(
     static fn () => CompressionCodec::lz4DecompressBlock(hex2bin('306162630000')),
     \RuntimeException::class,
-    'LZ4 零偏移抛异常'
+    'LZ4 zero offset throws'
 );
 
-// ZSTD Raw/RLE 帧：一个完整的标准小帧（magic/帧头/RAW 块）+ 往返 + RLE
+// ZSTD Raw/RLE frames: one complete standard small frame (magic/header/RAW block) + round-trip + RLE
 $zstdNode = hex2bin('28b52ffde01600000000000000b100007a7374642d7261772d6672616d652d7061796c6f6164');
-$T->checkSame('zstd-raw-frame-payload', CompressionCodec::zstdDecompressFrame($zstdNode), 'ZSTD 标准帧解压');
-$T->checkSame($zstdNode, CompressionCodec::zstdCompressRaw('zstd-raw-frame-payload'), 'ZSTD 压缩逐字节 = 固定向量');
-$zstdRle = CompressionCodec::zstdCompressRaw(str_repeat('Z', 500000)); // 500KB 全 Z → RLE 块
-$T->check(strlen($zstdRle) < 5000, 'ZSTD RLE 大跑长压缩有效');
-$T->checkSame(str_repeat('Z', 500000), CompressionCodec::zstdDecompressFrame($zstdRle), 'ZSTD RLE 往返');
-$zstdBig = CompressionCodec::zstdCompressRaw(str_repeat('chunk-', 60000)); // >128KB → 多 Raw 块
-$T->checkSame(str_repeat('chunk-', 60000), CompressionCodec::zstdDecompressFrame($zstdBig), 'ZSTD 多块帧往返');
-// Compressed 块（type=2）：显式抛，绝不把压缩流当正文透传
-// magic + 帧头(FCS=8B) + 块头 04 00 00（last=0, type=2=Compressed, size=0）
+$T->checkSame('zstd-raw-frame-payload', CompressionCodec::zstdDecompressFrame($zstdNode), 'ZSTD standard frame decompression');
+$T->checkSame($zstdNode, CompressionCodec::zstdCompressRaw('zstd-raw-frame-payload'), 'ZSTD compression byte-for-byte = fixed vector');
+$zstdRle = CompressionCodec::zstdCompressRaw(str_repeat('Z', 500000)); // 500KB of all Z => RLE block
+$T->check(strlen($zstdRle) < 5000, 'ZSTD RLE compresses long runs effectively');
+$T->checkSame(str_repeat('Z', 500000), CompressionCodec::zstdDecompressFrame($zstdRle), 'ZSTD RLE round-trip');
+$zstdBig = CompressionCodec::zstdCompressRaw(str_repeat('chunk-', 60000)); // >128KB => multiple Raw blocks
+$T->checkSame(str_repeat('chunk-', 60000), CompressionCodec::zstdDecompressFrame($zstdBig), 'ZSTD multi-block frame round-trip');
+// Compressed block (type=2): throws explicitly, never passes a compressed stream through as body
+// magic + header(FCS=8B) + block header 04 00 00 (last=0, type=2=Compressed, size=0)
 $compFrame = pack('V', 0xFD2FB528) . chr(0xE0) . pack('P', 0) . chr(0x04) . chr(0x00) . chr(0x00) . "\x01\x02";
 $T->checkThrows(
     static fn () => CompressionCodec::zstdDecompressFrame($compFrame),
     \RuntimeException::class,
-    'ZSTD Compressed 块抛异常'
+    'ZSTD Compressed block throws'
 );
 
-// MessageDecoder 接线：LZ4/ZSTD 经公开入口 decompressBody 可解；Producer 侧 compressBody 同源
+// MessageDecoder wiring: LZ4/ZSTD decompress via the public decompressBody entry; Producer-side compressBody shares the source
 $T->checkSame('via-decoder', MessageDecoder::decompressBody(
     CompressionCodec::lz4CompressFrame('via-decoder'),
     MessageSysFlag::LZ4_TYPE
-), 'MessageDecoder LZ4 分支');
+), 'MessageDecoder LZ4 branch');
 $T->checkSame('via-decoder', MessageDecoder::decompressBody(
     CompressionCodec::zstdCompressRaw('via-decoder'),
     MessageSysFlag::ZSTD_TYPE
-), 'MessageDecoder ZSTD 分支');
+), 'MessageDecoder ZSTD branch');
 
-// ZSTD 统一入口（CLI 优先 / Raw 兜底）：有 zstd CLI 时验证真压缩路径——
-// 压缩率真实生效 + 能解回外部 zstd CLI 压出的 Compressed 帧。
+// ZSTD unified entry (CLI first / Raw fallback): with a zstd CLI present, verify the real
+// compression path -- the ratio is genuinely effective + it can decode Compressed frames
+// produced by the external zstd CLI.
 if (trim((string) @shell_exec('command -v zstd 2>/dev/null')) !== '') {
-    $payload = str_repeat('zstd-cli-roundtrip-payload-', 4000); // ~108KB 可压文本
+    $payload = str_repeat('zstd-cli-roundtrip-payload-', 4000); // ~108KB compressible text
     $cliComp = CompressionCodec::zstdCompress($payload);
-    $T->check(strlen($cliComp) < strlen($payload) / 10, 'ZSTD CLI 真压缩率生效（<10% 原文）');
-    $T->checkSame($payload, CompressionCodec::zstdDecompress($cliComp), 'ZSTD CLI 往返');
-    // 真 CLI 压缩帧里是 Compressed 块 —— zstdDecompressFrame（纯实现）必须拒绝它，
-    // 证明「Compressed 块只经由 CLI 通道解，纯实现不静默透传」的分层成立。
+    $T->check(strlen($cliComp) < strlen($payload) / 10, 'ZSTD CLI achieves real compression (<10% of original)');
+    $T->checkSame($payload, CompressionCodec::zstdDecompress($cliComp), 'ZSTD CLI round-trip');
+    // A real CLI-compressed frame contains Compressed blocks -- zstdDecompressFrame (the pure
+    // implementation) must reject it, proving the layering holds: "Compressed blocks are only
+    // decoded via the CLI channel; the pure implementation does not silently pass them through."
     $T->checkThrows(
         static fn () => CompressionCodec::zstdDecompressFrame($cliComp),
         \RuntimeException::class,
-        'ZSTD CLI 帧（Compressed 块）纯实现拒绝'
+        'ZSTD CLI frame (Compressed block) rejected by the pure implementation'
     );
     $T->checkSame('via-decoder', MessageDecoder::decompressBody(
         CompressionCodec::zstdCompress('via-decoder'),
         MessageSysFlag::ZSTD_TYPE
-    ), 'MessageDecoder ZSTD CLI 分支');
+    ), 'MessageDecoder ZSTD CLI branch');
 } else {
-    // 无 CLI 兜底：zstdCompress 必须等于纯 Raw 实现
+    // No-CLI fallback: zstdCompress must equal the pure Raw implementation
     $T->checkSame(
         CompressionCodec::zstdCompressRaw('no-cli'),
         CompressionCodec::zstdCompress('no-cli'),
-        'ZSTD 无 CLI 时回退 Raw 帧'
+        'ZSTD falls back to Raw frames without a CLI'
     );
 }
 
-// ============================================================ SysFlag 位运算
+// ============================================================ SysFlag bit operations
 $T->checkSame(3, MessageSysFlag::getCompressionType(MessageSysFlag::setCompressionType(0, 3)), 'get/setCompressionType');
-$T->checkSame(0, MessageSysFlag::getCompressionType(0x1234 & ~MessageSysFlag::COMPRESSION_TYPE_COMPARATOR), '压缩类型掩码清零');
+$T->checkSame(0, MessageSysFlag::getCompressionType(0x1234 & ~MessageSysFlag::COMPRESSION_TYPE_COMPARATOR), 'compression type mask cleared');
 $T->check(MessageSysFlag::isCompressed(0x1) && !MessageSysFlag::isCompressed(0x2), 'isCompressed');
 $T->checkSame(0x0, MessageSysFlag::clearCompressedFlag(0x1), 'clearCompressedFlag');
 $T->checkSame(MessageSysFlag::TRANSACTION_COMMIT_TYPE, MessageSysFlag::getTransactionValue(MessageSysFlag::TRANSACTION_COMMIT_TYPE), 'getTransactionValue commit');
@@ -465,51 +469,51 @@ $T->checkSame(MessageSysFlag::TRANSACTION_ROLLBACK_TYPE, MessageSysFlag::getTran
 $T->checkSame(MessageSysFlag::TRANSACTION_PREPARED_TYPE, MessageSysFlag::resetTransactionValue(0, MessageSysFlag::TRANSACTION_PREPARED_TYPE), 'resetTransactionValue');
 $T->check(MessageSysFlag::check(MessageSysFlag::BORNHOST_V6_FLAG, MessageSysFlag::BORNHOST_V6_FLAG), 'MessageSysFlag.check');
 $T->checkSame(0b1011, PullSysFlag::buildSysFlag(true, true, false, true), 'PullSysFlag.buildSysFlag');
-$T->check(PullSysFlag::hasCommitOffsetFlag(1) && !PullSysFlag::hasSuspendFlag(1), 'PullSysFlag has 标志');
+$T->check(PullSysFlag::hasCommitOffsetFlag(1) && !PullSysFlag::hasSuspendFlag(1), 'PullSysFlag has flags');
 $T->checkSame(2, PullSysFlag::clearCommitOffsetFlag(3), 'PullSysFlag.clearCommitOffsetFlag');
 $T->checkSame(6, PullSysFlag::buildSysFlagWithSubscription(2), 'buildSysFlagWithSubscription');
 $T->checkSame('RW-', PermName::permToString(PermName::PERM_READ | PermName::PERM_WRITE), 'permToString(6)="RW-"');
 $T->checkSame('R-X', PermName::permToString(PermName::PERM_READ | PermName::PERM_INHERIT), 'permToString(5)="R-X"');
 $T->check(PermName::isValid(6) && !PermName::isValid(8), 'PermName.isValid');
 $T->check(PermName::checkPerm(6, 4), 'checkPerm');
-$T->checkThrows(static fn () => PermName::isValid('abc'), \ValueError::class, 'isValid(非数字) 抛 ValueError');
+$T->checkThrows(static fn () => PermName::isValid('abc'), \ValueError::class, 'isValid(non-numeric) throws ValueError');
 
-// ============================================================ TopicValidator 白名单
-$T->check(!TopicValidator::isTopicOrGroupIllegal('TestTopic_123'), '合法 topic 名');
-$T->check(TopicValidator::isTopicOrGroupIllegal('bad topic'), '含空格非法');
-$T->check(TopicValidator::isTopicOrGroupIllegal('topic!'), '含 ! 非法');
-$T->check(TopicValidator::isTopicOrGroupIllegal('主题'), '非 ASCII 非法');
-$T->check(!TopicValidator::isTopicOrGroupIllegal('%RETRY%x_-|'), '白名单含 % - _ |');
-$T->check(!TopicValidator::isTopicOrGroupIllegal(''), '空串返回 false（交给 isBlank）');
-$T->check(TopicValidator::isSystemTopic('rmq_sys_TRACE_DATA'), 'isSystemTopic 前缀命中');
-$T->check(TopicValidator::isSystemTopic('TBW102'), 'isSystemTopic 集合命中');
-$T->check(TopicValidator::isSystemTopic('RMQ_SYS_TRANS_HALF_TOPIC'), 'isSystemTopic 集合命中 2');
-$T->check(!TopicValidator::isSystemTopic('MyTopic'), 'isSystemTopic 普通名不命中');
-$T->check(TopicValidator::isNotAllowedSendTopic('SCHEDULE_TOPIC_XXXX'), 'isNotAllowedSendTopic 命中');
-$T->check(!TopicValidator::isNotAllowedSendTopic('TBW102'), 'TBW102 允许发送');
+// ============================================================ TopicValidator whitelist
+$T->check(!TopicValidator::isTopicOrGroupIllegal('TestTopic_123'), 'legal topic name');
+$T->check(TopicValidator::isTopicOrGroupIllegal('bad topic'), 'space makes it illegal');
+$T->check(TopicValidator::isTopicOrGroupIllegal('topic!'), '! makes it illegal');
+$T->check(TopicValidator::isTopicOrGroupIllegal('主题'), 'non-ASCII is illegal');
+$T->check(!TopicValidator::isTopicOrGroupIllegal('%RETRY%x_-|'), 'whitelist includes % - _ |');
+$T->check(!TopicValidator::isTopicOrGroupIllegal(''), 'empty string returns false (left to isBlank)');
+$T->check(TopicValidator::isSystemTopic('rmq_sys_TRACE_DATA'), 'isSystemTopic prefix hit');
+$T->check(TopicValidator::isSystemTopic('TBW102'), 'isSystemTopic set hit');
+$T->check(TopicValidator::isSystemTopic('RMQ_SYS_TRANS_HALF_TOPIC'), 'isSystemTopic set hit 2');
+$T->check(!TopicValidator::isSystemTopic('MyTopic'), 'isSystemTopic ordinary name no hit');
+$T->check(TopicValidator::isNotAllowedSendTopic('SCHEDULE_TOPIC_XXXX'), 'isNotAllowedSendTopic hit');
+$T->check(!TopicValidator::isNotAllowedSendTopic('TBW102'), 'TBW102 is allowed to send');
 $T->checkSame(127, TopicValidator::TOPIC_MAX_LENGTH, 'TOPIC_MAX_LENGTH=127');
 $T->checkSame(120, TopicValidator::GROUP_MAX_LENGTH, 'GROUP_MAX_LENGTH=120');
 
-// ============================================================ TopicConfig JSON 往返
+// ============================================================ TopicConfig JSON round-trip
 $tc = new TopicConfig('DemoTopic');
-$T->checkSame(16, $tc->readQueueNums, 'TopicConfig 默认 readQueueNums=16');
-$T->checkSame(16, $tc->writeQueueNums, 'TopicConfig 默认 writeQueueNums=16');
-$T->checkSame(6, $tc->perm, 'TopicConfig 默认 perm=6');
-$T->checkSame(TopicFilterType::SINGLE_TAG, $tc->topicFilterType, 'TopicConfig 默认 SINGLE_TAG');
-$T->checkSame(false, $tc->order, 'TopicConfig 默认 order=false');
-$T->checkSame([], $tc->attributes, 'TopicConfig 默认 attributes={}');
+$T->checkSame(16, $tc->readQueueNums, 'TopicConfig defaults readQueueNums=16');
+$T->checkSame(16, $tc->writeQueueNums, 'TopicConfig defaults writeQueueNums=16');
+$T->checkSame(6, $tc->perm, 'TopicConfig defaults perm=6');
+$T->checkSame(TopicFilterType::SINGLE_TAG, $tc->topicFilterType, 'TopicConfig defaults SINGLE_TAG');
+$T->checkSame(false, $tc->order, 'TopicConfig defaults order=false');
+$T->checkSame([], $tc->attributes, 'TopicConfig defaults attributes={}');
 
 $tc->attributes = ['key1' => 'value1'];
 $json = $tc->encode();
 $tc2 = TopicConfig::decode($json);
-$T->checkSame('DemoTopic', $tc2->topicName, 'TopicConfig JSON 往返 topicName');
-$T->checkSame(16, $tc2->readQueueNums, 'TopicConfig JSON 往返 readQueueNums');
-$T->checkSame(6, $tc2->perm, 'TopicConfig JSON 往返 perm');
-$T->checkSame(['key1' => 'value1'], $tc2->attributes, 'TopicConfig JSON 往返 attributes（会序列化）');
-$T->checkSame(false, $tc2->order, 'TopicConfig JSON 往返 order');
+$T->checkSame('DemoTopic', $tc2->topicName, 'TopicConfig JSON round-trip topicName');
+$T->checkSame(16, $tc2->readQueueNums, 'TopicConfig JSON round-trip readQueueNums');
+$T->checkSame(6, $tc2->perm, 'TopicConfig JSON round-trip perm');
+$T->checkSame(['key1' => 'value1'], $tc2->attributes, 'TopicConfig JSON round-trip attributes (serialized)');
+$T->checkSame(false, $tc2->order, 'TopicConfig JSON round-trip order');
 $decoded2 = TopicConfig::fromDict(json_decode($json, true));
-$T->checkSame($tc->toDict(), $decoded2->toDict(), 'TopicConfig toDict/fromDict 往返');
-$T->checkThrows(static fn () => TopicConfig::decode('{bad json'), \JsonException::class, 'TopicConfig.decode 非法 JSON 抛异常');
+$T->checkSame($tc->toDict(), $decoded2->toDict(), 'TopicConfig toDict/fromDict round-trip');
+$T->checkThrows(static fn () => TopicConfig::decode('{bad json'), \JsonException::class, 'TopicConfig.decode invalid JSON throws');
 
 // ============================================================ SubscriptionData / FilterAPI
 $sub = FilterAPI::buildSubscriptionData('TopicTest', 'TagA');
@@ -519,47 +523,47 @@ $sub2 = FilterAPI::buildSubscriptionData('TopicTest', 'TagA||TagB');
 $T->checkSame(['TagA', 'TagB'], $sub2->getTagsSet(), 'TagA||TagB tagsSet');
 $T->checkSame([2598919, 2598920], $sub2->getCodeSet(), 'TagA||TagB codeSet');
 $subAll = FilterAPI::buildSubscriptionData('TopicTest', '*');
-$T->checkSame('*', $subAll->getSubString(), '* 归一');
-$T->checkSame([], $subAll->getTagsSet(), '* tagsSet 为空');
-$T->checkSame([], $subAll->getCodeSet(), '* codeSet 为空');
-$T->checkSame('*', FilterAPI::buildSubscriptionData('T', null)->getSubString(), 'null 归一 *');
-$T->checkSame('   ', FilterAPI::buildSubscriptionData('T', '   ')->getSubString(), '纯空白 subString 原样保留');
+$T->checkSame('*', $subAll->getSubString(), '* normalized');
+$T->checkSame([], $subAll->getTagsSet(), '* tagsSet empty');
+$T->checkSame([], $subAll->getCodeSet(), '* codeSet empty');
+$T->checkSame('*', FilterAPI::buildSubscriptionData('T', null)->getSubString(), 'null normalized to *');
+$T->checkSame('   ', FilterAPI::buildSubscriptionData('T', '   ')->getSubString(), 'whitespace-only subString kept verbatim');
 $T->checkSame(['|'], FilterAPI::buildSubscriptionData('T', '|||')->getTagsSet(), '||| -> tag="|"');
-$T->checkSame(' TagA || TagB ', FilterAPI::buildSubscriptionData('T', ' TagA || TagB ')->getSubString(), '空白原样保留');
-$T->checkThrows(static fn () => FilterAPI::buildSubscriptionData('T', '||'), \InvalidArgumentException::class, '|| 抛 split error');
+$T->checkSame(' TagA || TagB ', FilterAPI::buildSubscriptionData('T', ' TagA || TagB ')->getSubString(), 'whitespace kept verbatim');
+$T->checkThrows(static fn () => FilterAPI::buildSubscriptionData('T', '||'), \InvalidArgumentException::class, '|| throws split error');
 $sd = new SubscriptionData('T', 'TagA');
-$T->checkSame(SubscriptionData::class, get_class($sd), 'SubscriptionData 构造');
+$T->checkSame(SubscriptionData::class, get_class($sd), 'SubscriptionData construction');
 $T->check($sd->equals(new SubscriptionData('T', 'TagA')), 'SubscriptionData.equals');
-$T->checkSame('TAG', $sd->getExpressionType(), 'expressionType 缺省 TAG');
-$T->check(!array_key_exists('filterClassSource', $sd->toDict()), 'toDict 不序列化 filterClassSource');
+$T->checkSame('TAG', $sd->getExpressionType(), 'expressionType defaults to TAG');
+$T->check(!array_key_exists('filterClassSource', $sd->toDict()), 'toDict does not serialize filterClassSource');
 
 // ============================================================ MessageType / BoundaryType
-$T->checkSame(0, MessageType::NORMAL_MSG->value, 'MessageType value=协议枚举序号');
+$T->checkSame(0, MessageType::NORMAL_MSG->value, 'MessageType value=protocol enum ordinal');
 $T->checkSame('Normal', MessageType::NORMAL_MSG->shortName(), 'shortName Normal');
 $T->checkSame('TransCommit', MessageType::TRANS_MSG_COMMIT->shortName(), 'shortName TransCommit');
 $T->checkSame(MessageType::DELAY_MSG, MessageType::getByShortName('Delay'), 'getByShortName Delay');
-$T->checkSame(MessageType::NORMAL_MSG, MessageType::getByShortName('unknown'), 'getByShortName 未知回 NORMAL');
-$T->checkSame('LOWER', BoundaryType::LOWER->value, 'BoundaryType 入网文本 LOWER');
+$T->checkSame(MessageType::NORMAL_MSG, MessageType::getByShortName('unknown'), 'getByShortName unknown falls back to NORMAL');
+$T->checkSame('LOWER', BoundaryType::LOWER->value, 'BoundaryType wire text LOWER');
 $T->checkSame(BoundaryType::UPPER, BoundaryType::getType('upper'), 'getType("upper")=UPPER');
 $T->checkSame(BoundaryType::UPPER, BoundaryType::getType('UPPER'), 'getType("UPPER")=UPPER');
-$T->checkSame(BoundaryType::LOWER, BoundaryType::getType('lower'), 'getType("lower")=LOWER（宽松解析）');
+$T->checkSame(BoundaryType::LOWER, BoundaryType::getType('lower'), 'getType("lower")=LOWER (lenient parsing)');
 $T->checkSame(BoundaryType::LOWER, BoundaryType::getType(null), 'getType(null)=LOWER');
 $T->checkSame('lower', BoundaryType::LOWER->lowercaseName(), 'lowercaseName');
 
 // ============================================================ RecallMessageHandle
 $handle = RecallMessageHandle::buildHandle('topic1', 'broker-a', '1700000000000', 'MSGID-001');
-$T->check(!str_contains($handle, '+') && !str_contains($handle, '/'), 'buildHandle base64url 字母表');
+$T->check(!str_contains($handle, '+') && !str_contains($handle, '/'), 'buildHandle base64url alphabet');
 $h1 = RecallMessageHandle::decodeHandle($handle);
-$T->check($h1->equals(new HandleV1('topic1', 'broker-a', '1700000000000', 'MSGID-001')), 'build/decode 往返');
-$T->check($h1->timestampStr === '1700000000000', 'timestampStr 保留字符串');
-// 无填充句柄也能解（base64 无填充编码变体）
-$T->check($h1->equals(RecallMessageHandle::decodeHandle(rtrim($handle, '='))), '无填充句柄兼容解码');
-$T->checkThrows(static fn () => RecallMessageHandle::decodeHandle(''), \RocketMQ\Client\Exceptions\MQClientException::class, '空句柄抛 MQClientException');
-$T->checkThrows(static fn () => RecallMessageHandle::decodeHandle('###'), \RocketMQ\Client\Exceptions\MQClientException::class, '非法 base64 抛 MQClientException');
+$T->check($h1->equals(new HandleV1('topic1', 'broker-a', '1700000000000', 'MSGID-001')), 'build/decode round-trip');
+$T->check($h1->timestampStr === '1700000000000', 'timestampStr kept as string');
+// Unpadded handles also decode (base64 unpadded encoding variant)
+$T->check($h1->equals(RecallMessageHandle::decodeHandle(rtrim($handle, '='))), 'unpadded handle decodes compatibly');
+$T->checkThrows(static fn () => RecallMessageHandle::decodeHandle(''), \RocketMQ\Client\Exceptions\MQClientException::class, 'empty handle throws MQClientException');
+$T->checkThrows(static fn () => RecallMessageHandle::decodeHandle('###'), \RocketMQ\Client\Exceptions\MQClientException::class, 'invalid base64 throws MQClientException');
 $badV = base64_encode('v2 t b ts id');
-$T->checkThrows(static fn () => RecallMessageHandle::decodeHandle($badV), \RocketMQ\Client\Exceptions\MQClientException::class, '版本不对抛 MQClientException');
+$T->checkThrows(static fn () => RecallMessageHandle::decodeHandle($badV), \RocketMQ\Client\Exceptions\MQClientException::class, 'wrong version throws MQClientException');
 $extra = base64_encode('v1 t b ts id extra');
-$T->check((RecallMessageHandle::decodeHandle($extra))->messageId === 'id', '多余分段忽略');
+$T->check((RecallMessageHandle::decodeHandle($extra))->messageId === 'id', 'extra segments ignored');
 
-// ============================================================ 收尾
+// ============================================================ Wrap-up
 exit($T->summary());

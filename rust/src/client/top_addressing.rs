@@ -1,12 +1,12 @@
-//! 1. `MixAll.getWSAddr()`：`http://<domain>:8080/rocketmq/<subgroup>`；domain 自带端口
-//!    （含 `:`）时不追加 `:8080`。
-//! 2. `fetchNSAddr(true, 3000)`：HTTP GET（超时 3000ms），unitName 非空白则 URL 追加
-//!    `-<unitName>?nofix=1`；para 非空则 `?k=v&...`。**code==200** 时对响应体做
-//!    `clearNewLine`（trim 后截断到第一个 `\r` 或 `\n`）作为 NS 地址串；否则返回 None。
-//! 3. `MQClientAPIImpl.fetchNameServerAddr()`：取到的串与上次**不同**才应用
-//!    （`updateNameServerAddressList`，按 `;` 切分）；相同则什么都不做。
-//! 4. `MQClientInstance`：**当且仅当**没配静态 namesrvAddr 时，start() 先 fetch 一次，
-//!    并调度 10s / 2min 周期刷新。
+//! 1. `MixAll.getWSAddr()`: `http://<domain>:8080/rocketmq/<subgroup>`; when the domain already carries a port
+//!    (contains `:`), `:8080` is not appended.
+//! 2. `fetchNSAddr(true, 3000)`: HTTP GET (timeout 3000ms); a non-blank unitName makes the URL append
+//!    `-<unitName>?nofix=1`; a non-empty para appends `?k=v&...`. On **code==200** the response body goes through
+//!    `clearNewLine` (trim, then cut at the first `\r` or `\n`) to become the NS address string; otherwise None is returned.
+//! 3. `MQClientAPIImpl.fetchNameServerAddr()`: the fetched string is applied only when **different** from the last one
+//!    (`updateNameServerAddressList`, split by `;`); when identical, nothing happens.
+//! 4. `MQClientInstance`: **if and only if** no static namesrvAddr is configured, start() fetches once first,
+//!    and schedules 10s / 2min periodic refresh.
 
 use std::time::Duration;
 
@@ -17,7 +17,7 @@ use crate::error::{Error, Result};
 
 pub const DEFAULT_NAMESRV_ADDR_LOOKUP: &str = "jmenv.tbsite.net";
 pub const DEFAULT_DOMAIN_SUBGROUP: &str = "nsaddr";
-/// domain 未显式给出时读取的环境变量。
+/// Environment variable read when the domain is not given explicitly.
 pub const NAMESRV_DOMAIN_ENV: &str = "ROCKETMQ_NAMESRV_DOMAIN";
 pub const DEFAULT_TIMEOUT_MILLIS: u64 = 3000;
 
@@ -48,7 +48,7 @@ impl Default for DefaultTopAddressing {
 }
 
 impl DefaultTopAddressing {
-    /// domain 取环境变量 `ROCKETMQ_NAMESRV_DOMAIN`；未设置 = 动态取址关闭。
+    /// Domain comes from the env var `ROCKETMQ_NAMESRV_DOMAIN`; unset = dynamic address lookup disabled.
     pub fn new() -> Self {
         Self::from_domain(std::env::var(NAMESRV_DOMAIN_ENV).unwrap_or_default())
     }
@@ -63,7 +63,7 @@ impl DefaultTopAddressing {
         Self { ws_addr, unit_name: String::new(), para: Vec::new(), timeout_millis: DEFAULT_TIMEOUT_MILLIS, ns_addr: None }
     }
 
-    /// 直接给定完整 WS 地址（单测 / 特殊部署用）。
+    /// Gives the full WS address directly (for unit tests / special deployments).
     pub fn from_ws_addr(ws_addr: impl Into<String>) -> Self {
         let mut ta = Self::from_domain("");
         ta.ws_addr = ws_addr.into();
@@ -72,7 +72,7 @@ impl DefaultTopAddressing {
 
     pub fn with_subgroup(mut self, subgroup: &str) -> Self {
         if !self.ws_addr.is_empty() {
-            // 只在「由 domain 推导」时才有意义；重建 URL 的末段即可。
+            // Only meaningful when derived from a domain; rebuilding the last URL segment is enough.
             if let Some(i) = self.ws_addr.rfind('/') {
                 self.ws_addr = format!("{}/{}", &self.ws_addr[..i], subgroup);
             }
@@ -95,7 +95,7 @@ impl DefaultTopAddressing {
         self
     }
 
-    /// 对应 `MixAll.getWSAddr`：domain 自带端口（含 `:`）时不追加默认 `:8080`。
+    /// Mirrors `MixAll.getWSAddr`: when the domain already carries a port (contains `:`), the default `:8080` is not appended.
     pub fn get_ws_addr(domain: &str, subgroup: Option<&str>) -> String {
         let grp = subgroup.unwrap_or(DEFAULT_DOMAIN_SUBGROUP);
         if domain.contains(':') {
@@ -104,12 +104,12 @@ impl DefaultTopAddressing {
         format!("http://{domain}:8080/rocketmq/{grp}")
     }
 
-    /// 动态取址是否可用（domain 已显式配置）。
+    /// Whether dynamic address lookup is available (domain explicitly configured).
     pub fn is_configured() -> bool {
         !std::env::var(NAMESRV_DOMAIN_ENV).unwrap_or_default().is_empty()
     }
 
-    /// 对应 `fetchNSAddr` 里的 URL 拼装（unitName / para 规则逐条照抄）。
+    /// Mirrors the URL assembly in `fetchNSAddr` (unitName / para rules copied rule by rule).
     pub fn build_url(&self) -> String {
         let mut url = self.ws_addr.clone();
         let has_unit = !self.unit_name.trim().is_empty();
@@ -171,7 +171,7 @@ impl DefaultTopAddressing {
         self.ns_addr.clone()
     }
 
-    /// 返回响应体文本；非 200 / 响应不合法都返回 Err（由 `fetch_ns_addr` 统一按失败处理）。
+    /// Returns the response body text; non-200 / malformed responses return Err (`fetch_ns_addr` handles both as failure).
     async fn http_get(&self, url: &str) -> Result<String> {
         let (host, port, path) = split_http_url(url)?;
         let addr = format!("{host}:{port}");
@@ -201,7 +201,7 @@ impl DefaultTopAddressing {
     }
 }
 
-/// `http://host:port/path?query` → `(host, port, path?query)`；缺省端口 80。
+/// `http://host:port/path?query` → `(host, port, path?query)`; default port 80.
 fn split_http_url(url: &str) -> Result<(String, u16, String)> {
     let rest = url
         .strip_prefix("http://")
@@ -228,7 +228,7 @@ fn split_http_url(url: &str) -> Result<(String, u16, String)> {
     Ok((host.to_string(), port, path))
 }
 
-/// 读到 EOF（请求里带了 `Connection: close`）；超时返回 Err。
+/// Reads to EOF (the request carries `Connection: close`); timeout returns Err.
 async fn read_to_end<S>(stream: &mut S, timeout: Duration) -> Result<Vec<u8>>
 where
     S: AsyncReadExt + Unpin,
@@ -242,7 +242,7 @@ where
                 break;
             }
             buf.extend_from_slice(&chunk[..n]);
-            // 超大响应不可能是地址列表，直接判失败，避免被恶意 body 拖爆内存。
+            // An oversized response cannot be an address list; fail outright so a malicious body cannot blow up memory.
             if buf.len() > 64 * 1024 {
                 return Err(Error::Decode("address server response too large".into()));
             }
@@ -254,8 +254,8 @@ where
         .map_err(|_| Error::Timeout { addr: "address server".into(), timeout_millis: timeout.as_millis() as i64 })?
 }
 
-/// 按第一个 `\r\n\r\n`（宽松处理裸 `\n\n`）切分头部与 body。分隔符是 ASCII，
-/// 所以直接在字节里找，避免依赖 UTF-8 解码结果。
+/// Splits header from body at the first `\r\n\r\n` (tolerating a bare `\n\n`). The separator is ASCII,
+/// so it is searched in the bytes directly, avoiding any dependence on UTF-8 decoding.
 fn split_headers(raw: &[u8]) -> Option<(&[u8], &[u8])> {
     let (idx, sep_len) = find_header_separator(raw)?;
     Some((&raw[..idx], &raw[idx + sep_len..]))
@@ -270,7 +270,7 @@ fn find_header_separator(raw: &[u8]) -> Option<(usize, usize)> {
     raw.windows(2).position(|w| w == lf_lf).map(|i| (i, 2))
 }
 
-/// 状态行 `HTTP/1.1 200 OK` → 200。
+/// Status line `HTTP/1.1 200 OK` → 200.
 fn parse_status_line(head: &[u8]) -> Result<u16> {
     let text = String::from_utf8_lossy(head);
     let first = text.lines().next().unwrap_or_default();
@@ -285,7 +285,7 @@ fn parse_status_line(head: &[u8]) -> Result<u16> {
 mod tests {
     use super::*;
 
-    // ---------------- URL 构造 ----------------
+    // ---------------- URL construction ----------------
 
     #[test]
     fn get_ws_addr_matches_nameserver_url_contract() {
@@ -293,7 +293,7 @@ mod tests {
             DefaultTopAddressing::get_ws_addr("jmenv.tbsite.net", None),
             "http://jmenv.tbsite.net:8080/rocketmq/nsaddr"
         );
-        // domain 自带端口 → 不追加 :8080
+        // domain carries a port → :8080 not appended
         assert_eq!(
             DefaultTopAddressing::get_ws_addr("host:12345", None),
             "http://host:12345/rocketmq/nsaddr"
@@ -312,7 +312,7 @@ mod tests {
             base().with_unit_name("unitA").build_url(),
             "http://h:8080/rocketmq/nsaddr-unitA?nofix=1"
         );
-        // 空白 unitName 视同未设置
+        // A blank unitName counts as unset
         assert_eq!(base().with_unit_name("   ").build_url(), "http://h:8080/rocketmq/nsaddr");
 
         let url = base()
@@ -346,7 +346,7 @@ mod tests {
         assert_eq!(clear_new_line("\r\n"), "");
     }
 
-    // ---------------- URL 解析 ----------------
+    // ---------------- URL parsing ----------------
 
     #[test]
     fn split_http_url_cases() {
@@ -374,16 +374,16 @@ mod tests {
         let (head, body) = split_headers(raw).unwrap();
         assert_eq!(parse_status_line(head).unwrap(), 200);
         assert_eq!(body, b"1.2.3");
-        // 裸 \n\n 也认
+        // A bare \n\n is also accepted
         assert_eq!(split_headers(b"HTTP/1.0 500\r\n\nx").unwrap().1, b"x");
         assert!(split_headers(b"garbage").is_none());
         assert!(parse_status_line(b"HTTP/1.1").is_err());
         assert!(parse_status_line(b"HTTP/1.1 xx").is_err());
     }
 
-    // ---------------- 取址行为（本地 mock HTTP server，不依赖外网）----------------
+    // ---------------- address fetching (local mock HTTP server, no external network) ----------------
 
-    /// 每次连接都从共享状态现读，这样测试中途改响应才生效。
+    /// Each connection reads the shared state fresh, so changing the response mid-test takes effect.
     type Respond = std::sync::Arc<std::sync::Mutex<(u16, String)>>;
 
     struct MockAddrServer {
@@ -440,7 +440,7 @@ mod tests {
         }
 
         fn top(&self) -> DefaultTopAddressing {
-            // domain 带端口 → get_ws_addr 不追加 :8080
+            // domain carries a port → get_ws_addr does not append :8080
             DefaultTopAddressing::from_domain(format!("127.0.0.1:{}", self.port))
         }
 
@@ -492,7 +492,7 @@ mod tests {
     #[tokio::test]
     async fn no_domain_means_disabled() {
         if DefaultTopAddressing::is_configured() {
-            return; // 环境里设了 ROCKETMQ_NAMESRV_DOMAIN，跳过 env 分支
+            return; // ROCKETMQ_NAMESRV_DOMAIN is set in the environment, skip the env branch
         }
         let ta = DefaultTopAddressing::new();
         assert_eq!(ta.ws_addr(), "");
@@ -504,7 +504,7 @@ mod tests {
         let server = MockAddrServer::start().await;
         let mut ta = server.top();
         assert_eq!(ta.fetch_and_apply().await.as_deref(), Some("127.0.0.1:9876"));
-        assert_eq!(ta.fetch_and_apply().await, None); // 相同 → 不应用
+        assert_eq!(ta.fetch_and_apply().await, None); // identical → not applied
         server.set_response(200, "10.0.0.9:9876");
         assert_eq!(ta.fetch_and_apply().await.as_deref(), Some("10.0.0.9:9876"));
         assert_eq!(ta.ns_addr(), Some("10.0.0.9:9876"));
@@ -521,7 +521,7 @@ mod tests {
 
     #[tokio::test]
     async fn slow_server_hits_timeout() {
-        // 监听但不回包 → 超时 → None，且不能卡死
+        // Listens but never responds → timeout → None, and must not hang
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let held = tokio::spawn(async move {

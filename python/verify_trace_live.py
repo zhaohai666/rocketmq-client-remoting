@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
-"""消息轨迹真机验证。
+"""Verification of the message trace against a real machine.
 
-前置：NameServer + Broker 已起，且 broker 配置里 **traceTopicEnable=true**
-（否则 RMQ_SYS_TRACE_TOPIC 不会被预建，也没法用 admin 建 —— 它是系统 topic，
-`validateSystemTopicWhenUpdateTopic` 默认 true 会拒绝创建）。
+Prerequisites: NameServer + Broker are running and the broker configuration has
+**traceTopicEnable=true** (otherwise RMQ_SYS_TRACE_TOPIC is not pre-created, and it cannot be
+created through admin either -- it is a system topic and `validateSystemTopicWhenUpdateTopic`,
+true by default, refuses to create it).
 
-用法：.venv/bin/python verify_trace_live.py [127.0.0.1:9876]
+Usage: .venv/bin/python verify_trace_live.py [127.0.0.1:9876]
 
-场景 S1–S17 见下方 main()，全部命中才返回 0。
+The scenarios S1-S17 are in main() below; it only returns 0 when all of them are hit.
 """
 from __future__ import annotations
 
@@ -27,10 +28,12 @@ from remoting.protocol.heartbeat import ConsumeFromWhere
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 STAMP = int(time.time() * 1000)
-# topic 与业务消费组都带 STAMP：`run_trace_live.sh all` 会让多轮验证**依次**跑在
-# 同一个 broker 上，固定名会让后一轮继承前一轮的位点与残留消息，使断言结果依赖
-# 运行顺序。全新 topic + 全新组才能让每次运行的起点一致（真正的鲁棒性另有保障，
-# 见 S6 的 body 过滤）。
+# Both the topic and the business consumer group carry the STAMP: `run_trace_live.sh all` runs
+# several rounds of verification **one after another** on the same broker, and fixed names would
+# make each round inherit the offsets and leftover messages of the previous one, so the assertion
+# results would depend on the run order. Only a brand-new topic plus a brand-new group makes every
+# run start from the same point (the real robustness is guaranteed separately, see the body filter
+# in S6).
 TOPIC = "TraceTopicLive_%d" % STAMP
 NOTRACE_TOPIC = "TraceNoTraceTopic_%d" % STAMP
 PRODUCER_GROUP = "GID_trace_producer_live"
@@ -52,11 +55,11 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 
 class _TraceCollector(MessageListenerConcurrently):
-    """消费 RMQ_SYS_TRACE_TOPIC，把轨迹文本解成 TraceContext 累积起来。"""
+    """Consume RMQ_SYS_TRACE_TOPIC and accumulate the TraceContext objects decoded from the trace text."""
 
     def __init__(self) -> None:
         self.records = []
-        self.raw = []           # (轨迹消息 keys, 轨迹消息自身的 topic, body)
+        self.raw = []           # (the trace message keys, the topic of the trace message itself, body)
         self.lock = threading.Lock()
 
     def consume_message(self, msgs, context=None):
@@ -113,96 +116,102 @@ def main() -> int:
     trace_reader.start()
     print("trace reader started (group=%s, topic=%s)" % (TRACE_READER_GROUP, MixAll.TRACE_TOPIC))
 
-    # ---------- S1 预热建 topic ----------
+    # ---------- S1 warm up to create the topic ----------
     warm = DefaultMQProducer(PRODUCER_GROUP + "_warm")
     warm.set_namesrv_addr(NAMESRV)
     warm.start()
     try:
         warm.send(Message(TOPIC, b"warm-up"), 5000)
-        check("S1 预热消息发送成功（触发 broker 自动建 topic）", True)
+        check("S1 the warm-up message was sent successfully (triggering the broker to auto-create the topic)", True)
     except Exception as e:  # noqa: BLE001
-        check("S1 预热消息发送成功（触发 broker 自动建 topic）", False, str(e))
+        check("S1 the warm-up message was sent successfully (triggering the broker to auto-create the topic)", False, str(e))
         return 1
 
-    # 预热后等一下再起消费者：降低"位点解析"与"broker consumequeue 异步分发"的竞态。
-    # 这一步只是让时序更宽裕，**不是**正确性保障 —— 预热消息本来就可能被投递，见 S6 的 body 过滤。
+    # Wait a bit after the warm-up before starting the consumer, to reduce the race between the
+    # "offset resolution" and the "asynchronous broker consumequeue dispatch".
+    # This step only gives the timing more slack, it is **not** a correctness guarantee -- the
+    # warm-up message may legitimately be delivered; see the body filter in S6.
     time.sleep(1.5)
 
-    # ---------- S2/S3 打开轨迹的生产者 ----------
+    # ---------- S2/S3 the producer with tracing turned on ----------
     msg_collector = _MsgCollector()
     consumer = DefaultMQPushConsumer(CONSUMER_GROUP)
     consumer.set_namesrv_addr(NAMESRV)
     consumer.set_consume_from_where(ConsumeFromWhere.CONSUME_FROM_LAST_OFFSET)
     consumer.subscribe(TOPIC, "*")
     consumer.set_message_listener(msg_collector)
-    consumer.set_enable_msg_trace(True)          # ← 消费侧轨迹
+    consumer.set_enable_msg_trace(True)          # <- tracing on the consumer side
     consumer.start()
-    # 必须先起消费者再发消息（CONSUME_FROM_LAST_OFFSET 语义 + 队列必须先分配）
+    # The consumer must be started before the messages are sent (CONSUME_FROM_LAST_OFFSET semantics
+    # + the queues must be assigned first)
     assigned = _wait_until(lambda: consumer.assigned_queue_count() > 0, 30)
-    check("S2 消费者已分配到队列（先起消费者再发消息）", assigned,
+    check("S2 the consumer was assigned queues (start the consumer before sending the messages)", assigned,
           "assigned=%d" % consumer.assigned_queue_count())
 
     producer = DefaultMQProducer(PRODUCER_GROUP)
     producer.set_namesrv_addr(NAMESRV)
-    producer.set_enable_trace(True)              # ← 发送侧轨迹
+    producer.set_enable_trace(True)              # <- tracing on the producer side
     producer.start()
 
     body = ("trace-live-%d" % STAMP).encode()
     keys = "KeyA KeyB %d" % STAMP
     result = producer.send(Message(TOPIC, body, "TagA", keys), 5000)
 
-    check("S3 SendResult.trace_on == True（broker 默认 traceOn=true）",
+    check("S3 SendResult.trace_on == True (the broker defaults traceOn=true)",
           result.trace_on is True, "trace_on=%s" % result.trace_on)
-    check("S4 SendResult.msg_id 是客户端 UNIQ_KEY，且与 offset_msg_id 不同",
+    check("S4 SendResult.msg_id is the client-side UNIQ_KEY and differs from offset_msg_id",
           bool(result.msg_id) and bool(result.offset_msg_id)
           and result.msg_id != result.offset_msg_id,
           "msgId=%s offsetMsgId=%s" % (result.msg_id, result.offset_msg_id))
-    check("S5 SendResult.region_id 已解析（缺省 DefaultRegion）",
+    check("S5 SendResult.region_id was resolved (DefaultRegion by default)",
           result.region_id == MixAll.DEFAULT_TRACE_REGION_ID, "region=%s" % result.region_id)
 
-    # ---------- S6/S7 消费到消息 ----------
-    # ⚠ 只统计**本次发送的**消息：topic 上必然还留着 S1 的预热消息，且"组首次消费"的起始位点
-    #   取的是当时的 maxOffset —— broker 的 consumequeue 是**异步分发**的，位点可能落在预热消息
-    #   之前，于是预热消息也会被投递过来（真机实测踩过）。断言的本意是"本次业务
-    #   消息被消费到"，所以按 body 过滤，而不是赌 topic 上只有一条消息。
+    # ---------- S6/S7 the message is consumed ----------
+    # CAUTION: only count the messages sent **this time**: the topic still necessarily holds the
+    #   warm-up message from S1, and the starting offset of "the group's first consumption" is taken
+    #   from the maxOffset at that moment -- the broker's consumequeue is dispatched
+    #   **asynchronously**, so the offset may land before the warm-up message and the warm-up
+    #   message would then be delivered too (this was actually hit in live testing). What the
+    #   assertion really means is "the business message of this round was consumed", so it filters
+    #   by body instead of betting that the topic only holds one message.
     def _is_primary(m) -> bool:
         return bytes(m.body).startswith(b"trace-live-")
 
     got = _wait_until(lambda: any(_is_primary(m) for m in msg_collector.snapshot()), 25)
     msgs = [m for m in msg_collector.snapshot() if _is_primary(m)]
-    check("S6 业务消费者收到本次发送的那 1 条消息（按 body 过滤预热消息）",
+    check("S6 the business consumer received that one message of this round (the warm-up message is filtered out by body)",
           got and len(msgs) == 1, "count=%d" % len(msgs))
     recv = msgs[0] if msgs else None
     recv_msg_id = recv.msg_id if recv else None
-    check("S7 消费侧 msg_id == SendResult.offset_msg_id，且 UNIQ_KEY 经属性带到消费侧",
+    check("S7 the consumer-side msg_id == SendResult.offset_msg_id and the UNIQ_KEY arrives on the consumer side through the properties",
           recv is not None and recv_msg_id == result.offset_msg_id
           and get_uniq_id(recv) == result.msg_id,
           "recv=%s offset=%s uniq=%s" % (recv_msg_id, result.offset_msg_id,
                                          get_uniq_id(recv) if recv else None))
 
-    # ---------- 无 keys 的消息（S17 用，真机数据锁解码器健壮性） ----------
+    # ---------- a message without keys (used by S17; live data pins the robustness of the decoder) ----------
     keyless = producer.send(Message(TOPIC, b"no-keys-here"), 5000)
     keyless_ok = _wait_until(
         lambda: any(bytes(m.body) == b"no-keys-here" for m in msg_collector.snapshot()), 25)
     keyless_id = keyless.offset_msg_id
 
-    # 关掉消费者 → 触发轨迹分发器 flush，保证 SubBefore/SubAfter 落盘
+    # Shut the consumer down -> this triggers the trace dispatcher to flush, guaranteeing that SubBefore/SubAfter land on disk
     consumer.shutdown()
     time.sleep(1.0)
 
-    # ---------- S8 等轨迹落地 ----------
+    # ---------- S8 wait for the traces to land ----------
     def _found_pub():
         recs, _ = collector.snapshot()
         return any(r.trace_type == TraceType.PUB and r.trace_beans
                    and r.trace_beans[0].msg_id == result.msg_id for r in recs)
 
     pub_ok = _wait_until(_found_pub, 35)
-    producer.shutdown()      # flush 发送侧轨迹
+    producer.shutdown()      # flush the producer-side traces
     time.sleep(0.5)
     _wait_until(_found_pub, 10)
 
     records, raw = collector.snapshot()
-    print("  [info] 收到 %d 条轨迹消息 / 解出 %d 条轨迹记录" % (len(raw), len(records)))
+    print("  [info] received %d trace messages / decoded %d trace records" % (len(raw), len(records)))
     for r in records:
         print("         - %s topic=%s msgId=%s group=%s success=%s code=%s" % (
             r.trace_type.value, r.trace_beans[0].topic if r.trace_beans else "-",
@@ -211,52 +220,52 @@ def main() -> int:
 
     pubs = [r for r in records if r.trace_type == TraceType.PUB and r.trace_beans
             and r.trace_beans[0].msg_id == result.msg_id]
-    check("S8 轨迹里出现 Pub 记录且 msgId 与 SendResult.msg_id 一致", pub_ok and len(pubs) >= 1,
+    check("S8 a Pub record shows up in the traces and its msgId matches SendResult.msg_id", pub_ok and len(pubs) >= 1,
           "count=%d" % len(pubs))
 
     pub = pubs[0] if pubs else None
     if pub is not None:
-        check("S9 Pub 轨迹的 topic / groupName 正确",
+        check("S9 the topic / groupName of the Pub trace are correct",
               pub.trace_beans[0].topic == TOPIC and pub.group_name == PRODUCER_GROUP,
               "topic=%s group=%s" % (pub.trace_beans[0].topic, pub.group_name))
     else:
-        check("S9 Pub 轨迹的 topic / groupName 正确", False, "no pub record")
+        check("S9 the topic / groupName of the Pub trace are correct", False, "no pub record")
 
-    check("S10 承载 Pub 轨迹的轨迹消息 keys 里含该 msgId（控制台按 keys 反查）",
+    check("S10 the keys of the trace message carrying the Pub trace contain that msgId (the console looks it up by keys)",
           any(result.msg_id in (k or "") for k, _t, _b in raw),
           "raw_keys=%s" % [k for k, _t, _b in raw][:3])
 
     subs_before = [r for r in records if r.trace_type == TraceType.SUB_BEFORE and r.trace_beans
                    and r.trace_beans[0].msg_id == recv_msg_id]
-    check("S11 轨迹里出现 SubBefore 且 msgId 与消费侧一致", len(subs_before) >= 1,
+    check("S11 a SubBefore shows up in the traces and its msgId matches the consumer side", len(subs_before) >= 1,
           "count=%d" % len(subs_before))
 
     subs_after = [r for r in records if r.trace_type == TraceType.SUB_AFTER and r.trace_beans
                   and r.trace_beans[0].msg_id == recv_msg_id]
     if subs_before and subs_after:
         before, after = subs_before[0], subs_after[0]
-        check("S12 SubBefore/SubAfter 配对且 requestId 一致、success=true、contextCode=0",
+        check("S12 SubBefore/SubAfter are paired with the same requestId, success=true, contextCode=0",
               after.request_id == before.request_id and after.is_success is True
               and after.context_code == 0,
               "req=%s success=%s code=%s" % (after.request_id, after.is_success,
                                              after.context_code))
-        check("S13 SubBefore 的 retryTimes 与被消费消息一致",
+        check("S13 the retryTimes of SubBefore match the consumed message",
               before.trace_beans[0].retry_times == msgs[0].reconsume_times,
               "trace=%s msg=%s" % (before.trace_beans[0].retry_times, msgs[0].reconsume_times))
     else:
-        check("S12 SubBefore/SubAfter 配对且 requestId 一致、success=true、contextCode=0",
+        check("S12 SubBefore/SubAfter are paired with the same requestId, success=true, contextCode=0",
               False, "before=%d after=%d" % (len(subs_before), len(subs_after)))
-        check("S13 SubBefore 的 retryTimes 与被消费消息一致", False, "no sub traces")
+        check("S13 the retryTimes of SubBefore match the consumed message", False, "no sub traces")
 
-    # ---------- S14 防递归：轨迹自身不再被追踪 ----------
-    check("S14 没有任何轨迹记录的 topic 是轨迹 topic 本身（防递归）",
+    # ---------- S14 recursion guard: the traces themselves are not traced any more ----------
+    check("S14 no trace record has the trace topic itself as its topic (recursion guard)",
           all(r.trace_beans[0].topic != MixAll.TRACE_TOPIC for r in records if r.trace_beans),
           "topics=%s" % sorted({r.trace_beans[0].topic for r in records if r.trace_beans}))
 
-    # ---------- S15 关闭轨迹就不产轨迹 ----------
+    # ---------- S15 tracing off produces no traces ----------
     quiet = DefaultMQProducer(PRODUCER_GROUP + "_quiet")
     quiet.set_namesrv_addr(NAMESRV)
-    quiet.set_enable_trace(False)                # ← 显式关闭
+    quiet.set_enable_trace(False)                # <- explicitly off
     quiet.start()
     quiet.send(Message(NOTRACE_TOPIC, b"no-trace"), 5000)
     quiet.shutdown()
@@ -264,19 +273,19 @@ def main() -> int:
     records2, _ = collector.snapshot()
     leaked = [r for r in records2 if r.trace_type == TraceType.PUB and r.trace_beans
               and r.trace_beans[0].topic == NOTRACE_TOPIC]
-    check("S15 enable_trace=false 的生产者不产生 Pub 轨迹", len(leaked) == 0,
+    check("S15 a producer with enable_trace=false produces no Pub trace", len(leaked) == 0,
           "leaked=%d" % len(leaked))
 
     all_segments = sum(text.count(TraceConstants.FIELD_SPLITOR)
                        for _k, t, text in raw if t == MixAll.TRACE_TOPIC)
-    check("S16 轨迹文本记录数（STX 计数）== 解码出的记录数（split 语义）",
+    check("S16 the record count of the trace text (STX count) == the number of decoded records (split semantics)",
           all_segments == len(records) and len(records) > 0,
           "segments=%d decoded=%d" % (all_segments, len(records)))
 
-    # ---------- S17 无 keys 消息的轨迹（SubBefore 末段为空）也要解得出来 ----------
+    # ---------- S17 the trace of a message without keys (the last segment of SubBefore is empty) must decode too ----------
     kl_before = [r for r in records if r.trace_type == TraceType.SUB_BEFORE and r.trace_beans
                  and r.trace_beans[0].msg_id == keyless_id]
-    check("S17 无 keys 的消息也能解出 SubBefore 轨迹（空 keys 段不崩）",
+    check("S17 a message without keys still yields a decodable SubBefore trace (an empty keys segment does not crash it)",
           keyless_ok and len(kl_before) >= 1 and kl_before[0].trace_beans[0].keys == "",
           "consumed=%s before=%d keys=%r" % (
               keyless_ok, len(kl_before),

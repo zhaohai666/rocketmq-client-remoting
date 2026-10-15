@@ -28,11 +28,11 @@ interface ResponseFuture {
   fired: boolean;
 }
 
-// TLS 细项：
-//   - caCert 给出 → 严格校验：broker 证书必须
-//     链到该 CA，且主机名/SAN 匹配（默认用连接 host 校验，serverName 可覆盖）；
-//     不给 → test-mode：信任自签（rejectUnauthorized=false，历史行为）。
-//   - clientCert/clientKey → mTLS 客户端证书。
+// TLS details:
+//   - caCert given → strict verification: the broker certificate must
+//     chain to that CA and the hostname/SAN must match (host is used by default; serverName can override);
+//     not given → test-mode: trust self-signed (rejectUnauthorized=false, historical behavior).
+//   - clientCert/clientKey → mTLS client certificate.
 export interface TlsOptions {
   caCert?: string;
   clientCert?: string;
@@ -91,8 +91,8 @@ export class RemotingClient {
     const opts: tls.ConnectionOptions = { rejectUnauthorized: strict };
     if (strict) {
       opts.ca = [await fs.promises.readFile(t!.caCert!)];
-      // servername 缺省即 host；仅当显式覆盖且不同才设（node 对 IP SNI 有
-      // DEP0123 弃用告警，但证书的 IP SAN 校验仍按 host 走）。
+      // servername defaults to host; set it only when explicitly overridden and different (node emits
+      // DEP0123 deprecation for IP SNI, but the certificate's IP SAN check still follows host).
       if (t!.serverName != null && t!.serverName !== '' && t!.serverName !== host) {
         opts.servername = t!.serverName;
       }
@@ -115,9 +115,9 @@ export class RemotingClient {
         const [phost, pport] = parseProxyAddr(proxy.addr);
         sock = net.connect({ host: phost, port: pport });
       } else if (this.tlsEnable) {
-        // caCert 给出即走严格校验：握手（含证书链 + 主机名校验）完成前
-        // 'secureConnect' 不触发 —— CA 不对/主机名不符在 connect 阶段就报错，
-        // 而不是等首次写入时才炸。test-mode（无 caCert）保持 rejectUnauthorized:false。
+        // caCert given → strict verification: 'secureConnect' is not emitted until the handshake
+        // (certificate chain + hostname check) completes — a wrong CA / mismatched hostname errors at
+        // connect time rather than on first write. test-mode (no caCert) keeps rejectUnauthorized:false.
         sock = tls.connect({ ...(await this._tlsOptions(host)), host, port });
       } else {
         sock = net.connect({ host, port });
@@ -126,13 +126,13 @@ export class RemotingClient {
       const timer = setTimeout(() => sock.destroy(new Error('connect timeout')), this.connectTimeoutMillis);
       try {
         if (proxy != null) {
-          // TCP 到代理已建连 → SOCKS CONNECT 握手（TLS 握手之前）。
+          // TCP to the proxy is connected → SOCKS CONNECT handshake (before the TLS handshake).
           const rawSock = sock;
           try {
             await once(rawSock, 'connect');
             await socksHandshake(rawSock, proxy, host, port, this.connectTimeoutMillis);
             if (this.tlsEnable) {
-              // 隧道内做 TLS 升级：SNI 用目标 host（serverName 覆盖在 _tlsOptions 里已设）。
+              // Upgrade to TLS inside the tunnel: SNI uses the target host (serverName override was set in _tlsOptions).
               const opts = await this._tlsOptions(host);
               if (opts.servername == null) opts.servername = host;
               opts.socket = rawSock;
@@ -141,7 +141,7 @@ export class RemotingClient {
               await once(sock, 'secureConnect');
             }
           } catch (e) {
-            // 握手失败：隧道不进连接池，必须拆掉，避免悬挂半开连接。
+            // Handshake failed: the tunnel must not enter the connection pool and must be torn down to avoid a dangling half-open connection.
             try { if (!rawSock.destroyed) rawSock.destroy(); } catch { /* ignore */ }
             throw e;
           }

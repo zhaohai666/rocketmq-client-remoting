@@ -7,7 +7,7 @@ from remoting.protocol.codes import RequestCode
 
 
 class _FakeClient:
-    """记录 shutdown 路径对本客户端实例的调用顺序。"""
+    """Record the order of calls made to this client instance on the shutdown path."""
 
     def __init__(self, fail_unregister: bool = False):
         self.calls = []
@@ -25,7 +25,7 @@ class _FakeClient:
 
 
 class _InvokeSpy:
-    """只替掉 ``_invoke_sync`` / ``_check_response``，跑真实的 ``unregister_client``。"""
+    """Replace only ``_invoke_sync`` / ``_check_response``, running the real ``unregister_client``."""
 
     def __init__(self):
         self.requests = []
@@ -64,7 +64,7 @@ def test_producer_shutdown_unregisters_before_closing_the_client():
     _, cid, group, consumer_group, _timeout = client.calls[0]
     assert cid == p.client_id
     assert group == "GID_unreg_test"
-    # 生产者退出：消费者槽位留空（上线时会被整个丢掉）
+    # producer shutdown: the consumer slot stays empty (it gets dropped entirely on registration)
     assert consumer_group == ""
 
 
@@ -105,7 +105,7 @@ def test_both_sides_present_when_given():
 
 
 def test_whitespace_group_is_dropped_too():
-    """纯空白与空串同处理：合法组名不可能全是空白（Validators 那一关过不去）。"""
+    """Whitespace-only strings are treated the same as empty ones: a legal group name cannot be all whitespace (it would not pass Validators)."""
     spy = _InvokeSpy()
     MQClientInstance.unregister_client(spy, "127.0.0.1:10911", "cid-1", "   ", "GID_c", 3000)
     ext = spy.requests[0][1].custom_header.to_ext_fields()
@@ -128,7 +128,7 @@ def test_unregister_fans_out_to_every_broker_including_slaves():
     inst.unregister_client_all_brokers("cid-1", "GID_p", "")
     assert seen == [("127.0.0.1:10911", "cid-1", "GID_p", ""),
                     ("127.0.0.1:10912", "cid-1", "GID_p", "")], seen
-    # 心跳/探活那侧依旧「一 brokerName 一台、master 优先」
+    # the heartbeat/liveness side still keeps "one per brokerName, master first"
     assert inst.get_route_of_all_brokers() == ["127.0.0.1:10911"]
     assert inst.get_all_broker_addrs() == ["127.0.0.1:10911", "127.0.0.1:10912"]
 
@@ -180,12 +180,12 @@ def test_consumer_heartbeat_fans_out_to_slaves_while_producer_stays_master_only(
     c._started = True
     assert c._send_heartbeat_to_all_broker() == 2
     assert [addr for addr, _ in sent] == [master, slave], sent
-    # 从节点拿到的那份必须**带消费组**，否则它的 ConsumerManager 建不出组信息
+    # the copy a slave receives must **carry the consumer group**, otherwise its ConsumerManager cannot build the group info
     for _addr, hb in sent:
         assert [cd.group_name for cd in hb.consumer_data_set] == ["GID_hb_fanout"]
         assert hb.client_id == "30.0.0.1@hb-offline"
 
-    # 生产者负向对照：同样的路由、同样的地址表，只准打 master 那一台
+    # negative control for the producer: same route, same address table, only the master is allowed
     pinst = instance("hb-producer")
     psent = []
     pinst.send_heartbeat = lambda addr, hb, timeout=5000: psent.append(addr)  # noqa: E731
@@ -214,5 +214,5 @@ def test_unregister_budget_is_the_client_api_timeout():
     inst.unregister_client = lambda addr, cid, pg, cg, timeout=5000: \
         seen_timeouts.append(timeout)  # noqa: E731
     inst.unregister_client_all_brokers("cid-1", "GID_p", "")
-    # 扇出的每一发都拿到同一份预算，且是默认值（调用方没传）
+    # every fan-out shot gets the same budget, and it is the default (the caller passed nothing)
     assert seen_timeouts == [3000, 3000], seen_timeouts

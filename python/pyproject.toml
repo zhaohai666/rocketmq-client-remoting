@@ -17,8 +17,9 @@ classifiers = [
 ]
 
 [tool.setuptools.packages.find]
-# python/ 目录本身就是源码根：client / common / remoting 是三个平铺的顶层包
-# （旧版嵌套包 rocketmq.* 已随目录结构上提而取消）。
+# The python/ directory is itself the source root: client / common / remoting are three
+# flat top-level packages (the legacy nested rocketmq.* package was retired with the
+# directory restructuring).
 include = ["client*", "common*", "remoting*"]
 
 [tool.pytest.ini_options]

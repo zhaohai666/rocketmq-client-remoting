@@ -1,26 +1,34 @@
 #!/bin/sh
-# 本地测试集群（RocketMQ 5.5.1）的 **master** broker 开关：真机验证里 "broker 重启 /
-# 主备切换 / master 掉线" 这一类故障注入要用它，四个语言的 live 用例共用同一份口径，
-# 别在各自脚本里散落。**只碰 master（-c $BROKER_CONF 的那个进程）**，同机的从节点
-# 不归它管 —— 停 master 后路由里 broker-a 只剩 brokerId=1，正是要验的场景。
+# Start/stop switch for the **master** broker of the local test cluster (RocketMQ 5.5.1):
+# used by live verification for fault injection such as "broker restart / master-slave
+# switchover / master going down", shared by all four languages' live cases under one
+# consistent approach instead of being scattered across individual scripts. **Only touches
+# the master (the process with -c $BROKER_CONF)**; the slave on the same machine is not
+# managed by it — after stopping the master, the route for broker-a is left with only
+# brokerId=1, which is exactly the scenario to verify.
 #
-#   sh scripts/rmq_test_broker.sh status   # master 在不在（从节点起了不算 UP）
-#   sh scripts/rmq_test_broker.sh stop     # 优雅停掉（SIGTERM → unregisterBrokerAll），等进程真的消失
-#   sh scripts/rmq_test_broker.sh start    # 后台拉起，等到日志出现 boot success
+#   sh scripts/rmq_test_broker.sh status   # is the master up (a running slave does not count as UP)
+#   sh scripts/rmq_test_broker.sh stop     # stop gracefully (SIGTERM -> unregisterBrokerAll), wait until the process is really gone
+#   sh scripts/rmq_test_broker.sh start    # start in the background, wait until the log shows boot success
 #
-# 只碰 /tmp/rmq_rust_live 这套一次性测试 store，不会删数据：start 不清 store，
-# 重启后消息和位点都还在（live 用例正是靠这一点验"断连后同一实例能恢复发送"）。
-# ⚠ **同一个 store 上绝不要起第二个 broker**：broker 的 JVM shutdown hook 会无条件向
-#   namesrv 发 unregisterBrokerAll，且**不检查自己到底有没有启动成功**。第二个进程哪怕
-#   只是因为 `MessageRocksDBStorage init error: ... LOCK: Resource temporarily
-#   unavailable` 启动失败、立刻退出，也会顺手把 broker-a 从 namesrv 上注销掉 —— 之后
-#   所有客户端查任何 topic 都拿不到路由（"Can not find Message Queue for topic"）约 30 秒，
-#   直到真 broker 的下一个 30s 注册周期把它补回来。五端 live 用例落在这个窗口里会**集体
-#   假失败**（与语言无关；2026-09-30 实测：压缩矩阵 22 条腿连挂 7 条，两个非 Go 发送端一起挂）。
-#   start 前的 `broker_pid` 判断依赖 `ps`，某些沙箱里 `ps` 被禁 → "已经在跑"会被误判成
-#   "没在跑"于是又拉一个 —— 所以别在沙箱里盲调 start。
+# Only touches the disposable test store under /tmp/rmq_rust_live, never deletes data: start
+# does not clear the store, so messages and offsets survive a restart (live cases rely exactly
+# on this to verify "the same instance can resume sending after a disconnect").
+# ⚠ **Never start a second broker on the same store**: the broker's JVM shutdown hook unconditionally
+#   sends unregisterBrokerAll to the namesrv and **does not check whether it actually started
+#   successfully**. Even if the second process fails to start and exits immediately, merely
+#   because of `MessageRocksDBStorage init error: ... LOCK: Resource temporarily
+#   unavailable`, it still deregisters broker-a from the namesrv on its way out — afterwards
+#   every client fails to get routes for any topic ("Can not find Message Queue for topic")
+#   for about 30 seconds, until the real broker's next 30s registration cycle restores it.
+#   Live cases across all five clients falling inside that window will **fail en masse**
+#   (language-independent; measured 2026-09-30: 7 of 22 legs in the compression matrix failed
+#   in a row, two non-Go senders failed together).
+#   The `broker_pid` check before start relies on `ps`, which is disabled in some sandboxes ->
+#   "already running" gets misjudged as "not running" and another one is started — so never
+#   blindly call start inside a sandbox.
 #
-# 不下载任何东西：MQ_HOME 指向本地已经构建好的发行包目录。
+# Downloads nothing: MQ_HOME points at a locally pre-built distribution directory.
 set -eu
 
 MQ_HOME="${MQ_HOME:-/Users/haizai/project/jingsai/roocketmq/zhaohai666-rocketmq/distribution/target/rocketmq-5.5.1/rocketmq-5.5.1}"
@@ -28,12 +36,14 @@ RMQ_TEST_HOME="${RMQ_TEST_HOME:-/tmp/rmq_rust_live}"
 BROKER_CONF="${BROKER_CONF:-$RMQ_TEST_HOME/broker.conf}"
 NAMESRV_ADDR="${NAMESRV_ADDR:-127.0.0.1:9876}"
 BROKER_PORT="${BROKER_PORT:-10911}"
-# 与首次拉起时一致的堆参数：不给 -Xms/-Xmx 会沿用 runbroker.sh 的 8g，本机吃不下。
+# Same heap parameters as the first startup: without -Xms/-Xmx it would inherit runbroker.sh's
+# 8g, which this machine cannot afford.
 JAVA_OPT_EXT="${JAVA_OPT_EXT:--Xms4g -Xmx4g -Duser.home=$RMQ_TEST_HOME}"
 
 broker_pid() {
-    # 只认 **master** 的 java 进程：同机还有从节点（brokerId=1）跑同一个主类，
-    # 用 -c 的配置文件区分；只匹配 java 本体（sh 外壳的 SIGTERM 传不到子进程）。
+    # Only recognize the **master** java process: a slave (brokerId=1) on the same machine runs
+    # the same main class, distinguished by its -c config file; match the java binary only
+    # (a SIGTERM to the sh wrapper does not reach the child process).
     ps -eo pid=,command= | awk -v conf="$BROKER_CONF" '
         /bin\/java/ && /org\.apache\.rocketmq\.broker\.BrokerStartup/ \
             && index($0, "-c " conf) { print $1; exit }'
@@ -46,7 +56,7 @@ wait_down() {
         sleep 0.5
         i=$((i + 1))
     done
-    echo "broker 进程没退干净" >&2
+    echo "broker process did not exit cleanly" >&2
     return 1
 }
 
@@ -61,19 +71,21 @@ case "${1:-status}" in
         fi
         ;;
     stop)
-        # 不用 mqshutdown：它按主类名抓**全部** BrokerStartup 进程，会把从节点一起杀掉
-        # （"主备切换 / master 掉线只剩从节点"这类验证必须只停 master）。SIGTERM 与
-        # mqshutdown 等价：broker 的 shutdown hook 里做 unregisterBrokerAll，名字服务里
-        # brokerId=0 立刻消失、从节点仍注册着 —— 正是要验的那条路由形状。
+        # Do not use mqshutdown: it grabs **all** BrokerStartup processes by main class name and
+        # would kill the slave too (verifications like "master-slave switchover / master down with
+        # only the slave left" require stopping only the master). SIGTERM is equivalent to
+        # mqshutdown: the broker's shutdown hook performs unregisterBrokerAll, so brokerId=0
+        # disappears from the name service immediately while the slave stays registered — exactly
+        # the route shape to verify.
         pid="$(broker_pid)"
         [ -n "$pid" ] && kill -15 "$pid"
         wait_down
         echo "broker DOWN"
         ;;
     start)
-        [ -n "$(broker_pid)" ] && { echo "broker 已经在跑"; exit 0; }
-        # 每次拉起单独记一份日志：wait-up 只认这份新日志里的 boot success，
-        # 旧日志里的成功行会把还没起来的 broker 判成 UP。
+        [ -n "$(broker_pid)" ] && { echo "broker is already running"; exit 0; }
+        # Keep a separate log for each start: wait-up only trusts boot success in this fresh log;
+        # success lines in an old log would mark a not-yet-started broker as UP.
         START_LOG="$RMQ_TEST_HOME/broker_restart.log"
         : > "$START_LOG"
         (cd "$MQ_HOME" && ROCKETMQ_HOME="$MQ_HOME" JAVA_OPT_EXT="$JAVA_OPT_EXT" \
@@ -82,7 +94,8 @@ case "${1:-status}" in
         i=0
         while [ "$i" -lt 240 ]; do
             if grep -q "boot success" "$START_LOG" 2>/dev/null; then
-                # 端口先于日志就绪会让下一个用例打空；日志出现后再确认一次监听
+                # The port can open before the log line appears, leaving the next case firing at
+                # nothing; confirm the listener once more after the log shows up
                 j=0
                 while [ "$j" -lt 40 ] && ! nc -G 2 -z 127.0.0.1 "$BROKER_PORT" 2>/dev/null; do
                     sleep 0.25
@@ -92,19 +105,19 @@ case "${1:-status}" in
                 exit 0
             fi
             if [ -z "$(broker_pid)" ] && [ "$i" -gt 20 ]; then
-                echo "broker 启动失败，看 $START_LOG" >&2
+                echo "broker failed to start, see $START_LOG" >&2
                 tail -20 "$START_LOG" >&2
                 exit 1
             fi
             sleep 0.5
             i=$((i + 1))
         done
-        echo "等不到 broker boot success，看 $START_LOG" >&2
+        echo "timed out waiting for broker boot success, see $START_LOG" >&2
         tail -20 "$START_LOG" >&2
         exit 1
         ;;
     *)
-        echo "用法: $0 {status|stop|start}" >&2
+        echo "Usage: $0 {status|stop|start}" >&2
         exit 2
         ;;
 esac

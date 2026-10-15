@@ -3,7 +3,7 @@ use std::fmt;
 
 use crate::common::message::{MessageExt, MessageQueue};
 
-// ---------------------------------------------------------------- 发送
+// ---------------------------------------------------------------- send
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum SendStatus {
@@ -15,7 +15,7 @@ pub enum SendStatus {
 }
 
 impl SendStatus {
-    /// 未知 code 一律回落 `SEND_OK`。
+    /// Unknown codes always fall back to `SEND_OK`.
     pub fn from_code(code: i32) -> SendStatus {
         match code {
             1 => SendStatus::FlushDiskTimeout,
@@ -118,7 +118,7 @@ impl SendResult {
 }
 
 impl fmt::Display for SendResult {
-    /// 逐字段渲染，日志/自检查里会比对这串文本。
+    /// Renders field by field; logging / self-check code compares this text.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -136,7 +136,7 @@ impl fmt::Display for SendResult {
     }
 }
 
-/// 可选字段的显示口径：`None` 就写 `None`。
+/// Display convention for optional fields: `None` is rendered as `None`.
 pub(crate) fn opt_str(value: &Option<String>) -> String {
     match value {
         Some(s) => s.clone(),
@@ -158,7 +158,7 @@ pub enum LocalTransactionState {
 }
 
 impl LocalTransactionState {
-    /// 事务应答 code 解析：未知值按 `UNKNOW`。
+    /// Transaction response code parsing: unknown values map to `UNKNOW`.
     pub fn from_code(code: i32) -> LocalTransactionState {
         match code {
             0 => LocalTransactionState::CommitMessage,
@@ -183,7 +183,7 @@ impl fmt::Display for LocalTransactionState {
     }
 }
 
-// ---------------------------------------------------------------- 拉取
+// ---------------------------------------------------------------- pull
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum PullStatus {
@@ -285,7 +285,7 @@ pub enum PopStatus {
 }
 
 impl PopStatus {
-    /// POP 应答解析：broker 给的是名字串，未知值按 `FOUND` 处理。
+    /// POP response parsing: the broker sends name strings; unknown values are treated as `FOUND`.
     pub fn from_name(name: &str) -> PopStatus {
         match name {
             "NO_NEW_MSG" => PopStatus::NoNewMsg,
@@ -311,8 +311,8 @@ impl fmt::Display for PopStatus {
     }
 }
 
-/// `start_offset_info` / `msg_offset_info` / `order_count_info` 保留 broker 原样字符串，
-/// 解析交给 [`crate::remoting::protocol::extra_info`]。
+/// `start_offset_info` / `msg_offset_info` / `order_count_info` keep the broker's raw strings;
+/// parsing is delegated to [`crate::remoting::protocol::extra_info`].
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct PopResult {
     pub status: PopStatus,
@@ -341,10 +341,10 @@ impl fmt::Display for PopResult {
     }
 }
 
-/// 对应 `change_invisible_time` 的结果。
+/// Result of `change_invisible_time`.
 ///
-/// `extra_info` 是用响应里**新的** popTime/invisibleTime/reviveQid 重建的 CK 串，
-/// 后续 ACK 必须用它，而不是请求时传进去的旧串。
+/// `extra_info` is the CK string rebuilt with the **new** popTime/invisibleTime/reviveQid from the response;
+/// subsequent ACKs must use it, not the old string passed in with the request.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ChangeInvisibleTimeResult {
     pub response_code: i32,
@@ -378,7 +378,7 @@ impl fmt::Display for ChangeInvisibleTimeResult {
     }
 }
 
-// ---------------------------------------------------------------- 消费
+// ---------------------------------------------------------------- consume
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConsumeReturnType {
@@ -458,8 +458,8 @@ impl fmt::Display for ConsumeOrderlyStatus {
 #[derive(Debug, Clone)]
 pub struct ConsumeConcurrentlyContext {
     pub message_queue: Option<MessageQueue>,
-    /// 缺省 0；为 0 时由投递线程改写成 `3 + reconsumeTimes`
-    /// （见 `consumer.rs` 的批量重投逻辑）。
+    /// Defaults to 0; when 0 the delivery thread rewrites it to `3 + reconsumeTimes`
+    /// (see the batch redelivery logic in `consumer.rs`).
     pub delay_level_when_next_consume: i32,
     pub ack_index: i32,
 }
@@ -528,7 +528,7 @@ mod tests {
         let result = SendResult::default();
         assert_eq!(result.status, SendStatus::SendOk);
         assert_eq!(result.queue_offset, 0);
-        // broker 默认回 TRACE_ON=true，缺省也要是 true
+        // The broker defaults to TRACE_ON=true, so the default here must also be true
         assert!(result.trace_on);
         assert_eq!(
             result.to_string(),
@@ -574,7 +574,7 @@ mod tests {
 
     #[test]
     fn pop_status_codes_differ_from_pull_status() {
-        // POLLING_FULL 是 2，而 PullStatus 的 2 是 NO_MATCHED_MSG —— 两套不能混用
+        // POLLING_FULL is 2, while PullStatus's 2 is NO_MATCHED_MSG -- the two sets must not be mixed
         assert_eq!(PopStatus::PollingFull as i32, 2);
         assert_eq!(PullStatus::NoMatchedMsg as i32, 2);
         assert_eq!(PopStatus::from_name("POLLING_NOT_FOUND"), PopStatus::PollingNotFound);
@@ -634,7 +634,7 @@ mod tests {
 
     #[test]
     fn consume_return_type_ordinals_are_stable() {
-        // 轨迹 contextCode 直接写 ordinal，顺序变了控制台就对不上
+        // Trace contextCode stores the ordinal directly; if the order changes the console will mismatch
         assert_eq!(ConsumeReturnType::Success.code(), 0);
         assert_eq!(ConsumeReturnType::TimeOut.code(), 1);
         assert_eq!(ConsumeReturnType::Exception.code(), 2);

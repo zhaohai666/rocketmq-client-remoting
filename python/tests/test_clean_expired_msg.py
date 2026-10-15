@@ -30,7 +30,7 @@ def stamp(m: MessageExt, ts_ms: int) -> MessageExt:
 
 
 class RecordingStop:
-    """假的 ``threading.Event``：记下每次 ``wait()`` 的超时，按剧本返回。"""
+    """Fake ``threading.Event``: records the timeout of every ``wait()`` and returns per script."""
 
     def __init__(self, results=()):
         self.results = list(results)
@@ -44,10 +44,10 @@ class RecordingStop:
 
 
 class Clock:
-    """可控时钟：替换 ``client.consumer`` 模块里的 ``time``。
+    """Controllable clock: replaces the ``time`` in the ``client.consumer`` module.
 
-    清扫的过期判据（``time.time()*1000 - stamp > consumeTimeout*60*1000``）必须能被
-    精确推到边界上，否则"严格大于"这条要么测不出来、要么靠 sleep 变得不稳定。
+    The expiry criterion for sweeping (``time.time()*1000 - stamp > consumeTimeout*60*1000``) must be
+    pushable exactly to the boundary, otherwise the "strictly greater" case is either untestable or made flaky by sleep.
     """
 
     def __init__(self, now_ms: float = 1_800_000_000_000.0):
@@ -58,7 +58,7 @@ class Clock:
 
 
 class Harness:
-    """一个不碰网络的消费者：队列/在途登记手动搭好，回投只记录。"""
+    """A consumer that never touches the network: queues / in-flight registration set up manually, send-back only recorded."""
 
     def __init__(self, consume_timeout=1, orderly=False):
         self.c = DefaultMQPushConsumer(GROUP)
@@ -108,7 +108,7 @@ class Harness:
         return sorted(m.queue_offset for m in self.c._process_queue_entries_locked(self.key))
 
 
-# ---------------------------------------------------------------- 调度节奏
+# ---------------------------------------------------------------- Scheduling cadence
 def test_sweep_schedule_initial_delay_equals_period(monkeypatch):
     pass
     c = DefaultMQPushConsumer(GROUP)
@@ -118,7 +118,7 @@ def test_sweep_schedule_initial_delay_equals_period(monkeypatch):
     stop = RecordingStop([False])
     c._stop = stop  # type: ignore[assignment]
     c._clean_expire_loop()
-    assert stop.timeouts == [900.0, 900.0]   # 首轮也要等满一个周期
+    assert stop.timeouts == [900.0, 900.0]   # the first round also waits a full period
     assert len(swept) == 1
 
     c2 = DefaultMQPushConsumer(GROUP + "_fast")
@@ -134,7 +134,7 @@ def test_sweep_schedule_initial_delay_equals_period(monkeypatch):
 
 
 def test_sweep_loop_exits_when_stopped_before_first_tick():
-    """shutdown 期间停住：首轮等待就被唤醒，不打任何清扫。"""
+    """Stopped during shutdown: the first wait is woken immediately, with no sweep at all."""
     c = DefaultMQPushConsumer(GROUP + "_stopped")
     c._started = True
     swept = []
@@ -160,7 +160,7 @@ def test_sweep_loop_survives_a_failing_pass():
     stop = RecordingStop([False, False])
     c._stop = stop  # type: ignore[assignment]
     c._clean_expire_loop()
-    assert len(calls) == 2, "首轮抛异常后必须继续下一轮"
+    assert len(calls) == 2, "the next round must continue after the first round raises"
 
 
 def test_sweep_thread_is_daemon_and_stops_with_the_flag():
@@ -175,7 +175,7 @@ def test_sweep_thread_is_daemon_and_stops_with_the_flag():
     assert not t.is_alive()
 
 
-# ---------------------------------------------------------------- 核心清扫语义
+# ---------------------------------------------------------------- Core sweep semantics
 def test_expired_first_entry_is_sent_back_at_delay_3_then_removed(monkeypatch):
     h = Harness()
     clock = Clock()
@@ -185,11 +185,11 @@ def test_expired_first_entry_is_sent_back_at_delay_3_then_removed(monkeypatch):
 
     h.sweep()
 
-    assert h.backed == [(m, 3)], "必须用固定 delayLevel 3 回投"
-    assert h.record_offsets == [], "回投成功且仍是队首 → 摘除"
+    assert h.backed == [(m, 3)], "must send back with the fixed delayLevel 3"
+    assert h.record_offsets == [], "send-back succeeded and still at the head → removed"
 
     h.sweep()
-    assert len(h.backed) == 1, "已摘除的不会在下一轮再被看见"
+    assert len(h.backed) == 1, "an already-removed one is not seen again in the next round"
 
 
 def test_unstamped_first_entry_blocks_the_whole_pass(monkeypatch):
@@ -197,7 +197,7 @@ def test_unstamped_first_entry_blocks_the_whole_pass(monkeypatch):
     h = Harness()
     clock = Clock()
     monkeypatch.setattr("client.consumer.time", clock)
-    head = msg(0)                                   # 未盖章
+    head = msg(0)                                   # unstamped
     tail = stamp(msg(1), int(clock.now_ms) - h.timeout_ms - 1)
     h.inflight([head, tail])
 
@@ -216,11 +216,11 @@ def test_expiry_is_strictly_greater_than_timeout(monkeypatch):
     h.inflight([boundary])
 
     h.sweep()
-    assert h.backed == [], "恰好等于阈值不许动手"
+    assert h.backed == [], "exactly at the threshold must not act"
 
     clock.now_ms += 1
     h.sweep()
-    assert h.backed_offsets == [0], "超过阈值 1ms 就该回投"
+    assert h.backed_offsets == [0], "1ms past the threshold should trigger send-back"
 
 
 def test_orderly_consumer_is_never_swept():
@@ -260,7 +260,7 @@ def test_failed_send_back_keeps_the_message_for_the_next_pass():
 
     h.sweep()
     assert h.backed == []
-    assert h.record_offsets == [0], "回投失败的消息必须留在原地等下一轮"
+    assert h.record_offsets == [0], "a message whose send-back failed must stay put for the next round"
 
     h.fail_offsets = set()
     h.sweep()
@@ -279,25 +279,25 @@ def test_sweep_only_looks_at_messages_registered_for_held_queues(monkeypatch):
     h.c._retire_queue_locked(h.key, None, [])
     h.c._clean_expired_msg_once()
 
-    assert h.backed == [], "队列已撤（登记一并清空）就不该再回投它上面的消息"
+    assert h.backed == [], "once the queue is retired (registration cleared), its messages must not be sent back again"
 
 
-# ---------------------------------------------------------------- 与消费路径的配合
+# ---------------------------------------------------------------- Interaction with the consume path
 def test_concurrent_batch_registers_inflight_and_send_back_proceeds(monkeypatch):
-    """对照腿：消息还在登记里（没被清扫）时，未认可的回投照常发生。"""
+    """Control leg: while the message is still registered (not swept), an unacknowledged send-back proceeds normally."""
     h = Harness()
     monkeypatch.setattr("client.consumer.time", Clock())
 
     class Listener:
         def consume_message(self, msgs, context):
-            assert h.c._inflight_msgs[h.key], "listener 运行时这批必须已登记在途"
+            assert h.c._inflight_msgs[h.key], "this batch must be registered in-flight while the listener runs"
             return ConsumeConcurrentlyStatus.RECONSUME_LATER
 
     h.c.message_listener = Listener()
     m = msg(0)
     assert h.c._consume_batch(h.key, h.mq, [m]) is True
     assert h.backed == [(m, 3)]
-    assert h.c._inflight_msgs.get(h.key) is None, "收尾后必须摘干净"
+    assert h.c._inflight_msgs.get(h.key) is None, "must be fully deregistered after wrap-up"
     assert h.c._consume_offsets[h.key] == 1
 
 
@@ -310,7 +310,7 @@ def test_send_back_skips_a_message_the_sweep_already_reclaimed(monkeypatch):
 
     class Listener:
         def consume_message(self, msgs, context):
-            # 模拟"listener 挂着不返回、清扫先动手"：把时钟推过阈值再触发清扫
+            # Simulate "the listener hangs without returning and the sweep acts first": push the clock past the threshold, then trigger the sweep
             clock.now_ms += h.timeout_ms + 1
             h.c._clean_expired_queue(h.key)
             swept.append(h.backed_offsets)
@@ -319,8 +319,8 @@ def test_send_back_skips_a_message_the_sweep_already_reclaimed(monkeypatch):
     h.c.message_listener = Listener()
     m = msg(0)
     assert h.c._consume_batch(h.key, h.mq, [m]) is True
-    assert swept == [[0]], "listener 期间清扫必须已把它回投"
-    assert h.backed == [(m, 3)], "整条链路上只允许一次回投"
+    assert swept == [[0]], "the sweep during the listener must have already sent it back"
+    assert h.backed == [(m, 3)], "only one send-back is allowed along the whole chain"
     assert h.c._consume_offsets[h.key] == 1
     assert h.c._inflight_msgs.get(h.key) is None
 
@@ -340,7 +340,7 @@ def test_sweep_can_reclaim_a_requeued_buffered_message(monkeypatch):
 
 
 def test_dispatch_loop_registers_inflight_and_deregisters_on_return():
-    """真分发循环的登记/摘除：listener 挂着时消息可见，返回后登记清空、位点前进。"""
+    """Registration/deregistration of the real dispatch loop: the message is visible while the listener hangs; after return, registration is cleared and the offset advances."""
     c = DefaultMQPushConsumer(GROUP + "_dispatch")
     c._started = True
     mq = MessageQueue(TOPIC, BROKER, 0)
@@ -362,7 +362,7 @@ def test_dispatch_loop_registers_inflight_and_deregisters_on_return():
     t = threading.Thread(target=c._dispatch_loop, daemon=True)
     t.start()
     try:
-        assert inside.wait(5), "listener 必须在分发线程里跑起来"
+        assert inside.wait(5), "the listener must be running in the dispatch thread"
         assert [m.queue_offset for m in c._inflight_msgs.get(key) or []] == [0]
     finally:
         release.set()

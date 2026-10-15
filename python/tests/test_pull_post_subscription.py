@@ -36,7 +36,7 @@ def test_find_broker_addr_in_subscribe_slave_miss_tries_next_id():
 
 
 def test_find_broker_addr_in_subscribe_falls_back_to_any_node():
-    # 不限定 brokerId（onlyThisBroker=false）时回退到 id 最小（=master）
+    # when brokerId is not restricted (onlyThisBroker=false), fall back to the smallest id (=master)
     assert MQClientInstance.find_broker_addr_in_subscribe({1: SLAVE}, 3) == (SLAVE, True)
     assert MQClientInstance.find_broker_addr_in_subscribe(_addrs(), 9) == (MASTER, False)
 
@@ -45,10 +45,10 @@ def test_find_broker_addr_in_subscribe_empty_table():
     assert MQClientInstance.find_broker_addr_in_subscribe({}, 0) == (None, False)
 
 
-# ---------------- pull_message 的 brokerId 选路与从节点 COMMIT_OFFSET 清位 ----------------
+# ---------------- pull_message's brokerId routing and slave COMMIT_OFFSET clearing ----------------
 
 class _Instance:
-    """最小可用 MQClientInstance：预置路由 + 记录 _invoke_sync 的地址与请求。"""
+    """A minimally usable MQClientInstance: preset route + records _invoke_sync's address and request."""
 
     def __init__(self, suggest, route):
         self.instance = MQClientInstance("ut@client", ["127.0.0.1:9876"],
@@ -58,7 +58,7 @@ class _Instance:
         self.instance.topic_route_table[TOPIC] = route
         self.requests = []
         self._suggest = suggest
-        # 替掉传输层：记录 (addr, request)，回 SUCCESS + suggest 头
+        # replace the transport layer: record (addr, request), reply SUCCESS + suggest header
         def _fake_invoke(addr, request, timeout_millis=None):
             self.requests.append((addr, request))
             response = RemotingCommand()
@@ -86,12 +86,12 @@ def test_pull_message_selects_slave_by_broker_id_and_clears_commit_offset():
     result = inst.instance.pull_message(GROUP, MQ, 0, 32, sys_flag, 0, None, 0, "TAG",
                                         broker_id=1)
 
-    # 选中了 brokerId=1（从节点），且 COMMIT_OFFSET 位被清掉
+    # brokerId=1 (slave) is selected, and the COMMIT_OFFSET bit is cleared
     assert inst.requests[0][0] == SLAVE
     req_header = inst.requests[0][1].custom_header
     assert not PullSysFlag.has_commit_offset_flag(req_header.sys_flag)
     assert PullSysFlag.has_suspend_flag(req_header.sys_flag)
-    # 应答的 suggestWhichBrokerId 透传给消费者（本轮回 0）
+    # the reply's suggestWhichBrokerId is passed through to the consumer (this round 0)
     assert result.suggest_which_broker_id == 0
 
 
@@ -104,10 +104,10 @@ def test_pull_message_master_id_keeps_commit_offset_flag():
     assert PullSysFlag.has_commit_offset_flag(inst.requests[0][1].custom_header.sys_flag)
 
 
-# ---------------- push 消费者：postSubscriptionWhenPull 门控 + suggest 回写 ----------------
+# ---------------- push consumer: postSubscriptionWhenPull gating + suggest write-back ----------------
 
 class _PullCapture:
-    """替身 client：只实现拉取循环用到的 pull_message。"""
+    """A stand-in client: implements only the pull_message used by the pull loop."""
 
     def __init__(self, suggest=1):
         self.calls = []
@@ -128,13 +128,13 @@ def _push_consumer():
     sub.tags_set = {"TagA"}
     c.subscription_data[TOPIC] = sub
     c._offset_table[c._mq_key(MQ)] = 0
-    # 拉取线程的持有判定替成恒真（真实现看 _queue_threads 注册表）
+    # replace the pull thread's ownership check with a constant true (the real implementation consults the _queue_threads registry)
     c._owns_queue = lambda key: True
     return c
 
 
 def _run_one_pull(c, client):
-    """把拉取循环跑一轮：第一轮 pull 返回后因队列线程不匹配而退出。"""
+    """Run the pull loop once: after the first pull returns it exits because the queue thread does not match."""
     c._mq_client = client
     t = threading.Thread(target=c._queue_pull_loop, args=(MQ,), daemon=True)
     t.start()
@@ -150,10 +150,10 @@ def test_push_subscription_bit_off_by_default():
     _run_one_pull(c, client)
 
     call = client.calls[0]
-    # 默认不发订阅表达式：subscription 位清零、请求头 subscription 为 None
+    # by default no subscription expression is sent: the subscription bit is cleared and the request header's subscription is None
     assert not PullSysFlag.has_subscription_flag(call["sys_flag"])
     assert call["subscription"] is None
-    # 首轮按 master 拉
+    # the first round pulls from master
     assert call["broker_id"] == MixAll.MASTER_ID
 
 

@@ -1,29 +1,34 @@
 #!/bin/bash
-# ACL 鉴权真机验证（起 namesrv + broker(authenticationEnabled=true) → 逐个客户端跑 → 收工）。
+# ACL authentication live verification (start namesrv + broker(authenticationEnabled=true) -> run each client -> wrap up).
 #
-# 用法: bash scripts/run_acl_live.sh [python|rust|csharp|cpp|all ...]   （默认 all）
+# Usage: bash scripts/run_acl_live.sh [python|rust|csharp|cpp|all ...]   (all by default)
 #
-# 为什么要有这个脚本：ACL 的假通过太多了 —— broker 没开鉴权时**正向场景照样全绿**，
-# 只有反向场景（无凭据 / 错 secretKey）才戳得穿；而「签名算错」与「没签名」在
-# broker 侧是同一种拒绝。所以每个脚本都成对断言「签名被接受」+「拒绝码必须是 16」，
-# 并且必须打真集群。本脚本负责把集群按 ACL 配置拉起来（本机没有现成的 ACL harness，
-# 仓库里另一份 scripts/rmq_test_broker.sh 是 macOS 的普通配置集群）。
+# Why this script exists: ACL produces too many false positives — when the broker has
+# authentication disabled, **positive scenarios stay fully green**; only negative scenarios
+# (no credentials / wrong secretKey) can pierce through, and "wrong signature" vs "no
+# signature" are the same rejection on the broker side. So each client script pairs the
+# assertions "signature accepted" + "rejection code must be 16", and must run against a real
+# cluster. This script is responsible for bringing the cluster up with ACL configuration
+# (there is no ready-made ACL harness on this machine; the other script in the repo,
+# scripts/rmq_test_broker.sh, is a plain macOS-configured cluster).
 #
-# ⚠ 集群 start + 等端口/路由 + 跑验证 + kill 必须在**同一条命令**里跑完：前台返回会回收
-#   后台 JVM。本脚本内部已经串好这条链，直接 `bash scripts/run_acl_live.sh all` 即可。
+# ⚠ Cluster start + waiting for ports/routes + running verification + kill must all finish
+#   within **the same command**: when a foreground command returns, the background JVMs are
+#   reaped. This script chains that internally already; just run `bash scripts/run_acl_live.sh all`.
 #
-# 全部路径可用环境变量覆盖（默认值是本机 Windows 开发机的形态）：
-#   RMQ_JAVA           java 可执行文件（需要 JDK 17+，本机用 LibericaJDK-21）
-#   RMQ_DIST_WIN       发行版目录的 **Windows** 形态路径（给 -cp / -c 用）
-#   RMQ_DIST           同一个目录的 MSYS/Git-Bash 形态路径（给读日志用）
-#   RMQ_ACL_STORE      broker store 根目录（Windows 形态，正斜杠；AuthConfig 取 $STORE/config）
-#   RMQ_ACL_LOG        namesrv/broker 的 stdout 落盘目录
-#   ROCKETMQ_NAMESRV   namesrv 地址（默认 127.0.0.1:9876）
-#   RMQ_ACL_AK / RMQ_ACL_SK  broker 里 initAuthenticationUser 建的 SUPER 用户凭据
-#   各端产物：RMQ_PY / RMQ_DOTNET / RMQ_CPP_ACL（默认指向本仓库构建产物）
+# All paths can be overridden via environment variables (defaults match this Windows dev machine):
+#   RMQ_JAVA           java executable (JDK 17+ required; LibericaJDK-21 on this machine)
+#   RMQ_DIST_WIN       the **Windows**-style path of the distribution directory (for -cp / -c)
+#   RMQ_DIST           the same directory in MSYS/Git-Bash form (for reading logs)
+#   RMQ_ACL_STORE      broker store root directory (Windows form, forward slashes; AuthConfig reads $STORE/config)
+#   RMQ_ACL_LOG        directory where namesrv/broker stdout lands
+#   ROCKETMQ_NAMESRV   namesrv address (default 127.0.0.1:9876)
+#   RMQ_ACL_AK / RMQ_ACL_SK  SUPER user credentials created by initAuthenticationUser in the broker
+#   Per-side artifacts: RMQ_PY / RMQ_DOTNET / RMQ_CPP_ACL (default to this repo's build outputs)
 #
-# broker 侧鉴权失败一律回 NO_PERMISSION(16)，具体原因只能看 remark：
-# 签名不对 → "check signature failed."；凭据缺失 → "username cannot be null."。
+# Broker-side authentication failures always return NO_PERMISSION(16); the specific reason can
+# only be seen in the remark: wrong signature -> "check signature failed."; missing credentials
+# -> "username cannot be null.".
 set -u
 
 CYGWIN_ROOT=${RMQ_CYGWIN_ROOT:-/c/Users/zhaoh}
@@ -51,9 +56,11 @@ if [ "${ENDS[0]}" = "all" ]; then ENDS=(python rust csharp cpp); fi
 mkdir -p "$LOGDIR"
 
 # ---------------------------------------------------------------- broker conf
-# 关掉鉴权的 broker 会让「无凭据被拒」这一半断言假绿，所以这份配置是脚本的核心产物：
-# authenticationMetadataProvider 必须显式给（不给就是 null，initAuthenticationUser 白写，
-# 所有请求都过不了鉴权），authenticationProvider 不给则默认 DefaultAuthenticationProvider。
+# A broker with authentication disabled makes the "no credentials rejected" half of the
+# assertions falsely green, so this config file is the script's core artifact:
+# authenticationMetadataProvider must be given explicitly (otherwise it is null,
+# initAuthenticationUser is written for nothing, and no request passes authentication);
+# without authenticationProvider, DefaultAuthenticationProvider is the default.
 cat > "$CONF" <<EOF
 brokerClusterName=DefaultCluster
 brokerName=broker-a
@@ -92,24 +99,25 @@ wait_port() {
     return 1
 }
 
-echo "=== [1/4] 起 nameServer ==="
+echo "=== [1/4] starting nameServer ==="
 rm -f "$DIST/logs/rocketmqlogs/namesrv.log"
 ( cd "$DIST" && ROCKETMQ_HOME="$DIST_WIN" "$JAVA" \
     -Drocketmq.home.dir="$DIST_WIN" -Xms512m -Xmx1g -cp "$DIST_WIN\\lib\\*" \
     org.apache.rocketmq.namesrv.NamesrvStartup > "$LOGDIR/namesrv.out" 2>&1 ) &
 NS_PID=$!
-wait_port 9876 || { echo "nameServer 没起来，看 $LOGDIR/namesrv.out"; tail -30 "$LOGDIR/namesrv.out"; exit 1; }
+wait_port 9876 || { echo "nameServer failed to start, see $LOGDIR/namesrv.out"; tail -30 "$LOGDIR/namesrv.out"; exit 1; }
 echo "nameServer UP"
 
-echo "=== [2/4] 起 broker（authenticationEnabled=true）==="
+echo "=== [2/4] starting broker (authenticationEnabled=true) ==="
 rm -f "$DIST/logs/rocketmqlogs/broker.log"
 ( cd "$DIST" && ROCKETMQ_HOME="$DIST_WIN" "$JAVA" \
     -Drocketmq.home.dir="$DIST_WIN" -Xms1g -Xmx1g -cp "$DIST_WIN\\lib\\*" \
     org.apache.rocketmq.broker.BrokerStartup -c "$CONF_WIN" > "$LOGDIR/broker.out" 2>&1 ) &
 BR_PID=$!
-wait_port $BROKER_PORT || { echo "broker 没起来，看 $LOGDIR/broker.out"; tail -40 "$LOGDIR/broker.out"; exit 1; }
+wait_port $BROKER_PORT || { echo "broker failed to start, see $LOGDIR/broker.out"; tail -40 "$LOGDIR/broker.out"; exit 1; }
 
-# 端口先于「向 namesrv 注册路由」就绪，不等就会拿不到 TBW102 路由而假失败。
+# The port opens before "routes are registered into the namesrv"; without waiting, TBW102
+# routes are missing and the run fails spuriously.
 i=0
 while [ "$i" -lt 60 ]; do
     grep -q "boot success" "$DIST/logs/rocketmqlogs/broker.log" 2>/dev/null && break
@@ -117,9 +125,9 @@ while [ "$i" -lt 60 ]; do
     i=$((i + 1))
 done
 sleep 12
-echo "broker UP（boot success + 12s 路由注册窗口）"
+echo "broker UP (boot success + 12s route registration window)"
 
-# ---------------------------------------------------------------- 跑各端
+# ---------------------------------------------------------------- run each client
 rc=0
 run_python() {
     cd "$ROOT/python" || return 1
@@ -154,9 +162,9 @@ for end in "${ENDS[@]}"; do
 done
 
 echo ""
-echo "=== [4/4] 收工 ==="
+echo "=== [4/4] wrap up ==="
 for end in "${ENDS[@]}"; do
     sum=$(grep -E "PASS=|passed," "$LOGDIR/$end.log" 2>/dev/null | tail -1)
-    echo "$end: ${sum:-无输出}"
+    echo "$end: ${sum:-no output}"
 done
 exit $rc

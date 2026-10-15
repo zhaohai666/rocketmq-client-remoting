@@ -5,17 +5,18 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * topic / group 名字的合法性判定。
+ * Legality checks for topic / group names.
  *
- * 协议里的字符表白名单是 ``^[%|a-zA-Z0-9_-]+$``，实现方式是一张 128 长的
- * ``VALID_CHAR_BIT_MAP``：**码点 >= 128 一律非法**。这里逐字节照抄，因为 broker 侧
- * （``TopicConfigValidator``）用的是同一张表，客户端放行而 broker 拒绝只会把错误推迟到
- * 建 topic 那一刻，而名字是**发送路径**上就该定的东西。
+ * The whitelist of allowed characters in the protocol is ``^[%|a-zA-Z0-9_-]+$``, implemented as a
+ * 128-entry ``VALID_CHAR_BIT_MAP``: **any code point >= 128 is illegal**. It is copied byte for byte
+ * here because the broker side (``TopicConfigValidator``) uses the same table, and letting the client
+ * accept a name that the broker rejects only defers the error to the moment the topic is created, while
+ * the name is something that should be settled **on the send path**.
  */
 final class TopicValidator
 {
     public const TOPIC_MAX_LENGTH = 127;
-    /** group 名要参与拼 %RETRY%group_topic / %DLQ%group_topic，所以比 topic 更短 */
+    /** A group name takes part in composing %RETRY%group_topic / %DLQ%group_topic, so it is shorter than a topic */
     public const GROUP_MAX_LENGTH = 120;
     public const RETRY_OR_DLQ_TOPIC_MAX_LENGTH = 255;
 
@@ -52,8 +53,9 @@ final class TopicValidator
     ];
 
     /**
-     * 客户端**不能直接发**的 topic：这几个是 broker 内部状态流水（半消息、延迟、轨迹校验…），
-     * 用户发进去会污染 broker 的事务/延迟/校验逻辑。
+     * The topics the client **must not send to** directly: these are internal broker state streams (half
+     * messages, delay, trace check...), and a user sending into them would pollute the broker's
+     * transaction / delay / check logic.
      */
     private const NOT_ALLOWED_SEND_TOPIC_SET = [
         self::RMQ_SYS_SCHEDULE_TOPIC,
@@ -69,10 +71,10 @@ final class TopicValidator
     private const ALLOWED_CHARS = '%-_|0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
 
     /**
-     * 空串返回 false（空由 isBlank 那步管）。
+     * Returns false for an empty string (emptiness is handled by the isBlank step).
      *
-     * 按字节遍历：合法字符全为 ASCII，任何 >= 0x80 的字节（即所有非 ASCII 码点）
-     * 一律非法——等价于逐码点判 >= 128。
+     * Iterates byte by byte: all legal characters are ASCII, so any byte >= 0x80 (that is, every
+     * non-ASCII code point) is illegal — equivalent to checking each code point for >= 128.
      */
     public static function isTopicOrGroupIllegal(string $name): bool
     {

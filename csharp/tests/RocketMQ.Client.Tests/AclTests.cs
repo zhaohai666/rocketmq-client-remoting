@@ -1,9 +1,9 @@
 //   RemotingCommand cmd = RemotingCommand.createRequestCommand(310, null);
 //   cmd.setExtFields(...); cmd.setBody(...);
 //   new AclClientRPCHook(new SessionCredentials(ak, sk[, token])).doBeforeRequest(addr, cmd);
-//   -> AclUtils.combineRequestContent(...) 与 cmd.getExtFields().get("Signature")
+//   -> AclUtils.combineRequestContent(...) and cmd.getExtFields().get("Signature")
 //
-// 任何一处拼接顺序 / 分隔符 / 字符集 / Base64 字母表的偏差都会立刻暴露。
+// Any deviation in concatenation order / separator / charset / Base64 alphabet shows up immediately.
 using System.Text;
 using RocketMQ.Common;
 using RocketMQ.Remoting;
@@ -44,7 +44,7 @@ public class AclTests
 
     private static string Hex(byte[] data) => Convert.ToHexString(data).ToLowerInvariant();
 
-    // ---------------------------------------------------------------- V1: 多字段 + body，无 token
+    // ---------------------------------------------------------------- V1: multiple fields + body, no token
     [Fact]
     public void V1_ContentAndSignatureMatchLegacy()
     {
@@ -60,7 +60,7 @@ public class AclTests
         Assert.Equal("qQhdzvXfV+g0r8LdwNCt+chJ4XY=", cmd.GetExtField(SessionCredentials.SignatureField));
     }
 
-    // ---------------------------------------------------------------- V2: 带 SecurityToken
+    // ---------------------------------------------------------------- V2: with SecurityToken
     [Fact]
     public void V2_TokenParticipatesInSignature()
     {
@@ -77,7 +77,7 @@ public class AclTests
             cmd.GetExtField(SessionCredentials.SignatureField));
     }
 
-    // ---------------------------------------------------------------- V3: 无 body
+    // ---------------------------------------------------------------- V3: no body
     [Fact]
     public void V3_WithoutBodyMatchesLegacy()
     {
@@ -89,7 +89,7 @@ public class AclTests
         Assert.Equal("d3vJKL2iRdr4ZykZfY+lxfQlfdc=", cmd.GetExtField(SessionCredentials.SignatureField));
     }
 
-    // ---------------------------------------------------------------- 插入顺序无关
+    // ---------------------------------------------------------------- Insertion order does not matter
     [Fact]
     public void SignatureIsIndependentOfInsertionOrder()
     {
@@ -109,7 +109,7 @@ public class AclTests
             b.GetExtField(SessionCredentials.SignatureField));
     }
 
-    // ---------------------------------------------------------------- Signature 必须被排除
+    // ---------------------------------------------------------------- Signature must be excluded
     [Fact]
     public void PreExistingSignatureFieldIsExcluded()
     {
@@ -123,13 +123,13 @@ public class AclTests
             AclClientRPCHook.BuildRequestContent(withoutSig),
             AclClientRPCHook.BuildRequestContent(withFakeSig));
 
-        // 两者算出的签名必须一致：Signature 不参与自己的签名
+        // both sides must compute the same signature: Signature does not take part in signing itself
         Assert.Equal(
             AclClientRPCHook.CalcSignature("SK", withoutSig),
             AclClientRPCHook.CalcSignature("SK", withFakeSig));
     }
 
-    // ---------------------------------------------------------------- HMAC-SHA1 原语（RFC 2202）
+    // ---------------------------------------------------------------- The HMAC-SHA1 primitive (RFC 2202)
     [Fact]
     public void HmacSha1MatchesRfc2202()
     {
@@ -139,10 +139,10 @@ public class AclTests
         Assert.Equal("effcdf6ae5eb2fa2d27416d5f184df9c259a7c79",
             Hex(Convert.FromBase64String(AclClientRPCHook.HmacSha1Base64(
                 "Jefe", Encoding.UTF8.GetBytes("what do ya want for nothing?")))));
-        // key 长于 64 字节块：必须先 SHA1 压缩成 20 字节再当 key。
-        // 注意 key 用 ASCII（80 个 'k'）：HmacSha1Base64 的 key 形参是 string，会按 UTF-8
-        // 编码成字节，用 (char)0xaa 这种非 ASCII 字符会编成 2 字节，向量就不成立了。
-        // 期望值是记录的黄金向量，可用标准 HMAC-SHA1 独立复算：
+        // a key longer than the 64-byte block: it must be compressed with SHA1 to 20 bytes and then used as the key.
+        // Note the key is ASCII (80 'k's): HmacSha1Base64's key parameter is a string and is encoded as UTF-8
+        // bytes, so a non-ASCII character like (char)0xaa would encode as 2 bytes and the vector would not hold.
+        // The expected values are recorded golden vectors that can be independently recomputed with a standard HMAC-SHA1:
         //   HMAC-SHA1(key=b'k'*80, msg=b'Test Using Larger Than Block-Size Key - Hash Key First')
         Assert.Equal("a08bbef5673f2c2a8bc6faf91fb5fb9b5ef7da35",
             Hex(Convert.FromBase64String(AclClientRPCHook.HmacSha1Base64(
@@ -150,17 +150,17 @@ public class AclTests
                 Encoding.UTF8.GetBytes("Test Using Larger Than Block-Size Key - Hash Key First")))));
     }
 
-    // ---------------------------------------------------------------- 标准 Base64（RFC 4648）
+    // ---------------------------------------------------------------- Standard Base64 (RFC 4648)
     [Fact]
     public void Base64IsStandardAlphabet()
     {
         Assert.Equal("TWFu", Convert.ToBase64String(Encoding.UTF8.GetBytes("Man")));
         Assert.Equal("TQ==", Convert.ToBase64String(Encoding.UTF8.GetBytes("M")));
-        // 标准字母表含 '+' '/'（URL-safe 会用 -_ 代替）
+        // the standard alphabet contains '+' '/' (URL-safe substitutes -_)
         Assert.Equal("+/+/", Convert.ToBase64String(new byte[] { 0xfb, 0xff, 0xbf }));
     }
 
-    // ---------------------------------------------------------------- 未注册钩子 = 零改动
+    // ---------------------------------------------------------------- No hook registered = zero changes
     [Fact]
     public void NoHookMeansNoMutation()
     {
@@ -170,7 +170,7 @@ public class AclTests
         Assert.Equal(string.Empty, cmd.GetExtField(SessionCredentials.SignatureField));
     }
 
-    // ---------------------------------------------------------------- 钩子注册语义：first-wins
+    // ---------------------------------------------------------------- Hook registration semantics: first-wins
     [Fact]
     public void RegisterRpcHookIsFirstWins()
     {
@@ -179,14 +179,15 @@ public class AclTests
         var second = new AclClientRPCHook(new SessionCredentials("AK2", "SK2"));
 
         Assert.True(client.RegisterRpcHook(first));
-        Assert.False(client.RegisterRpcHook(second)); // 已有钩子 → 不覆盖
+        Assert.False(client.RegisterRpcHook(second)); // a hook already exists -> not overwritten
         client.UnregisterRpcHook();
-        Assert.True(client.RegisterRpcHook(second)); // 注销后可再注册
+        Assert.True(client.RegisterRpcHook(second)); // it can be registered again after unregistering
     }
 
-    // ------------------------------------------------- stream + ACL 的组合顺序（ReqT 必须在签名内）
+    // ------------------------------------------------- The combination order of stream + ACL (ReqT must be inside the signature)
 
-    /// 传输层只有一槽，顺序靠 RequestHooks.Compose 还原；这里锁住它返回的形状。
+    /// The transport layer has only one slot, and the order is restored by
+    /// RequestHooks.Compose; the shape it returns is pinned here.
     [Fact]
     public void ComposeFollowsLegacyHookOrder()
     {
@@ -197,12 +198,13 @@ public class AclTests
         Assert.IsType<StreamTypeRPCHook>(RequestHooks.Compose(true, null));
 
         var chain = Assert.IsType<ChainedRpcHook>(RequestHooks.Compose(true, acl));
-        Assert.IsType<StreamTypeRPCHook>(chain.Hooks[0]); // stream 在前
-        Assert.Same(acl, chain.Hooks[1]); // 用户钩子（签名）在后
+        Assert.IsType<StreamTypeRPCHook>(chain.Hooks[0]); // stream comes first
+        Assert.Same(acl, chain.Hooks[1]); // the user hook (the signature) comes after
     }
 
-    /// 开 stream 时 ReqT 必须落在签名内容里：用签名后的 ExtFields 复算一次，能对上就说明
-    /// broker 按同样口径复算也能对上。
+    /// With stream on, ReqT must land inside the signed content: recomputing once from the
+    /// post-signature ExtFields and getting a match means the broker recomputing it the
+    /// same way will match too.
     [Fact]
     public void ReqTIsSignedWhenStreamTypeHookRunsFirst()
     {
@@ -218,7 +220,8 @@ public class AclTests
             cmd.GetExtField(SessionCredentials.SignatureField));
     }
 
-    /// 反证：顺序写反时同一套断言必须红，否则上一条测试没有牙齿。
+    /// Counter-proof: with the order reversed the same assertions must go red, otherwise
+    /// the previous test has no teeth.
     [Fact]
     public void ReversedHookOrderBreaksTheSignature()
     {

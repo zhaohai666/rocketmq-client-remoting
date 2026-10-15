@@ -28,23 +28,24 @@ _S5_REP_TEXT = {
     0x08: "address type not supported",
 }
 
-# ---- SOCKS5 用户名密码子协商（RFC 1929）----
+# ---- SOCKS5 username/password sub-negotiation (RFC 1929) ----
 _UP_VERSION = 0x01
 
-# ---- SOCKS4（含 4a 域名扩展）----
+# ---- SOCKS4 (including the 4a domain extension) ----
 _S4_VERSION = 0x04
 _S4_CMD_CONNECT = 0x01
 _S4_GRANTED = 0x5A
-# SOCKS4a：目标地址填 0.0.0.x（x 非 0）并在 userid 后跟域名，指示代理做解析
+# SOCKS4a: the target address is filled with 0.0.0.x (x non-zero) and the domain follows the
+# userid, telling the proxy to do the resolution
 _S4A_IP_PLACEHOLDER = b"\x00\x00\x00\x01"
 
 
 class SocksProxyError(Exception):
-    """SOCKS 握手失败（协议层拒绝 / 版本不符 / 连接被代理解）。"""
+    """SOCKS handshake failure (rejected at the protocol level / version mismatch / connection closed by the proxy)."""
 
 
 def _recv_exact(sock: socket.socket, n: int) -> bytes:
-    """收满 n 字节；对端提前关连接视为握手失败（SOCKS 应答长度是定死的）。"""
+    """Receive exactly n bytes; the peer closing the connection early counts as a handshake failure (the SOCKS reply length is fixed)."""
     buf = bytearray()
     while len(buf) < n:
         chunk = sock.recv(n - len(buf))
@@ -61,7 +62,7 @@ class SocksProxyConfig:
                  proxy_type: str = SOCKS5, username: str = "", password: str = "",
                  enable: Optional[bool] = None):
         addr = str(addr or "").strip()
-        if addr.startswith("["):  # IPv6 字面量 [::1]:1080
+        if addr.startswith("["):  # IPv6 literal [::1]:1080
             host, _, rest = addr[1:].partition("]")
             tail = rest.lstrip(":")
             if port is None and tail:
@@ -89,13 +90,13 @@ class SocksProxyConfig:
         self.enable = enable
 
     def is_enabled(self) -> bool:
-        """enable 语义：显式开关优先；未显式设置（None）时 addr 非空即视为开启。"""
+        """The enable semantics: an explicit switch wins; when it is not set explicitly (None), a non-empty addr means enabled."""
         if self.enable is None:
             return bool(self.addr)
         return bool(self.enable)
 
     def endpoint(self):
-        """代理自己的 (host, port)；addr 为空或缺端口即配置不完整，直接抛。"""
+        """The proxy's own (host, port); an empty addr or a missing port means the configuration is incomplete, so it raises right away."""
         if not self.addr:
             raise SocksProxyError("socks proxy addr is empty")
         if not self.port:
@@ -117,7 +118,7 @@ class SocksProxyConfig:
 
 
 def _encode_socks5_target(host: str, port: int) -> bytes:
-    """CONNECT 请求的目标地址段（atyp + addr + port）。域名交给代理解析。"""
+    """The target address segment of a CONNECT request (atyp + addr + port). A domain name is left for the proxy to resolve."""
     try:
         return b"\x01" + socket.inet_aton(host) + struct.pack(">H", port)
     except OSError:
@@ -170,7 +171,7 @@ def _socks5_handshake(sock: socket.socket, host: str, port: int,
     if rep != _S5_REP_SUCCEEDED:
         raise SocksProxyError("socks5 CONNECT failed: 0x%02x (%s)"
                               % (rep, _S5_REP_TEXT.get(rep, "unknown")))
-    # 3) 吃掉 BND.ADDR/BND.PORT（后续字节流已属于 RocketMQ 帧，不能漏读）
+    # 3) Consume BND.ADDR/BND.PORT (the following bytes already belong to the RocketMQ frame and must not be left unread)
     atyp = resp[3]
     if atyp == 0x01:
         _recv_exact(sock, 4 + 2)
@@ -185,8 +186,9 @@ def _socks5_handshake(sock: socket.socket, host: str, port: int,
 
 def _socks4_handshake(sock: socket.socket, host: str, port: int,
                       config: SocksProxyConfig) -> None:
-    # SOCKS4 没有方法协商；目标若是域名则走 4a 扩展（ver 仍 4，地址填
-    # 0.0.0.x 占位，userid 后跟以 NUL 结尾的域名，由代理解析）。
+    # SOCKS4 has no method negotiation; when the target is a domain name it uses the 4a
+    # extension (ver stays 4, the address is filled with the 0.0.0.x placeholder, and the
+    # NUL-terminated domain follows the userid for the proxy to resolve).
     try:
         ip_bytes = socket.inet_aton(host)
         domain_tail = b""
@@ -204,12 +206,14 @@ def _socks4_handshake(sock: socket.socket, host: str, port: int,
 
 def socks_handshake(sock: socket.socket, host: str, port: int,
                     config: SocksProxyConfig) -> None:
-    """在已连上代理的 ``sock`` 上对 ``host:port`` 做 SOCKS CONNECT 握手。
+    """Perform a SOCKS CONNECT handshake for ``host:port`` on a ``sock`` that is already connected to the proxy.
 
-    调用前提：``sock`` 已经 TCP 连到代理（``RemotingClient._create_conn`` 负责），
-    且处于超时受控状态（建连超时同样约束握手耗时）。成功返回后该套接字
-    等价于一条到目标的直连；失败抛 ``SocksProxyError``，由调用方收口成
-    ``RemotingConnectException``（与直连被拒同一出口，调用方无需新增异常分支）。
+    Preconditions: ``sock`` is already TCP-connected to the proxy (``RemotingClient._create_conn``
+    takes care of that) and is under timeout control (the connect timeout bounds the handshake
+    duration as well). On success the socket is equivalent to a direct connection to the
+    target; on failure ``SocksProxyError`` is raised and the caller turns it into a
+    ``RemotingConnectException`` (the same exit as a rejected direct connection, so callers
+    need no extra exception branch).
     """
     if config.proxy_type == SOCKS5:
         _socks5_handshake(sock, host, port, config)

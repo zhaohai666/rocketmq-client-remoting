@@ -8,7 +8,7 @@ from client.consumer import (_build_local_offsets_json,
                                        DefaultMQPushConsumer)
 from common.message import MessageQueue
 
-# 真实 fastjson2 2.0.59 + rocketmq-client 5.5.0 的输出（含 pretty 版）
+# Real output of fastjson2 2.0.59 + rocketmq-client 5.5.0 (including the pretty version)
 FASTJSON_OFFSETS_COMPACT = ('{"offsetTable":{{"brokerName":"broker-a","queueId":1,"topic":"Tt"}:9,'
                 '{"brokerName":"broker-a","queueId":0,"topic":"Tt"}:7}}')
 FASTJSON_OFFSETS_PRETTY = ('{\n\t"offsetTable":{\n\t\t{"brokerName":"broker-a","queueId":0,'
@@ -24,7 +24,7 @@ def test_build_uses_the_object_as_key_format():
     text = _build_local_offsets_json(
         {"Ttbroker-a0": 7, "Ttbroker-a1": 9}, _mq_map())
     assert text.startswith('{"offsetTable":{')
-    # 字段序 brokerName/queueId/topic（fastjson2 字母序），每个 key 是内嵌对象
+    # Field order brokerName/queueId/topic (fastjson2 alphabetical), each key is an inline object
     assert '"brokerName":"broker-a","queueId":0,"topic":"Tt"}:7' in text
     assert '"brokerName":"broker-a","queueId":1,"topic":"Tt"}:9' in text
 
@@ -96,11 +96,11 @@ def test_load_main_then_bak_fallback(offset_home):
     c._save_local_offsets()
     assert c._load_local_offsets()["Ttbroker-a0"] == 99
 
-    # 主文件缺失 → .bak（上一代）
+    # main file missing → .bak (previous generation)
     os.remove(path)
     assert c._load_local_offsets()["Ttbroker-a0"] == 7
 
-    # .bak 也缺失 → 空（按首次启动处理）
+    # .bak missing too → empty (treated as first startup)
     os.remove(path + ".bak")
     assert c._load_local_offsets() == {}
 

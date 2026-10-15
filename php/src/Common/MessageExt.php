@@ -5,8 +5,8 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * 拉取到的消息：Message 的字段加上 broker 回填的队列 / 位点 / 收发主机 /
- * 重投次数等存储侧信息。
+ * A pulled message: the fields of Message plus the storage-side information filled in by the broker,
+ * such as the queue / offset / producer and consumer hosts / redelivery count.
  */
 class MessageExt extends Message
 {

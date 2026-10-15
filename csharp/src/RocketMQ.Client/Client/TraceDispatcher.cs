@@ -1,11 +1,11 @@
-// 职责：钩子把 TraceContext 丢进内存队列（Append），后台线程按
-// 「攒够 batchNum 条 或 距上次发送超过 5s」两个条件触发刷写，再把编码后的文本
-// 用**独立的内部生产者**发到轨迹 topic（默认 RMQ_SYS_TRACE_TOPIC）。
+// Responsibility: hooks drop a TraceContext into an in-memory queue (Append); a background thread flushes when either
+// "enough batchNum records accumulated OR more than 5s since last send" is met, then sends the encoded text
+// with a **dedicated internal producer** to the trace topic (default RMQ_SYS_TRACE_TOPIC).
 //
 //
-// **防递归**：内部生产者自身的 EnableTrace 必须为 false，且
-// SendMessageTraceHook 会跳过 topic 以轨迹 topic 开头的消息 —— 两道保险都要有，
-// 否则轨迹会自我复制到无限。
+// **Recursion guard**: the internal producer's own EnableTrace must be false, and
+// SendMessageTraceHook skips messages whose topic starts with the trace topic prefix — both safeguards are required,
+// otherwise the trace would self-replicate without bound.
 using System.Collections.Concurrent;
 using System.Text;
 using System.Threading;
@@ -21,7 +21,7 @@ public enum TraceDispatcherType
     Consume = 1,
 }
 
-/// <summary>轨迹异步分发器（对应 AsyncTraceDispatcher）。</summary>
+/// <summary>Async trace dispatcher (corresponds to AsyncTraceDispatcher).</summary>
 public sealed class AsyncTraceDispatcher
 {
     private static int _counter = 1;
@@ -60,13 +60,13 @@ public sealed class AsyncTraceDispatcher
         _traceProducer = CreateTraceProducer(rpcHook);
     }
 
-    // ---------------- 内部生产者 ----------------
+    // ---------------- Internal producer ----------------
     private DefaultMQProducer CreateTraceProducer(IRpcHook? rpcHook)
     {
         string groupName = TraceConstants.GroupNamePrefix + "-" + _group + "-" + _type + "-"
                             + Interlocked.Increment(ref _counter);
         var producer = new DefaultMQProducer(groupName);
-        // ACL 钩子透传：轨迹消息同样要能通过认证集群（null 表示宿主未开 ACL）
+        // ACL hook passthrough: trace messages must also be able to pass through authenticated clusters (null means the host did not enable ACL)
         if (rpcHook is not null)
         {
             producer.SetRpcHook(rpcHook);
@@ -74,7 +74,7 @@ public sealed class AsyncTraceDispatcher
 
         producer.SendMsgTimeout = 5000;
         producer.MaxMessageSize = _maxMsgSize;
-        // ⚠ 必须关闭自身的轨迹，否则轨迹消息会被再次追踪 → 无限递归
+        // WARNING: must turn off its own tracing, otherwise trace messages would be traced again -> infinite recursion
         producer.EnableTrace = false;
         return producer;
     }
@@ -83,15 +83,15 @@ public sealed class AsyncTraceDispatcher
 
     public string NamespaceV2 { get; set; } = string.Empty;
 
-    /// <summary>当前待发送的轨迹条数（轨迹队列的积压量）。
-    /// 队列满时 Append 会返回 false 并丢弃，这里是唯一的观测点。</summary>
+    /// <summary>Number of trace records pending to be sent (the backlog of the trace queue).
+    /// When the queue is full, Append returns false and drops the record; this is the only observation point.</summary>
     public int QueueSize => _queue.Count;
 
     public void SetHostProducer(object host) => _hostProducer = host;
 
     public void SetHostConsumer(object host) => _hostConsumer = host;
 
-    /// <summary>宿主客户端的 clientId（EndTransaction 轨迹的 clientHost 用它）。</summary>
+    /// <summary>The host client's clientId (used by the EndTransaction trace's clientHost).</summary>
     public string ClientId()
     {
         if (_hostProducer is DefaultMQProducer producer)
@@ -107,7 +107,7 @@ public sealed class AsyncTraceDispatcher
         return string.Empty;
     }
 
-    // ---------------- 生命周期 ----------------
+    // ---------------- Lifecycle ----------------
     public void Start(List<string> nameSrvAddr, AccessChannel accessChannel)
     {
         lock (_lock)
@@ -163,7 +163,7 @@ public sealed class AsyncTraceDispatcher
         }
     }
 
-    // ---------------- 入队 / 刷写 ----------------
+    // ---------------- Enqueue / flush ----------------
     public bool Append(TraceContext ctx)
     {
         return _queue.TryAdd(ctx);
@@ -249,7 +249,7 @@ public sealed class AsyncTraceDispatcher
         });
     }
 
-    // ---------------- 发送 ----------------
+    // ---------------- Send ----------------
     private void SendTraceData(List<TraceContext> contextList)
     {
         var beanMap = new Dictionary<string, List<TraceTransferBean>>();
@@ -328,7 +328,7 @@ public sealed class AsyncTraceDispatcher
     private void SendTraceDataByMq(HashSet<string> keySet, string data, string traceTopic)
     {
         var msg = new Message(traceTopic, Encoding.UTF8.GetBytes(data));
-        // keys 里放的是**原始消息的 msgId**（不是 offsetMsgId），控制台按它反查轨迹
+        // keys holds the **original message's msgId** (not offsetMsgId); the console uses it to look up the trace
         var keys = new List<string>(keySet);
         keys.Sort(StringComparer.Ordinal);
         msg.Keys = string.Join(MessageConst.KeySeparator, keys);

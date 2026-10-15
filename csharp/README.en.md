@@ -35,12 +35,12 @@ Measured on this machine:
 
 | Command | Result |
 | --- | --- |
-| `dotnet build --no-incremental` | `0 个警告` / `0 个错误` (0 warnings / 0 errors), elapsed `00:00:17.94` |
-| `dotnet test tests/RocketMQ.Client.Tests` | `已通过! - 失败: 0，通过: 856，已跳过: 0，总计: 856，持续时间: 2 m 53 s` (0 failed / 856 passed / 2 m 53 s) |
+| `dotnet build --no-incremental` | `0 Warning(s)` / `0 Error(s)`, elapsed `00:00:17.94` |
+| `dotnet test tests/RocketMQ.Client.Tests` | `Passed! - Failed: 0, Passed: 856, Skipped: 0, Total: 856, Duration: 2 m 53 s` |
 
 `Directory.Build.props` turns `TreatWarningsAsErrors=true` on globally, so "builds" means "builds with
-zero warnings". The test summary line follows the machine locale — this box prints it in Chinese, so
-grep for `总计:` when parsing.
+zero warnings". The test summary line follows the machine locale — grep for `Passed!` / `Failed:` when
+parsing, and be aware a non-English locale prints localized labels.
 
 The example project builds a single executable named `rmq` holding all live-cluster cases as
 subcommands:

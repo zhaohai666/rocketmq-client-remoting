@@ -1,11 +1,11 @@
-//! [`DefaultLitePullConsumer`] 对**真实 5.5.1 broker** 的联调验证。
+//! Live verification of [`DefaultLitePullConsumer`] against a **real 5.5.1 broker**.
 //!
-//! 覆盖 S1..S6 六个基础场景，另外补了 pause/resume、
-//! 手工心跳、以及「`seek()` 会丢掉缓冲里该队列早于目标位点的消息」这三条
-//! （L7/L8/L4）——它们都只有真机能验（后台拉取循环 + broker 侧位点与订阅）。
+//! Covers the six basic scenarios S1..S6, plus three additions: pause/resume, manual heartbeat,
+//! and "seek() drops buffered messages of that queue older than the target offset" (L7/L8/L4) --
+//! only a real broker can verify these (background pull loop + broker-side offsets and subscriptions).
 //!
 //!
-//! 用法（先按项目记忆里记的 runbook 起本地集群）：
+//! Usage (first start the local cluster per the runbook recorded in project memory):
 //! ```text
 //! cargo run --example live_lite_pull_consumer -- 127.0.0.1:9876
 //! ```
@@ -32,13 +32,13 @@ use rocketmq_client_remoting::common::topic_config::{TopicFilterType, DEFAULT_PE
 use rocketmq_client_remoting::remoting::protocol::heartbeat::ConsumeFromWhere;
 use rocketmq_client_remoting::remoting::protocol::route::TopicRouteData;
 
-/// 测试 topic 的队列数与消息条数（12 条，TagA/TagB 交替 → 各 6 条）。
+/// Queue count and message count of the test topic (12 messages, TagA/TagB alternating -> 6 each).
 const QUEUE_NUMS: i32 = 4;
 const N_MSG: usize = 12;
-/// 等后台拉取循环把消息灌进缓冲的最长秒数。
+/// Max seconds to wait for the background pull loop to fill the buffer.
 const WAIT_SECONDS: u64 = 30;
 
-// ------------------------------------------------------------------ 骨架
+// ------------------------------------------------------------------ skeleton
 
 fn stamp() -> String {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -47,7 +47,7 @@ fn stamp() -> String {
     }
 }
 
-/// 断言累积器：一次跑完所有场景再汇总，首个失败不提前退出。
+/// Assertion accumulator: run every scenario once, then summarize; the first failure does not exit early.
 struct Checker {
     passed: u32,
     failed: Vec<String>,
@@ -102,11 +102,11 @@ fn wall_clock(secs_offset: i64) -> String {
     dt.format("%Y%m%d%H%M%S").to_string()
 }
 
-/// 等首轮重平衡把队列分下来。
+/// Wait for the first rebalance to hand out queues.
 ///
-/// ⚠ lite 的 `start()` **不**同步重平衡（起后台循环后由
-/// `_pull_service_loop` 每 >1s 触发一次），所以刚 start 时 `assignment()` 可能是空的。
-/// 这里显式 `rebalance()` 催一次，别把「最终一致」测成「瞬时一致」。
+/// ⚠ lite's `start()` does **not** rebalance synchronously (once the background loop is up,
+/// `_pull_service_loop` triggers one every >1s), so `assignment()` may be empty right after
+/// start. Nudge an explicit `rebalance()` here; never test "eventually consistent" as "instantly consistent".
 async fn wait_assignment(c: &DefaultLitePullConsumer, want: usize, secs: u64) -> Vec<MessageQueue> {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
@@ -119,7 +119,7 @@ async fn wait_assignment(c: &DefaultLitePullConsumer, want: usize, secs: u64) ->
     }
 }
 
-/// 反复 `poll` 直到累计够 `want` 条或超时（消息是后台循环灌进缓冲的，不能 sleep 赌）。
+/// Repeatedly `poll` until `want` messages accumulate or timeout (the background loop fills the buffer; never gamble on a sleep).
 async fn poll_bounded(c: &DefaultLitePullConsumer, want: usize, secs: u64) -> Vec<MessageExt> {
     let mut got: Vec<MessageExt> = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(secs);
@@ -129,17 +129,17 @@ async fn poll_bounded(c: &DefaultLitePullConsumer, want: usize, secs: u64) -> Ve
     got
 }
 
-// ------------------------------------------------------------------ 夹具
+// ------------------------------------------------------------------ fixture
 
 struct Fixture {
     namesrv: String,
     stamp: String,
     producer: DefaultMQProducer,
-    /// 建/删 topic 用的运维实例。
+    /// Admin instance used to create/delete topics.
     admin: MQClientInstance,
     broker_name: String,
     broker_addr: String,
-    /// 本次建过的 topic，L10 统一删掉。
+    /// Topics created in this run; L10 deletes them all.
     topics: Mutex<Vec<String>>,
 }
 
@@ -191,7 +191,7 @@ impl Fixture {
         format!("rust-live-lite-{kind}-{}", self.stamp)
     }
 
-    /// 显式建 topic（不靠 `autoCreateTopicEnable`，队列数才确定）。
+    /// Create the topic explicitly (not relying on `autoCreateTopicEnable`, so the queue count is deterministic).
     async fn create_topic(&self, topic: &str, queues: i32) -> Result<(), String> {
         self.admin
             .create_topic_in_broker(
@@ -214,7 +214,7 @@ impl Fixture {
         Ok(())
     }
 
-    /// 按组名建 lite 消费者（未订阅、未 start；起点由调用方 `set_consume_from_where`）。
+    /// Build a lite consumer for a group name (not subscribed, not started; the caller sets the start point via `set_consume_from_where`).
     fn consumer(&self, kind: &str) -> Result<DefaultLitePullConsumer, String> {
         let cfg = LitePullConsumerConfig {
             consumer_group: self.group_name(kind),
@@ -226,8 +226,8 @@ impl Fixture {
         DefaultLitePullConsumer::with_config(cfg).map_err(|e| format!("{kind} build failed: {e}"))
     }
 
-    /// 建好、订阅、已 start 的消费者（订阅必须早于 start：
-    /// `start()` 里那次同步心跳要带上订阅集）。
+    /// Built, subscribed, started consumer (subscribing must precede start:
+    /// the synchronous heartbeat inside `start()` must carry the subscription set).
     async fn subscribed(
         &self,
         ck: &mut Checker,
@@ -240,7 +240,7 @@ impl Fixture {
         let c = match self.consumer(kind) {
             Ok(c) => c,
             Err(e) => {
-                ck.abort(&format!("{kind} 构造"), &e);
+                ck.abort(&format!("{kind} build"), &e);
                 return None;
             }
         };
@@ -258,7 +258,7 @@ impl Fixture {
         Some(c)
     }
 
-    /// 交替发 TagA/TagB（偶数下标 TagA），body = `<topic>-<i:02>`。
+    /// Send TagA/TagB alternately (even indexes are TagA); body = `<topic>-<i:02>`.
     async fn produce_alternating(&self, topic: &str) -> usize {
         let mut ok = 0;
         for i in 0..N_MSG {
@@ -285,7 +285,7 @@ fn broker_of(route: &TopicRouteData) -> Result<(String, String), String> {
     Ok((bd.broker_name.clone(), addr))
 }
 
-/// 业务 topic 的全部队列（走运维实例的路由，不依赖消费者）。
+/// All queues of the business topic (routed via the admin instance, not the consumer).
 async fn route_queues(fx: &Fixture, topic: &str) -> Vec<MessageQueue> {
     fx.admin
         .get_topic_publish_info(topic, false)
@@ -298,51 +298,51 @@ fn expected_bodies(topic: &str) -> BTreeSet<String> {
     (0..N_MSG).map(|i| format!("{topic}-{i:02}")).collect()
 }
 
-// ------------------------------------------------------------- L1 生命周期
+// ------------------------------------------------------------- L1 lifecycle
 
 async fn l1_lifecycle(ck: &mut Checker, fx: &Fixture) {
     let c = match fx.consumer("bare") {
         Ok(c) => c,
         Err(e) => {
-            ck.abort("L1 构造", &e);
+            ck.abort("L1 build", &e);
             return;
         }
     };
     match c.start().await {
-        Ok(()) => ck.check("L1 未订阅时 start 失败", false, "start 竟然成功了"),
+        Ok(()) => ck.check("L1 start fails without a subscription", false, "start unexpectedly succeeded"),
         Err(e) => ck.check(
-            "L1 未订阅时 start 失败",
+            "L1 start fails without a subscription",
             e.to_string().contains("subscription is not set"),
             &e.to_string(),
         ),
     }
-    ck.check("L1 失败后不残留 started 状态", !c.is_started(), "");
+    ck.check("L1 no started state left behind after failure", !c.is_started(), "");
     ck.check(
-        "L1 未 start 时 poll 返回空",
+        "L1 poll returns empty before start",
         c.poll(Some(100)).await.is_empty(),
         "",
     );
-    ck.check("L1 未 start 时 is_running 为 false", !c.is_running(), "");
+    ck.check("L1 is_running is false before start", !c.is_running(), "");
 
-    // consumeTimestamp 只认 14 位墙钟：epoch 毫秒必须被拒（否则会被当成 epoch 解析，
-    // 起点直接跑到几十年后 —— 静默退化成「从 max offset 消费」）。
+    // consumeTimestamp only accepts 14-digit wall clock: epoch millis must be rejected (otherwise parsed
+    // as an epoch, the start point jumps decades ahead -- silently degrading to "consume from max offset").
     c.subscribe(&fx.topic_name("Ts"), "*");
     c.set_consume_timestamp("1789000000000");
     match c.start().await {
-        Ok(()) => ck.check("L1 非法 consumeTimestamp 被拒", false, "start 竟然成功了"),
+        Ok(()) => ck.check("L1 invalid consumeTimestamp is rejected", false, "start unexpectedly succeeded"),
         Err(e) => ck.check(
-            "L1 非法 consumeTimestamp 被拒",
+            "L1 invalid consumeTimestamp is rejected",
             e.to_string().contains("consumeTimestamp is invalid"),
             &e.to_string(),
         ),
     }
-    ck.check("L1 校验失败后回到未启动", !c.is_started(), "");
+    ck.check("L1 back to not-started after the validation failure", !c.is_started(), "");
 
-    // assign 模式（不需要订阅表）+ 幂等性。
+    // Assign mode (no subscription table needed) + idempotency.
     let c2 = match fx.consumer("life") {
         Ok(c) => c,
         Err(e) => {
-            ck.abort("L1 构造", &e);
+            ck.abort("L1 build", &e);
             return;
         }
     };
@@ -351,15 +351,15 @@ async fn l1_lifecycle(ck: &mut Checker, fx: &Fixture) {
         &fx.broker_name,
         0,
     )]);
-    ck.check("L1 assign 后 is_assign_mode", c2.is_assign_mode(), "");
+    ck.check("L1 is_assign_mode after assign", c2.is_assign_mode(), "");
     if let Err(e) = c2.start().await {
-        ck.abort("L1 assign 模式 start", &e.to_string());
+        ck.abort("L1 assign-mode start", &e.to_string());
         return;
     }
-    ck.check("L1 start 后 is_started", c2.is_started(), "");
-    ck.check("L1 重复 start 幂等", c2.start().await.is_ok(), "");
+    ck.check("L1 is_started after start", c2.is_started(), "");
+    ck.check("L1 repeated start is idempotent", c2.start().await.is_ok(), "");
     ck.check(
-        "L1 client_id = 本机IP@instanceName（buildMQClientId 语义）",
+        "L1 client_id = local IP@instanceName (buildMQClientId semantics)",
         c2.client_id()
             .split_once('@')
             .is_some_and(|(ip, instance)| !ip.is_empty() && instance.starts_with("live-lite-life")),
@@ -367,16 +367,16 @@ async fn l1_lifecycle(ck: &mut Checker, fx: &Fixture) {
     );
     c2.shutdown();
     c2.shutdown();
-    ck.check("L1 shutdown 幂等且不 panic", !c2.is_started(), "");
-    ck.check("L1 shutdown 后 is_running 归位", !c2.is_running(), "");
+    ck.check("L1 shutdown is idempotent and does not panic", !c2.is_started(), "");
+    ck.check("L1 is_running resets after shutdown", !c2.is_running(), "");
 }
 
-// ------------------------------------------------- L2 subscribe + poll 收全
+// ------------------------------------------------- L2 subscribe + poll receives all
 
 async fn l2_subscribe_poll(ck: &mut Checker, fx: &Fixture, topic: &str) {
-    // 起点必须是 FIRST：首轮重平衡由后台循环做（`start()` 不同步重平衡），
-    // 用 LAST 的话「位点解析」与「消息发送」谁先谁后不确定 —— 解析晚于发送就会
-    // 把游标放到队尾，12 条永远收不到。LAST 路径由 L4（assign 模式）覆盖。
+    // The start point must be FIRST: the first rebalance is done by the background loop (`start()`
+    // does not rebalance synchronously); with LAST, whether "offset resolution" or "message send" goes
+    // first is indeterminate -- resolving after sending parks the cursor at the queue tail and the 12 messages are never received. LAST is covered by L4 (assign mode).
     let c = match fx
         .subscribed(ck, "sub", topic, "*", Some(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET), None)
         .await
@@ -386,43 +386,43 @@ async fn l2_subscribe_poll(ck: &mut Checker, fx: &Fixture, topic: &str) {
     };
     let sent = fx.produce_alternating(topic).await;
     ck.check(
-        &format!("发送 {N_MSG} 条全部 SEND_OK"),
+        &format!("sent all {N_MSG} with SEND_OK"),
         sent == N_MSG,
         &format!("sent={sent}"),
     );
     let assigned = wait_assignment(&c, QUEUE_NUMS as usize, 20).await;
     ck.check(
-        &format!("L2 首轮重平衡后分到 {QUEUE_NUMS} 个队列"),
+        &format!("L2 assigned {QUEUE_NUMS} queues after the first rebalance"),
         assigned.len() == QUEUE_NUMS as usize,
         &format!("assigned={assigned:?}"),
     );
     let got = poll_bounded(&c, N_MSG, WAIT_SECONDS).await;
     ck.check(
-        &format!("L2 poll 收全 {N_MSG} 条（不重不漏）"),
+        &format!("L2 poll received all {N_MSG} (no dup, no gap)"),
         bodies(&got) == expected_bodies(topic),
         &format!("n={} got={:?}", got.len(), bodies(&got)),
     );
     let per_queue_ok = got.iter().all(|m| {
         m.topic == topic && m.queue_id >= 0 && m.queue_offset >= 0 && m.reconsume_times == 0
     });
-    ck.check("L2 投递字段来自 broker", per_queue_ok, "");
+    ck.check("L2 delivery fields come from the broker", per_queue_ok, "");
     let mut by_queue: std::collections::BTreeMap<i32, Vec<i64>> =
         std::collections::BTreeMap::new();
     for m in &got {
         by_queue.entry(m.queue_id).or_default().push(m.queue_offset);
     }
     ck.check(
-        "L2 同队列内 queue_offset 严格递增",
+        "L2 queue_offset strictly increases within a queue",
         by_queue.values().all(|v| v.windows(2).all(|w| w[0] < w[1])),
         &format!("{by_queue:?}"),
     );
     c.shutdown();
 }
 
-// ------------------------------------------------------------- L3 位点提交
+// ------------------------------------------------------------- L3 offset commit
 
 async fn l3_commit(ck: &mut Checker, fx: &Fixture, topic: &str, mqs: &[MessageQueue]) {
-    // auto_commit=true（默认）：**拉到即提交**，不需要显式 commit()。
+    // auto_commit=true (default): **commits as soon as a pull lands**; no explicit commit() needed.
     let c = match fx
         .subscribed(
             ck,
@@ -439,7 +439,7 @@ async fn l3_commit(ck: &mut Checker, fx: &Fixture, topic: &str, mqs: &[MessageQu
     };
     let got = poll_bounded(&c, N_MSG, WAIT_SECONDS).await;
     ck.check(
-        &format!("L3 auto-commit 组收全 {N_MSG} 条"),
+        &format!("L3 auto-commit group received all {N_MSG}"),
         got.len() == N_MSG,
         &format!("n={}", got.len()),
     );
@@ -461,24 +461,24 @@ async fn l3_commit(ck: &mut Checker, fx: &Fixture, topic: &str, mqs: &[MessageQu
         }
     }
     if !err.is_empty() {
-        ck.abort("L3 committed 读回", &err);
+        ck.abort("L3 committed read-back", &err);
     } else {
         let advanced = committed
             .iter()
             .all(|(_, off)| off.unwrap_or(0) > 0);
         ck.check(
-            "L3 auto_commit=true 时继续 poll 过周期后位点自己落盘（没人调 commit）",
+            "L3 with auto_commit=true the offset persists on its own after polling past the period (nobody called commit)",
             advanced,
             &format!("{committed:?}"),
         );
     }
     c.shutdown();
 
-    // auto_commit=false：位点不落 broker，显式 commit() 之后才前进。
+    // auto_commit=false: the offset does not land on the broker; it advances only after an explicit commit().
     let manual = match fx.consumer("manual") {
         Ok(c) => c,
         Err(e) => {
-            ck.abort("L3 构造", &e);
+            ck.abort("L3 build", &e);
             return;
         }
     };
@@ -491,13 +491,13 @@ async fn l3_commit(ck: &mut Checker, fx: &Fixture, topic: &str, mqs: &[MessageQu
     }
     let got = poll_bounded(&manual, N_MSG, WAIT_SECONDS).await;
     ck.check(
-        "L3 auto_commit=false 也照常投递",
+        "L3 auto_commit=false still delivers normally",
         got.len() == N_MSG,
         &format!("n={}", got.len()),
     );
     let before = manual.committed(&mqs[0]).await.unwrap_or(None);
     ck.check(
-        "L3 auto_commit=false 时位点不落 broker",
+        "L3 with auto_commit=false the offset does not land on the broker",
         before.is_none(),
         &format!("{before:?}"),
     );
@@ -507,37 +507,37 @@ async fn l3_commit(ck: &mut Checker, fx: &Fixture, topic: &str, mqs: &[MessageQu
     }
     let after = manual.committed(&mqs[0]).await.unwrap_or(None);
     ck.check(
-        "L3 commit() 之后位点才落 broker",
+        "L3 the offset lands on the broker only after commit()",
         after.unwrap_or(0) > 0,
         &format!("before={before:?} after={after:?}"),
     );
     manual.shutdown();
 }
 
-// --------------------------------------------------- L4 assign + seek 重放
+// --------------------------------------------------- L4 assign + seek replay
 
 async fn l4_assign_seek(ck: &mut Checker, fx: &Fixture, topic: &str, mqs: &[MessageQueue]) {
     let c = match fx.consumer("assign") {
         Ok(c) => c,
         Err(e) => {
-            ck.abort("L4 构造", &e);
+            ck.abort("L4 build", &e);
             return;
         }
     };
     c.assign(mqs);
-    ck.check("L4 assign 后 is_assign_mode", c.is_assign_mode(), "");
+    ck.check("L4 is_assign_mode after assign", c.is_assign_mode(), "");
     if let Err(e) = c.start().await {
         ck.abort("L4 start", &e.to_string());
         return;
     }
     ck.check(
-        "L4 assign 模式 assignment() == assign 的队列",
+        "L4 assign mode: assignment() == the assigned queues",
         c.assignment().len() == mqs.len(),
         &format!("{:?}", c.assignment()),
     );
-    // assign 模式默认 LAST（新组无已提交位点）→ 存量一条不收。
+    // Assign mode defaults to LAST (a new group has no committed offset) -> not one backlog message is received.
     ck.check(
-        "L4 起点在队尾时 poll 不到存量",
+        "L4 poll finds no backlog when the start point is the queue tail",
         c.poll(Some(500)).await.is_empty(),
         "",
     );
@@ -550,7 +550,7 @@ async fn l4_assign_seek(ck: &mut Checker, fx: &Fixture, topic: &str, mqs: &[Mess
     let got = poll_bounded(&c, per_queue, 20).await;
     let got_bodies = bodies(&got);
     ck.check(
-        &format!("L4 seek_to_begin 后重放该队列的 {per_queue} 条"),
+        &format!("L4 after seek_to_begin replays that queue's {per_queue} messages"),
         got.len() == per_queue
             && got.iter().all(|m| m.queue_id == mqs[0].queue_id)
             && got_bodies.iter().all(|b| expected_bodies(topic).contains(b)),
@@ -562,24 +562,24 @@ async fn l4_assign_seek(ck: &mut Checker, fx: &Fixture, topic: &str, mqs: &[Mess
         return;
     }
     ck.check(
-        "L4 seek 丢掉缓冲里该队列早于目标位点的消息",
+        "L4 seek drops buffered messages of that queue older than the target offset",
         c.buffered_message_count() == 0,
         &format!("buffered={}", c.buffered_message_count()),
     );
     for mq in mqs {
         if let Err(e) = c.seek_to_begin(mq).await {
-            ck.abort("L4 全部队列 seek_to_begin", &e.to_string());
+            ck.abort("L4 seek_to_begin on all queues", &e.to_string());
             c.shutdown();
             return;
         }
     }
     let got = poll_bounded(&c, N_MSG, WAIT_SECONDS).await;
     ck.check(
-        &format!("L4 全部队列 seek_to_begin 后收全 {N_MSG} 条"),
+        &format!("L4 received all {N_MSG} after seek_to_begin on all queues"),
         bodies(&got) == expected_bodies(topic),
         &format!("n={} got={:?}", got.len(), bodies(&got)),
     );
-    // seek 到具体位点：队列 0 从 offset=1 起再放剩下 2 条。
+    // Seek to a concrete offset: queue 0 replays its remaining 2 messages from offset=1.
     c.seek(&mqs[0], 1);
     let replay = poll_bounded(&c, per_queue - 1, 20).await;
     let from_q0: BTreeSet<String> = replay
@@ -588,14 +588,14 @@ async fn l4_assign_seek(ck: &mut Checker, fx: &Fixture, topic: &str, mqs: &[Mess
         .map(|m| String::from_utf8_lossy(m.get_body()).into_owned())
         .collect();
     ck.check(
-        "L4 seek(具体位点) 只重放该队列剩余消息",
+        "L4 seek(concrete offset) replays only that queue's remaining messages",
         from_q0.len() == per_queue - 1,
         &format!("{from_q0:?}"),
     );
     c.shutdown();
 }
 
-// ------------------------------------------------------------ L5 订阅级 tag
+// ------------------------------------------------------------ L5 subscription-level tag
 
 async fn l5_tag_filter(ck: &mut Checker, fx: &Fixture, topic: &str) {
     let c = match fx
@@ -619,31 +619,31 @@ async fn l5_tag_filter(ck: &mut Checker, fx: &Fixture, topic: &str) {
     let got = poll_bounded(&c, N_MSG / 2, WAIT_SECONDS).await;
     let got_bodies = bodies(&got);
     ck.check(
-        &format!("L5 subscribe(\"TagA\") 只收 {} 条", N_MSG / 2),
+        &format!("L5 subscribe(\"TagA\") receives only {} messages", N_MSG / 2),
         got_bodies == want,
         &format!("n={} got={got_bodies:?}", got.len()),
     );
     ck.check(
-        "L5 收到的消息 tag 全为 TagA",
+        "L5 every received message has tag TagA",
         got.iter().all(|m| m.get_tags() == Some("TagA")),
         &format!("{:?}", got.iter().map(|m| m.get_tags()).collect::<Vec<_>>()),
     );
     let subs = c.subscription();
     ck.check(
-        "L5 subscription() 回读表达式",
+        "L5 subscription() reads the expression back",
         subs.iter().any(|(t, e)| t == topic && e == "TagA"),
         &format!("{subs:?}"),
     );
     let sub_data = c.subscriptions();
     ck.check(
-        "L5 subscriptions() 里是解析后的 SubscriptionData（心跳要带的）",
+        "L5 subscriptions() holds the parsed SubscriptionData (what the heartbeat carries)",
         sub_data.iter().any(|s| s.topic == topic && s.sub_string == "TagA"),
         &format!("{sub_data:?}"),
     );
-    // unsubscribe 后订阅表清空（心跳也随之少一项）。
+    // After unsubscribe the subscription table is empty (the heartbeat carries one item fewer).
     c.unsubscribe(topic);
     ck.check(
-        "L5 unsubscribe 后订阅表为空",
+        "L5 the subscription table is empty after unsubscribe",
         c.subscription().is_empty(),
         &format!("{:?}", c.subscription()),
     );
@@ -658,7 +658,7 @@ async fn l6_consume_from_timestamp(
     topic: &str,
     mqs: &[MessageQueue],
 ) {
-    // L6a：起点 = 30 分钟前的本地墙钟 → 早于本次全部消息 → 各队列从队首起收全。
+    // L6a: start point = local wall clock 30 minutes ago -> earlier than every message -> each queue receives all from its head.
     let past = wall_clock(-30 * 60);
     let c = match fx
         .subscribed(
@@ -676,14 +676,14 @@ async fn l6_consume_from_timestamp(
     };
     let got = poll_bounded(&c, N_MSG, WAIT_SECONDS).await;
     ck.check(
-        &format!("L6a 墙钟起点={past}（30 分钟前）→ 收全 {N_MSG} 条"),
+        &format!("L6a wall-clock start={past} (30 minutes ago) -> received all {N_MSG}"),
         bodies(&got) == expected_bodies(topic),
         &format!("n={} got={:?}", got.len(), bodies(&got)),
     );
     c.shutdown();
 
-    // L6b：墙钟真正影响的是「时间戳 → 队列位置」的映射。这里直接量这个映射：
-    // 已知的坑是把墙钟串当 epoch 毫秒解析 —— 那样两个方向会同时翻转。
+    // L6b: what the wall clock really affects is the "timestamp -> queue position" mapping; measure that
+    // mapping directly here. The known pitfall is parsing the wall-clock string as epoch millis -- that flips both directions at once.
     let c2 = match fx
         .subscribed(
             ck,
@@ -723,17 +723,17 @@ async fn l6_consume_from_timestamp(
         ck.abort("L6b offset_for_timestamp", &err);
     }
     ck.check(
-        "L6b 30 分钟前 → 各队列队首（Σ==0）",
+        "L6b 30 minutes ago -> head of each queue (Σ==0)",
         sum_past == 0,
         &format!("Σ={sum_past}"),
     );
     ck.check(
-        &format!("L6b 10 分钟后 → 越过全部 {N_MSG} 条（Σ=={N_MSG}）"),
+        &format!("L6b 10 minutes ahead -> past all {N_MSG} messages (Σ=={N_MSG})"),
         sum_future == N_MSG as i64,
         &format!("Σ={sum_future}"),
     );
     ck.check(
-        "L6b assign 之外也用同一路由（4 个队列）",
+        "L6b the same route is used beyond assign mode (4 queues)",
         assigned.len() == mqs.len(),
         &format!("{assigned:?}"),
     );
@@ -743,10 +743,10 @@ async fn l6_consume_from_timestamp(
 // ------------------------------------------------------- L7 pause / resume
 
 async fn l7_pause_resume(ck: &mut Checker, fx: &Fixture) {
-    // 独立 topic：本场景要再发 12 条，共用主 topic 会让别的场景计数失配。
+    // Separate topic: this scenario sends 12 more messages; sharing the main topic would skew the other scenarios' counts.
     let topic = fx.topic_name("Paused");
     if let Err(e) = fx.create_topic(&topic, QUEUE_NUMS).await {
-        ck.abort("L7 建 topic", &e);
+        ck.abort("L7 create topic", &e);
         return;
     }
     let c = match fx
@@ -763,45 +763,45 @@ async fn l7_pause_resume(ck: &mut Checker, fx: &Fixture) {
         Some(c) => c,
         None => return,
     };
-    // 先等队列分下来：`pause(&[])` 是什么都没暂停，后面所有断言都会失真。
+    // Wait for the queues to be assigned first: `pause(&[])` pauses nothing, and every later assertion would be distorted.
     let mqs = wait_assignment(&c, QUEUE_NUMS as usize, 20).await;
     ck.check(
-        &format!("L7 pause 前已分到 {QUEUE_NUMS} 个队列"),
+        &format!("L7 assigned {QUEUE_NUMS} queues before pause"),
         mqs.len() == QUEUE_NUMS as usize,
         &format!("assigned={mqs:?}"),
     );
     c.pause(&mqs);
     let sent = fx.produce_alternating(&topic).await;
     ck.check(
-        &format!("L7 暂停期间发了 {N_MSG} 条"),
+        &format!("L7 sent {N_MSG} messages while paused"),
         sent == N_MSG,
         &format!("sent={sent}"),
     );
     let during_pause = c.poll(Some(1500)).await;
     ck.check(
-        "L7 pause 后 poll 拿不到消息",
+        "L7 poll gets no messages after pause",
         during_pause.is_empty(),
         &format!(
-            "暂停期间仍拿到 {} 条（assignment={}）: {:?}",
+            "still got {} messages while paused (assignment={}): {:?}",
             during_pause.len(),
             mqs.len(),
             bodies(&during_pause)
         ),
     );
     c.resume(&mqs);
-    // 暂停期间漏进来的那几条也算已消费，别丢掉再等一遍。
+    // The few messages that slipped in during the pause count as consumed too; do not drop them and wait all over again.
     let mut got = during_pause;
     let need = N_MSG.saturating_sub(got.len());
     got.extend(poll_bounded(&c, need, WAIT_SECONDS).await);
     ck.check(
-        &format!("L7 resume 后收全新增 {N_MSG} 条"),
+        &format!("L7 received all {N_MSG} new messages after resume"),
         bodies(&got) == expected_bodies(&topic),
         &format!("n={} got={:?}", got.len(), bodies(&got)),
     );
     c.shutdown();
 }
 
-// ------------------------------------------------ L8 心跳 / L9 状态与运维
+// ------------------------------------------------ L8 heartbeat / L9 state & ops
 
 async fn l8_heartbeat_and_state(ck: &mut Checker, fx: &Fixture, topic: &str, mqs: &[MessageQueue]) {
     let c = match fx
@@ -818,21 +818,21 @@ async fn l8_heartbeat_and_state(ck: &mut Checker, fx: &Fixture, topic: &str, mqs
         Some(c) => c,
         None => return,
     };
-    // 心跳的目标是「实例路由表里已知的 broker」。lite 的 `start()` 已经同步刷过一次
-    // 订阅 topic 的路由，所以首轮心跳就能落到 broker 上；
-    // 这里仍然先等重平衡拿到分配，再验心跳真的到得了 broker
-    // —— 没注册上订阅，broker 侧的 tag 过滤与 GET_CONSUMER_LIST_BY_GROUP 都会失真。
+    // The heartbeat targets "brokers known to the instance's route table". lite's `start()` already
+    // refreshed the subscribed topic's route synchronously, so the first heartbeat can reach a broker;
+    // still wait for the rebalance assignment here, then verify the heartbeat truly arrives at the
+    // broker -- without a registered subscription, broker-side tag filtering and GET_CONSUMER_LIST_BY_GROUP both distort.
     let _ = wait_assignment(&c, QUEUE_NUMS as usize, 20).await;
     let _ = c.fetch_message_queues(topic).await;
     let ok = c.send_heartbeat_to_all_broker().await;
     ck.check(
-        "L8 路由已知时手工心跳发给 broker",
+        "L8 the manual heartbeat reaches brokers when routes are known",
         ok >= 1,
         &format!("ok={ok}"),
     );
     let got = poll_bounded(&c, 1, WAIT_SECONDS).await;
     ck.check(
-        "L9 poll 拿到消息后缓冲可读（buffered_message_count）",
+        "L9 the buffer is readable after poll receives a message (buffered_message_count)",
         !got.is_empty(),
         &format!("n={} buffered={}", got.len(), c.buffered_message_count()),
     );
@@ -843,7 +843,7 @@ async fn l8_heartbeat_and_state(ck: &mut Checker, fx: &Fixture, topic: &str, mqs
         .await
         .unwrap_or(-1);
     ck.check(
-        "L9 offset_for_timestamp 随时间单调",
+        "L9 offset_for_timestamp is monotonic in time",
         min >= 0 && at_now >= min,
         &format!("min={min} at_now={at_now}"),
     );
@@ -852,23 +852,23 @@ async fn l8_heartbeat_and_state(ck: &mut Checker, fx: &Fixture, topic: &str, mqs
         .await
         .unwrap_or_default();
     ck.check(
-        "L9 lite 的 fetch_subscribe_message_queues 与路由一致",
+        "L9 lite's fetch_subscribe_message_queues matches the route",
         fetched.len() == mqs.len(),
         &format!("got {}", fetched.len()),
     );
-    // 手工重平衡（后台循环之外再触发一次）不该改变队列总数。
+    // A manual rebalance (triggered once beyond the background loop) must not change the queue count.
     c.rebalance().await;
     ck.check(
-        "L9 手工 rebalance 后 assignment 仍是 4 个队列",
+        "L9 assignment still holds 4 queues after a manual rebalance",
         c.assignment().len() == mqs.len(),
         &format!("{:?}", c.assignment()),
     );
     c.shutdown();
 }
 
-// ------------------------ L11 三张位点表
+// ------------------------ L11 three offset tables
 
-/// 只读 broker 上那一格位点，不碰被测实例的任何内存（独立组连接）。
+/// Reads only that one offset cell on the broker; touches none of the tested instance's memory (independent group connection).
 async fn broker_offset(probe: &DefaultMQPullConsumer, mq: &MessageQueue) -> i64 {
     probe
         .fetch_consume_offset(mq)
@@ -877,8 +877,8 @@ async fn broker_offset(probe: &DefaultMQPullConsumer, mq: &MessageQueue) -> i64 
         .unwrap_or(-1)
 }
 
-/// assign 模式下手工搭一个 lite 消费者：提交时机全部由场景控制（`auto_commit=false`），
-/// 每条队列一次只拉 32 条，起点 FIRST。
+/// Hand-builds a lite consumer in assign mode: commit timing is fully scenario-controlled (`auto_commit=false`),
+/// 32 messages pulled per queue at a time, starting from FIRST.
 async fn lite_off_consumer(
     ck: &mut Checker,
     fx: &Fixture,
@@ -899,7 +899,7 @@ async fn lite_off_consumer(
     let o = match DefaultLitePullConsumer::with_config(cfg) {
         Ok(o) => o,
         Err(e) => {
-            ck.abort(&format!("L11 构造 {instance}"), &e.to_string());
+            ck.abort(&format!("L11 build {instance}"), &e.to_string());
             return None;
         }
     };
@@ -911,21 +911,21 @@ async fn lite_off_consumer(
     Some(o)
 }
 
-/// 三张位点表：`nextOffset`（拉取游标）/ `consumeOffset`（已消费游标）/
-/// `offsetStore` 的内存位点表（提交落点）。
+/// The three offset tables: `nextOffset` (pull cursor) / `consumeOffset` (consumed cursor) /
+/// the in-memory offset table of `offsetStore` (where commits land).
 ///
-/// 单测锁得住表形状，锁不住「这条链路真能改变 broker 侧的投递结果」：提交错一格
-/// （把拉取游标当提交源）在真机上的表现是**静默丢消息** —— 位点跑到消费前面，
-/// 调用方崩掉后那段消息重启再也不投；反过来提交得太保守只会重复投，肉眼看得见。
-/// 所以这里用一条 1 队列的新 topic 灌 1200 条（> 单次交付上限 1024），
-/// 让三个数字各自可数：拉取游标 1200、已消费游标 1024、broker 上那一格 1024。
+/// Unit tests can pin the table shape but not "this path can really change broker-side delivery":
+/// committing the wrong cell (using the pull cursor as the commit source) shows up on a real broker
+/// as **silent message loss** -- the offset runs ahead of consumption and after the caller crashes
+/// that stretch of messages is never redelivered, even across restarts; committing too conservatively
+/// only duplicates, which is visible. So a fresh 1-queue topic is filled with 1200 messages (> the 1024 single-delivery cap), making each number countable: pull cursor 1200, consumed cursor 1024, broker cell 1024.
 async fn l11_three_offset_tables(ck: &mut Checker, fx: &Fixture, mqs: &[MessageQueue]) {
     const N_BIG: i64 = 1200;
     const CHUNK: i64 = 300;
     let cap = MAX_POLL_BATCH_SIZE as i64;
     let topic = fx.topic_name("Off");
     if let Err(e) = fx.create_topic(&topic, 1).await {
-        ck.abort("L11 建 topic（1 条队列）", &e);
+        ck.abort("L11 create topic (1 queue)", &e);
         return;
     }
     let mut qs: Vec<MessageQueue> = Vec::new();
@@ -937,7 +937,7 @@ async fn l11_three_offset_tables(ck: &mut Checker, fx: &Fixture, mqs: &[MessageQ
         }
     }
     ck.check(
-        "L11 准备 topic（1 条队列）",
+        "L11 prepared topic (1 queue)",
         qs.len() == 1,
         &format!("queues={}", qs.len()),
     );
@@ -962,7 +962,7 @@ async fn l11_three_offset_tables(ck: &mut Checker, fx: &Fixture, mqs: &[MessageQ
         from = to;
     }
     ck.check(
-        &format!("L11 生产 {N_BIG} 条成功"),
+        &format!("L11 produced all {N_BIG} successfully"),
         landed == N_BIG,
         &format!("landed={landed}"),
     );
@@ -977,12 +977,12 @@ async fn l11_three_offset_tables(ck: &mut Checker, fx: &Fixture, mqs: &[MessageQ
     let probe = match DefaultMQPullConsumer::with_config(probe_cfg) {
         Ok(p) => p,
         Err(e) => {
-            ck.abort("L11 构造探针", &e.to_string());
+            ck.abort("L11 build probe", &e.to_string());
             return;
         }
     };
     if let Err(e) = probe.start().await {
-        ck.abort("L11 探针 start", &e.to_string());
+        ck.abort("L11 probe start", &e.to_string());
         return;
     }
     let Some(o) = lite_off_consumer(ck, fx, "liteoff", &group, std::slice::from_ref(&q0)).await
@@ -991,50 +991,50 @@ async fn l11_three_offset_tables(ck: &mut Checker, fx: &Fixture, mqs: &[MessageQ
         return;
     };
 
-    // ---- L11a 只拉不交付：拉取游标跑到 1200，已消费游标一格都不许动
+    // ---- L11a pull without delivering: the pull cursor runs to 1200, the consumed cursor must not move one cell
     let pull_deadline = Instant::now() + Duration::from_secs(30);
     while o.pull_cursor_of(&q0) < N_BIG && Instant::now() < pull_deadline {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     ck.check(
         &format!(
-            "L11a 后台把 {N_BIG} 条全拉进本地缓冲（拉取游标={})",
+            "L11a the background loop pulled all {N_BIG} into the local buffer (pull cursor={})",
             o.pull_cursor_of(&q0)
         ),
         o.pull_cursor_of(&q0) == N_BIG,
         &format!("pullCursor={}", o.pull_cursor_of(&q0)),
     );
     ck.check(
-        "L11a 一条都没交付 ⇒ 已消费游标停在 -1",
+        "L11a nothing delivered => the consumed cursor stays at -1",
         o.consume_cursor_of(&q0) == -1,
         &format!("consumeCursor={}", o.consume_cursor_of(&q0)),
     );
-    // 这条是 #68 的核心：旧实现的 commit() 遍历的就是拉取游标，这里会把 1200 发出去 ——
-    // 调用方在此之前崩掉 ⇒ 1200 条一条都没消费过，却再也不会投。
+    // This is the core of #68: the old implementation's commit() iterated the pull cursor and would have
+    // sent 1200 here -- a caller crashing before that point never consumed a message, yet none is ever redelivered.
     if let Err(e) = o.commit().await {
         ck.abort("L11a commit()", &e.to_string());
     }
     let after_empty_commit = broker_offset(&probe, &q0).await;
     ck.check(
-        "L11a 没交付过 ⇒ broker 一位没提交（旧实现在这里提交 1200）",
+        "L11a nothing delivered => the broker has no committed offset (the old implementation committed 1200 here)",
         after_empty_commit == -1,
         &format!("brokerOffset={after_empty_commit}"),
     );
 
-    // ---- L11b poll 单次上限 1024 < 缓冲里的 1200 ⇒ 尾巴那 176 条不算已消费
+    // ---- L11b a single poll caps at 1024 < 1200 buffered => the tail 176 do not count as consumed
     let first = o.poll(Some(3000)).await;
     ck.check(
-        &format!("L11b 一次 poll 交出 {cap} 条（单次交付上限）"),
+        &format!("L11b one poll hands out {cap} messages (single-delivery cap)"),
         first.len() as i64 == cap,
         &format!("got={}", first.len()),
     );
     ck.check(
-        "L11b 已消费游标 = 交出去的那一格",
+        "L11b the consumed cursor = the cell handed out",
         o.consume_cursor_of(&q0) == cap,
         &format!("consumeCursor={}", o.consume_cursor_of(&q0)),
     );
     ck.check(
-        &format!("L11b 缓冲里还压着 {} 条没交付", N_BIG - cap),
+        &format!("L11b {} undelivered messages still buffered", N_BIG - cap),
         o.pull_cursor_of(&q0) == N_BIG && o.consume_cursor_of(&q0) < o.pull_cursor_of(&q0),
         &format!("pull={}", o.pull_cursor_of(&q0)),
     );
@@ -1043,12 +1043,12 @@ async fn l11_three_offset_tables(ck: &mut Checker, fx: &Fixture, mqs: &[MessageQ
     }
     let broker_after_commit = broker_offset(&probe, &q0).await;
     ck.check(
-        &format!("L11b 提交给 broker 的正是 {cap}（不是 {N_BIG}）"),
+        &format!("L11b exactly {cap} committed to the broker (not {N_BIG})"),
         broker_after_commit == cap,
         &format!("brokerOffset={broker_after_commit}"),
     );
 
-    // ---- L11c 指定一个更靠前的位点：只改提交落点，两条游标都不许动
+    // ---- L11c pin an earlier offset: only the commit target changes, neither cursor may move
     let pull_before = o.pull_cursor_of(&q0);
     let consume_before = o.consume_cursor_of(&q0);
     let mut rewind: BTreeMap<String, i64> = BTreeMap::new();
@@ -1058,36 +1058,36 @@ async fn l11_three_offset_tables(ck: &mut Checker, fx: &Fixture, mqs: &[MessageQ
     }
     let broker_rewound = broker_offset(&probe, &q0).await;
     ck.check(
-        "L11c commit(map) 把 broker 位点改到调用方指定的 5",
+        "L11c commit(map) moves the broker offset to the caller-specified 5",
         broker_rewound == 5,
         &format!("brokerOffset={broker_rewound}"),
     );
     ck.check(
-        "L11c 提交位点不改拉取游标",
+        "L11c committing an offset does not touch the pull cursor",
         o.pull_cursor_of(&q0) == pull_before,
         &format!("pullCursor={}", o.pull_cursor_of(&q0)),
     );
     ck.check(
-        "L11c 提交位点不改已消费游标",
+        "L11c committing an offset does not touch the consumed cursor",
         o.consume_cursor_of(&q0) == consume_before,
         &format!("consumeCursor={}", o.consume_cursor_of(&q0)),
     );
-    // 位点退回 5 之后，尾巴那 176 条照旧交付（本地缓冲与 broker 位点无关）
+    // After rewinding to 5, the tail 176 are still delivered (the local buffer is independent of the broker offset)
     let tail = o.poll(Some(3000)).await;
     ck.check(
-        &format!("L11c 退回 5 之后缓冲里剩下的 {} 条照旧交付", N_BIG - cap),
+        &format!("L11c the {} messages left in the buffer are still delivered after rewinding to 5", N_BIG - cap),
         tail.len() as i64 == N_BIG - cap,
         &format!("got={}", tail.len()),
     );
     let mut seen = bodies(&first);
     seen.extend(bodies(&tail));
     ck.check(
-        &format!("L11 全程收全 {N_BIG} 条且一条不重不漏"),
+        &format!("L11 received all {N_BIG} across the whole run, no dup and no gap"),
         seen.len() as i64 == N_BIG,
         &format!("distinct={}", seen.len()),
     );
 
-    // ---- L11d persist=false：一个字节都不许上线，committed() 看得见、broker 看不见
+    // ---- L11d persist=false: not one byte goes online; committed() sees it, the broker does not
     let mut memory_only: BTreeMap<String, i64> = BTreeMap::new();
     memory_only.insert(key0.clone(), 777);
     if let Err(e) = o.commit_offsets(&memory_only, false).await {
@@ -1095,42 +1095,42 @@ async fn l11_three_offset_tables(ck: &mut Checker, fx: &Fixture, mqs: &[MessageQ
     }
     let committed_memory = o.committed(&q0).await.unwrap_or(None);
     ck.check(
-        "L11d persist=false：committed() 读到内存表的 777",
+        "L11d persist=false: committed() reads 777 from the in-memory table",
         committed_memory == Some(777),
         &format!("committed={committed_memory:?}"),
     );
     let broker_still = broker_offset(&probe, &q0).await;
     ck.check(
-        "L11d persist=false：broker 侧还是上一轮的 5",
+        "L11d persist=false: the broker side still has the previous round's 5",
         broker_still == 5,
         &format!("brokerOffset={broker_still}"),
     );
 
-    // ---- L11e 新实例（同组）从 broker 上那一格续消费：内存表不跨实例
+    // ---- L11e a new instance (same group) resumes from the broker's cell: the in-memory table does not cross instances
     if let Some(o2) = lite_off_consumer(ck, fx, "liteoff2", &group, std::slice::from_ref(&q0)).await
     {
         let start = o2.pull_cursor_of(&q0);
         ck.check(
-            "L11e 新实例的起点是 broker 上的 5（不是另一个实例内存里的 777）",
+            "L11e the new instance starts from the broker's 5 (not the other instance's in-memory 777)",
             (5..777).contains(&start),
             &format!("pullCursor={start}"),
         );
         o2.shutdown();
     }
 
-    // ---- L11f seek 同时改写两条游标：重放的段不能被旧位点跳过
-    // 先暂停这条队列：后台续拉会把拉取游标推过 60，不停下来这条断言就成了赌时序。
+    // ---- L11f seek rewrites both cursors: the replayed segment must not be skipped over by the old offset
+    // Pause this queue first: continued background pulls would push the pull cursor past 60; without that this assertion is a timing gamble.
     o.pause(std::slice::from_ref(&q0));
-    // 等在途那次拉取的应答落地（它落下来会写拉取游标），再 seek 才能钉在 60。
+    // Wait for the in-flight pull's response to land (it writes the pull cursor); only then can the seek pin at 60.
     tokio::time::sleep(Duration::from_millis(300)).await;
     o.seek(&q0, 60);
     ck.check(
-        "L11f seek 改拉取游标",
+        "L11f seek changes the pull cursor",
         o.pull_cursor_of(&q0) == 60,
         &format!("pullCursor={}", o.pull_cursor_of(&q0)),
     );
     ck.check(
-        "L11f seek 也改已消费游标",
+        "L11f seek also changes the consumed cursor",
         o.consume_cursor_of(&q0) == 60,
         &format!("consumeCursor={}", o.consume_cursor_of(&q0)),
     );
@@ -1139,14 +1139,14 @@ async fn l11_three_offset_tables(ck: &mut Checker, fx: &Fixture, mqs: &[MessageQ
     }
     let broker_seeked = broker_offset(&probe, &q0).await;
     ck.check(
-        "L11f seek 之后 commit 落到 60",
+        "L11f the commit after seek lands at 60",
         broker_seeked == 60,
         &format!("brokerOffset={broker_seeked}"),
     );
     o.resume(std::slice::from_ref(&q0));
 
     let Some(foreign) = mqs.get(1).cloned() else {
-        ck.abort("L11g 取 foreign 队列", "主 topic 不足 2 条队列");
+        ck.abort("L11g get foreign queue", "main topic has fewer than 2 queues");
         o.shutdown();
         probe.shutdown();
         return;
@@ -1158,61 +1158,61 @@ async fn l11_three_offset_tables(ck: &mut Checker, fx: &Fixture, mqs: &[MessageQ
         ck.abort("L11g commit(map, persist=false)", &e.to_string());
     }
     ck.check(
-        "L11g 未落盘的内存值先看得见",
+        "L11g the unpersisted in-memory value is visible first",
         o.pending_commit_of(&q0) == 300,
         &format!("pending={}", o.pending_commit_of(&q0)),
     );
     if let Err(e) = o.commit_queues(&[], true).await {
-        ck.abort("L11g commit(空集合)", &e.to_string());
+        ck.abort("L11g commit(empty set)", &e.to_string());
     }
     ck.check(
-        "L11g 空集合不清表也不发消息",
+        "L11g an empty set neither clears the table nor sends anything",
         o.pending_commit_of(&q0) == 300,
         &format!("pending={}", o.pending_commit_of(&q0)),
     );
     let broker_after_empty_set = broker_offset(&probe, &q0).await;
     ck.check(
-        "L11g 空集合没动 broker",
+        "L11g the empty set left the broker untouched",
         broker_after_empty_set == 60,
         &format!("brokerOffset={broker_after_empty_set}"),
     );
-    // 点名一条 foreign 队列：它没有消费记录（-1 守卫拦下写表），
-    // 但 persistAll 扫表时把 q0 那份未落盘的值清了 —— 这才是"提交部分队列"的代价。
+    // Name one foreign queue: it has no consume record (the -1 guard blocks the table write),
+    // but persistAll's table sweep clears q0's unpersisted value -- that is the real cost of "committing a subset of queues".
     if let Err(e) = o.commit_queues(std::slice::from_ref(&foreign), true).await {
-        ck.abort("L11g commit(部分队列)", &e.to_string());
+        ck.abort("L11g commit(subset of queues)", &e.to_string());
     }
     ck.check(
-        "L11g 点名提交会把没点名的内存值清掉（remove unused mq）",
+        "L11g a named commit clears the in-memory values of queues not named (remove unused mq)",
         o.pending_commit_of(&q0) == -1,
         &format!("pending={}", o.pending_commit_of(&q0)),
     );
     let after_prune = o.committed(&q0).await.unwrap_or(None);
     ck.check(
-        "L11g 清掉之后回读到的是 broker 上那一格（并回填进表）",
+        "L11g after the clear, the read-back is the broker's cell (and it backfills the table)",
         after_prune == Some(60) && o.pending_commit_of(&q0) == 60,
         &format!("committed={after_prune:?} pending={}", o.pending_commit_of(&q0)),
     );
     let broker_after_prune = broker_offset(&probe, &q0).await;
     ck.check(
-        "L11g 清理只是丢内存值，没往 broker 写 300",
+        "L11g the cleanup only drops the in-memory value; nothing wrote 300 to the broker",
         broker_after_prune == 60,
         &format!("brokerOffset={broker_after_prune}"),
     );
-    // commit(Set) 取的是当下已消费游标，不是内存里那格
+    // commit(Set) takes the current consumed cursor, not the in-memory cell
     if let Err(e) = o.commit_offsets(&memory_only2, false).await {
-        ck.abort("L11g commit(map, persist=false) 第二轮", &e.to_string());
+        ck.abort("L11g commit(map, persist=false) second round", &e.to_string());
     }
     if let Err(e) = o.commit_queues(std::slice::from_ref(&q0), true).await {
-        ck.abort("L11g commit(集合)", &e.to_string());
+        ck.abort("L11g commit(set)", &e.to_string());
     }
     let broker_set = broker_offset(&probe, &q0).await;
     ck.check(
-        "L11g commit(集合) 提交的是已消费游标（60），不是内存里那格 300",
+        "L11g commit(set) commits the consumed cursor (60), not the in-memory 300",
         broker_set == 60,
         &format!("brokerOffset={broker_set}"),
     );
     ck.check(
-        "L11g persistAll 之后内存表回到已消费游标（updateConsumeOffset 语义）",
+        "L11g after persistAll the in-memory table returns to the consumed cursor (updateConsumeOffset semantics)",
         o.pending_commit_of(&q0) == 60,
         &format!("pending={}", o.pending_commit_of(&q0)),
     );
@@ -1221,7 +1221,7 @@ async fn l11_three_offset_tables(ck: &mut Checker, fx: &Fixture, mqs: &[MessageQ
     probe.shutdown();
 }
 
-// ------------------------------------------------------------------ L10 清理
+// ------------------------------------------------------------------ L10 cleanup
 async fn l10_cleanup(ck: &mut Checker, fx: &Fixture) {
     let topics: Vec<String> = lock(&fx.topics).clone();
     let mut failed = Vec::new();
@@ -1235,13 +1235,13 @@ async fn l10_cleanup(ck: &mut Checker, fx: &Fixture) {
         }
     }
     ck.check(
-        "L10 删除本次建的 topic",
+        "L10 deleted the topics created in this run",
         failed.is_empty(),
         &format!("{failed:?}"),
     );
 }
 
-// ------------------------------------------------------------------ 驱动
+// ------------------------------------------------------------------ driver
 
 async fn run(namesrv: &str) -> Checker {
     let mut ck = Checker::new();
@@ -1249,12 +1249,12 @@ async fn run(namesrv: &str) -> Checker {
     let mut fx = match Fixture::new(namesrv, &stamp) {
         Ok(fx) => fx,
         Err(e) => {
-            ck.abort("夹具构造", &e);
+            ck.abort("fixture build", &e);
             return ck;
         }
     };
     if let Err(e) = fx.start().await {
-        ck.abort("夹具启动", &e);
+        ck.abort("fixture start", &e);
         return ck;
     }
     println!("== live lite-pull check, namesrv={namesrv} stamp={stamp} ==");
@@ -1263,12 +1263,12 @@ async fn run(namesrv: &str) -> Checker {
 
     let topic = fx.topic_name("Main");
     if let Err(e) = fx.create_topic(&topic, QUEUE_NUMS).await {
-        ck.abort("建 topic", &e);
+        ck.abort("create topic", &e);
         return ck;
     }
     let mqs = route_queues(&fx, &topic).await;
     if mqs.len() != QUEUE_NUMS as usize {
-        ck.abort("路由队列不足", &format!("got {}", mqs.len()));
+        ck.abort("not enough route queues", &format!("got {}", mqs.len()));
         l10_cleanup(&mut ck, &fx).await;
         return ck;
     }

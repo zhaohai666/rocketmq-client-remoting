@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * 订阅模式：POP 投递按逻辑队列还是物理队列。
+ * Subscription mode: whether POP delivery is by logical queue or physical queue.
  */
 final class SubscriptionMode
 {

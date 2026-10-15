@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
-# 检查 C++ 端每个编译单元是否**直接包含**了自己用到的标准库头。
+# Check whether every C++ translation unit **directly includes** the standard
+# library headers it actually uses.
 #
-# 为什么要有这一步：CI 用的标准库实现裁剪了头文件之间的传递包含，
-# 「包含 <vector> 就顺带拿到 <algorithm>」在 CI 上不成立，本地却能过 ——
-# 表现就是编译到某个目标才报 “‘xxx’ is not a member of ‘std’”，一次只暴露一个。
-# 这里静态扫一遍，把这类缺口一次性列出来。
+# Why this step exists: the standard library implementation used in CI prunes
+# transitive includes between headers, so "including <vector> also pulls in
+# <algorithm>" holds locally but not on CI -- the failure only surfaces when
+# compiling a specific target with "'xxx' is not a member of 'std'", one at a
+# time. This script statically scans everything and lists such gaps at once.
 #
-# 判定口径：只有「本文件用到该符号」且「沿本文件的包含闭包（含本项目头文件里写的
-# 标准库包含）也取不到对应头」才算缺口。所以给项目头文件补一条 #include 之后，
-# 所有包含它的编译单元就不再报错，这与真实预处理结果一致。
+# Criteria: a gap counts only when the file uses the symbol AND the symbol's
+# header cannot be reached through the file's include closure (including the
+# standard-library includes written inside this project's own headers). So once
+# a single #include is added to a project header, every unit that includes it
+# stops erroring -- consistent with the real preprocessor result.
 #
-# 用法：
-#   python3 scripts/check_cpp_portable_includes.py cpp          # 只报告，非零退出即有缺口
-#   python3 scripts/check_cpp_portable_includes.py cpp --apply  # 按字母序插入缺失的 #include
+# Usage:
+#   python3 scripts/check_cpp_portable_includes.py cpp          # report only; nonzero exit means a gap exists
+#   python3 scripts/check_cpp_portable_includes.py cpp --apply  # insert missing #includes in alphabetical order
 import pathlib
 import re
 import sys
 
-# 头文件 -> 该头提供、且容易被当成「别处顺带包含」的符号写法。
+# Header -> the symbols it provides that are easily mistaken for being pulled in transitively from elsewhere.
 NEED = {
     "algorithm": r"std::(sort|stable_sort|for_each|min_element|max_element|minmax|find_if|find_end"
                  r"|find_first_of|find|copy_if|copy_n|copy|transform|count_if|count|reverse_copy|reverse"

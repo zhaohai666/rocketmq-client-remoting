@@ -1,5 +1,6 @@
-// 日志模块单测：
-// 行格式、主线程命名 main、线程名线程本地性、按大小轮转 + maxIndex 上限、级别过滤、关闭文件输出。
+// Logging module unit tests:
+// line format, naming the main thread, thread name being thread-local, rotation by size
+// plus the maxIndex cap, level filtering, and turning file output off.
 using System.Globalization;
 using System.Text.RegularExpressions;
 using RocketMQ.Common;
@@ -25,7 +26,7 @@ public class LoggingTests : IDisposable
         }
         catch
         {
-            // 清理失败不影响测试
+            // A cleanup failure does not affect the test
         }
     }
 
@@ -33,8 +34,10 @@ public class LoggingTests : IDisposable
         @"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}) (DEBUG|INFO |WARN |ERROR) \[\d+\] \[([^\]]+)\] \[[^\]]+:\d+\] - (.*)$",
         RegexOptions.Compiled);
 
-    // ClientLog 全程持有写句柄，而 Windows 双向校验共享模式：File.ReadAllLines 以
-    // FileShare.Read 打开会判为与写句柄冲突。必须像 `tail -f` 那样以 ReadWrite 共享读取。
+    // ClientLog holds the write handle throughout, and Windows has bidirectional
+    // share-mode validation: File.ReadAllLines opens with FileShare.Read, which is judged
+    // to conflict with the write handle. It must be read shared for ReadWrite, the way
+    // `tail -f` does it.
     private static string[] ReadAllLinesShared(string path)
     {
         using FileStream fs = new(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
@@ -58,7 +61,7 @@ public class LoggingTests : IDisposable
         Assert.Single(lines);
         Match m = LineRegex.Match(lines[0]);
         Assert.True(m.Success, "line format mismatch: " + lines[0]);
-        // INFO 占 5 位宽（左对齐带尾随空格）
+        // INFO occupies a 5-character field (left aligned with trailing spaces)
         Assert.Contains(" INFO  [", lines[0]);
         Assert.EndsWith("- hello-测试", lines[0]);
     }
@@ -66,8 +69,9 @@ public class LoggingTests : IDisposable
     [Fact]
     public void ThreadName_IsThreadLocal_Isolated()
     {
-        // xunit 的测试线程已被命名为 "C# TP Worker"（非 main），所以只验证：
-        // 1) 命名前的值与命名后的值不同且更新生效；2) 其它线程不受影响。
+        // xunit's test thread is already named "C# TP Worker" (not main), so only these
+        // are verified: 1) the value before naming differs from the one after and the
+        // update takes effect; 2) other threads are unaffected.
         string mainBefore = ClientLog.CurrentThreadName();
 
         string? before = null;
@@ -83,7 +87,7 @@ public class LoggingTests : IDisposable
 
         Assert.NotEqual("ConsumeMessageThread_0", before);
         Assert.Equal("ConsumeMessageThread_0", after);
-        // 回到本线程：名字不受工作线程影响（thread-local）
+        // Back on this thread: the name is not influenced by the worker thread (thread-local)
         Assert.Equal(mainBefore, ClientLog.CurrentThreadName());
     }
 
@@ -106,7 +110,7 @@ public class LoggingTests : IDisposable
     public void DisableFileOutput()
     {
         ClientLog.SetLogFile(string.Empty);
-        // 不抛异常即通过（文件输出已关闭）
+        // Passing means it does not throw (file output is already off)
         ClientLog.Info("stderr-only");
         ClientLog.FlushLogFile();
     }
@@ -115,7 +119,7 @@ public class LoggingTests : IDisposable
     public void SizeRotation_FixedWindow_WithMaxIndexCap()
     {
         string path = Path.Combine(_dir, "rot.log");
-        ClientLog.SetLogFileLimits(2000, 3); // 注入小阈值：2KB 轮转、最多 3 份备份
+        ClientLog.SetLogFileLimits(2000, 3); // inject small thresholds: rotate at 2KB, at most 3 backups
         ClientLog.SetLogFile(path);
 
         for (int i = 0; i < 400; ++i)
@@ -131,7 +135,7 @@ public class LoggingTests : IDisposable
         long baseSize = new FileInfo(path).Length;
         Assert.True(baseSize <= 2000, "base file should be capped at maxSize");
 
-        // 备份文件内容也应是完整行
+        // The backup file's content should also be whole lines
         string[] backupLines = ReadAllLinesShared(backup1);
         Assert.All(backupLines, l => Assert.Matches(LineRegex, l));
     }

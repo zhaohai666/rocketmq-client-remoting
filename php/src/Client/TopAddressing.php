@@ -42,8 +42,8 @@ class DefaultTopAddressing
     }
 
     /**
-     * 对应 ``DefaultTopAddressing.clearNewLine``：trim 后截断到第一个 \r 或 \n。
-     * （落成静态方法以便 autoload。）
+     * Corresponds to ``DefaultTopAddressing.clearNewLine``: trim, then truncate at the first \r or \n.
+     * (Made a static method so it is autoloadable.)
      */
     public static function clearNewLine(string $content): string
     {
@@ -59,9 +59,9 @@ class DefaultTopAddressing
         return $s;
     }
 
-    // ---------------- URL 构造（MixAll.getWSAddr / fetchNSAddr 语义）----------------
+    // ---------------- URL construction (MixAll.getWSAddr / fetchNSAddr semantics) ----------------
 
-    /** 对应 ``MixAll.getWSAddr``：domain 自带端口（含 ':'）时不追加默认 :8080。 */
+    /** Corresponds to ``MixAll.getWSAddr``: when the domain already has a port (contains ':'), do not append the default :8080. */
     public static function getWsAddr(string $domain, ?string $subgroup = null): string
     {
         $grp = ($subgroup !== null && $subgroup !== '') ? $subgroup : self::DEFAULT_DOMAIN_SUBGROUP;
@@ -71,7 +71,7 @@ class DefaultTopAddressing
         return sprintf('http://%s:8080/rocketmq/%s', $domain, $grp);
     }
 
-    /** 对应 ``fetchNSAddr`` 里的 URL 拼装（unitName / para 规则逐条照抄）。 */
+    /** Corresponds to the URL assembly in ``fetchNSAddr`` (unitName / para rules copied verbatim). */
     public function buildUrl(): string
     {
         $url = $this->wsAddr;
@@ -94,14 +94,14 @@ class DefaultTopAddressing
         return $url;
     }
 
-    /** 动态取址是否可用（domain 已显式配置）。 */
+    /** Whether dynamic address lookup is available (domain explicitly configured). */
     public static function isConfigured(): bool
     {
         return getenv('ROCKETMQ_NAMESRV_DOMAIN') !== false
             && (string) getenv('ROCKETMQ_NAMESRV_DOMAIN') !== '';
     }
 
-    // ---------------- 取址 ----------------
+    // ---------------- Address lookup ----------------
 
     public function fetchNsAddr(bool $verbose = true): ?string
     {
@@ -138,7 +138,7 @@ class DefaultTopAddressing
         return null;
     }
 
-    // ---------------- 传输 ----------------
+    // ---------------- Transport ----------------
 
     public function httpGet(string $url, float $timeoutSeconds): ?string
     {

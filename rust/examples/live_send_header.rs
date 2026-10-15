@@ -1,11 +1,11 @@
-//! 发送头三个字段（`defaultTopic` / `defaultTopicQueueNums` / `brokerName`）真机验证。
+//! Live verification of the three send-header fields (`defaultTopic` / `defaultTopicQueueNums` / `brokerName`).
 //!
-//! 覆盖 H0..H5 六个场景。
+//! Covers the six scenarios H0..H5.
 //!
-//! 前置：NameServer + Broker 已起，`autoCreateTopicEnable=true`。
+//! Prerequisite: NameServer + Broker are running with `autoCreateTopicEnable=true`.
 //!
 //!
-//! 用法：
+//! Usage:
 //! ```text
 //! cargo run --example live_send_header -- 127.0.0.1:9876
 //! ```
@@ -26,14 +26,14 @@ use rocketmq_client_remoting::common::mix_all::MixAll;
 use rocketmq_client_remoting::common::sysflag::PermName;
 use rocketmq_client_remoting::error::Error;
 
-/// 「等 broker 侧结果落地」的默认预算（秒）。自动建出来的 topic 要等配置回读得到。
+/// Default budget (seconds) for "waiting for the broker-side result to land". An auto-created topic needs time before its config reads back.
 const WAIT_SECONDS: u64 = 20;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 断言累积器：跑完全部场景再汇总，首个失败不提前退出。
+/// Assertion accumulator: every scenario runs to completion before the summary; the first failure does not exit early.
 struct Checker {
     passed: u32,
     failed: Vec<String>,
@@ -63,7 +63,7 @@ impl Checker {
     }
 }
 
-/// 一次异步发送的终态。
+/// Terminal state of one async send.
 #[derive(Default)]
 struct Latch {
     oks: AtomicUsize,
@@ -112,13 +112,13 @@ impl SendCallback for Latch {
     }
 }
 
-/// 环境：一个名字服务地址 + 一组按 stamp 隔离的 topic，跑完自己删干净。
+/// Environment: one name server address + a set of stamp-isolated topics, cleaned up by itself when the run ends.
 struct Env {
     namesrv: String,
     stamp: String,
     admin: DefaultMQAdminExt,
     broker_addr: Mutex<String>,
-    /// H5 的判据：路由里这台 broker 的名字，就是发送头里的 `n`。
+    /// H5's criterion: the name of this broker in the route is exactly the send header's `n`.
     broker_name: Mutex<String>,
     topics: Mutex<Vec<String>>,
 }
@@ -159,8 +159,8 @@ impl Env {
         lock(&self.broker_name).clone()
     }
 
-    /// 集群探活：端口开着 != broker 已注册到 namesrv，所以轮询；
-    /// 顺带反查这台 broker 的名字。
+    /// Cluster probe: an open port != the broker is registered with the namesrv, so poll;
+    /// also look up this broker's name along the way.
     async fn start(&self, ck: &mut Checker) -> bool {
         if let Err(e) = self.admin.start().await {
             ck.abort("admin start", &e.to_string());
@@ -179,7 +179,7 @@ impl Env {
                     *lock(&self.broker_addr) = addr.clone();
                     *lock(&self.broker_name) = name.clone();
                     ck.check(
-                        "集群探活",
+                        "cluster probe",
                         true,
                         &format!("broker={addr} name={name}"),
                     );
@@ -187,14 +187,14 @@ impl Env {
                 }
             }
             if Instant::now() >= deadline {
-                ck.abort("集群探活", "nameServer 在预算内没有返回任何 broker");
+                ck.abort("cluster probe", "nameServer returned no broker within the budget");
                 return false;
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
 
-    /// 只配了 c/d 两个旋钮的生产者；`None` 表示保持默认。
+    /// A producer with only the c/d knobs configured; `None` keeps the default.
     fn producer(&self, kind: &str, c: Option<&str>, d: Option<i32>) -> Result<DefaultMQProducer, String> {
         DefaultMQProducer::with_config(ProducerConfig {
             producer_group: self.producer_group(),
@@ -208,7 +208,7 @@ impl Env {
         .map_err(|e| e.to_string())
     }
 
-    /// 起一个独立生产者发一条消息，发完就关（H1..H3 每笔都要用不同的 c/d 组合）。
+    /// Starts a standalone producer to send one message, then shuts it down (H1..H3 each need a different c/d combination).
     async fn send_once(&self, kind: &str, c: Option<&str>, d: Option<i32>, topic: &str, body: &str) -> Result<SendResult, String> {
         let producer = self.producer(kind, c, d)?;
         producer.start().await.map_err(|e| e.to_string())?;
@@ -225,11 +225,11 @@ impl Env {
                 println!("  [WARN] delete_topic({topic}) failed: {e}");
             }
         }
-        ck.check("清理本次的 topic", true, "");
+        ck.check("cleanup of this run's topics", true, "");
     }
 }
 
-/// 读回 broker 上该 topic 的 (read, write) 队列数；还不存在时 None。
+/// Reads back the (read, write) queue counts of the topic on the broker; None when it does not exist yet.
 async fn queue_nums(env: &Env, topic: &str) -> Option<(i32, i32)> {
     env.admin
         .examine_topic_config(&env.broker(), topic)
@@ -238,7 +238,7 @@ async fn queue_nums(env: &Env, topic: &str) -> Option<(i32, i32)> {
         .map(|cfg| (cfg.read_queue_nums, cfg.write_queue_nums))
 }
 
-/// 等 topic 在 broker 上出现（自动建 topic 在发送链路里同步做，配置落地要一点时间）。
+/// Waits for the topic to appear on the broker (auto topic creation happens synchronously in the send path; the config takes a moment to land).
 async fn wait_topic(env: &Env, topic: &str) -> Option<(i32, i32)> {
     let deadline = Instant::now() + Duration::from_secs(WAIT_SECONDS);
     loop {
@@ -250,7 +250,7 @@ async fn wait_topic(env: &Env, topic: &str) -> Option<(i32, i32)> {
     }
 }
 
-/// 该 topic 全 broker 的落库条数（新 topic 的 minOffset 恒为 0）；读不到返回 -1。
+/// The persisted message count of the topic across all brokers (a new topic's minOffset is always 0); returns -1 when unreadable.
 async fn total_messages(env: &Env, topic: &str) -> i64 {
     match env.admin.examine_topic_stats(topic).await {
         Ok(stats) => stats
@@ -265,28 +265,28 @@ async fn total_messages(env: &Env, topic: &str) -> i64 {
 // ------------------------------------------------------- H0/H1/H2/H3
 
 async fn check_queue_nums(ck: &mut Checker, env: &Env) {
-    // H0：TBW102 是这个 broker 上真正的「模板 topic」，H2/H3 的判据都依赖它的队列数。
+    // H0: TBW102 is the real "template topic" on this broker; H2/H3's criteria both depend on its queue counts.
     let (tbw_read, tbw_write) = match queue_nums(env, MixAll::DEFAULT_TOPIC).await {
         Some(pair) if pair.1 > 0 => pair,
         other => {
             ck.abort(
-                "H0 TBW102 模板可读",
+                "H0 TBW102 template readable",
                 &format!("examine_topic_config(TBW102) = {other:?}"),
             );
             return;
         }
     };
     ck.check(
-        "H0 TBW102 模板可读",
+        "H0 TBW102 template readable",
         true,
         &format!("read={tbw_read} write={tbw_write}"),
     );
 
-    // H1：什么都不设，d 走 MixAll::DEFAULT_TOPIC_QUEUE_NUMS(4)。
+    // H1: nothing is set, so d uses MixAll::DEFAULT_TOPIC_QUEUE_NUMS(4).
     let t1 = env.topic("Def");
     match env.send_once("h1", None, None, &t1, "h1").await {
         Ok(r) => ck.check(
-            "H1 默认配置发送成功",
+            "H1 default-config send succeeded",
             r.status == SendStatus::SendOk,
             &format!(
                 "msgId={} broker={}",
@@ -296,30 +296,30 @@ async fn check_queue_nums(ck: &mut Checker, env: &Env) {
                     .unwrap_or_default()
             ),
         ),
-        Err(e) => ck.abort("H1 默认配置发送成功", &e),
+        Err(e) => ck.abort("H1 default-config send succeeded", &e),
     }
     let (r1, w1) = wait_topic(env, &t1).await.unwrap_or((-1, -1));
     let expected1 = std::cmp::min(MixAll::DEFAULT_TOPIC_QUEUE_NUMS, tbw_write);
     ck.check(
-        "H1 默认 d=4 建的 topic 队列数=min(4, TBW102)",
+        "H1 topic created with default d=4 has queue count min(4, TBW102)",
         w1 == expected1 && r1 == w1,
         &format!("read={r1} write={w1} (TBW102={tbw_write})"),
     );
 
-    // H2：d=2 必须把队列数带下去 —— 修之前这里写死 4。
+    // H2: d=2 must carry the queue count down -- before the fix this hardcoded 4.
     let t2 = env.topic("Nums");
     if let Err(e) = env.send_once("h2", None, Some(2), &t2, "h2").await {
-        ck.abort("H2 发送", &e);
+        ck.abort("H2 send", &e);
     }
     let (r2, w2) = wait_topic(env, &t2).await.unwrap_or((-1, -1));
     ck.check(
-        "H2 defaultTopicQueueNums=2 建的 topic 只有 2 条队列",
+        "H2 a topic created with defaultTopicQueueNums=2 has only 2 queues",
         w2 == std::cmp::min(2, tbw_write) && r2 == w2,
-        &format!("read={r2} write={w2}（写死 4 的旧行为会是 {w1}）"),
+        &format!("read={r2} write={w2} (the old hardcoded-4 behavior would give {w1})"),
     );
 
-    // H3：c 指向自己的模板 topic。模板必须带 PERM_INHERIT，否则 TopicConfigManager:286
-    // 的 isInherited 不通过，broker 直接拒绝自动建 topic。
+    // H3: c points at its own template topic. The template must carry PERM_INHERIT, otherwise the
+    // broker's isInherited check fails and the broker rejects the auto-created topic outright.
     let src = env.topic("Src");
     if let Err(e) = env
         .admin
@@ -332,23 +332,23 @@ async fn check_queue_nums(ck: &mut Checker, env: &Env) {
         )
         .await
     {
-        ck.abort("H3 模板 topic 创建", &e.to_string());
+        ck.abort("H3 template topic creation", &e.to_string());
         return;
     }
     let (src_read, src_write) = wait_topic(env, &src).await.unwrap_or((-1, -1));
     ck.check(
-        "H3 模板 topic 建好（3 条队列、带 INHERIT）",
+        "H3 template topic created (3 queues, with INHERIT)",
         src_write == 3 && (src_read, src_write) != (tbw_read, tbw_write),
         &format!("src=({src_read},{src_write}) tbw102=({tbw_read},{tbw_write})"),
     );
 
     let t3 = env.topic("Inherit");
     if let Err(e) = env.send_once("h3", Some(&src), Some(8), &t3, "h3").await {
-        ck.abort("H3 发送", &e);
+        ck.abort("H3 send", &e);
     }
     let (r3, w3) = wait_topic(env, &t3).await.unwrap_or((-1, -1));
     ck.check(
-        &format!("H3 createTopicKey=模板 topic 时被继承（min(8,3)=3 而不是 TBW102 的 {tbw_write}）"),
+        &format!("H3 inherited when createTopicKey=template topic (min(8,3)=3 instead of TBW102's {tbw_write})"),
         w3 == 3 && r3 == 3,
         &format!("read={r3} write={w3}"),
     );
@@ -361,7 +361,7 @@ async fn check_send_entries(ck: &mut Checker, env: &Env) {
     let producer = match env.producer("h4", None, None) {
         Ok(p) => p,
         Err(e) => {
-            ck.abort("H4 构造", &e);
+            ck.abort("H4 construction", &e);
             return;
         }
     };
@@ -372,7 +372,7 @@ async fn check_send_entries(ck: &mut Checker, env: &Env) {
 
     let mut landed: Vec<(&str, bool, String)> = Vec::new();
 
-    // ① 同步
+    // (1) sync
     let mut m1 = Message::new(&t4, Some(b"h4-sync"));
     let pinned_mq: Option<MessageQueue> = match producer.send(&mut m1, Some(5_000), None).await {
         Ok(r) => {
@@ -385,7 +385,7 @@ async fn check_send_entries(ck: &mut Checker, env: &Env) {
         }
     };
 
-    // ② 定点：显式给 mq，落在另一条调用链上（broker 名由调用方给）
+    // (2) pinned: an explicit mq, taking a different call chain (the broker name is given by the caller)
     match pinned_mq.as_ref() {
         Some(mq) => {
             let mut m2 = Message::new(&t4, Some(b"h4-pinned"));
@@ -399,23 +399,23 @@ async fn check_send_entries(ck: &mut Checker, env: &Env) {
                     landed.push((
                         "pinned",
                         r.status == SendStatus::SendOk && same,
-                        format!("落点={}", mq.broker_name),
+                        format!("landing={}", mq.broker_name),
                     ));
                 }
                 Err(e) => landed.push(("pinned", false, e.to_string())),
             }
         }
-        None => landed.push(("pinned", false, "同步发送没拿到 mq".to_string())),
+        None => landed.push(("pinned", false, "the sync send returned no mq".to_string())),
     }
 
-    // ③ 单向：没有应答，只能靠后面的总数兜底
+    // (3) oneway: no response; only the total count below can back it up
     let mut m3 = Message::new(&t4, Some(b"h4-oneway"));
     match producer.send_oneway(&mut m3, None).await {
         Ok(()) => landed.push(("oneway", true, String::new())),
         Err(e) => landed.push(("oneway", false, e.to_string())),
     }
 
-    // ④ 批量（320）
+    // (4) batch (320)
     let batch: Vec<Message> = (0..3)
         .map(|i| Message::new(&t4, Some(format!("h4-batch-{i}").as_bytes())))
         .collect();
@@ -424,7 +424,7 @@ async fn check_send_entries(ck: &mut Checker, env: &Env) {
         Err(e) => landed.push(("batch", false, e.to_string())),
     }
 
-    // ⑤ 异步：走 ASYNC 分支，最终落到同一个 sendKernelImpl
+    // (5) async: takes the ASYNC branch and ends up on the same send kernel path
     let latch = Arc::new(Latch::default());
     match producer.send_async(
         Message::new(&t4, Some(b"h4-async")),
@@ -449,12 +449,12 @@ async fn check_send_entries(ck: &mut Checker, env: &Env) {
 
     for (entry, ok, detail) in landed {
         ck.check(
-            &format!("H4 {entry} 入口发送成功"),
+            &format!("H4 {entry} entry send succeeded"),
             ok,
             if ok { "" } else { &detail },
         );
     }
-    // 1 同步 + 1 定点 + 1 单向 + 3 批量 + 1 异步 = 7 条
+    // 1 sync + 1 pinned + 1 oneway + 3 batch + 1 async = 7 messages
     let deadline = Instant::now() + Duration::from_secs(WAIT_SECONDS);
     let mut total = total_messages(env, &t4).await;
     while total < 7 && Instant::now() < deadline {
@@ -462,7 +462,7 @@ async fn check_send_entries(ck: &mut Checker, env: &Env) {
         total = total_messages(env, &t4).await;
     }
     ck.check(
-        "H4 七条消息逐条落库（批量按子消息计）",
+        "H4 all seven messages persisted one by one (the batch counts as sub-messages)",
         total == 7,
         &format!("total={total}"),
     );
@@ -479,16 +479,16 @@ async fn check_broker_name(ck: &mut Checker, env: &Env) {
                 .map(|mq| mq.broker_name)
                 .unwrap_or_default();
             ck.check(
-                "H5 落点 broker 名与路由一致（n 就是它）",
+                "H5 the landing broker name matches the route (n is exactly it)",
                 r.status == SendStatus::SendOk && landed == env.broker_name(),
-                &format!("落点={landed} 路由={}", env.broker_name()),
+                &format!("landing={landed} route={}", env.broker_name()),
             );
         }
-        Err(e) => ck.abort("H5 发送", &e),
+        Err(e) => ck.abort("H5 send", &e),
     }
 }
 
-// ------------------------------------------------------------------ 驱动
+// ------------------------------------------------------------------ driver
 
 async fn run(namesrv: &str) -> Checker {
     let mut ck = Checker::new();
@@ -498,11 +498,11 @@ async fn run(namesrv: &str) -> Checker {
     if !env.start(&mut ck).await {
         return ck;
     }
-    println!("\n-- H0~H3: c/d 决定自动建 topic 的队列数 --");
+    println!("\n-- H0~H3: c/d decides the queue count of the auto-created topic --");
     check_queue_nums(&mut ck, &env).await;
-    println!("\n-- H4: 五种发送入口逐条落地 --");
+    println!("\n-- H4: the five send entries, each verified to land --");
     check_send_entries(&mut ck, &env).await;
-    println!("\n-- H5: n 就是路由选中的那台 broker --");
+    println!("\n-- H5: n is exactly the broker the route selects --");
     check_broker_name(&mut ck, &env).await;
     env.cleanup(&mut ck).await;
     env.admin.shutdown();
@@ -518,7 +518,7 @@ fn stamp() -> String {
 
 fn report(ck: &mut Checker) {
     println!(
-        "== 结果: {}/{} 通过 ==",
+        "== result: {}/{} passed ==",
         ck.passed,
         ck.passed as usize + ck.failed.len()
     );

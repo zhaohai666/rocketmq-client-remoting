@@ -39,7 +39,7 @@ check("V1 content_hex", AclClientRPCHook.build_request_content(cmd).hex(), V1_HE
 check("V1 signature", cmd.ext_fields["Signature"], V1_SIG)
 check("V1 AccessKey extField", cmd.ext_fields["AccessKey"], "AK_TEST")
 
-# ---- V2 (带 SecurityToken) ----
+# ---- V2 (with SecurityToken) ----
 V2_HEX = ("414b5f54455354544f4b454e2d4142436c6173743166616c73654d7947726f7570"
           "4d79546f7069630102030405")
 V2_SIG = "5YIp2FNQL8pxQP3w6YKnSv3kAsw="
@@ -51,18 +51,18 @@ check("V2 content_hex", AclClientRPCHook.build_request_content(cmd).hex(), V2_HE
 check("V2 signature", cmd.ext_fields["Signature"], V2_SIG)
 check("V2 SecurityToken extField", cmd.ext_fields["SecurityToken"], "TOKEN-ABC")
 
-# ---- V3 (无 body) ----
+# ---- V3 (no body) ----
 cmd = build({"a": "1", "b": "2"}, None)
 hook = AclClientRPCHook(SessionCredentials("AK", "SK"))
 hook.do_before_request("127.0.0.1:9876", cmd)
 check("V3 content_hex", AclClientRPCHook.build_request_content(cmd).hex(), "414b3132")
 check("V3 signature", cmd.ext_fields["Signature"], "d3vJKL2iRdr4ZykZfY+lxfQlfdc=")
 
-# ---- V4 (预先存在的 Signature 必须被排除) ----
+# ---- V4 (pre-existing Signature must be excluded) ----
 cmd = build({"topic": "MyTopic", "Signature": "SHOULD_BE_EXCLUDED"}, None)
-check("V4 Signature 被排除", AclClientRPCHook.build_request_content(cmd), b"MyTopic")
+check("V4 Signature excluded", AclClientRPCHook.build_request_content(cmd), b"MyTopic")
 
-# ---- V5 顺序无关性：插入顺序不同的等价 extFields 必须得到同一签名 ----
+# ---- V5 order independence: extFields with equal values but different insertion order must yield the same signature ----
 a = build({"topic": "MyTopic", "producerGroup": "MyGroup", "a": "1", "Zz": "last", "batch": "false"},
           bytes([1, 2, 3, 4, 5]))
 b = build({"batch": "false", "Zz": "last", "a": "1", "producerGroup": "MyGroup", "topic": "MyTopic"},
@@ -70,7 +70,7 @@ b = build({"batch": "false", "Zz": "last", "a": "1", "producerGroup": "MyGroup",
 h = AclClientRPCHook(SessionCredentials("AK_TEST", "SK_TEST_SECRET_12345678"))
 h.do_before_request("x", a)
 h.do_before_request("x", b)
-check("V5 插入顺序无关", a.ext_fields["Signature"], b.ext_fields["Signature"])
+check("V5 insertion order irrelevant", a.ext_fields["Signature"], b.ext_fields["Signature"])
 
 print("")
 print("acl python cross-check: %s" % ("ALL PASS" if FAIL == 0 else "%d FAILED" % FAIL))

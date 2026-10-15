@@ -1,11 +1,14 @@
-// 队列分配策略（消费组内的队列切分算法）。
+// Queue allocation strategies (the queue-splitting algorithms inside a consumer
+// group).
 //
-// 统一的行为约定：入参非法（currentCID 不在 cidAll 里、mqAll/cidAll 为空）
-// 时不抛异常，策略一律返回空列表——rebalance 是后台定时器，一次脏输入不能
-// 把消费者弄死。
+// One behavioural convention holds everywhere: on illegal input (currentCID not
+// in cidAll, empty mqAll/cidAll) nothing is thrown and the strategy returns an
+// empty list — rebalance is a background timer, and one dirty input must not kill
+// the consumer.
 //
-// 确定性才是关键：组内每个实例都以相同方式排序 mqAll 与 cidAll、跑同样的
-// 下标运算，否则两个实例算出重叠的分配，每条消息都被消费两遍。
+// Determinism is what matters: every instance in the group must sort mqAll and
+// cidAll the same way and run the same index arithmetic, otherwise two instances
+// compute overlapping allocations and every message is consumed twice.
 import { createHash } from 'node:crypto';
 import { MessageQueue } from '../common/message.ts';
 import { getLogger } from '../logging.ts';
@@ -17,8 +20,9 @@ export interface AllocateMessageQueueStrategy {
   name(): string;
 }
 
-// checkCid 是所有策略的前置校验：currentCID 必须在 cidAll 里，不在时打出
-// [BUG] 日志并让策略返回空分配。
+// checkCid is the shared pre-check for all strategies: currentCID must be in
+// cidAll; when it is not, log a [BUG] line and let the strategy return an empty
+// allocation.
 function checkCid(consumerGroup: string, currentCID: string, mqAll: MessageQueue[], cidAll: string[]): number {
   if (!currentCID || mqAll.length === 0 || cidAll.length === 0) return -1;
   const index = cidAll.indexOf(currentCID);
@@ -39,7 +43,8 @@ function sortCidAll(cidAll: string[]): string[] {
 
 // ------------------------------------------------------------- AVG
 
-// AVG：把排序后的队列按连续区间平均分给组内消费者，余数分给前 mod 个。
+// AVG: hands contiguous ranges of the sorted queues to the consumers of the
+// group, with the remainder going to the first `mod` of them.
 export class AllocateMessageQueueAveragely implements AllocateMessageQueueStrategy {
   name(): string { return 'AVG'; }
 
@@ -68,7 +73,7 @@ export class AllocateMessageQueueAveragely implements AllocateMessageQueueStrate
 
 // ------------------------------------------------ AVG_BY_CIRCLE
 
-// AVG_BY_CIRCLE：按排序后的 cidAll 环形轮流取队列。
+// AVG_BY_CIRCLE: takes queues in a round-robin circle over the sorted cidAll.
 export class AllocateMessageQueueAveragelyByCircle implements AllocateMessageQueueStrategy {
   name(): string { return 'AVG_BY_CIRCLE'; }
 
@@ -87,8 +92,9 @@ export class AllocateMessageQueueAveragelyByCircle implements AllocateMessageQue
 
 // ------------------------------------------------------------- CONFIG
 
-// CONFIG：直接返回调用方配置好的队列列表。注意这里【不做任何校验】——
-// 空的 group 或 cidAll 也照样返回配置列表。
+// CONFIG: returns the queue list the caller configured, verbatim. Note that it
+// does **no validation at all** here — an empty group or cidAll still returns
+// the configured list.
 export class AllocateMessageQueueByConfig implements AllocateMessageQueueStrategy {
   messageQueueList: MessageQueue[];
 
@@ -98,7 +104,7 @@ export class AllocateMessageQueueByConfig implements AllocateMessageQueueStrateg
 
   name(): string { return 'CONFIG'; }
 
-  // 忽略全部入参（这里不跑任何校验）。
+  // Every argument is ignored (no validation runs here).
   allocate(_consumerGroup: string, _currentCID: string, _mqAll: MessageQueue[], _cidAll: string[]): MessageQueue[] {
     return [...this.messageQueueList];
   }
@@ -110,8 +116,10 @@ export interface HashFunction {
   hash(key: string): number; // uint32
 }
 
-// md5 哈希：取 MD5 摘要的【前四个字节】、大端序拼成 uint32。取整段 128 位
-// （或别的切片）会落在与既有客户端不同的哈希环上，队列归属就对不上了。
+// md5 hash: takes the **first four bytes** of the MD5 digest and assembles them
+// big-endian into a uint32. Using the whole 128-bit value (or a different slice)
+// lands on a different hash ring than existing clients use, and queue ownership
+// no longer lines up.
 class Md5Hash implements HashFunction {
   hash(key: string): number {
     const sum = createHash('md5').update(key, 'utf8').digest();
@@ -142,7 +150,8 @@ class ConsistentHashRouter {
       if (!this.ring.has(key)) {
         this.keys = insertU32(this.keys, key);
       }
-      // 哈希重复时直接在原键上覆盖旧节点（有序表 put 的语义）。
+      // On a hash collision the old node is overwritten on the same key (the
+      // semantics of an ordered-map put).
       this.ring.set(key, v);
     }
   }
@@ -159,8 +168,9 @@ class ConsistentHashRouter {
     this.keys = kept;
   }
 
-  // routeNode：取环上第一个 >= hash 的键（尾区间是【闭】区间，即含端点），
-  // 越界则回绕到第一个键。
+  // routeNode: takes the first key on the ring that is >= the hash (the wrap-around
+  // range is a **closed** interval, endpoint included), wrapping to the first key
+  // when out of range.
   routeNode(objectKey: string): string | null {
     if (this.keys.length === 0) return null;
     let idx = lowerBound(this.keys, this.hashFn.hash(objectKey));
@@ -197,16 +207,18 @@ function lowerBound(sorted: number[], v: number): number {
   return lo;
 }
 
-// 队列在哈希环上的键字符串：`MessageQueue [topic=..., brokerName=...,
-// queueId=...]`，必须与经典 remoting 协议的既有形态逐字符一致。
+// The key string a queue is hashed by on the ring:
+// `MessageQueue [topic=..., brokerName=..., queueId=...]` — it must match the
+// existing shape of the classic remoting protocol character for character.
 function queueRingKeyString(mq: MessageQueue): string {
   return `MessageQueue [topic=${mq.getTopic()}, brokerName=${mq.getBrokerName()}, queueId=${mq.getQueueId()}]`;
 }
 
 // ------------------------------------------- CONSISTENT_HASH
 
-// CONSISTENT_HASH：一致性哈希策略。要点不是均匀而是【稳定】：队列数或消费者
-// 数变化时，只有受影响弧段上的队列会换主人，而 AVG 会移动所有人的边界。
+// CONSISTENT_HASH: the consistent-hash strategy. The point is not uniformity but
+// **stability**: when the queue count or the consumer count changes, only the
+// queues on the affected arc change owner, whereas AVG moves everyone's boundary.
 export class AllocateMessageQueueConsistentHash implements AllocateMessageQueueStrategy {
   virtualNodeCnt: number;
   customHashFunction?: HashFunction;
@@ -233,9 +245,10 @@ export class AllocateMessageQueueConsistentHash implements AllocateMessageQueueS
 
 // ------------------------------------------------- MACHINE_ROOM
 
-// splitTrimmingTrailingEmpty：按分隔符切分并丢掉【末尾】空段（limit=0 的
-// split 语义）；但串里没有分隔符时原样整段返回——所以 "" 仍是 [""]，不会
-// 变成空数组。
+// splitTrimmingTrailingEmpty: splits on the separator and drops **trailing**
+// empty segments (the limit=0 split semantics); but with no separator present the
+// whole string is returned as one segment — so "" stays [""], it does not become
+// an empty array.
 function splitTrimmingTrailingEmpty(text: string, sep: string): string[] {
   const parts = text.split(sep);
   if (parts.length === 1) return parts;
@@ -243,9 +256,10 @@ function splitTrimmingTrailingEmpty(text: string, sep: string): string[] {
   return parts;
 }
 
-// MACHINE_ROOM：broker 名约定为 `<idc>@<brokerName>`；只有 idc 前缀在
-// ConsumerIDCs 集合里的队列参与分配，然后按类 AVG 规则切分，余数分给前
-// `mod` 个消费者（比较用 `rem > index`，不是 `>=`）。
+// MACHINE_ROOM: broker names follow the `<idc>@<brokerName>` convention; only
+// queues whose idc prefix is in the ConsumerIDCs set take part in allocation, and
+// they are then split by the AVG-like rule with the remainder going to the first
+// `mod` consumers (the comparison is `rem > index`, not `>=`).
 export class AllocateMessageQueueByMachineRoom implements AllocateMessageQueueStrategy {
   consumerIDCs: Set<string>;
 
@@ -260,8 +274,8 @@ export class AllocateMessageQueueByMachineRoom implements AllocateMessageQueueSt
     const cidAll = sortCidAll(cidAllRaw);
     const index = checkCid(consumerGroup, currentCID, mqAll, cidAll);
     if (index < 0) return [];
-    // consumerIDCs 没有内建默认值（缺省会让 idc 匹配直接炸），这里默认空
-    // 集合，即"什么都不分"。
+    // consumerIDCs has no built-in default (omitting it would blow up idc
+    // matching); the default here is the empty set, i.e. "assign nothing".
     const candidates: MessageQueue[] = [];
     for (const mq of mqAll) {
       const parts = splitTrimmingTrailingEmpty(mq.getBrokerName(), '@');
@@ -283,7 +297,7 @@ export class AllocateMessageQueueByMachineRoom implements AllocateMessageQueueSt
   }
 }
 
-// 策略工厂：名字 -> 实例（覆盖上面几个内置策略）。
+// Strategy factory: name -> instance (covering the built-in strategies above).
 export const ALLOCATE_STRATEGIES: Record<string, () => AllocateMessageQueueStrategy> = {
   AVG: () => new AllocateMessageQueueAveragely(),
   AVG_BY_CIRCLE: () => new AllocateMessageQueueAveragelyByCircle(),
@@ -312,26 +326,33 @@ export function createAllocateStrategy(name: string): AllocateMessageQueueStrate
 
 // --------------------------------------------- MACHINE_ROOM_NEARBY
 
-// MachineRoomResolver：告诉策略某个队列 / 某个消费者住在哪个机房。
-// 两个方法都不允许返回 null/空串——机房解析为空会让整轮分配带错终止，
-// 消费者把异常抛出去，rebalance 这一轮因而保留现有分配。
+// MachineRoomResolver: tells the strategy which machine room a given queue or a
+// given consumer lives in. Neither method may return null/an empty string — an
+// empty room would make the whole allocation round carry a wrong terminator, the
+// consumer throws, and this rebalance round therefore keeps the existing
+// allocation.
 export interface MachineRoomResolver {
   brokerDeployIn(messageQueue: MessageQueue): string;
   consumerDeployIn(clientID: string): string;
 }
 
-// AllocateMachineRoomNearby：代理在另一个策略外面的"就近机房"分配。队列与
-// 消费者先按机房分组，然后
+// AllocateMachineRoomNearby: "nearby machine room" allocation as a proxy in
+// front of another strategy. Queues and consumers are first grouped by machine
+// room, then
 //
-//  1. 本消费者所在机房的队列，只分给该机房的消费者（走内层策略）；
-//  2. 没有任何存活消费者的机房，其队列由【全部】消费者分摊（同样走内层
-//     策略）——否则那些队列就没人消费了。
+//  1. the queues of this consumer's room go only to the consumers of that room
+//     (handled by the inner strategy);
+//  2. the queues of any room with no live consumer are shared by **all**
+//     consumers (also via the inner strategy) — otherwise those queues would
+//     have nobody consuming them.
 //
-// name() 是 "MACHINE_ROOM_NEARBY" + "-" + <内层名>，日志能看出实际做切分的
-// 是哪个算法。
+// name() is "MACHINE_ROOM_NEARBY" + "-" + <inner name>, so logs reveal which
+// algorithm actually does the splitting.
 //
-// 构造参数为空时抛错；resolver 返回空机房时也抛错。allocate 期间的失败会
-// 直接从 allocate() 抛出——rebalance 循环捕获后保留现有分配（异常终止本轮）。
+// The constructor throws on empty arguments, and so does a resolver that returns
+// an empty machine room. Failures during allocate propagate straight out of
+// allocate() — the rebalance loop catches them and keeps the existing allocation
+// (aborting the round).
 export class AllocateMachineRoomNearby implements AllocateMessageQueueStrategy {
   inner: AllocateMessageQueueStrategy;
   resolver: MachineRoomResolver;
@@ -350,8 +371,8 @@ export class AllocateMachineRoomNearby implements AllocateMessageQueueStrategy {
     const cidAll = sortCidAll(cidAllRaw);
     if (checkCid(consumerGroup, currentCID, mqAll, cidAll) < 0) return [];
 
-    // 队列按机房分组：机房间按字典序处理——靠输入排序 + Map 的插入顺序保证
-    // 确定性。
+    // Group queues by machine room: the rooms are processed in lexicographic order —
+    // determinism comes from sorting the input plus Map insertion order.
     const mr2Mq = new Map<string, MessageQueue[]>();
     for (const mq of mqAll) {
       const room = this.resolver.brokerDeployIn(mq);

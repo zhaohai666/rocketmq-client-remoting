@@ -98,11 +98,11 @@ public sealed class TopicConfig
         return c;
     }
 
-    // encode 语义：JsonValue -> UTF-8 字节串（RemotingSerializable::encode）。
-    // 因 C# 侧暂无 RemotingSerializable，这里直接内联其语义（JSON dump -> UTF-8）。
+    // Encode semantics: JsonValue -> UTF-8 byte string (RemotingSerializable::encode).
+    // Since RemotingSerializable is not yet available on the C# side, inline its semantics here (JSON dump -> UTF-8).
     public byte[] Encode() => Encoding.UTF8.GetBytes(Json.Dump(ToJson()));
 
-    // decode 与 encode 对称：解析失败返回 false（不抛异常）。
+    // Decode is symmetric with encode: returns false on parse failure (does not throw).
     public static bool Decode(byte[] data, out TopicConfig outConfig)
     {
         outConfig = new TopicConfig();

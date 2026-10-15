@@ -225,7 +225,7 @@ class MixAll:
         return MixAll.build_mq_client_id(MixAll.cached_ip_str(), instance_name,
                                         unit_name, enable_stream_request_type)
 
-    # ---------------- Properties <-> String（对应 MixAll.properties2String/string2Properties）----------------
+    # ---------------- Properties <-> String (corresponds to MixAll.properties2String/string2Properties) ----------------
     @staticmethod
     def properties2_string(properties, is_sort: bool = False) -> str:
         pass
@@ -246,7 +246,7 @@ class MixAll:
         if text is None:
             return {}
         result = {}
-        # 先把续行合并成逻辑行（.properties 的续行格式）
+        # first merge continuation lines into logical lines (.properties continuation format)
         logical_lines = []
         pending = None
         for raw in text.splitlines():
@@ -254,7 +254,7 @@ class MixAll:
             if pending is not None:
                 line = pending + line.lstrip()
                 pending = None
-            # 统计行尾反斜杠个数：奇数表示续行
+            # count trailing backslashes: odd count means continuation line
             trailing = len(line) - len(line.rstrip("\\"))
             if trailing % 2 == 1:
                 pending = line[:-1]
@@ -275,10 +275,10 @@ class MixAll:
             while i < n and line[i] not in "=:" and line[i] not in _PROP_WS:
                 i += 1
             key = line[key_start:i]
-            # 跳过分隔符前的空白
+            # skip whitespace before the separator
             while i < n and line[i] in _PROP_WS:
                 i += 1
-            # 可选的 '=' / ':' 及其后的空白
+            # optional '=' / ':' and the whitespace after it
             if i < n and line[i] in "=:":
                 i += 1
                 while i < n and line[i] in _PROP_WS:
@@ -287,11 +287,12 @@ class MixAll:
         return result
 
 
-# .properties 格式认的空白字符（string2_properties 的分隔判断用）。
-# 必须是模块级常量：staticmethod 里裸名查找走的是模块全局，不是类作用域。
+# Whitespace characters recognized by the .properties format (used by string2_properties for separator detection).
+# Must be a module-level constant: a bare name lookup inside a staticmethod resolves to the module global,
+# not the class scope.
 _PROP_WS = " \t\f"
 
-# `MixAll.cached_ip_str` 的缓存，同样是模块级（类作用域里不能赋值）。
+# Cache for `MixAll.cached_ip_str`, also module-level (cannot be assigned inside class scope).
 _CACHED_IP_STR = None
 
 
@@ -313,9 +314,9 @@ _PREDEFINE_GROUP_SET = frozenset([
 ])
 
 class QueryMsgType:
-    """按 key 查消息的三种模式（对应 tools 的 QueryMsgByKeySubCommand.QueryMsgType）。
+    """Three modes for querying messages by key (corresponds to tools' QueryMsgByKeySubCommand.QueryMsgType).
 
-    与 ``MixAll.UNIQUE_MSG_QUERY_FLAG`` 不是一个东西：后者是 extFields 里的**键名**。
+    Not the same as ``MixAll.UNIQUE_MSG_QUERY_FLAG``: the latter is the **key name** inside extFields.
     """
 
     ALL_MESSAGE = 0

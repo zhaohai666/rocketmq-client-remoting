@@ -1,12 +1,17 @@
-// 为什么必须离线锁死：这是唯一能把**卡死的 listener** 救出来的闸门，坏了全是静默的：
-//   - 判松了（不严格大于、没盖章也算过期、对非队首动手）：正在被消费的消息被抢走回投，
-//     重复投递；
-//   - 判紧了（队首不过期却继续扫后面）：队首永远卡住，后面的过期消息永远出不去；
-//   - 上限写丢（单轮无界）：一次把整条队列清空，位点/重投节奏全乱；
-//   - 回投失败后摘除：消息真丢。
-// 未 Start 的消费者 SendMessageBack 必定抛，所以离线能锁死「判定」与「回投失败原地保留」
-// 两条分支；真机链路（挂起 → 清扫 → %RETRY% 重投到达）见
-// examples/RocketMQ.Examples/LiveCleanExpiredMsg.cs。
+// Why it must be pinned offline: this is the only gate that can rescue a **hung listener**,
+// and when it breaks everything is silent:
+//   - judged too loosely (not strictly greater, counting unstamped as expired, touching
+//     anything that is not the head): a message that is being consumed gets taken away and
+//     resent, so it is delivered twice;
+//   - judged too tightly (the head is not expired but it keeps scanning further): the head
+//     is stuck forever and the expired messages behind it can never get out;
+//   - the upper bound dropped (unbounded per round): one round empties the whole queue and
+//     the offset / redelivery cadence is completely scrambled;
+//   - removed after a failed resend: the message is really lost.
+// A consumer that is not Started always throws from SendMessageBack, so offline can pin the
+// "decision" and the "a failed resend keeps it in place" branches; the real-machine path
+// (suspend -> sweep -> arrival via %RETRY%) is covered by
+// examples/RocketMQ.Examples/LiveCleanExpiredMsg.cs.
 
 using RocketMQ.Client;
 using RocketMQ.Common;
@@ -44,7 +49,8 @@ public class CleanExpiredMsgTests
 
     private static long Now() => UtilAll.CurrentTimeMillis();
 
-    /// <summary>未 Start 的消费者：SendMessageBack 必定抛（正是「回投失败原地保留」的夹具）。</summary>
+    /// <summary>A consumer that is not Started: SendMessageBack always throws (exactly the
+    /// "a failed resend keeps it in place" fixture).</summary>
     private sealed class Harness
     {
         private readonly DefaultMQPushConsumer _consumer;
@@ -108,7 +114,8 @@ public class CleanExpiredMsgTests
         Assert.Equal(1_700_000_000_000L, DefaultMQPushConsumer.ConsumeStartTimestampForTest(m));
     }
 
-    /// <summary>过期判据是**严格**大于（等于阈值不动手），没盖章不当过期。</summary>
+    /// <summary>The expiry criterion is **strictly** greater (exactly at the threshold
+    /// nothing happens), and an unstamped entry is not expired.</summary>
     [Fact]
     public void IsConsumeExpiredIsStrictAndIgnoresMissingStamps()
     {
@@ -117,7 +124,7 @@ public class CleanExpiredMsgTests
         Assert.False(DefaultMQPushConsumer.IsConsumeExpiredForTest(now - 60_000, now, 1));
         Assert.False(DefaultMQPushConsumer.IsConsumeExpiredForTest(now, now, 1));
         Assert.False(DefaultMQPushConsumer.IsConsumeExpiredForTest(null, now, 1));
-        // 默认 15 分钟：14 分 59.999 秒不动手，15 分零 1 毫秒动手
+        // The default is 15 minutes: 14 minutes 59.999 seconds does nothing, 15 minutes and 1 millisecond does
         Assert.False(DefaultMQPushConsumer.IsConsumeExpiredForTest(now - 899_999, now, 15));
         Assert.True(DefaultMQPushConsumer.IsConsumeExpiredForTest(now - 900_001, now, 15));
     }
@@ -126,7 +133,7 @@ public class CleanExpiredMsgTests
     public void StopsAtAFreshHead()
     {
         var h = new Harness();
-        h.Seed(Ext(0), Ext(1, Now() - 120_000));  // 头没盖章，尾巴过期
+        h.Seed(Ext(0), Ext(1, Now() - 120_000));  // the head is unstamped, the tail is expired
         Assert.Equal(0, h.Clean());
         Assert.Equal(2, h.Entries().Count);
     }
@@ -140,7 +147,8 @@ public class CleanExpiredMsgTests
         Assert.Single(h.Entries());
     }
 
-    /// <summary>坏戳与空戳同命：坏值解析失败按没盖章处理，不是「等同于 0」。</summary>
+    /// <summary>A bad stamp and an absent stamp fare alike: a bad value that fails to
+    /// parse is treated as unstamped, not as "equivalent to 0".</summary>
     [Fact]
     public void BadStampIsNotTreatedAsAncient()
     {
@@ -157,7 +165,7 @@ public class CleanExpiredMsgTests
     {
         var h = new Harness();
         h.Seed(Ext(0, Now() - 120_000), Ext(1, Now() - 120_000));
-        Assert.Equal(2, h.Clean());  // loop=min(2,16)=2：同一条队首重试两次
+        Assert.Equal(2, h.Clean());  // loop=min(2,16)=2: the same head is retried twice
         Assert.Equal(2, h.Entries().Count);
         Assert.Null(h.Offset());
     }
@@ -182,24 +190,25 @@ public class CleanExpiredMsgTests
         Assert.Single(h.Entries());
     }
 
-    /// <summary>「仍是队首才摘」的两种让位：正常收尾（条目已摘/已前进）与更小位点冒头。</summary>
+    /// <summary>The two ways of yielding "still the head": a normal finish (the entry is
+    /// already removed / has advanced) and a smaller offset surfacing in front.</summary>
     [Fact]
     public void RemoveExpiredEntryOnlyWhenStillHead()
     {
-        // 仍是队首：视图里摘掉
+        // Still the head: removed from the view
         var h = new Harness();
         h.Consumer.SetPendingForTest(h.Key, new List<MessageExt> { Ext(0), Ext(1) });
         Assert.True(h.Consumer.RemoveExpiredEntryIfStillHeadForTest(h.Key, h.Entries().Single(m => m.QueueOffset == 0)));
         Assert.Single(h.Entries());
 
-        // 前面冒出了更小的位点：让位，不许抢摘
+        // A smaller offset surfaced in front: yield, it must not be grabbed away
         var h2 = new Harness();
         h2.Consumer.SetPendingForTest(h2.Key, new List<MessageExt> { Ext(3), Ext(5) });
         MessageExt five = h2.Entries().Single(m => m.QueueOffset == 5);
         Assert.False(h2.Consumer.RemoveExpiredEntryIfStillHeadForTest(h2.Key, five));
         Assert.Equal(2, h2.Entries().Count);
 
-        // 已经不在视图里（listener 正常收尾先摘了）：同样为 false，且不抛
+        // Already gone from the view (the listener removed it on its normal finish): likewise false, and it does not throw
         var h3 = new Harness();
         Assert.False(h3.Consumer.RemoveExpiredEntryIfStillHeadForTest(h3.Key, Ext(0)));
     }
@@ -227,7 +236,7 @@ public class CleanExpiredMsgTests
         List<MessageExt> batch = h.Consumer.TakeBatchForConsume(h.Key);
         Assert.Equal(2, batch.Count);
 
-        // 模拟清扫先把本批的第一条回投并摘除（它在 _inFlightMsgs 里，两处一起清）
+        // Simulates the sweep resending and removing the first message of this batch (it is in _inFlightMsgs, both are cleared together)
         h.Consumer.RemoveProcessQueueEntryForTest(h.Key, batch[0]);
 
         h.Consumer.ConsumeBatchForTest(h.Key, Queue0(), batch);

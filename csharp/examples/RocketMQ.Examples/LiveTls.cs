@@ -1,13 +1,16 @@
-// TLS + traceparent 真机联调。
+// Real-machine integration of TLS + traceparent.
 //
-// 验证点（单进程闭环）：
-//   0. 传输层：逐轮新建 TLS 连接的首包必须落地；一条 TLS 连接上并发请求必须全部拿到应答
-//      并且 opaque 逐笔对上（C# 的读线程走 SslStream.Read、调用方走 SslStream.Write，
-//      两者必然在同一条会话上交叠）；
-//   1. TLS 生产者/消费者（test-mode，信任 broker 自签证书）真连真发真收；
-//   2. 生产侧注入的 traceparent 属性随消息走完整链路，消费侧可提取且合法。
+// What is verified (a single-process loop):
+//   0. Transport layer: the first packet of every freshly created TLS connection must land;
+//      concurrent requests on one TLS connection must all get responses with their opaque
+//      matched one by one (C#'s reader thread goes through SslStream.Read and the callers
+//      through SslStream.Write, so the two inevitably interleave on the same session);
+//   1. A TLS producer/consumer (test-mode, trusting the broker's self-signed certificate)
+//      really connects, sends and receives;
+//   2. The traceparent property injected on the producer side travels the whole chain and
+//      can be extracted and is legal on the consumer side.
 //
-// 用法：dotnet run ... -- tls <namesrv> <topic> <group>
+// Usage: dotnet run ... -- tls <namesrv> <topic> <group>
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -23,13 +26,15 @@ namespace RocketMQ.Examples;
 
 internal static class LiveTls
 {
-    // ---- S0 传输层压力的口径 ----
-    // nameServer 对不存在的 topic 回 TOPIC_NOT_EXIST(17) 也算"首包落地"；等满超时才算丢。
+    // ---- the rule of thumb for S0 transport stress ----
+    // The nameServer replying TOPIC_NOT_EXIST(17) for a non-existent topic also counts as
+    // "the first packet landed"; only waiting out the timeout counts as a loss.
     private const int FirstPacketRounds = 30;
     private const long FirstPacketBudgetMs = 1500;
     private const int ConcurrentThreads = 16;
     private const int ConcurrentPerThread = 20;
-    // 320 笔并发在 loopback 上实测几百毫秒；预算给 10s，真被会话串行化卡到就是几十秒量级。
+    // 320 concurrent requests measured in a few hundred milliseconds on loopback; the
+    // budget is 10s, and if the session really got serialised it would be tens of seconds.
     private const long ConcurrentBudgetMs = 10000;
 
     private static RemotingCommand RouteRequest(string topic) =>
@@ -37,8 +42,10 @@ internal static class LiveTls
             new GetRouteInfoRequestHeader { Topic = topic });
 
     /// <summary>
-    /// 直接用 RemotingClient 压 TLS 会话的读写线程口径：S0a 每轮新建连接打首包，
-    /// S0b 一条连接上多线程并发（读线程与写线程彻底交叠）并要求 opaque 逐笔对上。
+    /// Drives the TLS session's reader/writer thread rule directly with RemotingClient:
+    /// S0a creates a connection each round and sends a first packet, S0b runs many threads
+    /// concurrently on one connection (the reader and writer threads interleave completely)
+    /// and requires the opaque of every request to match.
     /// </summary>
     private static bool RunTransportStress(string namesrv, TlsOptions? tlsOptions)
     {
@@ -58,13 +65,13 @@ internal static class LiveTls
                 if (ms > FirstPacketBudgetMs)
                 {
                     lost++;
-                    Console.WriteLine("  round " + i + " 首包慢到 " + ms + "ms");
+                    Console.WriteLine("  round " + i + " first packet took " + ms + "ms");
                 }
             }
             catch (Exception e)
             {
                 lost++;
-                Console.WriteLine("  round " + i + " 首包失败 (" + sw.ElapsedMilliseconds + "ms): "
+                Console.WriteLine("  round " + i + " first packet failed (" + sw.ElapsedMilliseconds + "ms): "
                     + e.Message);
             }
             finally
@@ -74,7 +81,7 @@ internal static class LiveTls
         }
 
         Console.WriteLine("  [" + (lost == 0 ? "PASS" : "FAIL") + "] S0a " + FirstPacketRounds
-            + " 轮新建 TLS 连接首包全部落地  lost=" + lost + " worst=" + worstMs + "ms");
+            + " rounds of first packets on fresh TLS connections all landed  lost=" + lost + " worst=" + worstMs + "ms");
         ok &= lost == 0;
 
         var shared = new RemotingClient(tlsEnable: true, tlsOptions: tlsOptions);
@@ -93,18 +100,18 @@ internal static class LiveTls
                     try
                     {
                         RemotingCommand resp = shared.InvokeSync(namesrv, req, 5000);
-                        // opaque 错号 = 响应串台到别的请求，和丢一样严重
+                        // a mismatched opaque = the response crossed wires onto another request, as bad as a loss
                         if (resp.Opaque != req.Opaque)
                         {
                             Interlocked.Increment(ref failures);
                             Console.WriteLine("  thread " + thread + " req " + i
-                                + " 响应串台: sent=" + req.Opaque + " got=" + resp.Opaque);
+                                + " a response crossed wires: sent=" + req.Opaque + " got=" + resp.Opaque);
                         }
                     }
                     catch (Exception e)
                     {
                         Interlocked.Increment(ref failures);
-                        Console.WriteLine("  thread " + thread + " req " + i + " 失败: " + e.Message);
+                        Console.WriteLine("  thread " + thread + " req " + i + " failed: " + e.Message);
                     }
                 }
             });
@@ -114,9 +121,9 @@ internal static class LiveTls
         long concurrentMs = all.ElapsedMilliseconds;
         shared.Dispose();
         bool concurrentOk = failures == 0 && concurrentMs < ConcurrentBudgetMs;
-        Console.WriteLine("  [" + (concurrentOk ? "PASS" : "FAIL") + "] S0b 单条 TLS 连接 "
-            + ConcurrentThreads + " 线程并发 " + ConcurrentThreads * ConcurrentPerThread
-            + " 笔全部对上号  fail=" + failures + " elapsed=" + concurrentMs + "ms");
+        Console.WriteLine("  [" + (concurrentOk ? "PASS" : "FAIL") + "] S0b one TLS connection, "
+            + ConcurrentThreads + " threads concurrently, all " + ConcurrentThreads * ConcurrentPerThread
+            + " requests matched  fail=" + failures + " elapsed=" + concurrentMs + "ms");
         return ok && concurrentOk;
     }
 
@@ -131,10 +138,10 @@ internal static class LiveTls
         string namesrv = args[0];
         string topic = args[1];
         string group = args[2];
-        // 三腿：
-        //   plain     tlsEnable=True，信任自签（test-mode）
-        //   ca_verify + CaCert —— 严格校验证书链 + 主机名 SAN
-        //   mtls      ca_verify + 客户端证书（broker -Dtls.server.authClient=true）
+        // three legs:
+        //   plain     tlsEnable=True, trusting the self-signed certificate (test-mode)
+        //   ca_verify + CaCert -- strict certificate chain + hostname SAN verification
+        //   mtls      ca_verify + a client certificate (broker -Dtls.server.authClient=true)
         string leg = args.Length > 3 ? args[3] : "plain";
         TlsOptions? tlsOptions = null;
         if (leg is "ca_verify" or "mtls")
@@ -152,12 +159,14 @@ internal static class LiveTls
         }
         Console.WriteLine("=== C# TLS live: leg=" + leg + " topic=" + topic + " ===");
 
-        // 0) 传输层压力放在最前：只要一个能建 TLS 连接的 nameServer 地址，不依赖 topic
-        Console.WriteLine("=== S0 TLS 传输层 ===");
+        // 0) transport stress goes first: it only needs a nameServer address that can
+        //    establish a TLS connection, it does not depend on the topic
+        Console.WriteLine("=== S0 TLS transport layer ===");
         bool transportOk = RunTransportStress(namesrv, tlsOptions);
 
-        // 1) 明文生产者预建 topic（约定：先建 topic 再起消费者）。严格校验的集群是
-        //    namesrv+broker 全 TLS，这个 prep 生产者也走 TLS。
+        // 1) the plaintext producer pre-creates the topic (the convention: create the topic
+        //    before starting the consumer). On a strictly verified cluster both the namesrv
+        //    and the broker are TLS, so this prep producer goes over TLS too.
         var prep = new DefaultMQProducer("GID_TLS_PREP")
         {
             NamesrvAddr = namesrv,
@@ -171,12 +180,12 @@ internal static class LiveTls
         }
         catch (Exception e)
         {
-            Console.WriteLine("  预建 topic 失败（改用自动创建）: " + e.Message);
+            Console.WriteLine("  pre-creating the topic failed (falling back to auto-creation): " + e.Message);
         }
 
         Thread.Sleep(3000);
 
-        // 2) TLS 消费者先起
+        // 2) the TLS consumer starts first
         var listener = new CountListener();
         var consumer = new DefaultMQPushConsumer(group);
         consumer.SetNamesrvAddr(namesrv);
@@ -187,7 +196,7 @@ internal static class LiveTls
         consumer.Subscribe(topic, "*");
         consumer.Start();
 
-        // 3) TLS 生产者发送 3 条（trace 注入开启）
+        // 3) the TLS producer sends 3 messages (trace injection on)
         var producer = new DefaultMQProducer("GID_TLS_PROD");
         producer.NamesrvAddr = namesrv;
         producer.TlsEnable = true;
@@ -205,7 +214,7 @@ internal static class LiveTls
             }
         }
 
-        // 4) 等收齐
+        // 4) wait until everything is received
         for (int i = 0; i < 80 && listener.Count() < sent; i++)
         {
             Thread.Sleep(250);

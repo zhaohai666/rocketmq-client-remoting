@@ -142,7 +142,7 @@ export class DefaultMQPushConsumer {
   clientID = '';
   unitMode = false;
   tlsEnable: boolean | null = null;
-  // TLS 细项（见 setTlsOptions）；null = test-mode。
+  // TLS details (see setTlsOptions); null = test-mode.
   tlsOptions: { caCert?: string; clientCert?: string; clientKey?: string; serverName?: string } | null = null;
   socksProxyConfig: SocksProxyConfig | null = null;
 
@@ -194,8 +194,9 @@ export class DefaultMQPushConsumer {
   traceDispatcher: any = null;
 
   mqClient: MQClient | null = null;
-  // 本门面登记到共享实例上的反向请求处理器（code -> handler）；shutdown 摘除，
-  // 避免退场的 consumer 继续吃多播扇出。
+  // Reverse-request processors this facade registers on the shared instance
+  // (code -> handler); removed on shutdown so an exiting consumer stops
+  // consuming the multicast fan-out.
   private _facadeHandlers: Map<number, FacadeProcessor> = new Map();
   pullFromWhichNode = new Map<string, number>(); // mqKey -> brokerId
   offsetStore: OffsetStore | null = null;
@@ -262,7 +263,7 @@ export class DefaultMQPushConsumer {
   setInstanceName(name: string): this { this.instanceName = name; return this; }
   setUnitMode(mode: boolean): this { this.unitMode = mode; return this; }
   setTlsEnable(enable: boolean): this { this.tlsEnable = enable; return this; }
-  // TLS 细项（caCert=严格 CA 校验；clientCert/clientKey=mTLS；serverName=主机名覆盖）。
+  // TLS details (caCert=strict CA verification; clientCert/clientKey=mTLS; serverName=hostname override).
   setTlsOptions(opts: { caCert?: string; clientCert?: string; clientKey?: string; serverName?: string } | null): this {
     this.tlsOptions = opts; return this;
   }
@@ -560,14 +561,16 @@ export class DefaultMQPushConsumer {
       try { this._producer.shutdown(); } catch (e) { /* ignore */ }
       this._producer = null;
     }
-    // 摘掉本门面的反向请求处理器，然后把实例归还给 manager：计数 -1，**归零才
-    // 真正 shutdown**（停心跳/路由定时器、断 remoting）。同 clientId 还挂着别的
-    // 门面时时例与另一份 _statsManager 继续存活。
+    // Remove this facade's reverse-request processors, then hand the instance
+    // back to the manager: decrement the count; the REAL shutdown (stop
+    // heartbeat/route timers, drop remoting) happens only when it hits ZERO.
+    // Other facades sharing the same clientId — and another _statsManager —
+    // keep running.
     this._unregisterProcessors();
     if (client) {
       MQClientManager.getInstance().unregisterClient(client.clientId, client);
     }
-    this._statsManager = null; // refcount 归零时 manager 关实例，统一采样定时器随之停下
+    this._statsManager = null; // when the refcount hits zero the manager shuts the instance down and the shared sampling timer stops
     if (this.traceDispatcher) {
       try { this.traceDispatcher.shutdown(); } catch (e) { /* ignore */ }
       this.traceDispatcher = null;
@@ -1088,11 +1091,14 @@ export class DefaultMQPushConsumer {
       // — not "keep the previous value".
       let brokerId = this.pullFromWhichNode.get(key);
       if (brokerId === undefined) brokerId = MixAll.MASTER_ID;
-      // 静态主题：地址解析必须走端点重写（先按 MessageQueue 解析出真实
-      // brokerName 再查订阅地址），
-      // wire header 里的 brokerName 仍保留逻辑（mock）名，由 broker 侧
-      // TopicQueueMappingDetail 做逻辑→物理翻译。测试工程的 duck-typed mock
-      // client 可能没有这个方法——非静态主题的重写结果就是原 broker 名，回退安全。
+      // Static topic: address resolution must go through the endpoint rewrite
+      // (resolve the real brokerName from the MessageQueue first, then look up
+      // the subscribe address); the brokerName in the wire header keeps the
+      // logical (mock) name, and the broker-side TopicQueueMappingDetail
+      // performs the logical->physical translation. The test project's
+      // duck-typed mock client may not have this method — for non-static
+      // topics the rewrite yields the original broker name, so the fallback is
+      // safe.
       const realBrokerName = typeof client.getBrokerNameFromMessageQueue === 'function'
         ? client.getBrokerNameFromMessageQueue(mq) : mq.getBrokerName();
       let resolved = this._findBrokerAddressInSubscribe(realBrokerName, brokerId, false);
@@ -2199,7 +2205,7 @@ export class DefaultMQPushConsumer {
     this._facadeHandlers = handlers;
   }
 
-  // 摘除本门面登记到共享实例上的反向请求处理器（shutdown 用）。
+  // Remove the reverse-request processors this facade registered on the shared instance (used by shutdown).
   private _unregisterProcessors(): void {
     const client = this.mqClient;
     if (client != null) {

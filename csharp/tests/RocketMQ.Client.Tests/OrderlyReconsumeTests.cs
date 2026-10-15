@@ -34,7 +34,8 @@ public class OrderlyReconsumeTests
             .Select((rt, i) => Ext(start + i, rt))
             .ToList();
 
-    /// <summary>返回固定状态的顺序 listener（顺序侧没有 ackIndex，只有状态）。</summary>
+    /// <summary>An orderly listener returning a fixed state (the orderly side has no
+    /// ackIndex, only a state).</summary>
     private sealed class OrderlyListener : IMessageListenerOrderly
     {
         private readonly ConsumeOrderlyStatus _status;
@@ -43,14 +44,16 @@ public class OrderlyReconsumeTests
 
         public OrderlyListener(ConsumeOrderlyStatus status) => _status = status;
 
-        /// <summary>模拟 binlog 消费方：listener 置 AutoCommit=false 拿走提交权。</summary>
+        /// <summary>Simulates a binlog consumer: the listener sets AutoCommit=false and
+        /// takes the commit right.</summary>
         public OrderlyListener ManualCommit(bool autoCommit)
         {
             _autoCommit = autoCommit;
             return this;
         }
 
-        /// <summary>在 context 上指定挂起时长（-1 = 没指定，回落到消费者配置）。</summary>
+        /// <summary>Specifies the suspend duration on the context (-1 = not specified,
+        /// fall back to the consumer config).</summary>
         public OrderlyListener Asking(int ms)
         {
             _suspendMs = ms;
@@ -77,8 +80,9 @@ public class OrderlyReconsumeTests
     }
 
     /// <summary>
-    /// 一把「未 Start」的顺序消费者：回投必定失败（<c>Client()</c> 抛 → 内部吞掉 → 返回
-    /// false），正是「回投失败不能推进位点」这条分支的夹具。
+    /// An orderly consumer that is "not Started": a resend is bound to fail
+    /// (<c>Client()</c> throws -> swallowed internally -> false returned), which is
+    /// exactly the fixture for the "a failed resend must not advance the offset" branch.
     /// </summary>
     private sealed class Harness
     {
@@ -94,15 +98,18 @@ public class OrderlyReconsumeTests
             _consumer.SetMessageListener(new OrderlyListener(
                 ConsumeOrderlyStatus.SuspendCurrentQueueAMoment));
             _key = DefaultMQPushConsumer.OffsetKeyForTest(Queue0());
-            // 真机里 dispatchLoop 是「先从缓冲取走本批、再消费」，所以 key 一定还在表里
-            //（可能还有余量）。回投失败要塞回的正是这张表；不预置就等于队列已被撤走。
+            // On a real machine dispatchLoop is "take this batch out of the buffer first,
+            // then consume", so the key is still in the table (it may even have some
+            // remaining allowance). What a failed resend has to put back is exactly this
+            // table; not seeding it would mean the queue has already been withdrawn.
             _consumer.SetPendingForTest(_key, pending ?? new List<MessageExt>());
         }
 
         public bool Run(List<MessageExt> batch)
             => _consumer.ConsumeBatchForTest(_key, Queue0(), batch);
 
-        /// <summary>用指定 listener（可带 AutoCommit / 挂起时长设定）跑一批。</summary>
+        /// <summary>Runs a batch with the given listener (optionally with AutoCommit /
+        /// suspend duration settings).</summary>
         public bool RunWith(IMessageListenerOrderly listener, List<MessageExt> batch,
                             List<MessageExt>? pending = null)
         {
@@ -148,8 +155,9 @@ public class OrderlyReconsumeTests
     [Fact]
     public void DefaultCapNeverJudgesThePoisonMessageExhausted()
     {
-        // 默认配置下即便 reconsumeTimes 已到 int.MaxValue-1，也只是本地 +1 继续挂起重试，
-        // 不会去回投（更不会被 broker 投进 %DLQ%）。
+        // Under the default config, even once reconsumeTimes has reached int.MaxValue-1 it
+        // is only +1 locally and keeps retrying by suspending; it does not resend (and
+        // certainly is not put into %DLQ% by the broker).
         var h = new Harness(-1);
         List<MessageExt> batch = OffsetBatch(0, new[] { int.MaxValue - 1 });
         Assert.True(h.CheckGate(batch));
@@ -159,7 +167,8 @@ public class OrderlyReconsumeTests
     [Fact]
     public void BelowCapCountsLocallyAndSuspends()
     {
-        // 没用尽时压根不回投（未 Start 也回投不了，所以这条判据必须自己走判据函数）
+        // It does not resend at all when not exhausted (and it cannot resend while not
+        // Started either, so this criterion has to go through the criterion function itself)
         var h = new Harness(3);
         List<MessageExt> batch = OffsetBatch(0, new[] { 0, 2 });
         Assert.True(h.CheckGate(batch));
@@ -201,15 +210,15 @@ public class OrderlyReconsumeTests
         Assert.Equal(5, newMsg.DelayTimeLevel);
         Assert.Equal("mid-7", newMsg.GetProperty(MessageConst.PropertyOriginMessageId));
         Assert.False(newMsg.Properties.ContainsKey(MessageConst.PropertyTransactionPrepared),
-            "半消息标记必须清掉，否则 broker 会把它当回查消息");
+            "the half-message marker must be cleared, otherwise the broker treats it as a check message");
         Assert.False(string.IsNullOrEmpty(newMsg.GetProperty(MessageConst.PropertyUniqClientMessageIdKeyidx)),
-            "回投也要带 UNIQ_KEY，否则轨迹串不起来");
+            "a resend must carry UNIQ_KEY too, otherwise the trace cannot be tied together");
     }
 
     [Fact]
     public void SuspendRequeuesBatchWhileBelowCap()
     {
-        // 队尾还有下一条（offset 2），本批要按原顺序插到它前面
+        // There is a next one at the tail (offset 2), this batch must be inserted in front of it in the original order
         var h = new Harness(3, OffsetBatch(2, new[] { 0 }));
         Assert.False(h.Run(OffsetBatch(0, new[] { 0, 1 })));
         Assert.Null(h.Offset());
@@ -219,8 +228,9 @@ public class OrderlyReconsumeTests
     [Fact]
     public void SuccessPathSkipsTheReconsumeGate()
     {
-        // 阈值 0：一旦走到判据就会尝试回投（离线必败 → 挂起），所以「位点前进」
-        // 本身就证明了 SUCCESS 没碰判据。
+        // Threshold 0: as soon as the criterion is reached it attempts a resend (which
+        // offline always fails -> suspend), so "the offset advanced" itself proves SUCCESS
+        // never touched the criterion.
         var c = new DefaultMQPushConsumer(Group) { MaxReconsumeTimes = 0 };
         c.SetMessageListener(new OrderlyListener(ConsumeOrderlyStatus.Success));
         string key = DefaultMQPushConsumer.OffsetKeyForTest(Queue0());
@@ -230,7 +240,7 @@ public class OrderlyReconsumeTests
         Assert.Empty(c.PendingForTest(key));
     }
 
-    // ---------------- 挂起时长（context 优先 + 钳位） ----------------
+    // ---------------- Suspend duration (context first + clamping) ----------------
 
     [Fact]
     public void OrderlySuspendMillisResolvesThenClampsLikeLegacy()
@@ -244,20 +254,20 @@ public class OrderlyReconsumeTests
             return h.Consumer().OrderlySuspendMillis(ctx);
         }
 
-        Assert.Equal(900, Resolve(-1));       // 没指定 → 回落配置
-        Assert.Equal(70, Resolve(70));        // context 优先
-        Assert.Equal(10, Resolve(0));         // 钳下限
+        Assert.Equal(900, Resolve(-1));       // not specified -> fall back to the config
+        Assert.Equal(70, Resolve(70));        // the context wins
+        Assert.Equal(10, Resolve(0));         // clamped at the lower bound
         Assert.Equal(10, Resolve(9));
         Assert.Equal(10, Resolve(10));
         Assert.Equal(30000, Resolve(30000));
-        Assert.Equal(30000, Resolve(30001));  // 钳上限
+        Assert.Equal(30000, Resolve(30001));  // clamped at the upper bound
         Assert.Equal(30000, Resolve(int.MaxValue));
 
         h.Consumer().SuspendCurrentQueueTimeMillis = -1;
         Assert.Equal(10, Resolve(-1));
     }
 
-    // ---------------- AutoCommit=true 下的非法状态 ----------------
+    // ---------------- Illegal states under AutoCommit=true ----------------
 
     [Theory]
     [InlineData(ConsumeOrderlyStatus.Commit)]
@@ -267,10 +277,10 @@ public class OrderlyReconsumeTests
         var h = new Harness(0, OffsetBatch(2, new[] { 0 }));
         Assert.True(h.RunWith(new OrderlyListener(status), OffsetBatch(0, new[] { 0, 0 })));
         Assert.Equal(2, h.Offset());
-        Assert.Single(h.Pending());  // 队尾那条还在，本批没回投
+        Assert.Single(h.Pending());  // the tail one is still there, this batch was not resent
     }
 
-    // ---------------- AutoCommit=false（手动提交） ----------------
+    // ---------------- AutoCommit=false (manual commit) ----------------
 
     [Fact]
     public void ManualCommitAdvancesWithoutRequeueing()
@@ -311,10 +321,10 @@ public class OrderlyReconsumeTests
             .ManualCommit(false);
         Assert.False(h.RunWith(listener, OffsetBatch(0, new[] { 0 })));
         Assert.Null(h.Offset());
-        Assert.Equal(new[] { (0L, 1) }, h.Pending().ToArray());  // 本地 +1 后塞回
+        Assert.Equal(new[] { (0L, 1) }, h.Pending().ToArray());  // put back after the local +1
     }
 
-    // ---------------- 309 CONSUME_MESSAGE_DIRECTLY 的映射 ----------------
+    // ---------------- The mapping of 309 CONSUME_MESSAGE_DIRECTLY ----------------
 
     [Theory]
     [InlineData(ConsumeOrderlyStatus.Success, "CR_SUCCESS")]
@@ -328,7 +338,7 @@ public class OrderlyReconsumeTests
         ConsumeMessageDirectlyResult r = c.ConsumeMessageDirectly(Ext(0), Broker);
         Assert.Equal(expect, r.ConsumeResult);
         Assert.True(r.Order);
-        Assert.False(r.AutoCommit);  // listener 设的 false 要原样回给 broker
+        Assert.False(r.AutoCommit);  // the false the listener set must go back to the broker as is
     }
 
     [Fact]
@@ -339,7 +349,7 @@ public class OrderlyReconsumeTests
         Assert.Equal("CR_RETURN_NULL", r.ConsumeResult);
     }
 
-    // ---------------- %RETRY% 属性抬进发送头 ----------------
+    // ---------------- %RETRY% properties lifted into the send header ----------------
 
     [Fact]
     public void RetryTopicPropertiesAreLiftedIntoTheSendHeader()
@@ -354,7 +364,8 @@ public class OrderlyReconsumeTests
 
         Assert.Equal("4", request.ExtFields["j"]);
         Assert.Equal("6", request.ExtFields["l"]);
-        // ⚠ 线上属性里 RECONSUME_TIME 仍然保留：消费端要靠它还原重试次数
+        // Note: RECONSUME_TIME is still kept in the on-wire properties: the consumer side
+        // relies on it to reconstruct the retry count
         Assert.Contains(MessageConst.PropertyReconsumeTime, request.ExtFields["i"]);
     }
 
@@ -369,7 +380,7 @@ public class OrderlyReconsumeTests
         request.MakeCustomHeaderToNet();
 
         Assert.Equal("0", request.ExtFields["j"]);
-        Assert.False(request.ExtFields.ContainsKey("l"), "没配就不该上线");
+        Assert.False(request.ExtFields.ContainsKey("l"), "not configured must not go on the wire");
     }
 
     private static MQClientInstance NewInstance() => new(

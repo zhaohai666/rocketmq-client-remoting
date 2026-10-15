@@ -1,9 +1,9 @@
-// 自动压缩的**真实集群 + 跨客户端**联调工具。
+// A **real cluster + cross-client** integration tool for automatic compression.
 //
 //
 //
 //
-// 用法（由 Program 以 "compression-live <mode> ..." 形式调用）：
+// Usage (called by Program in the form "compression-live <mode> ..."):
 //   rmq compression-live selftest <namesrv>
 //   rmq compression-live send     <namesrv> <topic> <group> <size> [codec]
 //   rmq compression-live recv     <namesrv> <topic> <group> <size>
@@ -30,7 +30,7 @@ internal static class CompressionLive
         }
 
         string mode = args[0];
-        // 分发器已剥掉 "compression-live"，此处 args = [mode, namesrv, topic, group, size, [codec]]
+        // The dispatcher has already stripped "compression-live", so here args = [mode, namesrv, topic, group, size, [codec]]
         if (mode == "send" && args.Length >= 5)
         {
             if (!TryParseCodec(args.Length >= 6 ? args[5] : null, out int codec))
@@ -64,10 +64,11 @@ internal static class CompressionLive
             "usage: rmq compression-live selftest <namesrv>\n" +
             "       rmq compression-live send <namesrv> <topic> <group> <size> [codec]\n" +
             "       rmq compression-live recv <namesrv> <topic> <group> <size>\n" +
-            "  codec = zlib（默认）| lz4 | zstd，只影响发送端；接收端按 sysFlag 类型位自动解压");
+        "  codec = zlib (default) | lz4 | zstd, affects the sending side only; the receiving side decompresses automatically by the sysFlag type bits");
     }
 
-    /// <summary>矩阵用的算法名解析：拼错 codec 直接退出，别让它看起来像"互通失败"。</summary>
+    /// <summary>Resolving the algorithm name for the matrix: a mistyped codec exits right
+    /// away rather than letting it look like "interoperability failed".</summary>
     private static bool TryParseCodec(string? name, out int codec)
     {
         switch (name)
@@ -96,7 +97,7 @@ internal static class CompressionLive
         _ => "zlib",
     };
 
-    // ---------------- 确定性载荷 ----------------
+    // ---------------- the deterministic payload ----------------
 
     private static byte[] BuildPayload(int size)
     {
@@ -111,7 +112,7 @@ internal static class CompressionLive
         return s.ToArray();
     }
 
-    // ---------------- 消费者：收 1 条即停 ----------------
+    // ---------------- the consumer: stops after receiving 1 ----------------
 
     private sealed class FirstMsgListener : IMessageListenerConcurrently
     {
@@ -192,7 +193,8 @@ internal static class CompressionLive
         {
             NamesrvAddr = namesrv,
             SendMsgTimeout = 10000,
-            // 阈值以下不会压缩，矩阵要的是「真的压过」，所以调用方给够载荷尺寸（默认阈值 4 KiB）。
+     // Below the threshold nothing is compressed, and what the matrix wants is "really
+    // compressed", so the caller has to give a payload big enough (the default threshold is 4 KiB).
             CompressType = codec,
         };
         prod.Start();
@@ -234,7 +236,7 @@ internal static class CompressionLive
         return (lenOk && crcOk) ? 0 : 1;
     }
 
-    // ---------------- selftest：自产自销 + 压缩真实性校验 ----------------
+    // ---------------- selftest: produce and consume + verifying the compression really happened ----------------
 
     private static int SelfTest(string namesrv)
     {
@@ -250,14 +252,14 @@ internal static class CompressionLive
         string stamp = UtilAll.CurrentTimeMillis().ToString(CultureInfo.InvariantCulture);
         string topic = "CompressLiveDotnet_" + stamp;
         string group = "CompressLiveDotnetGroup_" + stamp;
-        const int size = 8192; // 远超 compressMsgBodyOverHowmuch(4096)
+   const int size = 8192; // far above compressMsgBodyOverHowmuch(4096)
         byte[] payload = BuildPayload(size);
         uint payloadCrc = UtilAll.Crc32(payload);
         Console.WriteLine("payload len=" + size.ToString(CultureInfo.InvariantCulture)
                           + " crc32=" + payloadCrc.ToString(CultureInfo.InvariantCulture)
-                          + "（确定性载荷，互通探针同算法）");
+    + " (a deterministic payload, the interop probe uses the same algorithm)");
 
-        // 1) 发出
+        // 1) send it out
         {
             var prod = new DefaultMQProducer("CompressLiveDotnetProducer_" + stamp)
             {
@@ -267,41 +269,43 @@ internal static class CompressionLive
             prod.Start();
             SendResult sr = prod.Send(new Message(topic, payload));
             bool ok = sr.SendStatus == SendStatus.SendOk;
-            Check("发送 " + size.ToString(CultureInfo.InvariantCulture) + "B 消息（触发自动压缩）", ok,
+  Check("sending a " + size.ToString(CultureInfo.InvariantCulture) + "B message (triggering automatic compression)", ok,
                 "msgId=" + sr.MsgId);
             prod.Shutdown();
             if (!ok) return 1;
         }
 
-        // 2) 收回来，正文必须与原文逐字节一致（证明"压缩-存储-解压"闭环）
+        // 2) Receive it back; the body must be byte-for-byte identical to the original
+        // (proving the "compress-store-decompress" loop)
         if (!RecvOne(namesrv, topic, group, 30, out MessageExt m))
         {
-            Check("消费回压缩消息", false, "30s 超时");
+      Check("consuming the compressed message back", false, "30s timeout");
             return 1;
         }
 
-        Check("消费回压缩消息", true,
+  Check("consuming the compressed message back", true,
             "len=" + m.Body.Length.ToString(CultureInfo.InvariantCulture)
             + " storeSize=" + m.StoreSize.ToString(CultureInfo.InvariantCulture));
-        Check("解压后正文与原文一致（len + CRC32）",
+        Check("the decompressed body matches the original (len + CRC32)",
             m.Body.Length == payload.Length && UtilAll.Crc32(m.Body) == payloadCrc,
-            "期望 len=" + payload.Length.ToString(CultureInfo.InvariantCulture)
+            "expected len=" + payload.Length.ToString(CultureInfo.InvariantCulture)
             + " crc=" + payloadCrc.ToString(CultureInfo.InvariantCulture)
-            + " 实际 len=" + m.Body.Length.ToString(CultureInfo.InvariantCulture)
+          + " actual len=" + m.Body.Length.ToString(CultureInfo.InvariantCulture)
             + " crc=" + UtilAll.Crc32(m.Body).ToString(CultureInfo.InvariantCulture));
 
-        // 3) 证明 broker 里存的**确实是压缩体**：storeSize 应该远小于原文长度。
-        Check("broker 侧存储为压缩体（storeSize 远小于原文）",
+      // 3) Prove that what the broker stored **really is compressed**: storeSize should be
+    // far smaller than the original length.
+      Check("the broker side stored a compressed body (storeSize far below the original)",
             m.StoreSize > 0 && m.StoreSize < size / 2,
             "storeSize=" + m.StoreSize.ToString(CultureInfo.InvariantCulture)
-            + " 原文=" + size.ToString(CultureInfo.InvariantCulture)
-            + " 压缩比=" + (size / Math.Max(1, m.StoreSize)).ToString(CultureInfo.InvariantCulture) + ":1");
+     + " original=" + size.ToString(CultureInfo.InvariantCulture)
+            + " ratio=" + (size / Math.Max(1, m.StoreSize)).ToString(CultureInfo.InvariantCulture) + ":1");
 
-        Check("解压后 COMPRESSED_FLAG 已清除",
+        Check("COMPRESSED_FLAG is cleared after decompressing",
             !MessageSysFlag.IsCompressed(m.SysFlag),
             "sysFlag=" + m.SysFlag.ToString(CultureInfo.InvariantCulture));
 
-        // 5) 小消息**不应**被压缩（阈值语义）
+        // 5) A small message must **not** be compressed (the threshold semantics)
         {
             string smallTopic = "CompressLiveSmall_" + stamp;
             string smallGroup = "CompressLiveSmallGroup_" + stamp;
@@ -315,20 +319,22 @@ internal static class CompressionLive
             prod.Shutdown();
             if (RecvOne(namesrv, smallTopic, smallGroup, 20, out MessageExt sm))
             {
-                Check("小于阈值(4096)的消息不压缩",
+  Check("a message below the threshold (4096) is not compressed",
                     sm.Body.Length == small.Length && !MessageSysFlag.IsCompressed(sm.SysFlag),
                     "len=" + sm.Body.Length.ToString(CultureInfo.InvariantCulture)
                     + " storeSize=" + sm.StoreSize.ToString(CultureInfo.InvariantCulture));
             }
             else
             {
-                Check("小于阈值(4096)的消息不压缩", false, "20s 未消费到");
+    Check("a message below the threshold (4096) is not compressed", false, "not consumed within 20s");
             }
         }
 
-        // 6) 复现"线上带压缩标志"的编解码路径，确认标志位语义闭环：
-        //    置 COMPRESSED_FLAG|ZLIB 的 MessageExt，用 needCompress=true 编码 -> 存储体变小；
-        //    解压解码 -> 还原原文；不解压解码 -> 拿到的就是压缩字节。
+        // 6) Reproduce the codec path that carries the compressed flag on the wire, confirming
+   // the flag semantics close the loop:
+        //    a MessageExt with COMPRESSED_FLAG|ZLIB is encoded with needCompress=true -> the
+  //    stored body gets smaller; decode with decompression -> the original is restored;
+        //    decode without decompression -> what you get are the compressed bytes.
         {
             var probe = new MessageExt
             {
@@ -342,11 +348,11 @@ internal static class CompressionLive
             MessageDecoder.DecodeMessage(storedCompressed, out MessageExt raw, true, /*decompressBody=*/false);
             MessageDecoder.DecodeMessage(storedCompressed, out MessageExt restored, true, /*decompressBody=*/true);
 
-            Check("带压缩标志编码后存储体变小",
+         Check("the stored body gets smaller after encoding with the compressed flag",
                 storedCompressed.Length < payload.Length / 2,
                 "stored=" + storedCompressed.Length.ToString(CultureInfo.InvariantCulture)
-                + " 原文=" + payload.Length.ToString(CultureInfo.InvariantCulture));
-            Check("不解压解码拿到压缩字节、解压解码还原原文",
+        + " original=" + payload.Length.ToString(CultureInfo.InvariantCulture));
+            Check("decoding without decompression yields the compressed bytes and with decompression restores the original",
                 raw.Body.Length < payload.Length
                 && restored.Body.Length == payload.Length
                 && UtilAll.Crc32(restored.Body) == payloadCrc
@@ -361,10 +367,10 @@ internal static class CompressionLive
                      ("zstd", CompressionType.ZSTD, CompressorFactory.HasZstdSupport()),
                  })
         {
-            string tag = "后端 " + name + " 真机往返";
+     string tag = name + " real-machine round trip";
             if (!available)
             {
-                Console.WriteLine("[SKIP] " + tag + "  本机没有可用的 lib" + name);
+        Console.WriteLine("[SKIP] " + tag + "  there is no usable lib" + name + " on this machine");
                 continue;
             }
 
@@ -388,7 +394,7 @@ internal static class CompressionLive
 
             if (!RecvOne(namesrv, btopic, bgroup, 30, out MessageExt bm))
             {
-                Check(tag, false, "30s 未消费到");
+            Check(tag, false, "not consumed within 30s");
                 continue;
             }
 

@@ -19,7 +19,7 @@ from common.sysflag import MessageSysFlag
 
 
 def build_ext(**overrides) -> MessageExt:
-    """构造一条字段全量赋值的 MessageExt。"""
+    """Build a MessageExt with all fields assigned."""
     ext = MessageExt()
     ext.set_topic(overrides.get("topic", "TopicTest"))
     ext.set_body(overrides.get("body", b"hello rocketmq"))
@@ -41,7 +41,7 @@ def build_ext(**overrides) -> MessageExt:
     return ext
 
 
-# ----------------------------------------------------------- 属性串
+# ----------------------------------------------------------- Property strings
 
 
 class TestPropertiesCodec:
@@ -80,7 +80,7 @@ class TestPropertiesCodec:
         assert string_2_message_properties(raw) == {}
 
 
-# ------------------------------------------------------- 17 段编解码
+# ------------------------------------------------------- 17-segment codec
 
 
 class TestMessageExtCodec:
@@ -104,7 +104,7 @@ class TestMessageExtCodec:
         assert got.get_properties() == {"TAGS": "TagA", "KEYS": "key1 key2"}
 
     def test_totalsize_is_authoritative(self):
-        """TOTALSIZE 必须等于实际帧长，否则 broker/puller 无法切分消息边界。"""
+        """TOTALSIZE must equal the actual frame length, otherwise the broker/puller cannot split message boundaries."""
         ext = build_ext()
         raw = encode_message_ext(ext)
         (store_size,) = struct.unpack_from(">i", raw, 0)
@@ -122,7 +122,7 @@ class TestMessageExtCodec:
 
     def test_store_size_respects_existing_value(self):
         ext = build_ext()
-        ext.set_store_size(1)  # < 真实长度时应被 max 兜底到可用长度
+        ext.set_store_size(1)  # when < the real length it should be capped by max to the usable length
         raw = encode_message_ext(ext)
         assert struct.unpack_from(">i", raw, 0)[0] == len(raw)
 
@@ -153,7 +153,7 @@ class TestMessageExtCodec:
     def test_check_crc_detects_corruption(self):
         ext = build_ext()
         raw = bytearray(encode_message_ext(ext))
-        # body 紧跟在 TOTALSIZE..PREPAREDTXOFFSET(共 84 字节) + 4 字节长度之后
+        # the body follows TOTALSIZE..PREPAREDTXOFFSET (84 bytes total) + a 4-byte length
         body_start = 84 + 4
         raw[body_start] ^= 0xFF
         got = decode_message(bytes(raw), check_crc=True)
@@ -196,14 +196,14 @@ class TestMessageExtCodec:
         assert bytes_to_ip_and_port(raw6) == ("2001:db8::1", 9876)
 
 
-# ------------------------------------------------- msgId / 十六进制
+# ------------------------------------------------- msgId / hex
 
 
 class TestMessageId:
     def test_create_and_decode_roundtrip_v4(self):
         msg_id = create_message_id(ip_and_port_to_bytes("10.0.0.1", 10911), 2048)
         assert len(msg_id) == 32
-        assert msg_id == msg_id.upper(), "bytes2string 产出大写十六进制"
+        assert msg_id == msg_id.upper(), "bytes2string produces uppercase hex"
         assert decode_message_id(msg_id) == ("10.0.0.1", 10911, 2048)
 
     def test_create_and_decode_roundtrip_v6(self):
@@ -215,11 +215,11 @@ class TestMessageId:
         assert bytes2string(b"\x00\x0f\xab\xff") == "000FABFF"
 
 
-# --------------------------------------------------------- V2 魔数
+# --------------------------------------------------------- V2 magic code
 
 
 def build_v2_frame(topic: str, body: bytes, properties_bytes: bytes) -> bytes:
-    """手工构造 V2 帧（topic 长度 2 字节），模拟 broker 写入超长 topic 的场景。"""
+    """Manually build a V2 frame (2-byte topic length), simulating a broker writing an over-long topic."""
     topic_bytes = topic.encode("utf-8")
     store_size = (4 + 4 + 4 + 4 + 4 + 8 + 8 + 4 + 8 + 8 + 8 + 8 + 4 + 8
                   + 4 + len(body) + 2 + len(topic_bytes) + 2 + len(properties_bytes))
@@ -246,7 +246,7 @@ def build_v2_frame(topic: str, body: bytes, properties_bytes: bytes) -> bytes:
 
 class TestV2MagicCode:
     def test_long_topic_decode(self):
-        topic = "TopicTestLong" + "x" * 130          # > 127，必须走 V2
+        topic = "TopicTestLong" + "x" * 130          # > 127, must use V2
         raw = build_v2_frame(topic, b"batch-body", b"TAGS\x01TagB\x02")
         msgs = decode_messages(raw)
         assert len(msgs) == 1
@@ -262,7 +262,7 @@ class TestV2MagicCode:
         assert got.get_msg_id() == create_message_id(ip_and_port_to_bytes("127.0.0.1", 10911), 2048)
 
 
-# --------------------------------------------- 6 段批量消息编码路径
+# --------------------------------------------- 6-segment batch message encoding path
 
 
 class TestBatchMessageCodec:
@@ -271,8 +271,8 @@ class TestBatchMessageCodec:
         msg.set_flag(7)
         raw = encode_message(msg)
         assert struct.unpack_from(">i", raw, 0)[0] == len(raw)
-        assert struct.unpack_from(">i", raw, 4)[0] == 0        # MAGICCODE 固定 0
-        assert struct.unpack_from(">i", raw, 8)[0] == 0        # BODYCRC 固定 0
+        assert struct.unpack_from(">i", raw, 4)[0] == 0        # MAGICCODE always 0
+        assert struct.unpack_from(">i", raw, 8)[0] == 0        # BODYCRC always 0
         assert struct.unpack_from(">i", raw, 12)[0] == 7       # FLAG
         assert struct.unpack_from(">i", raw, 16)[0] == 4       # BODY LEN
 
@@ -312,7 +312,7 @@ def test_crc32_is_standard():
 
 @pytest.mark.parametrize("compress_type", [MessageSysFlag.ZLIB_TYPE])
 def test_compressed_message_roundtrip(compress_type):
-    """带 COMPRESSED_FLAG 的消息解码时需解压（zlib 可用）。"""
+    """Messages with COMPRESSED_FLAG must be decompressed when decoded (zlib available)."""
     body = b"compress-me" * 50
     import zlib as _zlib
 
@@ -354,7 +354,7 @@ def test_unsupported_compression_type_raises_instead_of_passthrough():
     sys_flag = MessageSysFlag.COMPRESSED_FLAG | MessageSysFlag.set_compression_type(
         0, MessageSysFlag.SNAPPY_TYPE)
     topic_bytes = b"TopicTest"
-    payload = zlib.compress(body, 5)  # 内容真实是 zlib，但类型位谎报 SNAPPY
+    payload = zlib.compress(body, 5)  # the content really is zlib, but the type bit falsely reports SNAPPY
 
     store_size = (4 + 4 + 4 + 4 + 4 + 8 + 8 + 4 + 8 + 8 + 8 + 8 + 4 + 8
                   + 4 + len(payload) + 1 + len(topic_bytes) + 2)
@@ -382,12 +382,12 @@ def test_unsupported_compression_type_raises_instead_of_passthrough():
     with pytest.raises(RuntimeError, match="unsupported compression type"):
         _decompress(payload, MessageSysFlag.SNAPPY_TYPE)
 
-    # 反向确认：同一个 body 只要类型位正确就能正常解，说明上面的 None
-    # 确实来自"类型不支持"，不是帧构造错误
+    # Reverse confirmation: the same body decodes fine as long as the type bit is correct, showing the None above
+    # really comes from "unsupported type", not a frame construction error
     ok_flag = MessageSysFlag.COMPRESSED_FLAG | MessageSysFlag.set_compression_type(
         0, MessageSysFlag.ZLIB_TYPE)
     buf_ok = bytearray(buf)
-    # SYSFLAG 偏移：TOTALSIZE(4)+MAGIC(4)+BODYCRC(4)+QUEUEID(4)+FLAG(4)+QUEUEOFFSET(8)+PHYS(8)
+    # SYSFLAG offset: TOTALSIZE(4)+MAGIC(4)+BODYCRC(4)+QUEUEID(4)+FLAG(4)+QUEUEOFFSET(8)+PHYS(8)
     struct.pack_into(">i", buf_ok, 36, ok_flag)
     good = decode_message(bytes(buf_ok))
     assert good is not None and good.get_body() == body

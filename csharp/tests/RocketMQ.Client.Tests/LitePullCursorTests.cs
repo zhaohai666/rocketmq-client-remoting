@@ -1,14 +1,19 @@
-// 轻量拉取消费者的**拉取游标**（#105）离线单测 —— 假 namesrv + 假 broker（真 socket），
-// 不碰真集群。
+// Offline unit tests for the **pull cursor** of the lightweight pull consumer (#105) --
+// a fake namesrv + fake broker over real sockets, never touching a real cluster.
 //
 //
-// 为什么必须离线锁死：旧实现只在 FOUND 时用 `msgs[^1].QueueOffset + 1` 推进游标，于是
-// broker 回 NO_MATCHED_MSG（本轮扫过的整段都不匹配）时游标原地不动 —— 下一轮从同一位点
-// 把同一段重扫一遍，永远打转；OFFSET_ILLEGAL 的纠正值也吃不到，越界不自愈。真机窗口里
-// 两者都表现为「消费者活着但永远收不到消息」，很难归因。
+// Why it must be pinned offline: the old implementation only advanced the cursor with
+// `msgs[^1].QueueOffset + 1` on FOUND, so when the broker replied NO_MATCHED_MSG (the
+// whole range scanned in this round did not match) the cursor did not move -- the next
+// round rescans the same range from the same offset and spins forever; the corrected
+// value of OFFSET_ILLEGAL was never picked up either, so going out of bounds never
+// self-heals. In a real-machine window both show up as "the consumer is alive but never
+// receives a message", which is very hard to attribute.
 //
-// 判据取自**线上报文**：假 broker 的应答按脚本回，用例从 MockCluster 的取证里查
-// 「下一笔 PULL_MESSAGE 是不是从新位点起的」—— 游标真的上了线，而不只是内存表里改了个数。
+// The criteria come from **the traffic on the wire**: the fake broker replies from a
+// script and the case looks through MockCluster's evidence for "does the next
+// PULL_MESSAGE start from the new offset" -- the cursor really went on the wire, it is
+// not just a number changed in an in-memory table.
 using System.Linq;
 using System.Text;
 using RocketMQ.Client;
@@ -38,8 +43,9 @@ public class LitePullCursorTests
     }
 
     /// <summary>
-    /// 一篇 17 段存储格式的消息体（与 CodecTests 同一条编码路径）。挂在 SUCCESS 应答上，
-    /// 用来验「在途应答撞上 seek 时不许入缓冲」。
+    /// A message body in the 17-field storage format (the same encoding path as in
+    /// CodecTests). Hung off a SUCCESS response, used to verify "an in-flight response
+    /// colliding with a seek must not enter the buffer".
     /// </summary>
     private static byte[] BodyWithOneMessage(long queueOffset)
     {
@@ -82,8 +88,8 @@ public class LitePullCursorTests
     }
 
     /// <summary>
-    /// 指向假端点的 lite-pull（assign + FIRST_OFFSET：起点是字面量 0，第一笔 PULL_MESSAGE
-    /// 确定落在 queueOffset=0）。
+    /// A lite-pull pointing at the fake endpoint (assign + FIRST_OFFSET: the start is the
+    /// literal 0, so the first PULL_MESSAGE definitely lands on queueOffset=0).
     /// </summary>
     private static DefaultLitePullConsumer StartedLite(string group, MockCluster cluster)
     {
@@ -107,10 +113,10 @@ public class LitePullCursorTests
         {
             MessageQueue mq = Queue0();
             Assert.True(WaitFor(() => c.PullCursorOf(mq) == 5),
-                "NO_MATCHED_MSG 后拉取游标跟到 nextBeginOffset=5");
-            // 不是内存表里改了个数：下一笔 PULL_MESSAGE 真的从 5 起
+                "the pull cursor follows nextBeginOffset=5 after NO_MATCHED_MSG");
+            // Not just a number changed in an in-memory table: the next PULL_MESSAGE really starts at 5
             Assert.True(WaitFor(() => PullsFrom(cluster, 5) > 0),
-                "下一笔 PULL_MESSAGE 从 5 开始（游标真的上了线）");
+                "the next PULL_MESSAGE starts at 5 (the cursor really went on the wire)");
             Assert.Equal(0, cluster.CountRequests(RequestCode.GetMinOffset));
             Assert.Empty(c.Poll(50));
         }
@@ -123,8 +129,10 @@ public class LitePullCursorTests
     // ---------------------------------------------------------------- 2. OFFSET_ILLEGAL
 
     /// <summary>
-    /// OFFSET_ILLEGAL 的 nextBeginOffset 是 broker 对越界位点的纠正值：跟过去才算「越界自愈」，
-    /// 停在旧位点会每轮收到同一个纠正、原地打转。
+    /// The nextBeginOffset of OFFSET_ILLEGAL is the broker's corrected value for an
+    /// out-of-bounds offset: only by following it does "out of bounds self-heals" hold;
+    /// stopping at the old offset would receive the same correction every round and spin
+    /// in place.
     /// </summary>
     [Fact]
     public void CursorAdoptsTheBrokersOffsetCorrection()
@@ -136,9 +144,9 @@ public class LitePullCursorTests
         {
             MessageQueue mq = Queue0();
             Assert.True(WaitFor(() => c.PullCursorOf(mq) == 42),
-                "OFFSET_ILLEGAL 后拉取游标采纳 broker 纠正");
+                "the pull cursor adopts the broker's correction after OFFSET_ILLEGAL");
             Assert.True(WaitFor(() => PullsFrom(cluster, 42) > 0),
-                "下一笔 PULL_MESSAGE 从 42 开始");
+                "the next PULL_MESSAGE starts at 42");
         }
         finally
         {
@@ -146,12 +154,12 @@ public class LitePullCursorTests
         }
     }
 
-    // ---------------------------------------------------------------- 3. 在途 seek
+    // ---------------------------------------------------------------- 3. An in-flight seek
 
     [Fact]
     public void InFlightSeekWinsOverThePullResult()
     {
-        // 处置顺序是声明的反序：cluster 先走（它要 join 还卡在闸上的连接线程），闸后走。
+        // The disposal order is the reverse of the declaration: cluster goes first (it has to join the connection threads still stuck at the gate), the gate after.
         using var gate = new ManualResetEventSlim(false);
         using var cluster = MockCluster.Start(1);
         cluster.ScriptPull(ResponseCode.Success, PullResp(next: 7),
@@ -159,12 +167,12 @@ public class LitePullCursorTests
         DefaultLitePullConsumer c = StartedLite(GroupPrefix + "SeekRace", cluster);
         try
         {
-            Assert.True(WaitFor(() => Pulls(cluster) >= 1), "第一笔拉取到达 broker");
+            Assert.True(WaitFor(() => Pulls(cluster) >= 1), "the first pull reached the broker");
             MessageQueue mq = Queue0();
             c.Seek(mq, 99);
             gate.Set();
 
-            Assert.True(WaitFor(() => PullsFrom(cluster, 99) > 0), "seek 之后下一笔 PULL_MESSAGE 从 99 起");
+            Assert.True(WaitFor(() => PullsFrom(cluster, 99) > 0), "after the seek the next PULL_MESSAGE starts at 99");
             Assert.Equal(99, c.PullCursorOf(mq));
             Assert.Empty(c.Poll(50));
         }
@@ -175,7 +183,7 @@ public class LitePullCursorTests
         }
     }
 
-    // ---------------------------------------------------------------- 4. 线上报文契约（#107）
+    // ---------------------------------------------------------------- 4. The wire contract (#107)
 
     [Fact]
     public void LitePullCarriesCode361AndTheLiteBit()
@@ -187,7 +195,7 @@ public class LitePullCursorTests
         {
             MessageQueue mq = Queue0();
             Assert.True(WaitFor(() => cluster.CountRequests(RequestCode.LitePullMessage) >= 1),
-                "lite 消费者的拉取用 LITE_PULL_MESSAGE(361)");
+                "a lite consumer pulls with LITE_PULL_MESSAGE(361)");
             Assert.Equal(0, cluster.CountRequests(RequestCode.PullMessage));
 
             int expectedFlag = PullSysFlag.BuildSysFlag(commitOffset: false, suspend: false,
@@ -196,23 +204,23 @@ public class LitePullCursorTests
             {
                 int flag = int.Parse(rec.Ext["sysFlag"],
                     System.Globalization.CultureInfo.InvariantCulture);
-                Assert.True(PullSysFlag.HasLitePullFlag(flag), "lite 位必须置起");
-                Assert.False(PullSysFlag.HasSuspendFlag(flag), "lite 是短轮询，suspend 位为 0");
+                Assert.True(PullSysFlag.HasLitePullFlag(flag), "the lite bit must be set");
+                Assert.False(PullSysFlag.HasSuspendFlag(flag), "lite is a short poll, the suspend bit is 0");
                 Assert.Equal(expectedFlag, flag);
                 Assert.Equal("*", rec.Ext["subscription"]);
             }
 
-            // 对照：经典拉取消费者（DefaultMQPullConsumerImpl.pullSyncImpl:248 的 4 参版本）
+            // Contrast: a classic pull consumer (the 4-arg version at DefaultMQPullConsumerImpl.pullSyncImpl:248)
             classic = new DefaultMQPullConsumer(GroupPrefix + "Classic");
             classic.SetNamesrvAddr(cluster.NamesrvAddr);
             classic.Start();
             classic.Pull(mq, "*", 0, 32, 3000);
             Assert.True(WaitFor(() => cluster.CountRequests(RequestCode.PullMessage) >= 1),
-                "经典拉取用 PULL_MESSAGE(11)");
+                "a classic pull uses PULL_MESSAGE(11)");
             WireRecord classicRec = cluster.Records().Last(r => r.Code == RequestCode.PullMessage);
             int classicFlag = int.Parse(classicRec.Ext["sysFlag"],
                 System.Globalization.CultureInfo.InvariantCulture);
-            Assert.False(PullSysFlag.HasLitePullFlag(classicFlag), "经典 pull 不带 lite 位");
+            Assert.False(PullSysFlag.HasLitePullFlag(classicFlag), "a classic pull carries no lite bit");
             Assert.Equal(PullSysFlag.BuildSysFlag(false, false, true, false), classicFlag);
         }
         finally

@@ -32,7 +32,7 @@ func TestCompareAndIncreaseNamespace(t *testing.T) {
 	if got := CompareAndIncreaseNamespace("inst", "ns"); got != "%ns%%inst" {
 		t.Fatalf("got %q", got)
 	}
-	// 幂等：已带命名空间的实例名不再叠加
+	// Idempotent: an instance name that already carries a namespace is not stacked again
 	if got := CompareAndIncreaseNamespace("%ns%%inst", "ns"); got != "%ns%%inst" {
 		t.Fatalf("idempotency broken: %q", got)
 	}

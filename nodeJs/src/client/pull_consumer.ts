@@ -1,9 +1,10 @@
-// DefaultMQPullConsumer —— 拉取消费者。
+// DefaultMQPullConsumer — the pull consumer.
 //
-// 关键约束：`pull()` 是 SHORT 拉取——sysFlag 里 suspend=false，线路上
-// suspendTimeoutMillis=0。只有 `pullBlockIfNotFound` 才置 suspend=true
-// （broker 挂起请求约 5s 后应答 NO_NEW_MSG）。无条件写 suspend=true 的表现
-// 是每次空闲 pull 都超时 5s。
+// Key constraint: `pull()` is a SHORT pull — suspend=false in sysFlag and
+// suspendTimeoutMillis=0 on the wire. Only `pullBlockIfNotFound` sets
+// suspend=true (the broker suspends the request for about 5s before answering
+// NO_NEW_MSG). Unconditionally writing suspend=true manifests as a 5s timeout
+// on every idle pull.
 import type { MQClient } from './mq_client.ts';
 import { PullAPI } from './pull_api.ts';
 import { MQClient } from './mq_client.ts';
@@ -35,16 +36,17 @@ const DEFAULT_PULL_TIMEOUT_MILLIS = 20000;
 export class DefaultMQPullConsumer {
   consumerGroup: string;
   namespace = '';
-  // namespaceV2：服务端侧命名空间（由 NamespaceRpcHook 打 nsd/ns 扩展字段），
-  // 与客户端侧的 `namespace` 相互独立。
+  // namespaceV2: the server-side namespace (NamespaceRpcHook stamps the
+  // nsd/ns ext fields), independent of the client-side `namespace`.
   namespaceV2: string | null = null;
   nameServerAddr = '';
   messageModel: string = MessageModel.CLUSTERING;
   unitMode = false;
-  // instanceName / unitName / enableStreamRequestType：pull 消费者默认打开
-  // stream 标记，一是让 clientId 追加 `@STREAM`——避免同进程里 pull 消费者和
-  // push 消费者悄悄共用同一个客户端实例——二是让每个请求在 ACL 签名里带
-  // ReqT=0。
+  // instanceName / unitName / enableStreamRequestType: pull consumers enable
+  // the stream flag by default — first so clientId gets `@STREAM` appended,
+  // preventing a pull consumer and a push consumer in the same process from
+  // silently sharing one client instance; second so every request carries
+  // ReqT=0 in the ACL signature.
   instanceName = 'DEFAULT';
   unitName = '';
   enableStreamRequestType = true;
@@ -62,9 +64,10 @@ export class DefaultMQPullConsumer {
   maxReconsumeTimes = -1;
 
   private subscription = new Map<string, SubscriptionData>();
-  // 每个 topic 最近一次算出的份额——本实现里充当 rebalance 结果表，
-  // fetchMessageQueuesInBalance 在拿不到路由或消费者列表时保留的就是它
-  // （见该方法的注释）。
+  // Each topic's most recently computed share — serving as the rebalance result
+  // table in this implementation; fetchMessageQueuesInBalance preserves exactly
+  // this when it cannot get the route or the consumer list (see that method's
+  // comment).
   private balancedQueues = new Map<string, MessageQueue[]>();
   started = false;
 
@@ -74,7 +77,7 @@ export class DefaultMQPullConsumer {
 
   setNamesrvAddr(addr: string): this { this.nameServerAddr = addr; return this; }
   setNamespace(ns: string): this { this.namespace = ns; return this; }
-  // 设置/读取 namespaceV2（每个请求实时读取）。
+  // Set/read namespaceV2 (read live per request).
   setNamespaceV2(ns: string | null): this { this.namespaceV2 = ns; return this; }
   getNamespaceV2(): string | null { return this.namespaceV2; }
   setMessageModel(model: string): this { this.messageModel = model; return this; }
@@ -100,11 +103,12 @@ export class DefaultMQPullConsumer {
     if (this.subscription.size === 0) {
       throw new Error('subscription is not set, call subscribe() first');
     }
-    // 只有 CLUSTERING 才把默认 instanceName 改写掉（BROADCASTING 保留
-    // "DEFAULT"，让同进程实例共享一个客户端实例），clientId 形如
-    // `<ip>@<instanceName>[@<unitName>][@STREAM]`。⚠ 只用 pid 作实例名会在
-    // 同进程两个 pull 消费者之间撞车，allocate() 把同一片队列分给两边——
-    // 重复消费。
+    // Only CLUSTERING rewrites the default instanceName (BROADCASTING keeps
+    // "DEFAULT", letting same-process instances share one client instance);
+    // clientId has the form `<ip>@<instanceName>[@<unitName>][@STREAM]`. ⚠ Using
+    // pid alone as the instance name collides between two pull consumers in the
+    // same process — allocate() hands the same queue slice to both, causing
+    // duplicate consumption.
     if (this.messageModel === MessageModel.CLUSTERING) {
       this.instanceName = MixAll.changeInstanceNameToPid(this.instanceName);
     }
@@ -146,23 +150,25 @@ export class DefaultMQPullConsumer {
     if (this.mqClient) {
       await this.mqClient.unregisterClientAllBrokers('', this.consumerGroup).catch(() => {});
       this.mqClient.unregisterConsumer(this.consumerGroup);
-      // 归还给 manager：计数 -1，归零才真正 shutdown（同 clientId 还有别的门面时
-      // 实例与其后台定时器继续存活）。
+      // Hand back to the manager: count -1; the real shutdown happens only when
+      // it hits zero (when other facades share the same clientId, the instance
+      // and its background timers keep running).
       MQClientManager.getInstance().unregisterClient(this.mqClient.clientId, this.mqClient);
     }
     this.started = false;
   }
 
-  // fetchPublishMessageQueues：PUBLISH 视图（写权限、writeQueueNums、必须有
-  // master）。⚠ 这里曾经错误地返回 SUBSCRIBE 视图：当 readQueueNums !=
-  // writeQueueNums、或路由里没有 master broker 时两个列表不同，按这个列表
-  // 定分片的调用方会读到没分给自己的队列（或漏掉分到的）。
+  // fetchPublishMessageQueues: the PUBLISH view (write perm, writeQueueNums,
+  // must have a master). ⚠ This once wrongly returned the SUBSCRIBE view: when
+  // readQueueNums != writeQueueNums, or when the route has no master broker,
+  // the two lists differ, and a caller sharding by this list would read queues
+  // not assigned to it (or miss the ones that were).
   async fetchPublishMessageQueues(topic: string): Promise<MessageQueue[]> {
     return (await this.routeOf(topic, 'publish')).getAllMessageQueue(topic);
   }
 
-  // fetchSubscribeMessageQueues：SUBSCRIBE 视图（读权限、readQueueNums、不做
-  // master 过滤）。拉取方要遍历的就是这个列表。
+  // fetchSubscribeMessageQueues: the SUBSCRIBE view (read perm, readQueueNums,
+  // no master filtering). This is the list a puller iterates.
   async fetchSubscribeMessageQueues(topic: string): Promise<MessageQueue[]> {
     return (await this.routeOf(topic, 'subscribe')).getAllSubscribeMessageQueue(topic);
   }

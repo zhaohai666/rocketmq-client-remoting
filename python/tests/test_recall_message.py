@@ -23,7 +23,7 @@ UNIQ_KEY = "0123456789ABCDEF0123456789abcdef"
 ADDR = "127.0.0.1:10911"
 
 
-# ---------------- 句柄编解码 ----------------
+# ---------------- Handle encoding/decoding ----------------
 def test_build_handle_matches_the_wire_vector():
     pass
     handle = recall_message_handle.build_handle(TOPIC, BROKER, "1700000000000", UNIQ_KEY)
@@ -61,11 +61,11 @@ def _b64(text: str) -> str:
 
 @pytest.mark.parametrize("bad", [
     "",
-    "not-a-handle",                                 # 解出来不是 v1 开头的 5 段
-    "!!!!",                                         # 非法 base64 字符 -> DecoderException
-    _b64("v2 TopicA broker-a 1 " + UNIQ_KEY),       # 版本不对
-    _b64("v1 TopicA broker-a 1"),                   # 段数不足
-    "__4gYmFkIHV0Zjg=",                             # 解出来不是合法 utf-8
+    "not-a-handle",                                 # decoded result is not 5 segments starting with v1
+    "!!!!",                                         # illegal base64 chars -> DecoderException
+    _b64("v2 TopicA broker-a 1 " + UNIQ_KEY),       # wrong version
+    _b64("v1 TopicA broker-a 1"),                   # not enough segments
+    "__4gYmFkIHV0Zjg=",                             # decoded result is not valid utf-8
 ])
 def test_bad_handles_fail_with_the_protocol_message(bad):
     with pytest.raises(MQClientException) as exc:
@@ -73,7 +73,7 @@ def test_bad_handles_fail_with_the_protocol_message(bad):
     assert str(exc.value) == "recall handle is invalid"
 
 
-# ---------------- 报文头 ----------------
+# ---------------- Request/response headers ----------------
 def test_recall_request_headers_use_the_wire_keys():
     header = RecallMessageRequestHeader()
     header.producer_group = "PG"
@@ -98,7 +98,7 @@ def test_recall_response_header_and_send_response_recall_handle():
     sent.from_ext_fields({"msgId": "0" * 32, "recallHandle": "djEg"})
     assert sent.recall_handle == "djEg"
     assert sent.to_ext_fields()["recallHandle"] == "djEg"
-    # 普通消息没有这个字段：既不编出来，也不误读成空串。
+    # a normal message has no such field: it is neither encoded nor misread as an empty string.
     assert "recallHandle" not in SendMessageResponseHeader().to_ext_fields()
     plain = SendMessageResponseHeader()
     plain.from_ext_fields({"msgId": "0" * 32})
@@ -107,7 +107,7 @@ def test_recall_response_header_and_send_response_recall_handle():
 
 # ---------------- MQClientInstance.recall_message ----------------
 class _StubClient(MQClientInstance):
-    """跳过 __init__（不建 socket），只留 _invoke_sync 缝，验证 370 的响应处理。"""
+    """Skip __init__ (no socket built), leaving only the _invoke_sync seam, to verify the response handling of 370."""
 
     def __init__(self, response: RemotingCommand):
         self.calls: List[tuple] = []
@@ -139,7 +139,7 @@ def test_recall_message_rpc_returns_msg_id_and_uses_code_370():
     addr, request, timeout = client.calls[0]
     assert (addr, timeout) == (ADDR, 3000)
     assert request.code == RequestCode.RECALL_MESSAGE
-    request.make_custom_header_to_net()          # 真正落盘到 ext_fields 的那一步
+    request.make_custom_header_to_net()          # the step that actually lands the header in ext_fields
     assert request.ext_fields == {"producerGroup": "PG", "topic": TOPIC,
                                   "recallHandle": "djEg", "bname": BROKER}
 
@@ -159,7 +159,7 @@ def test_recall_message_rejects_success_without_msg_id():
         client.recall_message(ADDR, _request_header(), 3000)
 
 
-# ---------------- 生产者校验顺序 ----------------
+# ---------------- Producer validation order ----------------
 def _producer() -> DefaultMQProducer:
     p = DefaultMQProducer("PG")
     p.name_server_addrs = [ADDR]
@@ -172,14 +172,14 @@ def test_recall_before_start_fails_locally():
 
 
 class _NoIoClient:
-    """任何网络入口都被记下来：本地校验必须在打网络**之前**跑完。"""
+    """Every network entry is recorded: local validation must run completely **before** the network is touched."""
 
     def __init__(self):
         self.touched: List[str] = []
-        # False = 模拟「路由拿不到」；True = 预热成功，让流程继续往下走。
+        # False = simulate "route unavailable"; True = warm-up succeeded, let the flow continue
         self.no_publish_error = False
-        # MQClientInstance 上的真字段：拿不到路由时 validateNameServerSetting 靠它
-        # 分辨"没配 name server"(10004) 和"这个 topic 没路由"(10005)，这里给个地址。
+        # a real field on MQClientInstance: when the route cannot be fetched, validateNameServerSetting uses it
+        # to distinguish "no name server configured" (10004) from "this topic has no route" (10005); give it an address here.
         self.name_server_addrs: List[str] = [ADDR]
 
     def register_topic_in_use(self, topic):
@@ -243,19 +243,19 @@ def test_corrupt_handle_fails_before_any_io():
 
 def test_missing_broker_address_uses_the_protocol_message():
     client = _NoIoClient()
-    client.no_publish_error = True          # 路由预热成功，才轮到定位 broker 地址
+    client.no_publish_error = True          # route warm-up succeeded, only now does it get to locating the broker address
     handle = recall_message_handle.build_handle(TOPIC, BROKER, "1700000000000", UNIQ_KEY)
     with pytest.raises(MQClientException) as exc:
         _started(client).recall_message(TOPIC, handle)
     assert str(exc.value) == "The broker service address not found"
-    # 路由预热先于定位地址，且一次网络都没打。
+    # route warm-up precedes address location, and not a single network call was made.
     assert "publish" in client.touched
     assert "rpc" not in client.touched
 
 
 def test_publish_info_failure_propagates_unchanged():
-    """DefaultMQProducerImpl:1586 的 tryToFindTopicPublishInfo 没有 try/catch：
-    路由拿不到就直接失败，不会继续往后拼请求。"""
+    """tryToFindTopicPublishInfo at DefaultMQProducerImpl:1586 has no try/catch:
+    if the route cannot be fetched it fails directly, without continuing to assemble the request."""
     client = _NoIoClient()
     handle = recall_message_handle.build_handle(TOPIC, BROKER, "1700000000000", UNIQ_KEY)
     with pytest.raises(MQClientException) as exc:

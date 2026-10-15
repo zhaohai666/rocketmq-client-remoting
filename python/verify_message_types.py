@@ -1,31 +1,31 @@
 # -*- coding: utf-8 -*-
-"""rocketmq-client-remoting 不同消息类型联调测试。
+"""Interop tests of the different message types for rocketmq-client-remoting.
 
-覆盖 verify_live_clean.py 之外的消息类型/特性，全部针对真实集群验证：
-  1. 异步发送（send_async + SendCallback）：真异步链 —— 不阻塞调用方、
-     准备工作在 AsyncSenderExecutor_ 线程、钩子 after 与回调在
-     NettyClientPublicExecutor_ 线程、并发 20 条全部落到 broker、定点发送、
-     校验失败只走回调
-  2. 延迟消息（set_delay_time_level，验证延迟投递 + 时序）
-  3. 顺序消息（send_by_selector 同 key 落同队列 + 顺序消费保序）
-  4. 带 Tag 消息 + 服务端 Tag 过滤消费
-  5. 带 Key 消息 + 按 Key 服务端查询（query_message）
-  6. 用户属性（user property）生产/消费透传
-  7. 事务消息（send_message_in_transaction，两阶段：半消息 → 本地事务 → END_TRANSACTION；
-     本文件只做提交路径的冒烟，回查/回滚的完整链路见 verify_transaction_live.py）
-  8. 单向发送（send_oneway，无应答）+ 批量发送（send(list) → SEND_BATCH_MESSAGE），
-     两者都靠回读条数兜底
-  9. 定时消息（TIMER_DELIVER_MS，到点才投递）
+Message types/features not covered by verify_live_clean.py, all verified against a real cluster:
+  1. async send (send_async + SendCallback): a truly async chain -- does not block the caller,
+     preparation runs on the AsyncSenderExecutor_ thread, the hook after and the callback on the
+     NettyClientPublicExecutor_ thread, 20 concurrent sends all land on the broker, pinned send,
+     and validation failures go through the callback only
+  2. delayed messages (set_delay_time_level, verifying delayed delivery + timing)
+  3. ordered messages (send_by_selector with the same key lands on the same queue + order preserved by ordered consumption)
+  4. tagged messages + server-side Tag filtering on consume
+  5. keyed messages + server-side query by key (query_message)
+  6. user property pass-through on produce/consume
+  7. transactional messages (send_message_in_transaction, two phases: half message -> local transaction -> END_TRANSACTION;
+     this file only smoke-tests the commit path; the full check/rollback chain is in verify_transaction_live.py)
+  8. oneway send (send_oneway, no response) + batch send (send(list) -> SEND_BATCH_MESSAGE),
+     both are backed by read-back counts
+  9. timer messages (TIMER_DELIVER_MS, delivered only when the time comes)
 
-本脚本自身不启动集群；调用方需先启动 nameServer(9876)+broker(10911) 且
-autoCreateTopicEnable=true。运行：在 venv 中 `python verify_message_types.py`
-为避免 store 累积假象，所有 topic/group 均带时间戳且使用全新 store。
+This script does not start the cluster itself; the caller must start nameServer(9876)+broker(10911) first with
+autoCreateTopicEnable=true. Run: `python verify_message_types.py` in the venv
+To avoid the store-accumulation artifact, all topics/groups carry a timestamp and use a brand-new store.
 
-集群开了 ACL（broker authenticationEnabled=true）时把凭据带上：
-`python verify_message_types.py 127.0.0.1:9876 <accessKey> <secretKey>`。
-此时每一类消息的发送/消费都必须靠签名通过鉴权，脚本额外加一条反向断言：
-同一 topic 上不带凭据的发送必须被 broker 拒成 NO_PERMISSION(16)。
-没有这条反向断言，「带凭据全绿」在鉴权没真开起来的集群上是假绿。
+When the cluster has ACL enabled (broker authenticationEnabled=true), pass the credentials:
+`python verify_message_types.py 127.0.0.1:9876 <accessKey> <secretKey>`.
+In that case every message type's send/consume must pass auth via signing, and the script adds one extra reverse assertion:
+a send on the same topic without credentials must be rejected by the broker with NO_PERMISSION(16).
+Without this reverse assertion, "all green with credentials" is a false green on a cluster where auth is not really on.
 """
 import os
 import sys
@@ -46,22 +46,22 @@ from remoting.rpchook import AclClientRPCHook, SessionCredentials
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 AK = sys.argv[2] if len(sys.argv) > 2 else ""
 SK = sys.argv[3] if len(sys.argv) > 3 else ""
-# broker 侧所有鉴权失败都收敛成 NO_PERMISSION(16)
+# On the broker side all auth failures converge into NO_PERMISSION(16)
 NO_PERMISSION = 16
 
 
 def _hook():
-    """带凭据时返回 ACL 签名钩子，不带时返回 None（等价于跑在无鉴权集群上）。"""
+    """Returns the ACL signing hook when credentials are given, otherwise None (equivalent to running on a cluster without auth)."""
     if AK and SK:
         return AclClientRPCHook(SessionCredentials(AK, SK))
     return None
 
 
 def _rejected(exc: BaseException) -> bool:
-    """沿 cause 链判断是否被 broker 以 NO_PERMISSION 拒绝。
+    """Walk the cause chain to decide whether the broker rejected it with NO_PERMISSION.
 
-    MQBrokerException 直接把码放在 response_code 上，MQClientException 也可能
-    包一层（admin 路径），所以要顺着链找，不能只看最外层。
+    MQBrokerException puts the code directly on response_code, and MQClientException may
+    wrap a layer (admin path), so you must follow the chain and not only look at the outermost layer.
     """
     seen = set()
     cur = exc
@@ -85,7 +85,7 @@ def check(name, ok, detail=""):
 
 
 def _wait_broker(prod):
-    """轮询等待 broker 在 nameServer 注册完成（避免端口刚开、注册未落地的竞态）。"""
+    """Poll-wait for the broker to finish registering with nameServer (avoids the race where the port is open but registration has not landed)."""
     for _ in range(40):
         try:
             info = prod._mq_client.get_broker_cluster_info()
@@ -99,17 +99,17 @@ def _wait_broker(prod):
 
 def run_consumer(topic, sub_expr, duration, orderly=False, group_suffix="c",
                  expect=0, pull_timeout=3000, pull_suspend=1000):
-    """启动消费者，活跃等待直至收到 expect 条（或最多 duration 秒）后关闭。
+    """Start the consumer, actively wait until expect messages are received (or at most duration seconds), then shut down.
 
-    expect<=0 时退化为固定窗口等待。用活跃等待取代盲 sleep，避免消费者
-    冷启动（路由/队列尚未就绪）在固定窗口结束前尚未拉到消息导致的偶发 0 条。
+    When expect<=0 this degrades to a fixed-window wait. Active waiting replaces a blind sleep, avoiding the occasional 0 messages
+    caused by the consumer's cold start (route/queue not yet ready) not having pulled anything before the fixed window ends.
 
-    关键坑：消费循环在单线程内顺序长轮询各队列；空闲队列的 suspend 长轮询会
-    阻塞整轮，导致消息集中在高序号队列（如顺序消息全部落在 qid=2）时被排在
-    前面的空闲队列饿死。故把 pull_timeout(客户端等待响应) 与 pull_suspend(服务端
-    挂起) 都设短：空闲队列 ~1s 即返回 NO_NEW_MSG，循环很快轮到满载队列；
-    pull_timeout 略大于 pull_suspend，避免空闲轮询触发客户端超时 ERROR（新日志
-    已落文件，应保持干净）。
+    Key pitfall: the consume loop sequentially long-polls each queue in a single thread; an idle queue's suspend long-poll blocks
+    the whole round, so when messages concentrate on a high-index queue (e.g. all ordered messages landing on qid=2), they are starved
+    by the idle queues ahead of it. Hence both pull_timeout(client wait for response) and pull_suspend(server
+    suspend) are set short: an idle queue returns NO_NEW_MSG in ~1s and the loop quickly reaches the loaded queue;
+    pull_timeout is slightly larger than pull_suspend, to avoid idle polling triggering a client timeout ERROR (new logs
+    are written to a file and should stay clean).
     """
     received = []
     lock = threading.Lock()
@@ -152,11 +152,11 @@ def run_consumer(topic, sub_expr, duration, orderly=False, group_suffix="c",
 
 
 def _anon_probe() -> None:
-    """反向对照：不带凭据发送必须被拒成 NO_PERMISSION(16)。
+    """Reverse control: a send without credentials must be rejected with NO_PERMISSION(16).
 
-    缺了这条，「带凭据全绿」无法区分「签名被接受」和「集群根本没开鉴权」。
-    必须在建主生产者**之前**跑：同进程内 client_id 相同会共享 MQClientInstance，
-    而 ACL 钩子只在实例首次创建时注册，后起的实例才会带上自己的钩子。
+    Without this, "all green with credentials" cannot tell "the signature was accepted" from "the cluster has no auth at all".
+    It must run before the main producer is created: within the same process instances with the same client_id share the MQClientInstance,
+    and the ACL hook is only registered when the instance is first created, so only the later-started instance carries its own hook.
     """
     anon = DefaultMQProducer(producer_group="%s_anon" % PREFIX)
     anon.set_namesrv_addr(NAMESRV)
@@ -175,7 +175,7 @@ def _anon_probe() -> None:
         detail = "start failed: %r" % (e,)
     finally:
         anon.shutdown()
-    check("无凭据发送被拒(NO_PERMISSION=16)", denied, detail)
+    check("send without credentials rejected (NO_PERMISSION=16)", denied, detail)
 
 
 def main():
@@ -188,12 +188,12 @@ def main():
     prod.start()
     brokers = _wait_broker(prod)
     if not brokers:
-        check("集群探活", False, "nameServer 无 broker 注册")
+        check("cluster probe", False, "no broker registered with nameServer")
         prod.shutdown()
         return 1
-    check("集群探活", True, "brokers=%s" % brokers)
+    check("cluster probe", True, "brokers=%s" % brokers)
 
-    # ---------- 1. 异步发送（真异步链：不阻塞调用方 + 两个线程池 + 真投递 + 失败走回调） ----------
+    # ---------- 1. async send (a truly async chain: non-blocking caller + two thread pools + real delivery + failures via callback) ----------
     topic_async = "%s_Async" % PREFIX
 
     hook_threads = []
@@ -224,25 +224,25 @@ def main():
         if ok_res or errs:
             break
         time.sleep(0.05)
-    # 调用方拿到的是"已提交"，不是"已发完"：这一条挂了才算真异步
-    check("send_async 不阻塞调用方", caller_ms < 300, "callerBlockedMs=%d" % caller_ms)
-    check("异步发送 send_async",
+    # What the caller gets is "submitted", not "finished sending": this one counts only if it hangs
+    check("send_async does not block the caller", caller_ms < 300, "callerBlockedMs=%d" % caller_ms)
+    check("async send send_async",
           len(ok_res) == 1 and ok_res[0].send_status.name == "SEND_OK" and not errs,
           "ok=%d err=%d" % (len(ok_res), len(errs)))
     before_threads = [t for k, t in hook_threads if k == "before"]
     after_threads = [t for k, t in hook_threads if k == "after"]
-    check("发送准备在 AsyncSenderExecutor_ 线程上跑",
+    check("send preparation runs on the AsyncSenderExecutor_ thread",
           bool(before_threads) and all(t.startswith("AsyncSenderExecutor_")
                                        for t in before_threads),
           "before=%s" % (before_threads or "?"))
-    check("钩子 after 与用户回调在 NettyClientPublicExecutor_ 线程上跑",
+    check("the hook after and the user callback run on the NettyClientPublicExecutor_ thread",
           bool(after_threads) and all(t.startswith("NettyClientPublicExecutor_")
                                       for t in after_threads)
           and cb_threads == ["NettyClientPublicExecutor_1"],
           "after=%s callback=%s" % (after_threads or "?", cb_threads or "?"))
     prod.send_message_hook_list.remove(spy)
 
-    # 批量并发异步：20 条全部 SEND_OK，且 broker 侧真收得到
+    # Concurrent batch async: all 20 SEND_OK, and the broker really receives them
     ok_many, err_many = [], []
     for i in range(20):
         prod.send_async(Message(topic_async, ("async-%02d" % i).encode()),
@@ -251,12 +251,12 @@ def main():
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline and len(ok_many) + len(err_many) < 20:
         time.sleep(0.05)
-    check("并发 send_async 全部回调成功",
+    check("concurrent send_async all callbacks succeeded",
           len(ok_many) == 20 and not err_many,
           "ok=%d err=%d%s" % (len(ok_many), len(err_many),
                               (" last=%s" % err_many[-1]) if err_many else ""))
     recv_async = run_consumer(topic_async, "*", 15, group_suffix="async", expect=21)
-    check("异步发送的消息真落到 broker",
+    check("async-sent messages really land on the broker",
           len(recv_async) == 21,
           "received=%d/21" % len(recv_async))
 
@@ -269,7 +269,7 @@ def main():
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline and not (ok_fixed or err_fixed):
         time.sleep(0.05)
-    check("定点 send_async(带 mq)", bool(ok_fixed) and not err_fixed,
+    check("pinned send_async (with mq)", bool(ok_fixed) and not err_fixed,
           "ok=%d err=%d%s" % (len(ok_fixed), len(err_fixed),
                               (" last=%s" % err_fixed[-1]) if err_fixed else ""))
 
@@ -280,11 +280,11 @@ def main():
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline and not (ok_bad or err_bad):
         time.sleep(0.05)
-    check("空 body 的异步发送失败只走回调",
+    check("an async send with an empty body fails via the callback only",
           not ok_bad and len(err_bad) == 1,
           "err=%s" % (err_bad[0] if err_bad else "?"))
 
-    # ---------- 2. 顺序消息：同 key 落同队列 + 顺序消费保序 ----------
+    # ---------- 2. ordered messages: the same key lands on the same queue + order preserved by ordered consumption ----------
     topic_order = "%s_Order" % PREFIX
     qids = set()
     bodies_order = []
@@ -293,14 +293,14 @@ def main():
         bodies_order.append(b)
         sr = prod.send_by_selector(Message(topic_order, b), SelectMessageQueueByHash(), "shard-A")
         qids.add(sr.message_queue.queue_id)
-    check("顺序发送: 同 key 路由到同一队列",
+    check("ordered send: the same key routes to the same queue",
           len(qids) == 1, "distinct_queue_ids=%s" % (list(qids) or "?"))
     recv_order = run_consumer(topic_order, "*", 12, orderly=True, group_suffix="order")
     recv_bodies = sorted(m.body for m in recv_order)
-    check("顺序消费保序", recv_bodies == sorted(bodies_order) and len(recv_order) == 10,
+    check("ordered consumption preserves order", recv_bodies == sorted(bodies_order) and len(recv_order) == 10,
           "received=%d/%d" % (len(recv_order), len(bodies_order)))
 
-    # ---------- 3. 带 Tag 消息 + 服务端 Tag 过滤 ----------
+    # ---------- 3. tagged messages + server-side Tag filtering ----------
     topic_tag = "%s_Tag" % PREFIX
     for i in range(3):
         prod.send(Message(topic_tag, ("tagA-%d" % i).encode(), tags="TagA"))
@@ -308,11 +308,11 @@ def main():
         prod.send(Message(topic_tag, ("tagB-%d" % i).encode(), tags="TagB"))
     recv_tag = run_consumer(topic_tag, "TagA", 12, group_suffix="tag")
     recv_tags = set(m.get_tags() for m in recv_tag)
-    check("Tag 过滤消费（仅收到 TagA）",
+    check("Tag filtering on consume (only TagA is received)",
           len(recv_tag) == 3 and recv_tags == {"TagA"},
           "received=%d tags=%s" % (len(recv_tag), recv_tags))
 
-    # ---------- 4. 用户属性透传（独立 topic，避免与 Tag 测试耦合）----------
+    # ---------- 4. user property pass-through (a separate topic, to avoid coupling with the Tag test) ----------
     topic_prop = "%s_Prop" % PREFIX
     for i in range(3):
         m = Message(topic_prop, ("prop-%d" % i).encode(), tags="P")
@@ -322,29 +322,29 @@ def main():
     recv_prop = run_consumer(topic_prop, "*", 12, group_suffix="prop")
     ok_city = all(m.get_user_property("city") == "Hangzhou" for m in recv_prop)
     ok_env = all(m.get_user_property("env") == "prod" for m in recv_prop)
-    check("用户属性透传(city=Hangzhou, env=prod)",
+    check("user property pass-through (city=Hangzhou, env=prod)",
           ok_city and ok_env and len(recv_prop) == 3,
           "received=%d" % len(recv_prop))
 
-    # ---------- 5. 延迟消息 ----------
+    # ---------- 5. delayed messages ----------
     topic_delay = "%s_Delay" % PREFIX
     t0 = int(time.time() * 1000)
-    prod.send(Message(topic_delay, b"normal-now"))                       # 普通
+    prod.send(Message(topic_delay, b"normal-now"))                       # normal
     dm = Message(topic_delay, b"delayed-5s")
     dm.set_delay_time_level(2)                                          # level2 = 5s
     prod.send(dm)
     recv_delay = run_consumer(topic_delay, "*", 16, group_suffix="delay", expect=2)
     delayed = [m for m in recv_delay if m.body == b"delayed-5s"]
     normal = [m for m in recv_delay if m.body == b"normal-now"]
-    check("延迟消息最终投递", bool(delayed), "delayed received=%d normal=%d" % (len(delayed), len(normal)))
+    check("the delayed message is eventually delivered", bool(delayed), "delayed received=%d normal=%d" % (len(delayed), len(normal)))
     if delayed:
         drift = delayed[0].store_timestamp - delayed[0].born_timestamp
-        check("延迟生效(store_ts-born_ts>=3000ms)", drift >= 3000,
+        check("the delay takes effect (store_ts-born_ts>=3000ms)", drift >= 3000,
               "drift=%dms" % drift)
     else:
-        check("延迟生效(store_ts-born_ts>=3000ms)", False, "无延迟消息可校验")
+        check("the delay takes effect (store_ts-born_ts>=3000ms)", False, "no delayed message to verify")
 
-    # ---------- 6. 带 Key 消息 + 按 Key 查询 ----------
+    # ---------- 6. keyed messages + query by key ----------
     topic_key = "%s_Key" % PREFIX
     key = "MTKEY_%d" % STAMP
     body_key = b"key-msg-payload"
@@ -354,9 +354,9 @@ def main():
     end = int(time.time() * 1000) + 120000
     found = prod.query_message(topic_key, key, 10, begin, end)
     hit = any((m.body == body_key) for m in (found or []))
-    check("按 Key 查询(query_message)", hit, "returned=%d" % (len(found or [])))
+    check("query by key (query_message)", hit, "returned=%d" % (len(found or [])))
 
-    # ---------- 7. 事务消息（两阶段的提交路径冒烟；完整链路见 verify_transaction_live.py）----------
+    # ---------- 7. transactional messages (commit-path smoke of the two phases; the full chain is in verify_transaction_live.py) ----------
     topic_tx = "%s_Tx" % PREFIX
 
     class _TxListener(TransactionListener):
@@ -369,28 +369,28 @@ def main():
     tsr = prod.send_message_in_transaction(Message(topic_tx, b"tx-commit"), _TxListener())
     tx_ok = (tsr is not None and tsr.send_status.name == "SEND_OK"
              and tsr.get_local_transaction_state() == LocalTransactionState.COMMIT_MESSAGE)
-    check("事务消息发送(提交路径)", tx_ok,
+    check("transactional message send (commit path)", tx_ok,
           "state=%s" % (tsr.get_local_transaction_state() if tsr else "None"))
-    # 确认事务消息确实落库可被消费
+    # Confirm the transactional message really lands and can be consumed
     recv_tx = run_consumer(topic_tx, "*", 10, group_suffix="tx")
-    check("事务消息落库可被消费", any(m.body == b"tx-commit" for m in recv_tx),
+    check("the transactional message lands and can be consumed", any(m.body == b"tx-commit" for m in recv_tx),
           "received=%d" % len(recv_tx))
 
-    # ---------- 8. 单向 + 批量：没有逐条应答的两种入口，靠回读条数兜底 ----------
+    # ---------- 8. oneway + batch: two entries without per-message responses, backed by read-back counts ----------
     topic_ent = "%s_Entries" % PREFIX
     prod.send(Message(topic_ent, b"ent-sync"))
     prod.send_oneway(Message(topic_ent, b"ent-oneway"))
     ent_expect = [b"ent-sync", b"ent-oneway"] + [b"ent-batch-%d" % i for i in range(3)]
     brs = prod.send([Message(topic_ent, b) for b in ent_expect[2:]])
-    check("批量发送 send(list) SEND_OK", brs.send_status.name == "SEND_OK",
+    check("batch send(list) SEND_OK", brs.send_status.name == "SEND_OK",
           "status=%s" % brs.send_status.name)
     recv_ent = run_consumer(topic_ent, "*", 18, group_suffix="ent", expect=len(ent_expect))
     got_ent = sorted(m.body for m in recv_ent)
-    check("单向+批量消息全部落到 broker 并可消费",
+    check("oneway+batch messages all land on the broker and can be consumed",
           got_ent == sorted(ent_expect),
           "received=%d/%d bodies=%s" % (len(recv_ent), len(ent_expect), got_ent))
 
-    # ---------- 9. 定时消息（TIMER_DELIVER_MS：到点才投递）----------
+    # ---------- 9. timer messages (TIMER_DELIVER_MS: delivered only when the time comes) ----------
     topic_timer = "%s_Timer" % PREFIX
     deliver_at = int(time.time() * 1000) + 5000
     tm = Message(topic_timer, b"timer-5s")
@@ -398,26 +398,26 @@ def main():
     prod.send(tm)
     recv_timer = run_consumer(topic_timer, "*", 20, group_suffix="timer", expect=1)
     hit_timer = [m for m in recv_timer if m.body == b"timer-5s"]
-    check("定时消息最终投递", bool(hit_timer), "received=%d" % len(recv_timer))
+    check("the timer message is eventually delivered", bool(hit_timer), "received=%d" % len(recv_timer))
     if hit_timer:
         tdrift = hit_timer[0].store_timestamp - hit_timer[0].born_timestamp
-        check("定时生效(store_ts-born_ts>=4000ms)", tdrift >= 4000, "drift=%dms" % tdrift)
+        check("the timer takes effect (store_ts-born_ts>=4000ms)", tdrift >= 4000, "drift=%dms" % tdrift)
     else:
-        check("定时生效(store_ts-born_ts>=4000ms)", False, "无定时消息可校验")
+        check("the timer takes effect (store_ts-born_ts>=4000ms)", False, "no timer message to verify")
 
     prod.shutdown()
 
-    # ---------- 汇总 ----------
+    # ---------- summary ----------
     failed = [r for r in results if not r[1]]
-    print("\n================ 消息类型联调汇总 ================")
+    print("\n================ message type interop summary ================")
     for name, ok, detail in results:
         print("  [%s] %s" % ("PASS" if ok else "FAIL", name))
     print("==================================================")
     if failed:
-        print("结果: %d 项失败" % len(failed))
+        print("result: %d item(s) failed" % len(failed))
         return 1
-    print("结果: 全部通过（9 类消息类型均对真实集群验证通过%s）"
-          % ("，且带 ACL 签名" if AK and SK else ""))
+    print("result: all passed (all 9 message types verified against a real cluster%s)"
+          % (", with ACL signing" if AK and SK else ""))
     return 0
 
 

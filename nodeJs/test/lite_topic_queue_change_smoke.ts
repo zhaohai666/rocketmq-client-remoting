@@ -1,18 +1,20 @@
 // DefaultLitePullConsumer topic queue-change listener — offline wire test.
 //
-// 行为基线：
-//   * 注册：topic/listener 为 null 抛 "Topic or listener is null"；重复注册
-//     会告警并覆盖旧监听器；只有 RUNNING 状态的消费者会快照当前队列集合
-//     （否则第一轮比较会把本来就存在的集合当成变化）。
-//   * 比较：onChanged 只在集合真实变化时触发；单个 topic 的路由查询失败
-//     不得中断其他 topic 的检查。
-//   * "没有快照" 永远不算相等，所以 start() 之前注册的监听器会在第一轮
-//     触发一次。
-//   * 调度：首轮延迟 10s，之后每 topicMetadataCheckIntervalMillis
-//     （默认 30000ms）一次。
-//   ⚠ 监听器 map 以裸 topic 名为键（与 subscribe / route / rebalance 状态的
-//     键法一致）：namespaceV2 是在 wire 上靠 NamespaceRpcHook 的 nsd/ns 头
-//     生效的，不改写 topic 名。测试 6 钉住由此产生的行为。
+// Behaviour baseline:
+//   * Registration: a null topic/listener throws "Topic or listener is null";
+//     re-registering warns and overwrites the old listener; only a consumer in
+//     the RUNNING state snapshots the current queue set (otherwise the first
+//     comparison would treat the already-present set as a change).
+//   * Comparison: onChanged fires only on a real set change; one topic's route
+//     lookup failing must not abort the check for the other topics.
+//   * "No snapshot" never counts as equal, so a listener registered before
+//     start() fires once on the first round.
+//   * Scheduling: the first round is delayed 10s, then one round per
+//     topicMetadataCheckIntervalMillis (default 30000ms).
+//   ⚠ The listener map is keyed by bare topic name (consistent with the keys of
+//     the subscribe / route / rebalance state): namespaceV2 takes effect on the
+//     wire through NamespaceRpcHook's nsd/ns header, without rewriting topic
+//     names. Test 6 pins the behaviour that follows from this.
 //
 // Run: node --experimental-strip-types test/lite_topic_queue_change_smoke.ts
 import net from 'node:net';
@@ -323,7 +325,8 @@ async function main() {
     check('start() arms the scheduled check', (c as any)._metadataTimer != null);
 
     cluster.scale(TOPIC, 3);
-    // 检查周期在 start() 时固定；这里同样方式驱动一个短周期。
+    // The check period is pinned at start(); here a short period is driven the same
+    // way.
     clearInterval((c as any)._metadataTimer);
     clearTimeout((c as any)._metadataInitialTimer);
     (c as any)._metadataTimer = null;

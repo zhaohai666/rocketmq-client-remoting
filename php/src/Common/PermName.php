@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * 权限位常量：topic / 订阅组的 perm 字段按位解释（R=4、W=2、X=1）。
+ * Permission bit constants: the perm field of topic / subscription group is interpreted bitwise (R=4, W=2, X=1).
  */
 final class PermName
 {
@@ -16,10 +16,10 @@ final class PermName
     public const PERM_OWNER = 0x1 << 4;
 
     /**
-     * 合法权限值：``perm >= 0 && perm < PERM_PRIORITY``。
+     * Valid permission value: ``perm >= 0 && perm < PERM_PRIORITY``.
      *
-     * 字符串入参不是数字时抛 ValueError——perm 来自配置文本，把坏值静默当 0
-     * 会变成误放行；调用方需自行捕获。
+     * Throws ValueError when the string argument is not a number — perm comes from config text, and silently treating a
+     * bad value as 0 would wrongly allow it; the caller must catch it.
      */
     public static function isValid(int|string $perm): bool
     {

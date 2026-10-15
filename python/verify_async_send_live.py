@@ -37,7 +37,7 @@ def _wait_until(pred, timeout=20.0, interval=0.05):
 
 
 def _first(items):
-    """取第一条的文本（detail 里要打印，空列表得打印成空串而不是 IndexError）。"""
+    """Take the text of the first item (it goes into detail; an empty list must print as an empty string, not IndexError)."""
     return str(items[0]) if items else ""
 
 
@@ -62,12 +62,12 @@ class _Recorder(SendCallback):
             self._note()
 
     def _note(self):
-        """记下发终态的时刻和线程名（调用方必须已持有 ``self.lock``）。"""
+        """Record the moment and thread name of the terminal state (the caller must already hold ``self.lock``)."""
         self.ats.append(time.monotonic())
         self.threads.append(threading.current_thread().name)
 
     def after(self, moment):
-        """``moment``（``time.monotonic()`` 刻度）之后发出的回调条数。"""
+        """Count of callbacks emitted after ``moment`` (on the ``time.monotonic()`` scale)."""
         with self.lock:
             return sum(1 for t in self.ats if t > moment)
 
@@ -83,9 +83,9 @@ class _Recorder(SendCallback):
 
 
 class _TracingHook(SendMessageHook):
-    """before 钩子睡一段时间：把「准备段」拖慢，才能证明调用方没等它。
+    """The before hook sleeps for a while: slowing down the "prepare phase" is how we prove the caller did not wait on it.
 
-    顺便记下两件事：钩子跑在哪根线程上、before/after 各跑了几次。
+    It also records two things: which thread the hook ran on, and how many times before/after each ran.
     """
 
     def __init__(self, millis=0):
@@ -111,7 +111,7 @@ class _TracingHook(SendMessageHook):
 
 
 class _ForbiddenTagHook(CheckForbiddenHook):
-    """只拒绝带 forbidden 标签的消息，并记下它看到的 CommunicationMode。"""
+    """Only rejects messages tagged forbidden, and records the CommunicationMode it sees."""
 
     def __init__(self):
         self.lock = threading.Lock()
@@ -151,34 +151,34 @@ def _join_all(threads, timeout=30.0):
     for t in threads:
         t.join(max(0.0, deadline - time.monotonic()))
     stuck = sum(1 for t in threads if t.is_alive())
-    check("*  发送线程没有卡死", stuck == 0, "%d 条还活着" % stuck)
+    check("*  send threads did not get stuck", stuck == 0, "%d still alive" % stuck)
 
 
 def _landed(admin, topic, quiet=False):
-    """broker 上这个 topic 一共落了多少条（各队列 maxOffset-minOffset 之和）。
+    """How many messages landed on this topic on the broker (sum of maxOffset-minOffset across queues).
 
-    这是「回调里的 SendResult 不是自说自话」的唯一硬证据。读不到路由返回 -1。
+    This is the only hard evidence that "the SendResult in the callback is not self-reported". Returns -1 when the route cannot be read.
     """
     try:
         queues = admin.examine_topic_route(topic).get_all_message_queue(topic)
-    except Exception as e:  # noqa: BLE001 — 路由还没注册上
+    except Exception as e:  # noqa: BLE001 — route not registered yet
         if not quiet:
-            print("    (读 %s 路由失败: %s)" % (topic, e))
+            print("    (failed to read %s route: %s)" % (topic, e))
         return -1
     total = 0
     for mq in queues:
         try:
             total += admin.max_offset(mq) - admin.min_offset(mq)
-        except Exception:  # noqa: BLE001 — 该队列刚建出来还没写过
+        except Exception:  # noqa: BLE001 — this queue was just created and has not been written yet
             pass
     return total
 
 
 def _wait_landed(admin, topic, expected, timeout=30.0):
-    """等 broker 上至少出现 ``expected`` 条，返回最后一次的读数。
+    """Wait until at least ``expected`` messages appear on the broker, returning the last reading.
 
-    新建 topic 要等 broker 把 topicConfig 增量注册到 namesrv（秒级到十秒级），所以
-    头几次读不到路由不算失败，重试到超时才算。
+    A new topic must wait for the broker to register the topicConfig incrementally to namesrv (seconds to tens of seconds), so
+    the first few failed route reads are not failures; only retrying until timeout counts as failure.
     """
     deadline = time.time() + timeout
     landed = _landed(admin, topic, quiet=True)
@@ -195,7 +195,7 @@ def _queue_landed(admin, mq):
         return -1
 
 
-# ------------------------------------------------- A1 立刻返回 + 线程口径 + 读回
+# ------------------------------------------------- A1 return immediately + thread accounting + read-back
 def a1_non_blocking_and_read_back(admin, topic):
     hook = _TracingHook(400)
     p = _producer("a1-%d" % STAMP, hook)
@@ -207,51 +207,51 @@ def a1_non_blocking_and_read_back(admin, topic):
         began = time.monotonic()
         p.send_async(msg, rec, 5000)
         took_ms = int((time.monotonic() - began) * 1000)
-        check("A1 调用方在准备段（钩子睡 400ms）之前就已返回",
+        check("A1 the caller returned before the prepare phase (the hook sleeps 400ms)",
               took_ms < 200 and hook.before <= 1,
-              "调用方耗时=%dms before 已跑=%d" % (took_ms, hook.before))
-        check("A1 回调恰好一次且 SEND_OK",
+              "caller took=%dms before ran=%d" % (took_ms, hook.before))
+        check("A1 exactly one callback and SEND_OK",
               _wait_until(lambda: rec.done >= 1, 20.0)
               and len(rec.results) == 1 and not rec.errors, rec.summary())
         if not rec.results:
             return
         r = rec.results[0]
-        check("A1 before 钩子在 AsyncSenderExecutor_N 上跑",
+        check("A1 the before hook ran on AsyncSenderExecutor_N",
               hook.before_thread.startswith("AsyncSenderExecutor_"),
-              "线程名=%s" % hook.before_thread)
-        check("A1 用户回调在 NettyClientPublicExecutor_N 上跑（executeInvokeCallback）",
+              "thread name=%s" % hook.before_thread)
+        check("A1 the user callback ran on NettyClientPublicExecutor_N (executeInvokeCallback)",
               rec.threads[0].startswith("NettyClientPublicExecutor_"),
-              "线程名=%s" % rec.threads[0])
-        check("A1 before/after 各跑一次", hook.before == 1 and hook.after == 1,
+              "thread name=%s" % rec.threads[0])
+        check("A1 before/after each ran once", hook.before == 1 and hook.after == 1,
               "before=%d after=%d" % (hook.before, hook.after))
-        check("A1 broker 落了这一条", _wait_landed(admin, topic, 1) == 1)
-        # offset_msg_id 是 broker 给的，只有它能解出 commitLog 偏移 ⇒ 读回来对 body
+        check("A1 the broker landed this message", _wait_landed(admin, topic, 1) == 1)
+        # offset_msg_id is given by the broker; only it can be decoded to the commitLog offset ⇒ read the message back and match the body
         back = [None]
 
         def _view():
             try:
                 back[0] = admin.view_message(topic, r.offset_msg_id)
                 return back[0] is not None
-            except Exception:  # noqa: BLE001 — commitLog 还没刷出去
+            except Exception:  # noqa: BLE001 — commitLog not flushed out yet
                 return False
 
         read = _wait_until(_view, 15.0)
-        check("A1 用回调里的 offset_msg_id 能读回这条消息",
+        check("A1 the message can be read back with the offset_msg_id from the callback",
               read and back[0].body.decode() == body,
               "body=%s" % ("<null>" if back[0] is None else back[0].body.decode()))
-        check("A1 回调里的 queue_offset 就是它落在的位置",
+        check("A1 the queue_offset in the callback is exactly where it landed",
               r.queue_offset == admin.max_offset(r.message_queue) - 1,
               "queue_offset=%d max_offset=%d"
               % (r.queue_offset, admin.max_offset(r.message_queue)))
-        # msg_id 是客户端补的 UNIQ_KEY（32 位十六进制），不是 broker 的那份
-        check("A1 msg_id 是客户端 UNIQ_KEY、与 broker 的 offset_msg_id 不同",
+        # msg_id is the client-added UNIQ_KEY (32 hex digits), not the broker's copy
+        check("A1 msg_id is the client UNIQ_KEY, different from the broker's offset_msg_id",
               len(r.msg_id) == 32 and r.msg_id != r.offset_msg_id,
               "msgId=%s offsetMsgId=%s" % (r.msg_id, r.offset_msg_id))
     finally:
         p.shutdown()
 
 
-# ------------------------------------------------- A2 并发不串台
+# ------------------------------------------------- A2 concurrent sends do not cross
 def a2_burst_exactly_once_each(admin, topic):
     burst = 30
     p = _producer("a2-%d" % STAMP)
@@ -264,15 +264,15 @@ def a2_burst_exactly_once_each(admin, topic):
             for i in range(burst)]
         _start_all(threads)
         _join_all(threads)
-        check("A2 30 笔并发异步发送每笔都拿到终态",
+        check("A2 all 30 concurrent async sends got a terminal state",
               _wait_until(lambda: all(r.done >= 1 for r in each), 20.0),
               "done=%d" % sum(r.done for r in each))
-        check("A2 每笔**恰好一个**终态（不多不少）",
+        check("A2 each got exactly one terminal state (no more, no less)",
               all(r.done == 1 for r in each),
-              "多拿回调的笔数=%d" % sum(1 for r in each if r.done > 1))
-        check("A2 全部 SEND_OK",
+              "count with extra callbacks=%d" % sum(1 for r in each if r.done > 1))
+        check("A2 all SEND_OK",
               all(len(r.results) == 1 and not r.errors for r in each), each[0].summary())
-        check("A2 broker 上正好落 30 条", _wait_landed(admin, topic, burst) == burst)
+        check("A2 exactly 30 landed on the broker", _wait_landed(admin, topic, burst) == burst)
         slots = set()
         uniq = set()
         for r in each:
@@ -280,53 +280,53 @@ def a2_burst_exactly_once_each(admin, topic):
                 slots.add((s.message_queue.broker_name, s.message_queue.queue_id,
                            s.queue_offset))
                 uniq.add(s.msg_id)
-        check("A2 各笔的 (broker, queueId, queue_offset) 互不重叠",
-              len(slots) == burst, "去重后=%d" % len(slots))
-        check("A2 每笔的 UNIQ_KEY 都不一样", len(uniq) == burst, "去重后=%d" % len(uniq))
+        check("A2 each (broker, queueId, queue_offset) is distinct across sends",
+              len(slots) == burst, "after dedup=%d" % len(slots))
+        check("A2 every UNIQ_KEY is distinct", len(uniq) == burst, "after dedup=%d" % len(uniq))
     finally:
         p.shutdown()
 
 
-# ------------------------------------------------- A3 定点发送
+# ------------------------------------------------- A3 pinned send
 def a3_pinned_queue(admin, topic):
     p = _producer("a3-%d" % STAMP)
     p.start()
     rec = _Recorder()
     try:
-        # 先把 topic 撑出来（同步发一笔，让 broker 把队列建全），再挑一条定点打。
-        # ⚠ 取基线之前必须等预热那一笔在 broker 侧**已经可读**：刚 ack 的报文落到
-        # consumeQueue 有延迟，基线读成 0、对账时它变成 1，会凭空多出 1 条。
+        # First get the topic up (send one synchronously so the broker creates all queues), then pick a queue to pin.
+        # ⚠ Before taking the baseline you must wait for the warm-up message to be readable on the broker side: a freshly acked message landing in the
+        # consumeQueue has a delay; if the baseline reads as 0 and it becomes 1 during reconciliation, you get a phantom extra 1.
         p.send(Message(topic, b"async-a3-warmup"), 5000)
-        check("A3 预热那一笔已经在 broker 上可读", _wait_landed(admin, topic, 1) >= 1,
+        check("A3 the warm-up message is already readable on the broker", _wait_landed(admin, topic, 1) >= 1,
               "landed=%d" % _landed(admin, topic))
         queues = p.fetch_publish_message_queues(topic)
-        check("A3 取到了发布队列", len(queues) > 0, "queues=%d" % len(queues))
+        check("A3 got the publish queues", len(queues) > 0, "queues=%d" % len(queues))
         aimed = queues[0]
         before = _queue_landed(admin, aimed)
         others_before = sum(max(0, _queue_landed(admin, q)) for q in queues[1:])
         p.send_async(Message(topic, b"async-a3-pinned"), rec, 5000, aimed)
-        check("A3 定点异步发送拿到终态且 SEND_OK",
+        check("A3 the pinned async send got a terminal state and SEND_OK",
               _wait_until(lambda: rec.done >= 1, 20.0)
               and len(rec.results) == 1, rec.summary())
         if not rec.results:
             return
         r = rec.results[0]
-        check("A3 结果落在指定的那条队列上",
+        check("A3 the result landed on the specified queue",
               r.message_queue.broker_name == aimed.broker_name
               and r.message_queue.queue_id == aimed.queue_id,
               "broker=%s queueId=%d" % (r.message_queue.broker_name,
                                         r.message_queue.queue_id))
-        check("A3 那条队列正好多 1 条",
+        check("A3 that queue grew by exactly 1",
               _wait_until(lambda: _queue_landed(admin, aimed) == before + 1, 20.0),
-              "landed=%d 之前=%d" % (_queue_landed(admin, aimed), before))
+              "landed=%d before=%d" % (_queue_landed(admin, aimed), before))
         others_after = sum(max(0, _queue_landed(admin, q)) for q in queues[1:])
-        check("A3 别的队列一条都没多", others_after == others_before,
-              "其它队列 %d -> %d" % (others_before, others_after))
+        check("A3 no other queue grew at all", others_after == others_before,
+              "other queues %d -> %d" % (others_before, others_after))
     finally:
         p.shutdown()
 
 
-# ------------------------------------------------- A4 拦截钩子
+# ------------------------------------------------- A4 interception hook
 def a4_forbidden_hook(admin, topic):
     forbidden = _ForbiddenTagHook()
     p = _producer("a4-%d" % STAMP, forbidden)
@@ -335,33 +335,33 @@ def a4_forbidden_hook(admin, topic):
     try:
         bad = Message(topic, b"async-a4-rejected", tags="forbidden")
         p.send_async(bad, rejected, 5000)
-        check("A4 钩子拒绝的异常原样到了回调",
+        check("A4 the exception rejected by the hook reached the callback unchanged",
               _wait_until(lambda: rejected.done >= 1, 10.0)
               and rejected.errors
               and "tag forbidden is not allowed" in str(rejected.errors[0]),
               rejected.summary())
-        check("A4 拦截钩子看到的是 ASYNC", forbidden.mode == "ASYNC",
+        check("A4 the interception hook saw ASYNC", forbidden.mode == "ASYNC",
               "mode=%s" % forbidden.mode)
-        # 这个 topic 除了被拒的这一笔什么都没有 ⇒ 要么读到 0 条，要么连路由都还没
-        # 注册上（-1）。路由是**第一条消息落到 broker** 才会被 autoCreate 建出来的，
-        # 所以「读不到路由」本身就是「broker 没收到过请求」的证据。
+        # This topic has nothing besides the rejected message ⇒ either we read 0 messages, or the route is not even
+        # registered yet (-1). The route is only auto-created when the first message lands on the broker,
+        # so "cannot read the route" is itself evidence that "the broker never received the request".
         after_reject = _landed(admin, topic)
-        check("A4 被拒的这笔在 broker 上没留痕", after_reject <= 0,
-              "landed=%d（-1 = 路由还没建出来，即 broker 一条都没收到）" % after_reject)
+        check("A4 the rejected message left no trace on the broker", after_reject <= 0,
+              "landed=%d (-1 = route not created yet, i.e. the broker received nothing)" % after_reject)
 
         p.send_async(Message(topic, b"async-a4-ok"), passed, 5000)
-        check("A4 同一个生产者换个标签照常落地（拒绝没把池子弄坏）",
+        check("A4 the same producer lands a different tag just fine (the rejection did not break the pool)",
               _wait_until(lambda: passed.done >= 1, 20.0) and len(passed.results) == 1,
               passed.summary())
-        check("A4 broker 上正好落 1 条", _wait_landed(admin, topic, 1) == 1,
+        check("A4 exactly 1 landed on the broker", _wait_landed(admin, topic, 1) == 1,
               "landed=%d" % _landed(admin, topic))
-        check("A4 钩子一共被调 2 次（一笔被拒、一笔放行）", forbidden.calls == 2,
+        check("A4 the hook was called 2 times in total (one rejected, one allowed)", forbidden.calls == 2,
               "calls=%d" % forbidden.calls)
     finally:
         p.shutdown()
 
 
-# ------------------------------------------------- A5 批量走同步批量内核
+# ------------------------------------------------- A5 batches go through the sync-batch kernel
 def a5_batch_async(admin, topic):
     p = _producer("a5-%d" % STAMP)
     p.start()
@@ -369,25 +369,25 @@ def a5_batch_async(admin, topic):
     try:
         msgs = [Message(topic, ("async-a5-%d" % i).encode()) for i in range(3)]
         p.send_async(msgs, rec, 8000)
-        check("A5 批量异步只有一次回调且 SEND_OK",
+        check("A5 the batch async send got exactly one callback and SEND_OK",
               _wait_until(lambda: rec.done >= 1, 20.0)
               and rec.done == 1 and len(rec.results) == 1, rec.summary())
-        check("A5 三条一起落了地", _wait_landed(admin, topic, 3) == 3,
+        check("A5 all three landed together", _wait_landed(admin, topic, 3) == 3,
               "landed=%d" % _landed(admin, topic))
-        check("*  A5 请求码 = SEND_BATCH_MESSAGE(320) 由离线单测取证",
-              True, "真机看不到上线报文，见 tests/test_producer_async.py")
+        check("*  A5 request code = SEND_BATCH_MESSAGE(320), evidenced by an offline unit test",
+              True, "the wire message is not visible live; see tests/test_producer_async.py")
 
         r = rec.results[0] if rec.results else None
         if r is None:
-            check("A5 批量读回", False, "回调没有交付 SendResult")
+            check("A5 batch read-back", False, "the callback did not deliver a SendResult")
             return
-        check("A5 批量的 msg_id 是客户端 32 位 ID、不是 broker 的 offset_msg_id",
+        check("A5 the batch msg_id is the client 32-digit ID, not the broker's offset_msg_id",
               len(r.msg_id) == 32 and "," not in r.msg_id and r.msg_id != r.offset_msg_id,
               "msgId=%s offsetMsgId=%s" % (r.msg_id, r.offset_msg_id))
-        # 批量应答的 offset_msg_id 是 broker **逐条**回的一串（逗号分隔，一条子消息一个
-        # commitLog 偏移），它本身就是「这一批被拆开存成 3 条」的证据
+        # The batch reply's offset_msg_id is a broker-returned list one per sub-message (comma-separated, one commitLog
+        # offset per sub-message), which is itself evidence that "this batch was split and stored as 3 messages"
         sub_offsets = [o for o in r.offset_msg_id.split(",") if o]
-        check("A5 broker 逐条回了 3 个 commitLog 偏移（批量确实被拆开落地）",
+        check("A5 the broker returned 3 commitLog offsets one per sub-message (the batch really was split on landing)",
               len(sub_offsets) == 3, "offsetMsgId=%s" % r.offset_msg_id)
         stored = [None]
 
@@ -396,18 +396,18 @@ def a5_batch_async(admin, topic):
                 stored[0] = admin.view_message(topic, sub_offsets[0])
                 return True
             except Exception:
-                return False  # commitLog 还没刷出去
+                return False  # commitLog not flushed out yet
 
         uniq = ""
         if sub_offsets and _wait_until(_read_sub, 15.0) and stored[0] is not None:
             uniq = stored[0].get_property("UNIQ_KEY") or ""
-        check("A5 broker 上存的子消息带客户端 UNIQ_KEY（逐条 ID 编在 body 里）",
+        check("A5 the sub-messages stored on the broker carry the client UNIQ_KEY (the per-message ID is embedded in the body)",
               len(uniq) == 32, "stored UNIQ_KEY=%s" % uniq)
     finally:
         p.shutdown()
 
 
-# ------------------------------------------------- A6 Shutdown 不等在途
+# ------------------------------------------------- A6 Shutdown does not wait for in-flight
 def a6_shutdown_does_not_wait(admin, topic):
     sends = max(1, os.cpu_count() or 1) * 3
     hook = _TracingHook(100)
@@ -419,31 +419,31 @@ def a6_shutdown_does_not_wait(admin, topic):
             p.send_async(Message(topic, ("async-a6-%d" % i).encode()), rec, 8000)
         p.shutdown()
         returned_at = time.monotonic()
-        # 每一笔仍然会跑完准备段、仍然拿到终态回调（不等待 ≠ 凭空丢任务）
-        check("A6 每一笔都拿到终态回调（不等待 ≠ 回调凭空消失）",
+        # Every send still runs its prepare phase and still gets a terminal-state callback (not waiting ≠ dropping tasks)
+        check("A6 every send got a terminal-state callback (not waiting ≠ callbacks vanishing)",
               _wait_until(lambda: rec.done >= sends, 30.0) and rec.done == sends,
-              "done=%d 发送=%d" % (rec.done, sends))
-        check("A6 Shutdown 不等在途：返回之后还有回调在发",
+              "done=%d sent=%d" % (rec.done, sends))
+        check("A6 Shutdown does not wait for in-flight: callbacks still fire after it returns",
               rec.done >= sends
               and sum(1 for t in rec.ats if t > returned_at) >= sends - 1,
-              "Shutdown 返回后才有 %d/%d 笔落到终态"
+              "%d/%d sends only reached a terminal state after Shutdown returned"
               % (sum(1 for t in rec.ats if t > returned_at), sends))
-        check("A6 不等待的代价：客户端先关，在途发送基本全部报错",
+        check("A6 the cost of not waiting: the client closes first, so essentially all in-flight sends error out",
               len(rec.errors) * 2 >= sends,
-              "报错=%d/%d，例如：%s" % (len(rec.errors), sends, _first(rec.errors)))
+              "errors=%d/%d, e.g.: %s" % (len(rec.errors), sends, _first(rec.errors)))
         time.sleep(2.0)
         landed = _landed(admin, topic, quiet=True)
-        check("A6 broker 上落地的远少于发送条数（不等待真的会丢消息）",
+        check("A6 far fewer landed on the broker than were sent (not waiting really does drop messages)",
               0 <= max(0, landed) * 2 < sends,
-              "landed=%d 发送=%d" % (landed, sends))
-    except Exception as e:  # noqa: BLE001 — Shutdown 之后不该抛，抛了就是回归
-        check("A6 Shutdown 排空在途准备段", False, "%s: %s" % (type(e).__name__, e))
+              "landed=%d sent=%d" % (landed, sends))
+    except Exception as e:  # noqa: BLE001 — should not throw after Shutdown; throwing is a regression
+        check("A6 Shutdown drains in-flight prepare phases", False, "%s: %s" % (type(e).__name__, e))
 
     p2 = _producer("a6-after-%d" % STAMP)
     p2.start()
     after = _Recorder()
     p2.send_async(Message(topic, b"async-a6-after"), after, 8000)
-    check("A6 关掉的池子不会被别的生产者复用（新生产者接着能发）",
+    check("A6 the closed pool is not reused by another producer (a new producer can still send)",
           _wait_until(lambda: after.done >= 1, 20.0) and len(after.results) == 1,
           after.summary())
     p2.shutdown()
@@ -481,7 +481,7 @@ def main():
         for topic in topics.values():
             try:
                 admin.delete_topic_in_broker(addr, topic)
-            except Exception:  # noqa: BLE001 — 清理失败不影响结论
+            except Exception:  # noqa: BLE001 — cleanup failure does not affect the conclusion
                 pass
         admin.shutdown()
 

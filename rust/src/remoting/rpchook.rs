@@ -101,8 +101,8 @@ impl RPCHook for AclClientRPCHook {
     }
 }
 
-/// 与 `namespace`（v1，客户端拼 `%` 前缀）是**两套机制**：这里只动扩展头，
-/// 不碰 topic / group 名。
+/// This is a **separate mechanism** from `namespace` (v1, where the client prefixes `%` onto names): this hook only touches the extension headers,
+/// never the topic / group names.
 #[derive(Debug, Clone, Default)]
 pub struct NamespaceRpcHook {
     namespace_v2: String,
@@ -177,7 +177,7 @@ mod tests {
         assert_eq!(
             content,
             b"TBW102pgThello body".to_vec(),
-            "value 按 key 字典序（defaultTopic < producerGroup < topic）后接 body"
+            "values sorted lexicographically by key (defaultTopic < producerGroup < topic), then the body appended"
         );
     }
 
@@ -213,7 +213,7 @@ mod tests {
         let mut cmd2 = command();
         with_token.do_before_request("127.0.0.1:10911", &mut cmd2);
         assert_eq!(cmd2.get_ext_field("SecurityToken"), Some("TOKEN"));
-        // Signature 不参与签名，所以两份内容的签名只对其它字段敏感
+        // Signature is not itself signed, so the two signatures only differ due to the other fields
         assert_ne!(
             cmd.get_ext_field("Signature"),
             cmd2.get_ext_field("Signature")
@@ -278,15 +278,15 @@ mod tests {
             assert_eq!(
                 snapshot(&cmd),
                 before,
-                "未配置 namespaceV2 时 extFields 必须逐键不变"
+                "extFields must be unchanged key by key when namespaceV2 is not configured"
             );
         }
     }
 
     #[test]
     fn namespace_fields_are_covered_by_the_acl_signature() {
-        // MQClientAPIImpl:329 把 Namespace 排在 ACL 之前：nsd/ns 先写入 ⇒ 进签名内容。
-        // 若顺序反过来（先签后写），签名与线上报文脱节，broker 报 reserve field signature。
+        // The Namespace hook is applied before the ACL hook: nsd/ns are written first ⇒ they enter the signed content.
+        // If the order were reversed (sign first, then write), the signature would no longer match the wire payload and the broker would report a reserve field signature error.
         let mut signed = command();
         NamespaceRpcHook::new(Some("NS_V2")).do_before_request("a", &mut signed);
         AclClientRPCHook::new(SessionCredentials::new("AK", "SK"))
@@ -298,16 +298,16 @@ mod tests {
         assert_ne!(
             signed.get_ext_field(SessionCredentials::SIGNATURE),
             unsigned.get_ext_field(SessionCredentials::SIGNATURE),
-            "先 Namespace 后 ACL 时，nsd/ns 必须参与签名"
+            "with Namespace applied before ACL, nsd/ns must participate in the signature"
         );
 
-        // 签名内容里确实带着 ns/nsd 的值（sorted: AccessKey < defaultTopic < ns <
-        // nsd < producerGroup < topic，Signature 自身跳过）
+        // The signed content really carries the ns/nsd values (sorted: AccessKey < defaultTopic < ns <
+        // nsd < producerGroup < topic; Signature itself is skipped)
         let content = AclClientRPCHook::build_request_content(&mut signed);
         assert_eq!(
             String::from_utf8_lossy(&content),
             "AKTBW102NS_V2truepgThello body",
-            "nsd/ns 先写入时逐字节进签名内容"
+            "nsd/ns enter the signed content byte by byte when written first"
         );
     }
 }

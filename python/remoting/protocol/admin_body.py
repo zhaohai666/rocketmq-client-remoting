@@ -1,14 +1,17 @@
 # -*- coding: utf-8 -*-
-"""管理端专用响应体（协议 admin.* 与 body.* 中的管理类）：
+"""Response bodies used only by the administrative APIs (the admin.* classes in the
+protocol and the management classes in body.*):
 
 TopicStatsTable / TopicOffset / ConsumeStats / OffsetWrapper /
-TopicConfigSerializeWrapper / ConsumeQueueData / QueryConsumeQueueResponseBody。
+TopicConfigSerializeWrapper / ConsumeQueueData / QueryConsumeQueueResponseBody.
 
-⚠ 关键坑：这几个类的 Map 键是 **MessageQueue**，broker 侧按 fastjson 序列化时会把
-键直接内联成 JSON 对象，产出**非法 JSON**，例如：
+CAUTION: a key trap -- the Map keys of these classes are **MessageQueue**, and when
+the broker side serializes them with fastjson it inlines the keys directly as JSON
+objects, producing **invalid JSON**, for example:
     {"offsetTable":{{"brokerName":"broker-a","queueId":3,"topic":"MyTopic"}:{...}}}
-所以必须用 serialize.fastjson_loads 解析，再把字符串键还原成 MessageQueue。
-字段名与结构均由对 5.5.1 broker 的实测响应确认。
+So they must be parsed with serialize.fastjson_loads, and the string keys converted
+back into MessageQueue afterwards. The field names and structure were confirmed
+against real responses from a 5.5.1 broker.
 """
 from __future__ import annotations
 
@@ -21,9 +24,10 @@ from .serialize import RemotingSerializable, decode_message_queue_key
 
 
 def parse_message_queue_key(key: str) -> Optional[MessageQueue]:
-    """把 fastjson2 写出的 MessageQueue 内联对象键还原成 MessageQueue。
+    """Turn a MessageQueue key inlined by fastjson2 back into a MessageQueue.
 
-    返回 None 表示这个键不是内联对象（例如 ``"0"``、``"G1"`` 这类普通字符串键）。
+    Returning None means the key is not an inline object (for example an ordinary
+    string key such as ``"0"`` or ``"G1"``).
     """
     d = decode_message_queue_key(key)
     if d is None:
@@ -32,13 +36,14 @@ def parse_message_queue_key(key: str) -> Optional[MessageQueue]:
 
 
 def message_queue_key(mq: MessageQueue) -> str:
-    """把 MessageQueue 序列化成 fastjson2 风格的内联对象键（键按字母序）。"""
+    """Serialize a MessageQueue into a fastjson2-style inline object key (keys in
+    alphabetical order)."""
     return '{"brokerName":"%s","queueId":%d,"topic":"%s"}' % (
         mq.broker_name, mq.queue_id, mq.topic)
 
 
 def decode_message_queue_map(raw: Optional[dict]) -> Dict[MessageQueue, Any]:
-    """通用：解析以 MessageQueue 为键的 map（fastjson2 非字符串键）。"""
+    """Generic helper: parse a map keyed by MessageQueue (fastjson2 non-string keys)."""
     result: Dict[MessageQueue, Any] = {}
     for k, v in (raw or {}).items():
         mq = parse_message_queue_key(k)
@@ -119,7 +124,7 @@ class OffsetWrapper:
 
     @property
     def lag(self) -> int:
-        """lag 的定义：brokerOffset - consumerOffset。"""
+        """Definition of lag: brokerOffset - consumerOffset."""
         return self.broker_offset - self.consumer_offset
 
     def to_dict(self) -> dict:
@@ -231,7 +236,7 @@ class ConsumeQueueData:
             "eval": self.eval,
             "bitMap": self.bit_map,
         }
-        # fastjson NON_NULL 语义：null 字段不序列化
+        # fastjson NON_NULL semantics: null fields are not serialized
         if self.extend_data_json is not None:
             d["extendDataJson"] = self.extend_data_json
         if self.msg is not None:

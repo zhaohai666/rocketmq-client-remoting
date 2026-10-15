@@ -1,12 +1,17 @@
-// 前置：NameServer + Broker 已起，autoCreateTopicEnable=true。
+// Prerequisite: a NameServer + Broker are up, with autoCreateTopicEnable=true.
 //
 //
-// ⚠ 三条脚本纪律（真机联调踩出来的）：
-//   ① topic 一律带 Stamp —— 多轮**依次**跑在同一个 broker 上，固定名会继承上一轮的条数；
-//   ② 「被拒的发送连请求都没发出去」只能看 broker 侧落库条数（各队列 maxOffset-minOffset 之和），
-//      光看客户端回调会被「回调报错但请求照样发出去」的实现蒙过去；
-//   ③ 新建 topic 要等 broker 把 topicConfig 增量注册到 namesrv（秒级到十秒级），所以所有
-//      broker 侧对账都是**轮询到超时**，读一次路由失败不算失败。
+// Three script disciplines (learned from real-machine integration):
+//   (1) topics always carry a Stamp -- several rounds run **one after another** against the
+// same broker and a fixed name would inherit the previous round's message count;
+//   (2) "a rejected send did not even put a request on the wire" can only be judged from the
+//      broker-side stored count (the sum of maxOffset-minOffset over the queues); looking at
+//      the client callback alone is fooled by an implementation whose "callback reports an
+//      error but the request went out anyway";
+//   (3) a newly created topic has to wait for the broker to incrementally register its
+//      topicConfig with the namesrv (seconds to tens of seconds), so every broker-side
+//      reconciliation **polls until the timeout** and one failed route read does not count
+//      as a failure.
 using System.Globalization;
 using System.Text;
 
@@ -57,7 +62,8 @@ public static class LiveBackPressure
 
     private static long NowMs() => (long)UtilAll.MonotonicMillis();
 
-    /// <summary>线程安全的回调记录（成功数 / 完成数 / 首条错误）。</summary>
+    /// <summary>A thread-safe callback record (success count / done count / first
+   /// error).</summary>
     private sealed class Recorder : ISendCallback
     {
         private readonly object _lk = new();
@@ -120,8 +126,10 @@ public static class LiveBackPressure
     }
 
     /// <summary>
-    /// 在 SendMessageBefore 里睡一会儿。许可是**过闸时**拿的、**链终点**还的，所以占住在途
-    /// 最干净的办法是让链本身变慢：堵用户回调占不住许可（归还就在把结果交给用户之前一步）。
+    /// Sleeps for a while inside SendMessageBefore. The permit is taken **when passing the
+  /// gate** and returned at the **end of the chain**, so the cleanest way to hold one in
+    /// flight is to slow the chain itself down: blocking in the user callback does not hold
+    /// a permit (the return happens one step before the result is handed to the user).
     /// </summary>
     private sealed class SlowHook : ISendMessageHook
     {
@@ -152,7 +160,8 @@ public static class LiveBackPressure
         public string Topic(string prefix) => prefix + "_" + Stamp;
     }
 
-    // 钩子必须在 Start() 之前挂上：SlowHook 靠拖慢 beforeSend 撑开时间窗
+  // The hook has to be attached before Start(): SlowHook relies on slowing beforeSend to
+  // stretch out the time window
     private static DefaultMQProducer MakeProducer(Env env, string instance, bool enable,
         long num = -1, long size = -1, ISendMessageHook? hook = null)
     {
@@ -195,18 +204,19 @@ public static class LiveBackPressure
     private static void JoinAll(List<Thread> threads, double timeoutSeconds = 30.0)
     {
         long deadline = NowMs() + (long)(timeoutSeconds * 1000);
-        // Join(0) 在 C# 里是「无限等待」而不是「立刻返回」，所以剩余时间至少给 1ms
+        // Join(0) means "wait forever" in C# rather than "return at once", so the remaining time gets at least 1ms
         foreach (Thread th in threads) th.Join((int)Math.Max(1L, deadline - NowMs()));
         int stuck = threads.Count(t => t.IsAlive);
         if (stuck > 0)
         {
-            Check("*  发送线程没有卡死", false, stuck + " 条还活着");
+      Check("*  the sending threads did not wedge", false, stuck + " still alive");
         }
     }
 
     /// <summary>
-    /// broker 上这个 topic 一共落了多少条（各队列 maxOffset-minOffset 之和）；读不到路由返回 -1。
-    /// 这是「被拒的发送连请求都没发出去」的唯一硬证据。
+   /// How many messages this topic has stored on the broker in total (the sum of
+   /// maxOffset-minOffset over the queues); returns -1 when the route cannot be read.
+   /// This is the only hard evidence for "a rejected send did not even put a request on the wire".
     /// </summary>
     private static long LandedCount(DefaultMQAdminExt admin, string topic)
     {
@@ -217,7 +227,7 @@ public static class LiveBackPressure
         }
         catch (Exception)
         {
-            return -1;  // 路由还没注册上
+      return -1;  // the route is not registered yet
         }
 
         long total = 0;
@@ -229,14 +239,15 @@ public static class LiveBackPressure
             }
             catch (Exception)
             {
-                // 该队列刚建出来还没写过
+            // that queue was just created and nothing has been written to it yet
             }
         }
 
         return total;
     }
 
-    /// <summary>等 broker 上至少出现 expected 条，返回最后一次读数（新 topic 注册到 namesrv 是秒级的）。</summary>
+    /// <summary>Waits until at least expected messages appear on the broker and returns the
+  /// last reading (registering a new topic with the namesrv takes seconds).</summary>
     private static long WaitLanded(Env env, string topic, long expected, int seconds = 30)
     {
         long deadline = NowMs() + seconds * 1000L;
@@ -247,7 +258,7 @@ public static class LiveBackPressure
             landed = LandedCount(env.Admin, topic);
         }
 
-        if (landed < 0) LandedCount(env.Admin, topic);  // 真读不到时再打一次，便于定位
+    if (landed < 0) LandedCount(env.Admin, topic);  // only log it again when it really cannot be read, to ease diagnosis
         return landed;
     }
 
@@ -260,13 +271,13 @@ public static class LiveBackPressure
         }
         catch (Exception)
         {
-            // 拿不到集群信息时用本机默认值
+    // use the local defaults when the cluster info cannot be obtained
         }
 
         return "127.0.0.1:10911";
     }
 
-    // ---------------------------------------------------------------- B1 默认容量不漏配额
+    // ---------------------------------------------------------------- B1 the default capacity leaks no quota
     private static void B1DefaultCapacityNoLeak(Env env, string t)
     {
         DefaultMQProducer p = MakeProducer(env, "b1", true);
@@ -276,12 +287,12 @@ public static class LiveBackPressure
             List<Thread> threads = SpawnSenders(p, t,
                 i => Encoding.UTF8.GetBytes("b1-" + N(i) + "-" + new string('x', 120)), 40, rec, 5000);
             JoinAll(threads);
-            Check("B1 40 笔异步都走完回调", WaitUntil(() => rec.Done >= 40, 15000), rec.Summary());
-            Check("B1 全部 SEND_OK", rec.Ok == 40 && rec.ErrorCount == 0, rec.Summary());
+        Check("B1 all 40 async sends ran their callback", WaitUntil(() => rec.Done >= 40, 15000), rec.Summary());
+      Check("B1 all SEND_OK", rec.Ok == 40 && rec.ErrorCount == 0, rec.Summary());
             long landed = WaitLanded(env, t, 40);
-            Check("B1 broker 上正好落了 40 条", landed == 40, "landed=" + N(landed));
-            Check("B1 条数许可满额归还", NumPermits(p) == 1024, "available=" + N(NumPermits(p)));
-            Check("B1 字节许可满额归还", SizePermits(p) == 100L * 1024 * 1024,
+        Check("B1 exactly 40 landed on the broker", landed == 40, "landed=" + N(landed));
+        Check("B1 the count permits are fully returned", NumPermits(p) == 1024, "available=" + N(NumPermits(p)));
+        Check("B1 the byte permits are fully returned", SizePermits(p) == 100L * 1024 * 1024,
                 "available=" + N(SizePermits(p)));
         }
         finally
@@ -290,7 +301,7 @@ public static class LiveBackPressure
         }
     }
 
-    // ------------------------------------------------- B2/B3 条数闸：拒绝、对账、扩容
+    // ------------------------------------------------- B2/B3 the count gate: rejection, reconciliation, growth
     private static void B2AndB3NumGate(Env env, string t)
     {
         var slow = new SlowHook(600);
@@ -301,48 +312,50 @@ public static class LiveBackPressure
         {
             List<Thread> holders = SpawnSenders(p, t, _ => Encoding.UTF8.GetBytes("held"),
                 (int)FairSemaphore.MinAsyncSendNum, held, 8000);
-            Check("B2 在途占满后空闲条数为 0", WaitUntil(() => NumPermits(p) == 0, 3000),
+    Check("B2 the free count is 0 once in flight is saturated", WaitUntil(() => NumPermits(p) == 0, 3000),
                 "available=" + N(NumPermits(p)));
 
-            // 第 11、12 笔：预算只有 150ms，等不到许可
+      // the 11th and 12th: the budget is only 150ms, not enough to wait for a permit
             long began = NowMs();
             List<Thread> rejects = SpawnSenders(p, t, _ => Encoding.UTF8.GetBytes("rejected"),
                 2, rejected, 150);
             JoinAll(rejects, 10.0);
             long waited = NowMs() - began;
-            Check("B2 闸等到预算耗尽才报错（不是看一眼就拒）", waited >= 130,
-                "调用方等了 " + N(waited) + "ms");
-            Check("B2 超限的两笔回调 TooMuchRequest，文案与协议约定逐字一致",
+         Check("B2 the gate waits until the budget is exhausted before reporting (it is not a glance-and-reject)", waited >= 130,
+            "the caller waited " + N(waited) + "ms");
+            Check("B2 the two over-limit callbacks are TooMuchRequest with the text agreed by the protocol",
                 rejected.AllErrorsContain("send message tryAcquire semaphoreAsyncNum timeout", 2),
                 rejected.Summary());
-            Check("B2 超限回调的异常类型是 RemotingTooMuchRequestException",
+  Check("B2 the exception type of the over-limit callback is RemotingTooMuchRequestException",
                 rejected.AllErrorsAre(typeof(RemotingTooMuchRequestException), 2),
                 rejected.Summary());
 
             JoinAll(holders, 25.0);
-            Check("B2 在途的 10 笔都发出去了",
+         Check("B2 the 10 in-flight ones were all sent",
                 WaitUntil(() => held.Ok == (int)FairSemaphore.MinAsyncSendNum, 20000),
                 held.Summary());
             long landed2 = WaitLanded(env, t, FairSemaphore.MinAsyncSendNum);
-            Check("B2 被拒的两笔在 broker 上一条没留（连请求都没发）",
+          Check("B2 the two rejected ones left nothing on the broker (not even a request went out)",
                 landed2 == FairSemaphore.MinAsyncSendNum,
-                "landed=" + N(landed2) + " 期望 " + N(FairSemaphore.MinAsyncSendNum));
-            Check("B2 全部落地后条数许可回到 10",
+         "landed=" + N(landed2) + " expected " + N(FairSemaphore.MinAsyncSendNum));
+            Check("B2 the count permits are back to 10 once everything landed",
                 WaitUntil(() => NumPermits(p) == FairSemaphore.MinAsyncSendNum, 20000),
                 "available=" + N(NumPermits(p)));
 
-            // B3：再占满 10 个在途，把容量抬到 12 —— 卡在闸上的人应当被叫醒。
-            // 这一轮把钩子睡到 2s：占住在途的时间必须远大于「起线程 + 轮询确认 + 起等待方」
-            // 这几步的开销，否则检查还没做完整轮就已经归还了。
+          // B3: saturate 10 in flight again and raise the capacity to 12 -- whoever is stuck
+      // at the gate should be woken up.
+   // This round sleeps the hook for 2s: the time the in-flight slot is held must be far
+  // larger than the overhead of "start a thread + poll to confirm + start the waiter",
+    // otherwise it has already been returned before the check finishes the whole round.
             slow.SetMillis(2000);
             var round2 = new Recorder();
             List<Thread> holders2 = SpawnSenders(p, t, _ => Encoding.UTF8.GetBytes("held2"),
                 (int)FairSemaphore.MinAsyncSendNum, round2, 8000);
-            Check("B3 第二轮在途同样占满", WaitUntil(() => NumPermits(p) == 0, 3000),
+   Check("B3 the second round saturates in flight just the same", WaitUntil(() => NumPermits(p) == 0, 3000),
                 "available=" + N(NumPermits(p)));
 
             var woken = new Recorder();
-            // 跨线程读写的可见性：bool 没有 Volatile.Read 重载，用 int + Interlocked
+         // cross-thread visibility: bool has no Volatile.Read overload, so int + Interlocked
             int waiterReturned = 0;
             var waiter = new Thread(() =>
             {
@@ -355,22 +368,23 @@ public static class LiveBackPressure
             waiter.Start();
             Thread.Sleep(300);
             bool passedGate = Interlocked.CompareExchange(ref waiterReturned, 0, 0) != 0;
-            Check("B3 扩容前调用方确实卡在闸上", !passedGate && NumPermits(p) == 0,
-                "调用方已过闸=" + (passedGate ? "yes" : "no") + " available=" + N(NumPermits(p)));
+        Check("B3 the caller really is stuck at the gate before the growth", !passedGate && NumPermits(p) == 0,
+            "the caller passed the gate=" + (passedGate ? "yes" : "no") + " available=" + N(NumPermits(p)));
             p.BackPressureForAsyncSendNum = (int)(FairSemaphore.MinAsyncSendNum + 2);
             waiter.Join(15000);
-            // 调用方线程被叫醒就算「过闸了」，但结果要等整条链跑完（这一轮钩子睡 2s）才回到回调，
-            // 所以这里等的是回调，不是线程退出。
-            Check("B3 扩容把卡在闸上的发送方叫醒并发了出去",
+         // waking the calling thread counts as "passing the gate", but the result only comes
+       // back to the callback after the whole chain has run (the hook sleeps 2s this round),
+        // so what is waited on here is the callback, not the thread exiting.
+            Check("B3 the growth woke the senders stuck at the gate and they went out",
                 !waiter.IsAlive && WaitUntil(() => woken.Ok >= 1, 20000), woken.Summary());
             JoinAll(holders2, 25.0);
-            Check("B3 全部归还后空闲许可 = 新容量 12",
+            Check("B3 the free permits = the new capacity 12 once everything is returned",
                 WaitUntil(() => NumPermits(p) == FairSemaphore.MinAsyncSendNum + 2, 25000),
                 "available=" + N(NumPermits(p)));
             long expect3 = 2 * FairSemaphore.MinAsyncSendNum + 1;
             long landed3 = WaitLanded(env, t, expect3);
-            Check("B3 broker 总数 = 两轮在途 + 被叫醒的那一笔", landed3 == expect3,
-                "landed=" + N(landed3) + " 期望 " + N(expect3));
+        Check("B3 the broker's total = both rounds in flight + the one that was woken", landed3 == expect3,
+    "landed=" + N(landed3) + " expected " + N(expect3));
         }
         finally
         {
@@ -378,7 +392,7 @@ public static class LiveBackPressure
         }
     }
 
-    // ------------------------------------------------- B4 字节闸（1M 地板 + 600KB）
+      // ------------------------------------------------- B4 the byte gate (a 1M floor + 600KB)
     private static void B4SizeGate(Env env, string t)
     {
         DefaultMQProducer p = MakeProducer(env, "b4", true, FairSemaphore.MinAsyncSendNum,
@@ -394,28 +408,28 @@ public static class LiveBackPressure
                 IsBackground = true,
             };
             first.Start();
-            Check("B4 在途字节许可正好扣掉 body 长度",
+  Check("B4 the in-flight byte permits are exactly the body length taken off",
                 WaitUntil(() => SizePermits(p) == wantInFlight, 3000),
-                "available=" + N(SizePermits(p)) + " 期望 " + N(wantInFlight));
+     "available=" + N(SizePermits(p)) + " expected " + N(wantInFlight));
             var second = new Thread(() => p.SendAsync(new Message(t, big), two, 150))
             {
                 IsBackground = true,
             };
             second.Start();
             second.Join(10000);
-            Check("B4 第二笔 600KB 过不了字节闸，文案与协议约定逐字一致",
+     Check("B4 the second 600KB one cannot pass the byte gate, and the text is verbatim as agreed by the protocol",
                 two.AllErrorsContain("send message tryAcquire semaphoreAsyncSize timeout", 1),
                 two.Summary());
-            Check("B4 字节闸拒绝的异常类型是 RemotingTooMuchRequestException",
+      Check("B4 the exception type of the byte gate rejection is RemotingTooMuchRequestException",
                 two.AllErrorsAre(typeof(RemotingTooMuchRequestException), 1), two.Summary());
-            Check("B4 字节闸没过时条数许可已经归还",
+        Check("B4 the count permits are already back when the byte gate is not passed",
                 WaitUntil(() => NumPermits(p) == FairSemaphore.MinAsyncSendNum, 3000),
                 "available=" + N(NumPermits(p)));
             first.Join(25000);
-            Check("B4 第一笔正常落地", WaitUntil(() => one.Done >= 1, 20000), one.Summary());
+        Check("B4 the first one lands normally", WaitUntil(() => one.Done >= 1, 20000), one.Summary());
             long landed = WaitLanded(env, t, 1);
-            Check("B4 broker 上只有第一笔（被拒的没留痕）", landed == 1, "landed=" + N(landed));
-            Check("B4 全部归还：条数与字节都回到配置额",
+          Check("B4 only the first is on the broker (the rejected one left no trace)", landed == 1, "landed=" + N(landed));
+            Check("B4 everything returned: both the count and the bytes are back to the configured amount",
                 NumPermits(p) == FairSemaphore.MinAsyncSendNum
                 && SizePermits(p) == FairSemaphore.MinAsyncSendSize,
                 "num=" + N(NumPermits(p)) + " size=" + N(SizePermits(p)));
@@ -426,7 +440,7 @@ public static class LiveBackPressure
         }
     }
 
-    // ------------------------------------------------- B5 关掉背压就不限流
+      // ------------------------------------------------- B5 with backpressure off there is no throttling
     private static void B5GateOff(Env env, string t)
     {
         DefaultMQProducer p = MakeProducer(env, "b5", false, FairSemaphore.MinAsyncSendNum,
@@ -434,17 +448,17 @@ public static class LiveBackPressure
         var rec = new Recorder();
         try
         {
-            // 每三笔里有一笔 300KB：关着背压时连字节闸都不看，开着的话这里必然限流
+            // every third one is 300KB: with backpressure off even the byte gate is not looked at, while with it on this must throttle
             List<Thread> threads = SpawnSenders(p, t,
                 i => i % 3 == 0 ? Encoding.UTF8.GetBytes(new string('x', 300 * 1024))
                     : Encoding.UTF8.GetBytes("small"),
                 30, rec, 8000);
             JoinAll(threads);
-            Check("B5 关背压后 30 笔并发全部成功", WaitUntil(() => rec.Done >= 30, 25000),
+  Check("B5 all 30 concurrent sends succeed with backpressure off", WaitUntil(() => rec.Done >= 30, 25000),
                 rec.Summary());
-            Check("B5 全部 SEND_OK", rec.Ok == 30 && rec.ErrorCount == 0, rec.Summary());
+            Check("B5 all SEND_OK", rec.Ok == 30 && rec.ErrorCount == 0, rec.Summary());
             long landed = WaitLanded(env, t, 30);
-            Check("B5 broker 上 30 条都在", landed == 30, "landed=" + N(landed));
+            Check("B5 all 30 are on the broker", landed == 30, "landed=" + N(landed));
         }
         finally
         {
@@ -481,7 +495,7 @@ public static class LiveBackPressure
         }
         catch (Exception e)
         {
-            Check("脚本整体执行", false, e.Message);
+        Check("running the script as a whole", false, e.Message);
         }
 
         string addr = BrokerAddr(env);
@@ -493,7 +507,7 @@ public static class LiveBackPressure
             }
             catch (Exception)
             {
-                // 清理失败不影响结论
+          // a cleanup failure does not affect the conclusion
             }
         }
 

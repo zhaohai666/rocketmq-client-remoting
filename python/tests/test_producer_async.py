@@ -1,29 +1,40 @@
 # -*- coding: utf-8 -*-
-"""异步发送链（send_async(msg, callback, timeout) 及其底层的 remoting 异步请求/失败重试）
-的单测。
+"""Unit tests of the asynchronous send chain (send_async(msg, callback, timeout) and the remoting
+asynchronous request / failure retry underneath it).
 
-盯的是这些真实行为（不是"异步 = 开个线程"）：
+What they watch are these real behaviours (not "asynchronous = spawn a thread"):
 
-  * ``send_async`` **不阻塞调用方**：准备工作全部在 ``AsyncSenderExecutor_N`` 里做
-    （池大小 = CPU 核数、队列有界 50000），队列满了才把 ``executor rejected`` 抛给调用方；
-  * 出队之后才算耗时：预算被排队吃掉直接回调
-    ``RemotingTooMuchRequestException("DEFAULT ASYNC send call timeout")``，一次请求都不发；
-  * ASYNC 在默认发送循环里 ``timesTotal`` 固定为 1 —— 外层循环不换 broker，
-    换 broker 只发生在失败重试链上，上限是 ``retryTimesWhenSendAsyncFailed``；
-  * 重试**复用同一个 RemotingCommand**（请求只建一次）并换新 opaque —— 旧 opaque 还挂在
-    responseTable 里等超时，复用会让两次尝试的应答串台；
-  * 超时预算是**共享**的剩余时间（``timeoutMillis - cost``），不是每次尝试各给一份；
-  * 只有 remoting 层的异常才重试：``RemotingTimeoutException`` / ``RemotingSendRequestException``
-    包成 ``MQClientException("wait response timeout, cost=…")`` / ``("send request failed")``，
-    其余 ``RemotingException`` 包成 ``("unknown reason")`` 且 ``RemotingTooMuchRequestException``
-    不重试；
-  * ⚠ **已经收到响应**但 broker 回了错误码（``MQBrokerException``）**不重试、也不包装** ——
-    异步发送不看 ``retryResponseCodes``，这点和同步发送完全不同；
-  * 定点发送（带 mq）时下传的主题发布信息为 null，所以重试**回到同一台 broker**；
-  * 用户回调与 ``SendMessageHook.after`` 在 ``NettyClientPublicExecutor_N`` 上跑（回调统一
-    submit 到公共执行器，池不可用才就地跑），用户回调抛异常被吞掉，不能带走 worker。
+  * ``send_async`` **does not block the caller**: all the preparation happens in
+    ``AsyncSenderExecutor_N`` (pool size = number of CPU cores, bounded queue of 50000), and only
+    when the queue is full is ``executor rejected`` thrown to the caller;
+  * The elapsed time only starts counting after the task leaves the queue: if the budget was eaten by
+    the queueing it directly calls back with
+    ``RemotingTooMuchRequestException("DEFAULT ASYNC send call timeout")`` and sends not a single
+    request;
+  * In the default send loop ASYNC fixes ``timesTotal`` at 1 -- the outer loop does not switch broker;
+    switching broker only happens on the failure retry chain, whose upper bound is
+    ``retryTimesWhenSendAsyncFailed``;
+  * The retry **reuses the same RemotingCommand** (the request is built only once) and takes a new
+    opaque -- the old opaque is still sitting in the responseTable waiting for its timeout, and
+    reusing it would let the replies of the two attempts cross over;
+  * The timeout budget is the **shared** remaining time (``timeoutMillis - cost``), not a fresh budget
+    for each attempt;
+  * Only the remoting-layer exceptions are retried: ``RemotingTimeoutException`` /
+    ``RemotingSendRequestException`` are wrapped into ``MQClientException("wait response timeout,
+    cost=…")`` / ``("send request failed")``, the other ``RemotingException`` into ``("unknown
+    reason")``, and ``RemotingTooMuchRequestException`` is not retried at all;
+  * CAUTION: **a response has already been received** but the broker replied with an error code
+    (``MQBrokerException``) means **no retry and no wrapping either** -- asynchronous sending does not
+    look at ``retryResponseCodes``, which is completely different from synchronous sending;
+  * With a pinned send (carrying an mq) the topic publish info passed down is null, so the retry
+    **goes back to the very same broker**;
+  * The user callback and ``SendMessageHook.after`` run on ``NettyClientPublicExecutor_N`` (callbacks
+    are uniformly submitted to the common executor and only run in place when the pool is
+    unavailable), and an exception thrown by the user callback is swallowed so that it cannot take a
+    worker down with it.
 
-真机那段（消息真的落到 broker、回调里拿到 SEND_OK）在 ``verify_message_types.py`` 第 1 节。
+The live part (the message really lands on the broker and the callback gets SEND_OK) is section 1
+of ``verify_message_types.py``.
 """
 from __future__ import annotations
 
@@ -65,7 +76,7 @@ def _mq(broker: str, queue_id: int = 0) -> MessageQueue:
 
 
 class _Deliver:
-    """fake 用**回调**投递的结果（区别于就地抛出的异常）。"""
+    """A result delivered by the fake through the **callback** (as opposed to an exception raised in place)."""
 
     def __init__(self, result=None, error=None):
         self.result = result
@@ -73,7 +84,7 @@ class _Deliver:
 
 
 class _Callback:
-    """记录回调的测试替身。"""
+    """A test double that records the callbacks."""
 
     def __init__(self, raise_error: bool = False):
         self.results: List[SendResult] = []
@@ -98,11 +109,11 @@ class _Callback:
 
 
 class _FakeAsyncClient:
-    """MQClientInstance 替身，缝在异步发送用到的那三个接口上。
+    """An MQClientInstance double, stitched onto the three interfaces the asynchronous send uses.
 
-    ``outcomes`` 每一项：BaseException -> 从 ``send_message_async`` **就地抛出**（同步失败）；
-    ``_Deliver`` -> 走 ``on_complete`` 回调。
-    列表用完之后一律回 SEND_OK。
+    Each entry of ``outcomes``: BaseException -> **raised in place** from ``send_message_async``
+    (a synchronous failure); ``_Deliver`` -> goes through the ``on_complete`` callback.
+    Once the list is used up everything replies SEND_OK.
     """
 
     def __init__(self, queues: List[MessageQueue], outcomes: Optional[list] = None,
@@ -112,25 +123,27 @@ class _FakeAsyncClient:
         self.publish.msg_queue_list = list(queues)
         self.outcomes = list(outcomes or [])
         self.no_route = no_route
-        # MQClientInstance 真有这个字段，validateNameServerSetting（拿不到路由时判断
-        # 是"压根没配 name server"还是"这个 topic 没路由"）读的就是它。
+        # MQClientInstance really has this field, and it is what validateNameServerSetting
+        # reads (to tell "no name server configured at all" from "this topic has no route" when the
+        # route cannot be obtained).
         self.name_server_addrs = (["127.0.0.1:9876"] if namesrv_addrs is None
                                   else list(namesrv_addrs))
         self.block = block
-        # 发布地址**平表**：brokerName -> master 地址。
-        # 冷名单里的 broker 就是「没主」，压根不进表 —— 发布地址表查不到。
+        # The publish address **flat table**: brokerName -> master address.
+        # A broker on the cold list has "no master" and never enters the table at all -- so the
+        # publish address table cannot find it.
         self.publish_addr_table = {"broker-a": ADDR_A, "broker-b": ADDR_B}
         for name in cold_brokers:
             self.publish_addr_table.pop(name, None)
-        # get_topic_route_data 的返回值（定点发送链里那次按 topic 刷路由用）
+        # the return value of get_topic_route_data (used by the topic-based route refresh of the pinned send chain)
         self.route = route
         self.attempts: List[tuple] = []   # (addr, broker_name, opaque, timeout)
-        self.built: List[int] = []        # build_send_request 收到的 mq 个数（用于计数）
-        self.build_threads: List[str] = []   # 建请求时所在的线程名
-        self.sleep_ms = 0                 # 每次尝试耗时，用来验证"共享超时预算"
+        self.built: List[int] = []        # the number of mqs build_send_request received (used for counting)
+        self.build_threads: List[str] = []   # the name of the thread that built the request
+        self.sleep_ms = 0                 # the cost of each attempt, used to verify the "shared timeout budget"
         self.lock = threading.Lock()
 
-    # --- 生产者异步链会碰到的 MQClientInstance 接口 ---
+    # --- the MQClientInstance interfaces the producer asynchronous chain touches ---
     def register_topic_in_use(self, topic):
         pass
 
@@ -145,10 +158,13 @@ class _FakeAsyncClient:
         return self.publish_addr_table.get(broker_name)
 
     def publish_addr_for(self, broker_name, topic):
-        """与真身同一形状：查（只认主）→ 按 topic 刷一次路由 → 重查 → 报 not exist。
+        """The same shape as the real thing: look it up (master only) -> refresh the route
+        once by topic -> look it up again -> report not exist.
 
-        替身必须**照抄**这一步而不能简化：``test_pinned_send_refreshes_the_route_...``
-        测的就是「刷完路由地址才出现」，替身把两步塌成一步那条用例就失去意义了。
+        The double must **copy verbatim** this step instead of simplifying it:
+        ``test_pinned_send_refreshes_the_route_...`` tests exactly "the address only shows up
+        after the route was refreshed", so collapsing the two steps into one would make that test
+        case meaningless.
         """
         addr = self.find_broker_address_in_publish(broker_name)
         if not addr:
@@ -159,10 +175,11 @@ class _FakeAsyncClient:
         return addr
 
     def update_topic_route_info_from_name_server(self, topic, is_default=False):
-        """按 topic 刷一次路由：把 route 里**有主**的 broker 覆盖进发布地址平表。
+        """Refresh the route once by topic: overwrite the brokers of the route that **have a
+        master** into the publish address flat table.
 
-        真身这一步写的就是平表 ``broker_addr_table``；没主的 broker 不写，等于刷完仍
-        查不到。
+        This step of the real thing writes exactly the flat table ``broker_addr_table``; a broker
+        without a master is not written, which means it is still not found after the refresh.
         """
         for broker_data in (getattr(self.route, "broker_datas", None) or []):
             if broker_data.broker_addrs.get(0):
@@ -175,7 +192,8 @@ class _FakeAsyncClient:
                            default_topic=None, default_topic_queue_nums=None):
         with self.lock:
             self.built.append(mq.broker_name)
-            # 建请求发生在 AsyncSenderExecutor 线程上 —— 顺手记下线程名供断言用
+            # Building the request happens on the AsyncSenderExecutor thread -- record the thread name along the
+            # way for the assertions
             self.build_threads.append(threading.current_thread().name)
         return RemotingCommand.create_request_command(RequestCode.SEND_MESSAGE_V2, None)
 
@@ -199,7 +217,7 @@ class _FakeAsyncClient:
     def shutdown(self):
         pass
 
-    # --- 断言用 ---
+    # --- for the assertions ---
     @property
     def attempts_count(self) -> int:
         return len(self.attempts)
@@ -218,7 +236,7 @@ class _FakeAsyncClient:
 
 
 class _RecordingHook:
-    """SendMessageHook 替身：记录 before/after 各跑了几次、after 带了什么。"""
+    """A SendMessageHook double: it records how many times before/after ran and what after carried."""
 
     def __init__(self):
         self.before: List[SendMessageContext] = []
@@ -242,7 +260,8 @@ def _producer(queues=None, outcomes=None, async_retry=2, no_route=False,
     p.set_retry_times_when_send_failed(2)
     p.retry_times_when_send_async_failed = async_retry
     p.async_sender_queue_capacity = queue_capacity
-    # start() 会建真实客户端，这里只补齐异步链需要的三样：started 标记 + 两个池
+    # start() creates a real client; here only the three things the asynchronous chain needs are added:
+    # the started flag plus the two pools
     p._create_async_executors()
     p._mq_client = _FakeAsyncClient(
         [_mq("broker-a", 0), _mq("broker-b", 1)] if queues is None else list(queues),
@@ -256,12 +275,12 @@ def _client(p: DefaultMQProducer) -> _FakeAsyncClient:
 
 
 def _thread_names(pool: ConsumeExecutor) -> List[str]:
-    """池子里当前 worker 的线程名（``ThreadFactoryImpl`` 的产物）。"""
+    """The thread name of the current worker in the pool (a product of ``ThreadFactoryImpl``)."""
     return [t.name for t in pool._threads]
 
 
 def _wait_done(cb: _Callback, timeout: float = 5.0) -> None:
-    assert cb.done.wait(timeout), "异步回调没有触发"
+    assert cb.done.wait(timeout), "the asynchronous callback never fired"
 
 
 def _wait_attempts(client: _FakeAsyncClient, n: int, timeout: float = 5.0) -> None:
@@ -271,23 +290,24 @@ def _wait_attempts(client: _FakeAsyncClient, n: int, timeout: float = 5.0) -> No
 
 
 def _wait_num_permits(p: DefaultMQProducer, want: int, timeout: float = 5.0) -> None:
-    """条数许可是回调线程里归还的：队列里那些没人等回调的笔得轮询到有界超时为止。"""
+    """The count permits are returned inside the callback thread: for the queued entries whose callbacks nobody
+    waits for, it has to poll up to a bounded timeout."""
     deadline = time.monotonic() + timeout
     while p.get_semaphore_async_send_num_available_permits() != want and time.monotonic() < deadline:
         time.sleep(0.005)
-    assert p.get_semaphore_async_send_num_available_permits() == want, "条数许可没还齐"
+    assert p.get_semaphore_async_send_num_available_permits() == want, "the count permits were not all returned"
 
 
-# ---------------------------------------------------------------- 调用方不阻塞
+# ---------------------------------------------------------------- the caller is not blocked
 def test_send_async_returns_before_the_request_is_issued():
-    """任务只是 submit 到 asyncSenderExecutor，调用方立刻返回。"""
+    """The task is merely submitted to the asyncSenderExecutor and the caller returns immediately."""
     gate = threading.Event()
     p = _producer(block=gate)
     cb = _Callback()
     t0 = time.monotonic()
     p.send_async(Message("TopicTest", b"x"), cb, 3000)
     elapsed_ms = int((time.monotonic() - t0) * 1000)
-    assert elapsed_ms < 500, "send_async 阻塞了调用方 %dms" % elapsed_ms
+    assert elapsed_ms < 500, "send_async blocked the caller for %dms" % elapsed_ms
     assert not cb.done.is_set()
     gate.set()
     _wait_done(cb)
@@ -314,13 +334,13 @@ def test_send_work_happens_off_the_caller_thread():
             break
         time.sleep(0.005)
     assert "result" in seen, seen
-    # worker 线程名形如 AsyncSenderExecutor_1 / NettyClientPublicExecutor_1
+    # the worker thread names look like AsyncSenderExecutor_1 / NettyClientPublicExecutor_1
     assert seen["callback_thread"].startswith("NettyClientPublicExecutor_")
     assert seen["callback_thread"] != caller
     assert _client(p).attempts_count == 1
 
 
-# ---------------------------------------------------------------- 成功路径
+# ---------------------------------------------------------------- the success path
 def test_async_success_callback_and_hook_after():
     p = _producer()
     hook = _RecordingHook()
@@ -331,14 +351,14 @@ def test_async_success_callback_and_hook_after():
     assert len(cb.results) == 1 and cb.results[0].send_status == SendStatus.SEND_OK
     assert not cb.errors
     assert len(hook.before) == 1 and len(hook.after) == 1
-    # ASYNC 分支的钩子上下文：communicationMode 要标成 ASYNC
+    # the hook context of the ASYNC branch: communicationMode has to be marked ASYNC
     assert hook.before[0].communication_mode == CommunicationMode.ASYNC
     assert hook.after[0].send_result is cb.results[0]
     assert hook.after[0].exception is None
 
 
 def test_user_callback_exception_does_not_kill_the_pool():
-    """onSuccess/onException 外面包着兜底 catch：回调异常不能带走 worker。"""
+    """A catch-all wraps onSuccess/onException: an exception in the callback must not take the worker down."""
     p = _producer()
     first = _Callback(raise_error=True)
     p.send_async(Message("TopicTest", b"x"), first, 3000)
@@ -353,9 +373,9 @@ def test_user_callback_exception_does_not_kill_the_pool():
     assert second.results
 
 
-# ---------------------------------------------------------------- 排队与耗时
+# ---------------------------------------------------------------- queueing and elapsed time
 def test_zero_timeout_fails_without_sending_anything():
-    """异步任务出队执行的 runnable：timeout <= costTime 直接 onException。"""
+    """The runnable that an asynchronous task executes once it leaves the queue: timeout <= costTime goes straight to onException."""
     p = _producer()
     cb = _Callback()
     p.send_async(Message("TopicTest", b"x"), cb, 0)
@@ -366,10 +386,12 @@ def test_zero_timeout_fails_without_sending_anything():
 
 
 def test_bounded_queue_rejects_the_caller_not_the_callback():
-    """executor 拒收任务时直接把 ``MQClientException("executor rejected")`` 抛给调用方。
+    """When the executor rejects the task it throws ``MQClientException("executor rejected")``
+    straight to the caller.
 
-    这里把池压成 1 个 worker + 1 个队列位（真实池是 CPU 核数 + 50000），
-    好让"占住 worker → 填满队列 → 第三个被拒"这条链跑得快且确定。
+    Here the pool is squeezed to 1 worker + 1 queue slot (the real pool is the number of CPU cores +
+    50000), so that the chain "occupy the worker -> fill the queue -> the third one is rejected"
+    runs fast and deterministically.
     """
     gate = threading.Event()
     p = _producer(block=gate)
@@ -378,9 +400,9 @@ def test_bounded_queue_rejects_the_caller_not_the_callback():
                                               thread_index_from=1)
     running = _Callback()
     p.send_async(Message("TopicTest", b"1"), running, 3000)
-    _wait_attempts(_client(p), 1)          # 第一个任务已占住唯一的 worker
+    _wait_attempts(_client(p), 1)          # the first task has occupied the only worker
     queued = _Callback()
-    p.send_async(Message("TopicTest", b"2"), queued, 3000)   # 进队列
+    p.send_async(Message("TopicTest", b"2"), queued, 3000)   # goes into the queue
     for _ in range(200):
         if p._async_sender_executor.queued_count() == 1:
             break
@@ -400,10 +422,11 @@ def test_not_started_producer_raises_synchronously():
         p.send_async(Message("TopicTest", b"x"), _Callback(), 3000)
 
 
-# ---------------------------------------------------------------- 换 broker 重试
+# ---------------------------------------------------------------- switching broker on retry
 def test_connect_failure_retries_with_new_opaque_and_shrinking_budget():
-    """失败重试链：times<=retryTimesWhenSendAsyncFailed 才重试，
-    每轮换 broker、换 opaque、复用同一个请求，超时用共享的剩余预算。"""
+    """The failure retry chain: a retry happens only while times<=retryTimesWhenSendAsyncFailed,
+    every round switches broker and opaque and reuses the same request, and the timeout uses the
+    shared remaining budget."""
     outcomes = [RemotingConnectException(ADDR_A), RemotingConnectException(ADDR_B),
                 RemotingConnectException(ADDR_A)]
     p = _producer(outcomes=outcomes, async_retry=2)
@@ -411,15 +434,16 @@ def test_connect_failure_retries_with_new_opaque_and_shrinking_budget():
     p.send_async(Message("TopicTest", b"x"), cb, 3000)
     _wait_done(cb)
     client = _client(p)
-    assert client.attempts_count == 3          # 1 次原始 + 2 次重试
-    assert len(client.built) == 1              # 请求只建一次，跨重试复用
-    assert len(set(client.opques)) == 3        # 每次尝试一个新 opaque
-    assert client.brokers[0] != client.brokers[1]   # 避开刚失败的那台
+    assert client.attempts_count == 3          # 1 original + 2 retries
+    assert len(client.built) == 1              # the request is built only once and reused across retries
+    assert len(set(client.opques)) == 3        # every attempt takes a new opaque
+    assert client.brokers[0] != client.brokers[1]   # it avoids the machine that just failed
     assert client.timeouts[1] <= client.timeouts[0]
     assert len(cb.results) == 0 and len(cb.errors) == 1
-    # remoting 调用**就地抛异常**这条路：异常原样交给回调（不包 MQClientException），
-    # 并且 needRetry=true。包装成 "send request failed"/"unknown reason" 的是
-    # 回调投递失败那条路（见下面两个用例）。
+    # The path where the remoting call **raises the exception in place**: the exception goes to the
+    # callback unchanged (not wrapped in an MQClientException) and needRetry=true. What gets wrapped
+    # into "send request failed"/"unknown reason" is the path where the callback delivery fails (see
+    # the two test cases below).
     assert isinstance(cb.errors[0], RemotingConnectException)
 
 
@@ -429,16 +453,17 @@ def test_retry_cap_zero_disables_failover():
     cb = _Callback()
     p.send_async(Message("TopicTest", b"x"), cb, 3000)
     _wait_done(cb)
-    # 上限 0 次重试：只发一次就回调
+    # An upper bound of 0 retries: it sends once and then calls back
     assert _client(p).attempts_count == 1
     assert "wait response timeout" in str(cb.errors[0])
 
 
 def test_broker_error_code_is_returned_as_is_without_retry():
-    """⚠ 与同步发送不同：响应已收到 → needRetry=false，异常也**不包装**。
+    """CAUTION, different from synchronous sending: once the response is received
+    needRetry=false, and the exception is **not wrapped** either.
 
-    正常收响应那条路上 ``processSendResponse`` 抛的 ``MQBrokerException`` 会进
-    ``catch (Exception e)`` → 按 ``needRetry=false`` 交给失败回调。
+    On the normal response path the ``MQBrokerException`` thrown by ``processSendResponse`` falls
+    into ``catch (Exception e)`` -> with ``needRetry=false`` it is handed to the failure callback.
     """
     broker_error = MQBrokerException(ResponseCode.SYSTEM_BUSY, "broker busy")
     p = _producer(outcomes=[_Deliver(error=broker_error)], async_retry=2)
@@ -450,7 +475,7 @@ def test_broker_error_code_is_returned_as_is_without_retry():
 
 
 def test_retry_cap_is_read_from_config():
-    """retry_times_when_send_async_failed 过去只是个存下来没人读的字段。"""
+    """retry_times_when_send_async_failed used to be a field that was stored but never read."""
     p = _producer(outcomes=[RemotingConnectException(ADDR_A)] * 5, async_retry=4)
     cb = _Callback()
     p.send_async(Message("TopicTest", b"x"), cb, 3000)
@@ -459,8 +484,8 @@ def test_retry_cap_is_read_from_config():
 
 
 def test_retry_budget_is_shared_not_per_attempt():
-    """重试传的是 ``timeoutMillis - cost``：预算**共享**，
-    第二次尝试拿到的超时是剩下的那一点，而不是又一个完整 timeout。"""
+    """What the retry gets is ``timeoutMillis - cost``: the budget is **shared**, so the second
+    attempt receives only the little that is left rather than yet another full timeout."""
     p = _producer(outcomes=[RemotingConnectException(ADDR_A),
                             RemotingConnectException(ADDR_B)], async_retry=2)
     _client(p).sleep_ms = 60
@@ -468,14 +493,14 @@ def test_retry_budget_is_shared_not_per_attempt():
     p.send_async(Message("TopicTest", b"x"), cb, 100)
     _wait_done(cb)
     client = _client(p)
-    assert client.attempts_count == 2          # 第二轮就把预算花光了
+    assert client.attempts_count == 2          # the second round already used up the budget
     assert client.timeouts[0] == 100
     assert 0 < client.timeouts[1] < client.timeouts[0]
     assert isinstance(cb.errors[0], RemotingConnectException)
 
 
 def test_operation_fail_errors_are_wrapped_by_type():
-    """失败包装的三分支：按异常类型包装文案，TooMuchRequest 不重试。"""
+    """The three branches of the failure wrapping: the wording follows the exception type, and TooMuchRequest is not retried."""
     cases = [
         (RemotingSendRequestException(ADDR_A, "io fail"), "send request failed", True),
         (RemotingTimeoutException(ADDR_A, 3000), "wait response timeout", True),
@@ -495,9 +520,9 @@ def test_operation_fail_errors_are_wrapped_by_type():
         assert client.attempts_count == expected, (type(error).__name__, client.attempts)
 
 
-# ---------------------------------------------------------------- 定点发送
+# ---------------------------------------------------------------- pinned send
 def test_fixed_mq_retry_stays_on_the_same_broker():
-    """定点发送下传的 topicPublishInfo 是 null → 原地重试。"""
+    """The topicPublishInfo passed down by a pinned send is null -> it retries in place."""
     p = _producer(queues=[_mq("broker-a", 0)],
                   outcomes=[RemotingConnectException(ADDR_A),
                             RemotingConnectException(ADDR_A)], async_retry=2)
@@ -532,10 +557,12 @@ def test_fixed_mq_runs_check_forbidden_hook_in_async_mode():
 
 
 def test_pinned_send_refreshes_the_route_to_resolve_the_address():
-    """发布地址表查不到时按 topic 刷一次路由再解析。
+    """When the publish address table does not find it, refresh the route once by topic and resolve
+    again.
 
-    定点发送（调用方直接给 mq）不会在发送主流程里取发布信息，所以这一步是它
-    唯一的路由来源 —— 少了这一步，第一次定点发送必然带着空地址去连。
+    A pinned send (the caller supplies the mq directly) does not fetch the publish info in the main
+    send path, so this step is its only source of the route -- without it the very first pinned send
+    would inevitably connect with an empty address.
     """
     route = TopicRouteData()
     route.broker_datas = [BrokerData("DefaultCluster", "broker-cold", {0: ADDR_COLD})]
@@ -545,11 +572,11 @@ def test_pinned_send_refreshes_the_route_to_resolve_the_address():
     _wait_done(cb)
     client = _client(p)
     assert [a for a, _, _, _ in client.attempts] == [ADDR_COLD]
-    assert cb.results, "解析到地址后这一笔要发出去"
+    assert cb.results, "once the address is resolved this entry must go out"
 
 
 def test_unresolvable_broker_reports_not_exist_through_callback():
-    """刷完路由还是没有这台 broker：回调里要收到 "The broker[..] not exist"。"""
+    """Still no such broker after the route refresh: the callback has to receive "The broker[..] not exist"."""
     p = _producer(cold_brokers=["broker-cold"], route=TopicRouteData())
     cb = _Callback()
     p.send_async(Message("TopicTest", b"x"), cb, 3000, _mq("broker-cold", 0))
@@ -560,10 +587,11 @@ def test_unresolvable_broker_reports_not_exist_through_callback():
 
 
 def test_async_kernel_timeout_gate_fails_before_the_request_goes_out():
-    """ASYNC 分支自己的发送内核总闸。
+    """The master gate of the send kernel of the ASYNC branch.
 
-    钩子/压缩/路由都是这条链的耗时，预算被它们吃光时不再发起请求，回调拿到
-    ``RemotingTooMuchRequestException("sendKernelImpl call timeout")`` 且**不重试**。
+    Hooks / compression / routing are all part of the cost of this chain; when the budget is eaten up
+    by them no request is started, the callback receives
+    ``RemotingTooMuchRequestException("sendKernelImpl call timeout")`` and it is **not retried**.
     """
     hook = _RecordingHook()
 
@@ -582,10 +610,10 @@ def test_async_kernel_timeout_gate_fails_before_the_request_goes_out():
     cb = _Callback()
     p.send_async(Message("TopicTest", b"x"), cb, 50, _mq("broker-a", 0))
     _wait_done(cb)
-    assert _client(p).attempts_count == 0, "预算用尽后不能再发请求"
+    assert _client(p).attempts_count == 0, "no request may be sent once the budget is exhausted"
     assert isinstance(cb.errors[0], RemotingTooMuchRequestException)
     assert "sendKernelImpl call timeout" in str(cb.errors[0])
-    # 这条链的 catch 先跑 hook.after 再抛，所以 after 一定拿到这个异常
+    # the catch of this chain runs hook.after before rethrowing, so after definitely gets this exception
     assert len(hook.after) == 1
     assert isinstance(hook.after[0].exception, RemotingTooMuchRequestException)
 
@@ -609,7 +637,7 @@ def test_check_forbidden_rejection_reaches_the_callback():
     assert "forbidden by hook" in str(cb.errors[0])
 
 
-# ---------------------------------------------------------------- 路由与批量
+# ---------------------------------------------------------------- routing and batching
 def test_missing_route_reports_not_found_topic_through_callback():
     p = _producer(outcomes=[], no_route=True, queues=[])
     cb = _Callback()
@@ -621,11 +649,13 @@ def test_missing_route_reports_not_found_topic_through_callback():
 
 
 def test_no_name_server_address_reaches_the_callback_as_10004():
-    """异步链的定性不能和同步链分叉：没有 name server 地址时回调里拿到的也得是 10004。
+    """The behaviour of the asynchronous chain must not diverge from the synchronous one: with no name
+    server address the callback has to get 10004 too.
 
-    异步链与同步链走的是同一个 no-route 分支（先 validateNameServerSetting
-    再抛 no-route），所以两条链共用同一个判定；异步侧以前把异常包成新的 MQClientException
-    时丢了码，10004 会被改写成 10005。
+    The asynchronous and synchronous chains take the same no-route branch (validateNameServerSetting
+    first, then throw no-route), so both chains share the same decision; the asynchronous side used to
+    wrap the exception into a new MQClientException and lose the code in the process, rewriting 10004
+    into 10005.
     """
     p = _producer(outcomes=[], no_route=True, queues=[], namesrv_addrs=[])
     cb = _Callback()
@@ -638,7 +668,7 @@ def test_no_name_server_address_reaches_the_callback_as_10004():
 
 
 def test_batch_messages_fall_back_to_the_sync_batch_kernel():
-    """批量发送只有同步内核是有意设计：不阻塞调用方、回调照样触发。"""
+    """A batch send only has a synchronous kernel, which is a deliberate design: it does not block the caller and the callback still fires."""
     p = _producer()
     calls = []
 
@@ -655,12 +685,13 @@ def test_batch_messages_fall_back_to_the_sync_batch_kernel():
 
 
 def test_send_batch_writes_client_ids_before_encoding_the_body():
-    """批量发送必须遵守的**顺序**：逐条 checkMessage →
-    逐条 setUniqID → 逐条拼命名空间 → 给批量本身 setUniqID → 才 encode()。
+    """The **order** a batch send must follow: checkMessage per entry -> setUniqID per entry ->
+    build the namespace per entry -> setUniqID for the batch itself -> only then encode().
 
-    顺序错或干脆不写会让批量 body 里的每条子消息都没有 UNIQ_KEY：
-    消费端拿到没有客户端 ID 的消息、轨迹控制台串不起发送侧与消费侧，而 SendResult.msgId
-    只能退化成 broker 的 offsetMsgId —— 单看「发成功了没」完全看不出来。
+    Getting the order wrong, or not writing them at all, leaves every sub-message in the batch body
+    without a UNIQ_KEY: the consumer gets messages without a client id, the trace console cannot
+    connect the producer side with the consumer side, and SendResult.msgId can only degrade to the
+    broker's offsetMsgId -- looking only at "did the send succeed" reveals nothing of this.
     """
     p = _producer()
     p.namespace = "BatchNs"
@@ -676,38 +707,42 @@ def test_send_batch_writes_client_ids_before_encoding_the_body():
     msgs = [Message("TopicTest", b"one"), Message("TopicTest", b"two")]
     result = p._send_batch(msgs)
     assert result.send_status == SendStatus.SEND_OK
-    assert len(sent) == 1, "一批一个请求"
+    assert len(sent) == 1, "one batch is one request"
     batch = sent[0]
-    # ① 每条子消息各有自己的 UNIQ_KEY，批量本身也有（broker 判 inner-batch 用得到）
+    # (1) every sub-message has its own UNIQ_KEY, and so does the batch itself (the broker needs it to decide
+    # inner-batch)
     sub_ids = [m.get_property(UNIQ) for m in batch.messages]
     assert all(sub_ids) and len(set(sub_ids)) == len(sub_ids), sub_ids
     assert get_uniq_id(batch) and get_uniq_id(batch) not in sub_ids
-    # ② 编码在写 ID **之后**：解出来的每条子消息都带着自己的 UNIQ_KEY。
-    #    （批量 body 是 6 段轻量格式，不带 topic，所以 ID 是唯一能证明顺序的证据。）
+    # (2) the encoding happens **after** the IDs are written: every sub-message that is decoded carries its own UNIQ_KEY.
+    #    (The batch body is the 6-segment lightweight format and carries no topic, so the ID is the only evidence of the order.)
     inner = decode_batch_messages(batch.get_body())
     assert [m.get_property(UNIQ) for m in inner] == sub_ids
     assert [m.topic for m in batch.messages] == [p._with_namespace("TopicTest")] * 2
-    # ③ 回调里的 msgId 是**批量自身**的 UNIQ_KEY（非 inner-batch 时本端口解析层
-    #    拿不到子消息列表，无法逐条拼 ID，理由见 _parse_send_response 的注释）
+    # (3) the msgId in the callback is the UNIQ_KEY of the **batch itself** (for a non inner-batch the
+    #    parsing layer of this port cannot get the list of sub-messages and therefore cannot assemble
+    #    the IDs one by one; see the comment in _parse_send_response for the reason)
     response = RemotingCommand.create_response_command_with_header(ResponseCode.SUCCESS)
     response.ext_fields = {"msgId": "0" * 32, "queueId": "0", "queueOffset": "0"}
     parsed = MQClientInstance._parse_send_response(None, response, batch, _mq("broker-a", 0))
     assert parsed.msg_id == get_uniq_id(batch)
-    assert parsed.msg_id != "0" * 32, "不能退化成 broker 的 offsetMsgId"
+    assert parsed.msg_id != "0" * 32, "it must not degrade into the broker's offsetMsgId"
     assert "," not in parsed.msg_id
-    # broker 回了 batchUniqId（inner-batch）时同样用它
+    # the same one is used when the broker replied with a batchUniqId (inner-batch)
     response.ext_fields = {"msgId": "0" * 32, "queueId": "0", "queueOffset": "0",
                            "batchUniqId": get_uniq_id(batch)}
     parsed = MQClientInstance._parse_send_response(None, response, batch, _mq("broker-a", 0))
     assert parsed.msg_id == get_uniq_id(batch)
 
 
-# ---------------------------------------------------------------- 线程名 / 生命周期
+# ---------------------------------------------------------------- thread names / lifecycle
 def test_executor_thread_names_use_the_numbered_prefix(monkeypatch):
-    """worker 线程名形如 ``AsyncSenderExecutor_1``，序号从 **1** 开始。
+    """The worker thread name looks like ``AsyncSenderExecutor_1``, and the number starts at **1**.
 
-    这里把 ``cpu_count`` 钉成 1：池是 core==max==核数，单核下两次投递才复用同一个 worker。
-    多核机器上不会复用 —— 那是池按 core 逐步建线程的真实行为，见
+    Here ``cpu_count`` is pinned to 1: the pool is core==max==number of cores, and only on a single
+    core do two submissions reuse the same worker.
+    On a multi-core machine they are not reused -- that is the real behaviour of the pool creating
+    threads step by step up to core, see
     ``test_workers_grow_one_thread_per_submit_until_core``。
     """
     monkeypatch.setattr(producer_module.os, "cpu_count", lambda: 1)
@@ -722,17 +757,19 @@ def test_executor_thread_names_use_the_numbered_prefix(monkeypatch):
     cb2 = _Callback()
     p.send_async(Message("TopicTest", b"y"), cb2, 3000)
     _wait_done(cb2)
-    # core == max == 1 且没排队：复用同一个 worker，不会像原先那样一次发送一个线程
+    # core == max == 1 with nothing queued: the same worker is reused, instead of one thread per send as before
     assert _client(p).build_threads == ["AsyncSenderExecutor_1", "AsyncSenderExecutor_1"]
     assert cb2.threads == ["NettyClientPublicExecutor_1"]
 
 
 def test_workers_grow_one_thread_per_submit_until_core(monkeypatch):
-    """core==max==4：池未达 core（``poolSize < corePoolSize``）时**每个任务
-    新建一条线程**（哪怕别的 worker 正闲着），序号从 1 递增；到了 core 才不再建。
+    """core==max==4: while the pool has not reached core (``poolSize < corePoolSize``) **every
+    task creates a new thread** (even when another worker is idle), with the number incrementing
+    from 1; once core is reached it stops creating.
 
-    断的是"建了几条、叫什么"，不是"任务落在哪条上"：``notify`` 叫醒的是先在等待的那个
-    worker，所以任务归属本身是竞态的。
+    What it pins down is "how many threads were created and what they are called", not "which
+    thread a task lands on": ``notify`` wakes whichever worker has been waiting first, so the task
+    ownership is itself racy.
     """
     monkeypatch.setattr(producer_module.os, "cpu_count", lambda: 4)
     p = _producer()
@@ -748,7 +785,7 @@ def test_workers_grow_one_thread_per_submit_until_core(monkeypatch):
     cb5 = _Callback()
     p.send_async(Message("TopicTest", b"m5"), cb5, 3000)
     _wait_done(cb5)
-    # 到 core 之后不再新建线程，任务从队列里被已有 worker 取走
+    # once core is reached no more threads are created and a task is taken from the queue by an existing worker
     assert p._async_sender_executor.worker_count() == 4
     assert p._callback_executor.worker_count() == 4
     assert _thread_names(p._async_sender_executor) == [
@@ -766,7 +803,7 @@ def test_shutdown_stops_accepting_new_work():
 
 
 def test_callback_survives_after_callback_pool_is_gone():
-    """回调投递：池不可用（关了/被拒）就 **runInThisThread**，回调不能丢。"""
+    """Callback delivery: when the pool is unavailable (shut down / rejected) it does **runInThisThread**, the callback must not get lost."""
     p = _producer()
     pool = p._callback_executor
     pool.shutdown(wait=True)
@@ -777,13 +814,14 @@ def test_callback_survives_after_callback_pool_is_gone():
     assert cb.threads and not cb.threads[0].startswith("NettyClientPublicExecutor_")
 
 
-# ---------------------------------------------------------------- 异步发送背压
-# 异步发送有两道闸：条数闸与字节闸，许可在回调里归还。默认关闭，所以上面那批用例一行都不用改。
-# 字节闸的地板值是 1M，所以这里只能拿"1M 少掉多少"来断言，
-# 不能把上限配成几百字节 —— 那会被夹回 1M。
+# ---------------------------------------------------------------- asynchronous send back pressure
+# Asynchronous sending has two gates: a count gate and a byte gate, and the permits are returned in
+# the callback. It is off by default, so none of the test cases above had to be changed.
+# The floor value of the byte gate is 1M, so here the assertion can only be phrased as "how much less than
+# 1M"; the upper limit cannot be configured to a few hundred bytes -- that would be clamped back to 1M.
 def _backpressure_producer(num: int = 10, size: int = MIN_ASYNC_SEND_SIZE,
                            **kwargs) -> DefaultMQProducer:
-    """开背压的生产者。字节闸夹到地板值 1M：够用，又能把「扣了多少字节」算清楚。"""
+    """A producer with back pressure on. The byte gate is clamped to the floor value 1M: enough to work with, and it makes "how many bytes were deducted" calculable."""
     p = _producer(**kwargs)
     p.set_enable_backpressure_for_async_mode(True)
     p.set_back_pressure_for_async_send_num(num)
@@ -792,14 +830,14 @@ def _backpressure_producer(num: int = 10, size: int = MIN_ASYNC_SEND_SIZE,
 
 
 def test_backpressure_defaults_are_effectively_open():
-    """背压默认关，条数 1024 / 字节 100M。"""
+    """Back pressure is off by default: 1024 entries / 100M bytes."""
     p = DefaultMQProducer("GID_async_test")
     assert p.is_enable_backpressure_for_async_mode() is False
     assert p.get_back_pressure_for_async_send_num() == 1024
     assert p.get_back_pressure_for_async_send_size() == 100 * 1024 * 1024
     assert p.get_semaphore_async_send_num_available_permits() == 1024
     assert p.get_semaphore_async_send_size_available_permits() == 100 * 1024 * 1024
-    # 关着的时候一笔发送既不扣也不还许可
+    # while it is off a send neither deducts nor returns any permit
     p._create_async_executors()
     p._mq_client = _FakeAsyncClient([_mq("broker-a", 0)], None, False, None, None, ())
     p._started = True
@@ -811,7 +849,7 @@ def test_backpressure_defaults_are_effectively_open():
 
 
 def test_backpressure_num_floor_is_ten_and_size_floor_is_one_meg():
-    """条数地板 10、字节地板 1M —— 两个下限都夹得住。"""
+    """A count floor of 10 and a byte floor of 1M -- both lower bounds hold."""
     p = DefaultMQProducer("GID_async_test")
     p.set_back_pressure_for_async_send_num(1)
     p.set_back_pressure_for_async_send_size(1024)
@@ -822,10 +860,10 @@ def test_backpressure_num_floor_is_ten_and_size_floor_is_one_meg():
 
 
 def test_num_gate_fails_with_the_protocol_message_and_sends_nothing():
-    """条数拿不到就回调，一次请求都不发（预算也被闸自己花光）。"""
+    """When the count permit cannot be obtained it calls back and sends not a single request (the gate itself eats up the budget)."""
     gate = threading.Event()
     p = _backpressure_producer(num=10, block=gate)
-    assert p._semaphore_async_send_num.try_acquire(10, 0) is True   # 占满在途
+    assert p._semaphore_async_send_num.try_acquire(10, 0) is True   # occupies all the in-flight permits
     began = time.monotonic()
     cb = _Callback()
     p.send_async(Message("TopicTest", b"x"), cb, 300)
@@ -833,14 +871,14 @@ def test_num_gate_fails_with_the_protocol_message_and_sends_nothing():
     assert isinstance(cb.errors[0], RemotingTooMuchRequestException)
     assert str(cb.errors[0]).endswith("send message tryAcquire semaphoreAsyncNum timeout")
     assert _client(p).attempts_count == 0
-    assert int((time.monotonic() - began) * 1000) >= 250, "没等到超时就把失败交出去了"
+    assert int((time.monotonic() - began) * 1000) >= 250, "it handed over the failure without waiting for the timeout"
     assert p.get_semaphore_async_send_size_available_permits() == MIN_ASYNC_SEND_SIZE
     p._semaphore_async_send_num.release(10)
     gate.set()
 
 
 def test_size_gate_fails_with_its_own_message_and_gives_the_num_permit_back():
-    """字节闸没过时，**已经拿到**的条数许可必须归还。"""
+    """When the byte gate does not pass, the count permits that were **already acquired** must be returned."""
     p = _backpressure_producer(num=10)
     assert p._semaphore_async_send_size.try_acquire(MIN_ASYNC_SEND_SIZE, 0) is True
     cb = _Callback()
@@ -848,13 +886,13 @@ def test_size_gate_fails_with_its_own_message_and_gives_the_num_permit_back():
     _wait_done(cb)
     assert isinstance(cb.errors[0], RemotingTooMuchRequestException)
     assert "send message tryAcquire semaphoreAsyncSize timeout" in str(cb.errors[0])
-    assert p.get_semaphore_async_send_num_available_permits() == 10, "条数许可漏还了"
+    assert p.get_semaphore_async_send_num_available_permits() == 10, "some count permits were leaked"
     assert _client(p).attempts_count == 0
     p._semaphore_async_send_size.release(MIN_ASYNC_SEND_SIZE)
 
 
 def test_permits_are_borrowed_per_in_flight_send_and_given_back():
-    """一条在途发送 = 1 个条数许可 + body.length 个字节许可；回调后两者都回来。"""
+    """One in-flight send = 1 count permit + body.length byte permits; after the callback both come back."""
     gate = threading.Event()
     p = _backpressure_producer(num=10, block=gate)
     cb = _Callback()
@@ -874,7 +912,7 @@ def test_null_or_empty_body_still_costs_one_size_permit():
     no_body = Message("T", b"x")
     no_body.body = None
     assert producer_module._back_pressure_msg_len(no_body) == 1
-    # 批量按每条累加，其中空 body 那条同样算 1
+    # A batch accumulates per entry, and the entry with an empty body still counts as 1
     assert producer_module._back_pressure_msg_len(
         [Message("T", b"a" * 3), Message("T", b"")]) == 4
 
@@ -893,7 +931,7 @@ def test_failure_also_gives_the_permits_back():
 
 
 def test_retry_chain_releases_once_not_once_per_attempt():
-    """重试链上只有一份许可（一次发送一笔），终点归还一次；还多次会把容量虚增。"""
+    """There is only one permit on the retry chain (one send is one entry) and it is returned once at the end; returning it more often inflates the capacity."""
     p = _backpressure_producer(
         num=10, outcomes=[_Deliver(error=RemotingTimeoutException(ADDR_A, 1)),
                           _Deliver(error=RemotingTimeoutException(ADDR_B, 1)),
@@ -901,13 +939,13 @@ def test_retry_chain_releases_once_not_once_per_attempt():
     cb = _Callback()
     p.send_async(Message("TopicTest", b"x" * 300), cb, 3000)
     _wait_done(cb)
-    assert _client(p).attempts_count == 3, "这条链本应重试两轮后终止"
+    assert _client(p).attempts_count == 3, "this chain should have terminated after two retries"
     assert p.get_semaphore_async_send_num_available_permits() == 10
     assert p.get_semaphore_async_send_size_available_permits() == MIN_ASYNC_SEND_SIZE
 
 
 def test_gate_waits_for_a_permit_instead_of_failing_early():
-    """信号量是**等**到超时为止，不是看一眼不够就报错 —— 这才是背压限流的意义。"""
+    """The semaphore **waits** until the timeout instead of reporting an error as soon as it sees there are not enough -- that is what makes back-pressure rate limiting meaningful."""
     gate = threading.Event()
     p = _backpressure_producer(num=MIN_ASYNC_SEND_NUM, block=gate)
     held = []
@@ -926,7 +964,7 @@ def test_gate_waits_for_a_permit_instead_of_failing_early():
     t = threading.Thread(target=_send)
     t.start()
     time.sleep(0.2)
-    assert t.is_alive(), "调用方不该在许可还回来之前就返回"
+    assert t.is_alive(), "the caller must not return before the permits come back"
     gate.set()
     t.join(6.0)
     assert not t.is_alive()
@@ -935,7 +973,7 @@ def test_gate_waits_for_a_permit_instead_of_failing_early():
     for cb in held:
         _wait_done(cb)
     _wait_done(third)
-    assert third.results, "等到许可后这一笔应当发出去"
+    assert third.results, "once the permit is obtained this entry must go out"
     assert p.get_semaphore_async_send_num_available_permits() == MIN_ASYNC_SEND_NUM
 
 
@@ -970,9 +1008,9 @@ def test_growing_capacity_wakes_a_blocked_sender():
     t.start()
     time.sleep(0.2)
     assert t.is_alive()
-    p.set_back_pressure_for_async_send_num(11)     # 凭空多出 1 条容量
+    p.set_back_pressure_for_async_send_num(11)     # one extra unit of capacity out of thin air
     t.join(6.0)
-    assert not t.is_alive(), "扩容后调用方还卡在闸上"
+    assert not t.is_alive(), "the caller is still stuck at the gate after the capacity was raised"
     gate.set()
     _wait_done(blocked)
     assert blocked.results
@@ -988,13 +1026,13 @@ def test_queue_full_runs_inline_when_backpressure_is_on():
     running = _Callback()
     p.send_async(Message("TopicTest", b"1"), running, 8000)
     _wait_attempts(_client(p), 1)
-    p.send_async(Message("TopicTest", b"2"), _Callback(), 8000)     # 进队列
+    p.send_async(Message("TopicTest", b"2"), _Callback(), 8000)     # goes into the queue
     for _ in range(200):
         if p._async_sender_executor.queued_count() == 1:
             break
         time.sleep(0.005)
     assert p._async_sender_executor.queued_count() == 1
-    # 第三笔：池子拒收 → 就地跑，会占住调用方直到 gate 打开
+    # the third entry: the pool rejects it -> it runs in place, occupying the caller until the gate opens
     inline = _Callback()
     returned = threading.Event()
 
@@ -1005,14 +1043,15 @@ def test_queue_full_runs_inline_when_backpressure_is_on():
     t = threading.Thread(target=_third)
     t.start()
     time.sleep(0.2)
-    assert not returned.is_set(), "就地跑应当占住调用方"
+    assert not returned.is_set(), "running in place should occupy the caller"
     gate.set()
     t.join(6.0)
-    assert returned.is_set(), "队满不该把异常甩给调用方"
+    assert returned.is_set(), "a full queue must not throw the exception at the caller"
     _wait_done(running)
     _wait_done(inline)
     assert _client(p).attempts_count >= 3
-    # 第二笔的回调没人等，许可归还落在 worker 线程上：轮询而不是立刻断言
+    # nobody waits for the callback of the second entry and the permit is returned on a worker thread:
+    # poll instead of asserting right away
     _wait_num_permits(p, 10)
 
 
@@ -1063,6 +1102,6 @@ def test_request_goes_through_the_same_gate_and_leaks_nothing():
         p.request(Message("TopicTest", b"q" * 30), 300)
     assert ei.value.response_code == ClientErrorCode.REQUEST_TIMEOUT_EXCEPTION
     assert "wait reply message timeout" in str(ei.value)
-    assert delivered, "request() 应当走异步链"
+    assert delivered, "request() should go through the asynchronous chain"
     assert p.get_semaphore_async_send_num_available_permits() == 10
     assert p.get_semaphore_async_send_size_available_permits() == MIN_ASYNC_SEND_SIZE

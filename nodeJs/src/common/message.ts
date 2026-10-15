@@ -161,9 +161,9 @@ export class MessageBatch extends Message {
       const first = this.messages[0];
       this.setTopic(first.getTopic());
       this.setWaitStoreMsgOK(first.getWaitStoreMsgOK());
-      // 批量的线上 body 就是各条消息的 17 段格式首尾相接；不写回的话 send() 会
-      // 在 Validators.checkMessage 处报 "the message body length is zero"
-      // （generateFromList 走的正是这一行）。
+      // The on-wire batch body is just each message's 17-field format concatenated end to end;
+      // if this is not written back, send() will report "the message body length is zero" at
+      // Validators.checkMessage (generateFromList hits exactly this line).
       this.setBody(encodeMessages(this.messages));
     }
   }

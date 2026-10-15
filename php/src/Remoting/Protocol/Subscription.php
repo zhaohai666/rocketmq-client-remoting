@@ -7,20 +7,21 @@ namespace RocketMQ\Remoting\Protocol;
 use RocketMQ\Common\MixAll;
 
 /**
- * 订阅组相关模型：
- * SubscriptionGroupConfig / GroupRetryPolicy / SimpleSubscriptionData。
+ * Subscription-group related models:
+ * SubscriptionGroupConfig / GroupRetryPolicy / SimpleSubscriptionData.
  *
- * 字段名与默认值以真机探针实测为准（空 SubscriptionGroupConfig 的 JSON 回包）：
+ * Field names and defaults follow live-probe measurements (the JSON response for an empty
+ * SubscriptionGroupConfig):
  * {"attributes":{},"brokerId":0,"consumeBroadcastEnable":true,"consumeEnable":true,
  * "consumeFromMinEnable":true,"consumeMessageOrderly":false,"consumeTimeoutMinute":15,
  * "groupName":"MyGroup","groupRetryPolicy":{"type":"CUSTOMIZED"},"groupSysFlag":0,
  * "notifyConsumerIdsChangedEnable":true,"retryMaxTimes":16,"retryQueueNums":1,
  * "whichBrokerWhenConsumeSlowly":1}
- * 注意 fastjson2 **跳过 null 字段**（``subscriptionDataSet`` 为 null 时整个键不出现），
- * 所以 fromDict 一律用 ``?? default``。
+ * Note that fastjson2 **skips null fields** (when ``subscriptionDataSet`` is null the whole key
+ * is absent), so fromDict always uses ``?? default``.
  */
 
-/** 组级重试策略类型（协议字段 groupRetryPolicy.type 的枚举名）。 */
+/** Group-level retry policy type (enum name of the protocol field groupRetryPolicy.type). */
 final class GroupRetryPolicyType
 {
     public const EXPONENTIAL = 'EXPONENTIAL';
@@ -28,9 +29,10 @@ final class GroupRetryPolicyType
 }
 
 /**
- * 组级重试策略。
+ * Group-level retry policy.
  *
- * 简化版：只保留 type 与两个子策略的原始 array（子策略为 null 时线上不落键）。
+ * Simplified: keeps only type plus the raw arrays of the two sub-policies (a null sub-policy is
+ * not written to the wire).
  */
 final class GroupRetryPolicy
 {
@@ -57,8 +59,8 @@ final class GroupRetryPolicy
     public function toDict(): array
     {
         $d = ['type' => $this->type];
-        // 探针实测回包里 groupRetryPolicy 只有 type（子策略为 null 时不落键），
-        // 所以这里也只在显式赋值时才输出两个子策略。
+        // Live-probe responses show groupRetryPolicy carries only type (a null sub-policy drops
+        // the key), so here the two sub-policies are only output when explicitly assigned.
         if ($this->exponentialRetryPolicy !== null) {
             $d['exponentialRetryPolicy'] = $this->exponentialRetryPolicy;
         }
@@ -82,7 +84,7 @@ final class GroupRetryPolicy
     }
 }
 
-/** 精简订阅数据：协议字段 subscriptionDataSet 的元素形状。 */
+/** Compact subscription data: the element shape of the protocol field subscriptionDataSet. */
 final class SimpleSubscriptionData
 {
     public function __construct(
@@ -116,7 +118,7 @@ final class SimpleSubscriptionData
     }
 }
 
-/** 订阅组配置：Admin 读写 broker 上订阅组时的线格式。 */
+/** Subscription group config: the wire format used by Admin to read/write subscription groups on the broker. */
 final class SubscriptionGroupConfig
 {
     public string $groupName = '';
@@ -127,7 +129,7 @@ final class SubscriptionGroupConfig
     public int $retryQueueNums = 1;
     public int $retryMaxTimes = 16;
     public GroupRetryPolicy $groupRetryPolicy;
-    /** 默认 MixAll::MASTER_ID（0，即主 broker）。 */
+    /** Defaults to MixAll::MASTER_ID (0, i.e. the master broker). */
     public int $brokerId = MixAll::MASTER_ID;
     public int $whichBrokerWhenConsumeSlowly = 1;
     public bool $notifyConsumerIdsChangedEnable = true;
@@ -161,12 +163,12 @@ final class SubscriptionGroupConfig
             'notifyConsumerIdsChangedEnable' => $this->notifyConsumerIdsChangedEnable,
             'groupSysFlag' => $this->groupSysFlag,
             'consumeTimeoutMinute' => $this->consumeTimeoutMinute,
-            // 协议里 attributes 是 Map（默认 {}）。PHP 空 array 会被 json_encode
-            // 编成 []，broker 按 Map 解析时直接抛
-            // "expect '{', but '['" —— 空表必须显式输出对象。
+            // In the protocol attributes is a Map (default {}). A PHP empty array is encoded by
+            // json_encode as [], and the broker, parsing it as a Map, throws
+            // "expect '{', but '['" — the empty table must be emitted as an object explicitly.
             'attributes' => $this->attributes === [] ? new \stdClass() : $this->attributes,
         ];
-        // null 字段不落键（broker 回包里同样见不到该键）
+        // null fields drop the key (the broker response likewise never shows the key)
         if ($this->subscriptionDataSet !== null) {
             $d['subscriptionDataSet'] = array_map(
                 static fn(SimpleSubscriptionData $s): array => $s->toDict(),
@@ -225,9 +227,10 @@ final class SubscriptionGroupConfig
 }
 
 /**
- * 订阅组全量包装：broker 一次性下发所有订阅组时的 body。
+ * Full subscription-group wrapper: the body when the broker pushes down all subscription groups
+ * at once.
  *
- * 探针输出：{"dataVersion":{...},"forbiddenTable":{},"subscriptionGroupTable":{...}}
+ * Probe output: {"dataVersion":{...},"forbiddenTable":{},"subscriptionGroupTable":{...}}
  */
 final class SubscriptionGroupWrapper
 {

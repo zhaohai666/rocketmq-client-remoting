@@ -7,15 +7,15 @@ pub const YYYY_MM_DD_HH_MM_SS: &str = "%Y-%m-%d %H:%M:%S";
 
 const HEX_ARRAY: &[u8; 16] = b"0123456789ABCDEF";
 
-/// [`monotonic_millis`] 的原点，首次调用时锚定（进程起点）。
+/// Origin of [`monotonic_millis`], anchored on first call (process start).
 static MONOTONIC_ORIGIN: OnceLock<Instant> = OnceLock::new();
 
-/// 单调时钟换算的毫秒数：
-/// **单调递增**，不受系统时间被回拨/NTP 校正影响。
+/// Milliseconds measured on the monotonic clock:
+/// **monotonically increasing**, unaffected by system clock rollback / NTP corrections.
 ///
-/// 为什么不能像 [`current_time_millis`] 那样用挂钟：发送重试预算和 broker 延迟
-/// 故障规避都要算「两次事件之间隔了多久」，挂钟一旦回退就会算出负延迟，
-/// 于是把超时的请求记成「极快」，反而给坏的 broker 加分。
+/// Why not use the wall clock like [`current_time_millis`]: the send-retry budget and broker-latency
+/// fault avoidance both need "how much time elapsed between two events"; once the wall clock steps back the delta goes negative,
+/// recording timed-out requests as "extremely fast" and thus rewarding bad brokers.
 pub fn monotonic_millis() -> f64 {
     let origin = MONOTONIC_ORIGIN.get_or_init(Instant::now);
     origin.elapsed().as_secs_f64() * 1000.0
@@ -151,7 +151,7 @@ pub fn string_2_bytes(hex: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// 探测本机出口 IP（UDP 连公网地址后读 sockname，不真正发包）。
+/// Probes the local egress IP (connect a UDP socket to a public address and read the sockname; no packet is actually sent).
 pub fn local_ip() -> String {
     let socket = match UdpSocket::bind("0.0.0.0:0") {
         Ok(s) => s,
@@ -167,7 +167,7 @@ pub fn local_ip() -> String {
     }
 }
 
-/// 拆 `host:port`，支持 IPv6 的 `[::1]:9876` 写法。
+/// Splits `host:port`, supports the IPv6 `[::1]:9876` form.
 pub fn parse_addr(addr: &str) -> (String, String) {
     if let Some(rest) = addr.strip_prefix('[') {
         if let Some((host, tail)) = rest.split_once(']') {
@@ -187,15 +187,15 @@ pub fn current_day_millis() -> u32 {
     secs * 1000 + now.nanosecond() / 1_000_000
 }
 
-/// ⚠ 确定性要求：「类加载 hash」这一段不能用运行时的随机化字符串 hash（每进程不同
-/// 会让同一实例的 ID 漂移），这里换成跨进程稳定的 [`java_string_hash`]。
-/// 长度与字符集不变，唯一性仍由 IP/PID/时间/自增保证。
+/// ⚠ Determinism requirement: the "class-load hash" segment must not use the runtime's randomized string hash (per-process
+/// variation would make the same instance's ID drift), so it is replaced with the cross-process stable [`java_string_hash`].
+/// Length and character set are unchanged; uniqueness is still guaranteed by IP/PID/time/counter.
 pub fn create_uniq_id() -> String {
     use std::net::IpAddr;
     use std::sync::atomic::{AtomicU16, Ordering};
 
     static COUNTER: AtomicU16 = AtomicU16::new(0);
-    // 先 `+= 1` 再取 `& 0xFFFF`，即首个 ID 的 counter 为 1；这里同样从 1 起。
+    // First `+= 1` then take `& 0xFFFF`, i.e. the first ID's counter is 1; this does the same, starting from 1.
     let counter = COUNTER.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
 
     let mut bytes: Vec<u8> = Vec::with_capacity(16);
@@ -277,16 +277,16 @@ mod tests {
     fn uniq_id_shape_and_uniqueness() {
         let first = create_uniq_id();
         let second = create_uniq_id();
-        assert_ne!(first, second, "同进程内连续两次不能相同");
-        // IPv4：IP(4)+PID(2)+hash(4)+dayMs(4)+counter(2) = 16B -> 32 个大写 hex
+        assert_ne!(first, second, "two consecutive calls in the same process must differ");
+        // IPv4: IP(4)+PID(2)+hash(4)+dayMs(4)+counter(2) = 16B -> 32 uppercase hex chars
         if is_ipv4(&crate::common::mix_all::MixAll::get_ip_str()) {
-            assert_eq!(first.len(), 32, "IPv4 下长度恒为 32，got {first}");
+            assert_eq!(first.len(), 32, "length is always 32 under IPv4, got {first}");
         }
         assert!(
             first.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase()),
-            "只能出现大写 hex，got {first}"
+            "only uppercase hex allowed, got {first}"
         );
-        // 最后 4 位是自增 counter，第二次一定比第一次大 1
+        // The last 4 chars are the auto-increment counter; the second is always the first plus 1
         let n = |s: &str| u32::from_str_radix(&s[s.len() - 4..], 16).unwrap();
         assert_eq!(n(&second), n(&first) + 1);
     }
@@ -294,6 +294,6 @@ mod tests {
     #[test]
     fn day_millis_stays_in_one_day() {
         let ms = current_day_millis();
-        assert!(ms < 86_400_000, "当日毫秒数不能超过一天，got {ms}");
+        assert!(ms < 86_400_000, "millis of the current day must stay within one day, got {ms}");
     }
 }

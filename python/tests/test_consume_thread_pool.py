@@ -19,7 +19,7 @@ GROUP = "GID_ThreadPoolUnit"
 
 class TestConsumeExecutor:
     def test_spawns_up_to_core_then_queues(self):
-        """core=2：前两个任务各起一个线程；第 3 个任务只入队，不再建线程。"""
+        """core=2: the first two tasks each spawn a thread; the third task only queues, no new thread."""
         ex = ConsumeExecutor(2, 8, keep_alive_seconds=30)
         started = threading.Event()
         release = threading.Event()
@@ -34,7 +34,7 @@ class TestConsumeExecutor:
             started.clear()
             ex.submit(block, "b")
             assert started.wait(3)
-            # 两个 worker 都被占住，第 3 个任务只能在队列里等
+            # Both workers are occupied; the third task can only wait in the queue
             ex.submit(block, "c")
             time.sleep(0.1)
             assert ex.worker_count() == 2
@@ -70,22 +70,22 @@ class TestConsumeExecutor:
             ex.shutdown(wait=True)
 
     def test_extra_thread_retires_after_keep_alive_core_thread_does_not(self):
-        """> core 的线程空闲到 keep_alive 就退出；<= core 的线程永不退出。"""
+        """Threads above core exit once idle for keep_alive; threads at or below core never exit."""
         ex = ConsumeExecutor(1, 4, keep_alive_seconds=0.2)
         try:
             ex.submit(lambda: None)
-            ex.set_core_pool_size(2)          # 队列空 → 不补线程，core 现在是 2
+            ex.set_core_pool_size(2)          # empty queue → no extra threads; core is now 2
             time.sleep(0.05)
             assert ex.get_core_pool_size() == 2
-            # 此刻只有 1 个 worker；再提交任务把它抬到 2（仍 <= core，应在超时后存活）
+            # Only 1 worker right now; submit another task to raise it to 2 (still <= core, should survive the timeout)
             ex.submit(lambda: None)
             time.sleep(0.05)
             assert ex.worker_count() == 2
-            ex.set_core_pool_size(1)          # core 降到 1 → 多出的那个属于"超编"
-            time.sleep(0.6)                   # 超过 keep_alive
-            assert ex.worker_count() == 1     # 超编线程已退出
+            ex.set_core_pool_size(1)          # core drops to 1 → the extra one becomes "over-provisioned"
+            time.sleep(0.6)                   # past keep_alive
+            assert ex.worker_count() == 1     # the over-provisioned thread has exited
             time.sleep(0.4)
-            assert ex.worker_count() == 1     # core 内线程不会退出
+            assert ex.worker_count() == 1     # threads within core do not exit
         finally:
             ex.shutdown(wait=True)
 
@@ -101,7 +101,7 @@ class TestConsumeExecutor:
             assert ex.handler_exception_count() == 1
             assert ex.worker_count() == 1
             ex.submit(done.set)
-            assert done.wait(3)               # 同一个 worker 还能继续干活
+            assert done.wait(3)               # the same worker can keep working
         finally:
             ex.shutdown(wait=True)
 
@@ -128,7 +128,7 @@ class TestConsumeExecutor:
         assert counter["n"] == 5
 
     def test_zero_core_means_run_to_completion_style_queue(self):
-        """core=0（不建常驻线程）时任务仍然会被执行（提交时按需起线程）。"""
+        """With core=0 (no resident threads), tasks are still executed (threads are spawned on demand at submit time)."""
         ex = ConsumeExecutor(0, 2, keep_alive_seconds=0.1)
         done = threading.Event()
         try:
@@ -138,7 +138,7 @@ class TestConsumeExecutor:
             ex.shutdown(wait=True)
 
 
-# ------------------------------------------------------------------ 消费者侧
+# ------------------------------------------------------------------ Consumer side
 
 class TestConsumerDefaultsAndGuards:
     def test_thread_pool_defaults(self):
@@ -158,20 +158,20 @@ class TestConsumerDefaultsAndGuards:
         c = DefaultMQPushConsumer(GROUP)
         assert c.update_core_pool_size(0) is False
         assert c.update_core_pool_size(-1) is False
-        assert c.get_core_pool_size() == 20              # 未生效
+        assert c.get_core_pool_size() == 20              # not applied
 
     def test_update_core_pool_size_rejects_above_short_max(self):
         pass
         c = DefaultMQPushConsumer(GROUP)
         c.set_consume_thread_max(40000)
         assert c.update_core_pool_size(32768) is False
-        assert c.update_core_pool_size(32767) is True    # 上界本身是合法的
+        assert c.update_core_pool_size(32767) is True    # the bound itself is legal
         assert c.get_core_pool_size() == 32767
 
     def test_update_core_pool_size_rejects_equal_to_consume_thread_max(self):
         pass
         c = DefaultMQPushConsumer(GROUP)
-        assert c.update_core_pool_size(20) is False      # == consumeThreadMax（5.x 默认）
+        assert c.update_core_pool_size(20) is False      # == consumeThreadMax (5.x default)
         assert c.update_core_pool_size(19) is True
         assert c.get_core_pool_size() == 19
 
@@ -181,7 +181,7 @@ class TestConsumerDefaultsAndGuards:
         assert c.get_consume_thread_max() == 20
         assert c.update_core_pool_size(30) is False
         assert c.update_core_pool_size(21) is False
-        assert c.get_core_pool_size() == 20              # 一个都没落下去
+        assert c.get_core_pool_size() == 20              # none of them took effect
         c.set_consume_thread_max(30)
         assert c.update_core_pool_size(25) is True
         assert c.get_core_pool_size() == 25
@@ -192,7 +192,7 @@ class TestConsumerDefaultsAndGuards:
         assert c.get_consume_thread_min() == 4
         assert c.get_consume_thread_max() == 4
         assert c.get_core_pool_size() == 4
-        # max 现在是 4 → 守卫按新 max 判定
+        # max is now 4 → the guard judges by the new max
         assert c.update_core_pool_size(4) is False
         assert c.update_core_pool_size(3) is True
 
@@ -203,7 +203,7 @@ class TestConsumerDefaultsAndGuards:
         assert c.get_core_pool_size() == 8
         c.set_consume_thread_max(16)
         assert c.get_consume_thread_max() == 16
-        assert c.get_core_pool_size() == 8               # 改 max 不动 core
+        assert c.get_core_pool_size() == 8               # changing max does not move core
 
     def test_sizes_are_clamped_to_at_least_one(self):
         c = DefaultMQPushConsumer(GROUP)
@@ -223,7 +223,7 @@ class TestConsumerDefaultsAndGuards:
         assert c.update_core_pool_size(15) is True
 
 
-# ------------------------------------------------------------------ msgAccCnt / 阈值
+# ------------------------------------------------------------------ msgAccCnt / threshold
 
 def _msg(queue_offset: int, max_offset=None) -> MessageExt:
     m = MessageExt(topic="T", body=b"x")
@@ -242,14 +242,14 @@ class TestMsgAccCnt:
 
     def test_acc_cnt_ignores_non_positive(self):
         c = DefaultMQPushConsumer(GROUP)
-        c._update_msg_acc_cnt("k1", [_msg(100, 100)])     # == 0 → 不更新
+        c._update_msg_acc_cnt("k1", [_msg(100, 100)])     # == 0 → not updated
         assert c.msg_acc_cnt("k1") == 0
-        c._update_msg_acc_cnt("k1", [_msg(200, 100)])     # < 0 → 不更新
+        c._update_msg_acc_cnt("k1", [_msg(200, 100)])     # < 0 → not updated
         assert c.msg_acc_cnt("k1") == 0
 
     def test_acc_cnt_missing_property_is_ignored(self):
         c = DefaultMQPushConsumer(GROUP)
-        c._update_msg_acc_cnt("k1", [_msg(10)])           # 没有 MAX_OFFSET 属性
+        c._update_msg_acc_cnt("k1", [_msg(10)])           # no MAX_OFFSET property
         assert c.msg_acc_cnt("k1") == 0
 
     def test_acc_cnt_garbage_property_is_ignored(self):
@@ -262,7 +262,7 @@ class TestMsgAccCnt:
     def test_acc_cnt_keeps_largest_snapshot_of_last_pull(self):
         c = DefaultMQPushConsumer(GROUP)
         c._update_msg_acc_cnt("k1", [_msg(10, 500)])
-        c._update_msg_acc_cnt("k1", [_msg(400, 450)])     # 新的一批，积压变小
+        c._update_msg_acc_cnt("k1", [_msg(400, 450)])     # a new batch with a smaller backlog
         assert c.msg_acc_cnt("k1") == 50
 
     def test_compute_accumulation_total_sums_all_queues(self):
@@ -293,7 +293,7 @@ class TestAdjustThreadPoolIsNoOp:
         assert c.get_core_pool_size() == before           # no-op
 
     def test_explicit_update_still_works_after_adjust(self):
-        """自动弹性 no-op ≠ API 失效：显式 update_core_pool_size 仍然生效。"""
+        """Auto-scaling being a no-op does not mean the API is dead: an explicit update_core_pool_size still works."""
         c = DefaultMQPushConsumer(GROUP)
         c._update_msg_acc_cnt("a", [_msg(0, 10 ** 6)])
         c.adjust_thread_pool()

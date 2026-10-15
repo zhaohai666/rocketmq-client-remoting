@@ -19,7 +19,8 @@ final class StaticTopic
     }
 
     /**
-     * getMockBrokerName："__global__"（scope 本身）剥掉头两个字符，其余 scope 原样加前缀。
+     * getMockBrokerName: "__global__" (the scope itself) strips the first two characters;
+     * other scopes get the prefix added as-is.
      */
     public static function getMockBrokerName(string $scope): string
     {
@@ -31,8 +32,9 @@ final class StaticTopic
     }
 
     /**
-     * PHP 数组键只能用标量：逻辑队列一律以 "topic@brokerName@queueId" 字符串键
-     * 进端点表（引用身份的键查不到等值条目）。
+     * PHP array keys can only be scalars: logical queues always enter the endpoint table
+     * with a "topic@brokerName@queueId" string key (a reference-identity key cannot find
+     * an equal entry).
      */
     public static function queueKey(MessageQueue $mq): string
     {
@@ -76,12 +78,12 @@ final class StaticTopic
     }
 
     /**
-     * ClientMetadata.topicRouteData2EndpointsForStaticTopic：构建逻辑队列集
-     * MessageQueue(topic, mockBrokerName(scope), globalId) -> 承载它的真实 broker 名
-     * （total 范围内没有承载者的逻辑 id 指向 "__syslo__none__"）。
-     * 空映射（非静态主题）返回 null。
+     * ClientMetadata.topicRouteData2EndpointsForStaticTopic: builds the logical queue set
+     * MessageQueue(topic, mockBrokerName(scope), globalId) -> the real broker name hosting
+     * it (a logical id with no host within the total range points to "__syslo__none__").
+     * An empty mapping (non-static topic) returns null.
      *
-     * 返回 `array<queueKey, realBrokerName>`。
+     * Returns `array<queueKey, realBrokerName>`.
      *
      * @return array<string, string>|null
      */
@@ -116,7 +118,7 @@ final class StaticTopic
                 if ($info['epoch'] >= $maxTotalNumOfEpoch && $info['totalQueues'] > $maxTotalNums) {
                     $maxTotalNums = $info['totalQueues'];
                 }
-                // 只有 global id（键）形状决定端点集；物理 id 是 broker 内部的。
+                // Only the global id (key) shape decides the endpoint set; the physical id is broker-internal.
                 foreach (array_keys($info['currIdMap']) as $globalId) {
                     $mq = new MessageQueue($topic, $mockName, $globalId);
                     $key = self::queueKey($mq);
@@ -127,8 +129,8 @@ final class StaticTopic
                 }
             }
 
-            // 补齐静态逻辑队列：total 之下的每个 id 都存在；没有承载者的指向
-            // NOT_EXIST 哨兵。
+            // Fill in the static logical queues: every id below total exists; those with
+            // no host point to the NOT_EXIST sentinel.
             for ($i = 0; $i < $maxTotalNums; ++$i) {
                 $mq = new MessageQueue($topic, $mockName, $i);
                 $key = self::queueKey($mq);

@@ -39,7 +39,8 @@ function nearbyMQs(): MessageQueue[] {
   console.log('OK: MACHINE_ROOM_NEARBY splits by room and shares orphans');
 }
 
-// 2) 解析出空机房时抛错（resolver 返回空串 -> Machine room is null）。
+// 2) Throwing when the resolved machine room is empty (resolver returns an empty
+// string -> Machine room is null).
 {
   const resolver: MachineRoomResolver = {
     brokerDeployIn: () => '',
@@ -50,7 +51,7 @@ function nearbyMQs(): MessageQueue[] {
   console.log('OK: MACHINE_ROOM_NEARBY empty room throws');
 }
 
-// 3) 构造器空值守卫：任一参数为 null 必须抛错。
+// 3) Constructor null guards: either argument being null must throw.
 {
   const resolver: MachineRoomResolver = {
     brokerDeployIn: () => 'room-a',
@@ -100,7 +101,7 @@ function nearbyMQs(): MessageQueue[] {
   console.log('OK: FairSemaphore byte-size acquire/release');
 }
 
-// 6) VIP 通道端口算术（开启时 port-2）。
+// 6) VIP channel port arithmetic (port-2 when enabled).
 {
   assert.strictEqual(MixAll.brokerVipChannel(true, '127.0.0.1:10911'), '127.0.0.1:10909');
   assert.strictEqual(MixAll.brokerVipChannel(false, '127.0.0.1:10911'), '127.0.0.1:10911');
@@ -120,11 +121,12 @@ function nearbyMQs(): MessageQueue[] {
   console.log('OK: timer delay setters use the server-side TIMER_* property names');
 }
 
-// 8) LitePullConsumer.seekToBegin / seekToEnd：
-//    begin = 先取 minOffset 再 seek，end = 先取 maxOffset 再 seek，
-//    两者都走 admin 路径、只寻址 master broker。
-//    假的 mqClient 应答边界 RPC，所以断言盯住拉取游标真正落点——
-//    静默无效的 seek 要到消费者重放整个队列或跳过整个队列时才暴露。
+// 8) LitePullConsumer.seekToBegin / seekToEnd:
+//    begin = read minOffset then seek, end = read maxOffset then seek,
+//    both go through the admin path and address only the master broker.
+//    The fake mqClient answers the boundary RPCs, so the assertions watch where
+//    the pull cursor really lands — a silently ineffective seek would otherwise
+//    only surface when the consumer replays or skips a whole queue.
 {
   const mq = new MessageQueue('SeekTopic', 'broker-a', 0);
   const route = { brokerDatas: [{ brokerName: 'broker-a', brokerAddrs: { '0': '127.0.0.1:10911' } }] };
@@ -137,8 +139,8 @@ function nearbyMQs(): MessageQueue[] {
     getMaxOffset: async () => stub.max,
   };
 
-  // seek() 自身以 started 为准入门槛（校验服务状态），两个封装同样如此——
-  // start 之前什么都不会移动。
+  // seek() itself gates on started (validating the service state), and so do both
+  // wrappers — nothing moves before start.
   await assert.rejects(() => c.seekToBegin(mq), /not started/);
   await assert.rejects(() => c.seekToEnd(mq), /not started/);
   assert.strictEqual(c.pullCursor.get(mqKey(mq)), undefined);
@@ -161,11 +163,13 @@ function nearbyMQs(): MessageQueue[] {
 }
 
 // 9) Push consumer: suspend() / resume() / isPaused()
-//    挂起标志只在 pullMessage 与 popMessage 两条路径读取，命中时按
-//    PULL_TIME_DELAY_MILLS_WHEN_SUSPEND=1000ms 退避。
-//    关键不变量是顺序：门槛必须在 pq.touchPull() 之后。门槛先于时间戳更新，
-//    会让"只是被挂起"的消费者在 120s 停滞检测器眼里形同死掉，rebalance 随即
-//    拆掉分配——运维暂停两分钟就会换来一次全量重投。
+//    The suspend flag is read only on the pullMessage and popMessage paths, and
+//    on a hit it backs off by PULL_TIME_DELAY_MILLS_WHEN_SUSPEND=1000ms.
+//    The key invariant is ordering: the gate must come after pq.touchPull(). A
+//    gate ahead of the timestamp update would make a merely suspended consumer
+//    look dead to the 120s stall detector, and rebalance would immediately tear
+//    down the allocation — a two-minute operations pause would buy one full
+//    redelivery.
 {
   const { DefaultMQPushConsumer } = await import('../src/client/consumer.ts');
   const { ProcessQueue } = await import('../src/client/process_queue.ts');
@@ -195,8 +199,8 @@ function nearbyMQs(): MessageQueue[] {
     return new PullResult(PullStatus.NO_NEW_MSG, next, 0, next, []);
   };
 
-  // suspend()/resume() 不触碰尚未 start 的消费者所持有的任何状态，
-  // 因此它们在 start 之前也必须安全。
+  // suspend()/resume() touch no state held by a consumer that has not started
+  // yet, so they must be safe before start too.
   const idle: any = new DefaultMQPushConsumer('suspendIdleGroup');
   assert.strictEqual(idle.isPaused(), false, 'pause defaults to false');
   idle.suspend(); idle.suspend();
@@ -241,8 +245,10 @@ function nearbyMQs(): MessageQueue[] {
 
 // 10) Push consumer thread elasticity: updateCorePoolSize / getCorePoolSize /
 //     adjustThreadPool / computeAccumulationTotal
-//    守卫才是重点：接受 >= consumeThreadMax 会让池 core 超过自身 max，
-//    ThreadPoolExecutor 会拒绝；坏值必须静默忽略、不抛错——这是该接口的约定。
+//    The guards are the point: accepting a value >= consumeThreadMax would put
+//    the pool's core above its own max and ThreadPoolExecutor would reject it;
+//    bad values must be silently ignored, not thrown — that is this interface's
+//    contract.
 {
   const { DefaultMQPushConsumer } = await import('../src/client/consumer.ts');
   const c: any = new DefaultMQPushConsumer('elasticitySmokeGroup');
@@ -251,7 +257,7 @@ function nearbyMQs(): MessageQueue[] {
 
   assert.strictEqual(c.updateCorePoolSize(32), true, 'a value below consumeThreadMax applies');
   assert.strictEqual(c.getCorePoolSize(), 32, 'getCorePoolSize reports the applied value');
-  // 守卫（全部静默拒绝）：越界、== / > max、非有限值。
+  // The guards (all reject silently): out of range, == / > max, non-finite.
   assert.strictEqual(c.updateCorePoolSize(0), false, 'core must be > 0');
   assert.strictEqual(c.updateCorePoolSize(-5), false, 'negative rejected');
   assert.strictEqual(c.updateCorePoolSize(32768), false, 'above Short.MAX_VALUE rejected');

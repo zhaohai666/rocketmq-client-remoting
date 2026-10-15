@@ -11,13 +11,13 @@ final class PopAssignmentPoller
      * @param \Closure(string, list<array{mq: \RocketMQ\Common\MessageQueue, mode: \RocketMQ\Remoting\Protocol\MessageRequestMode}>): void $applyFn
      */
     public function __construct(
-        /** 注册表键：一个实例可以挂多个消费者，也允许同一消费者重复注册（覆盖旧的）。 */
+        /** Registry key: one instance can host multiple consumers, and the same consumer may register repeatedly (overwriting the old one). */
         public string $key,
         public string $consumerGroup,
         public string $clientId,
-        /** 本端分配策略名（AVG / AVG_BY_CIRCLE ...）；broker 只认这两个，其余回无效结果。 */
+        /** Local allocation strategy name (AVG / AVG_BY_CIRCLE ...); the broker only recognizes these two, anything else returns an invalid result. */
         public string $strategyName,
-        /** 'CLUSTERING' | 'BROADCASTING'，进 body。 */
+        /** 'CLUSTERING' | 'BROADCASTING', goes into the body. */
         public string $messageModel,
         public \Closure $topicsFn,
         public \Closure $applyFn,
@@ -26,8 +26,9 @@ final class PopAssignmentPoller
     }
 
     /**
-     * 下一轮到点时刻（毫秒）。0 = 立刻到期（新注册 / rebalanceImmediately 唤醒时置零）。
-     * 由 {@see MQClientInstance::runPopAssignmentRound()} 在每轮开跑时重排。
+     * The next round's due time (milliseconds). 0 = due immediately (set to zero on new
+     * registration / rebalanceImmediately wakeup). Rearranged by
+     * {@see MQClientInstance::runPopAssignmentRound()} at the start of each round.
      */
     public int $nextRunMillis = 0;
 }

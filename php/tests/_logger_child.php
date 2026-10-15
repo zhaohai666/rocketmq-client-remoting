@@ -3,8 +3,9 @@
 declare(strict_types=1);
 
 /**
- * RunClientLogger.php 的子进程载体：在干净的环境变量下解析一次 sink，再执行父用例
- * 传入的一小段代码（只用于本目录的自测，代码来源固定、不接受外部输入）。
+ * Child-process carrier for RunClientLogger.php: resolves the sink once in a clean environment,
+ * then executes the small snippet of code passed in by the parent test case (for self-testing in
+ * this directory only; the code source is fixed and no external input is accepted).
  */
 
 require_once __DIR__ . '/../bootstrap.php';
@@ -16,6 +17,6 @@ if ($code === '') {
     fwrite(STDERR, "usage: _logger_child.php '<php snippet using Logger>'\n");
     exit(2);
 }
-// eval 的代码块是独立编译单元，文件顶部的 use 对它不生效，
-// 所以在其内部再写一次导入。
+// The eval'd code block is an independent compilation unit; the use statements at the top of
+// the file do not apply to it, so the imports are repeated inside.
 eval("use RocketMQ\\Client\\Logger;\n" . $code);

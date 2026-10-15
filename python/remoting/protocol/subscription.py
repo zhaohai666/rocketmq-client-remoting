@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
-"""订阅组相关模型，对应协议订阅包（subscription）：
+"""The models related to subscription groups, corresponding to the protocol's subscription package:
 SubscriptionGroupConfig / GroupRetryPolicy / SimpleSubscriptionData。
 
-字段名与默认值以 5.x broker 实测序列化输出为准（``JSON.toJSONString(new SubscriptionGroupConfig())``）：
+The field names and default values follow the real serialized output of a 5.x broker (``JSON.toJSONString(new SubscriptionGroupConfig())``):
 {"attributes":{},"brokerId":0,"consumeBroadcastEnable":true,"consumeEnable":true,
  "consumeFromMinEnable":true,"consumeMessageOrderly":false,"consumeTimeoutMinute":15,
  "groupName":"MyGroup","groupRetryPolicy":{"type":"CUSTOMIZED"},"groupSysFlag":0,
  "notifyConsumerIdsChangedEnable":true,"retryMaxTimes":16,"retryQueueNums":1,
  "whichBrokerWhenConsumeSlowly":1}
-注意 broker 侧 fastjson **跳过 null 字段**（``subscriptionDataSet`` 为 null 时整个键不出现），
-所以 from_dict 一律用 ``.get(k, default)``。
+Note that the broker-side fastjson **skips null fields** (when ``subscriptionDataSet`` is null the
+whole key does not appear), so from_dict always uses ``.get(k, default)``.
 """
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ class GroupRetryPolicyType:
 
 
 class GroupRetryPolicy:
-    """简化版：只保留 type 与两个子策略的原始 dict（broker 侧为 null 时不序列化）。"""
+    """A simplified version: it keeps only type and the raw dicts of the two sub-policies (the broker side does not serialize them when null)."""
 
     def __init__(self, policy_type: str = GroupRetryPolicyType.CUSTOMIZED,
                  exponential_retry_policy: Optional[dict] = None,
@@ -39,8 +39,9 @@ class GroupRetryPolicy:
 
     def to_dict(self) -> dict:
         d = {"type": self.type}
-        # 协议默认 type=CUSTOMIZED 且 customizedRetryPolicy 为 null（字段有默认实例但
-        # broker 侧 fastjson 只序列化非 null 的），实测输出里只有 type，故这里同样只在显式赋值时输出。
+        # The protocol defaults to type=CUSTOMIZED with customizedRetryPolicy null (the field has
+        # a default instance, but the broker-side fastjson only serializes non-null values), so the
+        # measured output contains only type; that is why it is likewise only emitted when explicitly set.
         if self.exponential_retry_policy is not None:
             d["exponentialRetryPolicy"] = self.exponential_retry_policy
         if self.customized_retry_policy is not None:
@@ -58,7 +59,7 @@ class GroupRetryPolicy:
 
 
 class SimpleSubscriptionData:
-    """协议模型 ``SimpleSubscriptionData``。"""
+    """The protocol model ``SimpleSubscriptionData``."""
 
     def __init__(self, topic: str = "", expression_type: str = "TAG",
                  expression: str = "*", version: int = 0):
@@ -86,7 +87,7 @@ class SimpleSubscriptionData:
 
 
 class SubscriptionGroupConfig:
-    """协议模型 ``SubscriptionGroupConfig``。"""
+    """The protocol model ``SubscriptionGroupConfig``."""
 
     def __init__(self, group_name: str = ""):
         self.group_name = group_name
@@ -122,7 +123,7 @@ class SubscriptionGroupConfig:
             "consumeTimeoutMinute": self.consume_timeout_minute,
             "attributes": self.attributes,
         }
-        # fastjson2 默认跳过 null
+        # fastjson2 skips null by default
         if self.subscription_data_set is not None:
             d["subscriptionDataSet"] = [s.to_dict() for s in self.subscription_data_set]
         return d
@@ -161,9 +162,9 @@ class SubscriptionGroupConfig:
 
 
 class SubscriptionGroupWrapper:
-    """协议模型 ``SubscriptionGroupWrapper``。
+    """The protocol model ``SubscriptionGroupWrapper``.
 
-    broker 实测输出：{"dataVersion":{...},"forbiddenTable":{},"subscriptionGroupTable":{...}}
+    Measured broker output:{"dataVersion":{...},"forbiddenTable":{},"subscriptionGroupTable":{...}}
     """
 
     def __init__(self):

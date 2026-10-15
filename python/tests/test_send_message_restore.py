@@ -28,12 +28,12 @@ ORIGINAL = b"A" * 8192
 
 
 def _offset_msg_id(offset: int) -> str:
-    """broker 的 offsetMsgId：4 字节 IP + 4 字节端口 + 8 字节偏移（MessageDecoder 格式）。"""
+    """The broker's offsetMsgId: 4-byte IP + 4-byte port + 8-byte offset (MessageDecoder format)."""
     return "7f000001" + "00002a9f" + "%016x" % offset
 
 
 class _FakeRemoting:
-    """只收 END_TRANSACTION 这类 oneway 请求。"""
+    """Only receives oneway requests such as END_TRANSACTION."""
 
     def __init__(self):
         self.oneway: List[tuple] = []   # (addr, cmd)
@@ -43,23 +43,23 @@ class _FakeRemoting:
 
 
 class _FakeClient:
-    """MQClientInstance 替身，缝在发送链真正读消息对象的那几个接缝上。
+    """An MQClientInstance stand-in, sewn onto the few seams where the send chain really reads the message object.
 
-    记录的 ``topics``/``bodies``/``sys_flags`` 就是「上线时 broker 看到的东西」——
-    还原必须在这些值被取走**之后**发生。
+    The recorded ``topics``/``bodies``/``sys_flags`` are exactly "what the broker sees on the wire" --
+    restoration must happen **after** these values have been taken.
     """
 
     def __init__(self):
         self.publish = TopicPublishInfo()
         self.publish.msg_queue_list = [MessageQueue("TopicTest", "broker-a", 0)]
-        # MQClientInstance 真有这个字段（动态取址时它才是权威来源）
+        # MQClientInstance really has this field (with dynamic addressing it is the authoritative source)
         self.name_server_addrs = ["127.0.0.1:9876"]
         self.topics: List[str] = []
         self.bodies: List[bytes] = []
         self.sys_flags: List[int] = []
         self.remoting_client = _FakeRemoting()
 
-    # --- 发送链会碰到的 MQClientInstance 接口 ---
+    # --- the MQClientInstance interface the send chain will hit ---
     def register_topic_in_use(self, topic):
         pass
 
@@ -80,7 +80,7 @@ class _FakeClient:
     def send_message(self, group, msg, mq, timeout, sys_flag, unit_mode=False,
                      default_topic=None, default_topic_queue_nums=None):
         self._record(msg, sys_flag)
-        # offset_msg_id 要能过 decode_message_id（endTransaction 用它取 commitLogOffset）
+        # offset_msg_id must pass decode_message_id (endTransaction uses it to get commitLogOffset)
         return SendResult(SendStatus.SEND_OK, msg_id="0" * 32, message_queue=mq,
                           transaction_id="t-1", offset_msg_id=_offset_msg_id(0))
 
@@ -115,11 +115,11 @@ class _Callback:
         self.done.set()
 
     def wait(self, timeout: float = 5.0) -> None:
-        assert self.done.wait(timeout), "异步回调没有触发"
+        assert self.done.wait(timeout), "the async callback did not fire"
 
 
 class _Selector:
-    """MessageQueueSelector 替身：选第一个队列，并记下选队列时看到的 body。"""
+    """A MessageQueueSelector stand-in: picks the first queue and records the body seen when picking."""
 
     def __init__(self):
         self.seen_body: Optional[bytes] = None
@@ -152,7 +152,7 @@ def _producer(namespace: Optional[str] = None) -> DefaultMQProducer:
     p.set_namesrv_addr("127.0.0.1:9876")
     p.set_retry_times_when_send_failed(0)
     p.retry_times_when_send_async_failed = 0
-    # start() 会建真实客户端，这里只补齐发送链需要的：started 标记 + 两个池
+    # start() would build a real client; here only what the send chain needs is filled in: the started flag + two pools
     p._create_async_executors()
     p._mq_client = _FakeClient()
     p._started = True
@@ -160,7 +160,7 @@ def _producer(namespace: Optional[str] = None) -> DefaultMQProducer:
 
 
 def _compression_flag(p: DefaultMQProducer) -> int:
-    """本生产者压缩时应置的 sysFlag 位（COMPRESSED_FLAG + 压缩类型）。"""
+    """The sysFlag bit this producer should set when compressing (COMPRESSED_FLAG + compression type)."""
     return MessageSysFlag.set_compression_type(MessageSysFlag.COMPRESSED_FLAG, p.compress_type)
 
 
@@ -169,15 +169,15 @@ def _wait_restored(msg: Message, body: bytes = ORIGINAL, timeout: float = 2.0) -
     deadline = time.monotonic() + timeout
     while msg.body != body and time.monotonic() < deadline:
         time.sleep(0.005)
-    assert msg.body == body, "发送结束后调用方的 body 没有还原"
+    assert msg.body == body, "the caller's body was not restored after the send finished"
 
 
-# ---------------------------------------------------------------- 同步
+# ---------------------------------------------------------------- Sync
 def test_sync_send_restores_the_callers_body_and_recompresses_next_time():
-    """两次发送同一个 Message：每次上线的是「原文压缩后」的同一串字节。
+    """Sending the same Message twice: what goes on the wire each time is the same bytes of "compressed original".
 
-    少了还原，第二次上线的就是第一次那段 zlib 流（长度已低于阈值、压缩标志也不会置位），
-    消费端解出来是乱码。
+    Without restoration, the second send would put the first send's zlib stream on the wire (its length is already below the threshold, and the compression flag would not be set either),
+    so the consumer side would decode garbage.
     """
     p = _producer()
     client = p._mq_client
@@ -206,7 +206,7 @@ def test_sync_send_restores_the_namespaced_topic():
     assert msg.topic == "TopicTest"
 
 
-# ---------------------------------------------------------------- 批量
+# ---------------------------------------------------------------- Batch
 def test_batch_send_keeps_sub_message_topic_namespaced():
     pass
     p = _producer(NS)
@@ -219,12 +219,12 @@ def test_batch_send_keeps_sub_message_topic_namespaced():
     assert m1.topic == "%s%%TopicTest" % NS
     assert m2.topic == "%s%%TopicTest" % NS
     assert m1.body == b"a" and m2.body == b"b"
-    # 批量永不压缩，sysFlag 里没有 COMPRESSED 位
+    # batches are never compressed, so sysFlag has no COMPRESSED bit
     assert client.sys_flags[0] == 0
     assert get_uniq_id(m1) and get_uniq_id(m2)
 
 
-# ---------------------------------------------------------------- 异步
+# ---------------------------------------------------------------- Async
 def test_async_send_restores_the_callers_body():
     p = _producer()
     client = p._mq_client
@@ -275,7 +275,7 @@ def test_async_send_restores_the_body_even_when_the_send_fails():
     _wait_restored(msg)
 
 
-# ---------------------------------------------------------------- 单向 / selector
+# ---------------------------------------------------------------- Oneway / selector
 def test_oneway_send_restores_the_callers_message():
     p = _producer(NS)
     client = p._mq_client
@@ -302,7 +302,7 @@ def test_selector_send_restores_the_callers_message():
     assert msg.topic == "TopicTest"
 
 
-# ---------------------------------------------------------------- 事务
+# ---------------------------------------------------------------- Transactions
 def test_transaction_send_restores_the_message_and_keeps_the_wire_topic():
     pass
     p = _producer(NS)
@@ -314,18 +314,18 @@ def test_transaction_send_restores_the_message_and_keeps_the_wire_topic():
 
     assert result.local_transaction_state == LocalTransactionState.COMMIT_MESSAGE
     assert listener.args == ["arg-1"]
-    # 本地事务看到的是还原后的消息：原始 body + 已剥命名空间的 topic
+    # the local transaction sees the restored message: original body + topic with the namespace stripped
     assert listener.body == ORIGINAL
     assert listener.topic == "TopicTest"
-    # 半消息上线时仍是压缩 body + 带命名空间的 topic
+    # when the half message goes on the wire it is still the compressed body + namespaced topic
     assert client.bodies[0] != ORIGINAL
     assert zlib.decompress(client.bodies[0]) == ORIGINAL
     assert client.topics[0] == "%s%%TopicTest" % NS
 
-    assert client.remoting_client.oneway, "没有发出 END_TRANSACTION"
+    assert client.remoting_client.oneway, "no END_TRANSACTION was sent"
     _addr, cmd = client.remoting_client.oneway[-1]
-    # ext_fields 是编码时才铺开的（make_custom_header_to_net），这里走同一条路，断言的是
-    # **真正上线**的键值，而不是内存里的 header 对象
+    # ext_fields is only laid out at encoding time (make_custom_header_to_net); the same path is taken here, so what is asserted is the
+    # **really-on-the-wire** key-value pairs, not the in-memory header object
     cmd.make_custom_header_to_net()
     header = EndTransactionRequestHeader()
     header.from_ext_fields(cmd.ext_fields)
@@ -344,12 +344,12 @@ def test_transaction_without_listener_still_leaves_the_message_untouched():
     assert msg.body == ORIGINAL
 
 
-# ---------------------------------------------------------------- 判据本身
+# ---------------------------------------------------------------- The criterion itself
 def test_compress_helper_is_deterministic_so_the_two_sends_are_comparable():
-    """上面断言用「两次上线的字节相同」判定压缩跑了两次，先钉住这个前提。"""
+    """The assertions above use "the bytes on the wire are identical twice" to judge that compression ran twice; pin this premise down first."""
     once = _compress(ORIGINAL, MessageSysFlag.ZLIB_TYPE, 5)
     assert once == _compress(ORIGINAL, MessageSysFlag.ZLIB_TYPE, 5)
-    # 负向对照：少了还原，第二次上线的就是压了两遍的流 —— 判据能发现它
+    # negative control: without restoration the second send would put a twice-compressed stream on the wire -- the criterion can catch it
     twice = _compress(once, MessageSysFlag.ZLIB_TYPE, 5)
     assert twice != once
     assert zlib.decompress(once) == ORIGINAL

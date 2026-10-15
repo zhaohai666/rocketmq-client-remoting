@@ -1,4 +1,4 @@
-// 系统原生压缩库的 P/Invoke 绑定（libzstd / liblz4）。
+// P/Invoke bindings for the system native compression libraries (libzstd / liblz4).
 using System.Globalization;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -6,25 +6,25 @@ using System.Runtime.InteropServices;
 namespace RocketMQ.Common;
 
 /// <summary>
-/// 原生库句柄解析与可用性探测。
+/// Native library handle resolution and availability probing.
 ///
-/// macOS 上 <c>NativeLibrary.TryLoad("zstd")</c> 与 <c>"libzstd"</c> 都会失败，
-/// 只有 <c>"libzstd.dylib"</c> 能被 dyld 的 fallback library path 命中，
-/// 因此必须自带候选名列表 + <see cref="NativeLibrary.SetDllImportResolver"/>；
-/// 这也顺带覆盖 Homebrew 的两种前缀（/usr/local 与 Apple Silicon 的 /opt/homebrew）
-/// 以及 Linux 的 .so/.so.1 命名。
+/// On macOS, <c>NativeLibrary.TryLoad("zstd")</c> and <c>"libzstd"</c> both fail,
+/// only <c>"libzstd.dylib"</c> is picked up by dyld's fallback library path,
+/// so we must supply our own candidate-name list + <see cref="NativeLibrary.SetDllImportResolver"/>;
+/// this also conveniently covers Homebrew's two prefixes (/usr/local and Apple Silicon's /opt/homebrew)
+/// as well as Linux's .so/.so.1 naming.
 /// </summary>
 internal static class NativeCompressionLibrary
 {
-    /// <summary>DllImport 里写的逻辑名；由 <see cref="Resolve"/> 翻译成真实库。</summary>
+    /// <summary>The logical name written in DllImport; translated to the real library by <see cref="Resolve"/>.</summary>
     internal const string Zstd = "zstd";
 
     internal const string Lz4 = "lz4";
 
-    // 候选名按「最可能且最具体」排序；NativeLibrary 的默认探测（DllImportSearchPath）
-    // 在 macOS 上不会命中这些绝对路径，所以全部显式列出。
-    // Windows 的 DLL 名不落在此表：由 LoadFirst 前置的 RMQ_NATIVE_COMPRESSION_DIR
-    // 探测（见下）与运行时默认解析补齐。
+    // Candidate names are ordered by "most likely and most specific"; NativeLibrary's default probing (DllImportSearchPath)
+    // does not hit these absolute paths on macOS, so they are all listed explicitly.
+    // Windows DLL names are not in this table: they are covered by the RMQ_NATIVE_COMPRESSION_DIR
+    // probe (see below) in front of LoadFirst, plus the runtime's default resolution.
     private static readonly string[] ZstdCandidates =
     {
         "libzstd.dylib",
@@ -55,8 +55,8 @@ internal static class NativeCompressionLibrary
 
     private static readonly Lazy<IntPtr> Lz4Handle = new(() => LoadFirst(WithEnvDir(Lz4Candidates)));
 
-    // 符号级校验：库能加载但少了 LZ4F_* 导出（例如被换成了裁剪过的静态库）时，
-    // 必须在探测阶段就判定不可用，而不是等 DllImport 抛 EntryPointNotFoundException。
+    // Symbol-level check: if the library loads but is missing the LZ4F_* exports (e.g. replaced by a trimmed static lib),
+    // it must be judged unavailable during probing, rather than waiting for DllImport to throw EntryPointNotFoundException.
     private static readonly Lazy<bool> ZstdUsable = new(() => HasAll(ZstdHandle.Value,
         "ZSTD_compress", "ZSTD_decompress", "ZSTD_compressBound", "ZSTD_decompressBound",
         "ZSTD_findFrameCompressedSize", "ZSTD_isError", "ZSTD_getErrorName"));
@@ -73,12 +73,12 @@ internal static class NativeCompressionLibrary
 
     static NativeCompressionLibrary()
     {
-        // 解析器只对「本程序集发起的 DllImport」生效，且是全局一次性注册。
+        // The resolver only applies to DllImports initiated by this assembly, and is registered globally once.
         NativeLibrary.SetDllImportResolver(typeof(NativeCompressionLibrary).Assembly, Resolve);
     }
 
     /// <summary>
-    /// 显式触发一次探测（让静态构造函数跑起来）。压缩路径首次用到时调用。
+    /// Explicitly trigger one probe (so the static constructor runs). Called when the compression path is first used.
     /// </summary>
     internal static void EnsureProbed()
     {
@@ -88,8 +88,9 @@ internal static class NativeCompressionLibrary
 
     private static IntPtr Resolve(string libraryName, Assembly owner, DllImportSearchPath? searchPath)
     {
-        // 静态构造函数里才注册解析器，而解析器可能在静态构造函数完成前被 DllImport
-        // 调到；这里只读 Lazy 字段，不会再触发注册，无死锁风险。
+        // The resolver is registered inside the static constructor, but may be called by DllImport
+        // before the static constructor finishes; here we only read the Lazy fields, which will not
+        // trigger registration again, so there is no deadlock risk.
         if (string.Equals(libraryName, Zstd, StringComparison.Ordinal))
         {
             return ZstdHandle.Value;
@@ -100,7 +101,7 @@ internal static class NativeCompressionLibrary
             return Lz4Handle.Value;
         }
 
-        return IntPtr.Zero; // 交回运行时默认解析
+        return IntPtr.Zero; // hand back to the runtime's default resolution
     }
 
     private static IntPtr LoadFirst(string[] candidates)
@@ -117,8 +118,8 @@ internal static class NativeCompressionLibrary
     }
 
     /// <summary>
-    /// RMQ_NATIVE_COMPRESSION_DIR 指向装着 liblz4/libzstd 的目录（如 zlib 的
-    /// CMAKE_PREFIX_PATH 同一惯例），其下的候选名排在系统默认解析之前。
+    /// RMQ_NATIVE_COMPRESSION_DIR points to the directory holding liblz4/libzstd (same convention as zlib's
+    /// CMAKE_PREFIX_PATH); the candidate names under it are tried before the system's default resolution.
     /// </summary>
     private static string[] WithEnvDir(string[] candidates)
     {
@@ -156,10 +157,10 @@ internal static class NativeCompressionLibrary
         return true;
     }
 
-    /// <summary>原生库版本，仅用于日志（zstd 10507 -&gt; "1.5.7"）。</summary>
+    /// <summary>Native library version, used only for logging (zstd 10507 -&gt; "1.5.7").</summary>
     internal static string FormatVersion(uint packed)
     {
-        // zstd/lz4 的版本号打包方式一致：major*10000 + minor*100 + patch。
+        // zstd/lz4 pack the version number the same way: major*10000 + minor*100 + patch.
         uint major = packed / 10000;
         uint minor = packed / 100 % 100;
         uint patch = packed % 100;
@@ -174,14 +175,14 @@ internal static class NativeCompressionLibrary
 }
 
 /// <summary>
-/// 把 byte[] 钉住并暴露 IntPtr，供 native 侧按偏移读写。
-/// 用 GCHandle 而不是 unsafe + fixed，是为了不在类库里打开 AllowUnsafeBlocks。
+/// Pins a byte[] and exposes an IntPtr, for the native side to read/write by offset.
+/// Uses GCHandle instead of unsafe + fixed, to avoid enabling AllowUnsafeBlocks in the library.
 /// </summary>
 internal readonly struct PinnedBytes : IDisposable
 {
-    // 空数组不钉自己：GCHandle 对 byte[0] 的 AddrOfPinnedObject 语义未定义（可能是 0），
-    // 而 native 即便 srcSize==0 也可能要求指针非空。统一指向这个 1 字节替身，
-    // 调用点就不需要为「空消息体」特判（zstd/lz4 都允许 srcSize==0 + 合法指针）。
+    // Empty arrays are not pinned themselves: GCHandle.AddrOfPinnedObject on byte[0] has undefined semantics (may be 0),
+    // yet native may still require a non-null pointer even when srcSize==0. Point uniformly at this 1-byte stand-in,
+    // so call sites need no special handling for "empty message body" (both zstd/lz4 allow srcSize==0 with a valid pointer).
     private static readonly byte[] EmptyStandIn = new byte[1];
     private static readonly GCHandle EmptyStandInHandle =
         GCHandle.Alloc(EmptyStandIn, GCHandleType.Pinned);
@@ -201,10 +202,10 @@ internal readonly struct PinnedBytes : IDisposable
         Ptr = _handle.AddrOfPinnedObject();
     }
 
-    /// <summary>首字节地址（空数组时指向 1 字节替身，保证非 null）。</summary>
+    /// <summary>Address of the first byte (points at the 1-byte stand-in for empty arrays, guaranteeing non-null).</summary>
     public IntPtr Ptr { get; }
 
-    /// <summary>第 offset 个字节的地址（native 流式接口要按已消费偏移续读）。</summary>
+    /// <summary>Address of the byte at offset (native streaming interfaces read on from the already-consumed offset).</summary>
     public IntPtr At(int offset) => Ptr + offset;
 
     public void Dispose()
@@ -249,15 +250,15 @@ internal static class NativeZstdCodec
     [DllImport(Lib, EntryPoint = "ZSTD_versionNumber")]
     private static extern uint VersionNumber();
 
-    // zstd.h: #define ZSTD_CONTENTSIZE_UNKNOWN (0ULL - 1)、ZSTD_CONTENTSIZE_ERROR (0ULL - 2)
+    // zstd.h: #define ZSTD_CONTENTSIZE_UNKNOWN (0ULL - 1), ZSTD_CONTENTSIZE_ERROR (0ULL - 2)
     private const ulong ContentSizeUnknown = ulong.MaxValue;
     private const ulong ContentSizeError = ulong.MaxValue - 1;
 
-    // 帧头里的 content-size 是**不可信输入**（可以被伪造得极大），照 LZ4 侧同一上限拦住，
-    // 避免一条坏消息把进程撑爆。
+    // The content-size in the frame header is **untrusted input** (can be forged to be huge); cap it at the same
+    // limit as the LZ4 side to avoid a single bad message blowing up the process.
     private const long MaxDecompressed = 512L * 1024 * 1024;
 
-    /// <summary>zstd-jni 的 Zstd.compress(byte[]) 就是单帧 one-shot，这里同一形状。</summary>
+    /// <summary>zstd-jni's Zstd.compress(byte[]) is a single-frame one-shot, same shape here.</summary>
     internal static byte[] Compress(byte[] src, int level)
     {
         nuint bound = CompressBound((nuint)src.Length);
@@ -274,7 +275,7 @@ internal static class NativeZstdCodec
         FailIfError(written, "ZSTD_compress");
         if ((long)written > dst.Length)
         {
-            // compressBound 是最坏情况上界，写超说明结果不可信——宁可抛错也不交半截数据。
+            // compressBound is the worst-case upper bound; writing past it means the result is untrustworthy — throw rather than hand back half data.
             throw new InvalidOperationException("zstd compress overflowed its compressBound-sized buffer");
         }
 
@@ -285,16 +286,17 @@ internal static class NativeZstdCodec
     {
         using var pin = new PinnedBytes(src);
 
-        // 关键：不能用「第一帧的 content-size」定缓冲——多帧串接时那只够第一帧，
-        // 而 ZSTD_decompress 容量不足是**直接报错**（"Destination buffer is too small"），
-        // 不是写满返回，所以按写满扩容重试的写法解不了串接帧。
-        // ZSTD_decompressBound 给的正是「所有连续帧明文总量」的上界：
-        // 每帧都带 content-size 时它是精确值，否则按 #blocks * min(128KB, window) 估算。
+        // Key: do NOT size the buffer from "the first frame's content-size" — when multiple frames are concatenated that
+        // is only enough for the first frame, and ZSTD_decompress on insufficient capacity **fails outright**
+        // ("Destination buffer is too small"), it does not fill-and-return, so a rewrite that grows-and-retries on fill
+        // cannot decode concatenated frames.
+        // ZSTD_decompressBound gives exactly the upper bound on the total plaintext of all consecutive frames:
+        // it is exact when every frame carries a content-size, otherwise estimated as #blocks * min(128KB, window).
         ulong bound = DecompressBound(pin.Ptr, (nuint)src.Length);
         if (bound == ContentSizeError || bound == ContentSizeUnknown)
         {
-            // 帧本身有问题（非法 magic / 截断）。用 findFrameCompressedSize 复述原生错误名，
-            // 保持「坏输入必抛」而不是透传。
+            // The frame itself is malformed (illegal magic / truncated). Replay the native error name via findFrameCompressedSize,
+            // keeping "bad input must throw" rather than passing through.
             FailIfError(FindFrameCompressedSize(pin.Ptr, (nuint)src.Length), "ZSTD_decompressBound");
             throw new InvalidOperationException("zstd decompress failed: cannot bound decompressed size");
         }
@@ -312,7 +314,7 @@ internal static class NativeZstdCodec
             written = Decompress(pinDst.Ptr, (nuint)dst.Length, pin.Ptr, (nuint)src.Length);
         }
 
-        // 上界充足的前提下若仍报 too small，说明帧头在撒谎：抛错，绝不返回半截明文。
+        // If it still reports too small despite an adequate upper bound, the frame header is lying: throw, never return half plaintext.
         FailIfError(written, "ZSTD_decompress");
         return Shrink(dst, (int)written);
     }
@@ -368,40 +370,40 @@ internal static class NativeZstdCodec
     }
 }
 
-/// 走官方 LZ4F 流式 API，帧头与 lz4-java 默认写法对齐：
-/// 独立块（FLG bit5=1）、max64KB 块（BD=0x40）、不写 content-size（流式时长度未知）、
-/// 不带 content/block checksum ⇒ FLG=0x60，头 7 字节 = magic(4)+FLG+BD+HC。
+/// Uses the official LZ4F streaming API; the frame header is aligned with lz4-java's default writing:
+/// independent blocks (FLG bit5=1), max64KB blocks (BD=0x40), no content-size written (length unknown in streaming),
+/// no content/block checksum => FLG=0x60, header 7 bytes = magic(4)+FLG+BD+HC.
 /// </summary>
 internal static class NativeLz4Codec
 {
     private const string Lib = NativeCompressionLibrary.Lz4;
 
-    /// <summary>lz4frame.h 的 LZ4F_VERSION，创建上下文时必须原样传入。</summary>
+    /// <summary>lz4frame.h's LZ4F_VERSION, must be passed verbatim when creating a context.</summary>
     private const uint Lz4fVersion = 100;
 
-    /// <summary>lz4frame.h 的 LZ4F_HEADER_SIZE_MAX：头最大 19 字节（magic+FLG+BD+size8+dictID4+HC）。</summary>
+    /// <summary>lz4frame.h's LZ4F_HEADER_SIZE_MAX: header is at most 19 bytes (magic+FLG+BD+size8+dictID4+HC).</summary>
     private const int HeaderSizeMax = 19;
 
-    /// <summary>LZ4F_max64KB，也是 lz4-java LZ4FrameOutputStream 的默认块大小。</summary>
+    /// <summary>LZ4F_max64KB, also the default block size of lz4-java's LZ4FrameOutputStream.</summary>
     private const uint BlockMax64KB = 4;
 
-    /// <summary>LZ4F_blockIndependent：lz4-java 默认写独立块（解码端因此无需回溯窗口）。</summary>
+    /// <summary>LZ4F_blockIndependent: lz4-java default writes independent blocks (so the decoder needs no history window).</summary>
     private const uint BlockIndependent = 1;
 
-    // 解压时的目的缓冲；一个满块最多 64KB 明文。
+    // Destination buffer for decompression; one full block is at most 64KB of plaintext.
     private const int DecompressChunk = 64 * 1024;
 
-    // 防「垃圾输入把内存吃光」：单条消息体上限远小于此。
+    // Guard against "garbage input eating all memory": per-message body limit is far below this.
     private const long MaxDecompressed = 512L * 1024 * 1024;
 
     internal static bool IsAvailable => NativeCompressionLibrary.Lz4Available;
 
     /// <summary>
-    /// LZ4F_preferences_t 的托管镜像。字段偏移**不是**靠顺序推导出来的：
-    /// 用本地编译器对 /usr/local/include/lz4frame.h 打印 offsetof 实测得到
-    /// frameInfo{0,4,8,12,16(8B),24,28} + level{32,36,40} + reserved{44,48,52}、总大小 56，
-    /// 所以用 LayoutKind.Explicit 把偏移钉死，避免不同运行时/平台的重排风险。
-    /// C 侧枚举字段都是 4 字节 int/unsigned，contentSize 是 unsigned long long。
+    /// Managed mirror of LZ4F_preferences_t. The field offsets are **not** derived from order:
+    /// they were obtained by having the local compiler print offsetof against /usr/local/include/lz4frame.h,
+    /// frameInfo{0,4,8,12,16(8B),24,28} + level{32,36,40} + reserved{44,48,52}, total size 56,
+    /// so LayoutKind.Explicit pins the offsets to avoid reordering risk across runtimes/platforms.
+    /// The C-side enum fields are all 4-byte int/unsigned, contentSize is unsigned long long.
     /// </summary>
     [StructLayout(LayoutKind.Explicit, Size = 56)]
     private struct Preferences
@@ -420,17 +422,17 @@ internal static class NativeLz4Codec
         [FieldOffset(48)] public uint Reserved1;
         [FieldOffset(52)] public uint Reserved2;
 
-        /// <summary>等价于 C 的 LZ4F_INIT_PREFERENCES 后把 blockMode 改成 independent。</summary>
+        /// <summary>Equivalent to C's LZ4F_INIT_PREFERENCES with blockMode changed to independent.</summary>
         internal static Preferences Lz4LegacyLike() => new()
         {
             BlockSizeID = BlockMax64KB,
             BlockMode = BlockIndependent,
             ContentChecksumFlag = 0,
             FrameType = 0,
-            ContentSize = 0, // 0 == unknown：流式写法，头里不留 content-size 字段
+            ContentSize = 0, // 0 == unknown: streaming write, no content-size field in the header
             DictID = 0,
             BlockChecksumFlag = 0,
-            CompressionLevel = 0, // 0 = 库默认（fast mode）；lz4-java 也忽略上层的 level
+            CompressionLevel = 0, // 0 = library default (fast mode); lz4-java also ignores the caller's level
             AutoFlush = 0,
             FavorDecSpeed = 0,
         };
@@ -483,7 +485,7 @@ internal static class NativeLz4Codec
         try
         {
             var header = new byte[HeaderSizeMax];
-            // 单块最坏增量 + 帧尾（end mark 4B，可能带 content checksum）
+            // worst-case single-block increment + frame footer (end mark 4B, possibly with content checksum)
             nuint bodyCapacity = CompressBound((nuint)src.Length, ref prefs);
             FailIfError(bodyCapacity, "LZ4F_compressBound");
             nuint tailCapacity = CompressBound(0, ref prefs);
@@ -525,7 +527,7 @@ internal static class NativeLz4Codec
         }
         finally
         {
-            _ = FreeCompressionContext(cctx); // 文档：总是成功，返回值可忽略
+            _ = FreeCompressionContext(cctx); // docs: always succeeds, return value can be ignored
         }
     }
 
@@ -577,7 +579,7 @@ internal static class NativeLz4Codec
                     srcPos += (int)srcAvail;
                     frameDone = hint == 0;
 
-                    // 没有任何推进：输入耗尽但帧还没结束 == 截断帧。
+                    // No progress at all: input exhausted but frame not yet ended == truncated frame.
                     if (!frameDone && srcAvail == 0 && dstAvail == 0)
                     {
                         throw new InvalidOperationException(

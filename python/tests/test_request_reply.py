@@ -24,7 +24,7 @@ BASE_TOPIC = "RRUnitTopic"
 
 
 def _request_msg() -> Message:
-    """构造一条「broker 已投递给消费者」的请求消息（带 broker 写入的 CLUSTER）。"""
+    """Build a request message "already delivered by the broker to the consumer" (carrying the broker-written CLUSTER)."""
     m = Message(BASE_TOPIC, b"ping")
     m.put_property(MessageConst.PROPERTY_CLUSTER, "DefaultCluster")
     m.put_property(MessageConst.PROPERTY_CORRELATION_ID, "corr-1")
@@ -33,12 +33,12 @@ def _request_msg() -> Message:
     return m
 
 
-# ---------------------------------------------------------------- 应答消息构造
+# ---------------------------------------------------------------- Reply message construction
 def test_create_reply_message_matches_the_wire_shape():
     reply = create_reply_message(_request_msg(), b"pong")
     assert reply.topic == "DefaultCluster_REPLY_TOPIC"
     assert reply.get_body() == b"pong"
-    # 四个属性一个都不能少，且 CORRELATION_ID/REPLY_TO_CLIENT/TTL 是原样带回
+    # none of the four properties may be missing, and CORRELATION_ID/REPLY_TO_CLIENT/TTL are carried back as-is
     assert reply.get_property(MessageConst.PROPERTY_MESSAGE_TYPE) == "reply"
     assert reply.get_property(MessageConst.PROPERTY_CORRELATION_ID) == "corr-1"
     assert reply.get_property(MessageConst.PROPERTY_MESSAGE_REPLY_TO_CLIENT) == "10.0.0.1@pg#123"
@@ -68,17 +68,17 @@ def test_is_reply_message_flag():
 
 
 def test_reply_topic_constant_is_postfix_not_prefix():
-    # 别把 Request-Reply 的 <cluster>_REPLY_TOPIC 与老的控制台前缀 %REPLY% 搞混
+    # do not confuse Request-Reply's <cluster>_REPLY_TOPIC with the old console prefix %REPLY%
     assert MixAll.REPLY_TOPIC_POSTFIX == "REPLY_TOPIC"
     assert MixAll.REPLY_MESSAGE_FLAG == "reply"
     assert MixAll.get_reply_topic("DefaultCluster") == "DefaultCluster_REPLY_TOPIC"
 
 
-# ---------------------------------------------------------------- 等待槽
+# ---------------------------------------------------------------- Waiting slots
 def test_correlation_id_is_random():
     ids = {create_correlation_id() for _ in range(50)}
     assert len(ids) == 50
-    assert all(len(i) == 36 for i in ids)  # UUID 字符串
+    assert all(len(i) == 36 for i in ids)  # UUID string
 
 
 def test_future_wait_times_out_returns_none():
@@ -103,7 +103,7 @@ def test_holder_put_response_removes_entry():
     assert holder.get_request("c1") is f
 
     assert holder.put_response("c1", Message(BASE_TOPIC, b"pong")) is f
-    # 已经被摘走 → 再投一次（重复应答）必须返回 None，且不会二次唤醒
+    # already removed -> delivering again (duplicate reply) must return None and must not wake twice
     assert holder.get_request("c1") is None
     assert holder.put_response("c1", Message(BASE_TOPIC, b"pong2")) is None
 
@@ -123,9 +123,9 @@ def test_request_timeout_exception_is_mq_client_exception():
     assert issubclass(RequestTimeoutException, MQClientException)
 
 
-# ---------------------------------------------------------------- 线上编码
+# ---------------------------------------------------------------- On-the-wire encoding
 def _make_instance() -> MQClientInstance:
-    # 只构造，不 start() → 不建连、不发心跳，纯离线断言
+    # construct only, no start() -> no connection, no heartbeat, pure offline assertions
     return MQClientInstance("RRUnitClient_%d" % threading.get_ident(), ["127.0.0.1:9876"])
 
 
@@ -168,9 +168,9 @@ def test_reply_wins_over_batch_in_the_send_code():
     assert req.ext_fields["m"] == "true"
 
 
-# ---------------------------------------------------------------- broker 回推入口 326
+# ---------------------------------------------------------------- Broker push entry point 326
 def _push_reply_command(correlation_id: str, body: bytes) -> RemotingCommand:
-    """按 broker ``ReplyMessageProcessor#pushReplyMessage`` 的字段造一条 326 请求。"""
+    """Build a 326 request with the fields of the broker's ``ReplyMessageProcessor#pushReplyMessage``."""
     h = ReplyMessageRequestHeader()
     h.producer_group = "PG_RR"
     h.topic = "DefaultCluster_REPLY_TOPIC"
@@ -191,7 +191,7 @@ def _push_reply_command(correlation_id: str, body: bytes) -> RemotingCommand:
     h.store_host = "127.0.0.1:10911"
     h.store_timestamp = 1700000000001
     cmd = RemotingCommand.create_request_command(RequestCode.PUSH_REPLY_MESSAGE_TO_CLIENT, h)
-    # 真实链路上 ext_fields 由 decode() 从报文填好；这里直接放进去（等价于过了一遍网络）。
+    # on the real path ext_fields is filled from the frame by decode(); here it is put in directly (equivalent to having gone through the network).
     cmd.ext_fields = h.to_ext_fields()
     cmd.body = body
     return cmd
@@ -204,10 +204,10 @@ def test_process_reply_message_delivers_and_responds_success():
     try:
         req = _push_reply_command("corr-326", b"pong")
         resp = inst._process_reply_message(req, "127.0.0.1:10911")
-        # 必须回响应：broker 的 Broker2Client.callClient 是 invokeSync(10s)
+        # a response must be sent: the broker's Broker2Client.callClient is invokeSync(10s)
         assert resp is not None
         assert resp.code == ResponseCode.SUCCESS
-        # 应答被投进等待槽，body 与属性都在
+        # the reply is delivered into the waiting slot, with body and properties intact
         got = future.wait_response_message(1000)
         assert got is not None
         assert got.get_body() == b"pong"
@@ -219,10 +219,10 @@ def test_process_reply_message_delivers_and_responds_success():
 
 
 def test_process_reply_message_unknown_correlation_still_responds_success():
-    """迟到/重复的应答：查不到等待槽只记 warn，仍然要回 SUCCESS。
+    """A late/duplicate reply: when no waiting slot is found, only a warn is logged, and SUCCESS must still be returned.
 
-    回非 SUCCESS 会让 broker 把它当成 push 失败记进日志 —— 实际上应答没丢，
-    只是对应的请求已经超时或已处理过了。
+    Returning non-SUCCESS would make the broker record it as a push failure in the log -- in fact the reply is not lost,
+    the corresponding request has just timed out or has already been processed.
     """
     inst = _make_instance()
     resp = inst._process_reply_message(_push_reply_command("no-such-id", b"late"), "127.0.0.1:10911")
@@ -233,7 +233,7 @@ def test_process_reply_message_unknown_correlation_still_responds_success():
 def test_process_reply_message_returns_system_error_on_bad_header():
     inst = _make_instance()
     cmd = RemotingCommand.create_request_command(RequestCode.PUSH_REPLY_MESSAGE_TO_CLIENT, None)
-    # properties 是非法格式 → 解析抛错 → 必须回 SYSTEM_ERROR 而不是让读线程崩掉
+    # properties is in an illegal format -> parsing raises -> must reply SYSTEM_ERROR instead of crashing the read thread
     cmd.ext_fields = {"properties": "\x00\xff broken"}
     cmd.body = b"x"
     resp = inst._process_reply_message(cmd, "127.0.0.1:10911")

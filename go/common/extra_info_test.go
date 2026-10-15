@@ -176,7 +176,7 @@ func TestExtraInfoParseBatchInfo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseStartOffsetInfo: %v", err)
 	}
-	// 多队列切片必须按 (retry, queueId) 分开，否则第一条会覆盖第二条
+	// Multi-queue slices must be split by (retry, queueId), otherwise the first entry would overwrite the second
 	if starts["0@0"] != 10 || starts["0@1"] != 20 {
 		t.Fatalf("start offsets %v", starts)
 	}

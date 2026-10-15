@@ -58,7 +58,7 @@ console.log('== transaction END_TRANSACTION mapping ==');
   // extFields materialize lazily inside headerEncode() — force it, like the
   // real transport does, before asserting the wire fields.
   const exts = oneway.map((r) => { r.headerEncode(); return r.extFields; });
-  // Wire 字段会被字符串化（JSON 头约定）——按数值比较。
+  // Wire fields are stringified (the JSON header convention) — compare numerically.
   check('COMMIT -> TRANSACTION_COMMIT_TYPE(8)', Number(exts[0]['commitOrRollback']) === MessageSysFlag.TRANSACTION_COMMIT_TYPE,
     `got ${exts[0]['commitOrRollback']}`);
   check('ROLLBACK -> TRANSACTION_ROLLBACK_TYPE(12)', Number(exts[1]['commitOrRollback']) === MessageSysFlag.TRANSACTION_ROLLBACK_TYPE,
@@ -156,9 +156,11 @@ console.log('== producer compression selection ==');
   const zback = decodeMessage(encodeMessageExt(ze, false), true, true);
   check('decodeMessage inflates ZSTD-flagged body', zback != null && zback.getBody().equals(payload));
 
-  // 外部真实压缩帧：常见压缩器产出的是 Compressed 块而不是 Raw 块。
-  // 解不出来就意味着跨语言消费静默收不到消息，所以这是承重的互操作断言。
-  // Fixture = 用 `zstd -3 --no-check` 压缩上面的 payload。
+  // A real external compressed frame: what common compressors produce is a
+  // Compressed block rather than a Raw block.
+  // Failing to decode it would mean cross-language consumption silently receives
+  // nothing, so this is a load-bearing interoperability assertion.
+  // Fixture = the payload above compressed with `zstd -3 --no-check`.
   const zstdCliFrame = Buffer.from(
     '28b52ffd60480ccd000088726f636b65746d712d7061796c6f61642d0100694afe5c02', 'hex');
   const hasNodeZstd = typeof (nodeZlib as unknown as {

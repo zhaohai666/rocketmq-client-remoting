@@ -13,8 +13,8 @@ use super::result::{LocalTransactionState, SendResult};
 
 pub type AnyHolder = Arc<dyn Any + Send + Sync>;
 
-/// 类型不匹配时返回 `None` 而不是 panic —— 钩子之间互不相干，
-/// 一个钩子塞错类型不该让整个发送链路挂掉。
+/// Returns `None` instead of panicking on a type mismatch -- hooks are independent of each other,
+/// and one hook stuffing in the wrong type must not take down the whole send pipeline.
 pub fn any_downcast<T: Any + Send + Sync>(holder: &Option<AnyHolder>) -> Option<&T> {
     holder.as_ref().and_then(|value| value.downcast_ref::<T>())
 }
@@ -65,7 +65,7 @@ pub struct SendMessageContext {
     pub born_host: String,
     pub communication_mode: Option<CommunicationMode>,
     pub send_result: Option<SendResult>,
-    /// 异常槽位：发送失败时由调用方写入，`after` 钩子里读它判成败。
+    /// Exception slot: written by the caller when the send fails, read in the `after` hook to tell success from failure.
     pub exception: Option<Error>,
     pub mq_trace_context: Option<AnyHolder>,
     pub props: Option<HashMap<String, String>>,
@@ -74,7 +74,7 @@ pub struct SendMessageContext {
 }
 
 impl fmt::Debug for SendMessageContext {
-    /// `Arc<dyn Any>` 无法 derive(Debug)，这里只打印「有没有值」，不暴露钩子私有状态。
+    /// `Arc<dyn Any>` cannot derive(Debug), so this prints only whether a value is present, without exposing hook-private state.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SendMessageContext")
             .field("producer_group", &self.producer_group)
@@ -113,17 +113,17 @@ pub struct ConsumeMessageContext {
     pub msg_list: Vec<MessageExt>,
     pub mq: Option<MessageQueue>,
     pub success: bool,
-    /// 消费状态的名字串（如 `"CONSUME_SUCCESS"`）。
+    /// Name string of the consume status (e.g. `"CONSUME_SUCCESS"`).
     pub status: Option<String>,
     pub mq_trace_context: Option<AnyHolder>,
     pub props: Option<HashMap<String, String>>,
-    /// `"LOCAL"` / `"CLOUD"`，见模块头差异说明 3。
+    /// `"LOCAL"` / `"CLOUD"`, see difference note 3 in the module header.
     pub access_channel: Option<String>,
 }
 
 impl ConsumeMessageContext {
-    /// 构造消费钩子上下文：`success` 缺省 `true`；
-    /// `msg_list` 为 `None` 或空时都得到空列表。
+    /// Builds the consume-hook context: `success` defaults to `true`;
+    /// a `msg_list` of `None` or empty both yield an empty list.
     pub fn new(
         consumer_group: &str,
         msg_list: Option<Vec<MessageExt>>,
@@ -140,7 +140,7 @@ impl ConsumeMessageContext {
 }
 
 impl fmt::Debug for ConsumeMessageContext {
-    /// `msg_list` 只打长度（一批消息的完整 repr 太吵），私有轨迹状态只打「有没有」。
+    /// `msg_list` prints only the length (the full repr of a message batch is too noisy), and private trace state prints only whether it is present.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ConsumeMessageContext")
             .field("consumer_group", &self.consumer_group)
@@ -191,8 +191,8 @@ pub trait EndTransactionHook: Send + Sync {
 
 // ------------------------------------------------------- CheckForbiddenHook
 
-/// 发送前拦截钩子的上下文。与 [`SendMessageContext`] 的关键差别：**没有 sendResult**
-/// （此刻还没发），带上 `arg`（`send(msg, selector, arg)` 里的业务参数）。
+/// Context of the pre-send interception hook. The key difference from [`SendMessageContext`]: **no sendResult**
+/// (nothing has been sent yet), plus `arg` (the business argument from `send(msg, selector, arg)`).
 #[derive(Default)]
 pub struct CheckForbiddenContext {
     pub name_srv_addr: String,
@@ -234,8 +234,8 @@ pub trait CheckForbiddenHook: Send + Sync {
 
 // --------------------------------------------------------- FilterMessageHook
 
-/// `msg_list` 是**可变的**：钩子把它替换/裁剪掉的消息会被客户端直接丢弃
-/// （拉取路径 = 静默跳过；POP 路径 = 立刻 ack）。
+/// `msg_list` is **mutable**: messages a hook replaces or trims away are dropped by the client outright
+/// (pull path = silently skipped; POP path = acked immediately).
 #[derive(Clone, Default)]
 pub struct FilterMessageContext {
     pub consumer_group: String,
@@ -281,29 +281,29 @@ pub trait FilterMessageHook: Send + Sync {
     }
 }
 
-// -------------------------------------------------------------- 钩子注册表
+// -------------------------------------------------------------- hook registry
 
-/// `send_message_hook_list` 等钩子注册表。
+/// Hook registries such as `send_message_hook_list`.
 ///
-/// 注册与触发可能跨线程，所以这里是
-/// `RwLock<Vec<Arc<H>>>`；[`HookList::hooks`] 返回**快照**，
-/// 遍历语义等于「当时那张列表」。
+/// Registration and firing can happen across threads, so this is
+/// `RwLock<Vec<Arc<H>>>`; [`HookList::hooks`] returns a **snapshot**,
+/// whose iteration semantics equal "the list as it was at that moment".
 pub struct HookList<H: ?Sized> {
     inner: RwLock<Vec<Arc<H>>>,
 }
 
 impl<H: ?Sized> HookList<H> {
-    /// 空表。
+    /// Empty list.
     pub fn new() -> Self {
         HookList { inner: RwLock::new(Vec::new()) }
     }
 
-    /// 追加到末尾，触发顺序 = 注册顺序；非空由 `Arc` 保证，无需判空。
+    /// Appends to the end; firing order = registration order; `Arc` guarantees a valid hook, so no null check is needed.
     pub fn register(&self, hook: Arc<H>) {
         write_guard(&self.inner).push(hook);
     }
 
-    /// 是否已注册钩子。
+    /// Whether any hook is registered.
     pub fn has_hooks(&self) -> bool {
         !read_guard(&self.inner).is_empty()
     }
@@ -316,7 +316,7 @@ impl<H: ?Sized> HookList<H> {
         self.len() == 0
     }
 
-    /// 按注册顺序的快照。
+    /// Snapshot in registration order.
     pub fn hooks(&self) -> Vec<Arc<H>> {
         read_guard(&self.inner).clone()
     }
@@ -334,18 +334,18 @@ impl<H: ?Sized> fmt::Debug for HookList<H> {
     }
 }
 
-/// `send_message_hook_list`：producer 侧发送钩子注册表。
+/// `send_message_hook_list`: producer-side send hook registry.
 pub type SendMessageHookList = HookList<dyn SendMessageHook>;
-/// `consume_message_hook_list`：consumer 侧消费钩子注册表。
+/// `consume_message_hook_list`: consumer-side consume hook registry.
 pub type ConsumeMessageHookList = HookList<dyn ConsumeMessageHook>;
-/// `end_transaction_hook_list`。
+/// `end_transaction_hook_list`.
 pub type EndTransactionHookList = HookList<dyn EndTransactionHook>;
-/// `check_forbidden_hook_list`。
+/// `check_forbidden_hook_list`.
 pub type CheckForbiddenHookList = HookList<dyn CheckForbiddenHook>;
-/// `filter_message_hook_list`。
+/// `filter_message_hook_list`.
 pub type FilterMessageHookList = HookList<dyn FilterMessageHook>;
 
-/// `DefaultMQProducerImpl.executeSendMessageHookBefore`：异常吞掉并记 warn。
+/// `DefaultMQProducerImpl.executeSendMessageHookBefore`: exceptions are swallowed and logged as warn.
 pub fn execute_send_message_hook_before(
     hooks: &SendMessageHookList,
     context: &mut SendMessageContext,
@@ -357,7 +357,7 @@ pub fn execute_send_message_hook_before(
     }
 }
 
-/// `DefaultMQProducerImpl.executeSendMessageHookAfter`：异常吞掉并记 warn。
+/// `DefaultMQProducerImpl.executeSendMessageHookAfter`: exceptions are swallowed and logged as warn.
 pub fn execute_send_message_hook_after(
     hooks: &SendMessageHookList,
     context: &mut SendMessageContext,
@@ -369,9 +369,9 @@ pub fn execute_send_message_hook_after(
     }
 }
 
-/// `DefaultMQProducerImpl.executeCheckForbiddenHook`。
+/// `DefaultMQProducerImpl.executeCheckForbiddenHook`.
 ///
-/// ⚠ 与上面两个相反：**不吞异常**，第一个拒绝就向上抛。
+/// ⚠ Opposite of the two above: **does not swallow exceptions**; the first rejection is propagated up.
 pub fn execute_check_forbidden_hook(
     hooks: &CheckForbiddenHookList,
     context: &mut CheckForbiddenContext,
@@ -385,7 +385,7 @@ pub fn execute_check_forbidden_hook(
     Ok(())
 }
 
-/// `DefaultMQProducerImpl.executeEndTransactionHook`：异常吞掉并记 warn。
+/// `DefaultMQProducerImpl.executeEndTransactionHook`: exceptions are swallowed and logged as warn.
 pub fn execute_end_transaction_hook(
     hooks: &EndTransactionHookList,
     context: &mut EndTransactionContext,
@@ -397,7 +397,7 @@ pub fn execute_end_transaction_hook(
     }
 }
 
-/// `DefaultMQPushConsumerImpl.executeConsumeHookBefore`：异常吞掉并记 warn。
+/// `DefaultMQPushConsumerImpl.executeConsumeHookBefore`: exceptions are swallowed and logged as warn.
 pub fn execute_consume_hook_before(hooks: &ConsumeMessageHookList, context: &mut ConsumeMessageContext) {
     for hook in hooks.hooks() {
         if let Err(e) = hook.consume_message_before(context) {
@@ -406,7 +406,7 @@ pub fn execute_consume_hook_before(hooks: &ConsumeMessageHookList, context: &mut
     }
 }
 
-/// `DefaultMQPushConsumerImpl.executeConsumeHookAfter`：异常吞掉并记 warn。
+/// `DefaultMQPushConsumerImpl.executeConsumeHookAfter`: exceptions are swallowed and logged as warn.
 pub fn execute_consume_hook_after(hooks: &ConsumeMessageHookList, context: &mut ConsumeMessageContext) {
     for hook in hooks.hooks() {
         if let Err(e) = hook.consume_message_after(context) {
@@ -418,13 +418,13 @@ pub fn execute_consume_hook_after(hooks: &ConsumeMessageHookList, context: &mut 
 pub fn execute_filter_hooks(hooks: &FilterMessageHookList, context: &mut FilterMessageContext) {
     for hook in hooks.hooks() {
         if let Err(e) = hook.filter_message(context) {
-            // hook_name 不可失败，日志直接带上。
+            // hook_name cannot fail, so it goes straight into the log.
             rmq_error!("execute hook error. hookName={}: {}", hook.hook_name(), e);
         }
     }
 }
 
-/// `Option<AnyHolder>` 的 Debug 口径：只暴露「有没有值」，不依赖具体类型。
+/// Debug convention for `Option<AnyHolder>`: exposes only whether a value is present, independent of the concrete type.
 fn holder_state(holder: &Option<AnyHolder>) -> &'static str {
     if holder.is_some() {
         "set"
@@ -433,7 +433,7 @@ fn holder_state(holder: &Option<AnyHolder>) -> &'static str {
     }
 }
 
-/// 锁毒化时照样读写（钩子表不该因为别的线程 panic 而整体不可用）。
+/// Reads/writes proceed even when the lock is poisoned (the hook table must not become wholly unusable because another thread panicked).
 fn read_guard<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
     lock.read().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -447,7 +447,7 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// 记录调用顺序的假钩子。
+    /// Fake hook that records the call order.
     #[derive(Default)]
     struct Recorder {
         calls: Mutex<Vec<String>>,
@@ -597,7 +597,7 @@ mod tests {
         assert_eq!(CommunicationMode::Sync.name(), "SYNC");
         assert_eq!(CommunicationMode::Async.to_string(), "ASYNC");
         assert_eq!(CommunicationMode::Oneway.to_string(), "ONEWAY");
-        // 未知名字回落 SYNC（与 result.rs 的 from_code 口径一致）
+        // Unknown names fall back to SYNC (same convention as from_code in result.rs)
         assert_eq!(CommunicationMode::from_name("NOPE"), CommunicationMode::Sync);
         assert_eq!(CommunicationMode::from_name(""), CommunicationMode::Sync);
         assert_eq!(CommunicationMode::from_name("ONEWAY"), CommunicationMode::Oneway);
@@ -628,7 +628,7 @@ mod tests {
         assert_eq!(context.group, "");
         assert_eq!(context.broker_addr, "");
         assert!(context.communication_mode.is_none());
-        // 此刻还没发：与 SendMessageContext 的关键差别
+        // Nothing has been sent yet: the key difference from SendMessageContext
         assert!(context.send_result.is_none());
         assert!(context.arg.is_none());
         assert!(!context.unit_mode);
@@ -649,7 +649,7 @@ mod tests {
 
     #[test]
     fn consume_context_success_defaults_true_like_golden_init() {
-        // 构造时 success 是 true；投递路径上 consumer 侧会显式改成 false。
+        // success is true at construction; the consumer side explicitly flips it to false on the delivery path.
         let context = ConsumeMessageContext::new("GID_test", None, None);
         assert!(context.success);
         assert_eq!(context.consumer_group, "GID_test");
@@ -665,7 +665,7 @@ mod tests {
             Some(MessageQueue::new("TopicTest", "broker-a", 0)),
         );
         assert_eq!(with_msgs.msg_list.len(), 1);
-        // 空列表与 None 一样落到空表
+        // An empty list lands as an empty list, same as None
         assert!(ConsumeMessageContext::new("G", Some(Vec::new()), None).msg_list.is_empty());
     }
 
@@ -705,10 +705,10 @@ mod tests {
 
         let mut context = SendMessageContext::default();
         execute_send_message_hook_before(&hooks, &mut context);
-        // 第一个钩子的错误被吞（warn），第二个照常执行
+        // The first hook's error is swallowed (warn), and the second still runs
         assert_eq!(boom.snapshot(), vec!["before".to_string()]);
         assert_eq!(fine.snapshot(), vec!["before".to_string()]);
-        // before 写下的私有状态 after 能取回（mq_trace_context 约定）
+        // Private state written by before is retrievable in after (the mq_trace_context convention)
         execute_send_message_hook_after(&hooks, &mut context);
         assert_eq!(
             fine.snapshot(),
@@ -726,7 +726,7 @@ mod tests {
 
         let mut context = CheckForbiddenContext::default();
         let err = execute_check_forbidden_hook(&hooks, &mut context)
-            .expect_err("test-only: 拦截异常必须向上抛");
+            .expect_err("test-only: the interception error must propagate up");
         assert!(err.to_string().contains("forbidden by test hook"));
         assert_eq!(first.snapshot(), vec!["check".to_string()]);
         assert_eq!(second.snapshot(), Vec::<String>::new());
@@ -763,7 +763,7 @@ mod tests {
         context.success = false;
         execute_consume_hook_before(&hooks, &mut context);
         execute_consume_hook_after(&hooks, &mut context);
-        // 抛错只影响它自己那一侧：before 的错被吞，它的 after 照旧执行
+        // A thrown error affects only its own side: before's error is swallowed, and its after still runs
         assert_eq!(
             boom.snapshot(),
             vec!["consume-before".to_string(), "consume-after".to_string()]
@@ -773,7 +773,7 @@ mod tests {
             vec!["consume-before".to_string(), "consume-after".to_string()]
         );
 
-        // 事务收尾钩子抛错同样只记 warn，且不影响后续钩子
+        // An error thrown by the end-transaction hook likewise only logs warn and does not affect later hooks
         let end_hooks = EndTransactionHookList::new();
         let end_recorder = Arc::new(Recorder::default());
         end_hooks.register(Arc::new(EndHook { recorder: end_recorder.clone() }));
@@ -799,7 +799,7 @@ mod tests {
         assert_eq!(context.msg_list[0].get_body(), b"keep");
         assert_eq!(recorder.snapshot(), vec!["filter".to_string()]);
 
-        // 抛错的过滤钩子不影响投递：列表原样
+        // A throwing filter hook does not affect delivery: the list stays as is
         let boom_hooks = FilterMessageHookList::new();
         boom_hooks.register(Arc::new(BoomFilter));
         let mut context = FilterMessageContext::new("G", Some(vec![msg_ext(b"a")]), None);
@@ -807,7 +807,7 @@ mod tests {
         assert_eq!(context.msg_list.len(), 1);
         assert_eq!(context.msg_list[0].get_body(), b"a");
 
-        // 钩子也可以把列表整体清空
+        // A hook may also clear the list entirely
         let mut context = FilterMessageContext::new("G", Some(vec![msg_ext(b"a")]), None);
         context.msg_list.clear();
         assert!(context.msg_list.is_empty());

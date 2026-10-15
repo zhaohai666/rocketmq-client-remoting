@@ -1,8 +1,10 @@
-// C# 客户端 SQL92 过滤 + CHECK_CLIENT_CONFIG(46) 真机联调
-// （场景 S1–S4 逐段验，报文形状的离线断言见 CheckClientConfigTests）。
+// Real-machine integration of the C# client's SQL92 filtering + CHECK_CLIENT_CONFIG(46)
+// (scenarios S1-S4 verified section by section; the offline assertions on the wire shape are
+// in CheckClientConfigTests).
 //
-// 前置：本地 5.5.1 集群已起，且 broker 配了 enablePropertyFilter=true。
-// 用法：rmq sql92 [namesrv]
+// Prerequisite: a local 5.5.1 cluster is up and the broker is configured with
+// enablePropertyFilter=true.
+// Usage: rmq sql92 [namesrv]
 using System.Text;
 using RocketMQ.Client;
 using RocketMQ.Common;
@@ -53,11 +55,13 @@ public static class LiveSql92
     private static string Join(IEnumerable<string> items) =>
         "[" + string.Join(",", items) + "]";
 
-    // ---------------- 取证钩子 ----------------
+    // ---------------- the evidence hook ----------------
 
     /// <summary>
-    /// 钩在 transport 上，抓启动期真正发出去的 46 号请求（含 body）。
-    /// DoBeforeRequest 跑在发送线程上、一个钩子对象可能被多线程共用，必须自带锁。
+  /// Hung on the transport, capturing the 46 requests really sent during startup (including
+  /// the body).
+  /// DoBeforeRequest runs on the sending thread and one hook object may be shared by several
+  /// threads, so it must bring its own lock.
     /// </summary>
     private sealed class CheckConfigProbe : IRpcHook
     {
@@ -113,7 +117,7 @@ public static class LiveSql92
         }
     }
 
-    // ---------------- 收集监听器 ----------------
+    // ---------------- the collecting listener ----------------
 
     private sealed class Sink
     {
@@ -177,9 +181,10 @@ public static class LiveSql92
         }
     }
 
-    // ---------------- 环境 ----------------
+    // ---------------- environment ----------------
 
-    /// <summary>一套按 Stamp 隔离的 topic/group，跑完自己扫干净。</summary>
+    /// <summary>A topic/group set isolated by Stamp that sweeps itself up when
+   /// done.</summary>
     private sealed class Env
     {
         private readonly DefaultMQAdminExt _admin = new("SQL92DOTNETADMIN");
@@ -229,7 +234,8 @@ public static class LiveSql92
         }
 
         /// <summary>
-        /// 消费者通用装配：地址 + 起点 + 订阅（selector 为 null 时用 TAG 表达式）+ 可选取证钩子。
+        /// The common consumer wiring: address + starting point + subscription (the TAG
+        /// expression when selector is null) + an optional evidence hook.
         /// </summary>
         public void Configure(DefaultMQPushConsumer c, string topic, MessageSelector? selector,
             string expression, IRpcHook? probe)
@@ -280,7 +286,7 @@ public static class LiveSql92
 
             foreach (string g in _groups.ToList())
             {
-                // %RETRY%/%DLQ% 随订阅组一起删（只有走删组接口 broker 才会真删 retry topic）
+            // %RETRY%/%DLQ% go away together with the subscription group (the broker really deletes the retry topic only when the delete-group endpoint is used)
                 try
                 {
                     _admin.DeleteSubscriptionGroup(addr, g, true);
@@ -297,7 +303,7 @@ public static class LiveSql92
                 }
                 catch (Exception)
                 {
-                    // retry topic 可能已被删组接口连带删掉
+                // the retry topic may already have been taken down along with the group
                 }
             }
 
@@ -305,11 +311,11 @@ public static class LiveSql92
         }
     }
 
-    // ---------------- S1 线上取证 ----------------
+    // ---------------- S1 the wire evidence ----------------
 
     private static void S1WireEvidence(Env env, string topic)
     {
-        Console.WriteLine("\n---------- S1 启动期的 46 号请求 ----------");
+        Console.WriteLine("\n---------- S1 the 46 requests during startup ----------");
         string sqlGroup = env.Group("SQL");
         var probe = new CheckConfigProbe();
         var sqlSink = new Sink();
@@ -323,10 +329,10 @@ public static class LiveSql92
         }
         catch (Exception e)
         {
-            Check("S1 SQL92 消费者启动成功", false, e.Message);
+  Check("S1 the SQL92 consumer started successfully", false, e.Message);
         }
 
-        Check("S1 SQL92 订阅触发恰好一笔 CHECK_CLIENT_CONFIG(46)", probe.CheckCount() == 1,
+   Check("S1 the SQL92 subscription triggers exactly one CHECK_CLIENT_CONFIG(46)", probe.CheckCount() == 1,
             "codes=" + probe.CodesStr());
         CheckClientRequestBody? body = probe.FirstBody();
         bool shapeOk = body != null
@@ -335,7 +341,7 @@ public static class LiveSql92
                        && body.SubscriptionData?.ExpressionType == ExpressionType.Sql92
                        && body.SubscriptionData?.SubString == "color = 'red'"
                        && body.SubscriptionData?.Topic == topic;
-        Check("S1 body 是 CheckClientRequestBody（clientId / group / subscriptionData）", shapeOk,
+        Check("S1 the body is a CheckClientRequestBody (clientId / group / subscriptionData)", shapeOk,
             "hasBody=" + (body != null)
             + " group=" + body?.Group
             + " clientId=" + body?.ClientId + " want=" + sqlConsumer.ClientId
@@ -355,10 +361,10 @@ public static class LiveSql92
         }
         catch (Exception e)
         {
-            Check("S1 TAG 消费者启动成功", false, e.Message);
+        Check("S1 the TAG consumer started successfully", false, e.Message);
         }
 
-        Check("S1 纯 TAG 订阅一笔 46 都不发（isTagType 短路）", tagProbe.CheckCount() == 0,
+      Check("S1 a pure TAG subscription sends not a single 46 (the isTagType short circuit)", tagProbe.CheckCount() == 0,
             "codes=" + tagProbe.CodesStr());
         tagConsumer.Shutdown();
     }
@@ -367,7 +373,7 @@ public static class LiveSql92
 
     private static void S2S3RealFiltering(Env env, string topic, DefaultMQProducer prod)
     {
-        Console.WriteLine("\n---------- S2 broker 按属性过滤 / S3 永不匹配的表达式 ----------");
+        Console.WriteLine("\n---------- S2 the broker filters by property / S3 an expression that never matches ----------");
         var redSink = new Sink();
         var greenSink = new Sink();
         var allSink = new Sink();
@@ -380,7 +386,8 @@ public static class LiveSql92
         redConsumer.SetMessageListener(new CollectListener(redSink));
         greenConsumer.SetMessageListener(new CollectListener(greenSink));
         allConsumer.SetMessageListener(new CollectListener(allSink));
-        // 必须先起来再发：新消费组的 CONSUME_FROM_LAST_OFFSET 会跳过启动前的消息。
+        // It has to be started before the send: a new group's CONSUME_FROM_LAST_OFFSET skips
+    // the messages sent before startup.
         redConsumer.Start();
         greenConsumer.Start();
         allConsumer.Start();
@@ -401,7 +408,7 @@ public static class LiveSql92
                     };
                     msg.PutProperty("color", color);
                     SendResult r = prod.Send(msg, 5000);
-                    Check("S2 发送 " + text + " 成功", r.SendStatus == SendStatus.SendOk, r.MsgId);
+                    Check("S2 sending " + text + " succeeded", r.SendStatus == SendStatus.SendOk, r.MsgId);
                     (color == "red" ? redSent : blueSent).Add(text);
                 }
             }
@@ -410,21 +417,21 @@ public static class LiveSql92
             blueSent.Sort(StringComparer.Ordinal);
 
             WaitUntil(() => allSink.Count() >= 6, 25000);
-            Thread.Sleep(4000); // 再等一会，确认 green 不是"来得晚"
+            Thread.Sleep(4000); // wait a bit more, to confirm green is not "it just arrived late"
             List<string> gotRed = redSink.Sorted();
             List<string> gotAll = allSink.Sorted();
-            Check("S2 SQL92(color=red) 收到 3 条，且正好是发出去的那 3 条",
+            Check("S2 the SQL92(color=red) consumer received 3, and exactly the 3 that were sent",
                 gotRed.SequenceEqual(redSent), Join(gotRed));
             List<string> everything = redSent.Concat(blueSent).ToList();
             everything.Sort(StringComparer.Ordinal);
-            Check("S2 TAG '*' 对照组收到 6 条（红+蓝全在）", gotAll.SequenceEqual(everything),
+     Check("S2 the TAG '*' control group received all 6 (red+blue)", gotAll.SequenceEqual(everything),
                 Join(gotAll));
-            Check("S2 blue 的 3 条没漏进 SQL92 消费者（证明 broker 真在过滤）",
+     Check("S2 the 3 blue ones did not leak into the SQL92 consumer (proving the broker really filters)",
                 !blueSent.Any(gotRed.Contains), Join(gotRed));
             SortedSet<string> colors = redSink.Colors();
-            Check("S2 收到的消息属性 color 可读且都是 red", colors.SetEquals(new[] { "red" }),
+          Check("S2 the color property of the received messages is readable and all red", colors.SetEquals(new[] { "red" }),
                 Join(colors));
-            Check("S3 订阅永不匹配的 color='green' ⇒ 一条都没收到", greenSink.Count() == 0,
+      Check("S3 subscribing to the never-matching color='green' => nothing received", greenSink.Count() == 0,
                 Join(greenSink.Sorted()));
         }
         finally
@@ -435,11 +442,11 @@ public static class LiveSql92
         }
     }
 
-    // ---------------- S4 反证 ----------------
+    // ---------------- S4 the counter-proof ----------------
 
     private static void S4BadExpressionFails(Env env, string topic)
     {
-        Console.WriteLine("\n---------- S4 非法表达式在启动期失败 ----------");
+        Console.WriteLine("\n---------- S4 an illegal expression fails at startup ----------");
         string badGroup = env.Group("BAD");
         var sink = new Sink();
         var consumer = new DefaultMQPushConsumer(badGroup);
@@ -468,15 +475,15 @@ public static class LiveSql92
         }
 
         long costMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - began;
-        Check("S4 Start() 抛出 MQClientException", threw == 1, message);
-        Check("S4 错误码是 broker 的 SUBSCRIPTION_PARSE_FAILED(23)",
+     Check("S4 Start() threw MQClientException", threw == 1, message);
+     Check("S4 the error code is the broker's SUBSCRIPTION_PARSE_FAILED(23)",
             code == ResponseCode.SubscriptionParseFailed,
             "code=" + code.ToString(CultureInfo.InvariantCulture) + " remark=" + message);
-        Check("S4 失败后消费者没留在已启动状态", !consumer.IsStarted);
-        Check("S4 非法表达式立刻失败（<5s，不是等超时兜底）", costMs < 5000,
+        Check("S4 after the failure the consumer did not stay in the started state", !consumer.IsStarted);
+        Check("S4 the illegal expression fails at once (<5s, not by waiting out a timeout backstop)", costMs < 5000,
             costMs.ToString(CultureInfo.InvariantCulture) + "ms");
 
-        // 回滚干净了？同一个对象换个合法表达式应当能重新 Start
+        // Was the rollback clean? The same object with a legal expression must be able to Start again
         string retryMessage = "";
         try
         {
@@ -488,7 +495,7 @@ public static class LiveSql92
             retryMessage = e.Message;
         }
 
-        Check("S4 失败后修正表达式可重新 Start（启动已就地回滚）", retryMessage.Length == 0,
+   Check("S4 after the failure a corrected expression can Start again (the startup was rolled back in place)", retryMessage.Length == 0,
             retryMessage);
         if (retryMessage.Length == 0)
         {
@@ -518,9 +525,9 @@ public static class LiveSql92
         producer.Start();
         try
         {
-            // 队列数 4：建 topic 时显式指定 4 个队列
+       // 4 queues: explicitly asked for 4 queues when creating the topic
             producer.CreateTopic(MixAll.DefaultTopic, topic, 4);
-            Check("T0 topic 路由就绪（4 队列）",
+     Check("T0 the topic route is ready (4 queues)",
                 WaitUntil(() => env.RouteQueueCount(topic) >= 4, 20000),
                 "queues=" + env.RouteQueueCount(topic).ToString(CultureInfo.InvariantCulture));
 

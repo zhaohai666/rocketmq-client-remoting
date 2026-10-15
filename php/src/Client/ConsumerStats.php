@@ -20,13 +20,13 @@ final class StatsSnapshot
     }
 }
 
-/** 单项统计：累计 value/times + 分钟/小时两级采样链。 */
+/** Single stat item: cumulative value/times + minute/hour two-tier sampling chain. */
 final class StatsItem
 {
     private int $value = 0;
     private int $times = 0;
 
-    /** @var list<array{0:int,1:int,2:int}> 元素 = (timestamp_ms, 累计 value, 累计 times) */
+    /** @var list<array{0:int,1:int,2:int}> element = (timestamp_ms, cumulative value, cumulative times) */
     private array $minute = [];
 
     /** @var list<array{0:int,1:int,2:int}> */
@@ -80,7 +80,7 @@ final class StatsItem
         return [(int) (microtime(true) * 1000.0), $this->value, $this->times];
     }
 
-    /** 追加分钟级采样点（每 10s 由采样线程调用）。 */
+    /** Append a minute-level sample point (called by the sampling thread every 10s). */
     public function sample(): void
     {
         $this->minute[] = $this->sampleData();
@@ -89,7 +89,7 @@ final class StatsItem
         }
     }
 
-    /** 追加小时级采样点（每 10 分钟由采样线程调用）。 */
+    /** Append an hour-level sample point (called by the sampling thread every 10 minutes). */
     public function sampleHour(): void
     {
         $this->hour[] = $this->sampleData();
@@ -205,7 +205,7 @@ final class ConsumerStatsManager
         ];
     }
 
-    // ---------------- 生命周期 ----------------
+    // ---------------- Lifecycle ----------------
 
     public function start(): void
     {
@@ -223,8 +223,9 @@ final class ConsumerStatsManager
     }
 
     /**
-     * 采样线程一轮：分钟级采样全部 StatsItemSet；每 60 轮（60 × 10s = 10 分钟）
-     * 追加一次小时级采样（对应采样循环体的循环体）。
+     * One round of the sampling thread: minute-level sampling of all StatsItemSets; every
+     * 60 rounds (60 x 10s = 10 minutes) an hour-level sample is appended (corresponding
+     * to the loop body of the sampling loop).
      */
     public function sampleOnce(): void
     {
@@ -270,7 +271,7 @@ final class ConsumerStatsManager
         $this->topicAndGroupConsumeFailedTps->addValue(self::key($topic, $group), $msgs, 1);
     }
 
-    // ---------------- 查询 ----------------
+    // ---------------- Query ----------------
 
     public function consumeStatus(string $group, string $topic): ConsumeStatus
     {

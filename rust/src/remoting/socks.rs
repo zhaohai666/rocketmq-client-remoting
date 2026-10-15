@@ -14,16 +14,16 @@ pub enum SocksVersion {
     V5,
 }
 
-/// `addr` 支持 scheme 前缀选版本：`socks5://host:port`（缺省）与
-/// `socks4://host:port`；`username`/`password` 任一非空即认为要走认证
-/// （SOCKS5 的用户名/密码子协商；SOCKS4 的 username 是 userid，无密码字段）。
+/// `addr` supports scheme prefixes to pick the version: `socks5://host:port` (default) and
+/// `socks4://host:port`; if either `username` or `password` is non-empty we assume auth is required
+/// (SOCKS5 username/password subnegotiation; in SOCKS4 the username is the userid, there is no password field).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SocksProxyConfig {
-    /// 代理地址 `host:port`（可带 `socks5://` / `socks4://` 前缀）。
+    /// Proxy address `host:port` (may carry a `socks5://` / `socks4://` prefix).
     pub addr: String,
-    /// 认证用户名（SOCKS5 子协商 / SOCKS4 userid）。`None`/空 = 不认证。
+    /// Auth username (SOCKS5 subnegotiation / SOCKS4 userid). `None`/empty = no auth.
     pub username: Option<String>,
-    /// 认证密码（仅 SOCKS5 子协商使用；SOCKS4 没有密码字段）。
+    /// Auth password (used only by the SOCKS5 subnegotiation; SOCKS4 has no password field).
     pub password: Option<String>,
 }
 
@@ -48,7 +48,7 @@ impl SocksProxyConfig {
         }
     }
 
-    /// 从 `addr` 里解析出协议版本与裸地址；缺省 SOCKS5。
+    /// Parse the protocol version and the bare address out of `addr`; defaults to SOCKS5.
     fn version_and_addr(&self) -> (SocksVersion, &str) {
         let addr = self.addr.trim();
         if let Some(rest) = addr
@@ -72,15 +72,15 @@ impl SocksProxyConfig {
     }
 }
 
-/// SOCKS5 子协商的方法号。
+/// SOCKS5 subnegotiation method numbers.
 const METHOD_NO_AUTH: u8 = 0x00;
 const METHOD_USERNAME_PASSWORD: u8 = 0x02;
 const METHOD_NO_ACCEPTABLE: u8 = 0xFF;
 
-/// SOCKS5 用户名/密码子协商的版本号（RFC 1929，固定 0x01）。
+/// SOCKS5 username/password subnegotiation version number (RFC 1929, fixed 0x01).
 const SUBNEGOTIATION_VERSION: u8 = 0x01;
 
-/// 经代理建连到 `target_host:target_port`：TCP 连代理 + SOCKS 握手（CONNECT）。
+/// Connect to `target_host:target_port` via the proxy: TCP connect to the proxy + SOCKS handshake (CONNECT).
 pub(crate) async fn connect_via_proxy(
     proxy: &SocksProxyConfig,
     target_host: &str,
@@ -134,8 +134,8 @@ async fn socks5_handshake(
     host: &str,
     port: u16,
 ) -> Result<()> {
-    // 方法协商：有凭据就同时报「无认证 + 用户名密码」两种（服务端挑一个），
-    // 无凭据只报「无认证」。
+    // Method selection: with credentials advertise both "no auth + username/password" (the server picks one),
+    // without credentials advertise only "no auth".
     let methods: &[u8] = if credentials.is_some() {
         &[METHOD_NO_AUTH, METHOD_USERNAME_PASSWORD]
     } else {
@@ -231,11 +231,11 @@ async fn socks5_handshake(
     if head[1] != 0x00 {
         return Err(connect_error(host, port, socks5_reply_reason(head[1])));
     }
-    // BND.ADDR + BND.PORT 读掉就行，内容对客户端没有意义。
+    // BND.ADDR + BND.PORT just get read off; their content means nothing to the client.
     let trail_len = match head[3] {
         0x01 => 4 + 2,
         0x04 => 16 + 2,
-        0x03 => 1 + 2, // 1 字节长度 + 之后单独读
+        0x03 => 1 + 2, // 1-byte length + the domain read separately afterwards
         other => {
             return Err(connect_error(
                 host,
@@ -268,7 +268,7 @@ async fn username_password_subnegotiation(
     port: u16,
 ) -> Result<()> {
     let (u, p) = (username.as_bytes(), password.as_bytes());
-    // RFC 1929：用户名/密码各限 1..255 字节。
+    // RFC 1929: username and password are each limited to 1..255 bytes.
     if u.is_empty() || u.len() > 255 || p.len() > 255 {
         return Err(connect_error(
             host,
@@ -322,8 +322,8 @@ fn socks5_reply_reason(rep: u8) -> String {
     }
 }
 
-/// SOCKS4 / 4a CONNECT。`credentials` 里只有 username 有意义（userid），
-/// SOCKS4 没有密码字段。目标是域名时走 4a 扩展（DESTPORT 后跟域名）。
+/// SOCKS4 / 4a CONNECT. Only the username in `credentials` is meaningful (userid),
+/// SOCKS4 has no password field. When the target is a domain, use the 4a extension (the domain follows DESTPORT).
 async fn socks4_handshake(
     stream: &mut TcpStream,
     credentials: Option<(&str, &str)>,
@@ -341,7 +341,7 @@ async fn socks4_handshake(
             None
         }
         Err(_) => {
-            // 4a：IP 写 0.0.0.x（x != 0），真域名跟在 userid 之后。
+            // 4a: the IP is written as 0.0.0.x (x != 0), the real domain follows the userid.
             request.extend_from_slice(&[0, 0, 0, 1]);
             Some(host)
         }
@@ -381,7 +381,7 @@ mod tests {
 
     use super::*;
 
-    /// 事件日志：假代理把协商过程记下来供断言。
+    /// Event log: the fake proxy records the negotiation here so assertions can inspect it.
     type Log = Arc<Mutex<Vec<String>>>;
 
     fn log_of(log: &Log) -> Vec<String> {
@@ -392,7 +392,7 @@ mod tests {
         log_of(log).iter().any(|e| e.contains(needle))
     }
 
-    /// 拨一个空闲端口给假代理当"目标回声服务"。
+    /// Dial a free port to serve as the fake proxy's "target echo service".
     async fn echo_target() -> (String, tokio::task::JoinHandle<()>) {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -420,7 +420,7 @@ mod tests {
     async fn read_method_selection(stream: &mut TokioTcpStream) -> Vec<u8> {
         let mut head = [0u8; 2];
         stream.read_exact(&mut head).await.unwrap();
-        assert_eq!(head[0], 0x05, "客户端的方法协商必须以 VER=0x05 开头");
+        assert_eq!(head[0], 0x05, "the client's method selection must start with VER=0x05");
         let mut methods = vec![0u8; head[1] as usize];
         stream.read_exact(&mut methods).await.unwrap();
         methods
@@ -430,7 +430,7 @@ mod tests {
         let mut head = [0u8; 4];
         stream.read_exact(&mut head).await.unwrap();
         assert_eq!(head[0], 0x05);
-        assert_eq!(head[1], 0x01, "只支持 CONNECT");
+        assert_eq!(head[1], 0x01, "only CONNECT is supported");
         let target = match head[3] {
             0x01 => {
                 let mut ip = [0u8; 4];
@@ -463,11 +463,11 @@ mod tests {
             .unwrap();
     }
 
-    /// 假 SOCKS5 代理。
+    /// Fake SOCKS5 proxy.
     ///
-    /// `auth` = `Some((user, pass, accept))`：只提供用户名密码方法，凭据匹配且
-    /// `accept` 为真才放行；`None`：只提供无认证方法。
-    /// 握手成功后把连接双向接到 `target`。
+    /// `auth` = `Some((user, pass, accept))`: offer only the username/password method, pass traffic through
+    /// only when the credentials match and `accept` is true; `None`: offer only the no-auth method.
+    /// After a successful handshake, splice the connection bidirectionally onto `target`.
     async fn fake_socks5(auth: Option<(String, String, bool)>, target: &str, log: Log) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -547,15 +547,15 @@ mod tests {
             Duration::from_secs(30),
         )
         .await
-        .expect("无认证 SOCKS5 建连必须成功");
+        .expect("no-auth SOCKS5 connection must succeed");
         stream.write_all(b"ping").await.unwrap();
         let mut buf = [0u8; 4];
         stream.read_exact(&mut buf).await.unwrap();
-        assert_eq!(&buf, b"ping", "经代理的数据必须原样到达目标回声服务");
-        assert!(log_has(&log, "methods:[0]"), "无凭据只报无认证方法");
+        assert_eq!(&buf, b"ping", "data through the proxy must reach the target echo service unchanged");
+        assert!(log_has(&log, "methods:[0]"), "without credentials only the no-auth method is advertised");
         assert!(
             log_has(&log, &format!("connect:{target}")),
-            "代理收到的 CONNECT 目标必须是原地址"
+            "the CONNECT target received by the proxy must be the original address"
         );
     }
 
@@ -577,16 +577,16 @@ mod tests {
             Duration::from_secs(30),
         )
         .await
-        .expect("带认证 SOCKS5 建连必须成功");
+        .expect("SOCKS5 connection with auth must succeed");
         stream.write_all(b"pong").await.unwrap();
         let mut buf = [0u8; 4];
         stream.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"pong");
         assert!(
             log_has(&log, "methods:[0, 2]"),
-            "有凭据要同时报无认证与用户名密码两种方法"
+            "with credentials both the no-auth and username/password methods must be advertised"
         );
-        assert!(log_has(&log, "auth:alice:secret"), "凭据必须原样上线");
+        assert!(log_has(&log, "auth:alice:secret"), "credentials must go on the wire verbatim");
     }
 
     #[tokio::test]
@@ -607,18 +607,18 @@ mod tests {
             Duration::from_secs(35),
         )
         .await
-        .expect_err("密码错必须被拒");
+        .expect_err("a wrong password must be rejected");
         assert!(
             err.to_string().contains("rejected"),
-            "文案要点明认证被拒: {err}"
+            "the message must state that auth was rejected: {err}"
         );
         assert!(log_has(&log, "auth:alice:wrong"));
-        assert!(!log_has(&log, "connect:"), "认证失败不得进入 CONNECT");
+        assert!(!log_has(&log, "connect:"), "auth failure must not proceed to CONNECT");
     }
 
     #[tokio::test]
     async fn socks5_rejects_when_no_acceptable_method() {
-        // 服务端只收用户名密码，客户端没配凭据 ⇒ 服务端挑了 0x02 而客户端拿不出凭据。
+        // The server only accepts username/password while the client has no credentials configured => the server picks 0x02 and the client cannot supply credentials.
         let (target, _t) = echo_target().await;
         let log: Log = Arc::new(Mutex::new(Vec::new()));
         let proxy_addr = fake_socks5(
@@ -635,7 +635,7 @@ mod tests {
             Duration::from_secs(35),
         )
         .await
-        .expect_err("无凭据撞上强制认证必须失败");
+        .expect_err("no credentials against mandatory auth must fail");
         assert!(
             err.to_string()
                 .contains("requires username/password auth but no credentials configured"),
@@ -644,7 +644,7 @@ mod tests {
         assert!(!log_has(&log, "connect:"));
     }
 
-    /// 服务端直接回 0xFF（一个可接受的方法都没有）——RFC 1929 的硬拒绝。
+    /// The server replies 0xFF directly (not one acceptable method) -- a hard rejection per RFC 1929.
     #[tokio::test]
     async fn socks5_no_acceptable_method_reply_is_reported() {
         let (target, _t) = echo_target().await;
@@ -668,7 +668,7 @@ mod tests {
             Duration::from_secs(35),
         )
         .await
-        .expect_err("0xFF 必须报错");
+        .expect_err("0xFF must raise an error");
         assert!(
             err.to_string().contains("no acceptable auth method"),
             "got {err}"
@@ -677,7 +677,7 @@ mod tests {
 
     #[tokio::test]
     async fn socks5_connect_failure_is_reported() {
-        // 目标地址写错，假代理回 0x04(host unreachable)。
+        // Wrong target address, the fake proxy replies 0x04 (host unreachable).
         let (target, _t) = echo_target().await;
         let log: Log = Arc::new(Mutex::new(Vec::new()));
         let proxy_addr = fake_socks5(None, &target, log.clone()).await;
@@ -689,10 +689,10 @@ mod tests {
             Duration::from_secs(35),
         )
         .await
-        .expect_err("CONNECT 失败必须报错");
+        .expect_err("a failed CONNECT must raise an error");
         assert!(
             err.to_string().contains("host unreachable"),
-            "CONNECT 失败码要翻译成人话: {err}"
+            "the CONNECT failure code must be translated into plain words: {err}"
         );
     }
 
@@ -709,7 +709,7 @@ mod tests {
         let log2 = log.clone();
         tokio::spawn(async move {
             let mut stream = listener.accept().await.unwrap().0;
-            // 请求：VER CMD PORT IP USERID 0x00
+            // request: VER CMD PORT IP USERID 0x00
             let mut head = [0u8; 8];
             stream.read_exact(&mut head).await.unwrap();
             assert_eq!(head[0], 0x04);
@@ -748,14 +748,14 @@ mod tests {
             Duration::from_secs(30),
         )
         .await
-        .expect("SOCKS4 建连必须成功");
+        .expect("the SOCKS4 connection must succeed");
         stream.write_all(b"ok").await.unwrap();
         let mut buf = [0u8; 2];
         stream.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"ok");
         assert!(
             log_has(&log, &format!("req:{t_host}:{t_port}:uid")),
-            "SOCKS4 请求形状（IP + userid）必须正确: {:?}",
+            "the SOCKS4 request shape (IP + userid) must be correct: {:?}",
             log_of(&log)
         );
     }
@@ -769,7 +769,7 @@ mod tests {
             let mut stream = listener.accept().await.unwrap().0;
             let mut head = [0u8; 8];
             stream.read_exact(&mut head).await.unwrap();
-            // 读掉 userid
+            // read off the userid
             loop {
                 let mut byte = [0u8; 1];
                 if stream.read_exact(&mut byte).await.is_err() || byte[0] == 0 {
@@ -793,7 +793,7 @@ mod tests {
             Duration::from_secs(35),
         )
         .await
-        .expect_err("SOCKS4 拒绝必须报错");
+        .expect_err("a SOCKS4 rejection must raise an error");
         assert!(err.to_string().contains("rejected"), "got {err}");
     }
 
@@ -803,7 +803,7 @@ mod tests {
         assert_eq!(
             v5.version_and_addr(),
             (SocksVersion::V5, "10.0.0.1:1080"),
-            "缺省就是 SOCKS5"
+            "the default is SOCKS5"
         );
         let explicit = SocksProxyConfig::new("socks5://10.0.0.1:1080");
         assert_eq!(explicit.version_and_addr().1, "10.0.0.1:1080");
@@ -811,7 +811,7 @@ mod tests {
         assert_eq!(v4.version_and_addr(), (SocksVersion::V4, "10.0.0.1:1080"));
         let auth = SocksProxyConfig::with_auth("p:1080", "u", "w");
         assert_eq!(auth.credentials(), Some(("u", "w")));
-        // 空用户名等价不认证（对齐仓库里 "空白 = 不设" 的口径，如 unitName）。
+        // An empty username is equivalent to no auth (matches the repo-wide "blank = unset" convention, as with unitName).
         assert_eq!(SocksProxyConfig::new("p:1080").credentials(), None);
         assert_eq!(
             SocksProxyConfig {
@@ -822,7 +822,7 @@ mod tests {
             .credentials(),
             None
         );
-        // 只给密码没有用户名：SOCKS5 子协商必须有用户名，同样视为不认证。
+        // Password only without a username: the SOCKS5 subnegotiation requires a username, so this also counts as no auth.
         assert_eq!(
             SocksProxyConfig {
                 addr: "p:1080".into(),
@@ -832,7 +832,7 @@ mod tests {
             .credentials(),
             None
         );
-        // 只给用户名没给密码：用户名密码子协商允许空密码。
+        // Username only without a password: the username/password subnegotiation allows an empty password.
         assert_eq!(
             SocksProxyConfig {
                 addr: "p:1080".into(),
@@ -852,16 +852,16 @@ mod tests {
         addr.split_once(':').unwrap().0
     }
 
-    /// 端到端：`RemotingClient` 配了 `socks_proxy` 后，一次同步 RPC 必须真的
-    /// 经过代理（代理日志里有 CONNECT、目标回声服务只见过代理的连接）。
-    /// 这条守的是 `connect()` 里的接线：TCP 连代理 → SOCKS 握手 → remoting 帧。
+    /// End to end: once `RemotingClient` is configured with `socks_proxy`, one synchronous RPC must really
+    /// go through the proxy (the proxy log shows a CONNECT, the target echo service only ever sees the proxy's connection).
+    /// This guards the wiring in `connect()`: TCP to the proxy → SOCKS handshake → remoting frames.
     #[tokio::test]
     async fn remoting_client_round_trips_through_socks_proxy() {
         use crate::remoting::client::{RemotingClient, RemotingClientConfig};
         use crate::remoting::protocol::codes::{request_code, response_code};
         use crate::remoting::protocol::remoting_command::RemotingCommand;
 
-        // 目标：最小 remoting echo（同 opaque 回 SUCCESS）。
+        // Target: a minimal remoting echo (replies SUCCESS with the same opaque).
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target = listener.local_addr().unwrap().to_string();
         let (t_host, t_port) = {
@@ -913,17 +913,17 @@ mod tests {
         let response = client
             .invoke_sync(&target, &mut cmd, Some(10_000))
             .await
-            .expect("经 SOCKS 代理的同步 RPC 必须成功");
+            .expect("a synchronous RPC through the SOCKS proxy must succeed");
         assert_eq!(response.code, response_code::SUCCESS);
         assert_eq!(response.opaque, cmd.opaque);
         assert!(
             log_has(&log, &format!("connect:{t_host}:{t_port}")),
-            "CONNECT 必须打到代理且目标是原地址: {:?}",
+            "the CONNECT must hit the proxy and its target must be the original address: {:?}",
             log_of(&log)
         );
         assert!(
             log_has(&log, "methods:[0]"),
-            "代理必须见到 SOCKS5 方法协商: {:?}",
+            "the proxy must see the SOCKS5 method negotiation: {:?}",
             log_of(&log)
         );
         client.shutdown();

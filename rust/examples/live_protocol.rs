@@ -1,37 +1,39 @@
-//! 真机协议层冒烟测试：直连本地 NameServer + Broker，验证 remoting 帧编解码
-//! 与 7 类核心请求码在**真实 broker** 上的往返。
+//! Live protocol-layer smoke test: connect directly to a local NameServer + Broker and
+//! verify the remoting frame codec plus the round-trip of 7 core request codes on a
+//! **real broker**.
 //!
-//! 用法（第一个参数是 namesrv 地址，默认 `127.0.0.1:9876`）：
+//! Usage (the first argument is the namesrv address, default `127.0.0.1:9876`):
 //!
 //! ```text
 //! cargo run --example live_protocol -- 127.0.0.1:9876
 //! ```
 //!
-//! 断言统一走 [`Checker::check`] 累积，任何一项失败进程以非 0 退出码结束。
+//! All assertions accumulate through [`Checker::check`]; any failure makes the process
+//! exit with a non-zero code.
 //!
-//! ## 覆盖场景
+//! ## Covered scenarios
 //!
-//! * S0 `GET_ROUTEINFO_BY_TOPIC(TBW102)` + `UPDATE_AND_CREATE_TOPIC(17)` —— 引导
-//! * S1 `GET_ROUTEINFO_BY_TOPIC(105)` —— namesrv 路由查询 + `TopicRouteData` 解码
-//! * S2 `GET_BROKER_CLUSTER_INFO(106)` —— 集群信息 JSON body 解码
-//! * S3 `SEND_MESSAGE_V2(310)` —— `SendMessageRequestHeaderV2` 单字母短键 a..n
-//! * S4 `PULL_MESSAGE(11)` —— `PullSysFlag` + 17 段存储格式解码回环
+//! * S0 `GET_ROUTEINFO_BY_TOPIC(TBW102)` + `UPDATE_AND_CREATE_TOPIC(17)` -- bootstrap
+//! * S1 `GET_ROUTEINFO_BY_TOPIC(105)` -- namesrv route query + `TopicRouteData` decoding
+//! * S2 `GET_BROKER_CLUSTER_INFO(106)` -- cluster info JSON body decoding
+//! * S3 `SEND_MESSAGE_V2(310)` -- `SendMessageRequestHeaderV2` single-letter short keys a..n
+//! * S4 `PULL_MESSAGE(11)` -- `PullSysFlag` + 17-section store format decode round-trip
 //! * S5 `GET_MIN/MAX_OFFSET(31/30)` + `UPDATE/QUERY_CONSUMER_OFFSET(15/14)`
 //! * S6 `HEART_BEAT(34)` + `GET_CONSUMER_LIST_BY_GROUP(38)` + `UNREGISTER_CLIENT(35)`
-//! * S7 RocketMQ 二进制 header（`serializeType=ROCKETMQ`）在真实 broker 上的往返
-//! * S8 `DELETE_TOPIC_IN_BROKER(215)` —— 清理，避免同一集群累积测试 topic
+//! * S7 RocketMQ binary header (`serializeType=ROCKETMQ`) round-trip on a real broker
+//! * S8 `DELETE_TOPIC_IN_BROKER(215)` -- cleanup, so the same cluster does not accumulate test topics
 //!
-//! ## 前置条件（唯一依赖，不需要下载任何东西）
+//! ## Preconditions (the only dependency; nothing needs to be downloaded)
 //!
-//! NameServer 上必须已有默认 topic `TBW102` 的路由，即 broker 开了
-//! `autoCreateTopicEnable=true`（本仓库 `broker.conf` 已开）—— S0 靠它定位 broker。
-//! 测试 topic 本身由 S0 显式创建：5.x 的 NameServer 不再为未知 topic 回落到
-//! TBW102，直接查新 topic 会回 `TOPIC_NOT_EXIST(17)`。
+//! The NameServer must already have a route for the default topic `TBW102`, i.e. the broker runs with
+//! `autoCreateTopicEnable=true` (already enabled in this repo's `broker.conf`) -- S0 uses it to locate the broker.
+//! The test topic itself is created explicitly by S0: 5.x NameServer no longer falls back to
+//! TBW102 for unknown topics; querying a new topic directly returns `TOPIC_NOT_EXIST(17)`.
 //!
-//! 运行日志里可能出现一条
-//! `no processor for request code 40 ... from <broker>`：那是 broker 在成员变更时
-//! 反向推送的 `NOTIFY_CONSUMER_IDS_CHANGED`，本例只验协议往返、没注册推送处理器，
-//! 属预期噪音（真正的 broker→client 推送在 push consumer 的例子里覆盖）。
+//! The run log may contain one line
+//! `no processor for request code 40 ... from <broker>`: that is the broker's reverse push of
+//! `NOTIFY_CONSUMER_IDS_CHANGED` on membership change; this example only verifies protocol round-trips and registers no push handler,
+//! so it is expected noise (real broker->client pushes are covered in the push consumer example).
 
 use std::env;
 use std::process::ExitCode;
@@ -67,13 +69,13 @@ use rocketmq_client_remoting::remoting::protocol::serialize::{
     header_length_of, protocol_type_of, RemotingSerializable,
 };
 
-/// 本次建出的 topic 队列数（默认 4）。
+/// Number of queues for the topic created in this run (default 4).
 const QUEUE_NUMS: i32 = 4;
 
-/// 一次运行的时间戳日志前缀。
+/// Timestamp log prefix for one run.
 ///
-/// topic / group 带时间戳后缀，避免同一集群上多次运行互相读到上次的消息 ——
-/// broker 的 `storePathRootDir` 是持久的，不复位就会累积历史消息。
+/// topic / group carry a timestamp suffix, so multiple runs on the same cluster do not read each
+/// other's previous messages -- the broker's `storePathRootDir` is persistent and accumulates history unless reset.
 fn stamp() -> String {
     let secs = match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(d) => d.as_secs(),
@@ -82,7 +84,7 @@ fn stamp() -> String {
     format!("{secs}")
 }
 
-/// 断言累积器：单次运行把所有场景跑完再统一报告，而不是首个失败就退出。
+/// Assertion accumulator: one run finishes every scenario and reports together, instead of exiting on the first failure.
 struct Checker {
     passed: u32,
     failed: Vec<String>,
@@ -103,14 +105,14 @@ impl Checker {
         }
     }
 
-    /// 场景本身跑不完（连不上、返回码不对）时也记一条失败。
+    /// Also records a failure when a scenario cannot complete (cannot connect, wrong response code).
     fn abort(&mut self, name: &str, err: &str) {
         println!("  [FAIL] {name}: {err}");
         self.failed.push(format!("{name}: {err}"));
     }
 }
 
-/// 场景返回值：`String` 是给人看的失败原因。
+/// Scenario return value: the `String` is a human-readable failure reason.
 type Live = Result<(), String>;
 
 async fn rpc(
@@ -125,7 +127,7 @@ async fn rpc(
         .map_err(|e| format!("invoke {addr} failed: {e}"))
 }
 
-/// 取出响应 body（大部分 body 类请求必须有 body）。
+/// Takes the response body (most body-class requests must have a body).
 fn body_of(resp: &RemotingCommand, what: &str) -> Result<Vec<u8>, String> {
     match resp.body() {
         Some(b) => Ok(b.to_vec()),
@@ -133,7 +135,7 @@ fn body_of(resp: &RemotingCommand, what: &str) -> Result<Vec<u8>, String> {
     }
 }
 
-/// 读出一个已编码帧头部的 `(totalLength, headerLengthAndProtocolMark)`。
+/// Reads the `(totalLength, headerLengthAndProtocolMark)` of an encoded frame header.
 fn frame_prefix(wire: &[u8]) -> Option<(i32, i32)> {
     let head = wire.get(0..8)?;
     let total = i32::from_be_bytes(head[0..4].try_into().ok()?);
@@ -141,7 +143,7 @@ fn frame_prefix(wire: &[u8]) -> Option<(i32, i32)> {
     Some((total, marked))
 }
 
-/// `GET_ROUTEINFO_BY_TOPIC(105)` 的原始往返，供 S0/S1/S7 复用。
+/// Raw round-trip of `GET_ROUTEINFO_BY_TOPIC(105)`, reused by S0/S1/S7.
 async fn get_route(
     client: &RemotingClient,
     namesrv: &str,
@@ -151,34 +153,34 @@ async fn get_route(
         request_code::GET_ROUTEINFO_BY_TOPIC,
         Some(Box::new(GetRouteInfoRequestHeader {
             topic: Some(topic.to_string()),
-            // 这个字段留 None（None 时不进 extFields）。
+            // Leave this field None (None does not enter extFields).
             accept_standard_json_only: None,
         })),
     );
     rpc(client, namesrv, req, 5000).await
 }
 
-/// 从路由里挑第一个 broker 的 (brokerName, masterAddr)。
+/// Picks the first broker's (brokerName, masterAddr) from the route.
 fn first_broker(route: &TopicRouteData) -> Option<(String, String)> {
     let bd = route.broker_datas.first()?;
     let addr = bd.select_broker_addr()?;
     Some((bd.broker_name.clone(), addr))
 }
 
-/// 解码 `TopicRouteData`。
+/// Decodes `TopicRouteData`.
 fn decode_route(resp: &RemotingCommand, what: &str) -> Result<TopicRouteData, String> {
     let raw = body_of(resp, what)?;
     TopicRouteData::decode(&raw).map_err(|e| format!("decode route failed: {e}"))
 }
 
-/// S0：拿默认 topic（TBW102）的路由定位 broker，再显式建出本次要用的 topic。
+/// S0: use the default topic's (TBW102) route to locate the broker, then explicitly create the topic for this run.
 ///
-/// ⚠ RocketMQ 5.x 的 NameServer **不再**为未知 topic 回落到 TBW102 —— 直接查
-/// 新 topic 会回 `TOPIC_NOT_EXIST(17)`，这正是控制台报
-/// "No route info of this topic" 的来源。本端引导走的是同一条路：先查
-/// `DEFAULT_TOPIC` 的路由，再对每个 broker 下 `UPDATE_AND_CREATE_TOPIC(17)`。
-/// broker 侧 `AdminBrokerProcessor.createTopic` 会同步
-/// `registerIncrementBrokerData` 把新 topic 推给所有 namesrv，所以 S1 无需等待。
+/// WARNING: RocketMQ 5.x NameServer **no longer** falls back to TBW102 for unknown topics -- querying
+/// a new topic directly returns `TOPIC_NOT_EXIST(17)`, which is where the console's
+/// "No route info of this topic" comes from. The local bootstrap takes the same path: first query
+/// the route of `DEFAULT_TOPIC`, then send `UPDATE_AND_CREATE_TOPIC(17)` to each broker.
+/// The broker side `AdminBrokerProcessor.createTopic` synchronously
+/// calls `registerIncrementBrokerData` to push the new topic to all nameservers, so S1 needs no wait.
 async fn s0_bootstrap(
     client: &RemotingClient,
     namesrv: &str,
@@ -212,8 +214,8 @@ async fn s0_bootstrap(
             read_queue_nums: Some(QUEUE_NUMS),
             write_queue_nums: Some(QUEUE_NUMS),
             perm: Some(topic_config::DEFAULT_PERM),
-            // broker 的 CreateTopicRequestHeader.checkFields() 会把它转枚举，
-            // 为空直接回 "topicFilterType = [null] value invalid"。
+            // The broker's CreateTopicRequestHeader.checkFields() converts it to an enum;
+            // if empty it directly replies "topicFilterType = [null] value invalid".
             topic_filter_type: Some(TopicFilterType::SINGLE_TAG.to_string()),
             topic_sys_flag: Some(0),
             order: Some(false),
@@ -236,7 +238,7 @@ async fn s0_bootstrap(
     Ok(())
 }
 
-/// S1：查真实 topic 的路由，产出后续场景要用的 broker 地址。
+/// S1: query the real topic's route and produce the broker address the later scenarios need.
 async fn s1_route(
     client: &RemotingClient,
     namesrv: &str,
@@ -275,8 +277,8 @@ async fn s1_route(
         "        queueData: brokerName={} read={} write={} perm={} sysFlag={}",
         qd.broker_name, qd.read_queue_nums, qd.write_queue_nums, qd.perm, qd.topic_sys_flag
     );
-    // 建 topic 时下发的 read/write 队列数与 perm 必须原样回读，
-    // 否则说明 S0 的 admin 写没有落到这台 broker。
+    // The read/write queue numbers and perm sent when creating the topic must be read back as-is,
+    // otherwise S0's admin write did not land on this broker.
     ck.check(
         "S1 route reflects the created topic config",
         qd.read_queue_nums == QUEUE_NUMS
@@ -306,7 +308,7 @@ async fn s1_route(
         util_all::is_not_blank_str(&bd.broker_name) && util_all::is_not_blank_str(&addr),
         &format!("brokerName={:?} addr={:?}", bd.broker_name, addr),
     );
-    // 路由里必须能选出至少一个可写队列，否则 producer 无从投递。
+    // At least one writable queue must be selectable from the route, otherwise the producer has nothing to deliver to.
     let mqs = route.get_all_message_queue(topic);
     ck.check(
         "S1 writable message queues not empty",
@@ -316,7 +318,7 @@ async fn s1_route(
     Ok((bd.broker_name.clone(), addr))
 }
 
-/// S2：`GET_BROKER_CLUSTER_INFO(106)` —— namesrv 回的 `ClusterInfo` JSON。
+/// S2: `GET_BROKER_CLUSTER_INFO(106)` -- the `ClusterInfo` JSON returned by namesrv.
 async fn s2_cluster_info(client: &RemotingClient, namesrv: &str, ck: &mut Checker) -> Live {
     let resp = rpc(
         client,
@@ -334,9 +336,9 @@ async fn s2_cluster_info(client: &RemotingClient, namesrv: &str, ck: &mut Checke
         return Ok(());
     }
     let raw = body_of(&resp, "GET_BROKER_CLUSTER_INFO")?;
-    // ⚠ 真机回的是 fastjson 风格的**非字符串 map 键**：
-    // `"brokerAddrs":{0:"127.0.0.1:10911"}` —— `serde_json` 会直接报
-    // "key must be a string"，必须用 crate 里那个 fastjson2 兼容解码器。
+    // WARNING: the real machine returns fastjson-style **non-string map keys**:
+    // `"brokerAddrs":{0:"127.0.0.1:10911"}` -- `serde_json` would directly report
+    // "key must be a string", so the fastjson2-compatible decoder in the crate must be used.
     let value: Value = RemotingSerializable::decode(&raw)
         .map_err(|e| format!("clusterInfo body is not parsable: {e}"))?;
     let table = value.get("brokerAddrTable").and_then(Value::as_object);
@@ -365,7 +367,7 @@ async fn s2_cluster_info(client: &RemotingClient, namesrv: &str, ck: &mut Checke
     Ok(())
 }
 
-/// 一次发送的结果，供 S4/S5 对拍。
+/// Result of one send, for S4/S5 to compare against.
 struct Sent {
     uniq_id: String,
     msg_id: String,
@@ -373,7 +375,7 @@ struct Sent {
     body: Vec<u8>,
 }
 
-/// S3：`SEND_MESSAGE_V2(310)` —— 手工拼 V2 短键 header + 原始 body。
+/// S3: `SEND_MESSAGE_V2(310)` -- hand-assembled V2 short-key header + raw body.
 async fn s3_send(
     client: &RemotingClient,
     broker_addr: &str,
@@ -399,7 +401,7 @@ async fn s3_send(
         default_topic: Some(MixAll::DEFAULT_TOPIC.to_string()),
         default_topic_queue_nums: Some(MixAll::DEFAULT_TOPIC_QUEUE_NUMS),
         queue_id: Some(0),
-        // 未压缩、非事务、IPv4 bornHost → sysFlag 全 0。
+        // Uncompressed, non-transactional, IPv4 bornHost -> sysFlag all 0.
         sys_flag: Some(0),
         born_timestamp: Some(util_all::current_time_millis()),
         flag: Some(msg.get_flag()),
@@ -437,8 +439,8 @@ async fn s3_send(
     println!(
         "        sendResult: msgId={wire_msg_id} uniqId={uniq_id} queueId={queue_id} offset={queue_offset}"
     );
-    // broker 回的 msgId 是 store 侧的 16 字节 offset 形式（32 个十六进制字符），
-    // 与客户端 UNIQ_KEY（UUID 形态，带连字符）是两条独立标识。
+    // The msgId the broker returns is the store-side 16-byte offset form (32 hex chars),
+    // an independent identifier from the client-side UNIQ_KEY (UUID form, with hyphens).
     ck.check(
         "S3 wire msgId is 32 hex chars",
         wire_msg_id.len() == 32 && wire_msg_id.chars().all(|c| c.is_ascii_hexdigit()),
@@ -455,7 +457,7 @@ async fn s3_send(
             && uniq_id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase()),
         &format!("uniqId={uniq_id:?}"),
     );
-    // store msgId 与 UNIQ_KEY 是两条独立标识，broker 只回前者。
+    // store msgId and UNIQ_KEY are two independent identifiers; the broker only returns the former.
     ck.check(
         "S3 store msgId differs from UNIQ_KEY",
         wire_msg_id != uniq_id,
@@ -464,7 +466,7 @@ async fn s3_send(
     Ok(Sent { uniq_id, msg_id: wire_msg_id, queue_offset, body })
 }
 
-/// S4：`PULL_MESSAGE(11)` —— 校验 17 段存储格式能解码回刚发出去的消息。
+/// S4: `PULL_MESSAGE(11)` -- verify the 17-section store format can decode back the message just sent.
 async fn s4_pull(
     client: &RemotingClient,
     broker_addr: &str,
@@ -473,8 +475,8 @@ async fn s4_pull(
     sent: &Sent,
     ck: &mut Checker,
 ) -> Live {
-    // suspend 位必须置上：commitLog→consumeQueue 的分发是异步的，不留长轮询窗口
-    // 时刚发出去的消息会以 PULL_NOT_FOUND(19) 返回。
+    // The suspend bit must be set: commitLog->consumeQueue dispatch is asynchronous, and without a
+    // long-poll window a just-sent message would come back as PULL_NOT_FOUND(19).
     let sys_flag = PullSysFlag::build_sys_flag_basic(false, true, true, false);
     let req = RemotingCommand::create_request_command(
         request_code::PULL_MESSAGE,
@@ -488,9 +490,9 @@ async fn s4_pull(
             sys_flag: Some(sys_flag),
             commit_offset: Some(0),
             suspend_timeout_millis: Some(15_000),
-            // FLAG_SUBSCRIPTION 置位时 broker 用
-            // `FilterAPI.build(topic, subscription, expressionType)` 现建订阅数据，
-            // 所以这里传表达式原文（`*`）而不是订阅 JSON。
+            // When FLAG_SUBSCRIPTION is set the broker builds subscription data on the fly via
+            // `FilterAPI.build(topic, subscription, expressionType)`,
+            // so the raw expression (`*`) is passed here instead of subscription JSON.
             subscription: Some("*".to_string()),
             sub_version: Some(0),
             expression_type: Some(ExpressionType::TAG.to_string()),
@@ -562,7 +564,7 @@ async fn s4_pull(
             sent.queue_offset
         ),
     );
-    // broker 回传的 msgId 也必须是 store 侧那条（同一个 commitlog offset）。
+    // The msgId echoed back by the broker must also be the store-side one (same commitlog offset).
     ck.check(
         "S4 store msgId equals SendResult.msgId",
         first.msg_id.as_deref() == Some(sent.msg_id.as_str()),
@@ -579,7 +581,7 @@ async fn s4_pull(
     Ok(())
 }
 
-/// S5：min/max offset 与消费位点的读写往返。
+/// S5: read/write round-trip of min/max offset and the consumer offset.
 async fn s5_offsets(
     client: &RemotingClient,
     broker_addr: &str,
@@ -717,7 +719,7 @@ async fn s5_offsets(
     Ok(())
 }
 
-/// S6：心跳注册 → 按组查在线成员 → 反注册。
+/// S6: heartbeat registration -> query online members by group -> unregister.
 async fn s6_heartbeat(
     client: &RemotingClient,
     broker_addr: &str,
@@ -812,7 +814,7 @@ async fn s6_heartbeat(
     )
     .await?;
     let ids = list_ids(&after)?;
-    // 反注册后要么组已空（broker 回 CONSUMER_NOT_ONLINE=206），要么列表里不再有你。
+    // After unregistering, either the group is empty (broker returns CONSUMER_NOT_ONLINE=206) or you are no longer in the list.
     ck.check(
         "S6 client gone after unregister",
         !ids.iter().any(|id| id == client_id),
@@ -821,7 +823,7 @@ async fn s6_heartbeat(
     Ok(())
 }
 
-/// S7：RocketMQ 二进制 header（`serializeType=ROCKETMQ`）走真实 namesrv。
+/// S7: RocketMQ binary header (`serializeType=ROCKETMQ`) against the real namesrv.
 async fn s7_rocketmq_serialize(client: &RemotingClient, namesrv: &str, topic: &str, ck: &mut Checker) -> Live {
     let mut req = RemotingCommand::create_request_command(
         request_code::GET_ROUTEINFO_BY_TOPIC,
@@ -873,8 +875,8 @@ async fn s7_rocketmq_serialize(client: &RemotingClient, namesrv: &str, topic: &s
     if resp.code != response_code::SUCCESS {
         return Ok(());
     }
-    // 真机行为：5.x 的 namesrv **回包仍用 JSON serialize type**（不跟随请求），
-    // 所以这里只打印不断言相等 —— 客户端必须按响应自己的标记选解码器。
+    // Real-machine behavior: the 5.x namesrv **still replies with the JSON serialize type** (it does not follow the request),
+    // so this only prints and does not assert equality -- the client must pick the decoder by the response's own mark.
     println!(
         "        response serializeType={} (request used ROCKETMQ={})",
         resp.serialize_type_current_rpc, serialize_type::ROCKETMQ
@@ -889,7 +891,7 @@ async fn s7_rocketmq_serialize(client: &RemotingClient, namesrv: &str, topic: &s
     Ok(())
 }
 
-/// S8：清理 —— 先删 broker 侧 topic 配置，再显式删 namesrv 路由。
+/// S8: cleanup -- first delete the broker-side topic config, then explicitly delete the namesrv route.
 async fn s8_cleanup(
     client: &RemotingClient,
     namesrv: &str,
@@ -955,7 +957,7 @@ async fn main() -> ExitCode {
     let client = RemotingClient::new();
     let mut ck = Checker::new();
 
-    // S0 拿到 broker 地址并建 topic；S1 才查得到真实 topic 的路由。
+    // S0 gets the broker address and creates the topic; only then can S1 query the real topic's route.
     if let Err(e) = s0_bootstrap(&client, &namesrv, &topic, &mut ck).await {
         ck.abort("S0 bootstrap", &e);
         client.shutdown();

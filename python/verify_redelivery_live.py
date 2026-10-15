@@ -1,19 +1,26 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""消费侧补齐真机验证（回投 / 位点持久化 / 顺序锁 / 广播 / 流控）。
+"""Verification of the consumer-side completion against a real machine (send-back / offset
+persistence / orderly lock / broadcast / flow control).
 
-用法（需本地 RocketMQ 5.5.1 集群）：
+Usage (requires a local RocketMQ 5.5.1 cluster):
     .venv/bin/python verify_redelivery_live.py 127.0.0.1:9876
 
-场景：
-  S1 回投：listener 对 retry-me 首次返回 RECONSUME_LATER → 应经 %RETRY%topic
-     （延迟梯度 level3=10s）二次投递，且 RECONSUME_TIMES=1；正常消息只投一次。
-  S2 位点持久化：消费 3 条后重启同组消费者 → 旧消息不重复，新消息继续投递。
-  S3 顺序消费：orderly listener 消费正常，且 broker 锁（LOCK_BATCH_MQ）生效。
-  S4 广播模式：同组两个消费者各自收全所有消息，互不影响。
-  S5 流控：阈值 2 + 慢消费 → 触发流控计数 >0，最终消息全部消费。
-  S9 死信终态：maxReconsumeTimes=2 ⇒ 投递 3 次（reconsumeTimes 0/1/2）后由 broker 转投
-     %DLQ%<group>（DLQ 里 reconsumeTimes=3、RETRY_TOPIC 保留原始 topic），且不再投第 4 次。
+Scenarios:
+  S1 send-back: the listener returns RECONSUME_LATER for retry-me the first time -> it should be
+     delivered a second time through %RETRY%topic (delay level3=10s) with RECONSUME_TIMES=1; an
+     ordinary message is delivered only once.
+  S2 offset persistence: restart a consumer of the same group after consuming 3 messages -> the
+     old messages are not repeated and the new messages keep being delivered.
+  S3 orderly consumption: the orderly listener consumes normally and the broker lock
+     (LOCK_BATCH_MQ) takes effect.
+  S4 broadcast mode: two consumers of the same group each collect all the messages, without
+     affecting each other.
+  S5 flow control: threshold 2 + slow consumption -> the flow control counter becomes > 0 and in
+     the end all the messages are consumed.
+  S9 dead-letter terminal state: maxReconsumeTimes=2 => after 3 deliveries (reconsumeTimes
+     0/1/2) the broker forwards it to %DLQ%<group> (in the DLQ reconsumeTimes=3 and RETRY_TOPIC
+     keeps the original topic), and there is no 4th delivery.
 """
 from __future__ import annotations
 
@@ -54,7 +61,7 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 
 class Collector:
-    """通用收集器：记录 (body, topic, properties, ts)。"""
+    """A generic collector: records (body, topic, properties, ts)."""
 
     def __init__(self, consumer: DefaultMQPushConsumer):
         self.consumer = consumer
@@ -102,7 +109,7 @@ def main() -> int:
     producer.start()
     time.sleep(1)
 
-    # ---------- S1 回投 ----------
+    # ---------- S1 send-back ----------
     topic1 = PREFIX + "_Retry"
     prepare_topic(topic1)
     group1 = PREFIX + "_g1"
@@ -115,7 +122,8 @@ def main() -> int:
             for m in msgs:
                 with lock1:
                     seen1.append((bytes(m.body), m.topic, m.get_reconsume_times(), time.time()))
-            # retry-me 首次投递失败，重投后成功（重投次数走 MessageExt 线上字段）
+            # The first delivery of retry-me fails, the redelivery succeeds (the retry count travels in the
+            # on-wire MessageExt field)
             if any(bytes(m.body) == b"retry-me" and m.get_reconsume_times() == 0 for m in msgs):
                 return ConsumeConcurrentlyStatus.RECONSUME_LATER
             return ConsumeConcurrentlyStatus.CONSUME_SUCCESS
@@ -127,30 +135,30 @@ def main() -> int:
     time.sleep(3)
     producer.send(Message(topic1, b"retry-me"))
     producer.send(Message(topic1, b"normal-1"))
-    print("S1: 已发送，等待回投（延迟梯度 level3≈10s）...")
+    print("S1: sent, waiting for the send-back (delay level3 is about 10s)...")
     time.sleep(30)
     c1.shutdown()
     retry_arrivals = [r for r in seen1 if r[0] == b"retry-me"]
     normal_arrivals = [r for r in seen1 if r[0] == b"normal-1"]
     retry_times_seen = [r[2] for r in retry_arrivals]
-    check("S1-retry-me 被投递多次", len(retry_arrivals) >= 2,
+    check("S1 retry-me was delivered several times", len(retry_arrivals) >= 2,
           "arrivals=%d" % len(retry_arrivals))
-    check("S1-重投来自 %RETRY%/RECONSUME_TIMES",
+    check("S1 the redelivery came from %RETRY%/RECONSUME_TIMES",
           any(r[2] >= 1 or r[1].startswith("%RETRY%") for r in retry_arrivals),
           "times=%s" % retry_times_seen)
     if len(retry_arrivals) >= 2:
         gap = retry_arrivals[-1][3] - retry_arrivals[0][3]
-        check("S1-回投有延迟梯度(>=8s)", gap >= 8.0, "gap=%.1fs" % gap)
+        check("S1 the send-back has a delay gradient (>=8s)", gap >= 8.0, "gap=%.1fs" % gap)
     else:
-        check("S1-回投有延迟梯度(>=8s)", False, "不足两次投递")
-    check("S1-正常消息只投一次", len(normal_arrivals) == 1,
+        check("S1 the send-back has a delay gradient (>=8s)", False, "fewer than two deliveries")
+    check("S1 the ordinary message was delivered only once", len(normal_arrivals) == 1,
           "arrivals=%d" % len(normal_arrivals))
     retried = [r for r in retry_arrivals if r[2] >= 1]
-    check("S1-重投消息 topic 还原为原始 topic",
+    check("S1 the topic of the redelivered message is restored to the original topic",
           bool(retried) and all(r[1] == topic1 for r in retried),
           "topics=%s" % sorted({r[1] for r in retried}))
 
-    # ---------- S2 位点持久化 ----------
+    # ---------- S2 offset persistence ----------
     topic2 = PREFIX + "_Offset"
     prepare_topic(topic2)
     group2 = PREFIX + "_g2"
@@ -162,11 +170,11 @@ def main() -> int:
     for b in old_bodies:
         producer.send(Message(topic2, b))
     time.sleep(8)
-    c2.shutdown()  # shutdown 持久化位点
+    c2.shutdown()  # shutdown persists the offsets
     got_first_round = [b for b in old_bodies if b in set(col2.bodies())]
-    check("S2-首轮消费 3 条", len(got_first_round) == 3,
+    check("S2 the first round consumed 3 messages", len(got_first_round) == 3,
           "got=%d" % len(got_first_round))
-    # 重启同组消费者，只发 1 条新消息
+    # Restart a consumer of the same group and only send 1 new message
     c2b = DefaultMQPushConsumer(group2)
     col2b = Collector(c2b)
     start_consumer(group2, topic2, col2b)
@@ -176,11 +184,11 @@ def main() -> int:
     c2b.shutdown()
     new_seen = b"persist-new" in set(col2b.bodies())
     old_resent = [b for b in old_bodies if b in set(col2b.bodies())]
-    check("S2-重启后新消息继续投递", new_seen, "" if new_seen else "未收到")
-    check("S2-重启不重复消费旧消息", len(old_resent) == 0,
-          "重复=%s" % old_resent)
+    check("S2 after the restart the new messages keep being delivered", new_seen, "" if new_seen else "not received")
+    check("S2 the restart does not reconsume the old messages", len(old_resent) == 0,
+          "duplicated=%s" % old_resent)
 
-    # ---------- S3 顺序消费 + broker 锁 ----------
+    # ---------- S3 orderly consumption + the broker lock ----------
     topic3 = PREFIX + "_Orderly"
     prepare_topic(topic3)
     group3 = PREFIX + "_g3"
@@ -198,23 +206,23 @@ def main() -> int:
     c3.set_message_listener(OrderlyListener())
     c3.subscribe(topic3, "*")
     c3.start()
-    time.sleep(5)  # 等 LOCK_BATCH_MQ 首轮生效
+    time.sleep(5)  # wait for the first LOCK_BATCH_MQ to take effect
     for i in range(4):
         producer.send(Message(topic3, b"orderly-%d" % i))
     time.sleep(8)
     lock_ok_n = len(c3._lock_ok)
     c3.shutdown()
-    check("S3-顺序消费收全", len(got3) == 4, "got=%d" % len(got3))
-    check("S3-broker 队列锁生效", lock_ok_n > 0, "lockOK=%d" % lock_ok_n)
+    check("S3 the orderly consumption collected all 4", len(got3) == 4, "got=%d" % len(got3))
+    check("S3 the broker queue lock took effect", lock_ok_n > 0, "lockOK=%d" % lock_ok_n)
 
-    # ---------- S4 广播模式 ----------
+    # ---------- S4 broadcast mode ----------
     topic4 = PREFIX + "_Bc"
     prepare_topic(topic4)
     group4 = PREFIX + "_g4"
 
     def make_broadcast_consumer(inst_name: str) -> Collector:
         c = DefaultMQPushConsumer(group4)
-        c.set_instance_name(inst_name)  # 保证两个消费者 clientId 不同
+        c.set_instance_name(inst_name)  # make sure the two consumers have different clientIds
         col = Collector(c)
         start_consumer(group4, topic4, col, model="BROADCASTING")
         return col
@@ -228,10 +236,10 @@ def main() -> int:
     na, nb = len(col4a.bodies()), len(col4b.bodies())
     col4a.consumer.shutdown()
     col4b.consumer.shutdown()
-    check("S4-广播消费者 A 收全", na == 3, "got=%d" % na)
-    check("S4-广播消费者 B 收全", nb == 3, "got=%d" % nb)
+    check("S4 broadcast consumer A collected all 3", na == 3, "got=%d" % na)
+    check("S4 broadcast consumer B collected all 3", nb == 3, "got=%d" % nb)
 
-    # ---------- S5 流控 ----------
+    # ---------- S5 flow control ----------
     topic5 = PREFIX + "_Flow"
     prepare_topic(topic5)
     group5 = PREFIX + "_g5"
@@ -257,16 +265,18 @@ def main() -> int:
     time.sleep(12)
     fc = c5._flow_control_triggered
     c5.shutdown()
-    check("S5-慢消费下消息全部到达", len(got5) == 10, "got=%d" % len(got5))
-    check("S5-流控触发计数>0", fc > 0, "triggered=%d" % fc)
+    check("S5 under slow consumption all the messages arrived", len(got5) == 10, "got=%d" % len(got5))
+    check("S5 the flow control trigger counter > 0", fc > 0, "triggered=%d" % fc)
 
-    # ---------- S6 集群多实例 rebalance（队列分配） ----------
-    # 两个同组实例订阅同一 topic：broker 端消费者列表应有 2 个 clientId，
-    # 队列按 AllocateMessageQueueAveragely 拆分；每条消息**只被消费一次**。
+    # ---------- S6 the multi-instance cluster rebalance (queue assignment) ----------
+    # Two instances of the same group subscribe to the same topic: the broker-side consumer list
+    # should have 2 clientIds, the queues are split by AllocateMessageQueueAveragely, and every
+    # message is **consumed exactly once**.
     topic6 = PREFIX + "_Rebalance"
     group6 = PREFIX + "_g6"
-    # 先把 topic 建出来（8 队列）并等路由传播，否则消费者启动时无路由，
-    # 分配要等到下一轮 20s rebalance 才稳定（测试会读到中间态）
+    # Create the topic first (8 queues) and wait for the route to propagate, otherwise the consumer
+    # has no route when it starts and the assignment only becomes stable after the next 20s
+    # rebalance (the test would read an intermediate state)
     created = False
     try:
         setup = MQClientInstance("setup-%d" % int(time.time() * 1000), [NAMESRV])
@@ -275,7 +285,7 @@ def main() -> int:
         setup.shutdown()
         created = True
     except Exception as e:  # noqa: BLE001
-        print("S6: 预建 topic 失败（改用自动创建）: %s" % e)
+        print("S6: pre-creating the topic failed (falling back to auto-creation): %s" % e)
     ca = DefaultMQPushConsumer(group6)
     ca.set_instance_name("inst-a")
     ca.set_namesrv_addr(NAMESRV)
@@ -302,8 +312,10 @@ def main() -> int:
     cb.set_message_listener(make_listener(rec_b))
     cb.subscribe(topic6, "*")
     cb.start()
-    # 等分配稳定：交集为空 + 两边都非空 + 主 topic 队列被完整覆盖
-    # （最多等 45s，覆盖 20s 的 rebalance 周期；分配集合里还含 %RETRY% 队列，故按主 topic 校验）
+    # Wait for the assignment to stabilize: the intersection is empty + both sides are non-empty +
+    # the queues of the main topic are fully covered (wait at most 45s to cover the 20s rebalance
+    # period; the assignment set also contains the %RETRY% queues, so it is validated against the
+    # main topic)
     deadline = time.time() + 45
     asg_a = asg_b = 0
     keys_a, keys_b = [], []
@@ -318,8 +330,9 @@ def main() -> int:
             break
         time.sleep(2)
     hb_a = ca.heartbeat_count()
-    # broker 在组成员变化时沿长连接反向推 40；这是全链路唯一的观测点（反向请求
-    # 无法由用例注入），只断言「本端确实收到并处理过」，不比次数。
+    # The broker pushes 40 back along the long connection when the group membership changes; this is
+    # the only observation point in the whole chain (a reverse request cannot be injected by the test
+    # case), so it only asserts that "this side really received and handled it", not the count.
     notified_a = ca._mq_client.consumer_ids_changed_count
     notified_b = cb._mq_client.consumer_ids_changed_count
     cid_list = ca._require_client().get_consumer_id_list_by_group(topic6, group6) or []
@@ -333,23 +346,26 @@ def main() -> int:
     covered_n = len((keys_a | keys_b) & expected_keys)
     ca.shutdown()
     cb.shutdown()
-    check("S6-消费者已心跳注册", hb_a > 0 and len(cid_list) == 2,
+    check("S6 the consumers registered through the heartbeat", hb_a > 0 and len(cid_list) == 2,
           "heartbeats=%d brokerCids=%d" % (hb_a, len(cid_list)))
-    check("S6-队列不重不漏(a=%d,b=%d,交集=%d,覆盖=%d/%d)"
+    check("S6 the queues have neither overlap nor gaps (a=%d,b=%d,intersection=%d,coverage=%d/%d)"
           % (asg_a, asg_b, len(keys_a & keys_b), covered_n, len(expected_keys)),
           asg_a > 0 and asg_b > 0 and not (keys_a & keys_b)
           and expected_keys and (keys_a | keys_b) >= expected_keys)
-    check("S6-消息无重复消费", dup6 == 0 and total6 == n6,
+    check("S6 no message was consumed twice", dup6 == 0 and total6 == n6,
           "got=%d/%d dup=%d" % (total6, n6, dup6))
-    # 反向推送只有 broker 发得出来，用例无法注入，所以计数是唯一能证明
-    # 「实例级 40 处理器跑过」的落点（处理器没注册时这里恒为 0）。
-    check("S6-成员变化时收到 broker 的 NOTIFY_CONSUMER_IDS_CHANGED(40)",
+    # Only the broker can send the reverse push and the test case cannot inject it, so this counter
+    # is the one place that can prove "the instance-level 40 handler ran" (it stays 0 when the handler
+    # is not registered).
+    check("S6 on a membership change the broker NOTIFY_CONSUMER_IDS_CHANGED(40) was received",
           notified_a > 0 and notified_b > 0,
           "a=%d b=%d" % (notified_a, notified_b))
 
-    # ---------- S7 优雅注销 ----------
-    # shutdown 时应发 UNREGISTER_CLIENT，broker 端立刻摘除，不必等心跳超时（~120s）。
-    # 查询用独立的探针客户端（消费者 shutdown 后其内部客户端也已关闭）。
+    # ---------- S7 graceful unregistration ----------
+    # On shutdown it should send UNREGISTER_CLIENT and the broker side removes it immediately,
+    # without waiting for the heartbeat to time out (~120s).
+    # The query uses an independent probe client (after the consumer shuts down, its internal client
+    # is closed too).
     probe = MQClientInstance("probe-%d" % int(time.time() * 1000), [NAMESRV])
     probe.start()
     group7 = PREFIX + "_g7"
@@ -366,13 +382,13 @@ def main() -> int:
     time.sleep(2)
     list_after = probe.get_consumer_id_list_by_group(topic6, group7) or []
     probe.shutdown()
-    check("S7-shutdown 已注销 clientId",
+    check("S7 the shutdown unregistered the clientId",
           cid7 in list_before and cid7 not in list_after,
           "before=%d after=%d" % (len(list_before), len(list_after)))
 
     ns = PREFIX + "_NS"
     raw_topic = PREFIX + "_NsTopic"
-    ns_topic = ns + "%" + raw_topic          # broker 侧真实主题名
+    ns_topic = ns + "%" + raw_topic          # the real topic name on the broker side
     prepare_topic(ns_topic)
     group8 = PREFIX + "_g8"
 
@@ -399,7 +415,7 @@ def main() -> int:
     c8.set_message_listener(NsListener(n8))
     c8.subscribe(raw_topic, "*")
     c8.start()
-    # 反证：不带 namespace 的消费者订阅同名 raw_topic，读的是另一个主题，不该收到
+    # The counter-proof: a consumer without a namespace subscribes to the same raw_topic, reads a different topic and must not receive anything
     c8p = DefaultMQPushConsumer(PREFIX + "_g8p")
     c8p.set_namesrv_addr(NAMESRV)
     c8p.set_message_listener(NsListener(n8_plain))
@@ -417,11 +433,11 @@ def main() -> int:
     c8.shutdown()
     c8p.shutdown()
     p8.shutdown()
-    check("S8-命名空间消费者收到消息", any(b == b"ns-1" for b in n8),
+    check("S8 the namespaced consumer received the messages", any(b == b"ns-1" for b in n8),
           "got=%s" % [b.decode() for b in n8])
-    check("S8-无命名空间消费者收不到(隔离)", not any(b == b"ns-1" for b in n8_plain),
+    check("S8 the consumer without a namespace receives nothing (isolation)", not any(b == b"ns-1" for b in n8_plain),
           "got=%s" % [b.decode() for b in n8_plain])
-    check("S8-topic 还原为业务原始名", bool(seen8_topics) and all(t == raw_topic for t in seen8_topics),
+    check("S8 the topic is restored to the original business name", bool(seen8_topics) and all(t == raw_topic for t in seen8_topics),
           "topics=%s" % sorted(set(seen8_topics)))
 
     topic9 = PREFIX + "_Dlq"
@@ -429,9 +445,11 @@ def main() -> int:
     group9 = PREFIX + "_g9"
     attempts = []
     lk9 = threading.Lock()
-    # 记录每次投递相对发送时刻的延迟：负载高时回投会比理论值（10s/30s 档位）慢很多，
-    # 有了延迟才能区分「次数算错」和「只是来得慢」——本机同机并跑四套真机用例时实测
-    # 第 3 次投递会拖到 100s 之后，那是环境慢，不是实现错。
+    # Record the delay of every delivery relative to the send moment: under a heavy load the
+    # send-back is much slower than the theoretical value (the 10s/30s levels); with the delay in
+    # hand it is possible to tell "the count is wrong" apart from "it simply arrived late" -- when
+    # running four live test cases in parallel on the same machine, the 3rd delivery was measured
+    # taking more than 100s, which is a slow environment and not an implementation bug.
     clock = {"sent": 0.0}
 
     class AlwaysFailListener(MessageListenerConcurrently):
@@ -445,30 +463,31 @@ def main() -> int:
     c9 = DefaultMQPushConsumer(group9)
     c9.set_namesrv_addr(NAMESRV)
     c9.set_message_listener(AlwaysFailListener())
-    c9.max_reconsume_times = 2   # 显式小值：默认 16 次要等几小时
+    c9.max_reconsume_times = 2   # an explicit small value: the default of 16 would take hours
     c9.subscribe(topic9, "*")
     c9.start()
     time.sleep(5)
-    # 消费者先起来再发（同 S8：CONSUME_FROM_LAST_OFFSET 会跳过启动前的消息）
+    # Start the consumer before sending (same as S8: CONSUME_FROM_LAST_OFFSET skips the messages sent before startup)
     clock["sent"] = time.time()
     sent9 = producer.send(Message(topic9, b"dlq-me"))
-    # 回投延迟档位 level3=10s、level4=30s ⇒ 三次投递约 40s；150s 是留出同机竞争的余量
+    # The send-back delay levels level3=10s and level4=30s => three deliveries take about 40s; 150s
+    # leaves the margin for contention on the same machine
     deadline = time.time() + 150
     while time.time() < deadline and len(attempts) < 3:
         time.sleep(2)
     first_three = list(attempts)
-    time.sleep(15)   # 反证窗口：不该再有第 4 次投递
+    time.sleep(15)   # the counter-proof window: there must not be a 4th delivery
     final = list(attempts)
     c9.shutdown()
     times_seen = ["%d@%.0fs" % (a[0], a[3]) for a in first_three]
-    check("S9-maxReconsumeTimes=2 时投递 3 次（0/1/2 各一次）",
+    check("S9 with maxReconsumeTimes=2 there are 3 deliveries (0/1/2 once each)",
           [a[0] for a in first_three][:3] == [0, 1, 2], "times=%s" % times_seen)
-    check("S9-用尽后不再投递（观察窗口内只有 3 次）", len(final) == 3,
+    check("S9 once exhausted there are no more deliveries (only 3 inside the observation window)", len(final) == 3,
           "arrivals=%d times=%s" % (len(final), [a[0] for a in final]))
-    check("S9-重投期间 topic 还原为业务 topic",
+    check("S9 during the redelivery the topic is restored to the business topic",
           all(a[2] == topic9 for a in first_three), "topics=%s" % sorted({a[2] for a in first_three}))
 
-    # %DLQ%<group> 由 broker 在投递进 DLQ 时才创建并注册路由，先等路由出现
+    # %DLQ%<group> is only created and route-registered by the broker when it delivers into the DLQ, so wait for the route first
     dlq_topic = MixAll.get_dlq_topic(group9)
     probe9 = MQClientInstance("dlq-probe-%d" % int(time.time() * 1000), [NAMESRV])
     probe9.start()
@@ -479,16 +498,16 @@ def main() -> int:
         if dlq_route is not None and dlq_route.broker_datas:
             break
         time.sleep(2)
-    check("S9- broker 自动创建并注册 %DLQ%<group> 路由", dlq_route is not None and bool(dlq_route.broker_datas),
+    check("S9 the broker automatically created and registered the %DLQ%<group> route", dlq_route is not None and bool(dlq_route.broker_datas),
           "dlq=%s" % dlq_topic)
     probe9.shutdown()
 
-    # 用 lite pull 从队首读 DLQ，确认「就是那条消息」而不是只看到位点前移
+    # Read the DLQ from the head using lite pull, to confirm that it is "exactly that message" rather than just seeing the offset move
     dlq_msgs = []
     if dlq_route is not None and dlq_route.broker_datas:
         lc9 = DefaultLitePullConsumer(PREFIX + "_g9dlq")
         lc9.set_namesrv_addr(NAMESRV)
-        # 新消费组 + CONSUME_FROM_LAST_OFFSET 会从队尾开始，把已经在 DLQ 里的那条跳过 ⇒ 假失败
+        # A new consumer group plus CONSUME_FROM_LAST_OFFSET would start at the tail and skip the entry already in the DLQ => a false failure
         lc9.set_consume_from_where(ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET)
         lc9.subscribe(dlq_topic, "*")
         lc9.start()
@@ -502,16 +521,16 @@ def main() -> int:
         lc9.shutdown()
     got9 = [(bytes(m.body), m.get_reconsume_times(), m.topic,
              (m.properties or {}).get("RETRY_TOPIC")) for m in dlq_msgs]
-    check("S9-消息落在 %DLQ%<group>", [g[0] for g in got9] == [b"dlq-me"],
+    check("S9 the message landed in %DLQ%<group>", [g[0] for g in got9] == [b"dlq-me"],
           "got=%s" % [(g[0].decode(), g[1]) for g in got9])
-    # broker 存储时 reconsumeTimes+1（AbstractSendMessageProcessor:226）⇒ 3
-    check("S9-DLQ 消息 reconsumeTimes=3（第 3 次回投转死信）",
+    # The broker increments reconsumeTimes when storing it (AbstractSendMessageProcessor:226) => 3
+    check("S9 the DLQ message has reconsumeTimes=3 (the 3rd send-back turned it into a dead letter)",
           len(got9) == 1 and got9[0][1] == 3, "got=%s" % got9)
-    check("S9-DLQ 消息保留 RETRY_TOPIC=原始业务 topic",
+    check("S9 the DLQ message keeps RETRY_TOPIC = the original business topic",
           len(got9) == 1 and got9[0][3] == topic9, "got=%s" % got9)
-    check("S9-DLQ 消息 topic 就是 %DLQ%<group>",
+    check("S9 the topic of the DLQ message is exactly %DLQ%<group>",
           len(got9) == 1 and got9[0][2] == dlq_topic, "got=%s" % got9)
-    print("S9: 原始 msgId=%s，DLQ 观测=%s" % (sent9.msg_id, got9))
+    print("S9: the original msgId=%s, the DLQ observation=%s" % (sent9.msg_id, got9))
 
     producer.shutdown()
     print("\nPASS=%d FAIL=%d" % (PASS, FAIL))

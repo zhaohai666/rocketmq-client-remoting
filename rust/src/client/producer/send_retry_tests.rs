@@ -1,9 +1,9 @@
-//! 真集群造不出 `SYSTEM_BUSY`，也造不出「慢 broker 把总预算吃光」，而这两条
-//! 恰好是这段内核的全部难点，所以这里在进程内起一个**假集群**（1 个 namesrv +
-//! N 个 broker，只说 remoting 协议），把每个 broker 的应答码和应答延迟脚本化。
+//! A real cluster cannot produce `SYSTEM_BUSY`, nor a slow broker eating the
+//! total budget -- and these two are exactly the whole difficulty of this kernel,
+//! so this starts an in-process **mock cluster** (1 name server + N brokers, remoting protocol only) that scripts each broker's response code and response delay.
 //!
-//! 末尾另有一节「unitMode / enableStreamRequestType」用同一套假集群做**线上报文**断言
-//! （`unitMode` 落在 V2 头的单字母键 `k`、`ReqT` 由 stream 钩子在 encode 之前写入）。
+//! A later "unitMode / enableStreamRequestType" section uses the same mock cluster for
+//! **wire-message** assertions (`unitMode` lands on the V2 header's single-letter key `k`; `ReqT` is written by the stream hook before encode).
 
 #![cfg(test)]
 
@@ -27,25 +27,25 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-// ---------------------------------------------------------------- 假集群
+// ---------------------------------------------------------------- mock cluster
 
-/// 脚本里表示「读到请求、快照下来，然后**关掉连接不回答**」的应答码。
+/// Response code in the script meaning "read the request, snapshot it, then **close the connection without answering**".
 const CLOSE_WITHOUT_ANSWER: i32 = -1;
 
-/// 单个 broker 的脚本：按顺序弹出 `(应答码, 应答前 sleep 毫秒)`，耗尽后一直用 `tail`。
+/// Per-broker script: pops `(response code, sleep millis before answering)` in order; once exhausted, keeps using `tail`.
 #[derive(Debug)]
 struct BrokerScript {
     steps: VecDeque<(i32, u64)>,
     tail: (i32, u64),
     requests: usize,
-    /// 每笔 SEND 请求**上线时**的 extFields 快照（钩子已经跑完，等价于真报文）。
+    /// extFields snapshot of each SEND request **as it goes on the wire** (hooks already ran; equivalent to the real message).
     sends: Vec<Vec<(String, String)>>,
-    /// 与 `sends` 一一对应的请求码（310 单条 / 320 批量 / 325 应答）。
+    /// Request code aligned 1:1 with `sends` (310 single / 320 batch / 325 reply).
     send_codes: Vec<i32>,
-    /// 与 `sends` 一一对应的 `opaque`：异步重试必须复用同一个请求、**换新的 opaque**，
-    /// 这是唯一能看出「换 opaque 了」的地方。
+    /// `opaque` aligned 1:1 with `sends`: async retry must reuse the same request with a **fresh opaque**,
+    /// the only place where "the opaque was rotated" is observable.
     send_opaques: Vec<i32>,
-    /// 与 `sends` 一一对应的 body：批量发送要按它验证「每条子消息的 UNIQ_KEY 在编码前就写好」。
+    /// Body aligned 1:1 with `sends`: batch sending verifies against it that "each sub-message's UNIQ_KEY is written before encoding".
     send_bodies: Vec<Vec<u8>>,
 }
 
@@ -65,24 +65,24 @@ impl BrokerScript {
 
 #[derive(Debug, Default)]
 struct ClusterState {
-    /// `false` ⇒ namesrv 对任何 topic 都回 `TOPIC_NOT_EXIST`（拿不到路由）
+    /// `false` ⇒ name server answers `TOPIC_NOT_EXIST` for every topic (no route obtainable)
     route_ok: bool,
     brokers: Vec<BrokerScript>,
 }
 
-/// 进程内假集群。broker 名固定为 `broker-0..N`，路由里的队列顺序与之一致，
-/// 因此第一次发送必然落在 `broker-0`（选队是轮询，游标从 0 起）。
+/// In-process mock cluster. Broker names are fixed to `broker-0..N`, and the queue order in
+/// the route matches them, so the first send necessarily lands on `broker-0` (queue selection is round-robin, cursor starts at 0).
 struct MockCluster {
     namesrv_addr: String,
-    /// 路由里 `broker-0..N` 的监听地址，顺序与路由一致。`with_addrs` 下就是传进来的那份。
+    /// Listen addresses of `broker-0..N` from the route, in route order. Under `with_addrs` these are exactly the ones passed in.
     broker_addrs: Vec<String>,
     state: Arc<Mutex<ClusterState>>,
-    /// 只持有、不等待：测试运行时结束时会被 abort。
+    /// Held only, never awaited: aborted when the test runtime finishes.
     tasks: Vec<JoinHandle<()>>,
 }
 
 impl MockCluster {
-    /// 起 `broker_count` 个真监听的 broker + 一个 namesrv。
+    /// Start `broker_count` genuinely listening brokers + a name server.
     async fn start(broker_count: usize, route_ok: bool) -> MockCluster {
         let mut listeners = Vec::new();
         let mut addrs = Vec::new();
@@ -99,7 +99,7 @@ impl MockCluster {
         cluster
     }
 
-    /// 只起 namesrv，路由指向给定地址（可以用一个已经关掉的端口造连接失败）。
+    /// Start only the name server; the route points at the given addresses (an already-closed port can produce a connect failure).
     async fn with_addrs(broker_addrs: Vec<String>, route_ok: bool) -> MockCluster {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock namesrv");
         let namesrv_addr = listener.local_addr().expect("mock namesrv addr").to_string();
@@ -112,7 +112,7 @@ impl MockCluster {
         MockCluster { namesrv_addr, broker_addrs, state, tasks }
     }
 
-    /// 脚本化第 `index` 个 broker：先按 `steps` 依次应答，之后一直用 `tail`。
+    /// Script the `index`-th broker: answer per `steps` in order first, then keep using `tail`.
     fn script(&self, index: usize, steps: Vec<(i32, u64)>, tail: (i32, u64)) {
         let mut state = lock(&self.state);
         let broker = &mut state.brokers[index];
@@ -125,35 +125,35 @@ impl MockCluster {
         broker.send_bodies.clear();
     }
 
-    /// 第 `index` 个 broker 收到的 SEND 请求数。
+    /// Number of SEND requests received by the `index`-th broker.
     fn requests(&self, index: usize) -> usize {
         lock(&self.state).brokers[index].requests
     }
 
-    /// 第 `index` 个 broker 收到的第 `n` 笔 SEND 的 extFields 快照。
+    /// extFields snapshot of the `n`-th SEND received by the `index`-th broker.
     fn send_ext(&self, index: usize, n: usize) -> Vec<(String, String)> {
         lock(&self.state).brokers[index].sends[n].clone()
     }
 
-    /// 第 `index` 个 broker 收到的第 `n` 笔 SEND 的 body 快照。
+    /// Body snapshot of the `n`-th SEND received by the `index`-th broker.
     fn send_body(&self, index: usize, n: usize) -> Vec<u8> {
         lock(&self.state).brokers[index].send_bodies[n].clone()
     }
 
-    /// 第 `index` 个 broker 收到的第 `n` 笔 SEND 的请求码。
+    /// Request code of the `n`-th SEND received by the `index`-th broker.
     fn send_code(&self, index: usize, n: usize) -> i32 {
         lock(&self.state).brokers[index].send_codes[n]
     }
 
-    /// 第 `index` 个 broker 收到的第 `n` 笔 SEND 的 `opaque`。
+    /// `opaque` of the `n`-th SEND received by the `index`-th broker.
     fn send_opaque(&self, index: usize, n: usize) -> i32 {
         lock(&self.state).brokers[index].send_opaques[n]
     }
 }
 
-/// 一个**没人监听**的地址：连上去立刻被拒（`Error::Connect`）。
+/// An address with **no listener**: connecting to it is refused at once (`Error::Connect`).
 ///
-/// 绑定后再立刻关掉，比凭空编一个端口更可靠（那个端口随时可能被人占上）。
+/// Binding then closing immediately is more reliable than inventing a port out of thin air (that port might be taken over by someone at any moment).
 async fn dead_addr() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind then close");
     let addr = listener.local_addr().expect("dead addr").to_string();
@@ -191,7 +191,7 @@ async fn write_frame(stream: &mut TcpStream, response: &mut RemotingCommand) {
     let _ = stream.flush().await;
 }
 
-/// 带请求 `opaque` 的响应（客户端按 opaque 配对，串了就当噪声丢掉）。
+/// Response carrying the request's `opaque` (the client pairs by opaque; mismatched ones are dropped as noise).
 fn response_for(request: &RemotingCommand, code: i32) -> RemotingCommand {
     let mut response = RemotingCommand::create_response(code, Some("mock failure".to_string()));
     response.opaque = request.opaque;
@@ -228,10 +228,10 @@ fn route_json(broker_addrs: &[String]) -> Vec<u8> {
             .collect(),
         ..Default::default()
     };
-    serde_json::to_vec(&route.to_json_value()).expect("路由可序列化")
+    serde_json::to_vec(&route.to_json_value()).expect("route must serialize")
 }
 
-/// namesrv：只答 `GET_ROUTEINFO_BY_TOPIC`，其余一律 SUCCESS。
+/// namesrv: answers only `GET_ROUTEINFO_BY_TOPIC`, everything else gets SUCCESS.
 fn spawn_namesrv(
     listener: TcpListener,
     state: Arc<Mutex<ClusterState>>,
@@ -264,7 +264,7 @@ fn spawn_namesrv(
     })
 }
 
-/// broker：SEND 按脚本应答，其它请求（心跳等）回 SUCCESS。
+/// broker: SENDs answer per the script, other requests (heartbeat etc.) get SUCCESS.
 fn spawn_broker(
     listener: TcpListener,
     index: usize,
@@ -289,7 +289,7 @@ fn spawn_broker(
                         let broker = &mut state.brokers[index];
                         let step = broker.steps.pop_front().unwrap_or(broker.tail);
                         broker.requests += 1;
-                        // 快照必须在应答之前：这时拿到的是钩子处理完、真正上线的那份头
+                        // The snapshot must come before answering: what is captured here is the header after the hooks ran, exactly the one that goes on the wire
                         broker.sends.push(
                             request
                                 .ext_fields()
@@ -303,7 +303,7 @@ fn spawn_broker(
                         (step.0, step.1, broker.requests)
                     };
                     if code == CLOSE_WITHOUT_ANSWER {
-                        // 丢掉连接：客户端看到的是 `Error::SendRequest`（connection closed）
+                        // Drop the connection: the client sees `Error::SendRequest` (connection closed)
                         return;
                     }
                     if delay > 0 {
@@ -327,27 +327,27 @@ fn spawn_broker(
     })
 }
 
-// ---------------------------------------------------------------- 生产者夹具
+// ------------------------------------------------------------- producer fixture
 
-/// 起一个指向假集群的生产者。`instance` 必须每个用例唯一：同 clientId 会共享
-/// [`MQClientInstance`]（连带路由表和 namesrv 地址）。
+/// Start a producer pointed at the mock cluster. `instance` must be unique per test case: the same clientId shares one
+/// [`MQClientInstance`] (together with its route table and name server address).
 async fn started(instance: &str, cluster: &MockCluster) -> DefaultMQProducer {
-    let producer = DefaultMQProducer::new("GID_send_retry").expect("组名合法");
+    let producer = DefaultMQProducer::new("GID_send_retry").expect("group name is valid");
     producer.set_instance_name(instance);
     producer.set_namesrv_addr(&cluster.namesrv_addr);
-    producer.start().await.expect("假集群里 start 应当成功");
+    producer.start().await.expect("start should succeed against the mock cluster");
     producer
 }
 
-/// 失败时把错误打出来，断言才好读。
+/// Print the error on failure so assertions stay readable.
 fn expect_client_code(err: Error) -> (Option<i32>, String) {
     match err {
         Error::Client { response_code, message } => (response_code, message),
-        other => panic!("期望 MQClientException，实际 {other}"),
+        other => panic!("expected an MQClientException, got {other}"),
     }
 }
 
-// ---------------------------------------------------------------- 用例
+// ---------------------------------------------------------------- test cases
 
 #[test]
 fn default_retry_response_codes_match_protocol() {
@@ -368,7 +368,7 @@ fn default_retry_response_codes_match_protocol() {
     assert_eq!(cfg.send_msg_max_timeout_per_request, -1);
 }
 
-/// 三档异常在故障表和重试决策上各不相同，不能合成一个 `retryable`。
+/// The three error tiers differ in both the fault table and the retry decision; they cannot be collapsed into one `retryable`.
 #[test]
 fn send_errors_classify_by_variant_arms() {
     let cases: [(&Error, Option<SendErrorKind>); 9] = [
@@ -405,15 +405,15 @@ fn send_errors_classify_by_variant_arms() {
     }
 }
 
-/// 挂钟会回退，算重试预算只能用单调时钟（负延迟会把慢 broker 记成快 broker）。
+/// The wall clock can roll back, so the retry budget may only use the monotonic clock (a negative latency would record a slow broker as a fast one).
 #[test]
 fn latency_since_never_goes_backwards() {
     let began = monotonic_millis();
     std::thread::sleep(Duration::from_millis(15));
     let first = latency_since(began);
     let second = latency_since(began);
-    assert!(first >= 10, "睡了 15ms，实测 {first}ms");
-    assert!(second >= first, "单调时钟不能倒退: {first} -> {second}");
+    assert!(first >= 10, "slept 15ms, measured {first}ms");
+    assert!(second >= first, "monotonic clock must not go backwards: {first} -> {second}");
 }
 
 #[tokio::test]
@@ -424,10 +424,10 @@ async fn retryable_broker_code_switches_to_another_broker() {
     let producer = started("retry_switch", &cluster).await;
 
     let mut msg = Message::new("T1", Some(b"body"));
-    let result = producer.send(&mut msg, None, None).await.expect("可重试码应换 broker 成功");
+    let result = producer.send(&mut msg, None, None).await.expect("a retryable code should switch brokers and succeed");
     assert_eq!(result.status, SendStatus::SendOk);
-    assert_eq!(cluster.requests(0), 1, "第一台回了 SYSTEM_BUSY");
-    assert_eq!(cluster.requests(1), 1, "第二台被轮到一次");
+    assert_eq!(cluster.requests(0), 1, "the first broker answered SYSTEM_BUSY");
+    assert_eq!(cluster.requests(1), 1, "the second broker was polled once");
     producer.shutdown();
 }
 
@@ -439,11 +439,11 @@ async fn non_retryable_broker_code_throws_at_once() {
     let producer = started("retry_illegal", &cluster).await;
 
     let mut msg = Message::new("T1", Some(b"body"));
-    let err = producer.send(&mut msg, None, None).await.expect_err("MESSAGE_ILLEGAL 必须原样抛");
+    let err = producer.send(&mut msg, None, None).await.expect_err("MESSAGE_ILLEGAL must be thrown verbatim");
     assert_eq!(err.response_code(), Some(response_code::MESSAGE_ILLEGAL));
-    assert!(matches!(err, Error::Broker { .. }), "抛的应当是 MQBrokerException: {err}");
+    assert!(matches!(err, Error::Broker { .. }), "the thrown error should be an MQBrokerException: {err}");
     assert_eq!(cluster.requests(0), 1);
-    assert_eq!(cluster.requests(1), 0, "确定性错误不该再试第二台");
+    assert_eq!(cluster.requests(1), 0, "a deterministic error should not try the second broker");
     producer.shutdown();
 }
 
@@ -455,11 +455,11 @@ async fn added_retry_response_code_makes_a_code_retryable() {
     let producer = started("retry_added", &cluster).await;
     producer.add_retry_response_code(response_code::MESSAGE_ILLEGAL);
     assert!(producer.is_retry_response_code(Some(response_code::MESSAGE_ILLEGAL)));
-    // 压根没等到响应码（连接都没通）等于不可重试：空码不在可重试集合里
+    // Never got a response code at all (the connection never came up) equals non-retryable: an empty code is not in the retryable set
     assert!(!producer.is_retry_response_code(None));
 
     let mut msg = Message::new("T1", Some(b"body"));
-    let result = producer.send(&mut msg, None, None).await.expect("加了码就该换 broker");
+    let result = producer.send(&mut msg, None, None).await.expect("adding the code should make it switch brokers");
     assert_eq!(result.status, SendStatus::SendOk);
     assert_eq!(cluster.requests(1), 1);
     producer.shutdown();
@@ -474,9 +474,9 @@ async fn exhausted_retries_report_brokers_sent_and_code() {
     producer.set_retry_times_when_send_failed(2);
 
     let mut msg = Message::new("T1", Some(b"body"));
-    let err = producer.send(&mut msg, None, None).await.expect_err("全失败必须抛错");
+    let err = producer.send(&mut msg, None, None).await.expect_err("all attempts failing must throw");
     let (code, message) = expect_client_code(err);
-    // 最后一次失败是 broker 码 ⇒ 沿用该码
+    // The last failure carries a broker code ⇒ that code is reused
     assert_eq!(code, Some(response_code::SYSTEM_BUSY));
     assert!(message.contains("Send [3] times"), "{message}");
     assert!(message.contains("Topic: T1"), "{message}");
@@ -495,17 +495,17 @@ async fn missing_route_fails_fast_with_not_found_topic_code() {
     let producer = started("retry_no_route", &cluster).await;
 
     let mut msg = Message::new("T1", Some(b"body"));
-    let err = producer.send(&mut msg, None, None).await.expect_err("没有路由必须失败");
+    let err = producer.send(&mut msg, None, None).await.expect_err("a missing route must fail");
     let (code, message) = expect_client_code(err);
     assert_eq!(code, Some(client_error_code::NOT_FOUND_TOPIC_EXCEPTION));
     assert!(message.contains("Message Queue"), "{message}");
-    assert_eq!(cluster.requests(0), 0, "路由都拿不到，不该发一条");
+    assert_eq!(cluster.requests(0), 0, "with no route at all, not even one request should be sent");
     producer.shutdown();
 }
 
 #[tokio::test]
 async fn connect_failure_is_qualified_with_10001() {
-    // 先占一个端口再立刻释放，路由指向它 ⇒ 连接必然被拒
+    // Occupy a port first and release it at once; the route points at it ⇒ the connect must be refused
     let dead_addr = {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind dead port");
         listener.local_addr().expect("dead addr").to_string()
@@ -514,72 +514,72 @@ async fn connect_failure_is_qualified_with_10001() {
     let producer = started("retry_connect", &cluster).await;
 
     let mut msg = Message::new("T1", Some(b"body"));
-    // 本机回环对"刚关闭端口"的拒绝可能被防火墙压到 ~2s 才回：默认 3s 预算撑不满
-    // 3 次重试，会被判 callTimeout 抛 TooMuchRequest；放宽让重试跑完，落进 10001。
+    // A loopback refusal for a "just-closed port" can be delayed to ~2s by the firewall: the default 3s
+    // budget cannot fit 3 retries, so it is judged callTimeout and throws TooMuchRequest; widen it so the retries run to the end and land on 10001.
     let err = producer
         .send(&mut msg, Some(30_000), None)
         .await
-        .expect_err("连不上必须失败");
+        .expect_err("an unreachable target must fail");
     let (code, message) = expect_client_code(err);
     assert_eq!(code, Some(client_error_code::CONNECT_BROKER_EXCEPTION), "{message}");
     producer.shutdown();
 }
 
-// ---------------- 6b. 寻址故障（10004）不能被说成「这个 topic 没路由」（10005）
+// ---------------- 6b. an addressing failure (10004) must not be phrased as "this topic has no route" (10005)
 
-/// 少了这一步，把地址服务器配错（或它返回空列表）的人看到的会是「这个 topic 没路由」，
-/// 于是去查建 topic / 查权限，而真正坏的是寻址 —— 错方向的排障能耗掉半小时。
+/// Without this step, someone who misconfigures the address server (or who gets an empty list back from it)
+/// would see "this topic has no route", go check topic creation / permissions, while what is actually broken is addressing -- troubleshooting in the wrong direction can burn half an hour.
 #[tokio::test]
 async fn no_name_server_address_reports_10004_not_missing_route() {
-    let producer = DefaultMQProducer::new("GID_send_retry").expect("组名合法");
+    let producer = DefaultMQProducer::new("GID_send_retry").expect("group name is valid");
     let client = MQClientInstance::new("retry_no_namesrv", Vec::new());
 
     let err = producer
         .topic_publish_info(&client, "T1")
         .await
-        .expect_err("一个 name server 地址都没有，必须失败");
+        .expect_err("with not a single name server address, it must fail");
     let (code, message) = expect_client_code(err);
     assert_eq!(code, Some(client_error_code::NO_NAME_SERVER_EXCEPTION));
     assert_eq!(message, "No name server address, please set it.");
 }
 
-/// 对照腿：地址配了、只是连不上（没人监听的端口）⇒ 10004 那道闸必须闭嘴。
+/// Control leg: the address is configured, only unreachable (a port nobody listens on) ⇒ the 10004 gate must stay silent.
 #[tokio::test]
 async fn unreachable_name_server_is_never_reported_as_10004() {
     let addr = dead_addr().await;
-    let producer = DefaultMQProducer::new("GID_send_retry").expect("组名合法");
+    let producer = DefaultMQProducer::new("GID_send_retry").expect("group name is valid");
     producer.set_instance_name("retry_dead_namesrv");
     producer.set_namesrv_addr(&addr);
-    producer.start().await.expect("配置非空即应放行");
+    producer.start().await.expect("a non-empty configuration should pass the gate");
 
     let mut msg = Message::new("T1", Some(b"body"));
     let err = producer
         .send(&mut msg, Some(3000), None)
         .await
-        .expect_err("连不上必须失败");
+        .expect_err("an unreachable target must fail");
     assert_ne!(
         err.response_code(),
         Some(client_error_code::NO_NAME_SERVER_EXCEPTION),
-        "配置里有地址就不能报 10004: {err}"
+        "an address in the configuration means 10004 must not be reported: {err}"
     );
     producer.shutdown();
 }
 
 #[tokio::test]
 async fn producer_start_reports_10004_when_addressing_is_missing() {
-    let producer = DefaultMQProducer::new("GID_send_retry").expect("组名合法");
+    let producer = DefaultMQProducer::new("GID_send_retry").expect("group name is valid");
     producer.set_instance_name("retry_start_noaddr");
     if DefaultTopAddressing::is_configured() {
         return;
     }
-    let err = producer.start().await.expect_err("没有寻址必须起不来");
+    let err = producer.start().await.expect_err("without addressing it must not start");
     assert_eq!(err.response_code(), Some(client_error_code::NO_NAME_SERVER_EXCEPTION), "{err}");
     let (_, message) = expect_client_code(err);
     assert!(message.contains("name server address is not set"), "{message}");
 }
 
-/// `sendMsgMaxTimeoutPerRequest` 的全部意义：慢 broker 只能吃掉被压过的那一小段，
-/// 剩下的预算留给下一台。不设上限时第一台会独占 700ms，整次发送必然更慢。
+/// The entire point of `sendMsgMaxTimeoutPerRequest`: a slow broker may only eat the clamped slice,
+/// and the remaining budget is left for the next one. Without the cap the first broker monopolizes 700ms and the whole send is necessarily slower.
 #[tokio::test]
 async fn per_request_timeout_caps_a_slow_broker_and_retries() {
     let cluster = MockCluster::start(2, true).await;
@@ -594,12 +594,12 @@ async fn per_request_timeout_caps_a_slow_broker_and_retries() {
     let result = producer
         .send(&mut msg, Some(3000), None)
         .await
-        .expect("被压过的单次超时之后应当换到健康的 broker");
+        .expect("after the clamped per-request timeout it should switch to the healthy broker");
     let elapsed = began.elapsed();
     assert_eq!(result.status, SendStatus::SendOk);
     assert!(
         elapsed < Duration::from_millis(500),
-        "单次超时没被压到 150ms：整次发送用了 {}ms",
+        "per-request timeout was not clamped to 150ms: the whole send took {}ms",
         elapsed.as_millis()
     );
     assert_eq!(cluster.requests(0), 1);
@@ -607,8 +607,8 @@ async fn per_request_timeout_caps_a_slow_broker_and_retries() {
     producer.shutdown();
 }
 
-/// 总预算被第一台吃光后，剩下的 broker 一次都试不到 —— 这时抛的是
-/// `RemotingTooMuchRequestException("sendDefaultImpl call timeout")`。
+/// Once the first broker eats the whole budget, the remaining brokers never get a single try -- what is
+/// thrown then is `RemotingTooMuchRequestException("sendDefaultImpl call timeout")`.
 #[tokio::test]
 async fn exhausted_budget_reports_call_timeout() {
     let cluster = MockCluster::start(2, true).await;
@@ -620,10 +620,10 @@ async fn exhausted_budget_reports_call_timeout() {
     let err = producer
         .send(&mut msg, Some(50), None)
         .await
-        .expect_err("500ms 的 broker 遇上的 50ms 预算必然超时");
+        .expect_err("a 50ms budget meeting 500ms brokers must time out");
     assert!(
         matches!(err, Error::TooMuchRequest(_)),
-        "期望 sendDefaultImpl call timeout，实际 {err}"
+        "expected sendDefaultImpl call timeout, got {err}"
     );
     assert_eq!(err.to_string(), "too much request: sendDefaultImpl call timeout");
     producer.shutdown();
@@ -631,28 +631,28 @@ async fn exhausted_budget_reports_call_timeout() {
 
 #[tokio::test]
 async fn not_store_ok_only_switches_broker_when_configured() {
-    // FLUSH_DISK_TIMEOUT 不是异常，是「存了但没存好」的正常应答
+    // FLUSH_DISK_TIMEOUT is not an exception, it is a normal "stored, but not durably" response
     let cluster = MockCluster::start(2, true).await;
     cluster.script(0, vec![], (response_code::FLUSH_DISK_TIMEOUT, 0));
     cluster.script(1, vec![], (response_code::SUCCESS, 0));
     let producer = started("retry_not_store", &cluster).await;
 
     let mut msg = Message::new("T1", Some(b"body"));
-    let result = producer.send(&mut msg, None, None).await.expect("默认原样返回该结果");
+    let result = producer.send(&mut msg, None, None).await.expect("by default the result is returned as-is");
     assert_eq!(result.status, SendStatus::FlushDiskTimeout);
-    assert_eq!(cluster.requests(1), 0, "没开开关就不该换 broker");
+    assert_eq!(cluster.requests(1), 0, "without the switch on, no broker switch should happen");
 
     producer.set_retry_another_broker_when_not_store_ok(true);
     assert!(producer.is_retry_another_broker_when_not_store_ok());
     let mut msg2 = Message::new("T1", Some(b"body"));
-    let result = producer.send(&mut msg2, None, None).await.expect("开了开关应当换 broker");
+    let result = producer.send(&mut msg2, None, None).await.expect("with the switch on it should switch brokers");
     assert_eq!(result.status, SendStatus::SendOk);
     assert_eq!(cluster.requests(1), 1);
     producer.shutdown();
 }
 
-/// 故障规避打开时：失败的 broker 要被隔离（不可选），故障表里记的仍是**真实延迟**，
-/// 只有算隔离窗口时才换成 10000ms 的哨兵值。
+/// With fault avoidance on: the failed broker must be isolated (unselectable), and the fault table still records the **real latency**;
+/// the 10000ms sentinel is substituted only when computing the isolation window.
 #[tokio::test]
 async fn failed_broker_is_isolated_and_latency_is_recorded() {
     let cluster = MockCluster::start(2, true).await;
@@ -663,27 +663,27 @@ async fn failed_broker_is_isolated_and_latency_is_recorded() {
     assert!(producer.is_retry_response_code(Some(response_code::SERVICE_NOT_AVAILABLE)));
 
     let mut msg = Message::new("T1", Some(b"body"));
-    let result = producer.send(&mut msg, None, None).await.expect("隔离后应换到健康 broker");
+    let result = producer.send(&mut msg, None, None).await.expect("after isolation it should switch to the healthy broker");
     assert_eq!(result.status, SendStatus::SendOk);
 
     let tolerance = producer.inner.fault_strategy.latency_fault_tolerance();
-    assert!(!tolerance.is_available("broker-0"), "回了错误码的 broker 必须被隔离");
-    let failed = tolerance.get_fault_item("broker-0").expect("失败的 broker 要进表");
+    assert!(!tolerance.is_available("broker-0"), "a broker that answered an error code must be isolated");
+    let failed = tolerance.get_fault_item("broker-0").expect("the failed broker must be in the table");
     assert!(
         failed.get_current_latency() >= 10 && failed.get_current_latency() < ISOLATION_LATENCY,
-        "故障表里该记真实延迟（30ms 左右），实际 {}",
+        "the fault table should record the real latency (around 30ms), got {}",
         failed.get_current_latency()
     );
-    assert!(!failed.is_reachable(), "MQBrokerException 一档传 reachable=False");
-    let ok = tolerance.get_fault_item("broker-1").expect("成功的 broker 要进表");
-    assert!(ok.is_available(tolerance.now_millis()), "健康的 broker 不该被隔离");
-    assert!(ok.is_reachable(), "成功一档传 reachable=True");
+    assert!(!failed.is_reachable(), "the MQBrokerException tier passes reachable=False");
+    let ok = tolerance.get_fault_item("broker-1").expect("the successful broker must be in the table");
+    assert!(ok.is_available(tolerance.now_millis()), "a healthy broker should not be isolated");
+    assert!(ok.is_reachable(), "the success tier passes reachable=True");
     producer.shutdown();
 }
 
 // ---------------------------------------------------------------- unitMode / stream
 
-/// 从 extFields 快照里取值（顺序无关，只按 key 找）。
+/// Read a value out of an extFields snapshot (order-independent, looked up by key only).
 fn ext_value<'a>(ext: &'a [(String, String)], key: &str) -> Option<&'a str> {
     ext.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
 }
@@ -693,20 +693,20 @@ async fn unit_mode_is_carried_in_the_send_header() {
     let cluster = MockCluster::start(1, true).await;
     cluster.script(0, vec![], (response_code::SUCCESS, 0));
 
-    let on = DefaultMQProducer::new("GID_send_retry").expect("组名合法");
+    let on = DefaultMQProducer::new("GID_send_retry").expect("group name is valid");
     on.set_instance_name("unit_mode_on");
     on.set_namesrv_addr(&cluster.namesrv_addr);
     on.set_unit_mode(true);
-    on.start().await.expect("假集群里 start 应当成功");
+    on.start().await.expect("start should succeed against the mock cluster");
     let mut msg = Message::new("T1", Some(b"unit-on"));
-    on.send(&mut msg, None, None).await.expect("发送应当成功");
+    on.send(&mut msg, None, None).await.expect("send should succeed");
 
-    let off = DefaultMQProducer::new("GID_send_retry").expect("组名合法");
+    let off = DefaultMQProducer::new("GID_send_retry").expect("group name is valid");
     off.set_instance_name("unit_mode_off");
     off.set_namesrv_addr(&cluster.namesrv_addr);
-    off.start().await.expect("默认 unitMode=false");
+    off.start().await.expect("default unitMode=false");
     let mut msg = Message::new("T1", Some(b"unit-off"));
-    off.send(&mut msg, None, None).await.expect("发送应当成功");
+    off.send(&mut msg, None, None).await.expect("send should succeed");
 
     assert_eq!(ext_value(&cluster.send_ext(0, 0), "k"), Some("true"));
     assert_eq!(ext_value(&cluster.send_ext(0, 1), "k"), Some("false"));
@@ -715,13 +715,13 @@ async fn unit_mode_is_carried_in_the_send_header() {
     off.shutdown();
 }
 
-/// `c`/`d` 是功能 bug：broker 侧自动建 topic 时用这两个值决定队列数
-/// （`AbstractSendMessageProcessor` 的 `createTopicInSendMessageMethod`），写死
-/// `TBW102`/4 等于把 `set_create_topic_key` / `set_default_topic_queue_nums` 变成假
-/// setter。`n` 是线上报文对等：经典 broker 按连接寻址、不读它，proxy 与审计侧读。
+/// `c`/`d` are a functional bug: the broker's auto topic creation decides the queue count
+/// from these two values (`createTopicInSendMessageMethod` in `AbstractSendMessageProcessor`), so hardcoding
+/// `TBW102`/4 turns `set_create_topic_key` / `set_default_topic_queue_nums` into fake
+/// setters. `n` is wire-message parity: the classic broker addresses by connection and does not read it, while the proxy and audit side do.
 ///
-/// 五种入口（同步 / 配置覆盖 / 批量 320 / 单向 / 异步）必须带同一份值，且 `d=0`
-/// 要原样上线 —— 0 是「调用方明说的 0」，不是「没配」。
+/// The five entry points (sync / config override / batch 320 / oneway / async) must carry the same values, and `d=0`
+/// must go on the wire verbatim -- 0 is "the caller explicitly said 0", not "nothing was configured".
 #[tokio::test]
 async fn send_header_carries_broker_name_and_topic_keys() {
     let cluster = MockCluster::start(1, true).await;
@@ -729,28 +729,28 @@ async fn send_header_carries_broker_name_and_topic_keys() {
     let producer = started("send_header_fields", &cluster).await;
 
     let mut msg = Message::new("T1", Some(b"single"));
-    producer.send(&mut msg, None, None).await.expect("发送应当成功");
+    producer.send(&mut msg, None, None).await.expect("send should succeed");
     let ext = cluster.send_ext(0, 0);
     assert_eq!(cluster.send_code(0, 0), request_code::SEND_MESSAGE_V2);
     assert_eq!(
         ext_value(&ext, "n"),
         Some("broker-0"),
-        "brokerName 要以单字母键 n 上线"
+        "brokerName must go on the wire under the single-letter key n"
     );
     assert_eq!(ext_value(&ext, "c"), Some(MixAll::DEFAULT_TOPIC));
     assert_eq!(ext_value(&ext, "d"), Some("4"));
 
-    // ② c/d 跟着 producer 配置走
+    // (2) c/d follow the producer configuration
     producer.set_create_topic_key("CreatedTopicKey");
     producer.set_default_topic_queue_nums(9);
     let mut msg = Message::new("T1", Some(b"configured"));
-    producer.send(&mut msg, None, None).await.expect("发送应当成功");
+    producer.send(&mut msg, None, None).await.expect("send should succeed");
     let ext = cluster.send_ext(0, 1);
     assert_eq!(ext_value(&ext, "c"), Some("CreatedTopicKey"));
     assert_eq!(ext_value(&ext, "d"), Some("9"));
     assert_eq!(ext_value(&ext, "n"), Some("broker-0"));
 
-    // ③ 批量走同一个建头函数（码 320、`m=true` 由 send_request_code 那一节负责）
+    // (3) batch goes through the same header-building function (code 320, `m=true` is covered by the send_request_code section)
     producer
         .send_batch(
             vec![
@@ -761,30 +761,30 @@ async fn send_header_carries_broker_name_and_topic_keys() {
             None,
         )
         .await
-        .expect("批量发送应当成功");
+        .expect("batch send should succeed");
     let ext = cluster.send_ext(0, 2);
     assert_eq!(cluster.send_code(0, 2), request_code::SEND_BATCH_MESSAGE);
     assert_eq!(ext_value(&ext, "n"), Some("broker-0"));
     assert_eq!(ext_value(&ext, "c"), Some("CreatedTopicKey"));
     assert_eq!(ext_value(&ext, "d"), Some("9"));
 
-    // ④⑤ 单向与异步同样不能漏；顺手验证 d=0 不上浮成默认值
+    // (4)(5) oneway and async must not be missed either; incidentally verify d=0 does not float up to the default
     producer.set_default_topic_queue_nums(0);
     let mut msg = Message::new("T1", Some(b"oneway"));
     producer
         .send_oneway(&mut msg, None)
         .await
-        .expect("单向发送应当成功");
-    assert!(wait_until(|| cluster.requests(0) >= 4).await, "单向请求也要被抓到");
+        .expect("oneway send should succeed");
+    assert!(wait_until(|| cluster.requests(0) >= 4).await, "the oneway request must be captured too");
     let ext = cluster.send_ext(0, 3);
     assert_eq!(ext_value(&ext, "n"), Some("broker-0"));
     assert_eq!(ext_value(&ext, "c"), Some("CreatedTopicKey"));
-    assert_eq!(ext_value(&ext, "d"), Some("0"), "0 是调用方明说的 0");
+    assert_eq!(ext_value(&ext, "d"), Some("0"), "0 is the caller's explicit 0");
 
     let cb = Arc::new(Recorder::default());
     producer
         .send_async(body_of(10), cb.clone(), Some(3_000), None)
-        .expect("异步可派发");
+        .expect("async is dispatchable");
     assert!(wait_until(|| cluster.requests(0) >= 5).await);
     let ext = cluster.send_ext(0, 4);
     assert_eq!(ext_value(&ext, "n"), Some("broker-0"));
@@ -804,14 +804,14 @@ async fn broker_name_header_follows_the_selected_queue() {
     let producer = started("send_header_broker_name", &cluster).await;
 
     let mut first = Message::new("T1", Some(b"to-0"));
-    producer.send(&mut first, None, None).await.expect("发送应当成功");
+    producer.send(&mut first, None, None).await.expect("send should succeed");
     let mut second = Message::new("T1", Some(b"to-1"));
-    producer.send(&mut second, None, None).await.expect("发送应当成功");
+    producer.send(&mut second, None, None).await.expect("send should succeed");
     assert_eq!(ext_value(&cluster.send_ext(0, 0), "n"), Some("broker-0"));
     assert_eq!(ext_value(&cluster.send_ext(1, 0), "n"), Some("broker-1"));
 
-    // 队列没有 broker 名（例如手工指定的 MessageQueue）时，键要整个消失而不是写 `n=`
-    let client = producer.require_client().expect("client 已启动");
+    // When the queue has no broker name (e.g. a manually specified MessageQueue), the key must vanish entirely rather than be written as `n=`
+    let client = producer.require_client().expect("client is started");
     let mut msg = Message::new("T1", Some(b"no-broker-name"));
     let mut publish = PublishMessage::Single(&mut msg);
     let mq = MessageQueue::new("T1", "", 0);
@@ -828,20 +828,20 @@ async fn broker_name_header_follows_the_selected_queue() {
             MixAll::DEFAULT_TOPIC_QUEUE_NUMS,
         )
         .await
-        .expect("空 brokerName 不该影响发送");
+        .expect("an empty brokerName must not affect the send");
     let ext = cluster.send_ext(0, 1);
-    assert!(ext_value(&ext, "n").is_none(), "空 brokerName 不该上线: {ext:?}");
+    assert!(ext_value(&ext, "n").is_none(), "an empty brokerName must not go on the wire: {ext:?}");
     assert_eq!(ext_value(&ext, "c"), Some(MixAll::DEFAULT_TOPIC));
     assert_eq!(ext_value(&ext, "d"), Some("4"));
 
     producer.shutdown();
 }
 
-/// 为什么必须在**线上报文**这一层锁死：broker 判死信读的是
-/// `SendMessageProcessor#handleRetryAndDLQ:197-210` 里的 `requestHeader.reconsumeTimes`
-/// 与 `maxReconsumeTimes`，**不看报文属性**。抬错等于把消费者配的
-/// `maxReconsumeTimes` 变成摆设 —— 退回订阅组默认的 retryMaxTimes(16)，毒消息要多耗
-/// 十几轮才进 `%DLQ%`。真机上这条只表现为「死信来得慢」，离线抓一次报文才看得出来。
+/// Why this must be nailed down at the **wire-message** layer: the broker's dead-letter decision reads
+/// `requestHeader.reconsumeTimes` and `maxReconsumeTimes` in `SendMessageProcessor#handleRetryAndDLQ:197-210`,
+/// **not the message properties**. Lifting them wrongly turns the consumer's configured
+/// `maxReconsumeTimes` into decoration -- it falls back to the subscription group's default retryMaxTimes(16), so a poison message burns a dozen extra rounds
+/// before entering `%DLQ%`. On a real cluster this only shows up as "dead letters arrive late"; only an offline packet capture reveals it.
 #[test]
 fn retry_topic_properties_are_lifted_into_the_send_header() {
     let mut msg = Message::new("%RETRY%GID_lift", Some(b"poison"));
@@ -866,16 +866,16 @@ fn retry_topic_properties_are_lifted_into_the_send_header() {
     );
     request.make_custom_header_to_net();
     let ext = request.ext_fields();
-    assert_eq!(ext.get("j"), Some("4"), "reconsumeTimes 抬进 j");
-    assert_eq!(ext.get("l"), Some("6"), "maxReconsumeTimes 抬进 l");
+    assert_eq!(ext.get("j"), Some("4"), "reconsumeTimes is lifted into j");
+    assert_eq!(ext.get("l"), Some("6"), "maxReconsumeTimes is lifted into l");
     let props = ext.get("i").unwrap_or_default();
     assert!(
         props.contains(crate::common::message_const::PROPERTY_RECONSUME_TIME),
-        "抬进头之后属性仍要上线: {props}"
+        "the property must still go on the wire after being lifted into the header: {props}"
     );
 }
 
-/// 反向对照：普通 topic 即使带着这两个属性也**不许**抬。
+/// Reverse control: an ordinary topic must **not** lift these two properties even when it carries them.
 #[test]
 fn ordinary_topic_never_lifts_reconsume_times() {
     let mut msg = Message::new("T1", Some(b"normal"));
@@ -901,14 +901,14 @@ fn ordinary_topic_never_lifts_reconsume_times() {
     request.make_custom_header_to_net();
     let ext = request.ext_fields();
     assert_eq!(ext.get("j"), Some("0"));
-    assert!(!ext.contains_key("l"), "没配就不该上线: {ext:?}");
+    assert!(!ext.contains_key("l"), "unconfigured means it must not go on the wire: {ext:?}");
 }
 
-/// 单位名要同时出现在 clientId 与线上报文里，且不影响发送。
+/// The unit name must appear in both the clientId and the wire message, without affecting the send.
 #[tokio::test]
 async fn unit_name_only_changes_the_client_id() {
     let cluster = MockCluster::start(1, true).await;
-    let producer = DefaultMQProducer::new("GID_send_retry").expect("组名合法");
+    let producer = DefaultMQProducer::new("GID_send_retry").expect("group name is valid");
     producer.set_instance_name("unit_name_case");
     producer.set_namesrv_addr(&cluster.namesrv_addr);
     producer.set_unit_name(Some("unitA"));
@@ -918,17 +918,17 @@ async fn unit_name_only_changes_the_client_id() {
         Some(format!("{}@unit_name_case@unitA", MixAll::cached_ip_str()))
     );
     let mut msg = Message::new("T1", Some(b"body"));
-    producer.send(&mut msg, None, None).await.expect("发送应当成功");
+    producer.send(&mut msg, None, None).await.expect("send should succeed");
     assert!(cluster.send_ext(0, 0).iter().all(|(k, _)| k != "unitName"));
     producer.shutdown();
 }
 
-/// ⚠ 请求码与 V2 头的 `m`（batch）是**两件不同的事**：broker 真正按 `m` 选
-/// `sendBatchMessage` 还是单条写入（`SendMessageProcessor:117` 读
-/// `requestHeader.isBatch()`），码只影响服务端按码归类（proxy/auth 把 310/320 列在
-/// 同一个 case，见 `AbstractRemotingActivity:69`、
-/// `DefaultAuthorizationContextBuilder:230-240`）。所以两个都得断言 ——
-/// 只对齐码不对齐 `m`，批量 body 会被按单条解析。
+/// ⚠ The request code and the V2 header's `m` (batch) are **two different things**: the broker really picks
+/// `sendBatchMessage` or single-write by `m` (`SendMessageProcessor:117` reads
+/// `requestHeader.isBatch()`); the code only affects server-side classification by code (proxy/auth list 310/320 in
+/// the same case, see `AbstractRemotingActivity:69` and
+/// `DefaultAuthorizationContextBuilder:230-240`). So both must be asserted --
+/// aligning the code but not `m` would make a batch body get parsed as a single message.
 #[tokio::test]
 async fn send_request_code_follows_protocol_three_way_branch() {
     let cluster = MockCluster::start(1, true).await;
@@ -936,7 +936,7 @@ async fn send_request_code_follows_protocol_three_way_branch() {
     let producer = started("send_code_branch", &cluster).await;
 
     let mut single = Message::new("T1", Some(b"single"));
-    producer.send(&mut single, None, None).await.expect("发送应当成功");
+    producer.send(&mut single, None, None).await.expect("send should succeed");
     assert_eq!(cluster.send_code(0, 0), request_code::SEND_MESSAGE_V2);
     assert_eq!(ext_value(&cluster.send_ext(0, 0), "m"), Some("false"));
 
@@ -950,7 +950,7 @@ async fn send_request_code_follows_protocol_three_way_branch() {
             None,
         )
         .await;
-    batch.expect("批量发送应当成功");
+    batch.expect("batch send should succeed");
     assert_eq!(cluster.send_code(0, 1), request_code::SEND_BATCH_MESSAGE);
     assert_eq!(ext_value(&cluster.send_ext(0, 1), "m"), Some("true"));
 
@@ -958,7 +958,7 @@ async fn send_request_code_follows_protocol_three_way_branch() {
         Message::new("T1", Some(b"r-0")),
         Message::new("T1", Some(b"r-1")),
     ])
-    .expect("同 topic、非延迟、非重试，应当合法");
+    .expect("same topic, not delayed, not a retry: should be legal");
     reply_batch
         .message
         .put_property(
@@ -967,7 +967,7 @@ async fn send_request_code_follows_protocol_three_way_branch() {
         );
     let mut publish = PublishMessage::Batch(&mut reply_batch);
     let mq = MessageQueue::new("T1", "broker-0", 0);
-    let client = producer.require_client().expect("client 已启动");
+    let client = producer.require_client().expect("client is started");
     client
         .send_message(
             "GID_send_retry",
@@ -980,7 +980,7 @@ async fn send_request_code_follows_protocol_three_way_branch() {
             MixAll::DEFAULT_TOPIC_QUEUE_NUMS,
         )
         .await
-        .expect("应答批量发送应当成功");
+        .expect("the reply batch send should succeed");
     producer.shutdown();
 }
 
@@ -1001,29 +1001,29 @@ async fn send_batch_writes_client_ids_before_encoding_the_body() {
             None,
         )
         .await
-        .expect("批量发送应当成功");
+        .expect("batch send should succeed");
 
-    // ① 上线的 body 里每条子消息都带着互不相同的 32 位客户端 ID
+    // (1) in the body that went on the wire, every sub-message carries a distinct 32-char client ID
     let wire = cluster.send_body(0, 0);
     let subs = crate::common::message_decoder::decode_batch_messages(&wire);
-    assert_eq!(subs.len(), 3, "批量 body 必须原样带 3 条子消息");
+    assert_eq!(subs.len(), 3, "the batch body must carry the 3 sub-messages verbatim");
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for sub in &subs {
         let id = crate::common::message_client_id_setter::get_uniq_id(sub)
-            .unwrap_or_else(|| panic!("子消息缺 UNIQ_KEY：ID 必须在编码之前写好"));
+            .unwrap_or_else(|| panic!("sub-message lacks UNIQ_KEY: the ID must be written before encoding"));
         assert_eq!(id.len(), 32, "{id}");
-        assert!(seen.insert(id.clone()), "每条子消息的 UNIQ_KEY 必须各不相同");
-        // 整批的 ID 不能和某条子消息撞，否则等于没把两者区分开
+        assert!(seen.insert(id.clone()), "each sub-message's UNIQ_KEY must be distinct");
+        // The whole-batch ID must not collide with any sub-message's, otherwise the two were never told apart
         assert_ne!(result.msg_id.as_deref(), Some(id.as_str()));
     }
 
-    // ② msg_id 就是批量自己写在报文属性里的 UNIQ_KEY，offsetMsgId 才是 broker 那份
-    let msg_id = result.msg_id.clone().expect("批量也要报出客户端 ID");
+    // (2) msg_id is the batch's own UNIQ_KEY written into the message properties; offsetMsgId is the broker's copy
+    let msg_id = result.msg_id.clone().expect("the batch must also report its client ID");
     assert_eq!(msg_id.len(), 32, "{msg_id}");
-    assert!(!msg_id.contains(','), "批量 msgId 用单个句柄，不拼逗号串：{msg_id}");
+    assert!(!msg_id.contains(','), "the batch msgId uses a single handle, not a comma-joined string: {msg_id}");
     let wire_ext = cluster.send_ext(0, 0);
     let props = ext_value(&wire_ext, "i").unwrap_or_default();
-    assert!(props.contains(msg_id.as_str()), "批量自身的 ID 要真的上线：{props}");
+    assert!(props.contains(msg_id.as_str()), "the batch's own ID must really go on the wire: {props}");
     assert_ne!(result.msg_id, result.offset_msg_id);
 
     producer.shutdown();
@@ -1050,53 +1050,53 @@ async fn stream_request_type_tags_requests_before_user_hooks_run() {
         "GID_send_retry",
         Some(probe.clone() as Arc<dyn RPCHook>),
     )
-    .expect("组名合法");
+    .expect("group name is valid");
     producer.set_instance_name("stream_on");
     producer.set_namesrv_addr(&cluster.namesrv_addr);
     producer.set_enable_stream_request_type(true);
     producer.start().await.expect("start");
     assert!(
         producer.client_id().unwrap_or_default().ends_with("@STREAM"),
-        "开启 stream 后 clientId 要带 @STREAM 后缀"
+        "with stream enabled the clientId must carry the @STREAM suffix"
     );
 
     let mut msg = Message::new("T1", Some(b"body"));
-    producer.send(&mut msg, None, None).await.expect("发送应当成功");
+    producer.send(&mut msg, None, None).await.expect("send should succeed");
     let ext = cluster.send_ext(0, 0);
     assert_eq!(
         ext_value(&ext, MixAll::REQ_T),
         Some("0"),
-        "ReqT 要出现在上线报文里（值是 RequestType.STREAM 的 code）"
+        "ReqT must appear in the wire message (the value is the RequestType.STREAM code)"
     );
     assert!(
         probe.req_t_seen_by_user_hook.load(Ordering::SeqCst),
-        "用户钩子跑的时候 ReqT 必须已经写入"
+        "ReqT must already be written when the user hook runs"
     );
     producer.shutdown();
 }
 
-/// 默认不开：普通生产者的请求里不该出现 ReqT。
+/// Off by default: an ordinary producer's requests must not contain ReqT.
 #[tokio::test]
 async fn stream_request_type_is_off_by_default_for_producers() {
     let cluster = MockCluster::start(1, true).await;
     let producer = started("stream_off", &cluster).await;
     assert!(!producer.config().enable_stream_request_type);
     let mut msg = Message::new("T1", Some(b"body"));
-    producer.send(&mut msg, None, None).await.expect("发送应当成功");
+    producer.send(&mut msg, None, None).await.expect("send should succeed");
     let ext = cluster.send_ext(0, 0);
-    assert!(ext_value(&ext, MixAll::REQ_T).is_none(), "默认不该带 ReqT: {ext:?}");
+    assert!(ext_value(&ext, MixAll::REQ_T).is_none(), "no ReqT by default: {ext:?}");
     assert!(
         !producer.client_id().unwrap_or_default().ends_with("@STREAM"),
-        "默认 clientId 不该带 @STREAM"
+        "the default clientId must not carry @STREAM"
     );
     producer.shutdown();
 }
 
-// ---------------------------------------------------------------- 异步发送背压
+// --------------------------------------------------------- async send backpressure
 
 use std::sync::atomic::AtomicUsize;
 
-/// 记录回调的发送回调。
+/// A send callback that records the invocations.
 #[derive(Default)]
 struct Recorder {
     done: AtomicUsize,
@@ -1122,7 +1122,7 @@ impl SendCallback for Recorder {
     }
 }
 
-/// 数 before/after 钩子各跑了几次，并记下 after 有没有看到结果/异常。
+/// Counts how often the before/after hooks run and records whether after saw a result/exception.
 #[derive(Default)]
 struct CountingSendHook {
     before: AtomicUsize,
@@ -1171,7 +1171,7 @@ impl SendMessageHook for CountingSendHook {
     }
 }
 
-/// 一个**耗时的**拦截钩子：用来把异步内核的准备段预算花光（真集群造不出这段时长）。
+/// A **slow** forbidden hook: used to burn the async kernel's prep-stage budget (a real cluster cannot produce this duration).
 struct SleepingForbiddenHook {
     millis: u64,
 }
@@ -1187,11 +1187,11 @@ impl CheckForbiddenHook for SleepingForbiddenHook {
     }
 }
 
-/// 一个**阻塞式**的 before 钩子：把每一笔发送卡在钩子里，直到测试放行；同时按标签记下
-/// 每笔进钩子的相对时刻 —— 真机验证脚本里的 `SlowHook` 同构。
+/// A **blocking** before hook: parks every send inside the hook until the test releases it, while recording
+/// each entry's relative timestamp by label -- isomorphic to the `SlowHook` in the live-verification script.
 ///
-/// 卡住的笔归还不了任何许可，所以「某笔过了闸」只可能是闸被抬大，判定不用猜时长。
-/// 占住的是**池消费者所在的线程**，因此这个钩子同时测到「池子被在途占满」这一维。
+/// A parked send returns no permit, so "a send passed the gate" can only mean the gate was raised -- the verdict needs no timing guesses.
+/// What it occupies is **the thread the pool consumer runs on**, so this hook also exercises the "pool saturated by in-flight sends" dimension.
 struct ParkingSendHook {
     clock: Mutex<Option<Instant>>,
     entries: Mutex<Vec<(String, u128)>>,
@@ -1209,13 +1209,13 @@ impl ParkingSendHook {
         }
     }
 
-    /// 重新计时并清空记录，让相邻用例互不干扰。
+    /// Restart the clock and clear the records so adjacent test cases do not interfere.
     fn begin(&self) {
         *lock(&self.clock) = Some(Instant::now());
         lock(&self.entries).clear();
     }
 
-    /// 放行所有卡在钩子里的发送。
+    /// Release every send parked in the hook.
     fn open(&self) {
         *lock(&self.gate) = true;
         self.opened.notify_all();
@@ -1248,8 +1248,8 @@ impl SendMessageHook for ParkingSendHook {
             .to_string();
         let began = lock(&self.clock).unwrap_or_else(Instant::now);
         lock(&self.entries).push((label, began.elapsed().as_millis()));
-        // 30s 兜底：用例中途 panic 时不能让池消费者永久卡住，否则测试进程挂死。
-        // 必须读 WaitTimeoutResult：把它丢掉就等于重新无超时等待，兜底形同虚设。
+        // 30s fallback: a mid-case panic must not leave a pool consumer parked forever, or the test process hangs.
+        // The WaitTimeoutResult must be read: discarding it means waiting without a timeout again, making the fallback useless.
         let mut guard = self
             .gate
             .lock()
@@ -1269,17 +1269,17 @@ impl SendMessageHook for ParkingSendHook {
     }
 }
 
-/// 带标签的消息（钩子按 keys 认领是哪一笔）。
+/// A labelled message (the hook claims each send by its keys).
 fn labelled(topic_len: usize, label: &str) -> Message {
     let mut msg = body_of(topic_len);
     msg.set_keys(label);
     msg
 }
 
-/// 开了背压的生产者：条数闸设成 `num`、字节闸夹到地板值 1M。
+/// A producer with backpressure enabled: count gate set to `num`, byte gate clamped to the floor value 1M.
 ///
-/// 字节闸只能配到 1M —— 再小会被夹回来，而 1M 已经够把「一笔扣了多少字节」算清楚
-/// （body 只有几百字节）。
+/// The byte gate can only be configured down to 1M -- smaller values are clamped back up, and 1M is already enough to compute
+/// "how many bytes one send deducts" precisely (the bodies are only a few hundred bytes).
 async fn backpressure_producer(
     instance: &str,
     cluster: &MockCluster,
@@ -1292,7 +1292,7 @@ async fn backpressure_producer(
     producer
 }
 
-/// 同上，再挂一个阻塞式 before 钩子（占住在途用）。
+/// Same as above, plus a blocking before hook attached (to occupy the in-flight slots).
 async fn backpressure_producer_with_hook(
     instance: &str,
     cluster: &MockCluster,
@@ -1304,29 +1304,29 @@ async fn backpressure_producer_with_hook(
     producer
 }
 
-/// 卡在 before 钩子里的在途笔数：比条数闸少一份，缺的那一份由测试自己占住。
+/// Number of in-flight sends parked in the before hook: one less than the count gate, the missing one held by the test itself.
 ///
-/// 为什么要测试代占这一份：条数闸的下限和**池并发额度的下限**是同一个数
-/// （[`MIN_ASYNC_SEND_NUM`]，见 [`async_sender_worker_count`]），两核机器上都是 10。
-/// 让 10 笔全卡进钩子，第 11 笔就只能在池队列里等一个额度、永远走不到闸上 —— 用例
-/// 变成赌宿主有几个核。占住一份后卡钩子的只有 9 笔，额度恒 ≥ 10，第 10 笔必然能在
-/// 池里跑起来并停在闸上，形状与核数无关。
+/// Why the test has to hold that one: the count gate's floor and **the pool concurrency floor** are the same number
+/// ([`MIN_ASYNC_SEND_NUM`], see [`async_sender_worker_count`]), 10 even on a two-core machine.
+/// If all 10 sends park in the hook, the 11th can only wait in the pool queue for a worker slot and never reaches the gate -- the case
+/// becomes a bet on how many cores the host has. With one held, only 9 park in the hook, the slot count is always ≥ 10, and the 10th
+/// necessarily runs in the pool and stops at the gate, making the shape independent of the core count.
 const PARKED_IN_HOOK: usize = MIN_ASYNC_SEND_NUM as usize - 1;
 
-/// 真机验证 B3 的离线对拍（`examples/live_backpressure.rs`）：**池内消费者都被同步钩子
-/// 按住时，运行时扩容仍然要把卡在闸上的那一笔叫醒并真的发出去**。
+/// Offline counterpart of live check B3 (`examples/live_backpressure.rs`): **while every pool consumer is held by a synchronous
+/// hook, a runtime resize must still wake the send parked at the gate and really dispatch it**.
 ///
-/// 单线程运行时测不出这件事——那里池任务只在调用方 await 时才跑，闸和池纠缠不到一起，
-/// 所以这一条要显式多样本运行时（与真机脚本同样的形状）。丢唤醒如果回归，这里会先红。
+/// A single-threaded runtime cannot measure this -- there pool tasks only run when the caller awaits, so the gate and the pool never entangle,
+/// hence this case needs an explicit multi-thread runtime (the same shape as the live script). If lost wakeups regress, this goes red first.
 ///
-/// 判定不看时长：9 笔卡在 before 钩子里、测试不放行就谁也归还不了许可，闸上缺的那一份
-/// 又由测试自己占着，所以第 10 笔「出现在钩子里」这件事本身就只能扩容抬了闸。
+/// The verdict does not look at durations: 9 sends are parked in the before hook and none can return a permit until the test releases them, and the one permit
+/// missing at the gate is held by the test itself, so "the 10th appears in the hook" can only mean the resize raised the gate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 32)]
 async fn resize_wakes_the_gate_waiter_while_pool_workers_are_parked() {
     let workers = async_sender_worker_count();
     assert!(
         workers > PARKED_IN_HOOK,
-        "池并发额度({workers})容不下 {} 笔卡进钩子再加第 {} 笔停在闸上",
+        "pool concurrency {workers} cannot fit {} sends parked in the hook plus a {}-th stopped at the gate",
         PARKED_IN_HOOK,
         PARKED_IN_HOOK + 1
     );
@@ -1338,44 +1338,44 @@ async fn resize_wakes_the_gate_waiter_while_pool_workers_are_parked() {
             .await;
     hook.begin();
 
-    // 闸差一份就满，这一份由测试占住，于是卡钩子的笔数就此与核数无关。
+    // The gate is one permit short of full and the test holds that one, so the number of hook-parked sends becomes core-count-independent.
     assert!(
         producer
             .inner
             .semaphore_async_send_num
             .try_acquire(1, 0)
             .await,
-        "起手时条数闸应当有空闲许可可占"
+        "at start the count gate should have a free permit to take"
     );
 
     let held = Arc::new(Recorder::default());
     for _ in 0..PARKED_IN_HOOK {
         producer
             .send_async(labelled(8, "held"), held.clone(), Some(15_000), None)
-            .expect("9 笔都该排进池队列");
+            .expect("all 9 sends should queue into the pool");
     }
-    // 必须等 9 笔真的卡进钩子再补第 10 笔：池里的任务和主任务并发，谁先到闸口不一定。
-    // 先过闸的那笔会拿到许可，「卡住的第 10 笔」就变成「卡住的第 10 笔 held」，
-    // 下面的判定只是运气（真机 B3 用看门线程盯同一件事）。
+    // Must wait until all 9 really park in the hook before adding the 10th: pool tasks run concurrently with the main task, and who reaches the gate first is not fixed.
+    // The first send through the gate takes a permit, so "the stuck 10th" becomes "the 10th stuck held",
+    // and the verdict below would be luck (live B3 watches the same thing with a watchdog thread).
     assert!(
         wait_until(|| hook.count_of("held") == PARKED_IN_HOOK).await,
-        "{} 笔没能全部卡进钩子（已记录 {}）",
+        "not all {} sends parked in the hook (recorded: {})",
         PARKED_IN_HOOK,
         hook.dump()
     );
     assert_eq!(
         producer.semaphore_async_send_num_available_permits(),
         0,
-        "{} 笔在途 + 测试占的 1 份要把条数闸压到刚好空",
+        "{} in-flight sends + the 1 permit held by the test must press the count gate to exactly empty",
         PARKED_IN_HOOK
     );
 
     let woken = Arc::new(Recorder::default());
     producer
         .send_async(labelled(8, "woken"), woken.clone(), Some(15_000), None)
-        .expect("第 10 笔也该排进池队列");
+        .expect("the 10th send should also queue into the pool");
 
-    // 它停在闸上（而不是还排在池队列里）是有凭据的：公平队列里多了一张票据。
+    // That it stops at the gate (rather than still waiting in the pool queue) has evidence: the fair queue holds one more ticket.
     assert!(
         wait_until(|| producer
             .inner
@@ -1383,34 +1383,34 @@ async fn resize_wakes_the_gate_waiter_while_pool_workers_are_parked() {
             .waiting_count()
             >= 1)
             .await,
-        "第 10 笔没能排到闸上（钩子记录: {}）",
+        "the 10th send never reached the gate (hook record: {})",
         hook.dump()
     );
     assert_eq!(
         hook.count_of("woken"),
         0,
-        "扩容之前第 10 笔不该过闸（钩子记录: {}）",
+        "before the resize the 10th send must not pass the gate (hook record: {})",
         hook.dump()
     );
     producer.set_back_pressure_for_async_send_num(MIN_ASYNC_SEND_NUM + 2);
 
-    // 叫醒它的只可能是扩容：此刻 9 笔在途还全卡在钩子里，没有许可被归还过。
+    // Only the resize can have woken it: at this moment all 9 in-flight sends are still parked in the hook and no permit has been returned.
     assert!(
         wait_until(|| hook.count_of("woken") == 1).await,
-        "扩容没把卡在闸上的那笔叫醒: {:?}",
+        "the resize did not wake the send parked at the gate: {:?}",
         woken.errors()
     );
     assert_eq!(
         hook.count_of("held"),
         PARKED_IN_HOOK,
-        "{} 笔并非全都卡在钩子里，第 10 笔过闸就不算扩容抬闸的证据",
+        "not all {} sends are parked in the hook, so the 10th passing the gate would not evidence a raised gate",
         PARKED_IN_HOOK
     );
 
     hook.open();
     assert!(
         wait_until(|| woken.done.load(Ordering::SeqCst) == 1).await,
-        "放行后第 10 笔没落地: {:?}",
+        "after release the 10th send never landed: {:?}",
         woken.errors()
     );
     assert_eq!(woken.ok.load(Ordering::SeqCst), 1, "{:?}", woken.errors());
@@ -1423,7 +1423,7 @@ async fn resize_wakes_the_gate_waiter_while_pool_workers_are_parked() {
     assert_eq!(
         producer.semaphore_async_send_num_available_permits(),
         MIN_ASYNC_SEND_NUM + 2,
-        "全部落地、测试占的那份也归还后空闲许可 = 新容量"
+        "after everything lands and the test-held permit is returned too, free permits = the new capacity"
     );
     producer.shutdown();
 }
@@ -1433,15 +1433,15 @@ fn body_of(len: usize) -> Message {
     Message::new("T1", Some(&body))
 }
 
-/// 轮询等待条件成立（最多约 15s），避免用固定 sleep 猜时长。
+/// Poll until the condition holds (about 15s at most) instead of guessing durations with a fixed sleep.
 ///
-/// 预算给到 15s 而不是 3s：CI runner 只有两四个核，却要跑 32 个 worker 线程的运行时和
-/// 整套并发用例，光"被调度到"就是几百毫秒量级。条件一满足就立刻返回，宽预算只会拖慢
-/// 真失败的上报，不会拖慢绿跑；反过来押 3s 只会把"调度慢"报成"回归"。
+/// The budget is 15s rather than 3s: a CI runner has only two or four cores, yet must run a runtime with 32 worker threads and
+/// the whole concurrency suite -- merely "getting scheduled" is on the order of hundreds of milliseconds. It returns the instant the condition holds, so a wide budget only slows the reporting of
+/// real failures, never green runs; conversely betting on 3s would report "slow scheduling" as a "regression".
 ///
-/// ⚠ 反过来也别拿时长当判据：这条链路上真出过的事是「池额度被卡在钩子里的在途占满，
-/// 第 N+1 笔根本没被派发」，放大时长窗口永远修不掉它，只能换成状态判据（见
-/// `resize_wakes_the_gate_waiter_while_pool_workers_are_parked`）。
+/// ⚠ Conversely, do not use durations as the verdict either: what really happened once on this path was "the pool slots are fully
+/// occupied by hook-parked in-flight sends, and send N+1 is never dispatched"; widening the timing window never fixes that, only a state-based verdict does (see
+/// `resize_wakes_the_gate_waiter_while_pool_workers_are_parked`).
 async fn wait_until<F: Fn() -> bool>(cond: F) -> bool {
     for _ in 0..1500 {
         if cond() {
@@ -1454,7 +1454,7 @@ async fn wait_until<F: Fn() -> bool>(cond: F) -> bool {
 
 #[test]
 fn backpressure_defaults_match_contract() {
-    let producer = DefaultMQProducer::new("GID_bp_default").expect("组名合法");
+    let producer = DefaultMQProducer::new("GID_bp_default").expect("group name is valid");
     assert!(!producer.is_enable_backpressure_for_async_mode());
     assert_eq!(producer.get_back_pressure_for_async_send_num(), 1024);
     assert_eq!(
@@ -1476,16 +1476,16 @@ fn constructor_floors_undersized_capacities() {
         back_pressure_for_async_send_size: 1024,
         ..Default::default()
     };
-    let producer = DefaultMQProducer::with_config(cfg).expect("配置合法");
+    let producer = DefaultMQProducer::with_config(cfg).expect("config is valid");
     assert_eq!(
         producer.get_back_pressure_for_async_send_num(),
         1,
-        "配置值本身原样留着不改"
+        "the configured value itself stays unchanged"
     );
     assert_eq!(
         producer.semaphore_async_send_num_available_permits(),
         MIN_ASYNC_SEND_NUM,
-        "但信号量按地板值建"
+        "but the semaphore is built at the floor value"
     );
     assert_eq!(
         producer.semaphore_async_send_size_available_permits(),
@@ -1495,7 +1495,7 @@ fn constructor_floors_undersized_capacities() {
 
 #[test]
 fn setter_floors_both_gates() {
-    let producer = DefaultMQProducer::new("GID_bp_setter").expect("组名合法");
+    let producer = DefaultMQProducer::new("GID_bp_setter").expect("group name is valid");
     producer.set_back_pressure_for_async_send_num(1);
     producer.set_back_pressure_for_async_send_size(1024);
     assert_eq!(
@@ -1516,7 +1516,7 @@ fn setter_floors_both_gates() {
     );
 }
 
-/// 关着的时候一笔发送既不扣也不还许可。
+/// While the gate is off, a send neither deducts nor returns permits.
 #[tokio::test]
 async fn disabled_gate_stays_out_of_the_way() {
     let cluster = MockCluster::start(1, true).await;
@@ -1527,8 +1527,8 @@ async fn disabled_gate_stays_out_of_the_way() {
     let cb = Arc::new(Recorder::default());
     producer
         .send_async(body_of(400), cb.clone(), Some(3_000), None)
-        .expect("运行时内可派发");
-    // 在途时容量一分未动
+        .expect("dispatchable within the runtime");
+    // while in flight the capacity is untouched
     assert!(wait_until(|| cluster.requests(0) >= 1).await);
     assert_eq!(producer.semaphore_async_send_num_available_permits(), 1024);
     assert_eq!(
@@ -1556,25 +1556,25 @@ async fn num_gate_rejects_with_contract_message_and_sends_nothing() {
     let cb = Arc::new(Recorder::default());
     producer
         .send_async(body_of(1), cb.clone(), Some(300), None)
-        .expect("运行时内可派发");
+        .expect("dispatchable within the runtime");
     assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
     let errors = cb.errors();
     assert_eq!(errors.len(), 1);
     assert!(
         errors[0].contains("send message tryAcquire semaphoreAsyncNum timeout"),
-        "错误文案逐字校验: {}",
+        "error text checked verbatim: {}",
         errors[0]
     );
     assert!(
         began.elapsed() >= Duration::from_millis(250),
-        "没等到超时就把失败交出去了：{:?}",
+        "the failure was handed back before the timeout elapsed: {:?}",
         began.elapsed()
     );
-    assert_eq!(cluster.requests(0), 0, "被闸拒绝时一次请求都不该发出去");
+    assert_eq!(cluster.requests(0), 0, "when the gate rejects, not a single request should go out");
     assert_eq!(
         producer.semaphore_async_send_size_available_permits(),
         MIN_ASYNC_SEND_SIZE,
-        "条数闸没过时不该去扣字节"
+        "when the count gate fails, the byte gate must not be deducted"
     );
     producer
         .inner
@@ -1597,18 +1597,18 @@ async fn size_gate_rejects_and_gives_the_num_permit_back() {
     let cb = Arc::new(Recorder::default());
     producer
         .send_async(body_of(10), cb.clone(), Some(200), None)
-        .expect("运行时内可派发");
+        .expect("dispatchable within the runtime");
     assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
     let errors = cb.errors();
     assert!(
         errors[0].contains("send message tryAcquire semaphoreAsyncSize timeout"),
-        "错误文案逐字校验: {}",
+        "error text checked verbatim: {}",
         errors[0]
     );
     assert_eq!(
         producer.semaphore_async_send_num_available_permits(),
         MIN_ASYNC_SEND_NUM,
-        "条数许可漏还了"
+        "the count permit was leaked"
     );
     assert_eq!(cluster.requests(0), 0);
     producer
@@ -1618,7 +1618,7 @@ async fn size_gate_rejects_and_gives_the_num_permit_back() {
     producer.shutdown();
 }
 
-/// 一条在途发送 = 1 个条数许可 + body.length 个字节许可；回调之后两者都回来。
+/// One in-flight send = 1 count permit + body.length byte permits; both come back after the callback.
 #[tokio::test]
 async fn permits_are_borrowed_per_in_flight_send_and_given_back() {
     let cluster = MockCluster::start(1, true).await;
@@ -1628,7 +1628,7 @@ async fn permits_are_borrowed_per_in_flight_send_and_given_back() {
     let cb = Arc::new(Recorder::default());
     producer
         .send_async(body_of(400), cb.clone(), Some(3_000), None)
-        .expect("运行时内可派发");
+        .expect("dispatchable within the runtime");
     assert!(wait_until(|| cluster.requests(0) >= 1).await);
     assert_eq!(producer.semaphore_async_send_num_available_permits(), 9);
     assert_eq!(
@@ -1654,7 +1654,7 @@ async fn failure_also_gives_the_permits_back() {
     let cb = Arc::new(Recorder::default());
     producer
         .send_async(body_of(300), cb.clone(), Some(3_000), None)
-        .expect("运行时内可派发");
+        .expect("dispatchable within the runtime");
     assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
     assert!(!cb.errors().is_empty());
     assert_eq!(producer.semaphore_async_send_num_available_permits(), 10);
@@ -1665,10 +1665,10 @@ async fn failure_also_gives_the_permits_back() {
     producer.shutdown();
 }
 
-/// 重试链只占**一份**许可（一次发送一笔），不是一笔尝试一份；还多次会把容量虚增。
+/// The retry chain holds **one** pair of permits (one per send, not one per attempt); returning them multiple times would inflate the capacity.
 ///
-/// 重试由「broker 关掉连接不回答」触发（异步链只对没收到响应的失败换 broker），
-/// 第二轮落在慢应答的 `broker-1` 上，好留出观察窗口。
+/// The retry is triggered by "the broker closes the connection without answering" (the async chain only switches brokers for failures with no response),
+/// and the second round lands on the slow-answering `broker-1`, leaving an observation window.
 #[tokio::test]
 async fn retry_chain_holds_one_pair_not_one_per_attempt() {
     let cluster = MockCluster::start(2, true).await;
@@ -1683,8 +1683,8 @@ async fn retry_chain_holds_one_pair_not_one_per_attempt() {
     let cb = Arc::new(Recorder::default());
     producer
         .send_async(body_of(300), cb.clone(), Some(9_000), None)
-        .expect("运行时内可派发");
-    // 第二轮尝试已经在路上，扣掉的仍然只是一笔的量
+        .expect("dispatchable within the runtime");
+    // the second attempt is already on its way, and what is deducted is still just one send's worth
     assert!(wait_until(|| cluster.requests(1) >= 1).await);
     assert_eq!(producer.semaphore_async_send_num_available_permits(), 9);
     assert_eq!(
@@ -1692,9 +1692,9 @@ async fn retry_chain_holds_one_pair_not_one_per_attempt() {
         MIN_ASYNC_SEND_SIZE - 300
     );
     assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
-    assert_eq!(cluster.requests(0), 1, "第一笔落在换掉的那台");
+    assert_eq!(cluster.requests(0), 1, "the first attempt landed on the dropped broker");
     assert_eq!(cluster.requests(1), 1);
-    assert!(cb.errors().is_empty(), "换 broker 之后应当发成功: {:?}", cb.errors());
+    assert!(cb.errors().is_empty(), "after switching brokers the send should succeed: {:?}", cb.errors());
     assert_eq!(producer.semaphore_async_send_num_available_permits(), 10);
     assert_eq!(
         producer.semaphore_async_send_size_available_permits(),
@@ -1718,8 +1718,8 @@ async fn gate_waits_for_a_permit_instead_of_failing_early() {
     let began = Instant::now();
     producer
         .send_async(body_of(1), cb.clone(), Some(5_000), None)
-        .expect("运行时内可派发");
-    // 让它在闸上排上队，然后确认它**还活着**（没提前失败、也没发出去）
+        .expect("dispatchable within the runtime");
+    // Let it queue at the gate, then confirm it is **still alive** (neither failed early nor sent out)
     assert!(wait_until(|| producer
         .inner
         .semaphore_async_send_num
@@ -1730,7 +1730,7 @@ async fn gate_waits_for_a_permit_instead_of_failing_early() {
     assert_eq!(cluster.requests(0), 0);
 
     tokio::time::sleep(Duration::from_millis(120)).await;
-    assert_eq!(cb.done.load(Ordering::SeqCst), 0, "还没到超时就不该提前失败");
+    assert_eq!(cb.done.load(Ordering::SeqCst), 0, "it must not fail early before the timeout");
     producer
         .inner
         .semaphore_async_send_num
@@ -1738,10 +1738,10 @@ async fn gate_waits_for_a_permit_instead_of_failing_early() {
     assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
     assert!(
         began.elapsed() >= Duration::from_millis(100),
-        "没有等许可，看一眼不够就失败了：{:?}",
+        "it did not wait for a permit, failing the moment one look showed there was none: {:?}",
         began.elapsed()
     );
-    assert!(cb.errors().is_empty(), "等到许可之后这一笔应当发出去");
+    assert!(cb.errors().is_empty(), "once the permit arrives, this send should go out");
     assert_eq!(cb.ok.load(Ordering::SeqCst), 1);
     assert_eq!(cluster.requests(0), 1);
     producer.shutdown();
@@ -1785,16 +1785,16 @@ async fn growing_capacity_wakes_a_blocked_sender() {
     let cb = Arc::new(Recorder::default());
     producer
         .send_async(body_of(1), cb.clone(), Some(5_000), None)
-        .expect("运行时内可派发");
+        .expect("dispatchable within the runtime");
     assert!(wait_until(|| producer
         .inner
         .semaphore_async_send_num
         .waiting_count()
         >= 1)
     .await);
-    producer.set_back_pressure_for_async_send_num(MIN_ASYNC_SEND_NUM + 1); // 凭空多出 1 条容量
+    producer.set_back_pressure_for_async_send_num(MIN_ASYNC_SEND_NUM + 1); // one extra unit of capacity out of thin air
     assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
-    assert!(cb.errors().is_empty(), "扩容后这一笔应当发出去: {:?}", cb.errors());
+    assert!(cb.errors().is_empty(), "after the resize this send should go out: {:?}", cb.errors());
     assert_eq!(cluster.requests(0), 1);
     producer.shutdown();
 }
@@ -1807,8 +1807,8 @@ fn empty_body_still_costs_one_size_permit() {
     assert_eq!(back_pressure_msg_len(&no_body), 1);
 }
 
-/// 「排队」在这里是任务从入队到被池内消费者跑起来之间的间隔，真集群造不出稳定时长，
-/// 所以直接把 `began` 摆在过去，等价于那段等待已经花光了预算。
+/// "Queueing" here is the gap between a task being enqueued and a pool consumer running it; a real cluster cannot produce a stable duration for it,
+/// so `began` is placed directly in the past, equivalent to that wait having spent the whole budget.
 #[tokio::test]
 async fn queue_wait_beyond_budget_reports_async_send_call_timeout() {
     let cluster = MockCluster::start(1, true).await;
@@ -1825,21 +1825,21 @@ async fn queue_wait_beyond_budget_reports_async_send_call_timeout() {
     assert_eq!(errors.len(), 1);
     assert!(
         errors[0].contains("DEFAULT ASYNC send call timeout"),
-        "错误文案逐字校验: {}",
+        "error text checked verbatim: {}",
         errors[0]
     );
-    assert_eq!(cluster.requests(0), 0, "预算没了就不该再发请求");
+    assert_eq!(cluster.requests(0), 0, "with no budget left, no request should be sent");
     producer.shutdown();
 }
 
-// ================================================================ 异步发送内核
+// ================================================================ async send kernel
 //
-// 队列有界、地址解析、复用请求换 opaque、`retryTimesWhenSendAsyncFailed`、异步不看
-// `retryResponseCodes` —— 这些只有真异步内核才谈得上，全部在假集群上对拍。
+// Bounded queue, address resolution, reused requests with a fresh opaque, `retryTimesWhenSendAsyncFailed`, async ignoring
+// `retryResponseCodes` -- these only exist for the real async kernel; all are checked against the mock cluster.
 
-/// 这里能确定性地造出队满：`#[tokio::test]` 用的是**单线程**运行时，两次 `send_async`
-/// 之间没有 `await`，池内消费者没机会被调度，所以容量 1 的队列在第二笔时必然是满的。
-/// 容量是**建池时**（`start()`）读的，所以要配在 `ProducerConfig` 里。
+/// Queue-full can be produced deterministically here: `#[tokio::test]` uses a **single-threaded** runtime, there is no `await` between the two
+/// `send_async` calls, so the pool consumer never gets scheduled and a capacity-1 queue is necessarily full at the second send.
+/// Capacity is read when the pool is **built** (`start()`), so it must be configured in `ProducerConfig`.
 #[tokio::test]
 async fn queue_full_rejects_the_caller_without_sending() {
     let cluster = MockCluster::start(1, true).await;
@@ -1851,25 +1851,25 @@ async fn queue_full_rejects_the_caller_without_sending() {
         async_sender_queue_capacity: 1,
         ..Default::default()
     })
-    .expect("配置合法");
-    producer.start().await.expect("假集群里 start 应当成功");
+    .expect("config is valid");
+    producer.start().await.expect("start should succeed against the mock cluster");
     assert_eq!(producer.get_async_sender_queue_capacity(), 1);
 
     let cb = Arc::new(Recorder::default());
     producer
         .send_async(body_of(10), cb.clone(), Some(3_000), None)
-        .expect("第一笔总能进队列");
+        .expect("the first send always enters the queue");
     let err = producer
         .send_async(body_of(10), cb.clone(), Some(3_000), None)
-        .expect_err("队列满了要把这一笔退回调用方");
+        .expect_err("when the queue is full the send must be handed back to the caller");
     assert!(
         err.to_string().contains("executor rejected"),
-        "拒绝文案逐字校验（末尾不留多余空格）: {err}"
+        "rejection text checked verbatim (no extra trailing space): {err}"
     );
-    assert_eq!(cb.done.load(Ordering::SeqCst), 0, "被拒的一笔不该有回调");
-    assert_eq!(cluster.requests(0), 0, "被拒之前一次请求都不该发出去");
+    assert_eq!(cb.done.load(Ordering::SeqCst), 0, "a rejected send must not call back");
+    assert_eq!(cluster.requests(0), 0, "before the rejection, no request should have been sent");
 
-    // 放行之后第一笔照常发出去、回调照样跑
+    // after letting the queue drain, the first send goes out as usual and its callback still runs
     assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
     assert_eq!(cb.ok.load(Ordering::SeqCst), 1);
     producer.shutdown();
@@ -1889,29 +1889,29 @@ async fn queue_full_with_backpressure_dispatches_off_the_queue() {
         back_pressure_for_async_send_size: MIN_ASYNC_SEND_SIZE,
         ..Default::default()
     })
-    .expect("配置合法");
-    producer.start().await.expect("假集群里 start 应当成功");
+    .expect("config is valid");
+    producer.start().await.expect("start should succeed against the mock cluster");
 
     let cb = Arc::new(Recorder::default());
     producer
         .send_async(body_of(10), cb.clone(), Some(3_000), None)
-        .expect("第一笔进队列");
+        .expect("the first send enters the queue");
     producer
         .send_async(body_of(10), cb.clone(), Some(3_000), None)
-        .expect("开了背压时队满也不该把这一笔退回调用方");
+        .expect("with backpressure on, a full queue must not hand the send back to the caller");
     assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 2).await);
-    assert_eq!(cb.ok.load(Ordering::SeqCst), 2, "两笔都要发出去");
+    assert_eq!(cb.ok.load(Ordering::SeqCst), 2, "both sends must go out");
     assert_eq!(cluster.requests(0), 2);
     assert_eq!(
         producer.semaphore_async_send_num_available_permits(),
         MIN_ASYNC_SEND_NUM,
-        "归还必须恰好等于扣掉的"
+        "the return must exactly equal what was deducted"
     );
     producer.shutdown();
 }
 
-/// 池已随 `shutdown()` 关掉 ⇒ 同步报错给调用方，而不是把任务投进一个
-/// 不会再有人消费的队列。回调一次都不跑。
+/// The pool is closed with `shutdown()` ⇒ the caller gets a synchronous error, instead of a task being posted to a
+/// queue no one will consume again. The callback never runs.
 #[tokio::test]
 async fn send_async_after_shutdown_is_rejected() {
     let cluster = MockCluster::start(1, true).await;
@@ -1919,14 +1919,14 @@ async fn send_async_after_shutdown_is_rejected() {
     let cb = Arc::new(Recorder::default());
     producer
         .send_async(body_of(10), cb.clone(), Some(3_000), None)
-        .expect("启动后接受异步发送");
+        .expect("async sends are accepted after start");
     assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
     producer.shutdown();
     let err = producer
         .send_async(body_of(10), cb.clone(), Some(1_000), None)
-        .expect_err("关闭后不该接受异步发送");
+        .expect_err("async sends must not be accepted after shutdown");
     assert!(err.to_string().contains("producer not started"), "{err}");
-    assert_eq!(cb.done.load(Ordering::SeqCst), 1, "被拒的一笔不该有回调");
+    assert_eq!(cb.done.load(Ordering::SeqCst), 1, "a rejected send must not call back");
 }
 
 #[tokio::test]
@@ -1944,17 +1944,17 @@ async fn prep_stage_beyond_budget_reports_send_kernel_timeout() {
     let cb = Arc::new(Recorder::default());
     producer
         .send_async(body_of(300), cb.clone(), Some(50), None)
-        .expect("运行时内可派发");
+        .expect("dispatchable within the runtime");
     assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
     let errors = cb.errors();
     assert!(
         errors[0].contains("sendKernelImpl call timeout"),
-        "错误文案逐字校验: {}",
+        "error text checked verbatim: {}",
         errors[0]
     );
-    assert_eq!(cluster.requests(0), 0, "预算没了就不该把请求交出去");
-    assert_eq!(hooks.before(), 1, "before 钩子在预算检查之前");
-    assert_eq!(hooks.after(), 1, "after 钩子要在终止前跑一次");
+    assert_eq!(cluster.requests(0), 0, "with no budget left, the request must not be handed out");
+    assert_eq!(hooks.before(), 1, "the before hook runs before the budget check");
+    assert_eq!(hooks.after(), 1, "the after hook must run once before the abort");
     assert_eq!(producer.semaphore_async_send_num_available_permits(), MIN_ASYNC_SEND_NUM);
     assert_eq!(
         producer.semaphore_async_send_size_available_permits(),
@@ -1968,18 +1968,18 @@ async fn connect_failure_retries_on_another_broker_with_a_fresh_opaque() {
     let live = MockCluster::start(1, true).await;
     live.script(0, vec![], (response_code::SUCCESS, 0));
     let dead = dead_addr().await;
-    // 路由里 broker-0 是死地址、broker-1 是真应答的 broker（选队从 0 起，重试避开 0）
+    // In the route, broker-0 is a dead address and broker-1 is a real answering broker (queue selection starts at 0, retry avoids 0)
     let cluster = MockCluster::with_addrs(vec![dead, live.broker_addrs[0].clone()], true).await;
     let producer = started("async_retry_broker", &cluster).await;
 
     let cb = Arc::new(Recorder::default());
     producer
         .send_async(body_of(10), cb.clone(), Some(5_000), None)
-        .expect("运行时内可派发");
+        .expect("dispatchable within the runtime");
     assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
-    assert!(cb.errors().is_empty(), "换 broker 之后应当发成功: {:?}", cb.errors());
+    assert!(cb.errors().is_empty(), "after switching brokers the send should succeed: {:?}", cb.errors());
     assert_eq!(cb.ok.load(Ordering::SeqCst), 1);
-    assert_eq!(live.requests(0), 1, "重试落在另一台 broker 上");
+    assert_eq!(live.requests(0), 1, "the retry landed on the other broker");
     producer.shutdown();
 }
 
@@ -1995,18 +1995,18 @@ async fn async_retry_honours_retry_times_when_send_async_failed() {
     let cb = Arc::new(Recorder::default());
     producer
         .send_async(body_of(10), cb.clone(), Some(5_000), None)
-        .expect("运行时内可派发");
+        .expect("dispatchable within the runtime");
     assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
     assert_eq!(
         cluster.requests(0) + cluster.requests(1),
         3,
-        "retry_times_when_send_async_failed=2 ⇒ 一共 3 笔尝试"
+        "retry_times_when_send_async_failed=2 ⇒ 3 attempts in total"
     );
     let errors = cb.errors();
     assert_eq!(errors.len(), 1);
     assert!(
         errors[0].contains("send request failed"),
-        "RemotingSendRequestException 分支: {}",
+        "RemotingSendRequestException branch: {}",
         errors[0]
     );
     producer.shutdown();
@@ -2024,15 +2024,15 @@ async fn retry_times_when_send_async_failed_zero_means_one_attempt() {
     let cb = Arc::new(Recorder::default());
     producer
         .send_async(body_of(10), cb.clone(), Some(5_000), None)
-        .expect("运行时内可派发");
+        .expect("dispatchable within the runtime");
     assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
     assert_eq!(cluster.requests(0), 1);
-    assert_eq!(cluster.requests(1), 0, "配 0 就不该换 broker");
+    assert_eq!(cluster.requests(1), 0, "with 0 configured, no broker switch should happen");
     producer.shutdown();
 }
 
-/// **异步发送不看 `retryResponseCodes`**：broker 明确回了错（这里回 `SYSTEM_ERROR`）
-/// 就原样交给回调，一次尝试就结束。这与同步发送的语义**不同**，别照搬。
+/// **Async sending ignores `retryResponseCodes`**: when the broker explicitly answers with an error (here `SYSTEM_ERROR`),
+/// it is handed to the callback as-is, ending after one attempt. This **differs** from the sync send's semantics; do not copy it over.
 #[tokio::test]
 async fn broker_rejected_response_ends_the_chain_after_one_attempt() {
     let cluster = MockCluster::start(2, true).await;
@@ -2041,20 +2041,20 @@ async fn broker_rejected_response_ends_the_chain_after_one_attempt() {
     let producer = started("async_broker_code", &cluster).await;
     assert!(
         producer.is_retry_response_code(Some(response_code::SYSTEM_ERROR)),
-        "这个码在同步路径里是可重试的"
+        "this code is retryable on the sync path"
     );
 
     let cb = Arc::new(Recorder::default());
     producer
         .send_async(body_of(10), cb.clone(), Some(5_000), None)
-        .expect("运行时内可派发");
+        .expect("dispatchable within the runtime");
     assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
     assert_eq!(cluster.requests(0), 1);
-    assert_eq!(cluster.requests(1), 0, "异步链不换 broker（needRetry=false 的那支）");
+    assert_eq!(cluster.requests(1), 0, "the async chain does not switch brokers (the needRetry=false branch)");
     let errors = cb.errors();
     assert!(
         errors[0].contains("MQBrokerException"),
-        "broker 的错误码要**原样**交付，不包装成 unknown reason: {}",
+        "the broker's error code must be delivered **verbatim**, not wrapped as unknown reason: {}",
         errors[0]
     );
     producer.shutdown();
@@ -2071,7 +2071,7 @@ async fn send_hooks_run_once_per_async_send() {
     let cb = Arc::new(Recorder::default());
     producer
         .send_async(body_of(10), cb.clone(), Some(3_000), None)
-        .expect("运行时内可派发");
+        .expect("dispatchable within the runtime");
     assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
     assert_eq!(cb.ok.load(Ordering::SeqCst), 1);
     assert_eq!(hooks.before(), 1);
@@ -2079,7 +2079,7 @@ async fn send_hooks_run_once_per_async_send() {
     producer.shutdown();
 }
 
-/// after 钩子要看到 `sendResult`（成功）或 `exception`（失败），与同步内核一致。
+/// The after hook must see `sendResult` (success) or `exception` (failure), consistent with the sync kernel.
 #[tokio::test]
 async fn after_hook_sees_the_async_outcome() {
     let cluster = MockCluster::start(1, true).await;
@@ -2093,19 +2093,19 @@ async fn after_hook_sees_the_async_outcome() {
     producer.register_send_message_hook(hooks.clone());
 
     let cb = Arc::new(Recorder::default());
-    // 第一笔失败（broker 明确回了错）、第二笔成功：两条终点都要带上各自的结果
+    // the first send fails (the broker explicitly answered an error), the second succeeds: both terminal paths must carry their own outcome
     for i in 1..=2 {
         producer
             .send_async(body_of(10), cb.clone(), Some(3_000), None)
-            .expect("运行时内可派发");
+            .expect("dispatchable within the runtime");
         assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == i).await);
     }
     assert_eq!(cb.ok.load(Ordering::SeqCst), 1);
     assert_eq!(cb.errors().len(), 1);
-    assert!(hooks.saw_result(), "成功分支要带 sendResult");
-    assert!(hooks.saw_exception(), "失败分支要带 exception");
+    assert!(hooks.saw_result(), "the success branch must carry sendResult");
+    assert!(hooks.saw_exception(), "the failure branch must carry exception");
     assert_eq!(hooks.before(), 2);
-    assert_eq!(hooks.after(), 2, "每笔发送在终点各跑一次 after");
+    assert_eq!(hooks.after(), 2, "each send runs after once at its terminal point");
     producer.shutdown();
 }
 
@@ -2123,40 +2123,40 @@ async fn pinned_mq_retries_on_the_same_broker_with_new_opaques() {
     let cb = Arc::new(Recorder::default());
     producer
         .send_async(body_of(10), cb.clone(), Some(5_000), Some(mq))
-        .expect("运行时内可派发");
+        .expect("dispatchable within the runtime");
     assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
-    assert!(cb.errors().is_empty(), "第三次尝试应当成功: {:?}", cb.errors());
-    assert_eq!(cluster.requests(0), 3, "三次尝试都在定点的那台");
+    assert!(cb.errors().is_empty(), "the third attempt should succeed: {:?}", cb.errors());
+    assert_eq!(cluster.requests(0), 3, "all three attempts stayed on the pinned broker");
     assert_ne!(
         cluster.send_opaque(0, 0),
         cluster.send_opaque(0, 1),
-        "重试必须换新 opaque，否则两次尝试的应答会串台"
+        "retry must use a fresh opaque, otherwise the two attempts' responses would cross-talk"
     );
     assert_ne!(
         cluster.send_opaque(0, 1),
         cluster.send_opaque(0, 2),
-        "重试必须换新 opaque，否则两次尝试的应答会串台"
+        "retry must use a fresh opaque, otherwise the two attempts' responses would cross-talk"
     );
     producer.shutdown();
 }
 
 #[test]
 fn send_async_before_start_raises_without_calling_back() {
-    let producer = DefaultMQProducer::new("GID_async_unstarted").expect("组名合法");
+    let producer = DefaultMQProducer::new("GID_async_unstarted").expect("group name is valid");
     let cb = Arc::new(Recorder::default());
     let err = producer
         .send_async(body_of(10), cb.clone(), Some(1_000), None)
-        .expect_err("未启动就该同步报错");
+        .expect_err("before start it must error synchronously");
     assert!(
         err.to_string().contains("producer not started"),
-        "未启动的守卫文案逐字校验: {err}"
+        "not-started guard text checked verbatim: {err}"
     );
     assert_eq!(cb.done.load(Ordering::SeqCst), 0);
 }
 
-// ------------------------------------------------- 定点发送的 topic 一致性守卫
+// ------------------------------------- topic-consistency guard for pinned sends
 
-/// 定点同步发送在 `sendKernelImpl` **之前**比 topic，不符就拒 —— 假 broker 一笔请求都收不到。
+/// Pinned sync sends compare the topic **before** `sendKernelImpl` and refuse on mismatch -- the mock broker receives not a single request.
 #[tokio::test]
 async fn pinned_sync_send_refuses_a_mismatched_topic_before_any_request() {
     let cluster = MockCluster::start(1, true).await;
@@ -2168,16 +2168,16 @@ async fn pinned_sync_send_refuses_a_mismatched_topic_before_any_request() {
     let err = producer
         .send(&mut msg, Some(3_000), Some(&mq))
         .await
-        .expect_err("topic 不符必须拒");
+        .expect_err("a mismatched topic must be refused");
     let (code, message) = expect_client_code(err);
     assert_eq!(code, None);
     assert_eq!(message, PINNED_TOPIC_MISMATCH_SYNC);
-    assert_eq!(cluster.requests(0), 0, "拒绝要发生在任何请求之前");
-    assert_eq!(msg.topic, "T1", "守卫在压缩之前，调用方的消息不该被动过");
+    assert_eq!(cluster.requests(0), 0, "the refusal must happen before any request");
+    assert_eq!(msg.topic, "T1", "the guard runs before compression; the caller's message must be untouched");
     producer.shutdown();
 }
 
-/// 同 topic 的定点发送照常上线，且线上带的就是那个 topic（守卫不能宽到误伤）。
+/// A pinned send with a matching topic goes on the wire as usual, carrying exactly that topic (the guard must not be so loose it misfires).
 #[tokio::test]
 async fn pinned_sync_send_with_a_matching_topic_reaches_the_broker() {
     let cluster = MockCluster::start(1, true).await;
@@ -2189,7 +2189,7 @@ async fn pinned_sync_send_with_a_matching_topic_reaches_the_broker() {
     let result = producer
         .send(&mut msg, Some(3_000), Some(&mq))
         .await
-        .expect("同 topic 定点发送应当成功");
+        .expect("a same-topic pinned send should succeed");
     assert_eq!(result.status, SendStatus::SendOk);
     assert_eq!(cluster.requests(0), 1);
     assert_eq!(ext_value(&cluster.send_ext(0, 0), "b"), Some("T1"));
@@ -2204,37 +2204,37 @@ async fn pinned_sync_send_compares_topics_after_namespace_wrapping() {
     let producer = started("pinned_guard_ns", &cluster).await;
     producer.set_namespace("ns1");
 
-    // ① 队列 topic 已经带前缀（路由表返回的就是这个形状）
+    // (1) the queue topic already carries the prefix (that is exactly the shape the route table returns)
     let mq = MessageQueue::new("ns1%T1", "broker-0", 0);
     let mut msg = body_of(8);
     producer
         .send(&mut msg, Some(3_000), Some(&mq))
         .await
-        .expect("已带前缀的队列 topic 不该被误拒");
+        .expect("a prefixed queue topic must not be refused by mistake");
     assert_eq!(
         ext_value(&cluster.send_ext(0, 0), "b"),
         Some("ns1%T1"),
-        "上线的是带前缀的资源名"
+        "what goes on the wire is the prefixed resource name"
     );
 
-    // ② 队列 topic 是裸名：两边都包装后相等，同样放行
+    // (2) the queue topic is a bare name: both sides wrapped become equal, also admitted
     let mq = MessageQueue::new("T1", "broker-0", 0);
     let mut msg = body_of(8);
     producer
         .send(&mut msg, Some(3_000), Some(&mq))
         .await
-        .expect("裸名队列同样应当放行");
+        .expect("a bare-name queue should also be admitted");
     assert_eq!(ext_value(&cluster.send_ext(0, 1), "b"), Some("ns1%T1"));
 
-    // ③ 另一个命名空间下的同名 topic —— 是另一个资源，要拒
+    // (3) same topic name under another namespace -- a different resource, must be refused
     let mq = MessageQueue::new("ns2%T1", "broker-0", 0);
     let mut msg = body_of(8);
     let err = producer
         .send(&mut msg, Some(3_000), Some(&mq))
         .await
-        .expect_err("跨命名空间要说 no");
+        .expect_err("across namespaces it must say no");
     assert_eq!(expect_client_code(err).1, PINNED_TOPIC_MISMATCH_SYNC);
-    assert_eq!(cluster.requests(0), 2, "前两条上线、第三条不上线");
+    assert_eq!(cluster.requests(0), 2, "the first two go on the wire, the third does not");
     producer.shutdown();
 }
 
@@ -2248,15 +2248,15 @@ async fn pinned_batch_send_shares_the_sync_guard() {
     let err = producer
         .send_batch(vec![body_of(8), body_of(9)], Some(&mq), Some(3_000))
         .await
-        .expect_err("批量 topic 不符同样要拒");
+        .expect_err("a mismatched batch topic must be refused just the same");
     assert_eq!(expect_client_code(err).1, PINNED_TOPIC_MISMATCH_SYNC);
-    assert_eq!(cluster.requests(0), 0, "拒绝要发生在任何请求之前");
+    assert_eq!(cluster.requests(0), 0, "the refusal must happen before any request");
 
     let mq = MessageQueue::new("T1", "broker-0", 0);
     producer
         .send_batch(vec![body_of(8), body_of(9)], Some(&mq), Some(3_000))
         .await
-        .expect("同 topic 的定点批量应当成功");
+        .expect("a same-topic pinned batch should succeed");
     assert_eq!(cluster.requests(0), 1);
     assert_eq!(cluster.send_code(0, 0), request_code::SEND_BATCH_MESSAGE);
     assert_eq!(ext_value(&cluster.send_ext(0, 0), "b"), Some("T1"));
@@ -2273,21 +2273,21 @@ async fn pinned_async_send_refuses_with_the_async_wording_via_the_callback() {
 
     producer
         .send_async(body_of(8), cb.clone(), Some(3_000), Some(mq))
-        .expect("运行时内可派发");
+        .expect("dispatchable within the runtime");
     assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
     assert_eq!(cb.ok.load(Ordering::SeqCst), 0);
-    assert_eq!(cb.done.load(Ordering::SeqCst), 1, "失败只能交一次");
+    assert_eq!(cb.done.load(Ordering::SeqCst), 1, "the failure may be delivered only once");
     let errors = cb.errors();
     assert!(
         errors.first().is_some_and(|e| e.contains(PINNED_TOPIC_MISMATCH_ASYNC)),
-        "异步文案逐字校验: {errors:?}"
+        "async wording checked verbatim: {errors:?}"
     );
-    assert_eq!(cluster.requests(0), 0, "拒绝要发生在任何请求之前");
+    assert_eq!(cluster.requests(0), 0, "the refusal must happen before any request");
     producer.shutdown();
 }
 
-/// 先来一笔普通发送把 broker 地址表喂上：单向定点发送自己不做路由查询
-/// （`need_addr` 只读缓存），这一步与守卫无关。
+/// First do one ordinary send to feed the broker address table: oneway pinned sends do no route lookup themselves
+/// (`need_addr` only reads the cache), so this step is unrelated to the guard.
 #[tokio::test]
 async fn oneway_pinned_send_has_no_topic_guard() {
     let cluster = MockCluster::start(1, true).await;
@@ -2297,40 +2297,40 @@ async fn oneway_pinned_send_has_no_topic_guard() {
     producer
         .send(&mut warmup, Some(3_000), None)
         .await
-        .expect("先让地址表里出现 broker-0");
+        .expect("let broker-0 appear in the address table first");
 
     let mq = MessageQueue::new("T2", "broker-0", 0);
     let mut msg = body_of(8);
     producer
         .send_oneway(&mut msg, Some(&mq))
         .await
-        .expect("单向发送这条路径没有队列归属守卫");
-    // 单向发送不等应答，客户端返回时假 broker 可能还没读完这一帧 —— 轮询等它落地。
+        .expect("this oneway path has no queue-ownership guard");
+    // Oneway sends wait for no answer; when the client returns, the mock broker may not have read this frame yet -- poll until it lands.
     assert!(
         wait_until(|| cluster.requests(0) == 2).await,
-        "topic 不符的单向消息照发（假 broker 实际收到 {} 笔）",
+        "the topic-mismatched oneway message is sent anyway (the mock broker actually received {} requests)",
         cluster.requests(0)
     );
     assert_eq!(
         ext_value(&cluster.send_ext(0, 1), "b"),
         Some("T1"),
-        "头里的 topic 取消息自己的 topic，只有 queueId 来自点名队列 —— 没有守卫时就会这样错位上线"
+        "the topic in the header comes from the message's own topic; only queueId comes from the named queue -- without the guard that is exactly how the mismatch goes on the wire"
     );
     producer.shutdown();
 }
 
 #[tokio::test]
 async fn state_check_precedes_the_pinned_guard() {
-    let producer = DefaultMQProducer::new("GID_pinned_unstarted").expect("组名合法");
+    let producer = DefaultMQProducer::new("GID_pinned_unstarted").expect("group name is valid");
     let mq = MessageQueue::new("T2", "broker-0", 0);
     let mut msg = body_of(8);
     let err = producer
         .send(&mut msg, Some(1_000), Some(&mq))
         .await
-        .expect_err("未启动就该报错");
+        .expect_err("before start it must error");
     assert!(
         err.to_string().contains("producer not started"),
-        "状态检查要先于守卫: {err}"
+        "the state check must precede the guard: {err}"
     );
 }
 

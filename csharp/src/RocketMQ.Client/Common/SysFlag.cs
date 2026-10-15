@@ -19,7 +19,7 @@ public static class MessageSysFlag
     public const int CompressionTypeComparator = 0x7 << 8;
     public const int CompressionTypeShift = 8;
 
-    // compression_type 数值（getCompressionType 的返回值）
+    // compression_type values (return value of getCompressionType)
     public const int Lz4Type = 1;
     public const int ZstdType = 2;
     public const int ZlibType = 3;

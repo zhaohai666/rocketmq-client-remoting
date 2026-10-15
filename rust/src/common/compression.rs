@@ -1,5 +1,5 @@
-//! 未支持的压缩类型**必须报错**，不能原样透传：调用方解压后会清掉
-//! `COMPRESSED_FLAG`，透传等于把压缩字节流当正文交出去且事后无法识别。
+//! Unsupported compression types **must error out**, never pass through unchanged: after decompressing the caller
+//! clears `COMPRESSED_FLAG`, so passing through hands the compressed byte stream over as the body with no way to detect it afterwards.
 
 use std::io::{Read as IoRead, Write as IoWrite};
 
@@ -10,8 +10,8 @@ pub const DEFAULT_COMPRESS_LEVEL: i32 = 5;
 
 pub const ZSTD_DEFAULT_LEVEL: i32 = 3;
 
-/// 0 必须映射到 ZLIB：老客户端产的压缩消息类型位就是 0，不映射的话解压会失败，
-/// 而外层照样清掉 `COMPRESSED_FLAG`，结果就是静默返回压缩字节流。
+/// 0 must map to ZLIB: messages produced by old clients have a compression-type bit of 0; without this mapping decompression
+/// would fail while the outer layer still clears `COMPRESSED_FLAG`, silently returning the compressed byte stream.
 pub fn normalize_compression_type(compression_type: i32) -> i32 {
     if compression_type == 0 {
         MessageSysFlag::ZLIB_TYPE
@@ -20,9 +20,9 @@ pub fn normalize_compression_type(compression_type: i32) -> i32 {
     }
 }
 
-/// 给「配置落盘前」的入口用（如 [`crate::client::producer::DefaultMQProducer::set_compress_type`]）：
-/// 宁可在 set 时拒绝，也不要等到发送时才发现算法不认识（旧版是发送阶段静默降级不压缩，
-/// 用户拿不到任何信号）。
+/// For entry points that persist configuration (e.g. [`crate::client::producer::DefaultMQProducer::set_compress_type`]):
+/// prefer rejecting at set time over discovering an unknown algorithm at send time (the old version silently downgraded
+/// to no compression at the send stage, giving the user no signal at all).
 pub fn validate_compression_type(compression_type: i32) -> Result<i32> {
     match compression_type {
         0 | MessageSysFlag::ZLIB_TYPE => Ok(MessageSysFlag::ZLIB_TYPE),
@@ -65,7 +65,7 @@ pub fn decompress(data: &[u8], compression_type: i32) -> Result<Vec<u8>> {
     }
 }
 
-/// `decompress` 的公开入口，按消息体压缩位调用。
+/// Public entry point of `decompress`, dispatched by the message-body compression bits.
 pub fn decompress_body(data: &[u8], compression_type: i32) -> Result<Vec<u8>> {
     decompress(data, compression_type)
 }
@@ -124,24 +124,24 @@ mod tests {
     use super::*;
     use crate::common::util_all;
 
-    /// 真值 fixture 使用的同一段明文（1120 字节）。
+    /// The same plaintext (1120 bytes) used by the ground-truth fixtures.
     fn payload() -> Vec<u8> {
         b"rocketmq-compressed-payload-".repeat(40)
     }
 
-    /// 外部 zlib（level 5）压同一段明文产出的字节（47B）。
-    /// 硬编码外部真值，用来证明我们读的是真正的 RFC1950 流，而不是自压自解。
+    /// Bytes produced by external zlib (level 5) compressing the same plaintext (47B).
+    /// Hard-coded external ground truth, proving we read a real RFC1950 stream rather than self-compress and self-decompress.
     const ZLIB_L5_HEX: &str = "785e2bca4fce4e2dc92dd44dcecf2d284a2d2e4e4dd12d48acccc94f4cd12d1a9\
                                51b951b951b95a3400e0058e0b9f0";
 
-    /// 外部 LZ4 Frame 工具产出的帧，`lz4` CLI 校验可解（66B）。
+    /// A frame produced by an external LZ4 Frame tool, verified decodable by the `lz4` CLI (66B).
     const LZ4_FRAME_HEX: &str = "04224d1868406004000000000000482b000000ff0d726f636b65746d712d636f\
                                  6d707265737365642d7061796c6f61642d1c00ffffffff30506c6f61642d00000000";
 
-    /// 同上，空输入的 frame（11B）。
+    /// Same as above, a frame for empty input (11B).
     const LZ4_FRAME_EMPTY_HEX: &str = "04224d1860408200000000";
 
-    /// `zstd -3` CLI 产出：带 content-size 的帧（50B）。
+    /// Produced by the `zstd -3` CLI: a frame with content-size (50B).
     const ZSTD_WITH_SIZE_HEX: &str = "28b52ffd646003250100e0726f636b65746d712d636f6d70726573736564\
                                       2d7061796c6f61642d010004f1ff740278aa9792";
 
@@ -202,20 +202,20 @@ mod tests {
     #[test]
     fn zlib_round_trip_and_external_fixture() {
         let compressed = zlib_compress(&payload(), 5).unwrap();
-        assert!(compressed.len() < payload().len(), "重复明文应被压缩");
-        assert_eq!(compressed[0], 0x78, "zlib 流第一个字节是 CMF");
-        // 互通真值：外部 zlib（level 5）产出的 47 字节必须能解开。
-        // 反向不成立——deflate 的具体字节由实现决定（本端口 flate2 后端与
-        // 外部实现同级别字节数就会不同），所以只断言「我们产的
-        // 流是合法 RFC1950」。
+        assert!(compressed.len() < payload().len(), "repeated plaintext should compress");
+        assert_eq!(compressed[0], 0x78, "first byte of the zlib stream is CMF");
+        // Interop ground truth: the 47 bytes produced by external zlib (level 5) must decompress.
+        // The reverse does not hold -- the exact deflate bytes are implementation-defined (this crate's
+        // flate2 backend would differ from an external implementation in bytes even at the same level), so we
+        // only assert "the stream we produce is valid RFC1950".
         let external = unhex(ZLIB_L5_HEX);
-        assert_eq!(external.len(), 47, "外部 fixture 长度");
+        assert_eq!(external.len(), 47, "external fixture length");
         assert_eq!(zlib_decompress(&external).unwrap(), payload());
         assert_eq!(
             decompress(&compressed, MessageSysFlag::ZLIB_TYPE).unwrap(),
             payload()
         );
-        // 类型位 0（老版本）按 ZLIB 解
+        // Type bits 0 (old clients) decompress as ZLIB
         assert_eq!(decompress(&compressed, 0).unwrap(), payload());
     }
 
@@ -228,7 +228,7 @@ mod tests {
             &[0x04, 0x22, 0x4D, 0x18],
             "LZ4 Frame magic"
         );
-        // 外部产出的 frame 必须能解
+        // Externally produced frames must decompress
         assert_eq!(lz4_decompress(&unhex(LZ4_FRAME_HEX)).unwrap(), payload());
         assert!(lz4_decompress(&unhex(LZ4_FRAME_EMPTY_HEX))
             .unwrap()
@@ -237,7 +237,7 @@ mod tests {
             decompress(&compressed, MessageSysFlag::LZ4_TYPE).unwrap(),
             payload()
         );
-        // 自己产出的 frame 也要能被「外部」路径解（同一实现，但至少自描述头一致）
+        // Our own frames must also decompress via the "external" path (same implementation, but at least the self-describing header matches)
         assert_eq!(decompress(&compressed, 1).unwrap(), payload());
         assert_eq!(
             lz4_compress(&[]).unwrap().as_slice()[..4],
@@ -311,11 +311,11 @@ mod tests {
             zstd_decompress(b"not-zstd"),
             Err(Error::Decode(_))
         ));
-        // 截断的 zlib 流必须报错，而不是静默返回半截数据
+        // A truncated zlib stream must error out, not silently return half the data
         let compressed = zlib_compress(&payload(), 5).unwrap();
         let truncated = &compressed[..compressed.len() / 2];
         assert!(matches!(zlib_decompress(truncated), Err(Error::Decode(_))));
-        // 截断的 lz4 frame 同理
+        // Same for a truncated lz4 frame
         let lz = lz4_compress(&payload()).unwrap();
         assert!(matches!(
             lz4_decompress(&lz[..lz.len() / 2]),

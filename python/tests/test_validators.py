@@ -60,7 +60,7 @@ class TestTopicOrGroupCharset:
         assert is_topic_or_group_illegal("topic" + ch) is True
 
     def test_empty_name_is_not_illegal(self):
-        # 空/纯空白由 check_topic / check_group 的第一步单独管，判定函数本身返回 False
+        # blank/whitespace-only names are handled separately by the first step of check_topic / check_group; the predicate itself returns False
         assert is_topic_or_group_illegal("") is False
 
     def test_pipe_is_a_legal_char(self):
@@ -70,7 +70,7 @@ class TestTopicOrGroupCharset:
         assert VALID_CHAR_PATTERN == "^[%|a-zA-Z0-9_-]+$"
 
     def test_length_limits(self):
-        # group 要参与拼 %RETRY%group_topic / %DLQ%group_topic，所以比 topic 短
+        # group participates in building %RETRY%group_topic / %DLQ%group_topic, so it is shorter than topic
         assert (TOPIC_MAX_LENGTH, GROUP_MAX_LENGTH, RETRY_OR_DLQ_TOPIC_MAX_LENGTH) == (127, 120, 255)
 
 
@@ -87,7 +87,7 @@ class TestSystemTopicSet:
         assert NOT_ALLOWED_SEND_TOPIC_SET <= SYSTEM_TOPIC_SET
 
     def test_retry_topic_is_sendable(self):
-        # ⚠ sendMessageBack 就是往 %RETRY%group 写的，禁掉会打断重投链路
+        # WARNING: sendMessageBack writes to %RETRY%group; forbidding it would break the redelivery chain
         assert is_not_allowed_send_topic("%RETRY%GID_any") is False
 
     def test_tbw102_is_not_forbidden(self):
@@ -224,7 +224,7 @@ class TestCheckMessage:
 
 
 class TestProducerWiring:
-    """校验必须排在任何网络动作之前——否则「名字写错」会退化成连不上/超时。"""
+    """Validation must come before any network action -- otherwise "a mistyped name" would degrade into a connection failure/timeout."""
 
     PROBE_ADDR = ["127.0.0.1:1"]
 
@@ -242,7 +242,7 @@ class TestProducerWiring:
         with pytest.raises(MQClientException) as ei:
             p.start()
         assert needle in str(ei.value)
-        assert not p._started, "失败的 start 不能留在已启动状态"
+        assert not p._started, "a failed start must not stay in the started state"
 
     def test_group_is_validated_after_the_namespace_wrap(self):
         p = DefaultMQProducer("g" * 110)
@@ -254,7 +254,7 @@ class TestProducerWiring:
         assert not p._started
 
     def test_send_rejects_illegal_topic_before_the_network(self):
-        # 未启动时先报 not started；真正要证的是 check_message 在 send 内核的第一步
+        # when not started it reports not started first; what really needs proving is that check_message is the first step inside send
         p = DefaultMQProducer("GID_validators")
         with pytest.raises(MQClientException):
             p._check_message(None)
@@ -283,7 +283,7 @@ class TestConsumerWiring:
         with pytest.raises(MQClientException) as ei:
             c.start()
         assert needle in str(ei.value)
-        assert not c._started, "失败的 start 不能留在已启动状态"
+        assert not c._started, "a failed start must not stay in the started state"
 
     @pytest.mark.parametrize(
         "cls,needle",
@@ -309,7 +309,7 @@ class TestConsumerWiring:
         assert "contains illegal characters" in str(ei.value)
 
     def test_legal_group_reaches_the_next_gate(self):
-        # 反向对照：组名合法时才会走到订阅/地址校验，证明上面的报错不是被别的检查抢先了
+        # reverse control: only a legal group name reaches the subscription/address validation, proving the errors above were not preempted by another check
         c = DefaultLitePullConsumer("GID_validators_lite")
         c.name_server_addrs = ["127.0.0.1:1"]
         with pytest.raises(MQClientException) as ei:

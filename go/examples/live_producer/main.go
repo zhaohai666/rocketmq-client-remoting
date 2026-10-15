@@ -138,20 +138,20 @@ func main() {
 	msg.SetKeys("go-live-key-1")
 	res, err := p.Send(msg)
 	if err != nil {
-		check("同步发送 SEND_OK", false, " err="+err.Error())
+		check("sync send SEND_OK", false, " err="+err.Error())
 	} else {
 		uniq, _ := common.GetUniqID(msg)
 		bump(1)
-		check("同步发送 SEND_OK", res.SendStatus == client.SendOK,
+		check("sync send SEND_OK", res.SendStatus == client.SendOK,
 			fmt.Sprintf(" status=%s msgId=%s", res.SendStatus, res.MsgID))
 		// msgId must be the client UNIQ_KEY and offsetMsgId the broker's id —
 		// swapping them breaks trace/console correlation silently.
 		check("SendResult.msgId == UNIQ_KEY", res.MsgID == uniq,
 			fmt.Sprintf(" msgId=%s uniq=%s", res.MsgID, uniq))
-		check("SendResult.offsetMsgId 非空", res.OffsetMsgID != "",
+		check("SendResult.offsetMsgId non-empty", res.OffsetMsgID != "",
 			" offsetMsgId="+res.OffsetMsgID)
 		check("queueOffset >= 0", res.QueueOffset >= 0, fmt.Sprintf(" offset=%d", res.QueueOffset))
-		check("regionId 有值", res.RegionID != "", " region="+res.RegionID)
+		check("regionId has a value", res.RegionID != "", " region="+res.RegionID)
 	}
 
 	// ---- 2. batch send (SEND_BATCH_MESSAGE = 320) -----------------------------------
@@ -160,24 +160,24 @@ func main() {
 		batch = append(batch, common.NewMessage(topicName, []byte(fmt.Sprintf("go-live-batch-%d", i))))
 	}
 	if bres, err := p.SendBatch(batch); err != nil {
-		check("批量发送 3 条", false, " err="+err.Error())
+		check("batch send 3 messages", false, " err="+err.Error())
 	} else {
 		bump(len(batch))
-		check("批量发送 3 条", bres.SendStatus == client.SendOK, " status="+bres.SendStatus.String())
+		check("batch send 3 messages", bres.SendStatus == client.SendOK, " status="+bres.SendStatus.String())
 	}
 
 	// ---- 3. compression (body >= 4096 -> zlib) ---------------------------------------
 	big := []byte(strings.Repeat("compress-me-", 500))
 	if cres, err := p.Send(common.NewMessage(topicName, big)); err != nil {
-		check("大消息压缩发送", false, " err="+err.Error())
+		check("large message sent compressed", false, " err="+err.Error())
 	} else {
 		bump(1)
-		check("大消息压缩发送", cres.SendStatus == client.SendOK, " status="+cres.SendStatus.String())
+		check("large message sent compressed", cres.SendStatus == client.SendOK, " status="+cres.SendStatus.String())
 	}
 
 	// ---- 4. oneway ------------------------------------------------------------------
 	onewayErr := p.SendOneway(common.NewMessage(topicName, []byte("go-live-oneway")), nil)
-	check("单向发送不报错", onewayErr == nil, errDetail(onewayErr))
+	check("oneway send reports no error", onewayErr == nil, errDetail(onewayErr))
 	if onewayErr == nil {
 		bump(1)
 	}
@@ -187,12 +187,12 @@ func main() {
 	txMsg := common.NewMessage(topicName, []byte("go-live-tx-commit"))
 	txRes, err := p.SendMessageInTransaction(txMsg, commitListener, nil)
 	if err != nil {
-		check("事务提交(COMMIT) 返回", false, " err="+err.Error())
+		check("transaction commit(COMMIT) returns", false, " err="+err.Error())
 	} else {
 		bump(1)
-		check("事务提交(COMMIT) 返回", txRes.LocalTransactionState == client.CommitMessage,
+		check("transaction commit(COMMIT) returns", txRes.LocalTransactionState == client.CommitMessage,
 			" state="+txRes.LocalTransactionState.String())
-		check("本地事务被执行", mustExecute(commitListener) == 1,
+		check("local transaction executed", mustExecute(commitListener) == 1,
 			fmt.Sprintf(" execute=%d", mustExecute(commitListener)))
 	}
 
@@ -203,12 +203,12 @@ func main() {
 	unknownListener := &txListener{executeRet: client.Unknow, checkRet: client.CommitMessage}
 	unknownMsg := common.NewMessage(topicName, []byte("go-live-tx-unknown"))
 	if _, err := p.SendMessageInTransaction(unknownMsg, unknownListener, nil); err != nil {
-		check("事务 UNKNOW 发送", false, " err="+err.Error())
+		check("transaction UNKNOW send", false, " err="+err.Error())
 	} else {
 		bump(1)
-		check("事务 UNKNOW 发送", true, " (半消息已写入，等待 broker 回查)")
+		check("transaction UNKNOW send", true, " (half message written, waiting for the broker check-back)")
 	}
-	fmt.Printf("      ... 等待 broker 回查（最多 %s，transactionCheckInterval 默认 30s）\n", *checkBackBudget)
+	fmt.Printf("      ... waiting for the broker check-back (up to %s, transactionCheckInterval defaults to 30s)\n", *checkBackBudget)
 	deadline := time.Now().Add(*checkBackBudget)
 	for {
 		if _, checks := unknownListener.counts(); checks > 0 {
@@ -220,7 +220,7 @@ func main() {
 		time.Sleep(500 * time.Millisecond)
 	}
 	_, checks := unknownListener.counts()
-	check("UNKNOW 触发 broker 回查", checks > 0, fmt.Sprintf(" checkLocalTransaction 调用=%d", checks))
+	check("UNKNOW triggers the broker check-back", checks > 0, fmt.Sprintf(" checkLocalTransaction calls=%d", checks))
 
 	runAsyncChecks(p, topicName)
 
@@ -252,27 +252,27 @@ func runAsyncChecks(p *client.DefaultMQProducer, topic string) {
 	out := make(chan asyncOutcome, 4)
 	err := p.SendAsync(msg, collect(out))
 	if err != nil {
-		check("异步发送提交", false, errDetail(err))
+		check("async send submitted", false, errDetail(err))
 	} else {
 		results, fails, extra, complete := drainAsync(out, 1, 15*time.Second)
 		uniq, _ := common.GetUniqID(msg)
 		switch {
 		case !complete:
-			check("异步发送提交", false, " 回调 15s 内没回来")
+			check("async send submitted", false, " callback did not return within 15s")
 		case extra > 0:
-			check("异步发送回调恰好一次", false, fmt.Sprintf(" 触发了 %d 次", extra+1))
+			check("async callback fires exactly once", false, fmt.Sprintf(" fired %d times", extra+1))
 		case len(fails) > 0:
-			check("异步发送提交", false, " err="+fails[0].Error())
+			check("async send submitted", false, " err="+fails[0].Error())
 		default:
 			bump(1)
 			r := results[0]
-			check("异步发送提交", r.SendStatus == client.SendOK,
+			check("async send submitted", r.SendStatus == client.SendOK,
 				fmt.Sprintf(" status=%s msgId=%s", r.SendStatus, r.MsgID))
-			check("异步回调恰好一次", true, " callbacks=1")
-			check("异步结果 offsetMsgId 非空", r.OffsetMsgID != "", " offsetMsgId="+r.OffsetMsgID)
+			check("async callback fires exactly once", true, " callbacks=1")
+			check("async result offsetMsgId non-empty", r.OffsetMsgID != "", " offsetMsgId="+r.OffsetMsgID)
 			// Same rule as the sync path: msgId is the client UNIQ_KEY, not the
 			// broker's id. The async request build must write UNIQ_KEY too.
-			check("异步结果 msgId == UNIQ_KEY", r.MsgID == uniq,
+			check("async result msgId == UNIQ_KEY", r.MsgID == uniq,
 				fmt.Sprintf(" msgId=%s uniq=%s", r.MsgID, uniq))
 		}
 	}
@@ -291,14 +291,14 @@ func runAsyncChecks(p *client.DefaultMQProducer, topic string) {
 	results, fails, extra, complete := drainAsync(burstOut, accepted, 30*time.Second)
 	switch {
 	case !complete:
-		check(fmt.Sprintf("异步并发 %d 条全部回调", accepted), false,
-			fmt.Sprintf(" 只回来 %d 条", len(results)+len(fails)))
+		check(fmt.Sprintf("async burst %d all callbacks returned", accepted), false,
+			fmt.Sprintf(" only %d came back", len(results)+len(fails)))
 	default:
 		bump(saved(results, fails))
-		check(fmt.Sprintf("异步并发 %d 条全部回调", accepted), true,
+		check(fmt.Sprintf("async burst %d all callbacks returned", accepted), true,
 			fmt.Sprintf(" callbacks=%d", accepted))
-		check("异步并发无失败", len(fails) == 0, firstErr(fails))
-		check("异步并发回调不重复", extra == 0, fmt.Sprintf(" extra=%d", extra))
+		check("async burst has no failures", len(fails) == 0, firstErr(fails))
+		check("async burst callbacks not duplicated", extra == 0, fmt.Sprintf(" extra=%d", extra))
 		statuses := 0
 		uniqueID := map[string]struct{}{}
 		for _, r := range results {
@@ -307,11 +307,11 @@ func runAsyncChecks(p *client.DefaultMQProducer, topic string) {
 			}
 			uniqueID[r.OffsetMsgID] = struct{}{}
 		}
-		check("异步并发全部 SEND_OK", statuses == len(results),
+		check("async burst all SEND_OK", statuses == len(results),
 			fmt.Sprintf(" ok=%d/%d", statuses, len(results)))
 		// 16 distinct broker ids means 16 distinct commits, i.e. no chain lost
 		// its own request to a neighbour.
-		check("异步并发 16 条互不相同", len(uniqueID) == len(results),
+		check("async burst 16 messages all distinct", len(uniqueID) == len(results),
 			fmt.Sprintf(" distinct=%d", len(uniqueID)))
 	}
 
@@ -328,20 +328,20 @@ func runAsyncChecks(p *client.DefaultMQProducer, topic string) {
 		// Under back pressure a full queue runs inline rather than failing, so a
 		// non-nil error here would be a real bug rather than a legal refusal.
 		if err := p.SendAsync(m, collect(bpOut)); err != nil {
-			check("背压下发异步发送", false, errDetail(err))
+			check("async send under back pressure", false, errDetail(err))
 			return
 		}
 	}
 	results, fails, _, complete = drainAsync(bpOut, bpBurst, 30*time.Second)
 	bump(saved(results, fails))
-	check("背压下 16 条全部回调", complete, fmt.Sprintf(" callbacks=%d", len(results)+len(fails)))
-	check("背压下全部 SEND_OK", len(fails) == 0 && len(results) == bpBurst,
+	check("all 16 callbacks returned under back pressure", complete, fmt.Sprintf(" callbacks=%d", len(results)+len(fails)))
+	check("all SEND_OK under back pressure", len(fails) == 0 && len(results) == bpBurst,
 		fmt.Sprintf(" ok=%d fails=%d%s", len(results), len(fails), firstErr(fails)))
 	waitNum := p.SemaphoreAsyncSendNumAvailablePermits()
 	waitSize := p.SemaphoreAsyncSendSizeAvailablePermits()
-	check("背压消息数许可全部归还", waitNum == p.BackPressureForAsyncSendNum(),
+	check("back-pressure message-count permits all returned", waitNum == p.BackPressureForAsyncSendNum(),
 		fmt.Sprintf(" available=%d total=%d", waitNum, p.BackPressureForAsyncSendNum()))
-	check("背压字节许可全部归还", waitSize == p.BackPressureForAsyncSendSize(),
+	check("back-pressure byte permits all returned", waitSize == p.BackPressureForAsyncSendSize(),
 		fmt.Sprintf(" available=%d total=%d", waitSize, p.BackPressureForAsyncSendSize()))
 	p.SetEnableBackpressureForAsyncMode(false)
 	p.SetBackPressureForAsyncSendSize(100 * 1024 * 1024)
@@ -352,17 +352,17 @@ func runAsyncChecks(p *client.DefaultMQProducer, topic string) {
 	pinOut := make(chan asyncOutcome, 4)
 	if err := p.SendAsyncToQueue(common.NewMessage(topic, []byte("go-live-async-pinned")),
 		pinned, collect(pinOut)); err != nil {
-		check("异步指定队列发送", false, errDetail(err))
+		check("async send to a specified queue", false, errDetail(err))
 	} else {
 		results, fails, _, complete = drainAsync(pinOut, 1, 15*time.Second)
 		switch {
 		case !complete || len(fails) > 0:
-			check("异步指定队列发送", false, fmt.Sprintf(" complete=%v%s", complete, firstErr(fails)))
+			check("async send to a specified queue", false, fmt.Sprintf(" complete=%v%s", complete, firstErr(fails)))
 		default:
 			bump(1)
-			check("异步指定队列发送", results[0].SendStatus == client.SendOK,
+			check("async send to a specified queue", results[0].SendStatus == client.SendOK,
 				fmt.Sprintf(" status=%s", results[0].SendStatus))
-			check("异步指定队列落在 queueId=1", results[0].MessageQueue.QueueID == 1,
+			check("async specified-queue send lands on queueId=1", results[0].MessageQueue.QueueID == 1,
 				fmt.Sprintf(" queueId=%d", results[0].MessageQueue.QueueID))
 		}
 	}
@@ -372,17 +372,17 @@ func runAsyncChecks(p *client.DefaultMQProducer, topic string) {
 	selOut := make(chan asyncOutcome, 4)
 	if err := p.SendAsyncBySelector(common.NewMessage(topic, []byte("go-live-async-selected")),
 		pickQueue{queueID: 2}, nil, collect(selOut)); err != nil {
-		check("异步选择器发送", false, errDetail(err))
+		check("async selector send", false, errDetail(err))
 	} else {
 		results, fails, _, complete = drainAsync(selOut, 1, 15*time.Second)
 		switch {
 		case !complete || len(fails) > 0:
-			check("异步选择器发送", false, fmt.Sprintf(" complete=%v%s", complete, firstErr(fails)))
+			check("async selector send", false, fmt.Sprintf(" complete=%v%s", complete, firstErr(fails)))
 		default:
 			bump(1)
-			check("异步选择器发送", results[0].SendStatus == client.SendOK,
+			check("async selector send", results[0].SendStatus == client.SendOK,
 				fmt.Sprintf(" status=%s", results[0].SendStatus))
-			check("异步选择器落在 queueId=2", results[0].MessageQueue.QueueID == 2,
+			check("async selector send lands on queueId=2", results[0].MessageQueue.QueueID == 2,
 				fmt.Sprintf(" queueId=%d", results[0].MessageQueue.QueueID))
 		}
 	}
@@ -397,17 +397,17 @@ func runAsyncChecks(p *client.DefaultMQProducer, topic string) {
 	}
 	batchOut := make(chan asyncOutcome, 4)
 	if err := p.SendAsyncBatch(batch, collect(batchOut)); err != nil {
-		check("异步批量发送", false, errDetail(err))
+		check("async batch send", false, errDetail(err))
 	} else {
 		results, fails, _, complete = drainAsync(batchOut, 1, 15*time.Second)
 		switch {
 		case !complete || len(fails) > 0:
-			check("异步批量发送", false, fmt.Sprintf(" complete=%v%s", complete, firstErr(fails)))
+			check("async batch send", false, fmt.Sprintf(" complete=%v%s", complete, firstErr(fails)))
 		default:
 			bump(len(batch))
-			check("异步批量发送", results[0].SendStatus == client.SendOK,
+			check("async batch send", results[0].SendStatus == client.SendOK,
 				fmt.Sprintf(" status=%s msgId=%s", results[0].SendStatus, results[0].MsgID))
-			check("异步批量结果 msgId 非空", results[0].MsgID != "",
+			check("async batch result msgId non-empty", results[0].MsgID != "",
 				" msgId="+results[0].MsgID)
 		}
 	}

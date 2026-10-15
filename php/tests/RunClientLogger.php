@@ -3,16 +3,19 @@
 declare(strict_types=1);
 
 /**
- * 客户端日志落盘自测（rocketmq_client.log 的生成能力）。
+ * Client log persistence self-test (rocketmq_client.log generation capability).
  *
- * 运行：php tests/RunClientLogger.php
+ * Run: php tests/RunClientLogger.php
  *
- * **本端口默认目录是 <cwd>/logs/rocketmqlogs，刻意不写 $HOME**（见 src/Client/Logger.php
- * 类注释）；第 1 组用例因此把「临时 HOME」和「临时 cwd」分开准备，并断言 HOME 下什么都没生成。
+ * **This port's default directory is <cwd>/logs/rocketmqlogs and deliberately never
+ * writes to $HOME** (see the src/Client/Logger.php class docblock); group 1 therefore
+ * prepares a "temp HOME" and a "temp cwd" separately and asserts that nothing was
+ * created under HOME.
  *
- * 为什么要用子进程：sink 是模块级单例，**每进程只解析
- * 一次**，而环境变量口径（LOG_FILE / LOG_DIR / USE_STDOUT / MAX_SIZE）正是被测行为本身，
- * 同进程里改 putenv 不会影响已解析的 sink。
+ * Why a child process: the sink is a module-level singleton, resolved **once per
+ * process**, and the env-var contract (LOG_FILE / LOG_DIR / USE_STDOUT / MAX_SIZE)
+ * is exactly the behavior under test; putenv within the same process does not affect
+ * an already-resolved sink.
  */
 
 require_once __DIR__ . '/../bootstrap.php';
@@ -21,7 +24,7 @@ use RocketMQ\Client\Logger;
 
 $checks = 0;
 $failures = [];
-/** @var list<string> 各用例自建的临时目录，末尾统一回收 */
+/** @var list<string> temp dirs created by individual cases, reclaimed together at the end */
 $tempDirs = [];
 
 function assertTrue(bool $cond, string $what): void
@@ -37,9 +40,9 @@ function assertTrue(bool $cond, string $what): void
 }
 
 /**
- * 在「临时 cwd + 临时 HOME + 干净环境变量」下跑一段 PHP。
+ * Run a snippet of PHP under "temp cwd + temp HOME + clean env vars".
  *
- * @return array{0:int,1:string,2:?string,3:string,4:string,5:string} [rc, 输出, 默认日志文件内容或 null, cwd, 期望文件路径, 临时 HOME]
+ * @return array{0:int,1:string,2:?string,3:string,4:string,5:string} [rc, output, default log file contents or null, cwd, expected file path, temp HOME]
  */
 function runInTempCwd(string $code, array $env, string $tag): array
 {
@@ -49,10 +52,12 @@ function runInTempCwd(string $code, array $env, string $tag): array
     @mkdir($home, 0o755, true);
     $GLOBALS['tempDirs'][] = $cwd;
     $GLOBALS['tempDirs'][] = $home;
-    // 外层先归零本端口认得的全部开关：run_all.php 以及调用者的环境都可能带值，
-    // 而“默认落盘路径/级别”正是被测行为。
-    // 用 env(1) 而不是 `VAR=x php ...`：赋值前缀只对其紧跟的那条命令生效，而这里
-    // php 前面还有个 cd（切 cwd 才能测“默认目录跟着部署走”）。
+    // Zero out every switch this port knows first: run_all.php and the caller's
+    // environment may both carry values, and the "default persistence path/level"
+    // is exactly the behavior under test.
+    // Use env(1) instead of `VAR=x php ...`: an assignment prefix only applies to the
+    // command right after it, and there is a cd before php here (switching cwd is how
+    // "the default directory follows the deployment" gets tested).
     $cmd = 'env HOME=' . escapeshellarg($home);
     $always = ['ROCKETMQ_CLIENT_LOG_DIR', 'ROCKETMQ_CLIENT_LOG_FILE', 'ROCKETMQ_CLIENT_LOG_LEVEL',
         'ROCKETMQ_CLIENT_LOG_USE_STDOUT', 'ROCKETMQ_CLIENT_LOG_FILE_MAX_SIZE',
@@ -61,17 +66,17 @@ function runInTempCwd(string $code, array $env, string $tag): array
         $cmd .= ' ' . $k . '=' . escapeshellarg((string)($env[$k] ?? ''));
     }
     $file = $cwd . '/logs/rocketmqlogs/' . ($env['ROCKETMQ_CLIENT_LOG_FILE'] ?? Logger::DEFAULT_LOG_FILE);
-    // 带路径分隔符的 LOG_FILE 按完整路径处理，被测用例都用默认目录
+    // A LOG_FILE containing a path separator is treated as a full path; the cases under test all use the default directory
     $cmd .= ' sh -c ' . escapeshellarg('cd ' . escapeshellarg($cwd) . ' && '
         . escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg(__DIR__ . '/_logger_child.php')
         . ' "$1"') . ' sh ' . escapeshellarg($code);
-    // stderr 一并收集：USE_STDOUT 用例要断言日志确实走 stderr
+    // stderr collected too: the USE_STDOUT case must assert that logs actually go to stderr
     exec($cmd . ' 2>&1', $out, $rc);
     $contents = is_file($file) ? (string)file_get_contents($file) : null;
     return [$rc, implode("\n", $out), $contents, $cwd, $file, $home];
 }
 
-/** 递归删掉一个目录（只用于本用例自建的临时目录）。 */
+/** Recursively delete a directory (only used for temp dirs created by this test). */
 function rmTree(string $dir): void
 {
     if (!is_dir($dir)) {
@@ -88,50 +93,51 @@ function rmTree(string $dir): void
 }
 
 // ---------------------------------------------------------------------------
-// 1) 默认：不设置任何环境变量也必须落盘
+// 1) Defaults: must persist even with no env vars set
 // ---------------------------------------------------------------------------
 [$rc, $stdout, $logBody, $cwd, $logPath, $home] = runInTempCwd(
     "Logger::info('hello-default'); Logger::warning('hello-warn');",
     [],
     'default'
 );
-assertTrue($rc === 0, '默认配置子进程正常退出');
+assertTrue($rc === 0, 'default-config child exits normally');
 assertTrue($logBody !== null && str_contains($logBody, 'hello-default'),
-    '默认写到 <cwd>/logs/rocketmqlogs/rocketmq_php_client.log');
-assertTrue($logBody !== null && str_contains($logBody, 'hello-warn'), 'WARN 级别同样落盘');
+    'defaults write to <cwd>/logs/rocketmqlogs/rocketmq_php_client.log');
+assertTrue($logBody !== null && str_contains($logBody, 'hello-warn'), 'WARN level also persists');
 assertTrue(!str_contains($stdout, 'hello-default'),
-    '默认落盘时不再重复输出到 stderr');
-// 约定：客户端不得在 $HOME 下写日志（默认目录固定为 <cwd>/logs/rocketmqlogs）
-assertTrue(!is_dir($home . '/logs'), '默认落盘不碰 $HOME');
+    'default persistence does not duplicate output to stderr');
+// Contract: the client must not write logs under $HOME (default directory is fixed to <cwd>/logs/rocketmqlogs)
+assertTrue(!is_dir($home . '/logs'), 'default persistence never touches $HOME');
 
 // ---------------------------------------------------------------------------
-// 2) 级别过滤：默认 INFO 丢弃 DEBUG
+// 2) Level filtering: default INFO drops DEBUG
 // ---------------------------------------------------------------------------
 [, , $logBody] = runInTempCwd("Logger::debug('dbg-only');", [], 'level');
-// 一条都不写时 sink 从不打开文件，因此「没有文件」与「文件里没有 DEBUG」都算通过
-assertTrue($logBody === null || !str_contains($logBody, 'dbg-only'), '默认 INFO 不写 DEBUG');
+// When nothing at all is written the sink never opens a file, so both "no file" and
+// "no DEBUG in the file" count as passing
+assertTrue($logBody === null || !str_contains($logBody, 'dbg-only'), 'default INFO does not write DEBUG');
 [, , $logBody] = runInTempCwd(
     "Logger::debug('dbg-on');",
     ['ROCKETMQ_CLIENT_LOG_LEVEL' => 'DEBUG'],
     'debuglevel'
 );
-assertTrue($logBody !== null && str_contains($logBody, 'dbg-on'), 'ROCKETMQ_CLIENT_LOG_LEVEL=DEBUG 生效');
+assertTrue($logBody !== null && str_contains($logBody, 'dbg-on'), 'ROCKETMQ_CLIENT_LOG_LEVEL=DEBUG takes effect');
 
 // ---------------------------------------------------------------------------
-// 3) USE_STDOUT / LOG_FILE=OFF 两个关闭口径
+// 3) The two shutoff switches: USE_STDOUT / LOG_FILE=OFF
 // ---------------------------------------------------------------------------
 [, $stdout, $logBody] = runInTempCwd(
     "Logger::info('to-stdout');",
     ['ROCKETMQ_CLIENT_LOG_USE_STDOUT' => '1'],
     'stdout'
 );
-assertTrue($logBody === null, 'ROCKETMQ_CLIENT_LOG_USE_STDOUT 置位时不建日志文件');
-assertTrue(str_contains($stdout, 'to-stdout'), 'USE_STDOUT 时输出走 stderr');
+assertTrue($logBody === null, 'no log file created when ROCKETMQ_CLIENT_LOG_USE_STDOUT is set');
+assertTrue(str_contains($stdout, 'to-stdout'), 'with USE_STDOUT, output goes to stderr');
 [, , $logBody] = runInTempCwd("Logger::info('off');", ['ROCKETMQ_CLIENT_LOG_FILE' => 'OFF'], 'off');
-assertTrue($logBody === null, 'ROCKETMQ_CLIENT_LOG_FILE=OFF 关闭文件落盘');
+assertTrue($logBody === null, 'ROCKETMQ_CLIENT_LOG_FILE=OFF disables file persistence');
 
 // ---------------------------------------------------------------------------
-// 4) 自定义目录与文件名（含路径分隔符时按完整路径）
+// 4) Custom directory and file name (a value with a path separator is treated as a full path)
 // ---------------------------------------------------------------------------
 $dir = sys_get_temp_dir() . '/rmq_php_log_custom_' . getmypid();
 [, , $logBody] = runInTempCwd(
@@ -140,7 +146,7 @@ $dir = sys_get_temp_dir() . '/rmq_php_log_custom_' . getmypid();
     'customdir'
 );
 assertTrue(is_file($dir . '/mine.log') && str_contains((string)file_get_contents($dir . '/mine.log'), 'custom-dir'),
-    'ROCKETMQ_CLIENT_LOG_DIR + 自定义文件名生效');
+    'ROCKETMQ_CLIENT_LOG_DIR + custom file name take effect');
 rmTree($dir);
 
 $full = sys_get_temp_dir() . '/rmq_php_log_fullpath_' . getmypid() . '/deep.log';
@@ -150,11 +156,11 @@ runInTempCwd(
     'fullpath'
 );
 assertTrue(is_file($full) && str_contains((string)file_get_contents($full), 'full-path'),
-    'LOG_FILE 含分隔符时按完整路径处理');
+    'LOG_FILE with a separator is treated as a full path');
 rmTree(dirname($full));
 
 // ---------------------------------------------------------------------------
-// 5) 按大小轮转：备份窗左移，最老的 .N 被删
+// 5) Size-based rotation: backup window shifts left, oldest .N is deleted
 // ---------------------------------------------------------------------------
 $rot = sys_get_temp_dir() . '/rmq_php_log_rot_' . getmypid();
 $code = "Logger::info(str_repeat('x', 90)); for (\$i = 0; \$i < 40; \$i++) { Logger::info('row-' . \$i); }";
@@ -164,16 +170,16 @@ runInTempCwd(
         'ROCKETMQ_CLIENT_LOG_FILE_MAX_INDEX' => '3'],
     'rotate'
 );
-assertTrue(is_file("$rot/rocketmq_php_client.log"), '轮转后当前日志文件仍在写');
+assertTrue(is_file("$rot/rocketmq_php_client.log"), 'current log file still written after rotation');
 $backups = array_filter([$rot . '/rocketmq_php_client.log.1', $rot . '/rocketmq_php_client.log.2',
     $rot . '/rocketmq_php_client.log.3', $rot . '/rocketmq_php_client.log.4'], 'is_file');
-assertTrue(count($backups) >= 1, '超过大小上限后备份文件产生');
+assertTrue(count($backups) >= 1, 'backup files produced once the size cap is exceeded');
 assertTrue(!is_file($rot . '/rocketmq_php_client.log.4'),
-    '备份数不超过 ROCKETMQ_CLIENT_LOG_FILE_MAX_INDEX');
+    'backup count never exceeds ROCKETMQ_CLIENT_LOG_FILE_MAX_INDEX');
 rmTree($rot);
 
 // ---------------------------------------------------------------------------
-// 6) 同进程：注入 handler 覆盖默认目标（单测/宿主接管日志时用）
+// 6) Same process: injecting a handler overrides the default target (for unit tests / hosts taking over logs)
 // ---------------------------------------------------------------------------
 $seen = [];
 Logger::setHandler(static function (string $line) use (&$seen): void {
@@ -182,10 +188,10 @@ Logger::setHandler(static function (string $line) use (&$seen): void {
 Logger::error('injected');
 Logger::debug('below-level');
 assertTrue(count($seen) === 1 && str_contains($seen[0], 'injected'),
-    'setHandler 接管输出且级别过滤仍生效');
+    'setHandler takes over output and level filtering still applies');
 Logger::setHandler(null);
 
-// 清理各用例自建的临时 cwd / HOME
+// Clean up the temp cwd / HOME created by each case
 foreach ($tempDirs as $d) {
     rmTree($d);
 }

@@ -2,18 +2,21 @@
 
 declare(strict_types=1);
 
-// 真机拉模式消费者验证，覆盖同场景（S1 队列、S1b 平衡视图、S2 发送+逐队列拉全、S3 位点提交回读）。
+// Live pull-consumer verification covering the same scenario set (S1 queues, S1b balanced view,
+// S2 send + per-queue drain, S3 offset commit round-trip).
 //
 //   php examples/live_pull.php [namesrv] [legs]     # legs = all | s1,s2,s3
 //
-// 为什么值得单独一条腿：拉模式没有后台 rebalance 线程，`fetchMessageQueuesInBalance`
-// 是**当场**用「真实路由 + GET_CONSUMER_LIST_BY_GROUP(38)」算出来的，两路输入只有真机
-// 才给得起：路由来自真 name server，成员表来自 broker 的 consumerTable（心跳注册）。
-// 判据是「**一笔都没拉过**的实例拿到非空份额」——算不动时本端口的设计是保留现有分配
-// （空集），所以非空只可能来自真算，不是兜底。
+// Why this deserves its own leg: the pull mode has no background rebalance thread, and
+// `fetchMessageQueuesInBalance` is computed **on the spot** from "real route +
+// GET_CONSUMER_LIST_BY_GROUP(38)"; only a live cluster can supply both inputs: the route comes
+// from a real name server, the membership table from the broker's consumerTable (heartbeat
+// registration). The criterion is "an instance that has **never pulled anything** gets a
+// non-empty share" — when computation is impossible, this port keeps the existing assignment
+// (empty set), so a non-empty result can only come from a real computation, not a fallback.
 //
 //
-// 收口行 `PASS=<n> FAIL=<n>`；任一 FAIL 非 0 退出。
+// Closing line `PASS=<n> FAIL=<n>`; exits non-zero on any FAIL.
 require __DIR__ . '/../bootstrap.php';
 
 use RocketMQ\Client\DefaultMQAdminExt;
@@ -51,10 +54,10 @@ echo "======================================================================" . 
 echo "PullConsumer live (PHP): ns=$ns topic=$topic group=$group" . PHP_EOL;
 echo "======================================================================" . PHP_EOL;
 
-/** 队列的稳定标识：brokerName:queueId，观测结果的比对都以此为键。 */
+/** Stable queue identifier: brokerName:queueId; all comparisons of observations key on it. */
 $qKey = static fn (MessageQueue $q): string => $q->brokerName . ':' . $q->queueId;
 
-/** 轮询到条件成立；返回是否成立（顺带把最后一次的观测值带回来）。 */
+/** Polls until the condition holds; returns whether it holds (also carries back the last observation). */
 $until = static function (int $timeoutMs, callable $cond): bool {
     $deadline = microtime(true) + $timeoutMs / 1000.0;
     do {
@@ -66,7 +69,7 @@ $until = static function (int $timeoutMs, callable $cond): bool {
     return false;
 };
 
-// ---------------------------------------------------------------- 建 topic
+// ---------------------------------------------------------------- create topic
 $admin = new DefaultMQAdminExt();
 $admin->setNamesrvAddr($ns);
 $admin->start();
@@ -79,12 +82,13 @@ try {
     exit(1);
 }
 
-// ============================================================ S1 / S1b 队列
+// ============================================================ S1 / S1b queues
 if ($want('s1') || $want('s2') || $want('s3')) {
     $consumer = new DefaultMQPullConsumer($group);
     $consumer->setNamesrvAddr($ns);
     $consumer->setInstanceName('php-pull-live-' . $stamp);
-    // 心跳订阅集的唯一来源，必须在 start() 之前登记（见文件头坑 1）。
+    // The single source of the heartbeat subscription set; must be registered before start()
+    // (see pitfall 1 in the file header).
     $consumer->registerTopic($topic);
     $consumer->start();
 
@@ -96,20 +100,21 @@ if ($want('s1') || $want('s2') || $want('s3')) {
                 $routes = $consumer->fetchSubscribeMessageQueues($topic);
                 return count($routes) >= $queueNum;
             } catch (Throwable) {
-                return false; // 路由还没出来
+                return false; // route not ready yet
             }
         });
-        $check(count($routes) === $queueNum, "S1 拿到 $queueNum 个队列", 'got=' . count($routes));
+        $check(count($routes) === $queueNum, "S1 got $queueNum queues", 'got=' . count($routes));
         $ids = array_map(static fn (MessageQueue $q): int => $q->queueId, $routes);
         sort($ids);
-        $check($ids === range(0, $queueNum - 1), 'S1 队列号 0..3 不重不漏',
+        $check($ids === range(0, $queueNum - 1), 'S1 queue ids 0..3 with no duplicates or gaps',
             'ids=' . implode(',', $ids));
 
-        // ---- S1b 平衡视图 ----
-        // 本实例此刻一笔都没拉过：兜底路径给的是空集，所以非空只可能是路由 + 38 真算的。
+        // ---- S1b balanced view ----
+        // This instance has not pulled anything yet: the fallback path yields an empty set, so a
+        // non-empty result can only come from a real route + 38 computation.
         echo PHP_EOL . 'S1b fetchMessageQueuesInBalance' . PHP_EOL;
         $hbOk = $consumer->sendHeartbeatToAllBroker();
-        $check($hbOk > 0, 'S1b 登记 topic 后心跳发出去了（38 可见的前提）', "heartbeat_ok=$hbOk");
+        $check($hbOk > 0, 'S1b heartbeat emitted after registering the topic (prerequisite for 38 visibility)', "heartbeat_ok=$hbOk");
         $mine = [];
         $until(20_000, static function () use ($consumer, $topic, $queueNum, &$mine): bool {
             try {
@@ -118,13 +123,13 @@ if ($want('s1') || $want('s2') || $want('s3')) {
                     return true;
                 }
             } catch (Throwable) {
-                // 路由 / 38 一时数不出来 —— 补一发心跳再试，不算失败
+                // route / 38 momentarily unreadable — re-send a heartbeat and retry; not a failure
             }
             $consumer->sendHeartbeatToAllBroker();
             return false;
         });
         $check(count($mine) === $queueNum,
-            "S1b 平衡视图：独占分组拿到全部 $queueNum 个队列（未拉取过⇒只可能是路由+38 算出来的）",
+            "S1b balanced view: an exclusively-assigned group gets all $queueNum queues (never pulled => only route+38 could compute it)",
             'got=' . count($mine) . " of $queueNum");
         $whole = array_map($qKey, $routes);
         $subset = true;
@@ -133,12 +138,12 @@ if ($want('s1') || $want('s2') || $want('s3')) {
                 $subset = false;
             }
         }
-        $check($subset, 'S1b 平衡视图是订阅视图的子集',
+        $check($subset, 'S1b the balanced view is a subset of the subscription view',
             'mine=' . implode(' ', array_map($qKey, $mine)));
 
-        // ---- S2 发送 + 逐队列拉全 ----
+        // ---- S2 send + per-queue drain ----
         if ($want('s2')) {
-            echo PHP_EOL . "S2 生产 $nMsg 条并逐队列拉取" . PHP_EOL;
+            echo PHP_EOL . "S2 producing $nMsg messages and pulling queue by queue" . PHP_EOL;
             $sent = [];
             $producer = new DefaultMQProducer($group);
             $producer->setNamesrvAddr($ns);
@@ -155,9 +160,9 @@ if ($want('s1') || $want('s2') || $want('s3')) {
             } finally {
                 $producer->shutdown();
             }
-            $check(count($sent) === $nMsg, "S2 生产 $nMsg 条成功", 'ok=' . count($sent));
+            $check(count($sent) === $nMsg, "S2 produced $nMsg messages successfully", 'ok=' . count($sent));
 
-            // ConsumeQueue 异步分发：轮询到各队列 max-min 之和到位（见文件头坑 2）。
+            // ConsumeQueue dispatches asynchronously: poll until the per-queue max-min sum lands (see pitfall 2 in the file header).
             $spanOk = $until(15_000, static function () use ($consumer, $routes, $nMsg): bool {
                 $total = 0;
                 foreach ($routes as $mq) {
@@ -169,7 +174,7 @@ if ($want('s1') || $want('s2') || $want('s3')) {
                 }
                 return $total >= $nMsg;
             });
-            $check($spanOk, "S2 各队列存量合计 $nMsg 条", 'span_ok=' . ($spanOk ? '1' : '0'));
+            $check($spanOk, "S2 total backlog across queues reaches $nMsg", 'span_ok=' . ($spanOk ? '1' : '0'));
 
             $got = [];
             foreach ($routes as $mq) {
@@ -187,12 +192,12 @@ if ($want('s1') || $want('s2') || $want('s3')) {
                 }
             }
             $check(count(array_diff(array_keys($sent), array_keys($got))) === 0
-                && count($got) === $nMsg, "S2 手动拉取收全 $nMsg 条且内容一致",
+                && count($got) === $nMsg, "S2 manual pull receives all $nMsg messages with matching content",
                 'got=' . count($got) . ' sent=' . count($sent));
 
-            // ---- S3 位点提交 / 回读（broker 往返，不是本地表）----
+            // ---- S3 offset commit / round-trip (broker round-trip, not a local table)----
             if ($want('s3')) {
-                echo PHP_EOL . 'S3 位点提交后回读' . PHP_EOL;
+                echo PHP_EOL . 'S3 read back after offset commit' . PHP_EOL;
                 $mq0 = $routes[0];
                 $target = $consumer->maxOffset($mq0);
                 $consumer->updateConsumeOffset($mq0, $target);
@@ -201,7 +206,7 @@ if ($want('s1') || $want('s2') || $want('s3')) {
                     $back = $consumer->fetchConsumeOffset($mq0);
                     return $back === $target;
                 });
-                $check($ok, 'S3 位点提交后回读一致', "want=$target got=" . var_export($back, true));
+                $check($ok, 'S3 offset round-trips consistently after commit', "want=$target got=" . var_export($back, true));
             }
         }
     } finally {
@@ -209,12 +214,12 @@ if ($want('s1') || $want('s2') || $want('s3')) {
     }
 }
 
-// ---------------------------------------------------------------- 收尾
+// ---------------------------------------------------------------- teardown
 try {
     $admin->deleteTopic($topic);
-    $check(true, '收尾：deleteTopic', "topic=$topic");
+    $check(true, 'teardown: deleteTopic', "topic=$topic");
 } catch (Throwable $e) {
-    $check(false, '收尾：deleteTopic', $e->getMessage());
+    $check(false, 'teardown: deleteTopic', $e->getMessage());
 }
 $admin->shutdown();
 

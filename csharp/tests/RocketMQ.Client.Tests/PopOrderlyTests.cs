@@ -1,5 +1,7 @@
-// 覆盖：分派进顺序骨架（listener 不被调、不 ack）、并发分支回归护栏、去重集按
-// (pq 引用, mq key) 判等、pq 撤销才摘请求、活队列 no-op。
+// Covered: dispatch into the orderly skeleton (the listener is not called, nothing is
+// acked), the concurrency branch regression guard, the dedup set comparing by
+// (pq reference, mq key), "only a pq withdrawal removes the request", and live queues being
+// a no-op.
 using RocketMQ.Client;
 using RocketMQ.Common;
 using RocketMQ.Remoting.Protocol;
@@ -29,7 +31,7 @@ public class PopOrderlyTests
         };
         if (withCk)
         {
-            // popTime 必须是"刚弹出"，否则 IsPopTimeout 会把本批按超时丢弃
+            // popTime must be "just popped", otherwise IsPopTimeout discards the batch as a timeout
             m.PutProperty(MessageConst.PropertyPopCk, ExtraInfoUtil.BuildExtraInfo(
                 queueOffset, UtilAll.CurrentTimeMillis(), 60000, 0, Topic, Broker, 0, queueOffset));
         }

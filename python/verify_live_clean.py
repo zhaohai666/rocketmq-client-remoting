@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-"""rocketmq-client-remoting 干净环境端到端验证。
+"""Clean-environment end-to-end verification for rocketmq-client-remoting.
 
-与 integration_live_test.py 的区别：本脚本使用一个「全新的、带时间戳的唯一
-topic + 唯一 consumer group + 全新 store 目录」，从而排除「/tmp/rmqstore 跨多次
-运行累积消息 + CONSUME_FROM_FIRST_OFFSET 从 0 重读」导致的消息计数虚高问题。
+Difference from integration_live_test.py: this script uses a "brand-new, timestamp-unique
+topic + unique consumer group + brand-new store directory", which rules out the inflated message counts caused by "/tmp/rmqstore accumulating messages across multiple
+runs + CONSUME_FROM_FIRST_OFFSET re-reading from 0".
 
-本脚本自身不启动集群；调用方负责先启动 nameServer(9876)+broker(10911) 且
-broker 开启 autoCreateTopic。运行：在 python venv 中 `python verify_live_clean.py`
+This script does not start the cluster itself; the caller is responsible for starting nameServer(9876)+broker(10911) first, with
+broker autoCreateTopic enabled. Run: `python verify_live_clean.py` in the python venv
 """
 import os
 import sys
@@ -41,7 +41,7 @@ def main():
     prod.set_namesrv_addr(NAMESRV)
     prod.set_send_msg_timeout(5000)
     prod.start()
-    # 轮询等待 broker 在 nameServer 完成注册（避免端口刚开、注册尚未落地的竞态）
+    # Poll-wait for the broker to finish registering with nameServer (avoids the race where the port is open but registration has not landed)
     brokers = []
     last_err = None
     for attempt in range(40):
@@ -54,13 +54,13 @@ def main():
             last_err = e
         time.sleep(1)
     if brokers:
-        check("集群探活", True, "brokers=%s" % brokers)
+        check("cluster probe", True, "brokers=%s" % brokers)
     else:
-        check("集群探活", False, "nameServer 无 broker 注册 last_err=%s" % last_err)
+        check("cluster probe", False, "no broker registered with nameServer last_err=%s" % last_err)
         prod.shutdown()
         return 1
 
-    # ---------- 生产：恰好 14 条（10 同步 + 3 批量 + 1 单向）----------
+    # ---------- produce: exactly 14 messages (10 sync + 3 batch + 1 oneway) ----------
     produced_bodies = []
     expected = set()
     send_ok = 0
@@ -74,7 +74,7 @@ def main():
                 send_ok += 1
         except Exception as e:  # noqa: BLE001
             print("sync send %d error: %s" % (i, e))
-    check("同步发送 %d 条" % N_SYNC, send_ok == N_SYNC, "send_ok=%d/%d" % (send_ok, N_SYNC))
+    check("sync send %d" % N_SYNC, send_ok == N_SYNC, "send_ok=%d/%d" % (send_ok, N_SYNC))
 
     try:
         batch = MessageBatch.generate_from_list([
@@ -87,7 +87,7 @@ def main():
         print("batch send error: %s" % e)
     for i in range(N_BATCH):
         expected.add("batch-%d" % i)
-    check("批量发送 %d 条" % N_BATCH, bok, "status=%s" % ("SEND_OK" if bok else "ERR"))
+    check("batch send %d" % N_BATCH, bok, "status=%s" % ("SEND_OK" if bok else "ERR"))
 
     try:
         prod.send_oneway(Message(TOPIC, b"oneway-ping"))
@@ -96,12 +96,12 @@ def main():
         ow_ok = False
         print("oneway error: %s" % e)
     expected.add("oneway-ping")
-    check("单向发送", ow_ok, "无异常返回")
+    check("oneway send", ow_ok, "returned without exception")
 
     total_produced = N_SYNC + N_BATCH + 1
     print("produced %d messages (topic=%s group=%s)" % (total_produced, TOPIC, GROUP))
 
-    # ---------- 消费：唯一 group + 从最早 offset ----------
+    # ---------- consume: unique group + from the earliest offset ----------
     received = []          # list of (queue_id, offset, body_str, msg_id)
     lock = threading.Lock()
 
@@ -131,30 +131,30 @@ def main():
     missing = expected - recv_set
     received_n = len(received)
 
-    print("\n--- 计数对账 ---")
-    print("生产总数            : %d" % total_produced)
-    print("消费投递总数        : %d" % received_n)
-    print("消费去重 body 数    : %d" % len(recv_set))
-    print("去重 (queue,offset) : %d" % len(distinct_qo))
-    print("重复 body 数        : %d" % dup_count)
-    print("多余 body(非生产)   : %s" % (list(extra) if extra else "无"))
-    print("缺失 body(未消费)   : %s" % (list(missing) if missing else "无"))
+    print("\n--- count reconciliation ---")
+    print("total produced        : %d" % total_produced)
+    print("total delivered       : %d" % received_n)
+    print("distinct bodies       : %d" % len(recv_set))
+    print("distinct (queue,offset): %d" % len(distinct_qo))
+    print("duplicate bodies      : %d" % dup_count)
+    print("extra bodies(not produced): %s" % (list(extra) if extra else "none"))
+    print("missing bodies(not consumed): %s" % (list(missing) if missing else "none"))
 
-    check("消费计数==生产计数(14)", received_n == total_produced,
+    check("consume count == produce count (14)", received_n == total_produced,
           "received=%d expected=%d" % (received_n, total_produced))
-    check("无重复投递", dup_count == 0, "dup=%d" % dup_count)
-    check("无多余消息", not extra, "extra=%s" % (list(extra) if extra else "无"))
-    check("无丢失消息", not missing, "missing=%s" % (list(missing) if missing else "无"))
+    check("no duplicate delivery", dup_count == 0, "dup=%d" % dup_count)
+    check("no extra messages", not extra, "extra=%s" % (list(extra) if extra else "none"))
+    check("no lost messages", not missing, "missing=%s" % (list(missing) if missing else "none"))
 
     failed = [r for r in results if not r[1]]
-    print("\n================ 汇总 ================")
+    print("\n================ summary ================")
     for name, ok, detail in results:
         print("  [%s] %s" % ("PASS" if ok else "FAIL", name))
     print("======================================")
     if failed:
-        print("结果: %d 项失败" % len(failed))
+        print("result: %d item(s) failed" % len(failed))
         return 1
-    print("结果: 全部通过（计数对账一致，证明此前 19/36 为 store 累积假象）")
+    print("result: all passed (count reconciliation consistent, proving the earlier 19/36 was a store-accumulation artifact)")
     return 0
 
 

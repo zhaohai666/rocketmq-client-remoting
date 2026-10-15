@@ -25,16 +25,16 @@ pub enum Error {
     Timeout { addr: String, timeout_millis: i64 },
     /// RemotingTooMuchRequestException
     TooMuchRequest(String),
-    /// broker / nameserver 返回非 SUCCESS
+    /// The broker / name server returned a non-SUCCESS code
     Server { response_code: i32, remark: String },
     /// MQClientException
     Client { response_code: Option<i32>, message: String },
     /// MQBrokerException
     Broker { response_code: i32, message: String },
     RequestTimeout { topic: String, timeout_millis: i64 },
-    /// 帧或结构体解码失败
+    /// Frame or struct decoding failed
     Decode(String),
-    /// 编码 / 参数非法
+    /// Encoding failure / illegal argument
     Encode(String),
     Io(std::io::Error),
     Json(serde_json::Error),
@@ -63,7 +63,7 @@ impl fmt::Display for Error {
             Error::Broker { response_code, message } => {
                 write!(f, "MQBrokerException(code={response_code}): {message}")
             }
-            // 运行时错误文本：上层与日志按这段字面量匹配，不能改。
+            // Runtime error text: upper layers and logs match this literal; it must not change.
             Error::RequestTimeout { topic, timeout_millis } => write!(
                 f,
                 "send request message to <{topic}> OK, but wait reply message timeout, \
@@ -112,13 +112,13 @@ impl Error {
         Error::Client { response_code: Some(code), message: message.into() }
     }
 
-    /// 文案按线上记录逐字钉死：`send request message to <%s> OK, ...`。
+    /// The text is pinned verbatim to the recorded wire format: `send request message to <%s> OK, ...`.
     pub fn request_timeout(topic: impl Into<String>, timeout_millis: i64) -> Error {
         Error::RequestTimeout { topic: topic.into(), timeout_millis }
     }
 }
 
-/// `bail!("...")` = `return Err(Error::client(format!("...")))`，即直接把错误返回给调用方。
+/// `bail!("...")` = `return Err(Error::client(format!("...")))`, i.e. the error is returned straight to the caller.
 #[macro_export]
 macro_rules! bail {
     ($($t:tt)*) => {
@@ -133,7 +133,7 @@ mod tests {
 
     #[test]
     fn request_timeout_text_matches_golden() {
-        // 运行时错误文本是字面量契约，一个字符都不能改
+        // The runtime error text is a literal contract; not a single character may change
         let e = Error::request_timeout("TopicTest", 3000);
         assert_eq!(
             e.to_string(),
@@ -145,13 +145,13 @@ mod tests {
     #[test]
     fn test_client_error_codes_match_server_contract() {
         let Ok(root) = std::env::var("ROCKETMQ_SERVER_SRC") else {
-            eprintln!("ROCKETMQ_SERVER_SRC 未设置，跳过 ClientErrorCode 对拍");
+            eprintln!("ROCKETMQ_SERVER_SRC not set; skipping the ClientErrorCode comparison");
             return;
         };
         let path = std::path::PathBuf::from(&root)
             .join("client/src/main/java/org/apache/rocketmq/client/common/ClientErrorCode.java");
         let Ok(text) = std::fs::read_to_string(&path) else {
-            eprintln!("{} 读不到，跳过 ClientErrorCode 对拍", path.display());
+            eprintln!("cannot read {}; skipping the ClientErrorCode comparison", path.display());
             return;
         };
         for (name, ours) in [
@@ -164,9 +164,9 @@ mod tests {
             ("CREATE_REPLY_MESSAGE_EXCEPTION", client_error_code::CREATE_REPLY_MESSAGE_EXCEPTION),
         ] {
             let Some(theirs) = java_const(&text, name) else {
-                panic!("服务端 ClientErrorCode 已无常量 {name}");
+                panic!("server-side ClientErrorCode no longer has constant {name}");
             };
-            assert_eq!(theirs, ours, "服务端 ClientErrorCode.{name} 与 rust 侧不一致");
+            assert_eq!(theirs, ours, "server-side ClientErrorCode.{name} does not match the rust side");
         }
     }
 

@@ -33,7 +33,8 @@ STAMP = int(time.time() * 1000)
 TOPIC = "PrMasterLive_%d" % STAMP
 GROUP = "GID_PrMasterLive_%d" % STAMP
 BROKER_NAME = "broker-a"
-# 本端失败上界：发布信息为空时压根没有 wire 调用，真机给 500ms 已留量级余量
+# The upper bound for a local failure: when the publish info is empty there is no wire call at
+# all, so 500ms on a real machine already leaves an order of magnitude of margin
 LOCAL_BUDGET_MS = 500.0
 
 PASS = 0
@@ -51,10 +52,12 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 
 def broker_ctl(action: str) -> tuple:
-    """跑 scripts/rmq_test_broker.sh，返回 (returncode, 输出)。
+    """Run scripts/rmq_test_broker.sh and return (returncode, output).
 
-    输出走**文件**而不是管道：start 会把 broker 拉成常驻进程，管道的写端被它继承，
-    ``subprocess`` 就要等到写端全部关闭才返回 —— 表现为脚本已经打印结果，调用方还卡着。
+    The output goes through a **file** rather than a pipe: start brings the broker up as a
+    long-running process and the write end of the pipe is inherited by it, so ``subprocess`` would
+    only return once every write end is closed -- which shows up as the script having printed its
+    result while the caller is still stuck.
     """
     out_path = "/tmp/rmq_pr_master_broker_ctl.%s.log" % action
     with open(out_path, "w") as fh:
@@ -65,11 +68,11 @@ def broker_ctl(action: str) -> tuple:
 
 
 def broker_addrs_of(inst: MQClientInstance, topic: str):
-    """强制刷新后取 broker-a 的 brokerAddrs（刷不到返回 None）。"""
+    """Force a refresh and then take the brokerAddrs of broker-a (returns None when the refresh fails)."""
     try:
         inst.update_topic_route_info_from_name_server(topic, 5000)
     except Exception as e:  # noqa: BLE001
-        print("    (路由刷新失败: %s)" % e)
+        print("    (route refresh failed: %s)" % e)
     route = inst.get_topic_route_data(topic)
     if route is None:
         return None
@@ -85,7 +88,7 @@ def wait_for(pred, timeout_s: float, what: str):
         if last:
             return last
         time.sleep(1)
-    print("    (等不到 %s，最后一次: %s)" % (what, last))
+    print("    (did not get %s within the timeout, last observation: %s)" % (what, last))
     return None
 
 
@@ -105,43 +108,43 @@ def main() -> int:
     got = []
     got_lock = threading.Lock()
     try:
-        # ---------- S0 控制腿 ----------
-        print("S0 控制腿（master 在）：路由 {0: master, 1: slave}、发布/订阅各 4 条")
+        # ---------- S0 the control leg ----------
+        print("S0 control leg (the master is up): route {0: master, 1: slave}, 4 queues each for publish/subscribe")
         inst.create_topic_in_route(TOPIC, 4, 4)
         try:
-            # 从节点也直建一份，不赌 SlaveSynchronize 的 5s 周期
+            # Create one on the slave directly as well, rather than betting on the 5s SlaveSynchronize period
             admin.create_topic_in_broker(SLAVE_ARG, TOPIC, 4, 4)
         except Exception as e:  # noqa: BLE001
-            print("    (从节点建 topic 失败: %s)" % e)
+            print("    (creating the topic on the slave failed: %s)" % e)
 
         def route_ok():
             addrs = broker_addrs_of(inst, TOPIC)
             return addrs if addrs and set(addrs) >= {0, 1} else None
 
-        addrs = wait_for(route_ok, 30, "路由 {0, 1}")
-        check("S0 路由含 {0: master, 1: slave}", addrs is not None,
+        addrs = wait_for(route_ok, 30, "the route {0, 1}")
+        check("S0 the route contains {0: master, 1: slave}", addrs is not None,
               "broker_addrs=%s" % (addrs or {}))
         if addrs is None:
-            print("== 前置不满足：没有可用的主从地址 ==")
+            print("== the precondition is not met: no usable master/slave address ==")
             return 1
-        check("S0 从节点地址与参数一致", addrs.get(1) == SLAVE_ARG,
+        check("S0 the slave address matches the argument", addrs.get(1) == SLAVE_ARG,
               "route=%s argv=%s" % (addrs.get(1), SLAVE_ARG))
 
         def publish_queues():
             info = inst.get_topic_publish_info(TOPIC)
             return list(info.msg_queue_list)
 
-        queues = wait_for(lambda: publish_queues() or None, 15, "发布队列")
-        check("S0 发布队列 4（控制）", bool(queues) and len(queues) == 4,
+        queues = wait_for(lambda: publish_queues() or None, 15, "the publish queues")
+        check("S0 4 publish queues (control)", bool(queues) and len(queues) == 4,
               "queues=%s" % ([(q.broker_name, q.queue_id) for q in queues or []]))
         subs = inst.get_topic_subscribe_info(TOPIC)
-        check("S0 订阅队列 4（控制）", len(subs) == 4,
+        check("S0 4 subscribe queues (control)", len(subs) == 4,
               "queues=%s" % ([(q.broker_name, q.queue_id) for q in subs]))
         if not queues:
             return 1
 
-        # ---------- S1 预埋 ----------
-        print("\nS1 预埋 4 条（每队列定点一条）并等从节点 store 追上")
+        # ---------- S1 seed the messages ----------
+        print("\nS1 seeding 4 messages (one pinned per queue) and waiting for the slave store to catch up")
         seeded = []
         for i, q in enumerate(sorted(queues, key=lambda x: x.queue_id)):
             body = ("pr-master-%d" % i).encode()
@@ -149,8 +152,8 @@ def main() -> int:
                               mq=MessageQueue(TOPIC, q.broker_name, q.queue_id))
             seeded.append(body)
             if r.send_status != SendStatus.SEND_OK:
-                check("S1 第 %d 条预埋 SEND_OK" % i, False, "status=%s" % r.send_status)
-        check("S1 4 条预埋全部 SEND_OK", len(seeded) == 4)
+                check("S1 the %d-th seeded message got SEND_OK" % i, False, "status=%s" % r.send_status)
+        check("S1 all 4 seeded messages got SEND_OK", len(seeded) == 4)
 
         master_max = {q.queue_id: inst.get_max_offset(q) for q in queues}
 
@@ -161,54 +164,57 @@ def main() -> int:
                 slave_max = {q.queue_id: inst.get_max_offset(q, addr=SLAVE_ARG)
                              for q in queues}
             except Exception as e:  # noqa: BLE001
-                print("    (从节点取 maxOffset 失败: %s)" % e)
+                print("    (reading maxOffset from the slave failed: %s)" % e)
                 return None
             return slave_max if all(slave_max[k] >= v for k, v in master_max.items()) else None
 
-        slave_max = wait_for(slave_caught_up, 30, "从节点复制追上")
-        check("S1 4 条已复制到从节点 store", slave_max is not None,
+        slave_max = wait_for(slave_caught_up, 30, "the slave replication catching up")
+        check("S1 the 4 messages were replicated to the slave store", slave_max is not None,
               "master=%s slave=%s" % (master_max, slave_max or {}))
 
-        # ---------- S2 停 master ----------
-        print("\nS2 停 master（scripts/rmq_test_broker.sh stop），等路由只剩从节点")
+        # ---------- S2 stop the master ----------
+        print("\nS2 stopping the master (scripts/rmq_test_broker.sh stop) and waiting until the route only has the slave")
         code, out = broker_ctl("stop")
-        check("S2 master 已优雅停机", code == 0, out)
+        check("S2 the master shut down gracefully", code == 0, out)
 
         def masterless():
             addrs_now = broker_addrs_of(inst, TOPIC)
             return addrs_now if addrs_now and 0 not in addrs_now and 1 in addrs_now else None
 
-        down_addrs = wait_for(masterless, 60, "masterless 路由")
-        check("S2 路由里 broker-a 只剩 {1: slave}", down_addrs is not None,
+        down_addrs = wait_for(masterless, 60, "the masterless route")
+        check("S2 the route of broker-a only has {1: slave} left", down_addrs is not None,
               "broker_addrs=%s" % (down_addrs or {}))
         if down_addrs is None:
             return 1
 
-        # ---------- S3 (A) 发布队列 ----------
-        print("\nS3 (A) 发布信息跳过没有 master 的 broker")
+        # ---------- S3 (A) the publish queues ----------
+        print("\nS3 (A) the publish info skips a broker that has no master")
         info = inst.topic_publish_info_table.get(TOPIC)
         n_pub = len(info.msg_queue_list) if info is not None else -1
-        check("S3 停 master 后发布队列 == 0", n_pub == 0, "msg_queue_list=%d" % n_pub)
+        check("S3 after stopping the master the publish queues == 0", n_pub == 0, "msg_queue_list=%d" % n_pub)
         acc_exc = None
         try:
             inst.get_topic_publish_info(TOPIC)
         except MQClientException as e:
             acc_exc = e
-        check("S3b 发布信息访问器本端抛「选不到队列」",
+        check("S3b the publish info accessor throws locally with 'no queue can be selected'",
               acc_exc is not None and "Can not find Message Queue for topic" in str(acc_exc),
               "%s" % acc_exc)
 
-        # ---------- S4 (C) 订阅队列 ----------
+        # ---------- S4 (C) the subscribe queues ----------
         subs_down = inst.get_topic_subscribe_info(TOPIC)
-        check("S4 (C) 订阅队列仍是 4、且都在 broker-a（消费侧不看 master）",
+        check("S4 (C) the subscribe queues are still 4 and all in broker-a (the consumer side does not look at the master)",
               len(subs_down) == 4 and all(q.broker_name == BROKER_NAME for q in subs_down),
               "queues=%s" % ([(q.broker_name, q.queue_id) for q in subs_down]))
 
-        # ---------- S5 (A 定型) 发送快速失败 ----------
-        # 分两段看：**缓存还没刷**时（现实中 30s 周期任务未到）发送实例手里还是停前的旧
-        # 路由，地址解析落在死掉的 master 上，快速失败、绝不静默改发从节点；**路由刷成停后
-        # 形状**后（周期任务 / 显式刷新），(A) 生效：发布队列为空，发送连一条 wire 都不发。
-        print("\nS5 不指定队列的同步发送：旧缓存快速失败 → 刷新后本端快速失败")
+        # ---------- S5 (A settled) the send fails fast ----------
+        # It is looked at in two stages: while the **cache has not been refreshed** yet (in
+        # reality the 30s periodic task has not fired), the sending instance still holds the old
+        # pre-shutdown route, so the address resolution lands on the dead master and the send fails
+        # fast, never silently switching to the slave; once **the route has been refreshed into the
+        # post-shutdown shape** (the periodic task / an explicit refresh), (A) takes effect: the
+        # publish queues are empty and the send does not put a single message on the wire.
+        print("\nS5 a synchronous send without a specified queue: fails fast on the stale cache -> fails fast locally after the refresh")
         began = time.monotonic()
         exc = None
         try:
@@ -216,18 +222,20 @@ def main() -> int:
         except Exception as e:  # noqa: BLE001
             exc = e
         stale_ms = (time.monotonic() - began) * 1000
-        # 这一腿是机会腿：周期刷新是否已经跑过不由本脚本定。两条腿的共同判据是
-        # "快速失败 + 绝不落到从节点地址上"（旧缓存腿打的是死掉的 master）。
-        check("S5 发送快速失败，且报错里没有从节点地址（绝不改发从节点）",
+        # This leg is an opportunistic one: whether the periodic refresh has already run is not
+        # decided by this script. The criterion shared by both legs is "fails fast + never lands on
+        # the slave address" (the stale-cache leg targets the dead master).
+        check("S5 the send fails fast and the error contains no slave address (it never switches to the slave)",
               exc is not None and stale_ms < LOCAL_BUDGET_MS and SLAVE_ARG not in str(exc),
               "%.0fms %s: %s" % (stale_ms, type(exc).__name__, exc))
 
-        # 让发送实例自己的路由缓存刷成停后形状（与 30s 周期任务同一条代码路径）
+        # Let the sending instance's own route cache be refreshed into the post-shutdown shape (the same
+        # code path as the 30s periodic task)
         pcli = producer._require_client()
         pcli.update_topic_route_info_from_name_server(TOPIC, 5000)
         p_info = pcli.topic_publish_info_table.get(TOPIC)
         n_pub_send = len(p_info.msg_queue_list) if p_info is not None else -1
-        check("S5b 发送实例的发布队列也 == 0（(A) 就作用在这里）", n_pub_send == 0,
+        check("S5b the publish queues of the sending instance are == 0 as well (this is where (A) takes effect)", n_pub_send == 0,
               "msg_queue_list=%d" % n_pub_send)
 
         began = time.monotonic()
@@ -237,7 +245,7 @@ def main() -> int:
         except Exception as e:  # noqa: BLE001
             exc2 = e
         fresh_ms = (time.monotonic() - began) * 1000
-        check("S5c 刷新后：本端 10005 抛「选不到队列」，无 wire 调用（无 BrokersSent）",
+        check("S5c after the refresh: the local 10005 throws 'no queue can be selected', with no wire call (no BrokersSent)",
               isinstance(exc2, MQClientException)
               and exc2.response_code == ClientErrorCode.NOT_FOUND_TOPIC_EXCEPTION
               and "Can not find Message Queue for topic" in str(exc2)
@@ -245,7 +253,7 @@ def main() -> int:
               and fresh_ms < LOCAL_BUDGET_MS,
               "%.0fms code=%s: %s" % (fresh_ms, getattr(exc2, "response_code", None), exc2))
 
-        print("\nS5d (B) 对照：定点发到该队列 → 本端报 broker 不存在（不发 wire）")
+        print("\nS5d (B) the control leg: a pinned send to that queue -> locally reports the broker does not exist (no wire)"),
         pinned_exc = None
         began = time.monotonic()
         try:
@@ -254,23 +262,24 @@ def main() -> int:
         except Exception as e:  # noqa: BLE001
             pinned_exc = e
         pinned_ms = (time.monotonic() - began) * 1000
-        check("S5d 定点发送本端报「The broker[broker-a] not exist」，无 wire"
-              "（不是从节点回的 SYSTEM_BUSY(2)）",
+        check("S5d the pinned send locally reports \"The broker[broker-a] not exist\", with no wire"
+              "(not the SYSTEM_BUSY(2) returned by the slave)",
               isinstance(pinned_exc, MQClientException)
               and str(pinned_exc) == "The broker[%s] not exist" % BROKER_NAME
               and pinned_ms < LOCAL_BUDGET_MS,
               "%.0fms %s: %s" % (pinned_ms, type(pinned_exc).__name__, pinned_exc))
 
-        print("\nS5e (D) 顺序锁：停窗口内整台跳过（不刷路由、不发 wire）")
+        print("\nS5e (D) the orderly lock: inside the outage window the whole machine is skipped (no route refresh, no wire)"),
         client_id = "pr-master-live-%d" % STAMP
         mqs = [MessageQueue(TOPIC, BROKER_NAME, 0)]
         began = time.monotonic()
         locks = inst.lock_batch_mq(GROUP, client_id, mqs)
         lock_ms = (time.monotonic() - began) * 1000
-        check("S5e 只剩从节点时一台都锁不上（旧口径会退到从节点上锁）",
+        check("S5e when only the slave is left not a single machine can be locked (the old behaviour would fall back to locking on the slave)",
               locks == [] and lock_ms < LOCAL_BUDGET_MS, "%.0fms locked=%s" % (lock_ms, locks))
 
-        # 对照腿：同一份报文直接点名从节点 —— 从节点**本来**就会把锁发出来
+        # The control leg: the very same request names the slave directly -- the slave **does** hand out
+    # the lock as it always does
         req = RemotingCommand.create_request_command(RequestCode.LOCK_BATCH_MQ, None)
         body = LockBatchRequestBody()
         body.consumer_group = GROUP
@@ -279,16 +288,16 @@ def main() -> int:
         req.body = body.encode()
         slave_ok = len(LockBatchResponseBody.decode(
             inst._invoke_sync(SLAVE_ARG, req, 3000).body).lock_ok_mq_set)
-        check("S5e2 对照：点名从节点时锁发得出来（空集不是 broker 拒绝）", slave_ok == 1,
+        check("S5e2 control: when the slave is named directly the lock is handed out (the empty set is not a broker rejection)", slave_ok == 1,
               "slave lockOKMQSet=%d" % slave_ok)
 
         began = time.monotonic()
         inst.unlock_batch_mq(GROUP, client_id, mqs)
         unlock_ms = (time.monotonic() - began) * 1000
-        check("S5e3 解锁同样安静跳过（不抛、不发）", unlock_ms < LOCAL_BUDGET_MS,
+        check("S5e3 the unlock is silently skipped in the same way (no throw, nothing sent)", unlock_ms < LOCAL_BUDGET_MS,
               "%.0fms" % unlock_ms)
 
-        print("\nS5f (E) POP 拉取：本端报「The broker[broker-a] not exist」（不发 wire）")
+        print("\nS5f (E) the POP pull: locally reports \"The broker[broker-a] not exist\" (no wire)")
         pop_exc = None
         began = time.monotonic()
         try:
@@ -297,13 +306,13 @@ def main() -> int:
         except Exception as e:  # noqa: BLE001
             pop_exc = e
         pop_ms = (time.monotonic() - began) * 1000
-        check("S5f 停窗口内 POP 本端报「The broker[broker-a] not exist」（不是从节点回的错）",
+        check("S5f inside the outage window the POP locally reports \"The broker[broker-a] not exist\" (not an error returned by the slave)",
               isinstance(pop_exc, MQClientException)
               and str(pop_exc) == "The broker[%s] not exist" % BROKER_NAME
               and pop_ms < LOCAL_BUDGET_MS,
               "%.0fms %s: %s" % (pop_ms, type(pop_exc).__name__, pop_exc))
 
-        print("\nS5g (F) 位点读取：冷实例刷一次路由后放宽到从节点")
+        print("\nS5g (F) reading the offset: the cold instance refreshes the route once and then widens to the slave")
         cold = MQClientInstance("pr-master-live-cold-%d" % STAMP, [NAMESRV])
         cold_exc = None
         off = None
@@ -313,13 +322,13 @@ def main() -> int:
             cold_exc = e
         finally:
             cold.shutdown()
-        check("S5g 冷实例位点读取不报错：刷路由 → 退到从节点由 broker 答复",
+        check("S5g reading the offset from the cold instance raises no error: refresh the route -> fall back to the slave and let the broker answer",
               cold_exc is None and (off is None or isinstance(off, int)),
               "%s: %s" % (type(cold_exc).__name__ if cold_exc else "ok",
                           cold_exc if cold_exc else "offset=%s" % off))
 
-        # ---------- S6 (C 端到端) 停窗口内消费 ----------
-        print("\nS6 停窗口内新起的 push 消费者：4 条队列 + 从从节点收齐预埋的 4 条")
+        # ---------- S6 (C end to end) consuming inside the outage window ----------
+        print("\nS6 a push consumer started inside the outage window: 4 queues + collecting all 4 seeded messages from the slave")
 
         def on_msg(msgs):
             with got_lock:
@@ -333,18 +342,18 @@ def main() -> int:
         consumer.subscribe(TOPIC, "*")
         consumer.start()
         subs_in_window = consumer._require_client().get_topic_subscribe_info(TOPIC)
-        check("S6a 窗口内消费者自己的订阅信息也是 4 条",
+        check("S6a the subscribe info of the consumer inside the window is 4 as well",
               len(subs_in_window) == 4,
               "queues=%s" % ([(q.broker_name, q.queue_id) for q in subs_in_window]))
-        wait_for(lambda: sorted(got) == sorted(seeded), 60, "4 条预埋消息")
-        check("S6 停 master 期间从从节点收齐 4 条",
+        wait_for(lambda: sorted(got) == sorted(seeded), 60, "the 4 seeded messages")
+        check("S6 while the master was down all 4 were collected from the slave",
               sorted(got) == sorted(seeded), "got=%s" % sorted(got))
 
-        # ---------- S7 负控（先把 master 拉回来） ----------
-        print("\nS7 负控：master 拉回后发布队列恢复、发送恢复")
+        # ---------- S7 the negative control (bring the master back first) ----------
+        print("\nS7 negative control: after the master comes back the publish queues and the send recover")
         code, out = broker_ctl("start")
         if code != 0:
-            print("  [FAIL] master 复位失败: %s" % out)
+            print("  [FAIL] restoring the master failed: %s" % out)
 
         def publish_back():
             try:
@@ -352,36 +361,36 @@ def main() -> int:
             except Exception:  # noqa: BLE001
                 return None
 
-        queues_back = wait_for(publish_back, 60, "发布队列恢复")
-        check("S7 发布队列恢复 4", bool(queues_back) and len(queues_back) == 4,
+        queues_back = wait_for(publish_back, 60, "the publish queues recovering")
+        check("S7 the publish queues recovered to 4", bool(queues_back) and len(queues_back) == 4,
               "queues=%s" % ([(q.broker_name, q.queue_id) for q in queues_back or []]))
-        # 两条失败发送都没在 broker 上留下消息：每条预埋队列的 maxOffset 仍是 1
+        # Neither of the two failed sends left a message on the broker: the maxOffset of every seeded queue is still 1
         after = {q.queue_id: inst.get_max_offset(q) for q in (queues_back or queues or [])}
-        check("S7b 两条失败发送没留下消息（maxOffset 仍是 1）",
+        check("S7b the two failed sends left no messages behind (maxOffset is still 1)",
               bool(after) and all(v == 1 for v in after.values()), "maxOffset=%s" % after)
         r = producer.send(Message(TOPIC, b"pr-master-back"))
-        check("S7c 发送恢复 SEND_OK", r.send_status == SendStatus.SEND_OK,
+        check("S7c the send recovered with SEND_OK", r.send_status == SendStatus.SEND_OK,
               "status=%s msgId=%s" % (r.send_status, r.msg_id))
     finally:
-        # master 必须回来（start 幂等，异常路径也走到这里）
+        # The master has to come back (start is idempotent and this is also reached on the exception path)
         broker_ctl("start")
         for c in (consumer, producer):
             if c is not None:
                 try:
                     c.shutdown()
                 except Exception as e:  # noqa: BLE001
-                    print("    (shutdown 失败: %s)" % e)
+                    print("    (shutdown failed: %s)" % e)
         try:
             inst.shutdown()
         except Exception as e:  # noqa: BLE001
-            print("    (instance shutdown 失败: %s)" % e)
+            print("    (instance shutdown failed: %s)" % e)
         try:
             admin.delete_topic(TOPIC)
         except Exception as e:  # noqa: BLE001
-            print("    (delete_topic(%s) 失败: %s)" % (TOPIC, e))
+            print("    (delete_topic(%s) failed: %s)" % (TOPIC, e))
         admin.shutdown()
 
-    print("\n== 结果: %d/%d 通过 ==" % (PASS, PASS + FAIL))
+    print("\n== Result: %d/%d passed ==" % (PASS, PASS + FAIL))
     return 0 if FAIL == 0 else 1
 
 

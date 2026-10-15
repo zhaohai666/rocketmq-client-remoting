@@ -1,6 +1,6 @@
 // live_check_client_config verifies CHECK_CLIENT_CONFIG(4) — the pre-flight
-// 推送/轻量拉取消费者在 start() 里、订阅路由解析完成之后且首次心跳之前
-// 会向服务端做的一次校验。
+// check push/lite-pull consumers perform in start(), after the subscription
+// route has been resolved and before the first heartbeat.
 //
 // What 46 is for: a subscription whose expressionType is not TAG (SQL92 or
 // CLASS_FILTER) only compiles on the broker. A client that never asks gets no

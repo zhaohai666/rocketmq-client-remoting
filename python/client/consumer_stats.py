@@ -29,7 +29,7 @@ class StatsSnapshot:
         self.avgpt: float = 0.0
         self.times: int = 0
 
-    def __repr__(self) -> str:  # pragma: no cover - 调试用
+    def __repr__(self) -> str:  # pragma: no cover - for debugging
         return "StatsSnapshot(sum=%d, tps=%.2f, avgpt=%.2f, times=%d)" % (
             self.sum, self.tps, self.avgpt, self.times)
 
@@ -53,7 +53,7 @@ def compute_stats_data(cs_list) -> StatsSnapshot:
 
 
 class StatsItem:
-    """单项统计：累计 value/times + 分钟/小时两级采样链。"""
+    """Single-item statistics: cumulative value/times + minute/hour two-level sampling chains."""
 
     def __init__(self, stats_name: str, stats_key: str) -> None:
         self.stats_name = stats_name
@@ -61,7 +61,7 @@ class StatsItem:
         self._lock = threading.Lock()
         self._value = 0
         self._times = 0
-        # 元素 = (timestamp_ms, 累计 value, 累计 times)
+        # element = (timestamp_ms, cumulative value, cumulative times)
         self._minute: Deque[Tuple[int, int, int]] = deque()
         self._hour: Deque[Tuple[int, int, int]] = deque()
 
@@ -84,14 +84,14 @@ class StatsItem:
         return (int(time.time() * 1000), self._value, self._times)
 
     def sample(self) -> None:
-        """追加分钟级采样点（每 10s 由采样线程调用）。"""
+        """Append a minute-level sampling point (called by the sampling thread every 10s)."""
         with self._lock:
             self._minute.append(self._sample_locked())
             while len(self._minute) > MINUTE_LIST_MAX:
                 self._minute.popleft()
 
     def sample_hour(self) -> None:
-        """追加点小时级采样点（每 10 分钟由采样线程调用）。"""
+        """Append an hour-level sampling point (called by the sampling thread every 10 minutes)."""
         with self._lock:
             self._hour.append(self._sample_locked())
             while len(self._hour) > HOUR_LIST_MAX:
@@ -161,7 +161,7 @@ class ConsumerStatsManager:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
-    # ---------------- 生命周期 ----------------
+    # ---------------- lifecycle ----------------
     def start(self) -> None:
         if self._thread is not None:
             return
@@ -182,7 +182,7 @@ class ConsumerStatsManager:
             rounds += 1
             for s in self._sets:
                 s.sample_all()
-            if rounds % 60 == 0:    # 60 × 10s = 10 分钟
+            if rounds % 60 == 0:    # 60 * 10s = 10 minutes
                 for s in self._sets:
                     s.sample_hour_all()
 
@@ -205,7 +205,7 @@ class ConsumerStatsManager:
     def inc_consume_failed_tps(self, group: str, topic: str, msgs: int) -> None:
         self.topic_and_group_consume_failed_tps.add_value(self._key(topic, group), int(msgs), 1)
 
-    # ---------------- 查询 ----------------
+    # ---------------- query ----------------
     def consume_status(self, group: str, topic: str) -> ConsumeStatus:
         pass
         cs = ConsumeStatus()

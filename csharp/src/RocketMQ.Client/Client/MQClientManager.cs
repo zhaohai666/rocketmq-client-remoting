@@ -1,8 +1,8 @@
-// 引用计数的判定必须原子（「减到 0 → 摘表 → 决定关停」不允许与并发的
-// getOrCreate 交错：否则一边刚拿到实例、另一边已经把它关了），而 register/unregister
-// 都是低频生命周期调用，所以直接用一把锁包住整张表，而不是
-// ConcurrentDictionary + 分散的 Interlocked —— 后者把「判 0」和「摘表」拆开后
-// 反而要再造第二把锁把两者缝回去。
+// The reference-count decision must be atomic ("decrement to 0 -> remove from table -> decide shutdown" must not interleave
+// with a concurrent getOrCreate: otherwise one side just got the instance while the other already shut it down), and register/unregister
+// are low-frequency lifecycle calls, so we simply guard the whole table with one lock instead of
+// ConcurrentDictionary + scattered Interlocked — the latter splits "check 0" and "remove from table" apart,
+// then needs a second lock to stitch them back together.
 using RocketMQ.Common;
 
 namespace RocketMQ.Client;
@@ -26,9 +26,9 @@ public sealed class MQClientManager
     {
     }
 
-    /// 返回后调用方须自行 <see cref="MQClientInstance.Start"/>（已启动的共享实例再调一次
-    /// Start 是幂等的：周期任务都有「已在跑就不再起」的守卫），并在 Shutdown 时用
-    /// <see cref="UnregisterMQClient"/> 归还。
+    /// After returning, the caller must call <see cref="MQClientInstance.Start"/> itself (calling Start again on an already-started
+    /// shared instance is idempotent: periodic tasks all have a "don't start if already running" guard), and return it on Shutdown via
+    /// <see cref="UnregisterMQClient"/>.
     /// </summary>
     public MQClientInstance GetOrCreateMQClientInstance(string clientId, Func<MQClientInstance> factory)
     {
@@ -53,8 +53,8 @@ public sealed class MQClientManager
         }
     }
 
-    /// 返回 true 表示本次调用真的触发了（或未来会触发）实例收尾：计数未归零时实例继续
-    /// 存活，false 不代表实例被关闭。
+    /// Returns true if this call actually triggered (or will trigger in the future) instance teardown: when the count has not
+    /// reached zero the instance stays alive; false does not mean the instance was shut down.
     /// </summary>
     public bool UnregisterMQClient(string clientId, MQClientInstance? instance)
     {
@@ -81,8 +81,8 @@ public sealed class MQClientManager
 
         if (last)
         {
-            // 在锁外关停：Shutdown 要 join 周期线程（各 2s 预算），抱着表锁会卡住
-            // 并发的 getOrCreate。此刻表项已摘，后到者只会拿到全新实例。
+            // Shut down outside the lock: Shutdown must join the periodic threads (each with a 2s budget); holding the table lock would block
+            // concurrent getOrCreate. The table entry is already removed now, so later callers only get a fresh instance.
             ClientLog.Info("the client factory [" + clientId + "] shutdown OK, refcount=0");
             instance.Shutdown();
         }
@@ -90,9 +90,9 @@ public sealed class MQClientManager
         return true;
     }
 
-    // ---------------- 诊断 / 测试观测面 ----------------
+    // ---------------- Diagnostics / test observability surface ----------------
 
-    /// <summary>当前存活的实例数（引用计数归零的已摘除）。</summary>
+    /// <summary>Number of currently alive instances (those whose reference count reached zero are removed).</summary>
     public int InstanceCount
     {
         get
@@ -104,7 +104,7 @@ public sealed class MQClientManager
         }
     }
 
-    /// <summary>某 clientId 当前被几个门面在用；不在表中返回 0。</summary>
+    /// <summary>How many facades are currently using a given clientId; returns 0 if not in the table.</summary>
     public int RefCountOf(string clientId)
     {
         lock (_gate)
@@ -113,7 +113,7 @@ public sealed class MQClientManager
         }
     }
 
-    /// <summary>取当前表项里的实例（诊断用；没人在用时返回 false）。</summary>
+    /// <summary>Take the current instance from the table (for diagnostics; returns false when nobody is using it).</summary>
     public bool TryGetMQClientInstance(string clientId, out MQClientInstance? instance)
     {
         lock (_gate)

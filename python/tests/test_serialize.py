@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""序列化层测试（RemotingSerializable / RocketMQSerializable）。"""
+"""Serialization layer tests (RemotingSerializable / RocketMQSerializable)."""
 from __future__ import annotations
 
 import json
@@ -35,7 +35,7 @@ class TestRocketMQSerializable:
 
     def test_map_serialize_uses_short_key_int_value(self):
         raw = RocketMQSerializable.map_serialize({"k": "v"})
-        # key: short len(2) + 1 字节；value: int len(4) + 1 字节
+        # key: short len(2) + 1 byte; value: int len(4) + 1 byte
         assert raw[:2] == struct.pack(">H", 1)
         assert raw[2:3] == b"k"
         assert raw[3:7] == struct.pack(">i", 1)
@@ -94,7 +94,7 @@ class TestRocketMQSerializable:
         assert got["version"] == 7
         assert got["opaque"] == 12345
         assert got["flag"] == 0
-        assert got["remark"] is None, "长度为 0 的字符串字段解出 None"
+        assert got["remark"] is None, "a zero-length string field decodes to None"
         assert got["extFields"] == {"topic": "TopicTest", "中文键": "中文值"}
 
     def test_write_str_short_and_int_length(self):

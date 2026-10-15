@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""离线解析 RocketMQ 5.x commitlog，打印每条消息的 reconsumeTimes / topic / properties。
+"""Offline RocketMQ 5.x commitlog parser; prints each message's reconsumeTimes / topic / properties.
 
-用途：POP S2 重投 recon=0 的取证——直接看 broker 写进 commitlog 的 reconsumeTimes
-字段是 0 还是 1（reviveRetry 的 suspend 分支会保持原值）。
+Purpose: evidence gathering for POP S2 redelivery with recon=0 — inspect directly whether the
+reconsumeTimes field the broker wrote into the commitlog is 0 or 1 (reviveRetry's suspend
+branch keeps the original value).
 
-用法：python3 dump_commitlog.py <store/commitlog 目录> [--filter ORIGIN_GROUP|%RETRY%]
+Usage: python3 dump_commitlog.py <store/commitlog dir> [--filter ORIGIN_GROUP|%RETRY%]
 """
 import struct
 import sys
@@ -21,7 +22,7 @@ def parse(path: Path, flt: str | None):
     while pos + 4 <= n:
         (total,) = struct.unpack_from('>i', data, pos)
         if total <= 0 or pos + total > n:
-            break  # 文件尾 / 预分配零区（total 含自身 4B）
+            break  # end of file / preallocated zero region (total includes its own 4B)
         msg = data[pos: pos + total]
         pos += total
         magic = struct.unpack_from('>i', msg, 4)[0]
@@ -31,7 +32,7 @@ def parse(path: Path, flt: str | None):
         sysflag = struct.unpack_from('>i', msg, 36)[0]
         born_v6 = bool(sysflag & 0x2)
         store_v6 = bool(sysflag & 0x4)
-        off = 40                            # bornTimestamp（含 totalLen 头的布局）
+        off = 40                            # bornTimestamp (layout including the totalLen header)
         off += 8 + (20 if born_v6 else 8)   # bornTs + bornHost
         off += 8 + (20 if store_v6 else 8)  # storeTs + storeHost
         recon = struct.unpack_from('>i', msg, off)[0]

@@ -1,8 +1,10 @@
-// POP 的 CK（checkpoint）串是 broker 与客户端交换消费进度的载体：
+// The POP CK (checkpoint) string is the carrier through which broker and client exchange
+// consume progress:
 //   ckQueueOffset popTime invisibleTime reviveQid retryFlag brokerName queueId [msgQueueOffset]
 //
-// ⚠ 普通 topic 直连 POP 时 broker **不在消息上写** POP_CK，它是客户端用响应头的
-//   startOffsetInfo/msgOffsetInfo 反构出来的（见 MqClient.StampPopCk）。没有它就发不了 ACK。
+// WARNING: on direct POP against a normal topic, the broker does **not** write POP_CK onto
+//   messages; the client reconstructs it from the startOffsetInfo/msgOffsetInfo response
+//   headers (see MqClient.StampPopCk). Without it no ACK can be sent.
 using System.Globalization;
 using RocketMQ.Common;
 
@@ -15,13 +17,13 @@ public static class ExtraInfoUtil
     public const string RetryTopicV2 = "2";
     public const string QueueOffsetKeyPrefix = "qo";
 
-    /// <summary>MessageConst.KEY_SEPARATOR —— 注意是空格。</summary>
+    /// <summary>MessageConst.KEY_SEPARATOR — note this is a space.</summary>
     public const char KeySeparator = ' ';
 
-    /// <summary>分隔「多个队列」的段。</summary>
+    /// <summary>Segment separating "multiple queues".</summary>
     private const char QueueSplitter = ';';
 
-    /// <summary>KeyBuilder.POP_ORDER_REVIVE_QUEUE —— reviveQid 为它表示顺序消费。</summary>
+    /// <summary>KeyBuilder.POP_ORDER_REVIVE_QUEUE — a reviveQid equal to it means ordered consumption.</summary>
     public const int PopOrderReviveQueue = 999;
 
     public static string[] Split(string extraInfo)

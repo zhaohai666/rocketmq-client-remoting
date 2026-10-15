@@ -1,8 +1,11 @@
-// MQClientManager 跨门面复用 MQClientInstance 的离线单测 —— 用 MockCluster，不依赖真集群。
+// Offline unit tests for MQClientManager reusing an MQClientInstance across facades --
+// using MockCluster, no dependency on a real cluster.
 //
 //
-// 用 MockCluster 的原因与 SendRetryTests 相同：start/shutdown 的全部报文（路由、心跳、
-// 35 注销）都能在进程内假集群上走通，引用计数的生死可以同步断言，不用等任何超时。
+// The reason for using MockCluster is the same as in SendRetryTests: every message of
+// start/shutdown (routes, heartbeats, the 35 unregister) can go through an in-process
+// fake cluster, so the life and death of the reference count can be asserted
+// synchronously without waiting for any timeout.
 using RocketMQ.Client;
 using RocketMQ.Common;
 using RocketMQ.Remoting.Protocol;
@@ -17,7 +20,8 @@ public class MQClientManagerTests
 {
     private const string Topic = "MgrShareUnitTopic";
 
-    /// <summary>什么都不做的监听器：本组用例只关心实例的生死，不关心消息。</summary>
+    /// <summary>A listener that does nothing: this group of cases only cares about the
+    /// life of the instance, not about messages.</summary>
     private sealed class NoopListener : IMessageListenerConcurrently
     {
         public bool Orderly() => false;
@@ -47,7 +51,7 @@ public class MQClientManagerTests
         return consumer;
     }
 
-    // ---------------- 1：同 clientId 两门面共享同一实例 ----------------
+    // ---------------- 1: two facades with the same clientId share one instance ----------------
 
     [Fact]
     public void SameClientIdFacadesShareOneInstanceWithRefcountTwo()
@@ -60,7 +64,7 @@ public class MQClientManagerTests
             producer.Start();
             consumer.Start();
 
-            // clientId 口径一致（ip@instanceName）⇒ 同一实例、引用计数 2
+            // the clientId rule agrees (ip@instanceName) => the same instance, reference count 2
             Assert.Equal(producer.ClientId, consumer.ClientId);
             Assert.Same(producer.Client(), consumer.Client());
             Assert.Equal(2, MQClientManager.Instance.RefCountOf(producer.ClientId));
@@ -73,7 +77,7 @@ public class MQClientManagerTests
         }
     }
 
-    // ---------------- 2：先关一个，实例仍存活 ----------------
+    // ---------------- 2: shut one down first, the instance is still alive ----------------
 
     [Fact]
     public void FirstFacadeShutdownKeepsSharedInstanceAlive()
@@ -94,7 +98,7 @@ public class MQClientManagerTests
             Assert.True(shared.Started, "shared instance must survive while consumer still uses it");
             Assert.Same(shared, consumer.Client());
 
-            // 存活的实例要真的能用：消费者侧的拉取走共享连接，拉空应答不抛
+            // the surviving instance must really be usable: the consumer-side pull goes over the shared connection and an empty response does not throw
             List<MessageQueue> queues = consumer.FetchSubscribeMessageQueues(Topic);
             Assert.NotEmpty(queues);
         }
@@ -108,7 +112,7 @@ public class MQClientManagerTests
         }
     }
 
-    // ---------------- 3：先关消费者也一样，生产者还能发 ----------------
+    // ---------------- 3: shutting the consumer down first is the same, the producer can still send ----------------
 
     [Fact]
     public void ConsumerShutdownFirstDoesNotBreakProducerOnSharedInstance()
@@ -128,7 +132,7 @@ public class MQClientManagerTests
             Assert.True(shared.Started);
             Assert.Same(shared, producer.Client());
 
-            // 「不能拖垮」要落在功能上：共享实例还活着，发送必须照常成功
+            // "must not bring it down" has to land functionally: the shared instance is still alive, so the send must succeed as usual
             SendResult r = producer.Send(
                 new Message(Topic, Encoding.UTF8.GetBytes("after-consumer-shutdown")), 5000);
             Assert.Equal(SendStatus.SendOk, r.SendStatus);
@@ -139,7 +143,7 @@ public class MQClientManagerTests
         }
     }
 
-    // ---------------- 4：全关后实例才真正关闭 ----------------
+    // ---------------- 4: only after all are shut down does the instance really close ----------------
 
     [Fact]
     public void LastFacadeShutdownStopsTheInstance()
@@ -160,7 +164,7 @@ public class MQClientManagerTests
         Assert.False(shared.Started, "instance must be shut down after the last facade leaves");
     }
 
-    // ---------------- 5：不同 clientId 各自独立 ----------------
+    // ---------------- 5: different clientIds are independent ----------------
 
     [Fact]
     public void DifferentClientIdsDoNotShare()
@@ -178,7 +182,7 @@ public class MQClientManagerTests
             Assert.Equal(1, MQClientManager.Instance.RefCountOf(producer.ClientId));
             Assert.Equal(1, MQClientManager.Instance.RefCountOf(consumer.ClientId));
 
-            // 一边关闭只影响自己那一份
+            // shutting one side down only affects its own copy
             producer.Shutdown();
             Assert.Equal(0, MQClientManager.Instance.RefCountOf(producer.ClientId));
             Assert.Equal(1, MQClientManager.Instance.RefCountOf(consumer.ClientId));
@@ -190,7 +194,7 @@ public class MQClientManagerTests
         }
     }
 
-    // ---------------- 6：共享实例上的反向请求处理器不互相顶掉 ----------------
+    // ---------------- 6: reverse request handlers on a shared instance do not displace each other ----------------
 
     [Fact]
     public void FacadeProcessorsStackOnSharedInstanceInsteadOfOverwriting()
@@ -205,7 +209,7 @@ public class MQClientManagerTests
             second.Start();
             consumer.Start();
 
-            // 三个门面共享同一实例，各 code 的登记数 = 在用门面数，先启动的不被顶掉
+            // three facades share one instance, the registration count per code equals the number of facades in use, and the first one started is not displaced
             MQClientInstance shared = first.Client();
             Assert.Same(shared, second.Client());
             Assert.Same(shared, consumer.Client());
@@ -213,13 +217,13 @@ public class MQClientManagerTests
             Assert.Equal(2, shared.FacadeProcessorCount(RequestCode.CheckTransactionState));
             Assert.Equal(1, shared.FacadeProcessorCount(RequestCode.GetConsumerRunningInfo));
 
-            // 先启动的生产者退场：39 只摘它自己那份，另一个生产者的还在
+            // the producer that started first leaves: 39 only drops its own share, the other producer's is still there
             first.Shutdown();
             Assert.Equal(2, MQClientManager.Instance.RefCountOf(first.ClientId));
             Assert.True(shared.Started);
             Assert.Equal(1, shared.FacadeProcessorCount(RequestCode.CheckTransactionState));
 
-            // 消费者也退场：307 归零，39（第二个生产者）仍在
+            // the consumer leaves as well: 307 goes to zero while 39 (the second producer) remains
             consumer.Shutdown();
             Assert.Equal(1, MQClientManager.Instance.RefCountOf(first.ClientId));
             Assert.True(shared.Started);

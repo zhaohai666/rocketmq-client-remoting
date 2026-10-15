@@ -12,7 +12,7 @@ import {
   ConsumerRunningInfo,
 } from './bodies.ts';
 
-// Re-export 共享管理体，使单一 import 即可覆盖所有 admin body。
+// Re-export shared admin bodies so a single import covers all admin body types.
 export {
   messageQueueKey,
   parseMessageQueueKey,
@@ -132,7 +132,7 @@ export class ConsumeQueueData {
       eval: this.eval,
       bitMap: this.bitMap,
     };
-    // null 字段不序列化
+    // null fields are not serialized
     if (this.extendDataJson != null) d['extendDataJson'] = this.extendDataJson;
     if (this.msg != null) d['msg'] = this.msg;
     return d;

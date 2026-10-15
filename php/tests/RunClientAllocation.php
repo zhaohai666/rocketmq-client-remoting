@@ -3,17 +3,17 @@
 declare(strict_types=1);
 
 /**
- * Client 分配策略（Allocation.php）纯 PHP assert 风格自测（不依赖 phpunit）。
+ * Client allocation strategies (Allocation.php) pure-PHP assert-style self test (no phpunit).
  *
- * 覆盖：AllocationHelper（mqSortKey / safeHookName / clientSideTagFilter /
+ * Covers: AllocationHelper (mqSortKey / safeHookName / clientSideTagFilter /
  * executeFilterHooks / filterMessagesForDelivery / strategyName /
- * wireQueueKeyString / wireSplit）、MessageSelector、MessageQueueListener、
- * AllocateMessageQueueStrategy 六种实现（AVG / AVG_BY_CIRCLE / CONFIG /
- * CONSISTENT_HASH / MACHINE_ROOM / MACHINE_ROOM_NEARBY）、一致性哈希环
- * （MD5Hash / ClientNode / VirtualNode / ConsistentHashRouter）。
+ * wireQueueKeyString / wireSplit), MessageSelector, MessageQueueListener,
+ * the six AllocateMessageQueueStrategy implementations (AVG / AVG_BY_CIRCLE / CONFIG /
+ * CONSISTENT_HASH / MACHINE_ROOM / MACHINE_ROOM_NEARBY), and the consistent-hash ring
+ * primitives (MD5Hash / ClientNode / VirtualNode / ConsistentHashRouter).
  *
- * 运行：C:/Users/zhaoh/.workbuddy/binaries/php/versions/8.3/php.exe tests/RunClientAllocation.php
- * 全部通过输出 "ALL TESTS PASSED (N checks)"，任一失败列出明细并以非零码退出。
+ * Run: C:/Users/zhaoh/.workbuddy/binaries/php/versions/8.3/php.exe tests/RunClientAllocation.php
+ * On success prints "ALL TESTS PASSED (N checks)"; any failure lists details and exits non-zero.
  */
 
 require_once __DIR__ . '/../bootstrap.php';
@@ -44,9 +44,9 @@ use RocketMQ\Common\MessageExt;
 use RocketMQ\Common\MessageQueue;
 use RocketMQ\Common\SubscriptionData;
 
-// ==================================================================== 测试替身
+// ==================================================================== test doubles
 
-/** hookName() 与 filterMessage() 都抛异常的 FilterMessageHook（测 safeHookName 退化 + 吞异常）。 */
+/** FilterMessageHook whose hookName() and filterMessage() both throw (tests safeHookName fallback + exception swallowing). */
 final class BrokenHook implements FilterMessageHook
 {
     public int $calls = 0;
@@ -63,7 +63,7 @@ final class BrokenHook implements FilterMessageHook
     }
 }
 
-/** 正常记录调用的 FilterMessageHook。 */
+/** FilterMessageHook that records calls normally. */
 final class RecordingFilterHook2 implements FilterMessageHook
 {
     public int $calls = 0;
@@ -81,7 +81,7 @@ final class RecordingFilterHook2 implements FilterMessageHook
     }
 }
 
-/** 把 msgList 里带指定 tag 的消息全部摘掉的钩子（模拟裁剪）。 */
+/** Hook that strips every message carrying the given tag from msgList (simulates pruning). */
 final class PruningFilterHook implements FilterMessageHook
 {
     public function __construct(private readonly string $tagToRemove)
@@ -105,7 +105,7 @@ final class PruningFilterHook implements FilterMessageHook
     }
 }
 
-/** MessageQueueListener 替身：记录最近一次回调。 */
+/** MessageQueueListener double: records the most recent callback. */
 final class RecordingListener implements MessageQueueListener
 {
     public ?array $last = null;
@@ -116,7 +116,7 @@ final class RecordingListener implements MessageQueueListener
     }
 }
 
-/** 只有 allocate 的鸭子类型策略（无 getName，测 strategyName 退化）。 */
+/** Duck-typed strategy with only allocate (no getName; tests strategyName fallback). */
 final class DuckStrategy
 {
     public function allocate(string $g, string $cid, array $mqAll, array $cidAll): array
@@ -125,7 +125,7 @@ final class DuckStrategy
     }
 }
 
-/** 恒定哈希（所有 key 落同一个 hash），用于测 TreeMap.put 覆盖语义。 */
+/** Constant hash (every key lands on the same hash); used to test TreeMap.put override semantics. */
 final class ConstantHash implements HashFunction
 {
     public function __construct(private readonly int $value)
@@ -138,7 +138,7 @@ final class ConstantHash implements HashFunction
     }
 }
 
-/** 哈希 = 首个字符的 ord（区分度够用，测试可控）。 */
+/** Hash = ord of the first character (enough spread, test-controllable). */
 final class FirstCharHash implements HashFunction
 {
     public function hash(string $key): int
@@ -147,7 +147,7 @@ final class FirstCharHash implements HashFunction
     }
 }
 
-/** 机房解析替身：broker 名按 "room@xxx" 取前缀，消费者按映射表。 */
+/** Machine room resolver double: broker names take the prefix before "room@xxx", consumers use a lookup table. */
 final class StaticRoomResolver implements MachineRoomResolver
 {
     /** @param array<string, string> $consumerRooms */
@@ -171,7 +171,7 @@ final class StaticRoomResolver implements MachineRoomResolver
     }
 }
 
-/** 记录内层策略收到的入参（验证 MACHINE_ROOM_NEARBY 的分组口径）。 */
+/** Records the arguments the inner strategy received (verifies MACHINE_ROOM_NEARBY grouping). */
 final class RecordingInnerStrategy implements AllocateMessageQueueStrategy
 {
     /** @var list<array{group: string, cid: string, mqAll: list<MessageQueue>, cidAll: list<string>}> */
@@ -180,7 +180,7 @@ final class RecordingInnerStrategy implements AllocateMessageQueueStrategy
     public function allocate(string $consumerGroup, string $currentCID, array $mqAll, array $cidAll): array
     {
         $this->calls[] = ['group' => $consumerGroup, 'cid' => $currentCID, 'mqAll' => $mqAll, 'cidAll' => $cidAll];
-        return $mqAll; // 全量透传，方便断言分组
+        return $mqAll; // pass everything through to make group assertions easy
     }
 
     public function getName(): string
@@ -272,7 +272,7 @@ final class RunClientAllocation
         return $out;
     }
 
-    /** 取 result 里的 queueId 列表，便于断言。 */
+    /** Extracts the queueId list from a result, for assertions. */
     private function qids(array $mqs): array
     {
         $out = [];
@@ -306,9 +306,9 @@ final class RunClientAllocation
     private function testMqSortKey(): void
     {
         $mq = new MessageQueue('T', 'b', 3);
-        $this->checkSame(['T', 'b', 3], AllocationHelper::mqSortKey($mq), 'mqSortKey 返回 (topic, brokerName, queueId) 三元组');
+        $this->checkSame(['T', 'b', 3], AllocationHelper::mqSortKey($mq), 'mqSortKey returns the (topic, brokerName, queueId) triple');
 
-        // 打乱后按 key 排序 → topic → brokerName → queueId（三级字典序比较）
+        // shuffle then sort by key -> topic -> brokerName -> queueId (three-level lexicographic comparison)
         $list = [
             new MessageQueue('T2', 'b1', 0),
             new MessageQueue('T1', 'b2', 5),
@@ -321,10 +321,10 @@ final class RunClientAllocation
         $this->checkSame(
             [['T1', 'b0', 0], ['T1', 'b1', 2], ['T1', 'b1', 9], ['T1', 'b2', 5], ['T2', 'b1', 0]],
             array_map(fn (MessageQueue $m) => [$m->topic, $m->brokerName, $m->queueId], $list),
-            'mqSortKey 排序结果 topic→brokerName→queueId'
+            'mqSortKey sorts topic -> brokerName -> queueId'
         );
 
-        // 与 MessageQueue.compareTo 全序一致（随机-ish 组合抽查）
+        // total order agrees with MessageQueue.compareTo (spot-check random-ish combinations)
         $pairs = [
             [new MessageQueue('A', 'b', 0), new MessageQueue('B', 'a', 9)],
             [new MessageQueue('A', 'a', 0), new MessageQueue('A', 'b', 0)],
@@ -335,7 +335,7 @@ final class RunClientAllocation
             $this->checkSame(
                 $x->compareTo($y) <=> 0,
                 AllocationHelper::mqSortKey($x) <=> AllocationHelper::mqSortKey($y),
-                "mqSortKey 与 compareTo 全序一致 #{$i}"
+                "mqSortKey total order agrees with compareTo #{$i}"
             );
         }
     }
@@ -345,10 +345,10 @@ final class RunClientAllocation
     private function testSafeHookName(): void
     {
         $ok = new RecordingFilterHook2();
-        $this->checkSame('recording-filter-hook', AllocationHelper::safeHookName($ok), 'safeHookName 正常取 hookName');
+        $this->checkSame('recording-filter-hook', AllocationHelper::safeHookName($ok), 'safeHookName returns hookName normally');
 
         $broken = new BrokenHook();
-        $this->checkSame(BrokenHook::class, AllocationHelper::safeHookName($broken), 'safeHookName hookName 抛异常 → 类名');
+        $this->checkSame(BrokenHook::class, AllocationHelper::safeHookName($broken), 'safeHookName falls back to class name when hookName throws');
     }
 
     // ==================================================================== clientSideTagFilter
@@ -357,43 +357,43 @@ final class RunClientAllocation
     {
         $sub = $this->subWithTags(['TagA', 'TagB']);
 
-        $this->checkSame([], AllocationHelper::clientSideTagFilter($sub, []), '空消息列表原样返回');
-        $this->checkSame([], AllocationHelper::clientSideTagFilter(null, []), 'sub=null + 空列表原样返回');
+        $this->checkSame([], AllocationHelper::clientSideTagFilter($sub, []), 'empty message list returned as-is');
+        $this->checkSame([], AllocationHelper::clientSideTagFilter(null, []), 'sub=null + empty list returned as-is');
 
         $msgs = [$this->msgWithTags('TagA'), $this->msgWithTags('TagC'), $this->msgWithTags(null), $this->msgWithTags('TagB')];
         $out = AllocationHelper::clientSideTagFilter($sub, $msgs);
-        $this->checkSame(['TagA', 'TagB'], array_map(fn (MessageExt $m) => $m->getTags(), $out), '只保留 tagsSet 内且非 null tag 的消息');
-        $this->checkSame(4, count($msgs), 'clientSideTagFilter 不改输入数组');
+        $this->checkSame(['TagA', 'TagB'], array_map(fn (MessageExt $m) => $m->getTags(), $out), 'keeps only messages whose tag is in tagsSet and non-null');
+        $this->checkSame(4, count($msgs), 'clientSideTagFilter does not modify the input array');
 
-        // SUB_ALL（tagsSet 空）不过滤
+        // SUB_ALL (empty tagsSet) does not filter
         $subAll = new SubscriptionData('TopicTest', '*');
         $outAll = AllocationHelper::clientSideTagFilter($subAll, $msgs);
-        $this->checkSame($msgs, $outAll, 'tagsSet 空（SUB_ALL）不过滤');
+        $this->checkSame($msgs, $outAll, 'empty tagsSet (SUB_ALL) does not filter');
 
-        // class filter 模式不过滤
+        // class filter mode does not filter
         $subClass = $this->subWithTags(['TagA'], true);
         $outClass = AllocationHelper::clientSideTagFilter($subClass, $msgs);
-        $this->checkSame($msgs, $outClass, 'classFilterMode=true 不过滤');
+        $this->checkSame($msgs, $outClass, 'classFilterMode=true does not filter');
 
-        // sub=null 不过滤
-        $this->checkSame($msgs, AllocationHelper::clientSideTagFilter(null, $msgs), 'sub=null 不过滤');
+        // sub=null does not filter
+        $this->checkSame($msgs, AllocationHelper::clientSideTagFilter(null, $msgs), 'sub=null does not filter');
 
-        // 全被滤光
+        // everything filtered out
         $onlyC = [$this->msgWithTags('TagC')];
-        $this->checkSame([], AllocationHelper::clientSideTagFilter($sub, $onlyC), '全部不匹配 → 空列表');
+        $this->checkSame([], AllocationHelper::clientSideTagFilter($sub, $onlyC), 'all unmatched -> empty list');
     }
 
     // ==================================================================== filter hooks
 
     private function testFilterHooks(): void
     {
-        // 正常执行
+        // normal execution
         $ctx = new FilterMessageContext('G', [], null);
         $hook = new RecordingFilterHook2();
         AllocationHelper::executeFilterHooks([$hook], $ctx);
-        $this->checkSame(1, $hook->calls, 'executeFilterHooks 执行钩子');
+        $this->checkSame(1, $hook->calls, 'executeFilterHooks executes hooks');
 
-        // 异常吞掉 + 记 error，后续钩子照常
+        // exceptions swallowed + logged as error; later hooks still run
         $broken = new BrokenHook();
         $hook2 = new RecordingFilterHook2();
         $lines = [];
@@ -401,16 +401,16 @@ final class RunClientAllocation
             $lines[] = $line;
         });
         AllocationHelper::executeFilterHooks([$broken, $hook2], $ctx);
-        $this->checkSame(1, $broken->calls, 'filterMessage 被调且异常被吞（calls 自增后抛出，进程未中断）');
-        $this->checkSame(1, $hook2->calls, '钩子异常被吞，后续钩子照常执行');
-        $this->checkSame(1, count($lines), '钩子异常记一条 error 日志');
-        $this->check(str_contains($lines[0] ?? '', 'execute hook error'), 'error 日志前缀 execute hook error');
-        $this->check(str_contains($lines[0] ?? '', BrokenHook::class), 'error 日志带退化钩子名（类名）');
-        Logger::setHandler(static function (string $line): void {}); // 恢复静音
+        $this->checkSame(1, $broken->calls, 'filterMessage called and exception swallowed (calls incremented before throw, process not interrupted)');
+        $this->checkSame(1, $hook2->calls, 'hook exception swallowed, subsequent hooks still run');
+        $this->checkSame(1, count($lines), 'hook exception logs one error line');
+        $this->check(str_contains($lines[0] ?? '', 'execute hook error'), 'error log prefixed with execute hook error');
+        $this->check(str_contains($lines[0] ?? '', BrokenHook::class), 'error log includes fallback hook name (class name)');
+        Logger::setHandler(static function (string $line): void {}); // restore silence
 
-        // 空钩子列表 no-op
+        // empty hook list is a no-op
         $this->capture(fn () => AllocationHelper::executeFilterHooks([], $ctx));
-        $this->check(true, 'executeFilterHooks 空列表 no-op 不抛');
+        $this->check(true, 'executeFilterHooks empty list is a no-op without throwing');
     }
 
     // ==================================================================== filterMessagesForDelivery
@@ -420,40 +420,40 @@ final class RunClientAllocation
         $sub = $this->subWithTags(['TagA', 'TagB']);
         $mq = new MessageQueue('TopicTest', 'broker-a', 0);
 
-        // 纯 tag 过滤、无钩子
+        // pure tag filtering, no hooks
         $msgs = [$this->msgWithTags('TagA'), $this->msgWithTags('TagX')];
         $out = AllocationHelper::filterMessagesForDelivery('G', [], $mq, $sub, $msgs);
-        $this->checkSame(['TagA'], array_map(fn (MessageExt $m) => $m->getTags(), $out), '无钩子：仅 tag 过滤');
+        $this->checkSame(['TagA'], array_map(fn (MessageExt $m) => $m->getTags(), $out), 'no hooks: tag filtering only');
 
-        // 钩子收到 context：group/mq/unitMode/msgList
+        // hook receives context: group/mq/unitMode/msgList
         $hook = new RecordingFilterHook2();
         $out = AllocationHelper::filterMessagesForDelivery('G1', [$hook], $mq, $sub, $msgs, true);
-        $this->checkSame(1, $hook->calls, '有钩子且过滤后非空 → 钩子执行');
+        $this->checkSame(1, $hook->calls, 'hook runs when filter result is non-empty');
         $this->checkSame('G1', $hook->last->consumerGroup, 'FilterMessageContext.consumerGroup');
         $this->checkSame($mq, $hook->last->mq, 'FilterMessageContext.mq');
-        $this->check(true === $hook->last->unitMode, 'FilterMessageContext.unitMode 默认参数透传');
-        $this->checkSame(['TagA'], array_map(fn (MessageExt $m) => $m->getTags(), $hook->last->msgList), '钩子拿到的是过滤后的列表');
-        $this->checkSame(['TagA'], array_map(fn (MessageExt $m) => $m->getTags(), $out), '返回值 = 过滤结果');
+        $this->check(true === $hook->last->unitMode, 'FilterMessageContext.unitMode default parameter passed through');
+        $this->checkSame(['TagA'], array_map(fn (MessageExt $m) => $m->getTags(), $hook->last->msgList), 'hook receives the filtered list');
+        $this->checkSame(['TagA'], array_map(fn (MessageExt $m) => $m->getTags(), $out), 'return value = filtered result');
 
-        // unitMode 默认 false
+        // unitMode defaults to false
         $hook->last = null;
         AllocationHelper::filterMessagesForDelivery('G', [$hook], $mq, $sub, $msgs);
-        $this->check(false === $hook->last->unitMode, 'unitMode 缺省 false');
+        $this->check(false === $hook->last->unitMode, 'unitMode defaults to false');
 
-        // 钩子摘消息：返回值反映钩子改动（可变 msgList 语义）
+        // hook prunes messages: return value reflects hook changes (mutable msgList semantics)
         $prune = new PruningFilterHook('TagA');
         $out = AllocationHelper::filterMessagesForDelivery('G', [$prune], $mq, $sub, $msgs);
-        $this->checkSame([], $out, '钩子裁剪后返回值随动（可变 msgList）');
+        $this->checkSame([], $out, 'return value follows hook pruning (mutable msgList)');
 
-        // 过滤后为空 → 不走钩子
+        // filtered to empty -> hooks not run
         $hook2 = new RecordingFilterHook2();
         $out = AllocationHelper::filterMessagesForDelivery('G', [$hook2], $mq, $sub, [$this->msgWithTags('TagX')]);
-        $this->checkSame(0, $hook2->calls, 'tag 过滤后为空 → 钩子不执行');
-        $this->checkSame([], $out, '空输入 → 空输出');
+        $this->checkSame(0, $hook2->calls, 'tag filter leaves nothing -> hooks not run');
+        $this->checkSame([], $out, 'empty input -> empty output');
 
-        // 空消息列表 → 钩子不执行
+        // empty message list -> hooks not run
         $out = AllocationHelper::filterMessagesForDelivery('G', [$hook2], $mq, $sub, []);
-        $this->checkSame(0, $hook2->calls, '空 msgs → 钩子不执行');
+        $this->checkSame(0, $hook2->calls, 'empty msgs -> hooks not run');
     }
 
     // ==================================================================== MessageSelector
@@ -461,8 +461,8 @@ final class RunClientAllocation
     private function testMessageSelector(): void
     {
         $s = new MessageSelector();
-        $this->checkSame('TAG', $s->type, 'MessageSelector 默认 type=TAG');
-        $this->checkSame('*', $s->expression, 'MessageSelector 默认 expression="*"');
+        $this->checkSame('TAG', $s->type, 'MessageSelector defaults to type=TAG');
+        $this->checkSame('*', $s->expression, 'MessageSelector defaults to expression="*"');
 
         $tag = MessageSelector::byTag('TagA');
         $this->checkSame('TAG', $tag->type, 'byTag type=TAG');
@@ -472,8 +472,8 @@ final class RunClientAllocation
         $this->checkSame('SQL92', $sql->type, 'bySql type=SQL92');
         $this->checkSame('a > 1', $sql->expression, 'bySql expression');
 
-        $this->checkSame('TAG', \RocketMQ\Common\ExpressionType::TAG, 'ExpressionType.TAG 常量');
-        $this->checkSame('SQL92', \RocketMQ\Common\ExpressionType::SQL92, 'ExpressionType.SQL92 常量');
+        $this->checkSame('TAG', \RocketMQ\Common\ExpressionType::TAG, 'ExpressionType.TAG constant');
+        $this->checkSame('SQL92', \RocketMQ\Common\ExpressionType::SQL92, 'ExpressionType.SQL92 constant');
     }
 
     // ==================================================================== listener / strategy interface
@@ -483,14 +483,14 @@ final class RunClientAllocation
         $listener = new RecordingListener();
         $mqAll = $this->mqs(2);
         $listener->messageQueueChanged('T', $mqAll, [$mqAll[0]]);
-        $this->checkSame(['T', $mqAll, [$mqAll[0]]], $listener->last, 'MessageQueueListener 回调参数透传');
+        $this->checkSame(['T', $mqAll, [$mqAll[0]]], $listener->last, 'MessageQueueListener callback arguments passed through');
 
         $avg = new AllocateMessageQueueAveragely();
-        $this->checkSame('AVG', AllocationHelper::strategyName($avg), 'strategyName 走 getName');
-        $this->checkSame('RECORDING', AllocationHelper::strategyName(new RecordingInnerStrategy()), 'strategyName 接口实现');
+        $this->checkSame('AVG', AllocationHelper::strategyName($avg), 'strategyName uses getName');
+        $this->checkSame('RECORDING', AllocationHelper::strategyName(new RecordingInnerStrategy()), 'strategyName for interface implementations');
 
         $duck = new DuckStrategy();
-        $this->checkSame(DuckStrategy::class, AllocationHelper::strategyName($duck), 'strategyName 无 getName → 类名（鸭子类型）');
+        $this->checkSame(DuckStrategy::class, AllocationHelper::strategyName($duck), 'strategyName without getName -> class name (duck typing)');
 
         $exploder = new class () implements AllocateMessageQueueStrategy {
             public function allocate(string $consumerGroup, string $currentCID, array $mqAll, array $cidAll): array
@@ -503,8 +503,8 @@ final class RunClientAllocation
                 throw new RuntimeException('getName boom');
             }
         };
-        // PHP 8.3 匿名类名 = implements 的接口 FQCN + "@anonymous" + 文件行号
-        $this->check(str_contains(AllocationHelper::strategyName($exploder), '@anonymous'), 'strategyName getName 抛异常 → 类名兜底（匿名类名）');
+        // PHP 8.3 anonymous class name = implemented interface FQCN + "@anonymous" + file line number
+        $this->check(str_contains(AllocationHelper::strategyName($exploder), '@anonymous'), 'strategyName falls back to class name (anonymous class name) when getName throws');
     }
 
     // ==================================================================== AVG
@@ -514,43 +514,43 @@ final class RunClientAllocation
         $s = new AllocateMessageQueueAveragely();
         $this->checkSame('AVG', $s->getName(), 'AVG.getName');
 
-        // 守卫（入参非法时不抛异常，直接返回 []）
-        $this->checkSame([], $s->allocate('G', '', $this->mqs(8), ['c0', 'c1']), 'AVG currentCID 为空 → []');
-        $this->checkSame([], $s->allocate('G', 'c0', [], ['c0']), 'AVG mqAll 空 → []');
-        $this->checkSame([], $s->allocate('G', 'c0', $this->mqs(8), []), 'AVG cidAll 空 → []');
-        $this->checkSame([], $s->allocate('G', 'cX', $this->mqs(8), ['c0', 'c1']), 'AVG currentCID 不在 cidAll → []');
+        // guards (return [] instead of throwing on invalid input)
+        $this->checkSame([], $s->allocate('G', '', $this->mqs(8), ['c0', 'c1']), 'AVG empty currentCID -> []');
+        $this->checkSame([], $s->allocate('G', 'c0', [], ['c0']), 'AVG empty mqAll -> []');
+        $this->checkSame([], $s->allocate('G', 'c0', $this->mqs(8), []), 'AVG empty cidAll -> []');
+        $this->checkSame([], $s->allocate('G', 'cX', $this->mqs(8), ['c0', 'c1']), 'AVG currentCID not in cidAll -> []');
 
-        // 8 mq / 3 cid：mod=2 avg=2 → [0-2],[3-5],[6-7]
+        // 8 mq / 3 cid: mod=2 avg=2 -> [0-2],[3-5],[6-7]
         $mqAll = $this->mqs(8);
-        $this->checkSame([0, 1, 2], $this->qids($s->allocate('G', 'c0', $mqAll, ['c0', 'c1', 'c2'])), 'AVG 8/3 c0 → 0,1,2');
-        $this->checkSame([3, 4, 5], $this->qids($s->allocate('G', 'c1', $mqAll, ['c0', 'c1', 'c2'])), 'AVG 8/3 c1 → 3,4,5');
-        $this->checkSame([6, 7], $this->qids($s->allocate('G', 'c2', $mqAll, ['c0', 'c1', 'c2'])), 'AVG 8/3 c2 → 6,7');
+        $this->checkSame([0, 1, 2], $this->qids($s->allocate('G', 'c0', $mqAll, ['c0', 'c1', 'c2'])), 'AVG 8/3 c0 -> 0,1,2');
+        $this->checkSame([3, 4, 5], $this->qids($s->allocate('G', 'c1', $mqAll, ['c0', 'c1', 'c2'])), 'AVG 8/3 c1 -> 3,4,5');
+        $this->checkSame([6, 7], $this->qids($s->allocate('G', 'c2', $mqAll, ['c0', 'c1', 'c2'])), 'AVG 8/3 c2 -> 6,7');
 
-        // 6/3 整除
+        // 6/3 evenly divisible
         $mqAll = $this->mqs(6);
-        $this->checkSame([0, 1], $this->qids($s->allocate('G', 'c0', $mqAll, ['c0', 'c1', 'c2'])), 'AVG 6/3 c0 → 0,1');
-        $this->checkSame([2, 3], $this->qids($s->allocate('G', 'c1', $mqAll, ['c0', 'c1', 'c2'])), 'AVG 6/3 c1 → 2,3');
-        $this->checkSame([4, 5], $this->qids($s->allocate('G', 'c2', $mqAll, ['c0', 'c1', 'c2'])), 'AVG 6/3 c2 → 4,5');
+        $this->checkSame([0, 1], $this->qids($s->allocate('G', 'c0', $mqAll, ['c0', 'c1', 'c2'])), 'AVG 6/3 c0 -> 0,1');
+        $this->checkSame([2, 3], $this->qids($s->allocate('G', 'c1', $mqAll, ['c0', 'c1', 'c2'])), 'AVG 6/3 c1 -> 2,3');
+        $this->checkSame([4, 5], $this->qids($s->allocate('G', 'c2', $mqAll, ['c0', 'c1', 'c2'])), 'AVG 6/3 c2 -> 4,5');
 
-        // 5/5：每人一个
+        // 5/5: one each
         $mqAll = $this->mqs(5);
         foreach (range(0, 4) as $i) {
-            $this->checkSame([$i], $this->qids($s->allocate('G', "c{$i}", $mqAll, ['c0', 'c1', 'c2', 'c3', 'c4'])), "AVG 5/5 c{$i} → 单队列");
+            $this->checkSame([$i], $this->qids($s->allocate('G', "c{$i}", $mqAll, ['c0', 'c1', 'c2', 'c3', 'c4'])), "AVG 5/5 c{$i} -> single queue");
         }
 
-        // 2/5：avg=0 → 前 2 人各 1，其余空
+        // 2/5: avg=0 -> first 2 consumers get one each, the rest empty
         $mqAll = $this->mqs(2);
-        $this->checkSame([0], $this->qids($s->allocate('G', 'c0', $mqAll, ['c0', 'c1', 'c2', 'c3', 'c4'])), 'AVG 2/5 c0 → 0');
-        $this->checkSame([1], $this->qids($s->allocate('G', 'c1', $mqAll, ['c0', 'c1', 'c2', 'c3', 'c4'])), 'AVG 2/5 c1 → 1');
-        $this->checkSame([], $s->allocate('G', 'c2', $mqAll, ['c0', 'c1', 'c2', 'c3', 'c4']), 'AVG 2/5 c2 → []');
-        $this->checkSame([], $s->allocate('G', 'c4', $mqAll, ['c0', 'c1', 'c2', 'c3', 'c4']), 'AVG 2/5 c4 → []');
+        $this->checkSame([0], $this->qids($s->allocate('G', 'c0', $mqAll, ['c0', 'c1', 'c2', 'c3', 'c4'])), 'AVG 2/5 c0 -> 0');
+        $this->checkSame([1], $this->qids($s->allocate('G', 'c1', $mqAll, ['c0', 'c1', 'c2', 'c3', 'c4'])), 'AVG 2/5 c1 -> 1');
+        $this->checkSame([], $s->allocate('G', 'c2', $mqAll, ['c0', 'c1', 'c2', 'c3', 'c4']), 'AVG 2/5 c2 -> []');
+        $this->checkSame([], $s->allocate('G', 'c4', $mqAll, ['c0', 'c1', 'c2', 'c3', 'c4']), 'AVG 2/5 c4 -> []');
 
-        // 1/3：avg=0, mod=1
+        // 1/3: avg=0, mod=1
         $mqAll = $this->mqs(1);
-        $this->checkSame([0], $this->qids($s->allocate('G', 'c0', $mqAll, ['c0', 'c1', 'c2'])), 'AVG 1/3 c0 → 0');
-        $this->checkSame([], $s->allocate('G', 'c1', $mqAll, ['c0', 'c1', 'c2']), 'AVG 1/3 c1 → []');
+        $this->checkSame([0], $this->qids($s->allocate('G', 'c0', $mqAll, ['c0', 'c1', 'c2'])), 'AVG 1/3 c0 -> 0');
+        $this->checkSame([], $s->allocate('G', 'c1', $mqAll, ['c0', 'c1', 'c2']), 'AVG 1/3 c1 -> []');
 
-        // 分片互斥且并集完整（8/3）
+        // shards are disjoint and their union is complete (8/3)
         $mqAll = $this->mqs(8);
         $all = [];
         foreach (['c0', 'c1', 'c2'] as $cid) {
@@ -559,7 +559,7 @@ final class RunClientAllocation
             }
         }
         sort($all);
-        $this->checkSame(range(0, 7), $all, 'AVG 8/3 三人并集 = 全部队列且无重叠');
+        $this->checkSame(range(0, 7), $all, 'AVG 8/3: union of three consumers = all queues with no overlap');
     }
 
     // ==================================================================== AVG_BY_CIRCLE
@@ -569,31 +569,31 @@ final class RunClientAllocation
         $s = new AllocateMessageQueueAveragelyByCircle();
         $this->checkSame('AVG_BY_CIRCLE', $s->getName(), 'AVG_BY_CIRCLE.getName');
 
-        $this->checkSame([], $s->allocate('G', '', $this->mqs(8), ['c0']), 'CIRCLE currentCID 为空 → []');
-        $this->checkSame([], $s->allocate('G', 'c0', [], ['c0']), 'CIRCLE mqAll 空 → []');
-        $this->checkSame([], $s->allocate('G', 'c0', $this->mqs(8), []), 'CIRCLE cidAll 空 → []');
-        $this->checkSame([], $s->allocate('G', 'cX', $this->mqs(8), ['c0']), 'CIRCLE currentCID 不在 cidAll → []');
+        $this->checkSame([], $s->allocate('G', '', $this->mqs(8), ['c0']), 'CIRCLE empty currentCID -> []');
+        $this->checkSame([], $s->allocate('G', 'c0', [], ['c0']), 'CIRCLE empty mqAll -> []');
+        $this->checkSame([], $s->allocate('G', 'c0', $this->mqs(8), []), 'CIRCLE empty cidAll -> []');
+        $this->checkSame([], $s->allocate('G', 'cX', $this->mqs(8), ['c0']), 'CIRCLE currentCID not in cidAll -> []');
 
-        // 8/3 轮转：c0 → 0,3,6；c1 → 1,4,7；c2 → 2,5
+        // 8/3 round-robin: c0 -> 0,3,6; c1 -> 1,4,7; c2 -> 2,5
         $mqAll = $this->mqs(8);
-        $this->checkSame([0, 3, 6], $this->qids($s->allocate('G', 'c0', $mqAll, ['c0', 'c1', 'c2'])), 'CIRCLE 8/3 c0 → 0,3,6');
-        $this->checkSame([1, 4, 7], $this->qids($s->allocate('G', 'c1', $mqAll, ['c0', 'c1', 'c2'])), 'CIRCLE 8/3 c1 → 1,4,7');
-        $this->checkSame([2, 5], $this->qids($s->allocate('G', 'c2', $mqAll, ['c0', 'c1', 'c2'])), 'CIRCLE 8/3 c2 → 2,5');
+        $this->checkSame([0, 3, 6], $this->qids($s->allocate('G', 'c0', $mqAll, ['c0', 'c1', 'c2'])), 'CIRCLE 8/3 c0 -> 0,3,6');
+        $this->checkSame([1, 4, 7], $this->qids($s->allocate('G', 'c1', $mqAll, ['c0', 'c1', 'c2'])), 'CIRCLE 8/3 c1 -> 1,4,7');
+        $this->checkSame([2, 5], $this->qids($s->allocate('G', 'c2', $mqAll, ['c0', 'c1', 'c2'])), 'CIRCLE 8/3 c2 -> 2,5');
 
         // 2/5
         $mqAll = $this->mqs(2);
-        $this->checkSame([0], $this->qids($s->allocate('G', 'c0', $mqAll, ['c0', 'c1', 'c2', 'c3', 'c4'])), 'CIRCLE 2/5 c0 → 0');
-        $this->checkSame([1], $this->qids($s->allocate('G', 'c1', $mqAll, ['c0', 'c1', 'c2', 'c3', 'c4'])), 'CIRCLE 2/5 c1 → 1');
-        $this->checkSame([], $s->allocate('G', 'c2', $mqAll, ['c0', 'c1', 'c2', 'c3', 'c4']), 'CIRCLE 2/5 c2 → []');
+        $this->checkSame([0], $this->qids($s->allocate('G', 'c0', $mqAll, ['c0', 'c1', 'c2', 'c3', 'c4'])), 'CIRCLE 2/5 c0 -> 0');
+        $this->checkSame([1], $this->qids($s->allocate('G', 'c1', $mqAll, ['c0', 'c1', 'c2', 'c3', 'c4'])), 'CIRCLE 2/5 c1 -> 1');
+        $this->checkSame([], $s->allocate('G', 'c2', $mqAll, ['c0', 'c1', 'c2', 'c3', 'c4']), 'CIRCLE 2/5 c2 -> []');
 
-        // 与 AVG 结果不同（同样是 8/3）：确认两种算法真的分道
+        // differs from AVG result (same 8/3): confirm the two algorithms actually diverge
         $avg = new AllocateMessageQueueAveragely();
         $circle = new AllocateMessageQueueAveragelyByCircle();
         $mqAll = $this->mqs(8);
         $this->check(
             $this->qids($avg->allocate('G', 'c1', $mqAll, ['c0', 'c1', 'c2']))
                 !== $this->qids($circle->allocate('G', 'c1', $mqAll, ['c0', 'c1', 'c2'])),
-            '8/3 下 AVG 与 CIRCLE 给 c1 的分片不同'
+            'AVG and CIRCLE give c1 different shards at 8/3'
         );
     }
 
@@ -603,152 +603,152 @@ final class RunClientAllocation
     {
         $s = new AllocateMessageQueueByConfig();
         $this->checkSame('CONFIG', $s->getName(), 'CONFIG.getName');
-        $this->checkSame([], $s->allocate('G', 'c0', $this->mqs(4), ['c0']), 'CONFIG 默认空列表');
+        $this->checkSame([], $s->allocate('G', 'c0', $this->mqs(4), ['c0']), 'CONFIG default empty list');
 
-        // 不做 check：空 group / 空 cidAll 照样返回配置值
+        // no checks: empty group / empty cidAll still returns the configured value
         $cfg = [new MessageQueue('T', 'b', 7)];
         $s2 = new AllocateMessageQueueByConfig($cfg);
-        $this->checkSame([7], $this->qids($s2->allocate('', 'c0', [], [])), 'CONFIG 不做 check，空参照返');
-        $this->checkSame([7], $this->qids($s2->allocate('G', 'not-in-cids', [], [])), 'CONFIG currentCID 不在 cidAll 也返回配置');
+        $this->checkSame([7], $this->qids($s2->allocate('', 'c0', [], [])), 'CONFIG does no checks, returns config with empty references');
+        $this->checkSame([7], $this->qids($s2->allocate('G', 'not-in-cids', [], [])), 'CONFIG returns config even when currentCID not in cidAll');
 
-        // 返回值与内部列表隔离：外部改动返回值不影响后续 allocate
+        // return value isolated from the internal list: external mutation does not affect later allocate
         $cfg2 = [new MessageQueue('T', 'b', 1), new MessageQueue('T', 'b', 2)];
         $s3 = new AllocateMessageQueueByConfig($cfg2);
         $r1 = $s3->allocate('G', 'c0', [], []);
-        $r1[] = new MessageQueue('T', 'b', 99); // 改返回值
+        $r1[] = new MessageQueue('T', 'b', 99); // mutate the return value
         $r2 = $s3->allocate('G', 'c0', [], []);
-        $this->checkSame(2, count($r2), 'CONFIG 返回副本，外部改动不渗回内部列表');
-        $this->checkSame([1, 2], $this->qids($r2), 'CONFIG 多次调用结果一致');
+        $this->checkSame(2, count($r2), 'CONFIG returns a copy; external mutation does not leak into the internal list');
+        $this->checkSame([1, 2], $this->qids($r2), 'CONFIG returns consistent results across calls');
     }
 
-    // ==================================================================== 一致性哈希环基元
+    // ==================================================================== consistent-hash ring primitives
 
     private function testHashPrimitives(): void
     {
-        // MD5Hash：前 4 字节大端（已知向量逐字节核对）
+        // MD5Hash: first 4 bytes big-endian (checked byte-by-byte against known vectors)
         $h = new MD5Hash();
-        // md5("foo")   = acbd18db4cc2f85cedef654fccc4a4d8 → 0xACBD18DB
-        $this->checkSame(0xACBD18DB, $h->hash('foo'), 'MD5Hash("foo")=0xACBD18DB（前 4 字节大端）');
-        // md5("")      = d41d8cd98f00b204e9800998ecf8427e → 0xD41D8CD9
+        // md5("foo")   = acbd18db4cc2f85cedef654fccc4a4d8 -> 0xACBD18DB
+        $this->checkSame(0xACBD18DB, $h->hash('foo'), 'MD5Hash("foo")=0xACBD18DB (first 4 bytes big-endian)');
+        // md5("")      = d41d8cd98f00b204e9800998ecf8427e -> 0xD41D8CD9
         $this->checkSame(0xD41D8CD9, $h->hash(''), 'MD5Hash("")=0xD41D8CD9');
-        // md5("hello") = 5d41402abc4b2a76b9719d911017c592 → 0x5D41402A
+        // md5("hello") = 5d41402abc4b2a76b9719d911017c592 -> 0x5D41402A
         $this->checkSame(0x5D41402A, $h->hash('hello'), 'MD5Hash("hello")=0x5D41402A');
-        // md5("MessageQueue [topic=T, brokerName=b, queueId=0]") = 218a9c35... → 0x218A9C35
-        $this->checkSame(0x218A9C35, $h->hash('MessageQueue [topic=T, brokerName=b, queueId=0]'), 'MD5Hash(队列键串形态) 向量');
-        $this->checkSame(2898073819, $h->hash('foo'), 'MD5Hash 结果是 32bit 无符号十进制（0xACBD18DB）');
-        $this->check(true === $h->hash('foo') >= 0, 'MD5Hash 恒非负');
+        // md5("MessageQueue [topic=T, brokerName=b, queueId=0]") = 218a9c35... -> 0x218A9C35
+        $this->checkSame(0x218A9C35, $h->hash('MessageQueue [topic=T, brokerName=b, queueId=0]'), 'MD5Hash (queue key-string shape) vector');
+        $this->checkSame(2898073819, $h->hash('foo'), 'MD5Hash result is an unsigned 32-bit decimal (0xACBD18DB)');
+        $this->check(true === $h->hash('foo') >= 0, 'MD5Hash is always non-negative');
 
         // ClientNode
         $n = new ClientNode('cid-1');
         $this->checkSame('cid-1', $n->getKey(), 'ClientNode.getKey=clientId');
-        $this->check(true === $n instanceof Node, 'ClientNode 实现 Node');
+        $this->check(true === $n instanceof Node, 'ClientNode implements Node');
 
         // VirtualNode
         $v = new VirtualNode($n, 3);
-        $this->checkSame('cid-1-3', $v->getKey(), 'VirtualNode key = 物理 key + "-" + 序号');
-        $this->check(true === $v instanceof Node, 'VirtualNode 实现 Node');
+        $this->checkSame('cid-1-3', $v->getKey(), 'VirtualNode key = physical key + "-" + index');
+        $this->check(true === $v instanceof Node, 'VirtualNode implements Node');
         $this->checkSame('cid-1', $v->getPhysicalNode()->getKey(), 'VirtualNode.getPhysicalNode');
-        $this->check(true === $v->isVirtualNodeOf($n), 'isVirtualNodeOf 按物理 key 判定');
-        $this->check(false === $v->isVirtualNodeOf(new ClientNode('cid-2')), 'isVirtualNodeOf 不同物理节点 → false');
+        $this->check(true === $v->isVirtualNodeOf($n), 'isVirtualNodeOf matches by physical key');
+        $this->check(false === $v->isVirtualNodeOf(new ClientNode('cid-2')), 'isVirtualNodeOf different physical node -> false');
         $v0 = new VirtualNode($n, 0);
-        $this->checkSame('cid-1-0', $v0->getKey(), 'VirtualNode 序号 0 命名');
+        $this->checkSame('cid-1-0', $v0->getKey(), 'VirtualNode index 0 naming');
     }
 
     // ==================================================================== ConsistentHashRouter
 
     private function testConsistentHashRouter(): void
     {
-        // 空环 → null
+        // empty ring -> null
         $router = new ConsistentHashRouter([], 3, new FirstCharHash());
-        $this->checkSame(null, $router->routeNode('anything'), '空环 routeNode → null');
-        $this->checkSame(null, (new ConsistentHashRouter())->routeNode('x'), '默认构造（无节点）routeNode → null');
+        $this->checkSame(null, $router->routeNode('anything'), 'empty ring routeNode -> null');
+        $this->checkSame(null, (new ConsistentHashRouter())->routeNode('x'), 'default construction (no nodes) routeNode -> null');
 
-        // vNodeCount 负数 → ValueError（构造守卫拒绝负值）
+        // negative vNodeCount -> ValueError (constructor guard rejects negative values)
         $router = new ConsistentHashRouter();
-        $this->checkThrows(fn () => $router->addNode(new ClientNode('c'), -1), \ValueError::class, 'addNode vNodeCount<0 → ValueError');
+        $this->checkThrows(fn () => $router->addNode(new ClientNode('c'), -1), \ValueError::class, 'addNode vNodeCount<0 -> ValueError');
 
-        // 基本路由：hash 落在哪个物理节点的弧段
+        // basic routing: which physical node's arc the hash falls into
         $r = new ConsistentHashRouter([new ClientNode('a'), new ClientNode('b'), new ClientNode('c')], 5, new FirstCharHash());
-        $node = $r->routeNode('a-0'); // hash=ord('a')=97，环上有 a-0 的 hash=97 → 归 a（有序环取首个 ≥ 目标，含端点）
-        $this->checkSame('a', $node->getKey(), 'routeNode 端点相等归自己（首个 ≥ 命中含端点）');
-        $node = $r->routeNode('b-9'); // hash=ord('b')=98 → 归 b
-        $this->checkSame('b', $node->getKey(), 'routeNode 命中 b 节点');
-        $node = $r->routeNode('z-1'); // hash=ord('z')=122 > 全环 → 回绕到首节点
-        $this->checkSame('a', $node->getKey(), 'routeNode 越过末尾回绕到 firstKey');
+        $node = $r->routeNode('a-0'); // hash=ord('a')=97, ring has a-0 with hash=97 -> goes to a (ordered ring takes first >= target, inclusive)
+        $this->checkSame('a', $node->getKey(), 'routeNode endpoint equality maps to itself (first >= hit is inclusive)');
+        $node = $r->routeNode('b-9'); // hash=ord('b')=98 -> goes to b
+        $this->checkSame('b', $node->getKey(), 'routeNode hits node b');
+        $node = $r->routeNode('z-1'); // hash=ord('z')=122 > whole ring -> wraps around to the first node
+        $this->checkSame('a', $node->getKey(), 'routeNode wraps around to firstKey past the end');
 
-        // 路由确定性
-        $this->checkSame($r->routeNode('b-9')->getKey(), $r->routeNode('b-9')->getKey(), 'routeNode 确定性');
+        // routing determinism
+        $this->checkSame($r->routeNode('b-9')->getKey(), $r->routeNode('b-9')->getKey(), 'routeNode is deterministic');
 
-        // 虚拟节点总数 & existingReplicas（MD5Hash 无碰撞，副本数可数）
+        // total virtual nodes & existingReplicas (MD5Hash has no collisions, replica count is countable)
         $r2 = new ConsistentHashRouter([], 0, new MD5Hash());
         $a = new ClientNode('a');
         $r2->addNode($a, 4);
-        $this->checkSame(4, $r2->getExistingReplicas($a), 'addNode 后 existingReplicas=4');
-        $r2->addNode($a, 2); // 已有副本接着编号（i + existingReplicas）
-        $this->checkSame(6, $r2->getExistingReplicas($a), '二次 addNode 副本接着编号 → 6');
+        $this->checkSame(4, $r2->getExistingReplicas($a), 'existingReplicas=4 after addNode');
+        $r2->addNode($a, 2); // new replicas continue numbering (i + existingReplicas)
+        $this->checkSame(6, $r2->getExistingReplicas($a), 'second addNode continues numbering -> 6');
         $r2->addNode(new ClientNode('b'), 3);
-        $this->checkSame(6, $r2->getExistingReplicas($a), '别的节点加入不影响 a 的副本数');
-        $this->checkSame(3, $r2->getExistingReplicas(new ClientNode('b')), 'b 的副本数=3');
+        $this->checkSame(6, $r2->getExistingReplicas($a), 'another node joining does not affect a replica count');
+        $this->checkSame(3, $r2->getExistingReplicas(new ClientNode('b')), 'b has 3 replicas');
 
         // removeNode
         $r2->removeNode($a);
-        $this->checkSame(0, $r2->getExistingReplicas($a), 'removeNode 清空物理节点全部虚拟节点');
-        $this->checkSame(3, $r2->getExistingReplicas(new ClientNode('b')), 'removeNode 不误伤其它节点');
-        $r2->removeNode($a); // 再删一次 no-op
-        $this->checkSame(3, $r2->getExistingReplicas(new ClientNode('b')), 'removeNode 幂等');
+        $this->checkSame(0, $r2->getExistingReplicas($a), 'removeNode clears all virtual nodes of the physical node');
+        $this->checkSame(3, $r2->getExistingReplicas(new ClientNode('b')), 'removeNode does not touch other nodes');
+        $r2->removeNode($a); // removing again is a no-op
+        $this->checkSame(3, $r2->getExistingReplicas(new ClientNode('b')), 'removeNode is idempotent');
 
-        // 同 hash 覆盖（有序 map：后来者覆盖值，环上位置不变）
+        // same-hash override (ordered map: later value overrides, ring position unchanged)
         $r3 = new ConsistentHashRouter([], 1, new ConstantHash(42));
         $r3->addNode(new ClientNode('p1'), 1);
         $r3->addNode(new ClientNode('p2'), 1);
         $node = $r3->routeNode('whatever');
-        $this->checkSame('p2', $node->getKey(), '同 hash 后来者覆盖（TreeMap.put 语义）');
-        $this->checkSame(0, $r3->getExistingReplicas(new ClientNode('p1')), '同 hash 覆盖后 p1 副本被换掉');
-        $this->checkSame(1, $r3->getExistingReplicas(new ClientNode('p2')), '同 hash 覆盖后 p2 占住位置');
+        $this->checkSame('p2', $node->getKey(), 'same hash: later entry overrides (TreeMap.put semantics)');
+        $this->checkSame(0, $r3->getExistingReplicas(new ClientNode('p1')), 'after same-hash override p1 replicas are replaced');
+        $this->checkSame(1, $r3->getExistingReplicas(new ClientNode('p2')), 'after same-hash override p2 holds the position');
 
-        // ring 尺寸 = 节点数 × vNodeCount（hash 无碰撞时）
+        // ring size = node count x vNodeCount (when the hash has no collisions)
         $r4 = new ConsistentHashRouter(
             [new ClientNode('c0'), new ClientNode('c1'), new ClientNode('c2')],
             10,
             new MD5Hash()
         );
         $node = $r4->routeNode('MessageQueue [topic=T, brokerName=b, queueId=0]');
-        $this->check($node !== null && in_array($node->getKey(), ['c0', 'c1', 'c2'], true), '路由结果必是环上物理节点之一');
+        $this->check($node !== null && in_array($node->getKey(), ['c0', 'c1', 'c2'], true), 'routing result is always one of the ring physical nodes');
 
-        // 默认构造：MD5Hash；单节点 + 1 个虚拟节点 → 所有 key 都路由到它
+        // default constructor: MD5Hash; single node + 1 virtual node -> every key routes to it
         $r5 = new ConsistentHashRouter([new ClientNode('only')], 1);
-        $this->checkSame('only', $r5->routeNode('k')->getKey(), '单节点环任意 key 路由');
+        $this->checkSame('only', $r5->routeNode('k')->getKey(), 'single-node ring routes any key');
         $r5b = new ConsistentHashRouter([new ClientNode('only')], 0);
-        $this->checkSame(null, $r5b->routeNode('k'), 'vNodeCount=0 → 环空 → null');
+        $this->checkSame(null, $r5b->routeNode('k'), 'vNodeCount=0 -> empty ring -> null');
     }
 
     // ==================================================================== wireQueueKeyString / wireSplit
 
     private function testWireFormatCompat(): void
     {
-        // 队列键串格式 MessageQueue [topic=…, brokerName=…, queueId=…]，逐字符固定
+        // queue key-string format MessageQueue [topic=…, brokerName=…, queueId=…], fixed character-by-character
         $this->checkSame(
             'MessageQueue [topic=TopicTest, brokerName=broker-a, queueId=3]',
             AllocationHelper::wireQueueKeyString(new MessageQueue('TopicTest', 'broker-a', 3)),
-            'wireQueueKeyString 逐字符固定'
+            'wireQueueKeyString fixed character-by-character'
         );
         $this->checkSame(
             'MessageQueue [topic=, brokerName=, queueId=0]',
             AllocationHelper::wireQueueKeyString(new MessageQueue('', '', 0)),
-            'wireQueueKeyString 空字段'
+            'wireQueueKeyString empty fields'
         );
 
-        // wireSplit：JDK 17 实测语义表（见 docblock）
-        $this->checkSame(['room1'], AllocationHelper::wireSplit('room1@', '@'), 'wireSplit "room1@" → ["room1"]（剔尾空段）');
-        $this->checkSame(['room1', 'b'], AllocationHelper::wireSplit('room1@b@', '@'), 'wireSplit "room1@b@" → 2 段（剔尾空段）');
-        $this->checkSame([], AllocationHelper::wireSplit('@', '@'), 'wireSplit "@" → []');
-        $this->checkSame([''], AllocationHelper::wireSplit('', '@'), 'wireSplit "" 原样返回 [""]（Pattern#split 早返回）');
-        $this->checkSame(['broker-a'], AllocationHelper::wireSplit('broker-a', '@'), 'wireSplit 无分隔符命中 → 整串原样');
-        $this->checkSame(['a', '', 'b'], AllocationHelper::wireSplit('a@@b', '@'), 'wireSplit 中间空段保留');
-        $this->checkSame([], AllocationHelper::wireSplit('@@', '@'), 'wireSplit "@@" → []');
-        $this->checkSame(['a', 'b'], AllocationHelper::wireSplit('a@b', '@'), 'wireSplit 常规两段');
-        $this->checkSame(['a', 'b', 'c'], AllocationHelper::wireSplit('a@b@c', '@'), 'wireSplit 三段');
-        $this->checkSame(['', 'b'], AllocationHelper::wireSplit('@b', '@'), 'wireSplit 首空段保留');
+        // wireSplit: semantics table measured on JDK 17 (see docblock)
+        $this->checkSame(['room1'], AllocationHelper::wireSplit('room1@', '@'), 'wireSplit "room1@" -> ["room1"] (trailing empty segment removed)');
+        $this->checkSame(['room1', 'b'], AllocationHelper::wireSplit('room1@b@', '@'), 'wireSplit "room1@b@" -> 2 segments (trailing empty segment removed)');
+        $this->checkSame([], AllocationHelper::wireSplit('@', '@'), 'wireSplit "@" -> []');
+        $this->checkSame([''], AllocationHelper::wireSplit('', '@'), 'wireSplit "" returns [""] as-is (Pattern#split early return)');
+        $this->checkSame(['broker-a'], AllocationHelper::wireSplit('broker-a', '@'), 'wireSplit no separator hit -> whole string as-is');
+        $this->checkSame(['a', '', 'b'], AllocationHelper::wireSplit('a@@b', '@'), 'wireSplit keeps interior empty segments');
+        $this->checkSame([], AllocationHelper::wireSplit('@@', '@'), 'wireSplit "@@" -> []');
+        $this->checkSame(['a', 'b'], AllocationHelper::wireSplit('a@b', '@'), 'wireSplit regular two segments');
+        $this->checkSame(['a', 'b', 'c'], AllocationHelper::wireSplit('a@b@c', '@'), 'wireSplit three segments');
+        $this->checkSame(['', 'b'], AllocationHelper::wireSplit('@b', '@'), 'wireSplit keeps the leading empty segment');
     }
 
     // ==================================================================== CONSISTENT_HASH
@@ -758,23 +758,23 @@ final class RunClientAllocation
         $s = new AllocateMessageQueueConsistentHash();
         $this->checkSame('CONSISTENT_HASH', $s->getName(), 'CONSISTENT_HASH.getName');
 
-        // 构造守卫
-        $this->checkThrows(fn () => new AllocateMessageQueueConsistentHash(-1), \ValueError::class, 'CONSISTENT_HASH virtualNodeCnt<0 → ValueError');
-        $this->check(true === (new \ReflectionClass(AllocateMessageQueueConsistentHash::class))->getMethod('__construct')->getNumberOfParameters() >= 1, 'CONSISTENT_HASH 构造器参数存在');
+        // constructor guards
+        $this->checkThrows(fn () => new AllocateMessageQueueConsistentHash(-1), \ValueError::class, 'CONSISTENT_HASH virtualNodeCnt<0 -> ValueError');
+        $this->check(true === (new \ReflectionClass(AllocateMessageQueueConsistentHash::class))->getMethod('__construct')->getNumberOfParameters() >= 1, 'CONSISTENT_HASH constructor parameter exists');
         try {
             new AllocateMessageQueueConsistentHash(-5);
         } catch (\ValueError $e) {
-            $this->check(str_contains($e->getMessage(), 'illegal virtualNodeCnt'), 'ValueError 文案带 illegal virtualNodeCnt');
+            $this->check(str_contains($e->getMessage(), 'illegal virtualNodeCnt'), 'ValueError message contains illegal virtualNodeCnt');
         }
 
-        // 守卫
+        // guards
         $mqAll = $this->mqs(8);
-        $this->checkSame([], $s->allocate('G', '', $mqAll, ['c0', 'c1']), 'CONSISTENT_HASH currentCID 空 → []');
-        $this->checkSame([], $s->allocate('G', 'c0', [], ['c0', 'c1']), 'CONSISTENT_HASH mqAll 空 → []');
-        $this->checkSame([], $s->allocate('G', 'c0', $mqAll, []), 'CONSISTENT_HASH cidAll 空 → []');
-        $this->checkSame([], $s->allocate('G', 'cX', $mqAll, ['c0', 'c1']), 'CONSISTENT_HASH currentCID 不在 cidAll → []');
+        $this->checkSame([], $s->allocate('G', '', $mqAll, ['c0', 'c1']), 'CONSISTENT_HASH empty currentCID -> []');
+        $this->checkSame([], $s->allocate('G', 'c0', [], ['c0', 'c1']), 'CONSISTENT_HASH empty mqAll -> []');
+        $this->checkSame([], $s->allocate('G', 'c0', $mqAll, []), 'CONSISTENT_HASH empty cidAll -> []');
+        $this->checkSame([], $s->allocate('G', 'cX', $mqAll, ['c0', 'c1']), 'CONSISTENT_HASH currentCID not in cidAll -> []');
 
-        // 分配基本性质：确定、互斥、并集完整
+        // basic allocation properties: deterministic, disjoint, union complete
         $mqAll = $this->mqs(8);
         $cids = ['c0', 'c1', 'c2'];
         $buckets = [];
@@ -788,15 +788,15 @@ final class RunClientAllocation
             }
         }
         sort($union);
-        $this->checkSame(range(0, 7), $union, 'CONSISTENT_HASH 8 队列 3 消费者：并集完整');
-        $this->checkSame(count($union), count(array_unique($union)), 'CONSISTENT_HASH 无重叠（每队列恰好一个主）');
+        $this->checkSame(range(0, 7), $union, 'CONSISTENT_HASH 8 queues 3 consumers: union complete');
+        $this->checkSame(count($union), count(array_unique($union)), 'CONSISTENT_HASH no overlap (each queue has exactly one owner)');
         $this->checkSame(
             $this->qids((new AllocateMessageQueueConsistentHash())->allocate('G', 'c1', $mqAll, $cids)),
             $buckets['c1'],
-            'CONSISTENT_HASH 确定性（同参重跑一致）'
+            'CONSISTENT_HASH deterministic (same args, same result)'
         );
 
-        // 稳定性：新增消费者只会从原有分片里「拿走」，存量归属不变（一致性哈希的稳定性判据）
+        // stability: adding a consumer only "takes away" from existing shards; existing ownership is unchanged (consistency-hash stability criterion)
         $mqAll = $this->mqs(20);
         $three = ['c0', 'c1', 'c2'];
         $four = ['c0', 'c1', 'c2', 'c3'];
@@ -805,26 +805,26 @@ final class RunClientAllocation
             $after = $this->qids((new AllocateMessageQueueConsistentHash())->allocate('G', $cid, $mqAll, $four));
             $this->check(
                 $after === array_values(array_intersect($before, $after)) && count($after) <= count($before),
-                "CONSISTENT_HASH 加入 c3 后 {$cid} 的存量归属只减不增"
+                "CONSISTENT_HASH: after c3 joins, {$cid} keeps only a subset of its previous queues"
             );
         }
         $c3 = $this->qids((new AllocateMessageQueueConsistentHash())->allocate('G', 'c3', $mqAll, $four));
-        $this->check(count($c3) > 0, 'CONSISTENT_HASH 新消费者 c3 分到队列');
+        $this->check(count($c3) > 0, 'CONSISTENT_HASH new consumer c3 gets queues');
 
-        // 自定义哈希注入真的生效
+        // custom hash injection really takes effect
         $constMq = $this->mqs(3);
         $allConst = new AllocateMessageQueueConsistentHash(1, new ConstantHash(7));
         $got = $this->qids($allConst->allocate('G', 'c1', $constMq, ['c0', 'c1']));
-        $this->checkSame([0, 1, 2], $got, '自定义 ConstantHash：环上只有一个落点，全队列归后加者');
+        $this->checkSame([0, 1, 2], $got, 'custom ConstantHash: single landing point on the ring, all queues go to the later entrant');
 
-        // 默认虚拟节点数 = 10（缺省配置）
+        // default virtual node count = 10 (default configuration)
         $ref = new \ReflectionClass(AllocateMessageQueueConsistentHash::class);
         $ctor = $ref->getMethod('__construct');
-        $this->checkSame(10, $ctor->getParameters()[0]->getDefaultValue(), 'CONSISTENT_HASH 默认 virtualNodeCnt=10');
+        $this->checkSame(10, $ctor->getParameters()[0]->getDefaultValue(), 'CONSISTENT_HASH default virtualNodeCnt=10');
 
-        // 单消费者：全部分给自己
+        // single consumer: everything goes to itself
         $solo = new AllocateMessageQueueConsistentHash();
-        $this->checkSame(range(0, 4), $this->qids($solo->allocate('G', 'only', $this->mqs(5), ['only'])), 'CONSISTENT_HASH 单消费者全量');
+        $this->checkSame(range(0, 4), $this->qids($solo->allocate('G', 'only', $this->mqs(5), ['only'])), 'CONSISTENT_HASH single consumer takes everything');
     }
 
     // ==================================================================== MACHINE_ROOM
@@ -838,92 +838,92 @@ final class RunClientAllocation
             ['T', 'room1@broker-a', 0],
             ['T', 'room1@broker-b', 1],
             ['T', 'room2@broker-c', 2],
-            ['T', 'broker-x', 3],       // 无 @ → 不参与
-            ['T', 'room1@', 4],         // consumeridcs 切出 1 段 → 不参与
-            ['T', 'room1@b@', 5],       // consumeridcs 切出 2 段 → 参与
-            ['T', 'room3@broker-d', 6], // 机房不在 consumeridcs → 不参与
+            ['T', 'broker-x', 3],       // no @ -> not eligible
+            ['T', 'room1@', 4],         // consumeridcs split yields 1 segment -> not eligible
+            ['T', 'room1@b@', 5],       // consumeridcs split yields 2 segments -> eligible
+            ['T', 'room3@broker-d', 6], // room not in consumeridcs -> not eligible
         ]);
 
-        // 4 条参与（0,1,5 + …），3 个消费者：mod=1 rem=1
-        $this->checkSame([0], $this->qids($s->allocate('G', 'c0', $mqAll, ['c0', 'c1', 'c2'])), 'MACHINE_ROOM c0 → 首条参与队列+余数');
+        // 4 eligible entries (0,1,5 + …), 3 consumers: mod=1 rem=1
+        $this->checkSame([0], $this->qids($s->allocate('G', 'c0', $mqAll, ['c0', 'c1', 'c2'])), 'MACHINE_ROOM c0 -> first eligible queue + remainder');
         $this->checkSame([1], $this->qids($s->allocate('G', 'c1', $mqAll, ['c0', 'c1', 'c2'])), 'MACHINE_ROOM c1');
         $this->checkSame([5], $this->qids($s->allocate('G', 'c2', $mqAll, ['c0', 'c1', 'c2'])), 'MACHINE_ROOM c2');
 
-        // 精确核对参与集合 = {0,1,5}：用 1 个消费者全量接
-        $this->checkSame([0, 1, 5], $this->qids($s->allocate('G', 'c0', $mqAll, ['c0'])), 'MACHINE_ROOM 参与集合 = room1@ 且 wireSplit 后 2 段');
+        // verify the eligible set = {0,1,5} exactly: one consumer takes all
+        $this->checkSame([0, 1, 5], $this->qids($s->allocate('G', 'c0', $mqAll, ['c0'])), 'MACHINE_ROOM eligible set = room1@ with 2 segments after wireSplit');
 
-        // rem 归属判据：rem > currentIndex（余数发给前 rem 个消费者）
+        // rem ownership criterion: rem > currentIndex (remainder goes to the first rem consumers)
         $s2 = new AllocateMessageQueueByMachineRoom(['r']);
         $mqAll2 = $this->mqsBrokers([
             ['T', 'r@b0', 0], ['T', 'r@b1', 1], ['T', 'r@b2', 2], ['T', 'r@b3', 3], ['T', 'r@b4', 4],
         ]);
-        // 5 条 / 3 人：mod=1 rem=2 → c0:[p0,p3] c1:[p1,p4] c2:[p2]
-        $this->checkSame([0, 3], $this->qids($s2->allocate('G', 'c0', $mqAll2, ['c0', 'c1', 'c2'])), 'MACHINE_ROOM rem 判据 c0 → [p0,p3]');
-        $this->checkSame([1, 4], $this->qids($s2->allocate('G', 'c1', $mqAll2, ['c0', 'c1', 'c2'])), 'MACHINE_ROOM rem 判据 c1 → [p1,p4]');
-        $this->checkSame([2], $this->qids($s2->allocate('G', 'c2', $mqAll2, ['c0', 'c1', 'c2'])), 'MACHINE_ROOM rem 判据 c2 → [p2]');
+        // 5 entries / 3 consumers: mod=1 rem=2 -> c0:[p0,p3] c1:[p1,p4] c2:[p2]
+        $this->checkSame([0, 3], $this->qids($s2->allocate('G', 'c0', $mqAll2, ['c0', 'c1', 'c2'])), 'MACHINE_ROOM rem criterion c0 -> [p0,p3]');
+        $this->checkSame([1, 4], $this->qids($s2->allocate('G', 'c1', $mqAll2, ['c0', 'c1', 'c2'])), 'MACHINE_ROOM rem criterion c1 -> [p1,p4]');
+        $this->checkSame([2], $this->qids($s2->allocate('G', 'c2', $mqAll2, ['c0', 'c1', 'c2'])), 'MACHINE_ROOM rem criterion c2 -> [p2]');
 
-        // 守卫
-        $this->checkSame([], $s->allocate('G', '', $mqAll, ['c0']), 'MACHINE_ROOM currentCID 空 → []');
-        $this->checkSame([], $s->allocate('G', 'c0', [], ['c0']), 'MACHINE_ROOM mqAll 空 → []');
-        $this->checkSame([], $s->allocate('G', 'c0', $mqAll, []), 'MACHINE_ROOM cidAll 空 → []');
-        $this->checkSame([], $s->allocate('G', 'cX', $mqAll, ['c0']), 'MACHINE_ROOM currentCID 不在 cidAll → []');
+        // guards
+        $this->checkSame([], $s->allocate('G', '', $mqAll, ['c0']), 'MACHINE_ROOM empty currentCID -> []');
+        $this->checkSame([], $s->allocate('G', 'c0', [], ['c0']), 'MACHINE_ROOM empty mqAll -> []');
+        $this->checkSame([], $s->allocate('G', 'c0', $mqAll, []), 'MACHINE_ROOM empty cidAll -> []');
+        $this->checkSame([], $s->allocate('G', 'cX', $mqAll, ['c0']), 'MACHINE_ROOM currentCID not in cidAll -> []');
 
-        // consumeridcs 空 → 一条都不分（未设置时兜成空结果，不抛空指针）
+        // empty consumeridcs -> nothing allocated (defaults to an empty result instead of a null pointer)
         $sEmpty = new AllocateMessageQueueByMachineRoom();
-        $this->checkSame([], $sEmpty->allocate('G', 'c0', $mqAll, ['c0']), 'MACHINE_ROOM 未配置 consumeridcs → []');
-        $this->checkSame([], $sEmpty->getConsumeridcs(), 'MACHINE_ROOM 默认 consumeridcs 空');
+        $this->checkSame([], $sEmpty->allocate('G', 'c0', $mqAll, ['c0']), 'MACHINE_ROOM unconfigured consumeridcs -> []');
+        $this->checkSame([], $sEmpty->getConsumeridcs(), 'MACHINE_ROOM default consumeridcs is empty');
 
         // get/set
         $this->checkSame(['room1'], $s->getConsumeridcs(), 'getConsumeridcs');
         $s->setConsumeridcs(['r9', 'r8']);
-        $this->checkSame(['r9', 'r8'], $s->getConsumeridcs(), 'setConsumeridcs 覆盖');
+        $this->checkSame(['r9', 'r8'], $s->getConsumeridcs(), 'setConsumeridcs overwrites');
 
-        // 换机房后重新分配
+        // reallocate after switching rooms
         $s->setConsumeridcs(['room2']);
-        $this->checkSame([2], $this->qids($s->allocate('G', 'c0', $mqAll, ['c0'])), 'setConsumeridcs 换机房后参与集合随动');
+        $this->checkSame([2], $this->qids($s->allocate('G', 'c0', $mqAll, ['c0'])), 'eligible set follows setConsumeridcs after switching rooms');
     }
 
     // ==================================================================== MACHINE_ROOM_NEARBY
 
     private function testMachineRoomNearby(): void
     {
-        // 构造守卫：null 参数（非空类型声明 → TypeError）
+        // constructor guards: null arguments (non-nullable type declarations -> TypeError)
         $inner = new AllocateMessageQueueAveragely();
         $resolver = new StaticRoomResolver(['c0' => 'A', 'c1' => 'B']);
         $this->checkThrows(
             fn () => new AllocateMachineRoomNearby(null, $resolver),
             \TypeError::class,
-            'NEARBY strategy=null → TypeError'
+            'NEARBY strategy=null -> TypeError'
         );
         $this->checkThrows(
             fn () => new AllocateMachineRoomNearby($inner, null),
             \TypeError::class,
-            'NEARBY resolver=null → TypeError'
+            'NEARBY resolver=null -> TypeError'
         );
 
         $s = new AllocateMachineRoomNearby($inner, $resolver);
-        $this->checkSame('MACHINE_ROOM_NEARBY-AVG', $s->getName(), 'NEARBY.getName = 前缀 + 内层策略名');
+        $this->checkSame('MACHINE_ROOM_NEARBY-AVG', $s->getName(), 'NEARBY.getName = prefix + inner strategy name');
         $this->checkSame(
             'MACHINE_ROOM_NEARBY-CONSISTENT_HASH',
             (new AllocateMachineRoomNearby(new AllocateMessageQueueConsistentHash(), $resolver))->getName(),
-            'NEARBY.getName 内层策略名随动'
+            'NEARBY.getName follows the inner strategy name'
         );
 
-        // 守卫
+        // guards
         $mqAll = $this->mqsBrokers([
             ['T', 'A@b0', 0], ['T', 'A@b1', 1], ['T', 'B@b0', 2], ['T', 'B@b1', 3],
         ]);
-        $this->checkSame([], $s->allocate('G', '', $mqAll, ['c0', 'c1']), 'NEARBY currentCID 空 → []');
-        $this->checkSame([], $s->allocate('G', 'c0', [], ['c0']), 'NEARBY mqAll 空 → []');
-        $this->checkSame([], $s->allocate('G', 'c0', $mqAll, []), 'NEARBY cidAll 空 → []');
-        $this->checkSame([], $s->allocate('G', 'cX', $mqAll, ['c0', 'c1']), 'NEARBY currentCID 不在 cidAll → []');
+        $this->checkSame([], $s->allocate('G', '', $mqAll, ['c0', 'c1']), 'NEARBY empty currentCID -> []');
+        $this->checkSame([], $s->allocate('G', 'c0', [], ['c0']), 'NEARBY empty mqAll -> []');
+        $this->checkSame([], $s->allocate('G', 'c0', $mqAll, []), 'NEARBY empty cidAll -> []');
+        $this->checkSame([], $s->allocate('G', 'cX', $mqAll, ['c0', 'c1']), 'NEARBY currentCID not in cidAll -> []');
 
-        // 基本分组：A 机房队列只在 A 消费者间分
-        // c0(A): AVG(2 mqs, [c0]) → mq0,mq1；c1(B): AVG(2 mqs, [c1]) → mq2,mq3
-        $this->checkSame([0, 1], $this->qids($s->allocate('G', 'c0', $mqAll, ['c0', 'c1'])), 'NEARBY c0 只拿 A 机房队列');
-        $this->checkSame([2, 3], $this->qids($s->allocate('G', 'c1', $mqAll, ['c0', 'c1'])), 'NEARBY c1 只拿 B 机房队列');
+        // basic grouping: room-A queues are only divided among room-A consumers
+        // c0(A): AVG(2 mqs, [c0]) -> mq0,mq1; c1(B): AVG(2 mqs, [c1]) -> mq2,mq3
+        $this->checkSame([0, 1], $this->qids($s->allocate('G', 'c0', $mqAll, ['c0', 'c1'])), 'NEARBY c0 only gets room-A queues');
+        $this->checkSame([2, 3], $this->qids($s->allocate('G', 'c1', $mqAll, ['c0', 'c1'])), 'NEARBY c1 only gets room-B queues');
 
-        // 同机房多消费者：A@b0..3 四条队列，c0/c2 同在 A
+        // multiple consumers in the same room: four queues A@b0..3, c0/c2 both in A
         $resolver2 = new StaticRoomResolver(['c0' => 'A', 'c1' => 'B', 'c2' => 'A']);
         $s2 = new AllocateMachineRoomNearby($inner, $resolver2);
         $mqAll2 = $this->mqsBrokers([
@@ -931,75 +931,75 @@ final class RunClientAllocation
         ]);
         $got0 = $this->qids($s2->allocate('G', 'c0', $mqAll2, ['c0', 'c1', 'c2']));
         $got2 = $this->qids($s2->allocate('G', 'c2', $mqAll2, ['c0', 'c1', 'c2']));
-        $this->checkSame([0, 1], $got0, 'NEARBY A 机房 4 队列 2 人：c0 → [0,1]（AVG 4/2）');
-        $this->checkSame([2, 3], $got2, 'NEARBY c2 → [2,3]');
+        $this->checkSame([0, 1], $got0, 'NEARBY 4 queues 2 consumers in room A: c0 -> [0,1] (AVG 4/2)');
+        $this->checkSame([2, 3], $got2, 'NEARBY c2 -> [2,3]');
         $got1 = $this->qids($s2->allocate('G', 'c1', $mqAll2, ['c0', 'c1', 'c2']));
-        $this->checkSame([4], $got1, 'NEARBY c1 只拿 B 机房队列');
+        $this->checkSame([4], $got1, 'NEARBY c1 only gets room-B queues');
 
-        // 无活消费者机房 → 回落全量分配（并集完整）
+        // room with no active consumer -> falls back to allocating among all consumers (union complete)
         $resolver3 = new StaticRoomResolver(['c0' => 'A', 'c1' => 'B']);
         $s3 = new AllocateMachineRoomNearby($inner, $resolver3);
         $mqAll3 = $this->mqsBrokers([
             ['T', 'A@b0', 0], ['T', 'A@b1', 1],
             ['T', 'B@b0', 2],
-            ['T', 'C@b0', 3], ['T', 'C@b1', 4], // C 机房没有消费者
+            ['T', 'C@b0', 3], ['T', 'C@b1', 4], // room C has no consumers
         ]);
         $got0 = $this->qids($s3->allocate('G', 'c0', $mqAll3, ['c0', 'c1']));
         $got1 = $this->qids($s3->allocate('G', 'c1', $mqAll3, ['c0', 'c1']));
-        // c0: A 组 AVG(2 mqs,[c0])=[0,1] + C 组 AVG(2 mqs,[c0,c1]) c0=[3] → [0,1,3]
-        // c1: B 组 AVG(1 mq,[c1])=[2] + C 组 c1=[4] → [2,4]
-        $this->checkSame([0, 1, 3], $got0, 'NEARBY 无主机房 C 的队列回落给全体消费者（c0）');
-        $this->checkSame([2, 4], $got1, 'NEARBY 无主机房 C 的队列回落给全体消费者（c1）');
+        // c0: group A AVG(2 mqs,[c0])=[0,1] + group C AVG(2 mqs,[c0,c1]) c0=[3] -> [0,1,3]
+        // c1: group B AVG(1 mq,[c1])=[2] + group C c1=[4] -> [2,4]
+        $this->checkSame([0, 1, 3], $got0, 'NEARBY queues in owner-less room C fall back to all consumers (c0)');
+        $this->checkSame([2, 4], $got1, 'NEARBY queues in owner-less room C fall back to all consumers (c1)');
         $union = array_merge($got0, $got1);
         sort($union);
-        $this->checkSame(range(0, 4), $union, 'NEARBY 全量并集完整（含无主机房）');
+        $this->checkSame(range(0, 4), $union, 'NEARBY full union complete (including owner-less room)');
 
-        // 分组口径验证：内层策略收到的 mqAll/cidAll 确实按机房切过
+        // grouping verification: the mqAll/cidAll the inner strategy received really were split by room
         $rec = new RecordingInnerStrategy();
         $s4 = new AllocateMachineRoomNearby($rec, $resolver);
         $s4->allocate('G', 'c0', $mqAll, ['c0', 'c1']);
-        $this->checkSame(1, count($rec->calls), 'NEARBY 内层只被调一次（本机房命中）');
-        $this->checkSame([0, 1], $this->qids($rec->calls[0]['mqAll']), 'NEARBY 内层收到 A 机房队列组');
-        $this->checkSame(['c0'], $rec->calls[0]['cidAll'], 'NEARBY 内层收到同机房消费者组');
-        $this->checkSame('G', $rec->calls[0]['group'], 'NEARBY 内层透传 consumerGroup');
-        $this->checkSame('c0', $rec->calls[0]['cid'], 'NEARBY 内层透传 currentCID');
+        $this->checkSame(1, count($rec->calls), 'NEARBY inner strategy called once (own-room hit)');
+        $this->checkSame([0, 1], $this->qids($rec->calls[0]['mqAll']), 'NEARBY inner strategy receives the room-A queue group');
+        $this->checkSame(['c0'], $rec->calls[0]['cidAll'], 'NEARBY inner strategy receives the same-room consumer group');
+        $this->checkSame('G', $rec->calls[0]['group'], 'NEARBY inner strategy gets consumerGroup passed through');
+        $this->checkSame('c0', $rec->calls[0]['cid'], 'NEARBY inner strategy gets currentCID passed through');
 
-        // resolver 返回空机房 → ValueError（照抛，保住 rebalance 现有分配）
+        // resolver returns an empty room -> ValueError (rethrown as-is, preserving rebalance's existing allocation)
         $badResolver = new StaticRoomResolver(['c0' => 'A'], 'X@b9');
         $s5 = new AllocateMachineRoomNearby($inner, $badResolver);
         $this->checkThrows(
             fn () => $s5->allocate('G', 'c0', [new MessageQueue('T', 'X@b9', 0)], ['c0']),
             \ValueError::class,
-            'NEARBY 机房 broker 侧为空 → ValueError'
+            'NEARBY broker-side room empty -> ValueError'
         );
         try {
             $s5->allocate('G', 'c0', [new MessageQueue('T', 'X@b9', 0)], ['c0']);
         } catch (\ValueError $e) {
-            $this->check(str_contains($e->getMessage(), 'Machine room is null for mq'), 'ValueError 文案 mq 侧');
-            $this->check(str_contains($e->getMessage(), 'MessageQueue [topic=T, brokerName=X@b9, queueId=0]'), 'ValueError 文案带队列键串形态');
+            $this->check(str_contains($e->getMessage(), 'Machine room is null for mq'), 'ValueError message for the mq side');
+            $this->check(str_contains($e->getMessage(), 'MessageQueue [topic=T, brokerName=X@b9, queueId=0]'), 'ValueError message includes the queue key-string shape');
         }
         $s6 = new AllocateMachineRoomNearby($inner, new StaticRoomResolver([]));
         $this->checkThrows(
             fn () => $s6->allocate('G', 'c0', [new MessageQueue('T', 'A@b', 0)], ['c0']),
             \ValueError::class,
-            'NEARBY 机房 consumer 侧为空 → ValueError'
+            'NEARBY consumer-side room empty -> ValueError'
         );
         try {
             $s6->allocate('G', 'c0', [new MessageQueue('T', 'A@b', 0)], ['c0']);
         } catch (\ValueError $e) {
-            $this->check(str_contains($e->getMessage(), 'Machine room is null for consumer id c0'), 'ValueError 文案 consumer 侧');
+            $this->check(str_contains($e->getMessage(), 'Machine room is null for consumer id c0'), 'ValueError message for the consumer side');
         }
 
-        // 机房遍历按字典序（TreeMap 语义）：构造乱序插入，无主机房回落顺序可重跑一致
+        // rooms iterated in lexicographic order (TreeMap semantics): out-of-order insertion, deterministic owner-less fallback across runs
         $got0b = $this->qids($s3->allocate('G', 'c0', $mqAll3, ['c0', 'c1']));
-        $this->checkSame($got0, $got0b, 'NEARBY 结果确定（机房字典序遍历）');
+        $this->checkSame($got0, $got0b, 'NEARBY deterministic result (rooms iterated lexicographically)');
     }
 
     // ==================================================================== run
 
     public function run(): int
     {
-        Logger::setHandler(static function (string $line): void {}); // 静音 [BUG]/error 日志
+        Logger::setHandler(static function (string $line): void {}); // silence [BUG]/error logs
         $this->testMqSortKey();
         $this->testSafeHookName();
         $this->testClientSideTagFilter();

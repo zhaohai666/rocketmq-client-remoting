@@ -22,7 +22,8 @@ OTHER = "PinnedGuardLiveOther_%d" % STAMP
 GROUP = "GID_PinnedGuardLive_%d" % STAMP
 NS = "ns1"
 WTOPIC = "%s%%%s" % (NS, TOPIC)
-# 反腿的耗时上界：守卫是纯字符串比较，真机给 50ms 已留两个数量级余量
+# The upper bound on the duration of the negative leg: the guard is a pure string comparison, so
+# 50ms on a real machine already leaves two orders of magnitude of margin
 LOCAL_BUDGET_MS = 50.0
 SYNC_WORDING = "message's topic not equal mq's topic"
 ASYNC_WORDING = "Topic of the message does not match its target message queue"
@@ -65,7 +66,7 @@ def wait_until(fn, timeout: float = 10.0, step: float = 0.05) -> bool:
 
 def wait_offset(prod: DefaultMQProducer, mq: MessageQueue, want: int,
                 timeout: float = 5.0) -> int:
-    """等 maxOffset 涨到 want 再返回（broker 的 ConsumeQueue 派发比 SEND 回包慢几毫秒）。"""
+    """Wait until maxOffset reaches want and then return (the broker dispatches the ConsumeQueue a few milliseconds slower than the SEND reply)."""
     wait_until(lambda: prod.max_offset(mq) >= want, timeout)
     return prod.max_offset(mq)
 
@@ -78,7 +79,7 @@ def queue_zero(prod: DefaultMQProducer, topic: str) -> MessageQueue:
 
 
 def timed_send(prod: DefaultMQProducer, msg, mq: MessageQueue):
-    """跑一次定点同步发送，返回 (异常或 None, 耗时毫秒)。"""
+    """Run one pinned synchronous send and return (the exception or None, the elapsed milliseconds)."""
     began = time.monotonic()
     try:
         prod.send(msg, 3000, mq)
@@ -98,15 +99,17 @@ def main() -> int:
         prod.create_topic("TBW102", TOPIC, 4)
         prod.create_topic("TBW102", OTHER, 4)
         if not (wait_route(prod, TOPIC, 4) and wait_route(prod, OTHER, 4)):
-            check("S0 两条 topic 的路由都注册好了", False)
+            check("S0 the routes of both topics are registered", False)
             return 1
         mq0 = queue_zero(prod, TOPIC)
         broker = mq0.broker_name
-        # 反腿的目标队列：**真**队列（同 broker 上的另一条 topic queue 0）。
-        # 不存在的 broker/队列会先死在路由上，就分不清拒的是 topic 还是地址了。
+        # The target queue of the negative leg: a **real** queue (queue 0 of another topic on the
+        # same broker). A non-existent broker/queue would die on the route first, and then it would
+        # be impossible to tell whether the topic or the address was what got rejected.
         mq_other = queue_zero(prod, OTHER)
 
-        # 消费者先起：默认 CONSUME_FROM_FIRST_OFFSET，免得和发送抢 rebalance 的时间点
+        # Bring the consumer up first: the default CONSUME_FROM_FIRST_OFFSET, so that it does not race
+        # the sends for the rebalance timing
         received = []
         push = DefaultMQPushConsumer(GROUP)
         push.set_namesrv_addr(NAMESRV)
@@ -120,11 +123,11 @@ def main() -> int:
         push.set_message_listener(SimpleMessageListener(_collect))
         push.start()
 
-        # ---------------- S1 正腿：真路由队列上的定点发送 ----------------
-        print("=== S1 真实路由队列上的定点发送 ===")
+        # ---------------- S1 the positive leg: a pinned send onto a real routed queue ----------------
+        print("=== S1 pinned send onto a real routed queue ===")
         k_single = "pinned-live-single"
         r = prod.send(Message(TOPIC, b"s1-single", keys=k_single), 3000, mq0)
-        check("S1a 同步单条定点 SEND_OK 且落在队列 %d" % mq0.queue_id,
+        check("S1a the synchronous single pinned send got SEND_OK and landed in queue %d" % mq0.queue_id,
               r.send_status == SendStatus.SEND_OK
               and r.message_queue is not None
               and r.message_queue.queue_id == mq0.queue_id
@@ -133,60 +136,61 @@ def main() -> int:
         k_b1, k_b2 = "pinned-live-b1", "pinned-live-b2"
         rb = prod.send([Message(TOPIC, b"s1-b1", keys=k_b1),
                         Message(TOPIC, b"s1-b2", keys=k_b2)], 3000, mq0)
-        check("S1b 同步批量定点 SEND_OK 且同一队列",
+        check("S1b the synchronous batch pinned send got SEND_OK and the same queue",
               rb.send_status == SendStatus.SEND_OK
               and rb.message_queue is not None
               and rb.message_queue.queue_id == mq0.queue_id,
               "status=%s mq=%s" % (rb.send_status, rb.message_queue))
         off_after_s1 = wait_offset(prod, mq0, 3)
-        # 批量在消费队列上按**子消息**逐条落位（broker 收到 inner-batch 后拆开写）⇒ 2 条子消息涨 2
-        check("S1c 三笔子消息都真落库（maxOffset = 单条 1 + 批量子消息 2）",
+        # On the consume queue a batch is written per **sub-message** (the broker splits the inner batch
+        # apart after receiving it) => 2 sub-messages advance the offset by 2
+        check("S1c all three sub-messages really landed (maxOffset = 1 single + 2 batch sub-messages)",
               off_after_s1 == 3, "maxOffset=%d" % off_after_s1)
 
-        # ---------------- S2 反腿：同步拒绝，本端、无痕 ----------------
-        print("=== S2 topic 不符：本端亚毫秒拒，broker 上无痕 ===")
+        # ---------------- S2 the negative leg: rejected synchronously, locally and without a trace ----------------
+        print("=== S2 the topic does not match: rejected in sub-millisecond time locally, with no trace on the broker ===")
         e, elapsed = timed_send(prod, Message(TOPIC, b"refused", keys="pinned-live-refused"),
                                 mq_other)
-        check("S2a 同步单条拒（协议原文案）",
+        check("S2a the synchronous single send is rejected (with the protocol wording)",
               e is not None and str(e) == SYNC_WORDING,
-              "%.2fms %s" % (elapsed, str(e) if e else "没有抛异常"))
-        check("S2b 拒在本端：亚毫秒且无 broker 码（不是超时/不是 broker remark）",
+              "%.2fms %s" % (elapsed, str(e) if e else "no exception was raised"))
+        check("S2b the rejection happens locally: sub-millisecond and with no broker code (not a timeout / not a broker remark)",
               e is not None and elapsed < LOCAL_BUDGET_MS and e.response_code is None,
               "%.2fms code=%r" % (elapsed, None if e is None else e.response_code))
         e2, elapsed2 = timed_send(prod, [Message(TOPIC, b"r1"), Message(TOPIC, b"r2")],
                                   mq_other)
-        check("S2c 同步批量共用同一处守卫与同一句文案",
+        check("S2c the synchronous batch shares the same guard and the same wording",
               e2 is not None and str(e2) == SYNC_WORDING and elapsed2 < LOCAL_BUDGET_MS,
-              "%.2fms %s" % (elapsed2, str(e2) if e2 else "没有抛异常"))
-        check("S2d wire 反证：A 的 maxOffset 一动没动，B 上一条都没有",
+              "%.2fms %s" % (elapsed2, str(e2) if e2 else "no exception was raised"))
+        check("S2d wire-level counter-proof: the maxOffset of A did not move at all and B has not a single message",
               prod.max_offset(mq0) == off_after_s1 and prod.max_offset(mq_other) == 0,
               "A=%d B=%d" % (prod.max_offset(mq0), prod.max_offset(mq_other)))
 
-        # ---------------- S3 命名空间：wrap 幂等，只拒真的不同名 ----------------
-        print("=== S3 命名空间下的比较（ns%%topic 与裸 topic 都不误拒）===")
+        # ---------------- S3 the namespace: wrap is idempotent and only a genuinely different name is rejected ----------------
+        print("=== S3 the comparison under a namespace (neither ns%%topic nor a bare topic is falsely rejected) ===")
         nsprod = DefaultMQProducer("PG_PinnedGuardLive_%d_ns" % STAMP, namespace=NS)
         nsprod.set_namesrv_addr(NAMESRV)
         nsprod.start()
         nsprod.create_topic("TBW102", WTOPIC, 4)
-        check("S3a 带前缀 topic 的路由可用", wait_route(nsprod, WTOPIC, 4), "topic=%s" % WTOPIC)
+        check("S3a the route of the prefixed topic is usable", wait_route(nsprod, WTOPIC, 4), "topic=%s" % WTOPIC)
         mqw = queue_zero(nsprod, WTOPIC)
         k_ns1, k_ns2 = "pinned-live-ns-q", "pinned-live-ns-m"
         r1 = nsprod.send(Message(TOPIC, b"ns-wrapped-queue", keys=k_ns1), 3000, mqw)
-        check("S3b 队列 topic 已带 ns 前缀：wrap 幂等，不误拒",
+        check("S3b the queue topic already carries the ns prefix: wrap is idempotent and nothing is falsely rejected",
               r1.send_status == SendStatus.SEND_OK, "status=%s" % r1.send_status)
         r2 = nsprod.send(Message(WTOPIC, b"ns-wrapped-message", keys=k_ns2), 3000, mqw)
-        check("S3c 消息 topic 自己已带前缀同样放行",
+        check("S3c a message topic that carries the prefix itself is let through as well",
               r2.send_status == SendStatus.SEND_OK, "status=%s" % r2.send_status)
         e3, elapsed3 = timed_send(nsprod, Message(TOPIC, b"ns2-refused"),
                                   MessageQueue("ns2%%%s" % TOPIC, mqw.broker_name, 0))
-        check("S3d 换成 ns2%% 前缀才拒（对照腿：拒的是名字，不是「有前缀」）",
+        check('S3d only switching to the ns2%% prefix gets it rejected (the control leg: it is the name that is rejected, not "having a prefix")',
               e3 is not None and str(e3) == SYNC_WORDING and elapsed3 < LOCAL_BUDGET_MS,
-              "%.2fms %s" % (elapsed3, str(e3) if e3 else "没有抛异常"))
-        check("S3e 两条放行腿真落进 ns1%%topic（maxOffset=2）",
+              "%.2fms %s" % (elapsed3, str(e3) if e3 else "no exception was raised"))
+        check("S3e the two legs that were let through really landed in ns1%%topic (maxOffset=2)",
               wait_offset(nsprod, mqw, 2) == 2, "maxOffset=%d" % nsprod.max_offset(mqw))
 
-        # ---------------- S4 异步：回调里是异步那处文案 ----------------
-        print("=== S4 异步单条/批量：拒绝走回调，放行走内核 ===")
+        # ---------------- S4 asynchronous: the callback carries the wording of the asynchronous site ----------------
+        print("=== S4 asynchronous single/batch: a rejection goes through the callback, a pass goes through the core ===")
         events = []
 
         def _cb(tag):
@@ -204,16 +208,16 @@ def main() -> int:
                         _cb("single-refused"), 3000, mq_other)
         ok_ev = wait_until(lambda: event_of("single-refused")[0] is not None, 10)
         kind, payload = event_of("single-refused")
-        check("S4a 单条异步拒绝走回调、文案是异步那处",
+        check("S4a the asynchronous single rejection goes through the callback, with the wording of the asynchronous site",
               ok_ev and kind == "err" and str(payload) == ASYNC_WORDING,
               "%s %s" % (kind, payload))
-        check("S4b 拒后 maxOffset 仍不动（异步也没偷发）",
+        check("S4b after the rejection the maxOffset still does not move (the asynchronous path did not sneak a send through)",
               prod.max_offset(mq0) == off_after_s1, "maxOffset=%d" % prod.max_offset(mq0))
         prod.send_async([Message(TOPIC, b"abr1"), Message(TOPIC, b"abr2")],
                         _cb("batch-refused"), 3000, mq_other)
         wait_until(lambda: event_of("batch-refused")[0] is not None, 10)
         kind_b, payload_b = event_of("batch-refused")
-        check("S4c 批量异步共用同一处文案与同一条拒绝路径",
+        check("S4c the asynchronous batch shares the same wording and the same rejection path",
               kind_b == "err" and str(payload_b) == ASYNC_WORDING,
               "%s %s" % (kind_b, payload_b))
         k_as = "pinned-live-async-single"
@@ -226,38 +230,38 @@ def main() -> int:
                    and event_of("batch-ok")[0] is not None, 10)
         ok_s, res_s = event_of("single-ok")
         ok_b, res_b = event_of("batch-ok")
-        check("S4d 两条放行腿都 SEND_OK",
+        check("S4d both legs that were let through got SEND_OK",
               ok_s == "ok" and res_s.send_status == SendStatus.SEND_OK
               and ok_b == "ok" and res_b.send_status == SendStatus.SEND_OK,
               "single=%s batch=%s" % (res_s, res_b))
         off_after_async = wait_offset(prod, mq0, off_after_s1 + 3)
-        check("S4e 异步放行腿同样真落库（单条 1 + 批量子消息 2，maxOffset 再涨 3）",
+        check("S4e the asynchronous legs really landed too (1 single + 2 batch sub-messages, maxOffset advances by 3 again)",
               off_after_async == off_after_s1 + 3, "maxOffset=%d" % off_after_async)
 
-        print("=== S5 单向定点没有守卫：msg 自己的 topic 说了算 ===")
+        print("=== S5 a oneway pinned send has no guard: the topic of the msg itself decides ===")
         k_ow = "pinned-live-oneway"
         prod.send_oneway(Message(TOPIC, b"oneway", keys=k_ow), mq_other)
         landed = wait_until(lambda: prod.max_offset(mq0) == off_after_async + 1, 10)
-        check("S5a 单向定点没有守卫：报文按 msg 自己的 topic 落进 A",
+        check("S5a the oneway pinned send has no guard: the message landed in A according to its own topic",
               landed, "A maxOffset=%d" % prod.max_offset(mq0))
-        check("S5b 目标队列所在的 B 一条都没有（是设计上的口子，不是漏发）",
+        check("S5b B, where the target queue lives, has not a single message (this is a deliberate hole by design, not a missed send)",
               prod.max_offset(mq_other) == 0, "B maxOffset=%d" % prod.max_offset(mq_other))
 
-        # ---------------- S6 正腿收尾：消息一条不少 ----------------
-        print("=== S6 push 消费者收齐正腿消息 ===")
+        # ---------------- S6 the end of the positive leg: not a single message is missing ----------------
+        print("=== S6 the push consumer collects every positive-leg message ===")
         expected = [k_single, k_b1, k_b2, k_as, k_ab1, k_ab2, k_ow]
         deadline = time.time() + 40
         while time.time() < deadline and not all(k in received for k in expected):
             time.sleep(0.5)
         missing = [k for k in expected if k not in received]
-        check("S6 正腿消息一条不少地被消费到", not missing,
+        check("S6 every positive-leg message was consumed, none missing", not missing,
               "received=%s missing=%s" % (received, missing))
     finally:
         for c in (push, nsprod):
             if c is not None:
                 try:
                     c.shutdown()
-                except Exception:  # noqa: BLE001 - 收尾失败不掩盖主断言
+                except Exception:  # noqa: BLE001 - a failing teardown must not mask the main assertions
                     pass
         prod.shutdown()
 

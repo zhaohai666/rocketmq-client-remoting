@@ -5,11 +5,11 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * 用户侧消息模型：topic / body / 有序属性表 / flag / 延迟等级。
+ * User-side message model: topic / body / ordered property table / flag / delay level.
  */
 class Message
 {
-    /** @var array<string, string> 有序属性表 */
+    /** @var array<string, string> Ordered property table */
     public array $properties = [];
 
     public ?string $transactionId = null;
@@ -32,7 +32,7 @@ class Message
         }
     }
 
-    // ---- 属性 ----
+    // ---- Properties ----
 
     public function setTags(string $tags): void
     {
@@ -104,7 +104,7 @@ class Message
         $this->properties = [];
     }
 
-    // ---- getter / setter（属性名即协议字段名）----
+    // ---- getter / setter (property names are protocol field names) ----
 
     public function getTopic(): string
     {
@@ -159,13 +159,13 @@ class Message
     }
 
     /**
-     * WAIT 属性缺省即 true，其余值只有忽略大小写的 ``"true"`` 算真
-     * （broker 侧就按这个口径决定是否等刷盘再回包）。
+     * The WAIT property defaults to true; any other value is truthy only if it is the case-insensitive ``"true"``
+     * (the broker side uses this criterion to decide whether to wait for disk flush before responding).
      *
-     * ⚠ 别写成 ``getWaitStoreMsgOk() === "true"``。本类构造器**不**预写 ``WAIT``，
-     * 所以"属性缺省"是**常态而不是边角**：按 ``=== "true"`` 判会让普通消息变成
-     * ``WAIT=false``，``MessageBatch`` 就会以 ``WAIT=false`` 下发 ——
-     * broker 不等刷盘就回 ``SEND_OK``，持久性静默降级。
+     * WARNING: Do not write ``getWaitStoreMsgOk() === "true"``. This class's constructor does **not** pre-write ``WAIT``,
+     * so "property absent" is the **normal case, not an edge case**: judging with ``=== "true"`` would turn ordinary
+     * messages into ``WAIT=false``, and ``MessageBatch`` would then be sent with ``WAIT=false`` ——
+     * the broker would respond ``SEND_OK`` without waiting for disk flush, silently degrading durability.
      */
     public static function isWaitStoreMsgOk(Message $msg): bool
     {

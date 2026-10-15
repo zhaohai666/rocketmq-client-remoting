@@ -1,8 +1,8 @@
 // -*- coding: utf-8 -*-
-// 经典 remoting 协议的公共请求/响应 body。
-// 其中许多 body 含 Map<MessageQueue, X>，其 JSON 键是内联对象键（服务端 JSON
-// 序列化的非字符串键形态）；我们用 fastjson 兼容的 RemotingSerializable.decode
-// 和 messageQueueKey 辅助函数来往返解析它们。字段名与 wire 协议键完全一致。
+// Common request/response bodies for the classic remoting protocol.
+// Many bodies contain Map<MessageQueue, X> whose JSON keys are inline object keys (the server's
+// non-string-key JSON shape); we round-trip them with the fastjson-compatible RemotingSerializable.decode
+// and the messageQueueKey helper. Field names match the wire protocol keys exactly.
 import { MessageQueue } from '../common/message.ts';
 import { RemotingSerializable, decodeMessageQueueKey } from './serialize.ts';
 import { BrokerData, QueueData, TopicRouteData, brokerData2Json, topicRouteData2TopicRouteDataJson } from './route.ts';
@@ -14,7 +14,7 @@ export { BrokerData, QueueData, TopicRouteData, brokerData2Json, topicRouteData2
 export { SubscriptionGroupWrapper };
 
 // ---------------------------------------------------------------------------
-// MessageQueue <-> 内联 JSON 键的辅助函数。
+// MessageQueue <-> inline JSON key helper functions.
 // ---------------------------------------------------------------------------
 export function messageQueueKey(mq: MessageQueue): string {
   return `{"brokerName":"${mq.brokerName}","queueId":${mq.queueId},"topic":"${mq.topic}"}`;
@@ -615,7 +615,7 @@ export class ConsumerRunningInfo {
 }
 
 // ---------------------------------------------------------------------------
-// TopicConfig（bodies 与 admin 共用）。默认值：readQueueNums=16,
+// TopicConfig (shared by bodies and admin). Defaults: readQueueNums=16,
 // writeQueueNums=16, perm=6, topicFilterType=SINGLE_TAG, topicSysFlag=0,
 // order=false, attributes={}。
 // ---------------------------------------------------------------------------
@@ -678,10 +678,10 @@ export class TopicConfig {
       d['order'] === true,
     );
   }
-  // 注意：UPDATE_AND_CREATE_TOPIC 的 body 在服务端还有一套私有二进制 KV 编解码
-  // （TopicConfig readBody/writeBody），它不属于 RocketMQSerializable 的
-  // 通用序列化范围；这里不实现该编解码，encode/decode 统一走 JSON，与其余
-  // body 保持一致。
+  // Note: the UPDATE_AND_CREATE_TOPIC body also has a private binary KV codec on the server side
+  // (TopicConfig readBody/writeBody) which is outside the general-purpose RocketMQSerializable
+  // serialization scope; we do not implement that codec here and keep encode/decode on JSON, consistent
+  // with the other bodies.
   encode(): Buffer { return RemotingSerializable.encode(this.toDict()); }
   static decode(data: Buffer): TopicConfig {
     return TopicConfig.fromDict(RemotingSerializable.decode(data) as Record<string, any>);

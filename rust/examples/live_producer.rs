@@ -1,30 +1,30 @@
-//! `DefaultMQProducer` 对**真实 5.5.1 broker** 的联调验证。
+//! Integration verification of `DefaultMQProducer` against a **real 5.5.1 broker**.
 //!
-//! 与另几个 live 示例的分工：`live_protocol.rs` 打协议编解码，
-//! `live_rebalance_and_trace.rs` / `live_client_modules.rs` 打客户端模块，
-//! `live_mq_client.rs` 打实例本身。这里打**生产者门面** ——
-//! producer 是 `MQClientInstance` 上面那一层，所以真集群独有的性质是
-//! 「broker 到底认不认这份请求」。锁死的条目：
+//! Division of labour with the other live examples: `live_protocol.rs` covers protocol codec,
+//! `live_rebalance_and_trace.rs` / `live_client_modules.rs` cover client modules, and
+//! `live_mq_client.rs` covers the instance itself. This one covers the **producer facade** --
+//! the producer is the layer above `MQClientInstance`, so the property unique to a real
+//! cluster is "does the broker actually accept this request". The pinned-down items:
 //!
 //!
-//! 用法（先按项目记忆里的 runbook 起本地集群）：
+//! Usage (first start a local cluster per the runbook in project knowledge):
 //! ```text
 //! cargo run --example live_producer -- 127.0.0.1:9876
 //! ```
 //!
-//! 带两个可选参数就是打到**开了鉴权**（`authenticationEnabled=true`）的集群上：
+//! With two optional arguments it instead targets a cluster with **authentication enabled** (`authenticationEnabled=true`):
 //! ```text
 //! cargo run --example live_producer -- 127.0.0.1:9876 <accessKey> <secretKey>
 //! ```
-//! 届时的额外规矩（不带凭据时行为与第一种用法逐字一致）：
-//! - 每个客户端启动前都装上同一份 ACL 签名钩子，broker 才会认它的 RPC；
-//! - 先跑 P0 反证：**不带**凭据的发送必须被拒，且拒的是 broker 码 16
-//!   （`NO_PERMISSION`），不是「随便什么错」——只有真把请求发到了 broker 才谈得上签名；
-//! - 签名钩子是注册在 `MQClientInstance` 的 remoting 通道上的，通道按 clientId 复用，
-//!   所以反证探针用自己独有的 instanceName、并且是本次运行起的**第一个**客户端，
-//!   跑完立刻 shutdown 并等实例从全局表里退掉，再起带凭据的客户端；
-//! - P9 要往 broker 写 `recallMessageEnable`（改 broker 配置）才能跑，
-//!   鉴权跑法不碰它，直接记为跳过。
+//! Extra rules then apply (behaviour is byte-identical to the first usage without credentials):
+//! - every client installs the same ACL signature hook before starting, otherwise the broker will not accept its RPCs;
+//! - run the P0 counter-proof first: a send **without** credentials must be rejected, and rejected with broker code 16
+//!   (`NO_PERMISSION`), not "any error whatsoever" -- only a request that really reached the broker can even speak of signing;
+//! - the signature hook is registered on the `MQClientInstance` remoting channel, which is reused per clientId, so the
+//!   counter-proof probe uses its own exclusive instanceName and must be the **first** client started in this run;
+//!   it shuts down right after and waits for the instance to leave the global table before the credentialed client starts;
+//! - P9 only runs after writing `recallMessageEnable` to the broker (a broker config change);
+//!   the authenticated run leaves it alone and records it as skipped.
 
 use std::collections::HashSet;
 use std::env;
@@ -77,17 +77,17 @@ use rocketmq_client_remoting::remoting::rpchook::{
     AclClientRPCHook, RPCHook, SessionCredentials,
 };
 
-/// 主 topic 的队列数（P2 的定点/选择器断言依赖它）。
+/// Queue count of the main topic (P2's fixed-queue/selector assertions depend on it).
 const QUEUE_NUMS: i32 = 4;
 const COMPRESSIBLE_BODY_LEN: usize = 8 * 1024;
-/// P5 等应答的预算：远短于 broker 的处理时间，保证一定走到超时分支。
+/// P5's reply-wait budget: far shorter than the broker's processing time, so the timeout branch is guaranteed to be hit.
 const REQUEST_TIMEOUT_MS: i64 = 1_500;
-/// P6 等 broker 回查的预算：half message 的免疫期默认 6s，扫描线程每轮再补几秒。
+/// P6's budget for waiting out the broker check-back: half messages are immune for a default 6s, plus a few seconds per scan round.
 const CHECK_BACK_BUDGET: Duration = Duration::from_secs(90);
-/// 消费组：只用于 pull/offset RPC，本示例不建消费者。
+/// Consumer group: only used for pull/offset RPCs; this example creates no consumer.
 const PULL_GROUP: &str = "CID_rust_live_producer";
 
-// ------------------------------------------------------------------ 骨架
+// ------------------------------------------------------------------ skeleton
 
 fn stamp() -> String {
     SystemTime::now()
@@ -96,7 +96,7 @@ fn stamp() -> String {
         .unwrap_or_else(|_| "0".to_string())
 }
 
-/// 断言累积器：跑完所有场景再汇总，首个失败不提前退出。
+/// Assertion accumulator: all scenarios run before the summary; the first failure does not exit early.
 struct Checker {
     passed: u32,
     failed: Vec<String>,
@@ -129,11 +129,11 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 签名被拒时 broker 回的码：鉴权失败（缺用户名、签名不对、权限不够）全都收敛到这一个。
+/// Code the broker returns on signature rejection: every auth failure (missing username, bad signature, insufficient permission) collapses into this one.
 const NO_PERMISSION: i32 = 16;
 
-/// ACL 凭据。两个都空 = 关闭鉴权模式，各客户端拿到 `None` 就是不装钩子，
-/// 行为与不带参数时逐字一致。
+/// ACL credentials. Both empty = authentication disabled; every client then gets `None`,
+/// i.e. no hook installed, byte-identical to the no-argument behaviour.
 #[derive(Clone)]
 struct Creds {
     access_key: String,
@@ -152,7 +152,7 @@ impl Creds {
         !self.access_key.is_empty() && !self.secret_key.is_empty()
     }
 
-    /// 装了钩子的集群返回钩子；没装凭据的集群返回 `None`，调用方直接透传。
+    /// Returns the hook for clusters that install one; `None` for clusters without credentials, which the caller passes straight through.
     fn hook(&self) -> Option<Arc<dyn RPCHook>> {
         if self.enabled() {
             Some(acl_hook(&self.access_key, &self.secret_key))
@@ -179,29 +179,29 @@ fn code_of(err: &Error) -> String {
     }
 }
 
-/// P0 反证：一个**不带任何凭据**的生产者，发送必须被 broker 拒成 16。
+/// P0 counter-proof: a producer carrying **no credentials at all** must have its send rejected by the broker with 16.
 ///
-/// 探针要跑成第一个客户端、且用独有的 instanceName —— 签名钩子是挂在按 clientId
-/// 复用的通道上的，先起的客户端把那根通道定调了。用完 shutdown + drop，
-/// 再等实例真的从全局表里消失，才允许带凭据的客户端起跑。
+/// The probe must run as the first client and use an exclusive instanceName -- the signature hook hangs on channels
+/// reused per clientId, and the first client sets that channel's tone. After use: shutdown + drop, then wait until the
+/// instance has really disappeared from the global table before the credentialed client may start.
 async fn anon_probe(namesrv: &str, run: &str, ck: &mut Checker) {
     let group = format!("PID_rust_producer_anon_{run}");
     let topic = format!("RustLiveProducerAnon_{run}");
     let anon = match DefaultMQProducer::new(&group) {
         Ok(p) => p,
         Err(e) => {
-            ck.abort("P0 构造匿名探针", &e.to_string());
+            ck.abort("P0 build the anonymous probe", &e.to_string());
             return;
         }
     };
     anon.set_namesrv_addr(namesrv);
     anon.set_instance_name(&format!("{run}-anon"));
-    // start 里就有 RPC（注册到实例、心跳）：被拒同样算 16 断言成立。
+    // start() already does RPCs (instance registration, heartbeat): a rejection there also satisfies the code-16 assertion.
     if let Err(e) = anon.start().await {
         ck.check(
-            "P0 匿名客户端被 broker 拒绝",
+            "P0 the anonymous client is rejected by the broker",
             denied(&e),
-            &format!("start 阶段 {}", code_of(&e)),
+            &format!("start stage {}", code_of(&e)),
         );
         return;
     }
@@ -209,20 +209,20 @@ async fn anon_probe(namesrv: &str, run: &str, ck: &mut Checker) {
     let mut m = msg(&topic, b"should-not-be-accepted", "", "");
     match anon.send(&mut m, Some(5000), None).await {
         Ok(r) => ck.check(
-            "P0 匿名客户端被 broker 拒绝",
+            "P0 the anonymous client is rejected by the broker",
             false,
-            &format!("broker 竟然收了匿名请求：{r:?}（多半是 authenticationEnabled 没开）"),
+            &format!("the broker actually accepted an anonymous request: {r:?} (most likely authenticationEnabled is off)"),
         ),
         Err(e) => {
             let remark = e.to_string();
             ck.check(
-                "P0 匿名客户端被 broker 拒绝",
+                "P0 the anonymous client is rejected by the broker",
                 denied(&e),
                 &format!("{} remark={remark}", code_of(&e)),
             );
-            // 「username cannot be null.」这类理由才说明探针真是裸的；
-            // 打印出来好区分「没签」与「签错了」。
-            println!("  [INFO] P0 拒绝理由：{remark}");
+            // Only reasons like "username cannot be null." prove the probe was truly bare;
+            // printing it distinguishes "never signed" from "signed wrongly".
+            println!("  [INFO] P0 rejection reason: {remark}");
         }
     }
     anon.shutdown();
@@ -241,15 +241,15 @@ async fn anon_probe(namesrv: &str, run: &str, ck: &mut Checker) {
         .unwrap_or(false)
     };
     ck.check(
-        "P0 匿名探针的实例已退场（不会把通道留给后面的客户端）",
+        "P0 the anonymous probe's instance has left the table (leaving no channel behind for later clients)",
         released,
-        &format!("clientId={probe_id} 还在全局表里"),
+        &format!("clientId={probe_id} still in the global table"),
     );
-    // 通道拆除与 broker 侧连接关闭之间没有同步点，再给一拍。
+    // No sync point exists between channel teardown and the broker side closing the connection; allow one more beat.
     tokio::time::sleep(Duration::from_secs(1)).await;
 }
 
-/// 轮询异步条件直到成立，超时返回 `false` 让调用方打出现场。
+/// Polls an async condition until it holds; on timeout returns `false` so the caller can print the scene.
 async fn wait_async<F, Fut>(mut cond: F, budget: Duration) -> bool
 where
     F: FnMut() -> Fut,
@@ -288,10 +288,10 @@ fn queue_ids(mqs: &[MessageQueue]) -> Vec<i32> {
     mqs.iter().map(|q| q.queue_id).collect()
 }
 
-/// 异步发送回调的观测点：每一笔要么成功要么失败，且**终态只来一次**。
+/// Observation point for async send callbacks: every send ends in success or failure, and the **terminal state arrives exactly once**.
 ///
-/// 一次性的 `ClosureSendCallback` 撑不起这类场景（它的闭包取走即空），而「有没有把
-/// 某一笔悄悄吞掉」正是异步内核最容易出事的地方。
+/// A one-shot `ClosureSendCallback` cannot support this kind of scenario (its closure is consumed on take), and "did
+/// some send get quietly swallowed" is exactly where the async kernel most easily goes wrong.
 #[derive(Default)]
 struct AsyncProbe {
     done: AtomicUsize,
@@ -348,10 +348,10 @@ impl SendCallback for AsyncProbe {
     }
 }
 
-/// 按异步回调报的 `(queue, offset)` 从 broker 读回那一条的正文。
+/// Reads back the body of the message sitting at the `(queue, offset)` the async callback reported.
 ///
-/// 「回调说 SEND_OK」只证明客户端这么认为；位点上真躺着这条消息才证明异步链走完了
-/// 网络、broker 也认了这份请求。落库有毫秒级延迟，所以重试到预算用完。
+/// "The callback said SEND_OK" only proves the client believes it; the message really lying at that offset proves the
+/// async chain crossed the network and the broker accepted the request. Commitlog visibility lags by milliseconds, so retry until the budget runs out.
 async fn body_at(
     instance: &MQClientInstance,
     mq: &MessageQueue,
@@ -361,7 +361,7 @@ async fn body_at(
 ) -> Option<Vec<u8>> {
     let deadline = Instant::now() + budget;
     loop {
-        // 队列刚建好时拉取本身会失败，那不算「没落库」，继续轮到预算用完。
+        // Pulls fail outright while the queue has just been created; that does not mean "not committed yet", so keep polling until the budget runs out.
         if let Ok(pulled) = pull_from(instance, mq, offset, broker_addr).await {
             if let Some(found) = pulled
                 .msg_found_list
@@ -397,7 +397,7 @@ async fn get_route(
         .map_err(|e| format!("get route of {topic} failed: {e}"))
 }
 
-/// 解码 namesrv 的 fastjson 风格路由（数字 map 键不带引号）。
+/// Decodes the name server's fastjson-style route (numeric map keys are unquoted).
 fn decode_route(resp: &RemotingCommand, what: &str) -> Result<TopicRouteData, String> {
     let raw = match resp.body() {
         Some(b) => b.to_vec(),
@@ -408,8 +408,8 @@ fn decode_route(resp: &RemotingCommand, what: &str) -> Result<TopicRouteData, St
     TopicRouteData::from_json_value(&value).map_err(|e| format!("{what} route invalid: {e}"))
 }
 
-/// 预建主 topic（走裸 RPC，与 `live_mq_client` 同一做法）；P7 再单独验
-/// 生产者自己的 `create_topic`。
+/// Pre-creates the main topic (via bare RPC, the same approach as `live_mq_client`); P7 then separately
+/// verifies the producer's own `create_topic`.
 async fn bootstrap_topic(client: &RemotingClient, namesrv: &str, topic: &str) -> Live {
     let resp = get_route(client, namesrv, MixAll::DEFAULT_TOPIC).await?;
     if resp.code != response_code::SUCCESS {
@@ -453,7 +453,7 @@ async fn bootstrap_topic(client: &RemotingClient, namesrv: &str, topic: &str) ->
     Ok(())
 }
 
-/// 实例侧 `pull_message` 的常用形状：订阅表达式 `*`、无悬挂等待。
+/// The common shape of the instance-side `pull_message`: subscription expression `*`, no suspended wait.
 async fn pull_from(
     instance: &MQClientInstance,
     mq: &MessageQueue,
@@ -476,14 +476,14 @@ async fn pull_from(
             0,
             Some(broker_addr),
             0,
-            // 显式给了 addr：不走 pullFromWhichNodeTable 选路（P5 前的老路径）
+            // An explicit addr: bypasses pullFromWhichNodeTable routing (the pre-P5 path)
             None,
         )
         .await
         .map_err(|e| format!("pull {} queue {} failed: {e}", mq.topic, mq.queue_id))
 }
 
-/// 某 topic 全部队列上读到的正文（一次快照）。
+/// Bodies read from every queue of one topic (a single snapshot).
 async fn read_all_bodies(
     instance: &MQClientInstance,
     topic: &str,
@@ -494,7 +494,7 @@ async fn read_all_bodies(
     let mut out = Vec::new();
     for q in 0..queues {
         let mq = MessageQueue::new(topic, broker_name, q);
-        // 某个队列拉不动不影响全局快照：这里要的是「读到了什么」，不是错误细节。
+        // A queue that cannot be pulled does not break the global snapshot: what matters here is "what was read", not error details.
         if let Ok(r) = pull_from(instance, &mq, 0, broker_addr).await {
             out.extend(bodies(&r.msg_found_list));
         }
@@ -502,11 +502,11 @@ async fn read_all_bodies(
     out
 }
 
-// ---------------------------------------------------------- P4 用的假分发器
+// ---------------------------------------------------------- fake dispatcher for P4
 
-/// 满足生产者轨迹接缝（`TraceDispatcher` + `TraceReportSink`）的最小分发器：
-/// 只把 `TraceContext` 收起来供断言 —— 证明「注入 → 注册钩子 → 启动 → 收到记录」
-/// 这条链在真发送上成立，不必依赖真轨迹 topic。
+/// Minimal dispatcher satisfying the producer trace seam (`TraceDispatcher` +
+/// `TraceReportSink`): it only collects `TraceContext`s for the assertions -- proving
+/// the chain "inject → hook registration → start → record received" holds on real sends, without the real trace topic.
 #[derive(Default)]
 struct FakeDispatcher {
     inner: Arc<FakeDispatcherState>,
@@ -555,9 +555,9 @@ impl TraceReportSink for FakeDispatcher {
     }
 }
 
-// -------------------------------------------------------- P3 用的记录钩子
+// ---------------------------------------------------------- recording hook for P3
 
-/// 记录 before/after 次序与 after 所见内容的钩子。
+/// Hook recording the before/after order and what after observed.
 #[derive(Default)]
 struct RecordingHook {
     state: Mutex<Vec<String>>,
@@ -601,7 +601,7 @@ impl SendMessageHook for RecordingHook {
     }
 }
 
-/// 拒绝所有发送的拦截钩子（P3 断言消息不落地）。
+/// Interception hook that rejects sends (P3 asserts the message never lands).
 struct ForbidTagA;
 
 impl CheckForbiddenHook for ForbidTagA {
@@ -625,7 +625,7 @@ impl CheckForbiddenHook for ForbidTagA {
     }
 }
 
-/// 记录事务收尾钩子被调到（P4 的 EndTransaction 轨迹一并验证这条链）。
+/// Records that the end-transaction hook was invoked (P4's EndTransaction trace verifies this chain too).
 #[derive(Default)]
 struct EndTxnHook {
     called: AtomicUsize,
@@ -647,9 +647,9 @@ impl EndTransactionHook for EndTxnHook {
     }
 }
 
-// -------------------------------------------------------- P6 用的事务监听器
+// ------------------------------------------------------ transaction listener for P6
 
-/// 本地事务返回预设状态；回查返回 `check_state`，并记下被回查到的消息。
+/// Local transactions return the preset state; check-backs return `check_state` and record the checked message.
 struct LiveListener {
     local_state: LocalTransactionState,
     check_state: LocalTransactionState,
@@ -695,7 +695,7 @@ impl TransactionListener for LiveListener {
 
 // ---------------------------------------------------------------------- P1
 
-/// 生命周期：未启动即失败、start 生成身份、shutdown 幂等且可重启。
+/// Lifecycle: fail before start, start mints an identity, shutdown is idempotent and restart is allowed.
 async fn p1_lifecycle(
     namesrv: &str,
     topic: &str,
@@ -739,7 +739,7 @@ async fn p1_lifecycle(
         MQClientInstance::find_instance(&client_id).is_some(),
         &client_id,
     );
-    // 幂等：第二次 start 不重建实例、不报错
+    // Idempotent: a second start neither rebuilds the instance nor errors
     let before = p.client().map(|c| c.client_id().to_string());
     p.start().await.map_err(|e| format!("second start failed: {e}"))?;
     let after = p.client().map(|c| c.client_id().to_string());
@@ -755,7 +755,7 @@ async fn p1_lifecycle(
         !p.is_started(),
         "still started",
     );
-    // 允许重启（会重新起实例与心跳线程）
+    // Restart allowed (the instance and heartbeat threads are started anew)
     p.start().await.map_err(|e| format!("restart failed: {e}"))?;
     let mut m = msg(topic, b"after-restart", "", "");
     let sent = p.send(&mut m, Some(5000), None).await;
@@ -788,7 +788,7 @@ async fn p1_lifecycle(
         "P1 shutdown() drains the async send queue: every queued send gets exactly one terminal callback",
         drained && draining.done() == DRAIN,
         &format!(
-            "{} 关停+跑完用时 {:?} 首笔错误 {:?}",
+            "{} shutdown+drain took {:?} first error {:?}",
             draining.summary(),
             began.elapsed(),
             shut.first()
@@ -814,7 +814,7 @@ async fn p1_lifecycle(
 
 // ---------------------------------------------------------------------- P2
 
-/// 六条发送路径 + 压缩，逐条对 broker 侧的实际结果。
+/// Six send paths + compression, each checked against the actual broker-side outcome.
 async fn p2_send_paths(
     p: &DefaultMQProducer,
     instance: &MQClientInstance,
@@ -833,7 +833,7 @@ async fn p2_send_paths(
         &format!("{:?}", queue_ids(&queues)),
     );
 
-    // ---- 同步发送：SendResult 逐字段
+    // ---- sync send: SendResult field by field
     let mut m1 = msg(topic, b"sync-1", "TagSync", "keySync1");
     let r1 = p.send(&mut m1, Some(5000), None).await
         .map_err(|e| format!("sync send failed: {e}"))?;
@@ -852,7 +852,7 @@ async fn p2_send_paths(
         &format!("uniq={uniq} {r1:?}"),
     );
 
-    // ---- 定点发送：必须落在指定队列
+    // ---- fixed-queue send: must land in exactly the given queue
     let target = MessageQueue::new(topic, broker_name, 2);
     let mut m2 = msg(topic, b"fixed-queue", "TagFixed", "");
     let r2 = p.send(&mut m2, Some(5000), Some(&target)).await
@@ -863,7 +863,7 @@ async fn p2_send_paths(
         &format!("{:?}", r2.message_queue),
     );
 
-    // ---- 批量
+    // ---- batch
     let batch_bodies: Vec<String> = (0..3).map(|i| format!("batch-{i}")).collect();
     let batch_msgs = batch_bodies
         .iter()
@@ -890,7 +890,7 @@ async fn p2_send_paths(
         &format!("parentOffset={} pulled={pulled}", rb.queue_offset),
     );
 
-    // ---- oneway：无响应，但必须能读回
+    // ---- oneway: no response, but it must still be readable back
     let mut m3 = msg(topic, b"sent-oneway", "TagOneway", "");
     let oneway_mq = MessageQueue::new(topic, broker_name, 3);
     p.send_oneway(&mut m3, Some(&oneway_mq))
@@ -912,7 +912,7 @@ async fn p2_send_paths(
         "the oneway body never showed up",
     );
 
-    // ---- 选择器（顺序消息）：同一 arg 必须同一队列
+    // ---- selector (ordered messages): one arg must pin one queue
     let mut picked = Vec::new();
     for i in 0..6 {
         let mut m = msg(topic, format!("order-{i}").as_bytes(), "TagOrder", "");
@@ -929,7 +929,7 @@ async fn p2_send_paths(
         &format!("{picked:?}"),
     );
 
-    // ---- 异步发送内核：回调里的 SendResult 与同步同形，而且消息真在 broker 上
+    // ---- async send kernel: the callback's SendResult matches the sync shape, and the message really is on the broker
     let probe = Arc::new(AsyncProbe::default());
     p.send_async(
         msg(topic, b"async-1", "TagAsync", ""),
@@ -975,7 +975,7 @@ async fn p2_send_paths(
         &probe.summary(),
     );
 
-    // ---- 池子不吞消息：并发 30 笔，每笔恰好一个终态回调，且每一笔都在回调报的位点上
+    // ---- the pool swallows nothing: 30 concurrent sends, each with exactly one terminal callback, each readable at the offset its callback reported
     const BURST: usize = 30;
     let burst = Arc::new(AsyncProbe::default());
     for i in 0..BURST {
@@ -1016,14 +1016,14 @@ async fn p2_send_paths(
         "P2 every burst message is readable at exactly the offset its own callback reported",
         read_back == want && slots.len() == BURST,
         &format!(
-            "读回 {} 条、位点 {} 个、缺 {:?}",
+            "read back {} messages, {} offsets, missing {:?}",
             read_back.len(),
             slots.len(),
             want.difference(&read_back).count()
         ),
     );
 
-    // ---- 定点异步发送：交给它的队列就是它落下去的队列
+    // ---- targeted async send: the queue handed in is the queue it lands in
     let target = MessageQueue::new(topic, broker_name, 2);
     let aimed = Arc::new(AsyncProbe::default());
     p.send_async(
@@ -1095,10 +1095,10 @@ async fn p2_send_paths(
             && rejected.ok() == 0
             && canonical_wording
             && still_works,
-        &format!("{} / 之后一笔 {}", rejected.summary(), after_reject.summary()),
+        &format!("{} / one follow-up send {}", rejected.summary(), after_reject.summary()),
     );
 
-    // ---- 压缩：8 KiB 可压缩正文 → 消费者读到原始正文
+    // ---- compression: an 8 KiB compressible body → the reader gets the original body back
     let raw: Vec<u8> = vec![b'z'; COMPRESSIBLE_BODY_LEN];
     let mut big = msg(topic, &raw, "TagCompressed", "keyCompressed");
     let big_mq = MessageQueue::new(topic, broker_name, 0);
@@ -1128,7 +1128,7 @@ async fn p2_send_paths(
         .iter()
         .find(|m| m.queue_offset == rb2.queue_offset);
     let decoded = stored.map(|m| m.body.clone().unwrap_or_default()).unwrap_or_default();
-    // broker 存的是我们发出去的压缩流，所以整条消息的 storeSize 远小于原始正文。
+    // The broker stores the compressed stream we sent, so the whole message's storeSize is far below the raw body length.
     let plain_len = i32::try_from(COMPRESSIBLE_BODY_LEN).unwrap_or(i32::MAX);
     let went_compressed = stored.map(|m| m.store_size < plain_len).unwrap_or(false);
     let flag_ok = stored
@@ -1158,7 +1158,7 @@ async fn p2_send_paths(
 
 // ---------------------------------------------------------------------- P3
 
-/// 钩子：拦截异常传播 + before/after 次序与可见性。
+/// Hooks: interception error propagation + before/after ordering and visibility.
 async fn p3_hooks(
     p: &DefaultMQProducer,
     instance: &MQClientInstance,
@@ -1171,7 +1171,7 @@ async fn p3_hooks(
     p.register_send_message_hook(hook.clone());
     p.register_check_forbidden_hook(Arc::new(ForbidTagA));
 
-    // 被拦截：错误原样抛出，且消息没进 broker
+    // Intercepted: the error surfaces as-is and the message never enters the broker
     let mut forbidden = msg(topic, b"must-not-land", "Forbidden", "");
     let err = p
         .send(&mut forbidden, Some(5000), Some(&MessageQueue::new(topic, broker_name, 3)))
@@ -1192,7 +1192,7 @@ async fn p3_hooks(
         &format!("err={err} lines={lines:?}"),
     );
 
-    // 正常放行：before -> after ok 各一次
+    // Passed through normally: one "before" then one "after ok"
     let before_len = hook.lines().len();
     let mut ok_msg = msg(topic, b"hook-passed", "TagAllowed", "");
     p.send(&mut ok_msg, Some(5000), Some(&MessageQueue::new(topic, broker_name, 2)))
@@ -1242,7 +1242,7 @@ async fn p3_hooks(
         .unwrap_or_default();
     let tail = hook.lines()[before_len..].to_vec();
     ck.check(
-        "P3b 定点到不存在的 broker：本端报 not exist，一个钩子都不跑（校验在 try 之外）",
+        "P3b send to a nonexistent broker: this side reports not exist, no hook runs at all (validation happens outside the try)",
         bogus.contains("The broker[RustNoSuchBroker_zzz] not exist") && tail.is_empty(),
         &format!("err={bogus} tail={tail:?}"),
     );
@@ -1251,7 +1251,7 @@ async fn p3_hooks(
 
 // ---------------------------------------------------------------------- P4
 
-/// 轨迹接缝：注入 → start 注册钩子并拉起 → 真发送产出 TraceContext。
+/// Trace seam: inject → start registers the hook and boots it → a real send produces a TraceContext.
 async fn p4_trace_seam(
     namesrv: &str,
     topic: &str,
@@ -1264,8 +1264,8 @@ async fn p4_trace_seam(
         .map_err(|e| format!("build failed: {e}"))?;
     p.set_namesrv_addr(namesrv);
     let dispatcher = FakeDispatcher::new();
-    // FakeDispatcher 同时实现 TraceDispatcher + TraceReportSink，靠 producer 模块里的
-    // blanket impl 直接当成 Arc<dyn TraceDispatcherChannel> 用。
+    // FakeDispatcher implements both TraceDispatcher + TraceReportSink; via the blanket impl in the producer
+    // module it can be used directly as Arc<dyn TraceDispatcherChannel>.
     p.set_trace_dispatcher(Some(dispatcher.clone()));
     p.set_enable_trace(true);
     p.start().await.map_err(|e| format!("start failed: {e}"))?;
@@ -1307,7 +1307,7 @@ async fn p4_trace_seam(
         &format!("{contexts:?}"),
     );
 
-    // 轨迹消息自己不产轨迹（避免回环）：topic 以轨迹 topic 开头的消息应被跳过
+    // Trace messages themselves must not produce traces (avoiding loops): messages whose topic starts with the trace topic are skipped
     let mut traced = msg(
         &format!("{}%x", MixAll::TRACE_TOPIC),
         b"trace-of-trace",
@@ -1333,7 +1333,7 @@ async fn p4_trace_seam(
 
 // ---------------------------------------------------------------------- P5
 
-/// Request-Reply：三个请求属性、等待槽生命周期、无人应答时的超时语义。
+/// Request-Reply: the three request properties, the wait-slot lifecycle, and the timeout semantics when nobody answers.
 async fn p5_request_reply(
     p: &DefaultMQProducer,
     topic: &str,
@@ -1394,7 +1394,7 @@ async fn p5_request_reply(
 
 // ---------------------------------------------------------------------- P6
 
-/// 事务：半消息不可见 → COMMIT 可见 / ROLLBACK 永不可见 / UNKNOW 被回查后提交。
+/// Transactions: half message invisible → COMMIT makes it visible / ROLLBACK never visible / UNKNOW committed after a check-back.
 #[allow(clippy::too_many_arguments)]
 async fn p6_transactions(
     p: &DefaultMQProducer,
@@ -1410,7 +1410,7 @@ async fn p6_transactions(
     let end_hook = Arc::new(EndTxnHook::default());
     p.register_end_transaction_hook(end_hook.clone());
 
-    // ---- COMMIT：半消息提交后消费者读得到
+    // ---- COMMIT: once the half message is committed, the consumer can read it
     let commit_listener = LiveListener::new(LocalTransactionState::CommitMessage, LocalTransactionState::Unknow);
     let mut commit_msg = msg(topic, b"txn-commit", "TagTxn", "keyTxnCommit");
     let r = p
@@ -1440,7 +1440,7 @@ async fn p6_transactions(
         &format!("{r:?} visible={committed}"),
     );
 
-    // ---- ROLLBACK：永远读不到
+    // ---- ROLLBACK: never readable
     let rollback_listener = LiveListener::new(LocalTransactionState::RollbackMessage, LocalTransactionState::Unknow);
     let mut rb = msg(topic, b"txn-rollback", "TagTxn", "keyTxnRollback");
     let rr = p
@@ -1456,7 +1456,7 @@ async fn p6_transactions(
         &format!("state={:?} bodies={:?}", rr.local_transaction_state, bodies.len()),
     );
 
-    // ---- UNKNOW → broker 回查（走心跳登记的连接）→ 这次返回 COMMIT
+    // ---- UNKNOW → broker check-back (over the heartbeat-registered connection) → this time return COMMIT
     let check_listener = LiveListener::new(LocalTransactionState::Unknow, LocalTransactionState::CommitMessage);
     let mut unknown = msg(topic, b"txn-checked", "TagTxn", "keyTxnCheck");
     let ru = p
@@ -1512,8 +1512,8 @@ async fn p6_transactions(
         &last_hook,
     );
 
-    // ---- TransactionMQProducer：预置监听器之后，发送时不必再传
-    // （本端这个子类唯一多做的事就是这段兜底，这里要把它打实。）
+    // ---- TransactionMQProducer: once a listener is preset, the send call need not pass one
+    // (this fallback is the only extra thing this subclass does here; pin it down.)
     let txn_group = format!("PID_rust_producer_{run}_p6txn");
     let txn = TransactionMQProducer::new(&txn_group).map_err(|e| format!("txn build failed: {e}"))?;
     txn.set_rpc_hook(creds.hook());
@@ -1546,7 +1546,7 @@ async fn p6_transactions(
             && preset_visible,
         &format!("{rt:?} visible={preset_visible}"),
     );
-    // Deref 到基础生产者：管理方法照常可用
+    // Deref to the base producer: the admin methods keep working
     let via_deref = txn
         .fetch_publish_message_queues(topic)
         .await
@@ -1563,7 +1563,7 @@ async fn p6_transactions(
 
 // ---------------------------------------------------------------------- P7
 
-/// 管理便捷方法：建 topic、四个 offset RPC、按 key 查询、view_message 报错。
+/// Admin conveniences: create a topic, the four offset RPCs, query by key, and view_message reporting an error.
 #[allow(clippy::too_many_arguments)]
 async fn p7_admin(
     p: &DefaultMQProducer,
@@ -1575,7 +1575,7 @@ async fn p7_admin(
     run: &str,
     ck: &mut Checker,
 ) -> Live {
-    // ---- create_topic：只给名字，队列由 broker 按默认值建
+    // ---- create_topic: name only; the broker creates queues from its defaults
     let created = format!("RustLiveProducerCreated_{run}");
     p.create_topic(&created, QUEUE_NUMS, 0)
         .await
@@ -1599,13 +1599,13 @@ async fn p7_admin(
         &new_err,
     );
 
-    // ---- offset 四件套
+    // ---- the four offset RPCs
     let mq = MessageQueue::new(topic, broker_name, 0);
     let max_offset = p.max_offset(&mq).await.map_err(|e| format!("max_offset: {e}"))?;
     let min_offset = p.min_offset(&mq).await.map_err(|e| format!("min_offset: {e}"))?;
-    // 基准不能用「现在减一分钟」：跑到这里时本次运行可能已经过了好几分钟（真机 TLS 上
-    // 等事务回查就吃掉 90s），那样 searchOffset 会跳过早先的消息，判据与时长耦合。
-    // topic 名带本次运行的秒级时间戳、只属于本次运行，所以开跑时刻就是第一条消息之前。
+    // The baseline cannot be "now minus one minute": by here this run may already be minutes old (on a real TLS machine
+    // waiting for the transaction check-back alone eats 90s), and searchOffset would then jump past earlier messages -- the criterion is coupled to duration.
+    // The topic name carries this run's second-level timestamp and belongs to this run alone, so the run start instant precedes the first message.
     let run_started_ms = run.parse::<i64>().unwrap_or_default() * 1000;
     let past = p.search_offset(&mq, run_started_ms).await
         .map_err(|e| format!("search_offset(run start): {e}"))?;
@@ -1623,7 +1623,7 @@ async fn p7_admin(
         &format!("min={min_offset} max={max_offset} past={past} future={future} earliest={earliest}"),
     );
 
-    // ---- 按 key 查询（broker 建索引是异步的，拉到为止）
+    // ---- query by key (the broker builds its index asynchronously, so poll until found)
     let key = format!("queryKey-{run}");
     let mut qm = msg(topic, b"queried-by-key", "TagQuery", &key);
     p.send(&mut qm, Some(5000), Some(&mq))
@@ -1659,7 +1659,7 @@ async fn p7_admin(
         &format!("len={missing}"),
     );
 
-    // ---- view_message：显式不支持
+    // ---- view_message: explicitly unsupported
     let err = p
         .view_message(topic, "0102030405")
         .err()
@@ -1671,7 +1671,7 @@ async fn p7_admin(
         &err,
     );
 
-    // ---- 清理本例建的 topic
+    // ---- clean up the topics this example created
     for t in [&created] {
         match instance.delete_topic_in_broker(broker_addr, t, 5000).await {
             Ok(()) => ck.check(&format!("P7 delete_topic_in_broker {t}"), true, ""),
@@ -1685,15 +1685,15 @@ async fn p7_admin(
     Ok(())
 }
 
-// ---------------------------------------------------------------- P8 重试内核
+// ---------------------------------------------------------------- P8 retry kernel
 
-/// 发送重试内核（`sendDefaultImpl`）里**能上真集群**的那几面：可重试码集合、
-/// 单次超时上限、非 SEND_OK 换 broker 开关，以及彻底拿不到路由时的定性。
+/// The faces of the send retry kernel (`sendDefaultImpl`) that **can run on a real cluster**: the retryable-code set,
+/// the per-request timeout cap, the switch that hops brokers on non-SEND_OK, and the characterisation when no route can be fetched at all.
 ///
-/// 「broker 回可重试码就换一台」「慢 broker 吃光预算报 call timeout」「端口拒绝报
-/// 10001」这三条要的是 broker 主动回错误码 / 慢到吃掉预算 / 端口拒连 —— 真集群一台
-/// 健康的单 broker 都给不了，留在 `src/client/producer/send_retry_tests.rs` 的
-/// 进程内假集群里对拍。
+/// "Broker answers a retryable code, so hop to another", "a slow broker eats the whole budget and reports call timeout",
+/// "a refused port reports 10001" -- these need a broker actively returning an error code / slowness that eats the budget
+/// / a port refusing connections. No healthy single-broker real cluster provides any of them; they are pinned in the
+/// in-process fake cluster in `src/client/producer/send_retry_tests.rs`.
 async fn p8_send_retry_kernel(
     p: &DefaultMQProducer,
     topic: &str,
@@ -1707,7 +1707,7 @@ async fn p8_send_retry_kernel(
         defaults == [1, 2, 14, 16, 17, 204, 205, 1500]
             && p.get_retry_response_codes().len() == 8
             && p.is_retry_response_code(Some(response_code::SERVICE_NOT_AVAILABLE))
-            // 没等到响应码（压根没连上）等于不可重试；不在集合里的码也不可重试
+            // no response code at all (never even connected) counts as not retryable; codes outside the set are not retryable either
             && !p.is_retry_response_code(None)
             && !p.is_retry_response_code(Some(response_code::MESSAGE_ILLEGAL)),
         &format!("{defaults:?}"),
@@ -1735,9 +1735,9 @@ async fn p8_send_retry_kernel(
     p.set_retry_another_broker_when_not_store_ok(false);
     p.set_send_msg_max_timeout_per_request(-1);
 
-    // 路由彻底拉不到：这次连 namesrv 都拒了。本端刻意**不**把传输层失败粉饰成「没有路由」
-    // （只有 broker 回了错误码时才往上层传递路由缺失），所以这里断言的是：原样报连接失败，
-    // 且一次 broker 都没联系、重试次数没被空转掉。
+    // No route whatsoever: this time even the name server refuses. This port deliberately does **not** whitewash a transport failure into "no route"
+    // (route-missing propagates upward only when the broker itself returned an error code), so what is asserted here: the connection failure is reported as-is,
+    // not a single broker is ever contacted, and the retry budget is not idled away.
     let dead_addr = std::net::TcpListener::bind("127.0.0.1:0")
         .ok()
         .and_then(|l| l.local_addr().ok())
@@ -1776,7 +1776,7 @@ async fn p8_send_retry_kernel(
 
 // ------------------------------------------------------------------- P9
 
-/// 读 broker 的一个配置项（`GET_BROKER_CONFIG` 的响应体是 properties 文本）。
+/// Reads one broker config item (the `GET_BROKER_CONFIG` response body is properties text).
 async fn read_broker_flag(instance: &MQClientInstance, addr: &str, key: &str) -> Option<String> {
     let mut request = RemotingCommand::create_request_command(request_code::GET_BROKER_CONFIG, None);
     let response = instance
@@ -1815,7 +1815,7 @@ async fn write_broker_flag(
     ))
 }
 
-/// 定时消息的 `recallMessage`(370)：handle 由 SEND 响应下发，撤回后消息**不会**投递。
+/// The timer message's `recallMessage` (370): the handle comes down with the SEND response; after recall the message is **never** delivered.
 async fn p9_recall(
     p: &DefaultMQProducer,
     instance: &MQClientInstance,
@@ -1831,7 +1831,7 @@ async fn p9_recall(
             .await
             .map_err(|e| format!("cannot enable {ENABLE_KEY} on the broker: {e}"))?;
     }
-    // 定时消息的投递时刻：留够「先撤回、再确认没投递」的窗口。
+    // Timer delivery instant: leave enough window to recall first and then confirm nothing was delivered.
     let delay_secs = 12;
 
     let mut to_recall = msg(topic, b"timer-recalled", "TagTimer", "keyTimerRecalled");
@@ -1864,7 +1864,7 @@ async fn p9_recall(
         &format!("{:?}", plain.recall_handle),
     );
 
-    // handle 里就带着 brokerName，解出来必须是我们发出去的那台 broker。
+    // The handle itself carries the brokerName; decoding it must yield the broker we sent to.
     let handle = recalled.recall_handle.clone().unwrap_or_default();
     let decoded = recall_message_handle::decode_handle(&handle);
     ck.check(
@@ -1910,7 +1910,7 @@ async fn p9_recall(
         &format!("{}ms {bad_err}", started.elapsed().as_millis()),
     );
 
-    // 到点之后：被撤回的那条不该出现，对照组必须出现。
+    // Once due: the recalled message must not appear, the control message must appear.
     let delivered = wait_async(
         || async {
             read_all_bodies(instance, topic, broker_name, broker_addr, QUEUE_NUMS)
@@ -1935,7 +1935,7 @@ async fn p9_recall(
 
     let restore = match prior.as_deref() {
         Some(value) => write_broker_flag(instance, broker_addr, ENABLE_KEY, value).await,
-        // broker 没这个键（更老的版本）：留 true 会改变 broker 行为，报出来让人知道。
+        // The broker lacks this key (an older version): leaving true behind would change broker behaviour, so surface it.
         None => Err("broker reported no recallMessageEnable to restore".to_string()),
     };
     let restore_detail = restore.clone().err().unwrap_or_default();
@@ -1947,9 +1947,9 @@ async fn p9_recall(
     Ok(())
 }
 
-// ------------------------------------------------- P11 退出时的 broker 侧注销
+// --------------------------------------------- P11 broker-side deregistration on exit
 
-/// 204 现在能看到这个生产组的 clientId 列表；broker 说「组不存在」时回空表。
+/// 204 now shows the clientId list of this producer group; an empty list comes back when the broker says "group does not exist".
 async fn producer_clients(admin: &DefaultMQAdminExt, group: &str) -> Vec<String> {
     match admin.examine_producer_connection_info(group, None).await {
         Ok(conn) => conn
@@ -1961,7 +1961,7 @@ async fn producer_clients(admin: &DefaultMQAdminExt, group: &str) -> Vec<String>
     }
 }
 
-/// P11：生产者退出必须逐台 broker 发 `UNREGISTER_CLIENT`(35)。
+/// P11: a producer exiting must send `UNREGISTER_CLIENT` (35) to every broker.
 async fn p11_producer_unregister(
     namesrv: &str,
     topic: &str,
@@ -2017,7 +2017,7 @@ async fn p11_producer_unregister(
         .await
         .map_err(|e| format!("admin start: {e}"))?;
 
-    // 注册靠心跳上线（30s 一轮），必须轮询等
+    // Registration goes live via heartbeat (one round per 30s), so poll and wait
     let deadline = Instant::now() + Duration::from_secs(90);
     let mut seen_a = producer_clients(&admin, &group_a).await;
     while !seen_a.contains(&id_a) && Instant::now() < deadline {
@@ -2037,7 +2037,7 @@ async fn p11_producer_unregister(
     );
 
     a.shutdown();
-    // 注销挂在运行时任务上（`shutdown()` 是同步的），给足一拍再判定
+    // Deregistration rides on a runtime task (`shutdown()` itself is synchronous); give it a full beat before judging
     let budget = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let now = producer_clients(&admin, &group_a).await;
@@ -2056,7 +2056,7 @@ async fn p11_producer_unregister(
     ck.check(
         "P11 A's shutdown did not take the shared channel down (B still registered)",
         producer_clients(&admin, &group_b).await.contains(&id_b),
-        "B 的连接也跟着没了 ⇒ 这条判据不成立",
+        "B's connection would have vanished with it ⇒ this criterion does not hold",
     );
     let mut mb2 = msg(topic, b"unreg-b-after-a", "", "");
     let b_still_sends = b
@@ -2117,7 +2117,7 @@ async fn run(namesrv: &str, creds: Creds) -> Checker {
 
     let mut ck = Checker::new();
 
-    // 带凭据时先跑反证：此刻还没有任何带签名的客户端，探针拿到的是自己独立的通道。
+    // With credentials, run the counter-proof first: at this moment no signed client exists yet, so the probe gets its own independent channel.
     if creds.enabled() {
         anon_probe(namesrv, &run, &mut ck).await;
     }
@@ -2126,7 +2126,7 @@ async fn run(namesrv: &str, creds: Creds) -> Checker {
     if let Some(hook) = creds.hook() {
         probe.register_rpc_hook(hook);
     }
-    // 先用裸 RPC 建 topic（P1 之前的生产者还没启动），再拿生产者跑各场景
+    // Create the topic via bare RPC first (the P1 producer is not started yet), then run the scenarios through the producer
     let created = bootstrap_topic(&probe, namesrv, &topic).await;
     probe.shutdown();
     if let Err(e) = created {
@@ -2147,7 +2147,7 @@ async fn run(namesrv: &str, creds: Creds) -> Checker {
     };
     p.set_namesrv_addr(namesrv);
     p.set_instance_name(&format!("{run}-main"));
-    // 让压缩阈值用默认 4 KiB，但显式打开故障规避开关的关闭态
+    // Keep the compression threshold at the default 4 KiB, but explicitly set the fault-avoidance switch to its off state
     p.set_send_latency_fault_enable(false);
     if let Err(e) = p.start().await {
         ck.abort("P0 start", &e.to_string());
@@ -2222,10 +2222,10 @@ async fn run(namesrv: &str, creds: Creds) -> Checker {
         ),
     ];
 
-    // P9 靠往 broker 写 `recallMessageEnable` 才跑得起来（先改再复原）。
-    // 鉴权跑法不动集群配置，整段跳过并在汇总里写明；不带凭据时照旧全跑。
+    // P9 only runs after writing `recallMessageEnable` to the broker (change first, then restore).
+    // The authenticated run leaves cluster config untouched: skip the whole section and say so in the summary; without credentials everything still runs.
     if creds.enabled() {
-        println!("  [SKIP] P9 recall：需要先改 broker 的 recallMessageEnable，鉴权跑法不碰集群配置");
+        println!("  [SKIP] P9 recall: needs a broker config change (recallMessageEnable) first; the authenticated run leaves cluster config untouched");
     } else {
         scenarios.push((
             "P9 recall",
@@ -2238,7 +2238,7 @@ async fn run(namesrv: &str, creds: Creds) -> Checker {
         }
     }
 
-    // 收尾：删主 topic（broker 配置 + namesrv 路由）
+    // Wrap-up: delete the main topic (broker config + name server route)
     match instance.delete_topic_in_broker(&broker_addr, &topic, 5000).await {
         Ok(()) => ck.check("P10 delete_topic_in_broker", true, ""),
         Err(e) => ck.check("P10 delete_topic_in_broker", false, &e.to_string()),

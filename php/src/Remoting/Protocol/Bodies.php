@@ -7,21 +7,23 @@ namespace RocketMQ\Remoting\Protocol;
 use RocketMQ\Common\MessageQueue;
 use RocketMQ\Common\SubscriptionData;
 
-// Bodies.php 的类依赖 AdminBodies.php 里的 decode_message_queue_map / message_queue_key
-// 帮助函数（函数不能被 autoloader 拉起，必须显式装载一次）。
+// The classes in Bodies.php depend on the decode_message_queue_map / message_queue_key helper functions
+// in AdminBodies.php (functions cannot be pulled in by the autoloader, so the file has to be loaded
+// explicitly once).
 require_once __DIR__ . '/AdminBodies.php';
 
 /**
- * 公共 body：请求/应答的 JSON body 结构，一个 request code 对应一种形状。
+ * Common bodies: the JSON body structures of requests/responses, one request code maps to one shape.
  *
- * ⚠ 以 MessageQueue 为键的 map：broker 侧序列化会把键**内联成 JSON 对象**
- * （``{{"brokerName":...,"queueId":...,"topic":...}:{...}}``）——这形状不是合法 JSON，
- * 但 broker 的解析器认它，所以必须用 messageQueueKey()/decodeMessageQueueMap()
- * 处理，不能当普通字符串键。本端口统一存成 list<array{mq, value}>。
+ * ⚠ For maps keyed by MessageQueue: the broker-side serializer **inlines the keys as JSON objects**
+ * (``{{"brokerName":...,"queueId":...,"topic":...}:{...}}``) — that shape is not legal JSON, but the
+ * broker's parser accepts it, so it has to be handled with messageQueueKey()/decodeMessageQueueMap()
+ * rather than as an ordinary string key. This port stores it uniformly as list<array{mq, value}>.
  */
 final class Bodies
 {
-    // 占位类：仅用于让 autoloader 命中本文件（见 bootstrap.php classmap）。
+    // Placeholder class: it only exists so that the autoloader hits this file (see the classmap in
+    // bootstrap.php).
 }
 
 final class KVTable
@@ -239,11 +241,12 @@ final class GetConsumerListByGroupResponseBody
 }
 
 /**
- * broker 回查客户端配置时下发的 body。
+ * The body pushed down when the broker queries back the client configuration.
  *
- * 只被 ``CHECK_CLIENT_CONFIG(46)`` 用到：broker 拿 clientId/group 记日志，真正被校验的
- * 只有 ``subscriptionData`` 的 expressionType 与 subString。namespace 字段在协议里
- * 存在但发送端不填，这里同样保留字段而不写值（broker 侧不序列化 null）。
+ * It is only used by ``CHECK_CLIENT_CONFIG(46)``: the broker logs the clientId/group, and what is really
+ * validated is only the expressionType and subString of ``subscriptionData``. The namespace field exists
+ * in the protocol but the sender does not fill it; here the field is likewise kept without a value (the
+ * broker side does not serialize null).
  */
 final class CheckClientRequestBody
 {
@@ -305,7 +308,7 @@ final class ClusterInfo
     public array $clusterAddrTable = [];
 
     /**
-     * 收集所有 broker 的地址（去重，按 broker 名称、brokerId 顺序）。
+     * Collects the addresses of all brokers (deduplicated, ordered by broker name then brokerId).
      *
      * @return list<string>
      */
@@ -351,8 +354,8 @@ final class ClusterInfo
     public static function fromDict(array $d): self
     {
         $ci = new self();
-        // 真实 RocketMQ 的 brokerAddrTable[name] 是一个 BrokerData 对象，
-        // 真正的 {brokerId: addr} 映射在其中的 brokerAddrs 字段下。
+        // In real RocketMQ, brokerAddrTable[name] is a BrokerData object, and the actual
+        // {brokerId: addr} mapping sits under its brokerAddrs field.
         foreach ((array)($d['brokerAddrTable'] ?? []) as $k => $vv) {
             $ids = [];
             foreach ((array)(is_array($vv) ? ($vv['brokerAddrs'] ?? []) : []) as $kk => $v) {
@@ -377,19 +380,20 @@ final class ClusterInfo
 }
 
 /**
- * 消费者运行信息：诊断与统计上报的主体结构。
+ * The consumer running information: the main structure for diagnostics and statistics reporting.
  *
- * 两侧都用得到：**管理侧**解析 broker 汇总的运行信息；**本客户端**在应答
- * GET_CONSUMER_RUNNING_INFO(307) 时编码自己的运行信息。
+ * Both sides need it: the **admin side** parses the running information aggregated by the broker, and
+ * **this client** encodes its own running information when answering
+ * GET_CONSUMER_RUNNING_INFO(307).
  *
- * ⚠ ``mqTable`` / ``mqPopTable`` 的键是 ``MessageQueue``（序列化后是内联对象键），
- * 本端口用 message_queue_key() 字符串键存取。
+ * ⚠ The keys of ``mqTable`` / ``mqPopTable`` are ``MessageQueue`` (inline object keys once serialized);
+ * this port accesses them with message_queue_key() string keys.
  */
 final class ConsumerRunningInfo
 {
     public const PROP_NAMESERVER_ADDR = 'PROP_NAMESERVER_ADDR';
     public const PROP_THREADPOOL_CORE_SIZE = 'PROP_THREADPOOL_CORE_SIZE';
-    public const PROP_CONSUME_ORDERLY = 'PROP_CONSUMEORDERLY';   // 协议键名就是 CONSUMEORDERLY，没有下划线
+    public const PROP_CONSUME_ORDERLY = 'PROP_CONSUMEORDERLY';   // the protocol key really is CONSUMEORDERLY, without an underscore
     public const PROP_CONSUME_TYPE = 'PROP_CONSUME_TYPE';
     public const PROP_CLIENT_VERSION = 'PROP_CLIENT_VERSION';
     public const PROP_CONSUMER_START_TIMESTAMP = 'PROP_CONSUMER_START_TIMESTAMP';
@@ -398,9 +402,9 @@ final class ConsumerRunningInfo
     public array $properties = [];
     /** @var list<array<string, mixed>> */
     public array $subscriptionSet = [];
-    /** @var array<string, array<string, mixed>> 键 = message_queue_key() */
+    /** @var array<string, array<string, mixed>> key = message_queue_key() */
     public array $mqTable = [];
-    /** @var array<string, array<string, mixed>> 键 = message_queue_key() */
+    /** @var array<string, array<string, mixed>> key = message_queue_key() */
     public array $mqPopTable = [];
     /** @var array<string, array<string, mixed>> */
     public array $statusTable = [];
@@ -635,10 +639,11 @@ final class ConsumeStatus
 }
 
 /**
- * 聚合消费统计（`GET_BROKER_CONSUME_STATS` 的响应 body）。
+ * The aggregated consumption statistics (the response body of `GET_BROKER_CONSUME_STATS`).
  *
- * ⚠ JSON 键是协议字段名 `consumeStatsList`，不是属性名 `statsList`：写错键名时
- * 真机响应会解析成空列表，看着像「这个 broker 没有积压」。
+ * ⚠ The JSON key is the protocol field name `consumeStatsList`, not the property name `statsList`: when
+ * the key name is wrong, a real response parses into an empty list, which looks like "this broker has no
+ * backlog".
  */
 final class ConsumeStatsList
 {
@@ -684,11 +689,13 @@ final class ConsumeStatsList
 }
 
 /**
- * 重置位点（222）的 map 形式 body。
+ * The map form of the offset reset (222) body.
  *
- * ⚠ 协议里 ``offsetTable`` 是 MessageQueue → Long 的一张平表，**不是** topic→queueId→offset
- * 的嵌套 map（写成嵌套 map 就解析不出真实 broker 响应）。
- * MessageQueue 键会被内联成 JSON 对象，故用 AdminBodies 的键工具解析。
+ * ⚠ In the protocol, ``offsetTable`` is a flat MessageQueue → Long table, **not** a nested
+ * topic→queueId→offset map (writing it as a nested map makes it impossible to parse real broker
+ * responses).
+ * The MessageQueue keys get inlined as JSON objects, so they are parsed with the key helpers from
+ * AdminBodies.
  */
 final class ResetOffsetBody
 {
@@ -727,7 +734,7 @@ final class ResetOffsetBody
     }
 }
 
-/** ForC 数组形式里的队列元素：队列三要素外加可选的 offset。 */
+/** The queue element in the ForC array form: the three queue elements plus an optional offset. */
 final class MessageQueueForC
 {
     public function __construct(
@@ -757,12 +764,13 @@ final class MessageQueueForC
 }
 
 /**
- * 重置位点（222）的数组形式 body：``offsetTable`` 是**数组**（每条自带 offset），
- * 不是 map。
+ * The array form of the offset reset (222) body: ``offsetTable`` is an **array** (each entry carries its
+ * own offset), not a map.
  *
- * broker 按发起方上报的 language 码选形状：只有 language=CPP 才推这种数组形式，
- * 其余语言码一律推 map 形式。发起重置的完全可能是上报 CPP 的管理端，
- * 所以两种都要能解——收到却解析不出等于整笔重置静默丢弃。
+ * The broker picks the shape by the language code reported by the initiator: only language=CPP pushes this
+ * array form, and every other language code pushes the map form. The initiator of a reset may well be an
+ * admin tool reporting CPP, so both have to be decodable — receiving something that cannot be parsed
+ * amounts to silently discarding the whole reset.
  */
 final class ResetOffsetBodyForC
 {
@@ -802,15 +810,16 @@ final class ResetOffsetBodyForC
 // ---------------------------------------------------------------- 42 GET_CONSUMER_STATUS_FROM_CLIENT
 
 /**
- * 取客户端消费状态（42）的 body。
+ * The body of fetching the client consumption status (42).
  *
- * 两个 map 的键都是 ``MessageQueue``（内联对象键）。
+ * The keys of both maps are ``MessageQueue`` (inline object keys).
  */
 final class GetConsumerStatusBody
 {
     /** @var array<string, array{mq: MessageQueue, offset: int}> */
     public array $messageQueueTable = [];
-    // 协议里已废弃但结构仍在（consumerTable: clientId → 位点表），解析时照旧兼容
+    // Deprecated in the protocol but the structure is still there (consumerTable: clientId -> offset
+    // table); parsing keeps supporting it as before
     /** @var array<string, list<array{mq: MessageQueue, offset: int}>> */
     public array $consumerTable = [];
 
@@ -866,7 +875,7 @@ final class GetConsumerStatusBody
 
 // ---------------------------------------------------------------- 307 / 309
 
-/** 单个处理队列的快照（应答 307 时逐队列上报）。 */
+/** A snapshot of a single process queue (reported queue by queue when answering 307). */
 final class ProcessQueueInfo
 {
     public int $commitOffset = 0;
@@ -880,7 +889,7 @@ final class ProcessQueueInfo
     public bool $locked = false;
     public int $tryUnlockTimes = 0;
     public int $lastLockTimestamp = 0;
-    public bool $droped = false;          // 协议字段名就是 droped（拼写如此，改了就丢字段）
+    public bool $droped = false;          // the protocol field name really is droped (spelled this way, changing it loses the field)
     public int $lastPullTimestamp = 0;
     public int $lastConsumeTimestamp = 0;
 
@@ -927,7 +936,7 @@ final class ProcessQueueInfo
     }
 }
 
-/** 直接消费的应答结果码。 */
+/** The result codes of a direct consumption. */
 final class CMResult
 {
     public const CR_SUCCESS = 'CR_SUCCESS';
@@ -939,9 +948,10 @@ final class CMResult
 }
 
 /**
- * 直接消费单条消息（309）的应答 body。
+ * The response body of consuming a single message directly (309).
  *
- * 字段全是标量 —— 是这一组 body 里唯一不需要处理 MessageQueue 内联键的一个。
+ * All fields are scalars — it is the only one in this group of bodies that does not need to deal with
+ * MessageQueue inline keys.
  */
 final class ConsumeMessageDirectlyResult
 {

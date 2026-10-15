@@ -1,8 +1,8 @@
-// C# 管理客户端（DefaultMQAdminExt）的**真实集群**联调（管理端 RPC 逐项打通）。
+// C# admin client (DefaultMQAdminExt) **real-cluster** integration (every admin-side RPC exercised).
 //
 //
-// 本程序自身不启动集群；调用方需先启动 nameServer(9876) + broker(10911) 且
-// autoCreateTopicEnable=true。用法（由 Program 以 "admin-live [namesrv]" 形式调用）。
+// This program does not start a cluster itself; the caller must start nameServer(9876) + broker(10911) with
+// autoCreateTopicEnable=true. Usage (invoked by Program as "admin-live [namesrv]").
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -14,7 +14,7 @@ using RocketMQ.Remoting.Protocol;
 
 namespace RocketMQ.Examples;
 
-/// <summary>真实集群管理端全链路联调。</summary>
+/// <summary>Full-chain admin integration against a real cluster.</summary>
 internal static class AdminLive
 {
     private static string _gNamesrv = "127.0.0.1:9876";
@@ -31,7 +31,7 @@ internal static class AdminLive
         Console.WriteLine("[" + (ok ? "PASS" : "FAIL") + "] " + name + (detail.Length > 0 ? "  " + detail : string.Empty));
     }
 
-    // 记录"依赖 broker 侧配置差异、本机不成立"的项，不计入失败。
+    // Records items that "depend on broker-side config differences and do not hold on this machine"; not counted as failures.
     private static void Skip(string name, string detail)
     {
         ++_gSkip;
@@ -42,7 +42,7 @@ internal static class AdminLive
 
     private static byte[] Str2Bytes(string s) => Encoding.UTF8.GetBytes(s);
 
-    // ---------------- 收集第一批消费到的消息（sendMessageBack 需要原始 MessageExt）----------------
+    // ---------------- Collect the first batch of consumed messages (sendMessageBack needs the original MessageExt) ----------------
 
     private sealed class CollectingListener : IMessageListenerConcurrently
     {
@@ -76,20 +76,20 @@ internal static class AdminLive
 
     private static int Report()
     {
-        Console.WriteLine("\n================ 汇总 ================");
+        Console.WriteLine("\n================ Summary ================");
         foreach ((string Name, bool Ok) r in Results)
         {
             Console.WriteLine("  [" + (r.Ok ? "PASS" : "FAIL") + "] " + r.Name);
         }
 
         Console.WriteLine("======================================");
-        Console.WriteLine("总计 " + (_gPass + _gFail).ToString(CultureInfo.InvariantCulture)
-                          + " 项，失败 " + _gFail.ToString(CultureInfo.InvariantCulture)
-                          + " 项，跳过 " + _gSkip.ToString(CultureInfo.InvariantCulture) + " 项");
+        Console.WriteLine("Total " + (_gPass + _gFail).ToString(CultureInfo.InvariantCulture)
+                          + " items, " + _gFail.ToString(CultureInfo.InvariantCulture)
+                          + " failed, " + _gSkip.ToString(CultureInfo.InvariantCulture) + " skipped");
         return _gFail == 0 ? 0 : 1;
     }
 
-    // ---------------- 入口 ----------------
+    // ---------------- Entry point ----------------
 
     public static int Run(string[] args)
     {
@@ -114,7 +114,7 @@ internal static class AdminLive
             return 1;
         }
 
-        // ---------- 1. 集群探活（broker 注册竞态：端口开 != 已注册）----------
+        // ---------- 1. Cluster liveness (broker registration race: port open != registered) ----------
         bool clusterOk = false;
         ClusterInfo? cluster = null;
         string lastErr = string.Empty;
@@ -140,7 +140,7 @@ internal static class AdminLive
 
         if (!clusterOk || cluster is null)
         {
-            Check("集群探活", false, "nameServer 无 broker 注册 last_err=" + lastErr);
+            Check("cluster liveness", false, "nameServer has no registered brokers last_err=" + lastErr);
             admin.Shutdown();
             return Report();
         }
@@ -151,7 +151,7 @@ internal static class AdminLive
             + " addrs=" + addrs.Count.ToString(CultureInfo.InvariantCulture));
         string brokerAddr = addrs[0];
 
-        // ---------- 2. Topic 管理 ----------
+        // ---------- 2. Topic management ----------
         try
         {
             admin.CreateTopic(MixAll.DefaultTopic, topic, 4);
@@ -168,7 +168,7 @@ internal static class AdminLive
         {
             TopicList all = admin.FetchAllTopicList();
             Check("fetchAllTopicList", true, "topicCount=" + all.Topics.Count.ToString(CultureInfo.InvariantCulture));
-            Check("新 topic 出现在 topicList", all.Contains(topic), topic);
+            Check("new topic appears in topicList", all.Contains(topic), topic);
         }
         catch (Exception e)
         {
@@ -187,7 +187,7 @@ internal static class AdminLive
                 if (qd.ReadQueueNums != 4) allFour = false;
             }
 
-            Check("路由 readQueueNums==4", allFour, "ok");
+            Check("route readQueueNums==4", allFour, "ok");
         }
         catch (Exception e)
         {
@@ -212,10 +212,10 @@ internal static class AdminLive
                 + " write=" + cfg.WriteQueueNums.ToString(CultureInfo.InvariantCulture)
                 + " perm=" + cfg.Perm.ToString(CultureInfo.InvariantCulture)
                 + " filter=" + cfg.TopicFilterType);
-            Check("TopicConfig 队列数与创建一致", cfg.ReadQueueNums == 4 && cfg.WriteQueueNums == 4,
+            Check("TopicConfig queue counts match creation", cfg.ReadQueueNums == 4 && cfg.WriteQueueNums == 4,
                 "read=" + cfg.ReadQueueNums.ToString(CultureInfo.InvariantCulture)
                 + " write=" + cfg.WriteQueueNums.ToString(CultureInfo.InvariantCulture));
-            Check("TopicConfig 默认 perm=6", cfg.Perm == 6, "perm=" + cfg.Perm.ToString(CultureInfo.InvariantCulture));
+            Check("TopicConfig default perm=6", cfg.Perm == 6, "perm=" + cfg.Perm.ToString(CultureInfo.InvariantCulture));
         }
         catch (Exception e)
         {
@@ -233,24 +233,24 @@ internal static class AdminLive
             Check("getAllTopicConfig", false, e.Message);
         }
 
-        // ---------- 3. Broker 配置：properties 文本（历史 bug 点）----------
+        // ---------- 3. Broker config: properties text (historical bug spot) ----------
         PropertyMap brokerCfg = new();
         try
         {
             brokerCfg = admin.GetBrokerConfig(brokerAddr);
-            Check("getBrokerConfig(properties 文本)", brokerCfg.Count > 0,
+            Check("getBrokerConfig (properties text)", brokerCfg.Count > 0,
                 "keys=" + brokerCfg.Count.ToString(CultureInfo.InvariantCulture));
             bool hasBn = brokerCfg.TryGetValue("brokerName", out var bn) && (bn?.Length ?? 0) > 0;
-            Check("getBrokerConfig 解析出 brokerName", hasBn, "brokerName=" + (hasBn ? bn : string.Empty));
+            Check("getBrokerConfig parsed brokerName", hasBn, "brokerName=" + (hasBn ? bn : string.Empty));
         }
         catch (Exception e)
         {
-            Check("getBrokerConfig(properties 文本)", false, e.Message);
+            Check("getBrokerConfig (properties text)", false, e.Message);
         }
 
         if (brokerCfg.Count > 0)
         {
-            // 可逆修改：写一个无害配置再还原
+            // Reversible change: write a harmless config then restore it
             bool foundO = brokerCfg.TryGetValue("sendMessageThreadPoolNums", out var o);
             string original = foundO && o != null ? o : string.Empty;
             const string probe = "11";
@@ -262,7 +262,7 @@ internal static class AdminLive
                 Thread.Sleep(1000);
                 PropertyMap after = admin.GetBrokerConfig(brokerAddr);
                 bool ok = after.TryGetValue("sendMessageThreadPoolNums", out var v) && v == probe;
-                Check("updateBrokerConfig 生效", ok, "期望 " + probe + " 实际 " + v);
+                Check("updateBrokerConfig took effect", ok, "expected " + probe + " got " + v);
                 if (original.Length > 0)
                 {
                     var back = new PropertyMap { ["sendMessageThreadPoolNums"] = original };
@@ -275,28 +275,28 @@ internal static class AdminLive
             }
         }
 
-        // ---------- 4. NameServer KV 配置 ----------
+        // ---------- 4. NameServer KV config ----------
         try
         {
             admin.CreateAndUpdateKvConfig(kvNs, "k1", "v1");
             Check("createAndUpdateKvConfig", true, "OK");
             bool found = admin.GetKvConfig(kvNs, "k1", out string value);
             Check("getKVConfig", found, "value=" + value);
-            Check("KV 值往返一致", found && value == "v1", "期望 v1 实际 " + value);
+            Check("KV value round trip", found && value == "v1", "expected v1 got " + value);
             KvTable t = admin.GetKvListByNamespace(kvNs);
-            Check("getKVListByNamespace 含 k1", t.Table.ContainsKey("k1"),
+            Check("getKVListByNamespace contains k1", t.Table.ContainsKey("k1"),
                 "tableSize=" + t.Table.Count.ToString(CultureInfo.InvariantCulture));
             admin.DeleteKvConfig(kvNs, "k1");
             Check("deleteKVConfig", true, "OK");
             bool stillThere = admin.GetKvConfig(kvNs, "k1", out _);
-            Check("KV 删除后不再存在", !stillThere, "found=" + (stillThere ? "1" : "0"));
+            Check("KV gone after delete", !stillThere, "found=" + (stillThere ? "1" : "0"));
         }
         catch (Exception e)
         {
-            Check("NameServer KV 链路", false, e.Message);
+            Check("NameServer KV chain", false, e.Message);
         }
 
-        // ---------- 5. 订阅组管理 ----------
+        // ---------- 5. Subscription group management ----------
         {
             var sgc = new SubscriptionGroupConfig(group) { ConsumeEnable = true, RetryMaxTimes = 5 };
             try
@@ -305,17 +305,17 @@ internal static class AdminLive
                 Check("createAndUpdateSubscriptionGroupConfig", true, "group=" + group);
 
                 bool ok = admin.GetSubscriptionGroupConfig(brokerAddr, group, out SubscriptionGroupConfig single);
-                Check("getSubscriptionGroupConfig(单查)", ok, "found=" + (ok ? "1" : "0"));
+                Check("getSubscriptionGroupConfig (single query)", ok, "found=" + (ok ? "1" : "0"));
                 if (ok)
                 {
-                    Check("订阅组 retryMaxTimes 往返一致", single.RetryMaxTimes == 5,
-                        "实际 " + single.RetryMaxTimes.ToString(CultureInfo.InvariantCulture));
+                    Check("subscription group retryMaxTimes round trip", single.RetryMaxTimes == 5,
+                        "got " + single.RetryMaxTimes.ToString(CultureInfo.InvariantCulture));
                 }
 
                 SubscriptionGroupWrapper wrapper = admin.GetAllSubscriptionGroup(brokerAddr);
-                Check("getAllSubscriptionGroup(分页)", wrapper.SubscriptionGroupTable.Count > 0,
+                Check("getAllSubscriptionGroup (paged)", wrapper.SubscriptionGroupTable.Count > 0,
                     "groups=" + wrapper.SubscriptionGroupTable.Count.ToString(CultureInfo.InvariantCulture));
-                Check("分页结果含新订阅组", wrapper.SubscriptionGroupTable.ContainsKey(group),
+                Check("paged result contains the new subscription group", wrapper.SubscriptionGroupTable.ContainsKey(group),
                     "count=" + wrapper.SubscriptionGroupTable.Count.ToString(CultureInfo.InvariantCulture));
 
                 bool exOk = admin.ExamineSubscriptionGroupConfig(brokerAddr, group, out SubscriptionGroupConfig ex);
@@ -323,11 +323,11 @@ internal static class AdminLive
             }
             catch (Exception e)
             {
-                Check("订阅组管理链路", false, e.Message);
+                Check("subscription group management chain", false, e.Message);
             }
         }
 
-        // ---------- 6. 生产 + 统计 + 查询 ----------
+        // ---------- 6. Produce + stats + query ----------
         var sent = new List<(byte[] Body, string MsgId, string OffsetMsgId)>();
         MessageQueue firstMq = new();
         {
@@ -355,7 +355,7 @@ internal static class AdminLive
                 }
             }
 
-            Check("同步发送 " + nMsg.ToString(CultureInfo.InvariantCulture) + " 条",
+            Check("sync send " + nMsg.ToString(CultureInfo.InvariantCulture) + " messages",
                 sent.Count == nMsg, "ok=" + sent.Count.ToString(CultureInfo.InvariantCulture)
                 + "/" + nMsg.ToString(CultureInfo.InvariantCulture));
             prod.Shutdown();
@@ -377,7 +377,7 @@ internal static class AdminLive
             TopicStatsTable stats = admin.ExamineTopicStats(topic);
             Check("examineTopicStats", stats.OffsetTable.Count > 0,
                 "queues=" + stats.OffsetTable.Count.ToString(CultureInfo.InvariantCulture));
-            Check("TopicStatsTable maxOffset 总和 >= 发送数", stats.TotalMaxOffset() >= nMsg,
+            Check("TopicStatsTable maxOffset sum >= sent count", stats.TotalMaxOffset() >= nMsg,
                 "maxOffsetSum=" + stats.TotalMaxOffset().ToString(CultureInfo.InvariantCulture));
         }
         catch (Exception e)
@@ -409,10 +409,10 @@ internal static class AdminLive
             Check("queryConsumeQueue", false, e.Message);
         }
 
-        // queryMessage：只断言"请求可达、正常应答、返回类型正确"。
-        // 不断言"一定查得到"：msgId 属于 uniqKey，broker 侧 uniqKey 倒排索引只有
-        // RocksDB 索引实现才支持；本机默认文件索引 + 消息未设 KEYS，查不到是
-        // **broker 配置差异**，不是客户端 bug。
+        // queryMessage: only assert "request reachable, normal reply, correct return type".
+        // Do not assert "must find it": msgId is a uniqKey and the broker-side uniqKey inverted index is only
+        // supported by the RocksDB index implementation; with this machine's default file index and no KEYS set,
+        // finding nothing is a **broker config difference**, not a client bug.
         {
             string msgId0 = sent[0].MsgId;
             try
@@ -420,20 +420,20 @@ internal static class AdminLive
                 List<MessageExt> byKey = admin.QueryMessage(topic, msgId0, 32, 0, UtilAll.CurrentTimeMillis() + 60000);
                 List<MessageExt> byKey2 = admin.QueryMessageByKey(topic, msgId0, 32);
                 bool uniqFound = admin.QueryMessageByUniqKey(topic, msgId0, out _);
-                Check("queryMessage 请求可达且正常应答", true,
+                Check("queryMessage request reachable with normal reply", true,
                     "key=" + byKey.Count.ToString(CultureInfo.InvariantCulture)
                     + " normal=" + byKey2.Count.ToString(CultureInfo.InvariantCulture)
                     + " uniq=" + (uniqFound ? "1" : "0"));
-                Skip("queryMessage 命中结果（需 broker 开 RocksDB/KEYS 索引）",
-                    "本机为默认文件索引且消息未设 KEYS，uniqKey 查询返回空属预期");
+                Skip("queryMessage hit result (needs broker RocksDB/KEYS index)",
+                    "this machine uses the default file index and the message has no KEYS; an empty uniqKey query result is expected");
             }
             catch (Exception e)
             {
-                Check("queryMessage 请求可达且正常应答", false, e.Message);
+                Check("queryMessage request reachable with normal reply", false, e.Message);
             }
         }
 
-        // viewMessage(byOffsetMsgId)：只有 broker 赋值的 offset msgId 能解出 commitLog 偏移
+        // viewMessage(byOffsetMsgId): only a broker-assigned offset msgId can decode the commitLog offset
         try
         {
             MessageExt vm = admin.ViewMessage(topic, sent[0].OffsetMsgId);
@@ -443,33 +443,33 @@ internal static class AdminLive
                 "topic=" + vm.Topic + " offset=" + vm.QueueOffset.ToString(CultureInfo.InvariantCulture)
                 + " body=" + head);
             bool bodyEq = vm.Body.Length == sent[0].Body.Length && vm.Body.AsSpan().SequenceEqual(sent[0].Body.AsSpan());
-            Check("viewMessage body 与发送一致", bodyEq,
-                "期望 " + Bytes2Str(sent[0].Body) + " 实际 " + Bytes2Str(vm.Body));
+            Check("viewMessage body matches what was sent", bodyEq,
+                "expected " + Bytes2Str(sent[0].Body) + " got " + Bytes2Str(vm.Body));
         }
         catch (Exception e)
         {
             Check("viewMessage(byOffsetMsgId)", false, e.Message);
         }
 
-        // viewMessage(uniqKey)：5.x 的 msgId 解不出偏移，必须走 uniqKey 兜底并给出干净异常，
-        // 而不是拿垃圾端口去 connect（曾表现为 "connect failed to 192.168.0.105:371196628"）
+        // viewMessage(uniqKey): the 5.x msgId cannot decode an offset; must fall back to uniqKey with a clean exception,
+        // instead of connecting with a garbage port (previously showed "connect failed to 192.168.0.105:371196628")
         try
         {
             admin.ViewMessage(topic, sent[0].MsgId);
-            Check("viewMessage(uniqKey) 走兜底并给出干净异常", false, "没有抛异常");
+            Check("viewMessage(uniqKey) falls back with a clean exception", false, "no exception was thrown");
         }
         catch (MQClientException e)
         {
-            Check("viewMessage(uniqKey) 走兜底并给出干净异常", true, "code="
+            Check("viewMessage(uniqKey) falls back with a clean exception", true, "code="
                 + e.ResponseCode.ToString(CultureInfo.InvariantCulture));
         }
         catch (Exception e)
         {
-            Check("viewMessage(uniqKey) 走兜底并给出干净异常", false,
+            Check("viewMessage(uniqKey) falls back with a clean exception", false,
                 e.GetType().Name + ": " + e.Message);
         }
 
-        // ---------- 7. Offset 只读查询 ----------
+        // ---------- 7. Offset read-only queries ----------
         try
         {
             maxOff = admin.MaxOffset(mq);
@@ -479,22 +479,22 @@ internal static class AdminLive
             Check("searchOffset(now) >= minOffset", admin.SearchOffset(mq, UtilAll.CurrentTimeMillis()) >= minOff, "ok");
             Check("earliestMsgStoreTime > 0", admin.EarliestMsgStoreTime(mq) > 0, "ok");
             bool offOk = admin.ExamineConsumerOffset(group, mq, out long off);
-            Check("examineConsumerOffset 可调用", true, "offset=" + off.ToString(CultureInfo.InvariantCulture));
+            Check("examineConsumerOffset callable", true, "offset=" + off.ToString(CultureInfo.InvariantCulture));
         }
         catch (Exception e)
         {
-            Check("Offset 只读查询", false, e.Message);
+            Check("Offset read-only queries", false, e.Message);
         }
 
         string bndTopic = "AdminBoundaryTopicDotnet_" + stamp;
         try
         {
             admin.CreateTopic(MixAll.DefaultTopic, bndTopic, 1);
-            Check("createTopic(" + bndTopic + ", 1 队列)", true, "queueNum=1");
+            Check("createTopic(" + bndTopic + ", 1 queue)", true, "queueNum=1");
         }
         catch (Exception e)
         {
-            Check("createTopic(" + bndTopic + ", 1 队列)", false, e.Message);
+            Check("createTopic(" + bndTopic + ", 1 queue)", false, e.Message);
         }
 
         try
@@ -511,12 +511,12 @@ internal static class AdminLive
                     Str2Bytes("boundary-" + i.ToString(CultureInfo.InvariantCulture))));
             }
 
-            Check("boundary topic 发送 3 条", true, "ok");
+            Check("boundary topic sent 3 messages", true, "ok");
             bprod.Shutdown();
         }
         catch (Exception e)
         {
-            Check("boundary topic 发送 3 条", false, e.Message);
+            Check("boundary topic sent 3 messages", false, e.Message);
         }
 
         Thread.Sleep(2000);
@@ -531,20 +531,20 @@ internal static class AdminLive
             long upPast = admin.SearchUpperBoundaryOffset(bmq, 1);
             Check("boundary topic maxOffset == 3", bMax == 3,
                 "max=" + bMax.ToString(CultureInfo.InvariantCulture));
-            Check("LOWER 边界 = maxOffset（队尾之后的下一个位点）", lo == bMax,
+            Check("LOWER boundary = maxOffset (the next offset after the queue tail)", lo == bMax,
                 "lower=" + lo.ToString(CultureInfo.InvariantCulture)
                 + " maxOffset=" + bMax.ToString(CultureInfo.InvariantCulture));
-            Check("UPPER 边界 = maxOffset-1（最后一条自身位点）", up == bMax - 1,
+            Check("UPPER boundary = maxOffset-1 (the last message's own offset)", up == bMax - 1,
                 "upper=" + up.ToString(CultureInfo.InvariantCulture)
                 + " maxOffset-1=" + (bMax - 1).ToString(CultureInfo.InvariantCulture));
-            Check("两个边界确实不同（证明 boundaryType 生效）", lo != up,
+            Check("the two boundaries really differ (proves boundaryType works)", lo != up,
                 "lower=" + lo.ToString(CultureInfo.InvariantCulture)
                 + " upper=" + up.ToString(CultureInfo.InvariantCulture));
-            Check("时间戳早于全部消息时 LOWER/UPPER 都塌到 minOffset",
+            Check("when the timestamp precedes all messages both LOWER/UPPER collapse to minOffset",
                 loPast == 0 && upPast == 0,
                 "lower=" + loPast.ToString(CultureInfo.InvariantCulture)
                 + " upper=" + upPast.ToString(CultureInfo.InvariantCulture));
-            Check("searchOffset 默认边界与显式 LOWER 同结果",
+            Check("searchOffset default boundary matches explicit LOWER",
                 admin.SearchOffset(bmq, future) == lo,
                 "lower=" + lo.ToString(CultureInfo.InvariantCulture));
         }
@@ -553,10 +553,10 @@ internal static class AdminLive
             Check("searchOffset boundaryType", false, e.Message);
         }
 
-        // ---------- 8. 消费 + sendMessageBack 重投 ----------
-        // 顺序很关键：必须**先消费**再重投。若先把位点重置到 max，消费者就再也拉不到
-        // 历史消息，sendMessageBack 路径根本没机会执行。
-        // 本组是新建的、无已提交位点，故 FIRST_OFFSET 会真正从最小位点开始读。
+        // ---------- 8. Consume + sendMessageBack redelivery ----------
+        // Order matters: consume FIRST, then redeliver. If the offset is reset to max beforehand the consumer can
+        // never pull the historical messages and the sendMessageBack path never gets to run.
+        // This group is brand new with no committed offsets, so FIRST_OFFSET really starts from the minimum offset.
         string retryTopic = MixAll.GetRetryTopic(group);
         bool backsent = false;
         {
@@ -576,7 +576,7 @@ internal static class AdminLive
                 Thread.Sleep(500);
             }
 
-            Check("消费到消息（sendMessageBack 前置）", listener.Count() >= 1,
+            Check("consumed messages (prerequisite for sendMessageBack)", listener.Count() >= 1,
                 "consumed=" + listener.Count().ToString(CultureInfo.InvariantCulture));
 
             if (listener.Count() >= 1)
@@ -586,7 +586,7 @@ internal static class AdminLive
                 {
                     bool ok = cons.SendMessageBack(first, 0);
                     backsent = true;
-                    Check("consumer.sendMessageBack(重投到 " + retryTopic + ")", ok,
+                    Check("consumer.sendMessageBack (redelivered to " + retryTopic + ")", ok,
                         "origin_topic=" + first.Topic + " commitLogOffset=" + first.CommitLogOffset.ToString(CultureInfo.InvariantCulture));
                 }
                 catch (Exception e)
@@ -598,10 +598,10 @@ internal static class AdminLive
             cons.Shutdown();
         }
 
-        // 校验 %RETRY% 里出现该消息：必须轮询而不是立即断言。
-        // broker 的 SendMessageProcessor.consumerSendMsgBack 在 delayLevel == 0 时会改写
-        // 成 `3 + reconsumeTimes`（默认 3 -> 10s），消息先进 SCHEDULE_TOPIC_XXXX，
-        // 到点才投递到 %RETRY%<group>。
+        // Verifying it shows up in %RETRY% requires polling, not an immediate assertion.
+        // The broker's SendMessageProcessor.consumerSendMsgBack rewrites delayLevel == 0 into
+        // `3 + reconsumeTimes` (default 3 -> 10s); the message first enters SCHEDULE_TOPIC_XXXX,
+        // and only reaches %RETRY%<group> when the delay expires.
         if (backsent)
         {
             long retryMax = -1;
@@ -623,10 +623,10 @@ internal static class AdminLive
                 ++waited;
             }
 
-            Check("sendMessageBack 落到 " + retryTopic + "（maxOffsetSum>0）", retryMax > 0,
+            Check("sendMessageBack landed in " + retryTopic + " (maxOffsetSum>0)", retryMax > 0,
                 "maxOffsetSum=" + retryMax.ToString(CultureInfo.InvariantCulture)
-                + "（轮询 " + waited.ToString(CultureInfo.InvariantCulture)
-                + "s；broker 把 delayLevel=0 改写为 3，约 10s 后可见）");
+                + " (polled " + waited.ToString(CultureInfo.InvariantCulture)
+                + "s; the broker rewrites delayLevel=0 into 3, visible in about 10s)");
         }
 
         {
@@ -664,15 +664,15 @@ internal static class AdminLive
                 }
             }
 
-            Check("fetchConsumeStatsInBroker 按订阅组出行", rows > 0,
+            Check("fetchConsumeStatsInBroker one row per subscription group", rows > 0,
                 "groups=" + rows.ToString(CultureInfo.InvariantCulture));
-            Check("fetchConsumeStatsInBroker 本组统计带 offsetTable", groupWithOffsets,
-                "轮询 " + waited.ToString(CultureInfo.InvariantCulture) + "s");
+            Check("fetchConsumeStatsInBroker group stats carry an offsetTable", groupWithOffsets,
+                "polled " + waited.ToString(CultureInfo.InvariantCulture) + "s");
         }
 
-        // ---------- 9. 真实 broker 端位点重置（放最后，避免干扰上面的消费）----------
+        // ---------- 9. Real broker-side offset reset (last, so it does not disturb the consumption above) ----------
         {
-            long ts = UtilAll.CurrentTimeMillis() + 60000; // 未来时间 -> 位点应被推到 max
+            long ts = UtilAll.CurrentTimeMillis() + 60000; // future time -> offsets should be pushed to max
             try
             {
                 SortedDictionary<MessageQueue, long> reset = admin.ResetOffsetByTimestamp(topic, group, ts, true);
@@ -681,7 +681,7 @@ internal static class AdminLive
                 Thread.Sleep(1000);
                 bool foundOff = admin.ExamineConsumerOffset(group, mq, out long off);
                 long maxNow = admin.MaxOffset(mq);
-                Check("reset 后消费者位点被推到 maxOffset", foundOff && off >= maxNow - 1,
+                Check("after reset the consumer offset was pushed to maxOffset", foundOff && off >= maxNow - 1,
                     "consumerOffset=" + off.ToString(CultureInfo.InvariantCulture)
                     + " maxOffset=" + maxNow.ToString(CultureInfo.InvariantCulture));
             }
@@ -700,7 +700,7 @@ internal static class AdminLive
             }
             catch (Exception e)
             {
-                Check("minOffset(reset 前置)", false, e.Message);
+                Check("minOffset (reset precondition)", false, e.Message);
                 minReset = -1;
             }
             if (minReset >= 0)
@@ -709,18 +709,18 @@ internal static class AdminLive
                 {
                     SortedDictionary<MessageQueue, long> table =
                         admin.ResetOffsetByQueueId(brokerAddr, group, topic, queueId, minReset);
-                    Check("resetOffsetByQueueId(回到 minOffset)",
+                    Check("resetOffsetByQueueId (back to minOffset)",
                         table.Count == 0 || table.Keys.First().QueueId == queueId,
                         "returnedTable=" + table.Count.ToString(CultureInfo.InvariantCulture)
-                        + "（协议语义为 void，可为空）");
+                        + " (the protocol semantics are void, may be empty)");
                     bool found = admin.ExamineConsumerOffset(group, mq, out long off);
-                    Check("resetOffsetByQueueId 后位点==目标 offset", found && off == minReset,
+                    Check("offset == target offset after resetOffsetByQueueId", found && off == minReset,
                         "consumerOffset=" + off.ToString(CultureInfo.InvariantCulture)
                         + " target=" + minReset.ToString(CultureInfo.InvariantCulture));
                 }
                 catch (Exception e)
                 {
-                    Check("resetOffsetByQueueId(回到 minOffset)", false, e.Message);
+                    Check("resetOffsetByQueueId (back to minOffset)", false, e.Message);
                 }
 
                 try
@@ -729,19 +729,19 @@ internal static class AdminLive
                     pull.SetNamesrvAddr(_gNamesrv);
                     pull.Start();
                     PullResult first = pull.Pull(mq, "*", minReset, 16, 5000);
-                    Check("重置后首笔 pull 被 broker 短路成 PULL_OFFSET_MOVED",
+                    Check("the first pull after reset is short-circuited by the broker into PULL_OFFSET_MOVED",
                         first.Status == PullStatus.OffsetIllegal && first.NextBeginOffset == minReset,
                         "status=" + first.Status + " nextBeginOffset="
                         + first.NextBeginOffset.ToString(CultureInfo.InvariantCulture));
                     PullResult second = pull.Pull(mq, "*", first.NextBeginOffset, 16, 5000);
-                    Check("重置位点之后可重新拉到历史消息", second.MsgFoundList.Count > 0,
+                    Check("historical messages are pullable again after the reset", second.MsgFoundList.Count > 0,
                         "status=" + second.Status + " found="
                         + second.MsgFoundList.Count.ToString(CultureInfo.InvariantCulture));
                     pull.Shutdown();
                 }
                 catch (Exception e)
                 {
-                    Check("重置后回拉", false, e.Message);
+                    Check("re-pull after reset", false, e.Message);
                 }
 
                 try
@@ -758,29 +758,29 @@ internal static class AdminLive
                         rejected = true;
                         remark = e.Message;
                     }
-                    Check("resetOffsetByQueueId 越界目标被 broker 拒绝", rejected,
+                    Check("resetOffsetByQueueId out-of-range target rejected by the broker", rejected,
                         "badTarget=" + badTarget.ToString(CultureInfo.InvariantCulture)
                         + " " + remark.Substring(0, Math.Min(120, remark.Length)));
                     bool found = admin.ExamineConsumerOffset(group, mq, out long off);
-                    Check("越界 reset 停留在第 1 笔写入的非法位点（两笔 RPC 非原子）",
+                    Check("the out-of-range reset stays at the first written illegal offset (the two RPCs are not atomic)",
                         found && off == badTarget,
                         "consumerOffset=" + off.ToString(CultureInfo.InvariantCulture));
                 }
                 catch (Exception e)
                 {
-                    Check("resetOffsetByQueueId 越界目标被 broker 拒绝", false, e.Message);
+                    Check("resetOffsetByQueueId out-of-range target rejected by the broker", false, e.Message);
                 }
             }
 
-            // 343 读的是 broker 的 offsetTable（whichTopicByConsumer），组提交过位点才有内容。
+            // 343 reads the broker's offsetTable (whichTopicByConsumer); the group only shows up after committing offsets.
             try
             {
                 TopicList byBroker = admin.QueryTopicsByConsumerToBroker(brokerAddr, group);
-                Check("queryTopicsByConsumerToBroker 读出本组消费过的 topic",
+                Check("queryTopicsByConsumerToBroker reads the topics this group consumed",
                     byBroker.Topics.Contains(topic),
                     "topics=" + byBroker.Topics.Count.ToString(CultureInfo.InvariantCulture));
                 TopicList byGroup = admin.QueryTopicsByConsumer(group);
-                Check("queryTopicsByConsumer(group) 按 %RETRY% 路由扇出并合并",
+                Check("queryTopicsByConsumer(group) fans out over the %RETRY% route and merges",
                     byGroup.Topics.Contains(topic),
                     "topics=" + byGroup.Topics.Count.ToString(CultureInfo.InvariantCulture));
             }
@@ -790,7 +790,7 @@ internal static class AdminLive
             }
         }
 
-        // ---------- 10. 清理 ----------
+        // ---------- 10. Cleanup ----------
         try
         {
             admin.DeleteSubscriptionGroup(brokerAddr, group, true);
@@ -807,7 +807,7 @@ internal static class AdminLive
             Check("deleteTopic", true, "OK");
             Thread.Sleep(1000);
             TopicList after = admin.FetchAllTopicList();
-            Check("deleteTopic 后 topic 消失", !after.Contains(topic), topic);
+            Check("topic gone after deleteTopic", !after.Contains(topic), topic);
         }
         catch (Exception e)
         {

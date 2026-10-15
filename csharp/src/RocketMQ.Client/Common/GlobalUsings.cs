@@ -1,6 +1,6 @@
-// 全局基础类型别名。
+// Global basic type aliases.
 //
-// PropertyMap 用 SortedDictionary 而不是 Dictionary：
-//   有序字典按键输出，properties2String 的输出顺序因此是确定的；
-//   broker 侧按行解析虽不依赖顺序，但确定序便于测试与排查。
+// PropertyMap uses SortedDictionary instead of Dictionary:
+//   an ordered dictionary outputs keys in order, so the output order of properties2String is deterministic;
+//   although the broker-side line-by-line parsing does not depend on order, a deterministic order aids testing and troubleshooting.
 global using PropertyMap = System.Collections.Generic.SortedDictionary<string, string>;

@@ -4,12 +4,12 @@ using RocketMQ.Remoting.Protocol;
 
 namespace RocketMQ.Client;
 
-// 测试工程与本程序集没有 InternalsVisibleTo 关系，故用 public，勿用于业务代码
-// （业务侧入口是 MqClient.GetBrokerNameFromMessageQueue / PopAckAddrFor）。
+// The test project has no InternalsVisibleTo relationship with this assembly, so these are public; do not use for business code
+// (the business entry points are MqClient.GetBrokerNameFromMessageQueue / PopAckAddrFor).
 public static class StaticTopic
 {
     // MixAll.METADATA_SCOPE_GLOBAL / LOGICAL_QUEUE_MOCK_BROKER_PREFIX /
-    // LOGICAL_QUEUE_MOCK_BROKER_NAME_NOT_EXIST。
+    // LOGICAL_QUEUE_MOCK_BROKER_NAME_NOT_EXIST.
     public const string MetadataScopeGlobal = "__global__";
     public const string LogicalQueueMockBrokerPrefix = "__syslo__";
     public const string LogicalQueueMockNotExist = "__syslo__none__";
@@ -18,7 +18,7 @@ public static class StaticTopic
         brokerName.StartsWith(LogicalQueueMockBrokerPrefix, StringComparison.Ordinal);
 
     /// <summary>
-    /// getMockBrokerName："__global__"（scope 本身）剥掉头两个字符，其余 scope 原样加前缀。
+    /// getMockBrokerName: "__global__" (the scope itself) strips its first two characters; other scopes keep their value with a prefix added.
     /// </summary>
     public static string GetMockBrokerName(string scope)
     {
@@ -36,7 +36,7 @@ public static class StaticTopic
         public int TotalQueues;
         public string Bname = string.Empty;
         public long Epoch;
-        // globalId -> 物理 queueId。物理 id 不参与端点推导，只保留给排查用。
+        // globalId -> physical queueId. The physical id is not used in endpoint derivation, kept only for troubleshooting.
         public readonly SortedDictionary<int, int> CurrIdMap = new();
     }
 
@@ -74,7 +74,7 @@ public static class StaticTopic
         {
             foreach (var kv in currIdMap.ObjectItems())
             {
-                // 键是 globalId 的十进制字符串；解析失败的条目跳过。
+                // The key is the decimal string of globalId; entries that fail to parse are skipped.
                 if (!int.TryParse(kv.Key, NumberStyles.Integer, CultureInfo.InvariantCulture,
                         out int gid) || !kv.Value.IsNumber)
                 {
@@ -89,10 +89,10 @@ public static class StaticTopic
     }
 
     /// <summary>
-    /// ClientMetadata.topicRouteData2EndpointsForStaticTopic：构建逻辑队列集
-    /// MessageQueue(topic, mockBrokerName(scope), globalId) -> 承载它的真实 broker 名
-    /// （total 范围内没有承载者的逻辑 id 指向 "__syslo__none__"）。
-    /// 空映射（非静态主题）返回 false 且不动 out。
+    /// ClientMetadata.topicRouteData2EndpointsForStaticTopic: build the logical queue set
+    /// MessageQueue(topic, mockBrokerName(scope), globalId) -> the real broker name that hosts it
+    /// (logical ids with no host within the total range point to "__syslo__none__").
+    /// An empty mapping (non-static topic) returns false and leaves out unchanged.
     /// </summary>
     public static bool TopicRouteData2EndpointsForStaticTopic(string topic,
         TopicRouteData route, Dictionary<MessageQueue, string> outEndpoints)
@@ -142,7 +142,7 @@ public static class StaticTopic
                     maxTotalNums = info.TotalQueues;
                 }
 
-                // 只有 global id（键）形状决定端点集；物理 id 是 broker 内部的。
+                // Only the global id (the key) shape determines the endpoint set; the physical id is broker-internal.
                 foreach (int globalId in info.CurrIdMap.Keys)
                 {
                     var mq = new MessageQueue(topic, mockName, globalId);
@@ -154,8 +154,8 @@ public static class StaticTopic
                 }
             }
 
-            // 补齐静态逻辑队列：total 之下的每个 id 都存在；没有承载者的指向
-            // NOT_EXIST 哨兵。
+            // Fill in the static logical queues: every id below total exists; those with no host point to the
+            // NOT_EXIST sentinel.
             for (int i = 0; i < maxTotalNums; i++)
             {
                 var mq = new MessageQueue(topic, mockName, i);

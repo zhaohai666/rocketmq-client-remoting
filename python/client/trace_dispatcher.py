@@ -43,7 +43,7 @@ class _BrokerSetSelector:
 
 
 class AsyncTraceDispatcher:
-    """轨迹异步分发器。"""
+    """Async trace dispatcher."""
 
     _COUNTER = itertools.count(1)
     _INSTANCE_NUM = itertools.count(0)
@@ -74,13 +74,13 @@ class AsyncTraceDispatcher:
                                             thread_name_prefix="MQTraceSendThread_%d_" % self.trace_instance_id)
         self.trace_producer = self._get_and_create_trace_producer(rpc_hook)
 
-    # ---------------- 内部生产者 ----------------
+    # ---------------- internal producer ----------------
     def _get_and_create_trace_producer(self, rpc_hook):
         from .producer import DefaultMQProducer
         producer = DefaultMQProducer(self._gen_group_name_for_trace(), rpc_hook)
         producer.set_send_msg_timeout(5000)
         producer.set_max_message_size(self.max_msg_size)
-        # ⚠ 必须关闭自身的轨迹，否则轨迹消息会被再次追踪 → 无限递归
+        # WARNING: must disable tracing for itself, otherwise trace messages would be traced again -> infinite recursion
         producer.set_enable_trace(False)
         return producer
 
@@ -105,12 +105,12 @@ class AsyncTraceDispatcher:
         return self.namespace_v2
 
     def _client_id(self) -> str:
-        """宿主客户端的 clientId（EndTransaction 轨迹的 clientHost 用它）。"""
+        """The host client's clientId (used as clientHost for EndTransaction trace)."""
         host = self.host_producer if self.host_producer is not None else self.host_consumer
         client = getattr(host, "_mq_client", None) if host is not None else None
         return getattr(client, "client_id", "") or "" if client is not None else ""
 
-    # ---------------- 生命周期 ----------------
+    # ---------------- lifecycle ----------------
     def start(self, name_srv_addr: str, access_channel: Optional[AccessChannel] = None) -> None:
         with self._lock:
             if not self.is_started:
@@ -149,7 +149,7 @@ class AsyncTraceDispatcher:
             pass
         self.stopped = True
 
-    # ---------------- 入队 / 刷写 ----------------
+    # ---------------- enqueue / flush ----------------
     def append(self, ctx) -> bool:
         pass
         try:
@@ -197,7 +197,7 @@ class AsyncTraceDispatcher:
         self._last_flush_time = int(time.time() * 1000)
         self._executor.submit(self._send_trace_data, context_list)
 
-    # ---------------- 发送 ----------------
+    # ---------------- send ----------------
     def _send_trace_data(self, context_list: List[TraceContext]) -> None:
         pass
         bean_map = {}
@@ -239,7 +239,7 @@ class AsyncTraceDispatcher:
 
     def _send_trace_data_by_mq(self, key_set: set, data: str, trace_topic: str) -> None:
         msg = Message(trace_topic, data.encode("utf-8"))
-        # keys 里放的是**原始消息的 msgId**（不是 offsetMsgId），控制台按它反查轨迹
+        # keys holds the **original message's msgId** (not offsetMsgId); the console uses it to look up the trace
         msg.set_keys(MessageConst.KEY_SEPARATOR.join(sorted(k for k in key_set if k)))
         try:
             trace_broker_set = self._try_get_message_queue_broker_set(self.trace_producer, trace_topic)

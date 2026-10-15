@@ -1,8 +1,8 @@
-//! 打开 `autoBatch` 之后，`send(Message)` 不再一条一条直发，而是先按
-//! `AggregateKey(topic, mq, waitStoreMsgOK, tag)` 归并进 `MessageAccumulation`，攒够
-//! `holdMs` / `holdSize`（或被守卫线程唤醒）再合成**一个** `MessageBatch` 发出去，
-//! 最后把 broker 回的**批量** `SendResult` 拆回每条消息各自的 `SendResult` —— 调用方
-//! 看到的东西与直发一致。
+//! With `autoBatch` on, `send(Message)` no longer sends one message at a time; messages are first
+//! merged by `AggregateKey(topic, mq, waitStoreMsgOK, tag)` into `MessageAccumulation`, accumulated
+//! until `holdMs` / `holdSize` is reached (or the guard thread wakes it), then composed into **one** `MessageBatch` and sent;
+//! finally the broker's **batch** `SendResult` is split back into each message's own `SendResult` -- what the
+//! caller sees is identical to direct sending.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -69,7 +69,7 @@ pub fn clone_error(err: &Error) -> Error {
     }
 }
 
-// ================================================================ 归并键
+// ================================================================ aggregation key
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AggregateKey {
@@ -103,7 +103,7 @@ impl AggregateKey {
     }
 }
 
-// ================================================================ 批次
+// ================================================================ batch
 
 struct AccumState {
     closed: bool,
@@ -162,22 +162,22 @@ impl MessageAccumulation {
         lock(&self.state).messages_size
     }
 
-    /// 本批的 `send_callbacks` 快照（只有异步 `add` 会写；取证/测试用）。
+    /// Snapshot of this batch's `send_callbacks` (written only by async `add`; forensic/testing use).
     pub fn send_callbacks(&self) -> Vec<Arc<dyn SendCallback>> {
         lock(&self.state).send_callbacks.clone()
     }
 
-    /// 本批已收集到的 keys 快照（只有同步 `add` 会写；取证/测试用）。
+    /// Snapshot of the keys collected in this batch (written only by sync `add`; forensic/testing use).
     pub fn keys(&self) -> HashSet<String> {
         lock(&self.state).keys.clone()
     }
 
-    /// 本批当前的消息快照（取证/测试用）。
+    /// Snapshot of the messages currently in this batch (forensic/testing use).
     pub fn messages_snapshot(&self) -> Vec<Message> {
         lock(&self.state).messages.clone()
     }
 
-    /// 拆条结果（测试/取证用）。
+    /// Per-message split results (testing/forensic use).
     pub fn send_results_snapshot(&self) -> Vec<SendResult> {
         lock(&self.send_results).clone()
     }
@@ -269,7 +269,7 @@ impl MessageAccumulation {
         let mut batch = MessageBatch::new(st.messages.clone());
         batch.message.set_topic(&self.key.topic);
         batch.message.set_wait_store_msg_ok(self.key.wait_store_msg_ok);
-        // 无条件写（空集合即 KEYS=""，见文件头第 5 条）
+        // Written unconditionally (an empty set means KEYS="", see item 5 of the file header)
         let mut keys: Vec<&str> = st.keys.iter().map(String::as_str).collect();
         keys.sort_unstable();
         batch.message.set_keys(&keys.join(KEY_SEPARATOR));
@@ -370,7 +370,7 @@ impl MessageAccumulation {
         self.send_sync()
     }
 
-    /// 测试用：手工触发一次异步发送（守卫线程 `readyToSend` 分支干的那件事）。
+    /// Test hook: manually triggers one async send (what the guard thread's `readyToSend` branch does).
     pub fn force_async_send(self: &Arc<Self>) {
         self.send_async_now();
     }
@@ -429,10 +429,10 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-// ================================================================ 累加器
+// ================================================================ accumulator
 
-/// 累加器的共享状态（`ProduceAccumulator` 只是它的一个 `Arc` 句柄，
-/// 与 `DefaultMQProducer` 的形状一致）。
+/// Shared state of the accumulator (`ProduceAccumulator` is just an `Arc` handle to it,
+/// matching the shape of `DefaultMQProducer`).
 struct AccumulatorInner {
     instance_name: String,
     hold_ms: AtomicI64,
@@ -574,12 +574,12 @@ impl ProduceAccumulator {
         false
     }
 
-    /// 批次发送完成后的归还。
+    /// Release after a batch send completes.
     pub fn release_hold(&self, size: i64) {
         *lock(&self.inner.currently_hold_size) -= size;
     }
 
-    // ---------------- 表操作 ----------------
+    // ---------------- table operations ----------------
     fn get_or_create_sync_batch(&self, key: &AggregateKey) -> Arc<MessageAccumulation> {
         let mut table = lock(&self.inner.sync_batches);
         if let Some(existing) = table.get(key) {
@@ -658,7 +658,7 @@ impl ProduceAccumulator {
         }
     }
 
-    // ---------------- 守卫线程 ----------------
+    // ---------------- guard thread ----------------
     fn guard_loop(&self, sync: bool) {
         while !self.inner.stopped.load(Ordering::Acquire) {
             self.guard_once(sync);
@@ -690,40 +690,40 @@ impl ProduceAccumulator {
         std::thread::sleep(Duration::from_millis(sleep_ms as u64));
     }
 
-    // ---------------- 取证 / 测试接缝 ----------------
-    /// 同步表里当前的批次数。
+    // ---------------- forensic / testing seams ----------------
+    /// Current batch count in the sync table.
     pub fn sync_batch_count(&self) -> usize {
         lock(&self.inner.sync_batches).len()
     }
 
-    /// 异步表里当前的批次数。
+    /// Current batch count in the async table.
     pub fn async_batch_count(&self) -> usize {
         lock(&self.inner.async_batches).len()
     }
 
-    /// 同步表快照（顺序不定）。
+    /// Snapshot of the sync table (order unspecified).
     pub fn sync_batches_snapshot(&self) -> Vec<Arc<MessageAccumulation>> {
         lock(&self.inner.sync_batches).values().cloned().collect()
     }
 
-    /// 异步表快照（顺序不定）。
+    /// Snapshot of the async table (order unspecified).
     pub fn async_batches_snapshot(&self) -> Vec<Arc<MessageAccumulation>> {
         lock(&self.inner.async_batches).values().cloned().collect()
     }
 
-    /// 测试用：往同步表里放一个（尚无人 add 的）批次 —— 用来验证守卫线程对
-    /// `messages_size == 0` 的清理口径，正常调用链里这个窗口只有一两行代码那么宽。
+    /// Test hook: puts a batch into the sync table that nobody has `add`ed to yet -- used to verify
+    /// the guard thread's cleanup convention for `messages_size == 0`; in the normal call chain this window is only a line or two of code wide.
     pub fn put_empty_sync_batch(&self, key: AggregateKey) -> Arc<MessageAccumulation> {
         self.get_or_create_sync_batch(&key)
     }
 
-    /// 测试用：手工跑一轮守卫（等价于守卫线程某个 `doWork` 周期）。
+    /// Test hook: manually runs one guard round (equivalent to one `doWork` cycle of the guard thread).
     pub fn run_guard_once(&self, sync: bool) {
         self.guard_once(sync);
     }
 }
 
-// ================================================================ 进程级复用表
+// ================================================================ process-level reuse table
 
 fn registry() -> &'static Mutex<HashMap<String, ProduceAccumulator>> {
     static TABLE: OnceLock<Mutex<HashMap<String, ProduceAccumulator>>> = OnceLock::new();

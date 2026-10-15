@@ -6,18 +6,18 @@ use serde_json::Value;
 use crate::common::message::MessageQueue;
 use crate::remoting::protocol::route::TopicRouteData;
 
-/// `MixAll.METADATA_SCOPE_GLOBAL`。
+/// Metadata scope that spans all brokers.
 pub const METADATA_SCOPE_GLOBAL: &str = "__global__";
-/// `MixAll.LOGICAL_QUEUE_MOCK_BROKER_PREFIX`。
+/// Prefix of the mock broker name that stands in for a logical queue.
 pub const LOGICAL_QUEUE_MOCK_BROKER_PREFIX: &str = "__syslo__";
-/// `MixAll.LOGICAL_QUEUE_MOCK_BROKER_NAME_NOT_EXIST`。
+/// Mock broker name sentinel marking a logical queue with no hosting broker.
 pub const LOGICAL_QUEUE_MOCK_NOT_EXIST: &str = "__syslo__none__";
 
 pub(crate) fn is_logical_queue_mock_broker_name(broker_name: &str) -> bool {
     broker_name.starts_with(LOGICAL_QUEUE_MOCK_BROKER_PREFIX)
 }
 
-/// `getMockBrokerName`：`__global__`（scope 本身）剥掉头两个字符，其余 scope 原样加前缀。
+/// Builds the mock broker name for a scope: for `"__global__"` (the scope itself) the first two characters are stripped; any other scope is prefixed as-is.
 pub fn get_mock_broker_name(scope: &str) -> String {
     if scope == METADATA_SCOPE_GLOBAL {
         format!("{}{}", LOGICAL_QUEUE_MOCK_BROKER_PREFIX, &scope[2..])
@@ -32,7 +32,7 @@ pub(crate) struct TopicQueueMappingInfo {
     pub total_queues: i32,
     pub bname: String,
     pub epoch: i64,
-    /// globalId -> 物理 queueId。物理 id 不参与端点推导，只保留给排查用。
+    /// globalId -> physical queueId. The physical id does not take part in endpoint derivation; it is kept only for troubleshooting.
     pub curr_id_map: BTreeMap<i32, i32>,
 }
 
@@ -68,10 +68,10 @@ pub(crate) fn parse_topic_queue_mapping_info(raw: &Value) -> Option<TopicQueueMa
     Some(info)
 }
 
-/// `ClientMetadata.topicRouteData2EndpointsForStaticTopic`：构建逻辑队列集
-/// `MessageQueue(topic, mockBrokerName(scope), globalId) -> 承载它的真实 broker 名`
-/// （total 范围内没有承载者的逻辑 id 指向 `__syslo__none__`）。
-/// 空映射（非静态主题）返回 `None`。
+/// Builds the logical queue set for a static topic:
+/// `MessageQueue(topic, mockBrokerName(scope), globalId) -> the real broker name hosting it`
+/// (logical ids within the total range that have no host point to `__syslo__none__`).
+/// Returns `None` for an empty mapping (non-static topic).
 pub fn topic_route_data_2_endpoints_for_static_topic(
     topic: &str,
     route: &TopicRouteData,
@@ -100,13 +100,13 @@ pub fn topic_route_data_2_endpoints_for_static_topic(
         let mut max_total_nums = 0i32;
         let max_total_num_of_epoch: i64 = -1;
         let mock_name = get_mock_broker_name(&scope);
-        // MessageQueue -> (epoch, bname)。
+        // MessageQueue -> (epoch, bname).
         let mut mq_end_points: HashMap<MessageQueue, (i64, String)> = HashMap::new();
         for (_, info) in &infos {
             if info.epoch >= max_total_num_of_epoch && info.total_queues > max_total_nums {
                 max_total_nums = info.total_queues;
             }
-            // 只有 global id（键）形状决定端点集；物理 id 是 broker 内部的。
+            // Only the shape of the global ids (keys) determines the endpoint set; physical ids are broker-internal.
             for global_id in info.curr_id_map.keys() {
                 let mq = MessageQueue::new(topic, &mock_name, *global_id);
                 match mq_end_points.get(&mq) {
@@ -118,8 +118,8 @@ pub fn topic_route_data_2_endpoints_for_static_topic(
             }
         }
 
-        // 补齐静态逻辑队列：total 之下的每个 id 都存在；没有承载者的指向
-        // NOT_EXIST 哨兵。
+        // Fill in the full static logical queue set: every id below total exists; ids with no host
+        // point to the NOT_EXIST sentinel.
         for i in 0..max_total_nums {
             let mq = MessageQueue::new(topic, &mock_name, i);
             let real = match mq_end_points.get(&mq) {
@@ -264,7 +264,7 @@ mod tests {
         assert_eq!(inst.get_broker_name_from_message_queue(&mq0), "broker-a");
         let mq1 = MessageQueue::new("StaticTopic", "__syslo__global__", 1);
         assert_eq!(inst.get_broker_name_from_message_queue(&mq1), "broker-b");
-        // 表里没有的队列 / 非静态主题原样透传自己的 broker 名。
+        // Queues missing from the table / non-static topics pass their own broker name through unchanged.
         let mq99 = MessageQueue::new("StaticTopic", "__syslo__global__", 99);
         assert_eq!(
             inst.get_broker_name_from_message_queue(&mq99),

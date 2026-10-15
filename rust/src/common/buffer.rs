@@ -76,12 +76,12 @@ impl Writer {
         self
     }
 
-    /// 覆盖写入位置 `at` 处的 4 字节大端整数（用于先占位后回填长度）。
+    /// Overwrites the 4-byte big-endian integer at position `at` (used to reserve space first and backfill a length later).
     pub fn patch_i32(&mut self, at: usize, v: i32) {
         self.buf[at..at + 4].copy_from_slice(&v.to_be_bytes());
     }
 
-    /// 对应 `RocketMQSerializable.writeStr(buf, useShortLength, s)`。
+    /// Writes an optional string: length prefix (u16 with `short_length`, else i32) followed by the bytes; `None` writes length 0.
     pub fn string(&mut self, short_length: bool, s: Option<&str>) -> &mut Writer {
         let bytes = s.map(str::as_bytes).unwrap_or(&[][..]);
         if short_length {
@@ -92,7 +92,7 @@ impl Writer {
         self.bytes(bytes)
     }
 
-    /// 对应 `RocketMQSerializable.writeDecimalLong`：4 字节长度 + 十进制文本。
+    /// Writes an i64 as a 4-byte length prefix followed by its decimal text form.
     pub fn decimal_long(&mut self, value: i64) -> &mut Writer {
         let len_at = self.buf.len();
         self.i32(0);
@@ -198,7 +198,7 @@ impl<'a> Reader<'a> {
         r
     }
 
-    /// 对应 `RocketMQSerializable.readStr`：长度为 0 时返回 `None`（而非空串）。
+    /// Reads an optional string; a length of 0 yields `None` (not an empty string).
     pub fn string(&mut self, short_length: bool) -> Result<Option<String>> {
         let n = if short_length {
             self.u16()? as usize
@@ -218,7 +218,7 @@ impl<'a> Reader<'a> {
             .map_err(|e| Error::Decode(format!("invalid utf8: {e}")))
     }
 
-    /// 对应 `RocketMQSerializable.readDecimalInt/Long`：长度前缀 + 十进制文本。
+    /// Reads a length-prefixed decimal integer (4-byte length + decimal text).
     pub fn decimal_long(&mut self) -> Result<i64> {
         let n = self.i32()?;
         if n <= 0 {
@@ -271,7 +271,7 @@ mod tests {
 
     #[test]
     fn decimal_long_matches_golden() {
-        // 线上格式：8 位十进制长度前缀 + ASCII 数字，如 0 -> 0000000130
+        // Wire format: 8-hex-digit length prefix + ASCII digits, e.g. 0 -> 0000000130
         let vectors = [
             (0i64, "0000000130"),
             (1, "0000000131"),

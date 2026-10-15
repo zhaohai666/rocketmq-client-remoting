@@ -1,21 +1,30 @@
-// 主动拉取消费者（DefaultMQPullConsumer）真机验证。
-// 用法：rmq pull [namesrv]
+// Real-machine verification of the active pull consumer (DefaultMQPullConsumer).
+// Usage: rmq pull [namesrv]
 //
-// 场景（拉模式的核心是「调用方自己拉、自己管位点」，断言都围绕这一点）：
-//   S1 建 topic + FetchSubscribeMessageQueues → 拿到 4 个队列
-//   S1b FetchMessageQueuesInBalance → 没拉取过的实例靠真实路由 + 38 算出自己那份
-//   S2 生产 12 条 → 每队列 min/max offset 差值 = 3（消息均匀落到 4 队列）
-//   S3 手动拉取：逐队列从 min offset 拉到 max offset → 收全 12 条且 body 与发送集合一致
-//   S4 手动提交位点：UpdateConsumeOffset → FetchConsumeOffset 回读一致（broker 往返）
-//   S5 位点由调用方掌控：从已提交位点再拉 → NoNewMsg；把位点退回 min 再拉 → Found
-//      （push 模式做不到这一点，这正是 pull 模式的存在意义）
-//   S6 SearchOffset(now) / EarliestMsgStoreTime → 均 > 0
-//   S7 SendMessageBack → 消息落到 %RETRY%group，可被拉取到（回投链路真实可用）
+// Scenarios (the core of pull mode is "the caller pulls and manages the offsets itself", and
+// every assertion circles around that):
+//   S1 create the topic + FetchSubscribeMessageQueues -> get 4 queues
+//   S1b FetchMessageQueuesInBalance -> an instance that never pulled computes its own share
+//       from the real route + 38
+//   S2 produce 12 messages -> the min/max offset difference per queue = 3 (the messages spread
+//      evenly over 4 queues)
+//   S3 manual pull: per queue from the min offset to the max offset -> all 12 received and
+//      the bodies match the sent set
+//   S4 manual offset commit: UpdateConsumeOffset -> reading it back with FetchConsumeOffset
+//      agrees (a broker round trip)
+//   S5 the offsets are the caller's to control: pulling again from the committed offset ->
+//       NoNewMsg; rolling the offset back to min and pulling again -> Found (push mode cannot
+//       do this, which is precisely why pull mode exists)
+//   S6 SearchOffset(now) / EarliestMsgStoreTime -> both > 0
+//   S7 SendMessageBack -> the message lands in %RETRY%group and can be pulled (the resend
+//      path really works)
 //
-// ⚠ 两个踩过的坑（不要"顺手优化"掉）：
-//   1. 必须**先建 topic 再取队列**：消费者不做默认 topic 兜底，topic 不存在就拿不到路由；
-//   2. 生产完**不能立刻查 maxOffset**：broker 的 consumequeue 是异步分发的，会读到 0
-//      （探针实测），必须轮询到各队列 max-min 之和到位。
+// Two pitfalls already hit (do not "tidy them away" by hand):
+//   1. The topic must be **created before the queues are fetched**: the consumer does no
+//      default-topic fallback, so a non-existent topic yields no route;
+//   2. maxOffset must **not** be queried right after producing: the broker's consumequeue is
+//      dispatched asynchronously so you read 0 (measured with a probe), and you have to poll
+//      until the sum of max-min across the queues is in place.
 using System.Globalization;
 using System.Text;
 
@@ -74,7 +83,7 @@ public static class LivePull
             + " group=" + Group);
         Console.WriteLine(new string('=', 70));
 
-        // ---------------- 建 topic ----------------
+        // ---------------- create the topic ----------------
         {
             var prep = new DefaultMQProducer("PG_PrepareNet_" + Stamp);
             prep.NamesrvAddr = namesrv;
@@ -94,9 +103,9 @@ public static class LivePull
         var consumer = new DefaultMQPullConsumer(Group);
         consumer.SetNamesrvAddr(namesrv);
 
-        // ---------------- S1 队列 ----------------
+        // ---------------- S1 the queues ----------------
         Console.WriteLine();
-        Console.WriteLine("S1 建 topic + FetchSubscribeMessageQueues");
+        Console.WriteLine("S1 create the topic + FetchSubscribeMessageQueues");
         List<MessageQueue> routes;
         {
             consumer.Start();
@@ -125,7 +134,7 @@ public static class LivePull
 
             if (routes.Count != QueueNum)
             {
-                Check("S1 拿到 " + QueueNum.ToString(CultureInfo.InvariantCulture) + " 个队列", false,
+       Check("S1 got " + QueueNum.ToString(CultureInfo.InvariantCulture) + " queues", false,
                     "got=" + routes.Count.ToString(CultureInfo.InvariantCulture) + " last=" + last);
                 Console.WriteLine();
                 Console.WriteLine("PullConsumer: PASS=" + _pass + " FAIL=" + _fail);
@@ -134,11 +143,11 @@ public static class LivePull
             }
         }
 
-        Check("S1 拿到 " + QueueNum.ToString(CultureInfo.InvariantCulture) + " 个队列", true,
+        Check("S1 got " + QueueNum.ToString(CultureInfo.InvariantCulture) + " queues", true,
             "got=" + routes.Count.ToString(CultureInfo.InvariantCulture));
         {
             bool namesOk = routes.All(q => q.Topic == Topic && q.BrokerName.Length > 0);
-            Check("S1 队列 topic 与 broker 名非空", namesOk, "sample=" + QKey(routes[0]));
+       Check("S1 the queue's topic and broker name are non-empty", namesOk, "sample=" + QKey(routes[0]));
         }
 
         Console.WriteLine();
@@ -146,7 +155,7 @@ public static class LivePull
         {
             consumer.RegisterMessageQueueListener(Topic, null);
             int hbOk = consumer.SendHeartbeatToAllBroker();
-            Check("S1b 登记 topic 后心跳发出去了（38 可见的前提）", hbOk > 0,
+          Check("S1b after registering the topic the heartbeat went out (the precondition for being visible to 38)", hbOk > 0,
                 "heartbeat_ok=" + hbOk.ToString(CultureInfo.InvariantCulture));
 
             var mine = new List<MessageQueue>();
@@ -170,20 +179,20 @@ public static class LivePull
                 Thread.Sleep(500);
             }
 
-            Check("S1b 平衡视图：独占分组拿到全部 "
-                  + QueueNum.ToString(CultureInfo.InvariantCulture) + " 个队列"
-                  + "（未拉取过⇒只可能是路由+38 算出来的）",
+            Check("S1b the balance view: an exclusive group gets all "
+             + QueueNum.ToString(CultureInfo.InvariantCulture) + " queues"
+      + " (never having pulled => it can only be route+38 computed)",
                 mine.Count == QueueNum,
                 "got=" + mine.Count.ToString(CultureInfo.InvariantCulture) + " of "
                 + QueueNum.ToString(CultureInfo.InvariantCulture));
             var whole = new HashSet<string>(routes.Select(QKey), StringComparer.Ordinal);
-            Check("S1b 平衡视图是订阅视图的子集", mine.All(q => whole.Contains(QKey(q))),
+    Check("S1b the balance view is a subset of the subscription view", mine.All(q => whole.Contains(QKey(q))),
                 "mine=" + string.Join(" ", mine.Select(QKey)));
         }
 
-        // ---------------- S2 生产 ----------------
+    // ---------------- S2 produce ----------------
         Console.WriteLine();
-        Console.WriteLine("S2 生产 " + NMsg.ToString(CultureInfo.InvariantCulture) + " 条");
+        Console.WriteLine("S2 producing " + NMsg.ToString(CultureInfo.InvariantCulture) + " messages");
         var sent = new HashSet<string>(StringComparer.Ordinal);
         {
             var prod = new DefaultMQProducer("PG_PullLiveNet_" + Stamp);
@@ -211,12 +220,12 @@ public static class LivePull
                 }
             }
 
-            Check("S2 生产 " + NMsg.ToString(CultureInfo.InvariantCulture) + " 条成功", sentOk == NMsg,
+  Check("S2 producing " + NMsg.ToString(CultureInfo.InvariantCulture) + " messages succeeded", sentOk == NMsg,
                 "sentOk=" + sentOk.ToString(CultureInfo.InvariantCulture));
             prod.Shutdown();
         }
 
-        // 轮询等 consumequeue 分发落地（不能刚发完就查 maxOffset）
+        // poll until the consumequeue dispatch lands (you cannot query maxOffset right after sending)
         var lo = new Dictionary<string, long>(StringComparer.Ordinal);
         var hi = new Dictionary<string, long>(StringComparer.Ordinal);
         {
@@ -245,15 +254,15 @@ public static class LivePull
         foreach (MessageQueue q in routes)
         {
             long diff = hi[QKey(q)] - lo[QKey(q)];
-            Check("S2 队列 " + QKey(q) + " 有 " + PerQueue.ToString(CultureInfo.InvariantCulture) + " 条",
+   Check("S2 the queue " + QKey(q) + " has " + PerQueue.ToString(CultureInfo.InvariantCulture),
                 diff == PerQueue,
                 "min=" + lo[QKey(q)].ToString(CultureInfo.InvariantCulture)
                     + " max=" + hi[QKey(q)].ToString(CultureInfo.InvariantCulture));
         }
 
-        // ---------------- S3 手动拉取 ----------------
+     // ---------------- S3 the manual pull ----------------
         Console.WriteLine();
-        Console.WriteLine("S3 手动拉取（逐队列 min -> max）");
+        Console.WriteLine("S3 manual pull (per queue min -> max)");
         var got = new HashSet<string>(StringComparer.Ordinal);
         foreach (MessageQueue q in routes)
         {
@@ -270,7 +279,7 @@ public static class LivePull
                 }
                 catch (Exception e)
                 {
-                    Check("S3 拉取 " + QKey(q) + " 异常", false, e.Message);
+          Check("S3 pulling " + QKey(q) + " threw", false, e.Message);
                     break;
                 }
 
@@ -298,7 +307,7 @@ public static class LivePull
                 }
                 else
                 {
-                    Check("S3 拉取 " + QKey(q) + " 状态异常", false, "status=" + r.Status);
+           Check("S3 pulling " + QKey(q) + " came back with an unexpected status", false, "status=" + r.Status);
                     break;
                 }
             }
@@ -307,7 +316,7 @@ public static class LivePull
         {
             var missing = sent.Except(got, StringComparer.Ordinal).OrderBy(x => x, StringComparer.Ordinal);
             var extra = got.Except(sent, StringComparer.Ordinal).OrderBy(x => x, StringComparer.Ordinal);
-            Check("S3 手动拉取收全 " + NMsg.ToString(CultureInfo.InvariantCulture) + " 条且内容一致",
+      Check("S3 the manual pull received all " + NMsg.ToString(CultureInfo.InvariantCulture) + " messages with matching content",
                 got.SetEquals(sent),
                 "got=" + got.Count.ToString(CultureInfo.InvariantCulture) + " missing=[" + Join(missing)
                     + "] extra=[" + Join(extra) + "]");
@@ -316,46 +325,46 @@ public static class LivePull
         if (got.Count == 0)
         {
             Console.WriteLine();
-            Console.WriteLine("!! 一条都没拉到，后续场景跳过");
+     Console.WriteLine("!! nothing was pulled at all, the later scenarios are skipped");
             Console.WriteLine();
             Console.WriteLine("PullConsumer: PASS=" + _pass + " FAIL=" + _fail);
             consumer.Shutdown();
             return 1;
         }
 
-        // ---------------- S4 手动提交位点 ----------------
+     // ---------------- S4 the manual offset commit ----------------
         Console.WriteLine();
-        Console.WriteLine("S4 手动提交位点并回读");
+        Console.WriteLine("S4 committing the offset by hand and reading it back");
         {
             MessageQueue q0 = routes[0];
             long target = hi[QKey(q0)];
             consumer.UpdateConsumeOffset(q0, target);
             bool haveOffset = consumer.FetchConsumeOffset(q0, out long back);
-            Check("S4 位点提交后回读一致", haveOffset && back == target,
+        Check("S4 the offset reads back the same after the commit", haveOffset && back == target,
                 "committed=" + back.ToString(CultureInfo.InvariantCulture)
                     + " target=" + target.ToString(CultureInfo.InvariantCulture));
         }
 
-        // ---------------- S5 位点由调用方掌控 ----------------
+     // ---------------- S5 the offsets are the caller's to control ----------------
         Console.WriteLine();
-        Console.WriteLine("S5 位点由调用方掌控");
+        Console.WriteLine("S5 the offsets are the caller's to control");
         {
             MessageQueue q0 = routes[0];
             long committed = hi[QKey(q0)];
             PullResult r1 = consumer.Pull(q0, "*", committed, 32, 5000);
-            Check("S5 从已提交位点再拉 = NoNewMsg",
+          Check("S5 pulling again from the committed offset = NoNewMsg",
                 r1.Status == PullStatus.NoNewMsg && r1.MsgFoundList.Count == 0,
                 "status=" + r1.Status + " n="
                     + r1.MsgFoundList.Count.ToString(CultureInfo.InvariantCulture));
 
             PullResult r2 = consumer.Pull(q0, "*", lo[QKey(q0)], 32, 5000);
-            Check("S5 位点退回 min 后可重拉（pull 模式的核心能力）",
+   Check("S5 after rolling the offset back to min it can be pulled again (the core capability of pull mode)",
                 r2.Status == PullStatus.Found && r2.MsgFoundList.Count > 0,
                 "status=" + r2.Status + " n="
                     + r2.MsgFoundList.Count.ToString(CultureInfo.InvariantCulture));
         }
 
-        // ---------------- S6 位点查询 ----------------
+        // ---------------- S6 offset queries ----------------
         Console.WriteLine();
         Console.WriteLine("S6 SearchOffset / EarliestMsgStoreTime / min/max");
         {
@@ -371,9 +380,9 @@ public static class LivePull
                     + " max=" + hi[QKey(q0)].ToString(CultureInfo.InvariantCulture));
         }
 
-        // ---------------- S7 回投 ----------------
+        // ---------------- S7 the resend ----------------
         Console.WriteLine();
-        Console.WriteLine("S7 SendMessageBack -> %RETRY%group 可拉取");
+        Console.WriteLine("S7 SendMessageBack -> pullable from %RETRY%group");
         {
             MessageExt? sample = null;
             foreach (MessageQueue q in routes)
@@ -388,7 +397,7 @@ public static class LivePull
 
             if (sample is null)
             {
-                Check("S7 取样本消息", false, "no message available");
+     Check("S7 got a sample message", false, "no message available");
             }
             else
             {
@@ -396,13 +405,13 @@ public static class LivePull
                 try
                 {
                     consumer.SendMessageBack(sample, 0);
-                    Check("S7 回投请求被 broker 接受", true,
+          Check("S7 the resend request was accepted by the broker", true,
                         "offset=" + sample.CommitLogOffset.ToString(CultureInfo.InvariantCulture)
                             + " body=" + want);
                 }
                 catch (Exception e)
                 {
-                    Check("S7 回投请求被 broker 接受", false, e.Message);
+        Check("S7 the resend request was accepted by the broker", false, e.Message);
                     Console.WriteLine();
                     Console.WriteLine("PullConsumer: PASS=" + _pass + " FAIL=" + _fail);
                     consumer.Shutdown();
@@ -472,7 +481,7 @@ public static class LivePull
                     }
                 }
 
-                Check("S7 %RETRY% 拉到了被回投的消息", found, detail);
+     Check("S7 the resent message was pulled from %RETRY%", found, detail);
             }
         }
 

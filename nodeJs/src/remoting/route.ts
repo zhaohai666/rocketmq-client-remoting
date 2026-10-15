@@ -203,7 +203,7 @@ export class TopicRouteData {
 }
 
 // ---------------------------------------------------------------------------
-// TopicRouteData 辅助函数。
+// TopicRouteData helper functions.
 // ---------------------------------------------------------------------------
 
 // Map<brokerName, Map<brokerId, addr>>.

@@ -1,12 +1,12 @@
-//! body 层报文里全部应答/请求体的模型类：
+//! Model classes for every request/response body in the body layer of wire messages:
 //! `KVTable` / `TopicList` / `LockBatchRequestBody` / `LockBatchResponseBody` /
 //! `UnlockBatchRequestBody` / `GetConsumerListByGroupResponseBody` / `ClusterInfo` /
 //! `ConsumerRunningInfo` / `Connection` / `ConsumerConnection` / `ProducerConnection` /
 //! `QueryConsumeTimeSpanBody` / `ConsumeStatus` / `ConsumeStatsList` /
 //! `ResetOffsetBody` / `GetConsumerStatusBody` / `ProcessQueueInfo` / `CMResult` /
-//! `ConsumeMessageDirectlyResult`。
+//! `ConsumeMessageDirectlyResult`.
 //!
-//! ## 三种「同一个 MessageQueue」的不同写法
+//! ## Three different spellings of "the same MessageQueue"
 
 use serde_json::{Map, Value};
 
@@ -19,16 +19,16 @@ use super::heartbeat::SubscriptionData;
 use super::serialize::RemotingSerializable;
 use crate::error::{Error, Result};
 
-// 这里也从 `admin_body` 把 MessageQueue 键工具再导出一份，供上层就近取用。
+// Also re-export the MessageQueue key helpers from `admin_body` here, so upper layers can pick them up nearby.
 pub use super::admin_body::{
     decode_message_queue_map, encode_message_queue_map, message_queue_key, parse_message_queue_key,
 };
 
-// ---------------------------------------------------------------- 内部小工具
+// ---------------------------------------------------------------- internal small helpers
 
-/// 字符串数组字段：缺失 / null 回空表。
+/// String-array field: missing / null falls back to an empty vec.
 ///
-/// 元素按 `jstring` 的口径宽松转换：broker 偶尔把字符串写在数字里。
+/// Elements use `jstring`'s lenient conversion: a broker sometimes writes strings as numbers.
 fn string_list(value: &Value, key: &str) -> Result<Vec<String>> {
     let mut out = Vec::new();
     for item in jarray(value, key)? {
@@ -41,14 +41,14 @@ fn string_list(value: &Value, key: &str) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// 原样透传的对象数组（`subscriptionSet` / `consumeStatsList` / `consumeTimeSpanSet`）。
+/// Object arrays passed through verbatim (`subscriptionSet` / `consumeStatsList` / `consumeTimeSpanSet`).
 ///
-/// 不做形状校验 —— 连 `null` 元素也原样保留。
+/// No shape validation -- even `null` elements are kept exactly as they are.
 fn raw_object_list(value: &Value, key: &str) -> Result<Vec<Value>> {
     Ok(jarray(value, key)?.into_iter().cloned().collect())
 }
 
-/// 原样透传的对象 map，保持报文顺序（`statusTable` / `subscriptionTable`）。
+/// Object maps passed through verbatim, keeping wire order (`statusTable` / `subscriptionTable`).
 fn raw_object_map(value: &Value, key: &str) -> Result<Vec<(String, Value)>> {
     Ok(jentries(value, key)?
         .into_iter()
@@ -56,7 +56,7 @@ fn raw_object_map(value: &Value, key: &str) -> Result<Vec<(String, Value)>> {
         .collect())
 }
 
-/// 把 `Vec<(String, Value)>` 写回 JSON 对象（`Map` 开了 `preserve_order`，顺序即插入序）。
+/// Write a `Vec<(String, Value)>` back into a JSON object (`Map` has `preserve_order`, so output order is insertion order).
 fn object_of(entries: &[(String, Value)]) -> Value {
     let mut map = Map::new();
     for (k, v) in entries {
@@ -65,7 +65,7 @@ fn object_of(entries: &[(String, Value)]) -> Value {
     Value::Object(map)
 }
 
-/// `decode_message_queue_map` 的 value 解析：原样透传（值类型见文档）。
+/// Value parser for `decode_message_queue_map`: passes values through unchanged (see the docs for value types).
 fn clone_value(value: &Value) -> Result<Value> {
     Ok(value.clone())
 }
@@ -74,7 +74,7 @@ fn string_array(items: &[String]) -> Value {
     Value::Array(items.iter().map(|s| Value::String(s.clone())).collect())
 }
 
-/// `None` 落成 `null`（键无条件写出，与「键不存在」是两回事）。
+/// `None` becomes `null` (keys are written unconditionally, which is different from "key absent").
 fn optional_string(value: &Option<String>) -> Value {
     match value {
         Some(s) => Value::String(s.clone()),
@@ -82,7 +82,7 @@ fn optional_string(value: &Option<String>) -> Value {
     }
 }
 
-/// 等价于 [`jlong`] 的宽松转换，但作用在裸 `Value` 上（map 的 value 没有键名可传）。
+/// The same lenient conversion as [`jlong`] but applied to a bare `Value` (map values have no key name to pass).
 fn long_of(value: &Value) -> i64 {
     match value {
         Value::Number(n) => n
@@ -96,12 +96,12 @@ fn long_of(value: &Value) -> i64 {
     }
 }
 
-/// `encode_message_queue_map` 的 value 转换：位点表。
+/// Value conversion for `encode_message_queue_map`: the offset table.
 fn long_value(value: &i64) -> Value {
     Value::from(*value)
 }
 
-/// 文本字段的宽松读取（map value 场景，同 [`jstring`] 但无需键名）。
+/// Lenient read of a text field (map-value context, same as [`jstring`] but no key name needed).
 fn text_of(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
@@ -110,10 +110,10 @@ fn text_of(value: &Value) -> String {
     }
 }
 
-/// MessageQueue 数组字段的读取（`mqSet` / `lockOKMQSet`）。
+/// Read a MessageQueue array field (`mqSet` / `lockOKMQSet`).
 ///
-/// 非对象元素直接报错：宽松兜底会把脏数据变成
-/// 一个「topic 为空的队列」，静默丢锁，比报错更糟。
+/// Non-object elements error out directly: a lenient fallback would turn dirty data
+/// into "a queue with an empty topic" and silently drop locks, which is worse than erroring.
 fn message_queue_list(value: &Value, key: &str) -> Result<Vec<MessageQueueKey>> {
     let mut out = Vec::new();
     for item in jarray(value, key)? {
@@ -133,8 +133,8 @@ fn message_queue_array(list: &[MessageQueueKey]) -> Value {
     Value::Array(list.iter().map(message_queue_value).collect())
 }
 
-/// `MessageQueue` 作为**值**（数组元素 / 嵌套对象）时的形态，
-/// 键序 `topic,brokerName,queueId`。
+/// Shape of `MessageQueue` when used as a **value** (array element / nested object),
+/// key order `topic,brokerName,queueId`.
 pub fn message_queue_value(mq: &MessageQueueKey) -> Value {
     json_object(vec![
         ("topic", Value::String(mq.topic.clone())),
@@ -147,7 +147,7 @@ pub fn message_queue_value(mq: &MessageQueueKey) -> Value {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct KVTable {
-    /// cluster → broker 给的 KV 串；顺序即 broker 返回顺序，故用 [`StringMap`]。
+    /// cluster → the KV string given by the broker; order is the broker's return order, hence [`StringMap`].
     pub table: StringMap,
 }
 
@@ -159,7 +159,7 @@ impl KVTable {
     pub fn from_json_value(value: &Value) -> Result<KVTable> {
         expect_object(value, "KVTable")?;
         Ok(KVTable {
-            // 缺键 / null / 非对象都回空表
+            // Missing key / null / non-object all fall back to an empty table
             table: StringMap::from_json(&jraw_map(value, "table")),
         })
     }
@@ -175,7 +175,7 @@ impl KVTable {
 
 // ---------------------------------------------------------------- TopicList
 
-/// `brokerAddr` 为 `None` 时**整个键不出现**，空串则要照写。
+/// When `brokerAddr` is `None` the **entire key is absent**; an empty string must still be written.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TopicList {
     pub topic_list: Vec<String>,
@@ -187,7 +187,7 @@ impl TopicList {
         TopicList::default()
     }
 
-    /// 返回 topic 列表的副本。
+    /// Return a copy of the topic list.
     pub fn get_topic_list(&self) -> Vec<String> {
         self.topic_list.clone()
     }
@@ -218,7 +218,7 @@ impl TopicList {
     }
 }
 
-// ---------------------------------------------------------------- 批量锁 / 解锁
+// ---------------------------------------------------------------- batch lock / unlock
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LockBatchRequestBody {
@@ -395,10 +395,10 @@ impl CheckClientRequestBody {
 
 // ---------------------------------------------------------------- ClusterInfo
 
-/// 内部只保留 `{brokerName: {brokerId: addr}}` 与 `{cluster: [brokerName]}` 两张表，
-/// `to_json_value` 再把前者包成 BrokerData 形状，其中 `cluster:""` 与
-/// `enableActingMaster:false` 是**恒定默认值**，
-/// 所以真实集群名 / acting-master 开关不会随本类型往返。
+/// Only two tables are kept internally: `{brokerName: {brokerId: addr}}` and `{cluster: [brokerName]}`;
+/// `to_json_value` re-wraps the former into BrokerData shape, where `cluster:""` and
+/// `enableActingMaster:false` are **constant defaults**,
+/// so the real cluster name / acting-master flag never round-trips through this type.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClusterInfo {
     pub broker_addr_table: Vec<(String, Vec<(i64, String)>)>,
@@ -406,7 +406,7 @@ pub struct ClusterInfo {
 }
 
 impl ClusterInfo {
-    /// 所有 broker 地址：按 brokerName、brokerId 升序去重、跳过空串。
+    /// All broker addresses: deduplicated, ascending by brokerName then brokerId, skipping empty strings.
     pub fn get_broker_addrs(&self) -> Vec<String> {
         let mut ordered: Vec<&(String, Vec<(i64, String)>)> =
             self.broker_addr_table.iter().collect();
@@ -429,8 +429,8 @@ impl ClusterInfo {
         for (name, addrs) in &self.broker_addr_table {
             let mut addr_map = Map::new();
             for (id, addr) in addrs {
-                // fastjson2 的 Long 键写成裸数字，本端与 route.rs 都写
-                // 带引号的十进制字符串；两种读法都容忍，写出统一用带引号的形式。
+                // fastjson2 writes Long keys as bare numbers; this crate and route.rs both
+                // write quoted decimal strings; both readings are tolerated, output always uses the quoted form.
                 addr_map.insert(id.to_string(), Value::String(addr.clone()));
             }
             table.insert(
@@ -462,7 +462,7 @@ impl ClusterInfo {
                     "brokerAddrTable[{name}] is not a json object"
                 )));
             }
-            // 真实 broker 的 brokerAddrTable[name] 是 BrokerData，地址表在它的 brokerAddrs 里
+            // For real brokers, brokerAddrTable[name] is a BrokerData; the address table sits in its brokerAddrs
             let mut addrs = Vec::new();
             for (id, addr) in jentries(broker, "brokerAddrs")? {
                 let id = id.trim().parse::<i64>().map_err(|_| {
@@ -504,8 +504,8 @@ impl ClusterInfo {
 
 // ---------------------------------------------------------------- ConsumerRunningInfo
 
-/// 两端都用得到：admin 侧解析 broker 汇总的运行信息，客户端侧在应答
-/// `GET_CONSUMER_RUNNING_INFO(307)` 时编码自己的运行信息。
+/// Needed on both sides: the admin side parses running info aggregated from brokers, while the client side
+/// encodes its own running info when answering `GET_CONSUMER_RUNNING_INFO(307)`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ConsumerRunningInfo {
     pub properties: StringMap,
@@ -542,7 +542,7 @@ impl ConsumerRunningInfo {
             ),
             ("statusTable", object_of(&self.status_table)),
             ("userConsumerInfo", self.user_consumer_info.to_json()),
-            // jstack 键无条件写出：None 落成 null 而不是消失
+            // The jstack key is written unconditionally: None becomes null instead of disappearing
             ("jstack", optional_string(&self.jstack)),
         ])
     }
@@ -568,7 +568,7 @@ impl ConsumerRunningInfo {
         ConsumerRunningInfo::from_json_value(&RemotingSerializable::decode(data)?)
     }
 
-    /// 把 `statusTable[topic]` 就地解成 [`ConsumeStatus`]，省去上层手工转换。
+    /// Decode `statusTable[topic]` in place into a [`ConsumeStatus`], sparing callers a manual conversion.
     pub fn consume_status(&self, topic: &str) -> Result<Option<ConsumeStatus>> {
         match self.status_table.iter().find(|(k, _)| k == topic) {
             None => Ok(None),
@@ -577,7 +577,7 @@ impl ConsumerRunningInfo {
     }
 }
 
-// ---------------------------------------------------------------- Connection / 连接类
+// ---------------------------------------------------------------- Connection / connection classes
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Connection {
@@ -609,13 +609,13 @@ impl Connection {
             client_id: jstring(value, "clientId"),
             client_addr: jstring(value, "clientAddr"),
             language: jstring(value, "language"),
-            // 缺键 / null → None，与「broker 真给了 0」区分开
+            // Missing key / null -> None, kept apart from "the broker really gave 0"
             version: jfield(value, "version").map(|v| long_of(v) as i32),
         })
     }
 }
 
-/// `connectionSet` 的读法（ConsumerConnection / ProducerConnection 共用）。
+/// How `connectionSet` is read (shared by ConsumerConnection / ProducerConnection).
 fn connections(value: &Value) -> Result<Vec<Connection>> {
     let mut out = Vec::new();
     for item in jarray(value, "connectionSet")? {
@@ -631,7 +631,7 @@ fn connection_array(list: &[Connection]) -> Value {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ConsumerConnection {
     pub connection_set: Vec<Connection>,
-    /// topic → `SubscriptionData` 的 JSON（类型见 `heartbeat::SubscriptionData`）。
+    /// topic → JSON of a `SubscriptionData` (type see `heartbeat::SubscriptionData`).
     pub subscription_table: Vec<(String, Value)>,
     pub consume_type: Option<String>,
     pub message_model: Option<String>,
@@ -818,7 +818,7 @@ impl ConsumeStatsList {
     }
 }
 
-// ---------------------------------------------------------------- 位点重置 / 状态上报
+// ---------------------------------------------------------------- offset reset / status reporting
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResetOffsetBody {
@@ -1058,7 +1058,7 @@ impl ProcessQueueInfo {
     }
 }
 
-// ---------------------------------------------------------------- 309 单条消息试消费
+// ---------------------------------------------------------------- 309 consume a single message directly
 
 pub struct CMResult;
 
@@ -1075,7 +1075,7 @@ impl CMResult {
 pub struct ConsumeMessageDirectlyResult {
     pub order: bool,
     pub auto_commit: bool,
-    /// [`CMResult`] 里的枚举名。
+    /// The enum name from [`CMResult`].
     pub consume_result: Option<String>,
     pub remark: Option<String>,
     pub spent_time_mills: i64,
@@ -1108,7 +1108,7 @@ impl ConsumeMessageDirectlyResult {
         expect_object(value, "ConsumeMessageDirectlyResult")?;
         Ok(ConsumeMessageDirectlyResult {
             order: jboolean(value, "order", false),
-            // autoCommit 缺省为 true（只在显式 false 时才关）
+            // autoCommit defaults to true (turned off only when explicitly false)
             auto_commit: jboolean(value, "autoCommit", true),
             consume_result: jstring(value, "consumeResult"),
             remark: jstring(value, "remark"),
@@ -1129,7 +1129,7 @@ impl ConsumeMessageDirectlyResult {
 mod tests {
     use super::*;
 
-    /// 把紧凑 JSON 文本变成 `Value`（用于构造「原样透传」字段的夹具）。
+    /// Turn compact JSON text into a `Value` (used to build fixtures for "pass-through" fields).
     fn py(text: &str) -> Value {
         RemotingSerializable::decode(text.as_bytes()).unwrap()
     }
@@ -1144,13 +1144,13 @@ mod tests {
         table.insert("DefaultCluster", "127.0.0.1:10911;127.0.0.1:10912");
         table.insert("broker-a", "127.0.0.1:10911");
         let kv = KVTable { table };
-        // 线上记录的报文：{"table": {"DefaultCluster": "...", "broker-a": "..."}}
+        // Wire-recorded message: {"table": {"DefaultCluster": "...", "broker-a": "..."}}
         assert_eq!(
             json_of(&kv.to_json_value()),
             r#"{"table":{"DefaultCluster":"127.0.0.1:10911;127.0.0.1:10912","broker-a":"127.0.0.1:10911"}}"#
         );
         assert_eq!(KVTable::decode(&kv.encode()).unwrap(), kv);
-        // 缺键 / null 表 → 空 map
+        // Missing key / null table -> empty map
         assert_eq!(
             KVTable::decode(br#"{"table":null}"#).unwrap().table.len(),
             0
@@ -1184,7 +1184,7 @@ mod tests {
         );
         assert!(bare.to_json_value().get("brokerAddr").is_none());
         assert_eq!(TopicList::decode(&bare.encode()).unwrap(), bare);
-        // 空串地址是「有值」，键必须留着
+        // An empty-string address is "a value"; the key must stay
         let empty_addr = TopicList {
             topic_list: Vec::new(),
             broker_addr: Some(String::new()),
@@ -1214,7 +1214,7 @@ mod tests {
             )
         );
         assert_eq!(LockBatchRequestBody::decode(&body.encode()).unwrap(), body);
-        // 线上记录的报文：null 字段也要写出来，三个键恒在
+        // Wire-recorded message: null fields are written out too, the three keys are always present
         assert_eq!(
             json_of(&LockBatchRequestBody::default().to_json_value()),
             r#"{"consumerGroup":null,"clientId":null,"mqSet":[]}"#
@@ -1240,7 +1240,7 @@ mod tests {
 
     #[test]
     fn lock_batch_response_body_accepts_string_queue_id() {
-        // broker 会把 queueId 写成字符串数字，读取要容忍
+        // brokers write queueId as a numeric string; reading must tolerate it
         let text = r#"{"lockOKMQSet":[{"topic":"BodyGoldenTopic","brokerName":"broker-a","queueId":"2"}]}"#;
         let body = LockBatchResponseBody::decode(text.as_bytes()).unwrap();
         assert_eq!(
@@ -1330,12 +1330,12 @@ mod tests {
                 vec!["broker-a".into(), "broker-b".into()],
             )],
         };
-        // 报文按插入顺序包成 BrokerData 形状，cluster / enableActingMaster 恒为默认值
+        // Messages are wrapped into BrokerData shape in insertion order, cluster / enableActingMaster are always the defaults
         assert_eq!(
             json_of(&cluster.to_json_value()),
             r#"{"brokerAddrTable":{"broker-b":{"cluster":"","brokerName":"broker-b","brokerAddrs":{"1":"127.0.0.1:10921","0":"127.0.0.1:10920"},"enableActingMaster":false},"broker-a":{"cluster":"","brokerName":"broker-a","brokerAddrs":{"0":"127.0.0.1:10911","1":"127.0.0.1:10912"},"enableActingMaster":false}},"clusterAddrTable":{"DefaultCluster":["broker-a","broker-b"]}}"#
         );
-        // getBrokerAddrs 的排序去重输出（顺序按报文钉死）
+        // getBrokerAddrs sorted, deduplicated output (order pinned to the wire form)
         assert_eq!(
             cluster.get_broker_addrs(),
             vec![
@@ -1350,7 +1350,7 @@ mod tests {
             Vec::<String>::new()
         );
 
-        // nameserver 真实报文：裸数字键 + 重复地址，读回后按名 / 号排序
+        // Real nameserver message: bare numeric keys + duplicate addresses, sorted by name / id after reading back
         let wire = r#"{"brokerAddrTable":{"broker-a":{"cluster":"DefaultCluster","brokerName":"broker-a","brokerAddrs":{1:"127.0.0.1:10911",0:"127.0.0.1:10911"},"enableActingMaster":true}},"clusterAddrTable":{"DefaultCluster":["broker-a"]}}"#;
         let back = ClusterInfo::decode(wire.as_bytes()).unwrap();
         assert_eq!(back.broker_addr_table.len(), 1);
@@ -1414,7 +1414,7 @@ mod tests {
         )];
         info.user_consumer_info.insert("key", "value");
 
-        // 内联对象键：写出即 fastjson2 形态，读回还是同一个 MessageQueueKey
+        // Inline object keys: written out in fastjson2 form, read back as the same MessageQueueKey
         let json = info.to_json_value();
         let key = json["mqTable"]
             .as_object()
@@ -1450,14 +1450,14 @@ mod tests {
         );
         assert!(back.consume_status("Missing").unwrap().is_none());
         assert!(back.jstack.is_none());
-        // jstack 有值时同样落在最后一个键上
+        // When jstack has a value it lands on the last key as well
         let with_stack = ConsumerRunningInfo {
             jstack: Some("thread dump".into()),
             ..Default::default()
         };
         assert!(json_of(&with_stack.to_json_value()).ends_with(r#","jstack":"thread dump"}"#));
 
-        // 空对象的报文：7 个键全在，jstack 落成 null
+        // Wire message of an empty object: all 7 keys present, jstack lands as null
         assert_eq!(
             json_of(&ConsumerRunningInfo::default().to_json_value()),
             concat!(
@@ -1469,7 +1469,7 @@ mod tests {
 
     #[test]
     fn consumer_running_info_accepts_server_inline_object_keys() {
-        // fastjson2 真机输出（非法 JSON），本端的容忍解析器必须能读
+        // fastjson2 real-machine output (invalid JSON); this crate's lenient parser must read it
         let wire = concat!(
             r#"{"properties":{"PROP_CONSUME_TYPE":"CONSUME_PASSIVELY"},"subscriptionSet":[],"#,
             r#""mqTable":{{"brokerName":"broker-a","queueId":0,"topic":"BodyGoldenTopic"}:"#,
@@ -1492,7 +1492,7 @@ mod tests {
         let status = info.consume_status("BodyGoldenTopic").unwrap().unwrap();
         assert_eq!(status.pull_rt, 1.5);
         assert_eq!(status.consume_failed_msgs, 2);
-        // 重新编码后键文本仍是同一份内联对象
+        // After re-encoding, the key text is still the same inline object
         let again = info.to_json_value();
         assert!(again["mqTable"]
             .as_object()
@@ -1526,7 +1526,7 @@ mod tests {
             r#"{"connectionSet":[{"clientId":"client-1@127.0.0.1","clientAddr":"/127.0.0.1:52100","language":"JAVA","version":40}],"subscriptionTable":{"BodyGoldenTopic":{"classFilterMode":false,"topic":"BodyGoldenTopic","subString":"*","tagsSet":["TagA"],"codeSet":[],"subVersion":1789712527657,"expressionType":"TAG"}},"consumeType":"CONSUME_PASSIVELY","messageModel":"CLUSTERING","consumeFromWhere":"CONSUME_FROM_LAST_OFFSET"}"#
         );
         assert_eq!(ConsumerConnection::decode(&cc.encode()).unwrap(), cc);
-        // 空连接：三个枚举键仍在、值为 null（键无条件写出）
+        // Empty connection: the three enum keys remain with null values (keys written unconditionally)
         assert_eq!(
             json_of(&ConsumerConnection::default().to_json_value()),
             r#"{"connectionSet":[],"subscriptionTable":{},"consumeType":null,"messageModel":null,"consumeFromWhere":null}"#
@@ -1542,7 +1542,7 @@ mod tests {
             )
         );
         assert_eq!(ProducerConnection::decode(&pc.encode()).unwrap(), pc);
-        // version 缺失 → None（区别于 broker 真给了 0）
+        // Missing version -> None (distinct from the broker really giving 0)
         let bare = Connection::from_json_value(&py(r#"{"clientId":"c"}"#)).unwrap();
         assert_eq!(bare.client_id.as_deref(), Some("c"));
         assert_eq!(bare.version, None);
@@ -1566,7 +1566,7 @@ mod tests {
                 (MessageQueueKey::new("BodyGoldenTopic", "broker-a", 1), 20),
             ],
         };
-        // encode() 写出的键是带引号的转义字符串（与 fastjson2 裸内联同义）
+        // Keys encode() writes are quoted escaped strings (equivalent to fastjson2's bare inline form)
         assert_eq!(
             json_of(&body.to_json_value()),
             r#"{"offsetTable":{"{\"brokerName\":\"broker-a\",\"queueId\":0,\"topic\":\"BodyGoldenTopic\"}":10,"{\"brokerName\":\"broker-a\",\"queueId\":1,\"topic\":\"BodyGoldenTopic\"}":20}}"#
@@ -1611,8 +1611,8 @@ mod tests {
             r#"{"topic":"BodyGoldenTopic","queueId":1,"brokerName":"broker-a","offset":20}]}"#
         );
         assert_eq!(ResetOffsetBodyForC::decode(wire.as_bytes()).unwrap(), body);
-        // 两条形状互不允许：map 体喂给 ForC 只会报错（反之亦然，见
-        // malformed_bodies_return_decode_errors）
+        // The two shapes never accept each other: feeding a map body to ForC only errors (and vice versa, see
+        // malformed_bodies_return_decode_errors)
         assert!(matches!(
             ResetOffsetBodyForC::decode(br#"{"offsetTable":{{"brokerName":"b","queueId":0,"topic":"t"}:1}}"#),
             Err(Error::Decode(_))
@@ -1680,7 +1680,7 @@ mod tests {
             )
         );
         assert_eq!(ProcessQueueInfo::decode(&info.encode()).unwrap(), info);
-        // 零值报文（序列化直出）：14 个键恒在
+        // Zero-value message (straight from serialization): the 14 keys are always present
         assert_eq!(
             json_of(&ProcessQueueInfo::default().to_json_value()),
             concat!(
@@ -1691,7 +1691,7 @@ mod tests {
                 r#""lastPullTimestamp":0,"lastConsumeTimestamp":0}"#
             )
         );
-        // 缺键 / 脏值回默认值，绝不 panic（对齐 jlong / jboolean 的口径）
+        // Missing keys / dirty values fall back to defaults, never panic (same rule as jlong / jboolean)
         let partial = ProcessQueueInfo::decode(br#"{"commitOffset":"8","locked":"true"}"#).unwrap();
         assert_eq!(partial.commit_offset, 8);
         assert!(partial.locked);
@@ -1714,7 +1714,7 @@ mod tests {
             consume_failed_tps: 0.5,
             consume_failed_msgs: 7,
         };
-        // 线上记录的报文：{"pullRT": 12.5, "pullTPS": 100.0, "consumeRT": 3.25,
+        // Wire-recorded message: {"pullRT": 12.5, "pullTPS": 100.0, "consumeRT": 3.25,
         //                  "consumeOKTPS": 99.5, "consumeFailedTPS": 0.5, "consumeFailedMsgs": 7}
         assert_eq!(
             json_of(&cs.to_json_value()),
@@ -1724,7 +1724,7 @@ mod tests {
             ConsumeStatus::from_json_value(&cs.to_json_value()).unwrap(),
             cs
         );
-        // 浮点字段的零值按 fastjson2 的 Double 写成 `0.0`，不是整数 `0`
+        // Zero values of float fields are written as Double `0.0` per fastjson2, not integer `0`
         assert_eq!(
             json_of(&ConsumeStatus::default().to_json_value()),
             r#"{"pullRT":0.0,"pullTPS":0.0,"consumeRT":0.0,"consumeOKTPS":0.0,"consumeFailedTPS":0.0,"consumeFailedMsgs":0}"#
@@ -1759,7 +1759,7 @@ mod tests {
             ConsumeMessageDirectlyResult::decode(&r.encode()).unwrap(),
             r
         );
-        // 空结果的报文：autoCommit 初值就是 true
+        // Wire message of an empty result: autoCommit starts as true
         assert_eq!(
             json_of(&ConsumeMessageDirectlyResult::default().to_json_value()),
             r#"{"order":false,"autoCommit":true,"consumeResult":null,"remark":null,"spentTimeMills":0}"#
@@ -1780,7 +1780,7 @@ mod tests {
             json_of(&message_queue_value(&mq)),
             r#"{"topic":"BodyGoldenTopic","brokerName":"broker-a","queueId":3}"#
         );
-        // 与内联对象键的字母序刻意不同
+        // Deliberately different from the alphabetical order of inline object keys
         assert_eq!(
             message_queue_key(&mq),
             r#"{"brokerName":"broker-a","queueId":3,"topic":"BodyGoldenTopic"}"#

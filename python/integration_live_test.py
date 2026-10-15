@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""rocketmq-client-remoting 真实集群联调测试。
+"""rocketmq-client-remoting integration test against a real cluster.
 
-前置：本地已启动 nameServer(9876) + broker(10911)，broker 开启 autoCreateTopic。
-运行：在 python venv 中 `python integration_live_test.py`
+Prerequisites: a local nameServer(9876) + broker(10911) is already running, with
+autoCreateTopic enabled on the broker.
+Run it like this in the python venv: `python integration_live_test.py`
 """
 import sys
 import time
@@ -28,7 +29,7 @@ def check(name, ok, detail=""):
 
 
 def main():
-    # ---------- 1. 集群探活 ----------
+    # ---------- 1. cluster liveness check ----------
     prod = DefaultMQProducer(producer_group="PythonTestProducerGroup")
     prod.set_namesrv_addr(NAMESRV)
     prod.set_send_msg_timeout(5000)
@@ -36,13 +37,13 @@ def main():
     try:
         info = prod._mq_client.get_broker_cluster_info()
         brokers = list(info.broker_addr_table.keys()) if info and info.broker_addr_table else []
-        check("集群探活: 获取 broker 路由", bool(brokers), "brokers=%s" % brokers)
+        check("cluster liveness: obtained the broker route", bool(brokers), "brokers=%s" % brokers)
     except Exception as e:  # noqa: BLE001
-        check("集群探活: 获取 broker 路由", False, "exception=%s" % e)
+        check("cluster liveness: obtained the broker route", False, "exception=%s" % e)
         prod.shutdown()
         return 1
 
-    # ---------- 2. 同步发送 N 条 ----------
+    # ---------- 2. send N messages synchronously ----------
     sent_bodies = []
     send_ok = 0
     send_ids = []
@@ -56,29 +57,29 @@ def main():
             send_ids.append(sr.msg_id)
             if sr.send_status.name == "SEND_OK":
                 send_ok += 1
-        check("同步发送 %d 条" % N, send_ok == N,
-              "send_ok=%d/%d, 首条 msg_id=%s" % (send_ok, N, send_ids[0] if send_ids else ""))
+        check("sent %d messages synchronously" % N, send_ok == N,
+              "send_ok=%d/%d, the first msg_id=%s" % (send_ok, N, send_ids[0] if send_ids else ""))
     except Exception as e:  # noqa: BLE001
-        check("同步发送 %d 条" % N, False, "exception=%s" % e)
+        check("sent %d messages synchronously" % N, False, "exception=%s" % e)
 
-    # ---------- 3. 批量发送 ----------
+    # ---------- 3. batch send ----------
     try:
         batch = MessageBatch.generate_from_list([
             Message(TOPIC, ("batch-%d" % i).encode("utf-8")) for i in range(3)
         ])
         bsr = prod.send(batch)
-        check("批量发送 3 条", bsr.send_status.name == "SEND_OK", "msg_id=%s" % bsr.msg_id)
+        check("batch-sent 3 messages", bsr.send_status.name == "SEND_OK", "msg_id=%s" % bsr.msg_id)
     except Exception as e:  # noqa: BLE001
-        check("批量发送 3 条", False, "exception=%s" % e)
+        check("batch-sent 3 messages", False, "exception=%s" % e)
 
-    # ---------- 4. 单向发送（不保证落库，仅验证不抛异常）----------
+    # ---------- 4. oneway send (no persistence guarantee, only checks that it does not throw) ----------
     try:
         prod.send_oneway(Message(TOPIC, b"oneway-ping"))
-        check("单向发送", True, "无异常返回")
+        check("oneway send", True, "returned without an exception")
     except Exception as e:  # noqa: BLE001
-        check("单向发送", False, "exception=%s" % e)
+        check("oneway send", False, "exception=%s" % e)
 
-    # ---------- 5. 推送消费（从最早 offset 消费）----------
+    # ---------- 5. push consumption (starting from the earliest offset) ----------
     received = []
     lock = threading.Lock()
 
@@ -95,7 +96,7 @@ def main():
     cons.set_message_listener(SimpleMessageListener(on_msg))
     cons.start()
 
-    # 等待消费（含同步 10 + 批量 3 + 单向 1）
+    # Wait for the consumption (10 synchronous + 3 batch + 1 oneway)
     time.sleep(12)
     cons.shutdown()
 
@@ -104,25 +105,25 @@ def main():
     expected_batch = set("batch-%d" % i for i in range(3))
     missing_sync = expected_sync - recv_set
     missing_batch = expected_batch - recv_set
-    check("消费数量(%d)" % len(received), len(received) >= N,
-          "received=%d (期望>=%d)" % (len(received), N))
-    check("同步消息内容完整", not missing_sync,
-          "missing=%s" % (list(missing_sync) if missing_sync else "无"))
-    check("批量消息内容完整", not missing_batch,
-          "missing=%s" % (list(missing_batch) if missing_batch else "无"))
+    check("consumed count (%d)" % len(received), len(received) >= N,
+          "received=%d (expected >= %d)" % (len(received), N))
+    check("the synchronous messages are all intact", not missing_sync,
+          "missing=%s" % (list(missing_sync) if missing_sync else "none"))
+    check("the batch messages are all intact", not missing_batch,
+          "missing=%s" % (list(missing_batch) if missing_batch else "none"))
 
     prod.shutdown()
 
-    # ---------- 汇总 ----------
+    # ---------- summary ----------
     failed = [r for r in results if not r[1]]
-    print("\n================ 汇总 ================")
+    print("\n================ summary ================")
     for name, ok, detail in results:
         print("  [%s] %s" % ("PASS" if ok else "FAIL", name))
     print("======================================")
     if failed:
-        print("结果: %d 项失败" % len(failed))
+        print("Result: %d check(s) failed" % len(failed))
         return 1
-    print("结果: 全部通过")
+    print("Result: all checks passed")
     return 0
 
 

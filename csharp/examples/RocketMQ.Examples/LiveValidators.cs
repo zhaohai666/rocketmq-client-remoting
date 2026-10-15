@@ -1,21 +1,30 @@
-// Validators / TopicValidator 真机验证。
-// 用法：rmq validators-live [namesrv]
+// Real-machine verification of Validators / TopicValidator.
+// Usage: rmq validators-live [namesrv]
 //
-// 本工具用同一套断言证明
-// 「非法名字在本地第一行就被拦掉，合法名字照常在集群收发」。
+// This tool uses one set of assertions to prove that
+// "an illegal name is stopped on the very first local line, while a legal name goes on being
+// sent and received by the cluster".
 //
-// 前置：NameServer + Broker 已起（普通配置，不需要 ACL/TLS/trace）。
+// Prerequisite: a NameServer + Broker are up (an ordinary configuration, no ACL/TLS/trace needed).
 //
-// 场景：
-//   S1 发送路径：空白/超长/非法字符 topic、禁发的 broker 内部流水、body 档位、
-//      INNER_MULTI_DISPATCH 分隔符 —— 全部在 <50ms 内本地拒（namesrv 就在场）
-//   S2 批量路径：逐条 CheckMessage（成员非法也要拦）+ 同质性检查
-//   S3 生产者 Start()：保留组 / 非法字符 / 超长三道门 + 等长(120)边界放行，失败不进 started 态
-//   S4 正腿：合法名字照常在集群收发（push + lite 两路消费者各收到 3 条）
-//   S5 对照腿：合法但**不存在**的 topic 要走真往返（broker 自动建出来），比本地拒慢一个数量级
-//   S6 pull / lite 的组名门 + 合法 pull 组查队列与位点
-//   S7 CreateTopic 的本地拒（空白 / 非法字符 / 系统 topic）
-//   S8 寻址故障（10004 一个 name server 地址都没有）不能被说成"topic 没路由"（10005）
+// Scenarios:
+//   S1 the send path: blank/oversized/illegal-character topics, the forbidden broker-internal
+//      flow topics, the body size tiers, the INNER_MULTI_DISPATCH separator -- all rejected
+//      locally in <50ms (with the namesrv sitting right there)
+//   S2 the batch path: per-message CheckMessage (an illegal member must also be stopped) plus
+//      the homogeneity check
+//   S3 the producer's Start(): reserved group / illegal characters / oversized, three gates,
+//      plus the equal-length(120) boundary being let through, and a failure not entering the
+//      started state
+//   S4 positive leg: legal names go on being sent and received by the cluster (a push and a
+//      lite consumer each receive 3)
+//   S5 control leg: a legal but **non-existent** topic has to go through a real round trip
+//      (the broker auto-creates it), an order of magnitude slower than a local reject
+//   S6 the group name gates of pull / lite plus querying queues and offsets with a legal pull
+//      group
+//   S7 the local rejects of CreateTopic (blank / illegal characters / system topic)
+//   S8 an addressing failure (10004, not a single name server address) must not be described
+//      as "the topic has no route" (10005)
 using System.Diagnostics;
 using System.Globalization;
 using System.Text;
@@ -28,7 +37,8 @@ namespace RocketMQ.Examples;
 
 public static class LiveValidators
 {
-    /// <summary>本地校验的超时预算（毫秒）：真往返那一腿是 S5 实测的几十毫秒起步。</summary>
+    /// <summary>The timeout budget (in milliseconds) for local validation: the real round
+    /// trip leg of S5 was measured starting at tens of milliseconds.</summary>
     private const double LocalBudgetMs = 50.0;
 
     private const int QueueNums = 4;
@@ -73,8 +83,9 @@ public static class LiveValidators
     private static string BodyOf(MessageExt m) => Encoding.UTF8.GetString(m.Body);
 
     /// <summary>
-    /// 跑一个动作，把抛出的异常按类型摊平成 (是否抛, 文案, 响应码, 耗时)。
-    /// 非 MQClientException（如批量的 ArgumentException）码记 0，表示"不在客户端错误码体系里"。
+    /// Runs an action and flattens the thrown exception by type into (threw, message, response
+    /// code, elapsed). A non-MQClientException (an ArgumentException from a batch, say) records
+    /// code 0, meaning "not in the client error code system".
     /// </summary>
     private sealed class Captured
     {
@@ -113,25 +124,28 @@ public static class LiveValidators
         }
     }
 
-    /// <summary>断言「本地就拒」：抛了、文案命中、码值对、且没慢到像跑了网络。返回实测耗时。</summary>
+    /// <summary>Asserts "rejected locally": it threw, the message matches, the code is right
+    /// and it was not slow enough to look like it went over the network. Returns the measured
+    /// elapsed time.</summary>
     private static double ExpectLocalReject(string name, Action fn, string needle, int wantCode)
     {
         Captured c = Capture(fn);
         Check(name,
             c.Threw && c.What.Contains(needle, StringComparison.Ordinal) && c.Code == wantCode
             && c.ElapsedMs < LocalBudgetMs,
-            (c.Threw ? c.What : "没有抛异常") + "  code=" + c.Code.ToString(CultureInfo.InvariantCulture)
+         (c.Threw ? c.What : "nothing was thrown") + "  code=" + c.Code.ToString(CultureInfo.InvariantCulture)
             + "  " + Ms(c.ElapsedMs));
         return c.ElapsedMs;
     }
 
-    /// <summary>断言「Start() 本地就拒，且失败后没有把自己标成 started」。</summary>
+ /// <summary>Asserts "Start() is rejected locally and did not mark itself started after the
+ /// failure".</summary>
     private static double ExpectStartReject(string name, Func<bool> startedFlag, Action startFn,
         string needle)
     {
         Captured c = Capture(startFn);
         Check(name, c.Threw && c.What.Contains(needle, StringComparison.Ordinal) && !startedFlag(),
-            (c.Threw ? c.What : "没有抛异常") + "  " + Ms(c.ElapsedMs));
+      (c.Threw ? c.What : "nothing was thrown") + "  " + Ms(c.ElapsedMs));
         return c.ElapsedMs;
     }
 
@@ -151,7 +165,8 @@ public static class LiveValidators
         return pred();
     }
 
-    /// <summary>路由查询在没路由时会抛（no route / TOPIC_NOT_EXIST），这里摊平成"队列数 0"。</summary>
+    /// <summary>A route query throws when there is no route (no route / TOPIC_NOT_EXIST); that
+    /// is flattened here into "0 queues".</summary>
     private static int RouteQueueCount(Func<List<MessageQueue>> fetch)
     {
         try
@@ -184,20 +199,20 @@ public static class LiveValidators
         }
     }
 
-    // ---------------- S1 发送路径
+    // ---------------- S1 the send path
 
     private static double S1SendPathRejects(DefaultMQProducer p)
     {
-        Console.WriteLine("== S1 发送路径的本地校验（namesrv 在场，仍然不碰网络）==");
+        Console.WriteLine("== S1 the local validation of the send path (with the namesrv present, still no network) ==");
         (string Label, string Topic, string Needle, int Code)[] negs =
         {
-            ("S1a 空 topic", "", "The specified topic is blank", ResponseCode.SystemError),
-            ("S1b 全空白 topic", "   ", "The specified topic is blank", ResponseCode.SystemError),
-            ("S1c 超长 topic(128)", RepeatedChar('a', 128), "is longer than topic max length 127",
+ ("S1a an empty topic", "", "The specified topic is blank", ResponseCode.SystemError),
+            ("S1b an all-whitespace topic", "   ", "The specified topic is blank", ResponseCode.SystemError),
+      ("S1c an oversized topic(128)", RepeatedChar('a', 128), "is longer than topic max length 127",
                 ResponseCode.SystemError),
-            ("S1d 带点 topic", "Validators.Live", IllegalTail, ResponseCode.SystemError),
+            ("S1d a topic with a dot", "Validators.Live", IllegalTail, ResponseCode.SystemError),
             ("S1e 非 ASCII topic", "Validators中文", IllegalTail, ResponseCode.SystemError),
-            ("S1f 禁发的 broker 内部流水", "SCHEDULE_TOPIC_XXXX", "is forbidden",
+            ("S1f the forbidden broker-internal flow topic", "SCHEDULE_TOPIC_XXXX", "is forbidden",
                 ResponseCode.SystemError),
         };
         double total = 0.0;
@@ -209,42 +224,43 @@ public static class LiveValidators
 
         double local = total / negs.Length;
 
-        ExpectLocalReject("S1g 空 body",
+  ExpectLocalReject("S1g an empty body",
             () => p.Send(new Message("ValidatorsPositive", Array.Empty<byte>())),
             "the message body length is zero", ResponseCode.MessageIllegal);
         ExpectLocalReject("S1h null message",
             () => Validators.CheckMessage(null, 4 << 20),
             "the message is null", ResponseCode.MessageIllegal);
-        ExpectLocalReject("S1i 超 maxMessageSize",
+      ExpectLocalReject("S1i over maxMessageSize",
             () => Validators.CheckMessage(new Message("ValidatorsPositive", Bytes("12345")), 4),
             "the message body size over max value, MAX: 4", ResponseCode.MessageIllegal);
-        Check("S1j 恰好等于 maxMessageSize 放行",
+        Check("S1j exactly maxMessageSize is let through",
             !Capture(() => Validators.CheckMessage(
                 new Message("ValidatorsPositive", Bytes("1234")), 4)).Threw);
 
         Message lmq = new("ValidatorsPositive", Bytes("hello"));
         lmq.SetUserProperty(MessageConst.PropertyInnerMultiDispatch, "a" + FileSeparator + "b");
-        ExpectLocalReject("S1k INNER_MULTI_DISPATCH 带路径分隔符", () => p.Send(lmq),
+     ExpectLocalReject("S1k INNER_MULTI_DISPATCH with a path separator", () => p.Send(lmq),
             "INNER_MULTI_DISPATCH", ResponseCode.MessageIllegal);
         Message legalLmq = new("ValidatorsPositive", Bytes("hello"));
         legalLmq.SetUserProperty(MessageConst.PropertyInnerMultiDispatch, "%LMQ%queue:testCID");
-        Check("S1l 常规 LMQ 取值不误杀",
+    Check("S1l an ordinary LMQ value is not killed by mistake",
             !Capture(() => Validators.CheckMessage(legalLmq, 4 << 20)).Threw);
 
-        // 顺序：先 topic → 禁发名单 → body。空 body + 非法 topic 必须报 topic
+        // The order: topic -> forbidden list -> body. An empty body plus an illegal topic
+        // must report the topic
         Captured order = Capture(() => p.Send(new Message("bad topic", Array.Empty<byte>())));
-        Check("S1m 校验顺序：topic 先于 body",
+  Check("S1m the validation order: topic before body",
             order.Threw && order.What.Contains("contains illegal characters", StringComparison.Ordinal),
-            order.Threw ? order.What : "没有抛异常");
+     order.Threw ? order.What : "nothing was thrown");
         return local;
     }
 
-    // ---------------- S2 批量
+    // ---------------- S2 batch
 
     private static void S2BatchRejects(DefaultMQProducer p, string topic)
     {
-        Console.WriteLine("== S2 批量路径的逐条校验 ==");
-        ExpectLocalReject("S2a 批量里有一条非法 topic",
+        Console.WriteLine("== S2 the per-message validation of the batch path ==");
+  ExpectLocalReject("S2a one illegal topic inside the batch",
             () => p.SendBatch(new List<Message>
             {
                 new(topic, Bytes("ok-1")),
@@ -252,7 +268,7 @@ public static class LiveValidators
             }),
             "The specified topic[bad.topic]" + IllegalTail, ResponseCode.SystemError);
 
-        ExpectLocalReject("S2b 批量里有一条空 body",
+        ExpectLocalReject("S2b one empty body inside the batch",
             () => p.SendBatch(new List<Message>
             {
                 new(topic, Bytes("ok-1")),
@@ -265,47 +281,48 @@ public static class LiveValidators
             new(topic, Bytes("ok-1")),
             new(topic + "Other", Bytes("ok-2")),
         }));
-        Check("S2c 批量 topic 不同质被拒（非 MQClientException 口径）",
+        Check("S2c a batch whose topics are not homogeneous is rejected (the non-MQClientException rule)",
             mixed.Threw && mixed.What.Contains("should be the same", StringComparison.Ordinal)
             && mixed.Code == 0 && mixed.ElapsedMs < LocalBudgetMs,
-            mixed.Threw ? mixed.What : "没有抛异常");
+     mixed.Threw ? mixed.What : "nothing was thrown");
     }
 
-    // ---------------- S3 生产者组名门
+    // ---------------- S3 the producer's group name gates
 
     private static void S3ProducerGroupGates()
     {
-        Console.WriteLine("== S3 生产者 Start() 的组名校验门 ==");
+        Console.WriteLine("== S3 the group name validation gates of the producer's Start() ==");
         (string Label, string Group, string Needle)[] negs =
         {
-            ("S3a 保留组 DEFAULT_PRODUCER", MixAll.DefaultProducerGroup,
+        ("S3a the reserved group DEFAULT_PRODUCER", MixAll.DefaultProducerGroup,
                 "producerGroup can not equal DEFAULT_PRODUCER, please specify another one."),
-            ("S3b 带空格的组", "bad group", "the specified group[bad group]" + IllegalTail),
-            ("S3c 超长组(121)", RepeatedChar('g', 121), "is longer than group max length: 120"),
+       ("S3b a group with a space", "bad group", "the specified group[bad group]" + IllegalTail),
+   ("S3c an oversized group(121)", RepeatedChar('g', 121), "is longer than group max length: 120"),
         };
         foreach ((string label, string group, string needle) in negs)
         {
-            // namesrv 指向**真实**集群也照样拒 —— 挡的是本地第一行，与网络可达性无关
+       // the namesrv pointing at a **real** cluster is rejected all the same -- what it blocks
+     // is the very first local line, unrelated to network reachability
             var prod = new DefaultMQProducer(group) { NamesrvAddr = _namesrv };
             ExpectStartReject(label, () => prod.IsStarted, () => prod.Start(), needle);
         }
 
         var edge = new DefaultMQProducer(RepeatedChar('g', 120)) { NamesrvAddr = _namesrv };
         Captured c = Capture(edge.Start);
-        Check("S3d 120 字符组名放行（长度判定是 > 而非 >=）",
+        Check("S3d a 120-character group name is let through (the length test is > and not >=)",
             !c.Threw || !c.What.Contains("group max length", StringComparison.Ordinal),
-            c.Threw ? c.What : "Start 未因组名长度失败");
+        c.Threw ? c.What : "Start did not fail because of the group name length");
         if (edge.IsStarted)
         {
             edge.Shutdown();
         }
     }
 
-    // ---------------- S4 正腿
+    // ---------------- S4 the positive leg
 
     private static void S4PositiveLeg(DefaultMQProducer p, string topic, string group, string prefix)
     {
-        Console.WriteLine("== S4 正腿：合法名字照常在集群收发 ==");
+        Console.WriteLine("== S4 the positive leg: legal names go on being sent and received by the cluster ==");
         var collector = new Collector();
         var cons = new DefaultMQPushConsumer(group);
         cons.SetNamesrvAddr(_namesrv);
@@ -313,7 +330,7 @@ public static class LiveValidators
         cons.Subscribe(topic, "*");
         cons.SetMessageListener(collector);
         Captured started = Capture(cons.Start);
-        Check("S4a 合法组名的 push 消费者可启动", !started.Threw,
+        Check("S4a the push consumer with a legal group name can start", !started.Threw,
             started.Threw ? started.What : "ok");
         if (started.Threw)
         {
@@ -325,25 +342,26 @@ public static class LiveValidators
         lite.SetConsumeFromWhere(ConsumeFromWhere.ConsumeFromLastOffset);
         lite.Subscribe(topic, "*");
         Captured liteStarted = Capture(lite.Start);
-        Check("S4b 合法组名的 lite 消费者可启动", !liteStarted.Threw,
+        Check("S4b the lite consumer with a legal group name can start", !liteStarted.Threw,
             liteStarted.Threw ? liteStarted.What : "ok");
 
-        // 消费者先起来再发消息：新组 + ConsumeFromLastOffset 取的是**启动那一刻**的队尾位点
+        // The consumer starts before the messages are sent: a new group plus
+        // ConsumeFromLastOffset takes the tail offset **at the moment of startup**
         bool assigned = WaitUntil(() => lite.Assignment().Count > 0, 20000);
-        Check("S4c lite 拿到队列分配", assigned,
-            lite.Assignment().Count.ToString(CultureInfo.InvariantCulture) + " 个队列");
+ Check("S4c lite got a queue assignment", assigned,
+        lite.Assignment().Count.ToString(CultureInfo.InvariantCulture) + " queues");
 
         for (int i = 0; i < 3; i++)
         {
             int n = i;
             Captured s = Capture(() => p.Send(new Message(topic, Bytes(prefix + "-body-" + n)), 5000));
-            Check("S4d 合法 topic 发送成功 #" + n.ToString(CultureInfo.InvariantCulture), !s.Threw,
+     Check("S4d sending on a legal topic succeeded #" + n.ToString(CultureInfo.InvariantCulture), !s.Threw,
                 s.Threw ? s.What : "SEND_OK");
         }
 
         bool gotAll = WaitUntil(() => collector.ByPrefix(prefix).Count >= 3, 30000);
-        Check("S4e push 消费者收到全部 3 条", gotAll,
-            "收到 " + collector.ByPrefix(prefix).Count.ToString(CultureInfo.InvariantCulture) + " 条");
+   Check("S4e the push consumer received all 3", gotAll,
+          "received " + collector.ByPrefix(prefix).Count.ToString(CultureInfo.InvariantCulture) + " messages");
 
         int polled = 0;
         long deadline = Stopwatch.GetTimestamp() + 20L * Stopwatch.Frequency;
@@ -352,50 +370,51 @@ public static class LiveValidators
             polled += lite.Poll(1000).Count;
         }
 
-        Check("S4f lite 消费者 poll 到全部 3 条", polled >= 3,
-            "poll 到 " + polled.ToString(CultureInfo.InvariantCulture) + " 条");
+    Check("S4f the lite consumer polled all 3", polled >= 3,
+        "polled " + polled.ToString(CultureInfo.InvariantCulture) + " messages");
         lite.Shutdown();
         cons.Shutdown();
     }
 
-    // ---------------- S5 对照腿
+    // ---------------- S5 the control leg
 
     private static void S5ControlLeg(DefaultMQProducer p, double localMs)
     {
-        Console.WriteLine("== S5 对照腿：本地校验省掉的是什么 ==");
-        // 合法但**不存在**的 topic：本地放行 → 真往返（broker 按 TBW102 自动建出来）
+        Console.WriteLine("== S5 the control leg: what the local validation saves ==");
+        // A legal but **non-existent** topic: let through locally -> a real round trip (the
+        // broker auto-creates it off TBW102)
         string missing = "ValidatorsMissing" + Stamp;
         Captured c = Capture(() => p.Send(new Message(missing, Bytes("x")), 5000));
-        Check("S5a 合法但不存在的 topic 不被本地误伤（broker 自动建出来）",
+    Check("S5a a legal but non-existent topic is not killed by mistake locally (the broker auto-creates it)",
             !c.Threw || !c.What.Contains(IllegalTail, StringComparison.Ordinal),
             (c.Threw ? c.What : "SEND_OK") + "  " + Ms(c.ElapsedMs));
         double baseline = localMs < 0.05 ? 0.05 : localMs;
-        Check("S5b 集群腿比本地反腿慢一个数量级以上", c.ElapsedMs > 10.0 * baseline,
-            Ms(c.ElapsedMs) + " vs 本地 " + Ms(baseline));
+  Check("S5b the cluster leg is more than an order of magnitude slower than the local negative leg", c.ElapsedMs > 10.0 * baseline,
+            Ms(c.ElapsedMs) + " vs local " + Ms(baseline));
     }
 
-    // ---------------- S6 消费者侧
+    // ---------------- S6 the consumer side
 
     private static void S6ConsumerGates(string topic)
     {
-        Console.WriteLine("== S6 pull/lite 的组名门 + 合法 pull 组查位点 ==");
+        Console.WriteLine("== S6 the group name gates of pull/lite + querying offsets with a legal pull group ==");
         var pullReserved = new DefaultMQPullConsumer(MixAll.DefaultConsumerGroup);
         pullReserved.SetNamesrvAddr(_namesrv);
-        ExpectStartReject("S6a pull 消费者挡 DEFAULT_CONSUMER", () => pullReserved.IsStarted,
+        ExpectStartReject("S6a a pull consumer blocks DEFAULT_CONSUMER", () => pullReserved.IsStarted,
             pullReserved.Start,
             "consumerGroup can not equal DEFAULT_CONSUMER, please specify another one.");
 
         var liteReserved = new DefaultLitePullConsumer(MixAll.DefaultConsumerGroup);
         liteReserved.SetNamesrvAddr(_namesrv);
         liteReserved.Subscribe(topic, "*");
-        ExpectStartReject("S6b lite 消费者挡 DEFAULT_CONSUMER", () => liteReserved.IsStarted,
+        ExpectStartReject("S6b a lite consumer blocks DEFAULT_CONSUMER", () => liteReserved.IsStarted,
             liteReserved.Start,
             "consumerGroup can not equal DEFAULT_CONSUMER, please specify another one.");
 
         var liteIllegal = new DefaultLitePullConsumer("bad group");
         liteIllegal.SetNamesrvAddr(_namesrv);
         liteIllegal.Subscribe(topic, "*");
-        ExpectStartReject("S6c lite 消费者挡非法字符组", () => liteIllegal.IsStarted,
+        ExpectStartReject("S6c a lite consumer blocks an illegal-character group", () => liteIllegal.IsStarted,
             liteIllegal.Start, "the specified group[bad group]" + IllegalTail);
 
         var pull = new DefaultMQPullConsumer("GID_validators_pull_" + Stamp);
@@ -414,7 +433,7 @@ public static class LiveValidators
             }
         }
 
-        Check("S6d 合法组名的 pull 消费者可启动并查到位点",
+        Check("S6d the pull consumer with a legal group name starts and queries its offsets",
             ok && queues >= QueueNums && maxOffset >= 0,
             started.Threw ? started.What : "queues=" + queues + " maxOffset=" + maxOffset);
         if (ok)
@@ -427,14 +446,14 @@ public static class LiveValidators
 
     private static void S7CreateTopicRejects(DefaultMQProducer p)
     {
-        Console.WriteLine("== S7 CreateTopic 的本地拒 ==");
-        ExpectLocalReject("S7a CreateTopic 挡非法字符",
+        Console.WriteLine("== S7 the local rejects of CreateTopic ==");
+    ExpectLocalReject("S7a CreateTopic blocks illegal characters",
             () => p.CreateTopic(MixAll.DefaultTopic, "bad topic", QueueNums),
             "The specified topic[bad topic]" + IllegalTail, ResponseCode.SystemError);
-        ExpectLocalReject("S7b CreateTopic 挡系统 topic",
+  ExpectLocalReject("S7b CreateTopic blocks a system topic",
             () => p.CreateTopic(MixAll.DefaultTopic, "RMQ_SYS_TRACE_TOPIC", QueueNums),
             "is conflict with system topic", ResponseCode.SystemError);
-        ExpectLocalReject("S7c CreateTopic 挡空 topic",
+   ExpectLocalReject("S7c CreateTopic blocks an empty topic",
             () => p.CreateTopic(MixAll.DefaultTopic, "", QueueNums),
             "The specified topic is blank", ResponseCode.SystemError);
     }
@@ -460,12 +479,12 @@ public static class LiveValidators
         Captured started = Capture(producer.Start);
         if (started.Threw)
         {
-            Check("S0 生产者启动", false, started.What);
+            Check("S0 the producer started", false, started.What);
             Report();
             return 1;
         }
 
-        Check("S0 生产者启动", true, "group=" + producer.ProducerGroup);
+        Check("S0 the producer started", true, "group=" + producer.ProducerGroup);
 
         double localMs = S1SendPathRejects(producer);
         S2BatchRejects(producer, topic);
@@ -474,7 +493,7 @@ public static class LiveValidators
         Captured created = Capture(() => producer.CreateTopic(MixAll.DefaultTopic, topic, QueueNums));
         if (created.Threw)
         {
-            Check("S4 前置：建 topic", false, created.What);
+       Check("S4 precondition: the topic was created", false, created.What);
             Report();
             producer.Shutdown();
             return 1;
@@ -483,7 +502,7 @@ public static class LiveValidators
         bool routed = WaitUntil(
             () => RouteQueueCount(() => producer.FetchPublishMessageQueues(topic)) >= QueueNums,
             20000);
-        Check("S4 前置：路由可发现", routed,
+   Check("S4 precondition: the route is discoverable", routed,
             "queues=" + RouteQueueCount(() => producer.FetchPublishMessageQueues(topic)));
         if (routed)
         {
@@ -495,7 +514,7 @@ public static class LiveValidators
         S7CreateTopicRejects(producer);
         if (routed)
         {
-            // S8 要一条**已存在**的 topic：唯一坏掉的必须只有寻址表
+   // S8 needs an **existing** topic: the only thing broken must be the addressing table
             S8NameServerAddressing(topic);
         }
 
@@ -505,10 +524,10 @@ public static class LiveValidators
     }
 
     /// <summary>
-    /// S8：寻址故障（10004）不能伪装成"topic 没路由"（10005）。
+    /// S8: an addressing failure (10004) must not masquerade as "the topic has no route" (10005).
     private static void S8NameServerAddressing(string topic)
     {
-        Console.WriteLine("== S8 10004（没配 name server）vs 10005（topic 没路由）的分界 ==");
+        Console.WriteLine("== S8 the boundary between 10004 (no name server configured) and 10005 (the topic has no route) ==");
         var p = new DefaultMQProducer("PID_ValidatorsLive_Addr")
         {
             NamesrvAddr = Namesrv,
@@ -517,8 +536,9 @@ public static class LiveValidators
         p.Start();
         try
         {
-            // NameServerAddrs 返回的就是实例内部那个 List，所以 Clear 就是把它清空：
-            // 一个活着的 producer、一条**已存在**的 topic，唯一坏掉的是寻址表。
+            // NameServerAddrs returns the instance's internal List itself, so Clear empties
+      // it: a live producer plus an **existing** topic, with the addressing table being the
+    // only thing broken.
             var addrs = (List<string>)p.Client().NameServerAddrs;
             var saved = new List<string>(addrs);
             addrs.Clear();
@@ -535,18 +555,18 @@ public static class LiveValidators
             }
 
             double elapsedMs = sw.Elapsed.TotalMilliseconds;
-            Check("S8a 一个地址都没有时报 10004 NO_NAME_SERVER_EXCEPTION（不是 10005）",
+  Check("S8a with not a single address it reports 10004 NO_NAME_SERVER_EXCEPTION (not 10005)",
                 e is not null && e.ResponseCode == ClientErrorCode.NoNameServerException,
                 "code=" + e?.ResponseCode + " msg=" + e?.Message);
-            Check("S8b 文案与协议约定逐字一致：「No name server address, please set it.」（指向寻址）",
+            Check("S8b the message is verbatim as agreed by the protocol: 'No name server address, please set it.' (it points at addressing)",
                 e?.Message == "No name server address, please set it.", "msg=" + e?.Message);
-            Check("S8c 失败发生在本地判定，没有把重试预算空转掉（<"
-                  + LocalBudgetMs.ToString(CultureInfo.InvariantCulture) + "ms）",
+  Check("S8c the failure happens in the local decision without burning the retry budget (<"
+    + LocalBudgetMs.ToString(CultureInfo.InvariantCulture) + "ms)",
                 elapsedMs < LocalBudgetMs, "elapsed=" + elapsedMs.ToString("F2", CultureInfo.InvariantCulture) + "ms");
 
             addrs.AddRange(saved);
             SendResult r = p.Send(new Message(topic, Bytes("name-server-back")));
-            Check("S8d 对照：地址恢复后同一条 topic 立刻 SEND_OK（说明 S8a 判的是寻址，不是 topic）",
+        Check("S8d the control: once the addresses are back the very same topic gets SEND_OK at once (showing S8a judged addressing, not the topic)",
                 r.SendStatus == SendStatus.SendOk, "status=" + r.SendStatus);
         }
         finally

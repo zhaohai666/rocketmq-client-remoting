@@ -25,7 +25,7 @@ def _mq(broker: str, queue_id: int = 0) -> MessageQueue:
 
 
 class _FakeClient:
-    """MQClientInstance 替身：按脚本回放 SendResult / 异常，并记录每次的超时预算。"""
+    """An MQClientInstance stand-in: replays SendResult / exceptions per the script, and records each attempt's timeout budget."""
 
     def __init__(self, queues: List[MessageQueue], outcomes: Optional[list] = None,
                  no_route: bool = False, first_send_sleep_ms: int = 0,
@@ -34,14 +34,14 @@ class _FakeClient:
         self.publish.msg_queue_list = list(queues)
         self.outcomes = list(outcomes or [])
         self.no_route = no_route
-        # MQClientInstance 真有这个字段（动态取址时它才是权威来源），
-        # validateNameServerSetting 读的就是它，替身少了会 AttributeError。
+        # MQClientInstance really has this field (with dynamic addressing it is the authoritative source),
+        # validateNameServerSetting reads it; a stand-in missing it would AttributeError.
         self.name_server_addrs = (["127.0.0.1:9876"] if namesrv_addrs is None
                                   else list(namesrv_addrs))
         self.first_send_sleep_ms = first_send_sleep_ms
         self.sent: List[tuple] = []      # (mq, timeout)
 
-    # --- send() 会碰到的 MQClientInstance 接口 ---
+    # --- the MQClientInstance interface send() will hit ---
     def register_topic_in_use(self, topic):
         pass
 
@@ -70,7 +70,7 @@ class _FakeClient:
             return outcome
         return SendResult(SendStatus.SEND_OK, msg_id="0" * 32, message_queue=mq)
 
-    # --- 断言用的便捷属性 ---
+    # --- convenience properties for assertions ---
     @property
     def sends(self) -> int:
         return len(self.sent)
@@ -111,7 +111,7 @@ def _ok(mq):
     return SendResult(SendStatus.SEND_OK, msg_id="0" * 32, message_queue=mq)
 
 
-# ---------------------------------------------------------------- 路由
+# ---------------------------------------------------------------- Routing
 def test_missing_route_fails_fast_with_not_found_topic_code():
     pass
     p = _producer(outcomes=[MQClientException("boom")], retry=3, no_route=True)
@@ -140,19 +140,19 @@ def test_no_name_server_address_reports_10004_not_missing_route():
 
 
 def test_name_server_configured_keeps_the_10005_no_route_code():
-    """有地址、只是这个 topic 没路由 → 10004 不能把 10005 顶掉（同一条检查的对照分支）。"""
+    """Addresses are configured, it is just this topic that has no route -> 10004 must not displace 10005 (the contrast branch of the same check)."""
     p = _producer(no_route=True, retry=2, namesrv_addrs=["127.0.0.1:9876"])
     with pytest.raises(MQClientException) as ei:
         p.send(Message("TopicTest", b"x"))
     assert ei.value.response_code == ClientErrorCode.NOT_FOUND_TOPIC_EXCEPTION
 
 
-# ---------------------------------------------------------------- 错误码表
+# ---------------------------------------------------------------- Error code table
 def test_client_error_code_table_matches_the_wire_codes():
-    """客户端错误码表一共七个常量，一个都不能少、一个都不能改值。
+    """The client error code table has seven constants in total: none may be missing and none may change value.
 
-    10001~10005 是发送重试的定性；10006/10007 各有各的抛出点（request-reply 超时、
-    造应答消息失败），以前表里缺这两个，站点只能拿默认码 1/None 抛出去。
+    10001~10005 qualify send retries; 10006/10007 each have their own throw points (request-reply timeout,
+    reply message construction failure). Previously these two were absent from the table, so call sites could only throw the default code 1/None.
     """
     expected = {
         "CONNECT_BROKER_EXCEPTION": 10001,
@@ -167,7 +167,7 @@ def test_client_error_code_table_matches_the_wire_codes():
     assert got == expected
 
 
-# ---------------------------------------------------------------- 尝试次数
+# ---------------------------------------------------------------- Attempt counts
 def test_send_ok_returns_without_consuming_retries():
     p = _producer(retry=3)
     result = p.send(Message("TopicTest", b"x"))
@@ -176,7 +176,7 @@ def test_send_ok_returns_without_consuming_retries():
 
 
 def test_retry_times_plus_one_attempts_when_everything_fails():
-    """retryTimesWhenSendFailed=2 → 一共 3 次尝试，异常码是最后一次的 broker 码。"""
+    """retryTimesWhenSendFailed=2 -> 3 attempts in total, and the exception code is the last attempt's broker code."""
     p = _producer(outcomes=[MQBrokerException(ResponseCode.SYSTEM_ERROR, "s"),
                             MQBrokerException(ResponseCode.SYSTEM_ERROR, "s"),
                             MQBrokerException(ResponseCode.SYSTEM_ERROR, "s")],
@@ -206,7 +206,7 @@ def test_success_after_two_failures_returns_result():
 
 # ---------------------------------------------------------------- retryResponseCodes
 def test_non_retryable_broker_code_raises_immediately():
-    """MESSAGE_ILLEGAL 不在 retryResponseCodes 里：重试也是白试，必须原样抛出。"""
+    """MESSAGE_ILLEGAL is not in retryResponseCodes: retrying would be futile, so it must be thrown as-is."""
     p = _producer(outcomes=[MQBrokerException(ResponseCode.MESSAGE_ILLEGAL, "bad"),
                             _ok(_mq("broker-a"))], retry=2)
     with pytest.raises(MQBrokerException) as ei:
@@ -242,7 +242,7 @@ def test_non_retryable_failure_returns_earlier_send_result():
     assert _client(p).sends == 2
 
 
-# ---------------------------------------------------------------- 非 SEND_OK
+# ---------------------------------------------------------------- Non-SEND_OK
 def test_not_store_ok_returned_as_is_by_default():
     pass
     p = _producer(outcomes=[SendResult(SendStatus.FLUSH_DISK_TIMEOUT, msg_id="2" * 32)],
@@ -262,7 +262,7 @@ def test_not_store_ok_retries_another_broker_when_enabled():
     assert p.is_retry_another_broker_when_not_store_ok() is True
 
 
-# ---------------------------------------------------------------- 超时预算
+# ---------------------------------------------------------------- Timeout budget
 def test_send_msg_max_timeout_per_request_only_caps_retriable_attempts():
     pass
     p = _producer(outcomes=[MQBrokerException(ResponseCode.SYSTEM_ERROR)] * 3,
@@ -272,7 +272,7 @@ def test_send_msg_max_timeout_per_request_only_caps_retriable_attempts():
     timeouts = _client(p).timeouts
     assert len(timeouts) == 3
     assert timeouts[0] == 100 and timeouts[1] == 100
-    assert timeouts[2] > 2900, "最后一次不再压缩"
+    assert timeouts[2] > 2900, "the last attempt is no longer compressed"
 
 
 def test_without_cap_every_attempt_gets_full_remaining_budget():
@@ -285,7 +285,7 @@ def test_without_cap_every_attempt_gets_full_remaining_budget():
 
 
 def test_call_timeout_stops_retrying_and_raises_too_much_request():
-    """首轮就把总预算吃光 → 不再发第二轮，抛 RemotingTooMuchRequestException。"""
+    """The first round exhausts the total budget -> no second round is sent, and RemotingTooMuchRequestException is thrown."""
     p = _producer(outcomes=[MQBrokerException(ResponseCode.SYSTEM_ERROR)], retry=2,
                   first_send_sleep_ms=60)
     with pytest.raises(RemotingTooMuchRequestException) as ei:
@@ -303,7 +303,7 @@ def test_existing_result_wins_over_call_timeout():
     assert result.send_status == SendStatus.FLUSH_DISK_TIMEOUT
 
 
-# ---------------------------------------------------------------- 队列选择
+# ---------------------------------------------------------------- Queue selection
 def test_retry_resets_index_and_switches_broker():
     p = _producer(queues=[_mq("broker-a"), _mq("broker-b")],
                   outcomes=[MQBrokerException(ResponseCode.SYSTEM_ERROR),
@@ -311,11 +311,11 @@ def test_retry_resets_index_and_switches_broker():
                             _ok(_mq("broker-a"))], retry=2)
     p.send(Message("TopicTest", b"x"))
     brokers = _client(p).brokers
-    assert brokers[0] != brokers[1], "重试要换到别的 broker（lastBrokerName + resetIndex）"
+    assert brokers[0] != brokers[1], "a retry must switch to a different broker (lastBrokerName + resetIndex)"
     assert len(set(brokers[:2])) == 2
 
 
-# ---------------------------------------------------------------- 错误码映射
+# ---------------------------------------------------------------- Error code mapping
 def test_connect_failure_maps_to_connect_broker_exception():
     p = _producer(outcomes=[RemotingConnectException(ADDR)], retry=0)
     with pytest.raises(MQClientException) as ei:
@@ -363,7 +363,7 @@ def test_last_error_kept_as_cause():
     assert "broker-a" in str(ei.value)
 
 
-# ---------------------------------------------------------------- 容错表
+# ---------------------------------------------------------------- Fault tolerance table
 def _fault(p, broker="broker-a"):
     return p._mq_fault_strategy.latency_fault_tolerance.get_fault_item(broker)
 
@@ -374,7 +374,7 @@ def test_successful_send_records_positive_latency_without_isolation():
     item = _fault(p)
     assert item is not None
     assert item.is_available() and item.is_reachable()
-    # 亚毫秒往返用墙钟毫秒差会记成 0，那样延迟阈值永远不生效
+    # a sub-millisecond round trip recorded with wall-clock millisecond difference would be 0, and then the latency threshold would never take effect
     assert item.current_latency > 0.0, "latency must be measured on a monotonic clock"
 
 
@@ -384,7 +384,7 @@ def test_client_exception_records_latency_without_isolation():
     with pytest.raises(MQClientException):
         p.send(Message("TopicTest", b"x"))
     item = _fault(p)
-    assert item.is_available(), "客户端自身问题不该把 broker 隔离"
+    assert item.is_available(), "a client-side problem must not isolate the broker"
     assert item.is_reachable()
 
 
@@ -394,7 +394,7 @@ def test_remoting_exception_isolates_but_keeps_reachable():
     with pytest.raises(MQClientException):
         p.send(Message("TopicTest", b"x"))
     item = _fault(p)
-    assert not item.is_available(), "RemotingException 要隔离该 broker"
+    assert not item.is_available(), "RemotingException must isolate that broker"
     assert item.is_reachable()
 
 
@@ -416,7 +416,7 @@ def test_fault_table_untouched_when_latency_fault_disabled():
 
 
 def test_isolated_broker_is_avoided_on_next_send():
-    """一次 SYSTEM_ERROR 把 broker-a 隔离；下次发送必须避开它。"""
+    """One SYSTEM_ERROR isolates broker-a; the next send must avoid it."""
     queues = [_mq("broker-a"), _mq("broker-b")]
     p = _producer(queues=queues, outcomes=[MQBrokerException(ResponseCode.SYSTEM_ERROR),
                                            _ok(_mq("broker-b"))],

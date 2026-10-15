@@ -1,17 +1,28 @@
-// 覆盖：
-//   1. manager factoryTable：clientId 命中复用 / 未命中现建（created 标志、factory 只跑一次）。
-//   2. 引用计数：register/unregister 平衡；**归零才真正 shutdown**（定时器停、实例不再 running）。
-//   3. 非本 manager 缓存的实例（测试替身）归还时保持旧语义：直接关，不炸。
-//   4. removeClientFactory：摘表不关停；identity 不符不误删顶替上来的新实例。
-//   5. MQClient.start() 幂等：共享实例上第二个门面不会重复拉起后台定时器 / 重复挂 39。
-//   6. 门面处理器多播：同 code 多个登记者扇出（39 广播），互不覆盖；最后一个摘除者卸掉传输层槽。
-//   7. 真门面复用：两个 producer + 一个 admin 同 instanceName → 同一个 MQClient；
-//      单个门面 shutdown 不杀共享实例；39 反向请求按组分发给正确的 producer，且广播给
-//      其他登记者。
-//   8. 独立 clientId 不复用：不同 instanceName 的 facade 各自一套实例与定时器，互不影响。
+// Coverage:
+//   1. manager factoryTable: a clientId hit reuses, a miss creates fresh (the
+//      created flag, the factory runs only once).
+//   2. Refcounting: register/unregister stay balanced; **only reaching zero
+//      really shuts down** (timers stop, the instance stops running).
+//   3. Instances not cached by this manager (test doubles) keep the old
+//      semantics on hand-back: shut down directly, do not blow up.
+//   4. removeClientFactory: removes from the table without shutting down; a
+//      mismatched identity does not wrongly delete the replacement instance.
+//   5. MQClient.start() is idempotent: a second facade over a shared instance
+//      neither re-creates the background timers nor re-attaches 39.
+//   6. Facade processor multicast: several registrants for one code fan out (39
+//      broadcasts) instead of overwriting each other; the last one removed
+//      detaches the transport-layer slot.
+//   7. Real facade reuse: two producers + one admin sharing an instanceName ->
+//      one MQClient; shutting down a single facade does not kill the shared
+//      instance; 39 reverse requests are dispatched by group to the right
+//      producer and also broadcast to the other registrants.
+//   8. Distinct clientIds are not shared: facades with different instanceNames
+//      each get their own instance and timers, unaffected by each other.
 //
-// 全程离线：假 name server 地址（心跳/路由节拍无 broker/无 publish info，不发网络），
-// END_TRANSACTION 的 oneway 走被替换的 capture 函数 —— 不连真集群，无死端口断言。
+// Fully offline: fake name server address (heartbeat/route beats have no broker
+// and no publish info, nothing goes on the wire), and END_TRANSACTION oneway
+// goes through a replaced capture function — no real cluster, no dead-port
+// assertions.
 import { MQClient } from '../src/client/mq_client.ts';
 import { MQClientManager } from '../src/client/mq_client_manager.ts';
 import { DefaultMQProducer } from '../src/client/producer.ts';
@@ -29,7 +40,7 @@ function check(name: string, cond: boolean, detail = '') {
   else { fail++; console.log(`  FAIL ${name} ${detail}`); }
 }
 const mgr = MQClientManager.getInstance();
-const FAKE_NS = '127.0.0.1:9876'; // 永不被拨：表空则节拍空转
+const FAKE_NS = '127.0.0.1:9876'; // never dialed: an empty table means the beats idle
 
 async function tick(times = 2): Promise<void> {
   for (let i = 0; i < times; i++) await new Promise((r) => setTimeout(r, 0));
@@ -52,94 +63,95 @@ console.log('== manager factoryTable ==');
   check('hit reuses the cached instance (created=false)', r2.created === false && r2.instance === r1.instance);
   check('factory not run on a hit', factoryCalls === 1, `calls=${factoryCalls}`);
   const r3 = mgr.getOrCreateMQClientInstance('cid_1B', () => new MQClient('cid_1B', FAKE_NS, null));
-  check('一个独立 clientId 不复用（不同实例）', r3.instance !== r1.instance && r3.created === true);
-  check('getClientFactory 观测面', mgr.getClientFactory('cid_1A') === r1.instance);
+  check('a distinct clientId is not reused (separate instance)', r3.instance !== r1.instance && r3.created === true);
+  check('getClientFactory observation surface', mgr.getClientFactory('cid_1A') === r1.instance);
   let threw = '';
   try { mgr.getOrCreateMQClientInstance('', () => new MQClient('x', FAKE_NS, null)); }
   catch (e) { threw = (e as Error).message; }
-  check('空 clientId 直接报', threw.includes('clientId is empty'), threw);
+  check('empty clientId reports directly', threw.includes('clientId is empty'), threw);
   r1.instance.shutdown(); r3.instance.shutdown();
   mgr.reset();
 }
 
 // ---------------------------------------------------------------- 2. refcount
-console.log('== 引用计数：归零才真正 shutdown ==');
+console.log('== reference counting: only a zero count really shuts down ==');
 {
   mgr.reset();
   const inst = new MQClient('cid_2', FAKE_NS, null);
   inst.start();
-  check('实例已启动', inst.isRunning() === true);
+  check('instance is running', inst.isRunning() === true);
   mgr.registerClient('cid_2', inst);
-  mgr.registerClient('cid_2', inst); // 两个门面同一 clientId
-  check('refcount 计到 2', mgr.refcountOf('cid_2') === 2, `got ${mgr.refcountOf('cid_2')}`);
+  mgr.registerClient('cid_2', inst); // two facades on the same clientId
+  check('refcount reaches 2', mgr.refcountOf('cid_2') === 2, `got ${mgr.refcountOf('cid_2')}`);
   const last1 = mgr.unregisterClient('cid_2', inst);
-  check('计数未归零：不关停，实例继续存活', last1 === false && inst.isRunning() === true);
-  check('表项仍在', mgr.getClientFactory('cid_2') === inst);
+  check('count not yet zero: not shut down, instance stays alive', last1 === false && inst.isRunning() === true);
+  check('table entry still present', mgr.getClientFactory('cid_2') === inst);
   const last2 = mgr.unregisterClient('cid_2', inst);
-  check('归零：真正 shutdown（停定时器/断连）', last2 === true && inst.isRunning() === false);
-  check('归零后条目从表里摘掉', mgr.getClientFactory('cid_2') === null && mgr.refcountOf('cid_2') === 0);
+  check('count hits zero: real shutdown (timers stopped / connection closed)', last2 === true && inst.isRunning() === false);
+  check('after hitting zero the entry is removed from the table', mgr.getClientFactory('cid_2') === null && mgr.refcountOf('cid_2') === 0);
 }
 
-// ---------------------------------------------------------------- 3. 非表实例归还
-console.log('== 测试替身 / 非本 manager 缓存的实例 ==');
+// ------------------------------------------------------- 3. hand-back of an unlisted instance
+console.log('== test doubles / instances not cached by this manager ==');
 {
   mgr.reset();
   let shut = 0;
   const fake = { shutdown() { shut++; } } as any;
-  check('表里没有该 clientId：按旧语义直接关', mgr.unregisterClient('cid_unknown', fake) === true && shut === 1);
+  check('clientId not in the table: closed directly per legacy semantics', mgr.unregisterClient('cid_unknown', fake) === true && shut === 1);
   let threw = false;
   try { mgr.unregisterClient('cid_unknown', {} as any); } catch (e) { threw = true; }
-  check('替身没有 shutdown 也不炸', threw === false);
-  check('null 实例归还返回 false', mgr.unregisterClient('cid_unknown', null) === false);
-  // 表里另有他人条目时不误伤：identity 不符只关调用方手里的实例
+  check('a test double with no shutdown does not throw', threw === false);
+  check('returning a null instance yields false', mgr.unregisterClient('cid_unknown', null) === false);
+  // Do not harm someone else's entry when one exists: an identity mismatch shuts
+  // down only the instance the caller holds.
   const inst = new MQClient('cid_3', FAKE_NS, null);
   inst.start();
   mgr.registerClient('cid_3', inst);
   const stranger = { shutdown() { shut++; } } as any;
   mgr.unregisterClient('cid_3', stranger);
-  check('identity 不符：不动表项，共享实例继续存活',
+  check('identity mismatch: table entry untouched, shared instance stays alive',
     mgr.refcountOf('cid_3') === 1 && inst.isRunning() === true && shut === 2);
   mgr.unregisterClient('cid_3', inst);
   mgr.reset();
 }
 
-// ---------------------------------------------------------------- 4. removeClientFactory
-console.log('== removeClientFactory：摘表不关停 ==');
+// ------------------------------------------------------ 4. removeClientFactory
+console.log('== removeClientFactory: removes the entry without shutting down ==');
 {
   mgr.reset();
   const inst = new MQClient('cid_4', FAKE_NS, null);
   inst.start();
   mgr.registerClient('cid_4', inst);
   const other = { shutdown() { throw new Error('must NOT be shut down'); } } as any;
-  mgr.removeClientFactory('cid_4', other); // identity 不符：不误删
-  check('identity 守卫：表项仍在', mgr.getClientFactory('cid_4') === inst);
+  mgr.removeClientFactory('cid_4', other); // identity mismatch: no wrong removal
+  check('identity guard: table entry still present', mgr.getClientFactory('cid_4') === inst);
   mgr.removeClientFactory('cid_4', inst);
-  check('摘表后 getOrCreate 不会再毒化出半死实例', mgr.getClientFactory('cid_4') === null);
-  check('removeClientFactory 不关停（实例仍在跑）', inst.isRunning() === true);
+  check('after removal getOrCreate cannot poison a half-dead instance', mgr.getClientFactory('cid_4') === null);
+  check('removeClientFactory does not shut down (instance still running)', inst.isRunning() === true);
   inst.shutdown();
   mgr.reset();
 }
 
-// ---------------------------------------------------------------- 5. start() 幂等
-console.log('== MQClient.start() 幂等（共享实例第二个门面不重复起后台任务） ==');
+// ------------------------------------------------------- 5. start() idempotency
+console.log('== MQClient.start() is idempotent (a second facade on a shared instance does not start background tasks again) ==');
 {
   const inst = new MQClient('cid_5', FAKE_NS, null);
   inst.start();
   const hb = (inst as any)._heartbeatTimer;
   const rt = (inst as any)._routeTimer;
   const cnt39 = inst.facadeProcessorCount(RequestCode.CHECK_TRANSACTION_STATE);
-  inst.start(); // 复用门面再 start 一次
-  check('心跳定时器只拉起一次', (inst as any)._heartbeatTimer === hb && hb != null);
-  check('路由刷新定时器只拉起一次', (inst as any)._routeTimer === rt && rt != null);
-  check('39 处理器不因重复 start 翻倍',
+  inst.start(); // a reusing facade calls start() again
+  check('heartbeat timer started only once', (inst as any)._heartbeatTimer === hb && hb != null);
+  check('route refresh timer started only once', (inst as any)._routeTimer === rt && rt != null);
+  check('the 39 handler does not double on repeated start',
     inst.facadeProcessorCount(RequestCode.CHECK_TRANSACTION_STATE) === cnt39 && cnt39 === 1);
   inst.shutdown();
-  check('shutdown 清掉后台定时器',
+  check('shutdown clears the background timers',
     (inst as any)._heartbeatTimer === null && (inst as any)._routeTimer === null);
 }
 
-// ---------------------------------------------------------------- 6. facade 多播
-console.log('== 实例级反向请求多播（后注册不再覆盖先注册） ==');
+// ---------------------------------------------------------- 6. facade multicast
+console.log('== instance-level reverse-request multicast (later registrants no longer overwrite earlier ones) ==');
 {
   const inst = new MQClient('cid_6', FAKE_NS, null);
   inst.start();
@@ -150,46 +162,50 @@ console.log('== 实例级反向请求多播（后注册不再覆盖先注册） 
   const code39 = RequestCode.CHECK_TRANSACTION_STATE;
   inst.registerFacadeProcessor(code39, h1);
   inst.registerFacadeProcessor(code39, h2);
-  check('同 code 三个登记者（内置 + 两个门面）扇出而非覆盖',
+  check('three registrants for the same code (builtin + two facades) fan out instead of overwriting',
     inst.facadeProcessorCount(code39) === 3, `got ${inst.facadeProcessorCount(code39)}`);
-  const cmd39 = RemotingCommand.createRequestCommand(code39, null); // 空 body：内置解码失败仍应答
+  const cmd39 = RemotingCommand.createRequestCommand(code39, null); // empty body: the built-in decoder still fails and answers
   const resp = inst.dispatchFacadeProcessor(cmd39, '127.0.0.1:10911');
-  check('39 广播：h1 与 h2 都被调用', hits.includes('h1') && hits.includes('h2'), hits.join(','));
-  check('应答取第一个非 null（内置处理器的 SYSTEM_ERROR）', resp != null && resp.code === ResponseCode.SYSTEM_ERROR);
+  check('39 broadcast: both h1 and h2 are invoked', hits.includes('h1') && hits.includes('h2'), hits.join(','));
+  check('the reply takes the first non-null (the builtin handler SYSTEM_ERROR)', resp != null && resp.code === ResponseCode.SYSTEM_ERROR);
   inst.unregisterFacadeProcessor(code39, h1);
   inst.unregisterFacadeProcessor(code39, h2);
-  check('摘除后回到内置独占', inst.facadeProcessorCount(code39) === 1);
-  // 传输层槽的装卸：首个登记者挂上分发器，最后一个摘除者卸槽（consumer 类 code 36）。
+  check('after removal it is back to builtin-only', inst.facadeProcessorCount(code39) === 1);
+  // Attaching and detaching the transport-layer slot: the first registrant hooks
+  // the dispatcher onto it, the last remover to leave takes it off (consumer-side
+  // code 36).
   const code36 = RequestCode.NOTIFY_CONSUMER_IDS_CHANGED;
   const ha = () => null;
   const hb2 = () => null;
   inst.registerFacadeProcessor(code36, ha);
-  check('首个登记者把分发器挂上传输层槽', rc.processors.has(code36));
+  check('the first registrant wires the dispatcher into the transport slot', rc.processors.has(code36));
   inst.registerFacadeProcessor(code36, hb2);
-  inst.unregisterFacadeProcessor(code36, () => null); // 摘不存在的身份：no-op
-  check('identity 摘除只认登记的那份', inst.facadeProcessorCount(code36) === 2 && rc.processors.has(code36));
+  inst.unregisterFacadeProcessor(code36, () => null); // removing an unregistered identity: a no-op
+  check('identity-based removal only accepts the registered instance', inst.facadeProcessorCount(code36) === 2 && rc.processors.has(code36));
   inst.unregisterFacadeProcessor(code36, ha);
-  check('还有登记者时不卸槽', rc.processors.has(code36) && inst.facadeProcessorCount(code36) === 1);
+  check('the transport slot stays while other registrants remain', rc.processors.has(code36) && inst.facadeProcessorCount(code36) === 1);
   inst.unregisterFacadeProcessor(code36, hb2);
-  check('最后一个摘除者卸掉传输层槽', !rc.processors.has(code36) && inst.facadeProcessorCount(code36) === 0);
-  // 广播 = 全扇出：后面的登记者产生应答，前面的照样被唤起；应答回给传输层的是第一个非 null。
+  check('the last remover unplugs the transport slot', !rc.processors.has(code36) && inst.facadeProcessorCount(code36) === 0);
+  // Broadcast = full fan-out: later registrants produce an answer, earlier ones are
+  // still invoked; the response handed back to the transport layer is the first
+  // non-null one.
   const seen: string[] = [];
   const m1 = () => { seen.push('m1'); return null; };
   const m2 = () => { seen.push('m2'); return RemotingCommand.createResponseCommand(ResponseCode.SUCCESS, 'm2'); };
   inst.registerFacadeProcessor(code36, m1);
   inst.registerFacadeProcessor(code36, m2);
   const dresp = inst.dispatchFacadeProcessor(RemotingCommand.createRequestCommand(code36, null), '127.0.0.1:10911');
-  check('广播：两个登记者都被唤起（不因先应答而短路）', seen.includes('m1') && seen.includes('m2'), seen.join(','));
-  check('应答回给传输层的是第一个非 null', dresp != null && dresp.remark === 'm2');
+  check('broadcast: both registrants are woken (no short-circuit on first reply)', seen.includes('m1') && seen.includes('m2'), seen.join(','));
+  check('the reply returned to the transport layer is the first non-null', dresp != null && dresp.remark === 'm2');
   inst.unregisterFacadeProcessor(code36, m1);
   inst.unregisterFacadeProcessor(code36, m2);
-  check('无人登记的 code 分派出 null',
+  check('an unregistered code dispatches null',
     inst.dispatchFacadeProcessor(RemotingCommand.createRequestCommand(9999, null), 'x') === null);
   inst.shutdown();
 }
 
-// ---------------------------------------------------------------- 7. 真门面复用
-console.log('== producer + producer + admin 同 instanceName → 共享一个 MQClient ==');
+// ---------------------------------------------------------- 7. real facade reuse
+console.log('== producer + producer + admin with the same instanceName -> one shared MQClient ==');
 {
   mgr.reset();
   const sharedName = 'SMGR_shared';
@@ -214,21 +230,22 @@ console.log('== producer + producer + admin 同 instanceName → 共享一个 MQ
   await pB.start();
   admin.start();
   const shared = pA.client!;
-  check('clientId 走 group 无关的 ip@instanceName 维度', shared.clientId === expectedClientId, shared.clientId);
-  check('三个门面共享同一个 MQClient 实例', pB.client === shared && admin.client === shared);
-  check('引用计数 = 门面数 3', mgr.refcountOf(shared.clientId) === 3, `got ${mgr.refcountOf(shared.clientId)}`);
-  check('两个 producer 都在实例的 producerTable 上',
+  check('clientId follows the group-independent ip@instanceName dimension', shared.clientId === expectedClientId, shared.clientId);
+  check('all three facades share one MQClient instance', pB.client === shared && admin.client === shared);
+  check('reference count equals the facade count 3', mgr.refcountOf(shared.clientId) === 3, `got ${mgr.refcountOf(shared.clientId)}`);
+  check('both producers are on the instance producerTable',
     shared.getRegisteredProducers().has('GID_mgr_reuse_A') && shared.getRegisteredProducers().has('GID_mgr_reuse_B'));
-  // 一条 RPC 通道：同一个 RemotingClient 对象
-  check('到 broker 的 RPC 通道只有一条（同一 RemotingClient）',
+  // One RPC channel: the very same RemotingClient object
+  check('only one RPC channel to the broker (same RemotingClient)',
     (pB.client as any).remotingClient === (admin.client as any).remotingClient);
 
-  // 反向请求：END_TRANSACTION 的 oneway 用 capture 替身（不外拨）。
+  // Reverse request: END_TRANSACTION oneway uses a capture double (nothing goes out).
   const ended: RemotingCommand[] = [];
   (shared.remotingClient as any).invokeOneway = (_addr: string, req: RemotingCommand) => {
     ended.push(req); return Promise.resolve();
   };
-  // 额外的 39 登记者（广播观察）：共享实例上 39 扇出给所有登记者。
+  // An extra 39 registrant (broadcast observation): on a shared instance 39 fans
+  // out to every registrant.
   const extra: number[] = [];
   const ex = () => { extra.push(1); return null; };
   shared.registerFacadeProcessor(RequestCode.CHECK_TRANSACTION_STATE, ex);
@@ -244,31 +261,31 @@ console.log('== producer + producer + admin 同 instanceName → 共享一个 MQ
   cmd.addExtField('commitLogOffset', '2');
   const resp = shared.dispatchFacadeProcessor(cmd, '127.0.0.1:10911');
   await tick(3);
-  check('39 即时应答 SUCCESS（检查在 setImmediate 里跑，不在分发线程同步外拨）',
+  check('39 replies SUCCESS immediately (the check runs in setImmediate, not synchronously on the dispatch thread)',
     resp != null && resp.code === ResponseCode.SUCCESS);
-  check('39 按组分发：只有 A 组的 listener 被唤起',
+  check('39 dispatches by group: only group A listener is woken',
     checkedFor.length === 1 && checkedFor[0] === 'GID_mgr_reuse_A', checkedFor.join(','));
-  check('39 同时广播给其他登记者（多播，非覆盖）', extra.length === 1);
-  check('A 组 COMMIT → END_TRANSACTION oneway 已发出',
+  check('39 also broadcasts to other registrants (multicast, not overwrite)', extra.length === 1);
+  check('group A COMMIT: the END_TRANSACTION oneway was sent',
     ended.length === 1 && ended[0].code === RequestCode.END_TRANSACTION);
   shared.unregisterFacadeProcessor(RequestCode.CHECK_TRANSACTION_STATE, ex);
 
-  // 单个门面 shutdown 不杀共享实例
+  // Shutting down a single facade does not kill the shared instance
   pA.shutdown();
-  check('A 退场：引用计数 3→2，共享实例继续存活',
+  check('A leaves: reference count 3->2, shared instance stays alive',
     mgr.refcountOf(shared.clientId) === 2 && shared.isRunning() === true);
-  check('A 从 producerTable 摘干净', !shared.getRegisteredProducers().has('GID_mgr_reuse_A'));
-  check('B 仍在使用同一个实例（未受 A 退场影响）', pB.client === shared && shared.isRunning() === true);
+  check('A is fully removed from producerTable', !shared.getRegisteredProducers().has('GID_mgr_reuse_A'));
+  check('B still uses the same instance (unaffected by A leaving)', pB.client === shared && shared.isRunning() === true);
   pB.shutdown();
-  check('B 退场：还剩 admin 一份，实例不断连',
+  check('B leaves: one admin reference remains, instance stays connected',
     mgr.refcountOf(shared.clientId) === 1 && shared.isRunning() === true);
   admin.shutdown();
-  check('最后一任退场：归零，实例真正 shutdown 并摘表',
+  check('the last one leaves: count hits zero, instance really shuts down and is removed',
     shared.isRunning() === false && mgr.getClientFactory(shared.clientId) === null);
 }
 
-// ---------------------------------------------------------------- 8. 独立 clientId 不复用
-console.log('== 独立 clientId 各自一套，互不影响 ==');
+// ------------------------------------- 8. distinct clientIds are not shared
+console.log('== independent clientIds each get their own set, unaffected by each other ==');
 {
   mgr.reset();
   const pX = new DefaultMQProducer('GID_mgr_iso_X');
@@ -279,15 +296,15 @@ console.log('== 独立 clientId 各自一套，互不影响 ==');
   await pY.start();
   const xInst = pX.client!;
   const yInst = pY.client!;
-  check('不同 instanceName → 不同实例', xInst !== yInst && xInst.clientId !== yInst.clientId);
-  check('两个 clientId 各计各数', mgr.refcountOf(xInst.clientId) === 1
+  check('different instanceName -> different instances', xInst !== yInst && xInst.clientId !== yInst.clientId);
+  check('the two clientIds are counted separately', mgr.refcountOf(xInst.clientId) === 1
     && mgr.refcountOf(yInst.clientId) === 1);
   pX.shutdown();
-  check('X 归零只关自己，Y 的实例与定时器不受影响',
+  check('X hitting zero closes only itself; the Y instance and timers are unaffected',
     xInst.isRunning() === false && yInst.isRunning() === true
     && mgr.getClientFactory(yInst.clientId) === yInst);
   pY.shutdown();
-  check('Y 也归零摘表', mgr.getClientFactory(yInst.clientId) === null);
+  check('Y also hits zero and is removed from the table', mgr.getClientFactory(yInst.clientId) === null);
   mgr.reset();
 }
 

@@ -114,9 +114,9 @@ pub fn is_enabled(level: Level) -> bool {
     level >= config().level
 }
 
-/// 手动设置级别（只能在第一次写日志前生效，之后走环境变量）。
+/// Manual setting (only takes effect before the first log write; afterwards the environment variables rule).
 pub fn set_console_output(enable: bool) {
-    // Config 在 OnceLock 里不可变，因此这里只影响 stdout 分支的开关位。
+    // Config is immutable inside a OnceLock, so this only flips the switch bit for the stdout branch.
     STDOUT_OVERRIDE
         .set(if enable { Some(true) } else { Some(false) })
         .ok();

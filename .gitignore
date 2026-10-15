@@ -15,7 +15,7 @@ dotnet/**/bin/
 dotnet/**/obj/
 *.user
 
-# 测试 / 工具缓存
+# Test / tool caches
 .pytest_cache/
 .mypy_cache/
 .coverage
@@ -34,19 +34,20 @@ rust/target/
 .DS_Store
 Thumbs.db
 
-# 误留的重定向文件（nohup 等）
+# Accidentally left redirection files (nohup etc.)
 nohup.out
 
-# 客户端日志：python/php 端默认落在**当前工作目录**的 logs/rocketmqlogs 下
-# （刻意不写 $HOME，见 python/rocketmq_logging.py、php/src/Client/Logger.php），
-# 在仓库根或端口目录跑示例/单测就会长出这个目录。
+# Client logs: the python/php clients write to logs/rocketmqlogs under the **current working
+# directory** by default (deliberately not $HOME; see python/rocketmq_logging.py,
+# php/src/Client/Logger.php). Running examples/tests from the repo root or a port directory
+# grows this directory.
 logs/
 
-# 本地 agent 工作目录（项目记忆 / 临时脚本），不入库
+# Local agent working directory (project memory / temp scripts), not committed
 .workbuddy/
 
-# cmake 杂散产物（在仓库根或非构建目录误跑 cmake 生成；cpp/go 等正规构建
-# 目录各自维护，不在此列）
+# Stray cmake artifacts (produced by accidentally running cmake in the repo root or a non-build
+# directory; the proper build dirs of cpp/go etc. maintain their own and are not listed here)
 CMakeCache.txt
 CMakeFiles/
 CTestTestfile.cmake

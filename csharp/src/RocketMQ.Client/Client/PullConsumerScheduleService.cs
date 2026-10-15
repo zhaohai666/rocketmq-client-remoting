@@ -58,7 +58,7 @@ public sealed class PullConsumerScheduleService : IDisposable
         _pullConsumer.SetRpcHook(rpcHook);
     }
 
-    // ---------------- 配置 ----------------
+    // ---------------- Configuration ----------------
 
     public DefaultMQPullConsumer PullConsumer
     {
@@ -90,7 +90,8 @@ public sealed class PullConsumerScheduleService : IDisposable
         set => _pullThreadNums = Math.Max(1, value);
     }
 
-    /// <summary>扫描周期毫秒（默认 20000，下限钳 100）。改在下一圈生效。</summary>
+    /// <summary>Scan interval in milliseconds (default 20000, clamped to a minimum of
+    /// 100). A change takes effect on the next round.</summary>
     public int RebalanceScanIntervalMillis
     {
         get => _rebalanceScanIntervalMillis;
@@ -105,7 +106,7 @@ public sealed class PullConsumerScheduleService : IDisposable
 
     public string ConsumerGroup => _pullConsumer.ConsumerGroup;
 
-    // ---------------- 注册 ----------------
+    // ---------------- Registration ----------------
 
     public void RegisterPullTaskCallback(string topic, IPullTaskCallback callback)
     {
@@ -119,11 +120,12 @@ public sealed class PullConsumerScheduleService : IDisposable
         _pullConsumer.RegisterMessageQueueListener(topic, null);
     }
 
-    /// <summary>delegate 形状的同款注册（本端口的函数式便车，语义与接口版逐字一致）。</summary>
+    /// <summary>The same registration in delegate form (this port's functional
+    /// convenience; the semantics are verbatim identical to the interface version).</summary>
     public void RegisterPullTaskCallback(string topic, Action<MessageQueue, PullTaskContext> callback) =>
         RegisterPullTaskCallback(topic, new DelegatePullTaskCallback(callback));
 
-    // ---------------- 生命周期 ----------------
+    // ---------------- Lifecycle ----------------
 
     public void Start()
     {
@@ -200,12 +202,15 @@ public sealed class PullConsumerScheduleService : IDisposable
 
     public void Dispose() => Shutdown();
 
-    // ---------------- 任务展开 ----------------
+    // ---------------- Task expansion ----------------
 
-    /// <summary>扫描循环（Start 尾挂起的后台线程）：每 <see cref="RebalanceScanIntervalMillis"/>
-    /// 对账一次。分片睡（每 100ms 复查停机位，口径同门面 HeartbeatLoop），Shutdown 最多
-    /// 100ms 就能退出当前睡眠段；异常一律在 ScanOnce 内部被逐 topic 接住，这里再兜一层
-    /// 防循环线程被打穿（打穿 = 队列增减从此不再响应）。</summary>
+    /// <summary>The scan loop (a background thread hung off the tail of Start): reconciles
+    /// once every <see cref="RebalanceScanIntervalMillis"/>. It sleeps in slices (rechecking
+    /// the shutdown flag every 100ms, the same rule as the facade's HeartbeatLoop), so
+    /// Shutdown exits the current sleep segment within 100ms; exceptions are always caught
+    /// per topic inside ScanOnce, and this outer layer adds one more guard so the loop
+    /// thread cannot be broken through (being broken through means queue additions and
+    /// removals are never handled again).</summary>
     private void ScanLoop()
     {
         while (!_scanStop && !_stopped)
@@ -291,7 +296,7 @@ public sealed class PullConsumerScheduleService : IDisposable
 
         task.Arm(() =>
         {
-            // 池已关（Shutdown 竞态）只丢这一轮，不让异常炸掉延迟载体
+            // The pool is already closed (a Shutdown race): only this round is lost, the exception does not blow up the delay carrier
             try
             {
                 executor.Submit(() => RunTask(task));
@@ -337,7 +342,8 @@ public sealed class PullConsumerScheduleService : IDisposable
         ScheduleTask(task, context.PullNextDelayTimeMillis);
     }
 
-    /// <summary>delegate → IPullTaskCallback 的薄包装（给函数式注册重载用）。</summary>
+    /// <summary>A thin delegate -> IPullTaskCallback wrapper (for the functional
+    /// registration overload).</summary>
     private sealed class DelegatePullTaskCallback(Action<MessageQueue, PullTaskContext> inner)
         : IPullTaskCallback
     {
@@ -355,8 +361,8 @@ public sealed class PullConsumerScheduleService : IDisposable
 
         internal volatile bool Cancelled;
 
-        /// <summary>delayMillis 后跑 fire（fire 本身通常只把活投进执行池）。已被取消的任务
-        /// 不再排。</summary>
+        /// <summary>Runs fire after delayMillis (fire itself usually only submits the work
+        /// to the executor pool). A task that was already cancelled is not scheduled.</summary>
         internal void Arm(Action fire, int delayMillis)
         {
             CancellationTokenSource? previous;
@@ -373,12 +379,12 @@ public sealed class PullConsumerScheduleService : IDisposable
                 _pending = cts;
             }
 
-            // 撤旧一轮的等点位（正常路径旧的已触发，这里是防御性收口）
+            // The wait position of the previous round is withdrawn (on the normal path it has already fired; this is a defensive cleanup)
             CancelQuietly(previous);
 
             _ = Task.Delay(Math.Max(0, delayMillis), cts.Token).ContinueWith(armed =>
             {
-                // 被取消/已释放的一轮直接作废；到点成功才投递
+                // A cancelled/already-released round is simply discarded; only a successful due-time delivery counts
                 if (!armed.IsCompletedSuccessfully)
                 {
                     return;
@@ -395,8 +401,9 @@ public sealed class PullConsumerScheduleService : IDisposable
             }, TaskScheduler.Default);
         }
 
-        /// <summary>撤掉在等点位的一轮（取消 + 释放句柄）。已触发或在跑的轮次不受影响，
-        /// 由 RunTask 的 Cancelled 检查收口。</summary>
+        /// <summary>Withdraws a round that is waiting at its due time (cancel + release the
+        /// handle). A round that has already fired or is running is unaffected and is
+        /// finalised by the Cancelled check in RunTask.</summary>
         internal void Disarm()
         {
             CancellationTokenSource? pending;
@@ -422,7 +429,7 @@ public sealed class PullConsumerScheduleService : IDisposable
             }
             catch (ObjectDisposedException)
             {
-                // 已被别处释放：等价于已撤防，无需处理
+                // Already released elsewhere: equivalent to already withdrawn, nothing to do
             }
 
             cts.Dispose();

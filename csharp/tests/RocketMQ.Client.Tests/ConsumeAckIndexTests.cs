@@ -1,4 +1,4 @@
-// classic 并发消费路径的 ackIndex 语义单测 —— 不需要集群。
+// Unit tests for the ackIndex semantics of the classic concurrent consume path -- no cluster needed.
 
 using RocketMQ.Client;
 using RocketMQ.Common;
@@ -61,9 +61,11 @@ public class ConsumeAckIndexTests
     }
 
     /// <summary>
-    /// 一把「未 Start」的消费者：SendMessageBack 必定失败，正是「回投失败不能推进位点」
-    /// 这条分支的夹具。真机里 dispatchLoop 是「先从缓冲取走本批、再消费」，所以 key 一定
-    /// 还在表里（可能还有余量）；回投失败要塞回的正是这张表。
+    /// An orderly consumer that is "not Started": SendMessageBack is bound to fail, which
+    /// is exactly the fixture for the "a failed resend must not advance the offset" branch.
+    /// On a real machine dispatchLoop is "take this batch out of the buffer first, then
+    /// consume", so the key is still in the table (it may even have some remaining
+    /// allowance); what a failed resend has to put back is exactly this table.
     /// </summary>
     private sealed class Harness
     {
@@ -89,7 +91,8 @@ public class ConsumeAckIndexTests
 
         public void RegisterHook(IConsumeMessageHook hook) => _consumer.RegisterConsumeMessageHook(hook);
 
-        /// <summary>队首缓冲的 (queueOffset, reconsumeTimes) 列表，便于一次性比对。</summary>
+        /// <summary>The (queueOffset, reconsumeTimes) list at the head of the buffer, for
+        /// comparing in one go.</summary>
         public List<(long Offset, int Times)> Pending()
             => _consumer.PendingForTest(_key).Select(m => (m.QueueOffset, m.ReconsumeTimes)).ToList();
 
@@ -138,7 +141,7 @@ public class ConsumeAckIndexTests
     [Fact]
     public void NegativeAckIndexBacksEveryMessageAndFreezesTheOffset()
     {
-        // ackIndex=-1（一条都不认可）：整批回投，位点原地不动（没有任何条目被处理完）
+        // ackIndex=-1 (not one entry acknowledged): the whole batch is resent and the offset stays put (nothing was finished)
         var h = new Harness();
         h.Run(OffsetBatch(3), ConsumeConcurrentlyStatus.ConsumeSuccess, -1);
         Assert.Equal(new List<(long, int)> { (0, 1), (1, 1), (2, 1) }, h.Pending());
@@ -182,7 +185,8 @@ public class ConsumeAckIndexTests
         Assert.Equal(2, h.Offset());
     }
 
-    /// <summary>只记 after 钩子看到的 (status, success, ConsumeContextType)。</summary>
+    /// <summary>Records only the (status, success, ConsumeContextType) the after hook
+    /// saw.</summary>
     private sealed class RecordingConsumeHook : IConsumeMessageHook
     {
         public List<(string? Status, bool Success, string? ContextType)> After { get; } = new();
@@ -212,13 +216,14 @@ public class ConsumeAckIndexTests
         var later = new Harness(MessageModel.Broadcasting);
         var laterHook = new RecordingConsumeHook();
         later.RegisterHook(laterHook);
-        // 广播模式下 RECONSUME_LATER 不回投（集群模式未 Start 时回投必定失败、
-        // 整批会退回队首），这里只关心钩子看到的 status。
+        // In broadcasting mode RECONSUME_LATER is not resent (in cluster mode a resend is
+        // bound to fail while not Started and the whole batch would go back to the head);
+        // only the status the hook saw matters here.
         Assert.True(later.Run(OffsetBatch(1), ConsumeConcurrentlyStatus.ReconsumeLater, null));
 
         Assert.Equal(("CONSUME_SUCCESS", true, "SUCCESS"), successHook.After[0]);
         Assert.Equal(("RECONSUME_LATER", false, "FAILED"), laterHook.After[0]);
-        // 反证：不能是 C# 枚举的拼写（旧实现的形态）
+        // Counter-proof: it must not be the C# enum's spelling (the shape of the old implementation)
         Assert.NotEqual(nameof(ConsumeConcurrentlyStatus.ConsumeSuccess), successHook.After[0].Status);
         Assert.NotEqual(nameof(ConsumeConcurrentlyStatus.ReconsumeLater), laterHook.After[0].Status);
     }

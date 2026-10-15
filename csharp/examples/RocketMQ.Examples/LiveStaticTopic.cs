@@ -1,14 +1,15 @@
-// C# 客户端静态主题（513 createStaticTopic + 端点重写）真机联调（场景段 S1-S5）。
+// Real-machine integration of the C# client's static topics (513 createStaticTopic +
+// endpoint rewriting) (scenario sections S1-S5).
 //
-// S1 createStaticTopic(513)：单 broker，totalQueues=8，物理 4 队列。
-// S2 路由回读：TopicQueueMappingByBroker 非空。
-// S3 topicRouteData2EndpointsForStaticTopic：8 条端点（0-3 → broker，
-//    4-7 → __syslo__none__）。
-// S4 实例重写：GetBrokerNameFromMessageQueue 对 mock 队列名解析到真实
-//    broker；表外 id 与非静态主题透传。
-// S5 端到端：普通生产者发 4 条、PUSH 消费者收齐 4 条。
+// S1 createStaticTopic(513): a single broker, totalQueues=8, 4 physical queues.
+// S2 route read back: TopicQueueMappingByBroker is non-empty.
+// S3 topicRouteData2EndpointsForStaticTopic: 8 endpoints (0-3 -> the broker,
+//    4-7 -> __syslo__none__).
+// S4 instance rewriting: GetBrokerNameFromMessageQueue resolves a mock queue name to the
+//    real broker; ids outside the table and non-static topics pass through.
+// S5 end to end: a normal producer sends 4 messages, a PUSH consumer receives all 4.
 //
-// 用法：rmq static-topic-live [namesrv]
+// Usage: rmq static-topic-live [namesrv]
 using System.Globalization;
 using RocketMQ.Client;
 using RocketMQ.Common;
@@ -90,8 +91,9 @@ public static class LiveStaticTopic
     }
 
     /// <summary>
-    /// 单 broker 的 TopicQueueMappingDetail 文档（513 body，broker 侧 TopicQueueMappingDetail
-    /// 的 fastjson2 字段名，与协议定义逐字段一致）。
+    /// The TopicQueueMappingDetail document for a single broker (the 513 body, the
+    /// broker-side fastjson2 field names of TopicQueueMappingDetail, matching the protocol
+    /// definition field by field).
     /// </summary>
     private static JsonValue MappingDetail(string brokerName)
     {
@@ -145,7 +147,7 @@ public static class LiveStaticTopic
         Console.WriteLine("namesrv=" + _nsAddr + " topic=" + _topic);
 
         // ---------------- S1 createStaticTopic(513) ----------------
-        Console.WriteLine("\nS1 起管理端，CreateStaticTopic(513)");
+        Console.WriteLine("\nS1 starting the admin side, CreateStaticTopic(513)");
         var admin = new DefaultMQAdminExt("StaticLiveAdmin_" + Stamp);
         admin.SetNamesrvAddr(_nsAddr);
         admin.Start();
@@ -155,7 +157,7 @@ public static class LiveStaticTopic
             ClusterInfo info = admin.FetchBrokerClusterInfo();
             _brokerName = info.BrokerAddrTable.Keys.First();
             brokerAddr = info.BrokerAddrTable[_brokerName].SelectBrokerAddr();
-            Check("S1 broker 地址解析", brokerAddr.Length > 0,
+            Check("S1 the broker address resolves", brokerAddr.Length > 0,
                 _brokerName + "(" + brokerAddr + ")");
 
             var config = new TopicConfig(_topic)
@@ -165,7 +167,7 @@ public static class LiveStaticTopic
             };
             admin.CreateStaticTopic(brokerAddr, MixAll.DefaultTopic, config,
                 MappingDetail(_brokerName), true);
-            Check("S1 CreateStaticTopic(513) 被接受", true,
+            Check("S1 CreateStaticTopic(513) was accepted", true,
                 "totalQueues=" + TotalQueues);
         }
         finally
@@ -173,8 +175,8 @@ public static class LiveStaticTopic
             admin.Shutdown();
         }
 
-        // ---------------- S2/S3 路由回读 + 端点集推导 ----------------
-        Console.WriteLine("\nS2/S3 路由回读 + 端点集推导");
+        // ---------------- S2/S3 route read back + endpoint set derivation ----------------
+        Console.WriteLine("\nS2/S3 route read back + endpoint set derivation");
         TopicRouteData? route = null;
         WaitUntil(() =>
         {
@@ -192,7 +194,7 @@ public static class LiveStaticTopic
             }
             catch (Exception)
             {
-                // 路由还没带上 mapping 信息，继续等
+                // the route does not carry the mapping information yet, keep waiting
             }
             finally
             {
@@ -201,7 +203,7 @@ public static class LiveStaticTopic
 
             return false;
         }, 30000, 2000);
-        Check("S2 路由携带 TopicQueueMappingByBroker", route is not null);
+        Check("S2 the route carries TopicQueueMappingByBroker", route is not null);
         if (route is null)
         {
             return Finish();
@@ -210,14 +212,14 @@ public static class LiveStaticTopic
         var endpoints = new Dictionary<MessageQueue, string>();
         bool derived = StaticTopic.TopicRouteData2EndpointsForStaticTopic(
             _topic, route, endpoints);
-        Check("S3 端点集非空", derived && endpoints.Count > 0);
+        Check("S3 the endpoint set is non-empty", derived && endpoints.Count > 0);
         if (!derived)
         {
             return Finish();
         }
 
         string mockName = StaticTopic.GetMockBrokerName(StaticTopic.MetadataScopeGlobal);
-        Check("S3 端点总数 = totalQueues", endpoints.Count == TotalQueues,
+        Check("S3 the total endpoint count = totalQueues", endpoints.Count == TotalQueues,
             "got " + endpoints.Count + " want " + TotalQueues);
 
         bool hostedOk = true;
@@ -228,7 +230,7 @@ public static class LiveStaticTopic
             hostedOk = hostedOk && bname == _brokerName;
         }
 
-        Check("S3 承载 id 0-" + (PhysicalQueues - 1) + " → broker", hostedOk);
+        Check("S3 the hosted ids 0-" + (PhysicalQueues - 1) + " -> the broker", hostedOk);
 
         bool unhostedOk = true;
         for (int gid = PhysicalQueues; gid < TotalQueues; ++gid)
@@ -238,11 +240,11 @@ public static class LiveStaticTopic
             unhostedOk = unhostedOk && bname == StaticTopic.LogicalQueueMockNotExist;
         }
 
-        Check("S3 无承载 id " + PhysicalQueues + "-" + (TotalQueues - 1)
+        Check("S3 the unhosted ids " + PhysicalQueues + "-" + (TotalQueues - 1)
               + " → __syslo__none__", unhostedOk);
 
-        // ---------------- S4/S5 实例重写 + 端到端收发 ----------------
-        Console.WriteLine("\nS4/S5 实例重写 + 端到端收发");
+        // ---------------- S4/S5 instance rewriting + end-to-end send/receive ----------------
+        Console.WriteLine("\nS4/S5 instance rewriting + end-to-end send/receive");
         var rec = new Recorder();
         var consumer = new DefaultMQPushConsumer(_group);
         consumer.SetNamesrvAddr(_nsAddr);
@@ -265,22 +267,23 @@ public static class LiveStaticTopic
 
             return true;
         }, 20000);
-        Check("S4 实例把 mock 队列重写到真实 broker", rewriteOk);
+        Check("S4 the instance rewrites the mock queue to the real broker", rewriteOk);
 
-        // id TotalQueues-1 在端点表内，值就是 __syslo__none__（协议语义：返回端点值）；
-        // 透传用例要用表外 id（这里取 99）。
+        // id TotalQueues-1 is inside the endpoint table and its value is __syslo__none__ (the
+        // protocol semantics: return the endpoint value); the pass-through case has to use an
+        // id outside the table (99 here).
         string unhostedRewrite = inst.GetBrokerNameFromMessageQueue(
             new MessageQueue(_topic, mockName, TotalQueues - 1));
-        Check("S4 无承载 id 返回哨兵值",
+        Check("S4 an unhosted id returns the sentinel value",
             unhostedRewrite == StaticTopic.LogicalQueueMockNotExist, unhostedRewrite);
 
         string outsideRewrite = inst.GetBrokerNameFromMessageQueue(
             new MessageQueue(_topic, mockName, 99));
-        Check("S4 表外 id 透传 mock 名", outsideRewrite == mockName, outsideRewrite);
+        Check("S4 an id outside the table passes the mock name through", outsideRewrite == mockName, outsideRewrite);
 
         string plainRewrite = inst.GetBrokerNameFromMessageQueue(
             new MessageQueue("Plain_" + Stamp, _brokerName, 0));
-        Check("S4 非静态主题原样透传", plainRewrite == _brokerName, plainRewrite);
+        Check("S4 a non-static topic passes through as is", plainRewrite == _brokerName, plainRewrite);
 
         var prod = new DefaultMQProducer("StaticProd_" + Stamp)
         {
@@ -307,11 +310,11 @@ public static class LiveStaticTopic
             prod.Shutdown();
         }
 
-        Check("S5 发送 " + PhysicalQueues + " 条", sent == PhysicalQueues,
+        Check("S5 sent " + PhysicalQueues + " messages", sent == PhysicalQueues,
             "sent=" + sent);
 
         bool consumed = WaitUntil(() => rec.Count() >= PhysicalQueues, 40000, 1000);
-        Check("S5 消费收齐 " + PhysicalQueues + " 条", consumed,
+        Check("S5 consumption received all " + PhysicalQueues, consumed,
             "got " + rec.Count());
         consumer.Shutdown();
 

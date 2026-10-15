@@ -1,16 +1,16 @@
-//! 设计要点（语义与线上基准一致）：
-//! - `snapshot()` 返回强类型 [`MetricsSnapshot`]，
-//!   [`MetricsSnapshot::to_json_value`] 的键名与顺序是固定的；
-//! - 时钟只在**私有**的 `record_*_side(failed, rt)` 里可注入，单测因此能精确断言 RT，
-//!   而不是睡墙钟。
+//! Design notes (semantics match the online baseline):
+//! - `snapshot()` returns the strongly typed [`MetricsSnapshot`],
+//!   the key names and order of [`MetricsSnapshot::to_json_value`] are fixed;
+//! - the clock is injectable only inside the **private** `record_*_side(failed, rt)`, so unit tests
+//!   can assert RT precisely instead of sleeping on the wall clock.
 
 use std::fmt;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// 取当前毫秒时间戳（浮点）。
+/// Current millisecond timestamp (floating point).
 ///
-/// 时钟回拨时 RT 可能为负 —— 同样不做防护（与线上基准口径一致优先）。
+/// RT can go negative when the clock rewinds -- deliberately unguarded (matching the online baseline takes priority).
 fn now_ms() -> f64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(d) => d.as_secs_f64() * 1000.0,
@@ -18,46 +18,46 @@ fn now_ms() -> f64 {
     }
 }
 
-/// 保留三位小数：对二进制真值做"四舍六入五成双"，即 `{:.3}` 的打印结果。
-/// 解析失败（inf/NaN）时原样返回，绝不 panic。
+/// Keep three decimals: round-half-to-even applied to the binary true value, i.e. the printed result of `{:.3}`.
+/// On parse failure (inf/NaN) the value is returned unchanged, never a panic.
 pub fn round3(value: f64) -> f64 {
     format!("{value:.3}").parse::<f64>().unwrap_or(value)
 }
 
-/// 指标快照。
+/// The metrics snapshot.
 ///
-/// 浮点字段均已 `round3` 舍入，整数字段是累计值。
+/// Float fields are all `round3`-rounded; integer fields are cumulative values.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct MetricsSnapshot {
-    /// `sendCount`：发送**成功**次数。
+    /// `sendCount`: number of **successful** sends.
     pub send_count: i64,
-    /// `sendFailureCount`：发送失败次数。
+    /// `sendFailureCount`: number of failed sends.
     pub send_failure_count: i64,
-    /// `sendRTSum`：成功 + 失败的总耗时（毫秒）。
+    /// `sendRTSum`: total duration of success + failure (milliseconds).
     pub send_rt_sum: f64,
-    /// `sendRTMax`：单次最大耗时。
+    /// `sendRTMax`: largest single duration.
     pub send_rt_max: f64,
-    /// `sendRTMin`：单次最小耗时。
+    /// `sendRTMin`: smallest single duration.
     pub send_rt_min: f64,
-    /// `sendRTAvg`：`rt_sum / send_count`（分母不含失败次数），count 为 0 时取 0.0。
+    /// `sendRTAvg`: `rt_sum / send_count` (the denominator excludes failure counts), 0.0 when count is 0.
     pub send_rt_avg: f64,
-    /// `consumeCount`：消费成功次数。
+    /// `consumeCount`: number of successful consumptions.
     pub consume_count: i64,
-    /// `consumeFailureCount`：消费失败次数。
+    /// `consumeFailureCount`: number of failed consumptions.
     pub consume_failure_count: i64,
-    /// `consumeRTSum`：成功 + 失败的总耗时（毫秒）。
+    /// `consumeRTSum`: total duration of success + failure (milliseconds).
     pub consume_rt_sum: f64,
-    /// `consumeRTMax`：单次最大耗时。
+    /// `consumeRTMax`: largest single duration.
     pub consume_rt_max: f64,
-    /// `consumeRTMin`：单次最小耗时。
+    /// `consumeRTMin`: smallest single duration.
     pub consume_rt_min: f64,
-    /// `consumeRTAvg`：`rt_sum / consume_count`，count 为 0 时取 0.0。
+    /// `consumeRTAvg`: `rt_sum / consume_count`, 0.0 when count is 0.
     pub consume_rt_avg: f64,
 }
 
 impl MetricsSnapshot {
-    /// 转成**固定键名、固定顺序**的 JSON 对象
-    /// （`sendCount/sendFailureCount/sendRTSum/sendRTMax/sendRTMin/sendRTAvg` + 消费侧同名）。
+    /// Convert to a JSON object with **fixed key names in fixed order**
+    /// (`sendCount/sendFailureCount/sendRTSum/sendRTMax/sendRTMin/sendRTAvg` + the same names on the consume side).
     pub fn to_json_value(&self) -> serde_json::Value {
         serde_json::json!({
             "sendCount": self.send_count,
@@ -77,14 +77,14 @@ impl MetricsSnapshot {
 }
 
 impl fmt::Display for MetricsSnapshot {
-    /// 打印 JSON 串，键名与顺序同快照字段，
-    /// 采用 serde_json 的紧凑格式。
+    /// Print the JSON string, key names and order same as the snapshot fields,
+    /// in serde_json's compact format.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "ClientMetrics{}", self.to_json_value())
     }
 }
 
-/// 一组（发送或消费）的内部累计量：`count/failure_count/rt_*`。
+/// One side's (send or consume) internal accumulators: `count/failure_count/rt_*`.
 #[derive(Debug, Default, Clone, Copy)]
 struct Side {
     count: i64,
@@ -96,7 +96,7 @@ struct Side {
 }
 
 impl Side {
-    /// `record_*_success/failure` 里共用的累加逻辑。
+    /// Accumulation logic shared by `record_*_success/failure`.
     fn record(&mut self, failed: bool, rt: f64) {
         if failed {
             self.failure_count += 1;
@@ -113,8 +113,8 @@ impl Side {
         self.started = true;
     }
 
-    /// 快照的半边，返回 `(count, failure_count, sum, max, min, avg)`。
-    /// avg 的分母只算成功次数，0 次时给 0.0。
+    /// The snapshot's half, returning `(count, failure_count, sum, max, min, avg)`.
+    /// The avg denominator counts successes only, 0.0 when there are none.
     fn parts(&self) -> (i64, i64, f64, f64, f64, f64) {
         let avg = if self.count != 0 {
             round3(self.rt_sum / self.count as f64)
@@ -132,10 +132,10 @@ impl Side {
     }
 }
 
-/// 线程安全的发送/消费基本指标计数器。
+/// Thread-safe basic send/consume metrics counter.
 ///
-/// 内部只有一把 `Mutex`，`Send + Sync`，可以被 `Arc` 包起来在 producer/consumer 的
-/// 多个任务间共享。锁中毒时照常取内值（统计路径绝不允许 panic）。
+/// One `Mutex` inside, `Send + Sync`, can be wrapped in an `Arc` and shared between multiple
+/// producer/consumer tasks. A poisoned lock still yields the inner value (the stats path must never panic).
 #[derive(Debug, Default)]
 pub struct ClientMetrics {
     inner: Mutex<MetricsState>,
@@ -154,7 +154,7 @@ impl Clone for ClientMetrics {
 }
 
 impl ClientMetrics {
-    /// 全零初始状态。
+    /// All-zero initial state.
     pub fn new() -> Self {
         Self::default()
     }
@@ -163,19 +163,19 @@ impl ClientMetrics {
         *self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    // ---------------- 发送 ----------------
+    // ---------------- send ----------------
 
-    /// 发送开始：**只返回时间戳**，不改状态。
+    /// Send start: **only returns a timestamp**, does not mutate state.
     pub fn record_send_start(&self) -> f64 {
         now_ms()
     }
 
-    /// 记录一次发送成功（按开始时间算 RT）。
+    /// Record one successful send (RT computed from the start time).
     pub fn record_send_success(&self, start_ms: f64) {
         self.record_send_side(false, now_ms() - start_ms);
     }
 
-    /// 记录一次发送失败：失败同样累加 rt_sum。
+    /// Record one failed send: failures also add into rt_sum.
     pub fn record_send_failure(&self, start_ms: f64) {
         self.record_send_side(true, now_ms() - start_ms);
     }
@@ -185,19 +185,19 @@ impl ClientMetrics {
         state.send.record(failed, rt);
     }
 
-    // ---------------- 消费 ----------------
+    // ---------------- consume ----------------
 
-    /// 消费开始：**只返回时间戳**，不改状态。
+    /// Consume start: **only returns a timestamp**, does not mutate state.
     pub fn record_consume_start(&self) -> f64 {
         now_ms()
     }
 
-    /// 记录一次消费成功（按开始时间算 RT）。
+    /// Record one successful consumption (RT computed from the start time).
     pub fn record_consume_success(&self, start_ms: f64) {
         self.record_consume_side(false, now_ms() - start_ms);
     }
 
-    /// 记录一次消费失败（按开始时间算 RT）。
+    /// Record one failed consumption (RT computed from the start time).
     pub fn record_consume_failure(&self, start_ms: f64) {
         self.record_consume_side(true, now_ms() - start_ms);
     }
@@ -207,9 +207,9 @@ impl ClientMetrics {
         state.consume.record(failed, rt);
     }
 
-    // ---------------- 快照 ----------------
+    // ---------------- snapshot ----------------
 
-    /// 取一次锁、读出**舍入后**的全量指标。
+    /// Take the lock once and read out the full **rounded** metrics.
     pub fn snapshot(&self) -> MetricsSnapshot {
         let state = self.locked();
         let (send_count, send_failure_count, send_rt_sum, send_rt_max, send_rt_min, send_rt_avg) =
@@ -237,7 +237,7 @@ impl ClientMetrics {
 mod tests {
     use super::*;
 
-    /// 用注入时钟走一遍公开路径的等价实现（`record_*` 只在墙钟上取 now_ms）。
+    /// Equivalent implementation of the public path driven with an injected clock (`record_*` only takes now_ms from the wall clock).
     fn record(metrics: &ClientMetrics, consume: bool, failed: bool, start_ms: f64, now_ms: f64) {
         let mut state = metrics.inner.lock().unwrap_or_else(|e| e.into_inner());
         let side = if consume { &mut state.consume } else { &mut state.send };
@@ -252,7 +252,7 @@ mod tests {
     fn fresh_snapshot_is_all_zero_and_matches_golden_dict() {
         let snapshot = ClientMetrics::new().snapshot();
         assert_eq!(snapshot, MetricsSnapshot::default());
-        // 空快照的键名与顺序是固定的
+        // Key names and order of an empty snapshot are fixed
         assert_eq!(
             snapshot.to_json_value(),
             serde_json::json!({
@@ -270,7 +270,7 @@ mod tests {
                 "consumeRTAvg": 0.0,
             })
         );
-        // 键序也要一致（preserve_order 生效）
+        // Key order must match too (preserve_order in effect)
         let value = snapshot.to_json_value();
         let keys: Vec<&String> = value
             .as_object()
@@ -300,9 +300,9 @@ mod tests {
         let metrics = ClientMetrics::new();
         let before = metrics.record_send_start();
         let after = metrics.record_consume_start();
-        assert!(before > 1_600_000_000_000.0, "毫秒时间戳量级: {before}");
+        assert!(before > 1_600_000_000_000.0, "millisecond timestamp magnitude: {before}");
         assert!(after >= before);
-        // 两个 start 都不记账
+        // Neither start hook books anything
         assert_eq!(metrics.snapshot(), MetricsSnapshot::default());
     }
 
@@ -321,24 +321,24 @@ mod tests {
 
     #[test]
     fn failures_share_the_rt_chain_but_not_the_count() {
-        // 口径：rt_sum 含失败耗时，avg 的分母只算成功次数。
+        // Rule: rt_sum includes failure durations, the avg denominator counts successes only.
         let metrics = ClientMetrics::new();
         record(&metrics, false, false, 0.0, 100.0); // rt 100
-        record(&metrics, false, true, 0.0, 200.0); // rt 200（失败）
+        record(&metrics, false, true, 0.0, 200.0); // rt 200 (failed)
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.send_count, 1);
         assert_eq!(snapshot.send_failure_count, 1);
         assert!(almost(snapshot.send_rt_sum, 300.0));
         assert!(almost(snapshot.send_rt_max, 200.0));
         assert!(almost(snapshot.send_rt_min, 100.0));
-        // 300 / 1 = 300，而不是 300 / 2
+        // 300 / 1 = 300, not 300 / 2
         assert!(almost(snapshot.send_rt_avg, 300.0));
     }
 
     #[test]
     fn zero_success_count_gives_zero_avg_not_nan() {
         let metrics = ClientMetrics::new();
-        record(&metrics, true, true, 0.0, 7.0); // 只有失败
+        record(&metrics, true, true, 0.0, 7.0); // failures only
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.consume_count, 0);
         assert_eq!(snapshot.consume_failure_count, 1);
@@ -349,7 +349,7 @@ mod tests {
 
     #[test]
     fn min_and_max_only_move_outwards_once_started() {
-        // 场景：started 已置位、max=100、min=1，再记一条超大 rt
+        // Scenario: started already set, max=100, min=1, then record one huge rt
         let metrics = ClientMetrics::new();
         {
             let mut state = metrics.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -385,7 +385,7 @@ mod tests {
         record(&metrics, false, false, 0.0, 12.345_678_9); // rt 12.3456789
         record(&metrics, false, false, 12.345_678_9, 12.346_078_9); // rt 0.0004
         let snapshot = metrics.snapshot();
-        // sum = 12.3460789 -> 12.346；max = 12.3456789 -> 12.346；min = 0.0004 -> 0.0
+        // sum = 12.3460789 -> 12.346; max = 12.3456789 -> 12.346; min = 0.0004 -> 0.0
         assert!(almost(snapshot.send_rt_sum, 12.346), "{snapshot:?}");
         assert!(almost(snapshot.send_rt_max, 12.346), "{snapshot:?}");
         assert!(almost(snapshot.send_rt_min, 0.0), "{snapshot:?}");
@@ -394,7 +394,7 @@ mod tests {
 
     #[test]
     fn round3_matches_golden_on_half_way_vectors() {
-        // 固定向量：二进制真值 + 四舍六入五成双
+        // Fixed vectors: binary true values + round-half-to-even
         for (v, want) in [
             (1.0005_f64, 1.0_f64),
             (0.0625, 0.062),
@@ -408,14 +408,14 @@ mod tests {
         ] {
             assert!(almost(round3(v), want), "round3({v}) = {}", round3(v));
         }
-        // inf/NaN 原样返回，不 panic
+        // inf/NaN are returned unchanged, no panic
         assert!(round3(f64::INFINITY).is_infinite());
         assert!(round3(f64::NAN).is_nan());
     }
 
     #[test]
     fn real_clock_paths_accumulate_non_negative_rt() {
-        // 走真实的 record_send_*：只做量级断言，不睡墙钟
+        // Drive the real record_send_* paths: only magnitude assertions, no sleeping on the wall clock
         let metrics = ClientMetrics::new();
         let start = metrics.record_send_start();
         for _ in 0..64 {
@@ -435,7 +435,7 @@ mod tests {
         assert!(snapshot.consume_rt_sum >= 0.0);
         assert!(snapshot.send_rt_min <= snapshot.send_rt_max);
         assert!(snapshot.consume_rt_min <= snapshot.consume_rt_max);
-        // 一次成功 + 一次失败的 rt_sum 都被 avg 的分子用到
+        // the rt_sum of one success + one failure is all used by avg's numerator
         assert!(snapshot.send_rt_avg >= snapshot.send_rt_min);
     }
 
@@ -446,7 +446,7 @@ mod tests {
         let text = metrics.snapshot().to_string();
         assert!(text.starts_with("ClientMetrics{"), "{text}");
         assert!(text.contains("\"sendRTSum\":12.265"), "{text}");
-        // Clone 是"当前值的深拷贝"，之后新记录不回灌到副本
+        // Clone is a "deep copy of the current values"; later records do not flow back into the copy
         let copied = metrics.clone();
         record(&metrics, false, false, 0.0, 1000.0);
         assert_eq!(copied.snapshot().send_count, 1);

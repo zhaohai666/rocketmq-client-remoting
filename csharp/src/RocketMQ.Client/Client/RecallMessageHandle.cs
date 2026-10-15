@@ -1,7 +1,7 @@
-// 句柄不是客户端自己造的：发送带 TIMER_DELIVER_MS / TIMER_DELAY_MS / TIMER_DELAY_SEC
-// 的定时消息时，broker 在 SendMessageProcessor#attachRecallHandle 里把这个句柄挂到
-// SEND 响应头的 recallHandle 字段上返回，客户端只负责原样带回去调用 RecallMessage。
-// 普通消息的响应里根本没有这个字段。
+// The handle is not created by the client itself: when sending a scheduled message carrying TIMER_DELIVER_MS / TIMER_DELAY_MS / TIMER_DELAY_SEC,
+// the broker attaches this handle in SendMessageProcessor#attachRecallHandle and returns it on the
+// recallHandle field of the SEND response header; the client only has to carry it back verbatim when calling RecallMessage.
+// Regular messages' responses do not contain this field at all.
 using System.Text;
 
 namespace RocketMQ.Client;

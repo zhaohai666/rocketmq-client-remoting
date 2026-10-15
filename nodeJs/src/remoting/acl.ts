@@ -28,9 +28,9 @@ export class AclRPCHook {
     this.securityToken = securityToken;
   }
   doBeforeRequest(_addr: string, cmd: RemotingCommand) {
-    // 签名前必须先物化 extFields：本实现的 RemotingCommand 惰性生成 extFields
-    // （只在 headerEncode() 里），若不先调用 makeCustomHeaderToNet()，
-    // ACL 签名覆盖的将是空字段集。
+    // extFields must be materialized before signing: this implementation's RemotingCommand generates
+    // extFields lazily (only inside headerEncode()), so without first calling makeCustomHeaderToNet(),
+    // the ACL signature would cover an empty field set.
     cmd.makeCustomHeaderToNet();
     signAcl(this.accessKey, this.secretKey, cmd.extFields, cmd.body, this.securityToken);
   }

@@ -9,57 +9,62 @@ use RocketMQ\Common\MessageQueue;
 use RocketMQ\Common\SubscriptionData;
 
 /**
- * 消费侧公共基础件：模块常量、模块级辅助函数与 PopProcessQueue。
+ * Common consumer-side foundation: module constants, module-level helper functions, and PopProcessQueue.
  *
- * 分配策略（AllocateMessageQueue*）已在 Allocation.php 实现，不在此重复；
- * 消费/拉取结果类型在 ConsumerResult.php。
+ * Allocation strategies (AllocateMessageQueue*) are implemented in Allocation.php and not
+ * repeated here; consume/pull result types live in ConsumerResult.php.
  *
- * ⚠ PHP 的 autoloader 只加载类、不加载函数：本文件里的全局函数随本文件被
- * autoload（任何类被首次引用时）一并定义。调用方若只调函数不碰类，须先
- * require 本文件（各消费方文件头部已做该保护）。
+ * WARNING: PHP's autoloader only loads classes, not functions: the global functions in this
+ * file are defined along with this file being autoloaded (when any class is first
+ * referenced). If a caller only calls functions without touching classes, it must
+ * require this file first (each consumer file already has this guard in its header).
  */
 
-/** 消费侧默认常量。 */
+/** Consumer-side default constants. */
 final class ConsumerDefaults
 {
     /**
-     * POP 消费失败后重投的延迟档位表（秒）：按消息已存活时长挑档，
-     * 超过最长档的 2 倍仍未消费成功就直接 ack 丢弃。
+     * Delay level table (seconds) for POP redelivery after a consume failure: pick a level
+     * by how long the message has already lived; if still not consumed successfully past
+     * twice the longest level, ack and drop it directly.
      * @var list<int>
      */
     public const POP_DELAY_LEVEL = [10, 30, 60, 120, 180, 240, 300, 360, 420, 480, 540, 600,
         1200, 1800, 3600, 7200];
 
-    /** POP 不可见时间的合法区间（毫秒）：超出范围一律回落到 60000 */
+    /** Legal range of POP invisible time (milliseconds); anything out of range falls back to 60000 */
     public const MIN_POP_INVISIBLE_TIME = 5000;
     public const MAX_POP_INVISIBLE_TIME = 300000;
 
-    /** pop 请求 initMode 字段：0 = 从队列最小位点起消费，1 = 从最大位点起消费 */
+    /** pop request initMode field: 0 = consume from the queue's minimum offset, 1 = from the maximum offset */
     public const CONSUME_INIT_MODE_MIN = 0;
     public const CONSUME_INIT_MODE_MAX = 1;
 
-    /** int32 上限：顺序消费「重试次数用尽」判据的默认值（-1 在这条链路上读成它）。 */
+    /** int32 upper bound: default for the orderly-consume "retries exhausted" check (-1 reads as it on this chain). */
     public const INT32_MAX = 0x7FFFFFFF;
 
     /**
-     * 拉取空闲上限 PULL_MAX_IDLE_TIME（默认 120000ms）。
-     * 一个仍归本实例的队列超过这么久没发起过任何拉取/弹出 ⇒ rebalance 撤掉重建。
+     * Pull idle cap PULL_MAX_IDLE_TIME (default 120000ms).
+     * A queue still owned by this instance has not initiated any pull/pop for this long
+     * => rebalance drops and rebuilds it.
      */
     public const PULL_MAX_IDLE_TIME = 120.0;
 
     /**
-     * suspend() 之后的拉取退避时长（1000ms）。PHP 没有循环线程，退避由调用方的
-     * tick 节奏承担（见 PushConsumer::suspend() 的说明），这个常量锁的是语义差：
-     * 挂起**不撤队列**，而 PULL_MAX_IDLE_TIME 判的是"这条循环还活着吗"。
+     * Pull backoff duration after suspend() (1000ms). PHP has no loop threads, so the
+     * backoff is borne by the caller's tick cadence (see PushConsumer::suspend()); this
+     * constant locks in a semantic difference: suspend does **not** drop the queue,
+     * whereas PULL_MAX_IDLE_TIME asks "is this loop still alive".
      */
     public const PULL_TIME_DELAY_WHEN_SUSPEND = 1.0;
 }
 
-/** 队列排序键：topic → brokerName → queueId。 */
+/** Queue sort key: topic -> brokerName -> queueId. */
 function consumer_mq_sort_key(MessageQueue $mq): array
 {
-    // rebalance 必须先把 mqAll/cidAll 排序再分配；顺序不一致会让不同实例算出
-    // 不同的分配结果（同一队列被两个实例同时消费）。
+    // rebalance must sort mqAll/cidAll before allocating; inconsistent ordering makes
+    // different instances compute different allocation results (the same queue consumed
+    // by two instances at once).
     return [$mq->topic, $mq->brokerName, $mq->queueId];
 }
 
@@ -70,18 +75,19 @@ function safe_hook_name(object $hook): string
             return (string) $hook->hookName();
         }
     } catch (\Throwable) {
-        // 落到类名兜底
+        // fall back to the class name
     }
     return get_class($hook);
 }
 
 /**
- * 客户端二次 tag 过滤。
+ * Client-side secondary tag filtering.
  *
- * broker 侧是按 tag 的**哈希（codeSet）**过滤的，存在哈希碰撞误放，所以客户端必须
- * 再按字符串核一遍。守卫 `!tagsSet.isEmpty() && !isClassFilterMode` 意味着：
- * 订阅 `"*"`（SUB_ALL）时不过滤 —— 所以 `FilterAPI::buildSubscriptionData`
- * 对 SUB_ALL 必须保持 tagsSet 为空（那里有详细注释）。
+ * The broker side filters by the tag **hash (codeSet)**, which allows false positives
+ * from hash collisions, so the client must check the strings again. The guard
+ * `!tagsSet.isEmpty() && !isClassFilterMode` means: when subscribed to `"*"` (SUB_ALL)
+ * no filtering happens -- so `FilterAPI::buildSubscriptionData` must keep tagsSet empty
+ * for SUB_ALL (detailed comments there).
  *
  * @param list<MessageExt> $msgs
  * @return list<MessageExt>
@@ -94,8 +100,9 @@ function client_side_tag_filter(?SubscriptionData $sub, array $msgs): array
     $out = [];
     foreach ($msgs as $m) {
         $tags = $m->getTags();
-        // ⚠ tagsSet 是 list（addTag 用 in_array 追加），不是 tag→tag 的 map；
-        //   用 isset($tagsSet[$tag]) 查键永远 miss，会把整批全滤掉。
+        // WARNING: tagsSet is a list (addTag appends via in_array), not a tag->tag map;
+        //   looking up with isset($tagsSet[$tag]) always misses and would filter out the
+        //   whole batch.
         if ($tags !== null && in_array($tags, $sub->tagsSet, true)) {
             $out[] = $m;
         }
@@ -104,9 +111,10 @@ function client_side_tag_filter(?SubscriptionData $sub, array $msgs): array
 }
 
 /**
- * 依次执行过滤钩子，**异常一律吞掉**，只记一条 error 日志。
+ * Execute the filter hooks in order, **swallowing all exceptions**, logging only one error line.
  *
- * 与 send/consume 钩子不同：过滤钩子失败不能影响消费，只是该次过滤不生效。
+ * Unlike send/consume hooks: a filter hook failure must not affect consumption, it just
+ * means that filtering pass does not take effect.
  *
  * @param list<object> $hookList
  */
@@ -122,11 +130,13 @@ function execute_filter_hooks(array $hookList, FilterMessageContext $context): v
 }
 
 /**
- * 投递前过滤 = 客户端二次 tag 过滤 + FilterMessageHook（拉取/POP/pull 三处共用）。
+ * Pre-delivery filtering = client-side secondary tag filtering + FilterMessageHook
+ * (shared by the pull/POP/pull three call sites).
  *
- * 钩子拿到的是**可变的** ``msgList``；被摘掉的消息由调用方决定处置方式：
- * 拉取路径 = 静默跳过（位点照常推进，不 ack）；
- * POP 路径 = 必须立刻 ack，否则 invisibleTime 到期后会复活重投。
+ * The hooks receive a **mutable** ``msgList``; removed messages are disposed of by the
+ * caller: the pull path = silently skip (offset advances as usual, no ack);
+ * the POP path = must ack immediately, otherwise the message revives and is redelivered
+ * after invisibleTime expires.
  *
  * @param list<object> $hookList
  * @param list<MessageExt> $msgs
@@ -143,20 +153,21 @@ function filter_messages_for_delivery(
     $out = client_side_tag_filter($sub, array_values($msgs));
     if ($out !== [] && $hookList !== []) {
         $context = new FilterMessageContext($consumerGroup, $out, $mq);
-        $context->unitMode = $unitMode;    // 单元化部署标记，钩子据此区分本单元/跨单元消息
+        $context->unitMode = $unitMode;    // unitized deployment marker; hooks use it to tell local-unit from cross-unit messages
         execute_filter_hooks($hookList, $context);
         $out = array_values($context->msgList);
     }
     return $out;
 }
 
-// ---------------- 本地位点文件格式 ----------------
-// offset.json 里 MessageQueue → offset 的映射是把 MessageQueue 对象**直接当 JSON
-// key** 写出的 —— 严格 JSON 非法，但这份文件自己回读能解析。key 内字段序固定为
-// brokerName/queueId/topic（字母序）。内存里的队列 key 仍用 topic+broker+queueId 拼接。
+// ---------------- Local offset file format ----------------
+// The MessageQueue -> offset map in offset.json writes the MessageQueue object
+// **directly as a JSON key** -- not strict JSON, but this file can be parsed back by
+// itself. The field order inside the key is fixed as brokerName/queueId/topic
+// (alphabetical). In-memory queue keys still use topic+broker+queueId concatenation.
 
 /**
- * @param array<string,int> $items key = topic.brokerName.queueId 拼接串
+ * @param array<string,int> $items key = topic.brokerName.queueId concatenated string
  * @param array<string,MessageQueue> $mqMap
  */
 function build_local_offsets_json(array $items, array $mqMap): string
@@ -165,7 +176,8 @@ function build_local_offsets_json(array $items, array $mqMap): string
     foreach ($items as $key => $off) {
         $mq = $mqMap[$key] ?? null;
         if ($mq === null) {
-            // 只写仍持有队列信息的条目：位点表里有、路由表里已经查不到的队列跳过
+            // Only write entries that still have queue info: queues present in the offset
+            // table but no longer found in the route table are skipped
             continue;
         }
         $obj = json_encode([
@@ -179,9 +191,9 @@ function build_local_offsets_json(array $items, array $mqMap): string
 }
 
 /**
- * 解析本地位点文件（严格 JSON 扁平 map 或「对象作 key」两种格式）。
+ * Parse the local offset file (either a strict-JSON flat map or the "object as key" format).
  *
- * @return array<string,int>|null key = topic.brokerName.queueId 拼接串
+ * @return array<string,int>|null key = topic.brokerName.queueId concatenated string
  */
 function parse_local_offsets_json(?string $text): ?array
 {
@@ -189,8 +201,9 @@ function parse_local_offsets_json(?string $text): ?array
         return null;
     }
     $stripped = trim($text);
-    // 先按严格 JSON 解析（旧版本写过的扁平 map）；「对象作 key」格式对严格解析
-    // 必然失败（含 pretty 版），落进下面的容忍扫描器。
+    // First parse as strict JSON (the flat map old versions wrote); the "object as key"
+    // format necessarily fails strict parsing (including the pretty variant) and falls
+    // through to the tolerant scanner below.
     $strict = json_decode($stripped, true);
     if (is_array($strict)) {
         $out = [];
@@ -218,9 +231,9 @@ function parse_local_offsets_json(?string $text): ?array
 }
 
 /**
- * 容忍解析 {"offsetTable":{{..}:off,{..}:off}}；失败返回 null。
+ * Tolerantly parse {"offsetTable":{{..}:off,{..}:off}}; returns null on failure.
  *
- * @return list<array{0:string,1:string,2:int,3:int}>|null 元素 = [topic, brokerName, queueId, offset]
+ * @return list<array{0:string,1:string,2:int,3:int}>|null element = [topic, brokerName, queueId, offset]
  */
 function scan_offset_table_body(string $text): ?array
 {
@@ -233,7 +246,7 @@ function scan_offset_table_body(string $text): ?array
         return $entries;
     }
     $pos = 0;
-    // 「对象作 key」的匹配式：(\{[^{}]*\})\s*:\s*(-?\d+)
+    // Match pattern for "object as key": (\{[^{}]*\})\s*:\s*(-?\d+)
     if (!preg_match_all('/(\{[^{}]*\})\s*:\s*(-?\d+)/s', $body, $matches, PREG_OFFSET_CAPTURE)) {
         return null;
     }
@@ -246,7 +259,7 @@ function scan_offset_table_body(string $text): ?array
             return null;
         }
         $fields = [];
-        // 字段匹配式："(\w+)"\s*:\s*("(?:[^"\\]|\\.)*"|-?\d+)
+        // Field match pattern: "(\w+)"\s*:\s*("(?:[^"\\]|\\.)*"|-?\d+)
         if (preg_match_all('/"(\w+)"\s*:\s*("(?:[^"\\\\]|\\\\.)*"|-?\d+)/s', $objBody, $fm, PREG_SET_ORDER)) {
             foreach ($fm as $fo) {
                 $raw = $fo[2];
@@ -275,10 +288,11 @@ function scan_offset_table_body(string $text): ?array
 }
 
 /**
- * 队列的线上字符串形态：一致性哈希要散列**它**，不是 PHP 的对象 repr。
+ * The queue's online string form: consistent hashing hashes **it**, not PHP's object repr.
  *
- * ⚠ 必须逐字符等于 `"MessageQueue [topic=.., brokerName=.., queueId=..]"`，
- * 换个写法环上的散列值就变了，队列归属会整体漂移。
+ * WARNING: it must equal `"MessageQueue [topic=.., brokerName=.., queueId=..]"` character
+ * for character; a different wording changes the hash value on the ring and shifts queue
+ * ownership wholesale.
  */
 function wire_queue_key_string(MessageQueue $mq): string
 {
@@ -287,20 +301,22 @@ function wire_queue_key_string(MessageQueue $mq): string
 }
 
 /**
- * 按「裁掉末尾空段」的规则切分字符串（等价于 limit=0 的 split）。
+ * Split a string by the "trailing empty segments trimmed" rule (equivalent to a limit=0 split).
  *
- * PHP 的 `explode` 保留尾空段，而 `AllocateMessageQueueByMachineRoom` 恰好按
- * `count == 2` 判合法，差异会直接改变一条队列参不参与分配：
+ * PHP's `explode` keeps trailing empty segments, while `AllocateMessageQueueByMachineRoom`
+ * judges validity exactly by `count == 2`, so the difference directly changes whether a
+ * queue participates in allocation:
  *
- * | 输入 | 本函数 | explode 原生 |
+ * | input | this function | native explode |
  * |---|---|---|
- * | `"room1@"` | `["room1"]`（1 段，剔除） | `["room1", ""]`（2 段，误收） |
- * | `"room1@b@"` | `["room1", "b"]`（2 段，收） | `["room1", "b", ""]`（3 段，误剔） |
+ * | `"room1@"` | `["room1"]` (1 segment, excluded) | `["room1", ""]` (2 segments, wrongly included) |
+ * | `"room1@b@"` | `["room1", "b"]` (2 segments, included) | `["room1", "b", ""]` (3 segments, wrongly excluded) |
  * | `"@"` | `[]` | `["", ""]` |
- * | `""` / `"broker-a"` | 无分隔符命中时**整串原样返回**，哪怕是空串 | 同 |
+ * | `""` / `"broker-a"` | when no separator matches, **the whole string is returned as-is**, even if empty | same |
  *
- * 最后一行是最容易踩的坑：没命中分隔符时必须原样返回整串，
- * 所以不能无条件裁尾（否则 `""` 会变成 `[]`）。
+ * The last row is the easiest pitfall: when no separator matches the whole string must be
+ * returned as-is, so you cannot trim trailing segments unconditionally (otherwise `""`
+ * would become `[]`).
  *
  * @return list<string>
  */
@@ -308,7 +324,7 @@ function wire_split(string $text, string $sep): array
 {
     $parts = explode($sep, $text);
     if (count($parts) === 1) {
-        return $parts; // 没命中分隔符：整串原样返回
+        return $parts; // no separator match: return the whole string as-is
     }
     while ($parts !== [] && end($parts) === '') {
         array_pop($parts);
@@ -317,23 +333,26 @@ function wire_split(string $text, string $sep): array
 }
 
 /**
- * POP 模式的队列状态。
+ * Queue state in POP mode.
  *
- * 与 pull 模式的 ProcessQueue 不同，POP **没有"已拉未消费"缓冲**：消息一弹出就交给
- * 消费流程，确认靠 ack。这里只跟踪两件事：
+ * Unlike pull mode's ProcessQueue, POP has **no "pulled but not consumed" buffer**: a
+ * message is handed to the consume flow as soon as it is popped, and confirmation is by
+ * ack. Only two things are tracked here:
  *
- * - ``waitAckCounter``：已弹出但还没 ack / 还没延长不可见时间的条数，用于流控；
- * - ``dropped``：队列是否已被 rebalance 撤走（撤走后本批消息不再消费、也不 ack，
- *   交给 invisibleTime 到期后 broker 自动复活重投）。
+ * - ``waitAckCounter``: the count popped but not yet acked / not yet extended with a new
+ *   invisible time, used for flow control;
+ * - ``dropped``: whether the queue has already been dropped by rebalance (after being
+ *   dropped, this batch is neither consumed nor acked; it is left to the broker to
+ *   revive and redeliver automatically after invisibleTime expires).
  *
- * PHP 单线程模型下不需要锁。
+ * No locks are needed under PHP's single-threaded model.
  */
 final class PopProcessQueue
 {
     private int $waitAckCounter = 0;
     private bool $dropped = false;
 
-    /** 最近一次发起弹出的时刻，float 秒。 */
+    /** Timestamp of the most recent pop initiation, float seconds. */
     public float $lastPopTimestamp = 0.0;
 
     public function __construct()
@@ -346,7 +365,7 @@ final class PopProcessQueue
         $this->waitAckCounter += $count;
     }
 
-    /** 递减沿用协议侧约定：调用方传负数（如 -count($msgs)），内部直接累加。 */
+    /** Decrement follows the protocol-side convention: the caller passes a negative number (e.g. -count($msgs)); internally it just accumulates. */
     public function decFoundMsg(int $count): void
     {
         $this->waitAckCounter += $count;

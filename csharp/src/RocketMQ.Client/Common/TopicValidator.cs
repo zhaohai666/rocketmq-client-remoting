@@ -1,13 +1,13 @@
 namespace RocketMQ.Common;
 
 /// <summary>
-/// topic / group 名字的字符表与保留名判定。
+/// Character table and reserved-name checks for topic / group names.
 public static class TopicValidator
 {
     public const int TopicMaxLength = 127;
 
     /// <summary>
-    /// group 名要参与拼 %RETRY%group_topic / %DLQ%group_topic，所以比 topic 更短。
+    /// The group name is used to build %RETRY%group_topic / %DLQ%group_topic, so it is shorter than the topic limit.
     /// </summary>
     public const int GroupMaxLength = 120;
 
@@ -47,9 +47,9 @@ public static class TopicValidator
     };
 
     /// <summary>
-    /// 客户端<b>不能直接发</b>的 topic：这几个是 broker 内部状态流水（半消息、延迟、轨迹校验……），
-    /// 用户发进去会污染 broker 的事务/延迟/校验逻辑。
-    /// 注意 <c>%RETRY%</c> 前缀<b>不在</b>此列 —— sendMessageBack 就是往 %RETRY%group 写的。
+    /// Topics the client <b>must not send to directly</b>: these are the broker's internal state streams (half messages, delays, trace checks, ...),
+    /// and if a user sends into them it pollutes the broker's transaction/delay/check logic.
+    /// Note the <c>%RETRY%</c> prefix is <b>not</b> in this list — sendMessageBack writes to %RETRY%group.
     /// </summary>
     public static readonly HashSet<string> NotAllowedSendTopicSet = new()
     {

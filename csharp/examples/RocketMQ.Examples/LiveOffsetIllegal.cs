@@ -1,23 +1,30 @@
-// 离线单测（tests/RocketMQ.Client.Tests/OffsetIllegalRecoverTests.cs，13 项）只能锁住本地状态
-// 怎么清、哪个 ack 被作废、冻结什么时候解；下面两件事只有真集群能证明：
+// The offline unit tests (tests/RocketMQ.Client.Tests/OffsetIllegalRecoverTests.cs, 13
+// cases) can only pin how the local state is cleared, which ack is invalidated and when the
+// freeze lifts; the following two things only a real cluster can prove:
 //
-//   S1 「丢队列」—— broker 判定位点非法时，这条队列上**已取回但还没消费/没 ack** 的消息必须
-//       整批作废。做法：listener 卡住第一条第 0 条（在途 1 条、缓冲里 2 条），再用
-//       resetOffsetByQueueId 把服务端位点重置到 3（下一笔 pull 被 PullMessageProcessor 短路成
-//       OFFSET_RESET ⇒ 客户端 PullStatus.OffsetIllegal，修正值在应答头 nextBeginOffset）。
-//       修复前：缓冲里的第 1、2 条照常投递；修复后：只剩在途的第 0 条，且它的 ack 因队列
-//       已被丢而作废。最后再发第 4 条，验证重建后的队列从修正位点续跑、冻结已随重建解除
-//       （新消息的 ack 让 broker 上的位点继续前进到 4）。
+//   S1 "dropping the queue" -- when the broker judges the offset illegal, the messages on
+//       that queue that were **already fetched but not yet consumed/acked** must be
+//       invalidated as a whole. The approach: the listener blocks on the first message (1 in
+//       flight, 2 in the buffer), then resetOffsetByQueueId resets the server-side offset to 3
+//       (the next pull gets short-circuited by PullMessageProcessor into OFFSET_RESET => the
+//       client sees PullStatus.OffsetIllegal and the corrected value is in the response
+//       header's nextBeginOffset). Before the fix: messages 1 and 2 in the buffer are still
+//       delivered as usual; after the fix: only the in-flight message 0 is left, and its ack is
+//       invalidated because the queue was dropped. Finally message 4 is sent to verify that
+//       the rebuilt queue resumes from the corrected offset and the freeze was lifted by the
+//       rebuild (the new message's ack lets the broker-side offset advance to 4).
 //
-//   S2 「立刻落盘」—— 纠错后的位点必须马上推给 broker，不能等周期落盘。做法：利用
-//       resetOffsetByQueueId 两笔 RPC 非原子（第 1 笔 commitOffset 无区间校验先落库、第 2 笔
-//       被 resetOffsetInner 以 "Target offset N not in consume queue range" 拒绝）的既有行为，
-//       把 broker 上的已提交位点做成非法值 103，再让一个 persistConsumerOffsetInterval=60000
-//       的新消费者从 103 起拉。窗口内唯一能把 103 写回 3（maxOffset）的路径就是纠错分支自带
-//       的那次 persist，且全程零投递。
+//   S2 "flush immediately" -- the corrected offset must be pushed to the broker at once, not
+//       left to the periodic flush. The approach: exploit the existing non-atomic behaviour of
+//       the two resetOffsetByQueueId RPCs (the 1st commitOffset has no range check and lands
+//       first, the 2nd is rejected by resetOffsetInner with "Target offset N not in consume
+//       queue range") to make the broker's committed offset the illegal value 103, then let a
+//       new consumer with persistConsumerOffsetInterval=60000 pull from 103. The only path
+//       inside the window that can write 103 back to 3 (maxOffset) is the persist the
+//       correction branch brings itself, with zero deliveries the whole way.
 //
 //
-// 用法：rmq offset-illegal [namesrv]（需本地 5.5.1 集群，autoCreateTopicEnable=true）
+// Usage: rmq offset-illegal [namesrv] (needs a local 5.5.1 cluster, autoCreateTopicEnable=true)
 using System.Globalization;
 using System.Text;
 
@@ -29,10 +36,12 @@ namespace RocketMQ.Examples;
 
 public static class LiveOffsetIllegal
 {
-    /// <summary>单队列 topic 上的消息条数：1 条在途 + 2 条缓冲，S1 窗口才成立。</summary>
+    /// <summary>The message count on the single-queue topic: 1 in flight + 2 in the buffer,
+   /// which is what makes S1's window hold.</summary>
     private const int Msgs = 3;
 
-    /// <summary>S2 的非法位点：远超该队列 maxOffset(=3)，但又落在 broker 的 int 范围内。</summary>
+    /// <summary>S2's illegal offset: far past that queue's maxOffset(=3), but still inside
+   /// the broker's int range.</summary>
     private const long IllegalTarget = 103;
 
     private static string _namesrv = "127.0.0.1:9876";
@@ -74,12 +83,14 @@ public static class LiveOffsetIllegal
         return pred();
     }
 
-    /// <summary>队列 key（与消费者内部 OffsetKey 一致）：topic + brokerName + queueId。</summary>
+  /// <summary>The queue key (identical to the consumer's internal OffsetKey): topic +
+    /// brokerName + queueId.</summary>
     private static string Key(MessageQueue mq) =>
         mq.Topic + mq.BrokerName + mq.QueueId.ToString(CultureInfo.InvariantCulture);
 
-    /// <summary>回读 broker 上的 (已提交位点, maxOffset)；committed = -1 表示查无记录
-    /// （QUERY_NOT_FOUND），0 是合法位点，两者不能混同。</summary>
+ /// <summary>Reads back the broker-side (committed offset, maxOffset); committed = -1 means
+ /// no record was found (QUERY_NOT_FOUND), 0 is a legal offset and the two must not be
+    /// conflated.</summary>
     private static (long Committed, long Max) Probe(DefaultMQAdminExt admin, string group,
         MessageQueue mq)
     {
@@ -106,9 +117,11 @@ public static class LiveOffsetIllegal
         return (off, max);
     }
 
-    /// <summary>第 1 批卡在闸门上（维持「1 条在途 + 其余在缓冲」的窗口），放行后照常返回成功。
-    /// 上限只防死锁：正常路径由 <see cref="Release"/> 显式放行，且必须晚于纠错 —— 在途批次的
-    /// ack 是否作废，正是 S1 要证的。</summary>
+  /// <summary>The 1st batch is blocked at the gate (keeping up the "1 in flight + the rest in
+    /// the buffer" window), and returns success as usual once released.
+    /// The cap only guards against deadlock: the normal path is released explicitly by
+ /// <see cref="Release"/> and must be later than the correction -- whether the in-flight
+ /// batch's ack is invalidated is exactly what S1 has to prove.</summary>
     private sealed class GatedListener : IMessageListenerConcurrently
     {
         private readonly object _lk = new();
@@ -182,7 +195,7 @@ public static class LiveOffsetIllegal
             List<string> addrs = cluster.GetBrokerAddrs();
             if (addrs.Count == 0)
             {
-                Check("集群探活", false, "nameServer 上无 broker 注册");
+            Check("the cluster liveness probe", false, "the nameServer has no broker registered");
                 admin.Shutdown();
                 return Report();
             }
@@ -191,12 +204,12 @@ public static class LiveOffsetIllegal
         }
         catch (Exception e)
         {
-            Check("集群探活", false, "fetchBrokerClusterInfo: " + e.Message);
+    Check("the cluster liveness probe", false, "fetchBrokerClusterInfo: " + e.Message);
             admin.Shutdown();
             return Report();
         }
 
-        Check("集群探活", true, "broker=" + brokerAddr);
+      Check("the cluster liveness probe", true, "broker=" + brokerAddr);
 
         var setup = new MQClientInstance("iloffsetup-" + stamp, new List<string> { _namesrv });
         setup.Start();
@@ -208,8 +221,9 @@ public static class LiveOffsetIllegal
 
         try
         {
-            // 显式 1 队列建 topic：S1 的窗口（3 条同在一条队列上）与 S2 的越界（103 > maxOffset）
-            // 都要求可数的队列数，不能靠 broker 的默认 4 队列。
+        // Explicitly creating the topic with 1 queue: S1's window (3 messages on one queue)
+     // and S2's out-of-range (103 > maxOffset) both require a countable queue count and
+        // cannot rely on the broker's default 4 queues.
             setup.CreateTopicInRoute(dropTopic, 1, 1);
             setup.CreateTopicInRoute(persistTopic, 1, 1);
             producer.Start();
@@ -220,7 +234,7 @@ public static class LiveOffsetIllegal
         }
         catch (Exception e)
         {
-            Check("联调过程中出现未预期异常", false, e.ToString());
+            Check("an unexpected exception occurred during the integration", false, e.ToString());
         }
         finally
         {
@@ -230,7 +244,7 @@ public static class LiveOffsetIllegal
             }
             catch (Exception)
             {
-                // 收尾失败不掩盖主断言
+           // a cleanup failure does not mask the main assertion
             }
 
             foreach (string t in new[] { dropTopic, persistTopic })
@@ -263,7 +277,7 @@ public static class LiveOffsetIllegal
             }
             catch (Exception)
             {
-                // 收尾失败不掩盖主断言
+    // a cleanup failure does not mask the main assertion
             }
 
             try
@@ -272,7 +286,7 @@ public static class LiveOffsetIllegal
             }
             catch (Exception)
             {
-                // 收尾失败不掩盖主断言
+       // a cleanup failure does not mask the main assertion
             }
         }
 
@@ -282,7 +296,7 @@ public static class LiveOffsetIllegal
     private static void ScenarioDropAndRebuild(DefaultMQProducer producer, DefaultMQAdminExt admin,
         string brokerAddr, string topic, string group, string stamp)
     {
-        Console.WriteLine("=== S1 OFFSET_ILLEGAL：整批作废在途/缓冲消息并按修正位点重建 ===");
+        Console.WriteLine("=== S1 OFFSET_ILLEGAL: invalidate the in-flight/buffer messages as a whole and rebuild at the corrected offset ===");
         var listener = new GatedListener();
         var c = new DefaultMQPushConsumer(group)
         {
@@ -311,7 +325,7 @@ public static class LiveOffsetIllegal
 
                 return queues.Count == 1;
             }, 20000);
-            Check("S1-topic 恰好 1 个队列（3 条消息同队列，1 在途 + 2 缓冲的窗口才成立）",
+            Check("S1-the topic has exactly 1 queue (3 messages on one queue, the window of 1 in flight + 2 in the buffer only holds then)",
                 oneQueue, "queues=" + N(queues.Count));
             if (!oneQueue) return;
 
@@ -331,39 +345,39 @@ public static class LiveOffsetIllegal
                 inflight = c.InFlightForTest(key);
                 return pending == Msgs - 1 && inflight == 1;
             }, 30000, 200);
-            Check("S1-窗口就绪：1 条在途（listener 被闸住）+ 2 条留在缓冲", arranged,
+          Check("S1-window ready: 1 in flight (the listener is gated) + 2 left in the buffer", arranged,
                 "pending=" + N(pending) + " inflight=" + N(inflight)
                 + " arrivals=" + Join(listener.Offsets()));
             if (!arranged) return;
 
-            // RPC2 写 resetOffsetTable → 下一笔 pull 被 PullMessageProcessor 短路成 OFFSET_RESET
+     // RPC2 writes resetOffsetTable -> the next pull gets short-circuited by PullMessageProcessor into OFFSET_RESET
             admin.ResetOffsetByQueueId(brokerAddr, group, topic, 0, Msgs);
-            Console.WriteLine("S1: 已发出 resetOffsetByQueueId(->" + N(Msgs)
-                + ")，等下一笔 pull 取走服务端重置...");
+            Console.WriteLine("S1: resetOffsetByQueueId(->" + N(Msgs)
+        + ") has been sent, waiting for the next pull to pick up the server-side reset...");
 
             bool dropped = WaitUntil(() => c.QueueEpochForTest(key) >= 1, 45000, 200);
-            Check("S1-broker 判定位点非法后本端丢弃该队列（ProcessQueue 代号 +1）", dropped,
+   Check("S1-after the broker judges the offset illegal this side drops the queue (ProcessQueue generation +1)", dropped,
                 "epoch=" + N(c.QueueEpochForTest(key)) + " arrivals=" + Join(listener.Offsets()));
 
             bool committed = WaitUntil(() =>
                 Probe(admin, group, mq).Committed == Msgs, 20000);
-            Check("S1-broker 上的位点停在修正值 3（本场景两笔重置 RPC 已先写过一次，弱断言）",
+      Check("S1-the broker-side offset stops at the corrected value 3 (this scenario's two reset RPCs already wrote it once, a weak assertion)",
                 committed, "committed=" + N(Probe(admin, group, mq).Committed));
 
             listener.Release();
             Thread.Sleep(6000);
             List<long> arr = listener.Offsets();
-            Check("S1-缓冲里已取回的 2 条被整批作废（第 1、2 条永不投递）",
+       Check("S1-the 2 messages already fetched into the buffer are invalidated as a whole (messages 1 and 2 are never delivered)",
                 arr.Count > 0 && !arr.Contains(1) && !arr.Contains(2), "arrivals=" + Join(arr));
 
             producer.Send(new Message(topic, Str2Bytes("ilo-after")));
             bool resumed = WaitUntil(() => listener.Offsets().Contains(Msgs), 30000);
             arr = listener.Offsets();
-            Check("S1-重建后的队列从修正位点续拉（第 3 条新消息正常投递，历史拿过的不重投）",
+    Check("S1-the rebuilt queue resumes pulling from the corrected offset (the new message 3 is delivered, the history already taken is not redelivered)",
                 resumed && !arr.Contains(1) && !arr.Contains(2), "arrivals=" + Join(arr));
 
             bool advanced = WaitUntil(() => Probe(admin, group, mq).Committed == Msgs + 1, 25000);
-            Check("S1-冻结随重建解除（新消息的 ack 让 broker 位点继续前进到 4）",
+            Check("S1-the freeze is lifted by the rebuild (the new message's ack lets the broker offset advance to 4)",
                 advanced, "committed=" + N(Probe(admin, group, mq).Committed));
         }
         finally
@@ -375,7 +389,7 @@ public static class LiveOffsetIllegal
             }
             catch (Exception)
             {
-                // 收尾失败不掩盖主断言
+              // a cleanup failure does not mask the main assertion
             }
         }
     }
@@ -383,7 +397,7 @@ public static class LiveOffsetIllegal
     private static void ScenarioImmediatePersist(DefaultMQProducer producer, DefaultMQAdminExt admin,
         string brokerAddr, string topic, string group, string stamp)
     {
-        Console.WriteLine("=== S2 OFFSET_ILLEGAL：纠错把修正位点立刻落盘（不等周期落盘）===");
+        Console.WriteLine("=== S2 OFFSET_ILLEGAL: the correction flushes the corrected offset immediately (not on the periodic flush) ===");
         var first = new RecordingListener();
         var c = new DefaultMQPushConsumer(group)
         {
@@ -409,7 +423,7 @@ public static class LiveOffsetIllegal
 
             return queues.Count == 1;
         }, 20000);
-        Check("S2-topic 恰好 1 个队列", oneQueue, "queues=" + N(queues.Count));
+        Check("S2-the topic has exactly 1 queue", oneQueue, "queues=" + N(queues.Count));
         if (!oneQueue)
         {
             c.Shutdown();
@@ -423,9 +437,10 @@ public static class LiveOffsetIllegal
         }
 
         bool consumed = WaitUntil(() => first.Offsets().Count == Msgs, 30000);
-        Check("S2-前置：消费者先正常消费掉 3 条", consumed, "arrivals=" + Join(first.Offsets()));
-        // shutdown 会同步 persist 一次，此后 broker 上的位点是 3；必须先停掉它，
-        // 否则它的周期/关停落盘会把下面种进去的非法值覆盖回去。
+    Check("S2-precondition: the consumer consumed the 3 normally first", consumed, "arrivals=" + Join(first.Offsets()));
+        // shutdown persists synchronously once, after which the broker-side offset is 3; it
+  // must be stopped first, otherwise its periodic/on-shutdown flush would write back over
+        // the illegal value planted below.
         c.Shutdown();
         Thread.Sleep(1000);
 
@@ -443,10 +458,10 @@ public static class LiveOffsetIllegal
                 + (msg.Length > 140 ? msg.Substring(0, 140) : msg);
         }
 
-        Check("S2-前置：越界目标被 resetOffsetInner 拒绝（第 2 笔 RPC）", rejected, remark);
+        Check("S2-precondition: the out-of-range target was rejected by resetOffsetInner (the 2nd RPC)", rejected, remark);
 
         (long seeded, long seededMax) = Probe(admin, group, mq);
-        Check("S2-前置：第 1 笔 commitOffset 已把非法位点 103 落库（两笔 RPC 非原子）",
+     Check("S2-precondition: the 1st commitOffset already persisted the illegal offset 103 (the two RPCs are not atomic)",
             seeded == IllegalTarget, "committed=" + N(seeded) + " maxOffset=" + N(seededMax));
 
         var second = new RecordingListener();
@@ -454,7 +469,8 @@ public static class LiveOffsetIllegal
         {
             InstanceName = "offset-illegal-persist2-" + stamp,
             ConsumeFromWhere = RocketMQ.Remoting.Protocol.ConsumeFromWhere.ConsumeFromFirstOffset,
-            // 周期落盘拉长到 60s：窗口内唯一能改写 broker 位点的路径是纠错分支自带的立即 persist
+        // The periodic flush stretched to 60s: the only path inside the window that can
+        // rewrite the broker offset is the immediate persist the correction branch brings
             PersistConsumerOffsetIntervalMillis = 60000,
         };
         c2.SetNamesrvAddr(_namesrv);
@@ -462,19 +478,20 @@ public static class LiveOffsetIllegal
         c2.Subscribe(topic, "*");
         long t0 = NowMs();
         c2.Start();
-        Console.WriteLine("S2: 新消费者从非法位点 " + N(IllegalTarget) + " 起拉，等纠错把 broker 位点写回 "
-            + N(Msgs) + "（周期落盘=60s）...");
+        Console.WriteLine("S2: the new consumer pulls from the illegal offset " + N(IllegalTarget) + ", waiting for the correction to write the broker offset back to "
+            + N(Msgs) + " (periodic flush = 60s)...");
 
         bool back = WaitUntil(() => Probe(admin, group, mq).Committed == Msgs, 20000, 500);
-        Check("S2-broker 位点由 103 纠回 3（纠错分支自带的那次 persist）", back,
+        Check("S2-the broker offset is corrected from 103 back to 3 (the persist the correction branch brings itself)", back,
             "elapsed=" + N((NowMs() - t0) / 1000) + "s committed="
             + N(Probe(admin, group, mq).Committed));
 
-        // 再等一个静默窗口：位点被纠回后不会回头重投 0..2，也不会再被改写
+     // Wait through another quiet window: once the offset is corrected back it does not go
+        // back to redeliver 0..2 and is not rewritten either
         Thread.Sleep(6000);
-        Check("S2-全程零投递（修正位点落在历史消息之后，一条都不下发）",
+        Check("S2-zero deliveries the whole way (the corrected offset lands after the history so nothing is dispatched)",
             second.Offsets().Count == 0, "arrivals=" + Join(second.Offsets()));
-        Check("S2-静默窗口后位点仍停在 3", Probe(admin, group, mq).Committed == Msgs,
+        Check("S2-after the quiet window the offset is still 3", Probe(admin, group, mq).Committed == Msgs,
             "committed=" + N(Probe(admin, group, mq).Committed));
         c2.Shutdown();
     }

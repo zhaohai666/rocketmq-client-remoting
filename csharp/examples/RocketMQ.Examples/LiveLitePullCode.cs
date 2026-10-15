@@ -1,24 +1,31 @@
-// lite-pull **请求码 / broker 开关**（#107）真机验证。
+// Real-machine verification of the lite-pull **request code / broker switch** (#107).
 //
-// 为什么必须真机：`FLAG_LITE_PULL_MESSAGE(0x10)` + `LITE_PULL_MESSAGE(361)` 这条链在离线
-// 假 broker 上永远是绿的 —— 少了位、码还是 11 时，报文依然是一个完全合法的 pull，
-// 假 broker（和真 broker 的普通 pull 分支）照常回消息。能把它区分出来的只有真 broker 的
-// `litePullMessageEnable` 开关（`PullMessageProcessor:325-331` **只拦 361**）：把开关在
-// 运行时翻成 false（UPDATE_BROKER_CONFIG，无需重启）：
+// Why it must be a real machine: the `FLAG_LITE_PULL_MESSAGE(0x10)` +
+// `LITE_PULL_MESSAGE(361)` chain is always green against an offline fake broker -- with the
+// bit missing or the code still 11, the request is still a perfectly legal pull and the fake
+// broker (like a real broker's ordinary pull branch) replies with messages as usual. The only
+// thing that can tell them apart is a real broker's `litePullMessageEnable` switch
+// (`PullMessageProcessor:325-331` **only intercepts 361**): flip the switch to false at
+// runtime (UPDATE_BROKER_CONFIG, no restart needed):
 //
-//   S1 开关默认 true：lite pull 全链路正常（基线）。
-//   S2 开关 false：
-//      S2a 裸 361 请求 → NO_PERMISSION(16) + "…for lite pull consumer is forbidden"；
-//      S2b 同队列同一位点的裸 11 请求 → 照常 SUCCESS 且拿到消息（**对照**：开关只管
-//          lite，普通 pull 不受影响 —— 没有这条腿，S2a 的失败可能只是 broker 坏了）；
-//      S2c lite 消费者安静饿死：消息明明在，poll 一条不来、拉取游标纹丝不动
-//          （旧实现位不置/码为 11，这条腿会收到消息 → 判别器变红）；
-//      S2d push 消费者照常消费（**对照**：整条消费链路没坏）。
-//   S3 开关还原 true：lite pull 立即恢复。
+//   S1 the switch defaults to true: the whole lite pull chain works (the baseline).
+//   S2 the switch is false:
+//      S2a a bare 361 request -> NO_PERMISSION(16) + "...for lite pull consumer is forbidden";
+//      S2b a bare 11 request on the same queue at the same offset -> SUCCESS and messages as
+//    usual (**the control**: the switch only covers lite, an ordinary pull is unaffected --
+//    without this leg S2a's failure could just mean the broker is broken);
+//      S2c the lite consumer quietly starves: the message is right there but poll never
+//          returns anything and the pull cursor does not move at all (the old implementation,
+//       which did not set the bit / used code 11, would receive the message on this leg -> the
+//          discriminator goes red);
+//      S2d a push consumer consumes as usual (**the control**: the whole consume chain is not
+//          broken).
+//   S3 the switch is set back to true: lite pull recovers immediately.
 //
-// 退出前**无条件**把 `litePullMessageEnable` 改回原值（与 reset-offset 同款）。
+// Before exiting it **unconditionally** sets `litePullMessageEnable` back to its original
+// value (the same as with reset-offset).
 //
-// 用法：rmq lite-pull-code [namesrv]
+// Usage: rmq lite-pull-code [namesrv]
 using System.Globalization;
 using System.Text;
 
@@ -59,7 +66,8 @@ public static class LiveLitePullCode
     private static int LiteFlag() => PullSysFlag.BuildSysFlag(commitOffset: false, suspend: false,
         subscription: true, classFilter: false, litePull: true);
 
-    /// <summary>DefaultMQPullConsumerImpl.pullSyncImpl:248 的 4 参版本，lite 位必须为 0。</summary>
+   /// <summary>The 4-arg version at DefaultMQPullConsumerImpl.pullSyncImpl:248; the lite bit
+    /// must be 0.</summary>
     private static int ClassicFlag() => PullSysFlag.BuildSysFlag(commitOffset: false, suspend: false,
         subscription: true, classFilter: false);
 
@@ -100,7 +108,8 @@ public static class LiveLitePullCode
         c.SetNamesrvAddr(namesrv);
         c.SetInstanceName("lite-code-net-" + stamp);
         c.SetConsumeFromWhere(ConsumeFromWhere.ConsumeFromFirstOffset);
-        // 位点由用例自己看：关掉自动提交，S2c 的「游标纹丝不动」才干净。
+        // The case looks at the offsets itself: with auto-commit off, S2c's "the cursor does
+        // not move at all" stays clean.
         c.SetAutoCommit(false);
         c.SetPullIntervalMillis(200);
         c.Assign(new[] { mq });
@@ -195,7 +204,7 @@ public static class LiveLitePullCode
             List<string> addrs = cluster.GetBrokerAddrs();
             if (addrs.Count == 0)
             {
-                Check("集群探活", false, "nameServer 上无 broker 注册");
+            Check("the cluster liveness probe", false, "the nameServer has no broker registered");
                 return Report();
             }
 
@@ -206,50 +215,50 @@ public static class LiveLitePullCode
             List<MessageQueue> mqs = admin.ExamineTopicRoute(topic).GetAllSubscribeMessageQueue(topic);
             if (mqs.Count == 0)
             {
-                Check("路由可见：1 条队列", false, "got=0");
+          Check("the route is visible: 1 queue", false, "got=0");
                 return Report();
             }
 
             MessageQueue q0 = mqs[0];
-            Check("路由可见：1 条队列", true, "queueId=" + N(q0.QueueId));
+            Check("the route is visible: 1 queue", true, "queueId=" + N(q0.QueueId));
             prod.Start();
 
-            // ---------------- R0 开关基线 ----------------
+   // ---------------- R0 the switch baseline ----------------
             original = ReadFlag(admin, brokerAddr);
             haveOriginal = original != "<missing>" && original != "<error>";
-            Check("R0 能读到 broker 的 " + KConfigKey, haveOriginal, "value=" + original);
+     Check("R0 can read the broker's " + KConfigKey, haveOriginal, "value=" + original);
             if (original != "true")
             {
-                Check("R0 已临时打开 " + KConfigKey, WriteFlag(admin, brokerAddr, "true"));
+           Check("R0 " + KConfigKey + " has been temporarily turned on", WriteFlag(admin, brokerAddr, "true"));
             }
 
             if (ReadFlag(admin, brokerAddr) != "true")
             {
-                Check("R0 开关不在 true，后续检查无意义", false);
+      Check("R0 the switch is not true, so the later checks are meaningless", false);
                 return Report();
             }
 
-            // ---------------- S1 基线 ----------------
+     // ---------------- S1 the baseline ----------------
             Console.WriteLine();
-            Console.WriteLine("S1 开关 true：lite pull 基线");
+       Console.WriteLine("S1 the switch is true: the lite pull baseline");
             prod.Send(new Message(topic, Encoding.UTF8.GetBytes("lite-code-s1")), q0);
             DefaultLitePullConsumer c1 = NewLite(namesrv, "GID_LiteCodeNet_g1_" + stamp, q0, stamp);
             consumers.Add(c1);
             List<string> got1 = Drain(c1, 1, 20000);
-            Check("S1 lite 消费者收到消息", got1.Contains("lite-code-s1"), "got=" + Join(got1));
-            Check("S1 拉取游标已推进", c1.PullCursorOf(q0) >= 1,
+          Check("S1 the lite consumer received the message", got1.Contains("lite-code-s1"), "got=" + Join(got1));
+      Check("S1 the pull cursor advanced", c1.PullCursorOf(q0) >= 1,
                 "cursor=" + N(c1.PullCursorOf(q0)));
 
-            // ---------------- S2 开关 false ----------------
+            // ---------------- S2 the switch is false ----------------
             Console.WriteLine();
-            Console.WriteLine("S2 运行时关闭 " + KConfigKey + "（UPDATE_BROKER_CONFIG，不重启 broker）");
-            Check("S2 开关已改为 false", WriteFlag(admin, brokerAddr, "false"));
+       Console.WriteLine("S2 turning " + KConfigKey + " off at runtime (UPDATE_BROKER_CONFIG, no broker restart)");
+            Check("S2 the switch was changed to false", WriteFlag(admin, brokerAddr, "false"));
             string readBack = ReadFlag(admin, brokerAddr);
-            Check("S2 开关读回确认", readBack == "false", "value=" + readBack);
+       Check("S2 the switch reads back as confirmed", readBack == "false", "value=" + readBack);
 
             prod.Send(new Message(topic, Encoding.UTF8.GetBytes("lite-code-s2")), q0);
 
-            // S2a：裸 361 → NO_PERMISSION + 固定 remark（走我们自己的客户端 API 选码）
+            // S2a: a bare 361 -> NO_PERMISSION + the fixed remark (going through our own client API to pick the code)
             MQClientInstance client = admin.Client();
             bool denied = false;
             string denyDetail;
@@ -257,7 +266,7 @@ public static class LiveLitePullCode
             {
                 client.PullMessage("GID_LiteCodeNet_g1_" + stamp, q0, 0, 32, LiteFlag(), 0,
                     "*", 0, ExpressionType.TAG, 30000, -1, 15000, brokerAddr, 0, null);
-                denyDetail = "竟然 SUCCESS —— lite 位/码没生效";
+        denyDetail = "it unexpectedly got SUCCESS -- the lite bit / code did not take effect";
             }
             catch (MQBrokerException e)
             {
@@ -269,9 +278,9 @@ public static class LiveLitePullCode
                 denyDetail = e.Message;
             }
 
-            Check("S2a 裸 361 被开关拒绝（NO_PERMISSION=16）", denied, denyDetail);
+    Check("S2a a bare 361 is rejected by the switch (NO_PERMISSION=16)", denied, denyDetail);
 
-            // S2b：同队列同一位点的裸 11 → 照常拿消息（对照组）
+   // S2b: a bare 11 on the same queue at the same offset -> messages as usual (the control group)
             bool classicOk = false;
             string classicDetail;
             try
@@ -289,18 +298,18 @@ public static class LiveLitePullCode
                 classicDetail = e.Message;
             }
 
-            Check("S2b 对照组：裸 11 不受开关影响，照常拿消息", classicOk, classicDetail);
+    Check("S2b the control group: a bare 11 is unaffected by the switch and gets messages as usual", classicOk, classicDetail);
 
-            // S2c：lite 消费者安静饿死
+            // S2c: the lite consumer quietly starves
             DefaultLitePullConsumer c2 = NewLite(namesrv, "GID_LiteCodeNet_g2_" + stamp, q0, stamp);
             consumers.Add(c2);
             List<string> starved = PollQuiet(c2, 8000);
-            Check("S2c 开关关闭期间 lite 消费者一条都收不到", starved.Count == 0,
+            Check("S2c during the switch being off the lite consumer receives nothing at all", starved.Count == 0,
                 "got=" + Join(starved));
-            Check("S2c 拉取游标纹丝不动", c2.PullCursorOf(q0) == 0,
+  Check("S2c the pull cursor does not move at all", c2.PullCursorOf(q0) == 0,
                 "cursor=" + N(c2.PullCursorOf(q0)));
 
-            // S2d：push 消费者照常消费（对照组）
+   // S2d: a push consumer consumes as usual (the control group)
             var sink = new CollectListener();
             push = new DefaultMQPushConsumer("GID_LiteCodeNet_push_" + stamp)
             {
@@ -318,22 +327,22 @@ public static class LiveLitePullCode
                 Thread.Sleep(300);
             }
 
-            Check("S2d 对照组：push 消费者照常收到消息（开关只管 lite）", sink.Has("lite-code-s2d"),
+   Check("S2d the control group: a push consumer still receives messages (the switch only covers lite)", sink.Has("lite-code-s2d"),
                 "got=" + Join(sink.Snapshot()));
 
-            // ---------------- S3 还原 ----------------
+            // ---------------- S3 restoring ----------------
             Console.WriteLine();
-            Console.WriteLine("S3 开关还原 true：lite 恢复");
-            Check("S3 开关已还原", WriteFlag(admin, brokerAddr, "true"));
+    Console.WriteLine("S3 the switch is restored to true: lite recovers");
+            Check("S3 the switch has been restored", WriteFlag(admin, brokerAddr, "true"));
             prod.Send(new Message(topic, Encoding.UTF8.GetBytes("lite-code-s3")), q0);
             DefaultLitePullConsumer c3 = NewLite(namesrv, "GID_LiteCodeNet_g3_" + stamp, q0, stamp);
             consumers.Add(c3);
             List<string> got3 = Drain(c3, 1, 20000);
-            Check("S3 还原后 lite 消费者立即恢复", got3.Count > 0, "got=" + Join(got3));
+    Check("S3 the lite consumer recovers at once after the restore", got3.Count > 0, "got=" + Join(got3));
         }
         catch (Exception e)
         {
-            Check("场景异常", false, e.Message);
+     Check("the scenario threw", false, e.Message);
         }
         finally
         {
@@ -345,7 +354,7 @@ public static class LiveLitePullCode
                 }
                 catch (Exception)
                 {
-                    // 收尾失败不掩盖主断言
+      // a cleanup failure does not mask the main assertion
                 }
             }
 

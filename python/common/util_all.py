@@ -126,14 +126,14 @@ class UtilAll:
 
 
 class InnerIdGenerator:
-    """消息唯一 ID 生成器（对应用户端 MessageClientIDSetter）。"""
+    """Unique message ID generator (corresponds to the client-side MessageClientIDSetter)."""
 
     _lock = threading.Lock()
     _counter = 0
 
     @staticmethod
     def create_uniq_id() -> str:
-        """生成 32 位十六进制唯一 ID：IP(4|16B) + PID(2B) + 类加载hash(4B) + 当月毫秒(4B) + 自增(2B)。"""
+        """Generate a 32-character hex unique ID: IP(4|16B) + PID(2B) + class-loader hash(4B) + ms within current month(4B) + auto-increment(2B)."""
         import os
         from .mix_all import MixAll
         pid = os.getpid()

@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * 消息属性访问器：属性表的集中读写入口（重试次数、撤回、轨迹等键都从这里走）。
+ * Message property accessor: centralized read/write entry point for the property table (reconsume times, recall, trace, etc. all go through here).
  */
 final class MessageAccessor
 {
@@ -90,9 +90,9 @@ final class MessageAccessor
     }
 
     /**
-     * 重试次数以**属性**形式挂在消息上，只由回投链路（``sendMessageBack``）写入，
-     * 与 MessageExt 线上第 13 字段的 reconsumeTimes 不是一回事 ——
-     * broker 投递给客户端的是后者，读错来源会拿到 0。
+     * Reconsume times are attached to the message as a **property**, written only by the send-back path (``sendMessageBack``),
+     * and are NOT the same as the reconsumeTimes in MessageExt's 13th wire field ——
+     * the broker delivers the latter to the client, so reading the wrong source yields 0.
      */
     public static function getReconsumeTime(Message $msg): ?string
     {

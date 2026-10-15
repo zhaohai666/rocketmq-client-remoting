@@ -93,37 +93,37 @@ def main() -> int:
     consumer.subscribe(topic_b, "*")
     consumer.start()
 
-    # ---------- S0 正对照 ----------
+    # ---------- S0 positive control ----------
     t0 = time.time()
     got = wait_for(lambda: who(admin, broker, topic_b) or None, 35)
-    check("S0-基础 topic B 已登记本组（300 查得到）", group in got,
+    check("S0-baseline topic B has this group registered (found via 300)", group in got,
           "groupList=%s elapsed=%.2fs" % (sorted(got), time.time() - t0))
 
-    # ---------- S1 负对照 ----------
+    # ---------- S1 negative control ----------
     got_l = who(admin, broker, topic_l)
-    check("S1-负对照：未订阅的 L 查不到本组", group not in got_l,
+    check("S1-negative control: the unsubscribed L does not find this group", group not in got_l,
           "groupList=%s" % sorted(got_l))
 
-    # ---------- S2 后置订阅立即生效 ----------
+    # ---------- S2 a late subscription takes effect immediately ----------
     t1 = time.time()
     consumer.subscribe(topic_l, "*")
     subscribe_ms = (time.time() - t1) * 1000.0
     got_l = who(admin, broker, topic_l)
     elapsed_ms = (time.time() - t1) * 1000.0
-    check("S2-后置订阅后 broker 立刻登记本组（300 查得到）", group in got_l,
+    check("S2-the broker registers this group immediately after the late subscription (found via 300)", group in got_l,
           "groupList=%s" % sorted(got_l))
-    # 心跳周期默认 30s：只有订阅路径那一轮**同步**心跳才能让登记这么快出现。
-    check("S2-登记耗时远小于 30s 心跳周期（只可能是订阅路径推的）",
+    # The heartbeat cycle defaults to 30s: only the subscription path's synchronous heartbeat round can make the registration appear this fast.
+    check("S2-registration time far below the 30s heartbeat cycle (can only be pushed by the subscription path)",
           group in got_l and elapsed_ms < 5000,
-          "subscribe 返回耗时=%.1fms，查询完成耗时=%.1fms" % (subscribe_ms, elapsed_ms))
+          "subscribe return took=%.1fms, query completion took=%.1fms" % (subscribe_ms, elapsed_ms))
 
-    # ---------- S3 后置订阅真会被消费 ----------
+    # ---------- S3 a late subscription really gets consumed ----------
     t2 = time.time()
-    # _mq_key 形如 "<topic><brokerName><queueId>"（无分隔符），按 topic 前缀筛即可。
+    # _mq_key looks like "<topic><brokerName><queueId>" (no separator), so filtering by topic prefix is enough.
     assigned = wait_for(
         lambda: [k for k in consumer.assigned_queue_keys() if k.startswith(topic_l)] or None,
         45)
-    check("S3-新 topic L 进入本实例分配集（rebalance 生效）", bool(assigned),
+    check("S3-new topic L enters this instance's assignment set (rebalance works)", bool(assigned),
           "assigned=%s elapsed=%.1fs" % (assigned, time.time() - t2))
 
     producer = DefaultMQProducer(PREFIX + "_pg")
@@ -132,13 +132,13 @@ def main() -> int:
     time.sleep(0.5)
     producer.send(Message(topic_l, b"late-subscribe-me"))
     got_msg = wait_for(lambda: [s for s in seen if s[0] == b"late-subscribe-me"] or None, 30)
-    check("S3-后置订阅的 topic 上的消息真的被消费", bool(got_msg),
+    check("S3-messages on the late-subscribed topic are really consumed", bool(got_msg),
           "seen=%s" % [(b.decode(), t) for b, t in seen])
 
-    # ---------- S4 活订阅表 ----------
+    # ---------- S4 live subscription table ----------
     consumer.unsubscribe(topic_l)
     live = {s.topic for s in consumer.subscriptions()}
-    check("S4-unsubscribe 后本组订阅集立刻少掉 L（只删表项，不发心跳）",
+    check("S4-this group's subscription set immediately loses L after unsubscribe (only deletes the entry, no heartbeat)",
           topic_l not in live and topic_b in live, "live=%s" % sorted(live))
 
     consumer.shutdown()

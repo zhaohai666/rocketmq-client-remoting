@@ -146,7 +146,7 @@ public static class MixAll
         return topic;
     }
 
-    /// <summary>本机出口 IP（UDP connect 探测，无外网回落 hostname -> 127.0.0.1）。</summary>
+    /// <summary>The local outbound IP (UDP connect probe; falls back to hostname -> 127.0.0.1 when no external network).</summary>
     public static string GetIpStr() => UtilAll.LocalIp();
 
     public static string CachedIpStr() => _cachedIpStr ??= UtilAll.LocalIp();
@@ -155,8 +155,8 @@ public static class MixAll
 
     public static int Pid() => UtilAll.Pid();
 
-    // 这是管理端最容易踩的坑：**GET_BROKER_CONFIG 的响应体是 properties 文本**
-    // （每行 "key=value"），不是 JSON、也不是 KVTable。用 JSON 解析器去解必然失败。
+    // This is the easiest pitfall for the admin side: **the GET_BROKER_CONFIG response body is properties text**
+    // (each line "key=value"), not JSON and not a KVTable. Parsing it with a JSON parser is bound to fail.
     public static string Properties2String(PropertyMap properties)
     {
         var sb = new System.Text.StringBuilder();
@@ -172,7 +172,7 @@ public static class MixAll
     {
         var result = new PropertyMap();
 
-        // 先把续行合并成逻辑行
+        // First merge continuation lines into logical lines
         var logical = new List<string>();
         string pending = string.Empty;
         bool hasPending = false;
@@ -186,7 +186,7 @@ public static class MixAll
                 hasPending = false;
             }
 
-            // 行尾反斜杠个数为奇数 => 续行
+            // odd number of trailing backslashes => continuation line
             int trailing = 0;
             for (int i = line.Length; i > 0 && line[i - 1] == '\\'; i--)
             {
@@ -235,13 +235,13 @@ public static class MixAll
             }
 
             string key = line[keyStart..i];
-            // 跳过分隔符前的空白
+            // Skip whitespace before the separator
             while (i < n && IsSpaceChar(line[i]))
             {
                 i++;
             }
 
-            // 可选的 '=' / ':' 及其后的空白
+            // Optional '=' / ':' and the whitespace after it
             if (i < n && (line[i] == '=' || line[i] == ':'))
             {
                 i++;
@@ -287,7 +287,7 @@ public static class MixAll
         return s[b..e];
     }
 
-    /// <summary>按 \r\n / \n / \r 切行。</summary>
+    /// <summary>Split lines by \r\n / \n / \r.</summary>
     private static List<string> SplitLines(string text)
     {
         var lines = new List<string>();

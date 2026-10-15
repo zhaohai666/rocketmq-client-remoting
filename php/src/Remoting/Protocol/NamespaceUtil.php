@@ -7,23 +7,24 @@ namespace RocketMQ\Remoting\Protocol;
 use RocketMQ\Common\MixAll;
 
 /**
- * 命名空间工具。
+ * Namespace utilities.
  *
- * 命名空间用于多租户隔离：客户端把 ``namespace`` 以 ``namespace%`` 前缀拼到
- * topic / group 上再发给 broker，从 broker 拿到的资源名在交给上层（listener、
- * admin 结果）之前再剥掉前缀。
+ * A namespace is used for multi-tenant isolation: the client prefixes ``namespace`` onto the topic /
+ * group as ``namespace%`` before sending to the broker, and the resource names coming back from the
+ * broker have the prefix stripped again before being handed up (to the listener, the admin results).
  *
- * 对齐要点（勿凭直觉改）：
- * - 分隔符是 ``%``（不是 ``/`` 也不是 ``:``）。
- * - ``%RETRY%`` / ``%DLQ%`` 前缀**在**命名空间之外：``%RETRY%NS%GID``。
- *   因此剥/拼都要先把 retry/DLQ 前缀摘下来处理，再拼回去。
- * - 系统资源（``rmq_sys_`` 前缀 topic、``CID_RMQ_SYS_`` 前缀 group）**不**加命名空间。
+ * Alignment points (do not change them out of intuition):
+ * - The separator is ``%`` (not ``/`` and not ``:``).
+ * - The ``%RETRY%`` / ``%DLQ%`` prefixes are **outside** the namespace: ``%RETRY%NS%GID``. So both
+ *   stripping and wrapping have to take the retry/DLQ prefix off first, process it, then put it back.
+ * - System resources (topics with the ``rmq_sys_`` prefix, groups with the ``CID_RMQ_SYS_`` prefix)
+ *   **do not** get a namespace.
  */
 final class NamespaceUtil
 {
     public const NAMESPACE_SEPARATOR = '%';
 
-    /** 摘掉 ``%RETRY%`` / ``%DLQ%`` 前缀，只留命名空间 + 资源名。 */
+    /** Strips the ``%RETRY%`` / ``%DLQ%`` prefix, leaving only the namespace + resource name. */
     public static function withOutRetryAndDlq(string $resource): string
     {
         return (string)MixAll::resetRetryAndDlqTopic($resource);
@@ -57,10 +58,10 @@ final class NamespaceUtil
     }
 
     /**
-     * 剥掉命名空间前缀。
+     * Strips the namespace prefix.
      *
-     * ``MQ_INST_XX%Topic`` → ``Topic``；``%RETRY%MQ_INST_XX%GID`` → ``%RETRY%GID``。
-     * 未带该命名空间时原样返回。
+     * ``MQ_INST_XX%Topic`` → ``Topic``; ``%RETRY%MQ_INST_XX%GID`` → ``%RETRY%GID``.
+     * Returns the input unchanged when it does not carry that namespace.
      */
     public static function withoutNamespace(string $resourceWithNamespace, string $namespace = ''): string
     {
@@ -90,7 +91,7 @@ final class NamespaceUtil
         return $resourceWithNamespace;
     }
 
-    /** 拼上命名空间前缀（幂等：已带前缀或系统资源原样返回）。 */
+    /** Prefixes the namespace (idempotent: an already-prefixed value or a system resource is returned as-is). */
     public static function wrapNamespace(string $namespace, string $resourceWithoutNamespace): string
     {
         if ($namespace === '' || $resourceWithoutNamespace === '') {
@@ -113,7 +114,7 @@ final class NamespaceUtil
         return sprintf('%s%s%s%s', $prefix, $namespace, self::NAMESPACE_SEPARATOR, $plain);
     }
 
-    /** retry 主题的资源名包装：``%RETRY%<namespace%group>``。 */
+    /** The resource name wrapping for a retry topic: ``%RETRY%<namespace%group>``. */
     public static function wrapNamespaceAndRetry(string $namespace, string $consumerGroup): string
     {
         if ($consumerGroup === '') {
@@ -122,7 +123,7 @@ final class NamespaceUtil
         return MixAll::RETRY_GROUP_TOPIC_PREFIX . self::wrapNamespace($namespace, $consumerGroup);
     }
 
-    /** 从资源名里取出命名空间；取不到返回空串。 */
+    /** Extracts the namespace from a resource name; returns an empty string when there is none. */
     public static function getNamespaceFromResource(string $resource): string
     {
         if ($resource === '' || self::isSystemResource($resource)) {

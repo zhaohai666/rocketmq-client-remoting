@@ -1,4 +1,5 @@
-// 本地位点表（OffsetStore）读写的离线单测：黄金向量来自真实 fastjson2 序列化输出。
+// Offline unit tests for reading/writing the local offset table (OffsetStore): the golden
+// vectors come from real fastjson2 serialisation output.
 using RocketMQ.Client;
 using RocketMQ.Common;
 using Xunit;
@@ -7,7 +8,7 @@ namespace RocketMQ.Client.Tests;
 
 public class LocalOffsetsTests
 {
-    // 真实 fastjson2 2.0.59 + rocketmq-client 5.5.0 的输出（含 pretty 版）
+    // the output of real fastjson2 2.0.59 + rocketmq-client 5.5.0 (including the pretty version)
     private const string LegacyCompact =
         "{\"offsetTable\":{{\"brokerName\":\"broker-a\",\"queueId\":1,\"topic\":\"Tt\"}:9,"
         + "{\"brokerName\":\"broker-a\",\"queueId\":0,\"topic\":\"Tt\"}:7}}";
@@ -44,7 +45,7 @@ public class LocalOffsetsTests
         string text = DefaultMQPushConsumer.BuildLocalOffsetsJson(
             Items(("Ttbroker-a0", 7), ("Ttbroker-a1", 9)), MqMap());
         Assert.StartsWith("{\"offsetTable\":{", text);
-        // 字段序 brokerName/queueId/topic（fastjson2 字母序），每个 key 是内嵌对象
+        // field order brokerName/queueId/topic (fastjson2 alphabetical), each key is an embedded object
         Assert.Contains("\"brokerName\":\"broker-a\",\"queueId\":0,\"topic\":\"Tt\"}:7", text);
         Assert.Contains("\"brokerName\":\"broker-a\",\"queueId\":1,\"topic\":\"Tt\"}:9", text);
     }
@@ -118,16 +119,16 @@ public class LocalOffsetsTests
             DefaultMQPushConsumer.SaveLocalOffsetsAt(path, Items(("Ttbroker-a0", 99)), mqMap);
             Assert.Equal(raw, File.ReadAllText(path + ".bak"));
 
-            // 主文件在 → 读主文件
+            // the main file is there -> read the main file
             Dictionary<string, long> loaded = DefaultMQPushConsumer.LoadLocalOffsetsAt(path);
             Assert.Equal(99L, loaded["Ttbroker-a0"]);
 
-            // 主文件缺失 → .bak（上一代）
+            // the main file is missing -> .bak (the previous generation)
             File.Delete(path);
             loaded = DefaultMQPushConsumer.LoadLocalOffsetsAt(path);
             Assert.Equal(7L, loaded["Ttbroker-a0"]);
 
-            // .bak 也缺失 → 空（按首次启动处理）
+            // .bak is missing too -> empty (treated as a first start)
             File.Delete(path + ".bak");
             Assert.Empty(DefaultMQPushConsumer.LoadLocalOffsetsAt(path));
         }

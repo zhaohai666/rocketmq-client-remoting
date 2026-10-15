@@ -1,25 +1,31 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""POP 模式（5.x 轻量消费）真机验证。
+"""Verification of the POP mode (5.x lightweight consumption) against a real machine.
 
-用法（需本地 RocketMQ 5.5.1 集群，broker 需 autoCreateTopicEnable/autoCreateSubscriptionGroup）：
+Usage (requires a local RocketMQ 5.5.1 cluster; the broker needs autoCreateTopicEnable/autoCreateSubscriptionGroup):
     .venv/bin/python verify_pop_live.py 127.0.0.1:9876
 
-为什么单独测：POP 是 5.x 的「轻量消费」管道，本项目此前只有常量、没有实现。
-POP 与 pull 的语义差异是断言的重心：
-  - **不提交位点**，靠 ack 确认；不 ack 的消息在 invisibleTime 后被复活重投；
-  - broker 在普通 topic 消息上**不写** POP_CK，客户端必须自己反构 8 段 CK 串。
+Why it is tested on its own: POP is the "lightweight consumption" pipeline of 5.x, and this
+project previously only had the constants, no implementation. The semantic differences
+between POP and pull are the focus of the assertions:
+  - it does **not** commit offsets; it is confirmed by ack, and an un-acked message is revived
+    and redelivered after invisibleTime;
+  - the broker does **not** write a POP_CK for messages of an ordinary topic, so the client has to
+    reconstruct the 8-segment CK string itself.
 
-场景：
-  S1 建 topic(8 队列) + 发 10 条
-  S2 多队列 POP（queue_id=-1, init_mode=0）→ FOUND 且拿到消息
-  S3 每条消息都被盖上 **8 段** POP_CK，且 brokerName/queueId 与消息实际一致
-  S4 ack 一条 → SUCCESS
-  S5 change_invisible_time → SUCCESS 且返回**新的** 8 段 extraInfo
-  S6 校验真的生效：非法 queueId → MESSAGE_ILLEGAL；越界 offset → NO_MESSAGE
-  S7 单队列 POP（新消费组 + queue_id=0）→ FOUND 且消息 queueId 全为 0
-  S8 不 ack 会复活：小 invisibleTime POP 后不 ack，等待后重 POP 能拿到同一条消息，
-     且它的 POP_CK 是 retryFlag=1（来自 %RETRY%<group>_<topic>）—— 至少一次语义
+Scenarios:
+  S1 create topic(8 queues) + send 10 messages
+  S2 multi-queue POP (queue_id=-1, init_mode=0) -> FOUND and messages obtained
+  S3 every message is stamped with an **8-segment** POP_CK whose brokerName/queueId match the
+     actual message
+  S4 ack one -> SUCCESS
+  S5 change_invisible_time -> SUCCESS and it returns a **new** 8-segment extraInfo
+  S6 the validation really works: an illegal queueId -> MESSAGE_ILLEGAL; an out-of-range offset
+     -> NO_MESSAGE
+  S7 single-queue POP (a new consumer group + queue_id=0) -> FOUND and all messages have queueId 0
+  S8 an un-acked message is revived: POP with a small invisibleTime and no ack, after waiting a
+     re-POP obtains the same message again, and its POP_CK has retryFlag=1 (coming from
+     %RETRY%<group>_<topic>) -- at-least-once semantics
 """
 from __future__ import annotations
 
@@ -72,8 +78,8 @@ def main() -> int:
     assert isinstance(client, MQClientInstance)
 
     try:
-        # ---------------- S1 建 topic + 发消息 ----------------
-        print("=== S1 准备 topic 与消息 ===")
+        # ---------------- S1 create the topic + send the messages ----------------
+        print("=== S1 preparing the topic and the messages ===")
         prod.create_topic("TBW102", TOPIC, QUEUE_NUM)
         prod.create_topic("TBW102", TOPIC_REVIVE, REVIVE_QUEUE_NUM)
         for i in range(N_MSG):
@@ -82,24 +88,24 @@ def main() -> int:
         print("  sent %d msgs to %s" % (N_MSG, TOPIC))
 
         route = client.get_topic_route_data(TOPIC)
-        check("S1 topic 路由可用", route is not None and len(route.get_broker_datas()) > 0)
+        check("S1 the topic route is usable", route is not None and len(route.get_broker_datas()) > 0)
         broker_name = route.get_broker_datas()[0].broker_name
         addr = MQClientInstance.find_broker_addr_in_route(route, broker_name)
         print("  brokerName=%s addr=%s" % (broker_name, addr))
 
-        # ---------------- S2 多队列 POP ----------------
-        print("=== S2 多队列 POP（addr 走自动解析路径）===")
+        # ---------------- S2 multi-queue POP ----------------
+        print("=== S2 multi-queue POP (the addr goes through the automatic resolution path) ===")
         res = client.pop_message(GROUP, TOPIC, queue_id=-1, max_msg_nums=32,
                                  invisible_time=60000, poll_time=0, init_mode=0)
-        check("S2 POP 取到消息", res.status == PopStatus.FOUND and len(res.msg_found_list) > 0,
+        check("S2 the POP obtained messages", res.status == PopStatus.FOUND and len(res.msg_found_list) > 0,
               "status=%s count=%d startOffsetInfo=%r" %
               (res.status, len(res.msg_found_list), res.start_offset_info))
         if not res.msg_found_list:
             print("############ PASS=%d FAIL=%d ############" % (PASS, FAIL))
             return 1
 
-        # ---------------- S3 POP_CK 反构 ----------------
-        print("=== S3 POP_CK 反构（8 段）===")
+        # ---------------- S3 POP_CK reconstruction ----------------
+        print("=== S3 POP_CK reconstruction (8 segments) ===")
         all8 = True
         match = True
         sample = None
@@ -116,9 +122,9 @@ def main() -> int:
                 match = False
             if sample is None:
                 sample = ck
-        check("S3a 每条消息都有 8 段 POP_CK", all8, "sample=%r" % sample)
-        check("S3b CK 的 brokerName/queueId 与消息一致", match)
-        check("S3c 1ST_POP_TIME 已补",
+        check("S3a every message has an 8-segment POP_CK", all8, "sample=%r" % sample)
+        check("S3b the brokerName/queueId of the CK match the message", match)
+        check("S3c 1ST_POP_TIME was filled in",
               all(m.properties.get(MessageConst.PROPERTY_FIRST_POP_TIME) is not None
                   for m in res.msg_found_list))
 
@@ -129,7 +135,7 @@ def main() -> int:
         seg1 = ei.split(ck1)
         code = client.ack_message(GROUP, TOPIC, ei.get_queue_id(seg1), ck1,
                                   ei.get_queue_offset(seg1), addr=addr)
-        check("S4 ack 返回 SUCCESS", code == ResponseCode.SUCCESS,
+        check("S4 the ack returned SUCCESS", code == ResponseCode.SUCCESS,
               "code=%d queueId=%d offset=%d" %
               (code, ei.get_queue_id(seg1), ei.get_queue_offset(seg1)))
 
@@ -141,39 +147,40 @@ def main() -> int:
         res5 = client.change_invisible_time(GROUP, TOPIC, ei.get_queue_id(seg2), ck2,
                                             ei.get_queue_offset(seg2), 30000, addr=addr)
         new_seg = ei.split(res5.extra_info) if res5.extra_info else []
-        check("S5a 延长不可见时间成功", res5.success,
+        check("S5a extending the invisible time succeeded", res5.success,
               "code=%d popTime=%d invisibleTime=%d" %
               (res5.response_code, res5.pop_time, res5.invisible_time))
-        check("S5b 返回新的 8 段 extraInfo 且用新值",
+        check("S5b it returns a new 8-segment extraInfo and uses the new value",
               len(new_seg) == 8 and ei.get_invisible_time(new_seg) == res5.invisible_time
               and ei.get_pop_time(new_seg) == res5.pop_time,
               "new=%r" % res5.extra_info)
 
-        # ---------------- S6 校验真的生效 ----------------
-        print("=== S6 非法参数必须被拒绝 ===")
+        # ---------------- S6 the validation really works ----------------
+        print("=== S6 illegal arguments must be rejected ===")
         bad_queue = client.ack_message(GROUP, TOPIC, QUEUE_NUM + 90, ck1,
                                        ei.get_queue_offset(seg1), addr=addr)
-        check("S6a 非法 queueId 被拒（MESSAGE_ILLEGAL）",
+        check("S6a an illegal queueId is rejected (MESSAGE_ILLEGAL)",
               bad_queue == ResponseCode.MESSAGE_ILLEGAL, "code=%d" % bad_queue)
         bad_offset = client.ack_message(GROUP, TOPIC, ei.get_queue_id(seg1), ck1,
                                         1 << 40, addr=addr)
-        check("S6b 越界 offset 被拒（NO_MESSAGE）",
+        check("S6b an out-of-range offset is rejected (NO_MESSAGE)",
               bad_offset == ResponseCode.NO_MESSAGE, "code=%d" % bad_offset)
 
-        # ---------------- S7 单队列 POP ----------------
-        print("=== S7 单队列 POP ===")
-        # 用新消费组：老组在同一 (topic) 上已有 pop 位点，重复 POP 拿不到东西
+        # ---------------- S7 single-queue POP ----------------
+        print("=== S7 single-queue POP ===")
+        # Use a new consumer group: the old group already has a pop offset on the same (topic), so a
+        # repeated POP would obtain nothing
         res7 = client.pop_message(GROUP_SINGLE, TOPIC, queue_id=0, max_msg_nums=32,
                                   invisible_time=60000, poll_time=0, init_mode=0, addr=addr)
         only_q0 = all(m.queue_id == 0 for m in res7.msg_found_list)
-        check("S7 单队列 POP 取到队列 0 的消息",
+        check("S7 the single-queue POP obtained the messages of queue 0",
               res7.status == PopStatus.FOUND and len(res7.msg_found_list) > 0 and only_q0,
               "status=%s count=%d queueIds=%s" %
               (res7.status, len(res7.msg_found_list),
                sorted({m.queue_id for m in res7.msg_found_list})))
 
-        # ---------------- S8 不 ack 会复活 ----------------
-        print("=== S8 不 ack → 复活重投（至少一次语义）===")
+        # ---------------- S8 an un-acked message gets revived ----------------
+        print("=== S8 no ack -> revived redelivery (at-least-once semantics) ===")
         for i in range(REVIVE_N_MSG):
             prod.send(Message(TOPIC_REVIVE, ("pop-revive-%d" % i).encode("utf-8"),
                               keys="rv%d" % i))
@@ -185,11 +192,11 @@ def main() -> int:
                                    init_mode=0, addr=addr_rv)
         first_keys = {m.properties.get(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX)
                       or m.msg_id for m in res8a.msg_found_list}
-        check("S8a 首轮 POP 取到消息（不 ack）",
+        check("S8a the first POP round obtained messages (no ack)",
               res8a.status == PopStatus.FOUND and len(res8a.msg_found_list) > 0,
               "count=%d" % len(res8a.msg_found_list))
 
-        print("  等待 %ds 让 broker 复活..." % REVIVE_WAIT_SEC)
+        print("  waiting %ds to let the broker revive it..." % REVIVE_WAIT_SEC)
         time.sleep(REVIVE_WAIT_SEC)
 
         res8b = client.pop_message(GROUP_REVIVE, TOPIC_REVIVE, queue_id=-1,
@@ -203,9 +210,9 @@ def main() -> int:
             ck = m.properties.get(MessageConst.PROPERTY_POP_CK)
             if ck:
                 retry_flags.add(ei.get_retry(ei.split(ck)))
-        check("S8b 未 ack 的消息被复活重投", len(revived) > 0,
+        check("S8b the un-acked message was revived and redelivered", len(revived) > 0,
               "revived=%d total=%d" % (len(revived), len(res8b.msg_found_list)))
-        check("S8c 复活消息的 POP_CK retryFlag=1（来自 %%RETRY%%<group>_<topic>）",
+        check("S8c the POP_CK of the revived message has retryFlag=1 (coming from %%RETRY%%<group>_<topic>)",
               "1" in retry_flags,
               "retryFlags=%s" % sorted(retry_flags))
 

@@ -1,11 +1,11 @@
-// 客户端结果类型与回调/监听器接口。
+// Client result types and callback/listener interfaces.
 using System.Globalization;
 using RocketMQ.Common;
 using RocketMQ.Remoting.Protocol;
 
 namespace RocketMQ.Client;
 
-// ---------------------------------------------------------------- 发送结果
+// ---------------------------------------------------------------- Send result
 
 public enum SendStatus
 {
@@ -36,7 +36,7 @@ public class SendResult
     public long QueueOffset { get; set; }
     public string TransactionId { get; set; } = string.Empty;
     public string RegionId { get; set; } = string.Empty;
-    // broker 在 SEND 响应头 TRACE_ON 里告知是否落轨迹（"false" 才关，缺省 true）。
+    // The broker tells via the TRACE_ON field of the SEND response header whether to record the trace ("false" turns it off; defaults to true).
     public bool TraceOn { get; set; } = true;
     public string? RecallHandle { get; set; }
 
@@ -48,7 +48,7 @@ public class SendResult
         + ", transactionId=" + TransactionId + ", regionId=" + RegionId + "]";
 }
 
-// ---------------------------------------------------------------- 事务
+// ---------------------------------------------------------------- Transaction
 
 public enum LocalTransactionState
 {
@@ -75,14 +75,14 @@ public sealed class TransactionSendResult : SendResult
 
 public interface ITransactionListener
 {
-    /// <summary>执行本地事务，返回提交/回滚/未知。</summary>
+    /// <summary>Execute the local transaction and return commit/rollback/unknown.</summary>
     LocalTransactionState ExecuteLocalTransaction(Message msg, string arg);
 
-    /// <summary>broker 回查本地事务状态。</summary>
+    /// <summary>The broker checks back the local transaction state.</summary>
     LocalTransactionState CheckLocalTransaction(MessageExt msg);
 }
 
-// ---------------------------------------------------------------- 异步回调
+// ---------------------------------------------------------------- Async callbacks
 
 public interface ISendCallback
 {
@@ -91,7 +91,7 @@ public interface ISendCallback
     void OnException(Exception error);
 }
 
-// ---------------------------------------------------------------- 拉取结果
+// ---------------------------------------------------------------- Pull result
 
 public enum PullStatus
 {
@@ -135,7 +135,7 @@ public interface IPullCallback
     void OnException(Exception error);
 }
 
-// ---------------------------------------------------------------- POP 结果
+// ---------------------------------------------------------------- POP result
 
 public enum PopStatus
 {
@@ -166,10 +166,10 @@ public sealed class PopResult
     public long InvisibleTime { get; set; }
     public int ReviveQid { get; set; }
 
-    /// <summary>每队列的起始 offset，形如 "0 3 0;0 2 0"；客户端据此反构 POP_CK。</summary>
+    /// <summary>Start offset per queue, e.g. "0 3 0;0 2 0"; the client uses it to reconstruct the POP_CK.</summary>
     public string StartOffsetInfo { get; set; } = string.Empty;
 
-    /// <summary>每队列本批弹出的 offset 列表，形如 "0 3 0,1,2"。</summary>
+    /// <summary>List of offsets popped in this batch per queue, e.g. "0 3 0,1,2".</summary>
     public string MsgOffsetInfo { get; set; } = string.Empty;
 
     public string OrderCountInfo { get; set; } = string.Empty;
@@ -178,8 +178,8 @@ public sealed class PopResult
 }
 
 /// <summary>
-/// CHANGE_MESSAGE_INVISIBLETIME 的结果。ExtraInfo 是用响应里**新的**
-/// popTime/invisibleTime/reviveQid 重建的 8 段串，后续 ACK 必须用它。
+/// Result of CHANGE_MESSAGE_INVISIBLETIME. ExtraInfo is the 8-segment string rebuilt using the **new**
+/// popTime/invisibleTime/reviveQid from the response; subsequent ACKs must use it.
 /// </summary>
 public sealed class ChangeInvisibleTimeResult
 {
@@ -192,7 +192,7 @@ public sealed class ChangeInvisibleTimeResult
     public bool Success => Code == ResponseCode.Success;
 }
 
-// ---------------------------------------------------------------- 消费状态
+// ---------------------------------------------------------------- Consume status
 
 public enum ConsumeConcurrentlyStatus
 {
@@ -251,7 +251,7 @@ public sealed class ConsumeOrderlyContext
     public ConsumeOrderlyContext(MessageQueue? mq = null) => MessageQueue = mq ?? new MessageQueue();
 }
 
-/// <summary>消费者监听器基接口。Orderly 为 true 表示顺序消费。</summary>
+/// <summary>Base interface for consumer listeners. Orderly=true means ordered consumption.</summary>
 public interface IMessageListener
 {
     bool Orderly();
@@ -267,7 +267,7 @@ public interface IMessageListenerOrderly : IMessageListener
     ConsumeOrderlyStatus ConsumeMessage(List<MessageExt> msgs, ConsumeOrderlyContext context);
 }
 
-// ---------------------------------------------------------------- 队列选择器
+// ---------------------------------------------------------------- Queue selector
 
 public interface IMessageQueueSelector
 {
@@ -286,7 +286,7 @@ public sealed class SelectMessageQueueByHash : IMessageQueueSelector
         int hashCode = LegacyHash.StringHash(arg);
         if (hashCode < 0)
         {
-            hashCode = hashCode == int.MinValue ? 0 : -hashCode; // 避免 int.MinValue 取负溢出
+            hashCode = hashCode == int.MinValue ? 0 : -hashCode; // avoid overflow when negating int.MinValue
         }
 
         return mqs[(int)((uint)hashCode % (uint)mqs.Count)];

@@ -1,36 +1,42 @@
 #!/bin/bash
-# 跨语言压缩矩阵：A 端发（自动压缩 8192B 确定性载荷）→ B 端收并核对 CRC32。
+# Cross-language compression matrix: side A sends (auto-compressing a deterministic 8192B payload) -> side B receives and verifies CRC32.
 #
-# 为什么要有这个脚本：各语言单测只能证明「自己压自己解」，证明不了
-# **A 端压出来的字节 B 端能不能解开** —— 而压缩解错的失败模式是静默数据损坏
-# （拿到压缩字节当正文，不报错），只有真机 + 真跨客户端才暴露得出来。
+# Why this script exists: per-language unit tests only prove "compress and decompress on your own";
+# they cannot prove **that the bytes compressed by side A can be decompressed by side B** — and
+# the failure mode of a wrong decompression is silent data corruption (compressed bytes treated
+# as the body, no error raised), which only real machines + genuinely cross-client runs expose.
 #
-# 各端（python / cpp / csharp / rust / go / php / nodeJs）载荷由各自本地按同一配方重建（同一行文本重复后
-# 截断），所以判定只看接收端打印的 `match=1`，**不要**比两边打印的 CRC 数字
-# （服务端统计口径的 crc32 会 & 0x7FFFFFFF，本仓库各端一律用标准 CRC-32）。
+# The payloads on each side (python / cpp / csharp / rust / go / php / nodeJs) are rebuilt locally
+# by each client with the same recipe (the same line of text repeated then truncated), so the
+# verdict relies solely on the receiver printing `match=1`; **never** compare the CRC numbers the
+# two sides print (the server-side stats crc32 is & 0x7FFFFFFF, whereas every client in this repo
+# uses standard CRC-32).
 #
-# 用法：scripts/compression_matrix.sh [codec]      codec = zlib（默认）| lz4 | zstd
-# 只有**发送端**关心 codec；接收端按 sysFlag 的类型位自动解压，所以「B 能解 A 压的」
-# 正是矩阵要证明的部分。
+# Usage: scripts/compression_matrix.sh [codec]      codec = zlib (default) | lz4 | zstd
+# Only the **sender** cares about codec; the receiver decompresses automatically based on the
+# type bits in sysFlag, so "B can decompress what A compressed" is exactly what the matrix proves.
 #
-# 前置条件（先构建好各端，本脚本只自己 build go）：
-#   python/.venv 已装 lz4（zstandard 可选，缺了 zstd 的 py 两只会打 SKIP）
+# Prerequisites (build each side first; this script only builds go itself):
+#   python/.venv has lz4 installed (zstandard optional; without zstd the two py legs print SKIP)
 #   cpp/build/examples/rmq_compression_live
-#   csharp 示例已 build（用 dotnet run --no-build）
+#   csharp examples built (run with dotnet run --no-build)
 #   rust example: cargo build --example live_compression_matrix
-#   php 端无需构建（解释执行），但 zstd 若没装 `zstd` CLI 会退回纯 PHP Raw/RLE 腿
-#   nodeJs 端无需构建（node --experimental-strip-types 直接跑 .ts）
-#   go 端由本脚本自己 build（零第三方依赖，标准库编译即可）
-# 以及一个 autoCreateTopicEnable=true 的 nameServer(9876)+broker(10911)。
+#   php needs no build (interpreted), but without the `zstd` CLI the zstd leg falls back to pure-PHP Raw/RLE
+#   nodeJs needs no build (node --experimental-strip-types runs .ts directly)
+#   go is built by this script itself (zero third-party deps, compiles with the standard library)
+# Plus a nameServer(9876)+broker(10911) with autoCreateTopicEnable=true.
 #
-# ⚠ 各端的 LZ4/ZSTD 都不走第三方包（零第三方依赖是硬约束）：python/cpp/csharp/rust/go/php
-#   全部手写帧编解码，nodeJs 的 zlib/zstd 取自 node:zlib（Node 自带 stdlib）、LZ4 手写。
-#   所以矩阵同时是这套手写字节的互操作验收：任何一端的帧头、HC/校验位或块格式写错，
-#   表现都是**对端解出坏正文或明确报错**。
+# ⚠ No side's LZ4/ZSTD uses third-party packages (zero third-party deps is a hard constraint):
+#   python/cpp/csharp/rust/go/php all hand-write the frame codecs; nodeJs's zlib/zstd comes from
+#   node:zlib (Node's own stdlib) and LZ4 is hand-written.
+#   So the matrix doubles as the interop acceptance of these hand-written byte formats: any
+#   wrong frame header, HC/checksum bit, or block format on one side shows up as **the peer
+#   decompressing a bad body or raising a clear error**.
 #
-# ⚠ python 端没有 zstandard 时**明确抛错**而不是静默透传（message_decoder._zstd），
-# 所以 zstd 矩阵里 python 必然失败 —— 那不是互通性问题，脚本直接 SKIP 掉，
-# zstd 的跨语言互通由 cpp / csharp / rust / go / php / nodeJs 六端互测覆盖。
+# ⚠ When the python side lacks zstandard it **raises an explicit error** instead of silently
+# passing through (message_decoder._zstd), so python always fails in the zstd matrix — that is
+# not an interop problem, the script just SKIPs it; zstd cross-language interop is covered by
+# the six-way cross-testing among cpp / csharp / rust / go / php / nodeJs.
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 NS=${ROCKETMQ_NAMESRV:-127.0.0.1:9876}
@@ -42,7 +48,7 @@ BIN=$(mktemp -d)
 TARGET=${CARGO_TARGET_DIR:-$ROOT/rust/target}
 trap 'rm -rf "$BIN"' EXIT
 
-command -v timeout >/dev/null || { echo "需要 GNU coreutils 的 timeout（macOS: brew install coreutils）" >&2; exit 2; }
+command -v timeout >/dev/null || { echo "GNU coreutils timeout is required (macOS: brew install coreutils)" >&2; exit 2; }
 
 cat > "$BIN/py_send" <<EOF
 #!/bin/bash
@@ -74,7 +80,7 @@ cat > "$BIN/net_recv" <<EOF
 cd "$ROOT/csharp" || exit 1
 exec dotnet run --no-build --project examples/RocketMQ.Examples -- compression-live recv $NS "\$1" "\$2" $SIZE
 EOF
-# rust 端：cargo 造出来的 example 二进制（参数顺序 send|recv <topic> <group> <size> [namesrv] [codec]）
+# rust side: the example binary produced by cargo (arg order send|recv <topic> <group> <size> [namesrv] [codec])
 RSBIN="$TARGET/debug/examples/live_compression_matrix"
 cat > "$BIN/rs_send" <<EOF
 #!/bin/bash
@@ -84,10 +90,10 @@ cat > "$BIN/rs_recv" <<EOF
 #!/bin/bash
 exec $RSBIN recv "\$1" "\$2" $SIZE $NS
 EOF
-# go 端：现场 build 成二进制（和 rust 一样，避免每条腿都重新编译一次）。
+# go side: built on the fly into a binary (like rust, avoiding a recompile per leg).
 GO=${RMQ_GO:-go}
 (cd "$ROOT/go" && $GO build -o "$BIN/go_compression" ./examples/live_compression_matrix) \
-  || { echo "go 端 build 失败（需要 go 工具链）" >&2; exit 2; }
+  || { echo "go build failed (go toolchain required)" >&2; exit 2; }
 cat > "$BIN/go_send" <<EOF
 #!/bin/bash
 exec $BIN/go_compression send "\$1" "\$2" $SIZE $NS $CODEC
@@ -96,7 +102,7 @@ cat > "$BIN/go_recv" <<EOF
 #!/bin/bash
 exec $BIN/go_compression recv "\$1" "\$2" $SIZE $NS
 EOF
-# php 端：PHP 8.1 直跑，零第三方依赖（脚本参数 send|recv <topic> <group>，size/ns/codec 内联）。
+# php side: runs directly on PHP 8.1, zero third-party deps (script args send|recv <topic> <group>, size/ns/codec inlined).
 PHP_BIN=${PHP_BIN:-php}
 cat > "$BIN/php_send" <<EOF
 #!/bin/bash
@@ -108,11 +114,12 @@ cat > "$BIN/php_recv" <<EOF
 cd "$ROOT/php" || exit 1
 exec $PHP_BIN examples/live_compression.php recv "\$1" "\$2" $SIZE "$NS"
 EOF
-# nodeJs 端：.ts 直跑（--experimental-strip-types，零构建）。zlib/zstd 走 node:zlib，
-# LZ4 是本项目手写的帧编解码（src/common/compress.ts）。
+# nodeJs side: .ts run directly (--experimental-strip-types, zero build). zlib/zstd via node:zlib,
+# LZ4 is this project's hand-written frame codec (src/common/compress.ts).
 NODE_BIN=${NODE_BIN:-node}
-# node:zlib 的 zstd 绑定是 Node 23.8 才有的；没有时本端只会解自写的 Raw/RLE 帧，
-# 对端的真实压缩块属于「本端能力缺失」，不是互通性失败 → 探测一次，zstd 腿据此 SKIP。
+# node:zlib's zstd bindings only exist since Node 23.8; without them this side can only
+# decompress its own Raw/RLE frames, so the peer's genuinely compressed blocks count as
+# "missing local capability", not an interop failure -> probe once, and SKIP the zstd legs accordingly.
 NODE_ZSTD=1
 $NODE_BIN -e 'const z=require("node:zlib");process.exit(typeof z.zstdCompressSync==="function"&&typeof z.zstdDecompressSync==="function"?0:1)' || NODE_ZSTD=0
 cat > "$BIN/node_send" <<EOF
@@ -132,7 +139,8 @@ fail=0
 run_pair() { # label  sender  receiver
   local topic="XCompress_${CODEC}_${STAMP}_$1" group="XCompressG_${STAMP}_$1"
   echo "----- $1 [$CODEC]: $2 send -> $3 recv"
-  # 本端缺 codec 能力时 SKIP，别记成互通失败（详见各自 compress 实现的降级说明）。
+  # SKIP when this side lacks the codec capability; do not record it as an interop failure
+  # (see each compress implementation's degradation notes for details).
   if [[ $CODEC == zstd ]]; then
     case "$2$3" in
       *py_*)
@@ -145,8 +153,8 @@ run_pair() { # label  sender  receiver
         fi ;;
     esac
   fi
-  # Go 端口 2026-10-09 起带手写 LZ4 Frame / ZSTD 编解码（common/lz4.go、
-  # common/zstd.go，零第三方依赖），因此 Go 腿在所有 codec 下正常参与矩阵。
+  # The Go side has hand-written LZ4 Frame / ZSTD codecs since 2026-10-09 (common/lz4.go,
+  # common/zstd.go, zero third-party deps), so Go legs now join the matrix under all codecs.
   local sout rout lout line
   sout=$(timeout 180 "$BIN/$2" "$topic" "$group" 2>&1); rout=$?
   echo "$sout" | grep -o "SEND_[A-Z]*.*" | head -1
@@ -168,7 +176,7 @@ run_pair py2net py_send net_recv
 run_pair net2py net_send py_recv
 run_pair cpp2net cpp_send net_recv
 run_pair net2cpp net_send cpp_recv
-# 加上 rust（各取一对，覆盖四个方向的发送与接收）
+# Add rust (one pair per counterpart, covering all four send/receive directions)
 run_pair py2rs py_send rs_recv
 run_pair rs2py rs_send py_recv
 run_pair cpp2rs cpp_send rs_recv
@@ -176,7 +184,7 @@ run_pair rs2cpp rs_send cpp_recv
 run_pair net2rs net_send rs_recv
 run_pair rs2net rs_send net_recv
 run_pair rs2rs rs_send rs_recv
-# Go 腿（每个方向都覆盖：发送与接收各一条）
+# Go legs (covering every direction: one send and one receive each)
 run_pair go2go go_send go_recv
 run_pair go2py go_send py_recv
 run_pair py2go py_send go_recv
@@ -186,14 +194,15 @@ run_pair go2net go_send net_recv
 run_pair net2go net_send go_recv
 run_pair go2rs go_send rs_recv
 run_pair rs2go rs_send go_recv
-# PHP 腿（覆盖双向互通 + php 自环；lz4/zstd 由 CompressionCodec 纯实现参与）
+# PHP legs (covering bidirectional interop + php self-loop; lz4/zstd join via the pure CompressionCodec implementation)
 run_pair php2php php_send php_recv
 run_pair php2py php_send py_recv
 run_pair py2php py_send php_recv
 run_pair php2cpp php_send cpp_recv
 run_pair cpp2php cpp_send php_recv
-# nodeJs 腿（2026-10-09 起补齐：此前矩阵完全没有 node 端，手写 LZ4 帧从未被
-# 对端验证过）。双向各一条，覆盖 node 与六个端互通。
+# nodeJs legs (added 2026-10-09: the matrix previously had no node side at all, so the
+# hand-written LZ4 frames were never peer-verified). One each direction, covering node
+# interop with all six other sides.
 run_pair node2node node_send node_recv
 run_pair node2py node_send py_recv
 run_pair py2node py_send node_recv

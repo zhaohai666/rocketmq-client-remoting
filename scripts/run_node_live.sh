@@ -1,13 +1,15 @@
 #!/bin/bash
-# Node.js 端的真机验证入口（对照 run_go_*_live.sh / run_php_live.sh 的口径）。
+# Live verification entry point for the Node.js client (mirrors the approach of run_go_*_live.sh / run_php_live.sh).
 #
-# 用法: bash scripts/run_node_live.sh producer|consumer|pull|lite_pull|admin|pop|request_reply|admin_ns|acl|tls|check_config|fixes2 [namesrv]
+# Usage: bash scripts/run_node_live.sh producer|consumer|pull|lite_pull|admin|pop|request_reply|admin_ns|acl|tls|check_config|fixes2 [namesrv]
 #
-# 集群：默认假定已经在跑（ns+broker 端口都通）。没起会自拉一套（jps 找 pid 收尾，
-# 只停自己起来的那一次；已经在跑的不碰——rmq_test_broker.sh 靠 /bin/ps 找 pid，
-# 沙箱里被禁，所以这里直接内联起 namesrv+broker）。
+# Cluster: assumes one is already running by default (both ns+broker ports reachable). If not,
+# this script starts its own (finds pids with jps for cleanup, stopping only the instance it
+# started; anything already running is left untouched — rmq_test_broker.sh locates pids via
+# /bin/ps, which is disabled in the sandbox, so namesrv+broker are started inline here).
 #
-# ⚠ 集群 start + 等端口 + 跑验证 + kill 必须都在本脚本内串完：前台返回会回收后台 JVM。
+# ⚠ Cluster start + waiting for ports + running verification + kill must all be chained inside
+# this script: when a foreground command returns, the background JVMs are reaped.
 set -u
 
 WHICH=${1:-producer}
@@ -47,20 +49,21 @@ port_open() {
     "$NODE_BIN" -e "const s=require('net').createConnection({host:'127.0.0.1',port:$1});s.on('connect',()=>{s.end();process.exit(0)});s.on('error',()=>process.exit(1));setTimeout(()=>process.exit(1),500)" 2>/dev/null
 }
 
-# ---------------------------------------------------------------- tls 分支（独占集群 + 自管证书/三轮 broker）
-# nodeJs 的 tlsEnable 是**进程级全局**开关：namesrv 连接也走 TLS，
-# 所以 namesrv+broker 都要 -Dtls.enable=true + 同一套 server 证书（permissive）。
-# 三腿：plain_tls（信任自签）/ ca_verify（严格 CA 校验）/ mtls（broker 要求客户端证书）。
+# ---------------------------------------------------------------- tls branch (exclusive cluster + self-managed certs / three broker rounds)
+# tlsEnable on nodeJs is a **process-wide global** switch: the namesrv connection also goes
+# through TLS, so namesrv+broker both need -Dtls.enable=true + the same server certificate
+# (permissive). Three legs: plain_tls (trusts self-signed) / ca_verify (strict CA verification) /
+# mtls (broker requires client certificates).
 if [ "$WHICH" = "tls" ]; then
     if port_open "$NS_PORT" || port_open "$BROKER_PORT"; then
-        echo "=== tls 分支需要 TLS 专用集群，但 ${NS_PORT}/${BROKER_PORT} 已有集群在跑（多半是明文）。请先停掉它。 ===" >&2
+        echo "=== the tls branch needs a TLS-dedicated cluster, but a cluster is already running on ${NS_PORT}/${BROKER_PORT} (most likely plaintext). Stop it first. ===" >&2
         exit 2
     fi
-    command -v openssl >/dev/null 2>&1 || { echo "openssl 不可用" >&2; exit 2; }
+    command -v openssl >/dev/null 2>&1 || { echo "openssl is not available" >&2; exit 2; }
     TWORK=/tmp/rmq_node_live_tls
     rm -rf "$TWORK"
     mkdir -p "$TWORK/store"
-    echo "=== 生成测试证书（CA / server(SAN: IP:127.0.0.1,DNS:localhost) / client） ==="
+    echo "=== generating test certificates (CA / server(SAN: IP:127.0.0.1,DNS:localhost) / client) ==="
     (cd "$TWORK" \
         && openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 2 -subj "/CN=rmq-node-test-ca" >/dev/null 2>&1 \
         && openssl req -newkey rsa:2048 -nodes -keyout server.key -out server.csr -subj "/CN=127.0.0.1" >/dev/null 2>&1 \
@@ -68,9 +71,9 @@ if [ "$WHICH" = "tls" ]; then
         && openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 2 -extfile server.ext >/dev/null 2>&1 \
         && openssl req -newkey rsa:2048 -nodes -keyout client.key -out client.csr -subj "/CN=rmq-node-test-client" >/dev/null 2>&1 \
         && openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out client.crt -days 2 >/dev/null 2>&1) \
-        || { echo "证书生成失败" >&2; exit 2; }
-    # RocketMQ 的 PemReader 只吃 PKCS#8（"BEGIN PRIVATE KEY"）；老 LibreSSL 默认吐
-    # PKCS#1（"BEGIN RSA PRIVATE KEY"）时显式转一道。
+        || { echo "certificate generation failed" >&2; exit 2; }
+    # RocketMQ's PemReader only accepts PKCS#8 ("BEGIN PRIVATE KEY"); when an older LibreSSL
+    # emits PKCS#1 ("BEGIN RSA PRIVATE KEY") by default, convert it explicitly.
     srv_hdr=$(head -1 "$TWORK/server.key")
     case "$srv_hdr" in
         *"BEGIN PRIVATE KEY"*) : ;;
@@ -99,11 +102,12 @@ EOF
         if port_open "$NS_PORT" && port_open "$BROKER_PORT"; then sleep 2; break; fi
         sleep 1
         if [ "$i" = "60" ]; then
-            echo "=== TLS 集群 60s 未就绪（见 $TWORK/ns.log / $TWORK/broker.log） ===" >&2
+            echo "=== TLS cluster not ready within 60s (see $TWORK/ns.log / $TWORK/broker.log) ===" >&2
             exit 2
         fi
     done
-    # 等 broker 注册进 nameserver（路由查询在 permissive 服务端上走明文即可）。
+    # Wait for the broker to register into the nameserver (a plaintext route query is fine on
+    # a permissive server).
     for i in $(seq 1 60); do
         if "$NODE_BIN" --experimental-strip-types --no-warnings -e "
             const { MQClient } = await import('$NODEJS_DIR/src/client/mq_client.ts');
@@ -118,17 +122,17 @@ EOF
             } catch (e) { process.exit(1); }
         " 2>/dev/null; then break; fi
         sleep 1
-        if [ "$i" = "60" ]; then echo "=== broker 60s 未注册进 nameserver ===" >&2; exit 2; fi
+        if [ "$i" = "60" ]; then echo "=== broker not registered into nameserver within 60s ===" >&2; exit 2; fi
     done
 
     cd "$NODEJS_DIR" || exit 1
     RC=0
-    echo "=== [leg 1/3] plain_tls（test-mode：信任自签） ==="
+    echo "=== [leg 1/3] plain_tls (test-mode: trust self-signed) ==="
     "$NODE_BIN" --experimental-strip-types "$EXAMPLE" --ns "$NS" --stamp "$STAMP" --leg plain_tls --caCert "$TWORK/ca.crt" --serverName 127.0.0.1 || RC=1
-    echo "=== [leg 2/3] ca_verify（真校验证书链 + 主机名 SAN） ==="
+    echo "=== [leg 2/3] ca_verify (verify certificate chain + hostname SAN) ==="
     "$NODE_BIN" --experimental-strip-types "$EXAMPLE" --ns "$NS" --stamp "$STAMP" --leg ca_verify --caCert "$TWORK/ca.crt" --serverName 127.0.0.1 || RC=1
 
-    echo "=== 重启 broker（追加 -Dtls.server.authClient=true → mTLS） ==="
+    echo "=== restarting broker (adding -Dtls.server.authClient=true → mTLS) ==="
     pids=$(jps -l 2>/dev/null | awk '/BrokerStartup/ {print $1}')
     # shellcheck disable=SC2086
     [ -n "$pids" ] && kill $pids 2>/dev/null
@@ -142,19 +146,22 @@ EOF
             sleep 2
         fi
     done
-    # 端口关了 ≠ store 文件锁（$WORK/store/lock）已释放：老 JVM 干净退出还要删锁文件，
-    # 抢跑会 "Lock failed, MQ already started"。给 3s 缓冲。
+    # Port closed ≠ store file lock ($WORK/store/lock) released: a cleanly exiting old JVM
+    # still needs to delete the lock file, and starting too early hits "Lock failed, MQ
+    # already started". Allow a 3s buffer.
     sleep 3
-    # mTLS：server 侧要求客户端证书的正确开关是 tls.server.authClient
-    # （tls.client.authServer 是「client 认证 server」，写它会毒到 broker→namesrv 通道）。
+    # mTLS: the correct switch for the server side to require client certificates is
+    # tls.server.authClient (tls.client.authServer means "client authenticates the server";
+    # setting it poisons the broker→namesrv channel).
     export JAVA_OPT_EXT="-Xms1g -Xmx2g -Xmn768m -Dtls.enable=true -Dtls.test.mode.enable=false -Dtls.server.certPath=$TWORK/server.crt -Dtls.server.keyPath=$TWORK/server.key -Dtls.server.authClient=true -Dtls.server.trustCertPath=$TWORK/ca.crt"
     nohup "$DIST/bin/mqbroker" -c "$TWORK/broker.conf" > "$TWORK/broker2.log" 2>&1 &
     for i in $(seq 1 60); do
         if port_open "$BROKER_PORT"; then sleep 2; break; fi
         sleep 1
-        if [ "$i" = "60" ]; then echo "=== mTLS broker 60s 未就绪（见 $TWORK/broker2.log） ===" >&2; exit 2; fi
+        if [ "$i" = "60" ]; then echo "=== mTLS broker not ready within 60s (see $TWORK/broker2.log) ===" >&2; exit 2; fi
     done
-    # 等 broker 重新注册进 nameserver（createTopic 的 TBW102 路由就绪才算就绪）。
+    # Wait for the broker to re-register into the nameserver (ready only once the createTopic
+    # TBW102 route is in place).
     for i in $(seq 1 60); do
         if "$NODE_BIN" --experimental-strip-types --no-warnings -e "
             const { MQClient } = await import('$NODEJS_DIR/src/client/mq_client.ts');
@@ -169,9 +176,9 @@ EOF
             } catch (e) { process.exit(1); }
         " 2>/dev/null; then break; fi
         sleep 1
-        if [ "$i" = "60" ]; then echo "=== mTLS broker 60s 未注册进 nameserver ===" >&2; exit 2; fi
+        if [ "$i" = "60" ]; then echo "=== mTLS broker not registered into nameserver within 60s ===" >&2; exit 2; fi
     done
-    echo "=== [leg 3/3] mtls（客户端证书双向认证） ==="
+    echo "=== [leg 3/3] mtls (client certificates, mutual authentication) ==="
     "$NODE_BIN" --experimental-strip-types "$EXAMPLE" --ns "$NS" --stamp "$STAMP" --leg mtls --caCert "$TWORK/ca.crt" --serverName 127.0.0.1 --clientCert "$TWORK/client.crt" --clientKey "$TWORK/client.key" || RC=1
     echo "=== exit=$RC ==="
     exit $RC
@@ -180,7 +187,7 @@ fi
 STARTED_BROKER=0
 cleanup() {
     if [ "$STARTED_BROKER" = "1" ]; then
-        echo "--- 收工：停掉本脚本起的集群（jps 找 pid） ---"
+        echo "--- Done: stopping the cluster started by this script (finding pids via jps) ---"
         local pids
         pids=$(jps -l 2>/dev/null | awk '/NamesrvStartup|BrokerStartup/ {print $1}')
         if [ -n "$pids" ]; then
@@ -198,8 +205,8 @@ cleanup() {
 trap cleanup EXIT
 
 if ! port_open "$NS_PORT" || ! port_open "$BROKER_PORT"; then
-    echo "=== 集群未监听（${NS_PORT}/${BROKER_PORT}），拉起本地测试集群 ==="
-    [ -d "$DIST" ] || { echo "找不到 RocketMQ 分发目录: ${DIST}（用 ROCKETMQ_DIST 覆盖）" >&2; exit 2; }
+    echo "=== cluster not listening (${NS_PORT}/${BROKER_PORT}), starting a local test cluster ==="
+    [ -d "$DIST" ] || { echo "RocketMQ distribution directory not found: ${DIST} (override with ROCKETMQ_DIST)" >&2; exit 2; }
     mkdir -p "$WORK/store"
     cat > "$WORK/broker.conf" <<EOF
 brokerClusterName = DefaultCluster
@@ -221,18 +228,18 @@ EOF
     STARTED_BROKER=1
     for i in $(seq 1 60); do
         if port_open "$NS_PORT" && port_open "$BROKER_PORT"; then
-            echo "=== 集群就绪（等待 ${i}x1s） ==="
+            echo "=== cluster ready (waited ${i}x1s) ==="
             sleep 2
             break
         fi
         sleep 1
         if [ "$i" = "60" ]; then
-            echo "=== 集群 60s 未就绪，放弃（见 $WORK/ns.log / $WORK/broker.log） ===" >&2
+            echo "=== cluster not ready within 60s, giving up (see $WORK/ns.log / $WORK/broker.log) ===" >&2
             exit 2
         fi
     done
-    # 端口通了 ≠ TBW102 已注册：路由没进 nameserver 之前 createTopic 会死于
-    # "No route info of default topic TBW102"。等一个真正的 route 查询成功。
+    # Port open ≠ TBW102 registered: before the route reaches the nameserver, createTopic dies
+    # with "No route info of default topic TBW102". Wait for a real route query to succeed.
     for i in $(seq 1 60); do
         if "$NODE_BIN" --experimental-strip-types --no-warnings -e "
             const { MQClient } = await import('$NODEJS_DIR/src/client/mq_client.ts');
@@ -246,12 +253,12 @@ EOF
               process.exit(resp.code === ResponseCode.SUCCESS ? 0 : 1);
             } catch (e) { process.exit(1); }
         " 2>/dev/null; then
-            echo "=== TBW102 路由已注册 ==="
+            echo "=== TBW102 route registered ==="
             break
         fi
         sleep 1
         if [ "$i" = "60" ]; then
-            echo "=== broker 60s 未注册进 nameserver，放弃 ===" >&2
+            echo "=== broker not registered into nameserver within 60s, giving up ===" >&2
             exit 2
         fi
     done

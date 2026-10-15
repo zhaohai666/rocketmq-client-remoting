@@ -1,16 +1,25 @@
-// 与 rmq pop（协议管道）的区别：这里验证**消费循环** ——
-//   POP 弹出 → 投递 listener → 成功则 ack、失败则延长不可见时间 → 不重复投递。
-// 消费循环不查/不提交消费位点，进度完全由 broker 的 checkpoint 跟踪。
+// The difference from rmq pop (the protocol pipe): what is verified here is the **consume
+// loop** --
+//   POP pops -> delivers to the listener -> ack on success, extend the invisible time on
+//   failure -> no duplicate delivery.
+// The consume loop neither queries nor commits consumer offsets; progress is tracked
+// entirely by the broker's checkpoint.
 //
-// 场景：
-//   S1 POP 消费：起消费者 → 发 12 条 → 全部收到、无重复、body 集合一致
-//   S2 ack 生效：收满后再观察一段时间（> invisibleTime）→ 不应被重复投递
-//   S3 RECONSUME_LATER：listener 持续返回 RECONSUME_LATER → 按延迟档位重新投递
-//   S4 多队列：消息确实落到了多个队列且都被消费（POP 是逐队列弹的）
-//   S5 拉取统计：POP 路径也要把 pullRT/pullTPS 记进 307 状态表（持续流量 + 真实 RPC）
+// Scenarios:
+//   S1 POP consumption: start the consumer -> send 12 messages -> all received, no
+//      duplicates, the set of bodies matches
+//   S2 ack takes effect: after receiving everything, observe for a while (> invisibleTime)
+//      -> nothing must be redelivered
+//   S3 RECONSUME_LATER: the listener keeps returning RECONSUME_LATER -> redelivered
+//      following the delay tiers
+//   S4 Multiple queues: the messages really landed on several queues and all of them were
+//      consumed (POP pops queue by queue)
+//   S5 Pull statistics: the POP path must also record pullRT/pullTPS into the 307 status
+//      table (continuous traffic + real RPCs)
 //
-// ⚠ S2 的观测窗口必须 > PopInvisibleTime，否则"ack 完全没发出去"也看不出重复投递
-//   （消息还没到复活时间）——这是最容易伪装成通过的假绿。
+// Note: S2's observation window must be > PopInvisibleTime, otherwise "the ack never went
+//   out at all" shows no duplicate delivery either (the message has not reached its revival
+//   time yet) -- this is the false green most likely to slip through.
 using System.Globalization;
 using System.Text;
 
@@ -132,7 +141,8 @@ public static class LivePopConsumer
             lock (_lk) return new List<string>(_keys);
         }
 
-        // 至少被投递过两次的不同消息数（"每条都重投了"才是 S3 要证明的语义）
+        // the number of distinct messages that were delivered at least twice ("every one of
+        // them was redelivered" is the semantics S3 has to prove)
         public int RedeliveredKinds()
         {
             lock (_lk) return _keys.GroupBy(k => k).Count(g => g.Count() >= 2);
@@ -162,19 +172,20 @@ public static class LivePopConsumer
         PrepareTopic(prep, topicStats);
         prep.Shutdown();
 
-        // ---------------- S1 / S2 / S4：正常消费 + ack ----------------
-        Console.WriteLine("=== S1 POP 消费（全收 + 无重复）===");
+        // ---------------- S1 / S2 / S4: normal consumption + ack ----------------
+        Console.WriteLine("=== S1 POP consumption (all received + no duplicates) ===");
         var listener = new SuccessListener();
         var consumer = new DefaultMQPushConsumer(group);
         consumer.SetNamesrvAddr(nsAddr);
         consumer.PopMode = true;
         consumer.SetConsumeThreadNums(4);
         consumer.ConsumeMessageBatchMaxSize = 4;
-        // ⚠ 故意压到 10s：让"没 ack → invisibleTime 到期复活重投"在观测窗口内来得及暴露
+        // Deliberately pushed down to 10s: so that "not acked -> revived redelivery when
+        // invisibleTime expires" has a chance to show up inside the observation window
         consumer.PopInvisibleTime = 10000;
         consumer.SetMessageListener(listener);
         consumer.Subscribe(topic, "*");
-        // 先起消费者再发消息（见项目约定）
+        // start the consumer before sending the messages (see the project convention)
         consumer.Start();
         Thread.Sleep(1000);
 
@@ -194,36 +205,37 @@ public static class LivePopConsumer
         Console.WriteLine("  sent " + nMsg.ToString(CultureInfo.InvariantCulture) + " msgs");
 
         bool all = WaitUntil(() => listener.Snapshot().Count >= nMsg, 30000);
-        // 必须 > PopInvisibleTime(10s)，否则 ack 没发也看不出重复投递
+        // must be > PopInvisibleTime(10s), otherwise a missing ack shows no duplicate delivery either
         Thread.Sleep(16000);
 
         List<string> got = listener.Snapshot();
         var gotSet = new HashSet<string>(got, StringComparer.Ordinal);
-        Check("S1a 全部消息被消费", all && got.Count >= nMsg,
+        Check("S1a all messages were consumed", all && got.Count >= nMsg,
             "received=" + got.Count.ToString(CultureInfo.InvariantCulture)
                 + "/" + nMsg.ToString(CultureInfo.InvariantCulture));
-        Check("S1b body 集合与发送一致", gotSet.SetEquals(sent),
+        Check("S1b the set of bodies matches what was sent", gotSet.SetEquals(sent),
             "got=" + gotSet.Count.ToString(CultureInfo.InvariantCulture)
                 + " sent=" + sent.Count.ToString(CultureInfo.InvariantCulture));
-        Check("S2a 无重复投递", gotSet.Count == got.Count,
+        Check("S2a no duplicate delivery", gotSet.Count == got.Count,
             "received=" + got.Count.ToString(CultureInfo.InvariantCulture)
                 + " unique=" + gotSet.Count.ToString(CultureInfo.InvariantCulture));
-        Check("S2b 观察期内没有新增投递", got.Count == nMsg,
+        Check("S2b no new deliveries within the observation window", got.Count == nMsg,
             "received=" + got.Count.ToString(CultureInfo.InvariantCulture));
-        Check("S4 消息分布在多个队列且都被消费", listener.QueueCount() > 1,
+        Check("S4 the messages spread over several queues and all were consumed", listener.QueueCount() > 1,
             "queues=" + listener.QueueCount().ToString(CultureInfo.InvariantCulture));
         consumer.Shutdown();
         producer.Shutdown();
 
-        // ---------------- S3：RECONSUME_LATER → 延迟后重投 ----------------
-        Console.WriteLine("=== S3 RECONSUME_LATER → 延迟后重投 ===");
+        // ---------------- S3: RECONSUME_LATER -> redelivery after the delay ----------------
+        Console.WriteLine("=== S3 RECONSUME_LATER -> redelivery after the delay ===");
         var laterListener = new LaterListener();
         var c2 = new DefaultMQPushConsumer(groupLater);
         c2.SetNamesrvAddr(nsAddr);
         c2.PopMode = true;
         c2.SetConsumeThreadNums(2);
         c2.PopInvisibleTime = 5000;
-        // 消费失败时的延迟档位：把第一档压到 3s，让"延长不可见 → 重新可见"尽快发生
+        // the delay tier on consumption failure: push the first tier down to 3s so that
+        // "extend the invisible time -> visible again" happens as soon as possible
         c2.PopDelayLevel = new List<int> { 3, 10, 30, 60, 120, 300, 600, 1200, 1800, 3600, 7200 };
         c2.SetMessageListener(laterListener);
         c2.Subscribe(topicLater, "*");
@@ -242,20 +254,21 @@ public static class LivePopConsumer
 
         bool first = WaitUntil(() => laterListener.Count() >= 3, 30000);
         int firstRound = laterListener.Count();
-        Check("S3a 首轮投递 3 条", first && firstRound >= 3,
+        Check("S3a the first round delivered 3", first && firstRound >= 3,
             "count=" + firstRound.ToString(CultureInfo.InvariantCulture));
 
-        // ⚠ 断言的是"每条都重投过"，不是"又多收了 3 次投递"：按条数算时，
-        // 某一条被重投 3 次而另一条从没回来也会通过。
+        // Note: what is asserted is "every one of them was redelivered", not "3 more
+        // deliveries arrived": counting by message, one message redelivered 3 times while
+        // another never came back would still pass.
         bool again = WaitUntil(() => laterListener.RedeliveredKinds() >= 3, 40000);
-        Check("S3b 每条消费失败的消息都被重新投递（延长不可见时间生效）", again,
+        Check("S3b every message that failed consumption was redelivered (extending the invisible time took effect)", again,
             "first=" + firstRound.ToString(CultureInfo.InvariantCulture)
                 + " redelivered=" + laterListener.RedeliveredKinds().ToString(CultureInfo.InvariantCulture)
                 + " deliveries=" + string.Join(",", laterListener.Snapshot()));
         c2.Shutdown();
         p2.Shutdown();
 
-        Console.WriteLine("=== S5 POP 循环把 pullRT/pullTPS 写进 307 状态表 ===");
+        Console.WriteLine("=== S5 the POP loop writes pullRT/pullTPS into the 307 status table ===");
         var statsListener = new SuccessListener();
         var c5 = new DefaultMQPushConsumer(groupStats);
         c5.SetNamesrvAddr(nsAddr);
@@ -271,7 +284,7 @@ public static class LivePopConsumer
         p5.Start();
         int sent5 = 0;
         long began5 = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        while (DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - began5 < 26000)   // 约 3 个采样周期
+        while (DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - began5 < 26000)   // about 3 sampling periods
         {
             for (int i = 0; i < 4; i++)
             {
@@ -285,7 +298,8 @@ public static class LivePopConsumer
         var admin = new DefaultMQAdminExt("PopConsNetAdmin");
         admin.SetNamesrvAddr(nsAddr);
         admin.Start();
-        // 走 broker 转发到消费者本体的 307；statusTable 是透传 JSON，按键取回后再解
+        // goes through the broker forwarded to the consumer itself as 307; statusTable is
+        // passed-through JSON, so it is fetched by key and then decoded
         JsonValue status = JsonValue.Null;
         try
         {
@@ -305,18 +319,21 @@ public static class LivePopConsumer
             + " pullRT=" + pullRT.ToString("0.00", CultureInfo.InvariantCulture)
             + " pullTPS=" + pullTPS.ToString("0.0000", CultureInfo.InvariantCulture)
             + " consumeOKTPS=" + consumeOKTPS.ToString("0.0000", CultureInfo.InvariantCulture));
-        Check("S5a pullRT 非 0（POP 每次 FOUND 记一次拉取耗时）", pullRT > 0.0,
+        Check("S5a pullRT is non-zero (POP records a pull duration on every FOUND)", pullRT > 0.0,
             "pullRT=" + pullRT.ToString(CultureInfo.InvariantCulture));
-        Check("S5b pullTPS 非 0（按弹到的条数计）", pullTPS > 0.0,
+        Check("S5b pullTPS is non-zero (counted by the number of messages popped)", pullTPS > 0.0,
             "pullTPS=" + pullTPS.ToString(CultureInfo.InvariantCulture));
-        // 拉取侧与消费侧两格各自独立：只有 consumeOKTPS 有值而 pull* 全 0，正是
-        // POP 循环漏记拉取统计的特征形状。
-        Check("S5c consumeOKTPS 同时非 0（两格各自独立上报）", consumeOKTPS > 0.0,
+        // the pull side and the consume side are independent slots: only consumeOKTPS having
+        // a value while pull* are all 0 is exactly the shape of a POP loop that forgot to
+        // record the pull statistics.
+        Check("S5c consumeOKTPS is non-zero at the same time (the two slots report independently)", consumeOKTPS > 0.0,
             "consumeOKTPS=" + consumeOKTPS.ToString(CultureInfo.InvariantCulture));
-        // 状态表非 0 只说明"计数被调用过"，还得确认这些统计对应的流量真被消费掉：
-        // 否则 pullTPS 可以靠一直接触到从未 ack 的消息刷高，看板上好看、实际在打转。
+        // A non-zero status table only means "the counter was called"; it still has to be
+        // confirmed that the traffic behind those statistics really was consumed: otherwise
+        // pullTPS can be pushed up by continuously touching messages that were never acked,
+        // which looks good on the dashboard while it is actually spinning.
         bool consumed5 = WaitUntil(() => statsListener.Snapshot().Count >= sent5, 20000);
-        Check("S5d 状态表背后的流量确实被消费了", consumed5,
+        Check("S5d the traffic behind the status table really was consumed", consumed5,
             "received=" + statsListener.Snapshot().Count.ToString(CultureInfo.InvariantCulture)
                 + " sent=" + sent5.ToString(CultureInfo.InvariantCulture));
         c5.Shutdown();

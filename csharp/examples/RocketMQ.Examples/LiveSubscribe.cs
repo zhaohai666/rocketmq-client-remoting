@@ -1,5 +1,5 @@
-// 前置：NameServer + Broker 已起（本仓库 /tmp/rmq_rust_live/broker.conf）。
-// 用法：rmq subscribe [namesrv]
+// Prerequisite: a NameServer + Broker are already up (/tmp/rmq_rust_live/broker.conf in this repo).
+// Usage: rmq subscribe [namesrv]
 using System.Globalization;
 using System.Text;
 
@@ -34,8 +34,9 @@ public static class LiveSubscribe
 
     private static long NowMs() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
-    /// <summary>真机投递受 broker 长轮询/流控与同机负载影响，固定 sleep 会把「实现没问题」
-    /// 测成假失败。</summary>
+    /// <summary>Real-machine delivery is affected by the broker's long polling / flow
+    /// control and by load on the same machine, so a fixed sleep turns "the implementation
+    /// is fine" into a false failure.</summary>
     private static bool WaitUntil(Func<bool> pred, int timeoutMs, int intervalMs = 100)
     {
         long deadline = NowMs() + timeoutMs;
@@ -98,7 +99,7 @@ public static class LiveSubscribe
             List<string> addrs = cluster.GetBrokerAddrs();
             if (addrs.Count == 0)
             {
-                Check("集群探活", false, "nameServer 无 broker 注册");
+                Check("the cluster liveness probe", false, "the nameServer has no broker registered");
                 admin.Shutdown();
                 return Report();
             }
@@ -107,12 +108,12 @@ public static class LiveSubscribe
         }
         catch (Exception e)
         {
-            Check("集群探活", false, "fetchBrokerClusterInfo: " + e.Message);
+            Check("the cluster liveness probe", false, "fetchBrokerClusterInfo: " + e.Message);
             admin.Shutdown();
             return Report();
         }
 
-        Check("集群探活", true, "broker=" + brokerAddr);
+        Check("the cluster liveness probe", true, "broker=" + brokerAddr);
 
         DefaultMQPushConsumer? consumer = null;
         DefaultMQProducer? producer = null;
@@ -133,41 +134,42 @@ public static class LiveSubscribe
 
             HashSet<string> Who(string topic) => admin.QueryTopicConsumeByWho(brokerAddr, topic);
 
-            // ---------------- S0 正对照 ----------------
+            // ---------------- S0 positive control ----------------
             long t0 = NowMs();
             bool s0 = WaitUntil(() => Who(tBase).Contains(group), 35000);
-            Check("S0-基础 topic B 已登记本组（300 查得到）", s0,
+            Check("S0-the base topic B has this group registered (visible to a 300 query)", s0,
                 "groupList=" + Join(Who(tBase).OrderBy(x => x, StringComparer.Ordinal))
                 + " elapsed=" + (NowMs() - t0).ToString(CultureInfo.InvariantCulture) + "ms");
 
-            // ---------------- S1 负对照 ----------------
+            // ---------------- S1 negative control ----------------
             HashSet<string> gotL0 = Who(tLate);
-            Check("S1-负对照：未订阅的 L 查不到本组", !gotL0.Contains(group),
+            Check("S1-negative control: the unsubscribed L does not show this group", !gotL0.Contains(group),
                 "groupList=" + Join(gotL0.OrderBy(x => x, StringComparer.Ordinal)));
 
-            // ---------------- S2 后置订阅立即生效 ----------------
+            // ---------------- S2 a later subscription takes effect immediately ----------------
             long t1 = NowMs();
             consumer.Subscribe(tLate, "*");
             long subscribeMs = NowMs() - t1;
             HashSet<string> gotL1 = Who(tLate);
             long elapsedMs = NowMs() - t1;
             bool registered = gotL1.Contains(group);
-            Check("S2-后置订阅后 broker 立刻登记本组（300 查得到）", registered,
+            Check("S2-after the later subscription the broker registers this group at once (visible to a 300 query)", registered,
                 "groupList=" + Join(gotL1.OrderBy(x => x, StringComparer.Ordinal)));
-            // 心跳周期默认 30s：只有订阅路径那一轮**同步**心跳才能让登记这么快出现。
-            Check("S2-登记耗时远小于 30s 心跳周期（只可能是订阅路径推的）",
+            // The heartbeat interval defaults to 30s: only the **synchronous** heartbeat on
+            // the subscription path can make the registration appear this fast.
+            Check("S2-registration took far less than the 30s heartbeat interval (it can only be the subscription path)",
                 registered && elapsedMs < HeartbeatPeriodMs / 6,
-                "subscribe 返回耗时=" + subscribeMs.ToString(CultureInfo.InvariantCulture)
-                + "ms，查询完成耗时=" + elapsedMs.ToString(CultureInfo.InvariantCulture) + "ms");
+                "subscribe returned in " + subscribeMs.ToString(CultureInfo.InvariantCulture)
+                + "ms, the query completed in " + elapsedMs.ToString(CultureInfo.InvariantCulture) + "ms");
 
-            // ---------------- S3 后置订阅真会被消费 ----------------
+            // ---------------- S3 a later subscription really gets consumed ----------------
             long t2 = NowMs();
             bool assigned = WaitUntil(
                 () => consumer.AssignedQueueKeys().Any(k => k.StartsWith(tLate, StringComparison.Ordinal)),
                 45000);
             List<string> lateKeys = consumer.AssignedQueueKeys()
                 .Where(k => k.StartsWith(tLate, StringComparison.Ordinal)).ToList();
-            Check("S3-新 topic L 进入本实例分配集（rebalance 生效）", assigned,
+            Check("S3-the new topic L enters this instance's assignment set (the rebalance took effect)", assigned,
                 "assigned=" + Join(lateKeys) + " elapsed="
                 + (NowMs() - t2).ToString(CultureInfo.InvariantCulture) + "ms");
 
@@ -182,22 +184,22 @@ public static class LiveSubscribe
             producer.Send(new Message(tLate, Encoding.UTF8.GetBytes("late-subscribe-me")), 20000);
             bool consumed = WaitUntil(
                 () => sink.Snapshot().Any(b => b == "late-subscribe-me"), 30000);
-            Check("S3-后置订阅的 topic 上的消息真的被消费", consumed,
+            Check("S3-messages on the later-subscribed topic really are consumed", consumed,
                 "seen=" + Join(sink.Snapshot()));
 
-            // ---------------- S4 活订阅表 ----------------
+            // ---------------- S4 the live subscription table ----------------
             consumer.Unsubscribe(tLate);
             List<string> live = consumer.SubscribedTopics();
-            Check("S4-Unsubscribe 后本组订阅集立刻少掉 L（只删表项，不发心跳）",
+            Check("S4-after Unsubscribe this group's subscription set immediately loses L (only the entry is removed, no heartbeat is sent)",
                 !live.Contains(tLate) && live.Contains(tBase), "live=" + Join(live));
         }
         catch (Exception e)
         {
-            Check("场景执行", false, e.Message);
+            Check("running the scenario", false, e.Message);
         }
 
-        try { consumer?.Shutdown(); } catch (Exception e) { Console.WriteLine("    (consumer shutdown 失败: " + e.Message + ")"); }
-        try { producer?.Shutdown(); } catch (Exception e) { Console.WriteLine("    (producer shutdown 失败: " + e.Message + ")"); }
+        try { consumer?.Shutdown(); } catch (Exception e) { Console.WriteLine("    (consumer shutdown failed: " + e.Message + ")"); }
+        try { producer?.Shutdown(); } catch (Exception e) { Console.WriteLine("    (producer shutdown failed: " + e.Message + ")"); }
         foreach (string t in new[] { tBase, tLate })
         {
             try
@@ -207,13 +209,13 @@ public static class LiveSubscribe
             }
             catch (Exception e)
             {
-                Console.WriteLine("    (deleteTopic(" + t + ") 失败: " + e.Message + ")");
+                Console.WriteLine("    (deleteTopic(" + t + ") failed: " + e.Message + ")");
             }
         }
 
         try { admin.DeleteSubscriptionGroup(brokerAddr, group, true); }
-        catch (Exception e) { Console.WriteLine("    (deleteSubscriptionGroup(" + group + ") 失败: " + e.Message + ")"); }
-        try { admin.Shutdown(); } catch (Exception e) { Console.WriteLine("    (admin shutdown 失败: " + e.Message + ")"); }
+        catch (Exception e) { Console.WriteLine("    (deleteSubscriptionGroup(" + group + ") failed: " + e.Message + ")"); }
+        try { admin.Shutdown(); } catch (Exception e) { Console.WriteLine("    (admin shutdown failed: " + e.Message + ")"); }
 
         return Report();
     }

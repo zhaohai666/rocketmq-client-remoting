@@ -51,17 +51,17 @@ def main() -> int:
     producer = None
     inst = None
     try:
-        # ---------- 建 topic（路由给 master，另在从节点上各建一份） ----------
-        # 从节点自己的 TopicConfigManager 靠 SlaveSynchronize 同步（首轮 ~10s、之后 60s 一次），
-        # 不等它同步：PullMessageProcessor 的 topic 检查（:347）排在订阅检查（:420）之前，
-        # 从节点不认识 topic 时会先回 TOPIC_NOT_EXIST(17) 把要验的那道门整个遮住。
-        print("建 topic（master 走 route + slave 直连各一份）")
+        # ---------- Create topic (route to master, plus a separate copy on the slave) ----------
+        # The slave's own TopicConfigManager is synced by SlaveSynchronize (first round ~10s, then every 60s),
+        # so do not wait for it: PullMessageProcessor's topic check (:347) runs before the subscription check (:420),
+        # and when the slave does not know the topic it replies TOPIC_NOT_EXIST(17) first, masking the very gate under test.
+        print("create topic (master via route + slave direct, one each)")
         inst = MQClientInstance("hb-slave-setup-%d" % STAMP, [NAMESRV])
         inst.start()
         inst.create_topic_in_route(TOPIC, 4, 4)
 
-        # ---------- S0 路由里主从都在 ----------
-        print("\nS0 路由：broker-a 的 {0: master, 1: slave}")
+        # ---------- S0 route has both master and slave ----------
+        print("\nS0 route: broker-a {0: master, 1: slave}")
         route = None
         deadline = time.time() + 30
         while time.time() < deadline:
@@ -73,29 +73,29 @@ def main() -> int:
             time.sleep(1)
         bd = route.broker_datas[0] if route and route.broker_datas else None
         addrs = dict(bd.broker_addrs) if bd else {}
-        check("S0 路由含 {0: master, 1: slave}", set(addrs) >= {0, 1},
+        check("S0 route has {0: master, 1: slave}", set(addrs) >= {0, 1},
               "broker_addrs=%s" % addrs)
         master = addrs.get(0, "127.0.0.1:10911")
         slave = addrs.get(1, SLAVE_ARG)
-        check("S0 从节点地址与参数一致", slave == SLAVE_ARG,
+        check("S0 slave address matches argument", slave == SLAVE_ARG,
               "route=%s argv=%s" % (slave, SLAVE_ARG))
-        # 从节点也要认识 topic：直连它在它自己的 TopicConfigManager 里建一份
+        # The slave must also know the topic: connect directly to it and create one in its own TopicConfigManager
         try:
             admin.create_topic_in_broker(slave, TOPIC, 4, 4)
-            print("    (已在从节点 %s 建 topic %s)" % (slave, TOPIC))
+            print("    (created topic %s on slave %s)" % (TOPIC, slave))
         except Exception as e:  # noqa: BLE001
-            print("    (从节点建 topic 失败: %s)" % e)
-        check("S0 getAllBrokerAddrs 两台、getRouteOfAllBrokers 只有 master",
+            print("    (failed to create topic on slave: %s)" % e)
+        check("S0 getAllBrokerAddrs has two, getRouteOfAllBrokers only master",
               sorted(inst.get_all_broker_addrs()) == sorted([master, slave])
               and inst.get_route_of_all_brokers() == [master],
               "all=%s probe=%s" % (inst.get_all_broker_addrs(),
                                    inst.get_route_of_all_brokers()))
         if not (master and slave and master != slave):
-            print("\n== 前置不满足：没有可用的主从地址 ==")
+            print("\n== precondition not met: no usable master/slave addresses ==")
             return 1
 
-        # ---------- S1 消费者起来并注册 ----------
-        print("\nS1 push consumer 起并等首轮心跳")
+        # ---------- S1 bring up consumer and register ----------
+        print("\nS1 start push consumer and wait for first heartbeat")
         got = []
         lock = threading.Lock()
 
@@ -114,37 +114,37 @@ def main() -> int:
         wait = time.time() + 20
         while time.time() < wait and consumer.heartbeat_count() < 1:
             time.sleep(0.5)
-        check("S1 首轮心跳已发出", consumer.heartbeat_count() >= 1,
+        check("S1 first heartbeat sent", consumer.heartbeat_count() >= 1,
               "heartbeat_count=%d clientId=%s" % (consumer.heartbeat_count(), client_id))
 
         def ids_at(addr, group):
-            """直接打指定地址查 38；broker 回「组不存在」也走 SUCCESS+空表。"""
+            """Query 38 directly against the given address; the broker replies SUCCESS+empty list for "group not exist" too."""
             try:
                 body = client.get_consumer_list_by_group(group, 5000, addr=addr)
             except Exception as e:  # noqa: BLE001
                 return None, "%s: %s" % (type(e).__name__, e)
             return list(body.consumer_id_list or []), ""
 
-        # ---------- S2 从节点也认识本组 ----------
-        print("\nS2 从节点上 GET_CONSUMER_LIST_BY_GROUP(38) 能看到本 clientId")
+        # ---------- S2 slave also knows this group ----------
+        print("\nS2 GET_CONSUMER_LIST_BY_GROUP(38) on the slave can see this clientId")
         seen, err = ids_at(slave, GROUP)
-        check("S2 从节点 38 查到本 clientId（心跳真扇出到从节点）",
+        check("S2 slave 38 finds this clientId (heartbeat truly fans out to the slave)",
               bool(seen) and client_id in seen,
               "slave=%s seen=%s %s" % (slave, seen, err))
-        # ---------- S2b 负向对照 ----------
+        # ---------- S2b negative control ----------
         ghost, err2 = ids_at(slave, GHOST_GROUP)
-        check("S2b 对照组：从节点查一个从未心跳过的组 → 空",
+        check("S2b control: a never-heartbeated group on the slave -> empty",
               ghost == [] or ghost is None,
               "ghost=%s %s" % (ghost, err2))
-        # ---------- S3 主节点同样认识本组 ----------
+        # ---------- S3 master also knows this group ----------
         seen_m, err3 = ids_at(master, GROUP)
-        check("S3 主节点 38 也查到本组（说明该组确实注册成了）",
+        check("S3 master 38 also finds this group (proves it really is registered)",
               bool(seen_m) and client_id in seen_m,
               "master=%s seen=%s %s" % (master, seen_m, err3))
 
-        # ---------- S4 指向从节点的「无订阅标志」拉取 ----------
-        # push 消费者的默认形状：subscription=False（postSubscriptionWhenPull=false）
-        print("\nS4 无订阅标志拉取打从节点（push 默认形状）")
+        # ---------- S4 pull against the slave with the "no subscription flag" ----------
+        # push consumer default shape: subscription=False (postSubscriptionWhenPull=false)
+        print("\nS4 no-subscription-flag pull against the slave (push default shape)")
         mq = MessageQueue(TOPIC, bd.broker_name, 0)
         sys_flag = PullSysFlag.build_sys_flag(commit_offset=False, suspend=False,
                                               subscription=False, class_filter=False)
@@ -161,21 +161,21 @@ def main() -> int:
                 return None, "%s: %s" % (type(e).__name__, e)
 
         status, err4 = pull_at(slave, GROUP)
-        check("S4 从节点对上已注册组不再回 SUBSCRIPTION_NOT_EXIST(24)",
+        check("S4 slave no longer returns SUBSCRIPTION_NOT_EXIST(24) for a registered group",
               status == "OK",
-              "slave=%s -> %s %s" % (slave, status or "拒绝", err4))
+              "slave=%s -> %s %s" % (slave, status or "rejected", err4))
         status_g, err5 = pull_at(slave, GHOST_GROUP)
-        check("S4b 对照组：同一个从节点对未注册组仍回 24（那道门真按每台自己的表判）",
+        check("S4b control: the same slave still returns 24 for an unregistered group (that gate really judges by each node's own table)",
               "code=%d" % ResponseCode.SUBSCRIPTION_NOT_EXIST in err5,
               "ghost -> %s" % err5)
 
-        # ---------- S5 生产者心跳仍只打 master ----------
-        print("\nS5 生产者心跳只打 master：从节点 204 查不到本组，主节点查得到")
+        # ---------- S5 producer heartbeat still only goes to master ----------
+        print("\nS5 producer heartbeat only hits master: 204 cannot find the group on the slave, master can")
         producer = DefaultMQProducer(PRODUCER_GROUP)
         producer.set_namesrv_addr(NAMESRV)
         producer.start()
-        # 生产者 start() 时的首轮心跳可能赶在路由表填好之前（那时已知 broker 为空、发 0 发），
-        # 先发一笔把路由拉起来，再等下一轮心跳周期（默认 30s）把组登记上去。
+        # The producer's first heartbeat at start() may fire before the route table is filled (known broker list empty then, nothing sent),
+        # so send one message first to pull up the route, then wait for the next heartbeat cycle (default 30s) to register the group.
         producer.send(Message(TOPIC, b"hb-slave-probe"))
         wait = time.time() + 70
         pc_master = None
@@ -184,10 +184,10 @@ def main() -> int:
             if pc_master:
                 break
             time.sleep(1)
-        check("S5 主节点 204 能看到本生产者（心跳链路通）",
+        check("S5 master 204 can see this producer (heartbeat path works)",
               bool(pc_master), "master=%s seen=%s" % (master, pc_master))
         pc_slave = _connection_client_ids(admin, slave, PRODUCER_GROUP)
-        check("S5b 从节点 204 查不到本生产者组（生产者心跳仍只打 master）",
+        check("S5b slave 204 cannot find this producer group (producer heartbeat still only hits master)",
               not pc_slave, "slave=%s seen=%s" % (slave, pc_slave))
     finally:
         for c in (consumer, producer):
@@ -195,24 +195,24 @@ def main() -> int:
                 try:
                     c.shutdown()
                 except Exception as e:  # noqa: BLE001
-                    print("    (shutdown 失败: %s)" % e)
+                    print("    (shutdown failed: %s)" % e)
         if inst is not None:
             try:
                 inst.shutdown()
             except Exception as e:  # noqa: BLE001
-                print("    (setup instance shutdown 失败: %s)" % e)
+                print("    (setup instance shutdown failed: %s)" % e)
         try:
             admin.delete_topic(TOPIC)
         except Exception as e:  # noqa: BLE001
-            print("    (delete_topic(%s) 失败: %s)" % (TOPIC, e))
+            print("    (delete_topic(%s) failed: %s)" % (TOPIC, e))
         admin.shutdown()
 
-    print("\n== 结果: %d/%d 通过 ==" % (PASS, PASS + FAIL))
+    print("\n== result: %d/%d passed ==" % (PASS, PASS + FAIL))
     return 0 if FAIL == 0 else 1
 
 
 def _connection_client_ids(admin: DefaultMQAdminExt, broker_addr: str, group: str):
-    """204 看到的 clientId 列表；broker 说「组不存在」时回 None。"""
+    """clientId list as seen via 204; returns None when the broker says "group not exist"."""
     try:
         pc = admin.examine_producer_connection_info(group, broker_addr)
     except Exception as e:  # noqa: BLE001

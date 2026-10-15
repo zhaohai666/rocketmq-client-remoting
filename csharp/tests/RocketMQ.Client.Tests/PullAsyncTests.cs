@@ -17,10 +17,12 @@ public class PullAsyncTests
 
     private static int Pulls(MockCluster cluster) => cluster.CountRequests(RequestCode.PullMessage);
 
-    /// <summary>等一笔回调落账（success 或 exception 任一），返回是否在期限内等到。</summary>
+    /// <summary>Waits for a callback to be accounted (either success or exception) and
+    /// returns whether it arrived within the deadline.</summary>
     private static bool WaitForRec(Recorder rec, int timeoutMs = 8000) => rec.WaitForFirst(timeoutMs);
 
-    /// <summary>已启动的拉模式消费者，每用例独立 instanceName（clientId 隔离 MqClient）。</summary>
+    /// <summary>A started pull-mode consumer, with a distinct instanceName per case (the
+    /// clientId isolates the MqClient).</summary>
     private static DefaultMQPullConsumer Started(MockCluster cluster, string instance)
     {
         var c = new DefaultMQPullConsumer(GroupPrefix + "_" + instance);
@@ -30,7 +32,8 @@ public class PullAsyncTests
         return c;
     }
 
-    /// <summary>恰好一次记账的 IPullCallback 替身；可选「回调内再抛」制造逃逸压力。</summary>
+    /// <summary>An IPullCallback stand-in that accounts exactly once; optionally "throws
+    /// again inside the callback" to create escaping pressure.</summary>
     private sealed class Recorder : IPullCallback
     {
         private readonly ManualResetEventSlim _first = new(false);
@@ -78,7 +81,8 @@ public class PullAsyncTests
         ["maxOffset"] = max.ToString(System.Globalization.CultureInfo.InvariantCulture),
     };
 
-    /// <summary>一篇 17 段存储格式的消息体（与 LitePullCursorTests 同一条编码路径）。</summary>
+    /// <summary>A message body in the 17-field storage format (the same encoding path as
+    /// in LitePullCursorTests).</summary>
     private static byte[] BodyWithOneMessage(long queueOffset)
     {
         var m = new MessageExt
@@ -100,7 +104,7 @@ public class PullAsyncTests
         return MessageDecoder.EncodeMessageExt(m, false);
     }
 
-    // ---------------------------------------------------------------- 1. 成功路径
+    // ---------------------------------------------------------------- 1. Success path
 
     [Fact]
     public void PullAsync_NoNewMsg_OnSuccessExactlyOnce_OffCallerThread()
@@ -111,20 +115,20 @@ public class PullAsyncTests
         long callerThread = Thread.CurrentThread.ManagedThreadId;
         try
         {
-            // 无脚本 = 空 broker 的忠实形态：PULL_NOT_FOUND + nextBeginOffset 回显请求位点
+            // No script = the faithful shape of an empty broker: PULL_NOT_FOUND + nextBeginOffset echoing the request offset
             c.PullAsync(Queue0(), "*", 100, 32, rec);
-            Assert.True(WaitForRec(rec), "回调要落账");
+            Assert.True(WaitForRec(rec), "the callback must be accounted");
             Assert.Equal(1, rec.Successes);
             Assert.Equal(0, rec.Exceptions);
             Assert.NotNull(rec.LastResult);
             Assert.True(rec.LastResult!.IsNoNewMsg); // PullNotFound → NO_NEW_MSG
             Assert.Equal(100L, rec.LastResult!.NextBeginOffset);
-            // 回调不在调用线程上跑（异步语义的最低要求）
+            // The callback does not run on the calling thread (the minimum requirement of async semantics)
             Assert.NotEqual(callerThread, rec.CallbackThreadId);
 
-            Thread.Sleep(150); // 恰好一次：迟到的第二笔算违规
+            Thread.Sleep(150); // exactly once: a second, late arrival counts as a violation
             Assert.Equal(1, rec.Successes);
-            Assert.Equal(1, Pulls(cluster)); // 一次调用 = 一笔 PULL_MESSAGE(11)
+            Assert.Equal(1, Pulls(cluster)); // one call = one PULL_MESSAGE(11)
         }
         finally
         {
@@ -152,7 +156,7 @@ public class PullAsyncTests
             Assert.Equal(Topic, m.Topic);
             Assert.Equal(0L, m.QueueOffset);
             Assert.Equal("hello-pull-async", Encoding.UTF8.GetString(m.Body));
-            // MqClient.PullMessage:1541 用请求队列补写 brokerName/queueId —— 异步链不许丢
+            // MqClient.PullMessage:1541 fills in brokerName/queueId from the request queue -- the async chain must not lose them
             Assert.Equal(MockCluster.BrokerName(0), m.BrokerName);
             Assert.Equal(0, m.QueueId);
         }
@@ -170,7 +174,7 @@ public class PullAsyncTests
         var rec = new Recorder();
         try
         {
-            // (topic, brokerName, queueId) 定位版：免拼 MessageQueue，落同一笔 PULL_MESSAGE
+            // The (topic, brokerName, queueId) locating version: no MessageQueue assembly, landing the same PULL_MESSAGE
             c.PullAsync(Topic, "*", MockCluster.BrokerName(0), 0, 7, 16, rec);
             Assert.True(WaitForRec(rec));
             Assert.Equal(1, rec.Successes);
@@ -185,13 +189,13 @@ public class PullAsyncTests
         }
     }
 
-    // ---------------------------------------------------------------- 2. 异常路径
+    // ---------------------------------------------------------------- 2. Exception path
 
     [Fact]
     public void PullAsync_BrokerErrorCode_GoesToOnException_AsBrokerException()
     {
         using var cluster = MockCluster.Start(1);
-        // SystemError(1) 不在 pull 状态码映射表里 → 内核抛 MQBrokerException（MqClient:1521）
+        // SystemError(1) is not in the pull status code mapping table => the kernel throws MQBrokerException (MqClient:1521)
         cluster.ScriptPull(ResponseCode.SystemError);
         DefaultMQPullConsumer c = Started(cluster, "pa_brokererr");
         var rec = new Recorder();
@@ -215,8 +219,11 @@ public class PullAsyncTests
     {
         using var gate = new ManualResetEventSlim(false);
         using var cluster = MockCluster.Start(1);
-        // 挂闸不应答：把「请求到了 broker、应答永远在路上」的窗口拉成确定性的
-        // （Fake 可控，不用死端口 —— Windows 回环拒连自带 ~2s 建连延迟，会污染计时断言。）
+        // The gate never answers: it turns the "the request reached the broker, the response
+        // is forever on its way" window into a deterministic one
+        // (the Fake is controllable, no dead port needed -- a Windows loopback refused
+        // connection brings its own ~2s connect delay, which would pollute the timing
+        // assertions).
         cluster.ScriptPull(ResponseCode.PullNotFound, gate: gate);
         DefaultMQPullConsumer c = Started(cluster, "pa_timeout");
         var rec = new Recorder();
@@ -225,26 +232,26 @@ public class PullAsyncTests
             var sw = Stopwatch.StartNew();
             c.PullAsync(Queue0(), "*", 0, 32, rec, timeoutMillis: 800);
             long callElapsed = sw.ElapsedMilliseconds;
-            // 调用线程立即返回：不等满 800ms 的拉取超时
-            Assert.True(callElapsed < 500, "PullAsync 不许阻塞调用线程，elapsed=" + callElapsed + "ms");
+            // The calling thread returns immediately: it does not wait out the 800ms pull timeout
+            Assert.True(callElapsed < 500, "PullAsync must not block the calling thread, elapsed=" + callElapsed + "ms");
 
-            Assert.True(WaitForRec(rec), "超时也要走 onException");
+            Assert.True(WaitForRec(rec), "a timeout must also go to onException");
             Assert.Equal(0, rec.Successes);
             Assert.Equal(1, rec.Exceptions);
             Assert.IsType<RemotingTimeoutException>(rec.LastError);
             sw.Stop();
-            // 超时用的是显式 timeoutMillis（800ms），不是默认 consumerPullTimeoutMillis（10s）
+            // The timeout uses the explicit timeoutMillis (800ms), not the default consumerPullTimeoutMillis (10s)
             Assert.True(sw.ElapsedMilliseconds < 6000,
-                "800ms 显式超时兜底，actual total=" + sw.ElapsedMilliseconds + "ms");
+                "the explicit 800ms timeout is the backstop, actual total=" + sw.ElapsedMilliseconds + "ms");
         }
         finally
         {
-            gate.Set(); // 放 broker 连接线程收工（Fake 侧 5s 兜底之外不卡 teardown）
+            gate.Set(); // let the broker's connection thread wind up (no teardown blocking beyond the Fake's 5s backstop)
             c.Shutdown();
         }
     }
 
-    // ---------------------------------------------------------------- 3. 调用栈上的同步守卫
+    // ---------------------------------------------------------------- 3. Synchronous guards on the call stack
 
     [Fact]
     public void PullAsync_NotStarted_ThrowsSynchronously_AndCallbackUntouched()
@@ -253,22 +260,22 @@ public class PullAsyncTests
         var c = new DefaultMQPullConsumer(GroupPrefix + "NotStarted");
         c.SetNamesrvAddr(cluster.NamesrvAddr);
         var rec = new Recorder();
-        // 有意差异（口径从 SendAsync 沿用）：配置错误在调用栈上抛，不静默转 onException
+        // A deliberate difference (the rule carried over from SendAsync): a configuration error throws on the call stack, it is not silently turned into onException
         MQClientException ex = Assert.Throws<MQClientException>(
             () => c.PullAsync(Queue0(), "*", 0, 32, rec));
         Assert.Contains("not started", ex.Message);
         Assert.Equal(0, rec.Successes + rec.Exceptions);
 
-        // 重载版同样守卫
+        // The overload is guarded too
         Assert.Throws<MQClientException>(
             () => c.PullAsync(Topic, "*", MockCluster.BrokerName(0), 0, 0, 32, rec));
 
-        // null 回调：ThrowIfNull 排在取 client 之前 —— 未启动也先报参数
+        // A null callback: ThrowIfNull comes before getting the client -- so even when not started the argument is reported first
         Assert.Throws<ArgumentNullException>(
             () => c.PullAsync(Queue0(), "*", 0, 32, null!));
     }
 
-    // ---------------------------------------------------------------- 4. 回调再抛不许逃逸
+    // ---------------------------------------------------------------- 4. A callback that throws again must not escape
 
     [Fact]
     public void PullAsync_CallbackThrows_IsSwallowed_AndConsumerKeepsWorking()
@@ -281,9 +288,9 @@ public class PullAsyncTests
         {
             c.PullAsync(Queue0(), "*", 0, 32, angry);
             Assert.True(WaitForRec(angry));
-            Assert.True(angry.Threw, "回调确实走过 throw 分支");
+            Assert.True(angry.Threw, "the callback really went through the throw branch");
 
-            // 回调异常只留日志（PullConsumer.cs:786-793）：消费者不受牵连，下一笔照常成功
+            // The callback exception is only logged (PullConsumer.cs:786-793): the consumer is unaffected and the next pull succeeds as usual
             c.PullAsync(Queue0(), "*", 3, 32, calm);
             Assert.True(WaitForRec(calm));
             Assert.Equal(1, calm.Successes);

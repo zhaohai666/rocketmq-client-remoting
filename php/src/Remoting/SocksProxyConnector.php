@@ -6,9 +6,9 @@ namespace RocketMQ\Remoting;
 
 final class SocksProxyConnector
 {
-    // ---------- SOCKS 常量 ----------
+    // ---------- SOCKS constants ----------
     private const VER_SOCKS5 = 0x05;
-    private const VER_AUTH = 0x01;          // RFC 1929 用户名/密码子协商版本
+    private const VER_AUTH = 0x01;          // RFC 1929 username/password sub-negotiation version
     private const METHOD_NO_AUTH = 0x00;
     private const METHOD_USERPASS = 0x02;
     private const METHOD_UNACCEPTABLE = 0xFF;
@@ -18,12 +18,13 @@ final class SocksProxyConnector
     private const ATYP_IPV6 = 0x04;
 
     /**
-     * 在已连上代理的流上完成 CONNECT 握手，成功返回后该流即可当目标地址的直连流用。
+     * Completes the CONNECT handshake over a stream already connected to the proxy; on success
+     * the stream can be used as a direct stream to the target address.
      *
-     * @param resource $conn      与代理服务器的 TCP 流（阻塞模式）
-     * @param string   $host      目标主机（域名或 IP 字面量）
-     * @param int      $port      目标端口
-     * @param float    $timeoutSec 整个握手的预算秒数（本端口用 connectTimeout）
+     * @param resource $conn      TCP stream to the proxy server (blocking mode)
+     * @param string   $host      target host (domain or IP literal)
+     * @param int      $port      target port
+     * @param float    $timeoutSec budget in seconds for the whole handshake (this port uses connectTimeout)
      */
     public static function handshake($conn, string $host, int $port, SocksProxyConfig $cfg, float $timeoutSec): void
     {
@@ -38,14 +39,15 @@ final class SocksProxyConnector
         }
     }
 
-    // ---------- SOCKS5（RFC 1928 + RFC 1929） ----------
+    // ---------- SOCKS5 (RFC 1928 + RFC 1929) ----------
 
     private static function handshakeSocks5($conn, string $host, int $port, SocksProxyConfig $cfg, float $deadline): void
     {
         $hasCredentials = $cfg->getUsername() !== null && $cfg->getUsername() !== '';
 
-        // 1) 方法协商：与 Netty Socks5ProxyHandler 同口径——带了用户名就只报 0x02，
-        //    否则只报 0x00（不报 0x02 让代理被迫选密码法，认证字节流会错位）。
+        // 1) Method negotiation: same semantics as Netty Socks5ProxyHandler — with a username
+        //    configured, offer only 0x02, otherwise only 0x00 (offering 0x02 without credentials
+        //    would let the proxy pick the password method and misalign the auth byte stream).
         $method = $hasCredentials ? self::METHOD_USERPASS : self::METHOD_NO_AUTH;
         self::writeAll($conn, chr(self::VER_SOCKS5) . "\x01" . chr($method), $deadline);
         $reply = unpack('Cver/Cmethod', self::readExact($conn, 2, $deadline));
@@ -64,7 +66,7 @@ final class SocksProxyConnector
             ));
         }
 
-        // 2) CONNECT：VER CMD RSV ATYP DST.ADDR DST.PORT
+        // 2) CONNECT: VER CMD RSV ATYP DST.ADDR DST.PORT
         self::writeAll($conn, chr(self::VER_SOCKS5) . chr(self::CMD_CONNECT) . "\x00" . self::socks5Target($host, $port), $deadline);
         $reply = unpack('Cver/Crep/Crsv/Catyp', self::readExact($conn, 4, $deadline));
         if ($reply['ver'] !== self::VER_SOCKS5) {
@@ -73,7 +75,7 @@ final class SocksProxyConnector
         if ($reply['rep'] !== 0x00) {
             throw new \RuntimeException(self::socks5RepMessage((int)$reply['rep']));
         }
-        // BND.ADDR 变长，按 ATYP 跳过，再吃掉 2 字节 BND.PORT
+        // BND.ADDR is variable-length; skip it per ATYP, then consume the 2-byte BND.PORT
         $bndLen = match ((int)$reply['atyp']) {
             self::ATYP_IPV4 => 4,
             self::ATYP_IPV6 => 16,
@@ -83,7 +85,7 @@ final class SocksProxyConnector
         self::readExact($conn, $bndLen + 2, $deadline);
     }
 
-    /** RFC 1929 用户名/密码子协商：VER(1) ULEN(1) UNAME PLEN(1) PASSWD → VER(1) STATUS(1)。 */
+    /** RFC 1929 username/password sub-negotiation: VER(1) ULEN(1) UNAME PLEN(1) PASSWD -> VER(1) STATUS(1). */
     private static function socks5Auth($conn, string $user, string $pass, float $deadline): void
     {
         self::writeAll($conn, chr(self::VER_AUTH) . chr(strlen($user)) . $user . chr(strlen($pass)) . $pass, $deadline);
@@ -96,7 +98,7 @@ final class SocksProxyConnector
         }
     }
 
-    /** CONNECT 请求的 ATYP + ADDR + PORT 段（IPv4/IPv6 字面量走二进制，其余按域名）。 */
+    /** ATYP + ADDR + PORT segment of the CONNECT request (IPv4/IPv6 literals go binary, everything else as a domain). */
     private static function socks5Target(string $host, int $port): string
     {
         $portBytes = pack('n', $port & 0xFFFF);
@@ -125,23 +127,24 @@ final class SocksProxyConnector
         };
     }
 
-    // ---------- SOCKS4（含 4a 域名扩展） ----------
+    // ---------- SOCKS4 (including the 4a domain extension) ----------
 
     private static function handshakeSocks4($conn, string $host, int $port, SocksProxyConfig $cfg, float $deadline): void
     {
-        // SOCKS4 没有方法协商：直接发 CONNECT 请求（VER CMD DST.PORT DST.IP USERID 0x00）。
+        // SOCKS4 has no method negotiation: send the CONNECT request directly (VER CMD DST.PORT DST.IP USERID 0x00).
         $userid = (string)($cfg->getUsername() ?? '');
         $ip = filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)
             ? (string)inet_pton($host)
             : self::resolveIpv4($host);
         if ($ip !== null) {
-            // 经典 SOCKS4：客户端自己解析域名，只送 4 字节 IP
+            // Classic SOCKS4: the client resolves the domain itself and sends only the 4-byte IP
             self::writeAll($conn, "\x04\x01" . pack('n', $port & 0xFFFF) . $ip . $userid . "\x00", $deadline);
         } else {
-            // 解析不了 → SOCKS4a 扩展：DST.IP 用 0.0.0.x（x != 0）占位，USERID 后跟域名
+            // Unresolvable -> SOCKS4a extension: DST.IP uses 0.0.0.x (x != 0) as a placeholder,
+            // followed by USERID then the domain
             self::writeAll($conn, "\x04\x01" . pack('n', $port & 0xFFFF) . "\x00\x00\x00\x01" . $userid . "\x00" . $host . "\x00", $deadline);
         }
-        // 回复定长 8 字节：VN(0) CD，CD == 90(0x5A) 才算成功
+        // The reply is a fixed 8 bytes: VN(0) CD; CD == 90(0x5A) means success
         $reply = unpack('Cvn/Ccd', self::readExact($conn, 2, $deadline));
         if ($reply['vn'] !== 0x00) {
             throw new \RuntimeException(sprintf('unexpected socks4 reply version %d', $reply['vn']));
@@ -152,18 +155,18 @@ final class SocksProxyConnector
         self::readExact($conn, 6, $deadline); // DST.PORT + DST.IP
     }
 
-    /** 域名 → 4 字节 IPv4；解析不了返回 null（调用方退 SOCKS4a）。 */
+    /** Domain -> 4-byte IPv4; returns null when unresolvable (the caller falls back to SOCKS4a). */
     private static function resolveIpv4(string $host): ?string
     {
         $ip = @gethostbyname($host);
         if ($ip === $host) {
-            return null; // gethostbyname 失败时原样返回主机名
+            return null; // gethostbyname returns the hostname as-is on failure
         }
         $packed = @inet_pton($ip);
         return ($packed !== false && strlen($packed) === 4) ? $packed : null;
     }
 
-    // ---------- 阻塞 I/O（带 deadline） ----------
+    // ---------- Blocking I/O (with deadline) ----------
 
     private static function writeAll($conn, string $data, float $deadline): void
     {
@@ -201,7 +204,7 @@ final class SocksProxyConnector
         return $buf;
     }
 
-    /** 把流的 socket 超时压到剩余预算：代理不回话时 fread 也能按时收口，不会挂死。 */
+    /** Clamps the stream's socket timeout to the remaining budget: if the proxy never replies, fread still closes on time instead of hanging. */
     private static function armTimeout($conn, float $deadline): void
     {
         $remaining = $deadline - microtime(true);

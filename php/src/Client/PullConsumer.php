@@ -28,17 +28,19 @@ use RocketMQ\Client\Exceptions\MQClientException;
 use RocketMQ\Client\Exceptions\MQBrokerException;
 use RocketMQ\Remoting\SocksProxyConfig;
 
-// 模块级辅助函数随 ConsumerSupport.php 的类一起被 autoload（见 PushConsumer 同款保护）。
+// Module-level helper functions are autoloaded together with the ConsumerSupport.php classes
+// (same guard as in PushConsumer).
 if (!function_exists(__NAMESPACE__ . '\\client_side_tag_filter')) {
     require_once __DIR__ . '/ConsumerSupport.php';
 }
 
 /**
- * 拉模式消费者，走经典 remoting 协议的 PULL_MESSAGE 路径。
+ * Pull-mode consumer, following the classic remoting protocol's PULL_MESSAGE path.
  *
- * 与推送消费者的本质区别：调用方自己 ``pull($mq, $offset)`` 逐队列拉、
- * 自己管位点；没有本地缓冲、没有后台拉取线程、不做 rebalance —— 无线程模型对它
- * 天然成立，PHP 适配零偏差。
+ * Essential difference from the push consumer: the caller pulls queue by queue itself via
+ * ``pull($mq, $offset)`` and manages offsets itself; there is no local buffer, no background
+ * pull thread and no rebalance, so a threadless model fits it naturally with zero PHP
+ * adaptation drift.
  */
 final class DefaultMQPullConsumer
 {
@@ -46,54 +48,59 @@ final class DefaultMQPullConsumer
     public string $namespace = '';
     public string $instanceName = MixAll::DEFAULT_INSTANCE_NAME;
     public ?string $clientId = null;
-    /** unitName/unitMode/enableStreamRequestType：参与 clientId 拼装、单元化标记与请求码选择的三个开关。 */
+    /** unitName/unitMode/enableStreamRequestType: the three switches taking part in clientId assembly, unitization marking and request-code selection. */
     public ?string $unitName = null;
     public bool $unitMode = false;
     /**
-     * 拉模式消费者把 ``enableStreamRequestType`` 固定初值为 true：它参与 clientId 拼装，
-     * 与推送消费者的默认 false 是两套初值，不能混用。
+     * The pull-mode consumer fixes the initial value of ``enableStreamRequestType`` to true:
+     * it takes part in clientId assembly, and its default differs from the push consumer's
+     * false; the two initial values must not be mixed up.
      */
     public bool $enableStreamRequestType = true;
     /**
-     * 5.x 新命名空间：非空时**每笔**请求带
-     * `nsd=true` / `ns=<该值>` 两个扩展头，由 broker 解析到对应 serverless 实例。
-     * 与上面那个 `namespace`（客户端给 topic/group 拼 `namespace%` 前缀）是两套机制，
-     * 这里**不**改任何资源名。见 NamespaceRpcHook。
+     * 5.x new namespace: when non-empty, **every** request carries
+     * the two extension headers `nsd=true` / `ns=<value>`, which the broker resolves to the
+     * corresponding serverless instance. It is a separate mechanism from the `namespace`
+     * above (client-side `namespace%` prefix for topic/group), and here **no** resource name
+     * is modified. See NamespaceRpcHook.
      */
     public string $namespaceV2 = '';
     public string $messageModel = MessageModel::CLUSTERING;
     public int $brokerSuspendMaxTimeMillis = 20000;
     public int $consumerPullTimeoutMillis = 10000;
     public int $consumerTimeoutMillisWhenSuspend = 30000;
-    /** 路由刷新周期（只在 start() 建 MQClientInstance 时透传一次）。 */
+    /** Route refresh period (passed through only once when start() builds the MQClientInstance). */
     public int $pollNameServerInterval = 30000;
     /** @var list<string> */
     public array $nameServerAddrs = [];
     public mixed $rpcHook = null;
     /** @var array<string,bool> */
     public array $registerTopics = [];
-    /** TLS 开关（null = 交给 env ROCKETMQ_TLS_ENABLE）。 */
+    /** TLS switch (null = defer to env ROCKETMQ_TLS_ENABLE). */
     public ?bool $tlsEnable = null;
-    /** TLS 细项（caCert/clientCert/clientKey/serverName），语义见 RemotingClient::$tlsOptions。 */
+    /** TLS details (caCert/clientCert/clientKey/serverName), semantics in RemotingClient::$tlsOptions. */
     public ?array $tlsOptions = null;
     public ?SocksProxyConfig $socksProxy = null;
     public ?MessageQueueListener $messageQueueListener = null;
     /**
-     * 队列分配策略（默认 AVG，setters/getter 不校验取值）。
-     * 本端口拉模式由调用方自己管队列，所以它只作为配置存在并被 start() 校验。
+     * Queue allocation strategy (AVG by default; setters/getters do not validate values).
+     * In this pull-mode port the caller manages queues itself, so it exists purely as
+     * configuration and is validated by start().
      */
     public ?AllocateMessageQueueStrategy $allocateMessageQueueStrategy;
-    /** @var list<object> 投递前过滤钩子，start() 时注册进拉取结果处理 */
+    /** @var list<object> Pre-delivery filter hooks, registered into pull-result processing at start() */
     public array $filterMessageHookList = [];
-    /** mqKey → brokerId：broker 在拉取响应里回传的建议下一跳节点表 */
+    /** mqKey -> brokerId: suggested next-hop node table echoed back by the broker in pull responses */
     private array $pullFromWhichNode = [];
     /**
-     * 同一张表的**键集**（mqKey → MessageQueue）。表键是字符串，位点/节点决策用不到队列对象，
-     * 但 fetchMessageQueuesInBalance 要把「本实例实际拉过的队列」还给调用方，
-     * 所以顺手把对象留着（mqKey 是 topic+brokerName+queueId 直拼，反解不可靠）。
+     * The **key set** of the same table (mqKey -> MessageQueue). The table key is a string and
+     * offset/node decisions need no queue object, but fetchMessageQueuesInBalance has to hand
+     * back "the queues this instance actually pulled" to the caller, so the object is kept
+     * along (mqKey is a direct topic+brokerName+queueId concatenation; reverse parsing is
+     * unreliable).
      */
     private array $pulledQueues = [];
-    // ---- 消费者心跳（broker 侧订阅关系的注册周期，默认 30s）----
+    // ---- Consumer heartbeat (broker-side subscription registration period, 30s by default) ----
     public bool $heartbeatEnabled = true;
     public int $heartbeatIntervalMillis = 30000;
     private int $heartbeatCount = 0;
@@ -117,7 +124,7 @@ final class DefaultMQPullConsumer
         $this->allocateMessageQueueStrategy = new AllocateMessageQueueAveragely();
     }
 
-    // ---------------- 配置 ----------------
+    // ---------------- Configuration ----------------
 
     public function setNamesrvAddr(string $addr): void
     {
@@ -146,9 +153,10 @@ final class DefaultMQPullConsumer
     }
 
     /**
-     * 服务端命名空间（`nsd`/`ns` 扩展头），不改 topic/group 名；
-     * 与 `$namespace` 那个「客户端拼 `namespace%` 前缀」的机制互不相干。
-     * start() 之后改也生效——钩子每笔请求实时读 {@see MQClientInstance::$namespaceV2}。
+     * Server-side namespace (`nsd`/`ns` extension headers), topic/group names unchanged;
+     * unrelated to the mechanism of that `$namespace` ("client prefixes `namespace%`").
+     * Changing it after start() also takes effect, the hook reads
+     * {@see MQClientInstance::$namespaceV2} live on every request.
      */
     public function setNamespaceV2(string $namespaceV2): void
     {
@@ -158,7 +166,7 @@ final class DefaultMQPullConsumer
         }
     }
 
-    /** 读取服务端命名空间（`nsd`/`ns` 扩展头用的那一份）。 */
+    /** Read the server-side namespace (the one used by the `nsd`/`ns` extension headers). */
     public function getNamespaceV2(): string
     {
         return $this->namespaceV2;
@@ -184,7 +192,7 @@ final class DefaultMQPullConsumer
         $this->messageQueueListener = $listener;
     }
 
-    /** 设置队列分配策略：setter 不做校验，合法性统一由 start() 把关。 */
+    /** Set the queue allocation strategy: the setter does not validate; start() owns validity. */
     public function setAllocateMessageQueueStrategy(?AllocateMessageQueueStrategy $strategy): void
     {
         $this->allocateMessageQueueStrategy = $strategy;
@@ -200,12 +208,12 @@ final class DefaultMQPullConsumer
         $this->filterMessageHookList[] = $hook;
     }
 
-    // ---------------- 投递前过滤钩子 ----------------
+    // ---------------- Pre-delivery filter hooks ----------------
 
     /**
-     * 拉模式也要过过滤钩子（拉取结果统一在投递前过一次钩子链）。
-     * 拉模式的 tag 过滤交给调用方（不传 subscriptionData 时 tagsSet 为空 → 不筛），
-     * 这里只跑钩子。
+     * Pull mode also runs filter hooks (pull results pass the hook chain once before delivery).
+     * Tag filtering in pull mode is left to the caller (with no subscriptionData the tagsSet
+     * is empty, so nothing is filtered); only the hooks run here.
      *
      * @param list<MessageExt> $msgs
      * @return list<MessageExt>
@@ -221,10 +229,11 @@ final class DefaultMQPullConsumer
         return array_values($context->msgList);
     }
 
-    // ---------------- 心跳（把消费组注册给 broker） ----------------
+    // ---------------- Heartbeat (register the consumer group with the broker) ----------------
 
     /**
-     * 为心跳准备 broker 地址：把 registerTopics 的路由拉一遍并登记为「在用」。
+     * Prepare broker addresses for heartbeat: pull routes of registerTopics once and register
+     * them as "in use".
      */
     private function refreshRouteForHeartbeat(): void
     {
@@ -262,7 +271,7 @@ final class DefaultMQPullConsumer
         return $hb;
     }
 
-    /** 向所有已知 broker（含从节点）发一次本组心跳，返回成功台数。 */
+    /** Send one heartbeat of this group to all known brokers (including slaves), returning the success count. */
     public function sendHeartbeatToAllBroker(): int
     {
         $client = $this->requireClient();
@@ -282,13 +291,13 @@ final class DefaultMQPullConsumer
         return $ok;
     }
 
-    /** 心跳成功轮数（真机验证用）。 */
+    /** Number of successful heartbeat rounds (for real-machine verification). */
     public function heartbeatCount(): int
     {
         return $this->heartbeatCount;
     }
 
-    /** 心跳到点驱动（后台心跳循环的循环体；无订阅时可跳过）。 */
+    /** Heartbeat-driven on schedule (the loop body of the background heartbeat loop; skippable with no subscription). */
     public function tick(?int $nowMillis = null): void
     {
         if (!$this->started) {
@@ -307,7 +316,7 @@ final class DefaultMQPullConsumer
         }
     }
 
-    // ---------------- 生命周期 ----------------
+    // ---------------- Lifecycle ----------------
 
     public function start(): void
     {
@@ -349,7 +358,8 @@ final class DefaultMQPullConsumer
         }
         $this->mqClient->start();
         $this->started = true;
-        // 心跳：先刷 registerTopics 的路由，再同步发一轮让 broker 立刻认识本组。
+        // Heartbeat: refresh the routes of registerTopics first, then send one round synchronously
+        // so the broker recognizes this group immediately.
         $this->refreshRouteForHeartbeat();
         try {
             $this->sendHeartbeatToAllBroker();
@@ -384,7 +394,7 @@ final class DefaultMQPullConsumer
         return $this->mqClient;
     }
 
-    // ---------------- 拉取 ----------------
+    // ---------------- Pulling ----------------
 
     /** @return list<MessageQueue> */
     public function fetchSubscribeMessageQueues(string $topic): array
@@ -424,7 +434,7 @@ final class DefaultMQPullConsumer
         return $this->sortedQueues($allocated, $topic);
     }
 
-    /** 按 topic 收口 + house 排序口径（topic → brokerName → queueId），保证多次调用稳定。 */
+    /** Scope by topic plus house sort order (topic -> brokerName -> queueId), keeping repeated calls stable. */
     private function sortedQueues(array $mqs, string $topic): array
     {
         $out = [];
@@ -480,7 +490,7 @@ final class DefaultMQPullConsumer
     ): PullResult {
         $client = $this->requireClient();
         $sub = FilterAPI::buildSubscriptionData($mq->topic, $subExpression);
-        // block=true：suspend=True 让 broker 挂起到有消息；超时用 consumerTimeoutMillisWhenSuspend。
+        // block=true: suspend=True makes the broker hang until messages arrive; timeout uses consumerTimeoutMillisWhenSuspend.
         $sysFlag = PullSysFlag::buildSysFlag(false, true, true, false);
         $key = self::mqKey($mq);
         $result = $client->pullMessage(
@@ -505,7 +515,7 @@ final class DefaultMQPullConsumer
         return $result;
     }
 
-    // ---------------- Offset 管理 ----------------
+    // ---------------- Offset management ----------------
 
     public function fetchConsumeOffset(MessageQueue $mq): ?int
     {
@@ -552,7 +562,7 @@ final class DefaultMQPullConsumer
     public function sendMessageBack(MessageExt $msg, int $delayLevel): void
     {
         $client = $this->requireClient();
-        // 从节点不接 CONSUMER_SEND_MSG_BACK（master 专属），所以这里只认 brokerId=0
+        // Slaves do not accept CONSUMER_SEND_MSG_BACK (master only), so only brokerId=0 counts here.
         $addr = $client->findBrokerAddressInPublish($msg->brokerName ?? '');
         if ($addr === null || $addr === '') {
             throw new MQClientException('Broker[' . ($msg->brokerName ?? '') . '] master node does not exist');
@@ -591,13 +601,14 @@ final class DefaultLitePullConsumer
     public ?string $clientId = null;
     public ?string $unitName = null;
     public bool $unitMode = false;
-    /** 轻量拉取消费者把 ``enableStreamRequestType`` 固定初值为 true（它参与 clientId 拼装）。 */
+    /** The lite-pull consumer fixes the initial value of ``enableStreamRequestType`` to true (it takes part in clientId assembly). */
     public bool $enableStreamRequestType = true;
     /**
-     * 5.x 新命名空间：非空时**每笔**请求带
-     * `nsd=true` / `ns=<该值>` 两个扩展头，由 broker 解析到对应 serverless 实例。
-     * 与上面那个 `namespace`（客户端给 topic/group 拼 `namespace%` 前缀）是两套机制，
-     * 这里**不**改任何资源名。见 NamespaceRpcHook。
+     * 5.x new namespace: when non-empty, **every** request carries
+     * the two extension headers `nsd=true` / `ns=<value>`, which the broker resolves to the
+     * corresponding serverless instance. It is a separate mechanism from the `namespace`
+     * above (client-side `namespace%` prefix for topic/group), and here **no** resource name
+     * is modified. See NamespaceRpcHook.
      */
     public string $namespaceV2 = '';
     public string $messageModel = MessageModel::CLUSTERING;
@@ -605,26 +616,26 @@ final class DefaultLitePullConsumer
     public array $nameServerAddrs = [];
     public mixed $rpcHook = null;
     public ?bool $tlsEnable = null;
-    /** TLS 细项（caCert/clientCert/clientKey/serverName），语义见 RemotingClient::$tlsOptions。 */
+    /** TLS details (caCert/clientCert/clientKey/serverName), semantics in RemotingClient::$tlsOptions. */
     public ?array $tlsOptions = null;
     public ?SocksProxyConfig $socksProxy = null;
 
-    /** subscribe 模式的订阅表（topic => sub_expression）。 */
+    /** Subscription table in subscribe mode (topic => sub_expression). */
     public array $subscription = [];
     /** @var array<string,SubscriptionData> */
     public array $subscriptionData = [];
-    /** assign 模式下指定 topic 的 tag 过滤表达式。 */
+    /** Tag filter expression for the specified topic in assign mode. */
     private array $assignSubExpr = [];
     private bool $assignMode = false;
-    /** @var array<string,MessageQueue> 已分配队列（key = mqKey） */
+    /** @var array<string,MessageQueue> Assigned queues (key = mqKey) */
     private array $assigned = [];
 
-    /** rebalance 算法（subscribe 模式）。 */
+    /** Rebalance algorithm (subscribe mode). */
     public AllocateMessageQueueStrategy $allocateMessageQueueStrategy;
 
-    // 拉取 / poll 配置
+    // Pull / poll configuration
     public string $consumeFromWhere = ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET;
-    /** CONSUME_FROM_TIMESTAMP 的起点（格式 yyyyMMddHHmmss），默认 30 分钟前。 */
+    /** Start point of CONSUME_FROM_TIMESTAMP (format yyyyMMddHHmmss), 30 minutes ago by default. */
     public string $consumeTimestamp;
     public int $pullBatchSize = 32;
     public int $pollTimeoutMillis = 5000;
@@ -633,18 +644,18 @@ final class DefaultLitePullConsumer
     public int $autoCommitIntervalMillis = 5000;
     public int $consumerTimeoutMillisWhenSuspend = 30000;
     public int $brokerSuspendMaxTimeMillis = 20000;
-    public int $pullIntervalMillis = 50;  // 队尾空轮询时的退避，避免空转打爆 broker
+    public int $pullIntervalMillis = 50;  // Backoff on empty polls at queue tail, avoiding busy loops hammering the broker
 
-    // 运行状态
+    // Runtime state
     public ?MQClientInstance $mqClient = null;
     private bool $started = false;
     private bool $running = false;
 
-    /** @var list<MessageExt> 本地缓冲 */
+    /** @var list<MessageExt> Local buffer */
     private array $localBuffer = [];
-    /** @var array<string,int> 拉取游标（key = mqKey） */
+    /** @var array<string,int> Pull cursor (key = mqKey) */
     private array $nextOffset = [];
-    /** @var array<string,int> 已消费游标（poll 交出去才前进） */
+    /** @var array<string,int> Consume cursor (advances only when poll() hands messages out) */
     private array $consumeOffset = [];
     private array $offsetTable = [];
     /** @var array<string,int> */
@@ -656,18 +667,20 @@ final class DefaultLitePullConsumer
     private float $lastRebalanceTs = 0.0;
     private float $nextHeartbeatAt = 0.0;
     /**
-     * 队列集合变更监听的比对周期（毫秒）。0 或负数夹到 1s 下限 —— 周期为 0 意味着
-     * 每次 tick 都全量查路由，比对照常跑但把 tick 变成 RPC 风暴。
+     * Comparison period of the queue-set change listener (milliseconds). 0 or negative is
+     * clamped to a 1s floor: a period of 0 means querying full routes on every tick, which
+     * runs the comparison as usual but turns tick into an RPC storm.
      */
     public int $topicMetadataCheckIntervalMillis = 30000;
-    /** @var array<string,object|callable> 监听器，键 = 套好命名空间的 topic */
+    /** @var array<string,object|callable> Listeners, key = namespaced topic */
     private array $topicChangeListeners = [];
-    /** @var array<string,array<string,bool>> 上次快照：topic => {mqKey => true} */
+    /** @var array<string,array<string,bool>> Last snapshot: topic => {mqKey => true} */
     private array $messageQueuesForTopic = [];
     /**
-     * 下一趟比对的时刻（秒，microtime 口径）。0 = 还没排期。
-     * start() 排到 now+10s（首查不抢启动路径的 RPC）；公开是为了让单测能把首查提前，
-     * 不必真等 10s。
+     * Time of the next comparison round (seconds, microtime basis). 0 = not scheduled yet.
+     * start() schedules it at now+10s (the first query does not steal RPC from the startup
+     * path); it is public so unit tests can pull the first query forward without really
+     * waiting 10s.
      */
     public float $nextMetadataCheckAt = 0.0;
 
@@ -688,7 +701,7 @@ final class DefaultLitePullConsumer
         $this->allocateMessageQueueStrategy = new AllocateMessageQueueAveragely();
     }
 
-    // ---------------- 命名空间 / 配置 ----------------
+    // ---------------- Namespace / configuration ----------------
 
     private function withNamespace(string $topic): string
     {
@@ -729,9 +742,10 @@ final class DefaultLitePullConsumer
     }
 
     /**
-     * 服务端命名空间（`nsd`/`ns` 扩展头），不改 topic/group 名；
-     * 与 `$namespace` 那个「客户端拼 `namespace%` 前缀」的机制互不相干。
-     * start() 之后改也生效——钩子每笔请求实时读 {@see MQClientInstance::$namespaceV2}。
+     * Server-side namespace (`nsd`/`ns` extension headers), topic/group names unchanged;
+     * unrelated to the mechanism of that `$namespace` ("client prefixes `namespace%`").
+     * Changing it after start() also takes effect, the hook reads
+     * {@see MQClientInstance::$namespaceV2} live on every request.
      */
     public function setNamespaceV2(string $namespaceV2): void
     {
@@ -741,7 +755,7 @@ final class DefaultLitePullConsumer
         }
     }
 
-    /** 读取服务端命名空间（`nsd`/`ns` 扩展头用的那一份）。 */
+    /** Read the server-side namespace (the one used by the `nsd`/`ns` extension headers). */
     public function getNamespaceV2(): string
     {
         return $this->namespaceV2;
@@ -757,14 +771,14 @@ final class DefaultLitePullConsumer
         return $this->socksProxy;
     }
 
-    // ---------------- 订阅 / 分配 ----------------
+    // ---------------- Subscription / allocation ----------------
 
     public function subscribe(string $topic, string $subExpression = '*'): void
     {
         $this->assignMode = false;
         $ns = $this->withNamespace($topic);
         $this->subscription[$ns] = $subExpression;
-        // 同步构建 SubscriptionData，供心跳把 tag 订阅注册给 broker。
+        // Build SubscriptionData synchronously so the heartbeat registers the tag subscription with the broker.
         try {
             $this->subscriptionData[$ns] = FilterAPI::buildSubscriptionData($ns, $subExpression);
         } catch (\Throwable) {
@@ -790,7 +804,7 @@ final class DefaultLitePullConsumer
     }
 
     /**
-     * assign 模式：显式指定队列，不走 rebalance。
+     * assign mode: queues are specified explicitly, no rebalance.
      *
      * @param list<MessageQueue> $messageQueues
      */
@@ -818,7 +832,7 @@ final class DefaultLitePullConsumer
         }
     }
 
-    // ---------------- 生命周期 ----------------
+    // ---------------- Lifecycle ----------------
 
     public function start(): void
     {
@@ -861,7 +875,7 @@ final class DefaultLitePullConsumer
             $this->mqClient->remotingClient->registerRpcHook($this->rpcHook);
         }
         $this->mqClient->start();
-        // assign 模式在 start 时解析初始位点。
+        // assign mode resolves initial offsets at start.
         if ($this->assignMode) {
             foreach (array_keys($this->assigned) as $key) {
                 if (!isset($this->nextOffset[$key])) {
@@ -873,21 +887,23 @@ final class DefaultLitePullConsumer
                 }
             }
         }
-        // 先把 tag 订阅注册给 broker（心跳），再启动拉取。心跳要靠「已知 broker 列表」，
-        // 而该列表只来自 topic 路由表：start 时先把订阅/指派的 topic 拉一遍路由。
+        // Register the tag subscription with the broker (heartbeat) before starting pulling.
+        // The heartbeat relies on the "known broker list", and that list comes only from the
+        // topic route table: pull routes of subscribed/assigned topics once at start.
         $this->refreshRouteForHeartbeat();
         $this->running = true;
         $this->sendHeartbeatToAllBroker();
         $this->nextHeartbeatAt = microtime(true) + 5.0;
-        // 队列集合变更比对：首查排在启动后 10s，不抢启动路径上的 RPC。
+        // Queue-set change comparison: the first query is scheduled 10s after startup, not stealing RPC from the startup path.
         $this->nextMetadataCheckAt = microtime(true) + 10.0;
         $this->started = true;
     }
 
-    /** 为心跳准备 broker 地址：拉取并登记本实例关注的 topic 路由。 */
+    /** Prepare broker addresses for heartbeat: pull and register the topic routes this instance cares about. */
     private function refreshRouteForHeartbeat(): void
     {
-        // ⚠ start() 在 $started=true 之前调用本方法，不能用 requireClient()（死锁）。
+        // WARNING: start() calls this method before $started=true, so requireClient() cannot be
+        // used here (deadlock).
         $client = $this->mqClient;
         if ($client === null) {
             throw new MQClientException('consumer not started, call start() first');
@@ -942,7 +958,7 @@ final class DefaultLitePullConsumer
         return $this->mqClient;
     }
 
-    // ---------------- 心跳（把 tag 订阅注册给 broker）----------------
+    // ---------------- Heartbeat (register the tag subscription with the broker) ----------------
 
     private function buildHeartbeat(): HeartbeatData
     {
@@ -980,7 +996,7 @@ final class DefaultLitePullConsumer
     }
 
     /**
-     * tick 驱动（PHP 适配）：rebalance（1s 节流）+ 全队列短轮询拉取 + 心跳。
+     * tick-driven (PHP adaptation): rebalance (1s throttle) + short-poll pulling of all queues + heartbeat.
      */
     public function tick(?int $nowMillis = null): void
     {
@@ -1027,9 +1043,10 @@ final class DefaultLitePullConsumer
     }
 
     /**
-     * 单队列一次拉取：短轮询；FOUND/NO_NEW_MSG/NO_MATCHED_MSG/
-     * OFFSET_ILLEGAL 都推进拉取游标到 nextBeginOffset；刹车：**在途结果不许盖掉刚 seek /
-     * 刚被撤走的位点**（游标还是不是我发请求时的那个值）。
+     * One pull of a single queue: short polling; FOUND/NO_NEW_MSG/NO_MATCHED_MSG/
+     * OFFSET_ILLEGAL all advance the pull cursor to nextBeginOffset; brake: **in-flight
+     * results must not overwrite just-seeked / just-removed offsets** (is the cursor still
+     * the value it was when the request was sent).
      */
     private function pullOne(MessageQueue $mq): bool
     {
@@ -1040,8 +1057,8 @@ final class DefaultLitePullConsumer
             $this->nextOffset[$key] = $offset;
         }
         $sub = $this->subscriptionFor($mq->topic) ?: '*';
-        // 短轮询（suspend=False）；lite_pull=True 置 FLAG_LITE_PULL_MESSAGE，
-        // 请求码切到 LITE_PULL_MESSAGE(361)。
+        // Short polling (suspend=False); lite_pull=True sets FLAG_LITE_PULL_MESSAGE,
+        // switching the request code to LITE_PULL_MESSAGE(361).
         $sysFlag = PullSysFlag::buildSysFlag(false, false, true, false, true);
         try {
             $result = $this->requireClient()->pullMessage(
@@ -1093,7 +1110,7 @@ final class DefaultLitePullConsumer
         $kept = [];
         foreach ($msgs as $m) {
             $tag = $m->getTags();
-            // ⚠ tagsSet 是 list，不是 map：isset($tagsSet[$tag]) 永远 miss（同 ConsumerSupport）。
+            // WARNING: tagsSet is a list, not a map: isset($tagsSet[$tag]) always misses (same as ConsumerSupport).
             if ($tag !== null && in_array($tag, $subData->tagsSet, true)) {
                 $kept[] = $m;
             }
@@ -1126,11 +1143,12 @@ final class DefaultLitePullConsumer
             return $this->seekOffset[$key];
         }
         if ($this->mqClient === null) {
-            // 允许先 assign 再 start，但**不能**在没问过 broker 的情况下给出 0
-            // —— assign 会把结果存进 nextOffset，起点会被永久钉死在 0。
+            // assign-before-start is allowed, but 0 must **not** be handed out without asking
+            // the broker, as assign stores the result into nextOffset, pinning the start
+            // point at 0 forever.
             throw new MQClientException('The lite pull consumer is not running');
         }
-        // 有已提交位点则沿用（保证重启续消费）
+        // Reuse a committed offset when present (guaranteeing consumption resumes after restart)
         try {
             $off = $this->mqClient->queryConsumerOffset($this->consumerGroup, $mq);
             if ($off !== null) {
@@ -1159,7 +1177,7 @@ final class DefaultLitePullConsumer
         return (int) $dt->format('U') * 1000 + (int) $dt->format('v');
     }
 
-    // ---------------- rebalance（subscribe 模式）----------------
+    // ---------------- rebalance (subscribe mode) ----------------
 
     private function rebalance(): void
     {
@@ -1221,15 +1239,16 @@ final class DefaultLitePullConsumer
                     continue;
                 }
                 $this->persistOffsetByKey($key);
-                // AssignedMessageQueue 的条目一起丢掉：留着 seekOffset 就是让这条队列
-                // 哪天回到本实例时静默跳回用户很久以前手动钉过的位置。
+                // Drop the AssignedMessageQueue entries together: keeping seekOffset would let
+                // this queue silently jump back to a position the user pinned manually long
+                // ago when it someday returns to this instance.
                 unset($this->nextOffset[$key], $this->consumeOffset[$key],
                     $this->offsetTable[$key], $this->seekOffset[$key]);
             }
             if ($this->messageQueueListener !== null) {
                 try {
-                    // MessageQueueListener 接口签名是 (topic, mqAll, mqDivided)；
-                    // lite 的 rebalance 是全体订阅一起算，这里逐 topic 通知。
+                    // The MessageQueueListener interface signature is (topic, mqAll, mqDivided);
+                    // lite's rebalance computes all subscriptions together, so notify per topic here.
                     foreach (array_keys($this->subscription) as $topic) {
                         $this->messageQueueListener->messageQueueChanged(
                             $topic,
@@ -1247,7 +1266,7 @@ final class DefaultLitePullConsumer
         }
     }
 
-    // ---------------- poll / 位点 ----------------
+    // ---------------- poll / offsets ----------------
 
     public function poll(?int $timeout = null): array
     {
@@ -1261,7 +1280,7 @@ final class DefaultLitePullConsumer
             if ($remaining <= 0) {
                 return [];
             }
-            // PHP 适配：Condition.wait → 10ms 粒度有界自旋。
+            // PHP adaptation: Condition.wait -> bounded spin at 10ms granularity.
             usleep(10000);
         }
         $out = [];
@@ -1285,7 +1304,7 @@ final class DefaultLitePullConsumer
         return $out;
     }
 
-    /** seek：三张游标一起拨回去，并丢弃缓冲里低于新位点的旧消息。 */
+    /** seek: dial all three cursors back together and drop buffered messages below the new offset. */
     public function seek(MessageQueue $mq, int $offset): void
     {
         $key = self::mqKey($mq);
@@ -1314,19 +1333,19 @@ final class DefaultLitePullConsumer
         $this->seek($mq, $this->requireClient()->getMaxOffset($mq));
     }
 
-    /** 拉取游标（观测点：真机对拍要看的正是"拉了多少"与"交了多少"这两格的差）。 */
+    /** Pull cursor (observation point: what a real-machine comparison shows is exactly the difference between "pulled" and "handed out"). */
     public function pullCursorOf(MessageQueue $mq): int
     {
         return $this->nextOffset[self::mqKey($mq)] ?? -1;
     }
 
-    /** 已消费游标（``poll()`` 交出去的那一格）。 */
+    /** Consume cursor (the cell ``poll()`` hands out). */
     public function consumeCursorOf(MessageQueue $mq): int
     {
         return $this->consumeOffset[self::mqKey($mq)] ?? -1;
     }
 
-    /** 内存位点表里那一格（``persist=False`` 提交但还没落盘的值就在这）。 */
+    /** The cell in the in-memory offset table (where ``persist=False`` committed-but-not-yet-flushed values live). */
     public function pendingCommitOf(MessageQueue $mq): int
     {
         return $this->offsetTable[self::mqKey($mq)] ?? -1;
@@ -1457,14 +1476,18 @@ final class DefaultLitePullConsumer
     }
 
     /**
-     * 按**已套命名空间**的 topic 名列队列。队列变更监听内部走这一层：它持有的键
-     * 本来就是套好的，再套一次只会得到 ns%ns%topic 的查不到的名字。
+     * List queues by **already namespaced** topic. The queue change listener goes through this
+     * layer internally: the key it holds is namespaced already, and namespacing it again only
+     * yields an ns%ns%topic name that cannot be found.
      *
-     * 两件事必须一起做对，否则队列变更监听静默失真：
-     * 1. **每轮现问 name server**，不吃周期刷新的路由缓存；少了这一步，扩容最快也要等
-     *    一次路由轮询才看得见（监听回调比预期慢一个周期）。
-     * 2. 空队列集是**抛异常**，不是返回空表 —— "查不到" ≠ "这个 topic 缩到 0 队列"，
-     *    后者会让监听器收到一次假缩容回调并把快照刷成空集。
+     * Two things must be done right together, otherwise the queue change listener silently
+     * distorts:
+     * 1. **Ask the name server fresh every round**, never eating the periodically refreshed
+     *    route cache; without this step, scaling out becomes visible only after one route
+     *    polling round at the earliest (listener callbacks lag one period behind expectation).
+     * 2. An empty queue set **throws an exception** rather than returning an empty list:
+     *    "not found" is not the same as "this topic shrank to 0 queues", as the latter would
+     *    give the listener a false scale-down callback and flush the snapshot to empty.
      *
      * @return list<MessageQueue>
      */
@@ -1474,7 +1497,8 @@ final class DefaultLitePullConsumer
         try {
             $client->updateTopicRouteInfoFromNameServer($fullTopic);
         } catch (\Throwable $e) {
-            // 抖动时退回当下缓存再判一次（外层会把"仍然没队列"报成一条 warn）。
+            // On jitter, fall back to the current cache and judge once more (the outer layer
+            // reports "still no queues" as one warn).
             Logger::debug("fetch queues: route refresh for $fullTopic failed: " . $e->getMessage());
         }
         $queues = $client->getTopicSubscribeInfo($fullTopic);
@@ -1486,7 +1510,7 @@ final class DefaultLitePullConsumer
         return $queues;
     }
 
-    // ---------------- topic 队列集合变更监听 ----------------
+    // ---------------- Topic queue-set change listener ----------------
 
     public function setTopicMetadataCheckIntervalMillis(int $millis): void
     {
@@ -1499,18 +1523,21 @@ final class DefaultLitePullConsumer
     }
 
     /**
-     * 登记一个 topic 的队列集合变更监听：tick 按 topicMetadataCheckIntervalMillis 的
-     * 周期拉取该 topic 的订阅队列集合，与上一次快照做**集合**比对，只有真的变了才回调。
+     * Register a queue-set change listener for a topic: tick pulls the topic's subscribed queue
+     * set on the topicMetadataCheckIntervalMillis period and does a **set** comparison against
+     * the last snapshot, calling back only when it really changed.
      *
-     * 监听器可以是有 `onChanged(string $topic, array $mqs)` 方法的对象，也可以是
-     * 接收同样两个参数的可调用值。
+     * The listener can be an object with an `onChanged(string $topic, array $mqs)` method, or a
+     * callable taking the same two arguments.
      *
-     * 口径：
-     * * topic 为空或监听器为 null → 抛 MQClientException('Topic or listener is null')；
-     * * 重复注册同一 topic → 覆盖旧监听器并 warn 一条；
-     * * 键取套好命名空间的 topic，回调收到的第一个参数也是它；
-     * * 运行中注册立刻记一版快照，否则下一轮会把"当前集合"当成变化误报一次；
-     *   未启动时没法查队列，就不记快照，由启动后的第一趟补上初始状态。
+     * Policy:
+     * * empty topic or null listener -> throw MQClientException('Topic or listener is null');
+     * * registering the same topic twice -> overwrite the old listener and warn once;
+     * * the key is the namespaced topic, and the callback's first argument is it too;
+     * * registering while running records a snapshot immediately, otherwise the next round
+     *   would report the "current set" as a change once; when not started queues cannot be
+     *   queried, so no snapshot is recorded, and the first round after startup fills in the
+     *   initial state.
      */
     public function registerTopicMessageQueueChangeListener(string $topic, mixed $listener): void
     {
@@ -1536,11 +1563,13 @@ final class DefaultLitePullConsumer
     }
 
     /**
-     * 跑一轮比对（tick 调它，调用方与单测也可以直接驱动），返回这一轮回调了几次。
+     * Run one comparison round (tick calls it; callers and unit tests can drive it directly),
+     * returning how many callbacks fired this round.
      *
-     * ⚠ 有意做法：单个 topic 失败只记日志、跳过它自己，同轮其余 topic 照常比对。
-     * 一个长期查不到路由的 topic 不该把排在它后面的监听器永久饿死；下一轮照常，
-     * 两种写法都不打断调度。
+     * WARNING - intentional: a single topic failing only logs and skips itself, while other
+     * topics in the same round compare as usual. A topic that long cannot find a route should
+     * not starve the listeners queued behind it forever; the next round proceeds normally,
+     * and neither writing interrupts scheduling.
      */
     public function fetchTopicMessageQueuesAndCompare(): int
     {
@@ -1554,8 +1583,9 @@ final class DefaultLitePullConsumer
             }
             $current = self::queueKeySet($queues);
             $snapshot = $this->messageQueuesForTopic[$key] ?? null;
-            // 没有快照 ⇒ 视作变化：查队列永远回一个非空集合，所以第一趟必然把当前
-            // 状态交给调用方，之后只报增量。
+            // No snapshot => treat as change: querying queues always returns a non-empty set,
+            // so the first round necessarily hands the current state to the caller, and only
+            // increments are reported afterwards.
             if ($snapshot !== null && self::sameKeySet($snapshot, $current)) {
                 continue;
             }
@@ -1577,7 +1607,7 @@ final class DefaultLitePullConsumer
     }
 
     /**
-     * 集合相等：数量一致且每个成员都在对方里（顺序无关）。
+     * Sets are equal: same count and every member is in the other (order irrelevant).
      *
      * @param array<string,bool> $old
      * @param array<string,bool> $new
@@ -1604,7 +1634,8 @@ final class DefaultLitePullConsumer
             }
             Logger::warning("Topic queue change listener for $topic is not callable");
         } catch (\Throwable $e) {
-            // 回调是调用方的代码：它抛了不能把比对线程带下去，也不能吞得无声无息。
+            // The callback is the caller's code: its throw must not take the comparison
+            // thread down, nor be swallowed silently.
             Logger::error("Topic queue change listener for $topic threw: " . $e->getMessage());
         }
     }
@@ -1636,7 +1667,7 @@ final class DefaultLitePullConsumer
     }
 }
 
-/** 便捷监听器包装：把消费逻辑转成纯函数。 */
+/** Convenient listener wrapper: turning consume logic into a pure function. */
 final class SimpleMessageListener implements MessageListenerConcurrently
 {
     /** @var callable(list<MessageExt>): ConsumeConcurrentlyStatus */

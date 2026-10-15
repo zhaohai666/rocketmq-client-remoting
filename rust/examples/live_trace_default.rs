@@ -1,12 +1,12 @@
-//! 验证 Rust 轨迹默认自建 producer 真的把轨迹发到了 RMQ_SYS_TRACE_TOPIC。
+//! Verifies that the Rust trace default built-in producer really sends trace data to RMQ_SYS_TRACE_TOPIC.
 //!
-//! 修复前：未注入 `TraceDispatcherConfig::producer` 时兜底
-//! `DisabledTraceProducer`，轨迹链路默认**静默断开**。
-//! 修复后：未注入时自建真实
-//! DefaultMQProducer。本工具发 3 条业务消息后用 admin 查 RMQ_SYS_TRACE_TOPIC
-//! 的 maxOffset，> 0 即轨迹链路真的通了。
+//! Before the fix: when `TraceDispatcherConfig::producer` was not injected, the code fell back to
+//! `DisabledTraceProducer`, and the trace pipeline was **silently disconnected** by default.
+//! After the fix: when not injected, a real
+//! DefaultMQProducer is built. This tool sends 3 business messages, then uses admin to check RMQ_SYS_TRACE_TOPIC
+//! maxOffset; > 0 means the trace pipeline is really connected.
 //!
-//! 用法：cargo run --example live_trace_default -- 127.0.0.1:9876
+//! Usage: cargo run --example live_trace_default -- 127.0.0.1:9876
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -22,7 +22,7 @@ async fn main() -> ExitCode {
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "127.0.0.1:9876".to_string());
 
-    // 业务生产者：打开轨迹（默认自建内部轨迹 producer，无需注入桥接）
+    // Business producer: trace enabled (builds its own internal trace producer by default, no bridge injection needed)
     let cfg = ProducerConfig {
         producer_group: "GID_RsTraceDefault".to_string(),
         enable_trace: true,
@@ -55,7 +55,7 @@ async fn main() -> ExitCode {
     }
     println!("sent={sent}/{N}");
 
-    // 轨迹批量上报有窗口期，给一点时间
+    // Trace batch reporting has a window period; give it a little time
     tokio::time::sleep(Duration::from_secs(6)).await;
 
     let admin = DefaultMQAdminExt::new();

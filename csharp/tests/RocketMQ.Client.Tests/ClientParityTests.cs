@@ -1,5 +1,6 @@
-// 2026-10 对齐批次的离线单测：namespaceV2 请求钩子 / VIP channel / 定时消息 setter /
-// ConsumeFromWhere 弃用值 / recall 轨迹钩子 / request 等待槽 TTL 扫描。
+// Offline unit tests of the 2026-10 alignment batch: the namespaceV2 request hook /
+// VIP channel / scheduled message setters / the deprecated ConsumeFromWhere values /
+// the recall trace hook / the request waiting slot TTL scan.
 using System.Reflection;
 using System.Threading;
 using RocketMQ.Client;
@@ -8,7 +9,7 @@ using RocketMQ.Remoting;
 using RocketMQ.Remoting.Protocol;
 using Xunit;
 
-// PropertyMap 是 src 侧的 global using 别名（SortedDictionary<string,string>）。
+// PropertyMap is a global using alias on the src side (SortedDictionary<string,string>).
 using PropertyMap = System.Collections.Generic.SortedDictionary<string, string>;
 
 namespace RocketMQ.Client.Tests;
@@ -17,7 +18,7 @@ public class ClientParityTests
 {
     private const string NsV2 = "MQ_INST_parity";
 
-    /// <summary>只记录自己被调用顺序的探针钩子。</summary>
+    /// <summary>A probe hook that only records the order in which it was called.</summary>
     private sealed class OrderProbeHook : IRpcHook
     {
         private readonly string _name;
@@ -43,7 +44,7 @@ public class ClientParityTests
         }
     }
 
-    // ---------------------------------------------------------------- namespaceV2 钩子
+    // ---------------------------------------------------------------- namespaceV2 hooks
 
     [Fact]
     public void NamespaceRpcHook_AddsNsdAndNs()
@@ -103,13 +104,13 @@ public class ClientParityTests
     {
         var user = new OrderProbeHook("user", new List<string>());
 
-        // 无 ns 无 stream ⇒ 用户钩子原样返回（不套链，零开销）
+        // No ns and no stream => the user hook is returned as is (no chaining, zero overhead)
         Assert.Same(user, RequestHooks.Compose(false, user));
-        // 只有 stream ⇒ 直接给 StreamTypeRPCHook
+        // Stream only => straight to StreamTypeRPCHook
         Assert.IsType<StreamTypeRPCHook>(RequestHooks.Compose(true, null));
-        // 只有 ns ⇒ 直接给 NamespaceRpcHook
+        // ns only => straight to NamespaceRpcHook
         Assert.IsType<NamespaceRpcHook>(RequestHooks.Compose(false, null, () => NsV2));
-        // 都没有 ⇒ null（不注册钩子）
+        // Neither => null (no hook registered)
         Assert.Null(RequestHooks.Compose(false, null));
     }
 
@@ -124,7 +125,7 @@ public class ClientParityTests
         hook.DoBeforeRequest("a", bare);
         Assert.False(bare.ExtFields.ContainsKey(MixAll.RpcNamespaceField));
 
-        // Start() 之后才配命名空间：钩子还挂在实例上，下一笔请求就带上 ns/nsd
+        // A namespace configured after Start(): the hook is still hung on the instance, so the very next request carries ns/nsd
         current = NsV2;
         var late = RemotingCommand.CreateRequestCommand(RequestCode.SendMessage, null);
         hook.DoBeforeRequest("a", late);
@@ -135,8 +136,9 @@ public class ClientParityTests
     [Fact]
     public void AclSignature_CoversNamespaceAndStreamFields()
     {
-        // 顺序错了（ACL 先算签名）就会签出一份「不含 nsd/ReqT」的内容，
-        // 与真正上线的 ExtFields 不一致 → 开鉴权的 broker 验签失败。
+        // If the order were wrong (ACL signing first), it would sign content without nsd/ReqT,
+        // which does not match the ExtFields that really go on the wire -> signature
+        // verification fails on a broker with auth enabled.
         var credentials = new SessionCredentials("AK", "SK");
         var hook = RequestHooks.Compose(true, new AclClientRPCHook(credentials), () => NsV2)!;
 
@@ -147,7 +149,7 @@ public class ClientParityTests
         Assert.Equal(NsV2, withNs.ExtFields[MixAll.RpcNamespaceField]);
         Assert.Equal("0", withNs.ExtFields[MixAll.ReqT]);
 
-        // 同一个请求换个命名空间 ⇒ 签名必须变（说明 ns 进了签名内容）
+        // The same request under a different namespace => the signature must change (showing that ns is part of the signed content)
         var otherNs = RequestHooks.Compose(true, new AclClientRPCHook(credentials), () => NsV2 + "_2")!;
         var other = RemotingCommand.CreateRequestCommand(RequestCode.SendMessage, null);
         other.Body = withNs.Body;
@@ -190,7 +192,7 @@ public class ClientParityTests
         Assert.Equal(string.Empty, p.NamespaceV2);
     }
 
-    // ---------------------------------------------------------------- 定时消息 setter
+    // ---------------------------------------------------------------- Scheduled message setters
 
     [Fact]
     public void TimerSetters_WriteLegacyPropertyNames()
@@ -220,7 +222,7 @@ public class ClientParityTests
         Assert.ThrowsAny<FormatException>(() => m.GetDelayTimeSec());
     }
 
-    // ---------------------------------------------------------------- ConsumeFromWhere 弃用值
+    // ---------------------------------------------------------------- Deprecated ConsumeFromWhere values
 
     [Theory]
     [InlineData(ConsumeFromWhere.ConsumeFromLastOffsetAndFromMinWhenBootFirst,
@@ -238,14 +240,14 @@ public class ClientParityTests
     [Fact]
     public void ConsumeFromWhere_DeprecatedStringsMatchLegacy()
     {
-        // 心跳里上报的是字面字符串，配置文件里还留着这些历史值，拼错就是换了一个枚举
+        // What is reported in the heartbeat is the literal string and these historic values are still in config files, so a typo means a different enum
         Assert.Equal("CONSUME_FROM_LAST_OFFSET_AND_FROM_MIN_WHEN_BOOT_FIRST",
             ConsumeFromWhere.ConsumeFromLastOffsetAndFromMinWhenBootFirst);
         Assert.Equal("CONSUME_FROM_MIN_OFFSET", ConsumeFromWhere.ConsumeFromMinOffset);
         Assert.Equal("CONSUME_FROM_MAX_OFFSET", ConsumeFromWhere.ConsumeFromMaxOffset);
     }
 
-    // ---------------------------------------------------------------- recall 轨迹钩子
+    // ---------------------------------------------------------------- Recall trace hook
 
     private const string RecallTopic = NsV2 + "%TopicRecall";
     private const string RecallGroup = NsV2 + "%GID_Recall";
@@ -261,8 +263,7 @@ public class ClientParityTests
             Bname = "broker-a",
         };
         var cmd = RemotingCommand.CreateRequestCommand(RequestCode.RecallMessage, header);
-        // 真实发送链在上线前会把 customHeader 摊进 ExtFields（编码时 MakeCustomHeaderToNet），
-        // 钩子读的是摊平后的字段，所以测试同样要先摊平。
+        // The real send chain spreads customHeader into ExtFields before going on the wire (MakeCustomHeaderToNet while encoding), and the hook reads the spread fields, so the test has to spread them too.
         cmd.MakeCustomHeaderToNet();
         return cmd;
     }
@@ -309,11 +310,11 @@ public class ClientParityTests
         TraceContext ctx = Assert.Single(contexts);
         Assert.Equal(RocketMQ.Client.TraceType.Recall, ctx.TraceType);
         Assert.Equal("DefaultRegion", ctx.RegionId);
-        Assert.Equal("GID_Recall", ctx.GroupName); // 命名空间前缀剥掉
+        Assert.Equal("GID_Recall", ctx.GroupName); // the namespace prefix is stripped
         Assert.True(ctx.IsSuccess);
         TraceBean bean = Assert.Single(ctx.TraceBeans);
         Assert.Equal("TopicRecall", bean.Topic);
-        Assert.Equal(UniqKey, bean.MsgId); // msgId 来自句柄，不是响应体
+        Assert.Equal(UniqKey, bean.MsgId); // the msgId comes from the handle, not the response body
     }
 
     [Fact]
@@ -331,9 +332,9 @@ public class ClientParityTests
     }
 
     [Theory]
-    [InlineData(false, true, true, "开关默认关（配置项缺省 false）")]
-    [InlineData(true, false, true, "响应为 null")]
-    [InlineData(true, true, false, "响应没带 MSG_REGION")]
+    [InlineData(false, true, true, "the switch is off by default (the config item defaults to false)")]
+    [InlineData(true, false, true, "the response is null")]
+    [InlineData(true, true, false, "the response carries no MSG_REGION")]
     public void RecallTraceHook_ThreeGatesAllMustPass(bool enabled, bool hasResponse, bool hasRegion, string why)
     {
         _ = why;
@@ -370,7 +371,7 @@ public class ClientParityTests
         Assert.Empty(Drain(dispatcher));
     }
 
-    // ---------------------------------------------------------------- request 等待槽 TTL 扫描
+    // ---------------------------------------------------------------- request waiting slot TTL scan
 
     private sealed class RecordingCallback : RequestCallback
     {
@@ -400,7 +401,7 @@ public class ClientParityTests
         Assert.Equal(ClientErrorCode.RequestTimeoutException,
             Assert.IsAssignableFrom<MQClientException>(cb.Error).ResponseCode);
 
-        // 再扫一次：表里已经没有了，回调也不会第二次触发
+        // Scan once more: it is gone from the table and the callback does not fire a second time
         Assert.Empty(holder.ScanExpiredRequest());
         Assert.Equal(0, cb.SuccessCount);
     }
@@ -419,7 +420,7 @@ public class ClientParityTests
     [Fact]
     public void ScanExpiredRequest_AnsweredAfterSweep_CallbackFiresOnce()
     {
-        // 「谁摘到谁负责」：扫描先摘走 ⇒ 后到的应答拿到 null，用户回调仍然只有一次
+        // "Whoever picks it up owns it": the scan picks it up first => the later response gets null, and the user callback still fires only once
         var holder = new RequestFutureHolder();
         var cb = new RecordingCallback();
         var future = new RequestResponseFuture("corr-race", 1, cb);
@@ -428,7 +429,7 @@ public class ClientParityTests
 
         Assert.Single(holder.ScanExpiredRequest());
         Assert.Null(holder.PutResponse("corr-race", new Message("T", System.Text.Encoding.UTF8.GetBytes("late"))));
-        // 回调走的是超时分支，且只有这一次
+        // The callback takes the timeout branch, and only that once
         Assert.IsType<RequestTimeoutException>(cb.Error);
         Assert.Equal(0, cb.SuccessCount);
     }
@@ -449,25 +450,29 @@ public class ClientParityTests
     [Fact]
     public void ScheduledTask_RefCountsProducersAndIsSafeToToggle()
     {
-        // 扫描线程是进程级单例 + producer 引用计数：起两次停一次不能把还在用的 producer 饿死，
-        // 全部退场后必须真的停（否则测试进程挂着后台线程）。
+        // The scan thread is a process-wide singleton plus a producer reference count:
+        // starting twice and stopping once must not starve a producer that is still in
+        // use, and after everyone has left it must really stop (otherwise the test process
+        // keeps a background thread alive).
         var holder = new RequestFutureHolder();
         var p1 = new object();
         var p2 = new object();
         holder.StartScheduledTask(p1);
-        holder.StartScheduledTask(p1); // 同一实例重复计入不算两个
+        holder.StartScheduledTask(p1); // the same instance counted twice is not two
         holder.StartScheduledTask(p2);
         holder.ShutdownScheduledTask(p1);
 
         var future = new RequestResponseFuture("corr-thread", 1, null);
         holder.PutRequest("corr-thread", future);
         Thread.Sleep(30);
-        // p2 仍存活 ⇒ 扫描线程还在跑。到期条目必须由「手动扫」或「后台线程」之一摘掉，
-        // 两者都算通过（这里断言的是引用计数没把线程停掉，而不是谁摘的）。
+        // p2 is still alive => the scan thread is still running. The expired entry must be
+        // picked up by either the "manual scan" or the "background thread"; both count as
+        // passing (what is asserted here is that the reference count did not stop the
+        // thread, not who picked it up).
         holder.ScanExpiredRequest();
         Assert.Null(holder.GetRequest("corr-thread"));
 
         holder.ShutdownScheduledTask(p2);
-        holder.ShutdownScheduledTask(p2); // 重复停无害
+        holder.ShutdownScheduledTask(p2); // a repeated stop is harmless
     }
 }

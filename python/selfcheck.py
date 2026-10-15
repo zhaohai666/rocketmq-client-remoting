@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
-"""协议自检（selfcheck）：无集群环境下的协议编解码回环验证。
+"""Protocol selfcheck (selfcheck): round-trip verification of the protocol codec without a cluster.
 
-覆盖：
-  1. RemotingCommand JSON 序列化回环（code/remark/extFields/body）
-  2. RemotingCommand ROCKETMQ 二进制序列化回环（含 ext_fields map）
-  3. custom_header -> ext_fields -> decode_command_custom_header 字段映射
-  4. 消息 17 段编码 -> decode_messages 回环（普通 topic 与超长 topic V2 魔数）
-  5. AclRPCHook 签名注入与校验字段存在
+Coverage:
+  1. RemotingCommand JSON serialization round-trip (code/remark/extFields/body)
+  2. RemotingCommand ROCKETMQ binary serialization round-trip (including the ext_fields map)
+  3. custom_header -> ext_fields -> decode_command_custom_header field mapping
+  4. The 17-segment message encoding -> decode_messages round-trip (a normal topic and the
+     V2 magic number of an over-long topic)
+  5. AclRPCHook signature injection and the presence of the verification fields
 """
 from __future__ import annotations
 
@@ -22,7 +23,7 @@ from remoting.protocol.remoting_command import RemotingCommand, SerializeType
 
 
 def build_v2_frame(topic: str, body: bytes, properties_bytes: bytes) -> bytes:
-    """手工构造 V2 魔数（topic 长度 2 字节）的 17 段帧，模拟 broker 写入超长 topic 的场景。"""
+    """Hand-build a 17-segment frame with the V2 magic number (a 2-byte topic length), simulating the scenario where the broker writes an over-long topic."""
     topic_bytes = topic.encode("utf-8")
     store_size = (4 + 4 + 4 + 4 + 4 + 8 + 8 + 4 + 8 + 8 + 8 + 8 + 4 + 8
                   + 4 + len(body) + 2 + len(topic_bytes) + 2 + len(properties_bytes))
@@ -59,7 +60,7 @@ def _check(name: str, cond: bool, detail: str = "") -> bool:
 def run_selfcheck() -> int:
     results = []
 
-    # 1) JSON 回环
+    # 1) JSON round-trip
     cmd = RemotingCommand.create_request_command(105)  # GET_ROUTEINFO_BY_TOPIC
     cmd.remark = "hello \u4e2d\u6587"
     cmd.ext_fields["topic"] = "TopicTest"
@@ -73,7 +74,7 @@ def run_selfcheck() -> int:
                           and dec.ext_fields == cmd.ext_fields and dec.opaque == cmd.opaque,
                           "code=%s remark=%s body=%s ext=%s" % (dec.code, dec.remark, dec.body, dec.ext_fields)))
 
-    # 2) ROCKETMQ 二进制回环（强制该命令用 ROCKETMQ 序列化）
+    # 2) ROCKETMQ binary round-trip (force this command to use ROCKETMQ serialization)
     cmd2 = RemotingCommand.create_request_command(105)
     cmd2.remark = "binary \u5b57\u6bb5"
     cmd2.ext_fields["topic"] = "TopicTest"
@@ -89,7 +90,7 @@ def run_selfcheck() -> int:
                           "code=%s remark=%s ext=%s stype=%s" % (dec2.code, dec2.remark, dec2.ext_fields,
                                                                  dec2.serialize_type_current_rpc)))
 
-    # 3) custom_header 序列化 + 反 decode 映射（V2 短字段）
+    # 3) custom_header serialization + the reverse decode mapping (V2 short fields)
     hdr = SendMessageRequestHeaderV2()
     hdr.producer_group = "PG_1"
     hdr.topic = "TopicTest"
@@ -115,7 +116,7 @@ def run_selfcheck() -> int:
                           "producerGroup=%s queueId=%s bornTs=%s" % (h2.producer_group, h2.queue_id,
                                                                       h2.born_timestamp)))
 
-    # 4) 消息 17 段回环（MessageExt -> encode -> decode）
+    # 4) The 17-segment message round-trip (MessageExt -> encode -> decode)
     ext = MessageExt()
     ext.set_topic("TopicTest")
     ext.set_body(b"hello rocketmq \xe4\xb8\xad\xe6\x96\x87")
@@ -153,7 +154,7 @@ def run_selfcheck() -> int:
     results.append(_check("message 17-seg round-trip", ok,
                           "len=%d got=%s" % (len(exts), exts[0].get_msg_id() if exts else None)))
 
-    # 5) V2 魔数超长 topic（>127 字符）解码：手工构造 broker 侧 V2 帧
+    # 5) Decoding an over-long topic (>127 characters) with the V2 magic number: hand-build the broker-side V2 frame
     long_topic = "TopicTestLong" + "x" * 130
     raw2 = build_v2_frame(long_topic, b"batch-body", string2bytes("TAGS\x01TagB\x02"))
     exts2 = decode_messages(raw2, read_body=True)
@@ -163,7 +164,7 @@ def run_selfcheck() -> int:
                           and exts2[0].get_properties().get("TAGS") == "TagB",
                           "topic_len=%d got=%s" % (len(long_topic), exts2[0].get_topic() if exts2 else None)))
 
-    # 5.1) 批量消息（6 段轻量格式）回环
+    # 5.1) The batch message (6-segment lightweight format) round-trip
     batch = MessageBatch.generate_from_list([
         Message(topic="TopicTest", body=b"m1", tags="TagA"),
         Message(topic="TopicTest", body=b"m2", tags="TagA"),
@@ -174,7 +175,7 @@ def run_selfcheck() -> int:
                           and all(m.get_properties().get("TAGS") == "TagA" for m in decoded_batch),
                           "count=%d bodies=%s" % (len(decoded_batch), [m.get_body() for m in decoded_batch])))
 
-    # 6) ACL RPCHook 资源签名注入
+    # 6) ACL RPCHook resource signature injection
     from remoting.rpchook import AclRPCHook, SessionCredentials
     cred = SessionCredentials(access_key="AK", secret_key="SK", security_token="token123")
     hook = AclRPCHook(cred)

@@ -1,6 +1,6 @@
-// 管理端 body 单测：
-// fastjson2 非法 JSON 容错（MessageQueue 内联对象键、NaN/Infinity、裸数字键）、
-// properties 文本往返、DTO 默认值、offsetTable 解析。
+// Admin-side body unit tests:
+// fastjson2 illegal-JSON tolerance (MessageQueue inline object keys, NaN/Infinity, bare
+// numeric keys), properties text round trip, DTO defaults, offsetTable parsing.
 using System.Text;
 using RocketMQ.Common;
 using RocketMQ.Remoting.Protocol;
@@ -11,12 +11,12 @@ namespace RocketMQ.Client.Tests;
 
 public class AdminBodyTests
 {
-    // ---------------------------------------------- MessageQueue 内联对象键
+    // ---------------------------------------------- MessageQueue inline object keys
 
     [Fact]
     public void MessageQueueKey_Fastjson2FieldOrder()
     {
-        // 键按字母序：brokerName, queueId, topic
+        // keys in alphabetical order: brokerName, queueId, topic
         var mq = new MessageQueue("MyTopic", "broker-a", 3);
         Assert.Equal("{\"brokerName\":\"broker-a\",\"queueId\":3,\"topic\":\"MyTopic\"}",
             MessageQueueKeys.MessageQueueKey(mq));
@@ -25,8 +25,9 @@ public class AdminBodyTests
     [Fact]
     public void TopicStatsTable_DecodeIllegalJson_InlineObjectKey()
     {
-        // 真实 broker（fastjson2）输出：键是 JSON 对象字面量 → 整体是"非法 JSON"，
-        // 解析器必须容忍"对象作为键"（保留原始文本作键名）。
+        // What a real broker (fastjson2) emits: the key is a JSON object literal -> the
+        // whole thing is "illegal JSON", so the parser must tolerate "an object as a key"
+        // (keeping the raw text as the key name).
         const string json = "{\"offsetTable\":{{\"brokerName\":\"broker-a\",\"queueId\":3,\"topic\":\"MyTopic\"}:" +
                             "{\"maxOffset\":88,\"minOffset\":0,\"lastUpdateTimestamp\":1700000000000}}," +
                             "\"topicPutTps\":0.0}";
@@ -76,7 +77,7 @@ public class AdminBodyTests
         Assert.Equal(7, sl.TotalDiff);
         Assert.Equal(2, sl.TotalInflightDiff);
 
-        // 旧键名的 JSON 必须解析不出行，否则会掩盖回归
+        // a JSON with the old key name must fail to parse, otherwise it would mask a regression
         Assert.True(ConsumeStatsList.Decode(
             Encoding.UTF8.GetBytes("{\"statsList\":[{\"G\":[{}]}]}"), out ConsumeStatsList stale));
         Assert.Equal(0, stale.StatsList.Size());
@@ -85,7 +86,7 @@ public class AdminBodyTests
     [Fact]
     public void MessageQueueKey_PlainStringKey_ReturnsFalse()
     {
-        // 普通字符串键（"0"、"G1"）不是内联对象，解析必须返回 false
+        // an ordinary string key ("0", "G1") is not an inline object, parsing must return false
         Assert.False(MessageQueueKeys.ParseMessageQueueKey("0", out _));
         Assert.False(MessageQueueKeys.ParseMessageQueueKey("G1", out _));
         Assert.True(MessageQueueKeys.ParseMessageQueueKey(
@@ -98,7 +99,7 @@ public class AdminBodyTests
     [Fact]
     public void Json_ToleratesNaNAndInfinity()
     {
-        // fastjson2 会输出非法 JSON 的 NaN/-Infinity（Double 值）
+        // fastjson2 emits NaN/-Infinity (Double values), which is illegal JSON
         Assert.True(Json.TryParse("{\"a\":NaN,\"b\":-Infinity,\"c\":Infinity}", out JsonValue v, out _));
         Assert.True(double.IsNaN(v.Get("a").DoubleValue()));
         Assert.True(double.IsNegativeInfinity(v.Get("b").DoubleValue()));
@@ -108,7 +109,7 @@ public class AdminBodyTests
     [Fact]
     public void Json_ToleratesTrailingComma()
     {
-        // fastjson2 某些路径会留尾逗号
+        // certain fastjson2 paths leave a trailing comma
         Assert.True(Json.TryParse("{\"a\":1,}", out JsonValue v, out _));
         Assert.Equal(1, v.Get("a").IntValue());
     }
@@ -129,7 +130,7 @@ public class AdminBodyTests
         Assert.Equal(props, back);
     }
 
-    // ------------------------------------------------------------- 订阅组
+    // ------------------------------------------------------------- Subscription groups
 
     [Fact]
     public void SubscriptionGroupConfig_Defaults_MatchLegacyProbe()
@@ -148,7 +149,7 @@ public class AdminBodyTests
         Assert.Contains("\"retryMaxTimes\":16", json);
         Assert.Contains("\"retryQueueNums\":1", json);
         Assert.Contains("\"whichBrokerWhenConsumeSlowly\":1", json);
-        Assert.DoesNotContain("subscriptionDataSet", json); // fastjson2 跳过 null 字段
+        Assert.DoesNotContain("subscriptionDataSet", json); // fastjson2 skips null fields
     }
 
     // ------------------------------------------------------------- TopicConfig
@@ -170,7 +171,7 @@ public class AdminBodyTests
     [Fact]
     public void ClusterInfo_DecodeRealShape()
     {
-        // 真实 RocketMQ：brokerAddrTable[name] 是 BrokerData 对象
+        // Real RocketMQ: brokerAddrTable[name] is a BrokerData object
         const string json = "{\"brokerAddrTable\":{\"broker-a\":{\"brokerAddrs\":{\"0\":\"127.0.0.1:10911\"}," +
                             "\"brokerName\":\"broker-a\",\"cluster\":\"DefaultCluster\",\"enableActingMaster\":false,\"zoneName\":\"\"}}," +
                             "\"clusterAddrTable\":{\"DefaultCluster\":[\"broker-a\"]}}";

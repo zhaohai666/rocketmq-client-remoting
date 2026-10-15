@@ -19,8 +19,8 @@ def is_logical_queue_mock_broker_name(broker_name: str) -> bool:
 
 
 def get_mock_broker_name(scope: str) -> str:
-    """``getMockBrokerName``：``__global__``（scope 本身）剥掉头两个字符，
-    其余 scope 原样加前缀。"""
+    """``getMockBrokerName``: ``__global__`` (the scope itself) strips its first two characters,
+    other scopes get the prefix added verbatim."""
     if scope == METADATA_SCOPE_GLOBAL:
         return LOGICAL_QUEUE_MOCK_BROKER_PREFIX + scope[2:]
     return LOGICAL_QUEUE_MOCK_BROKER_PREFIX + scope
@@ -36,7 +36,7 @@ class TopicQueueMappingInfo:
         self.total_queues: int = 0
         self.bname: str = ""
         self.epoch: int = 0
-        # globalId -> 物理 queueId。物理 id 不参与端点推导，只保留给排查用。
+        # globalId -> physical queueId. The physical id is not used for endpoint derivation, only kept for troubleshooting.
         self.curr_id_map: Dict[int, int] = {}
 
 
@@ -72,10 +72,10 @@ def parse_topic_queue_mapping_info(raw) -> Optional[TopicQueueMappingInfo]:
 def topic_route_data_2_endpoints_for_static_topic(
     topic: str, route: Optional[TopicRouteData]
 ) -> Optional[Dict[MessageQueue, str]]:
-    """``ClientMetadata.topicRouteData2EndpointsForStaticTopic``：构建逻辑队列集
-    ``MessageQueue(topic, mockBrokerName(scope), globalId) -> 承载它的真实 broker 名``
-    （total 范围内没有承载者的逻辑 id 指向 ``__syslo__none__``）。
-    空映射（非静态主题）返回 ``None``。"""
+    """``ClientMetadata.topicRouteData2EndpointsForStaticTopic``: build the logical queue set
+    ``MessageQueue(topic, mockBrokerName(scope), globalId) -> the real broker name that carries it``
+    (logical ids within total with no carrier point to ``__syslo__none__``).
+    An empty mapping (non-static topic) returns ``None``."""
     if route is None or not route.topic_queue_mapping_by_broker:
         return None
 
@@ -98,15 +98,15 @@ def topic_route_data_2_endpoints_for_static_topic(
         for _, info in ordered:
             if info.epoch >= max_total_num_of_epoch and info.total_queues > max_total_nums:
                 max_total_nums = info.total_queues
-            # 只有 global id（键）形状决定端点集；物理 id 是 broker 内部的。
+            # only the global id (the key) shape determines the endpoint set; the physical id is broker-internal.
             for global_id in info.curr_id_map:
                 mq = MessageQueue(topic, mock_name, global_id)
                 old = mq_end_points.get(mq)
                 if old is None or old.epoch <= info.epoch:
                     mq_end_points[mq] = info
 
-        # 补齐静态逻辑队列：total 之下的每个 id 都存在；没有承载者的指向
-        # NOT_EXIST 哨兵。
+        # pad static logical queues: every id under total exists; those with no carrier point to the
+        # NOT_EXIST sentinel.
         for i in range(max_total_nums):
             mq = MessageQueue(topic, mock_name, i)
             holder = mq_end_points.get(mq)

@@ -34,72 +34,81 @@ use RocketMQ\Remoting\Protocol\ConsumerData;
 use RocketMQ\Client\Exceptions\MQClientException;
 use RocketMQ\Client\Exceptions\MQBrokerException;
 use RocketMQ\Client\Exceptions\RemotingTimeoutException;
-// consumerRunningInfo（307）用 message_queue_key 拼 mqTable/mqPopTable 的键。
-// PHP 的函数调用不带前缀时先查**当前命名空间**，漏掉这行不是"写法不统一"而是
-// 运行到这里直接 Uncaught Error —— 整份运行信息取不出来，控制台/诊断链路全瞎。
+// consumerRunningInfo (307) uses message_queue_key to build the mqTable/mqPopTable keys.
+// Unprefixed PHP function calls look in the **current namespace** first; omitting this line
+// is not "inconsistent style" but an Uncaught Error at runtime - the whole running info
+// becomes unavailable, and the console/diagnostics chain goes blind.
 use function RocketMQ\Remoting\Protocol\message_queue_key;
 
-// 本文件用到的模块级辅助函数随 ConsumerSupport.php 的类一起被 autoload；
-// 为防"只调函数不碰类"的调用次序，这里显式保证文件已加载。
+// The module-level helper functions used by this file are autoloaded together with the
+// ConsumerSupport.php classes; to guard against the "function called without touching the
+// class" ordering, the file is explicitly ensured loaded here.
 if (!function_exists(__NAMESPACE__ . '\\client_side_tag_filter')) {
     require_once __DIR__ . '/ConsumerSupport.php';
 }
 
 /**
- * 推模式消费者（经典 remoting 协议的 push 消费端）。
+ * Push-mode consumer (the push consumption side of the classic remoting protocol).
  *
- * ## PHP 单线程适配（有意偏差，改动前先读）
+ * ## PHP single-thread adaptation (intentional deviation, read before changing)
  *
- * 后台任务共 6 类（心跳 / 重平衡 / 每队列拉取 / 分发 / 位点落盘 / 顺序锁）+ POP 弹取；
- * PHP 无线程，全部收敛为调用方驱动的 ``tick()``：
+ * There are 6 kinds of background tasks (heartbeat / rebalance / per-queue pull / dispatch /
+ * offset persistence / orderly lock) plus POP popping; PHP has no threads, so all converge
+ * into the caller-driven ``tick()``:
  *
- * - **心跳 / 重平衡 / 位点落盘 / 顺序锁 / 过期清扫**：改为 tick 内的到点检查
- *   （周期 30s / 20s / 10s+persistConsumerOffsetInterval / 20s / consumeTimeout 分钟）；
- * - **拉取循环**：每队列一个长轮询循环（suspend=true）在多线程模型里各跑各的；PHP 单线程下
- *   长轮询会饿死其它队列，改为**短轮询**（suspend=false）+ 空结果空闲退避
- *   ``pullIntervalMillis``（默认 1000ms）。语义代价：空队列的位点修正
- *   （correctTagsOffset）从 ~15s 一次变 ~1s 一次，只会更勤不会更懒；
- *   吞吐代价：单队列单次 tick 至多 ``maxPullsPerQueuePerTick`` 轮短轮询；
- * - **消费**：分发即同步消费；PHP 在 tick 内分发同样同步执行，
- *   顺序消费的"挂起重试"从 sleep 改为 ``suspendedUntil`` 表（tick 到点前跳过该队列）；
- * - **POP**：同上，pollTime=0 短轮询 + 空闲退避；消费批次内联执行（不再建
- *   ConsumeExecutor —— 单线程下"真实并发度==core"没有意义，保留声明值可观测）。
+ * - **Heartbeat / rebalance / offset persistence / orderly lock / expiry sweep**: changed to
+ *   due-time checks inside tick
+ *   (periods 30s / 20s / 10s+persistConsumerOffsetInterval / 20s / consumeTimeout minutes);
+ * - **Pull loop**: each queue had its own long-polling loop (suspend=true) running
+ *   independently in the multi-threaded model; under PHP single-thread, long polling would
+ *   starve the other queues, so it becomes **short polling** (suspend=false) plus idle
+ *   backoff ``pullIntervalMillis`` on empty results (1000ms by default). Semantic cost:
+ *   offset correction of empty queues (correctTagsOffset) goes from ~once per 15s to ~once
+ *   per 1s, only more frequent never lazier; throughput cost: at most
+ *   ``maxPullsPerQueuePerTick`` short-poll rounds per queue per single tick;
+ * - **Consumption**: dispatch means synchronous consumption; PHP dispatches synchronously
+ *   inside tick as well, and orderly consumption's "suspend retry" changes from sleep to the
+ *   ``suspendedUntil`` table (the queue is skipped until tick reaches the due time);
+ * - **POP**: same as above, pollTime=0 short polling plus idle backoff; consume batches run
+ *   inline (no ConsumeExecutor is built, as "real concurrency == core" is meaningless under a
+ *   single thread, while the declared value stays observable).
  */
 final class DefaultMQPushConsumer
 {
-    // ---------------- POP 模式（5.x 轻量消费）配置 ----------------
+    // ---------------- POP mode (5.x lite consumption) configuration ----------------
 
     public string $consumerGroup;
     public ?bool $tlsEnable = null;
-    /** TLS 细项（caCert/clientCert/clientKey/serverName），语义见 RemotingClient::$tlsOptions。 */
+    /** TLS details (caCert/clientCert/clientKey/serverName), semantics in RemotingClient::$tlsOptions. */
     public ?array $tlsOptions = null;
     public ?SocksProxyConfig $socksProxy = null;
     public string $namespace = '';
     public string $instanceName = MixAll::DEFAULT_INSTANCE_NAME;
     public ?string $clientId = null;
-    /** unitName/unitMode/enableStreamRequestType：单元化与流式请求开关，前者参与 clientId 构造、unitMode 进心跳与订阅过滤。 */
+    /** unitName/unitMode/enableStreamRequestType: unitization and streaming request switches; the former takes part in clientId construction, and unitMode enters heartbeat and subscription filtering. */
     public ?string $unitName = null;
     public bool $unitMode = false;
     public bool $enableStreamRequestType = false;
     /**
-     * 5.x 新命名空间（namespaceV2）：非空时**每笔**请求带
-     * `nsd=true` / `ns=<该值>` 两个扩展头，由 broker 解析到对应 serverless 实例。
-     * 与上面那个 `namespace`（客户端给 topic/group 拼 `namespace%` 前缀）是两套机制，
-     * 这里**不**改任何资源名。见 NamespaceRpcHook。
+     * 5.x new namespace (namespaceV2): when non-empty, **every** request carries
+     * the two extension headers `nsd=true` / `ns=<value>`, which the broker resolves to the
+     * corresponding serverless instance. It is a separate mechanism from the `namespace`
+     * above (client-side `namespace%` prefix for topic/group), and here **no** resource name
+     * is modified. See NamespaceRpcHook.
      */
     public string $namespaceV2 = '';
     /** @var 'CLUSTERING'|'BROADCASTING' */
     public string $messageModel = MessageModel::CLUSTERING;
     public string $consumeFromWhere = ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET;
-    /** CONSUME_FROM_TIMESTAMP 的起点（格式 yyyyMMddHHmmss），默认 30 分钟前。 */
+    /** Start point of CONSUME_FROM_TIMESTAMP (format yyyyMMddHHmmss), 30 minutes ago by default. */
     public string $consumeTimestamp;
 
-    // ---- 消费并发度（声明值，默认 min=max=20；单线程模型下仅供观测与运行时调整）----
+    // ---- Consume concurrency (declared value, min=max=20 by default; under the single-thread model it is for observation and runtime adjustment only) ----
     public int $consumeThreadMin = 20;
     public int $consumeThreadMax = 20;
     public int $adjustThreadPoolNumsThreshold = 100000;
     private int $corePoolSize;
-    /** msgAccCnt（按队列 key）：最近一次拉取算出的"积压条数"（队列最大位点 − 本批最后一条 queueOffset）。 */
+    /** msgAccCnt (by queue key): the "backlog count" computed by the last pull (queue max offset minus the queueOffset of the batch's last message). */
     /** @var array<string,int> */
     private array $msgAccCntTable = [];
     public int $consumeConcurrentlyMaxSpan = 2000;
@@ -109,14 +118,15 @@ final class DefaultMQPushConsumer
     public int $pullThresholdSizeForTopic = -1;
     public int $pullInterval = 0;
     /**
-     * 拉取 RPC 超时。⚠ 长轮询语义下应给到 30000（挂起预算）；PHP 短轮询下
-     * broker 立即返回，默认压到 5000 —— 卡死的连接不必等 30s。
+     * Pull RPC timeout. WARNING: under long-poll semantics it should be 30000 (suspend budget);
+     * under PHP short polling the broker returns immediately, so the default is lowered to
+     * 5000 - a stuck connection need not wait 30s.
      */
     public int $pullTimeoutMillis = 5000;
     public int $pullIntervalMillis = 1000;
-    /** 单队列单次 tick 内最多短轮询轮数（PHP 适配新增，吞吐旋钮）。 */
+    /** Max short-poll rounds per queue within a single tick (new in the PHP adaptation; throughput knob). */
     public int $maxPullsPerQueuePerTick = 8;
-    /** 长轮询的 suspend 时长（保留字段：随请求头透传，PHP 短轮询下 broker 忽略）。 */
+    /** Suspend duration of long polling (reserved field: passed through with the request header; the broker ignores it under PHP short polling). */
     public int $pullSuspendTimeoutMillis = 20000;
     public int $consumeMessageBatchMaxSize = 1;
     public int $pullBatchSize = 32;
@@ -140,60 +150,60 @@ final class DefaultMQPushConsumer
     private array $msgQueueInflight = [];
     /** @var array<string,list<MessageExt>> */
     private array $inflightMsgs = [];
-    /** @var array<string,int> 拉取游标（nextBeginOffset） */
+    /** @var array<string,int> Pull cursor (nextBeginOffset) */
     private array $offsetTable = [];
     private array $pending = [];
-    /** @var array<string,MessageQueue> 已分配队列注册表 */
+    /** @var array<string,MessageQueue> Assigned queue registry */
     private array $mqMap = [];
-    /** @var array<string,int> 已消费位点（持久化到 broker 的是它） */
+    /** @var array<string,int> Consumed offset (the one persisted to the broker) */
     private array $consumeOffsets = [];
-    /** @var array<string,bool> 被 OFFSET_ILLEGAL 纠错冻结的位点 */
+    /** @var array<string,bool> Offsets frozen by OFFSET_ILLEGAL correction */
     private array $frozenOffsets = [];
-    /** @var array<string,int> 每队列 ProcessQueue 代号（撤销时 +1） */
+    /** @var array<string,int> Per-queue ProcessQueue epoch (+1 on revocation) */
     private array $queueEpoch = [];
-    /** @var array<string,bool> broker LOCK_BATCH_MQ 确认锁定成功的队列（顺序消费） */
+    /** @var array<string,bool> Queues confirmed locked by broker LOCK_BATCH_MQ (orderly consumption) */
     private array $lockOk = [];
     private int $flowControlTriggered = 0;
-    /** @var array<string,float> 每队列最近一次发起拉取/弹出的时刻（秒） */
+    /** @var array<string,float> Last time a pull/pop was initiated per queue (seconds) */
     private array $lastPullTable = [];
     private bool $paused = false;
-    /** @var array<string,int> MessageQueue key → 下一轮拉取应选的 brokerId */
+    /** @var array<string,int> MessageQueue key -> brokerId to pick for the next pull round */
     private array $pullFromWhichNode = [];
-    /** @var array<string,MessageQueue> 当前分给本实例的队列集（key => mq） */
+    /** @var array<string,MessageQueue> Queue set currently assigned to this instance (key => mq) */
     private array $assigned = [];
     private bool $rebalanceNow = false;
-    /** @var array<string,float> 顺序消费挂起重试的到点时刻（秒，PHP 适配） */
+    /** @var array<string,float> Due time of orderly consumption suspend-retry (seconds, PHP adaptation) */
     private array $suspendedUntil = [];
     private float $startTime = 0.0;
 
     public bool $heartbeatEnabled = true;
     public int $heartbeatIntervalMillis = 30000;
-    /** 路由刷新周期（只在 start() 建 MQClientInstance 时透传一次）。 */
+    /** Route refresh period (passed through only once when start() builds the MQClientInstance). */
     public int $pollNameServerInterval = 30000;
     public int $persistConsumerOffsetInterval = 5000;
     private int $heartbeatCount = 0;
 
-    // ---- POP 模式 ----
+    // ---- POP mode ----
     public bool $popMode = false;
     public int $popInvisibleTime = 60000;
     public int $popBatchNums = 32;
     public int $popThresholdForQueue = 96;
     /** @var list<int> */
     public array $popDelayLevel = ConsumerDefaults::POP_DELAY_LEVEL;
-    /** POP 长轮询挂起时长（PHP 短轮询下传 0）。 */
+    /** POP long-poll suspend duration (0 passed under PHP short polling). */
     public int $popPollTimeMillis = 15000;
     public int $popTimeoutMillis = 5000;
     public int $popIntervalMillis = 1000;
     public int $maxPopsPerQueuePerTick = 8;
     public int $popAssignmentIntervalMillis = MQClientInstance::POP_ASSIGNMENT_INTERVAL_MILLIS;
-    /** 向实例注册的分配轮询方（仅 broker 侧分配路径非空；tick 阶段⑦的驱动对象）。 */
+    /** The assignment poller registered with the instance (non-null only on the broker-side assignment path; the driving object of tick stage 7). */
     private ?PopAssignmentPoller $popAssignmentPoller = null;
     /** @var array<string,PopProcessQueue> */
     private array $popQueues = [];
-    /** @var array<string,bool> POP 顺序请求去重集（key = mqKey） */
+    /** @var array<string,bool> POP orderly request dedup set (key = mqKey) */
     private array $popOrderlyRequests = [];
 
-    // ---- 消息轨迹 ----
+    // ---- Message trace ----
     public bool $enableTrace = false;
     public ?string $traceTopic = null;
     public int $traceMsgBatchNum = 10;
@@ -205,13 +215,13 @@ final class DefaultMQPushConsumer
 
     private ?ConsumerStatsManager $statsManager = null;
 
-    // ---- tick 定时器（PHP 适配：原后台线程的到点时刻，秒）----
+    // ---- tick timers (PHP adaptation: due times of the original background threads, seconds) ----
     private float $nextHeartbeatAt = 0.0;
     private float $nextRebalanceAt = 0.0;
     private float $nextPersistAt = 0.0;
     private float $nextLockAt = 0.0;
     private float $nextCleanAt = 0.0;
-    /** PHP 适配：空结果队列的下次可拉时刻（key => 秒） */
+    /** PHP adaptation: next pullable time of empty-result queues (key => seconds) */
     private array $idleUntil = [];
 
     public function __construct(
@@ -232,7 +242,7 @@ final class DefaultMQPushConsumer
         $this->allocateStrategy = new AllocateMessageQueueAveragely();
     }
 
-    // ---------------- 配置 ----------------
+    // ---------------- Configuration ----------------
 
     public function setNamesrvAddr(string $addr): void
     {
@@ -357,7 +367,7 @@ final class DefaultMQPushConsumer
         return array_values($this->subscriptionData);
     }
 
-    // ---------------- 订阅 ----------------
+    // ---------------- Subscription ----------------
 
     public function subscribe(string $topic, string $subExpression = '*'): void
     {
@@ -409,7 +419,7 @@ final class DefaultMQPushConsumer
         return NamespaceUtil::wrapNamespace($this->namespace, $topic);
     }
 
-    // ---------------- 配置数值闸门 ----------------
+    // ---------------- Config value gates ----------------
 
     private function checkConfigRanges(): void
     {
@@ -465,7 +475,7 @@ final class DefaultMQPushConsumer
         }
     }
 
-    /** 解析 consumeTimestamp（解析不了必须硬失败）。 */
+    /** Parse consumeTimestamp (unparseable input must fail hard). */
     public function consumeTimestampMillis(): int
     {
         $ts = $this->consumeTimestamp;
@@ -484,7 +494,7 @@ final class DefaultMQPushConsumer
         return (int) $dt->format('U') * 1000 + (int) $dt->format('v');
     }
 
-    // ---------------- 生命周期 ----------------
+    // ---------------- Lifecycle ----------------
 
     public function start(): void
     {
@@ -536,11 +546,11 @@ final class DefaultMQPushConsumer
             $this->mqClient->remotingClient->registerRpcHook($this->rpcHook);
         }
         $this->mqClient->start();
-        // 动态 name server 回填。
+        // Dynamic name server backfill.
         if ($this->nameServerAddrs === [] && $this->mqClient->nameServerAddrs !== []) {
             $this->nameServerAddrs = array_values($this->mqClient->nameServerAddrs);
         }
-        // 消费统计（实例级共享）。
+        // Consume stats (shared at instance level).
         $this->statsManager = $this->mqClient->consumerStatsManager;
         $this->mqClient->registerConsumer($this->consumerGroup, $this);
         $this->started = true;
@@ -553,7 +563,7 @@ final class DefaultMQPushConsumer
         if ($this->messageModel !== MessageModel::BROADCASTING) {
             $retryTopic = MixAll::getRetryTopic($this->consumerGroup);
             if (!isset($this->subscriptionData[$retryTopic])) {
-                // SUB_ALL 下 tagsSet / codeSet 都为**空**（不是 {"*"}）。
+                // Under SUB_ALL both tagsSet / codeSet are **empty** (not {"*"}).
                 $this->subscriptionData[$retryTopic] = FilterAPI::buildSubscriptionData($retryTopic, '*');
             }
         }
@@ -569,19 +579,22 @@ final class DefaultMQPushConsumer
         } catch (\Throwable $e) {
             Logger::debug('initial heartbeat failed: ' . $e->getMessage());
         }
-        // POP broker 侧分配：先挂上轮询方（实例 tick 阶段⑦的驱动对象），再跑首轮同步分配。
-        // 顺序要紧 —— doRebalance() 在这条路径上就是"跑一轮 QUERY_ASSIGNMENT"，poller 没
-        // 注册就什么都不问。非该路径（默认 clientRebalance=true / 经典 pull）零开销。
+        // POP broker-side assignment: attach the poller first (the driving object of instance
+        // tick stage 7), then run the first synchronous assignment round. Order matters -
+        // doRebalance() on this path just "runs one QUERY_ASSIGNMENT round", and with no
+        // poller registered nothing is asked at all. Other paths (default clientRebalance=true /
+        // classic pull) have zero overhead.
         if ($this->usesBrokerPopAssignment()) {
             $this->registerPopAssignment();
         }
-        // 首轮分配必须同步完成：否则拉取会在空分配集上白转，直到第一轮 rebalance。
+        // The first assignment round must complete synchronously: otherwise pulling spins
+        // pointlessly on an empty assignment set until the first rebalance.
         try {
             $this->doRebalance();
         } catch (\Throwable $e) {
             Logger::warning('initial rebalance failed: ' . $e->getMessage());
         }
-        // 轨迹分发器（消费循环无线程，故最后启动即可）。
+        // Trace dispatcher (the consume loop has no threads, so starting it last is fine).
         $this->startTraceDispatcher();
     }
 
@@ -623,7 +636,7 @@ final class DefaultMQPushConsumer
             $this->mqClient?->unregisterPopAssignmentPoller($this->popAssignmentPoller->key);
             $this->popAssignmentPoller = null;
         }
-        // POP：把所有队列标成 dropped，在途批次不再 ack（交给 broker 复活重投）。
+        // POP: mark all queues as dropped; in-flight batches are no longer acked (left to broker revival redelivery).
         if ($this->popMode) {
             foreach ($this->popQueues as $pq) {
                 $pq->setDropped(true);
@@ -648,7 +661,7 @@ final class DefaultMQPushConsumer
                 Logger::debug('unlock on shutdown failed: ' . $e->getMessage());
             }
         }
-        // 优雅注销：立刻从各 broker 的 ConsumerManager 摘除，不必等心跳超时。
+        // Graceful unregister: detach from each broker's ConsumerManager immediately, without waiting for heartbeat timeout.
         try {
             $this->requireClient()->unregisterClientAllBrokers(
                 $this->clientId ?? '',
@@ -668,7 +681,7 @@ final class DefaultMQPushConsumer
                 // ignore
             }
         }
-        // 轨迹分发器最后关（flush 剩余轨迹）。
+        // The trace dispatcher shuts down last (flush remaining traces).
         if ($this->traceDispatcher !== null) {
             try {
                 $this->traceDispatcher->shutdown();
@@ -692,10 +705,11 @@ final class DefaultMQPushConsumer
         return $this->started;
     }
 
-    // ---------------- 心跳（消费者注册） ----------------
+    // ---------------- Heartbeat (consumer registration) ----------------
 
     /**
-     * 订阅 topic 的路由拉一遍，顺带把 broker 地址表填上（心跳要靠它）。
+     * Pull the routes of subscribed topics once, filling the broker address table along the way
+     * (the heartbeat relies on it).
      */
     private function refreshRoutes(): void
     {
@@ -728,12 +742,13 @@ final class DefaultMQPushConsumer
     }
 
     /**
-     * 向所有已知 broker（主 + 从）发心跳，返回成功台数。
+     * Send heartbeats to all known brokers (master + slave), returning the success count.
      *
-     * 消费者**必须**注册到 broker：broker 的 ConsumerManager 只有收到心跳才知道
-     * 消费组里有哪些 clientId，rebalance 的 GET_CONSUMER_LIST_BY_GROUP 才有返回。
-     * 从节点漏发不是"少一发冗余"：从节点收不到心跳时，它会给指向自己的拉取回
-     * SUBSCRIPTION_NOT_EXIST（详见向全部 broker 发心跳处的注释）。
+     * Consumers **must** register with the broker: the broker's ConsumerManager learns which
+     * clientIds are in a consumer group only upon receiving heartbeats, so rebalance's
+     * GET_CONSUMER_LIST_BY_GROUP has anything to return. Skipping slaves is not "one fewer
+     * redundant heartbeat": when a slave receives no heartbeat, it answers pulls directed at
+     * itself with SUBSCRIPTION_NOT_EXIST (see the comment at the send-heartbeat-to-all-brokers site).
      */
     public function sendHeartbeatToAllBroker(): int
     {
@@ -754,13 +769,13 @@ final class DefaultMQPushConsumer
         return $ok;
     }
 
-    /** 心跳成功轮数（真机验证用）。 */
+    /** Number of successful heartbeat rounds (for real-machine verification). */
     public function heartbeatCount(): int
     {
         return $this->heartbeatCount;
     }
 
-    /** 当前分给本实例的队列数（真机验证多实例分配用）。 */
+    /** Number of queues currently assigned to this instance (for real-machine multi-instance allocation verification). */
     public function assignedQueueCount(): int
     {
         return count($this->assigned);
@@ -777,7 +792,7 @@ final class DefaultMQPushConsumer
         return $keys;
     }
 
-    /** 分给本实例、属于指定 topic 的队列数（按 (topic,broker,queueId) 计，真机验证分配用）。 */
+    /** Number of queues assigned to this instance and belonging to the specified topic (counted by (topic,broker,queueId), for real-machine allocation verification). */
     public function assignedQueueCountForTopic(string $topic): int
     {
         $n = 0;
@@ -790,13 +805,13 @@ final class DefaultMQPushConsumer
     }
 
 
-    /** POP：在途 PopProcessQueue 数。 */
+    /** POP: number of in-flight PopProcessQueues. */
     public function popQueueCount(): int
     {
         return count($this->popQueues);
     }
 
-    /** POP：ACK 债务总和（已 pop 未 ack 的消息数；正常消费后应归零）。 */
+    /** POP: total ACK debt (messages popped but not acked; should return to zero after normal consumption). */
     public function popWaitAckCount(): int
     {
         $n = 0;
@@ -807,21 +822,23 @@ final class DefaultMQPushConsumer
     }
 
     /**
-     * 本地位点表条目数。POP 的游标在 broker 的 revive 队列里，**客户端不持有
-     * 位点表**——POP 模式下此值应恒为 0（pull 模式下每个已解析队列一条）。
+     * Number of local offset-table entries. POP's cursor lives in the broker's revive queue,
+     * so the **client holds no offset table**, and this value should always be 0 in POP mode
+     * (one entry per resolved queue in pull mode).
      */
     public function localOffsetCount(): int
     {
         return count($this->consumeOffsets);
     }
 
-    // ---------------- tick 驱动（PHP 适配核心） ----------------
+    // ---------------- tick driver (PHP adaptation core) ----------------
 
     /**
-     * 驱动一轮：实例事件泵 + 心跳 / 重平衡 / 拉取 + 分发消费 + 位点落盘 + 顺序锁。
-     * 调用方在循环里周期调用（空转时建议 sleep 50ms）。
+     * Drive one round: instance event pump + heartbeat / rebalance / pull + dispatch
+     * consumption + offset persistence + orderly lock.
+     * The caller calls this periodically in a loop (sleep 50ms is advised when idling).
      *
-     * @param int|null $nowMillis 可注入的当前时间（毫秒），为空时用内部时钟。
+     * @param int|null $nowMillis Injectable current time (milliseconds); the internal clock is used when empty.
      */
     public function tick(?int $nowMillis = null): void
     {
@@ -834,10 +851,10 @@ final class DefaultMQPushConsumer
         if ($client === null) {
             return;
         }
-        // ① 实例事件泵（路由刷新 / 统计采样 / pending 动作）。
+        // 1) Instance event pump (route refresh / stats sampling / pending actions).
         $client->tick($nowMs);
 
-        // ② 心跳。
+        // 2) Heartbeat.
         if ($this->heartbeatEnabled && $now >= $this->nextHeartbeatAt) {
             $this->nextHeartbeatAt = $now + $this->heartbeatIntervalMillis / 1000.0;
             try {
@@ -847,9 +864,10 @@ final class DefaultMQPushConsumer
             }
         }
 
-        // ③ 重平衡（启动阶段且无分配时快速重试）。
-        // POP broker 侧分配路径不在这里跑：本地策略一格都不该执行，节奏由实例 tick 的
-        // 阶段⑦（QUERY_ASSIGNMENT 轮）决定，见 usesBrokerPopAssignment()。
+        // 3) Rebalance (fast retry during startup while there is no assignment).
+        // The POP broker-side assignment path does not run here: not a single cell of the
+        // local strategy should execute, and the rhythm is decided by stage 7 of the
+        // instance tick (the QUERY_ASSIGNMENT round); see usesBrokerPopAssignment().
         if (!$this->usesBrokerPopAssignment()
             && ($this->rebalanceNow || $now >= $this->nextRebalanceAt)) {
             $startingUp = ($now - $this->startTime) < 60.0;
@@ -863,7 +881,7 @@ final class DefaultMQPushConsumer
             }
         }
 
-        // ④ 顺序锁（每 20s）。
+        // 4) Orderly lock (every 20s).
         if ($this->isOrderly() && !$this->popMode
             && $this->messageModel !== MessageModel::BROADCASTING
             && $now >= $this->nextLockAt) {
@@ -871,12 +889,12 @@ final class DefaultMQPushConsumer
             $this->lockQueuesOnce();
         }
 
-        // ⑤ 拉取 / POP 轮。
+        // 5) Pull / POP round.
         if ($this->popMode) {
             $this->popRound($now);
         } else {
             $this->pullRound($now);
-            // ⑥ 分发消费（每轮拉取后紧接分发）。
+            // 6) Dispatch consumption (dispatch follows each pull round immediately).
             $this->dispatchRound();
             if (!$this->isOrderly() && $now >= $this->nextCleanAt) {
                 $this->nextCleanAt = $now + max(1, $this->consumeTimeout) * 60.0;
@@ -888,7 +906,7 @@ final class DefaultMQPushConsumer
             }
         }
 
-        // ⑧ 位点落盘。
+        // 8) Offset persistence.
         if ($now >= $this->nextPersistAt) {
             $this->nextPersistAt = $now + $this->persistConsumerOffsetInterval / 1000.0;
             try {
@@ -899,13 +917,13 @@ final class DefaultMQPushConsumer
         }
     }
 
-    /** tick() 的别名。 */
+    /** Alias of tick(). */
     public function pumpOnce(?int $nowMillis = null): void
     {
         $this->tick($nowMillis);
     }
 
-    // ---------------- 重平衡 ----------------
+    // ---------------- Rebalance ----------------
 
     private function rebalancePullState(): void
     {
@@ -926,11 +944,11 @@ final class DefaultMQPushConsumer
                 $this->retireQueue($key, $current[$key], $retired);
             }
         }
-        // 收尾必须早于 ②建。
+        // Finishing must happen before 2)-building.
         if ($retired !== []) {
             $this->onQueuesRevoked($retired);
         }
-        // ②建：为缺失的队列准备状态。
+        // 2)-build: prepare state for missing queues.
         foreach ($current as $key => $mq) {
             if (isset($this->mqMap[$key])) {
                 continue;
@@ -938,11 +956,12 @@ final class DefaultMQPushConsumer
             if ($pop && !isset($this->popQueues[$key])) {
                 $this->popQueues[$key] = new PopProcessQueue();
             }
-            // 新 ProcessQueue 就位 ⇒ 解冻（重建后的队列按修正位点重新开始推进）。
+            // A new ProcessQueue is in place, so unfreeze (rebuilt queues resume advancing from the corrected offset).
             unset($this->frozenOffsets[$key]);
-            // 线程刚建、还没盖章，先用当前时刻占位，避免下一趟误判停摆。
+            // The thread was just created and not stamped yet; occupy with the current time to
+            // avoid a false stall verdict on the next round.
             $this->lastPullTable[$key] = microtime(true);
-            // 队列一旦分配就进 _mq_map：位点持久化、307 运行信息、220 重置都靠它。
+            // Once assigned, a queue enters _mq_map: offset persistence, 307 running info and 220 reset all rely on it.
             $this->mqMap[$key] = $mq;
         }
     }
@@ -950,10 +969,10 @@ final class DefaultMQPushConsumer
     private function retireQueue(string $key, ?MessageQueue $fallbackMq, array &$retired): void
     {
         unset($this->pending[$key], $this->idleUntil[$key], $this->suspendedUntil[$key]);
-        // 在途登记一并作废。
+        // In-flight registrations are voided together.
         unset($this->inflightMsgs[$key], $this->msgQueueInflight[$key]);
         unset($this->lockOk[$key]);
-        // 代号 +1 ⇒ 在途批次的 ack 全部失效；冻结标记保留到队列重建为止。
+        // Epoch +1 invalidates all acks of in-flight batches; the freeze mark is kept until the queue is rebuilt.
         $this->queueEpoch[$key] = ($this->queueEpoch[$key] ?? 0) + 1;
         $off = $this->consumeOffsets[$key] ?? null;
         unset($this->consumeOffsets[$key], $this->offsetTable[$key], $this->lastPullTable[$key]);
@@ -983,7 +1002,7 @@ final class DefaultMQPushConsumer
     {
         $broadcast = $this->messageModel === MessageModel::BROADCASTING;
         if ($broadcast) {
-            // 广播模式位点只存本地。撤下来的位点必须连同队列信息写回文件。
+            // Broadcast-mode offsets are stored locally only. Revoked offsets must be written back to the file along with the queue info.
             $this->saveLocalOffsets($revoked);
             return;
         }
@@ -999,7 +1018,7 @@ final class DefaultMQPushConsumer
                     Logger::debug("persist offset on revoke failed for $mq: " . $e->getMessage());
                 }
             }
-            // 撤队列时的单队列解锁只属于 classic 顺序（POP 模式下不会跑）。
+            // The single-queue unlock on queue revocation belongs to classic orderly only (it does not run in POP mode).
             if ($this->isOrderly() && !$this->popMode) {
                 try {
                     $client->unlockBatchMq($this->consumerGroup, $this->clientId ?? '', [$mq]);
@@ -1131,8 +1150,9 @@ final class DefaultMQPushConsumer
     }
 
     /**
-     * 建并注册分配轮询方（{@see MQClientInstance::registerPopAssignmentPoller()}，
-     * tick 阶段⑦的驱动对象）。start() 调用一次；重复调用只覆盖旧条目。
+     * Build and register the assignment poller ({@see MQClientInstance::registerPopAssignmentPoller()},
+     * the driving object of tick stage 7). start() calls it once; repeated calls only overwrite
+     * the old entry.
      */
     private function registerPopAssignment(): void
     {
@@ -1143,7 +1163,7 @@ final class DefaultMQPushConsumer
             clientId: $this->clientId ?? '',
             strategyName: $this->allocateStrategy->getName(),
             messageModel: $this->messageModel,
-            // topic 集合**每轮现查**：运行中 subscribe/unsubscribe 都会改变它。
+            // The topic set is **queried fresh every round**: subscribe/unsubscribe during runtime changes it.
             topicsFn: fn (): array => $this->popAssignmentTopics(),
             applyFn: function (string $topic, array $assignments): void {
                 $this->applyPopAssignment($topic, $assignments);
@@ -1153,15 +1173,16 @@ final class DefaultMQPushConsumer
         $client->registerPopAssignmentPoller($this->popAssignmentPoller);
     }
 
-    /** 本轮要问 broker 的 topic 集合（与本地 rebalance 的输入同源：订阅表）。 */
+    /** The topic set to ask the broker about this round (same source as the local rebalance's input: the subscription table). */
     public function popAssignmentTopics(): array
     {
         return array_keys($this->subscriptionData);
     }
 
     /**
-     * 同步跑一轮 broker 侧分配（start() 的首轮、rebalanceImmediately() 的即时重平衡
-     * 走这里；周期性由实例 tick 阶段⑦驱动）。
+     * Run one broker-side assignment round synchronously (start()'s first round and
+     * rebalanceImmediately()'s immediate rebalance go through here; the periodic rhythm is
+     * driven by instance tick stage 7).
      */
     public function runPopAssignmentRound(): void
     {
@@ -1253,9 +1274,9 @@ final class DefaultMQPushConsumer
         return $this->paused;
     }
 
-    // ---------------- 拉取（PHP：tick 内的短轮询轮） ----------------
+    // ---------------- Pull (PHP: short-poll round inside tick) ----------------
 
-    /** 一轮拉取：对每条已分配队列执行至多 maxPullsPerQueuePerTick 次短轮询。 */
+    /** One pull round: at most maxPullsPerQueuePerTick short polls per assigned queue. */
     private function pullRound(float $now): void
     {
         $orderly = $this->isOrderly();
@@ -1276,8 +1297,8 @@ final class DefaultMQPushConsumer
     }
 
     /**
-     * 单队列一次拉取（单轮）。
-     * 返回 true = 拉到了消息，可以立刻再来一轮；false = 本 tick 该队列到此为止。
+     * One pull of a single queue (a single round).
+     * true = messages were pulled, another round can run immediately; false = this queue is done for this tick.
      */
     private function pullOnce(MessageQueue $mq, string $key, bool $orderly, float $now): bool
     {
@@ -1293,18 +1314,18 @@ final class DefaultMQPushConsumer
         if ($sub === null) {
             return false;
         }
-        // 顺序消费：broker 未确认锁定（LOCK_BATCH_MQ）的队列不拉取。
+        // Orderly consumption: queues not confirmed locked by the broker (LOCK_BATCH_MQ) are not pulled.
         if ($orderly && !isset($this->lockOk[$key])) {
             return false;
         }
-        // 挂起重试未到点（PHP 适配：替代顺序消费的 sleep）。
+        // Suspend retry not yet due (PHP adaptation: replaces orderly consumption's sleep).
         if (isset($this->suspendedUntil[$key]) && $now < $this->suspendedUntil[$key]) {
             return false;
         }
         if ($this->flowControlHit($mq, $key)) {
             return false;
         }
-        // 空闲退避（PHP 短轮询适配）。
+        // Idle backoff (PHP short-poll adaptation).
         if (isset($this->idleUntil[$key]) && $now < $this->idleUntil[$key]) {
             return false;
         }
@@ -1324,7 +1345,7 @@ final class DefaultMQPushConsumer
                 ? ($sub->subString ?? '*') : null;
             $sysFlag = PullSysFlag::buildSysFlag(
                 commitOffset: false,
-                suspend: false,          // PHP 短轮询（有意偏差，见类头注释）
+                suspend: false,          // PHP short polling (intentional deviation, see the class header comment)
                 subscription: $subExpression !== null,
                 classFilter: false,
             );
@@ -1346,7 +1367,7 @@ final class DefaultMQPushConsumer
                 brokerId: $brokerId,
             );
             $this->pullFromWhichNode[$key] = $result->suggestWhichBrokerId ?? MixAll::MASTER_ID;
-            // 消费统计：RT 每次都记，TPS 只在有消息时记。
+            // Consume stats: RT is recorded every time, TPS only when there are messages.
             if ($this->statsManager !== null) {
                 $this->statsManager->incPullRt($this->consumerGroup, $mq->topic,
                     (int) ((microtime(true) - $pullBegan) * 1000));
@@ -1356,12 +1377,12 @@ final class DefaultMQPushConsumer
                 }
             }
         } catch (RemotingTimeoutException $e) {
-            // 短轮询下的网络超时按预期路径退避重试。
+            // Network timeout under short polling backs off and retries as an expected path.
             Logger::debug("pull timeout for $mq (will retry): " . $e->getMessage());
             $this->idleUntil[$key] = microtime(true) + 0.5;
             return false;
         } catch (\Throwable $e) {
-            // broker 侧非 SUCCESS 码（TOPIC_NOT_EXIST 等）：预期路径，debug + 退避。
+            // Broker-side non-SUCCESS codes (TOPIC_NOT_EXIST etc.): expected path, debug + backoff.
             Logger::debug("pull error for $mq: " . get_class($e) . ': ' . $e->getMessage());
             $this->idleUntil[$key] = microtime(true) + 0.5;
             return false;
@@ -1379,8 +1400,8 @@ final class DefaultMQPushConsumer
             );
         }
 
-        // 单线程模型下撤队列不可能发生在同步拉取期间；位点推进放在
-        // "仍持有队列"守卫之后执行。
+        // Under the single-thread model, queue revocation cannot happen during a synchronous
+        // pull; offset advancement runs after the "still holds the queue" guard.
         $illegal = false;
         if ($found && $result->msgFoundList !== []) {
             if (!isset($this->pending[$key])) {
@@ -1406,9 +1427,9 @@ final class DefaultMQPushConsumer
             return false;
         }
         if ($result->status === PullStatus::FOUND && $result->msgFoundList !== []) {
-            return true; // 拉到了，立刻再来一轮
+            return true; // Pulled something, run another round immediately
         }
-        // 空结果：空闲退避（短轮询下 broker 立即返回，没有挂起预算）。
+        // Empty result: idle backoff (under short polling the broker returns immediately, with no suspend budget).
         $this->idleUntil[$key] = microtime(true) + max(0, $this->pullIntervalMillis) / 1000.0;
         return false;
     }
@@ -1429,7 +1450,7 @@ final class DefaultMQPushConsumer
         }
     }
 
-    /** 读 ``msgAccCnt``：给 key 读单队列，不给则求和（等价 computeAccumulationTotal）。 */
+    /** Read ``msgAccCnt``: with a key read a single queue, without one sum (equivalent to computeAccumulationTotal). */
     public function msgAccCnt(?string $key = null): int
     {
         if ($key === null) {
@@ -1526,12 +1547,12 @@ final class DefaultMQPushConsumer
         return $this->flowControlTriggered;
     }
 
-    // ---------------- 初始位点 ----------------
+    // ---------------- Initial offset ----------------
 
     private function resolveInitialOffset(MQClientInstance $client, MessageQueue $mq, SubscriptionData $sub): int
     {
         if ($sub->expressionType === \RocketMQ\Common\ExpressionType::SQL92) {
-            // SQL 过滤无 offset 语义，默认最新
+            // SQL filtering has no offset semantics; default to latest
             return $client->getMaxOffset($mq);
         }
         if ($this->messageModel === MessageModel::BROADCASTING) {
@@ -1562,15 +1583,15 @@ final class DefaultMQPushConsumer
         if (NamespaceUtil::isRetryTopic($mq->topic)) {
             return 0;
         }
-        // 默认 CONSUME_FROM_LAST_OFFSET
+        // Default CONSUME_FROM_LAST_OFFSET
         return $client->getMaxOffset($mq);
     }
 
-    // ---------------- 分发消费（PHP：tick 内同步执行） ----------------
+    // ---------------- Dispatch consumption (PHP: synchronous execution inside tick) ----------------
 
     /**
-     * 一轮分发：把各队列 pending 里排好的批次交给 listener（同步执行）。
-     * 循环体批次数有界，保证 tick 可控。
+     * One dispatch round: hand the queued batches in each queue's pending to the listener
+     * (synchronously). The loop body's batch count is bounded, keeping tick controllable.
      */
     private function dispatchRound(): void
     {
@@ -1593,14 +1614,14 @@ final class DefaultMQPushConsumer
                 if (isset($this->pending[$key]) && $this->pending[$key] === []) {
                     unset($this->pending[$key]);
                 }
-                // 与"取走批次"同一临界区登记在途（单线程下即顺序执行）。
+                // Register in-flight in the same critical section as "taking the batch away" (sequential under a single thread).
                 $this->msgQueueInflight[$key] = ($this->msgQueueInflight[$key] ?? 0) + 1;
-                // 连同这批消息所属的 ProcessQueue 代号一起取走。
+                // Take away the ProcessQueue epoch this batch's messages belong to as well.
                 $epoch = $this->queueEpoch[$key] ?? 0;
                 try {
                     $this->consumeBatch($key, $mq, $batch, $epoch);
                 } catch (\Throwable $e) {
-                    // 分发路径意外异常：批次塞回队首，稍后重试（不要让它杀死 tick）。
+                    // Unexpected exception on the dispatch path: push the batch back to the head and retry later (do not let it kill tick).
                     Logger::error('dispatch batch error (will retry): ' . get_class($e) . ': ' . $e->getMessage());
                     if (isset($this->pending[$key])) {
                         foreach (array_reverse($batch) as $m) {
@@ -1637,7 +1658,7 @@ final class DefaultMQPushConsumer
         }
     }
 
-    // ---------------- broker 主动请求：220 / 221 / 307 / 309 ----------------
+    // ---------------- Broker-initiated requests: 220 / 221 / 307 / 309 ----------------
 
     public function resetOffset(string $topic, array $offsetTable): void
     {
@@ -1659,14 +1680,14 @@ final class DefaultMQPushConsumer
             if ($off === null) {
                 continue;
             }
-            // 新位点先写进表：撤销会把**它**交给 onQueuesRevoked 落盘。
+            // The new offset goes into the table first: revocation hands **it** to onQueuesRevoked for persistence.
             $this->consumeOffsets[$key] = $off;
             $this->retireQueue($key, $mq, $retired);
         }
         if ($retired === []) {
             return;
         }
-        usleep(200000); // 0.2s（有意偏差：代号已让在途 ack 全部失效）
+        usleep(200000); // 0.2s (intentional deviation: the epoch has already invalidated all in-flight acks)
         $this->onQueuesRevoked($retired);
         try {
             $this->doRebalance();
@@ -1708,7 +1729,7 @@ final class DefaultMQPushConsumer
             ConsumerRunningInfo::PROP_CLIENT_VERSION => 'V5_5_1',
         ];
         $subs = array_values($this->subscriptionData);
-        // POP 模式下弹出去 popQueues，classic 的 processQueue 是空的 —— 两把表互斥。
+        // In POP mode the popped ones go to popQueues, while classic's processQueue is empty - the two tables are mutually exclusive.
         $popKeys = $this->popMode ? array_fill_keys(array_keys($this->popQueues), true) : [];
         foreach ($this->mqMap as $key => $mq) {
             if (isset($popKeys[$key])) {
@@ -1786,7 +1807,7 @@ final class DefaultMQPushConsumer
         return $result;
     }
 
-    // ---------------- 批次消费 ----------------
+    // ---------------- Batch consumption ----------------
 
     private function isOrderly(): bool
     {
@@ -1836,7 +1857,7 @@ final class DefaultMQPushConsumer
                 ));
             }
             $rawStatus = $status;
-            // 归一化：null / 未知值一律按挂起（否则会被当成 SUCCESS 静默 ack）。
+            // Normalization: null / unknown values are always treated as suspend (otherwise they would be silently acked as SUCCESS).
             if (!($status instanceof ConsumeOrderlyStatus)) {
                 $status = ConsumeOrderlyStatus::SUSPEND_CURRENT_QUEUE_A_MOMENT;
             }
@@ -1978,11 +1999,11 @@ final class DefaultMQPushConsumer
             return true;
         }
         if ($ackIndex + 1 >= count($batch)) {
-            // 整批认可（默认路径）。
+            // Whole batch acknowledged (default path).
             $this->advanceConsumeOffset($key, $batch, null, $epoch);
             return true;
         }
-        // 集群模式：未认可的 [ack_index+1, size) 逐条回投 %RETRY%topic。
+        // Clustering mode: the unacknowledged [ack_index+1, size) are sent back one by one to %RETRY%topic.
         $msgBackFailed = $this->sendBackBatch($key, array_slice($batch, $ackIndex + 1), $context);
         if ($msgBackFailed !== []) {
             if (isset($this->pending[$key])) {
@@ -2021,7 +2042,7 @@ final class DefaultMQPushConsumer
         }
     }
 
-    /** 把这批消息从"在 listener 手里"的登记里摘除（按对象身份，幂等）。 */
+    /** Detach this batch from the "in the listener's hands" registration (by object identity, idempotent). */
     private function deregisterInflight(string $key, array $batch): void
     {
         $bucket = $this->inflightMsgs[$key] ?? null;
@@ -2091,7 +2112,7 @@ final class DefaultMQPushConsumer
         return false;
     }
 
-    /** 摘除刚清扫过的那条（调用方已确认它就是队首）。 */
+    /** Detach the entry just swept (the caller has confirmed it is the head of the queue). */
     private function removeProcessQueueEntry(string $key, MessageExt $msg): void
     {
         $this->deregisterInflight($key, [$msg]);
@@ -2104,7 +2125,7 @@ final class DefaultMQPushConsumer
         }
     }
 
-    // ---------------- cleanExpiredMsg：挂起 listener 的逃生口 ----------------
+    // ---------------- cleanExpiredMsg: the escape hatch of a hung listener ----------------
 
     public function cleanExpiredMsgOnce(): void
     {
@@ -2152,7 +2173,7 @@ final class DefaultMQPushConsumer
         }
     }
 
-    // ---------------- 并发回投 ----------------
+    // ---------------- Concurrent send-back ----------------
 
     private function sendBackBatch(string $key, array $batch, ConsumeConcurrentlyContext $context): array
     {
@@ -2171,7 +2192,7 @@ final class DefaultMQPushConsumer
                 continue;
             }
             try {
-                // 重投次数在 MessageExt 线上格式第 13 字段，broker 重投时会 +1。
+                // The reconsume count is field 13 of MessageExt's wire format; the broker increments it on redelivery.
                 $delayLevel = $context->delayLevelWhenNextConsume;
                 if (!$delayLevel) {
                     $delayLevel = 3 + $msg->getReconsumeTimes();
@@ -2210,7 +2231,7 @@ final class DefaultMQPushConsumer
         }
     }
 
-    // ---------------- 顺序消费的重试计数与回投 ----------------
+    // ---------------- Orderly consumption's retry counting and send-back ----------------
 
     private function orderlySuspendMillis(ConsumeOrderlyContext $context): int
     {
@@ -2268,7 +2289,7 @@ final class DefaultMQPushConsumer
             MessageAccessor::putProperty($newMsg, MessageConst::PROPERTY_RETRY_TOPIC, $msg->topic);
             MessageAccessor::setReconsumeTime($newMsg, $msg->getReconsumeTimes() + 1);
             MessageAccessor::setMaxReconsumeTimes($newMsg, $this->orderlyMaxReconsumeTimes());
-            // 半消息标记必须清掉，否则 broker 会把它再当事务回查消息处理
+            // The half-message mark must be cleared, otherwise the broker will treat it as a transaction check-back message again
             MessageAccessor::clearProperty($newMsg, MessageConst::PROPERTY_TRANSACTION_PREPARED);
             $newMsg->setDelayTimeLevel(3 + $msg->getReconsumeTimes());
             $publish = $client->getTopicPublishInfo($newMsg->topic, true);
@@ -2276,7 +2297,7 @@ final class DefaultMQPushConsumer
             if ($mq === null) {
                 throw new MQClientException("no writable queue for retry topic $newMsg->topic");
             }
-            // unitMode 跟着消费者：不带的话重投出去的消息会丢单元标记。
+            // unitMode follows the consumer: without it, sent-back messages lose their unitization mark.
             $client->sendMessage(MixAll::CLIENT_INNER_PRODUCER_GROUP, $newMsg, $mq, 3000, 0, $this->unitMode);
             return true;
         } catch (\Throwable $e) {
@@ -2290,12 +2311,12 @@ final class DefaultMQPushConsumer
         }
     }
 
-    // ---------------- 位点推进 / 修正 / 纠错 ----------------
+    // ---------------- Offset advancement / correction / recovery ----------------
 
     private function advanceConsumeOffset(string $key, array $batch, ?int $floor = null, ?int $epoch = null): void
     {
         if ($batch === []) {
-            // 整批回投都失败时没有任何条目被认可，位点原地不动
+            // When the whole batch's send-back fails, no entry is acknowledged and the offset stays put
             return;
         }
         $nextOff = max(array_map(static fn(MessageExt $m) => $m->queueOffset, $batch)) + 1;
@@ -2327,7 +2348,7 @@ final class DefaultMQPushConsumer
             return;
         }
         if (isset($this->frozenOffsets[$key])) {
-            // 位点已被 OFFSET_ILLEGAL 纠错冻结，这条路径同样不许改
+            // The offset has been frozen by OFFSET_ILLEGAL correction, so this path must not change it either
             return;
         }
         if (($this->pending[$key] ?? []) !== [] || ($this->msgQueueInflight[$key] ?? 0) !== 0) {
@@ -2348,7 +2369,7 @@ final class DefaultMQPushConsumer
         Logger::warning("the pull request offset illegal, fix it, queue=$key");
     }
 
-    // ---------------- 位点持久化 ----------------
+    // ---------------- Offset persistence ----------------
 
     public function persistOffsetsOnce(): void
     {
@@ -2429,7 +2450,7 @@ final class DefaultMQPushConsumer
         return [];
     }
 
-    // ---------------- 顺序消费队列锁 ----------------
+    // ---------------- Orderly consumption queue lock ----------------
 
     private function lockQueuesOnce(): void
     {
@@ -2456,7 +2477,7 @@ final class DefaultMQPushConsumer
         return array_values($this->assigned);
     }
 
-    // ---------------- 管理能力 ----------------
+    // ---------------- Admin capabilities ----------------
 
     /** @return list<MessageQueue> */
     public function fetchSubscribeMessageQueues(string $topic): array
@@ -2465,7 +2486,7 @@ final class DefaultMQPushConsumer
         return $client->getTopicSubscribeInfo($topic);
     }
 
-    // ---------------- 消费钩子 ----------------
+    // ---------------- Consume hooks ----------------
 
     private function buildConsumeHookContext(array $msgs, MessageQueue $mq): ConsumeMessageContext
     {
@@ -2570,10 +2591,10 @@ final class DefaultMQPushConsumer
         $this->executeConsumeHookAfter($hookCtx);
     }
 
-    // ---------------------------------------------------------------- POP 消费循环（PHP：tick 内短轮询）
+    // ---------------------------------------------------------------- POP consume loop (PHP: short polling inside a tick)
 
     /**
-     * 一轮 POP：对每条已分配队列执行至多 maxPopsPerQueuePerTick 次弹取（pollTime=0）。
+     * One POP round: pops at most maxPopsPerQueuePerTick times from every assigned queue (pollTime=0).
      */
     private function popRound(float $now): void
     {
@@ -2593,10 +2614,11 @@ final class DefaultMQPushConsumer
     }
 
     /**
-     * 单队列一次 POP（单轮）。
+     * A single POP against one queue (one round).
      *
-     * 与 pull 的关键差别：**不查、不提交消费位点**（进度由 broker 侧 checkpoint 跟踪，
-     * 确认只靠 ack）；弹出即投递消费（内联执行）；``POLLING_NOT_FOUND`` 是正常态。
+     * Key differences from pull: **no lookup, no consumption offset commit** (progress is tracked by the
+     * broker-side checkpoint, confirmation relies on ack alone); a popped message is delivered for
+     * consumption inline; ``POLLING_NOT_FOUND`` is a normal state.
      */
     private function popOnce(MessageQueue $mq, string $key, float $now): bool
     {
@@ -2616,7 +2638,8 @@ final class DefaultMQPushConsumer
         if ($pq === null || $pq->isDropped()) {
             return false;
         }
-        // 发起弹出就盖时刻：流控/空闲退避都不该让一条还在跑的循环被判成停摆。
+        // Stamp the time as soon as the pop starts: neither flow control nor idle backoff should let a
+        // loop that is still running be judged stalled.
         $now = microtime(true);
         $this->lastPullTable[$key] = $now;
         $pq->lastPopTimestamp = $now;
@@ -2630,7 +2653,7 @@ final class DefaultMQPushConsumer
         if ($pq->waitAckCount() > $this->popThresholdForQueue) {
             return false;
         }
-        // 空闲退避（PHP 短轮询适配）。
+        // Idle backoff (PHP short-poll adaptation).
         if (isset($this->idleUntil[$key]) && $now < $this->idleUntil[$key]) {
             return false;
         }
@@ -2642,7 +2665,7 @@ final class DefaultMQPushConsumer
                 $mq->queueId,
                 maxMsgNums: $this->popBatchNums,
                 invisibleTime: $invisible,
-                pollTime: 0,             // PHP 短轮询（有意偏差，见类头注释）
+                pollTime: 0,             // PHP short polling (intentional deviation, see the class header comment)
                 initMode: $initMode,
                 exp: ($sub->subString ?? '') !== '' ? $sub->subString : '*',
                 expType: $sub->expressionType,
@@ -2659,8 +2682,8 @@ final class DefaultMQPushConsumer
             $this->idleUntil[$key] = microtime(true) + 0.5;
             return false;
         }
-        // 弹出后队列被 rebalance 撤走：这一批**既不消费也不 ack**（单线程下极难发生，
-        // 守卫照抄）。
+        // The queue was revoked by rebalance after the pop came back: this batch is **neither consumed nor
+        // acked** (extremely rare in a single thread, the guard is copied as-is).
         if ($pq->isDropped()) {
             return false;
         }
@@ -2708,7 +2731,8 @@ final class DefaultMQPushConsumer
             }
             return true;
         }
-        // 空结果：短轮询立即返回会变成热循环，按空闲退避兜底。
+        // Empty result: an immediate return from short polling would turn into a hot loop, so fall back to
+        // idle backoff.
         $this->idleUntil[$key] = microtime(true) + max(0, $this->popIntervalMillis) / 1000.0;
         return false;
     }
@@ -2772,7 +2796,8 @@ final class DefaultMQPushConsumer
         }
 
         if ($this->isPopTimeout($msgs, $popTime, $invisible)) {
-            // 已经超过 invisibleTime：ack 也不会被承认，直接放弃本批（等 broker 复活重投）
+            // Already past invisibleTime: the ack would not be accepted either, so abandon this batch
+            // (wait for the broker to revive and redeliver it)
             Logger::debug(sprintf('pop timeout, abort consume for %s: popTime=%s invisible=%s',
                 (string) $mq, $popTime, $invisible));
             $pq->decFoundMsg(-count($msgs));
@@ -2826,7 +2851,7 @@ final class DefaultMQPushConsumer
         );
 
         if ($pq->isDropped() || $this->isPopTimeout($msgs, $popTime, $invisible)) {
-            // 消费期间队列被撤走或已超时：结果不再处理
+            // The queue was revoked or it already timed out while consuming: the result is no longer processed
             $pq->decFoundMsg(-count($msgs));
             return;
         }
@@ -2854,7 +2879,7 @@ final class DefaultMQPushConsumer
                 $ackIndex = count($msgs) - 1;
             }
         } else {
-            // RECONSUME_LATER：一条都不 ack
+            // RECONSUME_LATER: not a single message is acked
             $ackIndex = -1;
         }
 
@@ -2895,12 +2920,13 @@ final class DefaultMQPushConsumer
     }
 
     /**
-     * 从 POP_CK 解出 ack/延长不可见时间需要的 (topic, brokerName, queueId, offset, ck)。
+     * Extracts the (topic, brokerName, queueId, offset, ck) needed to ack / extend the invisible time
+     * from POP_CK.
      *
-     * ⚠ 两处都不能想当然：
-     *  1. topic 要用 ``ExtraInfoUtil::getRealTopic`` 按 CK 的 retryFlag 还原；
-     *  2. 地址要按 CK 里的 brokerName 反查，不能按 topic 查路由（retry topic 通常没有
-     *     独立路由表项）。
+     * ⚠ Neither of the two may be taken for granted:
+     *  1. the topic must be restored with ``ExtraInfoUtil::getRealTopic`` according to the CK retryFlag;
+     *  2. the address must be looked up by the brokerName inside the CK, not by querying the route for the
+     *     topic (a retry topic usually has no dedicated route table entry).
      *
      * @return array{0:string,1:string,2:int,3:int,4:string}|null
      */
@@ -2944,7 +2970,7 @@ final class DefaultMQPushConsumer
                 addr: $client->popAckAddrFor($brokerName, $topic, $queueId),
             );
         } catch (\Throwable $e) {
-            // ack 失败不致命：消息会在 invisibleTime 到期后被 broker 复活重投
+            // A failed ack is not fatal: the broker will revive and redeliver the message once invisibleTime expires
             Logger::debug('ack failed for ' . $msg->msgId . ': ' . $e->getMessage());
         }
     }

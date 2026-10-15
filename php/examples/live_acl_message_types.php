@@ -2,33 +2,39 @@
 
 declare(strict_types=1);
 
-// 真机 ACL + 全消息类型验证：一整套「带凭据签名被接受」的正向证据 + 一条
-// 「不带凭据必须被拒成 NO_PERMISSION(16)」的反向断言。
+// Live-cluster ACL + all-message-types verification: a full set of positive evidence that
+// "signed credentials are accepted", plus one negative assertion that "no credentials must be
+// rejected with NO_PERMISSION(16)".
 //
 //   php examples/live_acl_message_types.php [namesrv] [accessKey] [secretKey] [legs]
-//   例：php examples/live_acl_message_types.php 127.0.0.1:9876 AK_TEST SK_TEST_SECRET_12345678
+//   e.g.: php examples/live_acl_message_types.php 127.0.0.1:9876 AK_TEST SK_TEST_SECRET_12345678
 //   legs = all | neg,normal,async,oneway,batch,delay,timer,tx,order,tag,key,prop
 //
-// 为什么反向断言必须在最前面、且独立成一个进程阶段：broker 侧**所有**鉴权失败
-// （没签名 / 签名不对）都收敛成同一个 NO_PERMISSION(16)，靠 remark 才能区分
-// "check signature failed." 与 "username cannot be null."；而「带凭据全绿」在没有
-// 反向断言的对照下，无法区分「签名被接受」与「集群根本没开鉴权」。所以：
-//   N1 无凭据发送被拒且响应码**恰好是 16**（不是"某个错误"）；
-//   N2 错误 secretKey 同样被拒成 16。
-// 反向探针用的是**不带钩子**的生产者：RPC 钩子注册在客户端实例的 remoting 层
-// 装配点（start() 之后），先起的探针客户端必须**关干净并歇 1s** 再起带凭据的
-// 客户端，避免任何实例级共享把无钩子连接带进正向腿。
+// Why the negative assertion must run first and as its own process stage: on the broker, **all**
+// authentication failures (missing signature / wrong signature) collapse into the same
+// NO_PERMISSION(16); only the remark distinguishes "check signature failed." from "username
+// cannot be null.". And "all green with credentials" cannot distinguish "the signature is
+// accepted" from "the cluster has no authentication at all" without a negative control. Hence:
+//   N1 a send without credentials is rejected and the response code is **exactly 16** (not
+//   "some error");
+//   N2 a wrong secretKey is likewise rejected with 16.
+// The negative probe uses a producer **without hooks**: RPC hooks are registered at the client
+// instance's remoting-layer assembly point (after start()), so the probe client that starts
+// first must **shut down cleanly and rest 1s** before the credentialed client starts, keeping
+// any instance-level sharing from carrying the hook-less connection into the positive legs.
 //
-// 覆盖的消息类型（每类都从 broker 读回才算数，只有 oneway 允许靠回读条数兜底）：
-//   sync 普通 / async 回调 / oneway / 批量 send(array) / 延迟等级 / 定时 TIMER_DELIVER_MS /
-//   事务（半消息→本地 commit→END_TRANSACTION，读回证明变得可消费）/
-//   顺序 sendBySelector（同 arg 同队列 + 顺序消费保序）/ Tag 过滤 / Key 服务端查询 / 用户属性透传。
+// Message types covered (each counts only when read back from the broker; only oneway may fall
+// back to read-back counts):
+//   sync normal / async callback / oneway / batch send(array) / delay level / timer
+//   TIMER_DELIVER_MS / transaction (half message -> local commit -> END_TRANSACTION; reading it
+//   back proves the commit took effect) / orderly sendBySelector (same arg same queue + ordered
+//   consumption preserves order) / Tag filtering / server-side Key query / user property pass-through.
 //
-// PHP 适配（单线程）：push 消费者的全部后台工作收敛在 tick()，所有等待窗都在
-// 主动 tick 消费者地轮询（同 live_redelivery.php 的口径）；sendAsync 内部已泵到
-// 回调走完才返回。
+// PHP adaptation (single-threaded): all background work of the push consumer converges in
+// tick(); every wait window actively ticks the consumer in a polling loop (same approach as
+// live_redelivery.php); sendAsync pumps internally until the callbacks have run before returning.
 //
-// 收口行 `PASS=<n> FAIL=<n>`；任一 FAIL 非 0 退出。
+// Closing line `PASS=<n> FAIL=<n>`; exits non-zero on any FAIL.
 require __DIR__ . '/../bootstrap.php';
 
 use RocketMQ\Client\ConsumeConcurrentlyContext;
@@ -54,7 +60,8 @@ use RocketMQ\Remoting\Protocol\ConsumeFromWhere;
 use RocketMQ\Remoting\Protocol\ResponseCode;
 use RocketMQ\Remoting\SessionCredentials;
 
-// 日志不落在用户 $HOME 下：默认写当前工作目录的 logs/，这里显式钉到临时目录。
+// Keep the log out of the user's $HOME: the default is logs/ under the current working
+// directory; pin it to the temp directory here.
 if (getenv('ROCKETMQ_CLIENT_LOG_DIR') === false) {
     putenv('ROCKETMQ_CLIENT_LOG_DIR=' . sys_get_temp_dir() . '/rmq_php_acl_types_live_logs');
 }
@@ -77,8 +84,8 @@ $ak = trim((string)($argv[2] ?? ''));
 $sk = trim((string)($argv[3] ?? ''));
 $legsArg = trim($argv[4] ?? 'all');
 if ($ak === '' || $sk === '') {
-    echo '用法: php ' . $argv[0] . ' <namesrv> <accessKey> <secretKey> [legs]' . PHP_EOL;
-    echo '集群开了 ACL 时必须给凭据；本命令的全部正向腿都靠签名钩子过鉴权。' . PHP_EOL;
+    echo 'Usage: php ' . $argv[0] . ' <namesrv> <accessKey> <secretKey> [legs]' . PHP_EOL;
+    echo 'Credentials are required when the cluster has ACL enabled; every positive leg of this command authenticates via the signing hook.' . PHP_EOL;
     exit(1);
 }
 $want = function (string $leg) use ($legsArg): bool {
@@ -95,10 +102,11 @@ $want = function (string $leg) use ($legsArg): bool {
 
 $stamp = time();
 $prefix = 'PhpAclMt' . $stamp;
-// 钩子对象无状态，可以在同一进程的多个客户端实例间复用（每次 start 注册进各自的 remoting 层）。
+// The hook object is stateless and can be shared across multiple client instances in the same
+// process (each start() registers it into that instance's remoting layer).
 $acl = new AclClientRPCHook(new SessionCredentials($ak, $sk));
 
-/** 在窗口内轮询条件；每轮先 tick 传进来的消费者（PHP 无后台线程）。 */
+/** Polls the condition within the window; ticks the passed consumers each round (PHP has no background threads). */
 function mt_wait_until(float $windowSec, callable $cond, object ...$tickables): bool
 {
     $deadline = microtime(true) + $windowSec;
@@ -119,10 +127,11 @@ function mt_wait_until(float $windowSec, callable $cond, object ...$tickables): 
 }
 
 /**
- * 沿异常链找 broker 响应码。
+ * Walks the exception chain looking for the broker response code.
  *
- * 同步发送把 MQBrokerException(16) 包进 MQClientException 时只在外层带同一个码，
- * admin 路径也可能包一层——不能只看最外层，更不能只看消息文本。
+ * When a sync send wraps MQBrokerException(16) in an MQClientException, only the outer layer
+ * carries the same code; the admin path may wrap once more — never look at the outermost layer
+ * only, and never rely on the message text.
  */
 function mt_broker_code(Throwable $e): ?int
 {
@@ -141,7 +150,7 @@ function mt_broker_code(Throwable $e): ?int
     return null;
 }
 
-/** 收集型 listener：并发 / 顺序两套，按 body 与投递次序记账。 */
+/** Collecting listeners: concurrent / orderly variants, accounting by body and delivery order. */
 final class MtBox
 {
     /** @var list<MessageExt> */
@@ -152,13 +161,13 @@ final class MtBox
         $this->msgs[] = $m;
     }
 
-    /** @return list<string> 按投递顺序的 body */
+    /** @return list<string> bodies in delivery order */
     public function bodies(): array
     {
         return array_map(static fn (MessageExt $m): string => (string) $m->getBody(), $this->msgs);
     }
 
-    /** @return list<string> 排序后的 body（去队列间乱序影响） */
+    /** @return list<string> sorted bodies (removes cross-queue disorder) */
     public function sortedBodies(): array
     {
         $b = $this->bodies();
@@ -206,7 +215,7 @@ final class MtOrderlyListener implements MessageListenerOrderly
     }
 }
 
-/** 本地事务恒提交：半消息 → COMMIT → END_TRANSACTION，读回即证明提交生效。 */
+/** Local transaction always commits: half message -> COMMIT -> END_TRANSACTION; reading it back proves the commit took effect. */
 final class MtCommitListener implements TransactionListener
 {
     public array $executed = [];
@@ -247,17 +256,19 @@ function mt_new_producer(string $ns, string $group, AclClientRPCHook $hook, stri
 echo '=== PHP ACL message-types live: ns=' . $ns . ' ak=' . $ak
     . ' prefix=' . $prefix . ' legs=' . ($legsArg === '' ? 'all' : $legsArg) . ' ===' . PHP_EOL;
 
-// ---------------------------------------------------------------- 阶段 0：反向探针
-// 必须**最先**跑：不带钩子的探针客户端先建实例、先注销，再起带凭据的客户端。
+// ---------------------------------------------------------------- Stage 0: negative probe
+// Must run **first**: the hook-less probe client creates and deregisters its instance before the
+// credentialed client starts.
 if ($want('neg')) {
-    echo PHP_EOL . '--- N 无凭据/错凭据必须被 broker 拒成 NO_PERMISSION(16) ---' . PHP_EOL;
+    echo PHP_EOL . '--- N missing/wrong credentials must be rejected by the broker with NO_PERMISSION(16) ---' . PHP_EOL;
 
     $anonTopic = $prefix . '_Anon';
     $anon = new DefaultMQProducer('GID_' . $prefix . '_anon');
     $anon->setNamesrvAddr($ns);
     $anon->setInstanceName('aclmt-anon-' . $stamp);
     $anon->sendMsgTimeout = 3000;
-    // 关掉重试：NO_PERMISSION 在重试码表里，留着只会被重复拒绝拖慢探针。
+    // Disable retries: NO_PERMISSION is in the retryable code table; leaving retries on only
+    // slows the probe with repeated rejections.
     $anon->setRetryTimesWhenSendFailed(0);
     $anon->start();
     try {
@@ -266,13 +277,13 @@ if ($want('neg')) {
         $detail = '';
         try {
             $anon->send(new Message($anonTopic, 'should-not-send'));
-            $detail = '意外发送成功（集群没在拒无凭据请求？）';
+            $detail = 'unexpected send success (is the cluster not rejecting credential-less requests?)';
         } catch (Throwable $e) {
             $code = mt_broker_code($e);
             $denied = $code === ResponseCode::NO_PERMISSION;
             $detail = get_class($e) . ' code=' . var_export($code, true) . ' msg=' . $e->getMessage();
         }
-        $check($denied, 'N1 无凭据发送被 broker 拒绝，响应码恰为 16', $detail);
+        $check($denied, 'N1 credential-less send rejected by the broker, response code exactly 16', $detail);
     } finally {
         $anon->shutdown();
     }
@@ -292,22 +303,23 @@ if ($want('neg')) {
         $detail = '';
         try {
             $bad->send(new Message($anonTopic, 'should-not-send-either'));
-            $detail = '错 secretKey 意外发送成功';
+            $detail = 'unexpected send success with a wrong secretKey';
         } catch (Throwable $e) {
             $code = mt_broker_code($e);
             $denied = $code === ResponseCode::NO_PERMISSION;
             $detail = get_class($e) . ' code=' . var_export($code, true) . ' msg=' . $e->getMessage();
         }
-        $check($denied, 'N2 错误 secretKey 被 broker 拒绝，响应码恰为 16', $detail);
+        $check($denied, 'N2 wrong secretKey rejected by the broker, response code exactly 16', $detail);
     } finally {
         $bad->shutdown();
     }
 
-    // 探针实例收干净后再起带凭据的客户端（歇 1s 让注销落定）。
+    // Start the credentialed clients only after the probe instances are shut down (rest 1s to
+    // let the deregistration settle).
     sleep(1);
 }
 
-// ---------------------------------------------------------------- 正向腿共用客户端
+// ---------------------------------------------------------------- shared clients for positive legs
 $admin = mt_new_admin($ns, $acl, 'aclmt-admin-' . $stamp);
 $createdTopics = [];
 $shutdowns = [];
@@ -319,7 +331,7 @@ try {
     $admin->shutdown();
     exit(1);
 }
-$check(true, 'P0 带凭据 admin 与 broker 集群握手成功', 'broker=' . $brokerName);
+$check(true, 'P0 credentialed admin handshakes with the broker cluster', 'broker=' . $brokerName);
 
 $ensureTopic = static function (string $topic, int $queues) use ($admin, $brokerName, &$createdTopics): void {
     $admin->createTopic($brokerName, $topic, $queues);
@@ -327,9 +339,10 @@ $ensureTopic = static function (string $topic, int $queues) use ($admin, $broker
 };
 
 /**
- * 起一个带凭据的 push 消费者，在窗口内 tick 到 expect 条（或超时），再额外 settle
- * 秒持续 tick（给"不该出现的第 expect+1 条"留出暴露时间），返回记账盒。
- * 读回一律 CONSUME_FROM_FIRST_OFFSET + 全新分组，不受历史位点影响。
+ * Starts a credentialed push consumer, ticks within the window until expect messages arrive (or
+ * the window expires), then keeps ticking for an extra settle seconds (giving any unexpected
+ * expect+1-th message time to surface), and returns the accounting box.
+ * Read-backs always use CONSUME_FROM_FIRST_OFFSET + a brand-new group, immune to historical offsets.
  */
 $readBack = static function (string $topic, string $suffix, int $expect, float $windowSec,
     string $sub = '*', bool $orderly = false, float $settleSec = 0.0)
@@ -339,7 +352,8 @@ $readBack = static function (string $topic, string $suffix, int $expect, float $
     $c->setNamesrvAddr($ns);
     $c->setInstanceName('aclmt-rc-' . $suffix . '-' . $stamp);
     $c->setConsumeFromWhere(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
-    // 单线程 tick 顺序轮询各队列：空闲队列的挂起长轮询会把窗口耗光，把两端都调短。
+    // Single-threaded tick polls queues in order: suspended long polls on idle queues would burn
+    // the whole window, so both ends are shortened.
     $c->pullSuspendTimeoutMillis = 1000;
     $c->pullTimeoutMillis = 3000;
     $c->setMessageListener($orderly ? new MtOrderlyListener($box) : new MtConcurrentListener($box));
@@ -361,7 +375,8 @@ $readBack = static function (string $topic, string $suffix, int $expect, float $
 $producer = mt_new_producer($ns, 'GID_' . $prefix . '_prod', $acl, 'aclmt-prod-' . $stamp);
 $shutdowns[] = static fn () => $producer->shutdown();
 
-// 带重试的发送：新集群/路由注册抖动不该伪装成消息类型缺陷。
+// Send with retries: fresh-cluster / route-registration jitter must not masquerade as a
+// message-type defect.
 $sendWithRetry = static function (callable $send) use ($producer): mixed {
     $last = null;
     for ($i = 0; $i < 10; $i++) {
@@ -369,7 +384,7 @@ $sendWithRetry = static function (callable $send) use ($producer): mixed {
             return $send();
         } catch (Throwable $e) {
             $last = $e;
-            // 鉴权被拒没有重试的意义，直接上抛让腿自己断言。
+            // An auth rejection has nothing to retry; rethrow and let the leg assert it.
             if (mt_broker_code($e) === ResponseCode::NO_PERMISSION) {
                 throw $e;
             }
@@ -379,9 +394,9 @@ $sendWithRetry = static function (callable $send) use ($producer): mixed {
     throw $last ?? new RuntimeException('send never succeeded');
 };
 
-// ---------------------------------------------------------------- S1 同步普通
+// ---------------------------------------------------------------- S1 sync normal
 if ($want('normal')) {
-    echo PHP_EOL . '--- S1 sync 普通消息 ---' . PHP_EOL;
+    echo PHP_EOL . '--- S1 sync normal messages ---' . PHP_EOL;
     $topic = $prefix . '_Normal';
     $ensureTopic($topic, 1);
     $ok = 0;
@@ -389,21 +404,21 @@ if ($want('normal')) {
         $r = $sendWithRetry(static fn () => $producer->send(new Message($topic, $body)));
         $ok += $r->sendStatus === SendStatus::SEND_OK ? 1 : 0;
     }
-    $check($ok === 3, 'S1 带凭据 sync 发送 3 条 SEND_OK', 'ok=' . $ok);
+    $check($ok === 3, 'S1 credentialed sync sends 3 messages with SEND_OK', 'ok=' . $ok);
     $box = $readBack($topic, 'normal', 3, 30.0);
-    $check($box->sortedBodies() === ['norm-0', 'norm-1', 'norm-2'], 'S1 push 读回 3 条且内容一致',
+    $check($box->sortedBodies() === ['norm-0', 'norm-1', 'norm-2'], 'S1 push reads back 3 messages with matching content',
         'got=' . implode(',', $box->bodies()));
 }
 
-// ---------------------------------------------------------------- S2 异步
+// ---------------------------------------------------------------- S2 async
 if ($want('async')) {
-    echo PHP_EOL . '--- S2 sendAsync 回调链 ---' . PHP_EOL;
+    echo PHP_EOL . '--- S2 sendAsync callback chain ---' . PHP_EOL;
     $topic = $prefix . '_Async';
     $ensureTopic($topic, 1);
     $okResults = [];
     $errors = [];
     foreach (['async-0', 'async-1', 'async-2'] as $body) {
-        // PHP 单线程：sendAsync 内部已泵到回调走完才返回。
+        // PHP single-threaded: sendAsync pumps internally until the callbacks have run before returning.
         $producer->sendAsync(new Message($topic, $body),
             new SendCallbackImpl(static function (?SendResult $r) use (&$okResults): void {
                 $okResults[] = $r;
@@ -414,15 +429,15 @@ if ($want('async')) {
     $statusOk = count($okResults) === 3 && count($errors) === 0
         && array_reduce($okResults, static fn (bool $c, ?SendResult $r): bool =>
             $c && $r !== null && $r->sendStatus === SendStatus::SEND_OK, true);
-    $check($statusOk, 'S2 异步回调 3 次全部 SEND_OK', 'ok=' . count($okResults) . ' err=' . implode(';', $errors));
+    $check($statusOk, 'S2 async callbacks fired 3 times, all SEND_OK', 'ok=' . count($okResults) . ' err=' . implode(';', $errors));
     $box = $readBack($topic, 'async', 3, 30.0);
-    $check($box->sortedBodies() === ['async-0', 'async-1', 'async-2'], 'S2 异步消息读回 3 条',
+    $check($box->sortedBodies() === ['async-0', 'async-1', 'async-2'], 'S2 async messages read back 3',
         'got=' . implode(',', $box->bodies()));
 }
 
 // ---------------------------------------------------------------- S3 oneway
 if ($want('oneway')) {
-    echo PHP_EOL . '--- S3 sendOneway（无应答，靠读回条数兜底） ---' . PHP_EOL;
+    echo PHP_EOL . '--- S3 sendOneway (no reply; falls back to read-back counts) ---' . PHP_EOL;
     $topic = $prefix . '_Oneway';
     $ensureTopic($topic, 1);
     $threw = '';
@@ -435,12 +450,12 @@ if ($want('oneway')) {
     }
     $box = $readBack($topic, 'oneway', 3, 30.0);
     $check($threw === '' && $box->sortedBodies() === ['ow-0', 'ow-1', 'ow-2'],
-        'S3 oneway 3 条被 broker 收下并读回', 'got=' . implode(',', $box->bodies()) . ' ' . $threw);
+        'S3 oneway: 3 messages accepted by the broker and read back', 'got=' . implode(',', $box->bodies()) . ' ' . $threw);
 }
 
-// ---------------------------------------------------------------- S4 批量
+// ---------------------------------------------------------------- S4 batch
 if ($want('batch')) {
-    echo PHP_EOL . '--- S4 批量 send(array)（SEND_BATCH_MESSAGE） ---' . PHP_EOL;
+    echo PHP_EOL . '--- S4 batch send(array) (SEND_BATCH_MESSAGE) ---' . PHP_EOL;
     $topic = $prefix . '_Batch';
     $ensureTopic($topic, 1);
     $batch = [
@@ -449,42 +464,42 @@ if ($want('batch')) {
         new Message($topic, 'batch-2'),
     ];
     $r = $sendWithRetry(static fn () => $producer->send($batch));
-    $check($r->sendStatus === SendStatus::SEND_OK, 'S4 批量发送 SEND_OK', (string) $r->sendStatus->name);
+    $check($r->sendStatus === SendStatus::SEND_OK, 'S4 batch send SEND_OK', (string) $r->sendStatus->name);
     $box = $readBack($topic, 'batch', 3, 30.0);
     $check($box->sortedBodies() === ['batch-0', 'batch-1', 'batch-2'],
-        'S4 批量消息逐条读回 3 条', 'got=' . implode(',', $box->bodies()));
+        'S4 batch messages read back one by one, 3 total', 'got=' . implode(',', $box->bodies()));
 }
 
-// ---------------------------------------------------------------- S5 延迟等级
+// ---------------------------------------------------------------- S5 delay level
 if ($want('delay')) {
-    echo PHP_EOL . '--- S5 延迟消息 set_delay_time_level(3)=10s ---' . PHP_EOL;
+    echo PHP_EOL . '--- S5 delayed message set_delay_time_level(3)=10s ---' . PHP_EOL;
     $topic = $prefix . '_Delay';
     $ensureTopic($topic, 1);
     $sendWithRetry(static fn () => $producer->send(new Message($topic, 'delay-normal')));
     $dm = new Message($topic, 'delay-level3');
-    $dm->setDelayTimeLevel(3); // messageDelayLevel 表里 3 = 10s
+    $dm->setDelayTimeLevel(3); // level 3 = 10s in the messageDelayLevel table
     $sendWithRetry(static fn () => $producer->send($dm));
 
     $box = $readBack($topic, 'delay', 2, 40.0);
     $delayed = $box->ofBody('delay-level3');
     $normal = $box->ofBody('delay-normal');
-    $check(count($delayed) === 1 && count($normal) === 1, 'S5 延迟与对照消息都被读回',
+    $check(count($delayed) === 1 && count($normal) === 1, 'S5 both the delayed and the control message read back',
         'delayed=' . count($delayed) . ' normal=' . count($normal));
     if ($delayed !== []) {
         $drift = $delayed[0]->storeTimestamp - $delayed[0]->bornTimestamp;
-        $check($drift >= 8000, 'S5 延迟生效（store_ts-born_ts >= 8s，等级 3=10s）', 'drift=' . $drift . 'ms');
+        $check($drift >= 8000, 'S5 delay took effect (store_ts-born_ts >= 8s, level 3=10s)', 'drift=' . $drift . 'ms');
     } else {
-        $check(false, 'S5 延迟生效（store_ts-born_ts >= 8s，等级 3=10s）', '无延迟消息可校验');
+        $check(false, 'S5 delay took effect (store_ts-born_ts >= 8s, level 3=10s)', 'no delayed message to verify');
     }
     if ($normal !== []) {
         $ndrift = $normal[0]->storeTimestamp - $normal[0]->bornTimestamp;
-        $check($ndrift < 5000, 'S5 对照普通消息未被延迟', 'drift=' . $ndrift . 'ms');
+        $check($ndrift < 5000, 'S5 control normal message was not delayed', 'drift=' . $ndrift . 'ms');
     }
 }
 
-// ---------------------------------------------------------------- S6 定时（timer）
+// ---------------------------------------------------------------- S6 timer
 if ($want('timer')) {
-    echo PHP_EOL . '--- S6 定时消息 TIMER_DELIVER_MS=+5s ---' . PHP_EOL;
+    echo PHP_EOL . '--- S6 timer message TIMER_DELIVER_MS=+5s ---' . PHP_EOL;
     $topic = $prefix . '_Timer';
     $ensureTopic($topic, 1);
     $deliverAt = (int) (microtime(true) * 1000) + 5000;
@@ -494,18 +509,18 @@ if ($want('timer')) {
 
     $box = $readBack($topic, 'timer', 1, 40.0);
     $hit = $box->ofBody('timer-5s');
-    $check(count($hit) === 1, 'S6 定时消息到点投递并被读回', 'got=' . count($hit));
+    $check(count($hit) === 1, 'S6 timer message delivered on time and read back', 'got=' . count($hit));
     if ($hit !== []) {
         $drift = $hit[0]->storeTimestamp - $hit[0]->bornTimestamp;
-        $check($drift >= 4000, 'S6 定时生效（store_ts-born_ts >= 4s，投递点=+5s）', 'drift=' . $drift . 'ms');
+        $check($drift >= 4000, 'S6 timer took effect (store_ts-born_ts >= 4s, deliver point=+5s)', 'drift=' . $drift . 'ms');
     } else {
-        $check(false, 'S6 定时生效（store_ts-born_ts >= 4s，投递点=+5s）', '无定时消息可校验');
+        $check(false, 'S6 timer took effect (store_ts-born_ts >= 4s, deliver point=+5s)', 'no timer message to verify');
     }
 }
 
-// ---------------------------------------------------------------- S7 事务
+// ---------------------------------------------------------------- S7 transaction
 if ($want('tx')) {
-    echo PHP_EOL . '--- S7 事务消息：半消息 → 本地 COMMIT → END_TRANSACTION → 读回 ---' . PHP_EOL;
+    echo PHP_EOL . '--- S7 transactional message: half message -> local COMMIT -> END_TRANSACTION -> read back ---' . PHP_EOL;
     $topic = $prefix . '_Tx';
     $ensureTopic($topic, 1);
     $listener = new MtCommitListener();
@@ -513,20 +528,20 @@ if ($want('tx')) {
     $tsr = $sendWithRetry(static fn () => $producer->sendMessageInTransaction(
         new Message($topic, 'tx-commit'), $listener));
     $halfOk = $tsr->getSendStatus() === SendStatus::SEND_OK;
-    $check($halfOk, 'S7 半消息发送 SEND_OK',
+    $check($halfOk, 'S7 half message sent with SEND_OK',
         'status=' . $tsr->getSendStatus()->name . ' txId=' . var_export($tsr->getTransactionId(), true));
-    $check($listener->executed === ['tx-commit'], 'S7 本地事务被执行一次',
+    $check($listener->executed === ['tx-commit'], 'S7 local transaction executed exactly once',
         'executed=' . implode(',', $listener->executed));
     $check($tsr->getLocalTransactionState() === LocalTransactionState::COMMIT_MESSAGE,
-        'S7 终态为 COMMIT_MESSAGE', var_export($tsr->getLocalTransactionState()?->name, true));
+        'S7 final state is COMMIT_MESSAGE', var_export($tsr->getLocalTransactionState()?->name, true));
     $box = $readBack($topic, 'tx', 1, 40.0);
-    $check(count($box->ofBody('tx-commit')) === 1, 'S7 提交后消息可从 broker 读回（变得可消费）',
+    $check(count($box->ofBody('tx-commit')) === 1, 'S7 after commit the message is readable from the broker (became consumable)',
         'got=' . implode(',', $box->bodies()));
 }
 
-// ---------------------------------------------------------------- S8 顺序
+// ---------------------------------------------------------------- S8 orderly
 if ($want('order')) {
-    echo PHP_EOL . '--- S8 顺序消息：sendBySelector 同 arg 同队列 + 顺序消费保序 ---' . PHP_EOL;
+    echo PHP_EOL . '--- S8 orderly messages: sendBySelector same arg same queue + ordered consumption preserves order ---' . PHP_EOL;
     $topic = $prefix . '_Order';
     $ensureTopic($topic, 4);
     $sentOrder = [];
@@ -540,15 +555,15 @@ if ($want('order')) {
             $qids[$r->messageQueue->queueId] = true;
         }
     }
-    $check(count($qids) === 1, 'S8 同 arg 全部路由到同一队列', 'distinct_qids=' . implode(',', array_keys($qids)));
+    $check(count($qids) === 1, 'S8 same arg routes all messages to the same queue', 'distinct_qids=' . implode(',', array_keys($qids)));
     $box = $readBack($topic, 'order', 10, 40.0, '*', orderly: true);
-    $check($box->bodies() === $sentOrder, 'S8 顺序消费按发送序读回 10 条',
+    $check($box->bodies() === $sentOrder, 'S8 orderly consumption reads back 10 messages in send order',
         'got=' . implode(',', $box->bodies()));
 }
 
-// ---------------------------------------------------------------- S9 Tag 过滤
+// ---------------------------------------------------------------- S9 Tag filter
 if ($want('tag')) {
-    echo PHP_EOL . '--- S9 Tag 过滤消费（服务端只投 TagA） ---' . PHP_EOL;
+    echo PHP_EOL . '--- S9 Tag-filtered consumption (server delivers only TagA) ---' . PHP_EOL;
     $topic = $prefix . '_Tag';
     $ensureTopic($topic, 1);
     for ($i = 0; $i < 3; $i++) {
@@ -557,10 +572,12 @@ if ($want('tag')) {
     for ($i = 0; $i < 3; $i++) {
         $sendWithRetry(static fn () => $producer->send(new Message($topic, "tagB-$i", 'TagB')));
     }
-    // 先用 * 订阅把 6 条都读回来（TagB 也要落队），再换 TagA 订阅断言服务端过滤。
+    // First read all 6 back with a * subscription (TagB must land in the queue too), then switch
+    // to a TagA subscription to assert server-side filtering.
     $all = $readBack($topic, 'tagall', 6, 30.0);
-    $check(count($all->msgs) === 6, 'S9 两种 Tag 共 6 条都落队', 'got=' . count($all->msgs));
-    // settle 窗：达到 3 条后继续 tick 一段，让"混进来的 TagB"有机会现身再计数。
+    $check(count($all->msgs) === 6, 'S9 all 6 messages of both Tags landed in the queue', 'got=' . count($all->msgs));
+    // Settle window: after reaching 3, keep ticking for a while so any "strayed TagB" gets a
+    // chance to show up before counting.
     $onlyA = $readBack($topic, 'taga', 3, 30.0, 'TagA', false, 5.0);
     $tagsOk = count($onlyA->msgs) === 3;
     foreach ($onlyA->msgs as $m) {
@@ -568,19 +585,19 @@ if ($want('tag')) {
             $tagsOk = false;
         }
     }
-    $check($tagsOk, 'S9 TagA 订阅只收到 3 条且全为 TagA',
+    $check($tagsOk, 'S9 TagA subscription receives only 3 messages, all TagA',
         'got=' . implode(',', $onlyA->bodies()));
 }
 
-// ---------------------------------------------------------------- S10 Key 查询
+// ---------------------------------------------------------------- S10 Key query
 if ($want('key')) {
-    echo PHP_EOL . '--- S10 消息 Key + 服务端按 Key 查询 ---' . PHP_EOL;
+    echo PHP_EOL . '--- S10 message Key + server-side query by Key ---' . PHP_EOL;
     $topic = $prefix . '_Key';
     $ensureTopic($topic, 1);
     $key = 'ACLMTKEY_' . $stamp;
     $r = $sendWithRetry(static fn () => $producer->send(new Message($topic, 'key-payload', 'KeyTag', $key)));
-    $check($r->sendStatus === SendStatus::SEND_OK, 'S10 带 Key 消息发送 SEND_OK', 'key=' . $key);
-    // broker 的 Key 索引异步构建：轮询到命中为止。
+    $check($r->sendStatus === SendStatus::SEND_OK, 'S10 message with Key sent SEND_OK', 'key=' . $key);
+    // The broker's Key index builds asynchronously: poll until it hits.
     $found = [];
     $hit = mt_wait_until(20.0, function () use ($admin, $topic, $key, &$found): bool {
         try {
@@ -591,16 +608,16 @@ if ($want('key')) {
         }
     });
     $bodies = array_map(static fn (MessageExt $m): string => (string) $m->getBody(), $found);
-    $check($hit && in_array('key-payload', $bodies, true), 'S10 服务端按 Key 查询命中',
+    $check($hit && in_array('key-payload', $bodies, true), 'S10 server-side query by Key hits',
         'returned=' . implode(',', $bodies));
     $box = $readBack($topic, 'key', 1, 30.0);
     $keysOk = count($box->msgs) === 1 && $box->msgs[0]->getKeys() === $key;
-    $check($keysOk, 'S10 读回消息的 KEYS 属性一致', 'got=' . implode(',', $box->bodies()));
+    $check($keysOk, 'S10 KEYS property of the read-back message matches', 'got=' . implode(',', $box->bodies()));
 }
 
-// ---------------------------------------------------------------- S11 用户属性
+// ---------------------------------------------------------------- S11 user properties
 if ($want('prop')) {
-    echo PHP_EOL . '--- S11 用户属性透传 ---' . PHP_EOL;
+    echo PHP_EOL . '--- S11 user property pass-through ---' . PHP_EOL;
     $topic = $prefix . '_Prop';
     $ensureTopic($topic, 1);
     for ($i = 0; $i < 3; $i++) {
@@ -616,16 +633,16 @@ if ($want('prop')) {
             $propOk = false;
         }
     }
-    $check($propOk, 'S11 用户属性 city/env 端到端透传（3 条）', 'got=' . implode(',', $box->bodies()));
+    $check($propOk, 'S11 user properties city/env pass through end to end (3 messages)', 'got=' . implode(',', $box->bodies()));
 }
 
-// ---------------------------------------------------------------- 收尾
-echo PHP_EOL . '--- 收尾 ---' . PHP_EOL;
+// ---------------------------------------------------------------- teardown
+echo PHP_EOL . '--- teardown ---' . PHP_EOL;
 foreach ($shutdowns as $fn) {
     try {
         $fn();
     } catch (Throwable) {
-        // 收尾失败不影响结果
+        // Teardown failures must not affect the result
     }
 }
 if ($createdTopics !== []) {
@@ -637,7 +654,7 @@ if ($createdTopics !== []) {
     } catch (Throwable $e) {
         $delErr = $e->getMessage();
     }
-    $check($delErr === '', '清理：删除本轮创建的 topic', 'topics=' . count($createdTopics) . ' ' . $delErr);
+    $check($delErr === '', 'cleanup: delete the topics created this round', 'topics=' . count($createdTopics) . ' ' . $delErr);
 }
 $admin->shutdown();
 

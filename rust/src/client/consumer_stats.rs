@@ -1,12 +1,12 @@
-//! * [`StatsItem`] 持有**累计值** value / times（只增不减），以及两条采样快照链：
-//!   `minute`（每 10s 采一个累计点）与 `hour`（每 10 分钟采一个累计点）；
-//! * 快照计算 [`compute_stats_data`]：
+//! * [`StatsItem`] holds the **cumulative** value / times (only ever growing), plus two sampled snapshot chains:
+//!   `minute` (one cumulative point every 10s) and `hour` (one cumulative point every 10 minutes);
+//! * snapshot math in [`compute_stats_data`]:
 //!
 //!   ```text
-//!   sum       = last.value - first.value             # 窗口内的增量
-//!   tps       = sum * 1000.0 / (last.ts - first.ts)  # 每秒（注意不是每分钟！）
+//!   sum       = last.value - first.value             # the delta within the window
+//!   tps       = sum * 1000.0 / (last.ts - first.ts)  # per second (mind: not per minute!)
 //!   timesDiff = last.times - first.times
-//!   avgpt     = timesDiff > 0 ? sum / timesDiff : 0  # "每次调用的平均量"——RT 项即平均耗时
+//!   avgpt     = timesDiff > 0 ? sum / timesDiff : 0  # "average per call" -- for the RT item that is the average latency
 //!   ```
 
 use std::collections::{BTreeMap, VecDeque};
@@ -26,33 +26,33 @@ use crate::{bail, rmq_debug};
 pub const SAMPLING_INTERVAL_SECONDS: f64 = 10.0;
 pub const HOUR_SAMPLING_INTERVAL_SECONDS: f64 = 600.0;
 pub const MINUTE_LIST_MAX: usize = 60;
-/// 小时快照链长度。
+/// Hour snapshot chain length.
 pub const HOUR_LIST_MAX: usize = 60;
-/// 每多少轮分钟采样做一次小时采样：`600s / 10s = 60`（写死的 `% 60`）。
+/// How many minute-sampling rounds make one hour sample: `600s / 10s = 60` (the hardcoded `% 60`).
 pub const HOUR_SAMPLING_ROUNDS: u64 =
     (HOUR_SAMPLING_INTERVAL_SECONDS / SAMPLING_INTERVAL_SECONDS) as u64;
 
 pub type CallSnapshot = (i64, i64, i64);
 
-/// 锁中毒时照常取内值 —— 统计路径绝不允许 panic 把业务线程带下去。
+/// On lock poisoning, take the inner value anyway -- the stats path must never let a panic drag business threads down.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct StatsSnapshot {
-    /// 窗口内的累计增量。
+    /// The cumulative delta within the window.
     pub sum: i64,
-    /// 每秒量（`sum * 1000 / span_ms`）。
+    /// Per-second rate (`sum * 1000 / span_ms`).
     pub tps: f64,
-    /// 每次调用的平均量（RT 项即平均耗时，毫秒）。
+    /// Average per call (for the RT item, the average latency in milliseconds).
     pub avgpt: f64,
-    /// 窗口内的调用次数增量。
+    /// The call-count delta within the window.
     pub times: i64,
 }
 
 impl fmt::Display for StatsSnapshot {
-    /// 固定展示格式，逐字校验（tps/avgpt 保留两位小数）。
+    /// Fixed display format, verified verbatim (tps/avgpt keep two decimals).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -96,13 +96,13 @@ pub struct StatsItem {
 struct ItemState {
     value: i64,
     times: i64,
-    /// 元素 = `(timestamp_ms, 累计 value, 累计 times)`。
+    /// Element = `(timestamp_ms, cumulative value, cumulative times)`.
     minute: VecDeque<CallSnapshot>,
     hour: VecDeque<CallSnapshot>,
 }
 
 impl StatsItem {
-    /// 新建统计项：`stats_name` + `stats_key`（key 一般是 `topic@group`）。
+    /// Creates a stats item: `stats_name` + `stats_key` (the key is usually `topic@group`).
     pub fn new(stats_name: impl Into<String>, stats_key: impl Into<String>) -> StatsItem {
         StatsItem {
             stats_name: stats_name.into(),
@@ -111,12 +111,12 @@ impl StatsItem {
         }
     }
 
-    /// 统计名（`PULL_RT` / `PULL_TPS` / ...）。
+    /// The stats name (`PULL_RT` / `PULL_TPS` / ...).
     pub fn stats_name(&self) -> &str {
         &self.stats_name
     }
 
-    /// 统计 key（`topic@group`）。
+    /// The stats key (`topic@group`).
     pub fn stats_key(&self) -> &str {
         &self.stats_key
     }
@@ -127,27 +127,27 @@ impl StatsItem {
         state.times += inc_times;
     }
 
-    /// 当前累计 value。
+    /// The current cumulative value.
     pub fn value(&self) -> i64 {
         lock(&self.state).value
     }
 
-    /// 当前累计 times。
+    /// The current cumulative times.
     pub fn times(&self) -> i64 {
         lock(&self.state).times
     }
 
-    /// 追加分钟级采样点（每 10s 由采样任务调用），时钟取 `current_time_millis()`。
+    /// Appends a minute-level sample point (called by the sampler every 10s); the clock is `current_time_millis()`.
     ///
-    /// 细微差别：先读时钟再取锁 —— 采样点内容
-    /// （累计 value/times）仍在锁内取，口径不变。
+    /// Subtle difference: the clock is read before taking the lock -- the sample point contents
+    /// (cumulative value/times) are still read under the lock, same accounting as before.
     pub fn sample(&self) {
         let ts = current_time_millis();
         self.sample_at(ts);
     }
 
-    /// [`StatsItem::sample`] 的显式时钟版本（供单测注入采样时刻）：
-    /// 单测与"补采历史点"都靠它，无需睡墙钟。
+    /// Explicit-clock variant of [`StatsItem::sample`] (lets tests inject the sampling moment):
+    /// both tests and "back-filling historical points" rely on it, with no wall-clock sleeping.
     pub fn sample_at(&self, ts_ms: i64) {
         let mut state = lock(&self.state);
         let point = (ts_ms, state.value, state.times);
@@ -157,13 +157,13 @@ impl StatsItem {
         }
     }
 
-    /// 追加点小时级采样点（每 10 分钟由采样任务调用）。
+    /// Appends an hour-level sample point (called by the sampler every 10 minutes).
     pub fn sample_hour(&self) {
         let ts = current_time_millis();
         self.sample_hour_at(ts);
     }
 
-    /// [`StatsItem::sample_hour`] 的显式时钟版本。
+    /// Explicit-clock variant of [`StatsItem::sample_hour`].
     pub fn sample_hour_at(&self, ts_ms: i64) {
         let mut state = lock(&self.state);
         let point = (ts_ms, state.value, state.times);
@@ -183,19 +183,19 @@ impl StatsItem {
         compute_stats_data_pair(state.hour.front(), state.hour.back())
     }
 
-    /// 分钟链当前长度。
+    /// The current minute-chain length.
     pub fn minute_len(&self) -> usize {
         lock(&self.state).minute.len()
     }
 
-    /// 小时链当前长度。
+    /// The current hour-chain length.
     pub fn hour_len(&self) -> usize {
         lock(&self.state).hour.len()
     }
 }
 
-/// `Clone` 是**同一张表**的另一个句柄（内部 `Arc<Mutex<BTreeMap>>`），
-/// 所以 manager 可以把某个 set 交给调用方长期持有。
+/// `Clone` is another handle onto **the same table** (internally `Arc<Mutex<BTreeMap>>`),
+/// so the manager can hand a set to callers for long-term holding.
 #[derive(Clone)]
 pub struct StatsItemSet {
     stats_name: String,
@@ -212,7 +212,7 @@ impl fmt::Debug for StatsItemSet {
 }
 
 impl StatsItemSet {
-    /// 按名字建 item 集合。
+    /// Creates an item set by name.
     pub fn new(stats_name: impl Into<String>) -> StatsItemSet {
         StatsItemSet {
             stats_name: stats_name.into(),
@@ -224,7 +224,7 @@ impl StatsItemSet {
         &self.stats_name
     }
 
-    /// 不存在就建，存在就返回同一个 item。
+    /// Creates when absent; when present, returns the same item.
     pub fn get_and_create(&self, key: &str) -> Arc<StatsItem> {
         let mut items = lock(&self.items);
         items
@@ -233,22 +233,22 @@ impl StatsItemSet {
             .clone()
     }
 
-    /// 只查不建：不存在返回 None（**不**创建，consume_status 就靠这点跳过零值）。
+    /// Lookup only, never creates: returns None when absent (**no** creation; `consume_status` relies on this to skip zero values).
     pub fn find(&self, key: &str) -> Option<Arc<StatsItem>> {
         lock(&self.items).get(key).cloned()
     }
 
-    /// 取或建，然后累加。
+    /// Gets or creates, then accumulates.
     pub fn add_value(&self, key: &str, inc_value: i64, inc_times: i64) {
         self.get_and_create(key).add_value(inc_value, inc_times);
     }
 
-    /// 现有 key（字典序，见模块头的差异说明 5）。
+    /// Existing keys (lexicographic; see difference note 5 in the module header).
     pub fn keys(&self) -> Vec<String> {
         lock(&self.items).keys().cloned().collect()
     }
 
-    /// 巡采本 set 的所有 item（分钟级）。
+    /// Samples every item in this set (minute level).
     pub fn sample_all(&self) {
         for key in self.keys() {
             if let Some(item) = self.find(&key) {
@@ -257,7 +257,7 @@ impl StatsItemSet {
         }
     }
 
-    /// 巡采本 set 的所有 item（小时级）。
+    /// Samples every item in this set (hour level).
     pub fn sample_hour_all(&self) {
         for key in self.keys() {
             if let Some(item) = self.find(&key) {
@@ -267,7 +267,7 @@ impl StatsItemSet {
     }
 }
 
-/// 五个 set 的集合，字段顺序即巡采顺序。
+/// The bundle of five sets; field order is the sampling order.
 #[derive(Debug, Clone)]
 struct Sets {
     topic_and_group_pull_rt: StatsItemSet,
@@ -289,7 +289,7 @@ impl Sets {
     }
 }
 
-/// 采样线程的退出信号。
+/// Exit signal for the sampling task.
 #[derive(Debug, Default)]
 struct StopSignal {
     stopped: AtomicBool,
@@ -323,18 +323,18 @@ impl StopSignal {
 struct Inner {
     sets: Sets,
     sampler: Mutex<Option<JoinHandle<()>>>,
-    /// 单独放在 `Arc` 里：采样任务强引用它、弱引用 `Inner`，
-    /// 这样 manager 被丢弃时任务能自行退出，而 shutdown 又能立刻唤醒它。
+    /// Kept in its own `Arc`: the sampling task strongly references it and weakly references `Inner`,
+    /// so the task exits by itself once the manager is dropped, while shutdown can still wake it instantly.
     stop: Arc<StopSignal>,
     sampling_interval: Duration,
     hour_every_rounds: u64,
 }
 
-/// 五个 [`StatsItemSet`]，key 一律是 `topic@group`：
-/// PULL_RT / PULL_TPS / CONSUME_RT / CONSUME_OK_TPS / CONSUME_FAILED_TPS。
-/// [`ConsumerStatsManager::start`] 起一个统一采样任务（10s 分钟级 + 每 60 轮即 10 分钟做小时级）。
+/// Five [`StatsItemSet`]s, keys always `topic@group`:
+/// PULL_RT / PULL_TPS / CONSUME_RT / CONSUME_OK_TPS / CONSUME_FAILED_TPS.
+/// [`ConsumerStatsManager::start`] spawns one unified sampling task (10s minute-level + hour-level every 60 rounds, i.e. 10 minutes).
 ///
-/// `Clone` 共享同一个实例（内部 `Arc`），可以直接 `Arc::new` 给客户端在任务间传。
+/// `Clone` shares the same instance (internally an `Arc`); wrap it in `Arc::new` and pass it between the client's tasks.
 #[derive(Clone)]
 pub struct ConsumerStatsManager {
     inner: Arc<Inner>,
@@ -357,7 +357,7 @@ impl Default for ConsumerStatsManager {
 }
 
 impl ConsumerStatsManager {
-    /// 五个 set + 默认 10s/600s 采样参数。
+    /// The five sets + default 10s/600s sampling parameters.
     pub fn new() -> ConsumerStatsManager {
         ConsumerStatsManager::with_sampling(
             Duration::from_secs_f64(SAMPLING_INTERVAL_SECONDS),
@@ -365,9 +365,9 @@ impl ConsumerStatsManager {
         )
     }
 
-    /// 注入采样周期与"每多少轮做一次小时采样"，测试用毫秒级周期跑完整闭环。
+    /// Injects the sampling period and the "hour sample every N rounds"; tests run the full loop with millisecond periods.
     ///
-    /// `hour_every_rounds == 0` 表示关闭小时采样（避免取模除零）。
+    /// `hour_every_rounds == 0` disables hour sampling (avoiding a modulo division by zero).
     pub fn with_sampling(
         sampling_interval: Duration,
         hour_every_rounds: u64,
@@ -389,12 +389,12 @@ impl ConsumerStatsManager {
         }
     }
 
-    // ---------------- 生命周期 ----------------
+    // ---------------- lifecycle ----------------
 
-    /// 起统一采样任务。
+    /// Starts the unified sampling task.
     ///
-    /// 需要当前线程在 tokio 运行时里（`MQClientInstance` 的 start 本来就跑在异步上下文）；
-    /// 不在 tokio 运行时里时**返回 Err**（后台任务必须有宿主运行时）。
+    /// Requires the current thread to be inside a tokio runtime (`MQClientInstance`'s start already runs in an async context);
+    /// outside a tokio runtime it **returns Err** (a background task must have a host runtime).
     pub fn start(&self) -> Result<()> {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
@@ -408,8 +408,8 @@ impl ConsumerStatsManager {
         }
     }
 
-    /// 显式给运行时的 [`crate::remoting::client::RemotingClient::runtime_handle`]。
-    /// 重复调用是 no-op。
+    /// Explicit-runtime variant for [`crate::remoting::client::RemotingClient::runtime_handle`].
+    /// A repeated call is a no-op.
     pub fn start_with_handle(&self, handle: &tokio::runtime::Handle) {
         let mut slot = lock(&self.inner.sampler);
         if slot.as_ref().is_some_and(|task| !task.is_finished()) {
@@ -424,10 +424,10 @@ impl ConsumerStatsManager {
         rmq_debug!("consumer stats sampler started, interval={interval:?}");
     }
 
-    /// 置停止位、唤醒并 abort 采样任务。
+    /// Sets the stop flag, wakes, and aborts the sampling task.
     ///
-    /// 这里不阻塞（同步上下文不能 block_on），
-    /// abort 后任务立即消失，之后再 `start()` 会重新起一个。
+    /// It does not block here (a sync context cannot block_on);
+    /// after abort the task disappears at once, and a later `start()` spawns a fresh one.
     pub fn shutdown(&self) {
         self.inner.stop.stop();
         let task = lock(&self.inner.sampler).take();
@@ -437,23 +437,23 @@ impl ConsumerStatsManager {
         rmq_debug!("consumer stats sampler shutdown");
     }
 
-    /// 采样任务是否在跑。
+    /// Whether the sampling task is running.
     pub fn is_running(&self) -> bool {
         lock(&self.inner.sampler)
             .as_ref()
             .is_some_and(|task| !task.is_finished())
     }
 
-    // ---------------- 巡采（循环体） ----------------
+    // ---------------- sampling (loop body) ----------------
 
-    /// 全量巡采一轮分钟点。
+    /// Samples one full round of minute points.
     pub fn sample_all(&self) {
         for set in self.inner.sets.as_slice() {
             set.sample_all();
         }
     }
 
-    /// 全量巡采一轮小时点。
+    /// Samples one full round of hour points.
     pub fn sample_hour_all(&self) {
         for set in self.inner.sets.as_slice() {
             set.sample_hour_all();
@@ -461,7 +461,7 @@ impl ConsumerStatsManager {
     }
 
 
-    /// 统计键：`topic@group`，注意是 **topic 在前**。
+    /// The stats key: `topic@group`; note **topic comes first**.
     pub fn key(topic: &str, group: &str) -> String {
         format!("{topic}@{group}")
     }
@@ -501,29 +501,29 @@ impl ConsumerStatsManager {
             .add_value(&Self::key(topic, group), msgs, 1);
     }
 
-    // ---------------- 查询 ----------------
+    // ---------------- queries ----------------
 
-    /// 五个 set 的句柄（公开属性）。
+    /// Handles to the five sets (public accessors).
     pub fn topic_and_group_pull_rt(&self) -> StatsItemSet {
         self.inner.sets.topic_and_group_pull_rt.clone()
     }
 
-    /// 见 [`ConsumerStatsManager::topic_and_group_pull_rt`]。
+    /// See [`ConsumerStatsManager::topic_and_group_pull_rt`].
     pub fn topic_and_group_pull_tps(&self) -> StatsItemSet {
         self.inner.sets.topic_and_group_pull_tps.clone()
     }
 
-    /// 见 [`ConsumerStatsManager::topic_and_group_pull_rt`]。
+    /// See [`ConsumerStatsManager::topic_and_group_pull_rt`].
     pub fn topic_and_group_consume_rt(&self) -> StatsItemSet {
         self.inner.sets.topic_and_group_consume_rt.clone()
     }
 
-    /// 见 [`ConsumerStatsManager::topic_and_group_pull_rt`]。
+    /// See [`ConsumerStatsManager::topic_and_group_pull_rt`].
     pub fn topic_and_group_consume_ok_tps(&self) -> StatsItemSet {
         self.inner.sets.topic_and_group_consume_ok_tps.clone()
     }
 
-    /// 见 [`ConsumerStatsManager::topic_and_group_pull_rt`]。
+    /// See [`ConsumerStatsManager::topic_and_group_pull_rt`].
     pub fn topic_and_group_consume_failed_tps(&self) -> StatsItemSet {
         self.inner.sets.topic_and_group_consume_failed_tps.clone()
     }
@@ -551,8 +551,8 @@ impl ConsumerStatsManager {
     }
 }
 
-/// 一轮巡采：分钟点必采，小时点按 `rounds % hour_every_rounds == 0` 决定
-/// （`rounds` 从 1 开始）。
+/// One sampling round: minute points always, hour points only when `rounds % hour_every_rounds == 0`
+/// (`rounds` starts at 1).
 fn sample_round(inner: &Inner, rounds: u64) {
     for set in inner.sets.as_slice() {
         set.sample_all();
@@ -564,10 +564,10 @@ fn sample_round(inner: &Inner, rounds: u64) {
     }
 }
 
-/// 采样任务主体：先等一个周期再巡采（"先等后采"的次序）。
+/// Sampling task body: wait one period first, then sample (the "wait first, sample after" order).
 ///
-/// 只强引用 `StopSignal`、弱引用 `Inner`：manager 被丢弃后任务自行退出，
-/// 不把进程拖住。
+/// It strongly references only `StopSignal` and weakly `Inner`: once the manager is dropped the task exits by itself,
+/// without holding the process hostage.
 async fn sample_loop(
     inner: Weak<Inner>,
     stop: Arc<StopSignal>,
@@ -589,7 +589,7 @@ async fn sample_loop(
             break;
         }
         let Some(inner) = inner.upgrade() else {
-            // manager 已丢弃 —— 任务自行退出，不 panic
+            // manager already dropped -- the task exits by itself, no panic
             rmq_debug!("consumer stats sampler exits: manager dropped");
             return;
         };
@@ -628,13 +628,13 @@ mod tests {
 
     #[test]
     fn tps_formula_on_two_points() {
-        // 两个累计点：10 秒内 value 增 30、times 增 3 -> tps 3/s、avgpt 10
+        // two cumulative points: value +30 and times +3 over 10 seconds -> tps 3/s, avgpt 10
         let ss = compute_stats_data(&[(0, 100, 10), (10_000, 130, 13)]);
         assert_eq!(ss.sum, 30);
         assert!(almost(ss.tps, 3.0));
         assert!(almost(ss.avgpt, 10.0));
         assert_eq!(ss.times, 3);
-        // 展示格式金标向量
+        // display-format golden vector
         assert_eq!(
             ss.to_string(),
             "StatsSnapshot(sum=30, tps=3.00, avgpt=10.00, times=3)"
@@ -652,7 +652,7 @@ mod tests {
 
     #[test]
     fn reversed_chain_keeps_negative_sums_but_zero_rates() {
-        // 金标向量：compute_stats_data([(10000,130,13),(0,100,10)])
+        // golden vector: compute_stats_data([(10000,130,13),(0,100,10)])
         // -> sum=-30 tps=0.00 avgpt=0.00 times=-3
         let ss = compute_stats_data(&[(10_000, 130, 13), (0, 100, 10)]);
         assert_eq!(ss.sum, -30);
@@ -663,7 +663,7 @@ mod tests {
 
     #[test]
     fn zero_times_diff_gives_zero_avgpt_even_with_positive_sum() {
-        // 金标向量：[(0,100,10),(1000,400,10)] -> sum=300 tps=300 avgpt=0 times=0
+        // golden vector: [(0,100,10),(1000,400,10)] -> sum=300 tps=300 avgpt=0 times=0
         let ss = compute_stats_data(&[(0, 100, 10), (1_000, 400, 10)]);
         assert_eq!(ss.sum, 300);
         assert!(almost(ss.tps, 300.0));
@@ -673,7 +673,7 @@ mod tests {
 
     #[test]
     fn fractional_rates_are_plain_float_division() {
-        // 金标向量：[(0,0,0),(3000,10,3)] -> tps=3.33.. avgpt=3.33..
+        // golden vector: [(0,0,0),(3000,10,3)] -> tps=3.33.. avgpt=3.33..
         let ss = compute_stats_data(&[(0, 0, 0), (3_000, 10, 3)]);
         assert!(almost(ss.tps, 10.0 / 3.0), "{ss}");
         assert!(almost(ss.avgpt, 10.0 / 3.0), "{ss}");
@@ -711,9 +711,9 @@ mod tests {
     fn minute_snapshot_diffs_two_cumulative_points() {
         let it = StatsItem::new("PULL_TPS", "T@G");
         it.add_value(10, 1);
-        it.sample_at(1_000); // 第一个累计点
+        it.sample_at(1_000); // first cumulative point
         it.add_value(15, 1);
-        it.sample_at(2_000); // 第二个累计点
+        it.sample_at(2_000); // second cumulative point
         let ss = it.get_stats_data_in_minute();
         assert_eq!(ss.sum, 15);
         assert_eq!(ss.times, 1);
@@ -724,7 +724,7 @@ mod tests {
 
     #[test]
     fn hour_window_is_separate_from_minute() {
-        // 累计差分：两点 (ts,100,2) -> (ts,400,4)：sum=300、timesDiff=2、avgpt=150
+        // cumulative diff: two points (ts,100,2) -> (ts,400,4): sum=300, timesDiff=2, avgpt=150
         let it = StatsItem::new("PULL_RT", "T@G");
         it.add_value(100, 2);
         it.sample_hour_at(0);
@@ -734,14 +734,14 @@ mod tests {
         assert_eq!(ss.sum, 300);
         assert_eq!(ss.times, 2);
         assert!(almost(ss.avgpt, 150.0));
-        // 分钟链没被小时采样污染
+        // the minute chain is untouched by the hour sampling
         assert_eq!(it.get_stats_data_in_minute(), StatsSnapshot::default());
     }
 
     #[test]
     fn both_chains_are_capped_and_oldest_points_are_dropped() {
-        // 固定场景（80 轮，每轮 add_value(1,1) 后按 ts=i 采样）：
-        //   链封顶 60 个点，first=(20,21,21)、last=(79,80,80)
+        // fixed scenario (80 rounds, each round add_value(1,1) then sample at ts=i):
+        //   the chain caps at 60 points, first=(20,21,21), last=(79,80,80)
         //   -> sum=59 tps=1000.00 avgpt=1.00 times=59
         let it = StatsItem::new("PULL_TPS", "T@G");
         for i in 0..80_i64 {
@@ -825,7 +825,7 @@ mod tests {
 
     #[test]
     fn inc_semantics_match_contract() {
-        // TPS 类：value=消息数、times=调用次数；RT 类：value=耗时、times=调用次数
+        // TPS kinds: value=message count, times=call count; RT kinds: value=elapsed time, times=call count
         let m = ConsumerStatsManager::new();
         m.inc_pull_tps(GROUP, TOPIC, 10);
         m.inc_pull_tps(GROUP, TOPIC, 20);
@@ -880,7 +880,7 @@ mod tests {
         assert_eq!(cs.consume_failed_msgs, 0);
     }
 
-    /// 直接喂累计快照点（间隔 1s），绕开采样任务。
+    /// Feeds cumulative snapshot points directly (1s apart), bypassing the sampling task.
     fn feed(set: &StatsItemSet, now_ms: i64) {
         let it = set.find(KEY).expect("item created by inc_*");
         let points = vec![(now_ms - 1_000, 0, 0), (now_ms, it.value(), it.times())];
@@ -893,10 +893,10 @@ mod tests {
 
     #[test]
     fn consume_status_maps_rt_to_avgpt_and_tps_to_tps() {
-        // 协议对齐用例：
+        // protocol-alignment case:
         //   pull_rt value=200/times=4 -> avgpt=50ms
         //   consume_rt value=40/times=4 -> avgpt=10ms
-        //   pull_tps value=20 -> tps=20/s（消息每秒）
+        //   pull_tps value=20 -> tps=20/s (messages per second)
         //   consume_ok_tps value=8 -> tps=8/s
         let m = ConsumerStatsManager::new();
         let now = current_time_millis();
@@ -915,7 +915,7 @@ mod tests {
         assert!(almost(cs.consume_rt, 10.0), "{cs:?}");
         assert!(almost(cs.pull_tps, 20.0), "{cs:?}");
         assert!(almost(cs.consume_ok_tps, 8.0), "{cs:?}");
-        // 没碰过的 failed 维度保持 0
+        // the untouched failed dimension stays 0
         assert!(almost(cs.consume_failed_tps, 0.0));
         assert_eq!(cs.consume_failed_msgs, 0);
     }
@@ -936,13 +936,13 @@ mod tests {
         }
         let cs = m.consume_status(GROUP, TOPIC);
         assert_eq!(cs.consume_failed_msgs, 7);
-        // 分钟链里没点 -> tps 走 0，而不是 hour 的值
+        // no points in the minute chain -> tps falls back to 0, not the hour value
         assert!(almost(cs.consume_failed_tps, 0.0));
     }
 
     #[test]
     fn round_robin_follows_the_mod_60_rule() {
-        // rounds % hour_every_rounds == 0 才采小时点（这里把 60 换成 3 便于断言）
+        // hour points are taken only when rounds % hour_every_rounds == 0 (60 replaced by 3 here for easy asserts)
         let m = ConsumerStatsManager::with_sampling(Duration::from_millis(1), 3);
         m.inc_pull_tps(GROUP, TOPIC, 1);
         for rounds in 1..=3 {
@@ -963,7 +963,7 @@ mod tests {
 
     #[test]
     fn round_robin_with_zero_hour_period_never_samples_hour() {
-        // 除零保护：hour_every_rounds == 0 表示关闭小时采样
+        // division-by-zero guard: hour_every_rounds == 0 disables hour sampling
         let m = ConsumerStatsManager::with_sampling(Duration::from_millis(1), 0);
         m.inc_pull_rt(GROUP, TOPIC, 5);
         sample_round(&m.inner, 60);
@@ -1014,8 +1014,8 @@ mod tests {
         assert_eq!(c.topic_and_group_pull_rt().stats_name(), "PULL_RT");
     }
 
-    /// 把采样任务从槽里取出来，好让测试自己观察它的退出（`take` 后 shutdown 就没有
-    /// 可 abort 的句柄了，于是退出只能靠停止位 + Notify，正是想验证的路径）。
+    /// Takes the sampling task out of the slot so the test can observe its exit itself (after `take`, shutdown has no
+    /// handle left to abort, so exit can only happen via the stop flag + Notify -- exactly the path under test).
     fn take_sampler(m: &ConsumerStatsManager) -> JoinHandle<()> {
         lock(&m.inner.sampler).take().expect("sampler started")
     }
@@ -1027,7 +1027,7 @@ mod tests {
         assert!(!m.is_running());
         m.start().expect("start inside a tokio runtime");
         assert!(m.is_running());
-        // 重复 start 是 no-op（已有任务就直接返回）
+        // a repeated start is a no-op (returns directly when a task already exists)
         m.start().expect("start inside a tokio runtime");
         assert!(m.is_running());
 
@@ -1037,11 +1037,11 @@ mod tests {
         m.shutdown();
         assert!(!m.is_running());
         assert!(m.inner.stop.is_stopped());
-        // 没有 abort 可用，任务必须被停止位叫醒后自行退出
+        // no abort available: the task must wake on the stop flag and exit by itself
         task.await.expect("sampler exits without panic");
         let after_stop = minute_points(&m);
 
-        // shutdown 之后可以重新 start（任务句柄与停止位都被清空）
+        // start again after shutdown (both the task handle and the stop flag were reset)
         m.start().expect("start inside a tokio runtime");
         assert!(m.is_running());
         assert!(!m.inner.stop.is_stopped());
@@ -1059,7 +1059,7 @@ mod tests {
 
     #[tokio::test]
     async fn sampler_honours_the_injected_hour_round_period() {
-        // 周期 1ms、每 2 轮一次小时采样：小时链涨 1 个点时分钟链至少涨 2 个
+        // period 1ms, hour sample every 2 rounds: when the hour chain gains 1 point the minute chain gains at least 2
         let m = ConsumerStatsManager::with_sampling(Duration::from_millis(1), 2);
         m.inc_consume_ok_tps(GROUP, TOPIC, 3);
         m.start_with_handle(&tokio::runtime::Handle::current());
@@ -1081,7 +1081,7 @@ mod tests {
 
     #[tokio::test]
     async fn sampler_task_exits_when_manager_is_dropped() {
-        // manager 被丢弃后任务自行退出：不 panic、不吊着内存
+        // the task exits by itself after the manager is dropped: no panic, no dangling memory
         let m = ConsumerStatsManager::with_sampling(Duration::from_millis(1), 60);
         m.inc_pull_tps(GROUP, TOPIC, 1);
         m.start_with_handle(&tokio::runtime::Handle::current());
@@ -1089,13 +1089,13 @@ mod tests {
         wait_for(|| minute_points(&m) >= 1).await;
         drop(m);
         let outcome = tokio::time::timeout(Duration::from_secs(5), task).await;
-        assert!(outcome.is_ok(), "manager dropped 后采样任务没退出");
+        assert!(outcome.is_ok(), "the sampling task did not exit after the manager was dropped");
         outcome.expect("joined").expect("sampler exits without panic");
     }
 
     #[test]
     fn start_without_runtime_returns_error_instead_of_panicking() {
-        // 非异步上下文里 start() 必须返回 Err（内部用 Handle::try_current，绝不 panic）
+        // start() outside an async context must return Err (it uses Handle::try_current internally, never panics)
         let m = ConsumerStatsManager::new();
         let outcome = std::thread::spawn(move || m.start())
             .join()
@@ -1129,7 +1129,7 @@ mod tests {
         );
     }
 
-    /// 轮询等待条件成立（有上限，避免睡墙钟带来的偶发失败）。
+    /// Polls until the condition holds (with a deadline, avoiding flaky failures from wall-clock sleeps).
     async fn wait_for<F: FnMut() -> bool>(mut predicate: F) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while !predicate() {

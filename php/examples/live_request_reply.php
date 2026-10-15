@@ -2,23 +2,25 @@
 
 declare(strict_types=1);
 
-// 真机 Request-Reply 往返：producer request()/reply 通路。
+// Live Request-Reply round-trip: the producer request()/reply path.
 //
 //   php examples/live_request_reply.php responder <namesrv> <topic> <expect>
 //   php examples/live_request_reply.php requester <namesrv> <topic> <expect>
 //
-// PHP 单线程 ⇒ 应答方（consumer + producer.reply）与请求方（producer.request）必须
-// 是两个进程，由 scripts/run_php_live.sh 的 request_reply 腿编排：
-//   responder 后台起 → 打 RESPONDER_READY（建 topic + 路由就绪）→ requester 发
-//   expect 条 request() → responder 逐条 reply() 后自行退出。
+// PHP is single-threaded => the responder (consumer + producer.reply) and the requester
+// (producer.request) must be two processes, orchestrated by the request_reply leg of
+// scripts/run_php_live.sh:
+//   responder starts in the background -> prints RESPONDER_READY (topic created + route ready)
+//   -> requester sends expect request() calls -> responder replies one by one and exits on its own.
 //
-// 协议回顾（见 src/Client/RequestReply.php）：
-//   请求方给消息写 CORRELATION_ID / REPLY_TO_CLIENT(clientId) / TTL；应答方
-//   createReplyMessage 派生 topic=<CLUSTER>_REPLY_TOPIC、MSG_TYPE="reply" 的消息，
-//   发送换码 SEND_REPLY_MESSAGE_V2(325)，broker 按 REPLY_TO_CLIENT 把应答经
-//   PUSH_REPLY_MESSAGE_TO_CLIENT(326) 推回请求方连接 —— 不经过任何订阅。
+// Protocol recap (see src/Client/RequestReply.php):
+//   the requester writes CORRELATION_ID / REPLY_TO_CLIENT(clientId) / TTL onto the message; the
+//   responder's createReplyMessage derives a message with topic=<CLUSTER>_REPLY_TOPIC and
+//   MSG_TYPE="reply", sending with the alternate code SEND_REPLY_MESSAGE_V2(325); the broker
+//   pushes the reply back to the requester's connection via PUSH_REPLY_MESSAGE_TO_CLIENT(326)
+//   according to REPLY_TO_CLIENT — it never goes through any subscription.
 //
-// 收口：requester 打 `ROUNDTRIP ok=<n> total=<n>`；ok<total 非零退出。
+// Closing: requester prints `ROUNDTRIP ok=<n> total=<n>`; ok<total exits non-zero.
 require __DIR__ . '/../bootstrap.php';
 
 use RocketMQ\Client\ConsumeConcurrentlyContext;
@@ -40,7 +42,7 @@ $ns = $argv[2] ?? '127.0.0.1:9876';
 $topic = $argv[3] ?? ('PhpReqRep' . time());
 $expect = (int) ($argv[4] ?? 3);
 
-/** 在窗口内轮询条件（PHP 无后台线程，等待必须主动驱动）。 */
+/** Polls the condition within the window (PHP has no background threads; waiting must be driven actively). */
 function rr_wait_until(float $windowSec, callable $cond, object ...$tickables): bool
 {
     $deadline = microtime(true) + $windowSec;
@@ -59,9 +61,10 @@ function rr_wait_until(float $windowSec, callable $cond, object ...$tickables): 
 }
 
 if ($mode === 'responder') {
-    // ---------------------------------------------------------- 应答方进程
-    // 先显式建 topic：消费者没有默认 topic 兜底（TBW102 只给生产者），缺路由
-    // = 无分配 = 无消费，那会伪装成客户端 bug（B5 不变量）。
+    // ---------------------------------------------------------- responder process
+    // Create the topic explicitly first: the consumer has no default-topic fallback (TBW102 is
+    // only for producers); a missing route = no assignment = no consumption, which would
+    // masquerade as a client bug (the B5 invariant).
     $admin = new DefaultMQAdminExt();
     $admin->setNamesrvAddr($ns);
     $admin->start();
@@ -70,9 +73,10 @@ if ($mode === 'responder') {
         $names = array_keys($ci->brokerAddrTable);
         sort($names, SORT_STRING);
         $brokerName = $names[0] ?? 'broker-a';
-        // 业务 topic + reply topic 都要预建：应答发往 <CLUSTER>_REPLY_TOPIC，
-        // 没有路由时 send 会在默认 topic 兜底/重试里拖到远超请求方 TTL，
-        // 应答推回去时请求已经超时摘槽（"not matched any request"）。
+        // Both the business topic and the reply topic must be pre-created: replies go to
+        // <CLUSTER>_REPLY_TOPIC, and without a route the send would drag through the default
+        // topic fallback/retries far past the requester's TTL; by the time the reply is pushed
+        // back the request has already timed out and been swept ("not matched any request").
         $topics = [$topic, MixAll::getReplyTopic('DefaultCluster')];
         foreach ($topics as $t) {
             $route = null;
@@ -108,7 +112,7 @@ if ($mode === 'responder') {
 
     $replies = 0;
     $errors = [];
-    $counter = new ArrayObject(['replies' => 0, 'errors' => [], 'log' => []]); // 引用可变的计数器
+    $counter = new ArrayObject(['replies' => 0, 'errors' => [], 'log' => []]); // mutable-by-reference counter
     $producer = new DefaultMQProducer('GID_RR_Responder_' . time());
     $producer->setNamesrvAddr($ns);
     $producer->start();
@@ -171,11 +175,13 @@ if ($mode === 'responder') {
     $consumer->subscribe($topic, '*');
     $consumer->start();
 
-    // 暖机窗：等 rebalance 分配到位（FIRST_OFFSET + 已有路由，通常 <2s）。
+    // Warm-up window: wait for the rebalance assignment to land (FIRST_OFFSET + route already
+    // present, usually <2s).
     rr_wait_until(10, fn (): bool => false, $consumer);
     echo "RESPONDER_READY topic={$topic}" . PHP_EOL;
 
-    // 收满 expect 条应答即收口；超时也退出（让编排层拿 FAIL 而不是挂死）。
+    // Settle once expect replies arrive; also exits on timeout (letting the orchestration layer
+    // get a FAIL rather than hanging).
     $ok = rr_wait_until(90, fn (): bool => $counter['replies'] >= $expect, $consumer);
     $consumer->shutdown();
     $producer->shutdown();
@@ -191,7 +197,7 @@ if ($mode === 'responder') {
 }
 
 if ($mode === 'requester') {
-    // ---------------------------------------------------------- 请求方进程
+    // ---------------------------------------------------------- requester process
     $producer = new DefaultMQProducer('GID_RR_Requester_' . time());
     $producer->setNamesrvAddr($ns);
     $producer->start();

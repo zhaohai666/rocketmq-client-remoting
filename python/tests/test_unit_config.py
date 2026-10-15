@@ -20,10 +20,10 @@ MQ = MessageQueue("T", "broker-a", 0)
 
 
 def _new_instance(prefix: str, **kwargs) -> MQClientInstance:
-    """只构造、不 start() 的实例：不建连、不发心跳，纯离线断言。
+    """An instance that is only constructed, not start()ed: no connection, no heartbeat, pure offline assertions.
 
-    ``MQClientInstance.__init__`` 会写 ``INSTANCE_MAP[client_id]``，所以用完要摘掉，
-    否则同进程后续用例可能拿到这个假实例。
+    ``MQClientInstance.__init__`` writes ``INSTANCE_MAP[client_id]``, so the instance must be
+    removed when done, otherwise later test cases in the same process may pick up this fake instance.
     """
     inst = MQClientInstance("%s_%d" % (prefix, threading.get_ident()),
                             ["127.0.0.1:9876"], **kwargs)
@@ -76,7 +76,7 @@ def test_enable_stream_request_type_defaults_match_the_request_builders(factory,
     assert factory().enable_stream_request_type is expected
 
 
-# ---------------------------------------------------------------- unitName → 取址
+# ---------------------------------------------------------------- unitName -> addressing
 def test_unit_name_reaches_the_address_server_url():
     pass
     inst = _new_instance("unit_addr", unit_name="unitA")
@@ -90,13 +90,13 @@ def test_default_unit_name_is_empty():
     inst = _new_instance("no_unit_addr")
     try:
         assert inst.top_addressing._unit_name == ""
-        # 没有 unit 就不该出现 ?nofix=1（build_url 的另一条分支）
+        # with no unit, ?nofix=1 must not appear (build_url's other branch)
         assert "?nofix" not in inst.top_addressing.build_url()
     finally:
         _drop(inst)
 
 
-# ---------------------------------------------------------------- unitMode → 线上
+# ---------------------------------------------------------------- unitMode -> on the wire
 def test_send_request_header_carries_unit_mode():
     pass
     inst = _new_instance("unit_send")
@@ -113,7 +113,7 @@ def test_send_request_header_carries_unit_mode():
 
 
 def test_producer_send_passes_its_own_unit_mode():
-    """facade 的 unitMode 要一路传到 send_message，中途不能被写死成 false。"""
+    """The facade's unitMode must be passed all the way to send_message, not hardcoded to false midway."""
     seen = []
 
     class _Client:
@@ -208,7 +208,7 @@ def test_filter_message_context_carries_unit_mode():
 
 
 def test_push_consumer_filter_uses_its_own_unit_mode():
-    """模块级函数的参数不能只由测试传：推送消费者那条路也要接上自己的配置。"""
+    """The module-level function's argument must not be supplied only by the test: the push consumer path must also plug in its own configuration."""
     consumer = DefaultMQPushConsumer("CID_unit_filter")
     consumer.set_unit_mode(True)
     hook = _RecorderFilter()

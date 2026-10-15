@@ -1,20 +1,26 @@
-// 离线单测（tests/RocketMQ.Client.Tests/LitePullCursorTests.cs）只能证明「脚本回的
-// nextBeginOffset 被跟了」；真 broker 才能让下面两件事同时成立：那个 nextBeginOffset 是
-// **broker 自己算的**，而且跟过去以后**真的能收到消息**。
+// The offline unit tests (tests/RocketMQ.Client.Tests/LitePullCursorTests.cs) only prove
+// "the scripted nextBeginOffset was followed"; only a real broker lets the following two
+// things hold at once: that nextBeginOffset was **computed by the broker itself**, and that
+// after following it you **really receive messages**.
 //
-// 场景：
-//   S1 对照组：每条队列钉 1 条 → assign + seek(0) + `*` → 4 条全收（链路要通，
-//      maxOffset == 1 这个标尺也要立住）。
-//   S2 NO_MATCHED_MSG：把 assign 表达式换成永不匹配的 Tag 再 seek(0)。broker 按表达式把
-//      整段滤掉后回的 nextBeginOffset **已经越过整段**（= maxOffset）。断言每条队列的拉取
-//      游标都到 maxOffset（旧实现只在 FOUND 时推游标，这里会永远停在 0，每轮重扫同一段）。
-//      零投递。
-//   S3 OFFSET_ILLEGAL 自愈（决定性一条）：每条队列 seek(maxOffset + 1000)。broker 回纠正值
-//      → 游标必须回到 maxOffset；随后每条队列再钉 1 条，4 条必须**全部收到**。旧实现的游标
-//      永远卡在越界值上：每轮收到同一个「越界纠正」，新消息一条也看不到 —— 越界之后消费者
-//      会**静默**地永远收不到消息。
+// Scenarios:
+//   S1 control group: pin 1 message per queue -> assign + seek(0) + `*` -> all 4 received
+//      (the path has to work, and the maxOffset == 1 ruler has to be established).
+//   S2 NO_MATCHED_MSG: swap the assign expression for a Tag that never matches and seek(0)
+//      again. After the broker filters out the whole range by the expression, the
+//      nextBeginOffset it returns **has already passed the whole range** (= maxOffset).
+//      Assert that every queue's pull cursor reached maxOffset (the old implementation only
+//      advanced the cursor on FOUND, so here it would stay at 0 and rescan the same range
+//      every round). Zero deliveries.
+//   S3 OFFSET_ILLEGAL self-healing (the decisive one): seek(maxOffset + 1000) on every
+//      queue. The broker replies with the corrected value -> the cursor must go back to
+//      maxOffset; then pin 1 more message per queue and all 4 must be **received**. With
+//      the old implementation the cursor stayed stuck on the out-of-range value: every
+//      round it received the same "out of range" correction and not a single new message was
+//      visible -- after going out of range a consumer **silently** never receives messages
+//      again.
 //
-// 用法：rmq lite-pull-cursor [namesrv]
+// Usage: rmq lite-pull-cursor [namesrv]
 using System.Globalization;
 using System.Text;
 
@@ -76,7 +82,8 @@ public static class LiveLitePullCursor
 
     private static string Join(IEnumerable<string> items) => "[" + string.Join(", ", items) + "]";
 
-    /// <summary>反复 poll 直到收齐 expect 条（或超时），返回收到的 body。</summary>
+    /// <summary>Polls repeatedly until expect messages are collected (or it times out) and
+    /// returns the bodies received.</summary>
     private static List<string> Drain(DefaultLitePullConsumer c, int expect, int timeoutMs)
     {
         var outBodies = new List<string>();
@@ -92,7 +99,8 @@ public static class LiveLitePullCursor
         return outBodies;
     }
 
-    /// <summary>给定窗口里盯住缓冲（断言「不该有交付」时用）。</summary>
+    /// <summary>Watches the buffer within a given window (used when asserting "there must
+    /// be no delivery").</summary>
     private static List<string> PollQuiet(DefaultLitePullConsumer c, int windowMs)
     {
         var outBodies = new List<string>();
@@ -133,7 +141,7 @@ public static class LiveLitePullCursor
             Thread.Sleep(3000);
 
             List<MessageQueue> mqs = admin.ExamineTopicRoute(topic).GetAllSubscribeMessageQueue(topic);
-            Check("路由可见：4 条队列", mqs.Count == KQueues, "got=" + N(mqs.Count));
+            Check("the route is visible: 4 queues", mqs.Count == KQueues, "got=" + N(mqs.Count));
             if (mqs.Count != KQueues)
             {
                 return Report();
@@ -141,7 +149,7 @@ public static class LiveLitePullCursor
 
             prod.Start();
 
-            // ---------------- S1 对照组 ----------------
+            // ---------------- S1 the control group ----------------
             for (int i = 0; i < mqs.Count; ++i)
             {
                 var msg = new Message(topic, Encoding.UTF8.GetBytes("lc-s1-" + N(i)))
@@ -155,7 +163,8 @@ public static class LiveLitePullCursor
             c.SetNamesrvAddr(namesrv);
             c.SetInstanceName("lite-cursor-net-" + stamp);
             c.SetConsumeFromWhere(ConsumeFromWhere.ConsumeFromFirstOffset);
-            // 位点越界那一腿绝不能把越界值提交上去：关掉自动提交，只看拉取/交付两条游标。
+            // The out-of-range leg must never commit the out-of-range value: turn off auto
+            // commit and only watch the pull/delivery cursors.
             c.SetAutoCommit(false);
             c.SetPullIntervalMillis(200);
             c.Assign(mqs);
@@ -167,7 +176,7 @@ public static class LiveLitePullCursor
             }
 
             List<string> got1 = Drain(c, KQueues, 30000);
-            Check("S1-对照组：* 订阅下 4 条钉到队列的消息全收", got1.Count == KQueues,
+            Check("S1-control group: all 4 messages pinned to the queues are received under the * subscription", got1.Count == KQueues,
                 "got=" + N(got1.Count) + " bodies=" + Join(got1));
 
             var maxes = new List<long>();
@@ -186,7 +195,7 @@ public static class LiveLitePullCursor
 
                 return true;
             }, 10000);
-            Check("S1-每条队列 maxOffset == 1（后面两条腿的标尺）", maxOk,
+            Check("S1-every queue has maxOffset == 1 (the ruler for the two later legs)", maxOk,
                 string.Join(" ", maxes.Select(N)) + " ");
 
             // ---------------- S2 NO_MATCHED_MSG ----------------
@@ -205,10 +214,10 @@ public static class LiveLitePullCursor
 
                 return true;
             }, 20000);
-            Check("S2-NO_MATCHED_MSG 后拉取游标越过整段不匹配区间（== maxOffset=1）", s2,
+            Check("S2-after NO_MATCHED_MSG the pull cursor passes the whole non-matching range (== maxOffset=1)", s2,
                 CursorRow(c, mqs));
             List<string> quiet = PollQuiet(c, 1000);
-            Check("S2-空应答期间零投递", quiet.Count == 0, Join(quiet));
+            Check("S2-zero deliveries during the empty responses", quiet.Count == 0, Join(quiet));
 
             // ---------------- S3 OFFSET_ILLEGAL ----------------
             var ahead = new List<string>();
@@ -228,10 +237,11 @@ public static class LiveLitePullCursor
 
                 return true;
             }, 20000);
-            Check("S3-越界位点被 broker 纠正后游标回到 maxOffset（越界自愈）", s3,
+            Check("S3-after the broker corrects the out-of-range offset the cursor goes back to maxOffset (out of range self-heals)", s3,
                 CursorRow(c, mqs) + " seekedTo=" + string.Join(" ", ahead));
 
-            // S2 换上的永不匹配表达式要换回来，否则下面 4 条 TagA 会被 broker 原样滤掉。
+            // The never-matching expression S2 switched on has to be switched back, otherwise
+            // the 4 TagA messages below would be filtered out by the broker as-is.
             c.SetSubExpressionForAssign(topic, "*");
             for (int i = 0; i < mqs.Count; ++i)
             {
@@ -243,7 +253,7 @@ public static class LiveLitePullCursor
             }
 
             List<string> got3 = Drain(c, KQueues, 40000);
-            Check("S3-自愈后新消息全部送达（旧实现：游标卡在 +1000，一条都看不到）",
+            Check("S3-after the self-healing all the new messages arrive (with the old implementation: the cursor stuck at +1000, nothing visible)",
                 got3.Count == KQueues, "got=" + N(got3.Count) + " bodies=" + Join(got3));
             bool bodiesOk = got3.Count == KQueues;
             for (int i = 0; bodiesOk && i < KQueues; ++i)
@@ -251,11 +261,11 @@ public static class LiveLitePullCursor
                 bodiesOk = got3.Contains("lc-s3-" + N(i));
             }
 
-            Check("S3-收到的正是越界之后钉进去的那 4 条", bodiesOk, Join(got3));
+            Check("S3-what arrived is exactly the 4 messages pinned after going out of range", bodiesOk, Join(got3));
         }
         catch (Exception e)
         {
-            Check("场景异常", false, e.Message);
+            Check("the scenario threw", false, e.Message);
         }
         finally
         {
@@ -267,7 +277,7 @@ public static class LiveLitePullCursor
                 }
                 catch (Exception)
                 {
-                    // 收尾失败不掩盖主断言
+                    // a cleanup failure does not mask the main assertion
                 }
             }
 

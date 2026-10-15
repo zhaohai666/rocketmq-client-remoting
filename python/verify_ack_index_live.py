@@ -40,8 +40,8 @@ def new_client(tag: str) -> MQClientInstance:
 
 
 def prepare_topic(topic: str, queues: int = 1) -> None:
-    """建 topic。队列数默认 1：部分 ack 要求「一批里 3 条同一队列且连续」，
-    多队列时消息会散开，批次归属就不确定了（真实用法里 topic 由管理员预先建好）。"""
+    """Create the topic. Queue count defaults to 1: some ack cases require "3 messages in one batch on the same queue and contiguous",
+    with multiple queues the messages scatter and batch membership becomes indeterminate (in real usage the topic is pre-created by an admin)."""
     c = new_client("setup")
     try:
         c.create_topic_in_route(topic, queues, queues)
@@ -50,7 +50,7 @@ def prepare_topic(topic: str, queues: int = 1) -> None:
 
 
 def wait_until(pred, timeout: float, interval: float = 1.0) -> bool:
-    """轮询到条件成立（broker 侧对账一律轮询，不要固定 sleep：新 topic 注册是秒级的）。"""
+    """Poll until the condition holds (all broker-side reconciliation is polling, never a fixed sleep: new topic registration is second-scale)."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         if pred():
@@ -60,10 +60,10 @@ def wait_until(pred, timeout: float, interval: float = 1.0) -> bool:
 
 
 def committed_offset(group: str, topic: str) -> int:
-    """读 broker 上该 group 在这个 topic 各队列的已提交位点之和。
+    """Read the sum of committed offsets for this group across the topic's queues on the broker.
 
-    一次查询超时不能让整轮验证崩掉：这里把它当成「还没读到」（-1），由调用方的
-    wait_until 继续轮询。"""
+    A single query timing out must not crash the whole verification: treat it here as "not read yet" (-1), and let the caller's
+    wait_until keep polling."""
     c = new_client("reader")
     try:
         publish = c.get_topic_publish_info(topic)
@@ -81,7 +81,7 @@ def committed_offset(group: str, topic: str) -> int:
 
 
 class RecordingListener(MessageListenerConcurrently):
-    """按批次记录，并（可选）把 ackIndex 写进 context。"""
+    """Record per batch, and (optionally) write ackIndex into the context."""
 
     def __init__(self, ack_index=None, status=ConsumeConcurrentlyStatus.CONSUME_SUCCESS,
                  ack_first_batch_only=False):
@@ -97,7 +97,7 @@ class RecordingListener(MessageListenerConcurrently):
                                   time.time()) for m in msgs])
             index = len(self.batches)
         if self.ack_index is not None:
-            # 只收窄**首批**：重投回来的那一批必须整批认可，否则永远收敛不了
+            # Only narrow down the first batch: the batch that comes back from redelivery must be acknowledged as a whole, otherwise it never converges
             if not self.ack_first_batch_only or index == 1:
                 context.ack_index = self.ack_index
         return self.status
@@ -109,8 +109,8 @@ class RecordingListener(MessageListenerConcurrently):
 
 def start(group: str, topic: str, listener, batch_max: int = 3,
           model: str = None, from_first: bool = False) -> DefaultMQPushConsumer:
-    """`from_first=True` 给「消息先发、消费者后起」的用例：新组在 LAST_OFFSET 下会从
-    分配时刻的最新位点开始，先发的那几条会被直接跳过。"""
+    """`from_first=True` is for the "messages first, consumer later" cases: under LAST_OFFSET a new group starts from
+    the latest offset at assignment time, so the messages sent earlier are skipped outright."""
     c = DefaultMQPushConsumer(group)
     c.set_namesrv_addr(NAMESRV)
     c.set_message_listener(listener)
@@ -133,7 +133,7 @@ def main() -> int:
 
     bodies = [b"ack-%d" % i for i in range(3)]
 
-    # ---------- A1 对照组：默认整批认可 ----------
+    # ---------- A1 control group: whole-batch acknowledgement by default ----------
     t1 = PREFIX + "_Full"
     g1 = PREFIX + "_g1"
     prepare_topic(t1)
@@ -142,58 +142,58 @@ def main() -> int:
     time.sleep(3)
     for b in bodies:
         producer.send(Message(t1, b))
-    print("A1: 对照组已发送，等待消费...")
+    print("A1: control group sent, waiting for consumption...")
     wait_until(lambda: len(l1.arrivals()) >= 3, 30)
     time.sleep(3)
     arrivals1 = l1.arrivals()
-    check("A1-3 条各投递一次", sorted(r[0] for r in arrivals1) == sorted(bodies),
+    check("A1-all 3 delivered once each", sorted(r[0] for r in arrivals1) == sorted(bodies),
           "arrivals=%d" % len(arrivals1))
-    check("A1-没有任何重投", all(r[2] == 0 for r in arrivals1),
+    check("A1-no redeliveries at all", all(r[2] == 0 for r in arrivals1),
           "times=%s" % sorted(r[2] for r in arrivals1))
-    check("A1-位点提交到 3（等价于整批 ack）",
+    check("A1-offset committed to 3 (equivalent to a whole-batch ack)",
           wait_until(lambda: committed_offset(g1, t1) == 3, 20),
           "offset=%d" % committed_offset(g1, t1))
     c1.shutdown()
 
-    # ---------- A2 部分 ack：只认可首批的第一条 ----------
+    # ---------- A2 partial ack: only the first message of the first batch is acknowledged ----------
     t2 = PREFIX + "_Partial"
     g2 = PREFIX + "_g2"
     prepare_topic(t2)
     l2 = RecordingListener(ack_index=0, ack_first_batch_only=True)
-    # 先把 3 条放上去再起消费者：批次怎么切由拉取时机决定，先发就必然是「一整批 3 条」，
-    # 否则首批可能是 1 条或 2 条，ackIndex=0 扣下的尾巴数量就不确定了。
+    # Send the 3 first, then start the consumer: how the batch is split depends on pull timing, so sending first necessarily yields "one whole batch of 3";
+    # otherwise the first batch could be 1 or 2 messages and the number of tail messages withheld by ackIndex=0 would be indeterminate.
     for b in bodies:
         producer.send(Message(t2, b))
     c2 = start(g2, t2, l2, from_first=True)
-    print("A2: 已发送，等待部分 ack 后的回投（延迟梯度 level3≈10s）...")
-    # 首批 3 条 → 尾巴 2 条回投 %RETRY% → broker  revive 后重新投递；
-    # %RETRY% topic 首次回投才建出来，消费者还要等一轮 rebalance，窗口给足。
+    print("A2: sent, waiting for the send-back after partial ack (delay level3≈10s)...")
+    # First batch of 3 -> the 2-message tail is sent back to %RETRY% -> redelivered after the broker revives;
+    # the %RETRY% topic is only created on the first send-back, and the consumer must wait another rebalance round, so give it a generous window.
     wait_until(lambda: len(l2.arrivals()) >= 5, 90)
     time.sleep(3)
     arrivals2 = l2.arrivals()
     first_batch = [r[0] for r in l2.batches[0]] if l2.batches else []
     acked = first_batch[:1]
     tail = first_batch[1:]
-    check("A2-首批确实拿到 3 条", len(first_batch) == 3, "batch=%s" % first_batch)
-    check("A2-被认可的那条整个窗口只投一次",
+    check("A2-first batch really got 3 messages", len(first_batch) == 3, "batch=%s" % first_batch)
+    check("A2-the acknowledged message was delivered only once across the whole window",
           bool(acked) and [r[0] for r in arrivals2].count(acked[0]) == 1,
           "acked=%s" % acked)
     redelivered = [r for r in arrivals2 if r[0] in tail and r[2] >= 1]
-    check("A2-未认可的两条经 %RETRY% 二次到达",
+    check("A2-the two unacknowledged messages arrived a second time via %RETRY%",
           len(tail) == 2 and {r[0] for r in redelivered} == set(tail),
           "tail=%s redelivered=%d" % (tail, len(redelivered)))
-    check("A2-重投消息 reconsumeTimes>=1 且 topic 还原成业务 topic",
+    check("A2-redelivered messages have reconsumeTimes>=1 and the topic is restored to the business topic",
           bool(redelivered) and all(r[1] == t2 for r in redelivered),
           "topics=%s" % sorted({r[1] for r in redelivered}))
-    check("A2-3 条最终全部被消费（没丢）",
+    check("A2-all 3 were eventually consumed (none lost)",
           {r[0] for r in arrivals2} == set(bodies),
           "distinct=%d" % len({r[0] for r in arrivals2}))
-    check("A2-业务队列位点仍提交到 3（尾巴交给 broker 重投，不必钉住）",
+    check("A2-business queue offset still commits to 3 (the tail is left to broker redelivery, no need to pin it)",
           wait_until(lambda: committed_offset(g2, t2) == 3, 20),
           "offset=%d" % committed_offset(g2, t2))
     c2.shutdown()
 
-    # ---------- A3 RECONSUME_LATER 压过 ackIndex ----------
+    # ---------- A3 RECONSUME_LATER overrides ackIndex ----------
     t3 = PREFIX + "_LaterWins"
     g3 = PREFIX + "_g3"
     prepare_topic(t3)
@@ -201,15 +201,15 @@ def main() -> int:
     for b in bodies:
         producer.send(Message(t3, b))
     c3 = start(g3, t3, l3, from_first=True)
-    print("A3: 已发送，等待整批重投...")
-    # 每条都要重投一次以上；每次全批 RECONSUME_LATER 会一直重投，
-    # 所以只断言「3 条都出现过 reconsumeTimes>=1」，不比总条数。
-    check("A3-ackIndex=2 也拦不住 RECONSUME_LATER（3 条全部重投）",
+    print("A3: sent, waiting for whole-batch redelivery...")
+    # Each message must be redelivered at least once; a whole-batch RECONSUME_LATER keeps redelivering,
+    # so only assert that "all 3 have appeared with reconsumeTimes>=1" and do not compare total counts.
+    check("A3-ackIndex=2 cannot block RECONSUME_LATER either (all 3 redelivered)",
           wait_until(lambda: {r[0] for r in l3.arrivals() if r[2] >= 1} == set(bodies), 60),
           "redelivered=%d/%d" % (len({r[0] for r in l3.arrivals() if r[2] >= 1}), len(bodies)))
     c3.shutdown()
 
-    # ---------- A4 广播模式：尾巴不回投 ----------
+    # ---------- A4 broadcast mode: the tail is not sent back ----------
     t4 = PREFIX + "_Broadcast"
     g4 = PREFIX + "_g4"
     prepare_topic(t4)
@@ -217,11 +217,11 @@ def main() -> int:
     for b in bodies:
         producer.send(Message(t4, b))
     c4 = start(g4, t4, l4, model=MessageModel.BROADCASTING, from_first=True)
-    print("A4: 广播模式已发送，等待消费...")
+    print("A4: broadcast mode sent, waiting for consumption...")
     wait_until(lambda: len(l4.arrivals()) >= 3, 30)
-    time.sleep(12)  # 若有回投，level3≈10s 后会到；这里给足窗口确认「不会到」
+    time.sleep(12)  # If there were a send-back it would arrive after level3≈10s; give a generous window here to confirm it does not
     arrivals4 = l4.arrivals()
-    check("A4-广播：未认可的尾巴不回投（每条只到一次）",
+    check("A4-broadcast: the unacknowledged tail is not sent back (each arrives only once)",
           sorted(r[0] for r in arrivals4) == sorted(bodies)
           and all(r[2] == 0 for r in arrivals4),
           "arrivals=%d times=%s" % (len(arrivals4), sorted({r[2] for r in arrivals4})))

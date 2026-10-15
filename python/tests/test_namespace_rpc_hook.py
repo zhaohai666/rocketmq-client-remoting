@@ -24,9 +24,9 @@ def _request() -> RemotingCommand:
 
 
 def _new_instance(prefix: str, **kwargs) -> MQClientInstance:
-    """只构造、不 start() 的实例（与 test_unit_config 同款套路）。
+    """An instance that is only constructed, not start()ed (the same trick as test_unit_config).
 
-    ``MQClientInstance.__init__`` 会写 ``INSTANCE_MAP[client_id]``，用完要摘掉。
+    ``MQClientInstance.__init__`` writes ``INSTANCE_MAP[client_id]``, which must be removed after use.
     """
     return MQClientInstance("%s_%d" % (prefix, threading.get_ident()),
                             ["127.0.0.1:9876"], **kwargs)
@@ -36,7 +36,7 @@ def _drop(inst: MQClientInstance) -> None:
     MQClientInstance.INSTANCE_MAP.pop(inst.client_id, None)
 
 
-# ---------------------------------------------------------------- 常量与钩子本体
+# ---------------------------------------------------------------- Constants and the hook itself
 def test_ext_field_names_match_the_wire_keys():
     pass
     assert MixAll.RPC_REQUEST_HEADER_NAMESPACED_FIELD == "nsd"
@@ -74,9 +74,9 @@ def test_do_after_response_is_noop():
     assert resp.ext_fields == {}
 
 
-# ---------------------------------------------------------------- 组合顺序
+# ---------------------------------------------------------------- Composition order
 def test_composition_order_namespace_stream_acl():
-    """MQClientAPIImpl:329-335：Namespace → Stream → 用户（ACL）。"""
+    """MQClientAPIImpl:329-335: Namespace → Stream → user (ACL)."""
     inst = _new_instance("ns_order", enable_stream_request_type=True,
                          namespace_v2=NS_V2)
     try:
@@ -89,7 +89,7 @@ def test_composition_order_namespace_stream_acl():
 
 
 def test_namespace_hook_registered_before_user_hook_without_stream():
-    """stream 关闭时也一样：Namespace 仍在用户 rpcHook 之前。"""
+    """The same when stream is off: Namespace still comes before the user rpcHook."""
     inst = _new_instance("ns_order_no_stream")
     try:
         user = RPCHook()
@@ -111,7 +111,7 @@ def test_namespace_hook_registered_even_without_namespace():
 
 
 def test_lite_pull_consumer_forwards_namespace_v2_to_its_client():
-    """facade 的 namespace_v2 要一路传进 MQClientInstance 的钩子链。"""
+    """The facade's namespace_v2 must be passed all the way into MQClientInstance's hook chain."""
     consumer = DefaultLitePullConsumer("CID_ns_forward")
     consumer.set_namesrv_addr("127.0.0.1:9876")
     consumer.client_id = "ns-forward-client"
@@ -124,9 +124,9 @@ def test_lite_pull_consumer_forwards_namespace_v2_to_its_client():
         _drop(inst)
 
 
-# ---------------------------------------------------------------- ACL 签名覆盖
+# ---------------------------------------------------------------- ACL signature coverage
 def _signed_request(namespace_v2=None, ns_hook_first=True, body=b""):
-    """按指定顺序跑 Namespace 与 ACL 钩子，返回签好名的请求。"""
+    """Run the Namespace and ACL hooks in the specified order and return the signed request."""
     req = _request()
     req.body = body
     req.add_ext_field("topic", "MyTopic")
@@ -142,14 +142,14 @@ def _signed_request(namespace_v2=None, ns_hook_first=True, body=b""):
 
 
 def test_acl_signature_covers_namespace_fields():
-    """(d) 设了 namespaceV2 之后签名必须变 —— 证明 nsd/ns 被算进了签名内容。"""
+    """(d) After namespaceV2 is set, the signature must change — proving nsd/ns are included in the signed content."""
     with_ns = _signed_request(NS_V2)
     without_ns = _signed_request(None)
     assert with_ns.ext_fields["nsd"] == "true"
     assert with_ns.ext_fields["ns"] == NS_V2
     assert with_ns.ext_fields["Signature"] != without_ns.ext_fields["Signature"]
-    # 签名内容（排序后的 value 串）里必须能找到 ns 的值；Signature 键自身在
-    # combineRequestContent 里被排除，所以可以直接对已签名的请求重算内容。
+    # The signed content (the sorted value string) must contain the ns value; the Signature key itself is
+    # excluded in combineRequestContent, so the content can be recomputed directly on the signed request.
     content = AclClientRPCHook.build_request_content(with_ns)
     assert NS_V2.encode("utf-8") in content
 
@@ -158,12 +158,12 @@ def test_wrong_hook_order_would_not_be_covered_by_signature():
     pass
     wrong = _signed_request(NS_V2, ns_hook_first=False)
     right = _signed_request(NS_V2, ns_hook_first=True)
-    # 错误顺序的签名 == 根本没配 namespace 的签名（ns/nsd 没进签名内容）
+    # The wrong order's signature == the signature with no namespace configured at all (ns/nsd not in the signed content)
     assert wrong.ext_fields["Signature"] == _signed_request(None).ext_fields["Signature"]
     assert right.ext_fields["Signature"] != wrong.ext_fields["Signature"]
 
 
-# ---------------------------------------------------------------- facade 配置面
+# ---------------------------------------------------------------- Facade configuration surface
 def test_setters_exist_on_every_facade():
     pass
     for facade in (DefaultMQProducer("PID_ns_setter"),
@@ -191,14 +191,14 @@ def test_namespace_v2_defaults_empty_everywhere():
 
 
 def _admin():
-    # 注意 DefaultMQAdminExt 的第一个位置参数是 rpc_hook，不是 group。
+    # Note: DefaultMQAdminExt's first positional parameter is rpc_hook, not group.
     from client.admin import DefaultMQAdminExt
     return DefaultMQAdminExt()
 
 
-# ---------------------------------------------------------------- 轨迹分发器
+# ---------------------------------------------------------------- Trace dispatcher
 class _FakeTraceProducer:
-    """只记录调用的轨迹内部生产者（不做任何网络操作）。"""
+    """An internal trace producer that only records calls (no network operations whatsoever)."""
 
     def __init__(self):
         self.namespace_v2 = None

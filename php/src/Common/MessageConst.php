@@ -5,8 +5,8 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * 消息属性键常量：这些字符串就是协议里 properties 的键名，broker 与
- * 控制台都按字面匹配，改一个字符就等于把该功能关掉。
+ * Message property key constants: these strings are exactly the property key names in the protocol; the broker and
+ * console match them literally, so changing a single character is equivalent to disabling that feature.
  */
 final class MessageConst
 {
@@ -28,9 +28,9 @@ final class MessageConst
     public const PROPERTY_RECONSUME_TIME = 'RECONSUME_TIME';
     public const PROPERTY_MSG_REGION = 'MSG_REGION';
     /**
-     * 消息轨迹开关：broker 在 SEND 响应头里带回（SendMessageProcessor 写
-     * String.valueOf(brokerConfig.isTraceOn())，默认 true），客户端据此决定是否落轨迹；
-     * 消费侧则从消息属性里读同一个 key（ConsumeMessageTraceHookImpl）。
+     * Message trace switch: the broker returns it in the SEND response header (SendMessageProcessor writes
+     * String.valueOf(brokerConfig.isTraceOn()), default true), and the client uses it to decide whether to record traces;
+     * the consumer side reads the same key from the message property (ConsumeMessageTraceHookImpl).
      */
     public const PROPERTY_TRACE_SWITCH = 'TRACE_ON';
     public const PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX = 'UNIQ_KEY';
@@ -50,9 +50,9 @@ final class MessageConst
     public const PROPERTY_CLUSTER = 'CLUSTER';
     public const PROPERTY_MESSAGE_TYPE = 'MSG_TYPE';
     /**
-     * Request-Reply（5.x）：请求消息带 CORRELATION_ID/REPLY_TO_CLIENT/TTL，
-     * 应答方（消费者）回一条 MSG_TYPE="reply" 的消息，broker 按 REPLY_TO_CLIENT
-     * 把应答推回请求方的 PUSH_REPLY_MESSAGE_TO_CLIENT(326) 通道。
+     * Request-Reply (5.x): the request message carries CORRELATION_ID/REPLY_TO_CLIENT/TTL, and the replying side (consumer)
+     * sends back a message with MSG_TYPE="reply"; the broker pushes the reply back to the requester's
+     * PUSH_REPLY_MESSAGE_TO_CLIENT(326) channel based on REPLY_TO_CLIENT.
      */
     public const PROPERTY_CORRELATION_ID = 'CORRELATION_ID';
     public const PROPERTY_MESSAGE_REPLY_TO_CLIENT = 'REPLY_TO_CLIENT';
@@ -65,8 +65,9 @@ final class MessageConst
     public const PROPERTY_POP_CK_OFFSET = 'POP_CK_OFFSET';
     public const PROPERTY_POP_TIME = 'POP_TIME';
     /**
-     * 键名字面是 "1ST_POP_TIME"（首位是数字 1，不是字母 I），写错就没人能读到；
-     * 客户端在 POP 响应后处理时"仅在缺失时"补上，值为响应头的 popTime。
+     * The key name is literally "1ST_POP_TIME" (the first character is the digit 1, not the letter I); writing it wrong
+     * means nobody can read it. The client "only when missing" fills it in during POP response processing, with the value
+     * being the popTime from the response header.
      */
     public const PROPERTY_FIRST_POP_TIME = '1ST_POP_TIME';
     public const PROPERTY_INVISIBLE_TIME = 'INVISIBLE_TIME';
@@ -90,8 +91,8 @@ final class MessageConst
     public const MESSAGE_ID_PREFIX = 'MSGID-';
 
     /**
-     * 索引查询类型（对应 MessageConst.INDEX_KEY_TYPE / INDEX_UNIQUE_TYPE / INDEX_TAG_TYPE）
-     * broker 的 QueryMessageRequestHeader.indexType 取这些值；为空时 broker 按 "K" 处理。
+     * Index query type (corresponds to MessageConst.INDEX_KEY_TYPE / INDEX_UNIQUE_TYPE / INDEX_TAG_TYPE).
+     * The broker's QueryMessageRequestHeader.indexType takes these values; when empty the broker treats it as "K".
      */
     public const INDEX_KEY_TYPE = 'K';
     public const INDEX_UNIQUE_TYPE = 'U';

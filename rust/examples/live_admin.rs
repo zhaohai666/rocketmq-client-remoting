@@ -1,7 +1,7 @@
-//! [`DefaultMQAdminExt`] 对**真实 5.5.1 broker** 的联调验证。
+//! Live validation of [`DefaultMQAdminExt`] against a **real 5.5.1 broker**.
 //!
 //!
-//! 用法（先按项目记忆里记的 runbook 起本地集群）：
+//! Usage (start a local cluster first, per the runbook recorded in the project knowledge):
 //! ```text
 //! cargo run --example live_admin -- 127.0.0.1:9876
 //! ```
@@ -30,18 +30,18 @@ use rocketmq_client_remoting::remoting::protocol::heartbeat::ConsumeFromWhere;
 use rocketmq_client_remoting::remoting::protocol::route::TopicRouteData;
 use rocketmq_client_remoting::remoting::protocol::subscription::SubscriptionGroupConfig;
 
-/// 建 topic 用的队列数，A3 的路由/config 断言都以它为准。
+/// Queue count used when creating the topic; A3's route/config assertions are measured against it.
 const QUEUE_NUMS: i32 = 4;
-/// A7 之前生产的消息条数。
+/// Number of messages produced before A7.
 const N_MSG: usize = 8;
-/// 等 broker 侧可见（心跳、统计、延迟投递）的通用预算。
+/// Common budget for broker-side visibility (heartbeats, stats, delayed delivery).
 const WAIT_SECONDS: u64 = 30;
-/// broker 把 delayLevel=0 重写成 3（10s），这里留一倍余量。
+/// The broker rewrites delayLevel=0 to 3 (10s); this leaves a full extra margin.
 const RETRY_VISIBLE_SECONDS: u64 = 30;
-/// 生产者/消费者组靠心跳注册，默认 30s 一轮 ⇒ 预算要比一轮大一倍。
+/// Producer/consumer groups register via heartbeat, one round every 30s by default ⇒ the budget must exceed one full round.
 const HEARTBEAT_VISIBLE_SECONDS: u64 = 60;
 
-// ------------------------------------------------------------------ 骨架
+// ------------------------------------------------------------------ skeleton
 
 fn stamp() -> String {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -50,7 +50,7 @@ fn stamp() -> String {
     }
 }
 
-/// 断言累积器：一次跑完所有场景再汇总，首个失败不提前退出。
+/// Assertion accumulator: run all scenarios once, then summarize; the first failure does not exit early.
 struct Checker {
     passed: u32,
     skipped: u32,
@@ -81,7 +81,7 @@ impl Checker {
         self.failed.push(format!("{name}: {err}"));
     }
 
-    /// 「本机 broker 配置不满足该断言前提」的显式记录，与偷懒严格区分。
+    /// Explicit record of "this broker's configuration does not meet the assertion's precondition", strictly distinct from laziness.
     fn skip(&mut self, name: &str, why: &str) {
         println!("  [SKIP] {name}: {why}");
         self.skipped += 1;
@@ -103,7 +103,7 @@ async fn sleep_millis(millis: u64) {
     tokio::time::sleep(Duration::from_millis(millis)).await;
 }
 
-/// 出错只打一行、继续往下跑（管理端场景彼此独立，提前退出会掩盖后面的问题）。
+/// On error print one line and keep going (admin scenarios are independent; exiting early would mask later problems).
 macro_rules! step {
     ($ck:expr, $name:expr, $expr:expr) => {
         match $expr {
@@ -116,14 +116,14 @@ macro_rules! step {
     };
 }
 
-// ------------------------------------------------------------------ 夹具
+// ------------------------------------------------------------------ fixture
 
 struct Env {
     namesrv: String,
     stamp: String,
     topic: String,
     group: String,
-    /// 克隆位点用的目标组（A10）。
+    /// Target group used for cloning offsets (A10).
     dest_group: String,
     kv_namespace: String,
     admin: DefaultMQAdminExt,
@@ -157,7 +157,7 @@ impl Env {
         })
     }
 
-    /// 本 topic 的默认集群名：优先用 nameServer 回的路由字段。
+    /// Default cluster name of this topic: prefer the route field returned by the name server.
     async fn cluster_name(&self) -> String {
         match self.admin.examine_topic_route(&self.topic).await {
             Ok(route) => route
@@ -178,7 +178,7 @@ impl Env {
         lock(&self.broker_name).clone()
     }
 
-    /// 集群探活：端口开着 != broker 已注册到 nameServer，所以要轮询等待。
+    /// Cluster liveness: an open port != the broker being registered at the name server, hence the polling wait.
     async fn start(&self, ck: &mut Checker) -> bool {
         if let Err(e) = self.admin.start().await {
             ck.abort("admin start", &e.to_string());
@@ -209,20 +209,21 @@ impl Env {
                 Ok(_) => {}
                 Err(e) => {
                     if Instant::now() > deadline {
-                        ck.abort("集群探活", &e.to_string());
+                        ck.abort("cluster liveness probe", &e.to_string());
                         return false;
                     }
                 }
             }
             if Instant::now() > deadline {
-                ck.abort("集群探活", "nameServer 在预算内没有返回任何 broker");
+                ck.abort("cluster liveness probe", "the nameServer returned no broker within the budget");
                 return false;
             }
             sleep_millis(1000).await;
         }
     }
 
-    /// 一条发送成功的三件套：body + offsetMsgId（编码了 broker 地址）+ 客户端 uniqKey。
+    /// The trio of a successfully sent message: body + offsetMsgId (which encodes the broker
+    /// address) + the client-side uniqKey.
     async fn produce(&self, topic: &str, queue_id: i32, n: usize) -> Vec<SentMsg> {
         let broker = self.broker_name();
         let mut sent = Vec::new();
@@ -243,26 +244,30 @@ impl Env {
     }
 }
 
-/// A1 的输出：admin 私有实例关掉后自身状态。
+/// A1's output: the state of the admin's own private instance after it is shut down.
 #[derive(Clone, Debug)]
 struct SentMsg {
     body: String,
-    /// broker 侧 `QUEUE_OFFSET` 编码出来的地址 + 偏移，`view_message` 走 33 用它。
+    /// The address + offset encoded by the broker-side `QUEUE_OFFSET`; `view_message` uses it via
+    /// request code 33.
     offset_msg_id: String,
-    /// 客户端生成的 32 位十六进制 uniqKey，硬解会拼出一个假地址。
+    /// A 32-hex-digit uniqKey generated by the client; decoding it blindly yields a bogus address.
     uniq_key: String,
 }
 
-/// 只取客户端错的码值（broker 错也归一化到 `response_code()`）。
+/// Take only the client-side code value (broker errors are normalized into `response_code()`
+/// as well).
 fn client_code(err: &Error) -> Option<i32> {
     err.response_code()
 }
 
-// ------------------------------------------------------------------ A1 私有实例
+// ------------------------------------------------------------------ A1 private instance
 
-/// A1：admin 用的是**私有** `MQClientInstance`（模块头偏差 2），所以即便和 producer
-/// 撞了同一个 clientId，`admin.shutdown()` 也不能把 producer 打死。
-/// 这正是 #38 在其它 facade 上还没修的坑 —— 管理端必须先证明它不成立。
+/// A1: the admin uses a **private** `MQClientInstance` (see the deviation note 2 in the module
+/// header), so even when it collides with the producer's clientId, `admin.shutdown()` must not
+/// take the producer down.
+/// This is exactly the bug from #38 that is still unfixed on the other facades —— the admin side
+/// has to prove first that it does not hold here.
 async fn a1_private_instance_isolation(ck: &mut Checker, env: &Env) {
     let client_id = format!("rust-live-admin-shared@{}", env.stamp);
     let producer = match DefaultMQProducer::with_config(ProducerConfig {
@@ -273,7 +278,7 @@ async fn a1_private_instance_isolation(ck: &mut Checker, env: &Env) {
     }) {
         Ok(p) => p,
         Err(e) => {
-            ck.abort("A1 producer 构造", &e.to_string());
+            ck.abort("A1 build producer", &e.to_string());
             return;
         }
     };
@@ -292,7 +297,7 @@ async fn a1_private_instance_isolation(ck: &mut Checker, env: &Env) {
         return;
     }
     ck.check(
-        "A1 admin 与 producer 共用同一个 clientId",
+        "A1 admin and producer share the same clientId",
         admin.client_id() == client_id
             && producer.client_id().as_deref() == Some(client_id.as_str()),
         &format!(
@@ -301,36 +306,36 @@ async fn a1_private_instance_isolation(ck: &mut Checker, env: &Env) {
             producer.client_id()
         ),
     );
-    // admin 自己还能干活（两个实例并存，路由查询各走各的）。
+    // The admin still works on its own (two instances coexist, each does its own route lookup).
     ck.check(
-        "A1 两个实例并存时 admin 照常可用",
+        "A1 the admin stays usable while both instances coexist",
         admin.examine_topic_route(&env.topic).await.is_ok(),
-        "route 查询失败",
+        "route lookup failed",
     );
     admin.shutdown();
     ck.check(
-        "A1 admin shutdown 后自身未 started",
+        "A1 after admin shutdown the admin itself is not started",
         !admin.is_started(),
         "",
     );
     ck.check(
-        "A1 admin shutdown 后 producer 仍在 started",
+        "A1 after admin shutdown the producer is still started",
         producer.is_started(),
-        "admin 关掉了共享实例（#38 的坑复现）",
+        "the admin shut down the shared instance (the #38 bug reproduced)",
     );
-    // 真正发一条，证明连接没被连带拆掉。
+    // Actually send one, to prove the connection was not torn down along with it.
     let mut msg = Message::new(&env.topic, Some(b"a1-after-admin-shutdown"));
     let sent = producer.send(&mut msg, Some(5_000), None).await;
     match sent {
         Ok(result) => ck.check(
-            "A1 admin shutdown 后 producer 照常发送",
+            "A1 after admin shutdown the producer still sends normally",
             result.status == SendStatus::SendOk,
             &format!("status={}", result.status),
         ),
-        Err(e) => ck.abort("A1 admin shutdown 后 producer 照常发送", &e.to_string()),
+        Err(e) => ck.abort("A1 after admin shutdown the producer still sends normally", &e.to_string()),
     }
     ck.check(
-        "A1 admin 二次 shutdown 幂等",
+        "A1 a second admin shutdown is idempotent",
         {
             admin.shutdown();
             true
@@ -340,7 +345,7 @@ async fn a1_private_instance_isolation(ck: &mut Checker, env: &Env) {
     producer.shutdown();
 }
 
-// ------------------------------------------------------------------ A2 集群
+// ------------------------------------------------------------------ A2 cluster
 
 async fn a2_cluster(ck: &mut Checker, env: &Env) {
     let admin = &env.admin;
@@ -351,7 +356,7 @@ async fn a2_cluster(ck: &mut Checker, env: &Env) {
     );
     let Some(info) = info else { return };
     ck.check(
-        "A2 集群信息含 broker 与集群名",
+        "A2 the cluster info contains brokers and a cluster name",
         !info.broker_addr_table.is_empty() && !info.cluster_addr_table.is_empty(),
         &format!(
             "brokers={} clusters={}",
@@ -361,9 +366,9 @@ async fn a2_cluster(ck: &mut Checker, env: &Env) {
     );
     match admin.examine_broker_cluster_info().await {
         Ok(other) => ck.check(
-            "A2 examineBrokerClusterInfo 与 fetch 等价",
+            "A2 examineBrokerClusterInfo is equivalent to fetch",
             other.broker_addr_table == info.broker_addr_table,
-            "两个入口结果不一致",
+            "the two entry points disagree",
         ),
         Err(e) => ck.abort("A2 examineBrokerClusterInfo", &e.to_string()),
     }
@@ -371,36 +376,37 @@ async fn a2_cluster(ck: &mut Checker, env: &Env) {
     match admin.fetch_broker_runtime_stats(&addr, None).await {
         Ok(kv) => {
             ck.check(
-                "A2 fetchBrokerRuntimeStats 解析成 KVTable",
+                "A2 fetchBrokerRuntimeStats parses into a KVTable",
                 !kv.table.is_empty(),
                 &format!("keys={}", kv.table.len()),
             );
             match admin.get_broker_runtime_info(&addr, None).await {
                 Ok(same) => ck.check(
-                    "A2 getBrokerRuntimeInfo 别名同结果",
+                    "A2 the getBrokerRuntimeInfo alias returns the same result",
                     same.table.len() == kv.table.len(),
-                    "别名入口长度不一致",
+                    "the alias entry point has a different length",
                 ),
                 Err(e) => ck.abort("A2 getBrokerRuntimeInfo", &e.to_string()),
             }
         }
         Err(e) => ck.abort("A2 fetchBrokerRuntimeStats", &e.to_string()),
     }
-    // broker 侧 stats 库是运行时才有内容的，查不到只记一行不算失败。
+    // The broker-side stats store only has content at runtime; a miss just logs one line and does
+    // not count as a failure.
     match admin
         .view_broker_stats_data(&addr, "BROKER_PUT_NUMS", &env.broker_name())
         .await
     {
         Ok(value) => ck.check(
-            "A2 viewBrokerStatsData 正常应答",
+            "A2 viewBrokerStatsData replies normally",
             value.is_object() || value.is_null(),
             &value.to_string(),
         ),
-        Err(e) => println!("  [INFO] A2 viewBrokerStatsData 本机无数据: {e}"),
+        Err(e) => println!("  [INFO] A2 viewBrokerStatsData has no data locally: {e}"),
     }
 }
 
-// ------------------------------------------------------------------ A3 Topic 管理
+// ------------------------------------------------------------------ A3 topic management
 
 async fn a3_topic_lifecycle(ck: &mut Checker, env: &Env) {
     let admin = &env.admin;
@@ -409,13 +415,14 @@ async fn a3_topic_lifecycle(ck: &mut Checker, env: &Env) {
         .create_topic(MixAll::DEFAULT_TOPIC, &topic, QUEUE_NUMS, 0)
         .await
     {
-        Ok(()) => println!("  [INFO] A3 createTopic({topic}) 已下发"),
+        Ok(()) => println!("  [INFO] A3 createTopic({topic}) dispatched"),
         Err(e) => {
             ck.abort("A3 createTopic", &e.to_string());
             return;
         }
     }
-    // 路由是异步登记的（broker 每 10s 向 nameServer 注册），所以带预算轮询。
+    // The route is registered asynchronously (the broker registers with the nameServer every 10s), so
+    // poll within the budget.
     let mut route: Option<TopicRouteData> = None;
     let deadline = Instant::now() + Duration::from_secs(WAIT_SECONDS);
     loop {
@@ -431,7 +438,7 @@ async fn a3_topic_lifecycle(ck: &mut Checker, env: &Env) {
         sleep_millis(1000).await;
     }
     let Some(route) = route else {
-        ck.abort("A3 examineTopicRoute", "新 topic 路由在预算内不可见");
+        ck.abort("A3 examineTopicRoute", "the route of the new topic is not visible within the budget");
         return;
     };
     let read_nums: Vec<i32> = route
@@ -440,13 +447,13 @@ async fn a3_topic_lifecycle(ck: &mut Checker, env: &Env) {
         .map(|q| q.read_queue_nums)
         .collect();
     ck.check(
-        "A3 路由 readQueueNums 全部为建 topic 时的队列数",
+        "A3 every readQueueNums in the route equals the queue count used to create the topic",
         read_nums.iter().all(|n| *n == QUEUE_NUMS),
         &format!("{read_nums:?}"),
     );
     match admin.fetch_all_topic_list().await {
         Ok(list) => ck.check(
-            "A3 fetchAllTopicList 含新 topic",
+            "A3 fetchAllTopicList contains the new topic",
             list.get_topic_list().contains(&topic),
             &format!("topics={}", list.get_topic_list().len()),
         ),
@@ -457,16 +464,16 @@ async fn a3_topic_lifecycle(ck: &mut Checker, env: &Env) {
         Ok(clusters) => {
             clusters_of_topic = clusters.clone();
             ck.check(
-                "A3 getClusterList(topic) 给出该 topic 所在集群",
+                "A3 getClusterList(topic) gives the cluster that hosts this topic",
                 !clusters.is_empty(),
-                "返回空列表",
+                "an empty list came back",
             );
         }
         Err(e) => ck.abort("A3 getClusterList(topic)", &e.to_string()),
     }
     match admin.get_topic_cluster_list(&topic).await {
         Ok(clusters) => ck.check(
-            "A3 getTopicClusterList 与 getClusterList(topic) 等价",
+            "A3 getTopicClusterList is equivalent to getClusterList(topic)",
             clusters == clusters_of_topic,
             &format!("{clusters:?} vs {clusters_of_topic:?}"),
         ),
@@ -478,9 +485,9 @@ async fn a3_topic_lifecycle(ck: &mut Checker, env: &Env) {
     };
     match admin.fetch_topics_by_cluster(&cluster).await {
         Ok(topics) => ck.check(
-            &format!("A3 fetchTopicsByCluster({cluster}) 含新 topic"),
+            &format!("A3 fetchTopicsByCluster({cluster}) contains the new topic"),
             topics.contains(&topic),
-            &format!("topics={} 命中={}", topics.len(), topics.contains(&topic)),
+            &format!("topics={} hit={}", topics.len(), topics.contains(&topic)),
         ),
         Err(e) => ck.abort("A3 fetchTopicsByCluster", &e.to_string()),
     }
@@ -488,7 +495,7 @@ async fn a3_topic_lifecycle(ck: &mut Checker, env: &Env) {
     match admin.examine_topic_config(&addr, &topic).await {
         Ok(cfg) => {
             ck.check(
-                "A3 TopicConfig 队列数与创建一致",
+                "A3 the TopicConfig queue count matches the creation",
                 cfg.read_queue_nums == QUEUE_NUMS && cfg.write_queue_nums == QUEUE_NUMS,
                 &format!(
                     "read={} write={}",
@@ -496,12 +503,12 @@ async fn a3_topic_lifecycle(ck: &mut Checker, env: &Env) {
                 ),
             );
             ck.check(
-                "A3 TopicConfig.perm 是读写权限",
+                "A3 TopicConfig.perm is the read-write permission",
                 cfg.perm == DEFAULT_PERM,
                 &format!("perm={}", cfg.perm),
             );
             ck.check(
-                "A3 TopicConfig.attributes 被反序列化",
+                "A3 TopicConfig.attributes is deserialized",
                 cfg.attributes.is_empty() || cfg.attributes.contains_key("+traceSwitch"),
                 &format!("{:?}", cfg.attributes.iter().collect::<Vec<_>>()),
             );
@@ -510,7 +517,7 @@ async fn a3_topic_lifecycle(ck: &mut Checker, env: &Env) {
     }
     match admin.get_all_topic_config(&addr, None).await {
         Ok(wrapper) => ck.check(
-            "A3 getAllTopicConfig 含新 topic",
+            "A3 getAllTopicConfig contains the new topic",
             wrapper
                 .topic_config_table
                 .iter()
@@ -527,12 +534,12 @@ async fn a3_topic_lifecycle(ck: &mut Checker, env: &Env) {
                 .map(|(name, _)| name.as_str())
                 .collect();
             ck.check(
-                "A3 getUserTopicConfig 保留业务 topic",
+                "A3 getUserTopicConfig keeps business topics",
                 names.contains(&topic.as_str()),
                 &format!("{names:?}"),
             );
             ck.check(
-                "A3 getUserTopicConfig 剔除系统/重试/DLQ topic",
+                "A3 getUserTopicConfig filters out system/retry/DLQ topics",
                 !names.iter().any(|n| {
                     n.starts_with(MixAll::SYSTEM_TOPIC_PREFIX)
                         || n.starts_with(MixAll::RETRY_GROUP_TOPIC_PREFIX)
@@ -546,7 +553,7 @@ async fn a3_topic_lifecycle(ck: &mut Checker, env: &Env) {
     }
     match admin.get_system_topic_list_from_broker(&addr, None).await {
         Ok(list) => ck.check(
-            "A3 getSystemTopicListFromBroker 非空",
+            "A3 getSystemTopicListFromBroker is non-empty",
             !list.get_topic_list().is_empty(),
             &format!("{:?}", list.get_topic_list()),
         ),
@@ -554,13 +561,14 @@ async fn a3_topic_lifecycle(ck: &mut Checker, env: &Env) {
     }
     match admin.fetch_all_topic_route().await {
         Ok(routes) => ck.check(
-            "A3 fetchAllTopicRoute 有条目",
+            "A3 fetchAllTopicRoute has entries",
             !routes.is_empty(),
             &format!("count={}", routes.len()),
         ),
         Err(e) => ck.abort("A3 fetchAllTopicRoute", &e.to_string()),
     }
-    // 可逆改配置：把队列数改成 6 再回读，最后还原成 4（A13 删 topic 前保持原样）。
+    // A reversible config change: bump the queue count to 6, read it back, then restore it to 4 (so
+    // that A13 sees the original state before deleting the topic).
     let changed = TopicConfig {
         topic_name: topic.clone(),
         read_queue_nums: QUEUE_NUMS + 2,
@@ -579,21 +587,21 @@ async fn a3_topic_lifecycle(ck: &mut Checker, env: &Env) {
     sleep_millis(1500).await;
     match admin.examine_topic_config(&addr, &topic).await {
         Ok(cfg) => ck.check(
-            "A3 createAndUpdateTopicConfig 生效（队列数 +2）",
+            "A3 createAndUpdateTopicConfig took effect (queue count +2)",
             cfg.read_queue_nums == QUEUE_NUMS + 2,
             &format!("read={}", cfg.read_queue_nums),
         ),
-        Err(e) => ck.abort("A3 回读改后的 TopicConfig", &e.to_string()),
+        Err(e) => ck.abort("A3 read back the modified TopicConfig", &e.to_string()),
     }
     let mut restored = changed.clone();
     restored.read_queue_nums = QUEUE_NUMS;
     restored.write_queue_nums = QUEUE_NUMS;
     if let Err(e) = admin.create_and_update_topic_config(&addr, &restored).await {
-        println!("  [WARN] A3 还原队列数失败: {e}");
+        println!("  [WARN] A3 failed to restore the queue count: {e}");
     }
 }
 
-// ------------------------------------------------------------------ A4 Broker 配置
+// ------------------------------------------------------------------ A4 broker config
 
 async fn a4_broker_config(ck: &mut Checker, env: &Env) {
     let admin = &env.admin;
@@ -605,14 +613,14 @@ async fn a4_broker_config(ck: &mut Checker, env: &Env) {
             return;
         }
     };
-    // 响应体是 **properties 文本**，不是 KVTable JSON（历史 bug 点）。
+    // The response body is **properties text**, not KVTable JSON (a historical bug source).
     ck.check(
-        "A4 getBrokerConfig 解析出非空 k=v",
+        "A4 getBrokerConfig parses non-empty k=v pairs",
         !props.is_empty(),
         &format!("keys={}", props.len()),
     );
     ck.check(
-        "A4 brokerName 与路由里的 broker 一致",
+        "A4 brokerName matches the broker in the route",
         props
             .get("brokerName")
             .is_none_or(|v| v == env.broker_name() || env.broker_name().is_empty()),
@@ -622,23 +630,24 @@ async fn a4_broker_config(ck: &mut Checker, env: &Env) {
             env.broker_name()
         ),
     );
-    // 非法 brokerPermission 必须在**任何 IO 之前**被拒（code=16，不改 broker 一个字）。
+    // An illegal brokerPermission must be rejected **before any IO** (code=16, not a single byte on the
+    // broker is changed).
     let mut bad = StringMap::new();
     bad.insert("brokerPermission", "not-a-number");
     match admin.update_broker_config(&addr, &bad, None).await {
         Err(e) => ck.check(
-            "A4 非法 brokerPermission 本地快失败",
+            "A4 an illegal brokerPermission fails fast locally",
             client_code(&e) == Some(response_code::NO_PERMISSION),
             &e.to_string(),
         ),
         Ok(()) => ck.check(
-            "A4 非法 brokerPermission 本地快失败",
+            "A4 an illegal brokerPermission fails fast locally",
             false,
-            "居然打到了 broker，校验没生效",
+            "it actually reached the broker, so validation did not take effect",
         ),
     }
 
-    // 可逆改动：写一个无害值、回读、还原。
+    // A reversible change: write a harmless value, read it back, then restore it.
     let key = "sendMessageThreadPoolNums";
     let original = props.get(key).unwrap_or("16").to_string();
     let probe = "11";
@@ -650,17 +659,17 @@ async fn a4_broker_config(ck: &mut Checker, env: &Env) {
         sleep_millis(1000).await;
         match admin.get_broker_config(&addr, None).await {
             Ok(after) => ck.check(
-                "A4 updateBrokerConfig 真实生效",
+                "A4 updateBrokerConfig really took effect",
                 after.get(key) == Some(probe),
-                &format!("期望 {probe}，实际 {:?}", after.get(key)),
+                &format!("expected {probe}, actual {:?}", after.get(key)),
             ),
-            Err(e) => ck.abort("A4 回读 updateBrokerConfig", &e.to_string()),
+            Err(e) => ck.abort("A4 read back updateBrokerConfig", &e.to_string()),
         }
     }
     let mut revert = StringMap::new();
     revert.insert(key, original.as_str());
     if let Err(e) = admin.update_broker_config(&addr, &revert, None).await {
-        println!("  [WARN] A4 还原 {key} 失败: {e}");
+        println!("  [WARN] A4 failed to restore {key}: {e}");
     }
 }
 
@@ -675,7 +684,7 @@ async fn a5_kv_config(ck: &mut Checker, env: &Env) {
     }
     match admin.get_kv_config(&ns, "k1").await {
         Ok(value) => ck.check(
-            "A5 getKVConfig 值往返一致",
+            "A5 getKVConfig round-trips the value",
             value.as_deref() == Some("v1"),
             &format!("value={value:?}"),
         ),
@@ -683,22 +692,22 @@ async fn a5_kv_config(ck: &mut Checker, env: &Env) {
     }
     match admin.get_kv_list_by_namespace(&ns).await {
         Ok(table) => ck.check(
-            "A5 getKVListByNamespace 含 k1",
+            "A5 getKVListByNamespace contains k1",
             table.table.get("k1") == Some("v1"),
             &format!("{:?}", table.table.iter().collect::<Vec<_>>()),
         ),
         Err(e) => ck.abort("A5 getKVListByNamespace", &e.to_string()),
     }
     if let Err(e) = admin.put_kv_config(&ns, "k2", "v2").await {
-        ck.abort("A5 putKVConfig 别名", &e.to_string());
+        ck.abort("A5 putKVConfig alias", &e.to_string());
     } else {
         match admin.get_kv_config(&ns, "k2").await {
             Ok(value) => ck.check(
-                "A5 putKVConfig 别名同样落 NameServer",
+                "A5 the putKVConfig alias also lands in the NameServer",
                 value.as_deref() == Some("v2"),
                 &format!("value={value:?}"),
             ),
-            Err(e) => ck.abort("A5 回读 putKVConfig", &e.to_string()),
+            Err(e) => ck.abort("A5 read back putKVConfig", &e.to_string()),
         }
     }
     if let Err(e) = admin.delete_kv_config(&ns, "k1").await {
@@ -707,22 +716,23 @@ async fn a5_kv_config(ck: &mut Checker, env: &Env) {
         match admin.get_kv_config(&ns, "k1").await {
             Ok(value) => {
                 let gone = value.as_ref().filter(|v| !v.is_empty()).is_none();
-                ck.check("A5 删除后 KV 不再存在", gone, &format!("value={value:?}"));
+                ck.check("A5 the KV no longer exists after deletion", gone, &format!("value={value:?}"));
             }
-            Err(e) => ck.abort("A5 删除后回读 KV", &e.to_string()),
+            Err(e) => ck.abort("A5 read back the KV after deletion", &e.to_string()),
         }
     }
     let _ = admin.delete_kv_config(&ns, "k2").await;
 }
 
-// ------------------------------------------------------------------ A6 订阅组
+// ------------------------------------------------------------------ A6 subscription group
 
 async fn a6_subscription_group(ck: &mut Checker, env: &Env) {
     let admin = &env.admin;
     let addr = env.broker();
     let group = env.group.clone();
-    // 目标组也要显式建：A10 的 updateConsumerOffset / A12 的 resetOffset* 在 broker
-    // 关掉了 autoCreateSubscriptionGroup（或组名打错）时会回 code=26，先建好才测得准。
+    // The target group must also be created explicitly: A10's updateConsumerOffset and A12's
+    // resetOffset* return code=26 when the broker has autoCreateSubscriptionGroup turned off (or
+    // when the group name is wrong), so create it up front to get an accurate measurement.
     for name in [&group, &env.dest_group] {
         let mut config = SubscriptionGroupConfig::new(name);
         config.consume_enable = true;
@@ -737,32 +747,32 @@ async fn a6_subscription_group(ck: &mut Checker, env: &Env) {
     }
     match admin.get_subscription_group_config(&addr, &group).await {
         Ok(Some(found)) => ck.check(
-            "A6 单查 retryMaxTimes 往返一致",
+            "A6 a single lookup round-trips retryMaxTimes",
             found.retry_max_times == 5 && found.consume_enable,
             &format!(
                 "retryMax={} enable={}",
                 found.retry_max_times, found.consume_enable
             ),
         ),
-        Ok(None) => ck.check("A6 单查 retryMaxTimes 往返一致", false, "刚建的组查不到"),
+        Ok(None) => ck.check("A6 a single lookup round-trips retryMaxTimes", false, "the group just created cannot be found"),
         Err(e) => ck.abort("A6 getSubscriptionGroupConfig", &e.to_string()),
     }
     match admin.examine_subscription_group_config(&addr, &group).await {
         Ok(Some(found)) => ck.check(
-            "A6 examineSubscriptionGroupConfig 走全量分页取组",
+            "A6 examineSubscriptionGroupConfig fetches the group through full pagination",
             found.group_name == group,
             &found.group_name,
         ),
         Ok(None) => ck.check(
             "A6 examineSubscriptionGroupConfig",
             false,
-            "分页结果里没有该组",
+            "the group is not in the paginated result",
         ),
         Err(e) => ck.abort("A6 examineSubscriptionGroupConfig", &e.to_string()),
     }
     match admin.get_all_subscription_group(&addr, None).await {
         Ok(wrapper) => ck.check(
-            "A6 getAllSubscriptionGroup（分页）含新组",
+            "A6 getAllSubscriptionGroup (paginated) contains the new group",
             wrapper
                 .subscription_group_table
                 .iter()
@@ -779,7 +789,7 @@ async fn a6_subscription_group(ck: &mut Checker, env: &Env) {
                 .map(|(name, _)| name.as_str())
                 .collect();
             ck.check(
-                "A6 getUserSubscriptionGroup 含新组且剔除系统组",
+                "A6 getUserSubscriptionGroup contains the new group and filters out system groups",
                 names.contains(&group.as_str())
                     && !names.iter().any(|n| n.starts_with("CID_RMQ_SYS_")),
                 &format!("{names:?}"),
@@ -789,9 +799,9 @@ async fn a6_subscription_group(ck: &mut Checker, env: &Env) {
     }
 }
 
-// ------------------------------------------------------------------ A7 生产 + 统计
+// ------------------------------------------------------------------ A7 produce + stats
 
-/// A7 的输出：全部发送成功的消息，A9 的 viewMessage 要靠它。
+/// A7's output: all successfully sent messages, which A9's viewMessage relies on.
 async fn a7_produce_and_stats(ck: &mut Checker, env: &Env) -> Vec<SentMsg> {
     let admin = &env.admin;
     let topic = env.topic.clone();
@@ -801,17 +811,20 @@ async fn a7_produce_and_stats(ck: &mut Checker, env: &Env) -> Vec<SentMsg> {
         sent.extend(env.produce(&topic, queue_id, per_queue).await);
     }
     ck.check(
-        &format!("A7 同步发送 {} 条全部 SEND_OK", N_MSG),
+        &format!("A7 all {N_MSG} sync sends are SEND_OK"),
         sent.len() == N_MSG,
         &format!("ok={}/{}", sent.len(), N_MSG),
     );
     if sent.is_empty() {
         return sent;
     }
-    // broker 统计是周期刷新的，带预算轮询到 maxOffset 到位。
-    // 只保留**见过最大值**的那份快照：轮询期间 broker 侧的统计可能先回一个偏小的
-    // 半刷新结果，若最后一轮拿到什么就用什么，下面的"按 broker 查是合并结果子集"
-    // 会拿"更晚时刻"的单 broker 值去比"更早时刻"的合并值，随机假失败。
+    // Broker statistics are refreshed periodically, so poll within the budget until maxOffset is
+    // in place.
+    // Only the snapshot with the **largest value ever seen** is kept: during polling the
+    // broker-side statistics may first return a half-refreshed, smaller result; if we just used
+    // whatever the last round returned, the "per-broker query is a subset of the merged result"
+    // check below would compare a "later" single-broker value against an "earlier" merged value and
+    // fail at random.
     let deadline = Instant::now() + Duration::from_secs(WAIT_SECONDS);
     let mut stats: Option<TopicStatsTable> = None;
     loop {
@@ -843,23 +856,25 @@ async fn a7_produce_and_stats(ck: &mut Checker, env: &Env) -> Vec<SentMsg> {
     match stats {
         Some(table) => {
             ck.check(
-                "A7 examineTopicStats 合并后的 maxOffset 覆盖发送量",
+                "A7 the merged maxOffset from examineTopicStats covers the number sent",
                 table.total_max_offset() >= N_MSG as i64,
                 &format!("maxOffsetSum={}", table.total_max_offset()),
             );
             ck.check(
-                "A7 examineTopicStats 覆盖 topic 的每个队列",
+                "A7 examineTopicStats covers every queue of the topic",
                 table.offset_table.len() as i32 >= QUEUE_NUMS,
                 &format!("queues={}", table.offset_table.len()),
             );
             let addr = env.broker();
-            // 「按 broker 查 ⊆ 合并查」要的必须是**同一时刻之后**的合并视图：队列的
-            // maxOffset 单调不减，所以先取单 broker、紧接着再取合并，包含关系才成立。
-            // 反过来（拿更早的合并快照去比更晚的单 broker 值）会随机假失败。
+            // "per-broker query ⊆ merged query" requires a merged view taken **after the same
+            // instant**: a queue's maxOffset never decreases, so we fetch the single-broker view
+            // first and then immediately the merged view, and only then does the containment hold.
+            // The other way round (comparing an earlier merged snapshot with a later single-broker
+            // value) fails at random.
             match admin.examine_topic_stats_by_broker(&addr, &topic).await {
                 Ok(part) => match admin.examine_topic_stats(&topic).await {
                     Ok(merged) => ck.check(
-                        "A7 examineTopicStatsByBroker 是合并结果的子集",
+                        "A7 examineTopicStatsByBroker is a subset of the merged result",
                         part.offset_table.len() <= merged.offset_table.len()
                             && part.total_max_offset() <= merged.total_max_offset(),
                         &format!(
@@ -870,12 +885,12 @@ async fn a7_produce_and_stats(ck: &mut Checker, env: &Env) -> Vec<SentMsg> {
                             merged.total_max_offset()
                         ),
                     ),
-                    Err(e) => ck.abort("A7 examineTopicStats 复检", &e.to_string()),
+                    Err(e) => ck.abort("A7 examineTopicStats recheck", &e.to_string()),
                 },
                 Err(e) => ck.abort("A7 examineTopicStatsByBroker", &e.to_string()),
             }
         }
-        None => ck.abort("A7 examineTopicStats", "预算内没有拿到统计"),
+        None => ck.abort("A7 examineTopicStats", "no statistics within the budget"),
     }
     let addr = env.broker();
     let group = env.group.clone();
@@ -884,7 +899,7 @@ async fn a7_produce_and_stats(ck: &mut Checker, env: &Env) -> Vec<SentMsg> {
         .await
     {
         Ok(stats) => ck.check(
-            "A7 examineConsumeStats 正常应答（未消费时 lag 即积压）",
+            "A7 examineConsumeStats replies normally (lag equals the backlog when nothing is consumed)",
             !stats.offset_table.is_empty() && stats.total_lag() >= 0,
             &format!(
                 "queues={} lag={}",
@@ -898,12 +913,14 @@ async fn a7_produce_and_stats(ck: &mut Checker, env: &Env) -> Vec<SentMsg> {
         .fetch_consume_stats_in_broker(&addr, false, None)
         .await
     {
-        // broker 端 `AdminBrokerProcessor#fetchAllConsumeStatsInBroker` 是**按订阅组
-        // 逐个建一行**（`subscriptionGroupTable.keySet()` → `{group: [ConsumeStats]}`），
-        // 内层 topic 才来自位点表 `whichTopicByConsumer`。所以此刻即使没有提交位点，
-        // 行数也应该等于本 broker 上的订阅组数；「行里能看到本组且带统计」由 A8 断言。
+        // On the broker side `AdminBrokerProcessor#fetchAllConsumeStatsInBroker` builds **one row per
+        // subscription group** (`subscriptionGroupTable.keySet()` → `{group: [ConsumeStats]}`), and
+        // only the inner topic comes from the offset table `whichTopicByConsumer`. So even with no
+        // offset committed at this point, the row count should equal the number of subscription
+        // groups on this broker; "this group shows up in a row together with statistics" is
+        // asserted by A8.
         Ok(list) => ck.check(
-            "A7 fetchConsumeStatsInBroker 按订阅组出行",
+            "A7 fetchConsumeStatsInBroker emits one row per subscription group",
             !list.stats_list.is_empty(),
             &format!(
                 "groups={} totalDiff={}",
@@ -918,7 +935,7 @@ async fn a7_produce_and_stats(ck: &mut Checker, env: &Env) -> Vec<SentMsg> {
         .await
     {
         Ok(body) => ck.check(
-            "A7 queryConsumeQueue 索引可查",
+            "A7 the queryConsumeQueue index is queryable",
             body.max_queue_index >= N_MSG as i32 / QUEUE_NUMS,
             &format!(
                 "min={} max={} entries={}",
@@ -932,9 +949,10 @@ async fn a7_produce_and_stats(ck: &mut Checker, env: &Env) -> Vec<SentMsg> {
     sent
 }
 
-// ------------------------------------------------------------------ A8 在线消费者
+// ------------------------------------------------------------------ A8 online consumer
 
-/// 只记录 body 的并发 listener（A8 要证明管理端读到的运行时状态和客户端真实一致）。
+/// A concurrent listener that only records bodies (A8 has to prove that the runtime state read by
+/// the admin matches what the client really has).
 #[derive(Default)]
 struct Inbox {
     bodies: Mutex<Vec<String>>,
@@ -959,7 +977,8 @@ impl MessageListenerConcurrently for Inbox {
     }
 }
 
-/// A8 的输出：消费者 clientId，供 runningInfo 复查；`None` 表示没消费到。
+/// A8's output: the consumer's clientId, used to re-check runningInfo; `None` means nothing was
+/// consumed.
 async fn a8_online_consumer(ck: &mut Checker, env: &Env) -> Option<String> {
     let admin = &env.admin;
     let group = env.group.clone();
@@ -974,7 +993,7 @@ async fn a8_online_consumer(ck: &mut Checker, env: &Env) -> Option<String> {
     }) {
         Ok(c) => c,
         Err(e) => {
-            ck.abort("A8 消费者构造", &e.to_string());
+            ck.abort("A8 build consumer", &e.to_string());
             return None;
         }
     };
@@ -994,12 +1013,13 @@ async fn a8_online_consumer(ck: &mut Checker, env: &Env) -> Option<String> {
     }
     let got = inbox.bodies().len();
     ck.check(
-        &format!("A8 push 消费者在线消费（sendMessageBack 前置）>0 条，实得 {got}"),
+        &format!("A8 the push consumer consumes >0 messages online (prerequisite for sendMessageBack), got {got}"),
         got > 0,
         &format!("consumed={got}"),
     );
-    // 组名/客户端在线信息：这些请求经 broker 转发回**本进程的客户端**，
-    // 顺带证明 ClientRemotingProcessor 的回调链是通的。
+    // Group/client online information: these requests are forwarded by the broker back to the client
+    // **in this very process**, which incidentally proves that the ClientRemotingProcessor callback
+    // chain works.
     match admin.examine_consumer_connection_info(&group, None).await {
         Ok(conn) => {
             let ids: Vec<&str> = conn
@@ -1008,12 +1028,12 @@ async fn a8_online_consumer(ck: &mut Checker, env: &Env) -> Option<String> {
                 .filter_map(|c| c.client_id.as_deref())
                 .collect();
             ck.check(
-                "A8 examineConsumerConnectionInfo 含本消费者连接",
+                "A8 examineConsumerConnectionInfo contains this consumer's connection",
                 ids.contains(&client_id.as_str()),
                 &format!("{ids:?}"),
             );
             ck.check(
-                "A8 ConsumerConnection 带订阅关系与消费模式",
+                "A8 ConsumerConnection carries the subscription and the consume model",
                 !conn.subscription_table.is_empty()
                     && conn.consume_type.is_some()
                     && conn.message_model.is_some(),
@@ -1029,7 +1049,7 @@ async fn a8_online_consumer(ck: &mut Checker, env: &Env) -> Option<String> {
     }
     match admin.get_consumer_list_by_group(&group, None).await {
         Ok(body) => ck.check(
-            "A8 getConsumerListByGroup（broker→客户端回调）",
+            "A8 getConsumerListByGroup (broker→client callback)",
             body.consumer_id_list.contains(&client_id),
             &format!("{:?}", body.consumer_id_list),
         ),
@@ -1040,7 +1060,7 @@ async fn a8_online_consumer(ck: &mut Checker, env: &Env) -> Option<String> {
         .await
     {
         Ok(groups) => ck.check(
-            "A8 queryTopicConsumeByWho 能查到本组",
+            "A8 queryTopicConsumeByWho finds this group",
             !groups.is_empty(),
             &format!("{groups:?}"),
         ),
@@ -1051,9 +1071,9 @@ async fn a8_online_consumer(ck: &mut Checker, env: &Env) -> Option<String> {
         .await
     {
         Ok(value) => ck.check(
-            "A8 querySubscription 返回订阅 JSON",
+            "A8 querySubscription returns the subscription JSON",
             value.is_some(),
-            "broker 没有回订阅数据",
+            "the broker returned no subscription data",
         ),
         Err(e) => ck.abort("A8 querySubscription", &e.to_string()),
     }
@@ -1065,7 +1085,7 @@ async fn a8_online_consumer(ck: &mut Checker, env: &Env) -> Option<String> {
             let sub = info.properties.get("subscription");
             let commit = info.properties.get("commitOffsetWord");
             ck.check(
-                "A8 examineConsumerRunningInfo 走 307 回调拿到运行时属性",
+                "A8 examineConsumerRunningInfo gets the runtime properties through the 307 callback",
                 !info.properties.is_empty() && !info.mq_table.is_empty(),
                 &format!(
                     "props={} sub={:?} commit={:?}",
@@ -1075,9 +1095,9 @@ async fn a8_online_consumer(ck: &mut Checker, env: &Env) -> Option<String> {
                 ),
             );
             ck.check(
-                "A8 runningInfo 的 statusTable 按队列给出",
+                "A8 the statusTable of runningInfo is given per queue",
                 !info.status_table.is_empty(),
-                "statusTable 为空",
+                "statusTable is empty",
             );
         }
         Err(e) => ck.abort("A8 examineConsumerRunningInfo", &e.to_string()),
@@ -1087,15 +1107,16 @@ async fn a8_online_consumer(ck: &mut Checker, env: &Env) -> Option<String> {
         .await
     {
         Ok(value) => ck.check(
-            "A8 getConsumeStatus（223 回调）返回 consumerTable",
+            "A8 getConsumeStatus (223 callback) returns the consumerTable",
             value.is_object(),
             &value.to_string(),
         ),
         Err(e) => ck.abort("A8 getConsumeStatus", &e.to_string()),
     }
-    // 生产者组是**心跳**注册到 broker 的（`ProducerManager.groupChannelTable` 只由
-    // HEART_BEAT 填充），心跳 30s 一轮 ⇒ 必须轮询等它出现；没注册上时 broker 回
-    // SYSTEM_ERROR "the producer group[...] not exist"。
+    // A producer group registers with the broker via **heartbeat** (`ProducerManager.groupChannelTable`
+    // is only filled by HEART_BEAT), and the heartbeat runs every 30s ⇒ we must poll until it
+    // shows up; when it is not registered the broker replies SYSTEM_ERROR "the producer
+    // group[...] not exist".
     let pg = format!("rust-live-admin-pg-{}", env.stamp);
     let deadline = Instant::now() + Duration::from_secs(HEARTBEAT_VISIBLE_SECONDS);
     let mut producer_conns: Option<usize> = None;
@@ -1115,14 +1136,15 @@ async fn a8_online_consumer(ck: &mut Checker, env: &Env) -> Option<String> {
         sleep_millis(2_000).await;
     }
     ck.check(
-        "A8 examineProducerConnectionInfo 看到生产者注册的连接",
+        "A8 examineProducerConnectionInfo sees the connection registered by the producer",
         producer_conns.is_some(),
         &match producer_conns {
             Some(n) => format!("connections={n}"),
-            None => format!("预算内没等到，最后一次: {last_producer_err}"),
+            None => format!("not seen within the budget, last try: {last_producer_err}"),
         },
     );
-    // 消费发生后位点必须已提交（5s 周期刷新，这里给足预算轮询）。
+    // Once messages have been consumed the offset must have been committed (refreshed every 5s, so
+    // poll with a generous budget here).
     let mq = MessageQueue::new(&topic, &env.broker_name(), 0);
     let deadline = Instant::now() + Duration::from_secs(WAIT_SECONDS);
     let mut offset = None;
@@ -1145,13 +1167,14 @@ async fn a8_online_consumer(ck: &mut Checker, env: &Env) -> Option<String> {
         sleep_millis(1000).await;
     }
     ck.check(
-        "A8 消费后的位点已刷到 broker",
+        "A8 the offset after consuming has been flushed to the broker",
         offset.is_some(),
         &format!("offset={offset:?}"),
     );
-    // 343 QUERY_TOPICS_BY_CONSUMER 读的是 broker 的 offsetTable
-    // （`ConsumerOffsetManager#whichTopicByConsumer`），所以只有在消费者刷过位点之后
-    // 才有内容；订阅关系本身不参与。%RETRY% 同理，只有给重试 topic 提交过位点才会出现。
+    // 343 QUERY_TOPICS_BY_CONSUMER reads the broker's offsetTable
+    // (`ConsumerOffsetManager#whichTopicByConsumer`), so it only has content once the consumer has
+    // flushed an offset; the subscription itself does not take part. The same holds for %RETRY%,
+    // which only appears after an offset has been committed for a retry topic.
     match admin
         .query_topics_by_consumer_to_broker(&env.broker(), &group)
         .await
@@ -1159,7 +1182,7 @@ async fn a8_online_consumer(ck: &mut Checker, env: &Env) -> Option<String> {
         Ok(list) => {
             let topics = list.get_topic_list();
             ck.check(
-                "A8 queryTopicsByConsumerToBroker 从位点表读出本组消费过的 topic",
+                "A8 queryTopicsByConsumerToBroker reads the topics this group consumed from the offset table",
                 topics.contains(&topic),
                 &format!("{topics:?}"),
             );
@@ -1170,7 +1193,7 @@ async fn a8_online_consumer(ck: &mut Checker, env: &Env) -> Option<String> {
         Ok(list) => {
             let topics = list.get_topic_list();
             ck.check(
-                "A8 queryTopicsByConsumer(group) 按 %RETRY% 路由扇出并合并",
+                "A8 queryTopicsByConsumer(group) fans out over the %RETRY% routes and merges",
                 topics.contains(&topic),
                 &format!("{topics:?}"),
             );
@@ -1202,7 +1225,7 @@ async fn a8_online_consumer(ck: &mut Checker, env: &Env) -> Option<String> {
                         .is_some_and(|t| t.as_object().is_some_and(|m| !m.is_empty()))
                 });
             ck.check(
-                "A8 有提交位点后 fetchConsumeStatsInBroker 能看到本组",
+                "A8 after an offset has been committed fetchConsumeStatsInBroker can see this group",
                 hit && has_offsets,
                 &format!(
                     "rows={} hit={hit} offsetTable={has_offsets} groups={:?}",
@@ -1217,36 +1240,37 @@ async fn a8_online_consumer(ck: &mut Checker, env: &Env) -> Option<String> {
     Some(client_id)
 }
 
-// ------------------------------------------------------------------ A9 消息查询
+// ------------------------------------------------------------------ A9 message query
 
 async fn a9_message_query(ck: &mut Checker, env: &Env, sent: &[SentMsg]) {
     let admin = &env.admin;
     let topic = env.topic.clone();
     let Some(first) = sent.first() else {
-        ck.skip("A9 消息查询", "A7 没有发出任何消息，跳过");
+        ck.skip("A9 message query", "A7 did not send any message, skipping");
         return;
     };
     let now = now_millis();
-    // queryMessage 只断言「请求可达、broker 正常应答、返回类型正确」：msgId 属于
-    // uniqKey，broker 侧的 uniqKey 倒排索引只有 RocksDB 索引实现支持，本机是默认
-    // 文件索引 ⇒ 查不到是 broker 配置差异，不是客户端 bug。
+    // queryMessage only asserts "the request is reachable, the broker replies normally, and the
+    // return type is correct": msgId is a uniqKey, and the broker-side uniqKey inverted index is
+    // only supported by the RocksDB index implementation while this machine uses the default file
+    // index ⇒ not finding it is a broker configuration difference, not a client bug.
     let by_key = admin
         .query_message(&topic, &first.uniq_key, 32, now - 60_000, now + 60_000)
         .await;
     match by_key {
         Ok(msgs) => ck.check(
-            "A9 queryMessage 请求可达且正常应答",
+            "A9 the queryMessage request is reachable and replies normally",
             msgs.iter().all(|m| m.get_topic() == topic),
             &format!("hits={}", msgs.len()),
         ),
-        Err(e) => ck.abort("A9 queryMessage 请求可达且正常应答", &e.to_string()),
+        Err(e) => ck.abort("A9 the queryMessage request is reachable and replies normally", &e.to_string()),
     }
     match admin
         .query_message_by_key(&topic, &first.uniq_key, 32)
         .await
     {
         Ok(msgs) => ck.check(
-            "A9 queryMessageByUniqKey/NORMAL 模式可达",
+            "A9 queryMessageByUniqKey in NORMAL mode is reachable",
             msgs.iter().all(|m| m.get_topic() == topic),
             &format!("hits={}", msgs.len()),
         ),
@@ -1257,58 +1281,60 @@ async fn a9_message_query(ck: &mut Checker, env: &Env, sent: &[SentMsg]) {
         .await
     {
         Ok(found) => ck.check(
-            "A9 queryMessageByUniqKey 可达（命中的话必须是原消息）",
+            "A9 queryMessageByUniqKey is reachable (on a hit it must be the original message)",
             found.is_none_or(|m| m.get_topic() == topic),
             "",
         ),
         Err(e) => ck.abort("A9 queryMessage_by_uniq_key", &e.to_string()),
     }
     ck.skip(
-        "A9 queryMessage 命中结果",
-        "本机 broker 是默认文件索引且消息未设 KEYS，uniqKey 查询返回空属预期",
+        "A9 queryMessage hits",
+        "the local broker uses the default file index and the message carries no KEYS, so an empty uniqKey query result is expected",
     );
     match admin.view_message(&topic, &first.offset_msg_id).await {
         Ok(msg) => ck.check(
-            "A9 viewMessage(offsetMsgId) 取回原消息",
+            "A9 viewMessage(offsetMsgId) fetches the original message back",
             String::from_utf8_lossy(msg.get_body()) == first.body,
             &format!(
-                "期望 {:?} 实际 {:?}",
+                "expected {:?} actual {:?}",
                 first.body,
                 String::from_utf8_lossy(msg.get_body())
             ),
         ),
         Err(e) => ck.abort("A9 viewMessage(offsetMsgId)", &e.to_string()),
     }
-    // 客户端 uniqKey 同样是 32 位十六进制，硬解会拼出假地址；必须走兜底并以
-    // 干净的 NO_MESSAGE(208) 收场，而不是裸的溢出/连接异常。
+    // The client-side uniqKey is likewise 32 hex digits, and decoding it blindly yields a bogus
+    // address; it must take the fallback path and end with a clean NO_MESSAGE(208) instead of a raw
+    // overflow/connection exception.
     match admin.view_message(&topic, &first.uniq_key).await {
         Ok(_) => ck.check(
-            "A9 viewMessage(uniqKey) 走兜底并给出干净异常",
+            "A9 viewMessage(uniqKey) takes the fallback and yields a clean exception",
             false,
-            "uniqKey 竟然被查到了（本机开了 uniqKey 索引），按命中处理",
+            "the uniqKey was actually found (the uniqKey index is enabled locally), treating it as a hit",
         ),
         Err(e) => ck.check(
-            "A9 viewMessage(uniqKey) 走兜底并给出干净异常",
+            "A9 viewMessage(uniqKey) takes the fallback and yields a clean exception",
             client_code(&e) == Some(response_code::NO_MESSAGE),
             &e.to_string(),
         ),
     }
-    // 真正不合法的 msgId 也必须走同一条兜底，不能把解析错直接抛出去。
+    // A genuinely invalid msgId must take the very same fallback; the parse error must not be
+    // thrown out directly.
     match admin.view_message(&topic, "not-a-hex-msg-id").await {
         Err(e) => ck.check(
-            "A9 viewMessage(非法 msgId) 同样兜底成 208",
+            "A9 viewMessage(illegal msgId) also falls back to 208",
             client_code(&e) == Some(response_code::NO_MESSAGE),
             &e.to_string(),
         ),
         Ok(_) => ck.check(
-            "A9 viewMessage(非法 msgId) 同样兜底成 208",
+            "A9 viewMessage(illegal msgId) also falls back to 208",
             false,
-            "居然查到了",
+            "it was actually found",
         ),
     }
 }
 
-// ------------------------------------------------------------------ A10 Offset 管理
+// ------------------------------------------------------------------ A10 offset management
 
 async fn a10_offset_admin(ck: &mut Checker, env: &Env) {
     let admin = &env.admin;
@@ -1320,14 +1346,14 @@ async fn a10_offset_admin(ck: &mut Checker, env: &Env) {
     let min = step!(ck, "A10 minOffset", admin.min_offset(&mq).await);
     if let (Some(max), Some(min)) = (max, min) {
         ck.check(
-            "A10 maxOffset >= minOffset 且覆盖本队列发送量",
+            "A10 maxOffset >= minOffset and covers the number sent to this queue",
             max >= min && max - min >= (N_MSG / QUEUE_NUMS as usize) as i64,
             &format!("min={min} max={max}"),
         );
     }
     match admin.search_offset(&mq, now_millis()).await {
         Ok(offset) => ck.check(
-            "A10 searchOffset(now) 落在队列区间内",
+            "A10 searchOffset(now) falls inside the queue range",
             max.is_none_or(|m| offset <= m) && min.is_none_or(|m| offset >= m),
             &format!("offset={offset}"),
         ),
@@ -1335,7 +1361,7 @@ async fn a10_offset_admin(ck: &mut Checker, env: &Env) {
     }
     match admin.earliest_msg_store_time(&mq).await {
         Ok(ts) => ck.check(
-            "A10 earliestMsgStoreTime 是合理时间戳",
+            "A10 earliestMsgStoreTime is a plausible timestamp",
             ts > 1_600_000_000_000,
             &format!("ts={ts}"),
         ),
@@ -1344,11 +1370,11 @@ async fn a10_offset_admin(ck: &mut Checker, env: &Env) {
     let fresh = env.dest_group.clone();
     match admin.examine_consumer_offset(&fresh, &mq).await {
         Ok(offset) => ck.check(
-            "A10 未提交过位点的组读回 None（不是 0）",
+            "A10 a group that never committed an offset reads back None (not 0)",
             offset.is_none(),
             &format!("offset={offset:?}"),
         ),
-        Err(e) => ck.abort("A10 examineConsumerOffset(新组)", &e.to_string()),
+        Err(e) => ck.abort("A10 examineConsumerOffset(new group)", &e.to_string()),
     }
     if let Err(e) = admin
         .update_consumer_offset_to_broker(&addr, &fresh, &mq, 1)
@@ -1358,37 +1384,38 @@ async fn a10_offset_admin(ck: &mut Checker, env: &Env) {
     } else {
         match admin.examine_consumer_offset(&fresh, &mq).await {
             Ok(offset) => ck.check(
-                "A10 指定位点写回后可读",
+                "A10 the explicitly written offset can be read back",
                 offset == Some(1),
                 &format!("offset={offset:?}"),
             ),
-            Err(e) => ck.abort("A10 回读指定位点", &e.to_string()),
+            Err(e) => ck.abort("A10 read back the explicit offset", &e.to_string()),
         }
     }
     if let Err(e) = admin.update_consumer_offset(&fresh, &mq, 0).await {
-        ck.abort("A10 updateConsumerOffset（按路由解析地址）", &e.to_string());
+        ck.abort("A10 updateConsumerOffset (address resolved via the route)", &e.to_string());
     } else {
         match admin.examine_consumer_offset(&fresh, &mq).await {
             Ok(offset) => ck.check(
-                "A10 updateConsumerOffset 走路由解析同样生效",
+                "A10 updateConsumerOffset takes effect through route resolution too",
                 offset == Some(0),
                 &format!("offset={offset:?}"),
             ),
-            Err(e) => ck.abort("A10 回读路由定位的位点", &e.to_string()),
+            Err(e) => ck.abort("A10 read back the route-located offset", &e.to_string()),
         }
     }
-    // cloneGroupOffset(314)：把源组位点整份抄给目标组（offline=true，不要求在线）。
+    // cloneGroupOffset(314): copies the whole offset set of the source group over to the target
+    // group (offline=true, it does not require the target to be online).
     match admin
         .clone_group_offset(&addr, &group, &fresh, &topic, true)
         .await
     {
         Ok(()) => match admin.examine_consumer_offset(&fresh, &mq).await {
             Ok(copied) => ck.check(
-                "A10 cloneGroupOffset 后目标组位点与源组一致",
+                "A10 after cloneGroupOffset the target group's offset matches the source group",
                 copied.is_some(),
                 &format!("copied={copied:?}"),
             ),
-            Err(e) => ck.abort("A10 回读克隆后的位点", &e.to_string()),
+            Err(e) => ck.abort("A10 read back the cloned offset", &e.to_string()),
         },
         Err(e) => ck.abort("A10 cloneGroupOffset", &e.to_string()),
     }
@@ -1398,12 +1425,12 @@ async fn a10_offset_admin(ck: &mut Checker, env: &Env) {
         .create_topic(MixAll::DEFAULT_TOPIC, &bnd_topic, 1, 0)
         .await
     {
-        ck.abort("A10.5 createTopic(1 队列)", &e.to_string());
+        ck.abort("A10.5 createTopic(1 queue)", &e.to_string());
         return;
     }
     match env.produce(&bnd_topic, 0, 3).await.len() {
-        3 => println!("  [INFO] A10.5 boundary topic 已发送 3 条"),
-        n => ck.check("A10.5 boundary topic 发送 3 条", false, &format!("ok={n}")),
+        3 => println!("  [INFO] A10.5 boundary topic has sent 3 messages"),
+        n => ck.check("A10.5 boundary topic sent 3 messages", false, &format!("ok={n}")),
     }
     sleep_millis(2000).await;
     let bmq = MessageQueue::new(&bnd_topic, &env.broker_name(), 0);
@@ -1415,10 +1442,10 @@ async fn a10_offset_admin(ck: &mut Checker, env: &Env) {
     let up = step!(ck, "A10.5 searchUpperBoundaryOffset", admin
         .search_upper_boundary_offset(&bmq, future)
         .await);
-    let lo_past = step!(ck, "A10.5 LOWER(过去)", admin
+    let lo_past = step!(ck, "A10.5 LOWER(the past)", admin
         .search_lower_boundary_offset(&bmq, 1)
         .await);
-    let up_past = step!(ck, "A10.5 UPPER(过去)", admin
+    let up_past = step!(ck, "A10.5 UPPER(the past)", admin
         .search_upper_boundary_offset(&bmq, 1)
         .await);
     if let Some(bmax) = bmax {
@@ -1429,17 +1456,17 @@ async fn a10_offset_admin(ck: &mut Checker, env: &Env) {
         );
         if let (Some(lo), Some(up)) = (lo, up) {
             ck.check(
-                "A10.5 LOWER 边界 = maxOffset（队尾之后的下一个位点）",
+                "A10.5 LOWER boundary = maxOffset (the offset just past the tail)",
                 lo == bmax,
                 &format!("lower={lo} maxOffset={bmax}"),
             );
             ck.check(
-                "A10.5 UPPER 边界 = maxOffset-1（最后一条自身位点）",
+                "A10.5 UPPER boundary = maxOffset-1 (the offset of the last message itself)",
                 up == bmax - 1,
                 &format!("upper={up} maxOffset-1={}", bmax - 1),
             );
             ck.check(
-                "A10.5 两个边界确实不同（证明 boundaryType 生效）",
+                "A10.5 the two boundaries really differ (proving boundaryType takes effect)",
                 lo != up,
                 &format!("lower={lo} upper={up}"),
             );
@@ -1447,30 +1474,32 @@ async fn a10_offset_admin(ck: &mut Checker, env: &Env) {
     }
     if let (Some(lo_past), Some(up_past)) = (lo_past, up_past) {
         ck.check(
-            "A10.5 时间戳早于全部消息时 LOWER/UPPER 都塌到 minOffset",
+            "A10.5 when the timestamp predates every message both LOWER and UPPER collapse to minOffset",
             lo_past == 0 && up_past == 0,
             &format!("lower={lo_past} upper={up_past}"),
         );
     }
     match admin.search_offset(&bmq, future).await {
         Ok(same) => ck.check(
-            "A10.5 searchOffset 默认边界与显式 LOWER 同结果",
+            "A10.5 the searchOffset default boundary matches an explicit LOWER",
             Some(same) == lo,
             &format!("searchOffset={same} lower={lo:?}"),
         ),
         Err(e) => ck.abort("A10.5 searchOffset", &e.to_string()),
     }
     match admin.delete_topic(&bnd_topic, None).await {
-        Ok(()) => println!("  [INFO] A10.5 deleteTopic(boundary) 已下发"),
+        Ok(()) => println!("  [INFO] A10.5 deleteTopic(boundary) dispatched"),
         Err(e) => println!("  [WARN] A10.5 deleteTopic(boundary): {e}"),
     }
 }
 
-// ------------------------------------------------------------------ A11 重投到 %RETRY%
+// ------------------------------------------------------------------ A11 resend to %RETRY%
 
-/// 管理端视角的重投验证：拉一条 → `send_message_back` → 轮询 `%RETRY%<group>` 的
-/// broker 统计。push 消费者内部的回投路径由 `live_consumer` 的 C4 覆盖，这里用拉
-/// 模式消费者的公开 `send_message_back`，证明的是**管理端读得到**这条重投。
+/// Send-back verification from the admin's point of view: pull one message →
+/// `send_message_back` → poll the broker statistics of `%RETRY%<group>`.
+/// The requeue path inside a push consumer is covered by C4 in `live_consumer`; here the public
+/// `send_message_back` of a pull-mode consumer is used, and what it proves is that **the admin
+/// side can read** this requeue.
 async fn a11_send_back(ck: &mut Checker, env: &Env) {
     let topic = env.topic.clone();
     let group = env.group.clone();
@@ -1482,12 +1511,12 @@ async fn a11_send_back(ck: &mut Checker, env: &Env) {
     }) {
         Ok(c) => c,
         Err(e) => {
-            ck.abort("A11 拉消费者构造", &e.to_string());
+            ck.abort("A11 build pull consumer", &e.to_string());
             return;
         }
     };
     if let Err(e) = consumer.start().await {
-        ck.abort("A11 拉消费者 start", &e.to_string());
+        ck.abort("A11 start pull consumer", &e.to_string());
         return;
     }
     let mqs = match consumer.fetch_subscribe_message_queues(&topic).await {
@@ -1499,22 +1528,23 @@ async fn a11_send_back(ck: &mut Checker, env: &Env) {
         }
     };
     let Some(mq) = mqs.first() else {
-        ck.abort("A11 fetch_subscribe_message_queues", "topic 没有队列");
+        ck.abort("A11 fetch_subscribe_message_queues", "the topic has no queue");
         consumer.shutdown();
         return;
     };
-    // 从队首起拉：位点与 broker 存储区间无关，保证一定拿得到 A7 发的消息。
+    // Pull from the head of the queue: the offset is independent of the broker's stored range, so
+    // we are guaranteed to get one of the messages A7 sent.
     let min = consumer.min_offset(mq).await.unwrap_or(0);
     let msg: Option<MessageExt> = match consumer.pull(mq, "*", min, 1, Some(5_000)).await {
         Ok(result) => match result.status {
             PullStatus::Found => result.msg_found_list.into_iter().next(),
             other => {
-                ck.abort("A11 拉取一条消息", &format!("status={other}"));
+                ck.abort("A11 pull one message", &format!("status={other}"));
                 None
             }
         },
         Err(e) => {
-            ck.abort("A11 拉取一条消息", &e.to_string());
+            ck.abort("A11 pull one message", &e.to_string());
             None
         }
     };
@@ -1523,14 +1553,15 @@ async fn a11_send_back(ck: &mut Checker, env: &Env) {
         return;
     };
     if let Err(e) = consumer.send_message_back(&msg, 0).await {
-        ck.abort("A11 sendMessageBack 重投", &e.to_string());
+        ck.abort("A11 sendMessageBack resend", &e.to_string());
         consumer.shutdown();
         return;
     }
     consumer.shutdown();
     let retry_topic = MixAll::get_retry_topic(&group);
-    // 必须轮询：broker 的 consumerSendMsgBack 在 delayLevel==0 时改写成
-    // `3 + reconsumeTimes`（≈10s），消息先进 SCHEDULE_TOPIC_XXXX 才投递到 %RETRY%。
+    // Polling is mandatory: when delayLevel==0 the broker's consumerSendMsgBack rewrites it to
+    // `3 + reconsumeTimes` (≈10s), and the message first goes into SCHEDULE_TOPIC_XXXX before it is
+    // delivered to %RETRY%.
     let deadline = Instant::now() + Duration::from_secs(RETRY_VISIBLE_SECONDS);
     let mut max_sum;
     let mut waited = 0;
@@ -1551,13 +1582,13 @@ async fn a11_send_back(ck: &mut Checker, env: &Env) {
         waited += 1;
     }
     ck.check(
-        &format!("A11 sendMessageBack 落到 {retry_topic}"),
+        &format!("A11 sendMessageBack landed in {retry_topic}"),
         max_sum > 0,
-        &format!("maxOffsetSum={max_sum}（轮询 {waited}s；broker 把 delayLevel=0 改写成 3）"),
+        &format!("maxOffsetSum={max_sum} (polled {waited}s; the broker rewrites delayLevel=0 into 3)"),
     );
 }
 
-// ------------------------------------------------------------------ A12 位点重置
+// ------------------------------------------------------------------ A12 offset reset
 
 async fn a12_reset_offset(ck: &mut Checker, env: &Env) {
     let admin = &env.admin;
@@ -1565,7 +1596,8 @@ async fn a12_reset_offset(ck: &mut Checker, env: &Env) {
     let group = env.group.clone();
     let mq = MessageQueue::new(&topic, &env.broker_name(), 0);
     let max_now = admin.max_offset(&mq).await.unwrap_or(-1);
-    // 未来时间 ⇒ 位点应被推到该队列 maxOffset（222 由 broker 端算，不是本地 searchOffset）。
+    // A timestamp in the future ⇒ the offset should be pushed to this queue's maxOffset (222 is
+    // computed on the broker side, not by the local searchOffset).
     let ts = now_millis() + 60_000;
     match admin
         .reset_offset_by_timestamp(&topic, &group, ts, true, None, false)
@@ -1573,12 +1605,12 @@ async fn a12_reset_offset(ck: &mut Checker, env: &Env) {
     {
         Ok(offsets) => {
             ck.check(
-                "A12 resetOffsetByTimestamp 返回非空 offsetTable",
+                "A12 resetOffsetByTimestamp returns a non-empty offsetTable",
                 !offsets.is_empty(),
                 &format!("queues={}", offsets.len()),
             );
             ck.check(
-                "A12 重置结果覆盖 topic 的每个队列",
+                "A12 the reset result covers every queue of the topic",
                 offsets.len() as i32 >= QUEUE_NUMS,
                 &format!("queues={}", offsets.len()),
             );
@@ -1591,22 +1623,23 @@ async fn a12_reset_offset(ck: &mut Checker, env: &Env) {
     sleep_millis(1500).await;
     match admin.examine_consumer_offset(&group, &mq).await {
         Ok(offset) => ck.check(
-            "A12 broker 端重置后消费者位点被推到 maxOffset",
+            "A12 after the broker-side reset the consumer offset is pushed to maxOffset",
             offset.unwrap_or(-1) >= max_now - 1,
             &format!("consumerOffset={offset:?} maxOffset={max_now}"),
         ),
-        Err(e) => ck.abort("A12 回读重置后的位点", &e.to_string()),
+        Err(e) => ck.abort("A12 read back the offset after the reset", &e.to_string()),
     }
-    // 新版接口：目标组离线 ⇒ 真机走 222；CONSUMER_NOT_ONLINE 时退化到旧版。
+    // The newer entry point: with the target group offline a real broker uses 222; on
+    // CONSUMER_NOT_ONLINE it falls back to the older API.
     let dest = env.dest_group.clone();
     match admin.reset_offset_new(&dest, &topic, ts + 1_000).await {
         Ok(()) => match admin.examine_consumer_offset(&dest, &mq).await {
             Ok(offset) => ck.check(
-                "A12 resetOffsetNew 对离线组同样落到位",
+                "A12 resetOffsetNew also lands correctly for an offline group",
                 offset.unwrap_or(-1) >= max_now - 1,
                 &format!("consumerOffset={offset:?} maxOffset={max_now}"),
             ),
-            Err(e) => ck.abort("A12 回读 resetOffsetNew", &e.to_string()),
+            Err(e) => ck.abort("A12 read back resetOffsetNew", &e.to_string()),
         },
         Err(e) => ck.abort("A12 resetOffsetNew", &e.to_string()),
     }
@@ -1615,7 +1648,7 @@ async fn a12_reset_offset(ck: &mut Checker, env: &Env) {
         .await
     {
         Ok(offsets) => ck.check(
-            "A12 resetOffsetByTimestampOld 逐队列写回",
+            "A12 resetOffsetByTimestampOld writes back per queue",
             !offsets.is_empty(),
             &format!("queues={}", offsets.len()),
         ),
@@ -1628,10 +1661,10 @@ async fn a12_reset_offset(ck: &mut Checker, env: &Env) {
         .await
     {
         Ok(table) => ck.check(
-            "A12 resetOffsetByQueueId 打到 broker 成功",
+            "A12 resetOffsetByQueueId reaches the broker successfully",
             table.is_empty()
                 || table.iter().any(|(k, _)| k.queue_id == mq.queue_id),
-            &format!("returnedTable={}（可为空）", table.len()),
+            &format!("returnedTable={} (may be empty)", table.len()),
         ),
         Err(e) => {
             ck.abort("A12 resetOffsetByQueueId", &e.to_string());
@@ -1640,11 +1673,11 @@ async fn a12_reset_offset(ck: &mut Checker, env: &Env) {
     }
     match admin.examine_consumer_offset(&group, &mq).await {
         Ok(offset) => ck.check(
-            "A12 resetOffsetByQueueId 后位点==目标 offset",
+            "A12 after resetOffsetByQueueId the offset == the target offset",
             offset == Some(min_reset),
             &format!("consumerOffset={offset:?} target={min_reset}"),
         ),
-        Err(e) => ck.abort("A12 回读 resetOffsetByQueueId 位点", &e.to_string()),
+        Err(e) => ck.abort("A12 read back the offset after resetOffsetByQueueId", &e.to_string()),
     }
     {
         let consumer = match DefaultMQPullConsumer::with_config(PullConsumerConfig {
@@ -1655,18 +1688,18 @@ async fn a12_reset_offset(ck: &mut Checker, env: &Env) {
         }) {
             Ok(c) => Some(c),
             Err(e) => {
-                ck.abort("A12 重置后回拉：消费者构造", &e.to_string());
+                ck.abort("A12 re-pull after the reset: build consumer", &e.to_string());
                 None
             }
         };
         if let Some(consumer) = consumer {
             if let Err(e) = consumer.start().await {
-                ck.abort("A12 重置后回拉：start", &e.to_string());
+                ck.abort("A12 re-pull after the reset: start", &e.to_string());
             } else {
                 match consumer.pull(&mq, "*", min_reset, 1, Some(5_000)).await {
                     Ok(first) => {
                         ck.check(
-                            "A12 重置后首笔 pull 被 broker 短路成 PULL_OFFSET_MOVED",
+                            "A12 the first pull after the reset is short-circuited by the broker into PULL_OFFSET_MOVED",
                             first.status == PullStatus::OffsetIllegal
                                 && first.next_begin_offset == min_reset,
                             &format!(
@@ -1677,7 +1710,7 @@ async fn a12_reset_offset(ck: &mut Checker, env: &Env) {
                         let resume = first.next_begin_offset;
                         match consumer.pull(&mq, "*", resume, 16, Some(5_000)).await {
                             Ok(second) => ck.check(
-                                "A12 重置位点之后可重新拉到历史消息",
+                                "A12 after the offset reset the historical messages can be pulled again",
                                 !second.msg_found_list.is_empty(),
                                 &format!(
                                     "status={} found={} from={resume}",
@@ -1685,10 +1718,10 @@ async fn a12_reset_offset(ck: &mut Checker, env: &Env) {
                                     second.msg_found_list.len()
                                 ),
                             ),
-                            Err(e) => ck.abort("A12 重置后第二笔回拉", &e.to_string()),
+                            Err(e) => ck.abort("A12 second re-pull after the reset", &e.to_string()),
                         }
                     }
-                    Err(e) => ck.abort("A12 重置后回拉", &e.to_string()),
+                    Err(e) => ck.abort("A12 re-pull after the reset", &e.to_string()),
                 }
                 consumer.shutdown();
             }
@@ -1700,21 +1733,21 @@ async fn a12_reset_offset(ck: &mut Checker, env: &Env) {
         .await
         .is_err();
     ck.check(
-        "A12 resetOffsetByQueueId 越界目标被 broker 拒绝",
+        "A12 an out-of-range target for resetOffsetByQueueId is rejected by the broker",
         rejected,
         &format!("badTarget={bad_target}"),
     );
     match admin.examine_consumer_offset(&group, &mq).await {
         Ok(offset) => ck.check(
-            "A12 越界 reset 停留在第 1 笔写入的非法位点（两笔 RPC 非原子）",
+            "A12 the out-of-range reset stays at the illegal offset written by the first call (the two RPCs are not atomic)",
             offset == Some(bad_target),
             &format!("consumerOffset={offset:?} badTarget={bad_target}"),
         ),
-        Err(e) => ck.abort("A12 回读越界 reset 位点", &e.to_string()),
+        Err(e) => ck.abort("A12 read back the offset after the out-of-range reset", &e.to_string()),
     }
 }
 
-// ------------------------------------------------------------------ A13 写权限 + 清理
+// ------------------------------------------------------------------ A13 write permission + cleanup
 
 async fn a13_perm_and_cleanup(ck: &mut Checker, env: &Env) {
     let admin = &env.admin;
@@ -1727,7 +1760,7 @@ async fn a13_perm_and_cleanup(ck: &mut Checker, env: &Env) {
         .await
     {
         Ok(count) => ck.check(
-            "A13 wipeWritePermOfBroker 正常应答",
+            "A13 wipeWritePermOfBroker replies normally",
             count >= 0,
             &format!("wipeTopicCount={count}"),
         ),
@@ -1739,25 +1772,27 @@ async fn a13_perm_and_cleanup(ck: &mut Checker, env: &Env) {
     {
         Ok(count) => {
             ck.check(
-                "A13 addWritePermOfBroker 还原写权限",
+                "A13 addWritePermOfBroker restores the write permission",
                 count >= 0,
                 &format!("addTopicCount={count}"),
             );
-            // 还原后必须还能发（否则这条集群后续所有客户端测试都会挂）。
+            // After the restore we must still be able to send (otherwise every later client test on this
+            // cluster would fail).
             let mut msg = Message::new(&topic, Some(b"a13-after-perm-restore"));
             match env.producer.send(&mut msg, Some(5_000), None).await {
                 Ok(result) => ck.check(
-                    "A13 权限还原后 producer 照常发送",
+                    "A13 after the permission is restored the producer still sends normally",
                     result.status == SendStatus::SendOk,
                     &format!("status={}", result.status),
                 ),
-                Err(e) => ck.abort("A13 权限还原后 producer 照常发送", &e.to_string()),
+                Err(e) => ck.abort("A13 after the permission is restored the producer still sends normally", &e.to_string()),
             }
         }
         Err(e) => ck.abort("A13 addWritePermOfBroker", &e.to_string()),
     }
 
-    // 三段删除：broker 配置 → NameServer 路由 → 组合入口（幂等）。
+    // Delete in three steps: broker config → NameServer route → the combined entry point
+    // (idempotent).
     if let Err(e) = admin.delete_topic_in_broker(&addr, &topic).await {
         ck.abort("A13 deleteTopicInBroker", &e.to_string());
     }
@@ -1777,22 +1812,24 @@ async fn a13_perm_and_cleanup(ck: &mut Checker, env: &Env) {
     sleep_millis(1500).await;
     match admin.fetch_all_topic_list().await {
         Ok(list) => ck.check(
-            "A13 deleteTopic 后 topic 从列表消失",
+            "A13 after deleteTopic the topic disappears from the list",
             !list.get_topic_list().contains(&topic),
             &format!("topics={}", list.get_topic_list().len()),
         ),
-        Err(e) => ck.abort("A13 删除后 fetchAllTopicList", &e.to_string()),
+        Err(e) => ck.abort("A13 fetchAllTopicList after the deletion", &e.to_string()),
     }
-    // 判「组已删除」只能用只读的全量表（200 分页）。201 的
-    // `GET_SUBSCRIPTIONGROUP_CONFIG` 在 broker 端走 `findSubscriptionGroupConfig`，
-    // autoCreateSubscriptionGroup=true 时查不到就顺手建一个默认组（retryMaxTimes=16），
-    // 用它验证删除会得到「删了还在」的假象。
-    // 删除要过 broker 的 subscriptionGroupTable（分页应答按 groupSeq 现算），
-    // 固定 1.5s 等待偶尔抢不过它 ⇒ 轮询到预算用尽。
+    // To decide that a "group has been deleted" we can only use the read-only full table (200
+    // paginated). Code 201's `GET_SUBSCRIPTIONGROUP_CONFIG` goes through
+    // `findSubscriptionGroupConfig` on the broker, and with autoCreateSubscriptionGroup=true a
+    // miss quietly creates a default group (retryMaxTimes=16), so using it would give the false
+    // impression of "deleted but still there".
+    // The deletion has to go through the broker's subscriptionGroupTable (the paginated reply is
+    // computed live from groupSeq), and a fixed 1.5s wait occasionally loses the race ⇒ poll
+    // until the budget runs out.
     let deadline = Instant::now() + Duration::from_secs(15);
     for (label, name) in [
-        ("A13 deleteSubscriptionGroup 后查不到该组", group.clone()),
-        ("A13 目标组也一并删除", env.dest_group.clone()),
+        ("A13 the group cannot be found after deleteSubscriptionGroup", group.clone()),
+        ("A13 the target group is deleted as well", env.dest_group.clone()),
     ] {
         let mut gone = false;
         let mut detail = String::new();
@@ -1817,12 +1854,12 @@ async fn a13_perm_and_cleanup(ck: &mut Checker, env: &Env) {
     }
 }
 
-// ------------------------------------------------------------------ A0 门面状态
+// ------------------------------------------------------------------ A0 facade state
 
 fn a0_facade_state(ck: &mut Checker, env: &Env) {
     let admin = &env.admin;
     ck.check(
-        "A0 start 后 is_started 且生成了 clientId",
+        "A0 after start is_started holds and a clientId was generated",
         admin.is_started() && !admin.client_id().is_empty(),
         &format!(
             "started={} clientId={}",
@@ -1831,24 +1868,24 @@ fn a0_facade_state(ck: &mut Checker, env: &Env) {
         ),
     );
     ck.check(
-        "A0 name server 地址按 ; 拆分并回读",
+        "A0 the name server addresses are split on ; and read back",
         admin.get_name_server_address_list() == vec![env.namesrv.clone()]
             && admin.get_name_server_addr() == env.namesrv,
         &admin.get_name_server_addr(),
     );
     ck.check(
-        "A0 timeout_millis 用配置值",
+        "A0 timeout_millis uses the configured value",
         admin.timeout_millis() == 10_000,
         &format!("timeout={}", admin.timeout_millis()),
     );
     ck.check(
-        "A0 getMQClientInstance 可用",
+        "A0 getMQClientInstance is usable",
         admin.get_mq_client_instance().is_ok(),
-        "私有实例没拿到",
+        "the private instance was not obtained",
     );
 }
 
-// ------------------------------------------------------------------ 驱动
+// ------------------------------------------------------------------ driver
 
 async fn run(namesrv: &str) -> Checker {
     let mut ck = Checker::new();
@@ -1856,7 +1893,7 @@ async fn run(namesrv: &str) -> Checker {
     let env = match Env::new(namesrv, &stamp) {
         Ok(env) => env,
         Err(e) => {
-            ck.abort("夹具构造", &e);
+            ck.abort("build the fixture", &e);
             return ck;
         }
     };
@@ -1869,7 +1906,8 @@ async fn run(namesrv: &str) -> Checker {
     a0_facade_state(&mut ck, &env);
     a2_cluster(&mut ck, &env).await;
     a3_topic_lifecycle(&mut ck, &env).await;
-    // A1 需要一个可写 topic 才能证明「admin 关掉不影响 producer」，排在 A3 之后。
+    // A1 needs a writable topic to prove that "shutting the admin down does not affect the
+    // producer", so it runs after A3.
     a1_private_instance_isolation(&mut ck, &env).await;
     a4_broker_config(&mut ck, &env).await;
     a5_kv_config(&mut ck, &env).await;

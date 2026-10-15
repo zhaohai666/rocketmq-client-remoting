@@ -2,31 +2,36 @@
 
 declare(strict_types=1);
 
-// PHP 端 LitePull 消费者的 topic 队列集合变更监听真机验证。
+// PHP-side LitePull consumer live verification of topic queue-set change listening.
 //
 //   php examples/live_lite_topic_queue_change.php [namesrv]
 //
-// 为什么必须真机：比对趟次每趟都现问 nameserver 取订阅队列集合，而普通路由缓存是 30s
-// 才刷一次。假 nameserver 能证比对逻辑，只有真集群能证「现查」。这里把检查周期压到 1s
-// 下限、路由轮询保持默认 30s，再把 topic 真的扩容：从 nameserver 报出新队列数到监听器
-// 收到回调只该隔一两趟检查（≤5s）；读 30s 缓存的话这个窗口会拖到半分钟以上。
+// Why this must be a live run: the comparison pass asks the nameserver for the subscribed queue
+// set fresh on every pass, while the ordinary route cache refreshes only every 30s. A fake
+// nameserver can prove the comparison logic; only a real cluster can prove the "fresh lookup".
+// Here the check interval is pushed down to the 1s floor, the route polling keeps the default
+// 30s, and the topic is actually scaled: from the nameserver reporting the new queue count to
+// the listener's callback only one or two check passes should pass (<=5s); reading the 30s cache
+// would drag this window past half a minute.
 //
-// PHP 适配：没有调度线程，比对由调用方驱动 —— 主循环每轮先 tick() 再 poll()，
-// tick() 里到点的那一趟才会去比对。
+// PHP adaptation: no scheduler thread, the comparison is caller-driven — the main loop ticks()
+// first then polls() each round; only the pass due inside tick() performs the comparison.
 //
-//   L1  队列没动 ⇒ 监听器不被打扰
-//   L2  扩容 2→4：nameserver 认了之后回调紧跟几趟检查
-//   L3  回调后快照推进 ⇒ 同一套队列不重复回调
-//   L4  缩容 4→2：同样靠现查看到
-//   L5  没建过的 topic：取不到队列算「查不到」，不伪装成缩到 0 队列
+//   L1  queues untouched => the listener is not disturbed
+//   L2  scale up 2->4: the callback follows within a few passes once the nameserver reports it
+//   L3  after the callback the snapshot advances => the same queue set does not re-callback
+//   L4  scale down 4->2: likewise observed via the fresh lookup
+//   L5  a never-created topic: failing to fetch queues counts as "not found", not disguised as
+//       scaling to 0 queues
 //
-// 收口行 `PASS=<n> FAIL=<n>`；任一 FAIL 非 0 退出。
+// Closing line `PASS=<n> FAIL=<n>`; exits non-zero on any FAIL.
 require __DIR__ . '/../bootstrap.php';
 
 use RocketMQ\Client\DefaultLitePullConsumer;
 use RocketMQ\Client\DefaultMQProducer;
 
-// 日志不落在用户 $HOME 下：默认写当前工作目录的 logs/，这里显式钉到临时目录。
+// Keep the log out of the user's $HOME: the default is logs/ under the current working
+// directory; pin it to the temp directory here.
 if (getenv('ROCKETMQ_CLIENT_LOG_DIR') === false) {
     putenv('ROCKETMQ_CLIENT_LOG_DIR=' . sys_get_temp_dir() . '/rmq_php_qc_live_logs');
 }
@@ -50,16 +55,17 @@ $ghost = 'PhpLiteQcGhost_' . $stamp;
 
 const BASE_QUEUES = 2;
 const SCALED_QUEUES = 4;
-// 检查周期压到下限，好把「每趟现查」和「吃 30s 缓存」在时间上分开。
+// Push the check interval to the floor so "fresh lookup per pass" and "eating the 30s cache"
+// are separated in time.
 const CHECK_INTERVAL_MS = 1000;
-// nameserver 见到变化后允许的最大回调间隔。
+// Maximum allowed callback gap after the nameserver sees the change.
 const FRESH_WINDOW_MS = 5000;
 
 echo "======================================================================" . PHP_EOL;
 echo "LitePull queue-change live (PHP): ns=$ns topic=$topic group=$group" . PHP_EOL;
 echo "======================================================================" . PHP_EOL;
 
-/** 对同一 topic 再下发一次建 topic 请求，把读写队列数改成 $queueNum。 */
+/** Issues the create-topic request once more for the same topic, changing the read/write queue counts to $queueNum. */
 $scale = static function (int $queueNum) use ($ns, $topic): void {
     $prod = new DefaultMQProducer('PG_PhpQc_' . bin2hex(random_bytes(4)));
     $prod->setNamesrvAddr($ns);
@@ -72,7 +78,7 @@ $scale = static function (int $queueNum) use ($ns, $topic): void {
     $prod->shutdown();
 };
 
-/** 只记回调；比对在同一个线程里跑，所以不需要锁。 */
+/** Records callbacks only; the comparison runs in the same thread, so no locking is needed. */
 final class QcRecorder
 {
     /** @var list<array{0:string,1:list<int>}> */
@@ -97,8 +103,8 @@ final class QcRecorder
 }
 
 /**
- * 驱动消费者跑一段时间：每轮先 tick()（到点的那趟才比对）再 poll()。
- * 返回实际跑的毫秒数；cond 提前成立就立刻返回。
+ * Drives the consumer for a while: each round ticks() first (only the due pass compares) then
+ * polls(). Returns the milliseconds actually driven; returns early if cond becomes true.
  */
 $drive = static function (DefaultLitePullConsumer $c, int $millis, ?callable $cond = null): int {
     $waited = 0;
@@ -113,7 +119,7 @@ $drive = static function (DefaultLitePullConsumer $c, int $millis, ?callable $co
     return $waited;
 };
 
-/** 现查队列集合，直到报出 $want 个为止；返回等待毫秒数，超时返回 -1。 */
+/** Fresh-lookups the queue set until it reports $want; returns the waited milliseconds, -1 on timeout. */
 $waitQueueNum = static function (DefaultLitePullConsumer $c, string $t, int $want, int $timeoutMs): int {
     $waited = 0;
     while ($waited < $timeoutMs) {
@@ -122,7 +128,7 @@ $waitQueueNum = static function (DefaultLitePullConsumer $c, string $t, int $wan
                 return $waited;
             }
         } catch (\Throwable) {
-            // 路由还没更新，继续等
+            // Route not updated yet, keep waiting
         }
         usleep(250000);
         $waited += 250;
@@ -137,50 +143,52 @@ $c->setNamesrvAddr($ns);
 $c->instanceName = 'php-lite-qc-live';
 $c->setTopicMetadataCheckIntervalMillis(CHECK_INTERVAL_MS);
 $check($c->topicMetadataCheckIntervalMillis === CHECK_INTERVAL_MS,
-    'L0 检查周期压到 1s 下限', (string)$c->topicMetadataCheckIntervalMillis);
+    'L0 check interval pushed down to the 1s floor', (string)$c->topicMetadataCheckIntervalMillis);
 $c->subscribe($topic, '*');
 $c->start();
 
 $visible = $waitQueueNum($c, $topic, BASE_QUEUES, 30000);
-$check($visible >= 0, 'L0 路由可见（2 个队列）', $visible . 'ms');
+$check($visible >= 0, 'L0 route visible (2 queues)', $visible . 'ms');
 
-// 运行中注册 ⇒ 立刻记快照 ⇒ 之后队列不动就一律静默（tick() 驱动的那一趟也照样不打扰）
+// Registering while running => snapshot taken immediately => quiet as long as queues are
+// untouched (the tick()-driven pass is equally undisturbed)
 $rec = new QcRecorder();
 $c->registerTopicMessageQueueChangeListener($topic, $rec);
 $drive($c, 3000);
-$check($rec->count() === 0, 'L1 队列没动 ⇒ 静默（快照吃掉每一趟）', 'events=' . $rec->count());
+$check($rec->count() === 0, 'L1 queues untouched => silent (the snapshot eats every pass)', 'events=' . $rec->count());
 
-// 把首查排到当下：PHP 没有线程，首查延迟只是 nextMetadataCheckAt 的一个时间戳。
+// Schedule the first check for now: PHP has no threads, the first-check delay is just a
+// timestamp on nextMetadataCheckAt.
 $c->nextMetadataCheckAt = microtime(true);
 $drive($c, 1000);
-$check($rec->count() === 0, 'L1b 到点那趟真的跑过 ⇒ 依旧静默', 'events=' . $rec->count());
+$check($rec->count() === 0, 'L1b the due pass really ran => still silent', 'events=' . $rec->count());
 
-// ---- L2 扩容 2→4
+// ---- L2 scale up 2->4
 $scale(SCALED_QUEUES);
 $nsMs = $waitQueueNum($c, $topic, SCALED_QUEUES, 45000);
-$check($nsMs >= 0, 'L2a nameserver 报出 4 个队列', $nsMs . 'ms');
+$check($nsMs >= 0, 'L2a the nameserver reports 4 queues', $nsMs . 'ms');
 if ($nsMs >= 0) {
     $driven = $drive($c, FRESH_WINDOW_MS, static fn (): bool => $rec->count() >= 1);
     $check($rec->count() >= 1 && $rec->idsAt(0) === '0,1,2,3',
-        'L2b 比对趟次现查路由（回调紧跟 nameserver，不等 30s 缓存）',
+        'L2b the comparison pass fresh-lookups the route (the callback follows the nameserver, not the 30s cache)',
         $driven . 'ms, ids=' . $rec->idsAt(0));
 }
 
-// ---- L3 快照推进
+// ---- L3 snapshot advance
 $drive($c, 3000);
-$check($rec->count() === 1, 'L3 回调后快照推进 ⇒ 不重复回调', 'events=' . $rec->count());
+$check($rec->count() === 1, 'L3 the snapshot advances after the callback => no repeated callback', 'events=' . $rec->count());
 
-// ---- L4 缩容 4→2
+// ---- L4 scale down 4->2
 $scale(BASE_QUEUES);
 $nsMs = $waitQueueNum($c, $topic, BASE_QUEUES, 45000);
-$check($nsMs >= 0, 'L4a nameserver 报回 2 个队列', $nsMs . 'ms');
+$check($nsMs >= 0, 'L4a the nameserver reports back 2 queues', $nsMs . 'ms');
 if ($nsMs >= 0) {
     $driven = $drive($c, FRESH_WINDOW_MS, static fn (): bool => $rec->count() >= 2);
     $check($rec->count() >= 2 && $rec->idsAt(1) === '0,1',
-        'L4b 缩容同样靠现查路由看到', $driven . 'ms, ids=' . $rec->idsAt(1));
+        'L4b the scale-down is likewise seen via the fresh route lookup', $driven . 'ms, ids=' . $rec->idsAt(1));
 }
 
-// ---- L5 未知 topic：空队列集算「查不到」
+// ---- L5 unknown topic: an empty queue set counts as "not found"
 $raised = '';
 try {
     $raised = 'no exception, queues=' . count($c->fetchMessageQueues($ghost));
@@ -188,7 +196,7 @@ try {
     $raised = $e->getMessage();
 }
 $check(str_contains($raised, 'Namesrv return empty') || str_contains($raised, 'Can not find'),
-    'L5 未知 topic 取队列抛「查不到」而不是返回空', $raised);
+    'L5 fetching queues of an unknown topic throws "not found" instead of returning an empty set', $raised);
 
 $c->shutdown();
 

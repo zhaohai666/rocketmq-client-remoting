@@ -1,11 +1,11 @@
 // -*- coding: utf-8 -*-
-// Namespace 工具函数：namespace 前缀（分隔符 %）与 retry/DLQ 前缀的资源名处理。
+// Namespace utility functions: namespace prefix (delimiter %) and retry/DLQ prefixed resource-name handling.
 import { MixAll } from '../common/mixAll.ts';
 
 export const NAMESPACE_SEPARATOR = '%';
 
 export class NamespaceUtil {
-  // 剥掉资源名的 retry/DLQ 前缀。
+  // Strip the retry/DLQ prefix from a resource name.
   static withOutRetryAndDLQ(resource: string): string {
     return MixAll.resetRetryAndDlqTopic(resource);
   }
@@ -47,7 +47,7 @@ export class NamespaceUtil {
     return resourceWithNamespace;
   }
 
-  // 加上 namespace 前缀。
+  // Prepend the namespace prefix.
   static wrapNamespace(namespace: string, resourceWithoutNamespace: string): string {
     if (!namespace || !resourceWithoutNamespace) return resourceWithoutNamespace;
     if (NamespaceUtil.isSystemResource(resourceWithoutNamespace)) return resourceWithoutNamespace;
@@ -65,7 +65,7 @@ export class NamespaceUtil {
     return MixAll.RETRY_GROUP_TOPIC_PREFIX + NamespaceUtil.wrapNamespace(namespace, consumerGroup);
   }
 
-  // 从资源名中提取内嵌的 namespace。
+  // Extract the embedded namespace from a resource name.
   static getNamespaceFromResource(resource: string): string {
     if (!resource || NamespaceUtil.isSystemResource(resource)) return '';
     const plain = NamespaceUtil.withOutRetryAndDLQ(resource);

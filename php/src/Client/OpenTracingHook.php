@@ -9,23 +9,23 @@ use RocketMQ\Common\MessageExt;
 
 final class OpenTracingHook implements SendMessageHook, ConsumeMessageHook
 {
-    /** 跨进程传播用的消息属性名（JSON 编码的 tracer carrier）。 */
+    /** Message property name for cross-process propagation (JSON-encoded tracer carrier). */
     public const CARRIER_PROP = 'OT_CARRIER';
 
     public const OP_SEND = 'RocketMQ/send';
     public const OP_CONSUME = 'RocketMQ/consume';
 
-    /** @var \SplObjectStorage<object,object> Message → 在途发送 span */
+    /** @var \SplObjectStorage<object,object> Message -> in-flight send span */
     private \SplObjectStorage $sendSpans;
 
-    /** @var \SplObjectStorage<object,object> ConsumeMessageContext → 在途消费 span */
+    /** @var \SplObjectStorage<object,object> ConsumeMessageContext -> in-flight consume span */
     private \SplObjectStorage $consumeSpans;
 
     /**
-     * @param object $tracer 满足 TracingTracer duck-type 的对象：
-     *   - startSpan(string $operationName, array $options = []): object（options 支持
-     *     `tags` => array、`refs` => list<object>，返回对象需满足 setTag/log/finish）
-     *   - extract(array $carrier): ?object（SpanContext-like，无则 null）
+     * @param object $tracer an object satisfying the TracingTracer duck-type:
+     *   - startSpan(string $operationName, array $options = []): object (options supports
+     *     `tags` => array, `refs` => list<object>; the returned object must satisfy setTag/log/finish)
+     *   - extract(array $carrier): ?object (SpanContext-like, null if none)
      *   - inject(object $spanContext, array &$carrier): void
      */
     public function __construct(private readonly object $tracer)
@@ -39,13 +39,13 @@ final class OpenTracingHook implements SendMessageHook, ConsumeMessageHook
         return 'OpenTracingHook';
     }
 
-    // ------------------------------------------------ 发送侧
+    // ------------------------------------------------ Send side
 
     public function sendMessageBefore(SendMessageContext $context): void
     {
         $msg = $context->message;
         if ($msg === null || $this->sendSpans->contains($msg)) {
-            return; // 同一消息重复进入（客户端重试发送）不叠加 span
+            return; // the same message re-entering (client retry) does not stack spans
         }
         /** @var array<string,mixed> $carrier */
         $carrier = [];
@@ -66,7 +66,7 @@ final class OpenTracingHook implements SendMessageHook, ConsumeMessageHook
         if ($context->brokerAddr !== '') {
             $span->setTag('brokerAddr', $context->brokerAddr);
         }
-        // context 注入 message properties，随消息上 broker（zipkin/OTLP 之外的带内传播）
+        // context injected into message properties, travels with the message to the broker (in-band propagation besides zipkin/OTLP)
         $carrier = [];
         $this->tracer->inject($prevCtx ?? $this->spanContextOf($span), $carrier);
         if ($carrier !== []) {
@@ -99,7 +99,7 @@ final class OpenTracingHook implements SendMessageHook, ConsumeMessageHook
         $span->finish();
     }
 
-    // ------------------------------------------------ 消费侧
+    // ------------------------------------------------ Consume side
 
     public function consumeMessageBefore(ConsumeMessageContext $context): void
     {
@@ -118,7 +118,7 @@ final class OpenTracingHook implements SendMessageHook, ConsumeMessageHook
         foreach ($context->msgList as $m) {
             $parent = $this->extractCarrier($m);
             if ($parent !== null) {
-                break; // 首个带 carrier 的消息决定 span 的父子关系
+                break; // the first message carrying a carrier decides the span's parent-child relation
             }
         }
         if ($parent !== null) {
@@ -145,7 +145,7 @@ final class OpenTracingHook implements SendMessageHook, ConsumeMessageHook
         $span->finish();
     }
 
-    /** 从消息属性里解出上一次注入的 tracer carrier。 */
+    /** Extract the previously injected tracer carrier from the message properties. */
     private function extractCarrier(Message $msg): ?object
     {
         $raw = $msg->getUserProperty(self::CARRIER_PROP);
@@ -160,8 +160,9 @@ final class OpenTracingHook implements SendMessageHook, ConsumeMessageHook
     }
 
     /**
-     * 发送侧没有上游 carrier 时，从刚开的 span 拿 context（有 getContext/spanContext
-     * 方法的对象才取得到；没有就传 span 本身，由 tracer 决定怎么处理）。
+     * When the send side has no upstream carrier, take the context from the just-opened span
+     * (only objects with a getContext/spanContext method qualify; otherwise pass the span
+     * itself and let the tracer decide how to handle it).
      */
     private function spanContextOf(object $span): object
     {

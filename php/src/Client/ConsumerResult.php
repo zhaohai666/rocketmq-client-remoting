@@ -7,10 +7,11 @@ namespace RocketMQ\Client;
 use RocketMQ\Common\MessageExt;
 
 /**
- * 消费/拉取结果类型：拉取状态、消费返回类型、POP 结果与消费上下文/监听器契约。
+ * Consume/pull result types: pull status, consume return type, POP result, and
+ * consume context/listener contracts.
  */
 
-/** 拉取状态，取值来自经典 remoting 协议 pull 响应的 status 字段。 */
+/** Pull status; values come from the status field of the classic remoting protocol pull response. */
 enum PullStatus: int
 {
     case FOUND = 0;
@@ -18,7 +19,7 @@ enum PullStatus: int
     case NO_MATCHED_MSG = 2;
     case OFFSET_ILLEGAL = 3;
 
-    /** 由协议状态码构造：未知码兜底为 FOUND。 */
+    /** Build from a protocol status code; unknown codes fall back to FOUND. */
     public static function fromCode(int $code): self
     {
         return self::tryFrom($code) ?? self::FOUND;
@@ -26,10 +27,10 @@ enum PullStatus: int
 }
 
 /**
- * 消费返回类型。
+ * Consume return type.
  *
- * ⚠ 顺序即 ordinal —— 轨迹 SubAfter 的 ``contextCode`` 用的正是 ordinal，
- * 改动顺序会让控制台显示错乱。
+ * WARNING: the order is the ordinal -- the trace SubAfter ``contextCode`` uses exactly
+ * this ordinal; reordering breaks the console display.
  */
 enum ConsumeReturnType: int
 {
@@ -40,7 +41,7 @@ enum ConsumeReturnType: int
     case FAILED = 4;
 }
 
-/** POP 拉取状态，取值来自 broker pop 响应的 status 字段。 */
+/** POP pull status; values come from the status field of the broker pop response. */
 enum PopStatus: int
 {
     case FOUND = 0;
@@ -49,7 +50,7 @@ enum PopStatus: int
     case POLLING_NOT_FOUND = 3;
 }
 
-/** 并发消费返回状态。 */
+/** Concurrent consume return status. */
 enum ConsumeConcurrentlyStatus: int
 {
     case CONSUME_SUCCESS = 0;
@@ -57,10 +58,11 @@ enum ConsumeConcurrentlyStatus: int
 }
 
 /**
- * 顺序消费返回状态。
+ * Orderly consume return status.
  *
- * ORDINAL 本身不是线上值，但「按 ordinal 写死」的调用方依赖声明顺序，改动会错位；
- * COMMIT/ROLLBACK 属于已废弃分支，只服务于 binlog 消费场景。
+ * ORDINAL itself is not an online value, but callers that "hard-code by ordinal" depend
+ * on the declaration order; reordering shifts meaning. COMMIT/ROLLBACK belong to a
+ * deprecated branch that only serves the binlog consumption scenario.
  */
 enum ConsumeOrderlyStatus: int
 {
@@ -70,13 +72,14 @@ enum ConsumeOrderlyStatus: int
     case SUSPEND_CURRENT_QUEUE_A_MOMENT = 3;
 }
 
-/** 拉取结果，含 broker 建议下次拉取的 brokerId 字段。 */
+/** Pull result, including the brokerId field the broker suggests for the next pull. */
 final class PullResult
 {
     /**
      * @param list<MessageExt> $msgFoundList
-     * @param int|null $suggestWhichBrokerId broker 建议下次从哪个 brokerId 拉
-     *        （主从部署时可能是从节点）；null = 响应头没带（老 broker）。
+     * @param int|null $suggestWhichBrokerId which brokerId the broker suggests pulling from
+     *        next (possibly a slave in a master-slave deployment); null = not present in
+     *        the response header (old broker).
      */
     public function __construct(
         public PullStatus $status,
@@ -102,11 +105,12 @@ final class PullResult
 }
 
 /**
- * POP 响应。
+ * POP response.
  *
- * ``startOffsetInfo`` / ``msgOffsetInfo`` / ``orderCountInfo`` 保留 broker 原样
- * 字符串，解析交给 ExtraInfoUtil；``msgFoundList`` 里的每条消息
- * 都已盖好 ``POP_CK``（客户端反构）与 ``1ST_POP_TIME`` 属性。
+ * ``startOffsetInfo`` / ``msgOffsetInfo`` / ``orderCountInfo`` keep the broker's raw
+ * strings as-is; parsing is left to ExtraInfoUtil. Every message in ``msgFoundList``
+ * is already stamped with the ``POP_CK`` (client re-construction) and ``1ST_POP_TIME``
+ * properties.
  */
 final class PopResult
 {
@@ -139,10 +143,11 @@ final class PopResult
 }
 
 /**
- * CHANGE_INVISIBLE_TIME 请求的结果。
+ * Result of a CHANGE_INVISIBLE_TIME request.
  *
- * ``extraInfo`` 是用响应里**新的** popTime/invisibleTime/reviveQid 重建的 8 段 CK 串，
- * 后续 ACK 要用它（不是请求时传进去的那个旧串）。
+ * ``extraInfo`` is an 8-segment CK string rebuilt with the **new** popTime/invisibleTime/
+ * reviveQid from the response; the subsequent ACK uses it (not the old string passed in
+ * with the request).
  */
 final class ChangeInvisibleTimeResult
 {
@@ -170,18 +175,20 @@ final class ChangeInvisibleTimeResult
     }
 }
 
-/** 并发消费上下文。 */
+/** Concurrent consume context. */
 final class ConsumeConcurrentlyContext
 {
     /**
-     * 下次消费的延迟等级，缺省 0。
-     * 为 0 时由 caller 改写为 3 + reconsumeTimes。
+     * Delay level for the next consume attempt, default 0.
+     * When 0, the caller rewrites it to 3 + reconsumeTimes.
      */
     public int $delayLevelWhenNextConsume = 0;
 
     /**
-     * ackIndex：「listener 认可到第几条」，下标含自身，其后的消息按状态回投/丢弃。
-     * 默认值是「全批认可」（2^31-1），只有 listener 主动调小才会部分 ack。
+     * ackIndex: "up to which message the listener acknowledges"; the index includes the
+     * message itself, and messages after it are redelivered/dropped per status. The
+     * default is "acknowledge the whole batch" (2^31-1); only when the listener actively
+     * lowers it does a partial ack happen.
      */
     public int $ackIndex;
 
@@ -191,19 +198,19 @@ final class ConsumeConcurrentlyContext
     }
 }
 
-/** 顺序消费上下文。 */
+/** Orderly consume context. */
 final class ConsumeOrderlyContext
 {
     /**
-     * autoCommit：true 时由客户端按 listener 的状态提交位点（正常路径）；
-     * listener 置 false 拿走提交权。
+     * autoCommit: when true the client commits the offset per the listener's status
+     * (the normal path); the listener sets false to take over the commit right.
      */
     public bool $autoCommit = true;
 
     /**
-     * suspendCurrentQueueTimeMillis，**默认 -1**：-1 表示"没指定"，挂起时长回落到
-     * 消费者配置的 ``suspendCurrentQueueTimeMillis``（默认 1000）；解析出的值再由
-     * 调度侧钳到 [10, 30000]。
+     * suspendCurrentQueueTimeMillis, **default -1**: -1 means "unspecified"; the suspend
+     * duration falls back to the consumer's configured ``suspendCurrentQueueTimeMillis``
+     * (default 1000); the parsed value is then clamped to [10, 30000] on the scheduler side.
      */
     public int $suspendCurrentQueueTimeMillis = -1;
 
@@ -213,7 +220,8 @@ final class ConsumeOrderlyContext
 }
 
 /**
- * 并发消费监听器：一次收到一批消息，返回整批的处置状态。
+ * Concurrent consume listener: receives a batch of messages at a time and returns the
+ * disposition status of the whole batch.
  */
 interface MessageListenerConcurrently
 {
@@ -221,14 +229,14 @@ interface MessageListenerConcurrently
     public function consumeMessage(array $msgs, ConsumeConcurrentlyContext $context): ConsumeConcurrentlyStatus;
 }
 
-/** 顺序消费监听器：同一队列内串行回调，返回状态决定挂起/提交。 */
+/** Orderly consume listener: serial callbacks within the same queue; the status decides suspend/commit. */
 interface MessageListenerOrderly
 {
     /** @param list<MessageExt> $msgs */
     public function consumeMessage(array $msgs, ConsumeOrderlyContext $context): ConsumeOrderlyStatus;
 }
 
-/** 兼容别名：不区分顺序性，先按并发监听器对待。 */
+/** Compatibility alias: order-agnostic; treat as a concurrent listener for now. */
 interface MessageListener
 {
     /** @param list<MessageExt> $msgs */
@@ -236,16 +244,19 @@ interface MessageListener
 }
 
 /**
- * 钩子上下文里的 ``status``：约定形态是**裸枚举成员名**。
+ * The ``status`` in the hook context: the conventional form is the **bare enum member name**.
  *
- * 并发/顺序消费服务写进上下文 ``status`` 的都是归一化后那个枚举的成员名：
- * ``CONSUME_SUCCESS`` / ``RECONSUME_LATER`` / ``SUCCESS`` /
- * ``SUSPEND_CURRENT_QUEUE_A_MOMENT`` / ``COMMIT`` / ``ROLLBACK``。
- * status 对钩子和轨迹日志都是对外可见的，所以统一按 ``name`` 取，不带类名前缀。
- * 非枚举值兜底：有 ``__toString`` 就用它，否则退到类名，标量直接转字符串。
+ * What the concurrent/orderly consume services write into the context ``status`` is the
+ * member name of the normalized enum: ``CONSUME_SUCCESS`` / ``RECONSUME_LATER`` /
+ * ``SUCCESS`` / ``SUSPEND_CURRENT_QUEUE_A_MOMENT`` / ``COMMIT`` / ``ROLLBACK``.
+ * status is externally visible to hooks and trace logs, so it is uniformly taken by
+ * ``name``, without the class-name prefix. Fallback for non-enum values: use
+ * ``__toString`` if present, otherwise fall back to the class name; scalars are cast
+ * to string directly.
  *
- * ⚠ 本文件里的类被 autoload 时该函数才会被定义（PHP 的 autoloader 不加载函数）；
- * 调用方通常先 `use` 了本文件的枚举，所以文件已被 require。
+ * WARNING: this function is only defined when a class in this file is autoloaded (PHP's
+ * autoloader does not load functions); callers usually `use` the enums from this file
+ * first, so the file has already been required.
  */
 function consumeStatusName(mixed $status): string
 {

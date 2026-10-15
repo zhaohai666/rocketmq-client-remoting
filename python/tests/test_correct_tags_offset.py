@@ -22,7 +22,7 @@ def msg(queue_offset: int) -> MessageExt:
 
 
 class Harness:
-    """一个不碰网络的 push consumer：缓冲/位点/在途计数都手动搭。"""
+    """A push consumer that never touches the network: buffer / offset / in-flight count are all set up manually."""
 
     def __init__(self):
         self.c = DefaultMQPushConsumer(GROUP)
@@ -47,7 +47,7 @@ class Harness:
         return self.c._consume_offsets.get(self.key)
 
 
-# ------------------------------------------------- 空应答把位点抬到 nextBeginOffset
+# ------------------------------------------------- Empty response advances the offset to nextBeginOffset
 
 
 class TestAdvancesOnEmptyResponse:
@@ -57,8 +57,8 @@ class TestAdvancesOnEmptyResponse:
         assert h.offset == 110
 
     def test_no_matched_msg_advances_when_queue_empty(self):
-        # broker 侧过滤把整批都挡掉了（PULL_RETRY_IMMEDIATELY → NO_MATCHED_MSG）：
-        # 这些消息永远不会进 _pending，位点只能靠这一步跟上
+        # Broker-side filtering blocked the whole batch (PULL_RETRY_IMMEDIATELY → NO_MATCHED_MSG):
+        # those messages never enter _pending, so the offset can only catch up via this step
         h = Harness()
         h.correct(PullStatus.NO_MATCHED_MSG, 110)
         assert h.offset == 110
@@ -70,15 +70,15 @@ class TestAdvancesOnEmptyResponse:
         assert h.offset == 110
 
     def test_none_next_offset_is_ignored(self):
-        # 应答头缺 nextBeginOffset（本端口用 None 表达）：宁可不抬，也不能写个 0 把
-        # broker 上已提交的位点打回去
+        # The response header lacks nextBeginOffset (expressed as None in this port): better not to advance than to write a 0 that
+        # knocks the committed offset on the broker back down
         h = Harness()
         h.seed_consume_offset(50)
         h.correct(PullStatus.NO_NEW_MSG, None)
         assert h.offset == 50
 
 
-# ------------------------------------------------------------- 只前进，不回退
+# ------------------------------------------------------------- Advance only, never regress
 
 
 class TestIncreaseOnly:
@@ -95,7 +95,7 @@ class TestIncreaseOnly:
         assert h.offset == 110
 
 
-# ---------------------------------------------------------- 闸门：进程队列非空
+# ---------------------------------------------------------- Gate: process queue non-empty
 
 
 class TestProcessQueueGuard:
@@ -121,13 +121,13 @@ class TestProcessQueueGuard:
         assert h.offset == 110
 
 
-# ------------------------------------------------- 只有这两个状态才修正位点
+# ------------------------------------------------- Only these two statuses correct the offset
 
 
 class TestStatusGate:
     def test_found_is_ignored(self):
-        # FOUND 走的是 putMessage + 消费那条路：没人会"空手而归"，位点由 _advance 推进。
-        # 在这里顺手抬一把等于把还没消费的消息跳过。
+        # FOUND goes through the putMessage + consume path: nobody "comes back empty-handed", and the offset is advanced by _advance.
+        # Casually advancing it here would amount to skipping messages that have not been consumed yet.
         h = Harness()
         h.seed_consume_offset(50)
         h.correct(PullStatus.FOUND, 110)
@@ -140,11 +140,11 @@ class TestStatusGate:
         assert h.offset == 50
 
 
-# ------------------------------- dispatch 循环登记在途（闸门不能只是"能算出来"）
+# ------------------------------- The dispatch loop registers in-flight (the gate must not merely be "computable")
 
 
 class BlockingListener:
-    """进 listener 就挂住，直到测试放行 —— 用来把"在途窗口"变成确定性的。"""
+    """Blocks on entering the listener until the test releases it — used to make the "in-flight window" deterministic."""
 
     def __init__(self):
         self.entered = threading.Event()
@@ -172,23 +172,23 @@ class TestDispatchLoopWiring:
         c._start_dispatch_loop()
         try:
             assert listener.entered.wait(5), "dispatch loop never reached the listener"
-            # 缓冲已被取空、批次在 listener 手里：correctTagsOffset 必须不动
+            # The buffer has been drained and the batch is in the listener's hands: correctTagsOffset must not move
             assert c._msg_queue_inflight.get(key) == 1
             with c._lock:
                 c._correct_tags_offset_locked(key, PullStatus.NO_NEW_MSG, 110)
             assert c._consume_offsets.get(key) is None
         finally:
             listener.release.set()
-            # 等消费收尾（成功 → 位点到 2）并把在途计数注销
+            # Wait for consumption to finish (success → offset to 2) and deregister the in-flight count
             for _ in range(100):
                 if not c._msg_queue_inflight.get(key):
                     break
                 threading.Event().wait(0.02)
             c._stop.set()
             c._dispatch_thread.join(timeout=5)
-        assert c._msg_queue_inflight.get(key) is None, "在途计数没有注销，闸门会永远关着"
-        assert c._consume_offsets.get(key) == 2, "批次没被消费，位点不是 2"
-        # 注销之后同一条应答就能抬位点了（真机上就是"消费完 + 队列没消息"那一刻）
+        assert c._msg_queue_inflight.get(key) is None, "the in-flight count was not deregistered; the gate would stay closed forever"
+        assert c._consume_offsets.get(key) == 2, "the batch was not consumed; the offset is not 2"
+        # After deregistration, the same response can advance the offset (on a real machine: the moment "consumed + queue empty")
         with c._lock:
             c._correct_tags_offset_locked(key, PullStatus.NO_NEW_MSG, 110)
         assert c._consume_offsets.get(key) == 110

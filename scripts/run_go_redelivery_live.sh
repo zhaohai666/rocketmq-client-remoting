@@ -1,24 +1,36 @@
 #!/bin/bash
-# Go 客户端的「重投 / 死信终态 / 部分 ack」真机验证。
+# Live verification of the Go client's "redelivery / dead-letter final state /
+# partial ack" behavior.
 #
-# 用法: bash scripts/run_go_redelivery_live.sh [namesrv] [legs]   # legs: s1,s2,s3,s4，缺省全跑
+# Usage: bash scripts/run_go_redelivery_live.sh [namesrv] [legs]   # legs: s1,s2,s3,s4, all by default
 #
-# 为什么必须真集群：这一片的判据**一半在 broker 里**——
-#   * 回投延迟梯度（delayLevel 3/4）、RECONSUME_TIMES 阶梯，由 broker 的回投逻辑决定；
-#   * 死信终态的判据是「%DLQ%<group> 里到底有没有那条消息、它的 reconsumeTimes 是几」，
-#     只能换一个消费组从队首读回来；客户端这边的计数全绿也可能根本没进 DLQ；
-#   * ackIndex 部分 ack 的判据是「已被 ack 的首条一次都不再投」+「业务位点仍整批
-#     提交到 3」+「对照组一条都不回投」——三者缺一，回投都可能被误判成 harness 抖动。
+# Why a real cluster is required: half of the criteria for this area live
+# **inside the broker** --
+#   * the send-back delay gradient (delayLevel 3/4) and the RECONSUME_TIMES
+#     ladder are decided by the broker's redelivery logic;
+#   * the dead-letter final-state criterion is "whether that message is
+#     actually in %DLQ%<group> and what its reconsumeTimes is", which can only
+#     be read back from the queue head with a different consumer group; the
+#     client-side counters can be all green while nothing ever reached the DLQ;
+#   * the ackIndex partial-ack criterion is "the acked first message is never
+#     redelivered" + "the business offset is still committed as a whole batch
+#     to 3" + "the control group gets zero redeliveries" -- miss any one of the
+#     three and a redelivery could be misread as harness jitter.
 #
-# 客户端侧最容易踩的坑：从 %RETRY% 拉到的消息，客户端会把 msg.Topic **还原**成业务
-# topic（resetRetryTopicAndNamespace），所以按 `topic == %RETRY%<group>` 记账会永远读到 0。
-# 本工具一律按 body 记账，并把 listener 实际看到的主题分布打出来。
+# The easiest client-side pitfall: for messages pulled from %RETRY%, the client
+# **restores** msg.Topic to the business topic (resetRetryTopicAndNamespace),
+# so bookkeeping by `topic == %RETRY%<group>` always reads 0. This tool always
+# books by body and prints the topic distribution the listener actually saw.
 #
-# 集群：默认假定已经在跑（scripts/rmq_test_broker.sh 那套）。端口探测失败会自动
-# `rmq_test_broker.sh start`，收工时只停自己起来的那一次；已经在跑的不碰。
+# Cluster: assumed to be already running by default (the scripts/rmq_test_broker.sh
+# setup). If the port probe fails, `rmq_test_broker.sh start` is run automatically,
+# and only the instance started here is stopped at cleanup; anything already
+# running is left untouched.
 #
-# ⚠ 集群 start + 等端口 + 跑验证 + kill 必须都在本脚本内串完：前台返回会回收后台 JVM。
-# ⚠ 全跑约 5~7 分钟（S2/S3 各自要等 10s/30s 两档延迟 + 观察窗口）。
+# Note: cluster start + port wait + verification + kill must all be completed
+# serially inside this script: returning to the foreground reaps background JVMs.
+# Note: a full run takes about 5-7 minutes (S2/S3 each wait for the 10s/30s
+# delay tiers plus the observation window).
 set -u
 
 NS=${1:-${ROCKETMQ_NAMESRV:-127.0.0.1:9876}}
@@ -35,24 +47,26 @@ port_open() {
 STARTED_BROKER=0
 cleanup() {
     if [ "$STARTED_BROKER" = "1" ]; then
-        echo "--- 收工：停掉本脚本起的 broker ---"
+        echo "--- cleanup: stopping the broker started by this script ---"
         sh "$ROOT/scripts/rmq_test_broker.sh" stop || true
     fi
 }
 trap cleanup EXIT
 
 if ! port_open "$BROKER_PORT"; then
-    echo "=== broker 未监听 $BROKER_PORT，拉起本地测试集群 ==="
-    sh "$ROOT/scripts/rmq_test_broker.sh" start || { echo "broker 起不来"; exit 1; }
+    echo "=== broker not listening on $BROKER_PORT, starting local test cluster ==="
+    sh "$ROOT/scripts/rmq_test_broker.sh" start || { echo "failed to start broker"; exit 1; }
     STARTED_BROKER=1
-    # 端口先于「向 namesrv 注册路由」就绪，不等就会拿不到 TBW102 路由而假失败。
+    # The port is ready before the broker registers its route with the
+    # namesrv; not waiting means the TBW102 route is missing and the run
+    # false-fails.
     sleep 12
 fi
-port_open 9876 || { echo "nameserver 9876 没监听，先起 namesrv"; exit 1; }
+port_open 9876 || { echo "nameserver 9876 not listening, start namesrv first"; exit 1; }
 
 echo ""
-echo "=== Go redelivery live（ns=$NS legs=${LEGS:-all}）==="
-echo "    %RETRY% 回投 / %DLQ% 终态 / 顺序毒消息 / ackIndex 部分 ack，判据在 broker 侧读回"
+echo "=== Go redelivery live (ns=$NS legs=${LEGS:-all}) ==="
+echo "    %RETRY% redelivery / %DLQ% final state / orderly poison message / ackIndex partial ack; criteria read back from the broker side"
 cd "$ROOT/go" || exit 1
 if [ -n "$LEGS" ]; then
     "$GO" run ./examples/live_redelivery -ns "$NS" -legs "$LEGS"
@@ -64,8 +78,8 @@ echo "--- go exit=$RC ---"
 
 echo ""
 if [ "$RC" -eq 0 ]; then
-    echo "结果: 全部通过（ns=${NS}）"
+    echo "RESULT: all passed (ns=${NS})"
     exit 0
 fi
-echo "结果: 有失败（ns=${NS}）"
+echo "RESULT: failures present (ns=${NS})"
 exit 1

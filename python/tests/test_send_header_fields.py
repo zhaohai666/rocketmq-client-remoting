@@ -16,7 +16,7 @@ ADDR = "127.0.0.1:10911"
 
 
 def _new_instance(prefix: str) -> MQClientInstance:
-    """只构造、不 start() 的实例：不建连、不发心跳，纯离线断言。"""
+    """An instance that is only constructed, not start()ed: no connection, no heartbeat, pure offline assertions."""
     return MQClientInstance("%s_%d" % (prefix, threading.get_ident()),
                             ["127.0.0.1:9876"])
 
@@ -25,7 +25,7 @@ def _drop(inst: MQClientInstance) -> None:
     MQClientInstance.INSTANCE_MAP.pop(inst.client_id, None)
 
 
-# ---------------------------------------------------------------- 报文形状
+# ---------------------------------------------------------------- Request shape
 def test_send_header_carries_broker_name_as_the_single_letter_n():
     pass
     inst = _new_instance("hdr_broker")
@@ -66,7 +66,7 @@ def test_default_topic_and_queue_nums_follow_the_caller():
         off = inst._build_send_request("PG", msg, MQ, 3000, 0)
         off.make_custom_header_to_net()
         assert off.ext_fields["c"] == MixAll.DEFAULT_TOPIC == "TBW102"
-        # 0 是合法配置值，不能被 `or` 当成"没传"
+        # 0 is a legal config value and must not be treated as "not passed" by `or`
         zero = inst._build_send_request("PG", msg, MQ, 3000, 0, False, None, 0)
         zero.make_custom_header_to_net()
         assert zero.ext_fields["d"] == "0"
@@ -75,7 +75,7 @@ def test_default_topic_and_queue_nums_follow_the_caller():
 
 
 def test_batch_and_reply_paths_keep_the_same_three_fields():
-    """批量走 320、应答走 325，但 n/c/d 是同一份 header，不能漏。"""
+    """Batch goes via 320 and replies via 325, but n/c/d are the same header and must not be missed."""
     inst = _new_instance("hdr_batch")
     batch = MessageBatch.generate_from_list([Message("T_Header", b"a"),
                                              Message("T_Header", b"b")])
@@ -91,12 +91,12 @@ def test_batch_and_reply_paths_keep_the_same_three_fields():
         _drop(inst)
 
 
-# ---------------------------------------------------------------- facade 接通
+# ---------------------------------------------------------------- Facade wiring
 class _Recorder:
-    """MQClientInstance 替身：把三条发送入口收到的头参数原样记下来。
+    """An MQClientInstance stand-in: records the header parameters received by the three send entries as-is.
 
-    签名故意写全而不是 ``**kwargs``：facade 少传/错传某个字段时要立刻 TypeError，
-    而不是被 ``**`` 悄悄吞掉。
+    The signature is deliberately written out in full rather than ``**kwargs``: when a facade omits/mis-passes a field it must TypeError immediately,
+    rather than being silently swallowed by ``**``.
     """
 
     def __init__(self):
@@ -158,7 +158,7 @@ def _producer(create_topic_key: Optional[str] = None,
         p.set_create_topic_key(create_topic_key)
     if default_topic_queue_nums is not None:
         p.set_default_topic_queue_nums(default_topic_queue_nums)
-    # start() 会建真实客户端，这里只补齐异步链需要的三样：两个池 + started 标记
+    # start() would build a real client; here only the three things the async chain needs are filled in: two pools + the started flag
     p._create_async_executors()
     p._mq_client = _Recorder()
     p._started = True
@@ -166,7 +166,7 @@ def _producer(create_topic_key: Optional[str] = None,
 
 
 class _Latch:
-    """SendCallback 替身：把回调落成一次 Event。"""
+    """A SendCallback stand-in: turns the callback into a single Event."""
 
     def __init__(self, done: threading.Event):
         self._done = done
@@ -183,7 +183,7 @@ class _Latch:
 
 
 def test_sync_send_forwards_producer_config():
-    """set_create_topic_key / set_default_topic_queue_nums 必须真的上线（旧代码是假 setter）。"""
+    """set_create_topic_key / set_default_topic_queue_nums must really work (the old code had fake setters)."""
     p = _producer("MY_KEY", 16)
     p.send(Message("T_Header", b"x"))
     seen = p._mq_client.sync[-1]
@@ -201,14 +201,14 @@ def test_defaults_are_the_protocol_defaults_when_setters_never_run():
 
 
 class _FirstQueue:
-    """MessageQueueSelector 替身（producer.send_by_selector 走 .select 方法）。"""
+    """A MessageQueueSelector stand-in (producer.send_by_selector goes through the .select method)."""
 
     def select(self, mqs, msg, arg):
         return mqs[0]
 
 
 def test_every_send_entry_forwards_the_same_config():
-    """定点 / 轮询 / selector / oneway / 批量 / 异步都走 _send_header_args，漏一个就是一致性 bug。"""
+    """Fixed-queue / round-robin / selector / oneway / batch / async all go through _send_header_args; missing one is a consistency bug."""
     p = _producer("K2", 7)
     p.set_back_pressure_for_async_send_num(1000)
     p.set_back_pressure_for_async_send_size(1000 * 1024 * 1024)
@@ -226,12 +226,12 @@ def test_every_send_entry_forwards_the_same_config():
         p.shutdown()
 
     records = client.sync + client.oneway + client.built
-    # 2 次同步 + 1 次 selector + 1 次批量 = 4；oneway 1；异步 1
+    # 2 sync + 1 selector + 1 batch = 4; oneway 1; async 1
     assert (len(client.sync), len(client.oneway), len(client.built)) == (4, 1, 1), (
         len(client.sync), len(client.oneway), len(client.built))
     for rec in records:
         assert rec["default_topic"] == "K2", rec
         assert rec["default_topic_queue_nums"] == 7, rec
         assert rec["unit_mode"] is False, rec
-        # brokerName 不在参数里：它跟着 mq 走，由 _build_send_request 现取
+        # brokerName is not among the parameters: it travels with mq and is fetched on the spot by _build_send_request
         assert rec["mq"].broker_name == "broker-a", rec

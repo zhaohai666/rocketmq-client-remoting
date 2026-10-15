@@ -40,9 +40,9 @@ def _read_frame(sock):
 
 
 class DropOnReadServer:
-    """读掉每个请求然后**关掉连接**，一个字节响应都不回（模拟对端掉线/重启）。
+    """Reads every request then **closes the connection**, without responding a single byte (simulating a peer going offline / restarting).
 
-    ``hold`` 为真时读完第一帧后挂住不关，用来单独测"另一条连接不该被牵连"。
+    When ``hold`` is true, it hangs after reading the first frame instead of closing, to test "another connection must not be affected" in isolation.
     """
 
     def __init__(self, hold=False):
@@ -94,7 +94,7 @@ class DropOnReadServer:
                     continue
                 self.first_frame_read.set()
                 self.closed.set()
-                return  # 关连接：客户端读线程下一次 recv 见到 EOF
+                return  # close the connection: the client's read thread sees EOF on its next recv
         except OSError:
             self.closed.set()
         finally:
@@ -113,7 +113,7 @@ def _wait_until(predicate, timeout=8.0):
     return predicate()
 
 
-# 远超断连传播所需的时间；真机 loopback 上 EOF 在毫秒级就到，用它当"没修好"的判据
+# Far longer than disconnection propagation needs; on a real loopback machine EOF arrives in milliseconds, so this serves as the criterion for "not fixed"
 LONG_TIMEOUT_MILLIS = 30000
 
 
@@ -127,11 +127,11 @@ def test_sync_call_fails_fast_instead_of_waiting_for_timeout():
             client.invoke_sync(server.addr, req, LONG_TIMEOUT_MILLIS)
         cost = time.time() - started
         assert cost < LONG_TIMEOUT_MILLIS / 1000.0 / 3, (
-            "同步调用等满/接近超时才返回：说明连接断开没有立刻失败在途请求 (%.2fs)" % cost)
-        # 语义必须是"发送失败"，不是"超时"——重试分类按类型分流
+            "the sync call returned only at/near the timeout: the disconnect did not fail in-flight requests immediately (%.2fs)" % cost)
+        # The semantics must be "send failure", not "timeout" — retry classification branches by type
         assert not isinstance(caught.value, RemotingTimeoutException)
         assert "connection closed" in str(caught.value)
-        assert req.opaque not in client._response_table, "在途条目未摘除 -> 泄漏"
+        assert req.opaque not in client._response_table, "in-flight entry not removed -> leak"
     finally:
         client.shutdown()
         server.stop()
@@ -147,14 +147,14 @@ def test_async_callback_reports_send_failure_immediately():
         client.invoke_async(server.addr, req,
                             lambda resp, err: calls.append((resp, err)),
                             LONG_TIMEOUT_MILLIS)
-        assert _wait_until(lambda: len(calls) == 1), "回调未触发: %r" % (calls,)
+        assert _wait_until(lambda: len(calls) == 1), "callback not fired: %r" % (calls,)
         cost = time.time() - started
         resp, err = calls[0]
         assert resp is None
         assert isinstance(err, RemotingSendRequestException), (
-            "回调拿到的是 %r：连接断开应报发送失败，不是超时" % (err,))
+            "the callback got %r: a disconnect should report a send failure, not a timeout" % (err,))
         assert cost < LONG_TIMEOUT_MILLIS / 1000.0 / 3, (
-            "回调等了 %.2fs 才触发，接近 timeout+宽限" % cost)
+            "the callback took %.2fs to fire, close to timeout + grace" % cost)
         assert req.opaque not in client._response_table
     finally:
         client.shutdown()
@@ -168,11 +168,11 @@ def test_fail_fast_callback_fires_exactly_once():
     try:
         req = rc_mod.RemotingCommand.create_request_command(RequestCode.HEART_BEAT)
         calls = []
-        # 短超时：清理线程大概率比 EOF 更晚，但两者都会抢同一条条目
+        # Short timeout: the cleanup thread most likely runs later than EOF, but both race for the same entry
         client.invoke_async(server.addr, req, lambda resp, err: calls.append((resp, err)), 200)
         assert _wait_until(lambda: len(calls) >= 1)
-        time.sleep(1.8)  # 跨过 timeout + 1s 宽限，给清理线程充分机会重复投递
-        assert len(calls) == 1, "回调被投递了 %d 次" % len(calls)
+        time.sleep(1.8)  # cross timeout + 1s grace, giving the cleanup thread ample chance to redeliver
+        assert len(calls) == 1, "the callback was delivered %d times" % len(calls)
         assert not client._response_table
     finally:
         client.shutdown()
@@ -180,9 +180,9 @@ def test_fail_fast_callback_fires_exactly_once():
 
 
 def test_other_connections_are_not_collateral_damage():
-    """只失败断开那条连接自己的请求：别的地址、以及同地址的新连接都不能被牵连。"""
+    """Only the requests of the disconnected connection itself fail: other addresses, and new connections to the same address, must not be affected."""
     dying = DropOnReadServer()
-    alive = DropOnReadServer(hold=True)  # 只收请求、既不回也不关
+    alive = DropOnReadServer(hold=True)  # only receives requests, neither replies nor closes
     client = RemotingClient()
     try:
         quiet = []
@@ -195,11 +195,11 @@ def test_other_connections_are_not_collateral_damage():
         req_dying = rc_mod.RemotingCommand.create_request_command(RequestCode.HEART_BEAT)
         client.invoke_async(dying.addr, req_dying,
                             lambda resp, err: calls.append((resp, err)), LONG_TIMEOUT_MILLIS)
-        assert _wait_until(lambda: len(calls) == 1), "断开的连接没有立刻失败: %r" % (calls,)
+        assert _wait_until(lambda: len(calls) == 1), "the disconnected connection did not fail immediately: %r" % (calls,)
         assert isinstance(calls[0][1], RemotingSendRequestException)
 
-        assert req_alive.opaque in client._response_table, "另一条连接的在途请求被误杀"
-        assert not quiet, "仍在途的请求收到了回调: %r" % (quiet,)
+        assert req_alive.opaque in client._response_table, "the other connection's in-flight request was killed by mistake"
+        assert not quiet, "an in-flight request received a callback: %r" % (quiet,)
     finally:
         client.shutdown()
         alive.stop()
@@ -207,10 +207,10 @@ def test_other_connections_are_not_collateral_damage():
 
 
 def test_same_address_new_connection_survives_old_reader():
-    """按套接字身份认领：同地址换新连接时，旧读线程收尾不能判死新连接上的请求。
+    """Claim by socket identity: when the same address switches to a new connection, the old reader's teardown must not kill requests on the new connection.
 
-    这是 GO_AWAY 换连接重发、以及写失败后 close_channel 的实际形状——地址串没变，
-    变的是连接。只比地址串就会把新连接刚登记的请求一起误杀。
+    This is the actual shape of GO_AWAY reconnect-and-resend, as well as close_channel after a write failure — the address string stays the same,
+    but the connection changes. Comparing only address strings would kill the newly registered requests on the new connection too.
     """
     client = RemotingClient()
     old_sock = socket.socket()
@@ -227,7 +227,7 @@ def test_same_address_new_connection_survives_old_reader():
         assert client._fail_fast("127.0.0.1:9999", old_sock) == 1
         assert victim.opaque not in client._response_table
         assert keep_alive.opaque in client._response_table
-        assert never_written.opaque in client._response_table, "还没写出去的请求不该被牵连"
+        assert never_written.opaque in client._response_table, "requests not yet written out must not be affected"
         assert keep_alive.cause is None and never_written.cause is None
         assert victim.cause is not None and not victim.send_request_ok
     finally:
@@ -237,7 +237,7 @@ def test_same_address_new_connection_survives_old_reader():
 
 
 def test_shutdown_drains_and_reports_in_flight_requests():
-    """shutdown 时仍在途的请求不能悄悄消失：回调必须带着失败原因落地。"""
+    """Requests still in flight at shutdown must not silently disappear: the callbacks must land with a failure reason."""
     server = DropOnReadServer(hold=True)
     client = RemotingClient()
     try:
@@ -248,8 +248,8 @@ def test_shutdown_drains_and_reports_in_flight_requests():
         assert _wait_until(lambda: server.requests == 1)
         assert req.opaque in client._response_table
         client.shutdown()
-        assert _wait_until(lambda: len(calls) == 1), "shutdown 之后回调永不落地"
+        assert _wait_until(lambda: len(calls) == 1), "the callback never landed after shutdown"
         assert isinstance(calls[0][1], RemotingSendRequestException)
-        assert not client._response_table, "shutdown 泄漏了在途条目"
+        assert not client._response_table, "shutdown leaked in-flight entries"
     finally:
         server.stop()

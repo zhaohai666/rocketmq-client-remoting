@@ -25,18 +25,18 @@ def _route(queue_datas, broker_datas) -> TopicRouteData:
 
 def test_publish_queues_skip_a_broker_whose_master_is_gone():
     route = _route(
-        [QueueData("broker-a", 4, 4, 6, 0)],          # master 掉线，写位仍是 6
+        [QueueData("broker-a", 4, 4, 6, 0)],          # master offline, write queue count still 6
         [BrokerData("c", "broker-a", {SLAVE: "127.0.0.1:10931"})],
     )
     assert route.get_all_message_queue("T") == []
 
 
 def test_publish_queues_come_back_once_the_master_registers():
-    """负控：跳的是「没有 master」，不是 broker-a 这个名字。"""
+    """Negative control: what is skipped is "no master", not the name broker-a."""
     bd = BrokerData("c", "broker-a", {SLAVE: "127.0.0.1:10931"})
     route = _route([QueueData("broker-a", 4, 4, 6, 0)], [bd])
     assert route.get_all_message_queue("T") == []
-    bd.broker_addrs[MASTER] = "127.0.0.1:10911"       # master 重新注册
+    bd.broker_addrs[MASTER] = "127.0.0.1:10911"       # master registers again
     assert route.get_all_message_queue("T") == [
         MessageQueue("T", "broker-a", i) for i in range(4)]
 
@@ -75,7 +75,7 @@ def test_subscribe_info_uses_read_perm_and_read_queue_nums():
 
 
 def test_instance_subscribe_info_is_served_from_the_route_table():
-    """消费者的入口 get_topic_subscribe_info：路由已在表里就直接给队列（不再打 namesrv）。"""
+    """The consumer's entry get_topic_subscribe_info: if the route is already in the table, queues are returned directly (no namesrv query)."""
     inst = MQClientInstance("route-test@unit", ["127.0.0.1:9876"])
     inst.topic_route_table["T"] = _route(
         [QueueData("broker-a", 2, 2, 6, 0)],
@@ -85,7 +85,7 @@ def test_instance_subscribe_info_is_served_from_the_route_table():
         MessageQueue("T", "broker-a", i) for i in range(2)]
 
 
-# ---------------------------------------------- 地址侧：findBrokerAddressInPublish
+# ---------------------------------------------- Address side: findBrokerAddressInPublish
 def _route_of(addrs_by_broker) -> TopicRouteData:
     return _route(
         [QueueData(name, 2, 2, 6, 0) for name in addrs_by_broker],
@@ -94,10 +94,10 @@ def _route_of(addrs_by_broker) -> TopicRouteData:
 
 
 def _serving(route_holder):
-    """离线实例：``_invoke_sync`` 一律回 ``route_holder[0]`` 那份路由（None = namesrv 说没有）。
+    """An offline instance: ``_invoke_sync`` always replies with the ``route_holder[0]`` route (None = namesrv says there is none).
 
-    刷路由走的是**真的** ``update_topic_route_info_from_name_server`` —— 发布地址平表的
-    写入点就在它里面，绕过它直接往 ``broker_addr_table`` 塞值等于这条路径没测。
+    Route refresh goes through the **real** ``update_topic_route_info_from_name_server`` -- the write point of the publish address flat table
+    is inside it; bypassing it to stuff values directly into ``broker_addr_table`` would mean this path is not tested.
     """
     inst = MQClientInstance("route-test@unit", ["127.0.0.1:9876"])
     calls = []
@@ -116,12 +116,12 @@ def _serving(route_holder):
 
 
 def test_publish_lookup_takes_only_the_master_while_the_admin_lookup_falls_back():
-    """``findBrokerAddressInPublish`` 只认 brokerId=0；同一份路由上管理口径要退到从节点。"""
+    """``findBrokerAddressInPublish`` only accepts brokerId=0; on the same route the admin lookup must fall back to the slave."""
     holder = [_route_of({"broker-a": {SLAVE: "127.0.0.1:10931"}})]
     inst, _ = _serving(holder)
     assert inst.update_topic_route_info_from_name_server("T") is True
     assert inst.find_broker_address_in_publish("broker-a") is None
-    # 负控：退让口径（心跳/拉取/位点查询用）在**同一张路由**上必须拿得到从节点地址
+    # negative control: the concession lookup (used by heartbeat/pull/offset queries) must be able to get the slave address on the **same route**
     assert inst.broker_addr_of("broker-a") == "127.0.0.1:10931"
 
     holder[0] = _route_of({"broker-a": {MASTER: "127.0.0.1:10911",
@@ -132,7 +132,7 @@ def test_publish_lookup_takes_only_the_master_while_the_admin_lookup_falls_back(
 
 def test_publish_addr_for_refreshes_the_route_then_rechecks():
     pass
-    holder = [None]      # 还没见过这个 topic
+    holder = [None]      # this topic has not been seen yet
     inst, calls = _serving(holder)
     holder[0] = _route_of({"broker-a": {MASTER: "127.0.0.1:10911"}})
     assert inst.publish_addr_for("broker-a", "T") == "127.0.0.1:10911"
@@ -140,7 +140,7 @@ def test_publish_addr_for_refreshes_the_route_then_rechecks():
 
 
 def test_publish_addr_for_reports_not_exist_when_the_master_is_gone():
-    """主掉线（路由里只剩 brokerId=1）：本端报「broker 不存在」，一次请求都不发。"""
+    """Master offline (only brokerId=1 left in the route): the client reports "broker does not exist", sending no requests at all."""
     holder = [_route_of({"broker-a": {SLAVE: "127.0.0.1:10931"}})]
     inst, calls = _serving(holder)
     with pytest.raises(MQClientException) as exc:
@@ -148,14 +148,14 @@ def test_publish_addr_for_reports_not_exist_when_the_master_is_gone():
     assert str(exc.value) == "The broker[broker-a] not exist"
     assert exc.value.response_code is None
     assert calls == ["127.0.0.1:9876"]
-    # 负控：跳的是「没有 master」，不是 broker-a 这个名字 —— master 一注册立刻解析得出
+    # negative control: what is skipped is "no master", not the name broker-a -- once the master registers it resolves immediately
     holder[0] = _route_of({"broker-a": {MASTER: "127.0.0.1:10911",
                                         SLAVE: "127.0.0.1:10931"}})
     assert inst.publish_addr_for("broker-a", "T") == "127.0.0.1:10911"
 
 
 def test_publish_addr_for_reports_not_exist_for_an_unknown_broker():
-    """路由里压根没有这个 brokerName（拼错/已下线）：同样报 not exist，不退到别的 broker。"""
+    """The route does not have this brokerName at all (typo/offline): report not exist the same way, without falling back to another broker."""
     holder = [_route_of({"broker-b": {MASTER: "127.0.0.1:10912"}})]
     inst, _ = _serving(holder)
     with pytest.raises(MQClientException) as exc:
@@ -164,17 +164,17 @@ def test_publish_addr_for_reports_not_exist_for_an_unknown_broker():
 
 
 def test_admin_offset_queries_are_master_only_too():
-    """``MQAdminImpl:195-264`` 的四个 offset 查询同一口径：只打主，主没了就报 not exist。
+    """The four offset queries in ``MQAdminImpl:195-264`` share the same criterion: master only, and if the master is gone, report not exist.
 
-    四个查询在主端点名的地址解析是同一个入口：``earliest_msg_store_time`` 没有客户端层方法，
-    本端落在 ``_publish_addr_in_admin`` 上（admin.py:949 / producer.py:2045 / consumer.py:3689
-    三个门面都只填地址、不各自解析），所以这里连它一起钉住。
+    The four queries resolve the address named at the master endpoint through the same entry: ``earliest_msg_store_time`` has no client-layer method,
+    so on this side it lands on ``_publish_addr_in_admin`` (admin.py:949 / producer.py:2045 / consumer.py:3689
+    all three facades only fill in the address, not resolve individually), so it is pinned down here together with the others.
     """
     holder = [_route_of({"broker-a": {SLAVE: "127.0.0.1:10931"}})]
     inst, calls = _serving(holder)
     mq = MessageQueue("T", "broker-a", 0)
 
-    # 主没了：四个查询一律本端报错，一次 broker 请求都不发（旧行为是退到从节点上把查询做完）
+    # master gone: all four queries report client-side errors, sending no broker requests at all (the old behavior was to fall back to the slave and finish the query there)
     queries = {
         "maxOffset": lambda: inst.get_max_offset(mq),
         "minOffset": lambda: inst.get_min_offset(mq),
@@ -187,21 +187,21 @@ def test_admin_offset_queries_are_master_only_too():
         assert str(exc.value) == "The broker[broker-a] not exist", name
         assert exc.value.response_code is None, name
 
-    # 负控：主回来之后四路都解析得出，且请求落在**主**地址上（不是路由里那台从节点）
+    # negative control: after the master comes back all four resolve, and requests land on the **master** address (not the slave in the route)
     holder[0] = _route_of({"broker-a": {MASTER: "127.0.0.1:10911",
                                         SLAVE: "127.0.0.1:10931"}})
     assert inst.get_max_offset(mq) == 7
     assert inst.get_min_offset(mq) == 7
     assert inst.search_offset_by_timestamp(mq, 1700000000000) == 7
     assert inst._publish_addr_in_admin(mq) == "127.0.0.1:10911"
-    # 从节点地址一次都没被打过（三条查询各一次 master，转接解析不打 broker）
+    # the slave address was never hit once (three queries, one master each; the transfer resolution does not hit the broker)
     assert calls[-3:] == ["127.0.0.1:10911"] * 3
     assert "127.0.0.1:10931" not in calls
 
 
-# -------------------------------------- 订阅口径：findBrokerAddressInSubscribe(MASTER_ID, true)
+# -------------------------------------- Subscription side: findBrokerAddressInSubscribe(MASTER_ID, true)
 def _invoking(route_holder):
-    """离线实例：namesrv 回 ``route_holder[0]``；broker 请求按码回包并逐个记 ``(addr, code)``。"""
+    """An offline instance: namesrv replies with ``route_holder[0]``; broker requests are answered by code and each ``(addr, code)`` is recorded."""
     from remoting.protocol.body import LockBatchRequestBody, LockBatchResponseBody
     from remoting.protocol.codes import RequestCode
 
@@ -217,14 +217,14 @@ def _invoking(route_holder):
             route = route_holder[0]
             response.body = route.encode() if route is not None else None
         elif request.code == RequestCode.LOCK_BATCH_MQ:
-            # 把请求体的 mqSet 原样回成 lockOKMQSet：锁集非空即证明「这一发真的落地了」
+            # echo the request body's mqSet back as lockOKMQSet verbatim: a non-empty lock set proves "this shot really landed"
             rb = LockBatchResponseBody()
             rb.lock_ok_mq_set = list(LockBatchRequestBody.decode(request.body).mq_set)
             response.body = rb.encode()
         elif request.code == RequestCode.QUERY_CONSUMER_OFFSET:
             response.ext_fields = {"offset": "424242" if addr.endswith("10931") else "111"}
         elif request.code == RequestCode.POP_MESSAGE:
-            response.code = ResponseCode.POLLING_TIMEOUT     # 长轮询空手而归是常态
+            response.code = ResponseCode.POLLING_TIMEOUT     # a long poll coming back empty-handed is the norm
         return response
 
     inst._invoke_sync = fake_invoke     # type: ignore[method-assign]
@@ -245,7 +245,7 @@ def test_orderly_locks_skip_the_broker_when_the_master_is_gone():
     inst.unlock_batch_mq("GID", "cid", mqs)
     assert calls == []
 
-    # 负控：主回来之后锁/解锁都落在主地址上、返回的锁集就是请求的那两个队列
+    # negative control: after the master comes back lock/unlock both land on the master address, and the returned lock set is exactly the two requested queues
     holder[0] = _route_of({"broker-a": {MASTER: "127.0.0.1:10911",
                                         SLAVE: "127.0.0.1:10931"}})
     inst.update_topic_route_info_from_name_server("T")
@@ -272,10 +272,10 @@ def test_pop_message_is_master_only_and_reports_not_exist():
         inst.pop_message("GID", "T", broker_name="broker-a")
     assert str(exc.value) == "The broker[broker-a] not exist"
     assert exc.value.response_code is None
-    # 报错前必须刷过一次路由（popAsync 的 findBrokerAddressInSubscribe + 重查）
+    # the route must be refreshed once before reporting the error (popAsync's findBrokerAddressInSubscribe + recheck)
     assert calls == [("127.0.0.1:9876", RequestCode.GET_ROUTEINFO_BY_TOPIC)]
 
-    # 负控：主注册后（这一发顺带触发一次路由刷新）请求落在主地址上，从节点一条都没有
+    # negative control: after the master registers (this shot triggers a route refresh along the way) requests land on the master address, with none on the slave
     holder[0] = _route_of({"broker-a": {MASTER: "127.0.0.1:10911",
                                         SLAVE: "127.0.0.1:10931"}})
     calls.clear()
@@ -295,11 +295,11 @@ def test_consumer_offset_falls_back_to_the_slave_after_a_refresh():
     calls.clear()
     mq = MessageQueue("T", "broker-a", 0)
 
-    assert inst.query_consumer_offset("GID", mq) == 424242      # 从节点那份
+    assert inst.query_consumer_offset("GID", mq) == 424242      # the slave's copy
     assert calls == [("127.0.0.1:9876", RequestCode.GET_ROUTEINFO_BY_TOPIC),
                      ("127.0.0.1:10931", RequestCode.QUERY_CONSUMER_OFFSET)]
 
-    # 负控：主回来之后只打主（从节点计数不再增长）
+    # negative control: after the master comes back only the master is hit (the slave count stops growing)
     holder[0] = _route_of({"broker-a": {MASTER: "127.0.0.1:10911",
                                         SLAVE: "127.0.0.1:10931"}})
     inst.update_topic_route_info_from_name_server("T")
@@ -307,7 +307,7 @@ def test_consumer_offset_falls_back_to_the_slave_after_a_refresh():
     assert inst.query_consumer_offset("GID", mq) == 111
     assert calls == [("127.0.0.1:10911", RequestCode.QUERY_CONSUMER_OFFSET)]
 
-    # 路由里压根没有 broker-a（连从节点都没有）：刷一次路由后仍查不到 ⇒ 本端报 not exist
+    # the route does not have broker-a at all (not even a slave): still not found after one route refresh => client reports not exist
     holder2 = [_route_of({"broker-b": {MASTER: "127.0.0.1:10912"}})]
     inst2, calls2 = _invoking(holder2)
     with pytest.raises(MQClientException) as exc:
@@ -316,13 +316,13 @@ def test_consumer_offset_falls_back_to_the_slave_after_a_refresh():
     assert calls2 == [("127.0.0.1:9876", RequestCode.GET_ROUTEINFO_BY_TOPIC)]
 
 
-# ---------------------------------------------- NameServer 故障切换（_fetch 的语义）
+# ---------------------------------------------- NameServer failover (the semantics of _fetch)
 def _ns_instance(addrs):
-    """双 name server 的离线实例；返回 (inst, 脚本化应答列表)。
+    """An offline instance with two name servers; returns (inst, scripted response list).
 
-    脚本列表按地址顺序取用：每项是一个 ``RemotingCommand`` 或一个异常实例。
-    这是「多 NameServer 下杀掉 ns[0]」的 mock 版 —— mock 层不建 TCP，
-    连接失败直接以 ``RemotingConnectException`` 表达，与真实行为一致。
+    The script list is consumed in address order: each item is a ``RemotingCommand`` or an exception instance.
+    This is the mock version of "kill ns[0] under multiple NameServers" -- the mock layer builds no TCP,
+    connection failures are expressed directly as ``RemotingConnectException``, consistent with real behavior.
     """
     inst = MQClientInstance("route-test@unit", list(addrs))
     script = []
@@ -352,7 +352,7 @@ def _topic_not_exist():
 
 
 def test_route_fetch_fails_over_to_the_surviving_name_server():
-    """ns[0] 连不上 + ns[1] 正常应答 ⇒ 必须拿到路由（生产者侧的切换路径）。"""
+    """ns[0] unreachable + ns[1] answers normally => the route must be obtained (the producer-side failover path)."""
     inst, script = _ns_instance(["127.0.0.1:19876", "127.0.0.1:9876"])
     script.append(RemotingConnectException("127.0.0.1:19876"))
     script.append(_route_ok())
@@ -361,13 +361,12 @@ def test_route_fetch_fails_over_to_the_surviving_name_server():
 
 
 def test_route_fetch_never_reraises_a_stale_connect_error():
-    """本文件要守的缺陷：ns[0] 连不上 + ns[1] 给出**权威答复**（TOPIC_NOT_EXIST）。
+    """The defect this file guards: ns[0] unreachable + ns[1] gives an **authoritative reply** (TOPIC_NOT_EXIST).
 
-    %RETRY%group 对新组就是没有路由 —— ns[1] 的答复是终局，不能被 ns[0] 那次的
-    连接异常盖掉。真实场景：多 NameServer 下杀掉 ns[0]，消费者 start() 在
-    _refresh_routes() 直接抛 RemotingConnectException（生产者总拿得到 SUCCESS，
-    所以只有消费侧炸）。修复后必须是「False + 不抛」，让 _refresh_routes 的
-    MQClientException 兜底把它当『暂无路由』记掉。
+    %RETRY%group genuinely has no route for a new group -- ns[1]'s reply is final and must not be
+    overridden by that one connection exception from ns[0]. Real scenario: kill ns[0] under multiple NameServers, and the consumer's start()
+    throws RemotingConnectException directly in _refresh_routes() (the producer always gets SUCCESS,
+    so only the consumer side blows up). After the fix it must be "False + no throw", letting _refresh_routes' MQClientException fallback record it as "no route for now".
     """
     inst, script = _ns_instance(["127.0.0.1:19876", "127.0.0.1:9876"])
     script.append(RemotingConnectException("127.0.0.1:19876"))
@@ -385,7 +384,7 @@ def test_route_fetch_raises_only_when_every_name_server_is_unreachable():
 
 
 def test_route_fetch_timeout_also_moves_to_the_next_name_server():
-    """超时与连接失败同级：都是传输级失败，同样换下一台。"""
+    """A timeout is on par with a connection failure: both are transport-level failures, so move to the next one the same way."""
     inst, script = _ns_instance(["127.0.0.1:19876", "127.0.0.1:9876"])
     script.append(RemotingTimeoutException("127.0.0.1:19876", 5000))
     script.append(_route_ok())

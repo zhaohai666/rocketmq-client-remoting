@@ -3,10 +3,10 @@
 declare(strict_types=1);
 
 /**
- * Remoting 层纯 PHP assert 风格自测（不依赖 phpunit）。
+ * Remoting layer pure-PHP assert-style self-test (no phpunit dependency).
  *
- * 运行：C:/Users/zhaoh/.workbuddy/binaries/php/versions/8.3/php.exe tests/RunRemoting.php
- * 全部通过输出 "ALL TESTS PASSED (N checks)"，任一失败列出明细并以非零码退出。
+ * Run: C:/Users/zhaoh/.workbuddy/binaries/php/versions/8.3/php.exe tests/RunRemoting.php
+ * On success prints "ALL TESTS PASSED (N checks)"; any failure lists details and exits non-zero.
  */
 
 require_once __DIR__ . '/../bootstrap.php';
@@ -105,7 +105,7 @@ final class RunRemoting
         return 1;
     }
 
-    // ==================================================================== JSON 帧
+    // ==================================================================== JSON frame
 
     private function testJsonFrameRoundtrip(): void
     {
@@ -126,66 +126,66 @@ final class RunRemoting
         $cmd->body = "body-bytes-\x01\x02";
 
         $frame = $cmd->encode();
-        // totalLength 前缀
+        // totalLength prefix
         $total = RocketMQSerializable::unpackSignedInt(substr($frame, 0, 4));
-        $this->checkSame(strlen($frame), $total + 4, 'JSON 帧 totalLength 覆盖除前缀外全部字节');
-        // headerLength 高 8 位 = SerializeType(JSON=0)
+        $this->checkSame(strlen($frame), $total + 4, 'JSON frame totalLength covers all bytes except the prefix');
+        // headerLength high 8 bits = SerializeType(JSON=0)
         $oriHeaderLen = RocketMQSerializable::unpackSignedInt(substr($frame, 4, 4));
-        $this->checkSame(SerializeType::JSON->value, RemotingCommand::getProtocolType($oriHeaderLen), 'JSON 帧序列化类型位');
+        $this->checkSame(SerializeType::JSON->value, RemotingCommand::getProtocolType($oriHeaderLen), 'JSON frame serialization type bits');
         $headerLen = RemotingCommand::getHeaderLength($oriHeaderLen);
-        $this->check($headerLen > 0 && $headerLen < strlen($frame), 'JSON 帧 header 长度合理');
+        $this->check($headerLen > 0 && $headerLen < strlen($frame), 'JSON frame header length reasonable');
 
         $decoded = RemotingCommand::decode($frame);
-        $this->checkSame($cmd->code, $decoded->code, 'JSON 往返 code');
-        $this->checkSame($cmd->opaque, $decoded->opaque, 'JSON 往返 opaque');
-        $this->checkSame($cmd->version, $decoded->version, 'JSON 往返 version(CURRENT_VERSION)');
-        $this->checkSame($cmd->flag, $decoded->flag, 'JSON 往返 flag');
-        $this->checkSame($cmd->remark, $decoded->remark, 'JSON 往返 remark');
-        $this->checkSame($cmd->body, $decoded->body, 'JSON 往返 body');
-        $this->checkSame('yes', $decoded->getExtField('handWritten') ?? '', 'JSON 往返 extFields(手写)');
-        $this->checkSame('GID-php', $decoded->getExtField('producerGroup') ?? '', 'JSON 往返 extFields(customHeader 落地)');
-        $this->checkSame('3', $decoded->getExtField('queueId') ?? '', 'JSON 往返 extFields(int → str)');
-        $this->checkSame('true', $decoded->getExtField('unitMode') ?? '', 'JSON 往返 extFields(bool → 小写 true)');
+        $this->checkSame($cmd->code, $decoded->code, 'JSON roundtrip code');
+        $this->checkSame($cmd->opaque, $decoded->opaque, 'JSON roundtrip opaque');
+        $this->checkSame($cmd->version, $decoded->version, 'JSON roundtrip version(CURRENT_VERSION)');
+        $this->checkSame($cmd->flag, $decoded->flag, 'JSON roundtrip flag');
+        $this->checkSame($cmd->remark, $decoded->remark, 'JSON roundtrip remark');
+        $this->checkSame($cmd->body, $decoded->body, 'JSON roundtrip body');
+        $this->checkSame('yes', $decoded->getExtField('handWritten') ?? '', 'JSON roundtrip extFields(handwritten)');
+        $this->checkSame('GID-php', $decoded->getExtField('producerGroup') ?? '', 'JSON roundtrip extFields(customHeader materialized)');
+        $this->checkSame('3', $decoded->getExtField('queueId') ?? '', 'JSON roundtrip extFields(int → str)');
+        $this->checkSame('true', $decoded->getExtField('unitMode') ?? '', 'JSON roundtrip extFields(bool → lowercase true)');
 
-        // flag 位
+        // flag bits
         $req = new RemotingCommand(10);
-        $this->check(!$req->isResponseType() && !$req->isOnewayRPC(), '新命令默认非响应非 oneway');
+        $this->check(!$req->isResponseType() && !$req->isOnewayRPC(), 'new command defaults to non-response non-oneway');
         $req->markResponseType();
         $req->markOnewayRPC();
-        $this->check($req->isResponseType() && $req->isOnewayRPC(), 'markResponseType/markOnewayRPC 置位');
-        $this->checkSame('RESPONSE_COMMAND', $req->getType(), 'getType 响应');
+        $this->check($req->isResponseType() && $req->isOnewayRPC(), 'markResponseType/markOnewayRPC set the bits');
+        $this->checkSame('RESPONSE_COMMAND', $req->getType(), 'getType response');
         $back = RemotingCommand::decode($req->encode());
-        $this->check($back->isResponseType() && $back->isOnewayRPC(), 'flag 位往返');
+        $this->check($back->isResponseType() && $back->isOnewayRPC(), 'flag bits roundtrip');
 
-        // 响应命令工厂
+        // Response command factory
         $resp = RemotingCommand::createResponseCommand(ResponseCode::SUCCESS, 'ok');
         $resp->opaque = 777;
         $back = RemotingCommand::decode($resp->encode());
-        $this->checkSame(ResponseCode::SUCCESS, $back->code, '响应命令 code 往返');
-        $this->checkSame(777, $back->opaque, '响应命令 opaque 往返');
-        $this->checkSame('ok', $back->remark, '响应命令 remark 往返');
+        $this->checkSame(ResponseCode::SUCCESS, $back->code, 'response command code roundtrip');
+        $this->checkSame(777, $back->opaque, 'response command opaque roundtrip');
+        $this->checkSame('ok', $back->remark, 'response command remark roundtrip');
 
-        // language 字符串形态（5.x NameServer 把 language 序列化为枚举名）
+        // language string shape (5.x NameServer serializes language as the enum name)
         $json = '{"code":105,"language":"JAVA","version":515,"opaque":9,"flag":0,"extFields":{"topic":"t"}}';
         $cmd2 = RemotingCommand::decode(pack('N', strlen($json) + 4) . pack('N', strlen($json)) . $json);
-        $this->checkSame(LanguageCode::JAVA->value, $cmd2->language, 'language 枚举名字符串 → int 码');
-        $this->checkSame('t', $cmd2->getExtField('topic') ?? '', 'language 字符串形态 extFields');
+        $this->checkSame(LanguageCode::JAVA->value, $cmd2->language, 'language enum-name string → int code');
+        $this->checkSame('t', $cmd2->getExtField('topic') ?? '', 'language string shape extFields');
 
-        // 坏帧
+        // Bad frame
         $this->checkThrows(
             static fn(): RemotingCommand => RemotingCommand::decode(pack('N', 999) . pack('N', 1) . 'x'),
             RemotingCommandException::class,
-            'decode 坏 totalLength 抛 RemotingCommandException'
+            'decode with a bad totalLength throws RemotingCommandException'
         );
 
-        // opaque 自增 + createNewRequestId
+        // opaque auto-increment + createNewRequestId
         $a = new RemotingCommand(1);
         $b = new RemotingCommand(1);
-        $this->check($b->opaque === $a->opaque + 1, 'opaque 静态自增');
-        $this->checkSame(RemotingCommand::createNewRequestId(), $b->opaque + 1, 'createNewRequestId 同一计数器');
+        $this->check($b->opaque === $a->opaque + 1, 'opaque static increment');
+        $this->checkSame(RemotingCommand::createNewRequestId(), $b->opaque + 1, 'createNewRequestId shares the counter');
     }
 
-    // ==================================================================== ROCKETMQ 序列化
+    // ==================================================================== ROCKETMQ serialization
 
     private function testRocketmqSerialization(): void
     {
@@ -203,30 +203,30 @@ final class RunRemoting
 
         $frame = $cmd->encode();
         $oriHeaderLen = RocketMQSerializable::unpackSignedInt(substr($frame, 4, 4));
-        $this->checkSame(SerializeType::ROCKETMQ->value, RemotingCommand::getProtocolType($oriHeaderLen), 'ROCKETMQ 帧序列化类型位');
+        $this->checkSame(SerializeType::ROCKETMQ->value, RemotingCommand::getProtocolType($oriHeaderLen), 'ROCKETMQ frame serialization type bits');
         $headerData = substr($frame, 8, RemotingCommand::getHeaderLength($oriHeaderLen));
-        $this->checkSame(strlen($headerData), RocketMQSerializable::calTotalLen('bin-remark', RocketMQSerializable::mapSerialize($cmd->extFields)), 'ROCKETMQ header 长度 = calTotalLen');
+        $this->checkSame(strlen($headerData), RocketMQSerializable::calTotalLen('bin-remark', RocketMQSerializable::mapSerialize($cmd->extFields)), 'ROCKETMQ header length = calTotalLen');
 
-        // 字段序：code(2) language(1) version(2) opaque(4) flag(4) remark(int+utf8) ext(int+map)
+        // Field order: code(2) language(1) version(2) opaque(4) flag(4) remark(int+utf8) ext(int+map)
         $fields = RocketMQSerializable::rocketMqProtocolDecode($headerData);
-        $this->checkSame(RequestCode::HEART_BEAT, $fields['code'], 'ROCKETMQ 编码 code');
-        $this->checkSame(LanguageCode::PHP->value, $fields['language'], 'ROCKETMQ 编码 language=PHP');
-        $this->checkSame(RemotingCommand::CURRENT_VERSION, $fields['version'], 'ROCKETMQ 编码 version');
-        $this->checkSame($cmd->opaque, $fields['opaque'], 'ROCKETMQ 编码 opaque');
-        $this->checkSame(0, $fields['flag'], 'ROCKETMQ 编码 flag');
-        $this->checkSame('bin-remark', $fields['remark'], 'ROCKETMQ 编码 remark');
-        $this->checkSame('GID-bin', $fields['extFields']['producerGroup'] ?? '', 'ROCKETMQ 编码 extFields.producerGroup');
-        $this->checkSame('false', $fields['extFields']['unitMode'] ?? '', 'ROCKETMQ 编码 extFields.unitMode(小写 false)');
+        $this->checkSame(RequestCode::HEART_BEAT, $fields['code'], 'ROCKETMQ encoding code');
+        $this->checkSame(LanguageCode::PHP->value, $fields['language'], 'ROCKETMQ encoding language=PHP');
+        $this->checkSame(RemotingCommand::CURRENT_VERSION, $fields['version'], 'ROCKETMQ encoding version');
+        $this->checkSame($cmd->opaque, $fields['opaque'], 'ROCKETMQ encoding opaque');
+        $this->checkSame(0, $fields['flag'], 'ROCKETMQ encoding flag');
+        $this->checkSame('bin-remark', $fields['remark'], 'ROCKETMQ encoding remark');
+        $this->checkSame('GID-bin', $fields['extFields']['producerGroup'] ?? '', 'ROCKETMQ encoding extFields.producerGroup');
+        $this->checkSame('false', $fields['extFields']['unitMode'] ?? '', 'ROCKETMQ encoding extFields.unitMode(lowercase false)');
 
         $decoded = RemotingCommand::decode($frame);
-        $this->checkSame(SerializeType::ROCKETMQ->value, $decoded->serializeTypeCurrentRpc, 'ROCKETMQ 往返 serializeType');
-        $this->checkSame($cmd->code, $decoded->code, 'ROCKETMQ 往返 code');
-        $this->checkSame($cmd->opaque, $decoded->opaque, 'ROCKETMQ 往返 opaque');
-        $this->checkSame($cmd->remark, $decoded->remark, 'ROCKETMQ 往返 remark');
-        $this->checkSame($cmd->body, $decoded->body, 'ROCKETMQ 往返 body');
-        $this->checkSame($cmd->extFields, $decoded->extFields, 'ROCKETMQ 往返 extFields 全等');
+        $this->checkSame(SerializeType::ROCKETMQ->value, $decoded->serializeTypeCurrentRpc, 'ROCKETMQ roundtrip serializeType');
+        $this->checkSame($cmd->code, $decoded->code, 'ROCKETMQ roundtrip code');
+        $this->checkSame($cmd->opaque, $decoded->opaque, 'ROCKETMQ roundtrip opaque');
+        $this->checkSame($cmd->remark, $decoded->remark, 'ROCKETMQ roundtrip remark');
+        $this->checkSame($cmd->body, $decoded->body, 'ROCKETMQ roundtrip body');
+        $this->checkSame($cmd->extFields, $decoded->extFields, 'ROCKETMQ roundtrip extFields exact match');
 
-        // 序列化字段序：按协议头字段顺序手拼的字节串应逐字节一致
+        // Serialization field order: a byte string hand-assembled in protocol header field order must match byte for byte
         $extBytes = (string)RocketMQSerializable::mapSerialize($cmd->extFields);
         $expectHeader = pack('n', $cmd->code & 0xFFFF)
             . pack('C', $cmd->language & 0xFF)
@@ -235,9 +235,9 @@ final class RunRemoting
             . pack('N', $cmd->flag)
             . pack('N', strlen('bin-remark')) . 'bin-remark'
             . pack('N', strlen($extBytes)) . $extBytes;
-        $this->checkSame($expectHeader, $headerData, 'ROCKETMQ header 字段序逐字节一致');
+        $this->checkSame($expectHeader, $headerData, 'ROCKETMQ header field order matches byte for byte');
 
-        // writeDecimalLong 边界
+        // writeDecimalLong boundaries
         $buf = '';
         RocketMQSerializable::writeDecimalLong($buf, 0);
         $this->checkSame(pack('N', 1) . '0', $buf, 'writeDecimalLong(0)');
@@ -248,26 +248,26 @@ final class RunRemoting
         RocketMQSerializable::writeDecimalLong($buf, PHP_INT_MIN);
         $this->checkSame(pack('N', 20) . '-9223372036854775808', $buf, 'writeDecimalLong(PHP_INT_MIN)');
 
-        // map 往返（key short 长度 / value int 长度）
+        // Map roundtrip (key short length / value int length)
         $map = ['k1' => 'v1', '中文' => '值'];
         $bin = (string)RocketMQSerializable::mapSerialize($map);
         [$back, $off] = RocketMQSerializable::mapDeserialize($bin, 0, strlen($bin));
-        $this->checkSame($map, $back, 'mapSerialize/mapDeserialize 往返');
-        $this->checkSame(strlen($bin), $off, 'mapDeserialize 消费完全部字节');
-        // 空串 value 编码成长度 0 → readStr 还原为 null → 该键被丢弃
-        //（经典 remoting 协议的 map 编码本身有损，非实现缺陷）
+        $this->checkSame($map, $back, 'mapSerialize/mapDeserialize roundtrip');
+        $this->checkSame(strlen($bin), $off, 'mapDeserialize consumed all bytes');
+        // Empty-string value encodes as length 0 → readStr restores null → the key is dropped
+        // (the classic remoting protocol map encoding is lossy by itself, not an implementation bug)
         $lossy = (string)RocketMQSerializable::mapSerialize(['empty' => '']);
         [$backLossy, $offLossy] = RocketMQSerializable::mapDeserialize($lossy, 0, strlen($lossy));
-        $this->checkSame([], $backLossy, '空串 value 往返有损（长度0→null，协议编码本身有损）');
-        $this->checkSame(strlen($lossy), $offLossy, '有损用例仍消费完全部字节');
+        $this->checkSame([], $backLossy, 'empty-string value roundtrip is lossy (length 0 → null, the protocol encoding itself is lossy)');
+        $this->checkSame(strlen($lossy), $offLossy, 'lossy case still consumed all bytes');
         $this->checkSame(null, RocketMQSerializable::mapSerialize(null), 'mapSerialize(null) → null');
         $this->checkSame(null, RocketMQSerializable::mapSerialize([]), 'mapSerialize([]) → null');
 
-        // readStr 长度 0 → null
-        $this->checkSame([null, 4], RocketMQSerializable::readStr(pack('N', 0), 0, false), 'readStr 长度0 → null');
+        // readStr length 0 → null
+        $this->checkSame([null, 4], RocketMQSerializable::readStr(pack('N', 0), 0, false), 'readStr length 0 → null');
     }
 
-    // ==================================================================== header 快照
+    // ==================================================================== header snapshot
 
     private function testHeaderSnapshot(): void
     {
@@ -299,21 +299,21 @@ final class RunRemoting
             'unitMode' => 'true',
             'maxReconsumeTimes' => 16,
             'batch' => 'false',
-        ], $h->toExtFields(), 'SendMessageRequestHeader.toExtFields 字段名/顺序/bool 小写快照');
+        ], $h->toExtFields(), 'SendMessageRequestHeader.toExtFields field names/order/lowercase bool snapshot');
 
-        // null 字段不落 ext
+        // null fields stay out of ext
         $h2 = new SendMessageRequestHeader();
         $h2->topic = 'T';
-        $this->checkSame(['topic' => 'T'], $h2->toExtFields(), 'null 字段不写键');
+        $this->checkSame(['topic' => 'T'], $h2->toExtFields(), 'null fields write no key');
 
-        // V2 短字段名
+        // V2 short field names
         $v2 = new SendMessageRequestHeaderV2();
         $v2->producerGroup = 'GID';
         $v2->queueId = 5;
         $v2->brokerName = 'broker-a';
-        $this->checkSame(['a' => 'GID', 'e' => 5, 'n' => 'broker-a'], $v2->toExtFields(), 'SendMessageRequestHeaderV2 短字段名');
+        $this->checkSame(['a' => 'GID', 'e' => 5, 'n' => 'broker-a'], $v2->toExtFields(), 'SendMessageRequestHeaderV2 short field names');
 
-        // fromExtFields 回读（含类型转换）
+        // fromExtFields read-back (with type conversion)
         $h3 = new SendMessageRequestHeader();
         $h3->fromExtFields(['producerGroup' => 'G', 'queueId' => '7', 'bornTimestamp' => '123', 'unitMode' => 'True', 'batch' => '0']);
         $this->checkSame('G', $h3->producerGroup, 'fromExtFields string');
@@ -322,24 +322,24 @@ final class RunRemoting
         $this->check(true === $h3->unitMode, 'fromExtFields bool(true)');
         $this->check(false === $h3->batch, 'fromExtFields bool(0=false)');
 
-        // PopMessageRequestHeader.order 总在报文里（协议里是非空 Boolean）
+        // PopMessageRequestHeader.order always present on the wire (non-nullable Boolean in the protocol)
         $pop = new PopMessageRequestHeader();
         $pop->topic = 't';
         $ext = $pop->toExtFields();
-        $this->check(array_key_exists('order', $ext) && $ext['order'] === 'false', 'PopMessageRequestHeader.order 恒在且小写');
+        $this->check(array_key_exists('order', $ext) && $ext['order'] === 'false', 'PopMessageRequestHeader.order always present and lowercase');
 
-        // SearchOffsetRequestHeader.boundaryType 入网为枚举名大写
+        // SearchOffsetRequestHeader.boundaryType goes on the wire as the uppercase enum name
         $so = new SearchOffsetRequestHeader();
         $so->topic = 't';
         $so->boundaryType = BoundaryType::UPPER;
         $this->checkSame(['topic' => 't', 'boundaryType' => 'UPPER'], $so->toExtFields(), 'SearchOffsetRequestHeader boundaryType=UPPER');
     }
 
-    // ==================================================================== ACL 签名
+    // ==================================================================== ACL signature
 
     private function testAclSignature(): void
     {
-        Logger::setHandler(static function (string $line): void {}); // 测试期间静音
+        Logger::setHandler(static function (string $line): void {}); // silence during tests
 
         $sk = 'sk-fixed-123';
         $hook = new AclClientRPCHook(new SessionCredentials('ak-fixed', $sk));
@@ -352,63 +352,67 @@ final class RunRemoting
         $cmd->body = 'sig-payload';
 
         $hook->doBeforeRequest('127.0.0.1:10911', $cmd);
-        $this->checkSame('ak-fixed', $cmd->getExtField('AccessKey') ?? '', 'ACL AccessKey 已注入');
+        $this->checkSame('ak-fixed', $cmd->getExtField('AccessKey') ?? '', 'ACL AccessKey injected');
         $sig = $cmd->getExtField('Signature') ?? '';
-        $this->checkSame(28, strlen($sig), 'HmacSHA1 Base64 长度恒为 28');
+        $this->checkSame(28, strlen($sig), 'HmacSHA1 Base64 length is always 28');
 
-        // 独立复算：字典序取 extFields 全部 value（排除 Signature）+ body
+        // Independent recomputation: lexicographic extFields values (excluding Signature) + body
         $cmd->makeCustomHeaderToNet();
         $fields = $cmd->extFields;
         unset($fields['Signature']);
         ksort($fields, SORT_STRING);
         $content = implode('', array_map(strval(...), array_values($fields))) . 'sig-payload';
         $expect = base64_encode(hash_hmac('sha1', $content, $sk, true));
-        $this->checkSame($expect, $sig, '签名 = Base64(HmacSHA1(secretKey, 排序 value + body)) 可复算');
+        $this->checkSame($expect, $sig, 'signature = Base64(HmacSHA1(secretKey, sorted values + body)) reproducible');
 
-        // 固定输入 → 确定性签名（同输入两次构建一致）
+        // Fixed input → deterministic signature (two builds of the same input agree)
         $cmd2 = RemotingCommand::createRequestCommand(RequestCode::SEND_MESSAGE, $header);
         $cmd2->body = 'sig-payload';
         $hook->doBeforeRequest('127.0.0.1:10911', $cmd2);
-        $this->checkSame($sig, $cmd2->getExtField('Signature') ?? '', '同输入签名确定');
+        $this->checkSame($sig, $cmd2->getExtField('Signature') ?? '', 'same input produces the same signature');
 
-        // Signature 不参与签名内容
+        // Signature does not participate in the signed content
         $raw = AclClientRPCHook::buildRequestContent($cmd2);
-        $this->check(!str_contains($raw, $sig), 'Signature 不参与签名内容');
+        $this->check(!str_contains($raw, $sig), 'Signature not part of the signed content');
 
-        // securityToken 参与签名
+        // securityToken participates in the signature
         $hookTok = new AclClientRPCHook(new SessionCredentials('ak', 'sk', 'st-1'));
         $cmd4 = new RemotingCommand(RequestCode::HEART_BEAT);
         $hookTok->doBeforeRequest('addr', $cmd4);
-        $this->checkSame('st-1', $cmd4->getExtField('SecurityToken') ?? '', 'SecurityToken 已注入');
+        $this->checkSame('st-1', $cmd4->getExtField('SecurityToken') ?? '', 'SecurityToken injected');
 
-        // AclRpcHook 是 AclClientRPCHook 的兼容别名
+        // AclRpcHook is a compatibility alias of AclClientRPCHook
         $alias = new AclRpcHook(new SessionCredentials('a', 'b'));
-        $this->check($alias instanceof AclClientRPCHook, 'AclRpcHook 兼容别名');
+        $this->check($alias instanceof AclClientRPCHook, 'AclRpcHook compatibility alias');
     }
 
-    // ==================================================================== namespaceV2 钩子
+    // ==================================================================== namespaceV2 hook
 
     /**
-     * 5.x 服务端命名空间钩子（NamespaceRpcHook）。
+     * 5.x server-side namespace hook (NamespaceRpcHook).
      *
-     * 判据（5.x 服务端的命名空间扩展头语义）：
-     *   * doBeforeRequest 只有一段：namespaceV2 非空时加 **两个** 扩展头
-     *     nsd="true" / ns=<namespaceV2>；doAfterResponse 空实现。
-     *   * 空命名空间必须 **完全不碰** extFields —— 判据就是「未配置时请求原样」，
-     *     把 extFields 初始化成空 map 都算错（上线会多一个空对象）。
-     *   * 值是**每笔请求现读**的（每笔取 clientConfig 当前的 namespaceV2），所以 start() 之后
-     *     改配置也从下一笔请求生效；持字符串快照的写法会把这条路堵死。
-     *   * 注册顺序 Namespace → Stream → 用户钩子(ACL) 是语义不是风格：
-     *     nsd/ns 必须先进 extFields 才算得进签名，装反了签名「看着合法」但开鉴权的 broker
-     *     验签多出两个未签字段直接拒签。
+     * Criteria (5.x server namespace extension-header semantics):
+     *   * doBeforeRequest is the only leg: when namespaceV2 is non-empty it adds **two**
+     *     extension headers nsd="true" / ns=<namespaceV2>; doAfterResponse is a no-op.
+     *   * An empty namespace must **not touch** extFields at all — the criterion is
+     *     "the request is untouched when unconfigured"; even initializing extFields to an
+     *     empty map is wrong (in production it would add an empty object).
+     *   * The value is **read per request** (each request takes the clientConfig current
+     *     namespaceV2), so changing the config after start() takes effect from the next
+     *     request; a string-snapshot implementation would block that path.
+     *   * Registration order Namespace → Stream → user hooks(ACL) is semantics, not style:
+     *     nsd/ns must enter extFields before the signature is computed; reversed, the
+     *     signature "looks legal" but an auth-enabled broker rejects it with two extra
+     *     unsigned fields.
      */
     private function testNamespaceRpcHook(): void
     {
-        Logger::setHandler(static function (string $line): void {}); // 测试期间静音
+        Logger::setHandler(static function (string $line): void {}); // silence during tests
 
-        // 字段名按协议约定逐字固定（拼错 = broker 认不出命名空间，静默失败）
-        $this->checkSame('nsd', MixAll::RPC_REQUEST_HEADER_NAMESPACED_FIELD, 'nsd 字段名');
-        $this->checkSame('ns', MixAll::RPC_REQUEST_HEADER_NAMESPACE_FIELD, 'ns 字段名');
+        // Field names are fixed verbatim by the protocol (a typo = the broker does not
+        // recognize the namespace, silent failure)
+        $this->checkSame('nsd', MixAll::RPC_REQUEST_HEADER_NAMESPACED_FIELD, 'nsd field name');
+        $this->checkSame('ns', MixAll::RPC_REQUEST_HEADER_NAMESPACE_FIELD, 'ns field name');
 
         $ns = 'MQ_INST_php_parity';
         $hook = new NamespaceRpcHook($ns);
@@ -417,40 +421,41 @@ final class RunRemoting
         $this->checkSame('true', $cmd->getExtField('nsd') ?? '', 'nsd=true');
         $this->checkSame($ns, $cmd->getExtField('ns') ?? '', 'ns=<namespaceV2>');
 
-        // doAfterResponse 是空实现（响应回来不改写任何字段）
+        // doAfterResponse is a no-op (does not rewrite any field on the way back)
         $after = $cmd->extFields;
         $hook->doAfterResponse('127.0.0.1:10911', $cmd, null);
-        $this->checkSame($after, $cmd->extFields, 'doAfterResponse 不动请求');
+        $this->checkSame($after, $cmd->extFields, 'doAfterResponse leaves the request untouched');
 
-        // 空命名空间 = no-op，而且连 extFields 都不碰（'' 与 null 两条腿）
+        // Empty namespace = no-op, and it does not even touch extFields ('' and null legs)
         foreach (['', null] as $unset) {
             $bare = new RemotingCommand(RequestCode::SEND_MESSAGE);
             $before = $bare->extFields;
             (new NamespaceRpcHook($unset))->doBeforeRequest('a', $bare);
             $this->checkSame($before, $bare->extFields,
-                '未配命名空间时 extFields 原样（' . var_export($unset, true) . '）');
-            $this->check(!array_key_exists('ns', $bare->extFields), 'ns 没被写成空串');
-            $this->check(!array_key_exists('nsd', $bare->extFields), 'nsd 没被写成空串');
+                'extFields untouched when no namespace configured (' . var_export($unset, true) . ')');
+            $this->check(!array_key_exists('ns', $bare->extFields), 'ns not written as an empty string');
+            $this->check(!array_key_exists('nsd', $bare->extFields), 'nsd not written as an empty string');
         }
 
-        // 取值函数每笔请求现读：先空后配，第二笔必须带上（每笔现读 clientConfig 的当前值）
+        // The value provider is read per request: empty first, configured later; the second request must carry it
+        // (each request reads the current clientConfig value)
         $current = '';
         $live = new NamespaceRpcHook(function () use (&$current): string {
             return $current;
         });
         $first = new RemotingCommand(RequestCode::SEND_MESSAGE);
         $live->doBeforeRequest('a', $first);
-        $this->check(!array_key_exists('ns', $first->extFields), '现读：第一笔还没配命名空间');
+        $this->check(!array_key_exists('ns', $first->extFields), 'live read: first request has no namespace yet');
         $current = $ns;
         $second = new RemotingCommand(RequestCode::SEND_MESSAGE);
         $live->doBeforeRequest('a', $second);
-        $this->checkSame($ns, $second->getExtField('ns') ?? '', '现读：改完配置下一笔就生效');
+        $this->checkSame($ns, $second->getExtField('ns') ?? '', 'live read: config change applies to the next request');
         $current = $ns . '_2';
         $third = new RemotingCommand(RequestCode::SEND_MESSAGE);
         $live->doBeforeRequest('a', $third);
-        $this->checkSame($ns . '_2', $third->getExtField('ns') ?? '', '现读：再改再跟');
+        $this->checkSame($ns . '_2', $third->getExtField('ns') ?? '', 'live read: tracks further changes');
 
-        // 顺序：Namespace 排在 ACL 之前 ⇒ ns/nsd 进了签名内容，broker 复算得同一份签名
+        // Order: Namespace before ACL ⇒ ns/nsd enter the signed content; the broker recomputes the same signature
         $sk = 'sk-ns-123';
         $acl = new AclClientRPCHook(new SessionCredentials('ak-ns', $sk));
         $header = new SendMessageRequestHeader();
@@ -460,47 +465,48 @@ final class RunRemoting
 
         $signed = RemotingCommand::createRequestCommand(RequestCode::SEND_MESSAGE, $header);
         $signed->body = 'ns-payload';
-        $hook->doBeforeRequest('a', $signed);          // 先写 nsd/ns
-        $acl->doBeforeRequest('a', $signed);           // 再算签名（命名空间头必须先进 extFields）
+        $hook->doBeforeRequest('a', $signed);          // write nsd/ns first
+        $acl->doBeforeRequest('a', $signed);           // then sign (namespace headers must enter extFields first)
         $sigWithNs = $signed->getExtField('Signature') ?? '';
-        $this->check($sigWithNs !== '', '链式签名已生成');
+        $this->check($sigWithNs !== '', 'chained signature generated');
 
-        // 独立复算 broker 视角：字典序 value（排除 Signature）+ body
+        // Independent broker-side recomputation: lexicographic values (excluding Signature) + body
         $verify = $signed->extFields;
         unset($verify[SessionCredentials::SIGNATURE]);
         ksort($verify, SORT_STRING);
         $content = implode('', array_map(strval(...), array_values($verify))) . 'ns-payload';
         $this->checkSame(base64_encode(hash_hmac('sha1', $content, $sk, true)), $sigWithNs,
-            'nsd/ns 在签名内容里（broker 按上线字段复算能通过）');
+            'nsd/ns are in the signed content (the broker recomputing over the wire fields passes)');
 
-        // 反证：同一请求若不先装 Namespace 钩子，签名必然不同 —— 顺序写反就是验签失败
+        // Counter-proof: the same request signed without the Namespace hook first necessarily differs —
+        // reversed order means signature verification fails
         $noNs = RemotingCommand::createRequestCommand(RequestCode::SEND_MESSAGE, $header);
         $noNs->body = 'ns-payload';
         $acl->doBeforeRequest('a', $noNs);
         $this->check($sigWithNs !== ($noNs->getExtField('Signature') ?? ''),
-            '不先装 Namespace 就签不出同一份内容');
+            'without the Namespace hook first, the same content cannot be signed');
 
-        // Stream 也在 ACL 之前：ReqT 与 ns 同时进签名
+        // Stream also runs before ACL: ReqT and ns both enter the signature
         $chain = RemotingCommand::createRequestCommand(RequestCode::SEND_MESSAGE, $header);
         $chain->body = 'ns-payload';
         (new NamespaceRpcHook($ns))->doBeforeRequest('a', $chain);
         (new StreamTypeRPCHook())->doBeforeRequest('a', $chain);
         $acl->doBeforeRequest('a', $chain);
-        $this->checkSame('true', $chain->getExtField('nsd') ?? '', '链上 nsd 仍在');
-        $this->check(($chain->getExtField('ReqT') ?? '') !== '', '链上 ReqT 已写入');
+        $this->checkSame('true', $chain->getExtField('nsd') ?? '', 'nsd still present on the chain');
+        $this->check(($chain->getExtField('ReqT') ?? '') !== '', 'ReqT written on the chain');
         $chainVerify = $chain->extFields;
         unset($chainVerify[SessionCredentials::SIGNATURE]);
         ksort($chainVerify, SORT_STRING);
         $chainContent = implode('', array_map(strval(...), array_values($chainVerify))) . 'ns-payload';
         $this->checkSame(base64_encode(hash_hmac('sha1', $chainContent, $sk, true)),
-            $chain->getExtField('Signature') ?? '', 'ns + ReqT 一并进签名（命名空间头先于签名计算）');
+            $chain->getExtField('Signature') ?? '', 'ns + ReqT both in the signature (namespace headers computed before the signature)');
     }
 
-    // ==================================================================== 路由解码
+    // ==================================================================== route decoding
 
     private function testRouteDecode(): void
     {
-        // fastjson2 非标准 JSON：数字键不带引号
+        // fastjson2 non-standard JSON: numeric keys without quotes
         $raw = '{"orderTopicConf":null,'
             . '"queueDatas":[{"brokerName":"broker-a","readQueueNums":8,"writeQueueNums":8,"perm":6,"topicSysFlag":0},'
             . '{"brokerName":"broker-b","readQueueNums":4,"writeQueueNums":4,"perm":4,"topicSysFlag":0}],'
@@ -508,50 +514,50 @@ final class RunRemoting
             . '{"brokerAddrs":{0:"10.0.0.2:10911"},"brokerName":"broker-b","cluster":"DefaultCluster","enableActingMaster":false}],'
             . '"filterServerTable":{}}';
         $route = TopicRouteData::decode($raw);
-        $this->checkSame(2, count($route->queueDatas), 'fastjson 数字键解码 queueDatas');
-        $this->checkSame(2, count($route->brokerDatas), 'fastjson 数字键解码 brokerDatas');
+        $this->checkSame(2, count($route->queueDatas), 'fastjson numeric-key decode of queueDatas');
+        $this->checkSame(2, count($route->brokerDatas), 'fastjson numeric-key decode of brokerDatas');
         $this->checkSame('broker-a', $route->queueDatas[0]->brokerName, 'QueueData.brokerName');
         $this->checkSame(8, $route->queueDatas[0]->readQueueNums, 'QueueData.readQueueNums');
-        $this->checkSame([0 => '10.0.0.1:10911', 1 => '10.0.0.1:10921'], $route->brokerDatas[0]->brokerAddrs, 'BrokerData.brokerAddrs 数字键还原');
+        $this->checkSame([0 => '10.0.0.1:10911', 1 => '10.0.0.1:10921'], $route->brokerDatas[0]->brokerAddrs, 'BrokerData.brokerAddrs numeric keys restored');
 
-        // 发布侧：可写 + master 才收
+        // publish side: writable + master required
         $mqs = $route->getAllMessageQueue('T');
-        $this->checkSame(8, count($mqs), '发布侧 broker-a 8 个写队列');
-        $this->check($mqs[0]->topic === 'T' && $mqs[0]->brokerName === 'broker-a' && $mqs[0]->queueId === 0, 'MessageQueue(topic 回填, broker, queueId)');
-        // broker-b 只有读位（perm=4）→ 不进发布信息
+        $this->checkSame(8, count($mqs), 'publish side: broker-a 8 write queues');
+        $this->check($mqs[0]->topic === 'T' && $mqs[0]->brokerName === 'broker-a' && $mqs[0]->queueId === 0, 'MessageQueue(topic backfill, broker, queueId)');
+        // broker-b has read-only permission (perm=4) -> excluded from publish info
         $names = array_map(static fn(MessageQueue $mq): string => $mq->brokerName, $mqs);
-        $this->check(!in_array('broker-b', $names, true), 'perm=4 的 broker 不进发布侧');
-        // 订阅侧：只看读位，不要求 master
+        $this->check(!in_array('broker-b', $names, true), 'broker with perm=4 excluded from publish side');
+        // subscribe side: read permission only, master not required
         $subMqs = $route->getAllSubscribeMessageQueue('T');
-        $this->checkSame(12, count($subMqs), '订阅侧 8+4 读队列');
+        $this->checkSame(12, count($subMqs), 'subscribe side: 8+4 read queues');
 
-        // master 缺失的 broker 不进发布信息
+        // brokers without a master addr are skipped for publish info
         $route2 = new TopicRouteData();
         $qd = new QueueData('b1', 2, 2, 6);
         $route2->queueDatas = [$qd];
         $bdNoMaster = new BrokerData('c', 'b1', [1 => '10.0.0.9:10921']);
         $route2->brokerDatas = [$bdNoMaster];
-        $this->checkSame([], $route2->getAllMessageQueue('T'), '无 master 的 broker 跳过（发布侧）');
-        $this->checkSame(2, count($route2->getAllSubscribeMessageQueue('T')), '无 master 照样可订阅（订阅侧）');
+        $this->checkSame([], $route2->getAllMessageQueue('T'), 'broker without master skipped (publish side)');
+        $this->checkSame(2, count($route2->getAllSubscribeMessageQueue('T')), 'subscription still works without master (subscribe side)');
 
-        $this->checkSame('10.0.0.1:10911', $route->brokerDatas[0]->selectBrokerAddr(), 'selectBrokerAddr 优先 master');
-        $this->checkSame('10.0.0.9:10921', $route2->brokerDatas[0]->selectBrokerAddr(), '无 master 随机取（单元素）');
-        $this->checkSame(null, (new BrokerData('c', 'b2', []))->selectBrokerAddr(), '空 brokerAddrs → null');
+        $this->checkSame('10.0.0.1:10911', $route->brokerDatas[0]->selectBrokerAddr(), 'selectBrokerAddr prefers master');
+        $this->checkSame('10.0.0.9:10921', $route2->brokerDatas[0]->selectBrokerAddr(), 'no master: random pick (single element)');
+        $this->checkSame(null, (new BrokerData('c', 'b2', []))->selectBrokerAddr(), 'empty brokerAddrs -> null');
 
-        // 严格 JSON 也能解
+        // strict JSON also decodes
         $strict = json_encode($route->toDict(), JSON_UNESCAPED_SLASHES);
         $route3 = TopicRouteData::decode((string)$strict);
-        $this->checkSame(2, count($route3->queueDatas), '严格 JSON 解码 queueDatas');
-        $this->check($route3->topicRouteDataChanged($route) === false, '内容相同 → 路由未变化');
+        $this->checkSame(2, count($route3->queueDatas), 'strict JSON decode of queueDatas');
+        $this->check($route3->topicRouteDataChanged($route) === false, 'identical content -> route unchanged');
         $route3->queueDatas[0]->readQueueNums = 9;
-        $this->check($route3->topicRouteDataChanged($route) === true, 'queueNums 变化 → 路由变化');
+        $this->check($route3->topicRouteDataChanged($route) === true, 'queueNums changed -> route changed');
 
-        // encode → decode 往返
+        // encode -> decode roundtrip
         $route4 = TopicRouteData::decode($route->encode());
-        $this->checkSame($route->queueDatas[0]->brokerName, $route4->queueDatas[0]->brokerName, 'TopicRouteData encode/decode 往返');
+        $this->checkSame($route->queueDatas[0]->brokerName, $route4->queueDatas[0]->brokerName, 'TopicRouteData encode/decode roundtrip');
     }
 
-    // ==================================================================== 心跳
+    // ==================================================================== heartbeat
 
     private function testHeartbeat(): void
     {
@@ -564,20 +570,20 @@ final class RunRemoting
         $hb->consumerDataSet[] = $cd;
 
         $obj = $hb->toDict();
-        $this->checkSame('cid-php-1', $obj['clientID'], 'HeartbeatData.clientID 键名');
-        $this->checkSame(0, $obj['heartbeatFingerprint'], 'heartbeatFingerprint 恒 0（V1 注册路径）');
-        $this->checkSame(false, $obj['withoutSub'], 'withoutSub 恒 false');
+        $this->checkSame('cid-php-1', $obj['clientID'], 'HeartbeatData.clientID key name');
+        $this->checkSame(0, $obj['heartbeatFingerprint'], 'heartbeatFingerprint always 0 (V1 registration path)');
+        $this->checkSame(false, $obj['withoutSub'], 'withoutSub always false');
         $this->checkSame('GID-c', $obj['consumerDataSet'][0]['groupName'], 'ConsumerData.groupName');
         $this->checkSame('CLUSTERING', $obj['consumerDataSet'][0]['messageModel'], 'ConsumerData.messageModel');
-        $this->checkSame('*', $obj['consumerDataSet'][0]['subscriptionDataSet'][0]['subString'], 'subscriptionDataSet 走 toDict');
-        $this->checkSame('TAG', $obj['consumerDataSet'][0]['subscriptionDataSet'][0]['expressionType'], 'expressionType 默认 TAG');
+        $this->checkSame('*', $obj['consumerDataSet'][0]['subscriptionDataSet'][0]['subString'], 'subscriptionDataSet goes through toDict');
+        $this->checkSame('TAG', $obj['consumerDataSet'][0]['subscriptionDataSet'][0]['expressionType'], 'expressionType defaults to TAG');
 
         $back = HeartbeatData::decode($hb->encode());
-        $this->checkSame($hb->clientId, $back->clientId, 'HeartbeatData 往返 clientId');
-        $this->checkSame(1, count($back->consumerDataSet), 'HeartbeatData 往返 consumerDataSet');
-        $this->checkSame('*', $back->consumerDataSet[0]->subscriptionDataSet[0]->subString ?? '', 'HeartbeatData 往返 subscription');
-        $this->checkSame(42, $back->consumerDataSet[0]->subscriptionDataSet[0]->subVersion ?? 0, 'HeartbeatData 往返 subVersion');
-        $this->checkSame('GID-p', $back->producerDataSet[0]->groupName ?? '', 'HeartbeatData 往返 producerDataSet');
+        $this->checkSame($hb->clientId, $back->clientId, 'HeartbeatData roundtrip clientId');
+        $this->checkSame(1, count($back->consumerDataSet), 'HeartbeatData roundtrip consumerDataSet');
+        $this->checkSame('*', $back->consumerDataSet[0]->subscriptionDataSet[0]->subString ?? '', 'HeartbeatData roundtrip subscription');
+        $this->checkSame(42, $back->consumerDataSet[0]->subscriptionDataSet[0]->subVersion ?? 0, 'HeartbeatData roundtrip subVersion');
+        $this->checkSame('GID-p', $back->producerDataSet[0]->groupName ?? '', 'HeartbeatData roundtrip producerDataSet');
     }
 
     // ==================================================================== ExtraInfo / Namespace
@@ -585,103 +591,103 @@ final class RunRemoting
     private function testExtraInfoAndNamespace(): void
     {
         $ck = ExtraInfoUtil::buildExtraInfo(5, 1000, 30000, 2, 'TopicTest', 'broker-a', 3, 17);
-        $this->checkSame('5 1000 30000 2 0 broker-a 3 17', $ck, 'buildExtraInfo 8 段（普通 topic，空格分隔）');
+        $this->checkSame('5 1000 30000 2 0 broker-a 3 17', $ck, 'buildExtraInfo 8 segments (normal topic, space separated)');
         $segs = ExtraInfoUtil::split($ck);
-        $this->checkSame(8, count($segs), 'split 得 8 段');
+        $this->checkSame(8, count($segs), 'split yields 8 segments');
         $this->checkSame(5, ExtraInfoUtil::getCkQueueOffset($segs), 'getCkQueueOffset');
         $this->checkSame(1000, ExtraInfoUtil::getPopTime($segs), 'getPopTime');
         $this->checkSame(30000, ExtraInfoUtil::getInvisibleTime($segs), 'getInvisibleTime');
         $this->checkSame(2, ExtraInfoUtil::getReviveQid($segs), 'getReviveQid');
-        $this->checkSame('0', ExtraInfoUtil::getRetry($segs), 'getRetry(普通)');
+        $this->checkSame('0', ExtraInfoUtil::getRetry($segs), 'getRetry (normal)');
         $this->checkSame('broker-a', ExtraInfoUtil::getBrokerName($segs), 'getBrokerName');
         $this->checkSame(3, ExtraInfoUtil::getQueueId($segs), 'getQueueId');
         $this->checkSame(17, ExtraInfoUtil::getQueueOffset($segs), 'getQueueOffset');
-        $this->check(ExtraInfoUtil::isOrder($segs) === false, '非 999 不是顺序消费');
+        $this->check(ExtraInfoUtil::isOrder($segs) === false, 'non-999 means not ordered consumption');
 
         $ck7 = ExtraInfoUtil::buildExtraInfo(1, 2, 3, 4, 'TopicTest', 'b', 0);
-        $this->checkSame('1 2 3 4 0 b 0', $ck7, 'buildExtraInfo 7 段');
-        $this->checkThrows(static fn(): int => ExtraInfoUtil::getQueueOffset(ExtraInfoUtil::split($ck7)), \InvalidArgumentException::class, '段数不足抛异常');
+        $this->checkSame('1 2 3 4 0 b 0', $ck7, 'buildExtraInfo 7 segments');
+        $this->checkThrows(static fn(): int => ExtraInfoUtil::getQueueOffset(ExtraInfoUtil::split($ck7)), \InvalidArgumentException::class, 'throws when segments are insufficient');
 
-        // retry topic 形状
+        // retry topic shapes
         $this->checkSame('1', ExtraInfoUtil::retryOfTopic('%RETRY%GID_topic'), 'V1 retry');
         $this->checkSame('2', ExtraInfoUtil::retryOfTopic('%RETRY%GID+topic'), 'V2 retry');
-        $this->checkSame('0', ExtraInfoUtil::retryOfTopic('NormalTopic'), '普通');
+        $this->checkSame('0', ExtraInfoUtil::retryOfTopic('NormalTopic'), 'normal topic');
         $this->checkSame('%RETRY%GID_topic', ExtraInfoUtil::getRealTopic('topic', 'GID', '1'), 'getRealTopic V1');
         $this->checkSame('%RETRY%GID+topic', ExtraInfoUtil::getRealTopic('topic', 'GID', '2'), 'getRealTopic V2');
-        $this->checkSame('topic', ExtraInfoUtil::getRealTopic('topic', 'GID', '0'), 'getRealTopic 普通');
+        $this->checkSame('topic', ExtraInfoUtil::getRealTopic('topic', 'GID', '0'), 'getRealTopic normal');
         $this->checkSame('%RETRY%G_topic', ExtraInfoUtil::buildPopRetryTopicV1('topic', 'G'), 'buildPopRetryTopicV1');
         $this->checkSame('%RETRY%G+topic', ExtraInfoUtil::buildPopRetryTopicV2('topic', 'G'), 'buildPopRetryTopicV2');
         $this->check(ExtraInfoUtil::isPopRetryTopicV2('%RETRY%G+topic'), 'isPopRetryTopicV2');
-        $this->check(!ExtraInfoUtil::isPopRetryTopicV2('%RETRY%G_topic'), 'V1 不是 V2');
+        $this->check(!ExtraInfoUtil::isPopRetryTopicV2('%RETRY%G_topic'), 'V1 is not V2');
         $orderSegs = ExtraInfoUtil::split(ExtraInfoUtil::buildExtraInfo(0, 0, 0, 999, 't', 'b', 0));
-        $this->check(ExtraInfoUtil::isOrder($orderSegs), 'reviveQid=999 → isOrder');
+        $this->check(ExtraInfoUtil::isOrder($orderSegs), 'reviveQid=999 -> isOrder');
 
         // startOffsetInfo / msgOffsetInfo
         $start = ExtraInfoUtil::parseStartOffsetInfo('0 3 0;0 2 0');
         $this->checkSame(['0@3' => 0, '0@2' => 0], $start, 'parseStartOffsetInfo');
         $msg = ExtraInfoUtil::parseMsgOffsetInfo('0 3 0,1,2;0 2 5');
-        $this->checkSame([0, 1, 2], $msg['0@3'] ?? [], 'parseMsgOffsetInfo 列表');
-        $this->checkSame([5], $msg['0@2'] ?? [], 'parseMsgOffsetInfo 单条');
+        $this->checkSame([0, 1, 2], $msg['0@3'] ?? [], 'parseMsgOffsetInfo list');
+        $this->checkSame([5], $msg['0@2'] ?? [], 'parseMsgOffsetInfo single');
         $order = ExtraInfoUtil::parseOrderCountInfo('0 3 2');
         $this->checkSame(['0@3' => 2], $order, 'parseOrderCountInfo');
         $this->checkSame(null, ExtraInfoUtil::parseStartOffsetInfo(null), 'null → null');
-        $this->checkThrows(static fn(): ?array => ExtraInfoUtil::parseStartOffsetInfo('0 3'), \InvalidArgumentException::class, 'startOffsetInfo 段数错');
+        $this->checkThrows(static fn(): ?array => ExtraInfoUtil::parseStartOffsetInfo('0 3'), \InvalidArgumentException::class, 'startOffsetInfo wrong segment count');
 
         $this->checkSame('0@3', ExtraInfoUtil::getStartOffsetInfoMapKey('TopicTest', 3), 'getStartOffsetInfoMapKey');
         $this->checkSame('qo3%17', ExtraInfoUtil::getQueueOffsetKeyValueKey(3, 17), 'getQueueOffsetKeyValueKey');
         $this->checkSame('0@qo3%17', ExtraInfoUtil::getQueueOffsetMapKey('TopicTest', 3, 17), 'getQueueOffsetMapKey');
-        $this->checkSame('2@qo0%9', ExtraInfoUtil::getQueueOffsetMapKey('%RETRY%G+t', 0, 9), 'V2 topic 的 map key');
+        $this->checkSame('2@qo0%9', ExtraInfoUtil::getQueueOffsetMapKey('%RETRY%G+t', 0, 9), 'map key for V2 topic');
 
         // NamespaceUtil
-        $this->checkSame('Topic', NamespaceUtil::withoutNamespace('MQ_INST_XX%Topic'), 'withoutNamespace 普通');
+        $this->checkSame('Topic', NamespaceUtil::withoutNamespace('MQ_INST_XX%Topic'), 'withoutNamespace normal');
         $this->checkSame('%RETRY%GID', NamespaceUtil::withoutNamespace('%RETRY%MQ_INST_XX%GID'), 'withoutNamespace retry');
-        $this->checkSame('MQ_INST_YY%Topic', NamespaceUtil::withoutNamespace('MQ_INST_YY%Topic', 'MQ_INST_XX'), '命名空间不符原样返回');
+        $this->checkSame('MQ_INST_YY%Topic', NamespaceUtil::withoutNamespace('MQ_INST_YY%Topic', 'MQ_INST_XX'), 'mismatched namespace returned as-is');
         $this->checkSame('MQ_INST_XX%Topic', NamespaceUtil::wrapNamespace('MQ_INST_XX', 'Topic'), 'wrapNamespace');
         $this->checkSame('%RETRY%MQ_INST_XX%GID', NamespaceUtil::wrapNamespaceAndRetry('MQ_INST_XX', 'GID'), 'wrapNamespaceAndRetry');
         $this->checkSame('MQ_INST_XX', NamespaceUtil::getNamespaceFromResource('MQ_INST_XX%Topic'), 'getNamespaceFromResource');
-        $this->checkSame('', NamespaceUtil::getNamespaceFromResource('rmq_sys_ROUTE'), '系统 topic 无命名空间');
-        $this->check(!NamespaceUtil::isAlreadyWithNamespace('Topic', 'NS'), '未带命名空间判定');
-        $this->check(NamespaceUtil::isAlreadyWithNamespace('NS%Topic', 'NS'), '已带命名空间判定');
+        $this->checkSame('', NamespaceUtil::getNamespaceFromResource('rmq_sys_ROUTE'), 'system topic has no namespace');
+        $this->check(!NamespaceUtil::isAlreadyWithNamespace('Topic', 'NS'), 'not namespaced check');
+        $this->check(NamespaceUtil::isAlreadyWithNamespace('NS%Topic', 'NS'), 'already namespaced check');
     }
 
-    // ==================================================================== fastjson 兼容解析
+    // ==================================================================== fastjson-compatible parsing
 
     private function testFastjsonParser(): void
     {
         $v = RemotingSerializable::fastjsonLoads('{"a":1,"b":[1,2,{"c":"x"}],"d":{0:"z",1:"y"},"e":true,"f":null}');
-        $this->checkSame(1, $v['a'], 'fastjson 数字值');
-        $this->checkSame('x', $v['b'][2]['c'], 'fastjson 嵌套');
-        $this->checkSame('z', $v['d']['0'], 'fastjson 裸数字键');
+        $this->checkSame(1, $v['a'], 'fastjson numeric value');
+        $this->checkSame('x', $v['b'][2]['c'], 'fastjson nesting');
+        $this->checkSame('z', $v['d']['0'], 'fastjson bare numeric key');
         $this->checkSame(true, $v['e'], 'fastjson true');
         $this->checkSame(null, $v['f'], 'fastjson null');
 
         $v2 = RemotingSerializable::fastjsonLoads('{"g":1.5,"h":NaN,"i":Infinity,"j":-Infinity,}');
-        $this->checkSame(1.5, $v2['g'], 'fastjson 浮点');
-        $this->check(is_nan($v2['h']) && is_infinite($v2['i']) && $v2['j'] === -INF, 'fastjson NaN/Infinity 容忍');
-        $this->check($v2 !== null, 'fastjson 尾随逗号容忍');
+        $this->checkSame(1.5, $v2['g'], 'fastjson float');
+        $this->check(is_nan($v2['h']) && is_infinite($v2['i']) && $v2['j'] === -INF, 'fastjson tolerates NaN/Infinity');
+        $this->check($v2 !== null, 'fastjson tolerates trailing comma');
 
-        // MessageQueue 内联对象键
+        // MessageQueue inline object key
         $v3 = RemotingSerializable::fastjsonLoads(
             '{"offsetTable":{{"brokerName":"b","queueId":3,"topic":"t"}:{"minOffset":0,"maxOffset":9}}}'
         );
-        $this->check(isset($v3['offsetTable']), '内联对象键可解析');
+        $this->check(isset($v3['offsetTable']), 'inline object key parses');
         $key = (string)array_key_first($v3['offsetTable']);
         $mq = RemotingSerializable::decodeMessageQueueKey($key);
-        $this->check($mq !== null && $mq['topic'] === 't' && $mq['brokerName'] === 'b' && $mq['queueId'] === 3, 'decodeMessageQueueKey 还原');
-        $this->checkSame(null, RemotingSerializable::decodeMessageQueueKey('plain-key'), '普通字符串键 → null');
+        $this->check($mq !== null && $mq['topic'] === 't' && $mq['brokerName'] === 'b' && $mq['queueId'] === 3, 'decodeMessageQueueKey restores');
+        $this->checkSame(null, RemotingSerializable::decodeMessageQueueKey('plain-key'), 'plain string key -> null');
 
-        // 中文 / 转义
+        // CJK / escapes
         $v4 = RemotingSerializable::fastjsonLoads('{"s":"中文\\n\"q\""}');
-        $this->checkSame("中文\n\"q\"", $v4['s'], 'fastjson 中文与转义');
-        $this->checkThrows(static fn() => RemotingSerializable::fastjsonLoads('{"a":}'), FastJsonDecodeError::class, '非法输入抛 FastJsonDecodeError');
+        $this->checkSame("中文\n\"q\"", $v4['s'], 'fastjson CJK and escapes');
+        $this->checkThrows(static fn() => RemotingSerializable::fastjsonLoads('{"a":}'), FastJsonDecodeError::class, 'invalid input throws FastJsonDecodeError');
 
         // encode
-        $this->checkSame('', RemotingSerializable::encode(null), 'encode(null) → 空串');
-        $this->checkSame('raw', RemotingSerializable::encode('raw'), 'encode(bytes) 原样');
-        $this->checkSame('{"k":"v","u":"中/文"}', RemotingSerializable::encode(['k' => 'v', 'u' => '中/文']), 'encode 不转义中文与斜杠');
+        $this->checkSame('', RemotingSerializable::encode(null), 'encode(null) -> empty string');
+        $this->checkSame('raw', RemotingSerializable::encode('raw'), 'encode(bytes) passes through');
+        $this->checkSame('{"k":"v","u":"中/文"}', RemotingSerializable::encode(['k' => 'v', 'u' => '中/文']), 'encode does not escape CJK or slash');
     }
 
-    // ==================================================================== TCP 端到端
+    // ==================================================================== TCP end-to-end
 
     /** @return array{0: resource, 1: string} [server, addr] */
     private static function startEchoServer(): array
@@ -694,7 +700,7 @@ final class RunRemoting
         return [$server, (string)$name];
     }
 
-    /** 精确读 n 字节（阻塞）。 */
+    /** Reads exactly n bytes (blocking). */
     private static function readExact($stream, int $n): string
     {
         $buf = '';
@@ -708,7 +714,7 @@ final class RunRemoting
         return $buf;
     }
 
-    /** 从 server 侧读走一整帧并解码。 */
+    /** Reads and decodes one full frame from the server side. */
     private static function readFrame($conn): RemotingCommand
     {
         $total = RocketMQSerializable::unpackSignedInt(self::readExact($conn, 4));
@@ -716,14 +722,16 @@ final class RunRemoting
     }
 
     /**
-     * 建连并 accept。
+     * Establish the connection and accept it.
      *
-     * 客户端建连是**惰性**的（首次 send 才 connect），而 PHP 单线程里
-     * `invokeSync` 会一直阻塞在读响应上。所以测试先用一次 `invokeOneway` 把 TCP 连接
-     * 建起来（oneway 只写不等响应），再从 server 侧 accept，并丢弃这帧握手请求。
+     * Client connection is **lazy** (connect happens on first send), and in a
+     * single-threaded PHP script `invokeSync` blocks waiting for a response.
+     * So the test first uses one `invokeOneway` to bring up the TCP connection
+     * (oneway writes without waiting), then accepts on the server side and
+     * discards this handshake request frame.
      *
      * @param resource $server
-     * @return resource 已 accept 的 server 侧连接（阻塞模式）
+     * @return resource the accepted server-side connection (blocking mode)
      */
     private static function connectAndAccept(RemotingClient $client, string $addr, $server)
     {
@@ -733,13 +741,13 @@ final class RunRemoting
             throw new \RuntimeException('test server: accept failed');
         }
         stream_set_blocking($conn, true);
-        self::readFrame($conn); // 丢弃握手 oneway 帧
+        self::readFrame($conn); // discard the handshake oneway frame
         return $conn;
     }
 
     private function testTcpEndToEnd(): void
     {
-        // ---- 1. 同步 RPC：server 校验请求并回响应；连接复用 ----
+        // ---- 1. sync RPC: server validates request and replies; connection reuse ----
         [$server, $addr] = self::startEchoServer();
         $client = new RemotingClient(1000, 3000);
 
@@ -753,8 +761,10 @@ final class RunRemoting
         $conn = self::connectAndAccept($client, $addr, $server);
         $this->check(is_resource($conn), 'e2e: server accept');
 
-        // 单线程里 invokeSync 会阻塞在读响应上，服务端代码跑不到 → 先把响应写进连接缓冲
-        // （opaque 构造时已知），等 invokeSync 返回后再回读服务端收到的请求帧做断言。
+        // In a single thread invokeSync blocks on reading the response before the server-side
+        // code runs -> write the response into the connection buffer first (the opaque is known
+        // at construction), then after invokeSync returns read back the request frame the server
+        // received and assert on it.
         $respHeader = new SendMessageResponseHeader();
         $respHeader->msgId = 'MSG-1';
         $respHeader->queueId = 1;
@@ -765,55 +775,56 @@ final class RunRemoting
         fwrite($conn, $resp->encode());
 
         $got = $client->invokeSync($addr, $req, 3000);
-        $this->checkSame(ResponseCode::SUCCESS, $got->code, 'e2e: invokeSync 拿到响应 code');
-        $this->checkSame($req->opaque, $got->opaque, 'e2e: opaque 对上');
-        $this->checkSame('resp-body', $got->body, 'e2e: 响应 body');
+        $this->checkSame(ResponseCode::SUCCESS, $got->code, 'e2e: invokeSync got response code');
+        $this->checkSame($req->opaque, $got->opaque, 'e2e: opaque matches');
+        $this->checkSame('resp-body', $got->body, 'e2e: response body');
         $hdr = $got->decodeCommandCustomHeader(SendMessageResponseHeader::class);
-        $this->check($hdr instanceof SendMessageResponseHeader, 'decodeCommandCustomHeader 返回 header 对象');
+        $this->check($hdr instanceof SendMessageResponseHeader, 'decodeCommandCustomHeader returns header object');
         $this->checkSame('MSG-1', $hdr->msgId, 'decodeCommandCustomHeader msgId');
-        $this->checkSame(1, $hdr->queueId, 'decodeCommandCustomHeader queueId(int 转换)');
+        $this->checkSame(1, $hdr->queueId, 'decodeCommandCustomHeader queueId (int cast)');
         $this->checkSame(99, $hdr->queueOffset, 'decodeCommandCustomHeader queueOffset');
 
-        // 回读服务端侧真正收到的请求帧
+        // read back the request frame the server side actually received
         $srvCmd = self::readFrame($conn);
-        $this->checkSame(RequestCode::SEND_MESSAGE, $srvCmd->code, 'e2e: server 收到请求 code');
-        $this->checkSame('e2e-body', $srvCmd->body, 'e2e: server 收到请求 body');
-        $this->checkSame('GID-e2e', $srvCmd->getExtField('producerGroup') ?? '', 'e2e: server 收到 header 落地字段');
-        $this->check(!$srvCmd->isResponseType(), 'e2e: 请求不带响应标志');
+        $this->checkSame(RequestCode::SEND_MESSAGE, $srvCmd->code, 'e2e: server received request code');
+        $this->checkSame('e2e-body', $srvCmd->body, 'e2e: server received request body');
+        $this->checkSame('GID-e2e', $srvCmd->getExtField('producerGroup') ?? '', 'e2e: server received header field landed');
+        $this->check(!$srvCmd->isResponseType(), 'e2e: request carries no response flag');
 
-        // 连接复用：第二个请求走同一连接
+        // connection reuse: the second request uses the same connection
         $req2 = RemotingCommand::createRequestCommand(RequestCode::HEART_BEAT);
         $resp2 = RemotingCommand::createResponseCommand(ResponseCode::SUCCESS, 'hb-ok');
         $resp2->opaque = $req2->opaque;
         fwrite($conn, $resp2->encode());
         $got2 = $client->invokeSync($addr, $req2, 3000);
-        $this->checkSame('hb-ok', $got2->remark ?? '', 'e2e: 复用连接 invokeSync 成功');
+        $this->checkSame('hb-ok', $got2->remark ?? '', 'e2e: invokeSync succeeds on reused connection');
         $srvCmd2 = self::readFrame($conn);
-        $this->checkSame(RequestCode::HEART_BEAT, $srvCmd2->code, 'e2e: 复用连接上的第二个请求');
+        $this->checkSame(RequestCode::HEART_BEAT, $srvCmd2->code, 'e2e: second request on reused connection');
         fclose($conn);
         $client->shutdown();
         fclose($server);
 
-        // ---- 2. oneway + broker 主动请求 + 异步 ----
+        // ---- 2. oneway + broker-initiated request + async ----
         [$server2, $addr2] = self::startEchoServer();
         $client2 = new RemotingClient(1000, 3000);
         $connA = self::connectAndAccept($client2, $addr2, $server2);
 
-        // 2a. oneway：flag 位带 oneway 标记
+        // 2a. oneway: flag bits carry the oneway marker
         $ow = RemotingCommand::createRequestCommand(RequestCode::NOTIFY_CONSUMER_IDS_CHANGED, new NotifyConsumerIdsChangedRequestHeader());
         $client2->invokeOneway($addr2, $ow);
         $srvO = self::readFrame($connA);
-        $this->check($srvO->isOnewayRPC(), 'oneway 请求 flag 位');
+        $this->check($srvO->isOnewayRPC(), 'oneway request flag bits');
 
-        // 2b. broker 主动请求（processor）：server 发 CHECK_TRANSACTION_STATE，客户端处理器回响应
+        // 2b. broker-initiated request (processor): server sends CHECK_TRANSACTION_STATE, client processor replies
         $seen = null;
         $client2->registerProcessor(RequestCode::CHECK_TRANSACTION_STATE, static function (RemotingCommand $c, string $from) use (&$seen): ?RemotingCommand {
             $seen = $c;
             return RemotingCommand::createResponseCommand(ResponseCode::SUCCESS, 'processed');
         });
 
-        // PHP 单线程没有独立 IO 线程：broker 主动请求必须靠泵读进来。这里先发起 2c 要用的
-        // 异步请求（写出去后 pending 非空），用它驱动 waitResponses 的读循环。
+        // Single-threaded PHP has no dedicated IO thread: broker-initiated requests must be
+        // pumped in via reads. First issue the async request needed by 2c (once written,
+        // pending is non-empty), using it to drive the read loop of waitResponses.
         $asyncResult = null;
         $asyncError = null;
         $reqA = RemotingCommand::createRequestCommand(RequestCode::GET_ROUTEINFO_BY_TOPIC, new GetRouteInfoRequestHeader());
@@ -829,45 +840,46 @@ final class RunRemoting
             3000
         );
         $srvA = self::readFrame($connA);
-        $this->checkSame(RequestCode::GET_ROUTEINFO_BY_TOPIC, $srvA->code, 'e2e: 异步请求已上线');
+        $this->checkSame(RequestCode::GET_ROUTEINFO_BY_TOPIC, $srvA->code, 'e2e: async request on the wire');
 
         $pushReq = RemotingCommand::createRequestCommand(RequestCode::CHECK_TRANSACTION_STATE, new CheckTransactionStateRequestHeader());
         $pushReq->opaque = 4321;
         $pushReq->body = 'check-me';
         fwrite($connA, $pushReq->encode());
-        // 泵一把：读到 pushReq → 交给 processor → 响应写回 connA（异步那条还没响应，pending 非空）
+        // Pump once: read pushReq -> hand to processor -> response written back to connA
+        // (the async one has no response yet, pending is non-empty)
         $client2->waitResponses(300);
         $gotResp = self::readFrame($connA);
-        $this->check($seen !== null && $seen->body === 'check-me', 'processor 收到 broker 主动请求');
-        $this->check($gotResp->isResponseType(), 'processor 响应带响应标志');
-        $this->checkSame(4321, $gotResp->opaque, 'processor 响应 opaque 回填');
-        $this->checkSame('processed', $gotResp->remark ?? '', 'processor 响应 remark');
+        $this->check($seen !== null && $seen->body === 'check-me', 'processor received broker-initiated request');
+        $this->check($gotResp->isResponseType(), 'processor response carries response flag');
+        $this->checkSame(4321, $gotResp->opaque, 'processor response opaque backfilled');
+        $this->checkSame('processed', $gotResp->remark ?? '', 'processor response remark');
         $client2->unregisterProcessor(RequestCode::CHECK_TRANSACTION_STATE);
 
-        // 2c. 异步：server 回响应后 waitResponses 泵到回调
+        // 2c. async: after the server replies, waitResponses pumps to the callback
         $respA = RemotingCommand::createResponseCommand(ResponseCode::SUCCESS, 'route-ok');
         $respA->opaque = $srvA->opaque;
         $respA->body = json_encode(['topicList' => ['T1', 'T2']]);
         fwrite($connA, $respA->encode());
         $client2->waitResponses(3000);
-        $this->check($asyncError === null, 'e2e: 异步无失败回调');
-        $this->check($asyncResult instanceof RemotingCommand && $asyncResult->opaque === $reqA->opaque, 'e2e: 异步回调拿到响应（opaque 对上）');
-        $this->checkSame('route-ok', $asyncResult->remark ?? '', 'e2e: 异步响应 remark');
-        $this->checkSame(['T1', 'T2'], json_decode((string)$asyncResult->body, true)['topicList'] ?? [], 'e2e: 异步响应 body');
+        $this->check($asyncError === null, 'e2e: async has no failure callback');
+        $this->check($asyncResult instanceof RemotingCommand && $asyncResult->opaque === $reqA->opaque, 'e2e: async callback got response (opaque matches)');
+        $this->checkSame('route-ok', $asyncResult->remark ?? '', 'e2e: async response remark');
+        $this->checkSame(['T1', 'T2'], json_decode((string)$asyncResult->body, true)['topicList'] ?? [], 'e2e: async response body');
 
         fclose($connA);
         $client2->shutdown();
         fclose($server2);
 
-        // ---- 3. 超时 ----
+        // ---- 3. timeout ----
         [$server3, $addr3] = self::startEchoServer();
         $client3 = new RemotingClient(1000, 3000);
         $reqT = RemotingCommand::createRequestCommand(RequestCode::HEART_BEAT);
         $t0 = microtime(true);
-        $this->checkThrows(static fn(): RemotingCommand => $client3->invokeSync($addr3, $reqT, 400), RemotingTimeoutException::class, '无响应 → RemotingTimeoutException');
+        $this->checkThrows(static fn(): RemotingCommand => $client3->invokeSync($addr3, $reqT, 400), RemotingTimeoutException::class, 'no response -> RemotingTimeoutException');
         $elapsed = (microtime(true) - $t0) * 1000;
-        $this->check($elapsed < 2000, sprintf('超时按时返回（%.0fms）', $elapsed));
-        // 客户端连接已在 backlog 里，事后收走即可（server 全程不响应）
+        $this->check($elapsed < 2000, sprintf('timeout returns on time (%.0fms)', $elapsed));
+        // the client connection is already in the backlog, just reap it afterwards (server never responds)
         $connT = stream_socket_accept($server3, 5);
         if (is_resource($connT)) {
             fclose($connT);
@@ -875,17 +887,17 @@ final class RunRemoting
         $client3->shutdown();
         fclose($server3);
 
-        // ---- 4. 连接断开 → failFast（同步与异步）----
+        // ---- 4. connection closed -> failFast (sync and async) ----
         [$server4, $addr4] = self::startEchoServer();
         $client4 = new RemotingClient(1000, 5000);
         $connF = self::connectAndAccept($client4, $addr4, $server4);
 
-        // 4a. 同步：连接已被 server 关掉 → RemotingSendRequestException（不是超时）
+        // 4a. sync: connection already closed by the server -> RemotingSendRequestException (not a timeout)
         $reqF = RemotingCommand::createRequestCommand(RequestCode::HEART_BEAT);
-        fclose($connF); // server 侧断开；客户端下次 send 会重建连接
-        $this->checkThrows(static fn(): RemotingCommand => $client4->invokeSync($addr4, $reqF, 5000), RemotingSendRequestException::class, '连接断开 → 同步报 RemotingSendRequestException');
+        fclose($connF); // server side closes; the client will reconnect on next send
+        $this->checkThrows(static fn(): RemotingCommand => $client4->invokeSync($addr4, $reqF, 5000), RemotingSendRequestException::class, 'connection closed -> sync throws RemotingSendRequestException');
 
-        // 4b. 异步：请求已发出、响应未回时连接断开 → onFailure(RemotingSendRequestException)
+        // 4b. async: connection drops after the request is sent, before the response -> onFailure(RemotingSendRequestException)
         $asyncErr4 = null;
         $reqF2 = RemotingCommand::createRequestCommand(RequestCode::HEART_BEAT);
         $client4->invokeAsync(
@@ -897,22 +909,22 @@ final class RunRemoting
             },
             5000
         );
-        // 4a 已把旧连接关掉，这里的请求必定走新建连接
+        // 4a already closed the old connection, so this request must go over a new one
         $connF2 = stream_socket_accept($server4, 5);
         if (!is_resource($connF2)) {
             throw new \RuntimeException('test server: accept failed (4b)');
         }
         stream_set_blocking($connF2, true);
-        self::readFrame($connF2); // 读走请求
-        fclose($connF2);          // 不回响应直接断开
+        self::readFrame($connF2); // read the request
+        fclose($connF2);          // drop without responding
         $client4->waitResponses(2000);
-        $this->check($asyncErr4 instanceof RemotingSendRequestException, '连接断开 → 异步 onFailure(RemotingSendRequestException)');
-        $this->check(!$asyncErr4 instanceof RemotingTimeoutException, 'failFast 不是超时');
+        $this->check($asyncErr4 instanceof RemotingSendRequestException, 'connection closed -> async onFailure(RemotingSendRequestException)');
+        $this->check(!$asyncErr4 instanceof RemotingTimeoutException, 'failFast is not a timeout');
 
         fclose($server4);
         $client4->shutdown();
 
-        // ---- 5. GO_AWAY 换连接重发一次 ----
+        // ---- 5. GO_AWAY: reconnect and resend once ----
         [$server5, $addr5] = self::startEchoServer();
         $client5 = new RemotingClient(1000, 3000);
         $connG = self::connectAndAccept($client5, $addr5, $server5);
@@ -930,49 +942,50 @@ final class RunRemoting
             },
             3000
         );
-        // 第一轮：server 回 GO_AWAY
+        // first round: server replies GO_AWAY
         $srvG1 = self::readFrame($connG);
         $goAway = RemotingCommand::createResponseCommand(ResponseCode::GO_AWAY, 'busy');
         $goAway->opaque = $srvG1->opaque;
         fwrite($connG, $goAway->encode());
-        // 泵一把：客户端在 dispatch 里关旧连接 + 换连接重发（新连接进 server backlog）
+        // Pump once: the client closes the old connection in dispatch + resends over a new one (new connection enters server backlog)
         $client5->waitResponses(300);
-        // 第二轮：accept 新连接，读重发请求并回成功
+        // second round: accept the new connection, read the resent request and reply success
         $connG2 = stream_socket_accept($server5, 5);
         if (!is_resource($connG2)) {
             throw new \RuntimeException('test server: accept failed (go-away retry)');
         }
         stream_set_blocking($connG2, true);
         $srvG2 = self::readFrame($connG2);
-        $this->checkSame($reqG->code, $srvG2->code, 'GO_AWAY 后换连接重发同一请求');
-        $this->check($srvG2->opaque !== $reqG->opaque, '重发请求换了新 opaque');
+        $this->checkSame($reqG->code, $srvG2->code, 'same request resent over a new connection after GO_AWAY');
+        $this->check($srvG2->opaque !== $reqG->opaque, 'resent request carries a new opaque');
         $okResp = RemotingCommand::createResponseCommand(ResponseCode::SUCCESS, 'after-goaway');
         $okResp->opaque = $srvG2->opaque;
         fwrite($connG2, $okResp->encode());
         $client5->waitResponses(3000);
-        $this->check($errG === null, 'GO_AWAY 重发无失败回调');
-        $this->checkSame('after-goaway', $gotG?->remark ?? '', 'GO_AWAY 重发拿到最终响应');
+        $this->check($errG === null, 'GO_AWAY resend has no failure callback');
+        $this->checkSame('after-goaway', $gotG?->remark ?? '', 'GO_AWAY resend gets the final response');
         fclose($connG);
         fclose($connG2);
         $client5->shutdown();
         fclose($server5);
 
-        // ---- 6. namesrv 列表与轮询 ----
+        // ---- 6. nameserver list and round-robin ----
         $client6 = new RemotingClient(nameServers: ['ns-a:9876', 'ns-b:9876']);
         $this->checkSame(['ns-a:9876', 'ns-b:9876'], $client6->getNameServerAddressList(), 'getNameServerAddressList');
-        $this->checkSame('ns-a:9876', $client6->chooseNameServer(), '轮询第 1 个');
-        $this->checkSame('ns-b:9876', $client6->chooseNameServer(), '轮询第 2 个');
-        $this->checkSame('ns-a:9876', $client6->chooseNameServer(), '轮询回绕');
+        $this->checkSame('ns-a:9876', $client6->chooseNameServer(), 'round-robin picks the 1st');
+        $this->checkSame('ns-b:9876', $client6->chooseNameServer(), 'round-robin picks the 2nd');
+        $this->checkSame('ns-a:9876', $client6->chooseNameServer(), 'round-robin wraps around');
         $client6->updateNameServerAddressList(['ns-c:9876']);
-        $this->checkSame(['ns-c:9876'], $client6->getNameServerAddressList(), 'updateNameServerAddressList（故障切换入口）');
+        $this->checkSame(['ns-c:9876'], $client6->getNameServerAddressList(), 'updateNameServerAddressList (failover entry point)');
         $client6->shutdown();
     }
 
-    // ==================================================================== SOCKS 代理
+    // ==================================================================== SOCKS proxy
 
     /**
-     * 起本地假 SOCKS 代理子进程（tests/_socks_child.php）：子进程同进程里还开着目标
-     * echo 服务，stdout 一行 ``READY <proxyPort> <targetPort>`` 回报端口后进入服务循环。
+     * Spawns a local fake SOCKS proxy child process (tests/_socks_child.php): the child also
+     * runs the target echo service in the same process, reports ports with one ``READY <proxyPort> <targetPort>``
+     * line on stdout, then enters its serving loop.
      *
      * @return array{0: resource, 1: string, 2: string, 3: array<int, resource>} [proc, proxyAddr, targetAddr, pipes]
      */
@@ -998,7 +1011,7 @@ final class RunRemoting
         return [$proc, sprintf('127.0.0.1:%d', $ports[0]), sprintf('127.0.0.1:%d', $ports[1]), $pipes];
     }
 
-    /** 收尾子进程（成功路径里隧道 EOF 后子进程自然退出，这里兜底 reap + 断管道）。 */
+    /** Tears down the child process (on the success path it exits naturally after tunnel EOF; this is a fallback reap + pipe close). */
     private function stopSocksChild($proc, array $pipes): void
     {
         if (is_resource($proc)) {
@@ -1015,8 +1028,9 @@ final class RunRemoting
     }
 
     /**
-     * 经 SOCKS 代理完成一次 RocketMQ 请求往返：目标 echo 服务把请求帧原样回显，
-     * RemotingClient 的 dispatch 按 opaque 命中 pending，invokeSync 拿回请求帧本身。
+     * Completes one RocketMQ request roundtrip through the SOCKS proxy: the target echo service
+     * echoes the request frame back, the RemotingClient dispatch matches pending by opaque,
+     * and invokeSync receives the request frame itself.
      */
     private function socksRoundtrip(RemotingClient $client, string $targetAddr, string $body): RemotingCommand
     {
@@ -1028,67 +1042,68 @@ final class RunRemoting
     private function testSocksProxy(): void
     {
         $cfg = new SocksProxyConfig();
-        $this->check(!$cfg->isConfigured(), '缺省 SocksProxyConfig 未配置（addr=null）');
+        $this->check(!$cfg->isConfigured(), 'default SocksProxyConfig is unconfigured (addr=null)');
         $cfg = new SocksProxyConfig('127.0.0.1:1080', 'u', 'p');
-        $this->check($cfg->isConfigured(), '带 addr 即配置');
+        $this->check($cfg->isConfigured(), 'configured once addr is set');
         $this->checkSame('127.0.0.1:1080', $cfg->getAddr(), 'getAddr');
         $this->checkSame('u', $cfg->getUsername(), 'getUsername');
         $this->checkSame('p', $cfg->getPassword(), 'getPassword');
-        $this->checkSame('socks5', $cfg->getVersion(), '缺省版本 socks5（协议默认 SOCKS5）');
+        $this->checkSame('socks5', $cfg->getVersion(), 'default version socks5 (protocol default SOCKS5)');
         $this->checkSame(
             'SocksProxy address: 127.0.0.1:1080, username: u, password: p',
             (string)$cfg,
-            'toString 输出 SocksProxyConfig 约定格式'
+            'toString outputs the SocksProxyConfig conventional format'
         );
         $cfg->setAddr('10.0.0.1:1180');
         $cfg->setUsername(null);
         $cfg->setPassword(null);
-        $this->check($cfg->getUsername() === null && $cfg->getPassword() === null, 'setter 可置空认证字段');
+        $this->check($cfg->getUsername() === null && $cfg->getPassword() === null, 'setters can clear auth fields');
         $cfg->setVersion('4');
-        $this->checkSame('socks4', $cfg->normalizedVersion(), "version '4' 归一化为 socks4");
+        $this->checkSame('socks4', $cfg->normalizedVersion(), "version '4' normalized to socks4");
         $cfg->setVersion('SOCKS5');
-        $this->checkSame('socks5', $cfg->normalizedVersion(), '版本归一化忽略大小写');
+        $this->checkSame('socks5', $cfg->normalizedVersion(), 'version normalization ignores case');
         $cfg->setVersion('socks6');
-        $this->checkThrows(static fn() => $cfg->normalizedVersion(), \InvalidArgumentException::class, '未知版本启动期即抛');
+        $this->checkThrows(static fn() => $cfg->normalizedVersion(), \InvalidArgumentException::class, 'unknown version throws at startup');
 
-        // ---- 2. SOCKS5 无认证：经代理建连 + 一次请求往返 ----
+        // ---- 2. SOCKS5 without auth: connect through the proxy + one request roundtrip ----
         [$proc, $proxyAddr, $targetAddr, $pipes] = $this->startSocksChild('socks5_ok');
         try {
             $proxyCfg = new SocksProxyConfig($proxyAddr);
             $client = new RemotingClient(30000, 10000, socksProxy: $proxyCfg);
-            $this->checkSame($proxyCfg, $client->getSocksProxy(), 'RemotingClient 构造器收下 socksProxy');
+            $this->checkSame($proxyCfg, $client->getSocksProxy(), 'RemotingClient constructor accepts socksProxy');
             $got = $this->socksRoundtrip($client, $targetAddr, 'via-socks5');
-            $this->checkSame(RequestCode::HEART_BEAT, $got->code, 'socks5 无认证：请求经代理往返（echo 回请求帧）');
-            $this->checkSame('via-socks5', $got->body, 'socks5 无认证：body 完整穿过隧道');
+            $this->checkSame(RequestCode::HEART_BEAT, $got->code, 'socks5 no-auth: request roundtrips through the proxy (echoes the request frame)');
+            $this->checkSame('via-socks5', $got->body, 'socks5 no-auth: body passes through the tunnel intact');
             $client->shutdown();
         } finally {
             $this->stopSocksChild($proc, $pipes);
         }
 
-        // ---- 3. SOCKS5 用户名/密码子协商（RFC 1929）----
+        // ---- 3. SOCKS5 username/password sub-negotiation (RFC 1929) ----
         [$proc, $proxyAddr, $targetAddr, $pipes] = $this->startSocksChild('socks5_auth', 'socks-user', 'socks-pass');
         try {
             $client = new RemotingClient(30000, 10000, socksProxy: new SocksProxyConfig($proxyAddr, 'socks-user', 'socks-pass'));
             $got = $this->socksRoundtrip($client, $targetAddr, 'via-socks5-auth');
-            $this->checkSame('via-socks5-auth', $got->body, 'socks5 用户名/密码子协商后请求往返');
+            $this->checkSame('via-socks5-auth', $got->body, 'socks5: request roundtrips after username/password sub-negotiation');
             $client->shutdown();
         } finally {
             $this->stopSocksChild($proc, $pipes);
         }
 
-        // 密码错 → 子协商失败 → RemotingConnectException（代理端口存活，不走拒绝路径，
-        // 但按本机 loopback 怪癖给失败类断言 30s 级预算）
+        // wrong password -> sub-negotiation fails -> RemotingConnectException (proxy port is alive,
+        // so this is not the refused path; grant failure-class assertions a 30s-level budget
+        // due to the local loopback quirk)
         [$proc, $proxyAddr, $targetAddr, $pipes] = $this->startSocksChild('socks5_auth', 'socks-user', 'socks-pass');
         try {
             $client = new RemotingClient(30000, 10000, socksProxy: new SocksProxyConfig($proxyAddr, 'socks-user', 'wrong-pass'));
             $req = RemotingCommand::createRequestCommand(RequestCode::HEART_BEAT);
             try {
                 $client->invokeSync($targetAddr, $req, 10000);
-                $this->check(false, 'socks5 错误密码应建连失败');
+                $this->check(false, 'socks5 wrong password should fail to connect');
             } catch (RemotingConnectException $e) {
                 $this->check(
                     str_contains($e->getMessage(), 'authentication failed'),
-                    sprintf('socks5 错误密码 → 认证失败文案（got: %s）', $e->getMessage())
+                    sprintf('socks5 wrong password -> authentication failure message (got: %s)', $e->getMessage())
                 );
             }
             $client->shutdown();
@@ -1096,18 +1111,18 @@ final class RunRemoting
             $this->stopSocksChild($proc, $pipes);
         }
 
-        // ---- 4. SOCKS5 CONNECT 被拒（REP=0x01 general failure）----
+        // ---- 4. SOCKS5 CONNECT refused (REP=0x01 general failure) ----
         [$proc, $proxyAddr, $targetAddr, $pipes] = $this->startSocksChild('socks5_reject_connect');
         try {
             $client = new RemotingClient(30000, 10000, socksProxy: new SocksProxyConfig($proxyAddr));
             $req = RemotingCommand::createRequestCommand(RequestCode::HEART_BEAT);
             try {
                 $client->invokeSync($targetAddr, $req, 10000);
-                $this->check(false, 'socks5 CONNECT 被拒应建连失败');
+                $this->check(false, 'socks5 CONNECT refused should fail to connect');
             } catch (RemotingConnectException $e) {
                 $this->check(
                     str_contains($e->getMessage(), 'general SOCKS server failure'),
-                    sprintf('socks5 CONNECT 被拒 → REP 文案透传（got: %s）', $e->getMessage())
+                    sprintf('socks5 CONNECT refused -> REP message passed through (got: %s)', $e->getMessage())
                 );
             }
             $client->shutdown();
@@ -1115,12 +1130,12 @@ final class RunRemoting
             $this->stopSocksChild($proc, $pipes);
         }
 
-        // ---- 5. SOCKS4：往返 + 被拒（CD=91）----
+        // ---- 5. SOCKS4: roundtrip + refused (CD=91) ----
         [$proc, $proxyAddr, $targetAddr, $pipes] = $this->startSocksChild('socks4_ok');
         try {
             $client = new RemotingClient(30000, 10000, socksProxy: new SocksProxyConfig($proxyAddr, version: 'socks4'));
             $got = $this->socksRoundtrip($client, $targetAddr, 'via-socks4');
-            $this->checkSame('via-socks4', $got->body, 'socks4 请求经代理往返');
+            $this->checkSame('via-socks4', $got->body, 'socks4: request roundtrips through the proxy');
             $client->shutdown();
         } finally {
             $this->stopSocksChild($proc, $pipes);
@@ -1132,11 +1147,11 @@ final class RunRemoting
             $req = RemotingCommand::createRequestCommand(RequestCode::HEART_BEAT);
             try {
                 $client->invokeSync($targetAddr, $req, 10000);
-                $this->check(false, 'socks4 被拒应建连失败');
+                $this->check(false, 'socks4 refusal should fail to connect');
             } catch (RemotingConnectException $e) {
                 $this->check(
                     str_contains($e->getMessage(), 'code 91'),
-                    sprintf('socks4 被拒 → CD 码透传（got: %s）', $e->getMessage())
+                    sprintf('socks4 refused -> CD code passed through (got: %s)', $e->getMessage())
                 );
             }
             $client->shutdown();

@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-"""请求码 / 响应码 / 语言码 / 序列化类型（协议 rocketmq.remoting.protocol 枚举与常量）。"""
+"""Request codes / response codes / language codes / serialization types (the enums and
+constants of the rocketmq.remoting.protocol package)."""
 from __future__ import annotations
 
 from typing import Optional
@@ -128,7 +129,7 @@ class RequestCode:
     UPDATE_AND_GET_GROUP_FORBIDDEN = 353
     GET_BROKER_MEMBER_GROUP = 901
     BROKER_HEARTBEAT = 904
-    # ---- 以下按服务端 remoting 协议全量补齐（含 controller / acl / 冷数据 / 静态 topic）----
+    # ---- the remainder is completed from the full server-side remoting protocol (including controller / acl / cold storage / static topic) ----
     CHECK_ROCKSDB_CQ_WRITE_PROGRESS = 354
     EXPORT_ROCKSDB_CONFIG_TO_JSON = 355
     LITE_PULL_MESSAGE = 361
@@ -184,7 +185,7 @@ class RemotingSysResponseCode:
 
 
 class ResponseCode(RemotingSysResponseCode):
-    """协议继承结构：ResponseCode extends RemotingSysResponseCode。"""
+    """Protocol inheritance: ResponseCode extends RemotingSysResponseCode."""
     FLUSH_DISK_TIMEOUT = 10
     SLAVE_NOT_AVAILABLE = 11
     FLUSH_SLAVE_TIMEOUT = 12
@@ -244,7 +245,7 @@ class ResponseCode(RemotingSysResponseCode):
     LITE_SUBSCRIPTION_QUOTA_EXCEEDED = 2018
     USER_NOT_EXIST = 3001
     POLICY_NOT_EXIST = 3002
-    # 客户端侧伪响应码（协议 ResponseCode 中的负值常量）
+    # Client-side pseudo response codes (the negative constants in the protocol's ResponseCode)
     RPC_UNKNOWN = -1000
     RPC_ADDR_IS_NULL = -1002
     RPC_SEND_TO_CHANNEL_FAILED = -1004
@@ -252,7 +253,7 @@ class ResponseCode(RemotingSysResponseCode):
 
 
 class LanguageCode:
-    """语言枚举（与协议 LanguageCode 的 byte 码一致）。"""
+    """Language enumeration (the byte codes match the protocol's LanguageCode)."""
     JAVA = 0
     CPP = 1
     DOTNET = 2

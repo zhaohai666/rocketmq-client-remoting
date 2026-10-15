@@ -1,4 +1,4 @@
-// clientId 生成与复用规则的离线单测。
+// Offline unit tests for the clientId generation and reuse rules.
 using System.Text.RegularExpressions;
 using RocketMQ.Client;
 using RocketMQ.Common;
@@ -9,7 +9,7 @@ namespace RocketMQ.Client.Tests;
 
 public class ClientIdTests
 {
-    // <IP>@<pid>#<纳秒>
+    // <IP>@<pid>#<nanoseconds>
     private static readonly Regex LegacyStyle =
         new Regex(@"^[^@\s]+@" + Environment.ProcessId + @"#\d+$");
 
@@ -17,8 +17,9 @@ public class ClientIdTests
 
     private static string Ip => MixAll.CachedIpStr();
 
-    /// <summary>剥掉尾部的 <c>@STREAM</c>：pull / lite 消费者默认开 stream，
-    /// 结构断言只关心 `<ip>@<instance>` 那部分。</summary>
+    /// <summary>Strips the trailing <c>@STREAM</c>: pull / lite consumers enable stream by
+    /// default, and the structural assertions only care about the `<ip>@<instance>`
+    /// part.</summary>
     private static string WithoutStream(string clientId)
     {
         return clientId.EndsWith(StreamSuffix, StringComparison.Ordinal)
@@ -29,7 +30,7 @@ public class ClientIdTests
     private static (string Ip, string Instance) Split(string clientId)
     {
         int at = clientId.IndexOf('@');
-        Assert.True(at > 0 && at + 1 < clientId.Length, "clientId 少了 IP@instanceName 的分隔符: " + clientId);
+        Assert.True(at > 0 && at + 1 < clientId.Length, "clientId is missing the IP@instanceName separator: " + clientId);
         return (clientId[..at], clientId[(at + 1)..]);
     }
 
@@ -41,7 +42,7 @@ public class ClientIdTests
         }
         catch
         {
-            // 断言只看 clientId，连接失败是预期的
+            // the assertion only looks at clientId, a connection failure is expected
         }
         try
         {
@@ -49,12 +50,12 @@ public class ClientIdTests
         }
         catch
         {
-            // 半启动状态下 shutdown 不该让测试失败
+            // shutdown in a half-started state must not fail the test
         }
         return client;
     }
 
-    // ---------------------------------------------------------------- 纯字符串部分
+    // ---------------------------------------------------------------- Pure string part
 
     [Fact]
     public void BuildMqClientIdIsIpFirst()
@@ -94,7 +95,7 @@ public class ClientIdTests
         Assert.Equal("inst", instance);
     }
 
-    // ---------------------------------------------------------------- 生产者
+    // ---------------------------------------------------------------- Producers
 
     [Fact]
     public void ProducerStartStampsALegacyStyleClientId()
@@ -104,7 +105,7 @@ public class ClientIdTests
         Assert.Matches(LegacyStyle, p.ClientId);
         (string ip, string instance) = Split(p.ClientId);
         Assert.Equal(Ip, ip);
-        // instanceName 就地写回：重启不能再换一个 clientId
+        // instanceName is written back in place: a restart must not switch to another clientId
         Assert.Equal(instance, p.InstanceName);
 
         string restarted = p.ClientId;
@@ -115,7 +116,7 @@ public class ClientIdTests
     [Fact]
     public void TwoProducersInOneProcessDoNotShareAClientId()
     {
-        // 唯一性来自改写后的 instanceName（pid + 纳秒），不再依赖 clientId 尾巴上的序号。
+        // Uniqueness comes from the rewritten instanceName (pid + nanoseconds), no longer relying on the sequence number at the tail of the clientId.
         var a = new DefaultMQProducer("PID_clientid_a") { NamesrvAddr = "127.0.0.1:1" };
         var b = new DefaultMQProducer("PID_clientid_b") { NamesrvAddr = "127.0.0.1:1" };
         Stamped(a, a.Start, a.Shutdown);
@@ -136,7 +137,7 @@ public class ClientIdTests
         Assert.Equal("clientid-parity-fixed", p.InstanceName);
     }
 
-    // ---------------------------------------------------------------- 消费者
+    // ---------------------------------------------------------------- Consumers
 
     [Fact]
     public void PushClusteringRewritesAndBroadcastDoesNot()
@@ -198,7 +199,7 @@ public class ClientIdTests
         Assert.Matches(LegacyStyle, lite.ClientId);
     }
 
-    // ---------------------------------------------------------------- unitName / stream 后缀
+    // ---------------------------------------------------------------- unitName / stream suffix
 
     [Fact]
     public void StreamSuffixComesAfterUnitName()
@@ -211,7 +212,8 @@ public class ClientIdTests
             ClientIds.BuildMqClientId("10.0.0.1", "inst", "  ", false));
     }
 
-    /// 各 facade 的默认值：生产者/推送消费者/管理端不开 stream，pull/lite 开。
+    /// The defaults per facade: producers / push consumers / the admin side do not enable
+    /// stream, pull/lite do.
     [Fact]
     public void FacadeStreamDefaultsMatchLegacy()
     {
@@ -249,7 +251,7 @@ public class ClientIdTests
         Assert.False(lite.UnitMode);
     }
 
-    // ---------------------------------------------------------------- 管理端
+    // ---------------------------------------------------------------- Admin side
 
     [Fact]
     public void AdminKeepsItsOwnInstanceName()
@@ -272,12 +274,12 @@ public class ClientIdTests
         Assert.Matches(LegacyStyle, admin.ClientId);
     }
 
-    // ---------------------------------------------------------------- 失败路径
+    // ---------------------------------------------------------------- Failure paths
 
     [Fact]
     public void FailedStartDoesNotStamp()
     {
-        // 改名与拼 clientId 都在地址校验之后：没配 namesrv 就不该留下半个 clientId。
+        // Both the renaming and the clientId assembly come after the address validation: with no namesrv configured it must not leave half a clientId behind.
         var p = new DefaultMQProducer("PID_clientid_dead_group");
         Assert.Throws<MQClientException>(p.Start);
         Assert.Equal(string.Empty, p.ClientId);

@@ -42,7 +42,7 @@ func TestResetOffsetBodyRoundTrip(t *testing.T) {
 }
 
 func TestParseResetOffsetTableArrayShape(t *testing.T) {
-	// language=CPP 发起方的数组体：offsetTable 是数组，每条自带 offset。
+	// The array body sent by the CPP side: offsetTable is an array, each entry carrying its own offset.
 	text := `{"offsetTable":[{"topic":"Tt","brokerName":"broker-a","queueId":2,"offset":31}]}`
 	table, err := ParseResetOffsetTable([]byte(text))
 	if err != nil {
@@ -51,7 +51,7 @@ func TestParseResetOffsetTableArrayShape(t *testing.T) {
 	if len(table) != 1 || table[0].Queue.QueueID != 2 || table[0].Offset != 31 {
 		t.Errorf("table = %+v", table)
 	}
-	// map 解析器拿到数组只会报错——兜底数组解析是给老 CPP 管理集群用的。
+	// The map parser only errors on an array — the fallback array parse exists for old CPP admin clusters.
 	if _, err := DecodeResetOffsetBody([]byte(text)); err == nil {
 		t.Error("map parser must reject the array shape")
 	}
@@ -106,11 +106,11 @@ func TestCheckClientRequestBodyShape(t *testing.T) {
 			t.Errorf("body missing %s: %s", want, text)
 		}
 	}
-	// namespace 保留字段但发送端不填：键不出现。
+	// namespace is a reserved field but the sender leaves it blank: the key does not appear.
 	if strings.Contains(text, "namespace") {
 		t.Errorf("namespace must stay absent: %s", text)
 	}
-	// clientId/group 为 nil 时写 null（键恒在，与 broker 的反射口径一致）。
+	// When clientId/group is nil it is written as null (the key is always present, matching the broker's reflection).
 	empty := &CheckClientRequestBody{}
 	text2 := string(empty.Encode())
 	if !strings.Contains(text2, `"clientId":null`) || !strings.Contains(text2, `"group":null`) {

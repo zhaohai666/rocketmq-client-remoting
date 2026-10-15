@@ -8,7 +8,8 @@ from logging.handlers import TimedRotatingFileHandler
 
 LOGGER_NAME = "rocketmq.client"
 
-# 环境变量配置：ROCKETMQ_CLIENT_LOG_* 分别控制目录/文件名/级别/备份数/是否打 stdout
+# Environment variable configuration: ROCKETMQ_CLIENT_LOG_* control the directory / file name / level /
+# backup count / whether to write to stdout
 _DEFAULT_LOG_DIR = os.path.join(os.getcwd(), "logs", "rocketmqlogs")
 _LOG_DIR = os.environ.get("ROCKETMQ_CLIENT_LOG_DIR") or _DEFAULT_LOG_DIR
 _LOG_FILE = os.environ.get("ROCKETMQ_CLIENT_LOG_FILE") or "rocketmq_py_client.log"
@@ -29,9 +30,9 @@ def _level_from_name(raw: str) -> int:
 
 
 def _build_handlers():
-    """构造客户端自己的 handler 列表（文件 + 可选控制台）。"""
+    """Build the client's own list of handlers (file + optional console)."""
     handlers = []
-    # 文件 handler：按天滚动，文件名 rocketmq_py_client.log.YYYY-MM-DD，最多保留 N 份
+    # File handler: rolls over daily, file name rocketmq_py_client.log.YYYY-MM-DD, keeps at most N copies
     try:
         os.makedirs(_LOG_DIR, exist_ok=True)
         fh = TimedRotatingFileHandler(
@@ -40,11 +41,12 @@ def _build_handlers():
             backupCount=_LOG_MAX_INDEX,
             encoding="utf-8",
         )
-        fh.suffix = "%Y-%m-%d"  # 备份名形如 rocketmq_py_client.log.YYYY-MM-DD
+        fh.suffix = "%Y-%m-%d"  # the backup name looks like rocketmq_py_client.log.YYYY-MM-DD
         fh.setFormatter(_logging.Formatter(FORMAT))
         handlers.append(fh)
     except Exception as e:  # noqa: BLE001
-        # 无法写文件时优雅降级：仅打警告到 stderr，不阻断客户端
+        # Degrade gracefully when the file cannot be written: only print a warning to stderr and do not
+        # block the client
         sys.stderr.write("[rocketmq] client file log disabled: %s\n" % e)
     if _LOG_USE_STDOUT:
         sh = _logging.StreamHandler()
@@ -55,13 +57,14 @@ def _build_handlers():
 
 def get_logger(name: str = LOGGER_NAME) -> _logging.Logger:
     logger = _logging.getLogger(name)
-    # 宿主程序已配置过 logging（root 已有 handler）：复用其配置，不再自作主张加 handler
+    # The host program has already configured logging (root already has a handler): reuse its
+    # configuration instead of adding handlers on our own initiative
     if logger.handlers or (logger.parent is not None and logger.parent.handlers):
         return logger
     for h in _build_handlers():
         logger.addHandler(h)
     logger.setLevel(_level_from_name(_LOG_LEVEL_NAME))
-    logger.propagate = False  # 自带 console+file handler，避免再向上抛给 root 造成重复
+    logger.propagate = False  # we bring our own console+file handler; propagating up to root would duplicate output
     return logger
 
 

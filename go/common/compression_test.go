@@ -43,7 +43,7 @@ func TestZlibRoundTripAndLevel(t *testing.T) {
 	if err != nil || !bytes.Equal(back, zlibPayload) {
 		t.Fatalf("round trip failed: %v", err)
 	}
-	// 空输入也要成流
+	// Empty input must also produce a valid stream
 	empty, err := ZlibCompress(nil, DefaultCompressLevel)
 	if err != nil {
 		t.Fatal(err)
@@ -70,7 +70,7 @@ func TestZlibTruncatedStreamIsAnError(t *testing.T) {
 }
 
 func TestCompressDispatchAndUnsupportedTypes(t *testing.T) {
-	// 类型 0（无类型位的历史消息）按 ZLIB 处理
+	// Type 0 (legacy messages without a type bit) is handled as ZLIB
 	got, err := Compress([]byte("data"), 0, DefaultCompressLevel)
 	if err != nil {
 		t.Fatal(err)
@@ -84,7 +84,7 @@ func TestCompressDispatchAndUnsupportedTypes(t *testing.T) {
 	}{
 		{SnappyType, "unsupported compression type: 4"},
 	} {
-		// 无第三方依赖：Snappy 必须显式报错，绝不能把压缩字节原样透传
+		// No third-party dependency: Snappy must error explicitly; never pass the compressed bytes through unchanged
 		if _, err := Compress([]byte("data"), c.typ, DefaultCompressLevel); err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Fatalf("Compress(%d): %v", c.typ, err)
 		}
@@ -98,7 +98,7 @@ func TestCompressDispatchAndUnsupportedTypes(t *testing.T) {
 	if _, err := DecompressBody([]byte("x"), ZlibType); err == nil {
 		t.Fatal("decompress of non-zlib bytes must fail")
 	}
-	// LZ4/ZSTD 现已支持（hand-rolled codec），走 Compress/Decompress 全链路
+	// LZ4/ZSTD are now supported (hand-rolled codec) and go through the full Compress/Decompress path
 	for _, c := range []int32{Lz4Type, ZstdType} {
 		enc, err := Compress(zlibPayload, c, DefaultCompressLevel)
 		if err != nil {
@@ -138,7 +138,7 @@ func TestZlibOutputIsRFC1950(t *testing.T) {
 	if compressed[0] != 0x78 {
 		t.Fatalf("missing zlib header byte, got 0x%X", compressed[0])
 	}
-	// 与标准 zlib 输出可互相解开（deflate 实现字节不必一致，流必须一致）
+	// Interoperable with standard zlib output (the deflate byte layout need not match, but the stream must)
 	other, err := ZlibDecompress(mustZlibFixture(t))
 	if err != nil || !strings.HasPrefix(string(other), "rocketmq-compressed-") {
 		t.Fatal("fixture payload mismatch")

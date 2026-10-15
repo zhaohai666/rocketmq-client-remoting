@@ -17,7 +17,7 @@ class TestComputeStatsData:
         assert ss.sum == 0 and ss.tps == 0.0 and ss.avgpt == 0.0 and ss.times == 0
 
     def test_stats_snapshot_formula(self):
-        # 两个累计点：10 秒内 value 增 30、times 增 3
+        # Two cumulative points: value +30 and times +3 within 10 seconds
         snaps = [(0, 100, 10), (10_000, 130, 13)]
         ss = compute_stats_data(snaps)
         assert ss.sum == 30
@@ -41,16 +41,16 @@ class TestStatsItem:
     def test_minute_snapshot_diffs_samples(self):
         it = StatsItem("PULL_TPS", "T@G")
         it.add_value(10, 1)
-        it.sample()                    # 第一个累计点
+        it.sample()                    # first cumulative point
         it.add_value(15, 1)
-        it.sample()                    # 第二个累计点
+        it.sample()                    # second cumulative point
         ss = it.get_stats_data_in_minute()
         assert ss.sum == 15
         assert ss.times == 1
         assert ss.tps >= 0
 
     def test_hour_window_separate_from_minute(self):
-        # 累计差分：两点 (ts,100,2) → (ts,400,4)：sum=400-100=300、timesDiff=2
+        # Cumulative diff: two points (ts,100,2) → (ts,400,4): sum=400-100=300, timesDiff=2
         it = StatsItem("PULL_RT", "T@G")
         it.add_value(100, 2)
         it.sample_hour()
@@ -64,7 +64,7 @@ class TestStatsItem:
         it = StatsItem("PULL_TPS", "T@G")
         for _ in range(80):
             it.sample()
-        # 60 个点封顶（MINUTE_LIST_MAX）
+        # capped at 60 points (MINUTE_LIST_MAX)
         assert len(it._minute) == 60
 
 
@@ -86,7 +86,7 @@ class TestStatsItemSet:
 
 class TestConsumerStatsManager:
     def test_inc_semantics_match_the_server_counters(self):
-        # TPS 类：value=消息数、times=调用次数；RT 类：value=耗时、times=调用次数
+        # TPS type: value=message count, times=call count; RT type: value=elapsed time, times=call count
         m = ConsumerStatsManager()
         m.inc_pull_tps(GROUP, TOPIC, 10)
         m.inc_pull_tps(GROUP, TOPIC, 20)

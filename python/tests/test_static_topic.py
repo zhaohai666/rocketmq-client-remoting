@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-"""静态主题路由测试：类型化映射解析、topicRouteData2EndpointsForStaticTopic
-纯函数移植、以及实例的 getBrokerNameFromMessageQueue 重写，共五个用例。"""
+"""Static topic routing tests: typed mapping parsing, the pure-function port of topicRouteData2EndpointsForStaticTopic,
+and the instance's getBrokerNameFromMessageQueue override, five cases in total."""
 from __future__ import annotations
 
 from client import static_topic
@@ -64,7 +64,7 @@ def test_endpoints_single_scope_with_unhosted_queue():
         assert endpoints[MessageQueue("StaticTopic", "__syslo__global__", gid)] == "broker-a"
     unhosted = MessageQueue("StaticTopic", "__syslo__global__", 3)
     assert endpoints[unhosted] == "__syslo__none__"
-    # 空映射（非静态主题）返回 None。
+    # an empty mapping (non-static topic) returns None.
     assert topic_route_data_2_endpoints_for_static_topic("T", TopicRouteData()) is None
 
 
@@ -75,9 +75,9 @@ def test_scopes_stay_apart_and_epoch_fences():
         "broker-b": raw_mapping("zone-x", 1, "broker-b", 9, {"0": 0}),
     })
     endpoints = topic_route_data_2_endpoints_for_static_topic("T", route)
-    assert endpoints[MessageQueue("T", "__syslo__global__", 0)] == "broker-new"  # 高 epoch 围栏
+    assert endpoints[MessageQueue("T", "__syslo__global__", 0)] == "broker-new"  # higher epoch wins
     assert endpoints[MessageQueue("T", "__syslo__zone-x", 0)] == "broker-b"
-    assert len(endpoints) == 2  # scope 之间不合并
+    assert len(endpoints) == 2  # scopes do not merge
 
 
 def test_instance_rewrites_mock_broker_name_via_end_points_table():
@@ -90,7 +90,7 @@ def test_instance_rewrites_mock_broker_name_via_end_points_table():
         MessageQueue("StaticTopic", "__syslo__global__", 0)) == "broker-a"
     assert inst.get_broker_name_from_message_queue(
         MessageQueue("StaticTopic", "__syslo__global__", 1)) == "broker-b"
-    # 表里没有的队列 / 非静态主题原样透传自己的 broker 名。
+    # queues absent from the table / non-static topics pass their own broker name through as-is.
     assert inst.get_broker_name_from_message_queue(
         MessageQueue("StaticTopic", "__syslo__global__", 99)) == "__syslo__global__"
     assert inst.get_broker_name_from_message_queue(
@@ -99,12 +99,11 @@ def test_instance_rewrites_mock_broker_name_via_end_points_table():
 
 def test_route_refresh_builds_and_clears_end_points_table():
     inst = MQClientInstance("static-refresh@DEFAULT", ["127.0.0.1:9876"])
-    # 直接种路由表并走落库逻辑不可行（要真 namesrv），这里直接验证
-    # update 落库块的纯函数部分：静态路由建表、非静态清表由同一处 if/else 决定。
+    # seeding the route table and going through the persistence logic is not feasible (it needs a real namesrv), so the pure-function part of the update persistence block is verified directly here: static routes build the table, non-static ones clear it, decided by the same if/else.
     route = mapping_route({
         "broker-a": raw_mapping("__global__", 2, "broker-a", 0, {"0": 0, "1": 1}),
     })
     endpoints = static_topic.topic_route_data_2_endpoints_for_static_topic("S", route)
     assert endpoints is not None and len(endpoints) == 2
-    # 非静态（空 mapping）→ None → 落库块会 pop 旧条目。
+    # non-static (empty mapping) -> None -> the persistence block pops the old entries.
     assert topic_route_data_2_endpoints_for_static_topic("S", TopicRouteData()) is None

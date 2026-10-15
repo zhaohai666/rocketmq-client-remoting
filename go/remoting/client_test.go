@@ -176,7 +176,7 @@ func eofServer(t *testing.T, dropConns int64) (string, *atomic.Int64) {
 			}
 			idx := conns.Add(1) - 1
 			if idx < dropConns {
-				// 收到请求再关：制造"请求已写出、对端永不回复"的 EOF。
+				// Close after reading the request: manufacture an EOF of "request written, peer never replies".
 				_, _ = readFrame(conn)
 				conn.Close()
 				continue
@@ -222,7 +222,7 @@ func waitUntil(t *testing.T, cond func() bool, what string) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("等不到%s", what)
+	t.Fatalf("did not receive %s", what)
 }
 
 // ---------------- basic RPC ----------------
@@ -240,13 +240,13 @@ func TestInvokeSyncRoundTrip(t *testing.T) {
 		t.Fatalf("code = %d", response.Code)
 	}
 	if response.Opaque != cmd.Opaque {
-		t.Fatalf("响应必须带回请求的 opaque: %d != %d", response.Opaque, cmd.Opaque)
+		t.Fatalf("response must echo the request's opaque: %d != %d", response.Opaque, cmd.Opaque)
 	}
 	if response.Remark != "pong:hi" {
 		t.Fatalf("remark = %q", response.Remark)
 	}
 	if !response.IsResponseType() {
-		t.Fatal("必须是响应帧")
+		t.Fatal("must be a response frame")
 	}
 	if got := client.ConnectionAddrs(); len(got) != 1 || got[0] != addr {
 		t.Fatalf("connection addrs = %v", got)
@@ -318,10 +318,10 @@ func TestInvokeOnewayDoesNotWait(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !cmd.IsOnewayRPC() {
-		t.Fatal("oneway 标志必须打上")
+		t.Fatal("oneway flag must be set")
 	}
 	if client.InFlightCount() != 0 {
-		t.Fatalf("oneway 不登记在途表, got %d", client.InFlightCount())
+		t.Fatalf("oneway is not registered in the in-flight table, got %d", client.InFlightCount())
 	}
 }
 
@@ -334,7 +334,7 @@ func TestTimeoutWhenBrokerStaysSilent(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 	if client.InFlightCount() != 0 {
-		t.Fatalf("超时后在途表要清空, got %d", client.InFlightCount())
+		t.Fatalf("in-flight table must be cleared after timeout, got %d", client.InFlightCount())
 	}
 }
 
@@ -349,10 +349,10 @@ func TestGoAwayReconnectsAndRetriesOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	if response.Code != RespSuccess {
-		t.Fatalf("重发必须拿到真应答, code = %d", response.Code)
+		t.Fatalf("retry must obtain a real response, code = %d", response.Code)
 	}
 	if conns.Load() != 2 {
-		t.Fatalf("GO_AWAY 后必须换新连接, conns = %d", conns.Load())
+		t.Fatalf("a new connection must be used after GO_AWAY, conns = %d", conns.Load())
 	}
 	if client.InFlightCount() != 0 {
 		t.Fatalf("in-flight = %d", client.InFlightCount())
@@ -368,10 +368,10 @@ func TestSecondGoAwayFailsInsteadOfLooping(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 	if !strings.Contains(err.Error(), "GO_AWAY twice") {
-		t.Fatalf("错误文案要固定 GO_AWAY twice: %v", err)
+		t.Fatalf("error text must be fixed as GO_AWAY twice: %v", err)
 	}
 	if conns.Load() != 2 {
-		t.Fatalf("只重发一次, 不能无限重连, conns = %d", conns.Load())
+		t.Fatalf("retry only once, must not reconnect infinitely, conns = %d", conns.Load())
 	}
 	if client.InFlightCount() != 0 {
 		t.Fatalf("in-flight = %d", client.InFlightCount())
@@ -392,7 +392,7 @@ func TestGoAwayWithoutReconnectFlagSurfacesError(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 	if conns.Load() != 1 {
-		t.Fatalf("关掉开关就不该重连, conns = %d", conns.Load())
+		t.Fatalf("with the switch off it must not reconnect, conns = %d", conns.Load())
 	}
 }
 
@@ -409,7 +409,7 @@ func TestConnectFailureMapsToConnectError(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 	if client.IsChannelWritable(addr) {
-		t.Fatal("失败后不该有可写连接")
+		t.Fatal("should be no writable connection after failure")
 	}
 }
 
@@ -433,7 +433,7 @@ func TestCloseChannelForcesReconnect(t *testing.T) {
 	}
 	client.CloseChannel(addr)
 	if client.IsChannelWritable(addr) {
-		t.Fatal("close 后连接应不可写")
+		t.Fatal("connection must be unwritable after close")
 	}
 	response, err := client.InvokeSync(addr, request(ReqSendMessage, "second"), 3000)
 	if err != nil {
@@ -459,16 +459,16 @@ func TestConnectionEofFailsInFlightRequestFast(t *testing.T) {
 	_, err := client.InvokeSync(addr, request(ReqSendMessageV2, "eof"), 30000)
 	cost := time.Since(started)
 	if !common.IsKind(err, common.KindSendRequest) {
-		t.Fatalf("必须是发送失败, got %v", err)
+		t.Fatalf("must be a send failure, got %v", err)
 	}
 	if !strings.Contains(err.Error(), "connection closed") {
-		t.Fatalf("错误文案要固定 connection closed: %v", err)
+		t.Fatalf("error text must be fixed as connection closed: %v", err)
 	}
 	if cost >= 5*time.Second {
-		t.Fatalf("毫秒级判死, 不能等满 30s 超时: %v", cost)
+		t.Fatalf("death detected at millisecond granularity, must not wait the full 30s timeout: %v", cost)
 	}
 	if client.InFlightCount() != 0 {
-		t.Fatalf("判死之后在途表要清空, got %d", client.InFlightCount())
+		t.Fatalf("in-flight table must be cleared after death detection, got %d", client.InFlightCount())
 	}
 	if conns.Load() != 1 {
 		t.Fatalf("conns = %d", conns.Load())
@@ -491,10 +491,10 @@ func TestConnectionEofFailsAsyncCallbackExactlyOnce(t *testing.T) {
 			t.Fatalf("got %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("回调没触发")
+		t.Fatal("callback did not fire")
 	}
 	if len(hits) != 1 {
-		t.Fatalf("回调只能投递一次, got %d", len(hits))
+		t.Fatalf("callback must be delivered exactly once, got %d", len(hits))
 	}
 }
 
@@ -509,17 +509,17 @@ func TestFailFastLeavesOtherConnectionsAlone(t *testing.T) {
 		_, err := client.InvokeSync(aliveAddr, request(ReqPullMessage, "slow"), 30000)
 		slowResult <- err
 	}()
-	waitUntil(t, func() bool { return frames.Load() >= 1 }, "活连接收到请求")
+	waitUntil(t, func() bool { return frames.Load() >= 1 }, "live connection received request")
 	_, err := client.InvokeSync(doomedAddr, request(ReqSendMessageV2, "eof"), 30000)
 	if !common.IsKind(err, common.KindSendRequest) {
 		t.Fatalf("got %v", err)
 	}
 	if client.InFlightCount() != 1 {
-		t.Fatalf("只该判死自己那条连接上的请求, in-flight = %d", client.InFlightCount())
+		t.Fatalf("only requests on its own connection should be declared dead, in-flight = %d", client.InFlightCount())
 	}
 	select {
 	case <-slowResult:
-		t.Fatal("活连接上的请求不该被误伤")
+		t.Fatal("requests on the live connection must not be collateral damage")
 	default:
 	}
 }
@@ -535,7 +535,7 @@ func TestSameAddressWorksAfterFailFast(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 	if client.IsChannelWritable(addr) {
-		t.Fatal("死连接要摘出连接表")
+		t.Fatal("dead connection must be removed from the connection table")
 	}
 	response, err := client.InvokeSync(addr, request(ReqSendMessageV2, "ok"), 5000)
 	if err != nil {
@@ -545,7 +545,7 @@ func TestSameAddressWorksAfterFailFast(t *testing.T) {
 		t.Fatalf("code = %d", response.Code)
 	}
 	if conns.Load() != 2 {
-		t.Fatalf("第二次请求走的是新建的连接, conns = %d", conns.Load())
+		t.Fatalf("the second request goes through a newly built connection, conns = %d", conns.Load())
 	}
 }
 
@@ -559,15 +559,15 @@ func TestShutdownDrainsInFlightRequests(t *testing.T) {
 		_, err := client.InvokeSync(addr, request(ReqPullMessage, "pending"), 30000)
 		result <- err
 	}()
-	waitUntil(t, func() bool { return frames.Load() >= 1 }, "请求写出")
+	waitUntil(t, func() bool { return frames.Load() >= 1 }, "request written out")
 	client.Shutdown()
 	select {
 	case err := <-result:
 		if !common.IsKind(err, common.KindSendRequest) {
-			t.Fatalf("shutdown 要立刻收口, got %v", err)
+			t.Fatalf("shutdown must settle immediately, got %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("调用方被挂住")
+		t.Fatal("caller was hung")
 	}
 	if client.InFlightCount() != 0 {
 		t.Fatalf("in-flight = %d", client.InFlightCount())
@@ -592,7 +592,7 @@ func TestBrokerPushedRequestReachesProcessor(t *testing.T) {
 		push.Opaque = 9876
 		push.MarkOnewayRPC()
 		writeFrame(conn, push, 0)
-		// oneway 不应有响应；再发一条请求型的，要求回包
+		// oneway should not get a response; then send a request-type one and require a reply
 		needReply := CreateRequestCommand(ReqCheckTransactionState, nil)
 		needReply.Opaque = 5555
 		writeFrame(conn, needReply, 0)
@@ -618,7 +618,7 @@ func TestBrokerPushedRequestReachesProcessor(t *testing.T) {
 	defer client.Shutdown()
 	client.RegisterProcessor(ReqPushReplyMessageToClient, echo)
 	client.RegisterProcessor(ReqCheckTransactionState, echo)
-	// 先建连（服务端 accept 后才会推请求）
+	// Connect first (the server only pushes requests after accept)
 	warm := request(ReqHeartBeat, "warm")
 	if err := client.InvokeOneway(addr, warm); err != nil {
 		t.Fatal(err)
@@ -629,13 +629,13 @@ func TestBrokerPushedRequestReachesProcessor(t *testing.T) {
 			t.Fatalf("code = %d", response.Code)
 		}
 		if response.Opaque != 5555 {
-			t.Fatalf("响应必须回填 broker 请求的 opaque, got %d", response.Opaque)
+			t.Fatalf("response must fill back the broker request's opaque, got %d", response.Opaque)
 		}
 		if !response.IsResponseType() {
-			t.Fatal("必须是响应帧")
+			t.Fatal("must be a response frame")
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("客户端应回包")
+		t.Fatal("client should reply")
 	}
 	<-serverDone
 }
@@ -680,7 +680,7 @@ func TestRpcHooksRunBeforeEncode(t *testing.T) {
 	}
 	onWire := <-wireCh
 	if v, _ := onWire.GetExtField("Hooked"); v != "yes" {
-		t.Fatalf("钩子必须作用于上线报文, Hooked = %q", v)
+		t.Fatalf("hook must apply to the wire message, Hooked = %q", v)
 	}
 }
 
@@ -695,7 +695,7 @@ func TestRocketMQSerializeTypeRoundTrips(t *testing.T) {
 		t.Fatal(err)
 	}
 	if response.SerializeTypeCurrentRPC != SerializeTypeRocketMQ {
-		t.Fatalf("私有二进制协议位必须在高 8 位往返, got %d", response.SerializeTypeCurrentRPC)
+		t.Fatalf("private binary protocol bit must round-trip in the high 8 bits, got %d", response.SerializeTypeCurrentRPC)
 	}
 }
 
@@ -822,6 +822,6 @@ func TestTlsPlaintextRejected(t *testing.T) {
 	defer client.Shutdown()
 	_, err := client.InvokeSync(addr, request(ReqHeartBeat, "plain"), 3000)
 	if !common.IsKind(err, common.KindSendRequest) {
-		t.Fatalf("明文打 TLS 服务端必须失败, got %v", err)
+		t.Fatalf("plaintext against the TLS server must fail, got %v", err)
 	}
 }

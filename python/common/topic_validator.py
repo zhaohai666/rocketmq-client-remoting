@@ -2,7 +2,7 @@
 from typing import Set
 
 TOPIC_MAX_LENGTH = 127
-# group 名要参与拼 %RETRY%group_topic / %DLQ%group_topic，所以比 topic 更短
+# group names participate in building %RETRY%<group> / %DLQ%<group> topics, so they are shorter than topic
 GROUP_MAX_LENGTH = 120
 RETRY_OR_DLQ_TOPIC_MAX_LENGTH = 255
 
@@ -38,8 +38,9 @@ SYSTEM_TOPIC_SET: Set[str] = {
     RMQ_SYS_ROCKSDB_TRANS_OP_HALF_TOPIC,
 }
 
-# 客户端**不能直接发**的 topic：这几个是 broker 内部状态流水（半消息、延迟、轨迹校验…），
-# 用户发进去会污染 broker 的事务/延迟/校验逻辑。
+# Topics the client must NOT send directly: these are the broker's internal state streams (half messages,
+# delayed messages, trace verification, ...); sending user messages to them would pollute the broker's
+# transaction/delay/verification logic.
 NOT_ALLOWED_SEND_TOPIC_SET: Set[str] = {
     RMQ_SYS_SCHEDULE_TOPIC,
     RMQ_SYS_TRANS_HALF_TOPIC,
@@ -56,7 +57,7 @@ _ALLOWED_CHARS: Set[str] = set("%-_|") | set("0123456789") | set("abcdefghijklmn
 
 
 def is_topic_or_group_illegal(name: str) -> bool:
-    """对应 ``TopicValidator.isTopicOrGroupIllegal``：空串返回 False（空由 isBlank 那步管）。"""
+    """Corresponds to ``TopicValidator.isTopicOrGroupIllegal``: an empty string returns False (emptiness is handled by the isBlank step)."""
     return any(ord(ch) >= 128 or ch not in _ALLOWED_CHARS for ch in name)
 
 

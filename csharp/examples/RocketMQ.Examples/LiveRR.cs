@@ -1,23 +1,26 @@
-// Request-Reply（5.x）真机验证：发起、broker 回推、等待槽命中全链路。
-// 用法：rmq rr [namesrv]
+// Real-machine verification of Request-Reply (5.x): initiating, the broker pushing back and
+// the waiting slot being hit, the whole chain.
+// Usage: rmq rr [namesrv]
 //
-// 链路（场景与断言都落在协议字段上）：
-//   请求方 producer.Request(msg, timeout)            应答方 push consumer
+// The chain (the scenarios and the assertions all land on protocol fields):
+//   the requesting side producer.Request(msg, timeout)            the replying side push consumer
 //   ──────────────────────────────                  ─────────────────────
 //   CORRELATION_ID = uuid
-//   REPLY_TO_CLIENT = clientId ──────────►          收到请求（broker 已写 CLUSTER）
+//   REPLY_TO_CLIENT = clientId ---------->   receives the request (the broker has written CLUSTER)
 //   TTL = timeout                                  create_reply_message(req, body)
 //                                                    → topic = <CLUSTER>_REPLY_TOPIC
 //                                                    → MSG_TYPE = "reply"
 //   ◄── PUSH_REPLY_MESSAGE_TO_CLIENT(326) ────        producer.send(reply) → 325
-//        broker 按 REPLY_TO_CLIENT 找到请求方连接推回
+//        the broker finds the requester's connection by REPLY_TO_CLIENT and pushes back
 //
 //
-// ⚠ 两个真机必踩点：
-//   1) <cluster>_REPLY_TOPIC 是 broker 启动时注册的**系统 topic**，客户端 createTopic 会被
-//      INVALID_PARAMETER(29)「conflict with system topic」拒绝，且 broker 侧不留日志，只能从
-//      客户端异常看出来 —— 所以顺手把"错误传播是准的"也验了。
-//   2) 消费者一律用 CONSUME_FROM_FIRST_OFFSET（项目 MEMORY 第 8 条硬性约定）。
+// Two things a real machine always trips over:
+//   1) <cluster>_REPLY_TOPIC is a **system topic** the broker registers on startup; a client
+//      createTopic is refused with INVALID_PARAMETER(29) "conflict with system topic", and the
+//      broker side logs nothing so you can only tell from the client exception -- so
+//  "the error propagation is accurate" is verified as well while at it.
+//   2) consumers always use CONSUME_FROM_FIRST_OFFSET (the hard requirement in item 8 of the
+//      project's MEMORY).
 using System.Text;
 using System.Threading;
 
@@ -38,7 +41,7 @@ public static class LiveRR
     private static readonly string WatchGroup = "CG_RRWatchNet_" + Stamp;
 
     private const int QueueNum = 4;
-    // broker.conf 里写的是 brokerClusterName=DefaultCluster（见 /tmp/run_*_live.sh）
+    // What is written in broker.conf is brokerClusterName=DefaultCluster (see /tmp/run_*_live.sh)
     private const string Cluster = "DefaultCluster";
     private static readonly string ReplyTopic = MixAll.GetReplyTopic(Cluster);
     private const int RequestTimeout = 8000;
@@ -68,7 +71,8 @@ public static class LiveRR
 
     private static string BodyOf(Message m) => Encoding.UTF8.GetString(m.Body);
 
-    // 顺着 inner 链找出 broker 的原始异常（CreateTopic 把 MQBrokerException 包进 MQClientException）。
+    // Follows the inner chain to find the broker's original exception (CreateTopic wraps the
+  // MQBrokerException in an MQClientException).
     private static MQBrokerException? FindBrokerException(Exception? e)
     {
         while (e is not null)
@@ -100,7 +104,7 @@ public static class LiveRR
         return false;
     }
 
-    // ---------------- 应答方监听器（普通 push 消费者 + 发应答的生产者） ----------------
+    // ---------------- the replier's listener (an ordinary push consumer + a producer that sends the reply) ----------------
     private sealed class ReplierListener : IMessageListenerConcurrently
     {
         private readonly DefaultMQProducer _producer;
@@ -114,7 +118,8 @@ public static class LiveRR
         private string? _firstTtl;
         private MessageExt? _deliveredPing;
 
-        /// <summary>投递到的那条 "ping-1" 请求原文（S8 要用它验 broker 写的 CLUSTER）。</summary>
+      /// <summary>The verbatim "ping-1" request that was delivered (S8 uses it to verify
+    /// the CLUSTER the broker wrote).</summary>
         public MessageExt? DeliveredPing
         {
             get
@@ -195,7 +200,7 @@ public static class LiveRR
                     _received.Add(body);
                     if (body == "ping-1")
                     {
-                        // S8 要用**投递到的**那条原始消息验 CLUSTER 是 broker 补的
+       // S8 must use the **delivered** original message to verify the CLUSTER was filled in by the broker
                         _deliveredPing = m;
                     }
 
@@ -230,7 +235,7 @@ public static class LiveRR
         }
     }
 
-    // ---------------- 独立订阅 <cluster>_REPLY_TOPIC 的观察者（S4 的硬证据） ----------------
+    // ---------------- an independent observer subscribing to <cluster>_REPLY_TOPIC (the hard evidence for S4) ----------------
     private sealed class CollectListener : IMessageListenerConcurrently
     {
         private readonly List<string> _got = new();
@@ -270,12 +275,12 @@ public static class LiveRR
 
         Console.WriteLine(new string('=', 70));
         Console.WriteLine("Request-Reply live (C#): namesrv=" + namesrv + " topic=" + Topic);
-        Console.WriteLine("   应答 topic = " + ReplyTopic + "  cluster=" + Cluster);
+     Console.WriteLine("   reply topic = " + ReplyTopic + "  cluster=" + Cluster);
         Console.WriteLine(new string('=', 70));
 
-        // ---------------- S1 建请求 topic；应答 topic 由 broker 预注册（客户端不能建） ----------------
+     // ---------------- S1 create the request topic; the reply topic is pre-registered by the broker (a client cannot create it) ----------------
         Console.WriteLine();
-        Console.WriteLine("S1 建请求 topic；应答 topic 由 broker 预注册（客户端不能建）");
+    Console.WriteLine("S1 create the request topic; the reply topic is pre-registered by the broker (a client cannot create it)");
         {
             var prep = new DefaultMQProducer("PG_RRPrepNet_" + Stamp)
             {
@@ -288,22 +293,23 @@ public static class LiveRR
                 try
                 {
                     prep.CreateTopic("TBW102", ReplyTopic, QueueNum);
-                    Check("S1 客户端 CreateTopic(应答 topic) 被 broker 拒绝", false, "竟然建成功了");
+          Check("S1 the client's CreateTopic(reply topic) was rejected by the broker", false, "it unexpectedly succeeded");
                 }
                 catch (Exception e)
                 {
                     MQBrokerException? be = FindBrokerException(e);
                     int code = be?.ResponseCode ?? -1;
                     string desc = be?.ResponseMessage ?? string.Empty;
-                    // CreateTopicInRoute 把 MQBrokerException 的 message 文本嵌进外层
-                    // MQClientException（没把原异常作为 InnerException 透传），故也直接看文本。
-                    // broker 拒绝系统 topic 的原文固定为「CODE: 29 ... conflict with system topic」。
+   // CreateTopicInRoute embeds the MQBrokerException's message text into the outer
+    // MQClientException (it does not pass the original exception through as InnerException),
+    // so the text is looked at directly too. The broker's text for refusing a system topic
+ // is fixed: "CODE: 29 ... conflict with system topic".
                     string full = e.Message;
                     bool ok = (code == ResponseCode.InvalidParameter
                                   && desc.Contains("system topic", StringComparison.Ordinal))
                               || (full.Contains("CODE: 29", StringComparison.Ordinal)
                                   && full.Contains("system topic", StringComparison.Ordinal));
-                    Check("S1 客户端 CreateTopic(应答 topic) 被拒（broker 系统 topic）",
+           Check("S1 the client's CreateTopic(reply topic) was rejected (a broker system topic)",
                         ok, "code=" + (code >= 0 ? code.ToString(CultureInfo.InvariantCulture) : "?")
                         + " msg=" + full);
                 }
@@ -320,11 +326,13 @@ public static class LiveRR
             InstanceName = "RRReqNet",
         };
         requester.Start();
-        // 请求方必须先被 broker 登记（心跳）才能被 REPLY_TO_CLIENT 反查到 channel，
-        // 否则 broker 的 ReplyMessageProcessor 找不到 channel，回给应答方 SYSTEM_ERROR。
-        // C# 在 Request() 内部会补一次心跳（SendHeartbeatToAllBroker），
-        // 这里仅确认实例已经起来、clientId 已生成（真正的注册证明是 S3 能拿到应答）。
-        Check("S1 请求方已启动、clientId 已生成",
+        // The requesting side must be registered with the broker (heartbeat) before
+  // REPLY_TO_CLIENT can look the channel up, otherwise the broker's ReplyMessageProcessor
+        // finds no channel and replies SYSTEM_ERROR to the replier.
+  // C# issues one heartbeat inside Request() (SendHeartbeatToAllBroker); here it only
+ // confirms the instance is up and the clientId has been generated (the real proof of
+  // registration is that S3 gets a response).
+    Check("S1 the requesting side is up and its clientId has been generated",
             requester.IsStarted && requester.ClientId.Length > 0, "clientId=" + requester.ClientId);
 
         var replierProducer = new DefaultMQProducer("PG_RRReplierNet_" + Stamp)
@@ -344,7 +352,7 @@ public static class LiveRR
         replierConsumer.SetMessageListener(replier);
         replierConsumer.Start();
 
-        // 观察者：独立订阅 <cluster>_REPLY_TOPIC，是 S4 的硬证据
+     // The observer: independently subscribes to <cluster>_REPLY_TOPIC, the hard evidence for S4
         var watcher = new CollectListener();
         var watchConsumer = new DefaultMQPushConsumer(WatchGroup)
         {
@@ -355,14 +363,14 @@ public static class LiveRR
         watchConsumer.Subscribe(ReplyTopic, "*");
         watchConsumer.SetMessageListener(watcher);
         watchConsumer.Start();
-        Check("S1 应答消费者 / 观察者已启动",
+   Check("S1 the reply consumer / observer started",
             replierConsumer.IsStarted && watchConsumer.IsStarted, "");
 
         try
         {
-            // ---------------- S2/S3 一次完整往返 ----------------
+            // ---------------- S2/S3 one complete round trip ----------------
             Console.WriteLine();
-            Console.WriteLine("S2/S3 一次完整 request → reply 往返");
+    Console.WriteLine("S2/S3 one complete request -> reply round trip");
             var msg = new Message(Topic, Str2Bytes("ping-1"))
             {
                 Keys = "rr",
@@ -370,41 +378,41 @@ public static class LiveRR
             Message reply = requester.Request(msg, RequestTimeout);
 
             string want = "reply:ping-1";
-            Check("S3 Request() 拿到应答且 body 正确", BodyOf(reply) == want,
+     Check("S3 Request() got the response and the body is correct", BodyOf(reply) == want,
                 "got=" + BodyOf(reply) + " want=" + want);
-            Check("S3 应答 topic 是 <cluster>_REPLY_TOPIC", reply.Topic == ReplyTopic,
+    Check("S3 the reply topic is <cluster>_REPLY_TOPIC", reply.Topic == ReplyTopic,
                 "topic=" + reply.Topic);
             string? arrive = reply.GetProperty(MessageConst.PropertyReplyMessageArriveTime);
-            Check("S3 应答带 REPLY_MESSAGE_ARRIVE_TIME（客户端收到时打的戳）",
+  Check("S3 the reply carries REPLY_MESSAGE_ARRIVE_TIME (the stamp the client puts on when it receives it)",
                 !string.IsNullOrEmpty(arrive) && arrive.All(char.IsDigit), "value=" + arrive);
 
             bool gotReq = WaitFor(() => replier.ReceivedCount >= 1, 15000);
-            Check("S2 应答方收到请求消息", gotReq, "received=" + replier.ReceivedCount);
+     Check("S2 the replier received the request message", gotReq, "received=" + replier.ReceivedCount);
             if (gotReq)
             {
                 (string? corr, string? replyTo, string? ttl) = replier.FirstRequest;
-                Check("S2 请求消息带 CORRELATION_ID（uuid 字符串）",
+             Check("S2 the request message carries CORRELATION_ID (a uuid string)",
                     !string.IsNullOrEmpty(corr) && corr.Length == 36, "corr=" + corr);
-                Check("S2 请求消息带 REPLY_TO_CLIENT = 请求方 clientId",
+      Check("S2 the request message carries REPLY_TO_CLIENT = the requester's clientId",
                     replyTo == requester.ClientId, "replyTo=" + replyTo
                     + " clientId=" + requester.ClientId);
-                Check("S2 请求消息带 TTL = timeout", ttl == RequestTimeout.ToString(CultureInfo.InvariantCulture),
+  Check("S2 the request message carries TTL = timeout", ttl == RequestTimeout.ToString(CultureInfo.InvariantCulture),
                     "ttl=" + ttl);
             }
 
-            // ---------------- S4 应答确实走了 325 且落到了 REPLY_TOPIC ----------------
+          // ---------------- S4 the reply really went through 325 and landed on REPLY_TOPIC ----------------
             Console.WriteLine();
-            Console.WriteLine("S4 应答走 SEND_REPLY_MESSAGE_V2(325) 且落到 <cluster>_REPLY_TOPIC");
+    Console.WriteLine("S4 the reply goes out via SEND_REPLY_MESSAGE_V2(325) and lands on <cluster>_REPLY_TOPIC");
             bool replied = WaitFor(() => replier.RepliedCount >= 1, 15000);
-            Check("S4 应答方成功发出了应答消息", replied,
+      Check("S4 the replier sent the reply message successfully", replied,
                 "replied=" + replier.RepliedCount + " errors=" + replier.ReplyErrors);
             bool seen = WaitFor(() => watcher.Got.Contains(want), 15000);
-            Check("S4 订阅 " + ReplyTopic + " 的独立消费者能看到该应答",
+            Check("S4 the independent consumer of " + ReplyTopic + " can see that reply",
                 seen, "watched=[" + string.Join(" ", watcher.Got) + "]");
 
-            // ---------------- S5 无应答方 → RequestTimeoutException ----------------
+  // ---------------- S5 no replier -> RequestTimeoutException ----------------
             Console.WriteLine();
-            Console.WriteLine("S5 无应答方时 Request() 抛 RequestTimeoutException");
+  Console.WriteLine("S5 with no replier, Request() throws RequestTimeoutException");
             string silentTopic = Topic + "_NoReplier";
             {
                 var prep2 = new DefaultMQProducer("PG_RRPrep2Net_" + Stamp)
@@ -439,19 +447,19 @@ public static class LiveRR
             }
 
             long elapsed = NowMs() - t0;
-            Check("S5 抛的是 RequestTimeoutException（不是静默返回/别的异常）",
+         Check("S5 what is thrown is a RequestTimeoutException (not a silent return / some other exception)",
                 raised is RequestTimeoutException,
                 "raised=" + (raised?.GetType().Name ?? "null") + ": " + raised?.Message);
-            Check("S5 异常带 10006 REQUEST_TIMEOUT_EXCEPTION",
+    Check("S5 the exception carries 10006 REQUEST_TIMEOUT_EXCEPTION",
                 raised is MQClientException mce
                 && mce.ResponseCode == ClientErrorCode.RequestTimeoutException,
                 "code=" + (raised as MQClientException)?.ResponseCode);
-            Check("S5 超时时长接近设定值（2s ~ 12s，说明真的等了而不是立即失败）",
+     Check("S5 the timeout duration is close to the configured value (2s ~ 12s, showing it really waited rather than failing at once)",
                 2000 <= elapsed && elapsed <= 12000, "elapsed=" + elapsed.ToString(CultureInfo.InvariantCulture) + "ms");
 
-            // ---------------- S6 并发请求不串台 ----------------
+          // ---------------- S6 concurrent requests do not cross wires ----------------
             Console.WriteLine();
-            Console.WriteLine("S6 并发 3 个 request，各自拿到自己的应答");
+     Console.WriteLine("S6 3 concurrent requests, each getting its own reply");
             var results = new System.Collections.Concurrent.ConcurrentDictionary<int, string>();
             var errors = new List<string>();
             var tasks = new List<Task>();
@@ -491,32 +499,33 @@ public static class LiveRR
                 }
             }
 
-            Check("S6 3 个并发 request 全部拿到应答且一一对应",
+            Check("S6 all 3 concurrent requests got a reply and they match one to one",
                 s6Ok, "results=" + string.Join(",", results.OrderBy(k => k.Key)
                     .Select(k => k.Key.ToString(CultureInfo.InvariantCulture) + "=>" + k.Value))
                 + " errors=" + string.Join("; ", errors));
 
-            // ---------------- S7 消费者未被 Reply 流量破坏 ----------------
+     // ---------------- S7 the consumer is not disturbed by the Reply traffic ----------------
             Console.WriteLine();
-            Console.WriteLine("S7 应答方的消费者仍然完好（普通 push 消费不受 Reply 影响）");
+        Console.WriteLine("S7 the replier's consumer is still intact (ordinary push consumption is unaffected by Reply)");
             var plain = new Message(Topic, Str2Bytes("plain-after-replies"))
             {
                 Keys = "rr-plain",
             };
             requester.Send(plain);
             bool plainOk = WaitFor(() => replier.ReceivedBody("plain-after-replies"), 15000);
-            Check("S7 后续普通消息仍被消费", plainOk,
+     Check("S7 subsequent ordinary messages are still consumed", plainOk,
                 "received=" + replier.ReceivedCount);
 
             Console.WriteLine();
-            Console.WriteLine("S8 CLUSTER 由 broker 写入；造不出应答时报 10007 而不是别的错");
+     Console.WriteLine("S8 CLUSTER is written by the broker; when the reply cannot be built it reports 10007 rather than some other error");
             MessageExt? delivered = replier.DeliveredPing;
-            Check("S8 投递到的请求消息带 broker 写入的 CLUSTER=" + Cluster,
+     Check("S8 the delivered request message carries the broker-written CLUSTER=" + Cluster,
                 delivered?.GetProperty(MessageConst.PropertyCluster) == Cluster,
                 "cluster=" + delivered?.GetProperty(MessageConst.PropertyCluster));
-            // GetProperty 对不存在的键返回空串（不是 null），所以这里判"空"而不是"null"；
-            // 下面那条 10007 断言才是"这份确实没有 CLUSTER"的硬证据。
-            Check("S8 客户端手里那份请求消息**没有** CLUSTER（属性确实是 broker 补的）",
+            // GetProperty returns an empty string (not null) for a key that is not there, so
+  // this checks "empty" rather than "null"; the 10007 assertion below is the hard evidence
+      // that "this really has no CLUSTER".
+            Check("S8 the request message on the client side has **no** CLUSTER (the property really was filled in by the broker)",
                 msg.GetProperty(MessageConst.PropertyCluster).Length == 0,
                 "value=\"" + msg.GetProperty(MessageConst.PropertyCluster) + "\"");
 
@@ -530,12 +539,12 @@ public static class LiveRR
                 raised8 = e;
             }
 
-            Check("S8 拿本地那份请求消息造应答 → MQClientException 带 10007",
+      Check("S8 building a reply from the local copy of the request message -> MQClientException carrying 10007",
                 raised8 is MQClientException c8
                 && c8.ResponseCode == ClientErrorCode.CreateReplyMessageException,
                 "raised=" + (raised8?.GetType().Name ?? "null") + " code="
                 + (raised8 as MQClientException)?.ResponseCode);
-            Check("S8 10007 的文案与协议约定逐字一致，点到缺失的 CLUSTER 属性",
+   Check("S8 the 10007 message is verbatim as agreed by the protocol and points at the missing CLUSTER property",
                 raised8?.Message.Contains("property[" + MessageConst.PropertyCluster
                                           + "] is null.") == true,
                 "msg=" + raised8?.Message);
@@ -550,7 +559,7 @@ public static class LiveRR
                 raised8b = e;
             }
 
-            Check("S8 请求消息为 null → 同样是 10007（不是裸 NullReferenceException）",
+            Check("S8 a null request message -> also 10007 (not a bare NullReferenceException)",
                 raised8b is MQClientException c8b
                 && c8b.ResponseCode == ClientErrorCode.CreateReplyMessageException,
                 "raised=" + (raised8b?.GetType().Name ?? "null") + " code="

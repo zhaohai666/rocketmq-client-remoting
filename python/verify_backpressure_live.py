@@ -28,7 +28,7 @@ def check(name, ok, detail=""):
 
 
 class _Recorder:
-    """线程安全的回调记录（SendCallback 的鸭子类型）。"""
+    """Thread-safe callback recorder (a duck type of SendCallback)."""
 
     def __init__(self):
         self.lock = threading.Lock()
@@ -55,10 +55,10 @@ class _Recorder:
 
 
 class _SlowHook:
-    """在 ``sendKernelImpl`` 的 before 钩子里睡一会儿。
+    """Sleep for a while in the before hook of ``sendKernelImpl``.
 
-    许可是在**闸上**拿的、在**链的终点**还的，所以占住在途最干净的办法是让链本身变慢：
-    堵用户回调占不住许可（归还就在把结果交给用户之前一步）。
+    Permits are taken at the gate and returned at the end of the chain, so the cleanest way to hold in-flight slots is to slow the chain itself:
+    blocking the user callback cannot hold a permit (it is returned one step before the result is handed to the user).
     """
 
     def __init__(self, millis=300):
@@ -105,35 +105,35 @@ def _join_all(threads, timeout=30.0):
     for t in threads:
         t.join(max(0.0, deadline - time.monotonic()))
     stuck = sum(1 for t in threads if t.is_alive())
-    check("*  发送线程没有卡死", stuck == 0, "%d 条还活着" % stuck)
+    check("*  send threads did not get stuck", stuck == 0, "%d still alive" % stuck)
 
 
 def _landed_count(admin, topic, quiet=False):
-    """broker 上这个 topic 一共落了多少条（各队列 maxOffset-minOffset 之和）。
+    """How many messages landed on this topic on the broker (sum of maxOffset-minOffset across queues).
 
-    这是「被拒的发送连请求都没发出去」的唯一硬证据：只看客户端回调的话，
-    一个「回调报错但请求其实发出去了」的实现也能骗过去。读不到路由返回 -1。
+    This is the only hard evidence that "a rejected send never even sent its request": judging only by the client callback,
+    an implementation that "errors the callback but actually sent the request" would also pass. Returns -1 when the route cannot be read.
     """
     try:
         queues = admin.examine_topic_route(topic).get_all_message_queue(topic)
-    except Exception as e:  # noqa: BLE001 — 路由还没注册上
+    except Exception as e:  # noqa: BLE001 — route not registered yet
         if not quiet:
-            print("    (读 %s 路由失败: %s)" % (topic, e))
+            print("    (failed to read %s route: %s)" % (topic, e))
         return -1
     total = 0
     for mq in queues:
         try:
             total += admin.max_offset(mq) - admin.min_offset(mq)
-        except Exception:  # noqa: BLE001 — 该队列刚建出来还没写过
+        except Exception:  # noqa: BLE001 — this queue was just created and has not been written yet
             pass
     return total
 
 
 def _wait_landed(admin, topic, expected, timeout=30.0):
-    """等 broker 上至少出现 ``expected`` 条，返回最后一次的读数。
+    """Wait until at least ``expected`` messages appear on the broker, returning the last reading.
 
-    新建 topic 要等 broker 把 topicConfig 增量注册到 namesrv（秒级到十秒级），
-    所以头几次读不到路由不算失败，重试到超时才算。
+    A new topic must wait for the broker to register the topicConfig incrementally to namesrv (seconds to tens of seconds), so
+    the first few failed route reads are not failures; only retrying until timeout counts as failure.
     """
     deadline = time.time() + timeout
     landed = _landed_count(admin, topic, quiet=True)
@@ -141,7 +141,7 @@ def _wait_landed(admin, topic, expected, timeout=30.0):
         time.sleep(0.5)
         landed = _landed_count(admin, topic, quiet=True)
     if landed < 0:
-        _landed_count(admin, topic)      # 真读不到时把原因打出来，方便定位
+        _landed_count(admin, topic)      # when the route truly cannot be read, print the reason to help locate the issue
     return landed
 
 
@@ -160,7 +160,7 @@ def main():
     admin.start()
     topics = []
     try:
-        # ------------------------------------------------ B1 默认容量不漏配额
+        # ------------------------------------------------ B1 default capacity does not leak permits
         t1 = "BpDefault_%d" % STAMP
         topics.append(t1)
         p1 = _producer("bp-b1-%d" % STAMP)
@@ -172,20 +172,20 @@ def main():
             for i in range(40)]
         _start_all(b1_threads)
         _join_all(b1_threads)
-        check("B1 40 笔异步都走完回调", _wait_until(lambda: rec.done >= 40, timeout=15.0),
+        check("B1 all 40 async sends completed their callbacks", _wait_until(lambda: rec.done >= 40, timeout=15.0),
               rec.summary())
-        check("B1 全部 SEND_OK",
+        check("B1 all SEND_OK",
               all(r.send_status == SendStatus.SEND_OK for r in rec.results)
               and len(rec.results) == 40, rec.summary())
         landed = _wait_landed(admin, t1, 40)
-        check("B1 broker 上正好落了 40 条", landed == 40, "landed=%d" % landed)
-        check("B1 条数许可满额归还", _num_permits(p1) == 1024,
+        check("B1 exactly 40 landed on the broker", landed == 40, "landed=%d" % landed)
+        check("B1 count permits fully returned", _num_permits(p1) == 1024,
               "available=%d" % _num_permits(p1))
-        check("B1 字节许可满额归还", _size_permits(p1) == 100 * 1024 * 1024,
+        check("B1 byte permits fully returned", _size_permits(p1) == 100 * 1024 * 1024,
               "available=%d" % _size_permits(p1))
         p1.shutdown()
 
-        # ------------------------------------- B2/B3 条数闸：拒绝、对账、扩容
+        # ------------------------------------- B2/B3 count gate: reject, reconcile, expand
         t2 = "BpNumGate_%d" % STAMP
         topics.append(t2)
         p2 = _producer("bp-b2-%d" % STAMP, num=MIN_ASYNC_SEND_NUM)
@@ -196,72 +196,72 @@ def main():
         holders = [threading.Thread(target=lambda: p2.send_async(
             Message(t2, b"held"), held, 8000)) for _ in range(MIN_ASYNC_SEND_NUM)]
         _start_all(holders)
-        check("B2 在途占满后空闲条数为 0",
+        check("B2 the free count drops to 0 once in-flight is full",
               _wait_until(lambda: _num_permits(p2) == 0, timeout=3.0),
               "available=%d" % _num_permits(p2))
-        # 第 11、12 笔：预算只有 150ms，等不到许可
+        # The 11th and 12th sends: the budget is only 150ms, so they cannot wait for a permit
         rejected_threads = [threading.Thread(target=lambda: p2.send_async(
             Message(t2, b"rejected"), rejected, 150)) for _ in range(2)]
         began = time.monotonic()
         _start_all(rejected_threads)
         _join_all(rejected_threads, timeout=10.0)
-        check("B2 闸等到预算耗尽才报错（不是看一眼就拒）",
+        check("B2 the gate only errors after the budget is exhausted (it does not reject at a glance)",
               int((time.monotonic() - began) * 1000) >= 130,
-              "调用方等了 %dms" % int((time.monotonic() - began) * 1000))
-        check("B2 超限的两笔回调 TooMuchRequest，文案与协议约定逐字一致",
+              "the caller waited %dms" % int((time.monotonic() - began) * 1000))
+        check("B2 the two over-limit sends callback with TooMuchRequest, message matching the protocol contract verbatim",
               len(rejected.errors) == 2
               and all(isinstance(e, RemotingTooMuchRequestException) for e in rejected.errors)
               and all("send message tryAcquire semaphoreAsyncNum timeout" in str(e)
                       for e in rejected.errors),
               rejected.summary())
         _join_all(holders, timeout=25.0)
-        check("B2 在途的 10 笔都发出去了",
+        check("B2 all 10 in-flight sends went out",
               _wait_until(lambda: len(held.results) == MIN_ASYNC_SEND_NUM, timeout=20.0),
               held.summary())
         landed2 = _wait_landed(admin, t2, MIN_ASYNC_SEND_NUM)
-        check("B2 被拒的两笔在 broker 上一条没留（连请求都没发）",
+        check("B2 the two rejected sends left nothing on the broker (not even a request)",
               landed2 == MIN_ASYNC_SEND_NUM,
-              "landed=%d 期望 %d" % (landed2, MIN_ASYNC_SEND_NUM))
-        check("B2 全部落地后条数许可回到 10",
+              "landed=%d expected %d" % (landed2, MIN_ASYNC_SEND_NUM))
+        check("B2 count permits return to 10 after everything lands",
               _wait_until(lambda: _num_permits(p2) == MIN_ASYNC_SEND_NUM, timeout=20.0),
               "available=%d" % _num_permits(p2))
 
-        # B3：再占满 10 个在途，把容量抬到 12 —— 卡在闸上的人应当被叫醒。
-        # 这一轮把钩子睡到 2s：占住在途的时间必须远大于「起线程 + 轮询确认 + 起等待方」
-        # 这几步的开销，否则检查还没做完整轮就已经归还了（300ms 时实测就会漏）。
+        # B3: fill 10 in-flight again and raise the capacity to 12 -- those stuck at the gate should be woken up.
+        # This round sleeps the hook for 2s: the in-flight hold time must be far greater than the cost of "start thread + poll to confirm + start waiter",
+        # otherwise permits are already returned before the check completes a full pass (at 300ms this was observed to miss).
         slow2.millis = 2000
         holders2 = _Recorder()
         round2 = [threading.Thread(target=lambda: p2.send_async(
             Message(t2, b"held2"), holders2, 8000)) for _ in range(MIN_ASYNC_SEND_NUM)]
         _start_all(round2)
-        check("B3 第二轮在途同样占满", _wait_until(lambda: _num_permits(p2) == 0, timeout=3.0),
+        check("B3 the second round fills in-flight just the same", _wait_until(lambda: _num_permits(p2) == 0, timeout=3.0),
               "available=%d" % _num_permits(p2))
         waiter = threading.Thread(target=lambda: p2.send_async(
             Message(t2, b"woken"), woken, 8000))
         waiter.start()
         time.sleep(0.3)
-        check("B3 扩容前调用方确实卡在闸上", waiter.is_alive() and _num_permits(p2) == 0,
+        check("B3 before the expansion the caller really is stuck at the gate", waiter.is_alive() and _num_permits(p2) == 0,
               "alive=%s available=%d" % (waiter.is_alive(), _num_permits(p2)))
         p2.set_back_pressure_for_async_send_num(MIN_ASYNC_SEND_NUM + 2)
         waiter.join(15.0)
-        # 调用方线程被叫醒就算「过闸了」，但结果要等整条链跑完（这一轮钩子睡 2s）才回到回调，
-        # 所以这里等的是回调，不是线程退出。
-        check("B3 扩容把卡在闸上的发送方叫醒并发了出去",
+        # The caller thread being woken up counts as "through the gate", but the result only reaches the callback after the whole chain finishes (this round the hook sleeps 2s),
+        # so what we wait for here is the callback, not thread exit.
+        check("B3 the expansion woke up the sender stuck at the gate and sent it",
               not waiter.is_alive() and _wait_until(
                   lambda: any(r.send_status == SendStatus.SEND_OK for r in woken.results),
                   timeout=20.0),
               woken.summary())
         _join_all(round2, timeout=25.0)
-        check("B3 全部归还后空闲许可 = 新容量 12",
+        check("B3 free permits = the new capacity 12 after everything is returned",
               _wait_until(lambda: _num_permits(p2) == MIN_ASYNC_SEND_NUM + 2, timeout=25.0),
               "available=%d" % _num_permits(p2))
         expect3 = 2 * MIN_ASYNC_SEND_NUM + 1
         landed3 = _wait_landed(admin, t2, expect3)
-        check("B3 broker 总数 = 两轮在途 + 被叫醒的那一笔", landed3 == expect3,
-              "landed=%d 期望 %d" % (landed3, expect3))
+        check("B3 broker total = two rounds of in-flight + the woken send", landed3 == expect3,
+              "landed=%d expected %d" % (landed3, expect3))
         p2.shutdown()
 
-        # ------------------------------------------- B4 字节闸（1M 地板 + 600KB）
+        # ------------------------------------------- B4 byte gate (1M floor + 600KB)
         t3 = "BpSizeGate_%d" % STAMP
         topics.append(t3)
         p3 = _producer("bp-b4-%d" % STAMP, num=MIN_ASYNC_SEND_NUM,
@@ -272,32 +272,32 @@ def main():
         one, two = _Recorder(), _Recorder()
         th_big = threading.Thread(target=lambda: p3.send_async(Message(t3, big), one, 8000))
         th_big.start()
-        check("B4 在途字节许可正好扣掉 body 长度",
+        check("B4 the in-flight byte permit is deducted by exactly the body length",
               _wait_until(lambda: _size_permits(p3) == MIN_ASYNC_SEND_SIZE - len(big),
                           timeout=3.0),
-              "available=%d 期望 %d" % (_size_permits(p3), MIN_ASYNC_SEND_SIZE - len(big)))
+              "available=%d expected %d" % (_size_permits(p3), MIN_ASYNC_SEND_SIZE - len(big)))
         th_two = threading.Thread(target=lambda: p3.send_async(Message(t3, big), two, 150))
         th_two.start()
         th_two.join(10.0)
-        check("B4 第二笔 600KB 过不了字节闸，文案与协议约定逐字一致",
+        check("B4 the second 600KB send cannot pass the byte gate, message matching the protocol contract verbatim",
               len(two.errors) == 1
               and "send message tryAcquire semaphoreAsyncSize timeout" in str(two.errors[0]),
               two.summary())
-        check("B4 字节闸没过时条数许可已经归还",
+        check("B4 the count permit is already returned when the byte gate fails",
               _wait_until(lambda: _num_permits(p3) == MIN_ASYNC_SEND_NUM, timeout=3.0),
               "available=%d" % _num_permits(p3))
         th_big.join(25.0)
-        check("B4 第一笔正常落地", _wait_until(lambda: one.done >= 1, timeout=20.0),
+        check("B4 the first send landed normally", _wait_until(lambda: one.done >= 1, timeout=20.0),
               one.summary())
         landed4 = _wait_landed(admin, t3, 1)
-        check("B4 broker 上只有第一笔（被拒的没留痕）", landed4 == 1, "landed=%d" % landed4)
-        check("B4 全部归还：条数与字节都回到配置额",
+        check("B4 only the first send is on the broker (the rejected one left no trace)", landed4 == 1, "landed=%d" % landed4)
+        check("B4 everything returned: both count and bytes are back to the configured amount",
               _num_permits(p3) == MIN_ASYNC_SEND_NUM
               and _size_permits(p3) == MIN_ASYNC_SEND_SIZE,
               "num=%d size=%d" % (_num_permits(p3), _size_permits(p3)))
         p3.shutdown()
 
-        # ------------------------------------------------ B5 关掉背压就不限流
+        # ------------------------------------------------ B5 backpressure off means no throttling
         t4 = "BpOff_%d" % STAMP
         topics.append(t4)
         p4 = _producer("bp-b5-%d" % STAMP, enable=False, num=MIN_ASYNC_SEND_NUM,
@@ -307,7 +307,7 @@ def main():
         rec5 = _Recorder()
 
         def _body(i):
-            # 每三笔里有一笔 300KB：关着背压时连字节闸都不看，开着的话这里必然限流
+            # One in three is 300KB: with backpressure off the byte gate is not even consulted, but with it on this would certainly throttle
             return Message(t4, b"x" * (300 * 1024) if i % 3 == 0 else b"small")
 
         b5_threads = [threading.Thread(
@@ -315,18 +315,18 @@ def main():
             for i in range(30)]
         _start_all(b5_threads)
         _join_all(b5_threads)
-        check("B5 关背压后 30 笔并发全部成功", _wait_until(lambda: rec5.done >= 30, timeout=25.0),
+        check("B5 with backpressure off, all 30 concurrent sends succeed", _wait_until(lambda: rec5.done >= 30, timeout=25.0),
               rec5.summary())
-        check("B5 全部 SEND_OK", len(rec5.results) == 30, rec5.summary())
+        check("B5 all SEND_OK", len(rec5.results) == 30, rec5.summary())
         landed5 = _wait_landed(admin, t4, 30)
-        check("B5 broker 上 30 条都在", landed5 == 30, "landed=%d" % landed5)
+        check("B5 all 30 are on the broker", landed5 == 30, "landed=%d" % landed5)
         p4.shutdown()
     finally:
         addr = _broker_addr(admin)
         for topic in topics:
             try:
                 admin.delete_topic_in_broker(addr, topic)
-            except Exception:  # noqa: BLE001 — 清理失败不影响结论
+            except Exception:  # noqa: BLE001 — cleanup failure does not affect the conclusion
                 pass
         admin.shutdown()
 

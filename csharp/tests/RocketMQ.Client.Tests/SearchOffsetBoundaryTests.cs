@@ -1,4 +1,4 @@
-// SEARCH_OFFSET_BY_TIMESTAMP(29) 的 boundaryType 字段（离线，无真实集群）。
+// The boundaryType field of SEARCH_OFFSET_BY_TIMESTAMP(29) (offline, no real cluster).
 using System.Collections.Generic;
 using RocketMQ.Client;
 using RocketMQ.Common;
@@ -29,7 +29,7 @@ public class SearchOffsetBoundaryTests
         return admin;
     }
 
-    // ---------------------------------------------------------------- 报文形状
+    // ---------------------------------------------------------------- Wire shape
 
     [Fact]
     public void WireValueIsTheLegacyEnumNameNotTheLowercaseName()
@@ -42,12 +42,13 @@ public class SearchOffsetBoundaryTests
             Assert.Equal(expected.ToLowerInvariant(), BoundaryTypeNames.LowercaseName(boundary));
         }
 
-        // 两套写法确实不同：getName() 拿到的小写名永远不进报文
+        // the two spellings really differ: the lowercase name from getName() never enters the message
         Assert.NotEqual(BoundaryTypeNames.Name(BoundaryType.Upper),
             BoundaryTypeNames.LowercaseName(BoundaryType.Upper));
     }
 
-    /// <summary>@CFNullable：没设就整键不写，不能发 boundaryType=""。</summary>
+    /// <summary>@CFNullable: when it is not set the whole key is not written, and
+    /// boundaryType="" must not be sent.</summary>
     [Fact]
     public void UnsetBoundaryOmitsTheField()
     {
@@ -60,7 +61,7 @@ public class SearchOffsetBoundaryTests
         Assert.Null(roundTrip.BoundaryType);
     }
 
-    /// <summary>BoundaryType.getType：只有 upper（大小写不敏感）才是 UPPER。</summary>
+    /// <summary>BoundaryType.getType: only upper (case-insensitive) is UPPER.</summary>
     [Fact]
     public void DecodeIsLenientLikeLegacyGetType()
     {
@@ -81,7 +82,8 @@ public class SearchOffsetBoundaryTests
         Assert.Equal(BoundaryType.Lower, BoundaryTypeNames.GetType("123"));
     }
 
-    /// <summary>缺键 ⇒ null（读取端自行回落 LOWER），与 @CFNullable 的语义一致。</summary>
+    /// <summary>A missing key => null (the reading side falls back to LOWER itself),
+    /// consistent with the @CFNullable semantics.</summary>
     [Fact]
     public void MissingKeyDecodesToNullNotLower()
     {
@@ -90,7 +92,7 @@ public class SearchOffsetBoundaryTests
         Assert.Null(header.BoundaryType);
     }
 
-    // ---------------------------------------------------------------- 调用链（真连接，mock broker）
+    // ---------------------------------------------------------------- The call chain (a real connection, mock broker)
 
     [Fact]
     public void ClientAlwaysSendsLowerByDefault()

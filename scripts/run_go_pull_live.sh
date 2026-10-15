@@ -1,20 +1,24 @@
 #!/bin/bash
-# Go 主动拉取消费者（DefaultMQPullConsumer）的真机验证（跑 Go → 用**已验证的 Python
-# 客户端**回读对拍）。
+# Live verification of the Go active-pull consumer (DefaultMQPullConsumer) (run Go -> read
+# back and cross-check with the **already-verified Python client**).
 #
-# 用法: bash scripts/run_go_pull_live.sh [namesrv]        （默认 127.0.0.1:9876）
+# Usage: bash scripts/run_go_pull_live.sh [namesrv]        (default 127.0.0.1:9876)
 #
-# 为什么必须两个语言一起跑：Go 侧对 broker 的断言有一半是"自问自答" —— 自己提交位点、
-# 自己读回来，报文里 extFields 键名拼错（UPDATE_CONSUMER_OFFSET 的
-# consumerGroup/topic/queueId/commitOffset、CONSUMER_SEND_MSG_BACK 的
-# group/originTopic/offset/delayLevel/originMsgId/maxReconsumeTimes/unitMode）broker
-# 照样可能回 SUCCESS。判定标准是「换一个独立实现、按同一套协议字段名去问，能不能问出同样的
-# 结果」（见 python/go_pull_consume_check.py 的 docstring）。
+# Why both languages must run together: half of the Go side's assertions against the broker
+# are "self-asking and self-answering" — it commits offsets itself and reads them back itself.
+# If the extFields key names in the request are misspelled (UPDATE_CONSUMER_OFFSET's
+# consumerGroup/topic/queueId/commitOffset, CONSUMER_SEND_MSG_BACK's
+# group/originTopic/offset/delayLevel/originMsgId/maxReconsumeTimes/unitMode), the broker may
+# still reply SUCCESS. The verdict standard is "ask with an independent implementation using
+# the same set of protocol field names and see whether the same result comes out" (see the
+# docstring of python/go_pull_consume_check.py).
 #
-# 集群：默认假定已经在跑（scripts/rmq_test_broker.sh 那套）。端口探测失败会自动
-# `rmq_test_broker.sh start`，并在收工时只停自己起来的那一次；已经在跑的不碰。
+# Cluster: assumes one is already running by default (the scripts/rmq_test_broker.sh setup).
+# If the port probe fails, it automatically runs `rmq_test_broker.sh start`, and on cleanup
+# stops only the instance it started; anything already running is left untouched.
 #
-# ⚠ 集群 start + 等端口 + 跑验证 + kill 必须都在本脚本内串完：前台返回会回收后台 JVM。
+# ⚠ Cluster start + waiting for ports + running verification + kill must all be chained inside
+# this script: when a foreground command returns, the background JVMs are reaped.
 set -u
 
 NS=${1:-${ROCKETMQ_NAMESRV:-127.0.0.1:9876}}
@@ -34,27 +38,29 @@ port_open() {
 STARTED_BROKER=0
 cleanup() {
     if [ "$STARTED_BROKER" = "1" ]; then
-        echo "--- 收工：停掉本脚本起的 broker ---"
+        echo "--- Done: stopping the broker started by this script ---"
         sh "$ROOT/scripts/rmq_test_broker.sh" stop || true
     fi
 }
 trap cleanup EXIT
 
 if ! port_open "$BROKER_PORT"; then
-    echo "=== broker 未监听 ${BROKER_PORT}，拉起本地测试集群 ==="
-    sh "$ROOT/scripts/rmq_test_broker.sh" start || { echo "broker 起不来"; exit 1; }
+    echo "=== broker not listening on ${BROKER_PORT}, starting a local test cluster ==="
+    sh "$ROOT/scripts/rmq_test_broker.sh" start || { echo "broker failed to start"; exit 1; }
     STARTED_BROKER=1
-    # 端口先于「向 namesrv 注册路由」就绪，不等就会拿不到 TBW102 路由而假失败。
+    # The port opens before "routes are registered into the namesrv"; without waiting, TBW102
+    # routes are missing and the run fails spuriously.
     sleep 12
 fi
-port_open 9876 || { echo "nameserver 9876 没监听，先起 namesrv"; exit 1; }
+port_open 9876 || { echo "nameserver 9876 not listening; start namesrv first"; exit 1; }
 
 echo ""
 echo "=== [1/2] Go pull consumer live (topic=${TOPIC} group=${GROUP} suspend=${SUSPEND}) ==="
 cd "$ROOT/go" || exit 1
 GO_LOG=$(mktemp -t go_live_pull.XXXXXX)
-# 回读的期望位点/条数取自 Go 侧自己报的 COMMITTED=/TOTAL=，不写死：往 live_pull 里加
-# 一个检查就会让写死的期望值悄悄失准（少要几条 → 假绿）。
+# The expected offset/count for read-back come from the Go side's own COMMITTED=/TOTAL= report,
+# not hardcoded: adding one more check inside live_pull would silently invalidate hardcoded
+# expectations (asking for a few fewer -> false green).
 set -o pipefail
 "$GO" run ./examples/live_pull -ns "$NS" -topic "$TOPIC" -group "$GROUP" -suspend "$SUSPEND" 2>&1 | tee "$GO_LOG"
 GO_RC=$?
@@ -64,31 +70,32 @@ EXPECT_LINE=$(sed -n 's/^PASS=[0-9]* FAIL=[0-9]* COMMITTED=\([0-9][0-9]*\) TOTAL
 if [ -n "$EXPECT_LINE" ]; then
     COMMITTED=${EXPECT_LINE% *}
     TOTAL=${EXPECT_LINE#* }
-    echo "--- Go 报称 COMMITTED=$COMMITTED TOTAL=${TOTAL}，按此对拍 ---"
+    echo "--- Go reports COMMITTED=$COMMITTED TOTAL=${TOTAL}, cross-checking against it ---"
 else
     COMMITTED=3
     TOTAL=6
-    echo "--- 没读到 COMMITTED/TOTAL，回退到旧口径 3/6 ---"
+    echo "--- COMMITTED/TOTAL not found, falling back to the old baseline 3/6 ---"
 fi
 
 echo ""
-echo "=== [2/2] Python 客户端回读对拍 ==="
+echo "=== [2/2] Python client read-back cross-check ==="
 cd "$ROOT/python" || exit 1
 PY_LOG=$(mktemp -t py_read_go_pull.XXXXXX)
 "$PY" go_pull_consume_check.py "$TOPIC" "$GROUP" "$COMMITTED" "$TOTAL" 2>&1 | tee "$PY_LOG" | grep -E "^(PASS|FAIL|PASS=)"
 PY_RC=${PIPESTATUS[0]}
-# 汇总行只在脚本正常跑完时出现。没有它说明中途抛异常了 —— 那就把完整输出（含栈）
-# 打出来，否则被 grep 过滤掉的 traceback 会让人以为"少了一条断言"。
+# The summary line only appears when the script finishes normally. Without it something threw
+# mid-run — print the full output (with the stack); otherwise the traceback filtered out by
+# grep would make people think "one assertion fewer".
 if ! grep -q '^PASS=' "$PY_LOG"; then
-    echo "--- 没读到 PASS= 汇总行，完整输出如下（很可能是异常中断）---"
+    echo "--- PASS= summary line not found; full output below (most likely aborted by an exception) ---"
     cat "$PY_LOG"
 fi
 echo "--- python exit=$PY_RC ---"
 
 echo ""
 if [ "$GO_RC" -eq 0 ] && [ "$PY_RC" -eq 0 ]; then
-    echo "结果: 全部通过 (topic=$TOPIC group=$GROUP)"
+    echo "Result: all passed (topic=$TOPIC group=$GROUP)"
     exit 0
 fi
-echo "结果: 有失败 (go=$GO_RC python=$PY_RC topic=$TOPIC)"
+echo "Result: failures detected (go=$GO_RC python=$PY_RC topic=$TOPIC)"
 exit 1

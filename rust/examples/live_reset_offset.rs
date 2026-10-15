@@ -1,27 +1,28 @@
-//! 重置位点（RESET_CONSUMER_OFFSET）真机验证。
+//! Live verification of offset reset (RESET_CONSUMER_OFFSET).
 //!
-//! 220 是 broker 推给**消费端**的重置指令；管理端那笔 `INVOKE_BROKER_TO_RESET_OFFSET(222)`
-//! 的响应只是一张「每个队列重置到哪」的表，真正让消费端改位点的是 broker 随后 oneway 推的
-//! 220（`Broker2Client.resetOffset:181-238`）。broker 只在 `useServerSideResetOffset=false`
-//! 时才走这条推送路径（默认 true 在 `AdminBrokerProcessor:2255-2263` 直接服务端改位点、
-//! 一台消费端都不通知），所以本验证先把该开关热改成 false（回读确认），跑完还原。
+//! 220 is the reset instruction the broker pushes to the **consumer**; the response of the
+//! admin-side `INVOKE_BROKER_TO_RESET_OFFSET(222)` is only a table of "where each queue resets to",
+//! and what actually changes the consumer's offset is the oneway 220 the broker pushes right after
+//! (`Broker2Client.resetOffset:181-238`). The broker only takes this push path when `useServerSideResetOffset=false`
+//! (the default true changes the offset server-side directly in `AdminBrokerProcessor:2255-2263`,
+//! notifying no consumer at all), so this verification first hot-flips the switch to false (confirmed by a read-back), and restores it afterwards.
 //!
-//! 离线单测（`client::consumer` 的 reset_offset_* 与 `client::mq_client` 的 220 处理器用例）
-//! 锁死了请求体两种形状与「撤队列 + 代号 +1 + 新位点经撤销尾巴落盘」的本地状态；下面这些
-//! 事只有真集群能证明：
+//! The offline unit tests (`client::consumer`'s reset_offset_* and `client::mq_client`'s 220 handler cases)
+//! pin down both request-body shapes and the local state of "drop the queue + bump the epoch + the new offset lands via the revoke tail"; only a real
+//! cluster can prove the following:
 //!
-//! S1「回退重置立刻生效 + 在途批次作废」——位点从 10 往回重置到 3，三段判据。a) broker 上的
-//! 已提交位点在 ~2s 内变成 3：窗口内**只有**重置路径那次 persist 会写它（周期落盘已拉长到
-//! 60s），只写内存表的实现在这里原地不动（broker 停在 10）。b) listener 里卡着的旧批次
-//! （重置前取回的 offset 10）放行后其 ack 必须整批作废 —— 采样点：放行旧批次、新队列的第一批
-//! 已进 listener 且还没 ack 时，本地已消费位点必须还是「没有记录 / ≤3」；没有代号闸门的实现
-//! 这时会跳到 11。c) 队列被真正重建：3..14 每一批都**重投一次**（旧缓冲里没 ack 的 11..14
-//! 也随之作废，只能作为重投的一部分出现）。
+//! S1 "backward reset takes effect immediately + in-flight batches invalidated" -- the offset resets from 10 back to 3, with three discriminators. a) The
+//! committed offset on the broker becomes 3 within ~2s: inside the window **only** the persist of the reset path writes it (the periodic flush has been stretched to
+//! 60s), while a memory-table-only implementation stays put here (broker stuck at 10). b) The old batch stuck in the listener
+//! (offset 10 fetched before the reset) must have its ack invalidated as a whole batch once released -- sampling point: after releasing the old batch, when the first batch of the
+//! new queue has entered the listener and not yet acked, the local consumed offset must still be "no record / <=3"; an implementation without the epoch gate
+//! would jump to 11 here. c) The queue is truly rebuilt: every batch of 3..14 is **redelivered once** (the unacked 11..14
+//! in the old buffer are also invalidated and can only appear as part of the redelivery).
 //!
-//! S2「前跳 + 恢复」——timestamp=-1 重置到 maxOffset：位点直接跳到 10，中间 4..9 一条都不投；
-//! 随后新消息照常消费、位点继续前进。
+//! S2 "forward skip + recovery" -- timestamp=-1 resets to maxOffset: the offset jumps straight to 10, none of 4..9 is delivered;
+//! new messages are then consumed normally and the offset keeps advancing.
 //!
-//! 用法：
+//! Usage:
 //! ```text
 //! cargo run --example live_reset_offset -- 127.0.0.1:9876
 //! ```
@@ -96,7 +97,7 @@ async fn poll_until(mut pred: impl FnMut() -> bool, secs: u64) -> bool {
     }
 }
 
-/// `poll_until` 的 async 版本：谓词本身要发 RPC（`committed`）时用这个。
+/// Async version of `poll_until`: use this when the predicate itself needs to send an RPC (`committed`).
 async fn poll_until_async<F, Fut>(mut pred: F, secs: u64) -> bool
 where
     F: FnMut() -> Fut,
@@ -131,10 +132,10 @@ where
     }
 }
 
-/// 逐批闸住的 listener：每批停在闸门上，由测试逐批 `release()` —— 批与批之间的本地状态
-/// 因此可以被采样。S1 的关键采样点（旧批次已放行、新队列第一批还没 ack）只有在
-/// 「逐批可控」时才存在；一次性放行的 listener 会把 11（旧批次 ack）与随后的重投混在
-/// 一个瞬间里。
+/// Batch-by-batch gated listener: every batch stops at the gate, and the test releases it batch by batch via `release()` -- so the local state
+/// between batches can be sampled. S1's key sampling point (old batch released, first batch of the new queue not yet acked) only exists
+/// when batches are individually controllable; a one-shot listener would mix the 11 (old batch ack) and the subsequent redelivery
+/// into a single instant.
 struct SteppingListener {
     state: Mutex<StepState>,
     cv: Condvar,
@@ -187,8 +188,8 @@ impl MessageListenerConcurrently for SteppingListener {
     ) -> ConsumeConcurrentlyStatus {
         let mut st = lock(&self.state);
         st.batches.push(msgs.iter().map(|m| m.queue_offset).collect());
-        // 上限只防死锁：正常路径由测试逐批 release()；醒来的那个把闸门复位（语义同
-        // 一次性事件的 set() + clear()）。
+        // The cap only guards against deadlock: the normal path is the test calling release() batch by batch; the one that wakes resets the gate (semantically the same as
+        // a one-shot event's set() + clear()).
         let deadline = Instant::now() + Duration::from_secs(90);
         while !st.released {
             let now = Instant::now();
@@ -206,7 +207,7 @@ impl MessageListenerConcurrently for SteppingListener {
     }
 }
 
-/// 只记到达的 queueOffset：这一趟关心的是「哪些不该来」，不是消息内容。
+/// Only records arriving queueOffsets: this pass cares about "which ones should not have come", not the message content.
 struct RecordingListener {
     arrivals: Mutex<Vec<i64>>,
 }
@@ -269,7 +270,7 @@ impl Fixture {
             .await
             .map_err(|e| format!("producer start failed: {e}"))?;
 
-        // 端口开着 != broker 已注册到 nameServer：这里轮询等待
+        // Port open != broker registered with the nameServer: poll and wait here
         let deadline = Instant::now() + Duration::from_secs(40);
         let broker_addr = loop {
             if let Ok(info) = admin.fetch_broker_cluster_info().await {
@@ -282,7 +283,7 @@ impl Fixture {
                 }
             }
             if Instant::now() > deadline {
-                return Err("nameServer 在预算内没有返回任何 broker".to_string());
+                return Err("nameServer returned no broker within the budget".to_string());
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         };
@@ -327,7 +328,7 @@ impl Fixture {
             .ok_or_else(|| format!("route of {topic} has no queue"))
     }
 
-    /// [(mq, maxOffset, 已提交位点 or None)]，位点 None 表示 broker 上查无记录。
+    /// [(mq, maxOffset, committed offset or None)]; offset None means no record on the broker.
     async fn committed(&self, group: &str, topic: &str) -> Vec<(MessageQueue, i64, Option<i64>)> {
         let client = match self.admin.get_mq_client_instance() {
             Ok(c) => c,
@@ -378,7 +379,7 @@ impl Fixture {
         Ok(())
     }
 
-    /// 开关热改 + 回读（`useServerSideResetOffset` 是 220 推送路径的前提）。
+    /// Hot-flips the switch + reads it back (`useServerSideResetOffset` is the precondition for the 220 push path).
     async fn set_server_side_reset(&self, value: &str) -> bool {
         let mut props = StringMap::new();
         props.insert("useServerSideResetOffset".to_string(), value.to_string());
@@ -387,14 +388,14 @@ impl Fixture {
             .update_broker_config(&self.broker_addr, &props, None)
             .await
         {
-            println!("  (updateBrokerConfig 失败: {e})");
+            println!("  (updateBrokerConfig failed: {e})");
             return false;
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
         match self.admin.get_broker_config(&self.broker_addr, None).await {
             Ok(cfg) => cfg.get("useServerSideResetOffset") == Some(value),
             Err(e) => {
-                println!("  (getBrokerConfig 失败: {e})");
+                println!("  (getBrokerConfig failed: {e})");
                 false
             }
         }
@@ -424,7 +425,7 @@ fn all_committed(rows: &[(MessageQueue, i64, Option<i64>)], want: i64) -> bool {
     !rows.is_empty() && rows.iter().all(|(_, _, o)| *o == Some(want))
 }
 
-/// 本端口内存里的「已消费位点」；`None` = 该队列在表里没有记录。
+/// The "consumed offset" in this client's memory; `None` = the queue has no record in the table.
 fn local_offset(c: &DefaultMQPushConsumer, topic: &str) -> Option<i64> {
     c.get_consumer_status(Some(topic))
         .into_iter()
@@ -449,7 +450,7 @@ async fn s1_backward_reset(fx: &Fixture, ck: &mut Checker) {
         }
     };
 
-    // 前置：先用普通 listener 把 broker 上的位点做成 10（reset 要求该组在 broker 上有记录）
+    // Precondition: first use a plain listener to make the broker's offset 10 (reset requires the group to have a record on the broker)
     let l0 = RecordingListener::new();
     let c0 = match fx.consumer(&group, "back0", &topic, 1, None) {
         Ok(c) => c,
@@ -474,13 +475,13 @@ async fn s1_backward_reset(fx: &Fixture, ck: &mut Checker) {
         }
         if i == 2 {
             t_mid = now_millis();
-            // 让第 3 条（offset 3）与前面三条拉开存储时间，后面按时间戳重置才能稳定命中 3
+            // Separate the storage time of the 3rd message (offset 3) from the previous three, so the later timestamp reset can reliably hit 3
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
     }
     let consumed = poll_until(|| l0.arrivals().len() == MSGS as usize, 30).await;
     ck.check(
-        &format!("S1-前置：消费者消费掉 {MSGS} 条"),
+        &format!("S1-precondition: consumer consumed {MSGS} messages"),
         consumed,
         &format!("arrivals={:?}", l0.arrivals()),
     );
@@ -500,14 +501,14 @@ async fn s1_backward_reset(fx: &Fixture, ck: &mut Checker) {
         );
     }
     ck.check(
-        &format!("S1-前置：broker 位点周期落盘到 {MSGS}（reset 要求组在 broker 上有记录）"),
+        &format!("S1-precondition: broker offset periodically flushed to {MSGS} (reset requires the group to have a record on the broker)"),
         persisted,
         "",
     );
     c0.shutdown();
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    // 主力消费者：逐批闸住 + 周期落盘 60s ⇒ 窗口内唯一能改 broker 位点的路径是重置自带的那次
+    // Main consumer: batch-by-batch gating + periodic flush 60s => inside the window the only path that can change the broker offset is the reset's own persist
     let sink = SteppingListener::new();
     let c = match fx.consumer(&group, "back", &topic, 1, Some(60_000)) {
         Ok(c) => c,
@@ -540,7 +541,7 @@ async fn s1_backward_reset(fx: &Fixture, ck: &mut Checker) {
     .await;
     let arr0 = sink.offsets();
     ck.check(
-        "S1-窗口就绪：1 条在途（offset 10 卡在 listener）+ 4 条留在缓冲",
+        "S1-window ready: 1 in flight (offset 10 stuck in the listener) + 4 left in the buffer",
         ready && arr0.first() == Some(&10),
         &format!("arrivals={arr0:?} pending={}", c.cached_message_count(&key)),
     );
@@ -553,13 +554,13 @@ async fn s1_backward_reset(fx: &Fixture, ck: &mut Checker) {
     let quiet = poll_until(|| t_start.elapsed() > Duration::from_secs(12), 15).await;
     let rows = fx.committed(&group, &topic).await;
     ck.check(
-        "S1-首跳周期落盘已过（此后 60s 内不再有周期写）",
+        "S1-first periodic flush has passed (no periodic write within the next 60s)",
         quiet && all_committed(&rows, MSGS),
         &fmt(&rows),
     );
 
-    // 按时间戳重置到 3：t_mid 落在第 3 条与第 4 条之间 ⇒ getOffsetInQueueByTime 命中 3，
-    // 3 < consumerOffset(10) 且 isForce=true ⇒ broker 推 {mq: 3}
+    // Reset to 3 by timestamp: t_mid falls between the 3rd and 4th messages => getOffsetInQueueByTime hits 3,
+    // 3 < consumerOffset(10) and isForce=true => the broker pushes {mq: 3}
     let t0 = Instant::now();
     let table = match fx
         .admin
@@ -576,7 +577,7 @@ async fn s1_backward_reset(fx: &Fixture, ck: &mut Checker) {
     };
     let targets: Vec<i64> = table.iter().map(|(_, v)| *v).collect();
     ck.check(
-        "S1-222 响应里的目标位点就是 3",
+        "S1-the target offset in the 222 response is exactly 3",
         targets == vec![BACK_TARGET],
         &format!("table={targets:?}"),
     );
@@ -593,7 +594,7 @@ async fn s1_backward_reset(fx: &Fixture, ck: &mut Checker) {
     let rows = fx.committed(&group, &topic).await;
     ck.check(
         &format!(
-            "S1-broker 位点 {:.1}s 内变成 {BACK_TARGET}（重置路径自带的那次 persist，周期落盘=60s）",
+            "S1-broker offset becomes {BACK_TARGET} within {:.1}s (the persist carried by the reset path, periodic flush=60s)",
             elapsed.as_secs_f64()
         ),
         bumped,
@@ -602,26 +603,26 @@ async fn s1_backward_reset(fx: &Fixture, ck: &mut Checker) {
 
     let off = local_offset(&c, &topic);
     ck.check(
-        "S1-重置后本地表里没有旧位点（removeOffset；新位点经撤销尾巴出去）",
+        "S1-after the reset the local table has no old offset (removeOffset; the new offset goes out via the revoke tail)",
         off.is_none(),
         &format!("local_offset={off:?} epoch={}", c.queue_epoch(&key)),
     );
 
-    // 放行旧批次：它的 ack 属于已被撤销的 ProcessQueue，必须作废
+    // Release the old batch: its ack belongs to the already-revoked ProcessQueue and must be invalidated
     sink.release();
     let second = sink.wait_batch(2, 20).await;
     let off = local_offset(&c, &topic);
     let two = sink.batches();
     ck.check(
         &format!(
-            "S1-旧批次 ack 作废（放行后新队列第一批 offset {} 已在途时，本地位点仍未越过 {BACK_TARGET}）",
+            "S1-old batch ack invalidated (after release, while the new queue's first batch offset {} is in flight, the local offset has still not passed {BACK_TARGET})",
             if second && two.len() > 1 { two[1][0] } else { -1 }
         ),
         second && off.is_none_or(|o| o <= BACK_TARGET),
         &format!("local_offset={off:?} arrivals={:?}", sink.offsets()),
     );
 
-    // 逐批放行走完重投：3..14 每条重投一次（旧缓冲里 11..14 也已作废，只能作为重投出现）
+    // Release batch by batch to walk through the redelivery: each of 3..14 is redelivered once (the 11..14 in the old buffer are also invalidated and can only appear as redelivery)
     let mut expected = vec![10i64];
     expected.extend(BACK_TARGET..MSGS + 5);
     for n in 2..=expected.len() {
@@ -632,7 +633,7 @@ async fn s1_backward_reset(fx: &Fixture, ck: &mut Checker) {
     }
     let arr = sink.offsets();
     ck.check(
-        &format!("S1-队列被真正重建：重投序列是 {expected:?}"),
+        &format!("S1-the queue is truly rebuilt: the redelivery sequence is {expected:?}"),
         arr == expected,
         &format!("arrivals={arr:?}"),
     );
@@ -640,12 +641,12 @@ async fn s1_backward_reset(fx: &Fixture, ck: &mut Checker) {
 
     let rows = fx.committed(&group, &topic).await;
     ck.check(
-        &format!("S1-窗口内只有重置那次写 broker（位点仍停在 {BACK_TARGET}，周期落盘=60s）"),
+        &format!("S1-inside the window only the reset writes to the broker (offset still at {BACK_TARGET}, periodic flush=60s)"),
         all_committed(&rows, BACK_TARGET),
         &fmt(&rows),
     );
 
-    // 关停会落盘一次：重投的 ack 才是最终值（15 = 最后一条 14 的 +1）
+    // Shutdown flushes once: the redelivery's ack is the final value (15 = the last one 14 plus 1)
     c.shutdown();
     let final_ok = poll_until_async(
         || async {
@@ -658,7 +659,7 @@ async fn s1_backward_reset(fx: &Fixture, ck: &mut Checker) {
     let rows = fx.committed(&group, &topic).await;
     ck.check(
         &format!(
-            "S1-关停落盘把重投的 ack 写回 broker（位点前进到 {}）",
+            "S1-shutdown flush writes the redelivery's ack back to the broker (offset advances to {})",
             MSGS + 5
         ),
         final_ok,
@@ -678,9 +679,9 @@ async fn s2_forward_skip(fx: &Fixture, ck: &mut Checker) {
     }
 
     let sink = SteppingListener::new();
-    // 周期落盘用默认 5s：本场景要先靠首跳（start 后 10s）在 broker 上给这个组建记录
-    //（Broker2Client.resetOffset 对 queryOffset==-1 的组直接回 SYSTEM_ERROR），
-    // 再等一个 >5s 的窗口做重置 —— 重置那笔 persist 与周期写不同刻，判据仍然干净。
+    // Periodic flush uses the default 5s: this scenario first relies on the first flush (10s after start) to create a record for the group on the broker
+    // (Broker2Client.resetOffset directly replies SYSTEM_ERROR for groups with queryOffset==-1),
+    // then waits for a >5s window to do the reset -- the reset's persist and the periodic write are at different moments, so the discriminator stays clean.
     let c = match fx.consumer(&group, "skip", &topic, 1, None) {
         Ok(c) => c,
         Err(e) => {
@@ -705,7 +706,7 @@ async fn s2_forward_skip(fx: &Fixture, ck: &mut Checker) {
         }
     }
 
-    // 逐批放行前 3 条：第 4 条（offset 3）留在 listener 里当「在途批次」
+    // Release the first 3 batch by batch: the 4th (offset 3) stays in the listener as the "in-flight batch"
     let mut arranged = false;
     for n in 1..=4 {
         if !sink.wait_batch(n, 30).await {
@@ -718,7 +719,7 @@ async fn s2_forward_skip(fx: &Fixture, ck: &mut Checker) {
     }
     let arr = sink.offsets();
     ck.check(
-        "S2-窗口就绪：前 3 条已 ack、第 4 条卡在 listener",
+        "S2-window ready: the first 3 are acked, the 4th is stuck in the listener",
         arranged && arr == vec![0, 1, 2, 3],
         &format!("arrivals={arr:?}"),
     );
@@ -728,7 +729,7 @@ async fn s2_forward_skip(fx: &Fixture, ck: &mut Checker) {
         return;
     }
 
-    // 等首跳落盘把组建出来（本地已消费位点 3 = 前三条的 ack），并留出 >5s 的静默窗口
+    // Wait for the first flush to create the group record (local consumed offset 3 = the ack of the first three), and leave a >5s quiet window
     let ready = poll_until_async(
         || async {
             if t_start.elapsed() <= Duration::from_secs(12) {
@@ -742,7 +743,7 @@ async fn s2_forward_skip(fx: &Fixture, ck: &mut Checker) {
     .await;
     let rows = fx.committed(&group, &topic).await;
     ck.check(
-        "S2-前置：broker 上该组有记录（q0:3），且下一笔周期写还在 5s 之外",
+        "S2-precondition: the group has a record on the broker (q0:3), and the next periodic write is still more than 5s away",
         ready,
         &fmt(&rows),
     );
@@ -763,7 +764,7 @@ async fn s2_forward_skip(fx: &Fixture, ck: &mut Checker) {
     };
     let targets: Vec<i64> = table.iter().map(|(_, v)| *v).collect();
     ck.check(
-        &format!("S2-222 响应里的目标位点就是 maxOffset({MSGS})"),
+        &format!("S2-the target offset in the 222 response is exactly maxOffset({MSGS})"),
         targets == vec![MSGS],
         &format!("table={targets:?}"),
     );
@@ -780,7 +781,7 @@ async fn s2_forward_skip(fx: &Fixture, ck: &mut Checker) {
     let rows = fx.committed(&group, &topic).await;
     ck.check(
         &format!(
-            "S2-broker 位点 {:.1}s 内前跳到 {MSGS}（重置路径自带的那次 persist）",
+            "S2-broker offset jumps forward to {MSGS} within {:.1}s (the persist carried by the reset path)",
             elapsed.as_secs_f64()
         ),
         jumped,
@@ -791,7 +792,7 @@ async fn s2_forward_skip(fx: &Fixture, ck: &mut Checker) {
     tokio::time::sleep(Duration::from_secs(3)).await;
     let arr = sink.offsets();
     ck.check(
-        &format!("S2-被跳过的 4..{} 一条都不投（在途那条的 ack 也作废）", MSGS - 1),
+        &format!("S2-none of the skipped 4..{} is delivered (the in-flight one's ack is also invalidated)", MSGS - 1),
         arr == vec![0, 1, 2, 3],
         &format!("arrivals={arr:?}"),
     );
@@ -805,13 +806,13 @@ async fn s2_forward_skip(fx: &Fixture, ck: &mut Checker) {
     sink.release();
     let arr = sink.offsets();
     ck.check(
-        &format!("S2-重建后的队列从队尾续跑（新消息 offset {MSGS} 正常投递）"),
+        &format!("S2-the rebuilt queue continues from the tail (the new message offset {MSGS} is delivered normally)"),
         new_ok && arr == vec![0, 1, 2, 3, MSGS],
         &format!("arrivals={arr:?}"),
     );
 
-    // release() 只让 listener 返回；ack 是消费线程随后落的。不等本地位点真的推到 11 就
-    // 关停，关停那次 persist 可能跑在 ack 之前（写回的还是 10）—— 这是断言竞态，不是语义问题。
+    // release() only makes the listener return; the ack is landed by the consume thread afterwards. Shutting down without waiting for the local offset to really reach 11
+    // may make that shutdown persist run before the ack (writing back 10 still) -- this is an assertion race, not a semantic issue.
     poll_until(|| local_offset(&c, &topic) == Some(MSGS + 1), 10).await;
     c.shutdown();
     let final_ok = poll_until_async(
@@ -825,7 +826,7 @@ async fn s2_forward_skip(fx: &Fixture, ck: &mut Checker) {
     let rows = fx.committed(&group, &topic).await;
     ck.check(
         &format!(
-            "S2-关停落盘把新消息的 ack 写回 broker（位点前进到 {}）",
+            "S2-shutdown flush writes the new message's ack back to the broker (offset advances to {})",
             MSGS + 1
         ),
         final_ok,
@@ -836,7 +837,7 @@ async fn s2_forward_skip(fx: &Fixture, ck: &mut Checker) {
 
 async fn cleanup(fx: &Fixture, topic: &str, group: &str) {
     if let Err(e) = fx.admin.delete_topic(topic, None).await {
-        println!("    (deleteTopic({topic}) 失败: {e})");
+        println!("    (deleteTopic({topic}) failed: {e})");
     } else {
         println!("    (deleteTopic({topic}) OK)");
     }
@@ -845,7 +846,7 @@ async fn cleanup(fx: &Fixture, topic: &str, group: &str) {
         .delete_subscription_group(&fx.broker_addr, group, true)
         .await
     {
-        println!("    (deleteSubscriptionGroup({group}) 失败: {e})");
+        println!("    (deleteSubscriptionGroup({group}) failed: {e})");
     }
 }
 
@@ -854,11 +855,11 @@ async fn run(namesrv: &str) -> Checker {
     let fx = match Fixture::new(namesrv).await {
         Ok(fx) => fx,
         Err(e) => {
-            ck.check("集群探活", false, &e);
+            ck.check("cluster liveness", false, &e);
             return ck;
         }
     };
-    ck.check("集群探活", true, &format!("broker={}", fx.broker_addr));
+    ck.check("cluster liveness", true, &format!("broker={}", fx.broker_addr));
 
     let off = fx.set_server_side_reset("false").await;
     let cfg = fx
@@ -872,23 +873,23 @@ async fn run(namesrv: &str) -> Checker {
         })
         .unwrap_or_else(|_| "<read failed>".to_string());
     ck.check(
-        "开关热改：useServerSideResetOffset=false（220 推送路径的前提）",
+        "switch hot-flip: useServerSideResetOffset=false (precondition for the 220 push path)",
         off,
-        &format!("回读 useServerSideResetOffset={cfg}"),
+        &format!("read back useServerSideResetOffset={cfg}"),
     );
 
     s1_backward_reset(&fx, &mut ck).await;
     s2_forward_skip(&fx, &mut ck).await;
 
     let restored = fx.set_server_side_reset("true").await;
-    ck.check("还原 useServerSideResetOffset=true", restored, "");
+    ck.check("restore useServerSideResetOffset=true", restored, "");
 
     fx.shutdown();
     ck
 }
 
 fn report(ck: &mut Checker) {
-    println!("\n== 结果：{} PASS / {} FAIL ==", ck.passed, ck.failed.len());
+    println!("\n== result: {} PASS / {} FAIL ==", ck.passed, ck.failed.len());
     for f in &ck.failed {
         println!("  FAILED: {f}");
     }

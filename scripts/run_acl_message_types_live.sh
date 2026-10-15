@@ -1,26 +1,33 @@
 #!/bin/bash
-# 集群开启 ACL 时的「全部消息类型收发」真机验证（七端一条命令跑完）。
+# Live verification of "all message types send/receive" with ACL enabled on
+# the cluster (all seven clients in one command).
 #
-# 为什么要有这个脚本：ACL 的假通过太多了 —— broker 没开鉴权时正向场景照样全绿，
-# 只有「无凭据必须被拒(NO_PERMISSION=16)」这一半断言才戳得穿。所以每一端都是成对跑：
-# 先无凭据探一次必须被拒，再带签名把同步 / 异步 / 单向 / 批量 / 延迟等级 / 定时 /
-# 事务 / 顺序 / Tag 过滤 / 用户属性 / KEYS 服务端查询逐条发出去并从 broker 读回。
+# Why this script exists: ACL has too many false positives -- when the broker
+# has no authentication enabled, the positive scenarios still look all green;
+# only the "no-credentials must be rejected (NO_PERMISSION=16)" half of the
+# assertions can pierce through. So each client runs as a pair: first probe
+# without credentials, which must be rejected, then send each of sync / async /
+# oneway / batch / delay level / timer / transaction / orderly / Tag filtering /
+# user properties / KEYS server-side query with a signature and read back from
+# the broker.
 #
-# 用法:
-#   bash scripts/run_acl_message_types_live.sh                 # 假定集群已按下面的
-#                                                              # authentication* 配置起好
-#   bash scripts/run_acl_message_types_live.sh python cpp      # 只跑某几端
+# Usage:
+#   bash scripts/run_acl_message_types_live.sh                 # assumes the cluster
+#                                                              # is already up with the
+#                                                              # authentication* config below
+#   bash scripts/run_acl_message_types_live.sh python cpp      # run only the given clients
 #
-# 依赖的环境变量（都有默认值，指向本机集群）：
-#   ROCKETMQ_NAMESRV   namesrv 地址（默认 127.0.0.1:9876）
-#   RMQ_ACL_AK / RMQ_ACL_SK   与 broker initAuthenticationUser 一致的凭据
-#   RMQ_PY             python 解释器（默认 python3）
-#   RMQ_CPP_BUILD      cpp 的 cmake 构建目录（默认 cpp/build）
-#   RMQ_DOTNET         dotnet 可执行文件
-#   LOGDIR             各端输出落盘目录（默认 /tmp/rmq_acl_types_live_logs）
+# Environment variables used (all have defaults, pointing at a local cluster):
+#   ROCKETMQ_NAMESRV   namesrv address (default 127.0.0.1:9876)
+#   RMQ_ACL_AK / RMQ_ACL_SK   credentials matching the broker's initAuthenticationUser
+#   RMQ_PY             python interpreter (default python3)
+#   RMQ_CPP_BUILD      cpp cmake build directory (default cpp/build)
+#   RMQ_DOTNET         dotnet executable
+#   LOGDIR             per-client output directory (default /tmp/rmq_acl_types_live_logs)
 #
-# 集群没起时按下面的 broker.conf 关键三项拉起（缺 authenticationMetadataProvider
-# 的话 initAuthenticationUser 是白写的，所有请求都会被拒）：
+# When the cluster is not up, it is started with the three key broker.conf
+# settings below (without authenticationMetadataProvider, initAuthenticationUser
+# is a no-op and every request gets rejected):
 #   authenticationEnabled=true
 #   authenticationMetadataProvider=org.apache.rocketmq.auth.authentication.provider.LocalAuthenticationMetadataProvider
 #   initAuthenticationUser={"username":"<AK>","password":"<SK>"}
@@ -40,11 +47,12 @@ ENDS=("$@")
 [ ${#ENDS[@]} -eq 0 ] && ENDS=(python cpp csharp go nodejs php rust)
 if [ "${ENDS[0]}" = "all" ]; then ENDS=(python cpp csharp go nodejs php rust); fi
 
-# 每一端都要求带凭据跑，缺凭据一律记 FAIL 而不是跳过：跳过会让「没鉴权」的集群
-# 看起来和「鉴权全绿」的集群一模一样。
+# Every client must run with credentials; missing credentials are recorded as
+# FAIL rather than skipped: skipping would make an "authentication disabled"
+# cluster look identical to one where authentication is all green.
 require_creds() {
     [ -n "$AK" ] && [ -n "$SK" ] && return 0
-    echo "需要 RMQ_ACL_AK / RMQ_ACL_SK（broker initAuthenticationUser 里的那对）" >&2
+    echo "RMQ_ACL_AK / RMQ_ACL_SK are required (the pair from the broker's initAuthenticationUser)" >&2
     return 1
 }
 
@@ -106,9 +114,9 @@ for end in "${ENDS[@]}"; do
 done
 
 echo ""
-echo "=== 收工 ==="
+echo "=== summary ==="
 for end in "${ENDS[@]}"; do
-    sum=$(grep -E "PASS=|FAIL=|passed|ok$|结果:" "$LOGDIR/$end.log" 2>/dev/null | tail -1)
-    echo "$end: ${sum:-无输出}"
+    sum=$(grep -E "PASS=|FAIL=|passed|ok$|result:" "$LOGDIR/$end.log" 2>/dev/null | tail -1)
+    echo "$end: ${sum:-no output}"
 done
 exit $rc
