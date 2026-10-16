@@ -285,7 +285,7 @@ final class CompressionCodec
                 $out .= chr($h0) . chr(($sizeBits >> 8) & 0xFF) . chr(($sizeBits >> 16) & 0xFF);
                 $out .= $data[$pos];
             } else {
-                $sizeBits = $chunk << 3; // Block_Type=0（Raw）
+                $sizeBits = $chunk << 3; // Block_Type=0 (Raw)
                 $h0 = ($sizeBits & 0xFF) | $last;
                 $out .= chr($h0) . chr(($sizeBits >> 8) & 0xFF) . chr(($sizeBits >> 16) & 0xFF);
                 if ($chunk > 0) {

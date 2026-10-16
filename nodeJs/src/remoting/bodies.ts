@@ -617,7 +617,7 @@ export class ConsumerRunningInfo {
 // ---------------------------------------------------------------------------
 // TopicConfig (shared by bodies and admin). Defaults: readQueueNums=16,
 // writeQueueNums=16, perm=6, topicFilterType=SINGLE_TAG, topicSysFlag=0,
-// order=false, attributes={}。
+// order=false, attributes={}.
 // ---------------------------------------------------------------------------
 export const TopicFilterType = {
   SINGLE_TAG: 'SINGLE_TAG',

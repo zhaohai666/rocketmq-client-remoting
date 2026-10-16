@@ -2531,7 +2531,7 @@ class DefaultMQProducer
         if ($state === LocalTransactionState::ROLLBACK_MESSAGE) {
             return MessageSysFlag::TRANSACTION_ROLLBACK_TYPE;  // 0x3 << 2 = 12
         }
-        return MessageSysFlag::TRANSACTION_NOT_TYPE;           // 0（UNKNOW）
+        return MessageSysFlag::TRANSACTION_NOT_TYPE;           // 0 (UNKNOW)
     }
 
     public function sendMessageInTransaction(Message $msg, TransactionListener $listener, mixed $arg = null): TransactionSendResult

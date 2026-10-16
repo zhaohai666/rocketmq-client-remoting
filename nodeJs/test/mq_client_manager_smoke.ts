@@ -213,7 +213,7 @@ console.log('== producer + producer + admin with the same instanceName -> one sh
   const checkedFor: string[] = [];
   const listenerA = { checkLocalTransaction: (msg: MessageExt) => {
     checkedFor.push(String(msg.getProperty(MessageConst.PROPERTY_PRODUCER_GROUP)));
-    return 0; // COMMIT（LocalTransactionState.COMMIT_MESSAGE）
+    return 0; // COMMIT (LocalTransactionState.COMMIT_MESSAGE)
   } };
   const listenerB = { checkLocalTransaction: (msg: MessageExt) => {
     checkedFor.push('B:' + String(msg.getProperty(MessageConst.PROPERTY_PRODUCER_GROUP)));

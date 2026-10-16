@@ -11,11 +11,11 @@
 //!   (4) holding in-flight slots works via `std::thread::sleep` inside the hook, which pins a tokio worker thread inside a
 //!      synchronous call -- measured locally: **as long as any task blocks, the whole runtime's time driver stops advancing**
 //!      (while one task slept 1500ms, a `sleep(100ms)` in another task never woke once). Therefore
-//!        · the "in-flight sends" and the "sends that cannot get a permit" must be fired back-to-back, with no await in between to observe in-flight state;
-//!        · in-flight charging and "topping up the over-limit sends at the moment the gate fills" are both delegated to [`GateWatch`] (a plain OS thread),
+//!        - the "in-flight sends" and the "sends that cannot get a permit" must be fired back-to-back, with no await in between to observe in-flight state;
+//!        - in-flight charging and "topping up the over-limit sends at the moment the gate fills" are both delegated to [`GateWatch`] (a plain OS thread),
 //!          and "did it enter the send kernel" uses the hook's own recorded timestamps -- neither is affected by runtime scheduling;
 //!          moreover such assertions can only be read after the whole chain has finished, since the hook may still be stuck on the new topic's route;
-//!        · anything that must act while the hook "is still sleeping" (B3's runtime resize) also has to run on a plain thread.
+//!        - anything that must act while the hook "is still sleeping" (B3's runtime resize) also has to run on a plain thread.
 //!
 //! Usage:
 //! ```text

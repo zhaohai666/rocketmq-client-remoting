@@ -246,7 +246,7 @@ public:
     void setPullBatchSizeInBytes(int32_t n) { pullBatchSizeInBytes_ = n; }
     void setConsumeMessageBatchMaxSize(int32_t n) { consumeMessageBatchMaxSize_ = std::max(1, n); }
     // The dispatch layer slices batches with it.
-    // The max(1,·) in the setter is a runtime clamp; the gate has a different job (see checkConfigRanges).
+    // The max(1, n) in the setter is a runtime clamp; the gate has a different job (see checkConfigRanges).
     int32_t consumeMessageBatchMaxSize() const { return consumeMessageBatchMaxSize_; }
     void setPullTimeoutMillis(int32_t t) { pullTimeoutMillis_ = t; }
     void setPullSuspendTimeoutMillis(int32_t t) { pullSuspendTimeoutMillis_ = t; }

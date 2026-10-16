@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """The models related to subscription groups, corresponding to the protocol's subscription package:
-SubscriptionGroupConfig / GroupRetryPolicy / SimpleSubscriptionData。
+SubscriptionGroupConfig / GroupRetryPolicy / SimpleSubscriptionData.
 
 The field names and default values follow the real serialized output of a 5.x broker (``JSON.toJSONString(new SubscriptionGroupConfig())``):
 {"attributes":{},"brokerId":0,"consumeBroadcastEnable":true,"consumeEnable":true,

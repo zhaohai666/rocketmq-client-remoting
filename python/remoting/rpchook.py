@@ -116,8 +116,8 @@ class NamespaceRpcHook(RPCHook):
     `do_before_request` has a single non-empty guard: when namespaceV2 is not empty it
     adds two extra fields to every request::
 
-        nsd = "true"            （MixAll.RPC_REQUEST_HEADER_NAMESPACED_FIELD）
-        ns  = <namespaceV2>     （MixAll.RPC_REQUEST_HEADER_NAMESPACE_FIELD）
+        nsd = "true"            (MixAll.RPC_REQUEST_HEADER_NAMESPACED_FIELD)
+        ns  = <namespaceV2>     (MixAll.RPC_REQUEST_HEADER_NAMESPACE_FIELD)
 
     This is the **server-side** namespace mechanism of 5.x (an Alibaba Cloud serverless
     instance id and the like, with the broker resolving the real topic from the request
@@ -148,7 +148,7 @@ class StreamTypeRPCHook(RPCHook):
     """Tag every request with its request type marker (the Stream type).
 
     `do_before_request` is a single line:
-    `request.addExtField(MixAll.REQ_T, String.valueOf(RequestType.STREAM.getCode()))`，
+    `request.addExtField(MixAll.REQ_T, String.valueOf(RequestType.STREAM.getCode()))`,
     that is, `ReqT = "0"` (`RequestType` currently has only the single enum entry STREAM,
     whose code is `(byte) 0`).
 

@@ -7,7 +7,7 @@ from common.message import MessageQueue
 from remoting.protocol.route import TopicRouteData
 
 # MixAll.METADATA_SCOPE_GLOBAL / LOGICAL_QUEUE_MOCK_BROKER_PREFIX /
-# LOGICAL_QUEUE_MOCK_BROKER_NAME_NOT_EXIST。
+# LOGICAL_QUEUE_MOCK_BROKER_NAME_NOT_EXIST.
 METADATA_SCOPE_GLOBAL = "__global__"
 LOGICAL_QUEUE_MOCK_BROKER_PREFIX = "__syslo__"
 LOGICAL_QUEUE_MOCK_NOT_EXIST = "__syslo__none__"

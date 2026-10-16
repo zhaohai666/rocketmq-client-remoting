@@ -96,7 +96,7 @@ class NamespaceUtil:
 
     @staticmethod
     def wrap_namespace_and_retry(namespace: str, consumer_group: str) -> str:
-        """``%RETRY%<wrapNamespace(namespace, group)>``。"""
+        """``%RETRY%<wrapNamespace(namespace, group)>``."""
         if not consumer_group:
             return consumer_group
         return MixAll.RETRY_GROUP_TOPIC_PREFIX + NamespaceUtil.wrap_namespace(

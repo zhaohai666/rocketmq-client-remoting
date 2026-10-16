@@ -144,7 +144,7 @@ final class StreamTypeRPCHook extends RPCHook
  * 5.x server-side namespace hook: when `namespaceV2` is non-empty, adds **two** extension
  * headers to the request
  *
- *     nsd = "true"、ns = <namespaceV2>
+ *     nsd = "true", ns = <namespaceV2>
  *
  * (key constants see `MixAll::RPC_REQUEST_HEADER_NAMESPACED_FIELD` / `..._NAMESPACE_FIELD`).
  * `doAfterResponse` does not override — the base class is already an empty implementation.

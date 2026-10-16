@@ -9,7 +9,7 @@ SOCKS4 = "SOCKS4"
 SOCKS5 = "SOCKS5"
 SUPPORTED_PROXY_TYPES = (SOCKS4, SOCKS5)
 
-# ---- SOCKS5（RFC 1928）----
+# ---- SOCKS5 (RFC 1928) ----
 _S5_VERSION = 0x05
 _S5_CMD_CONNECT = 0x01
 _S5_METHOD_NO_AUTH = 0x00
@@ -151,7 +151,7 @@ def _socks5_handshake(sock: socket.socket, host: str, port: int,
         p = config.password.encode("utf-8")
         if len(u) > 255 or len(p) > 255:
             raise SocksProxyError("socks5 username/password longer than 255 bytes")
-        # RFC 1929：ver(1) ulen(1) uname ulen plen passwd
+        # RFC 1929: ver(1) ulen(1) uname ulen plen passwd
         sock.sendall(bytes((_UP_VERSION, len(u))) + u + bytes((len(p),)) + p)
         auth = _recv_exact(sock, 2)
         if auth[0] != _UP_VERSION:

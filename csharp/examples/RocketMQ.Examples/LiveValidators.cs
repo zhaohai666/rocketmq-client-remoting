@@ -211,7 +211,7 @@ public static class LiveValidators
       ("S1c an oversized topic(128)", RepeatedChar('a', 128), "is longer than topic max length 127",
                 ResponseCode.SystemError),
             ("S1d a topic with a dot", "Validators.Live", IllegalTail, ResponseCode.SystemError),
-            ("S1e 非 ASCII topic", "Validators中文", IllegalTail, ResponseCode.SystemError),
+            ("S1e non-ASCII topic", "Validators中文", IllegalTail, ResponseCode.SystemError),
             ("S1f the forbidden broker-internal flow topic", "SCHEDULE_TOPIC_XXXX", "is forbidden",
                 ResponseCode.SystemError),
         };

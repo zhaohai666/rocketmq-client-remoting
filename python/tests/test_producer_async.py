@@ -743,7 +743,7 @@ def test_executor_thread_names_use_the_numbered_prefix(monkeypatch):
     core do two submissions reuse the same worker.
     On a multi-core machine they are not reused -- that is the real behaviour of the pool creating
     threads step by step up to core, see
-    ``test_workers_grow_one_thread_per_submit_until_core``。
+    ``test_workers_grow_one_thread_per_submit_until_core``.
     """
     monkeypatch.setattr(producer_module.os, "cpu_count", lambda: 1)
     p = _producer()
