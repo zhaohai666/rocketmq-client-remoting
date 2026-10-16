@@ -811,7 +811,7 @@ async fn a7_produce_and_stats(ck: &mut Checker, env: &Env) -> Vec<SentMsg> {
         sent.extend(env.produce(&topic, queue_id, per_queue).await);
     }
     ck.check(
-        &format!("A7 all {N_MSG} sync sends are SEND_OK"),
+        &format!("A7 all {} sync sends are SEND_OK", N_MSG),
         sent.len() == N_MSG,
         &format!("ok={}/{}", sent.len(), N_MSG),
     );
