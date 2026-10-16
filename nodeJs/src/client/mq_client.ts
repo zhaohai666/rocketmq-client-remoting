@@ -594,8 +594,10 @@ export class MQClient {
     }, timeoutMillis);
   }
 
-  sendMessageOneway(addr: string, request: RemotingCommand): void {
-    this.remotingClient.invokeOneway(addr, request);
+  sendMessageOneway(addr: string, request: RemotingCommand): Promise<void> {
+    // Returned, not dropped: a connection failure here must reach the awaiting
+    // producer.sendOneway caller instead of surfacing as an unhandled rejection.
+    return this.remotingClient.invokeOneway(addr, request);
   }
 
   // ---- recall ----

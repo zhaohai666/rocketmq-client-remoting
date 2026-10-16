@@ -132,6 +132,28 @@ async function main(): Promise<void> {
   check('326 arrived as broker push (replies sent by responder)', repliesSent >= TOTAL,
     `repliesSent=${repliesSent}`);
 
+  // ---- cold start: request() issued right after start(), with no warm-up ----
+  // The broker delivers the reply by looking REPLY_TO_CLIENT up in its
+  // ProducerManager, and only a HEARTBEAT carrying ProducerData fills that table.
+  // The beat of start() cannot help (no route cached yet, so there is no broker to
+  // beat to) and the next one is 10s/30s away, so a request issued in the same
+  // second as start() used to lose its reply and only ever time out. This leg must
+  // NOT sleep, pre-fetch the route or beat by hand — that is the point.
+  const cold = new DefaultMQProducer('GID_NodeRR_Cold');
+  cold.setNamesrvAddr(NS);
+  cold.start();
+  let coldReply = '';
+  let coldErr = '';
+  try {
+    const r = await cold.request(new Message(TOPIC, Buffer.from('req-cold'), 'TagR', 'kcold'), 15_000);
+    coldReply = (r.getBody() || Buffer.alloc(0)).toString('utf8');
+  } catch (e) {
+    coldErr = (e as Error).message;
+  }
+  check('cold-start request right after start() gets its reply', coldReply === 'resp-cold',
+    `reply=${coldReply}${coldErr ? ' err=' + coldErr : ''}`);
+  cold.shutdown();
+
   await consumer.shutdown();
   requestor.shutdown();
   responder.shutdown();

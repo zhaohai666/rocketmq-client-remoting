@@ -349,7 +349,15 @@ export class RemotingClient {
     };
     this.responseTable.set(request.opaque, fut);
     fut.timer = setTimeout(() => {
-      if (this.responseTable.delete(request.opaque)) callback(null, new RemotingTimeoutException(addr, timeout));
+      if (!this.responseTable.delete(request.opaque)) return;
+      // This body runs on Node's timer stack: a throw from the caller's callback
+      // would surface as an uncaughtException and kill the process, so it must not
+      // escape here.
+      try {
+        callback(null, new RemotingTimeoutException(addr, timeout));
+      } catch (e) {
+        logger.error('invokeAsync timeout callback threw for %s: %s', addr, (e as Error).message);
+      }
     }, timeout);
     this._send(addr, request).then((sock) => {
       fut.conn = sock;

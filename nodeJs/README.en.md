@@ -182,13 +182,14 @@ const puller = new DefaultMQPullConsumer('GID_PULL');
 puller.setNamesrvAddr('127.0.0.1:9876');
 await puller.start();
 for (const mq of await puller.fetchMessageQueuesInBalance('TopicTest')) {
-  const offset = await puller.fetchConsumeOffset(mq, false);
+  const stored = await puller.fetchConsumeOffset(mq, true);    // committed offset, -1 when never consumed
+  const offset = stored >= 0 ? stored : 0;
   const res = await puller.pull(mq, '*', offset, 32);        // short poll
   // await puller.pullBlockIfNotFound(mq, '*', offset, 32)   // long poll
-  if (res.pullStatus === PullStatus.FOUND) puller.updateConsumeOffset(mq, res.nextBeginOffset);
+  if (res.status === PullStatus.FOUND) puller.updateConsumeOffset(mq, res.nextBeginOffset);
 }
 await puller.persistConsumeOffset();
-puller.shutdown();
+await puller.shutdown();
 ```
 
 ### LitePullConsumer (with the topic queue-change listener)

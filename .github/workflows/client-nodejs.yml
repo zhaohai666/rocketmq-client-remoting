@@ -29,3 +29,15 @@ jobs:
       - name: Run selfcheck (all modules + smoke tests)
         working-directory: nodeJs
         run: node --experimental-strip-types selfcheck.ts
+
+      # The package ships dist/ only, and the build type-checks nothing: a module
+      # that imports cleanly from src can still be emitted broken.
+      - name: Install dev dependencies
+        working-directory: nodeJs
+        run: npm ci --no-audit --no-fund
+
+      - name: Build and smoke the packaged dist
+        working-directory: nodeJs
+        run: |
+          npm run build
+          npm run smoke:dist

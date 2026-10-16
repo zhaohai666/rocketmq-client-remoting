@@ -178,13 +178,14 @@ const puller = new DefaultMQPullConsumer('GID_PULL');
 puller.setNamesrvAddr('127.0.0.1:9876');
 await puller.start();
 for (const mq of await puller.fetchMessageQueuesInBalance('TopicTest')) {
-  const offset = await puller.fetchConsumeOffset(mq, false);
+  const stored = await puller.fetchConsumeOffset(mq, true);    // 回读已提交位点，从未消费过时为 -1
+  const offset = stored >= 0 ? stored : 0;
   const res = await puller.pull(mq, '*', offset, 32);        // 短轮询
   // await puller.pullBlockIfNotFound(mq, '*', offset, 32)   // 长轮询
-  if (res.pullStatus === PullStatus.FOUND) puller.updateConsumeOffset(mq, res.nextBeginOffset);
+  if (res.status === PullStatus.FOUND) puller.updateConsumeOffset(mq, res.nextBeginOffset);
 }
 await puller.persistConsumeOffset();
-puller.shutdown();
+await puller.shutdown();
 ```
 
 ### LitePullConsumer（含 topic 队列变更监听）

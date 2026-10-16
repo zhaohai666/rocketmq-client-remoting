@@ -350,8 +350,11 @@ export class DefaultMQProducer {
         userHook: this.rpcHook,
       });
     }
-    client.start();
+    // Register before start(): the early beat fired by client.start() builds its
+    // HEARTBEAT from producerTable, so registering afterwards makes that beat carry
+    // no ProducerData and the broker never learns this producer's channel.
     client.registerProducer(this.producerGroup, this);
+    client.start();
     this.mqFaultStrategy = new MQFaultStrategy(this.sendLatencyFaultEnable);
     // Fault-strategy probe thread: MQFaultStrategy carries a start/stop
     // detector; resolver maps broker name -> publish addr, detector is a plain
@@ -592,7 +595,7 @@ export class DefaultMQProducer {
       this._sendAsyncKernel(msg, mq, tpInfo, sendCallback, request, addr);
       return null;
     } else {
-      this.client.sendMessageOneway(addr, request);
+      await this.client.sendMessageOneway(addr, request);
       return null;
     }
   }
@@ -832,6 +835,21 @@ export class DefaultMQProducer {
     try {
       await this._sendDefaultImpl(msg, CommunicationMode.ASYNC, wrapped, timeoutMillis);
     } catch (e) {
+      // A sendAsync caller hands over a SendCallback and normally does not attach
+      // a handler to the returned promise, so re-throwing here would turn an
+      // ordinary send failure into an unhandled rejection that kills the process.
+      // With a callback the callback owns the error; a callback-less caller still
+      // gets the rejection.
+      if (sendCallback) {
+        releaseOnce();
+        try {
+          sendCallback(null, e as Error);
+        } catch (cbErr) {
+          logger.warn('execute sendCallback in sendAsync failure, and callback throw: %s',
+            (cbErr as Error).message);
+        }
+        return;
+      }
       releaseOnce();
       throw e;
     }
@@ -961,11 +979,10 @@ export class DefaultMQProducer {
     header.msgId = uniqKey != null ? String(uniqKey) : sendResult.msgId;
     header.bname = sendResult.messageQueue != null ? sendResult.messageQueue.getBrokerName() : null;
     const request = RemotingCommand.createRequestCommand(RequestCode.END_TRANSACTION, header);
-    try {
-      this.client.remotingClient.invokeOneway(brokerAddr, request);
-    } catch (e) {
-      logger.warn(`end transaction failed: ${(e as Error).message}`);
-    }
+    // A synchronous try around an async call catches nothing: the rejection would
+    // escape as an unhandled rejection and kill the process.
+    this.client.remotingClient.invokeOneway(brokerAddr, request)
+      .catch((e) => { logger.warn(`end transaction failed: ${(e as Error).message}`); });
     // Trace: fire the EndTransactionTraceHook from endTransaction — the
     // EndTransaction record of a transaction message.
     if (this._traceDispatcher != null) {
@@ -994,8 +1011,19 @@ export class DefaultMQProducer {
     MessageAccessor.putProperty(msg, MessageConst.PROPERTY_MESSAGE_REPLY_TO_CLIENT, requestClientId);
     MessageAccessor.putProperty(msg, MessageConst.PROPERTY_MESSAGE_TTL, String(timeoutMillis));
     MessageAccessor.setMessageType(msg, MessageType.REQUEST_REPLY);
-    if (this.client != null && this.client.getTopicRouteData(msg.getTopic()) == null) {
-      await this._tryToFindTopicPublishInfo(msg.getTopic());
+    // The broker routes the reply back by looking REPLY_TO_CLIENT up in its
+    // ProducerManager, which is filled only by a HEARTBEAT carrying this
+    // producer's ProducerData. Neither the beat of start() (no route yet, so no
+    // broker to beat to) nor the 10s/30s refresh reaches a request issued right
+    // after start(), so the reply would be undeliverable and the request would
+    // only ever time out. Warm the route, then beat once, before the caller
+    // registers the future and sends.
+    if (this.client != null) {
+      if (this.client.getTopicRouteData(msg.getTopic()) == null
+        || this.client.getAllBrokerAddrEntries().length === 0) {
+        await this._tryToFindTopicPublishInfo(msg.getTopic());
+      }
+      await this.client.sendHeartbeatToAllBrokers();
     }
   }
 
@@ -1007,13 +1035,15 @@ export class DefaultMQProducer {
     try {
       return await new Promise<Message>((resolve, reject) => {
         timer = setTimeout(() => {
-          if (future.isSendRequestOk()) {
-            reject(new MQClientException(
-              `send request message to <${msg.getTopic()}> OK, but wait reply message timeout, ${timeoutMillis} ms.`));
-          } else {
-            reject(new MQClientException(`send request message to <${msg.getTopic()}> fail`));
-          }
+          // This body runs on Node's timer stack: anything thrown here is an
+          // uncaughtException and kills the process, and the awaiting caller is
+          // never told. Settle the future first, then reject.
+          const err = future.sendRequestOk
+            ? new MQClientException(
+              `send request message to <${msg.getTopic()}> OK, but wait reply message timeout, ${timeoutMillis} ms.`)
+            : new MQClientException(`send request message to <${msg.getTopic()}> fail`);
           future.completeExceptionally(new MQClientException('request timeout, no reply message.'));
+          reject(err);
         }, Math.max(1, timeoutMillis - cost));
         future.promise().then(resolve, reject);
       });

@@ -24,6 +24,7 @@
     "test": "node --experimental-strip-types --test",
     "typecheck": "tsc --noEmit",
     "selfcheck": "node --experimental-strip-types selfcheck.ts",
+    "smoke:dist": "node smoke_dist.mjs",
     "live:producer": "node --experimental-strip-types examples/live_producer.ts",
     "live:consumer": "node --experimental-strip-types examples/live_consumer.ts",
     "live:pull": "node --experimental-strip-types examples/live_pull.ts",

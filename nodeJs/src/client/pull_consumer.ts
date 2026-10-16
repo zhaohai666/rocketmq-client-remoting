@@ -5,7 +5,6 @@
 // suspend=true (the broker suspends the request for about 5s before answering
 // NO_NEW_MSG). Unconditionally writing suspend=true manifests as a 5s timeout
 // on every idle pull.
-import type { MQClient } from './mq_client.ts';
 import { PullAPI } from './pull_api.ts';
 import { MQClient } from './mq_client.ts';
 import { MQClientManager } from './mq_client_manager.ts';
@@ -100,9 +99,9 @@ export class DefaultMQPullConsumer {
     if (this.started) return;
     Validators.checkGroup(this.consumerGroup);
     if (!this.nameServerAddr) throw new Error('name server address is not set');
-    if (this.subscription.size === 0) {
-      throw new Error('subscription is not set, call subscribe() first');
-    }
+    // No subscription is required to start: a pull consumer names the topic in
+    // fetchSubscribeMessageQueues/pull and may pass the expression inline, so
+    // subscribe() is only one of the ways to get one.
     // Only CLUSTERING rewrites the default instanceName (BROADCASTING keeps
     // "DEFAULT", letting same-process instances share one client instance);
     // clientId has the form `<ip>@<instanceName>[@<unitName>][@STREAM]`. ⚠ Using
@@ -230,8 +229,19 @@ export class DefaultMQPullConsumer {
   // fetchConsumeOffset reads the consumed offset (-1 when unknown).
   async fetchConsumeOffset(mq: MessageQueue, fromStore: boolean): Promise<number> {
     if (!this.offsetStore) throw new Error('consumer not started');
+    if (fromStore) await this._warmQueueRoute(mq.getTopic());
     return this.offsetStore.readOffset(mq,
       fromStore ? ReadOffsetMode.READ_FROM_STORE : ReadOffsetMode.READ_FROM_MEMORY);
+  }
+
+  // The offset store resolves a queue's broker address from the cached route
+  // table, and a consumer started without subscribe() has nothing cached: a cold
+  // store read then silently answers -1 — the caller restarts at zero and
+  // re-consumes the whole topic — while a cold persist throws.
+  private async _warmQueueRoute(topic: string): Promise<void> {
+    if (!this.mqClient || !topic) return;
+    if (this.mqClient.getTopicRouteData(topic)) return;
+    await this.mqClient.updateTopicRouteInfoFromNameServer(topic, false).catch(() => {});
   }
 
   // persistConsumeOffset flushes all recorded offsets.
@@ -246,6 +256,9 @@ export class DefaultMQPullConsumer {
       if (i1 > 0 && i2 > i1) {
         mqs.push(new MessageQueue(key.slice(0, i1), key.slice(i1 + 1, i2), parseInt(key.slice(i2 + 1), 10) || 0));
       }
+    }
+    for (const topic of new Set(mqs.map(mq => mq.getTopic()))) {
+      await this._warmQueueRoute(topic);
     }
     await this.offsetStore.persistAll(mqs);
   }
@@ -285,6 +298,14 @@ export class DefaultMQPullConsumer {
       if (MixAll.MASTER_ID in m) { addr = m[MixAll.MASTER_ID]; break; }
     }
     if (!addr) return keep('no master broker in the route');
+
+    // The broker learns about a group only from a HEARTBEAT carrying its
+    // ConsumerData. start() beats once before any topic route is cached, so a
+    // consumer that starts without subscribe() has an empty address table and
+    // that beat reaches nobody. Query the consumer list without beating again
+    // here and the broker reports the group as unknown, so allocation assigns
+    // no queue at all.
+    await client.sendHeartbeatToAllBrokers().catch(() => {});
 
     let ids: string[];
     try {
