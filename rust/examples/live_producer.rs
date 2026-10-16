@@ -2017,17 +2017,25 @@ async fn p11_producer_unregister(
         .await
         .map_err(|e| format!("admin start: {e}"))?;
 
-    // Registration goes live via heartbeat (one round per 30s), so poll and wait
-    let deadline = Instant::now() + Duration::from_secs(90);
+    // Registration rides on the first heartbeat after the route lands, not on the periodic round,
+    // so keep the elapsed time: it is what separates a working beat from a 30s rescue.
+    let begin = Instant::now();
+    let deadline = begin + Duration::from_secs(15);
     let mut seen_a = producer_clients(&admin, &group_a).await;
     while !seen_a.contains(&id_a) && Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
         seen_a = producer_clients(&admin, &group_a).await;
     }
+    let waited = begin.elapsed();
     ck.check(
         "P11 the broker sees producer A's registration (204)",
         seen_a.contains(&id_a),
-        &format!("{seen_a:?}"),
+        &format!("{seen_a:?} waited={waited:?}"),
+    );
+    ck.check(
+        "P11 registration lands with the route, not on the next 30s round",
+        waited < Duration::from_secs(10),
+        &format!("only listed after {waited:?}"),
     );
     let seen_b = producer_clients(&admin, &group_b).await;
     ck.check(

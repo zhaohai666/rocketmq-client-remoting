@@ -724,7 +724,12 @@ final class DefaultMQPushConsumer
         }
     }
 
-    private function buildHeartbeat(): HeartbeatData
+    /**
+     * This consumer's slice of the registration payload. Public because the instance builds
+     * its heartbeat from every group it owns; a consumer that drives its own beat sends the
+     * very same payload, so the two paths cannot diverge.
+     */
+    public function buildHeartbeat(): HeartbeatData
     {
         $hb = new HeartbeatData($this->clientId ?? '');
         $cd = new ConsumerData(

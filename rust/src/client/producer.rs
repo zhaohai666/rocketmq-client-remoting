@@ -1824,9 +1824,9 @@ async fn send_heartbeat_to_all_broker(inner: &Inner, client: &MQClientInstance) 
     }
     let mut hb = HeartbeatData::new(client.client_id().to_string());
     hb.add_producer_data(ProducerData::new(group));
-    // ⚠ The heartbeatFingerprint / withoutSub fields of the heartbeat payload stay at their defaults
-    // (known defect). When absent the broker deserializes them as 0, which is equivalent to taking the V1 registration path,
-    // the same effect as setting them to 0 explicitly, so the current behaviour is kept without introducing a new difference.
+    // heartbeatFingerprint / withoutSub keep their defaults: absent from the payload the
+    // broker deserializes them as 0/false and takes the V1 registration path, which is the
+    // same effect as pinning them to 0/false explicitly.
     let mut ok = 0usize;
     for addr in addrs {
         if let Err(e) = client.send_heartbeat(&addr, &hb, 5000).await {

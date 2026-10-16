@@ -138,6 +138,11 @@ function producerBrokerLog(string $logFile, RemotingCommand $cmd): void
         'oneway' => $cmd->isOnewayRPC(),
         'ext' => $cmd->extFields,
     ];
+    // A heartbeat's registration payload lives in the body, and "the broker learned this group"
+    // can only be asserted from what actually arrived.
+    if ($cmd->code === RequestCode::HEART_BEAT) {
+        $entry['body'] = (string) $cmd->body;
+    }
     @file_put_contents($logFile, json_encode($entry, JSON_UNESCAPED_SLASHES) . "\n", FILE_APPEND);
 }
 
@@ -1825,6 +1830,89 @@ final class RunClientProducer
         $this->check(true, 'trace suite shutdown complete');
     }
 
+    // ================================================================ 19. Registration on the wire
+
+    /**
+     * What a broker can actually see of this client: the group must be inside a HEART_BEAT body,
+     * not merely "a heartbeat was sent". A beat whose payload omits the producer half leaves
+     * ProducerManager without this channel, so CHECK_TRANSACTION_STATE and a reply have nowhere
+     * to go back to.
+     */
+    private function testRegistrationOnWire(ProducerFakeBroker $broker): void
+    {
+        $p = $this->makeProducer($broker, 'GID-register', 'RegisterTopic', 'register-inst-1');
+        $p->start();
+        $inst = $this->privateOf($p, 'mqClient');
+        $this->check($inst instanceof MQClientInstance, 'producer owns an instance');
+
+        // The group is in the instance's registry, so the instance beat can carry it at all.
+        $this->checkSame(true, $inst->hasProducer('GID-register'), 'start() registers the producer group with the instance');
+        $groups = array_map(static fn($x) => $x->groupName, $inst->buildHeartbeatData()->producerDataSet);
+        $this->checkSame(['GID-register'], $groups, 'the instance heartbeat payload carries the producer group');
+
+        // Reaching the broker needs a route first: a beat before any broker is known lands nowhere,
+        // so the group has to show up on the wire by the time a send has resolved the route.
+        $p->send(new Message('RegisterTopic', 'register-body'));
+        $beats = $this->heartbeatPayloads($broker);
+        $this->check($beats !== [], 'broker received a heartbeat carrying a payload');
+        $this->check(
+            in_array(['GID-register'], array_column($beats, 'producers'), true),
+            'a heartbeat on the wire registers GID-register',
+        );
+        // The V1 registration path is deliberate: fingerprint 0 / withoutSub false makes the broker
+        // keep the full subscription set instead of an incremental heartbeat.
+        foreach ($beats as $b) {
+            $this->checkSame(0, $b['fingerprint'], 'heartbeatFingerprint=0 keeps the V1 registration path');
+            $this->checkSame(false, $b['withoutSub'], 'withoutSub=false reports the subscription set');
+            $this->check($b['clientId'] !== '', 'heartbeat carries this client clientId');
+        }
+
+        // PHP starts no threads: the tick pump is what keeps a producer-only app registered after
+        // the broker's channel for a previous session is gone.
+        $before = $broker->logCount(RequestCode::HEART_BEAT);
+        $inst->tick((int) (microtime(true) * 1000) + MQClientInstance::HEARTBEAT_INTERVAL_MILLIS + 1);
+        $this->check($broker->logCount(RequestCode::HEART_BEAT) > $before, 'the tick pump re-beats once the period elapses');
+        $afterTick = $this->heartbeatPayloads($broker);
+        $this->check(
+            in_array(['GID-register'], array_column($afterTick, 'producers'), true),
+            'the tick-driven beat still registers the group',
+        );
+        $this->check($inst->heartbeatCount() >= 1, 'the instance counts its own beats');
+
+        // Nothing registered ⇒ nothing on the wire (an app that shut its groups down must not
+        // re-register itself).
+        $p->shutdown();
+        $countAfterShutdown = $broker->logCount(RequestCode::HEART_BEAT);
+        $this->checkSame(false, $inst->hasProducer('GID-register'), 'shutdown drops the producer group from the instance');
+        $inst->heartbeatOnce();
+        $this->checkSame($countAfterShutdown, $broker->logCount(RequestCode::HEART_BEAT), 'an unregistered instance beats nobody');
+
+        MQClientInstance::removeInstance('register-inst-1-cid');
+        $this->check(true, 'registration suite shutdown complete');
+    }
+
+    /** @return list<array{clientId: string, producers: list<string>, consumers: list<string>, fingerprint: mixed, withoutSub: mixed}> */
+    private function heartbeatPayloads(ProducerFakeBroker $broker): array
+    {
+        $out = [];
+        foreach ($broker->logEntries() as $e) {
+            if (($e['code'] ?? 0) !== RequestCode::HEART_BEAT || !isset($e['body'])) {
+                continue;
+            }
+            // Read the fields off the JSON that actually arrived: the registration path the broker
+            // picks is decided by the wire, not by what the client object holds.
+            $raw = json_decode((string) $e['body'], true) ?: [];
+            $out[] = [
+                'clientId' => (string) ($raw['clientID'] ?? ''),
+                'producers' => array_map(static fn($x) => (string) ($x['groupName'] ?? ''), $raw['producerDataSet'] ?? []),
+                'consumers' => array_map(static fn($x) => (string) ($x['groupName'] ?? ''), $raw['consumerDataSet'] ?? []),
+                'fingerprint' => $raw['heartbeatFingerprint'] ?? null,
+                'withoutSub' => $raw['withoutSub'] ?? null,
+            ];
+        }
+        return $out;
+    }
+
     // ================================================================ helpers
 
     private function privateOf(object $obj, string $name): mixed
@@ -1876,6 +1964,7 @@ final class RunClientProducer
             $this->testAdminAndRecall($broker);
             $this->testAutoBatch($broker);
             $this->testTraceDispatcherWiring($broker);
+            $this->testRegistrationOnWire($broker);
         } finally {
             $broker->stop();
         }

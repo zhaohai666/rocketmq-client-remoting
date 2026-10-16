@@ -56,7 +56,9 @@ use RocketMQ\Remoting\SocksProxyConfig;
  * with no background threads. All periodic/async background work becomes caller-driven
  * explicit pumping:
  *
- *   * Heartbeat: ``heartbeatOnce()`` is driven periodically by the caller;
+ *   * Heartbeat: the instance registers this producer in its own table, so the group is
+ *     (re-)registered when a route lands and on every ``MQClientInstance::tick()``; an
+ *     application that drives no pump at all can still call ``heartbeatOnce()`` itself;
  *   * Transaction check-back CHECK_TRANSACTION_STATE(39): executed inline in the processor.
  *
  * Clock injection (``monoClock`` / ``wallClock``) is allowed for unit tests.
@@ -454,9 +456,10 @@ class DefaultMQProducer
     /** The current transaction listener (recorded during sendMessageInTransaction, for broker check-back calls) */
     private ?TransactionListener $transactionListener = null;
     /**
-     * PHP has no threads: the heartbeat starts no background loop; it is explicitly pumped
-     * by the caller (``heartbeatOnce()``). The field is kept only to express the "is the
-     * heartbeat still running" state (set to false after shutdown).
+     * PHP has no threads: this flag starts no loop. ``heartbeatOnce()`` is the explicit
+     * round for callers that want one; the instance's own pump registers and refreshes the
+     * group without it. The field only expresses the "is the heartbeat still running" state
+     * (set to false after shutdown).
      */
     public bool $heartbeatRunning = false;
     public int $heartbeatIntervalMillis = 30000;
@@ -1278,6 +1281,10 @@ class DefaultMQProducer
         if ($this->rpcHook !== null) {
             $this->mqClient->remotingClient->registerRpcHook($this->rpcHook);
         }
+        // The instance heartbeat is what registers this group with the broker (its payload is
+        // built from the instance's registries), so the producer must be in the table before
+        // the first beat -- including the one start()'s opening pump sends.
+        $this->mqClient->registerProducer($this->producerGroup);
         $this->mqClient->start();
         // Dynamic name server: the instance may already have obtained an address from the address server at startup; backfill it to this producer
         if ($this->nameServerAddrs === [] && $this->mqClient->nameServerAddrs !== []) {
@@ -1356,6 +1363,7 @@ class DefaultMQProducer
             $this->callbackExecutor = null;
         }
         if ($this->mqClient !== null) {
+            $this->mqClient->unregisterProducer($this->producerGroup);
             try {
                 $this->mqClient->unregisterClientAllBrokers($this->clientId ?? '', $this->producerGroup, '');
             } catch (\Throwable $e) {
@@ -1398,10 +1406,9 @@ class DefaultMQProducer
         }
         $hb = new HeartbeatData($this->clientId ?? '');
         $pd = new ProducerData($this->producerGroup);
-        // WARNING: HeartbeatData has no heartbeatFingerprint / withoutSub fields
-        // (a known defect, see project memory). When absent the broker deserializes them
-        // as 0, equivalent to the V1 registration path, with the same effect as an
-        // explicit 0; keep the status quo here and introduce no new difference.
+        // heartbeatFingerprint / withoutSub are pinned to 0/false by HeartbeatData::toDict(),
+        // which keeps the broker on the V1 registration path (the full subscription set is
+        // reported alongside the group).
         $hb->producerDataSet[] = $pd;
         $okCount = 0;
         foreach ($addrs as $addr) {

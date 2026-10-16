@@ -1,7 +1,7 @@
 #!/bin/bash
 # Live verification entry point for the PHP client (mirrors the approach of run_go_*_live.sh / run_node_live.sh).
 #
-# Usage: bash scripts/run_php_live.sh redelivery|admin|compression|pop|tls|request_reply|pull|lite_qc [namesrv]
+# Usage: bash scripts/run_php_live.sh redelivery|admin|compression|pop|tls|request_reply|pull|lite_qc|registration [namesrv]
 #   redelivery   php/examples/live_redelivery.php  (optional third arg legs=all|s1,s2,s3,s4)
 #   admin        php/examples/live_admin.php
 #   pull         php/examples/live_pull.php        (optional third arg legs=all|s1,s2,s3;
@@ -14,6 +14,10 @@
 #   compression  php/examples/live_compression.php (smoke only: a single php->php leg;
 #                 the cross-language matrix goes through the php_* legs of scripts/compression_matrix.sh)
 #   request_reply php/examples/live_request_reply.php (326 request-reply: responder + requester round trip)
+#   registration php/examples/live_producer_registration.php (broker-side view of producer
+#                 registration: GET_PRODUCER_CONNECTION_LIST(204) must list the clientId of a
+#                 producer that only called start(), the 30s tick pump must keep it listed, and
+#                 shutdown() must drop it)
 #   pop          php/examples/live_pop.php         (optional third arg legs=all|s1,s2;
 #                 **requires an exclusive cluster**: needs the four POP-specific broker.conf
 #                 settings, see below)
@@ -53,8 +57,9 @@ case "$WHICH" in
   pop)           EXAMPLE="examples/live_pop.php"            ;;
   tls)           EXAMPLE="examples/live_tls.php"            ;;
   request_reply) EXAMPLE="examples/live_request_reply.php"  ;;
+  registration)  EXAMPLE="examples/live_producer_registration.php" ;;
   static_topic)  EXAMPLE="examples/live_static_topic.php"   ;;
-  *) echo "unknown example: $WHICH (redelivery|admin|compression|pop|tls|request_reply|pull|lite_qc|static_topic)" >&2; exit 2 ;;
+  *) echo "unknown example: $WHICH (redelivery|admin|compression|pop|tls|request_reply|pull|lite_qc|static_topic|registration)" >&2; exit 2 ;;
 esac
 
 port_open() {

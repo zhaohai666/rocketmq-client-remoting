@@ -50,6 +50,7 @@ use RocketMQ\Remoting\Protocol\PopMessageRequestHeader;
 use RocketMQ\Remoting\Protocol\PopMessageResponseHeader;
 use RocketMQ\Remoting\Protocol\PullMessageRequestHeader;
 use RocketMQ\Remoting\Protocol\PullMessageResponseHeader;
+use RocketMQ\Remoting\Protocol\ProducerData;
 use RocketMQ\Remoting\Protocol\QueryAssignmentRequestBody;
 use RocketMQ\Remoting\Protocol\QueryAssignmentResponseBody;
 use RocketMQ\Remoting\Protocol\QueryConsumerOffsetRequestHeader;
@@ -91,10 +92,10 @@ use RocketMQ\Remoting\StreamTypeRPCHook;
  *
  * This file also hosts both the TopicPublishInfo and MQClientInstance classes.
  *
- * Single-threaded model: this port has no threads; the four kinds of periodic tasks --
- * dynamic NameServer refresh, thread-pool elasticity patrol, route refresh, and consume
- * stats sampling -- are all converged into caller-driven explicit ``tick()`` (expiry is
- * judged internally by timestamp, with the current time injectable); the resetOffset that
+ * Single-threaded model: this port has no threads; the periodic tasks -- dynamic NameServer
+ * refresh, thread-pool elasticity patrol, route refresh, consume stats sampling, and the
+ * registration heartbeat -- are all converged into caller-driven explicit ``tick()`` (expiry
+ * is judged internally by timestamp, with the current time injectable); the resetOffset that
  * used to be "dropped onto a background thread" now enters an internal pending queue,
  * executed by ``tick()``.
  */
@@ -201,6 +202,9 @@ class MQClientInstance
     /** Route refresh: first delay 10ms. */
     public const ROUTE_REFRESH_INITIAL_DELAY_MILLIS = 10;
 
+    /** Registration refresh (heartbeat) period: 30000ms. */
+    public const HEARTBEAT_INTERVAL_MILLIS = 30_000;
+
     public const QUERY_ASSIGNMENT_TIMEOUT_MILLIS = 3000;
 
     public const POP_ASSIGNMENT_INTERVAL_MILLIS = 20_000;
@@ -273,6 +277,15 @@ class MQClientInstance
     /** @var array<string, object> consumerGroup -> consumer instance */
     private array $consumerTable = [];
 
+    /** @var array<string, bool> producerGroup -> registered flag */
+    private array $producerTable = [];
+
+    /** @var list<string> broker addresses the current registration was last beaten to (sorted) */
+    private array $brokersBeaten = [];
+
+    /** Successful heartbeat rounds (each round may cover several brokers). */
+    private int $heartbeatCount = 0;
+
     private int $consumerIdsChangedCount = 0;
 
     /** @var list<callable> the delayed queue of "background tasks" under a single thread (actions that should not block the caller) */
@@ -287,6 +300,7 @@ class MQClientInstance
     private ?int $adjustPoolNextRunMillis = null;
     private ?int $routeRefreshNextRunMillis = null;
     private ?int $statsSampleNextRunMillis = null;
+    private ?int $heartbeatNextRunMillis = null;
     /** RequestFutureHolder TTL sweep: first 3s, period 1s. */
     private ?int $requestScanNextRunMillis = null;
     public const REQUEST_SCAN_INITIAL_DELAY_MILLIS = 3_000;
@@ -399,9 +413,10 @@ class MQClientInstance
      * Synchronous initialization (PHP starts no background threads; all periodic tasks are pumped by the caller).
      *
      * (1) set started; (2) start consume stats; (3) dynamic NameServer first address fetch
-     * (report 10004 directly if unavailable); (4) schedule each pump's first expiry; (5)
-     * synchronously run one initialization "pump": first route refresh + one heartbeat +
-     * CHECK_CLIENT_CONFIG(46) validation (the latter best-effort; exceptions are only logged).
+     * (report 10004 directly if unavailable); (4) schedule each pump's first expiry, the
+     * heartbeat pump included; (5) synchronously run one initialization "pump": first route
+     * refresh + one heartbeat + CHECK_CLIENT_CONFIG(46) validation (the latter best-effort;
+     * exceptions are only logged).
      *
      * Afterwards the caller periodically calls ``tick()`` to advance namesrv refresh /
      * route refresh / thread patrol / stats sampling.
@@ -438,6 +453,10 @@ class MQClientInstance
             : null;
         $this->statsSampleNextRunMillis = $now + self::STATS_SAMPLE_INTERVAL_MILLIS;
         $this->requestScanNextRunMillis = $now + self::REQUEST_SCAN_INITIAL_DELAY_MILLIS;
+        // The broker forgot everything this clientId registered when the previous session's
+        // channel went away, so no broker counts as beaten yet.
+        $this->brokersBeaten = [];
+        $this->heartbeatNextRunMillis = $now + self::HEARTBEAT_INTERVAL_MILLIS;
 
         $this->pumpStartupOnce();
     }
@@ -454,6 +473,8 @@ class MQClientInstance
         $this->faultStrategy = null;
         $this->popAssignmentPollers = [];
         $this->pendingActions = [];
+        $this->heartbeatNextRunMillis = null;
+        $this->brokersBeaten = [];
         $this->consumerStatsManager->shutdown();
         $this->remotingClient->shutdown();
     }
@@ -494,10 +515,23 @@ class MQClientInstance
             $this->adjustPoolNextRunMillis = $now + self::ADJUST_POOL_INTERVAL_MILLIS;
         }
 
-        // (3) route refresh (period = pollNameServerInterval)
+        // (3) route refresh (period = pollNameServerInterval); a route that brings a new
+        //   broker re-registers right away (heartbeatIfBrokerSetChanged inside the fetch).
         if ($this->routeRefreshNextRunMillis !== null && $now >= $this->routeRefreshNextRunMillis) {
             $this->routeRefreshOnce();
             $this->routeRefreshNextRunMillis = $now + $this->pollNameServerInterval;
+        }
+
+        // (3b) registration refresh. This port starts no threads, and the broker drops a
+        //   group as soon as its channel is gone, so this stage is the only thing that keeps
+        //   a producer-only client registered: the producer facade drives no beat itself.
+        if ($this->heartbeatNextRunMillis !== null && $now >= $this->heartbeatNextRunMillis) {
+            $this->heartbeatNextRunMillis = $now + self::HEARTBEAT_INTERVAL_MILLIS;
+            try {
+                $this->heartbeatOnce();
+            } catch (\Throwable $e) {
+                Logger::warning('heartbeat pump exception: ' . $e->getMessage());
+            }
         }
 
         // (4) consume stats sampling
@@ -674,17 +708,100 @@ class MQClientInstance
         }
     }
 
-    /** Send one heartbeat to all known brokers (an empty HeartbeatData by default, clientId only). */
+    /**
+     * Send one heartbeat to all known brokers with the full registration of this clientId.
+     *
+     * A client that has registered nothing sends nothing: an empty HeartbeatData re-registers
+     * neither a producer group nor a consumer group, so beating with one only spends the
+     * round trip.
+     */
     public function heartbeatOnce(int $timeoutMillis = 5000): void
     {
-        $data = new HeartbeatData($this->clientId);
-        foreach ($this->getAllBrokerAddrs() as $addr) {
+        $data = $this->buildHeartbeatData();
+        if ($data->producerDataSet === [] && $data->consumerDataSet === []) {
+            return;
+        }
+        $addrs = $this->getAllBrokerAddrs();
+        $ok = 0;
+        foreach ($addrs as $addr) {
             try {
                 $this->sendHeartbeat($addr, $data, $timeoutMillis);
+                $ok++;
             } catch (\Throwable $e) {
                 Logger::debug(sprintf('heartbeatOnce failed, addr=%s: %s', $addr, $e->getMessage()));
             }
         }
+        if ($ok > 0) {
+            $this->heartbeatCount++;
+        }
+        // Only a round that reached every known broker counts as done: a broker that is
+        // briefly unreachable keeps being retried by the next pump instead of being
+        // remembered as beaten.
+        if ($ok > 0 && $ok === count($addrs)) {
+            $sorted = $addrs;
+            sort($sorted);
+            $this->brokersBeaten = $sorted;
+        }
+    }
+
+    /**
+     * Beat as soon as the route cache shows brokers that the registration has not reached.
+     *
+     * A heartbeat only goes to brokers already in the cache, so the first beat of a client
+     * that has not fetched any route lands nowhere; without this hook the group would wait
+     * for the next 30s round to register with a broker that joined in between.
+     */
+    public function heartbeatIfBrokerSetChanged(int $timeoutMillis = 5000): void
+    {
+        $addrs = $this->getAllBrokerAddrs();
+        if ($addrs === []) {
+            return;
+        }
+        sort($addrs);
+        if ($addrs === $this->brokersBeaten) {
+            return;
+        }
+        $this->heartbeatOnce($timeoutMillis);
+    }
+
+    /** Number of successful heartbeat rounds driven by this instance. */
+    public function heartbeatCount(): int
+    {
+        return $this->heartbeatCount;
+    }
+
+    /**
+     * The registration of this clientId: every producer group and every consumer group it
+     * owns, so one beat refreshes both kinds on the broker.
+     *
+     * The broker's ProducerManager/ConsumerManager learn a group only from this payload; a
+     * beat missing one kind leaves that kind unregistered whenever its facade drives no
+     * heartbeat of its own, and the broker then holds no channel to route
+     * CHECK_TRANSACTION_STATE or a reply back on.
+     */
+    public function buildHeartbeatData(): HeartbeatData
+    {
+        $hb = new HeartbeatData($this->clientId);
+        $groups = array_keys($this->producerTable);
+        sort($groups);
+        foreach ($groups as $group) {
+            $hb->producerDataSet[] = new ProducerData($group);
+        }
+        foreach ($this->consumerTable as $group => $consumer) {
+            if (!$consumer instanceof DefaultMQPushConsumer) {
+                continue;
+            }
+            try {
+                $one = $consumer->buildHeartbeat();
+            } catch (\Throwable $e) {
+                Logger::debug(sprintf('heartbeat build failed for group %s: %s', $group, $e->getMessage()));
+                continue;
+            }
+            foreach ($one->consumerDataSet as $cd) {
+                $hb->consumerDataSet[] = $cd;
+            }
+        }
+        return $hb;
     }
 
     /** Execute and clear the delayed action queue (all actions that should not slow the caller are queued here). */
@@ -756,6 +873,25 @@ class MQClientInstance
     public function registerConsumer(string $group, object $consumer): void
     {
         $this->consumerTable[$group] = $consumer;
+    }
+
+    /**
+     * A producer group owned by this clientId. The heartbeat payload carries only the group
+     * name, so the registry is a set.
+     */
+    public function registerProducer(string $group): void
+    {
+        $this->producerTable[$group] = true;
+    }
+
+    public function unregisterProducer(string $group): void
+    {
+        unset($this->producerTable[$group]);
+    }
+
+    public function hasProducer(string $group): bool
+    {
+        return isset($this->producerTable[$group]);
     }
 
     public function unregisterConsumer(string $group): void
@@ -1092,6 +1228,7 @@ class MQClientInstance
         $publish->orderTopic = $route->orderTopicConf !== null;
         $publish->topicRouteData = $route;
         $publish->msgQueueList = $route->getAllMessageQueue($topic);
+        $this->heartbeatIfBrokerSetChanged();
         return true;
     }
 

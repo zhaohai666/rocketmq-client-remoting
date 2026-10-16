@@ -17,6 +17,7 @@ declare(strict_types=1);
 
 require_once __DIR__ . '/../bootstrap.php';
 
+use RocketMQ\Client\DefaultMQPushConsumer;
 use RocketMQ\Client\Exceptions\MQBrokerException;
 use RocketMQ\Client\Exceptions\MQClientException;
 use RocketMQ\Client\MQClientInstance;
@@ -37,8 +38,11 @@ use RocketMQ\Common\MixAll;
 use RocketMQ\Common\PermName;
 use RocketMQ\Common\PullSysFlag;
 use RocketMQ\Remoting\Protocol\BrokerData;
+use RocketMQ\Remoting\Protocol\ConsumerData;
 use RocketMQ\Remoting\Protocol\ExtraInfoUtil;
+use RocketMQ\Remoting\Protocol\HeartbeatData;
 use RocketMQ\Remoting\Protocol\PopMessageResponseHeader;
+use RocketMQ\Remoting\Protocol\ProducerData;
 use RocketMQ\Remoting\Protocol\PullMessageResponseHeader;
 use RocketMQ\Remoting\Protocol\QueueData;
 use RocketMQ\Remoting\Protocol\RemotingCommand;
@@ -667,22 +671,27 @@ final class RunClientInstance
         $probe->tick($base + 500);
         $this->checkSame(1, $probe->namesrvCalls, 'tick(base+500): namesrv due and runs');
         $this->checkSame(2, $probe->routeCalls, 'namesrv trigger does not affect route count');
+        $this->checkSame(1, $probe->heartbeatCalls, 'tick(base+500): the 30s registration pump is not yet due');
 
         $probe->tick($base + 60000);
         $this->checkSame(1, $probe->adjustCalls, 'tick(base+60000): thread check due and runs');
         $this->checkSame(3, $probe->routeCalls, 'route also due within the same tick (next +30010)');
+        $this->checkSame(2, $probe->heartbeatCalls, 'tick(base+60000): the 30s registration pump is due and runs');
 
         // pumpOnce alias equivalence
         $before = $probe->routeCalls + $probe->adjustCalls + $probe->namesrvCalls;
         $probe->pumpOnce($base + 60001);
         $after = $probe->routeCalls + $probe->adjustCalls + $probe->namesrvCalls;
         $this->checkSame($before, $after, 'pumpOnce alias triggers no pump before anything is due');
+        $this->checkSame(2, $probe->heartbeatCalls, 'the beat that just ran is rescheduled a full period out');
 
         // tick does not advance after shutdown
         $probe->shutdown();
         $r = $probe->routeCalls;
+        $h = $probe->heartbeatCalls;
         $probe->tick($base + 999999);
         $this->checkSame($r, $probe->routeCalls, 'tick runs no pumps after shutdown');
+        $this->checkSame($h, $probe->heartbeatCalls, 'the registration pump stops after shutdown too');
 
         // pending queue: enqueued items are consumed by tick/runPendingActions
         $ran = 0;
@@ -924,6 +933,97 @@ final class RunClientInstance
         $broker->stop();
     }
 
+    // ================================================================ 11. registration heartbeat
+
+    /**
+     * The instance beat is what registers a group whose facade drives no loop of its own, so it
+     * has to carry every group the clientId owns and fire the moment the route cache shows a
+     * broker that registration has not reached yet. `sendHeartbeat()` is overridden here so the
+     * payload can be inspected on the way out without any broker round-trip.
+     */
+    private function testRegistrationHeartbeat(): void
+    {
+        $broker = FakeBroker::start();
+        $probe = new HeartbeatProbeInstance('reg-cid', [$broker->addr], 2000, 3000);
+        $probe->start();
+
+        // A route landing registers nothing while the client owns no group at all.
+        $this->checkSame(true, $probe->updateTopicRouteInfoFromNameServer('RouteTopic'), 'RouteTopic route cached');
+        $this->checkSame([], $probe->beats, 'a beat carries nothing until a group is registered');
+        $this->checkSame(0, $probe->heartbeatCount(), 'an empty round is not a successful beat');
+
+        // Producer-only: groups sorted, no consumer half, and the known broker beaten once.
+        $probe->registerProducer('GID_reg_b');
+        $probe->registerProducer('GID_reg_a');
+        $probe->heartbeatOnce();
+        $this->checkSame(
+            [['addr' => '127.0.0.1:10911', 'producers' => ['GID_reg_a', 'GID_reg_b'], 'consumers' => []]],
+            $probe->beats,
+            'a beat carries both producer groups and no consumer data',
+        );
+        $this->checkSame(1, $probe->heartbeatCount(), 'a round that lands counts once');
+        $this->checkSame(['127.0.0.1:10911'], $this->getPrivate($probe, 'brokersBeaten'),
+            'the reached broker is remembered as beaten');
+
+        // Unchanged broker set: refreshing the same route registers nothing again.
+        $probe->updateTopicRouteInfoFromNameServer('RouteTopic');
+        $this->checkSame(1, count($probe->beats), 'a route refresh on an unchanged broker set does not re-beat');
+
+        // A broker joins the cache (TBW102 lives on another machine): that one refresh registers
+        // the new set, and the round beats every known broker, not only the newcomer.
+        $this->checkSame(true, $probe->updateTopicRouteInfoFromNameServer('NewTopic', 5000, true), 'default-topic fallback cached');
+        $this->checkSame(
+            [
+                ['addr' => '127.0.0.1:10911', 'producers' => ['GID_reg_a', 'GID_reg_b'], 'consumers' => []],
+                ['addr' => '127.0.0.1:10911', 'producers' => ['GID_reg_a', 'GID_reg_b'], 'consumers' => []],
+                ['addr' => '127.0.0.1:10912', 'producers' => ['GID_reg_a', 'GID_reg_b'], 'consumers' => []],
+            ],
+            $probe->beats,
+            'one beat registers the whole known set, not only the broker that joined',
+        );
+        $this->checkSame(2, $probe->heartbeatCount(), 'the second round counts once regardless of broker count');
+        $this->checkSame(['127.0.0.1:10911', '127.0.0.1:10912'], $this->getPrivate($probe, 'brokersBeaten'),
+            'both brokers are remembered as beaten');
+
+        // Consumers merge into the same payload, so a producer-only app and a mixed app differ
+        // only in which half is filled.
+        $consumer = new DefaultMQPushConsumer('GID_reg_consumer');
+        $consumer->subscribe('RegSubTopic', 'tagA');
+        $probe->registerConsumer('GID_reg_consumer', $consumer);
+        $data = $probe->buildHeartbeatData();
+        $this->checkSame(['GID_reg_a', 'GID_reg_b'], array_map(static fn($p) => $p->groupName, $data->producerDataSet),
+            'buildHeartbeatData keeps the producer half');
+        $this->checkSame(['GID_reg_consumer'], array_map(static fn($c) => $c->groupName, $data->consumerDataSet),
+            'the consumer group rides along in the same beat');
+        $sub = $data->consumerDataSet[0]->subscriptionDataSet[0] ?? null;
+        $this->checkSame(['RegSubTopic', 'tagA'], $sub === null ? [] : [$sub->topic, $sub->subString],
+            'the consumer slice keeps its subscription');
+
+        // Dropping every producer group leaves only the consumer half; the beat still goes out.
+        $probe->unregisterProducer('GID_reg_a');
+        $probe->unregisterProducer('GID_reg_b');
+        $probe->heartbeatOnce();
+        $last = $probe->beats[count($probe->beats) - 1] ?? null;
+        $this->checkSame(
+            ['addr' => '127.0.0.1:10912', 'producers' => [], 'consumers' => ['GID_reg_consumer']],
+            $last,
+            'unregistered producer groups leave the payload',
+        );
+
+        // With nothing left registered a round sends no request at all -- this is what keeps a
+        // client that shut every group down from re-registering itself.
+        $probe->unregisterConsumer('GID_reg_consumer');
+        $beatsAfterLastRound = count($probe->beats);
+        $probe->heartbeatOnce();
+        $this->checkSame($beatsAfterLastRound, count($probe->beats), 'an unregistered client beats nothing');
+
+        $probe->shutdown();
+        $this->checkSame([], $this->getPrivate($probe, 'brokersBeaten'), 'shutdown forgets which brokers were beaten');
+
+        MQClientInstance::removeInstance('reg-cid');
+        $broker->stop();
+    }
+
     /** Sends one namespaceV2 probe, returning the peer-echoed `ns=<value>;nsd=<value>`. */
     private function probeNamespace(MQClientInstance $inst, string $addr): string
     {
@@ -947,6 +1047,7 @@ final class RunClientInstance
         $this->testPopMessage();
         $this->testQueryConsumerOffset();
         $this->testNamespaceRpcHookOnWire();
+        $this->testRegistrationHeartbeat();
         return $this->summary();
     }
 }
@@ -980,6 +1081,26 @@ class TickProbeInstance extends MQClientInstance
     public function heartbeatOnce(int $timeoutMillis = 5000): void
     {
         $this->heartbeatCalls++;
+    }
+}
+
+/**
+ * Registration probe: records every heartbeat request the instance puts on the wire together with
+ * the payload built for it, so the producer/consumer halves and the broker set of a round can be
+ * asserted without a broker round-trip.
+ */
+class HeartbeatProbeInstance extends MQClientInstance
+{
+    /** @var list<array{addr: string, producers: list<string>, consumers: list<string>}> */
+    public array $beats = [];
+
+    public function sendHeartbeat(string $addr, HeartbeatData $heartbeatData, int $timeoutMillis = 5000): void
+    {
+        $this->beats[] = [
+            'addr' => $addr,
+            'producers' => array_map(static fn(ProducerData $p): string => $p->groupName, $heartbeatData->producerDataSet),
+            'consumers' => array_map(static fn(ConsumerData $c): string => $c->groupName, $heartbeatData->consumerDataSet),
+        ];
     }
 }
 

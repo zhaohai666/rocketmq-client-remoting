@@ -65,7 +65,7 @@ use crate::remoting::protocol::headers::{
     UnlockBatchMqRequestHeader, UnregisterClientRequestHeader, UpdateConsumerOffsetRequestHeader,
 };
 use crate::remoting::protocol::heartbeat::{
-    ConsumerData, ExpressionType, HeartbeatData, SubscriptionData,
+    ConsumerData, ExpressionType, HeartbeatData, ProducerData, SubscriptionData,
 };
 use crate::remoting::protocol::query_assignment_body::{
     MessageQueueAssignment, QueryAssignmentRequestBody, QueryAssignmentResponseBody,
@@ -516,6 +516,10 @@ struct Inner {
     consumer_table: Mutex<HashMap<String, Arc<dyn RegisteredConsumer>>>,
     producer_table: Mutex<HashSet<String>>,
     consumer_group_table: Mutex<HashSet<String>>,
+    /// Broker addresses the current registration was last beaten to, sorted.
+    /// A route refresh only changes this after a beat actually reached the new set, so a
+    /// broker that joined in between keeps being retried until the registration lands there.
+    brokers_beaten: Mutex<Vec<String>>,
     /// `fetch_and_apply` needs `&mut`, so this sits in a `tokio::sync::Mutex`.
     top_addressing: Arc<tokio::sync::Mutex<DefaultTopAddressing>>,
     consumer_stats_manager: Arc<ConsumerStatsManager>,
@@ -599,6 +603,7 @@ impl MQClientInstance {
             consumer_table: Mutex::new(HashMap::new()),
             producer_table: Mutex::new(HashSet::new()),
             consumer_group_table: Mutex::new(HashSet::new()),
+            brokers_beaten: Mutex::new(Vec::new()),
             top_addressing: Arc::new(tokio::sync::Mutex::new(
                 config
                     .top_addressing
@@ -1029,6 +1034,14 @@ impl MQClientInstance {
             return Ok(());
         }
         let _ = self.inner.stop.send(false);
+        // A previous session of this instance may have beaten the very same brokers already,
+        // but a restart means a new channel and the broker forgot the registration: force the
+        // next route refresh (and the beat loop) to treat the current set as never beaten.
+        self.inner
+            .brokers_beaten
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.inner.remoting_client.start();
         if let Err(e) = self.inner.consumer_stats_manager.start() {
             self.shutdown_factory();
@@ -1357,6 +1370,7 @@ impl MQClientInstance {
         // The publish info's three fields must be refreshed as one batch:
         // `TopicPublishInfo` has its own fine-grained lock, so the table lock is released before the refresh (no nested locks).
         publish.update_from_route(&route, topic);
+        self.send_heartbeat_if_broker_set_changed().await;
         Ok(true)
     }
 
@@ -2947,6 +2961,9 @@ impl MQClientInstance {
 
     pub fn prepare_heartbeat_data(&self) -> HeartbeatData {
         let mut hb = HeartbeatData::new(self.inner.client_id.clone());
+        for group in self.producer_groups() {
+            hb.add_producer_data(ProducerData::new(group));
+        }
         for (group, consumer) in self.consumers_entries() {
             let mut cd = ConsumerData::new(
                 group,
@@ -2963,15 +2980,42 @@ impl MQClientInstance {
         hb
     }
 
-    /// Send heartbeats to every known broker (**slaves included**); returns the success count.
-    pub async fn send_heartbeat_to_all_broker(&self, timeout_millis: i64) -> usize {
-        if self
+    /// Both registries of this clientId, so one beat keeps producer **and** consumer
+    /// registrations alive. Dropping either half leaves that kind registered only by its
+    /// own facade loop; when that loop is not running, the broker holds no channel for the
+    /// group and can never route CHECK_TRANSACTION_STATE or a reply back to this client.
+    fn has_registration(&self) -> bool {
+        !self
             .inner
-            .consumer_table
+            .producer_table
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_empty()
-        {
+            || !self
+                .inner
+                .consumer_table
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+    }
+
+    /// `producer_table` snapshot (sorted by group for deterministic traversal order).
+    fn producer_groups(&self) -> Vec<String> {
+        let mut groups: Vec<String> = self
+            .inner
+            .producer_table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect();
+        groups.sort();
+        groups
+    }
+
+    /// Send heartbeats to every known broker (**slaves included**); returns the success count.
+    pub async fn send_heartbeat_to_all_broker(&self, timeout_millis: i64) -> usize {
+        if !self.has_registration() {
             return 0;
         }
         let heartbeat_data = self.prepare_heartbeat_data();
@@ -2984,6 +3028,39 @@ impl MQClientInstance {
                 Ok(()) => ok += 1,
                 Err(e) => rmq_debug!("heartbeat to {addr} failed: {e}"),
             }
+        }
+        ok
+    }
+
+    /// Beat as soon as the route cache shows a broker set the registration has not reached
+    /// yet. Registration only goes to brokers already cached, so the first beat of a client
+    /// that starts without a route lands nowhere; without this the group waits for the next
+    /// 30s beat to register with a broker that joined in between.
+    ///
+    /// Returns the number of brokers that accepted the beat (0 when the set is unchanged or
+    /// nothing is registered). A beat that reaches no broker leaves the set unrecorded, so
+    /// the next route refresh retries it.
+    pub async fn send_heartbeat_if_broker_set_changed(&self) -> usize {
+        let addrs = self.get_all_broker_addrs();
+        if addrs.is_empty() {
+            return 0;
+        }
+        if *self
+            .inner
+            .brokers_beaten
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            == addrs
+        {
+            return 0;
+        }
+        let ok = self.send_heartbeat_to_all_broker(5000).await;
+        if ok > 0 {
+            *self
+                .inner
+                .brokers_beaten
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = addrs;
         }
         ok
     }
@@ -5138,6 +5215,146 @@ mod tests {
             .map(|cd| cd.group_name.as_str())
             .collect();
         assert_eq!(groups, vec![GROUP]);
+        instance.shutdown();
+    }
+
+    /// The instance heartbeat is the registration path of **both** kinds: with only a
+    /// producer registered it must still beat, or the broker holds no channel of this client
+    /// and can never route a transaction check-back or a reply back to it.
+    #[tokio::test]
+    async fn instance_heartbeat_carries_producer_and_consumer_registrations() {
+        const PG: &str = "GID_producer_half";
+        let master = MockBroker::start().await;
+        let slave = MockBroker::start().await;
+        let instance = new_instance();
+        let route = TopicRouteData {
+            queue_datas: vec![QueueData::new(
+                BROKER,
+                1,
+                1,
+                PermName::PERM_READ | PermName::PERM_WRITE,
+                0,
+            )],
+            broker_datas: vec![BrokerData::new(
+                "DefaultCluster",
+                BROKER,
+                vec![
+                    (i64::from(MixAll::MASTER_ID), master.addr.clone()),
+                    (i64::from(MixAll::MASTER_ID) + 1, slave.addr.clone()),
+                ],
+                "",
+            )],
+            ..Default::default()
+        };
+        guard(&instance.inner.tables)
+            .topic_route_table
+            .insert(TOPIC.to_string(), route);
+
+        // Nothing registered: the round trip is not spent on an empty payload.
+        assert_eq!(instance.send_heartbeat_to_all_broker(3000).await, 0);
+        assert!(master.recorded(request_code::HEART_BEAT).is_empty());
+
+        instance.register_producer(PG);
+        assert_eq!(
+            instance.send_heartbeat_to_all_broker(3000).await,
+            2,
+            "a producer-only instance beats to master + slave"
+        );
+        let on_master = master.recorded(request_code::HEART_BEAT);
+        let hb = HeartbeatData::decode(&on_master[0].body).expect("heartbeat body is a HeartbeatData");
+        let groups: Vec<&str> = hb
+            .producer_data_set
+            .iter()
+            .map(|pd| pd.group_name.as_str())
+            .collect();
+        assert_eq!(groups, vec![PG]);
+        assert!(
+            hb.consumer_data_set.is_empty(),
+            "no consumer is registered on this instance"
+        );
+
+        // Once a consumer joins, one beat refreshes both halves.
+        instance.register_consumer(GROUP, StubConsumer::new());
+        assert_eq!(instance.send_heartbeat_to_all_broker(3000).await, 2);
+        let on_master = master.recorded(request_code::HEART_BEAT);
+        let hb = HeartbeatData::decode(&on_master[1].body).expect("heartbeat body is a HeartbeatData");
+        assert_eq!(hb.producer_data_set.len(), 1, "the producer stays registered");
+        assert_eq!(hb.consumer_data_set.len(), 1, "the consumer joins the same beat");
+
+        instance.unregister_producer(PG);
+        assert_eq!(instance.prepare_heartbeat_data().producer_data_set.len(), 0);
+        instance.shutdown();
+    }
+
+    /// Registration only goes to brokers already in the route cache, so the beat has to
+    /// follow the route that first lands (and every broker that joins later) instead of
+    /// waiting for the next 30s round.
+    #[tokio::test]
+    async fn route_refresh_re_registers_brokers_that_just_joined() {
+        const PG: &str = "GID_route_join";
+        let first = MockBroker::start().await;
+        let namesrv = RouteNamesrv::start().await;
+        namesrv.serve(Some(route_body(BROKER, &[(0, first.addr.as_str())])));
+        let instance = instance_against(namesrv.addr.as_str());
+        instance.register_producer(PG);
+
+        assert!(instance
+            .update_topic_route_info_from_name_server(TOPIC, 3000, false)
+            .await
+            .unwrap());
+        let beats = first.recorded(request_code::HEART_BEAT);
+        assert_eq!(
+            beats.len(),
+            1,
+            "the broker that just entered the route is registered at once"
+        );
+        let hb = HeartbeatData::decode(&beats[0].body).expect("heartbeat body is a HeartbeatData");
+        assert_eq!(hb.producer_data_set.len(), 1, "the beat carries the producer group");
+
+        // Same route again: every known broker is already registered, so nothing goes out.
+        assert!(instance
+            .update_topic_route_info_from_name_server(TOPIC, 3000, false)
+            .await
+            .unwrap());
+        assert_eq!(
+            first.recorded(request_code::HEART_BEAT).len(),
+            1,
+            "an unchanged broker set is not beaten again"
+        );
+
+        // A slave joins the route: it is registered by the very next refresh, and the broker
+        // that was already registered is not beaten a second time.
+        let second = MockBroker::start().await;
+        namesrv.serve(Some(route_body(
+            BROKER,
+            &[(0, first.addr.as_str()), (1, second.addr.as_str())],
+        )));
+        assert!(instance
+            .update_topic_route_info_from_name_server(TOPIC, 3000, false)
+            .await
+            .unwrap());
+        assert_eq!(
+            second.recorded(request_code::HEART_BEAT).len(),
+            1,
+            "the new broker is registered without waiting for the next beat"
+        );
+        assert_eq!(
+            first.recorded(request_code::HEART_BEAT).len(),
+            2,
+            "one beat registers the whole known set, not only the broker that joined"
+        );
+
+        // And with the set unchanged again, the refresh spends no round trip at all.
+        assert!(instance
+            .update_topic_route_info_from_name_server(TOPIC, 3000, false)
+            .await
+            .unwrap());
+        assert_eq!(
+            first.recorded(request_code::HEART_BEAT).len(),
+            2,
+            "an unchanged broker set is not re-beaten"
+        );
+        assert_eq!(second.recorded(request_code::HEART_BEAT).len(), 1);
         instance.shutdown();
     }
 
