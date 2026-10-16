@@ -1109,7 +1109,7 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq, uint64_t token
         }
         if (offset < 0) {
             try {
-                offset = resolveInitialOffset(mq, sub);
+                offset = resolveInitialOffset(mq);
             } catch (const std::exception& e) {
                 logger_debug("resolve initial offset failed for " + mq.toString()
                              + ": " + e.what());
@@ -3245,16 +3245,15 @@ void DefaultMQPushConsumer::doRebalance() {
         if (was.count(key)) {
             continue;
         }
-        SubscriptionData sub;
         {
             std::lock_guard<std::mutex> lk(lock_);
             if (offsetTable_.count(key)) continue;
-            auto it = subscriptionData_.find(mq.topic);
-            if (it == subscriptionData_.end()) continue;
-            sub = it->second;
+            // sanity: still subscribed to this topic (no offset semantics attached to
+            // the subscription itself -- see resolveInitialOffset)
+            if (subscriptionData_.find(mq.topic) == subscriptionData_.end()) continue;
         }
         try {
-            int64_t off = resolveInitialOffset(mq, sub);
+            int64_t off = resolveInitialOffset(mq);
             std::lock_guard<std::mutex> lk(lock_);
             if (!offsetTable_.count(key)) {
                 offsetTable_[key] = off;
@@ -3451,13 +3450,16 @@ void DefaultMQPushConsumer::resetRetryTopicAndNamespace(std::vector<MessageExt>&
     }
 }
 
-int64_t DefaultMQPushConsumer::resolveInitialOffset(const MessageQueue& mq,
-                                                    const SubscriptionData& sub) {
+int64_t DefaultMQPushConsumer::resolveInitialOffset(const MessageQueue& mq) {
     MQClientInstance& c = client();
-    if (sub.expressionType == ExpressionType::SQL92) {
-        // SQL filtering has no offset semantics, so start from the latest
-        return c.getMaxOffset(mq);
-    }
+    // Java parity (RebalancePushImpl#computePullFromWhereWithException): the initial
+    // offset NEVER depends on the subscription type. An earlier draft short-circuited
+    // SQL92 subscriptions to the max offset, which silently skipped every message
+    // produced *before* the consumer started (send-first + CONSUME_FROM_FIRST_OFFSET
+    // received nothing; consumer-first only passed because the queues were empty and
+    // the max offset was 0 anyway). Java reads the stored offset and, when absent,
+    // uses 0 for FIRST_OFFSET / max for LAST_OFFSET etc. -- the broker applies the
+    // SQL92 filter to whatever range the pull covers.
     if (messageModel_ == MessageModel::BROADCASTING) {
         // Broadcasting: the offset lives only in the local offset file
         std::map<std::string, int64_t> stored = loadLocalOffsets();

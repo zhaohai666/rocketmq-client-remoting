@@ -1129,7 +1129,7 @@ final class DefaultMQPushConsumer
                 continue;
             }
             try {
-                $off = $this->resolveInitialOffset($client, $mq, $sub);
+                $off = $this->resolveInitialOffset($client, $mq);
             } catch (\Throwable $e) {
                 Logger::debug("resolve initial offset for $mq failed: " . $e->getMessage());
                 continue;
@@ -1332,7 +1332,7 @@ final class DefaultMQPushConsumer
         $offset = $this->offsetTable[$key] ?? null;
         if ($offset === null) {
             try {
-                $offset = $this->resolveInitialOffset($client, $mq, $sub);
+                $offset = $this->resolveInitialOffset($client, $mq);
             } catch (\Throwable $e) {
                 Logger::debug("resolve initial offset failed for $mq: " . $e->getMessage());
                 $this->idleUntil[$key] = microtime(true) + 1.0;
@@ -1549,12 +1549,16 @@ final class DefaultMQPushConsumer
 
     // ---------------- Initial offset ----------------
 
-    private function resolveInitialOffset(MQClientInstance $client, MessageQueue $mq, SubscriptionData $sub): int
+    private function resolveInitialOffset(MQClientInstance $client, MessageQueue $mq): int
     {
-        if ($sub->expressionType === \RocketMQ\Common\ExpressionType::SQL92) {
-            // SQL filtering has no offset semantics; default to latest
-            return $client->getMaxOffset($mq);
-        }
+        // Java parity (RebalancePushImpl#computePullFromWhereWithException): the initial
+        // offset NEVER depends on the subscription type. An earlier draft short-circuited
+        // SQL92 subscriptions to the max offset, which silently skipped every message
+        // produced *before* the consumer started (send-first + CONSUME_FROM_FIRST_OFFSET
+        // received nothing; consumer-first only passed because the queues were empty and
+        // the max offset was 0 anyway). Java reads the stored offset and, when absent,
+        // uses 0 for FIRST_OFFSET / max for LAST_OFFSET etc. -- the broker applies the
+        // SQL92 filter to whatever range the pull covers.
         if ($this->messageModel === MessageModel::BROADCASTING) {
             $stored = $this->loadLocalOffsets();
             $key = self::mqKey($mq);

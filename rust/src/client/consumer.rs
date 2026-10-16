@@ -1923,9 +1923,7 @@ impl DefaultMQPushConsumer {
             if was.contains(&key) {
                 continue;
             }
-            let sub = lock(&self.inner.state).subscription(&mq.topic).cloned();
-            let Some(sub) = sub else { continue };
-            match resolve_initial_offset(&self.inner, &client, mq, &sub).await {
+            match resolve_initial_offset(&self.inner, &client, mq).await {
                 Ok(off) => {
                     let mut state = lock(&self.inner.state);
                     state.offset_table.entry(key).or_insert(off);
@@ -2156,13 +2154,16 @@ async fn resolve_initial_offset(
     inner: &Inner,
     client: &MQClientInstance,
     mq: &MessageQueue,
-    sub: &SubscriptionData,
 ) -> Result<i64> {
+    // Java parity (RebalancePushImpl#computePullFromWhereWithException): the initial
+    // offset NEVER depends on the subscription type. An earlier draft short-circuited
+    // SQL92 subscriptions to the max offset, which silently skipped every message
+    // produced *before* the consumer started (send-first + CONSUME_FROM_FIRST_OFFSET
+    // received nothing; consumer-first only passed because the queues were empty and
+    // the max offset was 0 anyway). Java reads the stored offset and, when absent,
+    // uses 0 for FIRST_OFFSET / max for LAST_OFFSET etc. -- the broker applies the
+    // SQL92 filter to whatever range the pull covers.
     let cfg = read_cfg(inner);
-    if sub.expression_type == ExpressionType::SQL92 {
-        // SQL filtering has no offset semantics, so default to the latest
-        return client.get_max_offset(mq, 5000, None).await;
-    }
     let key = mq_key(mq);
     if cfg.message_model == MessageModel::BROADCASTING {
         let stored = load_local_offsets(inner);
@@ -2400,7 +2401,7 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
         let cached = lock(&inner.state).offset_table.get(&key).copied();
         let offset = match cached {
             Some(off) => off,
-            None => match resolve_initial_offset(&inner, &client, &mq, &sub).await {
+            None => match resolve_initial_offset(&inner, &client, &mq).await {
                 Ok(off) => {
                     lock(&inner.state).offset_table.insert(key.clone(), off);
                     off

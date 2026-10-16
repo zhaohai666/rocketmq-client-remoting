@@ -171,9 +171,10 @@ final class CollectListener implements MessageListenerConcurrently
  *
  * @return array{0: DefaultMQPushConsumer, 1: Box}
  */
-function new_consumer(string $suffix, ?MessageSelector $selector = null, string $expression = '*', ?Check46Probe $probe = null): array
+function new_consumer(string $suffix, ?MessageSelector $selector = null, string $expression = '*', ?Check46Probe $probe = null, ?string $topicOverride = null): array
 {
     global $ns, $group, $topic, $stamp;
+    $useTopic = $topicOverride ?? $topic;
     $c = new DefaultMQPushConsumer($group . '_' . $suffix);
     $c->setNamesrvAddr($ns);
     $c->setInstanceName('sql92php-' . $suffix . '-' . $stamp);
@@ -186,9 +187,9 @@ function new_consumer(string $suffix, ?MessageSelector $selector = null, string 
         $c->rpcHook = $probe;
     }
     if ($selector !== null) {
-        $c->subscribeWithSelector($topic, $selector);
+        $c->subscribeWithSelector($useTopic, $selector);
     } else {
-        $c->subscribe($topic, $expression);
+        $c->subscribe($useTopic, $expression);
     }
     $box = new Box();
     $c->setMessageListener(new CollectListener($box));
@@ -378,6 +379,78 @@ try {
     }
     check($retryErr === null, 'after fixing the expression it can be started again (the startup rolled back in place)',
         $retryErr === null ? '' : $retryErr->getMessage());
+
+    // ---------- S5 send-first + CONSUME_FROM_FIRST_OFFSET (the regression this leg pins) ----------
+    // An earlier draft resolved the initial offset of a SQL92 subscription to the max
+    // offset, silently skipping every message produced *before* the consumer started
+    // (consumer-first passed only because the queues were empty and max was 0 anyway).
+    // Java (RebalancePushImpl#computePullFromWhere) starts at 0 for FIRST_OFFSET
+    // regardless of the subscription type and lets the broker filter.
+    echo PHP_EOL . '---------- S5 send-first + CONSUME_FROM_FIRST_OFFSET ----------' . PHP_EOL;
+    $firstTopic = 'Sql92FirstPhp_' . $stamp;
+    $admin->createTopic($brokerName, $firstTopic, 4);
+    $firstReady = wait_until(20.0, function () use ($admin, $firstTopic): bool {
+        try {
+            $r = $admin->examineTopicRoute($firstTopic);
+        } catch (Throwable) {
+            return false;
+        }
+        $n = 0;
+        foreach ($r->queueDatas as $q) {
+            $n += $q->readQueueNums;
+        }
+        return $n >= 4;
+    });
+    check($firstReady, 'S5 the send-first topic route is ready (4 queues)');
+    $firstRed = [];
+    $firstBlue = [];
+    if ($firstReady) {
+        foreach (['red', 'blue'] as $color) {
+            for ($i = 0; $i < 2; $i++) {
+                $text = 'first-' . $color . '-' . $i;
+                $m = new Message($firstTopic, $text, null, $stamp . '-first-' . $color . '-' . $i);
+                $m->putProperty('color', $color);
+                $ok = false;
+                $err = '';
+                for ($try = 0; $try < 10; $try++) {
+                    try {
+                        $r = $prod->send($m);
+                        $ok = $r->sendStatus === SendStatus::SEND_OK;
+                        if (!$ok) {
+                            $err = (string) $r->sendStatus;
+                        }
+                        break;
+                    } catch (Throwable $e) {
+                        $err = $e->getMessage();
+                        usleep(300_000);
+                    }
+                }
+                check($ok, 'S5 sending ' . $text . ' succeeded', $err);
+                if ($color === 'red') {
+                    $firstRed[] = $text;
+                } else {
+                    $firstBlue[] = $text;
+                }
+            }
+        }
+        [$fc, $fBox] = new_consumer('FIRST', MessageSelector::bySql("color = 'red'"), topicOverride: $firstTopic);
+        $consumers[] = $fc;
+        $fc->start();
+        wait_until(25.0, static fn (): bool => count($fBox->msgs) >= 2, $fc);
+        $settle = microtime(true) + 2.0;
+        while (microtime(true) < $settle) {
+            $fc->tick();
+            usleep(100_000);
+        }
+        $fBodies = $fBox->sortedBodies();
+        sort($firstRed, SORT_STRING);
+        check($fBodies === $firstRed,
+            'S5 SQL92 + FIRST_OFFSET receives the 2 red messages sent BEFORE start (was: skipped by the old max-offset short-circuit)',
+            'got=' . implode(',', $fBodies));
+        $leakedFirst = array_intersect($firstBlue, $fBodies);
+        check($leakedFirst === [], 'S5 no blue leaks into the send-first SQL92 consumer',
+            'got=' . implode(',', $fBodies));
+    }
 } catch (Throwable $e) {
     check(false, 'unexpected exception', $e->getMessage());
 } finally {

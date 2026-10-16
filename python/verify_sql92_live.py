@@ -9,8 +9,8 @@ from typing import List, Optional, Tuple
 
 sys.path.insert(0, ".")
 
-from client.consumer import (DefaultMQPushConsumer, MessageSelector,
-                                      SimpleMessageListener)
+from client.consumer import (ConsumeFromWhere, DefaultMQPushConsumer,
+                                      MessageSelector, SimpleMessageListener)
 from client.consumer_result import ConsumeConcurrentlyStatus
 from client.exception import MQClientException
 from client.producer import DefaultMQProducer
@@ -88,7 +88,8 @@ class Collector:
 
 def new_consumer(group: str, selector: Optional[MessageSelector] = None,
                  expression: Optional[str] = None,
-                 probe: Optional[CheckConfigProbe] = None
+                 probe: Optional[CheckConfigProbe] = None,
+                 topic: Optional[str] = None
                  ) -> Tuple[DefaultMQPushConsumer, Collector]:
     """Build a push consumer subscribing to this topic (when probe is non-None the RPC hook is installed to gather evidence)."""
     c = DefaultMQPushConsumer(group)
@@ -96,9 +97,9 @@ def new_consumer(group: str, selector: Optional[MessageSelector] = None,
     if probe is not None:
         c.rpc_hook = probe
     if selector is not None:
-        c.subscribe_with_selector(TOPIC, selector)
+        c.subscribe_with_selector(topic or TOPIC, selector)
     else:
-        c.subscribe(TOPIC, expression or "*")
+        c.subscribe(topic or TOPIC, expression or "*")
     col = Collector()
     c.set_message_listener(col.listener())
     return c, col
@@ -226,6 +227,45 @@ def main() -> int:
               repr(retry_err))
         if retry_err is None:
             c4.shutdown()
+
+        # ---------- S5 send-first + CONSUME_FROM_FIRST_OFFSET (the regression this leg pins) ----------
+        # An earlier draft resolved the initial offset of a SQL92 subscription to the max
+        # offset, silently skipping every message produced *before* the consumer started
+        # (consumer-first passed only because the queues were empty and max was 0 anyway).
+        # Java (RebalancePushImpl#computePullFromWhere) starts at 0 for FIRST_OFFSET
+        # regardless of the subscription type and lets the broker filter.
+        print("\n---------- S5 send-first + CONSUME_FROM_FIRST_OFFSET ----------")
+        first_topic = "Sql92First_%d" % STAMP
+        prod.create_topic("TBW102", first_topic, 4)
+        check("S5 the send-first topic route is ready (4 queues)",
+              wait_for(lambda: len(
+                  prod._mq_client.get_topic_publish_info(first_topic).msg_queue_list) >= 4, 20.0))
+        first_red: List[str] = []
+        first_blue: List[str] = []
+        for color, sink in (("red", first_red), ("blue", first_blue)):
+            for i in range(2):
+                text = "first-%s-%d" % (color, i)
+                m = Message(first_topic, text.encode("utf-8"),
+                            keys="%s-first-%s-%d" % (STAMP, color, i))
+                m.put_property("color", color)
+                r = prod.send(m)
+                check("S5 sending %s succeeded" % text, r.send_status == SendStatus.SEND_OK,
+                      str(r.send_status))
+                sink.append(text)
+        fc, fcol = new_consumer(GROUP + "_FIRST",
+                                MessageSelector.by_sql("color = 'red'"),
+                                topic=first_topic)
+        fc.set_consume_from_where(ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET)
+        fc.start()
+        wait_for(lambda: len(fcol.msgs) >= 2, 25.0)
+        time.sleep(2.0)                        # rule out "arriving late" before judging the blue side
+        f_bodies = sorted(m.body.decode() for m in fcol.msgs)
+        check("S5 SQL92 + FIRST_OFFSET receives the 2 red messages sent BEFORE start "
+              "(was: skipped by the old max-offset short-circuit)",
+              f_bodies == sorted(first_red), str(f_bodies))
+        check("S5 no blue leaks into the send-first SQL92 consumer",
+              all(b not in f_bodies for b in first_blue), str(f_bodies))
+        fc.shutdown()
     finally:
         prod.shutdown()
 

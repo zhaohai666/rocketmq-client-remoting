@@ -1946,7 +1946,7 @@ class DefaultMQPushConsumer:
             if sub is None:
                 continue
             try:
-                off = self._resolve_initial_offset(client, mq, sub)
+                off = self._resolve_initial_offset(client, mq)
             except Exception as e:  # noqa: BLE001
                 logger.debug("resolve initial offset for %s failed: %s", mq, e)
                 continue
@@ -2018,7 +2018,7 @@ class DefaultMQPushConsumer:
             offset = self._offset_table.get(key)
             if offset is None:
                 try:
-                    offset = self._resolve_initial_offset(client, mq, sub)
+                    offset = self._resolve_initial_offset(client, mq)
                 except Exception as e:  # noqa: BLE001
                     logger.debug("resolve initial offset failed for %s: %s", mq, e)
                     time.sleep(1.0)
@@ -2553,11 +2553,16 @@ class DefaultMQPushConsumer:
         logger.debug("flow control: queue %s %s, pause pull", mq, reason)
         return True
 
-    def _resolve_initial_offset(self, client: MQClientInstance, mq: MessageQueue,
-                                sub: SubscriptionData) -> int:
-        if sub.expression_type == ExpressionType.SQL92:
-            # SQL filtering has no offset semantics; default to the latest
-            return client.get_max_offset(mq)
+    def _resolve_initial_offset(self, client: MQClientInstance,
+                                mq: MessageQueue) -> int:
+        # Java parity (RebalancePushImpl#computePullFromWhereWithException): the initial
+        # offset NEVER depends on the subscription type. An earlier draft short-circuited
+        # SQL92 subscriptions to the max offset, which silently skipped every message
+        # produced *before* the consumer started (send-first + CONSUME_FROM_FIRST_OFFSET
+        # received nothing; consumer-first only passed because the queues were empty and
+        # the max offset was 0 anyway). Java reads the stored offset and, when absent,
+        # uses 0 for FIRST_OFFSET / max for LAST_OFFSET etc. -- the broker applies the
+        # SQL92 filter to whatever range the pull covers.
         if self.message_model == MessageModel.BROADCASTING:
             # Broadcast mode: offsets are stored in the local file only
             stored = self._load_local_offsets()

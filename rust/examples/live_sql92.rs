@@ -494,6 +494,102 @@ async fn s4_bad_expression_fails_start(env: &Env, ck: &mut Checker) {
     }
 }
 
+async fn s5_send_first_first_offset(env: &Env, ck: &mut Checker) {
+    println!("\n---------- S5 send-first + CONSUME_FROM_FIRST_OFFSET ----------");
+    // The regression this pins: an earlier draft resolved the initial offset of a SQL92
+    // subscription to the max offset, silently skipping every message produced *before*
+    // the consumer started (consumer-first passed only because the queues were empty and
+    // the max offset was 0 anyway). Java (RebalancePushImpl#computePullFromWhere) starts
+    // at 0 for FIRST_OFFSET regardless of the subscription type and lets the broker filter.
+    let topic = format!("RustLiveSql92First{}", env.stamp);
+    if let Err(e) = env
+        .admin
+        .create_topic(MixAll::DEFAULT_TOPIC, &topic, QUEUE_NUMS, 0)
+        .await
+    {
+        return ck.abort("S5 create topic", &e.to_string());
+    }
+    let began = Instant::now();
+    let mut ready = false;
+    while began.elapsed() < Duration::from_secs(20) {
+        if let Ok(route) = env.admin.examine_topic_route(&topic).await {
+            if route.queue_datas.iter().map(|q| q.read_queue_nums).sum::<i32>() >= QUEUE_NUMS {
+                ready = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    ck.check("S5 topic route ready (4 queues)", ready, "route never carried the queues");
+    if !ready {
+        return;
+    }
+
+    // Send FIRST: 2 red + 1 blue, no consumer running yet.
+    let mut red = Vec::new();
+    let mut blue = Vec::new();
+    for (color, count, sink) in [("red", 2usize, &mut red), ("blue", 1usize, &mut blue)] {
+        for i in 0..count {
+            let text = format!("first-{color}-{i}");
+            let mut msg = Message::new(&topic, Some(text.as_bytes()));
+            msg.set_keys(&format!("sql92-first-{}-{color}-{i}", env.stamp));
+            msg.put_property("color", color);
+            match env.producer.send(&mut msg, Some(5000), None).await {
+                Ok(r) if r.status == SendStatus::SendOk => sink.push(text),
+                Ok(r) => println!("  [WARN] send {text} status={:?}", r.status),
+                Err(e) => println!("  [WARN] send {text} failed: {e}"),
+            }
+        }
+    }
+    ck.check(
+        "3 messages sent before the consumer starts (2 red + 1 blue)",
+        red.len() == 2 && blue.len() == 1,
+        &format!("red={} blue={}", red.len(), blue.len()),
+    );
+
+    let inbox = Arc::new(Inbox::default());
+    let consumer = match DefaultMQPushConsumer::with_config(ConsumerConfig {
+        consumer_group: format!("{}_FIRST", env.group),
+        name_server_addrs: vec![env.namesrv.clone()],
+        instance_name: format!("live-sql92-first-{}", env.stamp),
+        consume_from_where: ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET.to_string(),
+        ..Default::default()
+    })
+    .map_err(|e| format!("consumer build failed: {e}"))
+    {
+        Ok(c) => c,
+        Err(e) => return ck.abort("S5 build consumer", &e),
+    };
+    if let Err(e) = consumer.subscribe_with_selector(&topic, &MessageSelector::by_sql("color = 'red'")) {
+        return ck.abort("S5 subscribe", &e.to_string());
+    }
+    consumer.set_message_listener_concurrently(Arc::new(CollectingListener {
+        inbox: Arc::clone(&inbox),
+    }));
+    if let Err(e) = consumer.start().await {
+        return ck.abort("S5 consumer start", &e.to_string());
+    }
+    poll_until(|| inbox.count() >= 2, WAIT_SECONDS).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let bodies = inbox.bodies();
+    let mut want_red = red.clone();
+    want_red.sort();
+    ck.check(
+        "SQL92 + FIRST_OFFSET receives the 2 red messages sent BEFORE start (was: skipped by the old max-offset short-circuit)",
+        bodies == want_red,
+        &format!("{bodies:?}"),
+    );
+    ck.check(
+        "no blue leaks into the send-first SQL92 consumer",
+        blue.iter().all(|b| !bodies.contains(b)),
+        &format!("{bodies:?}"),
+    );
+    consumer.shutdown();
+    let retry_topic = format!("{}{}_FIRST", MixAll::RETRY_GROUP_TOPIC_PREFIX, env.group);
+    let _ = env.admin.delete_topic(&topic, None).await;
+    let _ = env.admin.delete_topic(&retry_topic, None).await;
+}
+
 async fn run(namesrv: &str) -> Checker {
     println!("SQL92 / CHECK_CLIENT_CONFIG live check on {namesrv}");
     let stamp = stamp();
@@ -569,6 +665,7 @@ async fn run(namesrv: &str) -> Checker {
     s1_wire_evidence(&env, &mut ck).await;
     s2_s3_real_filtering(&env, &mut ck).await;
     s4_bad_expression_fails_start(&env, &mut ck).await;
+    s5_send_first_first_offset(&env, &mut ck).await;
 
     // Cleanup: topic + retry group (the consumer group itself needs no explicit deletion).
     let retry_topic = format!("{}{}", MixAll::RETRY_GROUP_TOPIC_PREFIX, env.group);

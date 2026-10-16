@@ -682,7 +682,9 @@ private:
     void notifySubscriptionChanged(const std::string& topic);
 
     std::vector<MessageQueue> assignedQueues();
-    int64_t resolveInitialOffset(const MessageQueue& mq, const SubscriptionData& sub);
+    // Java parity (RebalancePushImpl#computePullFromWhereWithException): the initial
+    // offset never depends on the subscription type, so no subscription parameter here.
+    int64_t resolveInitialOffset(const MessageQueue& mq);
 
     // ---- Real rebalance (rebalanceByTopic) ----
     // Compute the queue set this instance should hold and write it into assignedQueues_, then sync the pull

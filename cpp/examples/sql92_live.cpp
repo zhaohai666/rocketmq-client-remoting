@@ -414,6 +414,72 @@ void s4BadExpressionFails(Env& env, const std::string& topic) {
     if (retryMsg.empty()) c.shutdown();
 }
 
+// ---------------------------------------------------------------- S5 send-first + FIRST_OFFSET
+void s5SendFirstFirstOffset(Env& env, DefaultMQProducer& prod) {
+    std::printf("\n---------- S5 send-first + CONSUME_FROM_FIRST_OFFSET ----------\n");
+    // The regression this pins: an earlier draft resolved the initial offset of a SQL92
+    // subscription to the max offset, silently skipping every message produced *before*
+    // the consumer started (consumer-first passed only because the queues were empty and
+    // the max offset was 0 anyway). Java (RebalancePushImpl#computePullFromWhere) starts
+    // at 0 for FIRST_OFFSET regardless of the subscription type and lets the broker filter.
+    const std::string topic = "Sql92CppFirst_" + gStamp;
+    env.topics.push_back(topic);
+    try {
+        prod.createTopic(MixAll::DEFAULT_TOPIC, topic, 4);
+    } catch (const std::exception& e) {
+        check("S5 create topic", false, e.what());
+        return;
+    }
+    const bool ready = waitFor([&] { return env.routeQueueCount(topic) >= 4; }, 20000);
+    check("S5 topic route ready (4 queues)", ready,
+          "queues=" + std::to_string(env.routeQueueCount(topic)));
+    if (!ready) return;
+
+    // Send FIRST: 2 red + 1 blue, no consumer running yet.
+    std::vector<std::string> redSent, blueSent;
+    for (const char* color : {"red", "blue"}) {
+        for (int i = 0; i < 2; ++i) {
+            const std::string text = std::string("first-") + color + "-" + std::to_string(i);
+            Message m(topic, bytesOf(text));
+            m.setKeys(gStamp + "-first-" + std::string(color) + "-" + std::to_string(i));
+            m.putProperty("color", color);
+            const SendResult r = prod.send(m, 5000);
+            check("S5 send " + text + " succeeded", r.sendStatus == SendStatus::SEND_OK, r.msgId);
+            if (std::string(color) == "red") {
+                redSent.push_back(text);
+            } else {
+                blueSent.push_back(text);
+            }
+        }
+    }
+    std::sort(redSent.begin(), redSent.end());
+
+    Sink sink;
+    std::shared_ptr<CollectListener> listener(new CollectListener(sink));
+    DefaultMQPushConsumer c(env.group("FIRST"));
+    MessageSelector sel = MessageSelector::bySql("color = 'red'");
+    env.configure(c, topic, &sel, std::string(), nullptr);
+    c.setConsumeFromWhere(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
+    c.setMessageListener(listener);
+    try {
+        c.start();
+    } catch (const std::exception& e) {
+        check("S5 consumer starts", false, e.what());
+        return;
+    }
+    waitFor([&] { return sink.count() >= 2; }, 25000);
+    std::this_thread::sleep_for(std::chrono::seconds(2));  // rule out "arriving late" before judging the blue side
+    const std::vector<std::string> got = sink.sorted();
+    check("S5 SQL92 + FIRST_OFFSET receives the 2 red messages sent BEFORE start (was: skipped by the old max-offset short-circuit)",
+          got == redSent, join(got));
+    bool leaked = false;
+    for (const std::string& b : blueSent) {
+        if (std::find(got.begin(), got.end(), b) != got.end()) leaked = true;
+    }
+    check("S5 no blue leaks into the send-first SQL92 consumer", !leaked, join(got));
+    c.shutdown();
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -484,6 +550,7 @@ int main(int argc, char** argv) {
         s1WireEvidence(env, topic);
         s2S3RealFiltering(env, topic, prod);
         s4BadExpressionFails(env, topic);
+        s5SendFirstFirstOffset(env, prod);
     } catch (const std::exception& e) {
         std::printf("  [FAIL] aborted: %s\n", e.what());
         ++gFail;
