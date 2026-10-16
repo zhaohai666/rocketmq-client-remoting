@@ -213,6 +213,81 @@ try {
     }
     check($box->has($controlBody), 'the sync control was delivered (the consumer itself is healthy)',
         'inbox=[' . implode(',', $box->sorted()) . ']');
+
+    // ---- O3: send-first + CONSUME_FROM_FIRST_OFFSET (the send-then-subscribe shape) ----
+    // The SQL92 regression taught us that consumer-first probes can mask initial-offset
+    // bugs (the queues are empty so max offset == 0). This leg pins the other ordering:
+    // all messages exist BEFORE the consumer starts, which starts at 0 for FIRST_OFFSET.
+    echo PHP_EOL . '---------- O3 send-first + CONSUME_FROM_FIRST_OFFSET ----------' . PHP_EOL;
+    $firstTopic = 'PhpOnewayFirst_' . $stamp;
+    $admin->createTopic($brokerName, $firstTopic, 4);
+    $firstReady = wait_until(20.0, function () use ($admin, $firstTopic): bool {
+        try {
+            $r = $admin->examineTopicRoute($firstTopic);
+        } catch (Throwable) {
+            return false;
+        }
+        $n = 0;
+        foreach ($r->queueDatas as $q) {
+            $n += $q->readQueueNums;
+        }
+        return $n >= 4;
+    });
+    check($firstReady, 'O3 the first-topic route is ready (4 queues)');
+    if ($firstReady) {
+        $firstBox = new Box();
+        $firstOneway = [];
+        for ($i = 0; $i < 3; $i++) {
+            $body = 'oneway-first-' . $i;
+            $threw = '';
+            try {
+                $prod->sendOneway(new Message($firstTopic, $body));
+            } catch (Throwable $e) {
+                $threw = $e->getMessage();
+            }
+            check($threw === '', 'O3 sendOneway(' . $body . ') did not throw', $threw);
+            if ($threw === '') {
+                $firstOneway[] = $body;
+            }
+        }
+        $firstControl = 'sync-control-first';
+        $firstOk = false;
+        $firstErr = '';
+        for ($try = 0; $try < 10; $try++) {
+            try {
+                $r = $prod->send(new Message($firstTopic, $firstControl));
+                $firstOk = $r->sendStatus === SendStatus::SEND_OK;
+                if (!$firstOk) {
+                    $firstErr = (string) $r->sendStatus;
+                }
+                break;
+            } catch (Throwable $e) {
+                $firstErr = $e->getMessage();
+                usleep(300_000);
+            }
+        }
+        check($firstOk, 'O3 the sync control message was sent (SEND_OK)', $firstErr);
+        usleep(1_000_000); // oneway is fire-and-forget: give the broker a beat to store the frames
+        $consumer2 = new DefaultMQPushConsumer($group . '_FIRST');
+        $consumer2->setNamesrvAddr($ns);
+        $consumer2->setInstanceName('onewaypush-first-' . $stamp);
+        $consumer2->setConsumeFromWhere(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
+        $consumer2->pullSuspendTimeoutMillis = 1000;
+        $consumer2->pullTimeoutMillis = 3000;
+        $consumer2->subscribe($firstTopic, '*');
+        $consumer2->setMessageListener(new CollectListener($firstBox));
+        $consumer2->start();
+        $wantFirst = 4;
+        $arrivedFirst = wait_until(30.0, static fn (): bool => count($firstBox->bodies) >= $wantFirst, $consumer2);
+        $allThere = $firstBox->has($firstControl);
+        foreach ($firstOneway as $b) {
+            $allThere = $allThere && $firstBox->has($b);
+        }
+        check($arrivedFirst && $allThere,
+            'O3 FIRST_OFFSET receives all 4 messages sent BEFORE start (3 oneway + 1 sync control)',
+            'got=' . count($firstBox->bodies) . ' [' . implode(',', $firstBox->sorted()) . ']');
+        $consumer2->shutdown();
+    }
 } catch (Throwable $e) {
     check(false, 'unexpected exception', $e->getMessage());
 } finally {

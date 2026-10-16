@@ -193,16 +193,28 @@ impl Env {
     /// Builds (but does not start) the push consumer; LAST_OFFSET so only messages sent
     /// after startup can arrive -- that is exactly what makes this a real-time test.
     fn consumer(&self, inbox: Arc<Inbox>) -> Result<DefaultMQPushConsumer, String> {
+        self.consumer_on(&self.topic, "MAIN", inbox, ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET)
+    }
+
+    /// Generic variant: caller picks the topic, the group suffix and the initial-offset policy.
+    /// `from_where` is the string constant from `ConsumeFromWhere` (`&'static str`).
+    fn consumer_on(
+        &self,
+        topic: &str,
+        suffix: &str,
+        inbox: Arc<Inbox>,
+        from_where: &str,
+    ) -> Result<DefaultMQPushConsumer, String> {
         let consumer = DefaultMQPushConsumer::with_config(ConsumerConfig {
-            consumer_group: self.group.clone(),
+            consumer_group: format!("{}_{}", self.group, suffix),
             name_server_addrs: vec![self.namesrv.clone()],
-            instance_name: format!("live-oneway-{}", self.stamp),
-            consume_from_where: ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET.to_string(),
+            instance_name: format!("live-oneway-{suffix}-{}", self.stamp),
+            consume_from_where: from_where.to_string(),
             ..Default::default()
         })
         .map_err(|e| format!("consumer build failed: {e}"))?;
         consumer
-            .subscribe(&self.topic, "*")
+            .subscribe(topic, "*")
             .map_err(|e| format!("subscribe failed: {e}"))?;
         consumer.set_message_listener_concurrently(Arc::new(CollectingListener {
             inbox: Arc::clone(&inbox),
@@ -327,6 +339,93 @@ async fn run(namesrv: &str) -> Checker {
         }
         None => ck.check("O2 pinned queue available", false, "route carried no queue"),
     }
+
+    // ---- O3: send-first + CONSUME_FROM_FIRST_OFFSET (the send-then-subscribe shape) ----
+    // The SQL92 regression taught us that consumer-first probes can mask initial-offset
+    // bugs (the queues are empty so max offset == 0). This leg pins the other ordering:
+    // all messages exist BEFORE the consumer starts, which starts at 0 for FIRST_OFFSET
+    // regardless of the subscription type (Java RebalancePushImpl#computePullFromWhere).
+    println!("\n---------- O3 send-first + CONSUME_FROM_FIRST_OFFSET ----------");
+    let first_topic = format!("RustLiveOnewayFirst{}", env.stamp);
+    if let Err(e) = env
+        .admin
+        .create_topic(MixAll::DEFAULT_TOPIC, &first_topic, QUEUE_NUMS, 0)
+        .await
+    {
+        ck.check("O3 create topic", false, &e.to_string());
+        return ck;
+    }
+    // poll the route (async fetch inside the loop body)
+    let began = Instant::now();
+    let mut first_route_ready = false;
+    while began.elapsed() < Duration::from_secs(20) {
+        match env.producer.fetch_publish_message_queues(&first_topic).await {
+            Ok(q) if q.len() >= QUEUE_NUMS as usize => {
+                first_route_ready = true;
+                break;
+            }
+            _ => tokio::time::sleep(Duration::from_millis(200)).await,
+        }
+    }
+    ck.check(
+        &format!("O3 first-topic route ready ({QUEUE_NUMS} queues)"),
+        first_route_ready,
+        "fetch_publish_message_queues never carried the queues",
+    );
+    if !first_route_ready {
+        return ck;
+    }
+    // Send FIRST: 3 oneway + 1 sync control, no consumer running yet.
+    let mut first_oneway = Vec::new();
+    for i in 0..ONEWAY_N {
+        let body = format!("oneway-first-{i}");
+        let mut msg = Message::new(&first_topic, Some(body.as_bytes()));
+        match env.producer.send_oneway(&mut msg, None).await {
+            Ok(()) => first_oneway.push(body),
+            Err(e) => ck.check(&format!("O3 send_oneway({body}) returned Ok"), false, &e.to_string()),
+        }
+    }
+    let first_control = "sync-control-first".to_string();
+    let mut control_msg = Message::new(&first_topic, Some(first_control.as_bytes()));
+    match env.producer.send(&mut control_msg, Some(5000), None).await {
+        Ok(r) if r.status == SendStatus::SendOk => {}
+        Ok(r) => ck.check("O3 sync control SEND_OK", false, &format!("status={:?}", r.status)),
+        Err(e) => ck.check("O3 sync control SEND_OK", false, &e.to_string()),
+    }
+    ck.check(
+        &format!("O3 {ONEWAY_N} oneway + 1 sync control sent before the consumer starts"),
+        first_oneway.len() == ONEWAY_N,
+        &format!("oneway sent={}", first_oneway.len()),
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await; // oneway is fire-and-forget: give the broker a beat
+    let first_inbox = Arc::new(Inbox::default());
+    let first_consumer = match env.consumer_on(
+        &first_topic,
+        "FIRST",
+        Arc::clone(&first_inbox),
+        ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            ck.check("O3 consumer build", false, &e);
+            return ck;
+        }
+    };
+    if let Err(e) = first_consumer.start().await {
+        ck.check("O3 consumer start", false, &e.to_string());
+        return ck;
+    }
+    let want_first = ONEWAY_N + 1;
+    let arrived_first = poll_until(|| first_inbox.count() >= want_first, WAIT_SECONDS).await;
+    ck.check(
+        &format!("O3 FIRST_OFFSET receives all {want_first} messages sent BEFORE start (3 oneway + 1 sync control)"),
+        arrived_first && first_inbox.has(&first_control) && first_oneway.iter().all(|b| first_inbox.has(b)),
+        &format!("got {} of {want_first}: {:?}", first_inbox.count(), first_inbox.bodies()),
+    );
+    first_consumer.shutdown();
+    let first_retry = format!("{}{}_FIRST", MixAll::RETRY_GROUP_TOPIC_PREFIX, env.group);
+    let _ = env.admin.delete_topic(&first_topic, None).await;
+    let _ = env.admin.delete_topic(&first_retry, None).await;
 
     consumer.shutdown();
     let retry_topic = format!("{}{}", MixAll::RETRY_GROUP_TOPIC_PREFIX, env.group);

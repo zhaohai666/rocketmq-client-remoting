@@ -10,6 +10,10 @@ target_link_libraries(rmq_interop PRIVATE rocketmq::remoting)
 add_executable(rmq_live_message_types live_message_types.cpp)
 target_link_libraries(rmq_live_message_types PRIVATE rocketmq::remoting)
 
+# Oneway send-first + FIRST_OFFSET ordering check (requires nameServer+broker up first; not packed into ctest)
+add_executable(rmq_oneway_first_live oneway_first_live.cpp)
+target_link_libraries(rmq_oneway_first_live PRIVATE rocketmq::remoting)
+
 add_executable(rmq_live_redelivery live_redelivery.cpp)
 target_link_libraries(rmq_live_redelivery PRIVATE rocketmq::remoting)
 
