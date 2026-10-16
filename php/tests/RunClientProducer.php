@@ -1606,6 +1606,7 @@ final class RunClientProducer
         $this->check($checkListener->lastChecked !== null, 'check: received MessageExt');
         $this->checkSame('trans-body', $checkListener->lastChecked->getBody() ?? '', 'check: MessageExt body');
         $this->checkSame('GID-trans', $checkListener->lastChecked->getProperty(MessageConst::PROPERTY_PRODUCER_GROUP), 'check: PGROUP property matches');
+        $this->waitLogCount($broker, RequestCode::END_TRANSACTION, 5);
         $endEntries = array_values(array_filter($broker->logEntries(), static fn ($e) => ($e['code'] ?? 0) === RequestCode::END_TRANSACTION));
         $checkEnd = null;
         foreach ($endEntries as $e) {
