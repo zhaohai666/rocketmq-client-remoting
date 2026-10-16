@@ -3,11 +3,27 @@
   "version": "5.5.1",
   "description": "Apache RocketMQ classic remoting protocol client for Node.js.",
   "type": "module",
-  "private": true,
-  "main": "src/index.ts",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "README.en.md"
+  ],
   "scripts": {
+    "build": "tsc -p tsconfig.build.json --noCheck && node fix-dts-imports.mjs",
+    "prepare": "npm run build",
+    "pack": "npm run build && npm pack",
     "test": "node --experimental-strip-types --test",
     "typecheck": "tsc --noEmit",
+    "selfcheck": "node --experimental-strip-types selfcheck.ts",
     "live:producer": "node --experimental-strip-types examples/live_producer.ts",
     "live:consumer": "node --experimental-strip-types examples/live_consumer.ts",
     "live:pull": "node --experimental-strip-types examples/live_pull.ts",
@@ -16,5 +32,8 @@
   },
   "engines": {
     "node": ">=22"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
   }
 }

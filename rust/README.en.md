@@ -337,7 +337,8 @@ list extra preconditions.
 | `live_admin` | the full admin chain (incl. boundaryType double boundaries, `reset_offset_by_queue_id`, query topics by consumer group) |
 | `live_admin_batch` | admin payloads against a real broker: batch topic creation, static topics, write-perm config, half messages, ordering config, etc. |
 | `live_unit_config` | unitName / unitMode / stream: the clientId suffix visible broker-side and the UNIT / UNIT_SUB flags |
-| `live_sql92` | SQL92 filtering + CHECK_CLIENT_CONFIG(46); ⚠ requires broker `enablePropertyFilter=true` |
+| `live_sql92` | SQL92 filtering + CHECK_CLIENT_CONFIG(46); ⚠ requires broker `enablePropertyFilter=true` (when the broker refuses SQL92 the probe prints the fix and exits cleanly) |
+| `live_oneway_push` | oneway real-time push: consumer starts first (LAST_OFFSET), `send_oneway` auto-selected/pinned queues + a sync control all arrive in real time |
 | `live_acl` | the ACL signing/authentication chain end to end; ⚠ requires `authenticationEnabled=true`, real args `<AK> <SK>` |
 | `live_acl_message_types` | every message type on an authenticating cluster: asserts first that an unsigned send is rejected with code 16, then sends and reads back sync / async / oneway / batch / delayed / timed / transaction (incl. transactionId) / orderly / tag / key / user property from the broker, with offset commit also going through signed RPC; ⚠ requires `authenticationEnabled=true`, real args `<AK> <SK>` (measured `PASS=33 FAIL=0`) |
 | `live_latency` | send-latency fault tolerance S1–S5: off by default so nothing is recorded, a healthy broker triggers no isolation, successful sends populate the table, an injected outage degrades available→reachable→plain round-robin, and the entry recovers on expiry |

@@ -220,6 +220,10 @@ if(WIN32)
 endif()
 
 add_library(rocketmq::remoting ALIAS rocketmq_remoting)
+# The library file stays librocketmq_remoting.a, but the EXPORTED namespace name is the
+# consumer-friendly rocketmq::remoting (matching the in-tree ALIAS), so
+# target_link_libraries(app PRIVATE rocketmq::remoting) works both ways.
+set_target_properties(rocketmq_remoting PROPERTIES EXPORT_NAME remoting)
 
 # ---------------------------------------------------------------- Subdirectories
 if(RMQ_BUILD_EXAMPLES)
@@ -232,6 +236,43 @@ if(RMQ_BUILD_TESTS)
 endif()
 
 # ---------------------------------------------------------------- Installation
+# Plain `make install` used to ship only the archive plus headers: a consumer then had to
+# build the target by hand AND declare every transitive dependency (XLIB/OpenSSL/zstd/lz4)
+# before find_package would succeed. With the EXPORT set + config package below, a
+# consumer only needs:
+#
+#     find_package(rocketmq_client_remoting CONFIG REQUIRED)
+#     target_link_libraries(my_app PRIVATE rocketmq::remoting)
+#
+# and the config file replays the Threads/ZLIB/zstd/lz4/OpenSSL finds in the consumer's
+# scope (see cmake/rocketmq_client_remoting-config.cmake.in).
+include(CMakePackageConfigHelpers)
+
+set(RMQ_INSTALL_CMAKEDIR ${CMAKE_INSTALL_LIBDIR}/cmake/rocketmq_client_remoting CACHE PATH
+    "Install directory for the rocketmq_client_remoting CMake package config")
+
 install(TARGETS rocketmq_remoting
-        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+        EXPORT rocketmq_client_remoting-targets
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+configure_package_config_file(
+    cmake/rocketmq_client_remoting-config.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/rocketmq_client_remoting-config.cmake
+    INSTALL_DESTINATION ${RMQ_INSTALL_CMAKEDIR})
+
+write_basic_package_version_file(
+    ${CMAKE_CURRENT_BINARY_DIR}/rocketmq_client_remoting-config-version.cmake
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion)
+
+install(FILES
+        ${CMAKE_CURRENT_BINARY_DIR}/rocketmq_client_remoting-config.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/rocketmq_client_remoting-config-version.cmake
+        DESTINATION ${RMQ_INSTALL_CMAKEDIR})
+
+install(EXPORT rocketmq_client_remoting-targets
+        FILE rocketmq_client_remoting-targets.cmake
+        NAMESPACE rocketmq::
+        DESTINATION ${RMQ_INSTALL_CMAKEDIR})

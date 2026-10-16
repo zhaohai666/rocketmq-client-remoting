@@ -16,6 +16,13 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 
+[tool.setuptools]
+# rocketmq_logging.py is a root-level module, not inside any package: 15 library modules
+# (client/*.py, remoting/client.py) do `from rocketmq_logging import get_logger`. Without
+# py-modules the wheel installs fine but every import of client/remoting dies with
+# ModuleNotFoundError on the first get_logger line.
+py-modules = ["rocketmq_logging"]
+
 [tool.setuptools.packages.find]
 # The python/ directory is itself the source root: client / common / remoting are three
 # flat top-level packages (the legacy nested rocketmq.* package was retired with the

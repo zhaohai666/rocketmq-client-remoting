@@ -431,6 +431,8 @@ bash scripts/run_php_live.sh <case> 127.0.0.1:9876 [legs]
 | `tls` | `examples/live_tls.php` | TLS 三腿 `plain_tls` / `ca_verify` / `mtls`，脚本现造 CA/server(SAN:127.0.0.1)/client 证书 |
 | `compression` | `examples/live_compression.php` | 本端压缩冒烟：zlib / lz4 / zstd 自压自解一条腿；退出码 0 ok / 1 普通失败 / 2 坏 codec / 3 recv 超时 |
 | `static_topic` | `examples/live_static_topic.php` | 静态主题 S1–S5：513 建 8 队列映射 4 物理队列、路由回读、端点表、mock 队列名解析回真实 broker、端到端收发 |
+| `sql92` | `examples/live_sql92.php` | SQL92 过滤 + CHECK_CLIENT_CONFIG(46) 四段（需 broker `enablePropertyFilter=true`；broker 拒 SQL92 时打印修复指引并干净退出） |
+| `oneway_push` | `examples/live_oneway_push.php` | oneway 实时推送：消费者先起（LAST_OFFSET），`sendOneway` 自动选队 + 同步对照组全部实时到达 |
 
 `examples/live_acl_message_types.php` 不走这个编排脚本：它要的是**开了鉴权**的 broker，而
 `run_php_live.sh` 起的是普通集群。跑法是 `ROCKETMQ_CLIENT_LOG_DIR=/tmp/... php

@@ -522,6 +522,50 @@ async fn run(namesrv: &str) -> Checker {
     }
     ck.check("T0 topic route ready (4 queues)", ready, "examine_topic_route cannot get the queues");
 
+    // Preflight: does this broker accept SQL92 subscriptions at all? The broker answers
+    // CHECK_CLIENT_CONFIG(46) with SYSTEM_ERROR ("The broker does not support consumer to
+    // filter message by SQL92") unless it runs with enablePropertyFilter=true, and the Java
+    // client fails start() the same way. Detect that up front and say what to do, instead of
+    // reporting four confusing FAILs deeper in.
+    {
+        let (preflight, _inbox) = match env.consumer(
+            "PREFLIGHT",
+            Some(MessageSelector::by_sql("color = 'red'")),
+            None,
+        ) {
+            Ok(pair) => pair,
+            Err(e) => {
+                ck.abort("preflight build consumer", &e);
+                return ck;
+            }
+        };
+        match preflight.start().await {
+            Ok(()) => {
+                preflight.shutdown();
+                println!("preflight OK: the broker accepts SQL92 subscriptions (enablePropertyFilter=true)");
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                preflight.shutdown();
+                if msg.contains("does not support consumer to filter message by") {
+                    println!("!! the broker refuses SQL92 subscriptions: {msg}");
+                    println!("!! fix: set enablePropertyFilter=true in broker.conf and restart the broker,");
+                    println!("!!      then re-run this probe (the same requirement applies to the Java client).");
+                    println!("!! skipping end-to-end SQL92 verification: broker not configured for property filter");
+                    let retry_topic = format!("{}{}", MixAll::RETRY_GROUP_TOPIC_PREFIX, env.group);
+                    let _ = env.admin.delete_topic(&env.topic, None).await;
+                    let _ = env.admin.delete_topic(&retry_topic, None).await;
+                    env.producer.shutdown();
+                    env.admin.shutdown();
+                    // Environment skip, not a client defect: no FAIL recorded.
+                    return ck;
+                }
+                ck.abort("preflight SQL92 consumer start", &msg);
+                return ck;
+            }
+        }
+    }
+
     s1_wire_evidence(&env, &mut ck).await;
     s2_s3_real_filtering(&env, &mut ck).await;
     s4_bad_expression_fails_start(&env, &mut ck).await;

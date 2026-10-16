@@ -306,7 +306,8 @@ broker 后再发消息"**（否则首批消息会因 broker 尚不认识本组�
 | `live_admin` | admin 全链路（含 boundaryType 双边界、`reset_offset_by_queue_id`、按组查 topic） |
 | `live_admin_batch` | 批量建 topic、静态 topic、写禁配、半消息、顺序配置等 admin 报文打真实 broker |
 | `live_unit_config` | unitName / unitMode / stream：broker 侧可见的 clientId 后缀与 UNIT / UNIT_SUB 位 |
-| `live_sql92` | SQL92 过滤 + CHECK_CLIENT_CONFIG(46)；⚠ 需 broker `enablePropertyFilter=true` |
+| `live_sql92` | SQL92 过滤 + CHECK_CLIENT_CONFIG(46)；⚠ 需 broker `enablePropertyFilter=true`（broker 拒 SQL92 时打印修复指引并干净退出） |
+| `live_oneway_push` | oneway 实时推送：消费者先起（LAST_OFFSET），`send_oneway` 自动选队/固定队列 + 同步对照组全部实时到达 |
 | `live_acl` | ACL 签名鉴权全链路；⚠ 需 `authenticationEnabled=true`，实参 `<AK> <SK>` |
 | `live_acl_message_types` | 鉴权集群上的全部消息类型收发：先断言无凭据发送被拒(16)，再带签名把同步 / 异步 / 单向 / 批量 / 延迟 / 定时 / 事务（含 transactionId）/ 顺序 / Tag / Key / 用户属性逐条发出并从 broker 读回，位点提交也走签名 RPC；⚠ 需 `authenticationEnabled=true`，实参 `<AK> <SK>`（实测 `PASS=33 FAIL=0`） |
 | `live_latency` | 发送延迟故障容错 S1–S5：默认关闭不记表、健康 broker 不触发隔离、成功发送后可容错、手工注入隔离走 available→reachable→普通轮询退化链、到期恢复 |

@@ -1,0 +1,32 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+# Replay the dependency finds the exported target needs, inside the consumer's scope.
+# Threads is a hard dependency of the transport layer (std::thread / std::mutex).
+find_dependency(Threads)
+
+# The optional backends (zlib / zstd / lz4 / OpenSSL) are PUBLIC link dependencies only
+# when they were found at this package's build time. Replay each find only when the
+# referenced target is missing in the consumer's scope: a build without a backend exports
+# no reference to it, so a consumer lacking that library is unaffected; a build with it
+# gets the same imported target (vcpkg / conda / system CONFIG packages) resolved here,
+# which is what makes a plain find_package(rocketmq_client_remoting) succeed with no
+# manual XLIB/OpenSSL/zstd/lz4 declarations. A plain-path backend (e.g. a brew dylib)
+# is baked into the export as an absolute path and works as-is on the same machine.
+if(NOT TARGET ZLIB::ZLIB)
+    find_package(ZLIB QUIET)
+endif()
+if(NOT TARGET OpenSSL::SSL)
+    find_package(OpenSSL QUIET)
+endif()
+if(NOT TARGET zstd::zstd AND NOT TARGET zstd::libzstd_shared AND NOT TARGET zstd::libzstd_static)
+    find_package(zstd CONFIG QUIET)
+endif()
+if(NOT TARGET lz4::lz4 AND NOT TARGET LZ4::lz4)
+    find_package(lz4 CONFIG QUIET)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/rocketmq_client_remoting-targets.cmake")
+
+check_required_components(rocketmq_client_remoting)

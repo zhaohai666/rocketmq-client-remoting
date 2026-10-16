@@ -1,0 +1,38 @@
+{
+  // Build config for the published package: compiles src/ into dist/ with declarations.
+  // Differences from the repo-wide tsconfig.json (which stays noEmit for direct
+  // `node --experimental-strip-types` execution):
+  //   - allowImportingTsExtensions + rewriteRelativeImportExtensions: the source imports
+  //     `./x.ts` (Node strip-types style); the emitted dist/ imports `./x.js` (plain Node).
+  //   - declaration: dist ships .d.ts so TypeScript consumers get types; declarationMap /
+  //     sourceMap stay off because the maps would reference ../src paths that do not exist
+  //     inside the published tarball.
+  //   - include only src/: examples / test / selfcheck are repo tooling, not shipped.
+  //   - types: []: the build is transpile-only (--noCheck), so no @types packages are
+  //     resolved at build time; the tree's node: usage needs no type library to emit.
+  // NOTE: the build runs with --noCheck (see package.json "build"): the tree carries
+  // pre-existing type debt that `tsc --noEmit` surfaces, and the packaging gate must not
+  // be blocked by it. Type checking stays a separate, tracked concern.
+  // NOTE 2: rewriteRelativeImportExtensions rewrites the emitted .js but NOT the emitted
+  // .d.ts, so fix-dts-imports.mjs runs right after tsc (see package.json "build").
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+    "declaration": true,
+    "declarationMap": false,
+    "sourceMap": false,
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": false,
+    "noImplicitAny": false,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "forceConsistentCasingInFileNames": true,
+    "types": []
+  },
+  "include": ["src/**/*.ts"]
+}

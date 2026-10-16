@@ -37,6 +37,9 @@ Thumbs.db
 # Accidentally left redirection files (nohup etc.)
 nohup.out
 
+# Node.js (nodeJs/ ships a built dist/ at pack time; never commit dependencies or build output)
+node_modules/
+
 # Client logs: the python/php clients write to logs/rocketmqlogs under the **current working
 # directory** by default (deliberately not $HOME; see python/rocketmq_logging.py,
 # php/src/Client/Logger.php). Running examples/tests from the repo root or a port directory
@@ -55,3 +58,6 @@ cmake_install.cmake
 Makefile
 cpp/build_scrub_b/
 nodeJs/selfcheck.ts.log
+
+# npm pack artifacts (nodeJs/ builds dist at pack time; the tarball itself is a build output)
+*.tgz

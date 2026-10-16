@@ -440,6 +440,47 @@ int main(int argc, char** argv) {
         check("T0 topic route ready (4 queues)", ready,
               "queues=" + std::to_string(env.routeQueueCount(topic)));
 
+        // Preflight: does this broker accept SQL92 subscriptions at all? The broker answers
+        // CHECK_CLIENT_CONFIG(46) with SYSTEM_ERROR ("The broker does not support consumer to
+        // filter message by SQL92") unless it runs with enablePropertyFilter=true, and the
+        // Java client fails start() the same way. Detect that up front and say what to do,
+        // instead of failing confusingly deeper in.
+        {
+            const std::string preGroup = env.group("PREFLIGHT");
+            DefaultMQPushConsumer pre(preGroup);
+            MessageSelector preSel = MessageSelector::bySql("color = 'red'");
+            env.configure(pre, topic, &preSel, std::string(), nullptr);
+            // start() requires a listener (same as every other consumer in this probe)
+            Sink preSink;
+            std::shared_ptr<CollectListener> preListener(new CollectListener(preSink));
+            pre.setMessageListener(preListener);
+            bool refused = false;
+            std::string refuseMsg;
+            try {
+                pre.start();
+                pre.shutdown();
+            } catch (const std::exception& e) {
+                refused = true;
+                refuseMsg = e.what();
+            }
+            if (refused &&
+                refuseMsg.find("does not support consumer to filter message by") != std::string::npos) {
+                std::printf("!! the broker refuses SQL92 subscriptions: %s\n", refuseMsg.c_str());
+                std::printf("!! fix: set enablePropertyFilter=true in broker.conf and restart the broker,\n");
+                std::printf("!!      then re-run this probe (the same requirement applies to the Java client).\n");
+                std::printf("!! skipping end-to-end SQL92 verification: broker not configured for property filter\n");
+                prod.shutdown();
+                env.cleanup();
+                std::printf("\n%d PASS / %d FAIL\n", gPass, gFail);
+                return 0;
+            }
+            if (refused) {
+                check("preflight SQL92 consumer start", false, refuseMsg);
+            } else {
+                std::printf("preflight OK: the broker accepts SQL92 subscriptions (enablePropertyFilter=true)\n");
+            }
+        }
+
         s1WireEvidence(env, topic);
         s2S3RealFiltering(env, topic, prod);
         s4BadExpressionFails(env, topic);

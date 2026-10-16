@@ -43,6 +43,24 @@ node --experimental-strip-types selfcheck.ts
 | `test/mq_client_manager_smoke.ts` | 52 通过 / 0 失败 |
 | `test/static_topic_smoke.ts` | 29 通过 / 0 失败 |
 
+### 打包 / npm 消费（tarball 与 registry）
+
+仓库内开发**零依赖零构建**（`--experimental-strip-types` 直跑）；对外消费走编译产物：
+
+```bash
+npm install          # 安装 devDependency（typescript），并触发 prepare -> npm run build 生成 dist/
+npm pack             # 产出 rocketmq-client-remoting-nodejs-5.5.1.tgz（只含 dist/ + README）
+npm publish          # 或发布到 registry（main/types/exports 均指向 dist/index.js|d.ts）
+```
+
+- 消费端 `npm install <tgz>` 后**普通 import 即可用**（无需任何 node flag）：
+  `import { DefaultMQProducer, Message } from 'rocketmq-client-remoting-nodejs'`。
+- 构建用 `tsc -p tsconfig.build.json --noCheck`（转译 + `rewriteRelativeImportExtensions`
+  把 `.ts` 导入改写为 `.js`），`fix-dts-imports.mjs` 补齐 `.d.ts` 里 tsc 不重写的同类引用。
+- 运行时**零第三方依赖**不变：`typescript` 仅是构建期 devDependency。
+- 构建为转译模式（`--noCheck`）：源码树尚有存量类型债（`tsc --noEmit` 全量报 205 处），
+  打包门禁不因其阻塞；类型体检是独立课题，不随本包交付。
+
 真机示例直接对集群运行：
 
 ```bash

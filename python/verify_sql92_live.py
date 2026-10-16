@@ -115,6 +115,29 @@ def main() -> int:
               wait_for(lambda: len(
                   prod._mq_client.get_topic_publish_info(TOPIC).msg_queue_list) >= 4, 20.0))
 
+        # ---------- preflight: does this broker accept SQL92 subscriptions at all? ----------
+        # The broker answers CHECK_CLIENT_CONFIG(46) with SYSTEM_ERROR ("The broker does not
+        # support consumer to filter message by SQL92") unless it runs with
+        # enablePropertyFilter=true, and the Java client fails start() the same way. Detect
+        # that up front and say what to do, instead of dying with a raw traceback inside S1.
+        preflight, _ = new_consumer(GROUP + "_PREFLIGHT", MessageSelector.by_sql("color = 'red'"))
+        try:
+            preflight.start()
+        except MQClientException as e:
+            msg = str(e)
+            if "does not support consumer to filter message by" in msg:
+                print("!! the broker refuses SQL92 subscriptions: %s" % msg)
+                print("!! fix: set enablePropertyFilter=true in broker.conf and restart the broker,")
+                print("!!      then re-run this probe (the same requirement applies to the Java client).")
+                print("!! skipping end-to-end SQL92 verification: broker not configured for property filter")
+                preflight.shutdown()
+                prod.shutdown()
+                return 0
+            raise
+        else:
+            preflight.shutdown()
+        print("preflight OK: the broker accepts SQL92 subscriptions (enablePropertyFilter=true)")
+
         # ---------- S1 live evidence: the shape of the code-46 request ----------
         print("\n---------- S1 the code-46 request during startup ----------")
         probe = CheckConfigProbe()

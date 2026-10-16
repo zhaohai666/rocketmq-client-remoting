@@ -68,10 +68,21 @@ Total Test time (real) =  91.14 sec
 cmake --install build --prefix /usr/local
 ```
 
+安装会同时落一份 **CMake 包配置**（`lib/cmake/rocketmq_client_remoting/`：config /
+config-version / targets），消费者端不再需要手工声明 Threads/zlib/zstd/lz4/OpenSSL：
+
+```cmake
+find_package(rocketmq_client_remoting CONFIG REQUIRED)
+target_link_libraries(my_app PRIVATE rocketmq::remoting)
+```
+
+config 文件会在消费者作用域内重放各依赖的 find（缺失的可选后端自动跳过）；纯路径后端
+（如 brew 的 dylib）以绝对路径随导出固化，同机使用无需额外配置。
+
 ## 快速上手
 
 引用头文件在 `include/rocketmq/` 下，按 `add_subdirectory(cpp)` 链接 `rocketmq::remoting`，
-或链接安装后的 `librocketmq_remoting.a`。
+或链接安装后的 `librocketmq_remoting.a`（走 `find_package` 时同样用 `rocketmq::remoting`）。
 
 ### 生产者
 

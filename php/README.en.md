@@ -473,6 +473,8 @@ bash scripts/run_php_live.sh <case> 127.0.0.1:9876 [legs]
 | `tls` | `examples/live_tls.php` | the three TLS legs `plain_tls` / `ca_verify` / `mtls`; the script mints CA/server(SAN:127.0.0.1)/client certificates on the spot |
 | `compression` | `examples/live_compression.php` | this-end compression smoke: one php→php leg compressing and decompressing over zlib / lz4 / zstd; exit codes 0 ok / 1 ordinary failure / 2 bad codec or usage / 3 recv timeout |
 | `static_topic` | `examples/live_static_topic.php` | static topic S1–S5: 513 mapping 8 queues over 4 physical ones, route read-back, the endpoints table, mock queue names resolving back to the real broker, end-to-end send and receive |
+| `sql92` | `examples/live_sql92.php` | SQL92 filtering + CHECK_CLIENT_CONFIG(46), four sections (needs broker `enablePropertyFilter=true`; when the broker refuses SQL92 the probe prints the fix and exits cleanly) |
+| `oneway_push` | `examples/live_oneway_push.php` | oneway real-time push: consumer starts first (LAST_OFFSET), `sendOneway` auto-selected queues + a sync control all arrive in real time |
 
 `examples/live_acl_message_types.php` does not go through this orchestration script: it needs a
 broker with authentication enabled, while `run_php_live.sh` starts a plain cluster. Run it as

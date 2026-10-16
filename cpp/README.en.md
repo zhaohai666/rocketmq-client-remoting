@@ -72,10 +72,23 @@ Install headers and library:
 cmake --install build --prefix /usr/local
 ```
 
+The install also ships a **CMake package config** (`lib/cmake/rocketmq_client_remoting/`:
+config / config-version / targets). Consumers no longer need to declare
+Threads/zlib/zstd/lz4/OpenSSL by hand:
+
+```cmake
+find_package(rocketmq_client_remoting CONFIG REQUIRED)
+target_link_libraries(my_app PRIVATE rocketmq::remoting)
+```
+
+The config file replays the dependency finds inside the consumer's scope (missing optional
+backends are skipped); a plain-path backend (e.g. a brew dylib) is baked into the export as
+an absolute path and works as-is on the same machine.
+
 ## Examples
 
 Headers live under `include/rocketmq/`. Link `rocketmq::remoting` via `add_subdirectory(cpp)`,
-or link an installed `librocketmq_remoting.a`.
+an installed `librocketmq_remoting.a`, or `find_package(rocketmq_client_remoting CONFIG REQUIRED)`.
 
 ### Producer
 

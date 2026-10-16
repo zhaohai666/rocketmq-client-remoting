@@ -43,6 +43,28 @@ node --experimental-strip-types selfcheck.ts
 | `test/mq_client_manager_smoke.ts` | 52 passed / 0 failed |
 | `test/static_topic_smoke.ts` | 29 passed / 0 failed |
 
+### Packaging / npm consumption (tarball and registry)
+
+In-repo development stays **zero-dependency, zero-build** (runs directly via
+`--experimental-strip-types`); out-of-repo consumption goes through the compiled output:
+
+```bash
+npm install          # installs the devDependency (typescript); prepare -> npm run build emits dist/
+npm pack             # produces rocketmq-client-remoting-nodejs-5.5.1.tgz (dist/ + README only)
+npm publish          # or publish to the registry (main/types/exports point at dist/index.js|d.ts)
+```
+
+- After `npm install <tgz>` a consumer uses **plain imports with no node flags**:
+  `import { DefaultMQProducer, Message } from 'rocketmq-client-remoting-nodejs'`.
+- The build runs `tsc -p tsconfig.build.json --noCheck` (transpile +
+  `rewriteRelativeImportExtensions` rewrites `.ts` imports to `.js`), and
+  `fix-dts-imports.mjs` rewrites the same specifiers in the emitted `.d.ts` files.
+- Runtime stays **zero third-party dependencies**: `typescript` is a build-time
+  devDependency only.
+- The build is transpile-only (`--noCheck`): the tree still carries pre-existing type debt
+  (`tsc --noEmit` reports 205 findings); the packaging gate must not be blocked by it, and
+  type hygiene remains a separate tracked concern.
+
 Run an example against a live cluster:
 
 ```bash

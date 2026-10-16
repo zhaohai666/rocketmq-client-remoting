@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Apache RocketMQ classic remoting protocol client (Rust / tokio)"
+repository = "https://github.com/zhaohai666/rocketmq-client-remoting"
+homepage = "https://github.com/zhaohai666/rocketmq-client-remoting"
+documentation = "https://docs.rs/rocketmq-client-remoting"
+readme = "README.md"
+keywords = ["rocketmq", "mq", "messaging", "remoting", "client"]
+categories = ["network-programming"]
+rust-version = "1.75"
 
 [lib]
 name = "rocketmq_client_remoting"
