@@ -239,10 +239,25 @@ console.log('== slave fallback ==');
   const entries = inst.getAllBrokerAddrEntries();
   check('all-broker entries include slave', entries.length === 2
     && entries.some((e) => e.id === 1 && e.addr === '127.0.0.1:10913'));
-  let beats = 0;
-  (inst as any).sendHeartbeat = async (_addr: string) => { beats++; return {}; };
+  let beats: string[] = [];
+  (inst as any).sendHeartbeat = async (addr: string) => { beats.push(addr); return {}; };
+  inst.registerConsumer('G', { subscriptionDataSet: [], unitMode: false });
   await (inst as any).sendHeartbeatToAllBrokers();
-  check('heartbeat sent to slave too', beats === 2, `beats=${beats}`);
+  check('heartbeat sent to slave too', beats.length === 2
+    && beats.includes('127.0.0.1:10911') && beats.includes('127.0.0.1:10913'), JSON.stringify(beats));
+  // The two guards the reference applies to every beat fan-out: a producer-only
+  // client reports to the master only, and a client that registers nothing sends
+  // no beat at all.
+  beats = [];
+  inst.unregisterConsumer('G');
+  inst.registerProducer('P', { groupName: 'P' });
+  await (inst as any).sendHeartbeatToAllBrokers();
+  check('a producer-only client beats the master only',
+    beats.length === 1 && beats[0] === '127.0.0.1:10911', JSON.stringify(beats));
+  beats = [];
+  inst.unregisterProducer('P');
+  await (inst as any).sendHeartbeatToAllBrokers();
+  check('an idle client sends no heartbeat', beats.length === 0, JSON.stringify(beats));
 }
 
 console.log(`\n${fail === 0 ? 'ALL GREEN' : fail + ' failure(s)'} (${pass} checks)`);

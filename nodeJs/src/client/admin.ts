@@ -36,7 +36,7 @@ import {
   GetConsumerListByGroupResponseBody, GroupList, KVTable, ProducerConnection,
   ResetOffsetBody, TopicConfig, TopicConfigSerializeWrapper, TopicList,
   TopicFilterType, DEFAULT_PERM, messageQueueKey,
-  ConsumeMessageDirectlyResult,
+  ConsumeMessageDirectlyResult, QueryConsumeTimeSpanBody,
 } from '../remoting/bodies.ts';
 import { TopicStatsTable } from '../remoting/admin_body.ts';
 import { TopicQueueMappingDetail } from '../remoting/static_topic.ts';
@@ -536,6 +536,26 @@ export class DefaultMQAdminExt {
     const response = await this._invokeBroker(brokerAddr, RequestCode.GET_TOPIC_STATS_INFO,
       adminExt({ topic }));
     return TopicStatsTable.decode(response.body as Buffer);
+  }
+
+  // QUERY_CONSUME_TIME_SPAN(303): walk the route's masters and concatenate each
+  // broker's consumeTimeSpanSet. A broker that answers with an empty body
+  // contributes nothing; a broker that ERRORS propagates — unlike the topic-stats
+  // sweep above, Java's consume-time-span path never swallows a per-broker failure.
+  async queryConsumeTimeSpan(topic: string, group: string,
+    timeoutMillis?: number): Promise<Record<string, any>[]> {
+    const route = await this.examineTopicRouteInfo(topic);
+    const spans: Record<string, any>[] = [];
+    for (const bd of route.brokerDatas) {
+      const addr = bd.selectBrokerAddr();
+      if (addr == null) continue;
+      const response = await this._invokeBroker(addr, RequestCode.QUERY_CONSUME_TIME_SPAN,
+        adminExt({ topic, group }), null, timeoutMillis);
+      const body = response.body as Buffer;
+      if (body == null || body.length === 0) continue;
+      spans.push(...QueryConsumeTimeSpanBody.decode(body).consumeTimeSpanSet);
+    }
+    return spans;
   }
 
   // ---------------- Cluster / broker ----------------

@@ -74,6 +74,8 @@ export class DefaultMQPullConsumer {
   // config wins). The instance-level persistAllConsumerOffset sweep is what
   // flushes this facade's offsets between the explicit shutdown/revoke flushes.
   persistConsumerOffsetInterval = 5000;
+  // Heartbeat V2 (Java ClientConfig.useHeartbeatV2): default off, like the reference.
+  useHeartbeatV2 = false;
 
   private subscription = new Map<string, SubscriptionData>();
   // Each topic's most recently computed share — serving as the rebalance result
@@ -108,6 +110,14 @@ export class DefaultMQPullConsumer {
     return this;
   }
   getPersistConsumerOffsetInterval(): number { return this.persistConsumerOffsetInterval; }
+  // Heartbeat V2 switch (Java ClientConfig.setUseHeartbeatV2); pushed through to
+  // the shared instance when this facade already owns one.
+  setUseHeartbeatV2(enable: boolean): this {
+    this.useHeartbeatV2 = enable === true;
+    if (this.mqClient) this.mqClient.setUseHeartbeatV2(this.useHeartbeatV2);
+    return this;
+  }
+  getUseHeartbeatV2(): boolean { return this.useHeartbeatV2; }
   getConsumerGroup(): string { return this.consumerGroup; }
   isStarted(): boolean { return this.started; }
 
@@ -152,6 +162,7 @@ export class DefaultMQPullConsumer {
       this.clientID, () => new MQClient(this.clientID, this.nameServerAddr));
     if (created) {
       client.setPersistConsumerOffsetInterval(this.persistConsumerOffsetInterval);
+      if (this.useHeartbeatV2) client.setUseHeartbeatV2(true);
       registerRpcHooks(client.remotingClient, {
         namespaceV2: () => this.namespaceV2,
         enableStreamRequestType: this.enableStreamRequestType,

@@ -175,6 +175,8 @@ export class DefaultMQPushConsumer {
   // config wins, matching Java's MQClientInstance construction); it drives the
   // instance-level persistAllConsumerOffset sweep.
   persistConsumerOffsetInterval = 5000;
+  // Heartbeat V2 (Java ClientConfig.useHeartbeatV2): default off, like the reference.
+  useHeartbeatV2 = false;
   allocateStrategy: AllocateMessageQueueStrategy = new AllocateMessageQueueAveragely();
   messageQueueListener: ((topic: string, mqAll: MessageQueue[], mqDivided: MessageQueue[]) => void) | null = null;
 
@@ -330,6 +332,16 @@ export class DefaultMQPushConsumer {
   }
   getPersistConsumerOffsetInterval(): number { return this.persistConsumerOffsetInterval; }
 
+  // Heartbeat V2 switch (Java ClientConfig.setUseHeartbeatV2). Only a broker that
+  // answers the V2 ext fields on HEART_BEAT is ever sent a without-subscription
+  // body, so turning this on against an old broker is harmless.
+  setUseHeartbeatV2(enable: boolean): this {
+    this.useHeartbeatV2 = enable === true;
+    if (this.mqClient) this.mqClient.setUseHeartbeatV2(this.useHeartbeatV2);
+    return this;
+  }
+  getUseHeartbeatV2(): boolean { return this.useHeartbeatV2; }
+
   isOrderly(): boolean { return this.orderly; }
   isStarted(): boolean { return this.started; }
   getConsumerGroup(): string { return this.consumerGroup; }
@@ -451,6 +463,7 @@ export class DefaultMQPushConsumer {
       if (this.tlsOptions != null) client.remotingClient.tlsOptions = this.tlsOptions;
       if (this.socksProxyConfig != null) client.remotingClient.socksProxyConfig = this.socksProxyConfig;
       client.setPersistConsumerOffsetInterval(this.persistConsumerOffsetInterval);
+      if (this.useHeartbeatV2) client.setUseHeartbeatV2(true);
       registerRpcHooks(client.remotingClient, {
         namespaceV2: () => this.namespaceV2,
         userHook: this.rpcHook,
@@ -816,9 +829,20 @@ export class DefaultMQPushConsumer {
     assigned.sort((a, b) => a.compareTo(b));
     this.assigned = assigned;
     const now = new Set(assigned.map(mqKey));
-    if (now.size !== was.size) {
+    let changed = now.size !== was.size;
+    if (!changed) {
+      for (const key of now) {
+        if (!was.has(key)) { changed = true; break; }
+      }
+    }
+    if (changed) {
       logger.info('rebalance result changed, group=%s clientId=%s assigned=%d',
         this.consumerGroup, this.clientID, assigned.length);
+      // The reference beats every broker the moment the allocation moves, with the
+      // cached fingerprints dropped. A rebalance that took a queue away changes
+      // what the broker must hold for this group, and waiting for the 30s beat
+      // leaves the old slice registered in the meantime.
+      void client.sendHeartbeatToAllBrokers(true);
     }
     // Resolve the initial offset for freshly assigned queues NOW, not lazily
     // on the first pull: CONSUME_FROM_LAST_OFFSET means "the newest offset as

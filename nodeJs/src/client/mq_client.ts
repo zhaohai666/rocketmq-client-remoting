@@ -26,6 +26,7 @@ import { CheckClientRequestBody } from '../remoting/bodies.ts';
 import { PopResult, processPopResponse } from './pop_api.ts';
 import {
   HeartbeatData, ProducerData, ConsumerData, ConsumeType, MessageModel, ConsumeFromWhere,
+  decodeHeartbeatV2Flags,
 } from '../remoting/heartbeat.ts';
 import { NamespaceUtil } from '../remoting/namespace.ts';
 import {
@@ -118,6 +119,15 @@ export class MQClient {
   consumerTable: Map<string, any>;
   producerTable: Map<string, any>;
   heartbeatIntervalMillis: number;
+  // Heartbeat V2. Off by default — the reference switch is a JVM system property
+  // that reads "false", and a beat with fingerprint 0 makes the broker take its
+  // plain registration path, exactly as before.
+  useHeartbeatV2: boolean;
+  // Addresses whose HEART_BEAT response declared IS_SUPPORT_HEART_BEAT_V2.
+  _brokerSupportV2HeartbeatSet: Set<string>;
+  // Last fingerprint accepted per broker address; a beat whose fingerprint
+  // matches this cache may drop its subscription sets.
+  _brokerAddrHeartbeatFingerprintTable: Map<string, number>;
   // Client-level API timeout (default 3000 ms): the timeout used by
   // the instance-level admin calls, including CHECK_CLIENT_CONFIG(46).
   mqClientApiTimeout: number;
@@ -167,6 +177,9 @@ export class MQClient {
     this.consumerTable = new Map();
     this.producerTable = new Map();
     this.heartbeatIntervalMillis = 30 * 1000;
+    this.useHeartbeatV2 = false;
+    this._brokerSupportV2HeartbeatSet = new Set();
+    this._brokerAddrHeartbeatFingerprintTable = new Map();
     this.mqClientApiTimeout = 3000;
     this.consumerStatsManager = new ConsumerStatsManager();
     this._heartbeatTimer = null;
@@ -624,7 +637,11 @@ export class MQClient {
   }
 
   // ---- heartbeat ----
-  buildHeartbeatData(): HeartbeatData {
+  // buildHeartbeatData(withoutSub) mirrors the reference's two heartbeat
+  // renderings: withoutSub keeps every consumer's identity but empties its
+  // subscription set, which is what lets a V2 broker skip registration work it
+  // already did.
+  buildHeartbeatData(withoutSub = false): HeartbeatData {
     const hb = new HeartbeatData(this.clientId);
     for (const [group, producer] of this.producerTable.entries()) {
       const pd = new ProducerData(group);
@@ -639,19 +656,60 @@ export class MQClient {
         consumer.messageModel != null ? consumer.messageModel : MessageModel.CLUSTERING,
         consumer.consumeFromWhere != null ? consumer.consumeFromWhere : ConsumeFromWhere.CONSUME_FROM_LAST_OFFSET,
       );
-      cd.subscriptionDataSet = consumer.subscriptionDataSet || [];
+      if (!withoutSub) cd.subscriptionDataSet = consumer.subscriptionDataSet || [];
       cd.unitMode = consumer.unitMode === true;
       hb.consumerDataSet.push(cd);
     }
+    hb.withoutSub = withoutSub;
     return hb;
   }
 
-  // Send a heartbeat to a single broker (HEART_BEAT=34, body = heartbeat JSON; fingerprint 0).
+  setUseHeartbeatV2(enable: boolean): this {
+    if (this.useHeartbeatV2 === (enable === true)) return this;
+    this.useHeartbeatV2 = enable === true;
+    // Turning the switch either way invalidates what the caches mean, so start the
+    // conversation with every broker over again.
+    this._brokerSupportV2HeartbeatSet.clear();
+    this._brokerAddrHeartbeatFingerprintTable.clear();
+    return this;
+  }
+
+  // Send one heartbeat to one broker (HEART_BEAT=34, body = heartbeat JSON).
+  //
+  // V1 (the default): the body carries subscriptions and fingerprint 0, so a broker
+  // takes its plain registration path and never answers the V2 flags.
+  //
+  // V2: the fingerprint of this client's subscription snapshot rides on the body —
+  // a non-zero fingerprint is exactly what makes the broker answer
+  // IS_SUPPORT_HEART_BEAT_V2 / IS_SUB_CHANGE. Once THIS address has declared
+  // support and the fingerprint it last accepted is unchanged, the beat goes out
+  // without subscription sets; a response saying the subscriptions changed drops
+  // the cached fingerprint so the next beat reports them again.
   async sendHeartbeat(brokerAddr: string): Promise<RemotingCommand> {
-    const hb = this.buildHeartbeatData();
+    const hb = this.buildHeartbeatData(false);
+    if (!this.useHeartbeatV2) return this._sendHeartbeatBody(brokerAddr, hb);
+    const fingerprint = hb.computeHeartbeatFingerprint();
+    hb.heartbeatFingerprint = fingerprint;
+    const withoutSub = this.buildHeartbeatData(true);
+    withoutSub.heartbeatFingerprint = fingerprint;
+    const skipSub = this._brokerSupportV2HeartbeatSet.has(brokerAddr) &&
+      this._brokerAddrHeartbeatFingerprintTable.get(brokerAddr) === fingerprint;
+    const response = await this._sendHeartbeatBody(brokerAddr, skipSub ? withoutSub : hb);
+    const flags = decodeHeartbeatV2Flags(response);
+    if (flags.supportV2) {
+      this._brokerSupportV2HeartbeatSet.add(brokerAddr);
+      if (flags.subChange) this._brokerAddrHeartbeatFingerprintTable.delete(brokerAddr);
+      else this._brokerAddrHeartbeatFingerprintTable.set(brokerAddr, fingerprint);
+    }
+    return response;
+  }
+
+  private async _sendHeartbeatBody(brokerAddr: string, hb: HeartbeatData): Promise<RemotingCommand> {
     const request = RemotingCommand.createRequestCommand(RequestCode.HEART_BEAT, null);
     request.body = hb.encode();
-    return this.remotingClient.invokeSync(brokerAddr, request, 3000);
+    // The reference sends the beat with the client-level API timeout, not a fixed
+    // one, so setMqClientApiTimeout governs the heartbeat too.
+    return this.remotingClient.invokeSync(brokerAddr, request, this.mqClientApiTimeout);
   }
 
   async unregisterClient(brokerAddr: string, producerGroup: string, consumerGroup: string): Promise<RemotingCommand> {
@@ -1125,11 +1183,28 @@ export class MQClient {
     if (typeof (this._heartbeatTimer as any).unref === 'function') this._heartbeatTimer.unref();
   }
 
-  // Public: facade start() (pull / lite-pull consumer) and route refresh both call this directly.
-  async sendHeartbeatToAllBrokers(): Promise<void> {
+  // Public: facade start() (pull / lite-pull consumer), route refresh and the
+  // push consumer's rebalance all call this directly. `isRebalance` is the push
+  // consumer's assignment-changed signal: it drops every cached fingerprint so
+  // the next beat re-reports subscriptions, the way the reference resets the
+  // table before beating when a rebalance moved the queue set.
+  async sendHeartbeatToAllBrokers(isRebalance = false): Promise<void> {
     const entries = this.getAllBrokerAddrEntries();
+    // Same two guards the reference applies before it walks the broker table: a
+    // client that registers nothing has nothing to report, and a producer-only
+    // client beats the MASTER only — heartbeating a slave with no consumer data
+    // would leave the slave holding a producer registration it can never use.
+    const beat = this.buildHeartbeatData(false);
+    const producerEmpty = beat.producerDataSet.length === 0;
+    const consumerEmpty = beat.consumerDataSet.length === 0;
+    if (producerEmpty && consumerEmpty) {
+      logger.warning('heartbeat skipped: no producer and no consumer registered');
+      return;
+    }
+    if (isRebalance) this._brokerAddrHeartbeatFingerprintTable.clear();
     logger.debug('heartbeat beat to %d broker(s)', entries.length);
-    for (const { addr } of entries) {
+    for (const { addr, id } of entries) {
+      if (consumerEmpty && id !== MixAll.MASTER_ID) continue;
       try { await this.sendHeartbeat(addr); } catch (e) { /* best effort */ }
     }
   }

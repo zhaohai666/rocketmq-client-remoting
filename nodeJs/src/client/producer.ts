@@ -157,6 +157,8 @@ export class DefaultMQProducer {
   // W3C traceparent passthrough switch. Independent of enableTrace, seeded
   // from ROCKETMQ_TRACE_CONTEXT_ENABLE.
   enableTraceContext: boolean;
+  // Heartbeat V2 (Java ClientConfig.useHeartbeatV2): default off, like the reference.
+  useHeartbeatV2: boolean;
 
   client: MQClient | null;
   mqFaultStrategy: MQFaultStrategy;
@@ -205,6 +207,7 @@ export class DefaultMQProducer {
     this.compressLevel = 5;
     this.startDetectorEnable = false;
     this.enableTraceContext = traceContextEnabledFromEnv();
+    this.useHeartbeatV2 = false;
 
     this.client = null;
     this.mqFaultStrategy = new MQFaultStrategy(this.sendLatencyFaultEnable);
@@ -264,6 +267,15 @@ export class DefaultMQProducer {
   getSocksProxyConfig(): SocksProxyConfig | null { return this.socksProxyConfig; }
   setSendMsgTimeout(ms: number): this { this.sendMsgTimeout = ms; return this; }
   setEnableTrace(enable: boolean): this { this.enableTrace = enable; return this; }
+  // Heartbeat V2 switch (Java ClientConfig.setUseHeartbeatV2). A broker that does
+  // not answer the V2 ext fields keeps receiving subscription-carrying bodies, so
+  // turning this on against an old broker is harmless.
+  setUseHeartbeatV2(enable: boolean): this {
+    this.useHeartbeatV2 = enable === true;
+    if (this.client) this.client.setUseHeartbeatV2(this.useHeartbeatV2);
+    return this;
+  }
+  getUseHeartbeatV2(): boolean { return this.useHeartbeatV2; }
   setTraceTopic(topic: string): this { this.traceTopic = topic; return this; }
   // compressType: 'ZLIB' | 'LZ4' | 'ZSTD'
   // or the raw MessageSysFlag type value (1/2/3).
@@ -345,6 +357,7 @@ export class DefaultMQProducer {
     this.client = client;
     manager.registerClient(clientId, client);
     if (created) {
+      if (this.useHeartbeatV2) client.setUseHeartbeatV2(true);
       registerRpcHooks(client.remotingClient, {
         namespaceV2: () => this.namespaceV2,
         userHook: this.rpcHook,
