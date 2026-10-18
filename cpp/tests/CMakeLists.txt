@@ -324,6 +324,16 @@ add_executable(rmq_test_pull_consumer_balance_view test_pull_consumer_balance_vi
 target_link_libraries(rmq_test_pull_consumer_balance_view PRIVATE rocketmq::remoting)
 add_test(NAME pull_consumer_balance_view COMMAND rmq_test_pull_consumer_balance_view)
 
+# Pull-consumer high-level capabilities (Java MQPullConsumerScheduleService + DefaultMQPullConsumer.pullAsync):
+# the schedule service fans this instance's share out into queue-dimension tasks (fake endpoint serves
+# route / consumer list / scripted pulls), pins per-queue seriality, the three-channel delay priority
+# (return value > pullMessageLater > setPullInterval > status default), the exception delay, reassignment
+# cancelling revoked queues, and a shutdown that drains the in-flight round; pullAsync pins the
+# exactly-once onSuccess/onException delivery on worker threads and the synchronous guards. Fully offline.
+add_executable(rmq_test_pull_schedule_service test_pull_schedule_service.cpp)
+target_link_libraries(rmq_test_pull_schedule_service PRIVATE rocketmq::remoting)
+add_test(NAME pull_schedule_service COMMAND rmq_test_pull_schedule_service)
+
 # Publish address "master only" (#100, findBrokerAddressInPublish):
 # the flat table is written by a real updateTopicRouteInfoFromNameServer; on a miss it refreshes the route then re-queries
 # (sendKernelImpl); still-missing throws "The broker[X] not exist" with code -1, and

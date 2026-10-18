@@ -13,7 +13,7 @@ import {
   LocalFileOffsetStore, RemoteBrokerOffsetStore, ReadOffsetMode, mqKey,
 } from './offset_store.ts';
 import type { OffsetStore } from './offset_store.ts';
-import { PullStatus, PullResult } from './consumer_result.ts';
+import { PullStatus, PullResult, MessageSelector } from './consumer_result.ts';
 import { MessageModel, ConsumeType } from '../remoting/heartbeat.ts';
 import { MessageQueue, MessageExt } from '../common/message.ts';
 import { MixAll } from '../common/mixAll.ts';
@@ -31,6 +31,14 @@ const logger = getLogger('client.pull_consumer');
 
 const DEFAULT_PULL_BATCH_SIZE = 32;
 const DEFAULT_PULL_TIMEOUT_MILLIS = 20000;
+
+// PullCallback — Java DefaultMQPullConsumer.pull(..., PullCallback, timeout).
+// Delivered EXACTLY ONCE per pullAsync call and never inline on the caller's
+// stack: the settle path hands over through setImmediate (event-loop semantics).
+export interface PullCallback {
+  onSuccess(pullResult: PullResult): void;
+  onException(e: Error): void;
+}
 
 export class DefaultMQPullConsumer {
   consumerGroup: string;
@@ -61,6 +69,11 @@ export class DefaultMQPullConsumer {
   pullBatchSize = DEFAULT_PULL_BATCH_SIZE;
   pullTimeoutMillis = DEFAULT_PULL_TIMEOUT_MILLIS;
   maxReconsumeTimes = -1;
+  // Java ClientConfig.persistConsumerOffsetInterval (default 5000ms): applied to
+  // the shared MQClient instance when THIS facade creates it (first creator's
+  // config wins). The instance-level persistAllConsumerOffset sweep is what
+  // flushes this facade's offsets between the explicit shutdown/revoke flushes.
+  persistConsumerOffsetInterval = 5000;
 
   private subscription = new Map<string, SubscriptionData>();
   // Each topic's most recently computed share — serving as the rebalance result
@@ -85,14 +98,35 @@ export class DefaultMQPullConsumer {
   setPullBatchSize(n: number): this { this.pullBatchSize = n; return this; }
   setPullTimeoutMillis(ms: number): this { this.pullTimeoutMillis = ms; return this; }
   setMaxReconsumeTimes(n: number): this { this.maxReconsumeTimes = n; return this; }
+  // Flush period for consumed offsets (Java ClientConfig.persistConsumerOffsetInterval).
+  // When already started the change is pushed through to the shared instance's
+  // sweep timer immediately.
+  setPersistConsumerOffsetInterval(ms: number): this {
+    if (!Number.isFinite(ms) || ms <= 0) throw new Error(`persistConsumerOffsetInterval must be > 0, got ${ms}`);
+    this.persistConsumerOffsetInterval = Math.floor(ms);
+    if (this.mqClient) this.mqClient.setPersistConsumerOffsetInterval(this.persistConsumerOffsetInterval);
+    return this;
+  }
+  getPersistConsumerOffsetInterval(): number { return this.persistConsumerOffsetInterval; }
   getConsumerGroup(): string { return this.consumerGroup; }
   isStarted(): boolean { return this.started; }
 
-  subscribe(topic: string, subExpression = '*'): this {
+  // subscribe registers a topic subscription. A string is a tag expression
+  // ("*" = all); a MessageSelector selects the expression type — bySql rides the
+  // wire as expressionType=SQL92 and is evaluated BY THE BROKER (the Java
+  // client does the same: no client-side SQL92 engine, see FilterAPI.build
+  // keeping tagsSet EMPTY so the client-side tag filter stays off).
+  subscribe(topic: string, subExpression: string | MessageSelector = '*'): this {
     if (!topic || !topic.trim()) throw new Error('subscription topic is empty');
-    const expr = subExpression || '*';
-    this.subscription.set(topic, FilterAPI.buildSubscriptionData(topic, expr));
+    this.subscription.set(topic, this._buildSub(topic, subExpression));
     return this;
+  }
+
+  private _buildSub(topic: string, subExpression: string | MessageSelector): SubscriptionData {
+    if (typeof subExpression === 'string') {
+      return FilterAPI.buildSubscriptionData(topic, subExpression || '*');
+    }
+    return FilterAPI.build(topic, subExpression.expression, subExpression.type);
   }
 
   async start(): Promise<void> {
@@ -117,6 +151,7 @@ export class DefaultMQPullConsumer {
     const { instance: client, created } = manager.getOrCreateMQClientInstance(
       this.clientID, () => new MQClient(this.clientID, this.nameServerAddr));
     if (created) {
+      client.setPersistConsumerOffsetInterval(this.persistConsumerOffsetInterval);
       registerRpcHooks(client.remotingClient, {
         namespaceV2: () => this.namespaceV2,
         enableStreamRequestType: this.enableStreamRequestType,
@@ -183,24 +218,53 @@ export class DefaultMQPullConsumer {
   }
 
   // pull is a SHORT poll (rule #10): suspend=false, suspendTimeoutMillis=0.
-  async pull(mq: MessageQueue, subExpression: string | null, offset: number, maxNums: number,
+  async pull(mq: MessageQueue, subExpression: string | MessageSelector | null, offset: number, maxNums: number,
     timeoutMillis = this.pullTimeoutMillis): Promise<PullResult> {
     return this._pullImpl(mq, subExpression, offset, maxNums, false, 0, timeoutMillis);
+  }
+
+  // pullAsync — Java DefaultMQPullConsumer.pull(mq, subExpression, offset,
+  // maxNums, PullCallback, timeout). Event-loop semantics: the callback fires
+  // EXACTLY ONCE (success XOR exception) and NEVER inline — even an immediate
+  // local failure (consumer not started, no subscription) is delivered through
+  // setImmediate, so the caller's statement always completes first.
+  pullAsync(mq: MessageQueue, subExpression: string | MessageSelector | null, offset: number,
+    maxNums: number, callback: PullCallback, timeoutMillis = this.pullTimeoutMillis): void {
+    if (callback == null || typeof callback.onSuccess !== 'function'
+      || typeof callback.onException !== 'function') {
+      throw new Error('pullAsync requires a PullCallback with onSuccess/onException');
+    }
+    let delivered = false;
+    const deliver = (fn: () => void): void => {
+      if (delivered) return; // exactly once, even if both settle paths raced
+      delivered = true;
+      setImmediate(() => {
+        try { fn(); } catch (e) {
+          logger.warning('pullAsync callback raised: %s', (e as Error).message);
+        }
+      });
+    };
+    this._pullImpl(mq, subExpression, offset, maxNums, false, 0, timeoutMillis).then(
+      (r) => deliver(() => callback.onSuccess(r)),
+      (e) => deliver(() => callback.onException(e instanceof Error ? e : new Error(String(e)))),
+    );
   }
 
   // pullBlockIfNotFound is a LONG poll: suspend=true. The broker holds the
   // request up to brokerSuspendMaxTimeMillis and answers NO_NEW_MSG when
   // nothing arrives in time — a benign timeout on the client is NORMAL here.
-  async pullBlockIfNotFound(mq: MessageQueue, subExpression: string | null, offset: number,
+  async pullBlockIfNotFound(mq: MessageQueue, subExpression: string | MessageSelector | null, offset: number,
     maxNums: number, timeoutMillis = this.pullTimeoutMillis,
     suspendTimeoutMillis = 20000): Promise<PullResult> {
     return this._pullImpl(mq, subExpression, offset, maxNums, true, suspendTimeoutMillis, timeoutMillis);
   }
 
-  private async _pullImpl(mq: MessageQueue, subExpression: string | null, offset: number,
+  private async _pullImpl(mq: MessageQueue, subExpression: string | MessageSelector | null, offset: number,
     maxNums: number, suspend: boolean, suspendTimeoutMillis: number,
     timeoutMillis: number): Promise<PullResult> {
-    if (!this.pullAPI) throw new Error('consumer not started');
+    // Java checks serviceState at the pull entry: a shutdown facade must report,
+    // never keep pulling through the (still open) client instance it shared.
+    if (!this.started || !this.pullAPI) throw new Error('consumer not started');
     const topic = mq.getTopic();
     let sub: SubscriptionData;
     if (subExpression == null) {
@@ -208,7 +272,7 @@ export class DefaultMQPullConsumer {
       if (!cached) throw new Error(`subscription for topic ${topic} is not set`);
       sub = cached;
     } else {
-      sub = FilterAPI.buildSubscriptionData(topic, subExpression || '*');
+      sub = this._buildSub(topic, subExpression);
     }
     // Pull / lite-pull consumers ALWAYS send the expression (rule #21):
     // subscription bit on.
@@ -261,6 +325,25 @@ export class DefaultMQPullConsumer {
       await this._warmQueueRoute(topic);
     }
     await this.offsetStore.persistAll(mqs);
+  }
+
+  // persistConsumerOffset — the MQConsumerInner contract name the MQClient's
+  // instance-level persistAllConsumerOffset sweep calls every
+  // persistConsumerOffsetInterval; delegates to persistConsumeOffset.
+  async persistConsumerOffset(): Promise<void> {
+    return this.persistConsumeOffset();
+  }
+
+  // maxOffset — the queue tail on the MASTER broker (Java
+  // DefaultMQPullConsumer.maxOffset). Throws when the route/broker is unknown;
+  // the pull schedule context treats that as "start from 0".
+  async maxOffset(mq: MessageQueue): Promise<number> {
+    if (!this.mqClient) throw new Error('consumer not started');
+    await this._warmQueueRoute(mq.getTopic());
+    const addrs = this.mqClient.getBrokerAddrTable().get(mq.getBrokerName());
+    const addr = addrs != null ? addrs[MixAll.MASTER_ID] : null;
+    if (addr == null) throw new Error(`Broker[${mq.getBrokerName()}] master node does not exist`);
+    return this.mqClient.getMaxOffset(addr, mq.getTopic(), mq.getQueueId());
   }
 
   async fetchMessageQueuesInBalance(topic: string): Promise<MessageQueue[]> {

@@ -290,6 +290,51 @@ pull.startHeartbeatLoop();   // 需要 broker 侧可见本组注册时打开
 
 `fetchMessageQueuesInBalance(topic)` 只返回本实例按分配策略应得的那份队列。
 
+异步拉取（Java `DefaultMQPullConsumer.pull(..., PullCallback, timeout)` 的对应物）：
+立即返回，工作线程执行同一套同步拉取内核，回调线程上 `onSuccess` / `onException`
+**恰好一次**触发；`shutdown()` 先排空在途请求：
+
+```cpp
+class MyPullCallback : public PullCallback {
+public:
+    void onSuccess(const PullResult& res) override { /* res.msgFoundList / res.nextBeginOffset */ }
+    void onException(const std::exception_ptr& e) override { /* std::rethrow_exception(e) 查看 */ }
+};
+
+pull.pullAsync(mq, "*", offset, 32, std::make_shared<MyPullCallback>(), 5000);
+```
+
+调度服务（Java `MQPullConsumerScheduleService` 的对应物）：按 topic 注册 `PullTaskCallback`，
+常驻调度线程周期性重算本实例应得份额（CLUSTERING 走 `fetchMessageQueuesInBalance`、
+BROADCASTING 走 `fetchSubscribeMessageQueues`），展开成 queue 维度拉取任务——同队列严格串行、
+不同队列在 `setPullThreadNums`（默认 20）宽的线程池上并行；服务代拉并管理位点
+（首轮 `fetchConsumeOffset`，查不到则 `maxOffset`；其后跟随 `nextBeginOffset`）：
+
+```cpp
+#include "rocketmq/client/pull_schedule_service.h"
+
+class MyPullTask : public PullTaskCallback {
+public:
+    int32_t doPullTask(const MessageQueue& mq, PullResult& res, PullTaskContext& ctx) override {
+        for (const MessageExt& m : res.msgFoundList) { /* ... */ }
+        ctx.pullConsumer()->updateConsumeOffset(mq, res.nextBeginOffset);
+        return res.isFound() ? 0 : PullTaskCallback::kUseContextDelay;
+    }
+};
+
+MQPullConsumerScheduleService svc("GID_PULL_SCHED");
+svc.defaultMQPullConsumer().setNamesrvAddr("127.0.0.1:9876");
+svc.registerPullTaskCallback("TopicDemo", std::make_shared<MyPullTask>(), "*");
+svc.start();
+// ...
+svc.shutdown();   // 先停调度，再排空在途 doPullTask，最后关消费者
+```
+
+下一轮延时按三通道优先级决议：`doPullTask` **返回值**（>= 0 毫秒，最高）＞
+`ctx.pullMessageLater(延时)`（一次性顺延）＞ `ctx.setPullInterval(间隔)` ＞ 状态默认
+（FOUND=0 立即；空应答 / OFFSET_ILLEGAL=`setPullTimeDelayMillisWhenException`，Java 口径 3s；
+拉取失败或回调抛异常=`setPullTaskExceptionDelayMillis`，Java 口径 1s）。
+
 ### 轻量拉消费者
 
 ```cpp
@@ -433,8 +478,10 @@ producer.setTlsOptions(opts);
 - ✅ 生产者：普通 / 顺序（selector 与定点）/ 延迟与定时 / 事务 / 批量 / 单向 / 真异步 /
   异步背压 / 自动攒批 / Request-Reply / 定时消息撤回 / 消息查询
 - ✅ 消费者：`DefaultMQPushConsumer`（并发、顺序、广播、POP）、
-  `DefaultMQPullConsumer`（短轮询 / 长轮询 / 位点表 / 心跳）、
-  `DefaultLitePullConsumer`（subscribe 与 assign 双模式、seek、三张位点表、队列变更监听）
+  `DefaultMQPullConsumer`（短轮询 / 长轮询 / 位点表 / 心跳 / 异步拉取 `pullAsync`）、
+  `DefaultLitePullConsumer`（subscribe 与 assign 双模式、seek、三张位点表、队列变更监听）、
+  `MQPullConsumerScheduleService`（按 topic 注册 `PullTaskCallback`，按本实例应得份额展开
+  queue 维度拉取任务：同队列串行、三通道延时优先级、关停排空在途）
 - ✅ 队列分配策略：AVG / AVG_BY_CIRCLE / CONFIG / CONSISTENT_HASH /
   MACHINE_ROOM / MACHINE_ROOM_NEARBY，三类消费者均可替换
 - ✅ 管理端 `DefaultMQAdminExt`：topic 与订阅组增删查、消费进度、连接信息、
@@ -560,11 +607,12 @@ cpp/
 │   ├── common/                 消息模型、编解码、压缩、哈希环、命名空间、日志
 │   ├── remoting/               RemotingClient、TLS 会话、RPC 钩子、protocol/（codes /
 │   │                           headers / route / heartbeat / body / admin_body / ...）
-│   └── client/                 producer / consumer / pull_consumer / lite_pull_consumer /
-│                               admin / mq_client / allocate_strategy / hook / trace /
-│                               request_reply / backpressure / validators / result / exception
+│   └── client/                 producer / consumer / pull_consumer / pull_schedule_service /
+│                               lite_pull_consumer / admin / mq_client / allocate_strategy /
+│                               hook / trace / request_reply / backpressure / validators /
+│                               result / exception
 ├── src/                        与 include 同构的实现（common / remoting / client）
-├── tests/                      56 个测试源文件 + interop_check.py = 57 个 ctest 用例
+├── tests/                      57 个测试源文件 + interop_check.py = 58 个 ctest 用例
 ├── examples/                   rmq_selfcheck / rmq_interop + 39 个真机联调工具
 └── tools/                      Windows 头文件准备与语法检查脚本
 ```

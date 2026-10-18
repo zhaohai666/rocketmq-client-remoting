@@ -124,6 +124,7 @@ void DefaultMQPullConsumer::start() {
                     + clientId_ + ")");
     }
     mqClient_->start();
+    createAsyncExecutors();
     refreshRouteForHeartbeat();
     started_ = true;
     try {
@@ -136,6 +137,23 @@ void DefaultMQPullConsumer::start() {
 
 void DefaultMQPullConsumer::shutdown() {
     if (!started_) return;
+    // Detach the pullAsync pools first: a late pullAsync then throws instead of enqueueing into a
+    // dying pool, while already-queued rounds still run to completion.
+    // ⚠ started_ must flip only **after** the queues drain -- an in-flight round still calls pull(),
+    //   which needs mqClient_; flipping early would turn queued pulls into spurious onException calls.
+    std::shared_ptr<ConsumeExecutor> asyncPool;
+    std::shared_ptr<ConsumeExecutor> callbackPool;
+    {
+        std::lock_guard<std::mutex> lk(asyncLock_);
+        asyncPool.swap(asyncPullExecutor_);
+        callbackPool.swap(callbackExecutor_);
+    }
+    if (asyncPool) {
+        asyncPool->shutdown(true);
+    }
+    if (callbackPool) {
+        callbackPool->shutdown(true);
+    }
     started_ = false;
     heartbeatStop_.store(true);
     heartbeatCv_.notify_all();
@@ -175,8 +193,12 @@ std::vector<MessageQueue> DefaultMQPullConsumer::fetchMessageQueuesInBalance(
 
     // Current assignment: queues of the topic pulled locally (keys written by pull(), topic is already realTopic).
     std::vector<MessageQueue> pulled;
-    for (const auto& kv : pullFromWhichNode_) {
-        if (kv.first.topic == realTopic) pulled.push_back(kv.first);
+    {
+        // pullAsync workers write the table concurrently with this read.
+        std::lock_guard<std::mutex> lk(pullFromWhichNodeMutex_);
+        for (const auto& kv : pullFromWhichNode_) {
+            if (kv.first.topic == realTopic) pulled.push_back(kv.first);
+        }
     }
     std::sort(pulled.begin(), pulled.end());
 
@@ -269,13 +291,103 @@ PullResult DefaultMQPullConsumer::pullBlockIfNotFound(const MessageQueue& mq,
 }
 
 int64_t DefaultMQPullConsumer::recalculatePullFromWhichNode(const MessageQueue& mq) const {
+    std::lock_guard<std::mutex> lk(pullFromWhichNodeMutex_);
     auto it = pullFromWhichNode_.find(mq);
     return it != pullFromWhichNode_.end() ? it->second : MixAll::MASTER_ID;
 }
 
 void DefaultMQPullConsumer::updatePullFromWhichNode(const MessageQueue& mq,
                                                     const PullResult& result) {
+    std::lock_guard<std::mutex> lk(pullFromWhichNodeMutex_);
     pullFromWhichNode_[mq] = result.suggestWhichBrokerId.value_or(MixAll::MASTER_ID);
+}
+
+// ---------------------------------------------------------------- Async pull
+// Producer-shaped two pools: PullAsyncExecutor runs the (synchronous-kernel) pull off the caller thread,
+// PullCallbackExecutor delivers the user callback so a slow onSuccess cannot block the pull workers.
+void DefaultMQPullConsumer::createAsyncExecutors() {
+    int32_t cores = static_cast<int32_t>(std::thread::hardware_concurrency());
+    if (cores <= 0) {
+        cores = 1;  // never build a pool that cannot run tasks
+    }
+    std::lock_guard<std::mutex> lk(asyncLock_);
+    asyncPullExecutor_ = std::make_shared<ConsumeExecutor>(
+        cores, cores, 60.0, "PullAsyncExecutor", asyncPullQueueCapacity_, "_", 1);
+    callbackExecutor_ = std::make_shared<ConsumeExecutor>(
+        cores, cores, 60.0, "PullCallbackExecutor", 0, "_", 1);
+}
+
+void DefaultMQPullConsumer::executeOnCallbackThread(std::function<void()> fn) {
+    std::shared_ptr<ConsumeExecutor> pool;
+    {
+        std::lock_guard<std::mutex> lk(asyncLock_);
+        pool = callbackExecutor_;
+    }
+    if (pool == nullptr) {
+        fn();
+        return;
+    }
+    try {
+        pool->submit(std::move(fn));
+    } catch (const RejectedExecutionError&) {
+        fn();
+    }
+}
+
+void DefaultMQPullConsumer::pullAsync(const MessageQueue& mq, const std::string& subExpression,
+                                      int64_t offset, int32_t maxNums,
+                                      std::shared_ptr<PullCallback> callback,
+                                      int32_t timeoutMillis) {
+    if (mqClient_ == nullptr || !started_) {
+        throw MQClientException("consumer not started, call start() first");
+    }
+    if (callback == nullptr) {
+        throw MQClientException("PullCallback is null");
+    }
+    std::shared_ptr<ConsumeExecutor> pool;
+    {
+        std::lock_guard<std::mutex> lk(asyncLock_);
+        pool = asyncPullExecutor_;
+    }
+    if (pool == nullptr) {
+        throw MQClientException("consumer already shutdown");
+    }
+    // Exactly-once latch: whichever path reaches the flag first delivers, every other path no-ops
+    // (covers the submit/shutdown race where delivery falls back to inline).
+    auto delivered = std::make_shared<std::atomic<bool>>(false);
+    auto deliver = [callback, delivered](const PullResult* result, const std::exception_ptr* eptr) {
+        if (delivered->exchange(true)) {
+            return;
+        }
+        // A throwing user callback must not take down the pool thread (producer convention: swallowed + logged).
+        try {
+            if (result != nullptr) {
+                callback->onSuccess(*result);
+            } else {
+                callback->onException(*eptr);
+            }
+        } catch (const std::exception& e) {
+            logger_warn(std::string("pull callback raised: ") + e.what());
+        } catch (...) {
+            logger_warn("pull callback raised unknown exception");
+        }
+    };
+    try {
+        pool->submit([this, mq, subExpression, offset, maxNums, timeoutMillis, deliver]() {
+            try {
+                const PullResult result = pull(mq, subExpression, offset, maxNums, timeoutMillis);
+                executeOnCallbackThread([deliver, result]() { deliver(&result, nullptr); });
+            } catch (...) {
+                const std::exception_ptr eptr = std::current_exception();
+                executeOnCallbackThread([deliver, eptr]() { deliver(nullptr, &eptr); });
+            }
+        });
+    } catch (const RejectedExecutionError&) {
+        // The pool shut down concurrently: report it through the callback instead of dropping it silently.
+        const std::exception_ptr eptr = std::make_exception_ptr(
+            MQClientException("pullAsync rejected: consumer is shutting down"));
+        deliver(nullptr, &eptr);
+    }
 }
 
 // ---------------------------------------------------------------- Consumer offset management

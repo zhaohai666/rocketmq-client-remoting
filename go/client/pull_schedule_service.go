@@ -92,7 +92,7 @@ type MQPullConsumerScheduleService struct {
 	started  bool
 	stopped  atomic.Bool
 	stop     chan struct{}
-	stopOnce sync.Once
+	stopOnce *sync.Once     // replaced per Start, so a restarted service can stop again
 	loopWG   sync.WaitGroup // the rebalance loop
 	runWG    sync.WaitGroup // rounds currently running (the drain target)
 
@@ -152,6 +152,7 @@ func newMQPullConsumerScheduleService(c *DefaultMQPullConsumer, owns bool) *MQPu
 		callbacks:               map[string]PullTaskCallback{},
 		tasks:                   map[common.MessageQueue]*pullQueueTask{},
 		queueLocks:              map[common.MessageQueue]*sync.Mutex{},
+		stopOnce:                new(sync.Once),
 		rebalanceNow:            make(chan struct{}, 1),
 	}
 }
@@ -327,6 +328,11 @@ func (s *MQPullConsumerScheduleService) Start() error {
 		s.rebalanceIntervalMillis = DefaultPullScheduleRebalanceIntervalMillis
 	}
 	s.stop = make(chan struct{})
+	// A fresh Once per Start: Shutdown consumes it, and a service that is
+	// started AGAIN after a Shutdown must be able to close its NEW stop
+	// channel — with a spent Once the second Shutdown would never wake the
+	// second rebalance loop and loopWG.Wait would hang forever.
+	s.stopOnce = new(sync.Once)
 	s.sem = make(chan struct{}, s.pullThreadNums)
 	s.stopped.Store(false)
 	s.started = true
@@ -483,16 +489,23 @@ func (t *pullQueueTask) run() {
 		l := s.lockFor(t.mq)
 		l.Lock()
 		next := int64(DefaultPullTaskNextDelayMillis)
-		// Add before the stopped check: a round that STARTED must be counted
-		// in the drain, or Shutdown could return while it is mid-Pull and the
-		// consumer underneath it goes away.
-		s.runWG.Add(1)
+		// The Add must sit under s.mu, fused with the stopped check: Shutdown
+		// stores stopped, then takes s.mu for the cancel sweep, then waits on
+		// runWG. An Add that acquires s.mu after the sweep sees stopped and
+		// bails without touching the WaitGroup; an Add before the sweep
+		// happens-before the Wait. An Add racing a Wait on a zero counter is
+		// sync.WaitGroup misuse and can panic the whole process — and a round
+		// that STARTED is still counted in the drain, so Shutdown can never
+		// return while it is mid-Pull and the consumer underneath goes away.
+		s.mu.Lock()
 		if s.stopped.Load() {
-			s.runWG.Done()
+			s.mu.Unlock()
 			l.Unlock()
 			<-s.sem
 			return
 		}
+		s.runWG.Add(1)
+		s.mu.Unlock()
 		next = s.runRound(t)
 		s.runWG.Done()
 		l.Unlock()
@@ -642,14 +655,20 @@ func (s *MQPullConsumerScheduleService) Shutdown() {
 		return
 	}
 	s.started = false
+	stopOnce := s.stopOnce
 	s.mu.Unlock()
 
 	s.stopped.Store(true)
-	s.stopOnce.Do(func() {
-		if s.stop != nil {
-			close(s.stop)
-		}
-	})
+	if stopOnce != nil {
+		stopOnce.Do(func() {
+			s.mu.Lock()
+			stop := s.stop
+			s.mu.Unlock()
+			if stop != nil {
+				close(stop)
+			}
+		})
+	}
 	// Wake the sleeping chains, then drain the running rounds within the
 	// shared shutdown budget (a callback that never returns must not hang
 	// the process — same bound the push consumer's drain uses).

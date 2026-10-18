@@ -90,6 +90,11 @@ export class DefaultLitePullConsumer {
   // The period at which a background task compares the queue set of every
   // watched topic.
   topicMetadataCheckIntervalMillis = DEFAULT_TOPIC_METADATA_CHECK_INTERVAL_MILLIS;
+  // Java ClientConfig.persistConsumerOffsetInterval (default 5000ms): applied to
+  // the shared MQClient instance when THIS facade creates it; drives the
+  // instance-level persistAllConsumerOffset sweep (which calls this facade's
+  // persistConsumerOffset -> commitSync).
+  persistConsumerOffsetInterval = 5000;
 
   setConsumeFromWhere(where: string): this { this.consumeFromWhere = where; return this; }
 
@@ -126,6 +131,16 @@ export class DefaultLitePullConsumer {
   setPollTimeoutMillis(ms: number): this { this.pollTimeoutMillis = ms; return this; }
   setAutoCommit(enable: boolean): this { this.autoCommit = enable; return this; }
   setAutoCommitIntervalMillis(ms: number): this { this.autoCommitIntervalMillis = ms; return this; }
+  // Flush period for consumed offsets (Java ClientConfig.persistConsumerOffsetInterval).
+  // When already started the change is pushed through to the shared instance's
+  // sweep timer immediately.
+  setPersistConsumerOffsetInterval(ms: number): this {
+    if (!Number.isFinite(ms) || ms <= 0) throw new Error(`persistConsumerOffsetInterval must be > 0, got ${ms}`);
+    this.persistConsumerOffsetInterval = Math.floor(ms);
+    if (this.mqClient) this.mqClient.setPersistConsumerOffsetInterval(this.persistConsumerOffsetInterval);
+    return this;
+  }
+  getPersistConsumerOffsetInterval(): number { return this.persistConsumerOffsetInterval; }
   getConsumerGroup(): string { return this.consumerGroup; }
   isStarted(): boolean { return this.started; }
 
@@ -183,6 +198,7 @@ export class DefaultLitePullConsumer {
     const { instance: client, created } = manager.getOrCreateMQClientInstance(
       this.clientID, () => new MQClient(this.clientID, this.nameServerAddr));
     if (created) {
+      client.setPersistConsumerOffsetInterval(this.persistConsumerOffsetInterval);
       registerRpcHooks(client.remotingClient, {
         namespaceV2: () => this.namespaceV2,
         enableStreamRequestType: this.enableStreamRequestType,
@@ -459,6 +475,14 @@ export class DefaultLitePullConsumer {
     if (!this.offsetStore) return;
     const queues = this._activeQueues();
     await this.offsetStore.persistAll(queues);
+  }
+
+  // persistConsumerOffset — the MQConsumerInner contract name the MQClient's
+  // instance-level persistAllConsumerOffset sweep calls every
+  // persistConsumerOffsetInterval; delegates to commitSync (Java
+  // DefaultLitePullConsumerImpl.persistConsumerOffset).
+  async persistConsumerOffset(): Promise<void> {
+    return this.commitSync();
   }
 
   // seek moves the pull cursor for one queue (the next poll starts there).

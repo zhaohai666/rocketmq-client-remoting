@@ -129,6 +129,75 @@ fn lite_pull_sys_flag() -> i32 {
     PullSysFlag::build_sys_flag(false, false, true, false, true)
 }
 
+// ================================================================ Async pull callback
+
+/// Async pull callback (Java `consumer/PullCallback.java`): fires **exactly once** per
+/// [`DefaultMQPullConsumer::pull_async`] -- either [`on_success`](PullCallback::on_success) with
+/// the [`PullResult`] or [`on_exception`](PullCallback::on_exception) with the failure.
+pub trait PullCallback: Send + Sync + 'static {
+    /// Called when the pull RPC reached a terminal success (any [`PullStatus`], including NO_NEW_MSG).
+    fn on_success(&self, pull_result: PullResult);
+
+    /// Called when the pull failed (not started races, transport errors, broker error codes, timeouts).
+    fn on_exception(&self, err: Error);
+}
+
+/// Success callback closure.
+pub type OnPullSuccessFn = Box<dyn FnOnce(PullResult) + Send + 'static>;
+
+/// Failure callback closure.
+pub type OnPullExceptionFn = Box<dyn FnOnce(Error) + Send + 'static>;
+
+/// Convenience callback: glues two plain closures into a [`PullCallback`]
+/// and guarantees each closure runs at most once (same shape as `producer::ClosureSendCallback`).
+pub struct ClosurePullCallback {
+    success: Mutex<Option<OnPullSuccessFn>>,
+    failure: Mutex<Option<OnPullExceptionFn>>,
+}
+
+impl ClosurePullCallback {
+    /// Either `success` or `failure` may be `None`.
+    pub fn new(
+        success: Option<OnPullSuccessFn>,
+        failure: Option<OnPullExceptionFn>,
+    ) -> ClosurePullCallback {
+        ClosurePullCallback {
+            success: Mutex::new(success),
+            failure: Mutex::new(failure),
+        }
+    }
+
+    fn take_success(&self) -> Option<OnPullSuccessFn> {
+        self.success
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+
+    fn take_failure(&self) -> Option<OnPullExceptionFn> {
+        self.failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+}
+
+impl PullCallback for ClosurePullCallback {
+    /// An `FnOnce` can run only once: taking it empties the slot, so a repeated callback has its
+    /// later arrival ignored.
+    fn on_success(&self, pull_result: PullResult) {
+        if let Some(f) = self.take_success() {
+            f(pull_result);
+        }
+    }
+
+    fn on_exception(&self, err: Error) {
+        if let Some(f) = self.take_failure() {
+            f(err);
+        }
+    }
+}
+
 // ================================================================ DefaultMQPullConsumer
 
 /// Configuration of [`DefaultMQPullConsumer`] (a flat set of properties).
@@ -836,6 +905,46 @@ impl DefaultMQPullConsumer {
                 .unwrap_or(MixAll::MASTER_ID as i64),
         );
         Ok(self.apply_delivery_filter(mq, result))
+    }
+
+    /// Async short-polling pull -- port of Java
+    /// `DefaultMQPullConsumer.pull(mq, subExpression, offset, maxNums, PullCallback, timeout)`.
+    ///
+    /// Returns immediately; a background tokio task runs the same RPC path as [`pull`](Self::pull)
+    /// (same sysFlag, same `pull_from_which_node` follow-up, same pre-delivery filter) and fires
+    /// `on_success` / `on_exception` on the callback **exactly once**.
+    ///
+    /// A not-started (or already shut down) consumer is rejected **synchronously** with `Err` and
+    /// the callback never fires -- Java's `makeSureStateOK()` throws the same way before the
+    /// request is handed to the async machinery. The spawned task is deliberately not tracked in
+    /// the shutdown task list: an in-flight `pull_async` drains (its callback still lands) instead
+    /// of being aborted mid-RPC.
+    pub fn pull_async(
+        &self,
+        mq: &MessageQueue,
+        sub_expression: &str,
+        offset: i64,
+        max_nums: i32,
+        timeout_millis: Option<i64>,
+        callback: Arc<dyn PullCallback>,
+    ) -> Result<()> {
+        let _ = self.require_client()?;
+        let handle = self.runtime_handle().ok_or_else(|| {
+            Error::client("pull_async needs a tokio runtime; call start() first")
+        })?;
+        let this = self.clone();
+        let mq = mq.clone();
+        let sub_expression = sub_expression.to_string();
+        handle.spawn(async move {
+            match this
+                .pull(&mq, &sub_expression, offset, max_nums, timeout_millis)
+                .await
+            {
+                Ok(result) => callback.on_success(result),
+                Err(err) => callback.on_exception(err),
+            }
+        });
+        Ok(())
     }
 
     /// Run the pre-delivery filter only when FOUND and non-empty.
@@ -4754,5 +4863,150 @@ mod tests {
         );
         assert!(lock(&events).is_empty(), "no callback events");
         c.shutdown();
+    }
+
+    // ---------------------- pull_async (Java DefaultMQPullConsumer.pull(.., PullCallback, timeout))
+
+    /// Counts the callback fires and keeps the delivered result/error for assertions.
+    #[derive(Default)]
+    struct AsyncPullProbe {
+        successes: AtomicUsize,
+        failures: AtomicUsize,
+        result: Mutex<Option<PullResult>>,
+        error: Mutex<Option<String>>,
+    }
+
+    impl AsyncPullProbe {
+        fn callback(self: &Arc<Self>) -> Arc<dyn PullCallback> {
+            let ok = Arc::clone(self);
+            let er = Arc::clone(self);
+            Arc::new(ClosurePullCallback::new(
+                Some(Box::new(move |r| {
+                    ok.successes.fetch_add(1, Ordering::SeqCst);
+                    *ok.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+                })),
+                Some(Box::new(move |e| {
+                    er.failures.fetch_add(1, Ordering::SeqCst);
+                    *er.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(e.to_string());
+                })),
+            ))
+        }
+
+        fn fires(&self) -> usize {
+            self.successes.load(Ordering::SeqCst) + self.failures.load(Ordering::SeqCst)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pull_async_delivers_the_found_result_exactly_once() {
+        let cluster = FakePullCluster::start_queues(1).await;
+        let c = started_pull("pull_async_ok", "PG_AsyncOk", &cluster, "T").await;
+        let q = queue("T", "broker-a", 0);
+        let body =
+            encode_message_ext(&msg("T", "broker-a", 0, 7, "hello"), false).expect("encodes");
+        cluster.master.script_pull(
+            response_code::SUCCESS,
+            &[
+                ("nextBeginOffset", "8"),
+                ("minOffset", "0"),
+                ("maxOffset", "9"),
+            ],
+            Some(body),
+            None,
+        );
+        let probe = Arc::new(AsyncPullProbe::default());
+        c.pull_async(&q, "*", 7, 32, Some(3_000), probe.callback())
+            .expect("a started consumer must accept pull_async");
+        wait_until(|| probe.fires() >= 1, "on_success lands").await;
+        // Let a hypothetical double-fire show up before asserting "exactly once".
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(probe.successes.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.failures.load(Ordering::SeqCst), 0, "no exception on success");
+        let r = lock(&probe.result).clone().expect("a result was delivered");
+        assert_eq!(r.status, PullStatus::Found);
+        assert_eq!(r.next_begin_offset, 8);
+        assert_eq!(r.msg_found_list.len(), 1);
+        assert_eq!(
+            r.msg_found_list[0].body.as_deref(),
+            Some("hello".as_bytes()),
+            "the FOUND body rides through the callback"
+        );
+        c.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pull_async_reports_broker_errors_through_on_exception() {
+        let cluster = FakePullCluster::start_queues(1).await;
+        let c = started_pull("pull_async_err", "PG_AsyncErr", &cluster, "T").await;
+        let q = queue("T", "broker-a", 0);
+        cluster.master.script_pull(response_code::SYSTEM_ERROR, &[], None, None);
+        let probe = Arc::new(AsyncPullProbe::default());
+        c.pull_async(&q, "*", 0, 32, Some(3_000), probe.callback())
+            .expect("accepted");
+        wait_until(|| probe.fires() >= 1, "on_exception lands").await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(probe.failures.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.successes.load(Ordering::SeqCst), 0);
+        assert!(
+            lock(&probe.error).clone().is_some_and(|e| !e.is_empty()),
+            "the failure reason rides along"
+        );
+        c.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pull_async_timeout_lands_in_on_exception() {
+        let cluster = FakePullCluster::start_queues(1).await;
+        let c = started_pull("pull_async_to", "PG_AsyncTimeout", &cluster, "T").await;
+        let q = queue("T", "broker-a", 0);
+        // The reply waits on a gate that is never opened: the request timeout must fire instead.
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
+        cluster.master.script_pull(
+            response_code::SUCCESS,
+            &[("nextBeginOffset", "1")],
+            None,
+            Some(gate_rx),
+        );
+        let probe = Arc::new(AsyncPullProbe::default());
+        c.pull_async(&q, "*", 0, 32, Some(300), probe.callback())
+            .expect("accepted");
+        wait_until(|| probe.fires() >= 1, "the timeout surfaces as on_exception").await;
+        assert_eq!(probe.failures.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.successes.load(Ordering::SeqCst), 0);
+        drop(gate_tx); // release the scripted reply; nothing may fire a second time
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(probe.fires(), 1, "the late reply must not fire the callback again");
+        c.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pull_async_rejected_before_start_and_after_shutdown() {
+        let cluster = FakePullCluster::start_queues(1).await;
+        let q = queue("T", "broker-a", 0);
+        // Before start: synchronous Err (Java makeSureStateOK throws), callback never fires.
+        let cold = DefaultMQPullConsumer::new("PG_AsyncCold").unwrap();
+        cold.set_instance_name("pull_async_cold");
+        cold.set_namesrv_addr(&cluster.namesrv_addr);
+        let probe = Arc::new(AsyncPullProbe::default());
+        let err = cold
+            .pull_async(&q, "*", 0, 32, None, probe.callback())
+            .expect_err("a cold consumer must reject pull_async synchronously");
+        assert!(
+            err.to_string().contains("consumer not started"),
+            "the rejection reason: {err}"
+        );
+        // After shutdown: same synchronous rejection.
+        let c = started_pull("pull_async_closed", "PG_AsyncClosed", &cluster, "T").await;
+        c.shutdown();
+        let err = c
+            .pull_async(&q, "*", 0, 32, None, probe.callback())
+            .expect_err("a shut-down consumer must reject pull_async");
+        assert!(
+            err.to_string().contains("consumer not started"),
+            "the rejection reason: {err}"
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(probe.fires(), 0, "a rejected pull_async never touches the callback");
+        cold.shutdown();
     }
 }

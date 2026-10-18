@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "rocketmq/client/allocate_strategy.h"
+#include "rocketmq/client/consume_executor.h"
 #include "rocketmq/client/mq_client.h"
 #include "rocketmq/client/result.h"
 #include "rocketmq/common/message.h"
@@ -67,6 +68,7 @@ public:
     }
     int32_t heartbeatBrokerIntervalMillis() const { return heartbeatBrokerIntervalMillis_; }
     void setMessageModel(const std::string& model) { messageModel_ = model; }
+    const std::string& messageModel() const { return messageModel_; }
     void setMessageQueueListener(std::shared_ptr<MessageQueueListener> listener) {
         messageQueueListener_ = std::move(listener);
     }
@@ -114,6 +116,19 @@ public:
     PullResult pullBlockIfNotFound(const MessageQueue& mq, const std::string& subExpression,
                                    int64_t offset, int32_t maxNums);
 
+    // Async pull (Java DefaultMQPullConsumer.pull(mq, subExpression, offset, maxNums, PullCallback, timeout)):
+    // returns at once; a worker thread runs the very same synchronous pull kernel and the callback pool
+    // delivers onSuccess/onException **exactly once**. Mirrors DefaultMQProducer::sendAsync's two-pool shape
+    // (PullAsyncExecutor for the request work + PullCallbackExecutor for the user callback).
+    // Not started / null callback throw synchronously; after shutdown() the in-flight requests are drained,
+    // and a late pullAsync throws instead of dropping the callback silently.
+    void pullAsync(const MessageQueue& mq, const std::string& subExpression, int64_t offset,
+                   int32_t maxNums, std::shared_ptr<PullCallback> callback,
+                   int32_t timeoutMillis = -1);
+
+    void setAsyncPullQueueCapacity(int32_t n) { asyncPullQueueCapacity_ = n; }
+    int32_t getAsyncPullQueueCapacity() const { return asyncPullQueueCapacity_; }
+
     int64_t recalculatePullFromWhichNode(const MessageQueue& mq) const;
 
     void updatePullFromWhichNode(const MessageQueue& mq, const PullResult& result);
@@ -141,6 +156,12 @@ private:
     void startHeartbeatLoop();
     void heartbeatLoop();
 
+    // ---------------- pullAsync plumbing (producer-shaped) ----------------
+    void createAsyncExecutors();
+    // Runs fn on the callback pool; falls back to inline once the pool is gone (shutdown race),
+    // so the exactly-once delivery never depends on the pool still being alive.
+    void executeOnCallbackThread(std::function<void()> fn);
+
     std::string consumerGroup_;
     std::string namespace_;
     std::string namespaceV2_;
@@ -165,8 +186,19 @@ private:
         std::make_shared<AllocateMessageQueueAveragely>();
 
     std::unique_ptr<MQClientInstance> mqClient_;
+    // pullAsync worker threads and synchronous callers share the table, so every read/write is guarded
+    // (recalculatePullFromWhichNode / updatePullFromWhichNode / fetchMessageQueuesInBalance).
+    mutable std::mutex pullFromWhichNodeMutex_;
     std::map<MessageQueue, int64_t> pullFromWhichNode_;
     bool started_ = false;
+
+    // ---------------- pullAsync pools ----------------
+    // shared_ptr + swap-on-shutdown, the producer's convention: an in-flight submission keeps its own
+    // reference while shutdown() drains the queue, so nothing dangles and nothing is dropped silently.
+    std::mutex asyncLock_;
+    int32_t asyncPullQueueCapacity_ = 50000;
+    std::shared_ptr<ConsumeExecutor> asyncPullExecutor_;
+    std::shared_ptr<ConsumeExecutor> callbackExecutor_;
 
     bool heartbeatEnabled_ = true;
     int32_t heartbeatBrokerIntervalMillis_ = 30000;

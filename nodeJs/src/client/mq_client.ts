@@ -136,6 +136,14 @@ export class MQClient {
   // adjustThreadPool task: every 1 minute every
   // consumer of this instance is offered a pool-size adjustment decision.
   _adjustThreadPoolTimer: NodeJS.Timeout | null;
+  // persistAllConsumerOffset task (Java ClientConfig.persistConsumerOffsetInterval,
+  // default 5000ms): the INSTANCE-level offset flush. The push consumer keeps its
+  // own 5s loop, but the pull / lite-pull facades only flushed on shutdown —
+  // a crash lost every offset since the start. Java schedules the first tick
+  // after a 10s initial delay, then every persistConsumerOffsetInterval.
+  persistConsumerOffsetInterval: number;
+  _persistOffsetTimer: NodeJS.Timeout | null;
+  _persistOffsetInitialTimer: NodeJS.Timeout | null;
   // Nameserver sticky/round-robin semantics: reuse the last NS that answered.
   // Prefer it; only fall back to the next one when it fails. Without this stickiness + rotation,
   // when one of several NS is down every route fetch would pick randomly and fail on the dead one.
@@ -168,6 +176,9 @@ export class MQClient {
     this._namesrvTimer = null;
     this._namesrvInitialTimer = null;
     this._adjustThreadPoolTimer = null;
+    this.persistConsumerOffsetInterval = 5000;
+    this._persistOffsetTimer = null;
+    this._persistOffsetInitialTimer = null;
     this._namesrvChosen = null;
     this._running = false;
     this._facadeProcessors = new Map();
@@ -976,6 +987,7 @@ export class MQClient {
     this._startRouteRefreshLoop();
     this._startNamesrvAddressingLoop();
     this._startAdjustThreadPoolLoop();
+    this._startPersistConsumerOffsetLoop();
     // The stats manager's own start() is empty (sampling hangs off each
     // StatsItem's scheduler); the unified sampler timer starts here.
     this.consumerStatsManager.start();
@@ -1008,6 +1020,54 @@ export class MQClient {
       if (consumer != null && typeof consumer.adjustThreadPool === 'function') {
         try { consumer.adjustThreadPool(); } catch (e) { /* best effort — never let one consumer break the sweep */ }
       }
+    }
+  }
+
+  // Periodic offset flush (Java MQClientInstance: scheduleAtFixedRate(
+  // persistAllConsumerOffset, 10s, persistConsumerOffsetInterval=5s)). The
+  // interval timer alone would fire at +5s already, so the 10s initial tick
+  // only matters for a configured interval LONGER than 10s — kept anyway for
+  // shape parity with the Java schedule.
+  private _startPersistConsumerOffsetLoop(): void {
+    if (this._persistOffsetTimer != null) return;
+    const beat = () => { this.persistAllConsumerOffset(); };
+    const initial = setTimeout(beat, 10_000);
+    if (typeof initial.unref === 'function') initial.unref();
+    this._persistOffsetInitialTimer = initial;
+    this._persistOffsetTimer = setInterval(beat, this.persistConsumerOffsetInterval);
+    if (typeof this._persistOffsetTimer.unref === 'function') this._persistOffsetTimer.unref();
+  }
+
+  // Java MQClientInstance.persistAllConsumerOffset: sweep EVERY consumer
+  // registered on this instance. Best effort per consumer — one failing flush
+  // must never starve the others (same isolation rule as adjustThreadPool).
+  persistAllConsumerOffset(): void {
+    for (const consumer of this.consumerTable.values()) {
+      if (consumer == null || typeof consumer.persistConsumerOffset !== 'function') continue;
+      try {
+        const r = consumer.persistConsumerOffset();
+        if (r != null && typeof r.then === 'function') {
+          r.catch((e: Error) => logger.debug('persistConsumerOffset failed: %s', e.message));
+        }
+      } catch (e) {
+        logger.debug('persistConsumerOffset raised: %s', (e as Error).message);
+      }
+    }
+  }
+
+  // Runtime knob for the flush period (Java ClientConfig.setPersistConsumerOffsetInterval).
+  // When the loop is already running the interval timer is rebuilt so the new
+  // period takes effect from the next tick; the 10s initial tick is left alone.
+  setPersistConsumerOffsetInterval(ms: number): void {
+    if (!Number.isFinite(ms) || ms <= 0) {
+      throw new Error(`persistConsumerOffsetInterval must be > 0, got ${ms}`);
+    }
+    this.persistConsumerOffsetInterval = Math.floor(ms);
+    if (this._persistOffsetTimer != null) {
+      clearInterval(this._persistOffsetTimer);
+      this._persistOffsetTimer = setInterval(() => { this.persistAllConsumerOffset(); },
+        this.persistConsumerOffsetInterval);
+      if (typeof this._persistOffsetTimer.unref === 'function') this._persistOffsetTimer.unref();
     }
   }
 
@@ -1189,6 +1249,8 @@ export class MQClient {
     if (this._namesrvInitialTimer != null) { clearTimeout(this._namesrvInitialTimer); this._namesrvInitialTimer = null; }
     if (this._topAddressing != null) { this._topAddressing.clearChangeCallBack(); this._topAddressing = null; }
     if (this._adjustThreadPoolTimer != null) { clearInterval(this._adjustThreadPoolTimer); this._adjustThreadPoolTimer = null; }
+    if (this._persistOffsetTimer != null) { clearInterval(this._persistOffsetTimer); this._persistOffsetTimer = null; }
+    if (this._persistOffsetInitialTimer != null) { clearTimeout(this._persistOffsetInitialTimer); this._persistOffsetInitialTimer = null; }
     this.consumerStatsManager.shutdown();
     try { this.remotingClient.shutdown(); } catch (e) { /* ignore */ }
     for (const acc of (this as any)._accumulators || []) { try { acc.stop(); } catch (e) {} }

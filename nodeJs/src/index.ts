@@ -22,9 +22,21 @@ export type { SendCallback } from './client/producer.ts';
 // ---- consumer ----
 export { DefaultMQPushConsumer } from './client/consumer.ts';
 export { DefaultMQPullConsumer } from './client/pull_consumer.ts';
+export type { PullCallback } from './client/pull_consumer.ts';
 export { DefaultLitePullConsumer } from './client/lite_pull_consumer.ts';
 export type { TopicMessageQueueChangeListener } from './client/lite_pull_consumer.ts';
 export { DefaultMQAdminExt } from './client/admin.ts';
+
+// ---- pull schedule service (Java MQPullConsumerScheduleService equivalent) ----
+export {
+  PullConsumerScheduleService,
+  PullTaskContext,
+  DEFAULT_PULL_NEXT_DELAY_MILLIS,
+  PULL_TASK_EXCEPTION_DELAY_MILLIS,
+  DEFAULT_QUEUE_CHECK_INTERVAL_MILLIS,
+  DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_MILLIS,
+} from './client/pull_schedule_service.ts';
+export type { PullTaskCallback, PullTaskOptions } from './client/pull_schedule_service.ts';
 
 // ---- consume results / listeners / selectors ----
 export {

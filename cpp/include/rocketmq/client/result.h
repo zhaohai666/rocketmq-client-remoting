@@ -135,6 +135,16 @@ struct PullResult {
     bool isNoNewMsg() const { return status == PullStatus::NO_NEW_MSG; }
 };
 
+// ---------------------------------------------------------------- async pull callback
+// Java's org.apache.rocketmq.client.consumer.PullCallback (DefaultMQPullConsumer.pull(..., PullCallback, timeout));
+// shaped exactly like SendCallback above: one of the two fires, exactly once.
+class PullCallback {
+public:
+    virtual ~PullCallback() = default;
+    virtual void onSuccess(const PullResult& pullResult) = 0;
+    virtual void onException(const std::exception_ptr& error) = 0;
+};
+
 // ---------------------------------------------------------------- POP mode
 
 enum class PopStatus {

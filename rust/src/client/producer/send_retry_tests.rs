@@ -1973,8 +1973,11 @@ async fn connect_failure_retries_on_another_broker_with_a_fresh_opaque() {
     let producer = started("async_retry_broker", &cluster).await;
 
     let cb = Arc::new(Recorder::default());
+    // The budget has to be roomy: a connect to a dead loopback port costs ~2s here and
+    // serialises behind the heartbeat connects to the same address, so the first attempt
+    // alone can burn seconds that would otherwise leave `remaining <= 0` and no retry.
     producer
-        .send_async(body_of(10), cb.clone(), Some(5_000), None)
+        .send_async(body_of(10), cb.clone(), Some(30_000), None)
         .expect("dispatchable within the runtime");
     assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
     assert!(cb.errors().is_empty(), "after switching brokers the send should succeed: {:?}", cb.errors());

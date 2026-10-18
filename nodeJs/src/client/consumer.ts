@@ -170,6 +170,11 @@ export class DefaultMQPushConsumer {
   maxReconsumeTimes = DEFAULT_MAX_RECONSUME_TIMES;
   suspendCurrentQueueTimeMillis = DEFAULT_SUSPEND_CURRENT_QUEUE_TIME_MS;
   consumeTimeout = DEFAULT_CONSUME_TIMEOUT;
+  // Java ClientConfig.persistConsumerOffsetInterval (default 5000ms): applied to
+  // the shared MQClient instance when THIS facade creates it (first creator's
+  // config wins, matching Java's MQClientInstance construction); it drives the
+  // instance-level persistAllConsumerOffset sweep.
+  persistConsumerOffsetInterval = 5000;
   allocateStrategy: AllocateMessageQueueStrategy = new AllocateMessageQueueAveragely();
   messageQueueListener: ((topic: string, mqAll: MessageQueue[], mqDivided: MessageQueue[]) => void) | null = null;
 
@@ -314,6 +319,16 @@ export class DefaultMQPushConsumer {
   }
   setEnableTrace(enable: boolean): this { this.enableTrace = enable; return this; }
   setTraceTopic(topic: string): this { this.traceTopic = topic; return this; }
+  // Flush period for consumed offsets (Java ClientConfig.persistConsumerOffsetInterval).
+  // When already started the change is pushed through to the shared instance's
+  // sweep timer immediately.
+  setPersistConsumerOffsetInterval(ms: number): this {
+    if (!Number.isFinite(ms) || ms <= 0) throw new Error(`persistConsumerOffsetInterval must be > 0, got ${ms}`);
+    this.persistConsumerOffsetInterval = Math.floor(ms);
+    if (this.mqClient) this.mqClient.setPersistConsumerOffsetInterval(this.persistConsumerOffsetInterval);
+    return this;
+  }
+  getPersistConsumerOffsetInterval(): number { return this.persistConsumerOffsetInterval; }
 
   isOrderly(): boolean { return this.orderly; }
   isStarted(): boolean { return this.started; }
@@ -435,6 +450,7 @@ export class DefaultMQPushConsumer {
       if (this.tlsEnable != null) client.remotingClient.tlsEnable = this.tlsEnable;
       if (this.tlsOptions != null) client.remotingClient.tlsOptions = this.tlsOptions;
       if (this.socksProxyConfig != null) client.remotingClient.socksProxyConfig = this.socksProxyConfig;
+      client.setPersistConsumerOffsetInterval(this.persistConsumerOffsetInterval);
       registerRpcHooks(client.remotingClient, {
         namespaceV2: () => this.namespaceV2,
         userHook: this.rpcHook,
@@ -718,7 +734,10 @@ export class DefaultMQPushConsumer {
   private async _persistOffsetLoop(): Promise<void> {
     const flag = this._newStopFlag();
     while (!this._isStopped(flag)) {
-      if (!(await this._sleepOrStop(5000, flag))) {
+      // The facade-level loop honors persistConsumerOffsetInterval (Java's
+      // ClientConfig knob); the instance-level sweep in MQClient covers the
+      // pull / lite-pull facades that have no loop of their own.
+      if (!(await this._sleepOrStop(this.persistConsumerOffsetInterval, flag))) {
         try { await this.persistConsumerOffset(); } catch (e) { /* best effort */ }
       }
     }

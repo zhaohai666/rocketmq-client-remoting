@@ -12,6 +12,7 @@ pub mod mq_client;
 pub mod produce_accumulator;
 pub mod producer;
 pub mod pull_consumer;
+pub mod pull_schedule_service;
 pub mod request_reply;
 pub mod result;
 pub(crate) mod shutdown;
