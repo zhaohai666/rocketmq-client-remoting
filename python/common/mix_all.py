@@ -52,6 +52,10 @@ class MixAll:
     TRANS_CHECK_MAX_TIME = 15
     UNIT_PREFIX = "unit_"
     REQ_T = "ReqT"
+    # Heartbeat V2 (MQClientAPIImpl#sendHeartbeatV2 reads both keys out of the HEART_BEAT(34)
+    # response extFields; ClientManageProcessor#heartBeatV2 writes them).
+    IS_SUPPORT_HEART_BEAT_V2 = "IS_SUPPORT_HEART_BEAT_V2"
+    IS_SUB_CHANGE = "IS_SUB_CHANGE"
     RPC_REQUEST_HEADER_NAMESPACED_FIELD = "nsd"
     RPC_REQUEST_HEADER_NAMESPACE_FIELD = "ns"
     STREAM_REQUEST_TYPE = "STREAM"

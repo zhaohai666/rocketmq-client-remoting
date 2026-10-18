@@ -339,6 +339,16 @@ class DefaultMQProducer:
         self._transaction_listener: Optional[TransactionListener] = None
         self._heartbeat_running = False
         self.heartbeat_interval_millis = 30000
+        # ---- ClientConfig knobs that drive the heartbeat / send address ----
+        # ``use_heartbeat_v2``: Java's ``ClientConfig.useHeartbeatV2`` (system property
+        # ``com.rocketmq.heartbeat.v2``), **false by default**. Off means the heartbeat body keeps
+        # ``heartbeatFingerprint = 0`` and the broker takes its V1 registration path; on switches
+        # every round to the fingerprint-gated V2 path (see client/heartbeat_v2.py).
+        self.use_heartbeat_v2 = False
+        # ``vip_channel_enabled``: Java's ``ClientConfig.vipChannelEnabled``, read on the send side
+        # through ``DefaultMQProducer#isSendMessageWithVIPChannel``, **false by default**. On makes
+        # sends target the broker's VIP port (listen port - 2, 10911 -> 10909).
+        self.vip_channel_enabled = False
         self.poll_name_server_interval = 30000
         self.send_latency_fault_enable = False
         self._mq_fault_strategy = MQFaultStrategy(False)
@@ -411,6 +421,31 @@ class DefaultMQProducer:
 
     def get_namespace_v2(self) -> Optional[str]:
         return self.namespace_v2
+
+    def set_vip_channel_enabled(self, enable: bool) -> None:
+        """Java's ``DefaultMQProducer#setSendMessageWithVIPChannel`` (same field as
+        ``ClientConfig.vipChannelEnabled``): sends -- including the request-reply reply, which is
+        just a send with ``MSG_TYPE=reply`` -- go to the broker's VIP port (listen port - 2).
+
+        Also refreshes the shared ``MQClientInstance`` flag when already started: the address
+        rewrite lives there (like Java's MQClientAPIImpl), and one instance can be shared by
+        several facades with the same clientId.
+        """
+        self.vip_channel_enabled = bool(enable)
+        if self._mq_client is not None:
+            self._mq_client.vip_channel_enabled = bool(enable)
+
+    def is_vip_channel_enabled(self) -> bool:
+        return self.vip_channel_enabled
+
+    def set_send_message_with_vip_channel(self, enable: bool) -> None:
+        """The Java-named alias of :meth:`set_vip_channel_enabled`."""
+        self.set_vip_channel_enabled(enable)
+
+    def set_use_heartbeat_v2(self, enable: bool) -> None:
+        """Opt into the fingerprint-gated heartbeat V2 path (Java's
+        ``ClientConfig.setUseHeartbeatV2``); off by default, exactly like the reference."""
+        self.use_heartbeat_v2 = bool(enable)
 
     def set_socks_proxy_config(self, socks_proxy_config: Optional[SocksProxyConfig]) -> None:
         pass
@@ -746,7 +781,8 @@ class DefaultMQProducer:
                     enable_stream_request_type=self.enable_stream_request_type,
                     unit_name=self.unit_name,
                     namespace_v2=self.namespace_v2,
-                    poll_name_server_interval=self.poll_name_server_interval)
+                    poll_name_server_interval=self.poll_name_server_interval,
+                    vip_channel_enabled=self.vip_channel_enabled)
 
             self._mq_client, created = MQClientManager.get_instance() \
                 .get_or_create_mq_client_instance(self.client_id, _create_instance)
@@ -892,14 +928,21 @@ class DefaultMQProducer:
             return 0
         hb = HeartbeatData(self.client_id or "")
         pd = ProducerData(self.producer_group)
-        # WARNING: the Python HeartbeatData has no heartbeatFingerprint / withoutSub fields
-        # (known gap, see project memory). When absent, the broker deserializes them as 0, which is equivalent to the V1 registration path;
-        # explicitly setting 0 has the same effect as omitting it, so the status quo is kept.
         hb.producer_data_set.add(pd)
         ok_count = 0
         for addr in addrs:
             try:
-                self._mq_client.send_heartbeat(addr, hb, 5000)
+                # Producer heartbeats carry ProducerData only (consumerEmpty=true), so Java sends
+                # them to masters only -- addrs comes from get_route_of_all_brokers.
+                # With heartbeat V2 on, the same HEART_BEAT(34) frame goes through the
+                # fingerprint-gated path; the broker only takes heartBeatV2 once the body's
+                # heartbeatFingerprint is non-zero, and a broker that never answers
+                # IS_SUPPORT_HEART_BEAT_V2 keeps receiving the full body.
+                if self.use_heartbeat_v2:
+                    self._mq_client.send_heartbeat_to_broker_v2(
+                        addr, hb, self.producer_group, 5000)
+                else:
+                    self._mq_client.send_heartbeat(addr, hb, 5000)
                 ok_count += 1
             except Exception as e:  # noqa: BLE001
                 logger.warning("producer heartbeat to %s failed: %s", addr, e)
@@ -1807,7 +1850,7 @@ class DefaultMQProducer:
         header.queue_id = mq.queue_id
         request = RemotingCommand.create_request_command(RequestCode.GET_EARLIEST_MSG_STORETIME, header)
         from remoting.protocol.headers import GetEarliestMsgStoretimeResponseHeader
-        response = client._invoke_sync(addr, request, 5000)
+        response = client._invoke_sync(client.vip_addr(addr), request, 5000)
         client._check_response(response)
         resp_header = GetEarliestMsgStoretimeResponseHeader()
         resp_header.from_ext_fields(response.ext_fields)

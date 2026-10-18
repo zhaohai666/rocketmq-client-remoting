@@ -59,6 +59,12 @@ impl ExpressionType {
     pub const TAG: &'static str = "TAG";
     pub const SQL92: &'static str = "SQL92";
     pub const CLASS_FILTER: &'static str = "CLASS_FILTER";
+
+    /// `ExpressionType.isTagType`: null, empty and `TAG` all count as the tag type. Anything
+    /// else (SQL92, class filter) is broker-side filtered and must keep `tagsSet` empty.
+    pub fn is_tag_type(type_: &str) -> bool {
+        type_.is_empty() || type_ == Self::TAG
+    }
 }
 
 // ---------------------------------------------------------------- SubscriptionData
@@ -216,6 +222,34 @@ impl FilterAPI {
         sub.set_tags(tags, codes);
         Ok(sub)
     }
+
+    /// `FilterAPI.build(topic, subString, type)`: the entry a `MessageSelector` goes through.
+    ///
+    /// Exactly `TAG` or an absent type compiles the tag expression into `tagsSet`/`codeSet`; any
+    /// other type (SQL92 in practice) forwards the raw expression and leaves **both collections
+    /// empty**, which is also what switches off the client-side re-filter in
+    /// `PullAPIWrapper#processPullResult` (that one only runs when `tagsSet` is non-empty).
+    /// An empty expression for a non-tag type is rejected.
+    pub fn build(topic: &str, sub_string: &str, expression_type: Option<&str>) -> Result<SubscriptionData> {
+        let type_ = match expression_type {
+            None => return Self::build_subscription_data(topic, Some(sub_string)),
+            Some(t) => t,
+        };
+        if type_ == ExpressionType::TAG {
+            let mut sub = Self::build_subscription_data(topic, Some(sub_string))?;
+            sub.expression_type = type_.to_string();
+            return Ok(sub);
+        }
+        if sub_string.is_empty() {
+            return Err(Error::client(format!("Expression can't be null! {type_}")));
+        }
+        Ok(SubscriptionData {
+            topic: topic.to_string(),
+            sub_string: sub_string.to_string(),
+            expression_type: type_.to_string(),
+            ..SubscriptionData::default()
+        })
+    }
 }
 
 fn normalise_sub_all(mut sub: SubscriptionData) -> SubscriptionData {
@@ -350,9 +384,12 @@ pub struct HeartbeatData {
     pub client_id: String,
     pub producer_data_set: Vec<ProducerData>,
     pub consumer_data_set: Vec<ConsumerData>,
-    /// Read-only: always written as 0 when encoding (see the module header).
-    pub heartbeat_fingerprint: i64,
-    /// Read-only: always written as `false` when encoding.
+    /// Heartbeat V2 fingerprint (`HeartbeatData.heartbeatFingerprint`). The V1 path keeps the
+    /// 0 default, which is what makes the broker take its legacy registration branch; the V2
+    /// path sets it from [`compute_heartbeat_fingerprint`](Self::compute_heartbeat_fingerprint).
+    pub heartbeat_fingerprint: i32,
+    /// Heartbeat V2 "no subscriptions in this body" marker
+    /// (`HeartbeatData.isWithoutSub`). See [`without_sub_copy`](Self::without_sub_copy).
     pub without_sub: bool,
 }
 
@@ -360,6 +397,59 @@ impl Default for HeartbeatData {
     fn default() -> Self {
         HeartbeatData::new("")
     }
+}
+
+/// `HeartbeatV2Result`: what one V2 heartbeat round answers.
+///
+/// A broker that predates heartbeat V2 answers `HEART_BEAT` with plain `SUCCESS` and **no**
+/// extFields, which decodes to `support_v2 = false` / `sub_change = false`: the client then
+/// keeps sending full V1-style bodies (fingerprint 0) to that address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeartbeatV2Result {
+    /// `version`: the broker's protocol version, taken from the response header the same way
+    /// the V1 path takes it (`sendHeartbeat` returns it into `brokerVersionTable`).
+    pub version: i32,
+    /// `isSubChange` (`MixAll.IS_SUB_CHANGE`): the fingerprint the broker holds for one of the
+    /// groups differs from the one just sent, so the client must drop its cached fingerprint and
+    /// send the subscriptions again on the next beat.
+    pub sub_change: bool,
+    /// `isSupportV2` (`MixAll.IS_SUPPORT_HEART_BEAT_V2`): the broker understood the V2 body, so
+    /// later beats to this address may use the subscription-free body.
+    pub support_v2: bool,
+}
+
+impl HeartbeatV2Result {
+    pub fn new(version: i32, sub_change: bool, support_v2: bool) -> HeartbeatV2Result {
+        HeartbeatV2Result {
+            version,
+            sub_change,
+            support_v2,
+        }
+    }
+
+    /// Parses the two boolean extFields of a `HEART_BEAT` response. Absent, empty or non-"true"
+    /// values all read as false, the same lenient `Boolean.parseBoolean` semantics the Java
+    /// client relies on.
+    pub fn from_response(response: &crate::remoting::protocol::remoting_command::RemotingCommand) -> HeartbeatV2Result {
+        HeartbeatV2Result::new(
+            response.version,
+            is_ext_true(response, crate::common::mix_all::MixAll::IS_SUB_CHANGE),
+            is_ext_true(
+                response,
+                crate::common::mix_all::MixAll::IS_SUPPORT_HEART_BEAT_V2,
+            ),
+        )
+    }
+}
+
+fn is_ext_true(
+    response: &crate::remoting::protocol::remoting_command::RemotingCommand,
+    key: &str,
+) -> bool {
+    response
+        .get_ext_field(key)
+        .map(|v| v.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 impl HeartbeatData {
@@ -371,6 +461,43 @@ impl HeartbeatData {
             heartbeat_fingerprint: 0,
             without_sub: false,
         }
+    }
+
+    /// `HeartbeatData#computeHeartbeatFingerprint`: a fingerprint over the **subscription
+    /// content** of this beat, deliberately blind to everything that churns between beats:
+    /// every `subVersion` (a wall-clock timestamp), `clientID`, `withoutSub` and the fingerprint
+    /// field itself. Two beats with the same group/subscription set therefore hash equal, and
+    /// the broker's per-group table can answer "did this client change its subscriptions?".
+    ///
+    /// The value is a Java `String.hashCode` of the canonical JSON, i.e. the same hash family
+    /// `codeSet` uses; it only has to be stable **within this process**, since the broker just
+    /// compares consecutive fingerprints from the same client id.
+    pub fn compute_heartbeat_fingerprint(&self) -> i32 {
+        let mut copy = self.clone();
+        for consumer in &mut copy.consumer_data_set {
+            for sub in &mut consumer.subscription_data_set {
+                sub.sub_version = 0;
+            }
+        }
+        copy.without_sub = false;
+        copy.heartbeat_fingerprint = 0;
+        copy.client_id = String::new();
+        crate::common::util_all::java_string_hash(&RemotingSerializable::to_json_string(
+            &copy.to_json_value(),
+        ))
+    }
+
+    /// `prepareHeartbeatData(true)` equivalent: the same registration without the subscription
+    /// sets, flagged `withoutSub`, carrying the fingerprint computed from the **full** body.
+    /// The broker keeps the subscriptions it already holds for this channel as long as the
+    /// fingerprint matches, which is what makes the cheap beat cheap.
+    pub fn without_sub_copy(&self) -> HeartbeatData {
+        let mut copy = self.clone();
+        for consumer in &mut copy.consumer_data_set {
+            consumer.subscription_data_set.clear();
+        }
+        copy.without_sub = true;
+        copy
     }
 
     /// Set semantics: duplicate groups / duplicate consumers are folded.
@@ -398,7 +525,7 @@ impl HeartbeatData {
                         .collect(),
                 ),
             ),
-            ("heartbeatFingerprint", Value::from(0_i64)),
+            ("heartbeatFingerprint", Value::from(i64::from(self.heartbeat_fingerprint))),
             (
                 "producerDataSet",
                 Value::Array(
@@ -408,7 +535,7 @@ impl HeartbeatData {
                         .collect(),
                 ),
             ),
-            ("withoutSub", Value::from(false)),
+            ("withoutSub", Value::from(self.without_sub)),
         ])
     }
 
@@ -427,7 +554,7 @@ impl HeartbeatData {
             client_id: jstring_or(value, "clientID", ""),
             producer_data_set,
             consumer_data_set,
-            heartbeat_fingerprint: jlong(value, "heartbeatFingerprint", 0),
+            heartbeat_fingerprint: jlong(value, "heartbeatFingerprint", 0) as i32,
             without_sub,
         })
     }
@@ -569,10 +696,148 @@ mod tests {
         let hb = HeartbeatData::decode(text.as_bytes()).unwrap();
         assert!(hb.without_sub);
         assert_eq!(hb.heartbeat_fingerprint, 7);
-        // Encoding goes back to the fixed V1-path values.
+        // Encoding now writes what the object holds: the V2 fields survive a round trip, so a
+        // fingerprint the V2 path set is actually put on the wire.
         let back = RemotingSerializable::to_json_string(&hb.to_json_value());
-        assert!(back.contains(r#""heartbeatFingerprint":0"#));
-        assert!(back.contains(r#""withoutSub":false"#));
+        assert!(back.contains(r#""heartbeatFingerprint":7"#));
+        assert!(back.contains(r#""withoutSub":true"#));
+        assert_eq!(HeartbeatData::decode(back.as_bytes()).unwrap(), hb);
+    }
+
+    /// The fingerprint must ignore everything that churns between two beats of the same
+    /// subscription set: `subVersion` (wall clock), `clientID`, `withoutSub` and the field itself.
+    #[test]
+    fn heartbeat_fingerprint_ignores_sub_version_client_id_and_its_own_fields() {
+        let mut base = HeartbeatData::new("10.0.0.1@1");
+        let mut cd = ConsumerData::new("cg", ConsumeType::CONSUME_PASSIVELY, MessageModel::CLUSTERING, ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET);
+        cd.add_subscription_data(SubscriptionData {
+            sub_version: 1,
+            ..SubscriptionData::new("TopicA", "TagA")
+        });
+        base.add_consumer_data(cd);
+        base.add_producer_data(ProducerData::new("pg"));
+
+        let first = base.compute_heartbeat_fingerprint();
+        assert_ne!(first, 0, "a real subscription set must not hash to the V1 marker");
+
+        // Same subscriptions, different subVersion / clientId / fingerprint / withoutSub.
+        let mut moved = base.clone();
+        moved.client_id = "10.0.0.9@999".to_string();
+        moved.heartbeat_fingerprint = first;
+        moved.without_sub = true;
+        moved.consumer_data_set[0].subscription_data_set[0].sub_version = 9_999_999;
+        assert_eq!(moved.compute_heartbeat_fingerprint(), first);
+
+        // A different subscription expression is a different fingerprint.
+        let mut changed = base.clone();
+        changed.consumer_data_set[0].subscription_data_set[0].sub_string = "TagB".to_string();
+        assert_ne!(changed.compute_heartbeat_fingerprint(), first);
+
+        // An extra producer group is visible too (the broker re-registers producers on every beat).
+        let mut extra = base.clone();
+        extra.add_producer_data(ProducerData::new("pg2"));
+        assert_ne!(extra.compute_heartbeat_fingerprint(), first);
+
+        // Stable across calls on the same value (no clock, no randomness).
+        assert_eq!(base.compute_heartbeat_fingerprint(), first);
+    }
+
+    #[test]
+    fn without_sub_copy_keeps_registration_and_marks_the_body() {
+        let mut hb = HeartbeatData::new("cid");
+        let mut cd = ConsumerData::new("cg", ConsumeType::CONSUME_PASSIVELY, MessageModel::CLUSTERING, ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET);
+        cd.add_subscription_data(SubscriptionData::new("TopicA", "*"));
+        cd.add_subscription_data(SubscriptionData::new("TopicB", "TagB"));
+        hb.add_consumer_data(cd);
+        hb.add_producer_data(ProducerData::new("pg"));
+
+        let fp = hb.compute_heartbeat_fingerprint();
+        let light = {
+            let mut light = hb.without_sub_copy();
+            light.heartbeat_fingerprint = fp;
+            light
+        };
+        assert!(light.without_sub);
+        assert_eq!(light.heartbeat_fingerprint, fp);
+        assert!(light.consumer_data_set[0].subscription_data_set.is_empty());
+        assert_eq!(light.client_id, "cid");
+        assert_eq!(light.producer_data_set.len(), 1);
+        // The heavy body is untouched.
+        assert_eq!(hb.consumer_data_set[0].subscription_data_set.len(), 2);
+        assert!(!hb.without_sub);
+        // The light body keeps the fingerprint of the heavy one: that is the whole point of the
+        // cheap beat, the broker matches it against its per-group table.
+        assert_eq!(light.compute_heartbeat_fingerprint(), hb.compute_heartbeat_fingerprint());
+    }
+
+    #[test]
+    fn heartbeat_v2_result_reads_ext_fields_leniently() {
+        use crate::remoting::protocol::remoting_command::RemotingCommand;
+        let mut response = RemotingCommand::create_response(0, None);
+        response.version = 403;
+        assert_eq!(
+            HeartbeatV2Result::from_response(&response),
+            HeartbeatV2Result::new(403, false, false),
+            "a pre-V2 broker answers SUCCESS with no extFields at all"
+        );
+
+        response.ext_fields_mut().insert(
+            crate::common::mix_all::MixAll::IS_SUPPORT_HEART_BEAT_V2,
+            "true",
+        );
+        response.ext_fields_mut().insert(
+            crate::common::mix_all::MixAll::IS_SUB_CHANGE,
+            "TRUE",
+        );
+        assert_eq!(
+            HeartbeatV2Result::from_response(&response),
+            HeartbeatV2Result::new(403, true, true)
+        );
+
+        response.ext_fields_mut().insert(
+            crate::common::mix_all::MixAll::IS_SUB_CHANGE,
+            "",
+        );
+        assert!(
+            !HeartbeatV2Result::from_response(&response).sub_change,
+            "empty is not true"
+        );
+    }
+
+    #[test]
+    fn filter_api_build_routes_by_expression_type() {
+        // TAG: compiled into tagsSet/codeSet like buildSubscriptionData.
+        let tag = FilterAPI::build("T", "TagA||TagB", Some(ExpressionType::TAG)).unwrap();
+        assert_eq!(tag.tags_set, vec!["TagA".to_string(), "TagB".to_string()]);
+        assert_eq!(tag.expression_type, ExpressionType::TAG);
+
+        // SQL92: raw expression, both collections stay empty (this is what turns the
+        // client-side tag re-filter off).
+        let sql = FilterAPI::build("T", "a > 10", Some(ExpressionType::SQL92)).unwrap();
+        assert_eq!(sql.sub_string, "a > 10");
+        assert_eq!(sql.expression_type, ExpressionType::SQL92);
+        assert!(sql.tags_set.is_empty() && sql.code_set.is_empty());
+        assert!(!sql.class_filter_mode);
+
+        // No type at all: same as the two-argument form.
+        let none = FilterAPI::build("T", "TagA", None).unwrap();
+        assert_eq!(none.tags_set, vec!["TagA".to_string()]);
+        assert_eq!(none.expression_type, ExpressionType::TAG);
+
+        // An empty expression for a non-tag type is rejected (Java throws IllegalArgumentException).
+        let err = FilterAPI::build("T", "", Some(ExpressionType::SQL92)).unwrap_err();
+        assert!(
+            matches!(&err, crate::error::Error::Client { message, .. } if message == "Expression can't be null! SQL92"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn expression_type_is_tag_type_matches_java() {
+        assert!(ExpressionType::is_tag_type(""));
+        assert!(ExpressionType::is_tag_type(ExpressionType::TAG));
+        assert!(!ExpressionType::is_tag_type(ExpressionType::SQL92));
+        assert!(!ExpressionType::is_tag_type(ExpressionType::CLASS_FILTER));
     }
 
     #[test]

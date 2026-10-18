@@ -637,3 +637,123 @@ func DecodeQueryConsumeQueueResponseBody(data []byte) (*QueryConsumeQueueRespons
 	}
 	return b, nil
 }
+
+// ---------------- QueryConsumeTimeSpan ----------------
+
+// QueueTimeSpan is one entry of QueryConsumeTimeSpanBody.consumeTimeSpanSet, the
+// QUERY_CONSUME_TIME_SPAN(303) per-queue consumption window.
+//
+// The three `*TimeStampStr` accessors the reference model exposes are derived
+// renderings of the numeric fields (the reference formats them with
+// `UtilAll.formatDate`, `yyyy-MM-dd HH:mm:ss.SSS`), not wire fields: a broker
+// never sends them. They are therefore not modelled here; format the numeric
+// fields at the call site if a report needs them.
+//
+// DelayTime is a broker-computed field, NOT a difference of the two timestamps
+// beside it: the reference fills it with `now - storeTime(next unconsumed
+// message)` for a queue the group has not drained, and leaves it 0 once the
+// group is up to date. Deriving a lag from max/consume would answer a different
+// question, so no accessor does so here.
+type QueueTimeSpan struct {
+	MessageQueue     common.MessageQueue
+	MinTimeStamp     int64
+	MaxTimeStamp     int64
+	ConsumeTimeStamp int64
+	DelayTime        int64
+}
+
+func (q *QueueTimeSpan) ToJSONValue() map[string]any {
+	return map[string]any{
+		"messageQueue": map[string]any{
+			"topic":      q.MessageQueue.Topic,
+			"brokerName": q.MessageQueue.BrokerName,
+			"queueId":    q.MessageQueue.QueueID,
+		},
+		"minTimeStamp":     q.MinTimeStamp,
+		"maxTimeStamp":     q.MaxTimeStamp,
+		"consumeTimeStamp": q.ConsumeTimeStamp,
+		"delayTime":        q.DelayTime,
+	}
+}
+
+func (q *QueueTimeSpan) FromJSONValue(value any) error {
+	obj, ok := value.(map[string]any)
+	if !ok {
+		return decodeErrf("QueueTimeSpan: expected object")
+	}
+	if mq, ok := obj["messageQueue"].(map[string]any); ok {
+		q.MessageQueue = common.NewMessageQueue(
+			jsonStringOr(mq, "topic", ""),
+			jsonStringOr(mq, "brokerName", ""),
+			jsonI32(mq, "queueId", 0))
+	}
+	q.MinTimeStamp = jsonI64(obj, "minTimeStamp", 0)
+	q.MaxTimeStamp = jsonI64(obj, "maxTimeStamp", 0)
+	q.ConsumeTimeStamp = jsonI64(obj, "consumeTimeStamp", 0)
+	q.DelayTime = jsonI64(obj, "delayTime", 0)
+	return nil
+}
+
+func (q *QueueTimeSpan) Encode() []byte { return EncodeJSON(q.ToJSONValue()) }
+
+func (q *QueueTimeSpan) String() string {
+	return fmt.Sprintf("QueueTimeSpan [messageQueue=%v, minTimeStamp=%d, maxTimeStamp=%d, "+
+		"consumeTimeStamp=%d, delayTime=%d]", q.MessageQueue, q.MinTimeStamp, q.MaxTimeStamp,
+		q.ConsumeTimeStamp, q.DelayTime)
+}
+
+// ------------------------------------------------------------------
+
+// QueryConsumeTimeSpanBody is the QUERY_CONSUME_TIME_SPAN(303) response body:
+// the per-queue windows one broker reports for a consumer group.
+type QueryConsumeTimeSpanBody struct {
+	ConsumeTimeSpanSet []*QueueTimeSpan
+}
+
+func NewQueryConsumeTimeSpanBody() *QueryConsumeTimeSpanBody {
+	return &QueryConsumeTimeSpanBody{ConsumeTimeSpanSet: []*QueueTimeSpan{}}
+}
+
+func (b *QueryConsumeTimeSpanBody) ToJSONValue() map[string]any {
+	set := make([]any, 0, len(b.ConsumeTimeSpanSet))
+	for _, span := range b.ConsumeTimeSpanSet {
+		set = append(set, span.ToJSONValue())
+	}
+	return map[string]any{"consumeTimeSpanSet": set}
+}
+
+func (b *QueryConsumeTimeSpanBody) FromJSONValue(value any) error {
+	obj, ok := value.(map[string]any)
+	if !ok {
+		return decodeErrf("QueryConsumeTimeSpanBody: expected object")
+	}
+	b.ConsumeTimeSpanSet = nil
+	for _, item := range jsonArray(obj, "consumeTimeSpanSet") {
+		span := &QueueTimeSpan{}
+		if err := span.FromJSONValue(item); err != nil {
+			return err
+		}
+		b.ConsumeTimeSpanSet = append(b.ConsumeTimeSpanSet, span)
+	}
+	return nil
+}
+
+func (b *QueryConsumeTimeSpanBody) Encode() []byte { return EncodeJSON(b.ToJSONValue()) }
+
+// DecodeQueryConsumeTimeSpanBody parses a QUERY_CONSUME_TIME_SPAN(303) body. An
+// empty body is the empty set, not an error: a broker that owns no queue of the
+// topic answers with no window at all.
+func DecodeQueryConsumeTimeSpanBody(data []byte) (*QueryConsumeTimeSpanBody, error) {
+	b := NewQueryConsumeTimeSpanBody()
+	if len(data) == 0 {
+		return b, nil
+	}
+	value, err := DecodeJSON(data)
+	if err != nil {
+		return nil, err
+	}
+	if err := b.FromJSONValue(value); err != nil {
+		return nil, err
+	}
+	return b, nil
+}

@@ -1223,3 +1223,50 @@ func (a *DefaultMQAdminExt) CloneGroupOffset(brokerAddr, srcGroup, destGroup, to
 	), nil, 0)
 	return err
 }
+
+// ---------------- consume time span ----------------
+
+// QueryConsumeTimeSpanFromBroker sends QUERY_CONSUME_TIME_SPAN(303) to one
+// broker and returns that broker's consumeTimeSpanSet.
+//
+// The header carries exactly `topic` + `group`. The body is a
+// QueryConsumeTimeSpanBody — a JSON object holding the window per queue the
+// broker owns for the topic; an empty body is a legitimate answer (a broker
+// that owns no queue of the topic has no window to report) and yields no
+// entries rather than an error.
+func (a *DefaultMQAdminExt) QueryConsumeTimeSpanFromBroker(brokerAddr, topic, group string) ([]*remoting.QueueTimeSpan, error) {
+	response, err := a.invokeBroker(brokerAddr, remoting.ReqQueryConsumeTimeSpan,
+		adminExt("topic", topic, "group", group), nil, 0)
+	if err != nil {
+		return nil, err
+	}
+	body, err := remoting.DecodeQueryConsumeTimeSpanBody(response.Body)
+	if err != nil {
+		return nil, err
+	}
+	return body.ConsumeTimeSpanSet, nil
+}
+
+// QueryConsumeTimeSpan walks the topic route and concatenates every master's
+// consume window for the group, in route order. A broker group without a
+// master address is skipped, and the first broker error aborts the walk (the
+// reference lets the exception propagate rather than returning a partial set).
+func (a *DefaultMQAdminExt) QueryConsumeTimeSpan(topic, group string) ([]*remoting.QueueTimeSpan, error) {
+	route, err := a.ExamineTopicRoute(topic)
+	if err != nil {
+		return nil, err
+	}
+	var spans []*remoting.QueueTimeSpan
+	for _, bd := range route.BrokerDatas {
+		addr, ok := bd.SelectBrokerAddr()
+		if !ok {
+			continue
+		}
+		part, err := a.QueryConsumeTimeSpanFromBroker(addr, topic, group)
+		if err != nil {
+			return nil, err
+		}
+		spans = append(spans, part...)
+	}
+	return spans, nil
+}

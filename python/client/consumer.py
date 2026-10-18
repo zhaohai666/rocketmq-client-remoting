@@ -881,6 +881,14 @@ class DefaultMQPushConsumer:
         # otherwise rebalance's GET_CONSUMER_LIST_BY_GROUP has no return.
         self.heartbeat_enabled = True
         self.heartbeat_interval_millis = 30000
+        # ---- ClientConfig knobs: heartbeat V2 and the VIP channel (both default false, as in Java) ----
+        # ``use_heartbeat_v2`` = ``com.rocketmq.heartbeat.v2``: on switches this consumer's HEART_BEAT(34)
+        # rounds to the fingerprint-gated path (client/heartbeat_v2.py); off keeps heartbeatFingerprint=0,
+        # i.e. the broker's V1 registration path.
+        # ``vip_channel_enabled`` = ``com.rocketmq.sendMessageWithVIPChannel``: on makes the offset /
+        # lock / consumer-list / send-re-back RPCs target the broker's VIP port (listen port - 2).
+        self.use_heartbeat_v2 = False
+        self.vip_channel_enabled = False
         # Route refresh interval (pollNameServerInterval defaults to 30000ms).
         # Only passed through once when start() builds the MQClientInstance; later changes take no effect
         # (the background scheduling is arranged with the interval at startup).
@@ -958,6 +966,27 @@ class DefaultMQPushConsumer:
 
     def get_namespace_v2(self) -> Optional[str]:
         return self.namespace_v2
+
+    def set_vip_channel_enabled(self, enable: bool) -> None:
+        """Java's ``ClientConfig.setVipChannelEnabled``: the RPCs the reference wraps with
+        ``MixAll.brokerVIPChannel`` (offsets, queue locks, the group consumer list, message
+        re-send-back, earliest-msg-store-time and every send -- reply messages included) target
+        the broker's VIP port (listen port - 2) instead of the plain one. Off by default.
+
+        The rewrite itself lives on ``MQClientInstance`` (like Java's MQClientAPIImpl), so an
+        already-started facade updates the shared instance too.
+        """
+        self.vip_channel_enabled = bool(enable)
+        if self._mq_client is not None:
+            self._mq_client.vip_channel_enabled = bool(enable)
+
+    def is_vip_channel_enabled(self) -> bool:
+        return self.vip_channel_enabled
+
+    def set_use_heartbeat_v2(self, enable: bool) -> None:
+        """Opt into the fingerprint-gated heartbeat V2 path (Java's
+        ``ClientConfig.setUseHeartbeatV2``); off by default, exactly like the reference."""
+        self.use_heartbeat_v2 = bool(enable)
 
     def set_socks_proxy_config(self, socks_proxy_config: Optional[SocksProxyConfig]) -> None:
         pass
@@ -1433,7 +1462,8 @@ class DefaultMQPushConsumer:
                     enable_stream_request_type=self.enable_stream_request_type,
                     unit_name=self.unit_name,
                     namespace_v2=self.namespace_v2,
-                    poll_name_server_interval=self.poll_name_server_interval)
+                    poll_name_server_interval=self.poll_name_server_interval,
+                    vip_channel_enabled=self.vip_channel_enabled)
 
             self._mq_client, created = MQClientManager.get_instance() \
                 .get_or_create_mq_client_instance(self.client_id, _create_instance)
@@ -1693,7 +1723,15 @@ class DefaultMQPushConsumer:
         ok = 0
         for addr in client.get_all_broker_addrs():
             try:
-                client.send_heartbeat(addr, hb, 5000)
+                # With use_heartbeat_v2 on the body carries a non-zero heartbeatFingerprint and the
+                # round goes through the V2 state machine (client/heartbeat_v2.py): once a broker
+                # answers IS_SUPPORT_HEART_BEAT_V2 and still holds our fingerprint, later rounds send
+                # the cheap withoutSub body. A broker that never answers those extFields keeps getting
+                # the full subscription set, so the plain HEART_BEAT(34) path stays intact.
+                if self.use_heartbeat_v2:
+                    client.send_heartbeat_to_broker_v2(addr, hb, self.consumer_group, 5000)
+                else:
+                    client.send_heartbeat(addr, hb, 5000)
                 ok += 1
             except Exception as e:  # noqa: BLE001
                 logger.debug("heartbeat to %s failed: %s", addr, e)
@@ -1932,6 +1970,13 @@ class DefaultMQPushConsumer:
         if now != was:
             logger.info("rebalance result changed, group=%s clientId=%s assigned=%d",
                         self.consumer_group, self.client_id, len(assigned))
+            # Java: RebalancePushImpl#messageQueueChanged calls
+            # sendHeartbeatToAllBrokerWithLockV2(true), i.e. it drops the remembered fingerprints
+            # (resetBrokerAddrHeartbeatFingerprintMap) so the next heartbeat round re-delivers the
+            # subscriptions to every broker instead of the cheap withoutSub body. Only the push
+            # rebalance does this -- RebalanceLitePullImpl#messageQueueChanged does not.
+            if self.use_heartbeat_v2:
+                client.reset_heartbeat_v2_fingerprint_table(self.consumer_group)
         # Newly assigned queues resolve their initial offset **immediately** (clear the dirty offset -> compute the start per consume_from_where -> write into the offset table).
         # It cannot be left to lazy resolution at first pull: CONSUME_FROM_LAST_OFFSET's semantics are "the latest offset at the allocation moment",
         # and lazy resolution would skip all messages produced between "after allocation" and "before first pull" (on live systems this presents as the consumer never receiving anything).
@@ -3554,7 +3599,8 @@ class DefaultMQPushConsumer:
         header.unit_mode = self.unit_mode
         header.max_reconsume_times = max_reconsume
         request = RemotingCommand.create_request_command(RequestCode.CONSUMER_SEND_MSG_BACK, header)
-        response = client._invoke_sync(addr, request, 5000)
+        # Java: MQClientAPIImpl#consumerSendMessageBack wraps the (master) address with the VIP channel.
+        response = client._invoke_sync(client.vip_addr(addr), request, 5000)
         client._check_response(response)
 
 
@@ -3619,6 +3665,10 @@ class DefaultMQPullConsumer:
         # (the heartbeat loop lives inside the consumer) and sends its own ConsumerData carrying CONSUME_ACTIVELY.
         self.heartbeat_enabled = True
         self.heartbeat_interval_millis = 30000
+        # ClientConfig knobs, both default false exactly like Java (see the push consumer's block
+        # for what they do; the pull consumer's heartbeat body is CONSUME_ACTIVELY).
+        self.use_heartbeat_v2 = False
+        self.vip_channel_enabled = False
         self._heartbeat_count = 0
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._heartbeat_stop = threading.Event()
@@ -3690,6 +3740,27 @@ class DefaultMQPullConsumer:
 
     def get_namespace_v2(self) -> Optional[str]:
         return self.namespace_v2
+
+    def set_vip_channel_enabled(self, enable: bool) -> None:
+        """Java's ``ClientConfig.setVipChannelEnabled``: the RPCs the reference wraps with
+        ``MixAll.brokerVIPChannel`` (offsets, queue locks, the group consumer list, message
+        re-send-back, earliest-msg-store-time and every send -- reply messages included) target
+        the broker's VIP port (listen port - 2) instead of the plain one. Off by default.
+
+        The rewrite itself lives on ``MQClientInstance`` (like Java's MQClientAPIImpl), so an
+        already-started facade updates the shared instance too.
+        """
+        self.vip_channel_enabled = bool(enable)
+        if self._mq_client is not None:
+            self._mq_client.vip_channel_enabled = bool(enable)
+
+    def is_vip_channel_enabled(self) -> bool:
+        return self.vip_channel_enabled
+
+    def set_use_heartbeat_v2(self, enable: bool) -> None:
+        """Opt into the fingerprint-gated heartbeat V2 path (Java's
+        ``ClientConfig.setUseHeartbeatV2``); off by default, exactly like the reference."""
+        self.use_heartbeat_v2 = bool(enable)
 
     def set_socks_proxy_config(self, socks_proxy_config: Optional[SocksProxyConfig]) -> None:
         pass
@@ -3767,7 +3838,15 @@ class DefaultMQPullConsumer:
         ok = 0
         for addr in client.get_all_broker_addrs():
             try:
-                client.send_heartbeat(addr, hb, 5000)
+                # With use_heartbeat_v2 on the body carries a non-zero heartbeatFingerprint and the
+                # round goes through the V2 state machine (client/heartbeat_v2.py): once a broker
+                # answers IS_SUPPORT_HEART_BEAT_V2 and still holds our fingerprint, later rounds send
+                # the cheap withoutSub body. A broker that never answers those extFields keeps getting
+                # the full subscription set, so the plain HEART_BEAT(34) path stays intact.
+                if self.use_heartbeat_v2:
+                    client.send_heartbeat_to_broker_v2(addr, hb, self.consumer_group, 5000)
+                else:
+                    client.send_heartbeat(addr, hb, 5000)
                 ok += 1
             except Exception as e:  # noqa: BLE001
                 logger.debug("heartbeat to %s failed: %s", addr, e)
@@ -3824,7 +3903,8 @@ class DefaultMQPullConsumer:
                                     enable_stream_request_type=self.enable_stream_request_type,
                                     unit_name=self.unit_name,
                                     namespace_v2=self.namespace_v2,
-                                    poll_name_server_interval=self.poll_name_server_interval)
+                                    poll_name_server_interval=self.poll_name_server_interval,
+                                    vip_channel_enabled=self.vip_channel_enabled)
         self._mq_client, created = MQClientManager.get_instance() \
             .get_or_create_mq_client_instance(self.client_id, _create_instance)
         if created and self.rpc_hook is not None:
@@ -4077,7 +4157,7 @@ class DefaultMQPullConsumer:
         header.topic = mq.topic
         header.queue_id = mq.queue_id
         request = RemotingCommand.create_request_command(RequestCode.GET_EARLIEST_MSG_STORETIME, header)
-        response = client._invoke_sync(addr, request, 5000)
+        response = client._invoke_sync(client.vip_addr(addr), request, 5000)
         client._check_response(response)
         resp_header = GetEarliestMsgStoretimeResponseHeader()
         resp_header.from_ext_fields(response.ext_fields)
@@ -4114,7 +4194,8 @@ class DefaultMQPullConsumer:
         # retryMaxTimes judgment.
         header.max_reconsume_times = None
         request = RemotingCommand.create_request_command(RequestCode.CONSUMER_SEND_MSG_BACK, header)
-        response = client._invoke_sync(addr, request, 5000)
+        # Java: MQClientAPIImpl#consumerSendMessageBack wraps the (master) address with the VIP channel.
+        response = client._invoke_sync(client.vip_addr(addr), request, 5000)
         client._check_response(response)
 
     def create_topic(self, key: str, new_topic: str, queue_num: int = 4,
@@ -4201,6 +4282,12 @@ class DefaultLitePullConsumer:
         self.pull_thread_nums = 1
         # The period of the background comparison of the queue sets of topics registered with register_topic_message_queue_change_listener, default 30s.
         self.topic_metadata_check_interval_millis = 30 * 1000
+        # ---- ClientConfig knobs (both default false, exactly like Java) ----
+        # ``use_heartbeat_v2`` puts this consumer's HEART_BEAT(34) rounds on the fingerprint-gated
+        # path (client/heartbeat_v2.py); ``vip_channel_enabled`` sends the send/reply RPCs and the
+        # offset / lock RPCs to the broker's VIP port (listen port - 2).
+        self.use_heartbeat_v2 = False
+        self.vip_channel_enabled = False
 
         # Runtime state
         self._mq_client: Optional[MQClientInstance] = None
@@ -4277,6 +4364,27 @@ class DefaultLitePullConsumer:
 
     def get_namespace_v2(self) -> Optional[str]:
         return self.namespace_v2
+
+    def set_vip_channel_enabled(self, enable: bool) -> None:
+        """Java's ``ClientConfig.setVipChannelEnabled``: the RPCs the reference wraps with
+        ``MixAll.brokerVIPChannel`` (offsets, queue locks, the group consumer list, message
+        re-send-back, earliest-msg-store-time and every send -- reply messages included) target
+        the broker's VIP port (listen port - 2) instead of the plain one. Off by default.
+
+        The rewrite itself lives on ``MQClientInstance`` (like Java's MQClientAPIImpl), so an
+        already-started facade updates the shared instance too.
+        """
+        self.vip_channel_enabled = bool(enable)
+        if self._mq_client is not None:
+            self._mq_client.vip_channel_enabled = bool(enable)
+
+    def is_vip_channel_enabled(self) -> bool:
+        return self.vip_channel_enabled
+
+    def set_use_heartbeat_v2(self, enable: bool) -> None:
+        """Opt into the fingerprint-gated heartbeat V2 path (Java's
+        ``ClientConfig.setUseHeartbeatV2``); off by default, exactly like the reference."""
+        self.use_heartbeat_v2 = bool(enable)
 
     def set_socks_proxy_config(self, socks_proxy_config: Optional[SocksProxyConfig]) -> None:
         pass
@@ -4392,7 +4500,8 @@ class DefaultLitePullConsumer:
                                 enable_stream_request_type=self.enable_stream_request_type,
                                 unit_name=self.unit_name,
                                 namespace_v2=self.namespace_v2,
-                                poll_name_server_interval=self.poll_name_server_interval)
+                                poll_name_server_interval=self.poll_name_server_interval,
+                                vip_channel_enabled=self.vip_channel_enabled)
 
     def start(self) -> None:
         if self._started:
@@ -4531,7 +4640,13 @@ class DefaultLitePullConsumer:
         # -- slaves are skipped only when consumerEmpty; pull mode carries a subscription set, so slaves must be registered too.
         for addr in self._mq_client.get_all_broker_addrs():
             try:
-                self._mq_client.send_heartbeat(addr, hb, 5000)
+                # Heartbeat V2 for the lite pull consumer: same state machine as the push/pull
+                # consumers (see client/heartbeat_v2.py), keyed by this consumer group.
+                if self.use_heartbeat_v2:
+                    self._mq_client.send_heartbeat_to_broker_v2(
+                        addr, hb, self.consumer_group, 5000)
+                else:
+                    self._mq_client.send_heartbeat(addr, hb, 5000)
                 ok += 1
             except Exception as e:  # noqa: BLE001
                 logger.debug("lite heartbeat to %s failed: %s", addr, e)

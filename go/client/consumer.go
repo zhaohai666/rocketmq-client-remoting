@@ -116,9 +116,12 @@ type DefaultMQPushConsumer struct {
 	unitName      string
 	unitMode      bool
 	streamRequest bool
-	tlsEnable     *bool
-	socksProxy    *remoting.SocksProxyConfig
-	rpcHook       remoting.RPCHook
+	// useHeartbeatV2 is ClientConfig.useHeartbeatV2, the
+	// `com.rocketmq.heartbeat.v2` switch (off unless turned on).
+	useHeartbeatV2 bool
+	tlsEnable      *bool
+	socksProxy     *remoting.SocksProxyConfig
+	rpcHook        remoting.RPCHook
 
 	messageModel     string
 	consumeFromWhere string
@@ -365,6 +368,18 @@ func (c *DefaultMQPushConsumer) SetEnableStreamRequestType(enable bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.streamRequest = enable
+}
+
+// SetUseHeartbeatV2 mirrors ClientConfig#setUseHeartbeatV2 (the
+// `com.rocketmq.heartbeat.v2` switch, off by default on both sides). When
+// enabled, the instance's heartbeat carries a subscription fingerprint and stops
+// re-sending unchanged subscriptions to brokers that answer
+// IS_SUPPORT_HEART_BEAT_V2; see Instance.SendHeartbeatToAllBrokerV2. Call it
+// before Start: the flag is read when the shared instance is created.
+func (c *DefaultMQPushConsumer) SetUseHeartbeatV2(enable bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.useHeartbeatV2 = enable
 }
 
 // SetRpcHook installs the user's RPC hook (typically an ACL hook built with
@@ -1134,6 +1149,7 @@ func (c *DefaultMQPushConsumer) Start() error {
 	c.clientID = common.BuildMQClientID(common.CachedIPStr(), c.instanceName, c.unitName, c.streamRequest)
 	cfg := NewClientInstanceConfig()
 	cfg.SocksProxy = c.socksProxy
+	cfg.UseHeartbeatV2 = c.useHeartbeatV2
 	instance := CreateOrGetInstance(c.clientID, c.nameServerAddrs, cfg)
 	c.instance = instance
 	namespaceV2 := c.namespaceV2
@@ -1443,8 +1459,26 @@ func (c *DefaultMQPushConsumer) sendHeartbeatNow() error {
 	if instance == nil {
 		return common.ClientError("consumer not started")
 	}
-	instance.SendHeartbeatToAllBroker(5000)
+	instance.SendHeartbeatToAllBrokerWithLockV2(false, 5000)
 	return nil
+}
+
+// beatAfterRebalance is the assignment-changed beat: with heartbeat V2 enabled
+// it drops every cached fingerprint (the broker must be handed the
+// subscriptions again for the queues this client just picked up) and sends one
+// immediate beat; with V2 off — the default — it is a no-op, keeping the
+// instance's 30s cadence the only beat on the plain path.
+func (c *DefaultMQPushConsumer) beatAfterRebalance(changed bool) {
+	if !changed {
+		return
+	}
+	c.mu.Lock()
+	instance := c.instance
+	c.mu.Unlock()
+	if instance == nil || !instance.Config().UseHeartbeatV2 {
+		return
+	}
+	instance.SendHeartbeatToAllBrokerWithLockV2(true, 5000)
 }
 
 // consumeTimestampMillis reads the configured value and parses it.
@@ -1869,6 +1903,7 @@ func (c *DefaultMQPushConsumer) syncPullLoops() {
 	}
 
 	c.mu.Lock()
+	added := 0
 	for mq := range current {
 		if _, ok := c.processQueueTable[mq]; ok {
 			continue
@@ -1887,12 +1922,19 @@ func (c *DefaultMQPushConsumer) syncPullLoops() {
 		stop := make(chan struct{})
 		c.queueStop[mq] = stop
 		go c.queuePullLoop(mq, stop)
+		added++
 	}
 	c.mu.Unlock()
 
 	if len(revoked) > 0 {
 		common.LogInfof("queues revoked, group=%s count=%d", c.consumerGroup, len(revoked))
 	}
+	// The reference re-beats right here (RebalancePushImpl.messageQueueChanged
+	// calls sendHeartbeatToAllBrokerWithLockV2(true)), because the assignment —
+	// and with V2 the fingerprint cache that suppresses subscriptions — just
+	// moved. This port only spends that extra beat when V2 is actually on, so
+	// the default heartbeat cadence stays exactly the 30s task's.
+	c.beatAfterRebalance(added+len(revoked) > 0)
 	c.notifyQueueChanged()
 }
 

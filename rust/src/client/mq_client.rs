@@ -398,6 +398,16 @@ pub struct MQClientInstanceConfig {
     pub unit_name: Option<String>,
     pub namespace_v2: Option<String>,
     pub enable_stream_request_type: bool,
+    /// `ClientConfig.vipChannelEnabled` (default false; the producer facade calls it
+    /// `sendMessageWithVIPChannel`). When on, every broker-facing RPC of this instance is sent
+    /// to `port - 2` of the route address (`MixAll.brokerVIPChannel`), the dedicated fast port a
+    /// broker opens besides its main listening port. Name-server requests never shift.
+    pub vip_channel_enabled: bool,
+    /// `ClientConfig.useHeartbeatV2` (default false; the
+    /// `com.rocketmq.heartbeat.v2` switch). When on, heartbeat rounds take the fingerprint path:
+    /// `HEART_BEAT(34)` with a non-zero `heartbeatFingerprint`, and -- once the broker says
+    /// `IS_SUPPORT_HEART_BEAT_V2` and the fingerprint is unchanged -- a `withoutSub` body.
+    pub use_heartbeat_v2: bool,
 }
 
 impl Default for MQClientInstanceConfig {
@@ -423,6 +433,8 @@ impl Default for MQClientInstanceConfig {
             unit_name: None,
             namespace_v2: None,
             enable_stream_request_type: false,
+            vip_channel_enabled: false,
+            use_heartbeat_v2: false,
         }
     }
 }
@@ -489,6 +501,8 @@ impl std::fmt::Debug for MQClientInstanceConfig {
                 "enable_stream_request_type",
                 &self.enable_stream_request_type,
             )
+            .field("vip_channel_enabled", &self.vip_channel_enabled)
+            .field("use_heartbeat_v2", &self.use_heartbeat_v2)
             .finish()
     }
 }
@@ -530,6 +544,19 @@ struct Inner {
     stop: watch::Sender<bool>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     consumer_ids_changed_count: AtomicUsize,
+    /// Live copy of `MQClientInstanceConfig::vip_channel_enabled`: unlike the other config fields
+    /// this one is readable *and* writable after `start()` (a facade's
+    /// `set_send_message_with_vip_channel` flips it), because the address rewrite happens per
+    /// request.
+    vip_channel_enabled: AtomicBool,
+    /// `MQClientInstance.brokerSupportV2HeartbeatSet`: addresses that answered
+    /// `IS_SUPPORT_HEART_BEAT_V2` at least once. An address outside the set is beaten with the
+    /// full body and fingerprint 0 semantics do not apply to it.
+    broker_support_v2_heartbeat_set: Mutex<HashSet<String>>,
+    /// `MQClientInstance.brokerAddrHeartbeatFingerprintTable`: the fingerprint the last accepted
+    /// full-body beat left at each V2-capable address. While a row matches the current
+    /// subscriptions, beats to that address may drop the subscription set.
+    broker_addr_heartbeat_fingerprint_table: Mutex<HashMap<String, i32>>,
 }
 
 fn parse_reset_offset_table(data: &[u8]) -> Result<Vec<(MessageQueue, i64)>> {
@@ -593,6 +620,7 @@ impl MQClientInstance {
             socks_proxy: config.socks_proxy.clone(),
             ..RemotingClientConfig::default()
         };
+        let vip_channel_enabled = config.vip_channel_enabled;
         let inner = Arc::new(Inner {
             client_id: client_id.to_string(),
             name_server_addrs: Mutex::new(name_server_addrs),
@@ -621,6 +649,9 @@ impl MQClientInstance {
             stop: watch::channel(false).0,
             tasks: Mutex::new(Vec::new()),
             consumer_ids_changed_count: AtomicUsize::new(0),
+            vip_channel_enabled: AtomicBool::new(vip_channel_enabled),
+            broker_support_v2_heartbeat_set: Mutex::new(HashSet::new()),
+            broker_addr_heartbeat_fingerprint_table: Mutex::new(HashMap::new()),
         });
         let this = MQClientInstance {
             inner: inner.clone(),
@@ -1292,6 +1323,21 @@ impl MQClientInstance {
             .await
     }
 
+    /// Broker-facing sync call that follows Java's `MQClientAPIImpl` methods with
+    /// `MixAll.brokerVIPChannel(clientConfig.isVipChannelEnabled(), addr)` in front of the
+    /// `invokeSync`: same address rewrite as [`send_message_to_addr`], applied per request.
+    ///
+    /// [`send_message_to_addr`]: Self::send_message_to_addr
+    pub(crate) async fn invoke_broker_sync(
+        &self,
+        addr: &str,
+        request: &mut RemotingCommand,
+        timeout_millis: i64,
+    ) -> Result<RemotingCommand> {
+        self.invoke_sync(&self.vip_addr(addr), request, timeout_millis)
+            .await
+    }
+
     /// Response check: any non-SUCCESS raises `MQBrokerException`; an empty
     /// remark becomes `""`.
     pub(crate) fn check_response(response: &RemotingCommand) -> Result<&RemotingCommand> {
@@ -1498,6 +1544,40 @@ impl MQClientInstance {
             .and_then(|bd| bd.select_broker_addr())
     }
 
+    // ---------------- VIP channel ----------------
+
+    /// `ClientConfig.setVipChannelEnabled`: flip the address rewrite for this live instance.
+    /// Every broker-facing RPC of this instance that the Java client rewrites through
+    /// `MixAll.brokerVIPChannel` follows the switch immediately, including requests already
+    /// queued on an existing connection (the address is resolved per request).
+    pub fn set_vip_channel_enabled(&self, enable: bool) {
+        self.inner
+            .vip_channel_enabled
+            .store(enable, Ordering::Release);
+    }
+
+    pub fn is_vip_channel_enabled(&self) -> bool {
+        self.inner.vip_channel_enabled.load(Ordering::Acquire)
+    }
+
+    /// `MixAll.brokerVIPChannel(clientConfig.isVipChannelEnabled(), addr)`: `ip:port` becomes
+    /// `ip:(port - 2)` (10911 -> 10909). Off (the default) the address is returned untouched,
+    /// and a name-server address must never be passed through here.
+    fn vip_addr(&self, addr: &str) -> String {
+        if !self.is_vip_channel_enabled() {
+            return addr.to_string();
+        }
+        MixAll::broker_vip_channel(true, addr)
+    }
+
+    /// The address this instance's live VIP decision would send a publish request to, or `None`
+    /// when the route holds no master for that broker name. The rewrite itself happens inside
+    /// the send RPCs, so this only exists for callers that must log or compare the address.
+    pub(crate) fn vip_addr_of_publish(&self, broker_name: &str) -> Option<String> {
+        self.find_broker_address_in_publish(broker_name)
+            .map(|addr| self.vip_addr(&addr))
+    }
+
     // ---------------- message sending ----------------
 
     /// Resolve the broker address from the route, then send synchronously.
@@ -1555,7 +1635,9 @@ impl MQClientInstance {
             create_topic_key,
             default_topic_queue_nums,
         );
-        let response = self.invoke_sync(addr, &mut request, timeout_millis).await?;
+        let response = self
+            .invoke_sync(&self.vip_addr(addr), &mut request, timeout_millis)
+            .await?;
         Self::parse_send_response(&response, msg.as_message(), mq)
     }
 
@@ -1585,10 +1667,8 @@ impl MQClientInstance {
             default_topic_queue_nums,
         );
         request.mark_oneway_rpc();
-        self.inner
-            .remoting_client
-            .invoke_oneway(addr, &mut request)
-            .await
+        let addr = self.vip_addr(addr);
+        self.inner.remoting_client.invoke_oneway(&addr, &mut request).await
     }
 
     /// `on_complete` fires exactly once (guaranteed by the remoting layer). `msg` is only read by
@@ -1603,8 +1683,9 @@ impl MQClientInstance {
         timeout_millis: i64,
         on_complete: Box<dyn FnOnce(Result<SendResult>) + Send + 'static>,
     ) {
+        let addr = self.vip_addr(addr);
         self.inner.remoting_client.invoke_async(
-            addr,
+            &addr,
             request,
             Box::new(move |response| match response {
                 Ok(response) => on_complete(Self::parse_send_response(&response, &msg, &mq)),
@@ -2433,6 +2514,12 @@ impl MQClientInstance {
             .insert(topic.to_string(), endpoints);
     }
 
+    /// Address used by the offset-family RPCs (`QUERY_CONSUMER_OFFSET` / `UPDATE_CONSUMER_OFFSET`
+    /// / `GET_MAX_OFFSET` / `GET_MIN_OFFSET` / `SEARCH_OFFSET_BY_TIMESTAMP` /
+    /// `GET_EARLIEST_MSG_STORETIME`).
+    ///
+    /// Returns the **plain** route address: the VIP rewrite happens at invoke time inside those
+    /// RPCs (Java does it in `MQClientAPIImpl`, so a caller-supplied address is rewritten too).
     async fn publish_addr_in_admin(&self, mq: &MessageQueue) -> Result<String> {
         let mut addr = self.find_broker_address_in_publish(&mq.broker_name);
         if addr.is_none() {
@@ -2492,6 +2579,7 @@ impl MQClientInstance {
 
     /// Differs from [`Self::publish_addr_in_admin`] only in the last step: admin offset queries
     /// always hit the master and fail if it is gone; consumer offset reads may fall back to a slave.
+    /// Like it, this returns the plain route address; the VIP rewrite happens at invoke time.
     async fn consumer_offset_addr(&self, mq: &MessageQueue) -> Result<String> {
         let mut addr = self.find_broker_address_in_publish(&mq.broker_name);
         if addr.is_none() {
@@ -2529,7 +2617,7 @@ impl MQClientInstance {
             Some(Box::new(header)),
         );
         let response = self
-            .invoke_sync(&addr, &mut request, timeout_millis)
+            .invoke_broker_sync(&addr, &mut request, timeout_millis)
             .await?;
         if response.code == response_code::QUERY_NOT_FOUND {
             return Ok(None);
@@ -2564,7 +2652,7 @@ impl MQClientInstance {
             Some(Box::new(header)),
         );
         let response = self
-            .invoke_sync(&addr, &mut request, timeout_millis)
+            .invoke_broker_sync(&addr, &mut request, timeout_millis)
             .await?;
         Self::check_response(&response)?;
         Ok(())
@@ -2589,7 +2677,7 @@ impl MQClientInstance {
             Some(Box::new(header)),
         );
         let response = self
-            .invoke_sync(&addr, &mut request, timeout_millis)
+            .invoke_broker_sync(&addr, &mut request, timeout_millis)
             .await?;
         Self::check_response(&response)?;
         let mut resp_header = GetMaxOffsetResponseHeader::default();
@@ -2616,7 +2704,7 @@ impl MQClientInstance {
             Some(Box::new(header)),
         );
         let response = self
-            .invoke_sync(&addr, &mut request, timeout_millis)
+            .invoke_broker_sync(&addr, &mut request, timeout_millis)
             .await?;
         Self::check_response(&response)?;
         let mut resp_header = GetMinOffsetResponseHeader::default();
@@ -2667,7 +2755,7 @@ impl MQClientInstance {
             Some(Box::new(header)),
         );
         let response = self
-            .invoke_sync(&addr, &mut request, timeout_millis)
+            .invoke_broker_sync(&addr, &mut request, timeout_millis)
             .await?;
         Self::check_response(&response)?;
         let mut resp_header = SearchOffsetResponseHeader::default();
@@ -2694,7 +2782,7 @@ impl MQClientInstance {
             Some(Box::new(header)),
         );
         let response = self
-            .invoke_sync(&addr, &mut request, timeout_millis)
+            .invoke_broker_sync(&addr, &mut request, timeout_millis)
             .await?;
         Self::check_response(&response)?;
         let mut resp_header = GetEarliestMsgStoretimeResponseHeader::default();
@@ -2729,7 +2817,7 @@ impl MQClientInstance {
             request_code::CONSUMER_SEND_MSG_BACK,
             Some(Box::new(header)),
         );
-        let response = self.invoke_sync(addr, &mut request, timeout_millis).await?;
+        let response = self.invoke_broker_sync(addr, &mut request, timeout_millis).await?;
         Self::check_response(&response)?;
         Ok(())
     }
@@ -2774,7 +2862,7 @@ impl MQClientInstance {
             request.add_ext_field(MixAll::UNIQUE_MSG_QUERY_FLAG, "true");
         }
         let response = self
-            .invoke_sync(&addr, &mut request, timeout_millis)
+            .invoke_broker_sync(&addr, &mut request, timeout_millis)
             .await?;
         if response.code == response_code::QUERY_NOT_FOUND {
             return Ok(None);
@@ -2890,7 +2978,7 @@ impl MQClientInstance {
             );
             request.set_body(Some(body.encode()));
             let result = self
-                .invoke_sync(&addr, &mut request, timeout_millis)
+                .invoke_broker_sync(&addr, &mut request, timeout_millis)
                 .await
                 .and_then(|response| {
                     Self::check_response(&response)?;
@@ -2933,7 +3021,7 @@ impl MQClientInstance {
             );
             request.set_body(Some(body.encode()));
             let result = self
-                .invoke_sync(&addr, &mut request, timeout_millis)
+                .invoke_broker_sync(&addr, &mut request, timeout_millis)
                 .await
                 .and_then(|response| Self::check_response(&response).map(|_| ()));
             if let Err(e) = result {
@@ -3159,7 +3247,7 @@ impl MQClientInstance {
             )
             .encode(),
         ));
-        let response = self.invoke_sync(addr, &mut request, timeout_millis).await?;
+        let response = self.invoke_broker_sync(addr, &mut request, timeout_millis).await?;
         if response.code != response_code::SUCCESS {
             return Err(Error::Broker {
                 response_code: response.code,
@@ -3376,7 +3464,7 @@ impl MQClientInstance {
                 Some(Box::new(header.clone())),
             );
             match self
-                .invoke_sync(broker_addr, &mut request, timeout_millis)
+                .invoke_broker_sync(broker_addr, &mut request, timeout_millis)
                 .await
             {
                 Ok(response) => {
@@ -3472,7 +3560,7 @@ impl MQClientInstance {
             RemotingCommand::create_request_command(request_code::DELETE_TOPIC_IN_BROKER, None);
         request.add_ext_field("topic", topic);
         let response = self
-            .invoke_sync(broker_addr, &mut request, timeout_millis)
+            .invoke_broker_sync(broker_addr, &mut request, timeout_millis)
             .await?;
         Self::check_response(&response)?;
         Ok(())
@@ -3543,7 +3631,7 @@ impl MQClientInstance {
             request_code::GET_CONSUMER_LIST_BY_GROUP,
             Some(Box::new(header)),
         );
-        let response = match self.invoke_sync(&addr, &mut request, timeout_millis).await {
+        let response = match self.invoke_broker_sync(&addr, &mut request, timeout_millis).await {
             Ok(response) => response,
             Err(e) => {
                 rmq_debug!("get_consumer_id_list_by_group failed, {addr} {consumer_group}: {e}");

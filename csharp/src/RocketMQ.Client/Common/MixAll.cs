@@ -69,6 +69,13 @@ public static class MixAll
     public const int CharacterMaxLength = 255;
 
     public const int MasterId = 0;
+
+    // Heartbeat V2: the two flags a V2-capable broker stamps on its HEART_BEAT(34)
+    // response. Both travel as the TEXT "true"/"false", so a response that carries
+    // neither (every pre-V2 broker) reads as "not V2-capable" -- see
+    // MQClientAPIImpl#sendHeartbeatV2.
+    public const string IsSupportHeartbeatV2 = "IS_SUPPORT_HEART_BEAT_V2";
+    public const string IsSubChange = "IS_SUB_CHANGE";
     public const int ReadPermByDefault = 4 | 2; // PERM_READ | PERM_WRITE
 
     private static readonly string[] PredefineGroups =

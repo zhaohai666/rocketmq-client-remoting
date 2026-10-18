@@ -19,9 +19,14 @@
 //     fingerprint, and subscription reporting can be skipped via withoutSub);
 //   - fingerprint == 0 -> takes the V1 path, registering the consumer with the full
 //     subscriptionDataSet.
-// So **keeping the default 0** is the safest choice: no need to implement the fingerprint
-// algorithm of computeHeartbeatFingerprint() that depends on fastjson2 field order, and the
-// broker still registers correctly.
+// A V1 beat therefore keeps the field at 0 (the client's default). Heartbeat V2 is opt-in
+// per client (ClientConfig#useHeartbeatV2, on this port MQClientInstance#UseHeartbeatV2):
+// when it is on, the fingerprint of the subscription snapshot is computed by
+// HeartbeatData#ComputeHeartbeatFingerprint and stamped on both the subscription-carrying
+// body and its withoutSub twin, and the broker's IS_SUPPORT_HEART_BEAT_V2 / IS_SUB_CHANGE
+// reply tells the client whether it may stop re-reporting subscriptions to that address.
+using System;
+using System.Collections.Generic;
 using RocketMQ.Common;
 
 namespace RocketMQ.Remoting.Protocol;
@@ -311,6 +316,109 @@ public sealed class HeartbeatData
         return hb;
     }
 
+    /// <summary>
+    /// The same body with every subscription set emptied and withoutSub flagged, so a V2
+    /// broker can skip registration work it already did (the reference's
+    /// prepareHeartbeatData(true)). Nothing shared with the caller is mutated: the
+    /// ProducerData / ConsumerData entries are fresh values that keep the group identity
+    /// (groupName, consumeType, messageModel, consumeFromWhere, unitMode) and only lose the
+    /// subscriptions.
+    /// </summary>
+    public HeartbeatData CloneWithoutSubscriptions()
+    {
+        var copy = new HeartbeatData(ClientId)
+        {
+            HeartbeatFingerprint = HeartbeatFingerprint,
+            WithoutSub = true,
+        };
+
+        foreach (ProducerData p in ProducerDataSet)
+        {
+            copy.AddProducerData(new ProducerData(p.GroupName));
+        }
+
+        foreach (ConsumerData c in ConsumerDataSet)
+        {
+            copy.AddConsumerData(new ConsumerData(c.GroupName, c.ConsumeType, c.MessageModel,
+                c.ConsumeFromWhere)
+            {
+                UnitMode = c.UnitMode,
+            });
+        }
+
+        return copy;
+    }
+
+    /// <summary>
+    /// Fingerprint of this body's subscription snapshot: the Java String.hashCode of a
+    /// NORMALISED rendering, i.e. the fields that change per beat or per client stripped out
+    /// (every subscription's subVersion, clientID, withoutSub, heartbeatFingerprint) and
+    /// every set put into a defined order.
+    ///
+    /// subVersion normalisation is the load-bearing part: it is stamped with the registration
+    /// time, so a rendering that kept it would report a subscription change on every single
+    /// beat and the broker-side skip would never trigger. Ordering matters here even more than
+    /// in the reference: that one relies on a set's iteration order being stable, while this
+    /// port builds its lists from a dictionary walk and from several facades sharing one
+    /// client id, so the sets are sorted explicitly.
+    ///
+    /// The number only has to be stable for THIS client while its subscriptions do not change
+    /// and different as soon as they do -- a broker compares one client's beats to each other,
+    /// never across languages.
+    /// </summary>
+    public int ComputeHeartbeatFingerprint() => LegacyHash.StringHash(NormalisedJson().Dump());
+
+    private JsonValue NormalisedJson()
+    {
+        var consumers = new List<JsonValue>();
+        foreach (ConsumerData c in ConsumerDataSet)
+        {
+            JsonValue cj = c.ToJson();
+            var subs = new List<JsonValue>();
+            foreach (SubscriptionData sd in c.SubscriptionDataSet)
+            {
+                JsonValue sj = sd.ToJson();
+                // Registration timestamp: normalise it out or every beat looks like a change.
+                sj.Set("subVersion", JsonValue.MakeInt(0));
+                subs.Add(sj);
+            }
+
+            cj.Set("subscriptionDataSet", SortedArray(subs));
+            consumers.Add(cj);
+        }
+
+        var producers = new List<JsonValue>();
+        foreach (ProducerData p in ProducerDataSet)
+        {
+            producers.Add(p.ToJson());
+        }
+
+        var o = JsonValue.MakeObject();
+        o.Set("clientID", JsonValue.MakeString(string.Empty));
+        o.Set("consumerDataSet", SortedArray(consumers));
+        o.Set("heartbeatFingerprint", JsonValue.MakeInt(0));
+        o.Set("producerDataSet", SortedArray(producers));
+        o.Set("withoutSub", JsonValue.MakeBool(false));
+        return o;
+    }
+
+    /// <summary>
+    /// An array whose elements are ordered by their own rendered form (code-unit order).
+    /// Sorting the rendering rather than the object makes the result independent of the
+    /// list's insertion order even for entries that agree on every identity field.
+    /// </summary>
+    private static JsonValue SortedArray(List<JsonValue> items)
+    {
+        items.Sort((a, b) => string.CompareOrdinal(a.Dump(), b.Dump()));
+        var arr = JsonValue.MakeArray();
+        foreach (JsonValue v in items)
+        {
+            arr.PushArray(v);
+        }
+
+        return arr;
+    }
+
     public byte[] Encode() => RemotingSerializable.Encode(ToJson());
 
     public static bool Decode(byte[] data, out HeartbeatData @out)
@@ -329,4 +437,62 @@ public sealed class HeartbeatData
         "HeartbeatData [clientID=" + ClientId
         + ", producerDataSet=" + ProducerDataSet.Count.ToString(System.Globalization.CultureInfo.InvariantCulture)
         + ", consumerDataSet=" + ConsumerDataSet.Count.ToString(System.Globalization.CultureInfo.InvariantCulture) + "]";
+}
+
+/// <summary>
+/// What a HEART_BEAT(34) response carries beyond "SUCCESS": the broker's protocol version
+/// plus the two heartbeat-V2 flags. The reference builds the same triple in
+/// <c>MQClientAPIImpl#sendHeartbeatV2</c> from <c>response.getVersion()</c> and the
+/// <c>MixAll.IS_SUPPORT_HEART_BEAT_V2</c> / <c>MixAll.IS_SUB_CHANGE</c> ext fields.
+///
+/// Reading is deliberately fail-open: absent ext fields -- every pre-V2 broker, and every
+/// test stub that does not know about V2 -- mean "this broker does not speak heartbeat V2",
+/// so the client keeps reporting its subscriptions instead of skipping them. The flags are
+/// TEXT booleans ("true"/"false"), so a key that is present but says false must not read as
+/// support.
+/// </summary>
+public sealed class HeartbeatV2Result
+{
+    public static readonly HeartbeatV2Result NoReply = new();
+
+    /// <summary>The broker's protocol version, taken from the response header.</summary>
+    public int Version { get; init; }
+
+    /// <summary>Whether this broker answered IS_SUPPORT_HEART_BEAT_V2=true.</summary>
+    public bool SupportV2 { get; init; }
+
+    /// <summary>Whether this broker answered IS_SUB_CHANGE=true, i.e. the fingerprint it
+    /// holds for the reported consumer groups differs from the one just received.</summary>
+    public bool SubChange { get; init; }
+
+    public static HeartbeatV2Result Of(RemotingCommand? response)
+    {
+        if (response is null)
+        {
+            return new HeartbeatV2Result();
+        }
+
+        return new HeartbeatV2Result
+        {
+            Version = response.Version,
+            SupportV2 = ReadTrue(response, MixAll.IsSupportHeartbeatV2),
+            SubChange = ReadTrue(response, MixAll.IsSubChange),
+        };
+    }
+
+    private static bool ReadTrue(RemotingCommand response, string key)
+    {
+        if (response.ExtFields is null)
+        {
+            return false;
+        }
+
+        return response.ExtFields.TryGetValue(key, out string? value)
+            && string.Equals(value, "true", StringComparison.OrdinalIgnoreCase);
+    }
+
+    public override string ToString() =>
+        "HeartbeatV2Result [version=" + Version.ToString(System.Globalization.CultureInfo.InvariantCulture)
+        + ", supportV2=" + (SupportV2 ? "true" : "false")
+        + ", subChange=" + (SubChange ? "true" : "false") + "]";
 }

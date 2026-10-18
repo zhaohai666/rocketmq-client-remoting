@@ -232,6 +232,38 @@ public sealed class MQClientInstance : IDisposable
 
         _remotingClient.RegisterProcessor(RequestCode.NotifyConsumerIdsChanged,
             ProcessNotifyConsumerIdsChanged);
+
+        // NOTIFY_UNSUBSCRIBE_LITE(200073): registered for exactly one reason -- to keep it off
+        // the transport's "no processor for broker request code" path. The reference registers
+        // it against the shared ClientRemotingProcessor in MQClientAPIImpl, but that
+        // processor's dispatch has NO case for the code: it falls through to the default
+        // branch and answers nothing, and the broker only ever sends it oneway (Broker2Client
+        // #notifyUnsubscribeLite), so nobody waits for a reply. Following the protocol here
+        // means doing nothing -- this port's classic-remoting client keeps no lite-subscription
+        // registry to drop (see the comment on ProcessNotifyUnsubscribeLite).
+        _remotingClient.RegisterProcessor(RequestCode.NotifyUnsubscribeLite,
+            ProcessNotifyUnsubscribeLite);
+    }
+
+    /// <summary>
+    /// The broker's "one of your lite subscriptions is gone" push. Swallowed without a reply,
+    /// the way the reference's client processor swallows it: on the classic-remoting path the
+    /// lite-subscription bookkeeping lives on the broker side, and the subscription sets this
+    /// client actually registers (the ConsumerData of a push / pull / lite-pull consumer) are
+    /// re-reported by every heartbeat anyway, so a dropped lite subscription cannot leave this
+    /// client pulling something it should have forgotten. A sync sender therefore times out
+    /// rather than getting a bogus SUCCESS -- the same answer the reference gives it.
+    /// </summary>
+    public RemotingCommand? ProcessNotifyUnsubscribeLite(RemotingCommand cmd, string addr)
+    {
+        var header = new NotifyUnsubscribeLiteRequestHeader();
+        header.FromExtFields(cmd.ExtFields ?? new PropertyMap());
+        ClientLog.Debug("receive NOTIFY_UNSUBSCRIBE_LITE(200073) from " + addr
+            + ": group=" + (header.ConsumerGroup ?? string.Empty)
+            + ", clientId=" + (header.ClientId ?? string.Empty)
+            + ", liteTopic=" + (header.LiteTopic ?? string.Empty)
+            + "; nothing to do on the classic remoting path");
+        return null;
     }
 
 
@@ -1846,13 +1878,321 @@ public sealed class MQClientInstance : IDisposable
 
     // ---------------- Heartbeat / unregister ----------------
 
-    public void SendHeartbeat(string addr, HeartbeatData heartbeatData, int timeoutMillis = 5000)
+    /// <summary>
+    /// One broker instance as the heartbeat fan-out sees it: which brokerName it belongs
+    /// to, which brokerId it has inside that name (0 = the master, see
+    /// <see cref="MixAll.MasterId"/>) and the address to talk to.
+    /// </summary>
+    public sealed record BrokerAddrEntry(string BrokerName, long BrokerId, string Addr);
+
+    /// <summary>
+    /// Heartbeat V2 switch (<c>ClientConfig#useHeartbeatV2</c>). Off (the default) every beat
+    /// keeps its full subscription set and fingerprint 0, i.e. exactly what a V1 client sends.
+    ///
+    /// Turning it either way restarts the conversation with every broker: the caches below say
+    /// "this address already holds this client's subscriptions", and that statement means
+    /// something different as soon as the mode changes (in V1 the client never reported a
+    /// fingerprint, so a broker that was told nothing must not be trusted to skip).
+    /// </summary>
+    public bool UseHeartbeatV2
+    {
+        get => _useHeartbeatV2;
+        set
+        {
+            if (_useHeartbeatV2 == value)
+            {
+                return;
+            }
+
+            _useHeartbeatV2 = value;
+            ClearHeartbeatV2State();
+        }
+    }
+
+    private volatile bool _useHeartbeatV2;
+
+    private readonly object _heartbeatV2Lock = new();
+
+    /// <summary>Addresses that answered IS_SUPPORT_HEART_BEAT_V2=true (brokerSupportV2HeartbeatSet).</summary>
+    private readonly HashSet<string> _brokerSupportV2HeartbeatSet = new(StringComparer.Ordinal);
+
+    /// <summary>Last fingerprint accepted per address (brokerAddrHeartbeatFingerprintTable).</summary>
+    private readonly Dictionary<string, int> _brokerAddrHeartbeatFingerprintTable =
+        new(StringComparer.Ordinal);
+
+    /// <summary>Broker protocol version per brokerName/addr, taken off every heartbeat reply
+    /// (the reference's brokerVersionTable).</summary>
+    private readonly Dictionary<string, Dictionary<string, int>> _brokerVersionTable =
+        new(StringComparer.Ordinal);
+
+    /// <summary>Whether this address has ever declared heartbeat V2 support.</summary>
+    public bool IsBrokerSupportV2Heartbeat(string addr)
+    {
+        lock (_heartbeatV2Lock)
+        {
+            return _brokerSupportV2HeartbeatSet.Contains(addr);
+        }
+    }
+
+    /// <summary>The fingerprint this address last accepted, or null when none is cached.</summary>
+    public int? BrokerHeartbeatFingerprint(string addr)
+    {
+        lock (_heartbeatV2Lock)
+        {
+            return _brokerAddrHeartbeatFingerprintTable.TryGetValue(addr, out int fp) ? fp : null;
+        }
+    }
+
+    /// <summary>The broker version recorded from the last heartbeat reply of this
+    /// brokerName/addr pair (null when this instance never beat it successfully).</summary>
+    public int? BrokerVersionOf(string brokerName, string addr)
+    {
+        lock (_heartbeatV2Lock)
+        {
+            return _brokerVersionTable.TryGetValue(brokerName, out Dictionary<string, int>? one)
+                && one.TryGetValue(addr, out int version)
+                ? version
+                : null;
+        }
+    }
+
+    /// <summary>
+    /// Clears the per-address fingerprint table (resetBrokerAddrHeartbeatFingerprintMap). The
+    /// reference does this when a beat is triggered by a rebalance: the assignment moved, so
+    /// the client must re-report its subscriptions rather than ask every broker to skip them.
+    /// </summary>
+    public void ResetBrokerAddrHeartbeatFingerprintTable()
+    {
+        lock (_heartbeatV2Lock)
+        {
+            _brokerAddrHeartbeatFingerprintTable.Clear();
+        }
+    }
+
+    /// <summary>Clears both V2 caches: the conversation with every broker starts over.</summary>
+    public void ClearHeartbeatV2State()
+    {
+        lock (_heartbeatV2Lock)
+        {
+            _brokerSupportV2HeartbeatSet.Clear();
+            _brokerAddrHeartbeatFingerprintTable.Clear();
+        }
+    }
+
+    /// <summary>
+    /// Sends one heartbeat to one broker address (HEART_BEAT(34); there is no separate request
+    /// code for V2) and returns what the reply said.
+    ///
+    /// V1 (the default): the body goes out exactly as built -- subscriptions included,
+    /// fingerprint 0 -- and the V2 flags are not even read, which is what keeps a V1 beat
+    /// indistinguishable from a beat sent to a broker that never heard of V2.
+    ///
+    /// V2: the fingerprint of this snapshot is stamped on the body and on its withoutSub twin,
+    /// then the short body goes out only when THIS address is known V2-capable AND the
+    /// fingerprint it last accepted is the current one; otherwise the subscriptions travel
+    /// again. A reply reporting subChange drops the cached fingerprint so the next beat
+    /// re-reports.
+    /// </summary>
+    public HeartbeatV2Result SendHeartbeat(string addr, HeartbeatData heartbeatData,
+        int timeoutMillis = 5000)
+    {
+        if (!UseHeartbeatV2)
+        {
+            return HeartbeatV2Result.Of(InvokeHeartbeat(addr, heartbeatData, timeoutMillis));
+        }
+
+        int fingerprint = heartbeatData.ComputeHeartbeatFingerprint();
+        heartbeatData.HeartbeatFingerprint = fingerprint;
+        HeartbeatData withoutSub = heartbeatData.CloneWithoutSubscriptions();
+
+        bool skipSub;
+        lock (_heartbeatV2Lock)
+        {
+            skipSub = _brokerSupportV2HeartbeatSet.Contains(addr)
+                && _brokerAddrHeartbeatFingerprintTable.TryGetValue(addr, out int cached)
+                && cached == fingerprint;
+        }
+
+        HeartbeatV2Result result =
+            HeartbeatV2Result.Of(InvokeHeartbeat(addr, skipSub ? withoutSub : heartbeatData, timeoutMillis));
+
+        lock (_heartbeatV2Lock)
+        {
+            if (skipSub)
+            {
+                // The reference only reacts to subChange here: support is already known.
+                if (result.SubChange)
+                {
+                    _brokerAddrHeartbeatFingerprintTable.Remove(addr);
+                }
+            }
+            else if (result.SupportV2)
+            {
+                _brokerSupportV2HeartbeatSet.Add(addr);
+                if (result.SubChange)
+                {
+                    _brokerAddrHeartbeatFingerprintTable.Remove(addr);
+                }
+                else
+                {
+                    _brokerAddrHeartbeatFingerprintTable[addr] = fingerprint;
+                }
+            }
+        }
+
+        return result;
+    }
+
+    private RemotingCommand InvokeHeartbeat(string addr, HeartbeatData heartbeatData,
+        int timeoutMillis)
     {
         RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.HeartBeat, null);
         request.Body = heartbeatData.Encode();
         request.HasBody = true;
         RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
         CheckResponseCode(response);
+        return response;
+    }
+
+    /// <summary>
+    /// The broker instances the heartbeat fan-out walks. Built from the cached topic routes,
+    /// which is the same source the reference's brokerAddrTable is filled from. With
+    /// <paramref name="includeSlaves" /> false, one entry per brokerName (the master, falling
+    /// back to whichever replica the route advertises) -- the address set the producer side
+    /// uses everywhere else on this port.
+    /// </summary>
+    public List<BrokerAddrEntry> GetBrokerAddrEntries(bool includeSlaves = true)
+    {
+        var entries = new List<BrokerAddrEntry>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        lock (_routeLock)
+        {
+            foreach (KeyValuePair<string, TopicRouteData> kv in _topicRouteTable)
+            {
+                foreach (BrokerData bd in kv.Value.BrokerDatas)
+                {
+                    if (includeSlaves)
+                    {
+                        foreach (KeyValuePair<long, string> one in bd.BrokerAddrs)
+                        {
+                            AddEntry(entries, seen, bd.BrokerName, one.Key, one.Value);
+                        }
+
+                        continue;
+                    }
+
+                    string masterFirst = bd.SelectBrokerAddr();
+                    if (masterFirst.Length > 0)
+                    {
+                        long id = MasterIdOf(bd);
+                        AddEntry(entries, seen, bd.BrokerName, id, masterFirst);
+                    }
+                }
+            }
+        }
+
+        return entries;
+    }
+
+    private static void AddEntry(List<BrokerAddrEntry> entries, HashSet<string> seen,
+        string brokerName, long brokerId, string addr)
+    {
+        if (string.IsNullOrEmpty(addr))
+        {
+            return;
+        }
+
+        string key = brokerName + "#" + brokerId.ToString(CultureInfo.InvariantCulture) + "@" + addr;
+        if (seen.Add(key))
+        {
+            entries.Add(new BrokerAddrEntry(brokerName, brokerId, addr));
+        }
+    }
+
+    private static long MasterIdOf(BrokerData bd)
+    {
+        foreach (KeyValuePair<long, string> one in bd.BrokerAddrs)
+        {
+            if (one.Value == bd.SelectBrokerAddr())
+            {
+                return one.Key;
+            }
+        }
+
+        return MixAll.MasterId;
+    }
+
+    /// <summary>
+    /// One heartbeat round over the broker table (the reference's
+    /// sendHeartbeatToAllBroker / sendHeartbeatToAllBrokerV2, with the same two guards):
+    /// <list type="number">
+    /// <item>a client that registers nothing has nothing to report -- no beat at all;</item>
+    /// <item>a producer-only client beats the masters only: a slave holding a producer
+    /// registration can never use it, and Java skips every entry whose brokerId is not
+    /// <c>MixAll.MASTER_ID</c> while the ConsumerData set is empty.</item>
+    /// </list>
+    /// <paramref name="isRebalance" /> is the push consumer's "the allocation moved" signal: it
+    /// drops every cached fingerprint first, so this round re-reports subscriptions to every
+    /// broker instead of sending the short body.
+    /// Returns how many brokers answered.
+    /// </summary>
+    public int SendHeartbeatToAllBrokers(HeartbeatData heartbeatData, bool isRebalance = false,
+        int timeoutMillis = 5000, bool includeSlaves = true)
+    {
+        bool producerEmpty = heartbeatData.ProducerDataSet.Count == 0;
+        bool consumerEmpty = heartbeatData.ConsumerDataSet.Count == 0;
+        if (producerEmpty && consumerEmpty)
+        {
+            ClientLog.Warn("sending heartbeat, but no consumer and no producer. [" + ClientId + "]");
+            return 0;
+        }
+
+        List<BrokerAddrEntry> entries = GetBrokerAddrEntries(includeSlaves);
+        if (entries.Count == 0)
+        {
+            return 0;
+        }
+
+        if (isRebalance)
+        {
+            ResetBrokerAddrHeartbeatFingerprintTable();
+        }
+
+        int ok = 0;
+        foreach (BrokerAddrEntry entry in entries)
+        {
+            if (consumerEmpty && entry.BrokerId != MixAll.MasterId)
+            {
+                continue;
+            }
+
+            try
+            {
+                HeartbeatV2Result result = SendHeartbeat(entry.Addr, heartbeatData, timeoutMillis);
+                RecordBrokerVersion(entry.BrokerName, entry.Addr, result.Version);
+                ok++;
+            }
+            catch (Exception e)
+            {
+                ClientLog.Warn("heartbeat to " + entry.Addr + " failed: " + e.Message);
+            }
+        }
+
+        return ok;
+    }
+
+    private void RecordBrokerVersion(string brokerName, string addr, int version)
+    {
+        lock (_heartbeatV2Lock)
+        {
+            if (!_brokerVersionTable.TryGetValue(brokerName, out Dictionary<string, int>? one))
+            {
+                one = new Dictionary<string, int>(StringComparer.Ordinal);
+                _brokerVersionTable[brokerName] = one;
+            }
+
+            one[addr] = version;
+        }
     }
 
     public void UnregisterClient(string addr, string clientId,

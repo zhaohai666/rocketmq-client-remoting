@@ -1813,6 +1813,54 @@ func (p *DefaultMQProducer) SendOneway(msg *common.Message, mq *common.MessageQu
 	return p.sendOnewayTo(msg, selected, sysFlag)
 }
 
+// SendOnewayBySelector is the SELECT/ONEWAY path: the caller's
+// MessageQueueSelector picks the queue and the message goes out as a oneway
+// send, with no response and no retry.
+//
+// The budget rule of the reference selector path still applies: the route
+// lookup and the selector itself are measured against the producer's send
+// timeout, and a selector that panics becomes "select message queue threw
+// exception." instead of escaping through the send.
+func (p *DefaultMQProducer) SendOnewayBySelector(msg *common.Message, selector MessageQueueSelector, arg any) error {
+	return p.SendOnewayBySelectorWithTimeout(msg, selector, arg, p.sendMsgTimeout)
+}
+
+// SendOnewayBySelectorWithTimeout is SendOnewayBySelector with an explicit
+// send budget. The budget only gates the route lookup plus the selection (a
+// oneway send has no response to time out on).
+func (p *DefaultMQProducer) SendOnewayBySelectorWithTimeout(msg *common.Message, selector MessageQueueSelector,
+	arg any, timeoutMillis int64) error {
+
+	if msg == nil {
+		return common.ClientError("the message is null")
+	}
+	if selector == nil {
+		return common.ClientError("message queue selector is null")
+	}
+	if _, err := p.requireClient(); err != nil {
+		return err
+	}
+	prevBody := msg.Body
+	defer func() {
+		msg.Body = prevBody
+		msg.Topic = common.WithoutNamespace(msg.Topic, p.namespace)
+	}()
+
+	msg.Topic = p.withNamespace(msg.Topic)
+	// The selector sees the ORIGINAL message (topic / business fields), so the
+	// route lookup and the selection run before compression — exactly as on the
+	// synchronous selector paths.
+	selected, err := p.invokeMessageQueueSelector(msg, selector, arg, timeoutMillis)
+	if err != nil {
+		return err
+	}
+	if err := p.checkMessage(msg); err != nil {
+		return err
+	}
+	sysFlag := p.tryToCompressMessage(msg, false)
+	return p.sendOnewayTo(msg, selected, sysFlag)
+}
+
 // SendBySelector sends via a MessageQueueSelector. This path always hands the
 // chosen queue straight to the send kernel.
 func (p *DefaultMQProducer) SendBySelector(msg *common.Message, selector MessageQueueSelector, arg any) (*SendResult, error) {

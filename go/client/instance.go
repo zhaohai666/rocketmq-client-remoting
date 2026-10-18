@@ -57,6 +57,13 @@ type ClientInstanceConfig struct {
 	// PersistConsumerOffsetIntervalMillis (default 5s).
 	PersistConsumerOffsetIntervalMillis int64
 	SocksProxy                          *remoting.SocksProxyConfig
+	// UseHeartbeatV2 is ClientConfig.useHeartbeatV2 — the
+	// `com.rocketmq.heartbeat.v2` switch. OFF by default, exactly like the
+	// reference: the beat then stays on the plain HEART_BEAT path with
+	// fingerprint 0. When on, an instance that talks to a V2-capable broker
+	// stops re-sending unchanged subscriptions (see
+	// SendHeartbeatToAllBrokerV2).
+	UseHeartbeatV2 bool
 }
 
 // NewClientInstanceConfig returns the classic defaults.
@@ -68,6 +75,7 @@ func NewClientInstanceConfig() ClientInstanceConfig {
 		NamesrvRefreshIntervalMillis:        120_000,
 		HeartbeatIntervalMillis:             30_000,
 		PersistConsumerOffsetIntervalMillis: 5_000,
+		UseHeartbeatV2:                      false,
 	}
 }
 
@@ -177,6 +185,24 @@ type Instance struct {
 
 	consumerIDsChanged atomic.Int64
 
+	// heartbeatMu is the reference's lockHeartbeat: at most one fan-out at a
+	// time, a caller that finds it busy skips its beat instead of queueing.
+	heartbeatMu sync.Mutex
+	// heartbeatStateMu guards the three V2 bookkeeping maps below. They are
+	// written by the heartbeat task and read by tests / diagnostics, never held
+	// across a network call.
+	heartbeatStateMu sync.Mutex
+	// heartbeatFingerprintTable is brokerAddr -> the fingerprint that broker
+	// last acknowledged. An address missing from it gets the full
+	// subscription-carrying body.
+	heartbeatFingerprintTable map[string]int32
+	// heartbeatV2Brokers is the set of addresses that answered
+	// IS_SUPPORT_HEART_BEAT_V2. A broker not in it is treated as V1-only.
+	heartbeatV2Brokers map[string]struct{}
+	// brokerVersionTable is brokerAddr -> the protocol version its last
+	// heartbeat response carried.
+	brokerVersionTable map[string]int32
+
 	// hooksInstalled guards EnsureRPCHooks. The hook chain belongs to the
 	// INSTANCE (it is built once, at transport construction), and
 	// Start() may be called more than once by the same or by a second tenant,
@@ -190,19 +216,22 @@ type Instance struct {
 
 func newInstance(clientID string, nameServerAddrs []string, config ClientInstanceConfig) *Instance {
 	inst := &Instance{
-		clientID:              clientID,
-		config:                config,
-		nameServerAddrs:       append([]string(nil), nameServerAddrs...),
-		topicRouteTable:       map[string]*TopicRouteData{},
-		topicPublishInfoTable: map[string]*TopicPublishInfo{},
-		topicEndPointsTable:   map[string]map[common.MessageQueue]string{},
-		brokerAddrTable:       map[string]map[int64]string{},
-		topicsInUse:           map[string]struct{}{},
-		consumerTable:         map[string]Consumer{},
-		producerTable:         map[string]struct{}{},
-		consumerGroupTable:    map[string]struct{}{},
-		consumerStats:         newConsumerStatsManager(),
-		stop:                  make(chan struct{}),
+		clientID:                  clientID,
+		config:                    config,
+		nameServerAddrs:           append([]string(nil), nameServerAddrs...),
+		topicRouteTable:           map[string]*TopicRouteData{},
+		topicPublishInfoTable:     map[string]*TopicPublishInfo{},
+		topicEndPointsTable:       map[string]map[common.MessageQueue]string{},
+		brokerAddrTable:           map[string]map[int64]string{},
+		topicsInUse:               map[string]struct{}{},
+		consumerTable:             map[string]Consumer{},
+		producerTable:             map[string]struct{}{},
+		consumerGroupTable:        map[string]struct{}{},
+		consumerStats:             newConsumerStatsManager(),
+		heartbeatFingerprintTable: map[string]int32{},
+		heartbeatV2Brokers:        map[string]struct{}{},
+		brokerVersionTable:        map[string]int32{},
+		stop:                      make(chan struct{}),
 	}
 	inst.remoting = remoting.NewRemotingClientWithConfig(remoting.ClientConfig{
 		ConnectTimeoutMillis:     config.ConnectTimeoutMillis,
@@ -711,7 +740,7 @@ func (i *Instance) Start() error {
 	// cleanOfflineBroker is bundled INTO the heartbeat task.
 	i.spawnPeriodic(func() {
 		i.cleanOfflineBroker()
-		i.SendHeartbeatToAllBroker(5000)
+		i.SendHeartbeatToAllBrokerWithLockV2(false, 5000)
 	}, 1_000, i.config.HeartbeatIntervalMillis)
 	i.spawnPeriodic(func() {
 		i.PersistConsumerOffsets()
@@ -1292,6 +1321,11 @@ func (i *Instance) PrepareHeartbeatData() *remoting.HeartbeatData {
 }
 
 // SendHeartbeat sends one heartbeat body to one broker.
+//
+// Every accepted beat also records the broker's protocol version, exactly as the
+// reference does on its plain path: the version table is filled by whichever
+// heartbeat form actually ran, so the V2 switch never decides whether a broker's
+// version becomes known.
 func (i *Instance) SendHeartbeat(addr string, hb *remoting.HeartbeatData, timeoutMillis int64) error {
 	request := remoting.CreateRequestCommand(remoting.ReqHeartBeat, nil)
 	request.SetBody(hb.Encode())
@@ -1299,7 +1333,11 @@ func (i *Instance) SendHeartbeat(addr string, hb *remoting.HeartbeatData, timeou
 	if err != nil {
 		return err
 	}
-	return i.checkResponse(response)
+	if err := i.checkResponse(response); err != nil {
+		return err
+	}
+	i.rememberBrokerVersion(addr, response.Version)
+	return nil
 }
 
 // SendHeartbeatToAllBroker fans the heartbeat out to every known broker
@@ -1322,6 +1360,192 @@ func (i *Instance) SendHeartbeatToAllBroker(timeoutMillis int64) int {
 		ok++
 	}
 	return ok
+}
+
+// PrepareHeartbeatDataWithoutSubscriptions is the V2 sibling body: same
+// consumers, `withoutSub` set and no subscription sets, which is what a V2
+// broker uses to skip re-registering subscriptions it already has.
+func (i *Instance) PrepareHeartbeatDataWithoutSubscriptions() *remoting.HeartbeatData {
+	return i.PrepareHeartbeatData().CloneWithoutSubscriptions()
+}
+
+// SendHeartbeatV2 sends one V2 body (fingerprint filled, optionally without
+// subscriptions) and reads the broker's two gating flags back off the response.
+// The request code is still HEART_BEAT(34): what makes it V2 is the body plus
+// the IS_SUPPORT_HEART_BEAT_V2 / IS_SUB_CHANGE answer.
+func (i *Instance) SendHeartbeatV2(addr string, hb *remoting.HeartbeatData,
+	timeoutMillis int64) (remoting.HeartbeatV2Result, error) {
+
+	request := remoting.CreateRequestCommand(remoting.ReqHeartBeat, nil)
+	request.SetBody(hb.Encode())
+	response, err := i.invokeSync(addr, request, timeoutMillis)
+	if err != nil {
+		return remoting.HeartbeatV2Result{}, err
+	}
+	if err := i.checkResponse(response); err != nil {
+		return remoting.HeartbeatV2Result{}, err
+	}
+	return remoting.DecodeHeartbeatV2Result(response), nil
+}
+
+// SendHeartbeatToAllBrokerV2 is the fingerprint-driven beat. For each address it
+// sends one of two bodies:
+//
+//   - the subscriptions WITHOUT the fingerprint-cached one, when this broker is
+//     known to speak V2 and the fingerprint stored for it equals the current
+//     one: nothing changed, so the subscription sets are dropped;
+//   - the full body otherwise (an unknown broker, a broker that answered
+//     "not supported", or a fingerprint the broker no longer agrees with).
+//
+// Both bodies carry the SAME fingerprint. The bookkeeping after a
+// subscription-carrying answer is the part that keeps the protocol honest: a
+// broker that supports V2 gets its fingerprint stored, unless it answered
+// IS_SUB_CHANGE — that answer means "the group's fingerprint I hold differs",
+// so the stored value is dropped and the next beat carries subscriptions again.
+//
+// isRebalance is the reference hook RebalancePushImpl uses: an assignment change
+// invalidates every cached fingerprint, because the client's view of which
+// subscriptions matter just changed and the broker must be told again.
+//
+// Returns the number of addresses that answered SUCCESS.
+func (i *Instance) SendHeartbeatToAllBrokerV2(isRebalance bool, timeoutMillis int64) int {
+	if len(i.consumerTableSnapshot()) == 0 {
+		return 0
+	}
+	withSub := i.PrepareHeartbeatData()
+	fingerprint := withSub.ComputeHeartbeatFingerprint()
+	if fingerprint == 0 {
+		// A broker dispatches on `fingerprint != 0` to take the V2 branch, so a
+		// hash that lands on 0 would silently downgrade this beat to V1 while
+		// this client still believes it is speaking V2. Rare as it is, the
+		// answer is to send the plain body and keep the caches untouched.
+		common.LogDebugf("heartbeat v2 fingerprint is 0 for [%s], fall back to the plain beat", i.clientID)
+		return i.SendHeartbeatToAllBroker(timeoutMillis)
+	}
+	withSub.HeartbeatFingerprint = int64(fingerprint)
+	withoutSub := withSub.CloneWithoutSubscriptions()
+
+	if isRebalance {
+		i.ResetBrokerHeartbeatFingerprints()
+	}
+
+	ok := 0
+	for _, addr := range i.GetAllBrokerAddrs() {
+		body := withSub
+		if i.brokerSupportsHeartbeatV2(addr) && i.cachedHeartbeatFingerprint(addr) == fingerprint {
+			body = withoutSub
+		}
+		result, err := i.SendHeartbeatV2(addr, body, timeoutMillis)
+		if err != nil {
+			common.LogDebugf("heartbeat v2 to %s failed: %v", addr, err)
+			continue
+		}
+		ok++
+		i.rememberBrokerVersion(addr, result.Version)
+		if !result.SupportV2 {
+			// An old broker: it understood the beat but not the fingerprint, so
+			// the subscriptions must keep travelling on every beat.
+			i.forgetHeartbeatV2Broker(addr)
+			continue
+		}
+		i.markHeartbeatV2Broker(addr)
+		if result.SubChange {
+			i.dropHeartbeatFingerprint(addr)
+			continue
+		}
+		i.storeHeartbeatFingerprint(addr, fingerprint)
+	}
+	return ok
+}
+
+// SendHeartbeatToAllBrokerWithLockV2 is the entry point the periodic task and a
+// rebalance use: one beat at a time, a concurrent caller simply skips (the
+// reference logs "lock heartBeat, but failed" rather than queueing, and a beat
+// that misses one round is retried by the next period).
+func (i *Instance) SendHeartbeatToAllBrokerWithLockV2(isRebalance bool, timeoutMillis int64) int {
+	if !i.heartbeatMu.TryLock() {
+		common.LogDebugf("sendHeartbeatToAllBrokerV2 lock heartBeat, but failed. [%s]", i.clientID)
+		return 0
+	}
+	defer i.heartbeatMu.Unlock()
+	if i.config.UseHeartbeatV2 {
+		return i.SendHeartbeatToAllBrokerV2(isRebalance, timeoutMillis)
+	}
+	return i.SendHeartbeatToAllBroker(timeoutMillis)
+}
+
+// ResetBrokerHeartbeatFingerprints clears the per-address fingerprint cache (the
+// reference's resetBrokerAddrHeartbeatFingerprintMap). Every broker then gets a
+// subscription-carrying beat again.
+func (i *Instance) ResetBrokerHeartbeatFingerprints() {
+	i.heartbeatStateMu.Lock()
+	defer i.heartbeatStateMu.Unlock()
+	for addr := range i.heartbeatFingerprintTable {
+		delete(i.heartbeatFingerprintTable, addr)
+	}
+}
+
+// cachedHeartbeatFingerprint reads the fingerprint stored for one broker
+// address; 0 means "nothing stored" (which is also the V1 fingerprint, so 0 can
+// never be a stored V2 value — see ComputeHeartbeatFingerprint's normalisation).
+func (i *Instance) cachedHeartbeatFingerprint(addr string) int32 {
+	i.heartbeatStateMu.Lock()
+	defer i.heartbeatStateMu.Unlock()
+	return i.heartbeatFingerprintTable[addr]
+}
+
+func (i *Instance) storeHeartbeatFingerprint(addr string, fingerprint int32) {
+	i.heartbeatStateMu.Lock()
+	defer i.heartbeatStateMu.Unlock()
+	i.heartbeatFingerprintTable[addr] = fingerprint
+}
+
+func (i *Instance) dropHeartbeatFingerprint(addr string) {
+	i.heartbeatStateMu.Lock()
+	defer i.heartbeatStateMu.Unlock()
+	delete(i.heartbeatFingerprintTable, addr)
+}
+
+// brokerSupportsHeartbeatV2 reports the addresses this instance has already
+// seen answer IS_SUPPORT_HEART_BEAT_V2.
+func (i *Instance) brokerSupportsHeartbeatV2(addr string) bool {
+	i.heartbeatStateMu.Lock()
+	defer i.heartbeatStateMu.Unlock()
+	_, ok := i.heartbeatV2Brokers[addr]
+	return ok
+}
+
+func (i *Instance) markHeartbeatV2Broker(addr string) {
+	i.heartbeatStateMu.Lock()
+	defer i.heartbeatStateMu.Unlock()
+	i.heartbeatV2Brokers[addr] = struct{}{}
+}
+
+func (i *Instance) forgetHeartbeatV2Broker(addr string) {
+	i.heartbeatStateMu.Lock()
+	defer i.heartbeatStateMu.Unlock()
+	delete(i.heartbeatV2Brokers, addr)
+	delete(i.heartbeatFingerprintTable, addr)
+}
+
+// rememberBrokerVersion records the broker protocol version a heartbeat response
+// carried (the reference's brokerVersionTable).
+func (i *Instance) rememberBrokerVersion(addr string, version int32) {
+	if addr == "" {
+		return
+	}
+	i.heartbeatStateMu.Lock()
+	defer i.heartbeatStateMu.Unlock()
+	i.brokerVersionTable[addr] = version
+}
+
+// BrokerVersion returns the last version one broker address reported through a
+// heartbeat, and whether anything is known about it.
+func (i *Instance) BrokerVersion(addr string) (int32, bool) {
+	i.heartbeatStateMu.Lock()
+	defer i.heartbeatStateMu.Unlock()
+	v, ok := i.brokerVersionTable[addr]
+	return v, ok
 }
 
 func (i *Instance) consumerTableSnapshot() []Consumer {

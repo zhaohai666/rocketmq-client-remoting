@@ -72,7 +72,7 @@ export class EndTransactionContext {
   msgId: string | null;
   transactionId: string | null;
   brokerAddr: string | null;
-  localTransactionState: number | null;
+  transactionState: number | null;
   fromTransactionCheck: boolean;
 
   constructor(producerGroup: string | null = null, message: Message | null = null, brokerAddr: string | null = null) {
@@ -81,7 +81,7 @@ export class EndTransactionContext {
     this.msgId = null;
     this.transactionId = null;
     this.brokerAddr = brokerAddr;
-    this.localTransactionState = null;
+    this.transactionState = null;
     this.fromTransactionCheck = false;
   }
 }

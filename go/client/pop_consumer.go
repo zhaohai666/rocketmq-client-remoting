@@ -537,9 +537,16 @@ func (c *DefaultMQPushConsumer) syncPopLoops() {
 	}
 
 	c.mu.Lock()
+	changed := 0
 	for mq := range c.popQueueTable {
 		if _, ok := current[mq]; !ok {
 			c.retirePopQueueLocked(mq)
+			changed++
+		}
+	}
+	for mq := range current {
+		if _, ok := c.popQueueTable[mq]; !ok {
+			changed++
 		}
 	}
 	c.mu.Unlock()
@@ -555,6 +562,7 @@ func (c *DefaultMQPushConsumer) syncPopLoops() {
 		go c.queuePopLoop(mq, stop)
 	}
 	c.mu.Unlock()
+	c.beatAfterRebalance(changed > 0)
 	c.notifyQueueChanged()
 }
 

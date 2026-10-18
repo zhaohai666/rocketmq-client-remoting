@@ -348,8 +348,12 @@ func (c *ConsumerData) FromJSONValue(value any) error {
 
 // ---------------------------------------------------------------- HeartbeatData
 
-// HeartbeatData is the HEART_BEAT(34) body. heartbeatFingerprint is always 0
-// and withoutSub always false (the fields exist for protocol compatibility).
+// HeartbeatData is the HEART_BEAT(34) body.
+//
+// heartbeatFingerprint / withoutSub are the V2 pair: both stay at their zero
+// value on a V1 beat (a broker that sees fingerprint 0 takes the plain
+// registration path), and are filled by the V2 path — see
+// ComputeHeartbeatFingerprint and CloneWithoutSubscriptions.
 type HeartbeatData struct {
 	ClientID             string
 	ProducerDataSet      []*ProducerData
@@ -456,3 +460,186 @@ func DecodeHeartbeatData(data []byte) (*HeartbeatData, error) {
 	}
 	return hb, nil
 }
+
+// ---------------------------------------------- heartbeat V2 (fingerprint)
+
+// Ext-field names the broker sets on a HEART_BEAT(34) response that understands
+// the V2 body. Both travel as `true` / `false` TEXT, so a reader that defaults
+// to false is correct for a broker that never heard of V2.
+const (
+	// ExtIsSupportHeartBeatV2 is MixAll.IS_SUPPORT_HEART_BEAT_V2.
+	ExtIsSupportHeartBeatV2 = "IS_SUPPORT_HEART_BEAT_V2"
+	// ExtIsSubChange is MixAll.IS_SUB_CHANGE.
+	ExtIsSubChange = "IS_SUB_CHANGE"
+)
+
+// HeartbeatV2Result is what a V2 heartbeat response amounts to: the broker
+// version plus the two flags that drive the client's V2 gating.
+type HeartbeatV2Result struct {
+	// Version is the broker's protocol version, taken off the response header
+	// exactly as the V1 path takes it.
+	Version int32
+	// SubChange tells the broker's view of this group's fingerprint changed, so
+	// the client must drop its cached fingerprint and report subscriptions
+	// again.
+	SubChange bool
+	// SupportV2 tells whether this broker understands the V2 body at all. A
+	// false here means the client must keep sending full V1-style heartbeats to
+	// this address.
+	SupportV2 bool
+}
+
+// DecodeHeartbeatV2Result reads the V2 flags off a heartbeat response. A
+// response without ext fields (an old broker, or a stub) reads as
+// SupportV2=false, which is the safe answer: the caller then keeps sending the
+// subscription-carrying body.
+func DecodeHeartbeatV2Result(response *RemotingCommand) HeartbeatV2Result {
+	if response == nil {
+		return HeartbeatV2Result{}
+	}
+	out := HeartbeatV2Result{Version: response.Version}
+	ext := response.ExtFields()
+	if ext == nil {
+		return out
+	}
+	if v, ok := ext.Get(ExtIsSupportHeartBeatV2); ok {
+		out.SupportV2 = strings.EqualFold(v, "true")
+	}
+	if v, ok := ext.Get(ExtIsSubChange); ok {
+		out.SubChange = strings.EqualFold(v, "true")
+	}
+	return out
+}
+
+// CloneWithoutSubscriptions builds the `withoutSub` sibling body: the same
+// consumers/producers and the same client id, but with every subscription set
+// emptied and `withoutSub` set, which is what lets a V2 broker skip the
+// (unchanged) subscription registration work.
+//
+// Nothing shared with the receiver is mutated: the ConsumerData entries are new
+// values, so the caller can keep using its own body afterwards.
+func (h *HeartbeatData) CloneWithoutSubscriptions() *HeartbeatData {
+	out := NewHeartbeatData(h.ClientID)
+	out.HeartbeatFingerprint = h.HeartbeatFingerprint
+	out.WithoutSub = true
+	for _, c := range h.ConsumerDataSet {
+		clone := *c
+		clone.SubscriptionDataSet = nil
+		out.ConsumerDataSet = append(out.ConsumerDataSet, &clone)
+	}
+	for _, p := range h.ProducerDataSet {
+		clone := *p
+		out.ProducerDataSet = append(out.ProducerDataSet, &clone)
+	}
+	return out
+}
+
+// ComputeHeartbeatFingerprint renders the fingerprint the V2 heartbeat path
+// compares between two heartbeats of the same client.
+//
+// The reference model hashes a JSON rendering of the body with the
+// subscription-version, client-id, without-sub and fingerprint fields themselves
+// stripped — those three change per heartbeat or per client and would make every
+// fingerprint differ. This port applies the same normalisation and additionally
+// puts the sets in a defined order, because a Go map / a repeated registration
+// gives no stable iteration order and a fingerprint that depends on it would
+// report a subscription change on every single beat.
+//
+// Consequences worth knowing:
+//   - the value is STABLE for one client while its subscriptions do not change,
+//     and DIFFERENT as soon as they do (that is all the protocol asks of it: the
+//     broker only ever compares a group's beats, and the client caches the value
+//     per broker address);
+//   - it is therefore not guaranteed to be the same NUMBER another language's
+//     client computes for the same subscriptions. A broker that hosts both
+//     answers IS_SUB_CHANGE on the alternating beat, which costs the redundant
+//     subscription registration and nothing else — behaviour stays correct.
+func (h *HeartbeatData) ComputeHeartbeatFingerprint() int32 {
+	return javaStringHash(h.fingerprintCanonicalText())
+}
+
+// fingerprintCanonicalText is the normalized body used by
+// ComputeHeartbeatFingerprint, exposed for tests and diagnostics.
+func (h *HeartbeatData) fingerprintCanonicalText() string {
+	consumers := make([]*ConsumerData, 0, len(h.ConsumerDataSet))
+	for _, c := range h.ConsumerDataSet {
+		clone := *c
+		subs := make([]*SubscriptionData, 0, len(c.SubscriptionDataSet))
+		for _, s := range c.SubscriptionDataSet {
+			if s == nil {
+				continue
+			}
+			sub := *s
+			// subVersion is a wall-clock stamp: never part of the fingerprint.
+			sub.SubVersion = 0
+			sub.TagsSet = sortedDedupStrings(s.TagsSet)
+			sub.CodeSet = sortedDedupI32(s.CodeSet)
+			subs = append(subs, &sub)
+		}
+		sort.SliceStable(subs, func(i, j int) bool { return subs[i].less(subs[j]) })
+		clone.SubscriptionDataSet = subs
+		consumers = append(consumers, &clone)
+	}
+	sort.SliceStable(consumers, func(i, j int) bool { return consumers[i].less(consumers[j]) })
+
+	producers := make([]*ProducerData, 0, len(h.ProducerDataSet))
+	for _, p := range h.ProducerDataSet {
+		if p == nil {
+			continue
+		}
+		clone := *p
+		producers = append(producers, &clone)
+	}
+	sort.SliceStable(producers, func(i, j int) bool { return producers[i].GroupName < producers[j].GroupName })
+
+	body := &HeartbeatData{
+		// The client id identifies the SENDER, not the subscription set: an
+		// instance restart with a fresh suffix must not look like a change.
+		ClientID:             "",
+		ProducerDataSet:      producers,
+		ConsumerDataSet:      consumers,
+		HeartbeatFingerprint: 0,
+		WithoutSub:           false,
+	}
+	return string(EncodeJSON(body.ToJSONValue()))
+}
+
+func (c *ConsumerData) less(other *ConsumerData) bool {
+	if c.GroupName != other.GroupName {
+		return c.GroupName < other.GroupName
+	}
+	if c.ConsumeType != other.ConsumeType {
+		return c.ConsumeType < other.ConsumeType
+	}
+	if c.MessageModel != other.MessageModel {
+		return c.MessageModel < other.MessageModel
+	}
+	if c.ConsumeFromWhere != other.ConsumeFromWhere {
+		return c.ConsumeFromWhere < other.ConsumeFromWhere
+	}
+	if c.UnitMode != other.UnitMode {
+		return c.UnitMode
+	}
+	return len(c.SubscriptionDataSet) < len(other.SubscriptionDataSet)
+}
+
+func (s *SubscriptionData) less(other *SubscriptionData) bool {
+	if s.Topic != other.Topic {
+		return s.Topic < other.Topic
+	}
+	if s.SubString != other.SubString {
+		return s.SubString < other.SubString
+	}
+	if s.ExpressionType != other.ExpressionType {
+		return s.ExpressionType < other.ExpressionType
+	}
+	return strings.Join(s.TagsSet, "\x00") < strings.Join(other.TagsSet, "\x00")
+}
+
+// javaStringHash is the protocol's 31-based string accumulation
+// (common.StringHash31 — the same helper the tag codeSet and the consistent-hash
+// queue ring use), applied to the canonical fingerprint text. Keeping one
+// implementation is deliberate: the port already fixes the reference side's
+// code-unit-versus-rune question once, and a second copy here would be free to
+// drift from it.
+func javaStringHash(text string) int32 { return common.StringHash31(text) }

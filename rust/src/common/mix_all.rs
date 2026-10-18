@@ -85,6 +85,13 @@ impl MixAll {
     pub const PULL_TIMEOUT_MILLIS_MEDIUM: i64 = 20000;
     pub const PULL_TIMEOUT_MILLIS_LOW: i64 = 10000;
     pub const LOG_STATS_TOPIC: &'static str = "LOG_STATS_TOPIC";
+    /// Heartbeat V2 response extField: the broker understood the V2 body, so later beats to this
+    /// address may drop the subscription set (`MixAll.IS_SUPPORT_HEART_BEAT_V2`).
+    pub const IS_SUPPORT_HEART_BEAT_V2: &'static str = "IS_SUPPORT_HEART_BEAT_V2";
+    /// Heartbeat V2 response extField: the fingerprint the broker holds for one of the groups
+    /// differs from the one just sent, so the cached fingerprint for this address is stale
+    /// (`MixAll.IS_SUB_CHANGE`).
+    pub const IS_SUB_CHANGE: &'static str = "IS_SUB_CHANGE";
 
     pub const W_HELPER: &'static str = "HELPER";
     pub const W_EXPIRY_DATE: &'static str = "EXPIRY_DATE";

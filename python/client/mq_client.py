@@ -50,12 +50,13 @@ from remoting.protocol.headers import (ConsumeMessageDirectlyResultRequestHeader
                                          SearchOffsetResponseHeader, SendMessageRequestHeader,
                                          SendMessageRequestHeaderV2, SendMessageResponseHeader,
                                          UpdateConsumerOffsetRequestHeader)
-from remoting.protocol.heartbeat import HeartbeatData
+from remoting.protocol.heartbeat import HeartbeatData, HeartbeatV2Result
 from remoting.protocol.remoting_command import RemotingCommand
 from remoting.protocol.route import TopicRouteData
 from remoting.rpchook import NamespaceRpcHook, StreamTypeRPCHook
 from .consumer_stats import ConsumerStatsManager
 from .exception import ClientErrorCode, MQBrokerException, MQClientException
+from .heartbeat_v2 import HeartbeatV2Coordinator
 from .mq_client_manager import MQClientManager
 from .request_reply import REQUEST_FUTURE_HOLDER, is_reply_message
 from .send_result import SendResult, SendStatus
@@ -119,12 +120,21 @@ class MQClientInstance:
                  unit_name: Optional[str] = None,
                  namespace_v2: Optional[str] = None,
                  poll_name_server_interval: int = 30000,
-                 socks_proxy_config=None):
+                 socks_proxy_config=None,
+                 vip_channel_enabled: bool = False):
         self.client_id = client_id
         self.name_server_addrs: List[str] = list(name_server_addrs)
         self.poll_name_server_interval = poll_name_server_interval
         self.namespace_v2 = namespace_v2 or ""
         self.socks_proxy_config = socks_proxy_config
+        # ClientConfig.vipChannelEnabled: every broker RPC listed in ``vip_addr`` below goes to
+        # ``MixAll.broker_vip_channel(True, addr)`` (listen port - 2) when this is on.
+        # Default off, same as the reference (`com.rocketmq.sendMessageWithVIPChannel`=false).
+        self.vip_channel_enabled = bool(vip_channel_enabled)
+        # Heartbeat V2 per-stream state (brokerSupportV2HeartbeatSet +
+        # brokerAddrHeartbeatFingerprintTable); the facades decide whether to use it, see
+        # client/heartbeat_v2.py.
+        self._heartbeat_v2 = HeartbeatV2Coordinator(self)
         self.remoting_client = RemotingClient(connect_timeout_millis, invoke_timeout_millis,
                                               tls_enable=tls_enable, tls_options=tls_options,
                                               socks_proxy_config=socks_proxy_config)
@@ -487,6 +497,21 @@ class MQClientInstance:
                      timeout_millis: Optional[int] = None) -> RemotingCommand:
         return self.remoting_client.invoke_sync(addr, request, timeout_millis)
 
+    def vip_addr(self, addr: Optional[str]) -> Optional[str]:
+        """``MixAll.brokerVIPChannel(clientConfig.isVipChannelEnabled(), addr)``.
+
+        Java wraps the broker address on the way out of ``MQClientAPIImpl`` (and of
+        ``DefaultMQProducerImpl#sendKernelImpl``): with the VIP channel enabled, the send/offset/
+        lock/consumer-list family of requests targets **the broker's listen port minus 2**
+        (``10911 -> 10909``), the fast channel the broker opens next to the plain one. The
+        NameServer is never rewritten (there is no VIP channel on 9876), and neither are the
+        requests the reference sends with a plain address: PULL_MESSAGE, POP/ACK/
+        CHANGE_INVISIBLE_TIME, HEART_BEAT, UNREGISTER_CLIENT, END_TRANSACTION, RECALL_MESSAGE.
+        """
+        if addr is None or not self.vip_channel_enabled:
+            return addr
+        return MixAll.broker_vip_channel(True, addr)
+
     def _check_response(self, response: RemotingCommand) -> RemotingCommand:
         if response.code == ResponseCode.SUCCESS:
             return response
@@ -650,7 +675,10 @@ class MQClientInstance:
                              default_topic_queue_nums: Optional[int] = None) -> SendResult:
         request = self._build_send_request(producer_group, msg, mq, timeout_millis, sys_flag,
                                            unit_mode, default_topic, default_topic_queue_nums)
-        response = self._invoke_sync(addr, request, timeout_millis)
+        # The VIP channel wraps every send flavour: SEND_MESSAGE_V2, SEND_BATCH_MESSAGE and
+        # SEND_REPLY_MESSAGE_V2 (the request-reply reply is a send, and in Java the rewrite happens
+        # in sendKernelImpl, i.e. before the request code is even chosen).
+        response = self._invoke_sync(self.vip_addr(addr), request, timeout_millis)
         return self._parse_send_response(response, msg, mq)
 
     def send_message_oneway(self, producer_group: str, msg: Message, mq: MessageQueue,
@@ -661,7 +689,7 @@ class MQClientInstance:
         request = self._build_send_request(producer_group, msg, mq, timeout_millis, sys_flag,
                                            unit_mode, default_topic, default_topic_queue_nums)
         request.mark_oneway_rpc()
-        self.remoting_client.invoke_oneway(addr, request)
+        self.remoting_client.invoke_oneway(self.vip_addr(addr), request)
 
     def build_send_request(self, producer_group: str, msg: Message, mq: MessageQueue,
                            timeout_millis: int = 3000, sys_flag: int = 0,
@@ -687,7 +715,7 @@ class MQClientInstance:
             except Exception as parse_error:  # noqa: BLE001 -- on parse failure, still hand it to the caller
                 on_complete(None, parse_error)
 
-        self.remoting_client.invoke_async(addr, request, _callback, timeout_millis)
+        self.remoting_client.invoke_async(self.vip_addr(addr), request, _callback, timeout_millis)
 
     def _build_send_request(self, producer_group: str, msg: Message, mq: MessageQueue,
                             timeout_millis: int = 3000, sys_flag: int = 0,
@@ -1155,7 +1183,7 @@ class MQClientInstance:
         header.queue_id = mq.queue_id
         header.set_zero_if_not_found = set_zero_if_not_found
         request = RemotingCommand.create_request_command(RequestCode.QUERY_CONSUMER_OFFSET, header)
-        response = self._invoke_sync(addr, request, timeout_millis)
+        response = self._invoke_sync(self.vip_addr(addr), request, timeout_millis)
         if response.code == ResponseCode.QUERY_NOT_FOUND:
             return None
         self._check_response(response)
@@ -1173,7 +1201,7 @@ class MQClientInstance:
         header.queue_id = mq.queue_id
         header.commit_offset = commit_offset
         request = RemotingCommand.create_request_command(RequestCode.UPDATE_CONSUMER_OFFSET, header)
-        response = self._invoke_sync(addr, request, timeout_millis)
+        response = self._invoke_sync(self.vip_addr(addr), request, timeout_millis)
         self._check_response(response)
 
     def get_max_offset(self, mq: MessageQueue, timeout_millis: int = 5000, addr: Optional[str] = None) -> int:
@@ -1183,7 +1211,7 @@ class MQClientInstance:
         header.topic = mq.topic
         header.queue_id = mq.queue_id
         request = RemotingCommand.create_request_command(RequestCode.GET_MAX_OFFSET, header)
-        response = self._invoke_sync(addr, request, timeout_millis)
+        response = self._invoke_sync(self.vip_addr(addr), request, timeout_millis)
         self._check_response(response)
         resp_header = GetMaxOffsetResponseHeader()
         resp_header.from_ext_fields(response.ext_fields)
@@ -1196,7 +1224,7 @@ class MQClientInstance:
         header.topic = mq.topic
         header.queue_id = mq.queue_id
         request = RemotingCommand.create_request_command(RequestCode.GET_MIN_OFFSET, header)
-        response = self._invoke_sync(addr, request, timeout_millis)
+        response = self._invoke_sync(self.vip_addr(addr), request, timeout_millis)
         self._check_response(response)
         resp_header = GetMinOffsetResponseHeader()
         resp_header.from_ext_fields(response.ext_fields)
@@ -1214,7 +1242,7 @@ class MQClientInstance:
         header.timestamp = timestamp
         header.boundary_type = boundary_type
         request = RemotingCommand.create_request_command(RequestCode.SEARCH_OFFSET_BY_TIMESTAMP, header)
-        response = self._invoke_sync(addr, request, timeout_millis)
+        response = self._invoke_sync(self.vip_addr(addr), request, timeout_millis)
         self._check_response(response)
         resp_header = SearchOffsetResponseHeader()
         resp_header.from_ext_fields(response.ext_fields)
@@ -1238,7 +1266,7 @@ class MQClientInstance:
         request = RemotingCommand.create_request_command(RequestCode.QUERY_MESSAGE, header)
         if uniq_key:
             request.ext_fields[MixAll.UNIQUE_MSG_QUERY_FLAG] = "true"
-        response = self._invoke_sync(addr, request, timeout_millis)
+        response = self._invoke_sync(self.vip_addr(addr), request, timeout_millis)
         if response.code == ResponseCode.QUERY_NOT_FOUND:
             return None
         self._check_response(response)
@@ -1318,7 +1346,8 @@ class MQClientInstance:
             request = RemotingCommand.create_request_command(RequestCode.LOCK_BATCH_MQ, LockBatchMqRequestHeader())
             request.body = body.encode()
             try:
-                response = self._invoke_sync(addr, request, timeout_millis)
+                # Java: MQClientAPIImpl#lockBatchMQ wraps the address with the VIP channel.
+                response = self._invoke_sync(self.vip_addr(addr), request, timeout_millis)
                 self._check_response(response)
                 rb = LockBatchResponseBody.decode(response.body)
                 for d in rb.lock_ok_mq_set:
@@ -1348,17 +1377,57 @@ class MQClientInstance:
             request = RemotingCommand.create_request_command(RequestCode.UNLOCK_BATCH_MQ, UnlockBatchMqRequestHeader())
             request.body = body.encode()
             try:
-                response = self._invoke_sync(addr, request, timeout_millis)
+                # Java: MQClientAPIImpl#unlockBatchMQ wraps the address with the VIP channel.
+                response = self._invoke_sync(self.vip_addr(addr), request, timeout_millis)
                 self._check_response(response)
             except Exception as e:  # noqa: BLE001
                 logger.warning("unlock_batch_mq failed for broker %s: %s", broker_name, e)
 
     # ---------------- heartbeat / unregister ----------------
-    def send_heartbeat(self, addr: str, heartbeat_data: HeartbeatData, timeout_millis: int = 5000) -> None:
+    def send_heartbeat(self, addr: str, heartbeat_data: HeartbeatData, timeout_millis: int = 5000) -> int:
+        """HEART_BEAT(34) with a V1 body; returns the broker version from the response header.
+
+        ``MQClientAPIImpl#sendHeartbeat`` returns ``response.getVersion()`` (Java records it in
+        ``brokerVersionTable``); the V1 path is what a ``heartbeatFingerprint == 0`` body takes on
+        the broker, and it stays the default here because ``useHeartbeatV2`` is off by default.
+        """
         request = RemotingCommand.create_request_command(RequestCode.HEART_BEAT, None)
         request.body = heartbeat_data.encode()
         response = self._invoke_sync(addr, request, timeout_millis)
         self._check_response(response)
+        return response.version or 0
+
+    def send_heartbeat_v2(self, addr: str, heartbeat_data: HeartbeatData,
+                          timeout_millis: int = 5000) -> HeartbeatV2Result:
+        """``MQClientAPIImpl#sendHeartbeatV2``: the same HEART_BEAT(34) frame, V2 body.
+
+        Nothing about the frame changes -- the body carries ``heartbeatFingerprint`` (non-zero) and
+        possibly ``withoutSub``, and the broker answers with the ``IS_SUPPORT_HEART_BEAT_V2`` /
+        ``IS_SUB_CHANGE`` extFields that decide the next round. A broker that predates V2 simply
+        ignores the two extra fields (it registers the full subscription set as before) and sends no
+        extFields back, which parses here as ``support_v2=False``.
+        """
+        request = RemotingCommand.create_request_command(RequestCode.HEART_BEAT, None)
+        request.body = heartbeat_data.encode()
+        response = self._invoke_sync(addr, request, timeout_millis)
+        self._check_response(response)
+        return HeartbeatV2Result.from_response(response.version or 0, response.ext_fields)
+
+    def send_heartbeat_to_broker_v2(self, addr: str, heartbeat_data: HeartbeatData,
+                                   owner: str = "", timeout_millis: int = 5000) -> int:
+        """Send one heartbeat through the V2 path (see ``client/heartbeat_v2.py``).
+
+        ``owner`` names the heartbeat stream (a facade's group), because this port sends one
+        heartbeat per facade rather than one aggregated heartbeat per instance like Java does.
+        """
+        return self._heartbeat_v2.send_to_broker(owner, addr, heartbeat_data, timeout_millis)
+
+    def reset_heartbeat_v2_fingerprint_table(self, owner: Optional[str] = None) -> None:
+        """Drop the remembered fingerprints (``resetBrokerAddrHeartbeatFingerprintMap``).
+
+        Java calls it when the queue allocation changes; ``owner=None`` resets every stream.
+        """
+        self._heartbeat_v2.reset_fingerprint_table(owner)
 
     def unregister_client(self, addr: str, client_id: str, producer_group: str,
                           consumer_group: str, timeout_millis: int = 3000) -> None:
@@ -1382,7 +1451,8 @@ class MQClientInstance:
         body.group = consumer_group
         body.subscription_data = subscription_data
         request.body = body.encode()
-        response = self._invoke_sync(broker_addr, request, timeout_millis)
+        # Java: MQClientAPIImpl#checkClientInBroker wraps the broker address with the VIP channel.
+        response = self._invoke_sync(self.vip_addr(broker_addr), request, timeout_millis)
         if response is None:
             raise MQClientException("checkClientConfig got no response from %s" % broker_addr)
         if response.code != ResponseCode.SUCCESS:
@@ -1497,7 +1567,8 @@ class MQClientInstance:
         header = GetConsumerListByGroupRequestHeader()
         header.consumer_group = consumer_group
         request = RemotingCommand.create_request_command(RequestCode.GET_CONSUMER_LIST_BY_GROUP, header)
-        response = self._invoke_sync(addr, request, timeout_millis)
+        # Java: MQClientAPIImpl#getConsumerIdListByGroup is one of the VIP-wrapped requests.
+        response = self._invoke_sync(self.vip_addr(addr), request, timeout_millis)
         self._check_response(response)
         if response.body:
             return GetConsumerListByGroupResponseBody.decode(response.body)
@@ -1580,11 +1651,14 @@ class MQClientInstance:
         header.consumer_group = consumer_group
         request = RemotingCommand.create_request_command(RequestCode.GET_CONSUMER_LIST_BY_GROUP,
                                                          header)
+        # Rebalance asks the broker for the group's consumer list: Java's
+        # MQClientAPIImpl#getConsumerIdListByGroup wraps this address with the VIP channel too.
+        target = self.vip_addr(addr)
         try:
-            response = self._invoke_sync(addr, request, timeout_millis)
+            response = self._invoke_sync(target, request, timeout_millis)
         except Exception as e:  # noqa: BLE001
             logger.debug("get_consumer_id_list_by_group failed, %s %s: %s",
-                         addr, consumer_group, e)
+                         target, consumer_group, e)
             return None
         if response.code != ResponseCode.SUCCESS or response.body is None:
             return None
