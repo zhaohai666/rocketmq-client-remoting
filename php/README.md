@@ -13,7 +13,7 @@ NameServer + Broker，不依赖 Proxy。
 - PHP 没有常驻线程，心跳、重平衡、位点持久化、轨迹分发等全部收敛为**由调用方循环驱动
   的 `tick()`**（见「快速上手」的执行模型说明）。
 - 真机基线：RocketMQ **5.5.1**（NameServer 9876 + Broker 10911）。
-- 体量：`src/` 69 个文件 / 30,642 行，`tests/` 15 个文件 / 12,831 行。
+- 体量：`src/` 73 个文件 / 30,280 行，`tests/` 19 个文件 / 15,163 行。
 
 ## 先决条件
 
@@ -40,7 +40,7 @@ cd php
 # 改动后对相关文件做语法检查
 php -l src/Client/Producer.php
 
-# 离线自测入口：静态守卫 + 13 个套件顺序执行，不连真机
+# 离线自测入口：静态守卫 + 14 个套件顺序执行，不连真机
 php tests/run_all.php
 
 # 单个套件
@@ -53,7 +53,7 @@ bash scripts/run_php_live.sh compression 127.0.0.1:9876
 
 `tests/run_all.php` 是**离线**套件：跑之前先做一道全仓**重复类名静态守卫**（PHP 没有
 模块隔离，同一 FQCN 在两个文件声明时先被 autoload 命中的胜出、另一个静默失效，所以这道
-守卫不能省），然后串起 13 个套件。当前实测：**守卫 CLEAN，13 个套件 2,117 项断言全部
+守卫不能省），然后串起 14 个套件。当前实测：**守卫 CLEAN，14 个套件 2,180 项断言全部
 通过**，任一失败即以非零码退出。
 
 ## 快速上手
@@ -371,8 +371,11 @@ LitePull / Admin）同款 API。须在 `start()` 前设置（建 `MQClientInstan
 - ✅ 消费：Push（并发 / 顺序 / 广播 / 位点持久化 / 启动期数值校验 / 拉取前流控阈值）、
   Pull（全量队列与本实例份额两种视图）、LitePull（含 topic 队列集合变更监听）、
   POP（200050 弹出 / 200051 ACK / 200053 延长不可见时间 + 检查点）、`ConsumeMessageDirectly`
-- ✅ 队列分配：`AVG` / `AVG_BY_CIRCLE` / `CONFIG` / `CONSISTENT_HASH` / `MACHINE_ROOM` /
-  `MACHINE_ROOM_NEARBY`，由重平衡驱动
+- ✅ 队列分配：本地策略 `AVG` / `AVG_BY_CIRCLE` / `CONFIG` / `CONSISTENT_HASH` /
+  `MACHINE_ROOM` / `MACHINE_ROOM_NEARBY`，由重平衡驱动；POP 消费且 `clientRebalance=false`
+  时改走 **broker 侧分配 `QUERY_ASSIGNMENT(400)`**（对齐 Java 客户端口径）：周期轮次挂在
+  实例 `tick()`，broker 答案（而非本地策略）决定拉取面；RPC 失败或结果集缺失**保留上一次
+  分配**、显式空集与 `TOPIC_NOT_EXIST(17)` 清空分配，绝不退化成“全要”兜底
 - ✅ 命名空间：本地前缀 `namespace` 与服务端 `namespaceV2` 两套机制
 - ✅ 管理端：topic / 订阅组 CRUD、集群与 broker 运行时信息、消费统计与进度、按
   key / uniqKey / msgId 查消息、位点读取与重置、name server 配置
@@ -382,7 +385,7 @@ LitePull / Admin）同款 API。须在 `start()` 前设置（建 `MQClientInstan
   SOCKS 代理（SOCKS4/5 + 用户名密码，握手后 TLS）、故障规避选队列、`Validators` 本地校验前置
 - ✅ 压缩：ZLIB（`gzcompress`）、纯 PHP LZ4 Frame、ZSTD（CLI 优先，纯 PHP 兜底）
 - ✅ TLS：CA 校验 / mTLS / SNI
-- ✅ 离线自测：13 套件 2,117 项断言 + 重复类名静态守卫（实测全绿）
+- ✅ 离线自测：14 套件 2,180 项断言 + 重复类名静态守卫（实测全绿）
 - ✅ 真机联调：`examples/live_*.php` 10 条用例覆盖管理端 / 重投死信 / 拉模式 / 队列变更监听 /
   POP / TLS / Request-Reply / 压缩冒烟 / 静态 topic / 鉴权集群上的全部消息类型收发
 

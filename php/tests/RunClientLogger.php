@@ -55,25 +55,40 @@ function runInTempCwd(string $code, array $env, string $tag): array
     // Zero out every switch this port knows first: run_all.php and the caller's
     // environment may both carry values, and the "default persistence path/level"
     // is exactly the behavior under test.
-    // Use env(1) instead of `VAR=x php ...`: an assignment prefix only applies to the
-    // command right after it, and there is a cd before php here (switching cwd is how
-    // "the default directory follows the deployment" gets tested).
-    $cmd = 'env HOME=' . escapeshellarg($home);
+    // proc_open with an argv array + explicit env + cwd instead of `env A=1 sh -c 'cd ... &&
+    // php ...'`: the shell form only exists on POSIX, and on Windows it made every case
+    // silently degrade into "no file written". Switching cwd is how "the default directory
+    // follows the deployment" gets tested.
     $always = ['ROCKETMQ_CLIENT_LOG_DIR', 'ROCKETMQ_CLIENT_LOG_FILE', 'ROCKETMQ_CLIENT_LOG_LEVEL',
         'ROCKETMQ_CLIENT_LOG_USE_STDOUT', 'ROCKETMQ_CLIENT_LOG_FILE_MAX_SIZE',
         'ROCKETMQ_CLIENT_LOG_FILE_MAX_INDEX'];
+    $childEnv = (array) getenv();
+    $childEnv['HOME'] = $home;
+    $childEnv['USERPROFILE'] = $home;
     foreach ($always as $k) {
-        $cmd .= ' ' . $k . '=' . escapeshellarg((string)($env[$k] ?? ''));
+        $childEnv[$k] = (string)($env[$k] ?? '');
     }
     $file = $cwd . '/logs/rocketmqlogs/' . ($env['ROCKETMQ_CLIENT_LOG_FILE'] ?? Logger::DEFAULT_LOG_FILE);
-    // A LOG_FILE containing a path separator is treated as a full path; the cases under test all use the default directory
-    $cmd .= ' sh -c ' . escapeshellarg('cd ' . escapeshellarg($cwd) . ' && '
-        . escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg(__DIR__ . '/_logger_child.php')
-        . ' "$1"') . ' sh ' . escapeshellarg($code);
+    $pipes = [];
+    $proc = proc_open(
+        [PHP_BINARY, __DIR__ . '/_logger_child.php', $code],
+        [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+        $pipes,
+        $cwd,
+        $childEnv
+    );
+    if (!is_resource($proc)) {
+        return [1, 'failed to spawn logger child', null, $cwd, $file, $home];
+    }
+    fclose($pipes[0]);
     // stderr collected too: the USE_STDOUT case must assert that logs actually go to stderr
-    exec($cmd . ' 2>&1', $out, $rc);
+    $out = (string)stream_get_contents($pipes[1]) . (string)stream_get_contents($pipes[2]);
+    foreach ([1, 2] as $i) {
+        fclose($pipes[$i]);
+    }
+    $rc = proc_close($proc);
     $contents = is_file($file) ? (string)file_get_contents($file) : null;
-    return [$rc, implode("\n", $out), $contents, $cwd, $file, $home];
+    return [$rc, $out, $contents, $cwd, $file, $home];
 }
 
 /** Recursively delete a directory (only used for temp dirs created by this test). */

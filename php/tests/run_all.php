@@ -26,6 +26,7 @@ $suites = [
     'Client accumulator' => __DIR__ . '/RunClientAccumulator.php',
     'Client instance' => __DIR__ . '/RunClientInstance.php',
     'Client fault detector' => __DIR__ . '/RunClientFaultDetector.php',
+    'Client POP assignment' => __DIR__ . '/RunClientPopAssignment.php',
     'Client consumer' => __DIR__ . '/RunClientConsumer.php',
     'Client producer' => __DIR__ . '/RunClientProducer.php',
     'Client queue-change listener' => __DIR__ . '/RunClientLiteTopicChange.php',

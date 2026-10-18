@@ -68,6 +68,11 @@ PHP 无线程：`invokeAsync` = 非阻塞写 + pending 表（opaque→[onSuccess
   消费者套件（`RunClientConsumer.php`）用子进程假 broker（`--broker` 自拉起）承载有状态剧本：
   每队列拉取计数（首拉 FOUND / OFFSET_ILLEGAL，后续 NO_NEW_MSG）、PULL/UPDATE_OFFSET/SEND_BACK/
   LOCK_BATCH_MQ 请求写 JSONL 日志供父进程断言线上行为（sysFlag suspend 位、delayLevel、mqSet）。
+  `RunClientPopAssignment.php` 同款基建：假 broker 按剧本文件应答 `QUERY_ASSIGNMENT(400)`
+  （success / 显式空集 / 缺结果集 / SYSTEM_ERROR / TOPIC_NOT_EXIST），断言 POP 消费者的
+  broker 侧分配腿——400 请求体五字段、broker 答案（而非本地策略）决定拉取面、分配变更下一
+  tick 生效、失败/缺集保留旧分配（绝不“全要”兜底）、tick 周期节奏与 rebalanceImmediately
+  唤醒、shutdown 摘除 poller，以及非 POP / clientRebalance=true 路径零 400、保持本地重平衡。
 - 真机（macOS）：`scripts/with_cluster.sh` 是 Windows Git Bash 版，跑不了。统一入口
   `bash scripts/run_php_live.sh redelivery|admin|compression|pop|tls`：自起 5.5.1 集群
   → 等端口 → **等 broker 路由注册进 nameserver**（`php examples/wait_broker_route.php`，

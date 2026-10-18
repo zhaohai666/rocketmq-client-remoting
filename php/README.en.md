@@ -15,7 +15,7 @@ This directory is the **PHP client SDK for Apache RocketMQ's classic remoting pr
   dispatch all collapse into a **caller-driven `tick()`** invoked from your own loop
   (see the execution-model note in "Examples").
 - Verified against a real RocketMQ **5.5.1** cluster (NameServer 9876 + Broker 10911).
-- Size: `src/` 69 files / 30,642 lines; `tests/` 15 files / 12,831 lines.
+- Size: `src/` 73 files / 30,280 lines; `tests/` 19 files / 15,163 lines.
 
 ## Prerequisites
 
@@ -45,7 +45,7 @@ cd php
 # syntax check of a file after modifying it
 php -l src/Client/Producer.php
 
-# offline self-test entry: static guard + 10 suites run sequentially, no cluster needed
+# offline self-test entry: static guard + 14 suites run sequentially, no cluster needed
 php tests/run_all.php
 
 # a single suite
@@ -59,8 +59,8 @@ bash scripts/run_php_live.sh compression 127.0.0.1:9876
 `tests/run_all.php` is the **offline** suite: before running anything it performs a
 repository-wide **duplicate-class-name static guard** (PHP has no module isolation, so
 when the same FQCN is declared in two files the one autoloaded first silently wins and
-the other dies — this guard cannot be skipped), then chains 10 suites. Measured today:
-**guard CLEAN, all 2,117 assertions across the 13 suites pass**; any failure exits with a
+the other dies — this guard cannot be skipped), then chains 14 suites. Measured today:
+**guard CLEAN, all 2,180 assertions across the 14 suites pass**; any failure exits with a
 non-zero code.
 
 ## Examples
@@ -400,8 +400,14 @@ Assigning the public `$client->socksProxy` property works too; all five client f
   this-instance share view), LitePull (incl. topic queue-set change listener),
   POP (200050 pop / 200051 ack / 200053 change-invisible-time + checkpoints),
   `ConsumeMessageDirectly`
-- ✅ Queue allocation: `AVG` / `AVG_BY_CIRCLE` / `CONFIG` / `CONSISTENT_HASH` /
-  `MACHINE_ROOM` / `MACHINE_ROOM_NEARBY`, driven by rebalance
+- ✅ Queue allocation: the local strategies `AVG` / `AVG_BY_CIRCLE` / `CONFIG` /
+  `CONSISTENT_HASH` / `MACHINE_ROOM` / `MACHINE_ROOM_NEARBY`, driven by rebalance; a POP
+  consumer with `clientRebalance=false` switches to the **broker-side assignment
+  `QUERY_ASSIGNMENT(400)`** (aligned with the Java client): the periodic rounds hang off the
+  instance `tick()` and the broker's answer — not the local strategy — decides the pull
+  surface; an RPC failure or a missing result set **keeps the previous assignment**, while an
+  explicit empty set and `TOPIC_NOT_EXIST(17)` clear it — it never degrades to a "take all
+  queues" fallback
 - ✅ Namespaces: the local-prefix `namespace` and the server-side `namespaceV2` mechanisms
 - ✅ Admin: topic / subscription-group CRUD, cluster and broker runtime information,
   consume stats and progress, message queries by key / uniqKey / msgId, offset read and
@@ -415,7 +421,7 @@ Assigning the public `$client->socksProxy` property works too; all five client f
 - ✅ Compression: ZLIB (`gzcompress`), pure-PHP LZ4 Frame, ZSTD (CLI preferred, pure-PHP
   fallback)
 - ✅ TLS: CA verification / mTLS / SNI
-- ✅ Offline self-test: 13 suites with 2,117 assertions + the duplicate-class-name static
+- ✅ Offline self-test: 14 suites with 2,180 assertions + the duplicate-class-name static
   guard (measured all green)
 - ✅ Live-cluster verification: the 10 `examples/live_*.php` cases cover the admin surface,
   redelivery / dead-letter, pull mode, queue-change listening, POP, TLS, Request-Reply,
