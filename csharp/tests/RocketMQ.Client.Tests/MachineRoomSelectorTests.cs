@@ -1,8 +1,8 @@
-// 离线单测：SelectMessageQueueByMachineRoom（Java selector/SelectMessageQueueByMachineRoom
-// 的空壳在本仓库统一落地为「brokerName 前缀匹配 + 无匹配退回第一个」，口径同
-// python producer.py / nodeJs producer.ts）、ConsumeExecutor 的有界 Shutdown
-// （Java DefaultMQPushConsumer#awaitTerminationMillisWhenShutdown 的执行侧）与
-// DefaultMQPushConsumer 的配置项往返。
+// Offline unit tests: SelectMessageQueueByMachineRoom (Java's selector is an empty shell;
+// every port in this repo lands it as "prefix-match on brokerName, fall back to the first
+// queue" — the same contract the python and nodeJs producers implement), the bounded
+// ConsumeExecutor.Shutdown behind awaitTerminationMillisWhenShutdown, and the
+// push-consumer config roundtrip.
 using RocketMQ.Client;
 using RocketMQ.Common;
 using System.Diagnostics;
@@ -32,7 +32,7 @@ public class MachineRoomSelectorTests
         MessageQueue picked = sel.Select(mqs, new Message("T", new byte[] { 1 }), "idcB");
         Assert.Equal("idcB-broker-0", picked.BrokerName);
 
-        // 前缀匹配取第一个命中，不是最后一个
+        // prefix match returns the FIRST hit, not the last
         Assert.Equal("idcA-broker-0", sel.Select(mqs, new Message("T", new byte[] { 1 }), "idcA").BrokerName);
     }
 
@@ -43,7 +43,7 @@ public class MachineRoomSelectorTests
         var sel = new SelectMessageQueueByMachineRoom();
 
         Assert.Equal("idcA-broker-0", sel.Select(mqs, new Message("T", new byte[] { 1 }), "idcZ").BrokerName);
-        // arg 为 null 视同空机房号：任何 brokerName 都以 "" 开头，等价于取第一个
+        // a null arg is an empty room id: every brokerName starts with "", so it takes the first
         Assert.Equal("idcA-broker-0", sel.Select(mqs, new Message("T", new byte[] { 1 }), null!).BrokerName);
     }
 
@@ -72,16 +72,16 @@ public class MachineRoomSelectorTests
         var exec = new ConsumeExecutor(1, 1, 60.0, "rmq-await-test");
         var release = new ManualResetEventSlim(false);
         exec.Submit(() => release.Wait(TimeSpan.FromSeconds(30)));
-        // 让 worker 真正跑起来并占住任务
+        // let the worker actually start and hold the task
         SpinWait.SpinUntil(() => exec.WorkerCount() == 1, 5000);
 
         var sw = Stopwatch.StartNew();
         exec.Shutdown(true, 200);
         sw.Stop();
 
-        // 有界等待：~200ms 就返回，不被 30s 的任务拖住；留足 Windows 计时余量
+        // bounded wait: returns in ~200ms instead of being held by the 30s task; generous Windows timing margin
         Assert.InRange(sw.ElapsedMilliseconds, 150, 3000);
-        release.Set(); // 放行 worker（后台线程，测试结束进程回收）
+        release.Set(); // release the worker (background thread, reclaimed when the process exits)
         exec.Dispose();
     }
 
@@ -97,7 +97,7 @@ public class MachineRoomSelectorTests
         });
         SpinWait.SpinUntil(() => Volatile.Read(ref done) == 1 || exec.QueuedCount() > 0, 5000);
 
-        exec.Shutdown(true, 0); // <=0：无限 join（默认口径）
+        exec.Shutdown(true, 0); // <=0: unbounded join (this port's default)
         Assert.Equal(1, Volatile.Read(ref done));
     }
 
@@ -105,7 +105,7 @@ public class MachineRoomSelectorTests
     public void Consumer_AwaitTerminationPropertyRoundTrips()
     {
         var consumer = new DefaultMQPushConsumer("GID_AwaitTest");
-        Assert.Equal(0, consumer.AwaitTerminationMillisWhenShutdown); // Java 默认 0
+        Assert.Equal(0, consumer.AwaitTerminationMillisWhenShutdown); // default 0
 
         consumer.SetAwaitTerminationMillisWhenShutdown(1500);
         Assert.Equal(1500, consumer.AwaitTerminationMillisWhenShutdown);

@@ -305,3 +305,29 @@ public sealed class SelectMessageQueueByRandom : IMessageQueueSelector
         return mqs[ThreadLocalRandom.Next(mqs.Count)];
     }
 }
+
+// Java's SelectMessageQueueByMachineRoom is an empty shell that returns null; this repo
+// lands one shared contract across all ports: take the first queue whose brokerName
+// starts with arg (the machine-room id, broker naming convention "<idc>-<broker>") and
+// fall back to the first queue when nothing matches.
+public sealed class SelectMessageQueueByMachineRoom : IMessageQueueSelector
+{
+    public MessageQueue Select(IReadOnlyList<MessageQueue> mqs, Message msg, string arg)
+    {
+        if (mqs.Count == 0)
+        {
+            throw new MQClientException("no message queue");
+        }
+
+        string room = arg ?? string.Empty;
+        foreach (MessageQueue mq in mqs)
+        {
+            if (mq.BrokerName.StartsWith(room, StringComparison.Ordinal))
+            {
+                return mq;
+            }
+        }
+
+        return mqs[0];
+    }
+}

@@ -539,6 +539,10 @@ public sealed class DefaultMQPushConsumer
     // Declarative core pool size (initial value for UpdateCorePoolSize),
     // default = consumeThreadMin
     private int _corePoolSize = 20;
+    // awaitTerminationMillisWhenShutdown: the ceiling in milliseconds that Shutdown
+    // spends draining the consume pool; <=0 keeps this port's default unbounded join
+    // (worker threads capture `this`, so they must be joined before it is released).
+    private long _awaitTerminationMillisWhenShutdown;
     // key -> ProcessQueue.msgAccCnt (backlog count computed by the last pull)
     private readonly Dictionary<string, long> _msgAccCntTable = new(StringComparer.Ordinal);
     // POP consume executor (created at Start when PopMode; released at Shutdown)
@@ -736,6 +740,10 @@ public sealed class DefaultMQPushConsumer
     }
 
     public void SetAdjustThreadPoolNumsThreshold(long v) => _adjustThreadPoolNumsThreshold = v;
+
+    public long AwaitTerminationMillisWhenShutdown => _awaitTerminationMillisWhenShutdown;
+
+    public void SetAwaitTerminationMillisWhenShutdown(long v) => _awaitTerminationMillisWhenShutdown = v;
 
     /// <summary>Runtime adjustment of consume concurrency (updateCorePoolSize
     /// → setCorePoolSize).
@@ -1522,8 +1530,9 @@ public sealed class DefaultMQPushConsumer
         // POP consume executor wraps up (shutdownGracefully semantics: no new
         // tasks accepted, finish the batches in hand). Dispose calls
         // Shutdown(wait=true): worker threads captured `this`, so they must be
-        // joined before it can be released.
-        _popConsumeExecutor?.Shutdown(true);
+        // joined before it can be released. awaitTerminationMillisWhenShutdown
+        // bounds that join when > 0.
+        _popConsumeExecutor?.Shutdown(true, (int)Math.Clamp(_awaitTerminationMillisWhenShutdown, 0, int.MaxValue));
         _popConsumeExecutor = null;
 
         // Persist consumed offsets once before exiting (shutdown →

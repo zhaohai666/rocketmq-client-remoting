@@ -100,7 +100,12 @@ public sealed class ConsumeExecutor : IDisposable
     public int QueuedCount() { lock (_gate) return _queue.Count; }
     public long HandlerExceptionCount() => Interlocked.Read(ref _handlerExceptions);
 
-    public void Shutdown(bool wait = false)
+    public void Shutdown(bool wait = false) => Shutdown(wait, 0);
+
+    // awaitTerminationMillis semantics: <=0 waits forever (this port's default - worker
+    // threads capture `this`, so they must be joined before it can be released);
+    // >0 bounds the wait and returns without the join once the budget expires.
+    public void Shutdown(bool wait, int timeoutMillis)
     {
         List<Thread> pending;
         lock (_gate)
@@ -110,11 +115,23 @@ public sealed class ConsumeExecutor : IDisposable
             pending = new List<Thread>(_threads);
         }
         if (!wait) return;
+        long deadline = timeoutMillis > 0
+            ? Environment.TickCount64 + timeoutMillis
+            : 0;
         foreach (Thread t in pending)
         {
             // Never Join the current thread (worker threads never reach this
             // point; only external callers do)
-            if (t.IsAlive && t != Thread.CurrentThread) t.Join();
+            if (!t.IsAlive || t == Thread.CurrentThread) continue;
+            if (deadline == 0)
+            {
+                t.Join();
+                continue;
+            }
+
+            long remaining = deadline - Environment.TickCount64;
+            if (remaining <= 0) break;
+            t.Join((int)Math.Min(remaining, int.MaxValue));
         }
     }
 
