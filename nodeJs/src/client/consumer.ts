@@ -729,10 +729,13 @@ export class DefaultMQPushConsumer {
     });
   }
 
-  // Immediate full-broker heartbeat (with the broker lock taken first).
+  // Immediate heartbeat round over every broker of the route table. The push
+  // facade calls this at start() — before rebalance asks the broker for the
+  // group's member list — and from its own 30s loop.
   async sendHeartbeatNow(): Promise<void> {
-    if (this.client == null) return;
-    await this.client.sendHeartbeatToAllBrokers();
+    const client = this.mqClient;
+    if (client == null) return;
+    await client.sendHeartbeatToAllBrokers();
   }
 
   private async _heartbeatLoop(): Promise<void> {
