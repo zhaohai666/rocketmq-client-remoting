@@ -99,9 +99,9 @@ func startAsyncFixture(t *testing.T, topic, group string, sendCode int32,
 	t.Helper()
 	handler := &sendBrokerOnReq{offset: 7, sendCode: sendCode}
 	broker := startMockServer(t, handler.handle)
-	ns := startMockServer(t, nameserverOnReq(map[string]string{
+	ns := startMockServer(t, nameserverOnReq(routes(map[string]string{
 		topic: routeBodyFor(broker.addr, ""),
-	}))
+	})))
 	return newStartedProducer(t, ns.addr, group, tune), broker, handler
 }
 
@@ -400,9 +400,9 @@ func TestAsyncSendRetriesOnAnotherBroker(t *testing.T) {
 	const topic = "AsyncRetryTopic"
 	handler := &sendBrokerOnReq{offset: 9}
 	live := startMockServer(t, handler.handle)
-	ns := startMockServer(t, nameserverOnReq(map[string]string{
+	ns := startMockServer(t, nameserverOnReq(routes(map[string]string{
 		topic: twoBrokerRouteBody(deadBrokerAddr, live.addr),
-	}))
+	})))
 	p := newStartedProducer(t, ns.addr, "GID_async_retry", func(p *DefaultMQProducer) {
 		p.SetRetryTimesWhenSendAsyncFailed(2)
 	})
@@ -517,9 +517,9 @@ func TestAsyncSendBrokerErrorIsNotRetried(t *testing.T) {
 	const topic = "AsyncBrokerErrTopic"
 	handler := &sendBrokerOnReq{sendCode: remoting.RespSystemBusy}
 	broker := startMockServer(t, handler.handle)
-	ns := startMockServer(t, nameserverOnReq(map[string]string{
+	ns := startMockServer(t, nameserverOnReq(routes(map[string]string{
 		topic: twoBrokerRouteBody(broker.addr, broker.addr),
-	}))
+	})))
 	p := newStartedProducer(t, ns.addr, "GID_async_brokererr", func(p *DefaultMQProducer) {
 		p.SetRetryTimesWhenSendAsyncFailed(2)
 	})

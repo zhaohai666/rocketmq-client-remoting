@@ -180,9 +180,9 @@ func TestSendHookAfterSeesNonRetryableBrokerError(t *testing.T) {
 	const topic = "HookSendErrTopic"
 	handler := &sendBrokerOnReq{offset: 1, sendCode: remoting.RespMessageIllegal}
 	broker := startMockServer(t, handler.handle)
-	ns := startMockServer(t, nameserverOnReq(map[string]string{
+	ns := startMockServer(t, nameserverOnReq(routes(map[string]string{
 		topic: routeBodyFor(broker.addr, ""),
-	}))
+	})))
 	p := MustNewDefaultMQProducer("GID_hook_send_err")
 	p.SetNameServerAddresses([]string{ns.addr})
 	p.SetInstanceName(uniqueClientID(t))
@@ -242,9 +242,9 @@ func TestSendHookRunsOncePerAttempt(t *testing.T) {
 	// makes three attempts — and each one gets its own before/after pair.
 	handler := &sendBrokerOnReq{offset: 1, sendCode: remoting.RespSystemError}
 	broker := startMockServer(t, handler.handle)
-	ns := startMockServer(t, nameserverOnReq(map[string]string{
+	ns := startMockServer(t, nameserverOnReq(routes(map[string]string{
 		topic: routeBodyFor(broker.addr, ""),
-	}))
+	})))
 	p := MustNewDefaultMQProducer("GID_hook_retry")
 	p.SetNameServerAddresses([]string{ns.addr})
 	p.SetInstanceName(uniqueClientID(t))
@@ -295,10 +295,10 @@ func TestCheckForbiddenHookContextFields(t *testing.T) {
 	// has to exist under the namespaced name too.
 	handler := &sendBrokerOnReq{offset: 3}
 	broker := startMockServer(t, handler.handle)
-	ns := startMockServer(t, nameserverOnReq(map[string]string{
+	ns := startMockServer(t, nameserverOnReq(routes(map[string]string{
 		topic:              routeBodyFor(broker.addr, ""),
 		"ns-hook%" + topic: routeBodyFor(broker.addr, ""),
-	}))
+	})))
 	p := MustNewDefaultMQProducer("GID_hook_forbid_ctx")
 	p.SetNameServerAddresses([]string{ns.addr})
 	p.SetInstanceName(uniqueClientID(t))

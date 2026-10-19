@@ -234,13 +234,11 @@ public sealed class MQClientInstance : IDisposable
             ProcessNotifyConsumerIdsChanged);
 
         // NOTIFY_UNSUBSCRIBE_LITE(200073): registered for exactly one reason -- to keep it off
-        // the transport's "no processor for broker request code" path. The reference registers
-        // it against the shared ClientRemotingProcessor in MQClientAPIImpl, but that
-        // processor's dispatch has NO case for the code: it falls through to the default
-        // branch and answers nothing, and the broker only ever sends it oneway (Broker2Client
-        // #notifyUnsubscribeLite), so nobody waits for a reply. Following the protocol here
-        // means doing nothing -- this port's classic-remoting client keeps no lite-subscription
-        // registry to drop (see the comment on ProcessNotifyUnsubscribeLite).
+        // the transport's "no processor for broker request code" path. The protocol defines no
+        // answer for it: the broker only ever sends it oneway, so nobody waits for a reply.
+        // Following the protocol here means doing nothing -- this port's classic-remoting client
+        // keeps no lite-subscription registry to drop (see the comment on
+        // ProcessNotifyUnsubscribeLite).
         _remotingClient.RegisterProcessor(RequestCode.NotifyUnsubscribeLite,
             ProcessNotifyUnsubscribeLite);
     }

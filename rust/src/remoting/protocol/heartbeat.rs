@@ -765,9 +765,12 @@ mod tests {
         // The heavy body is untouched.
         assert_eq!(hb.consumer_data_set[0].subscription_data_set.len(), 2);
         assert!(!hb.without_sub);
-        // The light body keeps the fingerprint of the heavy one: that is the whole point of the
-        // cheap beat, the broker matches it against its per-group table.
-        assert_eq!(light.compute_heartbeat_fingerprint(), hb.compute_heartbeat_fingerprint());
+        // The cheap beat is only valid because it CARRIES the full body's fingerprint in the field:
+        // recomputing over a subscription-stripped body deliberately differs (the subscriptions are
+        // part of what the fingerprint identifies), so a sender that recomputed it would tell the
+        // broker "subscriptions changed" every single round and the optimization would buy nothing.
+        assert_eq!(light.heartbeat_fingerprint, hb.compute_heartbeat_fingerprint());
+        assert_ne!(light.compute_heartbeat_fingerprint(), hb.compute_heartbeat_fingerprint());
     }
 
     #[test]

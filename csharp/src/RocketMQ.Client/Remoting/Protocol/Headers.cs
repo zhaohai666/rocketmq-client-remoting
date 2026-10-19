@@ -825,6 +825,37 @@ public sealed class NotifyConsumerIdsChangedRequestHeader : ICommandCustomHeader
         ConsumerGroup = HeaderCodec.GetOptStr(ext, "consumerGroup");
 }
 
+/// <summary>
+/// Header of NOTIFY_UNSUBSCRIBE_LITE(200073). All three fields are required on the wire, but
+/// this client never acts on them: the broker sends the request oneway and the classic path has
+/// no lite-subscription registry to drop, so the struct exists to pin the ext-field spellings
+/// (clientId with a lower-case d, not clientID).
+/// </summary>
+public sealed class NotifyUnsubscribeLiteRequestHeader : ICommandCustomHeader
+{
+    public string? LiteTopic { get; set; }
+
+    public string? ConsumerGroup { get; set; }
+
+    public string? ClientId { get; set; }
+
+    public PropertyMap ToExtFields()
+    {
+        var outMap = new PropertyMap();
+        HeaderCodec.PutOptStr(outMap, "liteTopic", LiteTopic);
+        HeaderCodec.PutOptStr(outMap, "consumerGroup", ConsumerGroup);
+        HeaderCodec.PutOptStr(outMap, "clientId", ClientId);
+        return outMap;
+    }
+
+    public void FromExtFields(PropertyMap ext)
+    {
+        LiteTopic = HeaderCodec.GetOptStr(ext, "liteTopic");
+        ConsumerGroup = HeaderCodec.GetOptStr(ext, "consumerGroup");
+        ClientId = HeaderCodec.GetOptStr(ext, "clientId");
+    }
+}
+
 public sealed class GetRouteInfoRequestHeader : ICommandCustomHeader
 {
     public string? Topic { get; set; }

@@ -31,7 +31,7 @@ func TestRemoteOffsetStoreFlows(t *testing.T) {
 		}
 		return nil
 	})
-	ns := startMockServer(t, nameserverOnReq(map[string]string{"Tt": routeBodyFor(broker.addr, "")}))
+	ns := startMockServer(t, nameserverOnReq(routes(map[string]string{"Tt": routeBodyFor(broker.addr, "")})))
 	inst := CreateOrGetInstance(uniqueClientID(t), []string{ns.addr}, testConfig())
 	defer inst.Shutdown()
 	warmRoute(t, inst, "Tt")
@@ -89,7 +89,7 @@ func TestRemoteOffsetStorePersistAllDropsUnused(t *testing.T) {
 		}
 		return nil
 	})
-	ns := startMockServer(t, nameserverOnReq(map[string]string{"Tt": routeBodyFor(broker.addr, "")}))
+	ns := startMockServer(t, nameserverOnReq(routes(map[string]string{"Tt": routeBodyFor(broker.addr, "")})))
 	inst := CreateOrGetInstance(uniqueClientID(t), []string{ns.addr}, testConfig())
 	defer inst.Shutdown()
 	warmRoute(t, inst, "Tt")

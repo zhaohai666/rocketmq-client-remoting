@@ -687,7 +687,7 @@ type clusterFixture struct {
 	// routeBodies is the nameserver's live per-topic route JSON; the mock
 	// handler reads it per request, so scaleTopic can grow or shrink a topic
 	// mid-test (the queue-set change a lite listener must notice).
-	routeBodies map[string]string
+	routeBodies *mockRouteTable
 }
 
 // newClusterFixture starts the mock cluster. queuesPerTopic maps each topic the
@@ -698,9 +698,9 @@ func newClusterFixture(t *testing.T, queuesPerTopic map[string]int) *clusterFixt
 	broker := newConsumerBroker()
 	broker.clientIDs = []string{clientID}
 	brokerSrv := startMockServer(t, broker.handler())
-	bodies := map[string]string{}
+	bodies := routes(map[string]string{})
 	for topic, queueNums := range queuesPerTopic {
-		bodies[topic] = consumerRouteBody("b1", brokerSrv.addr, queueNums)
+		bodies.set(topic, consumerRouteBody("b1", brokerSrv.addr, queueNums))
 	}
 	nserver := startMockServer(t, nameserverOnReq(bodies))
 	return &clusterFixture{
@@ -715,7 +715,7 @@ func newClusterFixture(t *testing.T, queuesPerTopic map[string]int) *clusterFixt
 // tests refresh through the instance directly).
 func (f *clusterFixture) scaleTopic(t *testing.T, topic string, queueNums int) {
 	t.Helper()
-	f.routeBodies[topic] = consumerRouteBody("b1", f.brokerSrv.addr, queueNums)
+	f.routeBodies.set(topic, consumerRouteBody("b1", f.brokerSrv.addr, queueNums))
 }
 
 // newConsumer builds a consumer wired to this fixture's nameserver, using the

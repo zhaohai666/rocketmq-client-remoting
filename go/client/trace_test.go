@@ -830,10 +830,10 @@ func TestProducerTraceE2EWritesPubToTraceTopic(t *testing.T) {
 	handler := &sendBrokerOnReq{offset: 7}
 	tap := &traceSendTap{inner: handler.handle, traceTopic: common.TraceTopic}
 	broker := startMockServer(t, tap.handle)
-	ns := startMockServer(t, nameserverOnReq(map[string]string{
+	ns := startMockServer(t, nameserverOnReq(routes(map[string]string{
 		topic:             routeBodyFor(broker.addr, ""),
 		common.TraceTopic: routeBodyFor(broker.addr, ""),
-	}))
+	})))
 
 	p := MustNewDefaultMQProducer(group)
 	p.SetNameServerAddresses([]string{ns.addr})

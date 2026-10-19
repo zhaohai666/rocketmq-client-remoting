@@ -265,8 +265,33 @@ func emptyRouteBody() string {
 	return `{"orderTopicConf":null,"queueDatas":[],"brokerDatas":[],"filterServerTable":{}}`
 }
 
+// mockRouteTable is the mock nameserver's topic -> route-body table. A test can
+// rewrite one topic mid-run (scaleTopic) while the server's handler goroutines
+// read the table per request, so every access goes through the mutex.
+type mockRouteTable struct {
+	mu     sync.Mutex
+	bodies map[string]string
+}
+
+func routes(bodies map[string]string) *mockRouteTable {
+	return &mockRouteTable{bodies: bodies}
+}
+
+func (r *mockRouteTable) set(topic, body string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.bodies[topic] = body
+}
+
+func (r *mockRouteTable) get(topic string) (string, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	body, ok := r.bodies[topic]
+	return body, ok
+}
+
 // nameserverOnReq answers GET_ROUTE_INFO_BY_TOPIC(105) with the per-topic body.
-func nameserverOnReq(bodies map[string]string) func(*mockServer, *remoting.RemotingCommand) *remoting.RemotingCommand {
+func nameserverOnReq(table *mockRouteTable) func(*mockServer, *remoting.RemotingCommand) *remoting.RemotingCommand {
 	return func(s *mockServer, req *remoting.RemotingCommand) *remoting.RemotingCommand {
 		if req.Code != remoting.ReqGetRouteInfoByTopic {
 			return nil
@@ -277,7 +302,7 @@ func nameserverOnReq(bodies map[string]string) func(*mockServer, *remoting.Remot
 		if header.Topic != nil {
 			topic = *header.Topic
 		}
-		body, ok := bodies[topic]
+		body, ok := table.get(topic)
 		if !ok {
 			resp := remoting.CreateResponseCommand(remoting.RespTopicNotExist, "topic["+topic+"] not exist")
 			return resp
@@ -445,9 +470,9 @@ func TestInstanceStartFailsWhenAddressServerEmpty(t *testing.T) {
 }
 
 func TestRouteFetchAndPublishInfo(t *testing.T) {
-	ns := startMockServer(t, nameserverOnReq(map[string]string{
+	ns := startMockServer(t, nameserverOnReq(routes(map[string]string{
 		"Tt": routeBodyFor("10.1.0.1:10911", "10.1.0.2:10911"),
-	}))
+	})))
 	inst := CreateOrGetInstance(uniqueClientID(t), []string{ns.addr}, testConfig())
 	defer inst.Shutdown()
 
@@ -502,7 +527,7 @@ func TestRouteFetchNoNameServerIs10004(t *testing.T) {
 }
 
 func TestRouteFetchTopicNotExistIsQuietlyFalse(t *testing.T) {
-	ns := startMockServer(t, nameserverOnReq(map[string]string{}))
+	ns := startMockServer(t, nameserverOnReq(routes(map[string]string{})))
 	inst := CreateOrGetInstance(uniqueClientID(t), []string{ns.addr}, testConfig())
 	defer inst.Shutdown()
 
@@ -522,7 +547,7 @@ func TestRouteFetchSuccessNoBodyStopsTheSearch(t *testing.T) {
 	ns1 := startMockServer(t, func(s *mockServer, req *remoting.RemotingCommand) *remoting.RemotingCommand {
 		return remoting.CreateResponseCommand(remoting.RespSuccess, "")
 	})
-	ns2 := startMockServer(t, nameserverOnReq(map[string]string{"Tt": routeBodyFor("10.1.0.1:10911", "")}))
+	ns2 := startMockServer(t, nameserverOnReq(routes(map[string]string{"Tt": routeBodyFor("10.1.0.1:10911", "")})))
 	inst := CreateOrGetInstance(uniqueClientID(t), []string{ns1.addr, ns2.addr}, testConfig())
 	defer inst.Shutdown()
 
@@ -544,9 +569,9 @@ func TestHeartbeatFanOutToMasterAndSlave(t *testing.T) {
 		return nil
 	})
 	brokerS := startMockServer(t, brokerM.onReq)
-	ns := startMockServer(t, nameserverOnReq(map[string]string{
+	ns := startMockServer(t, nameserverOnReq(routes(map[string]string{
 		"Tt": routeBodyFor(brokerM.addr, brokerS.addr),
-	}))
+	})))
 	inst := CreateOrGetInstance(uniqueClientID(t), []string{ns.addr}, testConfig())
 	defer inst.Shutdown()
 	warmRoute(t, inst, "Tt")
@@ -593,7 +618,7 @@ func TestNotifyConsumerIDsChangedWakesRebalance(t *testing.T) {
 		}
 		return nil
 	})
-	ns := startMockServer(t, nameserverOnReq(map[string]string{"Tt": routeBodyFor(broker.addr, "")}))
+	ns := startMockServer(t, nameserverOnReq(routes(map[string]string{"Tt": routeBodyFor(broker.addr, "")})))
 	inst := CreateOrGetInstance(uniqueClientID(t), []string{ns.addr}, testConfig())
 	defer inst.Shutdown()
 	warmRoute(t, inst, "Tt")
@@ -632,7 +657,7 @@ func TestResetOffsetPushGoroutine(t *testing.T) {
 		}
 		return nil
 	})
-	ns := startMockServer(t, nameserverOnReq(map[string]string{"Tt": routeBodyFor(broker.addr, "")}))
+	ns := startMockServer(t, nameserverOnReq(routes(map[string]string{"Tt": routeBodyFor(broker.addr, "")})))
 	inst := CreateOrGetInstance(uniqueClientID(t), []string{ns.addr}, testConfig())
 	defer inst.Shutdown()
 	warmRoute(t, inst, "Tt")
@@ -683,7 +708,7 @@ func TestGetConsumerStatusPush(t *testing.T) {
 		}
 		return nil
 	})
-	ns := startMockServer(t, nameserverOnReq(map[string]string{"Tt": routeBodyFor(broker.addr, "")}))
+	ns := startMockServer(t, nameserverOnReq(routes(map[string]string{"Tt": routeBodyFor(broker.addr, "")})))
 	inst := CreateOrGetInstance(uniqueClientID(t), []string{ns.addr}, testConfig())
 	defer inst.Shutdown()
 	warmRoute(t, inst, "Tt")
@@ -718,7 +743,7 @@ func TestGetConsumerStatusUnknownGroupIsSystemError(t *testing.T) {
 		}
 		return nil
 	})
-	ns := startMockServer(t, nameserverOnReq(map[string]string{"Tt": routeBodyFor(broker.addr, "")}))
+	ns := startMockServer(t, nameserverOnReq(routes(map[string]string{"Tt": routeBodyFor(broker.addr, "")})))
 	inst := CreateOrGetInstance(uniqueClientID(t), []string{ns.addr}, testConfig())
 	defer inst.Shutdown()
 	warmRoute(t, inst, "Tt")
@@ -735,9 +760,9 @@ func TestUnregisterClientAllBrokers(t *testing.T) {
 		return remoting.CreateResponseCommand(remoting.RespSuccess, "")
 	})
 	brokerS := startMockServer(t, brokerM.onReq)
-	ns := startMockServer(t, nameserverOnReq(map[string]string{
+	ns := startMockServer(t, nameserverOnReq(routes(map[string]string{
 		"Tt": routeBodyFor(brokerM.addr, brokerS.addr),
-	}))
+	})))
 	inst := CreateOrGetInstance(uniqueClientID(t), []string{ns.addr}, testConfig())
 	defer inst.Shutdown()
 	if _, err := inst.UpdateTopicRouteInfoFromNameServer("Tt", 2000, false); err != nil {
@@ -790,7 +815,7 @@ func TestCheckSubscriptionsInBroker(t *testing.T) {
 		}
 		return nil
 	})
-	ns := startMockServer(t, nameserverOnReq(map[string]string{"Tt": routeBodyFor(broker.addr, "")}))
+	ns := startMockServer(t, nameserverOnReq(routes(map[string]string{"Tt": routeBodyFor(broker.addr, "")})))
 	inst := CreateOrGetInstance(uniqueClientID(t), []string{ns.addr}, testConfig())
 	defer inst.Shutdown()
 	if _, err := inst.UpdateTopicRouteInfoFromNameServer("Tt", 2000, false); err != nil {
@@ -821,7 +846,7 @@ func TestCheckSubscriptionsInBroker(t *testing.T) {
 	code23 := startMockServer(t, func(s *mockServer, req *remoting.RemotingCommand) *remoting.RemotingCommand {
 		return remoting.CreateResponseCommand(23, "browser not found")
 	})
-	ns3 := startMockServer(t, nameserverOnReq(map[string]string{"Tt": routeBodyFor(code23.addr, "")}))
+	ns3 := startMockServer(t, nameserverOnReq(routes(map[string]string{"Tt": routeBodyFor(code23.addr, "")})))
 	inst3 := CreateOrGetInstance(uniqueClientID(t), []string{ns3.addr}, testConfig())
 	defer inst3.Shutdown()
 	if _, err := inst3.UpdateTopicRouteInfoFromNameServer("Tt", 2000, false); err != nil {
@@ -837,7 +862,7 @@ func TestCheckSubscriptionsInBroker(t *testing.T) {
 
 	dropper := startMockServer(t, nil)
 	dropper.setDrop(true)
-	ns4 := startMockServer(t, nameserverOnReq(map[string]string{"Tt": routeBodyFor(dropper.addr, "")}))
+	ns4 := startMockServer(t, nameserverOnReq(routes(map[string]string{"Tt": routeBodyFor(dropper.addr, "")})))
 	inst4 := CreateOrGetInstance(uniqueClientID(t), []string{ns4.addr}, testConfig())
 	defer inst4.Shutdown()
 	if _, err := inst4.UpdateTopicRouteInfoFromNameServer("Tt", 2000, false); err != nil {
@@ -850,9 +875,9 @@ func TestCheckSubscriptionsInBroker(t *testing.T) {
 }
 
 func TestCleanOfflineBroker(t *testing.T) {
-	ns := startMockServer(t, nameserverOnReq(map[string]string{
+	ns := startMockServer(t, nameserverOnReq(routes(map[string]string{
 		"Tt": routeBodyFor("10.1.0.1:10911", "10.1.0.2:10911"),
-	}))
+	})))
 	inst := CreateOrGetInstance(uniqueClientID(t), []string{ns.addr}, testConfig())
 	defer inst.Shutdown()
 	if _, err := inst.UpdateTopicRouteInfoFromNameServer("Tt", 2000, false); err != nil {
@@ -863,7 +888,7 @@ func TestCleanOfflineBroker(t *testing.T) {
 	}
 
 	// The nameserver now reports an empty route: b1 has no live entry left.
-	ns2 := startMockServer(t, nameserverOnReq(map[string]string{"Tt": emptyRouteBody()}))
+	ns2 := startMockServer(t, nameserverOnReq(routes(map[string]string{"Tt": emptyRouteBody()})))
 	inst2 := CreateOrGetInstance(uniqueClientID(t), []string{ns2.addr}, testConfig())
 	defer inst2.Shutdown()
 	if _, err := inst2.UpdateTopicRouteInfoFromNameServer("Tt", 2000, false); err != nil {

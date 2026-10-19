@@ -177,18 +177,25 @@ def test_explicit_cap_is_used_as_is():
 
 
 def test_orderly_cap_does_not_reuse_the_concurrent_16_default():
-    """The concurrent side's ``-1 -> 16`` (``DefaultMQPushConsumerImpl#getMaxReconsumeTimes:890``) and the orderly side's
-    ``-1 -> Integer.MAX_VALUE`` are **two** conventions. Merging them into one constant would make orderly consumption produce dead letters out of thin air,
-    or make concurrent messages retry forever -- so each side is tested once for the value that really lands in the request header."""
+    """``-1`` means "not configured", and the two consume modes resolve it differently: concurrent
+    send-back lands on 16, orderly consumption lands on ``Integer.MAX_VALUE``. Merging them into one
+    constant would make orderly consumption produce dead letters out of thin air, or make concurrent
+    messages retry forever -- so each side is tested once for the value that really lands in the
+    request header."""
     captured = {}
 
     class FakeClient:
         def find_broker_address_in_publish(self, broker_name):
             return "127.0.0.1:10911"
 
+        def vip_addr(self, addr):
+            # The VIP knob defaults off, so the address goes out unchanged.
+            return addr
+
         def _invoke_sync(self, addr, request, timeout):
             captured["ext"] = dict(request.ext_fields)
             captured["header"] = request.custom_header
+            captured["addr"] = addr
             return _OkResponse()
 
         def _check_response(self, response):
@@ -202,6 +209,7 @@ def test_orderly_cap_does_not_reuse_the_concurrent_16_default():
     c.send_message_back(m, 3)
     header: ConsumerSendMsgBackRequestHeader = captured["header"]
     assert header.max_reconsume_times == 16, "concurrent send-back still follows -1 -> 16"
+    assert captured["addr"] == "127.0.0.1:10911", "the plain broker address while the VIP channel is off"
     assert c._orderly_max_reconsume_times() == _INT32_MAX, "the orderly side must be" \
         " Integer.MAX_VALUE; the two must not share one parse result"
 

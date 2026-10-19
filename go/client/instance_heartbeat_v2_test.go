@@ -155,7 +155,7 @@ func newV2Cluster(t *testing.T, useV2, withSlave bool) *v2Cluster {
 		slave.setFlags(true, true, false)
 		body = routeBodyFor(master.srv.addr, slave.srv.addr)
 	}
-	ns := startMockServer(t, nameserverOnReq(map[string]string{"V2Topic": body}))
+	ns := startMockServer(t, nameserverOnReq(routes(map[string]string{"V2Topic": body})))
 
 	cfg := testConfig()
 	cfg.UseHeartbeatV2 = useV2
@@ -586,9 +586,9 @@ func TestInstanceHeartbeatV2ErrorLeavesStateAlone(t *testing.T) {
 	drop.srv.setDrop(true)
 	cfg := testConfig()
 	cfg.UseHeartbeatV2 = true
-	ns := startMockServer(t, nameserverOnReq(map[string]string{
+	ns := startMockServer(t, nameserverOnReq(routes(map[string]string{
 		"V2Drop": routeBodyFor(drop.srv.addr, ""),
-	}))
+	})))
 	dropping := CreateOrGetInstance(uniqueClientID(t), []string{ns.addr}, cfg)
 	t.Cleanup(dropping.Shutdown)
 	warmRoute(t, dropping, "V2Drop")

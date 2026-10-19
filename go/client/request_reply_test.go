@@ -96,9 +96,9 @@ func startProducerWithHandler(t *testing.T, topic, group string,
 ) (*DefaultMQProducer, *mockServer) {
 	t.Helper()
 	broker := startMockServer(t, onReq)
-	ns := startMockServer(t, nameserverOnReq(map[string]string{
+	ns := startMockServer(t, nameserverOnReq(routes(map[string]string{
 		topic: routeBodyFor(broker.addr, ""),
-	}))
+	})))
 	p := MustNewDefaultMQProducer(group)
 	p.SetNameServerAddresses([]string{ns.addr})
 	p.SetInstanceName(uniqueClientID(t))
@@ -457,9 +457,9 @@ func TestProducerRecallMessageRoundTrip(t *testing.T) {
 
 func TestProducerRecallRejectsBadHandleAndTopics(t *testing.T) {
 	const topic = "RecallRejectTopic"
-	ns := startMockServer(t, nameserverOnReq(map[string]string{
+	ns := startMockServer(t, nameserverOnReq(routes(map[string]string{
 		topic: routeBodyFor("127.0.0.1:1", ""),
-	}))
+	})))
 	p := MustNewDefaultMQProducer("GID_recall_reject")
 	p.SetNameServerAddresses([]string{ns.addr})
 	p.SetInstanceName(uniqueClientID(t))

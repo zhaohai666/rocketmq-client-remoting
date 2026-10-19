@@ -37,9 +37,9 @@ func startDetectorFixture(t *testing.T, probeAnswer func() int32) (*DefaultMQPro
 		}
 		return remoting.CreateResponseCommand(remoting.RespSuccess, "")
 	})
-	ns := startMockServer(t, nameserverOnReq(map[string]string{
+	ns := startMockServer(t, nameserverOnReq(routes(map[string]string{
 		detectTestTopic: routeBodyFor(broker.addr, ""),
-	}))
+	})))
 	p := MustNewDefaultMQProducer("GID_detector")
 	p.SetNameServerAddresses([]string{ns.addr})
 	p.SetInstanceName(uniqueClientID(t))

@@ -73,9 +73,9 @@ func startProducerFixture(t *testing.T, topic, group string) (*DefaultMQProducer
 	t.Helper()
 	handler := &sendBrokerOnReq{offset: 7}
 	broker := startMockServer(t, handler.handle)
-	ns := startMockServer(t, nameserverOnReq(map[string]string{
+	ns := startMockServer(t, nameserverOnReq(routes(map[string]string{
 		topic: routeBodyFor(broker.addr, ""),
-	}))
+	})))
 	p := MustNewDefaultMQProducer(group)
 	p.SetNameServerAddresses([]string{ns.addr})
 	p.SetInstanceName(uniqueClientID(t))
@@ -346,9 +346,9 @@ func TestProducerRetrySkipsTheFailingBroker(t *testing.T) {
 	broker1 := startMockServer(t, first.handle)
 	second := &sendBrokerOnReq{offset: 2}
 	broker2 := startMockServer(t, second.handle)
-	ns := startMockServer(t, nameserverOnReq(map[string]string{
+	ns := startMockServer(t, nameserverOnReq(routes(map[string]string{
 		topic: twoBrokerRouteBody(broker1.addr, broker2.addr),
-	}))
+	})))
 
 	p := MustNewDefaultMQProducer("GID_prod_retry")
 	p.SetNameServerAddresses([]string{ns.addr})
@@ -379,7 +379,7 @@ func TestProducerDoesNotRetryNonRetryableBrokerCode(t *testing.T) {
 	const topic = "ProdNoRetryTopic"
 	handler := &sendBrokerOnReq{offset: 1, sendCode: remoting.RespMessageIllegal}
 	broker := startMockServer(t, handler.handle)
-	ns := startMockServer(t, nameserverOnReq(map[string]string{topic: routeBodyFor(broker.addr, "")}))
+	ns := startMockServer(t, nameserverOnReq(routes(map[string]string{topic: routeBodyFor(broker.addr, "")})))
 
 	p := MustNewDefaultMQProducer("GID_prod_noretry")
 	p.SetNameServerAddresses([]string{ns.addr})
@@ -478,10 +478,10 @@ func TestProducerRetryTopicHoistsReconsumeTimes(t *testing.T) {
 	handler := &sendBrokerOnReq{offset: 1}
 	broker := startMockServer(t, handler.handle)
 	retryTopic := common.RetryGroupTopicPrefix + "GID_prod_hoist"
-	ns := startMockServer(t, nameserverOnReq(map[string]string{
+	ns := startMockServer(t, nameserverOnReq(routes(map[string]string{
 		baseTopic:  routeBodyFor(broker.addr, ""),
 		retryTopic: routeBodyFor(broker.addr, ""),
-	}))
+	})))
 	p := MustNewDefaultMQProducer("GID_prod_hoist")
 	p.SetNameServerAddresses([]string{ns.addr})
 	p.SetInstanceName(uniqueClientID(t))

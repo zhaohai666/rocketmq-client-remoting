@@ -119,6 +119,13 @@ type pullQueueTask struct {
 	cancel     chan struct{}
 	cancelOnce sync.Once
 	cancelled  atomic.Bool
+	// stop and sem are THIS task's life: putTask captures them under s.mu, and
+	// Start replaces the service's copies. A task that outlives Shutdown (parked
+	// in its delay, or draining past the bounded wait) therefore keeps watching
+	// the channel Shutdown closed, so it exits — and it never reads the fields a
+	// later Start writes.
+	stop chan struct{}
+	sem  chan struct{}
 	// cursor is the queue's pull position; -1 means "not resolved yet" and
 	// 	the next round reads it from the offset store / broker.
 	cursor atomic.Int64
@@ -455,7 +462,8 @@ func (s *MQPullConsumerScheduleService) putTask(topic string, queues []common.Me
 		if _, ok := s.tasks[mq]; ok {
 			continue
 		}
-		task := &pullQueueTask{mq: mq, service: s, cancel: make(chan struct{})}
+		task := &pullQueueTask{mq: mq, service: s, cancel: make(chan struct{}),
+			stop: s.stop, sem: s.sem}
 		task.cursor.Store(-1)
 		s.tasks[mq] = task
 		go task.run()
@@ -480,8 +488,8 @@ func (t *pullQueueTask) run() {
 			return
 		}
 		select {
-		case s.sem <- struct{}{}:
-		case <-s.stop:
+		case t.sem <- struct{}{}:
+		case <-t.stop:
 			return
 		case <-t.cancel:
 			return
@@ -501,7 +509,7 @@ func (t *pullQueueTask) run() {
 		if s.stopped.Load() {
 			s.mu.Unlock()
 			l.Unlock()
-			<-s.sem
+			<-t.sem
 			return
 		}
 		s.runWG.Add(1)
@@ -509,7 +517,7 @@ func (t *pullQueueTask) run() {
 		next = s.runRound(t)
 		s.runWG.Done()
 		l.Unlock()
-		<-s.sem
+		<-t.sem
 		if t.cancelled.Load() {
 			common.LogWarnf("The Pull Task is cancelled after doPullTask, %v", t.mq)
 			return
@@ -530,7 +538,7 @@ func (t *pullQueueTask) waitDelay(millis int64) bool {
 	select {
 	case <-timer.C:
 		return true
-	case <-t.service.stop:
+	case <-t.stop:
 		return false
 	case <-t.cancel:
 		return false

@@ -135,7 +135,7 @@ func newSpanCluster(t *testing.T, topic string, code1, code2 int32, body1, body2
 		topic:   topic,
 	}
 	route := spanRouteBody(c.master1.srv.addr, c.slave1.srv.addr, c.master2.srv.addr)
-	ns := startMockServer(t, nameserverOnReq(map[string]string{topic: route}))
+	ns := startMockServer(t, nameserverOnReq(routes(map[string]string{topic: route})))
 
 	admin := NewDefaultMQAdminExt(nil)
 	admin.SetNameServerAddresses([]string{ns.addr})
@@ -270,7 +270,7 @@ func TestAdminQueryConsumeTimeSpanPropagatesBrokerError(t *testing.T) {
 
 func TestAdminQueryConsumeTimeSpanWithoutRoute(t *testing.T) {
 	const topic = "SpanNoRouteTopic"
-	ns := startMockServer(t, nameserverOnReq(map[string]string{}))
+	ns := startMockServer(t, nameserverOnReq(routes(map[string]string{})))
 	admin := NewDefaultMQAdminExt(nil)
 	admin.SetNameServerAddresses([]string{ns.addr})
 	admin.SetInstanceName(uniqueSuffix(t))

@@ -19,9 +19,9 @@ func startTransactionFixture(t *testing.T, topic, group string) (*TransactionMQP
 	t.Helper()
 	handler := &sendBrokerOnReq{offset: 5}
 	broker := startMockServer(t, handler.handle)
-	ns := startMockServer(t, nameserverOnReq(map[string]string{
+	ns := startMockServer(t, nameserverOnReq(routes(map[string]string{
 		topic: routeBodyFor(broker.addr, ""),
-	}))
+	})))
 	p := MustNewTransactionMQProducer(group)
 	p.SetNameServerAddresses([]string{ns.addr})
 	p.SetInstanceName(uniqueClientID(t))
