@@ -1,24 +1,24 @@
-// The C++ counterpart of Java's MQPullConsumerScheduleService (+ the PullRequest / PullMessageService
-// scheduling semantics folded in): register a PullTaskCallback per topic; a resident scheduler thread
-// (detector-thread style: stop flag + sleepUntilDeadline, see src/client/schedule_util.h) periodically
+// Scheduled pull consumer: register a PullTaskCallback per topic; a resident scheduler thread
+// owns the queue-dimension pull scheduling (which queue's round is due, and when the next one runs)
+// (detector-thread style: stop flag + sleepUntilDeadline, see src/client/schedule_util.h); it periodically
 // recomputes **this instance's share** of every registered topic (fetchMessageQueuesInBalance for
-// CLUSTERING / fetchSubscribeMessageQueues for BROADCASTING -- this port has no rebalance thread, so the
-// refresh replaces Java's MessageQueueListener callback), fans the share out into queue-dimension tasks
+// CLUSTERING / fetchSubscribeMessageQueues for BROADCASTING -- this service has no rebalance thread, so the
+// refresh doubles as the queue-change notification), fans the share out into queue-dimension tasks
 // (putTask) and dispatches due tasks onto a ConsumeExecutor worker pool ("PullMsgThread", pullThreadNums
-// wide, Java default 20).
+// wide, 20 by default).
 //
 // Per-queue execution is **serial** (a running flag gates re-dispatch); different queues run in parallel.
 // Each round the service pulls on the task's behalf (offset bookkeeping included: the first round starts
-// from fetchConsumeOffset or maxOffset, later rounds follow nextBeginOffset like PullMessageService, and
+// from fetchConsumeOffset or maxOffset, later rounds follow the reply's nextBeginOffset, and
 // the offset is fed into updateConsumeOffset), then hands the PullResult to doPullTask.
 //
 // When the next round runs is decided by three channels, in strict priority order:
 //   1. the doPullTask **return value** (>= 0 = delay millis) -- highest;
-//   2. PullTaskContext::pullMessageLater(delayMillis) -- a one-shot deferral (executePullRequestLater);
-//   3. PullTaskContext::setPullInterval(millis) -- the interval channel (pullNextDelayTimeMillis);
+//   2. PullTaskContext::pullMessageLater(delayMillis) -- a one-shot deferral of just the next round;
+//   3. PullTaskContext::setPullInterval(millis) -- the interval channel for every following round;
 //   4. none used -> status default: FOUND = 0 (immediately), empty/illegal reply =
-//      pullTimeDelayMillisWhenException (Java's 3s); a failed service pull or a throwing callback =
-//      pullTaskExceptionDelayMillis (Java pins 1000ms on the callback exception).
+//      pullTimeDelayMillisWhenException (3s by default); a failed service pull or a throwing callback =
+//      pullTaskExceptionDelayMillis (1000ms by default, which a callback exception also lands on).
 //
 // shutdown() stops the scheduler first, then **drains** the in-flight tasks (ConsumeExecutor::shutdown(true))
 // before the consumer goes down, so no callback is cut in half.
@@ -41,8 +41,8 @@
 
 namespace rocketmq {
 
-// Java's PullTaskContext, extended with the three scheduling channels (see the file header for the
-// priority order). A fresh context is built for every round, exactly like Java's PullTaskImpl.
+// The per-round context, carrying the three scheduling channels (see the file header for the
+// priority order). A fresh context is built for every round, so one round leaks nothing into the next.
 class PullTaskContext {
 public:
     // Channel 3: the delay to the next round when neither the return value nor pullMessageLater is used.
@@ -53,7 +53,7 @@ public:
     int32_t pullInterval() const { return pullInterval_; }
     bool pullIntervalSet() const { return intervalSet_; }
 
-    // Channel 2: one-shot deferral of the next round (Java's executePullRequestLater equivalent).
+    // Channel 2: one-shot deferral of the next round; the interval for the rounds after it is unchanged.
     void pullMessageLater(int32_t delayMillis) {
         laterDelay_ = delayMillis;
         laterSet_ = true;
@@ -62,7 +62,7 @@ public:
     bool pullLaterSet() const { return laterSet_; }
 
     // The service-owned consumer, so a callback can pull other queues / manage offsets itself
-    // (Java's context.getPullConsumer()).
+    // through the same client the service pulls with.
     DefaultMQPullConsumer* pullConsumer() const { return consumer_; }
     void setPullConsumer(DefaultMQPullConsumer* consumer) { consumer_ = consumer; }
 
@@ -74,7 +74,7 @@ private:
     DefaultMQPullConsumer* consumer_ = nullptr;
 };
 
-// Java's PullTaskCallback. Differences forced by this port:
+// The per-topic task callback. Differences forced by this scheduling design:
 //   * the service pulls **before** the callback runs and passes the PullResult in (mutable, so a
 //     callback may even rewrite what it hands to its own downstream);
 //   * doPullTask returns the highest-priority scheduling channel: the next delay in millis, or
@@ -101,26 +101,26 @@ public:
 
     void setPullThreadNums(int32_t n) { pullThreadNums_ = n > 0 ? n : 1; }
     int32_t pullThreadNums() const { return pullThreadNums_; }
-    // How often the scheduler recomputes this instance's share (Java gets it pushed by rebalance; here it is polled).
+    // How often the scheduler recomputes this instance's share (polled here, since no rebalance thread pushes it).
     void setQueueRefreshIntervalMillis(int32_t millis) {
         queueRefreshIntervalMillis_ = millis > 0 ? millis : 1;
     }
     int32_t queueRefreshIntervalMillis() const { return queueRefreshIntervalMillis_; }
-    // maxMsgNums of the service pull (Java leaves this to the callback's own pull call).
+    // maxMsgNums of the service pull -- the service pulls on the callback's behalf, so the batch size is set here.
     void setPullBatchNums(int32_t n) { pullBatchNums_ = n > 0 ? n : 1; }
     int32_t pullBatchNums() const { return pullBatchNums_; }
-    // Java's PULL_TIME_DELAY_MILLS_WHEN_EXCEPTION: the status default for an empty / OFFSET_ILLEGAL reply.
+    // The status default (channel 4) for an empty / OFFSET_ILLEGAL reply; 3000ms unless overridden.
     void setPullTimeDelayMillisWhenException(int32_t millis) {
         pullTimeDelayMillisWhenException_ = millis >= 0 ? millis : 0;
     }
     int32_t pullTimeDelayMillisWhenException() const { return pullTimeDelayMillisWhenException_; }
-    // The retry delay when the service pull itself failed or doPullTask threw (Java pins 1000ms there).
+    // The retry delay when the service pull itself failed or doPullTask threw (1000ms unless overridden).
     void setPullTaskExceptionDelayMillis(int32_t millis) {
         pullTaskExceptionDelayMillis_ = millis >= 0 ? millis : 0;
     }
     int32_t pullTaskExceptionDelayMillis() const { return pullTaskExceptionDelayMillis_; }
 
-    // Java's registerPullTaskCallback: binds the callback (and the subExpression the service pull uses)
+    // Binds the callback (and the subExpression the service pull uses)
     // to the topic and registers the topic on the consumer so heartbeats carry the subscription.
     // May be called before or after start(); the refresh loop picks new topics up on the next pass.
     void registerPullTaskCallback(const std::string& topic,
@@ -133,9 +133,9 @@ public:
     void shutdown();
     bool isStarted() const { return started_; }
 
-    // Java's putTask: aligns the task table with a new queue set for one topic -- tasks of queues that
+    // Aligns the task table with a new queue set for one topic -- tasks of queues that
     // left the set are cancelled (an in-flight round finishes but is never rescheduled), new queues are
-    // scheduled immediately. Public like in Java; the scheduler calls it after every refresh.
+    // scheduled immediately. Public so a caller can drive the table itself; the scheduler calls it after every refresh.
     void putTask(const std::string& topic, const std::vector<MessageQueue>& mqNewSet);
 
     // Live entries of the task table (for tests/diagnostics).

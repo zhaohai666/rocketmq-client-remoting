@@ -1,16 +1,16 @@
 //! `MQPullConsumerScheduleService`: per-queue scheduled pulling on top of [`DefaultMQPullConsumer`].
 //!
-//! Port of Java `consumer/MQPullConsumerScheduleService.java` (+ the scheduling role that
-//! `impl/consumer/PullRequest.java` / `impl/consumer/PullMessageService.java` play for the push
-//! path -- this facade needs neither: the "pull request" here is just the per-queue task loop).
+//! Scheduled pulling is implemented directly on the consumer: no per-request state machine and
+//! no shared message service of the kind a push path needs -- this facade's "pull request" is
+//! just the per-queue task loop, each queue driven by its own task.
 //!
 //! # Shape
 //!
 //! * One [`PullTaskCallback`] per topic ([`register_pull_task_callback`]); the callback owns the
 //!   pulling itself, through the consumer exposed by [`PullTaskContext::pull_consumer`]
-//!   (Java: `context.getPullConsumer().pull(..)`).
-//! * One tokio task per [`MessageQueue`] ([`put_task`] expands/retires the task table exactly like
-//!   Java `putTask`: queues that fell out of the set are cancelled, new queues spawn immediately).
+//!   (i.e. it takes the consumer from its context and pulls on it).
+//! * One tokio task per [`MessageQueue`] ([`put_task`] expands/retires the task table:
+//!   queues that fell out of the set are cancelled, new queues spawn immediately).
 //!   The same queue is therefore **strictly serial** -- the next round starts only after the
 //!   previous `do_pull_task` returned.
 //! * Queue sets come from the local rebalance view: CLUSTERING uses
@@ -23,27 +23,27 @@
 //!
 //! 1. the **return value** of `do_pull_task` (`Some(delay)`) -- one-shot, highest priority;
 //! 2. [`pull_message_later`](PullTaskContext::pull_message_later) -- one-shot delay for the next
-//!    round (= Java `setPullNextDelayTimeMillis`);
+//!    round;
 //! 3. [`set_pull_interval`](PullTaskContext::set_pull_interval) -- standing per-queue interval,
 //!    remembered across rounds until changed again;
-//! 4. none of the above: [`DEFAULT_PULL_NEXT_DELAY_MILLIS`] (= Java's default 200ms).
+//! 4. none of the above: [`DEFAULT_PULL_NEXT_DELAY_MILLIS`] (200ms, the idle-round default).
 //!
 //! A panicking callback is caught (the round runs on a child task) and reschedules with
-//! [`PULL_TASK_EXCEPTION_DELAY_MILLIS`] -- Java's `catch (Throwable) { setPullNextDelayTimeMillis(1000) }`.
+//! [`PULL_TASK_EXCEPTION_DELAY_MILLIS`] -- the 1000ms error backoff for a lost round.
 //!
-//! # Deviations from Java (deliberate)
+//! # Scheduling model (design notes)
 //!
-//! * Java schedules on a `ScheduledThreadPoolExecutor(pullThreadNums = 20)`; here each queue is a
-//!   tokio task, so `pullThreadNums` has no meaning and is not ported.
-//! * Java is push-driven by the client instance's `RebalanceService` through a
-//!   `MessageQueueListener`; this port reconciles the balance view periodically
+//! * Each queue is its own tokio task; a fixed scheduler pool (`pullThreadNums = 20`) would
+//!   bound nothing here, so this facade exposes no such knob.
+//! * The balance view is reconciled by this service itself, not pushed to it: it
+//!   re-reads the rebalance state periodically
 //!   ([`reconcile_interval_millis`](MQPullConsumerScheduleService::reconcile_interval_millis),
-//!   default 20s = the Java rebalance period), once immediately inside
+//!   default 20s, the rebalance period a client instance keeps anyway), once immediately inside
 //!   [`start`](MQPullConsumerScheduleService::start), plus on-demand
 //!   [`reconcile`](MQPullConsumerScheduleService::reconcile) / manual
 //!   [`put_task`](MQPullConsumerScheduleService::put_task).
-//! * `do_pull_task` carries an extra `pull_result: Option<PullResult>` argument for signature
-//!   parity with the task spec; the scheduler never pulls itself, so it is always `None` today.
+//! * `do_pull_task` carries an extra `pull_result: Option<PullResult>` argument so every
+//!   task callback shares one signature; the scheduler never pulls itself, so it is always `None` today.
 //! * [`shutdown`](MQPullConsumerScheduleService::shutdown) **drains**: in-flight callbacks are
 //!   awaited (bounded by `SHUTDOWN_FINALIZE_BUDGET`), never aborted mid-flight.
 
@@ -68,18 +68,18 @@ use crate::remoting::protocol::namespace_util::NamespaceUtil;
 use crate::remoting::rpchook::RPCHook;
 use crate::{rmq_debug, rmq_error, rmq_warn};
 
-/// Default delay to the next round when the callback expressed nothing (Java `pullNextDelayTimeMillis = 200`).
+/// Default delay to the next round when the callback expressed nothing: 200ms.
 pub const DEFAULT_PULL_NEXT_DELAY_MILLIS: u64 = 200;
-/// Java's `catch (Throwable)` branch: `context.setPullNextDelayTimeMillis(1000)`.
+/// Error backoff for a round that panicked instead of returning a delay: 1000ms.
 pub const PULL_TASK_EXCEPTION_DELAY_MILLIS: u64 = 1_000;
-/// Default reconcile period, matching the 20s cadence of the Java `RebalanceService`.
+/// Default reconcile period: the 20s rebalance cadence a client instance keeps.
 pub const DEFAULT_RECONCILE_INTERVAL_MILLIS: u64 = 20_000;
 
 /// What a [`PullTaskCallback::do_pull_task`] returns: `Some(delay)` is the highest-priority
 /// rescheduling channel, `None` defers to the [`PullTaskContext`] channels.
 pub type PullTaskFuture = Pin<Box<dyn Future<Output = Option<Duration>> + Send + 'static>>;
 
-/// Per-topic pull task (Java `PullTaskCallback`).
+/// Per-topic pull task callback contract.
 ///
 /// The callback does the actual pulling through [`PullTaskContext::pull_consumer`] and expresses
 /// the next-round delay through the three channels documented on [`PullTaskContext`].
@@ -135,11 +135,11 @@ where
 struct CtxCell {
     /// Channel 3: standing per-queue interval, carried across rounds by the queue loop.
     interval: Option<Duration>,
-    /// Channel 2: one-shot delay for the next round (Java `pullNextDelayTimeMillis`).
+    /// Channel 2: one-shot delay for the next round.
     later: Option<Duration>,
 }
 
-/// Handed to every [`PullTaskCallback::do_pull_task`] round (Java `PullTaskContext`).
+/// Handed to every [`PullTaskCallback::do_pull_task`] round.
 ///
 /// Fresh per round; the standing interval set through [`set_pull_interval`](Self::set_pull_interval)
 /// is carried over to the following rounds of the same queue by the loop.
@@ -163,7 +163,7 @@ impl PullTaskContext {
         self.cell.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The consumer this service schedules for (= Java `getPullConsumer()`); clones share state.
+    /// The consumer this service schedules for; clones share state.
     pub fn pull_consumer(&self) -> DefaultMQPullConsumer {
         self.consumer.clone()
     }
@@ -178,12 +178,12 @@ impl PullTaskContext {
         self.lock_cell().interval
     }
 
-    /// Channel 2: one-shot delay for the next round (= Java `setPullNextDelayTimeMillis`).
+    /// Channel 2: one-shot delay for the next round.
     pub fn pull_message_later(&self, delay: Duration) {
         self.lock_cell().later = Some(delay);
     }
 
-    /// Java `getPullNextDelayTimeMillis()`: the delay the context channels alone would produce
+    /// The delay a caller can read: what the context channels alone would produce
     /// (the return-value channel is not visible here).
     pub fn pull_next_delay_millis(&self) -> i64 {
         self.resolve(None).as_millis() as i64
@@ -203,27 +203,27 @@ impl PullTaskContext {
         self.lock_cell().interval
     }
 
-    /// Java's `catch (Throwable)` branch: force the 1000ms error delay over whatever the
-    /// callback had set as its one-shot delay.
+    /// Panic path: force the 1000ms error delay over whatever the callback had
+    /// set as its one-shot delay.
     fn mark_exception(&self) {
         self.lock_cell().later = Some(Duration::from_millis(PULL_TASK_EXCEPTION_DELAY_MILLIS));
     }
 }
 
-/// One entry of the task table (Java `PullTaskImpl` + its scheduled future).
+/// One entry of the task table: a queue's loop task and its join handle.
 struct QueueTask {
     topic: String,
     mq: MessageQueue,
-    /// `true` = retired by `put_task` (Java `setCancelled(true)`); the loop notices and exits.
+    /// `true` = retired by `put_task`; the loop notices and exits.
     cancel: watch::Sender<bool>,
     handle: JoinHandle<()>,
 }
 
 struct ScheduleInner {
     consumer: DefaultMQPullConsumer,
-    /// Namespaced topic -> callback (Java `callbackTable`).
+    /// Namespaced topic -> callback.
     callbacks: RwLock<BTreeMap<String, Arc<dyn PullTaskCallback>>>,
-    /// mq key -> live task (Java `taskTable`).
+    /// mq key -> live task.
     tasks: Mutex<BTreeMap<String, QueueTask>>,
     /// Handles of tasks retired by `put_task`; drained/aborted at shutdown, pruned when finished.
     retired: Mutex<Vec<JoinHandle<()>>>,
@@ -297,7 +297,7 @@ async fn wait_or_stop(rx: &mut watch::Receiver<bool>, millis: u64) -> bool {
     }
 }
 
-/// The per-queue loop (Java `PullTaskImpl.run` + its reschedule).
+/// The per-queue loop: run one round, wait the resolved delay, repeat.
 ///
 /// Serial by construction: one iteration = one full `do_pull_task` round + the resolved delay.
 async fn queue_loop(
@@ -329,7 +329,7 @@ async fn queue_loop(
         };
         let context = Arc::new(PullTaskContext::new(inner.consumer.clone(), interval));
         // The round runs on a child task so that a panicking callback cannot take the loop down
-        // (Java catches Throwable here and reschedules after 1000ms).
+        // (the panic costs one round and reschedules after 1000ms).
         let round = tokio::spawn({
             let callback = Arc::clone(&callback);
             let mq = mq.clone();
@@ -358,7 +358,7 @@ async fn queue_loop(
     }
 }
 
-/// Java `MQPullConsumerScheduleService`. Clones share the same state.
+/// The per-queue scheduled pull service. Clones share the same state.
 #[derive(Clone)]
 pub struct MQPullConsumerScheduleService {
     inner: Arc<ScheduleInner>,
@@ -387,14 +387,14 @@ impl std::fmt::Debug for MQPullConsumerScheduleService {
 }
 
 impl MQPullConsumerScheduleService {
-    /// Java constructor: owns a fresh [`DefaultMQPullConsumer`] pinned to CLUSTERING.
+    /// The plain constructor: owns a fresh [`DefaultMQPullConsumer`] pinned to CLUSTERING.
     pub fn new(consumer_group: &str) -> Result<MQPullConsumerScheduleService> {
         let consumer = DefaultMQPullConsumer::new(consumer_group)?;
         consumer.set_message_model(MessageModel::CLUSTERING);
         Ok(MQPullConsumerScheduleService::from_consumer(consumer))
     }
 
-    /// Java's `(consumerGroup, rpcHook)` constructor.
+    /// The constructor variant that also takes an rpc hook.
     pub fn with_rpc_hook(
         consumer_group: &str,
         rpc_hook: Option<Arc<dyn RPCHook>>,
@@ -405,14 +405,14 @@ impl MQPullConsumerScheduleService {
     }
 
     /// Schedule on an existing (typically pre-configured) consumer
-    /// (covers Java `setDefaultMQPullConsumer` at construction time).
+    /// (pass the consumer in up front instead of letting the service build one).
     pub fn from_consumer(consumer: DefaultMQPullConsumer) -> MQPullConsumerScheduleService {
         MQPullConsumerScheduleService {
             inner: Arc::new(ScheduleInner::new(consumer)),
         }
     }
 
-    /// The consumer being scheduled (= Java `getDefaultMQPullConsumer()`); clones share state.
+    /// The consumer being scheduled; clones share state.
     pub fn pull_consumer(&self) -> DefaultMQPullConsumer {
         self.inner.consumer.clone()
     }
@@ -423,8 +423,8 @@ impl MQPullConsumerScheduleService {
 
     // ---------------- Configuration ----------------
 
-    /// How often the reconcile loop re-reads the rebalance view (default 20s, the Java
-    /// `RebalanceService` cadence). Also runs once immediately inside [`start`](Self::start)
+    /// How often the reconcile loop re-reads the rebalance view (default 20s, the
+    /// rebalance cadence a client instance keeps). Also runs once immediately inside [`start`](Self::start)
     /// and on every [`reconcile`](Self::reconcile) call.
     pub fn set_reconcile_interval_millis(&self, millis: u64) {
         self.inner
@@ -438,7 +438,7 @@ impl MQPullConsumerScheduleService {
 
     // ---------------- Callback registration ----------------
 
-    /// Java `registerPullTaskCallback(topic, callback)`: the topic is namespaced for the callback
+    /// Register a per-topic callback: the topic is namespaced for the callback
     /// table and registered on the consumer (so heartbeats carry its subscription and the route
     /// gets refreshed). Re-registering overwrites.
     pub fn register_pull_task_callback(&self, topic: &str, callback: Arc<dyn PullTaskCallback>) {
@@ -555,7 +555,7 @@ impl MQPullConsumerScheduleService {
 
     // ---------------- Task table ----------------
 
-    /// Java `putTask(topic, mqNewSet)`: retire the tasks of `topic` that fell out of the set and
+    /// Align the task table of `topic` with `mq_new_set`: retire the tasks that fell out of the set and
     /// spawn the missing ones. Queues already in the table keep their loop untouched.
     /// Retired loops are cancelled at their next checkpoint (an in-flight round still completes).
     pub fn put_task(&self, topic: &str, mq_new_set: &[MessageQueue]) {
@@ -588,7 +588,7 @@ impl MQPullConsumerScheduleService {
 fn put_task_on(inner: &Arc<ScheduleInner>, topic: &str, mq_new_set: &[MessageQueue]) {
     let new_keys: BTreeSet<String> = mq_new_set.iter().map(mq_key).collect();
     let mut tasks = lock(&inner.tasks);
-    // Retire the queues of this topic that are no longer assigned (Java: setCancelled + remove).
+    // Retire the queues of this topic that are no longer assigned: cancel the watch, drop the entry.
     let stale: Vec<String> = tasks
         .iter()
         .filter(|(key, task)| task.topic == topic && !new_keys.contains(*key))
@@ -796,12 +796,12 @@ mod tests {
         assert_eq!(ctx.resolve(Some(Duration::from_millis(300))), Duration::from_millis(300));
         // Channel 2 beats the standing interval
         assert_eq!(ctx.resolve(None), Duration::from_millis(500));
-        assert_eq!(ctx.pull_next_delay_millis(), 500, "Java getter shape");
+        assert_eq!(ctx.pull_next_delay_millis(), 500, "the delay getter reports channel 2");
         // Channel 3 alone
         let ctx2 = PullTaskContext::new(consumer.clone(), Some(Duration::from_millis(700)));
         assert_eq!(ctx2.resolve(None), Duration::from_millis(700));
         assert_eq!(ctx2.pull_interval(), Some(Duration::from_millis(700)));
-        // Nothing set: the Java default 200ms
+        // Nothing set: the 200ms default
         let ctx3 = PullTaskContext::new(consumer.clone(), None);
         assert_eq!(ctx3.resolve(None), Duration::from_millis(DEFAULT_PULL_NEXT_DELAY_MILLIS));
         assert_eq!(ctx3.pull_next_delay_millis(), 200);
@@ -809,7 +809,7 @@ mod tests {
         ctx3.pull_message_later(Duration::from_millis(50));
         ctx3.mark_exception();
         assert_eq!(ctx3.resolve(None), Duration::from_millis(PULL_TASK_EXCEPTION_DELAY_MILLIS));
-        // The consumer is reachable from the context (Java getPullConsumer)
+        // The consumer is reachable from the context
         assert_eq!(ctx3.pull_consumer().consumer_group(), "PG_CtxPrio");
     }
 
@@ -854,14 +854,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn missing_callback_ends_the_task_like_java() {
+    async fn missing_callback_ends_the_task() {
         let consumer = DefaultMQPullConsumer::new("PG_SchedNoCb").unwrap();
         let svc = MQPullConsumerScheduleService::from_consumer(consumer);
         let q = queue("T", "broker-a", 0);
-        // put_task before any callback: the loop exits on Java's "Pull Task Callback not exist" branch
+        // put_task before any callback: the loop exits on the "Pull Task Callback not exist" branch
         svc.put_task("T", std::slice::from_ref(&q));
         wait_until(|| !svc.task_alive(&q), "the loop exits without a callback").await;
-        // Java keeps the dead entry in taskTable, so re-putting the same set does NOT respawn;
+        // The dead entry stays in the task table, so re-putting the same set does NOT respawn;
         // the queue revives once it leaves the set and comes back (same semantics here).
         svc.register_pull_task_callback(
             "T",
@@ -871,7 +871,7 @@ mod tests {
         );
         assert_eq!(svc.callback_topics(), vec!["T".to_string()]);
         svc.put_task("T", std::slice::from_ref(&q));
-        assert!(!svc.task_alive(&q), "a dead entry is not respawned by an unchanged set (Java taskTable semantics)");
+        assert!(!svc.task_alive(&q), "a dead entry is not respawned by an unchanged set");
         let rec = Arc::new(Recorder::default());
         svc.register_pull_task_callback(
             "T",
@@ -992,7 +992,7 @@ mod tests {
             })
         });
         svc.put_task("T", &[queue("T", "broker-a", 0)]);
-        // Round 1 panics -> the Java Throwable branch reschedules after 1000ms -> round 2 arrives.
+        // Round 1 panics -> the panic branch reschedules after 1000ms -> round 2 arrives.
         wait_until(|| rec.call_count() >= 2, "the loop survived the panic").await;
         svc.shutdown();
     }

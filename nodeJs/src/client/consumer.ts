@@ -134,7 +134,7 @@ export class DefaultMQPushConsumer {
   // NamespaceRpcHook, independent from `namespace`.
   namespaceV2: string | null = null;
   // User RPCHook (e.g. AclRPCHook for broker-side ACL signing), installed on
-  // the MQClientInstance's remoting client at creation, exactly like the
+  // the shared MQClient instance's remoting client at creation, exactly like the
   // producer's `rpcHook`. Registered AFTER the namespace hook so the ACL
   // signature covers every extField the namespace hook stamps.
   rpcHook: AclRPCHook | null = null;
@@ -170,12 +170,12 @@ export class DefaultMQPushConsumer {
   maxReconsumeTimes = DEFAULT_MAX_RECONSUME_TIMES;
   suspendCurrentQueueTimeMillis = DEFAULT_SUSPEND_CURRENT_QUEUE_TIME_MS;
   consumeTimeout = DEFAULT_CONSUME_TIMEOUT;
-  // Java ClientConfig.persistConsumerOffsetInterval (default 5000ms): applied to
+  // Offset flush period (default 5000 ms): applied to
   // the shared MQClient instance when THIS facade creates it (first creator's
-  // config wins, matching Java's MQClientInstance construction); it drives the
-  // instance-level persistAllConsumerOffset sweep.
+  // config wins, because the instance is built once and then shared); it drives
+  // the instance-level persistAllConsumerOffset sweep.
   persistConsumerOffsetInterval = 5000;
-  // Heartbeat V2 (Java ClientConfig.useHeartbeatV2): default off, like the reference.
+  // Heartbeat V2: off by default, so heartbeats keep the V1 shape unless enabled.
   useHeartbeatV2 = false;
   allocateStrategy: AllocateMessageQueueStrategy = new AllocateMessageQueueAveragely();
   messageQueueListener: ((topic: string, mqAll: MessageQueue[], mqDivided: MessageQueue[]) => void) | null = null;
@@ -321,7 +321,7 @@ export class DefaultMQPushConsumer {
   }
   setEnableTrace(enable: boolean): this { this.enableTrace = enable; return this; }
   setTraceTopic(topic: string): this { this.traceTopic = topic; return this; }
-  // Flush period for consumed offsets (Java ClientConfig.persistConsumerOffsetInterval).
+  // Flush period for consumed offsets, in milliseconds; must be greater than 0.
   // When already started the change is pushed through to the shared instance's
   // sweep timer immediately.
   setPersistConsumerOffsetInterval(ms: number): this {
@@ -332,7 +332,7 @@ export class DefaultMQPushConsumer {
   }
   getPersistConsumerOffsetInterval(): number { return this.persistConsumerOffsetInterval; }
 
-  // Heartbeat V2 switch (Java ClientConfig.setUseHeartbeatV2). Only a broker that
+  // Heartbeat V2 switch. Only a broker that
   // answers the V2 ext fields on HEART_BEAT is ever sent a without-subscription
   // body, so turning this on against an old broker is harmless.
   setUseHeartbeatV2(enable: boolean): this {
@@ -581,7 +581,7 @@ export class DefaultMQPushConsumer {
     // CONSUMER_SEND_MSG_BACK(36) short and the message never reaches
     // %RETRY%/%DLQ%.
     await this._waitInFlightDrain(30000);
-    // Persist a second time at the end, mirroring the MQClientInstance-side
+    // Persist a second time at the end, mirroring the MQClient instance's
     // flush on shutdown: offsets the
     // drain just advanced must land too.
     try { await this.persistConsumerOffset(); } catch (e) { /* best effort */ }
@@ -747,8 +747,8 @@ export class DefaultMQPushConsumer {
   private async _persistOffsetLoop(): Promise<void> {
     const flag = this._newStopFlag();
     while (!this._isStopped(flag)) {
-      // The facade-level loop honors persistConsumerOffsetInterval (Java's
-      // ClientConfig knob); the instance-level sweep in MQClient covers the
+      // The facade-level loop honors this facade's persistConsumerOffsetInterval;
+      // the instance-level sweep in MQClient covers the
       // pull / lite-pull facades that have no loop of their own.
       if (!(await this._sleepOrStop(this.persistConsumerOffsetInterval, flag))) {
         try { await this.persistConsumerOffset(); } catch (e) { /* best effort */ }
@@ -838,7 +838,7 @@ export class DefaultMQPushConsumer {
     if (changed) {
       logger.info('rebalance result changed, group=%s clientId=%s assigned=%d',
         this.consumerGroup, this.clientID, assigned.length);
-      // The reference beats every broker the moment the allocation moves, with the
+      // Beat every broker the moment the allocation moves, with the
       // cached fingerprints dropped. A rebalance that took a queue away changes
       // what the broker must hold for this group, and waiting for the 30s beat
       // leaves the old slice registered in the meantime.
@@ -1080,7 +1080,7 @@ export class DefaultMQPushConsumer {
 
   // _queuePullLoop pulls one queue until it is retired or the consumer stops.
   //
-  // Why one loop PER QUEUE rather than a shared PullMessageService
+  // Why one loop PER QUEUE rather than one shared pull dispatcher
   // thread: the push consumer long-polls (suspend=true), so an idle queue
   // parks its request for up to ~15s. A shared loop would serialise those
   // parks and starve every other queue.
@@ -1637,8 +1637,8 @@ export class DefaultMQPushConsumer {
     return failed;
   }
 
-  // sendMessageBack is DefaultMQPushConsumerImpl#sendMessageBack: broker-side
-  // redelivery via CONSUMER_SEND_MSG_BACK(36).
+  // sendMessageBack asks the broker for a per-message
+  // redelivery through CONSUMER_SEND_MSG_BACK(36).
   //
   // `offset` is the message's commitLogOffset, NOT its queueOffset — the
   // broker looks the record up by physical offset.

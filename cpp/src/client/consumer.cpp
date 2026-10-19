@@ -674,7 +674,7 @@ void DefaultMQPushConsumer::shutdown() {
         popConsumeExecutor_->shutdown(true);
         popConsumeExecutor_.reset();
     }
-    // Persist consumed offsets once before exiting (the persistAllConsumerOffset tail of shutdown)
+    // Persist consumed offsets once before exiting (the final flush at the tail of shutdown)
     try {
         persistOffsetsOnce();
     } catch (const std::exception& e) {
@@ -770,7 +770,7 @@ bool DefaultMQPushConsumer::isOrderly() const {
 }
 
 void DefaultMQPushConsumer::rebalancePullThreads() {
-    // Same contract as updateProcessQueueTableInRebalance:
+    // What the rebalance queue-table sync owes, step by step:
     // sync the pull threads with the current assignment set and finish up the revoked queues (persist consumed offsets,
     // drop in-flight buffers, unlock queues in orderly clustering mode). Skipping any step lets the old instance keep
     // consuming the revoked queue's in-flight messages, duplicating the new owner (root cause of duplicate consumption across instances in one group).
@@ -1074,7 +1074,7 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq, uint64_t token
             sub = it->second;
         }
         // While paused this queue's pull is delayed by
-        // PULL_TIME_DELAY_MILLS_WHEN_SUSPEND (1000ms) before retrying; already fetched messages keep
+        // a fixed 1000ms pause delay before retrying; already fetched messages keep
         // being consumed and the offset never rewinds. Checked before flow control / the orderly lock (pause wins).
         if (paused_.load()) {
             logger_debug("consumer was paused, execute pull request later. group=" +
@@ -1277,7 +1277,7 @@ void DefaultMQPushConsumer::queuePopLoop(const MessageQueue& mq, uint64_t token)
             sub = it->second;
         }
         // While paused this queue's pop is delayed by
-        // PULL_TIME_DELAY_MILLS_WHEN_SUSPEND (1000ms) before retrying (same as the pull loop).
+        // the same fixed 1000ms pause delay before retrying as the pull loop.
         if (paused_.load()) {
             logger_debug("consumer was paused, execute pop request later. group=" +
                          consumerGroup_);
@@ -1420,7 +1420,7 @@ void DefaultMQPushConsumer::submitPopOrderlyRequest(const std::shared_ptr<PopPro
 void DefaultMQPushConsumer::runPopOrderlyRequest(const std::shared_ptr<PopProcessQueue>& pq,
                                                  const MessageQueue& mq) {
     // The skeleton of ConsumeRequest.run ends here: the request is removed only when pq was revoked (same log as removeConsumeRequest);
-    // otherwise it takes the queue lock and does nothing. The counterpart of fetchLockObject is the caller's dedupe set
+    // otherwise it takes the queue lock and does nothing. What stands in for a per-queue lock object here is the caller's dedupe set
     // (at most one request running per queue), so no extra lock is needed.
     if (pq->isDropped()) {
         logger_warn("run, message queue not be able to consume, because it's dropped. "
@@ -1661,7 +1661,7 @@ void DefaultMQPushConsumer::dispatchLoop() {
                 mq = it->second;
             }
             // Take the batch together with the ProcessQueue epoch it belongs to, and compare before consuming/acking:
-            // a mismatch invalidates the whole batch (the isDropped test, same contract as ConsumeMessageConcurrentlyService).
+            // a mismatch invalidates the whole batch (the isDropped test, the same epoch contract the concurrent listener enforces).
             uint64_t epoch = 0;
             std::vector<MessageExt> batch = takeBatchForConsume(key, &epoch);
             if (batch.empty()) continue;
@@ -1779,8 +1779,8 @@ std::vector<MessageExt> DefaultMQPushConsumer::filterMessagesForDelivery(
 
 std::vector<MessageExt> DefaultMQPushConsumer::droppedMessages(
     const std::vector<MessageExt>& original, const std::vector<MessageExt>& kept) {
-    // The original contract used List.contains(Object) (Object.equals = reference identity), and msgListFilterAgain
-    // shared element references with the original msgFoundList, so the difference was exact. After a vector copy there is no
+    // The contract this replaces compared messages by object identity: the membership test was asked about
+    // the very elements the filter returned, aliases of the original msgFoundList, so the difference was exact. After a vector copy there is no
     // identity left, so the difference is taken by msgId instead - msgIds within one POP result are guaranteed distinct
     // (they derive from storeHost + commitLogOffset), which is equivalent and immune to false matches on value equality.
     if (kept.size() >= original.size()) return {};
@@ -2111,7 +2111,7 @@ bool DefaultMQPushConsumer::consumeBatch(const std::string& key, const MessageQu
     std::vector<MessageExt> restored = batch;
     resetRetryTopicAndNamespace(restored);
     const bool broadcast = (messageModel_ == MessageModel::BROADCASTING);
-    // ---- Orderly consumption (same contract as ConsumeMessageOrderlyService) ----
+    // ---- Orderly consumption (one queue locked at a time, batch consumed in order) ----
     if (isOrderly()) {
         const bool useHook = hasConsumeMessageHook();
         ConsumeMessageContext hookCtx;
@@ -2214,7 +2214,7 @@ bool DefaultMQPushConsumer::consumeBatch(const std::string& key, const MessageQu
         std::this_thread::sleep_for(std::chrono::milliseconds(orderlySuspendMillis(ctx)));
         return false;
     }
-    // ---- Concurrent consumption (ConsumeRequest.run of ConsumeMessageConcurrentlyService) ----
+    // ---- Concurrent consumption (one registered task per popped/consumed batch) ----
     // "register in-flight -> consume -> deregister in-flight" is wrapped in RAII: the concurrent branch has many returns
     // (whole batch accepted, broadcast discard, redelivery failed ...). Missing one manual deregistration leaves the registry
     // dirty forever, and correctTagsOffset's in-flight gate would then block the offset permanently.
@@ -2508,8 +2508,8 @@ void DefaultMQPushConsumer::finishBatchConsume(const std::string& key) {
 // ---------------------------------------------------------------- Offset persistence
 void DefaultMQPushConsumer::offsetPersistLoop() {
     // Scheduling contract:
-    //   scheduleAtFixedRate(persistAllConsumerOffset, 1000 * 10, persistConsumerOffsetInterval)
-    // - the first task is delayed 10s, then the period comes from clientConfig.persistConsumerOffsetInterval (5s by default);
+    //   a fixed-rate task flushing every consumer offset: initial delay 1000 * 10, period = persistConsumerOffsetInterval
+    // - the first task is delayed 10s, then the period comes from the configured persistConsumerOffsetInterval (5s by default);
     // the first flush happens exactly at initialDelay, not at initialDelay + one period (the old form took 15s).
     // The rate is fixed: every tick is anchored at 10s + n x period (see schedule_util.h), so it does not drift
     // longer and longer the way "finish the work, then sleep one period sliced into 100ms chunks" would.
@@ -2658,7 +2658,7 @@ std::string DefaultMQPushConsumer::buildLocalOffsetsJson(
     const std::map<std::string, MessageQueue>& mqMap) {
     // On-disk format (mutually readable with files written by other clients, verified compatible in practice):
     // {"offsetTable":{{"brokerName":"broker-a","queueId":1,"topic":"Tt"}:9,...}}
-    // - the MessageQueue object is used directly as the JSON key; entries without queue info are skipped (same as persistAll).
+    // - the MessageQueue object is used directly as the JSON key; entries without queue info are skipped (as in the periodic full flush).
     std::string s = "{\"offsetTable\":{";
     bool first = true;
     for (const auto& kv : items) {
@@ -3160,7 +3160,7 @@ std::vector<MessageQueue> DefaultMQPushConsumer::assignedQueues() {
 
 // ---------------------------------------------------------------- Real rebalance
 void DefaultMQPushConsumer::doRebalance() {
-    // rebalanceByTopic: BROADCASTING keeps every queue; CLUSTERING asks the broker for the
+    // Recomputing one topic's share: BROADCASTING keeps every queue; CLUSTERING asks the broker for the
     // consumer id list -> sorts it -> runs the allocation strategy -> takes this instance's share.
     // No consumer list => keep the current assignment (debug log only), never fall back to "own every queue": that means duplicate consumption across group instances.
     //
@@ -3239,7 +3239,7 @@ void DefaultMQPushConsumer::doRebalance() {
                     + " clientId=" + clientId_ + " assigned=" + std::to_string(assigned.size()));
     }
     // Newly assigned queues resolve their initial offset IMMEDIATELY into offsetTable_ (same contract as
-    // updateProcessQueueTableInRebalance -> computePullFromWhere -> persisting it through the offset store).
+    // the queue-table sync -> resolve the initial offset -> persist it through the offset store).
     // It must not be resolved lazily at the first pull: CONSUME_FROM_LAST_OFFSET means "the max offset at
     // assignment time", and lazy resolution would skip messages produced between assignment and the first pull.
     for (const MessageQueue& mq : assigned) {
@@ -3454,12 +3454,12 @@ void DefaultMQPushConsumer::resetRetryTopicAndNamespace(std::vector<MessageExt>&
 
 int64_t DefaultMQPushConsumer::resolveInitialOffset(const MessageQueue& mq) {
     MQClientInstance& c = client();
-    // Java parity (RebalancePushImpl#computePullFromWhereWithException): the initial
+    // Resolving the start point of a freshly assigned queue: the initial
     // offset NEVER depends on the subscription type. An earlier draft short-circuited
     // SQL92 subscriptions to the max offset, which silently skipped every message
     // produced *before* the consumer started (send-first + CONSUME_FROM_FIRST_OFFSET
     // received nothing; consumer-first only passed because the queues were empty and
-    // the max offset was 0 anyway). Java reads the stored offset and, when absent,
+    // the max offset was 0 anyway). The rule reads the stored offset and, when absent,
     // uses 0 for FIRST_OFFSET / max for LAST_OFFSET etc. -- the broker applies the
     // SQL92 filter to whatever range the pull covers.
     if (messageModel_ == MessageModel::BROADCASTING) {
@@ -3603,7 +3603,7 @@ void DefaultMQPushConsumer::sendMessageBackAsNormalMessage(const MessageExt& msg
         c.getTopicPublishInfo(newMsg.topic, /*isDefault=*/true);
     MessageQueue selected = publish->selectOneMessageQueue();
     // This goes through the INTERNAL producer of MQClientInstance, which had
-    // resetClientConfig(clientConfig) applied when it was built, so its unitMode matches this consumer's -
+    // configured from this consumer when it was built, so its unitMode matches this consumer's -
     // it must be passed here, otherwise the redelivered message loses its unit marker.
     c.sendMessage(MixAll::CLIENT_INNER_PRODUCER_GROUP, newMsg, selected, 3000, /*sysFlag=*/0,
                   unitMode_);

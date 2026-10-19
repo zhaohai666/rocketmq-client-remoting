@@ -14,13 +14,13 @@
 //   1. ConsumerData has **no** consumeTimestamp / maxReconsumeTimes fields;
 //   2. HeartbeatData has two extra fields: heartbeatFingerprint / withoutSub.
 //
-// Semantics of heartbeatFingerprint (see the broker's ClientManageProcessor.heartBeat):
+// Semantics of heartbeatFingerprint (fixed by the broker's heartbeat handling):
 //   - fingerprint != 0 -> takes the heartBeatV2 path (subscription changes are detected by
 //     fingerprint, and subscription reporting can be skipped via withoutSub);
 //   - fingerprint == 0 -> takes the V1 path, registering the consumer with the full
 //     subscriptionDataSet.
 // A V1 beat therefore keeps the field at 0 (the client's default). Heartbeat V2 is opt-in
-// per client (ClientConfig#useHeartbeatV2, on this port MQClientInstance#UseHeartbeatV2):
+// per client (this port's MQClientInstance#UseHeartbeatV2):
 // when it is on, the fingerprint of the subscription snapshot is computed by
 // HeartbeatData#ComputeHeartbeatFingerprint and stamped on both the subscription-carrying
 // body and its withoutSub twin, and the broker's IS_SUPPORT_HEART_BEAT_V2 / IS_SUB_CHANGE
@@ -318,8 +318,8 @@ public sealed class HeartbeatData
 
     /// <summary>
     /// The same body with every subscription set emptied and withoutSub flagged, so a V2
-    /// broker can skip registration work it already did (the reference's
-    /// prepareHeartbeatData(true)). Nothing shared with the caller is mutated: the
+    /// broker can skip registration work it already did (the withoutSub=true twin of
+    /// the full body). Nothing shared with the caller is mutated: the
     /// ProducerData / ConsumerData entries are fresh values that keep the group identity
     /// (groupName, consumeType, messageModel, consumeFromWhere, unitMode) and only lose the
     /// subscriptions.
@@ -350,16 +350,16 @@ public sealed class HeartbeatData
     }
 
     /// <summary>
-    /// Fingerprint of this body's subscription snapshot: the Java String.hashCode of a
+    /// Fingerprint of this body's subscription snapshot: the classic h*31+c string hash of a
     /// NORMALISED rendering, i.e. the fields that change per beat or per client stripped out
     /// (every subscription's subVersion, clientID, withoutSub, heartbeatFingerprint) and
     /// every set put into a defined order.
     ///
     /// subVersion normalisation is the load-bearing part: it is stamped with the registration
     /// time, so a rendering that kept it would report a subscription change on every single
-    /// beat and the broker-side skip would never trigger. Ordering matters here even more than
-    /// in the reference: that one relies on a set's iteration order being stable, while this
-    /// port builds its lists from a dictionary walk and from several facades sharing one
+    /// beat and the broker-side skip would never trigger. Ordering matters here more than
+    /// anywhere else in the body: a set's iteration order cannot be assumed stable, because
+    /// this port builds its lists from a dictionary walk and from several facades sharing one
     /// client id, so the sets are sorted explicitly.
     ///
     /// The number only has to be stable for THIS client while its subscriptions do not change
@@ -441,9 +441,9 @@ public sealed class HeartbeatData
 
 /// <summary>
 /// What a HEART_BEAT(34) response carries beyond "SUCCESS": the broker's protocol version
-/// plus the two heartbeat-V2 flags. The reference builds the same triple in
-/// <c>MQClientAPIImpl#sendHeartbeatV2</c> from <c>response.getVersion()</c> and the
-/// <c>MixAll.IS_SUPPORT_HEART_BEAT_V2</c> / <c>MixAll.IS_SUB_CHANGE</c> ext fields.
+/// plus the two heartbeat-V2 flags. This client reads exactly that triple off the
+/// reply: <c>response.Version</c> plus the
+/// <c>MixAll.IsSupportHeartbeatV2</c> / <c>MixAll.IsSubChange</c> ext fields.
 ///
 /// Reading is deliberately fail-open: absent ext fields -- every pre-V2 broker, and every
 /// test stub that does not know about V2 -- mean "this broker does not speak heartbeat V2",

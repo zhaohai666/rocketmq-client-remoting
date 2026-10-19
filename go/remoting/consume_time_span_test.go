@@ -104,7 +104,7 @@ func TestQueueTimeSpanEncodeKeepsWireNames(t *testing.T) {
 			t.Errorf("encoded window missing %s: %s", want, text)
 		}
 	}
-	// The reference's `*TimeStampStr` accessors are derived renderings, never
+	// The `*TimeStampStr` keys are derived renderings, never
 	// wire fields: a broker that rejects unknown keys would reject them here.
 	for _, banned := range []string{"minTimeStampStr", "maxTimeStampStr", "consumeTimeStampStr"} {
 		if strings.Contains(text, banned) {

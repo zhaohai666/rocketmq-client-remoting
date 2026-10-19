@@ -130,7 +130,7 @@ func (a *DefaultMQAdminExt) UpdateConsumerOffsetToBroker(brokerAddr, consumerGro
 
 // ---------------- reset offset ----------------
 
-// resetOffsetRouteTopic mirrors the LMQ / timer-wheel special case: those
+// resetOffsetRouteTopic applies the LMQ / timer-wheel special case: those
 // topics are not routable by name, so the CLUSTER name is used for the route
 // lookup instead.
 func resetOffsetRouteTopic(topic, clusterName string) string {
@@ -234,11 +234,11 @@ func (a *DefaultMQAdminExt) invokeBrokerResetOffset(brokerAddr, topic, group str
 }
 
 //  1. updateConsumerOffset(15) rewrites offsetTable to the target;
-//  2. the 222 with `queueId` + `offset` goes through
-//     AdminBrokerProcessor#resetOffsetInner, which validates the target against
+//  2. the 222 with `queueId` + `offset` reaches the broker's reset-offset
+//     handling, which validates the target against
 //     [min, max+1] (out of range -> SYSTEM_ERROR "Target offset N not in
 //     consume queue range [min-max]"), then
-//     ConsumerOffsetManager#assignResetOffset — which writes BOTH
+//     assigns the reset offset: the broker writes BOTH
 //     resetOffsetTable (one-shot, taken by the next pull via
 //     queryThenEraseResetOffset) and offsetTable, and clears the queue's POP
 //     in-flight count.

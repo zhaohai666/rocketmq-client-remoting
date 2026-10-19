@@ -643,14 +643,14 @@ func DecodeQueryConsumeQueueResponseBody(data []byte) (*QueryConsumeQueueRespons
 // QueueTimeSpan is one entry of QueryConsumeTimeSpanBody.consumeTimeSpanSet, the
 // QUERY_CONSUME_TIME_SPAN(303) per-queue consumption window.
 //
-// The three `*TimeStampStr` accessors the reference model exposes are derived
-// renderings of the numeric fields (the reference formats them with
-// `UtilAll.formatDate`, `yyyy-MM-dd HH:mm:ss.SSS`), not wire fields: a broker
+// The three `*TimeStampStr` keys some admin output shows are derived
+// renderings of the numeric fields (formatted as
+// `yyyy-MM-dd HH:mm:ss.SSS`), not wire fields: a broker
 // never sends them. They are therefore not modelled here; format the numeric
 // fields at the call site if a report needs them.
 //
 // DelayTime is a broker-computed field, NOT a difference of the two timestamps
-// beside it: the reference fills it with `now - storeTime(next unconsumed
+// beside it: the broker fills it with `now - storeTime(next unconsumed
 // message)` for a queue the group has not drained, and leaves it 0 once the
 // group is up to date. Deriving a lag from max/consume would answer a different
 // question, so no accessor does so here.

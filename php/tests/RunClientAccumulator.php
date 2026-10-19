@@ -386,8 +386,8 @@ namespace {
             $this->check($sentBatch instanceof MessageBatch, 'what goes out is a MessageBatch');
             $this->checkSame(null, $sender->sent[0][1], 'no mq specified -> null passed through (producer picks the queue)');
             $this->checkSame(null, $sender->sent[0][2], 'sync path has no callback');
-            // single-threaded order is deterministic -> batch body byte-identical to the reference
-            $this->checkSame(MessageBatch::generateFromList($msgs)->encode(), $sentBatch->getBody(), 'batch body identical to the reference');
+            // single-threaded order is deterministic -> batch body byte-identical to a freshly generated batch
+            $this->checkSame(MessageBatch::generateFromList($msgs)->encode(), $sentBatch->getBody(), 'batch body identical to a freshly generated batch');
             $this->checkSame('', $sentBatch->getKeys(), 'sync without keys -> batch-level KEYS=""');
 
             $prev = null;

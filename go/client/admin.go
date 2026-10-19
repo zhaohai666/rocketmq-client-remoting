@@ -108,7 +108,7 @@ func (a *DefaultMQAdminExt) SetInstanceName(name string) {
 	a.InstanceName = name
 }
 
-// SetUnitName mirrors ClientConfig#setUnitName: it affects the clientId suffix
+// SetUnitName affects the clientId suffix
 // and the dynamic-addressing URL.
 func (a *DefaultMQAdminExt) SetUnitName(unitName string) {
 	a.mu.Lock()
@@ -123,14 +123,14 @@ func (a *DefaultMQAdminExt) UnitNameValue() string {
 	return a.UnitName
 }
 
-// SetEnableStreamRequestType mirrors ClientConfig#setEnableStreamRequestType.
+// SetEnableStreamRequestType marks this admin's requests as stream requests.
 func (a *DefaultMQAdminExt) SetEnableStreamRequestType(enable bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.EnableStreamRequestType = enable
 }
 
-// SetVipChannelEnabled mirrors ClientConfig#setVipChannelEnabled. The instance
+// SetVipChannelEnabled turns the VIP-port rewrite on for this admin. The instance
 // is told as well, because the RPCs the admin delegates to it (offset read and
 // write, max/min offset, consumer list, topic create/delete, system topic list)
 // do the rewrite at their own invoke boundary.
@@ -392,8 +392,8 @@ func (a *DefaultMQAdminExt) CreateTopic(key, newTopic string, queueNum int32, to
 		adminReadPermByDefault, topicSysFlag, "", 5000)
 }
 
-// CreateAndUpdateTopicConfig mirrors
-// DefaultMQAdminExtImpl.createAndUpdateTopicConfig (via the createTopicKey).
+// CreateAndUpdateTopicConfig pushes one TopicConfig to `addr`,
+// keyed by the broker's reserved createTopicKey.
 func (a *DefaultMQAdminExt) CreateAndUpdateTopicConfig(addr string, config *remoting.TopicConfig) error {
 	instance, err := a.requireClient()
 	if err != nil {
@@ -1292,8 +1292,8 @@ func (a *DefaultMQAdminExt) QueryConsumeTimeSpanFromBroker(brokerAddr, topic, gr
 
 // QueryConsumeTimeSpan walks the topic route and concatenates every master's
 // consume window for the group, in route order. A broker group without a
-// master address is skipped, and the first broker error aborts the walk (the
-// reference lets the exception propagate rather than returning a partial set).
+// master address is skipped, and the first broker error aborts the walk
+// instead of returning a partial set for the brokers that did answer.
 func (a *DefaultMQAdminExt) QueryConsumeTimeSpan(topic, group string) ([]*remoting.QueueTimeSpan, error) {
 	route, err := a.ExamineTopicRoute(topic)
 	if err != nil {

@@ -69,7 +69,7 @@ type MessageQueueSelector interface {
 	Select(mqs []common.MessageQueue, msg *common.Message, arg any) (common.MessageQueue, error)
 }
 
-// SelectMessageQueueByHash picks by arg's hash (String.hashCode semantics:
+// SelectMessageQueueByHash picks by arg's hash (the sharding contract's hash:
 // polynomial-31 over the string's UTF-16 code units).
 //
 // The hash must be reproducible across processes — that is the point of a
@@ -535,7 +535,7 @@ func (p *DefaultMQProducer) SetEnableStreamRequestType(e bool) {
 }
 func (p *DefaultMQProducer) SetRpcHook(hook remoting.RPCHook) { p.rpcHook = hook }
 
-// SetNamespaceV2 mirrors ClientConfig#setNamespaceV2: the SERVER-side namespace
+// SetNamespaceV2 sets the SERVER-side namespace
 // (sent as the `ns`/`nsd` extFields by NamespaceRpcHook), as opposed to
 // SetNamespace, which mangles topic names client-side.
 func (p *DefaultMQProducer) SetNamespaceV2(ns string) { p.namespaceV2 = ns }
@@ -767,7 +767,7 @@ func (p *DefaultMQProducer) startLocked() (bool, error) {
 	// NOTE: the transport keeps ONE processor per request code, so two producers
 	// sharing a clientId (same instanceName) would have the second one clobber
 	// the first. (A single processor that dispatches by group would avoid this,
-	// but this port registers per producer.)
+	// but this client registers per producer.)
 	// Producers
 	// started without SetInstanceName get a unique clientId each, so the
 	// default configuration is unaffected.
@@ -1033,8 +1033,8 @@ func responseCodeOf(err error) (int32, bool) {
 // Callers must invoke this ONCE, outside the retry loop, and restore the body
 // afterwards (every call site keeps prevBody and defers the restore).
 //
-// The reference send kernel compresses once per ATTEMPT, capturing the original
-// body and restoring it in a `finally`, so every retry re-compresses the
+// Compressing per ATTEMPT would capture the original
+// body and restore it after the send, so every retry would re-compress the
 // ORIGINAL body. Compressing once here and restoring at the end yields
 // byte-identical payloads and sysFlag, and skips the redundant recompression of
 // a body that is already compressed.
@@ -1253,15 +1253,15 @@ func sendStatusOf(code int32) (SendStatus, bool) {
 //  5. SendMessageHook.after with either SendResult or Exception.
 //
 // One deliberate divergence: if a forbidden hook rejects the message AND a send
-// hook is registered, the reference kernel would run
+// hook is registered, the naive error path would still call the after-hook
 //
 //	catch (...) { if (hasSendMessageHook()) { context.setException(e); ... } }
 //
-// with `context` still null — a NullPointerException that escapes the send
-// entirely, because NPE is not one of the four caught types. This port skips
-// the after-hook when there is no context instead of reproducing the NPE; the
+// with `context` still null -- a null-pointer failure that escapes the send
+// entirely, because it is not one of the four caught types. This client skips
+// the after-hook when there is no context instead of crashing there; the
 // observable difference is that the caller gets the interceptor's error rather
-// than a NullPointerException.
+// than a null-pointer failure.
 func (p *DefaultMQProducer) sendAttempt(msg *common.Message, isBatch bool, mq common.MessageQueue,
 	sysFlag int32, timeoutMillis int64, mode CommunicationMode) (*SendResult, error) {
 
@@ -1843,7 +1843,7 @@ func (p *DefaultMQProducer) SendOneway(msg *common.Message, mq *common.MessageQu
 // MessageQueueSelector picks the queue and the message goes out as a oneway
 // send, with no response and no retry.
 //
-// The budget rule of the reference selector path still applies: the route
+// The budget rule of this selector path is the broker-facing one: the route
 // lookup and the selector itself are measured against the producer's send
 // timeout, and a selector that panics becomes "select message queue threw
 // exception." instead of escaping through the send.
@@ -1946,13 +1946,13 @@ func (p *DefaultMQProducer) SendBySelectorWithTimeout(msg *common.Message, selec
 //     CHECK_TRANSACTION_STATE(39), and handleCheckTransactionState calls
 //     listener.CheckLocalTransaction and then ends the transaction.
 //
-// Where the check-back's listener comes from is the one place this port is a
-// deliberate SUPERSET of the reference behaviour. The reference API resolves
-// the check-back listener only for a TransactionMQProducer — a plain
+// Where the check-back's listener comes from is the one place this client is a
+// deliberate SUPERSET of the plain producer surface. Only TransactionMQProducer
+// wires a check-back listener -- a plain
 // DefaultMQProducer's half messages are recorded by the broker but can never
-// be answered (the check-back just logs "pick transactionCheckListener by
-// group[..] failed"). Here the listener handed to
-// this call is remembered and used for the check-back too, which makes the
+// be answered (that check-back can only log "no transactionCheckListener for
+// group[..]"). The listener handed to
+// this call is also remembered and used for the check-back, which makes the
 // standalone (non-TransactionMQProducer) path actually work.
 //
 // A TransactionMQProducer's own listener still takes precedence: the wrapper
@@ -2137,8 +2137,8 @@ func (p *DefaultMQProducer) endTransaction(sendResult *SendResult, msg *common.M
 		hookMsg = msg
 		hookMsgID = sendResult.MsgID
 		// The address must come from findBrokerAddressInPublish (master
-		// only); the reference path sends oneway without a null check first —
-		// this port keeps the explicit guard instead, but the address source
+		// only); a oneway send with no resolved address must not be attempted --
+		// this client keeps the explicit guard, and the address source
 		// must be master-only all the same.
 		addr, ok := inst.FindBrokerAddressInPublish(brokerName)
 		if !ok {
@@ -2254,12 +2254,12 @@ func (p *DefaultMQProducer) handleCheckTransactionState(request *remoting.Remoti
 
 	// The whole check is submitted to the check executor,
 	// whose default is a SINGLE worker with a 2000-slot queue: check-backs are
-	// serialised and a flood is rejected. Reproducing that ordering matters — a
+	// serialised and a flood is rejected. That ordering matters -- a
 	// producer whose checkLocalTransaction is slow must not be able to run
 	// check-backs concurrently with itself.
 	//
-	// The reference path lets the executor rejection escape checkTransactionState
-	// and land on the remoting thread. This port logs it
+	// An executor rejection must not escape checkTransactionState
+	// and land on the remoting thread, so this client logs it
 	// and drops the check: the broker will re-check after
 	// transactionCheckMax, whereas an escaping panic on the read goroutine would
 	// take the whole connection's dispatch loop with it.

@@ -537,10 +537,10 @@ func (h *HeartbeatData) CloneWithoutSubscriptions() *HeartbeatData {
 // ComputeHeartbeatFingerprint renders the fingerprint the V2 heartbeat path
 // compares between two heartbeats of the same client.
 //
-// The reference model hashes a JSON rendering of the body with the
+// The fingerprint hashes a JSON rendering of the body with the
 // subscription-version, client-id, without-sub and fingerprint fields themselves
-// stripped — those three change per heartbeat or per client and would make every
-// fingerprint differ. This port applies the same normalisation and additionally
+// stripped -- those three change per heartbeat or per client and would make every
+// fingerprint differ. This client applies that normalisation and additionally
 // puts the sets in a defined order, because a Go map / a repeated registration
 // gives no stable iteration order and a fingerprint that depends on it would
 // report a subscription change on every single beat.
@@ -637,9 +637,9 @@ func (s *SubscriptionData) less(other *SubscriptionData) bool {
 }
 
 // javaStringHash is the protocol's 31-based string accumulation
-// (common.StringHash31 — the same helper the tag codeSet and the consistent-hash
+// (common.StringHash31 -- the same helper the tag codeSet and the consistent-hash
 // queue ring use), applied to the canonical fingerprint text. Keeping one
-// implementation is deliberate: the port already fixes the reference side's
+// implementation is deliberate: this client already fixes the
 // code-unit-versus-rune question once, and a second copy here would be free to
 // drift from it.
 func javaStringHash(text string) int32 { return common.StringHash31(text) }

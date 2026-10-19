@@ -1,6 +1,6 @@
-// Offline unit tests: SelectMessageQueueByMachineRoom (Java's selector is an empty shell;
-// every port in this repo lands it as "prefix-match on brokerName, fall back to the first
-// queue" — the same contract the python and nodeJs producers implement), the bounded
+// Offline unit tests: SelectMessageQueueByMachineRoom (this client's contract:
+// prefix-match brokerName against the machine room and take the first hit, falling
+// back to the first queue when nothing matches; an empty queue list throws), the bounded
 // ConsumeExecutor.Shutdown behind awaitTerminationMillisWhenShutdown, and the
 // push-consumer config roundtrip.
 using RocketMQ.Client;

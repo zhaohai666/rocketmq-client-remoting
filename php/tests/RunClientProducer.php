@@ -1336,7 +1336,7 @@ final class RunClientProducer
         $this->checkSame(1, $slotF->calls, 'async failure: callback invoked exactly once');
         $this->check($slotF->error instanceof MQBrokerException, 'async failure: broker code surfaced as MQBrokerException');
 
-        // Connect failure: MQClientAPIImpl layer retries retryTimesWhenSendAsyncFailed=2 times (1+2=3 kernel attempts),
+        // Connect failure: this client's send layer retries retryTimesWhenSendAsyncFailed=2 times (1+2=3 kernel attempts),
         // finally wrapped as MQClientException('unknown reason') (taking the operationFail else branch),
         // with cause preserved as RemotingConnectException. The forbidden hook must sit **above the retry
         // layer** (sendKernelImpl) and execute only once — you cannot count kernel attempts with a throwing hook.

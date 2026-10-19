@@ -181,7 +181,7 @@ pub fn filter_messages_for_delivery(
     let mut out = client_side_tag_filter(sub, msgs);
     if !out.is_empty() && hooks.has_hooks() {
         let mut context = FilterMessageContext::new(consumer_group, Some(out), Some(mq.clone()));
-        // The `unitMode` of FilterMessageContext comes from the consumer's `ClientConfig#unitMode`.
+        // The context's `unitMode` comes straight from the consumer's unit-mode setting.
         context.unit_mode = unit_mode;
         crate::client::hook::execute_filter_hooks(hooks, &mut context);
         out = context.msg_list;
@@ -1205,7 +1205,7 @@ impl DefaultMQPushConsumer {
     ///
     /// Why it must be immediate:
     /// the broker's `ConsumerManager` records topic->group into its own
-    /// topicGroupTable only when it receives a heartbeat (ClientManageProcessor -> registerConsumer), and
+    /// topicGroupTable only when it receives a heartbeat (the registration is what creates it), and
     /// `QUERY_TOPIC_CONSUME_BY_WHO(300)` reads exactly that table; being one round late is a 30s window by default.
     ///
     /// It also registers the new topic as "in use" so the background route refresh task covers it --
@@ -2168,13 +2168,13 @@ async fn resolve_initial_offset(
     client: &MQClientInstance,
     mq: &MessageQueue,
 ) -> Result<i64> {
-    // Java parity (RebalancePushImpl#computePullFromWhereWithException): the initial
+    // Offset lookup follows the stored-offset contract: the initial
     // offset NEVER depends on the subscription type. An earlier draft short-circuited
     // SQL92 subscriptions to the max offset, which silently skipped every message
     // produced *before* the consumer started (send-first + CONSUME_FROM_FIRST_OFFSET
     // received nothing; consumer-first only passed because the queues were empty and
-    // the max offset was 0 anyway). Java reads the stored offset and, when absent,
-    // uses 0 for FIRST_OFFSET / max for LAST_OFFSET etc. -- the broker applies the
+    // the max offset was 0 anyway). A stored offset is read first and, when absent,
+    // the policy decides: 0 for FIRST_OFFSET, max for LAST_OFFSET etc. -- the broker applies the
     // SQL92 filter to whatever range the pull covers.
     let cfg = read_cfg(inner);
     let key = mq_key(mq);
@@ -2250,7 +2250,7 @@ async fn revoke_queues(inner: &Arc<Inner>, revoked: &[(MessageQueue, Option<i64>
 }
 
 /// The broker says "the offset you requested is illegal" (the queue was truncated, the commitlog expired, or the server reset it; see
-/// `PullMessageProcessor`, which answers `PULL_OFFSET_MOVED` for OFFSET_OVERFLOW_BADLY / NO_MESSAGE_IN_QUEUE / OFFSET_RESET alike)
+/// the broker answers `PULL_OFFSET_MOVED` for OFFSET_OVERFLOW_BADLY / NO_MESSAGE_IN_QUEUE / OFFSET_RESET alike)
 /// and puts the corrected value in `nextBeginOffset`. Correcting is not just moving the cursor:
 /// **every message already fetched on this queue but not yet consumed/acked is voided** (they fall inside the skipped
 /// range, and acking them would push the offset back to an illegal value), then the queue is rebuilt at the corrected offset.
@@ -6989,7 +6989,7 @@ mod tests {
         assert_eq!(consumer.pop_orderly_request_count(), 1);
     }
 
-    /// Same entry point, concurrent listener: goes through ConsumeMessagePopConcurrentlyService, consuming + acking as usual.
+    /// Same entry point, concurrent listener: goes through the concurrent POP listener, consuming + acking as usual.
     #[tokio::test]
     async fn pop_concurrent_dispatch_still_consumes() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();

@@ -1,14 +1,14 @@
 // -*- coding: utf-8 -*-
-// PullConsumerScheduleService — the Node port of Java's
-// MQPullConsumerScheduleService (+ PullTaskCallback / PullTaskContext), in the
-// richer "service pulls, callback consumes" shape the python port established:
+// PullConsumerScheduleService -- a scheduled pull facade pairing a
+// DefaultMQPullConsumer with a per-topic callback table (PullTaskCallback /
+// PullTaskContext), in the "service pulls, callback consumes" shape:
 // the service owns the per-queue pull round and hands the PullResult to the
 // topic's callback.
 //
-// Threading model: Java runs a ScheduledThreadPoolExecutor with pullThreadNums
-// workers; a single event loop has no pool. Each queue task is a self
-// rescheduling setTimeout chain, which gives exactly the guarantees the pool
-// gave:
+// Threading model: no thread pool. Each queue task is a self-rescheduling
+// setTimeout chain driven by the single event loop, and that chain still
+// gives the guarantees a dedicated pool with pullThreadNums workers would
+// give:
 //   * queue-dimension SERIAL execution — a queue's next round is scheduled only
 //     after its previous round (pull + callback) fully settles;
 //   * cross-queue concurrency — independent chains interleave on the loop;
@@ -20,7 +20,7 @@
 //   2. context.pullMessageLater(ms)          (one-shot, consumed after use),
 //   3. context.setPullInterval(ms)           (the resident interval).
 // A failed pull or a throwing callback falls back to
-// PULL_TASK_EXCEPTION_DELAY_MILLIS (Java: context.setPullNextDelayTimeMillis(1000)).
+// PULL_TASK_EXCEPTION_DELAY_MILLIS, the fixed one-second retry delay.
 //
 // The consumer facade underneath goes through MQClientManager like every other
 // facade (instance reuse + refcounted shutdown) — this service never builds an
@@ -37,11 +37,11 @@ const logger = getLogger('client.pull_schedule_service');
 export const DEFAULT_PULL_NEXT_DELAY_MILLIS = 200;
 export const PULL_TASK_EXCEPTION_DELAY_MILLIS = 1000;
 export const DEFAULT_QUEUE_CHECK_INTERVAL_MILLIS = 20000;
-// shutdown() waits at most this long for in-flight rounds to settle (Java joins
-// its worker pool with a bounded timeout too).
+// shutdown() waits at most this long for in-flight rounds to settle; a bounded
+// drain keeps a stalled round from blocking shutdown forever.
 export const DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_MILLIS = 5000;
 
-// PullTaskCallback — Java PullTaskCallback.doPullTask. The optional numeric
+// PullTaskCallback -- consumes one queue's PullResult. The optional numeric
 // return value (or resolved promise value) is rescheduling channel #1.
 export type PullTaskCallback = (
   mq: MessageQueue,
@@ -52,13 +52,13 @@ export type PullTaskCallback = (
 export interface PullTaskOptions {
   // Tag expression or '*' (default). SQL92 goes through the consumer's
   // subscribe(topic, MessageSelector.SQL92(...)) instead — broker-side filter,
-  // same scope as Java.
+  // covering the same subscription scope as a tag expression.
   subExpression?: string;
   // First-round start offset: a number, a provider function, or null (default)
   // = broker committed offset, falling back to the queue tail (LAST semantics).
   offset?: number | (() => number) | null;
-  // Resident rescheduling interval (channel #3). Default 200ms (Java
-  // PullTaskContext.pullNextDelayTimeMillis).
+  // Resident rescheduling interval (channel #3). Default 200 ms, the
+  // idle-round backoff between two completed rounds.
   nextDelayMillis?: number;
   maxMsgNums?: number;
   timeoutMillis?: number | null;
@@ -157,8 +157,8 @@ export class PullTaskContext {
     this._pullNextDelayMillis = Math.max(0, Math.floor(millis));
   }
 
-  // Java PullTaskContext.setPullNextDelayTimeMillis — same slot as
-  // setPullInterval (kept for API parity with the Java callback idiom).
+  // An alternate spelling of setPullInterval — both write the same
+  // resident interval field, so a callback may use either name.
   setPullNextDelayTimeMillis(millis: number): void {
     this.setPullInterval(millis);
   }
@@ -223,9 +223,9 @@ class PullTask {
 }
 
 export class PullConsumerScheduleService {
-  // Queue-view recheck period (the python port's queue_check_interval_millis;
-  // Java relies on the push-consumer rebalance's messageQueueChanged listener —
-  // this facade has no rebalance thread, so the view is reconciled on a timer).
+  // Queue-view recheck period: this facade has no rebalance thread that is
+  // notified when a topic's queue set changes,
+  // so the view is reconciled on a timer instead.
   queueCheckIntervalMillis = DEFAULT_QUEUE_CHECK_INTERVAL_MILLIS;
   shutdownDrainTimeoutMillis = DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_MILLIS;
 
@@ -288,8 +288,8 @@ export class PullConsumerScheduleService {
     for (const topic of [...this._callbackTable.keys()]) {
       await this._putTasksForTopic(topic);
     }
-    // Deliberately NOT unref'd: a running service must keep the process alive
-    // exactly like Java's non-daemon worker threads; shutdown() clears it.
+    // Deliberately NOT unref'd: a started service must keep the process alive
+    // until shutdown() clears it, so this timer holds the loop open.
     this._queueCheckTimer = setInterval(() => { void this._recheckQueues(); },
       this.queueCheckIntervalMillis);
     logger.info('PullConsumerScheduleService start OK, group=%s topics=%s',

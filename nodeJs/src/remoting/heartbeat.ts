@@ -236,9 +236,9 @@ export function decodeHeartbeatV2Flags(
   return out;
 }
 
-// Java String.hashCode over UTF-16 code units, kept in signed 32-bit range. The
+// A UTF-16 code-unit string hash kept in signed 32-bit range. The heartbeat
 // fingerprint must use THIS hash and not a JS-number hash: charCodeAt yields code
-// units, which is exactly what the reference model iterates over.
+// units, which is exactly what the 31-multiplier walk iterates over.
 export function javaStringHash(text: string): number {
   let h = 0;
   for (let i = 0; i < text.length; i++) {

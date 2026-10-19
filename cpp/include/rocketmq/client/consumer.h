@@ -8,7 +8,7 @@
 //      the buffer and hands them to the MessageListener; RECONSUME_LATER / failed batches are sent
 //      back one by one to %RETRY%topic (delay gradient 3+reconsumeTimes; above maxReconsumeTimes the broker moves them to %DLQ%);
 //   3. Offset layer: _consume_offsets records the committed consumer offset and every 5s submits it
-//      to the broker with UPDATE_CONSUMER_OFFSET (persistAllConsumerOffset); startup first issues QUERY_CONSUMER_OFFSET.
+//      to the broker with UPDATE_CONSUMER_OFFSET (the full flush); startup first issues QUERY_CONSUMER_OFFSET.
 //
 // Key engineering points (established against a real broker; do not delete):
 //   - Pulling must be parallel per queue: with one thread polling sequentially, the suspend of an
@@ -75,7 +75,7 @@ constexpr int64_t kMaxPopInvisibleTime = 300000;
 
 // Stall-detection threshold (config key `rocketmq.client.pull.pullMaxIdleTime`, default 120000ms):
 // if a queue still owned by this instance has not initiated a single pull/pop for longer than this,
-// that loop is dead or stuck, and updateProcessQueueTableInRebalance revokes and rebuilds it on
+// that loop is dead or stuck, and the rebalance queue-table sync revokes and rebuilds it on
 // exactly this criterion (otherwise that queue goes **silent** and never consumes again, and the client reports no error).
 constexpr int64_t kPullMaxIdleTime = 120000;
 
@@ -147,7 +147,7 @@ public:
     void setInstanceName(const std::string& name) { instanceName_ = name; }
 
     // ---------------- unitName / unitMode / enableStreamRequestType ----------------
-    // The three same-named switches of ClientConfig. They must be set before start():
+    // The three unit switches. They must be set before start():
     // unitName / @STREAM determine the shape of clientId, stream decides the hook chain (`ReqT` enters the ACL signature).
     void setUnitName(const std::string& unitName) { unitName_ = unitName; }
     const std::string& unitName() const { return unitName_; }
@@ -192,7 +192,7 @@ public:
     void setMessageModel(const std::string& model) { messageModel_ = model; }
     void setConsumeFromWhere(const std::string& where) { consumeFromWhere_ = where; }
     // suspend/resume: suspend sets the pause flag -- the pull/pop loops postpone the next attempt by
-    // 1s when they see it (PULL_TIME_DELAY_MILLS_WHEN_SUSPEND=1000), messages already pulled are still
+    // 1s when they see it (the paused-round delay is 1000ms), messages already pulled are still
     // consumed and no offset rolls back; resume clears the flag and runs doRebalance() at once.
     void suspend() { paused_.store(true); }
     void resume();
@@ -201,7 +201,7 @@ public:
     // (the error text "allocateMessageQueueStrategy is null" is the contract with callers).
     // Default AllocateMessageQueueAveragely.
     void setAllocateMessageQueueStrategy(std::shared_ptr<AllocateMessageQueueStrategy> strategy);
-    // Read back the current allocation strategy (same notion as the RebalanceImpl field of the same name).
+    // Read back the current allocation strategy -- the very one the rebalance uses to divide the queues.
     std::shared_ptr<AllocateMessageQueueStrategy> allocateMessageQueueStrategy() const;
     void setConsumeThreadNums(int32_t n);
     // ---- Consumer-thread elasticity ----
@@ -551,18 +551,18 @@ public:
     // same purpose as setPendingMessages: drive sweeps offline without starting a real dispatch thread.
     void setInflightMessages(const std::string& key, const std::vector<MessageExt>& msgs);
     // Scheduling convention: initialDelay == period == consumeTimeout minutes (default 15 -> 900000ms,
-    // both scheduleAtFixedRate arguments come from the same source).
+    // both the initial delay and the period come from the same source).
     static int64_t cleanExpirePeriodMillis(int32_t consumeTimeoutMinutes);
 
-    // ---- POP orderly consumption (ConsumeMessagePopOrderlyService, incomplete skeleton) ----
+    // ---- POP orderly consumption (incomplete skeleton) ----
     // This chain is an unfinished skeleton: the request is enqueued for dedup and run() returns as soon as it
     // holds the queue lock (POPTODO) -- messages are **neither consumed nor acked**, and the broker revives and
     // redelivers them when invisibleTime expires, so the macroscopic symptom is 'orderly + POP receives no messages and the backlog never drains'.
     // checkReconsumeTimes / sendMessageBack / submitConsumeRequestLater / processConsumeResult
     // checkReconsumeTimes / sendMessageBack / submitConsumeRequestLater / processConsumeResult in this skeleton
-    // are not wired up yet and will be ported once the feature is completed.
+    // are not wired up yet and will be implemented once the feature is completed.
     // Unified entry for a popped POP batch: orderly listeners are routed into the submitPopOrderlyRequest
-    // skeleton, concurrent listeners go to ConsumeMessagePopConcurrentlyService. Exposed to unit tests together with consumeBatch: misdispatch fails quietly (orderly messages get consumed / concurrent messages disappear).
+    // skeleton, concurrent listeners go to the concurrent POP listener. Exposed to unit tests together with consumeBatch: misdispatch fails quietly (orderly messages get consumed / concurrent messages disappear).
     void submitPopConsumeRequest(std::vector<MessageExt> msgs,
                                  std::shared_ptr<PopProcessQueue> pq, const MessageQueue& mq);
     // Submit a POP orderly request (submitConsumeRequest): with force=false dedup by
@@ -600,7 +600,7 @@ public:
     int64_t lastPullAt(const std::string& key) const;
     // Inject a timestamp (fault injection against a real broker): moving it outside the threshold is equivalent to 'this loop is stuck'
     void setLastPullAt(const std::string& key, int64_t millis);
-    // Immediately revoke/build pull threads according to the current assignment set (updateProcessQueueTableInRebalance)
+    // Immediately revoke/build pull threads according to the current assignment set (the rebalance queue-table sync)
     void syncPullThreads();
 
 private:
@@ -666,7 +666,7 @@ private:
     // The orderly-consume redelivery gate (checkReconsumeTimes / sendMessageBack on the orderly
     // path), not the same path as the concurrent one above
     bool orderlySendMessageBack(const MessageExt& msg);
-    // Offset persistence: every 5s submit the committed consumer offset to the broker (persistAllConsumerOffset)
+    // Offset persistence: every 5s submit the committed consumer offset to the broker (the full flush)
     void offsetPersistLoop();
     void persistOffsetsOnce();
     // Broadcast-mode local offset file (LocalFileOffsetStore)
@@ -686,11 +686,11 @@ private:
     void notifySubscriptionChanged(const std::string& topic);
 
     std::vector<MessageQueue> assignedQueues();
-    // Java parity (RebalancePushImpl#computePullFromWhereWithException): the initial
-    // offset never depends on the subscription type, so no subscription parameter here.
+    // The initial offset of a newly assigned queue never depends on the subscription type -- the broker
+    // applies the filter to whatever range the pull covers -- so there is no subscription parameter here.
     int64_t resolveInitialOffset(const MessageQueue& mq);
 
-    // ---- Real rebalance (rebalanceByTopic) ----
+    // ---- Real rebalance: divide each topic's queues across the group's instances ----
     // Compute the queue set this instance should hold and write it into assignedQueues_, then sync the pull
     // threads; newly assigned queues have their **initial offset resolved immediately** and written into offsetTable_.
     void doRebalance();
@@ -762,8 +762,8 @@ private:
     void startTraceDispatcher();
 
     std::string consumerGroup_;
-    // Queue allocation strategy (same notion as RebalanceImpl.allocateMessageQueueStrategy, passed in at construction).
-    // Default AllocateMessageQueueAveragely.
+    // Queue allocation strategy, passed in at construction and read by every rebalance round, so rebalance and
+    // callers observe the same object. Default AllocateMessageQueueAveragely.
     std::shared_ptr<AllocateMessageQueueStrategy> allocateStrategy_;
     std::string namespace_;
     // namespaceV2 (protocol field): when non-empty NamespaceRpcHook adds the nsd/ns headers to every request
@@ -780,7 +780,7 @@ private:
     // postSubscriptionWhenPull (default false). Pull-side gating for push consumers:
     // subString is sent with PULL_MESSAGE only when it is on **and** the mode is **not** class filtering.
     bool postSubscriptionWhenPull_ = false;
-    // Facade-level copies of the ClientConfig fields (each passed through / read once in start())
+    // Facade-level copies of the client configuration values (each passed through / read once in start())
     int32_t pollNameServerIntervalMillis_ = 30000;
     bool vipChannelEnabled_ = false;
     int32_t persistConsumerOffsetIntervalMillis_ = 5000;

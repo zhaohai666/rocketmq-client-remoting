@@ -90,12 +90,12 @@ export class DefaultLitePullConsumer {
   // The period at which a background task compares the queue set of every
   // watched topic.
   topicMetadataCheckIntervalMillis = DEFAULT_TOPIC_METADATA_CHECK_INTERVAL_MILLIS;
-  // Java ClientConfig.persistConsumerOffsetInterval (default 5000ms): applied to
+  // Offset flush period (default 5000 ms): applied to
   // the shared MQClient instance when THIS facade creates it; drives the
   // instance-level persistAllConsumerOffset sweep (which calls this facade's
   // persistConsumerOffset -> commitSync).
   persistConsumerOffsetInterval = 5000;
-  // Heartbeat V2 (Java ClientConfig.useHeartbeatV2): default off, like the reference.
+  // Heartbeat V2: off by default, so heartbeats keep the V1 shape unless enabled.
   useHeartbeatV2 = false;
 
   setConsumeFromWhere(where: string): this { this.consumeFromWhere = where; return this; }
@@ -133,7 +133,7 @@ export class DefaultLitePullConsumer {
   setPollTimeoutMillis(ms: number): this { this.pollTimeoutMillis = ms; return this; }
   setAutoCommit(enable: boolean): this { this.autoCommit = enable; return this; }
   setAutoCommitIntervalMillis(ms: number): this { this.autoCommitIntervalMillis = ms; return this; }
-  // Flush period for consumed offsets (Java ClientConfig.persistConsumerOffsetInterval).
+  // Flush period for consumed offsets, in milliseconds; must be greater than 0.
   // When already started the change is pushed through to the shared instance's
   // sweep timer immediately.
   setPersistConsumerOffsetInterval(ms: number): this {
@@ -143,7 +143,7 @@ export class DefaultLitePullConsumer {
     return this;
   }
   getPersistConsumerOffsetInterval(): number { return this.persistConsumerOffsetInterval; }
-  // Heartbeat V2 switch (Java ClientConfig.setUseHeartbeatV2); pushed through to
+  // Heartbeat V2 switch; pushed through to
   // the shared instance when this facade already owns one.
   setUseHeartbeatV2(enable: boolean): this {
     this.useHeartbeatV2 = enable === true;
@@ -490,8 +490,8 @@ export class DefaultLitePullConsumer {
 
   // persistConsumerOffset — the MQConsumerInner contract name the MQClient's
   // instance-level persistAllConsumerOffset sweep calls every
-  // persistConsumerOffsetInterval; delegates to commitSync (Java
-  // DefaultLitePullConsumerImpl.persistConsumerOffset).
+  // persistConsumerOffsetInterval; it is only a thin wrapper
+  // over commitSync.
   async persistConsumerOffset(): Promise<void> {
     return this.commitSync();
   }

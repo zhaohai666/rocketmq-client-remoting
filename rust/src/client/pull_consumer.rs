@@ -131,7 +131,7 @@ fn lite_pull_sys_flag() -> i32 {
 
 // ================================================================ Async pull callback
 
-/// Async pull callback (Java `consumer/PullCallback.java`): fires **exactly once** per
+/// Async pull callback: fires **exactly once** per
 /// [`DefaultMQPullConsumer::pull_async`] -- either [`on_success`](PullCallback::on_success) with
 /// the [`PullResult`] or [`on_exception`](PullCallback::on_exception) with the failure.
 pub trait PullCallback: Send + Sync + 'static {
@@ -913,15 +913,15 @@ impl DefaultMQPullConsumer {
         Ok(self.apply_delivery_filter(mq, result))
     }
 
-    /// Async short-polling pull -- port of Java
-    /// `DefaultMQPullConsumer.pull(mq, subExpression, offset, maxNums, PullCallback, timeout)`.
+    /// Async short-polling pull -- the [`PullCallback`] flavour of
+    /// [`pull`](Self::pull): same `mq, subExpression, offset, maxNums, timeout` inputs, result delivered through the callback.
     ///
     /// Returns immediately; a background tokio task runs the same RPC path as [`pull`](Self::pull)
     /// (same sysFlag, same `pull_from_which_node` follow-up, same pre-delivery filter) and fires
     /// `on_success` / `on_exception` on the callback **exactly once**.
     ///
     /// A not-started (or already shut down) consumer is rejected **synchronously** with `Err` and
-    /// the callback never fires -- Java's `makeSureStateOK()` throws the same way before the
+    /// the callback never fires -- the not-started state check fails synchronously before the
     /// request is handed to the async machinery. The spawned task is deliberately not tracked in
     /// the shutdown task list: an in-flight `pull_async` drains (its callback still lands) instead
     /// of being aborted mid-RPC.
@@ -4877,7 +4877,7 @@ mod tests {
         c.shutdown();
     }
 
-    // ---------------------- pull_async (Java DefaultMQPullConsumer.pull(.., PullCallback, timeout))
+    // ---------------------- pull_async (the async flavour of pull(.., PullCallback, timeout))
 
     /// Counts the callback fires and keeps the delivered result/error for assertions.
     #[derive(Default)]
@@ -4995,7 +4995,7 @@ mod tests {
     async fn pull_async_rejected_before_start_and_after_shutdown() {
         let cluster = FakePullCluster::start_queues(1).await;
         let q = queue("T", "broker-a", 0);
-        // Before start: synchronous Err (Java makeSureStateOK throws), callback never fires.
+        // Before start: synchronous Err from the state check, callback never fires.
         let cold = DefaultMQPullConsumer::new("PG_AsyncCold").unwrap();
         cold.set_instance_name("pull_async_cold");
         cold.set_namesrv_addr(&cluster.namesrv_addr);

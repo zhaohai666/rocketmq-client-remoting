@@ -1,7 +1,7 @@
 // Heartbeat V2 beat gating — offline test of MQClient's heartbeat decision.
 //
-// Behaviour baseline (Java MQClientInstance#sendHeartbeatToBroker /
-// #sendHeartbeatToBrokerV2 + broker ClientManageProcessor#heartBeat):
+// Behaviour baseline (this client's beat decision plus the broker's reply to a
+// HEART_BEAT request):
 //   * a fingerprint is stamped on the body ONLY when useHeartbeatV2 is on. With
 //     the switch off the body stays exactly what a V1 client sent (subscriptions,
 //     fingerprint 0) even when the broker declares V2 support;
@@ -209,7 +209,7 @@ async function main() {
     check('while the pre-V2 slave keeps the subscriptions',
       slave.last().withSub && slave.last().subscriptionCount === 1, JSON.stringify(slave.last()));
 
-    // A producer-only client has no consumer data, so the reference skips slaves.
+    // A producer-only client has no consumer data, so a slave gets no beat.
     client.unregisterConsumer('GID_two');
     client.registerProducer('GID_prod', { groupName: 'GID_prod' });
     master.clear();

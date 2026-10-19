@@ -136,7 +136,7 @@ struct PullResult {
 };
 
 // ---------------------------------------------------------------- async pull callback
-// Java's org.apache.rocketmq.client.consumer.PullCallback (DefaultMQPullConsumer.pull(..., PullCallback, timeout));
+// The callback form of DefaultMQPullConsumer.pull(mq, subExpression, offset, maxNums, callback, timeout);
 // shaped exactly like SendCallback above: one of the two fires, exactly once.
 class PullCallback {
 public:

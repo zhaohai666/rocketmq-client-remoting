@@ -1,16 +1,16 @@
 // PullConsumerScheduleService + DefaultMQPullConsumer.pullAsync — offline wire test.
 //
-// Behaviour baseline (Java client/impl/MQPullConsumerScheduleService.java,
-// PullMessageService + PullRequest + consumer/impl/PullAPIWrapper):
+// Behaviour baseline (the rules this scheduling service commits to,
+// each one asserted against the recorded wire traffic below):
 //   * start() expands every registered topic into QUEUE-dimension tasks; one task
 //     = one queue, and a queue's rounds are strictly serial (the next timer is
 //     armed only after the current round settles).
 //   * Three rescheduling channels with a fixed priority: the callback's return
 //     value > context.pullMessageLater() (one-shot) > context.setPullInterval()
 //     (resident) > the status default. A callback that throws waits
-//     PULL_TASK_EXCEPTION_DELAY_MILLIS (Java 1000ms) and costs one round, not the loop.
+//     PULL_TASK_EXCEPTION_DELAY_MILLIS (1000 ms) and costs one round, not the loop.
 //   * The first round's offset comes from the registration (number/provider), else
-//     the broker's committed offset, else the queue tail (Java's LAST fallback).
+//     the broker's committed offset, else the queue tail (the LAST-offset fallback).
 //   * A queue that leaves the view is cancelled; a transient route/consumer-list
 //     failure keeps the current tasks (never "cancel everything").
 //   * shutdown() drains: pending timers go away, an in-flight round still finishes.

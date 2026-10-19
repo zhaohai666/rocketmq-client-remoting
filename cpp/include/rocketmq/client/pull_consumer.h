@@ -120,9 +120,9 @@ public:
     PullResult pullBlockIfNotFound(const MessageQueue& mq, const std::string& subExpression,
                                    int64_t offset, int32_t maxNums);
 
-    // Async pull (Java DefaultMQPullConsumer.pull(mq, subExpression, offset, maxNums, PullCallback, timeout)):
+    // Async pull (DefaultMQPullConsumer.pull(mq, subExpression, offset, maxNums, PullCallback, timeout)):
     // returns at once; a worker thread runs the very same synchronous pull kernel and the callback pool
-    // delivers onSuccess/onException **exactly once**. Mirrors DefaultMQProducer::sendAsync's two-pool shape
+    // delivers onSuccess/onException **exactly once**. Same two-pool shape as the producer's async send
     // (PullAsyncExecutor for the request work + PullCallbackExecutor for the user callback).
     // Not started / null callback throw synchronously; after shutdown() the in-flight requests are drained,
     // and a late pullAsync throws instead of dropping the callback silently.

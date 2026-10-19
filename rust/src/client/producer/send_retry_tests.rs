@@ -716,7 +716,7 @@ async fn unit_mode_is_carried_in_the_send_header() {
 }
 
 /// `c`/`d` are a functional bug: the broker's auto topic creation decides the queue count
-/// from these two values (`createTopicInSendMessageMethod` in `AbstractSendMessageProcessor`), so hardcoding
+/// from these two values (the broker's auto-create path reads them off the request), so hardcoding
 /// `TBW102`/4 turns `set_create_topic_key` / `set_default_topic_queue_nums` into fake
 /// setters. `n` is wire-message parity: the classic broker addresses by connection and does not read it, while the proxy and audit side do.
 ///
@@ -838,7 +838,7 @@ async fn broker_name_header_follows_the_selected_queue() {
 }
 
 /// Why this must be nailed down at the **wire-message** layer: the broker's dead-letter decision reads
-/// `requestHeader.reconsumeTimes` and `maxReconsumeTimes` in `SendMessageProcessor#handleRetryAndDLQ:197-210`,
+/// `requestHeader.reconsumeTimes` and `maxReconsumeTimes` from the send request's header,
 /// **not the message properties**. Lifting them wrongly turns the consumer's configured
 /// `maxReconsumeTimes` into decoration -- it falls back to the subscription group's default retryMaxTimes(16), so a poison message burns a dozen extra rounds
 /// before entering `%DLQ%`. On a real cluster this only shows up as "dead letters arrive late"; only an offline packet capture reveals it.
@@ -924,10 +924,10 @@ async fn unit_name_only_changes_the_client_id() {
 }
 
 /// ⚠ The request code and the V2 header's `m` (batch) are **two different things**: the broker really picks
-/// `sendBatchMessage` or single-write by `m` (`SendMessageProcessor:117` reads
-/// `requestHeader.isBatch()`); the code only affects server-side classification by code (proxy/auth list 310/320 in
-/// the same case, see `AbstractRemotingActivity:69` and
-/// `DefaultAuthorizationContextBuilder:230-240`). So both must be asserted --
+/// its batch path or a single write by `m` (the send request's batch flag is
+/// what the broker reads); the code only affects server-side classification by code (proxy/auth list 310/320 in
+/// the same case, both keyed on the request code plus
+/// the batch flag). So both must be asserted --
 /// aligning the code but not `m` would make a batch body get parsed as a single message.
 #[tokio::test]
 async fn send_request_code_follows_protocol_three_way_branch() {

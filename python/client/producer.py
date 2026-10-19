@@ -339,14 +339,14 @@ class DefaultMQProducer:
         self._transaction_listener: Optional[TransactionListener] = None
         self._heartbeat_running = False
         self.heartbeat_interval_millis = 30000
-        # ---- ClientConfig knobs that drive the heartbeat / send address ----
-        # ``use_heartbeat_v2``: Java's ``ClientConfig.useHeartbeatV2`` (system property
-        # ``com.rocketmq.heartbeat.v2``), **false by default**. Off means the heartbeat body keeps
-        # ``heartbeatFingerprint = 0`` and the broker takes its V1 registration path; on switches
-        # every round to the fingerprint-gated V2 path (see client/heartbeat_v2.py).
+        # ---- Switches that drive the heartbeat and the send address ----
+        # ``use_heartbeat_v2``: the heartbeat V2 opt-in, **false by default**. Off means the
+        # heartbeat body keeps ``heartbeatFingerprint = 0`` and the broker takes its V1
+        # registration path; on switches every round to the fingerprint-gated V2 path
+        # (see client/heartbeat_v2.py).
         self.use_heartbeat_v2 = False
-        # ``vip_channel_enabled``: Java's ``ClientConfig.vipChannelEnabled``, read on the send side
-        # through ``DefaultMQProducer#isSendMessageWithVIPChannel``, **false by default**. On makes
+        # ``vip_channel_enabled``: read on the send side through
+        # :meth:`set_send_message_with_vip_channel`, **false by default**. On makes
         # sends target the broker's VIP port (listen port - 2, 10911 -> 10909).
         self.vip_channel_enabled = False
         self.poll_name_server_interval = 30000
@@ -423,12 +423,12 @@ class DefaultMQProducer:
         return self.namespace_v2
 
     def set_vip_channel_enabled(self, enable: bool) -> None:
-        """Java's ``DefaultMQProducer#setSendMessageWithVIPChannel`` (same field as
-        ``ClientConfig.vipChannelEnabled``): sends -- including the request-reply reply, which is
+        """Turn the VIP channel on or off (the same flag as
+        ``vip_channel_enabled``): sends -- including the request-reply reply, which is
         just a send with ``MSG_TYPE=reply`` -- go to the broker's VIP port (listen port - 2).
 
         Also refreshes the shared ``MQClientInstance`` flag when already started: the address
-        rewrite lives there (like Java's MQClientAPIImpl), and one instance can be shared by
+        rewrite lives there, and one instance can be shared by
         several facades with the same clientId.
         """
         self.vip_channel_enabled = bool(enable)
@@ -439,12 +439,12 @@ class DefaultMQProducer:
         return self.vip_channel_enabled
 
     def set_send_message_with_vip_channel(self, enable: bool) -> None:
-        """The Java-named alias of :meth:`set_vip_channel_enabled`."""
+        """Alias of :meth:`set_vip_channel_enabled` under the send-with-VIP-channel name."""
         self.set_vip_channel_enabled(enable)
 
     def set_use_heartbeat_v2(self, enable: bool) -> None:
-        """Opt into the fingerprint-gated heartbeat V2 path (Java's
-        ``ClientConfig.setUseHeartbeatV2``); off by default, exactly like the reference."""
+        """Opt into the fingerprint-gated heartbeat V2 path; off by default here, so a client
+        that never asks for it keeps the broker on its V1 registration path."""
         self.use_heartbeat_v2 = bool(enable)
 
     def set_socks_proxy_config(self, socks_proxy_config: Optional[SocksProxyConfig]) -> None:
@@ -932,8 +932,8 @@ class DefaultMQProducer:
         ok_count = 0
         for addr in addrs:
             try:
-                # Producer heartbeats carry ProducerData only (consumerEmpty=true), so Java sends
-                # them to masters only -- addrs comes from get_route_of_all_brokers.
+                # Producer heartbeats carry ProducerData only (no consumer data), so they are sent
+                # to masters only -- addrs comes from get_route_of_all_brokers.
                 # With heartbeat V2 on, the same HEART_BEAT(34) frame goes through the
                 # fingerprint-gated path; the broker only takes heartBeatV2 once the body's
                 # heartbeatFingerprint is non-zero, and a broker that never answers
@@ -1070,7 +1070,7 @@ class DefaultMQProducer:
                 send_start = self.metrics.record_send_start()
                 try:
                     result = self._send_with_hooks(client, msg, mq_sel, cur_timeout, sys_flag)
-                except Exception:  # noqa: BLE001 — re-raise as the original exception after metric accounting
+                except Exception:  # noqa: BLE001 -- re-raise as the original exception after metric accounting
                     self.metrics.record_send_failure(send_start)
                     raise
                 self.metrics.record_send_success(send_start)
@@ -1137,7 +1137,7 @@ class DefaultMQProducer:
         try:
             self._topic_publish_info(msg.topic)
             self._send_heartbeat_to_all_broker()
-        except Exception:  # noqa: BLE001 — when the route is unavailable, let the send path below report the error itself
+        except Exception:  # noqa: BLE001 -- when the route is unavailable, let the send path below report the error itself
             logger.debug("request: prepare route/heartbeat failed", exc_info=True)
 
         future = RequestResponseFuture(correlation_id, timeout)
@@ -1184,7 +1184,7 @@ class DefaultMQProducer:
         try:
             self._topic_publish_info(msg.topic)
             self._send_heartbeat_to_all_broker()
-        except Exception:  # noqa: BLE001 — same as the synchronous request: let the send path report the error itself
+        except Exception:  # noqa: BLE001 -- same as the synchronous request: let the send path report the error itself
             logger.debug("request_async: prepare route/heartbeat failed", exc_info=True)
 
         future = RequestResponseFuture(correlation_id, timeout, callback)
@@ -1311,7 +1311,7 @@ class DefaultMQProducer:
         msg.topic = self._with_namespace(msg.topic)
         self._check_message(msg)
         if selector is not None:
-            # sendSelectImpl ASYNC: the selector receives the **raw** queue list from the route
+            # ASYNC send with a selector: the selector receives the **raw** queue list from the route
             publish = self._topic_publish_info(msg.topic)
             selected = selector.select(publish.msg_queue_list, msg, arg)
             if selected is None:
@@ -1676,7 +1676,7 @@ class DefaultMQProducer:
             sys_flag, MessageSysFlag.TRANSACTION_PREPARED_TYPE)
 
         try:
-            # The transactional send also goes through sendKernelImpl (→ send hooks fire too),
+            # The transactional send also goes through the send kernel (so send hooks fire too),
             # so with tracing enabled a transactional message first lands a Pub (Trans_Msg_Half) trace
             send_result = self._send_with_hooks(client, msg, mq_sel,
                                                self.send_msg_timeout, sys_flag)
@@ -1827,7 +1827,7 @@ class DefaultMQProducer:
         client = self._require_client()
         validators.check_topic(new_topic)
         validators.is_system_topic(new_topic)
-        perm = 6  # PermName.PERM_READ | PERM_WRITE
+        perm = 6  # broker permission bits: read | write
         client.create_topic_in_route(new_topic, queue_num, queue_num, perm)
 
     def search_offset(self, mq: MessageQueue, timestamp: int) -> int:

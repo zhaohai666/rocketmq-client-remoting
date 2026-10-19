@@ -532,7 +532,7 @@ final class RunClientPopAssignment
         $this->checkSame('AVG', $round->strategyName, 'request body roundtrip: strategyName');
         $this->checkSame('CLUSTERING', QueryAssignmentRequestBody::decode(null)->messageModel, 'empty request defaults to CLUSTERING');
 
-        // Response body: the set lives under `messageQueueAssignments` (the Java wire spelling).
+        // Response body: the set lives under `messageQueueAssignments` (the wire field name).
         $json = '{"messageQueueAssignments":[{"messageQueue":{"topic":"T","brokerName":"b","queueId":1},'
             . '"mode":"POP","attachments":{"k":"v"}}]}';
         $resp = QueryAssignmentResponseBody::decode($json);

@@ -1,32 +1,32 @@
 # -*- coding: utf-8 -*-
 """Heartbeat V2: the fingerprint-gated heartbeat registration path.
 
-Java baseline (read it together with this module):
+The contract this module implements, split the way the work is split here:
 
-* ``MQClientInstance#sendHeartbeatToAllBrokerV2`` + ``#sendHeartbeatToBrokerV2`` -- the round
-  itself and the per-broker decision table,
-* ``MQClientAPIImpl#sendHeartbeatV2`` -- the RPC, which parses ``IS_SUPPORT_HEART_BEAT_V2`` and
-  ``IS_SUB_CHANGE`` out of the **response extFields** of a plain ``HEART_BEAT`` frame,
-* ``HeartbeatData#computeHeartbeatFingerprint`` -- the fingerprint,
-* ``ClientManageProcessor#heartBeat`` / ``#heartBeatV2`` -- the broker side, which switches on
-  ``heartbeatFingerprint != 0`` and keeps ``consumerGroup -> fingerprint``.
+* the heartbeat round and its per-broker decision table, which chooses between the full
+  registration body and the light "withoutSub" one,
+* the RPC side, which parses ``IS_SUPPORT_HEART_BEAT_V2`` and ``IS_SUB_CHANGE`` out of the
+  **response extFields** of a plain ``HEART_BEAT`` frame,
+* the heartbeat fingerprint, a hash of the whole registration content,
+* the broker side, which switches on ``heartbeatFingerprint != 0``, keeps
+  ``consumerGroup -> fingerprint`` and answers with the two flags above.
 
-Two things the reference does that are easy to get wrong:
+Two protocol facts that are easy to get wrong:
 
 1. **There is no ``HEART_BEAT_V2`` request code.** V2 reuses ``HEART_BEAT`` (34) and is
-   recognised from the two body fields; ``203`` is ``GET_CONSUMER_CONNECTION_LIST``. A port that
-   sends an invented request code gets ``UNKNOWN_REQUEST_CODE`` back from a real broker.
-2. **V2 is opt-in.** ``ClientConfig.useHeartbeatV2`` defaults to ``false`` in Java (system
-   property ``com.rocketmq.heartbeat.v2``), so a client that does not ask for it keeps sending
-   ``heartbeatFingerprint = 0`` and the broker keeps the V1 registration path.
+   recognised from the two body fields; ``203`` is ``GET_CONSUMER_CONNECTION_LIST``. A client
+   that sends an invented request code gets ``UNKNOWN_REQUEST_CODE`` back from a real broker.
+2. **V2 is opt-in.** ``use_heartbeat_v2`` defaults to ``False`` in this client, so a client
+   that does not ask for it keeps sending ``heartbeatFingerprint = 0`` and the broker keeps
+   the V1 registration path.
 
-The per-broker state (``brokerSupportV2HeartbeatSet`` + ``brokerAddrHeartbeatFingerprintTable``)
-lives here instead of inside ``MQClientInstance``'s send loop because this port lets every facade
-run its own heartbeat loop: one broker address receives several **independent** heartbeat streams
-(the producer's ``ProducerData``, each consumer's ``ConsumerData``), so the tables are keyed by
-``(owner, broker addr)`` -- ``owner`` being the facade's group. Keying by address alone, as Java
-can, would make those streams evict each other's fingerprint every round and silently degrade the
-"simple" heartbeat back to the full one forever.
+The per-broker state (the set of brokers known to speak V2 plus the
+``broker addr -> fingerprint`` table) lives here instead of inside a facade's send loop,
+because this port lets every facade run its own heartbeat loop: one broker address receives
+several **independent** heartbeat streams (the producer's ``ProducerData``, each consumer's
+``ConsumerData``), so the tables are keyed by ``(owner, broker addr)`` -- ``owner`` being the
+facade's group. Keying by address alone would make those streams evict each other's
+fingerprint every round and silently degrade the "simple" heartbeat back to the full one forever.
 """
 from __future__ import annotations
 
@@ -40,7 +40,7 @@ logger = get_logger()
 
 
 class HeartbeatV2State:
-    """The two tables Java keeps per heartbeat stream, plus the ``lockHeartbeat`` equivalent.
+    """The two tables kept per heartbeat stream, plus that stream's heartbeat lock.
 
     ``support_v2_broker_addrs``
         Brokers that answered ``IS_SUPPORT_HEART_BEAT_V2=true`` at least once. An address that is
@@ -58,10 +58,10 @@ class HeartbeatV2State:
         self.lock = threading.Lock()
 
     def reset_fingerprint_table(self) -> None:
-        """``MQClientInstance#resetBrokerAddrHeartbeatFingerprintMap``.
+        """Drop every remembered fingerprint for this stream.
 
-        Called when the queue allocation changes (Java's
-        ``RebalancePushImpl#messageQueueChanged`` -> ``sendHeartbeatToAllBrokerWithLockV2(true)``):
+        Called when the queue allocation changes (an assignment change asks for an
+        immediate heartbeat round instead of waiting for the next tick):
         the next round must re-deliver the subscriptions, so the remembered fingerprints are
         dropped. The "this broker speaks V2" knowledge survives -- it is a property of the broker,
         not of this round.
@@ -71,7 +71,7 @@ class HeartbeatV2State:
 
 
 class HeartbeatV2Coordinator:
-    """Sends one heartbeat stream through the V2 path (``sendHeartbeatToBrokerV2``)."""
+    """Sends one heartbeat stream through the V2 path (the per-broker decision table)."""
 
     def __init__(self, client):
         self._client = client
@@ -106,7 +106,7 @@ class HeartbeatV2Coordinator:
                        timeout_millis: int = 5000) -> int:
         """One broker over the V2 path; returns the broker version from the response header.
 
-        Mirrors the reference branch for branch:
+        The decision table, branch by branch:
 
         * broker already known to speak V2 **and** still holding our fingerprint -> send the
           ``withoutSub`` body; if it answers ``IS_SUB_CHANGE`` (its per-group table moved under our
@@ -116,8 +116,8 @@ class HeartbeatV2Coordinator:
           do we remember the address as a V2 broker and remember the fingerprint (a ``IS_SUB_CHANGE``
           answer means the broker's table moved, so the fingerprint is dropped instead).
 
-        Exceptions propagate: callers count successes per broker, exactly like the reference's
-        ``sendHeartbeatToAllBroker*`` loops.
+        Exceptions propagate: callers count the successes per broker, so a raised error is
+        how a round learns that this broker did not accept the heartbeat.
         """
         fingerprint = heartbeat_data.compute_fingerprint()
         heartbeat_data.heartbeat_fingerprint = fingerprint

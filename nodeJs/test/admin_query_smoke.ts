@@ -1,14 +1,14 @@
 // DefaultMQAdminExt.queryConsumeTimeSpan (303) — offline wire test.
 //
-// Behaviour baseline (Java MqClientAdminImpl#queryConsumeTimeSpan /
-// MQClientAPIImpl#queryConsumeTimeSpan + DefaultMQPushConsumerImpl#queryConsumeTimeSpan):
+// Behaviour baseline (the broker's QUERY_CONSUME_TIME_SPAN reply shape as this
+// admin exercises it, plus the error contract it must keep for callers):
 //   * one QUERY_CONSUME_TIME_SPAN(303) per broker of the topic's route, header
 //     keys `topic` + `group` (NOT consumerGroup), body decoded as
 //     QueryConsumeTimeSpanBody and its consumeTimeSpanSet concatenated;
 //   * the sweep walks EVERY broker in the route, master only (selectBrokerAddr),
 //     and a broker that answers with an empty body contributes nothing;
-//   * unlike examineTopicStats, a failing broker is NOT swallowed: Java's admin
-//     path completes the future exceptionally, so the caller sees the error.
+//   * unlike examineTopicStats, a failing broker is NOT swallowed: the admin call
+//     rejects, so the caller sees the error.
 //
 // Run: node --experimental-strip-types test/admin_query_smoke.ts
 import net from 'node:net';

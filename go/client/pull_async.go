@@ -1,9 +1,9 @@
 // Async pull: PullAsync runs one Pull off the caller's goroutine and delivers
 // the outcome through a PullCallback — exactly once.
 //
-// The two-pool split mirrors the async send path (async.go) and the Java
-// client's arrangement (pullMessageService runs the RPC, the public executor
-// runs user code):
+// The two-pool split is the same arrangement this client's async send path
+// uses (async.go): one pool runs the RPC, the other pool
+// runs user code:
 //
 //   - pullAsyncPool runs the RPC (the pullKernel round trip), so the caller
 //     never blocks on the wire;
@@ -28,9 +28,9 @@ import (
 	"github.com/zhaohai666/rocketmq-client-remoting/go/remoting"
 )
 
-// PullCallback receives the outcome of an asynchronous pull — the port of
-// org.apache.rocketmq.client.consumer.PullCallback. OnSuccess and OnException
-// are mutually exclusive and each fires exactly once.
+// PullCallback receives the outcome of an asynchronous pull. Its two arms are
+// mutually exclusive
+// and each fires exactly once: OnSuccess with the result, OnException with the error.
 type PullCallback interface {
 	OnSuccess(result *PullResult)
 	OnException(err error)

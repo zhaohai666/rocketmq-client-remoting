@@ -1329,9 +1329,9 @@ impl MQClientInstance {
             .await
     }
 
-    /// Broker-facing sync call that follows Java's `MQClientAPIImpl` methods with
-    /// `MixAll.brokerVIPChannel(clientConfig.isVipChannelEnabled(), addr)` in front of the
-    /// `invokeSync`: same address rewrite as [`send_message_to_addr`], applied per request.
+    /// Broker-facing sync call that applies the VIP-channel address rewrite
+    /// (`MixAll::broker_vip_channel`, gated by the client's vip-channel setting) in front of the
+    /// `invoke_sync`: same address rewrite as [`send_message_to_addr`], applied per request.
     ///
     /// [`send_message_to_addr`]: Self::send_message_to_addr
     pub(crate) async fn invoke_broker_sync(
@@ -2546,7 +2546,7 @@ impl MQClientInstance {
     /// `GET_EARLIEST_MSG_STORETIME`).
     ///
     /// Returns the **plain** route address: the VIP rewrite happens at invoke time inside those
-    /// RPCs (Java does it in `MQClientAPIImpl`, so a caller-supplied address is rewritten too).
+    /// RPCs (the rewrite lives inside those RPC calls here, so a caller-supplied address is rewritten too).
     async fn publish_addr_in_admin(&self, mq: &MessageQueue) -> Result<String> {
         let mut addr = self.find_broker_address_in_publish(&mq.broker_name);
         if addr.is_none() {

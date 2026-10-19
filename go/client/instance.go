@@ -52,19 +52,19 @@ type ClientInstanceConfig struct {
 	// NamesrvRefreshIntervalMillis drives the address-server re-fetch
 	// (2 minutes).
 	NamesrvRefreshIntervalMillis int64
-	// HeartbeatIntervalMillis (getHeartbeatBrokerInterval, default 30s).
+	// HeartbeatIntervalMillis is the beat-to-broker period (default 30s).
 	HeartbeatIntervalMillis int64
 	// PersistConsumerOffsetIntervalMillis (default 5s).
 	PersistConsumerOffsetIntervalMillis int64
 	SocksProxy                          *remoting.SocksProxyConfig
-	// UseHeartbeatV2 is ClientConfig.useHeartbeatV2 — the
-	// `com.rocketmq.heartbeat.v2` switch. OFF by default, exactly like the
-	// reference: the beat then stays on the plain HEART_BEAT path with
+	// UseHeartbeatV2 is this client's heartbeat-protocol-version-2 switch.
+	// OFF by default: the beat then stays on the plain HEART_BEAT path with
 	// fingerprint 0. When on, an instance that talks to a V2-capable broker
-	// stops re-sending unchanged subscriptions (see
+	// stops re-sending unchanged subscriptions to brokers that answer
+	// IS_SUPPORT_HEART_BEAT_V2 (see
 	// SendHeartbeatToAllBrokerV2).
 	UseHeartbeatV2 bool
-	// VipChannelEnabled is ClientConfig.vipChannelEnabled — the single
+	// VipChannelEnabled is this client's single
 	// broker-facing VIP switch. OFF by default: the broker's listen port serves
 	// every request unchanged. When ON, the RPCs the broker only answers on its
 	// VIP port are addressed at `port - 2` of the route address. It is read at
@@ -201,7 +201,7 @@ type Instance struct {
 
 	consumerIDsChanged atomic.Int64
 
-	// heartbeatMu is the reference's lockHeartbeat: at most one fan-out at a
+	// heartbeatMu is this client's heartbeat lock: at most one fan-out at a
 	// time, a caller that finds it busy skips its beat instead of queueing.
 	heartbeatMu sync.Mutex
 	// heartbeatStateMu guards the three V2 bookkeeping maps below. They are
@@ -274,11 +274,11 @@ func (i *Instance) ClientID() string { return i.clientID }
 // fields must be present BEFORE the user's hook runs, while the zone fields
 // are added after it and stay unsigned. See remoting/rpchooks.go.
 //
-// The classic remoting client ties the chain to the shared instance, which is
-// keyed by clientId and created once; the first creator's hook wins and later
-// tenants share it. This port mirrors that: the first call installs, later calls
+// The chain belongs to the shared instance, which is keyed by clientId and
+// created once; the first creator's hook wins and later
+// tenants share it. This client follows that: the first call installs, later calls
 // are no-ops. A second tenant therefore does NOT get its own user hook on a
-// shared instance — that is the intended behaviour, and silently stacking a
+// shared instance -- that is the intended behaviour, and silently stacking a
 // second ACL hook would corrupt every signature instead.
 func (i *Instance) EnsureRPCHooks(namespaceV2 string, stream bool, userHook remoting.RPCHook) {
 	i.mu.Lock()
@@ -397,7 +397,7 @@ func (i *Instance) RegisterProducer(group string) {
 	i.producerTable[group] = struct{}{}
 }
 
-// UnregisterProducer must run BEFORE Shutdown (the classic client shutdown
+// UnregisterProducer must run BEFORE Shutdown (this client's shutdown
 // ordering), so the departing producer does not block the factory's teardown.
 func (i *Instance) UnregisterProducer(group string) {
 	i.tablesMu.Lock()
@@ -466,8 +466,8 @@ func (i *Instance) RegisterTopicInUse(topic string) {
 
 // ---------------- broker -> client handlers ----------------
 
-// registerClientProcessors wires the instance-level processors — the classic
-// remoting client builds its client processor once at transport construction
+// registerClientProcessors wires the instance-level processors -- the client
+// processor is built once at transport construction
 // (326/220/221/307/309/40), not per consumer.
 func (i *Instance) registerClientProcessors() {
 	i.remoting.RegisterProcessor(remoting.ReqNotifyConsumerIDsChanged, i.processNotifyConsumerIDsChanged)
@@ -482,19 +482,19 @@ func (i *Instance) registerClientProcessors() {
 // processNotifyUnsubscribeLite (200073) is registered for exactly one reason:
 // to keep it off the "no processor for request code" WARN path.
 //
-// In the classic remoting protocol this code is registered against the shared
-// client processor, but that processor's switch has NO case for it — it falls
-// through to `default: break;` and answers nothing, and the broker only ever
+// On the classic remoting protocol this code is a push whose handler has NO
+// case for it: it falls
+// through and answers nothing, and the broker only ever
 // sends it oneway, so nothing is waiting for an answer. In other words the
 // whole feature is vestigial on the classic-remoting path (only the gRPC
-// proxy's client processor acts on it). Following the protocol means doing
-// nothing here — deliberately NOT even calling sink.Respond, because the
-// classic processor would not reply to a sync sender either.
+// proxy's own handler acts on it). Honouring the protocol means doing
+// nothing here -- deliberately NOT even calling sink.Respond, because a
+// classic-remoting client would not reply to a sync sender either.
 func (i *Instance) processNotifyUnsubscribeLite(_ *remoting.RemotingCommand, addr string, _ *remoting.ResponseSink) {
 	common.LogDebugf("remoting: NOTIFY_UNSUBSCRIBE_LITE(200073) from %s; nothing to do on the classic path", addr)
 }
 
-// ackIfWanted answers the push. The classic processor returns no reply for
+// ackIfWanted answers the push. The protocol defines no reply for
 // 40/220 and the broker sends both oneway; Respond itself drops replies for
 // oneway pushes, so a hypothetical sync pusher still gets its SUCCESS.
 func (i *Instance) ackIfWanted(sink *remoting.ResponseSink) {
@@ -517,7 +517,7 @@ func (i *Instance) processNotifyConsumerIDsChanged(request *remoting.RemotingCom
 	i.ackIfWanted(sink)
 }
 
-// processResetOffset (220): no reply (the classic processor answers none);
+// processResetOffset (220): no reply (the protocol defines none);
 // the actual reset
 // runs on its own goroutine because rebalance/lock/batch inside it make sync
 // calls that must not block the remoting read loop.
@@ -623,20 +623,20 @@ func (i *Instance) processGetConsumerRunningInfo(request *remoting.RemotingComma
 // processConsumeMessageDirectly (309) hands one broker-supplied message to the
 // local listener and returns its verdict.
 //
-// The classic processor answers SYSTEM_ERROR with
-// the same "not exist" remark when the instance-level running-info lookup
-// fails, and its consumeMessageDirectly dispatch returns nothing for any
-// consumer that is not a push consumer — so a pull or lite consumer
-// group produces that same error, not a silent success.
+// Broker contract for 309: a running-info lookup that finds nothing is
+// answered with SYSTEM_ERROR plus the fixed "not exist" remark, and a
+// consumer that is not a push consumer gets no result at all -- so a
+// pull or lite consumer group produces that same error rather than a
+// silent success.
 //
-// The listener runs on its own goroutine. The classic client runs it on the
-// Netty handler thread, which this port must not copy: the remoting read loop
-// is shared with every other response on the connection, and a listener that
-// makes a
-// every other response on the connection, and a listener that makes a
-// synchronous request (sendMessageBack, a downstream call) would wait on a
-// response only that loop can deliver. The reply still goes out strictly after
-// the listener returns, so the wire ordering the broker sees is unchanged.
+// The listener runs on its own goroutine, never on the remoting read
+// thread. That thread serves every other response on the connection, so a
+// listener that makes a synchronous request (sendMessageBack, a
+// downstream call) would wait on a response only that same thread can
+// deliver, and the connection would stall.
+// The reply still goes out strictly after the listener returns, so the
+// wire ordering the broker sees is unchanged: verdict first, always,
+// however long the listener took.
 func (i *Instance) processConsumeMessageDirectly(request *remoting.RemotingCommand, _ string, sink *remoting.ResponseSink) {
 	var header remoting.ConsumeMessageDirectlyResultRequestHeader
 	header.FromExtFields(request.ExtFields())
@@ -668,15 +668,15 @@ func (i *Instance) processConsumeMessageDirectly(request *remoting.RemotingComma
 		sink.Respond(remoting.CreateResponseCommand(remoting.RespSystemError, "empty message body"))
 		return
 	}
-	// The classic client decodes this body with its client-side message decoder,
-	// readBody=true, i.e.
-	// decode(bb, readBody=true, deCompressBody=true, isClient=true,
-	// isSetPropertiesString=false, checkCRC=false) — exactly
+	// This body is a client-side encoded message, so it is decoded with this
+	// client's default decode options:
+	// readBody=true, deCompressBody=true, isClient=true,
+	// isSetPropertiesString=false, checkCRC=false -- exactly
 	// common.DefaultDecodeOptions(). So the body is one stored message with its
 	// body present, DECOMPRESSED if the sysFlag says so, and with IsClient set
 	// (a MessageClientExt, i.e. MsgID also lands in OffsetMsgID).
-	// (Plain non-client decode, by contrast, passes isClient=false; using it
-	// here would drop OffsetMsgID from every 309 delivery.)
+	// (Decoding with isClient=false, by contrast,
+	// would drop OffsetMsgID from every 309 delivery.)
 	msg, err := common.DecodeMessage(request.Body)
 	if err != nil {
 		sink.Respond(remoting.CreateResponseCommand(remoting.RespSystemError,
@@ -989,7 +989,7 @@ func (i *Instance) UpdateTopicRouteInfoFromNameServer(topic string, timeoutMilli
 		delete(i.topicEndPointsTable, topic)
 	}
 	// The route's own brokerAddrs map is stored by shared reference, so the
-	// classic "only overwrite when changed" still refreshes; overwriting
+	// "only overwrite when changed" refresh still applies; overwriting
 	// unconditionally here is the same end state.
 	for _, bd := range route.BrokerDatas {
 		addrs := make(map[int64]string, len(bd.BrokerAddrs))
@@ -1361,10 +1361,10 @@ func (i *Instance) PrepareHeartbeatData() *remoting.HeartbeatData {
 
 // SendHeartbeat sends one heartbeat body to one broker.
 //
-// Every accepted beat also records the broker's protocol version, exactly as the
-// reference does on its plain path: the version table is filled by whichever
-// heartbeat form actually ran, so the V2 switch never decides whether a broker's
-// version becomes known.
+// Every accepted beat also records the broker's protocol version: the version
+// table is filled by whichever heartbeat form actually ran, so the V2 switch
+// never decides whether a broker's version becomes known, on the plain path
+// or the fingerprinted one.
 func (i *Instance) SendHeartbeat(addr string, hb *remoting.HeartbeatData, timeoutMillis int64) error {
 	request := remoting.CreateRequestCommand(remoting.ReqHeartBeat, nil)
 	request.SetBody(hb.Encode())
@@ -1442,7 +1442,7 @@ func (i *Instance) SendHeartbeatV2(addr string, hb *remoting.HeartbeatData,
 // IS_SUB_CHANGE — that answer means "the group's fingerprint I hold differs",
 // so the stored value is dropped and the next beat carries subscriptions again.
 //
-// isRebalance is the reference hook RebalancePushImpl uses: an assignment change
+// isRebalance marks a beat triggered by a queue-assignment change: such a change
 // invalidates every cached fingerprint, because the client's view of which
 // subscriptions matter just changed and the broker must be told again.
 //
@@ -1498,8 +1498,8 @@ func (i *Instance) SendHeartbeatToAllBrokerV2(isRebalance bool, timeoutMillis in
 }
 
 // SendHeartbeatToAllBrokerWithLockV2 is the entry point the periodic task and a
-// rebalance use: one beat at a time, a concurrent caller simply skips (the
-// reference logs "lock heartBeat, but failed" rather than queueing, and a beat
+// rebalance use: one beat at a time, a concurrent caller simply skips (this
+// client logs "lock heartBeat, but failed" rather than queueing, and a beat
 // that misses one round is retried by the next period).
 func (i *Instance) SendHeartbeatToAllBrokerWithLockV2(isRebalance bool, timeoutMillis int64) int {
 	if !i.heartbeatMu.TryLock() {
@@ -1513,8 +1513,8 @@ func (i *Instance) SendHeartbeatToAllBrokerWithLockV2(isRebalance bool, timeoutM
 	return i.SendHeartbeatToAllBroker(timeoutMillis)
 }
 
-// ResetBrokerHeartbeatFingerprints clears the per-address fingerprint cache (the
-// reference's resetBrokerAddrHeartbeatFingerprintMap). Every broker then gets a
+// ResetBrokerHeartbeatFingerprints clears the per-address fingerprint cache,
+// dropping the suppression bookkeeping. Every broker then gets a
 // subscription-carrying beat again.
 func (i *Instance) ResetBrokerHeartbeatFingerprints() {
 	i.heartbeatStateMu.Lock()
@@ -1568,7 +1568,7 @@ func (i *Instance) forgetHeartbeatV2Broker(addr string) {
 }
 
 // rememberBrokerVersion records the broker protocol version a heartbeat response
-// carried (the reference's brokerVersionTable).
+// carried into the instance's broker version table.
 func (i *Instance) rememberBrokerVersion(addr string, version int32) {
 	if addr == "" {
 		return

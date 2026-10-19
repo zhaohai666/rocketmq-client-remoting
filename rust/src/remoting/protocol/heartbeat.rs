@@ -227,8 +227,8 @@ impl FilterAPI {
     ///
     /// Exactly `TAG` or an absent type compiles the tag expression into `tagsSet`/`codeSet`; any
     /// other type (SQL92 in practice) forwards the raw expression and leaves **both collections
-    /// empty**, which is also what switches off the client-side re-filter in
-    /// `PullAPIWrapper#processPullResult` (that one only runs when `tagsSet` is non-empty).
+    /// empty**, which is also what switches off the client-side re-filter when a pull result is
+    /// post-processed (that one only runs when `tagsSet` is non-empty).
     /// An empty expression for a non-tag type is rejected.
     pub fn build(topic: &str, sub_string: &str, expression_type: Option<&str>) -> Result<SubscriptionData> {
         let type_ = match expression_type {
@@ -428,8 +428,8 @@ impl HeartbeatV2Result {
     }
 
     /// Parses the two boolean extFields of a `HEART_BEAT` response. Absent, empty or non-"true"
-    /// values all read as false, the same lenient `Boolean.parseBoolean` semantics the Java
-    /// client relies on.
+    /// values all read as false: these flags are lenient strings on the wire, and
+    /// anything the broker did not echo as "true" is not set.
     pub fn from_response(response: &crate::remoting::protocol::remoting_command::RemotingCommand) -> HeartbeatV2Result {
         HeartbeatV2Result::new(
             response.version,
@@ -463,13 +463,13 @@ impl HeartbeatData {
         }
     }
 
-    /// `HeartbeatData#computeHeartbeatFingerprint`: a fingerprint over the **subscription
+    /// [`Self::compute_heartbeat_fingerprint`]: a fingerprint over the **subscription
     /// content** of this beat, deliberately blind to everything that churns between beats:
     /// every `subVersion` (a wall-clock timestamp), `clientID`, `withoutSub` and the fingerprint
     /// field itself. Two beats with the same group/subscription set therefore hash equal, and
     /// the broker's per-group table can answer "did this client change its subscriptions?".
     ///
-    /// The value is a Java `String.hashCode` of the canonical JSON, i.e. the same hash family
+    /// The value is the 31-multiplier integer string hash of the canonical JSON, i.e. the same hash family
     /// `codeSet` uses; it only has to be stable **within this process**, since the broker just
     /// compares consecutive fingerprints from the same client id.
     pub fn compute_heartbeat_fingerprint(&self) -> i32 {
@@ -827,7 +827,7 @@ mod tests {
         assert_eq!(none.tags_set, vec!["TagA".to_string()]);
         assert_eq!(none.expression_type, ExpressionType::TAG);
 
-        // An empty expression for a non-tag type is rejected (Java throws IllegalArgumentException).
+        // An empty expression for a non-tag type is rejected with a client error.
         let err = FilterAPI::build("T", "", Some(ExpressionType::SQL92)).unwrap_err();
         assert!(
             matches!(&err, crate::error::Error::Client { message, .. } if message == "Expression can't be null! SQL92"),
@@ -836,7 +836,7 @@ mod tests {
     }
 
     #[test]
-    fn expression_type_is_tag_type_matches_java() {
+    fn expression_type_is_tag_type_only_for_empty_and_tag() {
         assert!(ExpressionType::is_tag_type(""));
         assert!(ExpressionType::is_tag_type(ExpressionType::TAG));
         assert!(!ExpressionType::is_tag_type(ExpressionType::SQL92));

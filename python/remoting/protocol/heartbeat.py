@@ -2,15 +2,15 @@
 """Heartbeat data (the models of the protocol's heartbeat package).
 
 The heartbeat body carries two extra fields next to the 4.x ones, both added for
-`MQClientInstance#sendHeartbeatToAllBrokerV2` (the "heartbeat V2" path):
+the "heartbeat V2" registration path:
 
-* ``heartbeatFingerprint`` -- a hash of the whole registration content. The broker's
-  ``ClientManageProcessor#heartBeat`` dispatches on it: ``0`` takes the V1 registration
-  path (the complete ``subscriptionDataSet`` is re-registered every round), a **non-zero**
-  value takes ``heartBeatV2`` where the broker keeps ``group -> fingerprint`` and answers
-  with ``IS_SUB_CHANGE``.
+* ``heartbeatFingerprint`` -- a hash of the whole registration content. The broker
+  dispatches on it: ``0`` takes the V1 registration path (the complete
+  ``subscriptionDataSet`` is re-registered every round), a **non-zero** value takes the
+  V2 path, where the broker keeps ``group -> fingerprint`` and answers with
+  ``IS_SUB_CHANGE``.
 * ``withoutSub`` -- the V2 "simple" heartbeat: the consumer groups are re-registered
-  **without** their subscription set (``registerConsumerWithoutSub``), which the broker
+  **without** their subscription set (a subscription-less re-registration), which the broker
   only accepts while the fingerprint it stored still matches.
 
 There is **no** ``HEART_BEAT_V2`` request code on the wire: V2 reuses ``HEART_BEAT`` (34)
@@ -129,10 +129,10 @@ class HeartbeatData:
     def to_dict(self) -> dict:
         # heartbeatFingerprint == 0 makes the broker take the V1 registration path
         # (registering with the complete subscriptionDataSet), which is the safest choice;
-        # only a non-zero value reaches the heartBeatV2 optimization -- that is exactly what
-        # ``MQClientInstance#sendHeartbeatToAllBrokerV2`` sets, see client/heartbeat_v2.py.
+        # only a non-zero value reaches the V2 optimization -- that is exactly what
+        # the opt-in heartbeat V2 round sets, see client/heartbeat_v2.py.
         # withoutSub is the same idea (the protocol field is isWithoutSub,
-        # while the fastjson name on the broker side is withoutSub).
+        # while the JSON key the broker decodes is withoutSub).
         return {
             "clientID": self.client_id,
             "producerDataSet": [p.to_dict() for p in sorted(
@@ -151,7 +151,7 @@ class HeartbeatData:
         for c in d.get("consumerDataSet") or []:
             hb.consumer_data_set.add(ConsumerData.from_dict(c))
         # The two V2 fields must survive a decode: the broker reads them back out of the body
-        # (ClientManageProcessor#heartBeat switches on heartbeatFingerprint), and a port that
+        # (its registration path switches on heartbeatFingerprint), and a client that
         # dropped them here could not echo a peer's heartbeat faithfully.
         hb.heartbeat_fingerprint = int(d.get("heartbeatFingerprint") or 0)
         hb.without_sub = bool(d.get("withoutSub") or False)
@@ -160,7 +160,7 @@ class HeartbeatData:
     def fingerprint_payload(self) -> dict:
         """The canonical dict whose hash is the heartbeat fingerprint.
 
-        Mirrors ``HeartbeatData#computeHeartbeatFingerprint``: copy the object, force every
+        Normalization before hashing: take the serialized dict, force every
         ``subVersion`` to 0, ``withoutSub`` to false, ``heartbeatFingerprint`` to 0 and
         ``clientID`` to "", then hash the JSON text. Dropping those four from the hash is the
         whole point: a subscription's version stamp is a wall-clock timestamp, the clientId
@@ -177,16 +177,16 @@ class HeartbeatData:
         return payload
 
     def compute_fingerprint(self) -> int:
-        """Java's ``computeHeartbeatFingerprint``: ``JSON.toJSONString(copy).hashCode()``.
+        """The fingerprint: the int32 string hash of the canonical JSON text.
 
-        ``utf16_int32_hash`` is the port of ``java.lang.String#hashCode`` (the same function the
-        tag hash ``codeSet`` uses), so the algorithm matches the reference even though the JSON
+        ``utf16_int32_hash`` hashes UTF-16 code units (the same function the
+        tag hash ``codeSet`` uses), so the arithmetic is fixed even though the JSON
         text itself is produced by this port's serializer. The value only ever gets compared
         with **its own history** (the broker stores ``group -> fingerprint`` and this client
         stores ``broker addr -> fingerprint``), never with a value another client produced.
 
-        Always compute it on the **with-subscription** body: Java computes it once per round on
-        ``heartbeatDataWithSub`` and stamps the same value onto the ``withoutSub`` variant, so the
+        Always compute it on the **with-subscription** body: this port computes it once per round
+        on the full heartbeat and stamps the same value onto the ``withoutSub`` variant, so the
         light copy's own ``compute_fingerprint()`` (its subscription sets are empty) is meaningless.
         """
         text = json.dumps(self.fingerprint_payload(), sort_keys=True, ensure_ascii=False,
@@ -194,11 +194,11 @@ class HeartbeatData:
         return utf16_int32_hash(text)
 
     def without_sub_copy(self) -> "HeartbeatData":
-        """The V2 "simple" heartbeat body (Java's ``prepareHeartbeatData(true)``).
+        """The V2 "simple" heartbeat body (the light variant of the registration).
 
         Same client / producer / consumer groups, **empty** subscription sets and
-        ``withoutSub=true``; the broker then re-registers the groups through
-        ``ConsumerManager#registerConsumerWithoutSub`` instead of re-parsing the subscriptions.
+        ``withoutSub=true``; the broker then re-registers the groups as subscription-less
+        ones instead of re-parsing the subscriptions.
         """
         copy = HeartbeatData(self.client_id)
         copy.heartbeat_fingerprint = self.heartbeat_fingerprint
@@ -230,7 +230,7 @@ def _subscription_sort_key(sub: SubscriptionData):
 
 
 class HeartbeatV2Result:
-    """``remoting/common/HeartbeatV2Result.java``: what a HEART_BEAT(34) response tells the client.
+    """The pair of flags a HEART_BEAT(34) response tells the client about heartbeat V2.
 
     ``support_v2`` comes from the ``IS_SUPPORT_HEART_BEAT_V2`` extField and ``sub_change`` from
     ``IS_SUB_CHANGE``; a broker that predates heartbeat V2 sends **neither**, which the client
@@ -245,7 +245,7 @@ class HeartbeatV2Result:
 
     @staticmethod
     def from_response(version: int, ext_fields: Optional[dict]) -> "HeartbeatV2Result":
-        """Parse the two flags the Java way: ``Boolean.parseBoolean(extFields.get(key))``.
+        """Parse the two flags the way the broker writes them: case-insensitive ``"true"`` text.
 
         A missing key / missing extFields block therefore parses as ``False``.
         """

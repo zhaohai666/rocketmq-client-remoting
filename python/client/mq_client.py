@@ -131,8 +131,8 @@ class MQClientInstance:
         # (listen port - 2). Off by default: the fast channel only exists on a broker that was
         # started with it enabled, so rewriting by default would point at a closed port.
         self.vip_channel_enabled = bool(vip_channel_enabled)
-        # Heartbeat V2 per-stream state (brokerSupportV2HeartbeatSet +
-        # brokerAddrHeartbeatFingerprintTable); the facades decide whether to use it, see
+        # Heartbeat V2 per-stream state (the set of brokers known to speak V2 plus the
+        # broker addr -> fingerprint table); the facades decide whether to use it, see
         # client/heartbeat_v2.py.
         self._heartbeat_v2 = HeartbeatV2Coordinator(self)
         self.remoting_client = RemotingClient(connect_timeout_millis, invoke_timeout_millis,
@@ -295,7 +295,7 @@ class MQClientInstance:
         self.rebalance_immediately()
         return None
 
-    # ---------------- broker proactive request handling (ClientRemotingProcessor) ----------------
+    # ---------------- broker proactive request handling (broker -> client requests) ----------------
     def _process_reset_offset(self, cmd: RemotingCommand, addr: str) -> Optional[RemotingCommand]:
         """RESET_CONSUMER_CLIENT_OFFSET(220): sent by the broker via invokeOneway, no reply needed.
 
@@ -676,8 +676,8 @@ class MQClientInstance:
         request = self._build_send_request(producer_group, msg, mq, timeout_millis, sys_flag,
                                            unit_mode, default_topic, default_topic_queue_nums)
         # The VIP channel wraps every send flavour: SEND_MESSAGE_V2, SEND_BATCH_MESSAGE and
-        # SEND_REPLY_MESSAGE_V2 (the request-reply reply is a send, and in Java the rewrite happens
-        # in sendKernelImpl, i.e. before the request code is even chosen).
+        # SEND_REPLY_MESSAGE_V2 (the request-reply reply is a send, and here the rewrite happens
+        # in the send path itself, i.e. before the request code is even chosen).
         response = self._invoke_sync(self.vip_addr(addr), request, timeout_millis)
         return self._parse_send_response(response, msg, mq)
 
@@ -1346,7 +1346,7 @@ class MQClientInstance:
             request = RemotingCommand.create_request_command(RequestCode.LOCK_BATCH_MQ, LockBatchMqRequestHeader())
             request.body = body.encode()
             try:
-                # Java: MQClientAPIImpl#lockBatchMQ wraps the address with the VIP channel.
+                # LOCK_BATCH_MQ is one of the VIP-wrapped broker requests.
                 response = self._invoke_sync(self.vip_addr(addr), request, timeout_millis)
                 self._check_response(response)
                 rb = LockBatchResponseBody.decode(response.body)
@@ -1377,7 +1377,7 @@ class MQClientInstance:
             request = RemotingCommand.create_request_command(RequestCode.UNLOCK_BATCH_MQ, UnlockBatchMqRequestHeader())
             request.body = body.encode()
             try:
-                # Java: MQClientAPIImpl#unlockBatchMQ wraps the address with the VIP channel.
+                # UNLOCK_BATCH_MQ is one of the VIP-wrapped broker requests.
                 response = self._invoke_sync(self.vip_addr(addr), request, timeout_millis)
                 self._check_response(response)
             except Exception as e:  # noqa: BLE001
@@ -1387,9 +1387,9 @@ class MQClientInstance:
     def send_heartbeat(self, addr: str, heartbeat_data: HeartbeatData, timeout_millis: int = 5000) -> int:
         """HEART_BEAT(34) with a V1 body; returns the broker version from the response header.
 
-        ``MQClientAPIImpl#sendHeartbeat`` returns ``response.getVersion()`` (Java records it in
-        ``brokerVersionTable``); the V1 path is what a ``heartbeatFingerprint == 0`` body takes on
-        the broker, and it stays the default here because ``useHeartbeatV2`` is off by default.
+        The version comes back in the response header and each round records it per broker; the
+        V1 path is what a ``heartbeatFingerprint == 0`` body takes on
+        the broker, and it stays the default here because ``use_heartbeat_v2`` is off by default.
         """
         request = RemotingCommand.create_request_command(RequestCode.HEART_BEAT, None)
         request.body = heartbeat_data.encode()
@@ -1399,7 +1399,7 @@ class MQClientInstance:
 
     def send_heartbeat_v2(self, addr: str, heartbeat_data: HeartbeatData,
                           timeout_millis: int = 5000) -> HeartbeatV2Result:
-        """``MQClientAPIImpl#sendHeartbeatV2``: the same HEART_BEAT(34) frame, V2 body.
+        """The V2 heartbeat RPC: the same HEART_BEAT(34) frame, V2 body.
 
         Nothing about the frame changes -- the body carries ``heartbeatFingerprint`` (non-zero) and
         possibly ``withoutSub``, and the broker answers with the ``IS_SUPPORT_HEART_BEAT_V2`` /
@@ -1418,14 +1418,14 @@ class MQClientInstance:
         """Send one heartbeat through the V2 path (see ``client/heartbeat_v2.py``).
 
         ``owner`` names the heartbeat stream (a facade's group), because this port sends one
-        heartbeat per facade rather than one aggregated heartbeat per instance like Java does.
+        heartbeat per facade rather than one aggregated heartbeat per client instance.
         """
         return self._heartbeat_v2.send_to_broker(owner, addr, heartbeat_data, timeout_millis)
 
     def reset_heartbeat_v2_fingerprint_table(self, owner: Optional[str] = None) -> None:
-        """Drop the remembered fingerprints (``resetBrokerAddrHeartbeatFingerprintMap``).
+        """Drop the remembered fingerprints of one stream or of every stream.
 
-        Java calls it when the queue allocation changes; ``owner=None`` resets every stream.
+        Call it when the queue allocation changes; ``owner=None`` resets every stream.
         """
         self._heartbeat_v2.reset_fingerprint_table(owner)
 
@@ -1451,7 +1451,7 @@ class MQClientInstance:
         body.group = consumer_group
         body.subscription_data = subscription_data
         request.body = body.encode()
-        # Java: MQClientAPIImpl#checkClientInBroker wraps the broker address with the VIP channel.
+        # CHECK_CLIENT_CONFIG(46) is one of the VIP-wrapped broker requests.
         response = self._invoke_sync(self.vip_addr(broker_addr), request, timeout_millis)
         if response is None:
             raise MQClientException("checkClientConfig got no response from %s" % broker_addr)
@@ -1567,7 +1567,7 @@ class MQClientInstance:
         header = GetConsumerListByGroupRequestHeader()
         header.consumer_group = consumer_group
         request = RemotingCommand.create_request_command(RequestCode.GET_CONSUMER_LIST_BY_GROUP, header)
-        # Java: MQClientAPIImpl#getConsumerIdListByGroup is one of the VIP-wrapped requests.
+        # GET_CONSUMER_LIST_BY_GROUP is one of the VIP-wrapped requests.
         response = self._invoke_sync(self.vip_addr(addr), request, timeout_millis)
         self._check_response(response)
         if response.body:
@@ -1651,8 +1651,8 @@ class MQClientInstance:
         header.consumer_group = consumer_group
         request = RemotingCommand.create_request_command(RequestCode.GET_CONSUMER_LIST_BY_GROUP,
                                                          header)
-        # Rebalance asks the broker for the group's consumer list: Java's
-        # MQClientAPIImpl#getConsumerIdListByGroup wraps this address with the VIP channel too.
+        # Rebalance asks the broker for the group's consumer list: this lookup is
+        # VIP-wrapped too, like the other requests a broker answers on the fast channel.
         target = self.vip_addr(addr)
         try:
             response = self._invoke_sync(target, request, timeout_millis)

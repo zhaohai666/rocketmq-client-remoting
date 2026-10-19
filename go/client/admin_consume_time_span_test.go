@@ -1,8 +1,8 @@
 // QUERY_CONSUME_TIME_SPAN(303) through DefaultMQAdminExt: the fan-out shape, the
 // header set and the two answer shapes a broker can give.
 //
-// Wire facts pinned here (the reference is
-// DefaultMQAdminExtImpl#queryConsumeTimeSpan -> MQClientAPIImpl#queryConsumeTimeSpan):
+// Wire facts pinned here, all of them
+// observable at the broker boundary rather than assumed:
 //   - one request per broker GROUP, to that group's MASTER address: a slave owns
 //     no consume queue of its own to report;
 //   - the header is exactly `topic` + `group` and there is no body;

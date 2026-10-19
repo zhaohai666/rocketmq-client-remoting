@@ -116,8 +116,8 @@ type DefaultMQPushConsumer struct {
 	unitName      string
 	unitMode      bool
 	streamRequest bool
-	// useHeartbeatV2 is ClientConfig.useHeartbeatV2, the
-	// `com.rocketmq.heartbeat.v2` switch (off unless turned on).
+	// useHeartbeatV2 is this client's heartbeat-protocol-version-2
+	// switch (off unless turned on).
 	useHeartbeatV2 bool
 	tlsEnable      *bool
 	socksProxy     *remoting.SocksProxyConfig
@@ -370,8 +370,8 @@ func (c *DefaultMQPushConsumer) SetEnableStreamRequestType(enable bool) {
 	c.streamRequest = enable
 }
 
-// SetUseHeartbeatV2 mirrors ClientConfig#setUseHeartbeatV2 (the
-// `com.rocketmq.heartbeat.v2` switch, off by default on both sides). When
+// SetUseHeartbeatV2 turns the heartbeat-protocol-version-2 switch on or off;
+// it is off by default. When
 // enabled, the instance's heartbeat carries a subscription fingerprint and stops
 // re-sending unchanged subscriptions to brokers that answer
 // IS_SUPPORT_HEART_BEAT_V2; see Instance.SendHeartbeatToAllBrokerV2. Call it
@@ -391,7 +391,7 @@ func (c *DefaultMQPushConsumer) SetRpcHook(hook remoting.RPCHook) {
 	c.rpcHook = hook
 }
 
-// SetNamespaceV2 mirrors ClientConfig#setNamespaceV2: the SERVER-side namespace
+// SetNamespaceV2 sets the SERVER-side namespace
 // sent as `ns`/`nsd` by NamespaceRpcHook, as opposed to SetNamespace, which
 // mangles topic names client-side.
 func (c *DefaultMQPushConsumer) SetNamespaceV2(ns string) {
@@ -561,9 +561,9 @@ func (c *DefaultMQPushConsumer) SetPostSubscriptionWhenPull(enable bool) {
 // SET_MESSAGE_REQUEST_MODE(401) for every subscribed topic — see
 // enablePopModeOnBroker.
 //
-// A POP consumer must not be orderly: the reference implementation leaves
-// orderly POP as an unfinished stub, and mixing the two here would need a queue
-// lock the POP protocol does not have.
+// A POP consumer must not be orderly: the broker's POP protocol has no queue
+// lock and no orderly POP variant, so mixing the two here would silently lose
+// ordering.
 func (c *DefaultMQPushConsumer) SetPopMode(enable bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1142,8 +1142,8 @@ func (c *DefaultMQPushConsumer) Start() error {
 		return err
 	}
 	if c.messageModel == MessageModelClustering {
-		// Only CLUSTERING rewrites DEFAULT to pid#nanotime so that same-process
-		// broadcast consumers share one instance.
+		// Only CLUSTERING rewrites DEFAULT to the pid plus a nanotime suffix so
+		// that same-process broadcast consumers share one instance.
 		c.instanceName = common.ChangeInstanceNameToPID(c.instanceName)
 	}
 	c.clientID = common.BuildMQClientID(common.CachedIPStr(), c.instanceName, c.unitName, c.streamRequest)
@@ -1566,9 +1566,9 @@ func (c *DefaultMQPushConsumer) checkConfigRangesLocked() error {
 	case c.popBatchNums <= 0 || c.popBatchNums > maxPopBatchNums:
 		return common.ClientError(fmt.Sprintf("popBatchNums Out of range [1, %d]", maxPopBatchNums))
 	case c.popMode && c.orderly:
-		// Orderly POP is an unfinished stub in the reference implementation.
+		// The broker offers no orderly variant of the POP protocol.
 		// There is no queue lock in the POP protocol to serialise on, so an
-		// orderly POP consumer would silently lose ordering — refuse instead.
+		// orderly POP consumer would silently lose ordering -- refuse instead.
 		return common.ClientError("pop mode does not support orderly consumption")
 	}
 	return nil
@@ -1841,9 +1841,9 @@ func (c *DefaultMQPushConsumer) ProcessQueueCount() int {
 //
 // It exists to pin the POP rule that has no broker-side observable: a POP
 // consumer keeps no cursor at all (the broker's revive queue is the cursor), so
-// this must stay 0 in POP mode. The broker's ConsumerOffsetManager DOES hold an
-// offset for a POP group, but the broker writes that itself
-// (PopMessageProcessor#getInitOffset commits with the label "getPopOffset"), so
+// this must stay 0 in POP mode. The broker's offset manager DOES hold an
+// offset for a POP group, but the broker writes that itself (it commits
+// with the label "getPopOffset" when initialising a POP offset), so
 // reading it back proves nothing about the client. This is the client-side half
 // of the contract.
 func (c *DefaultMQPushConsumer) LocalOffsetCount() int {
@@ -1929,10 +1929,10 @@ func (c *DefaultMQPushConsumer) syncPullLoops() {
 	if len(revoked) > 0 {
 		common.LogInfof("queues revoked, group=%s count=%d", c.consumerGroup, len(revoked))
 	}
-	// The reference re-beats right here (RebalancePushImpl.messageQueueChanged
-	// calls sendHeartbeatToAllBrokerWithLockV2(true)), because the assignment —
-	// and with V2 the fingerprint cache that suppresses subscriptions — just
-	// moved. This port only spends that extra beat when V2 is actually on, so
+	// A queue assignment change also moves the V2 fingerprint cache that
+	// suppresses unchanged subscriptions, so the broker needs a fresh beat right
+	// here. This client only spends that extra beat when V2 is on and the
+	// assignment really changed, so
 	// the default heartbeat cadence stays exactly the 30s task's.
 	c.beatAfterRebalance(added+len(revoked) > 0)
 	c.notifyQueueChanged()

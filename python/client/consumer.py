@@ -76,7 +76,7 @@ _ORDERLY_STATUSES = (ConsumeOrderlyStatus.SUCCESS, ConsumeOrderlyStatus.ROLLBACK
                      ConsumeOrderlyStatus.COMMIT,
                      ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT)
 
-# Pull idle upper bound (`rocketmq.client.pull.pullMaxIdleTime`, default 120000ms):
+# Pull idle upper bound (``PULL_MAX_IDLE_TIME``, 120s = 2 minutes by default):
 # if a queue still owned by this instance hasn't started any pull/pop for longer than this, its loop is
 # dead (or stuck), and rebalance removes and rebuilds it by this criterion.
 PULL_MAX_IDLE_TIME = 120.0
@@ -89,7 +89,7 @@ PULL_TIME_DELAY_WHEN_SUSPEND = 1.0
 def _mq_sort_key(mq: MessageQueue):
     """Queue sort key, comparison semantics: topic -> brokerName -> queueId.
 
-    Rebalance sorts mqAll/cidAll before allocating; inconsistent ordering makes different instances compute
+    Allocation sorts mq_all/cid_all before deciding; inconsistent ordering makes different instances compute
     different allocation results (the same queue consumed by two instances at once).
     """
     return (mq.topic, mq.broker_name, mq.queue_id)
@@ -218,9 +218,9 @@ class AllocateMessageQueueAveragely(AllocateMessageQueueStrategy):
 
     def allocate(self, consumer_group: str, current_cid: str, mq_all: List[MessageQueue],
                  cid_all: List[str]) -> List[MessageQueue]:
-        # Guard order: currentCID -> mqAll -> cidAll. All three cases only return an empty list without raising
+        # Guard order: current_cid -> mq_all -> cid_all. All three cases only return an empty list without raising
         # (rebalance is a periodic background task, bad input should not take the consumer down);
-        # when currentCID is not in cidAll, leave a [BUG] info log.
+        # when current_cid is not in cid_all, leave a [BUG] info log.
         if not current_cid or not mq_all or not cid_all:
             return []
         if current_cid not in cid_all:
@@ -270,7 +270,7 @@ class AllocateMessageQueueAveragelyByCircle(AllocateMessageQueueStrategy):
 
 
 class AllocateMessageQueueByConfig(AllocateMessageQueueStrategy):
-    """Allocation by explicit config: ignores mqAll/cidAll and directly returns the configured queue list.
+    """Allocation by explicit config: ignores mq_all/cid_all and directly returns the configured queue list.
 
     __init__ normalizes None into an empty list, and allocate returns a copy of the list so callers cannot mutate internal state.
     ``allocate`` does **not** validate input, so an empty group / empty cid_all still returns the configured value.
@@ -290,7 +290,7 @@ class AllocateMessageQueueByConfig(AllocateMessageQueueStrategy):
 # ------------------------------------------------------ Consistent hash ring
 #
 # Only AllocateMessageQueueConsistentHash uses it, but the whole thing is implemented in a fixed form rather than as an "equivalent rewrite":
-# the ring positions are jointly determined by three details -- how MD5 takes bytes, virtual node naming, and whether tailMap includes endpoints --
+# the ring positions are jointly determined by three details -- how MD5 takes bytes, virtual node naming, and whether the ring's range lookup includes its endpoints --
 # any difference would move every queue to a different owner, which shows up as duplicate/missed consumption when mixed with other consistent-hash clients.
 
 
@@ -369,7 +369,7 @@ class ConsistentHashRouter:
 
     def add_node(self, p_node: Node, v_node_count: int) -> None:
         # Existing replicas must continue the numbering, otherwise the v virtual nodes of the same
-        # physical node would all land on the same hash (when addNode is called twice, i + existingReplicas distinguishes them).
+        # physical node would all land on the same hash (when a node is added twice, i + the replica count already on the ring distinguishes them).
         if v_node_count < 0:
             raise ValueError("illegal virtual node counts :%d" % v_node_count)
         existing_replicas = self.get_existing_replicas(p_node)
@@ -689,7 +689,7 @@ _FIELD_RE = re.compile(r'"(\w+)"\s*:\s*("(?:[^"\\]|\\.)*"|-?\d+)')
 class PopProcessQueue:
     """Queue state in POP mode.
 
-    Unlike pull mode's ProcessQueue, POP **has no "pulled but not consumed" buffer**: once a message is popped it goes to the
+    Unlike pull mode's per-queue buffer, POP **has no "pulled but not consumed" buffer**: once a message is popped it goes to the
     consume thread, and confirmation is by ack. Only two things are tracked here:
 
     - ``wait_ack_counter``: the count of popped messages not yet acked / with unextended invisibility, used for flow control;
@@ -734,7 +734,7 @@ class DefaultMQPushConsumer:
     # ---------------- POP mode (5.x lightweight consumption) config ----------------
     #
     # POP has two sources of queues: broker-side allocation (QUERY_ASSIGNMENT(400) returns
-    # MessageQueueAssignment(mode=POP), no client-side rebalance), or client rebalance.
+    # a POP-mode assignment list, no client-side rebalance), or client rebalance.
     # This port uses **client rebalance** (see _rebalance_pull_threads): queues are computed locally per the allocation
     # strategy, then each queue is POPped independently -- one POP loop per queue + ack confirmation.
     # The only difference is "who decides which queues are allocated"; read this comment block before changing it.
@@ -756,7 +756,7 @@ class DefaultMQPushConsumer:
         # ---- unit / stream config ----
         # unitName takes part in the clientId's `@<unitName>` suffix and the dynamic addressing URL; unitMode is
         # reported to the broker along with the ConsumerData heartbeat, message redelivery request header and filter hooks;
-        # enableStreamRequestType both appends the `@STREAM` suffix to clientId (to
+        # ``enable_stream_request_type`` both appends the `@STREAM` suffix to clientId (to
         # "prevent unexpected reuses of MQClientInstance") and adds
         # the `ReqT=0` extension field to every request. Like the producer, push consumers default to off.
         self.unit_name: Optional[str] = None
@@ -787,7 +787,7 @@ class DefaultMQPushConsumer:
         # Whether the executor is self-built: this implementation does not support externally injected executors, so it is always True
         # -- the guard of update_core_pool_size therefore always holds.
         self._owns_consume_executor = True
-        # ProcessQueue.msgAccCnt (by queue key): the "backlog count" computed by the most recent pull
+        # Per-queue "accumulated message count" (by queue key): the backlog count computed by the most recent pull
         # = the MAX_OFFSET property on the message - that message's queueOffset (updated only when > 0)
         self._msg_acc_cnt_table: Dict[str, int] = {}
         self.consume_concurrently_max_span = 2000
@@ -797,7 +797,7 @@ class DefaultMQPushConsumer:
         self.pull_threshold_size_for_topic = -1
         self.pull_interval = 0
         self.pull_timeout_millis = 30000
-        # The suspend duration of long polling (brokerSuspendMaxTimeMillis defaults to 20000).
+        # The suspend duration of long polling (the broker's own max suspend time defaults to 20000).
         # Note: this property must be initialized here -- the pull loop reads it, and if missing it throws
         # AttributeError every round and is swallowed by the fallback except of _consume_loop, presenting as "the consumer receives nothing at all".
         self.pull_suspend_timeout_millis = 20000
@@ -825,12 +825,12 @@ class DefaultMQPushConsumer:
         self._consume_threads: List[threading.Thread] = []
         # In-flight batch count (the part in the buffer **currently being consumed by the listener**):
         # +1 when _dispatch_loop takes a batch, -1 at consumption completion (including exception re-enqueue).
-        # _pending together with it is the "queue-held message count"; correctTagsOffset's gate watches both.
+        # _pending together with it is the "queue-held message count"; _correct_tags_offset_locked's gate watches both.
         self._msg_queue_inflight: Dict[str, int] = {}
         # The **message bodies** of in-flight batches (key -> list, registered when a batch is taken, removed at consumption completion).
         # Corresponds to the part "dispatched to the listener but not yet acked":
         # _pending (pulled but not dispatched) union _inflight_msgs (dispatched but not settled) = the full set of queue-held messages.
-        # cleanExpiredMsg's "only look at the head (minimum offset)" criterion takes the first entry of this union.
+        # _clean_expired_queue's "only look at the head (minimum offset)" criterion takes the first entry of this union.
         self._inflight_msgs: Dict[str, List[MessageExt]] = {}
         self._offset_table: Dict[str, int] = {}
         self._stop = threading.Event()
@@ -841,13 +841,13 @@ class DefaultMQPushConsumer:
         self._pending: Dict[str, Deque[MessageExt]] = {}
         self._mq_map: Dict[str, MessageQueue] = {}
         self._consume_offsets: Dict[str, int] = {}
-        # Frozen offsets (allowToUpdate=false): after OFFSET_ILLEGAL correction writes the
-        # corrected value into _consume_offsets, in-flight ack / correctTagsOffset must not change it again,
+        # Frozen offsets (further updates refused): after OFFSET_ILLEGAL correction writes the
+        # corrected value into _consume_offsets, in-flight ack / _correct_tags_offset_locked must not change it again,
         # until this queue is rebuilt at the corrected offset (unfrozen when _rebalance_pull_threads creates a new loop).
         self._frozen_offsets: Set[str] = set()
-        # The "ProcessQueue epoch" of each queue: incremented when the queue is revoked (dropped).
+        # The queue-buffer epoch of each queue: incremented when the queue is revoked (dropped).
         # _dispatch_loop takes the epoch along with the batch and compares before acking -- a mismatch means this batch belongs
-        # to an already discarded old ProcessQueue and must be voided as a whole (without it, the old batch's ack would push the offset
+        # to an already discarded old queue buffer and must be voided as a whole (without it, the old batch's ack would push the offset
         # just corrected by the broker back to an illegal value, bouncing back and forth between client and broker).
         self._queue_epoch: Dict[str, int] = {}
         # Ordered consumption: the set of queue keys that broker LOCK_BATCH_MQ(41) confirmed as locked
@@ -876,24 +876,24 @@ class DefaultMQPushConsumer:
         self._rebalance_now = threading.Event()
         # start() moment: the rebalance loop retries with a shorter interval during startup (see _rebalance_loop)
         self._start_time = time.time()
-        # ---- Consumer heartbeat (heartbeatBrokerInterval defaults to 30s) ----
-        # Required: the broker's ConsumerManager only records the group's clientId after receiving a heartbeat,
+        # ---- Consumer heartbeat (``heartbeat_interval_millis`` defaults to 30s) ----
+        # Required: the broker's consumer table only records the group's clientId after receiving a heartbeat,
         # otherwise rebalance's GET_CONSUMER_LIST_BY_GROUP has no return.
         self.heartbeat_enabled = True
         self.heartbeat_interval_millis = 30000
-        # ---- ClientConfig knobs: heartbeat V2 and the VIP channel (both default false, as in Java) ----
-        # ``use_heartbeat_v2`` = ``com.rocketmq.heartbeat.v2``: on switches this consumer's HEART_BEAT(34)
+        # ---- Heartbeat V2 and the VIP channel switches (both default false) ----
+        # ``use_heartbeat_v2``: on switches this consumer's HEART_BEAT(34)
         # rounds to the fingerprint-gated path (client/heartbeat_v2.py); off keeps heartbeatFingerprint=0,
         # i.e. the broker's V1 registration path.
-        # ``vip_channel_enabled`` = ``com.rocketmq.sendMessageWithVIPChannel``: on makes the offset /
+        # ``vip_channel_enabled``: on makes the offset /
         # lock / consumer-list / send-re-back RPCs target the broker's VIP port (listen port - 2).
         self.use_heartbeat_v2 = False
         self.vip_channel_enabled = False
-        # Route refresh interval (pollNameServerInterval defaults to 30000ms).
+        # Route refresh interval (``poll_name_server_interval`` defaults to 30000ms).
         # Only passed through once when start() builds the MQClientInstance; later changes take no effect
         # (the background scheduling is arranged with the interval at startup).
         self.poll_name_server_interval = 30000
-        # Persist interval for consumed offsets (persistConsumerOffsetInterval defaults to 5000ms;
+        # Persist interval for consumed offsets (``persist_consumer_offset_interval`` defaults to 5000ms;
         # first delay 1000 * 10, then periodic at this value).
         # Also read only once by ``_offset_persist_loop`` at start().
         self.persist_consumer_offset_interval = 5000
@@ -906,7 +906,7 @@ class DefaultMQPushConsumer:
         self.pop_invisible_time = 60000
         # Max messages per POP (popBatchNums defaults to 32; the broker rejects >32)
         self.pop_batch_nums = 32
-        # Upper bound of this queue's "popped but not acked" counter; POP is paused when exceeded (popThresholdForQueue defaults to 96)
+        # Upper bound of this queue's "popped but not acked" counter; POP is paused when exceeded (pop_threshold_for_queue defaults to 96)
         self.pop_threshold_for_queue = 96
         # The delay levels (in seconds) for extending invisibility time on consume failure
         self.pop_delay_level = list(POP_DELAY_LEVEL)
@@ -918,9 +918,9 @@ class DefaultMQPushConsumer:
         self._pop_queues: Dict[str, PopProcessQueue] = {}
         self._pop_executor: Optional[ConsumeExecutor] = None
         # POP ordered-request dedup set, equality =
-        # (shardingKeyIndex, pq reference, mq); shardingKeyIndex is always 0, pq uses object identity
+        # (shard index, pq reference, mq); the shard index is always 0 here, pq uses object identity
         self._pop_orderly_requests: set = set()
-        # ---- Message trace (enableTrace / traceTopic) ----
+        # ---- Message trace (enable_trace / trace_topic) ----
         # When enabled, start() registers ConsumeMessageTraceHook, recording two trace segments SubBefore/SubAfter
         self.enable_trace = False
         self.trace_topic: Optional[str] = None      # None -> use RMQ_SYS_TRACE_TOPIC
@@ -968,12 +968,12 @@ class DefaultMQPushConsumer:
         return self.namespace_v2
 
     def set_vip_channel_enabled(self, enable: bool) -> None:
-        """Java's ``ClientConfig.setVipChannelEnabled``: the RPCs the reference wraps with
-        ``MixAll.brokerVIPChannel`` (offsets, queue locks, the group consumer list, message
-        re-send-back, earliest-msg-store-time and every send -- reply messages included) target
-        the broker's VIP port (listen port - 2) instead of the plain one. Off by default.
+        """Turn the VIP channel on or off. With it on, the RPCs the broker answers on its fast
+        channel -- offsets, queue locks, the group consumer list, message re-send-back,
+        earliest-msg-store-time and every send, reply messages included -- target **the broker's
+        listen port minus 2** instead of the plain one. Off by default.
 
-        The rewrite itself lives on ``MQClientInstance`` (like Java's MQClientAPIImpl), so an
+        The rewrite itself lives on ``MQClientInstance``, so an
         already-started facade updates the shared instance too.
         """
         self.vip_channel_enabled = bool(enable)
@@ -984,8 +984,8 @@ class DefaultMQPushConsumer:
         return self.vip_channel_enabled
 
     def set_use_heartbeat_v2(self, enable: bool) -> None:
-        """Opt into the fingerprint-gated heartbeat V2 path (Java's
-        ``ClientConfig.setUseHeartbeatV2``); off by default, exactly like the reference."""
+        """Opt into the fingerprint-gated heartbeat V2 path; off by default here, so a client
+        that never asks for it keeps the broker on its V1 registration path."""
         self.use_heartbeat_v2 = bool(enable)
 
     def set_socks_proxy_config(self, socks_proxy_config: Optional[SocksProxyConfig]) -> None:
@@ -1093,7 +1093,7 @@ class DefaultMQPushConsumer:
     def compute_accumulation_total(self) -> int:
         """The total backlog count across all queues.
 
-        That is, the sum of all ``msgAccCnt``: the backlog count from the most recent
+        That is, the sum of all ``msg_acc_cnt`` entries: the backlog count from the most recent
         pull recorded "per queue" (see ``_update_msg_acc_cnt``).
         """
         with self._lock:
@@ -1103,7 +1103,7 @@ class DefaultMQPushConsumer:
         """Attempt to adjust concurrency per the backlog threshold (scheduled once per minute).
 
         WARNING **this is a no-op**: the underlying ``inc_core_pool_size()`` / ``dec_core_pool_size()``
-        are **empty method bodies**. The threshold comparison and logging are kept here only to make ``msgAccCnt`` / threshold config
+        are **empty method bodies**. The threshold comparison and logging are kept here only to make ``msg_acc_cnt`` / threshold config
         observable and assertable; **do not "fix" it** -- what actually takes effect is the explicit ``update_core_pool_size()``.
         """
         acc_total = self.compute_accumulation_total()
@@ -1134,7 +1134,7 @@ class DefaultMQPushConsumer:
 
     # ---------------- Message trace ----------------
     def set_enable_msg_trace(self, enable: bool) -> None:
-        """Toggle consumer-side message tracing (equivalent to the constructor parameter enableMsgTrace)."""
+        """Toggle consumer-side message tracing (the consumer's ``enable_trace`` flag)."""
         self.enable_trace = enable
 
     def set_enable_trace(self, enable: bool) -> None:
@@ -1278,7 +1278,7 @@ class DefaultMQPushConsumer:
     def subscriptions(self) -> List[SubscriptionData]:
         """The consumer's current subscription set.
 
-        Used by ``MQClientInstance#check_client_in_broker`` (it iterates by instance and does not look at the specific consumer type).
+        Used by the client instance's ``check_client_in_broker`` (it iterates by instance and does not look at the specific consumer type).
         """
         return list(self.subscription_data.values())
 
@@ -1302,7 +1302,7 @@ class DefaultMQPushConsumer:
         """
         topic = self._with_namespace(topic)
         # Build the subscription data by expression type (FilterAPI.build policy):
-        #   TAG (or empty type) -> buildSubscriptionData (fills tagsSet + codeSet)
+        #   TAG (or empty type) -> build_subscription_data (fills tagsSet + codeSet)
         #   others (SQL92 / CLASS_FILTER) -> only set topic/subString/expressionType, leaving both sets empty
         if selector.type == ExpressionType.TAG:
             sub = FilterAPI.build_subscription_data(topic, selector.expression)
@@ -1328,8 +1328,8 @@ class DefaultMQPushConsumer:
     def _notify_subscription_changed(self, topic: str) -> None:
         """Immediate actions after the subscription table is added/updated: synchronously push one heartbeat round + register the topic as in use.
 
-        Why it must be pushed immediately: the broker's ``ConsumerManager`` only records topic->group into
-        **its own** topicGroupTable when a heartbeat is received (ClientManageProcessor -> registerConsumer), and
+        Why it must be pushed immediately: the broker only records topic->group into
+        **its own** topicGroupTable when a heartbeat is received (its consumer-registration step), and
         ``QUERY_TOPIC_CONSUME_BY_WHO(300)`` reads exactly that table; one round late is a 30s blind spot by default.
 
         Also register the new topic as "in use" so the background route refresh task covers it --
@@ -1417,7 +1417,7 @@ class DefaultMQPushConsumer:
         with self._lock:
             if self._started:
                 return
-            # The consumer group is also namespaced (setConsumerGroup(withNamespace(consumerGroup))).
+            # The consumer group is also namespaced (stored as the result of _with_namespace on the group).
             # Must happen before computing the retry topic: retry topic = %RETRY% + the prefixed group name.
             if self.namespace:
                 self.consumer_group = NamespaceUtil.wrap_namespace(self.namespace, self.consumer_group)
@@ -1445,9 +1445,9 @@ class DefaultMQPushConsumer:
             # The value gates run after all null checks and before any network action: bad config must fail
             # before the MQClientInstance is built, otherwise background threads would be started and then leak on error.
             self._check_config_ranges()
-            # Only CLUSTERING renames instanceName to the PID (BROADCASTING keeps "DEFAULT",
+            # Only CLUSTERING renames instance_name to the PID (BROADCASTING keeps "DEFAULT",
             # so broadcasting consumers in the same process can reuse the same client instance), then
-            # ``MixAll.client_id_for`` builds `<local IP>@<instanceName>[@<unitName>][@STREAM]`.
+            # ``MixAll.client_id_for`` builds `<local IP>@<instance_name>[@<unit_name>][@STREAM]`.
             if self.message_model == MessageModel.CLUSTERING:
                 self.instance_name = MixAll.change_instance_name_to_pid(self.instance_name)
             if self.client_id is None:
@@ -1478,7 +1478,7 @@ class DefaultMQPushConsumer:
                 manager.unregister_client(self.client_id, self._mq_client)
                 raise
             # Dynamic name server: the instance may have already obtained addresses from the address server at startup; backfill them into this consumer
-            # so consumerRunningInfo and other places can see them.
+            # so the running-info report and other places can see them.
             if not self.name_server_addrs and self._mq_client.name_server_addrs:
                 self.name_server_addrs = list(self._mq_client.name_server_addrs)
             # Consumption stats (shared at the instance level)
@@ -1487,7 +1487,7 @@ class DefaultMQPushConsumer:
             self._started = True
             self._start_time = time.time()
             self._stop.clear()
-            # In cluster mode, automatically subscribe to the retry topic (retryTopic = MixAll.get_retry_topic(consumer_group)),
+            # In cluster mode, automatically subscribe to the retry topic (retry_topic = MixAll.get_retry_topic(consumer_group)),
             # where broker-redelivered messages are written
             if self.message_model != MessageModel.BROADCASTING:
                 retry_topic = MixAll.get_retry_topic(self.consumer_group)
@@ -1588,8 +1588,8 @@ class DefaultMQPushConsumer:
             self._persist_offsets_once()
         except Exception as e:  # noqa: BLE001
             logger.debug("persist offsets on shutdown failed: %s", e)
-        # Ordered consumption unlocks queues on shutdown (unlockAll).
-        # The POP ordered service goes through the same entry point, and it only reads processQueueTable -- an empty table in POP mode,
+        # Ordered consumption unlocks every held queue on shutdown.
+        # The POP ordered service goes through the same entry point, and it only reads the local process-queue table -- an empty table in POP mode,
         # so no message is sent.
         if self._is_orderly() and not self.pop_mode \
                 and self.message_model != MessageModel.BROADCASTING:
@@ -1599,7 +1599,7 @@ class DefaultMQPushConsumer:
                     self._require_client().unlock_batch_mq(self.consumer_group, self.client_id or "", mqs)
             except Exception as e:  # noqa: BLE001
                 logger.debug("unlock on shutdown failed: %s", e)
-        # Graceful unregister: immediately remove this group from each broker's ConsumerManager,
+        # Graceful unregister: immediately remove this group from each broker's consumer table,
         # without waiting for heartbeat timeout (default ~120s) -- otherwise during that window
         # consumer change notifications / transaction checks may still be sent to this already-exited instance.
         try:
@@ -1690,7 +1690,7 @@ class DefaultMQPushConsumer:
                           self.message_model, self.consume_from_where)
         # unitMode must be written into ConsumerData:
         # the broker uses it to stamp the UNIT system flag on the auto-created %RETRY% topic
-        # (judged in ClientManageProcessor when registering the consumer).
+        # (the broker judges it when registering the consumer).
         cd.unit_mode = self.unit_mode
         with self._lock:
             subs = list(self.subscription_data.values())
@@ -1702,21 +1702,21 @@ class DefaultMQPushConsumer:
     def _send_heartbeat_to_all_broker(self) -> int:
         """Send a heartbeat to all known brokers.
 
-        The consumer **must** register with the broker: the broker's ConsumerManager only learns
+        The consumer **must** register with the broker: the broker's consumer table only learns
         which clientIds are in the consume group after receiving a heartbeat, otherwise rebalance's GET_CONSUMER_LIST_BY_GROUP has no return.
         This implementation previously never sent consumer heartbeats (subscriptions rode along in the pull request's subscription property),
         because at the time queue allocation was "all to self" so it was not exposed; once real rebalance is done,
         an empty consumer list means no queues can be allocated. Returns the number of successful sends, for live verification assertions.
 
         Recipients take **every** broker in the route (master + slave, `get_all_broker_addrs`):
-        iterate each brokerId in the route, skipping only when `id != MASTER_ID && consumerEmpty`;
-        this heartbeat always carries ConsumerData (consumerEmpty=false), so slaves are not skipped. Skipping slaves is not "one redundant send fewer":
-        the broker's `ConsumerManager` keeps **per-broker** state, and when a slave receives no heartbeat,
+        iterate each brokerId in the route, skipping only when `id != MASTER_ID` and the group is empty there;
+        this heartbeat always carries ConsumerData (never an empty consumer set), so slaves are not skipped. Skipping slaves is not "one redundant send fewer":
+        the broker's consumer registry keeps **per-broker** state, and when a slave receives no heartbeat,
         it returns `SUBSCRIPTION_NOT_EXIST` to pulls directed at it
-        (the peer `PullMessageProcessor`'s else branch requires that broker itself to know this consume group;
+        (that broker's own pull handling only accepts the request in its else branch when it itself knows this consume group;
         pulls with the default `post_subscription_when_pull=false` carry no subscription flag and take exactly this path).
         The producer side is the opposite: `producer.py::_send_heartbeat_to_all_broker` only carries ProducerData,
-        corresponding to `consumerEmpty=true`, in which case only the master needs the heartbeat.
+        i.e. its consumer set is empty, in which case only the master needs the heartbeat.
         """
         client = self._require_client()
         hb = self._build_heartbeat()
@@ -1780,12 +1780,12 @@ class DefaultMQPushConsumer:
         """Sync the pull thread set per the current queue allocation, and clean up state for revoked/stalled queues.
 
         When a queue is taken away, one must
-        (1) persist that queue's **consumed** offset, (2) discard the ProcessQueue (in-flight messages are no longer consumed, left to the new owner to redeliver),
+        (1) persist that queue's **consumed** offset, (2) discard the queue's local buffer (in-flight messages are no longer consumed, left to the new owner to redeliver),
         (3) for ordered consumption in cluster mode also UNLOCK_BATCH_MQ(42). Missing any step means in-flight messages in a revoked queue are
         **still consumed by the old instance**, duplicating the new owner (the root cause of the extra duplicate messages in live test S6).
 
         The same pass also performs **self-healing**: queues still owned by this instance but whose pull has stalled beyond ``PULL_MAX_IDLE_TIME``
-        are treated as revoked, immediately followed by rebuilding the pull with a new ProcessQueue, thereby rescuing dead/stuck consume loops.
+        are treated as revoked, immediately followed by rebuilding the pull with a fresh buffer, thereby rescuing dead/stuck consume loops.
 
         The **revoke first, then build** order is deliberate: the revoke's cleanup (persist offsets / UNLOCK) must happen
         **before** building threads; the reverse would have new loops start pulling at old offsets and write even smaller offsets back, adding duplicate deliveries for nothing.
@@ -1815,7 +1815,7 @@ class DefaultMQPushConsumer:
                     continue
                 if pop and key not in self._pop_queues:
                     self._pop_queues[key] = PopProcessQueue()
-                # New ProcessQueue in place => unfreeze:
+                # A fresh buffer in place => unfreeze:
                 # the rebuilt queue resumes advancing at the corrected offset
                 self._frozen_offsets.discard(key)
                 # The thread was just created and the loop has not reached the stamping point yet; use the current time as a placeholder to avoid a false stall verdict on the next pass
@@ -1893,7 +1893,7 @@ class DefaultMQPushConsumer:
                 except Exception as e:  # noqa: BLE001
                     logger.debug("persist offset on revoke failed for %s: %s", mq, e)
             # The per-queue unlock on revoke belongs only to classic ordered: it reads the
-            # ProcessQueue from the local queue table -- in POP mode that table is empty, so this path never runs.
+            # the queue's local buffer from the queue table -- in POP mode that table is empty, so this path never runs.
             if self._is_orderly() and not self.pop_mode:
                 # Ordered consumption: release the broker queue lock so the new owner can take over immediately
                 try:
@@ -1970,11 +1970,11 @@ class DefaultMQPushConsumer:
         if now != was:
             logger.info("rebalance result changed, group=%s clientId=%s assigned=%d",
                         self.consumer_group, self.client_id, len(assigned))
-            # Java: RebalancePushImpl#messageQueueChanged calls
-            # sendHeartbeatToAllBrokerWithLockV2(true), i.e. it drops the remembered fingerprints
-            # (resetBrokerAddrHeartbeatFingerprintMap) so the next heartbeat round re-delivers the
-            # subscriptions to every broker instead of the cheap withoutSub body. Only the push
-            # rebalance does this -- RebalanceLitePullImpl#messageQueueChanged does not.
+            # An assignment change on the push side drops the fingerprints remembered per
+            # broker (the heartbeat V2 state), i.e. it forces
+            # the next heartbeat round to re-deliver the subscriptions to every broker instead of
+            # the cheap withoutSub body. Only the push rebalance does this -- the
+            # lite-pull consumer's assignment change leaves the fingerprints alone.
             if self.use_heartbeat_v2:
                 client.reset_heartbeat_v2_fingerprint_table(self.consumer_group)
         # Newly assigned queues resolve their initial offset **immediately** (clear the dirty offset -> compute the start per consume_from_where -> write into the offset table).
@@ -2089,7 +2089,7 @@ class DefaultMQPushConsumer:
                                              max_msg_bytes=self.pull_batch_size_in_bytes,
                                              suspend_timeout_millis=self.pull_suspend_timeout_millis,
                                              broker_id=broker_id)
-                # Update pullFromWhichNode on every response:
+                # Update ``_pull_from_which_node`` on every response:
                 # when the response has no suggestWhichBrokerId, default to master=0
                 self._pull_from_which_node[mq] = result.suggest_which_broker_id \
                     if result.suggest_which_broker_id is not None else MixAll.MASTER_ID
@@ -2102,7 +2102,7 @@ class DefaultMQPushConsumer:
                                                          len(result.msg_found_list))
             except RemotingTimeoutException as e:
                 # A long poll timing out with no new message during suspend is normal behavior: the broker
-                # clamps the suspend time to its own brokerSuspendMaxTimeMillis (default ~15s),
+                # clamps the suspend time to its own configured maximum (default ~15s),
                 # ignoring the client's suspend_timeout_millis, so idle queues time out periodically.
                 # This is not an error, debug level only, to avoid polluting the client's runtime logs (see logging.py).
                 logger.debug("pull long-poll timeout for %s (benign, will retry): %s", mq, e)
@@ -2143,7 +2143,7 @@ class DefaultMQPushConsumer:
                     if result.status == PullStatus.OFFSET_ILLEGAL:
                         # When the offset is corrected by the broker
                         # correction and rebuild must be done together, see _offset_illegal_recover.
-                        # Freezing happens first inside the lock (equivalent to updateAndFreezeOffset executed synchronously in the callback),
+                        # Freezing happens first inside the lock (equivalent to the update-and-freeze done synchronously in the callback),
                         # with the queue-revoke and disk-persist RPCs moved outside the lock.
                         self._frozen_offsets.add(key)
                         self._consume_offsets[key] = int(result.next_begin_offset)
@@ -2157,10 +2157,10 @@ class DefaultMQPushConsumer:
                 self._offset_illegal_recover(key)
 
     def _update_msg_acc_cnt(self, key: str, msgs: List[MessageExt]) -> None:
-        """The computation of ``msgAccCnt`` (backlog count).
+        """The computation of ``msg_acc_cnt`` (backlog count).
 
-            accTotal = MAX_OFFSET property - this message's queueOffset
-            if (accTotal > 0) msgAccCnt = accTotal
+            acc_total = MAX_OFFSET property - this message's queueOffset
+            if (acc_total > 0) msg_acc_cnt = acc_total
 
         Takes the **last message of this batch**; feeds the threshold comparison of ``adjust_thread_pool``.
         """
@@ -2179,7 +2179,7 @@ class DefaultMQPushConsumer:
                 self._msg_acc_cnt_table[key] = acc_total
 
     def msg_acc_cnt(self, key: Optional[str] = None) -> int:
-        """Read ``msgAccCnt``: reads a single queue when a key is given, sums otherwise."""
+        """Read ``msg_acc_cnt``: reads a single queue when a key is given, sums otherwise."""
         with self._lock:
             if key is None:
                 return sum(self._msg_acc_cnt_table.values())
@@ -2201,7 +2201,7 @@ class DefaultMQPushConsumer:
         if invisible < MIN_POP_INVISIBLE_TIME or invisible > MAX_POP_INVISIBLE_TIME:
             # Clamp: anything outside [5s, 300s] falls back to 60s
             invisible = 60000
-        # The default is ConsumeInitMode.MAX (start at the tail); here it maps per consume_from_where,
+        # The broker's default POP init mode is MAX (start at the tail); here it maps per consume_from_where,
         # so the "consume from the beginning" semantics hold in POP mode too.
         init_mode = (CONSUME_INIT_MODE_MIN
                      if self.consume_from_where == ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET
@@ -2212,7 +2212,7 @@ class DefaultMQPushConsumer:
             pq = self._pop_queues.get(key)
             if pq is None or pq.is_dropped():
                 return
-            # The stall criterion reads lastPopTimestamp, which is stamped at pop **initiation**
+            # The stall criterion reads last_pop_timestamp, which is stamped at pop **initiation**
             # (the loop entry): flow control / long-poll suspension must not
             # make a still-running loop be judged as stalled.
             with self._lock:
@@ -2265,7 +2265,7 @@ class DefaultMQPushConsumer:
             if found:
                 # Consumption stats: POP path
                 # like the pull path, RT/TPS must be recorded into the stats table, otherwise the POP consumer's
-                # consumerRunningInfo() would always show 0 on the pull side -- on ops dashboards "this consumer is not
+                # the running-info report would always show 0 on the pull side -- on ops dashboards "this consumer is not
                 # pulling" and "this consumer did not start at all" would be indistinguishable. RT is recorded at the FOUND branch entry
                 # (before the null check), TPS only by the number actually popped.
                 if self._stats_manager is not None:
@@ -2400,7 +2400,7 @@ class DefaultMQPushConsumer:
         has_exception = False
         try:
             # The POP concurrent path likewise stamps CONSUME_START_TIME on each message
-            # before handing to the listener (POP has no cleanExpiredMsg cleanup,
+            # before handing to the listener (POP has no expired-message sweep,
             # but this property is visible to the listener/trace; the policy must match classic concurrent)
             for m in msgs:
                 MessageAccessor.set_consume_start_timestamp(m, int(time.time() * 1000))
@@ -2521,7 +2521,7 @@ class DefaultMQPushConsumer:
             client = self._require_client()
             # Address resolution is (brokerName, MASTER_ID, allow route refresh):
             # **master only**; if one route refresh still cannot get it, throw "The broker[X] not exist".
-            # Static topic: the mock broker name is first rewritten by topicEndPointsTable to the real carrier
+            # Static topic: the mock broker name is first rewritten by the route's broker-endpoint table to the real carrier
             # (using the checkpoint's own queueId -- each globalId may land on a different broker).
             client.ack_message(self.consumer_group, topic, queue_id, ck, offset,
                                broker_name=broker_name,
@@ -2600,14 +2600,14 @@ class DefaultMQPushConsumer:
 
     def _resolve_initial_offset(self, client: MQClientInstance,
                                 mq: MessageQueue) -> int:
-        # Java parity (RebalancePushImpl#computePullFromWhereWithException): the initial
-        # offset NEVER depends on the subscription type. An earlier draft short-circuited
+        # Contract of the initial offset: it NEVER depends on the subscription type.
+        # An earlier draft short-circuited
         # SQL92 subscriptions to the max offset, which silently skipped every message
         # produced *before* the consumer started (send-first + CONSUME_FROM_FIRST_OFFSET
         # received nothing; consumer-first only passed because the queues were empty and
-        # the max offset was 0 anyway). Java reads the stored offset and, when absent,
-        # uses 0 for FIRST_OFFSET / max for LAST_OFFSET etc. -- the broker applies the
-        # SQL92 filter to whatever range the pull covers.
+        # the max offset was 0 anyway). The rule followed here: read the stored offset and,
+        # when absent, use 0 for FIRST_OFFSET / max for LAST_OFFSET etc. -- the broker applies
+        # the SQL92 filter to whatever range the pull covers.
         if self.message_model == MessageModel.BROADCASTING:
             # Broadcast mode: offsets are stored in the local file only
             stored = self._load_local_offsets()
@@ -2631,7 +2631,7 @@ class DefaultMQPushConsumer:
             # FIRST_OFFSET with no committed offset on the broker: give 0 directly
             # (the comment policy is "the offset will be fixed by the OFFSET_ILLEGAL process"):
             # **do not** send a minOffset query. The cost of this extra shot is not just slowness:
-            # minOffset is the MQAdminImpl policy (master only), and while the master is down it is exactly "a newly started consumer
+            # minOffset is a master-only broker query, and while the master is down it is exactly "a newly started consumer
             # cannot pull anything" -- while slaves could already start pulling at 0, with the broker using
             # PULL_OFFSET_MOVED to correct the offset when out of bounds (_offset_illegal_recover).
             return 0
@@ -2671,7 +2671,7 @@ class DefaultMQPushConsumer:
                     # Register in-flight in the same critical section as "taking the batch": _correct_tags_offset_locked's gate
                     # relies on it to distinguish "the message is still in the buffer" and "the message is in the listener's hands" -- neither counts as empty.
                     self._msg_queue_inflight[key] = self._msg_queue_inflight.get(key, 0) + 1
-                    # Take the epoch of the ProcessQueue this batch belongs to along with it: compare before consuming/acking,
+                    # Take this batch's queue-buffer epoch along with it: compare before consuming/acking,
                     # and void the whole batch on mismatch
                     epoch = self._queue_epoch.get(key, 0)
                 if not batch:
@@ -2809,8 +2809,8 @@ class DefaultMQPushConsumer:
                     pqi = ProcessQueueInfo()
                     pqi.cached_msg_count = pq.wait_ack_count()
                     pqi.droped = pq.is_dropped()
-                    # POP queues use lastPopTimestamp in place of lastPullTimestamp
-                    # for stall detection (isPullExpired:74); the same timestamp is filled here to stay comparable.
+                    # POP queues use last_pop_timestamp in place of last_pull_timestamp
+                    # for stall detection; the same timestamp is filled here to stay comparable.
                     pqi.last_pull_timestamp = int(pq.last_pop_timestamp * 1000)
                     info.mq_pop_table[mq] = pqi.to_dict()
         info.subscription_set = [s.to_dict() if hasattr(s, "to_dict") else dict(s.__dict__)
@@ -2920,7 +2920,7 @@ class DefaultMQPushConsumer:
     def _process_queue_contains_locked(self, key: str, msg: MessageExt) -> bool:
         """Is this message still attached to the queue (in the in-flight registration or the pending buffer).
 
-        Messages swept away by cleanExpiredMsg do not count (they are already on their way back to the broker).
+        Messages swept away by _clean_expired_queue do not count (they are already on their way back to the broker).
         """
         for m in self._inflight_msgs.get(key) or ():
             if m is msg:
@@ -2941,7 +2941,7 @@ class DefaultMQPushConsumer:
         if dq and dq[0] is msg:
             dq.popleft()
 
-    # ---------------- cleanExpiredMsg: the escape hatch for suspended listeners ----------------
+    # ---------------- expired-message sweep: the escape hatch for suspended listeners ----------------
     # This is the only recovery
     # mechanism for "the listener hangs and never returns": messages held longer than consumeTimeout minutes are sent back to the broker (delayLevel=3), going through %RETRY%
     # for redelivery. Without it, one stuck message would stop that queue's offset forever, with the broker side only able to wait for the next
@@ -3020,9 +3020,9 @@ class DefaultMQPushConsumer:
                        epoch: Optional[int] = None) -> bool:
         """Consume one batch and handle redelivery/suspension. Returns whether the consume offset advanced.
 
-        ``epoch``: the epoch of the ProcessQueue this batch belongs to (see ``_queue_epoch``). When the queue is dropped while this batch
+        ``epoch``: the epoch of this batch's queue buffer (see ``_queue_epoch``). When the queue is dropped while this batch
         was queuing (rebalance revoke / OFFSET_ILLEGAL correction / stall self-healing), these messages
-        **must not be consumed nor acked** -- corresponding to the ``isDropped()`` short circuit, with the concurrent and orderly paths sharing the same policy.
+        **must not be consumed nor acked** -- the dropped-queue short circuit, with the concurrent and orderly paths sharing the same policy.
         """
         if epoch is not None and epoch != self._queue_epoch.get(key, 0):
             dropped = self._queue_epoch.get(key, 0)
@@ -3045,7 +3045,7 @@ class DefaultMQPushConsumer:
             try:
                 status = listener.consume_message(batch, ocontext)
             except Exception as e:  # noqa: BLE001
-                # The exception only sets hasException, leaving status null, uniformly
+                # The exception only sets has_exception, leaving status null, uniformly
                 # turned into suspension below: ordered consumption never has the "exception means ack" path
                 logger.debug("orderly listener error (retry in place): %s", e)
                 status = None
@@ -3111,7 +3111,7 @@ class DefaultMQPushConsumer:
                 # and whether the offset advances is up to the binlog consumer itself
                 return False
             # SUCCESS + autoCommit=False: only record OK TPS, do not commit.
-            # This port does not expose ProcessQueue to the listener (there is no commit opening),
+            # This port does not expose the queue buffer to the listener (there is no commit opening),
             # so it does not maintain an explicit commit() subtable like "currently consuming";
             # doing nothing would let this batch be swallowed by the dispatch thread with the offset unmoved. Equivalently here it pushes back to
             # the head and waits one suspend period: the offset likewise does not advance, no messages are lost, and the consume thread is not turned into a busy wait
@@ -3150,7 +3150,7 @@ class DefaultMQPushConsumer:
         has_exception = False
         try:
             # Stamp CONSUME_START_TIME on each message **before** handing to the listener, restamping on every delivery
-            # (including retries). cleanExpiredMsg's suspend escape hatch relies on it to judge "how long this one has been held".
+            # (including retries). _clean_expired_queue's suspend escape hatch relies on it to judge "how long this one has been held".
             for m in batch:
                 MessageAccessor.set_consume_start_timestamp(m, int(time.time() * 1000))
             status = listener.consume_message(batch, context)
@@ -3187,7 +3187,7 @@ class DefaultMQPushConsumer:
             hook_status=status)
         if broadcast:
             # Broadcast mode does not redeliver: the unacknowledged tail is only logged as a warn before being dropped,
-            # while the whole batch's offset still advances (:266's removeMessage gets the whole batch)
+            # while the whole batch's offset still advances (the drop step clears the whole batch)
             dropped = len(batch) - ack_index - 1
             if dropped > 0:
                 logger.warning("BROADCASTING, the message consume failed, drop it: %d msgs in %s",
@@ -3212,7 +3212,7 @@ class DefaultMQPushConsumer:
             time.sleep(0.2)
         failed_ids = {id(m) for m in msg_back_failed}
         # What is committed is "the largest queueOffset + 1 among this batch's processed entries", and must not pass over
-        # those still left in the ProcessQueue (removeMessage returns their smallest offset at this point)
+        # those still left in the queue's buffer (the removal step returns their smallest offset at this point)
         self._advance_consume_offset(
             key, [m for m in batch if id(m) not in failed_ids],
             floor=min((m.queue_offset or 0) for m in msg_back_failed) if msg_back_failed else None,
@@ -3314,7 +3314,7 @@ class DefaultMQPushConsumer:
         """Ordered consumption's redelivery: use the internal producer to forward the message to the retry topic.
 
         Take the instance's built-in internal producer and send this message **as a normal message** to `%RETRY%<group>`:
-        the broker's `handleRetryAndDLQ` (`SendMessageProcessor`), seeing that the group still holds an unexpired
+        the broker's retry/DLQ handling on its send path, seeing that the group still holds an unexpired
         queue lock (a characteristic of ordered consumption groups), directly redirects it to `%DLQ%<group>`. Among the property settings,
         `RECONSUME_TIME` / `MAX_RECONSUME_TIMES` are lifted into the request header by the send side
         (see `mq_client._build_send_request`); the peer matches on these headers, and changing them breaks compatibility.
@@ -3357,8 +3357,8 @@ class DefaultMQPushConsumer:
                                 epoch: Optional[int] = None) -> None:
         """Advance the "consumed offset".
 
-        ``epoch`` is the epoch of the ProcessQueue when this batch was taken: a mismatch with the current epoch means the queue has been
-        revoked/rebuilt (equivalent to the ``isDropped()`` gate), voiding the **whole batch's acks**.
+        ``epoch`` is the queue buffer's epoch when this batch was taken: a mismatch with the current epoch means the queue has been
+        revoked/rebuilt (equivalent to the dropped-queue gate), voiding the **whole batch's acks**.
         Entries in ``_frozen_offsets`` are offsets frozen by OFFSET_ILLEGAL correction, which likewise must not be changed.
 
         The two criteria and the write must be in the **same critical section**: revoke/reset (220) increments the epoch inside the lock,
@@ -3382,7 +3382,7 @@ class DefaultMQPushConsumer:
 
     def _correct_tags_offset_locked(self, key: str, status: PullStatus,
                                     next_off: Optional[int]) -> None:
-        """On an empty response, advance the "consumed offset" along with the pull cursor (correctTagsOffset). Must be called while holding the lock.
+        """On an empty response, advance the "consumed offset" along with the pull cursor (the tag-filter correction). Must be called while holding the lock.
 
         When the pull response is ``NO_NEW_MSG`` (the queue really has no messages) or ``NO_MATCHED_MSG`` (the broker went a full round per the subscription
         expression and matched nothing; the broker's returned
@@ -3391,7 +3391,7 @@ class DefaultMQPushConsumer:
         and those dropped by the client's second-pass tag filtering are explicitly not acked), and an unmoving offset stays put forever, with redelivery/restart
         sweeping this unwanted batch from the beginning again.
 
-        The update is ``updateOffset(mq, nextOffset, increaseOnly=true)``
+        The update is the consumed-offset write of ``_correct_tags_offset_locked``:
         (only moves forward, never back), and has one gate: the queue's held message count must be 0. It counts messages **still in the queue** --
         concurrent consumption's cleanup removal happens only after the listener returns, so in-flight batches
         count too; raising the offset without waiting for them to settle would have this batch silently skipped on process crash. This port combines
@@ -3407,7 +3407,7 @@ class DefaultMQPushConsumer:
             return
         if key in self._frozen_offsets:
             # The offset is already frozen by OFFSET_ILLEGAL correction (updates
-            # are discarded unconditionally when allowToUpdate=false), and this path likewise must not change it
+            # are refused unconditionally once frozen), and this path likewise must not change it
             return
         if self._pending.get(key) or self._msg_queue_inflight.get(key):
             return
@@ -3419,7 +3419,7 @@ class DefaultMQPushConsumer:
         """The correction-rebuild path for an OFFSET_ILLEGAL response.
 
         The broker says "the offset you requested is illegal" (the queue was truncated, the commitlog expired, or it was reset server-side:
-        the peer ``PullMessageProcessor`` returns ``PULL_OFFSET_MOVED`` for OFFSET_OVERFLOW_BADLY / NO_MESSAGE_IN_QUEUE /
+        the broker's own pull answer returns ``PULL_OFFSET_MOVED`` for OFFSET_OVERFLOW_BADLY / NO_MESSAGE_IN_QUEUE /
         OFFSET_RESET uniformly, which is mapped into this status when the client parses the response),
         and puts the corrected value in ``nextBeginOffset``. Correction is not just moving the cursor over:
         all messages on this queue **already fetched but not consumed/acked are voided** (they fall in the skipped range,
@@ -3599,7 +3599,7 @@ class DefaultMQPushConsumer:
         header.unit_mode = self.unit_mode
         header.max_reconsume_times = max_reconsume
         request = RemotingCommand.create_request_command(RequestCode.CONSUMER_SEND_MSG_BACK, header)
-        # Java: MQClientAPIImpl#consumerSendMessageBack wraps the (master) address with the VIP channel.
+        # SEND_MESSAGE_BACK is one of the VIP-wrapped RPCs and always goes to the master address.
         response = client._invoke_sync(client.vip_addr(addr), request, 5000)
         client._check_response(response)
 
@@ -3630,7 +3630,7 @@ class DefaultMQPullConsumer:
         # ---- unit / stream config ----
         # unitName takes part in the clientId's `@<unitName>` suffix and the dynamic addressing URL; unitMode is
         # reported to the broker along with the ConsumerData heartbeat, message redelivery request header and filter hooks;
-        # enableStreamRequestType both appends the `@STREAM` suffix to clientId (to
+        # ``enable_stream_request_type`` both appends the `@STREAM` suffix to clientId (to
         # "prevent unexpected reuses of MQClientInstance") and adds
         # the `ReqT=0` extension field to every request. Pull-mode consumers default to on (every constructor sets true).
         self.unit_name: Optional[str] = None
@@ -3660,12 +3660,12 @@ class DefaultMQPullConsumer:
         self.filter_message_hook_list: List[FilterMessageHook] = []
         # Pull node suggestion table: MessageQueue -> the brokerId to pick next round
         self._pull_from_which_node: Dict[MessageQueue, int] = {}
-        # ---- Consumer heartbeat (heartbeatBrokerInterval defaults to 30s) ----
-        # Pull-mode consumers must also register with the broker's ConsumerManager; this port follows the existing division of labor
+        # ---- Consumer heartbeat (``heartbeat_interval_millis`` defaults to 30s) ----
+        # Pull-mode consumers must also register with the broker's consumer table; this port follows the existing division of labor
         # (the heartbeat loop lives inside the consumer) and sends its own ConsumerData carrying CONSUME_ACTIVELY.
         self.heartbeat_enabled = True
         self.heartbeat_interval_millis = 30000
-        # ClientConfig knobs, both default false exactly like Java (see the push consumer's block
+        # Heartbeat V2 and the VIP channel switches, both default false (see the push consumer's block
         # for what they do; the pull consumer's heartbeat body is CONSUME_ACTIVELY).
         self.use_heartbeat_v2 = False
         self.vip_channel_enabled = False
@@ -3742,12 +3742,12 @@ class DefaultMQPullConsumer:
         return self.namespace_v2
 
     def set_vip_channel_enabled(self, enable: bool) -> None:
-        """Java's ``ClientConfig.setVipChannelEnabled``: the RPCs the reference wraps with
-        ``MixAll.brokerVIPChannel`` (offsets, queue locks, the group consumer list, message
-        re-send-back, earliest-msg-store-time and every send -- reply messages included) target
-        the broker's VIP port (listen port - 2) instead of the plain one. Off by default.
+        """Turn the VIP channel on or off. With it on, the RPCs the broker answers on its fast
+        channel -- offsets, queue locks, the group consumer list, message re-send-back,
+        earliest-msg-store-time and every send, reply messages included -- target **the broker's
+        listen port minus 2** instead of the plain one. Off by default.
 
-        The rewrite itself lives on ``MQClientInstance`` (like Java's MQClientAPIImpl), so an
+        The rewrite itself lives on ``MQClientInstance``, so an
         already-started facade updates the shared instance too.
         """
         self.vip_channel_enabled = bool(enable)
@@ -3758,8 +3758,8 @@ class DefaultMQPullConsumer:
         return self.vip_channel_enabled
 
     def set_use_heartbeat_v2(self, enable: bool) -> None:
-        """Opt into the fingerprint-gated heartbeat V2 path (Java's
-        ``ClientConfig.setUseHeartbeatV2``); off by default, exactly like the reference."""
+        """Opt into the fingerprint-gated heartbeat V2 path; off by default here, so a client
+        that never asks for it keeps the broker on its V1 registration path."""
         self.use_heartbeat_v2 = bool(enable)
 
     def set_socks_proxy_config(self, socks_proxy_config: Optional[SocksProxyConfig]) -> None:
@@ -3785,10 +3785,10 @@ class DefaultMQPullConsumer:
 
     # ---------------- Heartbeat (register the consume group with the broker) ----------------
     def _refresh_route_for_heartbeat(self) -> None:
-        """Prepare broker addresses for the heartbeat: pull the routes of registerTopics once and register them as "in use".
+        """Prepare broker addresses for the heartbeat: pull the routes of register_topics once and register them as "in use".
 
-        This chain is indirect: what `subscriptions()` returns is the subscription set built from `registerTopics`,
-        which drives route refresh -> `brokerAddrTable`
+        This chain is indirect: what `subscriptions()` returns is the subscription set built from `register_topics`,
+        which drives route refresh -> `broker_addr_table`
         having addresses -> the heartbeat can be sent. The heartbeat loop lives inside the consumer (the same division of labor as the push/lite consumers),
         so start explicitly refreshes once and hands the topic to
         MQClientInstance's background refresh task to keep it fresh.
@@ -3814,7 +3814,7 @@ class DefaultMQPullConsumer:
         The subscription set takes `subscriptions()`, building each with
         `build_subscription_data(topic, "*")`, and explicitly sets **subVersion to 0**
         -- pull mode has no "subscription version" semantics, and carrying the current timestamp
-        would make the broker think the subscription changed on every heartbeat. WARNING: the subscription set comes only from `registerTopics`.
+        would make the broker think the subscription changed on every heartbeat. WARNING: the subscription set comes only from `register_topics`.
         """
         hb = HeartbeatData(self.client_id or "")
         cd = ConsumerData(self.consumer_group, ConsumeType.CONSUME_ACTIVELY,
@@ -3831,7 +3831,7 @@ class DefaultMQPullConsumer:
         """Send one round of this group's heartbeat to all known brokers (including slaves), returning the number of successes.
 
         Recipients take `get_all_broker_addrs`, for the same reason as the push consumer's method of the same name
-        (slaves are skipped only when `consumerEmpty`).
+        (a slave is skipped only when the heartbeat carries no consumer data).
         """
         client = self._require_client()
         hb = self._build_heartbeat()
@@ -3917,7 +3917,7 @@ class DefaultMQPullConsumer:
             manager.unregister_client(self.client_id, self._mq_client)
             raise
         self._started = True
-        # Heartbeat: first refresh the routes of registerTopics (no addresses means nobody to send to), then synchronously send one round so the broker
+        # Heartbeat: first refresh the routes of register_topics (no addresses means nobody to send to), then synchronously send one round so the broker
         # immediately knows this group, then hand off to the background loop. The order matches the lite pull consumer's start:
         # send immediately after registration, without waiting for the periodic task's first 1s.
         self._refresh_route_for_heartbeat()
@@ -3970,12 +3970,12 @@ class DefaultMQPullConsumer:
     def fetch_message_queues_in_balance(self, topic: str) -> List[MessageQueue]:
         """The queues this instance should be responsible for "after balancing": the caller's pull loop relies on it to decide which queues to pull.
 
-        A common implementation reads the keys of `rebalanceImpl.processQueueTable` directly -- that table is the **product** of the background rebalance.
+        A common implementation reads the keys of the rebalance's process-queue table directly -- that table is the **product** of the background rebalance.
         This port's pull mode does not install a background rebalance (queues are managed by the caller, see the class comment),
-        so it computes on the spot using the **same allocation formula** as `RebalanceImpl.rebalanceByTopic`:
+        so it computes on the spot using the **same allocation formula** as the push consumer's topic rebalance:
         BROADCASTING gives all; CLUSTERING takes the subscription info (read perm policy, same source as
-        `fetch_subscribe_message_queues`) as mqAll, queries `GET_CONSUMER_LIST_BY_GROUP`
-        as cidAll, then hands them to this instance's configured allocation strategy. The formula shares the same
+        `fetch_subscribe_message_queues`) as mq_all, queries `GET_CONSUMER_LIST_BY_GROUP`
+        as cid_all, then hands them to this instance's configured allocation strategy. The formula shares the same
         policy as the push consumer's `_rebalance`, and if the two diverge the same queue would be claimed by two instances.
 
         When the route or consumer group list cannot be obtained (offline, broker not responding) **fall back to the key set of the local
@@ -4017,10 +4017,10 @@ class DefaultMQPullConsumer:
         timeout = timeout_millis if timeout_millis is not None else self.consumer_pull_timeout_millis
         sub = FilterAPI.build_subscription_data(mq.topic, sub_expression)
         # The four switch bits of sysFlag:
-        #   sysFlag = PullSysFlag.buildSysFlag(false, block, true, false)
+        #   sys_flag = PullSysFlag.build_sys_flag(false, block, true, false)
         # i.e. commit_offset=False, suspend=block. **pull()'s block=false** --
         # the offset is committed by the caller via update_consume_offset, and this is a **short poll** that does not suspend.
-        # WARNING: this was once written as suspend=True: the broker would suspend to brokerSuspendMaxTimeMillis at the end of the queue
+        # WARNING: this was once written as suspend=True: the broker would suspend to its own configured max at the end of the queue
         # (default 20s), while the client times out in 5s -> RemotingTimeoutException (always reproduced on live systems).
         sys_flag = PullSysFlag.build_sys_flag(commit_offset=False, suspend=False,
                                               subscription=True, class_filter=False)
@@ -4194,7 +4194,7 @@ class DefaultMQPullConsumer:
         # retryMaxTimes judgment.
         header.max_reconsume_times = None
         request = RemotingCommand.create_request_command(RequestCode.CONSUMER_SEND_MSG_BACK, header)
-        # Java: MQClientAPIImpl#consumerSendMessageBack wraps the (master) address with the VIP channel.
+        # SEND_MESSAGE_BACK is one of the VIP-wrapped RPCs and always goes to the master address.
         response = client._invoke_sync(client.vip_addr(addr), request, 5000)
         client._check_response(response)
 
@@ -4238,7 +4238,7 @@ class DefaultLitePullConsumer:
         # ---- unit / stream config ----
         # unitName takes part in the clientId's `@<unitName>` suffix and the dynamic addressing URL; unitMode is
         # reported to the broker along with the ConsumerData heartbeat, message redelivery request header and filter hooks;
-        # enableStreamRequestType both appends the `@STREAM` suffix to clientId
+        # ``enable_stream_request_type`` both appends the `@STREAM` suffix to clientId
         # (to prevent unexpected reuses of MQClientInstance) and adds
         # the `ReqT=0` extension field to every request. All three constructors default to true.
         self.unit_name: Optional[str] = None
@@ -4282,7 +4282,7 @@ class DefaultLitePullConsumer:
         self.pull_thread_nums = 1
         # The period of the background comparison of the queue sets of topics registered with register_topic_message_queue_change_listener, default 30s.
         self.topic_metadata_check_interval_millis = 30 * 1000
-        # ---- ClientConfig knobs (both default false, exactly like Java) ----
+        # ---- Heartbeat V2 / VIP channel switches (both default false) ----
         # ``use_heartbeat_v2`` puts this consumer's HEART_BEAT(34) rounds on the fingerprint-gated
         # path (client/heartbeat_v2.py); ``vip_channel_enabled`` sends the send/reply RPCs and the
         # offset / lock RPCs to the broker's VIP port (listen port - 2).
@@ -4303,17 +4303,17 @@ class DefaultLitePullConsumer:
         # Pull cursor: only means "after the last one already fetched into the local buffer", advanced by _pull_one.
         self._next_offset: Dict[MessageQueue, int] = {}
         # Consumed cursor: advances only when poll() really hands messages to the caller
-        # (assignedMessageQueue.updateConsumeOffset(mq, removeMessage(msgs)) at handoff time).
+        # (the consumed cursor and the handed-off messages move together at that moment).
         # Only by splitting it from the pull cursor into two tables can commit(Map, persist) make sense: when the caller specifies "where to commit to"
         # it must never casually change "where to pull from next".
         self._consume_offset: Dict[MessageQueue, int] = {}
-        # Commit landing: the in-memory offset table (RemoteBrokerOffsetStore.offsetTable).
+        # Commit landing: the in-memory offset table.
         # All three commit* entry points write this table first, sending it to the broker only when persist=true; committed() also reads it first,
-        # i.e. ReadOffsetType.MEMORY_FIRST_THEN_STORE.
+        # i.e. the memory-first, store-second read order.
         self._offset_table: Dict[MessageQueue, int] = {}
         self._seek_offset: Dict[MessageQueue, int] = {}
-        # Topic queue set change listener (topicMessageQueueChangeListenerMap + messageQueuesForTopic):
-        # the key is the **namespaced** topic (withNamespace(topic)), and the callback also receives this key.
+        # Topic queue set change listener (the listener map plus the set of watched topics):
+        # the key is the **namespaced** topic (namespace already wrapped in), and the callback also receives this key.
         self._topic_change_listeners: Dict[str, TopicMessageQueueChangeListener] = {}
         self._message_queues_for_topic: Dict[str, Set[MessageQueue]] = {}
         self._topic_listener_lock = threading.Lock()
@@ -4366,12 +4366,12 @@ class DefaultLitePullConsumer:
         return self.namespace_v2
 
     def set_vip_channel_enabled(self, enable: bool) -> None:
-        """Java's ``ClientConfig.setVipChannelEnabled``: the RPCs the reference wraps with
-        ``MixAll.brokerVIPChannel`` (offsets, queue locks, the group consumer list, message
-        re-send-back, earliest-msg-store-time and every send -- reply messages included) target
-        the broker's VIP port (listen port - 2) instead of the plain one. Off by default.
+        """Turn the VIP channel on or off. With it on, the RPCs the broker answers on its fast
+        channel -- offsets, queue locks, the group consumer list, message re-send-back,
+        earliest-msg-store-time and every send, reply messages included -- target **the broker's
+        listen port minus 2** instead of the plain one. Off by default.
 
-        The rewrite itself lives on ``MQClientInstance`` (like Java's MQClientAPIImpl), so an
+        The rewrite itself lives on ``MQClientInstance``, so an
         already-started facade updates the shared instance too.
         """
         self.vip_channel_enabled = bool(enable)
@@ -4382,8 +4382,8 @@ class DefaultLitePullConsumer:
         return self.vip_channel_enabled
 
     def set_use_heartbeat_v2(self, enable: bool) -> None:
-        """Opt into the fingerprint-gated heartbeat V2 path (Java's
-        ``ClientConfig.setUseHeartbeatV2``); off by default, exactly like the reference."""
+        """Opt into the fingerprint-gated heartbeat V2 path; off by default here, so a client
+        that never asks for it keeps the broker on its V1 registration path."""
         self.use_heartbeat_v2 = bool(enable)
 
     def set_socks_proxy_config(self, socks_proxy_config: Optional[SocksProxyConfig]) -> None:
@@ -4478,9 +4478,9 @@ class DefaultLitePullConsumer:
     def assign(self, message_queues) -> None:
         self._assign_mode = True
         queues = set(message_queues)
-        # updateAssignedMessageQueue: revoked queues are dropped along with the whole MessageQueueState
-        # (the pull cursor and consumed cursor disappear together). Does **not** touch the offsetStore's
-        # in-memory offset table -- that cleanup hangs off rebalance's removeUnnecessaryMessageQueue,
+        # Reassigning drops the revoked queues along with their whole per-queue state
+        # (the pull cursor and consumed cursor disappear together). It does **not** touch the in-memory offset table
+        # -- that cleanup hangs off the rebalance step that releases a no-longer-needed queue,
         # and assign mode does not go through rebalance, so persist does not happen here either.
         for mq in self._assigned - queues:
             self._next_offset.pop(mq, None)
@@ -4586,7 +4586,7 @@ class DefaultLitePullConsumer:
             return
         self._started = False
         self._running = False
-        # shutdown goes through persistConsumerOffset(): flush the in-memory offset table once per the currently held queues,
+        # shutdown goes through the offset persist step (_persist_offset_table): flush the in-memory offset table once per the currently held queues,
         # regardless of auto_commit (values accumulated with persist=False in manual mode must also be persisted).
         # Auto-commit mode takes one more step, commit(): this port does not have that 5s timer,
         # so offsets "handed out by poll but not yet at the deadline" must be made up here, otherwise they would be redelivered from the previous slot after restart.
@@ -4637,7 +4637,7 @@ class DefaultLitePullConsumer:
         hb = self._build_heartbeat()
         ok = 0
         # Sent to every broker (master + slave): same rationale as the push consumer's `DefaultMQPushConsumer._send_heartbeat_to_all_broker`
-        # -- slaves are skipped only when consumerEmpty; pull mode carries a subscription set, so slaves must be registered too.
+        # -- a slave is skipped only when the heartbeat carries no consumer data; pull mode carries a subscription set, so slaves must be registered too.
         for addr in self._mq_client.get_all_broker_addrs():
             try:
                 # Heartbeat V2 for the lite pull consumer: same state machine as the push/pull
@@ -4768,12 +4768,12 @@ class DefaultLitePullConsumer:
         """Commit **all** assigned queues when the time comes (maybeAutoCommit).
 
         The only call site is the start of ``poll()`` (plus ``shutdown()``'s fallback commit):
-        an idle consumer, even with the 5s ``persistConsumerOffset`` timer, has it flushing the **in-memory offset table**,
+        an idle consumer, even with a 5s offset-persist timer, has that timer flushing the **in-memory offset table**,
         and that table is written only by the ``commit`` path, so stopping poll does not advance the broker offset.
         Checking the auto-commit inside the pull loop here would become "committing even when nobody polls", which is more aggressive than the semantics should be, so it is not placed there.
 
         What is committed is the "consumed cursor" rather than the pull cursor -- messages in the buffer not yet handed to the caller do not count as consumed,
-        the same policy as ``processQueue.removeMessage`` advancing consumeOffset only in poll.
+        the same policy as the buffer-removal step, which advances the consumed cursor only in poll.
         """
         now = time.time() * 1000.0
         if now < self._next_auto_commit_deadline:
@@ -4822,13 +4822,13 @@ class DefaultLitePullConsumer:
 
     # ---------------- rebalance (subscribe mode) ----------------
     def _rebalance(self) -> None:
-        # It goes through the **exactly identical** rebalanceByTopic path as push, so mqAll / cidAll must both be sorted first.
+        # It goes through the **exactly identical** topic-rebalance path as push, so mq_all / cid_all must both be sorted first.
         # Inconsistent ordering would make different instances in the same group compute conflicting allocations (the same queue consumed by two instances simultaneously).
         new_set: Set[MessageQueue] = set()
         for topic in list(self.subscription.keys()):
             try:
-                # Same source as push's rebalance: the same RebalanceImpl,
-                # with mqAll coming from the subscription info (read perm, no master filtering).
+                # Same source as push's rebalance: the same queue-set computation,
+                # with mq_all coming from the subscription info (read perm, no master filtering).
                 mq_all = sorted(self._mq_client.get_topic_subscribe_info(topic),
                                 key=_mq_sort_key)
             except Exception:
@@ -4840,7 +4840,7 @@ class DefaultLitePullConsumer:
                 allocated = self.allocate_message_queue_strategy.allocate(
                     self.consumer_group, self.client_id, mq_all, cid_all)
             except Exception as e:  # noqa: BLE001
-                # Same policy as rebalanceByTopic's catch (Throwable): only log --
+                # Same policy as the topic rebalance's catch-all: only log --
                 # skip this topic this round (keeping its current allocation), and never take the queue away because of one strategy exception.
                 logger.error("allocate message queue exception, strategy=%s: %s",
                              _strategy_name(self.allocate_message_queue_strategy), e)
@@ -4857,15 +4857,15 @@ class DefaultLitePullConsumer:
                     except Exception:
                         logger.debug("rebalance: resolve offset failed for %s", mq)
             for mq in (old - new_set):
-                # removeUnnecessaryMessageQueue: persist(mq) first, then removeOffset(mq) --
+                # Releasing a queue this instance no longer holds: persist(mq) first, then drop it from the offset table --
                 # send out the last committed offset before letting go,
                 # so an already consumed queue is not redelivered from the previous 5s window.
                 self._persist_offset(mq)
                 self._next_offset.pop(mq, None)
-                # The AssignedMessageQueue entries are dropped too: on queue revoke, removeAssignMessageQueue
-                # drops the **entire MessageQueueState** (pullOffset / consumeOffset / seekOffset),
-                # and keeping seekOffset would let this queue silently jump back to a position the user manually
-                # pinned long ago should it return to this instance someday. That offsetStore slot was already cleared by the persist above.
+                # The per-queue assignment entries are dropped too: on a queue revoke this port
+                # discards the **entire per-queue state** (pull / consume / seek offsets),
+                # and keeping the seek offset would let this queue silently jump back to a position the user manually
+                # pinned long ago should it return to this instance someday. That in-memory offset slot was already cleared by the persist above.
                 self._consume_offset.pop(mq, None)
                 self._offset_table.pop(mq, None)
                 self._seek_offset.pop(mq, None)
@@ -4932,7 +4932,7 @@ class DefaultLitePullConsumer:
         return self._offset_table.get(mq, -1)
 
     def committed(self, mq: MessageQueue) -> Optional[int]:
-        """``committed()`` goes through ``offsetStore.readOffset(MEMORY_FIRST_THEN_STORE)``:
+        """Read the committed offset memory-first, store-second:
         look at the in-memory offset table first (values just committed with ``persist=False`` but not yet sent to the broker also count),
         then ask the broker, and backfill the broker's value into the table."""
         cached = self._offset_table.get(mq)
@@ -4944,7 +4944,7 @@ class DefaultLitePullConsumer:
         return broker_offset
 
     def _persist_offset(self, mq: MessageQueue) -> None:
-        """``OffsetStore#persist(mq)``: only sends this queue's in-memory offset to the broker, with no cleanup."""
+        """Persist one queue: only sends this queue's in-memory offset to the broker, with no cleanup."""
         offset = self._offset_table.get(mq)
         if offset is None:
             return
@@ -4954,11 +4954,11 @@ class DefaultLitePullConsumer:
             logger.debug("lite persist failed for %s: %s", mq, e)
 
     def _persist_offset_table(self, mqs) -> None:
-        """``RemoteBrokerOffsetStore#persistAll(Set)``: the part of the in-memory offset table falling on ``mqs``
-        is written to the broker, and entries **not** in it are deleted from the table on the way (the ``remove unused mq`` line in the logs).
+        """Persist a set of queues: the part of the in-memory offset table falling on ``mqs``
+        is written to the broker, and entries **not** in it are deleted from the table on the way (the sweep of queues this instance no longer holds).
 
         The second half is this table's real semantics: it only serves the currently held queues, and revoked queues left in the table would never be
-        committed again, so persistAll sweeps them away as it goes. The cost is that ``commit(some queues, persist=True)`` drops the other
+        committed again, so this persist sweeps them away as it goes. The cost is that ``commit(some queues, persist=True)`` drops the other
         queues' **not yet persisted** in-memory values along with them -- whoever is to be committed must be given in full, and do not expect the other queues from the previous round to still be in the table.
         """
         wanted = set(mqs)
@@ -4971,26 +4971,26 @@ class DefaultLitePullConsumer:
             self._persist_offset(mq)
 
     def commit(self, offsets=None, persist: bool = True) -> None:
-        """Commit consume offsets. The three entry points correspond to ``DefaultLitePullConsumer``'s three overloads:
+        """Commit consume offsets. The argument picks one of three commit scopes:
 
-        - ``commit()``                       -> ``commitAll()``: commit all assigned queues by the "consumed cursor"
-        - ``commit({MessageQueue: offset})`` -> ``commit(Map, persist)``: the caller specifies offsets
-        - ``commit([MessageQueue, ...])``     -> ``commit(Set, persist)``: commit only these queues
+        - ``commit()``                       -> every assigned queue, at its "consumed cursor"
+        - ``commit({MessageQueue: offset})`` -> only the queues named by the dict, at the given offsets
+        - ``commit([MessageQueue, ...])``     -> only these queues, at their consumed cursors
 
         Specifying offsets **only changes the commit position, not the pull cursor**: messages already in the buffer are still handed to the caller, and the next round's
-        ``commit()`` overwrites the table back per the cursor (the order at the same place is exactly this: Map goes through
-        ``updateConsumeOffset`` writing only offsetStore, while ``commitAll`` each time re-reads from
-        ``assignedMessageQueue.getConsumerOffset``).
+        ``commit()`` overwrites the table back per the cursor (the order at the same place is exactly this: an explicit
+        offset updates only the in-memory table, while a full commit re-reads each assigned
+        queue's consumed cursor).
 
-        Two known deviations, both on this chain:
-        1. ``commitAll()`` itself writes only the in-memory table; actually sending to the broker relies on MQClientInstance's every
-           ``persistConsumerOffsetInterval`` (5s) ``persistConsumerOffset()``; this port's
-           lite consumer does not attach that timer, so ``persist=True`` (the default) sends it in place.
-        2. ``persistAll`` is commonly done oneway (the ``updateConsumeOffsetToBroker(mq, offset)`` overload with
-           ``isOneway=true``), with exceptions only logged; here it is sent synchronously with a response, so bad offsets can be seen in the logs right away.
+        Two deliberate choices of this implementation, both on this chain:
+        1. a full commit itself writes only the in-memory table; shipping it to the broker would otherwise
+           rely on the client instance's periodic offset persist (every ``persist_consumer_offset_interval``,
+           5s), which this port's lite consumer does not attach, so ``persist=True`` (the default) sends it in place.
+        2. this persist step is commonly done oneway, with exceptions only logged; here it is sent
+           synchronously with a response, so bad offsets can be seen in the logs right away.
         """
         if offsets is None:
-            # commitAll(): only iterate the currently held queues
+            # No argument: only iterate the currently held queues
             targets = {mq: self._consume_offset.get(mq, -1) for mq in self._assigned}
             scope = self._assigned
         elif isinstance(offsets, dict):
@@ -5011,7 +5011,7 @@ class DefaultLitePullConsumer:
                 logger.error("consumerOffset is -1 in messageQueue [%s].", mq)
                 continue
             if mq not in self._assigned:
-                # The processQueue != null && !isDropped() guard: queues not held by this instance
+                # The "queue is held and not dropped" guard: queues not held by this instance
                 # are never committed on its behalf, and are silently skipped (not even a log here).
                 continue
             self._offset_table[mq] = offset

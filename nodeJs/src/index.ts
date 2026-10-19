@@ -27,7 +27,7 @@ export { DefaultLitePullConsumer } from './client/lite_pull_consumer.ts';
 export type { TopicMessageQueueChangeListener } from './client/lite_pull_consumer.ts';
 export { DefaultMQAdminExt } from './client/admin.ts';
 
-// ---- pull schedule service (Java MQPullConsumerScheduleService equivalent) ----
+// ---- pull schedule service (per-queue scheduled pull tasks) ----
 export {
   PullConsumerScheduleService,
   PullTaskContext,

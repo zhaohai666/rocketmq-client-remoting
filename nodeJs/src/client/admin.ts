@@ -564,8 +564,8 @@ export class DefaultMQAdminExt {
 
   // QUERY_CONSUME_TIME_SPAN(303): walk the route's masters and concatenate each
   // broker's consumeTimeSpanSet. A broker that answers with an empty body
-  // contributes nothing; a broker that ERRORS propagates — unlike the topic-stats
-  // sweep above, Java's consume-time-span path never swallows a per-broker failure.
+  // contributes nothing; a broker that ERRORS propagates -- unlike the topic-stats
+  // sweep above, which is best-effort, this one never swallows a per-broker error.
   async queryConsumeTimeSpan(topic: string, group: string,
     timeoutMillis?: number): Promise<Record<string, any>[]> {
     const route = await this.examineTopicRouteInfo(topic);
@@ -1238,7 +1238,7 @@ export class DefaultMQAdminExt {
     void messageQueueKey;
   }
 
-  // ---------------- Offset queries (MQAdminImpl surface) ----------------
+  // ---------------- Offset queries (admin-side offset surface) ----------------
 
   private _masterAddrForMq(mq: MessageQueue): string {
     const client = this._requireClient();
@@ -1448,8 +1448,8 @@ export class DefaultMQAdminExt {
     return msg;
   }
 
-  // The uniq-key leg of the viewMessage fallback:
-  // MQAdminImpl#queryMessageByUniqKey — U-index query across every broker in
+  // The uniq-key leg of the viewMessage fallback: the
+  // U-index query is sent across every broker in
   // the route, first hit wins, verified against the UNIQ_KEY property so a
   // stray key collision can't satisfy the lookup.
   async viewMessageByUniqKey(topic: string, uniqKey: string): Promise<MessageExt> {

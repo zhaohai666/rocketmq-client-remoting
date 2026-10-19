@@ -89,8 +89,8 @@ func TestDecodeHeartbeatV2ResultExtFields(t *testing.T) {
 			ext:  map[string]string{ExtIsSupportHeartBeatV2: "false", ExtIsSubChange: "false"},
 		},
 		{
-			// Anything that is not "true" parses as false, exactly like the
-			// reference's Boolean.parseBoolean.
+			// Anything that is not the literal "true" parses as false, which is
+			// exactly how these ext-field flags are defined on the wire.
 			name: "garbage text",
 			ext:  map[string]string{ExtIsSupportHeartBeatV2: "yes", ExtIsSubChange: "1"},
 		},
@@ -348,9 +348,9 @@ func TestComputeHeartbeatFingerprintChangesWithSubscriptions(t *testing.T) {
 	}
 }
 
-func TestComputeHeartbeatFingerprintIsJavaStringHashOfCanonicalText(t *testing.T) {
-	// The reference hashes the normalized JSON rendering with String.hashCode,
-	// i.e. the same 31-based accumulation this port already uses for tag codes and
+func TestComputeHeartbeatFingerprintIsUtf16StringHashOfCanonicalText(t *testing.T) {
+	// The fingerprint is the 31-based string hash of the normalized JSON
+	// rendering -- the same accumulation this client already uses for tag codes and
 	// the queue ring. Pinning the pair keeps the two from drifting apart.
 	hb := heartbeatOf("client@A", "CG", v2Sub(t, "Tt", "TagA || TagB"))
 	hb.AddProducerData(NewProducerData("PID"))

@@ -26,8 +26,8 @@ int64_t steadyNowMillis() {
 
 MQPullConsumerScheduleService::MQPullConsumerScheduleService(const std::string& consumerGroup)
     : consumer_(consumerGroup) {
-    // Java pins CLUSTERING in the constructor; this port's consumer already defaults to it, but the
-    // explicit set keeps the parity visible (and survives a future default change).
+    // The service divides the queue set across the group's instances, so it pins CLUSTERING here: the
+    // consumer already defaults to it, but the explicit set keeps the requirement visible (and survives a future default change).
     consumer_.setMessageModel(MessageModel::CLUSTERING);
 }
 
@@ -53,9 +53,9 @@ void MQPullConsumerScheduleService::registerPullTaskCallback(
         std::lock_guard<std::mutex> lk(stateM_);
         callbackTable_[topic] = TopicCallback{std::move(callback), subExpression};
     }
-    // Java's registerPullTaskCallback also calls registerMessageQueueListener(topic, null): the topic
-    // enters the consumer's register table so heartbeats carry the subscription (broker-side group
-    // registration); the listener slot stays empty -- the refresh loop drives queue changes here.
+    // Registering a callback also registers the topic on the consumer (registerMessageQueueListener with an
+    // empty listener): the topic enters the consumer's register table so heartbeats carry the subscription
+    // (broker-side group registration); the listener slot stays empty -- the refresh loop drives queue changes here.
     consumer_.registerMessageQueueListener(topic, nullptr);
 }
 
@@ -121,7 +121,7 @@ void MQPullConsumerScheduleService::shutdown() {
     logger_info("MQPullConsumerScheduleService shutdown, " + consumer_.consumerGroup());
 }
 
-// ---------------------------------------------------------------- task table (Java's putTask)
+// ---------------------------------------------------------------- task table (putTask)
 
 void MQPullConsumerScheduleService::putTask(const std::string& topic,
                                             const std::vector<MessageQueue>& mqNewSet) {
@@ -130,7 +130,7 @@ void MQPullConsumerScheduleService::putTask(const std::string& topic,
         if (it->first.topic == topic
             && std::find(mqNewSet.begin(), mqNewSet.end(), it->first) == mqNewSet.end()) {
             // An in-flight round of a cancelled task still runs to completion (shutdown drains it),
-            // but runTask sees the flag and never reschedules -- Java's setCancelled(true) semantics.
+            // but runTask sees the flag and never reschedules -- cancellation only bites on the next round.
             it->second->cancelled.store(true);
             it = taskTable_.erase(it);
         } else {
@@ -149,7 +149,7 @@ void MQPullConsumerScheduleService::putTask(const std::string& topic,
         auto task = std::make_shared<PullTask>();
         task->mq = mq;
         task->subExpression = subExpression;
-        // New queues run at once (Java: schedule(command, 0, MILLISECONDS)).
+        // New queues run at once: their first deadline is "now", i.e. zero delay.
         task->nextRunAtMillis = now;
         taskTable_.emplace(mq, task);
     }
@@ -221,15 +221,15 @@ void MQPullConsumerScheduleService::refreshAssignedQueues() {
         std::vector<MessageQueue> assigned;
         try {
             if (broadcasting) {
-                // Java's BROADCASTING branch takes mqAll; fetchSubscribeMessageQueues returns the route's
-                // (namespaced) queues, so strip the namespace to keep the task table on bare topics
+                // Under BROADCASTING the full routed queue set is used; fetchSubscribeMessageQueues returns the
+                // route's (namespaced) queues, so strip the namespace to keep the task table on bare topics
                 // (pull() wraps it again on the way out).
                 assigned = consumer_.fetchSubscribeMessageQueues(topic);
                 for (MessageQueue& mq : assigned) {
                     mq.topic = NamespaceUtil::withoutNamespace(mq.topic, consumer_.namespaceOf());
                 }
             } else {
-                // Java's CLUSTERING branch takes mqDivided: this instance's share, already bare-topic.
+                // Under CLUSTERING only this instance's share of the queues is pulled, and it is already bare-topic.
                 assigned = consumer_.fetchMessageQueuesInBalance(topic);
             }
         } catch (const std::exception& e) {
@@ -288,7 +288,7 @@ MessageQueue MQPullConsumerScheduleService::realQueue(const MessageQueue& mq) co
 }
 
 int64_t MQPullConsumerScheduleService::initializeOffset(const MessageQueue& mq) {
-    // PullMessageService's computePullFromWhere for CONSUME_FROM_LAST_OFFSET: the stored consume offset
+    // The start point of a fresh task under CONSUME_FROM_LAST_OFFSET: the stored consume offset
     // when the group has one, else the queue's maxOffset (start at the tail, never replay history).
     const MessageQueue real = realQueue(mq);
     int64_t stored = 0;
@@ -312,7 +312,7 @@ void MQPullConsumerScheduleService::runTask(const std::shared_ptr<PullTask>& tas
     try {
         const std::shared_ptr<PullTaskCallback> callback = callbackFor(task->mq.topic);
         if (callback == nullptr) {
-            // Java drops the round with a warning; here the task stays alive (a callback registered
+            // The round is skipped with a warning but the task stays alive (a callback registered
             // later must find its queue again) and simply waits one exception delay.
             logger_warn("Pull Task Callback not exist , " + task->mq.topic);
             delay = pullTaskExceptionDelayMillis_;
@@ -325,7 +325,7 @@ void MQPullConsumerScheduleService::runTask(const std::shared_ptr<PullTask>& tas
                 }
                 result = consumer_.pull(task->mq, task->subExpression, task->offset, pullBatchNums_);
                 pulled = true;
-                // PullMessageService's offset bookkeeping: follow nextBeginOffset on every reply and
+                // The round's offset bookkeeping: follow nextBeginOffset on every reply and
                 // keep the local offset table current (persisted by the instance-level periodic task).
                 task->offset = result.nextBeginOffset;
                 try {
@@ -349,7 +349,7 @@ void MQPullConsumerScheduleService::runTask(const std::shared_ptr<PullTask>& tas
                     returned = callback->doPullTask(task->mq, result, context);
                 } catch (const std::exception& e) {
                     callbackThrew = true;
-                    delay = pullTaskExceptionDelayMillis_;  // Java: setPullNextDelayTimeMillis(1000)
+                    delay = pullTaskExceptionDelayMillis_;  // the callback exception lands on the exception delay, 1000ms by default
                     logger_error(std::string("doPullTask Exception: ") + e.what());
                 } catch (...) {
                     callbackThrew = true;

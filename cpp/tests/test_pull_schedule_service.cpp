@@ -1,12 +1,12 @@
-// Offline unit tests for the two high-level pull-consumer capabilities ported from Java:
+// Offline unit tests for the two high-level pull-consumer capabilities:
 //
-//   1. MQPullConsumerScheduleService (Java: consumer/MQPullConsumerScheduleService.java, with the
-//      PullRequest / PullMessageService scheduling semantics folded in): per-topic PullTaskCallback
+//   1. MQPullConsumerScheduleService (the per-queue pull scheduling is folded into it): the
+//      scheduling shell itself -- due check, offset advance, rescheduling delay -- plus per-topic PullTaskCallback
 //      registration, queue-dimension task fan-out for **this instance's share**, strict per-queue
 //      seriality, the three scheduling channels (return value > pullMessageLater > setPullInterval >
 //      status default), the exception delay, reassignment cancelling revoked queues, and a shutdown
 //      that drains the in-flight round.
-//   2. DefaultMQPullConsumer::pullAsync (Java: DefaultMQPullConsumer.pull(..., PullCallback, timeout)):
+//   2. DefaultMQPullConsumer::pullAsync (the async form of pull(mq, subExpression, offset, maxNums, callback, timeout)):
 //      immediate return, exactly-one onSuccess/onException on a worker/callback thread, synchronous
 //      throw before start().
 //
@@ -611,7 +611,7 @@ void testStatusDefaultAndOffsetAdvance() {
 
     MQPullConsumerScheduleService svc("PG_SchedStatus");
     prepare(svc, ep, "sched_status");
-    // Java's PULL_TIME_DELAY_MILLS_WHEN_EXCEPTION is 3s; scaled down so the empty-reply gap is measurable.
+    // The exception-class delay defaults to 3s; scaled down so the empty-reply gap is measurable.
     svc.setPullTimeDelayMillisWhenException(400);
     auto cb = std::make_shared<StatusCallback>();
     svc.registerPullTaskCallback(kTopic, cb);
@@ -634,7 +634,7 @@ void testStatusDefaultAndOffsetAdvance() {
                "the empty reply waits pullTimeDelayMillisWhenException before the next round",
                "gap2=" + std::to_string(gap2));
     }
-    // Offset bookkeeping (PullMessageService semantics): the first pull starts at maxOffset (=0 here,
+    // Offset bookkeeping (the service pulls on the task's behalf): the first pull starts at maxOffset (=0 here,
     // QUERY_CONSUMER_OFFSET answered QUERY_NOT_FOUND), the next pull follows nextBeginOffset=5.
     expect(waitFor([&] { return ep.pullCount() >= 2; }), "two pulls reached the broker");
     expectInt(ep.pullOffset(0), 0, "the uninitialized task starts at the queried maxOffset");
@@ -672,7 +672,7 @@ void testCallbackExceptionRetriesAfterExceptionDelay() {
 
     MQPullConsumerScheduleService svc("PG_SchedThrow");
     prepare(svc, ep, "sched_throw");
-    svc.setPullTaskExceptionDelayMillis(300);  // Java pins 1000ms; scaled for the offline budget
+    svc.setPullTaskExceptionDelayMillis(300);  // the default is 1000ms; scaled for the offline budget
     auto cb = std::make_shared<ThrowingCallback>();
     svc.registerPullTaskCallback(kTopic, cb);
     svc.start();
@@ -684,7 +684,7 @@ void testCallbackExceptionRetriesAfterExceptionDelay() {
     if (calls.size() >= 2) {
         const int64_t gap = calls[1] - calls[0];
         expect(gap >= 250 && gap < 3000,
-               "the retry waits pullTaskExceptionDelayMillis (Java: 1000ms)",
+               "the retry waits pullTaskExceptionDelayMillis (default 1000ms)",
                "gap=" + std::to_string(gap));
     }
     svc.shutdown();

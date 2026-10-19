@@ -1,7 +1,7 @@
 // Instance-level heartbeat V2 gating, driven against an in-process mock broker.
 //
-// The state machine these tests pin is the one the reference runs
-// (MQClientInstance#sendHeartbeatToAllBrokerV2 / #sendHeartbeatToBrokerV2):
+// The state machine these tests pin is this client's V2 heartbeat
+// fan-out, tracked address by address:
 //
 //	first beat to an address  -> always the WITH-subscription body
 //	answer IS_SUPPORT..=true  -> the address joins the V2 set
@@ -9,7 +9,7 @@
 //	stored fingerprint == now -> a later beat may send the WITHOUT-sub body
 //	answer without the flags  -> the address is NOT V2-capable: full body forever
 //
-// and the switch itself: ClientConfig.useHeartbeatV2 is off by default, and with
+// and the switch itself: UseHeartbeatV2 is off by default, and with
 // it off the beat must stay byte-compatible with the plain V1 path (fingerprint
 // 0, withoutSub false, subscriptions included).
 package client
@@ -621,7 +621,7 @@ func TestInstanceHeartbeatV2ConcurrentBeatIsSkipped(t *testing.T) {
 	c := newV2Cluster(t, true, false)
 	c.master.setAnswerDelay(300 * time.Millisecond)
 
-	// The reference guards the fan-out with lockHeartbeat.tryLock(): a caller
+	// The fan-out is guarded by a try-lock on the heartbeat mutex: a caller
 	// that finds it busy skips its beat instead of queueing behind it.
 	done := make(chan int, 1)
 	go func() { done <- c.beat(t, false) }()

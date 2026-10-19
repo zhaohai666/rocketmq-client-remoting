@@ -1587,12 +1587,12 @@ final class DefaultMQPushConsumer
 
     private function resolveInitialOffset(MQClientInstance $client, MessageQueue $mq): int
     {
-        // Java parity (RebalancePushImpl#computePullFromWhereWithException): the initial
+        // Rule for the starting offset (this client's design): the initial
         // offset NEVER depends on the subscription type. An earlier draft short-circuited
         // SQL92 subscriptions to the max offset, which silently skipped every message
         // produced *before* the consumer started (send-first + CONSUME_FROM_FIRST_OFFSET
         // received nothing; consumer-first only passed because the queues were empty and
-        // the max offset was 0 anyway). Java reads the stored offset and, when absent,
+        // the max offset was 0 anyway). This client reads the stored offset and, when absent,
         // uses 0 for FIRST_OFFSET / max for LAST_OFFSET etc. -- the broker applies the
         // SQL92 filter to whatever range the pull covers.
         if ($this->messageModel === MessageModel::BROADCASTING) {

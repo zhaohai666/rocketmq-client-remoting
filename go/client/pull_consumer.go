@@ -514,7 +514,7 @@ func (c *DefaultMQPullConsumer) Start() error {
 		c.consumerGroup = common.WrapNamespace(c.namespace, c.consumerGroup)
 	}
 	if c.messageModel == MessageModelClustering {
-		// Only CLUSTERING rewrites the DEFAULT instance name to pid#nanotime.
+		// Only CLUSTERING rewrites the DEFAULT instance name to the pid plus a nanotime.
 		c.instanceName = common.ChangeInstanceNameToPID(c.instanceName)
 	}
 	if c.clientID == "" {
@@ -978,8 +978,8 @@ func (c *DefaultMQPullConsumer) UpdateConsumeOffset(mq common.MessageQueue, offs
 // UpdateConsumeOffsetToBroker writes one offset straight to
 // the broker, skipping the store's periodic flush.
 //
-// The `isOneway` flag of the classic API has no counterpart in this port's
-// offset store (every
+// The protocol's `isOneway` flag has no counterpart in this client's offset
+// store (every
 // write is a synchronous UPDATE_CONSUMER_OFFSET), so the round trip is always
 // confirmed before this returns.
 func (c *DefaultMQPullConsumer) UpdateConsumeOffsetToBroker(mq common.MessageQueue, offset int64) error {
@@ -1011,8 +1011,8 @@ func (c *DefaultMQPullConsumer) UpdateConsumeOffsetToBroker(mq common.MessageQue
 }
 
 // PersistConsumerOffset flushes every queue this consumer knows about. The
-// reference path passes the process-queue table's
-// keys; this port has no pull-side rebalance, so the set is the union of the two
+// flush set is whatever this consumer has touched, not a process-queue
+// table: there is no pull-side rebalance here, so the set is the union of the two
 // ways a queue can enter this consumer's world — the queues it has PULLED
 // (pullFromWhichNode) and the queues whose offset the CALLER parked locally
 // (offsetQueues). Both halves are needed: the remote store's PersistAll
@@ -1030,9 +1030,9 @@ func (c *DefaultMQPullConsumer) PersistConsumerOffset() error {
 	}
 	c.mu.Unlock()
 	if !started || store == nil {
-		// The strict reference behaviour throws when not running; the periodic
-		// caller here treats a
-		// not-yet-started consumer as "nothing to do".
+		// A strict reading would fail the flush when the consumer is not running;
+		// this client's periodic
+		// caller treats a not-yet-started consumer as "nothing to do".
 		return nil
 	}
 	seen := make(map[common.MessageQueue]struct{}, len(queued))
@@ -1145,8 +1145,8 @@ func (c *DefaultMQPullConsumer) ParseSubscribeMessageQueues(queues []common.Mess
 // pulling, so pulling "all queues" instead is the classic duplicate-consumption
 // bug in a multi-instance group.
 //
-// The reference implementation reads this from a process-queue table its
-// background rebalance thread fills. This port runs no pull-side rebalance
+// A process-queue table filled by a background rebalance thread is the usual
+// way to answer this, but this client runs no pull-side rebalance
 // thread (see the
 // file header), so the view is computed on demand with the exact allocation
 // formula the push consumer's doRebalance() runs.
@@ -1248,8 +1248,8 @@ func (c *DefaultMQPullConsumer) PulledQueues() []common.MessageQueue {
 //  1. the address comes from the PUBLISH table (master only), so the caller must
 //     have pulled the topic through THIS consumer first — a queue reached
 //     through another instance is not in this instance's route cache;
-//  2. the reference implementation's failure path re-sends the message to
-//     %RETRY%group through an internal producer. This port reports the failure
+//  2. a pull consumer owns no internal producer, so a failed bounce is never
+//     re-sent to %RETRY%group behind the caller's back: this client reports the failure
 //     instead of silently switching transports — a bounce that failed is
 //     something the caller needs to see.
 func (c *DefaultMQPullConsumer) SendMessageBack(msg *common.MessageExt, delayLevel int32, brokerName string) error {
@@ -1311,7 +1311,7 @@ func (c *DefaultMQPullConsumer) CreateTopic(key, newTopic string, queueNum, topi
 // RebalanceImmediately is the fan-out of broker's NOTIFY_CONSUMER_IDS_CHANGED
 // (40). A pull consumer has no assignment to recompute, so this refreshes the
 // routes of the subscribed topics and tells the listener what the queue set
-// looks like now — the same thing RebalancePullImpl.messageQueueChanged does.
+// looks like now. That refresh is the whole contract of this notification.
 func (c *DefaultMQPullConsumer) RebalanceImmediately() {
 	instance := c.Instance()
 	if instance == nil {

@@ -652,7 +652,7 @@ public sealed class DefaultMQPushConsumer
 
     // Pause flag: the flag driven by Suspend()/Resume().
     // Once set, both pull loops stop sending requests and poll for it to
-    // clear every 1000ms (PULL_TIME_DELAY_MILLS_WHEN_SUSPEND, :113).
+    // clear every 1000ms (this port's suspend poll interval).
     private volatile bool _paused;
     private readonly ManualResetEventSlim _stopEvent = new(false);
     private long _consumedCount;
@@ -1045,9 +1045,9 @@ public sealed class DefaultMQPushConsumer
     /// The immediate action after a subscription table insert/update: right
     /// after writing the subscription table, synchronously push one heartbeat
     /// round to all brokers.
-    /// Why it must be immediate: the broker's ConsumerManager only records
-    /// topic→group into its own topicGroupTable when it receives a heartbeat
-    /// (ClientManageProcessor → registerConsumer), and it is exactly this
+    /// Why it must be immediate: the broker's consumer manager only records
+    /// topic->group into its own registration table when it receives a heartbeat
+    /// (the heartbeat handler's consumer-registration step), and it is exactly this
     /// table that QUERY_TOPIC_CONSUME_BY_WHO(300) reads; one round later means
     /// a default 30s gap. At the same time the new topic is registered as "in
     /// use" so the background route refresh task covers it (the refresh task
@@ -1354,7 +1354,7 @@ public sealed class DefaultMQPushConsumer
             }
             // Dynamic name server: the instance may already have obtained
             // addresses from the address server at startup; backfill them into
-            // this consumer (naturally synced via the shared ClientConfig)
+            // this consumer (naturally synced via the shared client config)
             if (_nameServerAddrs.Count == 0 && _mqClient.NameServerAddrs.Count > 0)
             {
                 _nameServerAddrs = new List<string>(_mqClient.NameServerAddrs);
@@ -1479,7 +1479,7 @@ public sealed class DefaultMQPushConsumer
         // CLASSIC CONCURRENT path: it is built in the concurrent consume
         // service's constructor/start, orderly consumption's cleanExpiredMsg
         // returns directly anyway, and POP's
-        // ConsumeMessagePopConcurrentlyService has no corresponding schedule.
+        // the concurrent POP listener has no corresponding schedule.
         if (!IsOrderly() && !PopMode)
         {
             _cleanExpireThread = MakeThread("CleanExpireMsgScheduledThread_" + ConsumerGroup,
@@ -2251,7 +2251,7 @@ public sealed class DefaultMQPushConsumer
 
     /// <summary>Wake this consumer's rebalance thread after the instance
     /// receives the broker's 40 notification (the rebalanceImmediately →
-    /// RebalanceService#wakeup semantics). Runs on the remoting reader
+    /// rebalance-loop wakeup semantics of this port). Runs on the remoting reader
     /// thread: only sets the flag, sends no RPC, does no heavy work.</summary>
     /// <remarks>⚠ You must ABSOLUTELY NEVER call DoRebalance() synchronously
     /// here: it internally does blocking invokeSync
@@ -3496,10 +3496,10 @@ public sealed class DefaultMQPushConsumer
 
     /// <summary>The unified entry for POP popped batches: orderly listeners
     /// divert into the <see cref="SubmitPopOrderlyRequest"/> skeleton while
-    /// concurrent listeners go through ConsumeMessagePopConcurrentlyService.
+    /// concurrent listeners go through the concurrent POP listener.
     /// Public for the test project (no InternalsVisibleTo).
     /// <para>Service selection by listener type: orderly listener + POP goes
-    /// through ConsumeMessagePopOrderlyService. In 5.5.0 it is an unfinished
+    /// through the orderly POP listener, which is today an unfinished
     /// skeleton (POPTODO): after the dedup enqueue, run() returns as soon as
     /// it takes the queue lock -- messages are NEITHER consumed NOR acked, and
     /// the broker revives and redelivers them when invisibleTime expires.
@@ -4821,13 +4821,13 @@ public sealed class DefaultMQPushConsumer
     //      %RETRY%&lt;group&gt;), not ConsumerSendMsgBack(3).
 
     /// <summary>
-    /// getMaxReconsumeTimes.
+    /// The orderly side's max reconsume times.
     ///
     /// Orderly-consumed messages always stop in the local queue and retry in
     /// place, and the broker side has no redelivery count at all, so the
     /// default should be to keep retrying until success -- <c>-1</c> is read
     /// as <c>int.MaxValue</c> here. The concurrent consumption's
-    /// <c>-1 → 16</c> (<c>DefaultMQPushConsumerImpl#getMaxReconsumeTimes</c>)
+    /// <c>-1 -> 16</c> (this client's concurrent-side default)
     /// is another set of semantics: every round of send-back there goes
     /// through the broker, and 16 is the broker's default retryMaxTimes.
     /// Merging the two into one constant would either conjure dead letters
@@ -4951,13 +4951,13 @@ public sealed class DefaultMQPushConsumer
     ///
     /// Take the instance's built-in internal producer and send this message
     /// AS A NORMAL MESSAGE to <c>%RETRY%&lt;group&gt;</c>: the broker's
-    /// <c>handleRetryAndDLQ</c> (<c>SendMessageProcessor:199-234</c>) sees the
+    /// retry-and-DLQ interception sees the
     /// group still holds an unexpired queue lock (exactly the orderly
     /// consumption group's characteristic) and redirects it straight to
     /// <c>%DLQ%&lt;group&gt;</c>. Among them <c>RECONSUME_TIME</c> /
     /// <c>MAX_RECONSUME_TIMES</c> get lifted into the request header on the
     /// send side (<c>MQClientInstance.BuildSendRequest</c> lifts them into the
-    /// request header on the send side, equivalent to sendKernelImpl).
+    /// request header on the send side, as the sync send path does).
     ///
     /// Failure only returns false, never throws: the whole segment is wrapped
     /// in try/catch; throwing to the consume thread means this message is
@@ -4979,7 +4979,7 @@ public sealed class DefaultMQPushConsumer
             }
 
             // unitMode follows the consumer: building the internal producer
-            // must copy the consumer config (resetClientConfig); without it
+            // must copy the consumer config over; without it
             // the sent-back message would lose its unit mark.
             c.SendMessage(MixAll.ClientInnerProducerGroup, newMsg, publish.SelectOneMessageQueue(),
                 3000, unitMode: _unitMode);
@@ -5101,9 +5101,9 @@ public sealed class DefaultMQPushConsumer
     /// <para>
     /// When the pull response is <c>NoNewMsg</c> (the queue really has no
     /// messages) or <c>NoMatchedMsg</c> (the broker went a full round by the
-    /// subscription expression and not one matched, see
-    /// <c>MQClientAPIImpl:1095-1097</c> mapping <c>PULL_RETRY_IMMEDIATELY</c>
-    /// to it), this queue's "consumed offset" must follow the pull cursor,
+    /// subscription expression and not one matched: the response carries
+    /// <c>PULL_RETRY_IMMEDIATELY</c>, which this client maps to
+    /// NoMatchedMsg), this queue's "consumed offset" must follow the pull cursor,
     /// otherwise it DEADLOCKS PERMANENTLY: messages nobody acks belong to
     /// nobody (those filtered out on the broker side are not in the response,
     /// and those removed by the client's second-pass tag filter are
@@ -5112,13 +5112,12 @@ public sealed class DefaultMQPushConsumer
     /// redelivery/restart.
     /// </para>
     /// <para>
-    /// The update goes through
-    /// <c>offsetStore.updateOffset(mq, nextOffset, increaseOnly=true)</c>
-    /// (forward only, never backward), with one gate:
-    /// <c>0L == processQueue.getMsgCount()</c>. <c>msgCount</c> counts
-    /// messages STILL IN the ProcessQueue -- the concurrent consumption's
-    /// <c>removeMessage</c> is only called after the listener returns
-    /// (<c>ConsumeMessageConcurrentlyService:266</c>), so in-flight batches
+    /// The update goes through the offset store, in its forward-only
+    /// form (never backward), with one gate: the queue's own
+    /// pending-message count must be 0. That count tracks
+    /// messages STILL IN the process queue -- the concurrent consumption's
+    /// per-batch removal only runs once the listener returns, so
+    /// the removal doubles as the settle point: in-flight batches
     /// count too; raising the offset before they settle means this batch is
     /// silently skipped on process crash. This port combines <c>_pending</c>
     /// being empty and <c>_inFlight</c> being 0 into the same criterion, the
@@ -5199,9 +5198,9 @@ public sealed class DefaultMQPushConsumer
     /// <para>
     /// The broker says "the offset you requested is illegal" (the queue was
     /// truncated, the commitlog expired, or it was reset server-side; see
-    /// <c>PullMessageProcessor</c> replying <c>PULL_OFFSET_MOVED</c> uniformly
+    /// the broker replying <c>PULL_OFFSET_MOVED</c> uniformly
     /// for OFFSET_OVERFLOW_BADLY / OFFSET_TOO_SMALL / OFFSET_RESET, mapped by
-    /// the client at <c>MQClientAPIImpl:1099</c> to this status) and puts the
+    /// this client to this status) and puts the
     /// correction value in <c>nextBeginOffset</c>. The correction is not just
     /// moving the cursor over: all messages on this queue ALREADY FETCHED but
     /// not yet consumed/acked are VOIDED (they fall in the skipped range, and
@@ -6295,15 +6294,15 @@ public sealed class DefaultMQPushConsumer
         List<string> addrs;
         try
         {
-            // Send to every one (master + slave): sendHeartbeatToAllBroker
-            // walks every brokerId of brokerAddrTable, skipping only when
+            // Send to every one (master + slave): this client's heartbeat round
+            // walks every brokerId in the route-derived broker table, skipping only when
             // `consumerEmpty && id != MASTER_ID`; the consumer heartbeat
             // always carries ConsumerData, so slaves are not skipped. The
-            // broker's ConsumerManager has one copy per machine, and a slave
+            // broker keeps its consumer registrations per machine, and a slave
             // not receiving the heartbeat replies SUBSCRIPTION_NOT_EXIST to
-            // pulls pointing at itself (PullMessageProcessor:420-427; the
+            // pulls pointing at itself; the
             // default PostSubscriptionWhenPull=false pull carries no
-            // subscription flag and goes exactly that way). The producer
+            // subscription flag and goes exactly that way. The producer
             // heartbeat is the opposite: it carries only ProducerData
             // (consumerEmpty); see the KnownBrokerAddrs used in Producer.cs.
             addrs = _mqClient.GetAllBrokerAddrs();
@@ -6326,9 +6325,9 @@ public sealed class DefaultMQPushConsumer
             ConsumeType = ConsumeType.ConsumePassively,
             MessageModel = _messageModel,
             ConsumeFromWhere = _consumeFromWhere,
-            // consumerData.setUnitMode(impl.isUnitMode()).
+            // The beat's ConsumerData carries the consumer's own unitMode.
             // The broker reads it and marks %RETRY%group with the
-            // UNIT_SUB(0x2) system flag (ClientManageProcessor).
+            // UNIT_SUB(0x2) system flag.
             UnitMode = _unitMode,
         };
         lock (_lock)
@@ -6453,8 +6452,8 @@ public sealed class DefaultMQPushConsumer
             // consumerSendMessageBack protocol-wise only fills
             // group/offset/delayLevel/originMsgId/originTopic/maxReconsumeTimes/brokerName,
             // never writes unitMode, the field is always false. The broker
-            // side does read it (AbstractSendMessageProcessor:135-138 →
-            // buildSysFlag(false, true)), so it is reported truthfully here
+            // side does read it (its sys-flag builder receives
+            // (false, true)), so it is reported truthfully here
             // per the consumer config, and only then does the unitized retry
             // topic carry the UNIT_SUB flag.
             UnitMode = _unitMode,

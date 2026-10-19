@@ -99,17 +99,17 @@ async function main() {
       Number.isInteger(empty.computeHeartbeatFingerprint()));
   }
 
-  // ------------------------------------------ 3. java string hash semantics
+  // ------------------------------------ 3. signed 32-bit string hash semantics
   {
-    // Java's String.hashCode over UTF-16 code units. These values were read off a
-    // real JDK ("hello"/"world"/"Poland"/one astral char), so the port cannot drift
-    // into JS number semantics and still pass.
+    // The UTF-16 code-unit string hash the heartbeat fingerprint is built from.
+    // These fixed vectors pin the exact wrap behaviour ("hello"/"world"/"Poland"/
+    // one astral char), so the hash cannot drift into JS number semantics and pass.
     check('empty text hashes to 0', javaStringHash('') === 0);
-    check('"hello" hashes like Java', javaStringHash('hello') === 99162322,
+    check('"hello" matches the pinned vector', javaStringHash('hello') === 99162322,
       String(javaStringHash('hello')));
-    check('"world" hashes like Java', javaStringHash('world') === 113318802,
+    check('"world" matches the pinned vector', javaStringHash('world') === 113318802,
       String(javaStringHash('world')));
-    check('a value that overflows 32 bits wraps NEGATIVE, like Java',
+    check('a value that overflows 32 bits wraps NEGATIVE',
       javaStringHash('Poland') === -1898810230, String(javaStringHash('Poland')));
     check('a surrogate pair is hashed per code unit',
       javaStringHash('\uD83D\uDE00') === 1772899 &&

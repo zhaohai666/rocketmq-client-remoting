@@ -245,7 +245,7 @@ console.log('== slave fallback ==');
   await (inst as any).sendHeartbeatToAllBrokers();
   check('heartbeat sent to slave too', beats.length === 2
     && beats.includes('127.0.0.1:10911') && beats.includes('127.0.0.1:10913'), JSON.stringify(beats));
-  // The two guards the reference applies to every beat fan-out: a producer-only
+  // Two guards apply to every beat fan-out: a producer-only
   // client reports to the master only, and a client that registers nothing sends
   // no beat at all.
   beats = [];

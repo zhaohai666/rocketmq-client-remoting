@@ -32,9 +32,9 @@ const logger = getLogger('client.pull_consumer');
 const DEFAULT_PULL_BATCH_SIZE = 32;
 const DEFAULT_PULL_TIMEOUT_MILLIS = 20000;
 
-// PullCallback — Java DefaultMQPullConsumer.pull(..., PullCallback, timeout).
-// Delivered EXACTLY ONCE per pullAsync call and never inline on the caller's
-// stack: the settle path hands over through setImmediate (event-loop semantics).
+// PullCallback -- the asynchronous form of pull(mq, subExpression, offset,
+// maxNums, PullCallback, timeout): delivered EXACTLY ONCE per pullAsync call,
+// never inline on the caller's stack -- the settle path hands over via setImmediate.
 export interface PullCallback {
   onSuccess(pullResult: PullResult): void;
   onException(e: Error): void;
@@ -69,12 +69,12 @@ export class DefaultMQPullConsumer {
   pullBatchSize = DEFAULT_PULL_BATCH_SIZE;
   pullTimeoutMillis = DEFAULT_PULL_TIMEOUT_MILLIS;
   maxReconsumeTimes = -1;
-  // Java ClientConfig.persistConsumerOffsetInterval (default 5000ms): applied to
+  // Offset flush period (default 5000 ms): applied to
   // the shared MQClient instance when THIS facade creates it (first creator's
   // config wins). The instance-level persistAllConsumerOffset sweep is what
   // flushes this facade's offsets between the explicit shutdown/revoke flushes.
   persistConsumerOffsetInterval = 5000;
-  // Heartbeat V2 (Java ClientConfig.useHeartbeatV2): default off, like the reference.
+  // Heartbeat V2: off by default, so heartbeats keep the V1 shape unless enabled.
   useHeartbeatV2 = false;
 
   private subscription = new Map<string, SubscriptionData>();
@@ -100,7 +100,7 @@ export class DefaultMQPullConsumer {
   setPullBatchSize(n: number): this { this.pullBatchSize = n; return this; }
   setPullTimeoutMillis(ms: number): this { this.pullTimeoutMillis = ms; return this; }
   setMaxReconsumeTimes(n: number): this { this.maxReconsumeTimes = n; return this; }
-  // Flush period for consumed offsets (Java ClientConfig.persistConsumerOffsetInterval).
+  // Flush period for consumed offsets, in milliseconds; must be greater than 0.
   // When already started the change is pushed through to the shared instance's
   // sweep timer immediately.
   setPersistConsumerOffsetInterval(ms: number): this {
@@ -110,7 +110,7 @@ export class DefaultMQPullConsumer {
     return this;
   }
   getPersistConsumerOffsetInterval(): number { return this.persistConsumerOffsetInterval; }
-  // Heartbeat V2 switch (Java ClientConfig.setUseHeartbeatV2); pushed through to
+  // Heartbeat V2 switch; pushed through to
   // the shared instance when this facade already owns one.
   setUseHeartbeatV2(enable: boolean): this {
     this.useHeartbeatV2 = enable === true;
@@ -123,9 +123,9 @@ export class DefaultMQPullConsumer {
 
   // subscribe registers a topic subscription. A string is a tag expression
   // ("*" = all); a MessageSelector selects the expression type — bySql rides the
-  // wire as expressionType=SQL92 and is evaluated BY THE BROKER (the Java
-  // client does the same: no client-side SQL92 engine, see FilterAPI.build
-  // keeping tagsSet EMPTY so the client-side tag filter stays off).
+  // wire as expressionType=SQL92 and is evaluated BY THE BROKER: this
+  // client has no SQL92 engine, and FilterAPI.build keeps tagsSet
+  // EMPTY so the client-side tag filter stays off.
   subscribe(topic: string, subExpression: string | MessageSelector = '*'): this {
     if (!topic || !topic.trim()) throw new Error('subscription topic is empty');
     this.subscription.set(topic, this._buildSub(topic, subExpression));
@@ -234,9 +234,9 @@ export class DefaultMQPullConsumer {
     return this._pullImpl(mq, subExpression, offset, maxNums, false, 0, timeoutMillis);
   }
 
-  // pullAsync — Java DefaultMQPullConsumer.pull(mq, subExpression, offset,
+  // pullAsync -- the callback form of pull(mq, subExpression, offset,
   // maxNums, PullCallback, timeout). Event-loop semantics: the callback fires
-  // EXACTLY ONCE (success XOR exception) and NEVER inline — even an immediate
+  // EXACTLY ONCE (success XOR exception) and NEVER inline -- even an immediate
   // local failure (consumer not started, no subscription) is delivered through
   // setImmediate, so the caller's statement always completes first.
   pullAsync(mq: MessageQueue, subExpression: string | MessageSelector | null, offset: number,
@@ -273,7 +273,7 @@ export class DefaultMQPullConsumer {
   private async _pullImpl(mq: MessageQueue, subExpression: string | MessageSelector | null, offset: number,
     maxNums: number, suspend: boolean, suspendTimeoutMillis: number,
     timeoutMillis: number): Promise<PullResult> {
-    // Java checks serviceState at the pull entry: a shutdown facade must report,
+    // The pull entry checks the service state first: a shutdown facade must report,
     // never keep pulling through the (still open) client instance it shared.
     if (!this.started || !this.pullAPI) throw new Error('consumer not started');
     const topic = mq.getTopic();
@@ -345,8 +345,8 @@ export class DefaultMQPullConsumer {
     return this.persistConsumeOffset();
   }
 
-  // maxOffset — the queue tail on the MASTER broker (Java
-  // DefaultMQPullConsumer.maxOffset). Throws when the route/broker is unknown;
+  // maxOffset -- the queue tail on the MASTER broker, i.e. the highest
+  // offset ever written to that queue. Throws when the route/broker is unknown;
   // the pull schedule context treats that as "start from 0".
   async maxOffset(mq: MessageQueue): Promise<number> {
     if (!this.mqClient) throw new Error('consumer not started');

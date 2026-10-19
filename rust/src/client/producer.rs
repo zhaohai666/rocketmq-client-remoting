@@ -161,7 +161,7 @@ pub struct SelectMessageQueueByHash;
 
 impl MessageQueueSelector for SelectMessageQueueByHash {
 /// A shard key must be reproducible across processes: an environment-dependent string hash would put
-/// the same `arg` on different queues. This uses the classic `String.hashCode` integer hash semantics
+/// the same `arg` on different queues. This uses the classic 31-multiplier integer hash semantics
     /// (deterministic, fit to serve as a shard key).
     fn select(&self, mqs: &[MessageQueue], _msg: &Message, arg: &str) -> Result<MessageQueue> {
         if mqs.is_empty() {
@@ -553,7 +553,7 @@ impl Default for ProducerConfig {
 ///
 /// The handles are shared by [`DefaultMQProducer`] through `Arc`, and the transaction check-back processor pushed by the
 /// broker only holds a `Weak` (see [`CheckTransactionStateProcessor`]), for the same reason as
-/// `mq_client::ClientRemotingProcessor`: otherwise
+/// the client instance's broker-push processor: otherwise
 /// `Inner → RemotingClient → processor → Inner` would form a cycle and never be released.
 struct Inner {
     /// Scattered public attributes gathered into one configuration; the `RwLock` keeps setters "callable at any time",
@@ -3866,7 +3866,7 @@ impl DefaultMQProducer {
 }
 
 /// ⚠ Holds only a [`Weak`]: otherwise `Inner → RemotingClient → this processor → Inner` would form a cycle
-/// and the producer would never be released (the same reason as `mq_client::ClientRemotingProcessor`).
+/// and the producer would never be released (same guard as the client instance's broker-push processor).
 struct CheckTransactionStateProcessor {
     producer: Weak<Inner>,
 }

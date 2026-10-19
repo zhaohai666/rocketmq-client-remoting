@@ -157,7 +157,7 @@ export class DefaultMQProducer {
   // W3C traceparent passthrough switch. Independent of enableTrace, seeded
   // from ROCKETMQ_TRACE_CONTEXT_ENABLE.
   enableTraceContext: boolean;
-  // Heartbeat V2 (Java ClientConfig.useHeartbeatV2): default off, like the reference.
+  // Heartbeat V2: off by default, so heartbeats keep the V1 shape unless enabled.
   useHeartbeatV2: boolean;
 
   client: MQClient | null;
@@ -267,7 +267,7 @@ export class DefaultMQProducer {
   getSocksProxyConfig(): SocksProxyConfig | null { return this.socksProxyConfig; }
   setSendMsgTimeout(ms: number): this { this.sendMsgTimeout = ms; return this; }
   setEnableTrace(enable: boolean): this { this.enableTrace = enable; return this; }
-  // Heartbeat V2 switch (Java ClientConfig.setUseHeartbeatV2). A broker that does
+  // Heartbeat V2 switch. A broker that does
   // not answer the V2 ext fields keeps receiving subscription-carrying bodies, so
   // turning this on against an old broker is harmless.
   setUseHeartbeatV2(enable: boolean): this {
@@ -418,8 +418,8 @@ export class DefaultMQProducer {
         this._traceHook = new SendMessageTraceHookImpl(dispatcher);
         hookRegistry.registerSendMessageHook(this._traceHook);
         // Default recall-message trace hook (an RPCHook on the remoting
-        // client) — recall rpcs get their own Recall trace records. Gated on
-        // com.rocketmq.recall.default.trace.enable, default off.
+        // client) gives recall rpcs their own Recall trace records. Gated on this
+        // client's own env key com.rocketmq.recall.default.trace.enable, default off.
         const { DefaultRecallMessageTraceHook } = await import('./trace_hook.ts');
         this._recallTraceHook = new DefaultRecallMessageTraceHook(dispatcher);
         this.client.remotingClient.registerRpcHook(this._recallTraceHook);

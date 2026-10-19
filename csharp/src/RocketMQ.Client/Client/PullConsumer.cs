@@ -297,15 +297,15 @@ public sealed class DefaultMQPullConsumer
     // ---------------- Heartbeat (registers the consumer group with the broker) ----------------
     /// <summary>
     /// Why pull mode must heartbeat too: the broker's
-    /// <c>ConsumerManager.consumerTable</c> is per-instance, and the table is only created
+    /// registered-consumer table is per broker instance, and the table is only created
     /// by a heartbeat (or by a pull carrying the subscription flag). Without a heartbeat,
     /// neither 203 consumerConnection nor 38 GET_CONSUMER_LIST_BY_GROUP shows this group,
     /// and a broker with isRejectPullConsumerEnabled=true answers every pull of this
     /// group with "the pull consumer is rejected by server"
-    /// (PullMessageProcessor:493-505). And ClientManageProcessor:87-92 **skips** the
+    /// at its pull check. And the broker's heartbeat handling **skips** the
     /// subscription registration of ACTIVELY-type heartbeats -- pull mode relies on the
     /// compensating branch taken by a pull that carries the subscription flag
-    /// (:397-412), so the failure caused by a missing heartbeat is silent: pulling still
+    /// (the pull-side registration branch), so the failure caused by a missing heartbeat is silent: pulling still
     /// succeeds, the broker simply has no idea this group exists.
     /// </summary>
     private void RefreshRouteForHeartbeat()
@@ -424,7 +424,7 @@ public sealed class DefaultMQPullConsumer
 
             // The boundary of the resident loop: an exception escaping here would kill the
             // heartbeat thread (no more heartbeats at all), so it must be caught;
-            // per-broker failures are already handled inside SendHeartbeatToAllBroker.
+            // per-broker failures are already handled inside SendHeartbeatToAllBrokers.
             try
             {
                 SendHeartbeatToAllBroker();

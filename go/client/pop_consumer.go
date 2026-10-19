@@ -167,8 +167,8 @@ func (c *DefaultMQPushConsumer) popOnce(mq common.MessageQueue, sub *remoting.Su
 }
 
 // submitPopConsume splits one pop batch into consumeMessageBatchMaxSize chunks
-// and consumes them, mirroring
-// ConsumeMessagePopConcurrentlyService#submitPopConsumeRequest.
+// and hands each chunk to the consume service
+// in order, so a batch is never consumed out of sequence.
 func (c *DefaultMQPushConsumer) submitPopConsume(mq common.MessageQueue, msgs []*common.MessageExt, pq *popProcessQueue) {
 	batchSize := maxInt(1, c.consumeMessageBatchMaxSizeValue())
 	for total := 0; total < len(msgs); {
@@ -236,8 +236,8 @@ func (c *DefaultMQPushConsumer) consumePopBatch(mq common.MessageQueue, batch []
 	}
 
 	begin := common.CurrentTimeMillis()
-	// ConsumeMessagePopConcurrentlyService:380-382 — same CONSUME_START_TIME
-	// stamping as the pull path.
+	// Every message of the batch is stamped with CONSUME_START_TIME, the
+	// same stamping the pull path applies.
 	for _, msg := range batch {
 		msg.PutProperty(common.PropertyConsumeStartTime, i64Text(common.CurrentTimeMillis()))
 	}

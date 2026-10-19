@@ -738,7 +738,7 @@ final class RunClientAllocation
             'wireQueueKeyString empty fields'
         );
 
-        // wireSplit: semantics table measured on JDK 17 (see docblock)
+        // wireSplit: delimiter split semantics table (see docblock)
         $this->checkSame(['room1'], AllocationHelper::wireSplit('room1@', '@'), 'wireSplit "room1@" -> ["room1"] (trailing empty segment removed)');
         $this->checkSame(['room1', 'b'], AllocationHelper::wireSplit('room1@b@', '@'), 'wireSplit "room1@b@" -> 2 segments (trailing empty segment removed)');
         $this->checkSame([], AllocationHelper::wireSplit('@', '@'), 'wireSplit "@" -> []');

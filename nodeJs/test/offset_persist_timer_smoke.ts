@@ -1,11 +1,11 @@
 // MQClient instance-level persistAllConsumerOffset + persistConsumerOffsetInterval —
 // offline wire test.
 //
-// Behaviour baseline (Java MQClientInstance.startScheduledTask registers
-// persistAllConsumerOffset with initialDelay 10s / period
-// ClientConfig.persistConsumerOffsetInterval = 5000ms; RemoteBrokerOffsetStore
-// / LocalFileOffsetStore decide what a flush costs; one failing consumer must
-// never starve the others — the sweep is best-effort per consumer):
+// Behaviour baseline (the instance-level offset flush: initial delay 10s, period
+// persistConsumerOffsetInterval = 5000ms; the offset store decides
+// what a flush costs, and one failing consumer must
+// never starve the others -- the sweep is best-effort
+// per consumer):
 //   * The PULL / LITE-PULL facades only flushed on shutdown or by an explicit
 //     call, so a crash lost every offset since the last flush. The instance sweep
 //     is what closes that window.
@@ -149,10 +149,10 @@ async function main() {
   // ------------------------------------------------- 1. defaults and validation
   {
     const c = new DefaultMQPullConsumer('GID_persist_defaults');
-    check('the pull facade defaults to Java 5000ms', c.getPersistConsumerOffsetInterval() === 5000,
+    check('the pull facade defaults to 5000ms', c.getPersistConsumerOffsetInterval() === 5000,
       String(c.getPersistConsumerOffsetInterval()));
     const lite = new DefaultLitePullConsumer('GID_persist_defaults_lite');
-    check('the lite-pull facade defaults to Java 5000ms',
+    check('the lite-pull facade defaults to 5000ms',
       lite.getPersistConsumerOffsetInterval() === 5000,
       String(lite.getPersistConsumerOffsetInterval()));
     for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {

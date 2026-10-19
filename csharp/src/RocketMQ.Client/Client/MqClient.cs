@@ -245,12 +245,12 @@ public sealed class MQClientInstance : IDisposable
 
     /// <summary>
     /// The broker's "one of your lite subscriptions is gone" push. Swallowed without a reply,
-    /// the way the reference's client processor swallows it: on the classic-remoting path the
+    /// the way this client's processor handles it: on the classic-remoting path the
     /// lite-subscription bookkeeping lives on the broker side, and the subscription sets this
     /// client actually registers (the ConsumerData of a push / pull / lite-pull consumer) are
     /// re-reported by every heartbeat anyway, so a dropped lite subscription cannot leave this
     /// client pulling something it should have forgotten. A sync sender therefore times out
-    /// rather than getting a bogus SUCCESS -- the same answer the reference gives it.
+    /// rather than getting a bogus SUCCESS -- the only answer a oneway-only notification allows.
     /// </summary>
     public RemotingCommand? ProcessNotifyUnsubscribeLite(RemotingCommand cmd, string addr)
     {
@@ -840,7 +840,7 @@ public sealed class MQClientInstance : IDisposable
 
     /// Returning an empty string is a normal outcome (a down master looks exactly like
     /// this); what error to report is up to the caller
-    /// (<c>sendKernelImpl</c> reports MQClientException, <c>endTransaction</c> reports
+    /// (the send path reports MQClientException, the transaction-finish path reports
     /// nothing).
     /// </summary>
     public string FindBrokerAddressInPublish(string brokerName)
@@ -858,18 +858,18 @@ public sealed class MQClientInstance : IDisposable
         }
     }
 
-    /// Matches <c>DefaultMQProducerImpl.sendKernelImpl:919-924</c> (send),
-    /// <c>DefaultMQPushConsumerImpl.changePopInvisibleTimeAsync:869-876</c> / <c>ackAsync</c>
-    /// (POP's ack and invisible-time extension go through
-    /// <c>findBrokerAddressInSubscribe(brokerName, MASTER_ID, true)</c>, master only),
-    /// as well as MQAdminImpl's offset query (see <see cref="PublishAddrInAdmin"/>).
+    /// Used by the sync send path (its address step resolves here), by POP's ack and
+    /// invisible-time extension (both go through
+    /// <c>FindBrokerAddressInSubscribe(brokerName, MASTER_ID, true)</c>, master only),
+    /// and by the admin side's offset query
+    /// (see <see cref="PublishAddrInAdmin"/>).
     /// Same shape: look up the publish address (brokerId=0 only) -> on a miss refresh the
     /// route once for the topic -> look again -> if still missing throw
-    /// <c>MQClientException("The broker[X] not exist")</c> exactly as
-    /// <c>sendKernelImpl:1100</c> does (the code in this port is -1, meaning "not a code
+    /// <c>MQClientException("The broker[X] not exist")</c> with the same wording the
+    /// send path reports to its caller (the code in this port is -1, meaning "not a code
     /// returned by the broker").
     ///
-    /// A pinned send does not fetch publish info inside <c>sendDefaultImpl</c>, so this is
+    /// A pinned send does not fetch publish info on its send path, so this is
     /// its only source of routing; during a master/slave switch this is also the dividing
     /// line between "fail immediately on our side" and "send the request to a slave and
     /// eat a round of SYSTEM_BUSY(2) for nothing" -- slaves do not accept the write
@@ -1886,7 +1886,7 @@ public sealed class MQClientInstance : IDisposable
     public sealed record BrokerAddrEntry(string BrokerName, long BrokerId, string Addr);
 
     /// <summary>
-    /// Heartbeat V2 switch (<c>ClientConfig#useHeartbeatV2</c>). Off (the default) every beat
+    /// Heartbeat V2 switch for this instance. Off (the default) every beat
     /// keeps its full subscription set and fingerprint 0, i.e. exactly what a V1 client sends.
     ///
     /// Turning it either way restarts the conversation with every broker: the caches below say
@@ -1913,15 +1913,15 @@ public sealed class MQClientInstance : IDisposable
 
     private readonly object _heartbeatV2Lock = new();
 
-    /// <summary>Addresses that answered IS_SUPPORT_HEART_BEAT_V2=true (brokerSupportV2HeartbeatSet).</summary>
+    /// <summary>Addresses that answered IS_SUPPORT_HEART_BEAT_V2=true.</summary>
     private readonly HashSet<string> _brokerSupportV2HeartbeatSet = new(StringComparer.Ordinal);
 
-    /// <summary>Last fingerprint accepted per address (brokerAddrHeartbeatFingerprintTable).</summary>
+    /// <summary>Last fingerprint accepted per address.</summary>
     private readonly Dictionary<string, int> _brokerAddrHeartbeatFingerprintTable =
         new(StringComparer.Ordinal);
 
     /// <summary>Broker protocol version per brokerName/addr, taken off every heartbeat reply
-    /// (the reference's brokerVersionTable).</summary>
+    /// from the response header.</summary>
     private readonly Dictionary<string, Dictionary<string, int>> _brokerVersionTable =
         new(StringComparer.Ordinal);
 
@@ -1957,8 +1957,8 @@ public sealed class MQClientInstance : IDisposable
     }
 
     /// <summary>
-    /// Clears the per-address fingerprint table (resetBrokerAddrHeartbeatFingerprintMap). The
-    /// reference does this when a beat is triggered by a rebalance: the assignment moved, so
+    /// Clears the per-address fingerprint table. This client also clears it when a
+    /// beat is triggered by a rebalance: the assignment moved, so
     /// the client must re-report its subscriptions rather than ask every broker to skip them.
     /// </summary>
     public void ResetBrokerAddrHeartbeatFingerprintTable()
@@ -2020,7 +2020,7 @@ public sealed class MQClientInstance : IDisposable
         {
             if (skipSub)
             {
-                // The reference only reacts to subChange here: support is already known.
+                // Only subChange is acted on here: support is already known.
                 if (result.SubChange)
                 {
                     _brokerAddrHeartbeatFingerprintTable.Remove(addr);
@@ -2056,7 +2056,7 @@ public sealed class MQClientInstance : IDisposable
 
     /// <summary>
     /// The broker instances the heartbeat fan-out walks. Built from the cached topic routes,
-    /// which is the same source the reference's brokerAddrTable is filled from. With
+    /// which is where this client learns broker addresses in the first place. With
     /// <paramref name="includeSlaves" /> false, one entry per brokerName (the master, falling
     /// back to whichever replica the route advertises) -- the address set the producer side
     /// uses everywhere else on this port.
@@ -2123,12 +2123,12 @@ public sealed class MQClientInstance : IDisposable
     }
 
     /// <summary>
-    /// One heartbeat round over the broker table (the reference's
-    /// sendHeartbeatToAllBroker / sendHeartbeatToAllBrokerV2, with the same two guards):
+    /// One heartbeat round over the broker table (V1 and V2 share this entry point,
+    /// under the same two guards):
     /// <list type="number">
     /// <item>a client that registers nothing has nothing to report -- no beat at all;</item>
     /// <item>a producer-only client beats the masters only: a slave holding a producer
-    /// registration can never use it, and Java skips every entry whose brokerId is not
+    /// registration can never use it, so this client skips every entry whose brokerId is not
     /// <c>MixAll.MASTER_ID</c> while the ConsumerData set is empty.</item>
     /// </list>
     /// <paramref name="isRebalance" /> is the push consumer's "the allocation moved" signal: it

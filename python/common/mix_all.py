@@ -52,8 +52,8 @@ class MixAll:
     TRANS_CHECK_MAX_TIME = 15
     UNIT_PREFIX = "unit_"
     REQ_T = "ReqT"
-    # Heartbeat V2 (MQClientAPIImpl#sendHeartbeatV2 reads both keys out of the HEART_BEAT(34)
-    # response extFields; ClientManageProcessor#heartBeatV2 writes them).
+    # Heartbeat V2 (the broker's V2 registration path writes both keys into the HEART_BEAT(34)
+    # response extFields; the client reads them back out of that frame).
     IS_SUPPORT_HEART_BEAT_V2 = "IS_SUPPORT_HEART_BEAT_V2"
     IS_SUB_CHANGE = "IS_SUB_CHANGE"
     RPC_REQUEST_HEADER_NAMESPACED_FIELD = "nsd"
@@ -85,7 +85,7 @@ class MixAll:
 
     NAMESPACE_PATTERN = "^[%s]{4}[a-zA-Z0-9_-]+$"
 
-    READ_PERM_BY_DEFAULT = 4 | 2  # PermName.PERM_READ | PERM_WRITE
+    READ_PERM_BY_DEFAULT = 4 | 2  # broker permission bits: read | write
 
     @staticmethod
     def get_retry_topic(consumer_group: str) -> str:
@@ -229,7 +229,7 @@ class MixAll:
         return MixAll.build_mq_client_id(MixAll.cached_ip_str(), instance_name,
                                         unit_name, enable_stream_request_type)
 
-    # ---------------- Properties <-> String (corresponds to MixAll.properties2String/string2Properties) ----------------
+    # ---------------- Properties <-> String (properties text <-> dict conversion) ----------------
     @staticmethod
     def properties2_string(properties, is_sort: bool = False) -> str:
         pass
@@ -318,7 +318,7 @@ _PREDEFINE_GROUP_SET = frozenset([
 ])
 
 class QueryMsgType:
-    """Three modes for querying messages by key (corresponds to tools' QueryMsgByKeySubCommand.QueryMsgType).
+    """Three modes for querying messages by key (the query-by-key request modes).
 
     Not the same as ``MixAll.UNIQUE_MSG_QUERY_FLAG``: the latter is the **key name** inside extFields.
     """

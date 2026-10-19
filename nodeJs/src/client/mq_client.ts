@@ -119,9 +119,9 @@ export class MQClient {
   consumerTable: Map<string, any>;
   producerTable: Map<string, any>;
   heartbeatIntervalMillis: number;
-  // Heartbeat V2. Off by default — the reference switch is a JVM system property
-  // that reads "false", and a beat with fingerprint 0 makes the broker take its
-  // plain registration path, exactly as before.
+  // Heartbeat V2. Off by default; a broker only answers the V2 flags when the
+  // beat carries a non-zero fingerprint, and a beat with fingerprint 0 makes it
+  // take its plain registration path, exactly as before.
   useHeartbeatV2: boolean;
   // Broker-side VIP channel. Off by default. When a facade enables it, the
   // offset / queue-lock / consumer-list / subscription-check RPCs the broker
@@ -152,10 +152,10 @@ export class MQClient {
   // adjustThreadPool task: every 1 minute every
   // consumer of this instance is offered a pool-size adjustment decision.
   _adjustThreadPoolTimer: NodeJS.Timeout | null;
-  // persistAllConsumerOffset task (Java ClientConfig.persistConsumerOffsetInterval,
-  // default 5000ms): the INSTANCE-level offset flush. The push consumer keeps its
-  // own 5s loop, but the pull / lite-pull facades only flushed on shutdown —
-  // a crash lost every offset since the start. Java schedules the first tick
+  // persistAllConsumerOffset task (default 5000 ms): the
+  // INSTANCE-level offset flush. The push consumer keeps its
+  // own 5s loop, but the pull / lite-pull facades only flushed on shutdown --
+  // a crash lost every offset since the start. The first tick fires
   // after a 10s initial delay, then every persistConsumerOffsetInterval.
   persistConsumerOffsetInterval: number;
   _persistOffsetTimer: NodeJS.Timeout | null;
@@ -644,8 +644,8 @@ export class MQClient {
   }
 
   // ---- heartbeat ----
-  // buildHeartbeatData(withoutSub) mirrors the reference's two heartbeat
-  // renderings: withoutSub keeps every consumer's identity but empties its
+  // buildHeartbeatData(withoutSub) renders the two heartbeat
+  // shapes the V2 protocol knows: withoutSub keeps every consumer's identity but empties its
   // subscription set, which is what lets a V2 broker skip registration work it
   // already did.
   buildHeartbeatData(withoutSub = false): HeartbeatData {
@@ -729,7 +729,7 @@ export class MQClient {
   private async _sendHeartbeatBody(brokerAddr: string, hb: HeartbeatData): Promise<RemotingCommand> {
     const request = RemotingCommand.createRequestCommand(RequestCode.HEART_BEAT, null);
     request.body = hb.encode();
-    // The reference sends the beat with the client-level API timeout, not a fixed
+    // The beat is sent with the client-level API timeout, not a fixed
     // one, so setMqClientApiTimeout governs the heartbeat too.
     return this.remotingClient.invokeSync(brokerAddr, request, this.mqClientApiTimeout);
   }
@@ -1074,7 +1074,7 @@ export class MQClient {
   }
 
   // The TopAddressing branch runs ONLY when no name server address was
-  // explicitly configured: scheduleAtFixedRate(fetchNameServerAddr, 10s, 2min).
+  // explicitly configured: fetchNameServerAddr fires at +10s, then every 2min.
   private _startNamesrvAddressingLoop(): void {
     if (this.nameServerAddress != null) return; // explicitly set — skip the task
     this._topAddressing = new DefaultTopAddressing(null, null);
@@ -1103,11 +1103,11 @@ export class MQClient {
     }
   }
 
-  // Periodic offset flush (Java MQClientInstance: scheduleAtFixedRate(
-  // persistAllConsumerOffset, 10s, persistConsumerOffsetInterval=5s)). The
+  // Periodic offset flush: persistAllConsumerOffset runs 10s after start and
+  // then every persistConsumerOffsetInterval (default 5s). The
   // interval timer alone would fire at +5s already, so the 10s initial tick
-  // only matters for a configured interval LONGER than 10s — kept anyway for
-  // shape parity with the Java schedule.
+  // only matters for a configured interval LONGER than 10s -- kept anyway,
+  // because it also bounds the very first flush after start().
   private _startPersistConsumerOffsetLoop(): void {
     if (this._persistOffsetTimer != null) return;
     const beat = () => { this.persistAllConsumerOffset(); };
@@ -1118,8 +1118,8 @@ export class MQClient {
     if (typeof this._persistOffsetTimer.unref === 'function') this._persistOffsetTimer.unref();
   }
 
-  // Java MQClientInstance.persistAllConsumerOffset: sweep EVERY consumer
-  // registered on this instance. Best effort per consumer — one failing flush
+  // Instance-level flush sweep: walk EVERY consumer
+  // registered on this instance. Best effort per consumer -- one failing flush
   // must never starve the others (same isolation rule as adjustThreadPool).
   persistAllConsumerOffset(): void {
     for (const consumer of this.consumerTable.values()) {
@@ -1135,7 +1135,7 @@ export class MQClient {
     }
   }
 
-  // Runtime knob for the flush period (Java ClientConfig.setPersistConsumerOffsetInterval).
+  // Runtime knob for the flush period, in milliseconds (must be > 0).
   // When the loop is already running the interval timer is rebuilt so the new
   // period takes effect from the next tick; the 10s initial tick is left alone.
   setPersistConsumerOffsetInterval(ms: number): void {
@@ -1208,13 +1208,13 @@ export class MQClient {
   // Public: facade start() (pull / lite-pull consumer), route refresh and the
   // push consumer's rebalance all call this directly. `isRebalance` is the push
   // consumer's assignment-changed signal: it drops every cached fingerprint so
-  // the next beat re-reports subscriptions, the way the reference resets the
-  // table before beating when a rebalance moved the queue set.
+  // the next beat re-reports subscriptions -- after a rebalance moved the queue
+  // set the broker has to be told what this client now subscribes to.
   async sendHeartbeatToAllBrokers(isRebalance = false): Promise<void> {
     const entries = this.getAllBrokerAddrEntries();
-    // Same two guards the reference applies before it walks the broker table: a
+    // Two guards apply before walking the broker table: a
     // client that registers nothing has nothing to report, and a producer-only
-    // client beats the MASTER only — heartbeating a slave with no consumer data
+    // client beats the MASTER only -- heartbeating a slave with no consumer data
     // would leave the slave holding a producer registration it can never use.
     const beat = this.buildHeartbeatData(false);
     const producerEmpty = beat.producerDataSet.length === 0;
