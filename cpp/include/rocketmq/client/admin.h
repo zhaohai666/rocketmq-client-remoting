@@ -71,7 +71,15 @@ public:
     bool isEnableStreamRequestType() const { return enableStreamRequestType_; }
     void setPollNameServerIntervalMillis(int32_t millis) { pollNameServerIntervalMillis_ = millis; }
     int32_t pollNameServerIntervalMillis() const { return pollNameServerIntervalMillis_; }
-    void setVipChannelEnabled(bool enable) { vipChannelEnabled_ = enable; }
+    void setVipChannelEnabled(bool enable) {
+        vipChannelEnabled_ = enable;
+        // The shared instance runs the offset / consumer-list family that the admin delegates
+        // to it, so flipping the switch has to reach that instance too -- otherwise the admin's
+        // own RPCs move while the delegated ones keep the listening port.
+        if (mqClient_) {
+            mqClient_->setVipChannelEnabled(enable);
+        }
+    }
     bool isVipChannelEnabled() const { return vipChannelEnabled_; }
     std::string getNamesrvAddr() const;
     std::vector<std::string> getNameServerAddressList() const { return nameServerAddrs_; }

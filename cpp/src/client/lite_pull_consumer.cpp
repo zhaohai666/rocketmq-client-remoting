@@ -282,6 +282,8 @@ void DefaultLitePullConsumer::start() {
                                         /*invokeTimeoutMillis=*/10000,
                                         MQClientInstance::tlsEnabledFromEnv(), unitName_,
                                         pollNameServerIntervalMillis_));
+    // Broker VIP channel: forwarded to the instance that owns the broker RPCs (off = plain address).
+    mqClient_->setVipChannelEnabled(vipChannelEnabled_);
     const std::shared_ptr<RPCHook> requestHook =
         composeRequestHooks(enableStreamRequestType_, rpcHook_,
                             [this] { return namespaceV2_; });

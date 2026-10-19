@@ -12,6 +12,14 @@ final class MixAll
 {
     public const NAMESRV_ADDR_PROPERTY = 'rocketmq.namesrv.addr';
     public const NAMESRV_ADDR_ENV = 'NAMESRV_ADDR';
+    /**
+     * Response ext field: the broker understood the fingerprint-bearing heartbeat body, so later
+     * beats to this address may omit the subscription set.
+     */
+    public const IS_SUPPORT_HEART_BEAT_V2 = 'IS_SUPPORT_HEART_BEAT_V2';
+    /// Response ext field: the fingerprint the broker holds for one of the groups differs from the
+    /// one just sent, so the subscriptions have to go out again.
+    public const IS_SUB_CHANGE = 'IS_SUB_CHANGE';
     public const MESSAGE_COMPRESS_LEVEL = 'rocketmq.message.compressLevel';
     public const DEFAULT_TOPIC = 'TBW102';
     public const BENCHMARK_TOPIC = 'BenchmarkTest';

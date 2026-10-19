@@ -221,6 +221,9 @@ class DefaultMQAdminExt
     public function setVipChannelEnabled(bool $enable): void
     {
         $this->vipChannelEnabled = $enable;
+        if ($this->mqClient !== null) {
+            $this->mqClient->vipChannelEnabled = $enable;
+        }
     }
 
     public function getNameServerAddr(): string
@@ -270,6 +273,7 @@ class DefaultMQAdminExt
             pollNameServerInterval: $this->pollNameServerInterval,
             tlsOptions: $this->tlsOptions,
             socksProxy: $this->socksProxy,
+            vipChannelEnabled: $this->vipChannelEnabled,
         );
         if ($this->rpcHook !== null) {
             $this->mqClient->remotingClient->registerRpcHook($this->rpcHook);
@@ -337,16 +341,25 @@ class DefaultMQAdminExt
         throw new MQBrokerException($response->code, $response->remark ?? '');
     }
 
-    /** Send to the specified Broker and verify SUCCESS. */
+    /**
+     * Send to the specified Broker and verify SUCCESS.
+     *
+     * `$vip` mirrors the per-request address rewrite: the administration RPCs the broker answers on
+     * its VIP port go there while the channel is enabled, and the few calls only ever served on the
+     * plain port -- reading a broker's own configuration is one of them -- pass `$vip = false`.
+     */
     protected function invokeBroker(
         string $addr,
         int $code,
         ?array $extFields = null,
         ?string $body = null,
         ?int $timeoutMillis = null,
+        bool $vip = true,
     ): RemotingCommand {
         $client = $this->requireClient();
-        $addr = MixAll::brokerVipChannel($this->vipChannelEnabled, $addr);
+        if ($vip) {
+            $addr = MixAll::brokerVipChannel($this->vipChannelEnabled, $addr);
+        }
         $request = RemotingCommand::createRequestCommand($code, null);
         self::applyExtFields($request, $extFields);
         if ($body !== null) {
@@ -773,7 +786,7 @@ class DefaultMQAdminExt
      */
     public function getBrokerConfig(string $brokerAddr, ?int $timeoutMillis = null): array
     {
-        $response = $this->invokeBroker($brokerAddr, RequestCode::GET_BROKER_CONFIG, timeoutMillis: $timeoutMillis);
+        $response = $this->invokeBroker($brokerAddr, RequestCode::GET_BROKER_CONFIG, timeoutMillis: $timeoutMillis, vip: false);
         $text = $response->body ?? '';
         return MixAll::string2Properties($text);
     }
@@ -910,6 +923,7 @@ class DefaultMQAdminExt
     public function getAllSubscriptionGroup(string $brokerAddr, ?int $timeoutMillis = null): SubscriptionGroupWrapper
     {
         $client = $this->requireClient();
+        $brokerAddr = MixAll::brokerVipChannel($this->vipChannelEnabled, $brokerAddr);
         $timeout = $timeoutMillis ?? $this->timeoutMillis;
         $currentDataVersion = null;
         $groupSeq = 0;
@@ -1476,7 +1490,8 @@ class DefaultMQAdminExt
         if ($isCpp) {
             $request->language = LanguageCode::CPP->value;
         }
-        $response = $this->invokeSyncOn($client, $brokerAddr, $request, $this->timeoutMillis);
+        $vipAddr = MixAll::brokerVipChannel($this->vipChannelEnabled, $brokerAddr);
+        $response = $this->invokeSyncOn($client, $vipAddr, $request, $this->timeoutMillis);
         if ($response->code !== ResponseCode::SUCCESS) {
             throw new MQClientException(
                 ($response->remark !== null && $response->remark !== '') ? $response->remark : 'reset offset failed',

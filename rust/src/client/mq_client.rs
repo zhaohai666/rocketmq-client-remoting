@@ -65,7 +65,7 @@ use crate::remoting::protocol::headers::{
     UnlockBatchMqRequestHeader, UnregisterClientRequestHeader, UpdateConsumerOffsetRequestHeader,
 };
 use crate::remoting::protocol::heartbeat::{
-    ConsumerData, ExpressionType, HeartbeatData, ProducerData, SubscriptionData,
+    ConsumerData, ExpressionType, HeartbeatData, HeartbeatV2Result, ProducerData, SubscriptionData,
 };
 use crate::remoting::protocol::query_assignment_body::{
     MessageQueueAssignment, QueryAssignmentRequestBody, QueryAssignmentResponseBody,
@@ -398,15 +398,16 @@ pub struct MQClientInstanceConfig {
     pub unit_name: Option<String>,
     pub namespace_v2: Option<String>,
     pub enable_stream_request_type: bool,
-    /// `ClientConfig.vipChannelEnabled` (default false; the producer facade calls it
-    /// `sendMessageWithVIPChannel`). When on, every broker-facing RPC of this instance is sent
-    /// to `port - 2` of the route address (`MixAll.brokerVIPChannel`), the dedicated fast port a
-    /// broker opens besides its main listening port. Name-server requests never shift.
+    /// Fast-port rewrite switch (default false; a producer exposes it as
+    /// `send_message_with_vip_channel`). When on, the broker-facing requests of the
+    /// offset/lock/query/admin family and message sends go to `port - 2` of the route address --
+    /// the dedicated fast port a broker opens besides its main listening port. Heartbeats, pulls,
+    /// pops, acks, recalls and every name-server request never shift.
     pub vip_channel_enabled: bool,
-    /// `ClientConfig.useHeartbeatV2` (default false; the
-    /// `com.rocketmq.heartbeat.v2` switch). When on, heartbeat rounds take the fingerprint path:
-    /// `HEART_BEAT(34)` with a non-zero `heartbeatFingerprint`, and -- once the broker says
-    /// `IS_SUPPORT_HEART_BEAT_V2` and the fingerprint is unchanged -- a `withoutSub` body.
+    /// Heartbeat V2 switch (default false). When on, heartbeat rounds carry a non-zero
+    /// `heartbeatFingerprint` in `HEART_BEAT(34)`, and -- once the broker answers
+    /// `IS_SUPPORT_HEART_BEAT_V2` and the fingerprint is unchanged -- the subscription set is
+    /// dropped from the body.
     pub use_heartbeat_v2: bool,
 }
 
@@ -545,17 +546,20 @@ struct Inner {
     tasks: Mutex<Vec<JoinHandle<()>>>,
     consumer_ids_changed_count: AtomicUsize,
     /// Live copy of `MQClientInstanceConfig::vip_channel_enabled`: unlike the other config fields
-    /// this one is readable *and* writable after `start()` (a facade's
-    /// `set_send_message_with_vip_channel` flips it), because the address rewrite happens per
-    /// request.
+    /// this one is readable *and* writable after `start()` (an admin or producer facade flips it),
+    /// because the address rewrite happens per request.
     vip_channel_enabled: AtomicBool,
-    /// `MQClientInstance.brokerSupportV2HeartbeatSet`: addresses that answered
-    /// `IS_SUPPORT_HEART_BEAT_V2` at least once. An address outside the set is beaten with the
-    /// full body and fingerprint 0 semantics do not apply to it.
+    /// Heartbeat V2 switch, live so a facade can flip it after `start()` just like the VIP knob.
+    /// Off (the default) every beat keeps `heartbeatFingerprint = 0`, which is what makes the
+    /// broker take its legacy registration path.
+    use_heartbeat_v2: AtomicBool,
+    /// Broker addresses that answered `IS_SUPPORT_HEART_BEAT_V2` at least once. An address outside
+    /// the set always receives the full body, so a broker that predates the two body fields keeps
+    /// working untouched.
     broker_support_v2_heartbeat_set: Mutex<HashSet<String>>,
-    /// `MQClientInstance.brokerAddrHeartbeatFingerprintTable`: the fingerprint the last accepted
-    /// full-body beat left at each V2-capable address. While a row matches the current
-    /// subscriptions, beats to that address may drop the subscription set.
+    /// The fingerprint the last accepted full-body beat left at each V2-capable address, keyed by
+    /// address. While a row matches the freshly computed fingerprint, beats to that address may
+    /// drop the subscription set.
     broker_addr_heartbeat_fingerprint_table: Mutex<HashMap<String, i32>>,
 }
 
@@ -621,6 +625,7 @@ impl MQClientInstance {
             ..RemotingClientConfig::default()
         };
         let vip_channel_enabled = config.vip_channel_enabled;
+        let use_heartbeat_v2 = config.use_heartbeat_v2;
         let inner = Arc::new(Inner {
             client_id: client_id.to_string(),
             name_server_addrs: Mutex::new(name_server_addrs),
@@ -650,6 +655,7 @@ impl MQClientInstance {
             tasks: Mutex::new(Vec::new()),
             consumer_ids_changed_count: AtomicUsize::new(0),
             vip_channel_enabled: AtomicBool::new(vip_channel_enabled),
+            use_heartbeat_v2: AtomicBool::new(use_heartbeat_v2),
             broker_support_v2_heartbeat_set: Mutex::new(HashSet::new()),
             broker_addr_heartbeat_fingerprint_table: Mutex::new(HashMap::new()),
         });
@@ -1546,10 +1552,9 @@ impl MQClientInstance {
 
     // ---------------- VIP channel ----------------
 
-    /// `ClientConfig.setVipChannelEnabled`: flip the address rewrite for this live instance.
-    /// Every broker-facing RPC of this instance that the Java client rewrites through
-    /// `MixAll.brokerVIPChannel` follows the switch immediately, including requests already
-    /// queued on an existing connection (the address is resolved per request).
+    /// Flip the address rewrite for this live instance. Every broker-facing request of the
+    /// rewrite family follows the switch immediately, including requests already queued on an
+    /// existing connection (the address is resolved per request).
     pub fn set_vip_channel_enabled(&self, enable: bool) {
         self.inner
             .vip_channel_enabled
@@ -1560,7 +1565,7 @@ impl MQClientInstance {
         self.inner.vip_channel_enabled.load(Ordering::Acquire)
     }
 
-    /// `MixAll.brokerVIPChannel(clientConfig.isVipChannelEnabled(), addr)`: `ip:port` becomes
+    /// The address the live VIP decision sends this broker request to: `ip:port` becomes
     /// `ip:(port - 2)` (10911 -> 10909). Off (the default) the address is returned untouched,
     /// and a name-server address must never be passed through here.
     fn vip_addr(&self, addr: &str) -> String {
@@ -1570,12 +1575,34 @@ impl MQClientInstance {
         MixAll::broker_vip_channel(true, addr)
     }
 
-    /// The address this instance's live VIP decision would send a publish request to, or `None`
-    /// when the route holds no master for that broker name. The rewrite itself happens inside
-    /// the send RPCs, so this only exists for callers that must log or compare the address.
-    pub(crate) fn vip_addr_of_publish(&self, broker_name: &str) -> Option<String> {
-        self.find_broker_address_in_publish(broker_name)
-            .map(|addr| self.vip_addr(&addr))
+    // ---------------- heartbeat V2 switch ----------------
+
+    /// Flip the heartbeat fingerprint path for this live instance. Both per-address tables are
+    /// cleared so toggling cannot leave a broker remembered as V2-capable while the switch is off
+    /// (or the reverse): the next round re-answers `IS_SUPPORT_HEART_BEAT_V2` from scratch.
+    pub fn set_use_heartbeat_v2(&self, enable: bool) {
+        self.inner.use_heartbeat_v2.store(enable, Ordering::Release);
+        self.reset_broker_addr_heartbeat_fingerprint_table();
+        self.inner
+            .broker_support_v2_heartbeat_set
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    pub fn is_use_heartbeat_v2(&self) -> bool {
+        self.inner.use_heartbeat_v2.load(Ordering::Acquire)
+    }
+
+    /// Forget every remembered fingerprint, so the next round to each broker re-delivers the
+    /// subscriptions. Called when the queue allocation changes. The "this broker speaks V2"
+    /// knowledge survives -- it is a property of the broker, not of this round.
+    pub fn reset_broker_addr_heartbeat_fingerprint_table(&self) {
+        self.inner
+            .broker_addr_heartbeat_fingerprint_table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     // ---------------- message sending ----------------
@@ -3047,6 +3074,24 @@ impl MQClientInstance {
         Ok(())
     }
 
+    /// The same `HEART_BEAT(34)` frame read through the fingerprint contract: the broker answers
+    /// with `IS_SUPPORT_HEART_BEAT_V2` / `IS_SUB_CHANGE` in the **response extFields**. There is
+    /// no separate V2 request code -- a broker that predates the two body fields answers plain
+    /// SUCCESS with no ext fields, which decodes to "V1 only" and keeps the full body in flight.
+    /// Like the V1 path, the address is never VIP-rewritten: registration is not latency-critical.
+    pub async fn send_heartbeat_v2(
+        &self,
+        addr: &str,
+        heartbeat_data: &HeartbeatData,
+        timeout_millis: i64,
+    ) -> Result<HeartbeatV2Result> {
+        let mut request = RemotingCommand::create_request_command(request_code::HEART_BEAT, None);
+        request.set_body(Some(heartbeat_data.encode()));
+        let response = self.invoke_sync(addr, &mut request, timeout_millis).await?;
+        Self::check_response(&response)?;
+        Ok(HeartbeatV2Result::from_response(&response))
+    }
+
     pub fn prepare_heartbeat_data(&self) -> HeartbeatData {
         let mut hb = HeartbeatData::new(self.inner.client_id.clone());
         for group in self.producer_groups() {
@@ -3103,21 +3148,132 @@ impl MQClientInstance {
 
     /// Send heartbeats to every known broker (**slaves included**); returns the success count.
     pub async fn send_heartbeat_to_all_broker(&self, timeout_millis: i64) -> usize {
+        self.send_heartbeat_round(false, timeout_millis).await
+    }
+
+    /// Round that follows a queue-allocation change. The remembered fingerprints are dropped
+    /// first, so every V2-capable broker is handed the subscriptions again instead of the cheap
+    /// subscription-free body.
+    pub async fn send_heartbeat_after_rebalance(&self, timeout_millis: i64) -> usize {
+        self.send_heartbeat_round(true, timeout_millis).await
+    }
+
+    async fn send_heartbeat_round(&self, is_rebalance: bool, timeout_millis: i64) -> usize {
         if !self.has_registration() {
             return 0;
         }
-        let heartbeat_data = self.prepare_heartbeat_data();
+        if !self.is_use_heartbeat_v2() {
+            let heartbeat_data = self.prepare_heartbeat_data();
+            let mut ok = 0usize;
+            for addr in self.get_all_broker_addrs() {
+                match self
+                    .send_heartbeat(&addr, &heartbeat_data, timeout_millis)
+                    .await
+                {
+                    Ok(()) => ok += 1,
+                    Err(e) => rmq_debug!("heartbeat to {addr} failed: {e}"),
+                }
+            }
+            return ok;
+        }
+
+        let mut with_sub = self.prepare_heartbeat_data();
+        let fingerprint = with_sub.compute_heartbeat_fingerprint();
+        with_sub.heartbeat_fingerprint = fingerprint;
+        // The clone keeps the field just set: the cheap body is only valid because it carries the
+        // **full** body's fingerprint, since recomputing over a subscription-stripped body
+        // deliberately differs and would tell the broker "subscriptions changed" every round.
+        let without_sub = with_sub.without_sub_copy();
+        if is_rebalance {
+            self.reset_broker_addr_heartbeat_fingerprint_table();
+        }
         let mut ok = 0usize;
         for addr in self.get_all_broker_addrs() {
-            match self
-                .send_heartbeat(&addr, &heartbeat_data, timeout_millis)
+            if self
+                .send_heartbeat_to_broker_v2(
+                    &addr,
+                    &with_sub,
+                    &without_sub,
+                    fingerprint,
+                    timeout_millis,
+                )
                 .await
             {
-                Ok(()) => ok += 1,
-                Err(e) => rmq_debug!("heartbeat to {addr} failed: {e}"),
+                ok += 1;
             }
         }
         ok
+    }
+
+    /// One broker over the fingerprint path; returns whether the beat was accepted.
+    ///
+    /// A broker already known to speak the protocol **and** still holding our fingerprint gets the
+    /// subscription-free body; if it then answers `IS_SUB_CHANGE` (its per-group table moved under
+    /// our feet, e.g. another instance of the same group registered different subscriptions) the
+    /// fingerprint is forgotten so the next round re-sends everything. Anything else sends the full
+    /// body, and only a `IS_SUPPORT_HEART_BEAT_V2` answer earns the address a place in the tables.
+    async fn send_heartbeat_to_broker_v2(
+        &self,
+        addr: &str,
+        with_sub: &HeartbeatData,
+        without_sub: &HeartbeatData,
+        fingerprint: i32,
+        timeout_millis: i64,
+    ) -> bool {
+        let simple_round = {
+            let support = self
+                .inner
+                .broker_support_v2_heartbeat_set
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let table = self
+                .inner
+                .broker_addr_heartbeat_fingerprint_table
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            support.contains(addr) && table.get(addr) == Some(&fingerprint)
+        };
+        let (body, sent_simple) = if simple_round {
+            (without_sub, true)
+        } else {
+            (with_sub, false)
+        };
+        let result = match self.send_heartbeat_v2(addr, body, timeout_millis).await {
+            Ok(r) => r,
+            Err(e) => {
+                rmq_debug!("heartbeatV2 to {addr} failed: {e}");
+                return false;
+            }
+        };
+        let mut support = self
+            .inner
+            .broker_support_v2_heartbeat_set
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut table = self
+            .inner
+            .broker_addr_heartbeat_fingerprint_table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if sent_simple {
+            if result.sub_change {
+                table.remove(addr);
+            }
+        } else if result.support_v2 {
+            support.insert(addr.to_string());
+            if result.sub_change {
+                table.remove(addr);
+            } else {
+                table.insert(addr.to_string(), fingerprint);
+            }
+        }
+        rmq_debug!(
+            "heartbeatV2 {} to {addr} supportV2={} subChange={}",
+            if sent_simple { "simple" } else { "normal" },
+            result.support_v2,
+            result.sub_change
+        );
+        true
     }
 
     /// Beat as soon as the route cache shows a broker set the registration has not reached
@@ -3278,7 +3434,7 @@ impl MQClientInstance {
         };
         request.set_body(Some(body.encode()));
         let response = self
-            .invoke_sync(broker_addr, &mut request, timeout_millis)
+            .invoke_broker_sync(broker_addr, &mut request, timeout_millis)
             .await?;
         if response.code != response_code::SUCCESS {
             return Err(Error::client_with_code(
@@ -3603,7 +3759,9 @@ impl MQClientInstance {
             request_code::GET_CONSUMER_LIST_BY_GROUP,
             Some(Box::new(header)),
         );
-        let response = self.invoke_sync(addr, &mut request, timeout_millis).await?;
+        let response = self
+            .invoke_broker_sync(addr, &mut request, timeout_millis)
+            .await?;
         Self::check_response(&response)?;
         match response.body.as_deref() {
             Some(body) if !body.is_empty() => Ok(GetConsumerListByGroupResponseBody::decode(body)?),
@@ -4803,6 +4961,18 @@ mod tests {
                 Ok(l) => l,
                 Err(e) => panic!("bind mock broker: {e}"),
             };
+            Self::serve(listener).await
+        }
+
+        /// Binds exactly this loopback port, or None when it is already taken. The VIP cases need
+        /// two listeners whose ports differ by exactly 2, and an ephemeral bind cannot promise
+        /// that relationship.
+        async fn try_start_at(port: u16) -> Option<Arc<MockBroker>> {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.ok()?;
+            Some(Self::serve(listener).await)
+        }
+
+        async fn serve(listener: tokio::net::TcpListener) -> Arc<MockBroker> {
             let addr = match listener.local_addr() {
                 Ok(a) => a.to_string(),
                 Err(e) => panic!("mock broker addr: {e}"),
@@ -5371,6 +5541,201 @@ mod tests {
 
         instance.unregister_producer(PG);
         assert_eq!(instance.prepare_heartbeat_data().producer_data_set.len(), 0);
+        instance.shutdown();
+    }
+
+    /// The two response ext fields a V2-capable broker answers with.
+    fn v2_ext(support: bool, sub_change: bool) -> Vec<(String, String)> {
+        let mut ext = Vec::new();
+        if support {
+            ext.push((
+                crate::common::mix_all::MixAll::IS_SUPPORT_HEART_BEAT_V2.to_string(),
+                "true".to_string(),
+            ));
+        }
+        if sub_change {
+            ext.push((
+                crate::common::mix_all::MixAll::IS_SUB_CHANGE.to_string(),
+                "true".to_string(),
+            ));
+        }
+        ext
+    }
+
+    /// One broker, one subscribed consumer, and the fingerprint path switched on.
+    fn v2_instance(broker: &MockBroker) -> MQClientInstance {
+        let instance = instance_with_sub(broker, vec![tag_sub(TOPIC, "*", &ExpressionType::TAG.to_string())]);
+        instance.set_use_heartbeat_v2(true);
+        instance
+    }
+
+    /// Bodies of the beats that reached `broker`, oldest first.
+    fn beaten(broker: &MockBroker) -> Vec<HeartbeatData> {
+        broker
+            .recorded(request_code::HEART_BEAT)
+            .into_iter()
+            .map(|r| HeartbeatData::decode(&r.body).expect("heartbeat body is a HeartbeatData"))
+            .collect()
+    }
+
+    /// Off (the default) the beat is the legacy one: fingerprint 0 and the subscriptions inline.
+    /// This is the control for every assertion below -- a round that claims to simplify without
+    /// the switch would silently de-register the group on a broker holding the V1 path.
+    #[tokio::test]
+    async fn heartbeat_v2_off_keeps_the_legacy_body() {
+        let broker = MockBroker::start().await;
+        let instance = instance_with_sub(&broker, vec![tag_sub(TOPIC, "*", &ExpressionType::TAG.to_string())]);
+        assert!(!instance.is_use_heartbeat_v2(), "the switch is opt-in");
+        assert_eq!(instance.send_heartbeat_to_all_broker(3000).await, 1);
+        let beats = beaten(&broker);
+        assert_eq!(beats.len(), 1);
+        assert_eq!(beats[0].heartbeat_fingerprint, 0, "no fingerprint on the V1 body");
+        assert!(!beats[0].without_sub);
+        assert_eq!(beats[0].consumer_data_set[0].subscription_data_set.len(), 1);
+        instance.shutdown();
+    }
+
+    /// A broker that answers plain SUCCESS (no ext fields) never enters the tables, so every round
+    /// keeps the full body -- the fingerprint is on the wire, but the subscription set is never
+    /// dropped. That is what lets a pre-V2 broker keep working.
+    #[tokio::test]
+    async fn heartbeat_v2_full_body_until_the_broker_answers_it_understands() {
+        let broker = MockBroker::start().await;
+        let instance = v2_instance(&broker);
+        assert_eq!(instance.send_heartbeat_to_all_broker(3000).await, 1);
+        assert_eq!(instance.send_heartbeat_to_all_broker(3000).await, 1);
+        let beats = beaten(&broker);
+        assert_eq!(beats.len(), 2);
+        assert_ne!(beats[0].heartbeat_fingerprint, 0, "the switch is on the wire");
+        for hb in &beats {
+            assert!(!hb.without_sub, "a broker that never said V2 keeps the subscriptions");
+            assert_eq!(hb.consumer_data_set[0].subscription_data_set.len(), 1);
+        }
+        assert_eq!(
+            instance
+                .inner
+                .broker_support_v2_heartbeat_set
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            0,
+            "plain SUCCESS is not a V2 answer"
+        );
+        instance.shutdown();
+    }
+
+    /// Once the broker says `IS_SUPPORT_HEART_BEAT_V2` and the fingerprint is unchanged, the next
+    /// round is the cheap body -- and it must carry the **full** body's fingerprint, not a
+    /// recomputed one.
+    #[tokio::test]
+    async fn heartbeat_v2_drops_subscriptions_once_remembered() {
+        let broker = MockBroker::start().await;
+        broker.script_resp_ext(vec![v2_ext(true, false)]);
+        let instance = v2_instance(&broker);
+        assert_eq!(instance.send_heartbeat_to_all_broker(3000).await, 1);
+        assert_eq!(instance.send_heartbeat_to_all_broker(3000).await, 1);
+        let beats = beaten(&broker);
+        let full = &beats[0];
+        let light = &beats[1];
+        assert!(!full.without_sub);
+        assert_eq!(full.consumer_data_set[0].subscription_data_set.len(), 1);
+        assert!(light.without_sub, "second round is the cheap body");
+        assert!(
+            light.consumer_data_set[0].subscription_data_set.is_empty(),
+            "the subscription set is what the cheap body drops"
+        );
+        assert_eq!(
+            light.heartbeat_fingerprint, full.heartbeat_fingerprint,
+            "the cheap body carries the full body's fingerprint -- recomputing it would claim a change"
+        );
+        instance.shutdown();
+    }
+
+    /// `IS_SUB_CHANGE` on a cheap round means the broker's per-group table moved under this
+    /// client, so the remembered fingerprint is dropped and the subscriptions go out again.
+    #[tokio::test]
+    async fn heartbeat_v2_sub_change_redelivers_subscriptions() {
+        let broker = MockBroker::start().await;
+        broker.script_resp_ext(vec![
+            v2_ext(true, false),
+            v2_ext(true, true),
+            v2_ext(true, false),
+        ]);
+        let instance = v2_instance(&broker);
+        for _ in 0..3 {
+            assert_eq!(instance.send_heartbeat_to_all_broker(3000).await, 1);
+        }
+        let beats = beaten(&broker);
+        assert!(!beats[0].without_sub, "full body learns the broker speaks V2");
+        assert!(beats[1].without_sub, "fingerprint matched, so the cheap body went out");
+        assert!(
+            !beats[2].without_sub,
+            "subChange evicted the fingerprint, so the subscriptions went back out"
+        );
+        instance.shutdown();
+    }
+
+    /// A new subscription changes the fingerprint, so the broker is handed the full body again
+    /// without waiting for any explicit reset.
+    #[tokio::test]
+    async fn heartbeat_v2_new_subscription_forces_the_full_body() {
+        let broker = MockBroker::start().await;
+        broker.script_resp_ext(vec![v2_ext(true, false); 8]);
+        let instance = v2_instance(&broker);
+        assert_eq!(instance.send_heartbeat_to_all_broker(3000).await, 1);
+        assert_eq!(instance.send_heartbeat_to_all_broker(3000).await, 1);
+        let before = beaten(&broker);
+        assert!(before[1].without_sub, "warm baseline: the cheap body is in use");
+
+        instance.register_consumer(
+            "GID_second_group",
+            StubConsumer::with_subs("GID_second_group", vec![tag_sub(TOPIC, "tagB", &ExpressionType::TAG.to_string())]),
+        );
+        assert_eq!(instance.send_heartbeat_to_all_broker(3000).await, 1);
+        let after = beaten(&broker);
+        assert!(
+            !after[2].without_sub,
+            "a different subscription set is a different fingerprint"
+        );
+        assert_ne!(
+            after[2].heartbeat_fingerprint, before[0].heartbeat_fingerprint,
+            "the fingerprint identifies the subscriptions, not the client"
+        );
+        instance.shutdown();
+    }
+
+    /// A queue-allocation change takes the rebalance round, which forgets the fingerprints first so
+    /// every broker is handed the subscriptions again; the "this broker speaks V2" knowledge
+    /// survives because it is a property of the broker, not of the round.
+    #[tokio::test]
+    async fn heartbeat_v2_rebalance_round_redelivers_subscriptions() {
+        let broker = MockBroker::start().await;
+        broker.script_resp_ext(vec![v2_ext(true, false); 4]);
+        let instance = v2_instance(&broker);
+        assert_eq!(instance.send_heartbeat_to_all_broker(3000).await, 1);
+        assert_eq!(instance.send_heartbeat_to_all_broker(3000).await, 1);
+        assert!(beaten(&broker)[1].without_sub, "warm baseline");
+        assert_eq!(instance.send_heartbeat_after_rebalance(3000).await, 1);
+        let beats = beaten(&broker);
+        assert!(
+            !beats[2].without_sub,
+            "the rebalance round must not send the cheap body"
+        );
+        assert_eq!(
+            instance
+                .inner
+                .broker_support_v2_heartbeat_set
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            1,
+            "the broker is still known to speak the protocol"
+        );
+        assert_eq!(instance.send_heartbeat_to_all_broker(3000).await, 1);
+        assert!(
+            beaten(&broker)[3].without_sub,
+            "and the round after it is cheap again"
+        );
         instance.shutdown();
     }
 
@@ -6177,5 +6542,354 @@ mod tests {
             .recorded(request_code::QUERY_CONSUMER_OFFSET)
             .is_empty());
         instance2.shutdown();
+    }
+
+    // ---------------- VIP channel: the per-request broker address rewrite ----------------
+
+    /// Two listeners whose ports differ by exactly 2: the address a name server advertises, and
+    /// the fast-channel port derived from it. Only the landing listener proves which port a
+    /// request really used, so the pair has to be real sockets rather than bookkeeping.
+    async fn vip_pair() -> (Arc<MockBroker>, Arc<MockBroker>) {
+        for _ in 0..64 {
+            let port = {
+                let Ok(probe) = tokio::net::TcpListener::bind("127.0.0.1:0").await else {
+                    continue;
+                };
+                let Ok(local) = probe.local_addr() else {
+                    continue;
+                };
+                drop(probe);
+                local.port()
+            };
+            let Some(fast) = MockBroker::try_start_at(port - 2).await else {
+                continue;
+            };
+            if let Some(route) = MockBroker::try_start_at(port).await {
+                return (route, fast);
+            }
+        }
+        panic!("could not bind a loopback port pair (p, p-2) for the VIP channel cases");
+    }
+
+    /// An instance whose route and publish tables both carry the plain port, with the switch set
+    /// before any request goes out. No name server is needed: the tables are seeded directly.
+    fn vip_instance(route_addr: &str, on: bool) -> MQClientInstance {
+        let instance = instance_against(route_addr);
+        seed_route(&instance, TOPIC, BROKER, route_addr);
+        instance.seed_publish_addr_for_test(BROKER, route_addr);
+        instance.register_producer("GID_vip");
+        instance.set_vip_channel_enabled(on);
+        instance
+    }
+
+    /// One request of every family member, addressed at `route_addr` (the port the route
+    /// advertises). Outcomes are ignored on purpose: the landing listener is the observation, and
+    /// a scripted SUCCESS is not a decodable answer for every operation.
+    async fn drive_every_broker_rpc(instance: &MQClientInstance, route_addr: &str) {
+        let mq = MessageQueue::new(TOPIC, BROKER, 0);
+        let mqs = vec![mq.clone()];
+        let sub = tag_sub(TOPIC, "*", &ExpressionType::TAG.to_string());
+        let extra = crate::remoting::protocol::extra_info::build_extra_info(
+            1,
+            2,
+            3,
+            0,
+            TOPIC,
+            BROKER,
+            0,
+            None,
+        );
+
+        let _ = instance
+            .query_consumer_offset(GROUP, &mq, 3000, Some(route_addr), false)
+            .await;
+        let _ = instance
+            .update_consumer_offset(GROUP, &mq, 7, 3000, Some(route_addr))
+            .await;
+        let _ = instance.get_max_offset(&mq, 3000, Some(route_addr)).await;
+        let _ = instance.get_min_offset(&mq, 3000, Some(route_addr)).await;
+        let _ = instance
+            .search_offset_by_boundary(&mq, 1234, None, 3000, Some(route_addr))
+            .await;
+        let _ = instance
+            .get_earliest_msg_store_time(&mq, 3000, Some(route_addr))
+            .await;
+        let _ = instance
+            .get_consumer_list_by_group(GROUP, 3000, Some(route_addr))
+            .await;
+        let _ = instance.lock_batch_mq(GROUP, "cid", &mqs, 3000).await;
+        let _ = instance.unlock_batch_mq(GROUP, "cid", &mqs, 3000).await;
+        let _ = instance
+            .check_client_config(route_addr, GROUP, "cid", &sub, 3000)
+            .await;
+        let _ = instance
+            .create_topic_in_broker(
+                route_addr,
+                MixAll::DEFAULT_TOPIC,
+                TOPIC,
+                1,
+                1,
+                6,
+                0,
+                TopicFilterType::SINGLE_TAG,
+                false,
+                None,
+                3000,
+                1,
+            )
+            .await;
+        let _ = instance.delete_topic_in_broker(route_addr, TOPIC, 3000).await;
+        let _ = instance
+            .query_message(TOPIC, "key", 1, 0, 1, 3000, Some(route_addr), None, false)
+            .await;
+
+        // The traffic that must never move: registration, the pull and the pop family.
+        let _ = instance.send_heartbeat_to_all_broker(3000).await;
+        let _ = instance
+            .pull_message(
+                GROUP,
+                &mq,
+                0,
+                32,
+                0,
+                0,
+                "*",
+                0,
+                "TAG",
+                3000,
+                -1,
+                15000,
+                Some(route_addr),
+                0,
+                None,
+            )
+            .await;
+        let _ = instance
+            .pop_message(
+                GROUP,
+                TOPIC,
+                0,
+                1,
+                30000,
+                1000,
+                0,
+                None,
+                None,
+                false,
+                Some(BROKER),
+                3000,
+                Some(route_addr),
+            )
+            .await;
+        let _ = instance
+            .ack_message(GROUP, TOPIC, 0, &extra, 1, Some(BROKER), 3000, Some(route_addr))
+            .await;
+        let _ = instance
+            .change_invisible_time(
+                GROUP,
+                TOPIC,
+                0,
+                &extra,
+                1,
+                3000,
+                Some(BROKER),
+                3000,
+                Some(route_addr),
+            )
+            .await;
+        let _ = instance
+            .unregister_client(route_addr, "cid", GROUP, GROUP, 3000)
+            .await;
+    }
+
+    /// The request codes the rewrite moves, and the broker traffic it must leave alone.
+    const MOVED: [i32; 13] = [
+        request_code::QUERY_CONSUMER_OFFSET,
+        request_code::UPDATE_CONSUMER_OFFSET,
+        request_code::GET_MAX_OFFSET,
+        request_code::GET_MIN_OFFSET,
+        request_code::SEARCH_OFFSET_BY_TIMESTAMP,
+        request_code::GET_EARLIEST_MSG_STORETIME,
+        request_code::GET_CONSUMER_LIST_BY_GROUP,
+        request_code::LOCK_BATCH_MQ,
+        request_code::UNLOCK_BATCH_MQ,
+        request_code::CHECK_CLIENT_CONFIG,
+        request_code::UPDATE_AND_CREATE_TOPIC,
+        request_code::DELETE_TOPIC_IN_BROKER,
+        request_code::QUERY_MESSAGE,
+    ];
+
+    const NEVER_MOVED: [i32; 6] = [
+        request_code::HEART_BEAT,
+        request_code::PULL_MESSAGE,
+        request_code::POP_MESSAGE,
+        request_code::ACK_MESSAGE,
+        request_code::CHANGE_MESSAGE_INVISIBLETIME,
+        request_code::UNREGISTER_CLIENT,
+    ];
+
+    /// On, the whole moved family is dialled two ports below the advertised one and the never-
+    /// moved family keeps the advertised port -- so each direction only passes if both halves of
+    /// the allow-list are right. The route cache keeps carrying the plain port throughout: the
+    /// rewrite is per request, never a rewrite of what the name server published.
+    #[tokio::test]
+    async fn vip_channel_moves_the_broker_rpc_family_and_only_that_one() {
+        let (route, fast) = vip_pair().await;
+        let instance = vip_instance(&route.addr, true);
+        drive_every_broker_rpc(&instance, &route.addr).await;
+
+        for code in MOVED {
+            assert_eq!(
+                fast.recorded(code).len(),
+                1,
+                "request {code} must arrive at port - 2"
+            );
+            assert!(
+                route.recorded(code).is_empty(),
+                "request {code} must not also reach the listening port"
+            );
+        }
+        for code in NEVER_MOVED {
+            assert_eq!(
+                route.recorded(code).len(),
+                1,
+                "request {code} must keep the listening port"
+            );
+            assert!(
+                fast.recorded(code).is_empty(),
+                "request {code} must never reach port - 2"
+            );
+        }
+
+        let cached = guard(&instance.inner.tables)
+            .topic_route_table
+            .get(TOPIC)
+            .expect("the seeded route stays cached")
+            .clone();
+        assert_eq!(
+            cached.get_broker_datas()[0]
+                .broker_addrs
+                .iter()
+                .find(|(id, _)| *id == MixAll::MASTER_ID as i64)
+                .expect("the master address stays in the cached route")
+                .1,
+            route.addr,
+            "the cached route is never rewritten, only each request"
+        );
+        instance.shutdown();
+    }
+
+    /// Off (the default) not one request is moved: the same driver, the same two listeners, and
+    /// every code lands on the advertised port. This is the control for the case above -- a client
+    /// that always subtracted 2 would pass it and fail nothing.
+    #[tokio::test]
+    async fn vip_channel_off_leaves_every_broker_address_alone() {
+        let (route, fast) = vip_pair().await;
+        let instance = vip_instance(&route.addr, false);
+        assert!(!instance.is_vip_channel_enabled(), "the switch is opt-in");
+        drive_every_broker_rpc(&instance, &route.addr).await;
+
+        for code in MOVED.iter().chain(NEVER_MOVED.iter()) {
+            assert_eq!(
+                route.recorded(*code).len(),
+                1,
+                "with the switch off request {code} must use the listening port"
+            );
+            assert!(
+                fast.recorded(*code).is_empty(),
+                "with the switch off request {code} must not reach port - 2"
+            );
+        }
+        assert_eq!(instance.vip_addr(&route.addr), route.addr, "off leaves the address untouched");
+        instance.shutdown();
+    }
+
+    /// The administration facade over the same two-port harness. Three behaviours are pinned at
+    /// once: the broker-wide read it issues itself moves; the offset / consumer-list reads it
+    /// delegates to its own client instance move too, which only happens if the switch reached
+    /// that instance; and the read of a broker's own configuration stays on the listening port
+    /// whatever the switch says, because that RPC is answered there and nowhere else.
+    #[tokio::test]
+    async fn admin_broker_reads_move_except_the_broker_config_read() {
+        use crate::client::admin::DefaultMQAdminExt;
+
+        let (route, fast) = vip_pair().await;
+        let admin = DefaultMQAdminExt::new();
+        admin.set_instance_name(&format!("ADMIN_vip_{}", SEQ.fetch_add(1, Ordering::Relaxed)));
+        admin.set_name_server_addresses(&[route.addr.clone()]);
+        admin.set_timeout_millis(3000);
+        admin.set_vip_channel_enabled(true);
+        admin.start().await.expect("the fake broker answers the start handshake");
+        let mq = MessageQueue::new(TOPIC, BROKER, 0);
+
+        let _ = admin.fetch_broker_runtime_stats(&route.addr, None).await;
+        let _ = admin.update_consumer_offset_to_broker(&route.addr, GROUP, &mq, 7).await;
+        let _ = admin.get_consumer_list_by_group(GROUP, Some(route.addr.as_str())).await;
+        let _ = admin.get_broker_config(&route.addr, None).await;
+
+        assert_eq!(
+            fast.recorded(request_code::GET_BROKER_RUNTIME_INFO).len(),
+            1,
+            "an admin read of the broker's runtime info arrives at port - 2"
+        );
+        assert!(
+            route
+                .recorded(request_code::GET_BROKER_RUNTIME_INFO)
+                .is_empty(),
+            "and not at the listening port as well"
+        );
+        assert_eq!(
+            fast.recorded(request_code::UPDATE_CONSUMER_OFFSET).len(),
+            1,
+            "the delegated offset write follows the switch"
+        );
+        assert_eq!(
+            fast.recorded(request_code::GET_CONSUMER_LIST_BY_GROUP).len(),
+            1,
+            "the delegated consumer list follows the switch"
+        );
+        assert_eq!(
+            route.recorded(request_code::GET_BROKER_CONFIG).len(),
+            1,
+            "the broker's own configuration read keeps the listening port"
+        );
+        assert!(
+            fast.recorded(request_code::GET_BROKER_CONFIG).is_empty(),
+            "the fast channel does not serve that read"
+        );
+
+        // Flipping the switch off after start(): the delegated family has to go back to the
+        // listening port, which a setter that only touches the admin's own config would miss.
+        admin.set_vip_channel_enabled(false);
+        let _ = admin.update_consumer_offset_to_broker(&route.addr, GROUP, &mq, 8).await;
+        let _ = admin.get_consumer_list_by_group(GROUP, Some(route.addr.as_str())).await;
+        let _ = admin.fetch_broker_runtime_stats(&route.addr, None).await;
+        let _ = admin.get_broker_config(&route.addr, None).await;
+
+        assert_eq!(
+            route.recorded(request_code::UPDATE_CONSUMER_OFFSET).len(),
+            1,
+            "the delegated offset write returns to the listening port"
+        );
+        assert_eq!(
+            route.recorded(request_code::GET_CONSUMER_LIST_BY_GROUP).len(),
+            1,
+            "the delegated consumer list returns to the listening port"
+        );
+        assert_eq!(
+            route.recorded(request_code::GET_BROKER_RUNTIME_INFO).len(),
+            1,
+            "the admin's own read follows the switch off as well"
+        );
+        assert_eq!(
+            route.recorded(request_code::GET_BROKER_CONFIG).len(),
+            2,
+            "the configuration read never moved, in either state"
+        );
+        assert!(
+            fast.recorded(request_code::GET_BROKER_CONFIG).is_empty(),
+            "and never reached port - 2"
+        );
+        admin.shutdown();
     }
 }

@@ -116,6 +116,8 @@ void DefaultMQPullConsumer::start() {
                                         consumerPullTimeoutMillis_,
                                         MQClientInstance::tlsEnabledFromEnv(), unitName_,
                                         pollNameServerIntervalMillis_));
+    // Broker VIP channel: forwarded to the instance that owns the broker RPCs (off = plain address).
+    mqClient_->setVipChannelEnabled(vipChannelEnabled_);
     std::shared_ptr<RPCHook> requestHook =
         composeRequestHooks(enableStreamRequestType_, rpcHook_,
                             [this] { return namespaceV2_; });
@@ -435,8 +437,11 @@ int64_t DefaultMQPullConsumer::earliestMsgStoreTime(const MessageQueue& mq) {
     ext["topic"] = mq.topic;
     ext["queueId"] = std::to_string(mq.queueId);
     ext["brokerName"] = mq.brokerName;
+    // GET_EARLIEST_MSG_STORETIME belongs to the offset family the VIP switch rewrites; the shifted
+    // address is computed here at the invoke boundary and never stored back into addr.
     const RemotingCommand response = mqClient_->invokeSync(
-        addr, RequestCode::GET_EARLIEST_MSG_STORETIME, ext, Bytes(), false, 5000);
+        MixAll::brokerVipChannel(mqClient_->isVipChannelEnabled(), addr),
+        RequestCode::GET_EARLIEST_MSG_STORETIME, ext, Bytes(), false, 5000);
     return extInt(response, "timestamp", 0);
 }
 
@@ -458,7 +463,10 @@ void DefaultMQPullConsumer::sendMessageBack(const MessageExt& msg, int32_t delay
     header->maxReconsumeTimes = std::nullopt;
     RemotingCommand request =
         RemotingCommand::createRequestCommand(RequestCode::CONSUMER_SEND_MSG_BACK, header);
-    const RemotingCommand response = mqClient_->remotingClient().invokeSync(addr, request, 5000);
+    // CONSUMER_SEND_MSG_BACK is a broker write the VIP switch rewrites; applied per request here,
+    // the shifted address is never cached.
+    const RemotingCommand response = mqClient_->remotingClient().invokeSync(
+        MixAll::brokerVipChannel(mqClient_->isVipChannelEnabled(), addr), request, 5000);
     if (response.code != ResponseCode::SUCCESS) {
         throw MQBrokerException(response.code, response.remark);
     }

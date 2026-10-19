@@ -5,7 +5,7 @@ declare(strict_types=1);
 /**
  * Remoting layer pure-PHP assert-style self-test (no phpunit dependency).
  *
- * Run: C:/Users/zhaoh/.workbuddy/binaries/php/versions/8.3/php.exe tests/RunRemoting.php
+ * Run: php tests/RunRemoting.php
  * On success prints "ALL TESTS PASSED (N checks)"; any failure lists details and exits non-zero.
  */
 
@@ -35,6 +35,7 @@ use RocketMQ\Remoting\Protocol\ExtraInfoUtil;
 use RocketMQ\Remoting\Protocol\FastJsonDecodeError;
 use RocketMQ\Remoting\Protocol\GetRouteInfoRequestHeader;
 use RocketMQ\Remoting\Protocol\HeartbeatData;
+use RocketMQ\Remoting\Protocol\HeartbeatV2Result;
 use RocketMQ\Remoting\Protocol\LanguageCode;
 use RocketMQ\Remoting\Protocol\NamespaceUtil;
 use RocketMQ\Remoting\Protocol\NotifyConsumerIdsChangedRequestHeader;
@@ -571,8 +572,8 @@ final class RunRemoting
 
         $obj = $hb->toDict();
         $this->checkSame('cid-php-1', $obj['clientID'], 'HeartbeatData.clientID key name');
-        $this->checkSame(0, $obj['heartbeatFingerprint'], 'heartbeatFingerprint always 0 (V1 registration path)');
-        $this->checkSame(false, $obj['withoutSub'], 'withoutSub always false');
+        $this->checkSame(0, $obj['heartbeatFingerprint'], 'an unstamped body reports fingerprint 0 (the legacy registration path)');
+        $this->checkSame(false, $obj['withoutSub'], 'a body that reports its subscriptions leaves withoutSub false');
         $this->checkSame('GID-c', $obj['consumerDataSet'][0]['groupName'], 'ConsumerData.groupName');
         $this->checkSame('CLUSTERING', $obj['consumerDataSet'][0]['messageModel'], 'ConsumerData.messageModel');
         $this->checkSame('*', $obj['consumerDataSet'][0]['subscriptionDataSet'][0]['subString'], 'subscriptionDataSet goes through toDict');
@@ -584,6 +585,78 @@ final class RunRemoting
         $this->checkSame('*', $back->consumerDataSet[0]->subscriptionDataSet[0]->subString ?? '', 'HeartbeatData roundtrip subscription');
         $this->checkSame(42, $back->consumerDataSet[0]->subscriptionDataSet[0]->subVersion ?? 0, 'HeartbeatData roundtrip subVersion');
         $this->checkSame('GID-p', $back->producerDataSet[0]->groupName ?? '', 'HeartbeatData roundtrip producerDataSet');
+        $this->checkSame(0, $back->heartbeatFingerprint, 'HeartbeatData roundtrip heartbeatFingerprint');
+        $this->checkSame(false, $back->withoutSub, 'HeartbeatData roundtrip withoutSub');
+    }
+
+    /**
+     * The two body shapes of the fingerprint path and the response fields that decide between
+     * them. The value only ever has to be stable **inside this client** (it is compared with its
+     * own history), so what matters here is which changes move it and which must not.
+     */
+    private function testHeartbeatFingerprint(): void
+    {
+        $build = static function (string $tag, int $subVersion): HeartbeatData {
+            $data = new HeartbeatData('cid-fp');
+            $data->producerDataSet[] = new ProducerData('GID-p');
+            $cd = new ConsumerData('GID-c');
+            $sub = new SubscriptionData('TopicFp', $tag);
+            $sub->subVersion = $subVersion;
+            $cd->subscriptionDataSet[] = $sub;
+            $data->consumerDataSet[] = $cd;
+            return $data;
+        };
+
+        $fp = $build('tagA', 1000)->computeFingerprint();
+        $this->check($fp !== 0, 'a subscription-bearing body hashes to a non-zero fingerprint');
+        $this->checkSame($fp, $build('tagA', 999999)->computeFingerprint(),
+            'a subVersion timestamp that moved on does not change the fingerprint');
+        $this->checkSame($fp, $build('tagA', 1000)->computeFingerprint(),
+            'the same content always hashes the same');
+        $this->check($fp !== $build('tagB', 1000)->computeFingerprint(),
+            'a different subscription expression is a different fingerprint');
+
+        $otherClient = $build('tagA', 1000);
+        $otherClient->clientId = 'cid-another-instance';
+        $this->checkSame($fp, $otherClient->computeFingerprint(),
+            'the clientId is blanked out: one group spread over instances shares one fingerprint');
+
+        $full = $build('tagA', 1000);
+        $full->heartbeatFingerprint = $fp;
+        $light = $full->withoutSubCopy();
+        $this->checkSame($fp, $light->heartbeatFingerprint,
+            'the stripped body carries the full body stamp, never a recomputed one');
+        $this->checkSame(true, $light->withoutSub, 'the stripped body marks itself withoutSub');
+        $this->checkSame('cid-fp', $light->clientId, 'the stripped body keeps the clientId');
+        $this->checkSame(['GID-p'], array_map(static fn($p) => $p->groupName, $light->producerDataSet),
+            'the stripped body keeps the producer groups');
+        $this->checkSame(['GID-c'], array_map(static fn($c) => $c->groupName, $light->consumerDataSet),
+            'the stripped body keeps the consumer groups');
+        $this->checkSame([], $light->consumerDataSet[0]->subscriptionDataSet,
+            'the stripped body drops the subscription sets');
+        $this->check($light->computeFingerprint() !== $fp,
+            'recomputing over a subscription-free body gives a different value -- the reason the stamp is copied');
+
+        $lightBack = HeartbeatData::decode($light->encode());
+        $this->checkSame($fp, $lightBack->heartbeatFingerprint, 'the stamped fingerprint survives encode/decode');
+        $this->checkSame(true, $lightBack->withoutSub, 'withoutSub survives encode/decode');
+
+        $supported = HeartbeatV2Result::fromResponse(7, [
+            MixAll::IS_SUPPORT_HEART_BEAT_V2 => 'true',
+            MixAll::IS_SUB_CHANGE => 'false',
+        ]);
+        $this->checkSame(7, $supported->version, 'the response version is read off the header');
+        $this->checkSame(true, $supported->supportV2, 'IS_SUPPORT_HEART_BEAT_V2=true earns the broker a place in the table');
+        $this->checkSame(false, $supported->subChange, 'IS_SUB_CHANGE=false keeps the remembered fingerprint');
+
+        $plain = HeartbeatV2Result::fromResponse(0, []);
+        $this->checkSame(false, $plain->supportV2, 'a response without the fields is a broker that does not know them');
+        $this->checkSame(false, $plain->subChange, 'a missing IS_SUB_CHANGE is not a change');
+
+        $shouting = HeartbeatV2Result::fromResponse(0, [MixAll::IS_SUPPORT_HEART_BEAT_V2 => 'TRUE']);
+        $this->checkSame(true, $shouting->supportV2, 'the flag is parsed case-insensitively');
+        $this->checkSame(false, HeartbeatV2Result::fromResponse(0, [MixAll::IS_SUPPORT_HEART_BEAT_V2 => '1'])->supportV2,
+            'only the literal true counts; a broker sending 1 is not read as support');
     }
 
     // ==================================================================== ExtraInfo / Namespace
@@ -1169,6 +1242,7 @@ final class RunRemoting
         $this->testNamespaceRpcHook();
         $this->testRouteDecode();
         $this->testHeartbeat();
+        $this->testHeartbeatFingerprint();
         $this->testExtraInfoAndNamespace();
         $this->testFastjsonParser();
         $this->testTcpEndToEnd();

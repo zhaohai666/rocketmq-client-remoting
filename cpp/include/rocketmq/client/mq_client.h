@@ -97,6 +97,14 @@ public:
     // Route refresh interval held by this instance (offline / live-broker tests assert the facade forwards it).
     int32_t pollNameServerIntervalMillis() const { return pollNameServerIntervalMillis_; }
 
+    // Broker VIP channel: when true every broker-facing request in the rewritten family (message
+    // sends, offset query/update, queue locks, CHECK_CLIENT_CONFIG, GET_CONSUMER_LIST_BY_GROUP,
+    // CONSUMER_SEND_MSG_BACK, QUERY_MESSAGE, create/delete topic) is sent to port - 2 of the route
+    // address (10911 -> 10909). Off (default) leaves the address unchanged. Name-server requests and
+    // the pull/pop/ack/heartbeat/unregister family are never affected by this switch.
+    void setVipChannelEnabled(bool enable) { vipChannelEnabled_ = enable; }
+    bool isVipChannelEnabled() const { return vipChannelEnabled_; }
+
     DefaultTopAddressing& topAddressing() { return topAddressing_; }
     void fetchNameServerAddr();
 
@@ -372,6 +380,10 @@ private:
     std::string brokerAddr(const MessageQueue& mq);
     std::string publishAddrInAdmin(const MessageQueue& mq);
     std::string consumerOffsetAddr(const MessageQueue& mq);
+    // Target address of a broker request in the rewritten family: port - 2 when the VIP switch is on,
+    // otherwise the address unchanged. Name-server addresses must never be passed here. The value is
+    // computed per request at the invoke boundary; a shifted address is never cached.
+    std::string vipAddr(const std::string& addr) const;
     RemotingCommand invokeSyncOnAddr(const std::string& addr, RemotingCommand& request,
                                      int32_t timeoutMillis);
     void routeRefreshLoop();
@@ -397,6 +409,7 @@ private:
     // Topics in use (subscribed by consumers + sent by producers), routes refreshed by the periodic task
     std::set<std::string> topicsInUse_;
     bool tlsEnable_ = false;
+    bool vipChannelEnabled_ = false;
     TlsOptions tlsOptions_;
     bool started_ = false;
     std::atomic<bool> routeRefreshStop_{false};

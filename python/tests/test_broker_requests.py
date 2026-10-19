@@ -29,6 +29,7 @@ from remoting.protocol.headers import (ConsumeMessageDirectlyResultRequestHeader
                                                 GetConsumerStatusRequestHeader,
                                                 ResetOffsetRequestHeader)
 from common.subscription_data import SubscriptionData
+from remoting.protocol.heartbeat import HeartbeatData
 
 GROUP = "GID_BrokerReqUnit"
 TOPIC = "BrokerReqTopic"
@@ -401,3 +402,52 @@ class TestMqClientDispatch:
                        {"topic": TOPIC, "group": "nobody", "clientAddr": "x"})
         resp = mqc._process_get_consumer_status(cmd, "127.0.0.1:10911")
         assert resp is not None and resp.code == ResponseCode.SYSTEM_ERROR
+
+
+# ------------------------------------------------------- VIP channel address rewrite
+
+VIP_BROKER = "127.0.0.1:10911"
+VIP_PORT = "127.0.0.1:10909"
+
+
+def _recording_client(vip: bool) -> tuple:
+    """An instance whose transport only records which address each request actually hit."""
+    mqc = MQClientInstance("client@vip", ["127.0.0.1:9876"], vip_channel_enabled=vip)
+    seen = []
+
+    def fake_invoke(addr, request, timeout_millis=None):
+        seen.append((addr, request.code))
+        r = RemotingCommand()
+        r.code = ResponseCode.SUCCESS
+        return r
+
+    mqc.remoting_client.invoke_sync = fake_invoke
+    return mqc, seen
+
+
+def test_topic_admin_rpc_uses_the_vip_port():
+    mqc, seen = _recording_client(True)
+    mqc.create_topic_in_broker(VIP_BROKER, "DefaultTopic", TOPIC)
+    assert seen[-1] == (VIP_PORT, RequestCode.UPDATE_AND_CREATE_TOPIC)
+    mqc.delete_topic_in_broker(VIP_BROKER, TOPIC)
+    assert seen[-1] == (VIP_PORT, RequestCode.DELETE_TOPIC_IN_BROKER)
+
+    # Switch off: the same RPCs go to the port the route table published
+    plain, plain_seen = _recording_client(False)
+    plain.create_topic_in_broker(VIP_BROKER, "DefaultTopic", TOPIC)
+    assert plain_seen[-1] == (VIP_BROKER, RequestCode.UPDATE_AND_CREATE_TOPIC)
+    plain.delete_topic_in_broker(VIP_BROKER, TOPIC)
+    assert plain_seen[-1] == (VIP_BROKER, RequestCode.DELETE_TOPIC_IN_BROKER)
+
+
+def test_heartbeat_and_nameserver_rpc_never_use_the_vip_port():
+    mqc, seen = _recording_client(True)
+    mqc.send_heartbeat(VIP_BROKER, HeartbeatData())
+    assert seen[-1] == (VIP_BROKER, RequestCode.HEART_BEAT), \
+        "a heartbeat rewritten to port - 2 lands on a channel that has no subscription registration"
+
+    mqc.send_heartbeat_v2(VIP_BROKER, HeartbeatData())
+    assert seen[-1][0] == VIP_BROKER, "the V2 body rides the same unrewritten heartbeat frame"
+
+    mqc.unregister_client(VIP_BROKER, "client@vip", GROUP, "")
+    assert seen[-1] == (VIP_BROKER, RequestCode.UNREGISTER_CLIENT)

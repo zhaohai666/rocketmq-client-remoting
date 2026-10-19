@@ -53,9 +53,11 @@ type DefaultMQAdminExt struct {
 	UnitName        string
 	// EnableStreamRequestType is the classic enableStreamRequestType client knob.
 	EnableStreamRequestType bool
-	// VipChannelEnabled (vipChannelEnabled, false by
-	// default in 5.x): when true, broker requests go to the VIP port
-	// (port - 2). Never applied to nameserver traffic.
+	// VipChannelEnabled is the broker-facing VIP switch, off by default: with it
+	// on, the broker RPCs the VIP channel serves go to `port - 2` of the route
+	// address instead of the address itself. It is never applied to nameserver
+	// traffic. Set it before Start (it is handed to the instance the admin runs
+	// on) or through SetVipChannelEnabled, which flips both.
 	VipChannelEnabled bool
 	// PollNameServerIntervalMillis drives the route-refresh period; it is
 	// passed through once, when the instance is built.
@@ -128,11 +130,18 @@ func (a *DefaultMQAdminExt) SetEnableStreamRequestType(enable bool) {
 	a.EnableStreamRequestType = enable
 }
 
-// SetVipChannelEnabled mirrors ClientConfig#setVipChannelEnabled.
+// SetVipChannelEnabled mirrors ClientConfig#setVipChannelEnabled. The instance
+// is told as well, because the RPCs the admin delegates to it (offset read and
+// write, max/min offset, consumer list, topic create/delete, system topic list)
+// do the rewrite at their own invoke boundary.
 func (a *DefaultMQAdminExt) SetVipChannelEnabled(enable bool) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	a.VipChannelEnabled = enable
+	instance := a.mqClient
+	a.mu.Unlock()
+	if instance != nil {
+		instance.SetVipChannelEnabled(enable)
+	}
 }
 
 // GetNameServerAddr renders the nameserver list as a `;`-joined string.
@@ -176,10 +185,12 @@ func (a *DefaultMQAdminExt) Start() error {
 	stream := a.EnableStreamRequestType
 	hook := a.RpcHook
 	pollInterval := a.PollNameServerIntervalMillis
+	vipEnabled := a.VipChannelEnabled
 	a.mu.Unlock()
 
 	config := NewClientInstanceConfig()
 	config.PollNameServerIntervalMillis = pollInterval
+	config.VipChannelEnabled = vipEnabled
 	instance := CreateOrGetInstance(clientID, addrs, config)
 	instance.EnsureRPCHooks("", stream, hook)
 	if err := instance.Start(); err != nil {
@@ -238,21 +249,49 @@ func (a *DefaultMQAdminExt) timeout(millis int64) int64 {
 func (a *DefaultMQAdminExt) vipChannel() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.mqClient != nil {
+		// Once started, the instance owns the switch: the broker RPCs the admin
+		// delegates to it read it there, so the admin's own invoke boundary has
+		// to read the same value. One request, one shift.
+		return a.mqClient.VipChannelEnabled()
+	}
 	return a.VipChannelEnabled
+}
+
+// brokerVIPAddr is the admin's invoke-boundary rewrite: it returns the VIP
+// address of a resolved broker address when the switch is on, and the address
+// itself otherwise. Requests aimed at a nameserver never go through it.
+func (a *DefaultMQAdminExt) brokerVIPAddr(addr string) string {
+	return common.BrokerVIPChannel(a.vipChannel(), addr)
 }
 
 // ---------------- low-level invoke helpers ----------------
 
-// invokeBroker sends a request to one broker, applying the VIP-channel
-// translation and checking for SUCCESS.
+// invokeBroker sends a request to one broker over the address the fast channel
+// listener uses when it is enabled, and checks for SUCCESS.
 func (a *DefaultMQAdminExt) invokeBroker(addr string, code int32, ext *common.StringMap,
+	body []byte, timeoutMillis int64) (*remoting.RemotingCommand, error) {
+
+	return a.invokeBrokerOn(a.brokerVIPAddr(addr), code, ext, body, timeoutMillis)
+}
+
+// invokeBrokerPlain is the same round trip on the address the nameserver
+// published. Reading a broker's own configuration is the one admin RPC that
+// never moves: it is served on the listening port only, so aiming it at the
+// fast channel would talk to a port that is closed when the channel is off.
+func (a *DefaultMQAdminExt) invokeBrokerPlain(addr string, code int32, ext *common.StringMap,
+	body []byte, timeoutMillis int64) (*remoting.RemotingCommand, error) {
+
+	return a.invokeBrokerOn(addr, code, ext, body, timeoutMillis)
+}
+
+func (a *DefaultMQAdminExt) invokeBrokerOn(target string, code int32, ext *common.StringMap,
 	body []byte, timeoutMillis int64) (*remoting.RemotingCommand, error) {
 
 	instance, err := a.requireClient()
 	if err != nil {
 		return nil, err
 	}
-	target := common.BrokerVIPChannel(a.vipChannel(), addr)
 	request := adminRequest(code, ext)
 	if body != nil {
 		request.SetBody(body)
@@ -668,9 +707,10 @@ func (a *DefaultMQAdminExt) GetBrokerRuntimeInfo(brokerAddr string, timeoutMilli
 }
 
 // GetBrokerConfig sends GET_BROKER_CONFIG(26). The body is properties TEXT,
-// not JSON — parsing it as a KVTable fails on every real broker.
+// not JSON — parsing it as a KVTable fails on every real broker. This read is
+// the one admin RPC that always uses the listening port.
 func (a *DefaultMQAdminExt) GetBrokerConfig(brokerAddr string, timeoutMillis int64) (map[string]string, error) {
-	response, err := a.invokeBroker(brokerAddr, remoting.ReqGetBrokerConfig, nil, nil, timeoutMillis)
+	response, err := a.invokeBrokerPlain(brokerAddr, remoting.ReqGetBrokerConfig, nil, nil, timeoutMillis)
 	if err != nil {
 		return nil, err
 	}
@@ -884,6 +924,9 @@ func (a *DefaultMQAdminExt) GetAllSubscriptionGroup(brokerAddr string, timeoutMi
 		return nil, err
 	}
 	timeout := a.timeout(timeoutMillis)
+	// Every page goes to the same broker, so the address is resolved once — the
+	// paging loop must not re-derive it.
+	target := a.brokerVIPAddr(brokerAddr)
 	var currentDataVersion map[string]any
 	groupSeq := 0
 	table := map[string]*remoting.SubscriptionGroupConfig{}
@@ -899,7 +942,7 @@ func (a *DefaultMQAdminExt) GetAllSubscriptionGroup(brokerAddr string, timeoutMi
 		if currentDataVersion != nil {
 			ext.Put("dataVersion", string(remoting.EncodeJSON(currentDataVersion)))
 		}
-		response, err := instance.invokeSync(brokerAddr,
+		response, err := instance.invokeSync(target,
 			adminRequest(remoting.ReqGetAllSubscriptionGroupConfig, ext), left)
 		if err != nil {
 			return nil, err

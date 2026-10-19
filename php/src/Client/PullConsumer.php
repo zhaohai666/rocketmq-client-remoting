@@ -65,6 +65,18 @@ final class DefaultMQPullConsumer
      * is modified. See NamespaceRpcHook.
      */
     public string $namespaceV2 = '';
+    /**
+     * Heartbeat fingerprint path (default false). On, this facade's HEART_BEAT(34) rounds carry a
+     * non-zero heartbeatFingerprint and, once a broker answers IS_SUPPORT_HEART_BEAT_V2 and the
+     * fingerprint is unchanged, the subscription set drops out of the body.
+     */
+    public bool $useHeartbeatV2 = false;
+    /**
+     * VIP channel (default false; the broker only opens the `listen port - 2` channel when started
+     * with it). On, the offset / queue-lock / consumer-list / send-back requests this facade makes go
+     * to that port, while pulls, heartbeats and unregistration stay on the published one.
+     */
+    public bool $vipChannelEnabled = false;
     public string $messageModel = MessageModel::CLUSTERING;
     public int $brokerSuspendMaxTimeMillis = 20000;
     public int $consumerPullTimeoutMillis = 10000;
@@ -145,6 +157,23 @@ final class DefaultMQPullConsumer
     public function setUnitName(?string $unitName): void
     {
         $this->unitName = $unitName;
+    }
+
+    /**
+     * Turn the VIP channel on or off, and push the change into the live client instance so the next
+     * request already carries the rewritten port.
+     */
+    public function setVipChannelEnabled(bool $enable): void
+    {
+        $this->vipChannelEnabled = $enable;
+        if ($this->mqClient !== null) {
+            $this->mqClient->vipChannelEnabled = $enable;
+        }
+    }
+
+    public function isVipChannelEnabled(): bool
+    {
+        return $this->vipChannelEnabled;
     }
 
     public function setUnitMode(bool $unitMode): void
@@ -352,6 +381,8 @@ final class DefaultMQPullConsumer
             pollNameServerInterval: $this->pollNameServerInterval,
             tlsOptions: $this->tlsOptions,
             socksProxy: $this->socksProxy,
+            useHeartbeatV2: $this->useHeartbeatV2,
+            vipChannelEnabled: $this->vipChannelEnabled,
         );
         if ($this->rpcHook !== null) {
             $this->mqClient->remotingClient->registerRpcHook($this->rpcHook);
@@ -550,7 +581,7 @@ final class DefaultMQPullConsumer
         $header->topic = $mq->topic;
         $header->queueId = $mq->queueId;
         $request = RemotingCommand::createRequestCommand(RequestCode::GET_EARLIEST_MSG_STORETIME, $header);
-        $response = $client->remotingClient->invokeSync($addr, $request, 5000);
+        $response = $client->remotingClient->invokeSync($client->vipAddrFor($addr), $request, 5000);
         if ($response->code !== ResponseCode::SUCCESS) {
             throw new MQBrokerException($response->code, $response->remark ?? '');
         }
@@ -576,7 +607,7 @@ final class DefaultMQPullConsumer
         $header->unitMode = $this->unitMode;
         $header->maxReconsumeTimes = null;
         $request = RemotingCommand::createRequestCommand(RequestCode::CONSUMER_SEND_MSG_BACK, $header);
-        $response = $client->remotingClient->invokeSync($addr, $request, 5000);
+        $response = $client->remotingClient->invokeSync($client->vipAddrFor($addr), $request, 5000);
         if ($response->code !== ResponseCode::SUCCESS) {
             throw new MQBrokerException($response->code, $response->remark ?? '');
         }
@@ -611,6 +642,18 @@ final class DefaultLitePullConsumer
      * is modified. See NamespaceRpcHook.
      */
     public string $namespaceV2 = '';
+    /**
+     * Heartbeat fingerprint path (default false). On, this facade's HEART_BEAT(34) rounds carry a
+     * non-zero heartbeatFingerprint and, once a broker answers IS_SUPPORT_HEART_BEAT_V2 and the
+     * fingerprint is unchanged, the subscription set drops out of the body.
+     */
+    public bool $useHeartbeatV2 = false;
+    /**
+     * VIP channel (default false; the broker only opens the `listen port - 2` channel when started
+     * with it). On, the offset / queue-lock / consumer-list / send-back requests this facade makes go
+     * to that port, while pulls, heartbeats and unregistration stay on the published one.
+     */
+    public bool $vipChannelEnabled = false;
     public string $messageModel = MessageModel::CLUSTERING;
     /** @var list<string> */
     public array $nameServerAddrs = [];
@@ -755,6 +798,24 @@ final class DefaultLitePullConsumer
         }
     }
 
+
+    /**
+     * Turn the VIP channel on or off, and push the change into the live client instance so the next
+     * request already carries the rewritten port.
+     */
+    public function setVipChannelEnabled(bool $enable): void
+    {
+        $this->vipChannelEnabled = $enable;
+        if ($this->mqClient !== null) {
+            $this->mqClient->vipChannelEnabled = $enable;
+        }
+    }
+
+    public function isVipChannelEnabled(): bool
+    {
+        return $this->vipChannelEnabled;
+    }
+
     /** Read the server-side namespace (the one used by the `nsd`/`ns` extension headers). */
     public function getNamespaceV2(): string
     {
@@ -870,6 +931,8 @@ final class DefaultLitePullConsumer
             pollNameServerInterval: $this->pollNameServerInterval,
             tlsOptions: $this->tlsOptions,
             socksProxy: $this->socksProxy,
+            useHeartbeatV2: $this->useHeartbeatV2,
+            vipChannelEnabled: $this->vipChannelEnabled,
         );
         if ($this->rpcHook !== null) {
             $this->mqClient->remotingClient->registerRpcHook($this->rpcHook);

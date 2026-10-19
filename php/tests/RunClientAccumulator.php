@@ -75,7 +75,7 @@ namespace {
     /**
      * ProduceAccumulator (auto batching) pure-PHP assert-style self test (no phpunit, no real cluster).
      *
-     * Run: C:/Users/zhaoh/.workbuddy/binaries/php/versions/8.3/php.exe tests/RunClientAccumulator.php
+     * Run: php tests/RunClientAccumulator.php
      * On success prints "ALL TESTS PASSED (N checks)"; any failure lists details and exits non-zero.
      *
      * Single-thread adaptation: background guard thread -> explicit pump (tick/flush/flushAll);

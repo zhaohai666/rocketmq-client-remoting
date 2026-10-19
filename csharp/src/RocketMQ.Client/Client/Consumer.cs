@@ -6462,7 +6462,7 @@ public sealed class DefaultMQPushConsumer
             // broker moves to %DLQ% once exceeded)
             MaxReconsumeTimes = MaxReconsumeTimesOrDefault(),
         };
-        c.InvokeSync(addr, RequestCode.ConsumerSendMsgBack, header.ToExtFields(), null, false, 5000);
+        c.InvokeSync(c.VipAddr(addr), RequestCode.ConsumerSendMsgBack, header.ToExtFields(), null, false, 5000);
         return true;
     }
 

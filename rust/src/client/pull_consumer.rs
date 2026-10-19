@@ -236,6 +236,10 @@ pub struct PullConsumerConfig {
     pub heartbeat_enabled: bool,
     /// `heartbeat_interval_millis` (default 30000ms).
     pub heartbeat_broker_interval_millis: u64,
+    /// Heartbeat fingerprint path (default false). On, this facade's `HEART_BEAT(34)` rounds carry
+    /// a non-zero `heartbeatFingerprint`, and once the broker answers `IS_SUPPORT_HEART_BEAT_V2`
+    /// and the fingerprint is unchanged the subscription set drops out of the body.
+    pub use_heartbeat_v2: bool,
 }
 
 impl Default for PullConsumerConfig {
@@ -259,6 +263,7 @@ impl Default for PullConsumerConfig {
             consumer_timeout_millis_when_suspend: DEFAULT_CONSUMER_TIMEOUT_MILLIS_WHEN_SUSPEND,
             heartbeat_enabled: true,
             heartbeat_broker_interval_millis: DEFAULT_HEARTBEAT_BROKER_INTERVAL_MILLIS,
+            use_heartbeat_v2: false,
         }
     }
 }
@@ -585,6 +590,7 @@ impl DefaultMQPullConsumer {
             namespace_v2: cfg.namespace_v2.clone(),
             enable_stream_request_type: cfg.enable_stream_request_type,
             route_refresh_interval_millis: cfg.poll_name_server_interval_millis,
+            use_heartbeat_v2: cfg.use_heartbeat_v2,
             ..Default::default()
         };
         let client = MQClientInstance::create_mq_client_instance(
@@ -1175,6 +1181,10 @@ pub struct LitePullConsumerConfig {
     pub pull_thread_nums: i32,
     /// [`register_topic_message_queue_change_listener`]: DefaultLitePullConsumer::register_topic_message_queue_change_listener
     pub topic_metadata_check_interval_millis: i64,
+    /// Heartbeat fingerprint path (default false). On, this facade's `HEART_BEAT(34)` rounds carry
+    /// a non-zero `heartbeatFingerprint`, and once the broker answers `IS_SUPPORT_HEART_BEAT_V2`
+    /// and the fingerprint is unchanged the subscription set drops out of the body.
+    pub use_heartbeat_v2: bool,
 }
 
 impl Default for LitePullConsumerConfig {
@@ -1204,6 +1214,7 @@ impl Default for LitePullConsumerConfig {
             pull_interval_millis: 50,
             pull_thread_nums: 1,
             topic_metadata_check_interval_millis: 30_000,
+            use_heartbeat_v2: false,
         }
     }
 }
@@ -1711,6 +1722,7 @@ impl DefaultLitePullConsumer {
             namespace_v2: cfg.namespace_v2.clone(),
             enable_stream_request_type: cfg.enable_stream_request_type,
             route_refresh_interval_millis: cfg.poll_name_server_interval_millis,
+            use_heartbeat_v2: cfg.use_heartbeat_v2,
             ..Default::default()
         };
         let client = MQClientInstance::create_mq_client_instance(

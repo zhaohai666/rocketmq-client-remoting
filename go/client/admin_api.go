@@ -86,9 +86,10 @@ func (i *Instance) GetAllTopicListFromNameServer(timeoutMillis int64) (*remoting
 }
 
 // GetSystemTopicListFromBroker sends GET_SYSTEM_TOPIC_LIST_FROM_BROKER(305).
+// It is broker-facing, so the VIP-channel shift applies when the switch is on.
 func (i *Instance) GetSystemTopicListFromBroker(addr string, timeoutMillis int64) (*remoting.TopicList, error) {
 	request := adminRequest(remoting.ReqGetSystemTopicListFromBroker, nil)
-	response, err := i.invokeSync(addr, request, timeoutMillis)
+	response, err := i.invokeSync(i.brokerVIPAddr(addr), request, timeoutMillis)
 	if err != nil {
 		return nil, err
 	}
@@ -121,6 +122,9 @@ func (i *Instance) CreateTopicInBroker(addr, defaultTopic, topic string,
 	if retryTimes < 1 {
 		retryTimes = 1
 	}
+	// The same broker for every attempt, so the address is resolved once here —
+	// the retries must not re-derive it.
+	target := i.brokerVIPAddr(addr)
 	var lastErr error
 	for attempt := 0; attempt < retryTimes; attempt++ {
 		request := adminRequest(remoting.ReqUpdateAndCreateTopic, adminExt(
@@ -135,7 +139,7 @@ func (i *Instance) CreateTopicInBroker(addr, defaultTopic, topic string,
 			"attributes", attributes,
 			"force", false,
 		))
-		response, err := i.invokeSync(addr, request, timeoutMillis)
+		response, err := i.invokeSync(target, request, timeoutMillis)
 		if err != nil {
 			lastErr = err
 			continue
@@ -180,9 +184,12 @@ func (i *Instance) CreateTopicInRoute(topic string, readQueueNums, writeQueueNum
 
 // ---------------- topic deletion ----------------
 
-// DeleteTopicInBroker sends DELETE_TOPIC_IN_BROKER(215) to one broker.
+// DeleteTopicInBroker sends DELETE_TOPIC_IN_BROKER(215) to one broker. It is a
+// broker-facing admin RPC, so the VIP-channel shift applies when the switch is
+// on; the nameserver-side deletion never shifts.
 func (i *Instance) DeleteTopicInBroker(addr, topic string, timeoutMillis int64) error {
-	response, err := i.invokeSync(addr, adminRequest(remoting.ReqDeleteTopicInBroker, adminExt("topic", topic)), timeoutMillis)
+	response, err := i.invokeSync(i.brokerVIPAddr(addr),
+		adminRequest(remoting.ReqDeleteTopicInBroker, adminExt("topic", topic)), timeoutMillis)
 	if err != nil {
 		return err
 	}

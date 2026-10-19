@@ -372,6 +372,10 @@ RemotingCommand MQClientInstance::invokeSyncOnAddr(const std::string& addr,
     return remotingClient_->invokeSync(addr, request, timeoutMillis);
 }
 
+std::string MQClientInstance::vipAddr(const std::string& addr) const {
+    return MixAll::brokerVipChannel(vipChannelEnabled_, addr);
+}
+
 void MQClientInstance::checkResponseCode(const RemotingCommand& response) {
     if (response.code != ResponseCode::SUCCESS) {
         throw MQBrokerException(response.code, response.remark);
@@ -838,7 +842,7 @@ SendResult MQClientInstance::sendMessage(const std::string& producerGroup, const
     RemotingCommand request =
         buildSendRequest(producerGroup, msg, mq, sysFlag, unitMode, createTopicKey,
                          defaultTopicQueueNums);
-    RemotingCommand response = invokeSyncOnAddr(addr, request, timeoutMillis);
+    RemotingCommand response = invokeSyncOnAddr(vipAddr(addr), request, timeoutMillis);
     return parseSendResponse(response, msg, mq);
 }
 
@@ -848,7 +852,7 @@ void MQClientInstance::sendMessageAsync(const std::string& addr, RemotingCommand
                                        std::function<void(const SendResult&, const InvokeError&)>
                                            onComplete) {
     remotingClient_->invokeAsync(
-        addr, request,
+        vipAddr(addr), request,
         [onComplete, msg, mq](const RemotingCommand& response, const InvokeError& error) {
             if (!error.empty()) {
                 onComplete(SendResult(), error);
@@ -898,7 +902,7 @@ void MQClientInstance::sendMessageOneway(const std::string& producerGroup, const
         buildSendRequest(producerGroup, msg, mq, sysFlag, unitMode, createTopicKey,
                          defaultTopicQueueNums);
     request.markOnewayRpc();
-    remotingClient_->invokeOneway(addr, request);
+    remotingClient_->invokeOneway(vipAddr(addr), request);
 }
 
 // ---------------------------------------------------------------- Message pull
@@ -1219,7 +1223,7 @@ bool MQClientInstance::queryConsumerOffset(const std::string& consumerGroup,
     if (setZeroIfNotFound) {
         request.extFields["setZeroIfNotFound"] = "true";
     }
-    RemotingCommand response = invokeSyncOnAddr(addr, request, timeoutMillis);
+    RemotingCommand response = invokeSyncOnAddr(vipAddr(addr), request, timeoutMillis);
     if (response.code == ResponseCode::QUERY_NOT_FOUND) {
         return false;
     }
@@ -1241,7 +1245,7 @@ void MQClientInstance::updateConsumerOffset(const std::string& consumerGroup,
     header->commitOffset = commitOffset;
     RemotingCommand request =
         RemotingCommand::createRequestCommand(RequestCode::UPDATE_CONSUMER_OFFSET, header);
-    RemotingCommand response = invokeSyncOnAddr(addr, request, timeoutMillis);
+    RemotingCommand response = invokeSyncOnAddr(vipAddr(addr), request, timeoutMillis);
     checkResponseCode(response);
 }
 
@@ -1283,7 +1287,7 @@ std::vector<MessageQueue> MQClientInstance::lockBatchMq(const std::string& consu
         std::string bodyText = body.dump();
         Bytes payload(bodyText.begin(), bodyText.end());
         RemotingCommand response =
-            invokeSyncRaw(addr, RequestCode::LOCK_BATCH_MQ, PropertyMap{}, payload,
+            invokeSyncRaw(vipAddr(addr), RequestCode::LOCK_BATCH_MQ, PropertyMap{}, payload,
                           /*hasBody=*/true, timeoutMillis);
         checkResponseCode(response);
         // LockBatchResponseBody: {"lockOKMQSet":[{topic,brokerName,queueId}]}
@@ -1331,7 +1335,7 @@ void MQClientInstance::unlockBatchMq(const std::string& consumerGroup,
         std::string bodyText = body.dump();
         Bytes payload(bodyText.begin(), bodyText.end());
         RemotingCommand response =
-            invokeSyncRaw(addr, RequestCode::UNLOCK_BATCH_MQ, PropertyMap{}, payload,
+            invokeSyncRaw(vipAddr(addr), RequestCode::UNLOCK_BATCH_MQ, PropertyMap{}, payload,
                           /*hasBody=*/true, timeoutMillis);
         checkResponseCode(response);
     }
@@ -1345,7 +1349,7 @@ int64_t MQClientInstance::getMaxOffset(const MessageQueue& mq, int32_t timeoutMi
     header->queueId = mq.queueId;
     RemotingCommand request =
         RemotingCommand::createRequestCommand(RequestCode::GET_MAX_OFFSET, header);
-    RemotingCommand response = invokeSyncOnAddr(addr, request, timeoutMillis);
+    RemotingCommand response = invokeSyncOnAddr(vipAddr(addr), request, timeoutMillis);
     checkResponseCode(response);
     GetMaxOffsetResponseHeader respHeader;
     respHeader.fromExtFields(response.extFields);
@@ -1360,7 +1364,7 @@ int64_t MQClientInstance::getMinOffset(const MessageQueue& mq, int32_t timeoutMi
     header->queueId = mq.queueId;
     RemotingCommand request =
         RemotingCommand::createRequestCommand(RequestCode::GET_MIN_OFFSET, header);
-    RemotingCommand response = invokeSyncOnAddr(addr, request, timeoutMillis);
+    RemotingCommand response = invokeSyncOnAddr(vipAddr(addr), request, timeoutMillis);
     checkResponseCode(response);
     GetMinOffsetResponseHeader respHeader;
     respHeader.fromExtFields(response.extFields);
@@ -1385,7 +1389,7 @@ int64_t MQClientInstance::searchOffsetByBoundary(const MessageQueue& mq, int64_t
     header->boundaryType = boundaryType;
     RemotingCommand request =
         RemotingCommand::createRequestCommand(RequestCode::SEARCH_OFFSET_BY_TIMESTAMP, header);
-    RemotingCommand response = invokeSyncOnAddr(addr, request, timeoutMillis);
+    RemotingCommand response = invokeSyncOnAddr(vipAddr(addr), request, timeoutMillis);
     checkResponseCode(response);
     SearchOffsetResponseHeader respHeader;
     respHeader.fromExtFields(response.extFields);
@@ -1421,7 +1425,7 @@ bool MQClientInstance::queryMessage(const std::string& topic, const std::string&
     if (uniqKey) {
         request.extFields[MixAll::UNIQUE_MSG_QUERY_FLAG] = "true";
     }
-    RemotingCommand response = invokeSyncOnAddr(addr, request, timeoutMillis);
+    RemotingCommand response = invokeSyncOnAddr(vipAddr(addr), request, timeoutMillis);
     if (response.code == ResponseCode::QUERY_NOT_FOUND) {
         return false;
     }
@@ -1571,7 +1575,7 @@ void MQClientInstance::createTopicInBroker(const std::string& brokerAddr,
     int attempts = retryTimes > 0 ? retryTimes : 1;
     for (int i = 0; i < attempts; ++i) {
         try {
-            RemotingCommand response = invokeSyncOnAddr(brokerAddr, request, timeoutMillis);
+            RemotingCommand response = invokeSyncOnAddr(vipAddr(brokerAddr), request, timeoutMillis);
             checkResponseCode(response);
             return;
         } catch (const MQBrokerException&) {
@@ -1616,7 +1620,7 @@ void MQClientInstance::deleteTopicInBroker(const std::string& brokerAddr,
                                           const std::string& topic, int32_t timeoutMillis) {
     PropertyMap ext;
     ext["topic"] = topic;
-    invokeSync(brokerAddr, RequestCode::DELETE_TOPIC_IN_BROKER, ext, Bytes(), false, timeoutMillis);
+    invokeSync(vipAddr(brokerAddr), RequestCode::DELETE_TOPIC_IN_BROKER, ext, Bytes(), false, timeoutMillis);
 }
 
 void MQClientInstance::deleteTopicInNamesrv(const std::string& topic, int32_t timeoutMillis) {
@@ -1679,7 +1683,7 @@ GetConsumerListByGroupResponseBody MQClientInstance::getConsumerListByGroup(
     header->consumerGroup = consumerGroup;
     RemotingCommand request =
         RemotingCommand::createRequestCommand(RequestCode::GET_CONSUMER_LIST_BY_GROUP, header);
-    RemotingCommand response = invokeSyncOnAddr(addr, request, timeoutMillis);
+    RemotingCommand response = invokeSyncOnAddr(vipAddr(addr), request, timeoutMillis);
     checkResponseCode(response);
     GetConsumerListByGroupResponseBody out;
     if (!response.body.empty()) {
@@ -1754,7 +1758,7 @@ void MQClientInstance::checkClientConfig(const std::string& brokerAddr,
     body.subscriptionData = subscriptionData;
     request.body = body.encode();
     request.hasBody = true;
-    RemotingCommand response = invokeSyncOnAddr(brokerAddr, request, timeoutMillis);
+    RemotingCommand response = invokeSyncOnAddr(vipAddr(brokerAddr), request, timeoutMillis);
     if (response.code != ResponseCode::SUCCESS) {
         throw MQClientException(response.remark, response.code);
     }

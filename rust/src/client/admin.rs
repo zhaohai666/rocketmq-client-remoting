@@ -437,6 +437,12 @@ impl DefaultMQAdminExt {
 
     pub fn set_vip_channel_enabled(&self, enable: bool) {
         self.update_config(|c| c.vip_channel_enabled = enable);
+        // The private instance answers the delegated offset / consumer-list family and applies
+        // the rewrite itself, so flipping the switch has to reach it too -- otherwise the admin's
+        // own RPCs move while the delegated ones keep the listening port.
+        if let Some(client) = lock(&self.inner.client).as_ref() {
+            client.set_vip_channel_enabled(enable);
+        }
     }
 
     pub fn set_poll_name_server_interval_millis(&self, millis: u64) {
@@ -517,6 +523,7 @@ impl DefaultMQAdminExt {
                 namespace_v2: cfg.namespace_v2.clone(),
                 enable_stream_request_type: cfg.enable_stream_request_type,
                 route_refresh_interval_millis: cfg.poll_name_server_interval_millis,
+                vip_channel_enabled: cfg.vip_channel_enabled,
                 ..Default::default()
             },
         );
@@ -567,7 +574,8 @@ impl DefaultMQAdminExt {
 
     // ---------------- Low-level invoke helpers ----------------
 
-    /// Sends to the given Broker/NameServer and checks for SUCCESS.
+    /// Sends to one broker over the address the fast channel listener uses when the switch is
+    /// on, and checks for SUCCESS.
     async fn invoke_broker(
         &self,
         addr: &str,
@@ -576,11 +584,40 @@ impl DefaultMQAdminExt {
         body: Option<Vec<u8>>,
         timeout_millis: Option<i64>,
     ) -> Result<RemotingCommand> {
+        let target =
+            MixAll::broker_vip_channel(read_cfg(&self.inner.cfg).vip_channel_enabled, addr);
+        self.invoke_broker_on(&target, code, ext, body, timeout_millis)
+            .await
+    }
+
+    /// The same round trip on the address the name server published. Reading a broker's own
+    /// configuration is the one admin RPC that never moves: it answers on the listening port
+    /// only, so aiming it at the fast channel would talk to a port that is closed whenever the
+    /// channel is off.
+    async fn invoke_broker_plain(
+        &self,
+        addr: &str,
+        code: i32,
+        ext: &StringMap,
+        body: Option<Vec<u8>>,
+        timeout_millis: Option<i64>,
+    ) -> Result<RemotingCommand> {
+        self.invoke_broker_on(addr, code, ext, body, timeout_millis)
+            .await
+    }
+
+    async fn invoke_broker_on(
+        &self,
+        target: &str,
+        code: i32,
+        ext: &StringMap,
+        body: Option<Vec<u8>>,
+        timeout_millis: Option<i64>,
+    ) -> Result<RemotingCommand> {
         let client = self.require_client()?;
         let timeout = effective_timeout(self.timeout_millis(), timeout_millis);
-        let addr = &MixAll::broker_vip_channel(read_cfg(&self.inner.cfg).vip_channel_enabled, addr);
         let mut request = build_request(code, ext, body);
-        let response = client.invoke_sync(addr, &mut request, timeout).await?;
+        let response = client.invoke_sync(target, &mut request, timeout).await?;
         MQClientInstance::check_response(&response)?;
         Ok(response)
     }
@@ -1043,13 +1080,16 @@ impl DefaultMQAdminExt {
     }
 
     /// The response body is **properties text**, not JSON/KVTable.
+    ///
+    /// This read is the one broker RPC that always uses the listening port: the fast channel
+    /// serves the other admin RPCs, not this one.
     pub async fn get_broker_config(
         &self,
         broker_addr: &str,
         timeout_millis: Option<i64>,
     ) -> Result<StringMap> {
         let response = self
-            .invoke_broker(
+            .invoke_broker_plain(
                 broker_addr,
                 request_code::GET_BROKER_CONFIG,
                 &ExtFields::new(),

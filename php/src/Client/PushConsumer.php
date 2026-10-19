@@ -97,6 +97,18 @@ final class DefaultMQPushConsumer
      * is modified. See NamespaceRpcHook.
      */
     public string $namespaceV2 = '';
+    /**
+     * Heartbeat fingerprint path (default false). On, this facade's HEART_BEAT(34) rounds carry a
+     * non-zero heartbeatFingerprint and, once a broker answers IS_SUPPORT_HEART_BEAT_V2 and the
+     * fingerprint is unchanged, the subscription set drops out of the body.
+     */
+    public bool $useHeartbeatV2 = false;
+    /**
+     * VIP channel (default false; the broker only opens the `listen port - 2` channel when started
+     * with it). On, the offset / queue-lock / consumer-list / send-back requests this facade makes go
+     * to that port, while pulls, heartbeats and unregistration stay on the published one.
+     */
+    public bool $vipChannelEnabled = false;
     /** @var 'CLUSTERING'|'BROADCASTING' */
     public string $messageModel = MessageModel::CLUSTERING;
     public string $consumeFromWhere = ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET;
@@ -263,6 +275,23 @@ final class DefaultMQPushConsumer
     public function setUnitName(?string $unitName): void
     {
         $this->unitName = $unitName;
+    }
+
+    /**
+     * Turn the VIP channel on or off, and push the change into the live client instance so the next
+     * request already carries the rewritten port.
+     */
+    public function setVipChannelEnabled(bool $enable): void
+    {
+        $this->vipChannelEnabled = $enable;
+        if ($this->mqClient !== null) {
+            $this->mqClient->vipChannelEnabled = $enable;
+        }
+    }
+
+    public function isVipChannelEnabled(): bool
+    {
+        return $this->vipChannelEnabled;
     }
 
     public function setUnitMode(bool $unitMode): void
@@ -541,6 +570,8 @@ final class DefaultMQPushConsumer
             pollNameServerInterval: $this->pollNameServerInterval,
             tlsOptions: $this->tlsOptions,
             socksProxy: $this->socksProxy,
+            useHeartbeatV2: $this->useHeartbeatV2,
+            vipChannelEnabled: $this->vipChannelEnabled,
         );
         if ($this->rpcHook !== null) {
             $this->mqClient->remotingClient->registerRpcHook($this->rpcHook);
@@ -2234,7 +2265,7 @@ final class DefaultMQPushConsumer
         $header->unitMode = $this->unitMode;
         $header->maxReconsumeTimes = $maxReconsume;
         $request = RemotingCommand::createRequestCommand(RequestCode::CONSUMER_SEND_MSG_BACK, $header);
-        $response = $client->remotingClient->invokeSync($addr, $request, 5000);
+        $response = $client->remotingClient->invokeSync($client->vipAddrFor($addr), $request, 5000);
         if ($response->code !== ResponseCode::SUCCESS) {
             throw new MQBrokerException($response->code, $response->remark ?? '');
         }

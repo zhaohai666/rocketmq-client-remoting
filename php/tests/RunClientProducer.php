@@ -5,7 +5,7 @@ declare(strict_types=1);
 /**
  * DefaultMQProducer / TransactionMQProducer pure-PHP assert-style self-test (no phpunit, no real cluster).
  *
- * Run: C:/Users/zhaoh/.workbuddy/binaries/php/versions/8.3/php.exe tests/RunClientProducer.php
+ * Run: php tests/RunClientProducer.php
  * On success prints "ALL TESTS PASSED (N checks)"; any failure lists details and exits non-zero.
  *
  * Network-related cases re-launch this script with a `--broker` argument as a **child-process**

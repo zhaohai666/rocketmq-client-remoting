@@ -12,7 +12,7 @@ declare(strict_types=1);
  * CONSISTENT_HASH / MACHINE_ROOM / MACHINE_ROOM_NEARBY), and the consistent-hash ring
  * primitives (MD5Hash / ClientNode / VirtualNode / ConsistentHashRouter).
  *
- * Run: C:/Users/zhaoh/.workbuddy/binaries/php/versions/8.3/php.exe tests/RunClientAllocation.php
+ * Run: php tests/RunClientAllocation.php
  * On success prints "ALL TESTS PASSED (N checks)"; any failure lists details and exits non-zero.
  */
 

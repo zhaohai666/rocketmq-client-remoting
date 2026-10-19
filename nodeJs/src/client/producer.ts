@@ -284,7 +284,13 @@ export class DefaultMQProducer {
     return this;
   }
   setCompressMsgBodyOverHowmuch(howmuch: number): this { this.compressMsgBodyOverHowmuch = howmuch; return this; }
-  setSendMessageWithVIPChannel(enable: boolean): this { this.sendMessageWithVIPChannel = enable; return this; }
+  setSendMessageWithVIPChannel(enable: boolean): this {
+    this.sendMessageWithVIPChannel = enable;
+    // The offset / lock / consumer-list RPCs are issued on the shared instance,
+    // so keep its VIP view in step with this facade's send switch.
+    if (this.client) this.client.setVipChannelEnabled(enable);
+    return this;
+  }
   isSendMessageWithVIPChannel(): boolean { return this.sendMessageWithVIPChannel; }
   // ASYNC retry budget (first attempt not counted). Only the async chain reads it.
   setRetryTimesWhenSendAsyncFailed(n: number): this { this.retryTimesWhenSendAsyncFailed = n; return this; }
@@ -356,6 +362,9 @@ export class DefaultMQProducer {
     });
     this.client = client;
     manager.registerClient(clientId, client);
+    // Keep the shared instance's VIP view aligned with this facade's send switch,
+    // so the instance-level offset / lock / consumer-list RPCs honour it too.
+    client.setVipChannelEnabled(this.sendMessageWithVIPChannel);
     if (created) {
       if (this.useHeartbeatV2) client.setUseHeartbeatV2(true);
       registerRpcHooks(client.remotingClient, {

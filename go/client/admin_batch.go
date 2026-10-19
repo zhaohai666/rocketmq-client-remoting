@@ -222,7 +222,7 @@ func (a *DefaultMQAdminExt) ResumeCheckHalfMessage(brokerAddr, topic, msgID stri
 	if err != nil {
 		return false, err
 	}
-	target := common.BrokerVIPChannel(a.vipChannel(), brokerAddr)
+	target := a.brokerVIPAddr(brokerAddr)
 	request := adminRequest(remoting.ReqResumeCheckHalfMessage, header)
 	response, err := instance.invokeSync(target, request, a.timeout(0))
 	if err != nil {

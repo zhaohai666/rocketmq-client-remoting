@@ -41,6 +41,7 @@ use RocketMQ\Remoting\Protocol\GetMaxOffsetResponseHeader;
 use RocketMQ\Remoting\Protocol\GetMinOffsetRequestHeader;
 use RocketMQ\Remoting\Protocol\GetMinOffsetResponseHeader;
 use RocketMQ\Remoting\Protocol\HeartbeatData;
+use RocketMQ\Remoting\Protocol\HeartbeatV2Result;
 use RocketMQ\Remoting\Protocol\LockBatchMqRequestHeader;
 use RocketMQ\Remoting\Protocol\LockBatchRequestBody;
 use RocketMQ\Remoting\Protocol\LockBatchResponseBody;
@@ -224,12 +225,27 @@ class MQClientInstance
     public int $pollNameServerInterval;
 
     /**
-     * VIP channel switch (default false): when true, **send / pull / POP / assignment**
-     * requests to brokers go through the VIP port (port - 2). This port applies it in one
-     * place, ``vipAddrFor()``, rather than recomputing at every call site (Admin has its
-     * own independent switch of the same name).
+     * VIP channel switch (default false): when true, the broker port is shifted to the dedicated
+     * fast port (port - 2) for **sends** and for the offset / lock / offset-search / message-query
+     * / consumer-list / client-config / broker-admin family. This port applies it in one place,
+     * ``vipAddrFor()``, rather than recomputing at every call site (Admin has its own independent
+     * switch of the same name). Heartbeats, unregistration, pulls, pops, acks, invisible-time
+     * changes, recalls and every name-server request are never shifted.
      */
     public bool $vipChannelEnabled = false;
+
+    /**
+     * Heartbeat fingerprint path (default false). When on, each round hashes its subscription set
+     * into ``heartbeatFingerprint`` and, once a broker has answered IS_SUPPORT_HEART_BEAT_V2 and
+     * still holds that fingerprint, sends it the subscription-free body instead.
+     */
+    public bool $useHeartbeatV2 = false;
+
+    /** @var array<string, true> broker addresses that answered IS_SUPPORT_HEART_BEAT_V2 at least once */
+    private array $supportV2BrokerAddrs = [];
+
+    /** @var array<string, int> broker address => the fingerprint that round left there */
+    private array $brokerAddrHeartbeatFingerprint = [];
 
     /**
      * 5.x new namespace: when non-empty, **every** request carries the two extension
@@ -321,12 +337,14 @@ class MQClientInstance
         int $pollNameServerInterval = 30000,
         ?array $tlsOptions = null,
         bool $vipChannelEnabled = false,
+        bool $useHeartbeatV2 = false,
         ?SocksProxyConfig $socksProxy = null,
     ) {
         $this->clientId = $clientId;
         $this->nameServerAddrs = array_values($nameServerAddrs);
         $this->pollNameServerInterval = $pollNameServerInterval;
         $this->vipChannelEnabled = $vipChannelEnabled;
+        $this->useHeartbeatV2 = $useHeartbeatV2;
         $this->namespaceV2 = $namespaceV2;
         $this->remotingClient = new RemotingClient($connectTimeoutMillis, $invokeTimeoutMillis, $tlsEnable, tlsOptions: $tlsOptions, socksProxy: $socksProxy);
         $this->remotingClient->registerRpcHook(new NamespaceRpcHook(\Closure::fromCallable([$this, 'namespaceV2Value'])));
@@ -717,15 +735,46 @@ class MQClientInstance
      */
     public function heartbeatOnce(int $timeoutMillis = 5000): void
     {
+        $this->heartbeatRound(false, $timeoutMillis);
+    }
+
+    /**
+     * Round that follows a queue-allocation change: the remembered fingerprints are dropped
+     * first, so every broker is handed the subscriptions again instead of the cheap body.
+     */
+    public function heartbeatOnceAfterRebalance(int $timeoutMillis = 5000): void
+    {
+        $this->heartbeatRound(true, $timeoutMillis);
+    }
+
+    private function heartbeatRound(bool $isRebalance, int $timeoutMillis): void
+    {
         $data = $this->buildHeartbeatData();
         if ($data->producerDataSet === [] && $data->consumerDataSet === []) {
             return;
+        }
+        $fingerprint = 0;
+        $withoutSub = null;
+        if ($this->useHeartbeatV2) {
+            // One value per round, stamped on both bodies: the cheap body is only valid because it
+            // carries the **full** body's fingerprint, since recomputing over a subscription-
+            // stripped body deliberately differs and would claim a change every round.
+            $fingerprint = $data->computeFingerprint();
+            $data->heartbeatFingerprint = $fingerprint;
+            $withoutSub = $data->withoutSubCopy();
+            if ($isRebalance) {
+                $this->resetBrokerAddrHeartbeatFingerprint();
+            }
         }
         $addrs = $this->getAllBrokerAddrs();
         $ok = 0;
         foreach ($addrs as $addr) {
             try {
-                $this->sendHeartbeat($addr, $data, $timeoutMillis);
+                if ($withoutSub === null) {
+                    $this->sendHeartbeat($addr, $data, $timeoutMillis);
+                } else {
+                    $this->sendHeartbeatV2($addr, $data, $withoutSub, $fingerprint, $timeoutMillis);
+                }
                 $ok++;
             } catch (\Throwable $e) {
                 Logger::debug(sprintf('heartbeatOnce failed, addr=%s: %s', $addr, $e->getMessage()));
@@ -1140,7 +1189,11 @@ class MQClientInstance
 
     // ---------------- Low-level invoke ----------------
 
-    private function invokeSync(string $addr, RemotingCommand $request, ?int $timeoutMillis = null): RemotingCommand
+    /**
+     * The instance's single synchronous exit point. Protected so a test subclass can intercept
+     * every request the instance puts on the wire -- and answer it -- without a broker.
+     */
+    protected function invokeSync(string $addr, RemotingCommand $request, ?int $timeoutMillis = null): RemotingCommand
     {
         return $this->remotingClient->invokeSync($addr, $request, $timeoutMillis);
     }
@@ -1750,7 +1803,7 @@ class MQClientInstance
             : RequestCode::PULL_MESSAGE;
         $request = RemotingCommand::createRequestCommand($code, $header);
         // The pull path likewise goes through VIP channel conversion
-        $response = $this->invokeSync($this->vipAddrFor($addr), $request, $timeoutMillis);
+        $response = $this->invokeSync($addr, $request, $timeoutMillis);
 
         if ($response->code === ResponseCode::SUCCESS) {
             $status = PullStatus::FOUND;
@@ -2194,7 +2247,7 @@ class MQClientInstance
         $header->queueId = $mq->queueId;
         $header->setZeroIfNotFound = $setZeroIfNotFound;
         $request = RemotingCommand::createRequestCommand(RequestCode::QUERY_CONSUMER_OFFSET, $header);
-        $response = $this->invokeSync($addr, $request, $timeoutMillis);
+        $response = $this->invokeSync($this->vipAddrFor($addr), $request, $timeoutMillis);
         if ($response->code === ResponseCode::QUERY_NOT_FOUND) {
             return null;
         }
@@ -2220,7 +2273,7 @@ class MQClientInstance
         $header->queueId = $mq->queueId;
         $header->commitOffset = $commitOffset;
         $request = RemotingCommand::createRequestCommand(RequestCode::UPDATE_CONSUMER_OFFSET, $header);
-        $response = $this->invokeSync($addr, $request, $timeoutMillis);
+        $response = $this->invokeSync($this->vipAddrFor($addr), $request, $timeoutMillis);
         $this->checkResponse($response);
     }
 
@@ -2233,7 +2286,7 @@ class MQClientInstance
         $header->topic = $mq->topic;
         $header->queueId = $mq->queueId;
         $request = RemotingCommand::createRequestCommand(RequestCode::GET_MAX_OFFSET, $header);
-        $response = $this->invokeSync($addr, $request, $timeoutMillis);
+        $response = $this->invokeSync($this->vipAddrFor($addr), $request, $timeoutMillis);
         $this->checkResponse($response);
         $respHeader = new GetMaxOffsetResponseHeader();
         $respHeader->fromExtFields($response->extFields);
@@ -2249,7 +2302,7 @@ class MQClientInstance
         $header->topic = $mq->topic;
         $header->queueId = $mq->queueId;
         $request = RemotingCommand::createRequestCommand(RequestCode::GET_MIN_OFFSET, $header);
-        $response = $this->invokeSync($addr, $request, $timeoutMillis);
+        $response = $this->invokeSync($this->vipAddrFor($addr), $request, $timeoutMillis);
         $this->checkResponse($response);
         $respHeader = new GetMinOffsetResponseHeader();
         $respHeader->fromExtFields($response->extFields);
@@ -2276,7 +2329,7 @@ class MQClientInstance
         $header->timestamp = $timestamp;
         $header->boundaryType = $boundaryType;
         $request = RemotingCommand::createRequestCommand(RequestCode::SEARCH_OFFSET_BY_TIMESTAMP, $header);
-        $response = $this->invokeSync($addr, $request, $timeoutMillis);
+        $response = $this->invokeSync($this->vipAddrFor($addr), $request, $timeoutMillis);
         $this->checkResponse($response);
         $respHeader = new SearchOffsetResponseHeader();
         $respHeader->fromExtFields($response->extFields);
@@ -2313,7 +2366,7 @@ class MQClientInstance
         if ($uniqKey) {
             $request->extFields[MixAll::UNIQUE_MSG_QUERY_FLAG] = 'true';
         }
-        $response = $this->invokeSync($addr, $request, $timeoutMillis);
+        $response = $this->invokeSync($this->vipAddrFor($addr), $request, $timeoutMillis);
         if ($response->code === ResponseCode::QUERY_NOT_FOUND) {
             return null;
         }
@@ -2439,7 +2492,7 @@ class MQClientInstance
             $request = RemotingCommand::createRequestCommand(RequestCode::LOCK_BATCH_MQ, new LockBatchMqRequestHeader());
             $request->body = $body->encode();
             try {
-                $response = $this->invokeSync($addr, $request, $timeoutMillis);
+                $response = $this->invokeSync($this->vipAddrFor($addr), $request, $timeoutMillis);
                 $this->checkResponse($response);
                 $rb = LockBatchResponseBody::decode($response->body ?? '');
                 foreach ($rb->lockOkMqSet as $d) {
@@ -2486,7 +2539,7 @@ class MQClientInstance
             $request = RemotingCommand::createRequestCommand(RequestCode::UNLOCK_BATCH_MQ, new UnlockBatchMqRequestHeader());
             $request->body = $body->encode();
             try {
-                $response = $this->invokeSync($addr, $request, $timeoutMillis);
+                $response = $this->invokeSync($this->vipAddrFor($addr), $request, $timeoutMillis);
                 $this->checkResponse($response);
             } catch (\Throwable $e) {
                 Logger::warning(sprintf('unlock_batch_mq failed for broker %s: %s', $brokerName, $e->getMessage()));
@@ -2502,6 +2555,75 @@ class MQClientInstance
         $request->body = $heartbeatData->encode();
         $response = $this->invokeSync($addr, $request, $timeoutMillis);
         $this->checkResponse($response);
+    }
+
+    /**
+     * One broker over the fingerprint path -- the same HEART_BEAT(34) frame, read through the two
+     * response ext fields. There is no separate request code for it.
+     *
+     * A broker already known to speak the protocol **and** still holding our fingerprint gets the
+     * subscription-free body; if it then answers IS_SUB_CHANGE (its per-group table moved under
+     * our feet, e.g. another instance of the same group registered different subscriptions) the
+     * fingerprint is forgotten, so the next round re-sends everything. Anything else sends the full
+     * body, and only an IS_SUPPORT_HEART_BEAT_V2 answer earns the address a place in the tables --
+     * a broker that never heard of the fields keeps receiving the subscriptions, untouched.
+     */
+    public function sendHeartbeatV2(
+        string $addr,
+        HeartbeatData $withSub,
+        HeartbeatData $withoutSub,
+        int $fingerprint,
+        int $timeoutMillis = 5000,
+    ): HeartbeatV2Result {
+        $simple = isset($this->supportV2BrokerAddrs[$addr])
+            && ($this->brokerAddrHeartbeatFingerprint[$addr] ?? null) === $fingerprint;
+        $request = RemotingCommand::createRequestCommand(RequestCode::HEART_BEAT, null);
+        $request->body = ($simple ? $withoutSub : $withSub)->encode();
+        $response = $this->invokeSync($addr, $request, $timeoutMillis);
+        $this->checkResponse($response);
+        $result = HeartbeatV2Result::fromResponse($response->version, $response->extFields);
+        if ($simple) {
+            if ($result->subChange) {
+                unset($this->brokerAddrHeartbeatFingerprint[$addr]);
+            }
+        } elseif ($result->supportV2) {
+            $this->supportV2BrokerAddrs[$addr] = true;
+            if ($result->subChange) {
+                unset($this->brokerAddrHeartbeatFingerprint[$addr]);
+            } else {
+                $this->brokerAddrHeartbeatFingerprint[$addr] = $fingerprint;
+            }
+        }
+        Logger::debug(sprintf(
+            'heartbeatV2 %s addr=%s supportV2=%s subChange=%s',
+            $simple ? 'simple' : 'normal',
+            $addr,
+            $result->supportV2 ? 'true' : 'false',
+            $result->subChange ? 'true' : 'false',
+        ));
+        return $result;
+    }
+
+    /**
+     * Forget every remembered fingerprint, so the next round to each broker re-delivers the
+     * subscriptions. The "this broker speaks the protocol" knowledge survives: it is a property of
+     * the broker, not of this round.
+     */
+    public function resetBrokerAddrHeartbeatFingerprint(): void
+    {
+        $this->brokerAddrHeartbeatFingerprint = [];
+    }
+
+    /** Addresses this instance is known to have registered with over the fingerprint path. */
+    public function supportV2BrokerAddrsForTest(): array
+    {
+        return array_keys($this->supportV2BrokerAddrs);
+    }
+
+    /** Remembered broker address => fingerprint table, for tests and diagnostics. */
+    public function heartbeatFingerprintTable(): array
+    {
+        return $this->brokerAddrHeartbeatFingerprint;
     }
 
     /** UNREGISTER_CLIENT(35): detach this clientId from this broker. */
@@ -2541,7 +2663,7 @@ class MQClientInstance
         $body->group = $consumerGroup;
         $body->subscriptionData = $subscriptionData;
         $request->body = $body->encode();
-        $response = $this->invokeSync($brokerAddr, $request, $timeoutMillis);
+        $response = $this->invokeSync($this->vipAddrFor($brokerAddr), $request, $timeoutMillis);
         if ($response->code !== ResponseCode::SUCCESS) {
             throw new MQClientException($response->remark ?? '', $response->code);
         }
@@ -2614,7 +2736,7 @@ class MQClientInstance
         $lastExc = null;
         for ($attempt = 0; $attempt < $attempts; $attempt++) {
             try {
-                $response = $this->invokeSync($brokerAddr, $request, $timeoutMillis);
+                $response = $this->invokeSync($this->vipAddrFor($brokerAddr), $request, $timeoutMillis);
                 $this->checkResponse($response);
                 return;
             } catch (MQBrokerException $e) {
@@ -2677,7 +2799,7 @@ class MQClientInstance
     {
         $request = RemotingCommand::createRequestCommand(RequestCode::DELETE_TOPIC_IN_BROKER, null);
         $request->extFields['topic'] = $topic;
-        $response = $this->invokeSync($brokerAddr, $request, $timeoutMillis);
+        $response = $this->invokeSync($this->vipAddrFor($brokerAddr), $request, $timeoutMillis);
         $this->checkResponse($response);
     }
 
@@ -2708,7 +2830,7 @@ class MQClientInstance
         $header = new GetConsumerListByGroupRequestHeader();
         $header->consumerGroup = $consumerGroup;
         $request = RemotingCommand::createRequestCommand(RequestCode::GET_CONSUMER_LIST_BY_GROUP, $header);
-        $response = $this->invokeSync($addr, $request, $timeoutMillis);
+        $response = $this->invokeSync($this->vipAddrFor($addr), $request, $timeoutMillis);
         $this->checkResponse($response);
         if ($response->body !== null && $response->body !== '') {
             return GetConsumerListByGroupResponseBody::decode($response->body);
@@ -2849,7 +2971,7 @@ class MQClientInstance
         $header->consumerGroup = $consumerGroup;
         $request = RemotingCommand::createRequestCommand(RequestCode::GET_CONSUMER_LIST_BY_GROUP, $header);
         try {
-            $response = $this->invokeSync($addr, $request, $timeoutMillis);
+            $response = $this->invokeSync($this->vipAddrFor($addr), $request, $timeoutMillis);
         } catch (\Throwable $e) {
             Logger::debug(sprintf(
                 'get_consumer_id_list_by_group failed, %s %s: %s',

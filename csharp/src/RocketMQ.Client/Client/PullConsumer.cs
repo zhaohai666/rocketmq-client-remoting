@@ -685,7 +685,7 @@ public sealed class DefaultMQPullConsumer
             ["brokerName"] = mq.BrokerName,
         };
         RemotingCommand response = c.InvokeSync(
-            addr, RequestCode.GetEarliestMsgStoretime, ext, null, false, 5000);
+            c.VipAddr(addr), RequestCode.GetEarliestMsgStoretime, ext, null, false, 5000);
         return ExtInt(response, "timestamp", 0);
     }
 
@@ -708,7 +708,7 @@ public sealed class DefaultMQPullConsumer
             UnitMode = _unitMode,
             MaxReconsumeTimes = null,
         };
-        c.InvokeSync(addr, RequestCode.ConsumerSendMsgBack, header.ToExtFields(), null, false, 5000);
+        c.InvokeSync(c.VipAddr(addr), RequestCode.ConsumerSendMsgBack, header.ToExtFields(), null, false, 5000);
     }
 
     public void CreateTopic(string key, string newTopic, int queueNum = 4)

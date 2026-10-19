@@ -8,7 +8,7 @@ declare(strict_types=1);
  * Covers: SendResult / ConsumerResult / TopAddressing / Latency / Metrics / Backpressure /
  * Hook / Validators / ConsumeExecutor / ConsumerStats / RequestReply / TraceContextPropagator.
  *
- * Run: C:/Users/zhaoh/.workbuddy/binaries/php/versions/8.3/php.exe tests/RunClientLeaf.php
+ * Run: php tests/RunClientLeaf.php
  * On success prints "ALL TESTS PASSED (N checks)"; any failure lists details and exits non-zero.
  */
 

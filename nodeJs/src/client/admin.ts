@@ -192,7 +192,12 @@ export class DefaultMQAdminExt {
   setNameServerAddressList(addrs: string[]): void { this.namesrvAddr = addrs.join(';'); }
   setInstanceName(name: string): void { this.instanceName = name; }
   setUnitName(unitName: string): void { this.unitName = unitName; }
-  setVipChannelEnabled(enable: boolean): void { this.vipChannelEnabled = enable; }
+  setVipChannelEnabled(enable: boolean): void {
+    this.vipChannelEnabled = enable;
+    // The offset / consumer-list requests are issued on the shared instance, so
+    // keep its VIP view in step with this facade's switch.
+    if (this.client != null) this.client.setVipChannelEnabled(enable);
+  }
   // Server-side namespace accessor, read live per request by NamespaceRpcHook.
   setNamespaceV2(namespaceV2: string | null): void { this.namespaceV2 = namespaceV2; }
   getNamespaceV2(): string | null { return this.namespaceV2; }
@@ -232,6 +237,9 @@ export class DefaultMQAdminExt {
     }
     manager.registerClient(clientId, client);
     this.client.start();
+    // A facade created with the VIP switch already on (before start()) must have
+    // it reflected on the instance it just obtained.
+    this.client.setVipChannelEnabled(this.vipChannelEnabled);
     this._started = true;
     logger.info(`adminExt ${this.adminExtGroup} started, clientId=${clientId}`);
   }
@@ -278,8 +286,24 @@ export class DefaultMQAdminExt {
   // Sends to one broker (with VIP translation) and raises on non-SUCCESS.
   private async _invokeBroker(addr: string, code: number, ext: Record<string, string> | null,
     body: Buffer | null = null, timeoutMillis?: number): Promise<RemotingCommand> {
+    return this._invokeChecked(this._vipChannel(addr), code, ext, body, timeoutMillis);
+  }
+
+  // Sends to an explicitly named name-server address and raises on non-SUCCESS.
+  // The VIP port (listen port - 2) is a broker-only contract, so a name-server
+  // address is used as-is and NEVER passed through the VIP translation.
+  private async _invokeNameServerAddr(addr: string, code: number,
+    ext: Record<string, string> | null, body: Buffer | null = null,
+    timeoutMillis?: number): Promise<RemotingCommand> {
+    return this._invokeChecked(addr, code, ext, body, timeoutMillis);
+  }
+
+  // Shared checked invoke: raise on any non-SUCCESS response. `target` is the
+  // already-resolved address to dial.
+  private async _invokeChecked(target: string, code: number,
+    ext: Record<string, string> | null, body: Buffer | null = null,
+    timeoutMillis?: number): Promise<RemotingCommand> {
     const client = this._requireClient();
-    const target = this._vipChannel(addr);
     const response = await client.remotingClient.invokeSync(target, this._request(code, ext, body),
       this._timeout(timeoutMillis));
     if (response.code !== ResponseCode.SUCCESS) {
@@ -456,7 +480,7 @@ export class DefaultMQAdminExt {
     const client = this._requireClient();
     const targets = addrs != null ? addrs : client.getNameServerAddressList();
     for (const nsAddr of targets) {
-      await this._invokeBroker(nsAddr, RequestCode.DELETE_TOPIC_IN_NAMESRV, adminExt({ topic }), null, 5000);
+      await this._invokeNameServerAddr(nsAddr, RequestCode.DELETE_TOPIC_IN_NAMESRV, adminExt({ topic }), null, 5000);
     }
   }
 
@@ -577,8 +601,12 @@ export class DefaultMQAdminExt {
   // GET_BROKER_CONFIG(26). The body is Properties-format TEXT on the broker
   // side, NOT JSON — a client that parses it as a KVTable fails on every real
   // broker.
+  //
+  // This read is the one broker RPC that always uses the listening port: the fast channel
+  // serves the other admin RPCs, not this one, so the address goes out untranslated even
+  // when the VIP switch is on.
   async getBrokerConfig(brokerAddr: string, timeoutMillis?: number): Promise<Record<string, string>> {
-    const response = await this._invokeBroker(brokerAddr, RequestCode.GET_BROKER_CONFIG, null,
+    const response = await this._invokeChecked(brokerAddr, RequestCode.GET_BROKER_CONFIG, null,
       null, timeoutMillis);
     return string2Properties((response.body as Buffer).toString('utf8'));
   }
@@ -594,7 +622,7 @@ export class DefaultMQAdminExt {
 
   // WIPE_WRITE_PERM_OF_BROKER(205) — returns the number of topics affected.
   async wipeWritePermOfBroker(namesrvAddr: string, brokerName: string): Promise<number> {
-    const response = await this._invokeBroker(namesrvAddr, RequestCode.WIPE_WRITE_PERM_OF_BROKER,
+    const response = await this._invokeNameServerAddr(namesrvAddr, RequestCode.WIPE_WRITE_PERM_OF_BROKER,
       adminExt({ brokerName }));
     const v = response.extFields ? response.extFields['wipeTopicCount'] : null;
     return v != null ? parseInt(v, 10) : 0;
@@ -602,7 +630,7 @@ export class DefaultMQAdminExt {
 
   // ADD_WRITE_PERM_OF_BROKER(327) — returns the number of topics affected.
   async addWritePermOfBroker(namesrvAddr: string, brokerName: string): Promise<number> {
-    const response = await this._invokeBroker(namesrvAddr, RequestCode.ADD_WRITE_PERM_OF_BROKER,
+    const response = await this._invokeNameServerAddr(namesrvAddr, RequestCode.ADD_WRITE_PERM_OF_BROKER,
       adminExt({ brokerName }));
     const v = response.extFields ? response.extFields['addTopicCount'] : null;
     return v != null ? parseInt(v, 10) : 0;
@@ -772,6 +800,9 @@ export class DefaultMQAdminExt {
   async getAllSubscriptionGroup(brokerAddr: string, timeoutMillis?: number): Promise<Record<string, any>> {
     const client = this._requireClient();
     const timeout = this._timeout(timeoutMillis);
+    // The VIP port is a broker-only contract; every page of this one request is
+    // dialled at the resolved target, never at the cached route address.
+    const target = this._vipChannel(brokerAddr);
     let currentDataVersion: Record<string, any> | null = null;
     let groupSeq = 0;
     const table: Record<string, any> = {};
@@ -785,10 +816,10 @@ export class DefaultMQAdminExt {
       if (currentDataVersion != null) {
         ext['dataVersion'] = JSON.stringify(currentDataVersion);
       }
-      const response = await client.remotingClient.invokeSync(brokerAddr,
+      const response = await client.remotingClient.invokeSync(target,
         this._request(RequestCode.GET_ALL_SUBSCRIPTIONGROUP_CONFIG, ext), left);
       if (response.code !== ResponseCode.SUCCESS) {
-        throw new MQBrokerException(response.code, response.remark || '', brokerAddr);
+        throw new MQBrokerException(response.code, response.remark || '', target);
       }
       const wrapper = RemotingSerializable.decode(response.body as Buffer) as Record<string, any>;
       const subTable = (wrapper['subscriptionGroupTable'] || {}) as Record<string, any>;
@@ -1265,9 +1296,10 @@ export class DefaultMQAdminExt {
       timestamp: String(timestamp),
       boundaryType: BoundaryType.get_type(boundaryType),
     }));
-    const response = await client.remotingClient.invokeSync(brokerAddr, request, this._timeout());
+    const target = this._vipChannel(brokerAddr);
+    const response = await client.remotingClient.invokeSync(target, request, this._timeout());
     if (response.code !== ResponseCode.SUCCESS) {
-      throw new MQBrokerException(response.code, response.remark || `CODE: ${response.code}`, brokerAddr);
+      throw new MQBrokerException(response.code, response.remark || `CODE: ${response.code}`, target);
     }
     const offset = response.extFields != null ? response.extFields['offset'] : null;
     return offset != null ? parseInt(offset, 10) : 0;
@@ -1403,9 +1435,10 @@ export class DefaultMQAdminExt {
       offset: String(offset),
       topic,
     }));
-    const response = await client.remotingClient.invokeSync(addr, request, this._timeout());
+    const target = this._vipChannel(addr);
+    const response = await client.remotingClient.invokeSync(target, request, this._timeout());
     if (response.code !== ResponseCode.SUCCESS) {
-      throw new MQBrokerException(response.code, response.remark || `CODE: ${response.code}`, addr);
+      throw new MQBrokerException(response.code, response.remark || `CODE: ${response.code}`, target);
     }
     if (response.body == null || response.body.length === 0) {
       throw new MQClientException(`message not found: ${msgId}`);

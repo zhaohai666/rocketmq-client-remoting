@@ -126,6 +126,26 @@ def test_vip_knob_defaults_off_and_only_rewrites_broker_requests():
     assert client.requests[-1][0] == NS_ADDR
 
 
+def test_vip_knob_rewrites_the_admin_family_but_not_broker_config_reads():
+    client = _FakeClient([_ok(), _ok(), _ok(), _ok()])
+    admin = _admin(client)
+    admin.set_vip_channel_enabled(True)
+
+    admin.fetch_broker_runtime_stats(ADDR_A)
+    assert client.requests[-1][0] == "127.0.0.1:10909"
+
+    admin.get_all_subscription_group(ADDR_A)
+    assert client.requests[-1][0] == "127.0.0.1:10909"
+
+    admin._invoke_broker_reset_offset(ADDR_A, TOPIC, GROUP, 0, True, False)
+    assert client.requests[-1][0] == "127.0.0.1:10909"
+
+    # The control: reading a broker's own config is answered on the plain port, so it must stay put
+    # even with the switch on.
+    admin.get_broker_config(ADDR_A)
+    assert client.requests[-1][0] == ADDR_A
+
+
 # ------------------------------------------------------------------ examineConsumeStatsGroup
 
 def test_examine_consume_stats_group_merges_brokers_and_sums_tps():

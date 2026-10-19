@@ -422,6 +422,20 @@ class DefaultMQProducer
      * See NamespaceRpcHook.
      */
     public string $namespaceV2 = '';
+    /**
+     * Heartbeat fingerprint path (default false). On, this facade's HEART_BEAT(34) rounds carry a
+     * non-zero heartbeatFingerprint and, once a broker answers IS_SUPPORT_HEART_BEAT_V2 and the
+     * fingerprint is unchanged, the subscription set drops out of the body.
+     */
+    public bool $useHeartbeatV2 = false;
+    /**
+     * VIP channel (default false). The broker opens this second channel at `listen port - 2` only
+     * when it was started with it enabled, so the default keeps every request on the published port.
+     * On, the requests it answers there -- message sends in all flavours, and the earliest-message
+     * lookup this facade exposes -- are addressed at that port; heartbeats, transaction back-checks
+     * and the oneway END_TRANSACTION never shift.
+     */
+    public bool $vipChannelEnabled = false;
 
     public string $createTopicKey = MixAll::DEFAULT_TOPIC;
     public int $defaultTopicQueueNums = MixAll::DEFAULT_TOPIC_QUEUE_NUMS;
@@ -748,6 +762,23 @@ class DefaultMQProducer
     public function setUnitName(?string $unitName): void
     {
         $this->unitName = $unitName;
+    }
+
+    /**
+     * Turn the VIP channel on or off, and push the change into the live client instance so the next
+     * request already carries the rewritten port.
+     */
+    public function setVipChannelEnabled(bool $enable): void
+    {
+        $this->vipChannelEnabled = $enable;
+        if ($this->mqClient !== null) {
+            $this->mqClient->vipChannelEnabled = $enable;
+        }
+    }
+
+    public function isVipChannelEnabled(): bool
+    {
+        return $this->vipChannelEnabled;
     }
 
     public function getUnitName(): ?string
@@ -1277,6 +1308,8 @@ class DefaultMQProducer
             pollNameServerInterval: $this->pollNameServerInterval,
             tlsOptions: $this->tlsOptions,
             socksProxy: $this->socksProxy,
+            useHeartbeatV2: $this->useHeartbeatV2,
+            vipChannelEnabled: $this->vipChannelEnabled,
         );
         if ($this->rpcHook !== null) {
             $this->mqClient->remotingClient->registerRpcHook($this->rpcHook);
@@ -1406,11 +1439,27 @@ class DefaultMQProducer
         }
         $hb = new HeartbeatData($this->clientId ?? '');
         $pd = new ProducerData($this->producerGroup);
-        // heartbeatFingerprint / withoutSub are pinned to 0/false by HeartbeatData::toDict(),
-        // which keeps the broker on the V1 registration path (the full subscription set is
-        // reported alongside the group).
+        // heartbeatFingerprint / withoutSub keep their 0/false defaults on the legacy path, which
+        // is what keeps the broker on its full registration branch (the group is reported
+        // alongside the subscription set). With the fingerprint path on, both fields are filled in
+        // below and the instance's tables decide which body each broker gets.
         $hb->producerDataSet[] = $pd;
         $okCount = 0;
+        if ($client->useHeartbeatV2) {
+            // One fingerprint for the round, carried by both bodies.
+            $fingerprint = $hb->computeFingerprint();
+            $hb->heartbeatFingerprint = $fingerprint;
+            $withoutSub = $hb->withoutSubCopy();
+            foreach ($addrs as $addr) {
+                try {
+                    $client->sendHeartbeatV2($addr, $hb, $withoutSub, $fingerprint, $timeoutMillis);
+                    $okCount++;
+                } catch (\Throwable $e) {
+                    Logger::warning(sprintf('producer heartbeat to %s failed: %s', $addr, $e->getMessage()));
+                }
+            }
+            return $okCount;
+        }
         foreach ($addrs as $addr) {
             try {
                 $client->sendHeartbeat($addr, $hb, $timeoutMillis);
@@ -2783,7 +2832,7 @@ class DefaultMQProducer
         }
         $header = new GetEarliestMsgStoretimeRequestHeader(topic: $mq->topic, queueId: $mq->queueId);
         $request = RemotingCommand::createRequestCommand(RequestCode::GET_EARLIEST_MSG_STORETIME, $header);
-        $response = $client->remotingClient->invokeSync($addr, $request, 5000);
+        $response = $client->remotingClient->invokeSync($client->vipAddrFor($addr), $request, 5000);
         if ($response->code !== ResponseCode::SUCCESS) {
             throw new MQBrokerException($response->code, $response->remark ?? '');
         }

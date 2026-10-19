@@ -1657,7 +1657,7 @@ export class DefaultMQPushConsumer {
     h.unitMode = this.unitMode;
     h.maxReconsumeTimes = maxReconsume;
     const request = RemotingCommand.createRequestCommand(RequestCode.CONSUMER_SEND_MSG_BACK, h);
-    const response = await client.remotingClient.invokeSync(addr, request, 5000);
+    const response = await client.remotingClient.invokeSync(client.vipChannel(addr), request, 5000);
     if (response.code !== ResponseCode.SUCCESS) {
       throw new Error(`sendMessageBack failed: CODE ${response.code} ${response.remark || ''}`);
     }
@@ -2098,7 +2098,7 @@ export class DefaultMQPushConsumer {
       const request = RemotingCommand.createRequestCommand(RequestCode.LOCK_BATCH_MQ, h);
       request.body = Buffer.from(JSON.stringify(body), 'utf-8');
       try {
-        const response = await client.remotingClient.invokeSync(addr, request, 1000);
+        const response = await client.remotingClient.invokeSync(client.vipChannel(addr), request, 1000);
         if (response.code !== ResponseCode.SUCCESS) {
           logger.warning('batch lock rejected by broker %s: CODE %s %s', brokerName, response.code, response.remark || '');
           continue;
@@ -2143,7 +2143,7 @@ export class DefaultMQPushConsumer {
       const request = RemotingCommand.createRequestCommand(RequestCode.UNLOCK_BATCH_MQ, h);
       request.body = Buffer.from(JSON.stringify(body), 'utf-8');
       try {
-        await client.remotingClient.invokeSync(addr, request, 1000);
+        await client.remotingClient.invokeSync(client.vipChannel(addr), request, 1000);
       } catch (e) {
         logger.debug('batch unlock failed for broker %s: %s', brokerName, (e as Error).message);
       }

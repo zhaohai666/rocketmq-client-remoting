@@ -427,6 +427,8 @@ void DefaultMQPushConsumer::start() {
                                              /*invokeTimeoutMillis=*/pullTimeoutMillis_,
                                              tlsEnable_, unitName_,
                                              pollNameServerIntervalMillis_));
+        // Broker VIP channel: forwarded to the instance that owns the broker RPCs (off = plain address).
+        mqClient_->setVipChannelEnabled(vipChannelEnabled_);
         // TLS strict verification option (non-empty caCert = strict verification): forwarded to the instance and the underlying transport
         if (tlsOptionsSet_) {
             mqClient_->setTlsOptions(tlsOptions_);
@@ -3742,7 +3744,10 @@ bool DefaultMQPushConsumer::sendMessageBack(const MessageExt& msg, int32_t delay
         header->maxReconsumeTimes = maxReconsumeTimesOrDefault();
         RemotingCommand request =
             RemotingCommand::createRequestCommand(RequestCode::CONSUMER_SEND_MSG_BACK, header);
-        RemotingCommand response = c.remotingClient().invokeSync(addr, request, 5000);
+        // CONSUMER_SEND_MSG_BACK is a broker write the VIP switch rewrites; applied per request at
+        // this invoke boundary, the shifted address is never cached.
+        RemotingCommand response = c.remotingClient().invokeSync(
+            MixAll::brokerVipChannel(c.isVipChannelEnabled(), addr), request, 5000);
         if (response.code != ResponseCode::SUCCESS) {
             throw MQBrokerException(response.code, response.remark);
         }

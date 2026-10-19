@@ -177,6 +177,10 @@ public:
     // passed through to MQClientInstance in start().
     void setPollNameServerIntervalMillis(int32_t millis) { pollNameServerIntervalMillis_ = millis; }
     int32_t pollNameServerIntervalMillis() const { return pollNameServerIntervalMillis_; }
+    // Broker VIP channel: when true the rewritten broker request family is sent to port - 2 of the
+    // route address. Must be set before start(); forwarded to the MQClientInstance that owns the RPCs.
+    void setVipChannelEnabled(bool enable) { vipChannelEnabled_ = enable; }
+    bool isVipChannelEnabled() const { return vipChannelEnabled_; }
     // persistConsumerOffsetInterval (default 5000ms): the background consumer-offset flush period;
     // the final flush of shutdown() is independent of it (raising it only delays the timing, it never drops an offset).
     void setPersistConsumerOffsetIntervalMillis(int32_t millis) {
@@ -778,6 +782,7 @@ private:
     bool postSubscriptionWhenPull_ = false;
     // Facade-level copies of the ClientConfig fields (each passed through / read once in start())
     int32_t pollNameServerIntervalMillis_ = 30000;
+    bool vipChannelEnabled_ = false;
     int32_t persistConsumerOffsetIntervalMillis_ = 5000;
     std::string messageModel_ = MessageModel::CLUSTERING;
     std::string consumeFromWhere_ = ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET;

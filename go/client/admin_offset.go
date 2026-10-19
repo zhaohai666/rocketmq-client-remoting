@@ -60,7 +60,7 @@ func (a *DefaultMQAdminExt) searchOffsetWithBoundary(mq common.MessageQueue, tim
 		Timestamp:    remoting.I64Ptr(timestamp),
 		BoundaryType: &boundary,
 	}
-	response, err := instance.invokeSync(addr,
+	response, err := instance.invokeSync(a.brokerVIPAddr(addr),
 		remoting.CreateRequestCommand(remoting.ReqSearchOffsetByTimestamp, header), a.timeout(0))
 	if err != nil {
 		return 0, err
@@ -89,7 +89,7 @@ func (a *DefaultMQAdminExt) EarliestMsgStoreTime(mq common.MessageQueue) (int64,
 	if err != nil {
 		return 0, err
 	}
-	response, err := instance.invokeSync(addr, adminRequest(remoting.ReqGetEarliestMsgStoretime,
+	response, err := instance.invokeSync(a.brokerVIPAddr(addr), adminRequest(remoting.ReqGetEarliestMsgStoretime,
 		adminExt("topic", mq.Topic, "queueId", mq.QueueID, "brokerName", mq.BrokerName)), a.timeout(0))
 	if err != nil {
 		return 0, err
@@ -208,7 +208,7 @@ func (a *DefaultMQAdminExt) invokeBrokerResetOffset(brokerAddr, topic, group str
 	if isCpp {
 		request.Language = remoting.LangCPP
 	}
-	response, err := instance.invokeSync(brokerAddr, request, a.timeout(0))
+	response, err := instance.invokeSync(a.brokerVIPAddr(brokerAddr), request, a.timeout(0))
 	if err != nil {
 		return nil, err
 	}
@@ -421,7 +421,7 @@ func (a *DefaultMQAdminExt) queryMessageOneBroker(addr, topic, key string, maxNu
 		// with the default query count).
 		request.AddExtField(common.UniqueMsgQueryFlag, "true")
 	}
-	response, err := instance.invokeSync(addr, request, a.timeout(0))
+	response, err := instance.invokeSync(a.brokerVIPAddr(addr), request, a.timeout(0))
 	if err != nil {
 		return nil, err
 	}
@@ -464,8 +464,11 @@ func (a *DefaultMQAdminExt) viewMessageByID(topic, msgID string) (*common.Messag
 	if port == 0 || port > 65535 {
 		return nil, common.ClientError(fmt.Sprintf("not a valid offset msgId: %s", msgID))
 	}
+	// The address is the store host:port the broker stamped into the offset
+	// msgId — a broker address, so the VIP-channel rewrite applies to it like to
+	// any other query request.
 	addr := fmt.Sprintf("%s:%d", ip, port)
-	response, err := instance.invokeSync(addr, adminRequest(remoting.ReqViewMessageByID,
+	response, err := instance.invokeSync(a.brokerVIPAddr(addr), adminRequest(remoting.ReqViewMessageByID,
 		adminExt("topic", topic, "offset", offset)), a.timeout(0))
 	if err != nil {
 		return nil, err

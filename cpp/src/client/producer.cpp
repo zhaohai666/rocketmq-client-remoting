@@ -228,6 +228,8 @@ void DefaultMQProducer::start() {
                                          /*invokeTimeoutMillis=*/15000,
                                          tlsEnable_, unitName_,
                                          pollNameServerIntervalMillis_));
+    // Broker VIP channel: forwarded to the instance that owns the broker RPCs (off = plain address).
+    mqClient_->setVipChannelEnabled(vipChannelEnabled_);
     // TLS strict-verification option (non-empty caCert = strict verification): forwarded to the instance and the underlying transport
     if (tlsOptionsSet_) {
         mqClient_->setTlsOptions(tlsOptions_);

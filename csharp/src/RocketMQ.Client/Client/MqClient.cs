@@ -1677,7 +1677,9 @@ public sealed class MQClientInstance : IDisposable
             request.ExtFields["setZeroIfNotFound"] = "true";
         }
 
-        RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
+        // The broker also listens on (route port - 2) for offset reads; the rewrite happens
+        // per request so a shifted address is never kept in the route tables.
+        RemotingCommand response = InvokeSyncOnAddr(VipAddr(addr), request, timeoutMillis);
         if (response.Code == ResponseCode.QueryNotFound)
         {
             return false;
@@ -1703,7 +1705,7 @@ public sealed class MQClientInstance : IDisposable
             CommitOffset = commitOffset,
         };
         RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.UpdateConsumerOffset, header);
-        RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
+        RemotingCommand response = InvokeSyncOnAddr(VipAddr(addr), request, timeoutMillis);
         CheckResponseCode(response);
     }
 
@@ -1754,7 +1756,7 @@ public sealed class MQClientInstance : IDisposable
             body.Set("clientId", JsonValue.MakeString(clientId));
             body.Set("mqSet", BuildMqSetJson(kv.Value));
             byte[] payload = Encoding.UTF8.GetBytes(body.Dump());
-            RemotingCommand response = InvokeSyncRaw(addr, RequestCode.LockBatchMq,
+            RemotingCommand response = InvokeSyncRaw(VipAddr(addr), RequestCode.LockBatchMq,
                 null, payload, true, timeoutMillis);
             CheckResponseCode(response);
             // LockBatchResponseBody: {"lockOKMQSet":[{topic,brokerName,queueId}]}
@@ -1813,7 +1815,7 @@ public sealed class MQClientInstance : IDisposable
             body.Set("clientId", JsonValue.MakeString(clientId));
             body.Set("mqSet", BuildMqSetJson(kv.Value));
             byte[] payload = Encoding.UTF8.GetBytes(body.Dump());
-            RemotingCommand response = InvokeSyncRaw(addr, RequestCode.UnlockBatchMq,
+            RemotingCommand response = InvokeSyncRaw(VipAddr(addr), RequestCode.UnlockBatchMq,
                 null, payload, true, timeoutMillis);
             CheckResponseCode(response);
         }
@@ -1828,7 +1830,7 @@ public sealed class MQClientInstance : IDisposable
             QueueId = mq.QueueId,
         };
         RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.GetMaxOffset, header);
-        RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
+        RemotingCommand response = InvokeSyncOnAddr(VipAddr(addr), request, timeoutMillis);
         CheckResponseCode(response);
         var respHeader = new GetMaxOffsetResponseHeader();
         respHeader.FromExtFields(response.ExtFields);
@@ -1844,7 +1846,7 @@ public sealed class MQClientInstance : IDisposable
             QueueId = mq.QueueId,
         };
         RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.GetMinOffset, header);
-        RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
+        RemotingCommand response = InvokeSyncOnAddr(VipAddr(addr), request, timeoutMillis);
         CheckResponseCode(response);
         var respHeader = new GetMinOffsetResponseHeader();
         respHeader.FromExtFields(response.ExtFields);
@@ -1867,7 +1869,7 @@ public sealed class MQClientInstance : IDisposable
             BoundaryType = boundaryType,
         };
         RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.SearchOffsetByTimestamp, header);
-        RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
+        RemotingCommand response = InvokeSyncOnAddr(VipAddr(addr), request, timeoutMillis);
         CheckResponseCode(response);
         var respHeader = new SearchOffsetResponseHeader();
         respHeader.FromExtFields(response.ExtFields);
@@ -2246,7 +2248,7 @@ public sealed class MQClientInstance : IDisposable
         };
         request.Body = body.Encode();
         request.HasBody = true;
-        RemotingCommand response = InvokeSyncOnAddr(brokerAddr, request, timeoutMillis);
+        RemotingCommand response = InvokeSyncOnAddr(VipAddr(brokerAddr), request, timeoutMillis);
         if (response.Code != ResponseCode.Success)
         {
             throw new MQClientException(response.Remark, response.Code);
@@ -2375,7 +2377,7 @@ public sealed class MQClientInstance : IDisposable
         {
             try
             {
-                RemotingCommand response = InvokeSyncOnAddr(brokerAddr, request, timeoutMillis);
+                RemotingCommand response = InvokeSyncOnAddr(VipAddr(brokerAddr), request, timeoutMillis);
                 CheckResponseCode(response);
                 return;
             }
@@ -2436,7 +2438,7 @@ public sealed class MQClientInstance : IDisposable
     public void DeleteTopicInBroker(string brokerAddr, string topic, int timeoutMillis = 5000)
     {
         var ext = new PropertyMap { ["topic"] = topic };
-        InvokeSync(brokerAddr, RequestCode.DeleteTopicInBroker, ext, null, false, timeoutMillis);
+        InvokeSync(VipAddr(brokerAddr), RequestCode.DeleteTopicInBroker, ext, null, false, timeoutMillis);
     }
 
     public void DeleteTopicInNamesrv(string topic, int timeoutMillis = 5000)
@@ -2515,7 +2517,7 @@ public sealed class MQClientInstance : IDisposable
             ConsumerGroup = consumerGroup,
         };
         RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.GetConsumerListByGroup, header);
-        RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
+        RemotingCommand response = InvokeSyncOnAddr(VipAddr(addr), request, timeoutMillis);
         CheckResponseCode(response);
         GetConsumerListByGroupResponseBody.Decode(response.Body, out GetConsumerListByGroupResponseBody @out);
         return @out;
@@ -2564,7 +2566,7 @@ public sealed class MQClientInstance : IDisposable
                 Bname = brokerName.Length > 0 ? brokerName : null,
             };
             RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.GetConsumerListByGroup, header);
-            RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
+            RemotingCommand response = InvokeSyncOnAddr(VipAddr(addr), request, timeoutMillis);
             if (response.Code != ResponseCode.Success || response.Body.Length == 0)
             {
                 return null;
@@ -2645,7 +2647,7 @@ public sealed class MQClientInstance : IDisposable
             request.ExtFields[MixAll.UniqueMsgQueryFlag] = "true";
         }
 
-        RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
+        RemotingCommand response = InvokeSyncOnAddr(VipAddr(addr), request, timeoutMillis);
         if (response.Code == ResponseCode.QueryNotFound)
         {
             return false;

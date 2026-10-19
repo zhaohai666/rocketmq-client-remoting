@@ -439,7 +439,7 @@ export class DefaultMQPullConsumer {
     h.unitMode = this.unitMode;
     h.maxReconsumeTimes = this.maxReconsumeTimes === -1 ? 16 : this.maxReconsumeTimes;
     const request = RemotingCommand.createRequestCommand(RequestCode.CONSUMER_SEND_MSG_BACK, h);
-    const response = await this.mqClient.remotingClient.invokeSync(addr, request, 5000);
+    const response = await this.mqClient.remotingClient.invokeSync(this.mqClient.vipChannel(addr), request, 5000);
     if (response.code !== ResponseCode.SUCCESS) {
       throw new Error(`sendMessageBack failed: CODE ${response.code} ${response.remark || ''}`);
     }

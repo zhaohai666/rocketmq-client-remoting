@@ -13,6 +13,13 @@
 //   - CONSUMER_SEND_MSG_BACK(36): MASTER ONLY (a slave does not accept it);
 //   - offset queries (max/min/timestamp): master first, one route refresh,
 //     then master again (consistent with MQAdminImpl).
+//
+// Every RPC in this file is also a broker-facing one, so each carries the
+// request at the address the VIP-channel contract asks for: with the switch on,
+// the address handed to the invoke is the resolved address shifted to
+// `port - 2`; with it off — the default — the resolved address goes out
+// unchanged. The shift happens at the invoke boundary only, so the cached route
+// keeps publishing the address the nameserver returned.
 package client
 
 import (
@@ -23,11 +30,13 @@ import (
 )
 
 // GetConsumerListByGroup sends GET_CONSUMER_LIST_BY_GROUP(38) to one broker and
-// returns the group's online clientIds. Used by rebalance.
+// returns the group's online clientIds. Used by rebalance. It is a broker-facing
+// RPC the VIP-channel contract rewrites, so the address is shifted at this
+// invoke boundary.
 func (i *Instance) GetConsumerListByGroup(addr, group string, timeoutMillis int64) ([]string, error) {
 	header := &remoting.GetConsumerListByGroupRequestHeader{ConsumerGroup: remoting.StrPtr(group)}
 	request := remoting.CreateRequestCommand(remoting.ReqGetConsumerListByGroup, header)
-	response, err := i.invokeSync(addr, request, timeoutMillis)
+	response, err := i.invokeSync(i.brokerVIPAddr(addr), request, timeoutMillis)
 	if err != nil {
 		return nil, err
 	}
@@ -115,7 +124,7 @@ func (i *Instance) batchLock(group, clientID string, mqs []common.MessageQueue, 
 			})
 			request.SetBody(body.Encode())
 		}
-		response, err := i.invokeSync(addr, request, timeoutMillis)
+		response, err := i.invokeSync(i.brokerVIPAddr(addr), request, timeoutMillis)
 		if err != nil {
 			common.LogWarnf("batch lock/unlock failed for broker %s: %v", brokerName, err)
 			continue
@@ -151,7 +160,8 @@ func (i *Instance) GetMaxOffset(mq common.MessageQueue, timeoutMillis int64) (in
 		Topic:   remoting.StrPtr(mq.Topic),
 		QueueID: remoting.I32Ptr(mq.QueueID),
 	}
-	response, err := i.invokeSync(addr, remoting.CreateRequestCommand(remoting.ReqGetMaxOffset, header), timeoutMillis)
+	response, err := i.invokeSync(i.brokerVIPAddr(addr),
+		remoting.CreateRequestCommand(remoting.ReqGetMaxOffset, header), timeoutMillis)
 	if err != nil {
 		return 0, err
 	}
@@ -173,7 +183,8 @@ func (i *Instance) GetMinOffset(mq common.MessageQueue, timeoutMillis int64) (in
 		Topic:   remoting.StrPtr(mq.Topic),
 		QueueID: remoting.I32Ptr(mq.QueueID),
 	}
-	response, err := i.invokeSync(addr, remoting.CreateRequestCommand(remoting.ReqGetMinOffset, header), timeoutMillis)
+	response, err := i.invokeSync(i.brokerVIPAddr(addr),
+		remoting.CreateRequestCommand(remoting.ReqGetMinOffset, header), timeoutMillis)
 	if err != nil {
 		return 0, err
 	}
@@ -197,7 +208,8 @@ func (i *Instance) SearchOffsetByTimestamp(mq common.MessageQueue, timestamp int
 		Timestamp:    remoting.I64Ptr(timestamp),
 		BoundaryType: &lower,
 	}
-	response, err := i.invokeSync(addr, remoting.CreateRequestCommand(remoting.ReqSearchOffsetByTimestamp, header), timeoutMillis)
+	response, err := i.invokeSync(i.brokerVIPAddr(addr),
+		remoting.CreateRequestCommand(remoting.ReqSearchOffsetByTimestamp, header), timeoutMillis)
 	if err != nil {
 		return 0, err
 	}
@@ -227,7 +239,8 @@ func (i *Instance) sendMessageBack(group string, msg *common.MessageExt, delayLe
 		UnitMode:          remoting.BoolPtr(unitMode),
 		MaxReconsumeTimes: remoting.I32Ptr(maxReconsumeTimes),
 	}
-	response, err := i.invokeSync(addr, remoting.CreateRequestCommand(remoting.ReqConsumerSendMsgBack, header), timeoutMillis)
+	response, err := i.invokeSync(i.brokerVIPAddr(addr),
+		remoting.CreateRequestCommand(remoting.ReqConsumerSendMsgBack, header), timeoutMillis)
 	if err != nil {
 		return err
 	}

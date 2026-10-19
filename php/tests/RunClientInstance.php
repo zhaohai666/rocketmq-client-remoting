@@ -5,7 +5,7 @@ declare(strict_types=1);
 /**
  * MQClientInstance pure-PHP assert-style self test (no phpunit, no real cluster).
  *
- * Run: C:/Users/zhaoh/.workbuddy/binaries/php/versions/8.3/php.exe tests/RunClientInstance.php
+ * Run: php tests/RunClientInstance.php
  * On success prints "ALL TESTS PASSED (N checks)"; any failure lists details and exits non-zero.
  *
  * Network cases (route fetch / default-topic fallback, PULL, POP, offsets, etc.) are served by a
@@ -37,6 +37,7 @@ use RocketMQ\Common\MessageQueue;
 use RocketMQ\Common\MixAll;
 use RocketMQ\Common\PermName;
 use RocketMQ\Common\PullSysFlag;
+use RocketMQ\Common\SubscriptionData;
 use RocketMQ\Remoting\Protocol\BrokerData;
 use RocketMQ\Remoting\Protocol\ConsumerData;
 use RocketMQ\Remoting\Protocol\ExtraInfoUtil;
@@ -1024,6 +1025,255 @@ final class RunClientInstance
         $broker->stop();
     }
 
+    // ==================================================== 11b. heartbeat fingerprint rounds
+
+    /**
+     * Seed the two lookup tables one route fetch would have filled: the heartbeat fan-out walks the
+     * cached topic routes, while the lock family resolves a broker by name, so a probe needs both
+     * before a request leaves.
+     */
+    private function seedProbeRoute(MQClientInstance $probe): void
+    {
+        $route = new TopicRouteData();
+        $route->brokerDatas = [new BrokerData('DefaultCluster', 'broker-a', [MixAll::MASTER_ID => '127.0.0.1:10911'])];
+        $probe->topicRouteTable['V2BeatTopic'] = $route;
+        $probe->brokerAddrTable['broker-a'] = [MixAll::MASTER_ID => '127.0.0.1:10911'];
+    }
+
+    /**
+     * The fingerprint path decides per broker, per round, from what that broker answered last time.
+     * Every assertion here is about which body left the client, because that is all the broker sees:
+     * the full one while it has not said it understands the fields (or the moment it says its own
+     * table moved), the subscription-free one only once both are remembered.
+     */
+    private function testHeartbeatV2Rounds(): void
+    {
+        $brokerAddrs = ['127.0.0.1:10911'];
+
+        // -- control: switch off, the round is the plain registration body and stays that way.
+        $legacy = new HeartbeatV2ProbeInstance('v2-off', $brokerAddrs, 2000, 3000);
+        $this->seedProbeRoute($legacy);
+        $legacy->registerProducer('GID_v2_p');
+        $legacy->heartbeatOnce();
+        $legacy->script[] = ['supportV2' => true, 'subChange' => false];
+        $legacy->heartbeatOnce();
+        $this->checkSame(2, count($legacy->sent), 'two rounds went out');
+        $this->checkSame(
+            [0, false],
+            [$legacy->sent[0]['fingerprint'], $legacy->sent[0]['withoutSub']],
+            'with the switch off the body reports fingerprint 0, which is the broker legacy path',
+        );
+        $this->checkSame([], $legacy->supportV2BrokerAddrsForTest(),
+            'a client with the switch off never learns that a broker speaks the protocol');
+        $this->checkSame([], $legacy->heartbeatFingerprintTable(), 'and remembers no fingerprint');
+        $legacy->shutdown();
+        MQClientInstance::removeInstance('v2-off');
+
+        // -- switch on, broker does not know the fields: the full body keeps going out.
+        $naive = new HeartbeatV2ProbeInstance('v2-naive', $brokerAddrs, 2000, 3000);
+        $this->seedProbeRoute($naive);
+        $naive->useHeartbeatV2 = true;
+        $naive->registerProducer('GID_v2_p');
+        $naive->heartbeatOnce();
+        $naive->heartbeatOnce();
+        $this->check($naive->sent[0]['fingerprint'] !== 0, 'a stamped body carries a non-zero fingerprint');
+        $this->checkSame(false, $naive->sent[0]['withoutSub'], 'the first round to a broker sends the subscriptions');
+        $this->checkSame($naive->sent[0]['fingerprint'], $naive->sent[1]['fingerprint'],
+            'unchanged subscriptions keep the same fingerprint');
+        $this->checkSame(false, $naive->sent[1]['withoutSub'],
+            'a broker that does not answer the fields keeps receiving the subscriptions');
+        $this->checkSame([], $naive->supportV2BrokerAddrsForTest(),
+            'only an IS_SUPPORT_HEART_BEAT_V2 answer earns the address a place in the tables');
+        $naive->shutdown();
+        MQClientInstance::removeInstance('v2-naive');
+
+        // -- switch on, broker answers: full round, then cheap rounds, then whatever moves it back.
+        $p = new HeartbeatV2ProbeInstance('v2-live', $brokerAddrs, 2000, 3000);
+        $this->seedProbeRoute($p);
+        $p->useHeartbeatV2 = true;
+        $p->registerProducer('GID_v2_p');
+        $consumer = new DefaultMQPushConsumer('GID_v2_c');
+        $consumer->subscribe('V2SubTopic', 'tagA');
+        $p->registerConsumer('GID_v2_c', $consumer);
+
+        $p->script[] = ['supportV2' => true, 'subChange' => false];
+        $p->heartbeatOnce();
+        $full = $p->sent[0];
+        $this->checkSame(['V2SubTopic:tagA'], $full['subs'], 'the first body carries the subscription');
+        $this->checkSame(['127.0.0.1:10911'], $p->supportV2BrokerAddrsForTest(),
+            'the address that answered IS_SUPPORT_HEART_BEAT_V2 is remembered');
+        $this->checkSame(['127.0.0.1:10911' => $full['fingerprint']], $p->heartbeatFingerprintTable(),
+            'and the fingerprint it accepted is stored under that address');
+
+        $p->heartbeatOnce();
+        $cheap = $p->sent[1];
+        $this->checkSame(true, $cheap['withoutSub'], 'the remembered broker gets the subscription-free body');
+        $this->checkSame([], $cheap['subs'], 'and that body really holds no subscription set');
+        $this->checkSame($full['producers'], $cheap['producers'], 'the producer half still rides along');
+        $this->checkSame($full['consumers'], $cheap['consumers'], 'so does the consumer group');
+        $this->checkSame($full['fingerprint'], $cheap['fingerprint'],
+            'the cheap body keeps the full body stamp rather than recomputing one');
+
+        // The broker says its own table moved: forget the fingerprint, send everything again.
+        $p->script[] = ['supportV2' => true, 'subChange' => true];
+        $p->heartbeatOnce();
+        $this->checkSame(true, $p->sent[2]['withoutSub'],
+            'a broker that already knows us gets the cheap body first, then learns it disagrees');
+        $this->checkSame([], $p->heartbeatFingerprintTable(),
+            'IS_SUB_CHANGE drops the remembered fingerprint so the next round re-delivers');
+        $p->script[] = ['supportV2' => true, 'subChange' => false];
+        $p->heartbeatOnce();
+        $this->checkSame(false, $p->sent[3]['withoutSub'], 'the next round carries the subscriptions again');
+        $this->checkSame(['V2SubTopic:tagA'], $p->sent[3]['subs'], 'the whole subscription set is back');
+        $this->checkSame(['127.0.0.1:10911' => $p->sent[3]['fingerprint']], $p->heartbeatFingerprintTable(),
+            'and the re-delivered body re-arms the remembered stamp');
+
+        // A new subscription is a new fingerprint, so the remembered broker gets the full body.
+        $p->heartbeatOnce();
+        $this->checkSame(true, $p->sent[4]['withoutSub'], 'once re-armed the broker is back on the cheap body');
+        $consumer->subscribe('V2SecondTopic', 'tagB');
+        $p->script[] = ['supportV2' => true, 'subChange' => false];
+        $p->heartbeatOnce();
+        $this->checkSame(false, $p->sent[5]['withoutSub'],
+            'a subscription change moves the fingerprint, so the full body goes out');
+        $this->check(['V2SubTopic:tagA', 'V2SecondTopic:tagB'] === array_values($p->sent[5]['subs']),
+            'both subscriptions are reported in the round that re-delivers them');
+
+        // A rebalance round must re-deliver even to a broker that is already current.
+        $p->heartbeatOnce();
+        $this->checkSame(true, $p->sent[6]['withoutSub'], 'the queue change is remembered as accepted again');
+        $p->heartbeatOnceAfterRebalance();
+        $this->checkSame(false, $p->sent[7]['withoutSub'],
+            'the round after an allocation change re-delivers the subscriptions');
+        $this->checkSame(['127.0.0.1:10911'], $p->supportV2BrokerAddrsForTest(),
+            'but knowing that the broker speaks the protocol survives the reset');
+
+        // The frame never changes: no separate request code for the fingerprint path.
+        $this->check(array_reduce($p->sent, static fn(bool $c, array $b): bool => $c && $b['code'] === RequestCode::HEART_BEAT, true),
+            'every round of either path is a HEART_BEAT(34) request');
+
+        $p->shutdown();
+        MQClientInstance::removeInstance('v2-live');
+    }
+
+    // ==================================================== 11c. VIP channel address rewrite
+
+    /**
+     * The fast channel is a per-request port change and never a change to the cached route: only
+     * the RPCs the protocol allows are moved, each one at the moment it leaves the client. Both
+     * directions are pinned here -- a call site left unwrapped silently loses the fast channel,
+     * while a heartbeat, a pull or a registration that *was* wrapped would aim at a port a broker
+     * only opens when the channel is enabled.
+     */
+    private function testVipChannelAddressRewrite(): void
+    {
+        $listen = '127.0.0.1:10911';
+        $fast = '127.0.0.1:10909';
+        $mq = new MessageQueue('V2BeatTopic', 'broker-a', 0);
+
+        $mk = static fn(string $id, bool $on): VipChannelProbeInstance =>
+            new VipChannelProbeInstance($id, ['127.0.0.1:9876'], 2000, 3000, vipChannelEnabled: $on);
+
+        // -- control: switch off, so every request still goes to the port the route table holds.
+        $off = $mk('vip-off', false);
+        $this->seedProbeRoute($off);
+        $this->checkSame($listen, $off->vipAddrFor($listen), 'switch off leaves the address alone');
+        $this->runVipProbeCalls($off, $mq, $listen);
+        $this->checkSame([], array_values(array_filter($off->wire, static fn(array $w): bool => $w['addr'] !== $listen)),
+            'with the switch off not one broker RPC is moved');
+        $off->shutdown();
+        MQClientInstance::removeInstance('vip-off');
+
+        // -- switch on: the offset / consumer-list / lock / administration family moves.
+        $on = $mk('vip-on', true);
+        $this->seedProbeRoute($on);
+        $this->checkSame($fast, $on->vipAddrFor($listen), 'switch on moves the port by 2');
+        $this->runVipProbeCalls($on, $mq, $listen);
+        foreach ([
+            RequestCode::QUERY_CONSUMER_OFFSET,
+            RequestCode::UPDATE_CONSUMER_OFFSET,
+            RequestCode::GET_MAX_OFFSET,
+            RequestCode::GET_MIN_OFFSET,
+            RequestCode::SEARCH_OFFSET_BY_TIMESTAMP,
+            RequestCode::GET_CONSUMER_LIST_BY_GROUP,
+            RequestCode::LOCK_BATCH_MQ,
+            RequestCode::UNLOCK_BATCH_MQ,
+            RequestCode::CHECK_CLIENT_CONFIG,
+            RequestCode::UPDATE_AND_CREATE_TOPIC,
+            RequestCode::DELETE_TOPIC_IN_BROKER,
+            RequestCode::SEND_MESSAGE_V2,
+            RequestCode::QUERY_MESSAGE,
+        ] as $code) {
+            $this->checkSame([$fast], $on->addrSetFor($code), sprintf('request %d targets the fast port', $code));
+        }
+
+        // -- switch on, and still never moved: registration traffic, the pull and pop family.
+        foreach ([
+            RequestCode::HEART_BEAT,
+            RequestCode::UNREGISTER_CLIENT,
+            RequestCode::PULL_MESSAGE,
+            RequestCode::POP_MESSAGE,
+            RequestCode::ACK_MESSAGE,
+            RequestCode::CHANGE_MESSAGE_INVISIBLETIME,
+        ] as $code) {
+            $this->checkSame([$listen], $on->addrSetFor($code), sprintf('request %d keeps the listening port', $code));
+        }
+        $this->checkSame($on->topicRouteTable['V2BeatTopic']->brokerDatas[0]->brokerAddrs,
+            [MixAll::MASTER_ID => $listen], 'the cached route is never rewritten, only each request');
+        $on->shutdown();
+        MQClientInstance::removeInstance('vip-on');
+    }
+
+    /**
+     * Fires one call per VIP-allowed and one per never-rewritten broker RPC through the recording
+     * probe. Only the address the request leaves on is under test, so a response this canned body
+     * cannot decode is expected and ignored.
+     */
+    private function runVipProbeCalls(VipChannelProbeInstance $probe, MessageQueue $mq, string $listen): void
+    {
+        $subscription = new SubscriptionData('V2BeatTopic', 'tagVip');
+        $beat = new HeartbeatData($probe->clientId);
+        $beat->producerDataSet[] = new ProducerData('GID_vip_p');
+        $extraInfo = ExtraInfoUtil::buildExtraInfo(0, 0, 0, 0, 'V2BeatTopic', 'broker-a', 0, 1);
+
+        $calls = [
+            // The offset family.
+            fn() => $probe->queryConsumerOffset('GID_vip', $mq, 3000, $listen),
+            fn() => $probe->updateConsumerOffset('GID_vip', $mq, 7, 3000, $listen),
+            fn() => $probe->getMaxOffset($mq, 3000, $listen),
+            fn() => $probe->getMinOffset($mq, 3000, $listen),
+            fn() => $probe->searchOffsetByTimestamp($mq, 1_700_000_000_000, 3000, $listen),
+            // The consumer-side family.
+            fn() => $probe->getConsumerListByGroup('GID_vip', 3000, $listen),
+            fn() => $probe->getConsumerIdListByGroup('V2BeatTopic', 'GID_vip', 3000),
+            fn() => $probe->lockBatchMq('GID_vip', $probe->clientId, [$mq], 3000),
+            fn() => $probe->unlockBatchMq('GID_vip', $probe->clientId, [$mq], 3000),
+            fn() => $probe->checkClientConfig($listen, 'GID_vip', $probe->clientId, $subscription, 3000),
+            // The administration family the client itself calls.
+            fn() => $probe->createTopicInBroker($listen, 'VipTopic', 'VipTopic', 1, 1, 6, 0, timeoutMillis: 3000, retryTimes: 1),
+            fn() => $probe->deleteTopicInBroker($listen, 'VipTopic', 3000),
+            // A producer send follows the same switch.
+            fn() => $probe->sendMessageToAddr('GID_vip', new Message('V2BeatTopic', 'vip-body'), $mq, $listen, 3000),
+            // The never-rewritten half.
+            fn() => $probe->sendHeartbeat($listen, $beat, 3000),
+            fn() => $probe->sendHeartbeatV2($listen, $beat, $beat, 1234, 3000),
+            fn() => $probe->unregisterClient($listen, $probe->clientId, 'GID_vip_p', 'GID_vip', 3000),
+            fn() => $probe->pullMessage('GID_vip', $mq, 0, 1, PullSysFlag::FLAG_COMMIT_OFFSET, 0, 'tagVip', 1, 'TAG', 3000, -1, 100, $listen),
+            fn() => $probe->popMessage('GID_vip', 'V2BeatTopic', 0, 1, 1000, 100, 0, 'tagVip', 'TAG', false, 'broker-a', 3000, $listen),
+            fn() => $probe->ackMessage('GID_vip', 'V2BeatTopic', 0, $extraInfo, 0, 'broker-a', 3000, $listen),
+            fn() => $probe->changeInvisibleTime('GID_vip', 'V2BeatTopic', 0, $extraInfo, 0, 1000, 'broker-a', 3000, $listen),
+            fn() => $probe->queryMessage('V2BeatTopic', 'vip-key', 1, 1_700_000_000_000, 1_700_000_001_000, 3000, $listen),
+        ];
+        foreach ($calls as $call) {
+            try {
+                $call();
+            } catch (\Throwable) {
+                // The canned response body is not decodable for every op; the wire address is the observation.
+            }
+        }
+    }
+
+
     /** Sends one namespaceV2 probe, returning the peer-echoed `ns=<value>;nsd=<value>`. */
     private function probeNamespace(MQClientInstance $inst, string $addr): string
     {
@@ -1048,6 +1298,8 @@ final class RunClientInstance
         $this->testQueryConsumerOffset();
         $this->testNamespaceRpcHookOnWire();
         $this->testRegistrationHeartbeat();
+        $this->testHeartbeatV2Rounds();
+        $this->testVipChannelAddressRewrite();
         return $this->summary();
     }
 }
@@ -1101,6 +1353,80 @@ class HeartbeatProbeInstance extends MQClientInstance
             'producers' => array_map(static fn(ProducerData $p): string => $p->groupName, $heartbeatData->producerDataSet),
             'consumers' => array_map(static fn(ConsumerData $c): string => $c->groupName, $heartbeatData->consumerDataSet),
         ];
+    }
+}
+
+/**
+ * Fingerprint-path probe: takes over the instance's single synchronous exit point, records which
+ * heartbeat body went out, and answers with the two response fields the next round is decided from.
+ * `$script` is consumed one entry per beat; anything left over reads as "this broker does not know
+ * the fields".
+ */
+class HeartbeatV2ProbeInstance extends MQClientInstance
+{
+    /** @var list<array{code: int, addr: string, fingerprint: int, withoutSub: bool, producers: list<string>, consumers: list<string>, subs: list<string>}> */
+    public array $sent = [];
+
+    /** @var list<array{supportV2: bool, subChange: bool}> */
+    public array $script = [];
+
+    protected function invokeSync(string $addr, RemotingCommand $request, ?int $timeoutMillis = null): RemotingCommand
+    {
+        $data = $request->code === RequestCode::HEART_BEAT && ($request->body ?? '') !== ''
+            ? HeartbeatData::decode($request->body)
+            : null;
+
+        $subs = [];
+        foreach ($data?->consumerDataSet ?? [] as $cd) {
+            foreach ($cd->subscriptionDataSet as $sd) {
+                $subs[] = $sd->topic . ':' . $sd->subString;
+            }
+        }
+        $this->sent[] = [
+            'code' => $request->code,
+            'addr' => $addr,
+            'fingerprint' => $data?->heartbeatFingerprint ?? 0,
+            'withoutSub' => $data?->withoutSub ?? false,
+            'producers' => array_map(static fn(ProducerData $p): string => $p->groupName, $data?->producerDataSet ?? []),
+            'consumers' => array_map(static fn(ConsumerData $c): string => $c->groupName, $data?->consumerDataSet ?? []),
+            'subs' => $subs,
+        ];
+
+        $answer = array_shift($this->script) ?? ['supportV2' => false, 'subChange' => false];
+        $response = RemotingCommand::createResponseCommand(ResponseCode::SUCCESS);
+        $response->addExtField(MixAll::IS_SUPPORT_HEART_BEAT_V2, $answer['supportV2'] ? 'true' : 'false');
+        $response->addExtField(MixAll::IS_SUB_CHANGE, $answer['subChange'] ? 'true' : 'false');
+        return $response;
+    }
+}
+
+/**
+ * VIP-channel probe: records the address every request really left on, then answers with a body
+ * that decodes for most operations. The observation is the address, never the result.
+ */
+class VipChannelProbeInstance extends MQClientInstance
+{
+    /** @var list<array{code: int, addr: string}> */
+    public array $wire = [];
+
+    protected function invokeSync(string $addr, RemotingCommand $request, ?int $timeoutMillis = null): RemotingCommand
+    {
+        $this->wire[] = ['code' => $request->code, 'addr' => $addr];
+        $response = RemotingCommand::createResponseCommand(ResponseCode::SUCCESS);
+        $response->body = '{"offset":7,"consumerIdList":["vip@client"],"maxOffset":7,"minOffset":0}';
+        return $response;
+    }
+
+    /** @return list<string> The distinct addresses used for one request code. */
+    public function addrSetFor(int $code): array
+    {
+        $addrs = [];
+        foreach ($this->wire as $w) {
+            if ($w['code'] === $code) {
+                $addrs[$w['addr']] = $w['addr'];
+            }
+        }
+        return array_values($addrs);
     }
 }
 

@@ -123,6 +123,12 @@ export class MQClient {
   // that reads "false", and a beat with fingerprint 0 makes the broker take its
   // plain registration path, exactly as before.
   useHeartbeatV2: boolean;
+  // Broker-side VIP channel. Off by default. When a facade enables it, the
+  // offset / queue-lock / consumer-list / subscription-check RPCs the broker
+  // answers go to the VIP port (listen port - 2). This mirrors the producer and
+  // admin VIP switches onto the shared instance where those requests are made;
+  // a name-server address never reaches it (the VIP port is broker-only).
+  vipChannelEnabled: boolean;
   // Addresses whose HEART_BEAT response declared IS_SUPPORT_HEART_BEAT_V2.
   _brokerSupportV2HeartbeatSet: Set<string>;
   // Last fingerprint accepted per broker address; a beat whose fingerprint
@@ -178,6 +184,7 @@ export class MQClient {
     this.producerTable = new Map();
     this.heartbeatIntervalMillis = 30 * 1000;
     this.useHeartbeatV2 = false;
+    this.vipChannelEnabled = false;
     this._brokerSupportV2HeartbeatSet = new Set();
     this._brokerAddrHeartbeatFingerprintTable = new Map();
     this.mqClientApiTimeout = 3000;
@@ -482,7 +489,7 @@ export class MQClient {
     body.group = consumerGroup;
     body.subscriptionData = sub.toDict ? sub.toDict() : sub;
     request.body = body.encode();
-    const response = await this.remotingClient.invokeSync(addr, request, timeoutMillis);
+    const response = await this.remotingClient.invokeSync(this.vipChannel(addr), request, timeoutMillis);
     if (response.code !== ResponseCode.SUCCESS) {
       throw new MQClientException(
         `CODE: ${response.code} exception message: ${response.remark ?? ''}`,
@@ -674,6 +681,21 @@ export class MQClient {
     return this;
   }
 
+  // Broker-side VIP channel switch (mirrors the facade VIP config). Off by
+  // default; on makes the offset / lock / consumer-list / subscription-check
+  // RPCs target the broker VIP port (listen port - 2).
+  setVipChannelEnabled(enable: boolean): this {
+    this.vipChannelEnabled = enable === true;
+    return this;
+  }
+
+  // Per-request VIP translation of a BROKER address at the invoke boundary. Off
+  // (or an unparseable port) returns the address untouched, so a disabled switch
+  // changes nothing and a name-server address must never be passed here.
+  vipChannel(addr: string): string {
+    return MixAll.brokerVipChannel(this.vipChannelEnabled, addr);
+  }
+
   // Send one heartbeat to one broker (HEART_BEAT=34, body = heartbeat JSON).
   //
   // V1 (the default): the body carries subscriptions and fingerprint 0, so a broker
@@ -748,7 +770,7 @@ export class MQClient {
   async getConsumerListByGroup(brokerAddr: string, consumerGroup: string): Promise<RemotingCommand> {
     const request = RemotingCommand.createRequestCommand(RequestCode.GET_CONSUMER_LIST_BY_GROUP, null);
     request.addExtField('consumerGroup', consumerGroup);
-    return this.remotingClient.invokeSync(brokerAddr, request, 3000);
+    return this.remotingClient.invokeSync(this.vipChannel(brokerAddr), request, 3000);
   }
 
   // ---- offset helpers (used by offset store / consumers / admin) ----
@@ -779,7 +801,7 @@ export class MQClient {
     h.queueId = mq.getQueueId();
     h.setZeroIfNotFound = setZeroIfNotFound;
     const request = RemotingCommand.createRequestCommand(RequestCode.QUERY_CONSUMER_OFFSET, h);
-    const response = await this.remotingClient.invokeSync(brokerAddr, request, timeoutMillis);
+    const response = await this.remotingClient.invokeSync(this.vipChannel(brokerAddr), request, timeoutMillis);
     if (response.code === ResponseCode.QUERY_NOT_FOUND) return { found: false, offset: -1 };
     if (response.code !== ResponseCode.SUCCESS) {
       throw new MQBrokerException(response.code, response.remark || '', brokerAddr);
@@ -797,7 +819,7 @@ export class MQClient {
     h.queueId = mq.getQueueId();
     h.commitOffset = offset;
     const request = RemotingCommand.createRequestCommand(RequestCode.UPDATE_CONSUMER_OFFSET, h);
-    const response = await this.remotingClient.invokeSync(brokerAddr, request, timeoutMillis);
+    const response = await this.remotingClient.invokeSync(this.vipChannel(brokerAddr), request, timeoutMillis);
     if (response.code !== ResponseCode.SUCCESS) {
       throw new MQBrokerException(response.code, response.remark || '', brokerAddr);
     }
@@ -808,7 +830,7 @@ export class MQClient {
     h.topic = topic;
     h.queueId = queueId;
     const request = RemotingCommand.createRequestCommand(RequestCode.GET_MAX_OFFSET, h);
-    const response = await this.remotingClient.invokeSync(brokerAddr, request, timeoutMillis);
+    const response = await this.remotingClient.invokeSync(this.vipChannel(brokerAddr), request, timeoutMillis);
     if (response.code !== ResponseCode.SUCCESS) {
       throw new MQBrokerException(response.code, response.remark || '', brokerAddr);
     }
@@ -821,7 +843,7 @@ export class MQClient {
     h.topic = topic;
     h.queueId = queueId;
     const request = RemotingCommand.createRequestCommand(RequestCode.GET_MIN_OFFSET, h);
-    const response = await this.remotingClient.invokeSync(brokerAddr, request, timeoutMillis);
+    const response = await this.remotingClient.invokeSync(this.vipChannel(brokerAddr), request, timeoutMillis);
     if (response.code !== ResponseCode.SUCCESS) {
       throw new MQBrokerException(response.code, response.remark || '', brokerAddr);
     }
@@ -836,7 +858,7 @@ export class MQClient {
     h.queueId = queueId;
     h.timestamp = timestamp;
     const request = RemotingCommand.createRequestCommand(RequestCode.SEARCH_OFFSET_BY_TIMESTAMP, h);
-    const response = await this.remotingClient.invokeSync(brokerAddr, request, timeoutMillis);
+    const response = await this.remotingClient.invokeSync(this.vipChannel(brokerAddr), request, timeoutMillis);
     if (response.code !== ResponseCode.SUCCESS) {
       throw new MQBrokerException(response.code, response.remark || '', brokerAddr);
     }
@@ -850,7 +872,7 @@ export class MQClient {
     h.topic = topic;
     h.queueId = queueId;
     const request = RemotingCommand.createRequestCommand(RequestCode.GET_EARLIEST_MSG_STORETIME, h);
-    const response = await this.remotingClient.invokeSync(brokerAddr, request, timeoutMillis);
+    const response = await this.remotingClient.invokeSync(this.vipChannel(brokerAddr), request, timeoutMillis);
     if (response.code !== ResponseCode.SUCCESS) {
       throw new MQBrokerException(response.code, response.remark || '', brokerAddr);
     }

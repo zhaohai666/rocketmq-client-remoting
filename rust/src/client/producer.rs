@@ -480,6 +480,10 @@ pub struct ProducerConfig {
     /// `totalBatchMaxBytes`: the **global** byte cap of batching in flight.
     /// Same convention: `-1` = not stated.
     pub total_batch_max_bytes: i64,
+    /// Heartbeat fingerprint path (default false). On, this facade's `HEART_BEAT(34)` rounds carry
+    /// a non-zero `heartbeatFingerprint`, and once the broker answers `IS_SUPPORT_HEART_BEAT_V2`
+    /// and the fingerprint is unchanged the subscription set drops out of the body.
+    pub use_heartbeat_v2: bool,
 }
 
 impl Default for ProducerConfig {
@@ -538,6 +542,7 @@ impl Default for ProducerConfig {
             batch_max_delay_ms: -1,
             batch_max_bytes: -1,
             total_batch_max_bytes: -1,
+            use_heartbeat_v2: false,
         }
     }
 }
@@ -1349,6 +1354,7 @@ impl DefaultMQProducer {
             namespace_v2: cfg.namespace_v2.clone(),
             enable_stream_request_type: cfg.enable_stream_request_type,
             route_refresh_interval_millis: cfg.poll_name_server_interval_millis,
+            use_heartbeat_v2: cfg.use_heartbeat_v2,
             ..Default::default()
         };
         let client = MQClientInstance::create_mq_client_instance(

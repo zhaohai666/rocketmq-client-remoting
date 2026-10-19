@@ -149,6 +149,9 @@ func (i *Instance) ChangeInvisibleTime(addr string, header *remoting.ChangeInvis
 // SetMessageRequestMode sends SET_MESSAGE_REQUEST_MODE(401) — the broker-side
 // switch that decides whether a (group, topic) pair is served in POP or PULL
 // mode.
+//
+// It is an admin/inspection RPC aimed at the broker, not part of the POP data
+// exchange, so it follows the VIP-channel rewrite like its admin twin does.
 func (i *Instance) SetMessageRequestMode(addr, topic, consumerGroup, mode string, popShareQueueNum int32, timeoutMillis int64) error {
 	body := &remoting.SetMessageRequestModeRequestBody{
 		Topic:            topic,
@@ -158,7 +161,7 @@ func (i *Instance) SetMessageRequestMode(addr, topic, consumerGroup, mode string
 	}
 	request := remoting.CreateRequestCommand(remoting.ReqSetMessageRequestMode, nil)
 	request.SetBody(body.Encode())
-	response, err := i.invokeSync(addr, request, timeoutMillis)
+	response, err := i.invokeSync(i.brokerVIPAddr(addr), request, timeoutMillis)
 	if err != nil {
 		return err
 	}
@@ -180,7 +183,7 @@ func (i *Instance) QueryAssignment(addr, topic, consumerGroup, clientID, strateg
 	// SET_MESSAGE_REQUEST_MODE.
 	request := remoting.CreateRequestCommand(remoting.ReqQueryAssignment, nil)
 	request.SetBody(body.Encode())
-	response, err := i.invokeSync(addr, request, timeoutMillis)
+	response, err := i.invokeSync(i.brokerVIPAddr(addr), request, timeoutMillis)
 	if err != nil {
 		return nil, err
 	}

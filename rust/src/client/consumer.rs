@@ -467,6 +467,10 @@ pub struct ConsumerConfig {
     /// Whether to send the subscription expression along with PULL_MESSAGE (the SUBSCRIPTION bit), default false:
     /// only needed by server-side scenarios using class filter mode.
     pub post_subscription_when_pull: bool,
+    /// Heartbeat fingerprint path (default false). On, this facade's `HEART_BEAT(34)` rounds carry
+    /// a non-zero `heartbeatFingerprint`, and once the broker answers `IS_SUPPORT_HEART_BEAT_V2`
+    /// and the fingerprint is unchanged the subscription set drops out of the body.
+    pub use_heartbeat_v2: bool,
 }
 
 impl Default for ConsumerConfig {
@@ -520,6 +524,7 @@ impl Default for ConsumerConfig {
             trace_topic: None,
             trace_msg_batch_num: 10,
             post_subscription_when_pull: false,
+            use_heartbeat_v2: false,
         }
     }
 }
@@ -1344,6 +1349,7 @@ impl DefaultMQPushConsumer {
             namespace_v2: cfg.namespace_v2.clone(),
             enable_stream_request_type: cfg.enable_stream_request_type,
             route_refresh_interval_millis: cfg.poll_name_server_interval_millis,
+            use_heartbeat_v2: cfg.use_heartbeat_v2,
             persist_offset_interval_millis: cfg.persist_consumer_offset_interval_millis,
             ..Default::default()
         };
@@ -2078,6 +2084,13 @@ impl DefaultMQPushConsumer {
                 // a freshly built loop is not misjudged by the next rebalance as "never stamped = stalled".
                 state.last_pull_at.insert(key.clone(), now);
                 to_spawn.push((mq.clone(), token));
+            }
+        }
+        if !revoked.is_empty() || !to_spawn.is_empty() {
+            // The assignment moved, so every broker that speaks the fingerprint protocol has to
+            // be handed the subscriptions again rather than the cheap subscription-free body.
+            if let Some(client) = self.client() {
+                client.reset_broker_addr_heartbeat_fingerprint_table();
             }
         }
         if !revoked.is_empty() {

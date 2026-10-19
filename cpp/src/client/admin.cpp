@@ -88,6 +88,9 @@ void DefaultMQAdminExt::start() {
     mqClient_.reset(new MQClientInstance(clientId_, nameServerAddrs_,
                                         3000, 15000, MQClientInstance::tlsEnabledFromEnv(),
                                         unitName_, pollNameServerIntervalMillis_));
+    // The instance answers the delegated offset / consumer-list family, and it applies the
+    // VIP translation itself -- so the admin's switch has to be handed over before start().
+    mqClient_->setVipChannelEnabled(vipChannelEnabled_);
     std::shared_ptr<RPCHook> requestHook =
         composeRequestHooks(enableStreamRequestType_, rpcHook_,
                             [this] { return namespaceV2_; });
@@ -698,8 +701,10 @@ PropertyMap DefaultMQAdminExt::getBrokerConfig(const std::string& brokerAddr,
                                                int32_t timeoutMillis) {
     // ⚠ The response body is **properties text** ("k=v\n"), not JSON/KVTable.
     // The early implementation parsed it as KVTable JSON, which always fails against a real broker.
+    // Reading a broker's own configuration is the one admin RPC that always uses the listening
+    // port: the fast channel serves the other admin RPCs, not this one.
     RemotingCommand response = requireClient().invokeSync(
-        vipAddr(brokerAddr), RequestCode::GET_BROKER_CONFIG, PropertyMap(), Bytes(), false,
+        brokerAddr, RequestCode::GET_BROKER_CONFIG, PropertyMap(), Bytes(), false,
         timeoutMillis < 0 ? timeoutMillis_ : timeoutMillis);
     return MixAll::string2Properties(response.body);
 }

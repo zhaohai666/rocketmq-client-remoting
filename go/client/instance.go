@@ -64,6 +64,16 @@ type ClientInstanceConfig struct {
 	// stops re-sending unchanged subscriptions (see
 	// SendHeartbeatToAllBrokerV2).
 	UseHeartbeatV2 bool
+	// VipChannelEnabled is ClientConfig.vipChannelEnabled — the single
+	// broker-facing VIP switch. OFF by default: the broker's listen port serves
+	// every request unchanged. When ON, the RPCs the broker only answers on its
+	// VIP port are addressed at `port - 2` of the route address. It is read at
+	// the invoke boundary, one request at a time, so the cached route keeps the
+	// address the nameserver published, and it never applies to nameserver
+	// traffic or to the RPCs the broker serves on the plain port only
+	// (heartbeat, unregister, pull/POP/ACK, recall and the oneway
+	// END_TRANSACTION).
+	VipChannelEnabled bool
 }
 
 // NewClientInstanceConfig returns the classic defaults.
@@ -76,6 +86,7 @@ func NewClientInstanceConfig() ClientInstanceConfig {
 		HeartbeatIntervalMillis:             30_000,
 		PersistConsumerOffsetIntervalMillis: 5_000,
 		UseHeartbeatV2:                      false,
+		VipChannelEnabled:                   false,
 	}
 }
 
@@ -173,6 +184,11 @@ type Instance struct {
 
 	started atomic.Bool
 
+	// vipChannelEnabled is the live copy of ClientInstanceConfig.VipChannelEnabled:
+	// a client that owns this instance can flip the switch after Start, and the
+	// next broker-facing request already carries the VIP port.
+	vipChannelEnabled atomic.Bool
+
 	consumerTable      map[string]Consumer
 	producerTable      map[string]struct{}
 	consumerGroupTable map[string]struct{}
@@ -233,6 +249,7 @@ func newInstance(clientID string, nameServerAddrs []string, config ClientInstanc
 		brokerVersionTable:        map[string]int32{},
 		stop:                      make(chan struct{}),
 	}
+	inst.vipChannelEnabled.Store(config.VipChannelEnabled)
 	inst.remoting = remoting.NewRemotingClientWithConfig(remoting.ClientConfig{
 		ConnectTimeoutMillis:     config.ConnectTimeoutMillis,
 		InvokeTimeoutMillis:      config.InvokeTimeoutMillis,
@@ -289,6 +306,28 @@ func (i *Instance) Remoting() *remoting.RemotingClient { return i.remoting }
 
 // Config exposes the instance-scoped configuration.
 func (i *Instance) Config() ClientInstanceConfig { return i.config }
+
+// SetVipChannelEnabled is the one broker-facing VIP switch of this client
+// instance. When it is on, the requests the broker only accepts on its VIP port
+// are sent to `port - 2` of the route address; when it is off — the default —
+// every address goes out exactly as the nameserver published it. The switch is
+// live: flipping it takes effect on the next request.
+func (i *Instance) SetVipChannelEnabled(enable bool) { i.vipChannelEnabled.Store(enable) }
+
+// VipChannelEnabled reports the current VIP switch.
+func (i *Instance) VipChannelEnabled() bool { return i.vipChannelEnabled.Load() }
+
+// brokerVIPAddr is the invoke-boundary rewrite: it returns the VIP address for
+// one resolved broker address when the switch is on, and the address itself
+// otherwise. Call it per request, on a locally resolved address only — the
+// cached route must keep the address the nameserver published, and a nameserver
+// address must never be handed here.
+func (i *Instance) brokerVIPAddr(addr string) string {
+	if !i.vipChannelEnabled.Load() {
+		return addr
+	}
+	return common.BrokerVIPChannel(true, addr)
+}
 
 // NameServerAddrs snapshots the configured nameserver list.
 func (i *Instance) NameServerAddrs() []string {
@@ -1633,7 +1672,7 @@ func (i *Instance) checkClientConfig(addr, consumerGroup string, sub *remoting.S
 		SubscriptionData: sub,
 	}
 	request.SetBody(body.Encode())
-	response, err := i.invokeSync(addr, request, timeoutMillis)
+	response, err := i.invokeSync(i.brokerVIPAddr(addr), request, timeoutMillis)
 	if err != nil {
 		return err
 	}
@@ -1695,7 +1734,7 @@ func (i *Instance) QueryConsumerOffset(consumerGroup string, mq common.MessageQu
 		header.SetZeroIfNotFound = remoting.BoolPtr(true)
 	}
 	request := remoting.CreateRequestCommand(remoting.ReqQueryConsumerOffset, header)
-	response, err := i.invokeSync(addr, request, timeoutMillis)
+	response, err := i.invokeSync(i.brokerVIPAddr(addr), request, timeoutMillis)
 	if err != nil {
 		return 0, false, err
 	}
@@ -1728,7 +1767,7 @@ func (i *Instance) UpdateConsumerOffset(consumerGroup string, mq common.MessageQ
 		CommitOffset:  remoting.I64Ptr(commitOffset),
 	}
 	request := remoting.CreateRequestCommand(remoting.ReqUpdateConsumerOffset, header)
-	response, err := i.invokeSync(addr, request, timeoutMillis)
+	response, err := i.invokeSync(i.brokerVIPAddr(addr), request, timeoutMillis)
 	if err != nil {
 		return err
 	}
@@ -1737,6 +1776,11 @@ func (i *Instance) UpdateConsumerOffset(consumerGroup string, mq common.MessageQ
 
 // ---------------- low-level helpers ----------------
 
+// invokeSync is address-transparent: it sends to exactly the address it is
+// handed, which is what nameserver traffic and an already-rewritten address
+// need. A broker-facing request in family of the VIP-served RPCs resolves its
+// address and wraps it in brokerVIPAddr at the call site, one request at a
+// time.
 func (i *Instance) invokeSync(addr string, request *remoting.RemotingCommand, timeoutMillis int64) (*remoting.RemotingCommand, error) {
 	return i.remoting.InvokeSync(addr, request, timeoutMillis)
 }

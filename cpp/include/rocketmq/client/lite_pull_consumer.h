@@ -65,6 +65,10 @@ public:
     bool isEnableStreamRequestType() const { return enableStreamRequestType_; }
     void setPollNameServerIntervalMillis(int32_t millis) { pollNameServerIntervalMillis_ = millis; }
     int32_t pollNameServerIntervalMillis() const { return pollNameServerIntervalMillis_; }
+    // Broker VIP channel: when true the rewritten broker request family is sent to port - 2 of the
+    // route address. Must be set before start(); forwarded to the MQClientInstance that owns the RPCs.
+    void setVipChannelEnabled(bool enable) { vipChannelEnabled_ = enable; }
+    bool isVipChannelEnabled() const { return vipChannelEnabled_; }
     void setMessageModel(const std::string& model) { messageModel_ = model; }
     void setNamespace(const std::string& ns) { namespace_ = ns; }
     void setNamespaceV2(const std::string& ns) { namespaceV2_ = ns; }
@@ -193,6 +197,7 @@ private:
     bool unitMode_ = false;
     bool enableStreamRequestType_ = true;
     int32_t pollNameServerIntervalMillis_ = 30000;
+    bool vipChannelEnabled_ = false;
     std::string messageModel_ = MessageModel::CLUSTERING;
     std::string consumeFromWhere_ = ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET;
     std::string consumeTimestamp_;

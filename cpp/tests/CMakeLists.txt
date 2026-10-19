@@ -364,3 +364,10 @@ add_test(NAME lite_topic_queue_change COMMAND rmq_test_lite_topic_queue_change)
 add_executable(rmq_test_static_topic test_static_topic.cpp)
 target_link_libraries(rmq_test_static_topic PRIVATE rocketmq::remoting)
 add_test(NAME static_topic COMMAND rmq_test_static_topic)
+
+# Client-level broker VIP channel switch (port - 2): offline, two loopback listeners bound two ports
+# apart pin that an offset request and a queue lock go to port-2 with the switch on and to the plain
+# port with it off, and that heartbeat / pull / pop / ack / unregister / recall stay on the plain port.
+add_executable(rmq_test_vip_channel test_vip_channel.cpp)
+target_link_libraries(rmq_test_vip_channel PRIVATE rocketmq::remoting)
+add_test(NAME vip_channel COMMAND rmq_test_vip_channel)

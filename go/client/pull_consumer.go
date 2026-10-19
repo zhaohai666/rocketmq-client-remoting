@@ -1088,8 +1088,9 @@ func (c *DefaultMQPullConsumer) EarliestMsgStoreTime(mq common.MessageQueue) (in
 	if err != nil {
 		return 0, err
 	}
-	response, err := instance.invokeSync(addr, adminRequest(remoting.ReqGetEarliestMsgStoretime,
-		adminExt("topic", mq.Topic, "queueId", mq.QueueID, "brokerName", mq.BrokerName)), 5000)
+	response, err := instance.invokeSync(instance.brokerVIPAddr(addr),
+		adminRequest(remoting.ReqGetEarliestMsgStoretime,
+			adminExt("topic", mq.Topic, "queueId", mq.QueueID, "brokerName", mq.BrokerName)), 5000)
 	if err != nil {
 		return 0, err
 	}

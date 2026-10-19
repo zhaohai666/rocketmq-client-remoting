@@ -83,7 +83,11 @@ func (p *DefaultMQProducer) detectByMaxOffset(addr string, timeoutMillis int64) 
 		QueueID: remoting.I32Ptr(0),
 	}
 	request := remoting.CreateRequestCommand(remoting.ReqGetMaxOffset, header)
-	response, err := inst.invokeSync(addr, request, timeoutMillis)
+	// Probe the same port the sends will use: the address comes from
+	// FindBrokerAddressInPublish, exactly like a send address, so with the VIP
+	// channel on the probe is shifted too — otherwise the detector would
+	// grade the plain port while the traffic goes to the VIP one.
+	response, err := inst.invokeSync(inst.brokerVIPAddr(addr), request, timeoutMillis)
 	if err != nil {
 		common.LogDebugf("detector: GET_MAX_OFFSET probe to %s failed: %v", addr, err)
 		return false

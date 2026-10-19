@@ -383,6 +383,8 @@ type DefaultMQProducer struct {
 
 	// sendMessageWithVIPChannel
 	// (default false): when set, the SEND rpcs go to the VIP port (broker port-2).
+	// It only ever concerns sends — the RPCs the broker answers on the plain
+	// listener (END_TRANSACTION, CDC_RECALL_MESSAGE) use the resolved address.
 	sendMessageWithVIPChannel bool
 
 	sendLatencyFaultEnable bool
@@ -573,8 +575,21 @@ func (p *DefaultMQProducer) SetDefaultTopicQueueNums(n int32)    { p.defaultTopi
 // when set, the send rpcs target the broker's VIP port (listen port - 2,
 // common.BrokerVIPChannel). Off by default — a cluster without the VIP listener
 // would make every send time out on a dead port.
+//
+// The shift is applied per request, at each send invoke, so the cached route
+// keeps the address the nameserver published. It is live: flipping it after
+// Start changes the very next send. Turning the channel on also turns on the
+// instance-wide switch that the other broker-facing RPCs of the same clientId
+// read; flipping it off only stops this producer's own sends — it never rewrites
+// another tenant's setting.
 func (p *DefaultMQProducer) SetSendMessageWithVIPChannel(enable bool) {
+	p.mu.Lock()
 	p.sendMessageWithVIPChannel = enable
+	inst := p.mqClient
+	p.mu.Unlock()
+	if enable && inst != nil {
+		inst.SetVipChannelEnabled(true)
+	}
 }
 
 // IsSendMessageWithVIPChannel reports the current VIP-channel switch.
@@ -723,7 +738,18 @@ func (p *DefaultMQProducer) startLocked() (bool, error) {
 	}
 	cfg.SocksProxy = p.socksProxy
 	cfg.PollNameServerIntervalMillis = p.pollNameServerIntv
+	// A producer that asks for the VIP channel seeds the instance-wide switch too,
+	// so the other broker-facing RPCs of this clientId (offsets, locks, the
+	// admin calls riding the same instance) see the same intent.
+	cfg.VipChannelEnabled = p.sendMessageWithVIPChannel
 	inst := CreateOrGetInstance(p.clientID, p.nameServerAddrs, cfg)
+	// CreateOrGetInstance keeps the FIRST tenant's config, so a producer that
+	// joins a live instance has to flip the switch itself. Only ever on: a
+	// producer with the channel off never turns off another tenant of the same
+	// clientId that asked for it.
+	if p.sendMessageWithVIPChannel {
+		inst.SetVipChannelEnabled(true)
+	}
 	// Namespace + stream + user(ACL) + zone, composed in a fixed order and only
 	// once per instance — the signature has to cover exactly these fields.
 	inst.EnsureRPCHooks(p.namespaceV2, p.enableStreamRequestType, p.rpcHook)
@@ -2139,7 +2165,10 @@ func (p *DefaultMQProducer) endTransaction(sendResult *SendResult, msg *common.M
 	if brokerAddr == "" {
 		return common.ClientError("no broker address for end transaction")
 	}
-	return inst.Remoting().InvokeOneway(p.sendAddr(brokerAddr), request)
+	// END_TRANSACTION is never sent over the VIP channel: the broker only
+	// accepts it on the normal listener, so the resolved address goes out
+	// unshifted even when the producer has VIP sends enabled.
+	return inst.Remoting().InvokeOneway(brokerAddr, request)
 }
 
 // transactionFlag maps LocalTransactionState to the MessageSysFlag wire
@@ -2290,7 +2319,10 @@ func (p *DefaultMQProducer) RecallMessage(topic, recallHandle string) (string, e
 		RecallHandle:  strPtr(recallHandle),
 		Bname:         strPtr(handle.BrokerName),
 	})
-	response, err := inst.Remoting().InvokeSync(p.sendAddr(addr), request, p.sendMsgTimeout)
+	// CDC_RECALL_MESSAGE is never sent over the VIP channel: the recall is
+	// handled by the broker's normal processor, so the resolved address goes
+	// out unshifted even when the producer has VIP sends enabled.
+	response, err := inst.Remoting().InvokeSync(addr, request, p.sendMsgTimeout)
 	if err != nil {
 		return "", err
 	}

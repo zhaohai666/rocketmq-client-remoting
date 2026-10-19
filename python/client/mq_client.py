@@ -127,9 +127,9 @@ class MQClientInstance:
         self.poll_name_server_interval = poll_name_server_interval
         self.namespace_v2 = namespace_v2 or ""
         self.socks_proxy_config = socks_proxy_config
-        # ClientConfig.vipChannelEnabled: every broker RPC listed in ``vip_addr`` below goes to
-        # ``MixAll.broker_vip_channel(True, addr)`` (listen port - 2) when this is on.
-        # Default off, same as the reference (`com.rocketmq.sendMessageWithVIPChannel`=false).
+        # When on, every broker RPC listed in ``vip_addr`` below targets the VIP port
+        # (listen port - 2). Off by default: the fast channel only exists on a broker that was
+        # started with it enabled, so rewriting by default would point at a closed port.
         self.vip_channel_enabled = bool(vip_channel_enabled)
         # Heartbeat V2 per-stream state (brokerSupportV2HeartbeatSet +
         # brokerAddrHeartbeatFingerprintTable); the facades decide whether to use it, see
@@ -498,15 +498,15 @@ class MQClientInstance:
         return self.remoting_client.invoke_sync(addr, request, timeout_millis)
 
     def vip_addr(self, addr: Optional[str]) -> Optional[str]:
-        """``MixAll.brokerVIPChannel(clientConfig.isVipChannelEnabled(), addr)``.
+        """The address a broker RPC is really sent to.
 
-        Java wraps the broker address on the way out of ``MQClientAPIImpl`` (and of
-        ``DefaultMQProducerImpl#sendKernelImpl``): with the VIP channel enabled, the send/offset/
-        lock/consumer-list family of requests targets **the broker's listen port minus 2**
-        (``10911 -> 10909``), the fast channel the broker opens next to the plain one. The
-        NameServer is never rewritten (there is no VIP channel on 9876), and neither are the
-        requests the reference sends with a plain address: PULL_MESSAGE, POP/ACK/
-        CHANGE_INVISIBLE_TIME, HEART_BEAT, UNREGISTER_CLIENT, END_TRANSACTION, RECALL_MESSAGE.
+        With the VIP channel enabled, the requests the broker answers on the fast channel it opens
+        next to the plain one -- message sends, the offset / lock / consumer-list family, the topic
+        and subscription administration calls -- target **the broker's listen port minus 2**
+        (``10911 -> 10909``). The NameServer is never rewritten (there is no VIP channel on 9876),
+        and neither are the requests only ever answered on the plain port: PULL_MESSAGE,
+        POP/ACK/CHANGE_INVISIBLE_TIME, HEART_BEAT, UNREGISTER_CLIENT, END_TRANSACTION,
+        RECALL_MESSAGE, and reading a broker's own configuration.
         """
         if addr is None or not self.vip_channel_enabled:
             return addr
@@ -1504,7 +1504,7 @@ class MQClientInstance:
         last_exc: Optional[Exception] = None
         for attempt in range(max(1, retry_times)):
             try:
-                response = self._invoke_sync(broker_addr, request, timeout_millis)
+                response = self._invoke_sync(self.vip_addr(broker_addr), request, timeout_millis)
                 self._check_response(response)
                 return
             except MQBrokerException:
@@ -1544,7 +1544,7 @@ class MQClientInstance:
     def delete_topic_in_broker(self, broker_addr: str, topic: str, timeout_millis: int = 5000) -> None:
         request = RemotingCommand.create_request_command(RequestCode.DELETE_TOPIC_IN_BROKER, None)
         request.ext_fields["topic"] = topic
-        response = self._invoke_sync(broker_addr, request, timeout_millis)
+        response = self._invoke_sync(self.vip_addr(broker_addr), request, timeout_millis)
         self._check_response(response)
 
     def delete_topic_in_namesrv(self, topic: str, timeout_millis: int = 5000) -> None:

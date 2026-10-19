@@ -14,7 +14,7 @@ declare(strict_types=1);
  * requests; FakeClient subclasses MQClientInstance, overriding the admin-oriented methods
  * delegated to the instance and recording calls.
  *
- * Run: C:/Users/zhaoh/.workbuddy/binaries/php/versions/8.3/php.exe tests/RunClientAdmin.php
+ * Run: php tests/RunClientAdmin.php
  * On success prints "ALL TESTS PASSED (N checks)"; any failure lists details and exits non-zero.
  */
 

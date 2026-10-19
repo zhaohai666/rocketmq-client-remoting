@@ -208,10 +208,18 @@ class DefaultMQAdminExt:
     def _invoke_broker(self, addr: str, code: int,
                        ext_fields: Optional[Dict[str, str]] = None,
                        body: Optional[bytes] = None,
-                       timeout_millis: Optional[int] = None) -> RemotingCommand:
-        """Send to the specified Broker and verify SUCCESS."""
+                       timeout_millis: Optional[int] = None,
+                       vip: bool = True) -> RemotingCommand:
+        """Send to the specified Broker and verify SUCCESS.
+
+        ``vip`` mirrors the per-request behaviour of the broker address rewrite: the RPCs the
+        protocol rewrites go to the VIP port (listen port - 2) while the switch is on, and the few
+        broker RPCs that are answered on the plain port only -- reading the broker config is one of
+        them -- pass ``vip=False``.
+        """
         client = self._require_client()
-        addr = MixAll.broker_vip_channel(self.vip_channel_enabled, addr)
+        if vip:
+            addr = MixAll.broker_vip_channel(self.vip_channel_enabled, addr)
         request = RemotingCommand.create_request_command(code, None)
         if ext_fields:
             for k, v in ext_fields.items():
@@ -486,7 +494,7 @@ class DefaultMQAdminExt:
                           timeout_millis: Optional[int] = None) -> Dict[str, str]:
         pass
         response = self._invoke_broker(broker_addr, RequestCode.GET_BROKER_CONFIG,
-                                       timeout_millis=timeout_millis)
+                                       timeout_millis=timeout_millis, vip=False)
         text = (response.body or b"").decode("utf-8")
         return MixAll.string2_properties(text)
 
@@ -602,6 +610,7 @@ class DefaultMQAdminExt:
         pass
         client = self._require_client()
         timeout = timeout_millis or self.timeout_millis
+        broker_addr = MixAll.broker_vip_channel(self.vip_channel_enabled, broker_addr)
         current_data_version: Optional[dict] = None
         group_seq = 0
         table: Dict[str, SubscriptionGroupConfig] = {}
@@ -1010,7 +1019,9 @@ class DefaultMQAdminExt:
             request.ext_fields[k] = str(v)
         if is_cpp:
             request.language = LanguageCode.CPP
-        response = client._invoke_sync(broker_addr, request, self.timeout_millis)
+        response = client._invoke_sync(
+            MixAll.broker_vip_channel(self.vip_channel_enabled, broker_addr),
+            request, self.timeout_millis)
         if response.code != ResponseCode.SUCCESS:
             raise MQClientException(response.remark or "reset offset failed", response.code)
         if not response.body:

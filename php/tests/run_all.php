@@ -5,7 +5,7 @@ declare(strict_types=1);
 /**
  * Entry point for all PHP-side unit tests (no phpunit dependency).
  *
- * Run: C:/Users/zhaoh/.workbuddy/binaries/php/versions/8.3/php.exe tests/run_all.php
+ * Run: php tests/run_all.php
  *
  * Contents:
  *   0) Static guard — a full class-name conflict scan (PHP has no module isolation; same-named

@@ -140,7 +140,18 @@ public sealed class DefaultMQAdminExt
     public bool VipChannelEnabled
     {
         get => _vipChannelEnabled;
-        set => _vipChannelEnabled = value;
+        set
+        {
+            _vipChannelEnabled = value;
+            // The shared instance runs the offset / consumer-list family that the admin
+            // delegates to it, so flipping the switch after Start() has to reach that
+            // instance too -- otherwise the admin's own RPCs move while the delegated
+            // ones keep the listening port.
+            if (_mqClient is not null)
+            {
+                _mqClient.VipChannelEnabled = value;
+            }
+        }
     }
 
     public int PollNameServerIntervalMillis
@@ -185,7 +196,8 @@ public sealed class DefaultMQAdminExt
         IRpcHook? requestHook = RequestHooks.Compose(_enableStreamRequestType, _rpcHook, () => _namespaceV2);
         _mqClient = MQClientManager.Instance.GetOrCreateMQClientInstance(_clientId,
             () => new MQClientInstance(_clientId, _nameServerAddrs, unitName: _unitName,
-                pollNameServerIntervalMillis: _pollNameServerIntervalMillis));
+                pollNameServerIntervalMillis: _pollNameServerIntervalMillis,
+                vipChannelEnabled: _vipChannelEnabled));
         if (requestHook is not null && !_mqClient.RegisterRpcHook(requestHook))
         {
             ClientLog.Warn("admin rpc hook ignored: MQClientInstance already has one (clientId="
@@ -569,7 +581,9 @@ public sealed class DefaultMQAdminExt
     public PropertyMap GetBrokerConfig(string brokerAddr, int timeoutMillis = -1)
     {
         int to = timeoutMillis < 0 ? _timeoutMillis : timeoutMillis;
-        RemotingCommand response = RequireClient().InvokeSync(AddrForRpc(brokerAddr), RequestCode.GetBrokerConfig, new PropertyMap(), null, false, to);
+        // Reading a broker's own configuration is the one admin RPC that always uses the
+        // listening port: the fast channel serves the other RPCs, not this one.
+        RemotingCommand response = RequireClient().InvokeSync(brokerAddr, RequestCode.GetBrokerConfig, new PropertyMap(), null, false, to);
         return MixAll.String2Properties(Encoding.UTF8.GetString(response.Body));
     }
 
@@ -808,7 +822,7 @@ public sealed class DefaultMQAdminExt
             if (haveVersion) ext["dataVersion"] = DvText(currentDataVersion);
 
             RemotingCommand response = client.InvokeSyncRaw(
-                brokerAddr, RequestCode.GetAllSubscriptiongroupConfig, ext, null, false, (int)left);
+                AddrForRpc(brokerAddr), RequestCode.GetAllSubscriptiongroupConfig, ext, null, false, (int)left);
             if (response.Code != ResponseCode.Success)
             {
                 throw new MQBrokerException(response.Code, response.Remark);
@@ -1340,7 +1354,7 @@ public sealed class DefaultMQAdminExt
         };
         if (queueId >= 0) ext["queueId"] = I64Str(queueId);
         RemotingCommand response = client.InvokeSyncRaw(
-            brokerAddr, RequestCode.InvokeBrokerToResetOffset, ext, null, false, _timeoutMillis,
+            AddrForRpc(brokerAddr), RequestCode.InvokeBrokerToResetOffset, ext, null, false, _timeoutMillis,
             isCpp ? LanguageCode.Cpp : -1);
         if (response.Code != ResponseCode.Success)
         {
