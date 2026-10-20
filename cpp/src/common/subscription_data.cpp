@@ -177,4 +177,31 @@ SubscriptionData FilterAPI::buildSubscriptionData(const std::string& topic,
     return sub;
 }
 
+SubscriptionData FilterAPI::buildSubscriptionData(const std::string& topic,
+                                                 const std::string& expression,
+                                                 const std::string& expressionType) {
+    if (expressionType == ExpressionType::TAG) {
+        return buildSubscriptionData(topic, expression);
+    }
+    // Not a tag list: nothing is parsed locally, the broker's filter layer is the only one that judges
+    // the expression, so tagsSet / codeSet stay empty and the client-side re-filter has nothing to run.
+    SubscriptionData sub(topic, expression);
+    sub.expressionType = expressionType;
+    return sub;
+}
+
+std::string FilterAPI::pullExpression(const SubscriptionData& sub) {
+    if (sub.expressionType != ExpressionType::TAG) {
+        return sub.subString;
+    }
+    return sub.subString.empty() ? std::string("*") : sub.subString;
+}
+
+int64_t FilterAPI::pullSubVersionOf(const SubscriptionData& sub) {
+    // A TAG subscription keeps the historic shape: subVersion 0 on the wire (the broker does not use it
+    // there). A selector subscription is versioned: the broker compares it against the version it holds
+    // for the group, so the value the subscription was built with is what has to travel.
+    return sub.expressionType == ExpressionType::TAG ? 0 : sub.subVersion;
+}
+
 }  // namespace rocketmq

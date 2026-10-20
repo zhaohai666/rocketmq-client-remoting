@@ -266,6 +266,20 @@ while (true) {
 位点默认自动提交（`autoCommit`），也可 `commit()` / `commit($offsets, persist: false)` 手动控制；
 `pause()` / `resume()` 按队列暂停与恢复拉取。
 
+订阅表达式也可以用选择器写法（push 的 `subscribe`、lite 的 `subscribe` /
+`setSubExpressionForAssign`、pull 侧的 `pull` / `pullBlockIfNotFound` 各有一个 `*WithSelector` /
+`pullBySelector` 同名兄弟）：`MessageSelector::byTag('TagA||TagB')` 与字符串写法在线上完全同形；
+`MessageSelector::bySql("color = 'red'")` 把表达式原样带上请求头（`expressionType=SQL92`、
+`subVersion` 为订阅自身版本），并且不再走客户端的 tag 二次过滤——本地按 tag 列表去解析一段 SQL
+会把 broker 已经选出的消息全部丢弃。
+
+```php
+use RocketMQ\Client\MessageSelector;
+
+$lite->subscribeWithSelector('TopicDemo', MessageSelector::bySql("color = 'red' AND weight > 10"));
+$pulled->pullBySelector($mq, MessageSelector::bySql("color = 'red'"), offset: 0, maxNums: 32);
+```
+
 ### Admin
 
 ```php

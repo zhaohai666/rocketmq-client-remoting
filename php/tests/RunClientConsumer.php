@@ -14,9 +14,11 @@ declare(strict_types=1);
  * broker is **stateful**:
  *   - per-queue pull counters (first pull returns FOUND / OFFSET_ILLEGAL, later ones NO_NEW_MSG);
  *   - OTopic's QUERY_CONSUMER_OFFSET returns 77 after "an OFFSET_ILLEGAL happened";
- *   - writes PULL / UPDATE_CONSUMER_OFFSET / CONSUMER_SEND_MSG_BACK / LOCK_BATCH_MQ
- *     requests line-by-line into the JSONL file named by RMQ_LOG; the parent process asserts
- *     wire behavior from it (sysFlag suspend bit, send-back delayLevel, lock mqSet, commit offsets).
+ *   - writes PULL / LITE_PULL / HEART_BEAT / UPDATE_CONSUMER_OFFSET / CONSUMER_SEND_MSG_BACK /
+ *     LOCK_BATCH_MQ requests line-by-line into the JSONL file named by RMQ_LOG; the parent process
+ *     asserts wire behavior from it (sysFlag suspend bit, the subscription expression cells a
+ *     selector puts on the pull request, the subscription set a heartbeat registers, send-back
+ *     delayLevel, lock mqSet, commit offsets).
  * The consumer list (for rebalance) is read from the JSON file named by RMQ_CONSUMER_MAP: {group: [cid,...]}.
  */
 
@@ -32,6 +34,7 @@ use RocketMQ\Client\ConsumerDefaults;
 use RocketMQ\Client\DefaultLitePullConsumer;
 use RocketMQ\Client\DefaultMQPullConsumer;
 use RocketMQ\Client\DefaultMQPushConsumer;
+use RocketMQ\Client\MessageSelector;
 use RocketMQ\Client\PopProcessQueue;
 use RocketMQ\Client\SimpleMessageListener;
 use RocketMQ\Client\ConsumeConcurrentlyContext;
@@ -45,13 +48,17 @@ use RocketMQ\Client\MQClientInstance;
 use RocketMQ\Client\Exceptions\MQBrokerException;
 use RocketMQ\Client\Exceptions\MQClientException;
 use RocketMQ\Client\PullStatus;
+use RocketMQ\Common\ExpressionType;
+use RocketMQ\Common\FilterAPI;
 use RocketMQ\Common\MessageDecoder;
 use RocketMQ\Common\MessageExt;
 use RocketMQ\Common\MessageQueue;
 use RocketMQ\Common\MixAll;
 use RocketMQ\Common\PullSysFlag;
 use RocketMQ\Common\SubscriptionData;
+use RocketMQ\Common\UtilAll;
 use RocketMQ\Remoting\Protocol\BrokerData;
+use RocketMQ\Remoting\Protocol\HeartbeatData;
 use RocketMQ\Remoting\Protocol\PullMessageResponseHeader;
 use RocketMQ\Remoting\Protocol\QueueData;
 use RocketMQ\Remoting\Protocol\RemotingCommand;
@@ -61,8 +68,11 @@ use RocketMQ\Remoting\Protocol\RocketMQSerializable;
 use RocketMQ\Remoting\Protocol\TopicRouteData;
 use RocketMQ\Common\PermName;
 use function RocketMQ\Client\build_local_offsets_json;
+use function RocketMQ\Client\build_pull_subscription_data;
+use function RocketMQ\Client\build_selector_subscription_data;
 use function RocketMQ\Client\client_side_tag_filter;
 use function RocketMQ\Client\filter_messages_for_delivery;
+use function RocketMQ\Client\parse_tag_subscription;
 use function RocketMQ\Client\wire_queue_key_string;
 use function RocketMQ\Client\wire_split;
 use function RocketMQ\Client\parse_local_offsets_json;
@@ -115,6 +125,51 @@ function consPullPlan(string $topic, int $seq, string $reqCode): array
             return [ResponseCode::PULL_NOT_FOUND, 77, []];
         case 'DTopic':
             return [ResponseCode::SUCCESS, 5, [['body' => 'direct-4', 'offset' => 4]]];
+
+        // ---- selector-driven subscription scenarios ----------------------------------
+        // Every topic below hands back the same two tagged messages on the first round, so
+        // the only variable left is the subscription shape the client put on the wire.
+        // TagA matches a "TagA || TagB" tag subscription, TagC matches no tag at all.
+        case 'QTopic':   // pull consumer + SQL92 selector
+        case 'QTopic2':  // pull consumer + bare tag expression (control of QTopic)
+        case 'QTopic3':  // pull consumer + TAG selector (control of QTopic2)
+        case 'QTopic4':  // pull consumer + CLASS_FILTER selector
+        case 'LSqlTopic':    // lite subscribe mode + SQL92 selector
+        case 'LTagTopic':    // lite subscribe mode + tag expression (control)
+        case 'LAssignTopic': // lite assign mode + SQL92 selector
+        case 'LClassTopic':  // lite assign mode + CLASS_FILTER selector
+        case 'LRawTopic':    // lite assign mode + no subscription at all (parsed on the spot)
+            if ($seq === 1) {
+                return [ResponseCode::SUCCESS, 2, [
+                    ['body' => 'sel-tag-a', 'offset' => 0, 'tag' => 'TagA'],
+                    ['body' => 'sel-tag-c', 'offset' => 1, 'tag' => 'TagC'],
+                ]];
+            }
+            return [ResponseCode::PULL_NOT_FOUND, 2, []];
+
+        // ---- shutdown drain scenarios ------------------------------------------------
+        // KTopic/KTopic2/KTopic3: one backlog of 21 messages each (bigger than a drain chunk,
+        // small enough for the no-ceiling walk), one topic per consumer so each scenario owns
+        // its own pull sequence. JTopic: FOUND on every round, so the caller can stack a
+        // backlog past the drain round cap.
+        case 'KTopic':
+        case 'KTopic2':
+        case 'KTopic3':
+            if ($seq === 1) {
+                $msgs = [];
+                for ($i = 0; $i < 21; $i++) {
+                    $msgs[] = ['body' => "drain-$i", 'offset' => $i];
+                }
+                return [ResponseCode::SUCCESS, 21, $msgs];
+            }
+            return [ResponseCode::PULL_NOT_FOUND, 21, []];
+        case 'JTopic':
+            $msgs = [];
+            for ($i = 0; $i < 32; $i++) {
+                $msgs[] = ['body' => "cap-$i", 'offset' => $i];
+            }
+            return [ResponseCode::SUCCESS, 32, $msgs];
+
         case 'LTopic':
             if ($reqCode != RequestCode::LITE_PULL_MESSAGE) {
                 return [ResponseCode::PULL_NOT_FOUND, 0, []];
@@ -184,13 +239,16 @@ function consRouteBody(string $addr): string
 }
 
 /** Encodes one message in the 17-segment format and concatenates it into the PULL/LITE_PULL response body. */
-function consEncodeMsg(string $topic, string $body, int $queueOffset): string
+function consEncodeMsg(string $topic, string $body, int $queueOffset, ?string $tag = null): string
 {
     $m = new MessageExt(topic: $topic, body: $body);
     $m->setQueueId(0);
     $m->setQueueOffset($queueOffset);
     $m->setBornTimestamp(1_700_000_000_000);
     $m->setStoreTimestamp(1_700_000_000_000);
+    if ($tag !== null) {
+        $m->setTags($tag);
+    }
     return MessageDecoder::encodeMessageExt($m);
 }
 
@@ -226,6 +284,11 @@ function consRespond(RemotingCommand $cmd): ?RemotingCommand
                 $off = match ($topic) {
                     'CTopic', 'RTopic', 'PTopic', 'STopic', 'LTopic', 'FTopic' => 0,
                     'DTopic' => 7,
+                    // Selector scenarios and drain scenarios start every queue from 0, so the
+                    // recorded pull always begins at the scripted batch.
+                    'QTopic', 'QTopic2', 'QTopic3', 'QTopic4',
+                    'LSqlTopic', 'LTagTopic', 'LAssignTopic', 'LClassTopic', 'LRawTopic',
+                    'KTopic', 'KTopic2', 'KTopic3', 'JTopic' => 0,
                     default => null,
                 };
             }
@@ -266,6 +329,11 @@ function consRespond(RemotingCommand $cmd): ?RemotingCommand
                 'queueOffset' => (int) ($ext['queueOffset'] ?? 0),
                 'sysFlag' => (int) ($ext['sysFlag'] ?? 0),
                 'group' => (string) ($ext['consumerGroup'] ?? ''),
+                // The subscription the caller reported: expression text, expression type and the
+                // version stamp are the three cells a selector-driven pull is judged on.
+                'subscription' => $ext['subscription'] ?? null,
+                'expressionType' => $ext['expressionType'] ?? null,
+                'subVersion' => isset($ext['subVersion']) ? (int) $ext['subVersion'] : null,
                 'seq' => $seq,
             ]);
             [$code, $next, $msgs] = consPullPlan($topic, $seq, (string) $cmd->code);
@@ -279,11 +347,39 @@ function consRespond(RemotingCommand $cmd): ?RemotingCommand
             if ($msgs !== []) {
                 $body = '';
                 foreach ($msgs as $m) {
-                    $body .= consEncodeMsg($topic, $m['body'], $m['offset']);
+                    $body .= consEncodeMsg($topic, $m['body'], $m['offset'], $m['tag'] ?? null);
                 }
                 $resp->body = $body;
             }
             return $resp;
+        }
+
+        case RequestCode::HEART_BEAT: {
+            // Registration body decoded off the wire: one log line per consumer group, carrying
+            // exactly the subscription set the broker would install.
+            $hb = ($cmd->body ?? '') !== '' ? HeartbeatData::decode($cmd->body) : null;
+            $consumers = [];
+            foreach ($hb?->consumerDataSet ?? [] as $cd) {
+                $subs = [];
+                foreach ($cd->subscriptionDataSet as $sd) {
+                    $subs[] = [
+                        'topic' => (string) $sd->topic,
+                        'subString' => (string) ($sd->subString ?? ''),
+                        'expressionType' => $sd->expressionType,
+                        'classFilterMode' => $sd->classFilterMode,
+                        'tagsSet' => $sd->tagsSet,
+                        'codeSet' => $sd->codeSet,
+                        'subVersion' => $sd->subVersion,
+                    ];
+                }
+                $consumers[] = ['group' => $cd->groupName, 'subs' => $subs];
+            }
+            consLog([
+                'code' => $cmd->code,
+                'clientId' => $hb?->clientId ?? '',
+                'consumers' => $consumers,
+            ]);
+            return RemotingCommand::createResponseCommand(ResponseCode::SUCCESS);
         }
 
         case RequestCode::UPDATE_CONSUMER_OFFSET:
@@ -481,6 +577,44 @@ final class ConsOrderlyListener implements MessageListenerOrderly
     }
 }
 
+/**
+ * Shutdown-drain listener: counts every batch (and message) it is handed. When built with a work
+ * size it hashes that many bytes per batch — a fixed, deterministic amount of CPU per batch, so a
+ * millisecond ceiling provably binds in the middle of the first drain chunk. Nothing here sleeps
+ * or waits: the drain either hands a batch over or it does not, and that is what is asserted.
+ */
+final class ConsDrainListener implements MessageListenerConcurrently
+{
+    public int $batches = 0;
+
+    /** @var list<string> */
+    public array $bodies = [];
+
+    private string $pad;
+
+    public function __construct(private int $workBytes = 0)
+    {
+        $this->pad = $workBytes > 0 ? str_repeat('d', $workBytes) : '';
+    }
+
+    public function consumeMessage(array $msgs, ConsumeConcurrentlyContext $context): ConsumeConcurrentlyStatus
+    {
+        $this->batches++;
+        foreach ($msgs as $m) {
+            $this->bodies[] = (string) $m->getBody();
+        }
+        if ($this->workBytes > 0) {
+            md5($this->pad);
+        }
+        return ConsumeConcurrentlyStatus::CONSUME_SUCCESS;
+    }
+
+    public function messageCount(): int
+    {
+        return count($this->bodies);
+    }
+}
+
 // ======================================================================
 // test runner
 // ======================================================================
@@ -564,6 +698,183 @@ final class RunClientConsumer
         if ($c->clientId !== null) {
             MQClientInstance::removeInstance($c->clientId);
         }
+    }
+
+    /** Last recorded pull request of one topic + group (the cell set a subscription is judged on). */
+    private function lastPullRow(int $code, string $topic, string $group): array
+    {
+        $rows = $this->logWhere($code, $topic, $group);
+        $this->check($rows !== [], "pull of $topic by $group reached the broker");
+        return $rows[count($rows) - 1] ?? [];
+    }
+
+    /** @return array{subscription:mixed,expressionType:mixed,subVersion:mixed,sysFlag:mixed} */
+    private function subscriptionCells(array $row): array
+    {
+        return [
+            'subscription' => $row['subscription'] ?? null,
+            'expressionType' => $row['expressionType'] ?? null,
+            'subVersion' => $row['subVersion'] ?? null,
+            'sysFlag' => $row['sysFlag'] ?? null,
+        ];
+    }
+
+    /**
+     * The subscription set a heartbeat registered for one group: topic => the cells the broker
+     * installs from. Reads the last beat that mentions the group.
+     *
+     * @return array<string,array<string,mixed>>
+     */
+    private function heartbeatSubs(string $group): array
+    {
+        $found = [];
+        foreach ($this->log as $e) {
+            if (($e['code'] ?? 0) !== RequestCode::HEART_BEAT) {
+                continue;
+            }
+            foreach (($e['consumers'] ?? []) as $cd) {
+                if (($cd['group'] ?? '') !== $group) {
+                    continue;
+                }
+                $found = [];
+                foreach (($cd['subs'] ?? []) as $sd) {
+                    $found[(string) $sd['topic']] = $sd;
+                }
+            }
+        }
+        $this->check($found !== [], "heartbeat of $group registered a subscription set");
+        return $found;
+    }
+
+    /** Read a private member of the push facade (drain bookkeeping is not part of the public API). */
+    private function pushPrivate(DefaultMQPushConsumer $c, string $name): mixed
+    {
+        $p = new \ReflectionProperty(DefaultMQPushConsumer::class, $name);
+        $p->setAccessible(true);
+        return $p->getValue($c);
+    }
+
+    private function pushPrivateMethod(DefaultMQPushConsumer $c, string $name, array $args = []): mixed
+    {
+        $m = new \ReflectionMethod(DefaultMQPushConsumer::class, $name);
+        $m->setAccessible(true);
+        return $m->invokeArgs($c, $args);
+    }
+
+    private function pushPrivateConstant(string $name): int
+    {
+        $value = (new \ReflectionClass(DefaultMQPushConsumer::class))->getConstant($name);
+        $this->check(is_int($value), "drain constant $name is an int");
+        return (int) $value;
+    }
+
+    // ================================================================ 1b. Selector-driven subscription building (pure)
+
+    private function testSelectorSubscriptionUnit(): void
+    {
+        $mq = new MessageQueue('QTopic', 'b-cons', 0);
+
+        // No selector: the expression is a tag list and FilterAPI compiles it.
+        $tag = build_pull_subscription_data($mq, 'TagA || TagB');
+        $this->checkSame('QTopic', $tag->topic, 'pull subscription takes the queue topic');
+        $this->checkSame('TagA || TagB', $tag->subString, 'bare expression keeps its text');
+        $this->checkSame(ExpressionType::TAG, $tag->expressionType, 'bare expression is a tag subscription');
+        $this->checkSame(['TagA', 'TagB'], $tag->tagsSet, 'bare expression compiles the tag set');
+        $this->checkSame([2598919, 2598920], $tag->codeSet, 'bare expression compiles the tag hash set');
+        $this->checkSame(false, $tag->classFilterMode, 'tag subscription is not class-filter mode');
+        // Nothing at all means SUB_ALL: an empty tag set, which is what disables client-side filtering.
+        $all = build_pull_subscription_data($mq, null);
+        $this->checkSame('*', $all->subString, 'no expression falls back to SUB_ALL');
+        $this->checkSame([], $all->tagsSet, 'SUB_ALL keeps the tag set empty');
+        $this->checkSame([], $all->codeSet, 'SUB_ALL keeps the hash set empty');
+
+        // TAG selector (and the empty type, which reads as TAG): the same tag derivation.
+        $byTag = build_selector_subscription_data('QTopic', MessageSelector::byTag('TagA || TagB'));
+        $this->checkSame($tag->tagsSet, $byTag->tagsSet, 'tag selector compiles the same tag set as the bare expression');
+        $this->checkSame($tag->codeSet, $byTag->codeSet, 'tag selector compiles the same hash set as the bare expression');
+        $this->checkSame(ExpressionType::TAG, $byTag->expressionType, 'tag selector reports TAG');
+        $blankType = build_selector_subscription_data('QTopic', new MessageSelector('', 'TagA || TagB'));
+        $this->checkSame(ExpressionType::TAG, $blankType->expressionType, 'empty selector type reads as TAG');
+        $this->checkSame(['TagA', 'TagB'], $blankType->tagsSet, 'empty selector type keeps the tag derivation');
+
+        // Non-tag selector: the raw expression is kept as it stands, no tag compilation.
+        $sql = build_selector_subscription_data('QTopic', MessageSelector::bySql('a > 10'));
+        $this->checkSame('SQL92', $sql->expressionType, 'SQL92 selector reports SQL92');
+        $this->checkSame('a > 10', $sql->subString, 'SQL92 expression is not parsed as a tag list');
+        $this->checkSame([], $sql->tagsSet, 'SQL92 subscription leaves tagsSet empty');
+        $this->checkSame([], $sql->codeSet, 'SQL92 subscription leaves codeSet empty');
+        $this->checkSame(false, $sql->classFilterMode, 'SQL92 subscription is not class-filter mode');
+        $this->checkSame('QTopic', $sql->topic, 'SQL92 subscription keeps the topic');
+
+        $cls = build_selector_subscription_data('QTopic', new MessageSelector(ExpressionType::CLASS_FILTER, 'MyClassFilter'));
+        $this->checkSame(ExpressionType::CLASS_FILTER, $cls->expressionType, 'class-filter selector keeps its own type');
+        $this->checkSame('MyClassFilter', $cls->subString, 'class-filter expression is kept verbatim');
+        $this->checkSame(true, $cls->classFilterMode, 'class-filter mode is set only for CLASS_FILTER');
+        $this->checkSame([], $cls->tagsSet, 'class-filter subscription leaves tagsSet empty');
+        $this->checkSame([], $cls->codeSet, 'class-filter subscription leaves codeSet empty');
+
+        // A non-tag selector without an expression is refused outright.
+        $threw = null;
+        try {
+            build_selector_subscription_data('QTopic', new MessageSelector(ExpressionType::SQL92, ''));
+        } catch (\ValueError $e) {
+            $threw = $e->getMessage();
+        }
+        $this->checkSame("Expression can't be null! SQL92", $threw, 'empty SQL92 expression throws ValueError');
+        $threw = null;
+        try {
+            build_pull_subscription_data($mq, null, new MessageSelector(ExpressionType::CLASS_FILTER, ''));
+        } catch (\ValueError $e) {
+            $threw = $e->getMessage();
+        }
+        $this->checkSame("Expression can't be null! CLASS_FILTER", $threw, 'empty class-filter expression throws ValueError');
+
+        // Unusable queue, and a tag expression FilterAPI rejects, both surface as client exceptions.
+        foreach ([null, new MessageQueue('', 'b-cons', 0)] as $i => $bad) {
+            $message = null;
+            try {
+                build_pull_subscription_data($bad, 'TagA');
+            } catch (MQClientException $e) {
+                $message = $e->getMessage();
+            }
+            $this->checkSame('mq is null', $message, "unusable queue #$i reports 'mq is null'");
+        }
+        $message = null;
+        try {
+            build_pull_subscription_data($mq, '||');
+        } catch (MQClientException $e) {
+            $message = $e->getMessage();
+        }
+        $this->checkSame('parse subscription error: subString split error', $message,
+            'a tag expression FilterAPI rejects is rethrown as a subscription error');
+        $message = null;
+        try {
+            build_pull_subscription_data($mq, null, MessageSelector::byTag('||'));
+        } catch (MQClientException $e) {
+            $message = $e->getMessage();
+        }
+        $this->checkSame('parse subscription error: subString split error', $message,
+            'a TAG selector holding a bad expression reports the same subscription error');
+
+        // parse_tag_subscription is the single place that rule lives.
+        $this->checkSame(['TagA'], build_pull_subscription_data($mq, 'TagA')->tagsSet, 'single tag expression compiles');
+        $this->checkSame(FilterAPI::buildSubscriptionData('QTopic', 'TagA')->tagsSet,
+            parse_tag_subscription('QTopic', 'TagA')->tagsSet,
+            'parse_tag_subscription matches the FilterAPI build');
+        $this->checkSame('*', parse_tag_subscription('QTopic', null)->subString,
+            'parse_tag_subscription reads a missing expression as SUB_ALL');
+
+        // Client-side filtering is a tag-only affair: an empty tagsSet means the broker decided.
+        $mTagA = new MessageExt(topic: 'QTopic', body: 'sel-tag-a');
+        $mTagA->setTags('TagA');
+        $mTagC = new MessageExt(topic: 'QTopic', body: 'sel-tag-c');
+        $mTagC->setTags('TagC');
+        $this->checkSame([$mTagA], client_side_tag_filter($tag, [$mTagA, $mTagC]),
+            'tag subscription re-filters the batch by tag string');
+        $this->checkSame([$mTagA, $mTagC], client_side_tag_filter($sql, [$mTagA, $mTagC]),
+            'SQL92 subscription is never re-filtered client-side');
+        $this->checkSame([$mTagA, $mTagC], client_side_tag_filter($cls, [$mTagA, $mTagC]),
+            'class-filter subscription is never re-filtered client-side');
     }
 
     // ================================================================ 1. ConsumerSupport pure logic
@@ -1015,6 +1326,112 @@ final class RunClientConsumer
         $this->cleanup($c);
     }
 
+    // ================================================================ 4b. Pull consumer: selector on the wire
+
+    /**
+     * A selector decides what the pull reports: the expression text, its type and the version
+     * stamp travel together, so a SQL92 expression is never mistaken for a tag list. The tag
+     * path is the paired control and must stay on the version-0 shape it has always used.
+     */
+    private function testPullSelectorWire(ConsFakeBroker $broker): void
+    {
+        $c = new DefaultMQPullConsumer('GID-Q-CONS');
+        $c->setInstanceName('CONS-Q');
+        $c->setNameServerAddresses([$broker->addr]);
+        $c->registerTopic('QTopic');
+        $c->registerTopic('QTopic2');
+        $c->registerTopic('QTopic3');
+        $c->registerTopic('QTopic4');
+        $c->start();
+
+        $sql = "(TAGS in ('TagA')) AND (a > 10)";
+        $mq = $c->fetchSubscribeMessageQueues('QTopic')[0] ?? null;
+        $this->check($mq !== null, 'pull consumer resolves the QTopic queue');
+        if ($mq === null) {
+            return;
+        }
+
+        $r = $c->pullBySelector($mq, MessageSelector::bySql($sql), 0, 32);
+        $this->checkSame(PullStatus::FOUND, $r->status, 'SQL92 selector pull finds the batch');
+        // Pull mode hands the batch over untouched: only a tag subscription filters client-side.
+        $this->checkSame(['sel-tag-a', 'sel-tag-c'],
+            array_map(static fn($m) => $m->getBody(), $r->msgFoundList),
+            'pull mode does not second-guess a SQL92 match');
+
+        $this->loadLog(getenv('RMQ_LOG'));
+        $sqlRow = $this->lastPullRow(RequestCode::PULL_MESSAGE, 'QTopic', 'GID-Q-CONS');
+        $this->checkSame($sql, $sqlRow['subscription'] ?? null, 'SQL92 expression reaches the wire verbatim');
+        $this->checkSame(ExpressionType::SQL92, $sqlRow['expressionType'] ?? null, 'SQL92 selector reports SQL92');
+        $this->check((int) ($sqlRow['subVersion'] ?? 0) > 0, 'non-tag pull reports the subscription version');
+        $this->checkSame(PullSysFlag::FLAG_SUBSCRIPTION, (int) ($sqlRow['sysFlag'] ?? 0),
+            'SQL92 short-poll sysFlag=4 (class-filter bit stays off)');
+
+        // Paired control 1: the bare tag expression keeps the old shape (TAG + version 0 + compiled tags).
+        $mq2 = $c->fetchSubscribeMessageQueues('QTopic2')[0] ?? null;
+        $bare = $c->pull($mq2, 'TagA || TagB', 0);
+        $this->checkSame(PullStatus::FOUND, $bare->status, 'bare tag pull finds the batch');
+        $this->loadLog(getenv('RMQ_LOG'));
+        $tagRow = $this->lastPullRow(RequestCode::PULL_MESSAGE, 'QTopic2', 'GID-Q-CONS');
+        $this->checkSame('TagA || TagB', $tagRow['subscription'] ?? null, 'tag expression reaches the wire as written');
+        $this->checkSame(ExpressionType::TAG, $tagRow['expressionType'] ?? null, 'bare expression reports TAG');
+        $this->checkSame(0, (int) ($tagRow['subVersion'] ?? -1), 'tag pull keeps the version-0 stamp');
+        $this->checkSame(PullSysFlag::FLAG_SUBSCRIPTION, (int) ($tagRow['sysFlag'] ?? 0),
+            'tag short-poll sysFlag=4 (subscription bit, no suspend, no class filter)');
+
+        // Paired control 2: a TAG selector is byte-identical to the bare expression.
+        $mq3 = $c->fetchSubscribeMessageQueues('QTopic3')[0] ?? null;
+        $c->pullBySelector($mq3, MessageSelector::byTag('TagA || TagB'), 0);
+        $this->loadLog(getenv('RMQ_LOG'));
+        $selTagRow = $this->lastPullRow(RequestCode::PULL_MESSAGE, 'QTopic3', 'GID-Q-CONS');
+        $this->checkSame($this->subscriptionCells($tagRow), $this->subscriptionCells($selTagRow),
+            'a TAG selector puts the same subscription cells on the wire as the bare expression');
+
+        // CLASS_FILTER: its own type on the wire, and the pull sysFlag stays the plain subscription
+        // one (the class-filter bit routes to a legacy filter server this client does not speak).
+        $mq4 = $c->fetchSubscribeMessageQueues('QTopic4')[0] ?? null;
+        $c->pullBySelector($mq4, new MessageSelector(ExpressionType::CLASS_FILTER, 'MyClassFilter'), 0);
+        $this->loadLog(getenv('RMQ_LOG'));
+        $clsRow = $this->lastPullRow(RequestCode::PULL_MESSAGE, 'QTopic4', 'GID-Q-CONS');
+        $this->checkSame('MyClassFilter', $clsRow['subscription'] ?? null, 'class-filter expression is not parsed as a tag list');
+        $this->checkSame(ExpressionType::CLASS_FILTER, $clsRow['expressionType'] ?? null, 'class-filter selector reports CLASS_FILTER');
+        $this->check((int) ($clsRow['subVersion'] ?? 0) > 0, 'class-filter pull reports the subscription version');
+        $this->checkSame(PullSysFlag::FLAG_SUBSCRIPTION, (int) ($clsRow['sysFlag'] ?? 0),
+            'class-filter pull keeps the class-filter sysFlag bit off (4)');
+
+        // Long polling keeps the selector shape too: only the suspend bit differs.
+        $blocked = $c->pullBlockIfNotFoundBySelector($mq, MessageSelector::bySql($sql), 0, 32);
+        $this->checkSame(PullStatus::NO_NEW_MSG, $blocked->status, 'blocked SQL92 pull reports the scripted empty round');
+        $this->loadLog(getenv('RMQ_LOG'));
+        $blockRow = $this->lastPullRow(RequestCode::PULL_MESSAGE, 'QTopic', 'GID-Q-CONS');
+        $this->checkSame(PullSysFlag::FLAG_SUBSCRIPTION | PullSysFlag::FLAG_SUSPEND, (int) ($blockRow['sysFlag'] ?? 0),
+            'pullBlockIfNotFoundBySelector sysFlag=6 (suspend bit on)');
+        $this->checkSame($sql, $blockRow['subscription'] ?? null, 'long-poll keeps the SQL92 expression');
+        $this->checkSame(ExpressionType::SQL92, $blockRow['expressionType'] ?? null, 'long-poll keeps SQL92 as the type');
+        $this->check((int) ($blockRow['subVersion'] ?? 0) > 0,
+            'a long-poll round of the same selector still reports a version, not the tag version 0');
+
+        // An unusable queue is rejected before any request leaves.
+        $message = null;
+        try {
+            $c->pullBySelector(new MessageQueue('', 'b-cons', 0), MessageSelector::bySql($sql));
+        } catch (MQClientException $e) {
+            $message = $e->getMessage();
+        }
+        $this->checkSame('mq is null', $message, 'pullBySelector rejects a queue without a topic');
+
+        // What a pull consumer registers is its own contract: the topics it subscribes to, with the
+        // SUB_ALL tag subscription. Selectors belong to the pull request, not to the registration.
+        $subs = $this->heartbeatSubs('GID-Q-CONS');
+        $this->checkSame(['QTopic', 'QTopic2', 'QTopic3', 'QTopic4'], array_keys($subs),
+            'pull heartbeat registers every subscribed topic in sorted order');
+        $this->checkSame('*', $subs['QTopic']['subString'] ?? null, 'pull heartbeat subscription is SUB_ALL');
+        $this->checkSame(ExpressionType::TAG, $subs['QTopic']['expressionType'] ?? null, 'pull heartbeat subscription is a tag one');
+        $this->checkSame([], $subs['QTopic']['tagsSet'] ?? null, 'SUB_ALL registers an empty tag set');
+        $this->checkSame(0, (int) ($subs['QTopic']['subVersion'] ?? -1), 'pull heartbeat subscription is version 0');
+
+        $this->cleanup($c);
+    }
+
     // ================================================================ 5. LitePull: assign-mode dual cursors + commit + seek
 
     private function testLitePull(ConsFakeBroker $broker): void
@@ -1094,11 +1511,327 @@ final class RunClientConsumer
         $this->cleanup($c);
     }
 
+    // ================================================================ 5b. LitePull: selector subscription end to end
+
+    /**
+     * The selector has to survive the whole path: the local subscription table, the registration
+     * the broker is handed, and every pull request that follows. A tag subscription is the paired
+     * control and keeps both the compiled tag set on the registration and the version-0 pull shape,
+     * which is also what makes the client-side second filtering possible.
+     */
+    private function testLitePullSelectorWire(ConsFakeBroker $broker): void
+    {
+        $sql = "(TAGS in ('TagA')) AND (a > 10)";
+
+        // ---- subscribe mode + SQL92 selector ----
+        $sqlC = new DefaultLitePullConsumer('GID-M-CONS');
+        $sqlC->setInstanceName('CONS-M');
+        $sqlC->setNamesrvAddr($broker->addr);
+        $sqlC->subscribeWithSelector('LSqlTopic', MessageSelector::bySql($sql));
+        $sqlC->start();
+
+        $this->loadLog(getenv('RMQ_LOG'));
+        $sqlSubs = $this->heartbeatSubs('GID-M-CONS');
+        $this->checkSame(['LSqlTopic'], array_keys($sqlSubs), 'SQL92 selector is the only registered subscription');
+        $sqlSub = $sqlSubs['LSqlTopic'] ?? [];
+        $this->checkSame($sql, $sqlSub['subString'] ?? null, 'heartbeat registers the SQL92 expression text');
+        $this->checkSame(ExpressionType::SQL92, $sqlSub['expressionType'] ?? null,
+            'ConsumerData.subscriptionDataSet says SQL92, not TAG');
+        $this->checkSame([], $sqlSub['tagsSet'] ?? null, 'SQL92 registration carries no compiled tag set');
+        $this->checkSame([], $sqlSub['codeSet'] ?? null, 'SQL92 registration carries no compiled hash set');
+        $this->checkSame(false, $sqlSub['classFilterMode'] ?? null, 'SQL92 registration is not class-filter mode');
+        $this->check((int) ($sqlSub['subVersion'] ?? 0) > 0, 'SQL92 registration carries its own version stamp');
+
+        // One tick rebalances and pulls, so the request the subscription produced is on the log.
+        $sqlC->tick();
+        $this->checkSame(['sel-tag-a', 'sel-tag-c'],
+            array_map(static fn($m) => $m->getBody(), $sqlC->poll(0)),
+            'a SQL92 batch is handed over whole: the client never re-filters it');
+        $this->loadLog(getenv('RMQ_LOG'));
+        $sqlPull = $this->lastPullRow(RequestCode::LITE_PULL_MESSAGE, 'LSqlTopic', 'GID-M-CONS');
+        $this->checkSame($sql, $sqlPull['subscription'] ?? null, 'the pull request repeats the SQL92 expression');
+        $this->checkSame(ExpressionType::SQL92, $sqlPull['expressionType'] ?? null, 'the pull request is typed SQL92');
+        $this->checkSame((int) $sqlSub['subVersion'], (int) ($sqlPull['subVersion'] ?? -1),
+            'the pulled version is the registered version');
+        $this->checkSame(PullSysFlag::FLAG_SUBSCRIPTION | PullSysFlag::FLAG_LITE_PULL_MESSAGE,
+            (int) ($sqlPull['sysFlag'] ?? 0), 'SQL92 lite pull sysFlag=20 (subscription + lite, no class filter)');
+        // One live connection at a time: the fake broker serves connections sequentially.
+        $this->cleanup($sqlC);
+
+        // ---- subscribe mode + tag expression (paired control, byte-identical to the old shape) ----
+        $tagC = new DefaultLitePullConsumer('GID-N-CONS');
+        $tagC->setInstanceName('CONS-N');
+        $tagC->setNamesrvAddr($broker->addr);
+        $tagC->subscribe('LTagTopic', 'TagA || TagB');
+        $tagC->start();
+
+        $this->loadLog(getenv('RMQ_LOG'));
+        $tagSubs = $this->heartbeatSubs('GID-N-CONS');
+        $tagSub = $tagSubs['LTagTopic'] ?? [];
+        $this->checkSame('TagA || TagB', $tagSub['subString'] ?? null, 'tag registration keeps the expression text');
+        $this->checkSame(ExpressionType::TAG, $tagSub['expressionType'] ?? null, 'tag registration is typed TAG');
+        $this->checkSame(['TagA', 'TagB'], $tagSub['tagsSet'] ?? null, 'tag registration carries the compiled tag set');
+        $this->checkSame([2598919, 2598920], $tagSub['codeSet'] ?? null, 'tag registration carries the compiled hash set');
+        $this->checkSame(false, $tagSub['classFilterMode'] ?? null, 'tag registration is not class-filter mode');
+        $this->check((int) ($tagSub['subVersion'] ?? 0) > 0, 'the tag registration stamps its own version');
+
+        $tagC->tick();
+        // tagsSet is what makes client-side filtering possible: TagC is not in the subscription.
+        $this->checkSame(['sel-tag-a'],
+            array_map(static fn($m) => $m->getBody(), $tagC->poll(0)),
+            'a tag subscription re-filters the batch client-side');
+        $this->loadLog(getenv('RMQ_LOG'));
+        $tagPull = $this->lastPullRow(RequestCode::LITE_PULL_MESSAGE, 'LTagTopic', 'GID-N-CONS');
+        $this->checkSame('TagA || TagB', $tagPull['subscription'] ?? null, 'tag pull reports the tag expression');
+        $this->checkSame(ExpressionType::TAG, $tagPull['expressionType'] ?? null, 'tag pull is typed TAG');
+        $this->checkSame(0, (int) ($tagPull['subVersion'] ?? -1),
+            'a tag pull keeps the version-0 shape whatever the registration says');
+        $this->checkSame(PullSysFlag::FLAG_SUBSCRIPTION | PullSysFlag::FLAG_LITE_PULL_MESSAGE,
+            (int) ($tagPull['sysFlag'] ?? 0), 'tag lite pull sysFlag=20 matches the pre-selector wire');
+        $this->cleanup($tagC);
+
+        // ---- assign mode + selectors (and one queue with no subscription at all) ----
+        $assignC = new DefaultLitePullConsumer('GID-O-CONS');
+        $assignC->setInstanceName('CONS-O');
+        $assignC->setNamesrvAddr($broker->addr);
+        $assignC->setSubExpressionForAssignWithSelector('LAssignTopic', MessageSelector::bySql($sql));
+        $assignC->setSubExpressionForAssignWithSelector('LClassTopic', new MessageSelector(ExpressionType::CLASS_FILTER, 'MyClassFilter'));
+        $assignC->assign([
+            new MessageQueue('LAssignTopic', 'b-cons', 0),
+            new MessageQueue('LClassTopic', 'b-cons', 0),
+            new MessageQueue('LRawTopic', 'b-cons', 0),
+        ]);
+        $assignC->start();
+        $assignC->tick();
+
+        $this->loadLog(getenv('RMQ_LOG'));
+        $assignSubs = $this->heartbeatSubs('GID-O-CONS');
+        $this->checkSame(['LAssignTopic', 'LClassTopic'], array_keys($assignSubs),
+            'assign-mode selector subscriptions are the ones registered');
+        $this->checkSame(ExpressionType::SQL92, $assignSubs['LAssignTopic']['expressionType'] ?? null,
+            'setSubExpressionForAssignWithSelector registers SQL92');
+        $this->checkSame(ExpressionType::CLASS_FILTER, $assignSubs['LClassTopic']['expressionType'] ?? null,
+            'setSubExpressionForAssignWithSelector registers CLASS_FILTER');
+        $this->checkSame(true, $assignSubs['LClassTopic']['classFilterMode'] ?? null,
+            'class-filter mode is the only thing CLASS_FILTER sets beyond the type');
+        $this->checkSame([], $assignSubs['LClassTopic']['tagsSet'] ?? null,
+            'class-filter registration carries no compiled tag set');
+
+        $assignSql = $this->lastPullRow(RequestCode::LITE_PULL_MESSAGE, 'LAssignTopic', 'GID-O-CONS');
+        $this->checkSame($sql, $assignSql['subscription'] ?? null, 'assign-mode pull repeats the SQL92 expression');
+        $this->checkSame(ExpressionType::SQL92, $assignSql['expressionType'] ?? null, 'assign-mode pull is typed SQL92');
+        $this->checkSame((int) $assignSubs['LAssignTopic']['subVersion'], (int) ($assignSql['subVersion'] ?? -1),
+            'assign-mode pulled version matches the registered version');
+
+        $assignCls = $this->lastPullRow(RequestCode::LITE_PULL_MESSAGE, 'LClassTopic', 'GID-O-CONS');
+        $this->checkSame('MyClassFilter', $assignCls['subscription'] ?? null, 'class-filter pull reports the raw expression');
+        $this->checkSame(ExpressionType::CLASS_FILTER, $assignCls['expressionType'] ?? null, 'class-filter pull is typed CLASS_FILTER');
+        $this->checkSame(
+            PullSysFlag::FLAG_SUBSCRIPTION | PullSysFlag::FLAG_LITE_PULL_MESSAGE,
+            (int) ($assignCls['sysFlag'] ?? 0), 'class-filter lite pull sysFlag=20 (subscription + lite, class filter off)');
+
+        // A queue assigned with no subscription at all: the raw expression is parsed on the spot,
+        // which is SUB_ALL, so nothing is compiled and nothing is re-filtered client-side.
+        $rawPull = $this->lastPullRow(RequestCode::LITE_PULL_MESSAGE, 'LRawTopic', 'GID-O-CONS');
+        $this->checkSame('*', $rawPull['subscription'] ?? null, 'unsubscribed queue pulls with SUB_ALL');
+        $this->checkSame(ExpressionType::TAG, $rawPull['expressionType'] ?? null, 'a parsed-on-the-spot expression is a tag one');
+        $this->checkSame(0, (int) ($rawPull['subVersion'] ?? -1), 'SUB_ALL pull keeps the version-0 shape');
+        $this->check($this->logWhere(RequestCode::LITE_PULL_MESSAGE, 'LSqlTopic', 'GID-O-CONS') === []
+            && $this->logWhere(RequestCode::LITE_PULL_MESSAGE, 'LTagTopic', 'GID-O-CONS') === [],
+            'assign mode pulls exactly the queues it was given');
+        $this->cleanup($assignC);
+
+        // subscriptionDataFor guards against a stored SubscriptionData belonging to another topic.
+        $guard = new DefaultLitePullConsumer('GID-O-CONS');
+        $guard->subscriptionData['LRawTopic'] = new SubscriptionData('OtherTopic', 'TagZ');
+        $resolved = $this->litePrivateMethod($guard, 'subscriptionDataFor', ['LRawTopic']);
+        $this->checkSame('LRawTopic', $resolved->topic, 'a stored subscription of another topic is not reused');
+        $this->checkSame('*', $resolved->subString, 'the topic is parsed from its own raw expression instead');
+        $this->checkSame(ExpressionType::TAG, $resolved->expressionType, 'the fallback parse is a tag subscription');
+        $this->checkSame([], $resolved->tagsSet, 'the fallback parse of an absent expression has no tags');
+        // The stored subscription wins as soon as its topic matches.
+        $guard->subscriptionData['LRawTopic'] = new SubscriptionData('LRawTopic', 'TagA');
+        $this->checkSame('TagA',
+            $this->litePrivateMethod($guard, 'subscriptionDataFor', ['LRawTopic'])->subString,
+            'a matching stored subscription is the one a pull reports');
+        // An empty stored expression still reads as SUB_ALL, never as an empty string on the wire.
+        $bare = new DefaultLitePullConsumer('GID-O-CONS');
+        $bare->subscription['LRawTopic'] = '';
+        $this->checkSame('*', $this->litePrivateMethod($bare, 'subscriptionDataFor', ['LRawTopic'])->subString,
+            'an empty raw expression falls back to SUB_ALL');
+    }
+
+    private function litePrivateMethod(object $c, string $name, array $args = []): mixed
+    {
+        $m = new \ReflectionMethod(DefaultLitePullConsumer::class, $name);
+        $m->setAccessible(true);
+        return $m->invokeArgs($c, $args);
+    }
+
+    // ================================================================ 6. Shutdown drain (awaitTerminationMillisWhenShutdown)
+
+    /**
+     * shutdown() hands the batches still sitting in the per-queue buffers to the listener before
+     * tearing anything down, bounded by awaitTerminationMillisWhenShutdown. Everything here is
+     * judged on counters (what the listener got, what is still queued), never on elapsed time: the
+     * ceiling is only given a backlog and a per-batch workload big enough that it provably binds
+     * inside the first chunk, and the round-cap case needs no timing at all.
+     */
+    private function testShutdownDrain(ConsFakeBroker $broker): void
+    {
+        $GLOBALS['DRAIN_LISTENER'] = [];
+
+        // Defaults: no extra ceiling, and the drain's own bookkeeping is fixed by the class.
+        $idle = new DefaultMQPushConsumer('GID-DRAIN-IDLE');
+        $this->checkSame(0, $idle->awaitTerminationMillisWhenShutdown, 'shutdown drain has no time ceiling by default');
+        $this->checkSame(0, $idle->getAwaitTerminationMillisWhenShutdown(), 'the getter reads the public field back');
+        $this->checkSame(1000, $idle->dispatchBatchesPerTick, 'a tick dispatches 1000 batches by default');
+        $this->checkSame(16, $this->pushPrivateConstant('SHUTDOWN_DRAIN_CHUNK_BATCHES'),
+            'the drain walks the backlog 16 batches at a time');
+        $this->checkSame(64, $this->pushPrivateConstant('SHUTDOWN_DRAIN_MAX_ROUNDS'),
+            'the drain stops after 64 rounds whatever the backlog');
+
+        // Setter round trip, including the "no ceiling" reading of a non-positive value.
+        $idle->setAwaitTerminationMillisWhenShutdown(250);
+        $this->checkSame(250, $idle->getAwaitTerminationMillisWhenShutdown(), 'the setter drives the ceiling');
+        $this->checkSame(250, $idle->awaitTerminationMillisWhenShutdown, 'the setter writes the public field');
+        $idle->setAwaitTerminationMillisWhenShutdown(0);
+        $this->checkSame(0, $idle->awaitTerminationMillisWhenShutdown, '0 puts no time ceiling on the drain');
+        // Never started: nothing queued, nothing drained, nothing thrown.
+        $this->checkSame(0, $this->pushPrivateMethod($idle, 'queuedMessageCount'), 'an idle consumer queues nothing');
+        $idle->shutdown();
+        $this->checkSame(0, $this->pushPrivateMethod($idle, 'queuedMessageCount'), 'shutdown of an idle consumer drains nothing');
+
+        // ---- positive ceiling: shutdown returns while messages are still queued ----
+        // A ceiling of 1ms against a ~10ms-per-batch listener cannot survive the first 16-batch
+        // chunk, so exactly one chunk goes out and the rest stays queued.
+        $limited = $this->drainConsumer($broker, 'GID-K-CONS', 'CONS-K', 'KTopic', 400_000, 2, 1);
+        $this->checkSame(1, $limited->getAwaitTerminationMillisWhenShutdown(), 'drain case keeps its ceiling');
+        $tick = $this->drainTick($limited);
+        $this->checkSame(2, $tick['batches'], 'dispatchBatchesPerTick=2 hands exactly 2 batches per tick');
+        $this->checkSame(['drain-0', 'drain-1'], $tick['bodies'], 'the first two batches go out in order');
+        $this->checkSame(19, $tick['queued'], '21 pulled - 2 dispatched leaves 19 queued');
+        $after = $this->drainShutdown($limited);
+        $this->checkSame(18, $after['batches'], 'a bounded drain stops after one 16-batch chunk');
+        $ordered = [];
+        for ($i = 2; $i < 18; $i++) {
+            $ordered[] = "drain-$i";
+        }
+        $this->checkSame($ordered, array_slice($this->drainListener($limited)->bodies, 2, 16),
+            'the bounded drain walks the backlog in queue order');
+        $this->checkSame(3, $after['queued'], 'shutdown returns with the rest of the backlog still queued');
+        $this->checkSame(3, array_sum($after['pending']), 'what is left is still in the per-queue buffer');
+
+        // ---- control: the default 0 walks the whole backlog ----
+        $plain = $this->drainConsumer($broker, 'GID-K2-CONS', 'CONS-K2', 'KTopic2', 0, 2, 0);
+        $this->checkSame(2, $this->drainTick($plain)['batches'], 'control tick dispatched the same 2 batches');
+        $done = $this->drainShutdown($plain);
+        $this->checkSame(21, $done['batches'], 'with no ceiling the drain delivers the whole backlog');
+        $this->checkSame(0, $done['queued'], 'and leaves nothing queued');
+        $this->checkSame([], $done['pending'], 'the per-queue buffers are gone, not merely empty');
+
+        // ---- a ceiling that binds cannot strand a backlog fitting in one chunk ----
+        $small = $this->drainConsumer($broker, 'GID-K3-CONS', 'CONS-K3', 'KTopic3', 400_000, 10, 1);
+        $busy = $this->drainTick($small);
+        $this->checkSame(10, $busy['batches'], 'dispatchBatchesPerTick=10 hands 10 batches to the listener');
+        $this->checkSame(11, $busy['queued'], 'the other 11 are still queued at the ceiling');
+        $few = $this->drainShutdown($small);
+        $this->checkSame(21, $few['batches'], '11 queued batches fit in one chunk, so all of them go out');
+        $this->checkSame(0, $few['queued'], 'a spending ceiling strands nothing once the buffer is empty');
+
+        // ---- round cap: no timing involved, the backlog simply outruns 64 chunks ----
+        $cap = $this->drainConsumer($broker, 'GID-J-CONS', 'CONS-J', 'JTopic', 0, 1, 0, 4096);
+        $rounds = $this->pushPrivateConstant('SHUTDOWN_DRAIN_MAX_ROUNDS');
+        $chunk = $this->pushPrivateConstant('SHUTDOWN_DRAIN_CHUNK_BATCHES');
+        $queuedAfter = 0;
+        for ($i = 0; $i < 5; $i++) {
+            $cap->tick();
+            $queuedAfter = $this->pushPrivateMethod($cap, 'queuedMessageCount');
+        }
+        $this->checkSame(1275, $queuedAfter, '5 ticks of 8 short polls less 1 batch each leave a 1275-batch backlog');
+        $this->check($queuedAfter > $rounds * $chunk,
+            'the backlog is deliberately bigger than one drain may deliver (64 x 16 batches)');
+        $batchesBefore = $this->drainListener($cap)->batches;
+        $cap->shutdown();
+        $delivered = $this->drainListener($cap)->batches - $batchesBefore;
+        $this->checkSame($rounds * $chunk, $delivered, 'the cap is what stopped this drain, not the clock');
+        $this->checkSame($queuedAfter - $rounds * $chunk,
+            $this->pushPrivateMethod($cap, 'queuedMessageCount'), 'everything past the cap stays queued');
+    }
+
+    /**
+     * Build and start a drain-scenario push consumer: one message per batch, a fixed number of
+     * batches per tick, a listener that burns a known amount of CPU per batch (0 = no work at all),
+     * and optionally a pull threshold high enough to let a backlog grow past the drain cap.
+     */
+    private function drainConsumer(
+        ConsFakeBroker $broker,
+        string $group,
+        string $instance,
+        string $topic,
+        int $workBytes,
+        int $batchesPerTick,
+        int $ceilingMillis,
+        ?int $pullThreshold = null,
+    ): DefaultMQPushConsumer {
+        $listener = new ConsDrainListener($workBytes);
+        $GLOBALS['DRAIN_LISTENER'][$instance] = $listener;
+        $c = new DefaultMQPushConsumer($group);
+        $c->setInstanceName($instance);
+        $c->setNameServerAddresses([$broker->addr]);
+        $c->setMessageListener($listener);
+        $c->consumeMessageBatchMaxSize = 1;
+        $c->dispatchBatchesPerTick = $batchesPerTick;
+        $c->setAwaitTerminationMillisWhenShutdown($ceilingMillis);
+        if ($pullThreshold !== null) {
+            $c->pullThresholdForQueue = $pullThreshold;
+        }
+        $c->subscribe($topic);
+        $c->start();
+        return $c;
+    }
+
+    private function drainListener(DefaultMQPushConsumer $c): ConsDrainListener
+    {
+        $listener = $GLOBALS['DRAIN_LISTENER'][$c->instanceName] ?? null;
+        $this->check($listener instanceof ConsDrainListener, 'drain listener found for ' . $c->instanceName);
+        return $listener;
+    }
+
+    /** @return array{batches:int,bodies:list<string>,queued:int} */
+    private function drainTick(DefaultMQPushConsumer $c): array
+    {
+        $c->tick();
+        $listener = $this->drainListener($c);
+        return [
+            'batches' => $listener->batches,
+            'bodies' => $listener->bodies,
+            'queued' => $this->pushPrivateMethod($c, 'queuedMessageCount'),
+        ];
+    }
+
+    /** @return array{batches:int,queued:int,pending:array<string,int>} */
+    private function drainShutdown(DefaultMQPushConsumer $c): array
+    {
+        $c->shutdown();
+        $listener = $this->drainListener($c);
+        $pending = [];
+        foreach ((array) $this->pushPrivate($c, 'pending') as $key => $dq) {
+            $pending[(string) $key] = is_array($dq) ? count($dq) : 0;
+        }
+        return [
+            'batches' => $listener->batches,
+            'queued' => $this->pushPrivateMethod($c, 'queuedMessageCount'),
+            'pending' => $pending,
+        ];
+    }
+
     // ================================================================ run
 
     public function run(): int
     {
         $this->testConsumerSupportUnit();
+        $this->testSelectorSubscriptionUnit();
 
         // ---- network cases: start the fake broker + log/consumer-list files ----
         $tmpDir = sys_get_temp_dir() . '/rmq-cons-test-' . getmypid();
@@ -1116,6 +1849,11 @@ final class RunClientConsumer
             'GID-P-CONS' => [MixAll::clientIdFor('CONS-P', null, true)],
             'GID-L-CONS' => [MixAll::clientIdFor('CONS-L', null, true)],
             'GID-SUS-CONS' => [MixAll::clientIdFor('CONS-SUS', null, false)],
+            // shutdown-drain push consumers (one queue each, single-member group).
+            'GID-K-CONS' => [MixAll::clientIdFor('CONS-K', null, false)],
+            'GID-K2-CONS' => [MixAll::clientIdFor('CONS-K2', null, false)],
+            'GID-K3-CONS' => [MixAll::clientIdFor('CONS-K3', null, false)],
+            'GID-J-CONS' => [MixAll::clientIdFor('CONS-J', null, false)],
         ];
         file_put_contents($groupMapPath, json_encode($groupMap));
         putenv("RMQ_CONSUMER_MAP={$groupMapPath}");
@@ -1126,7 +1864,10 @@ final class RunClientConsumer
             $this->testPushSuspendResume($broker);
             $this->testPushOrderly($broker);
             $this->testPullConsumer($broker);
+            $this->testPullSelectorWire($broker);
             $this->testLitePull($broker);
+            $this->testLitePullSelectorWire($broker);
+            $this->testShutdownDrain($broker);
         } finally {
             $broker->stop();
             putenv('RMQ_LOG');

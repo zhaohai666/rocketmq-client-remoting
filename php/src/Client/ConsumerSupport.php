@@ -4,9 +4,12 @@ declare(strict_types=1);
 
 namespace RocketMQ\Client;
 
+use RocketMQ\Common\ExpressionType;
+use RocketMQ\Common\FilterAPI;
 use RocketMQ\Common\MessageExt;
 use RocketMQ\Common\MessageQueue;
 use RocketMQ\Common\SubscriptionData;
+use RocketMQ\Client\Exceptions\MQClientException;
 
 /**
  * Common consumer-side foundation: module constants, module-level helper functions, and PopProcessQueue.
@@ -108,6 +111,66 @@ function client_side_tag_filter(?SubscriptionData $sub, array $msgs): array
         }
     }
     return $out;
+}
+
+/**
+ * Build the SubscriptionData one ad-hoc pull request carries.
+ *
+ * Two shapes of input, one code path:
+ *   - a bare expression string (no selector) always parses through FilterAPI, so the tag
+ *     derivation (tagsSet / codeSet) is what the request reports;
+ *   - a MessageSelector decides its own expression type. A TAG selector keeps the FilterAPI
+ *     derivation above; any other type (SQL92 / CLASS_FILTER) must **not** go through it —
+ *     parsing "a > 10" as a tag list would both mangle the expression and hand the caller a
+ *     tagsSet that filters away every broker-side SQL92 match.
+ *
+ * @throws MQClientException when the queue is unusable or the tag expression cannot be parsed
+ * @throws \ValueError when a non-tag selector carries no expression
+ */
+function build_pull_subscription_data(
+    ?MessageQueue $mq,
+    ?string $subExpression = null,
+    ?MessageSelector $selector = null,
+): SubscriptionData {
+    if ($mq === null || $mq->topic === '') {
+        throw new MQClientException('mq is null');
+    }
+    return build_selector_subscription_data($mq->topic, $selector, $subExpression);
+}
+
+/**
+ * Topic-level form of the same rule, used by the lite-pull subscription tables (the queues of
+ * a subscribed topic are discovered later, so the expression is stored before any queue is known).
+ */
+function build_selector_subscription_data(
+    string $topic,
+    ?MessageSelector $selector = null,
+    ?string $subExpression = null,
+): SubscriptionData {
+    if ($selector === null) {
+        return parse_tag_subscription($topic, $subExpression);
+    }
+    $type = $selector->type === '' ? ExpressionType::TAG : $selector->type;
+    if ($type === ExpressionType::TAG) {
+        return parse_tag_subscription($topic, $selector->expression);
+    }
+    if ($selector->expression === '') {
+        throw new \ValueError("Expression can't be null! " . $type);
+    }
+    $sub = new SubscriptionData($topic, $selector->expression);
+    $sub->setExpressionType($type);
+    $sub->setClassFilterMode($type === ExpressionType::CLASS_FILTER);
+    return $sub;
+}
+
+/** FilterAPI parse of one tag expression, reported to the caller as a subscription error. */
+function parse_tag_subscription(string $topic, ?string $subExpression): SubscriptionData
+{
+    try {
+        return FilterAPI::buildSubscriptionData($topic, $subExpression ?? FilterAPI::SUB_ALL);
+    } catch (\Throwable $e) {
+        throw new MQClientException('parse subscription error: ' . $e->getMessage());
+    }
 }
 
 /**

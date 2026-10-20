@@ -410,6 +410,10 @@ pub struct ConsumerConfig {
     pub consume_thread_max: i32,
     /// Backlog threshold for dynamic thread pool growth, default 100000.
     pub adjust_thread_pool_nums_threshold: i64,
+    /// Ceiling in milliseconds that `shutdown()` spends waiting for the consume executor to
+    /// terminate. Default 0: any `<= 0` value keeps this port's existing bounded drain
+    /// ([`SHUTDOWN_DRAIN_TIMEOUT`]); a positive value replaces that ceiling with itself.
+    pub await_termination_millis_when_shutdown: i64,
     /// Maximum allowed offset span in concurrent consumption (**messages**), default 2000.
     pub consume_concurrently_max_span: i64,
     /// Per-queue cache message-count threshold, default 1000 (**count**).
@@ -496,6 +500,7 @@ impl Default for ConsumerConfig {
             consume_thread_min: 20,
             consume_thread_max: 20,
             adjust_thread_pool_nums_threshold: 100_000,
+            await_termination_millis_when_shutdown: 0,
             consume_concurrently_max_span: 2000,
             pull_threshold_for_queue: 1000,
             pull_threshold_size_for_queue: 100,
@@ -1051,6 +1056,20 @@ impl DefaultMQPushConsumer {
         self.update_config(|c| c.persist_consumer_offset_interval_millis = millis);
     }
 
+    /// Cap how long `shutdown()` waits for the consume executor to terminate, in milliseconds.
+    ///
+    /// `<= 0` (the default 0) keeps this port's existing bounded drain; a positive value
+    /// replaces that bound with the configured ceiling. The value is read once per `shutdown()`
+    /// call, so changing it afterwards only takes effect on the next shutdown.
+    pub fn set_await_termination_millis_when_shutdown(&self, millis: i64) {
+        self.update_config(|c| c.await_termination_millis_when_shutdown = millis);
+    }
+
+    /// Read the configured consume-executor termination ceiling back.
+    pub fn await_termination_millis_when_shutdown(&self) -> i64 {
+        read_cfg(&self.inner).await_termination_millis_when_shutdown
+    }
+
     /// Read-only access to the shared [`MQClientInstance`]: the static-topic leg uses it to read endpoint rewrite results; errors when not started.
     pub fn mq_client(&self) -> Result<MQClientInstance> {
         if !self.inner.started.load(Ordering::Acquire) {
@@ -1486,6 +1505,17 @@ impl DefaultMQPushConsumer {
         // The POP executor moves into the finalize task the same way: stop accepting first, then wait a bounded time for submitted tasks.
         let pop_executor = lock(&self.inner.pop_executor).take();
         let client = lock(&self.inner.client).clone();
+        // Ceiling for the consume-executor termination wait inside the finalize below: a
+        // positive configured value replaces the default bounded drain; 0 (or any `<= 0`)
+        // keeps the wait exactly as it has always been.
+        let executor_drain_budget = {
+            let millis = read_cfg(&self.inner).await_termination_millis_when_shutdown;
+            if millis > 0 {
+                Duration::from_millis(millis as u64)
+            } else {
+                SHUTDOWN_DRAIN_TIMEOUT
+            }
+        };
         if let Some(client) = client {
             let group = self.consumer_group();
             let broadcast = self.config().message_model == MessageModel::BROADCASTING;
@@ -1527,16 +1557,13 @@ impl DefaultMQPushConsumer {
                     }
                     if let Some(executor) = pop_executor {
                         executor.shutdown();
-                        if tokio::time::timeout(
-                            SHUTDOWN_DRAIN_TIMEOUT,
-                            executor.await_termination(),
-                        )
-                        .await
-                        .is_err()
+                        if tokio::time::timeout(executor_drain_budget, executor.await_termination())
+                            .await
+                            .is_err()
                         {
                             rmq_warn!(
                                 "push shutdown: pop consume executor still busy after \
-                                 {SHUTDOWN_DRAIN_TIMEOUT:?}"
+                                 {executor_drain_budget:?}"
                             );
                         }
                     }
@@ -9365,5 +9392,104 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    // ================================================================
+    // Configurable ceiling on the consume-executor termination wait at shutdown
+    // ================================================================
+
+    #[test]
+    fn await_termination_millis_when_shutdown_defaults_to_zero_and_round_trips() {
+        let c = DefaultMQPushConsumer::new("GID_atms").expect("a legal group name must not fail");
+        assert_eq!(
+            c.config().await_termination_millis_when_shutdown,
+            0,
+            "default is 0 (= keep the existing bounded drain)"
+        );
+        assert_eq!(c.await_termination_millis_when_shutdown(), 0);
+        c.set_await_termination_millis_when_shutdown(2_000);
+        assert_eq!(c.await_termination_millis_when_shutdown(), 2_000);
+        assert_eq!(c.config().await_termination_millis_when_shutdown, 2_000);
+        c.set_await_termination_millis_when_shutdown(-1);
+        assert_eq!(
+            c.await_termination_millis_when_shutdown(),
+            -1,
+            "a negative value is stored as written; `<= 0` means wait as today"
+        );
+    }
+
+    /// A positive ceiling bounds the executor drain: `shutdown()` returns while the consume
+    /// worker is still busy. Reverting the bound to the fixed default makes both state gates
+    /// red (the task ends at 4s, `shutdown` could only return after it).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_bounds_pop_executor_wait_by_configured_millis() {
+        let cluster = AssignCluster::start().await;
+        let c = pop_consumer_on_cluster("pop_drain_bound", &cluster);
+        let executor = ConsumeExecutor::new(1, 1).with_handle(&tokio::runtime::Handle::current());
+        *lock(&c.inner.pop_executor) = Some(executor.clone());
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&done);
+        executor
+            .submit(Box::pin(async move {
+                // Holds the single worker longer than the whole shutdown window.
+                tokio::time::sleep(Duration::from_millis(4_000)).await;
+                flag.store(true, Ordering::Release);
+            }))
+            .expect("submit");
+
+        c.set_await_termination_millis_when_shutdown(300);
+        let began = std::time::Instant::now();
+        c.shutdown();
+        let elapsed = began.elapsed();
+
+        // State gates: the executor had NOT terminated -- shutdown returned anyway because the
+        // configured ceiling bounded its wait.
+        assert!(
+            !done.load(Ordering::Acquire),
+            "shutdown must return while the consume task still runs (elapsed {elapsed:?})"
+        );
+        assert!(
+            executor.worker_count() >= 1,
+            "the worker was still occupied when shutdown returned"
+        );
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "the executor drain was bounded by the configured 300ms: elapsed {elapsed:?}"
+        );
+
+        // Test hygiene: let the task and its worker finish before the runtime drops.
+        tokio::time::timeout(Duration::from_secs(15), executor.await_termination())
+            .await
+            .expect("the worker retires on its own once the task ends");
+        assert!(done.load(Ordering::Acquire));
+    }
+
+    /// Default 0: shutdown still runs the executor wait through to termination (the pre-existing
+    /// bounded drain), so a short task is fully settled by the time `shutdown()` returns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_waits_for_pop_executor_termination_when_ceiling_is_default() {
+        let cluster = AssignCluster::start().await;
+        let c = pop_consumer_on_cluster("pop_drain_default", &cluster);
+        let executor = ConsumeExecutor::new(1, 1).with_handle(&tokio::runtime::Handle::current());
+        *lock(&c.inner.pop_executor) = Some(executor.clone());
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&done);
+        executor
+            .submit(Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                flag.store(true, Ordering::Release);
+            }))
+            .expect("submit");
+
+        c.shutdown();
+        assert!(
+            done.load(Ordering::Acquire),
+            "with the default ceiling shutdown waits for the executor to terminate"
+        );
+        assert_eq!(
+            executor.worker_count(),
+            0,
+            "every worker has left by the time shutdown returns"
+        );
     }
 }

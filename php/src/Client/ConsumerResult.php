@@ -244,6 +244,20 @@ interface MessageListener
 }
 
 /**
+ * Asynchronous pull outcome: exactly one of the two methods fires per request.
+ *
+ * ``onSuccess`` receives the decoded pull result (status, next begin offset and the message
+ * list already read from the response); ``onException`` receives the reason the request could
+ * not produce one -- a broker error code, a transport failure or a timeout.
+ */
+interface PullCallback
+{
+    public function onSuccess(PullResult $pullResult): void;
+
+    public function onException(\Throwable $e): void;
+}
+
+/**
  * The ``status`` in the hook context: the conventional form is the **bare enum member name**.
  *
  * What the concurrent/orderly consume services write into the context ``status`` is the

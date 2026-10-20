@@ -35,7 +35,7 @@ import {
   ClusterInfo, ConsumerConnection, ConsumeStats, ConsumeStatsList,
   GetConsumerListByGroupResponseBody, GroupList, KVTable, ProducerConnection,
   ResetOffsetBody, TopicConfig, TopicConfigSerializeWrapper, TopicList,
-  TopicFilterType, DEFAULT_PERM, messageQueueKey,
+  TopicFilterType, DEFAULT_PERM,
   ConsumeMessageDirectlyResult, QueryConsumeTimeSpanBody,
 } from '../remoting/bodies.ts';
 import { TopicStatsTable } from '../remoting/admin_body.ts';
@@ -229,6 +229,10 @@ export class DefaultMQAdminExt {
       clientId, () => new MQClient(clientId, this.namesrvAddr, presetRC));
     this.client = client;
     if (created) {
+      // Pass this facade's configured route-refresh period into the shared
+      // instance ONCE at registration; the instance-level route timer reads
+      // it from there instead of this facade field.
+      client.setPollNameServerIntervalMillis(this.pollNameServerIntervalMillis);
       registerRpcHooks(this.client.remotingClient, {
         namespaceV2: () => this.namespaceV2,
         enableStreamRequestType: this.enableStreamRequestType,
@@ -1116,9 +1120,17 @@ export class DefaultMQAdminExt {
   // INVOKE_BROKER_TO_RESET_OFFSET(222) → ResetOffsetBody (a MessageQueue-keyed
   // map whose keys the broker's fastjson codec inlines). `isC` selects the
   // C-compatible response shape via the `isC` ext field.
+  // When `queueId` is given the reset is scoped to that ONE queue and the
+  // broker reads the pair (queueId, offset) literally; without them the same
+  // request code resets EVERY queue of the group at `timestamp`.
   async invokeBrokerToResetOffset(brokerAddr: string, topic: string, group: string,
-    timestamp: number, isForce: boolean, isC = false): Promise<Map<MessageQueue, number> | null> {
+    timestamp: number, isForce: boolean, isC = false,
+    queueId: number | null = null, resetOffset: number | null = null): Promise<Map<MessageQueue, number> | null> {
     const ext = adminExt({ topic, consumerGroup: group, timestamp, isForce });
+    if (queueId != null) {
+      ext['queueId'] = extValue(queueId);
+      ext['offset'] = extValue(resetOffset != null ? resetOffset : -1);
+    }
     let code: number = RequestCode.INVOKE_BROKER_TO_RESET_OFFSET;
     if (isC) {
       // Same request code for both shapes; the `isC` flag tells the broker to
@@ -1234,8 +1246,8 @@ export class DefaultMQAdminExt {
     const client = this._requireClient();
     await client.updateConsumerOffset(brokerAddr, consumeGroup,
       new MessageQueue(topicName, '', queueId), resetOffset);
-    await this.invokeBrokerToResetOffset(brokerAddr, topicName, consumeGroup, 0, queueId, false);
-    void messageQueueKey;
+    await this.invokeBrokerToResetOffset(brokerAddr, topicName, consumeGroup, 0, false, false,
+      queueId, resetOffset);
   }
 
   // ---------------- Offset queries (admin-side offset surface) ----------------

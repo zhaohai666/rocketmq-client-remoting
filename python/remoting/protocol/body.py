@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import base64
 from typing import Dict, List, Optional
 
 from common.subscription_data import SubscriptionData
 from remoting.protocol.serialize import RemotingSerializable, fastjson_loads
+from remoting.protocol.bitset import BitSet
 # Parsing/serialization of MessageQueue as a map key (fastjson2 non-string keys) + shared DTOs
 from .admin_body import decode_message_queue_map, message_queue_key  # noqa: F401
 
@@ -730,3 +732,161 @@ class ConsumeMessageDirectlyResult:
     @staticmethod
     def decode(data: bytes) -> "ConsumeMessageDirectlyResult":
         return ConsumeMessageDirectlyResult.from_dict(fastjson_loads(data.decode("utf-8")))
+
+
+# ---------------------------------------------------------------- POP batch acknowledge
+#: compact key -> long key accepted when reading a ``BatchAck`` entry. The compact family
+#: is what goes on the wire; the long spellings only appear in payloads produced elsewhere.
+_BATCH_ACK_KEY_ALIASES = {
+    "c": "consumerGroup",
+    "t": "topic",
+    "r": "retry",
+    "so": "startOffset",
+    "q": "queueId",
+    "rq": "reviveQueueId",
+    "pt": "popTime",
+    "it": "invisibleTime",
+    "b": "bitSet",
+}
+
+
+class BatchAck:
+    """One entry of the batch acknowledge body: every acknowledged offset of a single
+    pop of a single queue.
+
+    ``start_offset`` is the checkpoint offset of that pop and ``bit_set`` marks the
+    acknowledged offsets **relative to it**: bit ``i`` stands for consume-queue offset
+    ``start_offset + i``, which the broker expands back into absolute offsets.
+
+    The JSON keys are the compact family ``c t r so q rq pt it b``, and ``b`` is the
+    base64 of the bit set bytes (little-endian, trailing zero bytes dropped).
+    """
+
+    def __init__(self):
+        self.consumer_group: Optional[str] = None
+        self.topic: Optional[str] = None
+        self.retry: str = "0"          # "1"/"2" when the message was revived from a retry topic
+        self.start_offset: int = 0
+        self.queue_id: int = 0
+        self.revive_queue_id: int = 0
+        self.pop_time: int = 0
+        self.invisible_time: int = 0
+        self.bit_set: BitSet = BitSet()
+
+    def acked_offsets(self) -> List[int]:
+        """The absolute consume-queue offsets this entry acknowledges."""
+        return [self.start_offset + index for index in self.bit_set.set_indexes()]
+
+    def to_dict(self) -> dict:
+        return {
+            "c": self.consumer_group,
+            "t": self.topic,
+            "r": self.retry,
+            "so": self.start_offset,
+            "q": self.queue_id,
+            "rq": self.revive_queue_id,
+            "pt": self.pop_time,
+            "it": self.invisible_time,
+            "b": base64.b64encode(self.bit_set.to_bytes()).decode("ascii"),
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> "BatchAck":
+        def pick(compact: str) -> Optional[object]:
+            if compact in d:
+                return d[compact]
+            return d.get(_BATCH_ACK_KEY_ALIASES[compact])
+
+        ack = BatchAck()
+        ack.consumer_group = pick("c")
+        ack.topic = pick("t")
+        retry = pick("r")
+        ack.retry = str(retry) if retry is not None else "0"
+        ack.start_offset = int(pick("so") or 0)
+        ack.queue_id = int(pick("q") or 0)
+        ack.revive_queue_id = int(pick("rq") or 0)
+        ack.pop_time = int(pick("pt") or 0)
+        ack.invisible_time = int(pick("it") or 0)
+        raw = pick("b")
+        ack.bit_set = BitSet.from_bytes(base64.b64decode(raw)) if raw else BitSet()
+        return ack
+
+    def __repr__(self):
+        return ("BatchAck[consumerGroup=%s, topic=%s, retry=%s, startOffset=%d, queueId=%d, "
+                "reviveQueueId=%d, popTime=%d, invisibleTime=%d, bits=%r]"
+                % (self.consumer_group, self.topic, self.retry, self.start_offset,
+                   self.queue_id, self.revive_queue_id, self.pop_time,
+                   self.invisible_time, self.bit_set.set_indexes()))
+
+
+class BatchAckMessageRequestBody:
+    """The body of ``BATCH_ACK_MESSAGE(200151)``: one broker plus the merged entries.
+
+    The request itself carries **no custom header** -- group, topic, queue, offsets,
+    popTime and invisibleTime all travel inside these entries.
+    """
+
+    def __init__(self):
+        self.broker_name: Optional[str] = None
+        self.acks: List[BatchAck] = []
+
+    @staticmethod
+    def from_extra_infos(consumer_group: str, topic: str,
+                         extra_info_list: List[str]) -> "BatchAckMessageRequestBody":
+        """Merge POP checkpoints into body entries, one per distinct pop.
+
+        Two checkpoints belong to the same pop -- and therefore to the same entry -- when
+        their retry flag, queueId, checkpoint offset **and** popTime all match; that
+        quadruple is the merge key. The first checkpoint of the list decides the body's
+        broker name, so a list spanning brokers must be split by the caller.
+        """
+        from remoting.protocol import extra_info as extra
+
+        broker_name: Optional[str] = None
+        merged: Dict[str, BatchAck] = {}
+        for info in extra_info_list:
+            seg = extra.split(info)
+            if broker_name is None:
+                broker_name = extra.get_broker_name(seg)
+            retry = extra.get_retry(seg)
+            queue_id = extra.get_queue_id(seg)
+            ck_queue_offset = extra.get_ck_queue_offset(seg)
+            pop_time = extra.get_pop_time(seg)
+            merge_key = "%s@%d@%d@%d" % (retry, queue_id, ck_queue_offset, pop_time)
+            ack = merged.get(merge_key)
+            if ack is None:
+                ack = BatchAck()
+                ack.consumer_group = consumer_group
+                ack.topic = topic
+                ack.retry = retry
+                ack.start_offset = ck_queue_offset
+                ack.queue_id = queue_id
+                ack.revive_queue_id = extra.get_revive_qid(seg)
+                ack.pop_time = pop_time
+                ack.invisible_time = extra.get_invisible_time(seg)
+                merged[merge_key] = ack
+            # the offset is relative to the checkpoint of this very pop
+            ack.bit_set.set_bit(extra.get_queue_offset(seg) - ck_queue_offset)
+
+        body = BatchAckMessageRequestBody()
+        body.broker_name = broker_name
+        body.acks = list(merged.values())
+        return body
+
+    def to_dict(self) -> dict:
+        return {"brokerName": self.broker_name,
+                "acks": [a.to_dict() for a in self.acks]}
+
+    @staticmethod
+    def from_dict(d: dict) -> "BatchAckMessageRequestBody":
+        b = BatchAckMessageRequestBody()
+        b.broker_name = d.get("brokerName")
+        b.acks = [BatchAck.from_dict(a) for a in (d.get("acks") or [])]
+        return b
+
+    def encode(self) -> bytes:
+        return RemotingSerializable.encode(self.to_dict())
+
+    @staticmethod
+    def decode(data: bytes) -> "BatchAckMessageRequestBody":
+        return BatchAckMessageRequestBody.from_dict(RemotingSerializable.decode_json(data))

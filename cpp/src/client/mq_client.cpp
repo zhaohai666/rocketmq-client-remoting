@@ -14,6 +14,7 @@
 #include <random>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -33,6 +34,7 @@
 #include "rocketmq/remoting/protocol/extra_info.h"
 #include "rocketmq/remoting/protocol/headers.h"
 #include "rocketmq/remoting/protocol/json.h"
+#include "rocketmq/remoting/rpchook.h"
 
 namespace rocketmq {
 
@@ -1166,6 +1168,113 @@ int32_t MQClientInstance::ackMessage(const std::string& consumerGroup, const std
 
     RemotingCommand request =
         RemotingCommand::createRequestCommand(RequestCode::ACK_MESSAGE, header);
+    RemotingCommand response = invokeSyncOnAddr(addr, request, timeoutMillis);
+    return response.code;
+}
+
+namespace {
+
+// One grouped batch-ack entry: the fields taken from the first extra info of a merge key plus the
+// set of offset-bit indices (each queueOffset - ckQueueOffset) folded into it.
+struct BatchAckEntry {
+    std::string retry;
+    int32_t queueId = 0;
+    int64_t startOffset = 0;
+    int32_t reviveQueueId = 0;
+    int64_t popTime = 0;
+    int64_t invisibleTime = 0;
+    std::set<int32_t> bits;
+};
+
+// base64 of a little-endian bit set whose length is the smallest byte count that still holds the
+// highest set bit (bit i lives at byte i/8, position i%8), so trailing zero bytes are dropped. An
+// empty set encodes to the empty string.
+std::string bitSetToBase64(const std::set<int32_t>& bits) {
+    if (bits.empty()) {
+        return base64Encode(Bytes());
+    }
+    const int32_t maxBit = *bits.rbegin();
+    Bytes bytes(static_cast<size_t>(maxBit / 8) + 1, 0);
+    for (const int32_t bit : bits) {
+        const size_t byteIndex = static_cast<size_t>(bit) / 8;
+        bytes[byteIndex] = static_cast<uint8_t>(bytes[byteIndex] | (1u << (bit % 8)));
+    }
+    return base64Encode(bytes);
+}
+
+// The JSON body: {"brokerName":..,"acks":[{c,t,r,so,q,rq,pt,it,b},..]} using the compact per-entry
+// keys, entries emitted in first-seen merge-key order.
+Bytes buildBatchAckBody(const std::string& consumerGroup, const std::string& topic,
+                        const std::string& brokerName, const std::vector<std::string>& order,
+                        const std::map<std::string, BatchAckEntry>& entries) {
+    JsonValue root = JsonValue::makeObject();
+    root.set("brokerName", JsonValue::makeString(brokerName));
+    JsonValue acks = JsonValue::makeArray();
+    for (const std::string& key : order) {
+        const BatchAckEntry& e = entries.at(key);
+        JsonValue o = JsonValue::makeObject();
+        o.set("c", JsonValue::makeString(consumerGroup));
+        o.set("t", JsonValue::makeString(topic));
+        o.set("r", JsonValue::makeString(e.retry));
+        o.set("so", JsonValue::makeInt(e.startOffset));
+        o.set("q", JsonValue::makeInt(e.queueId));
+        o.set("rq", JsonValue::makeInt(e.reviveQueueId));
+        o.set("pt", JsonValue::makeInt(e.popTime));
+        o.set("it", JsonValue::makeInt(e.invisibleTime));
+        o.set("b", JsonValue::makeString(bitSetToBase64(e.bits)));
+        acks.pushArray(o);
+    }
+    root.set("acks", acks);
+    return RemotingSerializable::encode(root);
+}
+
+}  // namespace
+
+int32_t MQClientInstance::batchAckMessage(const std::string& consumerGroup, const std::string& topic,
+                                         const std::vector<std::string>& extraInfoList,
+                                         int32_t timeoutMillis, const std::string& addrIn) {
+    if (extraInfoList.empty()) {
+        throw std::invalid_argument("batchAckMessage: the extra info list is empty");
+    }
+    // The body's broker name and the target address both come from the first extra info.
+    const std::vector<std::string> firstSeg = extra_info::split(extraInfoList.front());
+    const std::string brokerName = extra_info::getBrokerName(firstSeg);
+    const int32_t firstQueueId = extra_info::getQueueId(firstSeg);
+    const std::string addr = popAckAddrFor(topic, brokerName, firstQueueId, addrIn);
+
+    std::vector<std::string> order;
+    std::map<std::string, BatchAckEntry> entries;
+    for (const std::string& extraInfo : extraInfoList) {
+        const std::vector<std::string> seg = extra_info::split(extraInfo);
+        const std::string retry = extra_info::getRetry(seg);
+        const int32_t queueId = extra_info::getQueueId(seg);
+        const int64_t ckQueueOffset = extra_info::getCkQueueOffset(seg);
+        const int64_t popTime = extra_info::getPopTime(seg);
+        const std::string mergeKey = retry + "@" + std::to_string(queueId) + "@"
+                                     + std::to_string(ckQueueOffset) + "@" + std::to_string(popTime);
+        auto it = entries.find(mergeKey);
+        if (it == entries.end()) {
+            BatchAckEntry e;
+            e.retry = retry;
+            e.queueId = queueId;
+            e.startOffset = ckQueueOffset;
+            e.reviveQueueId = extra_info::getReviveQid(seg);
+            e.popTime = popTime;
+            e.invisibleTime = extra_info::getInvisibleTime(seg);
+            it = entries.emplace(mergeKey, std::move(e)).first;
+            order.push_back(mergeKey);
+        }
+        const int64_t bitIndex = extra_info::getQueueOffset(seg) - ckQueueOffset;
+        if (bitIndex < 0) {
+            throw std::invalid_argument("batchAckMessage: queueOffset below ckQueueOffset");
+        }
+        it->second.bits.insert(static_cast<int32_t>(bitIndex));
+    }
+
+    RemotingCommand request =
+        RemotingCommand::createRequestCommand(RequestCode::BATCH_ACK_MESSAGE, nullptr);
+    request.body = buildBatchAckBody(consumerGroup, topic, brokerName, order, entries);
+    request.hasBody = true;
     RemotingCommand response = invokeSyncOnAddr(addr, request, timeoutMillis);
     return response.code;
 }

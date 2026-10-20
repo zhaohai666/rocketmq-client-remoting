@@ -131,7 +131,20 @@ const (
 const pullMaxIdleTime = 120 * time.Second
 
 const (
+	// pullTimeDelayMillsWhenFlowControl is the wait after this client's OWN
+	// backlog crossed a pull threshold: the messages are already buffered here,
+	// so the loop only has to give the consume side a moment.
 	pullTimeDelayMillsWhenFlowControl = 50 * time.Millisecond
-	pullTimeDelayMillsWhenException   = 3000 * time.Millisecond
-	pullTimeDelayMillsWhenSuspend     = 1000 * time.Millisecond
+	// pullTimeDelayMillsWhenBrokerFlow is the wait after the BROKER refused a
+	// pull because it is flow-controlling its own queues (response code 215).
+	// Shorter than the local one on purpose: the request already round-tripped,
+	// nothing landed in the local buffer, and the queue is readable again as
+	// soon as the broker's pressure drops.
+	pullTimeDelayMillsWhenBrokerFlow = 20 * time.Millisecond
+	// pullTimeDelayMillsWhenPullFailed is the wait for every other failed pull:
+	// a system error, a busy answer, a dead connection. Retrying those hot adds
+	// pressure to whatever is already wrong.
+	pullTimeDelayMillsWhenPullFailed = 500 * time.Millisecond
+	pullTimeDelayMillsWhenException  = 3000 * time.Millisecond
+	pullTimeDelayMillsWhenSuspend    = 1000 * time.Millisecond
 )

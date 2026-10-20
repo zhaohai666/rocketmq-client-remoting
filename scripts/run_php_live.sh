@@ -1,7 +1,7 @@
 #!/bin/bash
 # Live verification entry point for the PHP client (mirrors the approach of run_go_*_live.sh / run_node_live.sh).
 #
-# Usage: bash scripts/run_php_live.sh redelivery|admin|compression|pop|tls|request_reply|pull|lite_qc|registration [namesrv]
+# Usage: bash scripts/run_php_live.sh redelivery|admin|compression|pop|tls|request_reply|pull|lite_qc|registration|sql92 [namesrv]
 #   redelivery   php/examples/live_redelivery.php  (optional third arg legs=all|s1,s2,s3,s4)
 #   admin        php/examples/live_admin.php
 #   pull         php/examples/live_pull.php        (optional third arg legs=all|s1,s2,s3;
@@ -18,6 +18,12 @@
 #                 registration: GET_PRODUCER_CONNECTION_LIST(204) must list the clientId of a
 #                 producer that only called start(), the 30s tick pump must keep it listed, and
 #                 shutdown() must drop it)
+#   sql92        php/examples/live_sql92.php
+#                 (SQL92 filtering end to end: the CHECK_CLIENT_CONFIG(46) probe, the broker really
+#                  filtering push/lite/pull reads by message property, the illegal-expression
+#                  SUBSCRIPTION_PARSE_FAILED(23) rejection, and the wire shape of a selector
+#                  subscription on the PULL / LITE_PULL requests — expressionType, the raw
+#                  expression, its own subVersion and the sysFlag bits, all recorded by an RPC hook)
 #   pop          php/examples/live_pop.php         (optional third arg legs=all|s1,s2;
 #                 **requires an exclusive cluster**: needs the four POP-specific broker.conf
 #                 settings, see below)
@@ -58,8 +64,9 @@ case "$WHICH" in
   tls)           EXAMPLE="examples/live_tls.php"            ;;
   request_reply) EXAMPLE="examples/live_request_reply.php"  ;;
   registration)  EXAMPLE="examples/live_producer_registration.php" ;;
+  sql92)         EXAMPLE="examples/live_sql92.php" ;;
   static_topic)  EXAMPLE="examples/live_static_topic.php"   ;;
-  *) echo "unknown example: $WHICH (redelivery|admin|compression|pop|tls|request_reply|pull|lite_qc|static_topic|registration)" >&2; exit 2 ;;
+  *) echo "unknown example: $WHICH (redelivery|admin|compression|pop|tls|request_reply|pull|lite_qc|sql92|static_topic|registration)" >&2; exit 2 ;;
 esac
 
 port_open() {

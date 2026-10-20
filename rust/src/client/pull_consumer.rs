@@ -829,40 +829,31 @@ impl DefaultMQPullConsumer {
         max_nums: i32,
         timeout_millis: Option<i64>,
     ) -> Result<PullResult> {
-        let client = self.require_client()?;
         let cfg = self.config();
         let timeout = timeout_millis.unwrap_or(cfg.consumer_pull_timeout_millis);
         let sub = FilterAPI::build_subscription_data(&mq.topic, Some(sub_expression))?;
-        let broker_id = lock(&self.inner.pull_from_which_node)
-            .get(mq)
-            .copied()
-            .unwrap_or(MixAll::MASTER_ID as i64);
-        let result = client
-            .pull_message(
-                &cfg.consumer_group,
-                mq,
-                offset,
-                max_nums,
-                pull_sys_flag(false),
-                0,
-                sub_expression_of(&sub),
-                0,
-                ExpressionType::TAG,
-                timeout,
-                -1,
-                PULL_SUSPEND_TIMEOUT_MILLIS,
-                None,
-                0,
-                Some(broker_id),
-            )
-            .await?;
-        lock(&self.inner.pull_from_which_node).insert(
-            mq.clone(),
-            result
-                .suggest_which_broker_id
-                .unwrap_or(MixAll::MASTER_ID as i64),
-        );
-        Ok(self.apply_delivery_filter(mq, result))
+        self.pull_with_subscription(mq, &sub, offset, max_nums, false, timeout, PULL_SUSPEND_TIMEOUT_MILLIS)
+            .await
+    }
+
+    /// Short-polling flavour of [`pull`](Self::pull) driven by a [`MessageSelector`]: the
+    /// selector's expression type travels with the request, so a SQL92 expression is not
+    /// reinterpreted as a tag list. A `TAG` selector (or an empty type) behaves exactly like
+    /// [`pull`](Self::pull): `tagsSet`/`codeSet` compiled by the filter API, `subVersion` sent
+    /// as 0; a non-tag selector carries only its raw expression with its own `expressionType`.
+    pub async fn pull_with_selector(
+        &self,
+        mq: &MessageQueue,
+        selector: &MessageSelector,
+        offset: i64,
+        max_nums: i32,
+        timeout_millis: Option<i64>,
+    ) -> Result<PullResult> {
+        let cfg = self.config();
+        let timeout = timeout_millis.unwrap_or(cfg.consumer_pull_timeout_millis);
+        let sub = pull_selector_subscription(&mq.topic, selector)?;
+        self.pull_with_subscription(mq, &sub, offset, max_nums, false, timeout, PULL_SUSPEND_TIMEOUT_MILLIS)
+            .await
     }
 
     /// Long polling (`suspend=True`), using
@@ -878,27 +869,83 @@ impl DefaultMQPullConsumer {
         offset: i64,
         max_nums: i32,
     ) -> Result<PullResult> {
-        let client = self.require_client()?;
         let cfg = self.config();
         let sub = FilterAPI::build_subscription_data(&mq.topic, Some(sub_expression))?;
+        self.pull_with_subscription(
+            mq,
+            &sub,
+            offset,
+            max_nums,
+            true,
+            cfg.consumer_timeout_millis_when_suspend,
+            cfg.broker_suspend_max_time_millis,
+        )
+        .await
+    }
+
+    /// Selector flavour of [`pull_block_if_not_found`](Self::pull_block_if_not_found): same
+    /// expression-type dispatch as [`pull_with_selector`](Self::pull_with_selector), same
+    /// suspend timeout shape as the string form.
+    pub async fn pull_block_if_not_found_with_selector(
+        &self,
+        mq: &MessageQueue,
+        selector: &MessageSelector,
+        offset: i64,
+        max_nums: i32,
+    ) -> Result<PullResult> {
+        let cfg = self.config();
+        let sub = pull_selector_subscription(&mq.topic, selector)?;
+        self.pull_with_subscription(
+            mq,
+            &sub,
+            offset,
+            max_nums,
+            true,
+            cfg.consumer_timeout_millis_when_suspend,
+            cfg.broker_suspend_max_time_millis,
+        )
+        .await
+    }
+
+    /// Shared kernel of the four pull flavours. `sub` decides the `subscription` /
+    /// `subVersion` / `expressionType` fields of the request: a tag-typed subscription keeps
+    /// the historic shape (expression as compiled into `tagsSet`/`codeSet`, `subVersion` 0);
+    /// any other type sends its own expression type and the subscription's real version.
+    async fn pull_with_subscription(
+        &self,
+        mq: &MessageQueue,
+        sub: &SubscriptionData,
+        offset: i64,
+        max_nums: i32,
+        suspend: bool,
+        timeout_millis: i64,
+        suspend_timeout_millis: i64,
+    ) -> Result<PullResult> {
+        let client = self.require_client()?;
+        let cfg = self.config();
         let broker_id = lock(&self.inner.pull_from_which_node)
             .get(mq)
             .copied()
             .unwrap_or(MixAll::MASTER_ID as i64);
+        // The class-filter bit stays clear on this path: it asks for the legacy filter-server
+        // route. The subscription's own expression type is still what the header reports.
+        let sys_flag = pull_sys_flag(suspend);
         let result = client
             .pull_message(
                 &cfg.consumer_group,
                 mq,
                 offset,
                 max_nums,
-                pull_sys_flag(true),
+                sys_flag,
                 0,
-                sub_expression_of(&sub),
-                0,
-                ExpressionType::TAG,
-                cfg.consumer_timeout_millis_when_suspend,
+                sub_expression_of(sub),
+                // A tag subscription keeps the version-0 shape it has always sent; a non-tag one
+                // rides with the subscription's own version.
+                if sub.expression_type == ExpressionType::TAG { 0 } else { sub.sub_version },
+                &sub.expression_type,
+                timeout_millis,
                 -1,
-                cfg.broker_suspend_max_time_millis,
+                suspend_timeout_millis,
                 None,
                 0,
                 Some(broker_id),
@@ -1058,6 +1105,27 @@ fn sub_expression_of(sub: &SubscriptionData) -> &str {
     } else {
         &sub.sub_string
     }
+}
+
+/// `SubscriptionData` for one selector-driven pull: an empty **tag** expression falls back to
+/// `"*"`, an empty type to `TAG`, while a non-tag selector with an empty expression is rejected
+/// outright. A `TAG` selector gets `tagsSet`/`codeSet` compiled by the filter API; any other type
+/// carries only its raw expression plus `expressionType`, with `CLASS_FILTER` additionally
+/// setting the class-filter mode flag.
+fn pull_selector_subscription(topic: &str, selector: &MessageSelector) -> Result<SubscriptionData> {
+    let expression_type = if selector.selector_type.is_empty() {
+        ExpressionType::TAG
+    } else {
+        selector.selector_type.as_str()
+    };
+    let expression = if expression_type == ExpressionType::TAG && selector.expression.is_empty() {
+        FilterAPI::SUB_ALL
+    } else {
+        selector.expression.as_str()
+    };
+    let mut sub = FilterAPI::build(topic, expression, Some(expression_type))?;
+    sub.class_filter_mode = expression_type == ExpressionType::CLASS_FILTER;
+    Ok(sub)
 }
 
 /// Split on semicolons + trim each item + drop empty ones.
@@ -1575,10 +1643,33 @@ impl DefaultLitePullConsumer {
         }
     }
 
-    /// Lite only recognizes tag expressions; a `MessageSelector`
-    /// is always handled as its tag expression.
+    /// Subscribe using a [`MessageSelector`]: the selector's expression type is kept
+    /// end-to-end (subscription table → heartbeat subscription set → the background pull's
+    /// `expressionType`). A `TAG` selector (or an empty type) goes through the exact same tag
+    /// compilation as [`subscribe`](Self::subscribe) (`tagsSet`/`codeSet`); a non-tag selector
+    /// registers only its raw expression with its own `expressionType`, leaving both
+    /// collections empty -- which also switches off the client-side re-filter.
+    ///
+    /// An expression the filter API rejects follows the same stance as [`subscribe`](Self::subscribe):
+    /// the `subscription` entry is kept and the `subscription_data` entry is dropped.
     pub fn subscribe_with_selector(&self, topic: &str, selector: &MessageSelector) {
-        self.subscribe(topic, &selector.expression);
+        let topic = with_namespace(&self.config().namespace, topic);
+        {
+            let mut state = lock(&self.inner.state);
+            state.assign_mode = false;
+            state
+                .subscription
+                .insert(topic.clone(), selector.expression.clone());
+            match pull_selector_subscription(&topic, selector) {
+                Ok(sub) => {
+                    state.subscription_data.insert(topic, sub);
+                }
+                Err(e) => {
+                    rmq_debug!("lite subscribe: build subscription data failed: {e}");
+                    state.subscription_data.remove(&topic);
+                }
+            }
+        }
     }
 
     pub fn unsubscribe(&self, topic: &str) {
@@ -2577,7 +2668,25 @@ impl DefaultLitePullConsumer {
             },
         };
         let cfg = self.config();
+        // A selector subscription owns its expression type and version on the wire; the tag
+        // path keeps exactly the historic shape (raw expression, TAG, version 0). The same
+        // entry decides the client-side re-filter, so a SQL92 expression is never compiled
+        // into a tag set here.
+        let registered = lock(&self.inner.state)
+            .subscription_data
+            .get(&mq.topic)
+            .cloned();
         let expr = self.subscription_for(&mq.topic);
+        let (expr, expression_type, sub_version) = match &registered {
+            Some(sub) if sub.expression_type != ExpressionType::TAG => (
+                sub.sub_string.clone(),
+                sub.expression_type.clone(),
+                sub.sub_version,
+            ),
+            _ => (expr, ExpressionType::TAG.to_string(), 0),
+        };
+        // Same class-filter rule as the pull path above: the bit stays clear, the type travels.
+        let sys_flag = lite_pull_sys_flag();
         let result = match client
             .pull_message(
                 &cfg.consumer_group,
@@ -2586,11 +2695,11 @@ impl DefaultLitePullConsumer {
                 cfg.pull_batch_size,
                 // Short polling (suspend=False); offsets are committed separately by auto-commit;
                 // for the lite bit see lite_pull_sys_flag (#107)
-                lite_pull_sys_flag(),
+                sys_flag,
                 0,
                 &expr,
-                0,
-                ExpressionType::TAG,
+                sub_version,
+                &expression_type,
                 LITE_PULL_TIMEOUT_MILLIS,
                 -1,
                 PULL_SUSPEND_TIMEOUT_MILLIS,
@@ -2620,9 +2729,7 @@ impl DefaultLitePullConsumer {
         if !intact || result.status != PullStatus::Found || result.msg_found_list.is_empty() {
             return false;
         }
-        // Recompute tagsSet from the expression on the spot, then filter (no set = no filtering)
-        let sub = FilterAPI::build_subscription_data(&mq.topic, Some(&expr)).ok();
-        let msgs = client_side_tag_filter(sub.as_ref(), result.msg_found_list);
+        let msgs = client_side_tag_filter(registered.as_ref(), result.msg_found_list);
         if msgs.is_empty() {
             // All dropped by the tag filter: as far as the broker is concerned this window has already been read (the cursor was advanced above),
             // there is simply nothing deliverable -- the window must not be re-pulled in place like the old implementation did.
@@ -3075,6 +3182,70 @@ mod tests {
         c.subscribe("T", "||");
         assert_eq!(c.subscription().len(), 1);
         assert!(c.subscriptions().is_empty());
+    }
+
+    #[test]
+    fn subscribe_with_selector_keeps_the_expression_type() {
+        let c = DefaultLitePullConsumer::new("LitePG").unwrap();
+        c.subscribe_with_selector("SQL", &MessageSelector::by_sql("a > 1"));
+        let sd = &c.subscriptions()[0];
+        assert_eq!(sd.expression_type, ExpressionType::SQL92);
+        assert_eq!(sd.sub_string, "a > 1");
+        assert!(
+            sd.tags_set.is_empty() && sd.code_set.is_empty(),
+            "a SQL92 entry must not compile tag collections"
+        );
+        assert_eq!(
+            c.subscription()[0].1,
+            "a > 1",
+            "the raw expression stays in the subscription table"
+        );
+
+        // A TAG selector keeps exactly the tag shape `subscribe` produces.
+        c.subscribe_with_selector("TAG", &MessageSelector::by_tag("TagB || TagA"));
+        let sd = c
+            .subscriptions()
+            .into_iter()
+            .find(|s| s.topic == "TAG")
+            .expect("TAG entry registered");
+        let built = FilterAPI::build_subscription_data("TAG", Some("TagB || TagA")).unwrap();
+        assert_eq!(sd.expression_type, ExpressionType::TAG);
+        assert_eq!(sd.tags_set, built.tags_set);
+        assert_eq!(sd.code_set, built.code_set);
+        assert_eq!(sd.sub_string, built.sub_string);
+
+        // An empty selector type falls back to the TAG path.
+        c.subscribe_with_selector("PLAIN", &MessageSelector::new("", "TagA"));
+        let sd = c
+            .subscriptions()
+            .into_iter()
+            .find(|s| s.topic == "PLAIN")
+            .expect("PLAIN entry registered");
+        assert_eq!(sd.expression_type, ExpressionType::TAG);
+        assert_eq!(sd.tags_set, vec!["TagA".to_string()]);
+
+        // A non-tag selector without an expression is rejected by the filter API: same stance as
+        // a bad tag expression (keep the `subscription` entry, drop the `subscription_data`).
+        c.subscribe_with_selector("BAD", &MessageSelector::by_sql(""));
+        assert!(c.subscription().iter().any(|(t, _)| t == "BAD"));
+        assert!(!c.subscriptions().iter().any(|s| s.topic == "BAD"));
+    }
+
+    #[test]
+    fn lite_heartbeat_carries_selector_expression_type() {
+        let c = DefaultLitePullConsumer::new("LitePG").unwrap();
+        c.update_config(|cfg| cfg.client_id = Some("cid-sel".to_string()));
+        c.subscribe_with_selector("T", &MessageSelector::by_sql("color = 'blue'"));
+        let hb = build_lite_heartbeat(&c.inner);
+        let set = &hb.consumer_data_set[0].subscription_data_set;
+        assert_eq!(set.len(), 1);
+        assert_eq!(set[0].topic, "T");
+        assert_eq!(set[0].expression_type, ExpressionType::SQL92);
+        assert_eq!(set[0].sub_string, "color = 'blue'");
+        assert!(set[0].tags_set.is_empty());
+        // The wire payload keeps the field names the broker parses.
+        let json = set[0].to_json_value();
+        assert_eq!(json["expressionType"], serde_json::json!("SQL92"));
     }
 
     #[test]
@@ -3749,6 +3920,22 @@ mod tests {
                 .collect()
         }
 
+        /// The value of one ext field (`expressionType` / `subscription` / `subVersion` ...) of
+        /// every received pull request that carries it, in arrival order.
+        fn pull_ext_values(&self, key: &str) -> Vec<String> {
+            lock(&self.requests)
+                .iter()
+                .filter(|(code, _)| {
+                    *code == request_code::PULL_MESSAGE || *code == request_code::LITE_PULL_MESSAGE
+                })
+                .filter_map(|(_, ext)| {
+                    ext.iter()
+                        .find(|(k, _)| k == key)
+                        .map(|(_, v)| v.clone())
+                })
+                .collect()
+        }
+
         /// Decode every received heartbeat into `HeartbeatData` (a decode failure blows up right in the assertion).
         fn heartbeats(&self) -> Vec<HeartbeatData> {
             lock(&self.heartbeat_bodies)
@@ -4327,6 +4514,172 @@ mod tests {
         );
         c.shutdown();
         classic.shutdown();
+    }
+
+    // ---------------- Selector-driven pulls keep the selector type ----------------
+
+    #[tokio::test]
+    async fn pull_with_selector_keeps_the_selector_type_on_the_wire() {
+        let cluster = FakePullCluster::start().await;
+        let c = started_pull("pull_sel_types", "PG_PullSel", &cluster, "T").await;
+        let q = queue("T", "broker-a", 0);
+
+        // Control: the plain string pull stays TAG with version 0 -- exactly the historic shape.
+        c.pull(&q, "TagA", 0, 32, Some(5000))
+            .await
+            .expect("the string pull must succeed");
+        assert_eq!(
+            cluster.master.pull_ext_values("expressionType").last(),
+            Some(&"TAG".to_string())
+        );
+        assert_eq!(
+            cluster.master.pull_ext_values("subVersion").last(),
+            Some(&"0".to_string())
+        );
+
+        // A SQL92 selector must not be downgraded to a tag list: its own expressionType and
+        // the subscription's real version ride the request.
+        c.pull_with_selector(&q, &MessageSelector::by_sql("a > 1"), 0, 32, Some(5000))
+            .await
+            .expect("the SQL92 selector pull must succeed");
+        assert_eq!(
+            cluster.master.pull_ext_values("expressionType").last(),
+            Some(&"SQL92".to_string())
+        );
+        assert_eq!(
+            cluster.master.pull_ext_values("subscription").last(),
+            Some(&"a > 1".to_string())
+        );
+        let version = cluster
+            .master
+            .pull_ext_values("subVersion")
+            .last()
+            .expect("the SQL92 pull recorded a subVersion")
+            .parse::<i64>()
+            .expect("subVersion is numeric");
+        assert!(version > 0, "a SQL92 pull sends the subscription version");
+
+        // A TAG selector keeps the tag behaviour (compiled expression, version 0).
+        c.pull_with_selector(&q, &MessageSelector::by_tag("TagA || TagB"), 0, 32, Some(5000))
+            .await
+            .expect("the TAG selector pull must succeed");
+        assert_eq!(
+            cluster.master.pull_ext_values("expressionType").last(),
+            Some(&"TAG".to_string())
+        );
+        assert_eq!(
+            cluster.master.pull_ext_values("subVersion").last(),
+            Some(&"0".to_string())
+        );
+        assert_eq!(
+            cluster.master.pull_ext_values("subscription").last(),
+            Some(&"TagA || TagB".to_string())
+        );
+        c.shutdown();
+    }
+
+    #[tokio::test]
+    async fn pull_block_if_not_found_with_selector_sends_sql92_with_the_suspend_bit() {
+        let cluster = FakePullCluster::start().await;
+        let c = started_pull("pull_sel_block", "PG_PullSelBlock", &cluster, "T").await;
+        let q = queue("T", "broker-a", 0);
+
+        c.pull_block_if_not_found(&q, "TagA", 0, 32)
+            .await
+            .expect("the long-poll string form must still succeed");
+        c.pull_block_if_not_found_with_selector(&q, &MessageSelector::by_sql("color = 'blue'"), 0, 32)
+            .await
+            .expect("the long-poll selector form must succeed");
+
+        let types = cluster.master.pull_ext_values("expressionType");
+        assert_eq!(types.len(), 2);
+        assert_eq!(types[0], "TAG", "control: the string form stays TAG");
+        assert_eq!(types[1], "SQL92");
+        let flags = cluster.master.pull_sys_flags();
+        assert_eq!(flags.len(), 2);
+        for f in &flags {
+            assert!(PullSysFlag::has_suspend_flag(*f), "both are long polls: {f:#x}");
+        }
+        c.shutdown();
+    }
+
+    /// A lite subscribe-mode consumer registered with a SQL92 selector: the type reaches the
+    /// broker in the heartbeat **and** in the background pull; a tag subscription must keep
+    /// sending `TAG` with version 0 (the control goes red together with the SQL92 wiring).
+    #[tokio::test]
+    async fn lite_sql92_selector_reaches_heartbeat_and_background_pull() {
+        // Two read queues: once the TAG control joins the group, each instance still owns one
+        // queue, so both pull shapes are guaranteed to reach the broker.
+        let cluster = FakePullCluster::start_queues(2).await;
+        let c = DefaultLitePullConsumer::new("LitePG_Sql92").expect("the group name is legal");
+        c.set_instance_name("lite_sql92_pull");
+        c.set_namesrv_addr(&cluster.namesrv_addr);
+        c.set_consume_from_where(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
+        c.subscribe_with_selector("T", &MessageSelector::by_sql("a > 1"));
+        c.start().await.expect("start must succeed");
+        cluster.set_cid_list(&[c.client_id().as_str()]);
+
+        // The heartbeat subscription set carries the selector's type.
+        wait_until(
+            || {
+                cluster.master.heartbeats().iter().any(|hb| {
+                    hb.consumer_data_set.iter().any(|cd| {
+                        cd.subscription_data_set.iter().any(|sd| {
+                            sd.topic == "T"
+                                && sd.expression_type == "SQL92"
+                                && sd.sub_string == "a > 1"
+                                && sd.tags_set.is_empty()
+                        })
+                    })
+                })
+            },
+            "the heartbeat carries the SQL92 subscription data",
+        )
+        .await;
+
+        // The background pull request must not downgrade it to a tag subscription.
+        wait_until(
+            || {
+                cluster.master.pull_ext_values("expressionType").iter().any(|t| t == "SQL92")
+            },
+            "the lite pull request carries expressionType=SQL92",
+        )
+        .await;
+        let subs = cluster.master.pull_ext_values("subscription");
+        assert!(
+            subs.iter().any(|s| s == "a > 1"),
+            "the raw SQL expression rides the request: {subs:?}"
+        );
+        let versions = cluster.master.pull_ext_values("subVersion");
+        assert!(
+            versions.iter().any(|v| v.parse::<i64>().unwrap_or(0) != 0),
+            "a non-tag subscription sends its real version, not 0: {versions:?}"
+        );
+
+        // TAG control on the same cluster: a tag subscription must keep sending TAG/version 0.
+        let plain =
+            DefaultLitePullConsumer::new("LitePG_TagCtl").expect("the group name is legal");
+        plain.set_instance_name("lite_tag_control");
+        plain.set_namesrv_addr(&cluster.namesrv_addr);
+        plain.set_consume_from_where(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
+        plain.subscribe("T", "TagA");
+        plain.start().await.expect("start must succeed");
+        cluster.set_cid_list(&[c.client_id().as_str(), plain.client_id().as_str()]);
+        wait_until(
+            || cluster.master.pull_ext_values("expressionType").iter().any(|t| t == "TAG"),
+            "the tag subscription keeps sending TAG",
+        )
+        .await;
+        assert!(
+            cluster
+                .master
+                .pull_ext_values("subVersion")
+                .iter()
+                .any(|v| v == "0"),
+            "the tag pull keeps version 0"
+        );
+        c.shutdown();
+        plain.shutdown();
     }
 
     // ---------------------- The pull cursor follows nextBeginOffset (#105)

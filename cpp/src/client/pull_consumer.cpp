@@ -248,21 +248,30 @@ std::vector<MessageQueue> DefaultMQPullConsumer::fetchMessageQueuesInBalance(
 // ---------------------------------------------------------------- Pull
 PullResult DefaultMQPullConsumer::pull(const MessageQueue& mq, const std::string& subExpression,
                                       int64_t offset, int32_t maxNums, int32_t timeoutMillis) {
+    return pull(mq, MessageSelector::byTag(subExpression), offset, maxNums, timeoutMillis);
+}
+
+PullResult DefaultMQPullConsumer::pull(const MessageQueue& mq, const MessageSelector& selector,
+                                      int64_t offset, int32_t maxNums, int32_t timeoutMillis) {
     if (mqClient_ == nullptr) {
         throw MQClientException("consumer not started, call start() first");
     }
     const int32_t timeout = timeoutMillis > 0 ? timeoutMillis : consumerPullTimeoutMillis_;
+    MessageQueue real = mq;
+    real.topic = NamespaceUtil::wrapNamespace(namespace_, mq.topic);
+    const SubscriptionData sub =
+        FilterAPI::buildSubscriptionData(real.topic, selector.expression, selector.type);
+    // The class-filter bit stays clear on this path: it asks the client to re-route the pull to a
+    // legacy filter server, which this SDK does not speak. A CLASS_FILTER subscription is still
+    // reported by its own expression type in the header.
     const int32_t sysFlag = PullSysFlag::buildSysFlag(/*commitOffset=*/false,
                                                       /*suspend=*/false,
                                                       /*subscription=*/true,
                                                       /*classFilter=*/false);
-    MessageQueue real = mq;
-    real.topic = NamespaceUtil::wrapNamespace(namespace_, mq.topic);
-    const SubscriptionData sub = FilterAPI::buildSubscriptionData(real.topic, subExpression);
     PullResult result = mqClient_->pullMessage(
         consumerGroup_, real, offset, maxNums, sysFlag, /*commitOffset=*/0,
-        sub.subString.empty() ? std::string("*") : sub.subString,
-        /*subVersion=*/0, ExpressionType::TAG, timeout, /*maxMsgBytes=*/-1,
+        FilterAPI::pullExpression(sub), FilterAPI::pullSubVersionOf(sub), sub.expressionType,
+        timeout, /*maxMsgBytes=*/-1,
         /*suspendTimeoutMillis=*/15000, /*addr=*/std::string(), /*requestSource=*/0,
         /*brokerId=*/recalculatePullFromWhichNode(real));
     updatePullFromWhichNode(real, result);
@@ -272,20 +281,28 @@ PullResult DefaultMQPullConsumer::pull(const MessageQueue& mq, const std::string
 PullResult DefaultMQPullConsumer::pullBlockIfNotFound(const MessageQueue& mq,
                                                       const std::string& subExpression,
                                                       int64_t offset, int32_t maxNums) {
+    return pullBlockIfNotFound(mq, MessageSelector::byTag(subExpression), offset, maxNums);
+}
+
+PullResult DefaultMQPullConsumer::pullBlockIfNotFound(const MessageQueue& mq,
+                                                      const MessageSelector& selector,
+                                                      int64_t offset, int32_t maxNums) {
     if (mqClient_ == nullptr) {
         throw MQClientException("consumer not started, call start() first");
     }
+    MessageQueue real = mq;
+    real.topic = NamespaceUtil::wrapNamespace(namespace_, mq.topic);
+    const SubscriptionData sub =
+        FilterAPI::buildSubscriptionData(real.topic, selector.expression, selector.type);
+    // Same class-filter rule as the short-poll path above: the bit stays clear, the type travels.
     const int32_t sysFlag = PullSysFlag::buildSysFlag(/*commitOffset=*/false,
                                                       /*suspend=*/true,
                                                       /*subscription=*/true,
                                                       /*classFilter=*/false);
-    MessageQueue real = mq;
-    real.topic = NamespaceUtil::wrapNamespace(namespace_, mq.topic);
-    const SubscriptionData sub = FilterAPI::buildSubscriptionData(real.topic, subExpression);
     PullResult result = mqClient_->pullMessage(
         consumerGroup_, real, offset, maxNums, sysFlag, /*commitOffset=*/0,
-        sub.subString.empty() ? std::string("*") : sub.subString,
-        /*subVersion=*/0, ExpressionType::TAG, consumerTimeoutMillisWhenSuspend_,
+        FilterAPI::pullExpression(sub), FilterAPI::pullSubVersionOf(sub), sub.expressionType,
+        consumerTimeoutMillisWhenSuspend_,
         /*maxMsgBytes=*/-1, brokerSuspendMaxTimeMillis_, /*addr=*/std::string(),
         /*requestSource=*/0, /*brokerId=*/recalculatePullFromWhichNode(real));
     updatePullFromWhichNode(real, result);
@@ -340,6 +357,14 @@ void DefaultMQPullConsumer::pullAsync(const MessageQueue& mq, const std::string&
                                       int64_t offset, int32_t maxNums,
                                       std::shared_ptr<PullCallback> callback,
                                       int32_t timeoutMillis) {
+    pullAsync(mq, MessageSelector::byTag(subExpression), offset, maxNums, std::move(callback),
+              timeoutMillis);
+}
+
+void DefaultMQPullConsumer::pullAsync(const MessageQueue& mq, const MessageSelector& selector,
+                                      int64_t offset, int32_t maxNums,
+                                      std::shared_ptr<PullCallback> callback,
+                                      int32_t timeoutMillis) {
     if (mqClient_ == nullptr || !started_) {
         throw MQClientException("consumer not started, call start() first");
     }
@@ -375,9 +400,9 @@ void DefaultMQPullConsumer::pullAsync(const MessageQueue& mq, const std::string&
         }
     };
     try {
-        pool->submit([this, mq, subExpression, offset, maxNums, timeoutMillis, deliver]() {
+        pool->submit([this, mq, selector, offset, maxNums, timeoutMillis, deliver]() {
             try {
-                const PullResult result = pull(mq, subExpression, offset, maxNums, timeoutMillis);
+                const PullResult result = pull(mq, selector, offset, maxNums, timeoutMillis);
                 executeOnCallbackThread([deliver, result]() { deliver(&result, nullptr); });
             } catch (...) {
                 const std::exception_ptr eptr = std::current_exception();

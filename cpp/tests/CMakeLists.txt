@@ -120,6 +120,13 @@ add_executable(rmq_test_pop_orderly test_pop_orderly.cpp)
 target_link_libraries(rmq_test_pop_orderly PRIVATE rocketmq::remoting)
 add_test(NAME pop_orderly COMMAND rmq_test_pop_orderly)
 
+# BATCH_ACK_MESSAGE grouping: a fake endpoint records the decoded request frame off the socket, so the
+# merge rule (one entry per distinct merge key, the retry dimension splitting it, offset bits folded
+# relative to startOffset) and the no-custom-header JSON body are pinned on captured wire state.
+add_executable(rmq_test_batch_ack test_batch_ack.cpp)
+target_link_libraries(rmq_test_batch_ack PRIVATE rocketmq::remoting)
+add_test(NAME batch_ack COMMAND rmq_test_batch_ack)
+
 # ackIndex semantics of classic concurrent consumption (the consume-result dispatch of processConsumeResult): the tail of a partial ack is redelivered,
 # a failed redelivery pins the offset, RECONSUME_LATER overrides a wide ackIndex, broadcast drops the tail
 add_executable(rmq_test_consume_ack_index test_consume_ack_index.cpp)
@@ -371,3 +378,29 @@ add_test(NAME static_topic COMMAND rmq_test_static_topic)
 add_executable(rmq_test_vip_channel test_vip_channel.cpp)
 target_link_libraries(rmq_test_vip_channel PRIVATE rocketmq::remoting)
 add_test(NAME vip_channel COMMAND rmq_test_vip_channel)
+
+# Pull-path subscription expression (tag shape vs selector shape): the fake cluster reads the
+# PULL_MESSAGE / LITE_PULL_MESSAGE header and the HEART_BEAT body off the socket, so the recorded
+# expressionType / subscription / subVersion decide -- every selector case is paired with the historic
+# tag shape (TAG + subVersion 0 + a parsed tagsSet that still drives the local re-filter).
+add_executable(rmq_test_pull_selector test_pull_selector.cpp)
+target_link_libraries(rmq_test_pull_selector PRIVATE rocketmq::remoting)
+add_test(NAME pull_selector COMMAND rmq_test_pull_selector)
+
+# Pull-loop pause mapping: broker FLOW_CONTROL(215) vs every other code vs the client threshold pause.
+# A pure decision a real run cannot reveal quickly, so it is pinned offline.
+add_executable(rmq_test_pull_pause test_pull_pause.cpp)
+target_link_libraries(rmq_test_pull_pause PRIVATE rocketmq::remoting)
+add_test(NAME pull_pause COMMAND rmq_test_pull_pause)
+
+# Producer heartbeat period knob: reachable through a setter, and non-positive periods rejected on the
+# spot (they would anchor the next tick in the past). Everything is a recorded getter value; no thread.
+add_executable(rmq_test_producer_heartbeat_knob test_producer_heartbeat_knob.cpp)
+target_link_libraries(rmq_test_producer_heartbeat_knob PRIVATE rocketmq::remoting)
+add_test(NAME producer_heartbeat_knob COMMAND rmq_test_producer_heartbeat_knob)
+
+# Shutdown drain ceiling (awaitTerminationMillisWhenShutdown): the knob plumbing plus the executor
+# honouring a ceiling on its one backlog drain -- paired against a no-ceiling and a generous-ceiling run.
+add_executable(rmq_test_shutdown_drain_ceiling test_shutdown_drain_ceiling.cpp)
+target_link_libraries(rmq_test_shutdown_drain_ceiling PRIVATE rocketmq::remoting)
+add_test(NAME shutdown_drain_ceiling COMMAND rmq_test_shutdown_drain_ceiling)

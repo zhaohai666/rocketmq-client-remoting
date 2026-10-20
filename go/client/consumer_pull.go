@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/zhaohai666/rocketmq-client-remoting/go/common"
+	"github.com/zhaohai666/rocketmq-client-remoting/go/remoting"
 )
 
 // queuePullLoop pulls one queue until it is retired or the consumer stops.
@@ -87,7 +88,7 @@ func (c *DefaultMQPushConsumer) queuePullLoop(mq common.MessageQueue, stop chan 
 				common.LogDebugf("pull long-poll timeout for %v (benign, will retry): %v", mq, err)
 			} else {
 				common.LogDebugf("pull error for %v: %v", mq, err)
-				if c.sleepOrStop(stop, 500*time.Millisecond) {
+				if c.sleepOrStop(stop, pullRetryDelay(err)) {
 					return
 				}
 			}
@@ -467,6 +468,33 @@ func isTimeout(err error) bool {
 		return true
 	}
 	return false
+}
+
+// pullRetryDelay is how long the pull loop waits before its next attempt after a
+// failed pull. Two failures look alike in the log but mean opposite things and
+// must not share one wait:
+//
+//   - the BROKER refused the pull because it is flow-controlling its own queues
+//     (response code 215): the request already round-tripped, nothing landed in
+//     the local buffer, and the queue is quiet again as soon as the broker's
+//     pressure drops — so a short backoff, and no rebalance or threshold rescan;
+//   - anything else (a system error, a busy/dispatch answer, a dead connection):
+//     the longer generic wait, because retrying hot at a broker that is
+//     unhealthy adds pressure to whatever is already wrong.
+//
+// This client's own backlog threshold is not here: flowControlHit stops the pull
+// BEFORE the request is sent and sleeps
+// pullTimeDelayMillsWhenFlowControl, so the two waits never meet.
+//
+// One loop serves both the concurrent and the orderly consumer (orderly is just
+// a flag on it), so both paths get the same discrimination.
+func pullRetryDelay(err error) time.Duration {
+	if e, ok := err.(*common.Error); ok {
+		if code, has := e.ResponseCode(); has && code == remoting.RespFlowControl {
+			return pullTimeDelayMillsWhenBrokerFlow
+		}
+	}
+	return pullTimeDelayMillsWhenPullFailed
 }
 
 func maxInt(a, b int) int {

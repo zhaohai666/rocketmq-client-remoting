@@ -1577,6 +1577,94 @@ public sealed class MQClientInstance : IDisposable
     }
 
     /// <summary>
+    /// BATCH_ACK_MESSAGE (200151): confirms several POP messages in one request.
+    ///
+    /// Each extraInfo is the same 8-segment CK string a single ACK takes. All checkpoints that
+    /// share retry flag + queueId + ckQueueOffset + popTime collapse into ONE entry whose bit
+    /// set marks index (queueOffset - ckQueueOffset), so a whole pop batch costs one round trip
+    /// instead of one ACK per message.
+    ///
+    /// A batch is single-broker by construction: the body's brokerName -- and therefore the
+    /// address lookup -- comes from the FIRST extraInfo, even when a later checkpoint names
+    /// another broker. The request carries no custom header at all: everything the broker needs
+    /// is inside the JSON body. Returns the broker response code; SUCCESS means it worked.
+    /// </summary>
+    public int BatchAckMessage(string consumerGroup, string topic, IReadOnlyList<string> extraInfoList,
+        int timeoutMillis = 3000, string? addrIn = null)
+    {
+        if (extraInfoList.Count == 0)
+        {
+            throw new ArgumentException("batch ack needs at least one extraInfo", nameof(extraInfoList));
+        }
+
+        // Only the first checkpoint decides the broker, and it does so even when its own
+        // brokerName segment is empty -- a later non-empty name must not take over.
+        string[] firstSegments = ExtraInfoUtil.Split(extraInfoList[0]);
+        string firstBrokerName = ExtraInfoUtil.GetBrokerName(firstSegments);
+        int firstQueueId = ExtraInfoUtil.GetQueueId(firstSegments);
+
+        var inOrder = new List<BatchAck>();
+        var byMergeKey = new Dictionary<string, BatchAck>(StringComparer.Ordinal);
+        foreach (string extraInfo in extraInfoList)
+        {
+            string[] seg = ExtraInfoUtil.Split(extraInfo);
+            string retry = ExtraInfoUtil.GetRetry(seg);
+            int queueId = ExtraInfoUtil.GetQueueId(seg);
+            long ckQueueOffset = ExtraInfoUtil.GetCkQueueOffset(seg);
+            long popTime = ExtraInfoUtil.GetPopTime(seg);
+            string mergeKey = retry + "@"
+                              + queueId.ToString(CultureInfo.InvariantCulture) + "@"
+                              + ckQueueOffset.ToString(CultureInfo.InvariantCulture) + "@"
+                              + popTime.ToString(CultureInfo.InvariantCulture);
+
+            if (!byMergeKey.TryGetValue(mergeKey, out BatchAck? ack))
+            {
+                ack = new BatchAck
+                {
+                    ConsumerGroup = consumerGroup,
+                    Topic = topic,
+                    Retry = retry,
+                    StartOffset = ckQueueOffset,
+                    QueueId = queueId,
+                    ReviveQueueId = ExtraInfoUtil.GetReviveQid(seg),
+                    PopTime = popTime,
+                    InvisibleTime = ExtraInfoUtil.GetInvisibleTime(seg),
+                };
+                byMergeKey[mergeKey] = ack;
+                inOrder.Add(ack);
+            }
+
+            // A repeated mergeKey only contributes its bit: the fields stay those of the
+            // checkpoint that created the entry.
+            long queueOffset = ExtraInfoUtil.GetQueueOffset(seg);
+            long bitIndex = queueOffset - ckQueueOffset;
+            if (bitIndex < 0 || bitIndex > BatchAck.MaxBitIndex)
+            {
+                throw new ArgumentException(
+                    "batch ack offset out of range: queueOffset "
+                    + queueOffset.ToString(CultureInfo.InvariantCulture)
+                    + " against ckQueueOffset " + ckQueueOffset.ToString(CultureInfo.InvariantCulture));
+            }
+
+            ack.AckOffsets.Add(unchecked((int)bitIndex));
+        }
+
+        var body = new BatchAckMessageRequestBody { BrokerName = firstBrokerName };
+        body.Acks.AddRange(inOrder);
+
+        string addr = addrIn ?? string.Empty;
+        if (addr.Length == 0)
+        {
+            addr = PopAckAddrFor(topic, body.BrokerName, firstQueueId);
+        }
+
+        RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.BatchAckMessage, null);
+        request.Body = body.Encode();
+        RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
+        return response.Code;
+    }
+
+    /// <summary>
     /// CHANGE_MESSAGE_INVISIBLETIME (200053, note it is not 200052 -- that one is PEEK):
     /// extends the invisible time of a POP message.
     ///

@@ -334,6 +334,9 @@ final class DefaultMQPullConsumer
         }
         $nowMs = $nowMillis ?? UtilAll::currentTimeMillis();
         $this->mqClient?->tick($nowMs);
+        // Asynchronous pulls have no thread of their own: every pull callback the broker already
+        // answered is dispatched here, inside the caller's loop.
+        $this->pumpAsyncPulls();
         $now = $nowMs / 1000.0;
         if ($this->heartbeatEnabled && $now >= $this->nextHeartbeatAt) {
             $this->nextHeartbeatAt = $now + $this->heartbeatIntervalMillis / 1000.0;
@@ -485,32 +488,36 @@ final class DefaultMQPullConsumer
         int $maxNums = 32,
         ?int $timeoutMillis = null,
     ): PullResult {
-        $client = $this->requireClient();
-        $timeout = $timeoutMillis ?? $this->consumerPullTimeoutMillis;
-        $sub = FilterAPI::buildSubscriptionData($mq->topic, $subExpression);
-        $sysFlag = PullSysFlag::buildSysFlag(false, false, true, false);
-        $key = self::mqKey($mq);
-        $result = $client->pullMessage(
-            $this->consumerGroup,
+        return $this->doPull(
             $mq,
+            build_pull_subscription_data($mq, $subExpression),
             $offset,
             $maxNums,
-            $sysFlag,
-            0,
-            $sub->subString ?? '*',
-            0,
-            ExpressionType::TAG,
-            timeoutMillis: $timeout,
-            maxMsgBytes: -1,
-            suspendTimeoutMillis: 15000,
-            brokerId: $this->pullFromWhichNode[$key] ?? MixAll::MASTER_ID,
+            false,
+            $timeoutMillis ?? $this->consumerPullTimeoutMillis,
         );
-        $this->pullFromWhichNode[$key] = $result->suggestWhichBrokerId ?? MixAll::MASTER_ID;
-        $this->pulledQueues[$key] = $mq;
-        if ($result->status === PullStatus::FOUND && $result->msgFoundList !== []) {
-            $result->msgFoundList = $this->filterMessagesForDelivery($mq, $result->msgFoundList);
-        }
-        return $result;
+    }
+
+    /**
+     * Selector flavour of {@see pull()}: the expression type of the selector is what goes on
+     * the wire, so a SQL92 expression is reported as SQL92 instead of being mistaken for a tag
+     * list; a TAG selector keeps the tag derivation of {@see pull()}.
+     */
+    public function pullBySelector(
+        MessageQueue $mq,
+        MessageSelector $selector,
+        int $offset = 0,
+        int $maxNums = 32,
+        ?int $timeoutMillis = null,
+    ): PullResult {
+        return $this->doPull(
+            $mq,
+            build_pull_subscription_data($mq, null, $selector),
+            $offset,
+            $maxNums,
+            false,
+            $timeoutMillis ?? $this->consumerPullTimeoutMillis,
+        );
     }
 
     public function pullBlockIfNotFound(
@@ -519,10 +526,52 @@ final class DefaultMQPullConsumer
         int $offset,
         int $maxNums,
     ): PullResult {
+        return $this->doPull(
+            $mq,
+            build_pull_subscription_data($mq, $subExpression),
+            $offset,
+            $maxNums,
+            true,
+            $this->consumerTimeoutMillisWhenSuspend,
+        );
+    }
+
+    /** Selector flavour of {@see pullBlockIfNotFound()} (same expression-type rule). */
+    public function pullBlockIfNotFoundBySelector(
+        MessageQueue $mq,
+        MessageSelector $selector,
+        int $offset,
+        int $maxNums,
+    ): PullResult {
+        return $this->doPull(
+            $mq,
+            build_pull_subscription_data($mq, null, $selector),
+            $offset,
+            $maxNums,
+            true,
+            $this->consumerTimeoutMillisWhenSuspend,
+        );
+    }
+
+    /**
+     * The single pull body behind the four entry points above: ``$block`` picks long polling
+     * (suspend bit on, the suspend budgets apply) versus short polling, and the subscription
+     * decides both the reported expression and its expression type.
+     */
+    private function doPull(
+        MessageQueue $mq,
+        SubscriptionData $sub,
+        int $offset,
+        int $maxNums,
+        bool $block,
+        int $timeoutMillis,
+    ): PullResult {
         $client = $this->requireClient();
-        $sub = FilterAPI::buildSubscriptionData($mq->topic, $subExpression);
+        $isTag = $sub->expressionType === ExpressionType::TAG;
         // block=true: suspend=True makes the broker hang until messages arrive; timeout uses consumerTimeoutMillisWhenSuspend.
-        $sysFlag = PullSysFlag::buildSysFlag(false, true, true, false);
+        // The class-filter bit stays clear on this path: it asks for the legacy filter-server route.
+        // The subscription's own expression type is still what the header reports.
+        $sysFlag = PullSysFlag::buildSysFlag(false, $block, true, false);
         $key = self::mqKey($mq);
         $result = $client->pullMessage(
             $this->consumerGroup,
@@ -532,14 +581,21 @@ final class DefaultMQPullConsumer
             $sysFlag,
             0,
             $sub->subString ?? '*',
-            0,
-            ExpressionType::TAG,
-            timeoutMillis: $this->consumerTimeoutMillisWhenSuspend,
+            // A tag subscription keeps the version-0 shape it has always sent; a non-tag one
+            // reports the subscription's own version.
+            $isTag ? 0 : $sub->subVersion,
+            $sub->expressionType,
+            timeoutMillis: $timeoutMillis,
             maxMsgBytes: -1,
-            suspendTimeoutMillis: $this->brokerSuspendMaxTimeMillis,
+            suspendTimeoutMillis: $block ? $this->brokerSuspendMaxTimeMillis : 15000,
             brokerId: $this->pullFromWhichNode[$key] ?? MixAll::MASTER_ID,
         );
         $this->pullFromWhichNode[$key] = $result->suggestWhichBrokerId ?? MixAll::MASTER_ID;
+        if (!$block) {
+            // Only the short-poll entry points book the queue as "pulled from" (the long-poll
+            // ones never did, and fetchMessageQueuesInBalance reads exactly this key set).
+            $this->pulledQueues[$key] = $mq;
+        }
         if ($result->status === PullStatus::FOUND && $result->msgFoundList !== []) {
             $result->msgFoundList = $this->filterMessagesForDelivery($mq, $result->msgFoundList);
         }
@@ -547,6 +603,149 @@ final class DefaultMQPullConsumer
     }
 
     // ---------------- Offset management ----------------
+
+    // ---------------- Asynchronous pulling ----------------
+
+    /**
+     * Asynchronous form of {@see pull()}: the request goes out and this returns immediately;
+     * the outcome arrives on ``$callback`` once the caller pumps (``tick()`` drives the pump).
+     *
+     * The frame is built by the same body as the synchronous pull, so the wire shape —
+     * subscription text, expression type, version stamp, sysFlag bits — is identical.
+     *
+     * @throws MQClientException when the arguments are unusable (not started, bad offset, no callback)
+     */
+    public function pullAsync(
+        MessageQueue $mq,
+        string $subExpression,
+        int $offset,
+        int $maxNums,
+        ?PullCallback $callback = null,
+        ?int $timeoutMillis = null,
+    ): void {
+        $this->doPullAsync(
+            $mq,
+            build_pull_subscription_data($mq, $subExpression),
+            $offset,
+            $maxNums,
+            false,
+            $timeoutMillis ?? $this->consumerPullTimeoutMillis,
+            $callback,
+        );
+    }
+
+    /** Selector flavour of {@see pullAsync()} (same expression-type rule as the sync selector pulls). */
+    public function pullAsyncBySelector(
+        MessageQueue $mq,
+        MessageSelector $selector,
+        int $offset,
+        int $maxNums,
+        ?PullCallback $callback = null,
+        ?int $timeoutMillis = null,
+    ): void {
+        $this->doPullAsync(
+            $mq,
+            build_pull_subscription_data($mq, null, $selector),
+            $offset,
+            $maxNums,
+            false,
+            $timeoutMillis ?? $this->consumerPullTimeoutMillis,
+            $callback,
+        );
+    }
+
+    /** Asynchronous long-polling pull: the suspend bit goes on and the suspend budget applies. */
+    public function pullBlockIfNotFoundAsync(
+        MessageQueue $mq,
+        string $subExpression,
+        int $offset,
+        int $maxNums,
+        ?PullCallback $callback = null,
+    ): void {
+        $this->doPullAsync(
+            $mq,
+            build_pull_subscription_data($mq, $subExpression),
+            $offset,
+            $maxNums,
+            true,
+            $this->consumerTimeoutMillisWhenSuspend,
+            $callback,
+        );
+    }
+
+    /**
+     * The single asynchronous pull body: same subscription/sysFlag rules as {@see doPull()},
+     * same post-processing (suggested broker, pulled-queue bookkeeping, filter hooks), only the
+     * transport differs.
+     */
+    private function doPullAsync(
+        MessageQueue $mq,
+        SubscriptionData $sub,
+        int $offset,
+        int $maxNums,
+        bool $block,
+        int $timeoutMillis,
+        ?PullCallback $callback,
+    ): void {
+        $client = $this->requireClient();
+        if ($offset < 0) {
+            throw new MQClientException('offset < 0');
+        }
+        if ($maxNums <= 0) {
+            throw new MQClientException('maxNums <= 0');
+        }
+        if ($callback === null) {
+            throw new MQClientException('pullCallback is null');
+        }
+        // The topic of an in-flight pull joins the subscription set the heartbeat registers.
+        $this->registerTopic($mq->topic);
+        $isTag = $sub->expressionType === ExpressionType::TAG;
+        // The class-filter bit stays clear here too, and a tag subscription keeps version 0.
+        $sysFlag = PullSysFlag::buildSysFlag(false, $block, true, false);
+        $key = self::mqKey($mq);
+        $client->pullMessageAsync(
+            function (?PullResult $result, ?\Throwable $failure) use ($callback, $mq, $key, $block): void {
+                try {
+                    if ($result === null) {
+                        $callback->onException($failure ?? new MQClientException('pullAsync unknown exception'));
+                        return;
+                    }
+                    $this->pullFromWhichNode[$key] = $result->suggestWhichBrokerId ?? MixAll::MASTER_ID;
+                    if (!$block) {
+                        $this->pulledQueues[$key] = $mq;
+                    }
+                    if ($result->status === PullStatus::FOUND && $result->msgFoundList !== []) {
+                        $result->msgFoundList = $this->filterMessagesForDelivery($mq, $result->msgFoundList);
+                    }
+                    $callback->onSuccess($result);
+                } catch (\Throwable $inner) {
+                    $callback->onException($inner);
+                }
+            },
+            $this->consumerGroup,
+            $mq,
+            $offset,
+            $maxNums,
+            $sysFlag,
+            0,
+            $sub->subString ?? '*',
+            $isTag ? 0 : $sub->subVersion,
+            $sub->expressionType,
+            timeoutMillis: $timeoutMillis,
+            maxMsgBytes: -1,
+            suspendTimeoutMillis: $block ? $this->brokerSuspendMaxTimeMillis : 15000,
+            brokerId: $this->pullFromWhichNode[$key] ?? MixAll::MASTER_ID,
+        );
+    }
+
+    /**
+     * Read the responses the asynchronous pulls are waiting for, up to the given pump budget.
+     * Callbacks fire from inside this call; it returns as soon as nothing is in flight.
+     */
+    public function pumpAsyncPulls(int $timeoutMillis = 20): void
+    {
+        $this->requireClient()->remotingClient->waitResponses($timeoutMillis);
+    }
 
     public function fetchConsumeOffset(MessageQueue $mq): ?int
     {
@@ -865,6 +1064,29 @@ final class DefaultLitePullConsumer
     }
 
     /**
+     * Selector flavour of {@see subscribe()}: the expression type travels with the subscription,
+     * so a SQL92 expression is both reported to the broker as SQL92 in the heartbeat and pulled
+     * with expressionType=SQL92 instead of being parsed as a tag list.
+     */
+    public function subscribeWithSelector(string $topic, MessageSelector $selector): void
+    {
+        $this->assignMode = false;
+        $ns = $this->withNamespace($topic);
+        $sub = build_selector_subscription_data($ns, $selector);
+        $this->subscription[$ns] = $sub->subString ?? '*';
+        $this->subscriptionData[$ns] = $sub;
+    }
+
+    /** Selector flavour of {@see setSubExpressionForAssign()} (same expression-type rule). */
+    public function setSubExpressionForAssignWithSelector(string $topic, MessageSelector $selector): void
+    {
+        $ns = $this->withNamespace($topic);
+        $sub = build_selector_subscription_data($ns, $selector);
+        $this->assignSubExpr[$ns] = $sub->subString ?? '*';
+        $this->subscriptionData[$ns] = $sub;
+    }
+
+    /**
      * assign mode: queues are specified explicitly, no rebalance.
      *
      * @param list<MessageQueue> $messageQueues
@@ -1106,6 +1328,20 @@ final class DefaultLitePullConsumer
     }
 
     /**
+     * The SubscriptionData a pull of this topic reports: the stored one (built by subscribe /
+     * subscribeWithSelector / setSubExpressionForAssign) when present, otherwise the raw
+     * expression parsed as a tag subscription.
+     */
+    private function subscriptionDataFor(string $topic): SubscriptionData
+    {
+        $stored = $this->subscriptionData[$topic] ?? null;
+        if ($stored instanceof SubscriptionData && $stored->topic === $topic) {
+            return $stored;
+        }
+        return parse_tag_subscription($topic, $this->subscriptionFor($topic) ?: '*');
+    }
+
+    /**
      * One pull of a single queue: short polling; FOUND/NO_NEW_MSG/NO_MATCHED_MSG/
      * OFFSET_ILLEGAL all advance the pull cursor to nextBeginOffset; brake: **in-flight
      * results must not overwrite just-seeked / just-removed offsets** (is the cursor still
@@ -1119,11 +1355,11 @@ final class DefaultLitePullConsumer
             $offset = $this->resolveInitialOffset($mq);
             $this->nextOffset[$key] = $offset;
         }
-        $sub = $this->subscriptionFor($mq->topic) ?: '*';
-        // Short polling (suspend=False); lite_pull=True sets FLAG_LITE_PULL_MESSAGE,
-        // switching the request code to LITE_PULL_MESSAGE(361).
-        $sysFlag = PullSysFlag::buildSysFlag(false, false, true, false, true);
         try {
+            $sub = $this->subscriptionDataFor($mq->topic);
+            // Short polling (suspend=False); lite_pull=True sets FLAG_LITE_PULL_MESSAGE,
+            // switching the request code to LITE_PULL_MESSAGE(361).
+            $sysFlag = PullSysFlag::buildSysFlag(false, false, true, false, true);
             $result = $this->requireClient()->pullMessage(
                 $this->consumerGroup,
                 $mq,
@@ -1131,9 +1367,9 @@ final class DefaultLitePullConsumer
                 $this->pullBatchSize,
                 $sysFlag,
                 0,
-                $sub,
-                0,
-                ExpressionType::TAG,
+                $sub->subString ?? '*',
+                $sub->expressionType === ExpressionType::TAG ? 0 : $sub->subVersion,
+                $sub->expressionType,
                 timeoutMillis: 30000,
                 maxMsgBytes: -1,
                 suspendTimeoutMillis: 15000,
@@ -1147,38 +1383,15 @@ final class DefaultLitePullConsumer
             $this->nextOffset[$key] = $result->nextBeginOffset;
         }
         if ($intact && $result->status === PullStatus::FOUND && $result->msgFoundList !== []) {
-            $msgs = $this->filterTags($mq->topic, $result->msgFoundList, $sub);
+            // Client-side second filtering only exists for tag subscriptions: a SQL92 /
+            // class-filter match is decided by the broker alone.
+            $msgs = client_side_tag_filter($sub, $result->msgFoundList);
             if ($msgs !== []) {
                 $this->enqueue($msgs);
                 return true;
             }
         }
         return false;
-    }
-
-    /** @param list<MessageExt> $msgs @return list<MessageExt> */
-    private function filterTags(string $topic, array $msgs, string $sub): array
-    {
-        if ($sub === '' || $sub === '*') {
-            return $msgs;
-        }
-        try {
-            $subData = FilterAPI::buildSubscriptionData($topic, $sub);
-        } catch (\Throwable) {
-            return $msgs;
-        }
-        if ($subData->tagsSet === []) {
-            return $msgs;
-        }
-        $kept = [];
-        foreach ($msgs as $m) {
-            $tag = $m->getTags();
-            // WARNING: tagsSet is a list, not a map: isset($tagsSet[$tag]) always misses (same as ConsumerSupport).
-            if ($tag !== null && in_array($tag, $subData->tagsSet, true)) {
-                $kept[] = $m;
-            }
-        }
-        return $kept;
     }
 
     /** @param list<MessageExt> $msgs */

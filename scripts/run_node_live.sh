@@ -1,7 +1,7 @@
 #!/bin/bash
 # Live verification entry point for the Node.js client (mirrors the approach of run_go_*_live.sh / run_php_live.sh).
 #
-# Usage: bash scripts/run_node_live.sh producer|consumer|pull|lite_pull|admin|pop|request_reply|admin_ns|acl|tls|check_config|fixes2 [namesrv]
+# Usage: bash scripts/run_node_live.sh producer|consumer|pull|lite_pull|admin|pop|request_reply|admin_ns|acl|tls|check_config|fixes2|batch|slave [namesrv]
 #
 # Cluster: assumes one is already running by default (both ns+broker ports reachable). If not,
 # this script starts its own (finds pids with jps for cleanup, stopping only the instance it
@@ -42,7 +42,8 @@ case "$WHICH" in
   check_config)  EXAMPLE="examples/live_check_client_config.ts" ;;
   fixes2)        EXAMPLE="examples/live_fixes2.ts"              ;;
   slave)         EXAMPLE="examples/live_slave_only.ts"          ;;
-  *) echo "unknown example: $WHICH (producer|consumer|pull|lite_pull|admin|pop|request_reply|admin_ns|acl|tls|check_config|fixes2|slave)" >&2 ; exit 2 ;;
+  batch)         EXAMPLE="examples/live_auto_batch.ts"          ;;
+  *) echo "unknown example: $WHICH (producer|consumer|pull|lite_pull|admin|pop|request_reply|admin_ns|acl|tls|check_config|fixes2|batch|slave)" >&2 ; exit 2 ;;
 esac
 
 port_open() {

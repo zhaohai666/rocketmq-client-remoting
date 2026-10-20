@@ -7,13 +7,35 @@ namespace RocketMQ\Client;
 use RocketMQ\Common\Message;
 use RocketMQ\Common\MessageExt;
 
-final class OpenTracingHook implements SendMessageHook, ConsumeMessageHook
+/**
+ * OpenTracing hook trio for the message lifecycle (Pub / SubBefore / EndTransaction), reporting
+ * with the documented trace key set (see TraceConstants) and the ``Topic <name> <Operation>``
+ * operation-name style (see TraceType).
+ *
+ * Registration is through the ordinary hook lists, so every method really runs:
+ *   - Producer::registerSendMessageHook()     -> sendMessageBefore / sendMessageAfter
+ *   - Producer::registerEndTransactionHook()  -> endTransaction
+ *   - PushConsumer::registerConsumeMessageHook() -> consumeMessageBefore / consumeMessageAfter
+ *
+ * Nothing here touches the message body or its properties except the one carrier property
+ * written on the send side (CARRIER_PROP), which is what the cross-process link rides on.
+ */
+final class OpenTracingHook implements SendMessageHook, ConsumeMessageHook, EndTransactionHook
 {
     /** Message property name for cross-process propagation (JSON-encoded tracer carrier). */
     public const CARRIER_PROP = 'OT_CARRIER';
 
-    public const OP_SEND = 'RocketMQ/send';
-    public const OP_CONSUME = 'RocketMQ/consume';
+    /** Operation-name style: ``Topic <name> <Operation>`` (Operation is the trace type value). */
+    public const OP_NAME_TEMPLATE = 'Topic %s %s';
+
+    /** Extra keys of the documented set that have no dedicated constant (same ``rocketmq.`` namespace). */
+    public const TAG_PRODUCER_GROUP = 'rocketmq.producer_group';
+    public const TAG_CONSUMER_GROUP = 'rocketmq.consumer_group';
+    public const TAG_BROKER_ADDR = 'rocketmq.broker_addr';
+    public const TAG_SEND_STATUS = 'rocketmq.send_status';
+    public const TAG_CONSUME_STATUS = 'rocketmq.status';
+    public const TAG_QUEUE_OFFSET = 'rocketmq.queue_offset';
+    public const TAG_MESSAGE_QUEUE = 'rocketmq.mq';
 
     /** @var \SplObjectStorage<object,object> Message -> in-flight send span */
     private \SplObjectStorage $sendSpans;
@@ -39,6 +61,12 @@ final class OpenTracingHook implements SendMessageHook, ConsumeMessageHook
         return 'OpenTracingHook';
     }
 
+    /** ``Topic <name> <Operation>``: the operation part is the trace-type value (Pub / SubBefore / EndTransaction). */
+    public static function operationName(string $topic, TraceType $traceType): string
+    {
+        return sprintf(self::OP_NAME_TEMPLATE, $topic, $traceType->value);
+    }
+
     // ------------------------------------------------ Send side
 
     public function sendMessageBefore(SendMessageContext $context): void
@@ -52,19 +80,20 @@ final class OpenTracingHook implements SendMessageHook, ConsumeMessageHook
         $prevCtx = $this->extractCarrier($msg);
         $options = [
             'tags' => [
-                'messaging.system' => 'rocketmq',
-                'messaging.destination' => $msg->getTopic(),
-                'messaging.operation' => 'send',
-                'component' => 'rocketmq-php-client',
+                TraceConstants::ROCKETMQ_SERVICE => TraceConstants::ROCKETMQ_SERVICE,
+                TraceConstants::ROCKETMQ_TAGS => (string) ($msg->getTags() ?? ''),
+                TraceConstants::ROCKETMQ_KEYS => (string) ($msg->getKeys() ?? ''),
+                TraceConstants::ROCKETMQ_BODY_LENGTH => strlen((string) $msg->getBody()),
+                TraceConstants::ROCKETMQ_MSG_TYPE => $context->msgType->name,
+                self::TAG_PRODUCER_GROUP => $context->producerGroup,
             ],
         ];
         if ($prevCtx !== null) {
             $options['refs'] = [$prevCtx];
         }
-        $span = $this->tracer->startSpan(self::OP_SEND, $options);
-        $span->setTag('producerGroup', $context->producerGroup);
+        $span = $this->tracer->startSpan(self::operationName($msg->getTopic(), TraceType::PUB), $options);
         if ($context->brokerAddr !== '') {
-            $span->setTag('brokerAddr', $context->brokerAddr);
+            $span->setTag(self::TAG_BROKER_ADDR, $context->brokerAddr);
         }
         // context injected into message properties, travels with the message to the broker (in-band propagation besides zipkin/OTLP)
         $carrier = [];
@@ -83,17 +112,18 @@ final class OpenTracingHook implements SendMessageHook, ConsumeMessageHook
         }
         $span = $this->sendSpans[$msg];
         $this->sendSpans->detach($msg);
+        $span->setTag(TraceConstants::ROCKETMQ_SUCCESS, $context->exception === null);
         if ($context->exception !== null) {
             $span->setTag('error', true);
             $span->log(['event' => 'error', 'error.object' => $context->exception::class, 'message' => $context->exception->getMessage()]);
         } else {
             $sr = $context->sendResult;
             if ($sr !== null) {
-                $span->setTag('sendStatus', $sr->sendStatus->name ?? (string) $sr->sendStatus);
+                $span->setTag(self::TAG_SEND_STATUS, $sr->sendStatus->name ?? (string) $sr->sendStatus);
                 if ($sr->msgId !== null) {
-                    $span->setTag('msgId', $sr->msgId);
+                    $span->setTag(TraceConstants::ROCKETMQ_MSG_ID, $sr->msgId);
                 }
-                $span->setTag('queueOffset', $sr->queueOffset);
+                $span->setTag(self::TAG_QUEUE_OFFSET, $sr->queueOffset);
             }
         }
         $span->finish();
@@ -106,12 +136,15 @@ final class OpenTracingHook implements SendMessageHook, ConsumeMessageHook
         if ($this->consumeSpans->contains($context)) {
             return;
         }
+        $first = $context->msgList[0] ?? null;
+        $topic = $first instanceof MessageExt
+            ? $first->topic
+            : (string) ($context->mq?->topic ?? '');
         $options = [
             'tags' => [
-                'messaging.system' => 'rocketmq',
-                'messaging.operation' => 'receive',
-                'messaging.consumer.group' => $context->consumerGroup,
-                'component' => 'rocketmq-php-client',
+                TraceConstants::ROCKETMQ_SERVICE => TraceConstants::ROCKETMQ_SERVICE,
+                TraceConstants::ROCKETMQ_RETRY_TIMERS => (int) ($first?->reconsumeTimes ?? 0),
+                self::TAG_CONSUMER_GROUP => $context->consumerGroup,
             ],
         ];
         $parent = null;
@@ -124,9 +157,9 @@ final class OpenTracingHook implements SendMessageHook, ConsumeMessageHook
         if ($parent !== null) {
             $options['refs'] = [$parent];
         }
-        $span = $this->tracer->startSpan(self::OP_CONSUME, $options);
+        $span = $this->tracer->startSpan(self::operationName($topic, TraceType::SUB_BEFORE), $options);
         if ($context->mq !== null) {
-            $span->setTag('mq', $context->mq->topic . '#' . $context->mq->queueId . '@' . $context->mq->brokerName);
+            $span->setTag(self::TAG_MESSAGE_QUEUE, $context->mq->topic . '#' . $context->mq->queueId . '@' . $context->mq->brokerName);
         }
         $this->consumeSpans[$context] = $span;
     }
@@ -138,10 +171,45 @@ final class OpenTracingHook implements SendMessageHook, ConsumeMessageHook
         }
         $span = $this->consumeSpans[$context];
         $this->consumeSpans->detach($context);
-        $span->setTag('success', $context->success);
+        $span->setTag(TraceConstants::ROCKETMQ_SUCCESS, $context->success);
         if ($context->status !== null) {
-            $span->setTag('status', $context->status);
+            $span->setTag(self::TAG_CONSUME_STATUS, $context->status);
         }
+        $span->finish();
+    }
+
+    // ------------------------------------------------ Transaction commit / rollback side
+
+    /**
+     * One closed span per END_TRANSACTION leg: the transaction identity is reported with the
+     * documented keys, and the message is left untouched (no carrier is written here -- the send
+     * side already injected it).
+     */
+    public function endTransaction(EndTransactionContext $context): void
+    {
+        $topic = (string) ($context->message?->getTopic() ?? '');
+        $state = $context->transactionState;
+        $span = $this->tracer->startSpan(
+            self::operationName($topic, TraceType::END_TRANSACTION),
+            [
+                'tags' => [
+                    TraceConstants::ROCKETMQ_SERVICE => TraceConstants::ROCKETMQ_SERVICE,
+                    self::TAG_PRODUCER_GROUP => $context->producerGroup,
+                    TraceConstants::ROCKETMQ_TRANSACTION_ID => (string) ($context->transactionId ?? ''),
+                    TraceConstants::ROCKETMQ_TRANSACTION_STATE => $state instanceof \BackedEnum
+                        ? $state->name
+                        : (string) ($state ?? ''),
+                    TraceConstants::ROCKETMQ_IS_FROM_TRANSACTION_CHECK => $context->fromTransactionCheck,
+                ],
+            ],
+        );
+        if ($context->msgId !== null) {
+            $span->setTag(TraceConstants::ROCKETMQ_MSG_ID, $context->msgId);
+        }
+        if ($context->brokerAddr !== '') {
+            $span->setTag(self::TAG_BROKER_ADDR, $context->brokerAddr);
+        }
+        $span->setTag(TraceConstants::ROCKETMQ_SUCCESS, true);
         $span->finish();
     }
 

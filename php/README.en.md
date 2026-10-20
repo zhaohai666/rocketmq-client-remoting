@@ -281,6 +281,21 @@ while (true) {
 Offsets commit automatically by default (`autoCommit`); you can also call `commit()` or
 `commit($offsets, persist: false)` manually, and `pause()` / `resume()` per queue.
 
+A subscription expression can also be given as a selector (`push`'s `subscribe`, lite's
+`subscribe` / `setSubExpressionForAssign` and the pull side's `pull` / `pullBlockIfNotFound` each have
+a `*WithSelector` / `pullBySelector` sibling): `MessageSelector::byTag('TagA||TagB')` is wire-identical
+to the string spelling, while `MessageSelector::bySql("color = 'red'")` puts the expression on the
+request header verbatim (`expressionType=SQL92`, `subVersion` the subscription's own version) and skips
+the client-side tag second pass — parsing a SQL expression as a tag list locally would drop every
+message the broker had already selected.
+
+```php
+use RocketMQ\Client\MessageSelector;
+
+$lite->subscribeWithSelector('TopicDemo', MessageSelector::bySql("color = 'red' AND weight > 10"));
+$pulled->pullBySelector($mq, MessageSelector::bySql("color = 'red'"), offset: 0, maxNums: 32);
+```
+
 ### Admin
 
 ```php

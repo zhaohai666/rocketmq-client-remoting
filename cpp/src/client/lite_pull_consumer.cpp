@@ -113,11 +113,16 @@ DefaultLitePullConsumer::allocateMessageQueueStrategy() const {
 
 // ---------------------------------------------------------------- Subscribe / assign
 void DefaultLitePullConsumer::subscribe(const std::string& topic, const std::string& subExpression) {
+    subscribe(topic, MessageSelector::byTag(subExpression));
+}
+
+void DefaultLitePullConsumer::subscribe(const std::string& topic, const MessageSelector& selector) {
     assignMode_ = false;
     std::string ns = withNamespace(topic);
-    subscription_[ns] = subExpression;
+    subscription_[ns] = selector.expression;
     try {
-        subscriptionData_[ns] = FilterAPI::buildSubscriptionData(ns, subExpression);
+        subscriptionData_[ns] =
+            FilterAPI::buildSubscriptionData(ns, selector.expression, selector.type);
     } catch (...) {
         subscriptionData_.erase(ns);
     }
@@ -127,6 +132,15 @@ void DefaultLitePullConsumer::subscribe(const std::string& topic,
                                         const std::string& subExpression,
                                         std::shared_ptr<LiteMessageQueueListener> messageQueueListener) {
     subscribe(topic, subExpression);
+    if (messageQueueListener != nullptr) {
+        std::lock_guard<std::mutex> lk(topicListenerMutex_);
+        topicListeners_[withNamespace(topic)] = std::move(messageQueueListener);
+    }
+}
+
+void DefaultLitePullConsumer::subscribe(const std::string& topic, const MessageSelector& selector,
+                                        std::shared_ptr<LiteMessageQueueListener> messageQueueListener) {
+    subscribe(topic, selector);
     if (messageQueueListener != nullptr) {
         std::lock_guard<std::mutex> lk(topicListenerMutex_);
         topicListeners_[withNamespace(topic)] = std::move(messageQueueListener);
@@ -207,10 +221,16 @@ void DefaultLitePullConsumer::metadataLoop() {
 
 void DefaultLitePullConsumer::setSubExpressionForAssign(const std::string& topic,
                                                        const std::string& subExpression) {
+    setSubExpressionForAssign(topic, MessageSelector::byTag(subExpression));
+}
+
+void DefaultLitePullConsumer::setSubExpressionForAssign(const std::string& topic,
+                                                        const MessageSelector& selector) {
     std::string ns = withNamespace(topic);
-    assignSubExpr_[ns] = subExpression;
+    assignSubExpr_[ns] = selector.expression;
     try {
-        subscriptionData_[ns] = FilterAPI::buildSubscriptionData(ns, subExpression);
+        subscriptionData_[ns] =
+            FilterAPI::buildSubscriptionData(ns, selector.expression, selector.type);
     } catch (...) {
         subscriptionData_.erase(ns);
     }
@@ -404,6 +424,15 @@ std::string DefaultLitePullConsumer::subscriptionFor(const std::string& topic) c
     return "*";
 }
 
+// The subscription this round of pulling is described by: the registered entry when the topic has one
+// (subscribe / setSubExpressionForAssign build it selector-aware, so its expression type and version
+// reach the wire) and the plain tag form of the raw table entry otherwise.
+SubscriptionData DefaultLitePullConsumer::subscriptionDataFor(const std::string& topic) const {
+    auto it = subscriptionData_.find(topic);
+    if (it != subscriptionData_.end()) return it->second;
+    return SubscriptionData(topic, subscriptionFor(topic));
+}
+
 bool DefaultLitePullConsumer::pullOne(const MessageQueue& mq) {
     int64_t offset = 0;
     bool known = false;
@@ -432,7 +461,9 @@ bool DefaultLitePullConsumer::pullOne(const MessageQueue& mq) {
             offset = it->second;
         }
     }
-    std::string sub = subscriptionFor(mq.topic);
+    const SubscriptionData subData = subscriptionDataFor(mq.topic);
+    // The wire expression follows the subscription's own type: a tag subscription sends the compiled
+    // tag form, a selector subscription sends its expression verbatim -- never re-tagged.
     const int32_t sysFlag = PullSysFlag::buildSysFlag(/*commitOffset=*/false,
                                                       /*suspend=*/false,
                                                       /*subscription=*/true,
@@ -440,8 +471,9 @@ bool DefaultLitePullConsumer::pullOne(const MessageQueue& mq) {
                                                       /*litePull=*/true);
     PullResult result;
     try {
-        result = mqClient_->pullMessage(consumerGroup_, mq, offset, pullBatchSize_, sysFlag, 0, sub,
-                                        /*subVersion=*/0, ExpressionType::TAG,
+        result = mqClient_->pullMessage(consumerGroup_, mq, offset, pullBatchSize_, sysFlag, 0,
+                                        FilterAPI::pullExpression(subData),
+                                        FilterAPI::pullSubVersionOf(subData), subData.expressionType,
                                         /*timeoutMillis=*/30000, /*maxMsgBytes=*/-1,
                                         /*suspendTimeoutMillis=*/15000);
     } catch (...) {
@@ -461,7 +493,7 @@ bool DefaultLitePullConsumer::pullOne(const MessageQueue& mq) {
         return false;
     }
     std::vector<MessageExt> msgs = std::move(result.msgFoundList);
-    filterTags(mq.topic, msgs, sub);
+    filterTags(msgs, subData);
     if (msgs.empty()) {
         // Everything was filtered out by the tag: the broker already counts this window as read (the cursor was advanced
         // above), there was simply nothing deliverable - unlike the old behaviour, the same window is not re-pulled in place.
@@ -471,15 +503,12 @@ bool DefaultLitePullConsumer::pullOne(const MessageQueue& mq) {
     return true;
 }
 
-bool DefaultLitePullConsumer::filterTags(const std::string& topic, std::vector<MessageExt>& msgs,
-                                        const std::string& sub) {
-    if (sub.empty() || sub == "*") return true;
-    SubscriptionData subData;
-    try {
-        subData = FilterAPI::buildSubscriptionData(topic, sub);
-    } catch (...) {
-        return true;
-    }
+// The client-side second pass over the tag list (the broker's codeSet hash filter can collide and let a
+// message through). It runs on a tag subscription only: a selector expression is not a tag list, so its
+// tagsSet is empty by construction and nothing is filtered locally -- the broker's filter layer alone
+// decides what this subscription matches.
+bool DefaultLitePullConsumer::filterTags(std::vector<MessageExt>& msgs,
+                                        const SubscriptionData& subData) {
     if (subData.tagsSet.empty()) return true;
     size_t w = 0;
     for (size_t r = 0; r < msgs.size(); ++r) {

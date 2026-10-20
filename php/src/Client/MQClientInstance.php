@@ -23,6 +23,7 @@ use RocketMQ\Common\PullSysFlag;
 use RocketMQ\Common\SubscriptionData;
 use RocketMQ\Common\TopicFilterType;
 use RocketMQ\Remoting\Protocol\AckMessageRequestHeader;
+use RocketMQ\Remoting\Protocol\BatchAckMessageRequestBody;
 use RocketMQ\Remoting\Protocol\ChangeInvisibleTimeRequestHeader;
 use RocketMQ\Remoting\Protocol\ChangeInvisibleTimeResponseHeader;
 use RocketMQ\Remoting\Protocol\CheckClientRequestBody;
@@ -225,6 +226,13 @@ class MQClientInstance
     public int $pollNameServerInterval;
 
     /**
+     * Registration refresh (heartbeat) period, default HEARTBEAT_INTERVAL_MILLIS.
+     * Same reading rule as pollNameServerInterval: taken once at start(), so a facade's
+     * heartbeatIntervalMillis decides the cadence of the beats this instance pumps.
+     */
+    public int $heartbeatIntervalMillis;
+
+    /**
      * VIP channel switch (default false): when true, the broker port is shifted to the dedicated
      * fast port (port - 2) for **sends** and for the offset / lock / offset-search / message-query
      * / consumer-list / client-config / broker-admin family. This port applies it in one place,
@@ -339,10 +347,14 @@ class MQClientInstance
         bool $vipChannelEnabled = false,
         bool $useHeartbeatV2 = false,
         ?SocksProxyConfig $socksProxy = null,
+        int $heartbeatIntervalMillis = self::HEARTBEAT_INTERVAL_MILLIS,
     ) {
         $this->clientId = $clientId;
         $this->nameServerAddrs = array_values($nameServerAddrs);
         $this->pollNameServerInterval = $pollNameServerInterval;
+        $this->heartbeatIntervalMillis = $heartbeatIntervalMillis > 0
+            ? $heartbeatIntervalMillis
+            : self::HEARTBEAT_INTERVAL_MILLIS;
         $this->vipChannelEnabled = $vipChannelEnabled;
         $this->useHeartbeatV2 = $useHeartbeatV2;
         $this->namespaceV2 = $namespaceV2;
@@ -474,7 +486,7 @@ class MQClientInstance
         // The broker forgot everything this clientId registered when the previous session's
         // channel went away, so no broker counts as beaten yet.
         $this->brokersBeaten = [];
-        $this->heartbeatNextRunMillis = $now + self::HEARTBEAT_INTERVAL_MILLIS;
+        $this->heartbeatNextRunMillis = $now + $this->heartbeatIntervalMillis;
 
         $this->pumpStartupOnce();
     }
@@ -544,7 +556,7 @@ class MQClientInstance
         //   group as soon as its channel is gone, so this stage is the only thing that keeps
         //   a producer-only client registered: the producer facade drives no beat itself.
         if ($this->heartbeatNextRunMillis !== null && $now >= $this->heartbeatNextRunMillis) {
-            $this->heartbeatNextRunMillis = $now + self::HEARTBEAT_INTERVAL_MILLIS;
+            $this->heartbeatNextRunMillis = $now + $this->heartbeatIntervalMillis;
             try {
                 $this->heartbeatOnce();
             } catch (\Throwable $e) {
@@ -1732,8 +1744,16 @@ class MQClientInstance
 
     // ---------------- Message pulling ----------------
 
-    public function pullMessage(
-        string $consumerGroup,
+    /**
+     * Resolve the broker address and build the pull frame for one queue.
+     *
+     * This is the whole request-shape logic, shared by the synchronous {@see pullMessage()} and
+     * the asynchronous {@see pullMessageAsync()}: both put **the same** header cells on the wire
+     * (including the commit-offset clearing that a slave answer requires).
+     *
+     * @return array{0: RemotingCommand, 1: string} [request frame, broker address to send it to]
+     */
+    private function preparePullRequest(
         MessageQueue $mq,
         int $queueOffset,
         int $maxMsgNums,
@@ -1742,13 +1762,13 @@ class MQClientInstance
         ?string $subscription,
         int $subVersion,
         ?string $expressionType,
-        int $timeoutMillis = 30000,
-        int $maxMsgBytes = -1,
-        int $suspendTimeoutMillis = 15000,
-        ?string $addr = null,
+        int $maxMsgBytes,
+        int $suspendTimeoutMillis,
+        string $consumerGroup,
         int $requestSource = 0,
+        ?string $addr = null,
         ?int $brokerId = null,
-    ): PullResult {
+    ): array {
         $slave = false;
         if ($addr === null) {
             $route = $this->getTopicRouteData($mq->topic);
@@ -1801,10 +1821,15 @@ class MQClientInstance
         $code = PullSysFlag::hasLitePullFlag($sysFlag)
             ? RequestCode::LITE_PULL_MESSAGE
             : RequestCode::PULL_MESSAGE;
-        $request = RemotingCommand::createRequestCommand($code, $header);
-        // The pull path likewise goes through VIP channel conversion
-        $response = $this->invokeSync($addr, $request, $timeoutMillis);
+        return [RemotingCommand::createRequestCommand($code, $header), $addr];
+    }
 
+    /**
+     * Turn one pull response into a pull result: status mapping, response header cells and the
+     * decoded message list (each message re-stamped with the queue it came from).
+     */
+    private function decodePullResponse(RemotingCommand $response, MessageQueue $mq): PullResult
+    {
         if ($response->code === ResponseCode::SUCCESS) {
             $status = PullStatus::FOUND;
         } elseif ($response->code === ResponseCode::PULL_NOT_FOUND) {
@@ -1834,6 +1859,113 @@ class MQClientInstance
             $respHeader->maxOffset ?? 0,
             $found,
             $respHeader->suggestWhichBrokerId,
+        );
+    }
+
+    public function pullMessage(
+        string $consumerGroup,
+        MessageQueue $mq,
+        int $queueOffset,
+        int $maxMsgNums,
+        int $sysFlag,
+        int $commitOffset,
+        ?string $subscription,
+        int $subVersion,
+        ?string $expressionType,
+        int $timeoutMillis = 30000,
+        int $maxMsgBytes = -1,
+        int $suspendTimeoutMillis = 15000,
+        ?string $addr = null,
+        int $requestSource = 0,
+        ?int $brokerId = null,
+    ): PullResult {
+        [$request, $target] = $this->preparePullRequest(
+            $mq,
+            $queueOffset,
+            $maxMsgNums,
+            $sysFlag,
+            $commitOffset,
+            $subscription,
+            $subVersion,
+            $expressionType,
+            $maxMsgBytes,
+            $suspendTimeoutMillis,
+            $consumerGroup,
+            $requestSource,
+            $addr,
+            $brokerId,
+        );
+        // The pull path likewise goes through VIP channel conversion
+        $response = $this->invokeSync($target, $request, $timeoutMillis);
+        return $this->decodePullResponse($response, $mq);
+    }
+
+    /**
+     * Asynchronous sibling of {@see pullMessage()}: same frame, same address resolution, same
+     * decoding — only the transport differs. The request is written out and this returns right
+     * away; ``$onResult`` fires when the caller pumps the connection (see
+     * {@see \RocketMQ\Remoting\RemotingClient::waitResponses()}).
+     *
+     * A request that cannot be built at all (no route, unknown broker) throws synchronously,
+     * exactly like the pull entry points declare; everything that fails **after** the frame was
+     * written — broker error code, decode failure, transport failure, timeout — goes to
+     * ``$onResult(null, error)``.
+     *
+     * @param callable(?PullResult, ?\Throwable): void $onResult
+     */
+    public function pullMessageAsync(
+        callable $onResult,
+        string $consumerGroup,
+        MessageQueue $mq,
+        int $queueOffset,
+        int $maxMsgNums,
+        int $sysFlag,
+        int $commitOffset,
+        ?string $subscription,
+        int $subVersion,
+        ?string $expressionType,
+        int $timeoutMillis = 30000,
+        int $maxMsgBytes = -1,
+        int $suspendTimeoutMillis = 15000,
+        ?string $addr = null,
+        int $requestSource = 0,
+        ?int $brokerId = null,
+    ): void {
+        [$request, $target] = $this->preparePullRequest(
+            $mq,
+            $queueOffset,
+            $maxMsgNums,
+            $sysFlag,
+            $commitOffset,
+            $subscription,
+            $subVersion,
+            $expressionType,
+            $maxMsgBytes,
+            $suspendTimeoutMillis,
+            $consumerGroup,
+            $requestSource,
+            $addr,
+            $brokerId,
+        );
+        $onSuccess = function (?RemotingCommand $response) use ($onResult, $mq): void {
+            try {
+                if ($response === null) {
+                    throw new MQClientException('pull response is empty');
+                }
+                $onResult($this->decodePullResponse($response, $mq), null);
+            } catch (\Throwable $failure) {
+                $onResult(null, $failure);
+            }
+        };
+        $onFailure = function (\Throwable $failure) use ($onResult): void {
+            $onResult(null, $failure);
+        };
+        $this->remotingClient->invokeAsync(
+            $target,
+            $request,
+            \Closure::fromCallable($onSuccess),
+            \Closure::fromCallable($onFailure),
+            $timeoutMillis,
         );
     }
 
@@ -2166,6 +2298,41 @@ class MQClientInstance
         $header->extraInfo = $extraInfo;
         $header->offset = $offset;
         $request = RemotingCommand::createRequestCommand(RequestCode::ACK_MESSAGE, $header);
+        $response = $this->invokeSync($addr, $request, $timeoutMillis);
+        return $response->code;
+    }
+
+    /**
+     * Confirm a whole POP batch in one round trip (BATCH_ACK_MESSAGE = 200151).
+     *
+     * Every checkpoint that shares retry flag + queueId + checkpoint offset + pop time collapses into
+     * one entry whose bit set marks ``queueOffset - ckQueueOffset``, so a batch costs a single request
+     * instead of one ACK_MESSAGE per message. The request carries **no custom header**: the broker needs
+     * nothing beyond the JSON body. The body's broker name -- and therefore the target address -- comes
+     * from the first extra info, so a batch is single-broker by construction; checkpoints of another
+     * broker must be acknowledged by a separate call. Returns the broker response code.
+     */
+    public function batchAckMessage(
+        string $consumerGroup,
+        string $topic,
+        array $extraInfoList,
+        int $timeoutMillis = 3000,
+        ?string $addr = null,
+    ): int {
+        if ($extraInfoList === []) {
+            throw new MQClientException('batch ack needs at least one extra info');
+        }
+        $body = BatchAckMessageRequestBody::fromExtraInfos($consumerGroup, $topic, $extraInfoList);
+        if ($addr === null) {
+            $first = ExtraInfoUtil::split($extraInfoList[0]);
+            $addr = $this->popAckAddrFor(
+                ExtraInfoUtil::getBrokerName($first),
+                $topic,
+                ExtraInfoUtil::getQueueId($first),
+            );
+        }
+        $request = RemotingCommand::createRequestCommand(RequestCode::BATCH_ACK_MESSAGE, null);
+        $request->body = $body->encode();
         $response = $this->invokeSync($addr, $request, $timeoutMillis);
         return $response->code;
     }

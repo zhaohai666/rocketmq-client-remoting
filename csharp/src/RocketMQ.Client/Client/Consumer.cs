@@ -2995,6 +2995,29 @@ public sealed class DefaultMQPushConsumer
         return true;
     }
 
+    /// <summary>Client-side cache threshold reached: pause this queue's pull
+    /// for a full period before asking the broker again.</summary>
+    internal const int CacheFlowControlBackoffMillis = 100;
+
+    /// <summary>Broker-side flow control (response code 215) is a "busy right
+    /// now" answer, NOT a capacity verdict on this client: retry early instead
+    /// of parking on the general exception backoff.</summary>
+    public const int BrokerFlowControlBackoffMillis = 20;
+
+    /// <summary>General broker-error backoff for the pull loop.</summary>
+    public const int PullExceptionBackoffMillis = 500;
+
+    /// <summary>The backoff the pull loop applies after a pull request was
+    /// answered with an error response code. Shared by the concurrent and the
+    /// orderly path (both run in the same per-queue loop): FLOW_CONTROL(215)
+    /// retries in 20 ms, every other broker error keeps the general 500 ms
+    /// backoff. Public so the decision is pinnable offline without racing a
+    /// timer.</summary>
+    public static int PullBackoffMillisForBrokerResponse(int responseCode) =>
+        responseCode == ResponseCode.FlowControl
+            ? BrokerFlowControlBackoffMillis
+            : PullExceptionBackoffMillis;
+
     private void QueuePullLoop(MessageQueue mq)
     {
         // ⚠ Client() must NOT be used here: Shutdown() sets _started=false
@@ -3084,7 +3107,7 @@ public sealed class DefaultMQPushConsumer
             // one pauses this queue's pulling
             if (FlowControlHit(mq, key))
             {
-                _stopEvent.Wait(TimeSpan.FromMilliseconds(100));
+                _stopEvent.Wait(TimeSpan.FromMilliseconds(CacheFlowControlBackoffMillis));
                 continue;
             }
 
@@ -3153,9 +3176,13 @@ public sealed class DefaultMQPushConsumer
             catch (MQBrokerException e)
             {
                 // TOPIC_NOT_EXIST / PULL_NOT_FOUND etc. are mostly expected
-                // paths (topic not created yet); debug + back off
+                // paths (topic not created yet); debug + back off. A broker
+                // FLOW_CONTROL(215) is the exception: the broker is merely
+                // busy right now, so retry early rather than parking on the
+                // general exception backoff.
                 ClientLog.Debug("pull broker error for " + mq + ": " + e.Message);
-                _stopEvent.Wait(TimeSpan.FromMilliseconds(500));
+                _stopEvent.Wait(TimeSpan.FromMilliseconds(
+                    PullBackoffMillisForBrokerResponse(e.ResponseCode)));
                 continue;
             }
             catch (RemotingTimeoutException e)

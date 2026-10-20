@@ -706,6 +706,83 @@ final class RunClientInstance
         MQClientInstance::removeInstance('tick-cid');
     }
 
+    // ================================================================ 5b. heartbeat interval knob
+
+    /**
+     * The registration pump reads one value, taken when the instance is built: a facade that
+     * beats faster than the broker forgets it must not be put back on the 30s default, and a
+     * nonsense value (0 or less) must not stop the pump either. Everything is asserted against
+     * an injected clock, so the only thing under test is the schedule arithmetic.
+     */
+    private function testHeartbeatIntervalKnob(): void
+    {
+        $base = 1_000_000_000_000;
+
+        // A non-default value is what drives the next beat.
+        $knob = new TickProbeInstance('hb-knob-cid', [], heartbeatIntervalMillis: 5000);
+        $this->checkSame(5000, $knob->heartbeatIntervalMillis, 'the instance keeps the interval it was given');
+        $knob->clock = static fn(): int => $base;
+        $this->checkSame(null, $this->getPrivate($knob, 'heartbeatNextRunMillis'),
+            'nothing is scheduled before start(), so no tick can beat');
+        $knob->tick($base + 10_000_000);
+        $this->checkSame(0, $knob->heartbeatCalls, 'an unstarted instance runs no registration pump');
+        $knob->start();
+        $this->checkSame(1, $knob->heartbeatCalls, 'start() beats once and schedules the next one');
+        $this->checkSame($base + 5000, $this->getPrivate($knob, 'heartbeatNextRunMillis'),
+            'start() anchors the next beat to the given interval, not to the constant');
+
+        $knob->tick($base + 4999);
+        $this->checkSame(1, $knob->heartbeatCalls, 'tick(+4999): the 5s beat is not due yet');
+        $knob->tick($base + 5000);
+        $this->checkSame(2, $knob->heartbeatCalls, 'tick(+5000): the 5s beat is due and runs');
+        $this->checkSame($base + 10000, $this->getPrivate($knob, 'heartbeatNextRunMillis'),
+            'the beat that just ran is rescheduled one interval out, using the knob again');
+        $knob->tick($base + 9999);
+        $this->checkSame(2, $knob->heartbeatCalls, 'tick(+9999): still not due');
+        $knob->tick($base + 10000);
+        $this->checkSame(3, $knob->heartbeatCalls, 'tick(+10000): the second 5s beat runs');
+        $this->checkSame($base + 15000, $this->getPrivate($knob, 'heartbeatNextRunMillis'),
+            'the schedule keeps advancing by the knob, never by the 30s default');
+        $knob->shutdown();
+        $this->checkSame(null, $this->getPrivate($knob, 'heartbeatNextRunMillis'), 'shutdown unschedules the beat');
+        MQClientInstance::removeInstance('hb-knob-cid');
+
+        // Control: no argument means the documented constant.
+        $def = new TickProbeInstance('hb-default-cid', []);
+        $this->checkSame(MQClientInstance::HEARTBEAT_INTERVAL_MILLIS, $def->heartbeatIntervalMillis,
+            'the default interval is the class constant');
+        $this->checkSame(30_000, $def->heartbeatIntervalMillis, 'the default interval is 30s');
+        $def->clock = static fn(): int => $base;
+        $def->start();
+        $this->checkSame($base + 30_000, $this->getPrivate($def, 'heartbeatNextRunMillis'),
+            'the default schedule is anchored 30s out');
+        $def->tick($base + 4999);
+        $this->checkSame(1, $def->heartbeatCalls, 'tick(+4999): another client interval does not leak in');
+        $def->tick($base + 29999);
+        $this->checkSame(1, $def->heartbeatCalls, 'tick(+29999): the default beat is not due yet');
+        $def->tick($base + 30000);
+        $this->checkSame(2, $def->heartbeatCalls, 'tick(+30000): the default beat runs');
+        $def->shutdown();
+        MQClientInstance::removeInstance('hb-default-cid');
+
+        // A value of 0 or less falls back to the constant instead of disabling or spinning the pump.
+        foreach ([0, -1] as $bad) {
+            $cid = 'hb-invalid-' . $bad . '-cid';
+            $fallback = new TickProbeInstance($cid, [], heartbeatIntervalMillis: $bad);
+            $this->checkSame(MQClientInstance::HEARTBEAT_INTERVAL_MILLIS, $fallback->heartbeatIntervalMillis,
+                "interval $bad falls back to the constant");
+            $fallback->clock = static fn(): int => $base;
+            $fallback->start();
+            $this->checkSame(1, $fallback->heartbeatCalls, "interval $bad still beats once at start");
+            $this->checkSame($base + 30_000, $this->getPrivate($fallback, 'heartbeatNextRunMillis'),
+                "interval $bad schedules the constant period, not an immediate re-beat");
+            $fallback->tick($base + 1);
+            $this->checkSame(1, $fallback->heartbeatCalls, "interval $bad does not beat every tick");
+            $fallback->shutdown();
+            MQClientInstance::removeInstance($cid);
+        }
+    }
+
     private function setPrivate(object $obj, string $name, mixed $value): void
     {
         $p = new \ReflectionProperty(MQClientInstance::class, $name);
@@ -1292,6 +1369,7 @@ final class RunClientInstance
         $this->testParseSendResponse();
         $this->testProcessReplyMessage();
         $this->testTickThresholds();
+        $this->testHeartbeatIntervalKnob();
         $this->testRouteCacheAndFallback();
         $this->testPullMessage();
         $this->testPopMessage();

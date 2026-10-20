@@ -7,11 +7,12 @@ from typing import Dict, List, Tuple
 
 import pytest
 
-from client.consumer import DefaultLitePullConsumer
+from client.consumer import DefaultLitePullConsumer, MessageSelector
 from client.consumer_result import PullResult, PullStatus
 from client.exception import MQBrokerException, MQClientException
 from client.mq_client import MQClientInstance
 from common.message import MessageExt, MessageQueue
+from common.subscription_data import ExpressionType
 from common.sysflag import PullSysFlag
 from remoting.protocol.codes import RequestCode, ResponseCode
 from remoting.protocol.heartbeat import ConsumeFromWhere, ConsumeType
@@ -57,6 +58,10 @@ class MockClient:
         self.pull_requests: List[int] = []
         # #107: the sysFlag of every pull -- only the request itself can prove whether the lite bit (0x10) is set.
         self.pull_sys_flags: List[int] = []
+        # The expression type + subString of every pull: the heartbeat alone is not enough -- the
+        # broker only evaluates SQL92 when the **pull request** carries that type.
+        self.pull_expression_types: List[str] = []
+        self.pull_subscriptions: List[str] = []
 
     def start(self) -> None:
         pass
@@ -118,6 +123,8 @@ class MockClient:
                      addr=None, request_source=0) -> PullResult:
         self.pull_requests.append(queue_offset)
         self.pull_sys_flags.append(sys_flag)
+        self.pull_expression_types.append(expression_type)
+        self.pull_subscriptions.append(subscription)
         if self.scripted:
             entry = self.scripted.pop(0)
             # The callable runs "in the middle of a request": it simulates a concurrent seek / queue withdrawal
@@ -790,5 +797,88 @@ class TestLitePullWireContract:
         with pytest.raises(MQBrokerException) as ei:
             self._wire_pull(lite, response=denial)
         assert "for lite pull consumer is forbidden" in str(ei.value)
+
+
+class TestLitePullSelectorExpressionType:
+    """subscribe_with_selector must carry the expression type end-to-end: subscription data ->
+    heartbeat -> pull request. A selector silently degraded to a tag string matches nothing on
+    the broker and then gets dropped by the client-side tag pass as well."""
+
+    def _sql_consumer(self):
+        c = _Lite("LitePG_UT", _store=STORE)
+        c.set_namesrv_addr("127.0.0.1:9876")
+        c.set_auto_commit(False)
+        c.subscribe_with_selector("T", MessageSelector.by_sql("a > 1"))
+        # Wire the in-memory client directly (no start -> no background pull racing the script)
+        c._mq_client = c._mock
+        return c
+
+    def test_sql92_selector_builds_selector_typed_subscription_data(self):
+        c = self._sql_consumer()
+        try:
+            sd = c.subscription_data["T"]
+            assert sd.expression_type == ExpressionType.SQL92
+            assert sd.sub_string == "a > 1"
+            # The SQL text must NOT be parsed as a tag list
+            assert sd.tags_set == set() and sd.code_set == set()
+            cd = list(c._build_heartbeat().consumer_data_set)[0]
+            hb_sub = list(cd.subscription_data_set)[0]
+            assert hb_sub.expression_type == ExpressionType.SQL92
+            assert hb_sub.sub_string == "a > 1"
+        finally:
+            c.shutdown()
+
+    def test_sql92_selector_type_reaches_the_pull_request_and_skips_tag_filter(self):
+        c = self._sql_consumer()
+        try:
+            q0 = MessageQueue("T", "broker-a", 0)
+            c._next_offset[q0] = 0
+            # "B1" carries TagB: a client-side tag pass reading "a > 1" as a tag would drop it.
+            c._mock.scripted.append(PullResult(PullStatus.FOUND, 1, 0, 5,
+                                               [_make_msg("T", "broker-a", 0, 0, "B1")]))
+            assert c._pull_one(q0) is True
+            assert c._mock.pull_expression_types[-1] == ExpressionType.SQL92
+            assert c._mock.pull_subscriptions[-1] == "a > 1"
+            got = c.poll(timeout=500)
+            assert [m.body.decode() for m in got] == ["B1"], \
+                "SQL92 matches are filtered by the broker; the client must deliver them"
+        finally:
+            c.shutdown()
+
+    def test_tag_selector_keeps_tag_semantics(self):
+        # The control: a tag selector behaves exactly like subscribe(topic, tag) -- TAG on the
+        # wire, tagsSet filled for the heartbeat, and the client-side tag pass still applies.
+        c = _Lite("LitePG_UT", _store=STORE)
+        c.set_namesrv_addr("127.0.0.1:9876")
+        c.set_auto_commit(False)
+        c.subscribe_with_selector("T", MessageSelector.by_tag("TagA"))
+        c._mq_client = c._mock
+        try:
+            sd = c.subscription_data["T"]
+            assert sd.expression_type == ExpressionType.TAG
+            assert sd.tags_set == {"TagA"}
+            q0 = MessageQueue("T", "broker-a", 0)
+            c._next_offset[q0] = 0
+            c._mock.scripted.append(PullResult(PullStatus.FOUND, 1, 0, 5,
+                                               [_make_msg("T", "broker-a", 0, 0, "B1")]))
+            assert c._pull_one(q0) is False, "TagB must still be dropped by the client tag pass"
+            assert c._mock.pull_expression_types[-1] == ExpressionType.TAG
+        finally:
+            c.shutdown()
+
+    def test_plain_subscribe_and_unsubscribe_keep_the_type_table_consistent(self):
+        # The control for the default path: subscribe() is TAG, and unsubscribe removes the
+        # type entry too (a stale SQL92 type under a re-subscribed tag would leak to the wire).
+        c = _Lite("LitePG_UT", _store=STORE)
+        c.set_namesrv_addr("127.0.0.1:9876")
+        c.subscribe("T", "TagA")
+        assert c.subscription_expr_type["T"] == ExpressionType.TAG
+        c.unsubscribe("T")
+        assert "T" not in c.subscription_expr_type
+        c.subscribe_with_selector("T", MessageSelector.by_sql("a > 1"))
+        assert c.subscription_expr_type["T"] == ExpressionType.SQL92
+        c.unsubscribe("T")
+        assert "T" not in c.subscription_expr_type
+        c.shutdown()
 
 

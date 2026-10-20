@@ -193,6 +193,22 @@ final class DefaultMQPushConsumer
     /** Route refresh period (passed through only once when start() builds the MQClientInstance). */
     public int $pollNameServerInterval = 30000;
     public int $persistConsumerOffsetInterval = 5000;
+    /**
+     * awaitTerminationMillisWhenShutdown: how many milliseconds shutdown() may spend handing the
+     * batches still waiting in the per-queue buffers to the listener. ``<= 0`` (default) puts no
+     * extra ceiling on that drain -- it runs until the buffers are empty or the round cap below
+     * is reached; a positive value stops it once the budget is spent (what is left stays queued
+     * for the broker's redelivery, exactly as a consume pool that refused to terminate in time).
+     */
+    public int $awaitTerminationMillisWhenShutdown = 0;
+    /**
+     * Batches a single tick hands to the listener (PHP adaptation of the consume pool's throughput
+     * limit; also the chunk size the shutdown drain walks, so a time ceiling can bind mid-backlog).
+     */
+    public int $dispatchBatchesPerTick = 1000;
+    /** Round cap of the shutdown drain: keeps a listener that never accepts its batch from hanging shutdown. */
+    private const SHUTDOWN_DRAIN_MAX_ROUNDS = 64;
+    private const SHUTDOWN_DRAIN_CHUNK_BATCHES = 16;
     private int $heartbeatCount = 0;
 
     // ---- POP mode ----
@@ -359,6 +375,17 @@ final class DefaultMQPushConsumer
     public function setMessageListener(mixed $listener): void
     {
         $this->messageListener = $listener;
+    }
+
+    /** Ceiling in milliseconds that shutdown() spends draining queued consumption; <= 0 = no extra ceiling. */
+    public function setAwaitTerminationMillisWhenShutdown(int $millis): void
+    {
+        $this->awaitTerminationMillisWhenShutdown = $millis;
+    }
+
+    public function getAwaitTerminationMillisWhenShutdown(): int
+    {
+        return $this->awaitTerminationMillisWhenShutdown;
     }
 
     public function setAllocateMessageQueueStrategy(AllocateMessageQueueStrategy $strategy): void
@@ -662,6 +689,9 @@ final class DefaultMQPushConsumer
         if (!$this->started) {
             return;
         }
+        // Consume-side drain comes first: it still needs the live client (offset advancement,
+        // send-back) and must happen before anything is torn down.
+        $this->drainQueuedMessagesOnShutdown();
         $this->started = false;
         if ($this->popAssignmentPoller !== null) {
             $this->mqClient?->unregisterPopAssignmentPoller($this->popAssignmentPoller->key);
@@ -1633,9 +1663,9 @@ final class DefaultMQPushConsumer
      * One dispatch round: hand the queued batches in each queue's pending to the listener
      * (synchronously). The loop body's batch count is bounded, keeping tick controllable.
      */
-    private function dispatchRound(): void
+    private function dispatchRound(?int $budget = null): void
     {
-        $budget = 1000;
+        $budget = $budget ?? max(1, $this->dispatchBatchesPerTick);
         foreach (array_keys($this->pending) as $key) {
             if ($budget <= 0) {
                 return;
@@ -1682,6 +1712,46 @@ final class DefaultMQPushConsumer
                 $budget--;
             }
         }
+    }
+
+    /**
+     * Drain the batches still queued for consumption while shutting down, bounded by
+     * {@see $awaitTerminationMillisWhenShutdown}. The drain walks the buffers in chunks so a
+     * positive ceiling can bind in the middle of a backlog instead of only after all of it;
+     * ``<= 0`` adds no time ceiling and leaves only the round cap (a listener that keeps
+     * rejecting its batch must not hang shutdown).
+     */
+    private function drainQueuedMessagesOnShutdown(): void
+    {
+        if ($this->pending === [] || $this->messageListener === null) {
+            return;
+        }
+        $ceiling = $this->awaitTerminationMillisWhenShutdown;
+        $beginMs = UtilAll::currentTimeMillis();
+        for ($round = 0; $round < self::SHUTDOWN_DRAIN_MAX_ROUNDS; $round++) {
+            if ($this->pending === []) {
+                return;
+            }
+            $this->dispatchRound(self::SHUTDOWN_DRAIN_CHUNK_BATCHES);
+            if ($ceiling > 0 && UtilAll::currentTimeMillis() - $beginMs >= $ceiling) {
+                Logger::info(sprintf(
+                    'shutdown drain stopped by awaitTerminationMillisWhenShutdown=%dms, %d message(s) left queued',
+                    $ceiling,
+                    $this->queuedMessageCount(),
+                ));
+                return;
+            }
+        }
+    }
+
+    /** Total messages waiting in the per-queue buffers. */
+    private function queuedMessageCount(): int
+    {
+        $n = 0;
+        foreach ($this->pending as $dq) {
+            $n += is_array($dq) ? count($dq) : 0;
+        }
+        return $n;
     }
 
     private function resetRetryTopicAndNamespace(array $msgs): void

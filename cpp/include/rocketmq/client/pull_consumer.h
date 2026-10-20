@@ -119,6 +119,15 @@ public:
                     int64_t offset = 0, int32_t maxNums = 32, int32_t timeoutMillis = -1);
     PullResult pullBlockIfNotFound(const MessageQueue& mq, const std::string& subExpression,
                                    int64_t offset, int32_t maxNums);
+    // Same pulls driven by a subscription selector: the request carries the subscription's own
+    // expression type and its raw expression. A tag selector reproduces the string form exactly (the
+    // expression is parsed into tagsSet / codeSet and subVersion stays 0); a selector such as SQL92
+    // sends the expression verbatim with the version the subscription was built with, and tagsSet /
+    // codeSet stay empty so no client-side re-filter runs on it.
+    PullResult pull(const MessageQueue& mq, const MessageSelector& selector, int64_t offset = 0,
+                    int32_t maxNums = 32, int32_t timeoutMillis = -1);
+    PullResult pullBlockIfNotFound(const MessageQueue& mq, const MessageSelector& selector,
+                                   int64_t offset, int32_t maxNums);
 
     // Async pull (DefaultMQPullConsumer.pull(mq, subExpression, offset, maxNums, PullCallback, timeout)):
     // returns at once; a worker thread runs the very same synchronous pull kernel and the callback pool
@@ -127,6 +136,11 @@ public:
     // Not started / null callback throw synchronously; after shutdown() the in-flight requests are drained,
     // and a late pullAsync throws instead of dropping the callback silently.
     void pullAsync(const MessageQueue& mq, const std::string& subExpression, int64_t offset,
+                   int32_t maxNums, std::shared_ptr<PullCallback> callback,
+                   int32_t timeoutMillis = -1);
+    // Async pull of a selector subscription: the worker runs the selector-shaped pull kernel above,
+    // so the delivery contract (exactly once) and the wire shape are identical to the synchronous call.
+    void pullAsync(const MessageQueue& mq, const MessageSelector& selector, int64_t offset,
                    int32_t maxNums, std::shared_ptr<PullCallback> callback,
                    int32_t timeoutMillis = -1);
 

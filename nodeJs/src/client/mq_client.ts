@@ -46,6 +46,7 @@ import {
   MQClientException, MQBrokerException, RemotingException,
 } from '../remoting/exception.ts';
 import { SendResult } from './send_result.ts';
+import { EndTransactionContext, hookRegistry } from './hook.ts';
 import { ConsumerStatsManager } from './consumer_stats.ts';
 import { REQUEST_FUTURE_HOLDER } from './request_reply.ts';
 import { decompressFor } from '../common/compress.ts';
@@ -119,6 +120,11 @@ export class MQClient {
   consumerTable: Map<string, any>;
   producerTable: Map<string, any>;
   heartbeatIntervalMillis: number;
+  // Route-refresh period, mirrored from the admin facade's configuration at
+  // registration. The route timer and the heartbeat timer read these two
+  // instance-level values — the facades pass their config in ONCE, they do not
+  // each re-drive the timers.
+  pollNameServerIntervalMillis: number;
   // Heartbeat V2. Off by default; a broker only answers the V2 flags when the
   // beat carries a non-zero fingerprint, and a beat with fingerprint 0 makes it
   // take its plain registration path, exactly as before.
@@ -183,6 +189,7 @@ export class MQClient {
     this.consumerTable = new Map();
     this.producerTable = new Map();
     this.heartbeatIntervalMillis = 30 * 1000;
+    this.pollNameServerIntervalMillis = 30 * 1000;
     this.useHeartbeatV2 = false;
     this.vipChannelEnabled = false;
     this._brokerSupportV2HeartbeatSet = new Set();
@@ -1151,7 +1158,40 @@ export class MQClient {
     }
   }
 
-  // Route refresh every pollNameServerInterval (30s), initial delay 10s.
+  // Runtime knob for the beat period of the instance-level heartbeat loop, in
+  // milliseconds (must be > 0). The facades pass their configured value in at
+  // registration; when the loop is already running the interval timer is
+  // rebuilt so the new period takes effect from the next tick.
+  setHeartbeatIntervalMillis(ms: number): void {
+    if (!Number.isFinite(ms) || ms <= 0) {
+      throw new Error(`heartbeatIntervalMillis must be > 0, got ${ms}`);
+    }
+    this.heartbeatIntervalMillis = Math.floor(ms);
+    if (this._heartbeatTimer != null) {
+      clearInterval(this._heartbeatTimer);
+      this._heartbeatTimer = setInterval(() => { void this.sendHeartbeatToAllBrokers(); },
+        this.heartbeatIntervalMillis);
+      if (typeof (this._heartbeatTimer as any).unref === 'function') this._heartbeatTimer.unref();
+    }
+  }
+
+  // Runtime knob for the route-refresh period, in milliseconds (must be > 0).
+  // The 10s initial delay of the refresh loop is a documented constant and is
+  // left alone; only the interval timer is rebuilt.
+  setPollNameServerIntervalMillis(ms: number): void {
+    if (!Number.isFinite(ms) || ms <= 0) {
+      throw new Error(`pollNameServerIntervalMillis must be > 0, got ${ms}`);
+    }
+    this.pollNameServerIntervalMillis = Math.floor(ms);
+    if (this._routeTimer != null) {
+      clearInterval(this._routeTimer);
+      this._routeTimer = setInterval(() => { void this.updateAllTopicRoutesFromNameServer(); },
+        this.pollNameServerIntervalMillis);
+      if (typeof this._routeTimer.unref === 'function') this._routeTimer.unref();
+    }
+  }
+
+  // Route refresh every pollNameServerInterval (default 30s), initial delay 10s.
   // Refreshes the route
   // of EVERY topic the consumers subscribe to and the producers publish to —
   // without this, a route registered at the nameserver AFTER the client cached
@@ -1163,7 +1203,7 @@ export class MQClient {
     const beat = () => { void this.updateAllTopicRoutesFromNameServer(); };
     const initial = setTimeout(beat, 10_000);
     if (typeof initial.unref === 'function') initial.unref();
-    this._routeTimer = setInterval(beat, 30_000);
+    this._routeTimer = setInterval(beat, this.pollNameServerIntervalMillis);
     if (typeof this._routeTimer.unref === 'function') this._routeTimer.unref();
     this._routeInitialTimer = initial;
   }
@@ -1193,7 +1233,9 @@ export class MQClient {
     if (refreshed) void this.sendHeartbeatToAllBrokers();
   }
 
-  // Client-level heartbeat beat every 30s (+ an early beat at start). Without
+  // Client-level heartbeat beat every heartbeatIntervalMillis (default 30s;
+  // configurable — the facades pass their value in at registration) + an early
+  // beat at start. Without
   // it the broker's ProducerManager has no channel for the producer group and
   // can never send CHECK_TRANSACTION_STATE back — the transaction check-back
   // path silently dies ("Check transaction failed, channel table is empty").
@@ -1201,7 +1243,8 @@ export class MQClient {
   private _startHeartbeatLoop(): void {
     if (this._heartbeatTimer != null) return;
     void this.sendHeartbeatToAllBrokers();
-    this._heartbeatTimer = setInterval(() => { void this.sendHeartbeatToAllBrokers(); }, 30_000);
+    this._heartbeatTimer = setInterval(() => { void this.sendHeartbeatToAllBrokers(); },
+      this.heartbeatIntervalMillis);
     if (typeof (this._heartbeatTimer as any).unref === 'function') this._heartbeatTimer.unref();
   }
 
@@ -1270,9 +1313,25 @@ export class MQClient {
           else if (state === 1) header.commitOrRollback = MessageSysFlag.TRANSACTION_ROLLBACK_TYPE;
           else header.commitOrRollback = MessageSysFlag.TRANSACTION_NOT_TYPE;
           const request = RemotingCommand.createRequestCommand(RequestCode.END_TRANSACTION, header);
-          this.remotingClient.invokeOneway(addr, request).catch((e) => {
-            logger.warning('transaction check END_TRANSACTION oneway failed: %s', (e as Error).message);
-          });
+          // EndTransactionHook wraps the check-back commit/rollback dispatch
+          // with the same before/after discipline the send path applies to
+          // SendMessageHook.
+          const endCtx = new EndTransactionContext(group, msg, addr);
+          endCtx.msgId = header.msgId != null ? String(header.msgId) : null;
+          endCtx.transactionId = header.transactionId;
+          endCtx.transactionState = state;
+          endCtx.fromTransactionCheck = true;
+          const endHooks = hookRegistry.endTransactionHooks;
+          for (const hook of endHooks) hook.endTransactionBefore(endCtx);
+          try {
+            this.remotingClient.invokeOneway(addr, request).catch((e) => {
+              logger.warning('transaction check END_TRANSACTION oneway failed: %s', (e as Error).message);
+            });
+          } catch (e) {
+            for (const hook of endHooks) hook.endTransactionAfter(endCtx);
+            throw e;
+          }
+          for (const hook of endHooks) hook.endTransactionAfter(endCtx);
         } catch (e) {
           logger.warning('transaction check listener raised: %s', (e as Error).message);
         }

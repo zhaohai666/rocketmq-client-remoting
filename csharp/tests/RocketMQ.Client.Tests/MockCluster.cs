@@ -224,6 +224,21 @@ internal sealed class MockCluster : IDisposable
 
     private readonly Dictionary<int, Func<RemotingCommand, byte[]>> _replyBodies = new();
 
+    private readonly Dictionary<int, int> _replyCodes = new();
+
+    /// <summary>
+    /// Scripts the response code of one request code (every broker answers it that way).
+    /// For primitives whose contract is "the caller sees the broker code verbatim": the
+    /// generic SUCCESS answer cannot prove a non-success is neither swallowed nor thrown.
+    /// </summary>
+    public void SetReplyCode(int code, int replyCode)
+    {
+        lock (_gate)
+        {
+            _replyCodes[code] = replyCode;
+        }
+    }
+
     private Func<RemotingCommand, byte[]>? _routeBodyFor;
 
     /// <summary>
@@ -476,9 +491,11 @@ internal sealed class MockCluster : IDisposable
         if (!IsSendCode(req.Code))
         {
             Func<RemotingCommand, byte[]>? bodyFor;
+            int scriptedCode;
             lock (_gate)
             {
                 _replyBodies.TryGetValue(req.Code, out bodyFor);
+                scriptedCode = _replyCodes.TryGetValue(req.Code, out int c) ? c : ResponseCode.Success;
             }
 
             if (bodyFor is not null && !req.IsOnewayRpc())
@@ -489,8 +506,18 @@ internal sealed class MockCluster : IDisposable
                 return withBody;
             }
 
+            if (req.IsOnewayRpc())
+            {
+                return null;
+            }
+
+            if (scriptedCode != ResponseCode.Success)
+            {
+                return Respond(req, scriptedCode, "mock failure");
+            }
+
             // Heartbeats and other non-send requests are always answered successfully, do not let the background thread get stuck on an error
-            return req.IsOnewayRpc() ? null : Respond(req, ResponseCode.Success, null);
+            return Respond(req, ResponseCode.Success, null);
         }
 
         int code;

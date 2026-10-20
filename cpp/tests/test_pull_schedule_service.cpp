@@ -67,6 +67,7 @@ void expectInt(long long actual, long long expected, const std::string& name,
                const std::string& detail = "") {
     ++checks;
     if (actual != expected) {
+        ++fails;
         std::printf("FAIL %s (actual=%lld expected=%lld) %s\n", name.c_str(), actual, expected,
                     detail.c_str());
     }

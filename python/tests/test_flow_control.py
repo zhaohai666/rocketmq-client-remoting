@@ -7,8 +7,17 @@
 #
 # This file locks the offline semantics of flow-control judgment: the hit direction and units of the five gates are pinned one by one.
 # For the real-machine side, "no message is lost after a gate hits", see ../verify_flow_control_live.py.
-from client.consumer import DefaultMQPushConsumer
+import threading
+import time
+
+from client import consumer as consumer_mod
+from client.consumer import (DefaultMQPushConsumer, PopProcessQueue,
+                             PULL_TIME_DELAY_WHEN_BROKER_FLOW_CONTROL,
+                             PULL_TIME_DELAY_WHEN_EXCEPTION)
+from client.exception import MQBrokerException
 from common.message import MessageExt, MessageQueue
+from common.subscription_data import SubscriptionData
+from remoting.protocol.codes import ResponseCode
 
 TOPIC = "FlowControlPyUnitTopic"
 OTHER_TOPIC = "FlowControlPyUnitOther"
@@ -173,3 +182,100 @@ def test_one_hit_counts_one_tick_even_when_every_gate_matches():
     _stage(c, q1, [_sized(TOPIC, 2 * MIB, 0)])
     assert _hit(c, q0)
     assert c._flow_control_triggered == 1
+
+
+# ---------------- Broker FLOW_CONTROL(215) vs the generic pull/pop error backoff ----------------
+# The client's own threshold pause and the broker's answer are two different stalls:
+# 215 is transient producer-side throttling (retry in 20ms), every other broker error keeps the
+# 500ms generic backoff. Folding both into one delay either hammers a throttled broker or needlessly
+# stalls a healthy queue behind an 11x-longer wait.
+
+def _drive_loop(monkeypatch, loop_attr, client_method, errors, c, mq, key, setup=None):
+    """Run the real loop against a client that keeps failing; return the recorded backoffs.
+
+    The loop stops once the scripted errors are exhausted (the last recorded backoff sets the
+    stop flag), so the assertion gates on recorded state, not on a wall-clock window.
+    """
+    pending = list(errors)
+    delays = []
+
+    class _Client(object):
+        def __getattr__(self, name):
+            if name == client_method:
+                def _fail(*a, **k):
+                    raise pending.pop(0)
+                return _fail
+            raise AttributeError(name)
+
+    real_time = time
+
+    class _FakeTime(object):
+        def __getattr__(self, name):
+            return getattr(real_time, name)
+
+        def sleep(self, seconds):
+            delays.append(seconds)
+            if not pending:
+                c._stop.set()
+
+    c._mq_client = _Client()
+    if setup is not None:
+        setup()
+    monkeypatch.setattr(consumer_mod, "time", _FakeTime())
+    th = threading.Thread(target=getattr(c, loop_attr), args=(mq,), daemon=True)
+    c._queue_threads[key] = th
+    th.start()
+    deadline = real_time.time() + 10
+    while th.is_alive() and real_time.time() < deadline:
+        real_time.sleep(0.01)
+    c._stop.set()
+    th.join(timeout=5)
+    assert not pending, "the scripted errors must all be consumed"
+    return delays
+
+
+def _error_loop_consumer(group):
+    c = DefaultMQPushConsumer(group)
+    c._started = True
+    mq = _queue()
+    key = c._mq_key(mq)
+    c.subscription_data = {mq.topic: SubscriptionData(topic=mq.topic, sub_string="*")}
+    c._offset_table[key] = 0
+    return c, mq, key
+
+
+def test_broker_flow_control_pull_retries_in_20ms_other_codes_keep_500ms(monkeypatch):
+    assert PULL_TIME_DELAY_WHEN_BROKER_FLOW_CONTROL == 0.02
+    assert PULL_TIME_DELAY_WHEN_EXCEPTION == 0.5
+    c, mq, key = _error_loop_consumer("G_fc_broker_pull")
+    delays = _drive_loop(monkeypatch, "_queue_pull_loop", "pull_message",
+                         [MQBrokerException(ResponseCode.FLOW_CONTROL, "system busy"),
+                          MQBrokerException(ResponseCode.SYSTEM_BUSY, "busy")],
+                         c, mq, key)
+    # 215 gets the short branch, any other broker code keeps the generic backoff:
+    # the two directions pin each other (reverting either branch turns this red).
+    assert delays == [0.02, 0.5], delays
+
+
+def test_broker_flow_control_pop_retries_in_20ms_other_codes_keep_500ms(monkeypatch):
+    pq = PopProcessQueue()
+
+    def _setup():
+        c._pop_queues[key] = pq
+
+    c, mq, key = _error_loop_consumer("G_fc_broker_pop")
+    delays = _drive_loop(monkeypatch, "_queue_pop_loop", "pop_message",
+                         [MQBrokerException(ResponseCode.FLOW_CONTROL, "system busy"),
+                          MQBrokerException(ResponseCode.SYSTEM_BUSY, "busy")],
+                         c, mq, key, setup=_setup)
+    assert delays == [0.02, 0.5], delays
+
+
+def test_plain_client_error_pull_loop_keeps_generic_backoff(monkeypatch):
+    # Control without a broker code at all: a generic exception must not pick the 20ms branch.
+    c, mq, key = _error_loop_consumer("G_fc_generic")
+    delays = _drive_loop(monkeypatch, "_queue_pull_loop", "pull_message",
+                         [RuntimeError("socket reset"),
+                          MQBrokerException(ResponseCode.FLOW_CONTROL, "system busy")],
+                         c, mq, key)
+    assert delays == [0.5, 0.02], delays

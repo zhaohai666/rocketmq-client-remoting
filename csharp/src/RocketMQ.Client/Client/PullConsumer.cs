@@ -53,6 +53,13 @@ public sealed class DefaultMQPullConsumer
 
     private readonly Dictionary<MessageQueue, long> _pullFromWhichNode = new();
 
+    /// <summary>Non-TAG subscriptions recorded by the selector-flavoured pull overloads
+    /// (real topic -> SubscriptionData). The heartbeat then registers the real expression
+    /// type with the broker; TAG subscriptions never enter this table because their
+    /// heartbeat shape stays the legacy "*" one.</summary>
+    private readonly Dictionary<string, SubscriptionData> _selectorSubscriptions =
+        new(StringComparer.Ordinal);
+
     private MQClientInstance? _mqClient;
     private bool _started;
 
@@ -338,16 +345,51 @@ public sealed class DefaultMQPullConsumer
         {
             UnitMode = _unitMode,
         };
+        var announced = new HashSet<string>(StringComparer.Ordinal);
         foreach (string t in _registerTopics)
         {
-            SubscriptionData sub =
-                FilterAPI.BuildSubscriptionData(NamespaceUtil.WrapNamespace(_namespace, t), "*");
-            sub.SubVersion = 0;
-            cd.AddSubscriptionData(sub);
+            string real = NamespaceUtil.WrapNamespace(_namespace, t);
+            announced.Add(real);
+            cd.AddSubscriptionData(HeartbeatSubscription(real));
+        }
+
+        // A selector pull of a topic nobody ever registered still has to reach the
+        // heartbeat: without a subscription entry the broker cannot match its SQL92
+        // expression against the filter factory.
+        lock (_lock)
+        {
+            foreach (KeyValuePair<string, SubscriptionData> kv in _selectorSubscriptions)
+            {
+                if (announced.Contains(kv.Key))
+                {
+                    continue;
+                }
+
+                cd.AddSubscriptionData(kv.Value);
+            }
         }
 
         hb.AddConsumerData(cd);
         return hb;
+    }
+
+    /// <summary>The subscription a registered topic contributes to the heartbeat: the
+    /// selector-recorded one when its expression type is not TAG, otherwise the legacy
+    /// "*" / TAG / subVersion-0 shape (unchanged wire bytes for every tag flow).</summary>
+    private SubscriptionData HeartbeatSubscription(string realTopic)
+    {
+        lock (_lock)
+        {
+            if (_selectorSubscriptions.TryGetValue(realTopic, out SubscriptionData? recorded)
+                && recorded is not null)
+            {
+                return recorded;
+            }
+        }
+
+        SubscriptionData sub = FilterAPI.BuildSubscriptionData(realTopic, "*");
+        sub.SubVersion = 0;
+        return sub;
     }
 
     public int SendHeartbeatToAllBroker()
@@ -563,37 +605,90 @@ public sealed class DefaultMQPullConsumer
     public PullResult Pull(MessageQueue mq, string subExpression = "*", long offset = 0,
         int maxNums = 32, int timeoutMillis = -1)
     {
-        MQClientInstance c = RequireClient();
+        _ = RequireClient();
         int timeout = timeoutMillis > 0 ? timeoutMillis : _consumerPullTimeoutMillis;
-        int sysFlag = PullSysFlag.BuildSysFlag(commitOffset: false, suspend: false,
-            subscription: true, classFilter: false);
         MessageQueue real = WrapMq(mq);
         SubscriptionData sub = FilterAPI.BuildSubscriptionData(real.Topic, subExpression);
-        long brokerId = TakePullFromWhichNode(real);
-        PullResult result = c.PullMessage(_consumerGroup, real, offset, maxNums, sysFlag, 0,
-            string.IsNullOrEmpty(sub.SubString) ? "*" : sub.SubString,
-            0, ExpressionType.TAG, timeout, -1, 15000,
-            /*addrIn=*/null, /*requestSource=*/0, /*brokerId=*/brokerId);
-        UpdatePullFromWhichNode(real, result);
-        return result;
+        return PullCore(real, sub, offset, maxNums, suspend: false, timeout, 15000);
+    }
+
+    /// <summary>Selector flavour of <see cref="Pull(MessageQueue,string,long,int,int)"/>:
+    /// the expression type travels subscription -> heartbeat -> the pull request's
+    /// expressionType. A TAG selector produces exactly the request the string overload
+    /// sends today; a SQL92 one carries its own type and real subscription version.</summary>
+    public PullResult Pull(MessageQueue mq, MessageSelector selector, long offset = 0,
+        int maxNums = 32, int timeoutMillis = -1)
+    {
+        ArgumentNullException.ThrowIfNull(selector);
+        _ = RequireClient();
+        int timeout = timeoutMillis > 0 ? timeoutMillis : _consumerPullTimeoutMillis;
+        return PullSelectorCore(mq, selector, offset, maxNums, suspend: false, timeout, 15000);
     }
 
     public PullResult PullBlockIfNotFound(MessageQueue mq, string subExpression, long offset,
         int maxNums)
     {
-        MQClientInstance c = RequireClient();
-        int sysFlag = PullSysFlag.BuildSysFlag(commitOffset: false, suspend: true,
-            subscription: true, classFilter: false);
+        _ = RequireClient();
         MessageQueue real = WrapMq(mq);
         SubscriptionData sub = FilterAPI.BuildSubscriptionData(real.Topic, subExpression);
+        return PullCore(real, sub, offset, maxNums, suspend: true,
+            _consumerTimeoutMillisWhenSuspend, _brokerSuspendMaxTimeMillis);
+    }
+
+    /// <summary>Selector flavour of <see cref="PullBlockIfNotFound(MessageQueue,string,long,int)"/>
+    /// (the long poll: suspend=true), carrying the expression type exactly like
+    /// <see cref="Pull(MessageQueue,MessageSelector,long,int,int)"/>.</summary>
+    public PullResult PullBlockIfNotFound(MessageQueue mq, MessageSelector selector, long offset,
+        int maxNums)
+    {
+        ArgumentNullException.ThrowIfNull(selector);
+        _ = RequireClient();
+        return PullSelectorCore(mq, selector, offset, maxNums, suspend: true,
+            _consumerTimeoutMillisWhenSuspend, _brokerSuspendMaxTimeMillis);
+    }
+
+    /// <summary>One pull request as the broker sees it: the expression type comes from the
+    /// subscription itself. A TAG subscription keeps subVersion 0 on the wire (today's
+    /// byte shape); only an expression with its own version (SQL92 / class filter) sends
+    /// the real one.</summary>
+    private PullResult PullCore(MessageQueue real, SubscriptionData sub, long offset,
+        int maxNums, bool suspend, int timeoutMillis, int suspendTimeoutMillis)
+    {
+        MQClientInstance c = RequireClient();
+        int sysFlag = PullSysFlag.BuildSysFlag(commitOffset: false, suspend: suspend,
+            subscription: true, classFilter: false);
         long brokerId = TakePullFromWhichNode(real);
+        long subVersion = sub.ExpressionType == ExpressionType.TAG ? 0 : sub.SubVersion;
         PullResult result = c.PullMessage(_consumerGroup, real, offset, maxNums, sysFlag, 0,
             string.IsNullOrEmpty(sub.SubString) ? "*" : sub.SubString,
-            0, ExpressionType.TAG, _consumerTimeoutMillisWhenSuspend, -1,
-            _brokerSuspendMaxTimeMillis,
+            subVersion, sub.ExpressionType, timeoutMillis, -1, suspendTimeoutMillis,
             /*addrIn=*/null, /*requestSource=*/0, /*brokerId=*/brokerId);
         UpdatePullFromWhichNode(real, result);
         return result;
+    }
+
+    private PullResult PullSelectorCore(MessageQueue mq, MessageSelector selector, long offset,
+        int maxNums, bool suspend, int timeoutMillis, int suspendTimeoutMillis)
+    {
+        MessageQueue real = WrapMq(mq);
+        SubscriptionData sub = SubscriptionSelectors.Build(real.Topic, selector);
+        RememberSelectorSubscription(sub);
+        return PullCore(real, sub, offset, maxNums, suspend, timeoutMillis, suspendTimeoutMillis);
+    }
+
+    /// <summary>Only a non-TAG subscription joins the heartbeat table: the TAG heartbeat
+    /// shape ("*", subVersion 0) is deliberate legacy behaviour and must not change.</summary>
+    private void RememberSelectorSubscription(SubscriptionData sub)
+    {
+        if (sub.ExpressionType == ExpressionType.TAG)
+        {
+            return;
+        }
+
+        lock (_lock)
+        {
+            _selectorSubscriptions[sub.Topic] = sub;
+        }
     }
 
     public void PullAsync(MessageQueue mq, string subExpression, long offset, int maxNums,
@@ -640,6 +735,47 @@ public sealed class DefaultMQPullConsumer
         long offset, int maxNums, IPullCallback callback, int timeoutMillis = -1) =>
         PullAsync(new MessageQueue(topic, brokerName, queueId), subExpression, offset, maxNums,
             callback, timeoutMillis);
+
+    /// <summary>Selector flavour of <see cref="PullAsync(MessageQueue,string,long,int,IPullCallback,int)"/>:
+    /// same asynchronous contract (a not-started client throws synchronously), same
+    /// expression-type carrying rules as the synchronous selector pull.</summary>
+    public void PullAsync(MessageQueue mq, MessageSelector selector, long offset, int maxNums,
+        IPullCallback callback, int timeoutMillis = -1)
+    {
+        ArgumentNullException.ThrowIfNull(selector);
+        ArgumentNullException.ThrowIfNull(callback);
+        _ = RequireClient(); // not started: throws synchronously, matching the synchronous Pull
+        _ = Task.Run(() =>
+        {
+            PullResult result;
+            try
+            {
+                result = Pull(mq, selector, offset, maxNums, timeoutMillis);
+            }
+            catch (Exception e)
+            {
+                try
+                {
+                    callback.OnException(e);
+                }
+                catch (Exception inner)
+                {
+                    ClientLog.Warn("pullAsync onException callback threw: " + inner.Message);
+                }
+
+                return;
+            }
+
+            try
+            {
+                callback.OnSuccess(result);
+            }
+            catch (Exception e)
+            {
+                ClientLog.Warn("pullAsync onSuccess callback threw: " + e.Message);
+            }
+        });
+    }
 
     private long TakePullFromWhichNode(MessageQueue mq)
     {

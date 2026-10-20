@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "rocketmq/common/logging.h"
+#include "rocketmq/common/util_all.h"
 
 namespace rocketmq {
 
@@ -96,15 +97,22 @@ int64_t ConsumeExecutor::handlerExceptionCount() const {
     return handlerExceptions_.load(std::memory_order_relaxed);
 }
 
-void ConsumeExecutor::shutdown(bool wait) {
+void ConsumeExecutor::shutdown(bool wait, int64_t awaitTerminationMillis) {
     {
         std::lock_guard<std::mutex> lk(m_);
         shutdown_ = true;
+        // Arm the drain ceiling for the workers that are still holding queued tasks. <= 0 leaves it
+        // unset, which is exactly the drain behaviour before the ceiling existed.
+        if (awaitTerminationMillis > 0) {
+            drainDeadlineMs_ = UtilAll::currentTimeMillis() + awaitTerminationMillis;
+        }
         cv_.notify_all();
     }
     if (!wait) return;
     // Wait for all threads to exit (including those that already finished: join returns at once).
     // ⚠ No thread may join itself -- this path is only entered by an external caller (destructor/stop).
+    // This is the one and only wait: the ceiling is enforced by the workers themselves while they walk
+    // the backlog, so the join is bounded by it without a second polling loop here.
     std::vector<std::thread> pending;
     {
         std::lock_guard<std::mutex> lk(m_);
@@ -113,6 +121,10 @@ void ConsumeExecutor::shutdown(bool wait) {
     for (auto& t : pending) {
         if (t.joinable()) t.join();
     }
+}
+
+int64_t ConsumeExecutor::droppedTaskCount() const {
+    return droppedTasks_.load(std::memory_order_relaxed);
 }
 
 void ConsumeExecutor::spawnLocked() {
@@ -141,6 +153,17 @@ void ConsumeExecutor::run() {
                     --workers_;
                     return;
                 }
+            }
+            if (shutdown_ && drainDeadlineMs_ != 0 &&
+                UtilAll::currentTimeMillis() >= drainDeadlineMs_) {
+                // The drain ceiling expired with batches still queued: stop here instead of walking the
+                // rest of the backlog. Evaluated at every step of the drain, so it fires mid-backlog --
+                // the ceiling is not something only noticed once the queue is already empty.
+                droppedTasks_.fetch_add(static_cast<int64_t>(queue_.size()),
+                                        std::memory_order_relaxed);
+                queue_.clear();
+                --workers_;
+                return;
             }
             if (shutdown_ && queue_.empty()) {
                 --workers_;

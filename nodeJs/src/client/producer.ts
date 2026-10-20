@@ -33,10 +33,13 @@ import { SendResult, TransactionSendResult, SendStatus } from './send_result.ts'
 import { MQClient, TopicPublishInfo } from './mq_client.ts';
 import { MQClientManager } from './mq_client_manager.ts';
 import {
-  CommunicationMode, SendMessageContext, CheckForbiddenContext, SendMessageHook, hookRegistry,
+  CommunicationMode, SendMessageContext, CheckForbiddenContext, SendMessageHook,
+  EndTransactionContext, hookRegistry,
 } from './hook.ts';
 import { MQFaultStrategy, tcpDetect } from './latency.ts';
-import { getOrCreateProduceAccumulator, ProduceAccumulator } from './produce_accumulator.ts';
+import {
+  getOrCreateProduceAccumulator, ProduceAccumulator, MessageAccumulation,
+} from './produce_accumulator.ts';
 import { FairSemaphore } from './backpressure.ts';
 import { injectTraceContext, traceContextEnabledFromEnv } from './traceparent.ts';
 import {
@@ -116,7 +119,6 @@ export class DefaultMQProducer {
   compressMsgBodyOverHowmuch: number;
   maxMessageSize: number;
   retryTimesWhenSendFailed: number;
-  retryAnotherBrokerWhenNotStoreOK: boolean;
   namespace: string | null;
   // Server-side namespaceV2 (Aliyun-style serverless instance id). When
   // non-empty, NamespaceRpcHook stamps every request with nsd=true / ns=<value>
@@ -134,6 +136,22 @@ export class DefaultMQProducer {
   sendLatencyFaultEnable: boolean;
   heartbeatIntervalMillis: number;
   autoBatch: boolean;
+  // Auto-batch accumulator knobs, pushed into the accumulator when start()
+  // wires it: a buffered key flushes when its group reaches batchMaxBytes or
+  // when the batchMaxDelayMs hold timer drains it. -1 means "leave the
+  // accumulator's own default" (32 KB / 10 ms).
+  batchMaxBytes: number;
+  batchMaxDelayMs: number;
+  // Broker response codes that make a SYNC send worth another attempt on a
+  // DIFFERENT broker: the answer says the broker itself could not take the
+  // message (busy / internal error), so the next broker may well succeed. Any
+  // other broker answer (a rejected message, a permission failure...) is the
+  // caller's to see, so it is raised on the first attempt.
+  retryResponseCodes: Set<number>;
+  // When a send was accepted but the store answer is not SEND_OK (the disk or
+  // the slave lagged), re-pick another broker and retry; with the flag off the
+  // not-stored result goes back to the caller unchanged. SYNC only.
+  retryAnotherBrokerWhenNotStoreOK: boolean;
   enableTrace: boolean;
   // Custom trace topic; null = RMQ_SYS_TRACE_TOPIC.
   traceTopic: string | null;
@@ -187,6 +205,12 @@ export class DefaultMQProducer {
     this.maxMessageSize = 4 * 1024 * 1024;
     this.retryTimesWhenSendFailed = 2;
     this.retryAnotherBrokerWhenNotStoreOK = false;
+    this.retryResponseCodes = new Set([
+      ResponseCode.SYSTEM_ERROR, ResponseCode.SYSTEM_BUSY,
+      ResponseCode.SERVICE_NOT_AVAILABLE, ResponseCode.NO_PERMISSION,
+      ResponseCode.TOPIC_NOT_EXIST, ResponseCode.NO_BUYER_ID,
+      ResponseCode.NOT_IN_CURRENT_UNIT, ResponseCode.GO_AWAY,
+    ]);
     this.namespace = null;
     this.namespaceV2 = null;
     this.namesrvAddr = null;
@@ -199,6 +223,8 @@ export class DefaultMQProducer {
     this.sendLatencyFaultEnable = false;
     this.heartbeatIntervalMillis = 30 * 1000;
     this.autoBatch = false;
+    this.batchMaxBytes = -1;
+    this.batchMaxDelayMs = -1;
     this.enableTrace = false;
     this.traceTopic = null;
     this.compressType = MessageSysFlag.ZLIB_TYPE;
@@ -295,6 +321,62 @@ export class DefaultMQProducer {
   // ASYNC retry budget (first attempt not counted). Only the async chain reads it.
   setRetryTimesWhenSendAsyncFailed(n: number): this { this.retryTimesWhenSendAsyncFailed = n; return this; }
   getRetryTimesWhenSendAsyncFailed(): number { return this.retryTimesWhenSendAsyncFailed; }
+  // SYNC retry budget (first attempt not counted). Only the sync loop reads it.
+  setRetryTimesWhenSendFailed(n: number): this { this.retryTimesWhenSendFailed = n; return this; }
+  getRetryTimesWhenSendFailed(): number { return this.retryTimesWhenSendFailed; }
+  // Whether a "stored, but not stored well" answer makes the sync loop move on to
+  // another broker. SYNC only — the async chain delivers it as-is.
+  setRetryAnotherBrokerWhenNotStoreOK(enable: boolean): this {
+    this.retryAnotherBrokerWhenNotStoreOK = enable === true;
+    return this;
+  }
+  getRetryAnotherBrokerWhenNotStoreOK(): boolean { return this.retryAnotherBrokerWhenNotStoreOK; }
+  // Auto-batch switch. Enabling it after start() wires the accumulator right
+  // away: a switch that only worked before start() would be a silent no-op for
+  // the caller that flipped it on a live producer.
+  setAutoBatch(enable: boolean): this {
+    this.autoBatch = enable === true;
+    if (this.autoBatch && this.client != null) this._wireAccumulator();
+    return this;
+  }
+  isAutoBatch(): boolean { return this.autoBatch; }
+  // Beat period of the instance-level heartbeat loop. A live producer applies it
+  // to the shared instance at once (which rebuilds its timer); before start() it
+  // is the value handed over at registration.
+  setHeartbeatIntervalMillis(ms: number): this {
+    this.heartbeatIntervalMillis = ms;
+    if (this.client != null) this.client.setHeartbeatIntervalMillis(ms);
+    return this;
+  }
+  getHeartbeatIntervalMillis(): number {
+    return this.client != null ? this.client.heartbeatIntervalMillis : this.heartbeatIntervalMillis;
+  }
+  // Replace the whole retryable-code set (a fresh Set; the old contents are not merged).
+  setRetryResponseCodes(codes: Iterable<number>): this {
+    this.retryResponseCodes = new Set(codes);
+    return this;
+  }
+  getRetryResponseCodes(): Set<number> { return new Set(this.retryResponseCodes); }
+  addRetryResponseCode(code: number): this { this.retryResponseCodes.add(code); return this; }
+  removeRetryResponseCode(code: number): this { this.retryResponseCodes.delete(code); return this; }
+  isRetryResponseCode(code: number | null | undefined): boolean {
+    return code != null && this.retryResponseCodes.has(code);
+  }
+  // Auto-batch gates. -1 keeps the accumulator's own default (32 KB / 10 ms);
+  // any other value is range-checked by the accumulator and, when one is
+  // already wired, applied to it in place (the hold period rebuilds its timer).
+  setBatchMaxBytes(bytes: number): this {
+    if (bytes > -1) this._accumulator?.setMaxHoldSize(bytes);
+    this.batchMaxBytes = bytes;
+    return this;
+  }
+  getBatchMaxBytes(): number { return this._accumulator?.maxHoldSize ?? this.batchMaxBytes; }
+  setBatchMaxDelayMs(ms: number): this {
+    if (ms > -1) this._accumulator?.setHoldMs(ms);
+    this.batchMaxDelayMs = ms;
+    return this;
+  }
+  getBatchMaxDelayMs(): number { return this._accumulator?.holdMs ?? this.batchMaxDelayMs; }
   // ZLIB compression level 0-9 (default 5).
   setCompressLevel(level: number): this { this.compressLevel = level; return this; }
   getCompressLevel(): number { return this.compressLevel; }
@@ -367,6 +449,10 @@ export class DefaultMQProducer {
     client.setVipChannelEnabled(this.sendMessageWithVIPChannel);
     if (created) {
       if (this.useHeartbeatV2) client.setUseHeartbeatV2(true);
+      // Pass this facade's configured beat period into the shared instance ONCE
+      // at registration: the instance-level heartbeat timer and the consumer
+      // facades' own beats read it from there.
+      client.setHeartbeatIntervalMillis(this.heartbeatIntervalMillis);
       registerRpcHooks(client.remotingClient, {
         namespaceV2: () => this.namespaceV2,
         userHook: this.rpcHook,
@@ -384,7 +470,7 @@ export class DefaultMQProducer {
     if (this.startDetectorEnable) {
       this.mqFaultStrategy.setResolver((brokerName: string): string | null =>
         this.client != null ? this.client.findBrokerAddressInPublish(brokerName) : null);
-      this.mqFaultStrategy.setServiceDetector((addr: string, timeout: number): boolean => tcpDetect(addr, timeout));
+      this.mqFaultStrategy.setServiceDetector((addr: string, timeout: number): Promise<boolean> => tcpDetect(addr, timeout));
       this.mqFaultStrategy.setStartDetectorEnable(true);
     }
     this.mqFaultStrategy.startDetector();
@@ -392,15 +478,7 @@ export class DefaultMQProducer {
     // request-reply futures nobody will ever answer.
     REQUEST_FUTURE_HOLDER.startScheduledTask(this);
 
-    if (this.autoBatch) {
-      this._accumulator = getOrCreateProduceAccumulator(clientId);
-      this._accumulator.setSender(async (acc) => {
-        await this._flushAccumulation(acc);
-      });
-      this._accumulator.start();
-      const accs: ProduceAccumulator[] = ((client as any)._accumulators ||= []);
-      if (!accs.includes(this._accumulator)) accs.push(this._accumulator);
-    }
+    if (this.autoBatch) this._wireAccumulator();
 
     // Message trace wiring: without this, enableTrace is a silent no-op on the
     // produce side (SendMessageHook fires before/after every send).
@@ -791,15 +869,30 @@ export class DefaultMQProducer {
           if (this.sendLatencyFaultEnable) {
             this.mqFaultStrategy.updateFaultItem(mq.getBrokerName(), 0, false, true);
           }
+          // "Stored, but not stored well" (flush timeouts) is a finished send unless the
+          // caller asked to move on for it. lastBrokerName already holds this broker, so
+          // the next pick avoids it; once attempts run out the tail returns this result.
+          if (sendResult.sendStatus !== SendStatus.SEND_OK && this.retryAnotherBrokerWhenNotStoreOK) {
+            continue;
+          }
           return sendResult;
         }
       } catch (e) {
         logger.warn(`send to ${mq.toString()} failed (attempt ${times + 1}): ${(e as Error).message}`);
-        if (e instanceof MQBrokerException) lastBrokerErr = e;
+        if (e instanceof MQBrokerException) {
+          lastBrokerErr = e;
+          // A broker answer outside the retryable set is a verdict about THIS
+          // request, not a sick broker; another broker would give the same
+          // answer, so surface it now instead of spending the remaining attempts.
+          if (!this.isRetryResponseCode(e.responseCode)) throw e;
+        }
         if (this.sendLatencyFaultEnable) {
           this.mqFaultStrategy.updateFaultItem(mq.getBrokerName(), this.sendMsgTimeout, true, false);
         }
-        lastBrokerName = null;
+        // lastBrokerName keeps THIS broker: the next pick is steered away from the
+        // one that just failed, which is the whole point of retrying. Clearing it
+        // would leave the next attempt to plain round-robin and could re-send to
+        // the same broker while another one is healthy.
         // A failure may mean the cached publish info is still the default-topic
         // fallback (route registered late). Refetch the exact route between
         // attempts so the next try does not repeat the same illegal queue.
@@ -824,17 +917,31 @@ export class DefaultMQProducer {
   }
 
   // ---- public send API ----
-  async send(msg: Message, timeoutMillis: number = this.sendMsgTimeout): Promise<SendResult> {
-    const r = await this._sendDefaultImpl(msg, CommunicationMode.SYNC, null, timeoutMillis);
+  async send(msg: Message, timeoutMillis?: number): Promise<SendResult> {
+    // autoBatch: a message with no explicit timeout rides a group and this call
+    // awaits that group's send. An explicit timeout opts out — the hold timer
+    // would add latency the caller already bounded.
+    if (timeoutMillis === undefined && this._canAutoBatch(msg)) {
+      const batched = await this._sendByAccumulator(msg, null, null);
+      if (batched != null) return batched;
+    }
+    const r = await this._sendDefaultImpl(msg, CommunicationMode.SYNC, null, timeoutMillis ?? this.sendMsgTimeout);
     if (r == null) throw new MQClientException('null send result');
     return r;
   }
 
-  async sendOneway(msg: Message, timeoutMillis: number = this.sendMsgTimeout): Promise<void> {
-    await this._sendDefaultImpl(msg, CommunicationMode.ONEWAY, null, timeoutMillis);
+  async sendOneway(msg: Message, timeoutMillis?: number): Promise<void> {
+    await this._sendDefaultImpl(msg, CommunicationMode.ONEWAY, null, timeoutMillis ?? this.sendMsgTimeout);
   }
 
-  async sendAsync(msg: Message, sendCallback: SendCallback, timeoutMillis: number = this.sendMsgTimeout): Promise<void> {
+  async sendAsync(msg: Message, sendCallback: SendCallback, timeoutMillis?: number): Promise<void> {
+    // autoBatch takes async sends the same way: join the group, and the group's
+    // send settles this callback. Nothing is acquired from the async backpressure
+    // semaphores, because the batch leaves through the sync path.
+    if (timeoutMillis === undefined && this._canAutoBatch(msg)) {
+      await this._sendByAccumulator(msg, null, sendCallback);
+      return;
+    }
     // Async-send backpressure: the two fair semaphores bound the in-flight
     // async sends, but ONLY while enableBackpressureForAsyncMode is on
     // (default false). A full
@@ -855,7 +962,7 @@ export class DefaultMQProducer {
       if (sendCallback) sendCallback(sr, err);
     };
     try {
-      await this._sendDefaultImpl(msg, CommunicationMode.ASYNC, wrapped, timeoutMillis);
+      await this._sendDefaultImpl(msg, CommunicationMode.ASYNC, wrapped, timeoutMillis ?? this.sendMsgTimeout);
     } catch (e) {
       // A sendAsync caller hands over a SendCallback and normally does not attach
       // a handler to the returned promise, so re-throwing here would turn an
@@ -1001,20 +1108,38 @@ export class DefaultMQProducer {
     header.msgId = uniqKey != null ? String(uniqKey) : sendResult.msgId;
     header.bname = sendResult.messageQueue != null ? sendResult.messageQueue.getBrokerName() : null;
     const request = RemotingCommand.createRequestCommand(RequestCode.END_TRANSACTION, header);
-    // A synchronous try around an async call catches nothing: the rejection would
-    // escape as an unhandled rejection and kill the process.
-    this.client.remotingClient.invokeOneway(brokerAddr, request)
-      .catch((e) => { logger.warn(`end transaction failed: ${(e as Error).message}`); });
-    // Trace: fire the EndTransactionTraceHook from endTransaction — the
-    // EndTransaction record of a transaction message.
-    if (this._traceDispatcher != null) {
-      try {
-        this._traceDispatcher.appendEndTransaction(
-          this.producerGroup, msg != null ? msg.getTopic() : '',
-          header.msgId || '', header.transactionId, localTransactionState,
-          false, brokerAddr);
-      } catch (e) { /* trace never breaks the data path */ }
+    // EndTransactionHook wraps the one request that actually ends the
+    // transaction on the wire. Same discipline as the send-hook call site:
+    // before hooks run outside the try, after hooks run on both the success
+    // and the exception path, and a synchronous throw is re-raised after the
+    // after hooks have seen the context.
+    const endCtx = new EndTransactionContext(this.producerGroup, msg, brokerAddr);
+    endCtx.msgId = header.msgId != null ? String(header.msgId) : null;
+    endCtx.transactionId = header.transactionId;
+    endCtx.transactionState = localTransactionState;
+    endCtx.fromTransactionCheck = false;
+    const endHooks = hookRegistry.endTransactionHooks;
+    for (const hook of endHooks) hook.endTransactionBefore(endCtx);
+    try {
+      // A synchronous try around an async call catches nothing: the rejection would
+      // escape as an unhandled rejection and kill the process.
+      this.client.remotingClient.invokeOneway(brokerAddr, request)
+        .catch((e) => { logger.warn(`end transaction failed: ${(e as Error).message}`); });
+      // Trace: fire the EndTransactionTraceHook from endTransaction — the
+      // EndTransaction record of a transaction message.
+      if (this._traceDispatcher != null) {
+        try {
+          this._traceDispatcher.appendEndTransaction(
+            this.producerGroup, msg != null ? msg.getTopic() : '',
+            header.msgId || '', header.transactionId, localTransactionState,
+            false, brokerAddr);
+        } catch (e) { /* trace never breaks the data path */ }
+      }
+    } catch (e) {
+      for (const hook of endHooks) hook.endTransactionAfter(endCtx);
+      throw e;
     }
+    for (const hook of endHooks) hook.endTransactionAfter(endCtx);
   }
 
   // ---- request-reply ----
@@ -1346,17 +1471,128 @@ export class DefaultMQProducer {
   }
 
   // ---- batch ----
-  private async _flushAccumulation(acc: any): Promise<void> {
-    const msgs = acc.messages as Message[];
-    if (msgs.length === 0) return;
+  // Wire this facade's group buffer onto the shared instance. The accumulator is
+  // instance-level (keyed by clientId) so several producers over one instance
+  // share one buffer, and it is registered on the instance so a real shutdown
+  // stops it and flushes what is still held.
+  private _wireAccumulator(): void {
+    const client = this.client!;
+    this._accumulator = getOrCreateProduceAccumulator(client.clientId);
+    // Applied before the timer starts so a flush goes out on the configured
+    // period rather than on the accumulator's default.
+    if (this.batchMaxBytes > -1) this._accumulator.setMaxHoldSize(this.batchMaxBytes);
+    if (this.batchMaxDelayMs > -1) this._accumulator.setHoldMs(this.batchMaxDelayMs);
+    this._accumulator.setSender(async (acc) => { await this._flushAccumulation(acc); });
+    this._accumulator.start();
+    const accs: ProduceAccumulator[] = ((client as any)._accumulators ||= []);
+    if (!accs.includes(this._accumulator)) accs.push(this._accumulator);
+  }
+
+  // Whether auto-batch takes this message. False sends it the plain way: no
+  // accumulator is wired (autoBatch off, or start() not done), or the message
+  // must not ride a group.
+  private _canAutoBatch(msg: Message): boolean {
+    const accumulator = this._accumulator;
+    return this.autoBatch && accumulator != null && !accumulator.isStopped() && accumulator.isBatchable(msg);
+  }
+
+  // Auto-batch entry: hand one message to the group of its (topic, queue,
+  // waitStoreMsgOK, tag) key and wait for that group's send. With a callback the
+  // outcome belongs to that callback and the returned promise resolves as soon
+  // as the message joined the group; without one the caller awaits this
+  // message's own SendResult.
+  //
+  // A caller that passed an explicit timeout is NOT routed here: the hold timer
+  // would add latency the caller already bounded.
+  private async _sendByAccumulator(
+    msg: Message,
+    mq: MessageQueue | null,
+    sendCallback: SendCallback | null,
+  ): Promise<SendResult | null> {
+    const accumulator = this._accumulator;
+    if (accumulator == null) throw new MQClientException('producer not started');
+    try {
+      // Same entry guard as the direct path: an illegal topic or body must not
+      // reach the accumulator's table.
+      Validators.checkMessage(msg, this.maxMessageSize);
+      this._checkLegalTopic(msg.getTopic());
+      // UNIQ_KEY is stamped BEFORE joining: the group leaves as one packed
+      // message with one answer, and that answer is split back per member by
+      // this key. The direct path stamps it inside sendKernelImpl, which a batch
+      // never reaches per member.
+      if (!msg.getProperty(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX)) {
+        MessageAccessor.putProperty(msg, MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX, createUniqID());
+      }
+      const tpInfo = await this._tryToFindTopicPublishInfo(msg.getTopic());
+      if (tpInfo == null || !tpInfo.ok()) {
+        throw new MQClientException(
+          `No route info of this topic: ${msg.getTopic()}${this._routeFailureSuffix()}`,
+          this._lastRouteError ?? undefined,
+        );
+      }
+      const target = mq ?? this._selectOneMessageQueue(tpInfo, null);
+      if (target == null) throw new MQClientException(`no writable queue for topic ${msg.getTopic()}`);
+      const { future, flushNow } = accumulator.accumulate(msg, target);
+      // Crossing the byte gate means this group is complete: it leaves now
+      // instead of waiting for the hold timer.
+      if (flushNow != null) void this._flushAccumulation(flushNow);
+      if (sendCallback == null) return await future.promise;
+      future.promise.then(
+        (sr) => sendCallback(sr, null),
+        (e) => sendCallback(null, e as Error),
+      ).catch((cbErr) => logger.warn('accumulator send callback threw: %s', (cbErr as Error).message));
+      return null;
+    } catch (e) {
+      // A callback-owning caller must not see a rejection on the returned
+      // promise; the callback gets the error instead.
+      if (sendCallback == null) throw e;
+      try {
+        sendCallback(null, e instanceof Error ? e : new Error(String(e)));
+      } catch (cbErr) {
+        logger.warn('accumulator send callback threw: %s', (cbErr as Error).message);
+      }
+      return null;
+    }
+  }
+
+  // Send one buffered group as a single packed message and settle every caller
+  // waiting on it. Every exit settles: no route, no queue, a broker refusal and
+  // a successful send all reach the group's futures, because a group left
+  // unsettled would keep its callers' promises pending forever.
+  private async _flushAccumulation(acc: MessageAccumulation): Promise<void> {
+    if (acc.isEmpty()) return;
+    const msgs = acc.messages;
     const topic = msgs[0].getTopic();
-    const mq = new MessageQueue(topic, '', 0);
-    const tpInfo = await this._tryToFindTopicPublishInfo(topic);
-    if (tpInfo == null || !tpInfo.ok()) return;
-    const selected = this._selectOneMessageQueue(tpInfo, null);
-    if (selected == null) return;
-    const batch = MessageBatch.generateFromList(msgs);
-    await this._sendWithHooks(batch, selected, CommunicationMode.SYNC, null, tpInfo);
+    try {
+      // Read the cached route first and only fall back to the (awaiting) lookup
+      // on a miss. A drain triggered by shutdown has to reach the transport
+      // before the facade detaches its client, and an await in between would
+      // turn "flush what is still buffered" into "fail it with not started".
+      const cached = this.client != null ? this.client.getTopicPublishInfo(topic) : null;
+      const tpInfo = cached != null && cached.ok() && !(cached as any).fromDefaultTopic
+        ? cached
+        : await this._tryToFindTopicPublishInfo(topic);
+      if (tpInfo == null || !tpInfo.ok()) {
+        throw new MQClientException(
+          `No route info of this topic: ${topic}${this._routeFailureSuffix()}`,
+          this._lastRouteError ?? undefined,
+        );
+      }
+      // A route lookup that had to go to the name server leaves a gap the
+      // caller's shutdown can fall into; the transport calls below all need the
+      // instance, so say what actually happened instead of dereferencing null.
+      if (this.client == null) throw new MQClientException('producer not started');
+      // The group was keyed around this queue; picking another one would merge
+      // queues the callers deliberately kept apart. A queue that left the route
+      // makes this send fail, and the group's callers learn that failure.
+      const target = acc.entries[0].mq;
+      const batch = MessageBatch.generateFromList(msgs);
+      const result = await this._sendWithHooks(batch, target, CommunicationMode.SYNC, null, tpInfo);
+      if (result == null) throw new MQClientException('null send result');
+      acc.complete(result);
+    } catch (e) {
+      acc.fail(e instanceof Error ? e : new Error(String(e)));
+    }
   }
 
   // ---- accessors ----

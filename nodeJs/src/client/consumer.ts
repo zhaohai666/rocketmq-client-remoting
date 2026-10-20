@@ -741,7 +741,11 @@ export class DefaultMQPushConsumer {
   private async _heartbeatLoop(): Promise<void> {
     const flag = this._newStopFlag();
     while (!this._isStopped(flag)) {
-      if (!(await this._sleepOrStop(30000, flag))) {
+      // The beat period is the SHARED instance's configured
+      // heartbeatIntervalMillis (default 30s): one knob drives every beat of
+      // this clientId, set once at facade registration.
+      const interval = this.mqClient != null ? this.mqClient.heartbeatIntervalMillis : 30 * 1000;
+      if (!(await this._sleepOrStop(interval, flag))) {
         try { await this.sendHeartbeatNow(); } catch (e) { /* best effort */ }
       }
     }

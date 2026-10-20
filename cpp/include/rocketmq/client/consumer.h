@@ -48,19 +48,6 @@
 
 namespace rocketmq {
 
-// Subscription selector (tag / SQL92 expression)
-struct MessageSelector {
-    std::string type = ExpressionType::TAG;
-    std::string expression = "*";
-
-    static MessageSelector byTag(const std::string& tag) {
-        return MessageSelector{ExpressionType::TAG, tag};
-    }
-    static MessageSelector bySql(const std::string& sql) {
-        return MessageSelector{ExpressionType::SQL92, sql};
-    }
-};
-
 // POP redelivery delay-level table (the protocol side interprets it in **seconds**).
 // This is not the send-side delay-level table (whose first entry is 1s); do not mix them up.
 inline const std::vector<int32_t>& popDelayLevelTable() {
@@ -78,6 +65,17 @@ constexpr int64_t kMaxPopInvisibleTime = 300000;
 // that loop is dead or stuck, and the rebalance queue-table sync revokes and rebuilds it on
 // exactly this criterion (otherwise that queue goes **silent** and never consumes again, and the client reports no error).
 constexpr int64_t kPullMaxIdleTime = 120000;
+
+// Pull-loop pacing after a pause-worthy event. Two different things are called "flow control" and they
+// must not share one backoff:
+//   - the client's own ProcessQueue thresholds (cached messages over the count/size/span limits): the
+//     pause only has to give the consume side time to drain, so a comparatively long pause is right;
+//   - the broker's FLOW_CONTROL(215) answer: the broker throttled this request on its own window, which
+//     is unrelated to how full the local cache is, so the loop retries sooner.
+constexpr int32_t kPullPauseWhenClientFlowControl = 50;
+constexpr int32_t kPullPauseWhenBrokerFlowControl = 20;
+// Every other broker error on the pull path (topic not created yet, subscription not latest, ...).
+constexpr int32_t kPullPauseWhenPullError = 500;
 
 // POP initial-offset mode (protocol parameter ConsumeInitMode)
 enum class ConsumeInitMode : int32_t { MIN = 0, MAX = 1 };
@@ -322,6 +320,17 @@ public:
 
     void setHeartbeatEnabled(bool b) { heartbeatEnabled_ = b; }
     void setHeartbeatIntervalMillis(int32_t t) { heartbeatIntervalMillis_ = t; }
+    // awaitTerminationMillisWhenShutdown (default 0): how long shutdown() lets the listener finish the
+    // batches that are still queued when it starts. 0 or less keeps the historic drain -- every queued
+    // batch is handed to the listener before shutdown returns. A positive value is a **ceiling**: the
+    // drain is stopped as soon as it expires and the batches still in the backlog are dropped (POP:
+    // the broker revives the un-acked messages and redelivers them). A batch that is already
+    // running is never interrupted: the ceiling is evaluated between batches, so a listener that hangs
+    // inside one batch still holds shutdown() until that batch returns.
+    void setAwaitTerminationMillisWhenShutdown(int64_t t) { awaitTerminationMillisWhenShutdown_ = t; }
+    int64_t awaitTerminationMillisWhenShutdown() const { return awaitTerminationMillisWhenShutdown_; }
+    // Batches the drain ceiling dropped at the last shutdown() (0 when no ceiling was configured).
+    int64_t shutdownDroppedBatches() const { return shutdownDroppedBatches_; }
 
     // Namespace: when non-empty, topic / group are wrapped with an "ns%" prefix before talking
     // to the broker (start() wraps consumerGroup the same way).
@@ -583,6 +592,14 @@ public:
     // A wrong criterion means 'messages pile up in memory without bound / the offset span runs away', problems a
     // real broker run does not reveal quickly, so it must be pinnable offline; same reason as consumeBatch for keeping it public.
     bool flowControlHit(const MessageQueue& mq, const std::string& key);
+    // How long the pull loop pauses after a **failed** pull: the broker's FLOW_CONTROL(215) answer gets its
+    // own short pause, every other response code the general error backoff (see the kPullPause* constants).
+    // Public and static because the two events look identical offline (both arrive as one MQBrokerException),
+    // so a mapping mistake -- or a collapse back to one shared value -- has to be pinnable without a throttling broker.
+    static int32_t pullPauseMillisFor(int32_t responseCode);
+    // The pause the loop actually applied last (0 = nothing paused yet). The loop sleeps in its own thread,
+    // so this is how the two flow-control paths stay observable without measuring wall time.
+    int64_t lastPullPauseMillis() const { return lastPullPauseMillis_.load(); }
     // Record one POP round into the pull statistics (the PopCallback.onSuccess of popMessage,
     // same convention as the pull path's PullCallback): on FOUND record pullRT (recorded before the
     // empty check), and record pullTPS only when messages were popped. These two cells are the sole
@@ -704,6 +721,9 @@ private:
     // Stamp the timestamp each time a pull/pop is **initiated** (the stamping sites of pullMessage/popMessage:
     // before flow control and the lock decision -- the criterion is 'this loop is still running', not 'this round really hit the network').
     void stampPullAt(const std::string& key);
+    // Record the pause the pull loop is about to take, so the two flow-control paths (client thresholds vs
+    // the broker's FLOW_CONTROL(215)) stay distinguishable from outside without timing the sleep.
+    void notePullPause(int32_t millis);
     // Whether this queue has stalled (the isPullExpired criterion). The caller must hold lock_.
     bool pullStalledLocked(const std::string& key) const;
     // The loop function returned yet still owns this queue (it was not revoked by rebalance): mark it stalled
@@ -804,6 +824,11 @@ private:
     mutable std::map<std::string, int64_t> msgAccCntTable_;
     // POP consume executor (created when started with popMode_; shut down on stop)
     std::shared_ptr<ConsumeExecutor> popConsumeExecutor_;
+    // awaitTerminationMillisWhenShutdown: the ceiling shutdown() puts on draining the batches that are
+    // still queued for the executor when it starts (0 or less = no ceiling). See the setter.
+    int64_t awaitTerminationMillisWhenShutdown_ = 0;
+    // Batches the ceiling dropped at the last shutdown() (the executor is gone by the time a caller can ask)
+    int64_t shutdownDroppedBatches_ = 0;
     // Dedup set of POP orderly requests (same notion as ConcurrentSet<ConsumeRequest>, equality =
     // (shardingKeyIndex, pq reference, mq); shardingKeyIndex is always 0 and pq compares by pointer identity --
     // after rebalance revokes a queue and installs a new PopProcessQueue, new requests enqueue as usual)
@@ -915,6 +940,9 @@ private:
     std::atomic<int64_t> heartbeatCount_{0};
     std::atomic<int64_t> lastHeartbeatMs_{0};
     std::atomic<int64_t> flowControlTriggered_{0};
+    // Milliseconds the pull loop paused for at its most recent pause decision (client thresholds, broker
+    // flow control, or a failed pull); 0 until the first pause.
+    std::atomic<int64_t> lastPullPauseMillis_{0};
 
     // ---------------- Message trace / consume hooks ----------------
     bool enableMsgTrace_ = false;

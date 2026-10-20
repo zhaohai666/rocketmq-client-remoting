@@ -1124,6 +1124,40 @@ class MQClientInstance:
         response = self._invoke_sync(addr, request, timeout_millis)
         return response.code
 
+    def batch_ack_message(self, consumer_group: str, topic: str,
+                          extra_info_list: List[str], timeout_millis: int = 3000,
+                          addr: Optional[str] = None) -> int:
+        """Acknowledge a whole POP batch with one request (``BATCH_ACK_MESSAGE = 200151``).
+
+        ``extra_info_list`` entries are the messages' ``POP_CK`` properties. Entries that
+        share a (retry flag, queueId, checkpoint offset, popTime) group are merged into a
+        single body entry whose bit set marks each acknowledged offset relative to that
+        checkpoint, so a consumed batch costs one RPC instead of one per message.
+
+        Unlike ``ack_message`` this request carries **no custom header**: the group, topic,
+        queue, offsets, popTime and invisibleTime all travel in the JSON body, and the body
+        names a **single** broker -- the one in the first entry's checkpoint. Checkpoints of
+        other brokers must be acknowledged by a separate call.
+
+        Returns the broker response code; ``ResponseCode.SUCCESS`` means the batch was accepted.
+        """
+        from remoting.protocol import extra_info as extra
+        from remoting.protocol.body import BatchAckMessageRequestBody
+
+        if not extra_info_list:
+            raise MQClientException("batch ack needs at least one extra info")
+
+        first = extra.split(extra_info_list[0])
+        broker_name = extra.get_broker_name(first)
+        if addr is None:
+            addr = self.pop_ack_addr(broker_name, topic, extra.get_queue_id(first))
+
+        request = RemotingCommand.create_request_command(RequestCode.BATCH_ACK_MESSAGE, None)
+        request.body = BatchAckMessageRequestBody.from_extra_infos(
+            consumer_group, topic, extra_info_list).encode()
+        response = self._invoke_sync(addr, request, timeout_millis)
+        return response.code
+
     def change_invisible_time(self, consumer_group: str, topic: str, queue_id: int,
                               extra_info: str, offset: int, invisible_time: int,
                               broker_name: Optional[str] = None,

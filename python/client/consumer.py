@@ -21,7 +21,7 @@ from common.sysflag import MessageSysFlag, PullSysFlag
 from rocketmq_logging import get_logger
 from remoting.exception import (RemotingException, RemotingTimeoutException,
                                 RemotingTooMuchRequestException)
-from remoting.protocol.codes import RequestCode
+from remoting.protocol.codes import RequestCode, ResponseCode
 from remoting.protocol.heartbeat import (ConsumeFromWhere, ConsumeType,
                                            ConsumerData, HeartbeatData, MessageModel)
 from remoting.protocol.namespace_util import NamespaceUtil
@@ -84,6 +84,16 @@ PULL_MAX_IDLE_TIME = 120.0
 # Per-round backoff while suspended (default 1000ms):
 # after suspend(), the pull/pop loop does not exit; it just backs off this long each round before checking the gate again.
 PULL_TIME_DELAY_WHEN_SUSPEND = 1.0
+
+# Per-round backoff when the **broker** answers FLOW_CONTROL(215) to a pull/pop (default 20ms):
+# broker-side throttling is transient, so the retry stays short. This is deliberately distinct
+# from the pause taken when the client's own receive-buffer thresholds hit (the _flow_control_hit
+# branch); sharing one delay there would either hammer a throttled broker or stall a healthy queue.
+PULL_TIME_DELAY_WHEN_BROKER_FLOW_CONTROL = 0.02
+
+# Per-round backoff for any other broker/client error on the pull/pop path (default 500ms):
+# long enough to avoid a hot retry loop, short enough to recover quickly.
+PULL_TIME_DELAY_WHEN_EXCEPTION = 0.5
 
 
 def _mq_sort_key(mq: MessageQueue):
@@ -917,6 +927,13 @@ class DefaultMQPushConsumer:
         # Queue key -> PopProcessQueue (popped-but-unacked count + whether it has been revoked by rebalance)
         self._pop_queues: Dict[str, PopProcessQueue] = {}
         self._pop_executor: Optional[ConsumeExecutor] = None
+        # awaitTerminationMillisWhenShutdown: the ceiling (in milliseconds) that shutdown() spends
+        # letting the consume executors drain their in-flight batches before returning.
+        # <= 0 (default) adds **no** extra ceiling: the POP executor keeps the fire-and-forget
+        # shutdown and the thread joins keep their fixed timeouts. > 0 bounds both the POP
+        # executor's bounded join and the dispatch-thread join (the path concurrent/orderly
+        # consumption runs on) with this value.
+        self.await_termination_millis_when_shutdown = 0
         # POP ordered-request dedup set, equality =
         # (shard index, pq reference, mq); the shard index is always 0 here, pq uses object identity
         self._pop_orderly_requests: set = set()
@@ -1121,6 +1138,16 @@ class DefaultMQPushConsumer:
 
     def set_pull_suspend_timeout_millis(self, millis: int) -> None:
         self.pull_suspend_timeout_millis = int(millis)
+
+    def set_await_termination_millis_when_shutdown(self, millis: int) -> None:
+        """Bound how long shutdown() waits for the consume executors to drain in-flight batches.
+
+        <= 0 (default) adds no extra ceiling; a positive value is that ceiling in milliseconds.
+        """
+        self.await_termination_millis_when_shutdown = int(millis)
+
+    def get_await_termination_millis_when_shutdown(self) -> int:
+        return self.await_termination_millis_when_shutdown
 
     def set_post_subscription_when_pull(self, enable: bool) -> None:
         """Toggle "bring the subscription expression into the request header when pulling"."""
@@ -1570,6 +1597,7 @@ class DefaultMQPushConsumer:
                 logger.warning("trace dispatcher start failed: %s", e)
 
     def shutdown(self) -> None:
+        pop_drain_executor: Optional[ConsumeExecutor] = None
         with self._lock:
             if not self._started:
                 return
@@ -1580,8 +1608,15 @@ class DefaultMQPushConsumer:
                     pq.set_dropped(True)
                 self._pop_queues.clear()
                 if self._pop_executor is not None:
-                    self._pop_executor.shutdown(wait=False)
+                    pop_drain_executor = self._pop_executor
+                    pop_drain_executor.shutdown(wait=False)
                     self._pop_executor = None
+        # awaitTerminationMillisWhenShutdown > 0: give the POP consume executor a **bounded**
+        # drain of its in-flight batches before moving on (never under the lock: the workers
+        # themselves take it). <= 0 keeps the previous fire-and-forget behavior: no extra ceiling.
+        await_millis = self.await_termination_millis_when_shutdown
+        if pop_drain_executor is not None and await_millis > 0:
+            pop_drain_executor.shutdown(wait=True, timeout=await_millis / 1000.0)
         # Persist consumed offsets once before exiting (a full flush of the currently held queues).
         # Must be called before _started=False (_require_client).
         try:
@@ -1609,10 +1644,17 @@ class DefaultMQPushConsumer:
             logger.debug("unregister on shutdown failed: %s", e)
         with self._lock:
             self._started = False
-        for t in (self._persist_thread, self._lock_thread, self._dispatch_thread,
+        # awaitTerminationMillisWhenShutdown > 0 also bounds the dispatch-thread join:
+        # concurrent/orderly batches run to completion on that thread, so this is where the
+        # "let in-flight consumption finish" ceiling applies for the non-POP consume path.
+        # <= 0 keeps the previous fixed 2s joins.
+        dispatch_join_timeout = (await_millis / 1000.0 if await_millis > 0 else 2)
+        for t in (self._persist_thread, self._lock_thread,
                   self._clean_expire_thread, self._rebalance_thread, self._heartbeat_thread):
             if t is not None and t.is_alive():
                 t.join(timeout=2)
+        if self._dispatch_thread is not None and self._dispatch_thread.is_alive():
+            self._dispatch_thread.join(timeout=dispatch_join_timeout)
         for t in list(self._queue_threads.values()):
             if t.is_alive():
                 t.join(timeout=2)
@@ -2107,11 +2149,21 @@ class DefaultMQPushConsumer:
                 # This is not an error, debug level only, to avoid polluting the client's runtime logs (see logging.py).
                 logger.debug("pull long-poll timeout for %s (benign, will retry): %s", mq, e)
                 continue
-            except Exception as e:  # noqa: BLE001
-                # Broker-side non-SUCCESS codes (TOPIC_NOT_EXIST / PULL_NOT_FOUND, etc.) or other errors:
-                # mostly expected paths like a topic not yet being created; debug + brief backoff to avoid a hot loop
+            except MQBrokerException as e:
+                # Broker-side non-SUCCESS codes (FLOW_CONTROL / TOPIC_NOT_EXIST / PULL_NOT_FOUND, etc.):
+                # mostly expected paths like a topic not yet being created; debug + brief backoff to avoid a hot loop.
+                # The broker's FLOW_CONTROL(215) gets its own short retry: it is transient producer-side
+                # throttling, distinct from this client's own buffer thresholds (_flow_control_hit),
+                # and neither belongs in the generic error backoff.
                 logger.debug("pull error for %s: %s: %s", mq, type(e).__name__, e)
-                time.sleep(0.5)
+                if e.response_code == ResponseCode.FLOW_CONTROL:
+                    time.sleep(PULL_TIME_DELAY_WHEN_BROKER_FLOW_CONTROL)
+                else:
+                    time.sleep(PULL_TIME_DELAY_WHEN_EXCEPTION)
+                continue
+            except Exception as e:  # noqa: BLE001
+                logger.debug("pull error for %s: %s: %s", mq, type(e).__name__, e)
+                time.sleep(PULL_TIME_DELAY_WHEN_EXCEPTION)
                 continue
 
             # Client-side filtering before delivery:
@@ -2249,9 +2301,18 @@ class DefaultMQPushConsumer:
                 # No message during long-poll suspension -> the client times out first; normal behavior, go to the next round directly
                 logger.debug("pop long-poll timeout for %s (benign, will retry)", mq)
                 continue
+            except MQBrokerException as e:  # noqa: BLE001
+                # Same split as the pull loop: the broker's FLOW_CONTROL(215) is transient throttling
+                # and retries quickly; every other broker error keeps the generic backoff.
+                logger.debug("pop error for %s: %s: %s", mq, type(e).__name__, e)
+                if e.response_code == ResponseCode.FLOW_CONTROL:
+                    time.sleep(PULL_TIME_DELAY_WHEN_BROKER_FLOW_CONTROL)
+                else:
+                    time.sleep(PULL_TIME_DELAY_WHEN_EXCEPTION)
+                continue
             except Exception as e:  # noqa: BLE001
                 logger.debug("pop error for %s: %s: %s", mq, type(e).__name__, e)
-                time.sleep(0.5)
+                time.sleep(PULL_TIME_DELAY_WHEN_EXCEPTION)
                 continue
 
             # The queue is revoked by rebalance after popping: this batch is **neither consumed nor acked**
@@ -4256,6 +4317,10 @@ class DefaultLitePullConsumer:
         self.subscription: Dict[str, str] = {}
         # The SubscriptionData for subscriptions (with tagsSet), used for the heartbeat sent to the broker for tag filter registration
         self.subscription_data: Dict[str, SubscriptionData] = {}
+        # Expression type per subscribed topic (TAG / SQL92 / ...): the pull request must carry the
+        # same type as the subscription data registered by the heartbeat, otherwise a SQL92
+        # expression would be evaluated by the broker as a tag string and silently match nothing.
+        self.subscription_expr_type: Dict[str, str] = {}
         # assign mode: the tag filter expression when the caller explicitly specifies queues (passed through to pull)
         self._assign_sub_expr: Dict[str, str] = {}
         self._assign_mode = False
@@ -4448,6 +4513,7 @@ class DefaultLitePullConsumer:
         self._assign_mode = False
         ns = self._with_namespace(topic)
         self.subscription[ns] = sub_expression
+        self.subscription_expr_type[ns] = ExpressionType.TAG
         # Build the SubscriptionData synchronously, so the heartbeat registers the tag subscription with the broker (otherwise the broker does not recognize tag filtering)
         try:
             self.subscription_data[ns] = FilterAPI.build_subscription_data(ns, sub_expression)
@@ -4455,13 +4521,32 @@ class DefaultLitePullConsumer:
             self.subscription_data.pop(ns, None)
 
     def subscribe_with_selector(self, topic: str, selector) -> None:
-        # Lite supports tag-expression subscriptions only; MessageSelector is always treated as a tag
-        self.subscribe(topic, getattr(selector, "expression", "*"))
+        # Carry the selector's expression type end-to-end: TAG keeps the tag semantics
+        # (heartbeat tagsSet/codeSet + TAG on the wire); other types (SQL92 / CLASS_FILTER)
+        # register selector-typed subscription data and the pull request repeats that type,
+        # so the broker evaluates the expression instead of reading it as a tag string.
+        selector_type = getattr(selector, "type", ExpressionType.TAG) or ExpressionType.TAG
+        if selector_type == ExpressionType.TAG:
+            self.subscribe(topic, getattr(selector, "expression", "*") or "*")
+            return
+        expression = getattr(selector, "expression", None)
+        if not expression:
+            raise ValueError("Expression can't be null! %s" % selector_type)
+        self._assign_mode = False
+        ns = self._with_namespace(topic)
+        self.subscription[ns] = expression
+        self.subscription_expr_type[ns] = selector_type
+        # Same build policy as the push side: non-tag types only set topic/subString/expressionType,
+        # leaving tagsSet/codeSet empty (the expression is not a tag list).
+        sub = SubscriptionData(topic=ns, sub_string=expression)
+        sub.expression_type = selector_type
+        self.subscription_data[ns] = sub
 
     def unsubscribe(self, topic: str) -> None:
         ns = self._with_namespace(topic)
         self.subscription.pop(ns, None)
         self.subscription_data.pop(ns, None)
+        self.subscription_expr_type.pop(ns, None)
 
     def set_sub_expression_for_assign(self, topic: str, sub_expression: str) -> None:
         """Specify a tag filter expression for a topic's queues in assign mode (setSubExpressionForAssign).
@@ -4706,6 +4791,9 @@ class DefaultLitePullConsumer:
             offset = self._resolve_initial_offset(mq)
             self._next_offset[mq] = offset
         sub = self._subscription_for(mq.topic) or "*"
+        # The expression type that goes on the wire must match the subscription data the heartbeat
+        # registered; an unknown topic (assign mode without an explicit expression) keeps tag semantics.
+        exp_type = self.subscription_expr_type.get(mq.topic, ExpressionType.TAG)
         # Short poll (suspend=False), with offsets committed separately by auto-commit, not carried along on the pull request.
         # lite_pull=True sets FLAG_LITE_PULL_MESSAGE (buildSysFlag(false, block, true, false, true)),
         # and that flag decides the request code switches to LITE_PULL_MESSAGE(361): the broker distinguishes pull-mode subscription semantics by this code,
@@ -4716,7 +4804,7 @@ class DefaultLitePullConsumer:
         try:
             result = self._mq_client.pull_message(
                 self.consumer_group, mq, offset, self.pull_batch_size,
-                sys_flag, 0, sub, 0, ExpressionType.TAG,
+                sys_flag, 0, sub, 0, exp_type,
                 timeout_millis=30000, max_msg_bytes=-1,
                 suspend_timeout_millis=15000)
         except Exception as e:  # noqa: BLE001
@@ -4735,7 +4823,12 @@ class DefaultLitePullConsumer:
         if intact:
             self._next_offset[mq] = result.next_begin_offset
         if intact and result.status == PullStatus.FOUND and result.msg_found_list:
-            msgs = self._filter_tags(mq.topic, result.msg_found_list, sub)
+            if exp_type == ExpressionType.TAG:
+                msgs = self._filter_tags(mq.topic, result.msg_found_list, sub)
+            else:
+                # Non-tag expressions are evaluated by the broker; a client-side tag pass would
+                # read the SQL/class expression as a tag list and drop everything it matched.
+                msgs = result.msg_found_list
             if msgs:
                 self._enqueue(msgs)
                 return True

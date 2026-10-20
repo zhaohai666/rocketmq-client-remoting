@@ -116,6 +116,12 @@ public:
     void subscribe(const std::string& topic, const std::string& subExpression = "*");
     void subscribe(const std::string& topic, const std::string& subExpression,
                    std::shared_ptr<LiteMessageQueueListener> messageQueueListener);
+    // Selector subscription (tag / SQL92): the registered entry carries the selector's own expression
+    // type, so both the pull request and the heartbeat registration reach the broker with it, and the
+    // client-side tag re-filter stays out of the way (a selector expression is not a tag list).
+    void subscribe(const std::string& topic, const MessageSelector& selector);
+    void subscribe(const std::string& topic, const MessageSelector& selector,
+                   std::shared_ptr<LiteMessageQueueListener> messageQueueListener);
     void registerTopicMessageQueueChangeListener(
         const std::string& topic, std::shared_ptr<TopicMessageQueueChangeListener> listener);
     // One **pass** of the background comparison: walk the registered queue-change listeners, re-query
@@ -123,6 +129,9 @@ public:
     // snapshot and call back only on a real change. Public so tests need not wait for the background first check.
     void fetchTopicMessageQueuesAndCompare();
     void setSubExpressionForAssign(const std::string& topic, const std::string& subExpression);
+    // Assign mode with a selector: the pull of the assigned queues carries the selector's expression
+    // type and version exactly as the subscribe path does.
+    void setSubExpressionForAssign(const std::string& topic, const MessageSelector& selector);
     // Assign mode: queues are given explicitly, no rebalance involved.
     void assign(const std::vector<MessageQueue>& messageQueues);
 
@@ -169,7 +178,10 @@ private:
     void metadataLoop();
     bool pullOne(const MessageQueue& mq);
     std::string subscriptionFor(const std::string& topic) const;
-    bool filterTags(const std::string& topic, std::vector<MessageExt>& msgs, const std::string& sub);
+    // The registered SubscriptionData that describes this topic's subscription (expression type and
+    // version), falling back to the plain tag form of the raw table entry.
+    SubscriptionData subscriptionDataFor(const std::string& topic) const;
+    bool filterTags(std::vector<MessageExt>& msgs, const SubscriptionData& subData);
     void enqueue(const std::vector<MessageExt>& msgs);
     void maybeAutoCommit();
     // The half shared by commit()'s three entry points: write the in-memory offset table + persistAll on demand.
@@ -215,7 +227,9 @@ private:
 
     // Subscription table in subscribe mode (topic -> sub_expression, namespace already applied)
     std::map<std::string, std::string> subscription_;
-    // SubscriptionData per subscription (with tagsSet), used by the heartbeat sent to the broker to register tag filtering
+    // SubscriptionData per subscription, built selector-aware by subscribe / setSubExpressionForAssign:
+    // the heartbeat sent to the broker registers it, and the pull of a topic reads its expression type and
+    // version from it (a tag entry also carries the parsed tagsSet the delivery-side re-filter uses).
     std::map<std::string, SubscriptionData> subscriptionData_;
     // Assign mode: topic -> tag filter expression (passed through to pull)
     std::map<std::string, std::string> assignSubExpr_;

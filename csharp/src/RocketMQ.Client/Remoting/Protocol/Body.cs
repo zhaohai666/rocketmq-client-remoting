@@ -878,6 +878,241 @@ public sealed class ConsumeMessageDirectlyResult
     }
 }
 
+/// <summary>
+/// One entry of a BATCH_ACK_MESSAGE (200151) body.
+///
+/// It stands for a whole group of POP checkpoints that share retry flag, queueId,
+/// ckQueueOffset and popTime; the individual messages are named by the bit set, where bit
+/// <c>queueOffset - ckQueueOffset</c> marks "that consume-queue offset is confirmed".
+///
+/// On the wire every key uses its compact spelling (c/t/r/so/q/rq/pt/it/b); the long names
+/// are accepted when reading, so a peer that sends them still parses.
+/// </summary>
+public sealed class BatchAck
+{
+    /// <summary>Compact key written on the wire, long name accepted when reading.</summary>
+    private static readonly string[][] FieldKeys =
+    {
+        new[] { "c", "consumerGroup" },
+        new[] { "t", "topic" },
+        new[] { "r", "retry" },
+        new[] { "so", "startOffset" },
+        new[] { "q", "queueId" },
+        new[] { "rq", "reviveQueueId" },
+        new[] { "pt", "popTime" },
+        new[] { "it", "invisibleTime" },
+        new[] { "b", "bitSet" },
+    };
+
+    public string ConsumerGroup { get; set; } = string.Empty;
+    public string Topic { get; set; } = string.Empty;
+
+    /// <summary>The retry flag segment of the checkpoint: "0" normal, "1"/"2" retry.</summary>
+    public string Retry { get; set; } = ExtraInfoUtil.NormalTopic;
+
+    /// <summary>ckQueueOffset: the consume-queue offset the bits are counted from.</summary>
+    public long StartOffset { get; set; }
+
+    public int QueueId { get; set; }
+    public int ReviveQueueId { get; set; }
+    public long PopTime { get; set; }
+    public long InvisibleTime { get; set; }
+
+    /// <summary>The confirmed bit indexes (queueOffset - StartOffset), ascending and unique.</summary>
+    public SortedSet<int> AckOffsets { get; } = new();
+
+    public JsonValue ToJson()
+    {
+        var v = JsonValue.MakeObject();
+        v.Set("c", JsonValue.MakeString(ConsumerGroup));
+        v.Set("t", JsonValue.MakeString(Topic));
+        v.Set("r", JsonValue.MakeString(Retry));
+        v.Set("so", JsonValue.MakeInt(StartOffset));
+        v.Set("q", JsonValue.MakeInt(QueueId));
+        v.Set("rq", JsonValue.MakeInt(ReviveQueueId));
+        v.Set("pt", JsonValue.MakeInt(PopTime));
+        v.Set("it", JsonValue.MakeInt(InvisibleTime));
+        v.Set("b", JsonValue.MakeString(Convert.ToBase64String(PackBits(AckOffsets))));
+        return v;
+    }
+
+    public static BatchAck FromJson(JsonValue v)
+    {
+        var ack = new BatchAck
+        {
+            ConsumerGroup = ReadString(v, 0),
+            Topic = ReadString(v, 1),
+            Retry = ReadString(v, 2),
+            StartOffset = ReadLong(v, 3),
+            QueueId = unchecked((int)ReadLong(v, 4)),
+            ReviveQueueId = unchecked((int)ReadLong(v, 5)),
+            PopTime = ReadLong(v, 6),
+            InvisibleTime = ReadLong(v, 7),
+        };
+
+        foreach (int index in UnpackBits(ReadBits(v, 8)))
+        {
+            ack.AckOffsets.Add(index);
+        }
+
+        return ack;
+    }
+
+    private static string ReadString(JsonValue v, int field)
+    {
+        JsonValue? hit = v.Find(FieldKeys[field][0]) ?? v.Find(FieldKeys[field][1]);
+        return hit is { IsString: true } ? hit.StringValue() : string.Empty;
+    }
+
+    private static long ReadLong(JsonValue v, int field)
+    {
+        JsonValue? hit = v.Find(FieldKeys[field][0]) ?? v.Find(FieldKeys[field][1]);
+        return hit is null ? 0L : hit.IntValue(0);
+    }
+
+    private static byte[] ReadBits(JsonValue v, int field)
+    {
+        JsonValue? hit = v.Find(FieldKeys[field][0]) ?? v.Find(FieldKeys[field][1]);
+        if (hit is not { IsString: true } || hit.StringValue().Length == 0)
+        {
+            return Array.Empty<byte>();
+        }
+
+        try
+        {
+            return Convert.FromBase64String(hit.StringValue());
+        }
+        catch (FormatException)
+        {
+            // A base64 payload the peer cannot have meant: read it as an empty bit set
+            return Array.Empty<byte>();
+        }
+    }
+
+    /// <summary>
+    /// Packs the bit indexes into the wire representation: bit i lives in byte i/8 at position
+    /// i%8 (little-endian within the byte), and the array stops after the byte holding the
+    /// highest set bit, so no trailing zero byte is ever emitted. An empty set is an empty
+    /// array.
+    /// </summary>
+    internal static byte[] PackBits(IEnumerable<int> bitIndexes)
+    {
+        int highest = -1;
+        foreach (int index in bitIndexes)
+        {
+            RequireIndexRange(index);
+            if (index > highest)
+            {
+                highest = index;
+            }
+        }
+
+        if (highest < 0)
+        {
+            return Array.Empty<byte>();
+        }
+
+        var bytes = new byte[highest / 8 + 1];
+        foreach (int index in bitIndexes)
+        {
+            bytes[index / 8] |= unchecked((byte)(1 << (index % 8)));
+        }
+
+        return bytes;
+    }
+
+    /// <summary>The set bit indexes of a packed array, in ascending order.</summary>
+    internal static List<int> UnpackBits(byte[] bytes)
+    {
+        var indexes = new List<int>();
+        for (int i = 0; i < bytes.Length; ++i)
+        {
+            for (int bit = 0; bit < 8; ++bit)
+            {
+                if ((bytes[i] & (1 << bit)) != 0)
+                {
+                    indexes.Add(i * 8 + bit);
+                }
+            }
+        }
+
+        return indexes;
+    }
+
+    /// <summary>Bit indexes above the range the wire format can address are rejected rather
+    /// than turned into an out-of-memory allocation.</summary>
+    internal static void RequireIndexRange(int index)
+    {
+        if (index < 0 || index > MaxBitIndex)
+        {
+            throw new ArgumentException(
+                "batch ack bit index out of range: " + index.ToString(CultureInfo.InvariantCulture)
+                + ", the maximum is " + MaxBitIndex.ToString(CultureInfo.InvariantCulture));
+        }
+    }
+
+    /// <summary>Highest bit index a single entry can address (one consume-queue window).</summary>
+    public const int MaxBitIndex = 1024 * 1024 - 1;
+}
+
+/// <summary>
+/// BATCH_ACK_MESSAGE (200151) request body: the broker all the entries belong to, plus the
+/// entries themselves. Long key spellings on purpose here (only the entries are compacted).
+/// </summary>
+public sealed class BatchAckMessageRequestBody
+{
+    public string BrokerName { get; set; } = string.Empty;
+
+    public List<BatchAck> Acks { get; } = new();
+
+    public JsonValue ToJson()
+    {
+        var v = JsonValue.MakeObject();
+        v.Set("brokerName", JsonValue.MakeString(BrokerName));
+        var acks = JsonValue.MakeArray();
+        foreach (BatchAck ack in Acks)
+        {
+            acks.PushArray(ack.ToJson());
+        }
+
+        v.Set("acks", acks);
+        return v;
+    }
+
+    public static BatchAckMessageRequestBody FromJson(JsonValue v)
+    {
+        var body = new BatchAckMessageRequestBody
+        {
+            BrokerName = v.Get("brokerName").StringValue(string.Empty),
+        };
+
+        JsonValue? acks = v.Find("acks");
+        if (acks is { IsArray: true })
+        {
+            for (int i = 0; i < acks.Size(); ++i)
+            {
+                body.Acks.Add(BatchAck.FromJson(acks.At(i)));
+            }
+        }
+
+        return body;
+    }
+
+    public byte[] Encode() => RemotingSerializable.Encode(ToJson());
+
+    public static bool Decode(byte[] data, out BatchAckMessageRequestBody @out)
+    {
+        @out = new BatchAckMessageRequestBody();
+        if (data.Length == 0 || !RemotingSerializable.Decode(data, out JsonValue v))
+        {
+            return false;
+        }
+
+        @out = FromJson(v);
+        return true;
+    }
+}
+
 /// <summary>String map codec helper for the body layer.</summary>
 internal static class AdminJsonStrings
 {

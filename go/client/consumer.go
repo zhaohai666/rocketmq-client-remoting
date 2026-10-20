@@ -226,6 +226,12 @@ type DefaultMQPushConsumer struct {
 	draining bool
 	inFlight sync.WaitGroup
 
+	// awaitTerminationMillisWhenShutdown is the ceiling, in milliseconds, that
+	// Shutdown spends waiting for the batches still in hand. 0 (the default)
+	// keeps this client's own drain budget; any positive value replaces it, so
+	// an operator can either cut the wait short or extend it past the default.
+	awaitTerminationMillisWhenShutdown int64
+
 	innerProducerMu sync.Mutex
 	producer        *DefaultMQProducer
 
@@ -666,6 +672,24 @@ func (c *DefaultMQPushConsumer) SetConsumeTimeout(minutes int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.consumeTimeout = minutes
+}
+
+// SetAwaitTerminationMillisWhenShutdown sets, in milliseconds, how long
+// Shutdown may wait for the batches that are already in the listener's hands.
+// 0 — the default — keeps this client's own drain budget; a positive value
+// replaces it, so a caller can either give the drain more room or cut it short.
+func (c *DefaultMQPushConsumer) SetAwaitTerminationMillisWhenShutdown(ms int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.awaitTerminationMillisWhenShutdown = ms
+}
+
+// AwaitTerminationMillisWhenShutdown reports the configured drain ceiling
+// (0 = the client's own default budget).
+func (c *DefaultMQPushConsumer) AwaitTerminationMillisWhenShutdown() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.awaitTerminationMillisWhenShutdown
 }
 
 // SetSuspendCurrentQueueTimeMillis sets the orderly suspend default.
@@ -1148,6 +1172,16 @@ func (c *DefaultMQPushConsumer) Start() error {
 	}
 	c.clientID = common.BuildMQClientID(common.CachedIPStr(), c.instanceName, c.unitName, c.streamRequest)
 	cfg := NewClientInstanceConfig()
+	// The transport the instance dials with is built from this config, so a
+	// consumer that asked for TLS has to write the flag here too: every RPC the
+	// instance sends — the pulls, the beats, the offset commits, the locks —
+	// rides that transport. Without it the flag only ever reached the reply
+	// producer and the consumer itself kept talking plaintext.
+	//
+	// Start() already holds c.mu, so the field is read directly.
+	if c.tlsEnable != nil {
+		cfg.TLSEnable = *c.tlsEnable
+	}
 	cfg.SocksProxy = c.socksProxy
 	cfg.UseHeartbeatV2 = c.useHeartbeatV2
 	instance := CreateOrGetInstance(c.clientID, c.nameServerAddrs, cfg)
@@ -1326,6 +1360,7 @@ func (c *DefaultMQPushConsumer) Shutdown() {
 	}
 	c.stopOnce.Do(func() { close(c.stopCh) })
 	instance := c.instance
+	awaitMillis := c.awaitTerminationMillisWhenShutdown
 	c.mu.Unlock()
 
 	// Freeze new consume work right away: batches still in flight are waited
@@ -1353,7 +1388,13 @@ func (c *DefaultMQPushConsumer) Shutdown() {
 	// immediate process exit can cut a CONSUMER_SEND_MSG_BACK(36) short and the
 	// message never reaches %RETRY%/%DLQ%; a short join budget (seconds, not
 	// tens of seconds) is the drained-shutdown contract.
-	c.waitInFlightDrain()
+	//
+	// This is the one join every consume path reports to — the concurrent
+	// batches, the orderly batch run inline in the dispatch loop and the POP
+	// submits all register with inFlight — so the ceiling set through
+	// SetAwaitTerminationMillisWhenShutdown bounds this wait instead of
+	// introducing a second one.
+	c.waitInFlightDrain(shutdownDrainCeiling(awaitMillis))
 	// A second persist happens at instance shutdown
 	// (persistAllConsumerOffset): offsets the drain just advanced must land too.
 	if err := c.PersistConsumerOffset(); err != nil {
@@ -1431,22 +1472,33 @@ func (c *DefaultMQPushConsumer) beginInFlight() bool {
 // cannot hang shutdown, generous enough for a send-back round trip.
 var shutdownDrainBudget = 30 * time.Second
 
-// waitInFlightDrain waits (bounded) for the batches registered by beginInFlight
-// to finish. Must be called after freezeInFlight, while the client instance is
-// still alive — that window is what lets their send-backs land.
-func (c *DefaultMQPushConsumer) waitInFlightDrain() {
+// shutdownDrainCeiling turns awaitTerminationMillisWhenShutdown into the drain
+// budget. 0 — the default — and anything else that is not positive keep this
+// client's own budget; a positive value replaces it, because the caller asked
+// for that exact ceiling.
+func shutdownDrainCeiling(millis int64) time.Duration {
+	if millis <= 0 {
+		return shutdownDrainBudget
+	}
+	return time.Duration(millis) * time.Millisecond
+}
+
+// waitInFlightDrain waits (bounded by budget) for the batches registered by
+// beginInFlight to finish. Must be called after freezeInFlight, while the client
+// instance is still alive — that window is what lets their send-backs land.
+func (c *DefaultMQPushConsumer) waitInFlightDrain(budget time.Duration) {
 	drained := make(chan struct{})
 	go func() {
 		c.inFlight.Wait()
 		close(drained)
 	}()
-	timer := time.NewTimer(shutdownDrainBudget)
+	timer := time.NewTimer(budget)
 	defer timer.Stop()
 	select {
 	case <-drained:
 	case <-timer.C:
 		common.LogWarnf("consumer shutdown drain timed out after %s, group=%s; in-flight batches detached",
-			shutdownDrainBudget, c.consumerGroup)
+			budget, c.consumerGroup)
 	}
 }
 

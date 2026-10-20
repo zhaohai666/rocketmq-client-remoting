@@ -46,6 +46,10 @@ public sealed class DefaultLitePullConsumer
     private readonly Dictionary<string, SubscriptionData> _subscriptionData = new(StringComparer.Ordinal);
     // assign mode: topic -> tag filter expression (passed through to pull)
     private readonly Dictionary<string, string> _assignSubExpr = new(StringComparer.Ordinal);
+    // Expression type per topic for the selector-flavoured subscriptions (real topic ->
+    // TAG/SQL92/CLASS_FILTER). A topic missing from this table is a plain TAG subscription,
+    // which is exactly what every string-based subscription is today.
+    private readonly Dictionary<string, string> _subscriptionType = new(StringComparer.Ordinal);
     private bool _assignMode;
     private readonly HashSet<MessageQueue> _assigned = new();
 
@@ -206,6 +210,7 @@ public sealed class DefaultLitePullConsumer
         lock (_lock)
         {
             _subscription[ns] = subExpression;
+            _subscriptionType.Remove(ns);
             try
             {
                 _subscriptionData[ns] = FilterAPI.BuildSubscriptionData(ns, subExpression);
@@ -217,12 +222,50 @@ public sealed class DefaultLitePullConsumer
         }
     }
 
+    /// <summary>Selector-flavoured subscribe: the expression type is carried end-to-end
+    /// (subscription table -> heartbeat -> the lite-pull request's expressionType). A TAG
+    /// selector builds exactly the subscription the string overload builds today; a SQL92
+    /// (or class-filter) expression is kept verbatim, never hashed as a tag list.</summary>
+    public void Subscribe(string topic, MessageSelector selector)
+    {
+        ArgumentNullException.ThrowIfNull(selector);
+        _assignMode = false;
+        string ns = WithNamespace(topic);
+        lock (_lock)
+        {
+            try
+            {
+                SubscriptionData sub = SubscriptionSelectors.Build(ns, selector);
+                _subscription[ns] = sub.SubString;
+                if (sub.ExpressionType == ExpressionType.TAG)
+                {
+                    _subscriptionType.Remove(ns);
+                }
+                else
+                {
+                    _subscriptionType[ns] = sub.ExpressionType;
+                }
+
+                _subscriptionData[ns] = sub;
+            }
+            catch
+            {
+                _subscription.Remove(ns);
+                _subscriptionType.Remove(ns);
+                _subscriptionData.Remove(ns);
+            }
+        }
+    }
+
     public void SetSubExpressionForAssign(string topic, string subExpression)
     {
         string ns = WithNamespace(topic);
         lock (_lock)
         {
             _assignSubExpr[ns] = subExpression;
+            // The assign-mode string is a TAG filter again: drop any selector-typed entry
+            // for this topic so pull and heartbeat agree on it.
+            _subscriptionType.Remove(ns);
             try
             {
                 _subscriptionData[ns] = FilterAPI.BuildSubscriptionData(ns, subExpression);
@@ -477,6 +520,16 @@ public sealed class DefaultLitePullConsumer
         return "*";
     }
 
+    /// <summary>The expression type recorded for this topic; a topic without a selector
+    /// entry is TAG, which is every string-based subscription's type today.</summary>
+    private string SubscriptionTypeFor(string topic)
+    {
+        lock (_lock)
+        {
+            return _subscriptionType.TryGetValue(topic, out string? t) ? t : ExpressionType.TAG;
+        }
+    }
+
     private bool PullOne(MessageQueue mq)
     {
         long offset;
@@ -487,13 +540,29 @@ public sealed class DefaultLitePullConsumer
         }
 
         string sub = SubscriptionFor(mq.Topic);
+        string exprType = SubscriptionTypeFor(mq.Topic);
+        // A TAG subscription travels with subVersion 0 exactly as today; only an
+        // expression with its own version (SQL92 / class filter) sends the real one.
+        long subVersion = 0;
+        if (exprType != ExpressionType.TAG)
+        {
+            lock (_lock)
+            {
+                if (_subscriptionData.TryGetValue(mq.Topic, out SubscriptionData? d)
+                    && d is not null)
+                {
+                    subVersion = d.SubVersion;
+                }
+            }
+        }
+
         int sysFlag = PullSysFlag.BuildSysFlag(commitOffset: false, suspend: false,
             subscription: true, classFilter: false, litePull: true);
         PullResult result;
         try
         {
             result = RequireClient().PullMessage(_consumerGroup, mq, offset, _pullBatchSize, sysFlag, 0,
-                sub, /*subVersion=*/0, ExpressionType.TAG, /*timeoutMillis=*/30000, /*maxMsgBytes=*/-1,
+                sub, subVersion, exprType, /*timeoutMillis=*/30000, /*maxMsgBytes=*/-1,
                 /*suspendTimeoutMillis=*/15000);
         }
         catch
@@ -518,7 +587,12 @@ public sealed class DefaultLitePullConsumer
         }
 
         var msgs = new List<MessageExt>(result.MsgFoundList);
-        FilterTags(mq.Topic, msgs, sub);
+        // Client-side tag re-checking only makes sense for a TAG subscription: an SQL92 /
+        // class-filter expression is not a tag list and would filter everything out.
+        if (exprType == ExpressionType.TAG)
+        {
+            FilterTags(mq.Topic, msgs, sub);
+        }
         if (msgs.Count == 0)
         {
             // All filtered out by tags: the window is already read as far as the broker

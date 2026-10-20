@@ -476,6 +476,11 @@ class DefaultMQProducer
      * (set to false after shutdown).
      */
     public bool $heartbeatRunning = false;
+    /**
+     * Registration-refresh period handed to the MQClientInstance built by start().
+     * Read once at start() (same rule as pollNameServerInterval): it decides the cadence of
+     * the beats the instance pump sends for this producer-only client.
+     */
     public int $heartbeatIntervalMillis = 30000;
     // Route refresh period (default 30000ms).
     // Passed through only once when start() builds the MQClientInstance; later changes take
@@ -1310,6 +1315,7 @@ class DefaultMQProducer
             socksProxy: $this->socksProxy,
             useHeartbeatV2: $this->useHeartbeatV2,
             vipChannelEnabled: $this->vipChannelEnabled,
+            heartbeatIntervalMillis: $this->heartbeatIntervalMillis,
         );
         if ($this->rpcHook !== null) {
             $this->mqClient->remotingClient->registerRpcHook($this->rpcHook);

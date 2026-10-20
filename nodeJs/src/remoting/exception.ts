@@ -41,7 +41,13 @@ export class MQClientException extends Error {
 }
 
 export class MQBrokerException extends Error {
-  constructor(responseCode, errorMessage, brokerAddr = '') {
+  // Declared, not just assigned: callers branch on the code (the SYNC retry
+  // loop consults it before deciding whether another broker is worth trying),
+  // so an implicit-any field would let a typo in that branch pass unseen.
+  responseCode: number;
+  brokerAddr: string;
+
+  constructor(responseCode: number, errorMessage: string, brokerAddr: string = '') {
     super(errorMessage || `CODE: ${responseCode}`);
     this.name = 'MQBrokerException';
     this.responseCode = responseCode;

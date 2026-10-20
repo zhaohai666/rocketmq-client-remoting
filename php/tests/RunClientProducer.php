@@ -1892,6 +1892,46 @@ final class RunClientProducer
         $this->check(true, 'registration suite shutdown complete');
     }
 
+    /**
+     * The instance pump is the only thing keeping a producer-only app registered, and its period
+     * comes from the facade. The schedule is re-anchored with one far-future tick, then stepped on
+     * the exact boundaries; every gate here is the number of beats the broker recorded, never a
+     * wall-clock window.
+     */
+    private function testHeartbeatIntervalPassthrough(ProducerFakeBroker $broker): void
+    {
+        $p = $this->makeProducer($broker, 'GID-hb-interval', 'IntervalTopic', 'hb-interval-inst');
+        $this->checkSame(30000, $p->heartbeatIntervalMillis, 'a producer beats every 30s by default');
+        $p->heartbeatIntervalMillis = 5000;
+        $p->start();
+        $inst = $this->privateOf($p, 'mqClient');
+        $this->check($inst instanceof MQClientInstance, 'the producer owns an instance');
+        $this->checkSame(5000, $inst->heartbeatIntervalMillis,
+            'start() hands the producer interval to the instance pump');
+
+        // A beat needs a known broker: the route only arrives with the first send.
+        $p->send(new Message('IntervalTopic', 'interval-body'));
+        $base = (int) (microtime(true) * 1000) + 10_000_000;
+        $before = $broker->logCount(RequestCode::HEART_BEAT);
+        $this->waitLogCount($broker, RequestCode::HEART_BEAT, $before + 1);
+        $anchored = $broker->logCount(RequestCode::HEART_BEAT);
+        $this->check($anchored >= $before + 1, 'a beat is recorded once the producer is registered');
+
+        $inst->tick($base);
+        $due = $this->waitLogCount($broker, RequestCode::HEART_BEAT, $anchored + 1);
+        $this->check($due > $anchored, 'tick(base): the pump is due at its anchor and beats');
+
+        $count = $broker->logCount(RequestCode::HEART_BEAT);
+        $inst->tick($base + 4999);
+        $this->checkSame($count, $broker->logCount(RequestCode::HEART_BEAT),
+            'tick(+4999): one millisecond short of the producer interval beats nobody');
+        $this->waitLogCount($broker, RequestCode::HEART_BEAT, $count + 1);
+
+        $this->waitLogCount($broker, RequestCode::HEART_BEAT, $due + 1);
+        $count = $broker->logCount(RequestCode::HEART_BEAT);
+        $this->checkSame($count, 0, 'placeholder');
+    }
+
     /** @return list<array{clientId: string, producers: list<string>, consumers: list<string>, fingerprint: mixed, withoutSub: mixed}> */
     private function heartbeatPayloads(ProducerFakeBroker $broker): array
     {

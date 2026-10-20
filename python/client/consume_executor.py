@@ -98,7 +98,13 @@ class ConsumeExecutor:
         """Count of task exceptions that were swallowed (for observation/unit tests only)."""
         return self._handler_exceptions
 
-    def shutdown(self, wait: bool = False) -> None:
+    def shutdown(self, wait: bool = False, timeout: Optional[float] = None) -> None:
+        """Stop accepting tasks; workers still finish the tasks already queued.
+
+        ``wait``: join the worker threads before returning. ``timeout`` (seconds) bounds
+        that join; ``None`` (the default) keeps the join unbounded. Idempotent: a second
+        call after shutdown still collects and joins the live worker roster.
+        """
         pass
         with self._lock:
             if self._shutdown:
@@ -109,7 +115,7 @@ class ConsumeExecutor:
                 threads = list(self._threads)
         if wait:
             for t in threads:
-                t.join()
+                t.join(timeout=timeout)
 
     # ---------------- internal ----------------
 

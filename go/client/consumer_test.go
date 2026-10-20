@@ -14,11 +14,13 @@
 package client
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -73,10 +75,12 @@ type consumerBroker struct {
 	createTopicExt []*common.StringMap
 
 	// pullCode forces an answer code for PULL_MESSAGE(11); nextBegin and
-	// suggest override the response header.
-	pullCode  int32
-	nextBegin *int64
-	suggest   *int32
+	// suggest override the response header. pullForcedLeft bounds how many
+	// answers stay forced (-1 = every answer, as long as pullCode is set).
+	pullCode       int32
+	pullForcedLeft int
+	nextBegin      *int64
+	suggest        *int32
 	// lockOKMQSet is what LOCK_BATCH_MQ(41) grants. nil => grant everything the
 	// client asked for.
 	lockOKMQSet []common.MessageQueue
@@ -104,7 +108,20 @@ func newConsumerBroker() *consumerBroker {
 		minOffset:          map[mqKey]int64{},
 		committed:          map[string]int64{},
 		assignmentsByTopic: map[string]*assignmentFixture{},
+		// A forced answer is unlimited unless a test scripts a count.
+		pullForcedLeft: -1,
 	}
+}
+
+// forcePullAnswers makes the next count PULL_MESSAGE(11) answers carry code and
+// the ones after that come from the store again. A test that needs a consumer to
+// sit through a run of broker failures wants the run to END, so the state it
+// waits on — the message reaching the listener — says which wait the loop used.
+func (b *consumerBroker) forcePullAnswers(code int32, count int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.pullCode = code
+	b.pullForcedLeft = count
 }
 
 func commitKey(group, topic string, queueID int32) string {
@@ -321,6 +338,16 @@ func (b *consumerBroker) answerPull(req *remoting.RemotingCommand) *remoting.Rem
 	b.pulls = append(b.pulls, header)
 	b.pullExt = append(b.pullExt, req.ExtFields().Clone())
 	forced := b.pullCode
+	if forced != 0 && b.pullForcedLeft >= 0 {
+		// A scripted run of forced answers: after the requested count the broker
+		// goes back to answering from its store, so a consumer that keeps
+		// retrying eventually gets the message.
+		if b.pullForcedLeft == 0 {
+			forced = 0
+		} else {
+			b.pullForcedLeft--
+		}
+	}
 	next := b.nextBegin
 	suggest := b.suggest
 	b.mu.Unlock()
@@ -1797,5 +1824,299 @@ func TestConsumerStartRequiresPrerequisites(t *testing.T) {
 	requireNoError(t, "subscribe", c3.Subscribe(topic, "*"))
 	if err := c3.Start(); err == nil {
 		t.Errorf("Start with the DEFAULT_CONSUMER group must fail")
+	}
+}
+
+// ---------------------------------------------------------------- TLS switch
+
+// The push consumer's TLS switch decides how the instance's transport dials, so
+// it has to land in the instance config: the pulls, the beats, the offset
+// commits and the locks all ride that one transport. The assertion reaches past
+// the consumer into the transport itself, because a flag that stops at the
+// config never reaches the socket.
+func TestPushConsumerTLSReachesTheInstanceTransport(t *testing.T) {
+	topic := uniqueTopic("GoConsumerTLS", t)
+	f := newClusterFixture(t, map[string]int{topic: 1})
+
+	c := f.newConsumer(t, "GID_go_tls_on", newRecordingListener())
+	c.SetTLSEnable(true)
+	startConsumer(t, c, topic, "*")
+
+	inst := c.instance
+	if inst == nil {
+		t.Fatal("consumer has no instance after Start")
+	}
+	if !inst.Config().TLSEnable {
+		t.Errorf("instance config TLSEnable = false, want true: the consumer asked for TLS before Start")
+	}
+	if !inst.remoting.Config().TLSEnable {
+		t.Error("the transport the instance dials with is not TLS-enabled: the switch died before the socket")
+	}
+
+	// The reply producer the consumer builds for send-back is the other half of
+	// the same intent: a send-back written in plaintext to a TLS-only broker is
+	// a lost message, not a log line.
+	producer, err := c.innerProducer()
+	requireNoError(t, "inner producer", err)
+	t.Cleanup(producer.Shutdown)
+	if inner := FindInstance(producer.clientID); inner == nil {
+		t.Errorf("the reply producer has no live instance under clientID %q", producer.clientID)
+	} else if !inner.Config().TLSEnable {
+		t.Error("the reply producer's instance is not TLS-enabled")
+	}
+}
+
+// Control: the switch stays opt-in. A consumer that never asked for TLS must
+// leave the instance default alone, or every plaintext cluster would be reached
+// through a handshake nobody requested.
+func TestPushConsumerTLSUnsetLeavesTheInstanceDefault(t *testing.T) {
+	topic := uniqueTopic("GoConsumerTLSOff", t)
+	f := newClusterFixture(t, map[string]int{topic: 1})
+
+	c := f.newConsumer(t, "GID_go_tls_unset", newRecordingListener())
+	startConsumer(t, c, topic, "*")
+
+	if inst := c.instance; inst == nil {
+		t.Fatal("consumer has no instance after Start")
+	} else if inst.Config().TLSEnable {
+		t.Error("TLSEnable is on for a consumer that never asked for it")
+	} else if inst.remoting.Config().TLSEnable {
+		t.Error("the transport dials TLS although no switch was set")
+	}
+}
+
+// ---------------------------------------------------------------- drain ceiling
+
+// awaitTerminationMillisWhenShutdown is the ceiling Shutdown spends on the
+// batches already in the listener's hands. The ceiling has to REPLACE the
+// client's own drain budget, otherwise a caller who asked for a short exit still
+// waits the full default.
+func TestShutdownAwaitTerminationCutsTheDrainShort(t *testing.T) {
+	prev := shutdownDrainBudget
+	shutdownDrainBudget = 5 * time.Second
+	t.Cleanup(func() { shutdownDrainBudget = prev })
+
+	topic := uniqueTopic("GoConsumerDrainCeiling", t)
+	f := newClusterFixture(t, map[string]int{topic: 1})
+	f.broker.add(topic, 0, "c0")
+
+	entered := make(chan struct{}, 1)
+	var finished atomic.Bool
+	listener := newRecordingListener()
+	listener.onCall = func(batch []*common.MessageExt, _ *ConsumeConcurrentlyContext) {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		// A batch that outlives a tight ceiling: the drain must give up on it
+		// rather than sit for the whole default budget.
+		time.Sleep(time.Second)
+		finished.Store(true)
+	}
+	c := f.newConsumer(t, "GID_go_drain_ceiling", listener,
+		withConsumeFromWhere(ConsumeFromWhereFirstOffset))
+	c.SetAwaitTerminationMillisWhenShutdown(20)
+	startConsumer(t, c, topic, "*")
+
+	if got := c.AwaitTerminationMillisWhenShutdown(); got != 20 {
+		t.Fatalf("AwaitTerminationMillisWhenShutdown = %d, want the 20 that was set", got)
+	}
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("listener never received the batch")
+	}
+
+	c.Shutdown()
+	if finished.Load() {
+		t.Error("Shutdown waited out the batch although a 20 ms ceiling was set:" +
+			" the ceiling does not bound the drain it replaced")
+	}
+}
+
+// The other direction: a ceiling longer than the client's own budget must buy
+// the extra room, not be ignored in favour of the (here deliberately tiny)
+// default. The batch finishing inside the drain is what the broker-side commit
+// rides on, so the two observations go together.
+func TestShutdownAwaitTerminationGrantsTheExtraRoom(t *testing.T) {
+	prev := shutdownDrainBudget
+	shutdownDrainBudget = 10 * time.Millisecond
+	t.Cleanup(func() { shutdownDrainBudget = prev })
+
+	topic := uniqueTopic("GoConsumerDrainRoom", t)
+	f := newClusterFixture(t, map[string]int{topic: 1})
+	f.broker.add(topic, 0, "c1")
+
+	entered := make(chan struct{}, 1)
+	var finished atomic.Bool
+	listener := newRecordingListener()
+	listener.onCall = func(batch []*common.MessageExt, _ *ConsumeConcurrentlyContext) {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		time.Sleep(200 * time.Millisecond)
+		finished.Store(true)
+	}
+	c := f.newConsumer(t, "GID_go_drain_room", listener,
+		withConsumeFromWhere(ConsumeFromWhereFirstOffset))
+	c.SetAwaitTerminationMillisWhenShutdown(3000)
+	startConsumer(t, c, topic, "*")
+
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("listener never received the batch")
+	}
+
+	c.Shutdown()
+	if !finished.Load() {
+		t.Error("Shutdown gave up after the 10 ms default budget although a 3000 ms" +
+			" ceiling was set: the ceiling never replaced the budget")
+	}
+	waitFor(t, "the drained batch reaches the broker as a committed offset",
+		func() bool { return f.broker.commitCount() > 0 })
+}
+
+// 0 — the documented default — keeps the client's own budget: the ceiling is an
+// opt-in, and a negative value must not turn into a negative timer.
+func TestShutdownAwaitTerminationDefaultsToTheClientBudget(t *testing.T) {
+	c := MustNewDefaultMQPushConsumer("GID_go_drain_default")
+	if got := c.AwaitTerminationMillisWhenShutdown(); got != 0 {
+		t.Fatalf("the default ceiling = %d, want 0 (no ceiling requested)", got)
+	}
+	if got := shutdownDrainCeiling(0); got != shutdownDrainBudget {
+		t.Errorf("ceiling(0) = %s, want the client budget %s", got, shutdownDrainBudget)
+	}
+	if got := shutdownDrainCeiling(-1); got != shutdownDrainBudget {
+		t.Errorf("ceiling(-1) = %s, want the client budget %s: <= 0 means no extra ceiling", got, shutdownDrainBudget)
+	}
+	if got := shutdownDrainCeiling(250); got != 250*time.Millisecond {
+		t.Errorf("ceiling(250) = %s, want 250ms", got)
+	}
+}
+// ---------------------------------------------------------------- pull backoffs
+
+// The broker's flow-control answer and this client's own backlog are different
+// events and must not share one wait. The mapping is exact, so the numbers are
+// asserted directly: the short wait belongs to response code 215 alone, and
+// every other failure keeps the generic one.
+func TestPullRetryDelaySeparatesBrokerFlowFromEverythingElse(t *testing.T) {
+	if pullTimeDelayMillsWhenBrokerFlow != 20*time.Millisecond {
+		t.Errorf("broker flow-control backoff = %s, want 20ms", pullTimeDelayMillsWhenBrokerFlow)
+	}
+	if pullTimeDelayMillsWhenFlowControl != 50*time.Millisecond {
+		t.Errorf("local cache backoff = %s, want 50ms", pullTimeDelayMillsWhenFlowControl)
+	}
+	if pullTimeDelayMillsWhenPullFailed != 500*time.Millisecond {
+		t.Errorf("generic pull backoff = %s, want 500ms", pullTimeDelayMillsWhenPullFailed)
+	}
+
+	if got := pullRetryDelay(common.BrokerError(remoting.RespFlowControl, "too many requests")); got != pullTimeDelayMillsWhenBrokerFlow {
+		t.Errorf("backoff after response code %d = %s, want the broker flow-control wait %s",
+			remoting.RespFlowControl, got, pullTimeDelayMillsWhenBrokerFlow)
+	}
+	// A server-shaped (not broker-shaped) 215 is the same event and gets the same
+	// short wait.
+	if got := pullRetryDelay(common.ServerError(remoting.RespFlowControl, "flow control")); got != pullTimeDelayMillsWhenBrokerFlow {
+		t.Errorf("a server-kind 215 got %s, want the broker flow-control wait", got)
+	}
+
+	// Control: the short wait is not reachable by anything but 215 — not another
+	// broker answer, not an adjacent code, not an error that carries no code at
+	// all. Replacing the branch with "everything gets the short wait" reddens
+	// this leg, which the loop test below cannot see.
+	for _, other := range []error{
+		common.BrokerError(remoting.RespSystemError, "system error"),
+		common.BrokerError(remoting.RespSystemBusy, "system busy"),
+		common.BrokerError(remoting.RespPollingTimeout, "polling timeout"),
+		common.BrokerError(remoting.RespPullNotFound, "no new message"),
+		common.BrokerError(remoting.RespFlowControl-1, "adjacent code below"),
+		common.BrokerError(remoting.RespFlowControl+1, "adjacent code above"),
+		common.ServerError(remoting.RespFlowControl+1, "adjacent code, server kind"),
+		common.ClientError("the broker not exist"),
+		common.TimeoutError("127.0.0.1:10911", 3000),
+		errors.New("a plain error"),
+	} {
+		if got := pullRetryDelay(other); got != pullTimeDelayMillsWhenPullFailed {
+			t.Errorf("backoff after %v = %s, want the generic wait %s", other, got, pullTimeDelayMillsWhenPullFailed)
+		}
+	}
+}
+
+// The loop has to ACT on the distinction, and the state to wait on is the
+// message itself. The broker is scripted to refuse exactly this many pulls and
+// then answer normally: at the short backoff the run costs a fraction of a
+// second, at the generic one it costs count x 500ms, so a listener that has the
+// message inside a budget the generic wait cannot fit proves which delay the
+// loop slept for — with no wall-clock window to lose, because a loaded machine
+// only ever makes the retries slower.
+func assertShortBackoffGetsThrough(t *testing.T, f *clusterFixture, listener *recordingListener, count int) {
+	t.Helper()
+	waitForBudget(t, 4*time.Second, func() bool { return listener.receivedAll(1) })
+	if got := f.broker.pullCount(); got < count+1 {
+		t.Errorf("pulls = %d after %d forced answers, want at least %d: the run of answers was not sat through",
+			got, count, count+1)
+	}
+}
+
+func TestPullLoopRetriesBrokerFlowControlWithTheShortBackoff(t *testing.T) {
+	const forcedAnswers = 80
+
+	topic := uniqueTopic("GoConsumerBrokerFlow", t)
+	f := newClusterFixture(t, map[string]int{topic: 1})
+	f.broker.add(topic, 0, "bf0")
+	f.broker.forcePullAnswers(remoting.RespFlowControl, forcedAnswers)
+
+	listener := newRecordingListener()
+	c := f.newConsumer(t, "GID_go_broker_flow", listener,
+		withConsumeFromWhere(ConsumeFromWhereFirstOffset))
+	startConsumer(t, c, topic, "*")
+
+	assertShortBackoffGetsThrough(t, f, listener, forcedAnswers)
+}
+
+// The orderly consumer rides the same loop, and it is the path where a hot retry
+// costs the queue lock it is holding.
+func TestPullLoopRetriesBrokerFlowControlWithTheShortBackoffOrderly(t *testing.T) {
+	const forcedAnswers = 80
+
+	topic := uniqueTopic("GoConsumerBrokerFlowOrderly", t)
+	f := newClusterFixture(t, map[string]int{topic: 1})
+	f.broker.add(topic, 0, "bfo0")
+	f.broker.forcePullAnswers(remoting.RespFlowControl, forcedAnswers)
+
+	orderly := &fixedOrderlyListener{}
+	c := f.newConsumer(t, "GID_go_broker_flow_orderly", orderly,
+		withConsumeFromWhere(ConsumeFromWhereFirstOffset))
+	startConsumer(t, c, topic, "*")
+
+	waitForBudget(t, 4*time.Second, func() bool { return orderly.receivedAll(1) })
+	if got := f.broker.pullCount(); got < forcedAnswers+1 {
+		t.Errorf("pulls = %d after %d forced answers, want at least %d", got, forcedAnswers, forcedAnswers+1)
+	}
+}
+
+// Control leg: the very same run of forced answers, with a failure that is NOT
+// the broker's flow control, must still be holding the message back at the
+// instant the flow-control run had already delivered it. If the short wait ever
+// leaked to other failures, this is where it shows.
+func TestPullLoopKeepsTheGenericWaitForOtherPullFailures(t *testing.T) {
+	topic := uniqueTopic("GoConsumerNotBrokerFlow", t)
+	f := newClusterFixture(t, map[string]int{topic: 1})
+	f.broker.add(topic, 0, "nf0")
+	f.broker.forcePullAnswers(remoting.RespSystemError, 80)
+
+	listener := newRecordingListener()
+	c := f.newConsumer(t, "GID_go_not_broker_flow", listener,
+		withConsumeFromWhere(ConsumeFromWhereFirstOffset))
+	startConsumer(t, c, topic, "*")
+
+	// Five generic retries already cost 2.5s, so reaching this state means the
+	// loop is on the generic wait — and 80 of them cannot be done yet.
+	waitForBudget(t, 5*time.Second, func() bool { return f.broker.pullCount() >= 5 })
+	if listener.receivedAll(1) {
+		t.Errorf("the message arrived although the broker failed %d pulls with a non-flow-control"+
+			" answer: the short broker flow-control backoff was applied where it does not belong", 80)
 	}
 }

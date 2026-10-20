@@ -4,10 +4,12 @@
 //! `ConsumerRunningInfo` / `Connection` / `ConsumerConnection` / `ProducerConnection` /
 //! `QueryConsumeTimeSpanBody` / `ConsumeStatus` / `ConsumeStatsList` /
 //! `ResetOffsetBody` / `GetConsumerStatusBody` / `ProcessQueueInfo` / `CMResult` /
-//! `ConsumeMessageDirectlyResult`.
+//! `ConsumeMessageDirectlyResult` / `BatchAck` / `BatchAckMessageRequestBody`.
 //!
 //! ## Three different spellings of "the same MessageQueue"
 
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use serde_json::{Map, Value};
 
 use super::admin_body::{
@@ -15,6 +17,7 @@ use super::admin_body::{
     jstring, MessageQueueKey,
 };
 use super::ext_fields::StringMap;
+use super::extra_info;
 use super::heartbeat::SubscriptionData;
 use super::serialize::RemotingSerializable;
 use crate::error::{Error, Result};
@@ -1125,6 +1128,228 @@ impl ConsumeMessageDirectlyResult {
     }
 }
 
+// ---------------------------------------------------------------- 200151 batch acknowledge of POP messages
+
+/// The offset set of one batch-ack entry, as the indices of the bits that are set, ascending.
+///
+/// Index `n` means "the message at `startOffset + n` of this queue is acknowledged". The wire form is
+/// standard base64 of the little-endian byte packing (bit `n` sits at bit `n % 8` of byte `n / 8`), with
+/// trailing zero bytes dropped -- so the empty set encodes as an empty string.
+pub fn ack_bit_set_to_base64(bits: &[u32]) -> String {
+    let highest = match bits.iter().max() {
+        None => return String::new(),
+        Some(v) => *v,
+    };
+    let mut bytes = vec![0_u8; (highest as usize / 8) + 1];
+    for bit in bits {
+        bytes[*bit as usize / 8] |= 1_u8 << (*bit % 8);
+    }
+    BASE64_STANDARD.encode(bytes)
+}
+
+/// Inverse of [`ack_bit_set_to_base64`]; missing / null / empty text reads back as the empty set.
+pub fn ack_bit_set_from_base64(value: &Value, key: &str) -> Result<Vec<u32>> {
+    let text = match jstring(value, key) {
+        None => return Ok(Vec::new()),
+        Some(s) => s,
+    };
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    let bytes = BASE64_STANDARD
+        .decode(&text)
+        .map_err(|e| Error::Decode(format!("{key} is not a base64 bit set: {e}")))?;
+    let mut bits = Vec::new();
+    for (index, byte) in bytes.iter().enumerate() {
+        for position in 0..8 {
+            if byte & (1_u8 << position) != 0 {
+                bits.push((index * 8 + position) as u32);
+            }
+        }
+    }
+    Ok(bits)
+}
+
+/// One batch-ack entry: every acknowledged offset of a single `(retry, queueId, startOffset, popTime)` group.
+///
+/// All nine fields go on the wire under their compact spellings (`c`, `t`, `r`, `so`, `q`, `rq`, `pt`, `it`,
+/// `b`); reading accepts the long names too, because a broker-side tool may have written those.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BatchAck {
+    pub consumer_group: String,
+    pub topic: String,
+    /// The retry flag text ("0" / "1" / "2"), kept as a string exactly as the extra info carries it.
+    pub retry: String,
+    /// The ck-queue offset shared by the group; bit index 0 of [`Self::bit_set`] is this offset.
+    pub start_offset: i64,
+    pub queue_id: i32,
+    pub revive_queue_id: i32,
+    pub pop_time: i64,
+    pub invisible_time: i64,
+    /// Set bit indices, ascending.
+    pub bit_set: Vec<u32>,
+}
+
+impl BatchAck {
+    /// Marks one offset relative to [`Self::start_offset`]; a negative or duplicate index is rejected
+    /// rather than silently dropped, because a wrong offset would ack somebody else's message.
+    pub fn set_offset_bit(&mut self, queue_offset: i64) -> Result<()> {
+        let bit = queue_offset
+            .checked_sub(self.start_offset)
+            .ok_or_else(|| Error::Encode("offset delta overflows".to_string()))?;
+        if bit < 0 {
+            return Err(Error::Encode(format!(
+                "batch ack offset {queue_offset} is below the group start offset {}",
+                self.start_offset
+            )));
+        }
+        let bit = bit as u32;
+        if !self.bit_set.contains(&bit) {
+            self.bit_set.push(bit);
+            self.bit_set.sort_unstable();
+        }
+        Ok(())
+    }
+
+    pub fn to_json_value(&self) -> Value {
+        json_object(vec![
+            ("c", Value::String(self.consumer_group.clone())),
+            ("t", Value::String(self.topic.clone())),
+            ("r", Value::String(self.retry.clone())),
+            ("so", Value::from(self.start_offset)),
+            ("q", Value::from(self.queue_id)),
+            ("rq", Value::from(self.revive_queue_id)),
+            ("pt", Value::from(self.pop_time)),
+            ("it", Value::from(self.invisible_time)),
+            ("b", Value::String(ack_bit_set_to_base64(&self.bit_set))),
+        ])
+    }
+
+    /// `compact` / `long` pair lookup: the compact spelling wins when both are present.
+    fn text(value: &Value, compact: &str, long: &str) -> String {
+        jstring(value, compact)
+            .or_else(|| jstring(value, long))
+            .unwrap_or_default()
+    }
+
+    fn number(value: &Value, compact: &str, long: &str) -> i64 {
+        jlong(value, compact, jlong(value, long, 0))
+    }
+
+    pub fn from_json_value(value: &Value) -> Result<BatchAck> {
+        expect_object(value, "BatchAck")?;
+        Ok(BatchAck {
+            consumer_group: Self::text(value, "c", "consumerGroup"),
+            topic: Self::text(value, "t", "topic"),
+            retry: Self::text(value, "r", "retry"),
+            start_offset: Self::number(value, "so", "startOffset"),
+            queue_id: Self::number(value, "q", "queueId") as i32,
+            revive_queue_id: Self::number(value, "rq", "reviveQueueId") as i32,
+            pop_time: Self::number(value, "pt", "popTime"),
+            invisible_time: Self::number(value, "it", "invisibleTime"),
+            // One lookup only: a corrupt compact value must not be masked by an absent long-name twin.
+            bit_set: ack_bit_set_from_base64(
+                value,
+                if jfield(value, "b").is_some() {
+                    "b"
+                } else {
+                    "bitSet"
+                },
+            )?,
+        })
+    }
+}
+
+/// Body of BATCH_ACK_MESSAGE: the broker to talk to plus one entry per acknowledged offset group.
+///
+/// Built from a list of extra-info strings: the grouping key is `retry@queueId@ckQueueOffset@popTime`, and
+/// the broker name is the one of the **first** string -- a later string may name another broker, but one
+/// request can only ever address a single one, so its name is not consulted again.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BatchAckMessageRequestBody {
+    pub broker_name: Option<String>,
+    pub acks: Vec<BatchAck>,
+}
+
+impl BatchAckMessageRequestBody {
+    /// Groups `extra_info_list` into entries; see [`BatchAck`] for the field meanings.
+    ///
+    /// The first extra info of a group fixes that group's fields; a later extra info of the same group only
+    /// contributes its bit index. An empty list yields an empty body (no broker name, no acks).
+    pub fn from_extra_info_list(
+        consumer_group: &str,
+        topic: &str,
+        extra_info_list: &[&str],
+    ) -> Result<BatchAckMessageRequestBody> {
+        let mut broker_name: Option<String> = None;
+        // Insertion order is kept: the wire array follows the order the groups first appear in.
+        let mut groups: Vec<(String, usize)> = Vec::new();
+        let mut acks: Vec<BatchAck> = Vec::new();
+        for info in extra_info_list {
+            let segments = extra_info::split(info)?;
+            if broker_name.is_none() {
+                broker_name = Some(extra_info::get_broker_name(&segments)?);
+            }
+            let retry = extra_info::get_retry(&segments)?;
+            let queue_id = extra_info::get_queue_id(&segments)?;
+            let start_offset = extra_info::get_ck_queue_offset(&segments)?;
+            let pop_time = extra_info::get_pop_time(&segments)?;
+            let queue_offset = extra_info::get_queue_offset(&segments)?;
+            let key = format!("{retry}@{queue_id}@{start_offset}@{pop_time}");
+            let index = match groups.iter().position(|(k, _)| *k == key) {
+                Some(index) => groups[index].1,
+                None => {
+                    acks.push(BatchAck {
+                        consumer_group: consumer_group.to_string(),
+                        topic: topic.to_string(),
+                        retry,
+                        start_offset,
+                        queue_id,
+                        revive_queue_id: extra_info::get_revive_qid(&segments)?,
+                        pop_time,
+                        invisible_time: extra_info::get_invisible_time(&segments)?,
+                        bit_set: Vec::new(),
+                    });
+                    groups.push((key, acks.len() - 1));
+                    acks.len() - 1
+                }
+            };
+            acks[index].set_offset_bit(queue_offset)?;
+        }
+        Ok(BatchAckMessageRequestBody { broker_name, acks })
+    }
+
+    pub fn to_json_value(&self) -> Value {
+        json_object(vec![
+            ("brokerName", optional_string(&self.broker_name)),
+            (
+                "acks",
+                Value::Array(self.acks.iter().map(|a| a.to_json_value()).collect()),
+            ),
+        ])
+    }
+
+    pub fn from_json_value(value: &Value) -> Result<BatchAckMessageRequestBody> {
+        expect_object(value, "BatchAckMessageRequestBody")?;
+        let mut acks = Vec::new();
+        for item in jarray(value, "acks")? {
+            acks.push(BatchAck::from_json_value(item)?);
+        }
+        Ok(BatchAckMessageRequestBody {
+            broker_name: jstring(value, "brokerName"),
+            acks,
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        RemotingSerializable::encode(&self.to_json_value())
+    }
+
+    pub fn decode(data: &[u8]) -> Result<BatchAckMessageRequestBody> {
+        BatchAckMessageRequestBody::from_json_value(&RemotingSerializable::decode(data)?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1846,5 +2071,210 @@ mod tests {
             GetConsumerStatusBody::decode(br#"{"consumerTable":{"c1":[1]}}"#),
             Err(Error::Decode(_))
         ));
+    }
+
+    // ---------------- BATCH_ACK_MESSAGE body ----------------
+
+    /// Extra infos shaped exactly as the POP path writes them: `ck popTime invisible reviveQid retry broker queueId msgOffset`.
+    const CK_QUEUE3_BASE: &str = "100 1700000000000 60000 0 0 broker-a 3 100";
+    /// Same group as `CK_QUEUE3_BASE`, two offsets further into the queue.
+    const CK_QUEUE3_PLUS2: &str = "100 1700000000000 60000 0 0 broker-a 3 102";
+    /// A second group: same popTime, different queue id.
+    const CK_QUEUE4: &str = "7 1700000000000 60000 3 0 broker-a 4 7";
+    /// A retry-topic ticket (retry flag 1) of queue 3.
+    const CK_QUEUE3_RETRY: &str = "100 1700000000000 60000 0 1 broker-a 3 101";
+
+    fn group_of(infos: &[&str]) -> BatchAckMessageRequestBody {
+        BatchAckMessageRequestBody::from_extra_info_list("GID_Batch", "BatchTopic", infos)
+            .expect("grouping of a well-formed extra info list")
+    }
+
+    #[test]
+    fn batch_ack_body_encodes_compact_keys_in_wire_order() {
+        let body = group_of(&[CK_QUEUE3_BASE]);
+        assert_eq!(
+            json_of(&body.to_json_value()),
+            r#"{"brokerName":"broker-a","acks":[{"c":"GID_Batch","t":"BatchTopic","r":"0","so":100,"q":3,"rq":0,"pt":1700000000000,"it":60000,"b":"AQ=="}]}"#
+        );
+        // The long spellings must not leak into the request this side sends.
+        let text = json_of(&body.to_json_value());
+        for long in [
+            "\"consumerGroup\"",
+            "\"queueId\"",
+            "\"startOffset\"",
+            "\"bitSet\"",
+        ] {
+            assert!(!text.contains(long), "{text} leaked {long}");
+        }
+    }
+
+    #[test]
+    fn batch_ack_body_reads_both_key_spellings() {
+        let compact = BatchAckMessageRequestBody::decode(&group_of(&[CK_QUEUE3_BASE]).encode())
+            .expect("compact body decodes");
+        let long = BatchAckMessageRequestBody::from_json_value(
+            &py(r#"{"brokerName":"broker-a","acks":[{"consumerGroup":"GID_Batch","topic":"BatchTopic","retry":"0","startOffset":100,"queueId":3,"reviveQueueId":0,"popTime":1700000000000,"invisibleTime":60000,"bitSet":"AQ=="}]}"#),
+        )
+        .expect("long-name body decodes");
+        assert_eq!(compact, long);
+        // A missing / null bit set reads back as the empty set, not as a decode failure.
+        let no_bits = BatchAck::from_json_value(&py(
+            r#"{"c":"G","t":"T","r":"0","so":1,"q":1,"rq":0,"pt":2,"it":3,"b":null}"#,
+        ))
+        .unwrap();
+        assert!(no_bits.bit_set.is_empty());
+        assert!(BatchAck::from_json_value(&py(r#"{"c":"G"}"#))
+            .unwrap()
+            .bit_set
+            .is_empty());
+    }
+
+    #[test]
+    fn batch_ack_groups_two_tickets_of_one_key_into_a_single_entry() {
+        // Two messages of the same pop group: one entry carrying both bits.
+        let body = group_of(&[CK_QUEUE3_BASE, CK_QUEUE3_PLUS2]);
+        assert_eq!(body.acks.len(), 1, "one merge key means one entry");
+        assert_eq!(body.acks[0].bit_set, vec![0, 2]);
+        // The bit set is the base64 of the little-endian byte packing: bits 0 and 2 -> 0b101.
+        assert_eq!(ack_bit_set_to_base64(&body.acks[0].bit_set), "BQ==");
+        assert_eq!(
+            ack_bit_set_from_base64(&py(r#"{"b":"BQ=="}"#), "b").unwrap(),
+            vec![0, 2]
+        );
+    }
+
+    #[test]
+    fn batch_ack_keeps_distinct_merge_keys_apart() {
+        // Control for the grouping rule: same popTime but a different queue id stays a separate entry.
+        let body = group_of(&[CK_QUEUE3_BASE, CK_QUEUE4]);
+        assert_eq!(body.acks.len(), 2, "two merge keys mean two entries");
+        assert_eq!(body.acks[0].queue_id, 3);
+        assert_eq!(body.acks[0].start_offset, 100);
+        assert_eq!(body.acks[0].bit_set, vec![0]);
+        assert_eq!(body.acks[1].queue_id, 4);
+        assert_eq!(body.acks[1].start_offset, 7);
+        assert_eq!(body.acks[1].revive_queue_id, 3);
+        assert_eq!(body.acks[1].bit_set, vec![0]);
+        // Entries follow the order the groups first appear in: queue 3 first, then queue 4.
+        let acks = body.to_json_value()["acks"].as_array().unwrap().clone();
+        assert_eq!(acks[0]["q"], Value::from(3));
+        assert_eq!(acks[1]["q"], Value::from(4));
+    }
+
+    #[test]
+    fn batch_ack_merge_key_covers_every_group_component() {
+        // Each variant differs from CK_QUEUE3_BASE in exactly ONE component of the merge key, so a key
+        // that ignored that component would silently merge two different pop groups.
+        let only_retry = group_of(&[CK_QUEUE3_BASE, CK_QUEUE3_RETRY]);
+        assert_eq!(only_retry.acks.len(), 2, "the retry flag belongs to the key");
+        assert_eq!(only_retry.acks[0].retry, "0");
+        assert_eq!(only_retry.acks[1].retry, "1");
+
+        let only_queue = group_of(&[CK_QUEUE3_BASE, "100 1700000000000 60000 0 0 broker-a 4 100"]);
+        assert_eq!(only_queue.acks.len(), 2, "the queue id belongs to the key");
+        assert_eq!(only_queue.acks[0].queue_id, 3);
+        assert_eq!(only_queue.acks[1].queue_id, 4);
+
+        let only_start = group_of(&[CK_QUEUE3_BASE, "99 1700000000000 60000 0 0 broker-a 3 100"]);
+        assert_eq!(only_start.acks.len(), 2, "the ck queue offset belongs to the key");
+        assert_eq!(only_start.acks[1].start_offset, 99);
+        assert_eq!(only_start.acks[1].bit_set, vec![1]);
+
+        let only_pop = group_of(&[CK_QUEUE3_BASE, "100 1999000000000 60000 0 0 broker-a 3 100"]);
+        assert_eq!(only_pop.acks.len(), 2, "the pop time belongs to the key");
+        assert_eq!(only_pop.acks[1].pop_time, 1999000000000);
+
+        // Control: a ticket matching all four components merges instead of opening a group.
+        let merged = group_of(&[CK_QUEUE3_BASE, CK_QUEUE3_PLUS2]);
+        assert_eq!(merged.acks.len(), 1);
+        assert_eq!(merged.acks[0].bit_set, vec![0, 2]);
+    }
+
+    #[test]
+    fn batch_ack_bit_index_is_the_offset_relative_to_the_group_start_offset() {
+        // ckQueueOffset 100, message offset 130 -> bit 30, i.e. byte 3 with the low bit set.
+        let body = group_of(&["100 1700000000000 60000 0 0 broker-a 3 130"]);
+        assert_eq!(body.acks[0].bit_set, vec![30]);
+        assert_eq!(ack_bit_set_to_base64(&body.acks[0].bit_set), "AAAAQA==");
+        // Bit 64 opens a ninth byte: trailing zero bytes are kept only up to the highest set bit.
+        assert_eq!(ack_bit_set_to_base64(&[64]), "AAAAAAAAAAAB");
+        assert_eq!(
+            ack_bit_set_from_base64(&py(r#"{"b":"AAAAAAAAAAAB"}"#), "b").unwrap(),
+            vec![64]
+        );
+        // Repeated tickets of one group must not inflate the entry.
+        let twice = group_of(&[CK_QUEUE3_BASE, CK_QUEUE3_BASE, CK_QUEUE3_PLUS2]);
+        assert_eq!(twice.acks.len(), 1);
+        assert_eq!(twice.acks[0].bit_set, vec![0, 2]);
+    }
+
+    #[test]
+    fn batch_ack_bit_set_of_a_blank_group_encodes_as_empty_text() {
+        let mut ack = BatchAck::default();
+        ack.bit_set = Vec::new();
+        assert_eq!(ack_bit_set_to_base64(&ack.bit_set), "");
+        assert!(ack.to_json_value()["b"].is_string());
+        // Round-trip of the empty set: empty text is the empty set, not a decode failure.
+        let back = BatchAck::from_json_value(&ack.to_json_value()).unwrap();
+        assert_eq!(back, ack);
+        assert!(matches!(
+            ack_bit_set_from_base64(&py(r#"{"b":"not base64 !!"}"#), "b"),
+            Err(Error::Decode(_))
+        ));
+    }
+
+    #[test]
+    fn batch_ack_broker_name_comes_from_the_first_ticket_only() {
+        let body = group_of(&["100 1700000000000 60000 0 0 broker-a 3 100", CK_QUEUE4]);
+        assert_eq!(body.broker_name.as_deref(), Some("broker-a"));
+        // An empty list acks nothing and names no broker.
+        let empty = group_of(&[]);
+        assert_eq!(empty.broker_name, None);
+        assert!(empty.acks.is_empty());
+        assert_eq!(
+            json_of(&empty.to_json_value()),
+            r#"{"brokerName":null,"acks":[]}"#
+        );
+    }
+
+    #[test]
+    fn batch_ack_rejects_tickets_the_pop_layer_cannot_have_written() {
+        // A 7-segment ticket has no message offset, so no bit can be computed.
+        let err = BatchAckMessageRequestBody::from_extra_info_list(
+            "GID_Batch",
+            "BatchTopic",
+            &["100 1700000000000 60000 0 0 broker-a 3"],
+        )
+        .expect_err("a ticket without the message offset cannot be grouped");
+        assert!(err.to_string().contains("getQueueOffset"), "{err}");
+
+        // A message offset below the group's start offset would address a negative bit.
+        let err = group_err(&["100 1700000000000 60000 0 0 broker-a 3 99"]);
+        assert!(
+            err.to_string()
+                .contains("batch ack offset 99 is below the group start offset 100"),
+            "{err}"
+        );
+    }
+
+    fn group_err(infos: &[&str]) -> Error {
+        BatchAckMessageRequestBody::from_extra_info_list("GID_Batch", "BatchTopic", infos)
+            .expect_err("grouping is expected to fail")
+    }
+
+    #[test]
+    fn batch_ack_round_trips_through_the_wire_form() {
+        let body = group_of(&[CK_QUEUE3_BASE, CK_QUEUE3_PLUS2, CK_QUEUE4, CK_QUEUE3_RETRY]);
+        let back = BatchAckMessageRequestBody::decode(&body.encode()).unwrap();
+        assert_eq!(back, body);
+        assert_eq!(back.acks.len(), 3);
+        // Missing or non-array acks, and a non-object item, are hard failures.
+        assert!(BatchAckMessageRequestBody::decode(br#"{"acks":null}"#)
+            .unwrap()
+            .acks
+            .is_empty());
+        assert!(BatchAckMessageRequestBody::decode(br#"{"acks":"nope"}"#).is_err());
+        assert!(BatchAckMessageRequestBody::decode(br#"{"acks":["nope"]}"#).is_err());
+        assert!(BatchAckMessageRequestBody::decode(b"[1]").is_err());
     }
 }

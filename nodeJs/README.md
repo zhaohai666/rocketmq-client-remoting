@@ -355,6 +355,7 @@ bash scripts/run_node_live.sh <目标> [namesrv]
 | `examples/live_slave_only.ts` | 只剩 slave broker 时 push 消费者仍能消费 |
 | `examples/live_check_client_config.ts` | CHECK_CLIENT_CONFIG(46) 订阅预检 |
 | `examples/live_fixes2.ts` | 五项实报修复的端到端复验（事务半消息提交后立即可见等） |
+| `examples/live_auto_batch.ts` | autoBatch 分组发送回读：逐成员核对上报 queueOffset/offsetMsgId 与队列实际值、延迟与超限成员各走各路、单成员可按 UNIQ_KEY 查回；`autoBatch=false` 作对照组 |
 | `examples/live_compression.ts` | 压缩往返矩阵腿：zlib/LZ4/ZSTD 发送侧 + 接收侧 match 判定（`scripts/compression_matrix.sh` 调起） |
 
 两条顺序铁律：**先起消费者、等队列分配到位再发消息**（`CONSUME_FROM_LAST_OFFSET` 语义，否则首段消息落在分配完成前被跳过）；事务回查用例窗口 ≥90s（broker 巡检周期 30s）。topic/组名默认带时间戳，残留状态不会让断言假绿。

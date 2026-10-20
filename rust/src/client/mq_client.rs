@@ -1,6 +1,7 @@
 //! Responsibilities: name server address management, topic route retrieval and caching,
 //! broker address resolution, message sending (SEND_MESSAGE / SEND_MESSAGE_V2), pull
-//! (PULL_MESSAGE), POP retrieval (POP_MESSAGE / ACK_MESSAGE / CHANGE_MESSAGE_INVISIBLETIME),
+//! (PULL_MESSAGE), POP retrieval (POP_MESSAGE / ACK_MESSAGE / BATCH_ACK_MESSAGE /
+//! CHANGE_MESSAGE_INVISIBLETIME),
 //! offset query/update, heartbeat, queue locking, admin APIs (create/delete topic, cluster
 //! info, etc.) and broker-initiated request (220/221/307/309/326) dispatch.
 
@@ -42,9 +43,10 @@ use crate::remoting::client::{
 };
 use crate::remoting::protocol::admin_body::MessageQueueKey;
 use crate::remoting::protocol::body::{
-    CheckClientRequestBody, ClusterInfo, ConsumeMessageDirectlyResult, ConsumerRunningInfo,
-    GetConsumerListByGroupResponseBody, GetConsumerStatusBody, LockBatchRequestBody,
-    LockBatchResponseBody, ResetOffsetBody, ResetOffsetBodyForC, TopicList, UnlockBatchRequestBody,
+    BatchAckMessageRequestBody, CheckClientRequestBody, ClusterInfo, ConsumeMessageDirectlyResult,
+    ConsumerRunningInfo, GetConsumerListByGroupResponseBody, GetConsumerStatusBody,
+    LockBatchRequestBody, LockBatchResponseBody, ResetOffsetBody, ResetOffsetBodyForC, TopicList,
+    UnlockBatchRequestBody,
 };
 use crate::remoting::protocol::codes::{request_code, response_code};
 use crate::remoting::protocol::ext_fields::CustomHeader;
@@ -2304,6 +2306,55 @@ impl MQClientInstance {
             request_code::ACK_MESSAGE,
             Some(Box::new(header)),
         );
+        let response = self
+            .invoke_sync(&addr, &mut request, timeout_millis)
+            .await?;
+        Ok(response.code)
+    }
+
+    /// Ack a whole group of POP messages with one request (BATCH_ACK_MESSAGE = 200151).
+    ///
+    /// `extra_info_list` holds the `POP_CK` strings of the messages to ack, each of them pointing at the
+    /// same topic / consumer group. Tickets that share `(retry flag, queueId, ckQueueOffset, popTime)`
+    /// collapse into one entry whose bit set marks every message offset relative to that group's
+    /// `ckQueueOffset`, so a group of `n` popped messages costs one entry instead of `n` round trips.
+    ///
+    /// The request carries **no custom header** -- everything the broker needs sits in the JSON body, whose
+    /// broker name comes from the **first** extra info. `addr` omitted means the instance resolves it from
+    /// that broker name, the topic and the first ticket's queue id. Returns the broker response code;
+    /// `SUCCESS` means the batch was accepted -- per-bit failures are not reported back.
+    pub async fn batch_ack_message(
+        &self,
+        consumer_group: &str,
+        topic: &str,
+        extra_info_list: &[&str],
+        timeout_millis: i64,
+        addr: Option<&str>,
+    ) -> Result<i32> {
+        use crate::remoting::protocol::extra_info as extra;
+        if extra_info_list.is_empty() {
+            return Err(Error::client(
+                "batch ack needs at least one extraInfo (POP_CK) to acknowledge",
+            ));
+        }
+        // An unreadable ticket (too few segments, non-numeric) fails here, before anything hits the wire.
+        let first = extra::split(extra_info_list[0])?;
+        let body = BatchAckMessageRequestBody::from_extra_info_list(
+            consumer_group,
+            topic,
+            extra_info_list,
+        )?;
+        let addr = match addr {
+            Some(a) => a.to_string(),
+            None => {
+                let broker_name = extra::get_broker_name(&first)?;
+                let queue_id = extra::get_queue_id(&first)?;
+                self.pop_ack_addr(&broker_name, topic, queue_id).await?
+            }
+        };
+        let mut request =
+            RemotingCommand::create_request_command(request_code::BATCH_ACK_MESSAGE, None);
+        request.set_body(Some(body.encode()));
         let response = self
             .invoke_sync(&addr, &mut request, timeout_millis)
             .await?;
@@ -6155,6 +6206,250 @@ mod tests {
         MQClientInstance::new(&id, vec![namesrv.to_string()])
     }
 
+    // ---------------- 200151 batch acknowledge of POP messages ----------------
+
+    /// Three tickets off the wire: two of them share one pop group (same retry flag, queue id, ck offset
+    /// and pop time) and the third opens a second group on queue 4.
+    const BATCH_CK_A0: &str = "100 1700000000000 60000 0 0 broker-a 3 100";
+    const BATCH_CK_A2: &str = "100 1700000000000 60000 0 0 broker-a 3 102";
+    const BATCH_CK_B: &str = "7 1700000000000 60000 3 0 broker-a 4 9";
+
+    /// The key set of a JSON object, in wire order.
+    fn keys_of(value: &serde_json::Value) -> Vec<&str> {
+        match value {
+            serde_json::Value::Object(map) => map.keys().map(|k| k.as_str()).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Text of a JSON string field, for comparisons that read better than `Value::String(..)`.
+    fn text_of(value: &serde_json::Value) -> &str {
+        match value {
+            serde_json::Value::String(s) => s.as_str(),
+            _ => "",
+        }
+    }
+
+    /// The batch request goes out as one headerless frame whose JSON body carries the grouped acks.
+    #[tokio::test]
+    async fn batch_ack_message_sends_one_headerless_request_with_the_grouped_body() {
+        let broker = MockBroker::start().await;
+        let instance = new_instance();
+        let code = instance
+            .batch_ack_message(
+                GROUP,
+                TOPIC,
+                &[BATCH_CK_A0, BATCH_CK_A2, BATCH_CK_B],
+                3000,
+                Some(&broker.addr),
+            )
+            .await
+            .expect("the fake broker answers");
+        assert_eq!(code, response_code::SUCCESS);
+
+        let sent = broker.recorded(request_code::BATCH_ACK_MESSAGE);
+        assert_eq!(sent.len(), 1, "a list of tickets is one request");
+        // Control on the same fixture: no per-message ack leaked out alongside the batch request.
+        assert!(broker.recorded(request_code::ACK_MESSAGE).is_empty());
+        assert_eq!(sent[0].code, 200151, "the batch acknowledge request code");
+        // A null custom header means the header table travels empty.
+        assert!(
+            sent[0].ext_fields.is_empty(),
+            "the batch request must carry no custom header, got {:?}",
+            sent[0].ext_fields
+        );
+
+        let body: serde_json::Value = serde_json::from_slice(&sent[0].body).expect("json body");
+        assert_eq!(keys_of(&body), vec!["brokerName", "acks"]);
+        assert_eq!(text_of(&body["brokerName"]), BROKER);
+        let acks = body["acks"].as_array().expect("acks array");
+        assert_eq!(acks.len(), 2, "two groups, not three tickets");
+        for ack in acks {
+            assert_eq!(
+                keys_of(ack),
+                vec!["c", "t", "r", "so", "q", "rq", "pt", "it", "b"],
+                "compact spellings only"
+            );
+        }
+        // Group A: pre-filled from its first ticket, with both relative offsets marked.
+        assert_eq!(text_of(&acks[0]["c"]), GROUP);
+        assert_eq!(text_of(&acks[0]["t"]), TOPIC);
+        assert_eq!(text_of(&acks[0]["r"]), "0");
+        assert_eq!(acks[0]["so"], serde_json::Value::from(100_i64));
+        assert_eq!(acks[0]["q"], serde_json::Value::from(3_i32));
+        assert_eq!(acks[0]["rq"], serde_json::Value::from(0_i32));
+        assert_eq!(acks[0]["pt"], serde_json::Value::from(1700000000000_i64));
+        assert_eq!(acks[0]["it"], serde_json::Value::from(60000_i64));
+        // bits 0 and 2 set -> the little-endian byte 0b101
+        assert_eq!(text_of(&acks[0]["b"]), "BQ==");
+        // Group B opens on a different queue: its own start offset, revive queue id and one bit at index 2.
+        assert_eq!(acks[1]["so"], serde_json::Value::from(7_i64));
+        assert_eq!(acks[1]["q"], serde_json::Value::from(4_i32));
+        assert_eq!(acks[1]["rq"], serde_json::Value::from(3_i32));
+        assert_eq!(text_of(&acks[1]["b"]), "BA==");
+
+        instance.shutdown();
+    }
+
+    /// The same-pop-group rule, measured against what the broker actually received.
+    #[tokio::test]
+    async fn batch_ack_message_merges_tickets_of_one_key_and_splits_tickets_of_distinct_keys() {
+        let broker = MockBroker::start().await;
+        let instance = new_instance();
+        instance
+            .batch_ack_message(GROUP, TOPIC, &[BATCH_CK_A0, BATCH_CK_A2], 3000, Some(&broker.addr))
+            .await
+            .expect("two tickets of one group ack in one request");
+        let merged = broker.recorded(request_code::BATCH_ACK_MESSAGE);
+        let body: serde_json::Value =
+            serde_json::from_slice(&merged[0].body).expect("json body");
+        let acks = body["acks"].as_array().expect("acks array");
+        assert_eq!(acks.len(), 1, "one merge key must collapse to one entry");
+        assert_eq!(text_of(&acks[0]["b"]), "BQ==");
+
+        // Control: a ticket that differs only by its pop time is a second group, never a second bit.
+        instance
+            .batch_ack_message(
+                GROUP,
+                TOPIC,
+                &[BATCH_CK_A0, "100 1999000000000 60000 0 0 broker-a 3 102"],
+                3000,
+                Some(&broker.addr),
+            )
+            .await
+            .expect("two groups ack in one request");
+        let split = broker.recorded(request_code::BATCH_ACK_MESSAGE);
+        assert_eq!(split.len(), 2);
+        let body: serde_json::Value =
+            serde_json::from_slice(&split[1].body).expect("json body");
+        let acks = body["acks"].as_array().expect("acks array");
+        assert_eq!(acks.len(), 2, "a distinct merge key must stay its own entry");
+        assert_eq!(text_of(&acks[0]["b"]), "AQ==");
+        assert_eq!(acks[1]["pt"], serde_json::Value::from(1999000000000_i64));
+        // Its own group, its own start offset: the bit index is still 102 - 100.
+        assert_eq!(acks[1]["so"], serde_json::Value::from(100_i64));
+        assert_eq!(text_of(&acks[1]["b"]), "BA==");
+
+        // A later ticket of a group contributes only its bit: the group keeps the first ticket's timings.
+        instance
+            .batch_ack_message(
+                GROUP,
+                TOPIC,
+                &[BATCH_CK_A0, "100 1700000000000 99999 9 0 broker-a 3 101"],
+                3000,
+                Some(&broker.addr),
+            )
+            .await
+            .expect("the second ticket only marks a bit");
+        let last_body: serde_json::Value = serde_json::from_slice(
+            &broker.recorded(request_code::BATCH_ACK_MESSAGE)[2].body,
+        )
+        .expect("json body");
+        let last = last_body["acks"].as_array().expect("acks array");
+        assert_eq!(last.len(), 1);
+        assert_eq!(last[0]["it"], serde_json::Value::from(60000_i64));
+        assert_eq!(last[0]["rq"], serde_json::Value::from(0_i32));
+        assert_eq!(text_of(&last[0]["b"]), "Aw==");
+
+        // Fourth control: the queue id alone separates two groups -- same ck, same pop time, same offsets.
+        instance
+            .batch_ack_message(
+                GROUP,
+                TOPIC,
+                &[BATCH_CK_A0, "100 1700000000000 60000 0 0 broker-a 4 100"],
+                3000,
+                Some(&broker.addr),
+            )
+            .await
+            .expect("two queues ack in one request");
+        let by_queue: serde_json::Value = serde_json::from_slice(
+            &broker.recorded(request_code::BATCH_ACK_MESSAGE)[3].body,
+        )
+        .expect("json body");
+        let acks = by_queue["acks"].as_array().expect("acks array");
+        assert_eq!(acks.len(), 2, "a different queue is a different group");
+        assert_eq!(acks[0]["q"], serde_json::Value::from(3_i32));
+        assert_eq!(acks[1]["q"], serde_json::Value::from(4_i32));
+        assert_eq!(acks[1]["so"], serde_json::Value::from(100_i64));
+
+        instance.shutdown();
+    }
+
+    /// Without an explicit address the instance routes the batch itself, off the first ticket's broker.
+    #[tokio::test]
+    async fn batch_ack_message_resolves_the_broker_address_from_the_first_ticket() {
+        let namesrv = RouteNamesrv::start().await;
+        let master = MockBroker::start().await;
+        let slave = MockBroker::start().await;
+        namesrv.serve(Some(route_body(
+            BROKER,
+            &[
+                (MixAll::MASTER_ID as i64, &master.addr),
+                (MixAll::MASTER_ID as i64 + 1, &slave.addr),
+            ],
+        )));
+        let instance = instance_against(&namesrv.addr);
+        let code = instance
+            .batch_ack_message(GROUP, TOPIC, &[BATCH_CK_A0, BATCH_CK_B], 3000, None)
+            .await
+            .expect("the master answers");
+        assert_eq!(code, response_code::SUCCESS);
+        assert_eq!(master.recorded(request_code::BATCH_ACK_MESSAGE).len(), 1);
+        // Control: the pop family never moves to the slave address.
+        assert!(slave.recorded(request_code::BATCH_ACK_MESSAGE).is_empty());
+        let body: serde_json::Value =
+            serde_json::from_slice(&master.recorded(request_code::BATCH_ACK_MESSAGE)[0].body)
+                .expect("json body");
+        assert_eq!(text_of(&body["brokerName"]), BROKER);
+        instance.shutdown();
+    }
+
+    /// The broker's code is returned verbatim; an unusable ticket list never reaches the wire.
+    #[tokio::test]
+    async fn batch_ack_message_maps_the_broker_code_and_rejects_unusable_lists_offline() {
+        let broker = MockBroker::start().await;
+        let instance = new_instance();
+
+        // Empty list: nothing to acknowledge, so no request at all.
+        let err = instance
+            .batch_ack_message(GROUP, TOPIC, &[], 3000, Some(&broker.addr))
+            .await
+            .expect_err("an empty ticket list cannot be acked");
+        assert!(
+            err.to_string().contains("at least one extraInfo"),
+            "{err}"
+        );
+        assert!(broker.recorded(request_code::BATCH_ACK_MESSAGE).is_empty());
+
+        // A 7-segment ticket carries no message offset: it fails before the frame is built.
+        let err = instance
+            .batch_ack_message(GROUP, TOPIC, &["100 1700000000000 60000 0 0 broker-a 3"], 3000, Some(&broker.addr))
+            .await
+            .expect_err("a ticket without the message offset is rejected");
+        assert!(err.to_string().contains("getQueueOffset"), "{err}");
+        assert!(
+            broker.recorded(request_code::BATCH_ACK_MESSAGE).is_empty(),
+            "a rejected list must not have gone out"
+        );
+
+        // A non-SUCCESS answer comes back as the code, exactly like the single ack path.
+        broker.script(vec![response_code::SYSTEM_ERROR], vec!["no such group".to_string()]);
+        let code = instance
+            .batch_ack_message(GROUP, TOPIC, &[BATCH_CK_A0], 3000, Some(&broker.addr))
+            .await
+            .expect("the transport succeeded, the broker just disagreed");
+        assert_eq!(code, response_code::SYSTEM_ERROR);
+        assert_eq!(broker.recorded(request_code::BATCH_ACK_MESSAGE).len(), 1);
+
+        // Control for the same script seam: SUCCESS is what the fixture answers once the script is spent.
+        let again = instance
+            .batch_ack_message(GROUP, TOPIC, &[BATCH_CK_A0], 3000, Some(&broker.addr))
+            .await
+            .expect("the fake broker falls back to SUCCESS");
+        assert_eq!(again, response_code::SUCCESS);
+        instance.shutdown();
+    }
+
     /// `find_broker_address_in_publish` only accepts brokerId=0; on the same route the admin lookup must fall back to the slave.
     #[tokio::test]
     async fn publish_lookup_takes_only_the_master_while_the_admin_lookup_falls_back() {
@@ -6685,6 +6980,9 @@ mod tests {
             .ack_message(GROUP, TOPIC, 0, &extra, 1, Some(BROKER), 3000, Some(route_addr))
             .await;
         let _ = instance
+            .batch_ack_message(GROUP, TOPIC, &[BATCH_CK_A0], 3000, Some(route_addr))
+            .await;
+        let _ = instance
             .change_invisible_time(
                 GROUP,
                 TOPIC,
@@ -6719,11 +7017,12 @@ mod tests {
         request_code::QUERY_MESSAGE,
     ];
 
-    const NEVER_MOVED: [i32; 6] = [
+    const NEVER_MOVED: [i32; 7] = [
         request_code::HEART_BEAT,
         request_code::PULL_MESSAGE,
         request_code::POP_MESSAGE,
         request_code::ACK_MESSAGE,
+        request_code::BATCH_ACK_MESSAGE,
         request_code::CHANGE_MESSAGE_INVISIBLETIME,
         request_code::UNREGISTER_CLIENT,
     ];

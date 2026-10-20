@@ -380,6 +380,16 @@ int64_t committed = lite.committed(mq);
 lite.commit({{mq, 200}}, true);
 ```
 
+订阅表达式也可以用选择器写法（`subscribe` / `setSubExpressionForAssign` 与 pull 侧的 `pull` /
+`pullBlockIfNotFound` / `pullAsync` 都有同名重载）：`MessageSelector::byTag("TagA||TagB")` 与字符串写法
+在线上完全同形；`MessageSelector::bySql("color = 'red'")` 把表达式原样带上请求头（`expressionType=SQL92`、
+`subVersion` 为订阅自身版本），并且不再走客户端的 tag 二次过滤——本地按 tag 列表去解析一段 SQL 会把 broker
+已经选出的消息全部丢弃。
+
+```cpp
+lite.subscribe("TopicDemo", MessageSelector::bySql("color = 'red' AND weight > 10"));
+```
+
 ### 管理端
 
 ```cpp

@@ -670,8 +670,11 @@ void DefaultMQPushConsumer::shutdown() {
     }
     // Retire the POP consume executor (graceful shutdown: accept no new tasks, finish the batches in hand).
     // An explicit join is mandatory: worker threads captured this, so letting them keep running is a use-after-free.
+    // awaitTerminationMillisWhenShutdown is the ceiling on that drain (0 = finish every queued batch, the
+    // historic behaviour); the workers enforce it while walking the backlog, so this stays the single wait.
     if (popConsumeExecutor_) {
-        popConsumeExecutor_->shutdown(true);
+        popConsumeExecutor_->shutdown(true, awaitTerminationMillisWhenShutdown_);
+        shutdownDroppedBatches_ = popConsumeExecutor_->droppedTaskCount();
         popConsumeExecutor_.reset();
     }
     // Persist consumed offsets once before exiting (the final flush at the tail of shutdown)
@@ -999,6 +1002,17 @@ bool DefaultMQPushConsumer::flowControlHit(const MessageQueue& mq, const std::st
     return true;
 }
 
+// FLOW_CONTROL(215) is the only response code with its own pause on this path; the broker raised it
+// because of its own throttling window, which says nothing about this client's cache.
+int32_t DefaultMQPushConsumer::pullPauseMillisFor(int32_t responseCode) {
+    return responseCode == ResponseCode::FLOW_CONTROL ? kPullPauseWhenBrokerFlowControl
+                                                     : kPullPauseWhenPullError;
+}
+
+void DefaultMQPushConsumer::notePullPause(int32_t millis) {
+    lastPullPauseMillis_.store(millis);
+}
+
 int64_t DefaultMQPushConsumer::lastPullAt(const std::string& key) const {
     std::lock_guard<std::mutex> lk(lock_);
     auto it = lastPullAt_.find(key);
@@ -1094,9 +1108,11 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq, uint64_t token
                 continue;
             }
         }
-        // Flow control (the five ProcessQueue thresholds, see flowControlHit): any hit pauses pulling this queue
+        // Flow control from **this client's** ProcessQueue thresholds (see flowControlHit): any hit pauses
+        // pulling this queue. Deliberately a different pause from the broker's FLOW_CONTROL(215) answer below.
         if (flowControlHit(mq, key)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            notePullPause(kPullPauseWhenClientFlowControl);
+            std::this_thread::sleep_for(std::chrono::milliseconds(kPullPauseWhenClientFlowControl));
             continue;
         }
         int64_t offset;
@@ -1163,9 +1179,15 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq, uint64_t token
                                                       static_cast<int64_t>(result.msgFoundList.size()));
             }
         } catch (const MQBrokerException& e) {
-            // TOPIC_NOT_EXIST / PULL_NOT_FOUND and friends are mostly expected paths (topic not created yet), so debug + backoff
-            logger_debug("pull broker error for " + mq.toString() + ": " + e.what());
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            // A broker that answers FLOW_CONTROL(215) throttled this request on its own window: that is a
+            // different event from every other broker error and gets a shorter pause, so the loop does not
+            // sit out 500ms while the throttle has already lifted. The rest (TOPIC_NOT_EXIST,
+            // PULL_NOT_FOUND and friends) are mostly expected paths (topic not created yet): debug + backoff.
+            const int32_t pause = pullPauseMillisFor(e.responseCode);
+            logger_debug("pull broker error for " + mq.toString() + ": " + e.what()
+                         + ", pause pull " + std::to_string(pause) + "ms");
+            notePullPause(pause);
+            std::this_thread::sleep_for(std::chrono::milliseconds(pause));
             continue;
         } catch (const RemotingTimeoutException& e) {
             // Long polling timing out on the client when nothing arrives during suspend is normal: the broker clamps the
@@ -1176,7 +1198,8 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq, uint64_t token
             continue;
         } catch (const std::exception& e) {
             logger_debug("pull error for " + mq.toString() + ": " + e.what());
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            notePullPause(kPullPauseWhenPullError);
+            std::this_thread::sleep_for(std::chrono::milliseconds(kPullPauseWhenPullError));
             continue;
         }
 

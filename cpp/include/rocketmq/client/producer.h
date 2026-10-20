@@ -12,6 +12,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -119,6 +120,19 @@ public:
     bool isEnableStreamRequestType() const { return enableStreamRequestType_; }
     void setPollNameServerIntervalMillis(int32_t millis) { pollNameServerIntervalMillis_ = millis; }
     int32_t pollNameServerIntervalMillis() const { return pollNameServerIntervalMillis_; }
+    // heartbeatInterval (default 30000ms): the period of the producer heartbeat that registers
+    // ProducerData with every broker. The heartbeat loop reads it when it anchors the next tick, so a
+    // value set after start() takes effect from that tick on; like every other producer-side knob it is
+    // not guarded against a concurrent setter, so configure it before start(). A non-positive period is
+    // rejected on the spot: it would anchor the next tick in the past and spin the loop with no pause.
+    void setHeartbeatIntervalMillis(int32_t millis) {
+        if (millis <= 0) {
+            throw std::invalid_argument("heartbeatIntervalMillis must be positive, but get "
+                                        + std::to_string(millis) + "!");
+        }
+        heartbeatIntervalMillis_ = millis;
+    }
+    int32_t heartbeatIntervalMillis() const { return heartbeatIntervalMillis_; }
     // Broker VIP channel: when true the rewritten broker request family is sent to port - 2 of the
     // route address. Must be set before start(); forwarded to the MQClientInstance that owns the RPCs.
     void setVipChannelEnabled(bool enable) { vipChannelEnabled_ = enable; }
@@ -393,6 +407,7 @@ protected:
     // +interval every round without bound; after stop the thread would instead sleep to a deadline pushed tens of hours out, and join hangs forever.
     std::atomic<bool> heartbeatStop_{true};
     std::atomic<int64_t> lastHeartbeatMs_{0};
+    // The heartbeat period, read by the heartbeat loop every time it anchors the next tick
     int32_t heartbeatIntervalMillis_ = 30000;
     std::atomic<int32_t> heartbeatCount_{0};
 

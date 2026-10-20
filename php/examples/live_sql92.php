@@ -38,9 +38,13 @@ use RocketMQ\Client\DefaultMQProducer;
 use RocketMQ\Client\DefaultMQPushConsumer;
 use RocketMQ\Client\Exceptions\MQClientException;
 use RocketMQ\Client\MessageListenerConcurrently;
+use RocketMQ\Client\PullStatus;
 use RocketMQ\Client\MessageSelector;
 use RocketMQ\Client\SendStatus;
+use RocketMQ\Client\DefaultLitePullConsumer;
+use RocketMQ\Client\DefaultMQPullConsumer;
 use RocketMQ\Common\ExpressionType;
+use RocketMQ\Common\PullSysFlag;
 use RocketMQ\Common\Message;
 use RocketMQ\Common\MessageExt;
 use RocketMQ\Remoting\Protocol\ConsumeFromWhere;
@@ -120,6 +124,58 @@ final class Check46Probe extends RPCHook
     public function checkCount(): int
     {
         return count(array_filter($this->codes, static fn (int $c): bool => $c === RequestCode::CHECK_CLIENT_CONFIG));
+    }
+}
+
+
+/**
+ * Captures the subscription cells the PULL / LITE_PULL requests really carried to the broker.
+ *
+ * The cells are read off the request header, not ext_fields: the hook runs before encoding and
+ * the encoder is what copies a non-null header field into ext_fields, so at capture time the
+ * header is the only place the subscription exists.
+ */
+final class PullWireProbe extends RPCHook
+{
+    /** @var list<array<string, string>> */
+    public array $rows = [];
+
+    public function doBeforeRequest(string $remoteAddr, RemotingCommand $request): void
+    {
+        if ($request->code === RequestCode::PULL_MESSAGE
+            || $request->code === RequestCode::LITE_PULL_MESSAGE) {
+            $this->rows[] = [
+                'code' => (string) $request->code,
+                'topic' => self::cell($request, 'topic'),
+                'subscription' => self::cell($request, 'subscription'),
+                'expressionType' => self::cell($request, 'expressionType'),
+                'subVersion' => self::cell($request, 'subVersion'),
+                'sysFlag' => self::cell($request, 'sysFlag'),
+            ];
+        }
+    }
+
+    private static function cell(RemotingCommand $request, string $name): string
+    {
+        $header = $request->customHeader;
+        if ($header !== null) {
+            $fields = get_object_vars($header);
+            if (isset($fields[$name]) && $fields[$name] !== '') {
+                return (string) $fields[$name];
+            }
+        }
+        return (string) ($request->extFields[$name] ?? '');
+    }
+
+    /** Last recorded request for this topic, or null. */
+    public function last(string $topic): ?array
+    {
+        foreach (array_reverse($this->rows) as $r) {
+            if ($r['topic'] === $topic) {
+                return $r;
+            }
+        }
+        return null;
     }
 }
 
@@ -450,6 +506,165 @@ try {
         $leakedFirst = array_intersect($firstBlue, $fBodies);
         check($leakedFirst === [], 'S5 no blue leaks into the send-first SQL92 consumer',
             'got=' . implode(',', $fBodies));
+    }
+
+    // ---------- S6 the pull paths put the selector on the wire and the broker obeys it ----------
+    // The sections above drive the push consumer. The pull/lite-pull entry points carry the
+    // subscription themselves, so the two halves of the fix have to be proven separately: the
+    // request really says SQL92 (the broker then filters by property), and the client does NOT
+    // re-run a tag pass over what the broker matched. Reverting the selector support turns both
+    // readings red: the request goes out typed TAG (so the broker admits all six messages) and the
+    // raw expression is parsed as a tag list, so the local pass drops every one of them.
+    echo PHP_EOL . '---------- S6 pull-path selector against a real broker ----------' . PHP_EOL;
+    $pullTopic = 'Sql92PullPhp_' . $stamp;
+    // One write queue: a single walk of one queue sees every message, so the counts below are
+    // decided by filtering, not by how the sends spread over several queues.
+    $admin->createTopic($brokerName, $pullTopic, 1);
+    $pullReady = wait_until(20.0, function () use ($admin, $pullTopic): bool {
+        try {
+            $r = $admin->examineTopicRoute($pullTopic);
+        } catch (Throwable) {
+            return false;
+        }
+        $n = 0;
+        foreach ($r->queueDatas as $q) {
+            $n += $q->readQueueNums;
+        }
+        return $n >= 1;
+    });
+    check($pullReady, 'S6 the one-queue pull topic route is ready');
+    if ($pullReady) {
+        $pullRed = [];
+        $pullBlue = [];
+        foreach (['red', 'blue'] as $color) {
+            for ($i = 0; $i < 3; $i++) {
+                $text = 'pull-' . $color . '-' . $i;
+                $m = new Message($pullTopic, $text, 'TagPull', $stamp . '-pull-' . $color . '-' . $i);
+                $m->putProperty('color', $color);
+                $ok = false;
+                $err = '';
+                for ($try = 0; $try < 10; $try++) {
+                    try {
+                        $r = $prod->send($m);
+                        $ok = $r->sendStatus === SendStatus::SEND_OK;
+                        if (!$ok) {
+                            $err = (string) $r->sendStatus;
+                        }
+                        break;
+                    } catch (Throwable $e) {
+                        $err = $e->getMessage();
+                        usleep(300_000);
+                    }
+                }
+                check($ok, 'S6 sending ' . $text . ' succeeded', $err);
+                if ($color === 'red') {
+                    $pullRed[] = $text;
+                } else {
+                    $pullBlue[] = $text;
+                }
+            }
+        }
+        sort($pullRed, SORT_STRING);
+        sort($pullBlue, SORT_STRING);
+
+        $pullProbe = new PullWireProbe();
+        $pc = new DefaultMQPullConsumer($group . '_PULL', $pullProbe);
+        $pc->setNamesrvAddr($ns);
+        $pc->setInstanceName('sql92php-pull-' . $stamp);
+        $pc->start();
+        $consumers[] = $pc;
+        $mqs = $pc->fetchSubscribeMessageQueues($pullTopic);
+        check(count($mqs) >= 1, 'S6 the pull topic has a queue to read', 'queues=' . count($mqs));
+        if (count($mqs) >= 1) {
+            $mq = $mqs[0];
+            $sqlRed = "color = 'red'";
+
+            $redBodies = [];
+            $offset = 0;
+            for ($round = 0; $round < 8; $round++) {
+                $r = $pc->pullBySelector($mq, MessageSelector::bySql($sqlRed), $offset, 32);
+                $offset = (int) $r->nextBeginOffset;
+                foreach ($r->msgFoundList as $mm) {
+                    $redBodies[] = (string) $mm->getBody();
+                }
+                if ($r->status !== PullStatus::FOUND) {
+                    break;
+                }
+            }
+            sort($redBodies, SORT_STRING);
+            check($redBodies === $pullRed,
+                'S6 the broker filtered a SQL92 pull by property: exactly the 3 red messages',
+                'got=' . implode(',', $redBodies));
+            check(array_intersect($pullBlue, $redBodies) === [],
+                'S6 no blue leaked into the SQL92 pull', 'got=' . implode(',', $redBodies));
+
+            $sqlRow = $pullProbe->last($pullTopic);
+            check($sqlRow !== null && $sqlRow['expressionType'] === ExpressionType::SQL92
+                && $sqlRow['subscription'] === $sqlRed && (int) $sqlRow['subVersion'] > 0,
+                'S6 the pull request carried SQL92, the raw expression and a real subscription version',
+                json_encode($sqlRow, JSON_UNESCAPED_UNICODE));
+            check($sqlRow !== null
+                && (((int) $sqlRow['sysFlag']) & PullSysFlag::FLAG_SUBSCRIPTION) !== 0
+                && (((int) $sqlRow['sysFlag']) & PullSysFlag::FLAG_CLASS_FILTER) === 0,
+                'S6 the SQL92 pull asks for the subscription without the legacy filter-server bit',
+                $sqlRow === null ? 'no pull seen' : 'sysFlag=' . $sqlRow['sysFlag']);
+
+            // Control on the same queue at the same offset: a plain tag expression is admitted
+            // wholesale, which is what a dropped selector would have looked like.
+            $all = [];
+            for ($round = 0; $round < 8; $round++) {
+                $r = $pc->pull($mq, '*', 0, 32);
+                foreach ($r->msgFoundList as $mm) {
+                    $all[] = (string) $mm->getBody();
+                }
+                break;
+            }
+            sort($all, SORT_STRING);
+            check(count($all) === 6,
+                'S6 control: the same queue read with "*" returns all six messages',
+                'got=' . count($all) . ' [' . implode(',', $all) . ']');
+            $tagRow = $pullProbe->last($pullTopic);
+            check($tagRow !== null && $tagRow['expressionType'] === ExpressionType::TAG
+                && (int) $tagRow['subVersion'] === 0 && $tagRow['subscription'] === '*',
+                'S6 control: the tag pull keeps the historic shape (TAG, expression "*", version 0)',
+                json_encode($tagRow, JSON_UNESCAPED_UNICODE));
+
+            // The lite-pull entry point, assign mode with a selector.
+            $liteProbe = new PullWireProbe();
+            $lite = new DefaultLitePullConsumer($group . '_LITE', $liteProbe);
+            $lite->setNamesrvAddr($ns);
+            $lite->setInstanceName('sql92php-lite-' . $stamp);
+            $lite->autoCommit = false;
+            $lite->setConsumeFromWhere(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
+            $lite->setSubExpressionForAssignWithSelector($pullTopic, MessageSelector::bySql("color = 'blue'"));
+            $lite->assign([$mq]);
+            $lite->seek($mq, 0);
+            $lite->start();
+            $consumers[] = $lite;
+            $blueBodies = [];
+            $deadline = microtime(true) + 25.0;
+            while (microtime(true) < $deadline && count($blueBodies) < 3) {
+                $lite->tick();
+                foreach ($lite->poll(200) as $mm) {
+                    $blueBodies[] = (string) $mm->getBody();
+                }
+            }
+            sort($blueBodies, SORT_STRING);
+            check($blueBodies === $pullBlue,
+                'S6 the lite pull of a selector subscription read only the blue messages',
+                'got=' . implode(',', $blueBodies));
+            $liteRow = $liteProbe->last($pullTopic);
+            check($liteRow !== null && (int) $liteRow['code'] === RequestCode::LITE_PULL_MESSAGE
+                && $liteRow['expressionType'] === ExpressionType::SQL92
+                && $liteRow['subscription'] === "color = 'blue'" && (int) $liteRow['subVersion'] > 0,
+                'S6 the LITE_PULL request carried the selector verbatim',
+                json_encode($liteRow, JSON_UNESCAPED_UNICODE));
+            check($liteRow !== null
+                && (((int) $liteRow['sysFlag']) & PullSysFlag::FLAG_LITE_PULL_MESSAGE) !== 0
+                && (((int) $liteRow['sysFlag']) & PullSysFlag::FLAG_CLASS_FILTER) === 0,
+                'S6 the lite pull sysFlag keeps the lite bit and leaves the filter-server bit off',
+                $liteRow === null ? 'no lite pull seen' : 'sysFlag=' . $liteRow['sysFlag']);
+        }
     }
 } catch (Throwable $e) {
     check(false, 'unexpected exception', $e->getMessage());

@@ -245,6 +245,21 @@ public:
                        const std::string& brokerName = std::string(),
                        const std::string& addr = std::string());
 
+    // Ack a batch of POP messages in one BATCH_ACK_MESSAGE request. extraInfoList are the POP_CK
+    // strings of the messages to acknowledge (the same 8-segment form ackMessage takes one of).
+    // Grouping rule: the merge key is "<retry>@<queueId>@<ckQueueOffset>@<popTime>". The first extra
+    // info seen supplies the body's broker name. The first extra info of a merge key creates one
+    // batch entry, pre-filled with consumerGroup/topic/retry/startOffset(=ckQueueOffset)/queueId/
+    // reviveQueueId/popTime/invisibleTime and an empty offset bit set; a repeated merge key only
+    // sets the bit at index (queueOffset - ckQueueOffset). The request carries no custom header; the
+    // JSON body is {"brokerName":..,"acks":[..]} with the compact per-entry keys. addr is the broker
+    // address; when empty it is resolved from the broker name of the first extra info the same way
+    // ackMessage does. Returns the broker code; SUCCESS(0) is success.
+    int32_t batchAckMessage(const std::string& consumerGroup, const std::string& topic,
+                            const std::vector<std::string>& extraInfoList,
+                            int32_t timeoutMillis = 3000,
+                            const std::string& addr = std::string());
+
     // Extend a POP message's invisibility. The response returns the **new** popTime/invisibleTime/
     // reviveQid, from which the client rebuilds the 8-segment extraInfo (result field) for the later ACK.
     ChangeInvisibleTimeResult changeInvisibleTime(const std::string& consumerGroup,
