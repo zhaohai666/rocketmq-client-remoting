@@ -28,7 +28,11 @@ declare(strict_types=1);
 // Hard cluster prerequisites (POP-specific broker.conf, see the pop branch of
 // scripts/run_php_live.sh):
 //   timerWheelEnable=true / defaultMessageRequestMode=PULL (the PHP-side 401 is sent explicitly
-//   via Admin by this tool) / popResponseReturnActualRetryTopic=false / enablePopBatchAck=false.
+//   via Admin by this tool) / popResponseReturnActualRetryTopic=false.
+//   enablePopBatchAck is **not** one of them: that switch only steers the broker's internal re-put
+//   of buffered acks, it does not gate BATCH_ACK_MESSAGE (200151). This tool still acks message by
+//   message, because that is what the POP push consumer does — the batch command has its own live
+//   tool (examples/live_pop_batch_ack.php), and it needs no dedicated cluster either.
 //
 // Closing line `PASS=<n> FAIL=<n>`; exits non-zero on any FAIL.
 require __DIR__ . '/../bootstrap.php';

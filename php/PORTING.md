@@ -92,15 +92,25 @@ PHP 无线程：`invokeAsync` = 非阻塞写 + pending 表（opaque→[onSuccess
     <ns> [codec]` / `recv ...`），载荷配方逐字节固定，判定只看
     接收端 `match=1`（CRC-32 IEEE，`sprintf('%u', crc32(...))`），退出码 0/1/2/3。
     已在 `scripts/compression_matrix.sh` 注册 php_* 腿；LZ4（标准 LZ4 Frame 格式）与 ZSTD（Raw/RLE 帧）由 `CompressionCodec` 纯实现承担。
-  - `examples/live_pop.php`（POP 专用集群，四件 broker.conf：timerWheelEnable=true /
-    defaultMessageRequestMode=PULL / popResponseReturnActualRetryTopic=false /
-    enablePopBatchAck=false）：S1 ACK 真生效（6 条后盯 2.5x 不可见窗无重复投递 +
+  - `examples/live_pop.php`（POP 专用集群，三件 broker.conf：timerWheelEnable=true /
+    defaultMessageRequestMode=PULL / popResponseReturnActualRetryTopic=false）：S1 ACK 真生效（6 条后盯 2.5x 不可见窗无重复投递 +
     POP_CK 8 段形状 + 1ST_POP_TIME + ACK 债务归零 + `localOffsetCount()==0`）；
     S2 失败退避（RECONSUME_LATER → changePopInvisibleTime → revive 搬进
     `%RETRY%<group>_<topic>` → 重投 marker=1 + recon 递增 + 1ST_POP_TIME 保留）。
     PHP 有意偏差：PushConsumer.start() **不自动发 401**，由工具经
     `Admin::setMessageRequestMode(brokerAddr, topic, group, 'POP', 8)` 显式发
     （401 本属运维侧 mqadmin 的动作）。20/20。
+  - `examples/live_pop_batch_ack.php`（BATCH_ACK_MESSAGE(200151) 直驱，**不需要**专用集群：
+    200151 由 broker 无条件注册，`enablePopBatchAck` 只管 broker 内部缓冲 ack 的重新落盘时机，
+    从不给这条命令开关，标准 `enablePopBatchAck=false` 的集群即可跑）：L1 一次批量清掉 8 个 ck
+    （body 恰好覆盖 pop 到的 offset 各一次、merge key 只 1 组、编解码往返、2.5x 窗内零复投）；
+    L2 配对对照（故意漏掉最高 offset：只复活它、其余仍消失，复活 ck 带重试标记且
+    `%RETRY%<group>_<topic>` 的路由真到 nameserver，清它时 body 仍写**业务 topic** + marker=1；
+    等复活的那一段是「见到就停 + 3s 尾巴」而不是固定窗——固定 25s 窗会让 ck 到期再投、
+    被再次 pop，等到 ack 发出时最早那条 ck 早已过期，broker 已经把它搬走了，静默检查就会
+    挂在时序上而不是线序上）；
+    L3 两轮 pop 一次请求（popTime 进 merge key，两轮不合并，4 个 offset 各覆盖一次）。
+    POP 推进靠 `MQClientInstance::tick()`（PHP 无后台线程），pop/ack 地址由实例自解析。32/32。
   - `examples/live_tls.php`（TLS 专用集群：namesrv+broker 都 `-Dtls.enable=true`——
     PHP 端 tlsEnable 是进程级全局，namesrv 连接也走 TLS）：三腿
     plain_tls（test-mode 信任自签）/ ca_verify（caCert + serverName 真校验证书链 +

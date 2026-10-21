@@ -481,7 +481,8 @@ Each check prints `PASS` / `FAIL` and the last line is the tally (`PASS=<n> FAIL
 | `live_pull` | Pull: min / max / offset-by-timestamp, empty queue head short polling does not suspend, empty queue tail `NO_NEW_MSG` does not suspend, long polling waking early and expiring, caller-owned cursor, `sendMessageBack` into `%RETRY%`; closing line carries `COMMITTED=<offset>` |
 | `live_lite_pull` | LitePull: `Assign` dual-cursor advance, `Commit` and restart continuity without replay, `Seek` replay, `Subscribe` rebalance + auto-commit read back from the broker, shutdown persistence |
 | `live_lite_topic_queue_change` | The queue-change listener: really scales the topic up and down, and the callback must land within one or two check rounds — which proves the comparison reads a fresh route rather than the 30s route cache (measured `PASS=11 FAIL=0`) |
-| `live_pop` | POP consumption: the invisible window, ack and batch ack, changing the timeout on failure, the redelivery window. The assertions are timed windows and broker-side observable state, not return codes — POP goes wrong silently |
+| `live_pop` | POP consumption: the invisible window, one-message-at-a-time ack, changing the timeout on failure, the redelivery window. The assertions are timed windows and broker-side observable state, not return codes — POP goes wrong silently |
+| `live_pop_batch_ack` | BATCH_ACK_MESSAGE(200151) as its own live leg: the push consumer acks message by message and never batches, so the capability is only reachable by driving the wire primitive. l1 proves one request clears a whole batch (nothing may revive inside 2.5x the invisibility window), l2 is the paired control (leave exactly one checkpoint out and only that message may come back, which also pins the retry direction: the revived checkpoint lives in `%RETRY%<group>_<topic>` with marker 1 while the batch body still names the business topic, since the broker re-derives the physical queue from marker + group), l3 acks two pop rounds with one request (entries group by retry@queueId@ckOffset@popTime, no over-merging across rounds). Same criteria: timed windows plus broker-side state, and no broker switch needed |
 | `live_redelivery` | `%RETRY%` redelivery with its delay ladder, `%DLQ%` once `maxReconsumeTimes` is exhausted, the ordered poison-message DLQ path, `ackIndex` partial ack |
 | `live_shutdown_race` | The data contract of "close the client and exit the process immediately": two rounds of concurrent send-back (`%RETRY%` → `%DLQ%`), the ordered suspended send-back, the tail batch of a short-lived trace producer |
 | `live_admin` | 29 admin checks: cluster liveness and master election, topic CRUD, broker config and runtime KV, subscription group CRUD, eight messages to verify topic stats, the four offset queries, KEYS lookup + `viewMessage`, and confirmation that the topic is gone after deletion |
@@ -503,7 +504,7 @@ go run ./examples/live_compression_matrix recv <topic> <group> <size> 127.0.0.1:
 go run ./examples/live_acl_message_types -ns 127.0.0.1:9876 -ak <accessKey> -sk <secretKey>
 ```
 
-`live_pop` and `live_redelivery` accept `-legs s1,s2` to run only some scenarios. The
+`live_pop` and `live_redelivery` accept `-legs s1,s2`, and `live_pop_batch_ack` accepts `-legs l1,l2,l3`, to run only some scenarios. The
 repository root's `scripts/` directory wraps the full sequence (bring up the cluster, wait for
 readiness, verify, tear down — all in one command), named after the tools above, e.g.
 `bash scripts/run_go_producer_live.sh`.

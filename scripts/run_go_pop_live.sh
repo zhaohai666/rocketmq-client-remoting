@@ -32,8 +32,11 @@
 #                                                is the "stop answering this group with PULL" step
 #   popResponseReturnActualRetryTopic=false   —— default retry path: the broker itself stamps POP_CK and
 #                                                rewrites msg.Topic back to the business topic; S2 pins exactly this
-#   enablePopBatchAck=false                   —— so this tool does **not** run BATCH_ACK_MESSAGE(200151);
-#                                                the normal path is per-message ackAsync anyway, it never sends it
+#
+# enablePopBatchAck is NOT on that list: it only steers the broker-internal re-put of buffered
+# acks, it never gates BATCH_ACK_MESSAGE(200151). This tool still does not send 200151, because
+# the POP push consumer acks message by message — the batch command has its own live tool
+# (run_go_pop_batch_ack_live.sh).
 #
 # Cluster: assumes one is already running by default (the scripts/rmq_test_broker.sh setup). If
 # the port probe fails, it automatically runs `rmq_test_broker.sh start`, and on cleanup stops

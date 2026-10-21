@@ -445,6 +445,7 @@ bash scripts/run_php_live.sh <case> 127.0.0.1:9876 [legs]
 | `lite_qc` | `examples/live_lite_topic_queue_change.php` | LitePull topic 队列集合变更监听：检查周期压到 1s + 真实扩缩容，证明比对趟次现查路由；主循环每轮 `tick()`+`poll()` 驱动 |
 | `request_reply` | `examples/live_request_reply.php` | Request-Reply 往返：应答方进程（consumer + `reply()`）与发起方进程（`request()`）两段编排，`ROUNDTRIP ok=<n> total=<n>` 收口 |
 | `pop` | `examples/live_pop.php` | POP 消费 S1–S2：ACK 生效计时观察 + 失败退避（changeInvisibleTime→RETRY→重试标记）（可选 `legs=all\|s1,s2`） |
+| `pop_batch_ack` | `examples/live_pop_batch_ack.php` | BATCH_ACK(200151) 三腿：一次批量清掉整窗 ck（无复投）/ 故意漏一条→只复活它且按 marker+业务 topic 清掉 / 两轮 pop 不跨轮合并（merge key 含 popTime）；专用集群不需要额外开关（可选 `legs=all\|l1,l2,l3`） |
 | `tls` | `examples/live_tls.php` | TLS 三腿 `plain_tls` / `ca_verify` / `mtls`，脚本现造 CA/server(SAN:127.0.0.1)/client 证书 |
 | `compression` | `examples/live_compression.php` | 本端压缩冒烟：zlib / lz4 / zstd 自压自解一条腿；退出码 0 ok / 1 普通失败 / 2 坏 codec / 3 recv 超时 |
 | `static_topic` | `examples/live_static_topic.php` | 静态主题 S1–S5：513 建 8 队列映射 4 物理队列、路由回读、端点表、mock 队列名解析回真实 broker、端到端收发 |
@@ -463,9 +464,11 @@ examples/live_acl_message_types.php <namesrv> <accessKey> <secretKey> [legs]`，
 1. **先起消费者、再发消息**：消费者没有默认 topic 兜底，缺路由 = 无分配 = 无消费；
    先发消息后起消费者会把环境问题伪装成客户端 bug。所有 live 脚本都按这个顺序编排。
 2. **部分用例需要专用 broker 配置**（脚本已自动处理，但要求**独占集群**）：
-   `pop` 需要 POP 专用 `broker.conf` 四件配置（`timerWheelEnable=true`、
-   `defaultMessageRequestMode=PULL`、`popResponseReturnActualRetryTopic=false`、
-   `enablePopBatchAck=false`）；`tls` 需要 NameServer + Broker 都以 `tls.enable` 启动；
+   `pop` 需要 POP 专用 `broker.conf` 三件配置（`timerWheelEnable=true`、
+   `defaultMessageRequestMode=PULL`、`popResponseReturnActualRetryTopic=false`）；
+   `pop_batch_ack` 反过来**不需要**专用集群——BATCH_ACK_MESSAGE(200151) 是无条件注册的
+   broker 侧指令，`enablePopBatchAck` 只决定 broker 内部把缓冲 ack 重新落盘的时机，从不
+   给这条命令开关，标准集群配置即可跑；`tls` 需要 NameServer + Broker 都以 `tls.enable` 启动；
    撤回与轨迹链路还要求 broker 开 `recallMessageEnable=true` / `traceTopicEnable=true`。
    已在跑的明文集群遇到 `pop` / `tls` 时脚本直接以 2 号退出码拒绝，避免误停共享集群。
 3. **日志钉在临时目录**：`lite_qc` 用例默认把 `ROCKETMQ_CLIENT_LOG_DIR` 指到系统临时目录

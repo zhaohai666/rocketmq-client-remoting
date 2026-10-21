@@ -1,7 +1,7 @@
 #!/bin/bash
 # Live verification entry point for the PHP client (mirrors the approach of run_go_*_live.sh / run_node_live.sh).
 #
-# Usage: bash scripts/run_php_live.sh redelivery|admin|compression|pop|tls|request_reply|pull|lite_qc|registration|sql92 [namesrv]
+# Usage: bash scripts/run_php_live.sh redelivery|admin|compression|pop|pop_batch_ack|tls|request_reply|pull|lite_qc|registration|sql92 [namesrv]
 #   redelivery   php/examples/live_redelivery.php  (optional third arg legs=all|s1,s2,s3,s4)
 #   admin        php/examples/live_admin.php
 #   pull         php/examples/live_pull.php        (optional third arg legs=all|s1,s2,s3;
@@ -25,8 +25,20 @@
 #                  subscription on the PULL / LITE_PULL requests — expressionType, the raw
 #                  expression, its own subVersion and the sysFlag bits, all recorded by an RPC hook)
 #   pop          php/examples/live_pop.php         (optional third arg legs=all|s1,s2;
-#                 **requires an exclusive cluster**: needs the four POP-specific broker.conf
+#                 **requires an exclusive cluster**: needs the three POP-specific broker.conf
 #                 settings, see below)
+#   pop_batch_ack php/examples/live_pop_batch_ack.php (optional third arg legs=all|l1,l2,l3;
+#                 BATCH_ACK_MESSAGE(200151) driven straight against the broker, which the POP push
+#                 consumer never sends: one request clears a whole batch, the bitmap is honored
+#                 (paired control leaves one checkpoint out), and two pop rounds group by
+#                 retry@queueId@ckOffset@popTime without over-merging.
+#                 **No exclusive cluster needed**: 200151 is registered unconditionally and the
+#                 revive side handles the batch ack tag the same way, so the standard broker.conf
+#                 already serves it (enablePopBatchAck only steers the broker's internal re-put of
+#                 buffered acks). Full run a couple of minutes: l1 and l3 observe silence for 2.5x
+#                 the 10s invisibility window, while l2's first window is a probe that stops at the
+#                 first sighting — its checkpoint has to stay inside its own invisibility until the
+#                 follow-up ack goes out.)
 #   tls          php/examples/live_tls.php         (three legs plain_tls/ca_verify/mtls;
 #                 **requires an exclusive cluster**: namesrv+broker both need -Dtls.enable=true —
 #                 tlsEnable on PHP is a process-wide global switch too, so the namesrv connection
@@ -61,12 +73,13 @@ case "$WHICH" in
   lite_qc)       EXAMPLE="examples/live_lite_topic_queue_change.php" ;;
   compression)   EXAMPLE="examples/live_compression.php"    ;;
   pop)           EXAMPLE="examples/live_pop.php"            ;;
+  pop_batch_ack) EXAMPLE="examples/live_pop_batch_ack.php"  ;;
   tls)           EXAMPLE="examples/live_tls.php"            ;;
   request_reply) EXAMPLE="examples/live_request_reply.php"  ;;
   registration)  EXAMPLE="examples/live_producer_registration.php" ;;
   sql92)         EXAMPLE="examples/live_sql92.php" ;;
   static_topic)  EXAMPLE="examples/live_static_topic.php"   ;;
-  *) echo "unknown example: $WHICH (redelivery|admin|compression|pop|tls|request_reply|pull|lite_qc|sql92|static_topic|registration)" >&2; exit 2 ;;
+  *) echo "unknown example: $WHICH (redelivery|admin|compression|pop|pop_batch_ack|tls|request_reply|pull|lite_qc|sql92|static_topic|registration)" >&2; exit 2 ;;
 esac
 
 port_open() {
@@ -212,11 +225,11 @@ EOF
 fi
 
 # ---------------------------------------------------------------- pop branch exclusive-cluster check
-# POP requires four hard broker.conf settings (timerWheelEnable etc.). An already-running
+# POP requires three hard broker.conf settings (timerWheelEnable etc.). An already-running
 # cluster is mostly plain conf; silently reusing it would always hard-fail at S1 — rejecting
 # outright beats a mismatched run.
 if [ "$WHICH" = "pop" ] && { port_open x "$NS_PORT" || port_open x "$BROKER_PORT"; }; then
-    echo "=== the pop branch needs a POP-dedicated cluster (timerWheelEnable=true and three more settings)," >&2
+    echo "=== the pop branch needs a POP-dedicated cluster (timerWheelEnable=true and two more settings)," >&2
     echo "    but a cluster is already running on ${NS_PORT}/${BROKER_PORT}. Stop it first before running pop. ===" >&2
     exit 2
 fi
@@ -247,11 +260,12 @@ EOF
     if [ "$WHICH" = "pop" ]; then
         cat >> "$WORK/broker.conf" <<EOF
 
-# POP hard prerequisites (broker.conf needs these for the POP path to run)
+# POP hard prerequisites (broker.conf needs these for the POP path to run).
+# enablePopBatchAck is deliberately not here: it only steers the broker-internal re-put
+# of buffered acks, it never gates BATCH_ACK_MESSAGE (200151).
 timerWheelEnable = true
 defaultMessageRequestMode = PULL
 popResponseReturnActualRetryTopic = false
-enablePopBatchAck = false
 EOF
     fi
     export ROCKETMQ_HOME="$DIST"
@@ -282,7 +296,7 @@ fi
 
 echo "=== php live: $EXAMPLE (ns=$NS) ==="
 cd "$ROOT/php" || exit 1
-if [ "$WHICH" = "redelivery" ] || [ "$WHICH" = "pop" ] || [ "$WHICH" = "pull" ]; then
+if [ "$WHICH" = "redelivery" ] || [ "$WHICH" = "pop" ] || [ "$WHICH" = "pop_batch_ack" ] || [ "$WHICH" = "pull" ]; then
     "$PHP_BIN" "$EXAMPLE" "$NS" "$LEGS"
 elif [ "$WHICH" = "request_reply" ]; then
     # Two-process orchestration: the responder (consumer + producer.reply) starts in the

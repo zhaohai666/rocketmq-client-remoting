@@ -240,21 +240,26 @@ func TestBitSetRoundTripBase64(t *testing.T) {
 // the wrong message and leaves the intended one to be redelivered.
 func TestBuildBatchAckGroupsAndIndexesByBit(t *testing.T) {
 	// Two messages on the same queue/batch (ckQueueOffset 10, offsets 10 and 12)
-	// plus one on another queue, and one on a retry topic.
+	// plus one on another queue, one on a retry topic, and one that differs from
+	// the first ONLY in pop time.
 	c1 := common.BuildExtraInfoWithMsgQueueOffset(10, 1700000000000, 60000, 3, "T", "broker-a", 0, 10)
 	c2 := common.BuildExtraInfoWithMsgQueueOffset(10, 1700000000000, 60000, 3, "T", "broker-a", 0, 12)
 	c3 := common.BuildExtraInfoWithMsgQueueOffset(20, 1700000000000, 60000, 3, "T", "broker-a", 0, 20)
 	c4 := common.BuildExtraInfoWithMsgQueueOffset(0, 1700000000000, 60000, 3, "%RETRY%G_T", "broker-a", 0, 1)
+	c5 := common.BuildExtraInfoWithMsgQueueOffset(10, 1700000000999, 60000, 3, "T", "broker-a", 0, 10)
 
-	body, err := BuildBatchAckMessageRequestBody("T", "G", []string{c1, c2, c3, c4})
+	body, err := BuildBatchAckMessageRequestBody("T", "G", []string{c1, c2, c3, c4, c5})
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
 	if body.BrokerName != "broker-a" {
 		t.Fatalf("brokerName = %q", body.BrokerName)
 	}
-	if len(body.Acks) != 3 {
-		t.Fatalf("want 3 merged acks, got %d", len(body.Acks))
+	// popTime is part of the grouping key: two pop rounds that happen to start at
+	// the same queue offset are two different checkpoints on the broker, and one
+	// entry can only ever carry the bits of the round it names.
+	if len(body.Acks) != 4 {
+		t.Fatalf("want 4 merged acks (popTime separates the two rounds), got %d", len(body.Acks))
 	}
 	first := body.Acks[0]
 	if first.StartOffset != 10 || !first.BitSet.Get(0) || first.BitSet.Get(1) || !first.BitSet.Get(2) {
@@ -272,6 +277,11 @@ func TestBuildBatchAckGroupsAndIndexesByBit(t *testing.T) {
 	if last.Retry != "1" {
 		t.Fatalf("retry marker = %q", last.Retry)
 	}
+	secondRound := body.Acks[3]
+	if secondRound.StartOffset != 10 || secondRound.PopTime != 1700000000999 ||
+		!secondRound.BitSet.Get(0) || secondRound.BitSet.Get(2) {
+		t.Fatalf("the popTime-distinct round kept the wrong entry: %+v", secondRound)
+	}
 }
 
 func TestBatchAckBodyUsesShortJSONNames(t *testing.T) {
@@ -285,7 +295,7 @@ func TestBatchAckBodyUsesShortJSONNames(t *testing.T) {
 	raw := string(body.Encode())
 	// fastjson2 on the broker declares @JSONField(name=...) — the SHORT names —
 	// as the wire keys, not the property names.
-	for _, want := range []string{`"brokerName":"broker-a"`, `"c":"G"`, `"t":"T"`, `"r":"0"`, `"so":10`, `"q":0`, `"rq":3`, `"it":60000`} {
+	for _, want := range []string{`"brokerName":"broker-a"`, `"c":"G"`, `"t":"T"`, `"r":"0"`, `"so":10`, `"q":0`, `"rq":3`, `"pt":1700000000000`, `"it":60000`} {
 		if !contains(raw, want) {
 			t.Fatalf("body %s missing %s", raw, want)
 		}

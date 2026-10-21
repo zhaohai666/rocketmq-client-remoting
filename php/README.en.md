@@ -491,6 +491,7 @@ bash scripts/run_php_live.sh <case> 127.0.0.1:9876 [legs]
 | `lite_qc` | `examples/live_lite_topic_queue_change.php` | LitePull topic queue-set change listening: the check interval pinned to 1s plus real scale-in/out proves the comparison round queries routes live; the main loop drives `tick()`+`poll()` every round |
 | `request_reply` | `examples/live_request_reply.php` | Request-Reply roundtrip: the responder process (consumer + `reply()`) and the requester process (`request()`) orchestrated in two stages, summarized by `ROUNDTRIP ok=<n> total=<n>` |
 | `pop` | `examples/live_pop.php` | POP consumption S1–S2: timed-window observation that ACKs really take effect + failure backoff (change-invisible-time → RETRY → retry marker) (optional `legs=all\|s1,s2`) |
+| `pop_batch_ack` | `examples/live_pop_batch_ack.php` | BATCH_ACK(200151), three legs: one batch clears the whole visibility window (no redelivery) / deliberately leaving one checkpoint out revives only that message, which is then cleared by a marker-carrying body on the business topic / two pop rounds never merge across rounds (popTime is part of the merge key); needs no dedicated cluster switch (optional `legs=all\|l1,l2,l3`) |
 | `tls` | `examples/live_tls.php` | the three TLS legs `plain_tls` / `ca_verify` / `mtls`; the script mints CA/server(SAN:127.0.0.1)/client certificates on the spot |
 | `compression` | `examples/live_compression.php` | this-end compression smoke: one php→php leg compressing and decompressing over zlib / lz4 / zstd; exit codes 0 ok / 1 ordinary failure / 2 bad codec or usage / 3 recv timeout |
 | `static_topic` | `examples/live_static_topic.php` | static topic S1–S5: 513 mapping 8 queues over 4 physical ones, route read-back, the endpoints table, mock queue names resolving back to the real broker, end-to-end send and receive |
@@ -512,9 +513,12 @@ Three hard rules for running the live cases:
    consumer is up disguises an environment problem as a client bug. Every live script
    orchestrates in this order.
 2. **Some cases need dedicated broker configuration** (the script handles it, but they
-   demand an **exclusive cluster**): `pop` requires the four POP `broker.conf` settings
+   demand an **exclusive cluster**): `pop` requires the three POP `broker.conf` settings
    (`timerWheelEnable=true`, `defaultMessageRequestMode=PULL`,
-   `popResponseReturnActualRetryTopic=false`, `enablePopBatchAck=false`); `tls` requires
+   `popResponseReturnActualRetryTopic=false`). `pop_batch_ack` is the opposite: it needs
+   no dedicated cluster, because BATCH_ACK_MESSAGE(200151) is a command the broker
+   registers unconditionally and `enablePopBatchAck` only decides when the broker re-puts
+   buffered acks internally — it never gates this command. `tls` requires
    both NameServer and Broker started with `tls.enable`; the recall and trace paths also
    need the broker to have `recallMessageEnable=true` / `traceTopicEnable=true`. If a
    plaintext cluster is already listening, the `pop` / `tls` cases refuse to run with exit

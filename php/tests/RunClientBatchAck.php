@@ -156,10 +156,10 @@ $ckSame = static function (mixed $expected, mixed $actual, string $label) use (&
     $ckSame('0', $ack->retry, 'merge.retryIsStringZero');
 }
 
-// ==================================================================== 3. distinct keys -> two entries, in order
+// ==================================================================== 3. distinct keys -> one entry each, in order
 
 {
-    // A different pop time, then a different queue, then a different retry flag: three merge keys,
+    // A different queue, then a different retry flag: three merge keys,
     // emitted in first-seen order. The first entry's fields must belong to the first checkpoint.
     $body = BatchAckMessageRequestBody::fromExtraInfos($GROUP, $TOPIC, [
         ck($TOPIC, 0, 10, 1000, 60000, 0, 12),   // key 0@0@10@1000
@@ -173,6 +173,29 @@ $ckSame = static function (mixed $expected, mixed $actual, string $label) use (&
     $ckSame('1', $body->acks[2]->retry, 'merge.retryFlagIsStringOne');
     // The fourth info joins the first key (still 3 entries) and adds bit (14-10)=4 alongside (12-10)=2.
     $ckSame('FA==', $body->acks[0]->bitSet->toBase64(), 'merge.laterSameKeyFoldsBit');
+}
+
+// ==================================================================== 3b. pop time separates rounds
+
+{
+    // Same retry flag, same queue, SAME checkpoint offset, only the pop time differs: two pops of
+    // one queue that start at the same offset. Dropping popTime from the merge key would fold them
+    // into one entry and acknowledge offsets the second pop never returned -- and because the
+    // broker answers SUCCESS either way, only the entry count and the per-entry pop time can see it.
+    $body = BatchAckMessageRequestBody::fromExtraInfos($GROUP, $TOPIC, [
+        ck($TOPIC, 0, 10, 1000, 60000, 0, 10),   // key 0@0@10@1000
+        ck($TOPIC, 0, 10, 2000, 60000, 0, 10),   // key 0@0@10@2000 (only popTime differs)
+    ]);
+    $ckSame(2, count($body->acks), 'merge.popTimeIsPartOfTheKey');
+    // Each entry keeps its own single bit at index 0 -- neither round borrows the other's ack.
+    // Read through ?-> so a lost entry reports as a failed check instead of a fatal.
+    $roundA = $body->acks[0] ?? null;
+    $roundB = $body->acks[1] ?? null;
+    $ckSame(1000, $roundA?->popTime, 'merge.firstRoundPopTime');
+    $ckSame(2000, $roundB?->popTime, 'merge.secondRoundPopTime');
+    $ckSame([10], $roundA?->ackedOffsets(), 'merge.firstRoundOwnBits');
+    $ckSame([10], $roundB?->ackedOffsets(), 'merge.secondRoundOwnBits');
+    $ckSame('AQ==', $roundB?->bitSet->toBase64(), 'merge.secondRoundBitMinimal');
 }
 
 // ==================================================================== 4. compact keys + long-name read

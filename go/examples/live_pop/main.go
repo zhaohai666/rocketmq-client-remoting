@@ -38,9 +38,10 @@
 //   - popResponseReturnActualRetryTopic=false — the DEFAULT retry path, i.e. the
 //     one where the broker stamps the checkpoint itself and rewrites msg.Topic
 //     to the business topic before the client sees it. S2 exists to pin that.
-//   - enablePopBatchAck=false, so BATCH_ACK_MESSAGE(200151) is NOT exercised
-//     here: this broker would reject it. (The classic client never sends it
-//     anyway — its POP path acks one message at a time.)
+//   - enablePopBatchAck=false. That switch only steers the broker's internal
+//     re-put of buffered acks; it does not gate BATCH_ACK_MESSAGE(200151). This
+//     tool still does not send 200151, because the POP path here acks one
+//     message at a time — the batch command has its own live tool.
 //
 // Every scenario creates its topic first: a consumer has no default-topic
 // fallback (only producers get TBW102), so a missing topic means "no route, no

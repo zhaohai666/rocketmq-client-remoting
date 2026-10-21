@@ -461,7 +461,8 @@ go run ./examples/<名字> -ns 127.0.0.1:9876
 | `live_pull` | Pull：min / max / 按时间搜位点、空队头短轮询不挂起、空队尾 `NO_NEW_MSG` 不挂起、长轮询提前唤醒与超时、调用方游标、`sendMessageBack` 进 `%RETRY%`；收口行带 `COMMITTED=<offset>` |
 | `live_lite_pull` | LitePull：`Assign` 双游标推进、`Commit` 与重启续读不重放、`Seek` 重放、`Subscribe` 重平衡 + 自动提交在 broker 读回、关停持久化 |
 | `live_lite_topic_queue_change` | 队列变更监听：真的把 topic 扩容与缩容，回调必须在一两个检查轮内落地，证明比对的是现查路由而不是 30s 路由缓存（实测 `PASS=11 FAIL=0`） |
-| `live_pop` | POP 消费：不可见时间、ack 与批量 ack、改超时、重投窗口。断言的是定时窗口与 broker 侧可见状态，不是返回码 —— POP 出错全是静默的 |
+| `live_pop` | POP 消费：不可见时间、逐条 ack、改超时、重投窗口。断言的是定时窗口与 broker 侧可见状态，不是返回码 —— POP 出错全是静默的 |
+| `live_pop_batch_ack` | BATCH_ACK_MESSAGE(200151) 单独一条真机腿：push 消费者逐条 ack，从不发批量，所以这条能力只有直接驱动 wire 原语才碰得到。l1 一个请求清整批（2.5x 不可见窗内一条都不许重投）、l2 配对对照（少交一条 CK，必须只回来那一条，顺带钉住重试方向：重投 CK 落在 `%RETRY%<group>_<topic>` 且标记为 1，而批量体仍写业务 topic，broker 靠标记+组名还原物理队列）、l3 两轮 pop 一个请求（按 retry@queueId@ckOffset@popTime 分组，不许跨轮过度合并）。判据同样是定时窗口 + broker 侧可见状态，不需要任何 broker 开关 |
 | `live_redelivery` | `%RETRY%` 二次投递与延迟梯度、`maxReconsumeTimes` 到顶后进 `%DLQ%`、顺序毒消息的 DLQ 路径、`ackIndex` 部分 ack |
 | `live_shutdown_race` | 「关掉客户端就立刻退进程」的丢数据契约：并发回投两轮（`%RETRY%` → `%DLQ%`）、顺序挂起回投、短生命周期轨迹生产者的尾批 |
 | `live_admin` | 管理端 29 项：集群探活与 master 选主、topic CRUD、broker 配置与运行时 KV、订阅组 CRUD、发 8 条验 topic 统计、四路位点查询、KEYS 检索 + `viewMessage`、删 topic 后确认消失 |
@@ -483,7 +484,7 @@ go run ./examples/live_compression_matrix recv <topic> <group> <size> 127.0.0.1:
 go run ./examples/live_acl_message_types -ns 127.0.0.1:9876 -ak <accessKey> -sk <secretKey>
 ```
 
-`live_pop` 与 `live_redelivery` 支持 `-legs s1,s2` 只跑其中几个场景。仓库根目录 `scripts/`
+`live_pop` 与 `live_redelivery` 支持 `-legs s1,s2`、`live_pop_batch_ack` 支持 `-legs l1,l2,l3`，只跑其中几个场景。仓库根目录 `scripts/`
 下还有一层封装好的脚本（起集群、等就绪、跑验证、收工在同一条命令里），与上表按名字对应，
 例如 `bash scripts/run_go_producer_live.sh`。
 
