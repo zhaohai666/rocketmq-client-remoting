@@ -341,8 +341,9 @@ func (c *adminCluster) onNameServer(s *mockServer, req *remoting.RemotingCommand
 }
 
 // subscriptionGroupPage answers 201 ONE group per page (real brokers return up
-// to maxGroupNum at once, but paging only ever shows up with >10000 groups —
-// the unit test has to shrink the page to exercise the loop at all).
+// to maxGroupNum at once, but paging only ever shows up with more groups than
+// one page holds — the unit test has to shrink the page to exercise the loop at
+// all).
 func (c *adminCluster) subscriptionGroupPage(req *remoting.RemotingCommand) *remoting.RemotingCommand {
 	seqText, _ := req.ExtFields().Get("groupSeq")
 	seq, _ := adminParseInt64(seqText)
@@ -771,11 +772,11 @@ func TestAdminGetAllSubscriptionGroupAccumulatesPages(t *testing.T) {
 	if got := ext(t, pages[1], "groupSeq"); got != "1" {
 		t.Errorf("second page groupSeq = %q, want 1", got)
 	}
-	if got := ext(t, pages[0], "maxGroupNum"); got != "10000" {
+	if got := ext(t, pages[0], "maxGroupNum"); got != "2000" {
 		t.Errorf("maxGroupNum = %q", got)
 	}
-	if hasExt(pages[0], "dataVersion") {
-		t.Error("the first page must not carry dataVersion")
+	if got := ext(t, pages[0], "dataVersion"); got != "" {
+		t.Errorf("first page dataVersion = %q, want the present-but-empty string", got)
 	}
 	if !hasExt(pages[1], "dataVersion") {
 		t.Error("later pages must echo dataVersion")

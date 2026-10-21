@@ -120,6 +120,11 @@ internal sealed class MockCluster : IDisposable
         public Queue<(int Code, int DelayMs)> Steps { get; } = new();
         public (int Code, int DelayMs) Tail { get; set; } = (ResponseCode.Success, 0);
         public int Requests;
+
+        /// <summary>Every request code that landed on this broker, including heartbeats
+        /// and admin calls (the send counter above only covers send codes).</summary>
+        public readonly List<int> RequestCodes = new();
+
         public readonly List<int> SendOpaques = new();
     }
 
@@ -224,20 +229,44 @@ internal sealed class MockCluster : IDisposable
 
     private readonly Dictionary<int, Func<RemotingCommand, byte[]>> _replyBodies = new();
 
+    private readonly Dictionary<int, Func<RemotingCommand, Dictionary<string, string>>> _replyExts = new();
+
     private readonly Dictionary<int, int> _replyCodes = new();
+
+    /// <summary>
+    /// Attaches response extFields to a request code (per request, so a paged endpoint can
+    /// answer totalTopicNum / totalGroupNum according to the incoming seq).
+    /// </summary>
+    public void SetReplyExt(int code, Func<RemotingCommand, Dictionary<string, string>> extFor)
+    {
+        lock (_gate)
+        {
+            _replyExts[code] = extFor;
+        }
+    }
 
     /// <summary>
     /// Scripts the response code of one request code (every broker answers it that way).
     /// For primitives whose contract is "the caller sees the broker code verbatim": the
     /// generic SUCCESS answer cannot prove a non-success is neither swallowed nor thrown.
     /// </summary>
-    public void SetReplyCode(int code, int replyCode)
+    public void SetReplyCode(int code, int replyCode, string? remark = null)
     {
         lock (_gate)
         {
             _replyCodes[code] = replyCode;
+            if (remark is not null)
+            {
+                _replyRemarks[code] = remark;
+            }
+            else
+            {
+                _replyRemarks.Remove(code);
+            }
         }
     }
+
+    private readonly Dictionary<int, string> _replyRemarks = new();
 
     private Func<RemotingCommand, byte[]>? _routeBodyFor;
 
@@ -329,6 +358,17 @@ internal sealed class MockCluster : IDisposable
         lock (_gate)
         {
             return _brokers[index].Requests;
+        }
+    }
+
+    /// <summary>How many requests of this code landed on the index-th broker. Unlike
+    /// <see cref="Requests" /> this also covers heartbeats and admin calls, which is what
+    /// the per-broker fan-out assertions need.</summary>
+    public int RequestsAt(int index, int code)
+    {
+        lock (_gate)
+        {
+            return _brokers[index].RequestCodes.Count(c => c == code);
         }
     }
 
@@ -474,12 +514,49 @@ internal sealed class MockCluster : IDisposable
             return resp;
         }
 
-        return Respond(req, ResponseCode.Success, null);
+        Func<RemotingCommand, byte[]>? namesrvBodyFor;
+        Func<RemotingCommand, Dictionary<string, string>>? namesrvExtFor;
+        lock (_gate)
+        {
+            _replyBodies.TryGetValue(req.Code, out namesrvBodyFor);
+            _replyExts.TryGetValue(req.Code, out namesrvExtFor);
+        }
+
+        if (namesrvBodyFor is not null)
+        {
+            RemotingCommand withBody = Respond(req, ResponseCode.Success, null);
+            withBody.Body = namesrvBodyFor(req);
+            withBody.HasBody = true;
+            if (namesrvExtFor is not null)
+            {
+                foreach (KeyValuePair<string, string> kv in namesrvExtFor(req))
+                {
+                    withBody.AddExtField(kv.Key, kv.Value);
+                }
+            }
+
+            return withBody;
+        }
+
+        RemotingCommand plain = Respond(req, ResponseCode.Success, null);
+        if (namesrvExtFor is not null)
+        {
+            foreach (KeyValuePair<string, string> kv in namesrvExtFor(req))
+            {
+                plain.AddExtField(kv.Key, kv.Value);
+            }
+        }
+
+        return plain;
     }
 
     private RemotingCommand? BrokerRespond(int index, RemotingCommand req)
     {
         Record(req);
+        lock (_gate)
+        {
+            _brokers[index].RequestCodes.Add(req.Code);
+        }
         // Both 361 and 11 are answered as pull responses: whether the client switches
         // code is asserted separately by offline cases (#107); this only covers "the code
         // has to work once it is switched too".
@@ -491,11 +568,24 @@ internal sealed class MockCluster : IDisposable
         if (!IsSendCode(req.Code))
         {
             Func<RemotingCommand, byte[]>? bodyFor;
+            Func<RemotingCommand, Dictionary<string, string>>? extFor;
             int scriptedCode;
+            string? scriptedRemark;
+            bool silent;
             lock (_gate)
             {
+                // Silence is a whole-broker state: a heartbeat or admin call must run into
+                // the same wait the send path produces, not a canned SUCCESS.
+                silent = _brokers[index].Tail.Code == NoReply;
                 _replyBodies.TryGetValue(req.Code, out bodyFor);
+                _replyExts.TryGetValue(req.Code, out extFor);
                 scriptedCode = _replyCodes.TryGetValue(req.Code, out int c) ? c : ResponseCode.Success;
+                scriptedRemark = _replyRemarks.TryGetValue(req.Code, out string? m) ? m : null;
+            }
+
+            if (silent && !req.IsOnewayRpc())
+            {
+                return null;
             }
 
             if (bodyFor is not null && !req.IsOnewayRpc())
@@ -503,6 +593,14 @@ internal sealed class MockCluster : IDisposable
                 RemotingCommand withBody = Respond(req, ResponseCode.Success, null);
                 withBody.Body = bodyFor(req);
                 withBody.HasBody = true;
+                if (extFor is not null)
+                {
+                    foreach (KeyValuePair<string, string> kv in extFor(req))
+                    {
+                        withBody.AddExtField(kv.Key, kv.Value);
+                    }
+                }
+
                 return withBody;
             }
 
@@ -513,11 +611,20 @@ internal sealed class MockCluster : IDisposable
 
             if (scriptedCode != ResponseCode.Success)
             {
-                return Respond(req, scriptedCode, "mock failure");
+                return Respond(req, scriptedCode, scriptedRemark ?? "mock failure");
             }
 
             // Heartbeats and other non-send requests are always answered successfully, do not let the background thread get stuck on an error
-            return Respond(req, ResponseCode.Success, null);
+            RemotingCommand defaultReply = Respond(req, ResponseCode.Success, scriptedRemark);
+            if (extFor is not null)
+            {
+                foreach (KeyValuePair<string, string> kv in extFor(req))
+                {
+                    defaultReply.AddExtField(kv.Key, kv.Value);
+                }
+            }
+
+            return defaultReply;
         }
 
         int code;

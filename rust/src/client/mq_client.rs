@@ -6,9 +6,11 @@
 //! info, etc.) and broker-initiated request (220/221/307/309/326) dispatch.
 
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use tokio::sync::watch;
@@ -31,7 +33,8 @@ use crate::common::message_const::{
     PROPERTY_REPLY_MESSAGE_ARRIVE_TIME, PROPERTY_TRACE_SWITCH,
 };
 use crate::common::message_decoder::{
-    decode_message, decode_messages, message_properties_2_string, string_2_message_properties,
+    decode_message, decode_messages, decode_messages_with, message_properties_2_string,
+    string_2_message_properties, DecodeOptions,
 };
 use crate::common::mix_all::MixAll;
 use crate::common::sysflag::{MessageSysFlag, PullSysFlag};
@@ -50,6 +53,8 @@ use crate::remoting::protocol::body::{
 };
 use crate::remoting::protocol::codes::{request_code, response_code};
 use crate::remoting::protocol::ext_fields::CustomHeader;
+#[cfg(test)]
+use crate::remoting::protocol::ext_fields::ExtFields;
 use crate::remoting::protocol::extra_info;
 use crate::remoting::protocol::headers::{
     AckMessageRequestHeader, ChangeInvisibleTimeRequestHeader, ChangeInvisibleTimeResponseHeader,
@@ -411,6 +416,24 @@ pub struct MQClientInstanceConfig {
     /// `IS_SUPPORT_HEART_BEAT_V2` and the fingerprint is unchanged -- the subscription set is
     /// dropped from the body.
     pub use_heartbeat_v2: bool,
+    /// Decode-read-body switch (default true). Off, the pull / POP batch decoders still walk
+    /// every frame and advance the cursor, but keep no body bytes: no copy, no CRC check and
+    /// no decompression, so messages come back header-only.
+    pub decode_read_body: bool,
+    /// Internal-API timeout (default 3000ms) used by the client's own control RPCs (heartbeat,
+    /// client-config check, name-server route fetch, unregister, consumer-id list). An explicit
+    /// per-call timeout still wins.
+    pub mq_client_api_timeout_millis: i64,
+    /// Concurrent heartbeat switch (default false). V2 wins when both are on.
+    pub enable_concurrent_heartbeat: bool,
+    /// Worker count of the concurrent heartbeat pool (default: available processors).
+    pub concurrent_heartbeat_thread_pool_size: usize,
+}
+
+pub(crate) fn default_concurrent_heartbeat_pool_size() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
 }
 
 impl Default for MQClientInstanceConfig {
@@ -438,6 +461,10 @@ impl Default for MQClientInstanceConfig {
             enable_stream_request_type: false,
             vip_channel_enabled: false,
             use_heartbeat_v2: false,
+            decode_read_body: true,
+            mq_client_api_timeout_millis: MQ_CLIENT_API_TIMEOUT_MILLIS,
+            enable_concurrent_heartbeat: false,
+            concurrent_heartbeat_thread_pool_size: default_concurrent_heartbeat_pool_size(),
         }
     }
 }
@@ -506,6 +533,16 @@ impl std::fmt::Debug for MQClientInstanceConfig {
             )
             .field("vip_channel_enabled", &self.vip_channel_enabled)
             .field("use_heartbeat_v2", &self.use_heartbeat_v2)
+            .field("decode_read_body", &self.decode_read_body)
+            .field(
+                "mq_client_api_timeout_millis",
+                &self.mq_client_api_timeout_millis,
+            )
+            .field("enable_concurrent_heartbeat", &self.enable_concurrent_heartbeat)
+            .field(
+                "concurrent_heartbeat_thread_pool_size",
+                &self.concurrent_heartbeat_thread_pool_size,
+            )
             .finish()
     }
 }
@@ -555,6 +592,13 @@ struct Inner {
     /// Off (the default) every beat keeps `heartbeatFingerprint = 0`, which is what makes the
     /// broker take its legacy registration path.
     use_heartbeat_v2: AtomicBool,
+    /// Decode-read-body switch, live for the same reason: the decode happens per pull / POP.
+    decode_read_body: AtomicBool,
+    /// Internal-API timeout, live so a facade can adjust it without rebuilding the instance.
+    mq_client_api_timeout_millis: AtomicI64,
+    /// Fixed-size worker pool for concurrent heartbeat rounds, created by `start()` and torn
+    /// down by `shutdown()`.
+    heartbeat_pool: Mutex<Option<HeartbeatPool>>,
     /// Broker addresses that answered `IS_SUPPORT_HEART_BEAT_V2` at least once. An address outside
     /// the set always receives the full body, so a broker that predates the two body fields keeps
     /// working untouched.
@@ -563,6 +607,61 @@ struct Inner {
     /// address. While a row matches the freshly computed fingerprint, beats to that address may
     /// drop the subscription set.
     broker_addr_heartbeat_fingerprint_table: Mutex<HashMap<String, i32>>,
+    /// Test-only record of `(request code, timeout)` handed to the remoting layer. The broker
+    /// cannot see a client-side deadline, so the unit tests assert the resolved value here.
+    #[cfg(test)]
+    invoke_timeouts: Mutex<Vec<(i32, i64)>>,
+    /// Test-only canned replies, popped in order by request code before the remoting layer
+    /// is reached. Lets the paging loops be driven offline, page by page.
+    #[cfg(test)]
+    canned_replies: Mutex<VecDeque<(i32, RemotingCommand)>>,
+    /// Test-only record of `(request code, extFields)` as the caller built them.
+    #[cfg(test)]
+    invoke_requests: Mutex<Vec<(i32, ExtFields)>>,
+    /// Test-only count of heartbeat jobs that entered the worker pool.
+    #[cfg(test)]
+    heartbeat_pool_jobs: AtomicUsize,
+}
+
+/// One unit of concurrent heartbeat work: an already-built future the worker only has to await.
+type HeartbeatJob = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+/// Fixed-size heartbeat worker pool. Submission is non-blocking: a job is rejected only once the
+/// pool has been shut down, and the round accounts for that rejection itself.
+struct HeartbeatPool {
+    tx: tokio::sync::mpsc::UnboundedSender<HeartbeatJob>,
+    workers: Vec<JoinHandle<()>>,
+}
+
+impl HeartbeatPool {
+    fn start(size: usize) -> HeartbeatPool {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<HeartbeatJob>();
+        let rx = Arc::new(tokio::sync::Mutex::new(rx));
+        let mut workers = Vec::with_capacity(size);
+        for _ in 0..size.max(1) {
+            let rx = Arc::clone(&rx);
+            workers.push(tokio::spawn(async move {
+                loop {
+                    let job = { rx.lock().await.recv().await };
+                    match job {
+                        Some(job) => job.await,
+                        None => return,
+                    }
+                }
+            }));
+        }
+        HeartbeatPool { tx, workers }
+    }
+
+    fn submit(&self, job: HeartbeatJob) -> bool {
+        self.tx.send(job).is_ok()
+    }
+
+    fn shutdown(&mut self) {
+        for worker in self.workers.drain(..) {
+            worker.abort();
+        }
+    }
 }
 
 fn parse_reset_offset_table(data: &[u8]) -> Result<Vec<(MessageQueue, i64)>> {
@@ -628,6 +727,8 @@ impl MQClientInstance {
         };
         let vip_channel_enabled = config.vip_channel_enabled;
         let use_heartbeat_v2 = config.use_heartbeat_v2;
+        let decode_read_body = config.decode_read_body;
+        let mq_client_api_timeout_millis = config.mq_client_api_timeout_millis;
         let inner = Arc::new(Inner {
             client_id: client_id.to_string(),
             name_server_addrs: Mutex::new(name_server_addrs),
@@ -658,8 +759,19 @@ impl MQClientInstance {
             consumer_ids_changed_count: AtomicUsize::new(0),
             vip_channel_enabled: AtomicBool::new(vip_channel_enabled),
             use_heartbeat_v2: AtomicBool::new(use_heartbeat_v2),
+            decode_read_body: AtomicBool::new(decode_read_body),
+            mq_client_api_timeout_millis: AtomicI64::new(mq_client_api_timeout_millis),
+            heartbeat_pool: Mutex::new(None),
             broker_support_v2_heartbeat_set: Mutex::new(HashSet::new()),
             broker_addr_heartbeat_fingerprint_table: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            invoke_timeouts: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            canned_replies: Mutex::new(VecDeque::new()),
+            #[cfg(test)]
+            invoke_requests: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            heartbeat_pool_jobs: AtomicUsize::new(0),
         });
         let this = MQClientInstance {
             inner: inner.clone(),
@@ -1082,6 +1194,26 @@ impl MQClientInstance {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         self.inner.remoting_client.start();
+        // The concurrent-heartbeat pool lives exactly as long as a started instance.
+        if let Some(mut previous) = self
+            .inner
+            .heartbeat_pool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            previous.shutdown();
+        }
+        let pool_size = self
+            .inner
+            .config
+            .concurrent_heartbeat_thread_pool_size
+            .max(1);
+        *self
+            .inner
+            .heartbeat_pool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(HeartbeatPool::start(pool_size));
         if let Err(e) = self.inner.consumer_stats_manager.start() {
             self.shutdown_factory();
             return Err(e);
@@ -1130,7 +1262,7 @@ impl MQClientInstance {
         self.spawn_periodic(
             "heartbeat",
             |me| async move {
-                me.send_heartbeat_to_all_broker(5000).await;
+                me.send_heartbeat_to_all_broker(me.mq_client_api_timeout_millis()).await;
             },
             self.inner.config.heartbeat_initial_delay_millis,
             self.inner.config.heartbeat_interval_millis,
@@ -1173,6 +1305,15 @@ impl MQClientInstance {
         };
         for handle in handles {
             handle.abort();
+        }
+        if let Some(mut pool) = self
+            .inner
+            .heartbeat_pool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            pool.shutdown();
         }
         self.inner.consumer_stats_manager.shutdown();
         self.inner.remoting_client.shutdown();
@@ -1250,7 +1391,7 @@ impl MQClientInstance {
                 .collect();
             for topic in topics {
                 if let Err(e) = self
-                    .update_topic_route_info_from_name_server(&topic, 5000, false)
+                    .update_topic_route_info_from_name_server(&topic, self.mq_client_api_timeout_millis(), false)
                     .await
                 {
                     rmq_debug!("route refresh failed for {topic}: {e}");
@@ -1325,6 +1466,31 @@ impl MQClientInstance {
         request: &mut RemotingCommand,
         timeout_millis: i64,
     ) -> Result<RemotingCommand> {
+        #[cfg(test)]
+        {
+            let mut requests = self
+                .inner
+                .invoke_requests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            requests.push((request.code, request.ext_fields().clone()));
+            let mut replies = self
+                .inner
+                .canned_replies
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(pos) = replies.iter().position(|(code, _)| *code == request.code) {
+                if let Some((_, reply)) = replies.remove(pos) {
+                    return Ok(reply);
+                }
+            }
+            drop(requests);
+            self.inner
+                .invoke_timeouts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((request.code, timeout_millis));
+        }
         self.inner
             .remoting_client
             .invoke_sync(addr, request, Some(timeout_millis))
@@ -1487,7 +1653,7 @@ impl MQClientInstance {
                 return Ok(info);
             }
         }
-        self.update_topic_route_info_from_name_server(topic, 5000, is_default)
+        self.update_topic_route_info_from_name_server(topic, self.mq_client_api_timeout_millis(), is_default)
             .await?;
         match self.publish_info_of(topic) {
             Some(info) if info.ok() => Ok(info),
@@ -1501,7 +1667,7 @@ impl MQClientInstance {
             return Some(route);
         }
         if let Err(e) = self
-            .update_topic_route_info_from_name_server(topic, 5000, false)
+            .update_topic_route_info_from_name_server(topic, self.mq_client_api_timeout_millis(), false)
             .await
         {
             // A refresh failure swallows the exception and falls through to the cache read
@@ -1594,6 +1760,35 @@ impl MQClientInstance {
 
     pub fn is_use_heartbeat_v2(&self) -> bool {
         self.inner.use_heartbeat_v2.load(Ordering::Acquire)
+    }
+
+    // ---------------- decode read body / internal API timeout ----------------
+
+    /// Flip whether received message bodies are materialised. Off, the batch decoders still walk
+    /// every frame (queue offsets and properties stay intact) but keep no body bytes.
+    pub fn set_decode_read_body(&self, enable: bool) {
+        self.inner.decode_read_body.store(enable, Ordering::Release);
+    }
+
+    pub fn is_decode_read_body(&self) -> bool {
+        self.inner.decode_read_body.load(Ordering::Acquire)
+    }
+
+    /// The timeout the client's own control RPCs use when the caller gave none.
+    pub fn mq_client_api_timeout_millis(&self) -> i64 {
+        self.inner
+            .mq_client_api_timeout_millis
+            .load(Ordering::Acquire)
+    }
+
+    /// Change the internal-API timeout for later control RPCs. A non-positive value is ignored:
+    /// the remoting layer clamps timeouts to at least 1ms, so 0 would only produce surprise timeouts.
+    pub fn set_mq_client_api_timeout_millis(&self, timeout_millis: i64) {
+        if timeout_millis > 0 {
+            self.inner
+                .mq_client_api_timeout_millis
+                .store(timeout_millis, Ordering::Release);
+        }
     }
 
     /// Forget every remembered fingerprint, so the next round to each broker re-delivers the
@@ -1870,6 +2065,17 @@ impl MQClientInstance {
 
     // ---------------- pull ----------------
 
+    /// Decode a received message batch under the live decode-read-body switch. With the switch
+    /// off every frame is still walked (the cursor advances, offsets/properties stay intact) but
+    /// the body bytes are not copied, CRC-checked or decompressed.
+    fn decode_received_messages(&self, body: &[u8]) -> Vec<MessageExt> {
+        let options = DecodeOptions {
+            read_body: self.is_decode_read_body(),
+            ..DecodeOptions::default()
+        };
+        decode_messages_with(body, &options)
+    }
+
     /// Pull request (PULL_MESSAGE); each parameter lands in its own request header field.
     #[allow(clippy::too_many_arguments)]
     pub async fn pull_message(
@@ -1974,7 +2180,10 @@ impl MQClientInstance {
         };
         let mut resp_header = PullMessageResponseHeader::default();
         resp_header.from_ext_fields(response.ext_fields());
-        let mut found = response.body().map(decode_messages).unwrap_or_default();
+        let mut found = response
+            .body()
+            .map(|body| self.decode_received_messages(body))
+            .unwrap_or_default();
         // Stamp brokerName/queueId unconditionally
         for m in found.iter_mut() {
             m.broker_name = Some(mq.broker_name.clone());
@@ -2110,7 +2319,10 @@ impl MQClientInstance {
         let mut resp_header = PopMessageResponseHeader::default();
         resp_header.from_ext_fields(response.ext_fields());
         let mut found = if status == PopStatus::Found {
-            response.body().map(decode_messages).unwrap_or_default()
+            response
+                .body()
+                .map(|body| self.decode_received_messages(body))
+                .unwrap_or_default()
         } else {
             Vec::new()
         };
@@ -2512,6 +2724,37 @@ impl MQClientInstance {
             .map(|(topic, _)| topic.clone())
     }
 
+    /// Test-only: queue a canned reply for one request code. The next invoke of that code
+    /// consumes it instead of touching the transport.
+    #[cfg(test)]
+    pub(crate) fn queue_canned_reply(&self, code: i32, reply: RemotingCommand) {
+        self.inner
+            .canned_replies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back((code, reply));
+    }
+
+    /// Test-only: `(request code, extFields)` of every invoke, in order.
+    #[cfg(test)]
+    pub(crate) fn recorded_requests(&self) -> Vec<(i32, ExtFields)> {
+        self.inner
+            .invoke_requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Test-only: `(request code, resolved timeout millis)` of every invoke, in order.
+    #[cfg(test)]
+    pub(crate) fn recorded_timeouts(&self) -> Vec<(i32, i64)> {
+        self.inner
+            .invoke_timeouts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     /// Test-only: seed the publish address into the flat table (equivalent to the refresh route storage does).
     /// Offline cases have no name server; without a seeded table, address resolution fails before the hook.
     #[cfg(test)]
@@ -2539,7 +2782,7 @@ impl MQClientInstance {
     pub async fn publish_addr_for(&self, broker_name: &str, topic: &str) -> Result<String> {
         let mut addr = self.find_broker_address_in_publish(broker_name);
         if addr.is_none() {
-            self.update_topic_route_info_from_name_server(topic, 5000, false)
+            self.update_topic_route_info_from_name_server(topic, self.mq_client_api_timeout_millis(), false)
                 .await?;
             addr = self.find_broker_address_in_publish(broker_name);
         }
@@ -2571,7 +2814,7 @@ impl MQClientInstance {
         let mut des = resolve_des(self);
         let mut addr = self.find_broker_address_in_publish(&des);
         if addr.is_none() {
-            self.update_topic_route_info_from_name_server(topic, 5000, false)
+            self.update_topic_route_info_from_name_server(topic, self.mq_client_api_timeout_millis(), false)
                 .await?;
             des = resolve_des(self);
             addr = self.find_broker_address_in_publish(&des);
@@ -2601,7 +2844,7 @@ impl MQClientInstance {
     async fn publish_addr_in_admin(&self, mq: &MessageQueue) -> Result<String> {
         let mut addr = self.find_broker_address_in_publish(&mq.broker_name);
         if addr.is_none() {
-            self.update_topic_route_info_from_name_server(&mq.topic, 5000, false)
+            self.update_topic_route_info_from_name_server(&mq.topic, self.mq_client_api_timeout_millis(), false)
                 .await?;
             addr = self.find_broker_address_in_publish(&mq.broker_name);
         }
@@ -2643,6 +2886,23 @@ impl MQClientInstance {
         addrs
     }
 
+    /// The same set with each broker's id, sorted by address. Deduplicated by address so a
+    /// brokerName appearing in two routes is still beaten once.
+    fn broker_addrs_with_ids(&self) -> Vec<(i64, String)> {
+        let mut out: Vec<(i64, String)> = Vec::new();
+        for route in self.cached_routes() {
+            for bd in route.get_broker_datas() {
+                for (broker_id, addr) in &bd.broker_addrs {
+                    if !addr.is_empty() && !out.iter().any(|(_, a)| a == addr) {
+                        out.push((*broker_id, addr.clone()));
+                    }
+                }
+            }
+        }
+        out.sort_by(|a, b| a.1.cmp(&b.1));
+        out
+    }
+
     /// Snapshot of the cached routes.
     fn cached_routes(&self) -> Vec<TopicRouteData> {
         self.inner
@@ -2661,7 +2921,7 @@ impl MQClientInstance {
     async fn consumer_offset_addr(&self, mq: &MessageQueue) -> Result<String> {
         let mut addr = self.find_broker_address_in_publish(&mq.broker_name);
         if addr.is_none() {
-            self.update_topic_route_info_from_name_server(&mq.topic, 5000, false)
+            self.update_topic_route_info_from_name_server(&mq.topic, self.mq_client_api_timeout_millis(), false)
                 .await?;
             addr = self.broker_addr_of(&mq.broker_name);
         }
@@ -3215,20 +3475,26 @@ impl MQClientInstance {
         }
         if !self.is_use_heartbeat_v2() {
             let heartbeat_data = self.prepare_heartbeat_data();
-            let mut ok = 0usize;
-            for addr in self.get_all_broker_addrs() {
-                match self
-                    .send_heartbeat(&addr, &heartbeat_data, timeout_millis)
-                    .await
-                {
-                    Ok(()) => ok += 1,
-                    Err(e) => rmq_debug!("heartbeat to {addr} failed: {e}"),
-                }
+            if heartbeat_data.producer_data_set.is_empty()
+                && heartbeat_data.consumer_data_set.is_empty()
+            {
+                return 0;
             }
-            return ok;
+            // Dispatch order: V2 wins (handled below), then concurrent, then the serial loop.
+            if self.inner.config.enable_concurrent_heartbeat {
+                return self
+                    .send_heartbeat_concurrently(&heartbeat_data, timeout_millis)
+                    .await;
+            }
+            return self
+                .send_heartbeat_serially(&heartbeat_data, timeout_millis)
+                .await;
         }
 
         let mut with_sub = self.prepare_heartbeat_data();
+        if with_sub.producer_data_set.is_empty() && with_sub.consumer_data_set.is_empty() {
+            return 0;
+        }
         let fingerprint = with_sub.compute_heartbeat_fingerprint();
         with_sub.heartbeat_fingerprint = fingerprint;
         // The clone keeps the field just set: the cheap body is only valid because it carries the
@@ -3256,7 +3522,98 @@ impl MQClientInstance {
         ok
     }
 
-    /// One broker over the fingerprint path; returns whether the beat was accepted.
+    /// The plain one-at-a-time round (the default dispatch).
+    async fn send_heartbeat_serially(
+        &self,
+        heartbeat_data: &HeartbeatData,
+        timeout_millis: i64,
+    ) -> usize {
+        let mut ok = 0usize;
+        for addr in self.get_all_broker_addrs() {
+            match self
+                .send_heartbeat(&addr, heartbeat_data, timeout_millis)
+                .await
+            {
+                Ok(()) => ok += 1,
+                Err(e) => rmq_debug!("heartbeat to {addr} failed: {e}"),
+            }
+        }
+        ok
+    }
+
+    /// One beat per broker fanned out over the instance's fixed-size pool, then a wait for
+    /// **every** submission. A rejected submission (pool already shut down) adds its completion
+    /// permit immediately, so the round can never hang on a task that was never queued.
+    ///
+    /// With no consumer data only masters are targeted: a slave holds no consumer registrations,
+    /// so beating it would only wake a channel that cannot record anything.
+    async fn send_heartbeat_concurrently(
+        &self,
+        heartbeat_data: &HeartbeatData,
+        timeout_millis: i64,
+    ) -> usize {
+        let consumer_present = !heartbeat_data.consumer_data_set.is_empty();
+        let targets: Vec<(i64, String)> = self
+            .broker_addrs_with_ids()
+            .into_iter()
+            .filter(|(broker_id, _)| consumer_present || *broker_id == i64::from(MixAll::MASTER_ID))
+            .collect();
+        if targets.is_empty() {
+            return 0;
+        }
+        let pending = targets.len();
+        let heartbeat_data = Arc::new(heartbeat_data.clone());
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let ok = Arc::new(AtomicUsize::new(0));
+        let queued_all = {
+            let pool = self
+                .inner
+                .heartbeat_pool
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            match pool.as_ref() {
+                Some(pool) => {
+                    for (_, addr) in targets {
+                        let heartbeat_data = Arc::clone(&heartbeat_data);
+                        let gate = Arc::clone(&gate);
+                        let gate_job = Arc::clone(&gate);
+                        let ok = Arc::clone(&ok);
+                        let me = self.clone();
+                        let job: HeartbeatJob = Box::pin(async move {
+                            if me
+                                .send_heartbeat(&addr, &heartbeat_data, timeout_millis)
+                                .await
+                                .is_ok()
+                            {
+                                ok.fetch_add(1, Ordering::SeqCst);
+                            }
+                            gate_job.add_permits(1);
+                        });
+                        if pool.submit(job) {
+                            #[cfg(test)]
+                            self.inner.heartbeat_pool_jobs.fetch_add(1, Ordering::SeqCst);
+                        } else {
+                            // Rejected (pool closed): count the wait down as if it had run.
+                            gate.add_permits(1);
+                        }
+                    }
+                    true
+                }
+                None => false,
+            }
+        };
+        if !queued_all {
+            // The pool exists only between start() and shutdown(); a round outside that window
+            // still registers, just without the fan-out.
+            return self
+                .send_heartbeat_serially(heartbeat_data.as_ref(), timeout_millis)
+                .await;
+        }
+        let permits = u32::try_from(pending).unwrap_or(u32::MAX);
+        let _ = gate.acquire_many(permits).await;
+        ok.load(Ordering::SeqCst)
+    }
+
     ///
     /// A broker already known to speak the protocol **and** still holding our fingerprint gets the
     /// subscription-free body; if it then answers `IS_SUB_CHANGE` (its per-group table moved under
@@ -3349,7 +3706,7 @@ impl MQClientInstance {
         {
             return 0;
         }
-        let ok = self.send_heartbeat_to_all_broker(5000).await;
+        let ok = self.send_heartbeat_to_all_broker(self.mq_client_api_timeout_millis()).await;
         if ok > 0 {
             *self
                 .inner
@@ -3408,7 +3765,7 @@ impl MQClientInstance {
             Some(addr) => addr,
             None => {
                 if let Err(e) =
-                    self.update_topic_route_info_from_name_server(topic, 5000, false)
+                    self.update_topic_route_info_from_name_server(topic, self.mq_client_api_timeout_millis(), false)
                         .await
                 {
                     rmq_debug!("queryAssignment: route refresh for {topic} failed: {e}");
@@ -3518,7 +3875,7 @@ impl MQClientInstance {
         group: &str,
         subs: &[SubscriptionData],
     ) -> Result<()> {
-        let timeout_millis = MQ_CLIENT_API_TIMEOUT_MILLIS;
+        let timeout_millis = self.mq_client_api_timeout_millis();
         for sub in subs {
             if sub.expression_type.is_empty() || sub.expression_type == ExpressionType::TAG {
                 continue;
@@ -7190,5 +7547,215 @@ mod tests {
             "and never reached port - 2"
         );
         admin.shutdown();
+    }
+
+    // ---------------- receive / internal-API switches ----------------
+
+    #[test]
+    fn decode_read_body_switch_keeps_headers_and_drops_bodies() {
+        let instance = new_instance();
+        let mut first = sample_message();
+        first.queue_offset = 7;
+        let mut second = sample_message();
+        second.queue_offset = 8;
+        second.body = Some(b"second-body".to_vec());
+        let mut batch = encode_message_ext(&first, false).unwrap();
+        batch.extend(encode_message_ext(&second, false).unwrap());
+
+        let on = instance.decode_received_messages(&batch);
+        assert_eq!(on.len(), 2);
+        assert_eq!(on[0].body.as_deref(), Some(b"directly-consume-me".as_slice()));
+
+        instance.set_decode_read_body(false);
+        assert!(!instance.is_decode_read_body());
+        let off = instance.decode_received_messages(&batch);
+        assert_eq!(off.len(), 2, "the cursor still walks both frames");
+        assert_eq!(off[0].queue_offset, 7);
+        assert_eq!(off[1].queue_offset, 8);
+        assert!(
+            off.iter().all(|msg| msg.body.is_none()),
+            "off keeps no body bytes"
+        );
+        assert_eq!(
+            off[0].get_property(PROPERTY_CORRELATION_ID),
+            Some("corr-1"),
+            "headers survive the switch"
+        );
+
+        // Read at call time, not captured at construction.
+        instance.set_decode_read_body(true);
+        let again = instance.decode_received_messages(&batch);
+        assert_eq!(
+            again[0].body.as_deref(),
+            Some(b"directly-consume-me".as_slice())
+        );
+        instance.shutdown();
+    }
+
+    fn one_broker_route(addr: &str) -> TopicRouteData {
+        TopicRouteData {
+            queue_datas: vec![QueueData::new(
+                BROKER,
+                1,
+                1,
+                PermName::PERM_READ | PermName::PERM_WRITE,
+                0,
+            )],
+            broker_datas: vec![BrokerData::new(
+                "DefaultCluster",
+                BROKER,
+                vec![(i64::from(MixAll::MASTER_ID), addr.to_string())],
+                "",
+            )],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn api_timeout_default_is_3000_and_the_configured_value_reaches_the_heartbeat() {
+        assert_eq!(
+            MQClientInstanceConfig::default().mq_client_api_timeout_millis,
+            MQ_CLIENT_API_TIMEOUT_MILLIS
+        );
+        assert_eq!(MQ_CLIENT_API_TIMEOUT_MILLIS, 3000);
+
+        let broker = MockBroker::start().await;
+        let id = format!("{GROUP}@api-timeout-{}", SEQ.fetch_add(1, Ordering::Relaxed));
+        let instance = MQClientInstance::with_config(
+            &id,
+            vec![NAMESRV.to_string()],
+            MQClientInstanceConfig {
+                heartbeat_initial_delay_millis: 1,
+                heartbeat_interval_millis: 3_600_000,
+                route_refresh_interval_millis: 3_600_000,
+                adjust_pool_initial_delay_millis: 3_600_000,
+                persist_offset_initial_delay_millis: 3_600_000,
+                mq_client_api_timeout_millis: 1234,
+                ..MQClientInstanceConfig::default()
+            },
+        );
+        guard(&instance.inner.tables)
+            .topic_route_table
+            .insert(TOPIC.to_string(), one_broker_route(&broker.addr));
+        instance.register_producer("PG_cfg_timeout");
+        instance.start().await.unwrap();
+
+        assert!(
+            wait_until(|| !broker.recorded(request_code::HEART_BEAT).is_empty()).await,
+            "the scheduled heartbeat must go out"
+        );
+        let timeouts = guard(&instance.inner.invoke_timeouts).clone();
+        assert!(
+            timeouts
+                .iter()
+                .any(|(code, ms)| *code == request_code::HEART_BEAT && *ms == 1234),
+            "the scheduled heartbeat must carry the configured internal timeout: {timeouts:?}"
+        );
+        instance.shutdown();
+    }
+
+    #[tokio::test]
+    async fn concurrent_heartbeat_dispatch_uses_the_pool_and_the_serial_control_does_not() {
+        let master = MockBroker::start().await;
+        let slave = MockBroker::start().await;
+        let id = format!("{GROUP}@hb-pool-{}", SEQ.fetch_add(1, Ordering::Relaxed));
+        let instance = MQClientInstance::with_config(
+            &id,
+            vec![NAMESRV.to_string()],
+            MQClientInstanceConfig {
+                enable_concurrent_heartbeat: true,
+                concurrent_heartbeat_thread_pool_size: 2,
+                heartbeat_initial_delay_millis: 3_600_000,
+                route_refresh_interval_millis: 3_600_000,
+                adjust_pool_initial_delay_millis: 3_600_000,
+                persist_offset_initial_delay_millis: 3_600_000,
+                ..MQClientInstanceConfig::default()
+            },
+        );
+        let route = TopicRouteData {
+            queue_datas: vec![QueueData::new(
+                BROKER,
+                1,
+                1,
+                PermName::PERM_READ | PermName::PERM_WRITE,
+                0,
+            )],
+            broker_datas: vec![BrokerData::new(
+                "DefaultCluster",
+                BROKER,
+                vec![
+                    (i64::from(MixAll::MASTER_ID), master.addr.clone()),
+                    (i64::from(MixAll::MASTER_ID) + 1, slave.addr.clone()),
+                ],
+                "",
+            )],
+            ..Default::default()
+        };
+        guard(&instance.inner.tables)
+            .topic_route_table
+            .insert(TOPIC.to_string(), route);
+        instance.register_consumer(GROUP, StubConsumer::new());
+        instance.start().await.unwrap();
+
+        assert_eq!(instance.send_heartbeat_to_all_broker(3000).await, 2);
+        assert_eq!(
+            instance.inner.heartbeat_pool_jobs.load(Ordering::SeqCst),
+            2,
+            "one job per target broker"
+        );
+        assert_eq!(master.recorded(request_code::HEART_BEAT).len(), 1);
+        assert_eq!(slave.recorded(request_code::HEART_BEAT).len(), 1);
+        instance.shutdown();
+
+        // Control: the same round with the switch off stays serial -- no pool jobs.
+        let master = MockBroker::start().await;
+        let slave = MockBroker::start().await;
+        let id = format!("{GROUP}@hb-serial-{}", SEQ.fetch_add(1, Ordering::Relaxed));
+        let instance = MQClientInstance::with_config(
+            &id,
+            vec![NAMESRV.to_string()],
+            MQClientInstanceConfig {
+                enable_concurrent_heartbeat: false,
+                heartbeat_initial_delay_millis: 3_600_000,
+                route_refresh_interval_millis: 3_600_000,
+                adjust_pool_initial_delay_millis: 3_600_000,
+                persist_offset_initial_delay_millis: 3_600_000,
+                ..MQClientInstanceConfig::default()
+            },
+        );
+        let route = TopicRouteData {
+            queue_datas: vec![QueueData::new(
+                BROKER,
+                1,
+                1,
+                PermName::PERM_READ | PermName::PERM_WRITE,
+                0,
+            )],
+            broker_datas: vec![BrokerData::new(
+                "DefaultCluster",
+                BROKER,
+                vec![
+                    (i64::from(MixAll::MASTER_ID), master.addr.clone()),
+                    (i64::from(MixAll::MASTER_ID) + 1, slave.addr.clone()),
+                ],
+                "",
+            )],
+            ..Default::default()
+        };
+        guard(&instance.inner.tables)
+            .topic_route_table
+            .insert(TOPIC.to_string(), route);
+        instance.register_consumer(GROUP, StubConsumer::new());
+        instance.start().await.unwrap();
+
+        assert_eq!(instance.send_heartbeat_to_all_broker(3000).await, 2);
+        assert_eq!(
+            instance.inner.heartbeat_pool_jobs.load(Ordering::SeqCst),
+            0,
+            "the serial path must not touch the pool"
+        );
+        assert_eq!(master.recorded(request_code::HEART_BEAT).len(), 1);
+        assert_eq!(slave.recorded(request_code::HEART_BEAT).len(), 1);
+        instance.shutdown();
     }
 }

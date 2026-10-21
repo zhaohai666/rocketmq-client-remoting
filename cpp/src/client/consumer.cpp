@@ -429,6 +429,10 @@ void DefaultMQPushConsumer::start() {
                                              pollNameServerIntervalMillis_));
         // Broker VIP channel: forwarded to the instance that owns the broker RPCs (off = plain address).
         mqClient_->setVipChannelEnabled(vipChannelEnabled_);
+        mqClient_->setDecodeReadBody(decodeReadBody_);
+        mqClient_->setMqClientApiTimeout(mqClientApiTimeout_);
+        mqClient_->setEnableConcurrentHeartbeat(enableConcurrentHeartbeat_);
+        mqClient_->setConcurrentHeartbeatThreadPoolSize(concurrentHeartbeatThreadPoolSize_);
         // TLS strict verification option (non-empty caCert = strict verification): forwarded to the instance and the underlying transport
         if (tlsOptionsSet_) {
             mqClient_->setTlsOptions(tlsOptions_);
@@ -3578,9 +3582,14 @@ int32_t DefaultMQPushConsumer::sendHeartbeatToAllBroker() {
     hb.addConsumerData(cd);
 
     int32_t okCount = 0;
+    if (mqClient_->isEnableConcurrentHeartbeat()) {
+        okCount = mqClient_->sendHeartbeatConcurrently(hb);
+        if (okCount > 0) heartbeatCount_.fetch_add(okCount);
+        return okCount;
+    }
     for (const std::string& addr : addrs) {
         try {
-            mqClient_->sendHeartbeat(addr, hb, 5000);
+            mqClient_->sendHeartbeat(addr, hb);
             ++okCount;
             heartbeatCount_.fetch_add(1);
         } catch (const std::exception& e) {

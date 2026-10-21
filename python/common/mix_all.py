@@ -92,6 +92,12 @@ class MixAll:
         return "%s%s" % (MixAll.RETRY_GROUP_TOPIC_PREFIX, consumer_group)
 
     @staticmethod
+    def build_pop_retry_topic(topic: str, consumer_group: str) -> str:
+        """The pop retry topic of one (topic, group) pair: the retry prefix, the group and
+        the topic joined with the V1 separator ``_``."""
+        return "%s%s_%s" % (MixAll.RETRY_GROUP_TOPIC_PREFIX, consumer_group, topic)
+
+    @staticmethod
     def is_retry_topic(topic: str) -> bool:
         return topic is not None and topic.startswith(MixAll.RETRY_GROUP_TOPIC_PREFIX)
 

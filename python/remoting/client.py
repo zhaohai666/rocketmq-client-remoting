@@ -583,7 +583,6 @@ class RemotingClient:
     def _send(self, addr: str, cmd: RemotingCommand) -> socket.socket:
         self._apply_before_request_hooks(addr, cmd)
         return self._write(addr, cmd)
-
     def _write_response(self, addr: str, cmd: RemotingCommand) -> None:
         """Write a response back to the broker.
 
@@ -602,12 +601,21 @@ class RemotingClient:
                            cmd.code, addr, exc_info=True)
 
     def _write(self, addr: str, cmd: RemotingCommand) -> socket.socket:
-        """Write the command to the connection and make sure that connection's reader thread
-        has been started; returns the socket used.
+        """Get-or-create the connection, write the command, return the socket used.
 
         The return value is for in-flight request bookkeeping
         (``_ResponseFuture.conn``): when a connection breaks, only the requests that
         were really written to that connection should be dragged down with it.
+        The invoke paths must not go through here -- they claim the socket for the
+        future **before** the write (see _invoke_once) -- so they call _write_on directly.
+        """
+        sock = self._get_or_create_conn(addr)
+        self._write_on(addr, sock, cmd)
+        return sock
+
+    def _write_on(self, addr: str, sock: socket.socket, cmd: RemotingCommand) -> None:
+        """Write the command on the given socket and make sure that connection's reader
+        thread has been started.
 
         For TLS connections the reader thread is deferred to here and started only
         after the first record has been written: measurements (macOS loopback, peer is
@@ -625,7 +633,6 @@ class RemotingClient:
         the whole chain. Plaintext connections do not have this problem and still start
         their reader thread immediately.
         """
-        sock = self._get_or_create_conn(addr)
         data = cmd.encode()
         try:
             with self._sock_locks.get(addr, threading.Lock()):
@@ -638,7 +645,6 @@ class RemotingClient:
                     raise RemotingSendRequestException(addr)
         finally:
             self._start_reader(addr)
-        return sock
 
     def invoke_sync(self, addr: str, request: RemotingCommand, timeout_millis: Optional[int] = None) -> RemotingCommand:
         """Synchronous RPC, including the GO_AWAY reconnect-and-resend path."""
@@ -679,7 +685,15 @@ class RemotingClient:
         with self._response_lock:
             self._response_table[request.opaque] = future
         try:
-            future.conn = self._send(addr, request)
+            # The socket is claimed BEFORE the bytes hit the wire: a plaintext
+            # connection's reader thread is already running, and a peer that closes
+            # right after reading the frame can land its fail-fast scan in the gap
+            # between "sendall returned" and "the caller records the socket". Claiming
+            # early makes that scan find (and fail) this request instead of leaving it
+            # hanging until the timeout sweeper.
+            self._apply_before_request_hooks(addr, request)
+            future.conn = self._get_or_create_conn(addr)
+            self._write_on(addr, future.conn, request)
             future.send_request_ok = True
         except Exception:
             with self._response_lock:
@@ -742,12 +756,20 @@ class RemotingClient:
         with self._response_lock:
             self._response_table[request.opaque] = future
         try:
-            future.conn = self._send(addr, request)
+            # Same early claim as the synchronous path: the fail-fast scan of a
+            # connection that dies while the write is in flight must find this future.
+            self._apply_before_request_hooks(addr, request)
+            future.conn = self._get_or_create_conn(addr)
+            self._write_on(addr, future.conn, request)
             future.send_request_ok = True
         except Exception:
             with self._response_lock:
-                self._response_table.pop(request.opaque, None)
-            raise
+                claimed = self._response_table.pop(request.opaque, None) is not None
+            if claimed:
+                raise
+            # fail-fast or the sweeper already claimed this future and delivered the
+            # outcome through the callback; raising here would report the send twice
+            # (the producer's retry path would then run on top of the callback's)
 
     def _retry_after_go_away(self, addr: str, request: RemotingCommand,
                              callback: Callable[[Optional[RemotingCommand], Optional[BaseException]], None],

@@ -4,6 +4,7 @@ pub mod remoting_command;
 pub mod serialize;
 
 pub mod admin_body;
+pub mod auth_body;
 pub mod body;
 pub mod extra_info;
 pub mod headers;

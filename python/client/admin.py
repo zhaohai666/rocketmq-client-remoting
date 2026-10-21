@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import threading
 import time
-from typing import Dict, List, Optional, Set
+from concurrent.futures import ThreadPoolExecutor, wait
+from typing import Dict, List, Optional, Set, Union
 
 from common.boundary_type import BoundaryType
 from common.message import MessageExt, MessageQueue
@@ -11,14 +13,27 @@ from common.mix_all import MixAll
 from common.sysflag import PermName
 from common.topic_config import TopicConfig
 from rocketmq_logging import get_logger
+from remoting.exception import RemotingException
 from remoting.protocol.body import (ClusterInfo, ConsumeMessageDirectlyResult,
                                       ConsumerConnection,
                                       ConsumerRunningInfo, KVTable,
                                       ProducerConnection, QueryConsumeTimeSpanBody,
                                       ResetOffsetBody, TopicList)
-from remoting.protocol.headers import ConsumeMessageDirectlyResultRequestHeader
-from remoting.protocol.admin_body import (ConsumeStats, QueryConsumeQueueResponseBody,
-                                            TopicConfigSerializeWrapper, TopicStatsTable)
+from remoting.protocol.headers import (
+    AddBrokerRequestHeader, CheckRocksdbCqWriteProgressRequestHeader,
+    CleanControllerBrokerDataRequestHeader, ConsumeMessageDirectlyResultRequestHeader,
+    CreateTopicListRequestHeader, ExportRocksDBConfigToJsonRequestHeader,
+    GetLiteClientInfoRequestHeader, GetLiteGroupInfoRequestHeader,
+    GetLiteTopicInfoRequestHeader, GetMetaDataResponseHeader,
+    GetParentTopicInfoRequestHeader, RemoveBrokerRequestHeader,
+    TriggerLiteDispatchRequestHeader)
+from remoting.protocol.admin_body import (
+    AclInfo, AdminToolResult, AdminToolsResultCodeEnum, BrokerOperatorResult,
+    BrokerReplicasInfo, CheckRocksdbCqWriteResult, ConsumeStats, OffsetWrapper,
+    GetBrokerLiteInfoResponseBody, GetLiteClientInfoResponseBody,
+    GetLiteGroupInfoResponseBody, GetLiteTopicInfoResponseBody,
+    GetParentTopicInfoResponseBody, QueryConsumeQueueResponseBody,
+    TopicConfigSerializeWrapper, TopicStatsTable, UserInfo)
 from remoting.protocol.codes import LanguageCode, RequestCode, ResponseCode
 from remoting.protocol.remoting_command import RemotingCommand
 from remoting.protocol.route import BrokerData, QueueData, TopicRouteData
@@ -34,10 +49,20 @@ from .mq_client_manager import MQClientManager
 
 logger = get_logger()
 
-# Default timeout (corresponds to DefaultMQAdminExt.DEFAULT_TIMEOUT = 5000 * 3)
-DEFAULT_TIMEOUT = 5000 * 3
+# Default timeout of the admin RPC families that take the admin-wide budget
+# (the admin implementation's own default, not the facade constructor's 5000).
+DEFAULT_TIMEOUT = 20000
 
 NAMESPACE_ORDER_TOPIC_CONFIG = "ORDER_TOPIC_CONFIG"
+
+# Hardcoded budgets of the admin RPC families that do not follow the admin default:
+# the container add/remove pair and the controller-leader routed reads.
+ADMIN_CONTAINER_TIMEOUT = 20000
+CONTROLLER_RPC_TIMEOUT = 3000
+
+# The single ext field of the commitlog read-ahead request (no header class exists for
+# it, the key is the protocol constant).
+READ_AHEAD_MODE_KEY = "READ_AHEAD_MODE"
 
 
 
@@ -108,6 +133,8 @@ class DefaultMQAdminExt:
         self.rpc_hook = rpc_hook
         self.kv_namespace_to_delete_list: List[str] = []
         self.timeout_millis = int(kwargs.get("timeout_millis", DEFAULT_TIMEOUT))
+        self.max_page_size_in_get_metadata = int(
+            kwargs.get("max_page_size_in_get_metadata", 2000))
         self._mq_client: Optional[MQClientInstance] = None
         self._started = False
 
@@ -158,6 +185,10 @@ class DefaultMQAdminExt:
 
     def set_timeout_millis(self, timeout_millis: int) -> None:
         self.timeout_millis = timeout_millis
+
+    def set_max_page_size_in_get_metadata(self, page_size: int) -> None:
+        """Page size of the paged metadata reads (topic configs and subscription groups)."""
+        self.max_page_size_in_get_metadata = max(1, int(page_size))
 
     def start(self) -> None:
         if self._started:
@@ -268,6 +299,54 @@ class DefaultMQAdminExt:
             except Exception as e:  # noqa: BLE001
                 last_exc = e
         raise MQClientException("all name servers unreachable: %s" % last_exc)
+
+    # ---------------- Fan-out plumbing ----------------
+    @staticmethod
+    def _fan_out(targets, task, timeout_millis: int) -> None:
+        """Run one task per target concurrently and wait for them like a counted latch:
+        the wait is bounded by the timeout, and tasks that miss it still keep running and
+        contributing (their results are shared containers). Task exceptions are the
+        tasks' own business -- each one handles and logs them instead of propagating."""
+        if not targets:
+            return
+        executor = ThreadPoolExecutor(max_workers=len(targets),
+                                      thread_name_prefix="mq-admin-fanout")
+        try:
+            futures = [executor.submit(task, target) for target in targets]
+            wait(futures, timeout=max(0.0, timeout_millis / 1000.0))
+        finally:
+            executor.shutdown(wait=False)
+
+    def _examine_topic_route_info(self, topic: str) -> Optional[TopicRouteData]:
+        """Route fetch for the fan-out tools: None when the topic has no route, transport
+        failures raised (the tool envelope maps them to the remote-error code)."""
+        client = self._require_client()
+        if not client.update_topic_route_info_from_name_server(topic):
+            return None
+        with client.topic_route_lock:
+            return client.topic_route_table.get(topic)
+
+    def _admin_tool_execute(self, handler):
+        """Run a fan-out tool body and turn every failure into the tool envelope instead
+        of an exception."""
+        try:
+            return handler()
+        except RemotingException as e:
+            logger.warning("admin tool remote error: %s", e)
+            return AdminToolResult.failure(AdminToolsResultCodeEnum.REMOTING_ERROR,
+                                           str(e))
+        except MQClientException as e:
+            if e.response_code == ResponseCode.TOPIC_NOT_EXIST:
+                return AdminToolResult.failure(
+                    AdminToolsResultCodeEnum.TOPIC_ROUTE_INFO_NOT_EXIST, str(e))
+            return AdminToolResult.failure(AdminToolsResultCodeEnum.MQ_CLIENT_ERROR,
+                                           str(e))
+        except InterruptedError as e:
+            return AdminToolResult.failure(AdminToolsResultCodeEnum.INTERRUPT_ERROR,
+                                           str(e))
+        except Exception as e:  # noqa: BLE001
+            return AdminToolResult.failure(AdminToolsResultCodeEnum.MQ_BROKER_ERROR,
+                                           str(e))
 
     @staticmethod
     def _first_broker_addr(client: MQClientInstance) -> str:
@@ -411,11 +490,58 @@ class DefaultMQAdminExt:
 
     def get_all_topic_config(self, broker_addr: str,
                              timeout_millis: Optional[int] = None) -> TopicConfigSerializeWrapper:
-        response = self._invoke_broker(broker_addr, RequestCode.GET_ALL_TOPIC_CONFIG,
-                                       timeout_millis=timeout_millis)
-        if not response.body:
-            return TopicConfigSerializeWrapper()
-        return TopicConfigSerializeWrapper.decode(response.body)
+        client = self._require_client()
+        timeout = timeout_millis or self.timeout_millis
+        broker_addr = MixAll.broker_vip_channel(self.vip_channel_enabled, broker_addr)
+        current_data_version: Optional[dict] = None
+        topic_seq = 0
+        table: Dict[str, TopicConfig] = {}
+        begin = time.monotonic()
+        while True:
+            left = timeout - int((time.monotonic() - begin) * 1000)
+            if left < 0:
+                raise MQClientException("invokeSync call timeout")
+            data_version = ""
+            if current_data_version is not None:
+                data_version = RemotingSerializable.to_json(current_data_version)
+            ext = {
+                "topicSeq": topic_seq,
+                "maxTopicNum": self.max_page_size_in_get_metadata,
+                "dataVersion": data_version,
+            }
+            request = RemotingCommand.create_request_command(
+                RequestCode.GET_ALL_TOPIC_CONFIG, None)
+            for k, v in ext.items():
+                request.ext_fields[k] = str(v)
+            response = client._invoke_sync(broker_addr, request, left)
+            if response.code != ResponseCode.SUCCESS:
+                raise MQBrokerException(response.code, response.remark or "")
+            wrapper = (TopicConfigSerializeWrapper.decode(response.body)
+                       if response.body else TopicConfigSerializeWrapper())
+            table.update(wrapper.topic_config_table)
+            new_version = wrapper.data_version
+            if current_data_version is None:
+                current_data_version = new_version
+            topic_seq += len(wrapper.topic_config_table)
+
+            total = response.ext_fields.get("totalTopicNum")
+            if total is None:
+                # Old broker: returns everything at once
+                break
+            total = int(total)
+            if current_data_version != new_version:
+                logger.warning("topic config dataVersion changed, restart paging")
+                current_data_version = new_version
+                topic_seq = 0
+                table.clear()
+                continue
+            if topic_seq >= total - 1:
+                break
+
+        result = TopicConfigSerializeWrapper()
+        result.topic_config_table = table
+        result.data_version = current_data_version or {}
+        return result
 
     def get_user_topic_config(self, broker_addr: str, special_topic: bool = False,
                               timeout_millis: Optional[int] = None) -> TopicConfigSerializeWrapper:
@@ -622,10 +748,10 @@ class DefaultMQAdminExt:
                 raise MQClientException("invokeSync call timeout")
             ext = {
                 "groupSeq": group_seq,
-                "maxGroupNum": 10000,
+                "maxGroupNum": self.max_page_size_in_get_metadata,
+                "dataVersion": (RemotingSerializable.to_json(current_data_version)
+                                if current_data_version is not None else ""),
             }
-            if current_data_version is not None:
-                ext["dataVersion"] = RemotingSerializable.to_json(current_data_version)
             request = RemotingCommand.create_request_command(
                 RequestCode.GET_ALL_SUBSCRIPTIONGROUP_CONFIG, None)
             for k, v in ext.items():
@@ -746,7 +872,7 @@ class DefaultMQAdminExt:
         if not broker_name:
             try:
                 route = self._require_client().get_topic_route_data(topic)
-            except Exception:  # noqa: BLE001 — brokerName is only supplementary info; missing it is not blocking
+            except Exception:  # noqa: BLE001 - brokerName is only supplementary info; missing it is not blocking
                 route = None
             for bd in (route.get_broker_datas() if route else []):
                 if addr in (bd.broker_addrs or {}).values():
@@ -831,7 +957,6 @@ class DefaultMQAdminExt:
         return False
 
     def message_track_detail(self, msg: MessageExt) -> List[MessageTrack]:
-        pass
         result: List[MessageTrack] = []
         route = self.examine_topic_route(msg.topic)
         broker_addr = None
@@ -843,49 +968,72 @@ class DefaultMQAdminExt:
             return result
         groups = self.query_topic_consume_by_who(broker_addr, msg.topic)
         for group in sorted(groups):
-            mt = MessageTrack(consumer_group=group)
+            result.append(self._track_one_group(msg, group))
+        return result
+
+    def _track_one_group(self, msg: MessageExt, group: str) -> MessageTrack:
+        """The per-group verdict shared by the serial and the concurrent message track."""
+        mt = MessageTrack(consumer_group=group)
+        try:
+            cc = self.examine_consumer_connection_info(group)
+        except MQBrokerException as e:
+            if e.response_code == ResponseCode.CONSUMER_NOT_ONLINE:
+                mt.track_type = TrackType.NOT_ONLINE
+            mt.exception_desc = "CODE:%s DESC:%s" % (e.response_code, e.error_message)
+            return mt
+        except Exception as e:  # noqa: BLE001
+            mt.exception_desc = str(e)
+            return mt
+
+        if cc.consume_type == "CONSUME_ACTIVELY":
+            mt.track_type = TrackType.PULL
+        elif cc.consume_type == "CONSUME_PASSIVELY":
             try:
-                cc = self.examine_consumer_connection_info(group)
-            except MQBrokerException as e:
+                if_consumed = self.consumed(msg, group)
+            except (MQClientException, MQBrokerException) as e:
                 if e.response_code == ResponseCode.CONSUMER_NOT_ONLINE:
                     mt.track_type = TrackType.NOT_ONLINE
-                mt.exception_desc = "CODE:%s DESC:%s" % (e.response_code, e.error_message)
-                result.append(mt)
-                continue
+                    mt.exception_desc = ("CODE:%s DESC:%s"
+                                         % (e.response_code, getattr(e, "error_message", e)))
+                elif e.response_code == ResponseCode.BROADCAST_CONSUMPTION:
+                    mt.track_type = TrackType.CONSUME_BROADCASTING
+                return mt
             except Exception as e:  # noqa: BLE001
                 mt.exception_desc = str(e)
-                result.append(mt)
-                continue
+                return mt
 
-            if cc.consume_type == "CONSUME_ACTIVELY":
-                mt.track_type = TrackType.PULL
-            elif cc.consume_type == "CONSUME_PASSIVELY":
-                try:
-                    if_consumed = self.consumed(msg, group)
-                except (MQClientException, MQBrokerException) as e:
-                    if e.response_code == ResponseCode.CONSUMER_NOT_ONLINE:
-                        mt.track_type = TrackType.NOT_ONLINE
-                        mt.exception_desc = ("CODE:%s DESC:%s"
-                                             % (e.response_code, getattr(e, "error_message", e)))
-                    elif e.response_code == ResponseCode.BROADCAST_CONSUMPTION:
-                        mt.track_type = TrackType.CONSUME_BROADCASTING
-                    result.append(mt)
-                    continue
-                except Exception as e:  # noqa: BLE001
-                    mt.exception_desc = str(e)
-                    result.append(mt)
-                    continue
+            if if_consumed:
+                mt.track_type = TrackType.CONSUMED
+                sub = cc.subscription_table.get(msg.topic)
+                if sub:
+                    tags_set = set(sub.get("tagsSet") or [])
+                    if tags_set and "*" not in tags_set and msg.get_tags() not in tags_set:
+                        mt.track_type = TrackType.CONSUMED_BUT_FILTERED
+            else:
+                mt.track_type = TrackType.NOT_CONSUME_YET
+        return mt
 
-                if if_consumed:
-                    mt.track_type = TrackType.CONSUMED
-                    sub = cc.subscription_table.get(msg.topic)
-                    if sub:
-                        tags_set = set(sub.get("tagsSet") or [])
-                        if tags_set and "*" not in tags_set and msg.get_tags() not in tags_set:
-                            mt.track_type = TrackType.CONSUMED_BUT_FILTERED
-                else:
-                    mt.track_type = TrackType.NOT_CONSUME_YET
-            result.append(mt)
+    def message_track_detail_concurrent(self, msg: MessageExt) -> List[MessageTrack]:
+        """Track every consumer group of the message topic in parallel; the per-group
+        verdicts are the ones of the serial form, failures encoded into the track."""
+        result: List[MessageTrack] = []
+        route = self.examine_topic_route(msg.topic)
+        broker_addr = None
+        for bd in route.broker_datas:
+            broker_addr = bd.select_broker_addr()
+            if broker_addr:
+                break
+        if broker_addr is None:
+            return result
+        groups = sorted(self.query_topic_consume_by_who(broker_addr, msg.topic))
+        lock = threading.Lock()
+
+        def _track(group: str) -> None:
+            track = self._track_one_group(msg, group)
+            with lock:
+                result.append(track)
+
+        self._fan_out(groups, _track, self.timeout_millis)
         return result
 
     def query_topics_by_consumer_to_broker(self, broker_addr: str, group: str) -> TopicList:
@@ -1138,24 +1286,36 @@ class DefaultMQAdminExt:
 
     def create_and_update_topic_config_list(self, broker_addr: str,
                                             configs: List[TopicConfig]) -> None:
-        pass
-        if not configs:
-            raise MQClientException("createAndUpdateTopicConfigList: empty topicConfigList")
+        client = self._require_client()
         body = RemotingSerializable.encode(
             {"topicConfigList": [c.to_dict() for c in configs]})
-        self._invoke_broker(broker_addr, RequestCode.UPDATE_AND_CREATE_TOPIC_LIST,
-                            body=body)
+        request = RemotingCommand.create_request_command(
+            RequestCode.UPDATE_AND_CREATE_TOPIC_LIST, CreateTopicListRequestHeader())
+        request.body = body
+        response = client._invoke_sync(
+            MixAll.broker_vip_channel(self.vip_channel_enabled, broker_addr),
+            request, self.timeout_millis)
+        if response.code != ResponseCode.SUCCESS:
+            raise MQClientException(response.remark or
+                                    "createAndUpdateTopicConfigList failed",
+                                    response.code)
 
     def create_and_update_subscription_group_config_list(
             self, broker_addr: str, configs: List[SubscriptionGroupConfig]) -> None:
-        pass
-        if not configs:
-            raise MQClientException(
-                "createAndUpdateSubscriptionGroupConfigList: empty groupConfigList")
+        client = self._require_client()
         body = RemotingSerializable.encode(
             {"groupConfigList": [c.to_dict() for c in configs]})
-        self._invoke_broker(broker_addr, RequestCode.UPDATE_AND_CREATE_SUBSCRIPTIONGROUP_LIST,
-                            body=body)
+        # No header at all: this request carries no extFields on the wire.
+        request = RemotingCommand.create_request_command(
+            RequestCode.UPDATE_AND_CREATE_SUBSCRIPTIONGROUP_LIST, None)
+        request.body = body
+        response = client._invoke_sync(
+            MixAll.broker_vip_channel(self.vip_channel_enabled, broker_addr),
+            request, self.timeout_millis)
+        if response.code != ResponseCode.SUCCESS:
+            raise MQClientException(
+                response.remark or "createAndUpdateSubscriptionGroupConfigList failed",
+                response.code)
 
     def create_static_topic(self, broker_addr: str, default_topic: str,
                             config: TopicConfig, mapping_detail: Dict,
@@ -1347,6 +1507,669 @@ class DefaultMQAdminExt:
         self._invoke_broker(broker_addr, RequestCode.SET_MESSAGE_REQUEST_MODE,
                             ext_fields=ext)
 
+    # ---------------- Broker container ----------------
+    def add_broker_to_container(self, broker_container_addr: str,
+                                broker_config_path: str) -> None:
+        header = AddBrokerRequestHeader()
+        header.config_path = broker_config_path
+        self._invoke_broker(broker_container_addr, RequestCode.ADD_BROKER,
+                            ext_fields=header.to_ext_fields(),
+                            timeout_millis=ADMIN_CONTAINER_TIMEOUT, vip=False)
+
+    def remove_broker_from_container(self, broker_container_addr: str,
+                                     cluster_name: str, broker_name: str,
+                                     broker_id: int) -> None:
+        header = RemoveBrokerRequestHeader()
+        header.broker_cluster_name = cluster_name
+        header.broker_name = broker_name
+        header.broker_id = broker_id
+        self._invoke_broker(broker_container_addr, RequestCode.REMOVE_BROKER,
+                            ext_fields=header.to_ext_fields(),
+                            timeout_millis=ADMIN_CONTAINER_TIMEOUT, vip=False)
+
+    # ---------------- Controller ----------------
+    def get_controller_meta_data(self, controller_addr: str) -> GetMetaDataResponseHeader:
+        client = self._require_client()
+        request = RemotingCommand.create_request_command(
+            RequestCode.CONTROLLER_GET_METADATA_INFO, None)
+        response = client._invoke_sync(controller_addr, request,
+                                       CONTROLLER_RPC_TIMEOUT)
+        if response.code != ResponseCode.SUCCESS:
+            raise MQBrokerException(response.code, response.remark or "")
+        header = GetMetaDataResponseHeader()
+        header.from_ext_fields(response.ext_fields)
+        return header
+
+    def _controller_leader_address(self, controller_addr: str) -> str:
+        return self.get_controller_meta_data(controller_addr).controller_leader_address
+
+    def get_in_sync_state_data(self, controller_address: str,
+                               brokers: List[str]) -> BrokerReplicasInfo:
+        """Two-phase read: the meta data call names the leader, then the sync state
+        request itself goes to the leader address."""
+        client = self._require_client()
+        leader_address = self._controller_leader_address(controller_address)
+        request = RemotingCommand.create_request_command(
+            RequestCode.CONTROLLER_GET_SYNC_STATE_DATA, None)
+        request.body = RemotingSerializable.encode(list(brokers))
+        response = client._invoke_sync(leader_address, request, CONTROLLER_RPC_TIMEOUT)
+        if response.code != ResponseCode.SUCCESS:
+            raise MQBrokerException(response.code, response.remark or "")
+        return BrokerReplicasInfo.decode(response.body)
+
+    def clean_controller_broker_data(self, controller_addr: str, cluster_name: str,
+                                     broker_name: str,
+                                     broker_controller_ids_to_clean: Optional[str] = None,
+                                     is_clean_living_broker: bool = False) -> None:
+        client = self._require_client()
+        header = CleanControllerBrokerDataRequestHeader(
+            cluster_name=cluster_name, broker_name=broker_name,
+            broker_controller_ids_to_clean=broker_controller_ids_to_clean,
+            is_clean_living_broker=is_clean_living_broker)
+        leader_address = self._controller_leader_address(controller_addr)
+        request = RemotingCommand.create_request_command(
+            RequestCode.CLEAN_BROKER_DATA, header)
+        for k, v in header.to_ext_fields().items():
+            request.ext_fields[k] = str(v)
+        response = client._invoke_sync(leader_address, request, CONTROLLER_RPC_TIMEOUT)
+        if response.code != ResponseCode.SUCCESS:
+            raise MQBrokerException(response.code, response.remark or "")
+
+    def get_controller_config(self, controller_servers: Optional[List[str]] = None,
+                              timeout_millis: Optional[int] = None) -> Optional[Dict[str, Dict[str, str]]]:
+        client = self._require_client()
+        targets = controller_servers if controller_servers else list(client.name_server_addrs)
+        if not targets:
+            return None
+        request = RemotingCommand.create_request_command(
+            RequestCode.GET_CONTROLLER_CONFIG, None)
+        config_map: Dict[str, Dict[str, str]] = {}
+        for controller in targets:
+            response = client._invoke_sync(controller, request,
+                                           timeout_millis or self.timeout_millis)
+            if response.code != ResponseCode.SUCCESS:
+                raise MQClientException(response.remark or "get controller config failed",
+                                        response.code)
+            config_map[controller] = MixAll.string2_properties(
+                (response.body or b"").decode("utf-8"))
+        return config_map
+
+    def update_controller_config(self, properties: Dict[str, str],
+                                 controllers: Optional[List[str]] = None) -> None:
+        client = self._require_client()
+        text = MixAll.properties2_string(properties or {})
+        if not text or not controllers:
+            return
+        request = RemotingCommand.create_request_command(
+            RequestCode.UPDATE_CONTROLLER_CONFIG, None)
+        request.body = text.encode("utf-8")
+        err_response = None
+        for controller in controllers:
+            response = client._invoke_sync(controller, request, self.timeout_millis)
+            if response.code != ResponseCode.SUCCESS:
+                err_response = response
+        if err_response is not None:
+            raise MQClientException(
+                err_response.remark or "update controller config failed",
+                err_response.code)
+
+    # ---------------- Cold data flow control ----------------
+    def update_cold_data_flow_ctr_group_config(self, broker_addr: str,
+                                               properties: Dict[str, str]) -> None:
+        text = MixAll.properties2_string(properties or {})
+        if not text:
+            return
+        self._invoke_broker(broker_addr, RequestCode.UPDATE_COLD_DATA_FLOW_CTR_CONFIG,
+                            body=text.encode("utf-8"))
+
+    def remove_cold_data_flow_ctr_group_config(self, broker_addr: str,
+                                               consumer_group: str) -> None:
+        if not consumer_group:
+            return
+        # The group travels as a plain string body, not as JSON.
+        self._invoke_broker(broker_addr, RequestCode.REMOVE_COLD_DATA_FLOW_CTR_CONFIG,
+                            body=consumer_group.encode("utf-8"))
+
+    def get_cold_data_flow_ctr_info(self, broker_addr: str) -> Optional[str]:
+        response = self._invoke_broker(broker_addr,
+                                       RequestCode.GET_COLD_DATA_FLOW_CTR_INFO,
+                                       vip=False)
+        body = response.body
+        if body:
+            return body.decode("utf-8")
+        return None
+
+    # ---------------- CommitLog read ahead ----------------
+    def set_commit_log_read_ahead_mode(self, broker_addr: str,
+                                       mode: str) -> Optional[str]:
+        client = self._require_client()
+        # Built by hand: this request has no header class, and its single ext field is
+        # the protocol constant key.
+        request = RemotingCommand.create_request_command(
+            RequestCode.SET_COMMITLOG_READ_MODE, None)
+        request.ext_fields[READ_AHEAD_MODE_KEY] = mode
+        response = client._invoke_sync(broker_addr, request, self.timeout_millis)
+        if response.code != ResponseCode.SUCCESS:
+            raise MQBrokerException(response.code, response.remark or "")
+        return response.remark or None
+
+    # ---------------- Pop record export ----------------
+    def export_pop_records(self, broker_addr: str, timeout: int) -> None:
+        # The caller's timeout is forwarded verbatim; the admin default does not apply.
+        self._invoke_broker(broker_addr, RequestCode.POP_ROLLBACK,
+                            timeout_millis=timeout, vip=False)
+
+    # ---------------- RocksDB cold queue ----------------
+    def check_rocksdb_cq_write_progress(self, broker_addr: str, topic: str,
+                                        check_store_time: int) -> CheckRocksdbCqWriteResult:
+        client = self._require_client()
+        header = CheckRocksdbCqWriteProgressRequestHeader()
+        header.topic = topic
+        header.check_store_time = check_store_time
+        request = RemotingCommand.create_request_command(
+            RequestCode.CHECK_ROCKSDB_CQ_WRITE_PROGRESS, header)
+        for k, v in header.to_ext_fields().items():
+            request.ext_fields[k] = str(v)
+        response = client._invoke_sync(broker_addr, request, self.timeout_millis)
+        if response.code != ResponseCode.SUCCESS:
+            raise MQClientException(response.remark or "checkRocksdbCqWriteProgress failed",
+                                    response.code)
+        return CheckRocksdbCqWriteResult.decode(response.body)
+
+    def export_rocksdb_config_to_json(self, broker_addr: str,
+                                      config_types: List[str]) -> None:
+        client = self._require_client()
+        header = ExportRocksDBConfigToJsonRequestHeader()
+        header.update_config_type(config_types)
+        request = RemotingCommand.create_request_command(
+            RequestCode.EXPORT_ROCKSDB_CONFIG_TO_JSON, header)
+        for k, v in header.to_ext_fields().items():
+            request.ext_fields[k] = str(v)
+        response = client._invoke_sync(broker_addr, request, self.timeout_millis)
+        if response.code != ResponseCode.SUCCESS:
+            raise MQClientException(
+                response.remark or "exportRocksDBConfigToJson failed", response.code)
+
+    # ---------------- Lite topic admin ----------------
+    def _invoke_broker_method(self, addr: str, code: int,
+                              ext_fields: Optional[Dict[str, str]],
+                              decode_body) -> object:
+        """The shared lite-admin invocation: VIP routing, the body decoded only when the
+        broker sent one, and a broker exception carrying the address on failure."""
+        client = self._require_client()
+        request = RemotingCommand.create_request_command(code, None)
+        if ext_fields:
+            for k, v in ext_fields.items():
+                request.ext_fields[k] = str(v)
+        response = client._invoke_sync(
+            MixAll.broker_vip_channel(self.vip_channel_enabled, addr), request,
+            self.timeout_millis)
+        if response.code != ResponseCode.SUCCESS:
+            raise MQBrokerException(response.code, response.remark or "", addr)
+        if response.body:
+            return decode_body(response.body)
+        return None
+
+    def get_broker_lite_info(self, broker_addr: str) -> Optional[GetBrokerLiteInfoResponseBody]:
+        return self._invoke_broker_method(broker_addr, RequestCode.GET_BROKER_LITE_INFO,
+                                          None, GetBrokerLiteInfoResponseBody.decode)
+
+    def get_parent_topic_info(self, broker_addr: str,
+                              topic: str) -> Optional[GetParentTopicInfoResponseBody]:
+        header = GetParentTopicInfoRequestHeader()
+        header.topic = topic
+        return self._invoke_broker_method(broker_addr, RequestCode.GET_PARENT_TOPIC_INFO,
+                                          header.to_ext_fields(),
+                                          GetParentTopicInfoResponseBody.decode)
+
+    def get_lite_topic_info(self, broker_addr: str, parent_topic: str,
+                            lite_topic: Optional[str] = None
+                            ) -> Optional[GetLiteTopicInfoResponseBody]:
+        header = GetLiteTopicInfoRequestHeader()
+        header.parent_topic = parent_topic
+        header.lite_topic = lite_topic
+        return self._invoke_broker_method(broker_addr, RequestCode.GET_LITE_TOPIC_INFO,
+                                          header.to_ext_fields(),
+                                          GetLiteTopicInfoResponseBody.decode)
+
+    def get_lite_client_info(self, broker_addr: str, parent_topic: str, group: str,
+                             client_id: Optional[str] = None
+                             ) -> Optional[GetLiteClientInfoResponseBody]:
+        header = GetLiteClientInfoRequestHeader()
+        header.parent_topic = parent_topic
+        header.group = group
+        header.client_id = client_id
+        return self._invoke_broker_method(broker_addr, RequestCode.GET_LITE_CLIENT_INFO,
+                                          header.to_ext_fields(),
+                                          GetLiteClientInfoResponseBody.decode)
+
+    def get_lite_group_info(self, broker_addr: str, group: str,
+                            lite_topic: Optional[str] = None, top_k: int = 0
+                            ) -> Optional[GetLiteGroupInfoResponseBody]:
+        header = GetLiteGroupInfoRequestHeader()
+        header.group = group
+        header.lite_topic = lite_topic
+        header.top_k = top_k
+        return self._invoke_broker_method(broker_addr, RequestCode.GET_LITE_GROUP_INFO,
+                                          header.to_ext_fields(),
+                                          GetLiteGroupInfoResponseBody.decode)
+
+    def trigger_lite_dispatch(self, broker_addr: str, group: str,
+                              client_id: Optional[str] = None) -> None:
+        header = TriggerLiteDispatchRequestHeader()
+        header.group = group
+        header.client_id = client_id
+        self._invoke_broker_method(broker_addr, RequestCode.TRIGGER_LITE_DISPATCH,
+                                   header.to_ext_fields(), lambda body: None)
+
+    # ---------------- Concurrent fan-out tools ----------------
+    def examine_topic_stats_concurrent(self, topic: str) -> AdminToolResult:
+        def _execute() -> AdminToolResult:
+            table = TopicStatsTable()
+            route = self._examine_topic_route_info(topic)
+            if route is None or not route.get_broker_datas():
+                return AdminToolResult.success(table)
+
+            lock = threading.Lock()
+
+            def _collect(bd: BrokerData) -> None:
+                try:
+                    addr = bd.select_broker_addr()
+                    if addr is not None:
+                        part = self.examine_topic_stats_by_broker(addr, topic)
+                        with lock:
+                            table.offset_table.update(part.offset_table)
+                            table.topic_put_tps += part.topic_put_tps
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("getTopicStatsInfo error. topic=%s: %s", topic, e)
+
+            self._fan_out(list(route.get_broker_datas()), _collect, self.timeout_millis)
+            return AdminToolResult.success(table)
+
+        return self._admin_tool_execute(_execute)
+
+    def examine_consume_stats_concurrent(self, consumer_group: str,
+                                         topic: Optional[str] = None) -> AdminToolResult:
+        def _execute() -> AdminToolResult:
+            route = None
+            route_topics = [MixAll.get_retry_topic(consumer_group)]
+            if topic is not None:
+                route_topics.append(topic)
+                route_topics.append(MixAll.build_pop_retry_topic(topic, consumer_group))
+            for route_topic in route_topics:
+                try:
+                    route = self._examine_topic_route_info(route_topic)
+                except Exception:  # noqa: BLE001
+                    route = None
+                if route is not None:
+                    break
+            if route is None or not route.get_broker_datas():
+                return AdminToolResult.failure(
+                    AdminToolsResultCodeEnum.TOPIC_ROUTE_INFO_NOT_EXIST,
+                    "topic router info not found")
+
+            result = ConsumeStats()
+            lock = threading.Lock()
+            consume_tps_map: Dict[str, float] = {}
+
+            def _collect(bd: BrokerData) -> None:
+                try:
+                    addr = bd.select_broker_addr()
+                    if addr is not None:
+                        part = self.examine_consume_stats(addr, consumer_group, topic)
+                        with lock:
+                            result.offset_table.update(part.offset_table)
+                            consume_tps_map[addr] = part.consume_tps
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("getConsumeStats error. topic=%s, consumerGroup=%s: %s",
+                                   topic, consumer_group, e)
+
+            self._fan_out(list(route.get_broker_datas()), _collect, self.timeout_millis)
+            # The TPS of every broker that answered is summed, answer or not otherwise.
+            for tps in consume_tps_map.values():
+                result.consume_tps += tps
+
+            if not result.offset_table:
+                try:
+                    connection = self.examine_consumer_connection_info(consumer_group)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("examineConsumerConnectionInfo failed: %s", e)
+                    return AdminToolResult.failure(
+                        AdminToolsResultCodeEnum.CONSUMER_NOT_ONLINE,
+                        "Not found the consumer group consume stats, because return "
+                        "offset table is empty, maybe the consumer not consume any message")
+                if connection.message_model == "BROADCASTING":
+                    return AdminToolResult.failure(
+                        AdminToolsResultCodeEnum.BROADCAST_CONSUMPTION,
+                        "Not found the consumer group consume stats, because return "
+                        "offset table is empty, the consumer is under the broadcast mode")
+            return AdminToolResult.success(result)
+
+        return self._admin_tool_execute(_execute)
+
+    def delete_topic_in_broker_concurrent(self, addrs: Set[str],
+                                          topic: str) -> AdminToolResult:
+        success_list: List[str] = []
+        failure_list: List[str] = []
+        lock = threading.Lock()
+
+        def _delete(addr: str) -> None:
+            try:
+                self._require_client().delete_topic_in_broker(addr, topic)
+                with lock:
+                    success_list.append(addr)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("deleteTopicInBroker error. topic=%s, broker=%s: %s",
+                               topic, addr, e)
+                with lock:
+                    failure_list.append(addr)
+
+        self._fan_out(list(addrs), _delete, self.timeout_millis)
+        return AdminToolResult.success(BrokerOperatorResult(success_list, failure_list))
+
+    def reset_offset_new_concurrent(self, group: str, topic: str,
+                                    timestamp: int) -> AdminToolResult:
+        def _execute() -> AdminToolResult:
+            route = self._examine_topic_route_info(topic)
+            if route is None or not route.get_broker_datas():
+                return AdminToolResult.failure(
+                    AdminToolsResultCodeEnum.TOPIC_ROUTE_INFO_NOT_EXIST,
+                    "topic router info not found")
+            route_map: Dict[str, QueueData] = {}
+            for qd in route.queue_datas:
+                route_map[qd.broker_name] = qd
+
+            success_list: List[str] = []
+            failure_list: List[str] = []
+            lock = threading.Lock()
+
+            def _reset(bd: BrokerData) -> None:
+                addr = bd.select_broker_addr()
+                try:
+                    if addr is not None:
+                        offset_table = self._invoke_broker_reset_offset(
+                            addr, topic, group, timestamp, True, False)
+                        if offset_table is not None:
+                            with lock:
+                                success_list.append(addr)
+                        else:
+                            with lock:
+                                failure_list.append(addr)
+                except MQClientException as e:
+                    if e.response_code == ResponseCode.CONSUMER_NOT_ONLINE:
+                        try:
+                            self._reset_offset_old_on_broker(
+                                addr, route_map.get(bd.broker_name), group, topic,
+                                timestamp, True)
+                            with lock:
+                                success_list.append(addr)
+                        except Exception as e2:  # noqa: BLE001
+                            logger.warning("resetOffsetByTimestampOld error. addr=%s, "
+                                           "topic=%s, group=%s, timestamp=%s: %s",
+                                           addr, topic, group, timestamp, e2)
+                            with lock:
+                                failure_list.append(addr)
+                    elif e.response_code == ResponseCode.SYSTEM_ERROR:
+                        # A group that never came online has nothing to reset: counted
+                        # as done.
+                        with lock:
+                            success_list.append(addr)
+                    else:
+                        logger.warning("resetOffsetNewConcurrent error. addr=%s, "
+                                       "topic=%s, group=%s, timestamp=%s: %s",
+                                       addr, topic, group, timestamp, e)
+                        with lock:
+                            failure_list.append(addr)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("resetOffsetNewConcurrent error. addr=%s, topic=%s, "
+                                   "group=%s, timestamp=%s: %s",
+                                   addr, topic, group, timestamp, e)
+                    with lock:
+                        failure_list.append(addr)
+
+            self._fan_out(list(route.get_broker_datas()), _reset, self.timeout_millis)
+            result = BrokerOperatorResult(success_list, failure_list)
+            if len(success_list) == len(route.get_broker_datas()):
+                return AdminToolResult.success(result)
+            return AdminToolResult.failure(AdminToolsResultCodeEnum.MQ_BROKER_ERROR,
+                                           "operator failure", result)
+
+        return self._admin_tool_execute(_execute)
+
+    def _reset_offset_old_on_broker(self, broker_addr: str, queue_data: Optional[QueueData],
+                                    consumer_group: str, topic: str, timestamp: int,
+                                    force: bool) -> List[dict]:
+        """The old per-broker reset: reset the queues the group actually consumed (from
+        its consume stats), or every read queue when it never consumed the topic."""
+        client = self._require_client()
+        consume_stats = self.examine_consume_stats(broker_addr, consumer_group)
+        rollback_stats_list: List[dict] = []
+        has_consumed = False
+        for queue, wrapper in consume_stats.offset_table.items():
+            if queue.topic != topic:
+                continue
+            has_consumed = True
+            rollback_stats_list.append(
+                self._reset_offset_consume_offset(broker_addr, consumer_group, queue,
+                                                  wrapper, timestamp, force))
+        if not has_consumed and queue_data is not None:
+            topic_status = self.examine_topic_stats_by_broker(broker_addr, topic)
+            for i in range(queue_data.read_queue_nums):
+                queue = MessageQueue(topic, queue_data.broker_name, i)
+                offset_wrapper = topic_status.offset_table.get(queue)
+                fallback = OffsetWrapper(
+                    broker_offset=offset_wrapper.max_offset if offset_wrapper else 0,
+                    consumer_offset=offset_wrapper.min_offset if offset_wrapper else 0)
+                rollback_stats_list.append(
+                    self._reset_offset_consume_offset(broker_addr, consumer_group, queue,
+                                                      fallback, timestamp, force))
+        return rollback_stats_list
+
+    def _reset_offset_consume_offset(self, broker_addr: str, consumer_group: str,
+                                     queue: MessageQueue, offset_wrapper: OffsetWrapper,
+                                     timestamp: int, force: bool) -> dict:
+        client = self._require_client()
+        if timestamp == -1:
+            reset_offset = client.get_max_offset(queue, self.timeout_millis, broker_addr)
+        else:
+            reset_offset = client.search_offset_by_timestamp(
+                queue, timestamp, self.timeout_millis, broker_addr)
+        stats = {
+            "brokerName": queue.broker_name,
+            "queueId": queue.queue_id,
+            "brokerOffset": offset_wrapper.broker_offset,
+            "consumerOffset": offset_wrapper.consumer_offset,
+            "timestampOffset": reset_offset,
+            "rollbackOffset": offset_wrapper.consumer_offset,
+        }
+        if force or reset_offset <= offset_wrapper.consumer_offset:
+            stats["rollbackOffset"] = reset_offset
+            client.update_consumer_offset(consumer_group, queue, reset_offset,
+                                          self.timeout_millis, broker_addr)
+        return stats
+
+    def query_topics_by_consumer_concurrent(self, group: str) -> AdminToolResult:
+        def _execute() -> AdminToolResult:
+            retry_topic = MixAll.get_retry_topic(group)
+            route = self._examine_topic_route_info(retry_topic)
+            if route is None or not route.get_broker_datas():
+                return AdminToolResult.failure(
+                    AdminToolsResultCodeEnum.TOPIC_ROUTE_INFO_NOT_EXIST,
+                    "router info not found.")
+
+            result = TopicList()
+            lock = threading.Lock()
+
+            def _collect(bd: BrokerData) -> None:
+                try:
+                    addr = bd.select_broker_addr()
+                    if addr is not None:
+                        topic_list = self.query_topics_by_consumer_to_broker(addr, group)
+                        with lock:
+                            for topic in topic_list.get_topic_list():
+                                result.topic_list.append(topic)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("queryTopicsByConsumer error. group=%s: %s", group, e)
+
+            self._fan_out(list(route.get_broker_datas()), _collect, self.timeout_millis)
+            return AdminToolResult.success(result)
+
+        return self._admin_tool_execute(_execute)
+
+    def query_consume_time_span_concurrent(self, topic: str,
+                                           group: str) -> AdminToolResult:
+        def _execute() -> AdminToolResult:
+            span_set: List[dict] = []
+            route = self._examine_topic_route_info(topic)
+            if route is None or not route.get_broker_datas():
+                return AdminToolResult.success(span_set)
+            lock = threading.Lock()
+
+            def _collect(bd: BrokerData) -> None:
+                try:
+                    addr = bd.select_broker_addr()
+                    if addr is not None:
+                        response = self._invoke_broker(
+                            addr, RequestCode.QUERY_CONSUME_TIME_SPAN,
+                            {"topic": topic, "group": group})
+                        if response.body:
+                            body = QueryConsumeTimeSpanBody.decode(response.body)
+                            with lock:
+                                span_set.extend(body.consume_time_span_set)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("queryConsumeTimeSpan error. topic=%s, group=%s: %s",
+                                   topic, group, e)
+
+            self._fan_out(list(route.get_broker_datas()), _collect, self.timeout_millis)
+            return AdminToolResult.success(span_set)
+
+        return self._admin_tool_execute(_execute)
+
+    # ---------------- Auth user / ACL management ----------------
+    def _invoke_auth(self, broker_addr: str, code: int,
+                     ext_fields: Dict[str, str],
+                     body: Optional[bytes] = None,
+                     timeout_millis: Optional[int] = None) -> RemotingCommand:
+        """Send an auth management RPC and verify SUCCESS.
+
+        ``vip=False`` is load-bearing: these RPCs must reach the address the caller gave,
+        byte for byte. The VIP-channel rewrite would move them to another port, where the
+        auth processor is not listening.
+        """
+        return self._invoke_broker(broker_addr, code, ext_fields=ext_fields, body=body,
+                                   timeout_millis=timeout_millis, vip=False)
+
+    @staticmethod
+    def _auth_ext_fields(**fields: Optional[str]) -> Dict[str, str]:
+        """Keep only the header fields that are set: an unset one is omitted rather than
+        sent as ``""`` or ``"None"``, which the broker would read as a real value."""
+        return {k: v for k, v in fields.items() if v is not None}
+
+    @staticmethod
+    def _resolve_user(user: Optional[Union[UserInfo, str]], password: Optional[str],
+                      user_type: Optional[str]) -> UserInfo:
+        if isinstance(user, UserInfo):
+            return user
+        return UserInfo(username=user, password=password, user_type=user_type)
+
+    @staticmethod
+    def _resolve_acl(acl: Optional[Union[AclInfo, str]],
+                     resources: Union[str, List[str], None], actions: Optional[List[str]],
+                     source_ips: Optional[List[str]],
+                     decision: Optional[str]) -> AclInfo:
+        if isinstance(acl, AclInfo):
+            return acl
+        return AclInfo.for_resources(acl, resources, actions, source_ips, decision)
+
+    def create_user(self, broker_addr: str, user: Optional[Union[UserInfo, str]] = None,
+                    password: Optional[str] = None, user_type: Optional[str] = None,
+                    timeout_millis: Optional[int] = None) -> None:
+        """Create an auth user. Pass either a UserInfo or, in the convenience form, the
+        username / password / userType trio -- that form leaves userStatus unset, so the key
+        stays out of the body."""
+        info = self._resolve_user(user, password, user_type)
+        self._invoke_auth(broker_addr, RequestCode.AUTH_CREATE_USER,
+                          self._auth_ext_fields(username=info.username),
+                          body=info.encode(), timeout_millis=timeout_millis)
+
+    def update_user(self, broker_addr: str, user: Optional[Union[UserInfo, str]] = None,
+                    password: Optional[str] = None, user_type: Optional[str] = None,
+                    timeout_millis: Optional[int] = None) -> None:
+        """Update an auth user; same two call shapes as create_user."""
+        info = self._resolve_user(user, password, user_type)
+        self._invoke_auth(broker_addr, RequestCode.AUTH_UPDATE_USER,
+                          self._auth_ext_fields(username=info.username),
+                          body=info.encode(), timeout_millis=timeout_millis)
+
+    def delete_user(self, broker_addr: str, username: str,
+                    timeout_millis: Optional[int] = None) -> None:
+        self._invoke_auth(broker_addr, RequestCode.AUTH_DELETE_USER,
+                          self._auth_ext_fields(username=username),
+                          timeout_millis=timeout_millis)
+
+    def get_user(self, broker_addr: str, username: str,
+                 timeout_millis: Optional[int] = None) -> Optional[UserInfo]:
+        response = self._invoke_auth(broker_addr, RequestCode.AUTH_GET_USER,
+                                     self._auth_ext_fields(username=username),
+                                     timeout_millis=timeout_millis)
+        return UserInfo.decode(response.body)
+
+    def list_users(self, broker_addr: str, filter: Optional[str] = None,
+                   timeout_millis: Optional[int] = None) -> List[UserInfo]:
+        response = self._invoke_auth(broker_addr, RequestCode.AUTH_LIST_USER,
+                                     self._auth_ext_fields(filter=filter),
+                                     timeout_millis=timeout_millis)
+        return UserInfo.decode_list(response.body)
+
+    def create_acl(self, broker_addr: str, acl: Optional[Union[AclInfo, str]] = None,
+                   resources: Union[str, List[str], None] = None,
+                   actions: Optional[List[str]] = None,
+                   source_ips: Optional[List[str]] = None, decision: Optional[str] = None,
+                   timeout_millis: Optional[int] = None) -> None:
+        """Create an ACL. Pass either an AclInfo or, in the convenience form, the subject /
+        resources / actions / sourceIps / decision set -- that form builds one untyped policy
+        holding one entry per resource."""
+        info = self._resolve_acl(acl, resources, actions, source_ips, decision)
+        self._invoke_auth(broker_addr, RequestCode.AUTH_CREATE_ACL,
+                          self._auth_ext_fields(subject=info.subject),
+                          body=info.encode(), timeout_millis=timeout_millis)
+
+    def update_acl(self, broker_addr: str, acl: Optional[Union[AclInfo, str]] = None,
+                   resources: Union[str, List[str], None] = None,
+                   actions: Optional[List[str]] = None,
+                   source_ips: Optional[List[str]] = None, decision: Optional[str] = None,
+                   timeout_millis: Optional[int] = None) -> None:
+        """Update an ACL; same two call shapes as create_acl."""
+        info = self._resolve_acl(acl, resources, actions, source_ips, decision)
+        self._invoke_auth(broker_addr, RequestCode.AUTH_UPDATE_ACL,
+                          self._auth_ext_fields(subject=info.subject),
+                          body=info.encode(), timeout_millis=timeout_millis)
+
+    def delete_acl(self, broker_addr: str, subject: str, resource: str,
+                   timeout_millis: Optional[int] = None) -> None:
+        """Delete one resource grant of a subject: this request carries only the subject
+        and the resource, no body and no policy shape."""
+        self._invoke_auth(broker_addr, RequestCode.AUTH_DELETE_ACL,
+                          self._auth_ext_fields(subject=subject, resource=resource),
+                          timeout_millis=timeout_millis)
+
+    def get_acl(self, broker_addr: str, subject: str,
+                timeout_millis: Optional[int] = None) -> Optional[AclInfo]:
+        response = self._invoke_auth(broker_addr, RequestCode.AUTH_GET_ACL,
+                                     self._auth_ext_fields(subject=subject),
+                                     timeout_millis=timeout_millis)
+        return AclInfo.decode(response.body)
+
+    def list_acls(self, broker_addr: str, subject_filter: Optional[str] = None,
+                  resource_filter: Optional[str] = None,
+                  timeout_millis: Optional[int] = None) -> List[AclInfo]:
+        response = self._invoke_auth(
+            broker_addr, RequestCode.AUTH_LIST_ACL,
+            self._auth_ext_fields(subjectFilter=subject_filter,
+                                  resourceFilter=resource_filter),
+            timeout_millis=timeout_millis)
+        return AclInfo.decode_list(response.body)
+
 
 # ---------------------------------------------------------------- Helpers
 def _perm_is_valid(value) -> bool:
@@ -1362,4 +2185,7 @@ __all__ = ["DefaultMQAdminExt", "DEFAULT_TIMEOUT", "ClusterInfo", "TopicList", "
            "TopicRouteData", "QueueData", "BrokerData", "PullResult", "PullStatus",
            "TopicConfig", "TopicConfigSerializeWrapper", "TopicStatsTable",
            "ConsumeStats", "SubscriptionGroupConfig", "SubscriptionGroupWrapper",
-           "QueryConsumeQueueResponseBody"]
+           "QueryConsumeQueueResponseBody", "UserInfo", "AclInfo",
+           "AdminToolResult", "AdminToolsResultCodeEnum", "BrokerOperatorResult",
+           "BrokerReplicasInfo", "ReplicasInfo", "ReplicaIdentity",
+           "CheckRocksdbCqWriteResult", "GetMetaDataResponseHeader"]

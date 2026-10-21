@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import os
 import random
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional
 
 from common.boundary_type import BoundaryType
@@ -121,7 +123,11 @@ class MQClientInstance:
                  namespace_v2: Optional[str] = None,
                  poll_name_server_interval: int = 30000,
                  socks_proxy_config=None,
-                 vip_channel_enabled: bool = False):
+                 vip_channel_enabled: bool = False,
+                 decode_read_body: bool = True,
+                 mq_client_api_timeout: int = 3000,
+                 enable_concurrent_heartbeat: bool = False,
+                 concurrent_heartbeat_thread_pool_size: Optional[int] = None):
         self.client_id = client_id
         self.name_server_addrs: List[str] = list(name_server_addrs)
         self.poll_name_server_interval = poll_name_server_interval
@@ -131,6 +137,14 @@ class MQClientInstance:
         # (listen port - 2). Off by default: the fast channel only exists on a broker that was
         # started with it enabled, so rewriting by default would point at a closed port.
         self.vip_channel_enabled = bool(vip_channel_enabled)
+        # With this switch off, a received message body is skipped (header only) instead of
+        # being copied, CRC-checked and decompressed.
+        self.decode_read_body = bool(decode_read_body)
+        self.mq_client_api_timeout = int(mq_client_api_timeout)
+        self.enable_concurrent_heartbeat = bool(enable_concurrent_heartbeat)
+        self.concurrent_heartbeat_thread_pool_size = max(
+            1, int(concurrent_heartbeat_thread_pool_size or (os.cpu_count() or 1)))
+        self._heartbeat_executor: Optional[ThreadPoolExecutor] = None
         # Heartbeat V2 per-stream state (the set of brokers known to speak V2 plus the
         # broker addr -> fingerprint table); the facades decide whether to use it, see
         # client/heartbeat_v2.py.
@@ -403,6 +417,10 @@ class MQClientInstance:
 
     def _start_locked(self) -> None:
         self.consumer_stats_manager.start()
+        if self.enable_concurrent_heartbeat and self._heartbeat_executor is None:
+            self._heartbeat_executor = ThreadPoolExecutor(
+                max_workers=self.concurrent_heartbeat_thread_pool_size,
+                thread_name_prefix="rmq-heartbeat-%s" % self.client_id)
         dynamic_ns = (not self.name_server_addrs
                       and self.top_addressing is not None
                       and bool(self.top_addressing.ws_addr))
@@ -439,6 +457,9 @@ class MQClientInstance:
             self._route_refresh_stop.set()
             self._adjust_pool_stop.set()
             self._namesrv_refresh_stop.set()
+            if self._heartbeat_executor is not None:
+                self._heartbeat_executor.shutdown(wait=True, cancel_futures=True)
+                self._heartbeat_executor = None
             self.consumer_stats_manager.shutdown()
             self.remoting_client.shutdown()
 
@@ -518,12 +539,15 @@ class MQClientInstance:
         raise MQBrokerException(response.code, response.remark or "")
 
     # ---------------- route management ----------------
-    def update_topic_route_info_from_name_server(self, topic: str, timeout_millis: int = 5000,
+    def update_topic_route_info_from_name_server(self, topic: str,
+                                                 timeout_millis: Optional[int] = None,
                                                  is_default: bool = False) -> bool:
         pass
         if not self.name_server_addrs:
             raise MQClientException("name server address list is empty",
                                     ClientErrorCode.NO_NAME_SERVER_EXCEPTION)
+        timeout_millis = (self.mq_client_api_timeout if timeout_millis is None
+                          else timeout_millis)
 
         def _fetch(t: str):
             request = RemotingCommand.create_request_command(RequestCode.GET_ROUTEINFO_BY_TOPIC, None)
@@ -906,7 +930,7 @@ class MQClientInstance:
         resp_header.from_ext_fields(response.ext_fields)
         found = []
         if response.body:
-            found = decode_messages(response.body)
+            found = decode_messages(response.body, read_body=self.decode_read_body)
             for m in found:
                 m.broker_name = mq.broker_name
                 m.queue_id = mq.queue_id
@@ -1001,7 +1025,7 @@ class MQClientInstance:
 
         found: List[MessageExt] = []
         if status == PopStatus.FOUND and response.body:
-            found = decode_messages(response.body)
+            found = decode_messages(response.body, read_body=self.decode_read_body)
             self._stamp_pop_ck(found, broker_name, resp_header)
 
         for m in found:
@@ -1418,13 +1442,16 @@ class MQClientInstance:
                 logger.warning("unlock_batch_mq failed for broker %s: %s", broker_name, e)
 
     # ---------------- heartbeat / unregister ----------------
-    def send_heartbeat(self, addr: str, heartbeat_data: HeartbeatData, timeout_millis: int = 5000) -> int:
+    def send_heartbeat(self, addr: str, heartbeat_data: HeartbeatData,
+                       timeout_millis: Optional[int] = None) -> int:
         """HEART_BEAT(34) with a V1 body; returns the broker version from the response header.
 
         The version comes back in the response header and each round records it per broker; the
         V1 path is what a ``heartbeatFingerprint == 0`` body takes on
         the broker, and it stays the default here because ``use_heartbeat_v2`` is off by default.
         """
+        if timeout_millis is None:
+            timeout_millis = self.mq_client_api_timeout
         request = RemotingCommand.create_request_command(RequestCode.HEART_BEAT, None)
         request.body = heartbeat_data.encode()
         response = self._invoke_sync(addr, request, timeout_millis)
@@ -1432,7 +1459,7 @@ class MQClientInstance:
         return response.version or 0
 
     def send_heartbeat_v2(self, addr: str, heartbeat_data: HeartbeatData,
-                          timeout_millis: int = 5000) -> HeartbeatV2Result:
+                          timeout_millis: Optional[int] = None) -> HeartbeatV2Result:
         """The V2 heartbeat RPC: the same HEART_BEAT(34) frame, V2 body.
 
         Nothing about the frame changes -- the body carries ``heartbeatFingerprint`` (non-zero) and
@@ -1441,6 +1468,8 @@ class MQClientInstance:
         ignores the two extra fields (it registers the full subscription set as before) and sends no
         extFields back, which parses here as ``support_v2=False``.
         """
+        if timeout_millis is None:
+            timeout_millis = self.mq_client_api_timeout
         request = RemotingCommand.create_request_command(RequestCode.HEART_BEAT, None)
         request.body = heartbeat_data.encode()
         response = self._invoke_sync(addr, request, timeout_millis)
@@ -1448,13 +1477,81 @@ class MQClientInstance:
         return HeartbeatV2Result.from_response(response.version or 0, response.ext_fields)
 
     def send_heartbeat_to_broker_v2(self, addr: str, heartbeat_data: HeartbeatData,
-                                   owner: str = "", timeout_millis: int = 5000) -> int:
+                                   owner: str = "",
+                                   timeout_millis: Optional[int] = None) -> int:
         """Send one heartbeat through the V2 path (see ``client/heartbeat_v2.py``).
 
         ``owner`` names the heartbeat stream (a facade's group), because this port sends one
         heartbeat per facade rather than one aggregated heartbeat per client instance.
         """
+        if timeout_millis is None:
+            timeout_millis = self.mq_client_api_timeout
         return self._heartbeat_v2.send_to_broker(owner, addr, heartbeat_data, timeout_millis)
+
+    def _heartbeat_broker_addrs(self, consumer_data_present: bool) -> List[str]:
+        addrs: List[str] = []
+        with self.topic_route_lock:
+            table = {name: dict(ids) for name, ids in self.broker_addr_table.items()}
+        for ids in table.values():
+            for broker_id, addr in ids.items():
+                if not consumer_data_present and broker_id != MixAll.MASTER_ID:
+                    continue
+                if addr and addr not in addrs:
+                    addrs.append(addr)
+        return addrs
+
+    def send_heartbeat_concurrently(self, heartbeat_data: HeartbeatData,
+                                    timeout_millis: Optional[int] = None) -> int:
+        """Send one heartbeat per broker in parallel and wait for every result.
+
+        Guards: an empty heartbeat body sends nothing, and a body without consumer data only
+        reaches masters (slaves do not keep consumer registrations).
+        """
+        if not heartbeat_data.producer_data_set and not heartbeat_data.consumer_data_set:
+            logger.warning("heartbeat skipped: the body contains neither producer nor consumer data")
+            return 0
+        if not self.broker_addr_table:
+            return 0
+        addrs = self._heartbeat_broker_addrs(bool(heartbeat_data.consumer_data_set))
+        if not addrs:
+            return 0
+        if timeout_millis is None:
+            timeout_millis = self.mq_client_api_timeout
+        executor = self._heartbeat_executor
+        if executor is None:
+            logger.warning("concurrent heartbeat is enabled but no worker pool exists; sending sequentially")
+            ok = 0
+            for addr in addrs:
+                try:
+                    self.send_heartbeat(addr, heartbeat_data, timeout_millis)
+                    ok += 1
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("heartbeat to %s failed: %s", addr, e)
+            return ok
+        latch = threading.Semaphore(0)
+        result_lock = threading.Lock()
+        ok = [0]
+
+        def _send(addr: str) -> None:
+            try:
+                self.send_heartbeat(addr, heartbeat_data, timeout_millis)
+                with result_lock:
+                    ok[0] += 1
+            except Exception as e:  # noqa: BLE001
+                logger.warning("heartbeat to %s failed: %s", addr, e)
+            finally:
+                latch.release()
+
+        for addr in addrs:
+            try:
+                executor.submit(_send, addr)
+            except RuntimeError as e:
+                # A rejected task still owns one latch permit, otherwise the wait below never ends.
+                logger.warning("heartbeat task for %s rejected: %s", addr, e)
+                latch.release()
+        for _ in addrs:
+            latch.acquire()
+        return ok[0]
 
     def reset_heartbeat_v2_fingerprint_table(self, owner: Optional[str] = None) -> None:
         """Drop the remembered fingerprints of one stream or of every stream.
@@ -1464,8 +1561,10 @@ class MQClientInstance:
         self._heartbeat_v2.reset_fingerprint_table(owner)
 
     def unregister_client(self, addr: str, client_id: str, producer_group: str,
-                          consumer_group: str, timeout_millis: int = 3000) -> None:
+                          consumer_group: str, timeout_millis: Optional[int] = None) -> None:
         pass
+        if timeout_millis is None:
+            timeout_millis = self.mq_client_api_timeout
         from remoting.protocol.headers import UnregisterClientRequestHeader
         header = UnregisterClientRequestHeader()
         header.client_id = client_id
@@ -1477,8 +1576,10 @@ class MQClientInstance:
 
     def check_client_config(self, broker_addr: str, consumer_group: str, client_id: str,
                             subscription_data: SubscriptionData,
-                            timeout_millis: int = 3000) -> None:
+                            timeout_millis: Optional[int] = None) -> None:
         pass
+        if timeout_millis is None:
+            timeout_millis = self.mq_client_api_timeout
         request = RemotingCommand.create_request_command(RequestCode.CHECK_CLIENT_CONFIG, None)
         body = CheckClientRequestBody()
         body.client_id = client_id
@@ -1674,8 +1775,10 @@ class MQClientInstance:
         return addrs
 
     def get_consumer_id_list_by_group(self, topic: str, consumer_group: str,
-                                      timeout_millis: int = 5000) -> Optional[List[str]]:
+                                      timeout_millis: Optional[int] = None) -> Optional[List[str]]:
         pass
+        if timeout_millis is None:
+            timeout_millis = self.mq_client_api_timeout
         try:
             addr = self._broker_addr_for_topic(topic)
         except MQClientException as e:
@@ -1704,8 +1807,11 @@ class MQClientInstance:
         return list(body.consumer_id_list)
 
     def unregister_client_all_brokers(self, client_id: str, producer_group: str,
-                                      consumer_group: str, timeout_millis: int = 3000) -> None:
+                                      consumer_group: str,
+                                      timeout_millis: Optional[int] = None) -> None:
         pass
+        if timeout_millis is None:
+            timeout_millis = self.mq_client_api_timeout
         for addr in self.get_all_broker_addrs():
             try:
                 self.unregister_client(addr, client_id, producer_group, consumer_group,

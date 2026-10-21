@@ -207,6 +207,9 @@ class MQClientInstance
     /** Registration refresh (heartbeat) period: 30000ms. */
     public const HEARTBEAT_INTERVAL_MILLIS = 30_000;
 
+    /** Default timeout of the internal client-to-broker/name-server API calls, 3000ms. */
+    public const DEFAULT_MQ_CLIENT_API_TIMEOUT_MILLIS = 3000;
+
     public const QUERY_ASSIGNMENT_TIMEOUT_MILLIS = 3000;
 
     public const POP_ASSIGNMENT_INTERVAL_MILLIS = 20_000;
@@ -248,6 +251,34 @@ class MQClientInstance
      * still holds that fingerprint, sends it the subscription-free body instead.
      */
     public bool $useHeartbeatV2 = false;
+
+    /**
+     * Decode-read-body switch (default true). When off, a PULL / LITE_PULL / POP response is still
+     * walked frame by frame (the decoder cursor advances normally), but each message's body bytes
+     * are skipped without being copied, CRC-checked or decompressed: the returned messages are
+     * header-only, with their queue offsets and properties intact.
+     */
+    public bool $decodeReadBody = true;
+
+    /**
+     * Timeout (milliseconds) of the internal API calls this instance issues on its own behalf:
+     * heartbeat V1/V2, CHECK_CLIENT_CONFIG, route fetches from the name server, UNREGISTER_CLIENT
+     * and GET_CONSUMER_LIST_BY_GROUP. It is the fallback only -- an explicit per-call timeout
+     * always wins.
+     */
+    public int $mqClientApiTimeout = self::DEFAULT_MQ_CLIENT_API_TIMEOUT_MILLIS;
+
+    /**
+     * Concurrent heartbeat dispatch (default false). On (and with the fingerprint path off), one
+     * round fans one HEART_BEAT per broker out over the pool created by start() and waits for
+     * every task. The fingerprint path wins when both switches are on.
+     */
+    public bool $enableConcurrentHeartbeat = false;
+
+    /** Worker count of the concurrent heartbeat pool, default = available processors. */
+    public int $concurrentHeartbeatThreadPoolSize;
+
+    private ?ConsumeExecutor $heartbeatExecutor = null;
 
     /** @var array<string, true> broker addresses that answered IS_SUPPORT_HEART_BEAT_V2 at least once */
     private array $supportV2BrokerAddrs = [];
@@ -348,6 +379,10 @@ class MQClientInstance
         bool $useHeartbeatV2 = false,
         ?SocksProxyConfig $socksProxy = null,
         int $heartbeatIntervalMillis = self::HEARTBEAT_INTERVAL_MILLIS,
+        bool $decodeReadBody = true,
+        int $mqClientApiTimeout = self::DEFAULT_MQ_CLIENT_API_TIMEOUT_MILLIS,
+        bool $enableConcurrentHeartbeat = false,
+        ?int $concurrentHeartbeatThreadPoolSize = null,
     ) {
         $this->clientId = $clientId;
         $this->nameServerAddrs = array_values($nameServerAddrs);
@@ -357,6 +392,15 @@ class MQClientInstance
             : self::HEARTBEAT_INTERVAL_MILLIS;
         $this->vipChannelEnabled = $vipChannelEnabled;
         $this->useHeartbeatV2 = $useHeartbeatV2;
+        $this->decodeReadBody = $decodeReadBody;
+        $this->mqClientApiTimeout = $mqClientApiTimeout > 0
+            ? $mqClientApiTimeout
+            : self::DEFAULT_MQ_CLIENT_API_TIMEOUT_MILLIS;
+        $this->enableConcurrentHeartbeat = $enableConcurrentHeartbeat;
+        $this->concurrentHeartbeatThreadPoolSize = $concurrentHeartbeatThreadPoolSize !== null
+            && $concurrentHeartbeatThreadPoolSize > 0
+            ? $concurrentHeartbeatThreadPoolSize
+            : self::availableProcessors();
         $this->namespaceV2 = $namespaceV2;
         $this->remotingClient = new RemotingClient($connectTimeoutMillis, $invokeTimeoutMillis, $tlsEnable, tlsOptions: $tlsOptions, socksProxy: $socksProxy);
         $this->remotingClient->registerRpcHook(new NamespaceRpcHook(\Closure::fromCallable([$this, 'namespaceV2Value'])));
@@ -427,6 +471,71 @@ class MQClientInstance
         return $this->namespaceV2;
     }
 
+    // ---------------- Configuration setters ----------------
+
+    /** Gate body materialisation of PULL / LITE_PULL / POP responses (takes effect on the next decode). */
+    public function setDecodeReadBody(bool $decodeReadBody): void
+    {
+        $this->decodeReadBody = $decodeReadBody;
+    }
+
+    public function isDecodeReadBody(): bool
+    {
+        return $this->decodeReadBody;
+    }
+
+    /** Fallback timeout of the internal API calls; an explicit per-call timeout still wins. */
+    public function setMqClientApiTimeout(int $timeoutMillis): void
+    {
+        $this->mqClientApiTimeout = $timeoutMillis;
+    }
+
+    public function getMqClientApiTimeout(): int
+    {
+        return $this->mqClientApiTimeout;
+    }
+
+    public function setEnableConcurrentHeartbeat(bool $enable): void
+    {
+        $this->enableConcurrentHeartbeat = $enable;
+    }
+
+    public function isEnableConcurrentHeartbeat(): bool
+    {
+        return $this->enableConcurrentHeartbeat;
+    }
+
+    /** Resize the concurrently dispatching heartbeat pool when it already exists. */
+    public function setConcurrentHeartbeatThreadPoolSize(int $size): void
+    {
+        $this->concurrentHeartbeatThreadPoolSize = $size > 0 ? $size : self::availableProcessors();
+        $this->heartbeatExecutor?->setCorePoolSize($this->concurrentHeartbeatThreadPoolSize);
+    }
+
+    public function getConcurrentHeartbeatThreadPoolSize(): int
+    {
+        return $this->concurrentHeartbeatThreadPoolSize;
+    }
+
+    /** The worker count of the live heartbeat pool (0 before start()); for observation. */
+    public function heartbeatExecutorSize(): int
+    {
+        return $this->heartbeatExecutor?->getCorePoolSize() ?? 0;
+    }
+
+    /**
+     * The PHP stand-in for the runtime's available-processor count: PHP exposes no core count, so
+     * the same 4-core stand-in the send executors use applies (RMQ_CPU_CORES overrides it).
+     */
+    public static function availableProcessors(): int
+    {
+        $raw = getenv('RMQ_CPU_CORES');
+        if ($raw !== false && (int) $raw > 0) {
+            return (int) $raw;
+        }
+        return 4;
+    }
+
     // ---------------- Time ----------------
 
     public function currentTimeMillis(): int
@@ -455,6 +564,17 @@ class MQClientInstance
     {
         $this->started = true;
         $this->consumerStatsManager->start();
+        // The concurrent-heartbeat pool is part of the started instance: one worker per configured
+        // slot, created once here and reused by every round until shutdown().
+        if ($this->heartbeatExecutor === null) {
+            $this->heartbeatExecutor = new ConsumeExecutor(
+                $this->concurrentHeartbeatThreadPoolSize,
+                $this->concurrentHeartbeatThreadPoolSize,
+                0.0,
+                'client-heartbeat',
+                0,
+            );
+        }
 
         $dynamicNs = $this->nameServerAddrs === []
             && $this->topAddressing->wsAddr !== '';
@@ -505,6 +625,8 @@ class MQClientInstance
         $this->pendingActions = [];
         $this->heartbeatNextRunMillis = null;
         $this->brokersBeaten = [];
+        $this->heartbeatExecutor?->shutdown(true);
+        $this->heartbeatExecutor = null;
         $this->consumerStatsManager->shutdown();
         $this->remotingClient->shutdown();
     }
@@ -743,27 +865,35 @@ class MQClientInstance
      *
      * A client that has registered nothing sends nothing: an empty HeartbeatData re-registers
      * neither a producer group nor a consumer group, so beating with one only spends the
-     * round trip.
+     * round trip. The timeout falls back to this instance's mqClientApiTimeout; an explicit
+     * argument still wins. Returns the number of brokers that accepted the beat.
      */
-    public function heartbeatOnce(int $timeoutMillis = 5000): void
+    public function heartbeatOnce(?int $timeoutMillis = null): int
     {
-        $this->heartbeatRound(false, $timeoutMillis);
+        return $this->heartbeatRound(false, $timeoutMillis);
     }
 
     /**
      * Round that follows a queue-allocation change: the remembered fingerprints are dropped
      * first, so every broker is handed the subscriptions again instead of the cheap body.
      */
-    public function heartbeatOnceAfterRebalance(int $timeoutMillis = 5000): void
+    public function heartbeatOnceAfterRebalance(?int $timeoutMillis = null): int
     {
-        $this->heartbeatRound(true, $timeoutMillis);
+        return $this->heartbeatRound(true, $timeoutMillis);
     }
 
-    private function heartbeatRound(bool $isRebalance, int $timeoutMillis): void
+    private function heartbeatRound(bool $isRebalance, ?int $timeoutMillis): int
     {
+        $timeoutMillis ??= $this->mqClientApiTimeout;
         $data = $this->buildHeartbeatData();
         if ($data->producerDataSet === [] && $data->consumerDataSet === []) {
-            return;
+            return 0;
+        }
+        // A slave holds no consumer registrations: when the body has no consumer half there is
+        // nothing for it to learn, so the round only reaches masters.
+        $targets = $this->heartbeatTargetAddrs($data->consumerDataSet === []);
+        if ($targets === []) {
+            return 0;
         }
         $fingerprint = 0;
         $withoutSub = null;
@@ -778,31 +908,144 @@ class MQClientInstance
                 $this->resetBrokerAddrHeartbeatFingerprint();
             }
         }
-        $addrs = $this->getAllBrokerAddrs();
+        // Dispatch order: the fingerprint path wins, then the concurrent pool, then the serial loop.
+        if ($withoutSub !== null) {
+            $ok = $this->sendHeartbeatRoundSeriallyV2($targets, $data, $withoutSub, $fingerprint, $timeoutMillis);
+        } elseif ($this->enableConcurrentHeartbeat) {
+            $ok = $this->sendHeartbeatRoundConcurrently($targets, $data, $timeoutMillis);
+        } else {
+            $ok = $this->sendHeartbeatRoundSerially($targets, $data, $timeoutMillis);
+        }
+        if ($ok > 0) {
+            $this->heartbeatCount++;
+        }
+        // Only a round that reached every target counts as done: a broker that is briefly
+        // unreachable keeps being retried by the next pump instead of being remembered as beaten.
+        if ($ok > 0 && $ok === count($targets)) {
+            $sorted = $targets;
+            sort($sorted);
+            $this->brokersBeaten = $sorted;
+        }
+        return $ok;
+    }
+
+    /**
+     * Addresses one round must reach.
+     *
+     * The broker address table is the source of truth (it carries the broker ids); the topic
+     * routes are only a fallback for an instance whose address table has not been filled yet.
+     * A body without consumer data is addressed to masters only.
+     *
+     * @return list<string>
+     */
+    private function heartbeatTargetAddrs(bool $consumerEmpty): array
+    {
+        if ($this->brokerAddrTable === []) {
+            return $this->getAllBrokerAddrs();
+        }
+        $addrs = [];
+        foreach ($this->brokerAddrTable as $brokerAddrs) {
+            foreach ($brokerAddrs as $id => $addr) {
+                if ($addr === null || $addr === '') {
+                    continue;
+                }
+                if ($consumerEmpty && (int) $id !== MixAll::MASTER_ID) {
+                    continue;
+                }
+                if (!in_array($addr, $addrs, true)) {
+                    $addrs[] = $addr;
+                }
+            }
+        }
+        return $addrs;
+    }
+
+    /**
+     * @param list<string> $addrs
+     */
+    private function sendHeartbeatRoundSerially(array $addrs, HeartbeatData $data, int $timeoutMillis): int
+    {
         $ok = 0;
         foreach ($addrs as $addr) {
             try {
-                if ($withoutSub === null) {
-                    $this->sendHeartbeat($addr, $data, $timeoutMillis);
-                } else {
-                    $this->sendHeartbeatV2($addr, $data, $withoutSub, $fingerprint, $timeoutMillis);
-                }
+                $this->sendHeartbeat($addr, $data, $timeoutMillis);
                 $ok++;
             } catch (\Throwable $e) {
                 Logger::debug(sprintf('heartbeatOnce failed, addr=%s: %s', $addr, $e->getMessage()));
             }
         }
-        if ($ok > 0) {
-            $this->heartbeatCount++;
+        return $ok;
+    }
+
+    /**
+     * @param list<string> $addrs
+     */
+    private function sendHeartbeatRoundSeriallyV2(
+        array $addrs,
+        HeartbeatData $withSub,
+        HeartbeatData $withoutSub,
+        int $fingerprint,
+        int $timeoutMillis,
+    ): int {
+        $ok = 0;
+        foreach ($addrs as $addr) {
+            try {
+                $this->sendHeartbeatV2($addr, $withSub, $withoutSub, $fingerprint, $timeoutMillis);
+                $ok++;
+            } catch (\Throwable $e) {
+                Logger::debug(sprintf('heartbeatOnce failed, addr=%s: %s', $addr, $e->getMessage()));
+            }
         }
-        // Only a round that reached every known broker counts as done: a broker that is
-        // briefly unreachable keeps being retried by the next pump instead of being
-        // remembered as beaten.
-        if ($ok > 0 && $ok === count($addrs)) {
-            $sorted = $addrs;
-            sort($sorted);
-            $this->brokersBeaten = $sorted;
+        return $ok;
+    }
+
+    /**
+     * One task per broker on the pool created by start(); the round returns only after every
+     * submitted task has run. A rejected submission still counts its slot down, otherwise the
+     * wait would never finish; a failed beat counts as a failed broker, not a failed round.
+     *
+     * @param list<string> $addrs
+     */
+    private function sendHeartbeatRoundConcurrently(array $addrs, HeartbeatData $data, int $timeoutMillis): int
+    {
+        $pool = $this->heartbeatExecutor;
+        if ($pool === null) {
+            // An instance driven before start() still gets a pool, so the switch behaves the same.
+            $pool = new ConsumeExecutor(
+                $this->concurrentHeartbeatThreadPoolSize,
+                $this->concurrentHeartbeatThreadPoolSize,
+                0.0,
+                'client-heartbeat',
+                0,
+            );
+            $this->heartbeatExecutor = $pool;
         }
+        $ok = 0;
+        $pending = 0;
+        foreach ($addrs as $addr) {
+            $pending++;
+            try {
+                $pool->submit(function () use ($addr, $data, $timeoutMillis, &$ok, &$pending): void {
+                    try {
+                        $this->sendHeartbeat($addr, $data, $timeoutMillis);
+                        $ok++;
+                    } catch (\Throwable $e) {
+                        Logger::debug(sprintf('heartbeatOnce failed, addr=%s: %s', $addr, $e->getMessage()));
+                    } finally {
+                        $pending--;
+                    }
+                });
+            } catch (RejectedExecutionError $e) {
+                // Nothing was queued, so nothing will count this slot down later: do it here or
+                // the wait below never returns.
+                Logger::warning(sprintf('heartbeat submission rejected for %s: %s', $addr, $e->getMessage()));
+                $pending--;
+            }
+        }
+        // Cooperative "wait": PHP has one thread, so draining the pool is waiting for the tasks.
+        while ($pending > 0 && $pool->pumpOnce()) {
+        }
+        return $ok;
     }
 
     /**
@@ -812,7 +1055,7 @@ class MQClientInstance
      * that has not fetched any route lands nowhere; without this hook the group would wait
      * for the next 30s round to register with a broker that joined in between.
      */
-    public function heartbeatIfBrokerSetChanged(int $timeoutMillis = 5000): void
+    public function heartbeatIfBrokerSetChanged(?int $timeoutMillis = null): void
     {
         $addrs = $this->getAllBrokerAddrs();
         if ($addrs === []) {
@@ -975,7 +1218,7 @@ class MQClientInstance
      * ``continue`` (protocol-wise the whole round of validation ends here); when no route is
      * found, that subscription is skipped.
      */
-    public function checkClientInBroker(): void
+    public function checkClientInBroker(?int $timeoutMillis = null): void
     {
         foreach ($this->consumerTable as $group => $consumer) {
             $subs = $consumer !== null ? $consumer->subscriptions() : null;
@@ -983,14 +1226,14 @@ class MQClientInstance
                 // return, not continue: the subscriptions of later consumers are no longer validated.
                 return;
             }
-            $this->checkSubscriptionsInBroker($group, $subs);
+            $this->checkSubscriptionsInBroker($group, $subs, $timeoutMillis);
         }
     }
 
     /**
      * @param iterable<SubscriptionData> $subs
      */
-    public function checkSubscriptionsInBroker(string $group, iterable $subs): void
+    public function checkSubscriptionsInBroker(string $group, iterable $subs, ?int $timeoutMillis = null): void
     {
         foreach ($subs as $sub) {
             // null / "" / "TAG" all count as TAG expressions and are skipped uniformly (the broker side needs no validation).
@@ -1006,7 +1249,7 @@ class MQClientInstance
                 continue;
             }
             try {
-                $this->checkClientConfig($addr, $group, $this->clientId, $sub);
+                $this->checkClientConfig($addr, $group, $this->clientId, $sub, $timeoutMillis);
             } catch (MQClientException $e) {
                 throw $e;
             } catch (\Throwable $e) {
@@ -1227,7 +1470,7 @@ class MQClientInstance
      * fall back to TBW102 to synthesize publish info for a new topic when the real route
      * cannot be fetched.
      */
-    public function updateTopicRouteInfoFromNameServer(string $topic, int $timeoutMillis = 5000, bool $isDefault = false): bool
+    public function updateTopicRouteInfoFromNameServer(string $topic, ?int $timeoutMillis = null, bool $isDefault = false): bool
     {
         if ($this->nameServerAddrs === []) {
             // This port throws when the route cannot be fetched; here the 10004 (no name server) code is carried directly.
@@ -1236,6 +1479,9 @@ class MQClientInstance
                 ClientErrorCode::NO_NAME_SERVER_EXCEPTION,
             );
         }
+        // An explicit per-call timeout wins; otherwise the configured internal-API timeout applies
+        // to both the per-topic fetch and the default-topic fallback below.
+        $timeoutMillis ??= $this->mqClientApiTimeout;
 
         $fetch = function (string $t) use ($timeoutMillis): ?TopicRouteData {
             $request = RemotingCommand::createRequestCommand(RequestCode::GET_ROUTEINFO_BY_TOPIC, null);
@@ -1303,7 +1549,7 @@ class MQClientInstance
         if ($info !== null && $info->ok()) {
             return $info;
         }
-        $this->updateTopicRouteInfoFromNameServer($topic, 5000, $isDefault);
+        $this->updateTopicRouteInfoFromNameServer($topic, isDefault: $isDefault);
         $info = $this->topicPublishInfoTable[$topic] ?? null;
         if ($info === null || !$info->ok()) {
             throw new MQClientException(sprintf('Can not find Message Queue for topic: %s', $topic));
@@ -1846,7 +2092,9 @@ class MQClientInstance
         $respHeader->fromExtFields($response->extFields);
         $found = [];
         if ($response->body !== null && $response->body !== '') {
-            $found = MessageDecoder::decodeMessages($response->body);
+            // The body switch is read at decode time: off still walks every frame (cursor advances,
+            // queue offsets and properties survive) but leaves each message body null.
+            $found = MessageDecoder::decodeMessages($response->body, $this->decodeReadBody);
             foreach ($found as $m) {
                 $m->brokerName = $mq->brokerName;
                 $m->queueId = $mq->queueId;
@@ -2123,7 +2371,9 @@ class MQClientInstance
         /** @var list<MessageExt> $found */
         $found = [];
         if ($status === PopStatus::FOUND && $response->body !== null && $response->body !== '') {
-            $found = MessageDecoder::decodeMessages($response->body);
+            // Same decode-read-body contract as the pull path: with the switch off the POP frame is
+            // walked to the end, messages keep their offsets/properties, bodies stay null.
+            $found = MessageDecoder::decodeMessages($response->body, $this->decodeReadBody);
             // Reverse-construct POP_CK before rewriting the topic (retryFlag is derived from the message's original topic).
             $this->stampPopCk($found, $brokerName, $respHeader);
         }
@@ -2716,11 +2966,11 @@ class MQClientInstance
 
     // ---------------- Heartbeat / unregister ----------------
 
-    public function sendHeartbeat(string $addr, HeartbeatData $heartbeatData, int $timeoutMillis = 5000): void
+    public function sendHeartbeat(string $addr, HeartbeatData $heartbeatData, ?int $timeoutMillis = null): void
     {
         $request = RemotingCommand::createRequestCommand(RequestCode::HEART_BEAT, null);
         $request->body = $heartbeatData->encode();
-        $response = $this->invokeSync($addr, $request, $timeoutMillis);
+        $response = $this->invokeSync($addr, $request, $timeoutMillis ?? $this->mqClientApiTimeout);
         $this->checkResponse($response);
     }
 
@@ -2740,13 +2990,13 @@ class MQClientInstance
         HeartbeatData $withSub,
         HeartbeatData $withoutSub,
         int $fingerprint,
-        int $timeoutMillis = 5000,
+        ?int $timeoutMillis = null,
     ): HeartbeatV2Result {
         $simple = isset($this->supportV2BrokerAddrs[$addr])
             && ($this->brokerAddrHeartbeatFingerprint[$addr] ?? null) === $fingerprint;
         $request = RemotingCommand::createRequestCommand(RequestCode::HEART_BEAT, null);
         $request->body = ($simple ? $withoutSub : $withSub)->encode();
-        $response = $this->invokeSync($addr, $request, $timeoutMillis);
+        $response = $this->invokeSync($addr, $request, $timeoutMillis ?? $this->mqClientApiTimeout);
         $this->checkResponse($response);
         $result = HeartbeatV2Result::fromResponse($response->version, $response->extFields);
         if ($simple) {
@@ -2799,7 +3049,7 @@ class MQClientInstance
         string $clientId,
         ?string $producerGroup,
         ?string $consumerGroup,
-        int $timeoutMillis = 3000,
+        ?int $timeoutMillis = null,
     ): void {
         $header = new UnregisterClientRequestHeader();
         $header->clientId = $clientId;
@@ -2810,7 +3060,7 @@ class MQClientInstance
         $cg = trim((string) $consumerGroup);
         $header->consumerGroup = $cg !== '' ? $cg : null;
         $request = RemotingCommand::createRequestCommand(RequestCode::UNREGISTER_CLIENT, $header);
-        $response = $this->invokeSync($addr, $request, $timeoutMillis);
+        $response = $this->invokeSync($addr, $request, $timeoutMillis ?? $this->mqClientApiTimeout);
         $this->checkResponse($response);
     }
 
@@ -2822,7 +3072,7 @@ class MQClientInstance
         string $consumerGroup,
         string $clientId,
         SubscriptionData $subscriptionData,
-        int $timeoutMillis = 3000,
+        ?int $timeoutMillis = null,
     ): void {
         $request = RemotingCommand::createRequestCommand(RequestCode::CHECK_CLIENT_CONFIG, null);
         $body = new CheckClientRequestBody();
@@ -2830,7 +3080,7 @@ class MQClientInstance
         $body->group = $consumerGroup;
         $body->subscriptionData = $subscriptionData;
         $request->body = $body->encode();
-        $response = $this->invokeSync($this->vipAddrFor($brokerAddr), $request, $timeoutMillis);
+        $response = $this->invokeSync($this->vipAddrFor($brokerAddr), $request, $timeoutMillis ?? $this->mqClientApiTimeout);
         if ($response->code !== ResponseCode::SUCCESS) {
             throw new MQClientException($response->remark ?? '', $response->code);
         }
@@ -3126,7 +3376,7 @@ class MQClientInstance
      *
      * @return list<string>|null
      */
-    public function getConsumerIdListByGroup(string $topic, string $consumerGroup, int $timeoutMillis = 5000): ?array
+    public function getConsumerIdListByGroup(string $topic, string $consumerGroup, ?int $timeoutMillis = null): ?array
     {
         try {
             $addr = $this->brokerAddrForTopic($topic);
@@ -3138,7 +3388,7 @@ class MQClientInstance
         $header->consumerGroup = $consumerGroup;
         $request = RemotingCommand::createRequestCommand(RequestCode::GET_CONSUMER_LIST_BY_GROUP, $header);
         try {
-            $response = $this->invokeSync($this->vipAddrFor($addr), $request, $timeoutMillis);
+            $response = $this->invokeSync($this->vipAddrFor($addr), $request, $timeoutMillis ?? $this->mqClientApiTimeout);
         } catch (\Throwable $e) {
             Logger::debug(sprintf(
                 'get_consumer_id_list_by_group failed, %s %s: %s',
@@ -3166,7 +3416,7 @@ class MQClientInstance
         string $clientId,
         ?string $producerGroup,
         ?string $consumerGroup,
-        int $timeoutMillis = 3000,
+        ?int $timeoutMillis = null,
     ): void {
         foreach ($this->getAllBrokerAddrs() as $addr) {
             try {

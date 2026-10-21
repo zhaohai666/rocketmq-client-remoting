@@ -261,9 +261,10 @@ final class HeartbeatScheduleProbe extends MQClientInstance
 
     public int $routeCalls = 0;
 
-    public function heartbeatOnce(int $timeoutMillis = 5000): void
+    public function heartbeatOnce(?int $timeoutMillis = null): int
     {
         $this->beatCalls++;
+        return 1;
     }
 
     public function routeRefreshOnce(): void

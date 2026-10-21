@@ -6,6 +6,7 @@ namespace RocketMQ\Client;
 
 use RocketMQ\Client\Exceptions\MQBrokerException;
 use RocketMQ\Client\Exceptions\MQClientException;
+use RocketMQ\Client\Exceptions\RemotingException;
 use RocketMQ\Common\BoundaryType;
 use RocketMQ\Common\MessageDecoder;
 use RocketMQ\Common\MessageExt;
@@ -14,16 +15,32 @@ use RocketMQ\Common\MessageQueue;
 use RocketMQ\Common\MixAll;
 use RocketMQ\Common\PermName;
 use RocketMQ\Common\TopicConfig;
+use RocketMQ\Remoting\Protocol\AdminToolResult;
+use RocketMQ\Remoting\Protocol\AdminToolsResultCodeEnum;
+use RocketMQ\Remoting\Protocol\AuthAclInfo;
+use RocketMQ\Remoting\Protocol\AuthUserInfo;
+use RocketMQ\Remoting\Protocol\BrokerData;
+use RocketMQ\Remoting\Protocol\BrokerOperatorResult;
+use RocketMQ\Remoting\Protocol\BrokerReplicasInfo;
+use RocketMQ\Remoting\Protocol\CheckRocksdbCqWriteResult;
 use RocketMQ\Remoting\Protocol\ClusterInfo;
 use RocketMQ\Remoting\Protocol\ConsumeMessageDirectlyResult;
 use RocketMQ\Remoting\Protocol\ConsumeStats;
 use RocketMQ\Remoting\Protocol\ConsumeStatsList;
 use RocketMQ\Remoting\Protocol\ConsumerConnection;
 use RocketMQ\Remoting\Protocol\ConsumerRunningInfo;
+use RocketMQ\Remoting\Protocol\ExtraInfoUtil;
+use RocketMQ\Remoting\Protocol\GetBrokerLiteInfoResponseBody;
 use RocketMQ\Remoting\Protocol\GetConsumerListByGroupResponseBody;
+use RocketMQ\Remoting\Protocol\GetLiteClientInfoResponseBody;
+use RocketMQ\Remoting\Protocol\GetLiteGroupInfoResponseBody;
+use RocketMQ\Remoting\Protocol\GetLiteTopicInfoResponseBody;
+use RocketMQ\Remoting\Protocol\GetParentTopicInfoResponseBody;
 use RocketMQ\Remoting\Protocol\KVTable;
 use RocketMQ\Remoting\Protocol\LanguageCode;
+use RocketMQ\Remoting\Protocol\OffsetWrapper;
 use RocketMQ\Remoting\Protocol\ProducerConnection;
+use RocketMQ\Remoting\Protocol\QueueData;
 use RocketMQ\Remoting\Protocol\QueryConsumeQueueResponseBody;
 use RocketMQ\Remoting\Protocol\QueryConsumeTimeSpanBody;
 use RocketMQ\Remoting\Protocol\RemotingCommand;
@@ -65,8 +82,20 @@ use function RocketMQ\Remoting\Protocol\message_queue_key;
  */
 class DefaultMQAdminExt
 {
-    /** Default timeout, 5000 * 3. */
-    public const DEFAULT_TIMEOUT = 5000 * 3;
+    /** Default timeout for the administrative RPCs. */
+    public const DEFAULT_TIMEOUT = 20000;
+
+    /**
+     * Timeout the container join/leave RPCs are hard-coded to (the operation is a rare,
+     * operator-triggered config load; it does not follow the per-instance timeout).
+     */
+    public const CONTAINER_TIMEOUT = 20000;
+
+    /** Timeout of the controller-leader routed RPCs (metadata, sync state, clean). */
+    public const CONTROLLER_TIMEOUT = 3000;
+
+    /** Header field of SET_COMMITLOG_READ_MODE(2004): the only key of that request. */
+    public const READ_AHEAD_MODE = 'READ_AHEAD_MODE';
 
     /** Namespace name storing the order route config in the NameServer KV. */
     public const NAMESPACE_ORDER_TOPIC_CONFIG = 'ORDER_TOPIC_CONFIG';
@@ -128,6 +157,12 @@ class DefaultMQAdminExt
     public array $kvNamespaceToDeleteList = [];
 
     public int $timeoutMillis;
+
+    /**
+     * Page size of the metadata paging APIs (default 2000): maxTopicNum of GET_ALL_TOPIC_CONFIG
+     * and maxGroupNum of GET_ALL_SUBSCRIPTIONGROUP_CONFIG.
+     */
+    public int $maxPageSizeInGetMetadata = 2000;
 
     private ?MQClientInstance $mqClient = null;
 
@@ -240,6 +275,17 @@ class DefaultMQAdminExt
     public function setTimeoutMillis(int $timeoutMillis): void
     {
         $this->timeoutMillis = $timeoutMillis;
+    }
+
+    /** Page size of the paged metadata APIs; zero or negative values fall back to the default 2000. */
+    public function setMaxPageSizeInGetMetadata(int $size): void
+    {
+        $this->maxPageSizeInGetMetadata = $size > 0 ? $size : 2000;
+    }
+
+    public function getMaxPageSizeInGetMetadata(): int
+    {
+        return $this->maxPageSizeInGetMetadata;
     }
 
     public function start(): void
@@ -482,6 +528,32 @@ class DefaultMQAdminExt
         $this->requireClient()->deleteTopicInBroker($brokerAddr, $topic);
     }
 
+    /**
+     * Fan-out topic deletion over the caller's address set: every address is reported in
+     * exactly one of the two lists (or in neither, when the deadline cut the batch short).
+     * The envelope is always a success — the per-address outcome lives in the payload.
+     *
+     * @param list<string> $addrs
+     */
+    public function deleteTopicInBrokerConcurrent(array $addrs, string $topic): AdminToolResult
+    {
+        $successList = [];
+        $failureList = [];
+        $this->fanOutWithDeadline(array_values($addrs), function (string $addr, int $left) use ($topic, &$successList, &$failureList): void {
+            try {
+                $this->invokeBroker($addr, RequestCode::DELETE_TOPIC_IN_BROKER, ['topic' => $topic], timeoutMillis: $left);
+                $successList[] = $addr;
+            } catch (\Throwable $e) {
+                Logger::warning(sprintf('deleteTopicInBroker error. topic=%s, broker=%s: %s', $topic, $addr, $e->getMessage()));
+                $failureList[] = $addr;
+            }
+        });
+        $result = new BrokerOperatorResult();
+        $result->successList = $successList;
+        $result->failureList = $failureList;
+        return AdminToolResult::success($result);
+    }
+
     /** @param list<string>|null $addrs */
     public function deleteTopicInNameServer(?array $addrs, string $topic): void
     {
@@ -639,7 +711,7 @@ class DefaultMQAdminExt
         $client = $this->requireClient();
         $route = $client->getTopicRouteData($topic);
         if ($route === null) {
-            throw new MQClientException(sprintf('topic %s not exist', $topic));
+            throw new MQClientException(sprintf('topic %s not exist', $topic), ResponseCode::TOPIC_NOT_EXIST);
         }
         return $route;
     }
@@ -655,13 +727,75 @@ class DefaultMQAdminExt
         return TopicConfig::fromDict(is_array($obj) ? $obj : []);
     }
 
+    /**
+     * GET_ALL_TOPIC_CONFIG is a **paged** API: accumulate until topicSeq >= totalTopicNum-1.
+     *
+     * The first page always sends dataVersion as the empty string (the key is present, not
+     * omitted); later pages carry the JSON of the last dataVersion seen. A response without
+     * totalTopicNum comes from an old broker and ends the loop after its single page; a
+     * changed dataVersion discards the accumulated table and starts paging again from 0.
+     */
     public function getAllTopicConfig(string $brokerAddr, ?int $timeoutMillis = null): TopicConfigSerializeWrapper
     {
-        $response = $this->invokeBroker($brokerAddr, RequestCode::GET_ALL_TOPIC_CONFIG, timeoutMillis: $timeoutMillis);
-        if ($response->body === null || $response->body === '') {
-            return new TopicConfigSerializeWrapper();
+        $client = $this->requireClient();
+        $brokerAddr = MixAll::brokerVipChannel($this->vipChannelEnabled, $brokerAddr);
+        $timeout = $timeoutMillis ?? $this->timeoutMillis;
+        $pageSize = $this->maxPageSizeInGetMetadata > 0 ? $this->maxPageSizeInGetMetadata : 2000;
+        $currentDataVersion = null;
+        $topicSeq = 0;
+        /** @var array<string, TopicConfig> $table */
+        $table = [];
+        $begin = hrtime(true) / 1e6;
+        while (true) {
+            $left = $timeout - (int) ((hrtime(true) / 1e6) - $begin);
+            if ($left < 0) {
+                throw new MQClientException('invokeSync call timeout');
+            }
+            $request = RemotingCommand::createRequestCommand(RequestCode::GET_ALL_TOPIC_CONFIG, null);
+            $request->extFields['topicSeq'] = (string) $topicSeq;
+            $request->extFields['maxTopicNum'] = (string) $pageSize;
+            $request->extFields['dataVersion'] = $currentDataVersion === null
+                ? ''
+                : RemotingSerializable::toJson($currentDataVersion);
+            $response = $this->invokeSyncOn($client, $brokerAddr, $request, $left);
+            if ($response->code !== ResponseCode::SUCCESS) {
+                throw new MQBrokerException($response->code, $response->remark ?? '');
+            }
+            $wrapper = ($response->body !== null && $response->body !== '')
+                ? TopicConfigSerializeWrapper::decode($response->body)
+                : new TopicConfigSerializeWrapper();
+            foreach ($wrapper->topicConfigTable as $name => $cfg) {
+                $table[$name] = $cfg;
+            }
+            $newVersion = $wrapper->dataVersion;
+            if ($currentDataVersion === null) {
+                // Remember the version even when the loop breaks right below: old brokers still
+                // report it in the merged result.
+                $currentDataVersion = $newVersion;
+            }
+            $totalRaw = $response->extFields['totalTopicNum'] ?? null;
+            if ($totalRaw === null) {
+                // Old broker: everything arrived at once.
+                break;
+            }
+            $total = (int) $totalRaw;
+            if ($currentDataVersion != $newVersion) {
+                Logger::warning('topic dataVersion changed, restart paging');
+                $currentDataVersion = $newVersion;
+                $topicSeq = 0;
+                $table = [];
+                continue;
+            }
+            $topicSeq += count($wrapper->topicConfigTable);
+            if ($topicSeq >= $total - 1) {
+                break;
+            }
         }
-        return TopicConfigSerializeWrapper::decode($response->body);
+
+        $result = new TopicConfigSerializeWrapper();
+        $result->topicConfigTable = $table;
+        $result->dataVersion = $currentDataVersion ?? [];
+        return $result;
     }
 
     /** Exclude system topics and %RETRY%/%DLQ% (when specialTopic=false, retry/dead-letter queues are excluded too). */
@@ -722,13 +856,44 @@ class DefaultMQAdminExt
         return $merged;
     }
 
-    public function examineTopicStatsByBroker(string $brokerAddr, string $topic): TopicStatsTable
+    public function examineTopicStatsByBroker(string $brokerAddr, string $topic, ?int $timeoutMillis = null): TopicStatsTable
     {
-        $response = $this->invokeBroker($brokerAddr, RequestCode::GET_TOPIC_STATS_INFO, ['topic' => $topic]);
+        $response = $this->invokeBroker($brokerAddr, RequestCode::GET_TOPIC_STATS_INFO, ['topic' => $topic], timeoutMillis: $timeoutMillis);
         if ($response->body === null || $response->body === '') {
             return new TopicStatsTable();
         }
         return TopicStatsTable::decode($response->body);
+    }
+
+    /**
+     * Fan-out topic stats: one stats call per broker of the route, tables merged and the put
+     * TPS summed. A broker that fails only shrinks the merge (its error is logged, never
+     * raised); an empty route is a success carrying an empty table.
+     */
+    public function examineTopicStatsConcurrent(string $topic): AdminToolResult
+    {
+        return $this->adminToolExecute(function () use ($topic): AdminToolResult {
+            $table = new TopicStatsTable();
+            $route = $this->examineTopicRoute($topic);
+            $brokerDatas = $route->getBrokerDatas();
+            if ($brokerDatas === []) {
+                return AdminToolResult::success($table);
+            }
+            $this->fanOutWithDeadline($brokerDatas, function (BrokerData $bd, int $left) use ($topic, $table): void {
+                $addr = $bd->selectBrokerAddr();
+                if ($addr === null || $addr === '') {
+                    return;
+                }
+                try {
+                    $part = $this->examineTopicStatsByBroker($addr, $topic, $left);
+                    self::mergeMqTable($table->offsetTable, $part->offsetTable);
+                    $table->topicPutTps += $part->topicPutTps;
+                } catch (\Throwable $e) {
+                    Logger::warning(sprintf('getTopicStatsInfo error. topic=%s, broker=%s: %s', $topic, $addr, $e->getMessage()));
+                }
+            });
+            return AdminToolResult::success($table);
+        });
     }
 
     /**
@@ -824,6 +989,42 @@ class DefaultMQAdminExt
         return (int) (($response->extFields['addTopicCount'] ?? 0) ?: 0);
     }
 
+    /**
+     * ADD_BROKER(902): load a broker config file into the container at ``brokerContainerAddr``.
+     *
+     * The container address is used exactly as passed (no VIP rewrite), the request has no
+     * body and a fixed 20s timeout.
+     */
+    public function addBrokerToContainer(string $brokerContainerAddr, string $brokerConfig): void
+    {
+        $this->invokeBroker(
+            $brokerContainerAddr,
+            RequestCode::ADD_BROKER,
+            ['configPath' => $brokerConfig],
+            timeoutMillis: self::CONTAINER_TIMEOUT,
+            vip: false,
+        );
+    }
+
+    /**
+     * REMOVE_BROKER(903): drop one broker (by cluster + name + id) from the container.
+     * Same fixed timeout and plain-address routing as the join operation.
+     */
+    public function removeBrokerFromContainer(string $brokerContainerAddr, string $clusterName, string $brokerName, int $brokerId): void
+    {
+        $this->invokeBroker(
+            $brokerContainerAddr,
+            RequestCode::REMOVE_BROKER,
+            [
+                'brokerClusterName' => $clusterName,
+                'brokerName' => $brokerName,
+                'brokerId' => $brokerId,
+            ],
+            timeoutMillis: self::CONTAINER_TIMEOUT,
+            vip: false,
+        );
+    }
+
     /** Send CLEAN_UNUSED_TOPIC broker by broker; returns false if any fails. */
     public function cleanUnusedTopic(?string $clusterName = null, ?string $topic = null): bool
     {
@@ -890,6 +1091,151 @@ class DefaultMQAdminExt
         return KVTable::decode($response->body);
     }
 
+    // ---------------- Controller ----------------
+
+    /**
+     * CONTROLLER_GET_METADATA_INFO(1005): ask one controller who the leader is.
+     *
+     * Fixed 3s timeout, plain address, and the answer is the response header itself
+     * (``controllerLeaderAddress`` is the field the two-phase callers route to).
+     *
+     * @return array<string, string>
+     */
+    public function getControllerMetaData(string $controllerAddr): array
+    {
+        $response = $this->invokeBroker($controllerAddr, RequestCode::CONTROLLER_GET_METADATA_INFO, timeoutMillis: self::CONTROLLER_TIMEOUT, vip: false);
+        return $response->extFields;
+    }
+
+    /** The leader address from a metadata answer; the two-phase RPCs cannot proceed without it. */
+    private static function controllerLeaderAddress(array $meta): string
+    {
+        $leader = $meta['controllerLeaderAddress'] ?? null;
+        if ($leader === null || $leader === '') {
+            throw new MQClientException('controller leader address is missing');
+        }
+        return $leader;
+    }
+
+    /**
+     * CONTROLLER_GET_SYNC_STATE_DATA(1006), two-phase: the metadata answer names the leader,
+     * then the sync-state query goes to that leader with the broker names as the body (a raw
+     * JSON string array) and returns the per-broker replicas state.
+     *
+     * @param list<string> $brokers
+     */
+    public function getInSyncStateData(string $controllerAddress, array $brokers): BrokerReplicasInfo
+    {
+        $meta = $this->getControllerMetaData($controllerAddress);
+        $leaderAddress = self::controllerLeaderAddress($meta);
+        $response = $this->invokeBroker(
+            $leaderAddress,
+            RequestCode::CONTROLLER_GET_SYNC_STATE_DATA,
+            body: RemotingSerializable::encode(array_values($brokers)),
+            timeoutMillis: self::CONTROLLER_TIMEOUT,
+            vip: false,
+        );
+        if ($response->body === null || $response->body === '') {
+            return new BrokerReplicasInfo();
+        }
+        return BrokerReplicasInfo::decode($response->body);
+    }
+
+    /**
+     * GET_CONTROLLER_CONFIG(1010): read every controller's config (properties text).
+     *
+     * The controller list falls back to the configured name servers when the caller passes
+     * none; with no addresses at all there is nothing to ask and null is returned. The body
+     * of each answer is ``k=v`` text, not JSON.
+     *
+     * @param list<string>|null $controllerServers
+     * @return array<string, array<string, string>>|null
+     */
+    public function getControllerConfig(?array $controllerServers = null, ?int $timeoutMillis = null): ?array
+    {
+        $client = $this->requireClient();
+        $targets = ($controllerServers === null || $controllerServers === [])
+            ? array_values($client->nameServerAddrs)
+            : array_values($controllerServers);
+        if ($targets === []) {
+            return null;
+        }
+        $configMap = [];
+        foreach ($targets as $controller) {
+            try {
+                $response = $this->invokeNamesrvAddr($controller, RequestCode::GET_CONTROLLER_CONFIG, timeoutMillis: $timeoutMillis);
+            } catch (MQBrokerException $e) {
+                throw new MQClientException($e->getMessage(), $e->responseCode, $e);
+            }
+            $configMap[$controller] = MixAll::string2Properties($response->body ?? '');
+        }
+        return $configMap;
+    }
+
+    /**
+     * UPDATE_CONTROLLER_CONFIG(1009): push config entries to every controller.
+     *
+     * An empty property set (or an empty controller list) is a silent no-op; every response
+     * is collected and the LAST failure is thrown as one client exception.
+     *
+     * @param array<string, string> $properties
+     * @param list<string>|null $controllers
+     */
+    public function updateControllerConfig(array $properties, ?array $controllers = null, ?int $timeoutMillis = null): void
+    {
+        $text = MixAll::properties2String($properties);
+        if ($text === '' || $controllers === null || $controllers === []) {
+            return;
+        }
+        $client = $this->requireClient();
+        $request = RemotingCommand::createRequestCommand(RequestCode::UPDATE_CONTROLLER_CONFIG, null);
+        $request->body = $text;
+        $errResponse = null;
+        foreach (array_values($controllers) as $controller) {
+            $response = $this->invokeSyncOn($client, $controller, $request, $timeoutMillis ?? $this->timeoutMillis);
+            if ($response->code !== ResponseCode::SUCCESS) {
+                $errResponse = $response;
+            }
+        }
+        if ($errResponse !== null) {
+            throw new MQClientException(
+                ($errResponse->remark !== null && $errResponse->remark !== '')
+                    ? $errResponse->remark : 'update controller config failed',
+                $errResponse->code,
+            );
+        }
+    }
+
+    /**
+     * CLEAN_BROKER_DATA(1011): drop one broker's metadata from the controller store.
+     *
+     * Two-phase like the sync-state read: metadata first, then the leader. The header always
+     * carries ``brokerName`` plus the ``isCleanLivingBroker`` flag and the invoke timestamp;
+     * the cluster name and the controller-id set travel only when the caller supplies them.
+     */
+    public function cleanControllerBrokerData(
+        string $controllerAddr,
+        ?string $clusterName,
+        string $brokerName,
+        ?string $brokerControllerIdsToClean = null,
+        bool $isCleanLivingBroker = false,
+    ): void {
+        $meta = $this->getControllerMetaData($controllerAddr);
+        $leaderAddress = self::controllerLeaderAddress($meta);
+        $ext = [
+            'brokerName' => $brokerName,
+            'isCleanLivingBroker' => $isCleanLivingBroker ? 'true' : 'false',
+            'invokeTime' => (string) (int) floor(microtime(true) * 1000.0),
+        ];
+        if ($clusterName !== null && $clusterName !== '') {
+            $ext['clusterName'] = $clusterName;
+        }
+        if ($brokerControllerIdsToClean !== null && $brokerControllerIdsToClean !== '') {
+            $ext['brokerControllerIdsToClean'] = $brokerControllerIdsToClean;
+        }
+        $this->invokeBroker($leaderAddress, RequestCode::CLEAN_BROKER_DATA, $ext, timeoutMillis: self::CONTROLLER_TIMEOUT, vip: false);
+    }
+
     // ---------------- Subscription group management ----------------
 
     /** UPDATE_AND_CREATE_SUBSCRIPTIONGROUP: body is SubscriptionGroupConfig JSON. */
@@ -925,6 +1271,7 @@ class DefaultMQAdminExt
         $client = $this->requireClient();
         $brokerAddr = MixAll::brokerVipChannel($this->vipChannelEnabled, $brokerAddr);
         $timeout = $timeoutMillis ?? $this->timeoutMillis;
+        $pageSize = $this->maxPageSizeInGetMetadata > 0 ? $this->maxPageSizeInGetMetadata : 2000;
         $currentDataVersion = null;
         $groupSeq = 0;
         /** @var array<string, SubscriptionGroupConfig> $table */
@@ -939,11 +1286,13 @@ class DefaultMQAdminExt
             }
             $ext = [
                 'groupSeq' => (string) $groupSeq,
-                'maxGroupNum' => '10000',
+                'maxGroupNum' => (string) $pageSize,
             ];
-            if ($currentDataVersion !== null) {
-                $ext['dataVersion'] = RemotingSerializable::toJson($currentDataVersion);
-            }
+            // The key is always present; the first page carries the empty string, later pages the
+            // JSON of the last dataVersion seen (same rule as the topic paging loop).
+            $ext['dataVersion'] = $currentDataVersion === null
+                ? ''
+                : RemotingSerializable::toJson($currentDataVersion);
             $request = RemotingCommand::createRequestCommand(RequestCode::GET_ALL_SUBSCRIPTIONGROUP_CONFIG, null);
             foreach ($ext as $k => $v) {
                 $request->extFields[$k] = $v;
@@ -1070,7 +1419,7 @@ class DefaultMQAdminExt
 
     // ---------------- Consume stats ----------------
 
-    public function examineConsumeStats(string $brokerAddr, string $consumerGroup, ?string $topic = null, ?array $topicList = null): ConsumeStats
+    public function examineConsumeStats(string $brokerAddr, string $consumerGroup, ?string $topic = null, ?array $topicList = null, ?int $timeoutMillis = null): ConsumeStats
     {
         $ext = ['consumerGroup' => $consumerGroup];
         if ($topic !== null) {
@@ -1079,7 +1428,7 @@ class DefaultMQAdminExt
         if ($topicList !== null) {
             $ext['topicList'] = implode(';', $topicList);
         }
-        $response = $this->invokeBroker($brokerAddr, RequestCode::GET_CONSUME_STATS, $ext);
+        $response = $this->invokeBroker($brokerAddr, RequestCode::GET_CONSUME_STATS, $ext, timeoutMillis: $timeoutMillis);
         if ($response->body === null || $response->body === '') {
             return new ConsumeStats();
         }
@@ -1146,6 +1495,75 @@ class DefaultMQAdminExt
     }
 
     /**
+     * Fan-out consume stats: the route is looked up by the retry topic first, then the plain
+     * topic, then the pop-retry topic (first hit wins); the per-broker tables are merged and
+     * the TPS summed. An empty merged table is not a success: the group's connections are
+     * probed and the empty result is mapped to CONSUMER_NOT_ONLINE or, for a broadcasting
+     * group, to BROADCAST_CONSUMPTION.
+     */
+    public function examineConsumeStatsConcurrent(string $consumerGroup, ?string $topic = null): AdminToolResult
+    {
+        return $this->adminToolExecute(function () use ($consumerGroup, $topic): AdminToolResult {
+            $route = null;
+            $routeTopics = [MixAll::getRetryTopic($consumerGroup)];
+            if ($topic !== null) {
+                $routeTopics[] = $topic;
+                $routeTopics[] = ExtraInfoUtil::buildPopRetryTopic($topic, $consumerGroup);
+            }
+            foreach ($routeTopics as $routeTopic) {
+                try {
+                    $route = $this->examineTopicRoute($routeTopic);
+                    break;
+                } catch (\Throwable) {
+                    continue;
+                }
+            }
+            if ($route === null || $route->getBrokerDatas() === []) {
+                return AdminToolResult::failure(AdminToolsResultCodeEnum::TOPIC_ROUTE_INFO_NOT_EXIST, 'topic router info not found');
+            }
+
+            $result = new ConsumeStats();
+            $consumerTpsMap = [];
+            $this->fanOutWithDeadline($route->getBrokerDatas(), function (BrokerData $bd, int $left) use ($consumerGroup, $topic, $result, &$consumerTpsMap): void {
+                $addr = $bd->selectBrokerAddr();
+                if ($addr === null || $addr === '') {
+                    return;
+                }
+                try {
+                    $stats = $this->examineConsumeStats($addr, $consumerGroup, $topic, timeoutMillis: $left);
+                    self::mergeMqTable($result->offsetTable, $stats->offsetTable);
+                    $consumerTpsMap[$addr] = $stats->consumeTps;
+                } catch (\Throwable $e) {
+                    Logger::warning(sprintf('getConsumeStats error. topic=%s, consumerGroup=%s: %s', (string) $topic, $consumerGroup, $e->getMessage()));
+                }
+            });
+            foreach ($consumerTpsMap as $tps) {
+                $result->consumeTps += $tps;
+            }
+
+            if ($result->offsetTable === []) {
+                try {
+                    $connection = $this->examineConsumerConnectionInfo($consumerGroup);
+                } catch (\Throwable) {
+                    return AdminToolResult::failure(
+                        AdminToolsResultCodeEnum::CONSUMER_NOT_ONLINE,
+                        'Not found the consumer group consume stats, because return offset table is empty, '
+                        . 'maybe the consumer not consume any message',
+                    );
+                }
+                if ($connection->messageModel === 'BROADCASTING') {
+                    return AdminToolResult::failure(
+                        AdminToolsResultCodeEnum::BROADCAST_CONSUMPTION,
+                        'Not found the consumer group consume stats, because return offset table is empty, '
+                        . 'the consumer is under the broadcast mode',
+                    );
+                }
+            }
+            return AdminToolResult::success($result);
+        });
+    }
+
+    /**
      * Whether the group's consumerOffset on this queue has already passed this message's
      * queueOffset (offset passed => consumed).
      */
@@ -1195,63 +1613,102 @@ class DefaultMQAdminExt
         $sorted = $groups;
         sort($sorted, SORT_STRING);
         foreach ($sorted as $group) {
-            $mt = new MessageTrack(consumerGroup: $group);
+            $result[] = $this->trackMessageForGroup($msg, $group);
+        }
+        return $result;
+    }
+
+    /**
+     * The per-group verdict shared by the sequential and the fan-out message tracking:
+     * connection errors are encoded into the track (NOT_ONLINE for 206) instead of failing
+     * the whole call, and the pull / push / broadcast / filtered cases follow the group's
+     * consume type.
+     */
+    private function trackMessageForGroup(MessageExt $msg, string $group): MessageTrack
+    {
+        $mt = new MessageTrack(consumerGroup: $group);
+        try {
+            $cc = $this->examineConsumerConnectionInfo($group);
+        } catch (MQBrokerException $e) {
+            if ($e->responseCode === ResponseCode::CONSUMER_NOT_ONLINE) {
+                $mt->trackType = TrackType::NOT_ONLINE;
+            }
+            $mt->exceptionDesc = sprintf('CODE:%s DESC:%s', $e->responseCode, $e->getMessage());
+            return $mt;
+        } catch (\Throwable $e) {
+            $mt->exceptionDesc = $e->getMessage();
+            return $mt;
+        }
+
+        if ($cc->consumeType === 'CONSUME_ACTIVELY') {
+            $mt->trackType = TrackType::PULL;
+            return $mt;
+        }
+        if ($cc->consumeType === 'CONSUME_PASSIVELY') {
             try {
-                $cc = $this->examineConsumerConnectionInfo($group);
-            } catch (MQBrokerException $e) {
+                $ifConsumed = $this->consumed($msg, $group);
+            } catch (MQBrokerException|MQClientException $e) {
                 if ($e->responseCode === ResponseCode::CONSUMER_NOT_ONLINE) {
                     $mt->trackType = TrackType::NOT_ONLINE;
+                    $mt->exceptionDesc = sprintf('CODE:%s DESC:%s', $e->responseCode, $e->getMessage());
+                } elseif ($e->responseCode === ResponseCode::BROADCAST_CONSUMPTION) {
+                    $mt->trackType = TrackType::CONSUME_BROADCASTING;
                 }
-                $mt->exceptionDesc = sprintf('CODE:%s DESC:%s', $e->responseCode, $e->getMessage());
-                $result[] = $mt;
-                continue;
+                return $mt;
             } catch (\Throwable $e) {
                 $mt->exceptionDesc = $e->getMessage();
-                $result[] = $mt;
-                continue;
+                return $mt;
             }
 
-            if ($cc->consumeType === 'CONSUME_ACTIVELY') {
-                $mt->trackType = TrackType::PULL;
-            } elseif ($cc->consumeType === 'CONSUME_PASSIVELY') {
-                try {
-                    $ifConsumed = $this->consumed($msg, $group);
-                } catch (MQBrokerException|MQClientException $e) {
-                    if ($e->responseCode === ResponseCode::CONSUMER_NOT_ONLINE) {
-                        $mt->trackType = TrackType::NOT_ONLINE;
-                        $mt->exceptionDesc = sprintf('CODE:%s DESC:%s', $e->responseCode, $e->getMessage());
-                    } elseif ($e->responseCode === ResponseCode::BROADCAST_CONSUMPTION) {
-                        $mt->trackType = TrackType::CONSUME_BROADCASTING;
+            if ($ifConsumed) {
+                $mt->trackType = TrackType::CONSUMED;
+                // Also check this topic's tagsSet in the subscription table: non-empty and containing
+                // neither the message tag nor "*" => the subscription is narrower than the message,
+                // so the message is the filtered-out part (SQL92 subscriptions have an empty
+                // tagsSet and likewise fall back to CONSUMED -- the existing judgment
+                // convention, kept unchanged).
+                $sub = $cc->subscriptionTable[$msg->topic] ?? null;
+                if (is_array($sub)) {
+                    $tagsSet = array_map(strval(...), array_values((array) ($sub['tagsSet'] ?? [])));
+                    $msgTag = $msg->getTags();
+                    if ($tagsSet !== [] && !in_array('*', $tagsSet, true) && !in_array((string) $msgTag, $tagsSet, true)) {
+                        $mt->trackType = TrackType::CONSUMED_BUT_FILTERED;
                     }
-                    $result[] = $mt;
-                    continue;
-                } catch (\Throwable $e) {
-                    $mt->exceptionDesc = $e->getMessage();
-                    $result[] = $mt;
-                    continue;
                 }
-
-                if ($ifConsumed) {
-                    $mt->trackType = TrackType::CONSUMED;
-                    // Also check this topic's tagsSet in the subscription table: non-empty and containing
-                    // neither the message tag nor "*" => the subscription is narrower than the message,
-                    // so the message is the filtered-out part (SQL92 subscriptions have an empty
-                    // tagsSet and likewise fall back to CONSUMED -- the existing judgment
-                    // convention, kept unchanged).
-                    $sub = $cc->subscriptionTable[$msg->topic] ?? null;
-                    if (is_array($sub)) {
-                        $tagsSet = array_map(strval(...), array_values((array) ($sub['tagsSet'] ?? [])));
-                        $msgTag = $msg->getTags();
-                        if ($tagsSet !== [] && !in_array('*', $tagsSet, true) && !in_array((string) $msgTag, $tagsSet, true)) {
-                            $mt->trackType = TrackType::CONSUMED_BUT_FILTERED;
-                        }
-                    }
-                } else {
-                    $mt->trackType = TrackType::NOT_CONSUME_YET;
-                }
+            } else {
+                $mt->trackType = TrackType::NOT_CONSUME_YET;
             }
-            $result[] = $mt;
         }
+        return $mt;
+    }
+
+    /**
+     * Fan-out message tracking: the groups are discovered once (first broker of the topic's
+     * route answers QUERY_TOPIC_CONSUME_BY_WHO) and then every group is tracked independently.
+     *
+     * The result is the plain track list: a group whose probing fails keeps its own
+     * MessageTrack (exceptionDesc + trackType), the batch itself never fails.
+     *
+     * @return list<MessageTrack>
+     */
+    public function messageTrackDetailConcurrent(MessageExt $msg): array
+    {
+        $result = [];
+        $route = $this->examineTopicRoute($msg->topic);
+        $brokerAddr = null;
+        foreach ($route->brokerDatas as $bd) {
+            $brokerAddr = $bd->selectBrokerAddr();
+            if ($brokerAddr !== null) {
+                break;
+            }
+        }
+        if ($brokerAddr === null) {
+            return $result;
+        }
+        $groups = $this->queryTopicConsumeByWho($brokerAddr, $msg->topic);
+        $this->fanOutWithDeadline($groups, function (string $group) use ($msg, &$result): void {
+            $result[] = $this->trackMessageForGroup($msg, $group);
+        });
         return $result;
     }
 
@@ -1262,9 +1719,9 @@ class DefaultMQAdminExt
      * table (``topic@group`` keys). So an empty table is returned when the group has never
      * committed offsets; this is expected, not a bug.
      */
-    public function queryTopicsByConsumerToBroker(string $brokerAddr, string $group): TopicList
+    public function queryTopicsByConsumerToBroker(string $brokerAddr, string $group, ?int $timeoutMillis = null): TopicList
     {
-        $response = $this->invokeBroker($brokerAddr, RequestCode::QUERY_TOPICS_BY_CONSUMER, ['group' => $group]);
+        $response = $this->invokeBroker($brokerAddr, RequestCode::QUERY_TOPICS_BY_CONSUMER, ['group' => $group], timeoutMillis: $timeoutMillis);
         if ($response->body === null || $response->body === '') {
             return new TopicList();
         }
@@ -1293,6 +1750,42 @@ class DefaultMQAdminExt
             }
         }
         return $result;
+    }
+
+    /**
+     * Fan-out topic query by consumer: route by the retry topic, one QUERY_TOPICS_BY_CONSUMER
+     * per broker, results unioned (a failing broker only shrinks the union).
+     */
+    public function queryTopicsByConsumerConcurrent(string $group): AdminToolResult
+    {
+        return $this->adminToolExecute(function () use ($group): AdminToolResult {
+            // The route lookup answers null (not an error) when the retry topic has no route,
+            // so the fixed failure message below covers both the null and empty cases.
+            $route = $this->requireClient()->getTopicRouteData(MixAll::getRetryTopic($group));
+            $brokerDatas = $route?->getBrokerDatas() ?? [];
+            if ($brokerDatas === []) {
+                return AdminToolResult::failure(AdminToolsResultCodeEnum::TOPIC_ROUTE_INFO_NOT_EXIST, 'router info not found.');
+            }
+            $result = new TopicList();
+            $seen = [];
+            $this->fanOutWithDeadline($brokerDatas, function (BrokerData $bd, int $left) use ($group, $result, &$seen): void {
+                $addr = $bd->selectBrokerAddr();
+                if ($addr === null || $addr === '') {
+                    return;
+                }
+                try {
+                    foreach ($this->queryTopicsByConsumerToBroker($addr, $group, $left)->getTopicList() as $topic) {
+                        if (!isset($seen[$topic])) {
+                            $seen[$topic] = true;
+                            $result->topicList[] = $topic;
+                        }
+                    }
+                } catch (\Throwable $e) {
+                    Logger::warning(sprintf('queryTopicsByConsumer error. group=%s, broker=%s: %s', $group, $addr, $e->getMessage()));
+                }
+            });
+            return AdminToolResult::success($result);
+        });
     }
 
     public function querySubscription(string $brokerAddr, string $group, string $topic): ?array
@@ -1464,6 +1957,7 @@ class DefaultMQAdminExt
         bool $isCpp,
         ?int $queueId = null,
         ?int $offset = null,
+        ?int $timeoutMillis = null,
     ): array {
         $client = $this->requireClient();
         $request = RemotingCommand::createRequestCommand(RequestCode::INVOKE_BROKER_TO_RESET_OFFSET, null);
@@ -1491,7 +1985,7 @@ class DefaultMQAdminExt
             $request->language = LanguageCode::CPP->value;
         }
         $vipAddr = MixAll::brokerVipChannel($this->vipChannelEnabled, $brokerAddr);
-        $response = $this->invokeSyncOn($client, $vipAddr, $request, $this->timeoutMillis);
+        $response = $this->invokeSyncOn($client, $vipAddr, $request, $timeoutMillis ?? $this->timeoutMillis);
         if ($response->code !== ResponseCode::SUCCESS) {
             throw new MQClientException(
                 ($response->remark !== null && $response->remark !== '') ? $response->remark : 'reset offset failed',
@@ -1499,7 +1993,12 @@ class DefaultMQAdminExt
             );
         }
         if ($response->body === null || $response->body === '') {
-            return [];
+            // A SUCCESS without the offset table is not an empty reset: the queue table is the
+            // only payload, so its absence is reported as the response code the broker answered with.
+            throw new MQClientException(
+                ($response->remark !== null && $response->remark !== '') ? $response->remark : 'reset offset failed',
+                $response->code,
+            );
         }
         return ResetOffsetBody::decode($response->body)->offsetTable;
     }
@@ -1561,6 +2060,144 @@ class DefaultMQAdminExt
             }
             throw $e;
         }
+    }
+
+    /**
+     * Fan-out reset: one broker-side reset per broker of the topic route.
+     *
+     * A broker that answers CONSUMER_NOT_ONLINE is redone with the legacy per-queue reset;
+     * SYSTEM_ERROR usually means "the group never came online", which counts as done. The
+     * envelope only turns into a failure when at least one broker is missing from the
+     * success list — the payload still carries both address lists.
+     */
+    public function resetOffsetNewConcurrent(string $group, string $topic, int $timestamp): AdminToolResult
+    {
+        return $this->adminToolExecute(function () use ($group, $topic, $timestamp): AdminToolResult {
+            // The route lookup answers null (not an error) when the topic has no route,
+            // so the fixed failure message below covers both the null and empty cases.
+            $route = $this->requireClient()->getTopicRouteData($topic);
+            $brokerDatas = $route?->getBrokerDatas() ?? [];
+            if ($brokerDatas === []) {
+                return AdminToolResult::failure(AdminToolsResultCodeEnum::TOPIC_ROUTE_INFO_NOT_EXIST, 'topic router info not found');
+            }
+            $routeMap = [];
+            foreach ($route->queueDatas as $queueData) {
+                $routeMap[$queueData->brokerName] = $queueData;
+            }
+            $successList = [];
+            $failureList = [];
+            $this->fanOutWithDeadline($brokerDatas, function (BrokerData $bd, int $left) use ($group, $topic, $timestamp, $routeMap, &$successList, &$failureList): void {
+                $addr = $bd->selectBrokerAddr();
+                if ($addr === null || $addr === '') {
+                    return;
+                }
+                try {
+                    $this->invokeBrokerResetOffset($addr, $topic, $group, $timestamp, true, false, timeoutMillis: $left);
+                    $successList[] = $addr;
+                } catch (MQClientException $e) {
+                    if ($e->responseCode === ResponseCode::CONSUMER_NOT_ONLINE) {
+                        try {
+                            $this->resetOffsetByTimestampOldOnBroker($addr, $routeMap[$bd->brokerName] ?? null, $group, $topic, $timestamp, true);
+                            $successList[] = $addr;
+                        } catch (\Throwable $e2) {
+                            Logger::warning(sprintf('resetOffsetByTimestampOld error. addr=%s, topic=%s, group=%s, timestamp=%d: %s', $addr, $topic, $group, $timestamp, $e2->getMessage()));
+                            $failureList[] = $addr;
+                        }
+                    } elseif ($e->responseCode === ResponseCode::SYSTEM_ERROR) {
+                        // CODE: 1  DESC: the consumer group not exist, never online
+                        $successList[] = $addr;
+                    } else {
+                        $failureList[] = $addr;
+                        Logger::warning(sprintf('resetOffsetNewConcurrent error. addr=%s, topic=%s, group=%s, timestamp=%d: %s', $addr, $topic, $group, $timestamp, $e->getMessage()));
+                    }
+                } catch (\Throwable $e) {
+                    $failureList[] = $addr;
+                    Logger::warning(sprintf('resetOffsetNewConcurrent error. addr=%s, topic=%s, group=%s, timestamp=%d: %s', $addr, $topic, $group, $timestamp, $e->getMessage()));
+                }
+            });
+            $result = new BrokerOperatorResult();
+            $result->successList = $successList;
+            $result->failureList = $failureList;
+            if (count($result->successList) === count($brokerDatas)) {
+                return AdminToolResult::success($result);
+            }
+            return AdminToolResult::failure(AdminToolsResultCodeEnum::MQ_BROKER_ERROR, 'operator failure', $result);
+        });
+    }
+
+    /**
+     * The legacy reset restricted to ONE broker: queues the group actually consumed are reset
+     * from the consume-stats table; when the group never consumed here, the queue list comes
+     * from the route's queue data and the broker's own topic stats.
+     *
+     * @return list<array<string, mixed>>
+     */
+    private function resetOffsetByTimestampOldOnBroker(
+        string $brokerAddr,
+        ?QueueData $queueData,
+        string $consumerGroup,
+        string $topic,
+        int $timestamp,
+        bool $force,
+    ): array {
+        $client = $this->requireClient();
+        if ($queueData === null) {
+            throw new MQClientException(sprintf('no queue data for broker %s', $brokerAddr));
+        }
+        $stats = $this->examineConsumeStats($brokerAddr, $consumerGroup);
+        /** @var list<array<string, mixed>> $result */
+        $result = [];
+        $hasConsumed = false;
+        foreach ($stats->offsetTable as ['mq' => $mq, 'value' => $wrapper]) {
+            if ($mq->topic === $topic) {
+                $hasConsumed = true;
+                $result[] = $this->resetOffsetConsumeOffset($client, $brokerAddr, $consumerGroup, $mq, $wrapper, $timestamp, $force);
+            }
+        }
+        if (!$hasConsumed) {
+            $topicStatus = [];
+            foreach ($this->examineTopicStatsByBroker($brokerAddr, $topic)->offsetTable as ['mq' => $mq, 'value' => $to]) {
+                $topicStatus[message_queue_key($mq)] = $to;
+            }
+            for ($i = 0; $i < $queueData->readQueueNums; $i++) {
+                $mq = new MessageQueue($topic, $queueData->brokerName, $i);
+                $offset = $topicStatus[message_queue_key($mq)] ?? null;
+                $wrapper = new OffsetWrapper(
+                    $offset?->maxOffset ?? 0,
+                    $offset?->minOffset ?? 0,
+                );
+                $result[] = $this->resetOffsetConsumeOffset($client, $brokerAddr, $consumerGroup, $mq, $wrapper, $timestamp, $force);
+            }
+        }
+        return $result;
+    }
+
+    /** One queue of the legacy reset: find the offset by timestamp, write it back when forced or behind. */
+    private function resetOffsetConsumeOffset(
+        MQClientInstance $client,
+        string $brokerAddr,
+        string $consumeGroup,
+        MessageQueue $queue,
+        OffsetWrapper $offsetWrapper,
+        int $timestamp,
+        bool $force,
+    ): array {
+        if ($timestamp === -1) {
+            $resetOffset = $client->getMaxOffset($queue, timeoutMillis: $this->timeoutMillis, addr: $brokerAddr);
+        } else {
+            $resetOffset = $client->searchOffsetByTimestamp($queue, $timestamp, timeoutMillis: $this->timeoutMillis, addr: $brokerAddr);
+        }
+        if ($force || $resetOffset <= $offsetWrapper->consumerOffset) {
+            $client->updateConsumerOffset($consumeGroup, $queue, $resetOffset, timeoutMillis: $this->timeoutMillis, addr: $brokerAddr);
+        }
+        return [
+            'brokerName' => $queue->brokerName,
+            'queueId' => $queue->queueId,
+            'brokerOffset' => $offsetWrapper->brokerOffset,
+            'consumerOffset' => $offsetWrapper->consumerOffset,
+            'timestampOffset' => $resetOffset,
+            'rollbackOffset' => ($force || $resetOffset <= $offsetWrapper->consumerOffset) ? $resetOffset : $offsetWrapper->consumerOffset,
+        ];
     }
 
     /**
@@ -1796,10 +2433,15 @@ class DefaultMQAdminExt
         if ($configs === []) {
             throw new MQClientException('createAndUpdateTopicConfigList: empty topicConfigList');
         }
+        // No per-config validation here: the batch form takes the list as-is, unlike the single form.
         $body = RemotingSerializable::encode([
             'topicConfigList' => array_map(static fn(TopicConfig $c): array => $c->toDict(), $configs),
         ]);
-        $this->invokeBroker($brokerAddr, RequestCode::UPDATE_AND_CREATE_TOPIC_LIST, body: $body);
+        try {
+            $this->invokeBroker($brokerAddr, RequestCode::UPDATE_AND_CREATE_TOPIC_LIST, body: $body);
+        } catch (MQBrokerException $e) {
+            throw new MQClientException($e->getMessage(), $e->responseCode, $e);
+        }
     }
 
     public function createAndUpdateSubscriptionGroupConfigList(string $brokerAddr, array $configs): void
@@ -1810,7 +2452,11 @@ class DefaultMQAdminExt
         $body = RemotingSerializable::encode([
             'groupConfigList' => array_map(static fn(SubscriptionGroupConfig $c): array => $c->toDict(), $configs),
         ]);
-        $this->invokeBroker($brokerAddr, RequestCode::UPDATE_AND_CREATE_SUBSCRIPTIONGROUP_LIST, body: $body);
+        try {
+            $this->invokeBroker($brokerAddr, RequestCode::UPDATE_AND_CREATE_SUBSCRIPTIONGROUP_LIST, body: $body);
+        } catch (MQBrokerException $e) {
+            throw new MQClientException($e->getMessage(), $e->responseCode, $e);
+        }
     }
 
     public function createStaticTopic(string $brokerAddr, string $defaultTopic, TopicConfig $config, array $mappingDetail, bool $force = false): void
@@ -1939,6 +2585,131 @@ class DefaultMQAdminExt
         $this->invokeBroker($brokerAddr, RequestCode::CLEAN_UNUSED_TOPIC);
     }
 
+    // ---------------- Cold data flow control / commitlog read mode ----------------
+
+    /**
+     * UPDATE_COLD_DATA_FLOW_CTR_CONFIG(2001): the properties travel as ``k=v`` text in the
+     * body. An empty property set sends nothing at all — the request would only clear what
+     * the broker already has.
+     *
+     * @param array<string, string> $properties
+     */
+    public function updateColdDataFlowCtrGroupConfig(string $addr, array $properties, ?int $timeoutMillis = null): void
+    {
+        $text = MixAll::properties2String($properties);
+        if ($text === '') {
+            return;
+        }
+        $this->invokeBroker($addr, RequestCode::UPDATE_COLD_DATA_FLOW_CTR_CONFIG, body: $text, timeoutMillis: $timeoutMillis);
+    }
+
+    /**
+     * REMOVE_COLD_DATA_FLOW_CTR_CONFIG(2002): the body is the bare group name, not JSON.
+     * An empty group name sends nothing.
+     */
+    public function removeColdDataFlowCtrGroupConfig(string $addr, string $consumerGroup, ?int $timeoutMillis = null): void
+    {
+        if ($consumerGroup === '') {
+            return;
+        }
+        $this->invokeBroker($addr, RequestCode::REMOVE_COLD_DATA_FLOW_CTR_CONFIG, body: $consumerGroup, timeoutMillis: $timeoutMillis);
+    }
+
+    /**
+     * GET_COLD_DATA_FLOW_CTR_INFO(2003): the raw info text, or null when the broker answers
+     * without a body. Served on the plain port only.
+     */
+    public function getColdDataFlowCtrInfo(string $addr, ?int $timeoutMillis = null): ?string
+    {
+        $response = $this->invokeBroker($addr, RequestCode::GET_COLD_DATA_FLOW_CTR_INFO, timeoutMillis: $timeoutMillis, vip: false);
+        $body = $response->body;
+        return ($body !== null && $body !== '') ? $body : null;
+    }
+
+    /**
+     * SET_COMMITLOG_READ_MODE(2004): the header is built by hand around the single
+     * ``READ_AHEAD_MODE`` key; the answer is the response remark (no body), null when the
+     * broker sends none. Plain port.
+     */
+    public function setCommitLogReadAheadMode(string $addr, string $mode, ?int $timeoutMillis = null): ?string
+    {
+        $response = $this->invokeBroker(
+            $addr,
+            RequestCode::SET_COMMITLOG_READ_MODE,
+            [self::READ_AHEAD_MODE => $mode],
+            timeoutMillis: $timeoutMillis,
+            vip: false,
+        );
+        $remark = $response->remark;
+        return ($remark !== null && $remark !== '') ? $remark : null;
+    }
+
+    // ---------------- Pop record / RocksDB maintenance ----------------
+
+    /**
+     * POP_ROLLBACK(200056): ask the broker to dump its pop records. No header, no body,
+     * plain port. The timeout is the caller's, verbatim — this operation does not follow
+     * the admin-wide timeout.
+     */
+    public function exportPopRecords(string $brokerAddr, int $timeout): void
+    {
+        $this->invokeBroker($brokerAddr, RequestCode::POP_ROLLBACK, timeoutMillis: $timeout, vip: false);
+    }
+
+    /**
+     * CHECK_ROCKSDB_CQ_WRITE_PROGRESS(354): probe the RocksDB consume-queue write progress
+     * of one topic. Plain port; the progress check is answered with a JSON body.
+     */
+    public function checkRocksdbCqWriteProgress(string $brokerAddr, string $topic, int $checkStoreTime, ?int $timeoutMillis = null): ?CheckRocksdbCqWriteResult
+    {
+        try {
+            $response = $this->invokeBroker(
+                $brokerAddr,
+                RequestCode::CHECK_ROCKSDB_CQ_WRITE_PROGRESS,
+                ['topic' => $topic, 'checkStoreTime' => $checkStoreTime],
+                timeoutMillis: $timeoutMillis,
+                vip: false,
+            );
+        } catch (MQBrokerException $e) {
+            throw new MQClientException($e->getMessage(), $e->responseCode, $e);
+        }
+        if ($response->body === null || $response->body === '') {
+            return null;
+        }
+        return CheckRocksdbCqWriteResult::decode($response->body);
+    }
+
+    /**
+     * EXPORT_ROCKSDB_CONFIG_TO_JSON(355): ask the broker to dump config tables as JSON files.
+     * Code-only answer (no body to read). The type names travel ';'-separated, each entry
+     * followed by the separator, exactly as the header field is written.
+     *
+     * @param list<string> $configTypes
+     */
+    public function exportRocksDBConfigToJson(string $brokerAddr, array $configTypes, ?int $timeoutMillis = null): void
+    {
+        $known = ['topics', 'subscriptiongroups', 'consumeroffsets'];
+        $text = '';
+        foreach ($configTypes as $type) {
+            $name = strtolower(trim((string) $type));
+            if (!in_array($name, $known, true)) {
+                throw new MQClientException(sprintf('unknown config type: %s', $type));
+            }
+            $text .= $name . ';';
+        }
+        try {
+            $this->invokeBroker(
+                $brokerAddr,
+                RequestCode::EXPORT_ROCKSDB_CONFIG_TO_JSON,
+                ['configType' => $text],
+                timeoutMillis: $timeoutMillis,
+                vip: false,
+            );
+        } catch (MQBrokerException $e) {
+            throw new MQClientException($e->getMessage(), $e->responseCode, $e);
+        }
+    }
+
     public function queryConsumeTimeSpan(string $topic, string $group): array
     {
         $route = $this->examineTopicRoute($topic);
@@ -1958,6 +2729,40 @@ class DefaultMQAdminExt
             }
         }
         return $spans;
+    }
+
+    /**
+     * Fan-out consume time spans: one QUERY_CONSUME_TIME_SPAN per broker of the route, the
+     * per-broker span lists concatenated in route order. A route without brokers is a
+     * success carrying an empty list.
+     */
+    public function queryConsumeTimeSpanConcurrent(string $topic, string $group): AdminToolResult
+    {
+        return $this->adminToolExecute(function () use ($topic, $group): AdminToolResult {
+            $spans = [];
+            $route = $this->examineTopicRoute($topic);
+            $brokerDatas = $route->getBrokerDatas();
+            if ($brokerDatas === []) {
+                return AdminToolResult::success($spans);
+            }
+            $this->fanOutWithDeadline($brokerDatas, function (BrokerData $bd, int $left) use ($topic, $group, &$spans): void {
+                $addr = $bd->selectBrokerAddr();
+                if ($addr === null || $addr === '') {
+                    return;
+                }
+                try {
+                    $response = $this->invokeBroker($addr, RequestCode::QUERY_CONSUME_TIME_SPAN, ['topic' => $topic, 'group' => $group], timeoutMillis: $left);
+                    if ($response->body !== null && $response->body !== '') {
+                        foreach (QueryConsumeTimeSpanBody::decode($response->body)->consumeTimeSpanSet as $span) {
+                            $spans[] = $span;
+                        }
+                    }
+                } catch (\Throwable $e) {
+                    Logger::warning(sprintf('queryConsumeTimeSpan error. topic=%s, group=%s, broker=%s: %s', $topic, $group, $addr, $e->getMessage()));
+                }
+            });
+            return AdminToolResult::success($spans);
+        });
     }
 
     // ---------------- NameServer config (318/319) ----------------
@@ -2030,7 +2835,400 @@ class DefaultMQAdminExt
         $this->invokeBroker($brokerAddr, RequestCode::SET_MESSAGE_REQUEST_MODE, body: json_encode($body));
     }
 
+    // ---------------- User and access control management ----------------
+
+    /**
+     * AUTH_CREATE_USER(3001): stores a new user.
+     *
+     * Two accepted shapes: the user object as it should be stored, or the plain attributes. The
+     * attribute form leaves ``userStatus`` unset unless the caller spells it out, and an unset
+     * attribute drops its key from the body -- the broker then applies its own default instead of
+     * being told to store a null.
+     */
+    public function createUser(
+        string $brokerAddr,
+        AuthUserInfo|string $username,
+        ?string $password = null,
+        ?string $userType = null,
+        ?string $userStatus = null,
+        ?int $timeoutMillis = null,
+    ): void {
+        $user = self::userOf('createUser', $username, $password, $userType, $userStatus);
+        $this->invokeBroker(
+            $brokerAddr,
+            RequestCode::AUTH_CREATE_USER,
+            self::authExt(['username' => $user->username]),
+            body: $user->encode(),
+            timeoutMillis: $timeoutMillis,
+            vip: false,
+        );
+    }
+
+    /** AUTH_UPDATE_USER(3002): overwrites the stored attributes of an existing user. */
+    public function updateUser(
+        string $brokerAddr,
+        AuthUserInfo|string $username,
+        ?string $password = null,
+        ?string $userType = null,
+        ?string $userStatus = null,
+        ?int $timeoutMillis = null,
+    ): void {
+        $user = self::userOf('updateUser', $username, $password, $userType, $userStatus);
+        $this->invokeBroker(
+            $brokerAddr,
+            RequestCode::AUTH_UPDATE_USER,
+            self::authExt(['username' => $user->username]),
+            body: $user->encode(),
+            timeoutMillis: $timeoutMillis,
+            vip: false,
+        );
+    }
+
+    /** AUTH_DELETE_USER(3003): removes the user and everything granted to it. */
+    public function deleteUser(string $brokerAddr, string $username, ?int $timeoutMillis = null): void
+    {
+        $this->invokeBroker(
+            $brokerAddr,
+            RequestCode::AUTH_DELETE_USER,
+            self::authExt(['username' => $username]),
+            timeoutMillis: $timeoutMillis,
+            vip: false,
+        );
+    }
+
+    /** AUTH_GET_USER(3004): the stored user, or null when the body is empty. */
+    public function getUser(string $brokerAddr, string $username, ?int $timeoutMillis = null): ?AuthUserInfo
+    {
+        $response = $this->invokeBroker(
+            $brokerAddr,
+            RequestCode::AUTH_GET_USER,
+            self::authExt(['username' => $username]),
+            timeoutMillis: $timeoutMillis,
+            vip: false,
+        );
+        return AuthUserInfo::decodeOne($response->body);
+    }
+
+    /**
+     * AUTH_LIST_USER(3005): the users matching ``filter``.
+     *
+     * A filter the caller leaves out is not sent at all -- an empty string on the wire is a filter
+     * of its own, not the absence of one.
+     *
+     * @return list<AuthUserInfo>
+     */
+    public function listUser(string $brokerAddr, ?string $filter = null, ?int $timeoutMillis = null): array
+    {
+        $response = $this->invokeBroker(
+            $brokerAddr,
+            RequestCode::AUTH_LIST_USER,
+            self::authExt(['filter' => $filter]),
+            timeoutMillis: $timeoutMillis,
+            vip: false,
+        );
+        return AuthUserInfo::decodeList($response->body);
+    }
+
+    /**
+     * AUTH_CREATE_ACL(3006): stores the rules of one subject.
+     *
+     * Accepted shapes: the acl object (subject plus whatever policies it carries), or the plain
+     * attributes -- which build exactly one policy with no policy type and one entry per resource,
+     * every entry repeating the same actions, source ips and decision.
+     */
+    public function createAcl(
+        string $brokerAddr,
+        AuthAclInfo|string $subject,
+        array $resources = [],
+        array $actions = [],
+        array $sourceIps = [],
+        ?string $decision = null,
+        ?int $timeoutMillis = null,
+    ): void {
+        $acl = self::aclOf('createAcl', $subject, $resources, $actions, $sourceIps, $decision);
+        $this->invokeBroker(
+            $brokerAddr,
+            RequestCode::AUTH_CREATE_ACL,
+            self::authExt(['subject' => $acl->subject]),
+            body: $acl->encode(),
+            timeoutMillis: $timeoutMillis,
+            vip: false,
+        );
+    }
+
+    /** AUTH_UPDATE_ACL(3007): replaces the stored rules of one subject. */
+    public function updateAcl(
+        string $brokerAddr,
+        AuthAclInfo|string $subject,
+        array $resources = [],
+        array $actions = [],
+        array $sourceIps = [],
+        ?string $decision = null,
+        ?int $timeoutMillis = null,
+    ): void {
+        $acl = self::aclOf('updateAcl', $subject, $resources, $actions, $sourceIps, $decision);
+        $this->invokeBroker(
+            $brokerAddr,
+            RequestCode::AUTH_UPDATE_ACL,
+            self::authExt(['subject' => $acl->subject]),
+            body: $acl->encode(),
+            timeoutMillis: $timeoutMillis,
+            vip: false,
+        );
+    }
+
+    /**
+     * AUTH_DELETE_ACL(3008): removes one rule of a subject.
+     *
+     * This request names only the subject and the resource -- the rule to remove is identified by
+     * those two, so nothing else may travel with it: a body or an extra key would be read as a
+     * different request shape.
+     */
+    public function deleteAcl(string $brokerAddr, string $subject, ?string $resource = null, ?int $timeoutMillis = null): void
+    {
+        $this->invokeBroker(
+            $brokerAddr,
+            RequestCode::AUTH_DELETE_ACL,
+            self::authExt(['subject' => $subject, 'resource' => $resource]),
+            timeoutMillis: $timeoutMillis,
+            vip: false,
+        );
+    }
+
+    /** AUTH_GET_ACL(3009): the rules stored for one subject, or null when the body is empty. */
+    public function getAcl(string $brokerAddr, string $subject, ?int $timeoutMillis = null): ?AuthAclInfo
+    {
+        $response = $this->invokeBroker(
+            $brokerAddr,
+            RequestCode::AUTH_GET_ACL,
+            self::authExt(['subject' => $subject]),
+            timeoutMillis: $timeoutMillis,
+            vip: false,
+        );
+        return AuthAclInfo::decodeOne($response->body);
+    }
+
+    /**
+     * AUTH_LIST_ACL(3010): the stored rules matching the two filters.
+     *
+     * @return list<AuthAclInfo>
+     */
+    public function listAcl(
+        string $brokerAddr,
+        ?string $subjectFilter = null,
+        ?string $resourceFilter = null,
+        ?int $timeoutMillis = null,
+    ): array {
+        $response = $this->invokeBroker(
+            $brokerAddr,
+            RequestCode::AUTH_LIST_ACL,
+            self::authExt(['subjectFilter' => $subjectFilter, 'resourceFilter' => $resourceFilter]),
+            timeoutMillis: $timeoutMillis,
+            vip: false,
+        );
+        return AuthAclInfo::decodeList($response->body);
+    }
+
+    /**
+     * Header fields of the management requests: an unset (or empty) value gets no key, because the
+     * broker reads an empty string as a value that was deliberately supplied.
+     *
+     * @param array<string, string|null> $fields
+     * @return array<string, string>
+     */
+    private static function authExt(array $fields): array
+    {
+        $out = [];
+        foreach ($fields as $name => $value) {
+            if ($value === null || $value === '') {
+                continue;
+            }
+            $out[$name] = $value;
+        }
+        return $out;
+    }
+
+    /** @param AuthUserInfo|string $username */
+    private static function userOf(string $method, AuthUserInfo|string $username, ?string $password, ?string $userType, ?string $userStatus): AuthUserInfo
+    {
+        if ($username instanceof AuthUserInfo) {
+            if ($password !== null || $userType !== null || $userStatus !== null) {
+                throw new MQClientException(sprintf('%s: pass either a user object or the plain attributes, not both', $method));
+            }
+            return $username;
+        }
+        return new AuthUserInfo($username, $password, $userType, $userStatus);
+    }
+
+    /** @param AuthAclInfo|string $subject @param list<string> $resources @param list<string> $actions @param list<string> $sourceIps */
+    private static function aclOf(string $method, AuthAclInfo|string $subject, array $resources, array $actions, array $sourceIps, ?string $decision): AuthAclInfo
+    {
+        if ($subject instanceof AuthAclInfo) {
+            if ($resources !== [] || $actions !== [] || $sourceIps !== [] || $decision !== null) {
+                throw new MQClientException(sprintf('%s: pass either an acl object or the plain attributes, not both', $method));
+            }
+            return $subject;
+        }
+        return AuthAclInfo::forResources($subject, $resources, $actions, $sourceIps, $decision);
+    }
+
+    // ---------------- Lite admin ----------------
+
+    /**
+     * GET_BROKER_LITE_INFO(200074): the broker's lite-store footprint. No request header.
+     */
+    public function getBrokerLiteInfo(string $brokerAddr, ?int $timeoutMillis = null): ?GetBrokerLiteInfoResponseBody
+    {
+        return $this->invokeBrokerMethod($brokerAddr, RequestCode::GET_BROKER_LITE_INFO, null, GetBrokerLiteInfoResponseBody::class, $timeoutMillis);
+    }
+
+    /** GET_PARENT_TOPIC_INFO(200075): the lite layout hanging under one parent topic. */
+    public function getParentTopicInfo(string $brokerAddr, string $topic, ?int $timeoutMillis = null): ?GetParentTopicInfoResponseBody
+    {
+        return $this->invokeBrokerMethod($brokerAddr, RequestCode::GET_PARENT_TOPIC_INFO, ['topic' => $topic], GetParentTopicInfoResponseBody::class, $timeoutMillis);
+    }
+
+    /** GET_LITE_TOPIC_INFO(200076): one lite topic's state; the lite name is optional. */
+    public function getLiteTopicInfo(string $brokerAddr, string $parentTopic, ?string $liteTopic = null, ?int $timeoutMillis = null): ?GetLiteTopicInfoResponseBody
+    {
+        return $this->invokeBrokerMethod(
+            $brokerAddr,
+            RequestCode::GET_LITE_TOPIC_INFO,
+            self::nonNullExt(['parentTopic' => $parentTopic, 'liteTopic' => $liteTopic]),
+            GetLiteTopicInfoResponseBody::class,
+            $timeoutMillis,
+        );
+    }
+
+    /**
+     * GET_LITE_CLIENT_INFO(200077): one client's lite consumption state. ``maxCount`` is a
+     * primitive of the request header with a fixed default, so it always travels.
+     */
+    public function getLiteClientInfo(string $brokerAddr, string $parentTopic, string $group, ?string $clientId = null, ?int $timeoutMillis = null): ?GetLiteClientInfoResponseBody
+    {
+        return $this->invokeBrokerMethod(
+            $brokerAddr,
+            RequestCode::GET_LITE_CLIENT_INFO,
+            self::nonNullExt([
+                'parentTopic' => $parentTopic,
+                'group' => $group,
+                'clientId' => $clientId,
+                'maxCount' => 1000,
+            ]),
+            GetLiteClientInfoResponseBody::class,
+            $timeoutMillis,
+        );
+    }
+
+    /** GET_LITE_GROUP_INFO(200078): a group's lite lag picture; ``topK`` always travels. */
+    public function getLiteGroupInfo(string $brokerAddr, string $group, ?string $liteTopic = null, int $topK = 0, ?int $timeoutMillis = null): ?GetLiteGroupInfoResponseBody
+    {
+        return $this->invokeBrokerMethod(
+            $brokerAddr,
+            RequestCode::GET_LITE_GROUP_INFO,
+            self::nonNullExt([
+                'group' => $group,
+                'liteTopic' => $liteTopic,
+                'topK' => $topK,
+            ]),
+            GetLiteGroupInfoResponseBody::class,
+            $timeoutMillis,
+        );
+    }
+
+    /** TRIGGER_LITE_DISPATCH(200079): nudge the broker to dispatch one group's lite topics. */
+    public function triggerLiteDispatch(string $brokerAddr, string $group, ?string $clientId = null, ?int $timeoutMillis = null): void
+    {
+        $this->invokeBrokerMethod(
+            $brokerAddr,
+            RequestCode::TRIGGER_LITE_DISPATCH,
+            self::nonNullExt(['group' => $group, 'clientId' => $clientId]),
+            null,
+            $timeoutMillis,
+        );
+    }
+
     // ---------------------------------------------------------------- Helpers
+
+    /**
+     * The one exit point the lite admin queries share: VIP routing, SUCCESS-only, and a
+     * body-less SUCCESS is a null result rather than an error. A non-SUCCESS answer is a
+     * broker exception carrying the response code and remark.
+     *
+     * @param array<string, string|int|null>|null $extFields
+     * @param class-string<\RocketMQ\Remoting\Protocol\RemotingSerializable>|null $responseClass
+     */
+    private function invokeBrokerMethod(string $addr, int $requestCode, ?array $extFields, ?string $responseClass, ?int $timeoutMillis = null): ?object
+    {
+        $client = $this->requireClient();
+        $addr = MixAll::brokerVipChannel($this->vipChannelEnabled, $addr);
+        $request = RemotingCommand::createRequestCommand($requestCode, null);
+        self::applyExtFields($request, $extFields);
+        $response = $this->invokeSyncOn($client, $addr, $request, $timeoutMillis ?? $this->timeoutMillis);
+        if ($response->code === ResponseCode::SUCCESS) {
+            if ($response->body !== null && $response->body !== '' && $responseClass !== null) {
+                return $responseClass::decode($response->body);
+            }
+            return null;
+        }
+        throw new MQBrokerException($response->code, $response->remark ?? '');
+    }
+
+    /**
+     * Wraps one batch operation into the AdminToolResult envelope: remoting-level failures
+     * map to REMOTING_ERROR, a client exception naming a missing topic route maps to
+     * TOPIC_ROUTE_INFO_NOT_EXIST, everything else to MQ_BROKER_ERROR / MQ_CLIENT_ERROR.
+     */
+    private function adminToolExecute(callable $handler): AdminToolResult
+    {
+        try {
+            return $handler();
+        } catch (RemotingException $e) {
+            return AdminToolResult::failure(AdminToolsResultCodeEnum::REMOTING_ERROR, $e->getMessage());
+        } catch (MQClientException $e) {
+            if ($e->responseCode === ResponseCode::TOPIC_NOT_EXIST) {
+                return AdminToolResult::failure(AdminToolsResultCodeEnum::TOPIC_ROUTE_INFO_NOT_EXIST, $e->getMessage());
+            }
+            return AdminToolResult::failure(AdminToolsResultCodeEnum::MQ_CLIENT_ERROR, $e->getMessage());
+        } catch (\Throwable $e) {
+            return AdminToolResult::failure(AdminToolsResultCodeEnum::MQ_BROKER_ERROR, $e->getMessage());
+        }
+    }
+
+    /**
+     * Sequential counterpart of the per-address task fan-out that is bounded by ONE overall
+     * deadline: every entry is visited in order, each call budgeted by whatever is left of
+     * the deadline, and entries reached after the deadline are simply absent from the result
+     * (neither successes nor failures). The visitor owns its errors exactly like the
+     * per-task catch block does — nothing thrown inside propagates to the caller.
+     *
+     * @param list<mixed> $items
+     * @param callable(mixed, int): void $visit receives (item, remainingMillis)
+     */
+    private function fanOutWithDeadline(array $items, callable $visit): void
+    {
+        $begin = hrtime(true) / 1e6;
+        foreach ($items as $item) {
+            $left = $this->timeoutMillis - (int) ((hrtime(true) / 1e6) - $begin);
+            if ($left <= 0) {
+                return;
+            }
+            $visit($item, $left);
+        }
+    }
+
+    /** Header fields of the lite requests: an unset optional key gets no wire entry at all. */
+    private static function nonNullExt(array $fields): array
+    {
+        $out = [];
+        foreach ($fields as $name => $value) {
+            if ($value === null) {
+                continue;
+            }
+            $out[$name] = $value;
+        }
+        return $out;
+    }
 
     public static function permIsValid(int|string|null $value): bool
     {

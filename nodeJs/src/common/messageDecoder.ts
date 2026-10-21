@@ -257,11 +257,13 @@ export function decodeMessage(raw: Buffer, readBody = true, decompressBody = tru
         }
         msgExt.setBody(Buffer.from(body));
       } else {
-        msgExt.setBody(null as any);
+        // Header-only decode: assigning the field directly is required because
+        // setBody(null) would throw inside Buffer.from and null the whole frame.
+        msgExt.body = null as any;
       }
       offset += bodyLen;
     } else {
-      msgExt.setBody(null as any);
+      msgExt.body = null as any;
     }
 
     if (useV2) {

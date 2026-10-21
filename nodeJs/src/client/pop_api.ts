@@ -78,13 +78,14 @@ export function processPopResponse(
   brokerName: string, responseCode: number, responseRemark: string,
   body: Buffer | null, respHeader: PopMessageResponseHeader,
   requestTopic: string, namespace: string, order: boolean,
+  readBody = true,
 ): PopResult {
   const result = new PopResult();
   switch (responseCode) {
     case ResponseCode.SUCCESS:
       result.popStatus = PopStatus.FOUND;
       if (body && body.length > 0) {
-        result.msgFoundList = decodeMessagesForPop(body);
+        result.msgFoundList = decodeMessagesForPop(body, readBody);
       }
       break;
     case ResponseCode.POLLING_FULL:
@@ -243,6 +244,6 @@ export function ckParse(extraInfo: string): { brokerName: string; queueId: numbe
   }
 }
 
-function decodeMessagesForPop(raw: Buffer): MessageExt[] {
-  return decodeMessages(raw);
+function decodeMessagesForPop(raw: Buffer, readBody = true): MessageExt[] {
+  return decodeMessages(raw, readBody);
 }

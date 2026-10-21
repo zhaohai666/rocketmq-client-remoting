@@ -53,6 +53,7 @@ use RocketMQ\Remoting\Protocol\ResetOffsetBody;
 use RocketMQ\Remoting\Protocol\SimpleSubscriptionData;
 use RocketMQ\Remoting\Protocol\SubscriptionGroupConfig;
 use RocketMQ\Remoting\Protocol\SubscriptionGroupWrapper;
+use RocketMQ\Remoting\Protocol\TopicConfigSerializeWrapper;
 use RocketMQ\Remoting\Protocol\TopicList;
 use RocketMQ\Remoting\Protocol\TopicRouteData;
 use RocketMQ\Remoting\Protocol\TopicStatsTable;
@@ -145,7 +146,7 @@ final class FakeClient extends MQClientInstance
         return $this->topicRoutes[$topic] ?? null;
     }
 
-    public function updateTopicRouteInfoFromNameServer(string $topic, int $timeoutMillis = 5000, bool $isDefault = false): bool
+    public function updateTopicRouteInfoFromNameServer(string $topic, ?int $timeoutMillis = null, bool $isDefault = false): bool
     {
         $this->routeRefreshCalls[] = $topic;
         return false;
@@ -484,7 +485,7 @@ final class RunClientAdmin
 
     private function testAdminConfigLifecycle(): void
     {
-        $this->checkSame(15000, DefaultMQAdminExt::DEFAULT_TIMEOUT, 'DEFAULT_TIMEOUT = 5000*3');
+        $this->checkSame(20000, DefaultMQAdminExt::DEFAULT_TIMEOUT, 'DEFAULT_TIMEOUT = 20000');
         $this->checkSame('ORDER_TOPIC_CONFIG', DefaultMQAdminExt::NAMESPACE_ORDER_TOPIC_CONFIG, 'NAMESPACE_ORDER_TOPIC_CONFIG');
 
         $admin = new FakeAdmin();
@@ -497,6 +498,12 @@ final class RunClientAdmin
         $this->checkSame(DefaultMQAdminExt::DEFAULT_TIMEOUT, $admin->timeoutMillis, 'default timeoutMillis=DEFAULT_TIMEOUT');
         $this->checkSame(null, $admin->rpcHook, 'default rpcHook=null');
         $this->checkSame('', $admin->namespace, 'default namespace empty string');
+        $this->checkSame(2000, $admin->maxPageSizeInGetMetadata, 'default metadata page size=2000');
+        $this->checkSame(2000, $admin->getMaxPageSizeInGetMetadata(), 'getMaxPageSizeInGetMetadata default');
+        $admin->setMaxPageSizeInGetMetadata(5);
+        $this->checkSame(5, $admin->getMaxPageSizeInGetMetadata(), 'setMaxPageSizeInGetMetadata stores the value');
+        $admin->setMaxPageSizeInGetMetadata(0);
+        $this->checkSame(2000, $admin->getMaxPageSizeInGetMetadata(), 'non-positive page size falls back to 2000');
 
         $admin->setNamesrvAddr(' a:1 ; b:2 ; ;');
         $this->checkSame(['a:1', 'b:2'], $admin->getNameServerAddressList(), 'setNamesrvAddr splits on semicolons and trims');
@@ -815,6 +822,96 @@ final class RunClientAdmin
         $this->checkThrows(fn() => $admin12b->examineTopicStats('TS'), MQClientException::class, 'examineTopicStats all fail → Not found the topic stats info');
     }
 
+    // ================================================================ Topic metadata paging
+
+    /**
+     * GET_ALL_TOPIC_CONFIG paging: 5 is the requested page size, but the broker returns two entries
+     * per page. The next cursor must follow the returned count (2), the first request must carry the
+     * empty-string dataVersion, and the merged table must keep the version the walk started with.
+     */
+    private function testTopicMetadataPaging(): void
+    {
+        $admin = $this->newAdmin();
+        $admin->setMaxPageSizeInGetMetadata(5);
+        $page = 0;
+        $version = ['counter' => 11];
+        $admin->handler = function (RemotingCommand $cmd) use (&$page, $version) {
+            $page++;
+            $w = new TopicConfigSerializeWrapper();
+            $w->dataVersion = $version;
+            $w->topicConfigTable = $page === 1
+                ? ['A' => new TopicConfig('A'), 'B' => new TopicConfig('B')]
+                : ['C' => new TopicConfig('C'), 'D' => new TopicConfig('D')];
+            return $this->okResponse($w->encode(), ['totalTopicNum' => '4']);
+        };
+        $merged = $admin->getAllTopicConfig('b:topics');
+        $this->checkSame(2, count($admin->requests), 'topic paging: four topics in pages of two take two requests');
+        $r1 = $admin->requests[0]['cmd'];
+        $r2 = $admin->requests[1]['cmd'];
+        $this->checkSame(RequestCode::GET_ALL_TOPIC_CONFIG, $r1->code, 'topic paging uses GET_ALL_TOPIC_CONFIG=21');
+        $this->checkSame('0', $r1->extFields['topicSeq'] ?? null, 'first topic page starts at seq 0');
+        $this->checkSame('5', $r1->extFields['maxTopicNum'] ?? null, 'maxTopicNum is the configured page size 5');
+        $this->check(true, array_key_exists('dataVersion', $r1->extFields), 'first topic page carries the dataVersion key');
+        $this->checkSame('', $r1->extFields['dataVersion'] ?? null, 'first topic page sends an empty-string dataVersion');
+        $this->checkSame('2', $r2->extFields['topicSeq'] ?? null, 'topic cursor advances by the returned entries (2), not the page size (5)');
+        $this->checkSame('5', $r2->extFields['maxTopicNum'] ?? null, 'every topic page repeats maxTopicNum');
+        $this->checkSame('{"counter":11}', $r2->extFields['dataVersion'] ?? null, 'second topic page carries the version JSON');
+        $this->checkSame(['A', 'B', 'C', 'D'], array_keys($merged->topicConfigTable), 'topic paging merges all four returned topics');
+        $this->checkSame($version, $merged->dataVersion, 'merged topic dataVersion is the first page version');
+
+        // The version changes mid-walk: drop the partial table, restart at 0 and send the NEW version.
+        $admin2 = $this->newAdmin();
+        $admin2->setMaxPageSizeInGetMetadata(5);
+        $v1 = ['counter' => 1];
+        $v2 = ['counter' => 2];
+        $call = 0;
+        $admin2->handler = function (RemotingCommand $cmd) use (&$call, $v1, $v2) {
+            $call++;
+            $w = new TopicConfigSerializeWrapper();
+            if ($call === 1) {
+                $w->topicConfigTable = ['A' => new TopicConfig('A'), 'B' => new TopicConfig('B')];
+                $w->dataVersion = $v1;
+            } elseif ($call === 2) {
+                $w->topicConfigTable = ['C' => new TopicConfig('C')];
+                $w->dataVersion = $v2;
+            } elseif ($call === 3) {
+                $w->topicConfigTable = ['A' => new TopicConfig('A'), 'B' => new TopicConfig('B')];
+                $w->dataVersion = $v2;
+            } else {
+                $w->topicConfigTable = ['C' => new TopicConfig('C'), 'D' => new TopicConfig('D')];
+                $w->dataVersion = $v2;
+            }
+            return $this->okResponse($w->encode(), ['totalTopicNum' => '4']);
+        };
+        $restarted = $admin2->getAllTopicConfig('b:topics');
+        $sentVersions = array_map(
+            static fn(array $r): ?string => $r['cmd']->extFields['dataVersion'] ?? null,
+            $admin2->requests
+        );
+        $this->checkSame(4, count($admin2->requests), 'a changed version restarts and re-walks the topic table');
+        $this->checkSame(['', '{"counter":1}', '{"counter":2}', '{"counter":2}'], $sentVersions, 'restart sends the new version, never an empty one');
+        $this->checkSame('0', $admin2->requests[2]['cmd']->extFields['topicSeq'] ?? null, 'restart resets topicSeq to 0');
+        $this->checkSame(['A', 'B', 'C', 'D'], array_keys($restarted->topicConfigTable), 'restarted walk replaces the stale page data');
+        $this->checkSame($v2, $restarted->dataVersion, 'restarted walk reports the new version');
+
+        // Old broker: no totalTopicNum means the first page is the whole table.
+        $admin3 = $this->newAdmin();
+        $admin3->handler = function () {
+            $w = new TopicConfigSerializeWrapper();
+            $w->topicConfigTable = ['L1' => new TopicConfig('L1'), 'L2' => new TopicConfig('L2')];
+            $w->dataVersion = ['counter' => 3];
+            return $this->okResponse($w->encode());
+        };
+        $legacy = $admin3->getAllTopicConfig('b:legacy');
+        $this->checkSame(1, count($admin3->requests), 'topic broker without totalTopicNum answers in exactly one request');
+        $this->checkSame(['L1', 'L2'], array_keys($legacy->topicConfigTable), 'legacy topic page is kept whole');
+        $this->checkSame(['counter' => 3], $legacy->dataVersion, 'legacy topic page keeps its dataVersion');
+        $legacyCmd = $admin3->requests[0]['cmd'];
+        $this->checkSame('0', $legacyCmd->extFields['topicSeq'] ?? null, 'legacy topic request starts at seq 0');
+        $this->checkSame('2000', $legacyCmd->extFields['maxTopicNum'] ?? null, 'legacy topic request sends the default page size 2000');
+        $this->checkSame('', $legacyCmd->extFields['dataVersion'] ?? null, 'legacy topic request still carries the empty dataVersion');
+    }
+
     // ================================================================ Cluster / Broker
 
     private function testClusterBroker(): void
@@ -1020,8 +1117,8 @@ final class RunClientAdmin
         $r2 = $admin4->requests[1]['cmd'];
         $this->checkSame(RequestCode::GET_ALL_SUBSCRIPTIONGROUP_CONFIG, $r1->code, 'GET_ALL_SUBSCRIPTIONGROUP_CONFIG=201');
         $this->checkSame('0', $r1->extFields['groupSeq'] ?? null, 'first page groupSeq=0');
-        $this->checkSame('10000', $r1->extFields['maxGroupNum'] ?? null, 'maxGroupNum=10000');
-        $this->check(!isset($r1->extFields['dataVersion']), 'first page carries no dataVersion');
+        $this->checkSame('2000', $r1->extFields['maxGroupNum'] ?? null, 'maxGroupNum is the configured default page size');
+        $this->checkSame('', $r1->extFields['dataVersion'] ?? null, 'first page carries an empty-string dataVersion');
         $this->checkSame('2', $r2->extFields['groupSeq'] ?? null, 'second page groupSeq=2');
         $this->checkSame('{"counter":7}', $r2->extFields['dataVersion'] ?? null, 'second page carries dataVersion JSON');
 

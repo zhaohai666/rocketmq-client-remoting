@@ -41,6 +41,12 @@ public class DefaultMQProducer
     private bool _enableStreamRequestType;
     // Default value of pollNameServerInterval
     private int _pollNameServerIntervalMillis = 30000;
+    // ClientConfig knobs shared by every facade: body materialisation during batch
+    // decode, the internal-API timeout, and the concurrent-heartbeat dispatch.
+    private bool _decodeReadBody = true;
+    private int _mqClientApiTimeout = MQClientInstance.MqClientApiTimeoutMillis;
+    private bool _enableConcurrentHeartbeat;
+    private int _concurrentHeartbeatThreadPoolSize = Environment.ProcessorCount;
     private string _createTopicKey = MixAll.DefaultTopic;
     private int _defaultTopicQueueNums = MixAll.DefaultTopicQueueNums;
     private int _sendMsgTimeout = 3000;
@@ -486,6 +492,79 @@ public class DefaultMQProducer
         set => _pollNameServerIntervalMillis = value;
     }
 
+    /// <summary>When false, received pull/POP bodies are not materialised: frames are
+    /// still walked and messages returned header-only. Default true.</summary>
+    public bool DecodeReadBody
+    {
+        get => _decodeReadBody;
+        set
+        {
+            _decodeReadBody = value;
+            if (_mqClient is not null)
+            {
+                _mqClient.DecodeReadBody = value;
+            }
+        }
+    }
+
+    /// <summary>Internal API timeout (default 3000ms); an explicit per-call timeout wins.</summary>
+    public int MqClientApiTimeout
+    {
+        get => _mqClientApiTimeout;
+        set
+        {
+            _mqClientApiTimeout = value > 0 ? value : MQClientInstance.MqClientApiTimeoutMillis;
+            if (_mqClient is not null)
+            {
+                _mqClient.MqClientApiTimeout = _mqClientApiTimeout;
+            }
+        }
+    }
+
+    /// <summary>Fan heartbeat rounds out over a pool (default off; V2 still wins).</summary>
+    public bool EnableConcurrentHeartbeat
+    {
+        get => _enableConcurrentHeartbeat;
+        set
+        {
+            _enableConcurrentHeartbeat = value;
+            if (_mqClient is not null)
+            {
+                _mqClient.EnableConcurrentHeartbeat = value;
+            }
+        }
+    }
+
+    /// <summary>Pool size for concurrent heartbeats (default: available processors).</summary>
+    public int ConcurrentHeartbeatThreadPoolSize
+    {
+        get => _concurrentHeartbeatThreadPoolSize;
+        set
+        {
+            _concurrentHeartbeatThreadPoolSize = value > 0 ? value : Environment.ProcessorCount;
+            if (_mqClient is not null)
+            {
+                _mqClient.ConcurrentHeartbeatThreadPoolSize = _concurrentHeartbeatThreadPoolSize;
+            }
+        }
+    }
+
+    /// <summary>Paged metadata size (maxTopicNum / maxGroupNum). Default 2000.</summary>
+    public int MaxPageSizeInGetMetadata
+    {
+        get => _maxPageSizeInGetMetadata;
+        set
+        {
+            _maxPageSizeInGetMetadata = value > 0 ? value : MQClientInstance.DefaultMaxPageSizeInGetMetadata;
+            if (_mqClient is not null)
+            {
+                _mqClient.MaxPageSizeInGetMetadata = _maxPageSizeInGetMetadata;
+            }
+        }
+    }
+
+    private int _maxPageSizeInGetMetadata = MQClientInstance.DefaultMaxPageSizeInGetMetadata;
+
     // ---------------- ACL authentication ----------------
     // Must be called before Start(): the hook is bound to MQClientInstance in Start()
     // (when the instance is reused for the same clientId, first registrant wins).
@@ -833,6 +912,11 @@ public class DefaultMQProducer
                 ClientLog.Warn("producer rpc hook ignored: MQClientInstance already has one (clientId="
                     + _clientId + ")");
             }
+            _mqClient.DecodeReadBody = _decodeReadBody;
+            _mqClient.MqClientApiTimeout = _mqClientApiTimeout;
+            _mqClient.EnableConcurrentHeartbeat = _enableConcurrentHeartbeat;
+            _mqClient.ConcurrentHeartbeatThreadPoolSize = _concurrentHeartbeatThreadPoolSize;
+            _mqClient.MaxPageSizeInGetMetadata = _maxPageSizeInGetMetadata;
             try
             {
                 _mqClient.Start();
@@ -3234,21 +3318,7 @@ public class DefaultMQProducer
         };
         hb.AddProducerData(new ProducerData(_producerGroup));
 
-        int okCount = 0;
-        foreach (string addr in addrs)
-        {
-            try
-            {
-                c.SendHeartbeat(addr, hb, 5000);
-                ++okCount;
-            }
-            catch (Exception e)
-            {
-                ClientLog.Warn("producer heartbeat to " + addr + " failed: " + e.Message);
-            }
-        }
-
-        return okCount;
+        return c.SendHeartbeatToAllBrokers(hb, isRebalance: false, includeSlaves: false);
     }
 
     // Heartbeat thread (periodic heartbeat; interval defaults to 30s)

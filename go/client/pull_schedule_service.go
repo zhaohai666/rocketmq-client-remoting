@@ -427,7 +427,7 @@ func (s *MQPullConsumerScheduleService) doRebalance() {
 			return
 		}
 		if instance != nil {
-			if _, err := instance.UpdateTopicRouteInfoFromNameServer(topic, 5000, false); err != nil {
+			if _, err := instance.UpdateTopicRouteInfoFromNameServer(topic, 0, false); err != nil {
 				common.LogDebugf("pull schedule: route refresh failed for %s: %v", topic, err)
 			}
 		}

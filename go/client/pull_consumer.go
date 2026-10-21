@@ -96,6 +96,14 @@ type DefaultMQPullConsumer struct {
 	nameServerAddrs []string
 	pollNamesrvIntv int64
 
+	// Instance knobs seeded at Start and applied live when the shared instance
+	// already exists: receive-body decode, internal-API timeout and the
+	// concurrent heartbeat round.
+	decodeReadBody                    bool
+	mqClientAPITimeoutMillis          int64
+	enableConcurrentHeartbeat         bool
+	concurrentHeartbeatThreadPoolSize int
+
 	// Pull timings — see the file header for how the three relate.
 	brokerSuspendMaxTimeMillis       int64
 	consumerPullTimeoutMillis        int64
@@ -162,6 +170,8 @@ func NewDefaultMQPullConsumer(group string) (*DefaultMQPullConsumer, error) {
 		messageModel:                     MessageModelClustering,
 		consumeFromWhere:                 ConsumeFromWhereLastOffset,
 		pollNamesrvIntv:                  defaultConsumerPollNamesrvInterval,
+		decodeReadBody:                   true,
+		mqClientAPITimeoutMillis:         DefaultMQClientAPITimeoutMillis,
 		brokerSuspendMaxTimeMillis:       DefaultBrokerSuspendMaxTimeMillis,
 		consumerPullTimeoutMillis:        DefaultConsumerPullTimeoutMillis,
 		consumerTimeoutMillisWhenSuspend: DefaultConsumerTimeoutMillisWhenSuspend,
@@ -277,6 +287,62 @@ func (c *DefaultMQPullConsumer) SetSocksProxy(proxy *remoting.SocksProxyConfig) 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.socksProxy = proxy
+}
+
+// SetDecodeReadBody seeds the shared instance's receive-body decode switch:
+// when off, pull frames are walked without materialising bodies. It takes
+// effect on a running instance immediately.
+func (c *DefaultMQPullConsumer) SetDecodeReadBody(enable bool) {
+	c.mu.Lock()
+	c.decodeReadBody = enable
+	inst := c.instance
+	c.mu.Unlock()
+	if inst != nil {
+		inst.SetDecodeReadBody(enable)
+	}
+}
+
+// SetMQClientAPITimeoutMillis sets the internal-API budget used by heartbeats,
+// route fetches, unregister and consumer-list RPCs. Non-positive values
+// restore the 3000ms default.
+func (c *DefaultMQPullConsumer) SetMQClientAPITimeoutMillis(timeoutMillis int64) {
+	if timeoutMillis <= 0 {
+		timeoutMillis = DefaultMQClientAPITimeoutMillis
+	}
+	c.mu.Lock()
+	c.mqClientAPITimeoutMillis = timeoutMillis
+	inst := c.instance
+	c.mu.Unlock()
+	if inst != nil {
+		inst.SetMQClientAPITimeoutMillis(timeoutMillis)
+	}
+}
+
+// SetEnableConcurrentHeartbeat turns the concurrent heartbeat round on or off;
+// a V2 heartbeat still takes precedence when both are enabled.
+func (c *DefaultMQPullConsumer) SetEnableConcurrentHeartbeat(enable bool) {
+	c.mu.Lock()
+	c.enableConcurrentHeartbeat = enable
+	inst := c.instance
+	c.mu.Unlock()
+	if inst != nil {
+		inst.SetEnableConcurrentHeartbeat(enable)
+	}
+}
+
+// SetConcurrentHeartbeatThreadPoolSize sets the width of the concurrent
+// heartbeat pool; non-positive values restore the available-processor default.
+func (c *DefaultMQPullConsumer) SetConcurrentHeartbeatThreadPoolSize(size int) {
+	if size <= 0 {
+		size = runtime.NumCPU()
+	}
+	c.mu.Lock()
+	c.concurrentHeartbeatThreadPoolSize = size
+	inst := c.instance
+	c.mu.Unlock()
+	if inst != nil {
+		inst.SetConcurrentHeartbeatThreadPoolSize(size)
+	}
 }
 
 func (c *DefaultMQPullConsumer) SetMessageModel(model string) {
@@ -526,6 +592,10 @@ func (c *DefaultMQPullConsumer) Start() error {
 	}
 	cfg.SocksProxy = c.socksProxy
 	cfg.PollNameServerIntervalMillis = c.pollNamesrvIntv
+	cfg.DecodeReadBody = c.decodeReadBody
+	cfg.MQClientAPITimeoutMillis = c.mqClientAPITimeoutMillis
+	cfg.EnableConcurrentHeartbeat = c.enableConcurrentHeartbeat
+	cfg.ConcurrentHeartbeatThreadPoolSize = c.concurrentHeartbeatThreadPoolSize
 	instance := CreateOrGetInstance(c.clientID, c.nameServerAddrs, cfg)
 	c.instance = instance
 	namespaceV2 := c.namespaceV2
@@ -573,7 +643,7 @@ func (c *DefaultMQPullConsumer) Start() error {
 	instance.RegisterConsumer(c.consumerGroup, c)
 	for _, topic := range topics {
 		instance.RegisterTopicInUse(topic)
-		if _, err := instance.UpdateTopicRouteInfoFromNameServer(topic, 5000, false); err != nil {
+		if _, err := instance.UpdateTopicRouteInfoFromNameServer(topic, 0, false); err != nil {
 			common.LogDebugf("initial route refresh failed for %s: %v", topic, err)
 		}
 	}
@@ -1196,7 +1266,7 @@ func (c *DefaultMQPullConsumer) FetchMessageQueuesInBalance(topic string) ([]com
 		return mqAll, nil
 	}
 
-	cidAll, answered := instance.GetConsumerIDListByGroup(topic, group, 5000)
+	cidAll, answered := instance.GetConsumerIDListByGroup(topic, group, 0)
 	if len(mqAll) == 0 || !answered || len(cidAll) == 0 {
 		common.LogDebugf("fetchMessageQueuesInBalance: no route/consumer list for %s/%s, keep current assignment",
 			group, topic)
@@ -1327,7 +1397,7 @@ func (c *DefaultMQPullConsumer) RebalanceImmediately() {
 	sort.Strings(topics)
 
 	for _, topic := range topics {
-		if _, err := instance.UpdateTopicRouteInfoFromNameServer(topic, 5000, false); err != nil {
+		if _, err := instance.UpdateTopicRouteInfoFromNameServer(topic, 0, false); err != nil {
 			common.LogDebugf("route refresh failed for %s: %v", topic, err)
 		}
 		if listener == nil {

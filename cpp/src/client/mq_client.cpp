@@ -6,8 +6,11 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -16,6 +19,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "rocketmq/client/exception.h"
@@ -94,6 +98,76 @@ bool isBlank(const std::string& s) {
 }
 
 }  // namespace
+
+// Fixed-size worker pool used by the concurrent heartbeat round. Tasks that were already queued
+// still run during stop(); submissions made after stop() are rejected.
+class MQClientInstance::HeartbeatTaskRunner {
+public:
+    explicit HeartbeatTaskRunner(int32_t threads) {
+        const int32_t count = threads > 0 ? threads : 1;
+        workers_.reserve(static_cast<size_t>(count));
+        for (int32_t i = 0; i < count; ++i) {
+            workers_.emplace_back([this]() { workerLoop(); });
+        }
+    }
+
+    ~HeartbeatTaskRunner() { stop(); }
+
+    HeartbeatTaskRunner(const HeartbeatTaskRunner&) = delete;
+    HeartbeatTaskRunner& operator=(const HeartbeatTaskRunner&) = delete;
+
+    bool submit(std::function<void()> task) {
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            if (stopping_) return false;
+            tasks_.push_back(std::move(task));
+        }
+        cv_.notify_one();
+        return true;
+    }
+
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            if (stopping_) return;
+            stopping_ = true;
+        }
+        cv_.notify_all();
+        for (std::thread& worker : workers_) {
+            if (worker.joinable()) worker.join();
+        }
+        workers_.clear();
+    }
+
+private:
+    void workerLoop() {
+        for (;;) {
+            std::function<void()> task;
+            {
+                std::unique_lock<std::mutex> lk(mutex_);
+                cv_.wait(lk, [this]() { return stopping_ || !tasks_.empty(); });
+                if (tasks_.empty()) {
+                    if (stopping_) return;
+                    continue;
+                }
+                task = std::move(tasks_.front());
+                tasks_.pop_front();
+            }
+            task();
+        }
+    }
+
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::deque<std::function<void()>> tasks_;
+    bool stopping_ = false;
+    std::vector<std::thread> workers_;
+};
+
+int32_t MQClientInstance::defaultConcurrentHeartbeatThreadPoolSize() {
+    const unsigned int available = std::thread::hardware_concurrency();
+    return available == 0 ? 1 : static_cast<int32_t>(available);
+}
 
 std::string changeInstanceNameToPID(const std::string& instanceName) {
     if (instanceName == MixAll::DEFAULT_INSTANCE_NAME) {
@@ -241,6 +315,9 @@ void MQClientInstance::start() {
             routeRefreshLoop();
         });
     }
+    if (enableConcurrentHeartbeat_) {
+        ensureHeartbeatTaskRunner();
+    }
 }
 
 void MQClientInstance::registerTopicInUse(const std::string& topic) {
@@ -282,6 +359,14 @@ void MQClientInstance::shutdown() {
         routeRefreshThread_.join();
     }
     consumerStats_.shutdown();
+    {
+        std::shared_ptr<HeartbeatTaskRunner> runner;
+        {
+            std::lock_guard<std::mutex> lk(heartbeatTaskRunnerMutex_);
+            runner.swap(heartbeatTaskRunner_);
+        }
+        if (runner) runner->stop();
+    }
     if (remotingClient_) {
         // The code 40 callback captures this: it must be removed before the instance is destroyed, otherwise a reader thread could call back into a dangling object
         remotingClient_->unregisterProcessor(RequestCode::NOTIFY_CONSUMER_IDS_CHANGED);
@@ -388,6 +473,9 @@ void MQClientInstance::checkResponseCode(const RemotingCommand& response) {
 bool MQClientInstance::updateTopicRouteInfoFromNameServer(const std::string& topic,
                                                          int32_t timeoutMillis,
                                                          bool isDefault) {
+    if (timeoutMillis < 0) {
+        timeoutMillis = mqClientApiTimeout_;
+    }
     if (nameServerAddrs_.empty()) {
         throw MQClientException("name server address list is empty",
                                 ClientErrorCode::NO_NAME_SERVER_EXCEPTION);
@@ -482,7 +570,7 @@ std::shared_ptr<TopicPublishInfo> MQClientInstance::getTopicPublishInfo(const st
             return it->second;
         }
     }
-    updateTopicRouteInfoFromNameServer(topic, 5000, isDefault);
+    updateTopicRouteInfoFromNameServer(topic, -1, isDefault);
     std::lock_guard<std::recursive_mutex> lk(routeLock_);
     auto it = topicPublishInfoTable_.find(topic);
     if (it == topicPublishInfoTable_.end() || it->second == nullptr || !it->second->ok()) {
@@ -608,7 +696,7 @@ std::string MQClientInstance::publishAddrFor(const std::string& brokerName,
                                              const std::string& topic) {
     std::string addr = findBrokerAddressInPublish(brokerName);
     if (addr.empty()) {
-        updateTopicRouteInfoFromNameServer(topic, 5000, false);
+        updateTopicRouteInfoFromNameServer(topic, -1, false);
         addr = findBrokerAddressInPublish(brokerName);
     }
     if (addr.empty()) {
@@ -681,7 +769,7 @@ std::string MQClientInstance::popAckAddrFor(const std::string& topic,
     std::string des = resolveDes();
     std::string addr = findBrokerAddressInPublish(des);
     if (addr.empty()) {
-        updateTopicRouteInfoFromNameServer(topic, 5000, false);
+        updateTopicRouteInfoFromNameServer(topic, -1, false);
         des = resolveDes();
         addr = findBrokerAddressInPublish(des);
     }
@@ -696,7 +784,7 @@ std::string MQClientInstance::consumerOffsetAddr(const MessageQueue& mq) {
     // fail when it is gone, while offset reading may fall back to a slave.
     std::string addr = findBrokerAddressInPublish(mq.brokerName);
     if (addr.empty()) {
-        updateTopicRouteInfoFromNameServer(mq.topic, 5000, false);
+        updateTopicRouteInfoFromNameServer(mq.topic, -1, false);
         addr = brokerAddrOf(mq.brokerName);
     }
     if (addr.empty()) {
@@ -984,7 +1072,7 @@ PullResult MQClientInstance::pullMessage(const std::string& consumerGroup, const
     result.maxOffset = respHeader.maxOffset.value_or(0);
     result.suggestWhichBrokerId = respHeader.suggestWhichBrokerId;
     if (!response.body.empty()) {
-        result.msgFoundList = decodeMessages(response.body);
+        result.msgFoundList = decodeMessages(response.body, decodeReadBody_);
         for (MessageExt& m : result.msgFoundList) {
             m.brokerName = mq.brokerName;
             m.queueId = mq.queueId;
@@ -1139,7 +1227,7 @@ PopResult MQClientInstance::popMessage(const std::string& consumerGroup, const s
     result.orderCountInfo = respHeader.orderCountInfo.value_or("");
 
     if (result.status == PopStatus::FOUND && !response.body.empty()) {
-        result.msgFoundList = decodeMessages(response.body);
+        result.msgFoundList = decodeMessages(response.body, decodeReadBody_);
         stampPopCk(result.msgFoundList, brokerName, respHeader);
     }
     for (MessageExt& m : result.msgFoundList) {
@@ -1601,8 +1689,19 @@ std::vector<MessageExt> MQClientInstance::queryMessageAllBrokers(
 }
 
 // ---------------------------------------------------------------- Heartbeat / unregister
+void MQClientInstance::ensureHeartbeatTaskRunner() {
+    std::lock_guard<std::mutex> lk(heartbeatTaskRunnerMutex_);
+    if (!heartbeatTaskRunner_) {
+        heartbeatTaskRunner_ =
+            std::make_shared<HeartbeatTaskRunner>(concurrentHeartbeatThreadPoolSize_);
+    }
+}
+
 void MQClientInstance::sendHeartbeat(const std::string& addr, const HeartbeatData& heartbeatData,
                                     int32_t timeoutMillis) {
+    if (timeoutMillis < 0) {
+        timeoutMillis = mqClientApiTimeout_;
+    }
     RemotingCommand request =
         RemotingCommand::createRequestCommand(RequestCode::HEART_BEAT, nullptr);
     request.body = heartbeatData.encode();
@@ -1611,9 +1710,87 @@ void MQClientInstance::sendHeartbeat(const std::string& addr, const HeartbeatDat
     checkResponseCode(response);
 }
 
+int32_t MQClientInstance::sendHeartbeatConcurrently(const HeartbeatData& heartbeatData,
+                                                    int32_t timeoutMillis) {
+    if (heartbeatData.consumerDataSet.empty() && heartbeatData.producerDataSet.empty()) {
+        return 0;
+    }
+    if (timeoutMillis < 0) {
+        timeoutMillis = mqClientApiTimeout_;
+    }
+
+    // Snapshot the broker address table once: later route changes cannot alter this round, and a
+    // body without consumer data (producer-only) goes to masters only.
+    std::vector<std::string> addrs;
+    {
+        std::lock_guard<std::recursive_mutex> lk(routeLock_);
+        std::set<std::string> unique;
+        for (const auto& broker : brokerAddrTable_) {
+            for (const auto& idAddr : broker.second) {
+                if (heartbeatData.consumerDataSet.empty() && idAddr.first != MixAll::MASTER_ID) {
+                    continue;
+                }
+                if (!idAddr.second.empty()) unique.insert(idAddr.second);
+            }
+        }
+        addrs.assign(unique.begin(), unique.end());
+    }
+    if (addrs.empty()) {
+        return 0;
+    }
+
+    ensureHeartbeatTaskRunner();
+    std::shared_ptr<HeartbeatTaskRunner> runner;
+    {
+        std::lock_guard<std::mutex> lk(heartbeatTaskRunnerMutex_);
+        runner = heartbeatTaskRunner_;
+    }
+
+    struct RoundState {
+        std::mutex mutex;
+        std::condition_variable cv;
+        int32_t pending = 0;
+        int32_t succeeded = 0;
+    };
+    auto round = std::make_shared<RoundState>();
+    round->pending = static_cast<int32_t>(addrs.size());
+    auto finish = [round](bool ok) {
+        std::lock_guard<std::mutex> lk(round->mutex);
+        if (ok) ++round->succeeded;
+        if (--round->pending == 0) round->cv.notify_all();
+    };
+
+    for (const std::string& addr : addrs) {
+        const bool submitted = runner && runner->submit([this, addr, &heartbeatData,
+                                                         timeoutMillis, finish]() {
+            try {
+                sendHeartbeat(addr, heartbeatData, timeoutMillis);
+                finish(true);
+            } catch (const std::exception& e) {
+                logger_warn("concurrent heartbeat to " + addr + " failed: " + e.what());
+                finish(false);
+            } catch (...) {
+                finish(false);
+            }
+        });
+        if (!submitted) {
+            // A rejected submission still has to release the waiter.
+            logger_warn("concurrent heartbeat rejected for " + addr);
+            finish(false);
+        }
+    }
+
+    std::unique_lock<std::mutex> lk(round->mutex);
+    round->cv.wait(lk, [&round]() { return round->pending == 0; });
+    return round->succeeded;
+}
+
 void MQClientInstance::unregisterClient(const std::string& addr, const std::string& clientId,
                                        const std::string& producerGroup,
                                        const std::string& consumerGroup, int32_t timeoutMillis) {
+    if (timeoutMillis < 0) {
+        timeoutMillis = mqClientApiTimeout_;
+    }
     auto header = std::make_shared<UnregisterClientRequestHeader>();
     header->clientId = clientId;
     header->producerGroup = UtilAll::isBlank(producerGroup)
@@ -1788,6 +1965,9 @@ TopicList MQClientInstance::getAllTopicListFromNameServer(int32_t timeoutMillis)
 
 GetConsumerListByGroupResponseBody MQClientInstance::getConsumerListByGroup(
     const std::string& consumerGroup, const std::string& addr, int32_t timeoutMillis) {
+    if (timeoutMillis < 0) {
+        timeoutMillis = mqClientApiTimeout_;
+    }
     auto header = std::make_shared<GetConsumerListByGroupRequestHeader>();
     header->consumerGroup = consumerGroup;
     RemotingCommand request =
@@ -1803,6 +1983,9 @@ GetConsumerListByGroupResponseBody MQClientInstance::getConsumerListByGroup(
 
 std::vector<std::string> MQClientInstance::getConsumerIdListByGroup(
     const std::string& topic, const std::string& consumerGroup, int32_t timeoutMillis) {
+    if (timeoutMillis < 0) {
+        timeoutMillis = mqClientApiTimeout_;
+    }
     std::string addr;
     {
         auto route = getTopicRouteData(topic);
@@ -1859,6 +2042,9 @@ void MQClientInstance::checkClientConfig(const std::string& brokerAddr,
                                          const std::string& clientId,
                                          const SubscriptionData& subscriptionData,
                                          int32_t timeoutMillis) {
+    if (timeoutMillis < 0) {
+        timeoutMillis = mqClientApiTimeout_;
+    }
     RemotingCommand request =
         RemotingCommand::createRequestCommand(RequestCode::CHECK_CLIENT_CONFIG, nullptr);
     CheckClientRequestBody body;
@@ -1880,7 +2066,7 @@ void MQClientInstance::checkSubscriptionsInBroker(const std::string& group,
         const std::string addr = findBrokerAddrByTopic(sub.topic);
         if (addr.empty()) continue;  // No route found -> skip, do not raise
         try {
-            checkClientConfig(addr, group, clientId_, sub, kMqClientApiTimeoutMillis);
+            checkClientConfig(addr, group, clientId_, sub, -1);
         } catch (const MQClientException&) {
             throw;  // Already carries a broker response code; propagate unchanged
         } catch (const std::exception& e) {

@@ -2,7 +2,12 @@
 #include "rocketmq/client/admin.h"
 
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <exception>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -15,6 +20,7 @@
 #include "rocketmq/common/sysflag.h"
 #include "rocketmq/common/util_all.h"
 #include "rocketmq/remoting/protocol/codes.h"
+#include "rocketmq/remoting/protocol/extra_info.h"
 #include "rocketmq/remoting/protocol/serialize.h"
 
 namespace rocketmq {
@@ -36,6 +42,35 @@ int64_t extInt(const RemotingCommand& r, const std::string& key, int64_t fallbac
 
 // Equivalent text of a JsonValue (used to compare whether DataVersion changed)
 std::string dvText(const JsonValue& v) { return v.isNull() ? std::string("null") : v.dump(); }
+
+template <typename T>
+AdminToolResult<T> adminSuccess(T data) {
+    AdminToolResult<T> r;
+    r.success = true;
+    r.code = AdminToolResultCode::SUCCESS;
+    r.errorMsg = "success";
+    r.data = std::move(data);
+    return r;
+}
+
+template <typename T>
+AdminToolResult<T> adminFailure(int32_t code, std::string msg) {
+    AdminToolResult<T> r;
+    r.success = false;
+    r.code = code;
+    r.errorMsg = std::move(msg);
+    return r;
+}
+
+template <typename T>
+AdminToolResult<T> adminFailure(int32_t code, std::string msg, T data) {
+    AdminToolResult<T> r;
+    r.success = false;
+    r.code = code;
+    r.errorMsg = std::move(msg);
+    r.data = std::move(data);
+    return r;
+}
 
 }  // namespace
 
@@ -91,6 +126,7 @@ void DefaultMQAdminExt::start() {
     // The instance answers the delegated offset / consumer-list family, and it applies the
     // VIP translation itself -- so the admin's switch has to be handed over before start().
     mqClient_->setVipChannelEnabled(vipChannelEnabled_);
+    mqClient_->setMaxPageSizeInGetMetadata(maxPageSizeInGetMetadata_);
     std::shared_ptr<RPCHook> requestHook =
         composeRequestHooks(enableStreamRequestType_, rpcHook_,
                             [this] { return namespaceV2_; });
@@ -306,14 +342,73 @@ TopicConfig DefaultMQAdminExt::examineTopicConfig(const std::string& addr,
 
 TopicConfigSerializeWrapper DefaultMQAdminExt::getAllTopicConfig(const std::string& brokerAddr,
                                                                 int32_t timeoutMillis) {
-    RemotingCommand response = requireClient().invokeSync(
-        vipAddr(brokerAddr), RequestCode::GET_ALL_TOPIC_CONFIG, PropertyMap(), Bytes(), false,
-        timeoutMillis < 0 ? timeoutMillis_ : timeoutMillis);
-    TopicConfigSerializeWrapper w;
-    if (!response.body.empty()) {
-        TopicConfigSerializeWrapper::decode(response.body, w);
+    MQClientInstance& client = requireClient();
+    const int32_t timeout = timeoutMillis < 0 ? timeoutMillis_ : timeoutMillis;
+    const int64_t begin = UtilAll::currentTimeMillis();
+    const int32_t pageSize = client.maxPageSizeInGetMetadata();
+
+    TopicConfigSerializeWrapper result;
+    int64_t topicSeq = 0;
+    JsonValue currentDataVersion = JsonValue::makeNull();
+    bool haveVersion = false;
+
+    while (true) {
+        const int64_t left = timeout - (UtilAll::currentTimeMillis() - begin);
+        if (left < 0) {
+            throw MQClientException("invokeSync call timeout");
+        }
+        PropertyMap ext;
+        ext["topicSeq"] = i64str(topicSeq);
+        ext["maxTopicNum"] = i64str(pageSize);
+        // The key is always present; its first-page value is the empty string.
+        ext["dataVersion"] = haveVersion ? dvText(currentDataVersion) : std::string();
+
+        RemotingCommand response = client.invokeSyncRaw(
+            vipAddr(brokerAddr), RequestCode::GET_ALL_TOPIC_CONFIG, ext, Bytes(), false,
+            static_cast<int32_t>(left));
+        if (response.code != ResponseCode::SUCCESS) {
+            throw MQBrokerException(response.code, response.remark);
+        }
+        TopicConfigSerializeWrapper page;
+        if (!response.body.empty()) TopicConfigSerializeWrapper::decode(response.body, page);
+        for (const auto& kv : page.topicConfigTable) {
+            result.topicConfigTable[kv.first] = kv.second;
+        }
+
+        auto totalIt = response.extFields.find("totalTopicNum");
+        if (totalIt == response.extFields.end() || totalIt->second.empty()) {
+            // Old broker: the single response already contains the whole table.
+            if (!haveVersion) currentDataVersion = page.dataVersion;
+            break;
+        }
+        int64_t total = 0;
+        try {
+            total = std::stoll(totalIt->second);
+        } catch (...) {
+            if (!haveVersion) currentDataVersion = page.dataVersion;
+            break;
+        }
+
+        const JsonValue newVersion = page.dataVersion;
+        if (!haveVersion) {
+            currentDataVersion = newVersion;
+            haveVersion = true;
+        } else if (dvText(currentDataVersion) != dvText(newVersion)) {
+            // The table changed underneath the paging walk: restart from the first page with
+            // the version just observed and discard the pages merged so far.
+            logger_warn("topic config dataVersion changed, restart paging");
+            currentDataVersion = newVersion;
+            topicSeq = 0;
+            result.topicConfigTable.clear();
+            continue;
+        }
+
+        topicSeq += pageSize;
+        if (topicSeq >= total - 1) break;
     }
-    return w;
+
+    result.dataVersion = currentDataVersion;
+    return result;
 }
 
 TopicConfigSerializeWrapper DefaultMQAdminExt::getUserTopicConfig(
@@ -393,38 +488,37 @@ void DefaultMQAdminExt::createAndUpdateTopicConfigList(const std::string& broker
                                                       const std::vector<TopicConfig>& configs) {
     // UPDATE_AND_CREATE_TOPIC_LIST(18): the custom header is **empty** (the topic name acts as the
     // authorized resource in the body), and the body is CreateTopicListRequestBody JSON, i.e. {"topicConfigList":[...]}.
-    if (configs.empty()) {
-        throw MQClientException("createAndUpdateTopicConfigList: empty topicConfigList");
-    }
+    // The list is sent as received -- an empty one is not filtered out here.
     JsonValue rows = JsonValue::makeArray();
     for (const TopicConfig& config : configs) {
         rows.pushArray(config.toJson());
     }
     JsonValue body = JsonValue::makeObject();
     body.set("topicConfigList", rows);
-    requireClient().invokeSync(vipAddr(brokerAddr), RequestCode::UPDATE_AND_CREATE_TOPIC_LIST,
-                               PropertyMap(), RemotingSerializable::encode(body), true,
-                               timeoutMillis_);
+    RemotingCommand response = requireClient().invokeSyncRaw(
+        vipAddr(brokerAddr), RequestCode::UPDATE_AND_CREATE_TOPIC_LIST, PropertyMap(),
+        RemotingSerializable::encode(body), true, timeoutMillis_);
+    if (response.code != ResponseCode::SUCCESS) {
+        throw MQClientException(response.remark, response.code);
+    }
 }
 
 void DefaultMQAdminExt::createAndUpdateSubscriptionGroupConfigList(
     const std::string& brokerAddr, const std::vector<SubscriptionGroupConfig>& configs) {
     // UPDATE_AND_CREATE_SUBSCRIPTIONGROUP_LIST(225): same shape as the topic-list one, but the body key is
     // `groupConfigList` (the single-group version 200 has a bare SubscriptionGroupConfig object as its body).
-    if (configs.empty()) {
-        throw MQClientException(
-            "createAndUpdateSubscriptionGroupConfigList: empty groupConfigList");
-    }
     JsonValue rows = JsonValue::makeArray();
     for (const SubscriptionGroupConfig& config : configs) {
         rows.pushArray(config.toJson());
     }
     JsonValue body = JsonValue::makeObject();
     body.set("groupConfigList", rows);
-    requireClient().invokeSync(vipAddr(brokerAddr),
-                               RequestCode::UPDATE_AND_CREATE_SUBSCRIPTIONGROUP_LIST,
-                               PropertyMap(), RemotingSerializable::encode(body), true,
-                               timeoutMillis_);
+    RemotingCommand response = requireClient().invokeSyncRaw(
+        vipAddr(brokerAddr), RequestCode::UPDATE_AND_CREATE_SUBSCRIPTIONGROUP_LIST, PropertyMap(),
+        RemotingSerializable::encode(body), true, timeoutMillis_);
+    if (response.code != ResponseCode::SUCCESS) {
+        throw MQClientException(response.remark, response.code);
+    }
 }
 
 void DefaultMQAdminExt::createStaticTopic(const std::string& brokerAddr,
@@ -901,6 +995,7 @@ SubscriptionGroupWrapper DefaultMQAdminExt::getAllSubscriptionGroup(const std::s
     MQClientInstance& client = requireClient();
     int32_t timeout = timeoutMillis < 0 ? timeoutMillis_ : timeoutMillis;
     int64_t begin = UtilAll::currentTimeMillis();
+    const int32_t pageSize = client.maxPageSizeInGetMetadata();
 
     JsonValue currentDataVersion = JsonValue::makeNull();
     int64_t groupSeq = 0;
@@ -915,8 +1010,9 @@ SubscriptionGroupWrapper DefaultMQAdminExt::getAllSubscriptionGroup(const std::s
         }
         PropertyMap ext;
         ext["groupSeq"] = i64str(groupSeq);
-        ext["maxGroupNum"] = "10000";
-        if (haveVersion) ext["dataVersion"] = dvText(currentDataVersion);
+        ext["maxGroupNum"] = i64str(pageSize);
+        // The key is always present; its first-page value is the empty string.
+        ext["dataVersion"] = haveVersion ? dvText(currentDataVersion) : std::string();
 
         RemotingCommand response = client.invokeSyncRaw(
             vipAddr(brokerAddr), RequestCode::GET_ALL_SUBSCRIPTIONGROUP_CONFIG, ext, Bytes(), false,
@@ -932,25 +1028,26 @@ SubscriptionGroupWrapper DefaultMQAdminExt::getAllSubscriptionGroup(const std::s
                 forbidden.set(kv.first, kv.second);
             }
         }
-        JsonValue newVersion = wrapper.dataVersion;
-        if (!haveVersion) {
-            currentDataVersion = newVersion;
-            haveVersion = true;
-        }
-        groupSeq += static_cast<int64_t>(wrapper.subscriptionGroupTable.size());
 
         auto totalIt = response.extFields.find("totalGroupNum");
         if (totalIt == response.extFields.end() || totalIt->second.empty()) {
             // Old broker: everything in one response
+            if (!haveVersion) currentDataVersion = wrapper.dataVersion;
             break;
         }
         int64_t total = 0;
         try {
             total = std::stoll(totalIt->second);
         } catch (...) {
+            if (!haveVersion) currentDataVersion = wrapper.dataVersion;
             break;
         }
-        if (dvText(currentDataVersion) != dvText(newVersion)) {
+
+        JsonValue newVersion = wrapper.dataVersion;
+        if (!haveVersion) {
+            currentDataVersion = newVersion;
+            haveVersion = true;
+        } else if (dvText(currentDataVersion) != dvText(newVersion)) {
             logger_warn("subscription group dataVersion changed, restart paging");
             currentDataVersion = newVersion;
             groupSeq = 0;
@@ -958,6 +1055,8 @@ SubscriptionGroupWrapper DefaultMQAdminExt::getAllSubscriptionGroup(const std::s
             forbidden = JsonValue::makeObject();
             continue;
         }
+
+        groupSeq += pageSize;
         if (groupSeq >= total - 1) break;
     }
 
@@ -1000,11 +1099,12 @@ ConsumerConnection DefaultMQAdminExt::examineConsumerConnectionInfo(
     ext["consumerGroup"] = consumerGroup;
     RemotingCommand response = client.invokeSync(vipAddr(addr), RequestCode::GET_CONSUMER_CONNECTION_LIST,
                                                  ext, Bytes(), false, timeoutMillis_);
-    if (response.body.empty()) {
-        throw MQClientException("consumer group " + consumerGroup + " not online");
-    }
     ConsumerConnection cc;
-    ConsumerConnection::decode(response.body, cc);
+    if (!response.body.empty()) ConsumerConnection::decode(response.body, cc);
+    if (cc.connectionSet.empty()) {
+        throw MQClientException("Not found the consumer group connection",
+                                ResponseCode::CONSUMER_NOT_ONLINE);
+    }
     return cc;
 }
 
@@ -1157,6 +1257,84 @@ std::string codeDesc(int32_t code, const std::string& msg) {
 
 }  // namespace
 
+MessageTrack DefaultMQAdminExt::trackMessageGroup(const MessageExt& msg, const std::string& group,
+                                                  bool mapBroadcast) {
+    // One verdict per group, shared by the single and the concurrent track form. The connection
+    // probe failure keeps the verdict UNKNOWN unless the broker answered CONSUMER_NOT_ONLINE; the
+    // consumed() probe failure maps NOT_ONLINE, and (single form only) the broadcast verdict.
+    MessageTrack mt;
+    mt.consumerGroup = group;
+    ConsumerConnection cc;
+    try {
+        cc = examineConsumerConnectionInfo(group);
+    } catch (const MQBrokerException& e) {
+        if (e.getResponseCode() == ResponseCode::CONSUMER_NOT_ONLINE) {
+            mt.trackType = TrackType::NOT_ONLINE;
+        }
+        mt.exceptionDesc = codeDesc(e.getResponseCode(), e.getResponseMessage());
+        return mt;
+    } catch (const std::exception& e) {
+        mt.exceptionDesc = e.what();
+        return mt;
+    }
+
+    if (cc.consumeType == "CONSUME_ACTIVELY") {
+        mt.trackType = TrackType::PULL;
+        return mt;
+    }
+    if (cc.consumeType != "CONSUME_PASSIVELY") {
+        return mt;
+    }
+    bool ifConsumed = false;
+    try {
+        ifConsumed = consumed(msg, group);
+    } catch (const MQBrokerException& e) {
+        if (e.getResponseCode() == ResponseCode::CONSUMER_NOT_ONLINE) {
+            mt.trackType = TrackType::NOT_ONLINE;
+            mt.exceptionDesc = codeDesc(e.getResponseCode(), e.getResponseMessage());
+        }
+        if (mapBroadcast && e.getResponseCode() == ResponseCode::BROADCAST_CONSUMPTION) {
+            mt.trackType = TrackType::CONSUME_BROADCASTING;
+        }
+        return mt;
+    } catch (const MQClientException& e) {
+        if (e.getResponseCode() == ResponseCode::CONSUMER_NOT_ONLINE) {
+            mt.trackType = TrackType::NOT_ONLINE;
+            mt.exceptionDesc = codeDesc(e.getResponseCode(), e.what());
+        }
+        if (mapBroadcast && e.getResponseCode() == ResponseCode::BROADCAST_CONSUMPTION) {
+            mt.trackType = TrackType::CONSUME_BROADCASTING;
+        }
+        return mt;
+    } catch (const std::exception& e) {
+        mt.exceptionDesc = e.what();
+        return mt;
+    }
+
+    if (ifConsumed) {
+        mt.trackType = TrackType::CONSUMED;
+        const JsonValue* sub = cc.subscriptionTable.find(msg.topic);
+        if (sub != nullptr && sub->isObject()) {
+            const JsonValue* tags = sub->find("tagsSet");
+            std::set<std::string> tagsSet;
+            if (tags != nullptr && tags->isArray()) {
+                for (size_t i = 0; i < tags->size(); ++i) {
+                    if (tags->at(i).isString()) {
+                        tagsSet.insert(tags->at(i).stringValue());
+                    }
+                }
+            }
+            if (!tagsSet.empty() && tagsSet.count("*") == 0
+                && tagsSet.count(msg.getTags()) == 0) {
+                mt.trackType = TrackType::CONSUMED_BUT_FILTERED;
+            }
+        }
+    } else {
+        mt.trackType = TrackType::NOT_CONSUME_YET;
+    }
+    return mt;
+}
+
 std::vector<MessageTrack> DefaultMQAdminExt::messageTrackDetail(const MessageExt& msg) {
     std::vector<MessageTrack> result;
     TopicRouteData route = examineTopicRoute(msg.topic);
@@ -1168,78 +1346,7 @@ std::vector<MessageTrack> DefaultMQAdminExt::messageTrackDetail(const MessageExt
     if (brokerAddr.empty()) return result;
     std::set<std::string> groups = queryTopicConsumeByWho(brokerAddr, msg.topic);
     for (const std::string& group : groups) {
-        MessageTrack mt;
-        mt.consumerGroup = group;
-        ConsumerConnection cc;
-        try {
-            cc = examineConsumerConnectionInfo(group);
-        } catch (const MQBrokerException& e) {
-            if (e.getResponseCode() == ResponseCode::CONSUMER_NOT_ONLINE) {
-                mt.trackType = TrackType::NOT_ONLINE;
-            }
-            mt.exceptionDesc = codeDesc(e.getResponseCode(), e.getResponseMessage());
-            result.push_back(mt);
-            continue;
-        } catch (const std::exception& e) {
-            mt.exceptionDesc = e.what();
-            result.push_back(mt);
-            continue;
-        }
-
-        if (cc.consumeType == "CONSUME_ACTIVELY") {
-            mt.trackType = TrackType::PULL;
-        } else if (cc.consumeType == "CONSUME_PASSIVELY") {
-            bool ifConsumed = false;
-            try {
-                ifConsumed = consumed(msg, group);
-            } catch (const MQBrokerException& e) {
-                if (e.getResponseCode() == ResponseCode::CONSUMER_NOT_ONLINE) {
-                    mt.trackType = TrackType::NOT_ONLINE;
-                    mt.exceptionDesc =
-                        codeDesc(e.getResponseCode(), e.getResponseMessage());
-                } else if (e.getResponseCode() == ResponseCode::BROADCAST_CONSUMPTION) {
-                    mt.trackType = TrackType::CONSUME_BROADCASTING;
-                }
-                result.push_back(mt);
-                continue;
-            } catch (const MQClientException& e) {
-                if (e.getResponseCode() == ResponseCode::CONSUMER_NOT_ONLINE) {
-                    mt.trackType = TrackType::NOT_ONLINE;
-                    mt.exceptionDesc = codeDesc(e.getResponseCode(), e.what());
-                } else if (e.getResponseCode() == ResponseCode::BROADCAST_CONSUMPTION) {
-                    mt.trackType = TrackType::CONSUME_BROADCASTING;
-                }
-                result.push_back(mt);
-                continue;
-            } catch (const std::exception& e) {
-                mt.exceptionDesc = e.what();
-                result.push_back(mt);
-                continue;
-            }
-
-            if (ifConsumed) {
-                mt.trackType = TrackType::CONSUMED;
-                const JsonValue* sub = cc.subscriptionTable.find(msg.topic);
-                if (sub != nullptr && sub->isObject()) {
-                    const JsonValue* tags = sub->find("tagsSet");
-                    std::set<std::string> tagsSet;
-                    if (tags != nullptr && tags->isArray()) {
-                        for (size_t i = 0; i < tags->size(); ++i) {
-                            if (tags->at(i).isString()) {
-                                tagsSet.insert(tags->at(i).stringValue());
-                            }
-                        }
-                    }
-                    if (!tagsSet.empty() && tagsSet.count("*") == 0
-                        && tagsSet.count(msg.getTags()) == 0) {
-                        mt.trackType = TrackType::CONSUMED_BUT_FILTERED;
-                    }
-                }
-            } else {
-                mt.trackType = TrackType::NOT_CONSUME_YET;
-            }
-        }
-        result.push_back(mt);
+        result.push_back(trackMessageGroup(msg, group, true));
     }
     return result;
 }
@@ -1609,6 +1716,962 @@ ConsumeMessageDirectlyResult DefaultMQAdminExt::consumeMessageDirectly(
     }
     return consumeMessageDirectly(msg.getStoreHostString(), consumerGroup, clientId, topic,
                                   outMsgId);
+}
+
+// ---------------------------------------- AUTH user management (3001-3005)
+// Deliberately not routed through vipAddr: the caller-supplied address is used verbatim.
+void DefaultMQAdminExt::createUser(const std::string& brokerAddr, const UserInfo& user) {
+    if (user.username.empty()) {
+        throw MQClientException("createUser: username required");
+    }
+    PropertyMap ext;
+    ext["username"] = user.username;
+    requireClient().invokeSync(brokerAddr, RequestCode::AUTH_CREATE_USER, ext,
+                               RemotingSerializable::encode(user.toJson()), true, timeoutMillis_);
+}
+
+void DefaultMQAdminExt::createUser(const std::string& brokerAddr, const std::string& username,
+                                   const std::string& password, const std::string& userType) {
+    UserInfo user;
+    user.username = username;
+    user.password = password;
+    user.hasPassword = true;
+    user.userType = userType;
+    user.hasUserType = true;
+    createUser(brokerAddr, user);
+}
+
+void DefaultMQAdminExt::updateUser(const std::string& brokerAddr, const UserInfo& user) {
+    if (user.username.empty()) {
+        throw MQClientException("updateUser: username required");
+    }
+    PropertyMap ext;
+    ext["username"] = user.username;
+    requireClient().invokeSync(brokerAddr, RequestCode::AUTH_UPDATE_USER, ext,
+                               RemotingSerializable::encode(user.toJson()), true, timeoutMillis_);
+}
+
+void DefaultMQAdminExt::updateUser(const std::string& brokerAddr, const std::string& username,
+                                   const std::string& password, const std::string& userType) {
+    UserInfo user;
+    user.username = username;
+    user.password = password;
+    user.hasPassword = true;
+    user.userType = userType;
+    user.hasUserType = true;
+    updateUser(brokerAddr, user);
+}
+
+void DefaultMQAdminExt::deleteUser(const std::string& brokerAddr, const std::string& username) {
+    if (username.empty()) {
+        throw MQClientException("deleteUser: username required");
+    }
+    PropertyMap ext;
+    ext["username"] = username;
+    requireClient().invokeSync(brokerAddr, RequestCode::AUTH_DELETE_USER, ext, Bytes(), false,
+                               timeoutMillis_);
+}
+
+UserInfo DefaultMQAdminExt::getUser(const std::string& brokerAddr, const std::string& username) {
+    if (username.empty()) {
+        throw MQClientException("getUser: username required");
+    }
+    PropertyMap ext;
+    ext["username"] = username;
+    RemotingCommand response = requireClient().invokeSync(
+        brokerAddr, RequestCode::AUTH_GET_USER, ext, Bytes(), false, timeoutMillis_);
+    UserInfo out;
+    if (!response.body.empty()) UserInfo::decode(response.body, out);
+    return out;
+}
+
+std::vector<UserInfo> DefaultMQAdminExt::listUser(const std::string& brokerAddr,
+                                                  const std::optional<std::string>& filter) {
+    PropertyMap ext;
+    if (filter.has_value()) ext["filter"] = *filter;
+    RemotingCommand response = requireClient().invokeSync(
+        brokerAddr, RequestCode::AUTH_LIST_USER, ext, Bytes(), false, timeoutMillis_);
+    std::vector<UserInfo> out;
+    if (!response.body.empty()) {
+        JsonValue v;
+        if (RemotingSerializable::decode(response.body, v)) out = UserInfo::listFromJson(v);
+    }
+    return out;
+}
+
+// ---------------------------------------- AUTH ACL management (3006-3010)
+namespace {
+
+// One policy, policyType left unset, one entry per resource repeating the shared grant fields
+AclInfo buildSinglePolicyAcl(const std::string& subject, const std::vector<std::string>& resources,
+                             const std::vector<std::string>& actions,
+                             const std::vector<std::string>& sourceIps,
+                             const std::string& decision) {
+    AclInfo acl;
+    acl.subject = subject;
+    AclPolicy policy;
+    for (const std::string& resource : resources) {
+        AclEntry entry;
+        entry.resource = resource;
+        entry.actions = actions;
+        entry.hasActions = true;
+        entry.sourceIps = sourceIps;
+        entry.hasSourceIps = true;
+        entry.decision = decision;
+        entry.hasDecision = true;
+        policy.entries.push_back(entry);
+    }
+    acl.policies.push_back(policy);
+    return acl;
+}
+
+}  // namespace
+
+void DefaultMQAdminExt::createAcl(const std::string& brokerAddr, const AclInfo& acl) {
+    if (acl.subject.empty()) {
+        throw MQClientException("createAcl: subject required");
+    }
+    PropertyMap ext;
+    ext["subject"] = acl.subject;
+    requireClient().invokeSync(brokerAddr, RequestCode::AUTH_CREATE_ACL, ext,
+                               RemotingSerializable::encode(acl.toJson()), true, timeoutMillis_);
+}
+
+void DefaultMQAdminExt::createAcl(const std::string& brokerAddr, const std::string& subject,
+                                  const std::vector<std::string>& resources,
+                                  const std::vector<std::string>& actions,
+                                  const std::vector<std::string>& sourceIps,
+                                  const std::string& decision) {
+    createAcl(brokerAddr, buildSinglePolicyAcl(subject, resources, actions, sourceIps, decision));
+}
+
+void DefaultMQAdminExt::updateAcl(const std::string& brokerAddr, const AclInfo& acl) {
+    if (acl.subject.empty()) {
+        throw MQClientException("updateAcl: subject required");
+    }
+    PropertyMap ext;
+    ext["subject"] = acl.subject;
+    requireClient().invokeSync(brokerAddr, RequestCode::AUTH_UPDATE_ACL, ext,
+                               RemotingSerializable::encode(acl.toJson()), true, timeoutMillis_);
+}
+
+void DefaultMQAdminExt::updateAcl(const std::string& brokerAddr, const std::string& subject,
+                                  const std::vector<std::string>& resources,
+                                  const std::vector<std::string>& actions,
+                                  const std::vector<std::string>& sourceIps,
+                                  const std::string& decision) {
+    updateAcl(brokerAddr, buildSinglePolicyAcl(subject, resources, actions, sourceIps, decision));
+}
+
+void DefaultMQAdminExt::deleteAcl(const std::string& brokerAddr, const std::string& subject,
+                                  const std::string& resource) {
+    if (subject.empty()) {
+        throw MQClientException("deleteAcl: subject required");
+    }
+    PropertyMap ext;
+    ext["subject"] = subject;
+    if (!resource.empty()) ext["resource"] = resource;
+    requireClient().invokeSync(brokerAddr, RequestCode::AUTH_DELETE_ACL, ext, Bytes(), false,
+                               timeoutMillis_);
+}
+
+AclInfo DefaultMQAdminExt::getAcl(const std::string& brokerAddr, const std::string& subject) {
+    if (subject.empty()) {
+        throw MQClientException("getAcl: subject required");
+    }
+    PropertyMap ext;
+    ext["subject"] = subject;
+    RemotingCommand response = requireClient().invokeSync(
+        brokerAddr, RequestCode::AUTH_GET_ACL, ext, Bytes(), false, timeoutMillis_);
+    AclInfo out;
+    if (!response.body.empty()) AclInfo::decode(response.body, out);
+    return out;
+}
+
+std::vector<AclInfo> DefaultMQAdminExt::listAcl(const std::string& brokerAddr,
+                                                const std::optional<std::string>& subjectFilter,
+                                                const std::optional<std::string>& resourceFilter) {
+    PropertyMap ext;
+    if (subjectFilter.has_value()) ext["subjectFilter"] = *subjectFilter;
+    if (resourceFilter.has_value()) ext["resourceFilter"] = *resourceFilter;
+    RemotingCommand response = requireClient().invokeSync(
+        brokerAddr, RequestCode::AUTH_LIST_ACL, ext, Bytes(), false, timeoutMillis_);
+    std::vector<AclInfo> out;
+    if (!response.body.empty()) {
+        JsonValue v;
+        if (RemotingSerializable::decode(response.body, v)) out = AclInfo::listFromJson(v);
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------- Container management (902/903)
+void DefaultMQAdminExt::addBroker(const std::string& containerAddr, const std::string& configPath) {
+    // The container address travels verbatim (no VIP rewrite) with the admin default timeout.
+    PropertyMap ext;
+    if (!configPath.empty()) ext["configPath"] = configPath;
+    RemotingCommand response = requireClient().invokeSyncRaw(
+        containerAddr, RequestCode::ADD_BROKER, ext, Bytes(), false, DEFAULT_TIMEOUT);
+    if (response.code != ResponseCode::SUCCESS) {
+        throw MQBrokerException(response.code, response.remark);
+    }
+}
+
+void DefaultMQAdminExt::removeBroker(const std::string& containerAddr,
+                                     const std::string& brokerClusterName,
+                                     const std::string& brokerName, int64_t brokerId) {
+    PropertyMap ext;
+    ext["brokerName"] = brokerName;
+    ext["brokerClusterName"] = brokerClusterName;
+    ext["brokerId"] = i64str(brokerId);
+    RemotingCommand response = requireClient().invokeSyncRaw(
+        containerAddr, RequestCode::REMOVE_BROKER, ext, Bytes(), false, DEFAULT_TIMEOUT);
+    if (response.code != ResponseCode::SUCCESS) {
+        throw MQBrokerException(response.code, response.remark);
+    }
+}
+
+// ---------------------------------------------------------------- Controller administration
+namespace {
+
+std::string extStr(const RemotingCommand& r, const char* key) {
+    auto it = r.extFields.find(key);
+    return it == r.extFields.end() ? std::string() : it->second;
+}
+
+}  // namespace
+
+ControllerMetaData DefaultMQAdminExt::getControllerMetaData(const std::string& controllerAddr) {
+    RemotingCommand response = requireClient().invokeSyncRaw(
+        controllerAddr, RequestCode::CONTROLLER_GET_METADATA_INFO, PropertyMap(), Bytes(), false,
+        3000);
+    if (response.code != ResponseCode::SUCCESS) {
+        throw MQBrokerException(response.code, response.remark);
+    }
+    ControllerMetaData meta;
+    meta.group = extStr(response, "group");
+    meta.controllerLeaderId = extStr(response, "controllerLeaderId");
+    meta.controllerLeaderAddress = extStr(response, "controllerLeaderAddress");
+    meta.isLeader = extStr(response, "isLeader") == "true";
+    meta.peers = extStr(response, "peers");
+    return meta;
+}
+
+BrokerReplicasInfo DefaultMQAdminExt::getInSyncStateData(
+    const std::string& controllerAddr, const std::vector<std::string>& brokers) {
+    // Two-phase: ask any controller node for the metadata first, then the sync state from the leader.
+    ControllerMetaData meta = getControllerMetaData(controllerAddr);
+    if (meta.controllerLeaderAddress.empty()) {
+        throw MQClientException("controller leader address is not available");
+    }
+    JsonValue arr = JsonValue::makeArray();
+    for (const std::string& b : brokers) arr.pushArray(JsonValue::makeString(b));
+    RemotingCommand response = requireClient().invokeSyncRaw(
+        meta.controllerLeaderAddress, RequestCode::CONTROLLER_GET_SYNC_STATE_DATA, PropertyMap(),
+        RemotingSerializable::encode(arr), true, 3000);
+    if (response.code != ResponseCode::SUCCESS) {
+        throw MQBrokerException(response.code, response.remark);
+    }
+    BrokerReplicasInfo info;
+    if (!response.body.empty()) BrokerReplicasInfo::decode(response.body, info);
+    return info;
+}
+
+std::map<std::string, PropertyMap> DefaultMQAdminExt::getControllerConfig(
+    const std::vector<std::string>& controllerServers, int32_t timeoutMillis) {
+    int32_t wait = timeoutMillis < 0 ? timeoutMillis_ : timeoutMillis;
+    std::vector<std::string> targets = controllerServers;
+    if (targets.empty()) targets = requireClient().nameServerAddrs();
+    if (targets.empty()) return {};
+    std::map<std::string, PropertyMap> configMap;
+    for (const std::string& controller : targets) {
+        RemotingCommand response = requireClient().invokeSyncRaw(
+            controller, RequestCode::GET_CONTROLLER_CONFIG, PropertyMap(), Bytes(), false, wait);
+        if (response.code != ResponseCode::SUCCESS) {
+            throw MQClientException(response.remark, response.code);
+        }
+        configMap[controller] = MixAll::string2Properties(
+            std::string(response.body.begin(), response.body.end()));
+    }
+    return configMap;
+}
+
+void DefaultMQAdminExt::updateControllerConfig(const PropertyMap& properties,
+                                               const std::vector<std::string>& controllers,
+                                               int32_t timeoutMillis) {
+    int32_t wait = timeoutMillis < 0 ? timeoutMillis_ : timeoutMillis;
+    std::string text = MixAll::properties2String(properties);
+    if (text.empty() || controllers.empty()) return;
+    bool hasError = false;
+    int32_t errCode = 0;
+    std::string errRemark;
+    for (const std::string& controller : controllers) {
+        RemotingCommand response = requireClient().invokeSyncRaw(
+            controller, RequestCode::UPDATE_CONTROLLER_CONFIG, PropertyMap(),
+            Bytes(text.begin(), text.end()), true, wait);
+        if (response.code != ResponseCode::SUCCESS) {
+            // every server gets the request; the last rejected one decides the exception
+            hasError = true;
+            errCode = response.code;
+            errRemark = response.remark;
+        }
+    }
+    if (hasError) throw MQClientException(errRemark, errCode);
+}
+
+void DefaultMQAdminExt::cleanBrokerData(const std::string& controllerAddr,
+                                        const std::string& clusterName,
+                                        const std::string& brokerName,
+                                        const std::string& brokerControllerIdsToClean,
+                                        bool isCleanLivingBroker) {
+    // Two-phase like the sync-state read: metadata first, then the clean request to the leader.
+    ControllerMetaData meta = getControllerMetaData(controllerAddr);
+    if (meta.controllerLeaderAddress.empty()) {
+        throw MQClientException("controller leader address is not available");
+    }
+    PropertyMap ext;
+    if (!clusterName.empty()) ext["clusterName"] = clusterName;
+    ext["brokerName"] = brokerName;
+    if (!brokerControllerIdsToClean.empty()) {
+        ext["brokerControllerIdsToClean"] = brokerControllerIdsToClean;
+    }
+    ext["isCleanLivingBroker"] = isCleanLivingBroker ? "true" : "false";
+    ext["invokeTime"] = i64str(UtilAll::currentTimeMillis());
+    RemotingCommand response = requireClient().invokeSyncRaw(
+        meta.controllerLeaderAddress, RequestCode::CLEAN_BROKER_DATA, ext, Bytes(), false, 3000);
+    if (response.code != ResponseCode::SUCCESS) {
+        throw MQBrokerException(response.code, response.remark);
+    }
+}
+
+// ---------------------------------------------------------------- Cold-data flow control
+void DefaultMQAdminExt::updateColdDataFlowCtrGroupConfig(const std::string& brokerAddr,
+                                                         const PropertyMap& properties) {
+    std::string text = MixAll::properties2String(properties);
+    if (text.empty()) return;
+    RemotingCommand response = requireClient().invokeSyncRaw(
+        vipAddr(brokerAddr), RequestCode::UPDATE_COLD_DATA_FLOW_CTR_CONFIG, PropertyMap(),
+        Bytes(text.begin(), text.end()), true, timeoutMillis_);
+    if (response.code != ResponseCode::SUCCESS) {
+        throw MQBrokerException(response.code, response.remark);
+    }
+}
+
+void DefaultMQAdminExt::removeColdDataFlowCtrGroupConfig(const std::string& brokerAddr,
+                                                         const std::string& consumerGroup) {
+    if (consumerGroup.empty()) return;
+    RemotingCommand response = requireClient().invokeSyncRaw(
+        vipAddr(brokerAddr), RequestCode::REMOVE_COLD_DATA_FLOW_CTR_CONFIG, PropertyMap(),
+        Bytes(consumerGroup.begin(), consumerGroup.end()), true, timeoutMillis_);
+    if (response.code != ResponseCode::SUCCESS) {
+        throw MQBrokerException(response.code, response.remark);
+    }
+}
+
+std::string DefaultMQAdminExt::getColdDataFlowCtrInfo(const std::string& brokerAddr) {
+    RemotingCommand response = requireClient().invokeSyncRaw(
+        brokerAddr, RequestCode::GET_COLD_DATA_FLOW_CTR_INFO, PropertyMap(), Bytes(), false,
+        timeoutMillis_);
+    if (response.code != ResponseCode::SUCCESS) {
+        throw MQBrokerException(response.code, response.remark);
+    }
+    return std::string(response.body.begin(), response.body.end());
+}
+
+// ---------------------------------------------------------------- CommitLog read-ahead / pop rollback
+std::string DefaultMQAdminExt::setCommitLogReadAheadMode(const std::string& brokerAddr,
+                                                         const std::string& mode) {
+    PropertyMap ext;
+    ext["READ_AHEAD_MODE"] = mode;
+    RemotingCommand response = requireClient().invokeSyncRaw(
+        brokerAddr, RequestCode::SET_COMMITLOG_READ_MODE, ext, Bytes(), false, timeoutMillis_);
+    if (response.code != ResponseCode::SUCCESS) {
+        throw MQBrokerException(response.code, response.remark);
+    }
+    return response.remark;
+}
+
+void DefaultMQAdminExt::exportPopRecords(const std::string& brokerAddr, int32_t timeoutMillis) {
+    RemotingCommand response = requireClient().invokeSyncRaw(
+        brokerAddr, RequestCode::POP_ROLLBACK, PropertyMap(), Bytes(), false, timeoutMillis);
+    if (response.code != ResponseCode::SUCCESS) {
+        throw MQBrokerException(response.code, response.remark);
+    }
+}
+
+// ---------------------------------------------------------------- RocksDB maintenance (354/355)
+CheckRocksdbCqWriteResult DefaultMQAdminExt::checkRocksdbCqWriteProgress(
+    const std::string& brokerAddr, const std::string& topic, int64_t checkStoreTime) {
+    PropertyMap ext;
+    ext["topic"] = topic;
+    ext["checkStoreTime"] = i64str(checkStoreTime);
+    RemotingCommand response = requireClient().invokeSyncRaw(
+        brokerAddr, RequestCode::CHECK_ROCKSDB_CQ_WRITE_PROGRESS, ext, Bytes(), false,
+        timeoutMillis_);
+    if (response.code != ResponseCode::SUCCESS) {
+        throw MQClientException(response.remark, response.code);
+    }
+    CheckRocksdbCqWriteResult result;
+    if (!response.body.empty()) CheckRocksdbCqWriteResult::decode(response.body, result);
+    return result;
+}
+
+void DefaultMQAdminExt::exportRocksDBConfigToJson(const std::string& brokerAddr,
+                                                  const std::vector<std::string>& configTypes) {
+    // the separator is written after every entry, so a single type still carries a trailing ';'
+    std::string configType;
+    for (const std::string& t : configTypes) configType += t + ";";
+    PropertyMap ext;
+    ext["configType"] = configType;
+    RemotingCommand response = requireClient().invokeSyncRaw(
+        brokerAddr, RequestCode::EXPORT_ROCKSDB_CONFIG_TO_JSON, ext, Bytes(), false,
+        timeoutMillis_);
+    if (response.code != ResponseCode::SUCCESS) {
+        throw MQClientException(response.remark, response.code);
+    }
+}
+
+// ---------------------------------------------------------------- Lite topic administration
+JsonValue DefaultMQAdminExt::getBrokerLiteInfo(const std::string& brokerAddr) {
+    return invokeBrokerMethod(brokerAddr, RequestCode::GET_BROKER_LITE_INFO, PropertyMap(),
+                              timeoutMillis_);
+}
+
+JsonValue DefaultMQAdminExt::getParentTopicInfo(const std::string& brokerAddr,
+                                                const std::string& topic) {
+    PropertyMap ext;
+    ext["topic"] = topic;
+    return invokeBrokerMethod(brokerAddr, RequestCode::GET_PARENT_TOPIC_INFO, ext, timeoutMillis_);
+}
+
+JsonValue DefaultMQAdminExt::getLiteTopicInfo(const std::string& brokerAddr,
+                                              const std::string& parentTopic,
+                                              const std::string& liteTopic) {
+    PropertyMap ext;
+    ext["parentTopic"] = parentTopic;
+    if (!liteTopic.empty()) ext["liteTopic"] = liteTopic;
+    return invokeBrokerMethod(brokerAddr, RequestCode::GET_LITE_TOPIC_INFO, ext, timeoutMillis_);
+}
+
+JsonValue DefaultMQAdminExt::getLiteClientInfo(const std::string& brokerAddr,
+                                               const std::string& parentTopic,
+                                               const std::string& group,
+                                               const std::string& clientId, int32_t maxCount) {
+    PropertyMap ext;
+    ext["parentTopic"] = parentTopic;
+    ext["group"] = group;
+    if (!clientId.empty()) ext["clientId"] = clientId;
+    ext["maxCount"] = i64str(maxCount);
+    return invokeBrokerMethod(brokerAddr, RequestCode::GET_LITE_CLIENT_INFO, ext, timeoutMillis_);
+}
+
+JsonValue DefaultMQAdminExt::getLiteGroupInfo(const std::string& brokerAddr,
+                                              const std::string& group,
+                                              const std::string& liteTopic, int32_t topK) {
+    PropertyMap ext;
+    ext["group"] = group;
+    if (!liteTopic.empty()) ext["liteTopic"] = liteTopic;
+    ext["topK"] = i64str(topK);
+    return invokeBrokerMethod(brokerAddr, RequestCode::GET_LITE_GROUP_INFO, ext, timeoutMillis_);
+}
+
+void DefaultMQAdminExt::triggerLiteDispatch(const std::string& brokerAddr,
+                                            const std::string& group,
+                                            const std::string& clientId) {
+    PropertyMap ext;
+    ext["group"] = group;
+    if (!clientId.empty()) ext["clientId"] = clientId;
+    invokeBrokerMethod(brokerAddr, RequestCode::TRIGGER_LITE_DISPATCH, ext, timeoutMillis_);
+}
+
+// ---------------------------------------------------------------- Concurrent fan-out forms
+AdminToolResult<TopicStatsTable> DefaultMQAdminExt::examineTopicStatsConcurrent(
+    const std::string& topic, int32_t timeoutMillis) {
+    int32_t wait = timeoutMillis < 0 ? timeoutMillis_ : timeoutMillis;
+    return adminToolExecute<TopicStatsTable>(
+        [&]() -> AdminToolResult<TopicStatsTable> {
+            TopicRouteData route;
+            if (!examineTopicRouteOrNull(topic, route) || route.brokerDatas.empty()) {
+                return adminSuccess<TopicStatsTable>(TopicStatsTable());
+            }
+            TopicStatsTable merged;
+            std::mutex mergeMutex;
+            runBoundedFanOut(route.brokerDatas.size(), wait, [&](size_t i) {
+                try {
+                    const std::string addr = route.brokerDatas[i].selectBrokerAddr();
+                    if (addr.empty()) return;
+                    PropertyMap ext;
+                    ext["topic"] = topic;
+                    RemotingCommand response = requireClient().invokeSync(
+                        vipAddr(addr), RequestCode::GET_TOPIC_STATS_INFO, ext, Bytes(), false,
+                        wait);
+                    TopicStatsTable part;
+                    if (!response.body.empty()) TopicStatsTable::decode(response.body, part);
+                    std::lock_guard<std::mutex> lk(mergeMutex);
+                    for (const auto& kv : part.offsetTable) {
+                        merged.offsetTable[kv.first] = kv.second;
+                    }
+                    merged.topicPutTps += part.topicPutTps;
+                } catch (const std::exception& e) {
+                    logger_warn("getTopicStatsInfo error. topic=" + topic + ": "
+                                + std::string(e.what()));
+                }
+            });
+            return adminSuccess<TopicStatsTable>(merged);
+        });
+}
+
+AdminToolResult<ConsumeStats> DefaultMQAdminExt::examineConsumeStatsConcurrent(
+    const std::string& consumerGroup, const std::string& topic, int32_t timeoutMillis) {
+    int32_t wait = timeoutMillis < 0 ? timeoutMillis_ : timeoutMillis;
+    return adminToolExecute<ConsumeStats>(
+        [&]() -> AdminToolResult<ConsumeStats> {
+            std::vector<std::string> routeTopics;
+            routeTopics.push_back(MixAll::getRetryTopic(consumerGroup));
+            if (!topic.empty()) {
+                routeTopics.push_back(topic);
+                routeTopics.push_back(extra_info::buildPopRetryTopicV1(topic, consumerGroup));
+            }
+            bool haveRoute = false;
+            TopicRouteData route;
+            for (const std::string& rt : routeTopics) {
+                try {
+                    if (examineTopicRouteOrNull(rt, route)) {
+                        haveRoute = true;
+                        break;
+                    }
+                } catch (const std::exception&) {
+                    continue;
+                }
+            }
+            if (!haveRoute || route.brokerDatas.empty()) {
+                return adminFailure<ConsumeStats>(AdminToolResultCode::TOPIC_ROUTE_INFO_NOT_EXIST,
+                                                  "topic router info not found");
+            }
+            ConsumeStats result;
+            std::map<std::string, double> consumerTpsMap;
+            std::mutex mergeMutex;
+            runBoundedFanOut(route.brokerDatas.size(), wait, [&](size_t i) {
+                try {
+                    const std::string addr = route.brokerDatas[i].selectBrokerAddr();
+                    if (addr.empty()) return;
+                    PropertyMap ext;
+                    ext["consumerGroup"] = consumerGroup;
+                    if (!topic.empty()) ext["topic"] = topic;
+                    RemotingCommand response = requireClient().invokeSync(
+                        vipAddr(addr), RequestCode::GET_CONSUME_STATS, ext, Bytes(), false, wait);
+                    ConsumeStats part;
+                    if (!response.body.empty()) ConsumeStats::decode(response.body, part);
+                    std::lock_guard<std::mutex> lk(mergeMutex);
+                    for (const auto& kv : part.offsetTable) {
+                        result.offsetTable[kv.first] = kv.second;
+                    }
+                    consumerTpsMap[addr] = part.consumeTps;
+                } catch (const std::exception& e) {
+                    logger_warn("getConsumeStats error. topic=" + topic + " consumerGroup="
+                                + consumerGroup + ": " + std::string(e.what()));
+                }
+            });
+            for (const auto& kv : consumerTpsMap) result.consumeTps += kv.second;
+            if (result.offsetTable.empty()) {
+                try {
+                    ConsumerConnection connection = examineConsumerConnectionInfo(consumerGroup);
+                    if (connection.messageModel == "BROADCASTING") {
+                        return adminFailure<ConsumeStats>(
+                            AdminToolResultCode::BROADCAST_CONSUMPTION,
+                            "Not found the consumer group consume stats, because return offset "
+                            "table is empty, the consumer is under the broadcast mode");
+                    }
+                } catch (const std::exception&) {
+                    return adminFailure<ConsumeStats>(
+                        AdminToolResultCode::CONSUMER_NOT_ONLINE,
+                        "Not found the consumer group consume stats, because return offset table "
+                        "is empty, maybe the consumer not consume any message");
+                }
+            }
+            return adminSuccess<ConsumeStats>(result);
+        });
+}
+
+AdminToolResult<BrokerOperatorResult> DefaultMQAdminExt::deleteTopicInBrokerConcurrent(
+    const std::vector<std::string>& addrs, const std::string& topic, int32_t timeoutMillis) {
+    int32_t wait = timeoutMillis < 0 ? timeoutMillis_ : timeoutMillis;
+    return adminToolExecute<BrokerOperatorResult>(
+        [&]() -> AdminToolResult<BrokerOperatorResult> {
+            std::vector<std::string> targets;
+            {
+                std::set<std::string> seen;
+                for (const std::string& a : addrs) {
+                    if (seen.insert(a).second) targets.push_back(a);
+                }
+            }
+            BrokerOperatorResult result;
+            std::mutex mergeMutex;
+            runBoundedFanOut(targets.size(), wait, [&](size_t i) {
+                const std::string& addr = targets[i];
+                try {
+                    requireClient().deleteTopicInBroker(addr, topic, wait);
+                    std::lock_guard<std::mutex> lk(mergeMutex);
+                    result.successList.push_back(addr);
+                } catch (const std::exception& e) {
+                    logger_warn("deleteTopicInBroker error. topic=" + topic + " broker=" + addr
+                                + ": " + std::string(e.what()));
+                    std::lock_guard<std::mutex> lk(mergeMutex);
+                    result.failureList.push_back(addr);
+                }
+            });
+            return adminSuccess<BrokerOperatorResult>(result);
+        });
+}
+
+AdminToolResult<BrokerOperatorResult> DefaultMQAdminExt::resetOffsetNewConcurrent(
+    const std::string& group, const std::string& topic, int64_t timestamp, int32_t timeoutMillis) {
+    int32_t wait = timeoutMillis < 0 ? timeoutMillis_ : timeoutMillis;
+    return adminToolExecute<BrokerOperatorResult>(
+        [&]() -> AdminToolResult<BrokerOperatorResult> {
+            TopicRouteData route;
+            if (!examineTopicRouteOrNull(topic, route) || route.brokerDatas.empty()) {
+                return adminFailure<BrokerOperatorResult>(
+                    AdminToolResultCode::TOPIC_ROUTE_INFO_NOT_EXIST, "topic router info not found");
+            }
+            std::map<std::string, QueueData> topicRouteMap;
+            for (const QueueData& qd : route.queueDatas) topicRouteMap[qd.brokerName] = qd;
+            BrokerOperatorResult result;
+            std::mutex mergeMutex;
+            runBoundedFanOut(route.brokerDatas.size(), wait, [&](size_t i) {
+                const BrokerData& bd = route.brokerDatas[i];
+                const std::string addr = bd.selectBrokerAddr();
+                if (addr.empty()) return;
+                try {
+                    invokeBrokerToResetOffsetConcurrent(addr, topic, group, timestamp, wait);
+                    std::lock_guard<std::mutex> lk(mergeMutex);
+                    result.successList.push_back(addr);
+                } catch (const MQClientException& e) {
+                    if (e.getResponseCode() == ResponseCode::CONSUMER_NOT_ONLINE) {
+                        try {
+                            resetOffsetOldOnBroker(addr, topicRouteMap[bd.brokerName], group,
+                                                   topic, timestamp, true);
+                            std::lock_guard<std::mutex> lk(mergeMutex);
+                            result.successList.push_back(addr);
+                        } catch (const std::exception& e2) {
+                            logger_warn("resetOffsetByTimestampOld error. addr=" + addr
+                                        + " topic=" + topic + " group=" + group + ": "
+                                        + std::string(e2.what()));
+                            std::lock_guard<std::mutex> lk(mergeMutex);
+                            result.failureList.push_back(addr);
+                        }
+                    } else if (e.getResponseCode() == ResponseCode::SYSTEM_ERROR) {
+                        // the group never came online on this broker, the reset is a no-op
+                        std::lock_guard<std::mutex> lk(mergeMutex);
+                        result.successList.push_back(addr);
+                    } else {
+                        logger_warn("resetOffsetNewConcurrent error. addr=" + addr + " topic="
+                                    + topic + " group=" + group + ": " + std::string(e.what()));
+                        std::lock_guard<std::mutex> lk(mergeMutex);
+                        result.failureList.push_back(addr);
+                    }
+                } catch (const std::exception& e) {
+                    logger_warn("resetOffsetNewConcurrent error. addr=" + addr + " topic=" + topic
+                                + " group=" + group + ": " + std::string(e.what()));
+                    std::lock_guard<std::mutex> lk(mergeMutex);
+                    result.failureList.push_back(addr);
+                }
+            });
+            if (result.successList.size() == route.brokerDatas.size()) {
+                return adminSuccess<BrokerOperatorResult>(result);
+            }
+            return adminFailure<BrokerOperatorResult>(AdminToolResultCode::MQ_BROKER_ERROR,
+                                                      "operator failure", result);
+        });
+}
+
+AdminToolResult<TopicList> DefaultMQAdminExt::queryTopicsByConsumerConcurrent(
+    const std::string& group, int32_t timeoutMillis) {
+    int32_t wait = timeoutMillis < 0 ? timeoutMillis_ : timeoutMillis;
+    return adminToolExecute<TopicList>(
+        [&]() -> AdminToolResult<TopicList> {
+            TopicRouteData route;
+            if (!examineTopicRouteOrNull(MixAll::getRetryTopic(group), route)
+                || route.brokerDatas.empty()) {
+                return adminFailure<TopicList>(AdminToolResultCode::TOPIC_ROUTE_INFO_NOT_EXIST,
+                                               "router info not found.");
+            }
+            TopicList result;
+            std::mutex mergeMutex;
+            runBoundedFanOut(route.brokerDatas.size(), wait, [&](size_t i) {
+                try {
+                    const std::string addr = route.brokerDatas[i].selectBrokerAddr();
+                    if (addr.empty()) return;
+                    PropertyMap ext;
+                    ext["group"] = group;
+                    RemotingCommand response = requireClient().invokeSync(
+                        vipAddr(addr), RequestCode::QUERY_TOPICS_BY_CONSUMER, ext, Bytes(), false,
+                        wait);
+                    TopicList part;
+                    if (!response.body.empty()) TopicList::decode(response.body, part);
+                    std::lock_guard<std::mutex> lk(mergeMutex);
+                    for (const std::string& t : part.topicList) result.topicList.push_back(t);
+                } catch (const std::exception& e) {
+                    logger_warn("queryTopicsByConsumer error. group=" + group + ": "
+                                + std::string(e.what()));
+                }
+            });
+            return adminSuccess<TopicList>(result);
+        });
+}
+
+AdminToolResult<JsonValue> DefaultMQAdminExt::queryConsumeTimeSpanConcurrent(
+    const std::string& topic, const std::string& group, int32_t timeoutMillis) {
+    int32_t wait = timeoutMillis < 0 ? timeoutMillis_ : timeoutMillis;
+    return adminToolExecute<JsonValue>(
+        [&]() -> AdminToolResult<JsonValue> {
+            JsonValue spans = JsonValue::makeArray();
+            TopicRouteData route;
+            if (!examineTopicRouteOrNull(topic, route) || route.brokerDatas.empty()) {
+                return adminSuccess<JsonValue>(spans);
+            }
+            std::mutex mergeMutex;
+            runBoundedFanOut(route.brokerDatas.size(), wait, [&](size_t i) {
+                try {
+                    const std::string addr = route.brokerDatas[i].selectBrokerAddr();
+                    if (addr.empty()) return;
+                    PropertyMap ext;
+                    ext["topic"] = topic;
+                    ext["group"] = group;
+                    RemotingCommand response = requireClient().invokeSync(
+                        vipAddr(addr), RequestCode::QUERY_CONSUME_TIME_SPAN, ext, Bytes(), false,
+                        wait);
+                    if (response.body.empty()) return;
+                    JsonValue v;
+                    if (!RemotingSerializable::decode(response.body, v)) return;
+                    const JsonValue* arr = v.find("consumeTimeSpanSet");
+                    if (arr == nullptr || !arr->isArray()) return;
+                    std::lock_guard<std::mutex> lk(mergeMutex);
+                    for (size_t j = 0; j < arr->size(); ++j) spans.pushArray(arr->at(j));
+                } catch (const std::exception& e) {
+                    logger_warn("queryConsumeTimeSpan error. topic=" + topic + " group=" + group
+                                + ": " + std::string(e.what()));
+                }
+            });
+            return adminSuccess<JsonValue>(spans);
+        });
+}
+
+std::vector<MessageTrack> DefaultMQAdminExt::messageTrackDetailConcurrent(const MessageExt& msg,
+                                                                          int32_t timeoutMillis) {
+    int32_t wait = timeoutMillis < 0 ? timeoutMillis_ : timeoutMillis;
+    TopicRouteData route;
+    if (!examineTopicRouteOrNull(msg.topic, route)) {
+        throw MQClientException("topic " + msg.topic + " not exist");
+    }
+    std::string brokerAddr;
+    for (const BrokerData& bd : route.brokerDatas) {
+        brokerAddr = bd.selectBrokerAddr();
+        if (!brokerAddr.empty()) break;
+    }
+    if (brokerAddr.empty()) {
+        throw MQClientException("no broker address along the route of " + msg.topic);
+    }
+    std::set<std::string> groupSet = queryTopicConsumeByWho(brokerAddr, msg.topic);
+    std::vector<std::string> groupList(groupSet.begin(), groupSet.end());
+    std::vector<MessageTrack> result;
+    std::mutex mergeMutex;
+    runBoundedFanOut(groupList.size(), wait, [&](size_t i) {
+        MessageTrack mt = trackMessageGroup(msg, groupList[i], false);
+        std::lock_guard<std::mutex> lk(mergeMutex);
+        result.push_back(mt);
+    });
+    return result;
+}
+
+// ---------------------------------------------------------------- Long-tail helpers
+bool DefaultMQAdminExt::examineTopicRouteOrNull(const std::string& topic, TopicRouteData& out) {
+    // Route probe with the null-for-TOPIC_NOT_EXIST contract: a missing topic yields false, a link
+    // failure on every name server rethrows the last RemotingException, any other non-SUCCESS code
+    // becomes MQClientException (the envelope classifies it).
+    MQClientInstance& client = requireClient();
+    PropertyMap ext;
+    ext["topic"] = topic;
+    std::exception_ptr pending;
+    bool sawError = false;
+    for (const std::string& ns : client.nameServerAddrs()) {
+        try {
+            RemotingCommand response = client.invokeSyncRaw(
+                ns, RequestCode::GET_ROUTEINFO_BY_TOPIC, ext, Bytes(), false, timeoutMillis_);
+            if (response.code == ResponseCode::TOPIC_NOT_EXIST) return false;
+            if (response.code != ResponseCode::SUCCESS) {
+                throw MQClientException(response.remark, response.code);
+            }
+            TopicRouteData route;
+            if (response.body.empty() || !TopicRouteData::decode(response.body, route)) {
+                throw MQClientException("topic route query for " + topic + " returned a bad body");
+            }
+            out = route;
+            return true;
+        } catch (const RemotingException& e) {
+            pending = std::current_exception();
+            sawError = true;
+        }
+    }
+    if (sawError) std::rethrow_exception(pending);
+    throw MQClientException("no name server available for the route query of " + topic);
+}
+
+JsonValue DefaultMQAdminExt::invokeBrokerMethod(const std::string& addr, int32_t requestCode,
+                                                const PropertyMap& extFields,
+                                                int32_t timeoutMillis) {
+    RemotingCommand response = requireClient().invokeSyncRaw(vipAddr(addr), requestCode, extFields,
+                                                             Bytes(), false, timeoutMillis);
+    if (response.code != ResponseCode::SUCCESS) {
+        throw MQBrokerException(response.code, response.remark);
+    }
+    if (response.body.empty()) return JsonValue::makeNull();
+    JsonValue v;
+    if (!RemotingSerializable::decode(response.body, v)) {
+        throw MQClientException("invokeBrokerMethod: bad response body");
+    }
+    return v;
+}
+
+std::map<MessageQueue, int64_t> DefaultMQAdminExt::invokeBrokerToResetOffsetConcurrent(
+    const std::string& brokerAddr, const std::string& topic, const std::string& group,
+    int64_t timestamp, int32_t timeoutMillis) {
+    // Unlike invokeBrokerToResetOffset above, SUCCESS without a body is a failure carrying the
+    // SUCCESS code and the remark (the raw switch falls through to the throw).
+    MQClientInstance& client = requireClient();
+    PropertyMap ext = buildResetOffsetExtFields(topic, group, timestamp, true, -1, -1);
+    RemotingCommand response = client.invokeSyncRaw(
+        vipAddr(brokerAddr), RequestCode::INVOKE_BROKER_TO_RESET_OFFSET, ext, Bytes(), false,
+        timeoutMillis);
+    if (response.code == ResponseCode::SUCCESS && !response.body.empty()) {
+        ResetOffsetBody body;
+        std::map<MessageQueue, int64_t> offsets;
+        if (ResetOffsetBody::decode(response.body, body)) {
+            for (const auto& kv : body.offsetTable) offsets[kv.first] = kv.second;
+        }
+        return offsets;
+    }
+    throw MQClientException(response.remark, response.code);
+}
+
+void DefaultMQAdminExt::resetOffsetOldOnBroker(const std::string& brokerAddr,
+                                               const QueueData& queueData,
+                                               const std::string& group,
+                                               const std::string& topic, int64_t timestamp,
+                                               bool force) {
+    // Consume-stats walk for one broker: every consumed queue of the topic gets searchOffset +
+    // a forced consumer-offset update; a group that never consumed anything falls back to the
+    // topic-stats walk over the read queues.
+    MQClientInstance& client = requireClient();
+    ConsumeStats consumeStats;
+    {
+        PropertyMap ext;
+        ext["consumerGroup"] = group;
+        RemotingCommand response = client.invokeSync(vipAddr(brokerAddr),
+                                                     RequestCode::GET_CONSUME_STATS, ext, Bytes(),
+                                                     false, timeoutMillis_);
+        if (!response.body.empty()) ConsumeStats::decode(response.body, consumeStats);
+    }
+    bool hasConsumed = false;
+    for (const auto& kv : consumeStats.offsetTable) {
+        const MessageQueue& queue = kv.first;
+        if (queue.topic != topic) continue;
+        hasConsumed = true;
+        resetOffsetOldOnQueue(brokerAddr, group, queue, kv.second, timestamp, force);
+    }
+    if (hasConsumed) return;
+
+    std::map<MessageQueue, TopicOffset> topicStatus;
+    {
+        PropertyMap ext;
+        ext["topic"] = topic;
+        RemotingCommand response = client.invokeSync(vipAddr(brokerAddr),
+                                                     RequestCode::GET_TOPIC_STATS_INFO, ext,
+                                                     Bytes(), false, timeoutMillis_);
+        if (!response.body.empty()) {
+            TopicStatsTable table;
+            if (TopicStatsTable::decode(response.body, table)) {
+                topicStatus = std::move(table.offsetTable);
+            }
+        }
+    }
+    for (int32_t i = 0; i < queueData.readQueueNums; ++i) {
+        MessageQueue queue(topic, queueData.brokerName, i);
+        OffsetWrapper wrapper;
+        auto it = topicStatus.find(queue);
+        if (it != topicStatus.end()) {
+            // the stats walk feeds broker offset / min offset as the starting pair
+            wrapper.brokerOffset = it->second.maxOffset;
+            wrapper.consumerOffset = it->second.minOffset;
+        }
+        resetOffsetOldOnQueue(brokerAddr, group, queue, wrapper, timestamp, force);
+    }
+}
+
+void DefaultMQAdminExt::resetOffsetOldOnQueue(const std::string& brokerAddr,
+                                              const std::string& group, const MessageQueue& mq,
+                                              const OffsetWrapper& wrapper, int64_t timestamp,
+                                              bool force) {
+    MQClientInstance& client = requireClient();
+    int64_t resetOffset = (timestamp == -1) ? client.getMaxOffset(mq, timeoutMillis_, brokerAddr)
+                                            : client.searchOffsetByTimestamp(mq, timestamp,
+                                                                             timeoutMillis_,
+                                                                             brokerAddr);
+    if (force || resetOffset <= wrapper.consumerOffset) {
+        client.updateConsumerOffset(group, mq, resetOffset, timeoutMillis_, brokerAddr);
+    }
+}
+
+void DefaultMQAdminExt::runBoundedFanOut(size_t count, int32_t timeoutMillis,
+                                         const std::function<void(size_t)>& task) {
+    if (count == 0) return;
+    std::mutex doneMutex;
+    size_t done = 0;
+    std::condition_variable doneCv;
+    std::vector<std::thread> workers;
+    workers.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        workers.emplace_back([&task, &doneMutex, &done, &doneCv, i]() {
+            task(i);
+            std::lock_guard<std::mutex> lk(doneMutex);
+            ++done;
+            doneCv.notify_one();
+        });
+    }
+    {
+        std::unique_lock<std::mutex> lk(doneMutex);
+        doneCv.wait_for(lk, std::chrono::milliseconds(timeoutMillis),
+                        [&] { return done == count; });
+    }
+    // Every task has to finish before the caller reads the shared result containers
+    // (std::map is not thread-safe); the per-task RPC timeouts bound this join.
+    for (auto& t : workers) t.join();
+}
+
+template <typename T>
+AdminToolResult<T> DefaultMQAdminExt::adminToolExecute(
+    const std::function<AdminToolResult<T>()>& handler) const {
+    try {
+        return handler();
+    } catch (const RemotingException& e) {
+        AdminToolResult<T> r;
+        r.code = AdminToolResultCode::REMOTING_ERROR;
+        r.errorMsg = e.what();
+        return r;
+    } catch (const MQClientException& e) {
+        AdminToolResult<T> r;
+        if (e.getResponseCode() == ResponseCode::TOPIC_NOT_EXIST) {
+            r.code = AdminToolResultCode::TOPIC_ROUTE_INFO_NOT_EXIST;
+        } else {
+            r.code = AdminToolResultCode::MQ_CLIENT_ERROR;
+        }
+        r.errorMsg = e.what();
+        return r;
+    } catch (const std::exception& e) {
+        AdminToolResult<T> r;
+        r.code = AdminToolResultCode::MQ_BROKER_ERROR;
+        r.errorMsg = e.what();
+        return r;
+    }
 }
 
 }  // namespace rocketmq

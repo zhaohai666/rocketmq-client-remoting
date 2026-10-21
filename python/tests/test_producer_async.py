@@ -494,7 +494,8 @@ def test_retry_budget_is_shared_not_per_attempt():
     _wait_done(cb)
     client = _client(p)
     assert client.attempts_count == 2          # the second round already used up the budget
-    assert client.timeouts[0] == 100
+    # the first attempt gets the full budget minus its own bookkeeping, which can cost a few ms
+    assert 90 <= client.timeouts[0] <= 100
     assert 0 < client.timeouts[1] < client.timeouts[0]
     assert isinstance(cb.errors[0], RemotingConnectException)
 

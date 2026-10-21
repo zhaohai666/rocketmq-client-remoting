@@ -123,6 +123,159 @@ struct QueryConsumeQueueResponseBody {
     static bool decode(const Bytes& data, QueryConsumeQueueResponseBody& out);
 };
 
+// ---------------------------------------------------------------- AUTH user / ACL management
+// The enum-valued fields are carried as fixed wire strings; the spelling and casing below
+// are byte-exact parts of the protocol.
+struct UserType {
+    static constexpr const char* SUPER = "Super";
+    static constexpr const char* NORMAL = "Normal";
+};
+
+struct UserStatus {
+    static constexpr const char* ENABLE = "enable";
+    static constexpr const char* DISABLE = "disable";
+};
+
+struct AclPolicyType {
+    static constexpr const char* CUSTOM = "Custom";
+    static constexpr const char* DEFAULT = "Default";
+};
+
+struct AclDecision {
+    static constexpr const char* ALLOW = "Allow";
+    static constexpr const char* DENY = "Deny";
+};
+
+// Unset fields are omitted from the JSON (never emitted as null); the has* flags carry that.
+struct UserInfo {
+    std::string username;
+    std::string password;
+    bool hasPassword = false;
+    std::string userType;
+    bool hasUserType = false;
+    std::string userStatus;
+    bool hasUserStatus = false;
+
+    JsonValue toJson() const;
+    static UserInfo fromJson(const JsonValue& v);
+    // Response of the list operation: a JSON array of user objects; a non-array decodes to empty
+    static std::vector<UserInfo> listFromJson(const JsonValue& v);
+
+    Bytes encode() const;
+    static bool decode(const Bytes& data, UserInfo& out);
+};
+
+struct AclEntry {
+    std::string resource;
+    std::vector<std::string> actions;
+    bool hasActions = false;
+    std::vector<std::string> sourceIps;
+    bool hasSourceIps = false;
+    std::string decision;
+    bool hasDecision = false;
+
+    JsonValue toJson() const;
+    static AclEntry fromJson(const JsonValue& v);
+};
+
+struct AclPolicy {
+    std::string policyType;
+    bool hasPolicyType = false;
+    std::vector<AclEntry> entries;
+
+    JsonValue toJson() const;
+    static AclPolicy fromJson(const JsonValue& v);
+};
+
+struct AclInfo {
+    std::string subject;
+    std::vector<AclPolicy> policies;
+
+    JsonValue toJson() const;
+    static AclInfo fromJson(const JsonValue& v);
+    // Response of the list operation: a JSON array of acl objects; a non-array decodes to empty
+    static std::vector<AclInfo> listFromJson(const JsonValue& v);
+
+    Bytes encode() const;
+    static bool decode(const Bytes& data, AclInfo& out);
+};
+
+// ---------------------------------------------------------------- Controller replicas / sync state
+// Unset fields are omitted from the JSON (never emitted as null); the has* flags carry that.
+struct ReplicaIdentity {
+    std::string brokerName;
+    int64_t brokerId = 0;
+    std::string brokerAddress;
+    bool hasBrokerAddress = false;
+    bool alive = false;
+    bool hasAlive = false;
+
+    JsonValue toJson() const;
+    static ReplicaIdentity fromJson(const JsonValue& v);
+
+    Bytes encode() const;
+    static bool decode(const Bytes& data, ReplicaIdentity& out);
+};
+
+struct ReplicasInfo {
+    int64_t masterBrokerId = 0;
+    bool hasMasterBrokerId = false;
+    std::string masterAddress;
+    bool hasMasterAddress = false;
+    int32_t masterEpoch = 0;
+    int32_t syncStateSetEpoch = 0;
+    std::vector<ReplicaIdentity> inSyncReplicas;
+    std::vector<ReplicaIdentity> notInSyncReplicas;
+
+    JsonValue toJson() const;
+    static ReplicasInfo fromJson(const JsonValue& v);
+
+    Bytes encode() const;
+    static bool decode(const Bytes& data, ReplicasInfo& out);
+};
+
+// Response body of CONTROLLER_GET_SYNC_STATE_DATA(1006): {replicasInfoTable: {brokerName: ReplicasInfo}}
+struct BrokerReplicasInfo {
+    std::map<std::string, ReplicasInfo> replicasInfoTable;
+
+    JsonValue toJson() const;
+    static BrokerReplicasInfo fromJson(const JsonValue& v);
+
+    Bytes encode() const;
+    static bool decode(const Bytes& data, BrokerReplicasInfo& out);
+};
+
+// Response body of CHECK_ROCKSDB_CQ_WRITE_PROGRESS(354)
+struct CheckRocksdbCqWriteStatus {
+    static constexpr int32_t CHECK_OK = 0;
+    static constexpr int32_t CHECK_NOT_OK = 1;
+    static constexpr int32_t CHECK_IN_PROGRESS = 2;
+    static constexpr int32_t CHECK_ERROR = 3;
+};
+
+struct CheckRocksdbCqWriteResult {
+    std::string checkResult;
+    int32_t checkStatus = 0;
+
+    JsonValue toJson() const;
+    static CheckRocksdbCqWriteResult fromJson(const JsonValue& v);
+
+    Bytes encode() const;
+    static bool decode(const Bytes& data, CheckRocksdbCqWriteResult& out);
+};
+
+// Aggregate result of the fan-out delete/reset operations
+struct BrokerOperatorResult {
+    std::vector<std::string> successList;
+    std::vector<std::string> failureList;
+
+    JsonValue toJson() const;
+    static BrokerOperatorResult fromJson(const JsonValue& v);
+
+    Bytes encode() const;
+    static bool decode(const Bytes& data, BrokerOperatorResult& out);
+};
+
 }  // namespace rocketmq
 
 #endif  // ROCKETMQ_REMOTING_PROTOCOL_ADMIN_BODY_H

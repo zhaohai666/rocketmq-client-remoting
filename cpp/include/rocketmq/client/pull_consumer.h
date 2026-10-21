@@ -65,6 +65,23 @@ public:
     // route address. Must be set before start(); forwarded to the MQClientInstance that owns the RPCs.
     void setVipChannelEnabled(bool enable) { vipChannelEnabled_ = enable; }
     bool isVipChannelEnabled() const { return vipChannelEnabled_; }
+    // decodeReadBody (default true): false = pull / POP bodies are walked but not materialized.
+    // Must be set before start(); forwarded to the MQClientInstance that owns the RPCs.
+    void setDecodeReadBody(bool readBody) { decodeReadBody_ = readBody; }
+    bool isDecodeReadBody() const { return decodeReadBody_; }
+    // mqClientApiTimeout (default 3000ms): default timeout of heartbeat / route / unregister /
+    // consumer-list RPCs. Forwarded to the instance in start().
+    void setMqClientApiTimeout(int32_t millis) { mqClientApiTimeout_ = millis; }
+    int32_t mqClientApiTimeout() const { return mqClientApiTimeout_; }
+    // Concurrent heartbeat (default off) and its pool size (default: available processors).
+    void setEnableConcurrentHeartbeat(bool enable) { enableConcurrentHeartbeat_ = enable; }
+    bool isEnableConcurrentHeartbeat() const { return enableConcurrentHeartbeat_; }
+    void setConcurrentHeartbeatThreadPoolSize(int32_t size) {
+        concurrentHeartbeatThreadPoolSize_ = size;
+    }
+    int32_t concurrentHeartbeatThreadPoolSize() const {
+        return concurrentHeartbeatThreadPoolSize_;
+    }
     void setHeartbeatEnabled(bool b) { heartbeatEnabled_ = b; }
     bool isHeartbeatEnabled() const { return heartbeatEnabled_; }
     void setHeartbeatBrokerIntervalMillis(int32_t millis) {
@@ -190,6 +207,11 @@ private:
     bool enableStreamRequestType_ = true;
     int32_t pollNameServerIntervalMillis_ = 30000;
     bool vipChannelEnabled_ = false;
+    bool decodeReadBody_ = true;
+    int32_t mqClientApiTimeout_ = MQClientInstance::kMqClientApiTimeoutMillis;
+    bool enableConcurrentHeartbeat_ = false;
+    int32_t concurrentHeartbeatThreadPoolSize_ =
+        MQClientInstance::defaultConcurrentHeartbeatThreadPoolSize();
     std::string messageModel_ = MessageModel::CLUSTERING;
 
     int32_t brokerSuspendMaxTimeMillis_ = 20000;

@@ -32,6 +32,7 @@ package client
 import (
 	"fmt"
 	"math"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -119,9 +120,16 @@ type DefaultMQPushConsumer struct {
 	// useHeartbeatV2 is this client's heartbeat-protocol-version-2
 	// switch (off unless turned on).
 	useHeartbeatV2 bool
-	tlsEnable      *bool
-	socksProxy     *remoting.SocksProxyConfig
-	rpcHook        remoting.RPCHook
+	// Instance knobs seeded at Start and applied live when the shared instance
+	// already exists: receive-body decode, internal-API timeout and the
+	// concurrent heartbeat round.
+	decodeReadBody                    bool
+	mqClientAPITimeoutMillis          int64
+	enableConcurrentHeartbeat         bool
+	concurrentHeartbeatThreadPoolSize int
+	tlsEnable                         *bool
+	socksProxy                        *remoting.SocksProxyConfig
+	rpcHook                           remoting.RPCHook
 
 	messageModel     string
 	consumeFromWhere string
@@ -247,6 +255,9 @@ func NewDefaultMQPushConsumer(consumerGroup string) (*DefaultMQPushConsumer, err
 	return &DefaultMQPushConsumer{
 		consumerGroup:                 consumerGroup,
 		instanceName:                  common.DefaultInstanceName,
+		useHeartbeatV2:                false,
+		decodeReadBody:                true,
+		mqClientAPITimeoutMillis:      DefaultMQClientAPITimeoutMillis,
 		messageModel:                  MessageModelClustering,
 		consumeFromWhere:              ConsumeFromWhereLastOffset,
 		consumeTimestamp:              defaultConsumeTimestamp(),
@@ -386,6 +397,62 @@ func (c *DefaultMQPushConsumer) SetUseHeartbeatV2(enable bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.useHeartbeatV2 = enable
+}
+
+// SetDecodeReadBody seeds the shared instance's receive-body decode switch:
+// when off, pull/POP frames are walked without materialising bodies. It takes
+// effect on a running instance immediately.
+func (c *DefaultMQPushConsumer) SetDecodeReadBody(enable bool) {
+	c.mu.Lock()
+	c.decodeReadBody = enable
+	inst := c.instance
+	c.mu.Unlock()
+	if inst != nil {
+		inst.SetDecodeReadBody(enable)
+	}
+}
+
+// SetMQClientAPITimeoutMillis sets the internal-API budget used by heartbeats,
+// route fetches, client-config checks, unregister and consumer-list RPCs.
+// Non-positive values restore the 3000ms default.
+func (c *DefaultMQPushConsumer) SetMQClientAPITimeoutMillis(timeoutMillis int64) {
+	if timeoutMillis <= 0 {
+		timeoutMillis = DefaultMQClientAPITimeoutMillis
+	}
+	c.mu.Lock()
+	c.mqClientAPITimeoutMillis = timeoutMillis
+	inst := c.instance
+	c.mu.Unlock()
+	if inst != nil {
+		inst.SetMQClientAPITimeoutMillis(timeoutMillis)
+	}
+}
+
+// SetEnableConcurrentHeartbeat turns the concurrent heartbeat round on or off;
+// a V2 heartbeat still takes precedence when both are enabled.
+func (c *DefaultMQPushConsumer) SetEnableConcurrentHeartbeat(enable bool) {
+	c.mu.Lock()
+	c.enableConcurrentHeartbeat = enable
+	inst := c.instance
+	c.mu.Unlock()
+	if inst != nil {
+		inst.SetEnableConcurrentHeartbeat(enable)
+	}
+}
+
+// SetConcurrentHeartbeatThreadPoolSize sets the width of the concurrent
+// heartbeat pool; non-positive values restore the available-processor default.
+func (c *DefaultMQPushConsumer) SetConcurrentHeartbeatThreadPoolSize(size int) {
+	if size <= 0 {
+		size = runtime.NumCPU()
+	}
+	c.mu.Lock()
+	c.concurrentHeartbeatThreadPoolSize = size
+	inst := c.instance
+	c.mu.Unlock()
+	if inst != nil {
+		inst.SetConcurrentHeartbeatThreadPoolSize(size)
+	}
 }
 
 // SetRpcHook installs the user's RPC hook (typically an ACL hook built with
@@ -1184,6 +1251,10 @@ func (c *DefaultMQPushConsumer) Start() error {
 	}
 	cfg.SocksProxy = c.socksProxy
 	cfg.UseHeartbeatV2 = c.useHeartbeatV2
+	cfg.DecodeReadBody = c.decodeReadBody
+	cfg.MQClientAPITimeoutMillis = c.mqClientAPITimeoutMillis
+	cfg.EnableConcurrentHeartbeat = c.enableConcurrentHeartbeat
+	cfg.ConcurrentHeartbeatThreadPoolSize = c.concurrentHeartbeatThreadPoolSize
 	instance := CreateOrGetInstance(c.clientID, c.nameServerAddrs, cfg)
 	c.instance = instance
 	namespaceV2 := c.namespaceV2
@@ -1246,7 +1317,7 @@ func (c *DefaultMQPushConsumer) Start() error {
 	}
 	for _, topic := range topics {
 		instance.RegisterTopicInUse(topic)
-		if _, err := instance.UpdateTopicRouteInfoFromNameServer(topic, 5000, false); err != nil {
+		if _, err := instance.UpdateTopicRouteInfoFromNameServer(topic, 0, false); err != nil {
 			common.LogDebugf("initial route refresh failed for %s: %v", topic, err)
 		}
 	}
@@ -1511,7 +1582,7 @@ func (c *DefaultMQPushConsumer) sendHeartbeatNow() error {
 	if instance == nil {
 		return common.ClientError("consumer not started")
 	}
-	instance.SendHeartbeatToAllBrokerWithLockV2(false, 5000)
+	instance.SendHeartbeatToAllBrokerWithLockV2(false, 0)
 	return nil
 }
 
@@ -1530,7 +1601,7 @@ func (c *DefaultMQPushConsumer) beatAfterRebalance(changed bool) {
 	if instance == nil || !instance.Config().UseHeartbeatV2 {
 		return
 	}
-	instance.SendHeartbeatToAllBrokerWithLockV2(true, 5000)
+	instance.SendHeartbeatToAllBrokerWithLockV2(true, 0)
 }
 
 // consumeTimestampMillis reads the configured value and parses it.
@@ -1661,7 +1732,7 @@ func (c *DefaultMQPushConsumer) doRebalance() error {
 		if len(mqAll) == 0 {
 			continue
 		}
-		cidAll, answered := instance.GetConsumerIDListByGroup(topic, c.consumerGroup, 5000)
+		cidAll, answered := instance.GetConsumerIDListByGroup(topic, c.consumerGroup, 0)
 		if !answered || len(cidAll) == 0 {
 			common.LogDebugf("rebalance: no consumer id list for %s/%s, keep current", c.consumerGroup, topic)
 			for mq := range was {
@@ -1777,7 +1848,7 @@ func (c *DefaultMQPushConsumer) assignedFromBroker(topic string, was map[common.
 	name := strategyName(strategy)
 	addr, err := inst.BrokerAddrForTopic(topic)
 	if err != nil {
-		if _, rerr := inst.UpdateTopicRouteInfoFromNameServer(topic, 5000, false); rerr != nil {
+		if _, rerr := inst.UpdateTopicRouteInfoFromNameServer(topic, 0, false); rerr != nil {
 			common.LogDebugf("queryAssignment: route refresh for %s failed: %v", topic, rerr)
 		}
 		addr, err = inst.BrokerAddrForTopic(topic)

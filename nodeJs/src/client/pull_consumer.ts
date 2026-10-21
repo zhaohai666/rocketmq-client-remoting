@@ -6,7 +6,7 @@
 // NO_NEW_MSG). Unconditionally writing suspend=true manifests as a 5s timeout
 // on every idle pull.
 import { PullAPI } from './pull_api.ts';
-import { MQClient } from './mq_client.ts';
+import { MQClient, DEFAULT_CONCURRENT_HEARTBEAT_THREAD_POOL_SIZE } from './mq_client.ts';
 import { MQClientManager } from './mq_client_manager.ts';
 import { registerRpcHooks } from '../remoting/rpc_hooks.ts';
 import {
@@ -76,6 +76,16 @@ export class DefaultMQPullConsumer {
   persistConsumerOffsetInterval = 5000;
   // Heartbeat V2: off by default, so heartbeats keep the V1 shape unless enabled.
   useHeartbeatV2 = false;
+  // Materialise received message bodies during batch decode (default true).
+  decodeReadBody = true;
+  // Internal-API timeout (heartbeat, route fetch, check client, unregister and
+  // consumer-list RPCs), in milliseconds. Default 3000.
+  mqClientApiTimeout = 3000;
+  // Concurrent heartbeat round (ignored while heartbeat V2 is on).
+  enableConcurrentHeartbeat = false;
+  concurrentHeartbeatThreadPoolSize = DEFAULT_CONCURRENT_HEARTBEAT_THREAD_POOL_SIZE;
+  // Page size of the paged metadata admin calls (maxTopicNum / maxGroupNum).
+  maxPageSizeInGetMetadata = 2000;
 
   private subscription = new Map<string, SubscriptionData>();
   // Each topic's most recently computed share — serving as the rebalance result
@@ -118,6 +128,47 @@ export class DefaultMQPullConsumer {
     return this;
   }
   getUseHeartbeatV2(): boolean { return this.useHeartbeatV2; }
+  // Received-body decode switch, mirrored onto the shared instance.
+  setDecodeReadBody(enable: boolean): this {
+    this.decodeReadBody = enable === true;
+    if (this.mqClient) this.mqClient.setDecodeReadBody(this.decodeReadBody);
+    return this;
+  }
+  getDecodeReadBody(): boolean { return this.decodeReadBody; }
+  // Internal-API timeout, in milliseconds. An explicit per-call timeout passed
+  // by a caller still wins.
+  setMqClientApiTimeout(ms: number): this {
+    if (!Number.isFinite(ms) || ms <= 0) throw new Error(`mqClientApiTimeout must be > 0, got ${ms}`);
+    this.mqClientApiTimeout = Math.floor(ms);
+    if (this.mqClient) this.mqClient.setMqClientApiTimeout(this.mqClientApiTimeout);
+    return this;
+  }
+  getMqClientApiTimeout(): number { return this.mqClientApiTimeout; }
+  // Concurrent heartbeat round; heartbeat V2 still wins when it is enabled.
+  setEnableConcurrentHeartbeat(enable: boolean): this {
+    this.enableConcurrentHeartbeat = enable === true;
+    if (this.mqClient) this.mqClient.setEnableConcurrentHeartbeat(this.enableConcurrentHeartbeat);
+    return this;
+  }
+  getEnableConcurrentHeartbeat(): boolean { return this.enableConcurrentHeartbeat; }
+  setConcurrentHeartbeatThreadPoolSize(size: number): this {
+    if (!Number.isInteger(size) || size <= 0) {
+      throw new Error(`concurrentHeartbeatThreadPoolSize must be a positive integer, got ${size}`);
+    }
+    this.concurrentHeartbeatThreadPoolSize = size;
+    if (this.mqClient) this.mqClient.setConcurrentHeartbeatThreadPoolSize(size);
+    return this;
+  }
+  getConcurrentHeartbeatThreadPoolSize(): number { return this.concurrentHeartbeatThreadPoolSize; }
+  setMaxPageSizeInGetMetadata(size: number): this {
+    if (!Number.isInteger(size) || size <= 0) {
+      throw new Error(`maxPageSizeInGetMetadata must be a positive integer, got ${size}`);
+    }
+    this.maxPageSizeInGetMetadata = size;
+    if (this.mqClient) this.mqClient.setMaxPageSizeInGetMetadata(size);
+    return this;
+  }
+  getMaxPageSizeInGetMetadata(): number { return this.maxPageSizeInGetMetadata; }
   getConsumerGroup(): string { return this.consumerGroup; }
   isStarted(): boolean { return this.started; }
 
@@ -163,6 +214,11 @@ export class DefaultMQPullConsumer {
     if (created) {
       client.setPersistConsumerOffsetInterval(this.persistConsumerOffsetInterval);
       if (this.useHeartbeatV2) client.setUseHeartbeatV2(true);
+      client.setDecodeReadBody(this.decodeReadBody);
+      client.setMqClientApiTimeout(this.mqClientApiTimeout);
+      client.setEnableConcurrentHeartbeat(this.enableConcurrentHeartbeat);
+      client.setConcurrentHeartbeatThreadPoolSize(this.concurrentHeartbeatThreadPoolSize);
+      client.setMaxPageSizeInGetMetadata(this.maxPageSizeInGetMetadata);
       registerRpcHooks(client.remotingClient, {
         namespaceV2: () => this.namespaceV2,
         enableStreamRequestType: this.enableStreamRequestType,

@@ -5,6 +5,7 @@
 //
 // NOTE: this module is the single dependency of the producer; it must NOT import producer (the
 // consumer/admin agents will import it too). Hooks/transaction policy live in the producer.
+import os from 'node:os';
 import { RemotingClient } from '../remoting/client.ts';
 import { RemotingCommand, CURRENT_VERSION } from '../remoting/remotingCommand.ts';
 import { RequestCode, ResponseCode } from '../remoting/codes.ts';
@@ -56,6 +57,61 @@ import {
 } from '../remoting/pop_bodies.ts';
 
 const logger = getLogger('mqclient');
+
+// Default size of the concurrent-heartbeat pool: the number of processors the
+// runtime reports. Shared by the facades so their pre-start configuration
+// carries the same default the instance would have used.
+export const DEFAULT_CONCURRENT_HEARTBEAT_THREAD_POOL_SIZE =
+  Math.max(1, os.availableParallelism());
+
+// A minimal fixed-size task executor. It starts submitted tasks up to `size`
+// at a time and queues the rest. `submit` returns a promise that settles when
+// the task has run (or, for a task that never starts because the pool was shut
+// down, rejects immediately). The heartbeat round waits on those promises, so
+// a submission that is refused still settles the wait instead of hanging it.
+class FixedTaskExecutor {
+  size: number;
+  private active = 0;
+  private queue: Array<{
+    run: () => Promise<void>;
+    resolve: () => void;
+    reject: (e: Error) => void;
+  }> = [];
+  private closed = false;
+
+  constructor(size: number) {
+    this.size = Math.max(1, Math.floor(size));
+  }
+
+  submit(run: () => Promise<void>): Promise<void> {
+    if (this.closed) return Promise.reject(new Error('heartbeat executor is shut down'));
+    return new Promise<void>((resolve, reject) => {
+      this.queue.push({ run, resolve, reject });
+      this._drain();
+    });
+  }
+
+  private _drain(): void {
+    while (!this.closed && this.active < this.size && this.queue.length > 0) {
+      const item = this.queue.shift()!;
+      this.active++;
+      Promise.resolve()
+        .then(() => item.run())
+        .then(
+          () => { this.active--; item.resolve(); this._drain(); },
+          () => { this.active--; item.resolve(); this._drain(); },
+        );
+    }
+  }
+
+  get pending(): number { return this.queue.length; }
+
+  shutdown(): void {
+    this.closed = true;
+    const dropped = this.queue.splice(0);
+    for (const item of dropped) item.reject(new Error('heartbeat executor is shut down'));
+  }
+}
 
 // ---------------------------------------------------------------------------
 // TopicPublishInfo — holds the shared round-robin cursor used across calls.
@@ -141,8 +197,24 @@ export class MQClient {
   // matches this cache may drop its subscription sets.
   _brokerAddrHeartbeatFingerprintTable: Map<string, number>;
   // Client-level API timeout (default 3000 ms): the timeout used by
-  // the instance-level admin calls, including CHECK_CLIENT_CONFIG(46).
+  // the instance-level admin calls, including CHECK_CLIENT_CONFIG(46), the
+  // name-server route fetches, unregister and the consumer-list RPC. An
+  // explicit per-call timeout passed by a caller still wins.
   mqClientApiTimeout: number;
+  // Whether received message bodies are materialised during batch decode.
+  // On by default. Off: the stored-record frames are still walked (cursor and
+  // queue offsets advance), but body bytes are neither copied, CRC-checked nor
+  // decompressed — messages come back header-only with properties intact.
+  decodeReadBody: boolean;
+  // Concurrent heartbeat round. Off by default; when on (and heartbeat V2 is
+  // off — V2 always wins) one heartbeat per broker is fanned out over a
+  // fixed-size pool created when the instance starts.
+  enableConcurrentHeartbeat: boolean;
+  concurrentHeartbeatThreadPoolSize: number;
+  _heartbeatExecutor: FixedTaskExecutor | null;
+  // Page size of the paged metadata admin calls (GET_ALL_TOPIC_CONFIG /
+  // GET_ALL_SUBSCRIPTIONGROUP_CONFIG): maxTopicNum / maxGroupNum on the wire.
+  maxPageSizeInGetMetadata: number;
   // Consumer stats manager — shared at the instance level; ONE sampler timer,
   // 10s precision.
   consumerStatsManager: ConsumerStatsManager;
@@ -195,6 +267,11 @@ export class MQClient {
     this._brokerSupportV2HeartbeatSet = new Set();
     this._brokerAddrHeartbeatFingerprintTable = new Map();
     this.mqClientApiTimeout = 3000;
+    this.decodeReadBody = true;
+    this.enableConcurrentHeartbeat = false;
+    this.concurrentHeartbeatThreadPoolSize = DEFAULT_CONCURRENT_HEARTBEAT_THREAD_POOL_SIZE;
+    this._heartbeatExecutor = null;
+    this.maxPageSizeInGetMetadata = 2000;
     this.consumerStatsManager = new ConsumerStatsManager();
     this._heartbeatTimer = null;
     this._routeTimer = null;
@@ -337,7 +414,7 @@ export class MQClient {
     // (connection refused / TLS handshake failure...), and producers/consumers
     // attach it to their own route error instead of black-boxing it as
     // "No route info".
-    const response = await this._invokeSyncNameServer(request, 3000);
+    const response = await this._invokeSyncNameServer(request, this.mqClientApiTimeout);
     const code = response.code;
     if (code === ResponseCode.SUCCESS) {
       const routeData = TopicRouteData.decode(response.body as Buffer);
@@ -696,6 +773,53 @@ export class MQClient {
     return this;
   }
 
+  // Internal-API timeout for the broker / name-server RPCs this instance
+  // issues. Callers that pass an explicit timeout still use that value.
+  setMqClientApiTimeout(ms: number): this {
+    if (!Number.isFinite(ms) || ms <= 0) {
+      throw new Error(`mqClientApiTimeout must be > 0, got ${ms}`);
+    }
+    this.mqClientApiTimeout = Math.floor(ms);
+    return this;
+  }
+
+  // Whether batch decode materialises received message bodies.
+  setDecodeReadBody(enable: boolean): this {
+    this.decodeReadBody = enable === true;
+    return this;
+  }
+
+  // Dispatch the periodic heartbeat round over a pool instead of serially.
+  // Heartbeat V2 always wins over this switch (see sendHeartbeatToAllBrokers).
+  setEnableConcurrentHeartbeat(enable: boolean): this {
+    this.enableConcurrentHeartbeat = enable === true;
+    return this;
+  }
+
+  // Pool size of the concurrent heartbeat round. Rebuilds the pool when one is
+  // already alive (a round in flight settles; its queued submissions are
+  // refused and counted as unsuccessful waits).
+  setConcurrentHeartbeatThreadPoolSize(size: number): this {
+    if (!Number.isInteger(size) || size <= 0) {
+      throw new Error(`concurrentHeartbeatThreadPoolSize must be a positive integer, got ${size}`);
+    }
+    this.concurrentHeartbeatThreadPoolSize = size;
+    if (this._heartbeatExecutor != null) {
+      this._heartbeatExecutor.shutdown();
+      this._heartbeatExecutor = null;
+    }
+    return this;
+  }
+
+  // Page size used as maxTopicNum / maxGroupNum by the paged metadata calls.
+  setMaxPageSizeInGetMetadata(size: number): this {
+    if (!Number.isInteger(size) || size <= 0) {
+      throw new Error(`maxPageSizeInGetMetadata must be a positive integer, got ${size}`);
+    }
+    this.maxPageSizeInGetMetadata = size;
+    return this;
+  }
+
   // Per-request VIP translation of a BROKER address at the invoke boundary. Off
   // (or an unparseable port) returns the address untouched, so a disabled switch
   // changes nothing and a name-server address must never be passed here.
@@ -746,7 +870,7 @@ export class MQClient {
     request.addExtField('clientID', this.clientId);
     request.addExtField('producerGroup', producerGroup);
     request.addExtField('consumerGroup', consumerGroup);
-    return this.remotingClient.invokeSync(brokerAddr, request, 3000);
+    return this.remotingClient.invokeSync(brokerAddr, request, this.mqClientApiTimeout);
   }
 
   async unregisterClientAllBrokers(producerGroup: string, consumerGroup: string): Promise<void> {
@@ -777,7 +901,7 @@ export class MQClient {
   async getConsumerListByGroup(brokerAddr: string, consumerGroup: string): Promise<RemotingCommand> {
     const request = RemotingCommand.createRequestCommand(RequestCode.GET_CONSUMER_LIST_BY_GROUP, null);
     request.addExtField('consumerGroup', consumerGroup);
-    return this.remotingClient.invokeSync(this.vipChannel(brokerAddr), request, 3000);
+    return this.remotingClient.invokeSync(this.vipChannel(brokerAddr), request, this.mqClientApiTimeout);
   }
 
   // ---- offset helpers (used by offset store / consumers / admin) ----
@@ -903,7 +1027,8 @@ export class MQClient {
     const respHeader = new PopMessageResponseHeader();
     respHeader.fromExtFields(response.extFields || {});
     return processPopResponse(brokerName, response.code, response.remark || '',
-      response.body || null, respHeader, header.topic || '', namespace, header.order === true);
+      response.body || null, respHeader, header.topic || '', namespace, header.order === true,
+      this.decodeReadBody);
   }
 
   // ackMessage sends ACK_MESSAGE(200051) synchronously. `offset` must be the
@@ -1068,6 +1193,7 @@ export class MQClient {
   start(): void {
     if (this._running) return;
     this._running = true;
+    this._ensureHeartbeatExecutor();
     this._registerTransactionCheckProcessor();
     this._registerReplyMessageProcessor();
     this._startHeartbeatLoop();
@@ -1253,7 +1379,11 @@ export class MQClient {
   // consumer's assignment-changed signal: it drops every cached fingerprint so
   // the next beat re-reports subscriptions -- after a rebalance moved the queue
   // set the broker has to be told what this client now subscribes to.
-  async sendHeartbeatToAllBrokers(isRebalance = false): Promise<void> {
+  //
+  // Dispatch order: heartbeat V2 wins when enabled; otherwise the concurrent
+  // round when enableConcurrentHeartbeat is on; otherwise the serial loop. The
+  // return value is the number of brokers a beat was successfully delivered to.
+  async sendHeartbeatToAllBrokers(isRebalance = false): Promise<number> {
     const entries = this.getAllBrokerAddrEntries();
     // Two guards apply before walking the broker table: a
     // client that registers nothing has nothing to report, and a producer-only
@@ -1264,14 +1394,74 @@ export class MQClient {
     const consumerEmpty = beat.consumerDataSet.length === 0;
     if (producerEmpty && consumerEmpty) {
       logger.warning('heartbeat skipped: no producer and no consumer registered');
-      return;
+      return 0;
     }
     if (isRebalance) this._brokerAddrHeartbeatFingerprintTable.clear();
     logger.debug('heartbeat beat to %d broker(s)', entries.length);
+    if (this.useHeartbeatV2) {
+      // V2 keeps the serial path: its per-address fingerprint cache is updated
+      // from each response and is read by the next beat.
+      return this._sendHeartbeatsSerially(entries, consumerEmpty);
+    }
+    if (this.enableConcurrentHeartbeat) {
+      return this._sendHeartbeatsConcurrently(entries, consumerEmpty);
+    }
+    return this._sendHeartbeatsSerially(entries, consumerEmpty);
+  }
+
+  private async _sendHeartbeatsSerially(
+    entries: Array<{ brokerName: string; id: number; addr: string }>,
+    consumerEmpty: boolean,
+  ): Promise<number> {
+    let success = 0;
     for (const { addr, id } of entries) {
       if (consumerEmpty && id !== MixAll.MASTER_ID) continue;
-      try { await this.sendHeartbeat(addr); } catch (e) { /* best effort */ }
+      try { await this.sendHeartbeat(addr); success++; } catch (e) { /* best effort */ }
     }
+    return success;
+  }
+
+  // One heartbeat per eligible broker, fanned out over the instance's fixed
+  // pool, then wait for every task. A submission refused by a shut-down pool
+  // still settles its wait (and is not counted as a success).
+  private async _sendHeartbeatsConcurrently(
+    entries: Array<{ brokerName: string; id: number; addr: string }>,
+    consumerEmpty: boolean,
+  ): Promise<number> {
+    const targets: Array<{ brokerName: string; id: number; addr: string }> = [];
+    for (const entry of entries) {
+      if (consumerEmpty && entry.id !== MixAll.MASTER_ID) continue;
+      targets.push(entry);
+    }
+    if (targets.length === 0) return 0;
+    const executor = this._ensureHeartbeatExecutor();
+    let success = 0;
+    const waits: Promise<void>[] = [];
+    for (const { addr } of targets) {
+      let submitted: Promise<void>;
+      try {
+        submitted = executor.submit(async () => {
+          try {
+            await this.sendHeartbeat(addr);
+            success++;
+          } catch (e) { /* best effort: one broker must not sink the round */ }
+        });
+      } catch (e) {
+        // A synchronous refusal still contributes a completed wait.
+        waits.push(Promise.resolve());
+        continue;
+      }
+      waits.push(submitted.catch(() => { /* refused submission: wait is settled */ }));
+    }
+    await Promise.all(waits);
+    return success;
+  }
+
+  private _ensureHeartbeatExecutor(): FixedTaskExecutor {
+    if (this._heartbeatExecutor == null) {
+      this._heartbeatExecutor = new FixedTaskExecutor(this.concurrentHeartbeatThreadPoolSize);
+    }
+    return this._heartbeatExecutor;
   }
 
   private _registerTransactionCheckProcessor(): void {
@@ -1407,6 +1597,7 @@ export class MQClient {
     if (this._adjustThreadPoolTimer != null) { clearInterval(this._adjustThreadPoolTimer); this._adjustThreadPoolTimer = null; }
     if (this._persistOffsetTimer != null) { clearInterval(this._persistOffsetTimer); this._persistOffsetTimer = null; }
     if (this._persistOffsetInitialTimer != null) { clearTimeout(this._persistOffsetInitialTimer); this._persistOffsetInitialTimer = null; }
+    if (this._heartbeatExecutor != null) { this._heartbeatExecutor.shutdown(); this._heartbeatExecutor = null; }
     this.consumerStatsManager.shutdown();
     try { this.remotingClient.shutdown(); } catch (e) { /* ignore */ }
     for (const acc of (this as any)._accumulators || []) { try { acc.stop(); } catch (e) {} }

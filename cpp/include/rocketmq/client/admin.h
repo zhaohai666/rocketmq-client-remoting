@@ -1,10 +1,12 @@
 // Coverage: topic add/delete/query and configuration, broker cluster info plus runtime info/config,
 // name server KV configuration, subscription-group management, consumer/producer connections,
-// consume statistics, offset management (incl. real offset reset on a live broker), message queries (key / uniqKey / msgId / ConsumeQueue).
+// consume statistics, offset management (incl. real offset reset on a live broker), message queries (key / uniqKey / msgId / ConsumeQueue),
+// AUTH user management and ACL management.
 #ifndef ROCKETMQ_CLIENT_ADMIN_H
 #define ROCKETMQ_CLIENT_ADMIN_H
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -49,6 +51,37 @@ struct GroupForbidden {
     static bool decode(const Bytes& data, GroupForbidden& out);
 };
 
+// Code values carried by the AdminToolResult envelope of the concurrent fan-out forms.
+struct AdminToolResultCode {
+    static constexpr int32_t SUCCESS = 200;
+    static constexpr int32_t REMOTING_ERROR = -1001;
+    static constexpr int32_t MQ_BROKER_ERROR = -1002;
+    static constexpr int32_t MQ_CLIENT_ERROR = -1003;
+    static constexpr int32_t INTERRUPT_ERROR = -1004;
+    static constexpr int32_t TOPIC_ROUTE_INFO_NOT_EXIST = -2001;
+    static constexpr int32_t CONSUMER_NOT_ONLINE = -2002;
+    static constexpr int32_t BROADCAST_CONSUMPTION = -2003;
+};
+
+// Envelope of the concurrent fan-out forms: success=true always pairs with code=SUCCESS,
+// and a failure keeps `data` when the partial per-broker outcome is still useful.
+template <typename T>
+struct AdminToolResult {
+    bool success = false;
+    int32_t code = 0;
+    std::string errorMsg;
+    T data{};
+};
+
+// Response header of CONTROLLER_GET_METADATA_INFO(1005)
+struct ControllerMetaData {
+    std::string group;
+    std::string controllerLeaderId;
+    std::string controllerLeaderAddress;
+    bool isLeader = false;
+    std::string peers;
+};
+
 class DefaultMQAdminExt {
 public:
     // Matches DefaultMQAdminExt.DEFAULT_TIMEOUT = 5000 * 3
@@ -85,6 +118,16 @@ public:
     std::vector<std::string> getNameServerAddressList() const { return nameServerAddrs_; }
     void setTimeoutMillis(int32_t millis) { timeoutMillis_ = millis; }
     int32_t getTimeoutMillis() const { return timeoutMillis_; }
+    // maxPageSizeInGetMetadata (default 2000): page size carried as maxTopicNum / maxGroupNum by
+    // the paged getAllTopicConfig / getAllSubscriptionGroup requests. Forwarded live to the shared instance.
+    void setMaxPageSizeInGetMetadata(int32_t size) {
+        maxPageSizeInGetMetadata_ = size;
+        if (mqClient_) {
+            mqClient_->setMaxPageSizeInGetMetadata(size);
+        }
+    }
+    int32_t getMaxPageSizeInGetMetadata() const { return maxPageSizeInGetMetadata_; }
+    int32_t maxPageSizeInGetMetadata() const { return maxPageSizeInGetMetadata_; }
     void addKvNamespaceToDeleteList(const std::string& ns) {
         kvNamespaceToDeleteList_.push_back(ns);
     }
@@ -315,6 +358,45 @@ public:
                                                    int64_t index, int32_t count = 32,
                                                    const std::string& consumerGroup = std::string());
 
+    // ---------------- AUTH user management (3001-3005) ----------------
+    // Addressing is verbatim: the request goes to exactly the brokerAddr passed in (no VIP-channel
+    // rewrite, no master resolution). Any response code other than SUCCESS throws MQBrokerException
+    // carrying that code and remark. The convenience forms leave userStatus unset, so the body omits
+    // that key entirely.
+    void createUser(const std::string& brokerAddr, const UserInfo& user);
+    void createUser(const std::string& brokerAddr, const std::string& username,
+                    const std::string& password, const std::string& userType);
+    void updateUser(const std::string& brokerAddr, const UserInfo& user);
+    void updateUser(const std::string& brokerAddr, const std::string& username,
+                    const std::string& password, const std::string& userType);
+    void deleteUser(const std::string& brokerAddr, const std::string& username);
+    // An empty response body leaves the result value untouched (all fields unset)
+    UserInfo getUser(const std::string& brokerAddr, const std::string& username);
+    // The filter header is sent only when present; an empty body decodes to an empty list
+    std::vector<UserInfo> listUser(const std::string& brokerAddr,
+                                   const std::optional<std::string>& filter = std::nullopt);
+
+    // ---------------- AUTH ACL management (3006-3010) ----------------
+    // The convenience forms build exactly one policy with no policyType and one entry per resource,
+    // each entry repeating the same actions / sourceIps / decision.
+    void createAcl(const std::string& brokerAddr, const AclInfo& acl);
+    void createAcl(const std::string& brokerAddr, const std::string& subject,
+                   const std::vector<std::string>& resources,
+                   const std::vector<std::string>& actions,
+                   const std::vector<std::string>& sourceIps, const std::string& decision);
+    void updateAcl(const std::string& brokerAddr, const AclInfo& acl);
+    void updateAcl(const std::string& brokerAddr, const std::string& subject,
+                   const std::vector<std::string>& resources,
+                   const std::vector<std::string>& actions,
+                   const std::vector<std::string>& sourceIps, const std::string& decision);
+    // Only the subject and resource headers are carried, nothing else
+    void deleteAcl(const std::string& brokerAddr, const std::string& subject,
+                   const std::string& resource);
+    AclInfo getAcl(const std::string& brokerAddr, const std::string& subject);
+    std::vector<AclInfo> listAcl(const std::string& brokerAddr,
+                                 const std::optional<std::string>& subjectFilter = std::nullopt,
+                                 const std::optional<std::string>& resourceFilter = std::nullopt);
+
     // ---------------- Direct-consume probe (CONSUME_MESSAGE_DIRECTLY(309)) ----------------
     // 309 is an admin -> broker request: after the broker receives it, it **pushes it on** to the online
     // consumer for that clientId (see the client handler in DefaultMQPushConsumer) and brings back the
@@ -333,6 +415,112 @@ public:
         const std::string& topic, const std::string& consumerGroup, const std::string& clientId,
         const std::string& msgId);
 
+    // ---------------- Container management (ADD_BROKER(902) / REMOVE_BROKER(903)) ----------------
+    // Both go to the container address verbatim (no VIP rewrite), with the admin default timeout,
+    // and any response code other than SUCCESS throws MQBrokerException. configPath is omitted from
+    // the header when empty (nullable); the removeBroker fields are always sent.
+    void addBroker(const std::string& containerAddr, const std::string& configPath);
+    void removeBroker(const std::string& containerAddr, const std::string& brokerClusterName,
+                      const std::string& brokerName, int64_t brokerId);
+
+    // ---------------- Controller administration (1005/1006/1009/1010/1011) ----------------
+    // 1005 goes to the controller address verbatim with a fixed 3000ms timeout and an empty header;
+    // the response header becomes ControllerMetaData. Any other code throws MQBrokerException.
+    ControllerMetaData getControllerMetaData(const std::string& controllerAddr);
+    // Two-phase: 1005 to controllerAddr first, then 1006 to the controller leader with the broker
+    // names as a raw JSON array body (both phases 3000ms, no VIP). Response decodes to BrokerReplicasInfo.
+    BrokerReplicasInfo getInSyncStateData(const std::string& controllerAddr,
+                                          const std::vector<std::string>& brokers);
+    // 1010 per controller server (the name-server list when none given; still empty -> empty map).
+    // The body is properties text; a non-SUCCESS code throws MQClientException.
+    std::map<std::string, PropertyMap> getControllerConfig(
+        const std::vector<std::string>& controllerServers = std::vector<std::string>(),
+        int32_t timeoutMillis = -1);
+    // 1009 with the properties as body text. No request is sent when the text is empty or the
+    // server list is empty; otherwise every server gets the request and the last non-SUCCESS reply
+    // throws MQClientException after the loop.
+    void updateControllerConfig(
+        const PropertyMap& properties,
+        const std::vector<std::string>& controllers = std::vector<std::string>(),
+        int32_t timeoutMillis = -1);
+    // Two-phase: 1005 to controllerAddr first, then 1011 to the controller leader (3000ms, no VIP).
+    // clusterName and brokerControllerIdsToClean are omitted from the header when empty;
+    // isCleanLivingBroker and invokeTime are always sent.
+    void cleanBrokerData(const std::string& controllerAddr, const std::string& clusterName,
+                         const std::string& brokerName,
+                         const std::string& brokerControllerIdsToClean = std::string(),
+                         bool isCleanLivingBroker = false);
+
+    // ---------------- Cold-data flow control (2001/2002/2003) ----------------
+    // 2001 carries the properties as body text (no request at all when the text is empty);
+    // 2002 carries the consumer group as a plain string body (skipped when empty). Both VIP-rewritten.
+    // 2003 carries nothing and is NOT VIP-rewritten; an empty response body comes back as "".
+    void updateColdDataFlowCtrGroupConfig(const std::string& brokerAddr, const PropertyMap& properties);
+    void removeColdDataFlowCtrGroupConfig(const std::string& brokerAddr, const std::string& consumerGroup);
+    std::string getColdDataFlowCtrInfo(const std::string& brokerAddr);
+
+    // ---------------- CommitLog read-ahead (SET_COMMITLOG_READ_MODE(2004)) ----------------
+    // The mode travels in a `READ_AHEAD_MODE` ext field, no body, no VIP rewrite; the verdict is
+    // the response remark ("" when the broker sent none).
+    std::string setCommitLogReadAheadMode(const std::string& brokerAddr, const std::string& mode);
+
+    // ---------------- Pop rollback record export (POP_ROLLBACK(200056)) ----------------
+    // No header, no body, no VIP rewrite; the caller's timeout is used verbatim (never the admin default).
+    void exportPopRecords(const std::string& brokerAddr, int32_t timeoutMillis);
+
+    // ---------------- RocksDB maintenance (354 / 355) ----------------
+    // Both go to the broker address verbatim (no VIP rewrite), admin default timeout, and both
+    // throw MQClientException (not MQBrokerException) on a non-SUCCESS code.
+    CheckRocksdbCqWriteResult checkRocksdbCqWriteProgress(const std::string& brokerAddr,
+                                                          const std::string& topic,
+                                                          int64_t checkStoreTime);
+    // configType entries are joined with a ';' written after every entry ("topics;" / "topics;subscriptionGroups;")
+    void exportRocksDBConfigToJson(const std::string& brokerAddr,
+                                   const std::vector<std::string>& configTypes);
+
+    // ---------------- Lite topic administration (200074-200079) ----------------
+    // All six go through one helper: VIP-rewritten, admin default timeout, body decoded only when
+    // the broker sent one (else a null JsonValue), non-SUCCESS throws MQBrokerException.
+    JsonValue getBrokerLiteInfo(const std::string& brokerAddr);
+    JsonValue getParentTopicInfo(const std::string& brokerAddr, const std::string& topic);
+    JsonValue getLiteTopicInfo(const std::string& brokerAddr, const std::string& parentTopic,
+                               const std::string& liteTopic);
+    // maxCount is a header primitive and is always sent (default 1000 when the caller leaves it unset)
+    JsonValue getLiteClientInfo(const std::string& brokerAddr, const std::string& parentTopic,
+                                const std::string& group, const std::string& clientId,
+                                int32_t maxCount = 1000);
+    // topK is a header primitive and is always sent, even as 0; liteTopic omitted when empty
+    JsonValue getLiteGroupInfo(const std::string& brokerAddr, const std::string& group,
+                               const std::string& liteTopic, int32_t topK);
+    void triggerLiteDispatch(const std::string& brokerAddr, const std::string& group,
+                             const std::string& clientId);
+
+    // ---------------- Concurrent fan-out forms ----------------
+    // All seven submit one task per target and wait for the batch with a bounded wait
+    // (timeoutMillis, default the admin timeout). Task failures are logged, never propagated;
+    // the result reflects whatever finished inside the window.
+    // Route-less topics yield an empty success for the stats/time-span forms and a
+    // TOPIC_ROUTE_INFO_NOT_EXIST failure for the others, mirroring each route probe.
+    AdminToolResult<TopicStatsTable> examineTopicStatsConcurrent(const std::string& topic,
+                                                                 int32_t timeoutMillis = -1);
+    AdminToolResult<ConsumeStats> examineConsumeStatsConcurrent(const std::string& consumerGroup,
+                                                                const std::string& topic,
+                                                                int32_t timeoutMillis = -1);
+    AdminToolResult<BrokerOperatorResult> deleteTopicInBrokerConcurrent(
+        const std::vector<std::string>& addrs, const std::string& topic, int32_t timeoutMillis = -1);
+    AdminToolResult<BrokerOperatorResult> resetOffsetNewConcurrent(const std::string& group,
+                                                                   const std::string& topic,
+                                                                   int64_t timestamp,
+                                                                   int32_t timeoutMillis = -1);
+    AdminToolResult<TopicList> queryTopicsByConsumerConcurrent(const std::string& group,
+                                                               int32_t timeoutMillis = -1);
+    AdminToolResult<JsonValue> queryConsumeTimeSpanConcurrent(const std::string& topic,
+                                                              const std::string& group,
+                                                              int32_t timeoutMillis = -1);
+    // Not wrapped in the AdminToolResult envelope: fans over the consumer groups of the topic.
+    std::vector<MessageTrack> messageTrackDetailConcurrent(const MessageExt& msg,
+                                                           int32_t timeoutMillis = -1);
+
 private:
     // ---------------- Low-level invoke helpers ----------------
     MQClientInstance& requireClient();
@@ -349,6 +537,42 @@ private:
     std::vector<std::string> brokerAddrsOfCluster(MQClientInstance& client,
                                                   const std::string& clusterName);
 
+    // ---------------- Long-tail helpers ----------------
+    // Route probe used by the fan-out forms: TOPIC_NOT_EXIST yields false (no route), any other
+    // failure is rethrown untouched so the envelope classifies it.
+    bool examineTopicRouteOrNull(const std::string& topic, TopicRouteData& out);
+    // Shared funnel of the lite family: VIP rewrite, admin timeout, decode only when a body came
+    // back, MQBrokerException otherwise.
+    JsonValue invokeBrokerMethod(const std::string& addr, int32_t requestCode,
+                                 const PropertyMap& extFields, int32_t timeoutMillis);
+    // 29-family reset leaf for the concurrent form: SUCCESS without a body is a failure
+    // (code 0 + remark), matching the fall-through of the raw switch.
+    std::map<MessageQueue, int64_t> invokeBrokerToResetOffsetConcurrent(
+        const std::string& brokerAddr, const std::string& topic, const std::string& group,
+        int64_t timestamp, int32_t timeoutMillis);
+    // Per-broker consume-stats walk used as the fallback when the group never came online.
+    void resetOffsetOldOnBroker(const std::string& brokerAddr, const QueueData& queueData,
+                                const std::string& group, const std::string& topic,
+                                int64_t timestamp, bool force);
+    // One queue of that walk: timestamp -1 means max offset; the update runs when forced or when
+    // the reset target is not ahead of the consumer.
+    void resetOffsetOldOnQueue(const std::string& brokerAddr, const std::string& group,
+                               const MessageQueue& mq, const OffsetWrapper& wrapper,
+                               int64_t timestamp, bool force);
+    // Per-group verdict shared by messageTrackDetail and messageTrackDetailConcurrent;
+    // mapBroadcast selects the broadcast verdict the single form applies (the concurrent form leaves it).
+    MessageTrack trackMessageGroup(const MessageExt& msg, const std::string& group,
+                                   bool mapBroadcast);
+    // Bounded fan-out: one thread per entry, a bounded wait on the batch, then every thread is
+    // joined before the caller reads shared containers.
+    void runBoundedFanOut(size_t count, int32_t timeoutMillis,
+                          const std::function<void(size_t)>& task);
+    // Envelope wrapper: exceptions become failure codes (remoting -> REMOTING_ERROR,
+    // client TOPIC_NOT_EXIST -> TOPIC_ROUTE_INFO_NOT_EXIST, other client -> MQ_CLIENT_ERROR,
+    // broker and anything else -> MQ_BROKER_ERROR).
+    template <typename T>
+    AdminToolResult<T> adminToolExecute(const std::function<AdminToolResult<T>()>& handler) const;
+
     std::string instanceName_;
     std::string clientId_;
     std::string unitName_;
@@ -359,6 +583,7 @@ private:
     std::vector<std::string> nameServerAddrs_;
     std::vector<std::string> kvNamespaceToDeleteList_;
     int32_t timeoutMillis_ = DEFAULT_TIMEOUT;
+    int32_t maxPageSizeInGetMetadata_ = 2000;
 
     std::unique_ptr<MQClientInstance> mqClient_;
     // ACL hook, bound to the MQClientInstance transport at start()

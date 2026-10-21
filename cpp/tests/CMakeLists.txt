@@ -46,6 +46,14 @@ add_executable(rmq_test_admin test_admin.cpp)
 target_link_libraries(rmq_test_admin PRIVATE rocketmq::remoting)
 add_test(NAME admin COMMAND rmq_test_admin)
 
+# AUTH user management (3001-3005) + ACL management (3006-3010): a loopback pair of recording
+# listeners pins the request code, the exact extFields key set, the exact request-body bytes
+# (unset keys absent, enum spellings byte-exact), verbatim addressing with the VIP switch on,
+# the non-SUCCESS throw carrying code+remark, and the decoded getUser/listUser/getAcl/listAcl.
+add_executable(rmq_test_auth_admin test_auth_admin.cpp)
+target_link_libraries(rmq_test_auth_admin PRIVATE rocketmq::remoting)
+add_test(NAME auth_admin COMMAND rmq_test_auth_admin)
+
 # Admin-originated CONSUME_MESSAGE_DIRECTLY(309): mock broker pins the two viewMessage msgId paths (direct offsetMsgId
 # lookup + uniqKey search that replaces offsetMsgId), the 309 header carrying exactly four fields, the error semantics of non-SUCCESS / empty
 # body, and "if the message cannot be decoded, not one 309 is sent". The consumer-side handler lives in rmq_test_orderly_reconsume.
@@ -170,7 +178,7 @@ add_executable(rmq_test_trace_context test_trace_context.cpp)
 target_link_libraries(rmq_test_trace_context PRIVATE rocketmq::remoting)
 add_test(NAME trace_context COMMAND rmq_test_trace_context)
 
-# Cross-language interop (C++ <-> Python reference client). Depends on the python-side venv; skipped if absent.
+# Cross-language interop harness; depends on the sibling venv interpreter; skipped if absent.
 set(RMQ_PY_VENV "${CMAKE_CURRENT_SOURCE_DIR}/../../python/.venv/bin/python")
 if(EXISTS "${RMQ_PY_VENV}")
     add_test(NAME interop
@@ -331,7 +339,7 @@ add_executable(rmq_test_pull_consumer_balance_view test_pull_consumer_balance_vi
 target_link_libraries(rmq_test_pull_consumer_balance_view PRIVATE rocketmq::remoting)
 add_test(NAME pull_consumer_balance_view COMMAND rmq_test_pull_consumer_balance_view)
 
-# Pull-consumer high-level capabilities (Java MQPullConsumerScheduleService + DefaultMQPullConsumer.pullAsync):
+# Pull-consumer high-level capabilities (schedule service + async pull):
 # the schedule service fans this instance's share out into queue-dimension tasks (fake endpoint serves
 # route / consumer list / scripted pulls), pins per-queue seriality, the three-channel delay priority
 # (return value > pullMessageLater > setPullInterval > status default), the exception delay, reassignment
@@ -404,3 +412,11 @@ add_test(NAME producer_heartbeat_knob COMMAND rmq_test_producer_heartbeat_knob)
 add_executable(rmq_test_shutdown_drain_ceiling test_shutdown_drain_ceiling.cpp)
 target_link_libraries(rmq_test_shutdown_drain_ceiling PRIVATE rocketmq::remoting)
 add_test(NAME shutdown_drain_ceiling COMMAND rmq_test_shutdown_drain_ceiling)
+
+# Client configuration switches: decodeReadBody (default/off over pull, lite pull and POP),
+# mqClientApiTimeout (3000 default measured through a withholding broker, explicit and configured
+# overrides), concurrent heartbeat (masters only for a producer body, slave with consumer data),
+# and maxPageSizeInGetMetadata with full paged topic/group metadata walks.
+add_executable(rmq_test_client_config_switches test_client_config_switches.cpp)
+target_link_libraries(rmq_test_client_config_switches PRIVATE rocketmq::remoting)
+add_test(NAME client_config_switches COMMAND rmq_test_client_config_switches)

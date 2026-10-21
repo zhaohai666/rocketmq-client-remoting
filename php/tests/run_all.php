@@ -35,6 +35,9 @@ $suites = [
     'Client producer' => __DIR__ . '/RunClientProducer.php',
     'Client queue-change listener' => __DIR__ . '/RunClientLiteTopicChange.php',
     'Client static topic route' => __DIR__ . '/RunClientStaticTopic.php',
+    'Client auth admin' => __DIR__ . '/RunClientAuthAdmin.php',
+    'Client config knobs' => __DIR__ . '/RunClientConfigKnobs.php',
+    'Client admin long tail' => __DIR__ . '/RunClientAdminLongTail.php',
 ];
 
 // Load the autoloader at the top level so the sub-suites do not register it repeatedly.

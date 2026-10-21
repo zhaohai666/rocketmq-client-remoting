@@ -8,6 +8,7 @@ and from_ext_fields() (mapping ext_fields back to fields).
 """
 from __future__ import annotations
 
+import time
 from typing import Optional
 
 from common.boundary_type import BoundaryType
@@ -1664,3 +1665,231 @@ class ChangeInvisibleTimeResponseHeader(CommandCustomHeader):
         self.pop_time = _l(ext.get("popTime"))
         self.invisible_time = _l(ext.get("invisibleTime"))
         self.revive_qid = _i(ext.get("reviveQid"))
+
+
+# ---------------- broker container / controller / cold data / lite admin ----------------
+
+
+class AddBrokerRequestHeader(CommandCustomHeader):
+    """The protocol header ``AddBrokerRequestHeader`` (ADD_BROKER = 902)."""
+
+    def __init__(self):
+        self.config_path: Optional[str] = None
+
+    def to_ext_fields(self) -> dict:
+        return _ext({"configPath": self.config_path})
+
+
+class RemoveBrokerRequestHeader(CommandCustomHeader):
+    """The protocol header ``RemoveBrokerRequestHeader`` (REMOVE_BROKER = 903)."""
+
+    def __init__(self):
+        self.broker_name: Optional[str] = None
+        self.broker_cluster_name: Optional[str] = None
+        self.broker_id: Optional[int] = None
+
+    def to_ext_fields(self) -> dict:
+        return _ext({
+            "brokerName": self.broker_name,
+            "brokerClusterName": self.broker_cluster_name,
+            "brokerId": self.broker_id,
+        })
+
+
+class CreateTopicListRequestHeader(CommandCustomHeader):
+    """The protocol header ``CreateTopicListRequestHeader`` (UPDATE_AND_CREATE_TOPIC_LIST = 18).
+
+    The header declares no fields of its own; attaching it still serializes an
+    **empty** extFields map on the wire (the wire shape differs from omitting the map,
+    which is what a null header produces).
+    """
+
+    def to_ext_fields(self) -> dict:
+        return {}
+
+
+class GetMetaDataResponseHeader(CommandCustomHeader):
+    """The protocol response header ``GetMetaDataResponseHeader`` (CONTROLLER_GET_METADATA_INFO = 1005)."""
+
+    def __init__(self):
+        self.group: Optional[str] = None
+        self.controller_leader_id: Optional[str] = None
+        self.controller_leader_address: Optional[str] = None
+        self.is_leader: bool = False
+        self.peers: Optional[str] = None
+
+    def to_ext_fields(self) -> dict:
+        return _ext({
+            "group": self.group,
+            "controllerLeaderId": self.controller_leader_id,
+            "controllerLeaderAddress": self.controller_leader_address,
+            "isLeader": self.is_leader,
+            "peers": self.peers,
+        })
+
+    def from_ext_fields(self, ext: dict) -> None:
+        self.group = ext.get("group")
+        self.controller_leader_id = ext.get("controllerLeaderId")
+        self.controller_leader_address = ext.get("controllerLeaderAddress")
+        self.is_leader = _b(ext.get("isLeader")) or False
+        self.peers = ext.get("peers")
+
+
+class CleanControllerBrokerDataRequestHeader(CommandCustomHeader):
+    """The protocol header ``CleanControllerBrokerDataRequestHeader`` (CLEAN_BROKER_DATA = 1011).
+
+    ``invoke_time`` is a primitive long captured at construction, so it is always on
+    the wire even when every optional field stays unset.
+    """
+
+    def __init__(self, cluster_name: Optional[str] = None, broker_name: Optional[str] = None,
+                 broker_controller_ids_to_clean: Optional[str] = None,
+                 is_clean_living_broker: bool = False):
+        self.cluster_name = cluster_name
+        self.broker_name = broker_name
+        self.broker_controller_ids_to_clean = broker_controller_ids_to_clean
+        self.is_clean_living_broker = is_clean_living_broker
+        self.invoke_time: Optional[int] = int(time.time() * 1000)
+
+    def to_ext_fields(self) -> dict:
+        return _ext({
+            "clusterName": self.cluster_name,
+            "brokerName": self.broker_name,
+            "brokerControllerIdsToClean": self.broker_controller_ids_to_clean,
+            "isCleanLivingBroker": self.is_clean_living_broker,
+            "invokeTime": self.invoke_time,
+        })
+
+
+class CheckRocksdbCqWriteProgressRequestHeader(CommandCustomHeader):
+    """The protocol header ``CheckRocksdbCqWriteProgressRequestHeader`` (354).
+
+    ``check_store_time`` is a primitive long, so 0 is a real value that must be sent.
+    """
+
+    def __init__(self):
+        self.topic: Optional[str] = None
+        self.check_store_time: Optional[int] = None
+
+    def to_ext_fields(self) -> dict:
+        return _ext({
+            "topic": self.topic,
+            "checkStoreTime": self.check_store_time,
+        })
+
+
+class ExportRocksDBConfigType:
+    """Config groups of the ExportRocksDBConfigToJsonRequestHeader.ConfigType enum;
+    the on-wire value of each member is its lowercase name."""
+    TOPICS = "topics"
+    SUBSCRIPTION_GROUPS = "subscriptionGroups"
+    CONSUMER_OFFSETS = "consumerOffsets"
+
+    ALL = (TOPICS, SUBSCRIPTION_GROUPS, CONSUMER_OFFSETS)
+
+
+def rocksdb_config_types_to_ext(config_types) -> str:
+    """Join the requested config groups exactly as the protocol header does: the lookup
+    of each name is case-insensitive, the wire value is the canonical lowercase-camel
+    name, and one separator is appended after every member (so the trailing separator is
+    part of the wire value)."""
+    known = {n.lower(): n for n in ExportRocksDBConfigType.ALL}
+    names = []
+    for item in config_types or []:
+        name = item.value if hasattr(item, "value") else str(item)
+        canonical = known.get(name.strip().lower())
+        if canonical is None:
+            raise ValueError("Unknown config type: %s" % name)
+        names.append(canonical)
+    return "".join("%s;" % n for n in names)
+
+
+class ExportRocksDBConfigToJsonRequestHeader(CommandCustomHeader):
+    """The protocol header ``ExportRocksDBConfigToJsonRequestHeader`` (355)."""
+
+    def __init__(self):
+        self.config_type: Optional[str] = None
+
+    def update_config_type(self, config_types) -> None:
+        self.config_type = rocksdb_config_types_to_ext(config_types)
+
+    def to_ext_fields(self) -> dict:
+        return _ext({"configType": self.config_type})
+
+
+class GetParentTopicInfoRequestHeader(CommandCustomHeader):
+    """The protocol header ``GetParentTopicInfoRequestHeader`` (GET_PARENT_TOPIC_INFO = 200075)."""
+
+    def __init__(self):
+        self.topic: Optional[str] = None
+
+    def to_ext_fields(self) -> dict:
+        return _ext({"topic": self.topic})
+
+
+class GetLiteTopicInfoRequestHeader(CommandCustomHeader):
+    """The protocol header ``GetLiteTopicInfoRequestHeader`` (GET_LITE_TOPIC_INFO = 200076)."""
+
+    def __init__(self):
+        self.parent_topic: Optional[str] = None
+        self.lite_topic: Optional[str] = None
+
+    def to_ext_fields(self) -> dict:
+        return _ext({
+            "parentTopic": self.parent_topic,
+            "liteTopic": self.lite_topic,
+        })
+
+
+class GetLiteClientInfoRequestHeader(CommandCustomHeader):
+    """The protocol header ``GetLiteClientInfoRequestHeader`` (GET_LITE_CLIENT_INFO = 200077).
+
+    ``max_count`` is a primitive int defaulting to 1000, so it is always on the wire.
+    """
+
+    def __init__(self):
+        self.parent_topic: Optional[str] = None
+        self.group: Optional[str] = None
+        self.client_id: Optional[str] = None
+        self.max_count: int = 1000
+
+    def to_ext_fields(self) -> dict:
+        return _ext({
+            "parentTopic": self.parent_topic,
+            "group": self.group,
+            "clientId": self.client_id,
+            "maxCount": self.max_count,
+        })
+
+
+class GetLiteGroupInfoRequestHeader(CommandCustomHeader):
+    """The protocol header ``GetLiteGroupInfoRequestHeader`` (GET_LITE_GROUP_INFO = 200078).
+
+    ``top_k`` is a primitive int, so it is sent even when left at 0.
+    """
+
+    def __init__(self):
+        self.group: Optional[str] = None
+        self.lite_topic: Optional[str] = None
+        self.top_k: int = 0
+
+    def to_ext_fields(self) -> dict:
+        return _ext({
+            "group": self.group,
+            "liteTopic": self.lite_topic,
+            "topK": self.top_k,
+        })
+
+
+class TriggerLiteDispatchRequestHeader(CommandCustomHeader):
+    """The protocol header ``TriggerLiteDispatchRequestHeader`` (TRIGGER_LITE_DISPATCH = 200079)."""
+
+    def __init__(self):
+        self.group: Optional[str] = None
+        self.client_id: Optional[str] = None
+
+    def to_ext_fields(self) -> dict:
+        return _ext({
+            "group": self.group,
+            "clientId": self.client_id,
+        })

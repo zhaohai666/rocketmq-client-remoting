@@ -11,6 +11,7 @@ package client
 import (
 	"fmt"
 	"math/rand"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -381,6 +382,14 @@ type DefaultMQProducer struct {
 	socksProxy         *remoting.SocksProxyConfig
 	pollNameServerIntv int64
 
+	// Instance knobs seeded at Start and applied live when the shared instance
+	// already exists: receive-body decode, internal-API timeout and the
+	// concurrent heartbeat round.
+	decodeReadBody                    bool
+	mqClientAPITimeoutMillis          int64
+	enableConcurrentHeartbeat         bool
+	concurrentHeartbeatThreadPoolSize int
+
 	// sendMessageWithVIPChannel
 	// (default false): when set, the SEND rpcs go to the VIP port (broker port-2).
 	// It only ever concerns sends — the RPCs the broker answers on the plain
@@ -471,22 +480,26 @@ func NewDefaultMQProducer(producerGroup string) (*DefaultMQProducer, error) {
 		return nil, common.ClientError("producerGroup is empty")
 	}
 	p := &DefaultMQProducer{
-		producerGroup:           producerGroup,
-		instanceName:            common.DefaultInstanceName,
-		createTopicKey:          common.DefaultTopic,
-		defaultTopicQueueNums:   common.DefaultTopicQueueNums,
-		sendMsgTimeout:          DefaultSendMsgTimeout,
-		requestTimeout:          DefaultRequestTimeoutMillis,
-		compressMsgBodyOverHow:  DefaultCompressMsgBodyOverHowmuch,
-		compressLevel:           DefaultCompressLevel,
-		compressType:            common.ZlibType,
-		retryTimesWhenSendFail:  DefaultRetryTimesWhenSendFailed,
-		sendMsgMaxTimeoutPerReq: -1,
-		maxMessageSize:          DefaultMaxMessageSize,
-		pollNameServerIntv:      defaultPollNameServerInterval,
-		heartbeatIntervalMillis: DefaultHeartbeatIntervalMillis,
-		traceMsgBatchNum:        defaultTraceMsgBatchNum,
-		enableTraceContext:      TraceContextEnabledFromEnv(),
+		producerGroup:                     producerGroup,
+		instanceName:                      common.DefaultInstanceName,
+		createTopicKey:                    common.DefaultTopic,
+		defaultTopicQueueNums:             common.DefaultTopicQueueNums,
+		sendMsgTimeout:                    DefaultSendMsgTimeout,
+		requestTimeout:                    DefaultRequestTimeoutMillis,
+		compressMsgBodyOverHow:            DefaultCompressMsgBodyOverHowmuch,
+		compressLevel:                     DefaultCompressLevel,
+		compressType:                      common.ZlibType,
+		retryTimesWhenSendFail:            DefaultRetryTimesWhenSendFailed,
+		sendMsgMaxTimeoutPerReq:           -1,
+		maxMessageSize:                    DefaultMaxMessageSize,
+		pollNameServerIntv:                defaultPollNameServerInterval,
+		heartbeatIntervalMillis:           DefaultHeartbeatIntervalMillis,
+		decodeReadBody:                    true,
+		mqClientAPITimeoutMillis:          DefaultMQClientAPITimeoutMillis,
+		enableConcurrentHeartbeat:         false,
+		concurrentHeartbeatThreadPoolSize: 0,
+		traceMsgBatchNum:                  defaultTraceMsgBatchNum,
+		enableTraceContext:                TraceContextEnabledFromEnv(),
 		retryResponseCodes: map[int32]struct{}{
 			// RetryResponseCodes: only these codes
 			// are worth trying on another broker. Anything else (e.g.
@@ -594,6 +607,62 @@ func (p *DefaultMQProducer) SetSendMessageWithVIPChannel(enable bool) {
 
 // IsSendMessageWithVIPChannel reports the current VIP-channel switch.
 func (p *DefaultMQProducer) IsSendMessageWithVIPChannel() bool { return p.sendMessageWithVIPChannel }
+
+// SetDecodeReadBody seeds the shared instance's receive-body decode switch:
+// when off, pull/POP frames are walked without materialising bodies. It takes
+// effect on a running instance immediately.
+func (p *DefaultMQProducer) SetDecodeReadBody(enable bool) {
+	p.mu.Lock()
+	p.decodeReadBody = enable
+	inst := p.mqClient
+	p.mu.Unlock()
+	if inst != nil {
+		inst.SetDecodeReadBody(enable)
+	}
+}
+
+// SetMQClientAPITimeoutMillis sets the internal-API budget used by heartbeats,
+// route fetches, client-config checks, unregister and consumer-list RPCs.
+// Non-positive values restore the 3000ms default.
+func (p *DefaultMQProducer) SetMQClientAPITimeoutMillis(timeoutMillis int64) {
+	if timeoutMillis <= 0 {
+		timeoutMillis = DefaultMQClientAPITimeoutMillis
+	}
+	p.mu.Lock()
+	p.mqClientAPITimeoutMillis = timeoutMillis
+	inst := p.mqClient
+	p.mu.Unlock()
+	if inst != nil {
+		inst.SetMQClientAPITimeoutMillis(timeoutMillis)
+	}
+}
+
+// SetEnableConcurrentHeartbeat turns the concurrent heartbeat round on or off;
+// a V2 heartbeat still takes precedence when both are enabled.
+func (p *DefaultMQProducer) SetEnableConcurrentHeartbeat(enable bool) {
+	p.mu.Lock()
+	p.enableConcurrentHeartbeat = enable
+	inst := p.mqClient
+	p.mu.Unlock()
+	if inst != nil {
+		inst.SetEnableConcurrentHeartbeat(enable)
+	}
+}
+
+// SetConcurrentHeartbeatThreadPoolSize sets the width of the concurrent
+// heartbeat pool; non-positive values restore the available-processor default.
+func (p *DefaultMQProducer) SetConcurrentHeartbeatThreadPoolSize(size int) {
+	if size <= 0 {
+		size = runtime.NumCPU()
+	}
+	p.mu.Lock()
+	p.concurrentHeartbeatThreadPoolSize = size
+	inst := p.mqClient
+	p.mu.Unlock()
+	if inst != nil {
+		inst.SetConcurrentHeartbeatThreadPoolSize(size)
+	}
+}
 
 // sendAddr applies the VIP-channel rewrite to a resolved publish address;
 // every send invoke goes through it.
@@ -742,6 +811,10 @@ func (p *DefaultMQProducer) startLocked() (bool, error) {
 	// so the other broker-facing RPCs of this clientId (offsets, locks, the
 	// admin calls riding the same instance) see the same intent.
 	cfg.VipChannelEnabled = p.sendMessageWithVIPChannel
+	cfg.DecodeReadBody = p.decodeReadBody
+	cfg.MQClientAPITimeoutMillis = p.mqClientAPITimeoutMillis
+	cfg.EnableConcurrentHeartbeat = p.enableConcurrentHeartbeat
+	cfg.ConcurrentHeartbeatThreadPoolSize = p.concurrentHeartbeatThreadPoolSize
 	inst := CreateOrGetInstance(p.clientID, p.nameServerAddrs, cfg)
 	// CreateOrGetInstance keeps the FIRST tenant's config, so a producer that
 	// joins a live instance has to flip the switch itself. Only ever on: a
@@ -918,7 +991,7 @@ func (p *DefaultMQProducer) sendHeartbeatToAllBroker() error {
 	hb.AddProducerData(remoting.NewProducerData(group))
 	var firstErr error
 	for _, addr := range addrs {
-		if err := inst.SendHeartbeat(addr, hb, 5000); err != nil {
+		if err := inst.SendHeartbeat(addr, hb, 0); err != nil {
 			common.LogWarnf("producer heartbeat to %s failed: %v", addr, err)
 			if firstErr == nil {
 				firstErr = err

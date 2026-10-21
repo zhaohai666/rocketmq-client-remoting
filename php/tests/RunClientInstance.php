@@ -1408,9 +1408,10 @@ class TickProbeInstance extends MQClientInstance
         $this->namesrvCalls++;
     }
 
-    public function heartbeatOnce(int $timeoutMillis = 5000): void
+    public function heartbeatOnce(?int $timeoutMillis = null): int
     {
         $this->heartbeatCalls++;
+        return 1;
     }
 }
 
@@ -1424,7 +1425,7 @@ class HeartbeatProbeInstance extends MQClientInstance
     /** @var list<array{addr: string, producers: list<string>, consumers: list<string>}> */
     public array $beats = [];
 
-    public function sendHeartbeat(string $addr, HeartbeatData $heartbeatData, int $timeoutMillis = 5000): void
+    public function sendHeartbeat(string $addr, HeartbeatData $heartbeatData, ?int $timeoutMillis = null): void
     {
         $this->beats[] = [
             'addr' => $addr,

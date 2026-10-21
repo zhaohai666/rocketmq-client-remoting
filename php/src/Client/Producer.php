@@ -429,6 +429,17 @@ class DefaultMQProducer
      */
     public bool $useHeartbeatV2 = false;
     /**
+     * Decode-read-body switch (default true): when off, received PULL / POP bodies are not
+     * materialised (messages come back header-only, queue offsets and properties intact).
+     */
+    public bool $decodeReadBody = true;
+    /** Fallback timeout of internal client API calls (heartbeat, route fetch, ...); explicit call timeouts win. */
+    public int $mqClientApiTimeout = 3000;
+    /** Concurrent heartbeat dispatch (default false); the fingerprint path wins when both are on. */
+    public bool $enableConcurrentHeartbeat = false;
+    /** Worker count of the instance's concurrent heartbeat pool, default = available processors. */
+    public int $concurrentHeartbeatThreadPoolSize;
+    /**
      * VIP channel (default false). The broker opens this second channel at `listen port - 2` only
      * when it was started with it enabled, so the default keeps every request on the published port.
      * On, the requests it answers there -- message sends in all flavours, and the earliest-message
@@ -563,6 +574,7 @@ class DefaultMQProducer
         }
         $this->producerGroup = $producerGroup;
         $this->tlsEnable = $tlsEnable;
+        $this->concurrentHeartbeatThreadPoolSize = MQClientInstance::availableProcessors();
         // W3C traceparent pass-through (opt-in; null = let env ROCKETMQ_TRACE_CONTEXT_ENABLE decide)
         if ($enableTraceContext === null) {
             $enableTraceContext = TraceContextPropagator::traceContextEnabledFromEnv();
@@ -784,6 +796,42 @@ class DefaultMQProducer
     public function isVipChannelEnabled(): bool
     {
         return $this->vipChannelEnabled;
+    }
+
+    /** Gate body materialisation of received pull/pop results; the live instance follows immediately. */
+    public function setDecodeReadBody(bool $decodeReadBody): void
+    {
+        $this->decodeReadBody = $decodeReadBody;
+        if ($this->mqClient !== null) {
+            $this->mqClient->setDecodeReadBody($decodeReadBody);
+        }
+    }
+
+    /** Fallback timeout of the internal client API calls; explicit per-call timeouts still win. */
+    public function setMqClientApiTimeout(int $timeoutMillis): void
+    {
+        $this->mqClientApiTimeout = $timeoutMillis;
+        if ($this->mqClient !== null) {
+            $this->mqClient->setMqClientApiTimeout($timeoutMillis);
+        }
+    }
+
+    public function setEnableConcurrentHeartbeat(bool $enable): void
+    {
+        $this->enableConcurrentHeartbeat = $enable;
+        if ($this->mqClient !== null) {
+            $this->mqClient->setEnableConcurrentHeartbeat($enable);
+        }
+    }
+
+    public function setConcurrentHeartbeatThreadPoolSize(int $size): void
+    {
+        $this->concurrentHeartbeatThreadPoolSize = $size > 0
+            ? $size
+            : MQClientInstance::availableProcessors();
+        if ($this->mqClient !== null) {
+            $this->mqClient->setConcurrentHeartbeatThreadPoolSize($this->concurrentHeartbeatThreadPoolSize);
+        }
     }
 
     public function getUnitName(): ?string
@@ -1316,6 +1364,10 @@ class DefaultMQProducer
             useHeartbeatV2: $this->useHeartbeatV2,
             vipChannelEnabled: $this->vipChannelEnabled,
             heartbeatIntervalMillis: $this->heartbeatIntervalMillis,
+            decodeReadBody: $this->decodeReadBody,
+            mqClientApiTimeout: $this->mqClientApiTimeout,
+            enableConcurrentHeartbeat: $this->enableConcurrentHeartbeat,
+            concurrentHeartbeatThreadPoolSize: $this->concurrentHeartbeatThreadPoolSize,
         );
         if ($this->rpcHook !== null) {
             $this->mqClient->remotingClient->registerRpcHook($this->rpcHook);
@@ -1423,12 +1475,12 @@ class DefaultMQProducer
         }
     }
 
-    public function heartbeatOnce(int $timeoutMillis = 5000): int
+    public function heartbeatOnce(?int $timeoutMillis = null): int
     {
         return $this->sendHeartbeatToAllBroker($timeoutMillis);
     }
 
-    private function sendHeartbeatToAllBroker(int $timeoutMillis = 5000): int
+    private function sendHeartbeatToAllBroker(?int $timeoutMillis = null): int
     {
         $client = $this->mqClient;
         if ($client === null) {

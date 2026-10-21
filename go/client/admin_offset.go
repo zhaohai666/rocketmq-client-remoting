@@ -186,9 +186,21 @@ func (a *DefaultMQAdminExt) ResetOffsetByTimestamp(topic, group string, timestam
 func (a *DefaultMQAdminExt) invokeBrokerResetOffset(brokerAddr, topic, group string,
 	timestamp int64, isForce, isCpp bool, queueID *int32, offset *int64) (map[common.MessageQueue]int64, error) {
 
+	table, _, err := a.invokeBrokerResetOffsetDetailed(brokerAddr, topic, group,
+		timestamp, isForce, isCpp, queueID, offset)
+	return table, err
+}
+
+// invokeBrokerResetOffsetDetailed also tells a SUCCESS-without-table answer
+// apart: the broker signals "nothing was reset" by sending no offset table at
+// all, and the concurrent reset counts such a broker as failed rather than as
+// an error.
+func (a *DefaultMQAdminExt) invokeBrokerResetOffsetDetailed(brokerAddr, topic, group string,
+	timestamp int64, isForce, isCpp bool, queueID *int32, offset *int64) (map[common.MessageQueue]int64, bool, error) {
+
 	instance, err := a.requireClient()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	offsetValue := int64(-1)
 	if offset != nil {
@@ -210,27 +222,27 @@ func (a *DefaultMQAdminExt) invokeBrokerResetOffset(brokerAddr, topic, group str
 	}
 	response, err := instance.invokeSync(a.brokerVIPAddr(brokerAddr), request, a.timeout(0))
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if response.Code != remoting.RespSuccess {
 		remark := response.Remark
 		if remark == "" {
 			remark = "reset offset failed"
 		}
-		return nil, common.ClientErrorCode(response.Code, remark)
+		return nil, false, common.ClientErrorCode(response.Code, remark)
 	}
 	if len(response.Body) == 0 {
-		return map[common.MessageQueue]int64{}, nil
+		return nil, false, nil
 	}
 	body, err := remoting.DecodeResetOffsetBody(response.Body)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	out := map[common.MessageQueue]int64{}
 	for _, e := range body.OffsetTable {
 		out[e.Queue] = e.Offset
 	}
-	return out, nil
+	return out, body.OffsetTable != nil, nil
 }
 
 //  1. updateConsumerOffset(15) rewrites offsetTable to the target;
@@ -283,32 +295,61 @@ func (a *DefaultMQAdminExt) ResetOffsetByTimestampOld(consumerGroup, topic strin
 		if !ok {
 			continue
 		}
-		for _, qd := range route.QueueDatas {
-			if qd.BrokerName != bd.BrokerName {
-				continue
+		var qd *QueueData
+		for _, cand := range route.QueueDatas {
+			if cand.BrokerName == bd.BrokerName {
+				qd = cand
+				break
 			}
-			for queueID := int32(0); queueID < qd.ReadQueueNums; queueID++ {
-				mq := common.NewMessageQueue(topic, bd.BrokerName, queueID)
-				consumerOffset, _, err := instance.QueryConsumerOffset(consumerGroup, mq, a.timeout(0), addr, false)
-				if err != nil {
-					consumerOffset = 0
-				}
-				var resetOffset int64
-				if timestamp == -1 {
-					resetOffset, err = instance.GetMaxOffset(mq, a.timeout(0))
-				} else {
-					resetOffset, err = a.searchOffsetWithBoundary(mq, timestamp, remoting.BoundaryLower)
-				}
-				if err != nil {
-					return nil, err
-				}
-				if force || resetOffset <= consumerOffset {
-					if err := instance.UpdateConsumerOffset(consumerGroup, mq, resetOffset, a.timeout(0), addr); err != nil {
-						return nil, err
-					}
-					result[mq] = resetOffset
-				}
+		}
+		if qd == nil {
+			continue
+		}
+		part, err := a.resetOffsetOldOneBroker(instance, addr, bd.BrokerName, qd,
+			consumerGroup, topic, timestamp, force)
+		if err != nil {
+			return nil, err
+		}
+		for q, off := range part {
+			result[q] = off
+		}
+	}
+	return result, nil
+}
+
+// resetOffsetOldOneBroker rewrites one broker's committed offsets the
+// queue-by-queue way: query the committed offset, find the target by
+// timestamp (maxOffset when timestamp == -1), and push the update. The
+// concurrent reset reuses it as the fallback for a broker whose consumer
+// group is offline.
+func (a *DefaultMQAdminExt) resetOffsetOldOneBroker(instance *Instance, brokerAddr, brokerName string,
+	queueData *QueueData, consumerGroup, topic string, timestamp int64, force bool) (map[common.MessageQueue]int64, error) {
+
+	if queueData == nil {
+		// Without queue data the queues to rewrite cannot even be enumerated.
+		return nil, common.ClientError(fmt.Sprintf("no queue data for broker %s", brokerName))
+	}
+	result := map[common.MessageQueue]int64{}
+	for queueID := int32(0); queueID < queueData.ReadQueueNums; queueID++ {
+		mq := common.NewMessageQueue(topic, brokerName, queueID)
+		consumerOffset, _, err := instance.QueryConsumerOffset(consumerGroup, mq, a.timeout(0), brokerAddr, false)
+		if err != nil {
+			consumerOffset = 0
+		}
+		var resetOffset int64
+		if timestamp == -1 {
+			resetOffset, err = instance.GetMaxOffset(mq, a.timeout(0))
+		} else {
+			resetOffset, err = a.searchOffsetWithBoundary(mq, timestamp, remoting.BoundaryLower)
+		}
+		if err != nil {
+			return nil, err
+		}
+		if force || resetOffset <= consumerOffset {
+			if err := instance.UpdateConsumerOffset(consumerGroup, mq, resetOffset, a.timeout(0), brokerAddr); err != nil {
+				return nil, err
 			}
+			result[mq] = resetOffset
 		}
 	}
 	return result, nil

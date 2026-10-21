@@ -36,7 +36,7 @@ import (
 func (i *Instance) GetConsumerListByGroup(addr, group string, timeoutMillis int64) ([]string, error) {
 	header := &remoting.GetConsumerListByGroupRequestHeader{ConsumerGroup: remoting.StrPtr(group)}
 	request := remoting.CreateRequestCommand(remoting.ReqGetConsumerListByGroup, header)
-	response, err := i.invokeSync(i.brokerVIPAddr(addr), request, timeoutMillis)
+	response, err := i.invokeSync(i.brokerVIPAddr(addr), request, i.apiTimeout(timeoutMillis))
 	if err != nil {
 		return nil, err
 	}

@@ -52,6 +52,7 @@ class _FakeClient:
 def _client(fake) -> MQClientInstance:
     inst = object.__new__(MQClientInstance)
     inst._invoke_sync = fake
+    inst.decode_read_body = True
     return inst
 
 
@@ -298,7 +299,7 @@ class TestPopMessageRequest:
     def test_born_time_filled_and_fields_passed(self, monkeypatch):
         fake = _FakeClient([_resp(ResponseCode.SUCCESS, _pop_ext(0), body=b"x")])
         monkeypatch.setattr("client.mq_client.decode_messages",
-                            lambda body: [_msg(queue_offset=0)])
+                            lambda body, read_body=True: [_msg(queue_offset=0)])
         res = _client(fake).pop_message(GROUP, TOPIC, queue_id=-1, init_mode=0,
                                         invisible_time=60000, poll_time=0,
                                         addr=ADDR, broker_name=BROKER)
@@ -416,7 +417,7 @@ class TestStampPopCk:
 class TestPopMessagePostProcess:
     def test_broker_name_and_topic_stamped(self, monkeypatch):
         monkeypatch.setattr("client.mq_client.decode_messages",
-                            lambda body: [_msg(queue_offset=0)])
+                            lambda body, read_body=True: [_msg(queue_offset=0)])
         fake = _FakeClient([_resp(ResponseCode.SUCCESS, _pop_ext(0), body=b"x")])
         res = _client(fake).pop_message(GROUP, TOPIC, queue_id=0,
                                         addr=ADDR, broker_name=BROKER)

@@ -105,6 +105,31 @@ public:
     void setVipChannelEnabled(bool enable) { vipChannelEnabled_ = enable; }
     bool isVipChannelEnabled() const { return vipChannelEnabled_; }
 
+    // decodeReadBody (default true): when false, pull / POP responses are still walked frame by frame
+    // (queue offsets, properties and the next frame boundary stay valid) but body bytes are neither
+    // copied nor CRC-checked nor decompressed; the returned messages are header-only.
+    void setDecodeReadBody(bool readBody) { decodeReadBody_ = readBody; }
+    bool isDecodeReadBody() const { return decodeReadBody_; }
+
+    // mqClientApiTimeout (default 3000ms): the timeout used by heartbeat, check-client-config,
+    // route fetch, unregisterClient and getConsumerIdListByGroup when a call site names none.
+    // A non-negative per-call timeout still wins.
+    void setMqClientApiTimeout(int32_t millis) { mqClientApiTimeout_ = millis; }
+    int32_t mqClientApiTimeout() const { return mqClientApiTimeout_; }
+
+    // Concurrent heartbeat (default off) and the size of the fixed pool it uses (default: the
+    // number of available processors). The pool is created by start() and stopped by shutdown().
+    void setEnableConcurrentHeartbeat(bool enable) { enableConcurrentHeartbeat_ = enable; }
+    bool isEnableConcurrentHeartbeat() const { return enableConcurrentHeartbeat_; }
+    void setConcurrentHeartbeatThreadPoolSize(int32_t size) { concurrentHeartbeatThreadPoolSize_ = size; }
+    int32_t concurrentHeartbeatThreadPoolSize() const { return concurrentHeartbeatThreadPoolSize_; }
+    static int32_t defaultConcurrentHeartbeatThreadPoolSize();
+
+    // maxPageSizeInGetMetadata (default 2000): the page size admin metadata queries send as
+    // maxTopicNum / maxGroupNum while paging broker-side tables.
+    void setMaxPageSizeInGetMetadata(int32_t size) { maxPageSizeInGetMetadata_ = size; }
+    int32_t maxPageSizeInGetMetadata() const { return maxPageSizeInGetMetadata_; }
+
     DefaultTopAddressing& topAddressing() { return topAddressing_; }
     void fetchNameServerAddr();
 
@@ -136,7 +161,7 @@ public:
     }
 
     bool updateTopicRouteInfoFromNameServer(const std::string& topic,
-                                            int32_t timeoutMillis = 5000,
+                                            int32_t timeoutMillis = -1,
                                             bool isDefault = false);
     // Get the publish info (**the cached instance is shared**, the round-robin cursor advances inside it);
     // a cache miss triggers one route refresh, and if it still fails an MQClientException is thrown.
@@ -281,14 +306,19 @@ public:
 
     // ---------------- Heartbeat / unregister ----------------
     void sendHeartbeat(const std::string& addr, const HeartbeatData& heartbeatData,
-                       int32_t timeoutMillis = 5000);
+                       int32_t timeoutMillis = -1);
+    // One concurrent heartbeat round: snapshot the broker address table (masters only when the body
+    // carries no consumer data), submit every heartbeat to the fixed pool, wait for all of them and
+    // return the number of successes. Empty bodies send nothing.
+    int32_t sendHeartbeatConcurrently(const HeartbeatData& heartbeatData,
+                                      int32_t timeoutMillis = -1);
     void unregisterClient(const std::string& addr, const std::string& clientId,
                           const std::string& producerGroup, const std::string& consumerGroup,
-                          int32_t timeoutMillis = kMqClientApiTimeoutMillis);
+                          int32_t timeoutMillis = -1);
     void unregisterClientAllBrokers(const std::string& clientId,
                                     const std::string& producerGroup,
                                     const std::string& consumerGroup,
-                                    int32_t timeoutMillis = kMqClientApiTimeoutMillis);
+                                    int32_t timeoutMillis = -1);
 
     static constexpr int32_t kMqClientApiTimeoutMillis = 3000;
 
@@ -296,7 +326,7 @@ public:
 
     void checkClientConfig(const std::string& brokerAddr, const std::string& consumerGroup,
                            const std::string& clientId, const SubscriptionData& subscriptionData,
-                           int32_t timeoutMillis = kMqClientApiTimeoutMillis);
+                           int32_t timeoutMillis = -1);
 
     void checkSubscriptionsInBroker(const std::string& group,
                                     const std::vector<SubscriptionData>& subs);
@@ -342,10 +372,10 @@ public:
     TopicList getAllTopicListFromNameServer(int32_t timeoutMillis = 10000);
     GetConsumerListByGroupResponseBody getConsumerListByGroup(
         const std::string& consumerGroup, const std::string& addr,
-        int32_t timeoutMillis = 5000);
+        int32_t timeoutMillis = -1);
     std::vector<std::string> getConsumerIdListByGroup(const std::string& topic,
                                                      const std::string& consumerGroup,
-                                                     int32_t timeoutMillis = 5000);
+                                                     int32_t timeoutMillis = -1);
 
     // ---------------- Query messages by key / uniqKey ----------------
     // indexType is one of MessageConst::INDEX_*_TYPE; when uniqKey is true, MixAll::UNIQUE_MSG_QUERY_FLAG
@@ -402,6 +432,9 @@ private:
     RemotingCommand invokeSyncOnAddr(const std::string& addr, RemotingCommand& request,
                                      int32_t timeoutMillis);
     void routeRefreshLoop();
+    // Create the concurrent-heartbeat pool when the switch is on (called from start(); a later
+    // enable also creates it lazily on the next round).
+    void ensureHeartbeatTaskRunner();
 
     // For seeding the endpoint table in offline unit tests (offline has no name server; production code writes this table only in the route-commit block).
     friend struct MQClientInstanceTestAccess;
@@ -438,6 +471,16 @@ private:
     std::mutex rebalanceWakeupLock_;
     std::map<std::string, std::function<void()>> rebalanceWakeups_;
     std::atomic<size_t> consumerIdsChangedCount_{0};
+
+    // ---- client configuration switches (forwarded by the facades in start()) ----
+    bool decodeReadBody_ = true;
+    int32_t mqClientApiTimeout_ = kMqClientApiTimeoutMillis;
+    bool enableConcurrentHeartbeat_ = false;
+    int32_t concurrentHeartbeatThreadPoolSize_ = defaultConcurrentHeartbeatThreadPoolSize();
+    int32_t maxPageSizeInGetMetadata_ = 2000;
+    class HeartbeatTaskRunner;
+    std::shared_ptr<HeartbeatTaskRunner> heartbeatTaskRunner_;
+    std::mutex heartbeatTaskRunnerMutex_;
 };
 
 }  // namespace rocketmq

@@ -68,6 +68,9 @@ type DefaultMQAdminExt struct {
 	// classic kvNamespaceToDeleteList).
 	KVNamespaceToDeleteList []string
 	TimeoutMillis           int64
+	// MaxPageSizeInGetMetadata is the page size sent as maxTopicNum /
+	// maxGroupNum by the metadata paging loops (default 2000).
+	MaxPageSizeInGetMetadata int
 
 	mqClient *Instance
 	started  bool
@@ -79,6 +82,7 @@ func NewDefaultMQAdminExt(rpcHook remoting.RPCHook) *DefaultMQAdminExt {
 		PollNameServerIntervalMillis: 30_000,
 		RpcHook:                      rpcHook,
 		TimeoutMillis:                DefaultAdminTimeoutMillis,
+		MaxPageSizeInGetMetadata:     DefaultMaxPageSizeInGetMetadata,
 	}
 }
 
@@ -165,6 +169,35 @@ func (a *DefaultMQAdminExt) SetTimeoutMillis(timeoutMillis int64) {
 	a.TimeoutMillis = timeoutMillis
 }
 
+// SetMaxPageSizeInGetMetadata sets the page size used by the metadata paging
+// loops; non-positive values restore the 2000 default. A running instance is
+// told as well, so callers reading the knob there see the same value.
+func (a *DefaultMQAdminExt) SetMaxPageSizeInGetMetadata(size int) {
+	if size <= 0 {
+		size = DefaultMaxPageSizeInGetMetadata
+	}
+	a.mu.Lock()
+	a.MaxPageSizeInGetMetadata = size
+	instance := a.mqClient
+	a.mu.Unlock()
+	if instance != nil {
+		instance.SetMaxPageSizeInGetMetadata(size)
+	}
+}
+
+// pageSizeInGetMetadata resolves the current metadata page size.
+func (a *DefaultMQAdminExt) pageSizeInGetMetadata() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.MaxPageSizeInGetMetadata > 0 {
+		return a.MaxPageSizeInGetMetadata
+	}
+	if a.mqClient != nil {
+		return a.mqClient.MaxPageSizeInGetMetadata()
+	}
+	return DefaultMaxPageSizeInGetMetadata
+}
+
 // Start builds and starts the underlying instance.
 func (a *DefaultMQAdminExt) Start() error {
 	a.mu.Lock()
@@ -186,11 +219,13 @@ func (a *DefaultMQAdminExt) Start() error {
 	hook := a.RpcHook
 	pollInterval := a.PollNameServerIntervalMillis
 	vipEnabled := a.VipChannelEnabled
+	pageSize := a.MaxPageSizeInGetMetadata
 	a.mu.Unlock()
 
 	config := NewClientInstanceConfig()
 	config.PollNameServerIntervalMillis = pollInterval
 	config.VipChannelEnabled = vipEnabled
+	config.MaxPageSizeInGetMetadata = pageSize
 	instance := CreateOrGetInstance(clientID, addrs, config)
 	instance.EnsureRPCHooks("", stream, hook)
 	if err := instance.Start(); err != nil {
@@ -591,13 +626,94 @@ func (a *DefaultMQAdminExt) ExamineTopicConfig(addr, topic string) (*remoting.To
 	return remoting.DecodeTopicConfig(response.Body)
 }
 
-// GetAllTopicConfig sends GET_ALL_TOPIC_CONFIG(21) to one broker.
+// GetAllTopicConfig sends GET_ALL_TOPIC_CONFIG(21), accumulating PAGES until
+// topicSeq >= totalTopicNum-1. The first page carries an EMPTY dataVersion;
+// later pages carry the JSON of the last version seen, and a changed version
+// restarts paging from seq 0. A broker that does not send `totalTopicNum`
+// (older versions) returns everything in one round, so the loop ends after the
+// first page.
 func (a *DefaultMQAdminExt) GetAllTopicConfig(brokerAddr string, timeoutMillis int64) (*remoting.TopicConfigSerializeWrapper, error) {
-	response, err := a.invokeBroker(brokerAddr, remoting.ReqGetAllTopicConfig, nil, nil, timeoutMillis)
+	instance, err := a.requireClient()
 	if err != nil {
 		return nil, err
 	}
-	return remoting.DecodeTopicConfigSerializeWrapper(response.Body)
+	timeout := a.timeout(timeoutMillis)
+	target := a.brokerVIPAddr(brokerAddr)
+	pageSize := a.pageSizeInGetMetadata()
+	var currentDataVersion map[string]any
+	haveDataVersion := false
+	topicSeq := 0
+	table := map[string]*remoting.TopicConfig{}
+	begin := time.Now()
+	firstPage := true
+
+	for {
+		left := timeout - time.Since(begin).Milliseconds()
+		if left < 0 {
+			return nil, common.ClientError("invokeSync call timeout")
+		}
+		ext := adminExt("topicSeq", topicSeq, "maxTopicNum", pageSize)
+		if firstPage {
+			// The protocol requires the field on the first page, present and
+			// empty; omitting it makes a paging broker treat the request as a
+			// fresh enumeration of unknown version.
+			ext.Put("dataVersion", "")
+			firstPage = false
+		} else {
+			ext.Put("dataVersion", string(remoting.EncodeJSON(currentDataVersion)))
+		}
+		response, err := instance.invokeSync(target,
+			adminRequest(remoting.ReqGetAllTopicConfig, ext), left)
+		if err != nil {
+			return nil, err
+		}
+		if response.Code != remoting.RespSuccess {
+			return nil, common.BrokerError(response.Code, response.Remark)
+		}
+		wrapper, err := remoting.DecodeTopicConfigSerializeWrapper(response.Body)
+		if err != nil {
+			return nil, err
+		}
+		for k, v := range wrapper.TopicConfigTable {
+			table[k] = v
+		}
+
+		totalText, hasTotal := response.ExtFields().Get("totalTopicNum")
+		if !hasTotal {
+			// Older broker: one round returns everything.
+			currentDataVersion = wrapper.DataVersion
+			haveDataVersion = true
+			break
+		}
+		total, ok := adminParseInt64(totalText)
+		if !ok {
+			currentDataVersion = wrapper.DataVersion
+			haveDataVersion = true
+			break
+		}
+		newVersion := wrapper.DataVersion
+		if haveDataVersion && !sameDataVersion(currentDataVersion, newVersion) {
+			common.LogWarnf("topic config dataVersion changed, restart paging")
+			currentDataVersion = newVersion
+			topicSeq = 0
+			table = map[string]*remoting.TopicConfig{}
+			continue
+		}
+		currentDataVersion = newVersion
+		haveDataVersion = true
+
+		topicSeq += len(wrapper.TopicConfigTable)
+		if topicSeq >= int(total)-1 {
+			break
+		}
+	}
+
+	result := remoting.NewTopicConfigSerializeWrapper()
+	result.TopicConfigTable = table
+	if haveDataVersion {
+		result.DataVersion = currentDataVersion
+	}
+	return result, nil
 }
 
 // GetUserTopicConfig drops system topics and (unless specialTopic) the
@@ -927,19 +1043,25 @@ func (a *DefaultMQAdminExt) GetAllSubscriptionGroup(brokerAddr string, timeoutMi
 	// Every page goes to the same broker, so the address is resolved once — the
 	// paging loop must not re-derive it.
 	target := a.brokerVIPAddr(brokerAddr)
+	pageSize := a.pageSizeInGetMetadata()
 	var currentDataVersion map[string]any
 	groupSeq := 0
 	table := map[string]*remoting.SubscriptionGroupConfig{}
 	forbidden := map[string]any{}
 	begin := time.Now()
+	firstPage := true
 
 	for {
 		left := timeout - time.Since(begin).Milliseconds()
 		if left < 0 {
 			return nil, common.ClientError("invokeSync call timeout")
 		}
-		ext := adminExt("groupSeq", groupSeq, "maxGroupNum", 10000)
-		if currentDataVersion != nil {
+		ext := adminExt("groupSeq", groupSeq, "maxGroupNum", pageSize)
+		if firstPage {
+			// Present and empty on the first page, never omitted.
+			ext.Put("dataVersion", "")
+			firstPage = false
+		} else {
 			ext.Put("dataVersion", string(remoting.EncodeJSON(currentDataVersion)))
 		}
 		response, err := instance.invokeSync(target,

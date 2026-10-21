@@ -71,6 +71,14 @@ final class DefaultMQPullConsumer
      * fingerprint is unchanged, the subscription set drops out of the body.
      */
     public bool $useHeartbeatV2 = false;
+    /** Decode-read-body switch (default true): off leaves received message bodies unmaterialised. */
+    public bool $decodeReadBody = true;
+    /** Fallback timeout of internal client API calls; explicit call timeouts still win. */
+    public int $mqClientApiTimeout = 3000;
+    /** Concurrent heartbeat dispatch (default false); the fingerprint path wins when both are on. */
+    public bool $enableConcurrentHeartbeat = false;
+    /** Worker count of the instance's concurrent heartbeat pool, default = available processors. */
+    public int $concurrentHeartbeatThreadPoolSize;
     /**
      * VIP channel (default false; the broker only opens the `listen port - 2` channel when started
      * with it). On, the offset / queue-lock / consumer-list / send-back requests this facade makes go
@@ -133,6 +141,7 @@ final class DefaultMQPullConsumer
         $this->rpcHook = $rpcHook;
         $this->namespace = $namespace;
         $this->messageModel = $messageModel;
+        $this->concurrentHeartbeatThreadPoolSize = MQClientInstance::availableProcessors();
         $this->allocateMessageQueueStrategy = new AllocateMessageQueueAveragely();
     }
 
@@ -174,6 +183,42 @@ final class DefaultMQPullConsumer
     public function isVipChannelEnabled(): bool
     {
         return $this->vipChannelEnabled;
+    }
+
+    /** Gate body materialisation of received pull/pop results; the live instance follows immediately. */
+    public function setDecodeReadBody(bool $decodeReadBody): void
+    {
+        $this->decodeReadBody = $decodeReadBody;
+        if ($this->mqClient !== null) {
+            $this->mqClient->setDecodeReadBody($decodeReadBody);
+        }
+    }
+
+    /** Fallback timeout of the internal client API calls; explicit per-call timeouts still win. */
+    public function setMqClientApiTimeout(int $timeoutMillis): void
+    {
+        $this->mqClientApiTimeout = $timeoutMillis;
+        if ($this->mqClient !== null) {
+            $this->mqClient->setMqClientApiTimeout($timeoutMillis);
+        }
+    }
+
+    public function setEnableConcurrentHeartbeat(bool $enable): void
+    {
+        $this->enableConcurrentHeartbeat = $enable;
+        if ($this->mqClient !== null) {
+            $this->mqClient->setEnableConcurrentHeartbeat($enable);
+        }
+    }
+
+    public function setConcurrentHeartbeatThreadPoolSize(int $size): void
+    {
+        $this->concurrentHeartbeatThreadPoolSize = $size > 0
+            ? $size
+            : MQClientInstance::availableProcessors();
+        if ($this->mqClient !== null) {
+            $this->mqClient->setConcurrentHeartbeatThreadPoolSize($this->concurrentHeartbeatThreadPoolSize);
+        }
     }
 
     public function setUnitMode(bool $unitMode): void
@@ -308,7 +353,7 @@ final class DefaultMQPullConsumer
         $ok = 0;
         foreach ($client->getAllBrokerAddrs() as $addr) {
             try {
-                $client->sendHeartbeat($addr, $hb, 5000);
+                $client->sendHeartbeat($addr, $hb);
                 $ok++;
             } catch (\Throwable $e) {
                 Logger::debug("heartbeat to $addr failed: " . $e->getMessage());
@@ -386,6 +431,10 @@ final class DefaultMQPullConsumer
             socksProxy: $this->socksProxy,
             useHeartbeatV2: $this->useHeartbeatV2,
             vipChannelEnabled: $this->vipChannelEnabled,
+            decodeReadBody: $this->decodeReadBody,
+            mqClientApiTimeout: $this->mqClientApiTimeout,
+            enableConcurrentHeartbeat: $this->enableConcurrentHeartbeat,
+            concurrentHeartbeatThreadPoolSize: $this->concurrentHeartbeatThreadPoolSize,
         );
         if ($this->rpcHook !== null) {
             $this->mqClient->remotingClient->registerRpcHook($this->rpcHook);
@@ -847,6 +896,14 @@ final class DefaultLitePullConsumer
      * fingerprint is unchanged, the subscription set drops out of the body.
      */
     public bool $useHeartbeatV2 = false;
+    /** Decode-read-body switch (default true): off leaves received message bodies unmaterialised. */
+    public bool $decodeReadBody = true;
+    /** Fallback timeout of internal client API calls; explicit call timeouts still win. */
+    public int $mqClientApiTimeout = 3000;
+    /** Concurrent heartbeat dispatch (default false); the fingerprint path wins when both are on. */
+    public bool $enableConcurrentHeartbeat = false;
+    /** Worker count of the instance's concurrent heartbeat pool, default = available processors. */
+    public int $concurrentHeartbeatThreadPoolSize;
     /**
      * VIP channel (default false; the broker only opens the `listen port - 2` channel when started
      * with it). On, the offset / queue-lock / consumer-list / send-back requests this facade makes go
@@ -940,6 +997,7 @@ final class DefaultLitePullConsumer
         $this->namespace = $namespace;
         $this->messageModel = $messageModel;
         $this->consumeTimestamp = date('YmdHis', time() - 30 * 60);
+        $this->concurrentHeartbeatThreadPoolSize = MQClientInstance::availableProcessors();
         $this->allocateMessageQueueStrategy = new AllocateMessageQueueAveragely();
     }
 
@@ -1013,6 +1071,42 @@ final class DefaultLitePullConsumer
     public function isVipChannelEnabled(): bool
     {
         return $this->vipChannelEnabled;
+    }
+
+    /** Gate body materialisation of received pull/pop results; the live instance follows immediately. */
+    public function setDecodeReadBody(bool $decodeReadBody): void
+    {
+        $this->decodeReadBody = $decodeReadBody;
+        if ($this->mqClient !== null) {
+            $this->mqClient->setDecodeReadBody($decodeReadBody);
+        }
+    }
+
+    /** Fallback timeout of the internal client API calls; explicit per-call timeouts still win. */
+    public function setMqClientApiTimeout(int $timeoutMillis): void
+    {
+        $this->mqClientApiTimeout = $timeoutMillis;
+        if ($this->mqClient !== null) {
+            $this->mqClient->setMqClientApiTimeout($timeoutMillis);
+        }
+    }
+
+    public function setEnableConcurrentHeartbeat(bool $enable): void
+    {
+        $this->enableConcurrentHeartbeat = $enable;
+        if ($this->mqClient !== null) {
+            $this->mqClient->setEnableConcurrentHeartbeat($enable);
+        }
+    }
+
+    public function setConcurrentHeartbeatThreadPoolSize(int $size): void
+    {
+        $this->concurrentHeartbeatThreadPoolSize = $size > 0
+            ? $size
+            : MQClientInstance::availableProcessors();
+        if ($this->mqClient !== null) {
+            $this->mqClient->setConcurrentHeartbeatThreadPoolSize($this->concurrentHeartbeatThreadPoolSize);
+        }
     }
 
     /** Read the server-side namespace (the one used by the `nsd`/`ns` extension headers). */
@@ -1155,6 +1249,10 @@ final class DefaultLitePullConsumer
             socksProxy: $this->socksProxy,
             useHeartbeatV2: $this->useHeartbeatV2,
             vipChannelEnabled: $this->vipChannelEnabled,
+            decodeReadBody: $this->decodeReadBody,
+            mqClientApiTimeout: $this->mqClientApiTimeout,
+            enableConcurrentHeartbeat: $this->enableConcurrentHeartbeat,
+            concurrentHeartbeatThreadPoolSize: $this->concurrentHeartbeatThreadPoolSize,
         );
         if ($this->rpcHook !== null) {
             $this->mqClient->remotingClient->registerRpcHook($this->rpcHook);
@@ -1271,7 +1369,7 @@ final class DefaultLitePullConsumer
         $ok = 0;
         foreach ($this->mqClient->getAllBrokerAddrs() as $addr) {
             try {
-                $this->mqClient->sendHeartbeat($addr, $hb, 5000);
+                $this->mqClient->sendHeartbeat($addr, $hb);
                 $ok++;
             } catch (\Throwable $e) {
                 Logger::debug("lite heartbeat to $addr failed: " . $e->getMessage());

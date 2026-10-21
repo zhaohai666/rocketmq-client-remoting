@@ -78,6 +78,24 @@ pub fn jdouble(value: &Value, key: &str, default: f64) -> f64 {
     }
 }
 
+/// Boxed-integer field: `None` when the field is absent / `null` (nulls are omitted on the wire,
+/// a present-but-dirty value falls back to `None` too).
+pub fn optional_i64(value: &Value, key: &str) -> Option<i64> {
+    match jfield(value, key) {
+        Some(Value::Number(n)) => n
+            .as_i64()
+            .or_else(|| n.as_u64().map(|v| v as i64))
+            .or_else(|| n.as_f64().map(|f| f as i64)),
+        Some(Value::String(s)) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+/// Boxed-int field, same tolerance rules as [`optional_i64`].
+pub fn optional_i32(value: &Value, key: &str) -> Option<i32> {
+    optional_i64(value, key).map(|v| v as i32)
+}
+
 /// Boolean field (equivalent to `d.get(k, default)`; only a real `true` / `"true"` counts).
 pub fn jboolean(value: &Value, key: &str, default: bool) -> bool {
     match jfield(value, key) {
@@ -609,6 +627,223 @@ impl QueryConsumeQueueResponseBody {
 
     pub fn decode(data: &[u8]) -> Result<QueryConsumeQueueResponseBody> {
         QueryConsumeQueueResponseBody::from_json_value(&RemotingSerializable::decode(data)?)
+    }
+}
+
+// ---------------------------------------------------------------- BrokerReplicasInfo (controller sync state)
+
+/// One replica line of the in-sync-state table (`ReplicaIdentity`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ReplicaIdentity {
+    pub broker_name: String,
+    pub broker_id: Option<i64>,
+    pub broker_address: Option<String>,
+    pub alive: Option<bool>,
+}
+
+impl ReplicaIdentity {
+    pub fn to_json_value(&self) -> Value {
+        let mut map = Map::new();
+        map.insert("brokerName".to_string(), Value::String(self.broker_name.clone()));
+        if let Some(id) = self.broker_id {
+            map.insert("brokerId".to_string(), Value::from(id));
+        }
+        if let Some(addr) = &self.broker_address {
+            map.insert("brokerAddress".to_string(), Value::String(addr.clone()));
+        }
+        if let Some(alive) = self.alive {
+            map.insert("alive".to_string(), Value::Bool(alive));
+        }
+        Value::Object(map)
+    }
+
+    pub fn from_json_value(value: &Value) -> Result<ReplicaIdentity> {
+        expect_object(value, "ReplicaIdentity")?;
+        Ok(ReplicaIdentity {
+            broker_name: jstring_or(value, "brokerName", ""),
+            broker_id: optional_i64(value, "brokerId"),
+            broker_address: jstring(value, "brokerAddress"),
+            alive: jfield(value, "alive").map(|_| jboolean(value, "alive", false)),
+        })
+    }
+}
+
+/// Per-broker sync state: master placement plus the two replica sets.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ReplicasInfo {
+    pub master_broker_id: Option<i64>,
+    pub master_address: Option<String>,
+    pub master_epoch: Option<i32>,
+    pub sync_state_set_epoch: Option<i32>,
+    pub in_sync_replicas: Vec<ReplicaIdentity>,
+    pub not_in_sync_replicas: Vec<ReplicaIdentity>,
+}
+
+impl ReplicasInfo {
+    pub fn to_json_value(&self) -> Value {
+        let mut map = Map::new();
+        if let Some(id) = self.master_broker_id {
+            map.insert("masterBrokerId".to_string(), Value::from(id));
+        }
+        if let Some(addr) = &self.master_address {
+            map.insert("masterAddress".to_string(), Value::String(addr.clone()));
+        }
+        if let Some(epoch) = self.master_epoch {
+            map.insert("masterEpoch".to_string(), Value::from(epoch));
+        }
+        if let Some(epoch) = self.sync_state_set_epoch {
+            map.insert("syncStateSetEpoch".to_string(), Value::from(epoch));
+        }
+        map.insert(
+            "inSyncReplicas".to_string(),
+            Value::Array(self.in_sync_replicas.iter().map(|r| r.to_json_value()).collect()),
+        );
+        map.insert(
+            "notInSyncReplicas".to_string(),
+            Value::Array(
+                self.not_in_sync_replicas
+                    .iter()
+                    .map(|r| r.to_json_value())
+                    .collect(),
+            ),
+        );
+        Value::Object(map)
+    }
+
+    pub fn from_json_value(value: &Value) -> Result<ReplicasInfo> {
+        expect_object(value, "ReplicasInfo")?;
+        let replicas = |key: &str| -> Result<Vec<ReplicaIdentity>> {
+            Ok(jarray(value, key)?
+                .into_iter()
+                .map(ReplicaIdentity::from_json_value)
+                .collect::<Result<Vec<_>>>()?)
+        };
+        Ok(ReplicasInfo {
+            master_broker_id: optional_i64(value, "masterBrokerId"),
+            master_address: jstring(value, "masterAddress"),
+            master_epoch: optional_i32(value, "masterEpoch"),
+            sync_state_set_epoch: optional_i32(value, "syncStateSetEpoch"),
+            in_sync_replicas: replicas("inSyncReplicas")?,
+            not_in_sync_replicas: replicas("notInSyncReplicas")?,
+        })
+    }
+}
+
+/// Response body of the controller sync-state query: brokerName → ReplicasInfo.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BrokerReplicasInfo {
+    pub replicas_info_table: Vec<(String, ReplicasInfo)>,
+}
+
+impl BrokerReplicasInfo {
+    pub fn new() -> BrokerReplicasInfo {
+        BrokerReplicasInfo::default()
+    }
+
+    pub fn get(&self, broker_name: &str) -> Option<&ReplicasInfo> {
+        self.replicas_info_table
+            .iter()
+            .find(|(name, _)| name == broker_name)
+            .map(|(_, info)| info)
+    }
+
+    pub fn to_json_value(&self) -> Value {
+        let mut map = Map::new();
+        for (name, info) in &self.replicas_info_table {
+            map.insert(name.clone(), info.to_json_value());
+        }
+        json_object(vec![("replicasInfoTable", Value::Object(map))])
+    }
+
+    pub fn from_json_value(value: &Value) -> Result<BrokerReplicasInfo> {
+        expect_object(value, "BrokerReplicasInfo")?;
+        let mut table = Vec::new();
+        for (name, raw) in jentries(value, "replicasInfoTable")? {
+            table.push((name.clone(), ReplicasInfo::from_json_value(raw)?));
+        }
+        Ok(BrokerReplicasInfo { replicas_info_table: table })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        RemotingSerializable::encode(&self.to_json_value())
+    }
+
+    pub fn decode(data: &[u8]) -> Result<BrokerReplicasInfo> {
+        BrokerReplicasInfo::from_json_value(&RemotingSerializable::decode(data)?)
+    }
+}
+
+// ---------------------------------------------------------------- CheckRocksdbCqWriteResult
+
+/// `CheckStatus` enum: the numeric values are the protocol values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckRocksdbCqWriteStatus {
+    CheckOk,
+    CheckNotOk,
+    CheckInProgress,
+    CheckError,
+}
+
+impl CheckRocksdbCqWriteStatus {
+    pub fn value(&self) -> i32 {
+        match self {
+            CheckRocksdbCqWriteStatus::CheckOk => 0,
+            CheckRocksdbCqWriteStatus::CheckNotOk => 1,
+            CheckRocksdbCqWriteStatus::CheckInProgress => 2,
+            CheckRocksdbCqWriteStatus::CheckError => 3,
+        }
+    }
+
+    pub fn from_value(value: i32) -> Option<CheckRocksdbCqWriteStatus> {
+        match value {
+            0 => Some(CheckRocksdbCqWriteStatus::CheckOk),
+            1 => Some(CheckRocksdbCqWriteStatus::CheckNotOk),
+            2 => Some(CheckRocksdbCqWriteStatus::CheckInProgress),
+            3 => Some(CheckRocksdbCqWriteStatus::CheckError),
+            _ => None,
+        }
+    }
+}
+
+/// Result of the ConsumeQueue write-progress probe on a RocksDB store.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CheckRocksdbCqWriteResult {
+    pub check_result: Option<String>,
+    pub check_status: i32,
+}
+
+impl CheckRocksdbCqWriteResult {
+    pub fn status(&self) -> Option<CheckRocksdbCqWriteStatus> {
+        CheckRocksdbCqWriteStatus::from_value(self.check_status)
+    }
+
+    pub fn to_json_value(&self) -> Value {
+        json_object(vec![
+            (
+                "checkResult",
+                match &self.check_result {
+                    Some(text) => Value::String(text.clone()),
+                    None => Value::Null,
+                },
+            ),
+            ("checkStatus", Value::from(self.check_status)),
+        ])
+    }
+
+    pub fn from_json_value(value: &Value) -> Result<CheckRocksdbCqWriteResult> {
+        expect_object(value, "CheckRocksdbCqWriteResult")?;
+        Ok(CheckRocksdbCqWriteResult {
+            check_result: jstring(value, "checkResult"),
+            check_status: jint(value, "checkStatus", 0),
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        RemotingSerializable::encode(&self.to_json_value())
+    }
+
+    pub fn decode(data: &[u8]) -> Result<CheckRocksdbCqWriteResult> {
+        CheckRocksdbCqWriteResult::from_json_value(&RemotingSerializable::decode(data)?)
     }
 }
 

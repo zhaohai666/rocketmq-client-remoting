@@ -203,7 +203,9 @@ func (i *Instance) processPopResponse(brokerName string, response *remoting.Remo
 	case remoting.RespSuccess:
 		result.PopStatus = PopFound
 		if len(response.Body) > 0 {
-			result.MsgFoundList = common.DecodeMessages(response.Body)
+			opts := common.DefaultDecodeOptions()
+			opts.ReadBody = i.DecodeReadBody()
+			result.MsgFoundList = common.DecodeMessagesWith(response.Body, opts)
 		}
 	case remoting.RespPollingFull:
 		result.PopStatus = PopPollingFull
@@ -372,7 +374,7 @@ func (c *DefaultMQPushConsumer) popAckAddress(brokerName, topic string, queueID 
 	}
 	addr, _, found := inst.FindBrokerAddressInSubscribe(desBrokerName, int64(common.MasterID), true)
 	if !found {
-		if _, err := inst.UpdateTopicRouteInfoFromNameServer(topic, 5000, false); err != nil {
+		if _, err := inst.UpdateTopicRouteInfoFromNameServer(topic, 0, false); err != nil {
 			return "", err
 		}
 		if isLogicalQueueMockBrokerName(brokerName) {

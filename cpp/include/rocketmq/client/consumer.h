@@ -179,6 +179,23 @@ public:
     // route address. Must be set before start(); forwarded to the MQClientInstance that owns the RPCs.
     void setVipChannelEnabled(bool enable) { vipChannelEnabled_ = enable; }
     bool isVipChannelEnabled() const { return vipChannelEnabled_; }
+    // decodeReadBody (default true): false = pull / POP bodies are walked but not materialized.
+    // Must be set before start(); forwarded to the MQClientInstance that owns the RPCs.
+    void setDecodeReadBody(bool readBody) { decodeReadBody_ = readBody; }
+    bool isDecodeReadBody() const { return decodeReadBody_; }
+    // mqClientApiTimeout (default 3000ms): default timeout of heartbeat / route / unregister /
+    // consumer-list RPCs. Forwarded to the instance in start().
+    void setMqClientApiTimeout(int32_t millis) { mqClientApiTimeout_ = millis; }
+    int32_t mqClientApiTimeout() const { return mqClientApiTimeout_; }
+    // Concurrent heartbeat (default off) and its pool size (default: available processors).
+    void setEnableConcurrentHeartbeat(bool enable) { enableConcurrentHeartbeat_ = enable; }
+    bool isEnableConcurrentHeartbeat() const { return enableConcurrentHeartbeat_; }
+    void setConcurrentHeartbeatThreadPoolSize(int32_t size) {
+        concurrentHeartbeatThreadPoolSize_ = size;
+    }
+    int32_t concurrentHeartbeatThreadPoolSize() const {
+        return concurrentHeartbeatThreadPoolSize_;
+    }
     // persistConsumerOffsetInterval (default 5000ms): the background consumer-offset flush period;
     // the final flush of shutdown() is independent of it (raising it only delays the timing, it never drops an offset).
     void setPersistConsumerOffsetIntervalMillis(int32_t millis) {
@@ -803,6 +820,11 @@ private:
     // Facade-level copies of the client configuration values (each passed through / read once in start())
     int32_t pollNameServerIntervalMillis_ = 30000;
     bool vipChannelEnabled_ = false;
+    bool decodeReadBody_ = true;
+    int32_t mqClientApiTimeout_ = MQClientInstance::kMqClientApiTimeoutMillis;
+    bool enableConcurrentHeartbeat_ = false;
+    int32_t concurrentHeartbeatThreadPoolSize_ =
+        MQClientInstance::defaultConcurrentHeartbeatThreadPoolSize();
     int32_t persistConsumerOffsetIntervalMillis_ = 5000;
     std::string messageModel_ = MessageModel::CLUSTERING;
     std::string consumeFromWhere_ = ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET;

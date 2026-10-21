@@ -30,6 +30,7 @@ class _InvokeSpy:
     def __init__(self):
         self.requests = []
         self.timeouts = []
+        self.mq_client_api_timeout = 3000
 
     def _invoke_sync(self, addr, request, timeout_millis):
         self.requests.append((addr, request))

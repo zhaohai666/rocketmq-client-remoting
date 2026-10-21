@@ -375,7 +375,11 @@ def decode_message(raw: bytes, read_body: bool = True, decompress_body: bool = T
 
 
 def decode_messages(raw: bytes, read_body: bool = True) -> List[MessageExt]:
-    """Decode a stream of 17-segment messages into a list of MessageExt (corresponds to ``MessageDecoder.decodes``, used for pull results)."""
+    """Decode a stream of 17-segment messages into a list of MessageExt (corresponds to ``MessageDecoder.decodes``, used for pull results).
+
+    With ``read_body=False`` every frame is still walked and its body length skipped, but the
+    bytes are neither copied nor validated nor decompressed: the bodies stay ``None``.
+    """
     result: List[MessageExt] = []
     pos = 0
     total = len(raw)
@@ -385,7 +389,8 @@ def decode_messages(raw: bytes, read_body: bool = True) -> List[MessageExt]:
         (store_size,) = struct.unpack_from(">i", raw, pos)
         if store_size <= 0 or store_size > total - pos:
             break
-        msg = decode_message(raw[pos:pos + store_size], read_body=read_body)
+        msg = decode_message(raw[pos:pos + store_size], read_body=read_body,
+                             decompress_body=read_body, check_crc=read_body)
         if msg is None:
             break
         result.append(msg)

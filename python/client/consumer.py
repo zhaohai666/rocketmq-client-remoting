@@ -899,6 +899,14 @@ class DefaultMQPushConsumer:
         # lock / consumer-list / send-re-back RPCs target the broker's VIP port (listen port - 2).
         self.use_heartbeat_v2 = False
         self.vip_channel_enabled = False
+        # Received message bodies are materialised by default; switching this off decodes only
+        # the headers and leaves every body unset.
+        self.decode_read_body = True
+        # Concurrent heartbeat: one round fans out over the instance's worker pool and waits
+        # for every broker. The pool is created when the client instance starts.
+        self.enable_concurrent_heartbeat = False
+        self.concurrent_heartbeat_thread_pool_size = os.cpu_count() or 1
+        self.mq_client_api_timeout = 3000
         # Route refresh interval (``poll_name_server_interval`` defaults to 30000ms).
         # Only passed through once when start() builds the MQClientInstance; later changes take no effect
         # (the background scheduling is arranged with the interval at startup).
@@ -1004,6 +1012,34 @@ class DefaultMQPushConsumer:
         """Opt into the fingerprint-gated heartbeat V2 path; off by default here, so a client
         that never asks for it keeps the broker on its V1 registration path."""
         self.use_heartbeat_v2 = bool(enable)
+
+    def set_decode_read_body(self, enable: bool) -> None:
+        """Control whether received message bodies are materialised; on by default.
+
+        The shared client instance is updated too, because decoding happens there.
+        """
+        self.decode_read_body = bool(enable)
+        if self._mq_client is not None:
+            self._mq_client.decode_read_body = bool(enable)
+
+    def set_enable_concurrent_heartbeat(self, enable: bool) -> None:
+        """Send one heartbeat per broker in parallel once the client instance starts."""
+        self.enable_concurrent_heartbeat = bool(enable)
+        if self._mq_client is not None:
+            self._mq_client.enable_concurrent_heartbeat = bool(enable)
+
+    def set_concurrent_heartbeat_thread_pool_size(self, size: int) -> None:
+        """Worker count of the concurrent-heartbeat pool; applied when the instance starts."""
+        self.concurrent_heartbeat_thread_pool_size = max(1, int(size))
+        if self._mq_client is not None:
+            self._mq_client.concurrent_heartbeat_thread_pool_size = max(1, int(size))
+
+    def set_mq_client_api_timeout(self, timeout_millis: int) -> None:
+        """Timeout of the client's internal API calls (heartbeat, route fetch, unregister,
+        consumer-list lookup); per-call explicit timeouts still win."""
+        self.mq_client_api_timeout = int(timeout_millis)
+        if self._mq_client is not None:
+            self._mq_client.mq_client_api_timeout = int(timeout_millis)
 
     def set_socks_proxy_config(self, socks_proxy_config: Optional[SocksProxyConfig]) -> None:
         pass
@@ -1490,10 +1526,19 @@ class DefaultMQPushConsumer:
                     unit_name=self.unit_name,
                     namespace_v2=self.namespace_v2,
                     poll_name_server_interval=self.poll_name_server_interval,
-                    vip_channel_enabled=self.vip_channel_enabled)
+                    vip_channel_enabled=self.vip_channel_enabled,
+                    decode_read_body=self.decode_read_body,
+                    mq_client_api_timeout=self.mq_client_api_timeout,
+                    enable_concurrent_heartbeat=self.enable_concurrent_heartbeat,
+                    concurrent_heartbeat_thread_pool_size=self.concurrent_heartbeat_thread_pool_size)
 
             self._mq_client, created = MQClientManager.get_instance() \
                 .get_or_create_mq_client_instance(self.client_id, _create_instance)
+            self._mq_client.decode_read_body = self.decode_read_body
+            self._mq_client.mq_client_api_timeout = self.mq_client_api_timeout
+            self._mq_client.enable_concurrent_heartbeat = self.enable_concurrent_heartbeat
+            self._mq_client.concurrent_heartbeat_thread_pool_size = \
+                self.concurrent_heartbeat_thread_pool_size
             if created and self.rpc_hook is not None:
                 self._mq_client.remoting_client.register_rpc_hook(self.rpc_hook)
             manager = MQClientManager.get_instance()
@@ -1762,6 +1807,11 @@ class DefaultMQPushConsumer:
         """
         client = self._require_client()
         hb = self._build_heartbeat()
+        if not self.use_heartbeat_v2 and self.enable_concurrent_heartbeat:
+            ok = client.send_heartbeat_concurrently(hb, self.mq_client_api_timeout)
+            if ok > 0:
+                self._heartbeat_count += 1
+            return ok
         ok = 0
         for addr in client.get_all_broker_addrs():
             try:
@@ -1771,9 +1821,10 @@ class DefaultMQPushConsumer:
                 # the cheap withoutSub body. A broker that never answers those extFields keeps getting
                 # the full subscription set, so the plain HEART_BEAT(34) path stays intact.
                 if self.use_heartbeat_v2:
-                    client.send_heartbeat_to_broker_v2(addr, hb, self.consumer_group, 5000)
+                    client.send_heartbeat_to_broker_v2(
+                        addr, hb, self.consumer_group, self.mq_client_api_timeout)
                 else:
-                    client.send_heartbeat(addr, hb, 5000)
+                    client.send_heartbeat(addr, hb, self.mq_client_api_timeout)
                 ok += 1
             except Exception as e:  # noqa: BLE001
                 logger.debug("heartbeat to %s failed: %s", addr, e)
@@ -3730,6 +3781,12 @@ class DefaultMQPullConsumer:
         # for what they do; the pull consumer's heartbeat body is CONSUME_ACTIVELY).
         self.use_heartbeat_v2 = False
         self.vip_channel_enabled = False
+        # Received message bodies are materialised by default; switching this off decodes only
+        # the headers and leaves every body unset.
+        self.decode_read_body = True
+        self.enable_concurrent_heartbeat = False
+        self.concurrent_heartbeat_thread_pool_size = os.cpu_count() or 1
+        self.mq_client_api_timeout = 3000
         self._heartbeat_count = 0
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._heartbeat_stop = threading.Event()
@@ -3823,6 +3880,34 @@ class DefaultMQPullConsumer:
         that never asks for it keeps the broker on its V1 registration path."""
         self.use_heartbeat_v2 = bool(enable)
 
+    def set_decode_read_body(self, enable: bool) -> None:
+        """Control whether received message bodies are materialised; on by default.
+
+        The shared client instance is updated too, because decoding happens there.
+        """
+        self.decode_read_body = bool(enable)
+        if self._mq_client is not None:
+            self._mq_client.decode_read_body = bool(enable)
+
+    def set_enable_concurrent_heartbeat(self, enable: bool) -> None:
+        """Send one heartbeat per broker in parallel once the client instance starts."""
+        self.enable_concurrent_heartbeat = bool(enable)
+        if self._mq_client is not None:
+            self._mq_client.enable_concurrent_heartbeat = bool(enable)
+
+    def set_concurrent_heartbeat_thread_pool_size(self, size: int) -> None:
+        """Worker count of the concurrent-heartbeat pool; applied when the instance starts."""
+        self.concurrent_heartbeat_thread_pool_size = max(1, int(size))
+        if self._mq_client is not None:
+            self._mq_client.concurrent_heartbeat_thread_pool_size = max(1, int(size))
+
+    def set_mq_client_api_timeout(self, timeout_millis: int) -> None:
+        """Timeout of the client's internal API calls (heartbeat, route fetch, unregister,
+        consumer-list lookup); per-call explicit timeouts still win."""
+        self.mq_client_api_timeout = int(timeout_millis)
+        if self._mq_client is not None:
+            self._mq_client.mq_client_api_timeout = int(timeout_millis)
+
     def set_socks_proxy_config(self, socks_proxy_config: Optional[SocksProxyConfig]) -> None:
         pass
         self.socks_proxy_config = socks_proxy_config
@@ -3896,6 +3981,11 @@ class DefaultMQPullConsumer:
         """
         client = self._require_client()
         hb = self._build_heartbeat()
+        if not self.use_heartbeat_v2 and self.enable_concurrent_heartbeat:
+            ok = client.send_heartbeat_concurrently(hb, self.mq_client_api_timeout)
+            if ok > 0:
+                self._heartbeat_count += 1
+            return ok
         ok = 0
         for addr in client.get_all_broker_addrs():
             try:
@@ -3905,9 +3995,10 @@ class DefaultMQPullConsumer:
                 # the cheap withoutSub body. A broker that never answers those extFields keeps getting
                 # the full subscription set, so the plain HEART_BEAT(34) path stays intact.
                 if self.use_heartbeat_v2:
-                    client.send_heartbeat_to_broker_v2(addr, hb, self.consumer_group, 5000)
+                    client.send_heartbeat_to_broker_v2(
+                        addr, hb, self.consumer_group, self.mq_client_api_timeout)
                 else:
-                    client.send_heartbeat(addr, hb, 5000)
+                    client.send_heartbeat(addr, hb, self.mq_client_api_timeout)
                 ok += 1
             except Exception as e:  # noqa: BLE001
                 logger.debug("heartbeat to %s failed: %s", addr, e)
@@ -3965,9 +4056,18 @@ class DefaultMQPullConsumer:
                                     unit_name=self.unit_name,
                                     namespace_v2=self.namespace_v2,
                                     poll_name_server_interval=self.poll_name_server_interval,
-                                    vip_channel_enabled=self.vip_channel_enabled)
+                                    vip_channel_enabled=self.vip_channel_enabled,
+                                    decode_read_body=self.decode_read_body,
+                                    mq_client_api_timeout=self.mq_client_api_timeout,
+                                    enable_concurrent_heartbeat=self.enable_concurrent_heartbeat,
+                                    concurrent_heartbeat_thread_pool_size=self.concurrent_heartbeat_thread_pool_size)
         self._mq_client, created = MQClientManager.get_instance() \
             .get_or_create_mq_client_instance(self.client_id, _create_instance)
+        self._mq_client.decode_read_body = self.decode_read_body
+        self._mq_client.mq_client_api_timeout = self.mq_client_api_timeout
+        self._mq_client.enable_concurrent_heartbeat = self.enable_concurrent_heartbeat
+        self._mq_client.concurrent_heartbeat_thread_pool_size = \
+            self.concurrent_heartbeat_thread_pool_size
         if created and self.rpc_hook is not None:
             self._mq_client.remoting_client.register_rpc_hook(self.rpc_hook)
         manager = MQClientManager.get_instance()
@@ -4353,6 +4453,12 @@ class DefaultLitePullConsumer:
         # offset / lock RPCs to the broker's VIP port (listen port - 2).
         self.use_heartbeat_v2 = False
         self.vip_channel_enabled = False
+        # Received message bodies are materialised by default; switching this off decodes only
+        # the headers and leaves every body unset.
+        self.decode_read_body = True
+        self.enable_concurrent_heartbeat = False
+        self.concurrent_heartbeat_thread_pool_size = os.cpu_count() or 1
+        self.mq_client_api_timeout = 3000
 
         # Runtime state
         self._mq_client: Optional[MQClientInstance] = None
@@ -4450,6 +4556,34 @@ class DefaultLitePullConsumer:
         """Opt into the fingerprint-gated heartbeat V2 path; off by default here, so a client
         that never asks for it keeps the broker on its V1 registration path."""
         self.use_heartbeat_v2 = bool(enable)
+
+    def set_decode_read_body(self, enable: bool) -> None:
+        """Control whether received message bodies are materialised; on by default.
+
+        The shared client instance is updated too, because decoding happens there.
+        """
+        self.decode_read_body = bool(enable)
+        if self._mq_client is not None:
+            self._mq_client.decode_read_body = bool(enable)
+
+    def set_enable_concurrent_heartbeat(self, enable: bool) -> None:
+        """Send one heartbeat per broker in parallel once the client instance starts."""
+        self.enable_concurrent_heartbeat = bool(enable)
+        if self._mq_client is not None:
+            self._mq_client.enable_concurrent_heartbeat = bool(enable)
+
+    def set_concurrent_heartbeat_thread_pool_size(self, size: int) -> None:
+        """Worker count of the concurrent-heartbeat pool; applied when the instance starts."""
+        self.concurrent_heartbeat_thread_pool_size = max(1, int(size))
+        if self._mq_client is not None:
+            self._mq_client.concurrent_heartbeat_thread_pool_size = max(1, int(size))
+
+    def set_mq_client_api_timeout(self, timeout_millis: int) -> None:
+        """Timeout of the client's internal API calls (heartbeat, route fetch, unregister,
+        consumer-list lookup); per-call explicit timeouts still win."""
+        self.mq_client_api_timeout = int(timeout_millis)
+        if self._mq_client is not None:
+            self._mq_client.mq_client_api_timeout = int(timeout_millis)
 
     def set_socks_proxy_config(self, socks_proxy_config: Optional[SocksProxyConfig]) -> None:
         pass
@@ -4586,7 +4720,11 @@ class DefaultLitePullConsumer:
                                 unit_name=self.unit_name,
                                 namespace_v2=self.namespace_v2,
                                 poll_name_server_interval=self.poll_name_server_interval,
-                                vip_channel_enabled=self.vip_channel_enabled)
+                                vip_channel_enabled=self.vip_channel_enabled,
+                                decode_read_body=self.decode_read_body,
+                                mq_client_api_timeout=self.mq_client_api_timeout,
+                                enable_concurrent_heartbeat=self.enable_concurrent_heartbeat,
+                                concurrent_heartbeat_thread_pool_size=self.concurrent_heartbeat_thread_pool_size)
 
     def start(self) -> None:
         if self._started:
@@ -4617,6 +4755,11 @@ class DefaultLitePullConsumer:
                                                   self.enable_stream_request_type)
         self._mq_client, created = MQClientManager.get_instance() \
             .get_or_create_mq_client_instance(self.client_id, self._create_client)
+        self._mq_client.decode_read_body = self.decode_read_body
+        self._mq_client.mq_client_api_timeout = self.mq_client_api_timeout
+        self._mq_client.enable_concurrent_heartbeat = self.enable_concurrent_heartbeat
+        self._mq_client.concurrent_heartbeat_thread_pool_size = \
+            self.concurrent_heartbeat_thread_pool_size
         if created and self.rpc_hook is not None:
             self._mq_client.remoting_client.register_rpc_hook(self.rpc_hook)
         manager = MQClientManager.get_instance()
@@ -4720,6 +4863,9 @@ class DefaultLitePullConsumer:
         if self._mq_client is None:
             return 0
         hb = self._build_heartbeat()
+        if not self.use_heartbeat_v2 and self.enable_concurrent_heartbeat:
+            return self._mq_client.send_heartbeat_concurrently(
+                hb, self.mq_client_api_timeout)
         ok = 0
         # Sent to every broker (master + slave): same rationale as the push consumer's `DefaultMQPushConsumer._send_heartbeat_to_all_broker`
         # -- a slave is skipped only when the heartbeat carries no consumer data; pull mode carries a subscription set, so slaves must be registered too.
@@ -4729,9 +4875,9 @@ class DefaultLitePullConsumer:
                 # consumers (see client/heartbeat_v2.py), keyed by this consumer group.
                 if self.use_heartbeat_v2:
                     self._mq_client.send_heartbeat_to_broker_v2(
-                        addr, hb, self.consumer_group, 5000)
+                        addr, hb, self.consumer_group, self.mq_client_api_timeout)
                 else:
-                    self._mq_client.send_heartbeat(addr, hb, 5000)
+                    self._mq_client.send_heartbeat(addr, hb, self.mq_client_api_timeout)
                 ok += 1
             except Exception as e:  # noqa: BLE001
                 logger.debug("lite heartbeat to %s failed: %s", addr, e)

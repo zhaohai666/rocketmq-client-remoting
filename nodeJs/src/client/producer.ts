@@ -30,7 +30,7 @@ import {
   MQClientException, MQBrokerException,
 } from '../remoting/exception.ts';
 import { SendResult, TransactionSendResult, SendStatus } from './send_result.ts';
-import { MQClient, TopicPublishInfo } from './mq_client.ts';
+import { MQClient, TopicPublishInfo, DEFAULT_CONCURRENT_HEARTBEAT_THREAD_POOL_SIZE } from './mq_client.ts';
 import { MQClientManager } from './mq_client_manager.ts';
 import {
   CommunicationMode, SendMessageContext, CheckForbiddenContext, SendMessageHook,
@@ -177,6 +177,16 @@ export class DefaultMQProducer {
   enableTraceContext: boolean;
   // Heartbeat V2: off by default, so heartbeats keep the V1 shape unless enabled.
   useHeartbeatV2: boolean;
+  // Materialise received message bodies during batch decode (default true).
+  decodeReadBody: boolean;
+  // Internal-API timeout (heartbeat, route fetch, check client, unregister and
+  // consumer-list RPCs), in milliseconds. Default 3000.
+  mqClientApiTimeout: number;
+  // Concurrent heartbeat round (ignored while heartbeat V2 is on).
+  enableConcurrentHeartbeat: boolean;
+  concurrentHeartbeatThreadPoolSize: number;
+  // Page size of the paged metadata admin calls (maxTopicNum / maxGroupNum).
+  maxPageSizeInGetMetadata: number;
 
   client: MQClient | null;
   mqFaultStrategy: MQFaultStrategy;
@@ -234,6 +244,11 @@ export class DefaultMQProducer {
     this.startDetectorEnable = false;
     this.enableTraceContext = traceContextEnabledFromEnv();
     this.useHeartbeatV2 = false;
+    this.decodeReadBody = true;
+    this.mqClientApiTimeout = 3000;
+    this.enableConcurrentHeartbeat = false;
+    this.concurrentHeartbeatThreadPoolSize = DEFAULT_CONCURRENT_HEARTBEAT_THREAD_POOL_SIZE;
+    this.maxPageSizeInGetMetadata = 2000;
 
     this.client = null;
     this.mqFaultStrategy = new MQFaultStrategy(this.sendLatencyFaultEnable);
@@ -302,6 +317,48 @@ export class DefaultMQProducer {
     return this;
   }
   getUseHeartbeatV2(): boolean { return this.useHeartbeatV2; }
+  // Received-body decode switch. Pushed through to the shared instance so the
+  // pull / POP decode paths honour it immediately.
+  setDecodeReadBody(enable: boolean): this {
+    this.decodeReadBody = enable === true;
+    if (this.client) this.client.setDecodeReadBody(this.decodeReadBody);
+    return this;
+  }
+  getDecodeReadBody(): boolean { return this.decodeReadBody; }
+  // Internal-API timeout, in milliseconds. An explicit per-call timeout passed
+  // by a caller still wins.
+  setMqClientApiTimeout(ms: number): this {
+    if (!Number.isFinite(ms) || ms <= 0) throw new Error(`mqClientApiTimeout must be > 0, got ${ms}`);
+    this.mqClientApiTimeout = Math.floor(ms);
+    if (this.client) this.client.setMqClientApiTimeout(this.mqClientApiTimeout);
+    return this;
+  }
+  getMqClientApiTimeout(): number { return this.mqClientApiTimeout; }
+  // Concurrent heartbeat round; heartbeat V2 still wins when it is enabled.
+  setEnableConcurrentHeartbeat(enable: boolean): this {
+    this.enableConcurrentHeartbeat = enable === true;
+    if (this.client) this.client.setEnableConcurrentHeartbeat(this.enableConcurrentHeartbeat);
+    return this;
+  }
+  getEnableConcurrentHeartbeat(): boolean { return this.enableConcurrentHeartbeat; }
+  setConcurrentHeartbeatThreadPoolSize(size: number): this {
+    if (!Number.isInteger(size) || size <= 0) {
+      throw new Error(`concurrentHeartbeatThreadPoolSize must be a positive integer, got ${size}`);
+    }
+    this.concurrentHeartbeatThreadPoolSize = size;
+    if (this.client) this.client.setConcurrentHeartbeatThreadPoolSize(size);
+    return this;
+  }
+  getConcurrentHeartbeatThreadPoolSize(): number { return this.concurrentHeartbeatThreadPoolSize; }
+  setMaxPageSizeInGetMetadata(size: number): this {
+    if (!Number.isInteger(size) || size <= 0) {
+      throw new Error(`maxPageSizeInGetMetadata must be a positive integer, got ${size}`);
+    }
+    this.maxPageSizeInGetMetadata = size;
+    if (this.client) this.client.setMaxPageSizeInGetMetadata(size);
+    return this;
+  }
+  getMaxPageSizeInGetMetadata(): number { return this.maxPageSizeInGetMetadata; }
   setTraceTopic(topic: string): this { this.traceTopic = topic; return this; }
   // compressType: 'ZLIB' | 'LZ4' | 'ZSTD'
   // or the raw MessageSysFlag type value (1/2/3).
@@ -449,6 +506,11 @@ export class DefaultMQProducer {
     client.setVipChannelEnabled(this.sendMessageWithVIPChannel);
     if (created) {
       if (this.useHeartbeatV2) client.setUseHeartbeatV2(true);
+      client.setDecodeReadBody(this.decodeReadBody);
+      client.setMqClientApiTimeout(this.mqClientApiTimeout);
+      client.setEnableConcurrentHeartbeat(this.enableConcurrentHeartbeat);
+      client.setConcurrentHeartbeatThreadPoolSize(this.concurrentHeartbeatThreadPoolSize);
+      client.setMaxPageSizeInGetMetadata(this.maxPageSizeInGetMetadata);
       // Pass this facade's configured beat period into the shared instance ONCE
       // at registration: the instance-level heartbeat timer and the consumer
       // facades' own beats read it from there.

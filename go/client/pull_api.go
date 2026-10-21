@@ -182,7 +182,7 @@ func (p *pullAPI) pullKernelWithCode(code int32, group string, mq common.Message
 
 	addr, slave, found := p.instance.FindBrokerAddressInSubscribe(mq.BrokerName, p.recalculatePullFromWhichNode(mq), false)
 	if !found {
-		if _, err := p.instance.UpdateTopicRouteInfoFromNameServer(mq.Topic, 5000, false); err != nil {
+		if _, err := p.instance.UpdateTopicRouteInfoFromNameServer(mq.Topic, 0, false); err != nil {
 			return nil, err
 		}
 		addr, slave, found = p.instance.FindBrokerAddressInSubscribe(mq.BrokerName, p.recalculatePullFromWhichNode(mq), false)
@@ -237,7 +237,9 @@ func (p *pullAPI) pullKernelWithCode(code int32, group string, mq common.Message
 
 	var found2 []*common.MessageExt
 	if len(response.Body) > 0 {
-		found2 = common.DecodeMessages(response.Body)
+		opts := common.DefaultDecodeOptions()
+		opts.ReadBody = p.instance.DecodeReadBody()
+		found2 = common.DecodeMessagesWith(response.Body, opts)
 		for _, msg := range found2 {
 			msg.BrokerName = mq.BrokerName
 			msg.QueueID = mq.QueueID

@@ -135,58 +135,62 @@ func (a *DefaultMQAdminExt) MessageTrackDetail(msg *common.MessageExt) ([]*Messa
 		return result, err
 	}
 	for _, group := range sortedStringSet(groups) {
-		mt := &MessageTrack{ConsumerGroup: group, TrackType: TrackUnknown}
-		cc, err := a.ExamineConsumerConnectionInfo(group, "")
-		if err != nil {
-			if code, ok := responseCodeOf(err); ok && code == remoting.RespConsumerNotOnline {
-				mt.TrackType = TrackNotOnline
-			}
-			mt.ExceptionDesc = fmt.Sprintf("CODE:%s DESC:%s", describeCode(err), err.Error())
-			mt.HasException = true
-			result = append(result, mt)
-			continue
-		}
-		switch cc.ConsumeType {
-		case "CONSUME_ACTIVELY":
-			mt.TrackType = TrackPull
-		case "CONSUME_PASSIVELY":
-			ifConsumed, err := a.Consumed(msg, group)
-			if err != nil {
-				if code, ok := responseCodeOf(err); ok {
-					switch code {
-					case remoting.RespConsumerNotOnline:
-						mt.TrackType = TrackNotOnline
-						mt.ExceptionDesc = fmt.Sprintf("CODE:%d DESC:%s", code, err.Error())
-						mt.HasException = true
-					case remoting.RespNoBuyerId:
-						mt.TrackType = TrackConsumeBroadcasting
-					}
-				}
-				if !mt.HasException {
-					mt.ExceptionDesc = err.Error()
-					mt.HasException = true
-				}
-				result = append(result, mt)
-				continue
-			}
-			if ifConsumed {
-				mt.TrackType = TrackConsumed
-				if sub := cc.SubscriptionTable[msg.Topic]; sub != nil {
-					tags := stringSetOf(sub["tagsSet"])
-					msgTag, _ := msg.GetTags()
-					if len(tags) > 0 && !tags["*"] && !tags[msgTag] {
-						mt.TrackType = TrackConsumedButFiltered
-					}
-				}
-			} else {
-				mt.TrackType = TrackNotConsumeYet
-			}
-		default:
-			mt.TrackType = TrackUnknown
-		}
-		result = append(result, mt)
+		result = append(result, a.trackOneGroup(msg, group))
 	}
 	return result, nil
+}
+
+// trackOneGroup renders one consumer group's verdict for one message; the
+// sequential walk and the concurrent fan-out share it.
+func (a *DefaultMQAdminExt) trackOneGroup(msg *common.MessageExt, group string) *MessageTrack {
+	mt := &MessageTrack{ConsumerGroup: group, TrackType: TrackUnknown}
+	cc, err := a.ExamineConsumerConnectionInfo(group, "")
+	if err != nil {
+		if code, ok := responseCodeOf(err); ok && code == remoting.RespConsumerNotOnline {
+			mt.TrackType = TrackNotOnline
+		}
+		mt.ExceptionDesc = fmt.Sprintf("CODE:%s DESC:%s", describeCode(err), err.Error())
+		mt.HasException = true
+		return mt
+	}
+	switch cc.ConsumeType {
+	case "CONSUME_ACTIVELY":
+		mt.TrackType = TrackPull
+	case "CONSUME_PASSIVELY":
+		ifConsumed, err := a.Consumed(msg, group)
+		if err != nil {
+			if code, ok := responseCodeOf(err); ok {
+				switch code {
+				case remoting.RespConsumerNotOnline:
+					mt.TrackType = TrackNotOnline
+					mt.ExceptionDesc = fmt.Sprintf("CODE:%d DESC:%s", code, err.Error())
+					mt.HasException = true
+				case remoting.RespNoBuyerId:
+					mt.TrackType = TrackConsumeBroadcasting
+				}
+			}
+			if !mt.HasException {
+				mt.ExceptionDesc = err.Error()
+				mt.HasException = true
+			}
+			return mt
+		}
+		if ifConsumed {
+			mt.TrackType = TrackConsumed
+			if sub := cc.SubscriptionTable[msg.Topic]; sub != nil {
+				tags := stringSetOf(sub["tagsSet"])
+				msgTag, _ := msg.GetTags()
+				if len(tags) > 0 && !tags["*"] && !tags[msgTag] {
+					mt.TrackType = TrackConsumedButFiltered
+				}
+			}
+		} else {
+			mt.TrackType = TrackNotConsumeYet
+		}
+	default:
+		mt.TrackType = TrackUnknown
+	}
+	return mt
 }
 
 func describeCode(err error) string {

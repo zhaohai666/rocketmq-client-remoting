@@ -30,7 +30,10 @@ use crate::client::consumer::{
     mq_sort_key, sort_mqs, MessageQueueListener, MessageSelector, DEFAULT_INSTANCE_NAME,
 };
 use crate::client::hook::{FilterMessageHook, FilterMessageHookList};
-use crate::client::mq_client::{MQClientInstance, MQClientInstanceConfig};
+use crate::client::mq_client::{
+    default_concurrent_heartbeat_pool_size, MQClientInstance, MQClientInstanceConfig,
+    MQ_CLIENT_API_TIMEOUT_MILLIS,
+};
 use crate::client::result::{PullResult, PullStatus};
 use crate::client::shutdown::{run_finalize_blocking, SHUTDOWN_FINALIZE_BUDGET};
 use crate::client::top_addressing::DefaultTopAddressing;
@@ -63,8 +66,6 @@ const PULL_SUSPEND_TIMEOUT_MILLIS: i64 = 15_000;
 const LITE_PULL_TIMEOUT_MILLIS: i64 = 30_000;
 /// Lite heartbeat loop interval (50 polls of 0.1s).
 const LITE_HEARTBEAT_INTERVAL_MILLIS: u64 = 5_000;
-/// Lite heartbeat RPC timeout.
-const LITE_HEARTBEAT_TIMEOUT_MILLIS: i64 = 5_000;
 /// Minimum lite rebalance interval (subscribe mode).
 const LITE_REBALANCE_INTERVAL_MILLIS: i64 = 1_000;
 /// Single-drain cap for `poll()` (1024 messages).
@@ -74,8 +75,6 @@ const LITE_PULL_RPC_TIMEOUT_MILLIS: i64 = 5_000;
 const LITE_METADATA_FIRST_DELAY_MILLIS: u64 = 10_000;
 
 pub const DEFAULT_HEARTBEAT_BROKER_INTERVAL_MILLIS: u64 = 30_000;
-/// Heartbeat RPC timeout for the classic pull-mode consumer (same 5000ms figure as lite).
-const PULL_HEARTBEAT_TIMEOUT_MILLIS: i64 = 5_000;
 
 /// Take the lock; still used when poisoned, same reason as `consumer::lock`.
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -240,6 +239,14 @@ pub struct PullConsumerConfig {
     /// a non-zero `heartbeatFingerprint`, and once the broker answers `IS_SUPPORT_HEART_BEAT_V2`
     /// and the fingerprint is unchanged the subscription set drops out of the body.
     pub use_heartbeat_v2: bool,
+    /// Decode-read-body switch (default true): off, received message bodies stay unmaterialised.
+    pub decode_read_body: bool,
+    /// Internal-API timeout (default 3000ms) for the client's own control RPCs.
+    pub mq_client_api_timeout_millis: i64,
+    /// Concurrent heartbeat switch (default false). V2 wins when both are on.
+    pub enable_concurrent_heartbeat: bool,
+    /// Concurrent heartbeat pool size (default: available processors).
+    pub concurrent_heartbeat_thread_pool_size: usize,
 }
 
 impl Default for PullConsumerConfig {
@@ -264,6 +271,10 @@ impl Default for PullConsumerConfig {
             heartbeat_enabled: true,
             heartbeat_broker_interval_millis: DEFAULT_HEARTBEAT_BROKER_INTERVAL_MILLIS,
             use_heartbeat_v2: false,
+            decode_read_body: true,
+            mq_client_api_timeout_millis: MQ_CLIENT_API_TIMEOUT_MILLIS,
+            enable_concurrent_heartbeat: false,
+            concurrent_heartbeat_thread_pool_size: default_concurrent_heartbeat_pool_size(),
         }
     }
 }
@@ -464,6 +475,31 @@ impl DefaultMQPullConsumer {
         self.update_config(|c| c.poll_name_server_interval_millis = millis);
     }
 
+    /// Decode-read-body switch (default true). Off, received bodies stay unmaterialised; queue
+    /// offsets and properties are still decoded.
+    pub fn set_decode_read_body(&self, enable: bool) {
+        self.update_config(|c| c.decode_read_body = enable);
+        if let Some(client) = lock(&self.inner.client).clone() {
+            client.set_decode_read_body(enable);
+        }
+    }
+
+    pub fn is_decode_read_body(&self) -> bool {
+        self.config().decode_read_body
+    }
+
+    /// Internal-API timeout for the client's own control RPCs (default 3000ms).
+    pub fn set_mq_client_api_timeout_millis(&self, timeout_millis: i64) {
+        self.update_config(|c| c.mq_client_api_timeout_millis = timeout_millis);
+        if let Some(client) = lock(&self.inner.client).clone() {
+            client.set_mq_client_api_timeout_millis(timeout_millis);
+        }
+    }
+
+    pub fn mq_client_api_timeout_millis(&self) -> i64 {
+        self.config().mq_client_api_timeout_millis
+    }
+
     pub fn set_namespace(&self, namespace: &str) {
         let namespace = namespace.to_string();
         self.update_config(|c| c.namespace = namespace);
@@ -591,6 +627,10 @@ impl DefaultMQPullConsumer {
             enable_stream_request_type: cfg.enable_stream_request_type,
             route_refresh_interval_millis: cfg.poll_name_server_interval_millis,
             use_heartbeat_v2: cfg.use_heartbeat_v2,
+            decode_read_body: cfg.decode_read_body,
+            mq_client_api_timeout_millis: cfg.mq_client_api_timeout_millis,
+            enable_concurrent_heartbeat: cfg.enable_concurrent_heartbeat,
+            concurrent_heartbeat_thread_pool_size: cfg.concurrent_heartbeat_thread_pool_size,
             ..Default::default()
         };
         let client = MQClientInstance::create_mq_client_instance(
@@ -619,6 +659,8 @@ impl DefaultMQPullConsumer {
             }
         }
         client.register_consumer_group(&cfg.consumer_group);
+        client.set_decode_read_body(cfg.decode_read_body);
+        client.set_mq_client_api_timeout_millis(cfg.mq_client_api_timeout_millis);
         *lock(&self.inner.client) = Some(client);
         self.refresh_route_for_heartbeat().await;
         self.inner.running.store(true, Ordering::Release);
@@ -664,7 +706,7 @@ impl DefaultMQPullConsumer {
                                 &client_id,
                                 "",
                                 &group,
-                                crate::client::mq_client::MQ_CLIENT_API_TIMEOUT_MILLIS,
+                                client.mq_client_api_timeout_millis(),
                             )
                             .await;
                         client.unregister_consumer_group(&group);
@@ -785,7 +827,11 @@ impl DefaultMQPullConsumer {
         mq_all.retain(|mq| mq.topic == topic);
         sort_mqs(&mut mq_all);
         let cid_all = client
-            .get_consumer_id_list_by_group(topic, &cfg.consumer_group, 5000)
+            .get_consumer_id_list_by_group(
+                topic,
+                &cfg.consumer_group,
+                client.mq_client_api_timeout_millis(),
+            )
             .await;
 
         let mut allocated: Option<Vec<MessageQueue>> = None;
@@ -1165,12 +1211,10 @@ async fn send_pull_heartbeat(inner: &PullInner) -> usize {
         return 0;
     };
     let hb = build_pull_heartbeat(inner);
+    let timeout_millis = client.mq_client_api_timeout_millis();
     let mut ok = 0;
     for addr in client.get_all_broker_addrs() {
-        match client
-            .send_heartbeat(&addr, &hb, PULL_HEARTBEAT_TIMEOUT_MILLIS)
-            .await
-        {
+        match client.send_heartbeat(&addr, &hb, timeout_millis).await {
             Ok(()) => ok += 1,
             Err(e) => rmq_debug!("pull heartbeat to {addr} failed: {e}"),
         }
@@ -1253,6 +1297,14 @@ pub struct LitePullConsumerConfig {
     /// a non-zero `heartbeatFingerprint`, and once the broker answers `IS_SUPPORT_HEART_BEAT_V2`
     /// and the fingerprint is unchanged the subscription set drops out of the body.
     pub use_heartbeat_v2: bool,
+    /// Decode-read-body switch (default true): off, received message bodies stay unmaterialised.
+    pub decode_read_body: bool,
+    /// Internal-API timeout (default 3000ms) for the client's own control RPCs.
+    pub mq_client_api_timeout_millis: i64,
+    /// Concurrent heartbeat switch (default false). V2 wins when both are on.
+    pub enable_concurrent_heartbeat: bool,
+    /// Concurrent heartbeat pool size (default: available processors).
+    pub concurrent_heartbeat_thread_pool_size: usize,
 }
 
 impl Default for LitePullConsumerConfig {
@@ -1283,6 +1335,10 @@ impl Default for LitePullConsumerConfig {
             pull_thread_nums: 1,
             topic_metadata_check_interval_millis: 30_000,
             use_heartbeat_v2: false,
+            decode_read_body: true,
+            mq_client_api_timeout_millis: MQ_CLIENT_API_TIMEOUT_MILLIS,
+            enable_concurrent_heartbeat: false,
+            concurrent_heartbeat_thread_pool_size: default_concurrent_heartbeat_pool_size(),
         }
     }
 }
@@ -1553,6 +1609,31 @@ impl DefaultLitePullConsumer {
         self.update_config(|c| c.poll_name_server_interval_millis = millis);
     }
 
+    /// Decode-read-body switch (default true). Off, received bodies stay unmaterialised; queue
+    /// offsets and properties are still decoded.
+    pub fn set_decode_read_body(&self, enable: bool) {
+        self.update_config(|c| c.decode_read_body = enable);
+        if let Some(client) = lock(&self.inner.client).clone() {
+            client.set_decode_read_body(enable);
+        }
+    }
+
+    pub fn is_decode_read_body(&self) -> bool {
+        self.config().decode_read_body
+    }
+
+    /// Internal-API timeout for the client's own control RPCs (default 3000ms).
+    pub fn set_mq_client_api_timeout_millis(&self, timeout_millis: i64) {
+        self.update_config(|c| c.mq_client_api_timeout_millis = timeout_millis);
+        if let Some(client) = lock(&self.inner.client).clone() {
+            client.set_mq_client_api_timeout_millis(timeout_millis);
+        }
+    }
+
+    pub fn mq_client_api_timeout_millis(&self) -> i64 {
+        self.config().mq_client_api_timeout_millis
+    }
+
     pub fn set_message_model(&self, model: &str) {
         let model = model.to_string();
         self.update_config(|c| c.message_model = model);
@@ -1814,6 +1895,10 @@ impl DefaultLitePullConsumer {
             enable_stream_request_type: cfg.enable_stream_request_type,
             route_refresh_interval_millis: cfg.poll_name_server_interval_millis,
             use_heartbeat_v2: cfg.use_heartbeat_v2,
+            decode_read_body: cfg.decode_read_body,
+            mq_client_api_timeout_millis: cfg.mq_client_api_timeout_millis,
+            enable_concurrent_heartbeat: cfg.enable_concurrent_heartbeat,
+            concurrent_heartbeat_thread_pool_size: cfg.concurrent_heartbeat_thread_pool_size,
             ..Default::default()
         };
         let client = MQClientInstance::create_mq_client_instance(
@@ -1841,6 +1926,8 @@ impl DefaultLitePullConsumer {
             }
         }
         client.register_consumer_group(&cfg.consumer_group);
+        client.set_decode_read_body(cfg.decode_read_body);
+        client.set_mq_client_api_timeout_millis(cfg.mq_client_api_timeout_millis);
         *lock(&self.inner.client) = Some(client);
 
         // assign mode: complete the initial offsets at start
@@ -2551,7 +2638,11 @@ impl DefaultLitePullConsumer {
             }
             sort_mqs(&mut mq_all);
             let mut cid_all = client
-                .get_consumer_id_list_by_group(&topic, &group, LITE_PULL_RPC_TIMEOUT_MILLIS)
+                .get_consumer_id_list_by_group(
+                    &topic,
+                    &group,
+                    client.mq_client_api_timeout_millis(),
+                )
                 .await
                 .unwrap_or_default();
             if !cid_all.contains(&client_id) {
@@ -2819,12 +2910,10 @@ async fn send_lite_heartbeat(inner: &LiteInner) -> usize {
         return 0;
     };
     let hb = build_lite_heartbeat(inner);
+    let timeout_millis = client.mq_client_api_timeout_millis();
     let mut ok = 0;
     for addr in client.get_all_broker_addrs() {
-        match client
-            .send_heartbeat(&addr, &hb, LITE_HEARTBEAT_TIMEOUT_MILLIS)
-            .await
-        {
+        match client.send_heartbeat(&addr, &hb, timeout_millis).await {
             Ok(()) => ok += 1,
             Err(e) => rmq_debug!("lite heartbeat to {addr} failed: {e}"),
         }

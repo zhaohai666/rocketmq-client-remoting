@@ -161,6 +161,57 @@ def test_async_callback_reports_send_failure_immediately():
         server.stop()
 
 
+def test_mid_send_wind_down_scan_still_claims_the_async_future():
+    """The wind-down scan of a dying connection can land while the send is still
+    completing its bookkeeping: the future must already be claimable by that socket,
+    otherwise the callback silently hangs until the timeout sweeper (timeout + grace)."""
+    server = DropOnReadServer(hold=True)  # stays alive: no real EOF scan may rescue the timing
+    client = RemotingClient()
+    try:
+        req = rc_mod.RemotingCommand.create_request_command(RequestCode.HEART_BEAT)
+        calls = []
+        real_write_on = client._write_on
+
+        def write_and_scan(addr, sock, cmd):
+            real_write_on(addr, sock, cmd)
+            client._fail_fast(addr, sock)  # the wind-down scan, landing mid-send
+
+        client._write_on = write_and_scan
+        client.invoke_async(server.addr, req, lambda resp, err: calls.append((resp, err)),
+                            LONG_TIMEOUT_MILLIS)
+        assert _wait_until(lambda: len(calls) == 1), "callback not fired: %r" % (calls,)
+        resp, err = calls[0]
+        assert resp is None
+        assert isinstance(err, RemotingSendRequestException), (
+            "the callback got %r: a mid-send wind-down scan is a send failure" % (err,))
+        assert req.opaque not in client._response_table
+    finally:
+        client.shutdown()
+        server.stop()
+
+
+def test_sync_mid_send_wind_down_scan_reports_send_failure():
+    server = DropOnReadServer(hold=True)
+    client = RemotingClient()
+    try:
+        req = rc_mod.RemotingCommand.create_request_command(RequestCode.HEART_BEAT)
+        real_write_on = client._write_on
+
+        def write_and_scan(addr, sock, cmd):
+            real_write_on(addr, sock, cmd)
+            client._fail_fast(addr, sock)
+
+        client._write_on = write_and_scan
+        started = time.time()
+        with pytest.raises(RemotingSendRequestException):
+            client.invoke_sync(server.addr, req, 1500)
+        assert time.time() - started < 1.5, (
+            "the sync call waited out its timeout: the mid-send scan did not wake it")
+    finally:
+        client.shutdown()
+        server.stop()
+
+
 def test_fail_fast_callback_fires_exactly_once():
     pass
     server = DropOnReadServer()

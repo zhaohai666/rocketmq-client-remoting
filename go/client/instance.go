@@ -74,6 +74,25 @@ type ClientInstanceConfig struct {
 	// (heartbeat, unregister, pull/POP/ACK, recall and the oneway
 	// END_TRANSACTION).
 	VipChannelEnabled bool
+	// DecodeReadBody gates whether the pull and POP receive paths materialise
+	// message bodies. ON by default: frames are decoded in full, including CRC
+	// and decompression. OFF: every frame is still walked (offsets and
+	// properties survive), but body bytes are neither copied nor decompressed.
+	DecodeReadBody bool
+	// MQClientAPITimeoutMillis is the internal-API budget (default 3000ms)
+	// used by the heartbeats, the client-config check, the route fetches,
+	// unregisterClient and getConsumerIdListByGroup. An explicit positive
+	// per-call timeout still wins.
+	MQClientAPITimeoutMillis int64
+	// EnableConcurrentHeartbeat fans one heartbeat per broker out over a pool.
+	// OFF by default; a V2 heartbeat takes precedence when both are on.
+	EnableConcurrentHeartbeat bool
+	// ConcurrentHeartbeatThreadPoolSize is the pool width used by the
+	// concurrent heartbeat round (default: available processors).
+	ConcurrentHeartbeatThreadPoolSize int
+	// MaxPageSizeInGetMetadata is the page size the admin paging loops send as
+	// maxTopicNum / maxGroupNum (default 2000).
+	MaxPageSizeInGetMetadata int
 }
 
 // NewClientInstanceConfig returns the classic defaults.
@@ -87,8 +106,16 @@ func NewClientInstanceConfig() ClientInstanceConfig {
 		PersistConsumerOffsetIntervalMillis: 5_000,
 		UseHeartbeatV2:                      false,
 		VipChannelEnabled:                   false,
+		DecodeReadBody:                      true,
+		MQClientAPITimeoutMillis:            DefaultMQClientAPITimeoutMillis,
+		EnableConcurrentHeartbeat:           false,
+		ConcurrentHeartbeatThreadPoolSize:   runtime.NumCPU(),
+		MaxPageSizeInGetMetadata:            DefaultMaxPageSizeInGetMetadata,
 	}
 }
+
+// DefaultMaxPageSizeInGetMetadata is the classic metadata page size.
+const DefaultMaxPageSizeInGetMetadata = 2000
 
 // Consumer is the instance's view of one registered consumer (MQConsumerInner).
 // Every method is driven by the instance: heartbeat assembly, offset
@@ -189,6 +216,16 @@ type Instance struct {
 	// next broker-facing request already carries the VIP port.
 	vipChannelEnabled atomic.Bool
 
+	// Live copies of the receive/decode and internal-API knobs. They are read
+	// per call so a facade setter takes effect without a restart.
+	decodeReadBody              atomic.Bool
+	mqClientAPITimeoutMillis    atomic.Int64
+	enableConcurrentHeartbeat   atomic.Bool
+	concurrentHeartbeatPoolSize atomic.Int64
+	maxPageSizeInGetMetadata    atomic.Int64
+	heartbeatPoolMu             sync.Mutex
+	concurrentHeartbeatPool     *boundedPool
+
 	consumerTable      map[string]Consumer
 	producerTable      map[string]struct{}
 	consumerGroupTable map[string]struct{}
@@ -250,6 +287,23 @@ func newInstance(clientID string, nameServerAddrs []string, config ClientInstanc
 		stop:                      make(chan struct{}),
 	}
 	inst.vipChannelEnabled.Store(config.VipChannelEnabled)
+	inst.decodeReadBody.Store(config.DecodeReadBody)
+	if config.MQClientAPITimeoutMillis > 0 {
+		inst.mqClientAPITimeoutMillis.Store(config.MQClientAPITimeoutMillis)
+	} else {
+		inst.mqClientAPITimeoutMillis.Store(DefaultMQClientAPITimeoutMillis)
+	}
+	inst.enableConcurrentHeartbeat.Store(config.EnableConcurrentHeartbeat)
+	if config.ConcurrentHeartbeatThreadPoolSize > 0 {
+		inst.concurrentHeartbeatPoolSize.Store(int64(config.ConcurrentHeartbeatThreadPoolSize))
+	} else {
+		inst.concurrentHeartbeatPoolSize.Store(int64(runtime.NumCPU()))
+	}
+	if config.MaxPageSizeInGetMetadata > 0 {
+		inst.maxPageSizeInGetMetadata.Store(int64(config.MaxPageSizeInGetMetadata))
+	} else {
+		inst.maxPageSizeInGetMetadata.Store(DefaultMaxPageSizeInGetMetadata)
+	}
 	inst.remoting = remoting.NewRemotingClientWithConfig(remoting.ClientConfig{
 		ConnectTimeoutMillis:     config.ConnectTimeoutMillis,
 		InvokeTimeoutMillis:      config.InvokeTimeoutMillis,
@@ -327,6 +381,85 @@ func (i *Instance) brokerVIPAddr(addr string) string {
 		return addr
 	}
 	return common.BrokerVIPChannel(true, addr)
+}
+
+// SetDecodeReadBody is the live decode-read-body switch: when off, the pull
+// and POP receive paths still walk every frame (queue offsets and properties
+// survive) but leave the body nil instead of copying, CRC-checking and
+// decompressing it.
+func (i *Instance) SetDecodeReadBody(enable bool) { i.decodeReadBody.Store(enable) }
+
+// DecodeReadBody reports the current decode-read-body switch.
+func (i *Instance) DecodeReadBody() bool { return i.decodeReadBody.Load() }
+
+// SetMQClientAPITimeoutMillis changes the internal-API budget. Non-positive
+// values restore the classic 3000ms default.
+func (i *Instance) SetMQClientAPITimeoutMillis(timeoutMillis int64) {
+	if timeoutMillis <= 0 {
+		timeoutMillis = DefaultMQClientAPITimeoutMillis
+	}
+	i.mqClientAPITimeoutMillis.Store(timeoutMillis)
+}
+
+// MQClientAPITimeoutMillis returns the internal-API budget.
+func (i *Instance) MQClientAPITimeoutMillis() int64 {
+	if v := i.mqClientAPITimeoutMillis.Load(); v > 0 {
+		return v
+	}
+	return DefaultMQClientAPITimeoutMillis
+}
+
+// apiTimeout resolves a per-call timeout: an explicit positive value wins,
+// otherwise the configured internal-API budget applies.
+func (i *Instance) apiTimeout(timeoutMillis int64) int64 {
+	if timeoutMillis > 0 {
+		return timeoutMillis
+	}
+	return i.MQClientAPITimeoutMillis()
+}
+
+// SetEnableConcurrentHeartbeat turns the concurrent heartbeat round on or off.
+func (i *Instance) SetEnableConcurrentHeartbeat(enable bool) {
+	i.enableConcurrentHeartbeat.Store(enable)
+}
+
+// EnableConcurrentHeartbeat reports the concurrent-heartbeat switch.
+func (i *Instance) EnableConcurrentHeartbeat() bool {
+	return i.enableConcurrentHeartbeat.Load()
+}
+
+// SetConcurrentHeartbeatThreadPoolSize sets the width used by the pool created
+// at Start. Non-positive values restore the available-processor default.
+func (i *Instance) SetConcurrentHeartbeatThreadPoolSize(size int) {
+	if size <= 0 {
+		size = runtime.NumCPU()
+	}
+	i.concurrentHeartbeatPoolSize.Store(int64(size))
+}
+
+// ConcurrentHeartbeatThreadPoolSize returns the configured pool width.
+func (i *Instance) ConcurrentHeartbeatThreadPoolSize() int {
+	if v := i.concurrentHeartbeatPoolSize.Load(); v > 0 {
+		return int(v)
+	}
+	return runtime.NumCPU()
+}
+
+// SetMaxPageSizeInGetMetadata sets the admin paging page size. Non-positive
+// values restore the 2000 default.
+func (i *Instance) SetMaxPageSizeInGetMetadata(size int) {
+	if size <= 0 {
+		size = DefaultMaxPageSizeInGetMetadata
+	}
+	i.maxPageSizeInGetMetadata.Store(int64(size))
+}
+
+// MaxPageSizeInGetMetadata returns the admin paging page size.
+func (i *Instance) MaxPageSizeInGetMetadata() int {
+	if v := i.maxPageSizeInGetMetadata.Load(); v > 0 {
+		return int(v)
+	}
+	return DefaultMaxPageSizeInGetMetadata
 }
 
 // NameServerAddrs snapshots the configured nameserver list.
@@ -748,6 +881,10 @@ func (i *Instance) Start() error {
 		return nil
 	}
 	i.remoting.Start()
+	// The concurrent-heartbeat pool belongs to the instance lifetime: created
+	// here (an instance driven directly without Start creates it lazily) and
+	// shut down by shutdownFactory.
+	i.ensureConcurrentHeartbeatPool()
 	if len(i.NameServerAddrs()) == 0 && i.config.NamesrvWsAddr != "" {
 		if err := i.FetchNameServerAddr(); err != nil {
 			i.shutdownFactory()
@@ -771,7 +908,7 @@ func (i *Instance) Start() error {
 	// Route refresh: first jump 10ms after start, then the poll interval.
 	i.spawnPeriodic(func() {
 		for _, topic := range i.topicsInUseSnapshot() {
-			if _, err := i.UpdateTopicRouteInfoFromNameServer(topic, 5000, false); err != nil {
+			if _, err := i.UpdateTopicRouteInfoFromNameServer(topic, 0, false); err != nil {
 				common.LogDebugf("route refresh failed for %s: %v", topic, err)
 			}
 		}
@@ -779,7 +916,7 @@ func (i *Instance) Start() error {
 	// cleanOfflineBroker is bundled INTO the heartbeat task.
 	i.spawnPeriodic(func() {
 		i.cleanOfflineBroker()
-		i.SendHeartbeatToAllBrokerWithLockV2(false, 5000)
+		i.SendHeartbeatToAllBrokerWithLockV2(false, 0)
 	}, 1_000, i.config.HeartbeatIntervalMillis)
 	i.spawnPeriodic(func() {
 		i.PersistConsumerOffsets()
@@ -819,6 +956,7 @@ func (i *Instance) DetachFromRegistryIfLastTenant() {
 func (i *Instance) shutdownFactory() {
 	i.started.Store(false)
 	i.stopOnce.Do(func() { close(i.stop) })
+	i.shutdownConcurrentHeartbeatPool()
 	i.remoting.Shutdown()
 	removeFromRegistry(i.clientID, i)
 }
@@ -951,6 +1089,9 @@ func (i *Instance) UpdateTopicRouteInfoFromNameServer(topic string, timeoutMilli
 	if len(addrs) == 0 {
 		return false, common.ClientErrorCode(common.NoNameServerException, "name server address list is empty")
 	}
+	// A zero/negative per-call budget means "use the configured internal-API
+	// timeout"; an explicit positive value always wins.
+	timeoutMillis = i.apiTimeout(timeoutMillis)
 	route, err := i.fetchTopicRouteFromNamesrv(topic, timeoutMillis, addrs)
 	if err != nil {
 		return false, err
@@ -1049,7 +1190,7 @@ func (i *Instance) GetTopicPublishInfo(topic string, isDefault bool) (*TopicPubl
 	if info := i.PublishInfoOf(topic); info != nil && info.OK() {
 		return info, nil
 	}
-	if _, err := i.UpdateTopicRouteInfoFromNameServer(topic, 5000, isDefault); err != nil {
+	if _, err := i.UpdateTopicRouteInfoFromNameServer(topic, 0, isDefault); err != nil {
 		return nil, err
 	}
 	if info := i.PublishInfoOf(topic); info != nil && info.OK() {
@@ -1064,7 +1205,7 @@ func (i *Instance) GetTopicRouteData(topic string) *TopicRouteData {
 	if route := i.RouteOf(topic); route != nil {
 		return route
 	}
-	if _, err := i.UpdateTopicRouteInfoFromNameServer(topic, 5000, false); err != nil {
+	if _, err := i.UpdateTopicRouteInfoFromNameServer(topic, 0, false); err != nil {
 		common.LogDebugf("get_topic_route_data refresh failed for %s: %v", topic, err)
 	}
 	return i.RouteOf(topic)
@@ -1225,7 +1366,7 @@ func (i *Instance) FindBrokerAddressInPublish(brokerName string) (string, bool) 
 func (i *Instance) PublishAddrFor(brokerName, topic string) (string, error) {
 	addr, ok := i.FindBrokerAddressInPublish(brokerName)
 	if !ok {
-		if _, err := i.UpdateTopicRouteInfoFromNameServer(topic, 5000, false); err != nil {
+		if _, err := i.UpdateTopicRouteInfoFromNameServer(topic, 0, false); err != nil {
 			return "", err
 		}
 		addr, ok = i.FindBrokerAddressInPublish(brokerName)
@@ -1297,7 +1438,7 @@ func (i *Instance) cachedRoutes() []*TopicRouteData {
 func (i *Instance) ConsumerOffsetAddr(mq common.MessageQueue) (string, error) {
 	addr, ok := i.FindBrokerAddressInPublish(mq.BrokerName)
 	if !ok {
-		if _, err := i.UpdateTopicRouteInfoFromNameServer(mq.Topic, 5000, false); err != nil {
+		if _, err := i.UpdateTopicRouteInfoFromNameServer(mq.Topic, 0, false); err != nil {
 			return "", err
 		}
 		addr, ok = i.BrokerAddrOf(mq.BrokerName)
@@ -1345,7 +1486,7 @@ func (i *Instance) cleanOfflineBroker() {
 // ---------------- heartbeat ----------------
 
 // PrepareHeartbeatData assembles the heartbeat across all registered
-// consumers (clientId is the instance's).
+// consumers and producers (clientId is the instance's).
 func (i *Instance) PrepareHeartbeatData() *remoting.HeartbeatData {
 	hb := remoting.NewHeartbeatData(i.clientID)
 	for _, c := range i.consumersSnapshot() {
@@ -1356,7 +1497,23 @@ func (i *Instance) PrepareHeartbeatData() *remoting.HeartbeatData {
 		}
 		hb.AddConsumerData(cd)
 	}
+	for _, group := range i.producerGroupsSnapshot() {
+		hb.AddProducerData(remoting.NewProducerData(group))
+	}
 	return hb
+}
+
+// producerGroupsSnapshot lists the registered producer groups in sorted order
+// so the assembled heartbeat is deterministic.
+func (i *Instance) producerGroupsSnapshot() []string {
+	i.tablesMu.Lock()
+	defer i.tablesMu.Unlock()
+	groups := make([]string, 0, len(i.producerTable))
+	for g := range i.producerTable {
+		groups = append(groups, g)
+	}
+	sort.Strings(groups)
+	return groups
 }
 
 // SendHeartbeat sends one heartbeat body to one broker.
@@ -1368,7 +1525,7 @@ func (i *Instance) PrepareHeartbeatData() *remoting.HeartbeatData {
 func (i *Instance) SendHeartbeat(addr string, hb *remoting.HeartbeatData, timeoutMillis int64) error {
 	request := remoting.CreateRequestCommand(remoting.ReqHeartBeat, nil)
 	request.SetBody(hb.Encode())
-	response, err := i.invokeSync(addr, request, timeoutMillis)
+	response, err := i.invokeSync(addr, request, i.apiTimeout(timeoutMillis))
 	if err != nil {
 		return err
 	}
@@ -1401,6 +1558,101 @@ func (i *Instance) SendHeartbeatToAllBroker(timeoutMillis int64) int {
 	return ok
 }
 
+// GetAllMasterBrokerAddrs collects the id-0 (master) address of every broker
+// group, deduplicated and sorted. A heartbeat body with no consumer data only
+// needs to reach masters: slaves hold no producer state that a producer-only
+// beat would refresh.
+func (i *Instance) GetAllMasterBrokerAddrs() []string {
+	var addrs []string
+	for _, route := range i.cachedRoutes() {
+		for _, bd := range route.BrokerDatas {
+			for _, pair := range bd.BrokerAddrs {
+				if pair.ID == 0 && pair.Addr != "" && !containsString(addrs, pair.Addr) {
+					addrs = append(addrs, pair.Addr)
+				}
+			}
+		}
+	}
+	sort.Strings(addrs)
+	return addrs
+}
+
+// SendHeartbeatToAllBrokerConcurrently fans the beat out over the instance's
+// heartbeat pool and waits for every submitted task. An empty body sends
+// nothing; a body without consumer data reaches masters only; a submission the
+// pool rejects still counts down the wait so a saturated queue cannot hang the
+// round. Returns the number of addresses that answered SUCCESS.
+func (i *Instance) SendHeartbeatToAllBrokerConcurrently(timeoutMillis int64) int {
+	if len(i.consumerTableSnapshot()) == 0 && len(i.producerGroupsSnapshot()) == 0 {
+		return 0
+	}
+	hb := i.PrepareHeartbeatData()
+	if len(hb.ProducerDataSet) == 0 && len(hb.ConsumerDataSet) == 0 {
+		return 0
+	}
+	addrs := i.GetAllBrokerAddrs()
+	if len(hb.ConsumerDataSet) == 0 {
+		addrs = i.GetAllMasterBrokerAddrs()
+	}
+	if len(addrs) == 0 {
+		return 0
+	}
+	i.ensureConcurrentHeartbeatPool()
+	pool := i.currentHeartbeatPool()
+	if pool == nil {
+		// The instance is shutting down: the pool no longer accepts work.
+		return 0
+	}
+	var wg sync.WaitGroup
+	var ok atomic.Int64
+	for _, addr := range addrs {
+		wg.Add(1)
+		addr := addr
+		task := func() {
+			defer wg.Done()
+			if err := i.SendHeartbeat(addr, hb, timeoutMillis); err != nil {
+				common.LogDebugf("heartbeat to %s failed: %v", addr, err)
+				return
+			}
+			ok.Add(1)
+		}
+		if err := pool.Submit(task); err != nil {
+			common.LogDebugf("heartbeat task for %s rejected: %v", addr, err)
+			wg.Done()
+		}
+	}
+	wg.Wait()
+	return int(ok.Load())
+}
+
+// ensureConcurrentHeartbeatPool creates the instance-lifetime heartbeat pool
+// on first use. Start() calls it eagerly; an instance driven without Start
+// creates it lazily on the first concurrent round.
+func (i *Instance) ensureConcurrentHeartbeatPool() {
+	i.heartbeatPoolMu.Lock()
+	defer i.heartbeatPoolMu.Unlock()
+	if i.concurrentHeartbeatPool == nil {
+		i.concurrentHeartbeatPool = newBoundedPool("ConcurrentHeartbeatThreadPool",
+			i.ConcurrentHeartbeatThreadPoolSize(), 10_000)
+	}
+}
+
+func (i *Instance) currentHeartbeatPool() *boundedPool {
+	i.heartbeatPoolMu.Lock()
+	defer i.heartbeatPoolMu.Unlock()
+	return i.concurrentHeartbeatPool
+}
+
+func (i *Instance) shutdownConcurrentHeartbeatPool() {
+	i.heartbeatPoolMu.Lock()
+	pool := i.concurrentHeartbeatPool
+	i.concurrentHeartbeatPool = nil
+	i.heartbeatPoolMu.Unlock()
+	if pool != nil {
+		pool.Shutdown()
+	}
+}
+
 // PrepareHeartbeatDataWithoutSubscriptions is the V2 sibling body: same
 // consumers, `withoutSub` set and no subscription sets, which is what a V2
 // broker uses to skip re-registering subscriptions it already has.
@@ -1417,7 +1669,7 @@ func (i *Instance) SendHeartbeatV2(addr string, hb *remoting.HeartbeatData,
 
 	request := remoting.CreateRequestCommand(remoting.ReqHeartBeat, nil)
 	request.SetBody(hb.Encode())
-	response, err := i.invokeSync(addr, request, timeoutMillis)
+	response, err := i.invokeSync(addr, request, i.apiTimeout(timeoutMillis))
 	if err != nil {
 		return remoting.HeartbeatV2Result{}, err
 	}
@@ -1509,6 +1761,9 @@ func (i *Instance) SendHeartbeatToAllBrokerWithLockV2(isRebalance bool, timeoutM
 	defer i.heartbeatMu.Unlock()
 	if i.config.UseHeartbeatV2 {
 		return i.SendHeartbeatToAllBrokerV2(isRebalance, timeoutMillis)
+	}
+	if i.EnableConcurrentHeartbeat() {
+		return i.SendHeartbeatToAllBrokerConcurrently(timeoutMillis)
 	}
 	return i.SendHeartbeatToAllBroker(timeoutMillis)
 }
@@ -1646,7 +1901,7 @@ func (i *Instance) CheckSubscriptionsInBroker(group string, subs []*remoting.Sub
 		if !ok {
 			continue
 		}
-		if err := i.checkClientConfig(addr, group, sub, DefaultMQClientAPITimeoutMillis); err != nil {
+		if err := i.checkClientConfig(addr, group, sub, 0); err != nil {
 			if e, ok := err.(*common.Error); ok && e.Kind == common.KindClient {
 				return err
 			}
@@ -1672,7 +1927,7 @@ func (i *Instance) checkClientConfig(addr, consumerGroup string, sub *remoting.S
 		SubscriptionData: sub,
 	}
 	request.SetBody(body.Encode())
-	response, err := i.invokeSync(i.brokerVIPAddr(addr), request, timeoutMillis)
+	response, err := i.invokeSync(i.brokerVIPAddr(addr), request, i.apiTimeout(timeoutMillis))
 	if err != nil {
 		return err
 	}
@@ -1696,7 +1951,7 @@ func (i *Instance) UnregisterClient(addr string, producerGroup, consumerGroup st
 		header.ConsumerGroup = remoting.StrPtr(consumerGroup)
 	}
 	request := remoting.CreateRequestCommand(remoting.ReqUnregisterClient, header)
-	response, err := i.invokeSync(addr, request, timeoutMillis)
+	response, err := i.invokeSync(addr, request, i.apiTimeout(timeoutMillis))
 	if err != nil {
 		return err
 	}
@@ -1707,7 +1962,7 @@ func (i *Instance) UnregisterClient(addr string, producerGroup, consumerGroup st
 // per-broker registration state otherwise survives until the channel scan.
 func (i *Instance) UnregisterClientAllBrokers(producerGroup, consumerGroup string) {
 	for _, addr := range i.GetAllBrokerAddrs() {
-		if err := i.UnregisterClient(addr, producerGroup, consumerGroup, DefaultMQClientAPITimeoutMillis); err != nil {
+		if err := i.UnregisterClient(addr, producerGroup, consumerGroup, 0); err != nil {
 			common.LogDebugf("unregister_client failed, addr=%s: %v", addr, err)
 		}
 	}

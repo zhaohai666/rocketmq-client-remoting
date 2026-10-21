@@ -29,12 +29,18 @@ class MQClientException(Exception):
 
 
 class MQBrokerException(Exception):
-    """Corresponds to MQBrokerException: the broker returned a non-SUCCESS code."""
+    """Corresponds to MQBrokerException: the broker returned a non-SUCCESS code.
 
-    def __init__(self, response_code: int, error_message: str = ""):
+    ``addr`` is the address the failing request was sent to (None when the caller does
+    not know one).
+    """
+
+    def __init__(self, response_code: int, error_message: str = "",
+                 addr: Optional[str] = None):
         super().__init__(error_message)
         self.response_code = response_code
         self.error_message = error_message
+        self.addr = addr
 
     def __repr__(self):
         return "MQBrokerException(code=%s, msg=%s)" % (self.response_code, self.error_message)

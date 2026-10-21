@@ -35,6 +35,11 @@ public sealed class DefaultMQPullConsumer
     private bool _unitMode;
     private bool _enableStreamRequestType = true;
     private int _pollNameServerIntervalMillis = 30000;
+    private bool _decodeReadBody = true;
+    private int _mqClientApiTimeout = MQClientInstance.MqClientApiTimeoutMillis;
+    private bool _enableConcurrentHeartbeat;
+    private int _concurrentHeartbeatThreadPoolSize = Environment.ProcessorCount;
+    private int _maxPageSizeInGetMetadata = MQClientInstance.DefaultMaxPageSizeInGetMetadata;
     private bool _heartbeatEnabled = true;
     private int _heartbeatBrokerIntervalMillis = 30000;
     private long _heartbeatCount;
@@ -150,6 +155,77 @@ public sealed class DefaultMQPullConsumer
         set => _pollNameServerIntervalMillis = value;
     }
 
+    /// <summary>When false, received pull/POP bodies are not materialised: frames are
+    /// still walked and messages returned header-only. Default true.</summary>
+    public bool DecodeReadBody
+    {
+        get => _decodeReadBody;
+        set
+        {
+            _decodeReadBody = value;
+            if (_mqClient is not null)
+            {
+                _mqClient.DecodeReadBody = value;
+            }
+        }
+    }
+
+    /// <summary>Internal API timeout (default 3000ms); an explicit per-call timeout wins.</summary>
+    public int MqClientApiTimeout
+    {
+        get => _mqClientApiTimeout;
+        set
+        {
+            _mqClientApiTimeout = value > 0 ? value : MQClientInstance.MqClientApiTimeoutMillis;
+            if (_mqClient is not null)
+            {
+                _mqClient.MqClientApiTimeout = _mqClientApiTimeout;
+            }
+        }
+    }
+
+    /// <summary>Fan heartbeat rounds out over a pool (default off; V2 still wins).</summary>
+    public bool EnableConcurrentHeartbeat
+    {
+        get => _enableConcurrentHeartbeat;
+        set
+        {
+            _enableConcurrentHeartbeat = value;
+            if (_mqClient is not null)
+            {
+                _mqClient.EnableConcurrentHeartbeat = value;
+            }
+        }
+    }
+
+    /// <summary>Pool size for concurrent heartbeats (default: available processors).</summary>
+    public int ConcurrentHeartbeatThreadPoolSize
+    {
+        get => _concurrentHeartbeatThreadPoolSize;
+        set
+        {
+            _concurrentHeartbeatThreadPoolSize = value > 0 ? value : Environment.ProcessorCount;
+            if (_mqClient is not null)
+            {
+                _mqClient.ConcurrentHeartbeatThreadPoolSize = _concurrentHeartbeatThreadPoolSize;
+            }
+        }
+    }
+
+    /// <summary>Paged metadata size (maxTopicNum / maxGroupNum). Default 2000.</summary>
+    public int MaxPageSizeInGetMetadata
+    {
+        get => _maxPageSizeInGetMetadata;
+        set
+        {
+            _maxPageSizeInGetMetadata = value > 0 ? value : MQClientInstance.DefaultMaxPageSizeInGetMetadata;
+            if (_mqClient is not null)
+            {
+                _mqClient.MaxPageSizeInGetMetadata = _maxPageSizeInGetMetadata;
+            }
+        }
+    }
+
     private SocksProxyConfig? _socksProxyConfig;
 
     public SocksProxyConfig? SocksProxyConfig
@@ -244,6 +320,11 @@ public sealed class DefaultMQPullConsumer
                 ClientLog.Warn("pull consumer rpc hook ignored: MqClient already has one (clientId="
                     + _clientId + ")");
             }
+            _mqClient.DecodeReadBody = _decodeReadBody;
+            _mqClient.MqClientApiTimeout = _mqClientApiTimeout;
+            _mqClient.EnableConcurrentHeartbeat = _enableConcurrentHeartbeat;
+            _mqClient.ConcurrentHeartbeatThreadPoolSize = _concurrentHeartbeatThreadPoolSize;
+            _mqClient.MaxPageSizeInGetMetadata = _maxPageSizeInGetMetadata;
             try
             {
                 _mqClient.Start();
@@ -416,19 +497,7 @@ public sealed class DefaultMQPullConsumer
         }
 
         HeartbeatData hb = BuildHeartbeat();
-        int ok = 0;
-        foreach (string addr in addrs)
-        {
-            try
-            {
-                _mqClient.SendHeartbeat(addr, hb, 5000);
-                ++ok;
-            }
-            catch (Exception e)
-            {
-                ClientLog.Warn("heartbeat to " + addr + " failed: " + e.Message);
-            }
-        }
+        int ok = _mqClient.SendHeartbeatToAllBrokers(hb, isRebalance: false, includeSlaves: true);
 
         if (ok > 0)
         {

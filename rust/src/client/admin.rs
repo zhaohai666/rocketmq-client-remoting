@@ -1,8 +1,10 @@
 //! Coverage: topic create/delete/query and config, broker cluster info / runtime info / config,
 //! name server KV config, subscription group management, consumer and producer connections,
 //! consume stats, offset management (including real broker-side reset), message query (key / uniqKey / msgId / ConsumeQueue),
-//! and trial consumption of a single message (the initiator side of CONSUME_MESSAGE_DIRECTLY(309)).
+//! and trial consumption of a single message (the initiator side of CONSUME_MESSAGE_DIRECTLY(309)),
+//! and auth user / ACL management (the 3001-3010 admin RPCs).
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Instant;
@@ -22,8 +24,11 @@ use crate::common::topic_config::TopicConfig;
 use crate::common::util_all::current_time_millis;
 use crate::error::{Error, Result};
 use crate::remoting::protocol::admin_body::{
-    ConsumeStats, MessageQueueKey, QueryConsumeQueueResponseBody, TopicConfigSerializeWrapper,
-    TopicStatsTable,
+    BrokerReplicasInfo, CheckRocksdbCqWriteResult, ConsumeStats, MessageQueueKey, OffsetWrapper,
+    QueryConsumeQueueResponseBody, TopicConfigSerializeWrapper, TopicStatsTable,
+};
+use crate::remoting::protocol::auth_body::{
+    acl_from_body, acls_from_body, user_from_body, users_from_body, Acl, AuthUser,
 };
 use crate::remoting::protocol::body::{
     ClusterInfo, ConsumeMessageDirectlyResult, ConsumeStatsList, ConsumerConnection,
@@ -33,7 +38,7 @@ use crate::remoting::protocol::body::{
 use crate::remoting::protocol::codes::{language_code, request_code, response_code};
 use crate::remoting::protocol::ext_fields::{ExtFields, StringMap};
 use crate::remoting::protocol::remoting_command::RemotingCommand;
-use crate::remoting::protocol::route::TopicRouteData;
+use crate::remoting::protocol::route::{QueueData, TopicRouteData};
 use crate::remoting::protocol::serialize::RemotingSerializable;
 use crate::remoting::protocol::subscription::{SubscriptionGroupConfig, SubscriptionGroupWrapper};
 use crate::remoting::rpchook::RPCHook;
@@ -48,8 +53,8 @@ pub const DEFAULT_QUERY_MESSAGE_MAX_NUM: i32 = 32;
 
 /// The name server KV namespace holding ordered topic config.
 pub const NAMESPACE_ORDER_TOPIC_CONFIG: &str = "ORDER_TOPIC_CONFIG";
-/// The paging limit `maxGroupNum` of `get_all_subscription_group`.
-const MAX_GROUP_NUM: i32 = 10_000;
+/// Default page size for the metadata paging calls (`maxTopicNum` / `maxGroupNum`).
+pub const DEFAULT_MAX_PAGE_SIZE_IN_GET_METADATA: i32 = 2000;
 /// The query window upper bound of `query_message_by_uniq_key` (`now + 60 * 60 * 1000`).
 const UNIQ_QUERY_WINDOW_MILLIS: i64 = 60 * 60 * 1000;
 
@@ -66,6 +71,8 @@ pub struct AdminConfig {
     pub poll_name_server_interval_millis: u64,
     pub name_server_addrs: Vec<String>,
     pub timeout_millis: i64,
+    /// Page size sent as `maxTopicNum` / `maxGroupNum` when paging metadata (default 2000).
+    pub max_page_size_in_get_metadata: i32,
     pub kv_namespace_to_delete_list: Vec<String>,
 }
 
@@ -82,6 +89,7 @@ impl Default for AdminConfig {
             client_id: None,
             name_server_addrs: Vec::new(),
             timeout_millis: DEFAULT_TIMEOUT_MILLIS,
+            max_page_size_in_get_metadata: DEFAULT_MAX_PAGE_SIZE_IN_GET_METADATA,
             kv_namespace_to_delete_list: Vec::new(),
         }
     }
@@ -238,6 +246,19 @@ fn filter_user_topic_configs(
     wrapper
 }
 
+/// Merges the paged topic config tables: same name overwrites, first-appearance order kept.
+fn merge_topic_config_table(
+    table: &mut Vec<(String, Value)>,
+    part: Vec<(String, Value)>,
+) {
+    for (name, config) in part {
+        match table.iter_mut().find(|(n, _)| *n == name) {
+            Some(entry) => entry.1 = config,
+            None => table.push((name, config)),
+        }
+    }
+}
+
 /// Merges the paged subscription group tables: same name overwrites, first-appearance order kept.
 fn merge_group_table(
     table: &mut Vec<(String, SubscriptionGroupConfig)>,
@@ -329,6 +350,148 @@ pub struct MessageTrack {
     pub consumer_group: String,
     pub track_type: TrackType,
     pub exception_desc: Option<String>,
+}
+
+// ---------------------------------------------------------------- admin long-tail constants & DTO
+
+/// The container add/remove RPCs use a fixed 20s timeout, independent of the admin config.
+pub const ADMIN_CONTAINER_TIMEOUT_MILLIS: i64 = 20_000;
+
+/// Every controller-side admin RPC is hardcoded to 3s.
+pub const CONTROLLER_RPC_TIMEOUT_MILLIS: i64 = 3_000;
+
+/// The single ext key of `SET_COMMITLOG_READ_MODE(2004)` (the request has no header class).
+pub const READ_AHEAD_MODE_EXT_KEY: &str = "READ_AHEAD_MODE";
+
+/// `%RETRY%<group>_<topic>`: the pop retry topic of a group/topic pair.
+fn build_pop_retry_topic(topic: &str, consumer_group: &str) -> String {
+    format!("{}{}_{}", MixAll::RETRY_GROUP_TOPIC_PREFIX, consumer_group, topic)
+}
+
+/// The config categories of `EXPORT_ROCKSDB_CONFIG_TO_JSON(355)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RocksdbConfigType {
+    Topics,
+    SubscriptionGroups,
+    ConsumerOffsets,
+}
+
+impl RocksdbConfigType {
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            RocksdbConfigType::Topics => "topics",
+            RocksdbConfigType::SubscriptionGroups => "subscriptionGroups",
+            RocksdbConfigType::ConsumerOffsets => "consumerOffsets",
+        }
+    }
+}
+
+/// The response header of the controller metadata query (decoded from the response extFields).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ControllerMetaData {
+    pub group: Option<String>,
+    pub controller_leader_id: Option<String>,
+    pub controller_leader_address: Option<String>,
+    pub is_leader: bool,
+    pub peers: Option<String>,
+}
+
+/// Verdict codes of the admin tool results; the numbers are the protocol enum values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminToolsResultCode {
+    Success,
+    RemotingError,
+    MQBrokerError,
+    MQClientError,
+    InterruptError,
+    TopicRouteInfoNotExist,
+    ConsumerNotOnline,
+    BroadcastConsumption,
+}
+
+impl AdminToolsResultCode {
+    pub fn code(&self) -> i32 {
+        match self {
+            AdminToolsResultCode::Success => 200,
+            AdminToolsResultCode::RemotingError => -1001,
+            AdminToolsResultCode::MQBrokerError => -1002,
+            AdminToolsResultCode::MQClientError => -1003,
+            AdminToolsResultCode::InterruptError => -1004,
+            AdminToolsResultCode::TopicRouteInfoNotExist => -2001,
+            AdminToolsResultCode::ConsumerNotOnline => -2002,
+            AdminToolsResultCode::BroadcastConsumption => -2003,
+        }
+    }
+}
+
+/// Wrapped outcome of the concurrent fan-out admin calls.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdminToolResult<T> {
+    pub success: bool,
+    pub code: i32,
+    pub error_msg: Option<String>,
+    pub data: Option<T>,
+}
+
+impl<T> AdminToolResult<T> {
+    pub fn success(data: T) -> AdminToolResult<T> {
+        AdminToolResult {
+            success: true,
+            code: AdminToolsResultCode::Success.code(),
+            error_msg: Some("success".to_string()),
+            data: Some(data),
+        }
+    }
+
+    pub fn failure(code: AdminToolsResultCode, error_msg: impl Into<String>) -> AdminToolResult<T> {
+        AdminToolResult {
+            success: false,
+            code: code.code(),
+            error_msg: Some(error_msg.into()),
+            data: None,
+        }
+    }
+
+    pub fn failure_with(
+        code: AdminToolsResultCode,
+        error_msg: impl Into<String>,
+        data: T,
+    ) -> AdminToolResult<T> {
+        AdminToolResult {
+            success: false,
+            code: code.code(),
+            error_msg: Some(error_msg.into()),
+            data: Some(data),
+        }
+    }
+}
+
+/// Per-address outcome of a fanned-out broker operator (delete topic / reset offset).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BrokerOperatorResult {
+    pub success_list: Vec<String>,
+    pub failure_list: Vec<String>,
+}
+
+/// Error verdict mapping of the fan-out wrapper: transport failures are remoting errors, a
+/// missing route is its own code, and everything else falls into the broker / client buckets.
+fn admin_tools_code_of(error: &Error) -> AdminToolsResultCode {
+    match error {
+        Error::Connect { .. }
+        | Error::SendRequest { .. }
+        | Error::Timeout { .. }
+        | Error::RemotingCommand(_)
+        | Error::TooMuchRequest(_)
+        | Error::Io(_)
+        | Error::RequestTimeout { .. } => AdminToolsResultCode::RemotingError,
+        Error::Client { response_code, .. } => match response_code {
+            Some(code) if *code == response_code::TOPIC_NOT_EXIST => {
+                AdminToolsResultCode::TopicRouteInfoNotExist
+            }
+            _ => AdminToolsResultCode::MQClientError,
+        },
+        _ => AdminToolsResultCode::MQBrokerError,
+    }
 }
 
 // ---------------------------------------------------------------- facade
@@ -451,6 +614,15 @@ impl DefaultMQAdminExt {
 
     pub fn set_timeout_millis(&self, timeout_millis: i64) {
         self.update_config(|c| c.timeout_millis = timeout_millis);
+    }
+
+    /// Page size used by the topic-config and subscription-group paging calls.
+    pub fn set_max_page_size_in_get_metadata(&self, page_size: i32) {
+        self.update_config(|c| c.max_page_size_in_get_metadata = page_size.max(1));
+    }
+
+    pub fn max_page_size_in_get_metadata(&self) -> i32 {
+        read_cfg(&self.inner.cfg).max_page_size_in_get_metadata
     }
 
     pub fn set_rpc_hook(&self, hook: Option<Arc<dyn RPCHook>>) {
@@ -590,10 +762,10 @@ impl DefaultMQAdminExt {
             .await
     }
 
-    /// The same round trip on the address the name server published. Reading a broker's own
-    /// configuration is the one admin RPC that never moves: it answers on the listening port
+    /// The same round trip on the address the caller passed, with no fast-channel rewrite.
+    /// Reading a broker's own configuration is the archetype: it answers on the listening port
     /// only, so aiming it at the fast channel would talk to a port that is closed whenever the
-    /// channel is off.
+    /// channel is off. Any RPC that must reach exactly the address it was handed uses this.
     async fn invoke_broker_plain(
         &self,
         addr: &str,
@@ -938,19 +1110,80 @@ impl DefaultMQAdminExt {
         broker_addr: &str,
         timeout_millis: Option<i64>,
     ) -> Result<TopicConfigSerializeWrapper> {
-        let response = self
-            .invoke_broker(
-                broker_addr,
-                request_code::GET_ALL_TOPIC_CONFIG,
-                &ExtFields::new(),
-                None,
-                timeout_millis,
-            )
-            .await?;
-        match response.body.as_deref().filter(|b| !b.is_empty()) {
-            Some(body) => TopicConfigSerializeWrapper::decode(body),
-            None => Ok(TopicConfigSerializeWrapper::new()),
+        let client = self.require_client()?;
+        let timeout = effective_timeout(self.timeout_millis(), timeout_millis);
+        let page_size = read_cfg(&self.inner.cfg).max_page_size_in_get_metadata.max(1);
+        let began = Instant::now();
+        let mut current_version: Option<Value> = None;
+        let mut topic_seq: i32 = 0;
+        let mut table: Vec<(String, Value)> = Vec::new();
+        loop {
+            let elapsed = i64::try_from(began.elapsed().as_millis()).unwrap_or(i64::MAX);
+            let left = timeout - elapsed;
+            if left < 0 {
+                bail!("invokeSync call timeout");
+            }
+            let mut ext = ExtFields::new();
+            ext.insert("topicSeq", topic_seq.to_string());
+            ext.insert("maxTopicNum", page_size.to_string());
+            ext.insert(
+                "dataVersion",
+                current_version
+                    .as_ref()
+                    .map(RemotingSerializable::to_json_string)
+                    .unwrap_or_default(),
+            );
+            let mut request = build_request(request_code::GET_ALL_TOPIC_CONFIG, &ext, None);
+            let response = client
+                .invoke_sync(
+                    &MixAll::broker_vip_channel(
+                        read_cfg(&self.inner.cfg).vip_channel_enabled,
+                        broker_addr,
+                    ),
+                    &mut request,
+                    left,
+                )
+                .await?;
+            if response.code != response_code::SUCCESS {
+                return Err(Error::Broker {
+                    response_code: response.code,
+                    message: response.remark.unwrap_or_default(),
+                });
+            }
+            let wrapper = match response.body.as_deref().filter(|b| !b.is_empty()) {
+                Some(body) => TopicConfigSerializeWrapper::decode(body)?,
+                None => TopicConfigSerializeWrapper::new(),
+            };
+            let new_version = wrapper.data_version.clone();
+            let page_len = i32::try_from(wrapper.topic_config_table.len()).unwrap_or(i32::MAX);
+            merge_topic_config_table(&mut table, wrapper.topic_config_table);
+            let Some(total) = response
+                .get_ext_field("totalTopicNum")
+                .and_then(|v| v.trim().parse::<i32>().ok())
+            else {
+                current_version = Some(new_version);
+                break;
+            };
+            if current_version.is_none() {
+                current_version = Some(new_version.clone());
+            } else if current_version.as_ref() != Some(&new_version) {
+                rmq_warn!("topic config dataVersion changed, restart paging");
+                current_version = Some(new_version);
+                topic_seq = 0;
+                table.clear();
+                continue;
+            }
+            // The cursor walks by what the broker actually returned, not by the requested
+            // page size: a short page would otherwise skip past the next page's start.
+            topic_seq += page_len;
+            if topic_seq >= total - 1 {
+                break;
+            }
         }
+        Ok(TopicConfigSerializeWrapper {
+            topic_config_table: table,
+            data_version: current_version.unwrap_or(Value::Null),
+        })
     }
 
     /// Removes system topics and `%RETRY%` / `%DLQ%`.
@@ -1337,6 +1570,7 @@ impl DefaultMQAdminExt {
     ) -> Result<SubscriptionGroupWrapper> {
         let client = self.require_client()?;
         let timeout = effective_timeout(self.timeout_millis(), timeout_millis);
+        let page_size = read_cfg(&self.inner.cfg).max_page_size_in_get_metadata.max(1);
         let began = Instant::now();
         let mut current_version: Option<Value> = None;
         let mut group_seq: i32 = 0;
@@ -1350,10 +1584,14 @@ impl DefaultMQAdminExt {
             }
             let mut ext = ExtFields::new();
             ext.insert("groupSeq", group_seq.to_string());
-            ext.insert("maxGroupNum", MAX_GROUP_NUM.to_string());
-            if let Some(version) = current_version.as_ref() {
-                ext.insert("dataVersion", RemotingSerializable::to_json_string(version));
-            }
+            ext.insert("maxGroupNum", page_size.to_string());
+            ext.insert(
+                "dataVersion",
+                current_version
+                    .as_ref()
+                    .map(RemotingSerializable::to_json_string)
+                    .unwrap_or_default(),
+            );
             let mut request =
                 build_request(request_code::GET_ALL_SUBSCRIPTIONGROUP_CONFIG, &ext, None);
             let response = client
@@ -1376,15 +1614,14 @@ impl DefaultMQAdminExt {
                 Some(body) => SubscriptionGroupWrapper::decode(body)?,
                 None => SubscriptionGroupWrapper::new(),
             };
-            let page_count =
-                i32::try_from(wrapper.subscription_group_table.len()).unwrap_or(i32::MAX);
             let new_version = wrapper.data_version.clone();
+            let page_len = i32::try_from(wrapper.subscription_group_table.len()).unwrap_or(i32::MAX);
             merge_group_table(&mut table, wrapper.subscription_group_table);
             merge_json_map(&mut forbidden, wrapper.forbidden_table);
             if current_version.is_none() {
                 current_version = Some(new_version.clone());
             }
-            group_seq += page_count;
+            group_seq += page_len;
 
             // Old brokers: no totalGroupNum, everything comes back in one page.
             let Some(total) = response
@@ -1714,100 +1951,14 @@ impl DefaultMQAdminExt {
     }
 
     pub async fn message_track_detail(&self, msg: &MessageExt) -> Result<Vec<MessageTrack>> {
-        let mut result: Vec<MessageTrack> = Vec::new();
-        let route = self.examine_topic_route(&msg.topic).await?;
-        let mut broker_addr: Option<String> = None;
-        for bd in &route.broker_datas {
-            if let Some(addr) = bd.select_broker_addr() {
-                broker_addr = Some(addr);
-                break;
-            }
-        }
-        let Some(broker_addr) = broker_addr else {
-            return Ok(result);
-        };
+        let broker_addr = self.first_track_broker_addr(&msg.topic).await?;
         let mut groups = self
             .query_topic_consume_by_who(&broker_addr, &msg.topic)
             .await?;
         groups.sort();
+        let mut result: Vec<MessageTrack> = Vec::new();
         for group in groups {
-            let mut mt = MessageTrack {
-                consumer_group: group.clone(),
-                track_type: TrackType::Unknown,
-                exception_desc: None,
-            };
-            let cc = match self.examine_consumer_connection_info(&group, None).await {
-                Ok(cc) => cc,
-                Err(e) => {
-                    if e.response_code() == Some(response_code::CONSUMER_NOT_ONLINE) {
-                        mt.track_type = TrackType::NotOnline;
-                    }
-                    mt.exception_desc = Some(format!("CODE:{:?} DESC:{e}", e.response_code()));
-                    result.push(mt);
-                    continue;
-                }
-            };
-
-            match cc.consume_type.as_deref() {
-                Some("CONSUME_ACTIVELY") => mt.track_type = TrackType::Pull,
-                Some("CONSUME_PASSIVELY") => {
-                    let if_consumed = match self.consumed(msg, &group).await {
-                        Ok(v) => v,
-                        Err(e) => match e.response_code() {
-                            Some(code)
-                                if code == response_code::CONSUMER_NOT_ONLINE
-                                    || code == response_code::BROADCAST_CONSUMPTION =>
-                            {
-                                if code == response_code::CONSUMER_NOT_ONLINE {
-                                    mt.track_type = TrackType::NotOnline;
-                                    mt.exception_desc = Some(format!("CODE:{code} DESC:{e}"));
-                                } else {
-                                    mt.track_type = TrackType::ConsumeBroadcasting;
-                                }
-                                result.push(mt);
-                                continue;
-                            }
-                            _ => {
-                                mt.exception_desc = Some(format!("{e}"));
-                                result.push(mt);
-                                continue;
-                            }
-                        },
-                    };
-
-                    if if_consumed {
-                        mt.track_type = TrackType::Consumed;
-                        let sub = cc
-                            .subscription_table
-                            .iter()
-                            .find(|(topic, _)| *topic == msg.topic)
-                            .map(|(_, v)| v);
-                        if let Some(sub) = sub {
-                            let tags_set: Vec<String> = sub
-                                .get("tagsSet")
-                                .and_then(Value::as_array)
-                                .map(|a| {
-                                    a.iter()
-                                        .filter_map(Value::as_str)
-                                        .map(str::to_string)
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            let msg_tag = msg.get_tags();
-                            if !tags_set.is_empty()
-                                && !tags_set.iter().any(|t| t == "*")
-                                && !tags_set.iter().any(|t| Some(t.as_str()) == msg_tag)
-                            {
-                                mt.track_type = TrackType::ConsumedButFiltered;
-                            }
-                        }
-                    } else {
-                        mt.track_type = TrackType::NotConsumeYet;
-                    }
-                }
-                _ => {}
-            }
-            result.push(mt);
+            result.push(self.track_one_group(msg, &group).await);
         }
         Ok(result)
     }
@@ -2742,25 +2893,43 @@ impl DefaultMQAdminExt {
             let Some(addr) = bd.select_broker_addr() else {
                 continue;
             };
-            let ext = ext_pairs(&[("topic", topic.to_string()), ("group", group.to_string())]);
-            let response = self
-                .invoke_broker(
-                    &addr,
-                    request_code::QUERY_CONSUME_TIME_SPAN,
-                    &ext,
-                    None,
-                    None,
-                )
-                .await?;
-            if let Some(body) = response.body.as_deref().filter(|b| !b.is_empty()) {
-                let parsed: Value = serde_json::from_slice(body)
-                    .map_err(|e| Error::client(format!("decode QueryConsumeTimeSpanBody: {e}")))?;
-                if let Some(set) = parsed.get("consumeTimeSpanSet").and_then(Value::as_array) {
-                    spans.extend(set.iter().cloned());
-                }
-            }
+            spans.extend(
+                self.query_consume_time_span_by_broker(&addr, topic, group)
+                    .await?,
+            );
         }
         Ok(spans)
+    }
+
+    /// One broker's `QUERY_CONSUME_TIME_SPAN(303)`: the entries of `consumeTimeSpanSet`.
+    pub async fn query_consume_time_span_by_broker(
+        &self,
+        broker_addr: &str,
+        topic: &str,
+        group: &str,
+    ) -> Result<Vec<Value>> {
+        let ext = ext_pairs(&[("topic", topic.to_string()), ("group", group.to_string())]);
+        let response = self
+            .invoke_broker(
+                broker_addr,
+                request_code::QUERY_CONSUME_TIME_SPAN,
+                &ext,
+                None,
+                None,
+            )
+            .await?;
+        match response.body.as_deref().filter(|b| !b.is_empty()) {
+            Some(body) => {
+                let parsed: Value = serde_json::from_slice(body)
+                    .map_err(|e| Error::client(format!("decode QueryConsumeTimeSpanBody: {e}")))?;
+                Ok(parsed
+                    .get("consumeTimeSpanSet")
+                    .and_then(Value::as_array)
+                    .map(|set| set.iter().cloned().collect())
+                    .unwrap_or_default())
+            }
+            None => Ok(Vec::new()),
+        }
     }
 
     // ---------------- NameServer config (318/319) ----------------
@@ -2870,6 +3039,1330 @@ impl DefaultMQAdminExt {
         .await?;
         Ok(())
     }
+
+    // ---------------- Auth user / ACL management (3001-3010) ----------------
+
+    /// `AUTH_CREATE_USER(3001)` with the three-value short form.
+    ///
+    /// Wire fact: no `userStatus` key is sent at all — a key carrying null would ask the broker
+    /// to clear a status the caller never mentioned.
+    pub async fn create_user(
+        &self,
+        broker_addr: &str,
+        username: &str,
+        password: &str,
+        user_type: &str,
+    ) -> Result<()> {
+        let mut user = AuthUser::new(username);
+        user.password = Some(password.to_string());
+        user.user_type = Some(user_type.to_string());
+        self.create_user_with_config(broker_addr, &user).await
+    }
+
+    /// `AUTH_CREATE_USER(3001)`: the header carries the name, the body carries the whole record.
+    pub async fn create_user_with_config(
+        &self,
+        broker_addr: &str,
+        user: &AuthUser,
+    ) -> Result<()> {
+        self.write_user(broker_addr, request_code::AUTH_CREATE_USER, user)
+            .await
+    }
+
+    /// `AUTH_UPDATE_USER(3002)` with the three-value short form; unset keys stay unset.
+    pub async fn update_user(
+        &self,
+        broker_addr: &str,
+        username: &str,
+        password: &str,
+        user_type: &str,
+    ) -> Result<()> {
+        let mut user = AuthUser::new(username);
+        user.password = Some(password.to_string());
+        user.user_type = Some(user_type.to_string());
+        self.update_user_with_config(broker_addr, &user).await
+    }
+
+    /// `AUTH_UPDATE_USER(3002)`: same shape as 3001, and the same omission rule.
+    pub async fn update_user_with_config(
+        &self,
+        broker_addr: &str,
+        user: &AuthUser,
+    ) -> Result<()> {
+        self.write_user(broker_addr, request_code::AUTH_UPDATE_USER, user)
+            .await
+    }
+
+    /// `AUTH_DELETE_USER(3003)`: header-only, and the reply body is never read.
+    pub async fn delete_user(&self, broker_addr: &str, username: &str) -> Result<()> {
+        let ext = ext_pairs(&[("username", username.to_string())]);
+        self.invoke_broker_plain(broker_addr, request_code::AUTH_DELETE_USER, &ext, None, None)
+            .await?;
+        Ok(())
+    }
+
+    /// `AUTH_GET_USER(3004)`: a missing or empty body reads back as `None`.
+    pub async fn get_user(&self, broker_addr: &str, username: &str) -> Result<Option<AuthUser>> {
+        let ext = ext_pairs(&[("username", username.to_string())]);
+        let response = self
+            .invoke_broker_plain(broker_addr, request_code::AUTH_GET_USER, &ext, None, None)
+            .await?;
+        user_from_body(response.body.as_deref())
+    }
+
+    /// `AUTH_LIST_USER(3005)`: `filter=None` sends no filter header at all rather than an empty one.
+    pub async fn list_user(&self, broker_addr: &str, filter: Option<&str>) -> Result<Vec<AuthUser>> {
+        let ext = match filter {
+            Some(v) => ext_pairs(&[("filter", v.to_string())]),
+            None => ExtFields::new(),
+        };
+        let response = self
+            .invoke_broker_plain(broker_addr, request_code::AUTH_LIST_USER, &ext, None, None)
+            .await?;
+        users_from_body(response.body.as_deref())
+    }
+
+    /// `AUTH_CREATE_ACL(3006)` with the per-resource short form: one policy carrying no
+    /// `policyType`, and one entry per resource repeating the shared values.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_acl(
+        &self,
+        broker_addr: &str,
+        subject: &str,
+        resources: &[&str],
+        actions: &[&str],
+        source_ips: &[&str],
+        decision: &str,
+    ) -> Result<()> {
+        let acl = Acl::for_resources(subject, resources, actions, source_ips, decision);
+        self.create_acl_with_config(broker_addr, &acl).await
+    }
+
+    /// `AUTH_CREATE_ACL(3006)`: the header carries the subject, the body carries the policies.
+    pub async fn create_acl_with_config(&self, broker_addr: &str, acl: &Acl) -> Result<()> {
+        self.write_acl(broker_addr, request_code::AUTH_CREATE_ACL, acl)
+            .await
+    }
+
+    /// `AUTH_UPDATE_ACL(3007)` with the per-resource short form.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_acl(
+        &self,
+        broker_addr: &str,
+        subject: &str,
+        resources: &[&str],
+        actions: &[&str],
+        source_ips: &[&str],
+        decision: &str,
+    ) -> Result<()> {
+        let acl = Acl::for_resources(subject, resources, actions, source_ips, decision);
+        self.update_acl_with_config(broker_addr, &acl).await
+    }
+
+    /// `AUTH_UPDATE_ACL(3007)`: same shape as 3006.
+    pub async fn update_acl_with_config(&self, broker_addr: &str, acl: &Acl) -> Result<()> {
+        self.write_acl(broker_addr, request_code::AUTH_UPDATE_ACL, acl)
+            .await
+    }
+
+    /// `AUTH_DELETE_ACL(3008)`: the header is exactly `subject` + `resource`, and there is no body.
+    pub async fn delete_acl(&self, broker_addr: &str, subject: &str, resource: &str) -> Result<()> {
+        let ext = ext_pairs(&[
+            ("subject", subject.to_string()),
+            ("resource", resource.to_string()),
+        ]);
+        self.invoke_broker_plain(broker_addr, request_code::AUTH_DELETE_ACL, &ext, None, None)
+            .await?;
+        Ok(())
+    }
+
+    /// `AUTH_GET_ACL(3009)`: a missing or empty body reads back as `None`.
+    pub async fn get_acl(&self, broker_addr: &str, subject: &str) -> Result<Option<Acl>> {
+        let ext = ext_pairs(&[("subject", subject.to_string())]);
+        let response = self
+            .invoke_broker_plain(broker_addr, request_code::AUTH_GET_ACL, &ext, None, None)
+            .await?;
+        acl_from_body(response.body.as_deref())
+    }
+
+    /// `AUTH_LIST_ACL(3010)`: either filter is sent only when the caller supplies it.
+    pub async fn list_acl(
+        &self,
+        broker_addr: &str,
+        subject_filter: Option<&str>,
+        resource_filter: Option<&str>,
+    ) -> Result<Vec<Acl>> {
+        let mut pairs = Vec::new();
+        if let Some(v) = subject_filter {
+            pairs.push(("subjectFilter", v.to_string()));
+        }
+        if let Some(v) = resource_filter {
+            pairs.push(("resourceFilter", v.to_string()));
+        }
+        let ext = ext_pairs(&pairs);
+        let response = self
+            .invoke_broker_plain(broker_addr, request_code::AUTH_LIST_ACL, &ext, None, None)
+            .await?;
+        acls_from_body(response.body.as_deref())
+    }
+
+    /// 3001 / 3002 are the same round trip under a different code.
+    async fn write_user(&self, broker_addr: &str, code: i32, user: &AuthUser) -> Result<()> {
+        let ext = ext_pairs(&[("username", user.username.clone())]);
+        self.invoke_broker_plain(broker_addr, code, &ext, Some(user.encode()), None)
+            .await?;
+        Ok(())
+    }
+
+    /// 3006 / 3007 are the same round trip under a different code.
+    async fn write_acl(&self, broker_addr: &str, code: i32, acl: &Acl) -> Result<()> {
+        let ext = ext_pairs(&[("subject", acl.subject.clone())]);
+        self.invoke_broker_plain(broker_addr, code, &ext, Some(acl.encode()), None)
+            .await?;
+        Ok(())
+    }
+
+    // ---------------- Broker container ----------------
+
+    /// `ADD_BROKER(902)`: registers a broker config file into a running broker container.
+    /// The container address is used exactly as passed (no fast-channel rewrite), the timeout is
+    /// a fixed 20s, and the only payload is the header `configPath`.
+    pub async fn add_broker_to_container(
+        &self,
+        broker_container_addr: &str,
+        broker_config_path: &str,
+    ) -> Result<()> {
+        let ext = ext_pairs(&[("configPath", broker_config_path.to_string())]);
+        let client = self.require_client()?;
+        let mut request = build_request(request_code::ADD_BROKER, &ext, None);
+        let response = client
+            .invoke_sync(
+                broker_container_addr,
+                &mut request,
+                ADMIN_CONTAINER_TIMEOUT_MILLIS,
+            )
+            .await?;
+        MQClientInstance::check_response(&response)?;
+        Ok(())
+    }
+
+    /// `REMOVE_BROKER(903)`: counterpart of the add; the header names
+    /// brokerName / brokerClusterName / brokerId.
+    pub async fn remove_broker_from_container(
+        &self,
+        broker_container_addr: &str,
+        cluster_name: &str,
+        broker_name: &str,
+        broker_id: i64,
+    ) -> Result<()> {
+        let ext = ext_pairs(&[
+            ("brokerName", broker_name.to_string()),
+            ("brokerClusterName", cluster_name.to_string()),
+            ("brokerId", broker_id.to_string()),
+        ]);
+        let client = self.require_client()?;
+        let mut request = build_request(request_code::REMOVE_BROKER, &ext, None);
+        let response = client
+            .invoke_sync(
+                broker_container_addr,
+                &mut request,
+                ADMIN_CONTAINER_TIMEOUT_MILLIS,
+            )
+            .await?;
+        MQClientInstance::check_response(&response)?;
+        Ok(())
+    }
+
+    // ---------------- Controller administration ----------------
+
+    /// `CONTROLLER_GET_METADATA_INFO(1005)`: the response header names the current leader.
+    pub async fn get_controller_metadata(
+        &self,
+        controller_addr: &str,
+    ) -> Result<ControllerMetaData> {
+        let client = self.require_client()?;
+        let mut request = build_request(request_code::CONTROLLER_GET_METADATA_INFO, &ExtFields::new(), None);
+        let response = client
+            .invoke_sync(controller_addr, &mut request, CONTROLLER_RPC_TIMEOUT_MILLIS)
+            .await?;
+        MQClientInstance::check_response(&response)?;
+        Ok(ControllerMetaData {
+            group: response.get_ext_field("group").map(str::to_string),
+            controller_leader_id: response.get_ext_field("controllerLeaderId").map(str::to_string),
+            controller_leader_address: response
+                .get_ext_field("controllerLeaderAddress")
+                .map(str::to_string),
+            is_leader: response
+                .get_ext_field("isLeader")
+                .map(|v| v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            peers: response.get_ext_field("peers").map(str::to_string),
+        })
+    }
+
+    /// The leader address every controller-side write has to be re-routed to.
+    async fn controller_leader_address(&self, controller_addr: &str) -> Result<String> {
+        let meta = self.get_controller_metadata(controller_addr).await?;
+        meta.controller_leader_address
+            .filter(|a| !a.is_empty())
+            .ok_or_else(|| {
+                Error::client(format!(
+                    "controller {controller_addr} did not report a leader address"
+                ))
+            })
+    }
+
+    /// `CONTROLLER_GET_SYNC_STATE_DATA(1006)`: a two-phase read. The first phase asks the given
+    /// controller for its metadata, the second asks the **leader** for the sync state of the
+    /// named brokers; the request body is a bare JSON array of broker names.
+    pub async fn get_in_sync_state_data(
+        &self,
+        controller_addr: &str,
+        brokers: &[String],
+    ) -> Result<BrokerReplicasInfo> {
+        let leader_addr = self.controller_leader_address(controller_addr).await?;
+        let client = self.require_client()?;
+        let body = serde_json::to_vec(
+            &brokers
+                .iter()
+                .map(|name| Value::String(name.clone()))
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| Error::Encode(format!("encode broker list: {e}")))?;
+        let mut request =
+            build_request(request_code::CONTROLLER_GET_SYNC_STATE_DATA, &ExtFields::new(), Some(body));
+        let response = client
+            .invoke_sync(&leader_addr, &mut request, CONTROLLER_RPC_TIMEOUT_MILLIS)
+            .await?;
+        MQClientInstance::check_response(&response)?;
+        match response.body.as_deref().filter(|b| !b.is_empty()) {
+            Some(body) => BrokerReplicasInfo::decode(body),
+            None => Ok(BrokerReplicasInfo::new()),
+        }
+    }
+
+    /// `GET_CONTROLLER_CONFIG(1010)`: polls every controller, the response body is `k=v` text.
+    /// With no explicit servers the name server list is used; when even that is empty the call
+    /// returns `None` without any IO.
+    pub async fn get_controller_config(
+        &self,
+        controller_servers: &[String],
+    ) -> Result<Option<Vec<(String, StringMap)>>> {
+        // The empty-server early return happens before any client work: neither explicit
+        // servers nor a name server list means no call at all, started or not.
+        let fallback_servers = match self.require_client() {
+            Ok(client) => client.name_server_addrs(),
+            Err(_) => self.config().name_server_addrs,
+        };
+        let servers: &[String] = if controller_servers.is_empty() {
+            &fallback_servers
+        } else {
+            controller_servers
+        };
+        if servers.is_empty() {
+            return Ok(None);
+        }
+        let client = self.require_client()?;
+        let mut config_map: Vec<(String, StringMap)> = Vec::new();
+        for server in servers {
+            let mut request =
+                build_request(request_code::GET_CONTROLLER_CONFIG, &ExtFields::new(), None);
+            let response = client
+                .invoke_sync(server, &mut request, CONTROLLER_RPC_TIMEOUT_MILLIS)
+                .await?;
+            if response.code != response_code::SUCCESS {
+                return Err(Error::client_with_code(
+                    response.code,
+                    response.remark.unwrap_or_default(),
+                ));
+            }
+            let text = match response.body.as_deref() {
+                Some(body) if !body.is_empty() => String::from_utf8_lossy(body).into_owned(),
+                _ => String::new(),
+            };
+            config_map.push((server.clone(), MixAll::string_to_properties(&text)));
+        }
+        Ok(Some(config_map))
+    }
+
+    /// `UPDATE_CONTROLLER_CONFIG(1009)`: broadcasts the properties to every controller as `k=v`
+    /// text. An empty property set or an empty server list is a silent no-op; the **last**
+    /// non-SUCCESS response wins when several controllers fail.
+    pub async fn update_controller_config(
+        &self,
+        properties: &StringMap,
+        controllers: &[String],
+    ) -> Result<()> {
+        let text = MixAll::properties_to_string(properties, false);
+        if text.is_empty() || controllers.is_empty() {
+            return Ok(());
+        }
+        let client = self.require_client()?;
+        let mut last_error: Option<RemotingCommand> = None;
+        for controller in controllers {
+            let mut request = build_request(
+                request_code::UPDATE_CONTROLLER_CONFIG,
+                &ExtFields::new(),
+                Some(text.as_bytes().to_vec()),
+            );
+            let response = client
+                .invoke_sync(controller, &mut request, CONTROLLER_RPC_TIMEOUT_MILLIS)
+                .await?;
+            if response.code != response_code::SUCCESS {
+                last_error = Some(response);
+            }
+        }
+        match last_error {
+            None => Ok(()),
+            Some(response) => Err(Error::client_with_code(
+                response.code,
+                response.remark.unwrap_or_default(),
+            )),
+        }
+    }
+
+    /// `CLEAN_BROKER_DATA(1011)`: routed to the controller **leader** like every controller write;
+    /// the header always carries `invokeTime` and `isCleanLivingBroker`, the nullable fields are
+    /// omitted when absent.
+    pub async fn clean_controller_broker_data(
+        &self,
+        controller_addr: &str,
+        cluster_name: Option<&str>,
+        broker_name: &str,
+        broker_controller_ids_to_clean: Option<&str>,
+        is_clean_living_broker: bool,
+    ) -> Result<()> {
+        let leader_addr = self.controller_leader_address(controller_addr).await?;
+        let mut pairs = vec![("brokerName", broker_name.to_string())];
+        if let Some(cluster) = cluster_name {
+            pairs.push(("clusterName", cluster.to_string()));
+        }
+        if let Some(ids) = broker_controller_ids_to_clean {
+            pairs.push(("brokerControllerIdsToClean", ids.to_string()));
+        }
+        pairs.push(("isCleanLivingBroker", bool_flag(is_clean_living_broker).to_string()));
+        pairs.push(("invokeTime", current_time_millis().to_string()));
+        let ext = ext_pairs(&pairs);
+        let client = self.require_client()?;
+        let mut request = build_request(request_code::CLEAN_BROKER_DATA, &ext, None);
+        let response = client
+            .invoke_sync(&leader_addr, &mut request, CONTROLLER_RPC_TIMEOUT_MILLIS)
+            .await?;
+        MQClientInstance::check_response(&response)?;
+        Ok(())
+    }
+
+    // ---------------- Cold data flow control ----------------
+
+    /// `UPDATE_COLD_DATA_FLOW_CTR_CONFIG(2001)`: the properties go out as `k=v` text on the fast
+    /// channel; an empty property set skips the RPC entirely.
+    pub async fn update_cold_data_flow_ctr_group_config(
+        &self,
+        broker_addr: &str,
+        properties: &StringMap,
+    ) -> Result<()> {
+        let text = MixAll::properties_to_string(properties, false);
+        if text.is_empty() {
+            return Ok(());
+        }
+        self.invoke_broker(
+            broker_addr,
+            request_code::UPDATE_COLD_DATA_FLOW_CTR_CONFIG,
+            &ExtFields::new(),
+            Some(text.into_bytes()),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// `REMOVE_COLD_DATA_FLOW_CTR_CONFIG(2002)`: the body is the plain group string, not JSON;
+    /// an empty group skips the RPC.
+    pub async fn remove_cold_data_flow_ctr_group_config(
+        &self,
+        broker_addr: &str,
+        consumer_group: &str,
+    ) -> Result<()> {
+        if consumer_group.is_empty() {
+            return Ok(());
+        }
+        self.invoke_broker(
+            broker_addr,
+            request_code::REMOVE_COLD_DATA_FLOW_CTR_CONFIG,
+            &ExtFields::new(),
+            Some(consumer_group.as_bytes().to_vec()),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// `GET_COLD_DATA_FLOW_CTR_INFO(2003)`: answered on the listening port only; the raw body
+    /// text is returned as-is (`None` when the broker sends none).
+    pub async fn get_cold_data_flow_ctr_info(
+        &self,
+        broker_addr: &str,
+    ) -> Result<Option<String>> {
+        let response = self
+            .invoke_broker_plain(
+                broker_addr,
+                request_code::GET_COLD_DATA_FLOW_CTR_INFO,
+                &ExtFields::new(),
+                None,
+                None,
+            )
+            .await?;
+        Ok(response
+            .body
+            .as_deref()
+            .filter(|b| !b.is_empty())
+            .map(|b| String::from_utf8_lossy(b).into_owned()))
+    }
+
+    // ---------------- CommitLog read-ahead ----------------
+
+    /// `SET_COMMITLOG_READ_MODE(2004)`: no header class, so the single `READ_AHEAD_MODE` ext key
+    /// is built by hand; no fast-channel rewrite. The response remark (not a body) is the result.
+    pub async fn set_commit_log_read_ahead_mode(
+        &self,
+        broker_addr: &str,
+        mode: &str,
+    ) -> Result<Option<String>> {
+        let mut ext = ExtFields::new();
+        ext.insert(READ_AHEAD_MODE_EXT_KEY, mode);
+        let client = self.require_client()?;
+        let mut request = build_request(request_code::SET_COMMITLOG_READ_MODE, &ext, None);
+        let response = client
+            .invoke_sync(broker_addr, &mut request, self.timeout_millis())
+            .await?;
+        MQClientInstance::check_response(&response)?;
+        Ok(response.remark.filter(|r| !r.is_empty()))
+    }
+
+    // ---------------- Pop rollback / RocksDB ----------------
+
+    /// `POP_ROLLBACK(200056)`: a bare request that makes the broker export its pop records. No
+    /// header, no body, no fast channel; the caller's timeout is forwarded verbatim instead of
+    /// the admin default.
+    pub async fn export_pop_records(&self, broker_addr: &str, timeout_millis: i64) -> Result<()> {
+        let client = self.require_client()?;
+        let mut request = build_request(request_code::POP_ROLLBACK, &ExtFields::new(), None);
+        let response = client
+            .invoke_sync(broker_addr, &mut request, timeout_millis)
+            .await?;
+        MQClientInstance::check_response(&response)?;
+        Ok(())
+    }
+
+    /// `CHECK_ROCKSDB_CQ_WRITE_PROGRESS(354)`: `checkStoreTime` is a primitive long and always
+    /// sent, even when 0. Any non-SUCCESS is the broker's error.
+    pub async fn check_rocksdb_cq_write_progress(
+        &self,
+        broker_addr: &str,
+        topic: &str,
+        check_store_time: i64,
+    ) -> Result<CheckRocksdbCqWriteResult> {
+        let ext = ext_pairs(&[
+            ("topic", topic.to_string()),
+            ("checkStoreTime", check_store_time.to_string()),
+        ]);
+        let response = self
+            .invoke_broker_plain(
+                broker_addr,
+                request_code::CHECK_ROCKSDB_CQ_WRITE_PROGRESS,
+                &ext,
+                None,
+                None,
+            )
+            .await?;
+        let body = response
+            .body
+            .as_deref()
+            .filter(|b| !b.is_empty())
+            .ok_or_else(|| {
+                Error::Broker {
+                    response_code: response.code,
+                    message: format!("empty check result for topic {topic}"),
+                }
+            })?;
+        CheckRocksdbCqWriteResult::decode(body)
+    }
+
+    /// `EXPORT_ROCKSDB_CONFIG_TO_JSON(355)`: the config types join into one header value; the
+    /// separator trails every entry (the broker's parser splits on it), so `topics` goes out as
+    /// `"topics;"`. Code-only result: SUCCESS is the whole answer.
+    pub async fn export_rocksdb_config_to_json(
+        &self,
+        broker_addr: &str,
+        config_types: &[RocksdbConfigType],
+    ) -> Result<()> {
+        let mut config_type = String::new();
+        for config in config_types {
+            config_type.push_str(config.type_name());
+            config_type.push(';');
+        }
+        let ext = ext_pairs(&[("configType", config_type)]);
+        self.invoke_broker_plain(
+            broker_addr,
+            request_code::EXPORT_ROCKSDB_CONFIG_TO_JSON,
+            &ext,
+            None,
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    // ---------------- Lite (LMQ) administration ----------------
+
+    /// Shared round trip of the 200074-200079 family: the fast channel serves all of them, the
+    /// body (when the broker sent one) is returned decoded, and a non-SUCCESS response surfaces
+    /// as the broker error with the target address attached.
+    async fn invoke_broker_method(
+        &self,
+        addr: &str,
+        code: i32,
+        ext: &StringMap,
+        timeout_millis: Option<i64>,
+    ) -> Result<Option<Value>> {
+        let target =
+            MixAll::broker_vip_channel(read_cfg(&self.inner.cfg).vip_channel_enabled, addr);
+        let client = self.require_client()?;
+        let timeout = effective_timeout(self.timeout_millis(), timeout_millis);
+        let mut request = build_request(code, ext, None);
+        let response = client.invoke_sync(&target, &mut request, timeout).await?;
+        if response.code != response_code::SUCCESS {
+            return Err(Error::Broker {
+                response_code: response.code,
+                message: response.remark.unwrap_or_default(),
+            });
+        }
+        match response.body.as_deref().filter(|b| !b.is_empty()) {
+            Some(body) => Ok(Some(RemotingSerializable::decode(body)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// `GET_BROKER_LITE_INFO(200074)`, no header.
+    pub async fn get_broker_lite_info(&self, broker_addr: &str) -> Result<Option<Value>> {
+        self.invoke_broker_method(
+            broker_addr,
+            request_code::GET_BROKER_LITE_INFO,
+            &ExtFields::new(),
+            None,
+        )
+        .await
+    }
+
+    /// `GET_PARENT_TOPIC_INFO(200075)` with header `topic`.
+    pub async fn get_parent_topic_info(
+        &self,
+        broker_addr: &str,
+        topic: &str,
+    ) -> Result<Option<Value>> {
+        let ext = ext_pairs(&[("topic", topic.to_string())]);
+        self.invoke_broker_method(broker_addr, request_code::GET_PARENT_TOPIC_INFO, &ext, None)
+            .await
+    }
+
+    /// `GET_LITE_TOPIC_INFO(200076)` with header `parentTopic` + optional `liteTopic`.
+    pub async fn get_lite_topic_info(
+        &self,
+        broker_addr: &str,
+        parent_topic: &str,
+        lite_topic: Option<&str>,
+    ) -> Result<Option<Value>> {
+        let mut pairs = vec![("parentTopic", parent_topic.to_string())];
+        if let Some(lite) = lite_topic {
+            pairs.push(("liteTopic", lite.to_string()));
+        }
+        let ext = ext_pairs(&pairs);
+        self.invoke_broker_method(broker_addr, request_code::GET_LITE_TOPIC_INFO, &ext, None)
+            .await
+    }
+
+    /// `GET_LITE_CLIENT_INFO(200077)`: `maxCount` is a primitive int with a 1000 default and is
+    /// therefore always on the wire.
+    pub async fn get_lite_client_info(
+        &self,
+        broker_addr: &str,
+        parent_topic: &str,
+        group: &str,
+        client_id: Option<&str>,
+    ) -> Result<Option<Value>> {
+        let mut pairs = vec![
+            ("parentTopic", parent_topic.to_string()),
+            ("group", group.to_string()),
+        ];
+        if let Some(client) = client_id {
+            pairs.push(("clientId", client.to_string()));
+        }
+        pairs.push(("maxCount", "1000".to_string()));
+        let ext = ext_pairs(&pairs);
+        self.invoke_broker_method(broker_addr, request_code::GET_LITE_CLIENT_INFO, &ext, None)
+            .await
+    }
+
+    /// `GET_LITE_GROUP_INFO(200078)`: `topK` is a primitive int and always sent.
+    pub async fn get_lite_group_info(
+        &self,
+        broker_addr: &str,
+        group: &str,
+        lite_topic: Option<&str>,
+        top_k: i32,
+    ) -> Result<Option<Value>> {
+        let mut pairs = vec![("group", group.to_string())];
+        if let Some(lite) = lite_topic {
+            pairs.push(("liteTopic", lite.to_string()));
+        }
+        pairs.push(("topK", top_k.to_string()));
+        let ext = ext_pairs(&pairs);
+        self.invoke_broker_method(broker_addr, request_code::GET_LITE_GROUP_INFO, &ext, None)
+            .await
+    }
+
+    /// `TRIGGER_LITE_DISPATCH(200079)`, void result.
+    pub async fn trigger_lite_dispatch(
+        &self,
+        broker_addr: &str,
+        group: &str,
+        client_id: Option<&str>,
+    ) -> Result<()> {
+        let mut pairs = vec![("group", group.to_string())];
+        if let Some(client) = client_id {
+            pairs.push(("clientId", client.to_string()));
+        }
+        let ext = ext_pairs(&pairs);
+        self.invoke_broker_method(broker_addr, request_code::TRIGGER_LITE_DISPATCH, &ext, None)
+            .await
+            .map(|_| ())
+    }
+
+    // ---------------- Concurrent fan-out administration ----------------
+
+    /// Runs `task` once per key on a cloned admin, all concurrently. Every join failure
+    /// (a panicked task) is logged and skipped, never propagated. Results come back keyed
+    /// by their key, in completion order.
+    async fn fan_out<T, F, Fut>(&self, keys: Vec<String>, task: F) -> Vec<(String, T)>
+    where
+        F: Fn(DefaultMQAdminExt, String) -> Fut + Clone + Send + 'static,
+        Fut: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let mut set = tokio::task::JoinSet::new();
+        for key in keys {
+            let admin = self.clone();
+            let task = task.clone();
+            set.spawn(async move {
+                let out = task(admin, key.clone()).await;
+                (key, out)
+            });
+        }
+        let mut results = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok(pair) => results.push(pair),
+                Err(e) => rmq_warn!("concurrent admin task failed: {e}"),
+            }
+        }
+        results
+    }
+
+    /// The admin client, or the fan-out failure verdict for not being started.
+    fn admin_tool_client(
+        &self,
+    ) -> std::result::Result<MQClientInstance, (AdminToolsResultCode, String)> {
+        self.require_client()
+            .map_err(|e| (admin_tools_code_of(&e), e.to_string()))
+    }
+
+    /// Per-broker `GET_TOPIC_STATS_INFO` in parallel: offset tables merge per key, the put
+    /// TPS is summed, and any single broker failure is logged and skipped. A topic without
+    /// route data is the `-2001` verdict; a route without broker data is a success with an
+    /// empty table.
+    pub async fn examine_topic_stats_concurrent(
+        &self,
+        topic: &str,
+    ) -> AdminToolResult<TopicStatsTable> {
+        let client = match self.admin_tool_client() {
+            Ok(client) => client,
+            Err((code, message)) => return AdminToolResult::failure(code, message),
+        };
+        let Some(route) = client.get_topic_route_data(topic).await else {
+            return AdminToolResult::failure(
+                AdminToolsResultCode::TopicRouteInfoNotExist,
+                "topic router info not found",
+            );
+        };
+        if route.get_broker_datas().is_empty() {
+            return AdminToolResult::success(TopicStatsTable::new());
+        }
+        let addrs = route_masters(&route);
+        let topic_owned = topic.to_string();
+        let parts = self.fan_out(addrs, move |admin, addr| {
+            let topic = topic_owned.clone();
+            async move { admin.examine_topic_stats_by_broker(&addr, &topic).await }
+        });
+        let parts = parts.await;
+        let mut merged = TopicStatsTable::new();
+        for (addr, part) in parts {
+            match part {
+                Ok(part) => merge_topic_stats(&mut merged, part),
+                Err(e) => rmq_warn!("getTopicStatsInfo error. topic={topic} broker={addr}: {e}"),
+            }
+        }
+        AdminToolResult::success(merged)
+    }
+
+    /// Route discovery walks the retry topic, then the topic itself, then the pop retry
+    /// topic, taking the first hit. The per-broker `GET_CONSUME_STATS` fan merges offset
+    /// tables and sums the per-address TPS. An empty merged table probes the consumer
+    /// connection: unreachable means the group never consumed (offline verdict), a
+    /// broadcasting group gets its own verdict, and any other online group is a success
+    /// with the (empty) stats.
+    pub async fn examine_consume_stats_concurrent(
+        &self,
+        consumer_group: &str,
+        topic: Option<&str>,
+    ) -> AdminToolResult<ConsumeStats> {
+        let client = match self.admin_tool_client() {
+            Ok(client) => client,
+            Err((code, message)) => return AdminToolResult::failure(code, message),
+        };
+        let mut route_candidates = vec![MixAll::get_retry_topic(consumer_group)];
+        if let Some(topic) = topic.filter(|t| !t.is_empty()) {
+            route_candidates.push(topic.to_string());
+            route_candidates.push(build_pop_retry_topic(topic, consumer_group));
+        }
+        let mut found: Option<TopicRouteData> = None;
+        for candidate in &route_candidates {
+            if let Some(route) = client.get_topic_route_data(candidate).await {
+                found = Some(route);
+                break;
+            }
+        }
+        let Some(route) = found else {
+            return AdminToolResult::failure(
+                AdminToolsResultCode::TopicRouteInfoNotExist,
+                "topic router info not found",
+            );
+        };
+        if route.get_broker_datas().is_empty() {
+            return AdminToolResult::failure(
+                AdminToolsResultCode::TopicRouteInfoNotExist,
+                "topic router info not found",
+            );
+        }
+        let addrs = route_masters(&route);
+        let group_owned = consumer_group.to_string();
+        let topic_owned = topic.filter(|t| !t.is_empty()).map(str::to_string);
+        let parts = self
+            .fan_out(addrs, move |admin, addr| {
+                let group = group_owned.clone();
+                let topic = topic_owned.clone();
+                async move {
+                    admin
+                        .examine_consume_stats(&addr, &group, topic.as_deref(), None)
+                        .await
+                }
+            })
+            .await;
+        let mut result = ConsumeStats::new();
+        // One TPS slot per address: two route entries pointing at one address count once.
+        let mut tps_by_addr: HashMap<String, f64> = HashMap::new();
+        for (addr, part) in parts {
+            match part {
+                Ok(part) => {
+                    for (key, wrapper) in part.offset_table {
+                        match result.offset_table.iter_mut().find(|(k, _)| *k == key) {
+                            Some(slot) => slot.1 = wrapper,
+                            None => result.offset_table.push((key, wrapper)),
+                        }
+                    }
+                    tps_by_addr.insert(addr, part.consume_tps);
+                }
+                Err(e) => rmq_warn!(
+                    "getConsumeStats error. topic={topic:?} consumerGroup={consumer_group} broker={addr}: {e}"
+                ),
+            }
+        }
+        for tps in tps_by_addr.values() {
+            result.consume_tps += tps;
+        }
+        if result.offset_table.is_empty() {
+            const NOT_ONLINE_MSG: &str = "Not found the consumer group consume stats, because return offset table is empty, maybe the consumer not consume any message";
+            const BROADCAST_MSG: &str = "Not found the consumer group consume stats, because return offset table is empty, the consumer is under the broadcast mode";
+            return match self.examine_consumer_connection_info(consumer_group, None).await {
+                Err(_) => {
+                    AdminToolResult::failure(AdminToolsResultCode::ConsumerNotOnline, NOT_ONLINE_MSG)
+                }
+                Ok(cc) if cc.connection_set.is_empty() => {
+                    AdminToolResult::failure(AdminToolsResultCode::ConsumerNotOnline, NOT_ONLINE_MSG)
+                }
+                Ok(cc) if cc.message_model.as_deref() == Some("BROADCASTING") => {
+                    AdminToolResult::failure(
+                        AdminToolsResultCode::BroadcastConsumption,
+                        BROADCAST_MSG,
+                    )
+                }
+                Ok(_) => AdminToolResult::success(result),
+            };
+        }
+        AdminToolResult::success(result)
+    }
+
+    /// Fans `DELETE_TOPIC_IN_BROKER(215)` over the addresses the caller handed in
+    /// (de-duplicated like the set on the wire side); every address lands in exactly one of
+    /// the two lists, and the wrapper is always a success.
+    pub async fn delete_topic_in_broker_concurrent(
+        &self,
+        addrs: &[String],
+        topic: &str,
+    ) -> AdminToolResult<BrokerOperatorResult> {
+        if let Err((code, message)) = self.admin_tool_client() {
+            return AdminToolResult::failure(code, message);
+        }
+        let mut targets: Vec<String> = Vec::new();
+        for addr in addrs {
+            if !targets.iter().any(|seen| seen == addr) {
+                targets.push(addr.clone());
+            }
+        }
+        let topic_owned = topic.to_string();
+        let parts = self
+            .fan_out(targets, move |admin, addr| {
+                let topic = topic_owned.clone();
+                async move { admin.delete_topic_in_broker(&addr, &topic).await }
+            })
+            .await;
+        let mut result = BrokerOperatorResult::default();
+        for (addr, outcome) in parts {
+            match outcome {
+                Ok(()) => result.success_list.push(addr),
+                Err(e) => {
+                    rmq_warn!("deleteTopicInBroker error. topic={topic} broker={addr}: {e}");
+                    result.failure_list.push(addr);
+                }
+            }
+        }
+        AdminToolResult::success(result)
+    }
+
+    /// Per-broker `INVOKE_BROKER_TO_RESET_OFFSET(222)` in parallel. A group that never came
+    /// online on that broker falls back to the consume-stats-driven old reset; a
+    /// `SYSTEM_ERROR(1)` (the "never online" answer) counts as done. The wrapper succeeds
+    /// only when every route broker succeeded, and carries both lists otherwise.
+    pub async fn reset_offset_new_concurrent(
+        &self,
+        group: &str,
+        topic: &str,
+        timestamp: i64,
+    ) -> AdminToolResult<BrokerOperatorResult> {
+        let client = match self.admin_tool_client() {
+            Ok(client) => client,
+            Err((code, message)) => return AdminToolResult::failure(code, message),
+        };
+        let Some(route) = client.get_topic_route_data(topic).await else {
+            return AdminToolResult::failure(
+                AdminToolsResultCode::TopicRouteInfoNotExist,
+                "topic router info not found",
+            );
+        };
+        if route.get_broker_datas().is_empty() {
+            return AdminToolResult::failure(
+                AdminToolsResultCode::TopicRouteInfoNotExist,
+                "topic router info not found",
+            );
+        }
+        let total = route.get_broker_datas().len();
+        let targets: Vec<(String, Option<QueueData>)> = route
+            .get_broker_datas()
+            .iter()
+            .filter_map(|bd| {
+                let addr = bd.select_broker_addr().filter(|a| !a.is_empty())?;
+                let queue_data = route
+                    .queue_datas
+                    .iter()
+                    .find(|qd| qd.broker_name == bd.broker_name)
+                    .cloned();
+                Some((addr, queue_data))
+            })
+            .collect();
+        let group_owned = group.to_string();
+        let topic_owned = topic.to_string();
+        let addrs: Vec<String> = targets.iter().map(|(addr, _)| addr.clone()).collect();
+        let targets_for_task = targets.clone();
+        let parts = self
+            .fan_out(addrs, move |admin, addr| {
+                let group = group_owned.clone();
+                let topic = topic_owned.clone();
+                let queue_data = targets_for_task
+                    .iter()
+                    .find(|(target, _)| *target == addr)
+                    .and_then(|(_, qd)| qd.clone());
+                async move {
+                    admin
+                        .reset_offset_new_for_broker(&addr, queue_data.as_ref(), &group, &topic, timestamp)
+                        .await
+                }
+            })
+            .await;
+        let mut result = BrokerOperatorResult::default();
+        for (addr, ok) in parts {
+            if ok {
+                result.success_list.push(addr);
+            } else {
+                result.failure_list.push(addr);
+            }
+        }
+        if result.success_list.len() == total {
+            AdminToolResult::success(result)
+        } else {
+            AdminToolResult::failure_with(
+                AdminToolsResultCode::MQBrokerError,
+                "operator failure",
+                result,
+            )
+        }
+    }
+
+    /// One broker's leg of the reset fan-out; `true` lands in the success list.
+    async fn reset_offset_new_for_broker(
+        &self,
+        broker_addr: &str,
+        queue_data: Option<&QueueData>,
+        group: &str,
+        topic: &str,
+        timestamp: i64,
+    ) -> bool {
+        match self
+            .invoke_broker_reset_offset(broker_addr, topic, group, timestamp, true, false, None, None)
+            .await
+        {
+            Ok(_) => true,
+            Err(e) if e.response_code() == Some(response_code::CONSUMER_NOT_ONLINE) => {
+                match self
+                    .reset_offset_old_for_broker(broker_addr, queue_data, group, topic, timestamp, true)
+                    .await
+                {
+                    Ok(()) => true,
+                    Err(e2) => {
+                        rmq_warn!(
+                            "resetOffsetByTimestampOld error. addr={broker_addr} topic={topic} group={group} timestamp={timestamp}: {e2}"
+                        );
+                        false
+                    }
+                }
+            }
+            // CODE: 1 means "the consumer group never came online": nothing to roll back.
+            Err(e) if e.response_code() == Some(response_code::SYSTEM_ERROR) => true,
+            Err(e) => {
+                rmq_warn!(
+                    "resetOffsetNewConcurrent error. addr={broker_addr} topic={topic} group={group} timestamp={timestamp}: {e}"
+                );
+                false
+            }
+        }
+    }
+
+    /// The old reset on one broker: the broker's consume stats drive the queue list, and a
+    /// group that never consumed falls back to the topic stats over `readQueueNums` queues.
+    async fn reset_offset_old_for_broker(
+        &self,
+        broker_addr: &str,
+        queue_data: Option<&QueueData>,
+        group: &str,
+        topic: &str,
+        timestamp: i64,
+        force: bool,
+    ) -> Result<()> {
+        let stats = self.examine_consume_stats(broker_addr, group, None, None).await?;
+        let mut has_consumed = false;
+        for (key, wrapper) in &stats.offset_table {
+            if key.topic != topic {
+                continue;
+            }
+            has_consumed = true;
+            let mq = MessageQueue::new(&key.topic, &key.broker_name, key.queue_id);
+            self.reset_offset_consume_offset(broker_addr, group, &mq, wrapper, timestamp, force)
+                .await?;
+        }
+        if has_consumed {
+            return Ok(());
+        }
+        let queue_data = queue_data.ok_or_else(|| {
+            Error::client(format!("no queue data for broker {broker_addr} while resetting {topic}"))
+        })?;
+        let status = self.examine_topic_stats_by_broker(broker_addr, topic).await?;
+        for queue_id in 0..queue_data.read_queue_nums {
+            let Some((_, offset)) = status.offset_table.iter().find(|(k, _)| {
+                k.topic == topic
+                    && k.broker_name == queue_data.broker_name
+                    && k.queue_id == queue_id
+            }) else {
+                return Err(Error::client(format!(
+                    "queue {topic}#{queue_id} missing in the topic stats of {broker_addr}"
+                )));
+            };
+            let mq = MessageQueue::new(topic, &queue_data.broker_name, queue_id);
+            let wrapper = OffsetWrapper {
+                broker_offset: offset.max_offset,
+                consumer_offset: offset.min_offset,
+                ..OffsetWrapper::default()
+            };
+            self.reset_offset_consume_offset(broker_addr, group, &mq, &wrapper, timestamp, force)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// `searchOffset` (or `getMaxOffset` for `-1`), written back when forced or when the
+    /// reset would not move the consumer forward.
+    async fn reset_offset_consume_offset(
+        &self,
+        broker_addr: &str,
+        group: &str,
+        mq: &MessageQueue,
+        wrapper: &OffsetWrapper,
+        timestamp: i64,
+        force: bool,
+    ) -> Result<()> {
+        let client = self.require_client()?;
+        let reset_offset = if timestamp == -1 {
+            client
+                .get_max_offset(mq, self.timeout_millis(), Some(broker_addr))
+                .await?
+        } else {
+            client
+                .search_offset_by_timestamp(mq, timestamp, self.timeout_millis(), Some(broker_addr))
+                .await?
+        };
+        if force || reset_offset <= wrapper.consumer_offset {
+            client
+                .update_consumer_offset(group, mq, reset_offset, self.timeout_millis(), Some(broker_addr))
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Per-broker `QUERY_TOPICS_BY_CONSUMER(343)` in parallel over the retry topic's route;
+    /// every topic list is concatenated (no de-duplication) and single failures are skipped.
+    pub async fn query_topics_by_consumer_concurrent(
+        &self,
+        group: &str,
+    ) -> AdminToolResult<TopicList> {
+        let client = match self.admin_tool_client() {
+            Ok(client) => client,
+            Err((code, message)) => return AdminToolResult::failure(code, message),
+        };
+        let retry_topic = MixAll::get_retry_topic(group);
+        let Some(route) = client.get_topic_route_data(&retry_topic).await else {
+            return AdminToolResult::failure(
+                AdminToolsResultCode::TopicRouteInfoNotExist,
+                "router info not found.",
+            );
+        };
+        if route.get_broker_datas().is_empty() {
+            return AdminToolResult::failure(
+                AdminToolsResultCode::TopicRouteInfoNotExist,
+                "router info not found.",
+            );
+        }
+        let addrs = route_masters(&route);
+        let group_owned = group.to_string();
+        let parts = self
+            .fan_out(addrs, move |admin, addr| {
+                let group = group_owned.clone();
+                async move { admin.query_topics_by_consumer_to_broker(&addr, &group).await }
+            })
+            .await;
+        let mut result = TopicList::new();
+        for (addr, topics) in parts {
+            match topics {
+                Ok(topics) => {
+                    for topic in topics.get_topic_list() {
+                        result.topic_list.push(topic.clone());
+                    }
+                }
+                Err(e) => rmq_warn!("queryTopicsByConsumer error. group={group} broker={addr}: {e}"),
+            }
+        }
+        AdminToolResult::success(result)
+    }
+
+    /// Per-broker `QUERY_CONSUME_TIME_SPAN(303)` in parallel; the spans are concatenated.
+    /// No route at all is the `-2001` verdict, a route without broker data is a success
+    /// with an empty list.
+    pub async fn query_consume_time_span_concurrent(
+        &self,
+        topic: &str,
+        group: &str,
+    ) -> AdminToolResult<Vec<Value>> {
+        let client = match self.admin_tool_client() {
+            Ok(client) => client,
+            Err((code, message)) => return AdminToolResult::failure(code, message),
+        };
+        let Some(route) = client.get_topic_route_data(topic).await else {
+            return AdminToolResult::failure(
+                AdminToolsResultCode::TopicRouteInfoNotExist,
+                "topic router info not found",
+            );
+        };
+        if route.get_broker_datas().is_empty() {
+            return AdminToolResult::success(Vec::new());
+        }
+        let addrs = route_masters(&route);
+        let topic_owned = topic.to_string();
+        let group_owned = group.to_string();
+        let parts = self
+            .fan_out(addrs, move |admin, addr| {
+                let topic = topic_owned.clone();
+                let group = group_owned.clone();
+                async move {
+                    admin
+                        .query_consume_time_span_by_broker(&addr, &topic, &group)
+                        .await
+                }
+            })
+            .await;
+        let mut spans: Vec<Value> = Vec::new();
+        for (addr, part) in parts {
+            match part {
+                Ok(part) => spans.extend(part),
+                Err(e) => {
+                    rmq_warn!("queryConsumeTimeSpan error. topic={topic} group={group} broker={addr}: {e}")
+                }
+            }
+        }
+        AdminToolResult::success(spans)
+    }
+
+    /// The message track of one consumer group, shared verbatim by the sequential and the
+    /// concurrent track detail so both produce the same verdicts.
+    async fn track_one_group(&self, msg: &MessageExt, group: &str) -> MessageTrack {
+        let mut mt = MessageTrack {
+            consumer_group: group.to_string(),
+            track_type: TrackType::Unknown,
+            exception_desc: None,
+        };
+        let cc = match self.examine_consumer_connection_info(group, None).await {
+            Ok(cc) => cc,
+            Err(e) => {
+                if e.response_code() == Some(response_code::CONSUMER_NOT_ONLINE) {
+                    mt.track_type = TrackType::NotOnline;
+                }
+                mt.exception_desc = match e.response_code() {
+                    Some(code) => Some(format!("CODE:{code} DESC:{e}")),
+                    None => Some(format!("{e}")),
+                };
+                return mt;
+            }
+        };
+
+        match cc.consume_type.as_deref() {
+            Some("CONSUME_ACTIVELY") => mt.track_type = TrackType::Pull,
+            Some("CONSUME_PASSIVELY") => {
+                let if_consumed = match self.consumed(msg, group).await {
+                    Ok(v) => v,
+                    Err(e) => match e.response_code() {
+                        Some(code)
+                            if code == response_code::CONSUMER_NOT_ONLINE
+                                || code == response_code::BROADCAST_CONSUMPTION =>
+                        {
+                            if code == response_code::CONSUMER_NOT_ONLINE {
+                                mt.track_type = TrackType::NotOnline;
+                                mt.exception_desc = Some(format!("CODE:{code} DESC:{e}"));
+                            } else {
+                                mt.track_type = TrackType::ConsumeBroadcasting;
+                            }
+                            return mt;
+                        }
+                        _ => {
+                            mt.exception_desc = Some(format!("{e}"));
+                            return mt;
+                        }
+                    },
+                };
+
+                if if_consumed {
+                    mt.track_type = TrackType::Consumed;
+                    let sub = cc
+                        .subscription_table
+                        .iter()
+                        .find(|(topic, _)| *topic == msg.topic)
+                        .map(|(_, v)| v);
+                    if let Some(sub) = sub {
+                        let tags_set: Vec<String> = sub
+                            .get("tagsSet")
+                            .and_then(Value::as_array)
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(Value::as_str)
+                                    .map(str::to_string)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let msg_tag = msg.get_tags();
+                        if !tags_set.is_empty()
+                            && !tags_set.iter().any(|t| t == "*")
+                            && !tags_set.iter().any(|t| Some(t.as_str()) == msg_tag)
+                        {
+                            mt.track_type = TrackType::ConsumedButFiltered;
+                        }
+                    }
+                } else {
+                    mt.track_type = TrackType::NotConsumeYet;
+                }
+            }
+            _ => {}
+        }
+        mt
+    }
+
+    /// The per-group track verdicts of [`Self::message_track_detail`], fanned out over the
+    /// groups; the output list keeps the (sorted) group order.
+    pub async fn message_track_detail_concurrent(
+        &self,
+        msg: &MessageExt,
+    ) -> Result<Vec<MessageTrack>> {
+        let broker_addr = self.first_track_broker_addr(&msg.topic).await?;
+        let mut groups = self
+            .query_topic_consume_by_who(&broker_addr, &msg.topic)
+            .await?;
+        groups.sort();
+        let message = msg.clone();
+        let parts = self
+            .fan_out(groups.clone(), move |admin, group| {
+                let msg = message.clone();
+                async move { admin.track_one_group(&msg, &group).await }
+            })
+            .await;
+        // Completion order is scheduling noise; report in the group order.
+        let mut tracks: Vec<(String, MessageTrack)> = parts;
+        tracks.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(tracks.into_iter().map(|(_, track)| track).collect())
+    }
+
+    /// The group discovery leg shared by both track details: the topic's route, then the
+    /// first broker that has an address, then `QUERY_TOPIC_CONSUME_BY_WHO(300)`.
+    async fn first_track_broker_addr(&self, topic: &str) -> Result<String> {
+        let route = self.examine_topic_route(topic).await?;
+        route
+            .get_broker_datas()
+            .iter()
+            .find_map(|bd| bd.select_broker_addr())
+            .filter(|a| !a.is_empty())
+            .ok_or_else(|| Error::client(format!("no broker address for topic {topic}")))
+    }
+}
+
+/// The master (or fall-back) address of every broker data entry, dropping entries without one.
+fn route_masters(route: &TopicRouteData) -> Vec<String> {
+    route
+        .get_broker_datas()
+        .iter()
+        .filter_map(|bd| bd.select_broker_addr().filter(|a| !a.is_empty()))
+        .collect()
 }
 
 /// Takes the string array from the JSON body's `key`; a missing field counts as an empty table.
@@ -2890,8 +4383,8 @@ fn string_list(value: &Value, key: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::common::message_decoder::{create_message_id, encode_message_ext, ip_and_port_to_bytes};
-    use crate::remoting::protocol::admin_body::TopicOffset;
-    use crate::remoting::protocol::body::CMResult;
+    use crate::remoting::protocol::admin_body::{CheckRocksdbCqWriteStatus, TopicOffset};
+    use crate::remoting::protocol::body::{CMResult, Connection};
     use crate::remoting::protocol::route::QueueData;
 
     fn cluster() -> ClusterInfo {
@@ -3629,5 +5122,1703 @@ mod tests {
         assert!(err
             .to_string()
             .starts_with("MQClientException: admin not started"));
+    }
+
+    // ---------------- 3001-3010 auth user / ACL management (mock-broker cross-check) ----------------
+
+    use crate::remoting::protocol::auth_body::{
+        AclEntry, AclPolicy, DECISION_ALLOW, DECISION_DENY, POLICY_TYPE_CUSTOM, POLICY_TYPE_DEFAULT,
+        USER_STATUS_DISABLE, USER_STATUS_ENABLE, USER_TYPE_NORMAL, USER_TYPE_SUPER,
+    };
+
+    /// One auth request exactly as it left the wire: `(request code, extFields, body)`.
+    type AuthRecord = (i32, Vec<(String, String)>, Vec<u8>);
+    type AuthLog = Arc<Mutex<Vec<AuthRecord>>>;
+
+    /// How the mock broker answers one request code.
+    struct AuthReply {
+        code: i32,
+        remark: Option<String>,
+        body: Vec<u8>,
+    }
+
+    impl AuthReply {
+        fn ok(body: &str) -> AuthReply {
+            AuthReply {
+                code: response_code::SUCCESS,
+                remark: None,
+                body: body.as_bytes().to_vec(),
+            }
+        }
+
+        fn err(code: i32, remark: &str) -> AuthReply {
+            AuthReply {
+                code,
+                remark: Some(remark.to_string()),
+                body: Vec::new(),
+            }
+        }
+    }
+
+    /// Starts the auth cross-check mock broker: every request in 3001-3010 is recorded verbatim and
+    /// answered from `replies` (matched by request code); everything else the start handshake and
+    /// the route refreshers produce gets SUCCESS with no body, and is not recorded.
+    async fn spawn_auth_broker(listener: tokio::net::TcpListener, replies: Vec<(i32, AuthReply)>) -> AuthLog {
+        use tokio::io::AsyncWriteExt as _;
+        let log: AuthLog = Arc::new(Mutex::new(Vec::new()));
+        let inner = Arc::clone(&log);
+        let replies = Arc::new(replies);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { return };
+                let log = Arc::clone(&inner);
+                let replies = Arc::clone(&replies);
+                tokio::spawn(async move {
+                    while let Some(frame) = read_frame(&mut stream).await {
+                        let Ok(request) = RemotingCommand::decode(&frame) else { return };
+                        if (request_code::AUTH_CREATE_USER..=request_code::AUTH_LIST_ACL)
+                            .contains(&request.code)
+                        {
+                            lock(&log).push((
+                                request.code,
+                                request.ext_fields().iter().cloned().collect(),
+                                request.body().unwrap_or_default().to_vec(),
+                            ));
+                        }
+                        if request.is_oneway_rpc() {
+                            continue;
+                        }
+                        let scripted = replies
+                            .iter()
+                            .find(|(code, _)| *code == request.code)
+                            .map(|(_, reply)| reply);
+                        let mut response = match scripted {
+                            Some(reply) => {
+                                let mut cmd = reply_for(
+                                    &request,
+                                    reply.code,
+                                    if reply.body.is_empty() {
+                                        None
+                                    } else {
+                                        Some(reply.body.clone())
+                                    },
+                                );
+                                cmd.remark = reply.remark.clone();
+                                cmd
+                            }
+                            None => reply_for(&request, response_code::SUCCESS, None),
+                        };
+                        let bytes = response.encode();
+                        let _ = stream.write_all(&bytes).await;
+                        let _ = stream.flush().await;
+                    }
+                });
+            }
+        });
+        log
+    }
+
+    /// Binds a mock broker and returns `(its address, the recorded auth traffic)`.
+    async fn auth_broker(replies: Vec<(i32, AuthReply)>) -> (String, AuthLog) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock broker");
+        let addr = listener.local_addr().expect("mock broker addr").to_string();
+        let log = spawn_auth_broker(listener, replies).await;
+        (addr, log)
+    }
+
+    /// A fresh instance name per test: the admin's clientId is second-granularity, and a shared
+    /// name would make two running tests fight over one registry slot.
+    async fn started_auth_admin(addr: &str, tag: &str) -> DefaultMQAdminExt {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let admin = DefaultMQAdminExt::new();
+        admin.set_instance_name(&format!(
+            "ADMIN_auth_{tag}_{}",
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        admin.set_namesrv_addr(addr);
+        admin
+            .start()
+            .await
+            .expect("start against the mock broker should succeed");
+        admin
+    }
+
+    fn auth_record(log: &AuthLog, code: i32) -> AuthRecord {
+        let records: Vec<AuthRecord> = lock(log)
+            .iter()
+            .filter(|r| r.0 == code)
+            .cloned()
+            .collect();
+        assert_eq!(records.len(), 1, "code {code} must reach the wire exactly once");
+        records.into_iter().next().unwrap()
+    }
+
+    fn auth_body(log: &AuthLog, code: i32) -> String {
+        String::from_utf8(auth_record(log, code).2.clone()).expect("utf8 request body")
+    }
+
+    /// How many times one auth code reached the wire.
+    fn auth_count(log: &AuthLog, code: i32) -> usize {
+        lock(log).iter().filter(|r| r.0 == code).count()
+    }
+
+    /// Request side of 3001: the short form puts the name in the header, the record in the body,
+    /// and writes no `userStatus` key at all.
+    #[tokio::test]
+    async fn create_user_short_form_sends_username_header_and_no_status_key() {
+        let (addr, log) = auth_broker(vec![]).await;
+        let admin = started_auth_admin(&addr, "create").await;
+
+        admin
+            .create_user(&addr, "rocketmq", "12345678", USER_TYPE_SUPER)
+            .await
+            .expect("3001 short form");
+
+        let record = auth_record(&log, request_code::AUTH_CREATE_USER);
+        assert_eq!(
+            record.1,
+            vec![("username".to_string(), "rocketmq".to_string())],
+            "3001 carries the username header and nothing else"
+        );
+        assert_eq!(
+            auth_body(&log, request_code::AUTH_CREATE_USER),
+            r#"{"username":"rocketmq","password":"12345678","userType":"Super"}"#
+        );
+        admin.shutdown();
+    }
+
+    /// Paired control: the same call through the object form does write `userStatus`, so the key's
+    /// absence above is the short form's doing rather than the encoder dropping it.
+    #[tokio::test]
+    async fn create_user_object_form_writes_status_and_keeps_key_order() {
+        let (addr, log) = auth_broker(vec![]).await;
+        let admin = started_auth_admin(&addr, "create_obj").await;
+        let user = AuthUser {
+            username: "rocketmq".to_string(),
+            password: Some("12345678".to_string()),
+            user_type: Some(USER_TYPE_NORMAL.to_string()),
+            user_status: Some(USER_STATUS_DISABLE.to_string()),
+        };
+
+        admin
+            .create_user_with_config(&addr, &user)
+            .await
+            .expect("3001 object form");
+
+        assert_eq!(
+            auth_body(&log, request_code::AUTH_CREATE_USER),
+            r#"{"username":"rocketmq","password":"12345678","userType":"Normal","userStatus":"disable"}"#
+        );
+        admin.shutdown();
+    }
+
+    /// 3002 differs from 3001 only in the code, and it sends no body key the caller left unset.
+    #[tokio::test]
+    async fn update_user_sends_3002_with_the_same_shape_as_create() {
+        let (addr, log) = auth_broker(vec![]).await;
+        let admin = started_auth_admin(&addr, "update").await;
+
+        admin
+            .update_user(&addr, "alice", "abcdefgh", USER_TYPE_NORMAL)
+            .await
+            .expect("3002");
+
+        let record = auth_record(&log, request_code::AUTH_UPDATE_USER);
+        assert_eq!(record.1, vec![("username".to_string(), "alice".to_string())]);
+        assert_eq!(
+            auth_body(&log, request_code::AUTH_UPDATE_USER),
+            r#"{"username":"alice","password":"abcdefgh","userType":"Normal"}"#
+        );
+        assert!(
+            auth_count(&log, request_code::AUTH_CREATE_USER) == 0,
+            "3002 must not be sent under the 3001 code"
+        );
+        admin.shutdown();
+    }
+
+    /// 3003 is header-only and its reply is never read: the broker answers with bytes that are not
+    /// a record at all, and the call still succeeds.
+    #[tokio::test]
+    async fn delete_user_sends_only_the_username_header_and_ignores_the_body() {
+        let (addr, log) = auth_broker(vec![(
+            request_code::AUTH_DELETE_USER,
+            AuthReply::ok("this is not a user record"),
+        )])
+        .await;
+        let admin = started_auth_admin(&addr, "delete").await;
+
+        admin
+            .delete_user(&addr, "alice")
+            .await
+            .expect("3003 must not touch the reply body");
+
+        let record = auth_record(&log, request_code::AUTH_DELETE_USER);
+        assert_eq!(record.1, vec![("username".to_string(), "alice".to_string())]);
+        assert!(record.2.is_empty(), "3003 has no request body");
+        admin.shutdown();
+    }
+
+    #[tokio::test]
+    async fn get_user_decodes_the_record_and_a_missing_body_is_none() {
+        let (addr, log) = auth_broker(vec![(
+            request_code::AUTH_GET_USER,
+            AuthReply::ok(r#"{"username":"alice","userType":"Normal","userStatus":"enable"}"#),
+        )])
+        .await;
+        let admin = started_auth_admin(&addr, "get").await;
+
+        let user = admin
+            .get_user(&addr, "alice")
+            .await
+            .expect("3004")
+            .expect("the broker returned a record");
+        assert_eq!(user.username, "alice");
+        assert_eq!(user.user_type.as_deref(), Some(USER_TYPE_NORMAL));
+        assert_eq!(user.user_status.as_deref(), Some(USER_STATUS_ENABLE));
+        // A response that carries no password still decodes; the field stays unset
+        assert_eq!(user.password, None);
+        assert_eq!(
+            auth_record(&log, request_code::AUTH_GET_USER).1,
+            vec![("username".to_string(), "alice".to_string())]
+        );
+
+        // The same code answered with an empty body reads as "no such user", not as an error
+        let (addr2, log2) = auth_broker(vec![]).await;
+        let empty_admin = started_auth_admin(&addr2, "get_empty").await;
+        assert_eq!(empty_admin.get_user(&addr2, "ghost").await.unwrap(), None);
+        assert_eq!(auth_record(&log2, request_code::AUTH_GET_USER).0, 3004);
+        admin.shutdown();
+        empty_admin.shutdown();
+    }
+
+    /// 3005 sends `filter` only when the caller has one; an empty header table is the "list all"
+    /// request, not `filter=`.
+    #[tokio::test]
+    async fn list_user_omits_the_filter_header_when_unset() {
+        let (addr, log) = auth_broker(vec![(
+            request_code::AUTH_LIST_USER,
+            AuthReply::ok(r#"[{"username":"a"},{"username":"b","userStatus":"disable"}]"#),
+        )])
+        .await;
+        let admin = started_auth_admin(&addr, "list_user").await;
+
+        let all = admin.list_user(&addr, None).await.expect("3005 unfiltered");
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].username, "a");
+        assert_eq!(all[1].user_status.as_deref(), Some(USER_STATUS_DISABLE));
+        assert_eq!(
+            auth_record(&log, request_code::AUTH_LIST_USER).1,
+            Vec::<(String, String)>::new(),
+            "no filter must mean no header at all"
+        );
+
+        let filtered = admin
+            .list_user(&addr, Some("rock*"))
+            .await
+            .expect("3005 filtered");
+        assert_eq!(filtered.len(), 2, "the reply is the same record set here");
+        let exts: Vec<Vec<(String, String)>> = lock(&log)
+            .iter()
+            .filter(|r| r.0 == request_code::AUTH_LIST_USER)
+            .map(|r| r.1.clone())
+            .collect();
+        assert_eq!(
+            exts,
+            vec![
+                Vec::new(),
+                vec![("filter".to_string(), "rock*".to_string())]
+            ],
+            "the second call adds exactly one header, in order"
+        );
+        admin.shutdown();
+    }
+
+    /// 3006 short form: the header is only the subject, the body is one policy with no
+    /// `policyType` key and one entry per resource repeating the shared values.
+    #[tokio::test]
+    async fn create_acl_short_form_sends_one_policy_without_policy_type() {
+        let (addr, log) = auth_broker(vec![]).await;
+        let admin = started_auth_admin(&addr, "create_acl").await;
+
+        admin
+            .create_acl(
+                &addr,
+                "user:alice",
+                &["topic:T1", "topic:T2"],
+                &["PUB", "SUB"],
+                &["192.168.0.1"],
+                DECISION_ALLOW,
+            )
+            .await
+            .expect("3006 short form");
+
+        assert_eq!(
+            auth_record(&log, request_code::AUTH_CREATE_ACL).1,
+            vec![("subject".to_string(), "user:alice".to_string())],
+            "3006 carries the subject header and nothing else"
+        );
+        assert_eq!(
+            auth_body(&log, request_code::AUTH_CREATE_ACL),
+            concat!(
+                r#"{"subject":"user:alice","policies":[{"entries":["#,
+                r#"{"resource":"topic:T1","actions":["PUB","SUB"],"sourceIps":["192.168.0.1"],"decision":"Allow"},"#,
+                r#"{"resource":"topic:T2","actions":["PUB","SUB"],"sourceIps":["192.168.0.1"],"decision":"Allow"}"#,
+                r#"]}]}"#
+            )
+        );
+        admin.shutdown();
+    }
+
+    /// Paired control: `policyType` is written when the caller names it, so its absence in the
+    /// short form is the construction, not an encoder that drops the key.
+    #[tokio::test]
+    async fn create_acl_object_form_writes_policy_type() {
+        let (addr, log) = auth_broker(vec![]).await;
+        let admin = started_auth_admin(&addr, "create_acl_obj").await;
+        let mut acl = Acl::new("user:bob");
+        acl.policies.push(AclPolicy {
+            policy_type: Some(POLICY_TYPE_CUSTOM.to_string()),
+            entries: vec![AclEntry {
+                resource: "group:G1".to_string(),
+                actions: vec!["ANY".to_string()],
+                source_ips: vec!["*".to_string()],
+                decision: Some(DECISION_DENY.to_string()),
+            }],
+        });
+
+        admin
+            .create_acl_with_config(&addr, &acl)
+            .await
+            .expect("3006 object form");
+
+        assert_eq!(
+            auth_body(&log, request_code::AUTH_CREATE_ACL),
+            concat!(
+                r#"{"subject":"user:bob","policies":[{"policyType":"Custom","entries":["#,
+                r#"{"resource":"group:G1","actions":["ANY"],"sourceIps":["*"],"decision":"Deny"}]}]}"#
+            )
+        );
+        admin.shutdown();
+    }
+
+    #[tokio::test]
+    async fn update_acl_short_form_sends_3007() {
+        let (addr, log) = auth_broker(vec![]).await;
+        let admin = started_auth_admin(&addr, "update_acl").await;
+
+        admin
+            .update_acl(
+                &addr,
+                "user:alice",
+                &["topic:T1"],
+                &["PUB"],
+                &["10.0.0.1"],
+                DECISION_DENY,
+            )
+            .await
+            .expect("3007 short form");
+
+        let record = auth_record(&log, request_code::AUTH_UPDATE_ACL);
+        assert_eq!(record.1, vec![("subject".to_string(), "user:alice".to_string())]);
+        assert_eq!(
+            String::from_utf8(record.2.clone()).unwrap(),
+            concat!(
+                r#"{"subject":"user:alice","policies":[{"entries":["#,
+                r#"{"resource":"topic:T1","actions":["PUB"],"sourceIps":["10.0.0.1"],"decision":"Deny"}"#,
+                r#"]}]}"#
+            )
+        );
+        admin.shutdown();
+    }
+
+    /// 3008 deletes one grant of one subject: the header table is exactly these two keys, so any
+    /// extra field the request grew would be visible here.
+    #[tokio::test]
+    async fn delete_acl_ext_fields_are_exactly_subject_and_resource() {
+        let (addr, log) = auth_broker(vec![]).await;
+        let admin = started_auth_admin(&addr, "delete_acl").await;
+
+        admin
+            .delete_acl(&addr, "user:alice", "topic:T1")
+            .await
+            .expect("3008");
+
+        let record = auth_record(&log, request_code::AUTH_DELETE_ACL);
+        assert_eq!(
+            record.1,
+            vec![
+                ("subject".to_string(), "user:alice".to_string()),
+                ("resource".to_string(), "topic:T1".to_string()),
+            ],
+            "no policyType, no decision, no body"
+        );
+        assert_eq!(record.1.len(), 2);
+        assert!(record.2.is_empty(), "3008 has no request body");
+        admin.shutdown();
+    }
+
+    #[tokio::test]
+    async fn get_acl_decodes_policies_and_a_missing_body_is_none() {
+        let (addr, log) = auth_broker(vec![(
+            request_code::AUTH_GET_ACL,
+            AuthReply::ok(concat!(
+                r#"{"subject":"user:alice","policies":[{"policyType":"Default","entries":["#,
+                r#"{"resource":"topic:T1","actions":["ANY"],"sourceIps":["*"],"decision":"Allow"}]}]}"#
+            )),
+        )])
+        .await;
+        let admin = started_auth_admin(&addr, "get_acl").await;
+
+        let acl = admin
+            .get_acl(&addr, "user:alice")
+            .await
+            .expect("3009")
+            .expect("the broker returned an acl");
+        assert_eq!(acl.subject, "user:alice");
+        assert_eq!(acl.policies.len(), 1);
+        assert_eq!(acl.policies[0].policy_type.as_deref(), Some(POLICY_TYPE_DEFAULT));
+        assert_eq!(acl.policies[0].entries[0].resource, "topic:T1");
+        assert_eq!(acl.policies[0].entries[0].actions, vec!["ANY".to_string()]);
+        assert_eq!(
+            auth_record(&log, request_code::AUTH_GET_ACL).1,
+            vec![("subject".to_string(), "user:alice".to_string())],
+            "3009 asks by subject alone"
+        );
+
+        let (addr2, _) = auth_broker(vec![]).await;
+        let empty_admin = started_auth_admin(&addr2, "get_acl_empty").await;
+        assert_eq!(empty_admin.get_acl(&addr2, "user:ghost").await.unwrap(), None);
+        admin.shutdown();
+        empty_admin.shutdown();
+    }
+
+    /// 3010 has two independent filters, and each is sent only when supplied.
+    #[tokio::test]
+    async fn list_acl_sends_only_the_filters_the_caller_supplied() {
+        let (addr, log) = auth_broker(vec![(
+            request_code::AUTH_LIST_ACL,
+            AuthReply::ok(concat!(
+                r#"[{"subject":"user:a","policies":[]},{"subject":"user:b","policies":[{"entries":["#,
+                r#"{"resource":"topic:T","actions":["SUB"],"sourceIps":["*"],"decision":"Deny"}]}]}]"#
+            )),
+        )])
+        .await;
+        let admin = started_auth_admin(&addr, "list_acl").await;
+
+        let both = admin
+            .list_acl(&addr, Some("user:*"), Some("topic:T*"))
+            .await
+            .expect("3010 with both filters");
+        assert_eq!(both.len(), 2);
+        assert_eq!(both[0].subject, "user:a");
+        assert!(both[0].policies.is_empty(), "an empty policy list stays empty");
+        assert_eq!(both[1].policies[0].entries[0].decision.as_deref(), Some(DECISION_DENY));
+        assert_eq!(
+            auth_record(&log, request_code::AUTH_LIST_ACL).1,
+            vec![
+                ("subjectFilter".to_string(), "user:*".to_string()),
+                ("resourceFilter".to_string(), "topic:T*".to_string()),
+            ]
+        );
+
+        // One filter only: the other key is absent rather than empty
+        let one = admin
+            .list_acl(&addr, None, Some("group:G1"))
+            .await
+            .expect("3010 with one filter");
+        assert_eq!(one.len(), 2);
+        let exts: Vec<Vec<(String, String)>> = lock(&log)
+            .iter()
+            .filter(|r| r.0 == request_code::AUTH_LIST_ACL)
+            .map(|r| r.1.clone())
+            .collect();
+        assert_eq!(
+            exts,
+            vec![
+                vec![
+                    ("subjectFilter".to_string(), "user:*".to_string()),
+                    ("resourceFilter".to_string(), "topic:T*".to_string()),
+                ],
+                vec![("resourceFilter".to_string(), "group:G1".to_string())],
+            ],
+            "an unset filter header is omitted, never sent empty"
+        );
+        admin.shutdown();
+    }
+
+    /// The list replies are arrays of objects; the same decoders read an empty body as no records.
+    #[tokio::test]
+    async fn list_bodies_of_no_records_decode_as_empty_not_error() {
+        let (addr, _) = auth_broker(vec![]).await;
+        let admin = started_auth_admin(&addr, "empty_lists").await;
+
+        assert!(admin.list_user(&addr, Some("*")).await.unwrap().is_empty());
+        assert!(admin.list_acl(&addr, Some("*"), None).await.unwrap().is_empty());
+        admin.shutdown();
+    }
+
+    /// Only SUCCESS (0) passes: any other response code surfaces as the port's broker error,
+    /// carrying the code and the remark.
+    #[tokio::test]
+    async fn auth_rpc_rejects_a_non_success_response_code() {
+        let (addr, log) = auth_broker(vec![(
+            request_code::AUTH_CREATE_USER,
+            AuthReply::err(response_code::NO_PERMISSION, "acl not ready"),
+        )])
+        .await;
+        let admin = started_auth_admin(&addr, "bad_code").await;
+
+        let err = admin
+            .create_user(&addr, "rocketmq", "12345678", USER_TYPE_SUPER)
+            .await
+            .expect_err("a non-SUCCESS code must not pass");
+        assert_eq!(err.response_code(), Some(response_code::NO_PERMISSION));
+        assert!(err.to_string().contains("acl not ready"), "{err}");
+        // and the request really went out before the verdict came back
+        assert_eq!(
+            auth_record(&log, request_code::AUTH_CREATE_USER).0,
+            request_code::AUTH_CREATE_USER
+        );
+        admin.shutdown();
+    }
+
+    /// The reply of a write is never parsed: SUCCESS with a record body still returns no data.
+    #[tokio::test]
+    async fn create_user_ignores_a_record_in_the_reply() {
+        let (addr, _) = auth_broker(vec![(
+            request_code::AUTH_CREATE_USER,
+            AuthReply::ok(r#"{"username":"rocketmq","userStatus":"enable"}"#),
+        )])
+        .await;
+        let admin = started_auth_admin(&addr, "void_reply").await;
+
+        admin
+            .create_user(&addr, "rocketmq", "12345678", USER_TYPE_SUPER)
+            .await
+            .expect("3001 is a void operation");
+        admin.shutdown();
+    }
+
+    /// Addressing contract: the RPC goes to exactly the address the caller passed. With the fast
+    /// channel switched on, a rewritten target would be port-2 and nothing would be recorded here.
+    #[tokio::test]
+    async fn auth_rpc_targets_the_address_the_caller_passed_even_with_vip_channel_on() {
+        let (addr, log) = auth_broker(vec![]).await;
+        let admin = DefaultMQAdminExt::new();
+        admin.set_instance_name("ADMIN_auth_vip");
+        admin.set_namesrv_addr(&addr);
+        admin.set_vip_channel_enabled(true);
+        admin.start().await.expect("start against the mock broker");
+
+        admin
+            .delete_user(&addr, "alice")
+            .await
+            .expect("3003 must arrive at the port it was given");
+
+        assert_eq!(
+            auth_record(&log, request_code::AUTH_DELETE_USER).1,
+            vec![("username".to_string(), "alice".to_string())]
+        );
+        admin.shutdown();
+    }
+
+    #[tokio::test]
+    async fn auth_rpcs_require_start() {
+        let admin = DefaultMQAdminExt::new();
+        for (name, outcome) in [
+            (
+                "create_user",
+                admin
+                    .create_user("127.0.0.1:10911", "u", "p", USER_TYPE_NORMAL)
+                    .await
+                    .err(),
+            ),
+            (
+                "get_user",
+                admin.get_user("127.0.0.1:10911", "u").await.err(),
+            ),
+            (
+                "list_acl",
+                admin
+                    .list_acl("127.0.0.1:10911", Some("*"), Some("*"))
+                    .await
+                    .err(),
+            ),
+        ] {
+            let err = outcome.unwrap_or_else(|| panic!("{name} must refuse before start()"));
+            assert!(
+                err.to_string().starts_with("MQClientException: admin not started"),
+                "{name}: {err}"
+            );
+        }
+    }
+
+    /// The header names are wire-visible; a rename here silently asks the broker for nothing.
+    #[test]
+    fn auth_ext_field_names_match_the_protocol_spelling() {
+        let mut pairs = vec![
+            ("username", "u".to_string()),
+            ("filter", "f".to_string()),
+            ("subject", "user:u".to_string()),
+            ("resource", "topic:T".to_string()),
+        ];
+        pairs.push(("subjectFilter", "user:*".to_string()));
+        pairs.push(("resourceFilter", "topic:*".to_string()));
+        let ext = ext_pairs(&pairs);
+        for key in [
+            "username",
+            "filter",
+            "subject",
+            "resource",
+            "subjectFilter",
+            "resourceFilter",
+        ] {
+            assert!(ext.contains_key(key), "{key} missing");
+        }
+        assert!(!ext.contains_key("userName"), "no camel-case drift on username");
+        assert!(!ext.contains_key("subjects"), "the subject header is singular");
+        assert!(!ext.contains_key("resourceFilters"), "the filter headers are singular");
+    }
+
+    // ---------------------------------------------------------------- metadata paging
+
+    fn paging_client(id: &str) -> MQClientInstance {
+        MQClientInstance::with_config(
+            id,
+            vec!["127.0.0.1:9876".to_string()],
+            MQClientInstanceConfig::default(),
+        )
+    }
+
+    /// Wires the admin to a client whose RPCs are served from canned replies, no broker.
+    fn admin_on(client: &MQClientInstance, page_size: i32) -> DefaultMQAdminExt {
+        let admin = DefaultMQAdminExt::new();
+        admin.update_config(|c| {
+            c.max_page_size_in_get_metadata = page_size;
+            c.timeout_millis = 5_000;
+        });
+        *lock(&admin.inner.client) = Some(client.clone());
+        admin.inner.started.store(true, Ordering::Release);
+        admin
+    }
+
+    fn version_value(counter: i64) -> Value {
+        json!({"counter": counter, "timestamp": 1_700_000_000_000i64 + counter})
+    }
+
+    fn topic_page(counter: i64, names: &[&str]) -> Vec<u8> {
+        let mut wrapper = TopicConfigSerializeWrapper::new();
+        wrapper.data_version = version_value(counter);
+        for name in names {
+            wrapper
+                .topic_config_table
+                .push(((*name).to_string(), json!({"topicName": name})));
+        }
+        RemotingSerializable::encode(&wrapper.to_json_value())
+    }
+
+    fn group_page(counter: i64, names: &[&str]) -> Vec<u8> {
+        let mut wrapper = SubscriptionGroupWrapper::new();
+        wrapper.data_version = version_value(counter);
+        for name in names {
+            wrapper.subscription_group_table.push((
+                (*name).to_string(),
+                SubscriptionGroupConfig {
+                    group_name: (*name).to_string(),
+                    ..Default::default()
+                },
+            ));
+        }
+        RemotingSerializable::encode(&wrapper.to_json_value())
+    }
+
+    fn page_reply(body: Vec<u8>, total_key: &str, total: Option<i32>) -> RemotingCommand {
+        let mut reply = RemotingCommand::create_response(response_code::SUCCESS, None);
+        reply.set_body(Some(body));
+        if let Some(total) = total {
+            reply.add_ext_field(total_key, &total.to_string());
+        }
+        reply
+    }
+
+    fn paging_requests(client: &MQClientInstance, code: i32) -> Vec<ExtFields> {
+        client
+            .recorded_requests()
+            .into_iter()
+            .filter(|(request, _)| *request == code)
+            .map(|(_, ext)| ext)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn topic_paging_advances_by_the_returned_page_size() {
+        let client = paging_client("cfg-paging-topic-size");
+        client.queue_canned_reply(
+            request_code::GET_ALL_TOPIC_CONFIG,
+            page_reply(topic_page(1, &["A", "B"]), "totalTopicNum", Some(4)),
+        );
+        client.queue_canned_reply(
+            request_code::GET_ALL_TOPIC_CONFIG,
+            page_reply(topic_page(1, &["C", "D"]), "totalTopicNum", Some(4)),
+        );
+        let admin = admin_on(&client, 5);
+
+        let merged = admin
+            .get_all_topic_config("127.0.0.1:10911", None)
+            .await
+            .unwrap();
+
+        let names: Vec<&str> = merged
+            .topic_config_table
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(names, vec!["A", "B", "C", "D"]);
+        assert_eq!(merged.data_version, version_value(1));
+
+        let requests = paging_requests(&client, request_code::GET_ALL_TOPIC_CONFIG);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].get("topicSeq"), Some("0"));
+        assert_eq!(requests[0].get("maxTopicNum"), Some("5"));
+        assert_eq!(requests[0].get("dataVersion"), Some(""));
+        // The cursor moves by the two topics the broker returned, not by the requested five.
+        assert_eq!(requests[1].get("topicSeq"), Some("2"));
+        let v1 = RemotingSerializable::to_json_string(&version_value(1));
+        assert_eq!(requests[1].get("dataVersion"), Some(v1.as_str()));
+    }
+
+    #[tokio::test]
+    async fn topic_paging_restarts_from_zero_on_a_version_change() {
+        let client = paging_client("cfg-paging-topic-version");
+        for (page, total) in [
+            (topic_page(1, &["A", "B"]), 4),
+            (topic_page(2, &["C"]), 4),
+            (topic_page(2, &["A", "B"]), 4),
+            (topic_page(2, &["C", "D"]), 4),
+        ] {
+            client.queue_canned_reply(
+                request_code::GET_ALL_TOPIC_CONFIG,
+                page_reply(page, "totalTopicNum", Some(total)),
+            );
+        }
+        let admin = admin_on(&client, 2);
+
+        let merged = admin
+            .get_all_topic_config("127.0.0.1:10911", None)
+            .await
+            .unwrap();
+
+        let names: Vec<&str> = merged
+            .topic_config_table
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(names, vec!["A", "B", "C", "D"]);
+        assert_eq!(merged.data_version, version_value(2));
+
+        let requests = paging_requests(&client, request_code::GET_ALL_TOPIC_CONFIG);
+        let seqs: Vec<Option<&str>> = requests.iter().map(|ext| ext.get("topicSeq")).collect();
+        assert_eq!(seqs, vec![Some("0"), Some("2"), Some("0"), Some("2")]);
+        let v1 = RemotingSerializable::to_json_string(&version_value(1));
+        let v2 = RemotingSerializable::to_json_string(&version_value(2));
+        let versions: Vec<Option<&str>> =
+            requests.iter().map(|ext| ext.get("dataVersion")).collect();
+        assert_eq!(
+            versions,
+            vec![Some(""), Some(v1.as_str()), Some(v2.as_str()), Some(v2.as_str())]
+        );
+    }
+
+    #[tokio::test]
+    async fn topic_paging_stops_after_one_page_without_a_total() {
+        let client = paging_client("cfg-paging-topic-legacy");
+        client.queue_canned_reply(
+            request_code::GET_ALL_TOPIC_CONFIG,
+            page_reply(topic_page(3, &["A", "B"]), "totalTopicNum", None),
+        );
+        let admin = admin_on(&client, 2);
+
+        let merged = admin
+            .get_all_topic_config("127.0.0.1:10911", None)
+            .await
+            .unwrap();
+
+        assert_eq!(merged.topic_config_table.len(), 2);
+        assert_eq!(merged.data_version, version_value(3));
+        assert_eq!(
+            paging_requests(&client, request_code::GET_ALL_TOPIC_CONFIG).len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn group_paging_uses_the_same_cursor_and_restart_rules() {
+        let client = paging_client("cfg-paging-group");
+        client.queue_canned_reply(
+            request_code::GET_ALL_SUBSCRIPTIONGROUP_CONFIG,
+            page_reply(group_page(1, &["G1", "G2"]), "totalGroupNum", Some(4)),
+        );
+        client.queue_canned_reply(
+            request_code::GET_ALL_SUBSCRIPTIONGROUP_CONFIG,
+            page_reply(group_page(1, &["G3", "G4"]), "totalGroupNum", Some(4)),
+        );
+        let admin = admin_on(&client, 3);
+
+        let merged = admin
+            .get_all_subscription_group("127.0.0.1:10911", None)
+            .await
+            .unwrap();
+
+        let names: Vec<&str> = merged
+            .subscription_group_table
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(names, vec!["G1", "G2", "G3", "G4"]);
+        assert_eq!(merged.data_version, version_value(1));
+
+        let requests = paging_requests(&client, request_code::GET_ALL_SUBSCRIPTIONGROUP_CONFIG);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].get("groupSeq"), Some("0"));
+        assert_eq!(requests[0].get("maxGroupNum"), Some("3"));
+        assert_eq!(requests[0].get("dataVersion"), Some(""));
+        assert_eq!(requests[1].get("groupSeq"), Some("2"));
+        let v1 = RemotingSerializable::to_json_string(&version_value(1));
+        assert_eq!(requests[1].get("dataVersion"), Some(v1.as_str()));
+    }
+
+    #[tokio::test]
+    async fn group_paging_restarts_at_zero_under_the_new_version() {
+        let client = paging_client("cfg-paging-group-restart");
+        client.queue_canned_reply(
+            request_code::GET_ALL_SUBSCRIPTIONGROUP_CONFIG,
+            page_reply(group_page(1, &["G1"]), "totalGroupNum", Some(3)),
+        );
+        client.queue_canned_reply(
+            request_code::GET_ALL_SUBSCRIPTIONGROUP_CONFIG,
+            page_reply(group_page(2, &["G2"]), "totalGroupNum", Some(3)),
+        );
+        client.queue_canned_reply(
+            request_code::GET_ALL_SUBSCRIPTIONGROUP_CONFIG,
+            page_reply(group_page(2, &["F1"]), "totalGroupNum", Some(3)),
+        );
+        client.queue_canned_reply(
+            request_code::GET_ALL_SUBSCRIPTIONGROUP_CONFIG,
+            page_reply(group_page(2, &["F2"]), "totalGroupNum", Some(3)),
+        );
+        let admin = admin_on(&client, 1);
+
+        let merged = admin
+            .get_all_subscription_group("127.0.0.1:10911", None)
+            .await
+            .unwrap();
+
+        let names: Vec<&str> = merged
+            .subscription_group_table
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(names, vec!["F1", "F2"]);
+        assert_eq!(merged.data_version, version_value(2));
+
+        let requests = paging_requests(&client, request_code::GET_ALL_SUBSCRIPTIONGROUP_CONFIG);
+        assert_eq!(requests.len(), 4);
+        let seqs: Vec<Option<&str>> = requests
+            .iter()
+            .map(|ext| ext.get("groupSeq"))
+            .collect();
+        assert_eq!(seqs, vec![Some("0"), Some("1"), Some("0"), Some("1")]);
+        let v1 = RemotingSerializable::to_json_string(&version_value(1));
+        let v2 = RemotingSerializable::to_json_string(&version_value(2));
+        let versions: Vec<Option<&str>> = requests
+            .iter()
+            .map(|ext| ext.get("dataVersion"))
+            .collect();
+        assert_eq!(
+            versions,
+            vec![Some(""), Some(v1.as_str()), Some(v2.as_str()), Some(v2.as_str())]
+        );
+    }
+
+    // ---------------------------------------------------------------- admin long tail
+
+    fn long_tail_client(id: &str) -> MQClientInstance {
+        paging_client(id)
+    }
+
+    fn success_reply() -> RemotingCommand {
+        RemotingCommand::create_response(response_code::SUCCESS, None)
+    }
+
+    fn reply_with_body(body: Vec<u8>) -> RemotingCommand {
+        let mut reply = success_reply();
+        reply.set_body(Some(body));
+        reply
+    }
+
+    fn reply_with_ext(ext: &[(&str, &str)]) -> RemotingCommand {
+        let mut reply = success_reply();
+        for (key, value) in ext {
+            reply.add_ext_field(key, value);
+        }
+        reply
+    }
+
+    fn requests_of(client: &MQClientInstance, code: i32) -> Vec<ExtFields> {
+        paging_requests(client, code)
+    }
+
+    fn timeouts_of(client: &MQClientInstance, code: i32) -> Vec<i64> {
+        client
+            .recorded_timeouts()
+            .into_iter()
+            .filter(|(seen, _)| *seen == code)
+            .map(|(_, timeout)| timeout)
+            .collect()
+    }
+
+    fn route_reply(brokers: &[(&str, &str)]) -> RemotingCommand {
+        let broker_datas: Vec<Value> = brokers
+            .iter()
+            .map(|(name, addr)| {
+                json!({
+                    "cluster": "DefaultCluster",
+                    "brokerName": name,
+                    "brokerAddrs": {"0": addr},
+                    "zoneName": "",
+                    "enableActingMaster": false,
+                })
+            })
+            .collect();
+        let queue_datas: Vec<Value> = brokers
+            .iter()
+            .map(|(name, _)| {
+                json!({
+                    "brokerName": name,
+                    "readQueueNums": 2,
+                    "writeQueueNums": 2,
+                    "perm": 6,
+                    "topicSysFlag": 0,
+                })
+            })
+            .collect();
+        let body = json!({
+            "brokerDatas": broker_datas,
+            "queueDatas": queue_datas,
+            "filterServerTable": {},
+        });
+        reply_with_body(RemotingSerializable::encode(&body))
+    }
+
+    fn topic_stats_body(broker: &str, queue_id: i32, tps: f64) -> Vec<u8> {
+        let mut table = TopicStatsTable::new();
+        table.offset_table.push((
+            MessageQueueKey::new("T", broker, queue_id),
+            TopicOffset::new(0, 10, 0),
+        ));
+        table.topic_put_tps = tps;
+        RemotingSerializable::encode(&table.to_json_value())
+    }
+
+    fn consume_stats_body(broker: &str, topic: &str, tps: f64) -> Vec<u8> {
+        let mut stats = ConsumeStats::new();
+        stats.offset_table.push((
+            MessageQueueKey::new(topic, broker, 0),
+            OffsetWrapper::new(100, 40, 0, 0),
+        ));
+        stats.consume_tps = tps;
+        stats.encode()
+    }
+
+    fn connection_reply(consume_type: &str, message_model: &str) -> Vec<u8> {
+        ConsumerConnection {
+            connection_set: vec![Connection::default()],
+            consume_type: Some(consume_type.to_string()),
+            message_model: Some(message_model.to_string()),
+            ..Default::default()
+        }
+        .encode()
+    }
+
+    type AdminLog = Arc<Mutex<Vec<(i32, ExtFields, Option<Vec<u8>>)>>>;
+
+    /// Script entry: (request code, response code, response body, response ext fields).
+    /// Unscripted codes get a bare SUCCESS, which also covers the start-up chatter.
+    async fn spawn_admin_broker(
+        listener: tokio::net::TcpListener,
+        script: Vec<(i32, i32, Option<Vec<u8>>, Vec<(String, String)>)>,
+    ) -> AdminLog {
+        use tokio::io::AsyncWriteExt as _;
+        let log: AdminLog = Arc::new(Mutex::new(Vec::new()));
+        let inner = Arc::clone(&log);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let log = Arc::clone(&inner);
+                let script = script.clone();
+                tokio::spawn(async move {
+                    while let Some(frame) = read_frame(&mut stream).await {
+                        let Ok(request) = RemotingCommand::decode(&frame) else {
+                            return;
+                        };
+                        lock(&log).push((
+                            request.code,
+                            request.ext_fields().clone(),
+                            request.body.clone(),
+                        ));
+                        if request.is_oneway_rpc() {
+                            continue;
+                        }
+                        let hit = script.iter().find(|(want, ..)| *want == request.code);
+                        let (code, body, ext) = match hit {
+                            Some((_, code, body, ext)) => (*code, body.clone(), ext.clone()),
+                            None => (response_code::SUCCESS, None, Vec::new()),
+                        };
+                        let mut response = reply_for(&request, code, body);
+                        for (key, value) in &ext {
+                            response.add_ext_field(key, value);
+                        }
+                        let bytes = response.encode();
+                        let _ = stream.write_all(&bytes).await;
+                        let _ = stream.flush().await;
+                    }
+                });
+            }
+        });
+        log
+    }
+
+    async fn bind_admin_mock() -> (tokio::net::TcpListener, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock");
+        let addr = listener.local_addr().expect("mock addr").to_string();
+        (listener, addr)
+    }
+
+    /// The client the admin internally started with (test access to the recorded traffic).
+    fn admin_client(admin: &DefaultMQAdminExt) -> MQClientInstance {
+        lock(&admin.inner.client)
+            .clone()
+            .expect("admin was started with a client")
+    }
+
+    fn log_codes(log: &AdminLog) -> Vec<i32> {
+        lock(log).iter().map(|(code, _, _)| *code).collect()
+    }
+
+    fn logged_request(log: &AdminLog, code: i32) -> (ExtFields, Option<Vec<u8>>) {
+        let snapshot = lock(log);
+        let hit = snapshot
+            .iter()
+            .find(|(seen, _, _)| *seen == code)
+            .unwrap_or_else(|| panic!("no request {code} in the mock log"));
+        (hit.1.clone(), hit.2.clone())
+    }
+
+    #[tokio::test]
+    async fn container_add_remove_wire_shape_and_20s_timeout() {
+        let (listener, addr) = bind_admin_mock().await;
+        let log = spawn_admin_broker(listener, Vec::new()).await;
+        let admin = started_direct_admin(&addr).await;
+
+        admin
+            .add_broker_to_container(&addr, "/rm/broker-a.conf")
+            .await
+            .expect("add broker to container");
+        admin
+            .remove_broker_from_container(&addr, "DefaultCluster", "broker-a", 3)
+            .await
+            .expect("remove broker from container");
+
+        let (add_ext, add_body) = logged_request(&log, request_code::ADD_BROKER);
+        assert_eq!(add_ext.get("configPath"), Some("/rm/broker-a.conf"));
+        assert_eq!(add_ext.len(), 1, "configPath is the only header field");
+        assert!(add_body.is_none(), "the add carries no body");
+
+        let (remove_ext, remove_body) = logged_request(&log, request_code::REMOVE_BROKER);
+        assert_eq!(remove_ext.get("brokerName"), Some("broker-a"));
+        assert_eq!(remove_ext.get("brokerClusterName"), Some("DefaultCluster"));
+        assert_eq!(remove_ext.get("brokerId"), Some("3"));
+        assert!(remove_body.is_none());
+
+        let client = admin_client(&admin);
+        assert_eq!(
+            timeouts_of(&client, request_code::ADD_BROKER),
+            vec![ADMIN_CONTAINER_TIMEOUT_MILLIS],
+            "the container add uses the fixed 20s"
+        );
+        assert_eq!(
+            timeouts_of(&client, request_code::REMOVE_BROKER),
+            vec![ADMIN_CONTAINER_TIMEOUT_MILLIS]
+        );
+        admin.shutdown();
+    }
+
+    #[tokio::test]
+    async fn controller_metadata_decodes_the_response_header() {
+        let client = long_tail_client("long-tail-ctrl-meta");
+        let mut reply = reply_with_ext(&[
+            ("group", "ctr-group"),
+            ("controllerLeaderId", "ctr-1"),
+            ("controllerLeaderAddress", "10.9.9.9:9878"),
+            ("isLeader", "true"),
+            ("peers", "ctr-1:10.9.9.9:9878;ctr-2:10.9.9.10:9878"),
+        ]);
+        reply.add_ext_field("nonsenseField", "ignored");
+        client.queue_canned_reply(request_code::CONTROLLER_GET_METADATA_INFO, reply);
+        let admin = admin_on(&client, 2000);
+
+        let meta = admin
+            .get_controller_metadata("10.9.9.9:9878")
+            .await
+            .expect("metadata");
+        assert_eq!(meta.group.as_deref(), Some("ctr-group"));
+        assert_eq!(meta.controller_leader_id.as_deref(), Some("ctr-1"));
+        assert_eq!(meta.controller_leader_address.as_deref(), Some("10.9.9.9:9878"));
+        assert!(meta.is_leader);
+        assert_eq!(
+            meta.peers.as_deref(),
+            Some("ctr-1:10.9.9.9:9878;ctr-2:10.9.9.10:9878")
+        );
+
+        let requests = requests_of(&client, request_code::CONTROLLER_GET_METADATA_INFO);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].len(), 0, "the metadata query carries no header");
+    }
+
+    #[tokio::test]
+    async fn sync_state_two_phase_goes_to_the_leader_with_a_broker_list_body() {
+        let (listener, addr) = bind_admin_mock().await;
+        let replicas = BrokerReplicasInfo::new();
+        let mut meta_ext: Vec<(String, String)> =
+            vec![("controllerLeaderAddress".to_string(), addr.clone())];
+        meta_ext.push(("isLeader".to_string(), "false".to_string()));
+        let log = spawn_admin_broker(
+            listener,
+            vec![
+                (
+                    request_code::CONTROLLER_GET_METADATA_INFO,
+                    response_code::SUCCESS,
+                    None,
+                    meta_ext,
+                ),
+                (
+                    request_code::CONTROLLER_GET_SYNC_STATE_DATA,
+                    response_code::SUCCESS,
+                    Some(RemotingSerializable::encode(&replicas.to_json_value())),
+                    Vec::new(),
+                ),
+            ],
+        )
+        .await;
+        let admin = started_direct_admin(&addr).await;
+
+        let state = admin
+            .get_in_sync_state_data(&addr, &["broker-b".to_string()])
+            .await
+            .expect("sync state");
+
+        assert!(state.replicas_info_table.is_empty());
+        let codes = log_codes(&log);
+        assert_eq!(
+            codes.iter().filter(|c| **c == request_code::CONTROLLER_GET_METADATA_INFO).count(),
+            1,
+            "phase one: the metadata query"
+        );
+        let (sync_ext, sync_body) =
+            logged_request(&log, request_code::CONTROLLER_GET_SYNC_STATE_DATA);
+        assert!(sync_ext.is_empty(), "the sync state request has no header");
+        assert_eq!(
+            sync_body.as_deref(),
+            Some(br#"["broker-b"]"#.as_ref()),
+            "the body is the bare JSON array of broker names"
+        );
+        let client = admin_client(&admin);
+        assert_eq!(
+            timeouts_of(&client, request_code::CONTROLLER_GET_METADATA_INFO),
+            vec![CONTROLLER_RPC_TIMEOUT_MILLIS]
+        );
+        assert_eq!(
+            timeouts_of(&client, request_code::CONTROLLER_GET_SYNC_STATE_DATA),
+            vec![CONTROLLER_RPC_TIMEOUT_MILLIS]
+        );
+        admin.shutdown();
+    }
+
+    #[tokio::test]
+    async fn controller_config_reads_properties_and_falls_back_to_name_servers() {
+        let client = long_tail_client("long-tail-ctrl-config");
+        client.queue_canned_reply(
+            request_code::GET_CONTROLLER_CONFIG,
+            reply_with_body(b"ctrSyncTopicEnable = true\nx = 1\n".to_vec()),
+        );
+        client.queue_canned_reply(
+            request_code::GET_CONTROLLER_CONFIG,
+            reply_with_body(b"other = 2\n".to_vec()),
+        );
+        let admin = admin_on(&client, 2000);
+
+        // Explicit servers first.
+        let configs = admin
+            .get_controller_config(&["10.9.9.9:9878".to_string()])
+            .await
+            .expect("controller config")
+            .expect("one server answered");
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].0, "10.9.9.9:9878");
+        assert_eq!(configs[0].1.get("ctrSyncTopicEnable"), Some("true"));
+        assert_eq!(configs[0].1.get("x"), Some("1"));
+
+        // Without servers: the name server list takes over.
+        let fallback = admin
+            .get_controller_config(&[])
+            .await
+            .expect("fallback config")
+            .expect("the configured name server list is not empty");
+        assert_eq!(fallback[0].0, "127.0.0.1:9876");
+        assert_eq!(fallback[0].1.get("other"), Some("2"));
+
+        let requests = requests_of(&client, request_code::GET_CONTROLLER_CONFIG);
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|ext| ext.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn controller_config_with_no_servers_returns_none_without_io() {
+        let admin = DefaultMQAdminExt::new();
+        admin.update_config(|c| c.name_server_addrs.clear());
+        let started = admin.start().await;
+        assert!(started.is_err(), "no name server: start rolls back");
+        // Not started, but the empty-servers short circuit fires before any IO or start check.
+        let none = admin
+            .get_controller_config(&[])
+            .await
+            .expect("no servers means no call");
+        assert!(none.is_none());
+    }
+
+    #[tokio::test]
+    async fn update_controller_config_silent_on_empty_last_error_wins() {
+        let client = long_tail_client("long-tail-ctrl-update");
+        let admin = admin_on(&client, 2000);
+
+        // Empty properties: silent no-op, no RPC.
+        admin
+            .update_controller_config(&StringMap::new(), &["10.9.9.9:9878".to_string()])
+            .await
+            .expect("empty properties are a no-op");
+        assert!(requests_of(&client, request_code::UPDATE_CONTROLLER_CONFIG).is_empty());
+
+        // Both controllers reject; the LAST response's code and remark win.
+        let mut first = RemotingCommand::create_response(16, None);
+        first.remark = Some("first failure".to_string());
+        client.queue_canned_reply(request_code::UPDATE_CONTROLLER_CONFIG, first);
+        let mut second = RemotingCommand::create_response(3, None);
+        second.remark = Some("last failure".to_string());
+        client.queue_canned_reply(request_code::UPDATE_CONTROLLER_CONFIG, second);
+
+        let mut props = StringMap::new();
+        props.insert("ctrSyncTopicEnable".to_string(), "false".to_string());
+        let err = admin
+            .update_controller_config(&props, &["10.9.9.9:9878".to_string(), "10.9.9.10:9878".to_string()])
+            .await
+            .expect_err("both controllers rejected");
+        assert_eq!(err.response_code(), Some(3), "the last non-SUCCESS wins");
+        assert!(err.to_string().contains("last failure"));
+
+        let requests = requests_of(&client, request_code::UPDATE_CONTROLLER_CONFIG);
+        assert_eq!(requests.len(), 2, "one request per controller");
+        assert!(requests.iter().all(|ext| ext.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn clean_controller_broker_data_header_shape() {
+        let client = long_tail_client("long-tail-ctrl-clean");
+        let mut leader = reply_with_ext(&[("controllerLeaderAddress", "10.9.9.9:9878")]);
+        leader.add_ext_field("isLeader", "false");
+        client.queue_canned_reply(request_code::CONTROLLER_GET_METADATA_INFO, leader);
+        client.queue_canned_reply(request_code::CLEAN_BROKER_DATA, success_reply());
+        let admin = admin_on(&client, 2000);
+
+        admin
+            .clean_controller_broker_data(
+                "10.9.9.1:9878",
+                None,
+                "broker-a",
+                None,
+                false,
+            )
+            .await
+            .expect("clean broker data");
+
+        let (ext, body) = logged_via_requests(&client, request_code::CLEAN_BROKER_DATA);
+        assert_eq!(ext.get("brokerName"), Some("broker-a"));
+        assert_eq!(ext.get("isCleanLivingBroker"), Some("false"));
+        assert!(ext.contains_key("invokeTime"), "invokeTime is always sent");
+        assert!(!ext.contains_key("clusterName"));
+        assert!(!ext.contains_key("brokerControllerIdsToClean"));
+        assert!(body.is_none());
+
+        // The nullable fields land when the caller supplies them, and the boolean is a wire
+        // string either way.
+        let mut leader2 = reply_with_ext(&[("controllerLeaderAddress", "10.9.9.9:9878")]);
+        leader2.add_ext_field("isLeader", "false");
+        client.queue_canned_reply(request_code::CONTROLLER_GET_METADATA_INFO, leader2);
+        client.queue_canned_reply(request_code::CLEAN_BROKER_DATA, success_reply());
+        admin
+            .clean_controller_broker_data(
+                "10.9.9.1:9878",
+                Some("DefaultCluster"),
+                "broker-a",
+                Some("ctr-1;ctr-2"),
+                true,
+            )
+            .await
+            .expect("clean broker data with the full header");
+        let (ext, _) = logged_via_requests(&client, request_code::CLEAN_BROKER_DATA);
+        assert_eq!(ext.get("clusterName"), Some("DefaultCluster"));
+        assert_eq!(ext.get("brokerControllerIdsToClean"), Some("ctr-1;ctr-2"));
+        assert_eq!(ext.get("isCleanLivingBroker"), Some("true"));
+    }
+
+    /// recorded_requests carries no body, so the body-shaped requests assert through the mock.
+    fn logged_via_requests(client: &MQClientInstance, _code: i32) -> (ExtFields, Option<Vec<u8>>) {
+        let ext = requests_of(client, _code);
+        (ext.last().cloned().unwrap_or_default(), None)
+    }
+
+    #[tokio::test]
+    async fn cold_data_update_and_remove_body_shapes() {
+        let (listener, addr) = bind_admin_mock().await;
+        let log = spawn_admin_broker(listener, Vec::new()).await;
+        let admin = started_direct_admin(&addr).await;
+
+        let mut props = StringMap::new();
+        props.insert("coldFlowCtr.groupName".to_string(), "GID_a".to_string());
+        props.insert("coldFlowCtr.enable".to_string(), "true".to_string());
+        admin
+            .update_cold_data_flow_ctr_group_config(&addr, &props)
+            .await
+            .expect("update cold data config");
+
+        let (_, body) = logged_request(&log, request_code::UPDATE_COLD_DATA_FLOW_CTR_CONFIG);
+        assert_eq!(
+            body.as_deref(),
+            Some(MixAll::properties_to_string(&props, false).as_bytes()),
+            "the properties ride the body as k=v text"
+        );
+
+        admin
+            .remove_cold_data_flow_ctr_group_config(&addr, "GID_a")
+            .await
+            .expect("remove cold data config");
+        let (ext, body) = logged_request(&log, request_code::REMOVE_COLD_DATA_FLOW_CTR_CONFIG);
+        assert!(ext.is_empty());
+        assert_eq!(body.as_deref(), Some(b"GID_a".as_ref()), "the plain group string, not JSON");
+
+        // Empty payloads skip the RPC entirely.
+        let before = lock(&log).len();
+        admin
+            .update_cold_data_flow_ctr_group_config(&addr, &StringMap::new())
+            .await
+            .expect("empty properties are skipped");
+        admin
+            .remove_cold_data_flow_ctr_group_config(&addr, "")
+            .await
+            .expect("empty group is skipped");
+        assert_eq!(lock(&log).len(), before, "no request went out");
+        admin.shutdown();
+    }
+
+    #[tokio::test]
+    async fn cold_data_info_dials_the_listening_port_verbatim_even_with_vip_on() {
+        let (listener, addr) = bind_admin_mock().await;
+        let log = spawn_admin_broker(
+            listener,
+            vec![(
+                request_code::GET_COLD_DATA_FLOW_CTR_INFO,
+                response_code::SUCCESS,
+                Some(b"coldFlowCtr.enable=true\n".to_vec()),
+                Vec::new(),
+            )],
+        )
+        .await;
+        let admin = started_direct_admin(&addr).await;
+        admin.set_vip_channel_enabled(true);
+
+        // The switch would move a rewritten broker dial two ports down; this read still lands
+        // on the address the caller passed, so the mock at exactly that address serves it.
+        let info = admin
+            .get_cold_data_flow_ctr_info(&addr)
+            .await
+            .expect("cold data info without a rewrite");
+        assert_eq!(info.as_deref(), Some("coldFlowCtr.enable=true\n"));
+        assert_eq!(
+            log_codes(&log),
+            vec![request_code::GET_COLD_DATA_FLOW_CTR_INFO],
+            "exactly one request, dialed verbatim"
+        );
+
+        admin.shutdown();
+    }
+
+    #[tokio::test]
+    async fn read_ahead_mode_ext_key_and_remark() {
+        let client = long_tail_client("long-tail-read-ahead");
+        let mut ok = success_reply();
+        ok.remark = Some("NORMAL".to_string());
+        client.queue_canned_reply(request_code::SET_COMMITLOG_READ_MODE, ok);
+        client.queue_canned_reply(request_code::SET_COMMITLOG_READ_MODE, success_reply());
+        let admin = admin_on(&client, 2000);
+
+        let remark = admin
+            .set_commit_log_read_ahead_mode("10.0.0.10:10911", "NORMAL")
+            .await
+            .expect("read ahead mode");
+        assert_eq!(remark.as_deref(), Some("NORMAL"), "the remark is the result");
+
+        let none = admin
+            .set_commit_log_read_ahead_mode("10.0.0.10:10911", "UNKNOWN")
+            .await
+            .expect("no remark reads as none");
+        assert_eq!(none, None);
+
+        let requests = requests_of(&client, request_code::SET_COMMITLOG_READ_MODE);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].get(READ_AHEAD_MODE_EXT_KEY), Some("NORMAL"));
+        assert_eq!(requests[0].len(), 1, "READ_AHEAD_MODE is the only field");
+        assert_eq!(requests[1].get(READ_AHEAD_MODE_EXT_KEY), Some("UNKNOWN"));
+    }
+
+    #[tokio::test]
+    async fn pop_rollback_forwards_the_caller_timeout() {
+        let (listener, addr) = bind_admin_mock().await;
+        let log = spawn_admin_broker(listener, Vec::new()).await;
+        let admin = started_direct_admin(&addr).await;
+
+        admin
+            .export_pop_records(&addr, 4321)
+            .await
+            .expect("pop rollback");
+
+        let (ext, body) = logged_request(&log, request_code::POP_ROLLBACK);
+        assert!(ext.is_empty(), "no header, no body");
+        assert!(body.is_none());
+        let client = admin_client(&admin);
+        assert_eq!(
+            timeouts_of(&client, request_code::POP_ROLLBACK),
+            vec![4321],
+            "the caller's timeout goes out verbatim"
+        );
+        admin.shutdown();
+    }
+
+    #[tokio::test]
+    async fn rocksdb_check_and_export_wire_shape() {
+        let client = long_tail_client("long-tail-rocksdb");
+        client.queue_canned_reply(
+            request_code::CHECK_ROCKSDB_CQ_WRITE_PROGRESS,
+            reply_with_body(RemotingSerializable::encode(
+                &CheckRocksdbCqWriteResult {
+                    check_result: Some("ok".to_string()),
+                    check_status: 0,
+                }
+                .to_json_value(),
+            )),
+        );
+        client.queue_canned_reply(request_code::EXPORT_ROCKSDB_CONFIG_TO_JSON, success_reply());
+        let admin = admin_on(&client, 2000);
+
+        let progress = admin
+            .check_rocksdb_cq_write_progress("10.0.0.10:10911", "T", 0)
+            .await
+            .expect("check progress");
+        assert_eq!(progress.check_result.as_deref(), Some("ok"));
+        assert_eq!(progress.status(), Some(CheckRocksdbCqWriteStatus::CheckOk));
+
+        admin
+            .export_rocksdb_config_to_json(
+                "10.0.0.10:10911",
+                &[RocksdbConfigType::Topics, RocksdbConfigType::SubscriptionGroups],
+            )
+            .await
+            .expect("export rocksdb config");
+
+        let checks = requests_of(&client, request_code::CHECK_ROCKSDB_CQ_WRITE_PROGRESS);
+        assert_eq!(checks[0].get("topic"), Some("T"));
+        assert_eq!(
+            checks[0].get("checkStoreTime"),
+            Some("0"),
+            "the primitive long is sent even when zero"
+        );
+        let exports = requests_of(&client, request_code::EXPORT_ROCKSDB_CONFIG_TO_JSON);
+        assert_eq!(
+            exports[0].get("configType"),
+            Some("topics;subscriptionGroups;"),
+            "the separator trails every entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn lite_family_wire_shapes() {
+        let client = long_tail_client("long-tail-lite");
+        for code in [
+            request_code::GET_BROKER_LITE_INFO,
+            request_code::GET_PARENT_TOPIC_INFO,
+            request_code::GET_LITE_TOPIC_INFO,
+            request_code::GET_LITE_CLIENT_INFO,
+            request_code::GET_LITE_GROUP_INFO,
+            request_code::TRIGGER_LITE_DISPATCH,
+        ] {
+            client.queue_canned_reply(code, success_reply());
+            client.queue_canned_reply(code, success_reply());
+        }
+        let admin = admin_on(&client, 2000);
+        let addr = "10.0.0.10:10911";
+
+        admin.get_broker_lite_info(addr).await.expect("broker lite info");
+        admin.get_parent_topic_info(addr, "T").await.expect("parent topic info");
+        admin.get_lite_topic_info(addr, "T", Some("L1")).await.expect("lite topic info");
+        admin.get_lite_topic_info(addr, "T", None).await.expect("lite topic info, no lite filter");
+        admin
+            .get_lite_client_info(addr, "T", "GID_a", Some("cid-1"))
+            .await
+            .expect("lite client info");
+        admin
+            .get_lite_client_info(addr, "T", "GID_a", None)
+            .await
+            .expect("lite client info without client");
+        admin.get_lite_group_info(addr, "GID_a", None, 7).await.expect("lite group info");
+        admin
+            .trigger_lite_dispatch(addr, "GID_a", Some("cid-1"))
+            .await
+            .expect("trigger dispatch");
+
+        let broker_lite = requests_of(&client, request_code::GET_BROKER_LITE_INFO);
+        assert_eq!(broker_lite[0].len(), 0, "no header at all");
+
+        let parent = requests_of(&client, request_code::GET_PARENT_TOPIC_INFO);
+        assert_eq!(parent[0].get("topic"), Some("T"));
+
+        let lite_topic = requests_of(&client, request_code::GET_LITE_TOPIC_INFO);
+        assert_eq!(lite_topic[0].get("parentTopic"), Some("T"));
+        assert_eq!(lite_topic[0].get("liteTopic"), Some("L1"));
+        assert_eq!(
+            lite_topic[1].get("liteTopic"), None,
+            "the optional lite filter is omitted when absent"
+        );
+
+        let lite_client = requests_of(&client, request_code::GET_LITE_CLIENT_INFO);
+        assert_eq!(lite_client[0].get("parentTopic"), Some("T"));
+        assert_eq!(lite_client[0].get("group"), Some("GID_a"));
+        assert_eq!(lite_client[0].get("clientId"), Some("cid-1"));
+        assert_eq!(
+            lite_client[0].get("maxCount"),
+            Some("1000"),
+            "the primitive default is always on the wire"
+        );
+        assert_eq!(lite_client[1].get("clientId"), None);
+        assert_eq!(lite_client[1].get("maxCount"), Some("1000"));
+
+        let lite_group = requests_of(&client, request_code::GET_LITE_GROUP_INFO);
+        assert_eq!(lite_group[0].get("group"), Some("GID_a"));
+        assert_eq!(lite_group[0].get("topK"), Some("7"));
+        assert!(!lite_group[0].contains_key("liteTopic"));
+
+        let dispatch = requests_of(&client, request_code::TRIGGER_LITE_DISPATCH);
+        assert_eq!(dispatch[0].get("group"), Some("GID_a"));
+        assert_eq!(dispatch[0].get("clientId"), Some("cid-1"));
+    }
+
+    #[tokio::test]
+    async fn order_conf_non_cluster_merges_and_writes_back() {
+        let client = long_tail_client("long-tail-order-conf");
+        let mut current = reply_with_ext(&[("value", "b-a:2")]);
+        current.add_ext_field("namespace", "ORDER_TOPIC_CONFIG");
+        client.queue_canned_reply(request_code::GET_KV_CONFIG, current);
+        client.queue_canned_reply(request_code::PUT_KV_CONFIG, success_reply());
+        let admin = admin_on(&client, 2000);
+
+        admin
+            .create_or_update_order_conf("T1", "b-b:5", false)
+            .await
+            .expect("order conf update");
+
+        let writes = requests_of(&client, request_code::PUT_KV_CONFIG);
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].get("namespace"), Some("ORDER_TOPIC_CONFIG"));
+        assert_eq!(writes[0].get("key"), Some("T1"));
+        assert_eq!(
+            writes[0].get("value"),
+            Some("b-a:2;b-b:5"),
+            "the merge appends the new entry"
+        );
+
+        // A matching first token replaces the stored entry instead of appending.
+        let mut replaced = reply_with_ext(&[("value", "b-a:2;b-b:5")]);
+        replaced.add_ext_field("namespace", "ORDER_TOPIC_CONFIG");
+        client.queue_canned_reply(request_code::GET_KV_CONFIG, replaced);
+        client.queue_canned_reply(request_code::PUT_KV_CONFIG, success_reply());
+        admin
+            .create_or_update_order_conf("T1", "b-a:9", false)
+            .await
+            .expect("order conf replace");
+        let writes = requests_of(&client, request_code::PUT_KV_CONFIG);
+        assert_eq!(writes.len(), 2);
+        assert_eq!(
+            writes[1].get("value"),
+            Some("b-a:9;b-b:5"),
+            "the merge replaces the entry with the same first token"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_forms_carry_an_empty_header_and_the_list_body() {
+        let (listener, addr) = bind_admin_mock().await;
+        let log = spawn_admin_broker(listener, Vec::new()).await;
+        let admin = started_direct_admin(&addr).await;
+
+        let mut topic = TopicConfig::default();
+        topic.topic_name = "T".to_string();
+        topic.read_queue_nums = 4;
+        topic.write_queue_nums = 4;
+        topic.perm = 6;
+        admin
+            .create_and_update_topic_config_list(&addr, &[topic.clone()])
+            .await
+            .expect("topic list");
+        let mut group = SubscriptionGroupConfig::default();
+        group.group_name = "GID_a".to_string();
+        admin
+            .create_and_update_subscription_group_config_list(&addr, &[group])
+            .await
+            .expect("group list");
+
+        let (_, topic_body) = logged_request(&log, request_code::UPDATE_AND_CREATE_TOPIC_LIST);
+        let topic_json: Value = serde_json::from_slice(&topic_body.expect("topic body")).unwrap();
+        assert_eq!(topic_json["topicConfigList"][0]["topicName"], "T");
+        assert!(topic_json.get("groupConfigList").is_none());
+
+        let (group_ext, group_body) =
+            logged_request(&log, request_code::UPDATE_AND_CREATE_SUBSCRIPTIONGROUP_LIST);
+        assert!(group_ext.is_empty(), "the header stays empty");
+        let group_json: Value = serde_json::from_slice(&group_body.expect("group body")).unwrap();
+        assert_eq!(group_json["groupConfigList"][0]["groupName"], "GID_a");
+        assert!(group_json.get("topicConfigList").is_none());
+
+        // Empty lists are refused before any IO.
+        assert!(admin.create_and_update_topic_config_list(&addr, &[]).await.is_err());
+        assert!(
+            admin
+                .create_and_update_subscription_group_config_list(&addr, &[])
+                .await
+                .is_err()
+        );
+        admin.shutdown();
     }
 }

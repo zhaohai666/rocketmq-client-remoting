@@ -253,8 +253,11 @@ class RemotingCommand:
         }
         if self.remark is not None:
             d["remark"] = self.remark
-        if self.ext_fields:
-            d["extFields"] = self.ext_fields
+        # A request built with a header class always carries the extFields map, even when
+        # the header declares no fields: an empty map and an absent map are different
+        # frames on the wire (a null custom header keeps the map out of the JSON).
+        if self.ext_fields or self.custom_header is not None:
+            d["extFields"] = self.ext_fields or {}
         return d
 
     def add_ext_field(self, key: str, value: str) -> None:

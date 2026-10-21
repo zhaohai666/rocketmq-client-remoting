@@ -51,8 +51,8 @@ use crate::client::hook::{
 use crate::client::latency::{MQFaultStrategy, Resolver, ServiceDetector};
 use crate::client::metrics::ClientMetrics;
 use crate::client::mq_client::{
-    MQClientInstance, MQClientInstanceConfig, PublishMessage, TopicPublishInfo, TraceDispatcher,
-    MQ_CLIENT_API_TIMEOUT_MILLIS,
+    default_concurrent_heartbeat_pool_size, MQClientInstance, MQClientInstanceConfig,
+    PublishMessage, TopicPublishInfo, TraceDispatcher, MQ_CLIENT_API_TIMEOUT_MILLIS,
 };
 use crate::client::produce_accumulator::{
     get_or_create_produce_accumulator, AccumulatorSender, ProduceAccumulator, TIMER_DELAY_KEYS,
@@ -484,6 +484,14 @@ pub struct ProducerConfig {
     /// a non-zero `heartbeatFingerprint`, and once the broker answers `IS_SUPPORT_HEART_BEAT_V2`
     /// and the fingerprint is unchanged the subscription set drops out of the body.
     pub use_heartbeat_v2: bool,
+    /// Decode-read-body switch (default true): off, received message bodies stay unmaterialised.
+    pub decode_read_body: bool,
+    /// Internal-API timeout (default 3000ms) for the client's own control RPCs.
+    pub mq_client_api_timeout_millis: i64,
+    /// Concurrent heartbeat switch (default false).
+    pub enable_concurrent_heartbeat: bool,
+    /// Concurrent heartbeat pool size (default: available processors).
+    pub concurrent_heartbeat_thread_pool_size: usize,
 }
 
 impl Default for ProducerConfig {
@@ -543,6 +551,10 @@ impl Default for ProducerConfig {
             batch_max_bytes: -1,
             total_batch_max_bytes: -1,
             use_heartbeat_v2: false,
+            decode_read_body: true,
+            mq_client_api_timeout_millis: MQ_CLIENT_API_TIMEOUT_MILLIS,
+            enable_concurrent_heartbeat: false,
+            concurrent_heartbeat_thread_pool_size: default_concurrent_heartbeat_pool_size(),
         }
     }
 }
@@ -1126,6 +1138,31 @@ impl DefaultMQProducer {
         self.write_cfg(|c| c.request_timeout = timeout_millis);
     }
 
+    /// Decode-read-body switch (default true). Off, received bodies stay unmaterialised; queue
+    /// offsets and properties are still decoded.
+    pub fn set_decode_read_body(&self, enable: bool) {
+        self.write_cfg(|c| c.decode_read_body = enable);
+        if let Some(client) = self.client() {
+            client.set_decode_read_body(enable);
+        }
+    }
+
+    pub fn is_decode_read_body(&self) -> bool {
+        self.read_cfg(|c| c.decode_read_body)
+    }
+
+    /// Internal-API timeout for the client's own control RPCs (default 3000ms).
+    pub fn set_mq_client_api_timeout_millis(&self, timeout_millis: i64) {
+        self.write_cfg(|c| c.mq_client_api_timeout_millis = timeout_millis);
+        if let Some(client) = self.client() {
+            client.set_mq_client_api_timeout_millis(timeout_millis);
+        }
+    }
+
+    pub fn mq_client_api_timeout_millis(&self) -> i64 {
+        self.read_cfg(|c| c.mq_client_api_timeout_millis)
+    }
+
     /// Access the metrics collector.
     pub fn metrics(&self) -> &ClientMetrics {
         &self.inner.metrics
@@ -1355,6 +1392,10 @@ impl DefaultMQProducer {
             enable_stream_request_type: cfg.enable_stream_request_type,
             route_refresh_interval_millis: cfg.poll_name_server_interval_millis,
             use_heartbeat_v2: cfg.use_heartbeat_v2,
+            decode_read_body: cfg.decode_read_body,
+            mq_client_api_timeout_millis: cfg.mq_client_api_timeout_millis,
+            enable_concurrent_heartbeat: cfg.enable_concurrent_heartbeat,
+            concurrent_heartbeat_thread_pool_size: cfg.concurrent_heartbeat_thread_pool_size,
             ..Default::default()
         };
         let client = MQClientInstance::create_mq_client_instance(
@@ -1362,6 +1403,9 @@ impl DefaultMQProducer {
             cfg.name_server_addrs.clone(),
             instance_cfg,
         );
+        // A shared instance (same clientId) may predate this facade: apply the live switches.
+        client.set_decode_read_body(cfg.decode_read_body);
+        client.set_mq_client_api_timeout_millis(cfg.mq_client_api_timeout_millis);
         if let Some(hook) = self
             .inner
             .rpc_hook
@@ -1537,7 +1581,7 @@ impl DefaultMQProducer {
                                 &client_id,
                                 &group,
                                 "",
-                                MQ_CLIENT_API_TIMEOUT_MILLIS,
+                                client.mq_client_api_timeout_millis(),
                             )
                             .await;
                         client.shutdown();
@@ -1835,7 +1879,10 @@ async fn send_heartbeat_to_all_broker(inner: &Inner, client: &MQClientInstance) 
     // same effect as pinning them to 0/false explicitly.
     let mut ok = 0usize;
     for addr in addrs {
-        if let Err(e) = client.send_heartbeat(&addr, &hb, 5000).await {
+        if let Err(e) = client
+            .send_heartbeat(&addr, &hb, client.mq_client_api_timeout_millis())
+            .await
+        {
             rmq_warn!("producer heartbeat to {addr} failed: {e}");
         } else {
             ok += 1;

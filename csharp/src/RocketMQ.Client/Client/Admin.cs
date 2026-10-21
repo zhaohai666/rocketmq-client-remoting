@@ -1,8 +1,9 @@
 // Coverage: topic CRUD/config, broker cluster info and runtime info/config, NameServer KV
 // config, subscription group management, consumer/producer connections, consume stats,
-// offset management (including real broker offset reset), and message queries
-// (key / uniqKey / msgId / ConsumeQueue).
+// offset management (including real broker offset reset), message queries
+// (key / uniqKey / msgId / ConsumeQueue), and AUTH user / ACL management.
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
@@ -177,6 +178,23 @@ public sealed class DefaultMQAdminExt
 
     public int GetTimeoutMillis() => _timeoutMillis;
 
+    /// <summary>Page size sent as maxTopicNum / maxGroupNum by the two metadata paging
+    /// loops. Default 2000.</summary>
+    public int MaxPageSizeInGetMetadata
+    {
+        get => _maxPageSizeInGetMetadata;
+        set
+        {
+            _maxPageSizeInGetMetadata = value > 0 ? value : MQClientInstance.DefaultMaxPageSizeInGetMetadata;
+            if (_mqClient is not null)
+            {
+                _mqClient.MaxPageSizeInGetMetadata = _maxPageSizeInGetMetadata;
+            }
+        }
+    }
+
+    private int _maxPageSizeInGetMetadata = MQClientInstance.DefaultMaxPageSizeInGetMetadata;
+
     public void AddKvNamespaceToDeleteList(string ns) => _kvNamespaceToDeleteList.Add(ns);
 
     public void Start()
@@ -203,6 +221,7 @@ public sealed class DefaultMQAdminExt
             ClientLog.Warn("admin rpc hook ignored: MQClientInstance already has one (clientId="
                 + _clientId + ")");
         }
+        _mqClient.MaxPageSizeInGetMetadata = _maxPageSizeInGetMetadata;
         try
         {
             _mqClient.Start();
@@ -478,11 +497,85 @@ public sealed class DefaultMQAdminExt
 
     public TopicConfigSerializeWrapper GetAllTopicConfig(string brokerAddr, int timeoutMillis = -1)
     {
-        int to = timeoutMillis < 0 ? _timeoutMillis : timeoutMillis;
-        RemotingCommand response = RequireClient().InvokeSync(AddrForRpc(brokerAddr), RequestCode.GetAllTopicConfig, new PropertyMap(), null, false, to);
-        var w = new TopicConfigSerializeWrapper();
-        if (response.Body.Length > 0) TopicConfigSerializeWrapper.Decode(response.Body, out w);
-        return w;
+        MQClientInstance client = RequireClient();
+        int timeout = timeoutMillis < 0 ? _timeoutMillis : timeoutMillis;
+        int pageSize = client.MaxPageSizeInGetMetadata;
+        long begin = UtilAll.CurrentTimeMillis();
+
+        JsonValue currentDataVersion = JsonValue.Null;
+        long topicSeq = 0;
+        bool haveVersion = false;
+        var table = new SortedDictionary<string, TopicConfig>();
+
+        while (true)
+        {
+            long left = timeout - (UtilAll.CurrentTimeMillis() - begin);
+            if (left < 0)
+            {
+                throw new MQClientException("invokeSync call timeout");
+            }
+
+            // First page: dataVersion is the empty string (an explicit key, not an
+            // omitted one); later pages echo the last seen DataVersion JSON.
+            PropertyMap ext = new()
+            {
+                ["topicSeq"] = I64Str(topicSeq),
+                ["maxTopicNum"] = pageSize.ToString(CultureInfo.InvariantCulture),
+                ["dataVersion"] = haveVersion ? DvText(currentDataVersion) : string.Empty,
+            };
+
+            RemotingCommand response = client.InvokeSyncRaw(
+                AddrForRpc(brokerAddr), RequestCode.GetAllTopicConfig, ext, null, false, (int)left);
+            if (response.Code != ResponseCode.Success)
+            {
+                throw new MQBrokerException(response.Code, response.Remark);
+            }
+
+            var wrapper = new TopicConfigSerializeWrapper();
+            if (response.Body.Length > 0) TopicConfigSerializeWrapper.Decode(response.Body, out wrapper);
+            foreach (var kv in wrapper.TopicConfigTable) table[kv.Key] = kv.Value;
+
+            JsonValue newVersion = wrapper.DataVersion;
+            if (!haveVersion)
+            {
+                // Fill the version before the break so old-server responses still carry it.
+                currentDataVersion = newVersion;
+                haveVersion = true;
+            }
+
+            if (!response.ExtFields.TryGetValue("totalTopicNum", out string? totalStr) ||
+                string.IsNullOrEmpty(totalStr))
+            {
+                // Old broker: everything came at once.
+                break;
+            }
+
+            if (!long.TryParse(totalStr, NumberStyles.Integer, CultureInfo.InvariantCulture,
+                    out long total))
+            {
+                break;
+            }
+
+            if (DvText(currentDataVersion) != DvText(newVersion))
+            {
+                ClientLog.Warn("topic config dataVersion changed, restart paging");
+                currentDataVersion = newVersion;
+                topicSeq = 0;
+                table.Clear();
+                continue;
+            }
+
+            topicSeq += wrapper.TopicConfigTable.Count;
+            if (topicSeq >= total - 1)
+            {
+                break;
+            }
+        }
+
+        var result = new TopicConfigSerializeWrapper();
+        foreach (var kv in table) result.TopicConfigTable[kv.Key] = kv.Value;
+        result.DataVersion = currentDataVersion;
+        return result;
     }
 
     public TopicConfigSerializeWrapper GetUserTopicConfig(string brokerAddr,
@@ -801,6 +894,7 @@ public sealed class DefaultMQAdminExt
     {
         MQClientInstance client = RequireClient();
         int timeout = timeoutMillis < 0 ? _timeoutMillis : timeoutMillis;
+        int pageSize = client.MaxPageSizeInGetMetadata;
         long begin = UtilAll.CurrentTimeMillis();
 
         JsonValue currentDataVersion = JsonValue.Null;
@@ -817,9 +911,10 @@ public sealed class DefaultMQAdminExt
             PropertyMap ext = new()
             {
                 ["groupSeq"] = I64Str(groupSeq),
-                ["maxGroupNum"] = "10000",
+                ["maxGroupNum"] = pageSize.ToString(CultureInfo.InvariantCulture),
+                // First page carries the empty string, later pages the last seen version.
+                ["dataVersion"] = haveVersion ? DvText(currentDataVersion) : string.Empty,
             };
-            if (haveVersion) ext["dataVersion"] = DvText(currentDataVersion);
 
             RemotingCommand response = client.InvokeSyncRaw(
                 AddrForRpc(brokerAddr), RequestCode.GetAllSubscriptiongroupConfig, ext, null, false, (int)left);
@@ -1088,113 +1183,115 @@ public sealed class DefaultMQAdminExt
         HashSet<string> groups = QueryTopicConsumeByWho(brokerAddr, msg.Topic);
         foreach (string group in groups.OrderBy(g => g, StringComparer.Ordinal))
         {
-            var mt = new MessageTrack { ConsumerGroup = group };
-            ConsumerConnection cc;
-            try
-            {
-                cc = ExamineConsumerConnectionInfo(group);
-            }
-            catch (MQBrokerException e)
-            {
-                if (e.ResponseCode == ResponseCode.ConsumerNotOnline)
-                {
-                    mt.TrackType = TrackType.NotOnline;
-                }
-
-                mt.ExceptionDesc = "CODE:" + e.ResponseCode + " DESC:" + e.Message;
-                result.Add(mt);
-                continue;
-            }
-            catch (Exception e)
-            {
-                mt.ExceptionDesc = e.Message;
-                result.Add(mt);
-                continue;
-            }
-
-            switch (cc.ConsumeType)
-            {
-                case "CONSUME_ACTIVELY":
-                    mt.TrackType = TrackType.Pull;
-                    break;
-                case "CONSUME_PASSIVELY":
-                    bool ifConsumed;
-                    try
-                    {
-                        ifConsumed = Consumed(msg, group);
-                    }
-                    catch (MQClientException e)
-                    {
-                        if (e.ResponseCode == ResponseCode.ConsumerNotOnline)
-                        {
-                            mt.TrackType = TrackType.NotOnline;
-                            mt.ExceptionDesc = "CODE:" + e.ResponseCode + " DESC:" + e.Message;
-                        }
-                        else if (e.ResponseCode == ResponseCode.BroadcastConsumption)
-                        {
-                            mt.TrackType = TrackType.ConsumeBroadcasting;
-                        }
-
-                        result.Add(mt);
-                        continue;
-                    }
-                    catch (MQBrokerException e)
-                    {
-                        if (e.ResponseCode == ResponseCode.ConsumerNotOnline)
-                        {
-                            mt.TrackType = TrackType.NotOnline;
-                            mt.ExceptionDesc = "CODE:" + e.ResponseCode + " DESC:" + e.Message;
-                        }
-                        else if (e.ResponseCode == ResponseCode.BroadcastConsumption)
-                        {
-                            mt.TrackType = TrackType.ConsumeBroadcasting;
-                        }
-
-                        result.Add(mt);
-                        continue;
-                    }
-                    catch (Exception e)
-                    {
-                        mt.ExceptionDesc = e.Message;
-                        result.Add(mt);
-                        continue;
-                    }
-
-                    if (ifConsumed)
-                    {
-                        mt.TrackType = TrackType.Consumed;
-                        JsonValue? sub = cc.SubscriptionTable.Find(msg.Topic);
-                        if (sub is not null)
-                        {
-                            JsonValue? tagsSet = sub.Find("tagsSet");
-                            bool empty = tagsSet is not { IsArray: true } || tagsSet.Size() == 0;
-                            bool wildcard = tagsSet is { IsArray: true }
-                                            && Enumerable.Range(0, tagsSet.Size())
-                                                .Any(i => tagsSet.At(i).IsString
-                                                          && tagsSet.At(i).StringValue() == "*");
-                            bool hasTag = msg.Tags is string tag
-                                          && tagsSet is { IsArray: true }
-                                          && Enumerable.Range(0, tagsSet.Size())
-                                              .Any(i => tagsSet.At(i).IsString
-                                                        && tagsSet.At(i).StringValue() == tag);
-                            if (!empty && !wildcard && !hasTag)
-                            {
-                                mt.TrackType = TrackType.ConsumedButFiltered;
-                            }
-                        }
-                    }
-                    else
-                    {
-                        mt.TrackType = TrackType.NotConsumeYet;
-                    }
-
-                    break;
-            }
-
-            result.Add(mt);
+            result.Add(TrackOneGroup(msg, group));
         }
 
         return result;
+    }
+
+    /// <summary>The per-group track verdict shared by the single and the fan-out variant:
+    /// connection first, then (for push consumers) the consumed check and the tag filter.</summary>
+    private MessageTrack TrackOneGroup(MessageExt msg, string group)
+    {
+        var mt = new MessageTrack { ConsumerGroup = group };
+        ConsumerConnection cc;
+        try
+        {
+            cc = ExamineConsumerConnectionInfo(group);
+        }
+        catch (MQBrokerException e)
+        {
+            if (e.ResponseCode == ResponseCode.ConsumerNotOnline)
+            {
+                mt.TrackType = TrackType.NotOnline;
+            }
+
+            mt.ExceptionDesc = "CODE:" + e.ResponseCode + " DESC:" + e.Message;
+            return mt;
+        }
+        catch (Exception e)
+        {
+            mt.ExceptionDesc = e.Message;
+            return mt;
+        }
+
+        switch (cc.ConsumeType)
+        {
+            case "CONSUME_ACTIVELY":
+                mt.TrackType = TrackType.Pull;
+                return mt;
+            case "CONSUME_PASSIVELY":
+                bool ifConsumed;
+                try
+                {
+                    ifConsumed = Consumed(msg, group);
+                }
+                catch (MQClientException e)
+                {
+                    if (e.ResponseCode == ResponseCode.ConsumerNotOnline)
+                    {
+                        mt.TrackType = TrackType.NotOnline;
+                        mt.ExceptionDesc = "CODE:" + e.ResponseCode + " DESC:" + e.Message;
+                    }
+                    else if (e.ResponseCode == ResponseCode.BroadcastConsumption)
+                    {
+                        mt.TrackType = TrackType.ConsumeBroadcasting;
+                    }
+
+                    return mt;
+                }
+                catch (MQBrokerException e)
+                {
+                    if (e.ResponseCode == ResponseCode.ConsumerNotOnline)
+                    {
+                        mt.TrackType = TrackType.NotOnline;
+                        mt.ExceptionDesc = "CODE:" + e.ResponseCode + " DESC:" + e.Message;
+                    }
+                    else if (e.ResponseCode == ResponseCode.BroadcastConsumption)
+                    {
+                        mt.TrackType = TrackType.ConsumeBroadcasting;
+                    }
+
+                    return mt;
+                }
+                catch (Exception e)
+                {
+                    mt.ExceptionDesc = e.Message;
+                    return mt;
+                }
+
+                if (ifConsumed)
+                {
+                    mt.TrackType = TrackType.Consumed;
+                    JsonValue? sub = cc.SubscriptionTable.Find(msg.Topic);
+                    if (sub is not null)
+                    {
+                        JsonValue? tagsSet = sub.Find("tagsSet");
+                        bool empty = tagsSet is not { IsArray: true } || tagsSet.Size() == 0;
+                        bool wildcard = tagsSet is { IsArray: true }
+                                        && Enumerable.Range(0, tagsSet.Size())
+                                            .Any(i => tagsSet.At(i).IsString
+                                                      && tagsSet.At(i).StringValue() == "*");
+                        bool hasTag = msg.Tags is string tag
+                                      && tagsSet is { IsArray: true }
+                                      && Enumerable.Range(0, tagsSet.Size())
+                                          .Any(i => tagsSet.At(i).IsString
+                                                    && tagsSet.At(i).StringValue() == tag);
+                        if (!empty && !wildcard && !hasTag)
+                        {
+                            mt.TrackType = TrackType.ConsumedButFiltered;
+                        }
+                    }
+                }
+                else
+                {
+                    mt.TrackType = TrackType.NotConsumeYet;
+                }
+
+                return mt;
+            default:
+                return mt;
+        }
     }
 
     public TopicList QueryTopicsByConsumerToBroker(string brokerAddr, string group)
@@ -1367,9 +1464,13 @@ public sealed class DefaultMQAdminExt
             ResetOffsetBody.Decode(response.Body, out ResetOffsetBody body))
         {
             foreach (var kv in body.OffsetTable) offsets[kv.Key] = kv.Value;
+            return offsets;
         }
 
-        return offsets;
+        // An absent body is an error reply, not an empty reset: the broker answer for "nothing
+        // was reset" is a body with an empty offsetTable, not a missing one.
+        throw new MQClientException(
+            response.Remark.Length == 0 ? "reset offset failed" : response.Remark, response.Code);
     }
 
     public SortedDictionary<MessageQueue, long> ResetOffsetByQueueId(string brokerAddr,
@@ -1590,8 +1691,13 @@ public sealed class DefaultMQAdminExt
         foreach (TopicConfig config in configs) rows.PushArray(config.ToJson());
         JsonValue body = JsonValue.MakeObject();
         body.Set("topicConfigList", rows);
-        RequireClient().InvokeSync(AddrForRpc(brokerAddr), RequestCode.UpdateAndCreateTopicList,
-            new PropertyMap(), RemotingSerializable.Encode(body), true, _timeoutMillis);
+        RemotingCommand response = RequireClient().InvokeSyncRaw(AddrForRpc(brokerAddr),
+            RequestCode.UpdateAndCreateTopicList, new PropertyMap(), RemotingSerializable.Encode(body), true,
+            _timeoutMillis);
+        if (response.Code != ResponseCode.Success)
+        {
+            throw new MQClientException(response.Remark, response.Code);
+        }
     }
 
     public void CreateAndUpdateSubscriptionGroupConfigList(string brokerAddr,
@@ -1607,9 +1713,13 @@ public sealed class DefaultMQAdminExt
         foreach (SubscriptionGroupConfig config in configs) rows.PushArray(config.ToJson());
         JsonValue body = JsonValue.MakeObject();
         body.Set("groupConfigList", rows);
-        RequireClient().InvokeSync(AddrForRpc(brokerAddr),
-            RequestCode.UpdateAndCreateSubscriptiongroupList,
-            new PropertyMap(), RemotingSerializable.Encode(body), true, _timeoutMillis);
+        RemotingCommand response = RequireClient().InvokeSyncRaw(AddrForRpc(brokerAddr),
+            RequestCode.UpdateAndCreateSubscriptiongroupList, new PropertyMap(), RemotingSerializable.Encode(body),
+            true, _timeoutMillis);
+        if (response.Code != ResponseCode.Success)
+        {
+            throw new MQClientException(response.Remark, response.Code);
+        }
     }
 
     public void CreateStaticTopic(string brokerAddr, string defaultTopic, TopicConfig config,
@@ -1859,6 +1969,954 @@ public sealed class DefaultMQAdminExt
             RemotingCommand response = client.InvokeSync(
                 nsAddr, RequestCode.GetNamesrvConfig, new PropertyMap(), null, false, to);
             result[nsAddr] = MixAll.String2Properties(Encoding.UTF8.GetString(response.Body));
+        }
+
+        return result;
+    }
+
+    // ---------------------------------------------------------------- AUTH user / ACL management
+
+    // These RPCs are served by the broker on the port the caller names, so every one of them
+    // hands its address to the transport untouched.
+
+    /// <summary>Auth headers carry exactly the fields the caller set: an unset one is left off
+    /// the request entirely, never sent as an empty value.</summary>
+    private static PropertyMap AuthExt(params (string Key, string? Value)[] fields)
+    {
+        var ext = new PropertyMap();
+        foreach ((string key, string? value) in fields)
+        {
+            if (!string.IsNullOrEmpty(value)) ext[key] = value;
+        }
+
+        return ext;
+    }
+
+    public void CreateUser(string brokerAddr, UserInfo user) =>
+        RequireClient().InvokeSync(brokerAddr, RequestCode.AuthCreateUser,
+            AuthExt(("username", user.Username)), user.Encode(), true, _timeoutMillis);
+
+    /// <summary>The status is not part of this form, so the body carries no userStatus key.</summary>
+    public void CreateUser(string brokerAddr, string username, string password, string userType) =>
+        CreateUser(brokerAddr, new UserInfo
+        {
+            Username = username,
+            Password = password,
+            UserType = userType,
+        });
+
+    public void UpdateUser(string brokerAddr, UserInfo user) =>
+        RequireClient().InvokeSync(brokerAddr, RequestCode.AuthUpdateUser,
+            AuthExt(("username", user.Username)), user.Encode(), true, _timeoutMillis);
+
+    public void UpdateUser(string brokerAddr, string username, string password, string userType) =>
+        UpdateUser(brokerAddr, new UserInfo
+        {
+            Username = username,
+            Password = password,
+            UserType = userType,
+        });
+
+    public void DeleteUser(string brokerAddr, string username) =>
+        RequireClient().InvokeSync(brokerAddr, RequestCode.AuthDeleteUser,
+            AuthExt(("username", username)), null, false, _timeoutMillis);
+
+    /// <summary>Returns null when the body is absent.</summary>
+    public UserInfo? GetUser(string brokerAddr, string username)
+    {
+        RemotingCommand response = RequireClient().InvokeSync(brokerAddr, RequestCode.AuthGetUser,
+            AuthExt(("username", username)), null, false, _timeoutMillis);
+        if (response.Body.Length == 0 || !UserInfo.Decode(response.Body, out UserInfo user))
+        {
+            return null;
+        }
+
+        return user;
+    }
+
+    public List<UserInfo> ListUser(string brokerAddr, string filter = "")
+    {
+        RemotingCommand response = RequireClient().InvokeSync(brokerAddr, RequestCode.AuthListUser,
+            AuthExt(("filter", filter)), null, false, _timeoutMillis);
+        return UserInfo.DecodeList(response.Body);
+    }
+
+    public void CreateAcl(string brokerAddr, AclInfo acl) =>
+        RequireClient().InvokeSync(brokerAddr, RequestCode.AuthCreateAcl,
+            AuthExt(("subject", acl.Subject)), acl.Encode(), true, _timeoutMillis);
+
+    public void CreateAcl(string brokerAddr, string subject, List<string> resources,
+        List<string> actions, List<string> sourceIps, string decision) =>
+        CreateAcl(brokerAddr, AclInfo.OfResources(subject, resources, actions, sourceIps, decision));
+
+    public void UpdateAcl(string brokerAddr, AclInfo acl) =>
+        RequireClient().InvokeSync(brokerAddr, RequestCode.AuthUpdateAcl,
+            AuthExt(("subject", acl.Subject)), acl.Encode(), true, _timeoutMillis);
+
+    public void UpdateAcl(string brokerAddr, string subject, List<string> resources,
+        List<string> actions, List<string> sourceIps, string decision) =>
+        UpdateAcl(brokerAddr, AclInfo.OfResources(subject, resources, actions, sourceIps, decision));
+
+    public void DeleteAcl(string brokerAddr, string subject, string resource) =>
+        RequireClient().InvokeSync(brokerAddr, RequestCode.AuthDeleteAcl,
+            AuthExt(("subject", subject), ("resource", resource)), null, false, _timeoutMillis);
+
+    /// <summary>Returns null when the body is absent.</summary>
+    public AclInfo? GetAcl(string brokerAddr, string subject)
+    {
+        RemotingCommand response = RequireClient().InvokeSync(brokerAddr, RequestCode.AuthGetAcl,
+            AuthExt(("subject", subject)), null, false, _timeoutMillis);
+        if (response.Body.Length == 0 || !AclInfo.Decode(response.Body, out AclInfo acl))
+        {
+            return null;
+        }
+
+        return acl;
+    }
+
+    public List<AclInfo> ListAcl(string brokerAddr, string subjectFilter = "",
+        string resourceFilter = "")
+    {
+        RemotingCommand response = RequireClient().InvokeSync(brokerAddr, RequestCode.AuthListAcl,
+            AuthExt(("subjectFilter", subjectFilter), ("resourceFilter", resourceFilter)),
+            null, false, _timeoutMillis);
+        return AclInfo.DecodeList(response.Body);
+    }
+
+    // ---------------------------------------------------------------- Broker container lifecycle
+
+    // Both container RPCs keep the fixed 20000ms budget of the original admin tool regardless
+    // of the admin-wide timeout.
+    private const int ContainerRpcTimeoutMillis = 20000;
+
+    public void AddBrokerToContainer(string containerAddr, string brokerAddr)
+    {
+        RemotingCommand response = RequireClient().InvokeSyncRaw(containerAddr, RequestCode.AddBroker,
+            new PropertyMap { ["configPath"] = brokerAddr }, null, false, ContainerRpcTimeoutMillis);
+        if (response.Code != ResponseCode.Success)
+        {
+            throw new MQBrokerException(response.Code, response.Remark);
+        }
+    }
+
+    public void RemoveBrokerFromContainer(string containerAddr, string brokerClusterName,
+        string brokerName, long brokerId)
+    {
+        var ext = new PropertyMap
+        {
+            ["brokerClusterName"] = brokerClusterName,
+            ["brokerName"] = brokerName,
+            ["brokerId"] = I64Str(brokerId),
+        };
+        RemotingCommand response = RequireClient().InvokeSyncRaw(containerAddr, RequestCode.RemoveBroker,
+            ext, null, false, ContainerRpcTimeoutMillis);
+        if (response.Code != ResponseCode.Success)
+        {
+            throw new MQBrokerException(response.Code, response.Remark);
+        }
+    }
+
+    // ---------------------------------------------------------------- Cold data flow control
+
+    public void UpdateColdDataFlowCtrGroupConfig(string brokerAddr, PropertyMap properties)
+    {
+        string body = MixAll.Properties2String(properties);
+        if (body.Length == 0)
+        {
+            return;
+        }
+
+        RequireClient().InvokeSync(AddrForRpc(brokerAddr), RequestCode.UpdateColdDataFlowCtrConfig,
+            null, Encoding.UTF8.GetBytes(body), true, _timeoutMillis);
+    }
+
+    public void RemoveColdDataFlowCtrGroupConfig(string brokerAddr, string consumerGroup)
+    {
+        if (string.IsNullOrEmpty(consumerGroup))
+        {
+            return;
+        }
+
+        RequireClient().InvokeSync(AddrForRpc(brokerAddr), RequestCode.RemoveColdDataFlowCtrConfig,
+            null, Encoding.UTF8.GetBytes(consumerGroup), true, _timeoutMillis);
+    }
+
+    /// <summary>Raw flow-control rule dump; null when the broker has none.</summary>
+    public string? GetColdDataFlowCtrInfo(string brokerAddr)
+    {
+        RemotingCommand response = RequireClient().InvokeSyncRaw(brokerAddr, RequestCode.GetColdDataFlowCtrInfo,
+            null, null, false, _timeoutMillis);
+        if (response.Code != ResponseCode.Success)
+        {
+            throw new MQBrokerException(response.Code, response.Remark);
+        }
+
+        return response.Body is { Length: > 0 } ? Encoding.UTF8.GetString(response.Body) : null;
+    }
+
+    /// <summary>
+    /// Returns the broker remark as the outcome (it carries the refused-mode explanation);
+    /// null when the broker accepted silently.
+    /// </summary>
+    public string? SetCommitLogReadAheadMode(string brokerAddr, string mode)
+    {
+        RemotingCommand response = RequireClient().InvokeSyncRaw(brokerAddr, RequestCode.SetCommitlogReadMode,
+            new PropertyMap { ["readAheadMode"] = mode }, null, false, _timeoutMillis);
+        if (response.Code != ResponseCode.Success)
+        {
+            throw new MQBrokerException(response.Code, response.Remark);
+        }
+
+        return response.Remark.Length > 0 ? response.Remark : null;
+    }
+
+    // ---------------------------------------------------------------- Pop rollback / RocksDB
+
+    public void ExportPopRecords(string brokerAddr, long timeoutMillis)
+    {
+        RemotingCommand response = RequireClient().InvokeSyncRaw(brokerAddr, RequestCode.PopRollback,
+            null, null, false, (int)timeoutMillis);
+        if (response.Code != ResponseCode.Success)
+        {
+            throw new MQBrokerException(response.Code, response.Remark);
+        }
+    }
+
+    /// <summary>Returns null when the broker answered without a body.</summary>
+    public CheckRocksdbCqWriteResult? CheckRocksdbCqWriteProgress(string brokerAddr, string topic,
+        long checkStoreTime)
+    {
+        var ext = new PropertyMap
+        {
+            ["topic"] = topic,
+            ["checkStoreTime"] = I64Str(checkStoreTime),
+        };
+        RemotingCommand response = RequireClient().InvokeSyncRaw(brokerAddr, RequestCode.CheckRocksdbCqWriteProgress,
+            ext, null, false, _timeoutMillis);
+        if (response.Code != ResponseCode.Success)
+        {
+            throw new MQClientException(response.Remark, response.Code);
+        }
+
+        return response.Body is { Length: > 0 } && CheckRocksdbCqWriteResult.Decode(response.Body, out var result)
+            ? result
+            : null;
+    }
+
+    /// <summary>
+    /// Config types are the wire names ("topics", "subscriptionGroups", "consumerOffsets"); the
+    /// header value carries a trailing separator after every entry.
+    /// </summary>
+    public void ExportRocksdbConfigToJson(string brokerAddr, IReadOnlyList<string> configTypes)
+    {
+        var joined = new StringBuilder();
+        foreach (string type in configTypes)
+        {
+            joined.Append(type).Append(';');
+        }
+
+        RemotingCommand response = RequireClient().InvokeSyncRaw(brokerAddr, RequestCode.ExportRocksdbConfigToJson,
+            new PropertyMap { ["configType"] = joined.ToString() }, null, false, _timeoutMillis);
+        if (response.Code != ResponseCode.Success)
+        {
+            throw new MQClientException(response.Remark, response.Code);
+        }
+    }
+
+    // ---------------------------------------------------------------- Controller
+
+    /// <summary>Controller metadata (1005): the leader address for the follow-up calls lives
+    /// in the response extFields. Fixed 3000ms budget, no VIP channel.</summary>
+    private GetMetaDataResponseHeader GetControllerMetaData(string controllerAddr)
+    {
+        RemotingCommand response = RequireClient().InvokeSyncRaw(controllerAddr,
+            RequestCode.ControllerGetMetadataInfo, null, null, false, 3000);
+        if (response.Code != ResponseCode.Success)
+        {
+            throw new MQBrokerException(response.Code, response.Remark);
+        }
+
+        return GetMetaDataResponseHeader.FromExtFields(response.ExtFields);
+    }
+
+    /// <summary>Sync-state-set view (1006): metadata first, then the real call on the leader.
+    /// The broker-name list rides in the JSON body. Returns null on an empty body.</summary>
+    public BrokerReplicasInfo? GetInSyncStateData(string controllerAddr, IReadOnlyList<string> brokers)
+    {
+        GetMetaDataResponseHeader meta = GetControllerMetaData(controllerAddr);
+        JsonValue arr = JsonValue.MakeArray();
+        foreach (string broker in brokers) arr.PushArray(JsonValue.MakeString(broker));
+
+        RemotingCommand response = RequireClient().InvokeSyncRaw(meta.ControllerLeaderAddress,
+            RequestCode.ControllerGetSyncStateData, null, RemotingSerializable.Encode(arr), true, 3000);
+        if (response.Code != ResponseCode.Success)
+        {
+            throw new MQBrokerException(response.Code, response.Remark);
+        }
+
+        return response.Body is { Length: > 0 } && BrokerReplicasInfo.Decode(response.Body, out var info)
+            ? info
+            : null;
+    }
+
+    /// <summary>
+    /// Reads the controller config from every server (the name server list when none is
+    /// given); null when there is no server to ask.
+    /// </summary>
+    public Dictionary<string, PropertyMap>? GetControllerConfig(IReadOnlyList<string>? controllerServers = null,
+        int timeoutMillis = -1)
+    {
+        int to = timeoutMillis < 0 ? _timeoutMillis : timeoutMillis;
+        IReadOnlyList<string> servers = controllerServers is { Count: > 0 }
+            ? controllerServers
+            : RequireClient().NameServerAddrs;
+        if (servers.Count == 0)
+        {
+            return null;
+        }
+
+        var configMap = new Dictionary<string, PropertyMap>();
+        foreach (string controller in servers)
+        {
+            RemotingCommand response = RequireClient().InvokeSyncRaw(controller, RequestCode.GetControllerConfig,
+                null, null, false, to);
+            if (response.Code != ResponseCode.Success)
+            {
+                throw new MQClientException(response.Remark, response.Code);
+            }
+
+            configMap[controller] = response.Body is { Length: > 0 }
+                ? MixAll.String2Properties(Encoding.UTF8.GetString(response.Body))
+                : new PropertyMap();
+        }
+
+        return configMap;
+    }
+
+    /// <summary>Broadcasts the update to every controller; the last error reply wins.
+    /// Silently returns when the properties serialize to nothing or no controller is given.</summary>
+    public void UpdateControllerConfig(PropertyMap properties, IReadOnlyList<string>? controllers,
+        int timeoutMillis = -1)
+    {
+        int to = timeoutMillis < 0 ? _timeoutMillis : timeoutMillis;
+        string body = MixAll.Properties2String(properties);
+        if (body.Length == 0 || controllers is not { Count: > 0 })
+        {
+            return;
+        }
+
+        byte[] payload = Encoding.UTF8.GetBytes(body);
+        RemotingCommand? errResponse = null;
+        foreach (string controller in controllers)
+        {
+            RemotingCommand response = RequireClient().InvokeSyncRaw(controller, RequestCode.UpdateControllerConfig,
+                null, payload, true, to);
+            if (response.Code != ResponseCode.Success)
+            {
+                errResponse = response;
+            }
+        }
+
+        if (errResponse is not null)
+        {
+            throw new MQClientException(errResponse.Remark, errResponse.Code);
+        }
+    }
+
+    /// <summary>
+    /// Asks the controller to drop broker registration data (1011, routed through the leader).
+    /// invokeTime and isCleanLivingBroker are primitives of the header and always travel.
+    /// </summary>
+    public void CleanControllerBrokerData(string controllerAddr, string clusterName, string brokerName,
+        string? brokerControllerIdsToClean = "", bool isCleanLivingBroker = false)
+    {
+        GetMetaDataResponseHeader meta = GetControllerMetaData(controllerAddr);
+        var ext = new PropertyMap
+        {
+            ["clusterName"] = clusterName,
+            ["brokerName"] = brokerName,
+            ["isCleanLivingBroker"] = isCleanLivingBroker ? "true" : "false",
+            ["invokeTime"] = I64Str(UtilAll.CurrentTimeMillis()),
+        };
+        if (brokerControllerIdsToClean != null)
+        {
+            ext["brokerControllerIdsToClean"] = brokerControllerIdsToClean;
+        }
+
+        RemotingCommand response = RequireClient().InvokeSyncRaw(meta.ControllerLeaderAddress,
+            RequestCode.CleanBrokerData, ext, null, false, 3000);
+        if (response.Code != ResponseCode.Success)
+        {
+            throw new MQBrokerException(response.Code, response.Remark);
+        }
+    }
+
+    // ---------------------------------------------------------------- Lite admin
+
+    /// <summary>
+    /// Single-broker call that honors the VIP channel and returns the decoded body, null when
+    /// the broker answered without one; a non-success reply raises as a broker exception.
+    /// </summary>
+    private T? InvokeBrokerMethod<T>(string addr, int requestCode, PropertyMap? extFields,
+        int timeoutMillis, Func<JsonValue, T> decode) where T : class
+    {
+        int to = timeoutMillis < 0 ? _timeoutMillis : timeoutMillis;
+        RemotingCommand response = RequireClient().InvokeSync(AddrForRpc(addr), requestCode, extFields,
+            null, false, to);
+        if (response.Body is not { Length: > 0 }
+            || !RemotingSerializable.Decode(response.Body, out JsonValue v))
+        {
+            return null;
+        }
+
+        return decode(v);
+    }
+
+    public GetBrokerLiteInfoResponseBody? GetBrokerLiteInfo(string brokerAddr, int timeoutMillis = -1) =>
+        InvokeBrokerMethod(brokerAddr, RequestCode.GetBrokerLiteInfo, null, timeoutMillis,
+            GetBrokerLiteInfoResponseBody.FromJson);
+
+    public GetParentTopicInfoResponseBody? GetParentTopicInfo(string brokerAddr, string topic,
+        int timeoutMillis = -1) =>
+        InvokeBrokerMethod(brokerAddr, RequestCode.GetParentTopicInfo,
+            new PropertyMap { ["topic"] = topic }, timeoutMillis, GetParentTopicInfoResponseBody.FromJson);
+
+    public GetLiteTopicInfoResponseBody? GetLiteTopicInfo(string brokerAddr, string parentTopic,
+        string? liteTopic, int timeoutMillis = -1)
+    {
+        var ext = new PropertyMap { ["parentTopic"] = parentTopic };
+        if (liteTopic != null) ext["liteTopic"] = liteTopic;
+        return InvokeBrokerMethod(brokerAddr, RequestCode.GetLiteTopicInfo, ext, timeoutMillis,
+            GetLiteTopicInfoResponseBody.FromJson);
+    }
+
+    public GetLiteClientInfoResponseBody? GetLiteClientInfo(string brokerAddr, string parentTopic,
+        string group, string? clientId, int timeoutMillis = -1)
+    {
+        var ext = new PropertyMap { ["parentTopic"] = parentTopic, ["group"] = group };
+        if (clientId != null) ext["clientId"] = clientId;
+        // The request header carries a primitive maxCount defaulting to 1000, so it is always sent.
+        ext["maxCount"] = I64Str(1000);
+        return InvokeBrokerMethod(brokerAddr, RequestCode.GetLiteClientInfo, ext, timeoutMillis,
+            GetLiteClientInfoResponseBody.FromJson);
+    }
+
+    public GetLiteGroupInfoResponseBody? GetLiteGroupInfo(string brokerAddr, string group,
+        string? liteTopic, int topK, int timeoutMillis = -1)
+    {
+        var ext = new PropertyMap { ["group"] = group, ["topK"] = I64Str(topK) };
+        if (liteTopic != null) ext["liteTopic"] = liteTopic;
+        return InvokeBrokerMethod(brokerAddr, RequestCode.GetLiteGroupInfo, ext, timeoutMillis,
+            GetLiteGroupInfoResponseBody.FromJson);
+    }
+
+    public void TriggerLiteDispatch(string brokerAddr, string group, string? clientId, int timeoutMillis = -1)
+    {
+        int to = timeoutMillis < 0 ? _timeoutMillis : timeoutMillis;
+        var ext = new PropertyMap { ["group"] = group };
+        if (clientId != null) ext["clientId"] = clientId;
+        RequireClient().InvokeSync(AddrForRpc(brokerAddr), RequestCode.TriggerLiteDispatch, ext,
+            null, false, to);
+    }
+
+    // ---------------------------------------------------------------- Concurrent fan-out ops
+
+    /// <summary>
+    /// Wraps a fan-out body into the admin tool envelope: remote failures become result codes,
+    /// a missing route (17) is reported as TOPIC_ROUTE_INFO_NOT_EXIST.
+    /// </summary>
+    private AdminToolResult<T> AdminToolExecute<T>(Func<AdminToolResult<T>> handler)
+    {
+        try
+        {
+            return handler();
+        }
+        catch (RemotingException e)
+        {
+            ClientLog.Warn("adminToolExecute remoting error, " + e.Message);
+            return AdminToolResult<T>.Failure(AdminToolsResultCodeEnum.RemotingError, e.Message);
+        }
+        catch (MQClientException e) when (e.ResponseCode == ResponseCode.TopicNotExist)
+        {
+            return AdminToolResult<T>.Failure(AdminToolsResultCodeEnum.TopicRouteInfoNotExist, e.Message);
+        }
+        catch (MQClientException e)
+        {
+            return AdminToolResult<T>.Failure(AdminToolsResultCodeEnum.MqClientError, e.Message);
+        }
+        catch (ThreadInterruptedException e)
+        {
+            return AdminToolResult<T>.Failure(AdminToolsResultCodeEnum.InterruptError, e.Message);
+        }
+        catch (Exception e)
+        {
+            return AdminToolResult<T>.Failure(AdminToolsResultCodeEnum.MqBrokerError, e.Message);
+        }
+    }
+
+    /// <summary>Bounded wait over the fan-out tasks; a late task is dropped, a faulting one
+    /// has already been logged inside the task itself.</summary>
+    private static void WaitForFanOut(List<Task> tasks, int timeoutMillis)
+    {
+        if (tasks.Count == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            Task.WaitAll(tasks.ToArray(), timeoutMillis);
+        }
+        catch (AggregateException)
+        {
+        }
+    }
+
+    public AdminToolResult<TopicStatsTable> ExamineTopicStatsConcurrent(string topic)
+    {
+        return AdminToolExecute(() =>
+        {
+            var table = new TopicStatsTable();
+            TopicRouteData? route = RequireClient().GetTopicRouteData(topic);
+            if (route is not { BrokerDatas.Count: > 0 })
+            {
+                return AdminToolResult<TopicStatsTable>.Ok(table);
+            }
+
+            var tasks = new List<Task>();
+            var parts = new ConcurrentBag<(string BrokerName, TopicStatsTable Table)>();
+            foreach (BrokerData bd in route.BrokerDatas)
+            {
+                BrokerData broker = bd;
+                tasks.Add(Task.Run(() =>
+                {
+                    try
+                    {
+                        string addr = broker.SelectBrokerAddr();
+                        if (addr.Length != 0)
+                        {
+                            parts.Add((broker.BrokerName, ExamineTopicStatsByBroker(addr, topic)));
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        ClientLog.Warn("getTopicStatsInfo error. topic=" + topic + ", " + e.Message);
+                    }
+                }));
+            }
+
+            WaitForFanOut(tasks, _timeoutMillis);
+            foreach ((string _, TopicStatsTable tst) in parts.OrderBy(p => p.BrokerName, StringComparer.Ordinal))
+            {
+                foreach (var kv in tst.OffsetTable) table.OffsetTable[kv.Key] = kv.Value;
+                table.TopicPutTps += tst.TopicPutTps;
+            }
+
+            return AdminToolResult<TopicStatsTable>.Ok(table);
+        });
+    }
+
+    public AdminToolResult<ConsumeStats> ExamineConsumeStatsConcurrent(string consumerGroup, string topic = "")
+    {
+        return AdminToolExecute(() =>
+        {
+            // Route discovery walks retry topic first, then the topic itself, then its pop
+            // retry twin; the first route that yields brokers wins.
+            TopicRouteData? route = null;
+            var routeTopics = new List<string> { MixAll.GetRetryTopic(consumerGroup) };
+            if (topic.Length > 0)
+            {
+                routeTopics.Add(topic);
+                routeTopics.Add(ExtraInfoUtil.BuildPopRetryTopicV1(topic, consumerGroup));
+            }
+
+            foreach (string routeTopic in routeTopics)
+            {
+                route = RequireClient().GetTopicRouteData(routeTopic);
+                if (route is { BrokerDatas.Count: > 0 })
+                {
+                    break;
+                }
+
+                route = null;
+            }
+
+            if (route is not { BrokerDatas.Count: > 0 })
+            {
+                return AdminToolResult<ConsumeStats>.Failure(AdminToolsResultCodeEnum.TopicRouteInfoNotExist,
+                    "topic router info not found");
+            }
+
+            var tasks = new List<Task>();
+            var parts = new ConcurrentBag<(string Addr, ConsumeStats Stats)>();
+            foreach (BrokerData bd in route.BrokerDatas)
+            {
+                BrokerData broker = bd;
+                tasks.Add(Task.Run(() =>
+                {
+                    try
+                    {
+                        string addr = broker.SelectBrokerAddr();
+                        if (addr.Length != 0)
+                        {
+                            parts.Add((addr, ExamineConsumeStats(addr, consumerGroup, topic)));
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        ClientLog.Warn("getConsumeStats error. topic=" + topic + ", consumerGroup="
+                                       + consumerGroup + ", " + e.Message);
+                    }
+                }));
+            }
+
+            WaitForFanOut(tasks, _timeoutMillis);
+
+            var result = new ConsumeStats();
+            foreach ((string _, ConsumeStats stats) in parts.OrderBy(p => p.Addr, StringComparer.Ordinal))
+            {
+                foreach (var kv in stats.OffsetTable) result.OffsetTable[kv.Key] = kv.Value;
+                result.ConsumeTps += stats.ConsumeTps;
+            }
+
+            if (result.OffsetTable.Count == 0)
+            {
+                ConsumerConnection connection;
+                try
+                {
+                    connection = ExamineConsumerConnectionInfo(consumerGroup);
+                }
+                catch (Exception)
+                {
+                    return AdminToolResult<ConsumeStats>.Failure(AdminToolsResultCodeEnum.ConsumerNotOnline,
+                        "Not found the consumer group consume stats, because return offset table is empty, "
+                        + "maybe the consumer not consume any message");
+                }
+
+                if (connection.MessageModel == "BROADCASTING")
+                {
+                    return AdminToolResult<ConsumeStats>.Failure(AdminToolsResultCodeEnum.BroadcastConsumption,
+                        "Not found the consumer group consume stats, because return offset table is empty, "
+                        + "the consumer is under the broadcast mode");
+                }
+            }
+
+            return AdminToolResult<ConsumeStats>.Ok(result);
+        });
+    }
+
+    public AdminToolResult<BrokerOperatorResult> DeleteTopicInBrokerConcurrent(IEnumerable<string> addrs,
+        string topic)
+    {
+        return AdminToolExecute(() =>
+        {
+            var tasks = new List<Task>();
+            var outcomes = new ConcurrentBag<(string Addr, bool Ok)>();
+            foreach (string addr in addrs)
+            {
+                string target = addr;
+                tasks.Add(Task.Run(() =>
+                {
+                    try
+                    {
+                        DeleteTopicInBroker(target, topic);
+                        outcomes.Add((target, true));
+                    }
+                    catch (Exception e)
+                    {
+                        ClientLog.Warn("deleteTopicInBroker error. topic=" + topic + ", broker=" + target
+                                       + ", " + e.Message);
+                        outcomes.Add((target, false));
+                    }
+                }));
+            }
+
+            WaitForFanOut(tasks, _timeoutMillis);
+            var result = new BrokerOperatorResult();
+            foreach ((string addr, bool ok) in outcomes.OrderBy(o => o.Addr, StringComparer.Ordinal))
+            {
+                (ok ? result.SuccessList : result.FailureList).Add(addr);
+            }
+
+            return AdminToolResult<BrokerOperatorResult>.Ok(result);
+        });
+    }
+
+    public AdminToolResult<BrokerOperatorResult> ResetOffsetNewConcurrent(string group, string topic,
+        long timestamp)
+    {
+        return AdminToolExecute(() =>
+        {
+            TopicRouteData? route = RequireClient().GetTopicRouteData(topic);
+            if (route is not { BrokerDatas.Count: > 0 })
+            {
+                return AdminToolResult<BrokerOperatorResult>.Failure(
+                    AdminToolsResultCodeEnum.TopicRouteInfoNotExist, "topic router info not found");
+            }
+
+            var topicRouteMap = new Dictionary<string, QueueData>();
+            foreach (QueueData queueData in route.QueueDatas)
+            {
+                topicRouteMap[queueData.BrokerName] = queueData;
+            }
+
+            var tasks = new List<Task>();
+            var outcomes = new ConcurrentBag<(string Addr, bool Ok)>();
+            foreach (BrokerData bd in route.BrokerDatas)
+            {
+                BrokerData broker = bd;
+                tasks.Add(Task.Run(() =>
+                {
+                    string addr = broker.SelectBrokerAddr();
+                    if (addr.Length == 0)
+                    {
+                        return;
+                    }
+
+                    try
+                    {
+                        InvokeBrokerToResetOffset(addr, topic, group, timestamp, true, false, -1, -1);
+                        outcomes.Add((addr, true));
+                    }
+                    catch (MQClientException e)
+                    {
+                        if (e.ResponseCode == ResponseCode.ConsumerNotOnline)
+                        {
+                            // Group never consumed: fall back to the consume-stats driven per-queue reset.
+                            try
+                            {
+                                ResetOffsetOldOnBroker(addr, topicRouteMap[broker.BrokerName], group, topic,
+                                    timestamp, true);
+                                outcomes.Add((addr, true));
+                            }
+                            catch (Exception e2)
+                            {
+                                ClientLog.Warn("resetOffsetByTimestampOld error. addr=" + addr + ", topic="
+                                               + topic + ", group=" + group + ", " + e2.Message);
+                                outcomes.Add((addr, false));
+                            }
+                        }
+                        else if (e.ResponseCode == ResponseCode.SystemError)
+                        {
+                            // The broker answers SYSTEM_ERROR for a group that never came online.
+                            outcomes.Add((addr, true));
+                        }
+                        else
+                        {
+                            ClientLog.Warn("resetOffsetNewConcurrent error. addr=" + addr + ", topic=" + topic
+                                           + ", group=" + group + ", " + e.Message);
+                            outcomes.Add((addr, false));
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        ClientLog.Warn("resetOffsetNewConcurrent error. addr=" + addr + ", topic=" + topic
+                                       + ", group=" + group + ", " + e.Message);
+                        outcomes.Add((addr, false));
+                    }
+                }));
+            }
+
+            WaitForFanOut(tasks, _timeoutMillis);
+            var result = new BrokerOperatorResult();
+            int okCount = 0;
+            foreach ((string addr, bool ok) in outcomes.OrderBy(o => o.Addr, StringComparer.Ordinal))
+            {
+                (ok ? result.SuccessList : result.FailureList).Add(addr);
+                if (ok) ++okCount;
+            }
+
+            // Every routed broker must have acknowledged before the whole operation is a success.
+            return okCount == route.BrokerDatas.Count
+                ? AdminToolResult<BrokerOperatorResult>.Ok(result)
+                : AdminToolResult<BrokerOperatorResult>.Failure(AdminToolsResultCodeEnum.MqBrokerError,
+                    "operator failure", result);
+        });
+    }
+
+    /// <summary>
+    /// Old reset path pinned to one broker: reset every queue the group actually consumed on
+    /// that broker; when it never consumed anything, reset every read queue from the route.
+    /// </summary>
+    private void ResetOffsetOldOnBroker(string brokerAddr, QueueData? queueData, string consumerGroup,
+        string topic, long timestamp, bool force)
+    {
+        MQClientInstance client = RequireClient();
+        ConsumeStats consumeStats = ExamineConsumeStats(brokerAddr, consumerGroup);
+
+        bool hasConsumed = false;
+        foreach (var kv in consumeStats.OffsetTable)
+        {
+            if (kv.Key.Topic != topic) continue;
+            hasConsumed = true;
+            ResetOffsetConsumeOffsetOnBroker(client, brokerAddr, consumerGroup, kv.Key, kv.Value, timestamp, force);
+        }
+
+        if (hasConsumed) return;
+
+        TopicStatsTable topicStatus = ExamineTopicStatsByBroker(brokerAddr, topic);
+        for (int i = 0; i < queueData!.ReadQueueNums; ++i)
+        {
+            var mq = new MessageQueue(topic, queueData.BrokerName, i);
+            TopicOffset stats = topicStatus.OffsetTable[mq];
+            var wrapper = new OffsetWrapper { BrokerOffset = stats.MaxOffset, ConsumerOffset = stats.MinOffset };
+            ResetOffsetConsumeOffsetOnBroker(client, brokerAddr, consumerGroup, mq, wrapper, timestamp, force);
+        }
+    }
+
+    private void ResetOffsetConsumeOffsetOnBroker(MQClientInstance client, string brokerAddr,
+        string consumerGroup, MessageQueue queue, OffsetWrapper offsetWrapper, long timestamp, bool force)
+    {
+        long resetOffset = timestamp == -1
+            ? client.GetMaxOffset(queue, _timeoutMillis, brokerAddr)
+            : client.SearchOffsetByTimestamp(queue, timestamp, _timeoutMillis, brokerAddr);
+        if (force || resetOffset <= offsetWrapper.ConsumerOffset)
+        {
+            client.UpdateConsumerOffset(consumerGroup, queue, resetOffset, _timeoutMillis, brokerAddr);
+        }
+    }
+
+    public AdminToolResult<TopicList> QueryTopicsByConsumerConcurrent(string group)
+    {
+        return AdminToolExecute(() =>
+        {
+            TopicRouteData? route = RequireClient().GetTopicRouteData(MixAll.GetRetryTopic(group));
+            if (route is not { BrokerDatas.Count: > 0 })
+            {
+                return AdminToolResult<TopicList>.Failure(AdminToolsResultCodeEnum.TopicRouteInfoNotExist,
+                    "router info not found.");
+            }
+
+            var tasks = new List<Task>();
+            var parts = new ConcurrentBag<(string Addr, List<string> Topics)>();
+            foreach (BrokerData bd in route.BrokerDatas)
+            {
+                BrokerData broker = bd;
+                tasks.Add(Task.Run(() =>
+                {
+                    try
+                    {
+                        string addr = broker.SelectBrokerAddr();
+                        if (addr.Length != 0)
+                        {
+                            parts.Add((addr, QueryTopicsByConsumerToBroker(addr, group).Topics));
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        ClientLog.Warn("queryTopicsByConsumer error. group=" + group + ", " + e.Message);
+                    }
+                }));
+            }
+
+            WaitForFanOut(tasks, _timeoutMillis);
+            var result = new TopicList();
+            foreach ((string _, List<string> topics) in parts.OrderBy(p => p.Addr, StringComparer.Ordinal))
+            {
+                result.Topics.AddRange(topics);
+            }
+
+            return AdminToolResult<TopicList>.Ok(result);
+        });
+    }
+
+    public AdminToolResult<List<QueueTimeSpan>> QueryConsumeTimeSpanConcurrent(string topic, string group)
+    {
+        return AdminToolExecute(() =>
+        {
+            var spanSet = new List<QueueTimeSpan>();
+            TopicRouteData? route = RequireClient().GetTopicRouteData(topic);
+            if (route is not { BrokerDatas.Count: > 0 })
+            {
+                return AdminToolResult<List<QueueTimeSpan>>.Ok(spanSet);
+            }
+
+            var tasks = new List<Task>();
+            var parts = new ConcurrentBag<(string Addr, List<QueueTimeSpan> Spans)>();
+            foreach (BrokerData bd in route.BrokerDatas)
+            {
+                BrokerData broker = bd;
+                tasks.Add(Task.Run(() =>
+                {
+                    try
+                    {
+                        string addr = broker.SelectBrokerAddr();
+                        if (addr.Length != 0)
+                        {
+                            parts.Add((addr, QueryConsumeTimeSpanOnBroker(addr, topic, group)));
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        ClientLog.Warn("queryConsumeTimeSpan error. topic=" + topic + ", group=" + group
+                                       + ", " + e.Message);
+                    }
+                }));
+            }
+
+            WaitForFanOut(tasks, _timeoutMillis);
+            foreach ((string _, List<QueueTimeSpan> spans) in parts.OrderBy(p => p.Addr, StringComparer.Ordinal))
+            {
+                spanSet.AddRange(spans);
+            }
+
+            return AdminToolResult<List<QueueTimeSpan>>.Ok(spanSet);
+        });
+    }
+
+    private List<QueueTimeSpan> QueryConsumeTimeSpanOnBroker(string brokerAddr, string topic, string group)
+    {
+        PropertyMap ext = new() { ["topic"] = topic, ["group"] = group };
+        RemotingCommand response = RequireClient().InvokeSync(AddrForRpc(brokerAddr),
+            RequestCode.QueryConsumeTimeSpan, ext, null, false, _timeoutMillis);
+        return QueueTimeSpan.DecodeList(response.Body);
+    }
+
+    /// <summary>
+    /// Fan-out over the consuming groups: the group list is discovered once, then every group
+    /// is tracked on its own task. Only the settled tracks come back; a group whose task died
+    /// is logged and left out.
+    /// </summary>
+    public List<MessageTrack> MessageTrackDetailConcurrent(MessageExt msg)
+    {
+        var result = new List<MessageTrack>();
+        TopicRouteData route = ExamineTopicRoute(msg.Topic);
+        string? brokerAddr = null;
+        foreach (BrokerData bd in route.BrokerDatas)
+        {
+            string addr = bd.SelectBrokerAddr();
+            if (addr.Length != 0)
+            {
+                brokerAddr = addr;
+                break;
+            }
+        }
+
+        if (brokerAddr is null) return result;
+
+        HashSet<string> groups = QueryTopicConsumeByWho(brokerAddr, msg.Topic);
+        var tasks = new List<Task>();
+        var tracks = new ConcurrentBag<MessageTrack>();
+        foreach (string group in groups)
+        {
+            string target = group;
+            tasks.Add(Task.Run(() =>
+            {
+                try
+                {
+                    tracks.Add(TrackOneGroup(msg, target));
+                }
+                catch (Exception e)
+                {
+                    ClientLog.Warn("messageTrackDetail error. group=" + target + ", " + e.Message);
+                }
+            }));
+        }
+
+        WaitForFanOut(tasks, _timeoutMillis);
+        foreach (MessageTrack track in tracks.OrderBy(t => t.ConsumerGroup, StringComparer.Ordinal))
+        {
+            result.Add(track);
         }
 
         return result;

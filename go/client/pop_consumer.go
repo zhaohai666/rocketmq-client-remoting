@@ -135,7 +135,7 @@ func (c *DefaultMQPushConsumer) popOnce(mq common.MessageQueue, sub *remoting.Su
 
 	addr, _, found := inst.FindBrokerAddressInSubscribe(mq.BrokerName, int64(common.MasterID), true)
 	if !found {
-		if _, err := inst.UpdateTopicRouteInfoFromNameServer(mq.Topic, 5000, false); err != nil {
+		if _, err := inst.UpdateTopicRouteInfoFromNameServer(mq.Topic, 0, false); err != nil {
 			return nil, err
 		}
 		addr, _, found = inst.FindBrokerAddressInSubscribe(mq.BrokerName, int64(common.MasterID), true)

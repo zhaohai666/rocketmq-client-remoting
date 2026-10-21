@@ -170,6 +170,71 @@ public sealed class MQClientInstance : IDisposable
 
     private readonly int _pollNameServerIntervalMillis;
 
+    // ---------------- ClientConfig switches (read at every call site, not cached) ----------------
+
+    /// <summary>When false, batch decode still walks every frame and advances the cursor,
+    /// but does not copy, CRC-check or decompress the body: messages come back header-only
+    /// with queue offsets and properties intact. Default true.</summary>
+    public bool DecodeReadBody { get; set; } = true;
+
+    /// <summary>Timeout for this client's internal API calls (heartbeat, check-client,
+    /// route fetch, unregister, consumer-id lookup). Default 3000ms; an explicit
+    /// per-call timeout always wins.</summary>
+    public int MqClientApiTimeout
+    {
+        get => _mqClientApiTimeout;
+        set => _mqClientApiTimeout = value > 0 ? value : MqClientApiTimeoutMillis;
+    }
+
+    private int _mqClientApiTimeout = MqClientApiTimeoutMillis;
+
+    /// <summary>When true (and heartbeat V2 is off), one heartbeat round fans out over
+    /// the instance's pool instead of walking the brokers serially. Default false.</summary>
+    public bool EnableConcurrentHeartbeat { get; set; }
+
+    public int ConcurrentHeartbeatThreadPoolSize
+    {
+        get => _concurrentHeartbeatThreadPoolSize;
+        set => _concurrentHeartbeatThreadPoolSize = value > 0 ? value : Environment.ProcessorCount;
+    }
+
+    private int _concurrentHeartbeatThreadPoolSize = Environment.ProcessorCount;
+
+    /// <summary>Page size sent as maxTopicNum / maxGroupNum by the admin paging loops.
+    /// Default 2000.</summary>
+    public int MaxPageSizeInGetMetadata
+    {
+        get => _maxPageSizeInGetMetadata;
+        set => _maxPageSizeInGetMetadata = value > 0 ? value : DefaultMaxPageSizeInGetMetadata;
+    }
+
+    public const int DefaultMaxPageSizeInGetMetadata = 2000;
+    private int _maxPageSizeInGetMetadata = DefaultMaxPageSizeInGetMetadata;
+
+    private readonly object _heartbeatPoolLock = new();
+    private ConsumeExecutor? _heartbeatExecutor;
+    private volatile bool _heartbeatPoolClosed;
+
+    private ConsumeExecutor EnsureHeartbeatExecutor()
+    {
+        lock (_heartbeatPoolLock)
+        {
+            if (_heartbeatPoolClosed)
+            {
+                throw new RejectedExecutionException("client instance is shut down");
+            }
+
+            if (_heartbeatExecutor is null)
+            {
+                int size = Math.Max(1, ConcurrentHeartbeatThreadPoolSize);
+                _heartbeatExecutor = new ConsumeExecutor(size, size, 60.0,
+                    "ConcurrentHeartbeat", threadNameSep: "-", threadIndexFrom: 1);
+            }
+
+            return _heartbeatExecutor;
+        }
+    }
+
     public bool VipChannelEnabled
     {
         get => _vipChannelEnabled;
@@ -415,6 +480,11 @@ public sealed class MQClientInstance : IDisposable
     public void Start()
     {
         _started = true;
+        _heartbeatPoolClosed = false;
+        if (EnableConcurrentHeartbeat)
+        {
+            EnsureHeartbeatExecutor();
+        }
         ConsumerStats.Start();
         if (_nameServerAddrs.Count == 0 && !string.IsNullOrEmpty(TopAddressing.WsAddr))
         {
@@ -465,6 +535,16 @@ public sealed class MQClientInstance : IDisposable
         }
 
         ConsumerStats.Shutdown();
+        // The concurrent heartbeat pool belongs to this instance: stop accepting work and
+        // wait for the in-flight round so no task outlives the client.
+        ConsumeExecutor? heartbeatExecutor;
+        lock (_heartbeatPoolLock)
+        {
+            heartbeatExecutor = _heartbeatExecutor;
+            _heartbeatExecutor = null;
+            _heartbeatPoolClosed = true;
+        }
+        heartbeatExecutor?.Shutdown(true);
         // The 40 callback is a closure registered by the consumer (it captures consumer
         // state): remove the handler and the callback table before closing the connection,
         // so a broker 40 during shutdown does not reach a consumer that is already exiting.
@@ -574,8 +654,9 @@ public sealed class MQClientInstance : IDisposable
 
     // ---------------- Route management ----------------
 
-    public bool UpdateTopicRouteInfoFromNameServer(string topic, bool isDefault = false, int timeoutMillis = 5000)
+    public bool UpdateTopicRouteInfoFromNameServer(string topic, bool isDefault = false, int timeoutMillis = -1)
     {
+        int timeout = timeoutMillis >= 0 ? timeoutMillis : MqClientApiTimeout;
         if (_nameServerAddrs.Count == 0)
         {
             throw new MQClientException("name server address list is empty",
@@ -591,7 +672,7 @@ public sealed class MQClientInstance : IDisposable
             {
                 try
                 {
-                    RemotingCommand response = InvokeSyncOnAddr(nsAddr, request, timeoutMillis);
+                    RemotingCommand response = InvokeSyncOnAddr(nsAddr, request, timeout);
                     if (response.Code == ResponseCode.Success && response.Body.Length > 0)
                     {
                         return TopicRouteData.Decode(response.Body, out @out);
@@ -1320,7 +1401,7 @@ public sealed class MQClientInstance : IDisposable
         };
         if (response.Body.Length > 0)
         {
-            result.MsgFoundList = MessageDecoder.DecodeMessages(response.Body);
+            result.MsgFoundList = MessageDecoder.DecodeMessages(response.Body, DecodeReadBody);
             foreach (MessageExt m in result.MsgFoundList)
             {
                 m.BrokerName = mq.BrokerName;
@@ -1526,7 +1607,7 @@ public sealed class MQClientInstance : IDisposable
 
         if (result.Status == PopStatus.Found && response.Body.Length > 0)
         {
-            result.MsgFoundList = MessageDecoder.DecodeMessages(response.Body);
+            result.MsgFoundList = MessageDecoder.DecodeMessages(response.Body, DecodeReadBody);
             StampPopCk(result.MsgFoundList, brokerName, respHeader);
         }
 
@@ -2082,11 +2163,12 @@ public sealed class MQClientInstance : IDisposable
     /// re-reports.
     /// </summary>
     public HeartbeatV2Result SendHeartbeat(string addr, HeartbeatData heartbeatData,
-        int timeoutMillis = 5000)
+        int timeoutMillis = -1)
     {
+        int timeout = timeoutMillis >= 0 ? timeoutMillis : MqClientApiTimeout;
         if (!UseHeartbeatV2)
         {
-            return HeartbeatV2Result.Of(InvokeHeartbeat(addr, heartbeatData, timeoutMillis));
+            return HeartbeatV2Result.Of(InvokeHeartbeat(addr, heartbeatData, timeout));
         }
 
         int fingerprint = heartbeatData.ComputeHeartbeatFingerprint();
@@ -2102,7 +2184,7 @@ public sealed class MQClientInstance : IDisposable
         }
 
         HeartbeatV2Result result =
-            HeartbeatV2Result.Of(InvokeHeartbeat(addr, skipSub ? withoutSub : heartbeatData, timeoutMillis));
+            HeartbeatV2Result.Of(InvokeHeartbeat(addr, skipSub ? withoutSub : heartbeatData, timeout));
 
         lock (_heartbeatV2Lock)
         {
@@ -2225,7 +2307,7 @@ public sealed class MQClientInstance : IDisposable
     /// Returns how many brokers answered.
     /// </summary>
     public int SendHeartbeatToAllBrokers(HeartbeatData heartbeatData, bool isRebalance = false,
-        int timeoutMillis = 5000, bool includeSlaves = true)
+        int timeoutMillis = -1, bool includeSlaves = true)
     {
         bool producerEmpty = heartbeatData.ProducerDataSet.Count == 0;
         bool consumerEmpty = heartbeatData.ConsumerDataSet.Count == 0;
@@ -2236,6 +2318,12 @@ public sealed class MQClientInstance : IDisposable
         }
 
         List<BrokerAddrEntry> entries = GetBrokerAddrEntries(includeSlaves);
+        if (consumerEmpty)
+        {
+            // Without ConsumerData a slave can never use the registration: only masters.
+            entries.RemoveAll(entry => entry.BrokerId != MixAll.MasterId);
+        }
+
         if (entries.Count == 0)
         {
             return 0;
@@ -2246,26 +2334,91 @@ public sealed class MQClientInstance : IDisposable
             ResetBrokerAddrHeartbeatFingerprintTable();
         }
 
+        int timeout = timeoutMillis >= 0 ? timeoutMillis : MqClientApiTimeout;
+
+        // V2 keeps the shared fingerprint/support state single-threaded, so it wins over
+        // the concurrent round; when V2 is off and concurrency is enabled, one beat per
+        // broker goes out over the instance's pool.
+        if (EnableConcurrentHeartbeat && !UseHeartbeatV2)
+        {
+            return SendHeartbeatConcurrently(entries, heartbeatData, timeout);
+        }
+
         int ok = 0;
         foreach (BrokerAddrEntry entry in entries)
         {
-            if (consumerEmpty && entry.BrokerId != MixAll.MasterId)
+            if (SendOneHeartbeat(entry, heartbeatData, timeout))
             {
-                continue;
-            }
-
-            try
-            {
-                HeartbeatV2Result result = SendHeartbeat(entry.Addr, heartbeatData, timeoutMillis);
-                RecordBrokerVersion(entry.BrokerName, entry.Addr, result.Version);
                 ok++;
-            }
-            catch (Exception e)
-            {
-                ClientLog.Warn("heartbeat to " + entry.Addr + " failed: " + e.Message);
             }
         }
 
+        return ok;
+    }
+
+    private bool SendOneHeartbeat(BrokerAddrEntry entry, HeartbeatData heartbeatData, int timeout)
+    {
+        try
+        {
+            HeartbeatV2Result result = SendHeartbeat(entry.Addr, heartbeatData, timeout);
+            RecordBrokerVersion(entry.BrokerName, entry.Addr, result.Version);
+            return true;
+        }
+        catch (Exception e)
+        {
+            ClientLog.Warn("heartbeat to " + entry.Addr + " failed: " + e.Message);
+            return false;
+        }
+    }
+
+    /// <summary>Fans the round out over the instance pool and waits for every task; a
+    /// rejected submission still counts down, so the round can never hang.</summary>
+    private int SendHeartbeatConcurrently(List<BrokerAddrEntry> entries, HeartbeatData heartbeatData,
+        int timeout)
+    {
+        ConsumeExecutor pool;
+        try
+        {
+            pool = EnsureHeartbeatExecutor();
+        }
+        catch (Exception e)
+        {
+            ClientLog.Warn("concurrent heartbeat pool unavailable: " + e.Message);
+            return 0;
+        }
+
+        int ok = 0;
+        using var done = new CountdownEvent(entries.Count);
+        foreach (BrokerAddrEntry entry in entries)
+        {
+            BrokerAddrEntry target = entry;
+            try
+            {
+                pool.Submit(() =>
+                {
+                    try
+                    {
+                        if (SendOneHeartbeat(target, heartbeatData, timeout))
+                        {
+                            Interlocked.Increment(ref ok);
+                        }
+                    }
+                    finally
+                    {
+                        done.Signal();
+                    }
+                });
+            }
+            catch (Exception e)
+            {
+                // A rejected task (e.g. pool already shut down) must still release the
+                // waiter, otherwise the round waits forever.
+                ClientLog.Warn("concurrent heartbeat to " + entry.Addr + " rejected: " + e.Message);
+                done.Signal();
+            }
+        }
+
+        done.Wait();
         return ok;
     }
 
@@ -2285,8 +2438,9 @@ public sealed class MQClientInstance : IDisposable
 
     public void UnregisterClient(string addr, string clientId,
         string producerGroup, string consumerGroup,
-        int timeoutMillis = MqClientApiTimeoutMillis)
+        int timeoutMillis = -1)
     {
+        int timeout = timeoutMillis >= 0 ? timeoutMillis : MqClientApiTimeout;
         var header = new UnregisterClientRequestHeader
         {
             ClientId = clientId,
@@ -2294,7 +2448,7 @@ public sealed class MQClientInstance : IDisposable
             ConsumerGroup = string.IsNullOrWhiteSpace(consumerGroup) ? null : consumerGroup,
         };
         RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.UnregisterClient, header);
-        RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
+        RemotingCommand response = InvokeSyncOnAddr(addr, request, timeout);
         CheckResponseCode(response);
     }
 
@@ -2325,8 +2479,9 @@ public sealed class MQClientInstance : IDisposable
     }
 
     public void CheckClientConfig(string brokerAddr, string consumerGroup, string clientId,
-        SubscriptionData subscriptionData, int timeoutMillis = MqClientApiTimeoutMillis)
+        SubscriptionData subscriptionData, int timeoutMillis = -1)
     {
+        int timeout = timeoutMillis >= 0 ? timeoutMillis : MqClientApiTimeout;
         RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.CheckClientConfig, null);
         var body = new CheckClientRequestBody
         {
@@ -2336,7 +2491,7 @@ public sealed class MQClientInstance : IDisposable
         };
         request.Body = body.Encode();
         request.HasBody = true;
-        RemotingCommand response = InvokeSyncOnAddr(VipAddr(brokerAddr), request, timeoutMillis);
+        RemotingCommand response = InvokeSyncOnAddr(VipAddr(brokerAddr), request, timeout);
         if (response.Code != ResponseCode.Success)
         {
             throw new MQClientException(response.Remark, response.Code);
@@ -2631,8 +2786,9 @@ public sealed class MQClientInstance : IDisposable
         return string.Empty;
     }
 
-    public List<string>? GetConsumerIdListByGroup(string topic, string consumerGroup, int timeoutMillis = 5000)
+    public List<string>? GetConsumerIdListByGroup(string topic, string consumerGroup, int timeoutMillis = -1)
     {
+        int timeout = timeoutMillis >= 0 ? timeoutMillis : MqClientApiTimeout;
         string addr = BrokerAddrForTopic(topic);
         if (addr.Length == 0)
         {
@@ -2654,7 +2810,7 @@ public sealed class MQClientInstance : IDisposable
                 Bname = brokerName.Length > 0 ? brokerName : null,
             };
             RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.GetConsumerListByGroup, header);
-            RemotingCommand response = InvokeSyncOnAddr(VipAddr(addr), request, timeoutMillis);
+            RemotingCommand response = InvokeSyncOnAddr(VipAddr(addr), request, timeout);
             if (response.Code != ResponseCode.Success || response.Body.Length == 0)
             {
                 return null;
@@ -2671,13 +2827,14 @@ public sealed class MQClientInstance : IDisposable
     }
 
     public void UnregisterClientAllBrokers(string clientId, string producerGroup, string consumerGroup,
-        int timeoutMillis = MqClientApiTimeoutMillis)
+        int timeoutMillis = -1)
     {
+        int timeout = timeoutMillis >= 0 ? timeoutMillis : MqClientApiTimeout;
         foreach (string addr in GetAllBrokerAddrs())
         {
             try
             {
-                UnregisterClient(addr, clientId, producerGroup, consumerGroup, timeoutMillis);
+                UnregisterClient(addr, clientId, producerGroup, consumerGroup, timeout);
             }
             catch (Exception e)
             {

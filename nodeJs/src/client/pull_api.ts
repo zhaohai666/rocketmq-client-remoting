@@ -162,7 +162,7 @@ export class PullAPI {
     const num = (k: string, d: number) => (ext[k] != null ? parseInt(ext[k], 10) : d);
     let found: MessageExt[] = [];
     if (response.body && response.body.length > 0) {
-      found = decodeMessages(response.body);
+      found = decodeMessages(response.body, this.mqClient.decodeReadBody);
       for (const msg of found) {
         msg.setBrokerName(mq.getBrokerName());
         msg.setQueueId(mq.getQueueId());

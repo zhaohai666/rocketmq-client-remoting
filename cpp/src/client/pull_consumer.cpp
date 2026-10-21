@@ -118,6 +118,10 @@ void DefaultMQPullConsumer::start() {
                                         pollNameServerIntervalMillis_));
     // Broker VIP channel: forwarded to the instance that owns the broker RPCs (off = plain address).
     mqClient_->setVipChannelEnabled(vipChannelEnabled_);
+    mqClient_->setDecodeReadBody(decodeReadBody_);
+    mqClient_->setMqClientApiTimeout(mqClientApiTimeout_);
+    mqClient_->setEnableConcurrentHeartbeat(enableConcurrentHeartbeat_);
+    mqClient_->setConcurrentHeartbeatThreadPoolSize(concurrentHeartbeatThreadPoolSize_);
     std::shared_ptr<RPCHook> requestHook =
         composeRequestHooks(enableStreamRequestType_, rpcHook_,
                             [this] { return namespaceV2_; });
@@ -562,9 +566,14 @@ int32_t DefaultMQPullConsumer::sendHeartbeatToAllBroker() {
     }
     const HeartbeatData hb = buildHeartbeat();
     int32_t okCount = 0;
+    if (mqClient_->isEnableConcurrentHeartbeat()) {
+        okCount = mqClient_->sendHeartbeatConcurrently(hb);
+        if (okCount > 0) heartbeatCount_.fetch_add(1);
+        return okCount;
+    }
     for (const std::string& addr : addrs) {
         try {
-            mqClient_->sendHeartbeat(addr, hb, 5000);
+            mqClient_->sendHeartbeat(addr, hb);
             ++okCount;
         } catch (const std::exception& e) {
             logger_warn("heartbeat to " + addr + " failed: " + e.what());

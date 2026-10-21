@@ -304,4 +304,348 @@ bool QueryConsumeQueueResponseBody::decode(const Bytes& data,
     return true;
 }
 
+// ---------------------------------------------------------------- AUTH user / ACL management
+namespace {
+
+// Reads a JSON array of strings; present reports whether the key itself was an array
+std::vector<std::string> getStrList(const JsonValue& v, const char* key, bool& present) {
+    std::vector<std::string> out;
+    const JsonValue* p = v.find(key);
+    present = (p != nullptr && p->isArray());
+    if (!present) return out;
+    for (size_t i = 0; i < p->size(); ++i) {
+        if (p->at(i).isString()) out.push_back(p->at(i).stringValue());
+    }
+    return out;
+}
+
+JsonValue encodeStrList(const std::vector<std::string>& items) {
+    JsonValue arr = JsonValue::makeArray();
+    for (const std::string& s : items) arr.pushArray(JsonValue::makeString(s));
+    return arr;
+}
+
+}  // namespace
+
+JsonValue UserInfo::toJson() const {
+    // Key order is the protocol field order; an unset field contributes no key at all
+    JsonValue v = JsonValue::makeObject();
+    if (!username.empty()) v.set("username", JsonValue::makeString(username));
+    if (hasPassword) v.set("password", JsonValue::makeString(password));
+    if (hasUserType) v.set("userType", JsonValue::makeString(userType));
+    if (hasUserStatus) v.set("userStatus", JsonValue::makeString(userStatus));
+    return v;
+}
+
+UserInfo UserInfo::fromJson(const JsonValue& v) {
+    UserInfo u;
+    u.username = getStr(v, "username", "");
+    std::string tmp;
+    if (v.tryGetString("password", tmp)) {
+        u.password = tmp;
+        u.hasPassword = true;
+    }
+    if (v.tryGetString("userType", tmp)) {
+        u.userType = tmp;
+        u.hasUserType = true;
+    }
+    if (v.tryGetString("userStatus", tmp)) {
+        u.userStatus = tmp;
+        u.hasUserStatus = true;
+    }
+    return u;
+}
+
+std::vector<UserInfo> UserInfo::listFromJson(const JsonValue& v) {
+    std::vector<UserInfo> out;
+    if (!v.isArray()) return out;
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (v.at(i).isObject()) out.push_back(UserInfo::fromJson(v.at(i)));
+    }
+    return out;
+}
+
+Bytes UserInfo::encode() const { return RemotingSerializable::encode(toJson()); }
+
+bool UserInfo::decode(const Bytes& data, UserInfo& out) {
+    JsonValue v;
+    if (!RemotingSerializable::decode(data, v) || !v.isObject()) return false;
+    out = fromJson(v);
+    return true;
+}
+
+JsonValue AclEntry::toJson() const {
+    JsonValue v = JsonValue::makeObject();
+    if (!resource.empty()) v.set("resource", JsonValue::makeString(resource));
+    if (hasActions) v.set("actions", encodeStrList(actions));
+    if (hasSourceIps) v.set("sourceIps", encodeStrList(sourceIps));
+    if (hasDecision) v.set("decision", JsonValue::makeString(decision));
+    return v;
+}
+
+AclEntry AclEntry::fromJson(const JsonValue& v) {
+    AclEntry e;
+    e.resource = getStr(v, "resource", "");
+    e.actions = getStrList(v, "actions", e.hasActions);
+    e.sourceIps = getStrList(v, "sourceIps", e.hasSourceIps);
+    std::string tmp;
+    if (v.tryGetString("decision", tmp)) {
+        e.decision = tmp;
+        e.hasDecision = true;
+    }
+    return e;
+}
+
+JsonValue AclPolicy::toJson() const {
+    JsonValue v = JsonValue::makeObject();
+    if (hasPolicyType) v.set("policyType", JsonValue::makeString(policyType));
+    if (!entries.empty()) {
+        JsonValue arr = JsonValue::makeArray();
+        for (const AclEntry& e : entries) arr.pushArray(e.toJson());
+        v.set("entries", arr);
+    }
+    return v;
+}
+
+AclPolicy AclPolicy::fromJson(const JsonValue& v) {
+    AclPolicy p;
+    std::string tmp;
+    if (v.tryGetString("policyType", tmp)) {
+        p.policyType = tmp;
+        p.hasPolicyType = true;
+    }
+    const JsonValue* raw = v.find("entries");
+    if (raw != nullptr && raw->isArray()) {
+        for (size_t i = 0; i < raw->size(); ++i) {
+            if (raw->at(i).isObject()) p.entries.push_back(AclEntry::fromJson(raw->at(i)));
+        }
+    }
+    return p;
+}
+
+JsonValue AclInfo::toJson() const {
+    JsonValue v = JsonValue::makeObject();
+    if (!subject.empty()) v.set("subject", JsonValue::makeString(subject));
+    if (!policies.empty()) {
+        JsonValue arr = JsonValue::makeArray();
+        for (const AclPolicy& p : policies) arr.pushArray(p.toJson());
+        v.set("policies", arr);
+    }
+    return v;
+}
+
+AclInfo AclInfo::fromJson(const JsonValue& v) {
+    AclInfo a;
+    a.subject = getStr(v, "subject", "");
+    const JsonValue* raw = v.find("policies");
+    if (raw != nullptr && raw->isArray()) {
+        for (size_t i = 0; i < raw->size(); ++i) {
+            if (raw->at(i).isObject()) a.policies.push_back(AclPolicy::fromJson(raw->at(i)));
+        }
+    }
+    return a;
+}
+
+std::vector<AclInfo> AclInfo::listFromJson(const JsonValue& v) {
+    std::vector<AclInfo> out;
+    if (!v.isArray()) return out;
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (v.at(i).isObject()) out.push_back(AclInfo::fromJson(v.at(i)));
+    }
+    return out;
+}
+
+Bytes AclInfo::encode() const { return RemotingSerializable::encode(toJson()); }
+
+bool AclInfo::decode(const Bytes& data, AclInfo& out) {
+    JsonValue v;
+    if (!RemotingSerializable::decode(data, v) || !v.isObject()) return false;
+    out = fromJson(v);
+    return true;
+}
+
+// ---------------------------------------------------------------- ReplicaIdentity
+JsonValue ReplicaIdentity::toJson() const {
+    JsonValue v = JsonValue::makeObject();
+    v.set("brokerName", JsonValue::makeString(brokerName));
+    v.set("brokerId", JsonValue::makeInt(brokerId));
+    if (hasBrokerAddress) v.set("brokerAddress", JsonValue::makeString(brokerAddress));
+    if (hasAlive) v.set("alive", JsonValue::makeBool(alive));
+    return v;
+}
+
+ReplicaIdentity ReplicaIdentity::fromJson(const JsonValue& v) {
+    ReplicaIdentity r;
+    r.brokerName = getStr(v, "brokerName", "");
+    r.brokerId = getInt(v, "brokerId", 0);
+    std::string tmp;
+    if (v.tryGetString("brokerAddress", tmp)) {
+        r.brokerAddress = tmp;
+        r.hasBrokerAddress = true;
+    }
+    if (v.find("alive") != nullptr && !v.find("alive")->isNull()) {
+        r.alive = getBool(v, "alive", false);
+        r.hasAlive = true;
+    }
+    return r;
+}
+
+Bytes ReplicaIdentity::encode() const { return RemotingSerializable::encode(toJson()); }
+
+bool ReplicaIdentity::decode(const Bytes& data, ReplicaIdentity& out) {
+    JsonValue v;
+    if (!RemotingSerializable::decode(data, v) || !v.isObject()) return false;
+    out = fromJson(v);
+    return true;
+}
+
+// ---------------------------------------------------------------- ReplicasInfo
+JsonValue ReplicasInfo::toJson() const {
+    JsonValue v = JsonValue::makeObject();
+    if (hasMasterBrokerId) v.set("masterBrokerId", JsonValue::makeInt(masterBrokerId));
+    if (hasMasterAddress) v.set("masterAddress", JsonValue::makeString(masterAddress));
+    v.set("masterEpoch", JsonValue::makeInt(masterEpoch));
+    v.set("syncStateSetEpoch", JsonValue::makeInt(syncStateSetEpoch));
+    JsonValue inSync = JsonValue::makeArray();
+    for (const ReplicaIdentity& r : inSyncReplicas) inSync.pushArray(r.toJson());
+    v.set("inSyncReplicas", inSync);
+    JsonValue notInSync = JsonValue::makeArray();
+    for (const ReplicaIdentity& r : notInSyncReplicas) notInSync.pushArray(r.toJson());
+    v.set("notInSyncReplicas", notInSync);
+    return v;
+}
+
+ReplicasInfo ReplicasInfo::fromJson(const JsonValue& v) {
+    ReplicasInfo r;
+    if (v.find("masterBrokerId") != nullptr && v.find("masterBrokerId")->isNumber()) {
+        r.masterBrokerId = getInt(v, "masterBrokerId", 0);
+        r.hasMasterBrokerId = true;
+    }
+    std::string tmp;
+    if (v.tryGetString("masterAddress", tmp)) {
+        r.masterAddress = tmp;
+        r.hasMasterAddress = true;
+    }
+    r.masterEpoch = static_cast<int32_t>(getInt(v, "masterEpoch", 0));
+    r.syncStateSetEpoch = static_cast<int32_t>(getInt(v, "syncStateSetEpoch", 0));
+    const JsonValue* inSync = v.find("inSyncReplicas");
+    if (inSync != nullptr && inSync->isArray()) {
+        for (size_t i = 0; i < inSync->size(); ++i) {
+            if (inSync->at(i).isObject()) r.inSyncReplicas.push_back(ReplicaIdentity::fromJson(inSync->at(i)));
+        }
+    }
+    const JsonValue* notInSync = v.find("notInSyncReplicas");
+    if (notInSync != nullptr && notInSync->isArray()) {
+        for (size_t i = 0; i < notInSync->size(); ++i) {
+            if (notInSync->at(i).isObject()) {
+                r.notInSyncReplicas.push_back(ReplicaIdentity::fromJson(notInSync->at(i)));
+            }
+        }
+    }
+    return r;
+}
+
+Bytes ReplicasInfo::encode() const { return RemotingSerializable::encode(toJson()); }
+
+bool ReplicasInfo::decode(const Bytes& data, ReplicasInfo& out) {
+    JsonValue v;
+    if (!RemotingSerializable::decode(data, v) || !v.isObject()) return false;
+    out = fromJson(v);
+    return true;
+}
+
+// ---------------------------------------------------------------- BrokerReplicasInfo
+JsonValue BrokerReplicasInfo::toJson() const {
+    JsonValue v = JsonValue::makeObject();
+    JsonValue table = JsonValue::makeObject();
+    for (const auto& kv : replicasInfoTable) {
+        table.set(kv.first, kv.second.toJson());
+    }
+    v.set("replicasInfoTable", table);
+    return v;
+}
+
+BrokerReplicasInfo BrokerReplicasInfo::fromJson(const JsonValue& v) {
+    BrokerReplicasInfo b;
+    const JsonValue* table = v.find("replicasInfoTable");
+    if (table == nullptr || !table->isObject()) return b;
+    for (const auto& kv : table->objectItems()) {
+        if (kv.second.isObject()) {
+            b.replicasInfoTable[kv.first] = ReplicasInfo::fromJson(kv.second);
+        }
+    }
+    return b;
+}
+
+Bytes BrokerReplicasInfo::encode() const { return RemotingSerializable::encode(toJson()); }
+
+bool BrokerReplicasInfo::decode(const Bytes& data, BrokerReplicasInfo& out) {
+    JsonValue v;
+    if (!RemotingSerializable::decode(data, v) || !v.isObject()) return false;
+    out = fromJson(v);
+    return true;
+}
+
+// ---------------------------------------------------------------- CheckRocksdbCqWriteResult
+JsonValue CheckRocksdbCqWriteResult::toJson() const {
+    JsonValue v = JsonValue::makeObject();
+    v.set("checkResult", JsonValue::makeString(checkResult));
+    v.set("checkStatus", JsonValue::makeInt(checkStatus));
+    return v;
+}
+
+CheckRocksdbCqWriteResult CheckRocksdbCqWriteResult::fromJson(const JsonValue& v) {
+    CheckRocksdbCqWriteResult r;
+    r.checkResult = getStr(v, "checkResult", "");
+    r.checkStatus = static_cast<int32_t>(getInt(v, "checkStatus", 0));
+    return r;
+}
+
+Bytes CheckRocksdbCqWriteResult::encode() const { return RemotingSerializable::encode(toJson()); }
+
+bool CheckRocksdbCqWriteResult::decode(const Bytes& data, CheckRocksdbCqWriteResult& out) {
+    JsonValue v;
+    if (!RemotingSerializable::decode(data, v) || !v.isObject()) return false;
+    out = fromJson(v);
+    return true;
+}
+
+// ---------------------------------------------------------------- BrokerOperatorResult
+JsonValue BrokerOperatorResult::toJson() const {
+    JsonValue v = JsonValue::makeObject();
+    JsonValue success = JsonValue::makeArray();
+    for (const std::string& s : successList) success.pushArray(JsonValue::makeString(s));
+    v.set("successList", success);
+    JsonValue failure = JsonValue::makeArray();
+    for (const std::string& s : failureList) failure.pushArray(JsonValue::makeString(s));
+    v.set("failureList", failure);
+    return v;
+}
+
+BrokerOperatorResult BrokerOperatorResult::fromJson(const JsonValue& v) {
+    BrokerOperatorResult r;
+    const JsonValue* success = v.find("successList");
+    if (success != nullptr && success->isArray()) {
+        for (size_t i = 0; i < success->size(); ++i) {
+            if (success->at(i).isString()) r.successList.push_back(success->at(i).stringValue());
+        }
+    }
+    const JsonValue* failure = v.find("failureList");
+    if (failure != nullptr && failure->isArray()) {
+        for (size_t i = 0; i < failure->size(); ++i) {
+            if (failure->at(i).isString()) r.failureList.push_back(failure->at(i).stringValue());
+        }
+    }
+    return r;
+}
+
+Bytes BrokerOperatorResult::encode() const { return RemotingSerializable::encode(toJson()); }
+
+bool BrokerOperatorResult::decode(const Bytes& data, BrokerOperatorResult& out) {
+    JsonValue v;
+    if (!RemotingSerializable::decode(data, v) || !v.isObject()) return false;
+    out = fromJson(v);
+    return true;
+}
+
 }  // namespace rocketmq
