@@ -1053,7 +1053,7 @@ export class MQClient {
   async batchAckMessage(addr: string, body: BatchAckMessageRequestBody, timeoutMillis: number): Promise<void> {
     // No custom header — the request rides the body only.
     const request = RemotingCommand.createRequestCommand(RequestCode.BATCH_ACK_MESSAGE, null);
-    request.setBody(body.encode());
+    request.body = body.encode();
     const response = await this.remotingClient.invokeSync(addr, request, timeoutMillis);
     if (response.code !== ResponseCode.SUCCESS) {
       throw new MQBrokerException(response.code, response.remark || '', addr);

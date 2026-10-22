@@ -1,7 +1,7 @@
 #!/bin/bash
 # Live verification entry point for the Node.js client (mirrors the approach of run_go_*_live.sh / run_php_live.sh).
 #
-# Usage: bash scripts/run_node_live.sh producer|consumer|pull|lite_pull|admin|pop|request_reply|admin_ns|acl|tls|check_config|fixes2|batch|slave [namesrv]
+# Usage: bash scripts/run_node_live.sh producer|consumer|pull|lite_pull|admin|pop|pop_batch_ack|request_reply|admin_ns|acl|tls|check_config|fixes2|batch|slave [namesrv]
 #
 # Cluster: assumes one is already running by default (both ns+broker ports reachable). If not,
 # this script starts its own (finds pids with jps for cleanup, stopping only the instance it
@@ -35,6 +35,7 @@ case "$WHICH" in
   lite_pull)     EXAMPLE="examples/live_lite_pull.ts"      ;;
   admin)         EXAMPLE="examples/live_admin.ts"          ;;
   pop)           EXAMPLE="examples/live_pop.ts"            ;;
+  pop_batch_ack) EXAMPLE="examples/live_pop_batch_ack.ts"  ;;
   request_reply) EXAMPLE="examples/live_request_reply.ts"  ;;
   admin_ns)      EXAMPLE="examples/live_admin_ns.ts"       ;;
   acl)           EXAMPLE="examples/live_acl.ts"            ;;
@@ -43,7 +44,7 @@ case "$WHICH" in
   fixes2)        EXAMPLE="examples/live_fixes2.ts"              ;;
   slave)         EXAMPLE="examples/live_slave_only.ts"          ;;
   batch)         EXAMPLE="examples/live_auto_batch.ts"          ;;
-  *) echo "unknown example: $WHICH (producer|consumer|pull|lite_pull|admin|pop|request_reply|admin_ns|acl|tls|check_config|fixes2|batch|slave)" >&2 ; exit 2 ;;
+  *) echo "unknown example: $WHICH (producer|consumer|pull|lite_pull|admin|pop|pop_batch_ack|request_reply|admin_ns|acl|tls|check_config|fixes2|batch|slave)" >&2 ; exit 2 ;;
 esac
 
 port_open() {

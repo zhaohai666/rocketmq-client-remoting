@@ -50,7 +50,7 @@ for (const mod of modules) {
 
 // The offline smoke suites.
 const smokes = ['test/smoke.ts', 'test/producer_smoke.ts', 'test/consumer_smoke.ts', 'test/stats_smoke.ts',
-  'test/compat_contract_smoke.ts', 'test/pop_smoke.ts', 'test/fixes2_smoke.ts', 'test/namespace_rpc_smoke.ts',
+  'test/compat_contract_smoke.ts', 'test/body_crc_smoke.ts', 'test/pop_smoke.ts', 'test/pop_batch_ack_smoke.ts', 'test/fixes2_smoke.ts', 'test/namespace_rpc_smoke.ts',
   'test/ns_failover_smoke.ts', 'test/lite_topic_queue_change_smoke.ts', 'test/pull_balance_view_smoke.ts',
   'test/socks_smoke.ts', 'test/mq_client_manager_smoke.ts', 'test/static_topic_smoke.ts',
   'test/offset_persist_timer_smoke.ts', 'test/pull_schedule_smoke.ts', 'test/admin_query_smoke.ts',

@@ -24,7 +24,7 @@ git clone <本仓库> && cd rocketmq-client-remoting/nodeJs
 node --experimental-strip-types selfcheck.ts
 ```
 
-`selfcheck.ts` 加载 `src/` 全部 **63** 个模块并依次跑 **14** 套离线冒烟，2026-10-13 实测 **ALL GREEN**，共 **301** 项检查。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
+`selfcheck.ts` 加载 `src/` 全部 **63** 个模块并依次跑 **22** 套离线冒烟，2026-10-22 实测 **ALL GREEN**，共 **532** 项检查。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
 
 | 套件 | 实测 |
 | --- | --- |
@@ -34,14 +34,22 @@ node --experimental-strip-types selfcheck.ts
 | `test/stats_smoke.ts` | 14 通过 / 0 失败 |
 | `test/compat_contract_smoke.ts`（线上格式/行为钉死面） | 10 组检查通过 |
 | `test/pop_smoke.ts` | 11 组检查通过 |
-| `test/fixes2_smoke.ts` | 38 项检查通过 |
-| `test/namespace_rpc_smoke.ts` | 5 组检查通过 |
+| `test/body_crc_smoke.ts`（存储体 BODYCRC 掩码形式） | 18 通过 / 0 失败 |
+| `test/pop_batch_ack_smoke.ts`（200151 请求形状） | 9 通过 / 0 失败 |
+| `test/fixes2_smoke.ts` | 40 项检查通过 |
+| `test/namespace_rpc_smoke.ts` | 7 组检查通过 |
 | `test/ns_failover_smoke.ts` | 12 项检查通过 |
 | `test/lite_topic_queue_change_smoke.ts` | 25 通过 / 0 失败 |
 | `test/pull_balance_view_smoke.ts` | 14 通过 / 0 失败 |
 | `test/socks_smoke.ts`（SOCKS 代理握手 + 经代理建连） | 51 通过 / 0 失败 |
 | `test/mq_client_manager_smoke.ts` | 52 通过 / 0 失败 |
 | `test/static_topic_smoke.ts` | 29 通过 / 0 失败 |
+| `test/offset_persist_timer_smoke.ts` | 21 通过 / 0 失败 |
+| `test/pull_schedule_smoke.ts` | 43 通过 / 0 失败 |
+| `test/admin_query_smoke.ts` | 7 通过 / 0 失败 |
+| `test/auth_admin_smoke.ts` | 71 通过 / 0 失败 |
+| `test/heartbeat_v2_smoke.ts` | 30 通过 / 0 失败 |
+| `test/heartbeat_v2_beat_smoke.ts` | 28 通过 / 0 失败 |
 
 ### 打包 / npm 消费（tarball 与 registry）
 
@@ -345,6 +353,7 @@ bash scripts/run_node_live.sh <目标> [namesrv]
 | `examples/live_lite_pull.ts` | LitePull subscribe+poll、seek 回退、commitSync |
 | `examples/live_lite_queue_change.ts` | 队列变更监听：扩容 2→4 / 缩容 4→2 / 未知 topic 报错 / 轮询间隔下限 |
 | `examples/live_pop.ts` | POP 消费端到端：pop → ack → 不可见时间续期 |
+| `examples/live_pop_batch_ack.ts` | `BATCH_ACK_MESSAGE`(200151) 真机腿：整批 ack、漏掉一条后它从 retry 队列复活、两轮 pop 的合并键不塌缩 |
 | `examples/live_request_reply.ts` | 326 Request-Reply：requester 发问、responder 回执、应答闭环 |
 | `examples/live_admin.ts` | 管理端：topic CRUD/集群/运行时/订阅组/连接/位点/Properties 配置 |
 | `examples/live_admin_ns.ts` | 管理端专属回环：318/319 NameServer 配置、309 consumeMessageDirectly 等 |
