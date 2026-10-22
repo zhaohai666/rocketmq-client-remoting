@@ -47,14 +47,14 @@ cd build && ctest --output-on-failure
 ```
 
 产出静态库 `build/librocketmq_remoting.a`（别名 `rocketmq::remoting`）、65 个测试二进制与
-43 个 `build/examples/` 工具。本机实测：
+44 个 `build/examples/` 工具。本机实测：
 
 ```
 100% tests passed out of 66
-Total Test time (real) = 103.62 sec
+Total Test time (real) = 141.38 sec
 ```
 
-66 个用例 = 65 个测试二进制（4639 项断言）+ 1 个编解码互调用例（73 项断言），共 **4712 项断言**。
+66 个用例 = 65 个测试二进制（4672 项断言）+ 1 个编解码互调用例（73 项断言），共 **4745 项断言**。
 
 不依赖集群的协议层自检：
 
@@ -564,6 +564,7 @@ broker 侧的订阅表、位点与轨迹才落在预期的组上。
 ./build/examples/rmq_compression_live selftest 127.0.0.1:9876
 ./build/examples/rmq_compression_live send 127.0.0.1:9876 <topic> <group> <size> [codec]
 ./build/examples/rmq_live_pop_batch_ack 127.0.0.1:9876 [legs]   # legs 为 l1/l2/l3 的任意组合（逗号分隔），默认三条全跑
+./build/examples/rmq_live_pop_mode 127.0.0.1:9876 [legs]        # 401/402 请求模式切换，legs 同上
 ```
 
 | 二进制 | 验的东西 | 额外 broker 配置 |
@@ -575,6 +576,7 @@ broker 侧的订阅表、位点与轨迹才落在预期的组上。
 | `rmq_live_pop` | POP 拉取 / ack / 延长不可见时间 / 不 ack 复活重投 | — |
 | `rmq_live_pop_consumer` | POP 消费循环 + 307 状态表里的 pullRT / pullTPS | — |
 | `rmq_live_pop_batch_ack` | 批量 ack（200151）三条腿：整批一次请求且 body 里的位集逐条对得上被弹出的位点、只丢一条时只有那一条带重试标记回来、同一队列两轮弹取合进一个报文；发出的原始帧由 RPC 钩子抓取，再用独立实现的 base64 解码校验，不靠编码自己证明自己 | — |
+| `rmq_live_pop_mode` | SET_MESSAGE_REQUEST_MODE(401) 的真机三条腿（实测 `PASS=13 FAIL=0`）：生产 `setMessageRequestMode` 把四个值全写进 JSON body → GET_ALL_MESSAGE_REQUEST_MODE(402) 回读必须按这对 topic+group 出现 `mode=POP`、`popShareQueueNum` 是数字 4；同组改写 PULL/0 必须覆盖前一次；对照腿把同样四个值塞进 header、body 留空，broker 必须拒绝（实测 code=1，remark 说请求体解不出来）且该控制组在 402 里始终缺席——同一次回读里 body 形态的锚点条目仍然可见，缺席才真是缺席。topic 每次新建、名字带 stamp，主 broker 地址取自建 topic 的路由，回读轮询到有答案为止 | — |
 | `rmq_live_pull` | 拉消费者的队列、短轮询 / 长轮询、手动位点 | — |
 | `rmq_live_pull_heartbeat` | 拉消费者的 203 / 38 / 35 报文与 consumeType 口径 | — |
 | `rmq_live_lite_pull` | 轻量拉消费者的 subscribe / assign 双模式与 poll | — |

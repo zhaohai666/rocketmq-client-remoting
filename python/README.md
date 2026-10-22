@@ -24,7 +24,7 @@ python3 -m venv .venv
 .venv/bin/pip install -e .                     # 顶层包：client / common / remoting
 
 .venv/bin/pip install pytest                   # 只有跑单元测试才需要它
-.venv/bin/python -m pytest tests/ -q           # 1593 passed, 4 skipped（121.8s）
+.venv/bin/python -m pytest tests/ -q           # 1598 passed, 4 skipped（123.4s）
 .venv/bin/python selfcheck.py                  # selfcheck: 7/7 passed
 ```
 
@@ -417,7 +417,7 @@ TCP 建连后、TLS 握手前完成 SOCKS CONNECT；NameServer HTTP 动态取址
 > ⚠ 顺序规则：**先 `start()` 消费者，再发消息。** 新订阅组默认从队列尾部开始，
 > 且首轮 rebalance 要等心跳注册完成；先发后起会稳定少掉第一批。
 
-`verify_*_live.py` 共 41 个，前 3 行是不带 `_live` 后缀的补充脚本；每个脚本各证明一件事：
+`verify_*_live.py` 共 45 个，前 3 行是不带 `_live` 后缀的补充脚本；每个脚本各证明一件事：
 
 | 脚本 | 证明 |
 | --- | --- |
@@ -436,6 +436,7 @@ TCP 建连后、TLS 握手前完成 SOCKS CONNECT；NameServer HTTP 动态取址
 | `verify_correct_tags_offset_live.py` | 空应答也把已提交位点推走（correctTagsOffset） |
 | `verify_fail_fast_live.py` | broker 真死时在途请求立刻有终态（会停一次 broker 再拉起） |
 | `verify_flow_control_live.py` | 拉取前流控的五个阈值 + 启动期数值闸门 |
+| `verify_heartbeat_v2_live.py` | 心跳 V2 打到真 broker：broker 回 `IS_SUPPORT_HEART_BEAT_V2`、按组的 `group -> fingerprint` 表真的驱动 `IS_SUB_CHANGE`（V1 一轮后首个 V2 轮算变化、下一轮不算、订阅加宽又算），归一化后等价 body 的 fingerprint 与 broker 记下的相等，`withoutSub` 轻 body 不清空 broker 侧订阅集（204 仍能看到），换一个从未交过轻 body 的组则 204 什么都没有；真推消费者走 V2 链路时轻轮次确实上线、每轮被接受、tag 过滤仍然生效、组仍在册；关掉 opt-in 的同一消费者是对照——线上没有一个非零 fingerprint 或 withoutSub，消费结果一致 |
 | `verify_hook_live.py` | CheckForbidden / FilterMessage 钩子的真实拦截 |
 | `verify_interval_live.py` | 路由刷新周期与位点落盘周期按配置生效（两条不同周期对照） |
 | `verify_latency_live.py` | 发送延迟故障规避：隔离窗口、换 broker、恢复 |
@@ -449,6 +450,7 @@ TCP 建连后、TLS 握手前完成 SOCKS CONNECT；NameServer HTTP 动态取址
 | `verify_pop_live.py` | POP 协议面：POP / ACK / 续期不可见 |
 | `verify_pop_batch_ack_live.py` | `BATCH_ACK_MESSAGE`(200151) 真机腿：整批 ack、部分 ack 后未 ack 的那条走 retry topic 复活、多轮 ack 的合并键互不重叠 |
 | `verify_pop_consumer_live.py` | POP 消费循环（推模式消费者改走 POP），含 307 拉取统计 |
+| `verify_pop_mode_live.py` | `SET_MESSAGE_REQUEST_MODE`(401) 的真机三条腿（实测 `PASS=9 FAIL=0`）：生产 `set_message_request_mode` 把 topic / consumerGroup / mode / popShareQueueNum 四个值全写进 JSON body、header 一个字段都不带 → `GET_ALL_MESSAGE_REQUEST_MODE`(402) 必须按这对 topic+group 回读到 mode=POP 且 `popShareQueueNum` 是数字 4；同组改写 PULL/0 必须覆盖前一次（读回的是第二次，不是第一次留下的值）；对照腿把同样四个值塞进 header 且 body 留空，broker 必须拒绝（实测 code=1，remark 说请求体解不出来），且该控制组在 402 里始终缺席——header 形态换不动模式。topic 每次显式新建（401 拒绝 broker 没有配置的 topic，那种拒绝和报文错误从返回码上分不出来），订阅组交给 broker `autoCreateSubscriptionGroup`，名字带 stamp，回读轮询到有答案为止 |
 | `verify_producer_unregister_live.py` | 生产者退出真的发出 `UNREGISTER_CLIENT`(35) |
 | `verify_publish_route_master_live.py` | 发布路由跳过没有 master 的 broker（会停一次 master） |
 | `verify_pull_consumer_heartbeat_live.py` | 拉模式消费者的 203/38/35（会删掉自建 topic） |
@@ -460,6 +462,7 @@ TCP 建连后、TLS 握手前完成 SOCKS CONNECT；NameServer HTTP 动态取址
 | `verify_reset_offset_live.py` | 220 重置消费位点：两种 body 形状 + 在途作废 |
 | `verify_send_header_live.py` | 发送头 `c` / `d` / `n` 三字段上线形状 |
 | `verify_sql92_live.py` | SQL92 过滤 + `CHECK_CLIENT_CONFIG`(46)（需 broker `enablePropertyFilter=true`） |
+| `verify_static_topic_live.py` | 静态 topic 五段：513 建 8 个逻辑队列映射 4 个物理队列、路由回读 `TopicQueueMappingByBroker` 非空、端点表 0-3 指向真 broker 而 4-7 是 `__syslo__none__`、实例把 mock 队列名重写成真实 broker（表外的 id 与非静态 topic 原样透传）、普通生产者发 4 条推消费者收满 4 条 |
 | `verify_subscribe_live.py` | 后置订阅 + 立即推一轮心跳 |
 | `verify_tls_live.py` | 整条客户端链路跑 TLS（`--leg plain|ca_verify|mtls`） |
 | `verify_trace_live.py` | 消息轨迹全链路（需 broker `traceTopicEnable=true`） |

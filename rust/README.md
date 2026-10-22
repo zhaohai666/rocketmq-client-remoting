@@ -25,8 +25,8 @@ NameServer + Broker，无 proxy、无本地扩展依赖、无代码生成步骤�
 
 ```bash
 cd rust
-cargo build --all-targets                       # lib + 41 个 examples
-cargo test --quiet                              # 1092 passed; 0 failed; 0 ignored（~10s）
+cargo build --all-targets                       # lib + 42 个 examples
+cargo test --quiet                              # 1096 passed; 0 failed; 0 ignored（~10s）
 cargo clippy --all-targets --all-features -- -D warnings  # 零 warning 是硬门槛
 ```
 
@@ -306,6 +306,7 @@ broker 后再发消息"**（否则首批消息会因 broker 尚不认识本组�
 | `live_validators` | 名字校验亚毫秒本地失败 + 寻址故障定性（10004） |
 | `live_admin` | admin 全链路（含 boundaryType 双边界、`reset_offset_by_queue_id`、按组查 topic） |
 | `live_admin_batch` | 批量建 topic、静态 topic、写禁配、半消息、顺序配置等 admin 报文打真实 broker |
+| `live_message_request_mode` | SET_MESSAGE_REQUEST_MODE(401) 的全部载荷只在 JSON body 里、GET_ALL_MESSAGE_REQUEST_MODE(402) 回读的真机证明（实测 `PASS=10 FAIL=0`）：**L1** 生产 `set_message_request_mode` 写 POP/4 后，402 必须按这对 topic+group 建条目，且 `popShareQueueNum` 是数字 4；**L2** 同组再写 PULL/0，回读必须变成 PULL 与数字 0（第二次写覆盖第一次，而不是留下第一次的值）；**L3 对照**——四个值全塞 header、body 为空的原始 401 必须被 broker 拒绝（非 SUCCESS；实测 code=1，remark 说明请求体解不出来），且该控制组在 402 里始终缺席：header 形态改不动模式，L1/L2 的切换才是真切换。topic 显式先建（401 拒绝 broker 没有配置的 topic，那种拒绝与报文错误无法区分），订阅组交给 broker autoCreate；名字每跑一次换新 stamp，回读轮询到有答案为止，不用固定 sleep |
 | `live_unit_config` | unitName / unitMode / stream：broker 侧可见的 clientId 后缀与 UNIT / UNIT_SUB 位 |
 | `live_sql92` | SQL92 过滤 + CHECK_CLIENT_CONFIG(46)；⚠ 需 broker `enablePropertyFilter=true`（broker 拒 SQL92 时打印修复指引并干净退出） |
 | `live_oneway_push` | oneway 实时推送：消费者先起（LAST_OFFSET），`send_oneway` 自动选队/固定队列 + 同步对照组全部实时到达 |
@@ -361,7 +362,7 @@ rust/
 │       ├── hook.rs / latency.rs / consumer_stats.rs / metrics.rs / shutdown.rs
 │       ├── request_reply.rs / top_addressing.rs / validators.rs / result.rs
 │       └── trace.rs / trace_context.rs / trace_hook.rs / trace_dispatcher.rs
-└── examples/                   41 个真机联调工具（见上表）
+└── examples/                   42 个真机联调工具（见上表）
 ```
 
 单元测试内联在 `src/**/mod tests`（需要访问 `pub(crate)` 与假时钟）；只有真机才能证明的性质

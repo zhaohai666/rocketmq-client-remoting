@@ -28,7 +28,7 @@ python3 -m venv .venv
 .venv/bin/pip install -e .                     # top-level packages: client / common / remoting
 
 .venv/bin/pip install pytest                   # needed only to run the unit tests
-.venv/bin/python -m pytest tests/ -q           # 1593 passed, 4 skipped
+.venv/bin/python -m pytest tests/ -q           # 1598 passed, 4 skipped
 .venv/bin/python selfcheck.py                  # selfcheck: 7/7 passed
 ```
 
@@ -435,7 +435,7 @@ drops straight into CI.
 > the tail of the queue and the first rebalance waits for the heartbeat registration, so sending
 > before start-up reliably loses the first batch.
 
-There are 41 `verify_*_live.py` scripts; the first three rows are the companion scripts that are not
+There are 45 `verify_*_live.py` scripts; the first three rows are the companion scripts that are not
 named `_live`. One line each on what they prove:
 
 | Script | What it proves |
@@ -455,6 +455,7 @@ named `_live`. One line each on what they prove:
 | `verify_correct_tags_offset_live.py` | An empty response still advances the committed offset (correctTagsOffset) |
 | `verify_fail_fast_live.py` | In-flight requests get a terminal state immediately once the broker really dies (stops and restarts a broker) |
 | `verify_flow_control_live.py` | The five pre-pull flow-control thresholds plus the start-up numeric gates |
+| `verify_heartbeat_v2_live.py` | Heartbeat V2 against a real broker: the broker answers `IS_SUPPORT_HEART_BEAT_V2`, its per-group `group -> fingerprint` table really drives `IS_SUB_CHANGE` (a V1 round followed by the first V2 round is a change, the round after it is not, and a widened subscription is a change again), a fingerprint rebuilt from an equivalent body equals the one the broker recorded (the normalization that drops subVersion / clientID is what makes that true), and a `withoutSub` round keeps the broker-side subscription set (204 still shows it) while the same light body for a group that never delivered one leaves 204 with nothing; a real push consumer driven through the V2 path proves the light rounds go out, every round is accepted, the broker-side tag filter still holds afterwards and the group stays registered; the same consumer with the opt-in off is the paired control — not one non-zero fingerprint or withoutSub body on the wire, and it consumes just the same |
 | `verify_hook_live.py` | CheckForbidden / FilterMessage hooks actually intercepting |
 | `verify_interval_live.py` | Route-refresh and offset-persist periods take effect as configured (two instances, two periods) |
 | `verify_latency_live.py` | Send-latency fault avoidance: isolation window, broker switch, recovery |
@@ -467,6 +468,8 @@ named `_live`. One line each on what they prove:
 | `verify_pinned_guard_live.py` | The pinned-send topic guard: real routes not falsely rejected, wrong topic rejected, oneway unguarded |
 | `verify_pop_live.py` | The POP protocol surface: POP / ACK / invisible-time renew |
 | `verify_pop_consumer_live.py` | The POP consumption loop (a push consumer driven by POP), incl. 307 statistics |
+| `verify_pop_batch_ack_live.py` | BATCH_ACK_MESSAGE(200151) on a real broker: one request clears the whole batch, the one message left un-acked revives through the retry topic, and the merge keys of several ack rounds stay disjoint |
+| `verify_pop_mode_live.py` | Three live legs of SET_MESSAGE_REQUEST_MODE(401) (measured `PASS=9 FAIL=0`): the production `set_message_request_mode` writes topic / consumerGroup / mode / popShareQueueNum entirely into the JSON body with no custom header at all, so GET_ALL_MESSAGE_REQUEST_MODE(402) must answer an entry keyed by exactly this topic+group with mode POP and `popShareQueueNum` the number 4; re-issuing PULL/0 for the same group must overwrite the first write, i.e. the read-back reports the second write rather than what the first one left; the paired control pushes the same four values into the header with an empty body, the broker must refuse it (measured code=1 with a remark saying the request body could not be decoded) and that control group must stay absent from 402, so the header shape switches no mode. The topic is created explicitly every run (401 refuses a topic the broker has no config for, and that refusal is indistinguishable from a broken request shape), the subscription group is left to the broker's `autoCreateSubscriptionGroup`, names are stamped per run, and each read-back polls until it is answered |
 | `verify_producer_unregister_live.py` | Producer shutdown really sends `UNREGISTER_CLIENT`(35) |
 | `verify_publish_route_master_live.py` | Publish routing skips brokers without a master (stops a master once) |
 | `verify_pull_consumer_heartbeat_live.py` | The pull consumer's 203/38/35 heartbeats (deletes the topic it created) |
@@ -478,6 +481,7 @@ named `_live`. One line each on what they prove:
 | `verify_reset_offset_live.py` | 220 consumer offset reset: both body shapes plus in-flight invalidation |
 | `verify_send_header_live.py` | The on-the-wire shape of the `c` / `d` / `n` send-header fields |
 | `verify_sql92_live.py` | SQL92 filtering + `CHECK_CLIENT_CONFIG`(46) (needs broker `enablePropertyFilter=true`) |
+| `verify_static_topic_live.py` | Static topic in five stages: 513 maps 8 logical queues onto 4 physical ones, the route read-back has a non-empty `TopicQueueMappingByBroker`, the endpoint table sends 0-3 to the real broker and 4-7 to `__syslo__none__`, the instance rewrites a mock queue name back to the real broker (ids outside the table and non-static topics pass through), and an ordinary producer's 4 messages are all collected by a push consumer |
 | `verify_subscribe_live.py` | Late subscription + the immediate heartbeat round |
 | `verify_tls_live.py` | The entire client path over TLS (`--leg plain|ca_verify|mtls`) |
 | `verify_trace_live.py` | Message tracing end to end (needs broker `traceTopicEnable=true`) |

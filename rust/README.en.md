@@ -31,7 +31,7 @@ code-generation step.
 ```bash
 cd rust
 cargo build --all-targets                       # lib + 41 examples
-cargo test --quiet                              # 1092 passed; 0 failed; 0 ignored (~10s)
+cargo test --quiet                              # 1096 passed; 0 failed; 0 ignored (~10s)
 cargo clippy --all-targets --all-features -- -D warnings  # zero warnings is a hard gate
 ```
 
@@ -336,6 +336,7 @@ list extra preconditions.
 | `live_validators` | name validation fails locally in sub-millisecond time + addressing-fault characterization (10004) |
 | `live_admin` | the full admin chain (incl. boundaryType double boundaries, `reset_offset_by_queue_id`, query topics by consumer group) |
 | `live_admin_batch` | admin payloads against a real broker: batch topic creation, static topics, write-perm config, half messages, ordering config, etc. |
+| `live_message_request_mode` | real-broker proof that SET_MESSAGE_REQUEST_MODE(401) carries its whole payload in the JSON body and that GET_ALL_MESSAGE_REQUEST_MODE(402) reads it back (measured `PASS=10 FAIL=0`): **L1** after the production `set_message_request_mode` writes POP/4, 402 must hold an entry keyed by exactly this topic+group whose `popShareQueueNum` is the number 4; **L2** writing PULL/0 for the same group must come back as PULL with the number 0 — the second write replaces the first rather than leaving the first value standing; **L3 control** — a raw 401 with all four values pushed into the header and an empty body must be rejected by the broker (not SUCCESS; measured code=1 with a remark saying the request body could not be decoded) and its control group must stay absent from 402, so the header shape switches nothing and the switches in L1/L2 are real. The topic is created explicitly first (401 refuses a topic the broker has no config for, and that refusal is indistinguishable from a broken request shape), the subscription group is left to the broker's autoCreate, names are stamped per run, and every read-back polls until it is answered instead of sleeping a fixed duration. |
 | `live_unit_config` | unitName / unitMode / stream: the clientId suffix visible broker-side and the UNIT / UNIT_SUB flags |
 | `live_sql92` | SQL92 filtering + CHECK_CLIENT_CONFIG(46); ⚠ requires broker `enablePropertyFilter=true` (when the broker refuses SQL92 the probe prints the fix and exits cleanly) |
 | `live_oneway_push` | oneway real-time push: consumer starts first (LAST_OFFSET), `send_oneway` auto-selected/pinned queues + a sync control all arrive in real time |

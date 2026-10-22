@@ -33,7 +33,7 @@ dotnet test tests/RocketMQ.Client.Tests
 | 命令 | 结果 |
 | --- | --- |
 | `dotnet build --no-incremental` | `0 个警告` / `0 个错误`，用时 `00:00:17.94` |
-| `dotnet test tests/RocketMQ.Client.Tests` | `已通过! - 失败: 0，通过: 1001，已跳过: 0，总计: 1001，持续时间: 3 m 23 s` |
+| `dotnet test tests/RocketMQ.Client.Tests` | `已通过! - 失败: 0，通过:  1006，已跳过: 0，总计:  1006，持续时间: 3 m 23 s` |
 
 `Directory.Build.props` 里 `TreatWarningsAsErrors=true` 全局生效，所以「构建通过」等价于「零 warning」。
 测试输出跟随系统区域设置，中文 locale 下汇总行是中文，检索时按 `总计:` 匹配。
@@ -503,7 +503,7 @@ producer.TlsOptions = new TlsOptions
   发送 / 消费 / 事务 / Forbidden / FilterMessage 钩子、ACL 签名、动态 NameServer 取址、故障规避选队列
 - ✅ 压缩：zlib / LZ4 / ZSTD；TLS：`SslStream`，test-mode 与严格校验 / mTLS
 - ✅ 客户端日志：按大小轮转、双写 stderr 与文件
-- ✅ 单元测试 1001 项；`rmq` 真机联调工具 39 条子命令（含主从、故障注入、压缩互通矩阵）
+- ✅ 单元测试 1006 项；`rmq` 真机联调工具 40 条子命令（含主从、故障注入、压缩互通矩阵）
 
 ## 客户端日志
 
@@ -580,6 +580,7 @@ dotnet run --no-build --project examples/RocketMQ.Examples -- lite-queue-change 
 | `pop` | POP 协议：POP / ACK / 延长不可见 / 复活重投 |
 | `popc` | POP 消费侧：消费循环 / ack / 延迟重投 |
 | `pop-batch-ack <namesrv> [legs] [stamp]` | BATCH_ACK_MESSAGE(200151) 真机腿，跑法 `dotnet run --no-build --project examples/RocketMQ.Examples -- pop-batch-ack 127.0.0.1:9876`（`legs` 可给 `l1`/`l2`/`l3`）。三条：l1 一次请求清整批（8 条 CK 落成 1 个 body —— 位点从压缩 bit 集里**解回**来比对、每个合并键恰一个条目、条目逐字段照写自己的 CK、brokerName 取**第一条** CK、body 过一遍线上编解码、请求帧零自定义头，随后 2.5 倍不可见时间内零复活）；l2 对照腿（6 条只 ack 5 条，只有被漏掉的那条回来，其 CK 带重试标记 `1`，清它的 body 仍写**业务 topic**，`%RETRY%<group>_<topic>` 路由在 ack **之后**才探，之后无二次复活）；l3 同一队列两轮各 2 条用一个请求（两轮合并键不同，4 个位点落在 2 个条目）。窗口一律按已记录状态收口、每个等待都带预算；200151 **无需 broker 开关、无需重启** |
+| `pop-mode <namesrv> [legs] [stamp]` | SET_MESSAGE_REQUEST_MODE(401) / GET_ALL_MESSAGE_REQUEST_MODE(402) 真机腿（实测 `PASS=13 FAIL=0`），跑法 `dotnet run --no-build --project examples/RocketMQ.Examples -- pop-mode 127.0.0.1:9876`。l1：生产 `SetMessageRequestMode` 把四个值全写进 JSON body、header 一个字段都不带，402 必须按这对 topic+group 回读到 mode=POP 且 `popShareQueueNum` 是数字 4；l2：同组改写 PULL/0，读回必须是第二次写的值，不是第一次留下的；l3 对照：把同样四个值塞进 header、body 留空的原始 401 必须被 broker 拒绝（实测 code=1，remark 说请求体解不出来），该控制组在 402 里始终缺席，而同一次读回里 body 形态的锚点条目仍然可见——缺席才真是缺席。401 拒绝 broker 没有配置的 topic，所以 topic 每次先显式创建、名字带 stamp；订阅组交给 broker `autoCreateSubscriptionGroup`；每个等待都带预算、按已记录状态收口 |
 | `trace` | 消息轨迹全链路（需 broker `traceTopicEnable=true`） |
 | `hook` | CheckForbidden / FilterMessage 钩子 |
 | `backpressure` | 异步发送背压公平信号量：条数与字节闸、拒绝对账、运行时扩容 |
@@ -605,7 +606,7 @@ dotnet run --no-build --project examples/RocketMQ.Examples -- lite-queue-change 
 `acl`（`authenticationEnabled=true`）、`recall` / `lite-pull-code` / `reset-offset` /
 `admin-batch-live`（用例会自己翻开关并还原）、`tls` 的 `ca_verify` / `mtls`（broker 侧真起 TLS）、
 `fail-fast` / `publish-route-master` / `pull-heartbeat`（主从与停启，走 `../scripts/rmq_test_broker.sh`）。
-POP 与广播不需要额外开关，`popc` / `pop` / `pop-batch-ack` 直接跑：
+POP 与广播不需要额外开关，`popc` / `pop` / `pop-batch-ack` / `pop-mode` 直接跑：
 BATCH_ACK_MESSAGE(200151) 由 broker 无条件注册，既不用改配置也不用重启。
 
 ## 目录结构
