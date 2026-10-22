@@ -54,7 +54,7 @@ pub const MESSAGE_STORE_TIMESTAMP_POSITION: usize = 56;
 /// Fixed header (including the BODY length field) shared by v1/v2 frames apart from the differing topic length width.
 const HEADER_WITHOUT_BODY_LEN: usize = 4 + 4 + 4 + 4 + 4 + 8 + 8 + 4 + 8 + 8 + 4 + 8;
 
-pub use crate::common::util_all::crc32;
+pub use crate::common::util_all::{crc32, crc32_raw};
 
 /// Converts a string straight to bytes as UTF-8 (both the protocol properties section and the topic field use this encoding).
 pub fn string2bytes(s: &str) -> Vec<u8> {
@@ -204,7 +204,8 @@ pub struct DecodeOptions {
     pub decompress_body: bool,
     /// When true, `msgId` is also written into `offset_msg_id` (client view).
     pub is_client: bool,
-    /// Validates BODYCRC.
+    /// Validates the BODYCRC field (the stored CRC-32 of the body bytes with the
+    /// sign bit cleared) against the body actually read.
     pub check_crc: bool,
 }
 
@@ -381,6 +382,8 @@ pub fn decode_message_with(raw: &[u8], options: &DecodeOptions) -> Result<Messag
         let body_bytes = reader.bytes(body_len as usize)?;
         if options.read_body {
             let mut body = body_bytes.to_vec();
+            // crc32() returns the same sign-bit-cleared value the store stamps into BODYCRC,
+            // so a valid frame passes this check whatever the width of its checksum.
             if options.check_crc && crc32(&body) != body_crc {
                 return Err(Error::Decode("Msg crc is error".into()));
             }
@@ -595,8 +598,10 @@ mod tests {
         ext
     }
 
-    /// A 139-byte extended-message frame captured from the wire (ground truth of the v1 17-field encoding).
-    const EXT_HEX: &str = "0000008bdaa320a7f3307b09000000030000000200000000000000580000000000000400\
+    /// A 139-byte extended-message frame: ground truth of the v1 17-field encoding, BODYCRC
+    /// written the way the store writes it (0x7330_7B09 = CRC-32 of "hello rocketmq" with the
+    /// sign bit cleared, not the full 0xF330_7B09).
+    const EXT_HEX: &str = "0000008bdaa320a773307b09000000030000000200000000000000580000000000000400\
                            000000000000018bcfe568007f0000010000d4310000018bcfe5687b7f00000100002a9f\
                            0000000100000000000000000000000e68656c6c6f20726f636b65746d7109546f706963\
                            546573740019544147530154616741024b455953016b657931206b65793202";
@@ -673,7 +678,9 @@ mod tests {
         assert_eq!(got.get_queue_id(), 3);
         assert_eq!(got.queue_offset, 88);
         assert_eq!(got.commit_log_offset, 1024);
-        assert_eq!(got.get_body_crc(), crc32(b"hello rocketmq"));
+        assert_eq!(got.get_body_crc(), 0x7330_7B09, "stored BODYCRC field");
+        assert_eq!(crc32(b"hello rocketmq"), 0x7330_7B09);
+        assert_ne!(crc32_raw(b"hello rocketmq"), got.get_body_crc());
         assert_eq!(got.get_born_timestamp(), 1_700_000_000_000);
         assert_eq!(got.get_store_timestamp(), 1_700_000_000_123);
         assert_eq!(got.get_born_host(), Some("127.0.0.1"));
@@ -1055,12 +1062,77 @@ mod tests {
 
     // --------------------------------------------------------- crc32
 
+    /// BODYCRC sits right after TOTALSIZE(4) and MAGICCODE(4).
+    const BODY_CRC_POSITION: usize = 8;
+
+    /// Chosen because its unmasked checksum has the sign bit set.
+    const HIGH_BIT_BODY: &[u8] = b"crc-highbit-2";
+
+    /// Full CRC-32 of [`HIGH_BIT_BODY`] before the store clears the sign bit.
+    const HIGH_BIT_CRC_RAW: u32 = 0x9BD9_A717;
+
+    /// The BODYCRC field a store frame carries for [`HIGH_BIT_BODY`].
+    const HIGH_BIT_CRC_STORED: u32 = 0x1BD9_A717;
+
     #[test]
-    fn crc32_is_standard() {
+    fn body_crc_is_crc32_with_sign_bit_cleared() {
         assert_eq!(crc32(b""), 0);
-        assert_eq!(crc32(b"a"), 0xE8B7_BE43);
+        // Sign bit set: the stored field and the unmasked checksum diverge.
+        assert_eq!(crc32_raw(b"a"), 0xE8B7_BE43);
+        assert_eq!(crc32(b"a"), 0x68B7_BE43);
+        // Below 2^31 the two coincide, which is exactly why both are pinned here.
+        assert_eq!(crc32_raw(b"abc"), 0x3524_41C2);
         assert_eq!(crc32(b"abc"), 0x3524_41C2);
+        assert_eq!(crc32_raw(b"1234567890"), 639_479_525);
         assert_eq!(crc32(b"1234567890"), 639_479_525);
+        // The fixture pair, pinned from both sides.
+        assert_eq!(crc32_raw(HIGH_BIT_BODY), HIGH_BIT_CRC_RAW);
+        assert_eq!(crc32(HIGH_BIT_BODY), HIGH_BIT_CRC_STORED);
+        assert_eq!(HIGH_BIT_CRC_RAW & 0x7FFF_FFFF, HIGH_BIT_CRC_STORED);
+    }
+
+    #[test]
+    fn check_crc_accepts_high_bit_body_whose_stored_crc_is_masked() {
+        let mut ext = build_ext(&[]);
+        ext.set_body(Some(HIGH_BIT_BODY));
+        // Field taken from the stored constant, never derived through crc32().
+        ext.set_body_crc(HIGH_BIT_CRC_STORED);
+        let frame = encode_message_ext(&ext, false).unwrap();
+        let options = DecodeOptions {
+            check_crc: true,
+            ..DecodeOptions::default()
+        };
+        let got = decode_message_with(&frame, &options)
+            .expect("valid frame whose CRC has the sign bit set must pass");
+        assert_eq!(got.get_body(), HIGH_BIT_BODY);
+        assert_eq!(got.get_body_crc(), HIGH_BIT_CRC_STORED);
+    }
+
+    #[test]
+    fn check_crc_rejects_a_wrong_stored_crc_for_the_same_body() {
+        let mut ext = build_ext(&[]);
+        ext.set_body(Some(HIGH_BIT_BODY));
+        ext.set_body_crc(HIGH_BIT_CRC_STORED ^ 0x0000_0001);
+        let frame = encode_message_ext(&ext, false).unwrap();
+        let options = DecodeOptions {
+            check_crc: true,
+            ..DecodeOptions::default()
+        };
+        let err = decode_message_with(&frame, &options).unwrap_err();
+        assert!(matches!(err, Error::Decode(m) if m.contains("crc")));
+        // The identical frame decodes once the opt-in check is off.
+        assert_eq!(decode_message(&frame).unwrap().get_body(), HIGH_BIT_BODY);
+    }
+
+    #[test]
+    fn encoder_stamps_body_crc_with_sign_bit_cleared() {
+        let mut ext = build_ext(&[]);
+        ext.set_body(Some(HIGH_BIT_BODY));
+        ext.body_crc = crc32(ext.body.as_deref().unwrap_or(&[]));
+        let frame = encode_message_ext(&ext, false).unwrap();
+        let field_at = |p: usize| u32::from_be_bytes(frame[p..p + 4].try_into().unwrap());
+        assert_eq!(field_at(BODY_CRC_POSITION), HIGH_BIT_CRC_STORED);
+        assert_ne!(field_at(BODY_CRC_POSITION), HIGH_BIT_CRC_RAW);
     }
 
     #[test]

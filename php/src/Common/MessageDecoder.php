@@ -18,7 +18,7 @@ use Throwable;
  *    index  field                             encoding
  *    1      TOTALSIZE                         int(4)
  *    2      MAGICCODE                         int(4)  -626843481 (v1) / -626843477 (v2)
- *    3      BODYCRC                           int(4)
+ *    3      BODYCRC                           int(4)  CRC-32 of the body, sign bit dropped
  *    4      QUEUEID                           int(4)
  *    5      FLAG                              int(4)
  *    6      QUEUEOFFSET                       long(8)
@@ -127,12 +127,14 @@ final class MessageDecoder
     }
 
     /**
-     * BODYCRC uses the standard CRC32 (poly 0xEDB88320); the PHP built-in crc32() takes the same
-     * parameter, so the value can be compared directly against what the broker wrote.
+     * BODYCRC holds the CRC-32 (poly 0xEDB88320) of the body **with the high (sign) bit dropped**:
+     * ``UtilAll::crc32`` masks with 0x7FFFFFFF, which is exactly what the broker writes into the field.
+     * Comparing against the whole 32-bit CRC instead would reject roughly half of all bodies — every one
+     * whose CRC has the high bit set — as "Msg crc is error".
      */
     public static function crc32(string $data): int
     {
-        return crc32($data) & 0xFFFFFFFF;
+        return UtilAll::crc32($data);
     }
 
     // ------------------------------------------------------- property string <-> Map
@@ -368,6 +370,8 @@ final class MessageDecoder
         $buf = '';
         $buf .= pack('N', $storeSize & 0xFFFFFFFF);                       // 1 TOTALSIZE
         $buf .= pack('N', self::MESSAGE_MAGIC_CODE & 0xFFFFFFFF);         // 2 MAGICCODE
+        // BODYCRC echoes the value that was read from the wire, which already carries the CRC with the
+        // sign bit dropped; the mask only normalises the bit pattern.
         $buf .= pack('N', $messageExt->getBodyCrc() & 0xFFFFFFFF);        // 3 BODYCRC
         $buf .= pack('N', $messageExt->getQueueId() & 0xFFFFFFFF);        // 4 QUEUEID
         $buf .= pack('N', $messageExt->getFlag() & 0xFFFFFFFF);           // 5 FLAG
@@ -455,6 +459,8 @@ final class MessageDecoder
             if ($bodyLen > 0) {
                 if ($readBody) {
                     $body = self::take($raw, $offset, $bodyLen);
+                    // The comparison uses the same sign-bit-dropped CRC the broker wrote into BODYCRC; a
+                    // whole 32-bit CRC here would reject every body whose CRC has the high bit set.
                     if ($checkCrc && self::crc32($body) !== $bodyCrc) {
                         throw new \RuntimeException('Msg crc is error');
                     }
@@ -537,6 +543,9 @@ final class MessageDecoder
      * The single-message encoding of a batch message (6-segment lightweight format).
      *
      * Only TOTALSIZE / MAGICCODE(0) / BODYCRC(0) / FLAG / BODY / PROPERTIES are written.
+     *
+     * BODYCRC is a literal 0 here: this lightweight frame carries no body checksum at all, so no CRC is
+     * computed and the sign-bit-dropped form of the stored format does not apply.
      */
     public static function encodeMessage(Message $message): string
     {
@@ -548,7 +557,7 @@ final class MessageDecoder
         $buf = '';
         $buf .= pack('N', $storeSize & 0xFFFFFFFF);                 // 1 TOTALSIZE
         $buf .= pack('N', 0);                                       // 2 MAGICCODE (fixed 0 in the batch scenario)
-        $buf .= pack('N', 0);                                       // 3 BODYCRC
+        $buf .= pack('N', 0);                                       // 3 BODYCRC (fixed 0: see the note above)
         $buf .= pack('N', $message->getFlag() & 0xFFFFFFFF);        // 4 FLAG
         $buf .= pack('N', strlen($body) & 0xFFFFFFFF);              // 5 BODY
         $buf .= $body;

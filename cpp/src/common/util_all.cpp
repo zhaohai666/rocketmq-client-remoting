@@ -153,7 +153,8 @@ uint32_t UtilAll::crc32(const Bytes& data) {
     for (unsigned char c : data) {
         crc = table.t[(crc ^ c) & 0xFF] ^ (crc >> 8);
     }
-    return crc ^ 0xFFFFFFFFu;
+    // The stored BODYCRC field carries the sign bit of the CRC-32 result dropped.
+    return (crc ^ 0xFFFFFFFFu) & 0x7FFFFFFFu;
 }
 
 int32_t UtilAll::charToByte(char c) {

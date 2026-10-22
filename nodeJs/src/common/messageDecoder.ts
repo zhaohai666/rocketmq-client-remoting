@@ -3,7 +3,7 @@ import { Buffer } from 'node:buffer';
 import { Message, MessageExt, MessageBatch } from './message.ts';
 import { MessageSysFlag } from './sysflag.ts';
 import { compressFor, decompressFor } from './compress.ts';
-import { crc32 } from './utilAll.ts';
+import { crc32Match } from './utilAll.ts';
 
 const CHARSET = 'utf8';
 const NAME_VALUE_SEPARATOR = 1;
@@ -249,7 +249,10 @@ export function decodeMessage(raw: Buffer, readBody = true, decompressBody = tru
     if (bodyLen > 0) {
       if (readBody) {
         let body = raw.subarray(offset, offset + bodyLen);
-        if (checkCrc && crc32(body) !== bodyCrc) throw new Error('Msg crc is error');
+        // The BODYCRC field carries the CRC with the sign bit dropped, so the
+        // comparison must be made against that masked form. Checked on the stored
+        // bytes, before any decompression.
+        if (checkCrc && crc32Match(body) !== bodyCrc) throw new Error('Msg crc is error');
         if (decompressBody && (sysFlag & MessageSysFlag.COMPRESSED_FLAG)) {
           const ct = MessageSysFlag.getCompressionType(sysFlag);
           body = _decompress(body, ct);

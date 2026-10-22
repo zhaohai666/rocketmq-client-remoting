@@ -58,8 +58,17 @@ func StringHash31(s string) int32 {
 	return h
 }
 
-// Crc32 is the standard IEEE CRC-32 (b"a"=0xE8B7BE43, b"abc"=0x352441C2).
-func Crc32(data []byte) uint32 { return crc32.ChecksumIEEE(data) }
+// Crc32 returns the value a stored message carries in its BODYCRC field: the
+// IEEE CRC-32 of the body with the high (sign) bit dropped, i.e.
+// crc32.ChecksumIEEE(data) & 0x7FFFFFFF.
+//
+// The broker writes BODYCRC (and every other stored field) as a signed int32,
+// so the sign bit never reaches the wire: b"a" has IEEE CRC 0xE8B7BE43 but is
+// stored as 0x68B7BE43, and b"abc" (0x352441C2, sign bit clear) is stored
+// unchanged. Comparing a whole 32-bit IEEE CRC against that field disagrees for
+// roughly half of all bodies, so callers validating or stamping BODYCRC must use
+// this masked value rather than the raw checksum.
+func Crc32(data []byte) uint32 { return crc32.ChecksumIEEE(data) & 0x7FFFFFFF }
 
 // Bytes2String renders per-byte UPPERCASE hex (msgId casing depends on it).
 func Bytes2String(bytes []byte) string {

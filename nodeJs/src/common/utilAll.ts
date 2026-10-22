@@ -13,6 +13,8 @@ const CRC_TABLE = (() => {
   return table;
 })();
 
+// Raw full-width CRC-32/ISO-HDLC. Keep this as the generic utility; the value the
+// store frame carries is the masked form below.
 export function crc32(buf) {
   const data = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
   let c = 0xffffffff;
@@ -22,6 +24,10 @@ export function crc32(buf) {
   return (c ^ 0xffffffff) >>> 0;
 }
 
+// The BODYCRC form the store actually writes into a message frame: CRC-32/ISO-HDLC
+// with the sign bit dropped. Comparing a full 32-bit CRC against that wire field
+// disagrees for roughly half of all bodies (any body whose CRC has the high bit
+// set), so a check built on crc32() rejects perfectly valid messages.
 export function crc32Match(buf) {
   return crc32(buf) & 0x7fffffff;
 }

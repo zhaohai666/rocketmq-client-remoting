@@ -1,6 +1,7 @@
 package common
 
 import (
+	"hash/crc32"
 	"strings"
 	"testing"
 	"time"
@@ -26,21 +27,41 @@ func TestStringHash31MatchesReferenceVectors(t *testing.T) {
 	}
 }
 
-func TestCrc32MatchesZlib(t *testing.T) {
-	if Crc32(nil) != 0 {
-		t.Fatal("crc32(\"\") != 0")
+func TestCrc32PinsStoredBodyCRC(t *testing.T) {
+	// Crc32 returns the value the BODYCRC field carries: the IEEE CRC-32 with
+	// the high (sign) bit dropped, because the field is stored as signed int32.
+	cases := []struct {
+		in   string
+		want uint32
+	}{
+		{"", 0},
+		{"1234567890", 639479525},          // sign bit already clear: unchanged
+		{"the quick brown fox", 297861834}, // raw 2445345482 has the sign bit set
+		{"a", 0x68B7BE43},                  // raw 0xE8B7BE43 masked
+		{"abc", 0x352441C2},                // sign bit clear: unchanged
 	}
-	if Crc32([]byte("1234567890")) != 639479525 {
-		t.Fatal("crc32(1234567890) mismatch")
+	for _, c := range cases {
+		if got := Crc32([]byte(c.in)); got != c.want {
+			t.Fatalf("Crc32(%q) = %#x (%d), want %#x (%d)", c.in, got, got, c.want, c.want)
+		}
 	}
-	if Crc32([]byte("the quick brown fox")) != 2445345482 {
-		t.Fatal("crc32(quick fox) mismatch")
+
+	// Pinned control: at least one input's raw IEEE CRC differs from Crc32 only
+	// in the sign bit, so the mask is enforced rather than accidentally
+	// satisfied by inputs whose sign bit happens to be clear.
+	maskedOnly := 0
+	for _, c := range cases {
+		raw := crc32.ChecksumIEEE([]byte(c.in))
+		got := Crc32([]byte(c.in))
+		if got != raw && got^raw == 0x80000000 {
+			maskedOnly++
+		}
+		if got != raw&0x7FFFFFFF {
+			t.Fatalf("Crc32(%q) = %#x, want raw %#x & 0x7FFFFFFF", c.in, got, raw)
+		}
 	}
-	if Crc32([]byte("a")) != 0xE8B7BE43 {
-		t.Fatal("crc32(a) mismatch")
-	}
-	if Crc32([]byte("abc")) != 0x352441C2 {
-		t.Fatal("crc32(abc) mismatch")
+	if maskedOnly == 0 {
+		t.Fatal("no input had its sign bit dropped; mask is not pinned")
 	}
 }
 

@@ -35,6 +35,9 @@ struct UtilAll {
     // Network-order bytes -> IP string (v4: 4B, v6: 16B)
     static bool bytesToIp(const Bytes& raw, std::string& ip);
 
+    // Value the store writes into the BODYCRC field: CRC-32 with the sign bit dropped.
+    // Comparing a full 32-bit CRC against that field disagrees for roughly half of all bodies,
+    // i.e. every body whose CRC has bit 31 set, so such an opt-in check rejects valid messages.
     static uint32_t crc32(const Bytes& data);
 
     static int32_t charToByte(char c);

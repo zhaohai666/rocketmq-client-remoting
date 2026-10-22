@@ -357,10 +357,13 @@ func checkMessageIDRoundTrip() {
 }
 
 func checkCrc32Vector() {
-	const name = "Crc32 standard IEEE vectors (b\"\"=0, b\"a\"=0xE8B7BE43, b\"abc\"=0x352441C2)"
+	const name = "Crc32 stored-BODYCRC vectors: sign bit dropped (b\"\"=0, b\"a\"=0x68B7BE43, b\"abc\"=0x352441C2)"
 
+	// BODYCRC is stored as a signed int32, so the field holds the IEEE CRC-32
+	// with the high (sign) bit dropped. b"a" has IEEE CRC 0xE8B7BE43 but is
+	// stamped 0x68B7BE43; b"abc" has the sign bit clear and is unchanged.
 	ok := common.Crc32(nil) == 0 &&
-		common.Crc32([]byte("a")) == 0xE8B7BE43 &&
+		common.Crc32([]byte("a")) == 0x68B7BE43 &&
 		common.Crc32([]byte("abc")) == 0x352441C2
 	check(name, ok, fmt.Sprintf("empty=%#x a=%#x abc=%#x",
 		common.Crc32(nil), common.Crc32([]byte("a")), common.Crc32([]byte("abc"))))

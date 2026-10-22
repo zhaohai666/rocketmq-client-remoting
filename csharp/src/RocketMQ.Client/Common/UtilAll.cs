@@ -157,6 +157,12 @@ public static class UtilAll
         return true;
     }
 
+    /// <summary>
+    /// The value the store writes into a message frame's BODYCRC field: CRC-32/ISO-HDLC with the
+    /// sign bit dropped (<c>crc &amp; 0x7FFFFFFF</c>). Comparing a full 32-bit CRC against that field
+    /// disagrees for about half of all bodies — every one whose CRC has the high bit set — so such a
+    /// check would reject perfectly valid messages.
+    /// </summary>
     public static uint Crc32(byte[] data)
     {
         uint crc = 0xFFFFFFFFu;
@@ -165,7 +171,7 @@ public static class UtilAll
             crc = Crc32Table[(crc ^ b) & 0xFF] ^ (crc >> 8);
         }
 
-        return crc ^ 0xFFFFFFFFu;
+        return (crc ^ 0xFFFFFFFFu) & 0x7FFFFFFF;
     }
 
     private static readonly uint[] Crc32Table = BuildCrc32Table();

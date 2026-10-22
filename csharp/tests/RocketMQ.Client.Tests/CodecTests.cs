@@ -311,9 +311,107 @@ public class CodecTests
     }
 
     [Fact]
-    public void Crc32_KnownVector()
+    public void StoredBodyCrc_Vector_For123456789_IsMasked()
     {
-        Assert.Equal(0xCBF43926u, UtilAll.Crc32(Encoding.ASCII.GetBytes("123456789")));
+        // Stored BODYCRC = CRC-32/ISO-HDLC with the sign bit dropped.
+        // "123456789": raw = 0xCBF43926 (high bit set) -> stored/masked = 0x4BF43926.
+        byte[] data = Encoding.ASCII.GetBytes("123456789");
+        Assert.Equal(0xCBF43926u, RawCrc32(data));
+        Assert.Equal(0x4BF43926u, UtilAll.Crc32(data));
+    }
+
+    [Fact]
+    public void StoredBodyCrc_PinHighBitVector_SeparatesMaskedFromRaw()
+    {
+        // b"a": the raw CRC has the high bit set, so the masked stored value differs from the raw one.
+        byte[] a = Encoding.ASCII.GetBytes("a");
+        Assert.Equal(0xE8B7BE43u, RawCrc32(a));      // unmasked CRC-32/ISO-HDLC
+        Assert.Equal(0x68B7BE43u, UtilAll.Crc32(a)); // stored BODYCRC (sign bit dropped)
+
+        // b"abc": raw CRC already below 2^31, so masked == raw.
+        byte[] abc = Encoding.ASCII.GetBytes("abc");
+        Assert.Equal(0x352441C2u, RawCrc32(abc));
+        Assert.Equal(0x352441C2u, UtilAll.Crc32(abc));
+    }
+
+    [Fact]
+    public void StoredBodyCrc_DecodeFrameWithMaskedHighBitCrc_IsAccepted()
+    {
+        const string body = "crc-highbit-2";
+        byte[] bodyBytes = Encoding.ASCII.GetBytes(body);
+
+        // This body's raw CRC carries the high bit, so the stored field cannot equal the raw CRC.
+        uint raw = RawCrc32(bodyBytes);
+        Assert.True((raw & 0x8000_0000u) != 0, "raw CRC of the test body must have the high bit set");
+        uint masked = raw & 0x7FFF_FFFFu;
+        Assert.NotEqual(raw, masked);
+
+        // Store frame whose BODYCRC field is the masked value the store actually writes.
+        byte[] frame = HighBitBodyFrame(bodyBytes, masked);
+
+        // Accepted: the check compares against the masked stored value. An unmasked CRC here would
+        // disagree with the field and reject this valid message.
+        Assert.True(MessageDecoder.DecodeMessage(frame, out MessageExt d,
+            readBody: true, decompressBody: true, isClient: true, checkCrc: true));
+        Assert.Equal(body, Encoding.ASCII.GetString(d.Body));
+    }
+
+    [Fact]
+    public void StoredBodyCrc_DecodeFrameWithWrongBodyCrc_IsRejected()
+    {
+        const string body = "crc-highbit-2";
+        byte[] bodyBytes = Encoding.ASCII.GetBytes(body);
+        uint masked = RawCrc32(bodyBytes) & 0x7FFF_FFFFu;
+
+        // Same frame, but the BODYCRC field deliberately off by one.
+        byte[] frame = HighBitBodyFrame(bodyBytes, masked ^ 0x1u);
+
+        Assert.False(MessageDecoder.DecodeMessage(frame, out _,
+            readBody: true, decompressBody: true, isClient: true, checkCrc: true));
+
+        // Without the CRC check the very same frame decodes fine: the rejection comes from the check.
+        Assert.True(MessageDecoder.DecodeMessage(frame, out MessageExt d,
+            readBody: true, decompressBody: true, isClient: true, checkCrc: false));
+        Assert.Equal(body, Encoding.ASCII.GetString(d.Body));
+    }
+
+    private static byte[] HighBitBodyFrame(byte[] bodyBytes, uint storedBodyCrc)
+    {
+        var m = new MessageExt
+        {
+            Topic = "T_CRC",
+            Body = bodyBytes,
+            BodyCrc = storedBodyCrc,
+            QueueId = 0,
+            Flag = 0,
+            QueueOffset = 0,
+            CommitLogOffset = 0,
+            SysFlag = 0,
+            BornTimestamp = 1700000000000L,
+            StoreTimestamp = 1700000000001L,
+            BornHost = "127.0.0.1",
+            BornHostPort = 10911,
+            StoreHost = "127.0.0.1",
+            StoreHostPort = 10911,
+            ReconsumeTimes = 0,
+        };
+        return MessageDecoder.EncodeMessageExt(m, needCompress: false);
+    }
+
+    // Local unmasked CRC-32/ISO-HDLC, used only to show the masked stored value apart from the raw one.
+    private static uint RawCrc32(byte[] data)
+    {
+        uint crc = 0xFFFF_FFFFu;
+        foreach (byte b in data)
+        {
+            crc ^= b;
+            for (int k = 0; k < 8; k++)
+            {
+                crc = (crc & 1) != 0 ? (0xEDB8_8320u ^ (crc >> 1)) : (crc >> 1);
+            }
+        }
+
+        return crc ^ 0xFFFF_FFFFu;
     }
 
     [Fact]

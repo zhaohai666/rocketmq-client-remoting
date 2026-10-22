@@ -115,13 +115,23 @@ fn crc32_table() -> &'static [u32; 256] {
     })
 }
 
-pub fn crc32(data: &[u8]) -> u32 {
+/// Unmasked CRC-32/ISO-HDLC of `data`, i.e. the full 32-bit checksum.
+/// This is *not* the value the store writes into BODYCRC; see [`crc32`].
+pub fn crc32_raw(data: &[u8]) -> u32 {
     let table = crc32_table();
     let mut crc = 0xFFFF_FFFFu32;
     for b in data {
         crc = table[((crc ^ (*b as u32)) & 0xFF) as usize] ^ (crc >> 8);
     }
     crc ^ 0xFFFF_FFFF
+}
+
+/// The BODYCRC value a store frame carries for `data`: [`crc32_raw`] with the
+/// sign bit dropped (`& 0x7FFF_FFFF`). Comparing a full 32-bit CRC against that
+/// field instead rejects roughly half of all valid bodies, since about half of
+/// all CRCs have the high bit set and the store clears it.
+pub fn crc32(data: &[u8]) -> u32 {
+    crc32_raw(data) & 0x7FFF_FFFF
 }
 
 pub fn bytes_2_string(bytes: &[u8]) -> String {
@@ -228,10 +238,16 @@ mod tests {
     }
 
     #[test]
-    fn crc32_matches_zlib() {
+    fn crc32_is_stored_body_crc() {
         assert_eq!(crc32(b""), 0);
+        // Below 2^31: the stored field and the unmasked checksum coincide.
         assert_eq!(crc32(b"1234567890"), 639479525);
-        assert_eq!(crc32(b"the quick brown fox"), 2445345482);
+        assert_eq!(crc32_raw(b"1234567890"), 639479525);
+        // High bit set in the checksum: the store clears it, so the field differs.
+        assert_eq!(crc32_raw(b"the quick brown fox"), 0x91C1_02CA);
+        assert_eq!(crc32(b"the quick brown fox"), 0x11C1_02CA);
+        assert_eq!(crc32(b"ba-all-0"), 0x7383_6757);
+        assert_ne!(crc32(b"ba-all-0"), crc32_raw(b"ba-all-0"));
     }
 
     #[test]

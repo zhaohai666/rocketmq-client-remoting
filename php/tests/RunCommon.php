@@ -110,7 +110,39 @@ $T->checkSame('00000000000000000123', UtilAll::offset2Filename(123), 'offset2Fil
 $T->checkSame('-', UtilAll::timeToHumanString(0), 'timeToHumanString(0)="-"');
 $T->check(UtilAll::isBlank(null) && UtilAll::isBlank('  ') && !UtilAll::isBlank('x') && !UtilAll::isNotBlank(' '), 'isBlank/isNotBlank');
 $T->check(UtilAll::isIpv4('10.0.0.1') && !UtilAll::isIpv4('::1') && !UtilAll::isIpv4('999.1.1.1'), 'isIpv4');
-$T->check(UtilAll::crc32('hello') === crc32('hello'), 'crc32 matches the built-in');
+// BODYCRC holds the CRC-32 of the body with the high (sign) bit dropped, so this helper masks with
+// 0x7FFFFFFF rather than returning the whole 32-bit value.
+$T->checkSame(907060870, UtilAll::crc32('hello'), 'crc32("hello")=907060870, sign bit already clear');
+$T->checkSame(891568578, UtilAll::crc32('abc'), 'crc32("abc")=891568578, sign bit already clear');
+$T->checkSame(222957957, UtilAll::crc32('hello world'), 'crc32("hello world")=222957957, sign bit already clear');
+$T->checkSame(1756872259, UtilAll::crc32('a'), 'crc32("a")=1756872259, sign bit dropped from 3904355907');
+$T->checkSame(297861834, UtilAll::crc32('the quick brown fox'), 'crc32("the quick brown fox")=297861834, sign bit dropped from 2445345482');
+$T->checkSame(1937991511, UtilAll::crc32('ba-all-0'), 'crc32("ba-all-0")=1937991511, sign bit dropped from 4085475159');
+$T->checkSame(
+    1756872259,
+    MessageDecoder::crc32('a'),
+    'MessageDecoder::crc32 follows the same sign-bit-dropped contract'
+);
+// Control pair: the built-in and this helper differ on exactly one bit, and only on bodies whose CRC
+// has the sign bit set — this pins the mask rather than letting the two agree by accident.
+foreach (['', 'a', 'abc', 'hello', 'hello world', 'ba-all-0', 'the quick brown fox'] as $crcBody) {
+    $whole = crc32($crcBody) & 0xFFFFFFFF;
+    $dropped = UtilAll::crc32($crcBody);
+    $T->checkSame(
+        $whole >= 0x80000000 ? 0x80000000 : 0,
+        $whole ^ $dropped,
+        sprintf('crc32(%s) differs from the whole 32-bit CRC only in the sign bit', var_export($crcBody, true))
+    );
+}
+$T->check(
+    UtilAll::crc32('a') !== (crc32('a') & 0xFFFFFFFF),
+    'crc32("a") is not the whole 32-bit CRC'
+);
+$T->checkSame(
+    0x80000000,
+    (crc32('a') & 0xFFFFFFFF) ^ UtilAll::crc32('a'),
+    'crc32("a") and the whole 32-bit CRC differ in the sign bit alone'
+);
 $T->check(UtilAll::currentTimeMillis() > 1600000000000, 'currentTimeMillis is in milliseconds');
 $T->checkSame('127.0.0.1', UtilAll::string2UnicodeShift('127.0.0.1', 3), 'string2UnicodeShift returns as-is');
 
@@ -268,7 +300,12 @@ if ($decoded !== null) {
     $T->checkSame($expectedMsgId, $decoded->getOffsetMsgId(), 'offsetMsgId equals msgId (isClient)');
     [$dip, $dport, $doff] = MessageDecoder::decodeMessageId((string) $decoded->getMsgId());
     $T->checkSame(['10.0.0.3', 10911, 77777], [$dip, $dport, $doff], 'offsetMsgId parseAddr/parseOffset round-trip');
-    $T->checkSame(3668123815, MessageDecoder::crc32($decoded->getBody()) === $decoded->getBodyCrc() ? 3668123815 : 0, 'bodyCrc verifies consistent');
+    $T->checkSame(222957957, $decoded->getBodyCrc(), 'bodyCrc round-trips the sign-bit-dropped CRC');
+    $T->checkSame(
+        MessageDecoder::crc32((string) $decoded->getBody()),
+        $decoded->getBodyCrc(),
+        'bodyCrc verifies consistent'
+    );
 }
 
 // Unknown magic -> null (decode-returns-null semantics)
@@ -281,6 +318,59 @@ $T->checkSame(null, MessageDecoder::decodeMessage(substr($encoded, 0, 30)), 'tru
 
 // readBody=false -> body is null
 $T->checkSame(null, MessageDecoder::decodeMessage($encoded, readBody: false)?->getBody(), 'readBody=false yields null body');
+
+// checkCrc=true against a BODYCRC stamped with the sign-bit-dropped CRC: a frame whose body CRC has the
+// high bit set must still decode, and a whole batch of such frames must yield every frame.
+$crcFrames = [];
+for ($i = 0; count($crcFrames) < 8; $i++) {
+    $candidate = sprintf('msg-body-%d', $i);
+    // Keep only bodies whose whole 32-bit CRC has the sign bit set: those are exactly the ones a
+    // comparison against the unmasked value would wrongly reject.
+    if ((crc32($candidate) & 0x80000000) === 0) {
+        continue;
+    }
+    $crcExt = new MessageExt('TopicCrc', $candidate, 'TagA');
+    $crcExt->setQueueId(0);
+    $crcExt->setQueueOffset($i);
+    $crcExt->setCommitLogOffset(900000 + $i);
+    $crcExt->setBodyCrc(UtilAll::crc32($candidate));
+    $crcFrames[$candidate] = MessageDecoder::encodeMessageExt($crcExt);
+}
+$T->checkSame(8, count($crcFrames), 'collected 8 bodies whose CRC has the sign bit set');
+
+$crcStream = '';
+foreach ($crcFrames as $candidateBody => $frame) {
+    $checked = MessageDecoder::decodeMessage($frame, checkCrc: true);
+    $T->check($checked !== null, sprintf('checkCrc=true keeps the frame of %s', var_export($candidateBody, true)));
+    $T->checkSame(
+        $candidateBody,
+        $checked?->getBody(),
+        sprintf('checkCrc=true returns the payload of %s', var_export($candidateBody, true))
+    );
+    $crcStream .= $frame;
+}
+
+$streamFrames = MessageDecoder::decodeMessages($crcStream);
+$T->checkSame(8, count($streamFrames), 'the multi-frame stream decodes into all 8 frames');
+$T->checkSame(
+    array_keys($crcFrames),
+    array_map(static fn (MessageExt $m): string => (string) $m->getBody(), $streamFrames),
+    'the 8 frames come back in order with their payloads intact'
+);
+
+// The CRC check is really applied: stamping BODYCRC with the unmasked value must be rejected.
+$uncrcExt = new MessageExt('TopicCrc', 'a', 'TagA');
+$uncrcExt->setBodyCrc(crc32('a') & 0xFFFFFFFF);
+$T->checkSame(
+    null,
+    MessageDecoder::decodeMessage(MessageDecoder::encodeMessageExt($uncrcExt), checkCrc: true),
+    'an unmasked BODYCRC is rejected by checkCrc=true'
+);
+$T->checkSame(
+    'a',
+    MessageDecoder::decodeMessage(MessageDecoder::encodeMessageExt($uncrcExt), checkCrc: false)?->getBody(),
+    'the same frame decodes when checkCrc is off'
+);
 
 // 6-segment lightweight format: batch
 $bmsgs = [new Message('T', 'b1', 'TagA'), new Message('T', 'b2', null, 'k2')];

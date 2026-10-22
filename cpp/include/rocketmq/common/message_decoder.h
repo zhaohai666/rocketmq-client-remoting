@@ -48,6 +48,7 @@ Bytes ipAndPortToBytes(const std::string& ip, int32_t port, bool v6 = false);
 // 8B / 20B -> (ip, port)
 bool bytesToIpAndPort(const Bytes& raw, std::string& ip, int32_t& port);
 
+// Body checksum in the form the store writes into BODYCRC (sign bit dropped); pairs with that field.
 uint32_t crc32(const Bytes& data);
 
 std::string bytes2String(const Bytes& bs);

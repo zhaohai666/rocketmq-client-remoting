@@ -260,9 +260,9 @@ static void testUtilAndHash() {
     CHECK(UtilAll::string2Bytes("001FFF") == bs, "string2Bytes round");
     CHECK(UtilAll::string2Bytes("ZZ").empty(), "string2Bytes invalid -> empty");
 
-    // Standard CRC32("123456789") = 0xCBF43926
-    CHECK(UtilAll::crc32("123456789") == 0xCBF43926u, "crc32 known vector");
-    CHECK(crc32("123456789") == 0xCBF43926u, "message_decoder::crc32 delegates");
+    // The stored BODYCRC shape: CRC-32("123456789") = 0xCBF43926, sign bit dropped -> 0x4BF43926
+    CHECK(UtilAll::crc32("123456789") == 0x4BF43926u, "crc32 returns the stored BODYCRC field value");
+    CHECK(crc32("123456789") == 0x4BF43926u, "message_decoder::crc32 delegates");
 
     // msgId round trip
     Bytes addr = ipAndPortToBytes("127.0.0.1", 10911, false);
@@ -273,6 +273,97 @@ static void testUtilAndHash() {
     int64_t off = 0;
     CHECK(decodeMessageId(msgId, ip, port, off), "decodeMessageId ok");
     CHECK(ip == "127.0.0.1" && port == 10911 && off == 123456789LL, "decodeMessageId values");
+}
+
+// Local unmasked CRC-32, computed from scratch here so the raw value stays distinguishable from the
+// value the store puts into BODYCRC. Bit-by-bit form of the same polynomial, no lookup table.
+static uint32_t unmaskedCrc32(const Bytes& data) {
+    uint32_t crc = 0xFFFFFFFFu;
+    for (unsigned char b : data) {
+        crc ^= static_cast<uint32_t>(b);
+        for (int i = 0; i < 8; ++i) {
+            crc = (crc & 1u) != 0 ? (crc >> 1) ^ 0xEDB88320u : crc >> 1;
+        }
+    }
+    return crc ^ 0xFFFFFFFFu;
+}
+
+static void testBodyCrcFieldShape() {
+    // Two numbers pinned side by side so they cannot be confused: the helper returns the masked one.
+    CHECK(unmaskedCrc32("a") == 0xE8B7BE43u, "unmasked crc32 of a");
+    CHECK((unmaskedCrc32("a") & 0x80000000u) != 0, "unmasked crc32 of a has the sign bit set");
+    CHECK(UtilAll::crc32("a") == 0x68B7BE43u, "stored BODYCRC of a drops the sign bit");
+
+    // Below 2^31 the mask changes nothing, so that value is also a valid stored BODYCRC.
+    CHECK(unmaskedCrc32("abc") == 0x352441C2u, "unmasked crc32 of abc");
+    CHECK(UtilAll::crc32("abc") == 0x352441C2u, "stored BODYCRC of abc is unchanged");
+
+    // The helper never returns a value with the sign bit set -- it is the field, not the raw CRC.
+    for (const char* s : {"", "a", "abc", "123456789", "hello-body", "T_MSG"}) {
+        CHECK((UtilAll::crc32(s) & 0x80000000u) == 0,
+              std::string("returned BODYCRC always fits in 31 bits: ") + s);
+    }
+    CHECK(crc32("a") == UtilAll::crc32("a"), "message_decoder::crc32 returns the same field value");
+}
+
+static void testDecodeMessageCheckCrcContract() {
+    // A body whose unmasked CRC has the sign bit set: only the masked value is the stored BODYCRC.
+    Bytes body;
+    uint32_t raw = 0;
+    for (int i = 0; i < 200; ++i) {
+        const Bytes candidate = "crc-highbit-" + std::to_string(i);
+        const uint32_t c = unmaskedCrc32(candidate);
+        if ((c & 0x80000000u) != 0) {
+            body = candidate;
+            raw = c;
+            break;
+        }
+    }
+    CHECK(!body.empty() && (raw & 0x80000000u) != 0, "found a body whose raw crc has the sign bit");
+
+    const uint32_t stored = raw & 0x7FFFFFFFu;
+    CHECK(stored != raw, "masked field differs from the raw crc for that body");
+
+    MessageExt m;
+    m.topic = "T_CRCCHECK";
+    m.body = body;
+    m.bodyCrc = stored;
+    m.queueId = 0;
+    m.flag = 0;
+    m.sysFlag = 0;
+    m.bornHost = "127.0.0.1";
+    m.bornHostPort = 10911;
+    m.storeHost = "127.0.0.1";
+    m.storeHostPort = 10911;
+    m.commitLogOffset = 8192;
+    const Bytes frame = encodeMessageExt(m, false);
+
+    MessageExt accepted;
+    CHECK(decodeMessage(frame, accepted, /*readBody=*/true, /*decompressBody=*/false,
+                        /*isClient=*/true, /*checkCrc=*/true),
+          "checkCrc accepts the frame whose BODYCRC is the masked crc");
+    CHECK(accepted.body == body, "the accepted frame keeps the body bytes");
+    CHECK(accepted.bodyCrc == stored, "decoded BODYCRC equals the masked field");
+
+    // Without the opt-in check the same frame decodes, so the assertion above is about the comparison.
+    MessageExt unchecked;
+    CHECK(decodeMessage(frame, unchecked, true, false, true, false), "checkCrc off still decodes");
+
+    // A deliberately wrong BODYCRC must be rejected: flip one bit of the field.
+    MessageExt badField = m;
+    badField.bodyCrc = stored ^ 1u;
+    const Bytes badFieldFrame = encodeMessageExt(badField, false);
+    MessageExt rejectedField;
+    CHECK(!decodeMessage(badFieldFrame, rejectedField, true, false, true, true),
+          "checkCrc rejects a frame with a wrong BODYCRC field");
+
+    // Same field, tampered body: also rejected.
+    MessageExt badBody = m;
+    badBody.body = body + "x";
+    const Bytes badBodyFrame = encodeMessageExt(badBody, false);
+    MessageExt rejectedBody;
+    CHECK(!decodeMessage(badBodyFrame, rejectedBody, true, false, true, true),
+          "checkCrc rejects a body that does not match the BODYCRC field");
 }
 
 int main() {
@@ -286,6 +377,8 @@ int main() {
     testBatchDefaultsWaitStoreMsgOkToTrue();
     testWaitStoreMsgOkParseBooleanContract();
     testUtilAndHash();
+    testBodyCrcFieldShape();
+    testDecodeMessageCheckCrcContract();
 
     std::cout << "\n===== codec test summary =====\n";
     std::cout << "  PASS=" << g_pass << " FAIL=" << g_fail << "\n";

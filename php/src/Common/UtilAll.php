@@ -75,9 +75,20 @@ final class UtilAll
         return $index;
     }
 
+    /**
+     * The value the BODYCRC field of a stored message carries.
+     *
+     * The broker does not store the bare CRC-32 of the body: it writes the IEEE CRC-32 with the high
+     * (sign) bit dropped, i.e. ``crc32($data) & 0x7FFFFFFF``. A body of ``ba-all-0`` whose IEEE CRC-32
+     * is 4085475159 (0xF3836757) is stored with BODYCRC 1937991511 (0x73836757).
+     *
+     * Returning the masked value here is what makes the field comparable: a check against the whole
+     * 32-bit CRC disagrees for roughly half of all bodies (exactly those whose CRC has the high bit
+     * set), which would make every such body look corrupted.
+     */
     public static function crc32(string $data): int
     {
-        return crc32($data) & 0xFFFFFFFF;
+        return crc32($data) & 0x7FFFFFFF;
     }
 
     /**

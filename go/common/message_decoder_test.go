@@ -1,13 +1,17 @@
 package common
 
 import (
+	"bytes"
 	"encoding/binary"
+	"hash/crc32"
 	"strings"
 	"testing"
 )
 
 // Reference frame: 139 bytes, 17 segments (field values from buildExt below), byte-level truth.
-const ext139Hex = "0000008BDAA320A7F3307B09000000030000000200000000000000580000000000000400" +
+// The BODYCRC segment (bytes 8..11) is 0x73307B09, the masked checksum of the body:
+// IEEE CRC of "hello rocketmq" is 0xF3307B09 but the field stores it sign-bit-dropped.
+const ext139Hex = "0000008BDAA320A773307B09000000030000000200000000000000580000000000000400" +
 	"000000000000018BCFE568007F0000010000D4310000018BCFE5687B7F00000100002A9F" +
 	"0000000100000000000000000000000E68656C6C6F20726F636B65746D7109546F706963" +
 	"546573740019544147530154616741024B455953016B657931206B65793202"
@@ -267,6 +271,51 @@ func TestCheckCRCDetectsCorruption(t *testing.T) {
 	// Decodes fine without CRC checking (the body is already corrupt)
 	if _, err := DecodeMessage(raw); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestCheckCRCAcceptsSignBitDroppedBodyCRC pins that a frame whose BODYCRC
+// carries the masked checksum (the sign bit dropped, as the field actually
+// stores it) passes CheckCRC instead of being rejected as corrupt.
+func TestCheckCRCAcceptsSignBitDroppedBodyCRC(t *testing.T) {
+	// Bodies whose raw IEEE CRC has the high (sign) bit set.
+	bodies := [][]byte{[]byte("a"), []byte("the quick brown fox")}
+	options := DefaultDecodeOptions()
+	options.CheckCRC = true
+
+	var stream []byte
+	for _, body := range bodies {
+		raw := crc32.ChecksumIEEE(body)
+		if raw&0x80000000 == 0 {
+			t.Fatalf("fixture %q has no sign bit: raw=%#x", body, raw)
+		}
+		if got := Crc32(body); got != raw&0x7FFFFFFF || got == raw {
+			t.Fatalf("Crc32(%q)=%#x not the sign-bit-dropped form of raw=%#x", body, got, raw)
+		}
+		// buildV2Frame stamps the BODYCRC field with Crc32(body), the masked value.
+		frame := buildV2Frame(t, body, "TopicTest", "", 0)
+		ext, err := DecodeMessageWith(frame, options)
+		if err != nil {
+			t.Fatalf("CheckCRC decode of %q: %v", body, err)
+		}
+		if !bytes.Equal(ext.Body, body) {
+			t.Fatalf("body round trip: got %q want %q", ext.Body, body)
+		}
+		if ext.BodyCRC != Crc32(body) {
+			t.Fatalf("stored crc %d, want %d", ext.BodyCRC, Crc32(body))
+		}
+		stream = append(stream, frame...)
+	}
+
+	// A batch stream of such frames must decode every frame, not stop at the first.
+	msgs := DecodeMessagesWith(stream, options)
+	if len(msgs) != len(bodies) {
+		t.Fatalf("batch decoded %d frames, want %d", len(msgs), len(bodies))
+	}
+	for i, m := range msgs {
+		if !bytes.Equal(m.Body, bodies[i]) {
+			t.Fatalf("batch frame %d body %q, want %q", i, m.Body, bodies[i])
+		}
 	}
 }
 
