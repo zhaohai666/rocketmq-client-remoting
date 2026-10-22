@@ -25,8 +25,8 @@ NameServer + Broker，无 proxy、无本地扩展依赖、无代码生成步骤�
 
 ```bash
 cd rust
-cargo build --all-targets                       # lib + 39 个 examples
-cargo test --quiet                              # 982 passed; 0 failed; 0 ignored（~10s）
+cargo build --all-targets                       # lib + 41 个 examples
+cargo test --quiet                              # 1091 passed; 0 failed; 0 ignored（~10s）
 cargo clippy --all-targets -- -D warnings       # 零 warning 是硬门槛
 ```
 
@@ -292,6 +292,7 @@ broker 后再发消息"**（否则首批消息会因 broker 尚不认识本组�
 | --- | --- |
 | `live_protocol` | 帧编解码 + 核心请求码打真实 broker 的冒烟往返 |
 | `live_mq_client` | 实例复用、收发逐字段、位点五 RPC、POP 弹回-ACK-改不可见、批量锁、共用实例关闭守卫 |
+| `live_pop_batch_ack` | BATCH_ACK_MESSAGE(200151) 三条腿（实测 `42 passed, 0 failed`）：**L1 一次请求清整批**——单队列 topic 发 8 条、轮询到队列真有 8 条再 POP，逐字段校验自建的 `BatchAckMessageRequestBody`（合并键 `retry@queueId@ckQueueOffset@popTime` 一项一键、位集下标 `queueOffset-ckQueueOffset` 解回来正好是本次弹出的 8 个位点、字节最小小端 base64、九项紧凑键名全在 body 上、brokerName 取首个 CK），再验 broker 回 SUCCESS 且 25s 静默窗口一条不弹回；**L2 缺一笔的对照**——发 6 pop 6 只 ack 5，只有被丢的那条弹回，弹回的 CK 重试标记为 1、其 batch body 仍写业务 topic 且每项标记 1，200151 回 SUCCESS，**ack 之后**才探 `%RETRY%<group>_<topic>` 路由（路由登记要等 broker 心跳），之后不再弹回；**L3 两轮一请求**——同队列两次各 pop 2 条，两轮合并键不同不可被折叠，一个 body 两项覆盖 4 个位点各一次、一次 SUCCESS、两轮都不弹回。200151 无需 broker 开关（请求码无条件注册）；弹回观察窗口按"首见即停 + 3s 尾巴、ack 后立即收口，之后才跑长静默"编排，任何断言都不判"哪条 RPC 应答的" |
 | `live_producer` | 六条发送路径、事务两阶段+回查、撤回 recallMessage、异步内核、退出注销 35；⚠ TLS 腿需 `ROCKETMQ_TLS_ENABLE=1` |
 | `live_consumer` | 长轮询 / tag 过滤 / `%RETRY%` 重投 / `%DLQ%` 死信 / 部分 ack / POP / 广播 / 顺序死信 / 显式 COMMIT-ROLLBACK / 停摆自愈 / 307 |
 | `live_pull_consumer` | 手动 pull 不重不漏、位点调用方掌控、长轮询真的挂起 |
@@ -360,7 +361,7 @@ rust/
 │       ├── hook.rs / latency.rs / consumer_stats.rs / metrics.rs / shutdown.rs
 │       ├── request_reply.rs / top_addressing.rs / validators.rs / result.rs
 │       └── trace.rs / trace_context.rs / trace_hook.rs / trace_dispatcher.rs
-└── examples/                   39 个真机联调工具（见上表）
+└── examples/                   41 个真机联调工具（见上表）
 ```
 
 单元测试内联在 `src/**/mod tests`（需要访问 `pub(crate)` 与假时钟）；只有真机才能证明的性质
