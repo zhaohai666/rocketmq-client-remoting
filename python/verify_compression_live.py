@@ -38,7 +38,9 @@ def check(name, ok, detail=""):
 
 
 def crc32(data):
-    pass
+    """Full 32-bit CRC of a payload, compared only against the same payload sent
+    in this process. A stored message's BODYCRC field carries the same checksum
+    with the sign bit dropped, so this value is not comparable to that field."""
     return zlib.crc32(data) & 0xFFFFFFFF
 
 
