@@ -447,6 +447,7 @@ TCP 建连后、TLS 握手前完成 SOCKS CONNECT；NameServer HTTP 动态取址
 | `verify_orderly_reconsume_live.py` | 顺序消费的重投闸门与显式 COMMIT/ROLLBACK |
 | `verify_pinned_guard_live.py` | 定点发送的 topic 一致性守卫：真路由不误拒、拒在本端、单向无守卫 |
 | `verify_pop_live.py` | POP 协议面：POP / ACK / 续期不可见 |
+| `verify_pop_batch_ack_live.py` | `BATCH_ACK_MESSAGE`(200151) 真机腿：整批 ack、部分 ack 后未 ack 的那条走 retry topic 复活、多轮 ack 的合并键互不重叠 |
 | `verify_pop_consumer_live.py` | POP 消费循环（推模式消费者改走 POP），含 307 拉取统计 |
 | `verify_producer_unregister_live.py` | 生产者退出真的发出 `UNREGISTER_CLIENT`(35) |
 | `verify_publish_route_master_live.py` | 发布路由跳过没有 master 的 broker（会停一次 master） |
