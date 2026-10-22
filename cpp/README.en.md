@@ -50,15 +50,15 @@ cd build && ctest --output-on-failure
 ```
 
 This produces the static library `build/librocketmq_remoting.a` (alias `rocketmq::remoting`),
-56 test binaries and 41 tools under `build/examples/`. Measured on this machine:
+65 test binaries and 43 tools under `build/examples/`. Measured on this machine:
 
 ```
-100% tests passed out of 57
-Total Test time (real) =  91.14 sec
+100% tests passed out of 66
+Total Test time (real) =  97.43 sec
 ```
 
-The 57 cases are the 56 test binaries (4188 assertions) plus 1 codec-interop case
-(73 assertions): **4261 assertions in total**.
+The 66 cases are the 65 test binaries (4633 assertions) plus 1 codec-interop case
+(73 assertions): **4706 assertions in total**.
 
 The protocol-layer self-check needs no cluster:
 
@@ -528,6 +528,7 @@ arguments:
 ./build/examples/rmq_live_publish_route_master 127.0.0.1:9876 127.0.0.1:10911 [slaveAddr]
 ./build/examples/rmq_compression_live selftest 127.0.0.1:9876
 ./build/examples/rmq_compression_live send 127.0.0.1:9876 <topic> <group> <size> [codec]
+./build/examples/rmq_live_pop_batch_ack 127.0.0.1:9876 [legs]   # legs = any comma-separated subset of l1,l2,l3 (default: all three)
 ```
 
 | Binary | What it verifies | Extra broker config |
@@ -538,6 +539,7 @@ arguments:
 | `rmq_live_redelivery` | Thirteen legs: redelivery, offset persistence, ordered locks, broadcasting, flow control, multi-instance rebalance, explicit ack | — |
 | `rmq_live_pop` | POP polling / ack / invisible-time extension / redelivery after no ack | — |
 | `rmq_live_pop_consumer` | POP consume loop plus pullRT / pullTPS in the 307 status table | — |
+| `rmq_live_pop_batch_ack` | Three BATCH_ACK_MESSAGE(200151) legs: one request carrying the whole batch whose bit set decodes back to exactly the popped offsets, the paired control where only the dropped message returns with the retry marker, and two pop rounds of one queue merged into a single body; the outgoing frame is captured by an RPC hook and checked with an independently written base64 reader, so the encoder never grades its own homework | — |
 | `rmq_live_pull` | Pull consumer queues, short and long polling, manual offsets | — |
 | `rmq_live_pull_heartbeat` | The 203 / 38 / 35 payloads and consumeType shape of the pull consumer | — |
 | `rmq_live_lite_pull` | LitePull subscribe and assign modes plus poll | — |
@@ -586,8 +588,8 @@ cpp/
 │                               admin / mq_client / allocate_strategy / hook / trace /
 │                               request_reply / backpressure / validators / result / exception
 ├── src/                        Implementations mirroring include/ (common / remoting / client)
-├── tests/                      56 test sources + interop_check.py = 57 ctest cases
-├── examples/                   rmq_selfcheck / rmq_interop + 39 live-cluster tools
+├── tests/                      65 test sources + interop_check.py = 66 ctest cases
+├── examples/                   rmq_selfcheck / rmq_interop + 41 live-cluster tools
 └── tools/                      Windows header preparation and syntax-check scripts
 ```
 

@@ -46,15 +46,15 @@ cmake --build build -j6
 cd build && ctest --output-on-failure
 ```
 
-产出静态库 `build/librocketmq_remoting.a`（别名 `rocketmq::remoting`）、56 个测试二进制与
-41 个 `build/examples/` 工具。本机实测：
+产出静态库 `build/librocketmq_remoting.a`（别名 `rocketmq::remoting`）、65 个测试二进制与
+43 个 `build/examples/` 工具。本机实测：
 
 ```
-100% tests passed out of 57
-Total Test time (real) =  91.14 sec
+100% tests passed out of 66
+Total Test time (real) =  97.43 sec
 ```
 
-57 个用例 = 56 个测试二进制（4188 项断言）+ 1 个编解码互调用例（73 项断言），共 **4261 项断言**。
+66 个用例 = 65 个测试二进制（4633 项断言）+ 1 个编解码互调用例（73 项断言），共 **4706 项断言**。
 
 不依赖集群的协议层自检：
 
@@ -563,6 +563,7 @@ broker 侧的订阅表、位点与轨迹才落在预期的组上。
 ./build/examples/rmq_live_publish_route_master 127.0.0.1:9876 127.0.0.1:10911 [slaveAddr]
 ./build/examples/rmq_compression_live selftest 127.0.0.1:9876
 ./build/examples/rmq_compression_live send 127.0.0.1:9876 <topic> <group> <size> [codec]
+./build/examples/rmq_live_pop_batch_ack 127.0.0.1:9876 [legs]   # legs 为 l1/l2/l3 的任意组合（逗号分隔），默认三条全跑
 ```
 
 | 二进制 | 验的东西 | 额外 broker 配置 |
@@ -573,6 +574,7 @@ broker 侧的订阅表、位点与轨迹才落在预期的组上。
 | `rmq_live_redelivery` | 回投、位点持久化、顺序锁、广播、流控、多实例 rebalance、显式 ack 等十三段 | — |
 | `rmq_live_pop` | POP 拉取 / ack / 延长不可见时间 / 不 ack 复活重投 | — |
 | `rmq_live_pop_consumer` | POP 消费循环 + 307 状态表里的 pullRT / pullTPS | — |
+| `rmq_live_pop_batch_ack` | 批量 ack（200151）三条腿：整批一次请求且 body 里的位集逐条对得上被弹出的位点、只丢一条时只有那一条带重试标记回来、同一队列两轮弹取合进一个报文；发出的原始帧由 RPC 钩子抓取，再用独立实现的 base64 解码校验，不靠编码自己证明自己 | — |
 | `rmq_live_pull` | 拉消费者的队列、短轮询 / 长轮询、手动位点 | — |
 | `rmq_live_pull_heartbeat` | 拉消费者的 203 / 38 / 35 报文与 consumeType 口径 | — |
 | `rmq_live_lite_pull` | 轻量拉消费者的 subscribe / assign 双模式与 poll | — |
@@ -622,8 +624,8 @@ cpp/
 │                               hook / trace / request_reply / backpressure / validators /
 │                               result / exception
 ├── src/                        与 include 同构的实现（common / remoting / client）
-├── tests/                      57 个测试源文件 + interop_check.py = 58 个 ctest 用例
-├── examples/                   rmq_selfcheck / rmq_interop + 39 个真机联调工具
+├── tests/                      65 个测试源文件 + interop_check.py = 66 个 ctest 用例
+├── examples/                   rmq_selfcheck / rmq_interop + 41 个真机联调工具
 └── tools/                      Windows 头文件准备与语法检查脚本
 ```
 

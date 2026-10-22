@@ -82,6 +82,11 @@ target_link_libraries(rmq_live_pop PRIVATE rocketmq::remoting)
 add_executable(rmq_live_pop_consumer live_pop_consumer.cpp)
 target_link_libraries(rmq_live_pop_consumer PRIVATE rocketmq::remoting)
 
+# BATCH_ACK_MESSAGE(200151) real-machine leg: the POP consume path acks message by message and never batches,
+# so the batch wire path is only reachable by driving the primitive directly (not packed into ctest)
+add_executable(rmq_live_pop_batch_ack live_pop_batch_ack.cpp)
+target_link_libraries(rmq_live_pop_batch_ack PRIVATE rocketmq::remoting)
+
 # Message trace real-machine integration (requires broker traceTopicEnable=true; not packed into ctest)
 add_executable(rmq_live_trace live_trace.cpp)
 target_link_libraries(rmq_live_trace PRIVATE rocketmq::remoting)
