@@ -586,7 +586,51 @@ public class PopBatchAckWireTests
         Assert.Equal(ResponseCode.Success, RunAck(cluster, Ck(100, 1700, 3, 100), 100));
     }
 
-    // ---------------------------------------------------------------- (8) unusable input never reaches the wire
+    // ---------------------------------------------------------------- (8) the builder IS the wire
+
+    /// <summary>The request body is byte-for-byte the one <see cref="BatchAckMessageRequestBody.Build"/>
+    /// returns for the same checkpoints. The live leg reads the acknowledged offsets, the entry count
+    /// and the packed payload back off that builder, so without this identity those readings would
+    /// describe a second copy of the merge rules instead of the frame that really goes out.</summary>
+    [Fact]
+    public void BatchAck_BodySentIsTheBodyTheBuilderDescribes()
+    {
+        using var cluster = MockCluster.Start(1);
+        List<string> checkpoints = new()
+        {
+            Ck(100, 1700, 60000, 7, "0", Broker, 3, 100),
+            Ck(100, 1700, 60000, 7, "0", Broker, 3, 107),
+            Ck(100, 1700, 60000, 7, "1", Broker, 3, 108),
+        };
+
+        BatchAckMessageRequestBody built = BatchAckMessageRequestBody.Build(Group, Topic, checkpoints);
+        Assert.Equal(Broker, built.BrokerName);
+        Assert.Equal(2, built.Acks.Count);
+
+        Assert.Equal(ResponseCode.Success, RunBatchAck(cluster, checkpoints));
+
+        WireRecord hit = SingleBatchRequest(cluster);
+        Assert.Equal(built.Encode(), hit.Body);
+
+        // And the recorded frame reads back through the same model, so neither half of the
+        // round trip is doing anything the other does not.
+        Assert.True(BatchAckMessageRequestBody.Decode(hit.Body, out BatchAckMessageRequestBody sent));
+        Assert.Equal(built.Acks.Select(ShapeOfEntry), sent.Acks.Select(ShapeOfEntry));
+    }
+
+    /// <summary>Everything one entry claims, as one comparable value: the field set plus the bit
+    /// indexes it addresses, so a drifted field or a drifted bit shows up as a text difference
+    /// instead of an array-identity difference.</summary>
+    private static string ShapeOfEntry(BatchAck a) =>
+        a.ConsumerGroup + "/" + a.Topic + "/" + a.Retry + "/"
+        + a.StartOffset.ToString(CultureInfo.InvariantCulture) + "/"
+        + a.QueueId.ToString(CultureInfo.InvariantCulture) + "/"
+        + a.ReviveQueueId.ToString(CultureInfo.InvariantCulture) + "/"
+        + a.PopTime.ToString(CultureInfo.InvariantCulture) + "/"
+        + a.InvisibleTime.ToString(CultureInfo.InvariantCulture) + "/"
+        + string.Join(",", a.AckOffsets.Select(i => i.ToString(CultureInfo.InvariantCulture)));
+
+    // ---------------------------------------------------------------- (9) unusable input never reaches the wire
 
     [Fact]
     public void BatchAck_RejectsACheckpointBehindItsStartOffsetWithoutSending()

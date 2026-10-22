@@ -10,7 +10,7 @@
     <!-- Live-cluster verification tool collection.
          One executable + subcommands, avoiding the duplicated overhead of multiple csproj files.
          Subcommands: selfcheck / interop / message-types / admin-live / compression-live /
-         redelivery / acl / pull / rr / latency / pop / popc / trace.
+         redelivery / acl / pull / rr / latency / pop / popc / pop-batch-ack / trace.
          See csharp/README.md for usage. -->
   </PropertyGroup>
 

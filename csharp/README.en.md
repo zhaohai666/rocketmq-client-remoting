@@ -14,7 +14,7 @@ It talks straight to the NameServer (route discovery, dynamic addressing) and to
 - One library covers the producer, the Push / Pull / LitePull consumers, the admin client,
   message tracing, ACL and TLS.
 - Every capability is verified against a real RocketMQ 5.5.1 cluster (namesrv 9876 + broker 10911);
-  offline behaviour is pinned by 856 unit tests.
+  offline behaviour is pinned by 1000 unit tests.
 
 ## Prerequisites
 
@@ -36,7 +36,7 @@ Measured on this machine:
 | Command | Result |
 | --- | --- |
 | `dotnet build --no-incremental` | `0 Warning(s)` / `0 Error(s)`, elapsed `00:00:17.94` |
-| `dotnet test tests/RocketMQ.Client.Tests` | `Passed! - Failed: 0, Passed: 856, Skipped: 0, Total: 856, Duration: 2 m 53 s` |
+| `dotnet test tests/RocketMQ.Client.Tests` | `Passed! - Failed: 0, Passed: 1000, Skipped: 0, Total: 1000, Duration: 3 m 30 s` |
 
 `Directory.Build.props` turns `TreatWarningsAsErrors=true` on globally, so "builds" means "builds with
 zero warnings". The test summary line follows the machine locale — grep for `Passed!` / `Failed:` when
@@ -524,7 +524,7 @@ connection.
   FilterMessage hooks, ACL signing, dynamic NameServer addressing, fault-avoiding queue selection
 - ✅ Compression: zlib / LZ4 / ZSTD; TLS: `SslStream`, test-mode plus strict verification / mTLS
 - ✅ Client logging: size-based rotation, dual output to stderr and file
-- ✅ 856 unit tests; 38 live-cluster subcommands in `rmq` (master/slave, fault injection,
+- ✅ 1000 unit tests; 39 live-cluster subcommands in `rmq` (master/slave, fault injection,
   compression interoperability matrix)
 
 ## Client Logging
@@ -605,6 +605,7 @@ Subcommands:
 | `latency` | Send-latency fault avoidance: off / on / degraded isolation chain / recovery on expiry |
 | `pop` | POP protocol: POP / ACK / invisible-time extension / resurfacing redelivery |
 | `popc` | POP consumer side: consume loop / ack / delayed redelivery |
+| `pop-batch-ack <namesrv> [legs] [stamp]` | BATCH_ACK_MESSAGE(200151) on a real broker; run it with `dotnet run --no-build --project examples/RocketMQ.Examples -- pop-batch-ack 127.0.0.1:9876` (`legs` may be `l1`/`l2`/`l3`). Three legs. l1 clears a whole batch with one request (8 checkpoints into one body: the acknowledged offsets are decoded back out of the packed bit set and compared, one entry per merge key, every entry echoes the fields of its own checkpoint, brokerName comes from the FIRST checkpoint, the body survives the wire codec and the frame carries no custom header, then nothing revives inside 2.5x the invisibility window). l2 is the paired control: 6 popped, 5 acked — only the dropped message comes back, its checkpoint carries retry marker `1`, the body that clears it still names the **business topic**, the `%RETRY%<group>_<topic>` route is probed only **after** the ack, and there is no second revival. l3 acks two pop rounds of one queue (2 messages each) with one request: the rounds keep distinct merge keys, so 4 offsets land in 2 entries. Every window stops on recorded state and every wait carries a budget; 200151 needs **no broker switch and no restart** |
 | `trace` | End-to-end message tracing (needs `traceTopicEnable=true`) |
 | `hook` | CheckForbidden / FilterMessage hooks |
 | `backpressure` | Async-send fair semaphores: message and byte gates, rejection accounting, runtime expansion |
@@ -631,8 +632,9 @@ Legs that need extra broker configuration: `trace` (`traceTopicEnable=true`), `s
 `reset-offset` / `admin-batch-live` (these flip the switches themselves and restore them), the
 `ca_verify` / `mtls` TLS legs (the broker must really serve TLS), and `fail-fast` /
 `publish-route-master` / `pull-heartbeat` (master/slave plus stop-start, driven through
-`../scripts/rmq_test_broker.sh`). POP and broadcasting need no extra switch — `pop`, `popc` and
-`redelivery` run as-is.
+`../scripts/rmq_test_broker.sh`). POP and broadcasting need no extra switch — `pop`, `popc`,
+`redelivery` and `pop-batch-ack` run as-is: the broker registers BATCH_ACK_MESSAGE(200151)
+unconditionally, so that leg needs neither a configuration change nor a restart.
 
 ## Repository Layout
 
@@ -681,7 +683,7 @@ csharp/
 │       ├── BackPressure.cs  Latency.cs  ConsumeExecutor.cs
 │       ├── TopAddressing.cs        # dynamic NameServer addressing
 │       ├── ConsumerStats.cs  Validators.cs  ClientException.cs
-├── tests/RocketMQ.Client.Tests/    # xunit, 856 tests (codec/route/logging/transport/tracing/async/flow control/offsets…)
+├── tests/RocketMQ.Client.Tests/    # xunit, 1000 tests (codec/route/logging/transport/tracing/async/flow control/offsets…)
 └── examples/RocketMQ.Examples/     # the rmq live-cluster tool (see above)
 ```
 

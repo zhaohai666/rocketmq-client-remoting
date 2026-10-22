@@ -48,6 +48,7 @@ internal static class Program
                 "latency" => LiveLatency.Run(rest),
                 "pop" => LivePop.Run(rest),
                 "popc" => LivePopConsumer.Run(rest),
+                "pop-batch-ack" => LivePopBatchAck.Run(rest),
                 "trace" => LiveTrace.Run(rest),
                 "tls" => LiveTls.Run(rest),
                 "hook" => LiveHook.Run(rest),
@@ -112,6 +113,8 @@ internal static class Program
               latency      [namesrv]        real cluster send latency fault tolerance integration (off by default / on / isolation degradation chain / recovery on expiry)
               pop          [namesrv]        real cluster POP mode (5.x) integration (POP/ACK/extending invisible/revived redelivery)
               popc         [namesrv]        real cluster POP **consume side** integration (consume loop / ack / delayed redelivery)
+              pop-batch-ack <namesrv> [legs] [stamp]
+                                            real cluster BATCH_ACK_MESSAGE(200151) integration (one request clears a whole batch / leaving exactly one checkpoint out revives only that message, whose retry body carries marker 1 on the business topic / two pop rounds of one queue keep distinct merge keys; needs no broker switch and no restart)
               trace        [namesrv]        real cluster message trace integration (needs the broker traceTopicEnable=true)
               hook         [namesrv]        real cluster CheckForbidden/FilterMessage hook integration
               backpressure [namesrv]        real cluster async send backpressure integration (count/byte gates, reconciling rejections, growing at runtime)

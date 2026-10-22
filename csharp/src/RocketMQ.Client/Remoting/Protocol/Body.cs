@@ -1065,6 +1065,82 @@ public sealed class BatchAckMessageRequestBody
 
     public List<BatchAck> Acks { get; } = new();
 
+    /// <summary>
+    /// Merges POP checkpoints into the entries of one batch request, with the rule the request
+    /// builder itself uses: checkpoints sharing retry flag + queueId + ckQueueOffset + popTime
+    /// collapse into ONE entry whose bit set carries index (queueOffset - ckQueueOffset), every
+    /// entry keeps the fields of the checkpoint that created it, entries stay in first-seen order,
+    /// and the brokerName of the whole request is the FIRST checkpoint's even when its own segment
+    /// is empty -- a batch never spans two brokers.
+    ///
+    /// This is the decision half of BATCH_ACK_MESSAGE(200151): it produces the exact bytes the
+    /// request body carries, so they can be read back without sending them. Nothing here touches
+    /// the network; an unreadable checkpoint, an empty list, or an offset outside one consume-queue
+    /// window throws before any body exists.
+    /// </summary>
+    public static BatchAckMessageRequestBody Build(string consumerGroup, string topic,
+        IReadOnlyList<string> extraInfoList)
+    {
+        if (extraInfoList.Count == 0)
+        {
+            throw new ArgumentException("batch ack needs at least one extraInfo", nameof(extraInfoList));
+        }
+
+        // Only the first checkpoint decides the broker, and it does so even when its own
+        // brokerName segment is empty -- a later non-empty name must not take over.
+        string[] firstSegments = ExtraInfoUtil.Split(extraInfoList[0]);
+
+        var inOrder = new List<BatchAck>();
+        var byMergeKey = new Dictionary<string, BatchAck>(StringComparer.Ordinal);
+        foreach (string extraInfo in extraInfoList)
+        {
+            string[] seg = ExtraInfoUtil.Split(extraInfo);
+            string retry = ExtraInfoUtil.GetRetry(seg);
+            int queueId = ExtraInfoUtil.GetQueueId(seg);
+            long ckQueueOffset = ExtraInfoUtil.GetCkQueueOffset(seg);
+            long popTime = ExtraInfoUtil.GetPopTime(seg);
+            string mergeKey = retry + "@"
+                              + queueId.ToString(CultureInfo.InvariantCulture) + "@"
+                              + ckQueueOffset.ToString(CultureInfo.InvariantCulture) + "@"
+                              + popTime.ToString(CultureInfo.InvariantCulture);
+
+            if (!byMergeKey.TryGetValue(mergeKey, out BatchAck? ack))
+            {
+                ack = new BatchAck
+                {
+                    ConsumerGroup = consumerGroup,
+                    Topic = topic,
+                    Retry = retry,
+                    StartOffset = ckQueueOffset,
+                    QueueId = queueId,
+                    ReviveQueueId = ExtraInfoUtil.GetReviveQid(seg),
+                    PopTime = popTime,
+                    InvisibleTime = ExtraInfoUtil.GetInvisibleTime(seg),
+                };
+                byMergeKey[mergeKey] = ack;
+                inOrder.Add(ack);
+            }
+
+            // A repeated mergeKey only contributes its bit: the fields stay those of the
+            // checkpoint that created the entry.
+            long queueOffset = ExtraInfoUtil.GetQueueOffset(seg);
+            long bitIndex = queueOffset - ckQueueOffset;
+            if (bitIndex < 0 || bitIndex > BatchAck.MaxBitIndex)
+            {
+                throw new ArgumentException(
+                    "batch ack offset out of range: queueOffset "
+                    + queueOffset.ToString(CultureInfo.InvariantCulture)
+                    + " against ckQueueOffset " + ckQueueOffset.ToString(CultureInfo.InvariantCulture));
+            }
+
+            ack.AckOffsets.Add(unchecked((int)bitIndex));
+        }
+
+        var body = new BatchAckMessageRequestBody { BrokerName = ExtraInfoUtil.GetBrokerName(firstSegments) };
+        body.Acks.AddRange(inOrder);
+        return body;
+    }
+
     public JsonValue ToJson()
     {
         var v = JsonValue.MakeObject();
