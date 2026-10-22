@@ -74,6 +74,33 @@ pub const MAX_POLL_BATCH_SIZE: usize = 1024;
 const LITE_PULL_RPC_TIMEOUT_MILLIS: i64 = 5_000;
 const LITE_METADATA_FIRST_DELAY_MILLIS: u64 = 10_000;
 
+/// The polling shape of one pull request, bundled so the shared pull kernel stays under the
+/// argument-count limit. Short polling never suspends but still sends the historic fixed
+/// `suspendTimeoutMillis` in the header; long polling takes both config-driven timings.
+struct PullTiming {
+    suspend: bool,
+    timeout_millis: i64,
+    suspend_timeout_millis: i64,
+}
+
+impl PullTiming {
+    fn short(timeout_millis: i64) -> Self {
+        Self {
+            suspend: false,
+            timeout_millis,
+            suspend_timeout_millis: PULL_SUSPEND_TIMEOUT_MILLIS,
+        }
+    }
+
+    fn long(cfg: &PullConsumerConfig) -> Self {
+        Self {
+            suspend: true,
+            timeout_millis: cfg.consumer_timeout_millis_when_suspend,
+            suspend_timeout_millis: cfg.broker_suspend_max_time_millis,
+        }
+    }
+}
+
 pub const DEFAULT_HEARTBEAT_BROKER_INTERVAL_MILLIS: u64 = 30_000;
 
 /// Take the lock; still used when poisoned, same reason as `consumer::lock`.
@@ -878,7 +905,7 @@ impl DefaultMQPullConsumer {
         let cfg = self.config();
         let timeout = timeout_millis.unwrap_or(cfg.consumer_pull_timeout_millis);
         let sub = FilterAPI::build_subscription_data(&mq.topic, Some(sub_expression))?;
-        self.pull_with_subscription(mq, &sub, offset, max_nums, false, timeout, PULL_SUSPEND_TIMEOUT_MILLIS)
+        self.pull_with_subscription(mq, &sub, offset, max_nums, PullTiming::short(timeout))
             .await
     }
 
@@ -898,7 +925,7 @@ impl DefaultMQPullConsumer {
         let cfg = self.config();
         let timeout = timeout_millis.unwrap_or(cfg.consumer_pull_timeout_millis);
         let sub = pull_selector_subscription(&mq.topic, selector)?;
-        self.pull_with_subscription(mq, &sub, offset, max_nums, false, timeout, PULL_SUSPEND_TIMEOUT_MILLIS)
+        self.pull_with_subscription(mq, &sub, offset, max_nums, PullTiming::short(timeout))
             .await
     }
 
@@ -917,16 +944,8 @@ impl DefaultMQPullConsumer {
     ) -> Result<PullResult> {
         let cfg = self.config();
         let sub = FilterAPI::build_subscription_data(&mq.topic, Some(sub_expression))?;
-        self.pull_with_subscription(
-            mq,
-            &sub,
-            offset,
-            max_nums,
-            true,
-            cfg.consumer_timeout_millis_when_suspend,
-            cfg.broker_suspend_max_time_millis,
-        )
-        .await
+        self.pull_with_subscription(mq, &sub, offset, max_nums, PullTiming::long(&cfg))
+            .await
     }
 
     /// Selector flavour of [`pull_block_if_not_found`](Self::pull_block_if_not_found): same
@@ -941,16 +960,8 @@ impl DefaultMQPullConsumer {
     ) -> Result<PullResult> {
         let cfg = self.config();
         let sub = pull_selector_subscription(&mq.topic, selector)?;
-        self.pull_with_subscription(
-            mq,
-            &sub,
-            offset,
-            max_nums,
-            true,
-            cfg.consumer_timeout_millis_when_suspend,
-            cfg.broker_suspend_max_time_millis,
-        )
-        .await
+        self.pull_with_subscription(mq, &sub, offset, max_nums, PullTiming::long(&cfg))
+            .await
     }
 
     /// Shared kernel of the four pull flavours. `sub` decides the `subscription` /
@@ -963,9 +974,7 @@ impl DefaultMQPullConsumer {
         sub: &SubscriptionData,
         offset: i64,
         max_nums: i32,
-        suspend: bool,
-        timeout_millis: i64,
-        suspend_timeout_millis: i64,
+        timing: PullTiming,
     ) -> Result<PullResult> {
         let client = self.require_client()?;
         let cfg = self.config();
@@ -975,7 +984,7 @@ impl DefaultMQPullConsumer {
             .unwrap_or(MixAll::MASTER_ID as i64);
         // The class-filter bit stays clear on this path: it asks for the legacy filter-server
         // route. The subscription's own expression type is still what the header reports.
-        let sys_flag = pull_sys_flag(suspend);
+        let sys_flag = pull_sys_flag(timing.suspend);
         let result = client
             .pull_message(
                 &cfg.consumer_group,
@@ -989,9 +998,9 @@ impl DefaultMQPullConsumer {
                 // rides with the subscription's own version.
                 if sub.expression_type == ExpressionType::TAG { 0 } else { sub.sub_version },
                 &sub.expression_type,
-                timeout_millis,
+                timing.timeout_millis,
                 -1,
-                suspend_timeout_millis,
+                timing.suspend_timeout_millis,
                 None,
                 0,
                 Some(broker_id),

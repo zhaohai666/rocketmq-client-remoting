@@ -857,7 +857,7 @@ async fn run(namesrv: &str, creds: Creds) -> Checker {
     println!("A7 transactional message (half message → COMMIT → END_TRANSACTION → consumable)");
     let mut m7 = msg(&topic, b"acl-tx-commit", "TagTxn", "");
     let tx_result = p
-        .send_message_in_transaction(&mut m7, Some(Arc::new(CommitAlways::default())), None)
+        .send_message_in_transaction(&mut m7, Some(Arc::new(CommitAlways)), None)
         .await;
     let tx_prepared = m7
         .get_property(PROPERTY_TRANSACTION_PREPARED)
@@ -868,7 +868,7 @@ async fn run(namesrv: &str, creds: Creds) -> Checker {
             "status={:?} state={:?} halfProp={tx_prepared}",
             r.inner.status, r.local_transaction_state
         ),
-        Err(e) => format!("{} {e}", code_of(&e)),
+        Err(e) => format!("{} {e}", code_of(e)),
     };
     let tx_send_ok = match tx_result.as_ref() {
         Ok(r) => {
@@ -1042,11 +1042,11 @@ async fn run(namesrv: &str, creds: Creds) -> Checker {
     let timer_send = p.send(&mut m6, Some(5000), None).await;
     let delay_detail = match &delay_send {
         Ok(r) => format!("{:?}", r.status),
-        Err(e) => format!("{} {e}", code_of(&e)),
+        Err(e) => format!("{} {e}", code_of(e)),
     };
     let timer_detail = match &timer_send {
         Ok(r) => format!("{:?}", r.status),
-        Err(e) => format!("{} {e}", code_of(&e)),
+        Err(e) => format!("{} {e}", code_of(e)),
     };
     ck.check(
         "A5 delayed message (DELAY level) sent SEND_OK",

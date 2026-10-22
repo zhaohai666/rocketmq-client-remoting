@@ -232,7 +232,7 @@ pub fn users_from_body(body: Option<&[u8]>) -> Result<Vec<AuthUser>> {
     };
     array_items(&value, "user list")?
         .iter()
-        .map(|item| AuthUser::from_json_value(item))
+        .map(AuthUser::from_json_value)
         .collect::<Result<Vec<AuthUser>>>()
 }
 
@@ -250,7 +250,7 @@ pub fn acls_from_body(body: Option<&[u8]>) -> Result<Vec<Acl>> {
     };
     array_items(&value, "acl list")?
         .iter()
-        .map(|item| Acl::from_json_value(item))
+        .map(Acl::from_json_value)
         .collect::<Result<Vec<Acl>>>()
 }
 

@@ -1492,7 +1492,7 @@ async fn c4b_dlq_terminal(ck: &mut Checker, fx: &Fixture) {
     cfg.max_reconsume_times = MAX_RECONSUME;
     let c = match fx.push(cfg) {
         Ok(v) => v,
-        Err(e) => return ck.abort("C4b build consumer", &format!("{e}")),
+        Err(e) => return ck.abort("C4b build consumer", &e.to_string()),
     };
     if let Err(e) = c.subscribe(&topic, "*") {
         return ck.abort("C4b subscribe", &format!("{e}"));
@@ -2442,7 +2442,7 @@ async fn c12_orderly_dlq(ck: &mut Checker, fx: &Fixture) {
     cfg.suspend_current_queue_time_millis = 500;
     let c = match fx.push(cfg) {
         Ok(v) => v,
-        Err(e) => return ck.abort("C12 build consumer", &format!("{e}")),
+        Err(e) => return ck.abort("C12 build consumer", &e.to_string()),
     };
     if let Err(e) = c.subscribe(&topic, "*") {
         return ck.abort("C12 subscribe", &format!("{e}"));
@@ -2539,7 +2539,7 @@ async fn c12b_orderly_no_cap(ck: &mut Checker, fx: &Fixture) {
     cfg.suspend_current_queue_time_millis = 200;
     let c = match fx.push(cfg) {
         Ok(v) => v,
-        Err(e) => return ck.abort("C12b build consumer", &format!("{e}")),
+        Err(e) => return ck.abort("C12b build consumer", &e.to_string()),
     };
     if let Err(e) = c.subscribe(&topic, "*") {
         return ck.abort("C12b subscribe", &format!("{e}"));
@@ -2765,7 +2765,7 @@ async fn c12c_orderly_suspend_millis(ck: &mut Checker, fx: &Fixture) {
     cfg.suspend_current_queue_time_millis = 900;
     let c = match fx.push(cfg) {
         Ok(v) => v,
-        Err(e) => return ck.abort("C12c build consumer", &format!("{e}")),
+        Err(e) => return ck.abort("C12c build consumer", &e.to_string()),
     };
     if let Err(e) = c.subscribe(&topic, "*") {
         return ck.abort("C12c subscribe", &format!("{e}"));
@@ -2808,7 +2808,7 @@ async fn c12c_orderly_suspend_millis(ck: &mut Checker, fx: &Fixture) {
     cfg_b.suspend_current_queue_time_millis = 0;
     let cb = match fx.push(cfg_b) {
         Ok(v) => v,
-        Err(e) => return ck.abort("C12c build floor consumer", &format!("{e}")),
+        Err(e) => return ck.abort("C12c build floor consumer", &e.to_string()),
     };
     if let Err(e) = cb.subscribe(&topic_b, "*") {
         return ck.abort("C12c subscribe floor", &format!("{e}"));
@@ -2847,7 +2847,7 @@ async fn c13_orderly_explicit_commit_rollback(ck: &mut Checker, fx: &Fixture) {
     cfg.suspend_current_queue_time_millis = 200;
     let c = match fx.push(cfg) {
         Ok(v) => v,
-        Err(e) => return ck.abort("C13a build consumer", &format!("{e}")),
+        Err(e) => return ck.abort("C13a build consumer", &e.to_string()),
     };
     if let Err(e) = c.subscribe(&topic, "*") {
         return ck.abort("C13a subscribe", &format!("{e}"));
@@ -2894,7 +2894,7 @@ async fn c13_orderly_explicit_commit_rollback(ck: &mut Checker, fx: &Fixture) {
     cfg.suspend_current_queue_time_millis = 200;
     let c = match fx.push(cfg) {
         Ok(v) => v,
-        Err(e) => return ck.abort("C13b build consumer", &format!("{e}")),
+        Err(e) => return ck.abort("C13b build consumer", &e.to_string()),
     };
     if let Err(e) = c.subscribe(&topic, "*") {
         return ck.abort("C13b subscribe", &format!("{e}"));
@@ -2978,7 +2978,7 @@ async fn c13_orderly_explicit_commit_rollback(ck: &mut Checker, fx: &Fixture) {
     cfg.suspend_current_queue_time_millis = 200;
     let c = match fx.push(cfg) {
         Ok(v) => v,
-        Err(e) => return ck.abort("C13c build consumer", &format!("{e}")),
+        Err(e) => return ck.abort("C13c build consumer", &e.to_string()),
     };
     if let Err(e) = c.subscribe(&topic, "*") {
         return ck.abort("C13c subscribe", &format!("{e}"));

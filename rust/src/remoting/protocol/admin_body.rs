@@ -713,10 +713,10 @@ impl ReplicasInfo {
     pub fn from_json_value(value: &Value) -> Result<ReplicasInfo> {
         expect_object(value, "ReplicasInfo")?;
         let replicas = |key: &str| -> Result<Vec<ReplicaIdentity>> {
-            Ok(jarray(value, key)?
+            jarray(value, key)?
                 .into_iter()
                 .map(ReplicaIdentity::from_json_value)
-                .collect::<Result<Vec<_>>>()?)
+                .collect::<Result<Vec<_>>>()
         };
         Ok(ReplicasInfo {
             master_broker_id: optional_i64(value, "masterBrokerId"),

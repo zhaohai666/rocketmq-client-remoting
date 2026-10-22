@@ -557,7 +557,7 @@ fn sample_round(inner: &Inner, rounds: u64) {
     for set in inner.sets.as_slice() {
         set.sample_all();
     }
-    if inner.hour_every_rounds != 0 && rounds.is_multiple_of(inner.hour_every_rounds) {
+    if inner.hour_every_rounds != 0 && rounds % inner.hour_every_rounds == 0 {
         for set in inner.sets.as_slice() {
             set.sample_hour_all();
         }

@@ -623,7 +623,7 @@ async fn a4_broker_config(ck: &mut Checker, env: &Env) {
         "A4 brokerName matches the broker in the route",
         props
             .get("brokerName")
-            .is_none_or(|v| v == env.broker_name() || env.broker_name().is_empty()),
+            .map_or(true, |v| v == env.broker_name() || env.broker_name().is_empty()),
         &format!(
             "brokerName={:?} route={:?}",
             props.get("brokerName"),
@@ -833,7 +833,7 @@ async fn a7_produce_and_stats(ck: &mut Checker, env: &Env) -> Vec<SentMsg> {
                 let total = table.total_max_offset();
                 let better = stats
                     .as_ref()
-                    .is_none_or(|old| total > old.total_max_offset());
+                    .map_or(true, |old| total > old.total_max_offset());
                 if better {
                     stats = Some(table);
                 }
@@ -1282,7 +1282,7 @@ async fn a9_message_query(ck: &mut Checker, env: &Env, sent: &[SentMsg]) {
     {
         Ok(found) => ck.check(
             "A9 queryMessageByUniqKey is reachable (on a hit it must be the original message)",
-            found.is_none_or(|m| m.get_topic() == topic),
+            found.map_or(true, |m| m.get_topic() == topic),
             "",
         ),
         Err(e) => ck.abort("A9 queryMessage_by_uniq_key", &e.to_string()),
@@ -1354,7 +1354,7 @@ async fn a10_offset_admin(ck: &mut Checker, env: &Env) {
     match admin.search_offset(&mq, now_millis()).await {
         Ok(offset) => ck.check(
             "A10 searchOffset(now) falls inside the queue range",
-            max.is_none_or(|m| offset <= m) && min.is_none_or(|m| offset >= m),
+            max.map_or(true, |m| offset <= m) && min.map_or(true, |m| offset >= m),
             &format!("offset={offset}"),
         ),
         Err(e) => ck.abort("A10 searchOffset", &e.to_string()),

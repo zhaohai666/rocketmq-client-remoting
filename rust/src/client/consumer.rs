@@ -2594,7 +2594,7 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
         let mut illegal = false;
         {
             let mut state = lock(&inner.state);
-            if state.queue_owners.get(&key).is_none_or(|t| *t != token) {
+            if state.queue_owners.get(&key).map_or(true, |t| *t != token) {
                 rmq_debug!(
                     "queue {key} revoked during pull, discard {} fetched messages",
                     msgs.len()
@@ -4566,7 +4566,7 @@ fn correct_tags_offset_locked(state: &mut State, key: &str, status: PullStatus, 
     if state.frozen_offsets.contains(key) {
         return;
     }
-    if !state.pending.get(key).is_none_or(|dq| dq.is_empty()) {
+    if !state.pending.get(key).map_or(true, |dq| dq.is_empty()) {
         return;
     }
     if state.inflight.get(key).copied().unwrap_or(0) != 0 {

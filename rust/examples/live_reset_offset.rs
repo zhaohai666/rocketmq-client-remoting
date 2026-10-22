@@ -618,7 +618,7 @@ async fn s1_backward_reset(fx: &Fixture, ck: &mut Checker) {
             "S1-old batch ack invalidated (after release, while the new queue's first batch offset {} is in flight, the local offset has still not passed {BACK_TARGET})",
             if second && two.len() > 1 { two[1][0] } else { -1 }
         ),
-        second && off.is_none_or(|o| o <= BACK_TARGET),
+        second && off.map_or(true, |o| o <= BACK_TARGET),
         &format!("local_offset={off:?} arrivals={:?}", sink.offsets()),
     );
 

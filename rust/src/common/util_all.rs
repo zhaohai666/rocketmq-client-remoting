@@ -149,7 +149,7 @@ pub fn string_2_bytes(hex: &str) -> Option<Vec<u8>> {
     }
     let upper = hex.to_ascii_uppercase();
     let chars: Vec<u8> = upper.as_bytes().to_vec();
-    if !chars.len().is_multiple_of(2) {
+    if chars.len() % 2 != 0 {
         return None;
     }
     let mut out = Vec::with_capacity(chars.len() / 2);

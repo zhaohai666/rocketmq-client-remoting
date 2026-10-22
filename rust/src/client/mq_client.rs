@@ -5972,7 +5972,7 @@ mod tests {
 
     /// One broker, one subscribed consumer, and the fingerprint path switched on.
     fn v2_instance(broker: &MockBroker) -> MQClientInstance {
-        let instance = instance_with_sub(broker, vec![tag_sub(TOPIC, "*", &ExpressionType::TAG.to_string())]);
+        let instance = instance_with_sub(broker, vec![tag_sub(TOPIC, "*", ExpressionType::TAG)]);
         instance.set_use_heartbeat_v2(true);
         instance
     }
@@ -5992,7 +5992,7 @@ mod tests {
     #[tokio::test]
     async fn heartbeat_v2_off_keeps_the_legacy_body() {
         let broker = MockBroker::start().await;
-        let instance = instance_with_sub(&broker, vec![tag_sub(TOPIC, "*", &ExpressionType::TAG.to_string())]);
+        let instance = instance_with_sub(&broker, vec![tag_sub(TOPIC, "*", ExpressionType::TAG)]);
         assert!(!instance.is_use_heartbeat_v2(), "the switch is opt-in");
         assert_eq!(instance.send_heartbeat_to_all_broker(3000).await, 1);
         let beats = beaten(&broker);
@@ -6097,7 +6097,7 @@ mod tests {
 
         instance.register_consumer(
             "GID_second_group",
-            StubConsumer::with_subs("GID_second_group", vec![tag_sub(TOPIC, "tagB", &ExpressionType::TAG.to_string())]),
+            StubConsumer::with_subs("GID_second_group", vec![tag_sub(TOPIC, "tagB", ExpressionType::TAG)]),
         );
         assert_eq!(instance.send_heartbeat_to_all_broker(3000).await, 1);
         let after = beaten(&broker);
@@ -7240,7 +7240,7 @@ mod tests {
     async fn drive_every_broker_rpc(instance: &MQClientInstance, route_addr: &str) {
         let mq = MessageQueue::new(TOPIC, BROKER, 0);
         let mqs = vec![mq.clone()];
-        let sub = tag_sub(TOPIC, "*", &ExpressionType::TAG.to_string());
+        let sub = tag_sub(TOPIC, "*", ExpressionType::TAG);
         let extra = crate::remoting::protocol::extra_info::build_extra_info(
             1,
             2,
@@ -7472,7 +7472,7 @@ mod tests {
         let (route, fast) = vip_pair().await;
         let admin = DefaultMQAdminExt::new();
         admin.set_instance_name(&format!("ADMIN_vip_{}", SEQ.fetch_add(1, Ordering::Relaxed)));
-        admin.set_name_server_addresses(&[route.addr.clone()]);
+        admin.set_name_server_addresses(std::slice::from_ref(&route.addr));
         admin.set_timeout_millis(3000);
         admin.set_vip_channel_enabled(true);
         admin.start().await.expect("the fake broker answers the start handshake");

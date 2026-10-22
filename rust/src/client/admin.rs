@@ -2925,7 +2925,7 @@ impl DefaultMQAdminExt {
                 Ok(parsed
                     .get("consumeTimeSpanSet")
                     .and_then(Value::as_array)
-                    .map(|set| set.iter().cloned().collect())
+                    .map(|set| set.to_vec())
                     .unwrap_or_default())
             }
             None => Ok(Vec::new()),
@@ -4384,7 +4384,7 @@ mod tests {
     use super::*;
     use crate::common::message_decoder::{create_message_id, encode_message_ext, ip_and_port_to_bytes};
     use crate::remoting::protocol::admin_body::{CheckRocksdbCqWriteStatus, TopicOffset};
-    use crate::remoting::protocol::body::{CMResult, Connection};
+    use crate::remoting::protocol::body::CMResult;
     use crate::remoting::protocol::route::QueueData;
 
     fn cluster() -> ClusterInfo {
@@ -6079,76 +6079,14 @@ mod tests {
             .collect()
     }
 
-    fn route_reply(brokers: &[(&str, &str)]) -> RemotingCommand {
-        let broker_datas: Vec<Value> = brokers
-            .iter()
-            .map(|(name, addr)| {
-                json!({
-                    "cluster": "DefaultCluster",
-                    "brokerName": name,
-                    "brokerAddrs": {"0": addr},
-                    "zoneName": "",
-                    "enableActingMaster": false,
-                })
-            })
-            .collect();
-        let queue_datas: Vec<Value> = brokers
-            .iter()
-            .map(|(name, _)| {
-                json!({
-                    "brokerName": name,
-                    "readQueueNums": 2,
-                    "writeQueueNums": 2,
-                    "perm": 6,
-                    "topicSysFlag": 0,
-                })
-            })
-            .collect();
-        let body = json!({
-            "brokerDatas": broker_datas,
-            "queueDatas": queue_datas,
-            "filterServerTable": {},
-        });
-        reply_with_body(RemotingSerializable::encode(&body))
-    }
-
-    fn topic_stats_body(broker: &str, queue_id: i32, tps: f64) -> Vec<u8> {
-        let mut table = TopicStatsTable::new();
-        table.offset_table.push((
-            MessageQueueKey::new("T", broker, queue_id),
-            TopicOffset::new(0, 10, 0),
-        ));
-        table.topic_put_tps = tps;
-        RemotingSerializable::encode(&table.to_json_value())
-    }
-
-    fn consume_stats_body(broker: &str, topic: &str, tps: f64) -> Vec<u8> {
-        let mut stats = ConsumeStats::new();
-        stats.offset_table.push((
-            MessageQueueKey::new(topic, broker, 0),
-            OffsetWrapper::new(100, 40, 0, 0),
-        ));
-        stats.consume_tps = tps;
-        stats.encode()
-    }
-
-    fn connection_reply(consume_type: &str, message_model: &str) -> Vec<u8> {
-        ConsumerConnection {
-            connection_set: vec![Connection::default()],
-            consume_type: Some(consume_type.to_string()),
-            message_model: Some(message_model.to_string()),
-            ..Default::default()
-        }
-        .encode()
-    }
-
     type AdminLog = Arc<Mutex<Vec<(i32, ExtFields, Option<Vec<u8>>)>>>;
+    /// One scripted broker answer: (request code, response code, response body, response ext fields).
+    type AdminScript = Vec<(i32, i32, Option<Vec<u8>>, Vec<(String, String)>)>;
 
-    /// Script entry: (request code, response code, response body, response ext fields).
     /// Unscripted codes get a bare SUCCESS, which also covers the start-up chatter.
     async fn spawn_admin_broker(
         listener: tokio::net::TcpListener,
-        script: Vec<(i32, i32, Option<Vec<u8>>, Vec<(String, String)>)>,
+        script: AdminScript,
     ) -> AdminLog {
         use tokio::io::AsyncWriteExt as _;
         let log: AdminLog = Arc::new(Mutex::new(Vec::new()));
@@ -6783,17 +6721,21 @@ mod tests {
         let log = spawn_admin_broker(listener, Vec::new()).await;
         let admin = started_direct_admin(&addr).await;
 
-        let mut topic = TopicConfig::default();
-        topic.topic_name = "T".to_string();
-        topic.read_queue_nums = 4;
-        topic.write_queue_nums = 4;
-        topic.perm = 6;
+        let topic = TopicConfig {
+            topic_name: "T".to_string(),
+            read_queue_nums: 4,
+            write_queue_nums: 4,
+            perm: 6,
+            ..TopicConfig::default()
+        };
         admin
-            .create_and_update_topic_config_list(&addr, &[topic.clone()])
+            .create_and_update_topic_config_list(&addr, std::slice::from_ref(&topic))
             .await
             .expect("topic list");
-        let mut group = SubscriptionGroupConfig::default();
-        group.group_name = "GID_a".to_string();
+        let group = SubscriptionGroupConfig {
+            group_name: "GID_a".to_string(),
+            ..SubscriptionGroupConfig::default()
+        };
         admin
             .create_and_update_subscription_group_config_list(&addr, &[group])
             .await

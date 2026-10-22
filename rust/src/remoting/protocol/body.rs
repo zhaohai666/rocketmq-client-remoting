@@ -2210,8 +2210,7 @@ mod tests {
 
     #[test]
     fn batch_ack_bit_set_of_a_blank_group_encodes_as_empty_text() {
-        let mut ack = BatchAck::default();
-        ack.bit_set = Vec::new();
+        let ack = BatchAck::default();
         assert_eq!(ack_bit_set_to_base64(&ack.bit_set), "");
         assert!(ack.to_json_value()["b"].is_string());
         // Round-trip of the empty set: empty text is the empty set, not a decode failure.
