@@ -25,6 +25,7 @@ putenv('ROCKETMQ_NAMESRV_DOMAIN');
 use RocketMQ\Client\BackPressureSendCallback;
 use RocketMQ\Client\CheckForbiddenContext;
 use RocketMQ\Client\CheckForbiddenHook;
+use RocketMQ\Client\ConsumeExecutor;
 use RocketMQ\Client\DefaultMQProducer;
 use RocketMQ\Client\EndTransactionContext;
 use RocketMQ\Client\EndTransactionHook;
@@ -586,6 +587,35 @@ final class CallbackSlot implements SendCallback
     }
 }
 
+/**
+ * What one drive of the async send gate did: the caller's callback, the send task's
+ * executor (tasks stay queued until pumped, so "submitted" is observable), the gated
+ * callback holding the permits, and whether the task body ran.
+ */
+final class GateDrive
+{
+    public CallbackSlot $slot;
+    public ConsumeExecutor $executor;
+    public BackPressureSendCallback $gated;
+    public ?\Throwable $thrown = null;
+    public int $ran = 0;
+
+    public function __construct(int $msgLen, FairSemaphore $num, FairSemaphore $size)
+    {
+        $this->slot = new CallbackSlot();
+        $this->executor = new ConsumeExecutor(1, 1);
+        $this->gated = new BackPressureSendCallback($this->slot, $num, $size, $msgLen);
+    }
+
+    /** The send task only records that it ran; the completion is driven by the test. */
+    public function runnable(): \Closure
+    {
+        return function (): void {
+            $this->ran++;
+        };
+    }
+}
+
 // ======================================================================
 // Test runner
 // ======================================================================
@@ -978,6 +1008,155 @@ final class RunClientProducer
         $tsr->setTransactionId('tx-2');
         $this->checkSame('tx-2', $tsr->getTransactionId(), 'TransactionSendResult: setTransactionId delegated');
         $this->checkSame($base, $tsr->getSendResult(), 'TransactionSendResult: getSendResult returns the underlying result');
+    }
+
+    // ================================================================ 5b. Async send gate
+
+    /**
+     * Drive DefaultMQProducer::executeAsyncMessageSend on its own. The clock is scheduled
+     * reading-by-reading (the gate asks for the elapsed cost once before each permit
+     * stage), the send task only records that it was submitted, and no client, broker or
+     * second thread is involved -- so both the permit ledger and the caller's callback are
+     * directly observable.
+     *
+     * @param list<int> $elapsed cost the gate sees at each stage, relative to $begin
+     */
+    private function driveAsyncGate(
+        DefaultMQProducer $producer,
+        GateDrive $drive,
+        int $timeout,
+        float $begin,
+        array $elapsed,
+    ): void {
+        $remaining = $elapsed;
+        $producer->monoClock = static function () use (&$remaining, $begin): float {
+            if ($remaining === []) {
+                throw new \RuntimeException('async gate clock ran out of scheduled readings');
+            }
+            return $begin + (float) array_shift($remaining);
+        };
+        $method = new \ReflectionMethod(DefaultMQProducer::class, 'executeAsyncMessageSend');
+        $method->setAccessible(true);
+        try {
+            $method->invoke($producer, $drive->runnable(), $drive->gated, $timeout, $begin, $drive->executor);
+        } catch (\Throwable $e) {
+            $drive->thrown = $e;
+        }
+    }
+
+    private function testAsyncSendGate(): void
+    {
+        $producer = new DefaultMQProducer('PID-gate');
+        $producer->setEnableBackpressureForAsyncMode(true);
+        /** @var FairSemaphore $num */
+        $num = $this->privateOf($producer, 'semaphoreAsyncSendNum');
+        /** @var FairSemaphore $size */
+        $size = $this->privateOf($producer, 'semaphoreAsyncSendSize');
+        $numCap = $num->totalPermits();
+        $sizeCap = $size->totalPermits();
+        $this->checkSame($producer->getBackPressureForAsyncSendNum(), $numCap, 'gate: count cap is the configured knob');
+        $this->checkSame($producer->getBackPressureForAsyncSendSize(), $sizeCap, 'gate: byte cap is the configured knob');
+
+        // Open gate: both permits are held for the whole life of the request, and nothing
+        // stays queued behind the request being served.
+        $d = new GateDrive(128, $num, $size);
+        $this->driveAsyncGate($producer, $d, 3000, 0.0, [0, 0]);
+        $this->check(null === $d->thrown, 'gate: open gate does not raise');
+        $this->checkSame($numCap - 1, $num->availablePermits(), 'gate: count permit held while the send is in flight');
+        $this->checkSame($sizeCap - 128, $size->availablePermits(), 'gate: byte permit held while the send is in flight');
+        $this->checkSame(0, $num->waitingCount(), 'gate: the granted count request queued nothing');
+        $this->checkSame(0, $size->waitingCount(), 'gate: the granted byte request queued nothing');
+        $this->checkSame(1, $d->executor->queuedCount(), 'gate: the send task was submitted');
+        $this->checkSame(0, $d->ran, 'gate: the task has not run before the executor is pumped');
+        $this->checkSame(0, $d->slot->calls, 'gate: an in-flight send has not answered the caller');
+        $d->executor->pumpAll();
+        $this->checkSame(1, $d->ran, 'gate: pumping runs exactly the submitted send');
+        $d->gated->onSuccess(null);
+        $this->checkSame($numCap, $num->availablePermits(), 'gate: completion returns the count permit');
+        $this->checkSame($sizeCap, $size->availablePermits(), 'gate: completion returns the byte permit');
+
+        // The budget the gate checks is the *caller's*, not the semaphore's: once the send
+        // timeout is spent the gate must not take a permit at all. The semaphore answers a
+        // poll regardless of its timeout argument, so this guard is the only thing standing
+        // between a spent budget and a permit handed out afterwards.
+        foreach ([3000, 3001, 900000] as $spent) {
+            $d = new GateDrive(128, $num, $size);
+            $this->driveAsyncGate($producer, $d, 3000, 100.0, [$spent]);
+            $this->checkSame($numCap, $num->availablePermits(), "gate: a spent budget ({$spent}ms) leaves the count permit alone");
+            $this->checkSame($sizeCap, $size->availablePermits(), "gate: a spent budget ({$spent}ms) leaves the byte permit alone");
+            $this->checkSame(0, $d->executor->queuedCount(), "gate: a spent budget ({$spent}ms) submits no send");
+            $this->checkSame(0, $d->ran, "gate: a spent budget ({$spent}ms) runs no send");
+            $this->checkSame(0, $num->waitingCount(), "gate: a spent budget ({$spent}ms) queues nothing");
+            $this->checkSame(1, $d->slot->calls, "gate: a spent budget ({$spent}ms) answers the caller once");
+            $this->check($d->slot->error instanceof RemotingTooMuchRequestException, "gate: a spent budget ({$spent}ms) reports too much request");
+            $this->checkSame('send message tryAcquire semaphoreAsyncNum timeout',
+                $d->slot->error === null ? null : $d->slot->error->getMessage(),
+                "gate: a spent budget ({$spent}ms) uses the count-stage wording");
+        }
+        // Paired control for the boundary: one millisecond of budget left is left, so the
+        // gate grants. Reverting the guard to a bare tryAcquire makes both halves red.
+        $d = new GateDrive(128, $num, $size);
+        $this->driveAsyncGate($producer, $d, 3000, 0.0, [2999, 0]);
+        $this->checkSame(1, $d->executor->queuedCount(), 'gate: one millisecond of budget left still grants');
+        $d->gated->onException(new MQClientException('done'));
+        $this->checkSame($numCap, $num->availablePermits(), 'gate: the boundary send returned its count permit');
+        $this->checkSame($sizeCap, $size->availablePermits(), 'gate: the boundary send returned its byte permit');
+
+        // Byte stage refused after the count stage succeeded: what was taken comes back,
+        // what was not taken is not released.
+        $d = new GateDrive(1024, $num, $size);
+        $this->driveAsyncGate($producer, $d, 1000, 0.0, [10, 1000]);
+        $this->checkSame($numCap, $num->availablePermits(), 'gate: a byte-stage refusal rolls back the count permit it took');
+        $this->checkSame($sizeCap, $size->availablePermits(), 'gate: a byte-stage refusal takes no byte permit');
+        $this->checkSame(0, $d->executor->queuedCount(), 'gate: a byte-stage refusal submits no send');
+        $this->checkSame(0, $size->waitingCount(), 'gate: a byte-stage refusal queues nothing');
+        $this->checkSame(1, $d->slot->calls, 'gate: a byte-stage refusal answers the caller once');
+        $this->checkSame('send message tryAcquire semaphoreAsyncSize timeout',
+            $d->slot->error === null ? null : $d->slot->error->getMessage(),
+            'gate: a byte-stage refusal uses the byte-stage wording');
+
+        // Closed gate, ample budget: refused in this poll, and the refusal leaves no ticket,
+        // so the next request is served as soon as a permit returns.
+        $this->check(true === $num->tryAcquire($numCap, 0), 'gate: count gate drained to zero');
+        $d = new GateDrive(1, $num, $size);
+        $this->driveAsyncGate($producer, $d, 3000, 0.0, [0]);
+        $this->checkSame(0, $num->availablePermits(), 'gate: a drained count gate stays drained');
+        $this->checkSame(0, $num->waitingCount(), 'gate: the refused count request left the queue');
+        $this->checkSame($sizeCap, $size->availablePermits(), 'gate: a count-stage refusal never reaches the byte stage');
+        $this->checkSame(0, $d->executor->queuedCount(), 'gate: a count-stage refusal submits no send');
+        $this->checkSame(1, $d->slot->calls, 'gate: a count-stage refusal answers the caller once');
+        $this->check($d->slot->error instanceof RemotingTooMuchRequestException, 'gate: a count-stage refusal reports too much request');
+        $num->release(1);
+        $d = new GateDrive(1, $num, $size);
+        $this->driveAsyncGate($producer, $d, 3000, 0.0, [0, 0]);
+        $this->checkSame(1, $d->executor->queuedCount(), 'gate: the request after the release is served: the refused one never stayed at the head of the line');
+        $this->checkSame(0, $num->availablePermits(), 'gate: that request now holds the released permit');
+        $d->gated->onSuccess(null);
+        $this->checkSame(1, $num->availablePermits(), 'gate: and returns it');
+        $num->release($numCap - 1);
+
+        // Resizing the caps through the public knobs moves the free counter by the delta, so
+        // growth is usable at once and shrinkage over an in-flight load lands exactly on the
+        // new cap once that load drains -- never above it.
+        $p2 = new DefaultMQProducer('PID-gate-resize');
+        /** @var FairSemaphore $size2 */
+        $size2 = $this->privateOf($p2, 'semaphoreAsyncSendSize');
+        $doubled = 2 * $sizeCap;
+        $this->check(true === $size2->tryAcquire($sizeCap, 0), 'resize: every in-flight byte taken at the configured cap');
+        $p2->setBackPressureForAsyncSendSize($doubled);
+        $this->checkSame($sizeCap, $size2->availablePermits(), 'resize: raising the cap frees the delta while the old bytes are still in flight');
+        $this->check(true === $size2->tryAcquire($sizeCap, 0), 'resize: the delta is grantable at once');
+        $p2->setBackPressureForAsyncSendSize($sizeCap);
+        $this->checkSame(-$sizeCap, $size2->availablePermits(), 'resize: shrinking below the in-flight bytes gives a negative margin');
+        $this->check(false === $size2->tryAcquire(1, 0), 'resize: a negative margin refuses');
+        $size2->release($doubled);
+        $this->checkSame($sizeCap, $size2->availablePermits(), 'resize: draining the in-flight traffic lands exactly on the new cap');
+        $this->check(true === $size2->tryAcquire($sizeCap, 0), 'resize: the new cap is fully grantable');
+        $this->check(false === $size2->tryAcquire(1, 0), 'resize: nothing above the new cap is grantable');
+        $size2->release($sizeCap);
+        $this->checkSame($numCap, $num->availablePermits(), 'gate: the drives left the count gate balanced');
+        $this->checkSame($sizeCap, $size->availablePermits(), 'gate: the drives left the byte gate balanced');
+        $producer->monoClock = null;
     }
 
     // ================================================================ 6. Lifecycle / validation
@@ -1989,6 +2168,7 @@ final class RunClientProducer
         $this->testStaticHelpers();
         $this->testSelectors();
         $this->testCallbacksAndResults();
+        $this->testAsyncSendGate();
         $this->testLifecycleValidation();
 
         $broker = ProducerFakeBroker::start();

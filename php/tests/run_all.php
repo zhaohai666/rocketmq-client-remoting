@@ -16,29 +16,13 @@ declare(strict_types=1);
  * examples/live_*.php.
  */
 
-$suites = [
-    'Common layer' => __DIR__ . '/RunCommon.php',
-    'Remoting layer' => __DIR__ . '/RunRemoting.php',
-    'Client logger' => __DIR__ . '/RunClientLogger.php',
-    'Client leaf' => __DIR__ . '/RunClientLeaf.php',
-    'Client trace' => __DIR__ . '/RunClientTrace.php',
-    'Client OpenTracing' => __DIR__ . '/RunClientOpenTracing.php',
-    'Client accumulator' => __DIR__ . '/RunClientAccumulator.php',
-    'Client instance' => __DIR__ . '/RunClientInstance.php',
-    'Client fault detector' => __DIR__ . '/RunClientFaultDetector.php',
-    'Client POP assignment' => __DIR__ . '/RunClientPopAssignment.php',
-    'Client consumer' => __DIR__ . '/RunClientConsumer.php',
-    'Client consumer wire and shutdown drain' => __DIR__ . '/RunClientConsumerWire.php',
-    'Client async pull and scheduled pull' => __DIR__ . '/RunClientPullSchedule.php',
-    'Client batch acknowledge' => __DIR__ . '/RunClientBatchAck.php',
-    'Client heartbeat period' => __DIR__ . '/RunClientHeartbeatPeriod.php',
-    'Client producer' => __DIR__ . '/RunClientProducer.php',
-    'Client queue-change listener' => __DIR__ . '/RunClientLiteTopicChange.php',
-    'Client static topic route' => __DIR__ . '/RunClientStaticTopic.php',
-    'Client auth admin' => __DIR__ . '/RunClientAuthAdmin.php',
-    'Client config knobs' => __DIR__ . '/RunClientConfigKnobs.php',
-    'Client admin long tail' => __DIR__ . '/RunClientAdminLongTail.php',
-];
+// Every tests/Run*.php is a suite, so the directory — not a hand-kept list that silently falls
+// behind — decides what runs before a commit. (Two suites once sat here unlisted for exactly that
+// reason.) The `_`-prefixed children are transport helpers, not suites.
+$suites = [];
+foreach (glob(__DIR__ . '/Run*.php') ?: [] as $file) {
+    $suites[basename($file, '.php')] = $file;
+}
 
 // Load the autoloader at the top level so the sub-suites do not register it repeatedly.
 require_once __DIR__ . '/../bootstrap.php';

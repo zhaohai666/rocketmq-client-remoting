@@ -455,7 +455,9 @@ final class RunClientAdmin
         $this->checkSame([], $json['attributes'], 'SubscriptionGroupConfig.encode attributes={}');
 
         $cfg2 = SubscriptionGroupConfig::decode($cfg->encode());
-        $this->checkSame($cfg->toDict(), $cfg2->toDict(), 'SubscriptionGroupConfig encode→decode roundtrip');
+        // Compared by content: attributes is a dict on the wire, so both sides cast it to an
+        // object and two distinct instances of the same content are what a roundtrip must give.
+        $this->check($cfg->toDict() == $cfg2->toDict(), 'SubscriptionGroupConfig encode→decode roundtrip');
 
         $cfg3 = new SubscriptionGroupConfig('G');
         $cfg3->subscriptionDataSet = [new SimpleSubscriptionData('T', 'TAG', '*', 5)];
@@ -1941,14 +1943,25 @@ final class RunClientAdmin
         // setMessageRequestMode
         $admin10 = $this->newAdmin();
         $admin10->setMessageRequestMode('b:1', 'T', 'G1', 'POP', 4);
-        $this->checkSame(RequestCode::SET_MESSAGE_REQUEST_MODE, $this->lastCmd($admin10)->code, 'SET_MESSAGE_REQUEST_MODE=401');
+        $cmd10 = $this->lastCmd($admin10);
+        $this->checkSame(RequestCode::SET_MESSAGE_REQUEST_MODE, $cmd10->code, 'SET_MESSAGE_REQUEST_MODE=401');
+        // The whole request is the body: the broker decodes a SetMessageRequestModeRequestBody and
+        // reads no custom header at all, so an ext-field form would be accepted and do nothing.
         $this->checkSame(
-            ['topic' => 'T', 'consumerGroup' => 'G1', 'mode' => 'POP', 'popShareQueueNum' => '4'],
-            $this->lastCmd($admin10)->extFields,
-            '401 ext (popShareQueueNum>0 only)'
+            ['topic' => 'T', 'consumerGroup' => 'G1', 'mode' => 'POP', 'popShareQueueNum' => 4],
+            json_decode((string) $cmd10->body, true),
+            '401 body carries topic/consumerGroup/mode/popShareQueueNum'
         );
+        $this->checkSame([], $cmd10->extFields, '401 sends no custom header');
         $admin10->setMessageRequestMode('b:1', 'T', 'G1', 'PULL');
-        $this->check(!isset($this->lastCmd($admin10)->extFields['popShareQueueNum']), '401 popShareQueueNum=0 not dispatched');
+        $this->checkSame(
+            ['topic' => 'T', 'consumerGroup' => 'G1', 'mode' => 'PULL', 'popShareQueueNum' => 0],
+            json_decode((string) $this->lastCmd($admin10)->body, true),
+            '401 popShareQueueNum=0 is still part of the body'
+        );
+        $admin10->setMessageRequestMode('b:1', 'T', 'G1', '');
+        $this->checkSame('PULL', json_decode((string) $this->lastCmd($admin10)->body, true)['mode'],
+            '401 an empty mode falls back to PULL');
     }
 
     // ================================================================ Entry point

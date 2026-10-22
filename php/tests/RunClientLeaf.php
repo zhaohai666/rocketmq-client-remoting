@@ -775,6 +775,72 @@ final class RunClientLeaf
         $this->checkSame(-2, $s3->availablePermits(), 'setTotalPermits yields negative free permits');
         $s3->release(3);
         $this->checkSame(1, $s3->availablePermits(), 'release pulls the negative margin back positive');
+
+        // ---- poll-once gate: the queue never holds a waiter ------------------------------
+        // The gate decides inside the single poll that carries the request, and a request it
+        // does not grant there withdraws itself immediately. That is what keeps the caller's
+        // budget honest -- there is no later pass that could hand out a permit after the
+        // budget expired -- and it is what keeps one refused request from starving the ones
+        // behind it. Pinning the empty queue is the guard on both.
+
+        $g = new FairSemaphore(4);
+        $this->checkSame(0, $g->waitingCount(), 'fresh gate has an empty queue');
+        $this->check(true === $g->tryAcquire(4, 1000), 'grant: whole budget served in one poll');
+        $this->checkSame(0, $g->waitingCount(), 'grant: the served request leaves no ticket');
+        $this->checkSame(0, $g->availablePermits(), 'grant: permits deducted');
+
+        $this->check(false === $g->tryAcquire(1, 1000), 'refuse: gate is empty');
+        $this->checkSame(0, $g->waitingCount(), 'refuse: the refused request is not queued');
+        $this->check(false === $g->tryAcquire(9999, 1000), 'refuse: a request larger than the total is refused');
+        $this->checkSame(0, $g->waitingCount(), 'refuse: an impossible request still leaves the queue empty');
+        // Paired control for the two checks above: had either ticket stayed at the head,
+        // only the head may acquire, so every request behind it would be refused forever.
+        $g->release(2);
+        $this->check(true === $g->tryAcquire(2, 1000), 'refuse: a later request still reaches the head once permits return');
+        $this->checkSame(0, $g->availablePermits(), 'refuse: that later request consumed what was released');
+
+        // Releasing does not retroactively satisfy a refused request: the permit stays on
+        // the counter for the next poll, it is not handed to a request that already left.
+        $pb = new FairSemaphore(1);
+        $this->check(true === $pb->tryAcquire(1, 0), 'retroactive: first request takes the only permit');
+        $this->check(false === $pb->tryAcquire(1, 100000), 'retroactive: the second request is refused in its own poll');
+        $pb->release(1);
+        $this->checkSame(1, $pb->availablePermits(), 'retroactive: the released permit sits on the counter');
+        $this->check(true === $pb->tryAcquire(1, 0), 'retroactive: the released permit is granted to the next poll');
+        $this->checkSame(0, $pb->availablePermits(), 'retroactive: nothing is left over');
+
+        // The budget argument changes the answer never, not once: every poll is a single
+        // poll whatever the timeout says.
+        foreach ([0, -1, 1000, 600000] as $budget) {
+            $t = new FairSemaphore(3);
+            $this->check(true === $t->tryAcquire(3, $budget), "budget {$budget}: grant is unchanged by the timeout");
+            $this->checkSame(0, $t->waitingCount(), "budget {$budget}: grant leaves no waiter");
+            $this->check(false === $t->tryAcquire(1, $budget), "budget {$budget}: refusal is a return, not a wait");
+            $this->checkSame(0, $t->waitingCount(), "budget {$budget}: refusal leaves no waiter");
+        }
+
+        // Resize is a delta on the free counter, so over-subscription drains it below zero
+        // and drains back out exactly: returning every in-flight request lands on the new
+        // cap -- not above it (a clamp-to-total resize would keep granting past the cap the
+        // gate was just shrunk to).
+        $r = new FairSemaphore(5);
+        $this->check(true === $r->tryAcquire(5, 0), 'shrink: all 5 in flight before resizing');
+        $r->setTotalPermits(3);
+        $this->checkSame(-2, $r->availablePermits(), 'shrink: resizing below the in-flight count gives a negative margin');
+        $this->check(false === $r->tryAcquire(1, 0), 'shrink: a negative margin refuses');
+        $r->release(5);
+        $this->checkSame(3, $r->availablePermits(), 'shrink: returning every in-flight permit lands exactly on the new cap');
+        $this->check(true === $r->tryAcquire(3, 0), 'shrink: the new cap is fully grantable afterwards');
+        $this->check(false === $r->tryAcquire(1, 0), 'shrink: no headroom above the new cap');
+
+        // Growing admits the delta immediately, without waiting for an in-flight request.
+        $w = new FairSemaphore(4);
+        $this->check(true === $w->tryAcquire(4, 0), 'grow: all 4 in flight before resizing');
+        $w->setTotalPermits(6);
+        $this->checkSame(2, $w->availablePermits(), 'grow: the delta is free at once');
+        $this->check(true === $w->tryAcquire(2, 0), 'grow: the delta is grantable while the old requests are still in flight');
+        $w->release(6);
+        $this->checkSame(6, $w->availablePermits(), 'grow: returning everything restores the new total exactly');
     }
 
     // ==================================================================== Hook

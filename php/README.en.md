@@ -15,7 +15,7 @@ This directory is the **PHP client SDK for Apache RocketMQ's classic remoting pr
   dispatch all collapse into a **caller-driven `tick()`** invoked from your own loop
   (see the execution-model note in "Examples").
 - Verified against a real RocketMQ **5.5.1** cluster (NameServer 9876 + Broker 10911).
-- Size: `src/` 73 files / 30,280 lines; `tests/` 19 files / 15,163 lines.
+- Size: `src/` 76 files / 34,799 lines; `tests/` 26 files / 22,255 lines.
 
 ## Prerequisites
 
@@ -45,7 +45,7 @@ cd php
 # syntax check of a file after modifying it
 php -l src/Client/Producer.php
 
-# offline self-test entry: static guard + 21 suites run sequentially, no cluster needed
+# offline self-test entry: static guard + 23 suites run sequentially, no cluster needed
 php tests/run_all.php
 
 # a single suite
@@ -59,8 +59,9 @@ bash scripts/run_php_live.sh compression 127.0.0.1:9876
 `tests/run_all.php` is the **offline** suite: before running anything it performs a
 repository-wide **duplicate-class-name static guard** (PHP has no module isolation, so
 when the same FQCN is declared in two files the one autoloaded first silently wins and
-the other dies — this guard cannot be skipped), then chains 21 suites. Measured today:
-**guard CLEAN, all 3,354 assertions across the 21 suites pass**; any failure exits with a
+the other dies — this guard cannot be skipped), then chains **23** suites — the list is derived
+from `tests/Run*.php`, so a new suite cannot silently stay out of the check. Measured today:
+**guard CLEAN, all 4,078 assertions across the 23 suites pass**; any failure exits with a
 non-zero code.
 
 ## Examples
@@ -140,6 +141,11 @@ With `setAutoBatch(true)`, `send()` / `sendAsync()` go through the `ProduceAccum
 for automatic batching, governed by the two-level fair backpressure knobs
 (`setEnableBackpressureForAsyncMode` / `setBackPressureForAsyncSendNum` /
 `setBackPressureForAsyncSendSize`).
+
+This port's gate polls once with the remaining budget: a request that cannot be served is
+refused immediately with `RemotingTooMuchRequestException` instead of blocking inside
+`sendAsync()` — under the single-threaded `tick()` model a blocked caller could never pump the
+completion that returns the permit, and a refused request always leaves the line at once.
 
 **Transactional messages**:
 
@@ -436,7 +442,7 @@ Assigning the public `$client->socksProxy` property works too; all five client f
 - ✅ Compression: ZLIB (`gzcompress`), pure-PHP LZ4 Frame, ZSTD (CLI preferred, pure-PHP
   fallback)
 - ✅ TLS: CA verification / mTLS / SNI
-- ✅ Offline self-test: 21 suites with 3,354 assertions + the duplicate-class-name static
+- ✅ Offline self-test: 23 suites with 4,078 assertions + the duplicate-class-name static
   guard (measured all green)
 - ✅ Live-cluster verification: the 14 `examples/live_*.php` cases cover the admin surface,
   redelivery / dead-letter, pull mode, queue-change listening, POP, TLS, Request-Reply,

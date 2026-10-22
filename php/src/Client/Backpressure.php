@@ -63,6 +63,16 @@ final class FairSemaphore
         return $this->total;
     }
 
+    /**
+     * Requests still in line. The gate polls once and removes a request it cannot satisfy in
+     * that same poll, so a refusal never leaves a ticket behind waiting for a release that
+     * would arrive too late for its own budget.
+     */
+    public function waitingCount(): int
+    {
+        return count($this->queue);
+    }
+
     private function removeRequest(Pending $request): void
     {
         foreach ($this->queue as $i => $p) {

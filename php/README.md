@@ -13,7 +13,7 @@ NameServer + Broker，不依赖 Proxy。
 - PHP 没有常驻线程，心跳、重平衡、位点持久化、轨迹分发等全部收敛为**由调用方循环驱动
   的 `tick()`**（见「快速上手」的执行模型说明）。
 - 真机基线：RocketMQ **5.5.1**（NameServer 9876 + Broker 10911）。
-- 体量：`src/` 73 个文件 / 30,280 行，`tests/` 19 个文件 / 15,163 行。
+- 体量：`src/` 76 个文件 / 34,799 行，`tests/` 26 个文件 / 22,255 行。
 
 ## 先决条件
 
@@ -40,7 +40,7 @@ cd php
 # 改动后对相关文件做语法检查
 php -l src/Client/Producer.php
 
-# 离线自测入口：静态守卫 + 21 个套件顺序执行，不连真机
+# 离线自测入口：静态守卫 + 23 个套件顺序执行，不连真机
 php tests/run_all.php
 
 # 单个套件
@@ -53,8 +53,8 @@ bash scripts/run_php_live.sh compression 127.0.0.1:9876
 
 `tests/run_all.php` 是**离线**套件：跑之前先做一道全仓**重复类名静态守卫**（PHP 没有
 模块隔离，同一 FQCN 在两个文件声明时先被 autoload 命中的胜出、另一个静默失效，所以这道
-守卫不能省），然后串起 21 个套件。当前实测：**守卫 CLEAN，21 个套件 3,354 项断言全部
-通过**，任一失败即以非零码退出。
+守卫不能省），然后串起 **23** 个套件——套件清单由 `tests/Run*.php` 目录树推导，新增套件不会
+悄悄漏出自检。当前实测：**守卫 CLEAN，23 个套件 4,078 项断言全部通过**，任一失败即以非零码退出。
 
 ## 快速上手
 
@@ -130,6 +130,10 @@ $producer->sendAsync(new Message('TopicTest', 'hi'), new class implements SendCa
 `setAutoBatch(true)` 后 `send()` / `sendAsync()` 会经过 `ProduceAccumulator` 自动攒批，
 并受两级公平背压（`setEnableBackpressureForAsyncMode` / `setBackPressureForAsyncSendNum` /
 `setBackPressureForAsyncSendSize`）控制。
+
+本端口的闸门按剩余预算**只轮询一次**：拿不到许可就立刻抛
+`RemotingTooMuchRequestException`，不在 `sendAsync()` 里阻塞等待——单线程 `tick()` 模型下，
+一个阻塞的调用方永远等不到归还许可的那次完成回调，而被拒绝的请求一定会立刻离队。
 
 **事务消息**：
 
@@ -399,7 +403,7 @@ LitePull / Admin）同款 API。须在 `start()` 前设置（建 `MQClientInstan
   SOCKS 代理（SOCKS4/5 + 用户名密码，握手后 TLS）、故障规避选队列、`Validators` 本地校验前置
 - ✅ 压缩：ZLIB（`gzcompress`）、纯 PHP LZ4 Frame、ZSTD（CLI 优先，纯 PHP 兜底）
 - ✅ TLS：CA 校验 / mTLS / SNI
-- ✅ 离线自测：21 套件 3,354 项断言 + 重复类名静态守卫（实测全绿）
+- ✅ 离线自测：23 套件 4,078 项断言 + 重复类名静态守卫（实测全绿）
 - ✅ 真机联调：`examples/live_*.php` 14 条用例覆盖管理端 / 重投死信 / 拉模式 / 队列变更监听 /
   POP（含 BATCH_ACK 批量确认）/ POP 消费者 / TLS / Request-Reply / 压缩冒烟 / 静态 topic /
   SQL92 过滤 / 单向推送 / 生产端重注册 / 鉴权集群上的全部消息类型收发
