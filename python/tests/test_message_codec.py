@@ -304,10 +304,39 @@ class TestBatchMessageCodec:
 # ------------------------------------------------------------ crc32
 
 
-def test_crc32_is_standard():
+def test_crc32_is_the_body_crc_the_store_stamps():
     assert crc32(b"") == 0
-    assert crc32(b"a") == 0xE8B7BE43
+    # the field drops the sign bit: this body's CRC-32 has it set
+    assert zlib.crc32(b"a") & 0xFFFFFFFF == 0xE8B7BE43
+    assert crc32(b"a") == 0x68B7BE43
     assert crc32(b"abc") == 0x352441C2
+
+
+def test_check_crc_accepts_the_stored_body_crc():
+    """A body whose CRC-32 has the sign bit set is not "corrupt" -- it carries the masked
+    value the store wrote, and the check has to agree with that field."""
+    raw = encode_message_ext(build_ext(body=b"a"))
+    stored = struct.unpack_from(">I", raw, 8)[0]
+    assert stored == crc32(b"a")
+    assert decode_message(raw, check_crc=True) is not None
+
+
+def test_batch_decode_keeps_every_frame_of_a_batch():
+    """The read path hands back the whole batch, not up to the first high-bit body."""
+    stream = b"".join(encode_message_ext(build_ext(body=b"a%d" % i)) for i in range(6))
+    msgs = decode_messages(stream)
+    assert [m.get_body() for m in msgs] == [b"a%d" % i for i in range(6)]
+
+
+def test_batch_decode_does_not_verify_the_body_crc():
+    """Reading a stored body never re-checks field 3: a mismatched CRC is delivered, not
+    dropped -- stopping the walk there would silently lose the rest of the batch."""
+    ext = build_ext(body=b"keep-me")
+    raw = bytearray(encode_message_ext(ext))
+    struct.pack_into(">I", raw, 8, 0x7FFFFFFF)
+    msgs = decode_messages(bytes(raw))
+    assert [m.get_body() for m in msgs] == [b"keep-me"]
+    assert msgs[0].get_body_crc() == 0x7FFFFFFF
 
 
 @pytest.mark.parametrize("compress_type", [MessageSysFlag.ZLIB_TYPE])

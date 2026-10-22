@@ -76,7 +76,12 @@ class UtilAll:
 
     @staticmethod
     def crc32(data: bytes) -> int:
-        return zlib.crc32(data) & 0xFFFFFFFF
+        """The BODYCRC value a stored message carries: CRC-32 with the sign bit dropped.
+
+        Kept identical to the decoder's helper of the same name; a whole 32-bit CRC is not
+        what the wire field holds.
+        """
+        return zlib.crc32(data) & 0x7FFFFFFF
 
     HEX_ARRAY = "0123456789ABCDEF"
 

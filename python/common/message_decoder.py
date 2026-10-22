@@ -74,8 +74,14 @@ def bytes_to_ip_and_port(raw: bytes) -> Tuple[str, int]:
 
 
 def crc32(data: bytes) -> int:
-    pass
-    return zlib.crc32(data) & 0xFFFFFFFF
+    """The BODYCRC value the store puts on the wire.
+
+    Not the bare CRC-32: the sign bit is dropped (``& 0x7FFFFFFF``), which is what a
+    stored message carries in field 3. Comparing a whole 32-bit CRC against that field
+    disagrees for roughly half of all bodies, and a decoder that does so rejects those
+    frames instead of delivering them.
+    """
+    return zlib.crc32(data) & 0x7FFFFFFF
 
 
 # ------------------------------------------------------- properties string <-> Map
@@ -292,7 +298,7 @@ def encode_message_ext(message_ext: MessageExt, need_compress: bool = False) -> 
 
 def decode_message(raw: bytes, read_body: bool = True, decompress_body: bool = True,
                    is_client: bool = True, check_crc: bool = False) -> Optional[MessageExt]:
-    """Decode a 17-segment message into a MessageExt (corresponds to ``MessageDecoder.decode``)."""
+    """Decode a 17-segment message into a MessageExt, or None when a field cannot be read."""
     try:
         msg_ext = MessageExt()
         offset = 0
@@ -375,10 +381,12 @@ def decode_message(raw: bytes, read_body: bool = True, decompress_body: bool = T
 
 
 def decode_messages(raw: bytes, read_body: bool = True) -> List[MessageExt]:
-    """Decode a stream of 17-segment messages into a list of MessageExt (corresponds to ``MessageDecoder.decodes``, used for pull results).
+    """Decode a stream of 17-segment messages into a list of MessageExt, used for pull results.
 
-    With ``read_body=False`` every frame is still walked and its body length skipped, but the
-    bytes are neither copied nor validated nor decompressed: the bodies stay ``None``.
+    The frames are walked in order and the walk stops at the first frame that cannot be read.
+    The read path does **not** verify BODYCRC: a stored body is taken as delivered. With
+    ``read_body=False`` every frame is still walked and its body length skipped, but the bytes
+    are neither copied nor decompressed: the bodies stay ``None``.
     """
     result: List[MessageExt] = []
     pos = 0
@@ -390,7 +398,7 @@ def decode_messages(raw: bytes, read_body: bool = True) -> List[MessageExt]:
         if store_size <= 0 or store_size > total - pos:
             break
         msg = decode_message(raw[pos:pos + store_size], read_body=read_body,
-                             decompress_body=read_body, check_crc=read_body)
+                             decompress_body=read_body)
         if msg is None:
             break
         result.append(msg)

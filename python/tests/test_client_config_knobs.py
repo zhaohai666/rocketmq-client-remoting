@@ -231,11 +231,21 @@ def test_pull_decode_on_returns_bodies_and_pull_decode_off_keeps_the_batch():
     assert off.msg_found_list[2].get_sys_flag() & MessageSysFlag.COMPRESSED_FLAG
 
 
-def test_pull_decode_off_skips_crc_validation():
+def test_pull_read_path_never_validates_body_crc():
+    """A stored body is taken as delivered: the read path does not police BODYCRC.
+
+    The frame below carries the CRC of some other body and must still decode, with the
+    decode switch both on and off. Re-introducing a read-path CRC check turns the first
+    assertion red, which is what pins that the client leaves validation to the store.
+    """
     frame = _message(b"payload", 21, body_crc=crc32(b"different-body"))
 
     inst = _instance()
-    assert _pull(inst, encode_message_ext(frame)).msg_found_list == []
+    on = _pull(inst, encode_message_ext(frame))
+    assert len(on.msg_found_list) == 1
+    assert on.msg_found_list[0].get_body() == b"payload"
+    assert on.msg_found_list[0].get_queue_offset() == 21
+    assert on.msg_found_list[0].get_properties().get("TAGS") == "TagA"
 
     inst.decode_read_body = False
     off = _pull(inst, encode_message_ext(frame))

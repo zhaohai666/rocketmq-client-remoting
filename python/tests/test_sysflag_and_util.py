@@ -103,7 +103,7 @@ class TestUtilAll:
 
     def test_crc32(self):
         assert UtilAll.crc32(b"") == 0
-        assert UtilAll.crc32(b"a") == 0xE8B7BE43
+        assert UtilAll.crc32(b"a") == 0x68B7BE43  # the stored BODYCRC drops the sign bit
 
     def test_blank(self):
         assert UtilAll.is_blank(None)
