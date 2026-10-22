@@ -199,6 +199,35 @@ def test_zero_permits_acquire_is_satisfied_even_when_empty():
     assert sem.try_acquire(0, 0) is True
 
 
+def test_a_wake_that_arrives_after_the_budget_is_spent_grants_nothing():
+    """A caller that was woken but only got to run after its own deadline must not be handed a permit.
+
+    The ordering is forced rather than waited for: the test holds the condition's lock while it releases the
+    permit, so the waiter is notified *inside* its budget and can only resume -- and re-inspect the queue --
+    after the budget is gone. Granting there would put a caller that already gave up at the head of the queue
+    it left, then drop the permit again a few statements later.
+    """
+    sem = FairSemaphore(1)
+    assert sem.try_acquire(1, 0) is True            # the only permit is in flight
+    outcome: list = []
+
+    def _waiter() -> None:
+        outcome.append(sem.try_acquire(1, 100))
+
+    waiter = threading.Thread(target=_waiter)
+    waiter.start()
+    _wait_until(lambda: len(sem._queue) == 1)
+
+    with sem._cond:                                 # the waiter's wake-up cannot resume while this is held
+        sem.release(1)                              # notified at ~0ms, inside its 100ms budget
+        time.sleep(0.25)                            # ... and its budget expires while it is still locked out
+
+    _wait_threads([waiter])
+    assert outcome == [False], "a caller whose budget had already elapsed was granted anyway"
+    assert sem.available_permits() == 1, "the permit it refused must stay free for the next caller"
+    assert len(sem._queue) == 0, "an abandoned ticket must not stay in the queue"
+
+
 def test_backpressure_floors_are_the_documented_minima():
     assert MIN_ASYNC_SEND_NUM == 10
     assert MIN_ASYNC_SEND_SIZE == 1024 * 1024

@@ -27,7 +27,8 @@ func newFairSemaphore(permits int) *fairSemaphore {
 	return &fairSemaphore{total: permits, free: permits}
 }
 
-// ⚠ BOTH exits — taking the permits and giving up — must wake the queue again.
+// ⚠ EVERY exit — taking the permits, giving up, and handing back a grant that
+// only arrived after the caller's budget — must wake the queue again.
 // Under fairness only the head may proceed, so when the head changes the
 // request behind it can go from "not my turn" to "my turn" without the permit
 // COUNT changing for it: with the head asking for 5 out of 6 free, the head
@@ -62,21 +63,30 @@ func (s *fairSemaphore) tryAcquire(permits int, timeoutMillis int64) bool {
 
 	select {
 	case <-w.ready:
-		return true
 	case <-timer.C:
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if w.granted {
-		// Raced with a grant: the permits are already ours. Reporting failure
-		// here would leak them — every other bookkeeping path trusts that a
-		// granted waiter consumes what it was given.
-		return true
+	if !w.granted {
+		s.removeWaiterLocked(w)
+		s.notifyLocked() // the queue lost a member; the next request may now fit
+		return false
 	}
-	s.removeWaiterLocked(w)
-	s.notifyLocked() // the queue lost a member; the next request may now fit
-	return false
+	// A grant is paid for out of the free count the moment it lands in w.ready's
+	// buffer, which can be long before this goroutine gets to read it. Stop()
+	// reports false only once the budget has run out, so a wake-up that is read
+	// after the caller's own deadline is an expired caller, not a granted one:
+	// give the permits back and let the queue pay someone still inside their
+	// budget with them. Keeping them would report a success the caller then has
+	// to unwind — and the async sender, which trusts this answer, would send past
+	// its own timeout.
+	if !timer.Stop() {
+		s.free += w.permits
+		s.notifyLocked() // the permits are back and this waiter is gone: re-decide
+		return false
+	}
+	return true
 }
 
 func (s *fairSemaphore) release(permits int) {

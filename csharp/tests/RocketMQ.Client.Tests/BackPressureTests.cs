@@ -5,6 +5,7 @@
 // csharp/README.md).
 using System;
 using System.Collections.Generic;
+using System.Reflection;
 using System.Threading;
 
 using Xunit;
@@ -161,6 +162,36 @@ public class BackPressureTests
         JoinAll(new[] { head, second }, 8000);
         Assert.False(headResult);
         Assert.True(secondWaitedMs < 2000, "the second person slept until its own timeout: " + secondWaitedMs + "ms");
+    }
+
+    [Fact]
+    public void AWakeThatArrivesAfterTheBudgetIsSpentGrantsNothing()
+    {
+        // A caller that was woken but only got to run after its own deadline must not be handed a permit.
+        // The ordering is forced rather than waited for: the test holds the monitor while it releases the
+        // permit, so the waiter is notified *inside* its budget and can only resume -- and re-inspect the
+        // queue -- after the budget is gone. Granting there would put a caller that already gave up at the
+        // head of the queue it left, then drop the permit again a few statements later.
+        var sem = new FairSemaphore(1);
+        Assert.True(sem.TryAcquire(1, 0)); // the only permit is in flight
+        bool got = true;
+        var expired = new Thread(() => got = sem.TryAcquire(1, 100));
+        expired.Start();
+        WaitUntil(() => sem.WaitingCount() == 1); // returns only once the waiter is parked inside Wait
+
+        var sync = typeof(FairSemaphore).GetField("_sync",
+            BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(sem)!;
+        lock (sync) // the waiter's wake-up cannot resume while this is held
+        {
+            sem.Release(1); // notified at ~0ms, inside its 100ms budget
+            Thread.Sleep(250); // ... and its budget expires while it is still locked out
+        }
+
+        expired.Join(5000);
+        Assert.True(!got, "a caller whose budget had already elapsed was granted anyway");
+        Assert.Equal(1, sem.AvailablePermits()); // the permit it refused must stay free for the next caller
+        Assert.Equal(0, sem.WaitingCount()); // an abandoned ticket must not stay in the queue
+        Assert.True(sem.TryAcquire(1, 0));
     }
 
     [Fact]

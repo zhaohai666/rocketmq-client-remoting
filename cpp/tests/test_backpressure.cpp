@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <exception>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -14,6 +15,19 @@
 #include "rocketmq/client/backpressure.h"
 
 using namespace rocketmq;
+
+// Must be at rocketmq namespace scope -- the friend declaration in backpressure.h binds the name there.
+namespace rocketmq {
+struct FairSemaphoreTestAccess {
+    static std::mutex& gate(FairSemaphore& sem) { return sem.m_; }
+
+    // release() with the lock already held: the same two statements, minus the lock the test is holding.
+    static void releaseHolding(FairSemaphore& sem, int64_t permits) {
+        sem.free_ += permits;
+        sem.cv_.notify_all();
+    }
+};
+}  // namespace rocketmq
 
 namespace {
 
@@ -186,6 +200,30 @@ void testTimedOutHeadWakesTheWaiterBehindIt() {
            "waited=" + std::to_string(static_cast<long long>(secondWaitedMs.load())) + "ms");
 }
 
+// 7. A caller woken before its deadline, but only able to resume after it, must not be handed a permit.
+//    The ordering is forced rather than waited for: the test holds the gate's own mutex across the release, so the
+//    waiter is notified inside its budget and cannot return from wait_until (which needs that mutex) until the
+//    budget is gone. Granting there would put a caller that already gave up back at the head of the queue it left,
+//    and the permit it drops a few statements later is one the next waiter could still have used in time.
+void testWakeAfterTheBudgetIsSpentGrantsNothing() {
+    FairSemaphore sem(1);
+    expect(sem.tryAcquire(1, 0), "the only permit is in flight");
+    std::atomic<int> got{0};
+    std::thread expired([&] { got.store(sem.tryAcquire(1, 150) ? 1 : -1); });
+    // waitingCount() needs the mutex, so once it reports 1 the waiter is parked inside wait_until and holds nothing.
+    expect(waitFor([&] { return sem.waitingCount() == 1; }), "the caller is parked on the gate");
+    {
+        std::unique_lock<std::mutex> lk(FairSemaphoreTestAccess::gate(sem));
+        FairSemaphoreTestAccess::releaseHolding(sem, 1);  // notified at ~0ms, inside its 150ms budget
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));  // budget expires while it is locked out
+    }
+    expired.join();
+    expectEq(got.load(), -1, "a caller whose budget had already elapsed was granted anyway");
+    expectEq(sem.availablePermits(), 1, "the permit it refused must stay free for the next caller");
+    expectEq(sem.waitingCount(), 0, "an abandoned ticket must not stay in the queue");
+    expect(sem.tryAcquire(1, 0), "the next caller still inside its budget gets that permit");
+}
+
 void testSetTotalKeepsOutstandingWork() {
     FairSemaphore sem(10);
     expect(sem.tryAcquire(4, 0), "four permits are in flight");
@@ -273,6 +311,8 @@ int main() {
     runCase("grantedHeadStillFeedsTheWaiterBehindIt",
             testGrantedHeadStillFeedsTheWaiterBehindIt);
     runCase("timedOutHeadWakesTheWaiterBehindIt", testTimedOutHeadWakesTheWaiterBehindIt);
+    runCase("wakeAfterTheBudgetIsSpentGrantsNothing",
+            testWakeAfterTheBudgetIsSpentGrantsNothing);
     runCase("setTotalKeepsOutstandingWork", testSetTotalKeepsOutstandingWork);
     runCase("shrinkBelowOutstandingGivesNegativeFree",
             testShrinkBelowOutstandingGivesNegativeFree);

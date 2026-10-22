@@ -14,7 +14,18 @@ bool FairSemaphore::tryAcquire(int64_t permits, int32_t timeoutMillis) {
         std::chrono::steady_clock::now() + std::chrono::milliseconds(bounded);
     std::unique_lock<std::mutex> lk(m_);
     queue_.push_back(waiter);
+    bool woken = false;
     for (;;) {
+        // Only the first pass may grant on an already-spent budget: that is the "poll once without waiting" contract
+        // of a non-positive timeout. A later pass runs after wait_until returned -- and it returns with the lock only
+        // once it can get it, so on a busy host both the wake-up and the deadline can be behind it already. Granting
+        // there would put a caller that is gone back at the head of the queue it left, and the permit it hands back
+        // a few statements later (the async sender re-checks its own budget and refuses) is one the next waiter
+        // could still have used in time.
+        if (woken && std::chrono::steady_clock::now() >= deadline) {
+            leaveQueue(waiter);
+            return false;
+        }
         if (!queue_.empty() && queue_.front() == waiter && free_ >= permits) {
             queue_.pop_front();
             free_ -= permits;
@@ -25,18 +36,25 @@ bool FairSemaphore::tryAcquire(int64_t permits, int32_t timeoutMillis) {
             return true;
         }
         if (std::chrono::steady_clock::now() >= deadline) {
-            // Only this thread removes its own waiter (on acquiring the permit, and on timeout), so the lookup always succeeds.
-            for (auto it = queue_.begin(); it != queue_.end(); ++it) {
-                if (*it == waiter) {
-                    queue_.erase(it);
-                    break;
-                }
-            }
-            cv_.notify_all();  // the blocker is gone, same reasoning as above
+            // Timed out: leave the queue, don't block those behind
+            leaveQueue(waiter);
             return false;
         }
         cv_.wait_until(lk, deadline);
+        woken = true;
     }
+}
+
+// Give up the ticket, with the lock held: timeout must not block those behind, and the blocker leaving is itself a
+// head change. Only this thread ever removes its own waiter (on acquiring, and here), so the lookup always succeeds.
+void FairSemaphore::leaveQueue(const std::shared_ptr<Waiter>& waiter) {
+    for (auto it = queue_.begin(); it != queue_.end(); ++it) {
+        if (*it == waiter) {
+            queue_.erase(it);
+            break;
+        }
+    }
+    cv_.notify_all();  // the blocker is gone, same reasoning as above
 }
 
 void FairSemaphore::release(int64_t permits) {

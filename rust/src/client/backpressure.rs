@@ -86,6 +86,15 @@ impl FairSemaphore {
             if tokio::time::timeout(remaining, notified).await.is_err() {
                 return false;
             }
+            // Woken by a release or a resize. On a loaded host this task can be polled long after both the wake-up
+            // and the budget, and `Timeout` reports the inner future first -- so a wake that arrived before the
+            // deadline still lands here after it. The budget is what the caller asked for: taking the permit now
+            // would let an already-expired send cut ahead of the queue it just left, then hand the permit back a
+            // few statements later. Drop the ticket (`Ticket::Drop` wakes the next waiter) and leave it to someone
+            // still inside their own deadline.
+            if Instant::now() >= deadline {
+                return false;
+            }
             // Woken: loop back to the top and re-inspect the queue (possibly a spurious wake; re-inspecting just sleeps again)
         }
     }
@@ -391,6 +400,37 @@ mod tests {
         sem.release(1);
         let (got, _) = next.await.unwrap();
         assert!(got, "a ghost ticket jammed the head");
+    }
+
+    /// A waiter that is granted **after** its own budget elapsed is a waiter that never should have been granted:
+    /// the permit leaves the queue, sits with an expired caller for a few statements, and returns -- while a waiter
+    /// still inside its deadline watched the head go by.
+    ///
+    /// The ordering is forced, not waited for: this runtime has a single thread, so blocking it past the waiter's
+    /// budget means its timer fires and the release lands **without the task ever being polled in between**. Poll
+    /// `Timeout` in that state reports the wake-up first, which is exactly the path that used to hand the permit over.
+    #[tokio::test]
+    async fn a_wake_that_arrives_after_the_budget_is_spent_grants_nothing() {
+        let sem = semaphore(1);
+        assert!(sem.try_acquire(1, 0).await);
+        let expired = acquire_in_background(&sem, 1, 50);
+        wait_queue_len(&sem, 1).await;
+
+        // No poll of `expired` can happen during this: the only worker thread is busy sleeping.
+        std::thread::sleep(Duration::from_millis(150));
+        sem.release(1);
+
+        let (got, waited) = expired.await.unwrap();
+        assert!(
+            !got,
+            "a caller whose budget elapsed while it was unpoliced was still handed the permit (waited {waited:?})"
+        );
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "the permit an expired caller refused must stay free for the next one"
+        );
+        assert_eq!(sem.waiting_count(), 0, "an abandoned ticket must not stay in the queue");
     }
 
     #[tokio::test]

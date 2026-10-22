@@ -35,8 +35,20 @@ public sealed class FairSemaphore
         lock (_sync)
         {
             LinkedListNode<Waiter> node = _queue.AddLast(waiter);
+            bool woken = false;
             while (true)
             {
+                // Only the first pass may grant on an already-spent budget: that is the "poll once without waiting"
+                // contract of a non-positive timeout. A later pass runs after a Wait returned, and on a busy host the
+                // thread can be off-core long after both its wake-up and its deadline. Granting there would put a
+                // caller that is already gone back at the head of the queue it had left, and the permit it hands back
+                // a few statements later is one the next waiter could still have used in time.
+                if (woken && deadline - Environment.TickCount64 <= 0)
+                {
+                    LeaveQueue(node);
+                    return false;
+                }
+
                 if (ReferenceEquals(_queue.First, node) && _free >= permits)
                 {
                     _queue.Remove(node);
@@ -49,16 +61,23 @@ public sealed class FairSemaphore
                 if (remaining <= 0)
                 {
                     // Timed out: remove self from the queue, don't block those behind
-                    _queue.Remove(node);
-                    Monitor.PulseAll(_sync);  // same as above: the blocker left
+                    LeaveQueue(node);
                     return false;
                 }
 
                 // A Wait wakeup may be spurious (PulseAll wakes everyone, a woken one may still not reach the head),
                 // so re-check after waking and do not rely on the return value.
                 Monitor.Wait(_sync, (int)Math.Min(remaining, int.MaxValue));
+                woken = true;
             }
         }
+    }
+
+    /// <summary>Give up the ticket, with the lock held: timeout must not block those behind, and the blocker leaving is itself a head change.</summary>
+    private void LeaveQueue(LinkedListNode<Waiter> node)
+    {
+        _queue.Remove(node);
+        Monitor.PulseAll(_sync);  // same as above: the blocker left
     }
 
     public void Release(long permits)

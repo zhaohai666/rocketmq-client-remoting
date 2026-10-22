@@ -8,7 +8,8 @@
 #![cfg(test)]
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::AtomicI64;
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -1187,6 +1188,25 @@ impl CheckForbiddenHook for SleepingForbiddenHook {
     }
 }
 
+/// How long a parked send may wait before the hook gives up. This is a backstop, not the case's
+/// cleanup: the case releases the hook itself when it ends (ReleaseHookOnDrop), panic included. It
+/// has to stay far above the case's own budgets because the parked sends are what keep the count
+/// gate pressed -- a fuse the case can outlast would return the permits while the main task is still
+/// waiting to be scheduled, and the case would then report a drained gate as a full one.
+const PARK_BACKSTOP: Duration = Duration::from_secs(600);
+
+/// Wall-clock budget for every state wait in this case, and the timeout handed to its sends.
+///
+/// Both sit between two limits a loaded host can push the case against. The waits must all end long before
+/// [`PARK_BACKSTOP`] gives the parked sends back their permits -- the case's premise is a count gate pressed to
+/// empty, and a fuse that expires mid-case dissolves it (four budgets, 480s, is still under the 600s fuse). The
+/// sends' own budget must survive a *pool dispatch* stall: with 32 runtime workers, 12 concurrent test threads
+/// and the whole suite in flight, the 10th send was measured waiting ~30s just to be handed a pool slot, and a
+/// send whose queue delay eats its timeout is rejected by the count gate before it ever reaches the hook -- which
+/// would report a lost wakeup that never happened.
+const DISPATCH_BUDGET: Duration = Duration::from_secs(120);
+const SEND_BUDGET: i64 = 300_000;
+
 /// A **blocking** before hook: parks every send inside the hook until the test releases it, while recording
 /// each entry's relative timestamp by label -- isomorphic to the `SlowHook` in the live-verification script.
 ///
@@ -1194,7 +1214,14 @@ impl CheckForbiddenHook for SleepingForbiddenHook {
 /// What it occupies is **the thread the pool consumer runs on**, so this hook also exercises the "pool saturated by in-flight sends" dimension.
 struct ParkingSendHook {
     clock: Mutex<Option<Instant>>,
-    entries: Mutex<Vec<(String, u128)>>,
+    /// One row per hook entry: (label, milliseconds since [`ParkingSendHook::begin`], free count-gate
+    /// permits read at that instant, gate capacity at that instant). `-1` for the last two when the
+    /// hook is not yet pointed at a gate.
+    entries: Mutex<Vec<(String, u128, i64, i64)>>,
+    /// The producer's own state, so a send can read the count gate at the instant it parks.
+    observed: Mutex<Option<Weak<Inner>>>,
+    /// Lowest free permit count any parked send saw. `i64::MAX` until one records.
+    witnessed_permits: AtomicI64,
     gate: Mutex<bool>,
     opened: std::sync::Condvar,
 }
@@ -1204,6 +1231,8 @@ impl ParkingSendHook {
         ParkingSendHook {
             clock: Mutex::new(None),
             entries: Mutex::new(Vec::new()),
+            observed: Mutex::new(None),
+            witnessed_permits: AtomicI64::new(i64::MAX),
             gate: Mutex::new(false),
             opened: std::sync::Condvar::new(),
         }
@@ -1215,6 +1244,16 @@ impl ParkingSendHook {
         lock(&self.entries).clear();
     }
 
+    /// Point the hook at the gate it should witness. Call before any send is submitted.
+    fn observe_gate(&self, inner: &Arc<Inner>) {
+        *lock(&self.observed) = Some(Arc::downgrade(inner));
+    }
+
+    /// The fewest free permits a parked send has read.
+    fn witnessed_permits(&self) -> i64 {
+        self.witnessed_permits.load(Ordering::Relaxed)
+    }
+
     /// Release every send parked in the hook.
     fn open(&self) {
         *lock(&self.gate) = true;
@@ -1222,13 +1261,15 @@ impl ParkingSendHook {
     }
 
     fn count_of(&self, label: &str) -> usize {
-        lock(&self.entries).iter().filter(|(l, _)| l == label).count()
+        lock(&self.entries).iter().filter(|(l, _, _, _)| l == label).count()
     }
 
     fn dump(&self) -> String {
         lock(&self.entries)
             .iter()
-            .map(|(label, at)| format!("{label}@{at}ms"))
+            .map(|(label, at, free, total)| {
+                format!("{label}@{at}ms(free={free},cap={total})")
+            })
             .collect::<Vec<_>>()
             .join(",")
     }
@@ -1247,15 +1288,32 @@ impl SendMessageHook for ParkingSendHook {
             .unwrap_or_default()
             .to_string();
         let began = lock(&self.clock).unwrap_or_else(Instant::now);
-        lock(&self.entries).push((label, began.elapsed().as_millis()));
-        // 30s fallback: a mid-case panic must not leave a pool consumer parked forever, or the test process hangs.
+        // Witness the gate here rather than from the case's main task: this thread is by definition
+        // running, it still holds the permit this send took, and every peer that parked before it
+        // holds one too. The witness is recorded before the entry, so a case that sees all the
+        // entries it waits for also sees the reading that goes with them.
+        let gate = lock(&self.observed)
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .map(|inner| {
+                (
+                    inner.semaphore_async_send_num.available_permits(),
+                    inner.semaphore_async_send_num.total_permits(),
+                )
+            });
+        if let Some((free, _)) = gate {
+            self.witnessed_permits.fetch_min(free, Ordering::Relaxed);
+        }
+        let (free, cap) = gate.unwrap_or((-1, -1));
+        lock(&self.entries)
+            .push((label, began.elapsed().as_millis(), free, cap));
         // The WaitTimeoutResult must be read: discarding it means waiting without a timeout again, making the fallback useless.
         let mut guard = self
             .gate
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         while !*guard {
-            match self.opened.wait_timeout(guard, Duration::from_secs(30)) {
+            match self.opened.wait_timeout(guard, PARK_BACKSTOP) {
                 Ok((next, timed_out)) => {
                     guard = next;
                     if timed_out.timed_out() {
@@ -1266,6 +1324,16 @@ impl SendMessageHook for ParkingSendHook {
             }
         }
         Ok(())
+    }
+}
+
+/// Releases the hook when the case is finished with it, on the normal path and on a panic. This is
+/// what lets the park above be a backstop instead of the case's cleanup timer.
+struct ReleaseHookOnDrop(Arc<ParkingSendHook>);
+
+impl Drop for ReleaseHookOnDrop {
+    fn drop(&mut self) {
+        self.0.open();
     }
 }
 
@@ -1336,6 +1404,8 @@ async fn resize_wakes_the_gate_waiter_while_pool_workers_are_parked() {
     let producer =
         backpressure_producer_with_hook("resize_in_pool", &cluster, MIN_ASYNC_SEND_NUM, hook.clone())
             .await;
+    hook.observe_gate(&producer.inner);
+    let _release = ReleaseHookOnDrop(hook.clone());
     hook.begin();
 
     // The gate is one permit short of full and the test holds that one, so the number of hook-parked sends becomes core-count-independent.
@@ -1351,40 +1421,50 @@ async fn resize_wakes_the_gate_waiter_while_pool_workers_are_parked() {
     let held = Arc::new(Recorder::default());
     for _ in 0..PARKED_IN_HOOK {
         producer
-            .send_async(labelled(8, "held"), held.clone(), Some(15_000), None)
+            .send_async(labelled(8, "held"), held.clone(), Some(SEND_BUDGET), None)
             .expect("all 9 sends should queue into the pool");
     }
     // Must wait until all 9 really park in the hook before adding the 10th: pool tasks run concurrently with the main task, and who reaches the gate first is not fixed.
     // The first send through the gate takes a permit, so "the stuck 10th" becomes "the 10th stuck held",
     // and the verdict below would be luck (live B3 watches the same thing with a watchdog thread).
     assert!(
-        wait_until(|| hook.count_of("held") == PARKED_IN_HOOK).await,
+        wait_until_within(
+            || hook.count_of("held") == PARKED_IN_HOOK,
+            DISPATCH_BUDGET
+        )
+        .await,
         "not all {} sends parked in the hook (recorded: {})",
         PARKED_IN_HOOK,
         hook.dump()
     );
     assert_eq!(
-        producer.semaphore_async_send_num_available_permits(),
+        hook.witnessed_permits(),
         0,
-        "{} in-flight sends + the 1 permit held by the test must press the count gate to exactly empty",
-        PARKED_IN_HOOK
+        "{} in-flight sends + the 1 permit held by the test must press the count gate to exactly empty (read while parked sends still held theirs; recorded: {})",
+        PARKED_IN_HOOK,
+        hook.dump(),
     );
 
     let woken = Arc::new(Recorder::default());
     producer
-        .send_async(labelled(8, "woken"), woken.clone(), Some(15_000), None)
+        .send_async(labelled(8, "woken"), woken.clone(), Some(SEND_BUDGET), None)
         .expect("the 10th send should also queue into the pool");
 
     // That it stops at the gate (rather than still waiting in the pool queue) has evidence: the fair queue holds one more ticket.
     assert!(
-        wait_until(|| producer
-            .inner
-            .semaphore_async_send_num
-            .waiting_count()
-            >= 1)
-            .await,
-        "the 10th send never reached the gate (hook record: {})",
-        hook.dump()
+        wait_until_within(
+            || producer
+                .inner
+                .semaphore_async_send_num
+                .waiting_count()
+                >= 1,
+            DISPATCH_BUDGET
+        )
+        .await,
+        "the 10th send never reached the gate (hook record: {}, waiting: {}, errors: {:?})",
+        hook.dump(),
+        producer.inner.semaphore_async_send_num.waiting_count(),
+        woken.errors(),
     );
     assert_eq!(
         hook.count_of("woken"),
@@ -1396,7 +1476,7 @@ async fn resize_wakes_the_gate_waiter_while_pool_workers_are_parked() {
 
     // Only the resize can have woken it: at this moment all 9 in-flight sends are still parked in the hook and no permit has been returned.
     assert!(
-        wait_until(|| hook.count_of("woken") == 1).await,
+        wait_until_within(|| hook.count_of("woken") == 1, DISPATCH_BUDGET).await,
         "the resize did not wake the send parked at the gate: {:?}",
         woken.errors()
     );
@@ -1409,15 +1489,19 @@ async fn resize_wakes_the_gate_waiter_while_pool_workers_are_parked() {
 
     hook.open();
     assert!(
-        wait_until(|| woken.done.load(Ordering::SeqCst) == 1).await,
+        wait_until_within(|| woken.done.load(Ordering::SeqCst) == 1, DISPATCH_BUDGET).await,
         "after release the 10th send never landed: {:?}",
         woken.errors()
     );
     assert_eq!(woken.ok.load(Ordering::SeqCst), 1, "{:?}", woken.errors());
 
-    assert!(wait_until(|| held.done.load(Ordering::SeqCst)
-        == PARKED_IN_HOOK)
-        .await);
+    assert!(
+        wait_until_within(
+            || held.done.load(Ordering::SeqCst) == PARKED_IN_HOOK,
+            DISPATCH_BUDGET
+        )
+        .await
+    );
     assert_eq!(cluster.requests(0), PARKED_IN_HOOK + 1);
     producer.inner.semaphore_async_send_num.release(1);
     assert_eq!(
@@ -1444,6 +1528,23 @@ fn body_of(len: usize) -> Message {
 /// `resize_wakes_the_gate_waiter_while_pool_workers_are_parked`).
 async fn wait_until<F: Fn() -> bool>(cond: F) -> bool {
     for _ in 0..1500 {
+        if cond() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    cond()
+}
+
+/// [`wait_until`] bounded by the **wall clock** instead of a poll count.
+///
+/// A poll count is not a duration once the host is oversubscribed: every one of these sleeps can be rescheduled
+/// long after its 10ms, so a 1500-iteration loop can take minutes and the case's own timing relationships (send
+/// budget vs. park fuse) stop meaning what they say. A wall-clock bound keeps the budget honest -- and unlike a
+/// fixed sleep it still returns the instant the state is reached.
+async fn wait_until_within<F: Fn() -> bool>(cond: F, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
         if cond() {
             return true;
         }

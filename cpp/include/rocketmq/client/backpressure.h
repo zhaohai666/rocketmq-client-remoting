@@ -44,6 +44,13 @@ class FairSemaphore {
         explicit Waiter(int64_t p) : permits(p) {}
     };
 
+    // Abandon the ticket; the caller must hold m_.
+    void leaveQueue(const std::shared_ptr<Waiter>& waiter);
+
+    // Grants the offline test that has to hold m_ across a wake-up (to keep a woken waiter from resuming). It cannot
+    // call release() for that -- std::mutex is not reentrant -- so this seam exposes the lock and the release body.
+    friend struct FairSemaphoreTestAccess;
+
     mutable std::mutex m_;
     std::condition_variable cv_;
     int64_t total_;

@@ -192,6 +192,55 @@ func TestFairSemaphoreHeadGivingUpWakesTheNext(t *testing.T) {
 	}
 }
 
+// TestFairSemaphoreHandsBackAGrantOnlyReadAfterTheBudget pins the other half of
+// the same promise: a caller that is already past its own deadline must not be
+// handed permits. The notifier pays for a grant into the waiter's buffered
+// channel without waiting for it to read, so the wake-up and the answer can be
+// separated by as long as the scheduler likes.
+//
+// The ordering is forced rather than waited for: the test holds s.mu, so when the
+// caller's timer fires it blocks on that lock instead of answering, and the grant
+// is queued from behind the same lock — this is release()'s own body, and
+// release() cannot be called here because a Go mutex is not reentrant.
+func TestFairSemaphoreHandsBackAGrantOnlyReadAfterTheBudget(t *testing.T) {
+	s := newFairSemaphore(1)
+	if !s.tryAcquire(1, 100) {
+		t.Fatal("prime acquire failed")
+	}
+	done := make(chan bool, 1)
+	go func() { done <- s.tryAcquire(1, 300) }()
+	waitFor(t, "the caller queued", func() bool { return s.waitingCount() == 1 })
+
+	s.mu.Lock()
+	time.Sleep(500 * time.Millisecond) // its budget runs out; it is now blocked on this lock
+	if len(s.waiters) != 1 {
+		s.mu.Unlock()
+		t.Fatal("the caller left the queue before its grant could arrive: the ordering did not hold")
+	}
+	s.free += 1      // what release(1) does, minus the lock this test already holds
+	s.notifyLocked() // ... and its grant: deducted from free, queued in the waiter's channel
+	s.mu.Unlock()
+
+	var got bool
+	select {
+	case got = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the caller never returned")
+	}
+	if got {
+		t.Error("a caller whose budget had already elapsed was granted anyway")
+	}
+	if n := s.availablePermits(); n != 1 {
+		t.Errorf("available = %d, want 1 (the refused grant must go back, not leak)", n)
+	}
+	if n := s.waitingCount(); n != 0 {
+		t.Errorf("waiting = %d, want 0 (a refused grant must not stay queued)", n)
+	}
+	if !s.tryAcquire(1, 0) {
+		t.Error("the permit must be usable by the next caller, still inside its budget")
+	}
+}
+
 func TestFairSemaphoreSetTotalPermitsPreservesInFlight(t *testing.T) {
 	s := newFairSemaphore(10)
 	if !s.tryAcquire(3, 100) {
