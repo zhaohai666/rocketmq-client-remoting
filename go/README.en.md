@@ -15,7 +15,7 @@ rebalance, pull loops and offset commits are handled by periodic goroutines insi
 - Layers: `remoting` (wire protocol + long-connection transport) → `common` (message model,
   codecs, compression, constants) → `client` (Producer / Push / Pull / LitePull / Admin /
   transaction / trace)
-- Verified against a **RocketMQ 5.5.1** cluster: 13 live tools plus 626 unit tests
+- Verified against a **RocketMQ 5.5.1** cluster: 15 live tools plus 752 unit tests
 
 ## Prerequisites
 
@@ -55,10 +55,10 @@ Measured result of `go test ./... -count=1` (all three test packages `ok`):
 
 | Package | Test functions | Time |
 | --- | --- | --- |
-| `client` | 340 | 15.7s |
-| `common` | 134 | 1.9s |
-| `remoting` | 152 | 1.0s |
-| **Total** | **626** (56 `*_test.go` files) | ~19s |
+| `client` | 432 | 15.7s |
+| `common` | 135 | 1.9s |
+| `remoting` | 185 | 1.0s |
+| **Total** | **752** (68 `*_test.go` files) | ~19s |
 
 To count them yourself: `go test ./client/ -list '.*' | grep -c '^Test'`. Concurrency
 regression on its own:
@@ -460,7 +460,7 @@ Other switches: `ROCKETMQ_SERIALIZE_TYPE` (wire serialization, default `JSON`),
 
 ## Live Cluster Verification
 
-`examples/` holds 16 executables. They are **not part of `go test`**, every one is
+`examples/` holds 17 executables. They are **not part of `go test`**, every one is
 self-asserting, and all except `selfcheck` need a live cluster. The uniform way to run them:
 
 ```sh
@@ -573,8 +573,8 @@ go/
 │   ├── trace.go · trace_hook.go · trace_dispatcher.go · trace_context.go
 │   ├── consumer_stats.go · stats_item.go · consumer_running_info.go · fault_strategy.go
 │   ├── consume_directly.go · jsonutil.go
-│   └── *_test.go                   56 test files, 626 test functions
-└── examples/                   16 executables (see "Live Cluster Verification")
+│   └── *_test.go                   68 test files, 752 test functions
+└── examples/                   17 executables (see "Live Cluster Verification")
 ```
 
 ## License

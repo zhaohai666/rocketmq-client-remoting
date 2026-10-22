@@ -24,7 +24,7 @@ git clone <this repo> && cd rocketmq-client-remoting/nodeJs
 node --experimental-strip-types selfcheck.ts
 ```
 
-`selfcheck.ts` loads all **63** modules under `src/` and then runs the **14** offline smoke suites; measured **ALL GREEN** on 2026-10-13, **301** checks in total. Run a single suite with `node --experimental-strip-types test/<suite>.ts`; measured results:
+`selfcheck.ts` loads all **64** modules under `src/` and then runs the **22** offline smoke suites; measured **ALL GREEN** on 2026-10-22, **532** checks in total. Run a single suite with `node --experimental-strip-types test/<suite>.ts`; measured results:
 
 | Suite | Measured |
 | --- | --- |
@@ -34,14 +34,22 @@ node --experimental-strip-types selfcheck.ts
 | `test/stats_smoke.ts` | 14 passed / 0 failed |
 | `test/compat_contract_smoke.ts` (pinned wire-format / behavior surface) | 10 check groups passed |
 | `test/pop_smoke.ts` | 11 check groups passed |
-| `test/fixes2_smoke.ts` | 38 checks passed |
-| `test/namespace_rpc_smoke.ts` | 5 check groups passed |
+| `test/body_crc_smoke.ts` (stored-body BODYCRC mask forms) | 18 passed / 0 failed |
+| `test/pop_batch_ack_smoke.ts` (the 200151 request shape) | 9 passed / 0 failed |
+| `test/fixes2_smoke.ts` | 40 checks passed |
+| `test/namespace_rpc_smoke.ts` | 7 check groups passed |
 | `test/ns_failover_smoke.ts` | 12 checks passed |
 | `test/lite_topic_queue_change_smoke.ts` | 25 passed / 0 failed |
 | `test/pull_balance_view_smoke.ts` | 14 passed / 0 failed |
 | `test/socks_smoke.ts` (SOCKS proxy handshake + proxied connect) | 51 passed / 0 failed |
 | `test/mq_client_manager_smoke.ts` | 52 passed / 0 failed |
 | `test/static_topic_smoke.ts` | 29 passed / 0 failed |
+| `test/offset_persist_timer_smoke.ts` | 21 passed / 0 failed |
+| `test/pull_schedule_smoke.ts` | 43 passed / 0 failed |
+| `test/admin_query_smoke.ts` | 7 passed / 0 failed |
+| `test/auth_admin_smoke.ts` | 71 passed / 0 failed |
+| `test/heartbeat_v2_smoke.ts` | 30 passed / 0 failed |
+| `test/heartbeat_v2_beat_smoke.ts` | 28 passed / 0 failed |
 
 ### Packaging / npm consumption (tarball and registry)
 
@@ -375,7 +383,7 @@ nodeJs/
 │                        # allocation/offset-store/consume-stats/tracing/back-pressure/traceparent
 ├── examples/            # live real-cluster tools (see "Live Cluster Verification")
 ├── test/                # offline smoke suites (protocol round-trip, allocation, offsets, tracing, stats, namespace, POP)
-├── selfcheck.ts         # one-shot offline check (module load + 14 smoke suites)
+├── selfcheck.ts         # one-shot offline check (module load + 22 smoke suites)
 └── package.json         # engines: node >= 22
 ```
 

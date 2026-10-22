@@ -45,7 +45,7 @@ cd php
 # syntax check of a file after modifying it
 php -l src/Client/Producer.php
 
-# offline self-test entry: static guard + 14 suites run sequentially, no cluster needed
+# offline self-test entry: static guard + 21 suites run sequentially, no cluster needed
 php tests/run_all.php
 
 # a single suite
@@ -59,8 +59,8 @@ bash scripts/run_php_live.sh compression 127.0.0.1:9876
 `tests/run_all.php` is the **offline** suite: before running anything it performs a
 repository-wide **duplicate-class-name static guard** (PHP has no module isolation, so
 when the same FQCN is declared in two files the one autoloaded first silently wins and
-the other dies — this guard cannot be skipped), then chains 14 suites. Measured today:
-**guard CLEAN, all 2,180 assertions across the 14 suites pass**; any failure exits with a
+the other dies — this guard cannot be skipped), then chains 21 suites. Measured today:
+**guard CLEAN, all 3,354 assertions across the 21 suites pass**; any failure exits with a
 non-zero code.
 
 ## Examples
@@ -436,9 +436,9 @@ Assigning the public `$client->socksProxy` property works too; all five client f
 - ✅ Compression: ZLIB (`gzcompress`), pure-PHP LZ4 Frame, ZSTD (CLI preferred, pure-PHP
   fallback)
 - ✅ TLS: CA verification / mTLS / SNI
-- ✅ Offline self-test: 14 suites with 2,180 assertions + the duplicate-class-name static
+- ✅ Offline self-test: 21 suites with 3,354 assertions + the duplicate-class-name static
   guard (measured all green)
-- ✅ Live-cluster verification: the 10 `examples/live_*.php` cases cover the admin surface,
+- ✅ Live-cluster verification: the 14 `examples/live_*.php` cases cover the admin surface,
   redelivery / dead-letter, pull mode, queue-change listening, POP, TLS, Request-Reply,
   the compression smoke, static topics, and every message type sent and received on an
   ACL-enforcing cluster

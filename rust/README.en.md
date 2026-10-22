@@ -30,9 +30,9 @@ code-generation step.
 
 ```bash
 cd rust
-cargo build --all-targets                       # lib + 39 examples
-cargo test --quiet                              # 982 passed; 0 failed; 0 ignored (~10s)
-cargo clippy --all-targets -- -D warnings       # zero warnings is a hard gate
+cargo build --all-targets                       # lib + 41 examples
+cargo test --quiet                              # 1092 passed; 0 failed; 0 ignored (~10s)
+cargo clippy --all-targets --all-features -- -D warnings  # zero warnings is a hard gate
 ```
 
 Unit tests are inlined in `src/**/mod tests` (there is no standalone `tests/` directory);
@@ -393,7 +393,7 @@ rust/
 │       ├── hook.rs / latency.rs / consumer_stats.rs / metrics.rs / shutdown.rs
 │       ├── request_reply.rs / top_addressing.rs / validators.rs / result.rs
 │       └── trace.rs / trace_context.rs / trace_hook.rs / trace_dispatcher.rs
-└── examples/                   39 live-cluster tools (table above)
+└── examples/                   41 live-cluster tools (table above)
 ```
 
 Unit tests are inlined in `src/**/mod tests` (they need access to `pub(crate)` internals

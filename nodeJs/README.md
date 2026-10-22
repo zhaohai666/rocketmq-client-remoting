@@ -24,7 +24,7 @@ git clone <本仓库> && cd rocketmq-client-remoting/nodeJs
 node --experimental-strip-types selfcheck.ts
 ```
 
-`selfcheck.ts` 加载 `src/` 全部 **63** 个模块并依次跑 **22** 套离线冒烟，2026-10-22 实测 **ALL GREEN**，共 **532** 项检查。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
+`selfcheck.ts` 加载 `src/` 全部 **64** 个模块并依次跑 **22** 套离线冒烟，2026-10-22 实测 **ALL GREEN**，共 **532** 项检查。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
 
 | 套件 | 实测 |
 | --- | --- |

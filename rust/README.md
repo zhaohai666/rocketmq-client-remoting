@@ -26,8 +26,8 @@ NameServer + Broker，无 proxy、无本地扩展依赖、无代码生成步骤�
 ```bash
 cd rust
 cargo build --all-targets                       # lib + 41 个 examples
-cargo test --quiet                              # 1091 passed; 0 failed; 0 ignored（~10s）
-cargo clippy --all-targets -- -D warnings       # 零 warning 是硬门槛
+cargo test --quiet                              # 1092 passed; 0 failed; 0 ignored（~10s）
+cargo clippy --all-targets --all-features -- -D warnings  # 零 warning 是硬门槛
 ```
 
 单测全部内联在 `src/**/mod tests`（没有独立 `tests/` 目录）；真机联调工具在
