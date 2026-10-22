@@ -3,40 +3,20 @@
 //
 //   node --experimental-strip-types selfcheck.ts
 import { spawnSync } from 'node:child_process';
+import { readdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const node = process.execPath;
 
-// Every module in src/ must import cleanly (no console output expected).
-const modules = [
-  'src/logging.ts',
-  'src/remoting/remotingCommand.ts', 'src/remoting/serialize.ts', 'src/remoting/codes.ts',
-  'src/remoting/headers.ts', 'src/remoting/bodies.ts', 'src/remoting/heartbeat.ts',
-  'src/remoting/route.ts', 'src/remoting/namespace.ts', 'src/remoting/subscription.ts',
-  'src/remoting/admin_body.ts', 'src/remoting/extra_info.ts', 'src/remoting/acl.ts',
-  'src/remoting/rpc_hooks.ts',
-  'src/remoting/client.ts', 'src/remoting/exception.ts', 'src/remoting/socks_proxy.ts',
-  'src/remoting/static_topic.ts',
-  'src/common/message.ts', 'src/common/messageConst.ts', 'src/common/messageDecoder.ts',
-  'src/common/messageClientIdSetter.ts', 'src/common/message_accessor.ts', 'src/common/messageType.ts',
-  'src/common/mixAll.ts', 'src/common/sysflag.ts', 'src/common/utilAll.ts',
-  'src/common/subscriptionData.ts', 'src/common/topic_config.ts', 'src/common/topic_validator.ts',
-  'src/common/recall_message_handle.ts', 'src/common/boundary_type.ts', 'src/common/validators.ts',
-  'src/common/compress.ts',
-  'src/client/mq_client.ts', 'src/client/mq_client_manager.ts', 'src/client/producer.ts', 'src/client/consumer.ts',
-  'src/client/pull_consumer.ts', 'src/client/lite_pull_consumer.ts', 'src/client/admin.ts',
-  'src/client/allocate.ts', 'src/client/process_queue.ts', 'src/client/offset_store.ts',
-  'src/client/consumer_stats.ts', 'src/client/trace_context.ts', 'src/client/trace_dispatcher.ts',
-  'src/client/trace_hook.ts', 'src/client/pull_api.ts', 'src/client/hook.ts',
-  'src/client/latency.ts', 'src/client/backpressure.ts', 'src/client/produce_accumulator.ts',
-  'src/client/traceparent.ts', 'src/client/request_reply.ts', 'src/client/top_addressing.ts', 'src/client/send_result.ts',
-  'src/client/consumer_result.ts', 'src/client/exception.ts',
-  'src/client/pop_process_queue.ts', 'src/client/pop_api.ts', 'src/client/pop_consumer.ts',
-  'src/client/pull_schedule_service.ts',
-  'src/remoting/pop_bodies.ts',
-];
+// Every module in src/ must import cleanly (no console output expected). The set comes from the
+// tree, so a module added without ever being loaded here cannot slip past this gate.
+const modules = readdirSync(path.join(here, 'src'), { recursive: true })
+  .map(String)
+  .filter((f) => f.endsWith('.ts'))
+  .sort()
+  .map((f) => `src/${f}`);
 
 let failures = 0;
 console.log(`== module load check (${modules.length} modules) ==`);
@@ -48,14 +28,12 @@ for (const mod of modules) {
   else { failures++; console.log(`  FAIL ${mod}\n       ${(r.stderr || '').trim().split('\n')[0]}`); }
 }
 
-// The offline smoke suites.
-const smokes = ['test/smoke.ts', 'test/producer_smoke.ts', 'test/consumer_smoke.ts', 'test/stats_smoke.ts',
-  'test/compat_contract_smoke.ts', 'test/body_crc_smoke.ts', 'test/pop_smoke.ts', 'test/pop_batch_ack_smoke.ts', 'test/fixes2_smoke.ts', 'test/namespace_rpc_smoke.ts',
-  'test/ns_failover_smoke.ts', 'test/lite_topic_queue_change_smoke.ts', 'test/pull_balance_view_smoke.ts',
-  'test/socks_smoke.ts', 'test/mq_client_manager_smoke.ts', 'test/static_topic_smoke.ts',
-  'test/offset_persist_timer_smoke.ts', 'test/pull_schedule_smoke.ts', 'test/admin_query_smoke.ts',
-  'test/auth_admin_smoke.ts',
-  'test/heartbeat_v2_smoke.ts', 'test/heartbeat_v2_beat_smoke.ts'];
+// The offline smoke suites. Every test/*_smoke.ts is a suite, so the directory — not a
+// hand-kept list that silently falls behind — decides what gets run before a commit.
+const smokes = readdirSync(path.join(here, 'test'))
+  .filter((f) => f.endsWith('smoke.ts'))
+  .sort()
+  .map((f) => `test/${f}`);
 console.log(`\n== smoke suites (${smokes.length}) ==`);
 for (const smoke of smokes) {
   const r = spawnSync(node, ['--experimental-strip-types', '--no-warnings', path.join(here, smoke)],

@@ -24,32 +24,41 @@ git clone <本仓库> && cd rocketmq-client-remoting/nodeJs
 node --experimental-strip-types selfcheck.ts
 ```
 
-`selfcheck.ts` 加载 `src/` 全部 **64** 个模块并依次跑 **22** 套离线冒烟，2026-10-22 实测 **ALL GREEN**，共 **532** 项检查。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
+`selfcheck.ts` 加载 `src/` 全部 **65** 个模块并依次跑 **31** 套离线冒烟（两份清单都由目录树推导，新增文件不会漏出自检），2026-10-22 实测 **ALL GREEN**，共 **965** 项检查。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
 
 | 套件 | 实测 |
 | --- | --- |
-| `test/smoke.ts`（协议帧/传输/ACL 签名） | 6 组检查通过 |
-| `test/producer_smoke.ts` | 4 组检查通过 |
-| `test/consumer_smoke.ts` | 30 通过 / 0 失败 |
-| `test/stats_smoke.ts` | 14 通过 / 0 失败 |
-| `test/compat_contract_smoke.ts`（线上格式/行为钉死面） | 10 组检查通过 |
-| `test/pop_smoke.ts` | 11 组检查通过 |
+| `test/admin_concurrent_smoke.ts`（并发 admin 调用） | 27 通过 / 0 失败 |
+| `test/admin_lite_list_smoke.ts`（lite / concurrent 列表 admin） | 22 通过 / 0 失败 |
+| `test/admin_longtail_smoke.ts`（控制器 / 容器 / 冷数据 / rocksdb 长尾） | 46 通过 / 0 失败 |
+| `test/admin_query_smoke.ts` | 7 通过 / 0 失败 |
+| `test/admin_track_smoke.ts`（消息轨迹回查） | 18 通过 / 0 失败 |
+| `test/auth_admin_smoke.ts` | 71 通过 / 0 失败 |
+| `test/auto_batch_and_retry_smoke.ts`（自动攒批与同步重试） | 108 通过 / 0 失败 |
+| `test/backpressure_smoke.ts`（异步公平信号量闸门：等待、拒绝、回滚、文案） | 119 通过 / 0 失败 |
 | `test/body_crc_smoke.ts`（存储体 BODYCRC 掩码形式） | 18 通过 / 0 失败 |
-| `test/pop_batch_ack_smoke.ts`（200151 请求形状） | 9 通过 / 0 失败 |
+| `test/client_config_gaps_smoke.ts`（客户端配置旋钮） | 44 通过 / 0 失败 |
+| `test/compat_contract_smoke.ts`（线上格式/行为钉死面） | 10 组检查通过 |
+| `test/consumer_heartbeat_registration_smoke.ts`（消费端心跳注册） | 13 通过 / 0 失败 |
+| `test/consumer_smoke.ts` | 30 通过 / 0 失败 |
 | `test/fixes2_smoke.ts` | 40 项检查通过 |
+| `test/heartbeat_v2_beat_smoke.ts` | 28 通过 / 0 失败 |
+| `test/heartbeat_v2_smoke.ts` | 30 通过 / 0 失败 |
+| `test/lite_topic_queue_change_smoke.ts` | 25 通过 / 0 失败 |
+| `test/mq_client_manager_smoke.ts` | 52 通过 / 0 失败 |
 | `test/namespace_rpc_smoke.ts` | 7 组检查通过 |
 | `test/ns_failover_smoke.ts` | 12 项检查通过 |
-| `test/lite_topic_queue_change_smoke.ts` | 25 通过 / 0 失败 |
-| `test/pull_balance_view_smoke.ts` | 14 通过 / 0 失败 |
-| `test/socks_smoke.ts`（SOCKS 代理握手 + 经代理建连） | 51 通过 / 0 失败 |
-| `test/mq_client_manager_smoke.ts` | 52 通过 / 0 失败 |
-| `test/static_topic_smoke.ts` | 29 通过 / 0 失败 |
 | `test/offset_persist_timer_smoke.ts` | 21 通过 / 0 失败 |
+| `test/pop_batch_ack_smoke.ts`（200151 请求形状） | 9 通过 / 0 失败 |
+| `test/pop_smoke.ts` | 11 组检查通过 |
+| `test/producer_smoke.ts` | 4 组检查通过 |
+| `test/pull_balance_view_smoke.ts` | 14 通过 / 0 失败 |
 | `test/pull_schedule_smoke.ts` | 43 通过 / 0 失败 |
-| `test/admin_query_smoke.ts` | 7 通过 / 0 失败 |
-| `test/auth_admin_smoke.ts` | 71 通过 / 0 失败 |
-| `test/heartbeat_v2_smoke.ts` | 30 通过 / 0 失败 |
-| `test/heartbeat_v2_beat_smoke.ts` | 28 通过 / 0 失败 |
+| `test/smoke.ts`（协议帧/传输/ACL 签名） | 6 组检查通过 |
+| `test/socks_smoke.ts`（SOCKS 代理握手 + 经代理建连） | 51 通过 / 0 失败 |
+| `test/static_topic_smoke.ts` | 29 通过 / 0 失败 |
+| `test/stats_smoke.ts` | 14 通过 / 0 失败 |
+| `test/vip_channel_smoke.ts`（VIP channel port-2 改写） | 36 通过 / 0 失败 |
 
 ### 打包 / npm 消费（tarball 与 registry）
 
@@ -379,8 +388,8 @@ nodeJs/
 │   └── client/          # MQClient、producer、push/pull/lite-pull/pop 消费者、admin、
 │                        # 队列分配/位点存储/消费统计/轨迹/背压/traceparent
 ├── examples/            # 真机 live 工具（见「真实集群联调」）
-├── test/                # 离线冒烟（协议往返、分配、位点、轨迹、统计、命名空间、POP）
-├── selfcheck.ts         # 一键离线自检（模块加载 + 14 套冒烟）
+├── test/                # 离线冒烟（协议往返、攒批重试、背压闸门、分配、位点、轨迹、统计、命名空间、POP、admin）
+├── selfcheck.ts         # 一键离线自检（模块加载 + 31 套冒烟）
 └── package.json         # engines: node >= 22
 ```
 

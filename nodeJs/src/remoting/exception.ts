@@ -32,6 +32,10 @@ export class RemotingCommandException extends RemotingException {
   constructor(message) { super(message); this.name = 'RemotingCommandException'; }
 }
 
+export class RemotingTooMuchRequestException extends RemotingException {
+  constructor(message: string) { super(message); this.name = 'RemotingTooMuchRequestException'; }
+}
+
 export class MQClientException extends Error {
   constructor(message, cause = null) {
     super(message);
@@ -63,4 +67,4 @@ export class RuntimeException extends Error {
   constructor(message) { super(message); this.name = 'RuntimeException'; }
 }
 
-export default { RemotingException, RemotingConnectException, RemotingSendRequestException, RemotingTimeoutException, RemotingCommandException, MQClientException, MQBrokerException, InterruptedException, RuntimeException };
+export default { RemotingException, RemotingConnectException, RemotingSendRequestException, RemotingTimeoutException, RemotingCommandException, RemotingTooMuchRequestException, MQClientException, MQBrokerException, InterruptedException, RuntimeException };

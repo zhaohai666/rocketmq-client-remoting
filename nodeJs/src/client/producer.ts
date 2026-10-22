@@ -27,7 +27,7 @@ import { registerRpcHooks } from '../remoting/rpc_hooks.ts';
 import type { SocksProxyConfig } from '../remoting/socks_proxy.ts';
 import { getLogger } from '../logging.ts';
 import {
-  MQClientException, MQBrokerException,
+  MQClientException, MQBrokerException, RemotingTooMuchRequestException,
 } from '../remoting/exception.ts';
 import { SendResult, TransactionSendResult, SendStatus } from './send_result.ts';
 import { MQClient, TopicPublishInfo, DEFAULT_CONCURRENT_HEARTBEAT_THREAD_POOL_SIZE } from './mq_client.ts';
@@ -40,7 +40,7 @@ import { MQFaultStrategy, tcpDetect } from './latency.ts';
 import {
   getOrCreateProduceAccumulator, ProduceAccumulator, MessageAccumulation,
 } from './produce_accumulator.ts';
-import { FairSemaphore } from './backpressure.ts';
+import { FairSemaphore, MIN_ASYNC_SEND_NUM, MIN_ASYNC_SEND_SIZE } from './backpressure.ts';
 import { injectTraceContext, traceContextEnabledFromEnv } from './traceparent.ts';
 import {
   TraceContext, TraceBean, TraceType, TraceMsgType,
@@ -57,6 +57,14 @@ import {
 import type { RequestCallbackLike } from './request_reply.ts';
 
 const logger = getLogger('producer');
+
+// Permit floor: a configured value at or below the floor is raised to the floor, and the log
+// line still fires when it is exactly the floor.
+function backPressurePermits(configured: number, floor: number, name: string): number {
+  if (configured > floor) return configured;
+  logger.info('%s can not be smaller than %d.', name, floor);
+  return floor;
+}
 
 // ---- selector / callback / transaction types ----
 export abstract class MessageQueueSelector {
@@ -259,8 +267,10 @@ export class DefaultMQProducer {
     this.enableBackpressureForAsyncMode = false;
     this.backPressureForAsyncSendNum = 1024;
     this.backPressureForAsyncSendSize = 100 * 1024 * 1024;
-    this._semaphoreAsyncSendNum = new FairSemaphore(this.backPressureForAsyncSendNum);
-    this._semaphoreAsyncSendSize = new FairSemaphore(this.backPressureForAsyncSendSize);
+    this._semaphoreAsyncSendNum = new FairSemaphore(
+      backPressurePermits(this.backPressureForAsyncSendNum, MIN_ASYNC_SEND_NUM, 'semaphoreAsyncSendNum'));
+    this._semaphoreAsyncSendSize = new FairSemaphore(
+      backPressurePermits(this.backPressureForAsyncSendSize, MIN_ASYNC_SEND_SIZE, 'semaphoreAsyncSendSize'));
   }
 
   private _buildClientId(): string {
@@ -448,36 +458,44 @@ export class DefaultMQProducer {
 
   // Runtime backpressure knobs — take effect on the live semaphores.
   setBackPressureForAsyncSendNum(num: number): this {
-    this.backPressureForAsyncSendNum = num;
-    this._semaphoreAsyncSendNum.setTotalPermits(num);
+    this.backPressureForAsyncSendNum = backPressurePermits(num, MIN_ASYNC_SEND_NUM, 'semaphoreAsyncSendNum');
+    this._semaphoreAsyncSendNum.setTotalPermits(this.backPressureForAsyncSendNum);
     return this;
   }
   setBackPressureForAsyncSendSize(size: number): this {
-    this.backPressureForAsyncSendSize = size;
-    this._semaphoreAsyncSendSize.setTotalPermits(size);
+    this.backPressureForAsyncSendSize = backPressurePermits(size, MIN_ASYNC_SEND_SIZE, 'semaphoreAsyncSendSize');
+    this._semaphoreAsyncSendSize.setTotalPermits(this.backPressureForAsyncSendSize);
     return this;
   }
 
-  // Acquire both async-send permits or throw synchronously: a bounded
-  // async queue rejects with RemotingTooMuchRequestException when full. A
-  // partial acquisition is rolled back so permits never leak.
-  private _acquireAsyncPermits(msg: Message): void {
-    if (!this._semaphoreAsyncSendNum.tryAcquire()) {
-      throw new MQClientException(
-        `async send rejected: in-flight num over backPressureForAsyncSendNum(${this.backPressureForAsyncSendNum})`);
+  getSemaphoreAsyncSendNumAvailablePermits(): number { return this._semaphoreAsyncSendNum.availablePermitsCount(); }
+  getSemaphoreAsyncSendSizeAvailablePermits(): number { return this._semaphoreAsyncSendSize.availablePermitsCount(); }
+  getBackPressureForAsyncSendNum(): number { return this.backPressureForAsyncSendNum; }
+  getBackPressureForAsyncSendSize(): number { return this.backPressureForAsyncSendSize; }
+
+  // Acquire both async-send permits or refuse: each stage gets the caller's remaining budget
+  // and waits for permits inside it, and a stage that cannot be served -- whether because the
+  // budget ran out or because the gate stayed full to the end of it -- answers with
+  // RemotingTooMuchRequestException. A partial acquisition is rolled back so permits never
+  // leak. The byte charge is the body length as it is NOW: the send path may compress the body
+  // afterwards, and the release has to hand back what was taken, not the shrunk length.
+  async _acquireAsyncPermits(msg: Message, timeoutMillis: number, begin: number): Promise<number> {
+    const numBudget = timeoutMillis - (Date.now() - begin);
+    if (!(numBudget > 0 && await this._semaphoreAsyncSendNum.tryAcquire(1, numBudget))) {
+      throw new RemotingTooMuchRequestException('send message tryAcquire semaphoreAsyncNum timeout');
     }
     const bodyLen = msg.getBody() != null ? msg.getBody().length : 0;
-    if (!this._semaphoreAsyncSendSize.tryAcquireFor(bodyLen)) {
-      this._semaphoreAsyncSendNum.release();
-      throw new MQClientException(
-        `async send rejected: in-flight size over backPressureForAsyncSendSize(${this.backPressureForAsyncSendSize})`);
+    const sizeBudget = timeoutMillis - (Date.now() - begin);
+    if (!(sizeBudget > 0 && await this._semaphoreAsyncSendSize.tryAcquire(bodyLen, sizeBudget))) {
+      this._semaphoreAsyncSendNum.release(1);
+      throw new RemotingTooMuchRequestException('send message tryAcquire semaphoreAsyncSize timeout');
     }
+    return bodyLen;
   }
 
-  private _releaseAsyncPermits(msg: Message): void {
-    const bodyLen = msg.getBody() != null ? msg.getBody().length : 0;
-    this._semaphoreAsyncSendSize.releaseFor(bodyLen);
-    this._semaphoreAsyncSendNum.release();
+  private _releaseAsyncPermits(bodyLen: number): void {
+    this._semaphoreAsyncSendSize.release(bodyLen);
+    this._semaphoreAsyncSendNum.release(1);
   }
 
   async start(): Promise<void> {
@@ -1004,19 +1022,20 @@ export class DefaultMQProducer {
       await this._sendByAccumulator(msg, null, sendCallback);
       return;
     }
+    const timeout = timeoutMillis ?? this.sendMsgTimeout;
+    const begin = Date.now();
     // Async-send backpressure: the two fair semaphores bound the in-flight
     // async sends, but ONLY while enableBackpressureForAsyncMode is on
-    // (default false). A full
-    // semaphore throws synchronously. Permits return when the transport-level
-    // callback fires — exactly once — or when the send fails before reaching it.
-    if (this.enableBackpressureForAsyncMode) {
-      this._acquireAsyncPermits(msg);
-    }
-    let permitsHeld = true;
+    // (default false). A full semaphore waits inside the caller's budget and then
+    // refuses. Permits return when the transport-level callback fires — exactly once
+    // — or when the send fails before reaching it.
+    let sendTimeout = timeout;
+    let permitsHeld = false;
+    let heldBytes = 0;
     const releaseOnce = () => {
       if (permitsHeld) {
         permitsHeld = false;
-        this._releaseAsyncPermits(msg);
+        this._releaseAsyncPermits(heldBytes);
       }
     };
     const wrapped: SendCallback = (sr, err) => {
@@ -1024,15 +1043,25 @@ export class DefaultMQProducer {
       if (sendCallback) sendCallback(sr, err);
     };
     try {
-      await this._sendDefaultImpl(msg, CommunicationMode.ASYNC, wrapped, timeoutMillis ?? this.sendMsgTimeout);
+      if (this.enableBackpressureForAsyncMode) {
+        heldBytes = await this._acquireAsyncPermits(msg, timeout, begin);
+        permitsHeld = true;
+        // The gate waited inside the caller's budget, so the send gets what is left of it.
+        const cost = Date.now() - begin;
+        if (timeout <= cost) {
+          throw new RemotingTooMuchRequestException('DEFAULT ASYNC send call timeout');
+        }
+        sendTimeout = timeout - cost;
+      }
+      await this._sendDefaultImpl(msg, CommunicationMode.ASYNC, wrapped, sendTimeout);
     } catch (e) {
       // A sendAsync caller hands over a SendCallback and normally does not attach
       // a handler to the returned promise, so re-throwing here would turn an
-      // ordinary send failure into an unhandled rejection that kills the process.
-      // With a callback the callback owns the error; a callback-less caller still
-      // gets the rejection.
+      // ordinary send failure -- a refused gate among them -- into an unhandled
+      // rejection that kills the process. With a callback the callback owns the
+      // error; a callback-less caller still gets the rejection.
+      releaseOnce();
       if (sendCallback) {
-        releaseOnce();
         try {
           sendCallback(null, e as Error);
         } catch (cbErr) {
@@ -1041,7 +1070,6 @@ export class DefaultMQProducer {
         }
         return;
       }
-      releaseOnce();
       throw e;
     }
   }

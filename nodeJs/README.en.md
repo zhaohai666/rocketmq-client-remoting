@@ -24,32 +24,41 @@ git clone <this repo> && cd rocketmq-client-remoting/nodeJs
 node --experimental-strip-types selfcheck.ts
 ```
 
-`selfcheck.ts` loads all **64** modules under `src/` and then runs the **22** offline smoke suites; measured **ALL GREEN** on 2026-10-22, **532** checks in total. Run a single suite with `node --experimental-strip-types test/<suite>.ts`; measured results:
+`selfcheck.ts` loads all **65** modules under `src/` and then runs the **31** offline smoke suites (both lists are derived from the tree, so a new file cannot slip past the check); measured **ALL GREEN** on 2026-10-22, **965** checks in total. Run a single suite with `node --experimental-strip-types test/<suite>.ts`; measured results:
 
 | Suite | Measured |
 | --- | --- |
-| `test/smoke.ts` (frame / transport / ACL signing) | 6 check groups passed |
-| `test/producer_smoke.ts` | 4 check groups passed |
-| `test/consumer_smoke.ts` | 30 passed / 0 failed |
-| `test/stats_smoke.ts` | 14 passed / 0 failed |
-| `test/compat_contract_smoke.ts` (pinned wire-format / behavior surface) | 10 check groups passed |
-| `test/pop_smoke.ts` | 11 check groups passed |
+| `test/admin_concurrent_smoke.ts` (concurrent admin calls) | 27 passed / 0 failed |
+| `test/admin_lite_list_smoke.ts` (lite / concurrent list admin) | 22 passed / 0 failed |
+| `test/admin_longtail_smoke.ts` (controller / container / cold data / rocksdb) | 46 passed / 0 failed |
+| `test/admin_query_smoke.ts` | 7 passed / 0 failed |
+| `test/admin_track_smoke.ts` (message trace look-back) | 18 passed / 0 failed |
+| `test/auth_admin_smoke.ts` | 71 passed / 0 failed |
+| `test/auto_batch_and_retry_smoke.ts` (auto-batch groups and sync retry) | 108 passed / 0 failed |
+| `test/backpressure_smoke.ts` (the async fair semaphore: waiting, refusal, rollback, wording) | 119 passed / 0 failed |
 | `test/body_crc_smoke.ts` (stored-body BODYCRC mask forms) | 18 passed / 0 failed |
-| `test/pop_batch_ack_smoke.ts` (the 200151 request shape) | 9 passed / 0 failed |
+| `test/client_config_gaps_smoke.ts` (client configuration knobs) | 44 passed / 0 failed |
+| `test/compat_contract_smoke.ts` (pinned wire-format / behavior surface) | 10 check groups passed |
+| `test/consumer_heartbeat_registration_smoke.ts` (consumer heartbeat registration) | 13 passed / 0 failed |
+| `test/consumer_smoke.ts` | 30 passed / 0 failed |
 | `test/fixes2_smoke.ts` | 40 checks passed |
+| `test/heartbeat_v2_beat_smoke.ts` | 28 passed / 0 failed |
+| `test/heartbeat_v2_smoke.ts` | 30 passed / 0 failed |
+| `test/lite_topic_queue_change_smoke.ts` | 25 passed / 0 failed |
+| `test/mq_client_manager_smoke.ts` | 52 passed / 0 failed |
 | `test/namespace_rpc_smoke.ts` | 7 check groups passed |
 | `test/ns_failover_smoke.ts` | 12 checks passed |
-| `test/lite_topic_queue_change_smoke.ts` | 25 passed / 0 failed |
-| `test/pull_balance_view_smoke.ts` | 14 passed / 0 failed |
-| `test/socks_smoke.ts` (SOCKS proxy handshake + proxied connect) | 51 passed / 0 failed |
-| `test/mq_client_manager_smoke.ts` | 52 passed / 0 failed |
-| `test/static_topic_smoke.ts` | 29 passed / 0 failed |
 | `test/offset_persist_timer_smoke.ts` | 21 passed / 0 failed |
+| `test/pop_batch_ack_smoke.ts` (the 200151 request shape) | 9 passed / 0 failed |
+| `test/pop_smoke.ts` | 11 check groups passed |
+| `test/producer_smoke.ts` | 4 check groups passed |
+| `test/pull_balance_view_smoke.ts` | 14 passed / 0 failed |
 | `test/pull_schedule_smoke.ts` | 43 passed / 0 failed |
-| `test/admin_query_smoke.ts` | 7 passed / 0 failed |
-| `test/auth_admin_smoke.ts` | 71 passed / 0 failed |
-| `test/heartbeat_v2_smoke.ts` | 30 passed / 0 failed |
-| `test/heartbeat_v2_beat_smoke.ts` | 28 passed / 0 failed |
+| `test/smoke.ts` (frame / transport / ACL signing) | 6 check groups passed |
+| `test/socks_smoke.ts` (SOCKS proxy handshake + proxied connect) | 51 passed / 0 failed |
+| `test/static_topic_smoke.ts` | 29 passed / 0 failed |
+| `test/stats_smoke.ts` | 14 passed / 0 failed |
+| `test/vip_channel_smoke.ts` (VIP channel port-2 rewrite) | 36 passed / 0 failed |
 
 ### Packaging / npm consumption (tarball and registry)
 
@@ -382,8 +391,8 @@ nodeJs/
 │   └── client/          # MQClient, producer, push/pull/lite-pull/pop consumers, admin,
 │                        # allocation/offset-store/consume-stats/tracing/back-pressure/traceparent
 ├── examples/            # live real-cluster tools (see "Live Cluster Verification")
-├── test/                # offline smoke suites (protocol round-trip, allocation, offsets, tracing, stats, namespace, POP)
-├── selfcheck.ts         # one-shot offline check (module load + 22 smoke suites)
+├── test/                # offline smoke suites (protocol round-trip, auto-batch and retry, the backpressure gate, allocation, offsets, tracing, stats, namespace, POP, admin)
+├── selfcheck.ts         # one-shot offline check (module load + 31 smoke suites)
 └── package.json         # engines: node >= 22
 ```
 

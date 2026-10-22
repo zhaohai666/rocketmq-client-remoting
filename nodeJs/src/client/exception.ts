@@ -9,6 +9,7 @@ import {
   RemotingSendRequestException,
   RemotingTimeoutException,
   RemotingCommandException,
+  RemotingTooMuchRequestException,
   InterruptedException,
   RuntimeException,
 } from '../remoting/exception.ts';
@@ -40,6 +41,7 @@ export {
   RemotingSendRequestException,
   RemotingTimeoutException,
   RemotingCommandException,
+  RemotingTooMuchRequestException,
   InterruptedException,
   RuntimeException,
 };
@@ -54,6 +56,7 @@ export default {
   RemotingSendRequestException,
   RemotingTimeoutException,
   RemotingCommandException,
+  RemotingTooMuchRequestException,
   InterruptedException,
   RuntimeException,
 };

@@ -89,15 +89,15 @@ function nearbyMQs(): MessageQueue[] {
   console.log('OK: traceparent mint/validate/derive/inject/extract');
 }
 
-// 5) FairSemaphore byte-size acquire/release.
+// 5) FairSemaphore byte-size acquire/release (a zero budget is a single poll, never a wait).
 {
   const s = new FairSemaphore(100);
-  assert.ok(s.tryAcquireFor(60));
-  assert.ok(!s.tryAcquireFor(60)); // only 40 left
-  s.releaseFor(60);
+  assert.ok(await s.tryAcquire(60, 0));
+  assert.ok(!await s.tryAcquire(60, 0)); // only 40 left
+  s.release(60);
   assert.strictEqual(s.availablePermitsCount(), 100);
-  s.releaseFor(1000); // clamps at total
-  assert.strictEqual(s.availablePermitsCount(), 100);
+  s.release(1000); // over-releasing inflates the margin instead of clamping at the total
+  assert.strictEqual(s.availablePermitsCount(), 1100);
   console.log('OK: FairSemaphore byte-size acquire/release');
 }
 
