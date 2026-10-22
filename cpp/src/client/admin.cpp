@@ -724,13 +724,19 @@ void DefaultMQAdminExt::setMessageRequestMode(const std::string& brokerAddr,
                                              const std::string& consumerGroup,
                                              const std::string& mode, int32_t popShareQueueNum) {
     // SET_MESSAGE_REQUEST_MODE(401): switches a consumer group between POP and Pull modes (unitized scenario).
-    PropertyMap ext;
-    ext["topic"] = topic;
-    ext["consumerGroup"] = consumerGroup;
-    ext["mode"] = mode;
-    if (popShareQueueNum > 0) ext["popShareQueueNum"] = i64str(popShareQueueNum);
-    requireClient().invokeSync(vipAddr(brokerAddr), RequestCode::SET_MESSAGE_REQUEST_MODE, ext,
-                               Bytes(), false, timeoutMillis_);
+    // The broker decodes this request **entirely out of the JSON body** -- one object with
+    // {topic, consumerGroup, mode, popShareQueueNum} -- and reads no custom header at all, so a request
+    // whose values ride the header leaves it with no body to decode: it answers SYSTEM_ERROR and the mode
+    // never switches. All four keys are always in the body, and
+    // `mode` is the caller's string verbatim; `popShareQueueNum` is a JSON number that stays present at 0.
+    JsonValue body = JsonValue::makeObject();
+    body.set("topic", JsonValue::makeString(topic));
+    body.set("consumerGroup", JsonValue::makeString(consumerGroup));
+    body.set("mode", JsonValue::makeString(mode));
+    body.set("popShareQueueNum", JsonValue::makeInt(static_cast<int64_t>(popShareQueueNum)));
+    requireClient().invokeSync(vipAddr(brokerAddr), RequestCode::SET_MESSAGE_REQUEST_MODE,
+                               PropertyMap(), RemotingSerializable::encode(body), true,
+                               timeoutMillis_);
 }
 
 // ---------------------------------------- NameServer configuration (318/319)

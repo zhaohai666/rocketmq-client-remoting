@@ -1945,8 +1945,9 @@ final class RunClientAdmin
         $admin10->setMessageRequestMode('b:1', 'T', 'G1', 'POP', 4);
         $cmd10 = $this->lastCmd($admin10);
         $this->checkSame(RequestCode::SET_MESSAGE_REQUEST_MODE, $cmd10->code, 'SET_MESSAGE_REQUEST_MODE=401');
-        // The whole request is the body: the broker decodes a SetMessageRequestModeRequestBody and
-        // reads no custom header at all, so an ext-field form would be accepted and do nothing.
+        // The whole request is the body: the broker decodes one JSON object and reads no custom
+        // header at all, so a header-only request leaves it nothing to decode and never switches
+        // the mode.
         $this->checkSame(
             ['topic' => 'T', 'consumerGroup' => 'G1', 'mode' => 'POP', 'popShareQueueNum' => 4],
             json_decode((string) $cmd10->body, true),

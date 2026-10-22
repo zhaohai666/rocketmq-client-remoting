@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """Wire shape of the single-request admin RPC families: container membership,
 controller reads/writes, cold data flow control, commitlog read-ahead, pop record
-export, the RocksDB cold-queue checks and the order-conf KV round trip."""
+export, the RocksDB cold-queue checks, the order-conf KV round trip and the broker
+RPCs whose whole payload is a JSON body."""
 from __future__ import annotations
 
 import json
@@ -521,3 +522,116 @@ def test_order_conf_requires_key_and_value():
     with pytest.raises(MQClientException):
         admin.create_or_update_order_conf("k", "")
     assert client.requests == []
+
+
+# ------------------------------------------------- broker RPCs with a JSON body
+
+MODE_KEYS = ("topic", "consumerGroup", "mode", "popShareQueueNum")
+
+
+def _single_request(client: _FakeClient):
+    """The one request that reached the fake transport, as (addr, request, timeout)."""
+    assert len(client.requests) == 1, "exactly one request must reach the transport"
+    return client.requests[0]
+
+
+def _decoded_body(request) -> dict:
+    """The payload of a body-only RPC, read back off the wire.
+
+    A missing body here means the values went out as headers, which leaves the broker
+    with nothing to decode.
+    """
+    assert request.body, (
+        "the payload must travel in a JSON body; an empty body is the header form")
+    body = json.loads(request.body.decode("utf-8"))
+    assert isinstance(body, dict), "the body must be one JSON object"
+    return body
+
+
+def test_set_message_request_mode_sends_all_four_fields_in_a_json_body():
+    client = _FakeClient([_ok()])
+    admin = _admin(client)
+    admin.set_vip_channel_enabled(True)
+
+    admin.set_message_request_mode(ADDR, TOPIC, "GID_pop_share", "POP_SHARE",
+                                   pop_share_queue_num=8)
+
+    addr, request, timeout = _single_request(client)
+    assert request.code == RequestCode.SET_MESSAGE_REQUEST_MODE, "401 expected"
+    assert request.code == 401, "401 literal expected"
+    assert addr == "127.0.0.1:10909", "the VIP-channel rewrite still applies to this RPC"
+    assert timeout == 20000, "the admin default timeout still applies to this RPC"
+    assert request.ext_fields == {}, (
+        "the broker reads this RPC from the body, so no header may carry a value")
+    assert _decoded_body(request) == {
+        "topic": TOPIC,
+        "consumerGroup": "GID_pop_share",
+        "mode": "POP_SHARE",
+        "popShareQueueNum": 8,
+    }, "the decoded body must be exactly the four values the caller passed"
+
+
+def test_set_message_request_mode_keeps_pop_share_queue_num_at_zero_in_the_body():
+    client = _FakeClient([_ok()])
+    admin = _admin(client)
+
+    admin.set_message_request_mode(ADDR, TOPIC, "GID_zero", "NOT_CONSUME",
+                                   pop_share_queue_num=0)
+
+    _, request, _ = _single_request(client)
+    body = _decoded_body(request)
+    assert "popShareQueueNum" in body, (
+        "popShareQueueNum must be carried in the body even when it is 0")
+    assert body["popShareQueueNum"] == 0, "the zero value must stay 0"
+    assert set(body) == set(MODE_KEYS), "the body holds exactly the four keys"
+    assert request.ext_fields == {}, "no header may carry a value for this RPC"
+
+
+def test_set_message_request_mode_defaults_pop_share_queue_num_to_zero():
+    client = _FakeClient([_ok()])
+    admin = _admin(client)
+
+    admin.set_message_request_mode(ADDR, TOPIC, "GID_default", "NOT_CONSUME")
+
+    _, request, _ = _single_request(client)
+    body = _decoded_body(request)
+    assert body["popShareQueueNum"] == 0, (
+        "an omitted pop_share_queue_num still writes a 0 into the body")
+    assert request.ext_fields == {}, "the default case sets no header either"
+
+
+def test_set_message_request_mode_sends_the_callers_mode_verbatim():
+    client = _FakeClient([_ok()])
+    admin = _admin(client)
+
+    admin.set_message_request_mode(ADDR, TOPIC, "GID_mode", "pop_share")
+
+    _, request, _ = _single_request(client)
+    body = _decoded_body(request)
+    assert body["mode"] == "pop_share", (
+        "the mode is the caller's value; none is invented for it")
+
+
+def test_set_message_request_mode_never_smuggles_the_payload_into_headers():
+    """Paired control against the header form of this request: that form sent an empty
+    body plus four stringified headers, which leaves the broker nothing to decode."""
+    client = _FakeClient([_ok()])
+    admin = _admin(client)
+
+    admin.set_message_request_mode(ADDR, TOPIC, "GID_header_form", "POP_SHARE",
+                                   pop_share_queue_num=8)
+
+    _, request, _ = _single_request(client)
+    assert request.body is not None, "the body must be present, not left empty"
+    assert request.body != b"", "an empty body means the values went out as headers"
+    assert request.ext_fields == {}, (
+        "no payload value may travel as a header for this RPC")
+    for key in MODE_KEYS:
+        assert key not in request.ext_fields, "%s must not be sent as a header" % key
+    assert isinstance(request.body, (bytes, bytearray)), "the body is UTF-8 bytes"
+    body = json.loads(request.body.decode("utf-8"))
+    assert isinstance(body["popShareQueueNum"], int), (
+        "popShareQueueNum is a JSON number, not a stringified header value")
+    assert b'"8"' not in request.body, "no field may be quoted into a string"
+    assert body["topic"] == TOPIC and body["consumerGroup"] == "GID_header_form", (
+        "the topic and group stay in the body")

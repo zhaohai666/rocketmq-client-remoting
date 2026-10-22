@@ -1,12 +1,15 @@
-// Unit test for the admin-initiated CONSUME_MESSAGE_DIRECTLY(309) -- no cluster required.
+// Unit tests for the admin-initiated CONSUME_MESSAGE_DIRECTLY(309) and SET_MESSAGE_REQUEST_MODE(401)
+// request shapes -- no cluster required.
 //
 //
 // Why it must be locked down offline: every failure on this path is **silent** -- a wrong msgId key name means the broker-side
 // header cannot be parsed, the message pushed to the consumer matches nothing, and the remark/msgId in the admin result are all wrong;
 // picking the wrong target broker (the first in the route instead of the storage host) is invisible in a single-broker cluster and,
-// with several brokers, shows up as the broker answering NO_MESSAGE or the probe pushed to the wrong instance. The mock broker plays four request types:
-// route(105) / VIEW_MESSAGE_BY_ID(33) / QUERY_MESSAGE(12) / CONSUME_MESSAGE_DIRECTLY(309),
+// with several brokers, shows up as the broker answering NO_MESSAGE or the probe pushed to the wrong instance. The mock broker plays five request types:
+// route(105) / VIEW_MESSAGE_BY_ID(33) / QUERY_MESSAGE(12) / CONSUME_MESSAGE_DIRECTLY(309) / SET_MESSAGE_REQUEST_MODE(401),
 // sharing the socket skeleton with the MockBroker of rmq_test_check_client_config.
+// The same recording socket also pins the 401 wire shape, because a 401 whose payload sits in the wrong place
+// leaves the broker with no body to decode, so it answers SYSTEM_ERROR and the mode never switches.
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -24,6 +27,7 @@
 #include "rocketmq/common/net_compat.h"
 #include "rocketmq/remoting/protocol/body.h"
 #include "rocketmq/remoting/protocol/codes.h"
+#include "rocketmq/remoting/protocol/json.h"
 #include "rocketmq/remoting/protocol/remoting_command.h"
 #include "rocketmq/remoting/protocol/route.h"
 
@@ -180,7 +184,7 @@ public:
 
     // Each request type has its own script (consumed in arrival order; beyond the script the default reply is used).
     // Default: VIEW_MESSAGE_BY_ID / QUERY_MESSAGE answer NO_MESSAGE (message absent),
-    // 309 answers SUCCESS + empty body (triggering the admin "no consume result" branch).
+    // 309 and 401 answer SUCCESS + empty body.
     void scriptView(std::vector<ScriptedReply> replies) {
         std::lock_guard<std::mutex> lk(state_);
         viewReplies_ = std::move(replies);
@@ -202,14 +206,30 @@ public:
         directCount_.store(0);
     }
 
+    // The mock answers 401 with whatever the case scripts; the real broker rejects a request
+    // whose values ride the header, because it has no body object to decode.
+    void scriptSetMode(std::vector<ScriptedReply> replies) {
+        std::lock_guard<std::mutex> lk(state_);
+        setModeReplies_ = std::move(replies);
+        setModeRecords_.clear();
+        setModeCount_.store(0);
+    }
+
     int viewCount() const { return viewCount_.load(); }
     int queryCount() const { return queryCount_.load(); }
     int directCount() const { return directCount_.load(); }
+    int setModeCount() const { return setModeCount_.load(); }
 
     WireRecord directRecord(size_t i) {
         std::lock_guard<std::mutex> lk(state_);
         if (i >= directRecords_.size()) return WireRecord{};
         return directRecords_[i];
+    }
+
+    WireRecord setModeRecord(size_t i) {
+        std::lock_guard<std::mutex> lk(state_);
+        if (i >= setModeRecords_.size()) return WireRecord{};
+        return setModeRecords_[i];
     }
 
     WireRecord viewRecord(size_t i) {
@@ -270,7 +290,8 @@ private:
                 }
             } else if (req.code == RequestCode::VIEW_MESSAGE_BY_ID ||
                        req.code == RequestCode::QUERY_MESSAGE ||
-                       req.code == RequestCode::CONSUME_MESSAGE_DIRECTLY) {
+                       req.code == RequestCode::CONSUME_MESSAGE_DIRECTLY ||
+                       req.code == RequestCode::SET_MESSAGE_REQUEST_MODE) {
                 std::vector<ScriptedReply> replies;
                 std::vector<WireRecord>* records = nullptr;
                 std::atomic<int>* counter = nullptr;
@@ -281,6 +302,10 @@ private:
                 } else if (req.code == RequestCode::QUERY_MESSAGE) {
                     counter = &queryCount_;
                     records = &queryRecords_;
+                } else if (req.code == RequestCode::SET_MESSAGE_REQUEST_MODE) {
+                    counter = &setModeCount_;
+                    records = &setModeRecords_;
+                    fallback = ScriptedReply{ResponseCode::SUCCESS, std::string(), Bytes()};
                 } else {
                     counter = &directCount_;
                     records = &directRecords_;
@@ -310,10 +335,11 @@ private:
         netcompat::closeSocket(sock);
     }
 
-    // Picks the script matching the request code out of the three
+    // Picks the script matching the request code out of the four
     std::vector<ScriptedReply>& repliesFor(int32_t code) {
         if (code == RequestCode::VIEW_MESSAGE_BY_ID) return viewReplies_;
         if (code == RequestCode::QUERY_MESSAGE) return queryReplies_;
+        if (code == RequestCode::SET_MESSAGE_REQUEST_MODE) return setModeReplies_;
         return directReplies_;
     }
 
@@ -323,14 +349,17 @@ private:
     std::atomic<int> viewCount_{0};
     std::atomic<int> queryCount_{0};
     std::atomic<int> directCount_{0};
+    std::atomic<int> setModeCount_{0};
     std::mutex state_;
     std::map<std::string, Bytes> routes_;
     std::vector<ScriptedReply> viewReplies_;
     std::vector<ScriptedReply> queryReplies_;
     std::vector<ScriptedReply> directReplies_;
+    std::vector<ScriptedReply> setModeReplies_;
     std::vector<WireRecord> viewRecords_;
     std::vector<WireRecord> queryRecords_;
     std::vector<WireRecord> directRecords_;
+    std::vector<WireRecord> setModeRecords_;
     std::mutex workersM_;
     std::vector<std::thread> workers_;
     std::thread acceptor_;
@@ -548,6 +577,95 @@ void testMessageNotFoundSendsNothing(DefaultMQAdminExt& admin, MockBroker& mock)
     expectInt(mock.queryCount(), 1, "notFound.uniqKeyFallbackTried");
 }
 
+// ------------------------------------------------ SET_MESSAGE_REQUEST_MODE(401): the payload is the body
+//
+// The broker decodes 401 as one JSON object {topic, consumerGroup, mode, popShareQueueNum} and consults no
+// custom header, so a request whose values ride the header leaves it with nothing to decode and it answers
+// SYSTEM_ERROR -- the frame captured here is the only place that defect is visible.
+
+const char* kModeTopic = "SetModeAdminTopic";
+const char* kModeGroup = "GID_SetModeAdmin";
+
+// Every wire fact of one captured 401, checked against the values the caller passed.
+void expectSetModeBody(const WireRecord& rec, const std::string& topic, const std::string& group,
+                       const std::string& mode, int64_t popShareQueueNum,
+                       const std::string& name) {
+    expectInt(rec.code, RequestCode::SET_MESSAGE_REQUEST_MODE, name + ".requestCode");
+    // Nothing is read from the header: the request carries no custom header field at all.
+    expect(rec.ext.empty(), name + ".noExtFields", "count=" + std::to_string(rec.ext.size()));
+
+    JsonValue body;
+    std::string err;
+    const bool parsed = jsonParse(rec.body, body, &err);
+    expect(parsed, name + ".bodyParsesAsJSON",
+           rec.body.empty() ? std::string("(empty body)") : err);
+    if (!parsed) return;
+    expect(body.isObject(), name + ".bodyIsAnObject", rec.body);
+    expectInt(static_cast<long long>(body.objectItems().size()), 4,
+              name + ".bodyHasExactlyTheFourKeys");
+
+    expect(body.contains("topic") && body.get("topic").stringValue() == topic,
+           name + ".topicIsTheCallersTopic", body.get("topic").stringValue());
+    expect(body.contains("consumerGroup") && body.get("consumerGroup").stringValue() == group,
+           name + ".consumerGroupIsTheCallersGroup", body.get("consumerGroup").stringValue());
+    // mode goes out verbatim: no default is substituted for the caller's string.
+    expect(body.contains("mode") && body.get("mode").type() == JsonValue::Type::String &&
+               body.get("mode").stringValue() == mode,
+           name + ".modeIsTheCallersString",
+           body.get("mode").type() == JsonValue::Type::String ? body.get("mode").stringValue()
+                                                              : std::string("(not a string)"));
+    // popShareQueueNum is a JSON number, and the key is present whatever its value.
+    expect(body.contains("popShareQueueNum"), name + ".hasPopShareQueueNumKey", rec.body);
+    expect(body.get("popShareQueueNum").isNumber(), name + ".popShareQueueNumIsAJsonNumber",
+           rec.body);
+    expectInt(body.get("popShareQueueNum").intValue(), popShareQueueNum,
+              name + ".popShareQueueNumValue");
+}
+
+void testSetMessageRequestModeCarriesItsPayloadInJsonBody(DefaultMQAdminExt& admin,
+                                                         MockBroker& mock) {
+    mock.scriptSetMode({});
+    admin.setMessageRequestMode(mock.address(), kModeTopic, kModeGroup, "POP", 3);
+
+    expectInt(mock.setModeCount(), 1, "setMode.popShareQueueNum3.oneRequest");
+    expectSetModeBody(mock.setModeRecord(0), kModeTopic, kModeGroup, "POP", 3,
+                      "setMode.popShareQueueNum3");
+}
+
+// The dropped-at-zero case: a missing popShareQueueNum key is the broker reading 0 by default,
+// which is a different request from the one the caller asked for once share-queue counting is on.
+void testSetMessageRequestModeCarriesZeroPopShareQueueNum(DefaultMQAdminExt& admin,
+                                                         MockBroker& mock) {
+    mock.scriptSetMode({});
+    admin.setMessageRequestMode(mock.address(), kModeTopic, kModeGroup, "NOT_POP", 0);
+
+    expectInt(mock.setModeCount(), 1, "setMode.popShareQueueNum0.oneRequest");
+    const WireRecord rec = mock.setModeRecord(0);
+    expectSetModeBody(rec, kModeTopic, kModeGroup, "NOT_POP", 0, "setMode.popShareQueueNum0");
+    expect(rec.body.find("\"popShareQueueNum\":0") != std::string::npos,
+           "setMode.popShareQueueNum0.keyWrittenAsZero", rec.body);
+}
+
+// Paired control for the two reverts this defect allows: putting the four values back into extFields, or
+// leaving the body empty. Either one makes the assertions below fail.
+void testSetMessageRequestModeIsBodyFormNotHeaderForm(DefaultMQAdminExt& admin, MockBroker& mock) {
+    mock.scriptSetMode({});
+    admin.setMessageRequestMode(mock.address(), kModeTopic, kModeGroup, "POP", 1);
+
+    expectInt(mock.setModeCount(), 1, "setMode.control.oneRequest");
+    const WireRecord rec = mock.setModeRecord(0);
+    expect(!rec.body.empty(), "setMode.control.bodyIsNotEmpty");
+    expect(rec.body.size() > 2, "setMode.control.bodyHoldsAPayload",
+           "bytes=" + std::to_string(rec.body.size()));
+    expect(rec.ext.find("topic") == rec.ext.end(), "setMode.control.topicNotAHeaderField");
+    expect(rec.ext.find("consumerGroup") == rec.ext.end(),
+           "setMode.control.groupNotAHeaderField");
+    expect(rec.ext.find("mode") == rec.ext.end(), "setMode.control.modeNotAHeaderField");
+    expect(rec.ext.find("popShareQueueNum") == rec.ext.end(),
+           "setMode.control.shareQueueNumNotAHeaderField");
+    expectInt(static_cast<long long>(rec.ext.size()), 0, "setMode.control.zeroHeaderFields");
+}
+
 }  // namespace
 
 int main() {
@@ -576,6 +694,10 @@ int main() {
     testBrokerRejectPropagates(admin, mock);
     testEmptyResultBodyThrows(admin, mock);
     testMessageNotFoundSendsNothing(admin, mock);
+
+    testSetMessageRequestModeCarriesItsPayloadInJsonBody(admin, mock);
+    testSetMessageRequestModeCarriesZeroPopShareQueueNum(admin, mock);
+    testSetMessageRequestModeIsBodyFormNotHeaderForm(admin, mock);
 
     admin.shutdown();
     std::printf("admin consume directly: %d checks, %d failures\n", checks, fails);

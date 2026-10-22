@@ -1501,11 +1501,19 @@ class DefaultMQAdminExt:
                                  consumer_group: str, mode: str,
                                  pop_share_queue_num: int = 0) -> None:
         pass
-        ext = {"topic": topic, "consumerGroup": consumer_group, "mode": mode}
-        if pop_share_queue_num > 0:
-            ext["popShareQueueNum"] = pop_share_queue_num
+        # The broker decodes this request's entire payload from one JSON body object and
+        # reads no custom header: a request whose values ride the header leaves it with no
+        # body to decode, so it answers SYSTEM_ERROR and the mode never switches. All four
+        # keys therefore go in the body, none in ext fields, and popShareQueueNum stays in
+        # as a JSON number even at 0.
+        body = RemotingSerializable.encode({
+            "topic": topic,
+            "consumerGroup": consumer_group,
+            "mode": mode,
+            "popShareQueueNum": pop_share_queue_num,
+        })
         self._invoke_broker(broker_addr, RequestCode.SET_MESSAGE_REQUEST_MODE,
-                            ext_fields=ext)
+                            ext_fields=None, body=body)
 
     # ---------------- Broker container ----------------
     def add_broker_to_container(self, broker_container_addr: str,

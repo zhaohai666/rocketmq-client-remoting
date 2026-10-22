@@ -216,7 +216,8 @@ public:
     // consumeTimeSpanSet JSON arrays from the response bodies (the aggregated array is returned).
     JsonValue queryConsumeTimeSpan(const std::string& topic, const std::string& group);
     std::set<std::string> getTopicClusterList(const std::string& topic);
-    // SET_MESSAGE_REQUEST_MODE(401): popShareQueueNum is carried only when > 0.
+    // SET_MESSAGE_REQUEST_MODE(401): no custom header at all -- the request is one JSON body
+    // {topic, consumerGroup, mode, popShareQueueNum}, and `popShareQueueNum` is carried even when it is 0.
     void setMessageRequestMode(const std::string& brokerAddr, const std::string& topic,
                                const std::string& consumerGroup, const std::string& mode,
                                int32_t popShareQueueNum = 0);

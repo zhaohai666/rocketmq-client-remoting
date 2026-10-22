@@ -49,6 +49,7 @@ internal static class Program
                 "pop" => LivePop.Run(rest),
                 "popc" => LivePopConsumer.Run(rest),
                 "pop-batch-ack" => LivePopBatchAck.Run(rest),
+                "pop-mode" => LivePopMode.Run(rest),
                 "trace" => LiveTrace.Run(rest),
                 "tls" => LiveTls.Run(rest),
                 "hook" => LiveHook.Run(rest),
@@ -115,6 +116,8 @@ internal static class Program
               popc         [namesrv]        real cluster POP **consume side** integration (consume loop / ack / delayed redelivery)
               pop-batch-ack <namesrv> [legs] [stamp]
                                             real cluster BATCH_ACK_MESSAGE(200151) integration (one request clears a whole batch / leaving exactly one checkpoint out revives only that message, whose retry body carries marker 1 on the business topic / two pop rounds of one queue keep distinct merge keys; needs no broker switch and no restart)
+              pop-mode <namesrv> [legs] [stamp]
+                                            real cluster SET_MESSAGE_REQUEST_MODE(401) request shape + GET_ALL_MESSAGE_REQUEST_MODE(402) readback (the production write rides the JSON body and switches the mode / a second write replaces it / a header-only 401 with an empty body is rejected and switches nothing, anchored by a body-form write that is visible in the same readback)
               trace        [namesrv]        real cluster message trace integration (needs the broker traceTopicEnable=true)
               hook         [namesrv]        real cluster CheckForbidden/FilterMessage hook integration
               backpressure [namesrv]        real cluster async send backpressure integration (count/byte gates, reconciling rejections, growing at runtime)

@@ -36,6 +36,15 @@ public class AdminLongTailTests
 
     private static List<string> KeysOf(WireRecord record) => new(record.Ext.Keys);
 
+    /// <summary>The body of a recorded request, decoded back into JSON: the way to read an
+    /// RPC whose fields all ride in the body.</summary>
+    private static JsonValue DecodedBody(WireRecord record)
+    {
+        Assert.True(RemotingSerializable.Decode(record.Body, out JsonValue body),
+            "the request body must be a decodable JSON object");
+        return body;
+    }
+
     // ---------------------------------------------------------------- container 902/903
 
     [Fact]
@@ -592,6 +601,161 @@ public class AdminLongTailTests
                 admin.CreateAndUpdateSubscriptionGroupConfigList(cluster.BrokerAddrs[0],
                     new List<SubscriptionGroupConfig> { new() { GroupName = "GID_one" } }));
             Assert.Equal(14, e.ResponseCode);
+        }
+        finally
+        {
+            admin.Shutdown();
+        }
+    }
+
+    // ------------------------------------------------------- 401 message request mode
+    //
+    // SET_MESSAGE_REQUEST_MODE is an admin RPC with no custom header on the wire at all: the
+    // broker decodes the request body into one object and reads topic / consumerGroup / mode /
+    // popShareQueueNum out of it. A request that carries those as extFields has no body for the
+    // broker to decode, so it fails before reaching the mode table, and every case below reads
+    // the four fields back out of the recorded body.
+
+    [Fact]
+    public void SetMessageRequestMode_RidesEntirelyInTheJsonBody_WithNoExtField()
+    {
+        using var cluster = MockCluster.Start(1);
+        DefaultMQAdminExt admin = Started(cluster, "mode_pop");
+        try
+        {
+            admin.SetMessageRequestMode(cluster.BrokerAddrs[0], "T_mode", "GID_mode", "POP", 8);
+
+            WireRecord rec = Single(cluster, RequestCode.SetMessageRequestMode);
+            Assert.True(rec.HasBody);
+            Assert.Empty(rec.Ext);
+
+            JsonValue body = DecodedBody(rec);
+            Assert.Equal(
+                new[] { "topic", "consumerGroup", "mode", "popShareQueueNum" },
+                body.ObjectItems().Select(kv => kv.Key).ToList());
+            Assert.Equal("T_mode", body.Get("topic").StringValue());
+            Assert.Equal("GID_mode", body.Get("consumerGroup").StringValue());
+            Assert.Equal("POP", body.Get("mode").StringValue());
+            Assert.True(body.Get("popShareQueueNum").IsNumber);
+            Assert.Equal(8, body.Get("popShareQueueNum").IntValue());
+        }
+        finally
+        {
+            admin.Shutdown();
+        }
+    }
+
+    /// <summary>The exact bytes of the request: key order, and popShareQueueNum spelled as a
+    /// JSON number rather than a quoted string.</summary>
+    [Fact]
+    public void SetMessageRequestMode_BodyIsOneFlatJsonObject_OfExactlyThoseFourKeys()
+    {
+        using var cluster = MockCluster.Start(1);
+        DefaultMQAdminExt admin = Started(cluster, "mode_bytes");
+        try
+        {
+            admin.SetMessageRequestMode(cluster.BrokerAddrs[0], "T_probe", "GID_probe", "POP", 8);
+
+            WireRecord rec = Single(cluster, RequestCode.SetMessageRequestMode);
+            Assert.Equal(
+                "{\"topic\":\"T_probe\",\"consumerGroup\":\"GID_probe\",\"mode\":\"POP\","
+                + "\"popShareQueueNum\":8}",
+                BodyOf(rec));
+        }
+        finally
+        {
+            admin.Shutdown();
+        }
+    }
+
+    /// <summary>0 is a value the broker has to see, so the key stays in the body at 0; the
+    /// non-zero leg of the same pair proves the number is not being stringified.</summary>
+    [Fact]
+    public void SetMessageRequestMode_PopShareQueueNumZeroIsStillCarried()
+    {
+        using var cluster = MockCluster.Start(1);
+        DefaultMQAdminExt admin = Started(cluster, "mode_zero");
+        try
+        {
+            admin.SetMessageRequestMode(cluster.BrokerAddrs[0], "T_zero", "GID_zero", "POP");
+
+            WireRecord rec = Single(cluster, RequestCode.SetMessageRequestMode);
+            JsonValue zero = DecodedBody(rec);
+            Assert.True(zero.Contains("popShareQueueNum"),
+                "omitting the key at 0 loses half of the request");
+            Assert.Equal(4, zero.ObjectItems().Count);
+            Assert.True(zero.Get("popShareQueueNum").IsNumber);
+            Assert.Equal(0, zero.Get("popShareQueueNum").IntValue());
+            Assert.Equal("{\"topic\":\"T_zero\",\"consumerGroup\":\"GID_zero\",\"mode\":\"POP\","
+                         + "\"popShareQueueNum\":0}", BodyOf(rec));
+
+            admin.SetMessageRequestMode(cluster.BrokerAddrs[0], "T_six", "GID_six", "POP", 6);
+            List<WireRecord> both =
+                cluster.Records().FindAll(r => r.Code == RequestCode.SetMessageRequestMode);
+            Assert.Equal(2, both.Count);
+            Assert.Equal(6, DecodedBody(both[1]).Get("popShareQueueNum").IntValue());
+        }
+        finally
+        {
+            admin.Shutdown();
+        }
+    }
+
+    /// <summary>The caller's strings reach the body unchanged -- no mode is invented for an
+    /// unrecognised one -- and the JSON escaping of an odd resource name survives the trip.</summary>
+    [Fact]
+    public void SetMessageRequestMode_WritesTheCallerStringsVerbatim()
+    {
+        using var cluster = MockCluster.Start(1);
+        DefaultMQAdminExt admin = Started(cluster, "mode_verbatim");
+        try
+        {
+            admin.SetMessageRequestMode(cluster.BrokerAddrs[0], "myNs%T_mode",
+                "GID_odd\"q", "not-a-known-mode", 0);
+
+            WireRecord rec = Single(cluster, RequestCode.SetMessageRequestMode);
+            Assert.Empty(rec.Ext);
+            JsonValue body = DecodedBody(rec);
+            Assert.Equal("myNs%T_mode", body.Get("topic").StringValue());
+            Assert.Equal("GID_odd\"q", body.Get("consumerGroup").StringValue());
+            Assert.Equal("not-a-known-mode", body.Get("mode").StringValue());
+            Assert.Equal(0, body.Get("popShareQueueNum").IntValue());
+            Assert.Contains("\\\"", BodyOf(rec));
+        }
+        finally
+        {
+            admin.Shutdown();
+        }
+    }
+
+    /// <summary>The header-only shape is the failure mode this RPC has to keep out: a request
+    /// whose body is empty has nothing for the broker to read, so it reaches no mode table at
+    /// all and cannot be counted as a mode change. This case sends two requests through the same
+    /// admin and proves neither of them degenerates into a header-only one.</summary>
+    [Fact]
+    public void SetMessageRequestMode_AnEmptyBodyIsNeverASuccessfulModeChange()
+    {
+        using var cluster = MockCluster.Start(1);
+        DefaultMQAdminExt admin = Started(cluster, "mode_no_body_control");
+        try
+        {
+            admin.SetMessageRequestMode(cluster.BrokerAddrs[0], "T_a", "GID_a", "POP", 0);
+            admin.SetMessageRequestMode(cluster.BrokerAddrs[0], "T_b", "GID_b", "POP", 3);
+
+            List<WireRecord> sent =
+                cluster.Records().FindAll(r => r.Code == RequestCode.SetMessageRequestMode);
+            Assert.Equal(2, sent.Count);
+            foreach (WireRecord rec in sent)
+            {
+                Assert.True(rec.HasBody, "a header-only 401 request leaves the broker nothing to decode");
+                Assert.Empty(rec.Ext);
+                JsonValue body = DecodedBody(rec);
+                Assert.Equal(4, body.ObjectItems().Count);
+                Assert.True(body.Contains("popShareQueueNum"));
+            }
+
+            Assert.Equal("T_a", DecodedBody(sent[0]).Get("topic").StringValue());
+            Assert.Equal("T_b", DecodedBody(sent[1]).Get("topic").StringValue());
         }
         finally
         {

@@ -1911,18 +1911,23 @@ public sealed class DefaultMQAdminExt
 
     public HashSet<string> GetTopicClusterList(string topic) => GetClusterList(topic);
 
+    /// <summary>SET_MESSAGE_REQUEST_MODE (401) is read by the broker entirely out of the
+    /// JSON request body -- a decoded object with topic / consumerGroup / mode /
+    /// popShareQueueNum -- and it looks at no custom header at all. A header-only request
+    /// leaves the broker with no body to decode, so it fails before reaching the mode table
+    /// and the mode never switches. Every one of the four keys therefore rides in the body,
+    /// and popShareQueueNum is carried even when it is 0, because 0 is a request the broker
+    /// has to see rather than an absent value.</summary>
     public void SetMessageRequestMode(string brokerAddr, string topic, string consumerGroup,
         string mode, int popShareQueueNum = 0)
     {
-        PropertyMap ext = new()
-        {
-            ["topic"] = topic,
-            ["consumerGroup"] = consumerGroup,
-            ["mode"] = mode,
-        };
-        if (popShareQueueNum > 0) ext["popShareQueueNum"] = I64Str(popShareQueueNum);
+        JsonValue body = JsonValue.MakeObject();
+        body.Set("topic", JsonValue.MakeString(topic));
+        body.Set("consumerGroup", JsonValue.MakeString(consumerGroup));
+        body.Set("mode", JsonValue.MakeString(mode));
+        body.Set("popShareQueueNum", JsonValue.MakeInt(popShareQueueNum));
         RequireClient().InvokeSync(AddrForRpc(brokerAddr), RequestCode.SetMessageRequestMode,
-            ext, null, false, _timeoutMillis);
+            new PropertyMap(), RemotingSerializable.Encode(body), true, _timeoutMillis);
     }
 
 

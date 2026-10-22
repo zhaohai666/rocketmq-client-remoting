@@ -172,3 +172,9 @@ target_link_libraries(rmq_live_publish_route_master PRIVATE rocketmq::remoting)
 # (about 4 minutes, waiting for two sweep periods; not packed into ctest)
 add_executable(rmq_live_clean_expired_msg live_clean_expired_msg.cpp)
 target_link_libraries(rmq_live_clean_expired_msg PRIVATE rocketmq::remoting)
+
+# SET_MESSAGE_REQUEST_MODE(401) request shape live leg: the four values ride the JSON body, the only in-protocol
+# read-back is GET_ALL_MESSAGE_REQUEST_MODE(402), and the header form is a paired control that must be rejected
+# (not packed into ctest)
+add_executable(rmq_live_pop_mode live_pop_mode.cpp)
+target_link_libraries(rmq_live_pop_mode PRIVATE rocketmq::remoting)

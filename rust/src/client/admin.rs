@@ -3012,6 +3012,16 @@ impl DefaultMQAdminExt {
     }
 
     /// `SET_MESSAGE_REQUEST_MODE(401)`.
+    ///
+    /// Wire fact: the broker reads this request's **entire** payload out of the JSON body, as an
+    /// object with the fields `topic`, `consumerGroup`, `mode` and `popShareQueueNum`; it looks at
+    /// no custom header at all. A request that carries those values as ext fields leaves the broker
+    /// with no body to decode, so it fails before reaching the mode table, and the mode never
+    /// switches. Every value therefore rides the body here and the header stays empty.
+    ///
+    /// `popShareQueueNum` is always present as a JSON number, zero included: the body is decoded
+    /// into an object, so a value the caller never asked to omit is still the value the broker
+    /// applies, and dropping the key at 0 would leave the broker's own default in charge.
     pub async fn set_message_request_mode(
         &self,
         broker_addr: &str,
@@ -3020,20 +3030,19 @@ impl DefaultMQAdminExt {
         mode: &str,
         pop_share_queue_num: i32,
     ) -> Result<()> {
-        let mut pairs = vec![
-            ("topic", topic.to_string()),
-            ("consumerGroup", consumer_group.to_string()),
-            ("mode", mode.to_string()),
-        ];
-        if pop_share_queue_num > 0 {
-            pairs.push(("popShareQueueNum", pop_share_queue_num.to_string()));
-        }
-        let ext = ext_pairs(&pairs);
+        let body = serde_json::to_vec(&json!({
+            "topic": topic,
+            "consumerGroup": consumer_group,
+            // The caller's mode verbatim; an unset or unrecognised one is the broker's to reject.
+            "mode": mode,
+            "popShareQueueNum": pop_share_queue_num,
+        }))
+        .map_err(|e| Error::client(format!("encode message request mode: {e}")))?;
         self.invoke_broker(
             broker_addr,
             request_code::SET_MESSAGE_REQUEST_MODE,
-            &ext,
-            None,
+            &ExtFields::new(),
+            Some(body),
             None,
         )
         .await?;
@@ -6761,6 +6770,158 @@ mod tests {
                 .await
                 .is_err()
         );
+        admin.shutdown();
+    }
+
+    // ---------------- 401 SET_MESSAGE_REQUEST_MODE: the whole request is a JSON body ----------------
+
+    /// Every request of one code in wire order; `logged_request` only returns the first hit.
+    fn logged_requests(log: &AdminLog, code: i32) -> Vec<(ExtFields, Option<Vec<u8>>)> {
+        lock(log)
+            .iter()
+            .filter(|(seen, _, _)| *seen == code)
+            .map(|(_, ext, body)| (ext.clone(), body.clone()))
+            .collect()
+    }
+
+    /// The body a 401 must carry: UTF-8 JSON the broker decodes into one object.
+    fn body_json(body: &Option<Vec<u8>>) -> Value {
+        let raw = body
+            .as_deref()
+            .expect("the request carries a body, not a set of header fields");
+        serde_json::from_slice(raw).expect("the body is UTF-8 JSON")
+    }
+
+    #[tokio::test]
+    async fn message_request_mode_401_sends_the_whole_request_as_a_json_body() {
+        let (listener, addr) = bind_admin_mock().await;
+        let log = spawn_admin_broker(listener, Vec::new()).await;
+        let admin = started_direct_admin(&addr).await;
+
+        admin
+            .set_message_request_mode(&addr, "T", "GID_a", "POP_PINNER", 8)
+            .await
+            .expect("set message request mode");
+
+        let (ext, body) = logged_request(&log, request_code::SET_MESSAGE_REQUEST_MODE);
+        assert!(
+            ext.is_empty(),
+            "the broker reads this request out of the body; a header field is ignored there"
+        );
+        let json = body_json(&body);
+        // Exact object equality: all four keys, nothing else, the caller's values.
+        assert_eq!(
+            json,
+            json!({
+                "topic": "T",
+                "consumerGroup": "GID_a",
+                "mode": "POP_PINNER",
+                "popShareQueueNum": 8,
+            })
+        );
+        assert_eq!(json.as_object().expect("one object").len(), 4);
+        assert!(
+            json["popShareQueueNum"].is_number(),
+            "the queue count is a JSON number, not a string"
+        );
+        admin.shutdown();
+    }
+
+    /// The paired control of the header form: the four names must never reach the custom header,
+    /// and a dropped body means the request carries no payload the broker can read at all.
+    #[tokio::test]
+    async fn message_request_mode_401_values_never_ride_the_header() {
+        let (listener, addr) = bind_admin_mock().await;
+        let log = spawn_admin_broker(listener, Vec::new()).await;
+        let admin = started_direct_admin(&addr).await;
+
+        admin
+            .set_message_request_mode(&addr, "T", "GID_a", "POP_PINNER", 8)
+            .await
+            .expect("set message request mode");
+
+        let requests = logged_requests(&log, request_code::SET_MESSAGE_REQUEST_MODE);
+        assert_eq!(requests.len(), 1);
+        for name in ["topic", "consumerGroup", "mode", "popShareQueueNum"] {
+            assert!(
+                !requests[0].0.contains_key(name),
+                "{name} belongs in the body; the broker reads no header field here"
+            );
+        }
+        let body = requests[0]
+            .1
+            .clone()
+            .expect("the request has a body; a body-less 401 leaves the broker nothing to decode");
+        assert!(!body.is_empty(), "the body carries the whole request");
+        admin.shutdown();
+    }
+
+    /// `popShareQueueNum` is part of the decoded object whatever its value: 0 is a request to use
+    /// zero shared queues, not an omission, so the key stays in the body.
+    #[tokio::test]
+    async fn message_request_mode_401_carries_pop_share_queue_num_even_at_zero() {
+        let (listener, addr) = bind_admin_mock().await;
+        let log = spawn_admin_broker(listener, Vec::new()).await;
+        let admin = started_direct_admin(&addr).await;
+
+        admin
+            .set_message_request_mode(&addr, "T", "GID_a", "POP_PINNER", 0)
+            .await
+            .expect("zero is a legal queue count");
+        admin
+            .set_message_request_mode(&addr, "T", "GID_a", "POP_PINNER", 4)
+            .await
+            .expect("non-zero queue count");
+
+        let requests = logged_requests(&log, request_code::SET_MESSAGE_REQUEST_MODE);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            body_json(&requests[0].1),
+            json!({
+                "topic": "T",
+                "consumerGroup": "GID_a",
+                "mode": "POP_PINNER",
+                "popShareQueueNum": 0,
+            }),
+            "the zero case still sends the key"
+        );
+        assert_eq!(
+            body_json(&requests[1].1),
+            json!({
+                "topic": "T",
+                "consumerGroup": "GID_a",
+                "mode": "POP_PINNER",
+                "popShareQueueNum": 4,
+            })
+        );
+        assert!(requests.iter().all(|(ext, _)| ext.is_empty()));
+        admin.shutdown();
+    }
+
+    /// The mode goes out as the caller's string: no fallback name is substituted for an empty one.
+    #[tokio::test]
+    async fn message_request_mode_401_mode_is_the_callers_string() {
+        let (listener, addr) = bind_admin_mock().await;
+        let log = spawn_admin_broker(listener, Vec::new()).await;
+        let admin = started_direct_admin(&addr).await;
+
+        admin
+            .set_message_request_mode(&addr, "T", "GID_a", "", 1)
+            .await
+            .expect("empty mode");
+        admin
+            .set_message_request_mode(&addr, "T", "GID_a", "NOT_POP", 1)
+            .await
+            .expect("plain mode");
+
+        let requests = logged_requests(&log, request_code::SET_MESSAGE_REQUEST_MODE);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            body_json(&requests[0].1)["mode"],
+            Value::String(String::new()),
+            "an empty mode stays empty instead of becoming an invented default"
+        );
+        assert_eq!(body_json(&requests[1].1)["mode"], "NOT_POP");
         admin.shutdown();
     }
 }
