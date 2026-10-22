@@ -1995,6 +1995,7 @@ func TestShutdownAwaitTerminationDefaultsToTheClientBudget(t *testing.T) {
 		t.Errorf("ceiling(250) = %s, want 250ms", got)
 	}
 }
+
 // ---------------------------------------------------------------- pull backoffs
 
 // The broker's flow-control answer and this client's own backlog are different
