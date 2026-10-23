@@ -61,7 +61,6 @@ struct MessageConst {
     static constexpr const char* PROPERTY_FIRST_POP_TIME = "1ST_POP_TIME";
     static constexpr const char* PROPERTY_POP_TIME = "POP_TIME";
     static constexpr const char* PROPERTY_INVISIBLE_TIME = "INVISIBLE_TIME";
-    static constexpr const char* PROPERTY_DELAY_TIME = "DELAY_TIME";
     static constexpr const char* PROPERTY_START_TIME = "START_TIME";
     static constexpr const char* PROPERTY_END_TIME = "END_TIME";
     static constexpr const char* PROPERTY_EXPIRE_TIME = "EXPIRE_TIME";

@@ -1125,7 +1125,19 @@ export class DefaultMQProducer {
     timeoutMillis: number = this.sendMsgTimeout,
   ): Promise<TransactionSendResult> {
     listener = listener ?? (this as any).transactionListener ?? null;
-    if (listener == null) throw new MQClientException('transaction listener is null');
+    if (listener == null) throw new MQClientException('tranExecutor is null');
+    // A half message is committed exactly as it stands, so no schedule asked for here
+    // can be honoured. The key alone decides: a "0" or an empty value asks for nothing
+    // yet is still a stamp this path cannot carry, so the map is consulted directly --
+    // getProperty() folds an empty value to null and would let it through.
+    const properties = msg.getProperties();
+    for (const key of [MessageConst.PROPERTY_DELAY_TIME_LEVEL,
+      MessageConst.PROPERTY_TIMER_DELAY_SEC, MessageConst.PROPERTY_TIMER_DELAY_MS,
+      MessageConst.PROPERTY_TIMER_DELIVER_MS]) {
+      if (properties[key] !== undefined) {
+        throw new MQClientException('Transactional messages do not support delayed delivery');
+      }
+    }
     MessageAccessor.setTransactionPrepared(msg);
     MessageAccessor.putProperty(msg, MessageConst.PROPERTY_PRODUCER_GROUP, this.producerGroup);
     const sendResult = await this._sendDefaultImpl(msg, CommunicationMode.SYNC, null, timeoutMillis);

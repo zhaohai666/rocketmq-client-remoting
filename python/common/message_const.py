@@ -7,6 +7,12 @@ class MessageConst:
     PROPERTY_TAGS = "TAGS"
     PROPERTY_WAIT_STORE_MSG_OK = "WAIT"
     PROPERTY_DELAY_TIME_LEVEL = "DELAY"
+    # The 5.x timer spellings of "deliver later": relative seconds, relative
+    # milliseconds, an absolute deliver-at timestamp. Like the delay level they ask
+    # for a schedule, so every gate that refuses a delayed message checks all four.
+    PROPERTY_TIMER_DELAY_SEC = "TIMER_DELAY_SEC"
+    PROPERTY_TIMER_DELAY_MS = "TIMER_DELAY_MS"
+    PROPERTY_TIMER_DELIVER_MS = "TIMER_DELIVER_MS"
     PROPERTY_RETRY_TOPIC = "RETRY_TOPIC"
     PROPERTY_REAL_TOPIC = "REAL_TOPIC"
     PROPERTY_REAL_QUEUE_ID = "REAL_QID"
@@ -55,7 +61,6 @@ class MessageConst:
     PROPERTY_POP_TIME = "POP_TIME"
     PROPERTY_FIRST_POP_TIME = "1ST_POP_TIME"
     PROPERTY_INVISIBLE_TIME = "INVISIBLE_TIME"
-    PROPERTY_DELAY_TIME = "DELAY_TIME"
     PROPERTY_START_TIME = "START_TIME"
     PROPERTY_END_TIME = "END_TIME"
     PROPERTY_EXPIRE_TIME = "EXPIRE_TIME"

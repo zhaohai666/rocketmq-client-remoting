@@ -14,6 +14,12 @@ final class MessageConst
     public const PROPERTY_TAGS = 'TAGS';
     public const PROPERTY_WAIT_STORE_MSG_OK = 'WAIT';
     public const PROPERTY_DELAY_TIME_LEVEL = 'DELAY';
+    // The 5.x timer spellings of "deliver later": relative seconds, relative
+    // milliseconds, an absolute deliver-at timestamp. Like the delay level they ask for
+    // a schedule, so every gate that refuses a delayed message checks all four.
+    public const PROPERTY_TIMER_DELAY_SEC = 'TIMER_DELAY_SEC';
+    public const PROPERTY_TIMER_DELAY_MS = 'TIMER_DELAY_MS';
+    public const PROPERTY_TIMER_DELIVER_MS = 'TIMER_DELIVER_MS';
     public const PROPERTY_RETRY_TOPIC = 'RETRY_TOPIC';
     public const PROPERTY_REAL_TOPIC = 'REAL_TOPIC';
     public const PROPERTY_REAL_QUEUE_ID = 'REAL_QID';
@@ -71,7 +77,6 @@ final class MessageConst
      */
     public const PROPERTY_FIRST_POP_TIME = '1ST_POP_TIME';
     public const PROPERTY_INVISIBLE_TIME = 'INVISIBLE_TIME';
-    public const PROPERTY_DELAY_TIME = 'DELAY_TIME';
     public const PROPERTY_START_TIME = 'START_TIME';
     public const PROPERTY_END_TIME = 'END_TIME';
     public const PROPERTY_EXPIRE_TIME = 'EXPIRE_TIME';

@@ -76,9 +76,10 @@ use crate::common::compression;
 use crate::common::message::{Message, MessageBatch, MessageExt, MessageQueue};
 use crate::common::message_client_id_setter::set_uniq_id;
 use crate::common::message_const::{
-    PROPERTY_CORRELATION_ID, PROPERTY_DELAY_TIME, PROPERTY_DELAY_TIME_LEVEL,
+    PROPERTY_CORRELATION_ID, PROPERTY_DELAY_TIME_LEVEL,
     PROPERTY_MESSAGE_REPLY_TO_CLIENT, PROPERTY_MESSAGE_TTL, PROPERTY_PRODUCER_GROUP,
-    PROPERTY_TRANSACTION_PREPARED, PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX,
+    PROPERTY_TRANSACTION_PREPARED, PROPERTY_TIMER_DELIVER_MS, PROPERTY_TIMER_DELAY_MS,
+    PROPERTY_TIMER_DELAY_SEC, PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX,
 };
 use crate::common::message_decoder::{decode_message, decode_message_id, decode_messages};
 use crate::common::message_type::MessageType;
@@ -3618,15 +3619,16 @@ enum TxnEnd<'a> {
     },
 }
 
-/// Delay properties forbidden for transactional messages (the **list differs** from the one used for the hook context: this one has no
-/// `__STARTDELIVERTIME`, it uses only the
-/// DELAY / DELAY_TIME / TIMER_* five keys).
-const TRANSACTION_FORBIDDEN_DELAY_KEYS: [&str; 5] = [
+/// The four spellings of "deliver later" a transactional message may not carry: the delay
+/// level plus the three 5.x timer forms. A half message is committed exactly as it stands,
+/// so a schedule asked for here could never be honoured — the key alone decides, and the
+/// list is deliberately shorter than the one that classifies a hook context (which also
+/// counts the trace-only `__STARTDELIVERTIME`).
+const TRANSACTION_FORBIDDEN_DELAY_KEYS: [&str; 4] = [
     PROPERTY_DELAY_TIME_LEVEL,
-    PROPERTY_DELAY_TIME,
-    "TIMER_DELAY_MS",
-    "TIMER_DELAY_SEC",
-    "TIMER_DELIVER_MS",
+    PROPERTY_TIMER_DELAY_SEC,
+    PROPERTY_TIMER_DELAY_MS,
+    PROPERTY_TIMER_DELIVER_MS,
 ];
 
 impl DefaultMQProducer {
@@ -5154,13 +5156,50 @@ mod tests {
             }
         }
         let p = producer("GID_txn_delay");
-        let mut msg = Message::new("T1", Some(b"x"));
-        msg.put_property(PROPERTY_DELAY_TIME_LEVEL, "3");
-        // not started: blaming either the listener or the arguments is reasonable here; all that is required is that it is not a panic
-        assert!(p
-            .send_message_in_transaction(&mut msg, Some(Arc::new(L)), None)
+        let listener: Arc<dyn TransactionListener> = Arc::new(L);
+
+        // The key alone decides: "3", a "0" and an empty value all stamp a schedule the
+        // committed half message cannot carry. The producer is not started, which matters
+        // not — the refusal happens before the send path is reached.
+        for name in TRANSACTION_FORBIDDEN_DELAY_KEYS {
+            for value in ["3", "0", ""] {
+                let mut msg = Message::new("T1", Some(b"x"));
+                msg.put_property(name, value);
+                let err = p
+                    .send_message_in_transaction(&mut msg, Some(listener.clone()), None)
+                    .await
+                    .err()
+                    .map(|e| e.to_string())
+                    .unwrap_or_default();
+                assert!(
+                    err.contains("Transactional messages do not support delayed delivery"),
+                    "{name}={value:?}: {err}"
+                );
+                assert!(
+                    msg.get_property(PROPERTY_TRANSACTION_PREPARED).is_none(),
+                    "a refused message must carry no half-message marker"
+                );
+                assert!(
+                    msg.get_property(PROPERTY_PRODUCER_GROUP).is_none(),
+                    "a refused message must carry no producer group"
+                );
+            }
+        }
+
+        // Only those four names refuse; DELAY_TIME is not one of them, so the send path is
+        // reached and fails for some other reason (here: no client yet).
+        let mut lookalike = Message::new("T1", Some(b"x"));
+        lookalike.put_property("DELAY_TIME", "3");
+        let text = p
+            .send_message_in_transaction(&mut lookalike, Some(listener.clone()), None)
             .await
-            .is_err());
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            !text.contains("Transactional messages do not support delayed delivery"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -5203,7 +5242,7 @@ mod tests {
         // the transaction list lacks __STARTDELIVERTIME: the two lists really differ, pinned so they cannot be merged by accident
         assert!(!TRANSACTION_FORBIDDEN_DELAY_KEYS.contains(&"__STARTDELIVERTIME"));
         assert!(DELAY_PROPERTY_KEYS.contains(&"__STARTDELIVERTIME"));
-        assert_eq!(TRANSACTION_FORBIDDEN_DELAY_KEYS.len(), 5);
+        assert_eq!(TRANSACTION_FORBIDDEN_DELAY_KEYS.len(), 4);
         assert_eq!(DELAY_PROPERTY_KEYS.len(), 5);
     }
 

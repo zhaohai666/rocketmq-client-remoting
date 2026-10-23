@@ -61,7 +61,7 @@ repository-wide **duplicate-class-name static guard** (PHP has no module isolati
 when the same FQCN is declared in two files the one autoloaded first silently wins and
 the other dies — this guard cannot be skipped), then chains **23** suites — the list is derived
 from `tests/Run*.php`, so a new suite cannot silently stay out of the check. Measured today:
-**guard CLEAN, all 4,109 assertions across the 24 suites pass**; any failure exits with a
+**guard CLEAN, all 4,123 assertions across the 24 suites pass**; any failure exits with a
 non-zero code.
 
 ## Examples
@@ -442,7 +442,7 @@ Assigning the public `$client->socksProxy` property works too; all five client f
 - ✅ Compression: ZLIB (`gzcompress`), pure-PHP LZ4 Frame, ZSTD (CLI preferred, pure-PHP
   fallback)
 - ✅ TLS: CA verification / mTLS / SNI
-- ✅ Offline self-test: 24 suites with 4,109 assertions + the duplicate-class-name static
+- ✅ Offline self-test: 24 suites with 4,123 assertions + the duplicate-class-name static
   guard (measured all green)
 - ✅ Live-cluster verification: the 14 `examples/live_*.php` cases cover the admin surface,
   redelivery / dead-letter, pull mode, queue-change listening, POP, TLS, Request-Reply,

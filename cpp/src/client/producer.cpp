@@ -1807,8 +1807,17 @@ void DefaultMQProducer::checkTransactionState(const RemotingCommand& cmd, const 
 TransactionSendResult DefaultMQProducer::sendMessageInTransaction(const Message& msg,
                                                                   TransactionListener& listener,
                                                                   const std::string& arg) {
-    if (msg.getProperty(MessageConst::PROPERTY_DELAY_TIME_LEVEL).size() > 0) {
-        throw MQClientException("Transactional messages do not support delayed delivery");
+    // A half message is committed exactly as it stands, so no schedule asked for here can be
+    // honoured. The key alone decides: a "0" or an empty value asks for nothing yet is still a
+    // stamp this path cannot carry, so the map is consulted -- getProperty() folds an absent
+    // key and an empty value into the same empty string.
+    static constexpr const char* const scheduleKeys[] = {
+        MessageConst::PROPERTY_DELAY_TIME_LEVEL, MessageConst::PROPERTY_TIMER_DELAY_SEC,
+        MessageConst::PROPERTY_TIMER_DELAY_MS, MessageConst::PROPERTY_TIMER_DELIVER_MS};
+    for (const char* key : scheduleKeys) {
+        if (msg.getProperties().count(key) > 0) {
+            throw MQClientException("Transactional messages do not support delayed delivery");
+        }
     }
 
     MQClientInstance& c = client();

@@ -107,6 +107,12 @@ add_executable(rmq_test_producer_async test_producer_async.cpp)
 target_link_libraries(rmq_test_producer_async PRIVATE rocketmq::remoting)
 add_test(NAME producer_async COMMAND rmq_test_producer_async)
 
+# Transactional-send schedule guard: which properties refuse a half message, and what a refusal
+# leaves behind on the caller's message
+add_executable(rmq_test_transaction_guard test_transaction_guard.cpp)
+target_link_libraries(rmq_test_transaction_guard PRIVATE rocketmq::remoting)
+add_test(NAME transaction_guard COMMAND rmq_test_transaction_guard)
+
 # Async-send backpressure primitives: fairness (only the head can take) + in-place runtime capacity change (in-flight retained, waiters woken)
 add_executable(rmq_test_backpressure test_backpressure.cpp)
 target_link_libraries(rmq_test_backpressure PRIVATE rocketmq::remoting)

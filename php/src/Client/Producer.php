@@ -2653,8 +2653,12 @@ class DefaultMQProducer
         $prevBody = (string) $msg->getBody();
         $msg->setTopic($this->withNamespace($msg->getTopic()));
 
-        foreach ([MessageConst::PROPERTY_DELAY_TIME_LEVEL, MessageConst::PROPERTY_DELAY_TIME,
-            'TIMER_DELAY_MS', 'TIMER_DELAY_SEC', 'TIMER_DELIVER_MS'] as $key) {
+        // A half message is committed exactly as it stands, so no schedule asked for
+        // here can be honoured. The key alone decides: a "0" or an empty value asks for
+        // nothing yet is still a stamp this path cannot carry.
+        foreach ([MessageConst::PROPERTY_DELAY_TIME_LEVEL,
+            MessageConst::PROPERTY_TIMER_DELAY_SEC, MessageConst::PROPERTY_TIMER_DELAY_MS,
+            MessageConst::PROPERTY_TIMER_DELIVER_MS] as $key) {
             if ($msg->getProperty($key) !== null) {
                 throw new MQClientException('Transactional messages do not support delayed delivery', null);
             }

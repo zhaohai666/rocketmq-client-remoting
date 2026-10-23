@@ -344,6 +344,38 @@ def test_transaction_without_listener_still_leaves_the_message_untouched():
     assert msg.body == ORIGINAL
 
 
+def test_transaction_refuses_a_message_holding_any_schedule_property():
+    # A half message is committed exactly as it stands, so a schedule asked for here
+    # could never be honoured. The key alone decides: "3", a "0" and an empty value
+    # are all a stamp the transaction path cannot carry.
+    for value in ("3", "0", ""):
+        for name in ("DELAY", "TIMER_DELAY_SEC", "TIMER_DELAY_MS", "TIMER_DELIVER_MS"):
+            p = _producer()
+            msg = Message("TopicTest", b"x")
+            msg.put_property(name, value)
+
+            with pytest.raises(MQClientException) as info:
+                p.send_message_in_transaction(msg, _Listener())
+
+            assert "do not support delayed delivery" in str(info.value), (name, value)
+            assert p._mq_client.topics == [], "the refused half message must not reach the wire"
+
+
+def test_transaction_sends_a_message_holding_an_unrelated_property():
+    # Only the four schedule spellings refuse a transactional send. "DELAY_TIME"
+    # looks like one and is not one; a property that merely resembles a delay
+    # request must still commit, or the guard would reject messages asking for
+    # nothing at all.
+    for name in ("DELAY_TIME", "SOME_USER_PROPERTY"):
+        p = _producer()
+        msg = Message("TopicTest", b"x")
+        msg.put_property(name, "3")
+
+        result = p.send_message_in_transaction(msg, _Listener())
+
+        assert result.local_transaction_state == LocalTransactionState.COMMIT_MESSAGE, name
+
+
 # ---------------------------------------------------------------- The criterion itself
 def test_compress_helper_is_deterministic_so_the_two_sends_are_comparable():
     """The assertions above use "the bytes on the wire are identical twice" to judge that compression ran twice; pin this premise down first."""

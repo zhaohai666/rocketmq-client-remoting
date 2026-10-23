@@ -3154,15 +3154,19 @@ public class DefaultMQProducer
             throw new MQClientException("tranExecutor is null");
         }
 
-        // ensureNotDelayedForTransactional: transactional messages do not support delayed
-        // delivery.
-        // Note: C#'s DelayTimeLevel property has a default value of 0 (the getter returns 0 for a
-        // missing key), so we must check whether the key is really present in properties -- the
-        // property value alone is not enough.
-        if (msg.Properties.TryGetValue(MessageConst.PropertyDelayTimeLevel, out string? dl)
-            && !string.IsNullOrEmpty(dl))
+        // A half message is committed exactly as it stands, so no schedule asked for here
+        // can be honoured. The key alone decides: the four schedule spellings refuse even
+        // when their value asks for nothing, because a stamped property is a stamped
+        // property. Checked on the map, not through the accessors — DelayTimeLevel reads 0
+        // for a missing key, which is not the same question.
+        foreach (string key in new[] {
+                MessageConst.PropertyDelayTimeLevel, MessageConst.PropertyTimerDelaySec,
+                MessageConst.PropertyTimerDelayMs, MessageConst.PropertyTimerDeliverMs })
         {
-            throw new MQClientException("Transactional messages do not support delayed delivery");
+            if (msg.Properties.ContainsKey(key))
+            {
+                throw new MQClientException("Transactional messages do not support delayed delivery");
+            }
         }
 
         MQClientInstance c = GetClient();

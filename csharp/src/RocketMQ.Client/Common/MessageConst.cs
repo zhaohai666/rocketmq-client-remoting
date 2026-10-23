@@ -51,7 +51,6 @@ public static class MessageConst
 
     public const string PropertyFirstPopTime = "1ST_POP_TIME";
     public const string PropertyInvisibleTime = "INVISIBLE_TIME";
-    public const string PropertyDelayTime = "DELAY_TIME";
     public const string PropertyStartTime = "START_TIME";
     public const string PropertyEndTime = "END_TIME";
     public const string PropertyExpireTime = "EXPIRE_TIME";

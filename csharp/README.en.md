@@ -36,7 +36,7 @@ Measured on this machine:
 | Command | Result |
 | --- | --- |
 | `dotnet build --no-incremental` | `0 Warning(s)` / `0 Error(s)`, elapsed `00:00:17.94` |
-| `dotnet test tests/RocketMQ.Client.Tests` | `Passed! - Failed: 0, Passed: 1015, Skipped: 0, Total: 1015, Duration: 4 m 39 s` |
+| `dotnet test tests/RocketMQ.Client.Tests` | `Passed! - Failed: 0, Passed: 1030, Skipped: 0, Total: 1030, Duration: 4 m 34 s` |
 
 `Directory.Build.props` turns `TreatWarningsAsErrors=true` on globally, so "builds" means "builds with
 zero warnings". The test summary line follows the machine locale — grep for `Passed!` / `Failed:` when
@@ -524,7 +524,7 @@ connection.
   FilterMessage hooks, ACL signing, dynamic NameServer addressing, fault-avoiding queue selection
 - ✅ Compression: zlib / LZ4 / ZSTD; TLS: `SslStream`, test-mode plus strict verification / mTLS
 - ✅ Client logging: size-based rotation, dual output to stderr and file
-- ✅ 1015 unit tests; 40 live-cluster subcommands in `rmq` (master/slave, fault injection,
+- ✅ 1030 unit tests; 40 live-cluster subcommands in `rmq` (master/slave, fault injection,
   compression interoperability matrix)
 
 ## Client Logging

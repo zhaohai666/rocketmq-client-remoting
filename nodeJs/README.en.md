@@ -24,7 +24,7 @@ git clone <this repo> && cd rocketmq-client-remoting/nodeJs
 node --experimental-strip-types selfcheck.ts
 ```
 
-`selfcheck.ts` loads all **65** modules under `src/` and then runs the **34** offline smoke suites (both lists are derived from the tree, so a new file cannot slip past the check); measured **ALL GREEN** on 2026-10-23, **1054** checks in total. Run a single suite with `node --experimental-strip-types test/<suite>.ts`; measured results:
+`selfcheck.ts` loads all **65** modules under `src/` and then runs the **35** offline smoke suites (both lists are derived from the tree, so a new file cannot slip past the check); measured **ALL GREEN** on 2026-10-23, **1071** checks in total. Run a single suite with `node --experimental-strip-types test/<suite>.ts`; measured results:
 
 | Suite | Measured |
 | --- | --- |
@@ -61,6 +61,7 @@ node --experimental-strip-types selfcheck.ts
 | `test/socks_smoke.ts` (SOCKS proxy handshake + proxied connect) | 51 passed / 0 failed |
 | `test/static_topic_smoke.ts` | 29 passed / 0 failed |
 | `test/stats_smoke.ts` | 14 passed / 0 failed |
+| `test/transaction_schedule_guard_smoke.ts` (transactional send refuses a scheduled half message) | 17 passed / 0 failed |
 | `test/vip_channel_smoke.ts` (VIP channel port-2 rewrite) | 36 passed / 0 failed |
 
 ### Packaging / npm consumption (tarball and registry)
@@ -395,7 +396,7 @@ nodeJs/
 │                        # allocation/offset-store/consume-stats/tracing/back-pressure/traceparent
 ├── examples/            # live real-cluster tools (see "Live Cluster Verification")
 ├── test/                # offline smoke suites (protocol round-trip, auto-batch and retry, the backpressure gate, allocation, offsets, tracing, stats, namespace, POP, admin)
-├── selfcheck.ts         # one-shot offline check (module load + 34 smoke suites)
+├── selfcheck.ts         # one-shot offline check (module load + 35 smoke suites)
 └── package.json         # engines: node >= 22
 ```
 

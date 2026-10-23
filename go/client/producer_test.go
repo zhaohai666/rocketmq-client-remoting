@@ -683,13 +683,34 @@ func TestProducerTransactionRejectsDelay(t *testing.T) {
 	p, broker, _ := startProducerFixture(t, topic, "GID_prod_txdelay")
 
 	listener := &recordingTransactionListener{executeState: CommitMessage}
-	msg := common.NewMessage(topic, []byte("x"))
-	msg.SetDelayTimeLevel(3)
-	if _, err := p.SendMessageInTransaction(msg, listener, nil); err == nil {
-		t.Fatal("a delayed transactional message must be rejected")
+	// A half message is committed exactly as it stands, so no schedule asked for
+	// here can be honoured. The key alone decides: "3", a "0" and an empty value
+	// are all a stamp the transaction path cannot carry.
+	for _, name := range []string{
+		common.PropertyDelayTimeLevel, common.PropertyTimerDelaySec,
+		common.PropertyTimerDelayMs, common.PropertyTimerDeliverMs,
+	} {
+		for _, value := range []string{"3", "0", ""} {
+			msg := common.NewMessage(topic, []byte("x"))
+			msg.PutProperty(name, value)
+			if _, err := p.SendMessageInTransaction(msg, listener, nil); err == nil {
+				t.Fatalf("a transactional message with %s=%q must be rejected", name, value)
+			}
+		}
 	}
 	if got := len(broker.requests(remoting.ReqSendMessageV2)); got != 0 {
 		t.Errorf("no request must go out, got %d", got)
+	}
+
+	// Only the four schedule keys refuse a transactional send; a property that
+	// merely resembles one still goes out.
+	lookalike := common.NewMessage(topic, []byte("x"))
+	lookalike.PutProperty("DELAY_TIME", "3")
+	if _, err := p.SendMessageInTransaction(lookalike, listener, nil); err != nil {
+		t.Fatalf("an unrelated property must not be read as a schedule request: %v", err)
+	}
+	if got := len(broker.requests(remoting.ReqSendMessageV2)); got != 1 {
+		t.Errorf("the accepted half message must go out exactly once, got %d", got)
 	}
 }
 

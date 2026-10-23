@@ -55,7 +55,6 @@ const (
 	// client only backfills it when missing.
 	PropertyFirstPopTime    = "1ST_POP_TIME"
 	PropertyInvisibleTime   = "INVISIBLE_TIME"
-	PropertyDelayTime       = "DELAY_TIME"
 	PropertyStartTime       = "START_TIME"
 	PropertyEndTime         = "END_TIME"
 	PropertyExpireTime      = "EXPIRE_TIME"

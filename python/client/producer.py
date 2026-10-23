@@ -718,7 +718,9 @@ class DefaultMQProducer:
         if msg.get_property(MessageConst.PROPERTY_TRANSACTION_PREPARED) == "true":
             context.msg_type = MessageType.TRANS_MSG_HALF
         for key in ("__STARTDELIVERTIME", MessageConst.PROPERTY_DELAY_TIME_LEVEL,
-                    "TIMER_DELIVER_MS", "TIMER_DELAY_SEC", "TIMER_DELAY_MS"):
+                    MessageConst.PROPERTY_TIMER_DELIVER_MS,
+                    MessageConst.PROPERTY_TIMER_DELAY_SEC,
+                    MessageConst.PROPERTY_TIMER_DELAY_MS):
             if msg.get_property(key) is not None:
                 context.msg_type = MessageType.DELAY_MSG
                 break
@@ -1681,11 +1683,14 @@ class DefaultMQProducer:
         prev_body = msg.body
         msg.topic = self._with_namespace(msg.topic)
 
+        # A half message is committed as it is, so a schedule asked for here could
+        # never be honoured by the broker's check-back. The key alone decides: a
+        # literal "0" or "" still asks for nothing, yet a caller that stamped the
+        # property is holding a message the transaction path cannot carry.
         for key in (MessageConst.PROPERTY_DELAY_TIME_LEVEL,
-                    MessageConst.PROPERTY_DELAY_TIME,
-                    getattr(MessageConst, "PROPERTY_TIMER_DELAY_MS", "__none__"),
-                    getattr(MessageConst, "PROPERTY_TIMER_DELAY_SEC", "__none__"),
-                    getattr(MessageConst, "PROPERTY_TIMER_DELIVER_MS", "__none__")):
+                    MessageConst.PROPERTY_TIMER_DELAY_SEC,
+                    MessageConst.PROPERTY_TIMER_DELAY_MS,
+                    MessageConst.PROPERTY_TIMER_DELIVER_MS):
             if msg.get_property(key) is not None:
                 raise MQClientException(
                     "Transactional messages do not support delayed delivery", None)

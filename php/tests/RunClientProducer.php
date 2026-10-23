@@ -1799,14 +1799,57 @@ final class RunClientProducer
         $this->checkSame('7', (string) ($checkEnd['ext']['tranStateTableOffset'] ?? ''), 'check: offsets taken from the check header');
         $this->checkSame('99', (string) ($checkEnd['ext']['commitLogOffset'] ?? ''), 'check: commitLogOffset taken from the check header');
 
-        // Delay property rejected
-        $delayed = new Message('TransTopic', 'd');
-        $delayed->putProperty(MessageConst::PROPERTY_DELAY_TIME_LEVEL, '1');
-        $this->checkThrows(
-            fn() => $p->sendMessageInTransaction($delayed, $checkListener),
-            MQClientException::class,
-            'transactional message rejects delayed delivery'
-        );
+        // Every schedule spelling refuses a transactional send, and the key alone
+        // decides: "3", a "0" and an empty value all stamp a schedule the committed
+        // half message cannot carry.
+        $refusalText = static function (Message $m) use ($p, $checkListener): string {
+            try {
+                $p->sendMessageInTransaction($m, $checkListener);
+                return '<no error>';
+            } catch (\Throwable $e) {
+                return $e->getMessage();
+            }
+        };
+        $scheduleNames = [
+            MessageConst::PROPERTY_DELAY_TIME_LEVEL,
+            MessageConst::PROPERTY_TIMER_DELAY_SEC,
+            MessageConst::PROPERTY_TIMER_DELAY_MS,
+            MessageConst::PROPERTY_TIMER_DELIVER_MS,
+        ];
+        foreach ($scheduleNames as $name) {
+            foreach (['3', '0', ''] as $value) {
+                $stamped = new Message('TransTopic', 'd');
+                $stamped->putProperty($name, $value);
+                $this->checkSame(
+                    'Transactional messages do not support delayed delivery',
+                    $refusalText($stamped),
+                    "a transactional message with {$name}={$value} is refused"
+                );
+            }
+        }
+        // A refusal must not leave the half-message markers behind: the message the
+        // caller handed in is still an ordinary message.
+        $untouched = new Message('TransTopic', 'd');
+        $untouched->putProperty(MessageConst::PROPERTY_TIMER_DELIVER_MS, '1700000000000');
+        $refusalText($untouched);
+        $this->check($untouched->getProperty(MessageConst::PROPERTY_TRANSACTION_PREPARED) === null,
+            'a refused message carries no half-message marker');
+        $this->check($untouched->getProperty(MessageConst::PROPERTY_PRODUCER_GROUP) === null,
+            'a refused message carries no producer group');
+        // Only those four names refuse. DELAY_TIME is not a schedule spelling, so the send
+        // path is reached and fails for some other reason (here: no client yet).
+        $lookalike = new Message('TransTopic', 'l');
+        $lookalike->putProperty('DELAY_TIME', '3');
+        $idle = new TransactionMQProducer('GID-trans-lookalike');
+        $idle->setInstanceName('trans-lookalike-inst');
+        $lookalikeText = '';
+        try {
+            $idle->sendMessageInTransaction($lookalike, $checkListener);
+        } catch (\Throwable $e) {
+            $lookalikeText = $e->getMessage();
+        }
+        $this->check($lookalikeText !== 'Transactional messages do not support delayed delivery',
+            'DELAY_TIME is not a schedule spelling');
 
         // TransactionMQProducer without listener → throws
         $noListener = new TransactionMQProducer('GID-trans-none');
