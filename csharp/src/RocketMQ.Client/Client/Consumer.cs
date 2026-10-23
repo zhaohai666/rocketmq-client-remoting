@@ -101,8 +101,10 @@ public sealed class PopProcessQueue
         lock (_lock) { _waitAckCounter += n; }
     }
 
-    /// <summary>The parameter is "how much to subtract" (a positive count),
-    /// not a negative delta.</summary>
+    /// <summary>Accumulates the argument as given, so decrementing the debt means
+    /// passing a negative count: <c>DecFoundMsg(-msgs.Count)</c>. The consume-result
+    /// path relies on that, and a caller that handed over a positive count would
+    /// raise the debt instead of writing it off.</summary>
     public void DecFoundMsg(int n)
     {
         lock (_lock) { _waitAckCounter += n; }
@@ -3085,6 +3087,39 @@ public sealed class DefaultMQPushConsumer
         return true;
     }
 
+    /// <summary>The POP path's cache gate: **this queue's own** popped-but-unacked debt, compared
+    /// strictly greater than <see cref="PopThresholdForQueue"/>. POP keeps no "pulled but not
+    /// consumed" buffer, so the count / size / span checks of <see cref="FlowControlHit"/> have
+    /// nothing to read here — once a message is popped, consumption has begun and what matters is
+    /// the ack debt. The debt is per queue and never summed, and this threshold is a plain client
+    /// knob: the topic budgets divided at rebalance belong to the pull path and do not move it.
+    /// A hit increments the SAME <see cref="FlowControlTriggered"/> total the pull path uses, so one
+    /// client-wide flow-control count spans both paths and the throttled warn cadence also sees the
+    /// POP trips.</summary>
+    private bool PopFlowControlHit(MessageQueue mq, PopProcessQueue pq)
+    {
+        int waitAck = pq.WaitAckCount();
+        if (waitAck <= PopThresholdForQueue)
+        {
+            return false;
+        }
+
+        long times = Interlocked.Increment(ref _flowControlTriggered);
+        ClientLog.Debug("pop flow control: queue " + mq + " waiting-ack="
+            + waitAck.ToString(CultureInfo.InvariantCulture)
+            + " over popThresholdForQueue=" + PopThresholdForQueue.ToString(CultureInfo.InvariantCulture)
+            + ", pause pop");
+        if (IsFlowControlWarnTrip(times))
+        {
+            ClientLog.Warn("pop flow control: queue " + mq + " the messages waiting to ack ("
+                + waitAck.ToString(CultureInfo.InvariantCulture) + ") exceeds the pop threshold "
+                + PopThresholdForQueue.ToString(CultureInfo.InvariantCulture)
+                + ", so do flow control, pause pop for " + CacheFlowControlBackoffMillis
+                + " ms (flowControlTimes=" + times.ToString(CultureInfo.InvariantCulture) + ")");
+        }
+        return true;
+    }
+
     /// <summary>The number of trips between two WARN lines. A throttled queue trips a cache gate on
     /// every pull round, so warning each round buries the signal in noise. Public for the same
     /// reason as <c>FlowControlHitForTest</c>: the test project has no InternalsVisibleTo.</summary>
@@ -3203,8 +3238,10 @@ public sealed class DefaultMQPushConsumer
                 }
             }
 
-            // Flow control (five thresholds, see FlowControlHit): hitting any
-            // one pauses this queue's pulling
+            // Flow control (the three per-queue gates, see FlowControlHit):
+            // hitting any one pauses this queue's pulling. The topic-level
+            // budgets are not summed here; they were divided into these
+            // per-queue knobs when the assignment last changed.
             if (FlowControlHit(mq, key))
             {
                 _stopEvent.Wait(TimeSpan.FromMilliseconds(CacheFlowControlBackoffMillis));
@@ -3523,11 +3560,12 @@ public sealed class DefaultMQPushConsumer
             }
 
             if (pq is null || pq.IsDropped() || sub is null) return;
-            // Flow control: too many popped-but-unacked, slow down first
-            // (popThresholdForQueue)
-            if (pq.WaitAckCount() > PopThresholdForQueue)
+            // Flow control: this queue has too many popped-but-unacked messages, so hold back
+            // (PopFlowControlHit, against popThresholdForQueue). The trip is counted on the pull
+            // path's flow-control total, so one throttled warn cadence spans both paths.
+            if (PopFlowControlHit(mq, pq))
             {
-                Thread.Sleep(CacheFlowControlBackoffMillis);
+                _stopEvent.Wait(TimeSpan.FromMilliseconds(CacheFlowControlBackoffMillis));
                 continue;
             }
 
@@ -3547,10 +3585,20 @@ public sealed class DefaultMQPushConsumer
                 ClientLog.Debug("pop long-poll timeout for " + key + " (benign): " + e.Message);
                 continue;
             }
+            catch (MQBrokerException e)
+            {
+                // Same split as the pull path: a broker FLOW_CONTROL(215) is a
+                // "busy right now" answer, so retry in 20 ms instead of parking
+                // on the general 500 ms error backoff.
+                ClientLog.Debug("pop broker error for " + key + ": " + e.Message);
+                _stopEvent.Wait(TimeSpan.FromMilliseconds(
+                    PullBackoffMillisForBrokerResponse(e.ResponseCode)));
+                continue;
+            }
             catch (Exception e)
             {
                 ClientLog.Debug("pop error for " + key + ": " + e.Message);
-                Thread.Sleep(500);
+                _stopEvent.Wait(TimeSpan.FromMilliseconds(PullExceptionBackoffMillis));
                 continue;
             }
 
@@ -4214,6 +4262,12 @@ public sealed class DefaultMQPushConsumer
     /// <summary>Run one pre-pull flow-control verdict (without the network).
     /// A hit increments <see cref="FlowControlTriggered"/> by one.</summary>
     public bool FlowControlHitForTest(MessageQueue mq, string key) => FlowControlHit(mq, key);
+
+    /// <summary>Run one POP cache-gate verdict (without the network): this
+    /// queue's own wait-ack debt against <see cref="PopThresholdForQueue"/>.
+    /// A hit increments <see cref="FlowControlTriggered"/> by one.</summary>
+    public bool PopFlowControlHitForTest(MessageQueue mq, PopProcessQueue pq)
+        => PopFlowControlHit(mq, pq);
 
     /// <summary>Unit-test entry: divide the enabled topic-level budgets over the
     /// queues this consumer owns right now (see

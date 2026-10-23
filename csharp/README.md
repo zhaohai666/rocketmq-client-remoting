@@ -11,7 +11,7 @@ NameServer（取路由、动态取址）与 Broker（收发消息、心跳、位
   zlib 走内置 `ZLibStream`，LZ4 / ZSTD 通过 P/Invoke 调系统库。
 - 一个库覆盖生产者、Push / Pull / LitePull 三种消费者、管理端、消息轨迹、ACL、TLS。
 - 能力在真实 RocketMQ 5.5.1 集群（namesrv 9876 + broker 10911）上逐条联调，
-  离线行为由 1043 项单元测试锁死。
+  离线行为由 1045 项单元测试锁死。
 
 ## 先决条件
 
@@ -33,7 +33,7 @@ dotnet test tests/RocketMQ.Client.Tests
 | 命令 | 结果 |
 | --- | --- |
 | `dotnet build --no-incremental` | `0 个警告` / `0 个错误`，用时 `00:00:17.94` |
-| `dotnet test tests/RocketMQ.Client.Tests` | `已通过! - 失败:     0，通过:  1043，已跳过:     0，总计:  1043，持续时间: 4 m 38 s` |
+| `dotnet test tests/RocketMQ.Client.Tests` | `已通过! - 失败:     0，通过:  1045，已跳过:     0，总计:  1045，持续时间: 4 m 36 s` |
 
 `Directory.Build.props` 里 `TreatWarningsAsErrors=true` 全局生效，所以「构建通过」等价于「零 warning」。
 测试输出跟随系统区域设置，中文 locale 下汇总行是中文，检索时按 `总计:` 匹配。
@@ -268,7 +268,7 @@ consumer.PopMode = true;
 consumer.PopInvisibleTime = 60_000;      // 合法区间 5000 ~ 300000
 consumer.PopBatchNums = 32;
 consumer.PopPollTimeMillis = 15_000;
-consumer.PopThresholdForQueue = 96;
+consumer.PopThresholdForQueue = 96;      // 本队列待 ack 上限，严格大于才停（命中记进拉取路径同一个流控计数）
 ```
 
 常用调优：`ConsumeFromWhere = ConsumeFromWhere.ConsumeFromFirstOffset`（另有
@@ -493,6 +493,7 @@ producer.TlsOptions = new TlsOptions
 - ✅ 发送：同步 / 定点 / 队列选择器 / 批量（320）/ 自动攒批 / 单向 / 异步（发送池 + 公平背压信号量）/
   事务（两阶段 + broker 回查）/ 定时与延迟 / 撤回（recallMessage）/ Request-Reply
 - ✅ 消费：Push（长轮询 + POP + 顺序 + 广播 + 位点持久化 + 启动期数值校验 + 拉取前流控 +
+  POP 的待 ack 欠账闸门（默认 96，严格大于才停，命中记进拉取路径同一个流控计数）+
   挂起 listener 的清扫逃生口）、Pull（带消费者心跳）、LitePull（拉取 / 已消费 / 待提交三张位点表 +
   队列集合变更监听）
 - ✅ 队列分配：六种可插拔策略
@@ -503,7 +504,7 @@ producer.TlsOptions = new TlsOptions
   发送 / 消费 / 事务 / Forbidden / FilterMessage 钩子、ACL 签名、动态 NameServer 取址、故障规避选队列
 - ✅ 压缩：zlib / LZ4 / ZSTD；TLS：`SslStream`，test-mode 与严格校验 / mTLS
 - ✅ 客户端日志：按大小轮转、双写 stderr 与文件
-- ✅ 单元测试 1043 项；`rmq` 真机联调工具 40 条子命令（含主从、故障注入、压缩互通矩阵）
+- ✅ 单元测试 1045 项；`rmq` 真机联调工具 40 条子命令（含主从、故障注入、压缩互通矩阵）
 
 ## 客户端日志
 
@@ -656,7 +657,7 @@ csharp/
 │       ├── BackPressure.cs  Latency.cs  ConsumeExecutor.cs  Schedules（定时任务锚定）
 │       ├── TopAddressing.cs        # 动态 NameServer 取址
 │       ├── ConsumerStats.cs  Validators.cs  ClientException.cs
-├── tests/RocketMQ.Client.Tests/    # xunit，1043 项（编解码/路由/日志/传输/轨迹/异步/流控/位点…）
+├── tests/RocketMQ.Client.Tests/    # xunit，1045 项（编解码/路由/日志/传输/轨迹/异步/流控/位点…）
 └── examples/RocketMQ.Examples/     # rmq 真机联调工具（见上）
 ```
 

@@ -4,6 +4,10 @@
 // bytes; offset span, not count), the per-gate switches and the WARN cadence (once per 1000
 // trips) are each asserted with a paired control, because every one of them fails in the
 // silent direction when judged wrong.
+//
+// The POP queue's gate joins the same assertions at the bottom of the file: it judges the
+// ACK debt of ONE queue and reports on the pull path's counter, so the two modes together
+// give one throttling number per client.
 package client
 
 import (
@@ -331,5 +335,213 @@ func TestFlowControlGateNeverAddsUpTheQueuesOfATopic(t *testing.T) {
 		if reason := c.cacheGateReason(queues[i]); reason != "" {
 			t.Errorf("queue %d stayed at its share but pauses with %q; a full sibling must not spread", i, reason)
 		}
+	}
+}
+
+// ---------------------------------------------------------------- the POP gate
+
+// The POP queue carries no buffer, only the ACK debt, so its gate reads that debt —
+// and the trip has to land on the same counter the pull gates use: one throttling
+// number per client, not one per consumption mode. Each leg below sits next to the
+// control that goes red when the sharing, the direction, or the cadence is reverted.
+
+// popFCStage gives the consumer one POP queue owing the given number of ACKs, the
+// way a pop round leaves it, and returns its state.
+func popFCStage(c *DefaultMQPushConsumer, index int32, waitAck int) *popProcessQueue {
+	pq := newPopProcessQueue()
+	pq.IncFoundMsg(waitAck)
+	c.mu.Lock()
+	c.popQueueTable[fcQueue(index)] = pq
+	c.mu.Unlock()
+	return pq
+}
+
+// popFCHit asks the POP gate once, exactly as the pop loop does.
+func popFCHit(c *DefaultMQPushConsumer, index int32, waitAck int) bool {
+	return c.popFlowControlHit(fcQueue(index), popFCStage(c, index, waitAck))
+}
+
+// fcSeedTrips moves the shared counter to a chosen trip number, so the cadence can
+// be pinned at its boundary without running a thousand real trips.
+func fcSeedTrips(c *DefaultMQPushConsumer, times int64) {
+	c.mu.Lock()
+	c.flowControlTriggered = times
+	c.mu.Unlock()
+}
+
+func TestPopFlowControlGateIsStrictlyGreater(t *testing.T) {
+	c := fcConsumer(t, "GID_go_pop_fc_strict")
+	c.SetPopThresholdForQueue(3)
+
+	if popFCHit(c, 0, 2) {
+		t.Errorf("2 waiting ACKs at threshold 3 must not trip")
+	}
+	// Reaching the threshold exactly still pops; a queue may hold that many.
+	// Reverting ">" to ">=" reddens this leg.
+	if popFCHit(c, 0, 3) {
+		t.Errorf("3 waiting ACKs at threshold 3 must not trip: the gate is >, not >=")
+	}
+	if !popFCHit(c, 0, 4) {
+		t.Errorf("4 waiting ACKs at threshold 3 must trip")
+	}
+	// Only the trip records a tick — the two non-trips above must have left the
+	// counter alone, so a helper that incremented before judging is caught here.
+	if got := fcTriggered(c); got != 1 {
+		t.Errorf("flowControlTriggered = %d, want exactly 1 (one judgment records one tick)", got)
+	}
+
+	// Same arithmetic at the shipped default, which the knob starts at: 96 outstanding
+	// ACKs is what the queue may hold, the 97th pauses it.
+	if defaultPopThresholdForQueue != 96 {
+		t.Errorf("default popThresholdForQueue = %d, want 96", defaultPopThresholdForQueue)
+	}
+	d := fcConsumer(t, "GID_go_pop_fc_default")
+	if got := d.popThresholdForQueueValue(); got != defaultPopThresholdForQueue {
+		t.Fatalf("a fresh consumer's popThresholdForQueue = %d, want the default %d", got, defaultPopThresholdForQueue)
+	}
+	if popFCHit(d, 0, 96) {
+		t.Errorf("96 waiting ACKs at the default threshold of 96 must not trip")
+	}
+	if !popFCHit(d, 0, 97) {
+		t.Errorf("97 waiting ACKs at the default threshold of 96 must trip")
+	}
+	if got := fcTriggered(d); got != 1 {
+		t.Errorf("flowControlTriggered = %d, want 1: only the 97-ACK round ticked", got)
+	}
+}
+
+// A nil queue state (the loop lost it between rounds) is not a trip: the gate has no
+// debt to read, so it must not pause nor tick.
+func TestPopFlowControlHitIgnoresAMissingQueueState(t *testing.T) {
+	c := fcConsumer(t, "GID_go_pop_fc_nil")
+	c.SetPopThresholdForQueue(0)
+	if c.popFlowControlHit(fcQueue(0), nil) {
+		t.Errorf("a queue with no state must not be reported as flow-controlled")
+	}
+	if got := fcTriggered(c); got != 0 {
+		t.Errorf("flowControlTriggered = %d, want 0: a missing state records nothing", got)
+	}
+}
+
+// One pull hit plus one POP hit on the SAME consumer read 2, in either order: this is
+// the assertion that fails when the POP gate keeps a counter of its own or none.
+func TestPopFlowControlHitSharesThePullPathCounter(t *testing.T) {
+	c := fcConsumer(t, "GID_go_pop_fc_shared")
+	c.SetPullThresholdForQueue(1)
+	c.SetPopThresholdForQueue(1)
+
+	if !c.flowControlHit(fcQueue(0), fcStageQueue(c, 0, 2, 10)) {
+		t.Fatalf("2 buffered messages over a count gate of 1 must pause the pull loop")
+	}
+	if got := fcTriggered(c); got != 1 {
+		t.Fatalf("flowControlTriggered = %d after the pull hit, want 1", got)
+	}
+	if !popFCHit(c, 0, 2) {
+		t.Fatalf("2 waiting ACKs over a pop gate of 1 must pause the pop loop")
+	}
+	if got := fcTriggered(c); got != 2 {
+		t.Errorf("flowControlTriggered = %d after one pull hit and one POP hit, want 2: both paths must report on one counter", got)
+	}
+
+	// The reverse order on a fresh consumer: the POP hit takes trip 1 and the pull
+	// hit still lands on it, so neither path can own a private counter.
+	d := fcConsumer(t, "GID_go_pop_fc_shared_rev")
+	d.SetPullThresholdForQueue(1)
+	d.SetPopThresholdForQueue(1)
+	if !popFCHit(d, 0, 2) {
+		t.Fatalf("2 waiting ACKs over a pop gate of 1 must pause the pop loop")
+	}
+	if got := fcTriggered(d); got != 1 {
+		t.Fatalf("flowControlTriggered = %d after the POP hit, want 1", got)
+	}
+	if !d.flowControlHit(fcQueue(0), fcStageQueue(d, 0, 2, 10)) {
+		t.Fatalf("2 buffered messages over a count gate of 1 must pause the pull loop")
+	}
+	if got := fcTriggered(d); got != 2 {
+		t.Errorf("flowControlTriggered = %d after one POP hit and one pull hit, want 2", got)
+	}
+}
+
+// The POP trips are numbered off the shared counter, so they inherit the WARN cadence.
+// The counter is seeded at the boundary instead of running a thousand real trips.
+func TestPopFlowControlTripJoinsTheWarnCadence(t *testing.T) {
+	c := fcConsumer(t, "GID_go_pop_fc_cadence")
+	c.SetPopThresholdForQueue(1)
+
+	if !popFCHit(c, 0, 2) {
+		t.Fatalf("the first POP hit must trip the gate")
+	}
+	if got := fcTriggered(c); got != 1 || !isFlowControlWarnTrip(got) {
+		t.Errorf("the first POP trip (getter says %d) must log a WARN", got)
+	}
+	if !popFCHit(c, 0, 2) {
+		t.Fatalf("the second POP hit must trip the gate")
+	}
+	if got := fcTriggered(c); got != 2 || isFlowControlWarnTrip(got) {
+		t.Errorf("trip %d must stay on the debug channel only", got)
+	}
+
+	// The trip that lands one past the cadence period warns, and the one before the
+	// boundary does not. A POP path that warned every round, or never, breaks one of
+	// these two legs; one that did not touch the counter breaks both.
+	fcSeedTrips(c, flowControlWarnEvery)
+	if !popFCHit(c, 0, 2) {
+		t.Fatalf("the hit past the seeded boundary must trip the gate")
+	}
+	if got := fcTriggered(c); got != flowControlWarnEvery+1 || !isFlowControlWarnTrip(got) {
+		t.Errorf("trip %d (getter says %d) must log a WARN", flowControlWarnEvery+1, got)
+	}
+
+	fcSeedTrips(c, flowControlWarnEvery-1)
+	if !popFCHit(c, 0, 2) {
+		t.Fatalf("the hit just before the boundary must trip the gate")
+	}
+	if got := fcTriggered(c); got != flowControlWarnEvery || isFlowControlWarnTrip(got) {
+		t.Errorf("trip %d (getter says %d) must stay silent", flowControlWarnEvery, got)
+	}
+}
+
+// The gate judges THIS queue's own debt and never adds up the topic's POP queues: the
+// empty sibling keeps popping although its sibling alone exceeds the threshold, and
+// the over-threshold queue ticks exactly once. A summing gate reddens the sibling leg
+// and the tick count.
+func TestPopFlowControlGateJudgesOnlyThisQueuesDebt(t *testing.T) {
+	c := fcConsumer(t, "GID_go_pop_fc_per_queue")
+	c.SetPopThresholdForQueue(3)
+
+	full := popFCStage(c, 0, 4)
+	empty := popFCStage(c, 1, 0)
+	atLimit := popFCStage(c, 2, 3)
+
+	if !c.popFlowControlHit(fcQueue(0), full) {
+		t.Errorf("a queue over its own threshold must pause")
+	}
+	if c.popFlowControlHit(fcQueue(1), empty) {
+		t.Errorf("an empty queue pauses although its sibling is over the threshold: the gate must not add up the topic's queues")
+	}
+	if c.popFlowControlHit(fcQueue(2), atLimit) {
+		t.Errorf("a queue exactly at the threshold pauses although a sibling owes more: neither the sum nor >= belongs here")
+	}
+	if got := fcTriggered(c); got != 1 {
+		t.Errorf("flowControlTriggered = %d, want 1: only the over-threshold queue records a tick", got)
+	}
+}
+
+// The POP threshold is a plain per-queue knob: the rebalance division that turns the
+// two topic-level budgets into per-queue ones leaves it alone, so a hand-set POP
+// threshold means the same number of outstanding ACKs whatever the queue count.
+func TestPopThresholdIsNeverDividedAtRebalance(t *testing.T) {
+	c := fcConsumer(t, "GID_go_pop_fc_no_divide")
+	c.SetPopMode(true)
+	c.SetPullThresholdForTopic(1000)
+	c.SetPopThresholdForQueue(7)
+	ttOwnPopQueues(c, 4)
+
+	c.divideTopicThresholds()
+	if got := c.popThresholdForQueueValue(); got != 7 {
+		t.Errorf("popThresholdForQueue = %d, want the hand-set 7: the POP gate keeps its own per-queue knob", got)
+	}
+	if !popFCHit(c, 0, 8) {
+		t.Errorf("8 waiting ACKs must trip the untouched threshold of 7")
 	}
 }

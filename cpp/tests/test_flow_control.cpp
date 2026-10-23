@@ -1,8 +1,10 @@
-// Unit test for the pre-pull flow-control decision and for the topic-budget division that feeds its
-// per-queue gates -- no cluster needed.
+// Unit test for the pre-pull flow-control decision, for the POP-mode wait-ack gate that shares its
+// hit counter and warn cadence, and for the topic-budget division that feeds the per-queue gates
+// -- no cluster needed.
 #include <random>
 #include <cstdio>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -501,6 +503,242 @@ void testPopModeDividesOverThePopTableAndClassicOverMqMap() {
            std::to_string(m.pullThresholdForQueue()));
 }
 
+// ---------------------------------------------------------------- POP mode: the wait-ack gate
+
+// A pop queue holding `debt` messages that were popped but not acked yet -- exactly what queuePopLoop
+// leaves behind between two rounds (queuePopLoop does incFoundMsg for a found batch, the consume side
+// does ack()).
+std::shared_ptr<PopProcessQueue> popQueueWith(int32_t debt) {
+    auto pq = std::make_shared<PopProcessQueue>();
+    pq->incFoundMsg(debt);
+    return pq;
+}
+
+// The ceiling is a ceiling, not a target: the gate is **strictly greater than** it, exactly like the
+// three pull-side cache gates, so a queue that reached it exactly still pops. Every assertion below is
+// a pair -- the same debt one message later trips -- so an inverted or collapsed comparison goes red.
+void testPopGateBoundaryIsStrictlyOverTheCeiling() {
+    DefaultMQPushConsumer c("GID_PopFlowControlBoundary");
+    const MessageQueue mq = queueOf(kTopic, 0);
+    c.setPopThresholdForQueue(3);
+    expect(!c.popFlowControlHitForTest(mq, popQueueWith(0)), "popGate.nothingUnacked");
+    expect(!c.popFlowControlHitForTest(mq, popQueueWith(2)), "popGate.below");
+    expect(!c.popFlowControlHitForTest(mq, popQueueWith(3)), "popGate.exactlyAtCeiling");
+    expect(c.flowControlTriggered() == 0, "popGate.threeMissesTickNothing",
+           std::to_string(c.flowControlTriggered()));
+    expect(c.popFlowControlHitForTest(mq, popQueueWith(4)), "popGate.oneOverTheCeiling");
+    expect(c.flowControlTriggered() == 1, "popGate.overTicksOnce",
+           std::to_string(c.flowControlTriggered()));
+    // No pop state at all (the queue was revoked before the round) = nothing waits for an ack.
+    expect(!c.popFlowControlHitForTest(mq, nullptr), "popGate.noPopStateIsQuiet");
+    expect(c.flowControlTriggered() == 1, "popGate.noPopStateTicksNothing",
+           std::to_string(c.flowControlTriggered()));
+    // The gate reads THIS round's debt, it is not a latched flag: acking one message back to the
+    // ceiling lets the next round pop again.
+    auto pq = popQueueWith(4);
+    expect(c.popFlowControlHitForTest(mq, pq), "popGate.stillOverTheCeiling");
+    pq->ack();
+    expect(!c.popFlowControlHitForTest(mq, pq), "popGate.drainedBackUnderTheCeiling");
+    expect(c.flowControlTriggered() == 2, "popGate.drainingTicksNothing",
+           std::to_string(c.flowControlTriggered()));
+}
+
+// The default ceiling is 96 and it is NOT one of the two divided knobs: a topic budget rewrites the
+// pull-side knobs only, and the POP gate keeps judging this queue's own debt against popThresholdForQueue.
+void testPopCeilingDefaultsTo96AndIsNeverADividedKnob() {
+    DefaultMQPushConsumer c("GID_PopFlowControlNotDivided");
+    const MessageQueue mq = queueOf(kTopic, 0);
+    expect(c.popThresholdForQueue() == 96, "popDefault.ceilingIs96",
+           std::to_string(c.popThresholdForQueue()));
+    expect(!c.popFlowControlHitForTest(mq, popQueueWith(96)), "popDefault.at96StillPops");
+    expect(c.popFlowControlHitForTest(mq, popQueueWith(97)), "popDefault.at97Trips");
+    expect(c.flowControlTriggered() == 1, "popDefault.firstTripOnly",
+           std::to_string(c.flowControlTriggered()));
+
+    c.setPopMode(true);
+    c.setPullThresholdForQueue(1000);
+    c.setPullThresholdSizeForQueue(100);
+    c.setPullThresholdForTopic(1000);
+    c.setPullThresholdSizeForTopic(8);
+    for (int32_t id = 0; id < 4; id++) {          // 4 owned POP queues
+        c.setPopQueue(DefaultMQPushConsumer::offsetKey(queueOf(kTopic, id)));
+    }
+    c.divideTopicThresholdsForTest();
+    expect(c.pullThresholdForQueue() == 250, "popDefault.pullCountKnobDivided",
+           std::to_string(c.pullThresholdForQueue()));
+    expect(c.pullThresholdSizeForQueue() == 2, "popDefault.pullSizeKnobDivided",
+           std::to_string(c.pullThresholdSizeForQueue()));
+    // The paired control: the two knobs above moved precisely because they are the divided ones; the
+    // POP ceiling is not, so a stray division of it would read 250 here.
+    expect(c.popThresholdForQueue() == 96, "popDefault.popCeilingUnchanged",
+           std::to_string(c.popThresholdForQueue()));
+    expect(!c.popFlowControlHitForTest(mq, popQueueWith(96)), "popDefault.gateStillReads96");
+    expect(c.popFlowControlHitForTest(mq, popQueueWith(97)), "popDefault.gateStillTripsAt97");
+}
+
+// One client-wide counter: a pull trip and a POP trip tick the SAME number, so flowControlTriggered()
+// stays the single "how often did this client throttle itself" reading across both consumption modes.
+void testPopTripSharesThePullFlowControlCounter() {
+    DefaultMQPushConsumer c("GID_PopFlowControlSharedCounter");
+    const MessageQueue mq = queueOf(kTopic, 0);
+    const std::string key = DefaultMQPushConsumer::offsetKey(mq);
+    gatesOffExceptCounts(c);
+    c.setPullThresholdForQueue(1);
+    c.setPopThresholdForQueue(1);
+    expect(c.flowControlTriggered() == 0, "sharedCounter.freshConsumer");
+    stage(c, mq, nSized(kTopic, 100, 2));         // 2 over a ceiling of 1: the pull gate trips
+    expect(c.flowControlHit(mq, key), "sharedCounter.pullRoundTrips");
+    expect(c.flowControlTriggered() == 1, "sharedCounter.pullTickIsOne",
+           std::to_string(c.flowControlTriggered()));
+    expect(c.popFlowControlHitForTest(mq, popQueueWith(2)), "sharedCounter.popRoundTrips");
+    // The load-bearing assertion: reverts to a POP gate with a counter of its own (or with none) go red here.
+    expect(c.flowControlTriggered() == 2, "sharedCounter.bothPathsTickOneCounter",
+           std::to_string(c.flowControlTriggered()));
+    // Paired controls: a miss on either path adds nothing to the shared number.
+    expect(!c.popFlowControlHitForTest(mq, popQueueWith(1)), "sharedCounter.popMissStaysQuiet");
+    stage(c, mq, nSized(kTopic, 100, 1));
+    expect(!c.flowControlHit(mq, key), "sharedCounter.pullMissStaysQuiet");
+    expect(c.flowControlTriggered() == 2, "sharedCounter.missesTickNothing",
+           std::to_string(c.flowControlTriggered()));
+    // And the next trip on either side keeps counting in the same place.
+    expect(c.popFlowControlHitForTest(mq, popQueueWith(5)), "sharedCounter.secondPopRoundTrips");
+    expect(c.flowControlTriggered() == 3, "sharedCounter.popKeepsTheSameCounter",
+           std::to_string(c.flowControlTriggered()));
+    stage(c, mq, nSized(kTopic, 100, 3));
+    expect(c.flowControlHit(mq, key), "sharedCounter.secondPullRoundTrips");
+    expect(c.flowControlTriggered() == 4, "sharedCounter.pullJoinsItAgain",
+           std::to_string(c.flowControlTriggered()));
+}
+
+// The POP gate never sums its sibling queues: only a queue whose **own** debt is over the ceiling
+// pauses. Under an aggregating gate the five fixtures below (3 + 0 + 2 + 2 + 2 against a ceiling of 2)
+// would pause every queue of the topic, so each miss is its own control.
+void testPopGateIsPerQueueAndNeverSumsItsSiblings() {
+    DefaultMQPushConsumer c("GID_PopFlowControlNoSiblingSum");
+    const MessageQueue hot = queueOf(kTopic, 0);
+    const MessageQueue idle = queueOf(kTopic, 1);
+    c.setPopThresholdForQueue(2);
+    auto hotPq = popQueueWith(3);
+    auto idlePq = popQueueWith(0);
+    expect(c.popFlowControlHitForTest(hot, hotPq), "popNoSum.ownDebtOverTheCeilingTrips");
+    expect(!c.popFlowControlHitForTest(idle, idlePq), "popNoSum.siblingUnaffected");
+    // Three more queues each exactly AT the ceiling: together with the hot one they hold 9 messages
+    // against a ceiling of 2, yet only the queue that is over its own ceiling pauses.
+    for (int32_t id = 2; id <= 4; id++) {
+        expect(!c.popFlowControlHitForTest(queueOf(kTopic, id), popQueueWith(2)),
+               "popNoSum.atOwnCeilingStillPops.q" + std::to_string(id));
+    }
+    expect(c.flowControlTriggered() == 1, "popNoSum.exactlyOneTick",
+           std::to_string(c.flowControlTriggered()));
+    // The same hot queue trips again next round (a pause that never re-checks would show up as a
+    // single tick here).
+    expect(c.popFlowControlHitForTest(hot, hotPq), "popNoSum.tripsAgainNextRound");
+    expect(c.flowControlTriggered() == 2, "popNoSum.secondRoundSecondTick",
+           std::to_string(c.flowControlTriggered()));
+    // The recorded reason names this queue's own debt; a leftover cross-queue branch would sum them.
+    LogCapture log;
+    expect(c.popFlowControlHitForTest(hot, hotPq), "popNoSum.reasonRoundTrips");
+    const std::vector<std::string> debugs = log.lines(" DEBUG [");
+    expect(countWith(debugs, "waitAck=3") == 1, "popNoSum.reasonIsTheOwnDebt",
+           std::to_string(debugs.size()));
+    expect(countWith(debugs, "topicWaitAck=") == 0, "popNoSum.noTopicSumWording");
+    expect(countWith(debugs, "pause pop") == 1, "popNoSum.debugOncePerTrip",
+           std::to_string(debugs.size()));
+}
+
+// The WARN an operator actually reads has to explain the pause by itself: this queue's wait-ack debt,
+// the POP ceiling it exceeded, the pause length and the shared trip counter. The quiet control (a debt
+// exactly at the ceiling writes nothing) is what proves the text comes from the gate and not from some
+// other round.
+void testPopWarnTextNamesTheDebtAndTheCeiling() {
+    DefaultMQPushConsumer c("GID_PopFlowControlWarnText");
+    const MessageQueue mq = queueOf(kTopic, 7);
+    c.setPopThresholdForQueue(5);
+    {
+        LogCapture log;
+        expect(c.popFlowControlHitForTest(mq, popQueueWith(9)), "popWarn.trips");
+        const std::vector<std::string> warns = log.lines(" WARN  [");
+        expect(warns.size() == 1, "popWarn.exactlyOneWarn", std::to_string(warns.size()));
+        const std::string line = warns.empty() ? std::string() : warns[0];
+        expect(line.find("waitAck=9") != std::string::npos, "popWarn.namesTheWaitAckDebt", line);
+        expect(line.find("popThresholdForQueue=5") != std::string::npos,
+               "popWarn.namesThePopCeiling", line);
+        expect(line.find("50 ms") != std::string::npos, "popWarn.namesThePauseMillis", line);
+        expect(line.find("(flowControlTimes=1)") != std::string::npos,
+               "popWarn.namesTheSharedCounter", line);
+        expect(line.find(mq.toString()) != std::string::npos, "popWarn.namesTheQueue", line);
+        // The per-round debug channel keeps the same two numbers, so a throttled queue is readable at
+        // DEBUG without waiting for the 1000th trip.
+        const std::vector<std::string> debugs = log.lines(" DEBUG [");
+        expect(countWith(debugs, "waitAck=9") == 1, "popWarn.debugAlsoNamesTheDebt",
+               std::to_string(debugs.size()));
+        expect(countWith(debugs, "popThresholdForQueue=5") == 1, "popWarn.debugNamesTheCeiling",
+               std::to_string(debugs.size()));
+    }
+    DefaultMQPushConsumer quiet("GID_PopFlowControlWarnTextQuiet");
+    quiet.setPopThresholdForQueue(5);
+    LogCapture log;
+    expect(!quiet.popFlowControlHitForTest(mq, popQueueWith(5)), "popWarn.atCeilingIsQuiet");
+    expect(log.lines(" WARN  [").empty(), "popWarn.noWarnForTheQuietRound",
+           std::to_string(log.lines(" WARN  [").size()));
+    expect(log.lines(" DEBUG [").empty(), "popWarn.noDebugForTheQuietRound",
+           std::to_string(log.lines(" DEBUG [").size()));
+    expect(quiet.flowControlTriggered() == 0, "popWarn.quietRoundTicksNothing");
+}
+
+// The POP trip joins the warn cadence of the shared counter instead of running its own. Bringing the
+// counter to 999 through the pull gate is 999 pure function calls (no sleeps, no threads), so the two
+// POP rounds that follow really are trip 1000 and trip 1001: the first stays on the debug channel, the
+// second is the one that warns -- and it says so with the shared number.
+void testPopTripJoinsTheWarnCadenceOfTheSharedCounter() {
+    expect(kFlowControlWarnEvery == 1000, "popCadence.everyIs1000");
+    expect(isFlowControlWarnTrip(1), "popCadence.firstTripWarns");
+    expect(isFlowControlWarnTrip(1001), "popCadence.secondWarnIsTrip1001");
+    // Controls: a POP trip at these positions writes the debug line only.
+    for (int64_t n : {int64_t{0}, int64_t{2}, int64_t{1000}}) {
+        expect(!isFlowControlWarnTrip(n), "popCadence.staysQuietOn" + std::to_string(n));
+    }
+
+    DefaultMQPushConsumer c("GID_PopFlowControlCadence");
+    const MessageQueue mq = queueOf(kTopic, 0);
+    const std::string key = DefaultMQPushConsumer::offsetKey(mq);
+    gatesOffExceptCounts(c);
+    c.setPullThresholdForQueue(1);
+    c.setPopThresholdForQueue(1);
+    stage(c, mq, nSized(kTopic, 100, 2));
+    {
+        LogCapture seed;
+        for (int i = 0; i < 999; i++) {
+            expect(c.flowControlHit(mq, key), "popCadence.pullRoundTrips");
+        }
+        expect(c.flowControlTriggered() == 999, "popCadence.seededAt999",
+               std::to_string(c.flowControlTriggered()));
+    }
+    LogCapture log;
+    expect(c.popFlowControlHitForTest(mq, popQueueWith(2)), "popCadence.popRoundAt1000Trips");
+    expect(c.flowControlTriggered() == 1000, "popCadence.counterAt1000",
+           std::to_string(c.flowControlTriggered()));
+    expect(log.lines(" WARN  [").empty(), "popCadence.trip1000StaysOnDebug",
+           std::to_string(log.lines(" WARN  [").size()));
+    expect(countWith(log.lines(" DEBUG ["), "waitAck=2") == 1, "popCadence.debugEveryRound",
+           std::to_string(log.lines(" DEBUG [").size()));
+    expect(c.popFlowControlHitForTest(mq, popQueueWith(2)), "popCadence.popRoundAt1001Trips");
+    const std::vector<std::string> warns = log.lines(" WARN  [");
+    // The control for "the POP path never reaches the cadence": exactly one WARN, and it carries the
+    // shared counter, not a POP-local one.
+    expect(warns.size() == 1, "popCadence.thePopTripDoesWarn", std::to_string(warns.size()));
+    expect(!warns.empty() && warns[0].find("(flowControlTimes=1001)") != std::string::npos,
+           "popCadence.warnCarriesTheSharedCounter", warns.empty() ? std::string() : warns[0]);
+    expect(countWith(log.lines(" DEBUG ["), "waitAck=2") == 2, "popCadence.debugBothRounds",
+           std::to_string(log.lines(" DEBUG [").size()));
+    // A quiet round in between changes neither the counter nor the cadence.
+    expect(!c.popFlowControlHitForTest(mq, popQueueWith(1)), "popCadence.missIsQuiet");
+    expect(c.flowControlTriggered() == 1001, "popCadence.missChangesNothing",
+           std::to_string(c.flowControlTriggered()));
+    expect(log.lines(" WARN  [").size() == 1, "popCadence.stillOneWarn",
+           std::to_string(log.lines(" WARN  [").size()));
+}
+
 // Drive 'rounds' throttled rounds with the log redirected to a fresh file, and return the WARN lines.
 std::vector<std::string> captureWarns(DefaultMQPushConsumer& c, const MessageQueue& mq,
                                       const std::string& key, int rounds) {
@@ -588,6 +826,12 @@ int main() {
     testDivisionIsIdempotentAndReDerivesFromTheBudget();
     testDivisorCountsQueuesAcrossEveryTopic();
     testPopModeDividesOverThePopTableAndClassicOverMqMap();
+    testPopGateBoundaryIsStrictlyOverTheCeiling();
+    testPopCeilingDefaultsTo96AndIsNeverADividedKnob();
+    testPopTripSharesThePullFlowControlCounter();
+    testPopGateIsPerQueueAndNeverSumsItsSiblings();
+    testPopWarnTextNamesTheDebtAndTheCeiling();
+    testPopTripJoinsTheWarnCadenceOfTheSharedCounter();
     testCachePauseIsFiftyMillis();
     testWarnCadence();
     std::printf("flow control: %d checks, %d failures\n", checks, fails);

@@ -15,7 +15,7 @@ rebalance, pull loops and offset commits are handled by periodic goroutines insi
 - Layers: `remoting` (wire protocol + long-connection transport) → `common` (message model,
   codecs, compression, constants) → `client` (Producer / Push / Pull / LitePull / Admin /
   transaction / trace)
-- Verified against a **RocketMQ 5.5.1** cluster: 15 live tools plus 777 unit tests
+- Verified against a **RocketMQ 5.5.1** cluster: 15 live tools plus 784 unit tests
 
 ## Prerequisites
 
@@ -55,10 +55,10 @@ Measured result of `go test ./... -count=1` (all three test packages `ok`):
 
 | Package | Test functions | Time |
 | --- | --- | --- |
-| `client` | 457 | 45.0s |
-| `common` | 135 | 1.8s |
-| `remoting` | 185 | 1.0s |
-| **Total** | **777** (70 `*_test.go` files) | ~48s |
+| `client` | 464 | 45.4s |
+| `common` | 135 | 2.1s |
+| `remoting` | 185 | 1.5s |
+| **Total** | **784** (70 `*_test.go` files) | ~49s |
 
 To count them yourself: `go test ./client/ -list '.*' | grep -c '^Test'`. Concurrency
 regression on its own:
@@ -527,7 +527,7 @@ already receiving before producing; to read history explicitly, call
   LZ4 103 bytes, and all three codecs round-trip consistently.
 - The POP queue set is computed by local rebalance (one POP loop + ack per queue); the client
   does not ask the broker to assign queues.
-- `OFFSET_ILLEGAL` freeze-and-rebuild, the three per-queue pull cache gates (topic budgets divided over the owned queues at rebalance), the full heartbeat
+- `OFFSET_ILLEGAL` freeze-and-rebuild, the three per-queue pull cache gates (topic budgets divided over the owned queues at rebalance), POP's outstanding-ACK gate (strictly above `PopThresholdForQueue`, default 96, a trip counted on the pull path's one client-wide flow-control total and warn cadence), the full heartbeat
   surface and the six allocation strategies are currently covered by unit tests and the
   in-process fake cluster only — there is no matching tool in `examples/` yet.
 
@@ -573,7 +573,7 @@ go/
 │   ├── trace.go · trace_hook.go · trace_dispatcher.go · trace_context.go
 │   ├── consumer_stats.go · stats_item.go · consumer_running_info.go · fault_strategy.go
 │   ├── consume_directly.go · jsonutil.go
-│   └── *_test.go                   70 test files, 777 test functions
+│   └── *_test.go                   70 test files, 784 test functions
 └── examples/                   17 executables (see "Live Cluster Verification")
 ```
 

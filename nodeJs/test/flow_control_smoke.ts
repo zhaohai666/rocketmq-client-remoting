@@ -17,6 +17,10 @@
 //   * the WARN fires on the 1st trip and every 1000th after, while the counter keeps
 //     counting every trip;
 //   * popThresholdForQueue defaults to 96, not to the pull-side 1000;
+//   * the POP cache gate judges ONE queue's own outstanding-ACK debt, strictly
+//     greater than popThresholdForQueue, and a trip is a flow-control event of
+//     this client: it lands on the same counter and the same WARN cadence as the
+//     pull gate, so flowControlTimes is one client-wide number over both paths;
 //   * a stopped round waits with the right number: 50ms for this client's own cache
 //     gate, 20ms for the broker's 215, 500ms for every other failed pull — and no
 //     wait at all for an idle long-poll timeout. The broker's answer has to reach the
@@ -29,7 +33,7 @@ import { PopProcessQueue } from '../src/client/pop_process_queue.ts';
 import { SubscriptionData } from '../src/common/subscriptionData.ts';
 import { PullResult, PullStatus } from '../src/client/consumer_result.ts';
 import { PopResult } from '../src/client/pop_api.ts';
-import { queuePopLoop, POP_DELAY_WHEN_EXCEPTION } from '../src/client/pop_consumer.ts';
+import { queuePopLoop, POP_DELAY_WHEN_EXCEPTION, POP_DELAY_WHEN_CACHE_FLOW_CONTROL } from '../src/client/pop_consumer.ts';
 import { MQBrokerException, RemotingTimeoutException } from '../src/remoting/exception.ts';
 import {
   DefaultMQPushConsumer, isFlowControlWarnTrip, pullRetryDelayMillisFor,
@@ -362,6 +366,142 @@ async function drivePopLoop(group: string, failWith: Error): Promise<number[]> {
     new MQBrokerException(2, 'system error', '127.0.0.1:10911'));
   check('control: any other POP failure waits the long error backoff',
     broken.length === 1 && broken[0] === POP_DELAY_WHEN_EXCEPTION, JSON.stringify(broken));
+}
+
+// ---- the POP cache gate: one counter, one cadence, the same 50 ms ----------
+// The POP loop's own gate sits on the ANSWER DEBT rather than on a buffer, but a
+// trip is still a flow-control event of this client: it has to move the shared
+// counter and warn on the shared cadence, or the operator sees a queue that
+// pauses forever and a flowControlTimes figure of 0.
+
+// popHit asks the consumer's gate about one queue that owes `debt` answers.
+function popHit(c: DefaultMQPushConsumer, key: string, debt: number): boolean {
+  const pq = new PopProcessQueue();
+  pq.incFoundMsg(debt);
+  c.popQueueTable.set(key, pq);
+  return (c as any)._popFlowControlHit(key, pq);
+}
+
+// drivePopGate runs the real POP loop over one round with a queue that owes
+// `debt` answers against `threshold`. The waits are RECORDED, never slept, and
+// each recorded wait retires the loop's stop flag, so the gate's pause is the
+// only number that can appear. `rounds` counts POP requests that reached the
+// wire: a round the gate stopped must leave it at 0. `stamped` says whether the
+// round touched the queue's pop timestamp BEFORE judging the gate — the stall
+// criterion reads that stamp, so a gated round has to look alive.
+async function drivePopGate(opts: {
+  group: string, threshold: number, debt: number, queueId?: number,
+}): Promise<{ waits: number[], rounds: number, c: DefaultMQPushConsumer, stamped: boolean }> {
+  const c = consumer(opts.group);
+  c.popThresholdForQueue = opts.threshold;
+  const mq = queue(TOPIC, opts.queueId ?? 0);
+  const anyC = c as any;
+  c.subscription.set(TOPIC, new SubscriptionData(TOPIC, '*'));
+  const pq = new PopProcessQueue();
+  pq.incFoundMsg(opts.debt);
+  // A timestamp from deep in the past: only this round's stamp can lift it.
+  pq.setLastPopTimestamp(1);
+  c.popQueueTable.set(mqKey(mq), pq);
+  c.started = true;
+  anyC._findBrokerAddressInSubscribe = () => ({ addr: '127.0.0.1:10911', isSlave: false });
+  const flag = anyC._newStopFlag();
+  let rounds = 0;
+  c.mqClient = {
+    popMessage: async () => {
+      rounds++;
+      anyC._stopFlags.delete(flag);
+      return new PopResult();
+    },
+  } as never;
+  const waits: number[] = [];
+  anyC._sleepOrStop = async (ms: number) => {
+    waits.push(ms);
+    anyC._stopFlags.delete(flag);
+    return true;
+  };
+  const begin = Date.now();
+  await queuePopLoop(c, mq, flag);
+  return { waits, rounds, c, stamped: pq.getLastPopTimestamp() >= begin };
+}
+
+{
+  // The boundary, driven end to end. A debt that only REACHED the threshold
+  // pops: the gate is a strict ">", so the threshold reads as "how many answers
+  // may be outstanding", not "how many stop us".
+  const open = await drivePopGate({ group: 'G_nodejs_pop_gate_open', threshold: 2, debt: 2 });
+  check('control: a POP debt at the threshold pops with no flow-control pause at all',
+    open.waits.length === 0 && open.rounds === 1, JSON.stringify(open.waits));
+  check('control: a round that popped counted nothing', open.c.flowControlTriggered === 0);
+  check('control: a round that popped stamped the queue', open.stamped);
+
+  const gated = await drivePopGate({ group: 'G_nodejs_pop_gate_hot', threshold: 2, debt: 3 });
+  check('a POP debt of threshold+1 re-schedules the queue after exactly the 50ms cache wait',
+    gated.waits.length === 1 && gated.waits[0] === POP_DELAY_WHEN_CACHE_FLOW_CONTROL,
+    JSON.stringify(gated.waits));
+  check('the POP cache wait is the same 50ms number as the pull cache wait',
+    POP_DELAY_WHEN_CACHE_FLOW_CONTROL === 50);
+  check('a round the POP gate stopped never puts a pop request on the wire',
+    gated.rounds === 0, `rounds=${gated.rounds}`);
+  check('the POP gate counted exactly one trip on the shared counter',
+    gated.c.flowControlTriggered === 1, `got ${gated.c.flowControlTriggered}`);
+  check('a gated POP round still stamps the queue, so rebalance keeps it',
+    gated.stamped);
+  check('the first POP trip is a WARN trip of the shared cadence',
+    isFlowControlWarnTrip(gated.c.flowControlTriggered));
+}
+
+// Per-queue isolation: the debts of sibling queues are never summed, so one
+// runaway queue cannot hold up a queue that owes nothing.
+{
+  const c = consumer('G_nodejs_pop_gate_per_queue');
+  c.popThresholdForQueue = 3;
+  const hotKey = mqKey(queue(TOPIC, 0));
+  const coldKey = mqKey(queue(TOPIC, 1));
+  check('the queue whose own debt is over the pop threshold trips', popHit(c, hotKey, 4));
+  // Paired control on the SAME consumer and the SAME staged debts: judged on a
+  // summed debt (4 > 3) this empty sibling would trip too.
+  check('a sibling queue that owes nothing is not judged by its neighbour\'s debt',
+    !popHit(c, coldKey, 0));
+  check('two judgments over one hot queue counted one trip', c.flowControlTriggered === 1,
+    `got ${c.flowControlTriggered}`);
+  check('a POP debt equal to the threshold does not trip (>, not >=)', !popHit(c, hotKey, 3));
+  check('a POP debt of threshold+1 trips', popHit(c, hotKey, 4));
+  check('the boundary pair added exactly one trip', c.flowControlTriggered === 2,
+    `got ${c.flowControlTriggered}`);
+}
+
+// One counter across BOTH paths: the pull gate and the POP gate feed the same
+// flowControlTimes figure.
+{
+  const c = gatesOff(consumer('G_nodejs_pop_gate_shared_counter'));
+  c.pullThresholdForQueue = 1;
+  c.popThresholdForQueue = 1;
+  const mq = queue(TOPIC, 5);
+  check('a pull cache hit is counted', hit(c, mq, [msg(0, 10), msg(1, 10)]));
+  check('a POP debt hit is counted', popHit(c, mqKey(mq), 2));
+  // Paired control: leave the POP trip out of the counter and both gates still
+  // pause their queues while this total stops at 1.
+  check('flowControlTimes is one client-wide count spanning the pull path and the POP path',
+    c.flowControlTriggered === 2, `got ${c.flowControlTriggered}`);
+}
+
+// The cadence is driven off that shared counter, so POP trips shift it too.
+// Pre-seeding the counter pins the boundary arithmetic without running 1000
+// real trips.
+{
+  const c = consumer('G_nodejs_pop_gate_cadence');
+  c.popThresholdForQueue = 0;
+  const key = mqKey(queue(TOPIC, 0));
+  check('the 1st POP trip warns', popHit(c, key, 1) && isFlowControlWarnTrip(c.flowControlTriggered));
+  check('the 2nd POP trip stays on the debug channel',
+    popHit(c, key, 1) && !isFlowControlWarnTrip(c.flowControlTriggered));
+  c.flowControlTriggered = 999;
+  popHit(c, key, 1);
+  check('the 1000th trip of the shared counter does not warn',
+    c.flowControlTriggered === 1000 && !isFlowControlWarnTrip(c.flowControlTriggered));
+  popHit(c, key, 1);
+  check('the 1001st trip of the shared counter warns',
+    c.flowControlTriggered === 1001 && isFlowControlWarnTrip(c.flowControlTriggered));
 }
 
 console.log(`\nflow control: ${pass} checks, ${fail} failed`);

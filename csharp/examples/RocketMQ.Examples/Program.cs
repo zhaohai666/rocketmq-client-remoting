@@ -121,7 +121,7 @@ internal static class Program
               trace        [namesrv]        real cluster message trace integration (needs the broker traceTopicEnable=true)
               hook         [namesrv]        real cluster CheckForbidden/FilterMessage hook integration
               backpressure [namesrv]        real cluster async send backpressure integration (count/byte gates, reconciling rejections, growing at runtime)
-              flow-control [namesrv]        real cluster pre-pull flow control's five thresholds integration (count/byte/span/topic level, nothing lost after a hit)
+              flow-control [namesrv]        real cluster pre-pull flow control integration (the three per-queue gates: count/byte/span, with the topic budgets divided into them at rebalance, nothing lost after a hit)
               async-send   [namesrv]        real cluster async send kernel integration (the caller is not blocked, the thread rules, concurrency does not cross wires, draining on shutdown)
               validators-live [namesrv]     real cluster name validation integration (fast local reject + send/receive with legal names + a round-trip control)
               recall     [namesrv]        real cluster scheduled message recall integration (needs the broker recallMessageEnable, the script restores it)

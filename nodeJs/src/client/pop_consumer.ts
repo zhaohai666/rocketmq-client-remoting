@@ -8,7 +8,9 @@
 //     and the client either ACKs it or asks for more invisible time. A queue's
 //     "cursor" is the broker's revive queue, not a number we store.
 //  2. Flow control is on the ANSWER DEBT (waitAckCounter >
-//     popThresholdForQueue), not on buffered messages.
+//     popThresholdForQueue), not on buffered messages. A trip is still one
+//     flow-control event of this client: it bumps the shared counter the pull
+//     path uses, so a single number and a single WARN cadence describe both.
 //  3. A batch can expire WHILE the listener runs (invisibleTime is wall
 //     clock). Such a batch must not be acked — the broker has already taken it
 //     back and another consumer may own it. The window is checked twice: once
@@ -51,6 +53,9 @@ export const POP_MAX_INVISIBLE_TIME = 300000;
 // NOT an error.
 export const POP_DEFAULT_INVISIBLE_TIME = 60000;
 
+// The pause a POP round takes when this client's own gate stopped it. Same
+// number as the pull path's cache wait, and it is the duration named in the
+// shared flow-control WARN.
 export const POP_DELAY_WHEN_CACHE_FLOW_CONTROL = 50;
 export const POP_DELAY_WHEN_BROKER_FLOW = 20;
 export const POP_DELAY_WHEN_SUSPEND = 1000;
@@ -79,10 +84,11 @@ export async function queuePopLoop(c: DefaultMQPushConsumer, mq: MessageQueue, s
 
     const sub = c.subscription.get(mq.getTopic());
     if (!sub) return;
-    // Flow control on the outstanding-ACK debt, against popThresholdForQueue.
-    if (pq.waitAckMsgCount() > c.popThresholdForQueue) {
-      logger.debug('pop flow control: queue %s waiting-ack=%d exceeds threshold %d',
-        key, pq.waitAckMsgCount(), c.popThresholdForQueue);
+    // Flow control on this queue's outstanding-ACK debt, against
+    // popThresholdForQueue. The gate lives on the consumer because it feeds the
+    // SAME flowControlTriggered counter (and the SAME WARN cadence) as the pull
+    // path, so one flowControlTimes number covers both paths.
+    if (c._popFlowControlHit(key, pq)) {
       if (await c._sleepOrStop(POP_DELAY_WHEN_CACHE_FLOW_CONTROL, stopFlag)) return;
       continue;
     }

@@ -1773,12 +1773,30 @@ final class DefaultMQPushConsumer
      * Record one cache-flow-control trip: arm the per-queue pause and log it. Shared by the pull
      * gates and the POP wait-ack gate, which is the same event -- this client's own buffer is the
      * reason the request is not worth sending -- so both feed the same counter and the same pause.
+     * Only the wording differs: $path says which request the trip holds back and, for a pop trip,
+     * $queueOffset is the queue's current offset the round stood on, so the log reads as a position
+     * in the queue rather than as a bare counter.
      */
-    private function armCacheFlowControlPause(MessageQueue $mq, string $key, string $reason): void
-    {
+    private function armCacheFlowControlPause(
+        MessageQueue $mq,
+        string $key,
+        string $reason,
+        string $path = 'pull',
+        ?int $queueOffset = null,
+    ): void {
+        $isPop = $path === 'pop';
         $this->flowControlUntil[$key] = microtime(true)
             + self::PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL / 1000.0;
         $this->flowControlTriggered++;
+        if ($isPop) {
+            $at = $queueOffset === null ? 'at offset unknown' : 'at offset ' . $queueOffset;
+            Logger::debug(sprintf('flow control: queue %s %s, %s, pause pop', $mq, $reason, $at));
+            if (self::isFlowControlWarnTrip($this->flowControlTriggered)) {
+                Logger::warning(sprintf('flow control: queue %s %s %s, so do flow control, pause pop for %d ms (flowControlTimes=%d)',
+                    $mq, $reason, $at, self::PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL, $this->flowControlTriggered));
+            }
+            return;
+        }
         Logger::debug("flow control: queue $mq $reason, pause pull");
         if (self::isFlowControlWarnTrip($this->flowControlTriggered)) {
             Logger::warning(sprintf('flow control: queue %s %s exceeds its cache threshold, pause pull for %d ms (flowControlTimes=%d)',
@@ -2978,7 +2996,14 @@ final class DefaultMQPushConsumer
             return false;
         }
         if ($pq->waitAckCount() > $this->popThresholdForQueue) {
-            $this->armCacheFlowControlPause($mq, $key, 'waitAckCount=' . $pq->waitAckCount());
+            $this->armCacheFlowControlPause(
+                $mq,
+                $key,
+                sprintf('the messages waiting to ack (%d) exceeds the pop threshold %d',
+                    $pq->waitAckCount(), $this->popThresholdForQueue),
+                'pop',
+                isset($this->offsetTable[$key]) ? (int) $this->offsetTable[$key] : null,
+            );
             return false;
         }
         // Idle backoff (PHP short-poll adaptation).

@@ -1009,6 +1009,43 @@ bool DefaultMQPushConsumer::flowControlHit(const MessageQueue& mq, const std::st
     return true;
 }
 
+// The POP-mode sibling of flowControlHit: the queue's own popped-but-unacked debt against
+// popThresholdForQueue. Same shape as the pull gate on purpose --
+//   * **strictly greater than** the ceiling, so the ceiling reads as "how many may stay unacked" and a
+//     queue that reached it exactly still pops;
+//   * this queue's debt alone, never the sum over its sibling pop queues (a divided per-queue ceiling is
+//     strictly stricter than aggregating them, and one hot queue must not pause the others);
+//   * the tick lands on the SAME client-wide flowControlTriggered_ counter as the pull path, and the
+//     warn goes through isFlowControlWarnTrip, so a throttled client reports one number and one cadence
+//     no matter which consumption mode it is in. A null PopProcessQueue means this queue holds no pop
+//     state (nothing waits for an ack), so it is never a trip.
+// The caller sleeps kPullPauseWhenClientFlowControl, the same pause the pull loop takes for its own
+// cache gate; the stamping of lastPopTimestamp happens before this gate, so a throttled queue is never
+// mistaken for a dead loop by the stall self-healing (isPullExpired).
+bool DefaultMQPushConsumer::popFlowControlHit(const MessageQueue& mq,
+                                              const std::shared_ptr<PopProcessQueue>& pq) {
+    if (pq == nullptr) return false;
+    const int32_t waitAck = pq->waitAckCount();
+    if (waitAck <= popThresholdForQueue_) return false;
+    const int64_t times = flowControlTriggered_.fetch_add(1) + 1;
+    logger_debug("pop flow control: queue " + mq.toString() + " waitAck="
+                 + std::to_string(waitAck) + " popThresholdForQueue="
+                 + std::to_string(popThresholdForQueue_) + ", pause pop");
+    if (isFlowControlWarnTrip(times)) {
+        logger_warn("pop flow control: queue " + mq.toString() + " waitAck="
+                    + std::to_string(waitAck) + " exceeds popThresholdForQueue="
+                    + std::to_string(popThresholdForQueue_) + ", pause pop for "
+                    + std::to_string(kPullPauseWhenClientFlowControl) + " ms (flowControlTimes="
+                    + std::to_string(times) + ")");
+    }
+    return true;
+}
+
+bool DefaultMQPushConsumer::popFlowControlHitForTest(
+    const MessageQueue& mq, const std::shared_ptr<PopProcessQueue>& pq) {
+    return popFlowControlHit(mq, pq);
+}
+
 // FLOW_CONTROL(215) is the only response code with its own pause on this path; the broker raised it
 // because of its own throttling window, which says nothing about this client's cache.
 int32_t DefaultMQPushConsumer::pullPauseMillisFor(int32_t responseCode) {
@@ -1314,8 +1351,11 @@ void DefaultMQPushConsumer::queuePopLoop(const MessageQueue& mq, uint64_t token)
             std::this_thread::sleep_for(std::chrono::milliseconds(1000));
             continue;
         }
-        // Flow control: too many popped-but-unacked messages, so hold back first (popThresholdForQueue)
-        if (pq->waitAckCount() > popThresholdForQueue_) {
+        // Flow control: this queue's popped-but-unacked debt is over its ceiling, so hold back first
+        // (popThresholdForQueue, see popFlowControlHit). Observed exactly like the pull path's cache
+        // gate: the same client-wide hit counter and the same recorded pause length.
+        if (popFlowControlHit(mq, pq)) {
+            notePullPause(kPullPauseWhenClientFlowControl);
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(kPullPauseWhenClientFlowControl));
             continue;
@@ -1331,9 +1371,21 @@ void DefaultMQPushConsumer::queuePopLoop(const MessageQueue& mq, uint64_t token)
             // No message arrived while long polling was suspended -> the client times out first: normal behaviour, go to the next round
             logger_debug("pop long-poll timeout for " + key + " (benign): " + e.what());
             continue;
+        } catch (const MQBrokerException& e) {
+            // The same table the pull loop reads: FLOW_CONTROL(215) is the broker throttling its own
+            // window, so it waits out the short pause, while every other code keeps the general error
+            // backoff. Collapsing both into one wait either sits out 500ms after a throttle that has
+            // already lifted or hammers a busy broker 25x more often.
+            const int32_t pause = pullPauseMillisFor(e.responseCode);
+            logger_debug("pop broker error for " + key + ": " + e.what() + ", pause pop "
+                         + std::to_string(pause) + "ms");
+            notePullPause(pause);
+            std::this_thread::sleep_for(std::chrono::milliseconds(pause));
+            continue;
         } catch (const std::exception& e) {
             logger_debug(std::string("pop error for ") + key + ": " + e.what());
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            notePullPause(kPullPauseWhenPullError);
+            std::this_thread::sleep_for(std::chrono::milliseconds(kPullPauseWhenPullError));
             continue;
         }
         // The queue was revoked by rebalance after popping: this batch is neither consumed nor acked

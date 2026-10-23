@@ -97,8 +97,10 @@ inline StartOffsetPlan planInitialOffset(int64_t stored, const std::string& cons
 
 // Pull-loop pacing after a pause-worthy event. Two different things are called "flow control" and they
 // must not share one backoff:
-//   - the client's own ProcessQueue thresholds (cached messages over the count/size/span limits): the
-//     pause only has to give the consume side time to drain, so a comparatively long pause is right;
+//   - the client's own cache thresholds: the per-queue ProcessQueue limits on the pull path (cached
+//     messages over the count/size/span thresholds) and, on the POP path, this queue's popped-but-unacked
+//     debt over popThresholdForQueue; the pause only has to give the consume side time to drain, so a
+//     comparatively long pause is right;
 //   - the broker's FLOW_CONTROL(215) answer: the broker throttled this request on its own window, which
 //     is unrelated to how full the local cache is, so the loop retries sooner.
 constexpr int32_t kPullPauseWhenClientFlowControl = 50;
@@ -106,8 +108,9 @@ constexpr int32_t kPullPauseWhenBrokerFlowControl = 20;
 // Every other broker error on the pull path (topic not created yet, subscription not latest, ...).
 constexpr int32_t kPullPauseWhenPullError = 500;
 
-// A throttled queue trips a cache gate on every pull round, so warning every round buries the
-// signal in noise: only every kFlowControlWarnEvery-th trip warns (the 1st, then the 1001st, ...).
+// A throttled queue trips its cache gate on every round, so warning every round buries the signal in
+// noise: only every kFlowControlWarnEvery-th trip warns (the 1st, then the 1001st, ...). The trip count
+// is one client-wide number shared by the pull cache gate and the POP wait-ack gate below.
 constexpr int64_t kFlowControlWarnEvery = 1000;
 
 // Whether the n-th (1-based) flow-control trip is one that logs a WARN.
@@ -360,6 +363,8 @@ public:
     void setPopBatchNums(int32_t n) { popBatchNums_ = n; }
     int32_t popBatchNums() const { return popBatchNums_; }
     // Ceiling for this queue's 'popped but unacked' counter; POP pauses above it (popThresholdForQueue default 96)
+    // The pause is a flow-control hit like the pull path's: it ticks flowControlTriggered(), which is
+    // one client-wide count covering both consumption modes.
     void setPopThresholdForQueue(int32_t n) { popThresholdForQueue_ = n; }
     int32_t popThresholdForQueue() const { return popThresholdForQueue_; }
     // Suspension time of POP long polling. 0 = short polling (the broker returns immediately or NO_NEW_MSG).
@@ -665,6 +670,12 @@ public:
     // A wrong criterion means 'messages pile up in memory without bound / the offset span runs away', problems a
     // real broker run does not reveal quickly, so it must be pinnable offline; same reason as consumeBatch for keeping it public.
     bool flowControlHit(const MessageQueue& mq, const std::string& key);
+    // Test-only entry for the POP sibling of the gate above (the real one is private and runs on the
+    // pop thread of its queue). Same style as divideTopicThresholdsForTest: on a real broker an
+    // un-observed wait-ack pause only ever looks like 'consumption got slower', so both the criterion
+    // and the counter it ticks have to be reachable offline.
+    bool popFlowControlHitForTest(const MessageQueue& mq,
+                                  const std::shared_ptr<PopProcessQueue>& pq);
     // How long the pull loop pauses after a **failed** pull: the broker's FLOW_CONTROL(215) answer gets its
     // own short pause, every other response code the general error backoff (see the kPullPause* constants).
     // Public and static because the two events look identical offline (both arrive as one MQBrokerException),
@@ -819,6 +830,12 @@ private:
     // ---- POP consume loop (5.x lightweight consumption: popMessage callback + POP concurrent consume service) ----
     // POP loop of a single queue. It **neither queries nor commits consumer offsets**: progress is tracked by the broker-side checkpoint and confirmation relies on ack alone.
     void queuePopLoop(const MessageQueue& mq, uint64_t token);
+    // Pre-pop flow-control decision of POP mode: this queue's own wait-ack debt against
+    // popThresholdForQueue, **strictly greater than** the ceiling (a queue that reached it exactly may
+    // still pop) and never summed over its sibling queues, exactly like flowControlHit. A hit ticks the
+    // SAME client-wide counter as the pull path and goes through the same warn cadence, so
+    // flowControlTriggered() stays one number spanning both consumption modes.
+    bool popFlowControlHit(const MessageQueue& mq, const std::shared_ptr<PopProcessQueue>& pq);
     // Consume one batch and, based on the result, ack or extend the invisible time
     void consumePopBatch(std::vector<MessageExt> msgs,
                          std::shared_ptr<PopProcessQueue> pq, const MessageQueue& mq);

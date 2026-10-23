@@ -2818,6 +2818,37 @@ fn flow_control_hit(inner: &Inner, key: &str) -> bool {
 
 static EMPTY_DEQUE: VecDeque<MessageExt> = VecDeque::new();
 
+/// The POP path's cache gate: **this queue's own** popped-but-unacked debt, compared strictly
+/// greater than `pop_threshold_for_queue` (default 96).
+///
+/// POP keeps no "pulled but not consumed" buffer, so the count / bytes / span checks of
+/// [`flow_control_hit`] have nothing to read here -- once a message is popped, consumption has
+/// already begun and what matters is the ack debt. The debt is per queue and never summed, and the
+/// threshold is a plain client knob: the topic budgets divided at rebalance belong to the pull path
+/// and do not move it.
+///
+/// A hit is counted on the **same** `flow_control_triggered` total the pull path uses, so one
+/// client-wide flow-control count spans both paths and the throttled warn cadence (see
+/// [`is_flow_control_warn_trip`]) also sees the POP trips.
+fn pop_flow_control_hit(inner: &Inner, key: &str, pq: &PopProcessQueue) -> bool {
+    let wait_ack = pq.wait_ack_count();
+    let threshold = read_cfg(inner).pop_threshold_for_queue;
+    if wait_ack <= threshold {
+        return false;
+    }
+    let times = inner.flow_control_triggered.fetch_add(1, Ordering::SeqCst) + 1;
+    rmq_debug!(
+        "flow control: queue {key} wait_ack={wait_ack} over pop_threshold_for_queue={threshold}, pause pop"
+    );
+    if is_flow_control_warn_trip(times) {
+        rmq_warn!(
+            "flow control: queue {key} wait_ack={wait_ack} exceeds its pop_threshold_for_queue={threshold}, \
+             pause pop for {PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL} ms (flowControlTimes={times})"
+        );
+    }
+    true
+}
+
 /// Divide one enabled topic budget over `owned` queues and state the result with the literal
 /// log wording the gate documents.
 ///
@@ -3507,7 +3538,7 @@ async fn run_queue_pop_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
             None => return,
         };
         let cfg = read_cfg(&inner);
-        if pq.wait_ack_count() > cfg.pop_threshold_for_queue {
+        if pop_flow_control_hit(&inner, &key, &pq) {
             if wait_or_stop(&mut rx, PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL).await {
                 return;
             }
@@ -6560,6 +6591,118 @@ mod tests {
         assert!(
             is_flow_control_warn_trip(consumer.flow_control_triggered()),
             "the 1001st round is the next warn"
+        );
+    }
+
+    /// The POP path's gate reads **this queue's own** ack debt and nothing else: a queue sitting
+    /// exactly on the default 96 still pops, the 97th awaited ack pauses it, and a sibling that
+    /// carries no debt stays open while its neighbour is throttled.
+    #[test]
+    fn pop_gate_judges_this_queue_own_ack_debt() {
+        let consumer = DefaultMQPushConsumer::new("G_pop_gate").unwrap();
+        let queues = owned_queue_set("T", 2);
+        own_pop_queues(&consumer, &queues);
+        let pq_of = |mq: &MessageQueue| -> Arc<PopProcessQueue> {
+            lock(&consumer.inner.state)
+                .pop_queues
+                .get(&mq_key(mq))
+                .cloned()
+                .unwrap()
+        };
+        let hot_key = mq_key(&queues[0]);
+        let cold_key = mq_key(&queues[1]);
+        let hot = pq_of(&queues[0]);
+        let cold = pq_of(&queues[1]);
+
+        hot.inc_found_msg(96);
+        assert!(
+            !pop_flow_control_hit(&consumer.inner, &hot_key, &hot),
+            "96 awaited acks are not strictly greater than the default threshold 96"
+        );
+        assert_eq!(
+            consumer.flow_control_triggered(),
+            0,
+            "a round that does not trip counts nothing"
+        );
+        hot.inc_found_msg(1);
+        assert!(
+            pop_flow_control_hit(&consumer.inner, &hot_key, &hot),
+            "the 97th awaited ack pauses this queue"
+        );
+
+        // Paired control for the summing bug: the instance carries 97 awaited acks in total, all of
+        // them the hot queue's, so the empty sibling must keep popping.
+        assert_eq!(hot.wait_ack_count() + cold.wait_ack_count(), 97);
+        assert!(
+            !pop_flow_control_hit(&consumer.inner, &cold_key, &cold),
+            "the gate never sums its sibling queues"
+        );
+
+        // A tightened knob keeps the same strict comparison.
+        only(&consumer, |c| c.pop_threshold_for_queue = 3);
+        hot.dec_found_msg(94);
+        assert_eq!(hot.wait_ack_count(), 3);
+        assert!(
+            !pop_flow_control_hit(&consumer.inner, &hot_key, &hot),
+            "exactly the threshold 3 still pops"
+        );
+        hot.inc_found_msg(1);
+        assert!(
+            pop_flow_control_hit(&consumer.inner, &hot_key, &hot),
+            "debt 4 > threshold 3 pauses"
+        );
+    }
+
+    /// POP trips are counted on the pull path's counter, not next to it: one pull hit plus one pop
+    /// hit reads 2, and the throttled warn therefore counts the POP rounds too. An implementation
+    /// with its own POP counter passes every pure-gate assertion above and still buries the operator
+    /// in one warn per round.
+    #[test]
+    fn pop_and_pull_trips_share_one_flow_control_counter() {
+        let consumer = DefaultMQPushConsumer::new("G_pop_fc_counter").unwrap();
+        let mq = queue("T", "broker-a", 0);
+        let key = mq_key(&mq);
+        own_pop_queues(&consumer, std::slice::from_ref(&mq));
+        let pq = lock(&consumer.inner.state)
+            .pop_queues
+            .get(&key)
+            .cloned()
+            .unwrap();
+        only(&consumer, |c| {
+            c.pull_threshold_for_queue = 1;
+            c.pop_threshold_for_queue = 0;
+        });
+        pq.inc_found_msg(1);
+        stage(&consumer, &mq, vec![sized_msg(100, 0), sized_msg(100, 1)]);
+
+        assert!(flow_control_hit(&consumer.inner, &key), "buffered 2 > 1 pauses the pull");
+        assert_eq!(consumer.flow_control_triggered(), 1);
+        assert!(
+            pop_flow_control_hit(&consumer.inner, &key, &pq),
+            "wait ack 1 > 0 pauses the pop"
+        );
+        assert_eq!(
+            consumer.flow_control_triggered(),
+            2,
+            "one client-wide flow-control count spans the pull and POP paths"
+        );
+
+        for round in 3..=1000 {
+            assert!(
+                pop_flow_control_hit(&consumer.inner, &key, &pq),
+                "pop round {round} must still pause"
+            );
+        }
+        assert_eq!(consumer.flow_control_triggered(), 1000);
+        assert!(
+            !is_flow_control_warn_trip(consumer.flow_control_triggered()),
+            "1000 pop trips leave the cadence silent"
+        );
+        assert!(pop_flow_control_hit(&consumer.inner, &key, &pq));
+        assert_eq!(consumer.flow_control_triggered(), 1001);
+        assert!(
+            is_flow_control_warn_trip(consumer.flow_control_triggered()),
+            "the 1001st trip is the next warn"
         );
     }
 

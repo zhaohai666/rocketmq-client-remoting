@@ -366,4 +366,120 @@ public class FlowControlTests
         // 1.5MiB must be written as "1.5MB" under InvariantCulture, with no local thousands separator or comma decimal point
         Assert.Equal("1.5", (1.5).ToString("F1", CultureInfo.InvariantCulture));
     }
+
+    // ---------------- the POP path's wait-ack gate ----------------
+
+    private static bool PopHit(DefaultMQPushConsumer c, MessageQueue mq, PopProcessQueue pq)
+        => c.PopFlowControlHitForTest(mq, pq);
+
+    /// <summary>The POP gate judges one queue's own popped-but-unacked debt, strictly above the
+    /// threshold: the queue exactly on the limit still pops, and a sibling is never measured against
+    /// its neighbour's backlog.</summary>
+    [Fact]
+    public void PopGate_IsStrictlyGreaterAndReadsOnlyThisQueuesDebt()
+    {
+        var c = new DefaultMQPushConsumer("GID_PopFlowGateNet");
+        var hot = QueueOf(Topic, 0);
+        var cold = QueueOf(Topic, 1);
+        c.PopThresholdForQueue = 3;
+        var hotPq = new PopProcessQueue();
+        var coldPq = new PopProcessQueue();
+
+        hotPq.IncFoundMsg(3);
+        Assert.False(PopHit(c, hot, hotPq), "3 awaited acks are not strictly greater than the threshold 3");
+        // a round that does not trip must count nothing
+        Assert.Equal(0L, c.FlowControlTriggered);
+        hotPq.IncFoundMsg(1);
+        Assert.True(PopHit(c, hot, hotPq), "the 4th awaited ack pauses this queue");
+        Assert.Equal(1L, c.FlowControlTriggered);
+
+        // Paired control: all 4 outstanding acks sit on ONE queue, so the empty sibling must keep
+        // popping. A gate that summed the instance's debt would pause both.
+        Assert.Equal(4, hotPq.WaitAckCount() + coldPq.WaitAckCount());
+        Assert.False(PopHit(c, cold, coldPq), "the gate never sums its sibling queues");
+        // still 1: only the hot queue tripped
+        Assert.Equal(1L, c.FlowControlTriggered);
+
+        // The shipped default is a message count, not the pull side's 1000.
+        var plain = new DefaultMQPushConsumer("GID_PopFlowGateDefaultNet");
+        var defaultPq = new PopProcessQueue();
+        defaultPq.IncFoundMsg(plain.PopThresholdForQueue);
+        Assert.False(PopHit(plain, hot, defaultPq), "exactly the default threshold still pops");
+        defaultPq.IncFoundMsg(1);
+        Assert.True(PopHit(plain, hot, defaultPq), "one ack past the default threshold pauses");
+    }
+
+    /// <summary>A POP trip lands on the pull path's counter, so the throttled warn cadence spans both
+    /// paths. A POP gate with its own counter -- or none -- passes every pure-gate assertion above and
+    /// still buries the operator in one warn per round.</summary>
+    [Fact]
+    public void PopHit_LandsOnThePullPathsCounter_AndJoinsItsWarnCadence()
+    {
+        var c = new DefaultMQPushConsumer("GID_PopFlowCounterNet");
+        var mq = QueueOf(Topic, 0);
+        GatesOffExceptCounts(c);
+        c.PullThresholdForQueue = 1;
+        c.PopThresholdForQueue = 0;
+        Stage(c, mq, NSized(Topic, 100, 2));
+        var pq = new PopProcessQueue();
+        pq.IncFoundMsg(1);
+
+        Assert.True(Hit(c, mq), "2 buffered messages pause the pull on a gate of 1");
+        Assert.Equal(1L, c.FlowControlTriggered);
+        Assert.True(PopHit(c, mq, pq), "1 awaited ack pauses the pop on a threshold of 0");
+        // one client-wide flow-control count spans the pull path and the POP path
+        Assert.Equal(2L, c.FlowControlTriggered);
+
+        // Round the shared counter up to 1000 on the POP path, so the next trip is the warn trip.
+        for (int round = 3; round <= 1000; round++)
+        {
+            Assert.True(PopHit(c, mq, pq), $"pop round {round} must still pause");
+        }
+
+        Assert.Equal(1000L, c.FlowControlTriggered);
+        Assert.False(DefaultMQPushConsumer.IsFlowControlWarnTrip(c.FlowControlTriggered),
+            "1000 trips leave the cadence silent");
+        List<string> warns = CapturePopWarns(c, mq, pq);
+        Assert.Equal(1001L, c.FlowControlTriggered);
+        Assert.Single(warns);
+        Assert.Contains("the messages waiting to ack (1) exceeds the pop threshold 0", warns[0]);
+        Assert.Contains("pause pop for 50 ms (flowControlTimes=1001)", warns[0]);
+    }
+
+    /// <summary>One POP trip, captured from the log file the gate itself writes, with the same
+    /// rotation-limit care the pull-side capture takes.</summary>
+    private static List<string> CapturePopWarns(DefaultMQPushConsumer c, MessageQueue mq, PopProcessQueue pq)
+    {
+        string dir = Path.Combine(Path.GetTempPath(),
+            "rmq_dotnet_pop_fc_" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(dir);
+        string path = Path.Combine(dir, "flow.log");
+        long sizeBefore = ClientLog.LogFileMaxSize;
+        int indexBefore = ClientLog.LogFileMaxIndex;
+        try
+        {
+            ClientLog.SetLogFileLimits(256L * 1024 * 1024, 1);
+            ClientLog.SetLogFile(path);
+            ClientLog.SetLogLevel(LogLevel.Debug);
+            Assert.True(PopHit(c, mq, pq), "this trip must pause the pop");
+            ClientLog.FlushLogFile();
+            string[] lines = ReadAllLinesShared(path);
+            return lines.Where(l => l.Contains(" WARN  [")).ToList();
+        }
+        finally
+        {
+            ClientLog.SetLogFile(string.Empty);
+            ClientLog.FlushLogFile();
+            ClientLog.SetLogLevel(LogLevel.Info);
+            ClientLog.SetLogFileLimits(sizeBefore, indexBefore);
+            try
+            {
+                Directory.Delete(dir, recursive: true);
+            }
+            catch
+            {
+                // A cleanup failure does not affect the test
+            }
+        }
+    }
 }

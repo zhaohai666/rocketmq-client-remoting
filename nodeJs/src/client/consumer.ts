@@ -30,6 +30,7 @@ import { ProcessQueue } from './process_queue.ts';
 import { PopProcessQueue } from './pop_process_queue.ts';
 import {
   syncPopLoops, retirePopQueue, setMessageRequestModeOnBroker,
+  POP_DELAY_WHEN_CACHE_FLOW_CONTROL,
 } from './pop_consumer.ts';
 import {
   LocalFileOffsetStore, RemoteBrokerOffsetStore, ReadOffsetMode, mqKey,
@@ -1514,6 +1515,33 @@ export class DefaultMQPushConsumer {
       logger.warn('flow control: queue %s %s exceeds its cache threshold, pause pull for %d ms'
         + ' (flowControlTimes=%d)', mqKey(mq), reason, PULL_TIME_DELAY_MILLS_WHEN_FLOW_CONTROL,
         this.flowControlTriggered);
+    }
+    return true;
+  }
+
+  // _popFlowControlHit is the POP twin of _flowControlHit and it feeds the SAME
+  // counter, so flowControlTimes stays one client-wide number that spans the
+  // pull path and the POP path and the WARN cadence throttles both gates
+  // together.
+  //
+  // What it measures is not a buffer but this queue's OUTSTANDING-ACK DEBT: the
+  // messages the broker made invisible for this queue and whose answer (ACK or
+  // CHANGE_INVISIBLETIME) is still owed. Like the pull gate, it judges ONE
+  // queue's own debt strictly GREATER THAN popThresholdForQueue and never sums
+  // the debts of sibling queues: a queue that owes nothing keeps popping while
+  // its hot sibling waits, so one runaway queue cannot stall the group.
+  // Reaching the threshold exactly still pops, so the knob reads as "how many
+  // answers may be outstanding", not "how many stop us".
+  private _popFlowControlHit(key: string, pq: PopProcessQueue): boolean {
+    const waitAck = pq.waitAckMsgCount();
+    if (waitAck <= this.popThresholdForQueue) return false;
+    this.flowControlTriggered++;
+    logger.debug('pop flow control: queue %s waiting-ack=%d exceeds pop threshold %d',
+      key, waitAck, this.popThresholdForQueue);
+    if (isFlowControlWarnTrip(this.flowControlTriggered)) {
+      logger.warn('pop flow control: queue %s waiting-ack=%d exceeds pop threshold %d,'
+        + ' pause pop for %d ms (flowControlTimes=%d)', key, waitAck, this.popThresholdForQueue,
+        POP_DELAY_WHEN_CACHE_FLOW_CONTROL, this.flowControlTriggered);
     }
     return true;
   }

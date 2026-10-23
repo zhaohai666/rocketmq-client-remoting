@@ -24,7 +24,7 @@ git clone <本仓库> && cd rocketmq-client-remoting/nodeJs
 node --experimental-strip-types selfcheck.ts
 ```
 
-`selfcheck.ts` 加载 `src/` 全部 **65** 个模块并依次跑 **37** 套离线冒烟（两份清单都由目录树推导，新增文件不会漏出自检），2026-10-24 实测 **ALL GREEN**，共 **1168** 项检查。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
+`selfcheck.ts` 加载 `src/` 全部 **65** 个模块并依次跑 **37** 套离线冒烟（两份清单都由目录树推导，新增文件不会漏出自检），2026-10-24 实测 **ALL GREEN**，共 **1190** 项检查。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
 
 | 套件 | 实测 |
 | --- | --- |
@@ -44,7 +44,7 @@ node --experimental-strip-types selfcheck.ts
 | `test/consumer_smoke.ts` | 30 通过 / 0 失败 |
 | `test/consumer_status_reply_smoke.ts`（221 状态应答 + 307/309 未托管组 + 220 单向） | 22 通过 / 0 失败 |
 | `test/fixes2_smoke.ts` | 40 项检查通过 |
-| `test/flow_control_smoke.ts`（每队列三条闸门：只看本队列缓存、缓存闸门 50ms、broker 215 的 20ms、其余拉取失败 500ms，POP 队列同一条判断） | 65 项检查通过 |
+| `test/flow_control_smoke.ts`（每队列三条闸门：只看本队列缓存、缓存闸门 50ms、broker 215 的 20ms、其余拉取失败 500ms；POP 队列的待 ack 欠账闸门默认 96、严格大于才停，命中记进拉取路径同一个流控计数与告警节奏，POP 被 broker 回 215 同样只等 20ms） | 87 项检查通过 |
 | `test/heartbeat_v2_beat_smoke.ts` | 28 通过 / 0 失败 |
 | `test/heartbeat_v2_smoke.ts` | 30 通过 / 0 失败 |
 | `test/initial_offset_policy_smoke.ts`（初始位点：广播 / TIMESTAMP / %RETRY% / SQL92） | 40 通过 / 0 失败 |
@@ -316,7 +316,7 @@ producer.setSocksProxyConfig({ addr: '127.0.0.1:1080', version: 4 });           
 - ✅ Producer：同步 / 批量 / 单向 / 异步（公平信号量背压）/ 队列选择器 / 顺序 / 延迟与 5.x 定时 / 事务两阶段 + 回查 / Request-Reply（326 接收闭环）/ recallMessage / VIP channel（port-2）
 - ✅ PushConsumer：并发 / 顺序 / 广播、长轮询、位点持久化、流控阈值、307/220/221 应答、RETRY 还原、suspend/resume、核心线程数在线调整
 - ✅ PullConsumer / LitePullConsumer：短/长轮询、assign+seek+commitSync、自动提交、topic 队列变更监听
-- ✅ POP 消费模式：POP(200050)/ACK(200051)/CHANGE_INVISIBLE(200053)/BATCH_ACK(200151)/SET_MESSAGE_REQUEST_MODE(401)、POP_CK 双路径、欠账流控、退避表
+- ✅ POP 消费模式：POP(200050)/ACK(200051)/CHANGE_INVISIBLE(200053)/BATCH_ACK(200151)/SET_MESSAGE_REQUEST_MODE(401)、POP_CK 双路径、欠账流控（本队列待 ack 严格大于 `popThresholdForQueue`，默认 96，命中记进拉取路径同一个流控计数）、退避表
 - ✅ Admin：topic CRUD、集群/运行时信息、订阅组、消费统计、连接查询、位点重置与读取、KV 配置、NameServer 配置（318/319）、消息查询/查看、consumeMessageDirectly
 - ✅ ACL（HMAC-SHA1 + Base64）与 RPC 钩子链（Namespace → Stream → 用户钩子）
 - ✅ 命名空间两套：`namespace` 前缀 + `namespaceV2` 线上盖章；clientId `<ip>@<instanceName>[@<unitName>][@STREAM]`

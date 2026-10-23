@@ -56,9 +56,7 @@ func (c *DefaultMQPushConsumer) queuePopLoop(mq common.MessageQueue, stop chan s
 			}
 			continue
 		}
-		if pq.WaitAckMsgCount() > c.popThresholdForQueueValue() {
-			common.LogDebugf("pop flow control: queue %v waiting-ack=%d exceeds threshold %d",
-				mq, pq.WaitAckMsgCount(), c.popThresholdForQueueValue())
+		if c.popFlowControlHit(mq, pq) {
 			if c.sleepOrStop(stop, popDelayWhenCacheFlowControl*time.Millisecond) {
 				return
 			}
@@ -116,6 +114,41 @@ func (c *DefaultMQPushConsumer) queuePopLoop(mq common.MessageQueue, stop chan s
 			}
 		}
 	}
+}
+
+// popFlowControlHit reports whether this queue's outstanding-ACK debt is over the
+// POP cache threshold, and records the trip on the SAME counter the pull path's
+// cache gate bumps. One client-wide flowControlTimes number therefore spans both
+// consumption modes: an operator reading the diagnostics sees the whole throttling
+// picture of this client instead of half of it, and the WARN cadence (first trip,
+// then one per flowControlWarnEvery trips) keeps its meaning across both paths.
+//
+// Only THIS queue's own debt is judged — popThresholdForQueue is a plain per-queue
+// knob and is never divided at rebalance (see divideTopicThresholds). Like the
+// pull gates the comparison is strictly greater than, so a queue sitting exactly on
+// the threshold keeps popping; the wait itself stays with the loop, so a shutdown
+// interrupts it instead of running the pause out.
+func (c *DefaultMQPushConsumer) popFlowControlHit(mq common.MessageQueue, pq *popProcessQueue) bool {
+	if pq == nil {
+		return false
+	}
+	waitAck := pq.WaitAckMsgCount()
+	threshold := c.popThresholdForQueueValue()
+	if waitAck <= threshold {
+		return false
+	}
+
+	c.mu.Lock()
+	c.flowControlTriggered++
+	times := c.flowControlTriggered
+	c.mu.Unlock()
+	common.LogDebugf("pop flow control: queue %v waiting-ack=%d exceeds pop threshold %d, pause pop",
+		mq, waitAck, threshold)
+	if isFlowControlWarnTrip(times) {
+		common.LogWarnf("pop flow control: queue %v waiting-ack=%d exceeds pop threshold %d, pause pop for %dms (flowControlTimes=%d)",
+			mq, waitAck, threshold, popDelayWhenCacheFlowControl, times)
+	}
+	return true
 }
 
 // popOnce issues one POP_MESSAGE and returns the processed result.

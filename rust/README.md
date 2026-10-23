@@ -26,7 +26,7 @@ NameServer + Broker，无 proxy、无本地扩展依赖、无代码生成步骤�
 ```bash
 cd rust
 cargo build --all-targets                       # lib + 42 个 examples
-cargo test --quiet                              # 1113 passed; 0 failed; 0 ignored（~10s）
+cargo test --quiet                              # 1115 passed; 0 failed; 0 ignored（~10s）
 cargo clippy --all-targets --all-features -- -D warnings  # 零 warning 是硬门槛
 ```
 
@@ -251,7 +251,7 @@ ROCKETMQ_TLS_ENABLE=1 cargo run --quiet --example live_producer -- 127.0.0.1:987
   连接判死快速失败
 - ✅ Producer：上表九种发送形态全覆盖
 - ✅ PushConsumer：长轮询 + POP（`POP_CK` / ACK / CHANGE_INVISIBLE）、顺序、广播、
-  重试 / 死信、位点持久化、拉取停摆自愈
+  重试 / 死信、位点持久化、拉取停摆自愈、POP 的待 ack 欠账闸门（严格大于 `pop_threshold_for_queue`，默认 96，命中记进拉取路径同一个流控计数与告警节奏）
 - ✅ PullConsumer / LitePullConsumer（含队列变更监听、三张位点表、pause / resume）
 - ✅ 六个队列分配策略（AVG / AVG_BY_CIRCLE / CONFIG / CONSISTENT_HASH / MACHINE_ROOM /
   MACHINE_ROOM_NEARBY），可插拔并由真实重平衡驱动

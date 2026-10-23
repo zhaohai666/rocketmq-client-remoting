@@ -8,7 +8,7 @@ declare(strict_types=1);
  * Run: php tests/RunClientFlowControl.php (or via tests/run_all.php)
  * On success prints "ALL TESTS PASSED (N checks)"; any failure lists details and exits non-zero.
  *
- * Three contracts are pinned here:
+ * These contracts are pinned here:
  *
  * 1. Cache gates compare **strictly greater than** their thresholds. A buffer that has reached a
  *    threshold exactly is still allowed to pull, so every gate test sits next to its boundary
@@ -24,6 +24,11 @@ declare(strict_types=1);
  * 4. A gate judges **one queue's own buffer** and nothing else: the two topic-level budgets are not
  *    consulted at pull time (they are split into the per-queue knobs during rebalance), so the
  *    sibling queues of a topic never add up to a pause.
+ * 5. The POP wait-ack gate is the **same event** as a throttled pull, so it feeds the same counter,
+ *    arms the same pause and warns on the same cadence -- only its log wording differs, on both
+ *    tiers: the wait-ack debt as a count, the pop threshold it breached and the queue's current
+ *    offset, ending in the pause of the pop request. The pull texts the pull suites assert on are
+ *    asserted whole next to them and stay untouched.
  *
  * The gates are driven by seeding the queue's cached messages and calling the gate directly, and a
  * pull round is driven one queue at a time against an instance double that records the requests it
@@ -707,20 +712,41 @@ final class RunClientFlowControl
      */
     private function popConsumer(FcInstance $inst, string $group, string $topic, int $waitAck): array
     {
+        $sets = $this->popQueueSet($inst, $group, $topic, [0 => $waitAck]);
+        return [$sets[0][0], $sets[0][1], $sets[0][2], $inst];
+    }
+
+    /**
+     * The same wiring over several queues of one topic, each with its own wait-ack debt, so a POP
+     * round can be judged queue by queue.
+     *
+     * @param array<int,int> $waitAckByQueueId
+     * @return list<array{0:DefaultMQPushConsumer,1:MessageQueue,2:string}>
+     */
+    private function popQueueSet(FcInstance $inst, string $group, string $topic, array $waitAckByQueueId): array
+    {
         $c = new DefaultMQPushConsumer($group);
         $c->subscribe($topic);
         $this->setProp($c, 'started', true);
         $c->mqClient = $inst;
-        $mq = new MessageQueue($topic, 'b-fc', 0);
-        $key = message_queue_key($mq);
-        $pq = new \RocketMQ\Client\PopProcessQueue();
-        $pq->incFoundMsg($waitAck);
-        $this->setProp($c, 'mqMap', [$key => $mq]);
-        $this->setProp($c, 'popQueues', [$key => $pq]);
+        $mqMap = [];
+        $pops = [];
+        $sets = [];
+        foreach ($waitAckByQueueId as $queueId => $waitAck) {
+            $mq = new MessageQueue($topic, 'b-fc', (int) $queueId);
+            $key = message_queue_key($mq);
+            $pq = new \RocketMQ\Client\PopProcessQueue();
+            $pq->incFoundMsg($waitAck);
+            $mqMap[$key] = $mq;
+            $pops[$key] = $pq;
+            $sets[] = [$c, $mq, $key];
+        }
+        $this->setProp($c, 'mqMap', $mqMap);
+        $this->setProp($c, 'popQueues', $pops);
         $this->setProp($c, 'subscriptionData', [
             $topic => new \RocketMQ\Common\SubscriptionData($topic, '*'),
         ]);
-        return [$c, $mq, $key, $inst];
+        return $sets;
     }
 
     private function testPopGateArmsThePause(): void
@@ -758,6 +784,231 @@ final class RunClientFlowControl
         $this->checkSame(1, $inst2->popCount(),
             'a debt of exactly the threshold is still allowed to pop (>, not >=)');
         $this->checkSame(0, $c2->flowControlTriggeredCount(), 'a round that does not trip counts nothing');
+    }
+
+    /**
+     * A POP trip must read differently from a pull trip on both tiers: it names the wait-ack debt as
+     * a count, the pop threshold it breached and the queue's current offset the round stood on, and
+     * it pauses the pop rather than a pull. Every text here is asserted whole -- the message after
+     * the "[time] TIER: " prefix, read from the log handler -- so the wording is pinned from recorded
+     * state, never from a sleep window and never through a substring helper.
+     */
+    private function testPopTripNamesTheDebtInTheLog(): void
+    {
+        $this->captureLogs(Logger::DEBUG);
+        try {
+            // Leg 1: the queue has a current offset, and both tiers must carry it.
+            $inst = new FcInstance('fc-pop-word-' . uniqid(), []);
+            [$c, $mq, $key] = $this->popQueueSet($inst, 'GID-FC-POP-WORD', 'FCPopWord', [0 => 3])[0];
+            $c->popThresholdForQueue = 2;
+            $this->setProp($c, 'offsetTable', [$key => 777]);
+            $this->call($c, 'popOnce', [$mq, $key, microtime(true)]);
+
+            $debug = $this->linesOf('DEBUG');
+            $this->checkSame(1, count($debug), 'one pop trip logs exactly one debug line');
+            $this->checkSame(
+                "flow control: queue $mq the messages waiting to ack (3) exceeds the pop threshold 2,"
+                    . ' at offset 777, pause pop',
+                $this->messageOf((string) ($debug[0] ?? '')),
+                'the pop debug line carries the debt, the pop threshold, the queue offset and the pop pause',
+            );
+            $this->check(!str_contains((string) ($debug[0] ?? ''), 'waitAckCount='),
+                'the bare wait-ack count reason no longer reaches the log');
+            $this->check(!str_contains((string) ($debug[0] ?? ''), 'pause pull'),
+                'a pop debug line does not claim to pause a pull');
+            $warns = $this->linesOf('WARNING');
+            $this->checkSame(1, count($warns), 'the first pop trip warns');
+            $this->checkSame(
+                "flow control: queue $mq the messages waiting to ack (3) exceeds the pop threshold 2"
+                    . ' at offset 777, so do flow control, pause pop for 50 ms (flowControlTimes=1)',
+                $this->messageOf((string) ($warns[0] ?? '')),
+                'the pop warn line carries the debt, the threshold, the queue offset and the trip it fired on',
+            );
+
+            // Leg 2: a queue whose offset this client never resolved states that instead of inventing 0.
+            $this->captured = [];
+            $inst2 = new FcInstance('fc-pop-word2-' . uniqid(), []);
+            [$c2, $mq2, $key2] = $this->popQueueSet($inst2, 'GID-FC-POP-WORD2', 'FCPopWord2', [0 => 3])[0];
+            $c2->popThresholdForQueue = 2;
+            $this->call($c2, 'popOnce', [$mq2, $key2, microtime(true)]);
+            $noOffset = $this->linesOf('DEBUG');
+            $this->checkSame(1, count($noOffset), 'the offsetless pop trip logs one debug line');
+            $this->checkSame(
+                "flow control: queue $mq2 the messages waiting to ack (3) exceeds the pop threshold 2,"
+                    . ' at offset unknown, pause pop',
+                $this->messageOf((string) ($noOffset[0] ?? '')),
+                'a pop debug line without a resolved offset says so',
+            );
+            $noOffsetWarns = $this->linesOf('WARNING');
+            $this->checkSame(1, count($noOffsetWarns), 'the offsetless pop trip warns too');
+            $this->checkSame(
+                "flow control: queue $mq2 the messages waiting to ack (3) exceeds the pop threshold 2"
+                    . ' at offset unknown, so do flow control, pause pop for 50 ms (flowControlTimes=1)',
+                $this->messageOf((string) ($noOffsetWarns[0] ?? '')),
+                'a pop warn line without a resolved offset says so',
+            );
+
+            // Paired control: the pull path keeps its exact wording, counter and cadence shared.
+            $this->captured = [];
+            $pullMq = new MessageQueue('GateTopic', 'b-fc', 0);
+            $c3 = $this->gateConsumer('GID-FC-PULL-WORD');
+            $c3->pullThresholdForQueue = 1;
+            $c3->pullThresholdSizeForQueue = 100;
+            $c3->consumeConcurrentlyMaxSpan = 2000;
+            $this->hit($c3, $pullMq, $this->msgs([0, 1]));
+            $pullDebug = $this->linesOf('DEBUG');
+            $this->checkSame(1, count($pullDebug), 'one pull trip still logs exactly one debug line');
+            $this->checkSame(
+                "flow control: queue $pullMq count=2, pause pull",
+                $this->messageOf((string) ($pullDebug[0] ?? '')),
+                'the pull debug line keeps its wording untouched',
+            );
+            $pullWarns = $this->linesOf('WARNING');
+            $this->checkSame(1, count($pullWarns), 'the first pull trip still warns');
+            $this->checkSame(
+                "flow control: queue $pullMq count=2 exceeds its cache threshold,"
+                    . ' pause pull for 50 ms (flowControlTimes=1)',
+                $this->messageOf((string) ($pullWarns[0] ?? '')),
+                'the pull warn line keeps its wording untouched',
+            );
+        } finally {
+            $this->releaseLogs();
+        }
+    }
+
+    /** The message of a captured line, with its "[timestamp] TIER: " prefix and line feed stripped. */
+    private function messageOf(string $line): string
+    {
+        foreach (['DEBUG', 'INFO', 'WARNING', 'ERROR'] as $tier) {
+            $needle = $tier . ': ';
+            $pos = strpos($line, $needle);
+            if ($pos !== false) {
+                return rtrim(substr($line, $pos + strlen($needle)), "\n");
+            }
+        }
+        return rtrim($line, "\n");
+    }
+
+    /**
+     * One counter, two paths: the pop trip and the pull trip of the same consumer add up, so the
+     * warn cadence and any diagnostic reading the counter see one budget, not two.
+     */
+    private function testPopAndPullTripsShareOneCounter(): void
+    {
+        $inst = new FcInstance('fc-pop-counter-' . uniqid(), []);
+        [$c, $mq, $key] = $this->popQueueSet($inst, 'GID-FC-POP-COUNTER', 'FCPopCounter', [0 => 2])[0];
+        $c->popThresholdForQueue = 1;
+        $this->call($c, 'popOnce', [$mq, $key, microtime(true)]);
+        $this->checkSame(1, $c->flowControlTriggeredCount(), 'the pop trip is the first hit on the counter');
+
+        // The very same consumer then trips a pull gate: no second counter can absorb it.
+        $c->pullThresholdForQueue = 1;
+        $c->pullThresholdSizeForQueue = 100;
+        $c->consumeConcurrentlyMaxSpan = 2000;
+        $this->setProp($c, 'flowControlUntil', []);
+        $this->checkSame(true, $this->hit($c, $mq, $this->msgs([0, 1])), 'the pull gate trips too');
+        $this->checkSame(2, $c->flowControlTriggeredCount(),
+            'the pull trip lands on the counter the pop trip already used');
+
+        // Control: a consumer whose only trip is a pull trip still reads 1.
+        $c2 = $this->gateConsumer('GID-FC-PULL-ONLY');
+        $c2->pullThresholdForQueue = 1;
+        $c2->pullThresholdSizeForQueue = 100;
+        $c2->consumeConcurrentlyMaxSpan = 2000;
+        $this->hit($c2, new MessageQueue('GateTopic', 'b-fc', 0), $this->msgs([0, 1]));
+        $this->checkSame(1, $c2->flowControlTriggeredCount(),
+            'a pull-only consumer counts one trip, so the shared counter is not inflated');
+    }
+
+    /**
+     * The warn cadence is fed by pop trips too: the predicate picks the 1st trip and then every
+     * 1000th after it, and a pop trip that lands on the next warn threshold really emits the warn.
+     * The counter is seeded rather than driven 1000 times, so no case waits on a clock.
+     */
+    private function testPopTripsFeedTheWarnCadence(): void
+    {
+        $this->checkSame(true, DefaultMQPushConsumer::isFlowControlWarnTrip(1),
+            'the predicate picks a first pop trip');
+        $this->checkSame(false, DefaultMQPushConsumer::isFlowControlWarnTrip(2),
+            'the predicate keeps a second pop trip at debug level');
+        $this->checkSame(false, DefaultMQPushConsumer::isFlowControlWarnTrip(1000),
+            'trip 1000 is not the warn trip; the cadence counts from the first');
+        $this->checkSame(true, DefaultMQPushConsumer::isFlowControlWarnTrip(1001),
+            'trip 1001 is the next warn trip a pop path can land on');
+
+        $this->captureLogs(Logger::DEBUG);
+        try {
+            $inst = new FcInstance('fc-pop-cadence-' . uniqid(), []);
+            [$c, $mq, $key] = $this->popQueueSet($inst, 'GID-FC-POP-CADENCE', 'FCPopCadence', [0 => 2])[0];
+            $c->popThresholdForQueue = 1;
+            $this->setProp($c, 'flowControlTriggered', 1000);
+            $this->call($c, 'popOnce', [$mq, $key, microtime(true)]);
+            $this->checkSame(1001, $c->flowControlTriggeredCount(),
+                'the seeded counter let the pop trip land on 1001');
+            $warns = $this->linesOf('WARNING');
+            $this->checkSame(1, count($warns),
+                'a pop trip on the warn threshold warns just like a pull trip');
+            $this->checkSame(
+                "flow control: queue $mq the messages waiting to ack (2) exceeds the pop threshold 1"
+                    . ' at offset unknown, so do flow control, pause pop for 50 ms (flowControlTimes=1001)',
+                $this->messageOf((string) ($warns[0] ?? '')),
+                'the pop warn line carries the shared trip counter it fired on',
+            );
+            $this->checkSame(1, count($this->linesOf('DEBUG')),
+                'a pop trip between two warns still logs its debug line');
+
+            // The next pop trip is one past the warn threshold: debug only.
+            $this->captured = [];
+            $this->setProp($c, 'flowControlUntil', []);
+            $this->call($c, 'popOnce', [$mq, $key, microtime(true)]);
+            $this->checkSame(1002, $c->flowControlTriggeredCount(), 'the counter keeps counting up');
+            $this->checkSame(0, count($this->linesOf('WARNING')),
+                'trip 1002 on the pop path stays at debug level');
+            $this->checkSame(1, count($this->linesOf('DEBUG')),
+                'the quiet pop trip still leaves its debug line');
+        } finally {
+            $this->releaseLogs();
+        }
+    }
+
+    /**
+     * The pop pause is armed per queue: one queue past its own wait-ack threshold is skipped while
+     * its sibling, which holds nothing at all, pops on the very same round.
+     */
+    private function testPopPauseIsPerQueue(): void
+    {
+        $inst = new FcInstance('fc-pop-perq-' . uniqid(), []);
+        $sets = $this->popQueueSet($inst, 'GID-FC-POP-PERQ', 'FCPopPerQ', [0 => 3, 1 => 0]);
+        $c = $sets[0][0];
+        $c->popThresholdForQueue = 2;
+        [$mqA, $keyA] = [$sets[0][1], $sets[0][2]];
+        [$mqB, $keyB] = [$sets[1][1], $sets[1][2]];
+
+        $this->call($c, 'popOnce', [$mqA, $keyA, microtime(true)]);
+        $this->call($c, 'popOnce', [$mqB, $keyB, microtime(true)]);
+
+        $this->checkSame(1, $inst->popCount(),
+            'the throttled queue sends nothing while its empty sibling pops on the same round');
+        $this->checkSame(
+            [['topic' => 'FCPopPerQ', 'group' => 'GID-FC-POP-PERQ', 'queueId' => 1]],
+            $inst->pops,
+            'the request that went out is the sibling queue with no wait-ack debt',
+        );
+        $until = (array) $this->prop($c, 'flowControlUntil');
+        $this->check(isset($until[$keyA]), 'only the over-threshold queue armed a pause');
+        $this->check(!isset($until[$keyB]), 'the empty sibling armed no pause');
+        $this->checkSame(1, $c->flowControlTriggeredCount(),
+            'one over-threshold queue of two is one trip, not two');
+
+        // The armed pause holds only its own queue back: driven again inside the window queue A
+        // sends nothing again and the counter does not move, while queue B pops a second time.
+        $this->call($c, 'popOnce', [$mqA, $keyA, microtime(true)]);
+        $this->checkSame(1, $inst->popCount(), 'queue A is still inside its own pop pause');
+        $this->checkSame(1, $c->flowControlTriggeredCount(),
+            'a round skipped by the pause is not a fresh trip');
+        $this->setProp($c, 'idleUntil', []);
+        $this->call($c, 'popOnce', [$mqB, $keyB, microtime(true)]);
+        $this->checkSame(2, $inst->popCount(), 'the sibling keeps popping on its own rounds');
     }
 
     // ================================================================ 11. the gate never sums siblings
@@ -870,6 +1121,10 @@ final class RunClientFlowControl
         $this->testBrokerBackoffMapping();
         $this->testBrokerBackoffArmsThePause();
         $this->testPopGateArmsThePause();
+        $this->testPopTripNamesTheDebtInTheLog();
+        $this->testPopAndPullTripsShareOneCounter();
+        $this->testPopTripsFeedTheWarnCadence();
+        $this->testPopPauseIsPerQueue();
         $this->testGateNeverSumsTheQueuesOfATopic();
         return $this->summary();
     }

@@ -28,7 +28,7 @@ python3 -m venv .venv
 .venv/bin/pip install -e .                     # top-level packages: client / common / remoting
 
 .venv/bin/pip install pytest                   # needed only to run the unit tests
-.venv/bin/python -m pytest tests/ -q           # 1638 passed, 4 skipped
+.venv/bin/python -m pytest tests/ -q           # 1645 passed, 4 skipped
 .venv/bin/python selfcheck.py                  # selfcheck: 7/7 passed
 ```
 
@@ -383,7 +383,7 @@ third-party dependencies.
 | Push consumer: concurrent / orderly listeners, broadcasting, the three per-queue cache gates (topic budgets divided over the owned queues), offset correction and reset, stalled-loop recovery, expired-message sweep | ✅ |
 | Pull consumer: manual pull + long polling + manual commit + offset lookup by timestamp | ✅ |
 | Lite pull consumer: `poll` / `assign` / `seek` / `pause` / `commit`, three offset tables (pull / consumed / committed cursors), topic queue-change listener | ✅ |
-| POP consumption loop (`pop_mode`, with ack / renew / orderly POP) | ✅ |
+| POP consumption loop (`pop_mode`, with ack / renew / orderly POP / the outstanding-ACK cache gate: this queue's debt strictly above `pop_threshold_for_queue` (default 96) pauses the round for 50ms and is counted on the pull path's client-wide flow-control total) | ✅ |
 | Queue allocation strategies: AVG / AVG_BY_CIRCLE / CONFIG / CONSISTENT_HASH / MACHINE_ROOM / MACHINE_ROOM_NEARBY | ✅ |
 | Two namespace schemes: local `namespace` prefix and server-side `namespace_v2` | ✅ |
 | ACL signing (incl. SecurityToken): `AclClientRPCHook` / `NamespaceRpcHook` / `StreamTypeRPCHook` | ✅ |

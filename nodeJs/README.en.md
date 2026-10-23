@@ -24,7 +24,7 @@ git clone <this repo> && cd rocketmq-client-remoting/nodeJs
 node --experimental-strip-types selfcheck.ts
 ```
 
-`selfcheck.ts` loads all **65** modules under `src/` and then runs the **37** offline smoke suites (both lists are derived from the tree, so a new file cannot slip past the check); measured **ALL GREEN** on 2026-10-24, **1168** checks in total. Run a single suite with `node --experimental-strip-types test/<suite>.ts`; measured results:
+`selfcheck.ts` loads all **65** modules under `src/` and then runs the **37** offline smoke suites (both lists are derived from the tree, so a new file cannot slip past the check); measured **ALL GREEN** on 2026-10-24, **1190** checks in total. Run a single suite with `node --experimental-strip-types test/<suite>.ts`; measured results:
 
 | Suite | Measured |
 | --- | --- |
@@ -44,7 +44,7 @@ node --experimental-strip-types selfcheck.ts
 | `test/consumer_smoke.ts` | 30 passed / 0 failed |
 | `test/consumer_status_reply_smoke.ts` (221 status reply + 307/309 unhosted group + 220 oneway) | 22 passed / 0 failed |
 | `test/fixes2_smoke.ts` | 40 checks passed |
-| `test/flow_control_smoke.ts` (three per-queue gates: only this queue's own buffer counts; cache gate 50ms, the broker's 215 gets 20ms, every other failed pull 500ms, POP queues on the same branch) | 65 checks passed |
+| `test/flow_control_smoke.ts` (three per-queue gates: only this queue's own buffer counts; cache gate 50ms, the broker's 215 gets 20ms, every other failed pull 500ms; the POP queue's outstanding-ACK gate defaults to 96 and trips strictly above it, a trip lands on the same flow-control counter and warn cadence as the pull path, and a POP request answered 215 also waits only 20ms) | 87 checks passed |
 | `test/heartbeat_v2_beat_smoke.ts` | 28 passed / 0 failed |
 | `test/heartbeat_v2_smoke.ts` | 30 passed / 0 failed |
 | `test/initial_offset_policy_smoke.ts` (start position: broadcasting / TIMESTAMP / %RETRY% / SQL92) | 40 passed / 0 failed |
@@ -321,7 +321,7 @@ producer.setSocksProxyConfig({ addr: '127.0.0.1:1080', version: 4 });           
 - ✅ Producer: sync / batch / oneway / async (fair-semaphore back-pressure) / queue selector / ordered / delayed and 5.x timed / transaction two-phase + check-back / Request-Reply (326 receive-side closed loop) / recallMessage / VIP channel (port-2)
 - ✅ PushConsumer: concurrently / orderly / broadcasting, long polling, offset persistence, flow-control thresholds, 307/220/221 responses, RETRY restoration, suspend/resume, online core-thread resizing
 - ✅ PullConsumer / LitePullConsumer: short/long polling, assign + seek + commitSync, auto-commit, topic queue-change listener
-- ✅ POP consumption: POP(200050)/ACK(200051)/CHANGE_INVISIBLE(200053)/BATCH_ACK(200151)/SET_MESSAGE_REQUEST_MODE(401), POP_CK dual-path reconstruction, ack-debt flow control, back-off table
+- ✅ POP consumption: POP(200050)/ACK(200051)/CHANGE_INVISIBLE(200053)/BATCH_ACK(200151)/SET_MESSAGE_REQUEST_MODE(401), POP_CK dual-path reconstruction, ack-debt flow control (this queue's outstanding acks strictly above `popThresholdForQueue`, default 96, counted on the same flow-control counter as the pull path), back-off table
 - ✅ Admin: topic CRUD, cluster/runtime info, subscription groups, consume statistics, connection queries, offset reset and read, KV config, NameServer config (318/319), message query/view, consumeMessageDirectly
 - ✅ ACL (HMAC-SHA1 + Base64) and the RPC hook chain (Namespace → Stream → user hook)
 - ✅ Two namespace mechanisms: `namespace` prefix + `namespaceV2` wire stamping; clientId `<ip>@<instanceName>[@<unitName>][@STREAM]`

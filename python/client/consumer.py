@@ -2387,8 +2387,10 @@ class DefaultMQPushConsumer:
                 sub = self.subscription_data.get(mq.topic)
             if sub is None:
                 return
-            # Flow control: too many popped-but-unacked, back off first (pop_threshold_for_queue)
-            if pq.wait_ack_count() > self.pop_threshold_for_queue:
+            # Flow control: this queue has too many popped-but-unacked messages (strictly over
+            # pop_threshold_for_queue), so back off first. This wait-ack gate is the POP path's only
+            # cache gate and it shares the pull path's flow-control counter (see _pop_flow_control_hit).
+            if self._pop_flow_control_hit(mq, pq):
                 time.sleep(PULL_TIME_DELAY_WHEN_CACHE_FLOW_CONTROL)
                 continue
             began = time.time()
@@ -2765,6 +2767,34 @@ class DefaultMQPushConsumer:
             logger.warning("flow control: queue %s %s exceeds its cache threshold, pause pull for %.0f ms"
                            " (flowControlTimes=%d)",
                            mq, reason, PULL_TIME_DELAY_WHEN_CACHE_FLOW_CONTROL * 1000, times)
+        return True
+
+    def _pop_flow_control_hit(self, mq: MessageQueue, pq: "PopProcessQueue") -> bool:
+        """Whether the POP path's cache gate hits: this queue has too many popped-but-unacked messages.
+
+        POP keeps no "pulled but not consumed" buffer, so this wait-ack gate is the **only** cache gate
+        on the POP path -- the count / bytes / span checks of ``_flow_control_hit`` have nothing to read
+        here. As on the pull path the comparison is **strictly greater than** the threshold
+        (``pop_threshold_for_queue``, default 96), and only **this queue's own** debt is read: sibling
+        queues are never summed.
+
+        A hit is counted on the **same** ``_flow_control_triggered`` counter the pull path uses, so one
+        client-wide flow-control total spans both paths and the throttled warn cadence (see
+        ``is_flow_control_warn_trip``) also sees the POP trips.
+        """
+        wait_ack = pq.wait_ack_count()
+        if wait_ack <= self.pop_threshold_for_queue:
+            return False
+        with self._lock:
+            self._flow_control_triggered += 1
+            times = self._flow_control_triggered
+        logger.debug("flow control: queue %s wait_ack=%d over pop_threshold_for_queue=%d, pause pop",
+                     mq, wait_ack, self.pop_threshold_for_queue)
+        if is_flow_control_warn_trip(times):
+            logger.warning("flow control: queue %s wait_ack=%d exceeds its pop_threshold_for_queue=%d,"
+                           " pause pop for %.0f ms (flowControlTimes=%d)",
+                           mq, wait_ack, self.pop_threshold_for_queue,
+                           PULL_TIME_DELAY_WHEN_CACHE_FLOW_CONTROL * 1000, times)
         return True
 
     def _resolve_initial_offset(self, client: MQClientInstance,

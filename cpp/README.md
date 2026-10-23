@@ -51,10 +51,10 @@ cd build && ctest --output-on-failure
 
 ```
 100% tests passed out of 68
-Total Test time (real) = 94.16 sec
+Total Test time (real) = 117.72 sec
 ```
 
-68 个用例 = 67 个测试二进制（5868 项断言）+ 1 个编解码互调用例（73 项断言），共 **5941 项断言**。
+68 个用例 = 67 个测试二进制（6969 项断言）+ 1 个编解码互调用例（73 项断言），共 **7042 项断言**。
 
 不依赖集群的协议层自检：
 
@@ -257,6 +257,7 @@ POP 消费（不提交位点，靠 ack + invisibleTime 复活重投）：
 consumer.setPopMode(true);
 consumer.setPopInvisibleTime(30000);
 consumer.setPopBatchNums(16);
+consumer.setPopThresholdForQueue(96);   // 本队列待 ack 上限，严格大于才停；命中记进拉取路径同一个流控计数
 ```
 
 其他：`suspend()` / `resume()`、`setPullBatchSize` / `setPullThresholdForQueue`（拉取前流控）、

@@ -5,11 +5,13 @@
 // CONSUME_SUCCESS acks nothing and the broker revives and redelivers the messages once invisibleTime expires; if the
 // observation window is shorter than invisibleTime a live run still looks like "everything passed". Anything lockable offline must be locked down first.
 #include <cstdio>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "rocketmq/client/consumer.h"
 #include "rocketmq/client/result.h"
+#include "rocketmq/common/logging.h"
 #include "rocketmq/common/message.h"
 #include "rocketmq/common/message_const.h"
 #include "rocketmq/common/util_all.h"
@@ -57,6 +59,29 @@ MessageExt makeMsg(const std::string& topic = kTopic, int32_t queueId = 0,
     return m;
 }
 
+// Silence the recorder for a round that deliberately trips a gate: what is pinned here is the return
+// value and the shared hit counter, and the log wording itself is captured by the flow-control suite,
+// which redirects the recorder into a file under /tmp.
+class QuietLog {
+public:
+    QuietLog() {
+        previous_ = logLevel();
+        setLogLevel(LOG_OFF);
+    }
+    ~QuietLog() { setLogLevel(previous_); }
+
+private:
+    int previous_ = 0;
+};
+
+// A pop queue that has `debt` messages popped and not acked yet -- the state queuePopLoop hands to its
+// flow-control gate between two rounds.
+std::shared_ptr<PopProcessQueue> popQueueWithDebt(int32_t debt) {
+    auto pq = std::make_shared<PopProcessQueue>();
+    pq->incFoundMsg(debt);
+    return pq;
+}
+
 void testProcessQueue() {
     PopProcessQueue pq;
     expect(pq.waitAckCount() == 0, "pq.initial");
@@ -70,6 +95,48 @@ void testProcessQueue() {
     expect(!pq.isDropped(), "pq.notDropped");
     pq.setDropped(true);
     expect(pq.isDropped(), "pq.dropped");
+}
+
+// The POP wait-ack gate of the pop loop: it judges **this queue's own** unacked debt against the POP
+// ceiling (strictly greater), and acking the batch releases the pause again. The hit counter it ticks
+// is the client-wide flow-control counter the pull path uses, so a throttled consumer reports one
+// number whichever consumption mode it runs; the log wording is pinned by the flow-control suite.
+void testPopWaitAckGateFollowsTheQueueDebt() {
+    QuietLog quiet;
+    DefaultMQPushConsumer c(kGroup);
+    const MessageQueue mq(kTopic, kBroker, 0);
+    const MessageQueue sibling(kTopic, kBroker, 1);
+    c.setPopThresholdForQueue(2);
+    auto pq = std::make_shared<PopProcessQueue>();
+    expect(!c.popFlowControlHitForTest(mq, pq), "popGate.nothingPoppedYet");
+    pq->incFoundMsg(2);                 // two popped, none acked: exactly at the ceiling
+    expect(!c.popFlowControlHitForTest(mq, pq), "popGate.atTheCeilingStillPops");
+    expect(c.flowControlTriggered() == 0, "popGate.noTickWhileInsideTheCeiling",
+           std::to_string(c.flowControlTriggered()));
+    pq->incFoundMsg(1);                 // the next batch puts this queue over it
+    expect(c.popFlowControlHitForTest(mq, pq), "popGate.oneOverTheCeilingPauses");
+    expect(c.flowControlTriggered() == 1, "popGate.tripsTheSharedCounter",
+           std::to_string(c.flowControlTriggered()));
+    // A sibling queue holding nothing is never paused by another queue's debt.
+    auto empty = std::make_shared<PopProcessQueue>();
+    expect(!c.popFlowControlHitForTest(sibling, empty), "popGate.siblingQueueUnaffected");
+    expect(c.flowControlTriggered() == 1, "popGate.siblingAddsNothing",
+           std::to_string(c.flowControlTriggered()));
+    // The consume side acks the whole batch: the same debt that paused the round is gone, so the queue
+    // pops again and the counter stops moving.
+    for (int i = 0; i < 3; i++) pq->ack();
+    expect(pq->waitAckCount() == 0, "popGate.everythingAcked", std::to_string(pq->waitAckCount()));
+    expect(!c.popFlowControlHitForTest(mq, pq), "popGate.drainedQueuePopsAgain");
+    expect(c.flowControlTriggered() == 1, "popGate.drainingTicksNothing",
+           std::to_string(c.flowControlTriggered()));
+    // The default ceiling (96) is the shipped contract: 96 unacked still pops, 97 pauses.
+    DefaultMQPushConsumer d(kGroup);
+    expect(d.popThresholdForQueue() == 96, "popGate.defaultCeiling",
+           std::to_string(d.popThresholdForQueue()));
+    expect(!d.popFlowControlHitForTest(mq, popQueueWithDebt(96)), "popGate.defaultAt96Pops");
+    expect(d.popFlowControlHitForTest(mq, popQueueWithDebt(97)), "popGate.defaultAt97Pauses");
+    expect(d.flowControlTriggered() == 1, "popGate.defaultRoundTicksOnce",
+           std::to_string(d.flowControlTriggered()));
 }
 
 void testDefaults() {
@@ -189,6 +256,7 @@ void testPopPullStats() {
 
 int main() {
     testProcessQueue();
+    testPopWaitAckGateFollowsTheQueueDebt();
     testDefaults();
     testPopCkTarget();
     testIsPopTimeout();

@@ -1,6 +1,7 @@
 // Covers the semantics of POP orderly listening:
 //   - submitPopConsumeRequest:161-166 -- dispatch into the orderly skeleton; the listener is not invoked and no ack happens
-//     (pq's waitAckCount does not move = the backlog only grows; flow control is left to stall the pop loop)
+//     (the wait-ack backlog stays on pq = it only grows; the pop loop's wait-ack gate reports that
+//      growing debt on the client-wide flow-control counter and pauses this queue's rounds)
 //   - submitConsumeRequest:178-191 -- the dedup set compares (pq reference, mq): repeated submits of the same queue
 //     enqueue only once; after rebalance installs a **new** PopProcessQueue (different pointer identity) it enqueues as usual
 //   - ConsumeRequest.run:315-324 -- the request is removed only when pq is revoked; on a live queue it is a no-op
@@ -13,6 +14,7 @@
 
 #include "rocketmq/client/consumer.h"
 #include "rocketmq/client/result.h"
+#include "rocketmq/common/logging.h"
 #include "rocketmq/common/message.h"
 #include "rocketmq/common/message_const.h"
 #include "rocketmq/common/util_all.h"
@@ -85,6 +87,21 @@ public:
 
 std::vector<MessageExt> batch2() { return {ext(0), ext(1)}; }
 
+// Silence the recorder for a round that deliberately trips a gate: the assertions below are on the
+// retained backlog, the gate's answer and the shared hit counter; the log wording itself is captured
+// by the flow-control suite, which redirects the recorder into a file under /tmp.
+class QuietLog {
+public:
+    QuietLog() {
+        previous_ = logLevel();
+        setLogLevel(LOG_OFF);
+    }
+    ~QuietLog() { setLogLevel(previous_); }
+
+private:
+    int previous_ = 0;
+};
+
 // ------------------------------------------------ dispatch: orderly enters the skeleton, listener not invoked
 
 void testOrderlyDispatchNeverInvokesListener() {
@@ -101,6 +118,43 @@ void testOrderlyDispatchNeverInvokesListener() {
            std::to_string(pq->waitAckCount()));
     expect(c.popOrderlyRequestCount() == 1, "dispatch.orderly.requestKept",
            std::to_string(c.popOrderlyRequestCount()));
+}
+
+// The skeleton never acks, so the backlog above is exactly what the pop loop's wait-ack gate has to
+// report: instead of pausing the round silently, the queue over its own ceiling ticks the SAME
+// client-wide flow-control counter the pull path's cache gate uses. Control at the end: a queue with no
+// pop state left (revoked by rebalance) is not a flow-control trip.
+void testSkeletonBacklogTripsTheSharedFlowControlCounter() {
+    QuietLog quiet;
+    DefaultMQPushConsumer c(kGroup);
+    int calls = 0;
+    c.setMessageListener(std::make_shared<CountingOrderlyListener>(&calls));
+    c.setPopThresholdForQueue(1);
+    auto pq = std::make_shared<PopProcessQueue>();
+    pq->incFoundMsg(2);                       // queuePopLoop counts the batch before dispatch
+    c.submitPopConsumeRequest(batch2(), pq, queue0());
+    expect(pq->waitAckCount() == 2, "skeletonGate.backlogStaysUnacked",
+           std::to_string(pq->waitAckCount()));
+    expect(c.flowControlTriggered() == 0, "skeletonGate.dispatchAloneTicksNothing",
+           std::to_string(c.flowControlTriggered()));
+    // 2 over a ceiling of 1: the next round of this queue is a flow-control hit.
+    expect(c.popFlowControlHitForTest(queue0(), pq), "skeletonGate.overOwnCeilingTrips");
+    expect(c.flowControlTriggered() == 1, "skeletonGate.countedOnTheSharedCounter",
+           std::to_string(c.flowControlTriggered()));
+    // A second round on the same unacked backlog ticks again (the gate re-reads the debt every round,
+    // it is not a one-shot latch) -- still this queue's own debt, still one counter.
+    expect(c.popFlowControlHitForTest(queue0(), pq), "skeletonGate.tripsAgainNextRound");
+    expect(c.flowControlTriggered() == 2, "skeletonGate.secondRoundSecondTick",
+           std::to_string(c.flowControlTriggered()));
+    expect(calls == 0, "skeletonGate.listenerStillNotCalled", std::to_string(calls));
+    // Controls: the ceiling is not a target (exactly 1 unacked still pops), and a revoked queue with no
+    // pop state at all never counts as a hit.
+    auto atCeiling = std::make_shared<PopProcessQueue>();
+    atCeiling->incFoundMsg(1);
+    expect(!c.popFlowControlHitForTest(queue0(), atCeiling), "skeletonGate.atTheCeilingPops");
+    expect(!c.popFlowControlHitForTest(queue0(), nullptr), "skeletonGate.noPopStateIsQuiet");
+    expect(c.flowControlTriggered() == 2, "skeletonGate.quietRoundsAddNothing",
+           std::to_string(c.flowControlTriggered()));
 }
 
 // ------------------------------------------------ split: the concurrent branch still consumes normally (regression guard)
@@ -189,6 +243,7 @@ void testRunOnLiveQueueIsANoOp() {
 
 int main() {
     testOrderlyDispatchNeverInvokesListener();
+    testSkeletonBacklogTripsTheSharedFlowControlCounter();
     testConcurrentDispatchStillConsumes();
     testRequestDedup();
     testDroppedRequestIsRemoved();

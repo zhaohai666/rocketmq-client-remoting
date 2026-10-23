@@ -24,7 +24,7 @@ python3 -m venv .venv
 .venv/bin/pip install -e .                     # 顶层包：client / common / remoting
 
 .venv/bin/pip install pytest                   # 只有跑单元测试才需要它
-.venv/bin/python -m pytest tests/ -q           # 1638 passed, 4 skipped（123.2s）
+.venv/bin/python -m pytest tests/ -q           # 1645 passed, 4 skipped（122.2s）
 .venv/bin/python selfcheck.py                  # selfcheck: 7/7 passed
 ```
 
@@ -368,7 +368,7 @@ TCP 建连后、TLS 握手前完成 SOCKS CONNECT；NameServer HTTP 动态取址
 | Push Consumer：并发 / 顺序监听、广播、每队列三条缓存闸门（topic 预算在重平衡时摊到每队列）、位点修正与重置、停摆自愈、挂起消息清扫 | ✅ |
 | Pull Consumer：手动拉取 + 长轮询 + 手动提交位点 + 按时间戳查位点 | ✅ |
 | Lite Pull Consumer：`poll` / `assign` / `seek` / `pause` / `commit`、三张位点表、topic 队列变更监听 | ✅ |
-| POP 消费循环（`pop_mode`，含 ack / 续期 / POP 顺序） | ✅ |
+| POP 消费循环（`pop_mode`，含 ack / 续期 / POP 顺序 / 待 ack 欠账闸门：本队列欠账严格大于 `pop_threshold_for_queue`（默认 96）才停、命中重排 50ms 并记进拉取路径那个全局流控计数） | ✅ |
 | 队列分配策略：AVG / AVG_BY_CIRCLE / CONFIG / CONSISTENT_HASH / MACHINE_ROOM / MACHINE_ROOM_NEARBY | ✅ |
 | 命名空间两套：本地前缀 `namespace` 与服务端 `namespace_v2` | ✅ |
 | ACL 签名（含 SecurityToken）、`AclClientRPCHook` / `NamespaceRpcHook` / `StreamTypeRPCHook` | ✅ |

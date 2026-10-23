@@ -9,6 +9,9 @@
 # This file locks the offline semantics of flow-control judgment: the hit direction and units of the three per-queue
 # gates, how the two topic knobs are divided into them when the queue assignment changes,
 # plus the two stalls the gate can cause (the client's own cache threshold vs the broker's FLOW_CONTROL(215) reply).
+# The POP path's cache gate (this queue's wait-ack debt against ``pop_threshold_for_queue``) is locked here too:
+# it compares the same way, judges only its own queue, and counts on the **same** flow-control counter as the pull
+# path, so one client-wide total and one warn cadence span both paths.
 # For the real-machine side, "no message is lost after a gate hits", see ../verify_flow_control_live.py.
 import inspect
 import threading
@@ -536,3 +539,150 @@ def test_gate_debug_records_every_trip(caplog):
                   if r.levelname == "DEBUG" and "flow control" in r.getMessage()]
     assert len(debugs) == 3
     assert c._flow_control_triggered == 3
+
+
+# ---------------- The POP path's cache gate: this queue's wait-ack debt ----------------
+# POP has no "pulled but not consumed" buffer, so the wait-ack count is the only cache gate on that
+# path. It must compare the same way (strictly greater), judge only its own queue's debt, and -- the
+# point of this section -- land on the SAME _flow_control_triggered counter as the pull path, so one
+# client-wide flow-control total and one warn cadence cover both paths.
+
+def _pop_debt(count):
+    """A queue state carrying exactly ``count`` popped-but-unacked messages."""
+    pq = PopProcessQueue()
+    if count:
+        pq.inc_found_msg(count)
+    return pq
+
+
+def _pop_hit(c, mq, debt):
+    return c._pop_flow_control_hit(mq, _pop_debt(debt))
+
+
+def test_pop_gate_is_strictly_greater_at_the_default_threshold():
+    """Default 96: exactly 96 unacked messages still pops, 97 trips -- the same ">" as every cache gate."""
+    c = _consumer("G_fc_pop_boundary")
+    mq = _queue()
+    assert c.pop_threshold_for_queue == 96
+    assert not _pop_hit(c, mq, 0), "nothing popped and unacked must not hit"
+    assert not _pop_hit(c, mq, 96), "96 at threshold 96 must not hit (>, not >=)"
+    assert c._flow_control_triggered == 0, "a non-hit must not count"
+    assert _pop_hit(c, mq, 97), "threshold+1 must hit"
+    assert c._flow_control_triggered == 1
+    # The default is a config, not a constant of the gate: a tightened threshold follows it.
+    c.pop_threshold_for_queue = 3
+    assert not _pop_hit(c, mq, 3)
+    assert _pop_hit(c, mq, 4)
+    assert c._flow_control_triggered == 2
+
+
+def test_pop_gate_reads_only_its_own_queue_debt():
+    """No sibling summing on the POP path either: one queue over the threshold trips, its empty neighbour keeps popping."""
+    c = _consumer("G_fc_pop_no_sibling_sum")
+    c.pop_threshold_for_queue = 3
+    hot = _queue(queue_id=0)
+    cold = _queue(queue_id=1)
+    assert _pop_hit(c, hot, 4)
+    assert not _pop_hit(c, cold, 0), "an empty sibling must not be paused by the hot queue's debt"
+    # Three more queues each at exactly the threshold: 4 x 3 = 12 of instance-wide debt, far above 3,
+    # yet each queue sits at its own threshold, so nothing pauses.
+    for qid in range(1, 4):
+        assert not _pop_hit(c, _queue(queue_id=qid), 3)
+    assert c._flow_control_triggered == 1
+
+
+def test_pop_and_pull_trips_share_one_flow_control_counter():
+    """One pull trip plus one POP trip on the same consumer is two hits of ONE counter.
+
+    This is the assertion that goes red when the POP gate is a silent branch of its own.
+    """
+    c = _consumer("G_fc_pop_shared_counter")
+    mq = _queue()
+    _gates_off(c)
+    c.pull_threshold_for_queue = 1
+    c.pop_threshold_for_queue = 1
+    _stage(c, mq, _n_sized(TOPIC, 100, 2))    # 2 cached over a pull threshold of 1
+    assert _hit(c, mq)
+    assert _pop_hit(c, mq, 2)                 # 2 unacked over a pop threshold of 1
+    assert c._flow_control_triggered == 2, "the POP trip must be counted on the pull path's counter"
+    # Paired control: a POP-only hit on a fresh consumer counts exactly one.
+    only_pop = _consumer("G_fc_pop_shared_counter_control")
+    only_pop.pop_threshold_for_queue = 1
+    assert _pop_hit(only_pop, mq, 2)
+    assert only_pop._flow_control_triggered == 1
+    # And a below-threshold POP debt adds nothing to a counter already at 2.
+    assert not _pop_hit(c, mq, 1)
+    assert c._flow_control_triggered == 2
+
+
+def test_pop_gate_warn_cadence_follows_the_shared_counter(caplog):
+    """The warn cadence counts POP trips too: trip 1 warns, trip 2 and 3 (one of them a pull trip) stay quiet,
+    trip 1001 warns again. The 1000 trips in between are set, not run."""
+    assert is_flow_control_warn_trip(1)
+    assert not is_flow_control_warn_trip(2)
+    assert not is_flow_control_warn_trip(1000)
+    assert is_flow_control_warn_trip(1001)
+    c = _consumer("G_fc_pop_warn_cadence")
+    mq = _queue()
+    _gates_off(c)
+    c.pull_threshold_for_queue = 1
+    c.pop_threshold_for_queue = 1
+    _stage(c, mq, _n_sized(TOPIC, 100, 2))
+    with caplog.at_level("WARNING"):
+        assert _pop_hit(c, mq, 2)
+        assert len(_warns(caplog)) == 1, "the 1st trip must warn"
+        assert _pop_hit(c, mq, 2)
+        assert len(_warns(caplog)) == 1, "the 2nd trip must stay on the debug channel only"
+        assert _hit(c, mq), "a pull trip joins the same count"
+        assert len(_warns(caplog)) == 1, "trip 3 (the pull path's) must not warn either"
+        assert c._flow_control_triggered == 3
+        c._flow_control_triggered = FLOW_CONTROL_WARN_EVERY_N_TRIPS
+        assert _pop_hit(c, mq, 2)
+        assert len(_warns(caplog)) == 2, "trip 1001 must warn again"
+    first = _warns(caplog)[0]
+    assert "wait_ack=2" in first, first
+    assert "pop_threshold_for_queue=1" in first, first
+    assert "pause pop for 50 ms" in first, first
+    assert "flowControlTimes=1" in first, first
+
+
+def test_pop_gate_debug_records_the_debt_and_the_threshold(caplog):
+    """The per-trip debug line names the queue, its own wait-ack count and the threshold it exceeded."""
+    c = _consumer("G_fc_pop_debug")
+    mq = _queue()
+    c.pop_threshold_for_queue = 2
+    with caplog.at_level("DEBUG", logger="rocketmq.client"):
+        assert not _pop_hit(c, mq, 2)
+        assert _pop_hit(c, mq, 3)
+    debugs = [r.getMessage() for r in caplog.records
+              if r.levelname == "DEBUG" and "flow control" in r.getMessage()]
+    assert debugs == ["flow control: queue %s wait_ack=3 over pop_threshold_for_queue=2, pause pop" % mq], debugs
+
+
+def test_pop_cache_flow_control_pauses_the_pop_for_50ms_without_touching_the_broker(monkeypatch):
+    c, mq, key = _error_loop_consumer("G_fc_pop_cache_pause")
+
+    def _setup():
+        c.pop_threshold_for_queue = 1
+        c._pop_queues[key] = _pop_debt(2)      # 2 popped-but-unacked over a threshold of 1
+
+    delays = _drive_loop(monkeypatch, "_queue_pop_loop", "pop_message", [], c, mq, key, setup=_setup)
+    assert delays == [PULL_TIME_DELAY_WHEN_CACHE_FLOW_CONTROL], delays
+    assert c._flow_control_triggered == 1, "the loop's pause must be the counted trip"
+    assert c._pop_queues[key].wait_ack_count() == 2, "the gate only pauses popping, it never changes the debt"
+
+
+def test_pop_debt_at_the_threshold_pops_instead_of_stalling(monkeypatch):
+    # Paired control of the case above: debt exactly AT the threshold must not pause, so the loop
+    # reaches the broker and records the *error* backoff instead of the cache one.
+    c, mq, key = _error_loop_consumer("G_fc_pop_cache_pass")
+
+    def _setup():
+        c.pop_threshold_for_queue = 1
+        c._pop_queues[key] = _pop_debt(1)      # 1 message at a threshold of 1
+
+    delays = _drive_loop(monkeypatch, "_queue_pop_loop", "pop_message",
+                         [RuntimeError("socket reset")], c, mq, key, setup=_setup)
+    assert delays == [PULL_TIME_DELAY_WHEN_EXCEPTION], delays
+    assert c._flow_control_triggered == 0
+

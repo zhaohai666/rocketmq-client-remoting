@@ -54,11 +54,11 @@ This produces the static library `build/librocketmq_remoting.a` (alias `rocketmq
 
 ```
 100% tests passed out of 68
-Total Test time (real) = 94.16 sec
+Total Test time (real) = 117.72 sec
 ```
 
-The 68 cases are the 67 test binaries (5868 assertions) plus 1 codec-interop case
-(73 assertions): **5941 assertions in total**.
+The 68 cases are the 67 test binaries (6969 assertions) plus 1 codec-interop case
+(73 assertions): **7042 assertions in total**.
 
 The protocol-layer self-check needs no cluster:
 
@@ -266,6 +266,7 @@ POP consumption (no offset commit; ack plus invisibleTime decide redelivery):
 consumer.setPopMode(true);
 consumer.setPopInvisibleTime(30000);
 consumer.setPopBatchNums(16);
+consumer.setPopThresholdForQueue(96);   // this queue's outstanding-ACK ceiling, trips strictly above it; a trip counts on the pull path's shared flow-control total
 ```
 
 Also available: `suspend()` / `resume()`, `setPullBatchSize` / `setPullThresholdForQueue`

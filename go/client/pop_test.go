@@ -655,6 +655,102 @@ func TestPopProcessQueueSemantics(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------- gate in the loop
+
+// popGateLoopFixture is a POP consumer whose pop loop is driven by the cache gate
+// alone: the queue's debt stays over the threshold, so the loop never reaches a
+// broker call and every round is exactly one gate judgment plus one wait.
+func popGateLoopFixture(t *testing.T, group string, threshold, waitAck int) (*DefaultMQPushConsumer, common.MessageQueue, *popProcessQueue) {
+	t.Helper()
+	c := MustNewDefaultMQPushConsumer(group)
+	requireNoError(t, "subscribe", c.Subscribe(fcTopic, "*"))
+	c.SetPopMode(true)
+	c.SetPopThresholdForQueue(threshold)
+	mq := fcQueue(0)
+	pq := newPopProcessQueue()
+	pq.IncFoundMsg(waitAck)
+	c.mu.Lock()
+	c.popQueueTable[mq] = pq
+	c.mu.Unlock()
+	return c, mq, pq
+}
+
+// popWaitTrips polls the SHARED flow-control counter at 1 ms granularity until the pop
+// loop has recorded want trips. The tight granularity matters: the interruptibility leg
+// closes the stop channel right after a trip, so it has to know how far into the pause
+// it is. Waiting on this counter is itself the observable of the change — a POP trip
+// that did not reach it times out here.
+func popWaitTrips(t *testing.T, c *DefaultMQPushConsumer, want int64) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if c.FlowControlTriggered() >= want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("the pop loop recorded %d flow-control trips in 3s, want %d", c.FlowControlTriggered(), want)
+}
+
+// The loop's pause is the cache-gate wait: two rounds take two of them, so the loop
+// neither spins (lower bound) nor sits out one of the other POP back-offs (upper bound),
+// keeps stamping the last-pop time BEFORE judging the gate (the stall criterion reads
+// that stamp, so a pause that skipped the stamp would expire a merely throttled queue),
+// leaves the debt alone, and returns as soon as the queue is stopped instead of running
+// the wait out.
+func TestPopFlowControlLoopPausesForTheCacheDelayAndIsStoppable(t *testing.T) {
+	if popDelayWhenCacheFlowControl != 50 {
+		t.Fatalf("POP cache backoff = %d ms, want 50 ms", popDelayWhenCacheFlowControl)
+	}
+	const waitAck = 4
+	c, mq, pq := popGateLoopFixture(t, "PopGateLoopGroup", 3, waitAck)
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.queuePopLoop(mq, stop)
+	}()
+
+	popWaitTrips(t, c, 1)
+	begin := time.Now()
+	popWaitTrips(t, c, 3)
+	gap := time.Since(begin)
+	if floor := time.Duration(2*(popDelayWhenCacheFlowControl-5)) * time.Millisecond; gap < floor {
+		t.Errorf("two cache-gate rounds took %s, want at least %s: each round must wait popDelayWhenCacheFlowControl", gap, floor)
+	}
+	if ceil := time.Duration(2*popDelayWhenCacheFlowControl)*time.Millisecond + time.Second; gap > ceil {
+		t.Errorf("two cache-gate rounds took %s, want at most %s: the cache gate must not borrow a longer back-off", gap, ceil)
+	}
+
+	stamped := pq.LastPopTimestamp()
+	popWaitTrips(t, c, 4)
+	if pq.LastPopTimestamp() <= stamped {
+		t.Errorf("last-pop timestamp stayed %d across a tripped round: the loop must stamp before the gate", stamped)
+	}
+
+	// The debt is a pause, not a give-up: throttling hands no ACK back.
+	if n := pq.WaitAckMsgCount(); n != waitAck {
+		t.Errorf("waiting-ACK debt = %d during the pause, want the staged %d", n, waitAck)
+	}
+
+	// Interruptible: closing the queue's stop channel right after a trip cuts the
+	// remaining wait short — a plain sleep would still hold the loop for almost the
+	// whole 50 ms.
+	popWaitTrips(t, c, 5)
+	closeAt := time.Now()
+	close(stop)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the pop loop ignored its queue stop channel")
+	}
+	if waited := time.Since(closeAt); waited > time.Duration(popDelayWhenCacheFlowControl-5)*time.Millisecond {
+		t.Errorf("the loop returned %s after the stop signal, want well inside the %d ms pause: the wait must be stop-interruptible",
+			waited, popDelayWhenCacheFlowControl)
+	}
+}
+
 func TestPopDelayLevelTable(t *testing.T) {
 	if len(popDelayLevel) != 16 {
 		t.Fatalf("table length = %d", len(popDelayLevel))

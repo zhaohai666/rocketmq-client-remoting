@@ -31,7 +31,7 @@ code-generation step.
 ```bash
 cd rust
 cargo build --all-targets                       # lib + 42 examples
-cargo test --quiet                              # 1113 passed; 0 failed; 0 ignored (~10s)
+cargo test --quiet                              # 1115 passed; 0 failed; 0 ignored (~10s)
 cargo clippy --all-targets --all-features -- -D warnings  # zero warnings is a hard gate
 ```
 
@@ -272,7 +272,9 @@ verification); for production set it to `false` and configure the system trust c
   reconnection, GO_AWAY re-establish-and-resend, connection-fatal fast failure
 - ✅ Producer: all nine send shapes in the table above
 - ✅ PushConsumer: long polling + POP (`POP_CK` / ACK / CHANGE_INVISIBLE), ordering,
-  broadcasting, retry / dead-letter, offset persistence, pull-stall self-healing
+  broadcasting, retry / dead-letter, offset persistence, pull-stall self-healing, POP's
+  outstanding-ACK gate (strictly above `pop_threshold_for_queue`, default 96, a trip counted on the
+  pull path's one client-wide flow-control total and warn cadence)
 - ✅ PullConsumer / LitePullConsumer (incl. queue-change listener, three offset tables,
   pause / resume)
 - ✅ Six queue allocation strategies (AVG / AVG_BY_CIRCLE / CONFIG / CONSISTENT_HASH /

@@ -12,7 +12,7 @@ RocketMQ 经典 remoting 协议的 Go 客户端 SDK。直连 NameServer 取路�
 - 依赖：**零第三方依赖**，`go.mod` 里没有 `require` 段；LZ4 / ZSTD / 日志轮转全部手写
 - 分层：`remoting`（线协议与长连接传输）→ `common`（消息模型、编解码、压缩、常量）→
   `client`（Producer / Push / Pull / LitePull / Admin / 事务 / 轨迹）
-- 已在 **RocketMQ 5.5.1** 集群上跑通 15 个真机联调工具与 777 个单测
+- 已在 **RocketMQ 5.5.1** 集群上跑通 15 个真机联调工具与 784 个单测
 
 ## 先决条件
 
@@ -51,10 +51,10 @@ go test ./... -count=1
 
 | 包 | 测试函数数 | 耗时 |
 | --- | --- | --- |
-| `client` | 457 | 45.0s |
-| `common` | 135 | 1.8s |
-| `remoting` | 185 | 1.0s |
-| **合计** | **777**（70 个 `*_test.go`） | ~48s |
+| `client` | 464 | 45.4s |
+| `common` | 135 | 2.1s |
+| `remoting` | 185 | 1.5s |
+| **合计** | **784**（70 个 `*_test.go`） | ~49s |
 
 计数用 `go test ./client/ -list '.*' | grep -c '^Test'`。并发回归单独跑：
 
@@ -504,7 +504,7 @@ go run ./examples/live_acl_message_types -ns 127.0.0.1:9876 -ak <accessKey> -sk 
 - POP 的队列集合默认由本地重平衡算出（每队列一个 POP 循环 + ack）；`SetClientRebalance(false)`
   改为向 broker 发 `QUERY_ASSIGNMENT(400)` 由服务端分配（语义：broker 出错/应答缺失集合时保留
   当前分配，显式空集合清空，重试节奏跟随 20s 重平衡循环）。
-- `OFFSET_ILLEGAL` 冻结重建、每队列三条拉取流控闸门（topic 预算在重平衡时摊到每队列）、心跳全景、六个分配策略目前只有单测与进程内假集群
+- `OFFSET_ILLEGAL` 冻结重建、每队列三条拉取流控闸门（topic 预算在重平衡时摊到每队列）、POP 的待 ack 欠账闸门（严格大于 `PopThresholdForQueue`，默认 96，命中记进拉取路径同一个流控计数与告警节奏）、心跳全景、六个分配策略目前只有单测与进程内假集群
   覆盖，`examples/` 里还没有对应的真机工具。
 
 ## 目录结构
@@ -549,7 +549,7 @@ go/
 │   ├── trace.go · trace_hook.go · trace_dispatcher.go · trace_context.go
 │   ├── consumer_stats.go · stats_item.go · consumer_running_info.go · fault_strategy.go
 │   ├── consume_directly.go · jsonutil.go
-│   └── *_test.go                   70 个测试文件，777 个测试函数
+│   └── *_test.go                   70 个测试文件，784 个测试函数
 └── examples/                   17 个可执行工具（见「真实集群联调」）
 ```
 
