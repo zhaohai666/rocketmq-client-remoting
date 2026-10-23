@@ -36,7 +36,7 @@ Measured on this machine:
 | Command | Result |
 | --- | --- |
 | `dotnet build --no-incremental` | `0 Warning(s)` / `0 Error(s)`, elapsed `00:00:17.94` |
-| `dotnet test tests/RocketMQ.Client.Tests` | `Passed! - Failed: 0, Passed: 1033, Skipped: 0, Total: 1033, Duration: 4 m 35 s` |
+| `dotnet test tests/RocketMQ.Client.Tests` | `Passed! - Failed:     0, Passed:  1033, Skipped:     0, Total:  1033, Duration: 4 m 35 s` |
 
 `Directory.Build.props` turns `TreatWarningsAsErrors=true` on globally, so "builds" means "builds with
 zero warnings". The test summary line follows the machine locale — grep for `Passed!` / `Failed:` when

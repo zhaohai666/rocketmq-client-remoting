@@ -33,7 +33,7 @@ dotnet test tests/RocketMQ.Client.Tests
 | 命令 | 结果 |
 | --- | --- |
 | `dotnet build --no-incremental` | `0 个警告` / `0 个错误`，用时 `00:00:17.94` |
-| `dotnet test tests/RocketMQ.Client.Tests` | `已通过! - 失败: 0，通过: 1033，已跳过: 0，总计: 1033，持续时间: 4 m 35 s` |
+| `dotnet test tests/RocketMQ.Client.Tests` | `已通过! - 失败:     0，通过:  1033，已跳过:     0，总计:  1033，持续时间: 4 m 35 s` |
 
 `Directory.Build.props` 里 `TreatWarningsAsErrors=true` 全局生效，所以「构建通过」等价于「零 warning」。
 测试输出跟随系统区域设置，中文 locale 下汇总行是中文，检索时按 `总计:` 匹配。
