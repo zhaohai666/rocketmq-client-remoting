@@ -1368,11 +1368,20 @@ func (c *DefaultLitePullConsumer) resolveInitialOffset(instance *Instance, group
 		return 0, nil
 	}
 	if fromWhere == ConsumeFromWhereTimestamp {
+		// A retry queue is created by the first redelivery, long after the configured
+		// instant, so searching there answers nothing; its replay starts at the tail.
+		if common.IsRetryTopic(mq.Topic) {
+			return instance.GetMaxOffset(mq, litePullRPCTimeoutMillis)
+		}
 		ts, err := parseConsumeTimestamp(consumeTS)
 		if err != nil {
 			return 0, err
 		}
 		return instance.SearchOffsetByTimestamp(mq, ts, litePullRPCTimeoutMillis)
+	}
+	// First consumption of a retry queue replays from 0 instead of jumping to the tail.
+	if common.IsRetryTopic(mq.Topic) {
+		return 0, nil
 	}
 	return instance.GetMaxOffset(mq, litePullRPCTimeoutMillis)
 }

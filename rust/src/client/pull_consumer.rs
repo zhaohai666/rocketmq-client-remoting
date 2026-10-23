@@ -27,7 +27,8 @@ use crate::client::allocate_strategy::{
 };
 use crate::client::consumer::{
     client_side_tag_filter, consume_timestamp_millis, default_consume_timestamp, mq_key,
-    mq_sort_key, sort_mqs, MessageQueueListener, MessageSelector, DEFAULT_INSTANCE_NAME,
+    mq_sort_key, plan_initial_offset, sort_mqs, MessageQueueListener, MessageSelector,
+    StartOffsetPlan, DEFAULT_INSTANCE_NAME,
 };
 use crate::client::hook::{FilterMessageHook, FilterMessageHookList};
 use crate::client::mq_client::{
@@ -2862,6 +2863,7 @@ async fn resolve_initial_offset(
     if let Some(offset) = lock(&inner.state).seek_offset.get(&key).copied() {
         return Ok(offset);
     }
+    let mut stored = -1i64;
     match client
         .query_consumer_offset(
             &cfg.consumer_group,
@@ -2872,23 +2874,29 @@ async fn resolve_initial_offset(
         )
         .await
     {
-        Ok(Some(offset)) => return Ok(offset),
+        Ok(Some(offset)) => stored = offset,
         Ok(None) => {}
         Err(e) => rmq_debug!("lite query offset failed for {mq:?}: {e}"),
     }
-    if cfg.consume_from_where == ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET {
-        return Ok(0);
+    match plan_initial_offset(
+        stored,
+        &cfg.consume_from_where,
+        NamespaceUtil::is_retry_topic(&mq.topic),
+    ) {
+        StartOffsetPlan::Stored(off) => Ok(off),
+        StartOffsetPlan::FromZero => Ok(0),
+        StartOffsetPlan::QueueTail => client
+            .get_max_offset(mq, LITE_PULL_RPC_TIMEOUT_MILLIS, None)
+            .await,
+        StartOffsetPlan::SearchAtConfiguredTime => {
+            // Shares the parser and the decision with the push consumer: both consumers
+            // must resolve the same policy the same way.
+            let ts = consume_timestamp_millis(&cfg.consume_timestamp)?;
+            client
+                .search_offset_by_timestamp(mq, ts, LITE_PULL_RPC_TIMEOUT_MILLIS, None)
+                .await
+        }
     }
-    if cfg.consume_from_where == ConsumeFromWhere::CONSUME_FROM_TIMESTAMP {
-        // Shares the parser with the push consumer: the consumeTimestamp semantics of both consumers must stay consistent
-        let ts = consume_timestamp_millis(&cfg.consume_timestamp)?;
-        return client
-            .search_offset_by_timestamp(mq, ts, LITE_PULL_RPC_TIMEOUT_MILLIS, None)
-            .await;
-    }
-    client
-        .get_max_offset(mq, LITE_PULL_RPC_TIMEOUT_MILLIS, None)
-        .await
 }
 
 /// Heartbeat packet: carries only **this consumer's own** ConsumerData

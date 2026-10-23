@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace RocketMQ\Common;
 
+use RocketMQ\Client\Exceptions\MQClientException;
+
 /**
  * Common utilities: time formatting, hex string conversion in both directions, local IP probing and the
  * protocol-side string hash.
@@ -44,6 +46,41 @@ final class UtilAll
         }
         // Truncate the milliseconds before formatting: the default format does not include sub-second parts anyway.
         return date($pattern, intdiv($ts, 1000));
+    }
+
+    /** The start instant of CONSUME_FROM_TIMESTAMP: yyyyMMddHHmmss, local time. */
+    public const CONSUME_TIMESTAMP_FORMAT = 'YmdHis';
+
+    public static function timeMillisToHumanString3(int $ms): string
+    {
+        return date(self::CONSUME_TIMESTAMP_FORMAT, intdiv($ms, 1000));
+    }
+
+    /**
+     * Default for a consumer that never set one: boot time minus 30 minutes, so an untouched
+     * CONSUME_FROM_TIMESTAMP still replays a recent backlog instead of starting at "now".
+     */
+    public static function defaultConsumeTimestamp(): string
+    {
+        return self::timeMillisToHumanString3(self::currentTimeMillis() - 30 * 60 * 1000);
+    }
+
+    /**
+     * Parse that instant back. A malformed value is a hard failure: falling back to "now" would
+     * silently turn the policy into "skip the backlog".
+     */
+    public static function parseConsumeTimestamp(string $ts): int
+    {
+        $dt = \DateTime::createFromFormat(self::CONSUME_TIMESTAMP_FORMAT, $ts);
+        // The round trip rejects what createFromFormat tolerated but did not understand — a short
+        // string, a month 13, a trailing character.
+        if ($dt === false || strlen($ts) !== 14
+            || (int) $dt->format(self::CONSUME_TIMESTAMP_FORMAT) !== (int) $ts) {
+            throw new MQClientException(
+                "consumeTimestamp is invalid, the valid format is yyyyMMddHHmmss,but received $ts",
+            );
+        }
+        return (int) $dt->format('U') * 1000 + (int) $dt->format('v');
     }
 
     public static function isBlank(?string $s): bool

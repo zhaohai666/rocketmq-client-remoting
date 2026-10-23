@@ -2712,48 +2712,60 @@ class DefaultMQPushConsumer:
 
     def _resolve_initial_offset(self, client: MQClientInstance,
                                 mq: MessageQueue) -> int:
-        # Contract of the initial offset: it NEVER depends on the subscription type.
-        # An earlier draft short-circuited
-        # SQL92 subscriptions to the max offset, which silently skipped every message
-        # produced *before* the consumer started (send-first + CONSUME_FROM_FIRST_OFFSET
-        # received nothing; consumer-first only passed because the queues were empty and
-        # the max offset was 0 anyway). The rule followed here: read the stored offset and,
-        # when absent, use 0 for FIRST_OFFSET / max for LAST_OFFSET etc. -- the broker applies
-        # the SQL92 filter to whatever range the pull covers.
+        # Two invariants hold this method together:
+        # 1. the start offset NEVER depends on the subscription type. An earlier draft
+        #    short-circuited SQL92 subscriptions to the max offset, which silently
+        #    skipped every message produced *before* the consumer started (send-first +
+        #    CONSUME_FROM_FIRST_OFFSET received nothing; consumer-first only passed
+        #    because the queues were empty and the max offset was 0 anyway). The broker
+        #    applies the SQL92 filter to whatever range the pull covers, so the policy
+        #    alone decides the start.
+        # 2. broadcasting and clustering differ ONLY in where the stored offset is read
+        #    from (local file vs broker). Both fall through to the same policy switch
+        #    when nothing is stored, so a CONSUME_FROM_TIMESTAMP or %RETRY% start can
+        #    never become mode-dependent.
+        stored = -1
         if self.message_model == MessageModel.BROADCASTING:
             # Broadcast mode: offsets are stored in the local file only
-            stored = self._load_local_offsets()
-            key = "%s%s%d" % (mq.topic, mq.broker_name, mq.queue_id)
-            if key in stored:
-                return stored[key]
-            if self.consume_from_where == ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET:
-                # FIRST_OFFSET with no local offset: give 0 directly
-                # (the local file and broker paths share this branch); the real start is settled by OFFSET_ILLEGAL
-                # correction per the broker's returned nextBeginOffset.
-                return 0
-            return client.get_max_offset(mq)
-        # Cluster mode: first query the committed offset on the broker
-        try:
-            stored = client.query_consumer_offset(self.consumer_group, mq, set_zero_if_not_found=False)
-            if stored is not None and stored >= 0:
-                return stored
-        except Exception as e:  # noqa: BLE001
-            logger.debug("query consumer offset for %s not found: %s", mq, e)
+            local = self._load_local_offsets().get(
+                "%s%s%d" % (mq.topic, mq.broker_name, mq.queue_id))
+            if local is not None and local >= 0:
+                stored = local
+        else:
+            # Cluster mode: first query the committed offset on the broker
+            try:
+                remote = client.query_consumer_offset(self.consumer_group, mq,
+                                                      set_zero_if_not_found=False)
+                if remote is not None and remote >= 0:
+                    stored = remote
+            except Exception as e:  # noqa: BLE001
+                logger.debug("query consumer offset for %s not found: %s", mq, e)
+
+        if stored >= 0:
+            return stored
+
         if self.consume_from_where == ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET:
-            # FIRST_OFFSET with no committed offset on the broker: give 0 directly
-            # (the comment policy is "the offset will be fixed by the OFFSET_ILLEGAL process"):
+            # FIRST_OFFSET with nothing stored gives 0 directly -- for both modes (the
+            # local file and broker paths share this branch), and the comment policy is
+            # "the offset will be fixed by the OFFSET_ILLEGAL process":
             # **do not** send a minOffset query. The cost of this extra shot is not just slowness:
             # minOffset is a master-only broker query, and while the master is down it is exactly "a newly started consumer
             # cannot pull anything" -- while slaves could already start pulling at 0, with the broker using
             # PULL_OFFSET_MOVED to correct the offset when out of bounds (_offset_illegal_recover).
             return 0
+
         if self.consume_from_where == ConsumeFromWhere.CONSUME_FROM_TIMESTAMP:
+            if NamespaceUtil.is_retry_topic(mq.topic):
+                # A %RETRY% topic has no meaningful "time of the oldest retry" and every
+                # queued retry must be delivered, so it starts at the queue tail rather
+                # than searching backwards from a timestamp.
+                return client.get_max_offset(mq)
             return client.search_offset_by_timestamp(mq, self._consume_timestamp_millis())
+
+        # Default CONSUME_FROM_LAST_OFFSET: a %RETRY% topic starts at 0 (retry messages
+        # must be fully retried) instead of skipping from the max offset.
         if NamespaceUtil.is_retry_topic(mq.topic):
-            # First consume with no committed offset: the %RETRY% topic starts at 0
-            # (retry messages must be fully retried), instead of skipping from the max offset
             return 0
-        # Default CONSUME_FROM_LAST_OFFSET
         return client.get_max_offset(mq)
 
     # ---------------- Dispatch and consume ----------------
@@ -2871,12 +2883,14 @@ class DefaultMQPushConsumer:
         """The response data source of GET_CONSUMER_STATUS_FROM_CLIENT(221).
 
         The response carries a snapshot of the **consumed offsets** table
-        (not the pull cursor).
+        (not the pull cursor). A blank topic is not a filter: the caller asked
+        for everything this consumer holds, so an empty string must not read as
+        "match a topic literally named empty" and report nothing.
         """
         out: Dict[MessageQueue, int] = {}
         with self._lock:
             for key, mq in list(self._mq_map.items()):
-                if topic is not None and mq.topic != topic:
+                if topic and mq.topic != topic:
                     continue
                 off = self._consume_offsets.get(key)
                 if off is not None:
@@ -5044,7 +5058,15 @@ class DefaultLitePullConsumer:
             return 0
         if self.consume_from_where == ConsumeFromWhere.CONSUME_FROM_TIMESTAMP:
             ts = self._parse_consume_timestamp(self.consume_timestamp)
+            if NamespaceUtil.is_retry_topic(mq.topic):
+                # Same rule as push: a %RETRY% queue cannot be searched backwards from a
+                # timestamp, so it starts at the queue tail.
+                return self._mq_client.get_max_offset(mq)
             return self._mq_client.search_offset_by_timestamp(mq, ts)
+        if NamespaceUtil.is_retry_topic(mq.topic):
+            # Default LAST_OFFSET for a %RETRY% queue: start at 0 so every queued retry
+            # is delivered.
+            return 0
         return self._mq_client.get_max_offset(mq)
 
     def _parse_consume_timestamp(self, ts: str) -> int:

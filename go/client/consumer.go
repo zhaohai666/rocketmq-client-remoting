@@ -1092,7 +1092,9 @@ func (c *DefaultMQPushConsumer) PersistConsumerOffset() error {
 }
 
 // GetConsumerStatus answers GET_CONSUMER_STATUS_FROM_CLIENT(221): the CONSUMED
-// offsets from the offset store (cloneOffsetTable(topic)), not the pull cursor.
+// offsets from the offset store, not the pull cursor. Only a non-empty topic
+// filters -- the asking side leaves the field empty to mean "everything this
+// client has consumed".
 func (c *DefaultMQPushConsumer) GetConsumerStatus(topic *string) remoting.MQOffsetTable {
 	c.mu.Lock()
 	store := c.offsetStore

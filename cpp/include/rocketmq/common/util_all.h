@@ -22,6 +22,10 @@ struct UtilAll {
 
     static std::string timeMillisToHumanString3(int64_t ts);
 
+    // The inverse of timeMillisToHumanString3. A malformed value is a hard error: a consumer that
+    // silently fell back to "now" would skip the backlog it was configured to replay.
+    static int64_t parseConsumeTimestamp(const std::string& ts);
+
     static bool isBlank(const std::string& s);
     static bool isNotBlank(const std::string& s);
 

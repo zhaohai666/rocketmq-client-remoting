@@ -1046,13 +1046,13 @@ impl MQClientInstance {
         let mut header = GetConsumerStatusRequestHeader::default();
         header.from_ext_fields(cmd.ext_fields());
         let group = header.group.clone().unwrap_or_default();
-        let Some(consumer) = self.find_consumer(&group) else {
-            return RemotingCommand::create_response(
-                response_code::SYSTEM_ERROR,
-                Some(format!("no consumer for group={group}")),
-            );
+        // An unknown group is still answered SUCCESS with an empty table: the
+        // asking side always decodes the body, and an error code makes it drop
+        // the reply instead of reporting "this group consumed nothing".
+        let status = match self.find_consumer(&group) {
+            Some(consumer) => consumer.get_consumer_status(header.topic.as_deref()),
+            None => Vec::new(),
         };
-        let status = consumer.get_consumer_status(header.topic.as_deref());
         let body = GetConsumerStatusBody {
             message_queue_table: status
                 .into_iter()
@@ -1078,9 +1078,11 @@ impl MQClientInstance {
         header.from_ext_fields(cmd.ext_fields());
         let group = header.consumer_group.clone().unwrap_or_default();
         let Some(consumer) = self.find_consumer(&group) else {
+            // The admin side reports which client it probed, so the reply has to
+            // name the group that is not hosted here.
             return RemotingCommand::create_response(
                 response_code::SYSTEM_ERROR,
-                Some(format!("no consumer for group={group}")),
+                Some(format!("The Consumer Group <{group}> not exist in this consumer")),
             );
         };
         let info = consumer.consumer_running_info();
@@ -1097,9 +1099,10 @@ impl MQClientInstance {
         header.from_ext_fields(cmd.ext_fields());
         let group = header.consumer_group.clone().unwrap_or_default();
         let Some(consumer) = self.find_consumer(&group) else {
+            // Same as 307: the probe is reported per client, so name the group.
             return RemotingCommand::create_response(
                 response_code::SYSTEM_ERROR,
-                Some(format!("no consumer for group={group}")),
+                Some(format!("The Consumer Group <{group}> not exist in this consumer")),
             );
         };
         let Some(raw) = cmd.body().filter(|b| !b.is_empty()) else {
@@ -4744,7 +4747,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consumer_status_reports_system_error_for_an_unknown_group() {
+    async fn consumer_status_answers_an_empty_table_for_an_unknown_group() {
         let instance = new_instance();
         let mut header = GetConsumerStatusRequestHeader::default();
         header.group = Some("GID_Nobody".to_string());
@@ -4752,10 +4755,17 @@ mod tests {
             request_code::GET_CONSUMER_STATUS_FROM_CLIENT,
             header,
         ));
-        assert_eq!(resp.code, response_code::SYSTEM_ERROR);
-        assert_eq!(
-            resp.remark.as_deref(),
-            Some("no consumer for group=GID_Nobody")
+        // The asking side always decodes the body, so an unhosted group has to
+        // come back SUCCESS with an empty table; a SYSTEM_ERROR reply is dropped
+        // as a failure instead of reading as "nothing consumed". The test above
+        // is the control that a hosted group still reaches the wire with its
+        // offsets.
+        assert_eq!(resp.code, response_code::SUCCESS);
+        let body = GetConsumerStatusBody::decode(resp.body().unwrap_or_default()).unwrap();
+        assert!(
+            body.message_queue_table.is_empty(),
+            "an unknown group must report an empty table, got {:?}",
+            body.message_queue_table
         );
         instance.shutdown();
     }
@@ -4790,6 +4800,13 @@ mod tests {
             missing,
         ));
         assert_eq!(resp.code, response_code::SYSTEM_ERROR);
+        // The admin side reports which client it probed, so the reply has to name
+        // the group that is not hosted here. The SUCCESS reply above is the control
+        // that this is the group lookup and not a handler that never answers.
+        assert_eq!(
+            resp.remark.as_deref(),
+            Some("The Consumer Group <GID_Nobody> not exist in this consumer")
+        );
         instance.shutdown();
     }
 
@@ -4842,6 +4859,37 @@ mod tests {
         let resp = instance.process_consume_message_directly(&garbage);
         assert_eq!(resp.code, response_code::SYSTEM_ERROR);
         assert_eq!(resp.remark.as_deref(), Some("decode message failed"));
+        instance.shutdown();
+    }
+
+    #[tokio::test]
+    async fn consume_message_directly_names_the_group_nobody_hosts() {
+        let instance = new_instance();
+        instance.register_consumer(GROUP, StubConsumer::new());
+        let mut header = ConsumeMessageDirectlyResultRequestHeader::default();
+        header.consumer_group = Some("GID_Nobody".to_string());
+        header.broker_name = Some(BROKER.to_string());
+        let mut cmd = request(request_code::CONSUME_MESSAGE_DIRECTLY, header);
+        cmd.set_body(Some(encode_message_ext(&sample_message(), false).unwrap()));
+        let resp = instance.process_consume_message_directly(&cmd);
+        // The admin side reports which client ran the probe, so an unhosted group
+        // has to answer with the group name instead of silently consuming nothing.
+        assert_eq!(resp.code, response_code::SYSTEM_ERROR);
+        assert_eq!(
+            resp.remark.as_deref(),
+            Some("The Consumer Group <GID_Nobody> not exist in this consumer")
+        );
+        // Control: the hosted group's probe really does reach its consumer, so the
+        // error above is the group lookup and not a dead handler.
+        let mut mine = ConsumeMessageDirectlyResultRequestHeader::default();
+        mine.consumer_group = Some(GROUP.to_string());
+        mine.broker_name = Some(BROKER.to_string());
+        let mut ok = request(request_code::CONSUME_MESSAGE_DIRECTLY, mine);
+        ok.set_body(Some(encode_message_ext(&sample_message(), false).unwrap()));
+        assert_eq!(
+            instance.process_consume_message_directly(&ok).code,
+            response_code::SUCCESS
+        );
         instance.shutdown();
     }
 

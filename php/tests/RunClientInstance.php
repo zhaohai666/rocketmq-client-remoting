@@ -41,6 +41,8 @@ use RocketMQ\Common\SubscriptionData;
 use RocketMQ\Remoting\Protocol\BrokerData;
 use RocketMQ\Remoting\Protocol\ConsumerData;
 use RocketMQ\Remoting\Protocol\ExtraInfoUtil;
+use RocketMQ\Remoting\Protocol\GetConsumerStatusBody;
+use RocketMQ\Remoting\Protocol\GetConsumerStatusRequestHeader;
 use RocketMQ\Remoting\Protocol\HeartbeatData;
 use RocketMQ\Remoting\Protocol\PopMessageResponseHeader;
 use RocketMQ\Remoting\Protocol\ProducerData;
@@ -637,6 +639,107 @@ final class RunClientInstance
 
         $inst->shutdown();
         MQClientInstance::removeInstance('reply-cid');
+    }
+
+    // ================================================================ 4b. GET_CONSUMER_STATUS_FROM_CLIENT(221)
+
+    private function consumerStatusCommand(string $group, ?string $topic): RemotingCommand
+    {
+        $h = new GetConsumerStatusRequestHeader(topic: $topic, group: $group);
+        $cmd = RemotingCommand::createRequestCommand(RequestCode::GET_CONSUMER_STATUS_FROM_CLIENT, $h);
+        $cmd->makeCustomHeaderToNet();
+        return $cmd;
+    }
+
+    private function testConsumerStatusReply(): void
+    {
+        $inst = new MQClientInstance('status-cid', []);
+        $mq = new MessageQueue('StatusTopic', 'b1', 2);
+        $probe = new class ($mq) {
+            public function __construct(private readonly MessageQueue $mq)
+            {
+            }
+
+            public function getConsumerStatus(?string $topic): array
+            {
+                if ($topic !== null && $topic !== '' && $topic !== $this->mq->topic) {
+                    return [];
+                }
+                return [['mq' => $this->mq, 'offset' => 42]];
+            }
+        };
+        $inst->registerConsumer('GID_status', $probe);
+
+        // A hosted group answers with its offsets, and the queue keys survive the
+        // wire: an offset sitting behind a key that does not parse back into a
+        // MessageQueue is an offset nobody can act on.
+        $hosted = $inst->processGetConsumerStatus($this->consumerStatusCommand('GID_status', 'StatusTopic'), 'broker');
+        $this->checkSame(ResponseCode::SUCCESS, $hosted->code, '221 for a hosted group replies SUCCESS');
+        $table = GetConsumerStatusBody::decode((string) $hosted->body)->messageQueueTable;
+        $this->checkSame(1, count($table), '221 reports the hosted group queue');
+        $first = $table[0] ?? ['mq' => null, 'offset' => null];
+        $this->checkSame(42, $first['offset'], '221 reports the consumed offset');
+        $this->checkSame(
+            ['StatusTopic', 'b1', 2],
+            $first['mq'] === null ? [] : [$first['mq']->topic, $first['mq']->brokerName, $first['mq']->queueId],
+            'the 221 queue key decodes back into the same MessageQueue',
+        );
+
+        // An unhosted group is still answered SUCCESS with an empty table: the
+        // asking side always decodes the body, and an error code makes it drop the
+        // reply instead of reporting "this group consumed nothing". The hosted
+        // reply above is the control proving the empty table comes from the group
+        // and not from a handler that never fills one.
+        $unknown = $inst->processGetConsumerStatus($this->consumerStatusCommand('GID_Nobody', 'StatusTopic'), 'broker');
+        $this->checkSame(ResponseCode::SUCCESS, $unknown->code, '221 for an unhosted group replies SUCCESS');
+        $empty = GetConsumerStatusBody::decode((string) $unknown->body);
+        $this->checkSame([], $empty->messageQueueTable, '221 for an unhosted group reports an empty queue table');
+        $this->checkSame([], $empty->consumerTable, 'the unhosted reply is a whole body, not a bare error');
+
+        $inst->shutdown();
+        MQClientInstance::removeInstance('status-cid');
+    }
+
+    // ================================================================ 4c. 307 / 309 name the group nobody here hosts
+
+    private function testUnhostedGroupErrorRemarks(): void
+    {
+        $inst = new MQClientInstance('unhosted-cid', []);
+        $want = 'The Consumer Group <GID_nope> not exist in this consumer';
+
+        $info = RemotingCommand::createRequestCommand(RequestCode::GET_CONSUMER_RUNNING_INFO);
+        $info->extFields = ['consumerGroup' => 'GID_nope', 'clientId' => 'unhosted-cid'];
+        $resp = $inst->processGetConsumerRunningInfo($info, 'broker');
+        $this->checkSame(ResponseCode::SYSTEM_ERROR, $resp->code, '307 for an unhosted group replies SYSTEM_ERROR');
+        $this->checkSame($want, $resp->remark, '307 names the group that is not hosted here');
+
+        $direct = RemotingCommand::createRequestCommand(RequestCode::CONSUME_MESSAGE_DIRECTLY);
+        $direct->extFields = ['consumerGroup' => 'GID_nope', 'brokerName' => 'b1'];
+        $resp2 = $inst->processConsumeMessageDirectly($direct, 'broker');
+        $this->checkSame(ResponseCode::SYSTEM_ERROR, $resp2->code, '309 for an unhosted group replies SYSTEM_ERROR');
+        $this->checkSame($want, $resp2->remark, '309 names the group that is not hosted here');
+
+        // Control: the same instance does answer SUCCESS for a group it hosts, so
+        // the error above comes from the group lookup and not from a handler that
+        // never replies. The admin side reports which client it probed, which only
+        // a real reply can carry.
+        $probe = new class {
+            public function consumerRunningInfo(): \RocketMQ\Remoting\Protocol\ConsumerRunningInfo
+            {
+                return new \RocketMQ\Remoting\Protocol\ConsumerRunningInfo();
+            }
+        };
+        $inst->registerConsumer('GID_hosted', $probe);
+        $info2 = RemotingCommand::createRequestCommand(RequestCode::GET_CONSUMER_RUNNING_INFO);
+        $info2->extFields = ['consumerGroup' => 'GID_hosted', 'clientId' => 'unhosted-cid'];
+        $this->checkSame(
+            ResponseCode::SUCCESS,
+            $inst->processGetConsumerRunningInfo($info2, 'broker')->code,
+            '307 for a hosted group replies SUCCESS',
+        );
+
+        $inst->shutdown();
+        MQClientInstance::removeInstance('unhosted-cid');
     }
 
     // ================================================================ 5. tick() time thresholds
@@ -1368,6 +1471,8 @@ final class RunClientInstance
         $this->testBuildSendRequest();
         $this->testParseSendResponse();
         $this->testProcessReplyMessage();
+        $this->testConsumerStatusReply();
+        $this->testUnhostedGroupErrorRemarks();
         $this->testTickThresholds();
         $this->testHeartbeatIntervalKnob();
         $this->testRouteCacheAndFallback();

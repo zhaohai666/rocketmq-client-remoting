@@ -64,6 +64,14 @@ type consumerBroker struct {
 	maxOffsetQ   []mqKey
 	minOffsetQ   []mqKey
 	reqOrder     []int32
+	// queryOffsetZeroAnswers lists the topics of a QUERY_CONSUMER_OFFSET(14) that
+	// asked the broker to answer a fresh group with 0 instead of QUERY_NOT_FOUND.
+	queryOffsetZeroAnswers []string
+	// searchedOffset is what SEARCH_OFFSET_BY_TIMESTAMP(29) answers. A test that
+	// wants to know WHICH offset drove the start sets it to a value no other
+	// branch could produce — otherwise every search answers 0, which is also
+	// what CONSUME_FROM_FIRST_OFFSET resolves to locally.
+	searchedOffset int64
 	// sends records SEND_MESSAGE_V2(310) requests. In these fixtures the only
 	// sender is a trace dispatcher's internal producer, so the topic of each
 	// send tells the test whether tracing fired.
@@ -201,6 +209,12 @@ func (b *consumerBroker) answer(req *remoting.RemotingCommand) *remoting.Remotin
 		key := commitKey(deref(header.ConsumerGroup), deref(header.Topic), derefI32(header.QueueID))
 		b.mu.Lock()
 		offset, ok := b.committed[key]
+		// A broker asked this way answers a FRESH group with 0/SUCCESS instead of
+		// QUERY_NOT_FOUND, so the client's "no offset yet, fall through to the
+		// policy" branch can never be exercised. Capture the flag to pin it.
+		if header.SetZeroIfNotFound != nil && *header.SetZeroIfNotFound {
+			b.queryOffsetZeroAnswers = append(b.queryOffsetZeroAnswers, deref(header.Topic))
+		}
 		b.mu.Unlock()
 		if !ok {
 			return remoting.CreateResponseCommand(remoting.RespQueryNotFound,
@@ -252,9 +266,10 @@ func (b *consumerBroker) answer(req *remoting.RemotingCommand) *remoting.Remotin
 		header.FromExtFields(req.ExtFields())
 		b.mu.Lock()
 		b.searchTS = append(b.searchTS, derefI64(header.Timestamp))
+		searched := b.searchedOffset
 		b.mu.Unlock()
 		resp := remoting.CreateResponseCommand(remoting.RespSuccess, "")
-		resp.SetCustomHeader(&remoting.SearchOffsetResponseHeader{Offset: remoting.I64Ptr(0)})
+		resp.SetCustomHeader(&remoting.SearchOffsetResponseHeader{Offset: remoting.I64Ptr(searched)})
 		return resp
 	case remoting.ReqConsumerSendMsgBack:
 		header := &remoting.ConsumerSendMsgBackRequestHeader{}
@@ -508,6 +523,40 @@ func (b *consumerBroker) minOffsetQueries() []mqKey {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return append([]mqKey(nil), b.minOffsetQ...)
+}
+
+// maxOffsetQueries snapshots GET_MAX_OFFSET(30) targets.
+func (b *consumerBroker) maxOffsetQueries() []mqKey {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]mqKey(nil), b.maxOffsetQ...)
+}
+
+// boundaryQueries counts the two offset-boundary RPCs aimed at one topic: the
+// assertion "this start position came from the policy, not from the broker"
+// needs a number, not a list.
+func (b *consumerBroker) boundaryQueries(topic string) (min, max int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, k := range b.minOffsetQ {
+		if k.topic == topic {
+			min++
+		}
+	}
+	for _, k := range b.maxOffsetQ {
+		if k.topic == topic {
+			max++
+		}
+	}
+	return min, max
+}
+
+// zeroIfNotFoundQueries snapshots the QUERY_CONSUMER_OFFSET(14) requests that asked
+// the broker to answer a fresh group with 0.
+func (b *consumerBroker) zeroIfNotFoundQueries() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]string(nil), b.queryOffsetZeroAnswers...)
 }
 
 func (b *consumerBroker) searchTimestamps() []int64 {
@@ -1086,6 +1135,31 @@ func TestConsumerAckAdvancesCommittedOffset(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("GetConsumerStatus did not report queue %s:0", topic)
+	}
+
+	// 221's topic argument only filters when it names something: the asking side
+	// leaves the field empty to mean "everything this client has consumed", so an
+	// empty string must not read as "match a topic literally named empty".
+	whole := c.GetConsumerStatus(nil)
+	blank := ""
+	if got := c.GetConsumerStatus(&blank); len(got) != len(whole) {
+		t.Errorf("GetConsumerStatus(\"\") reported %d entries, want the whole table (%d)",
+			len(got), len(whole))
+	}
+	scoped := topic
+	if got := c.GetConsumerStatus(&scoped); len(got) == 0 {
+		t.Errorf("GetConsumerStatus(%q) reported nothing", topic)
+	}
+	for _, entry := range c.GetConsumerStatus(&scoped) {
+		if entry.Queue.Topic != topic {
+			t.Errorf("a topic-scoped query leaked queue %s:0", entry.Queue.Topic)
+		}
+	}
+	// Control: a name nobody holds really filters out everything, so the blank
+	// case above is the no-filter rule and not a handler ignoring its argument.
+	never := "NoSuchTopic_GoStatus"
+	if got := c.GetConsumerStatus(&never); len(got) != 0 {
+		t.Errorf("GetConsumerStatus(%q) = %d entries, want 0", never, len(got))
 	}
 }
 

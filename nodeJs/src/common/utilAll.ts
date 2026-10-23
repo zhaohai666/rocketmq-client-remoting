@@ -134,8 +134,33 @@ export function getHostIp() {
   return '127.0.0.1';
 }
 
+// The start instant of CONSUME_FROM_TIMESTAMP, in local "yyyyMMddHHmmss".
+export function timeMillisToHumanString3(ms: number): string {
+  const d = new Date(ms);
+  const p = (n: number, w = 2) => String(n).padStart(w, '0');
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+// Default for a consumer that never set one: boot time minus 30 minutes, so an untouched
+// CONSUME_FROM_TIMESTAMP still replays a recent backlog instead of starting at "now".
+export function defaultConsumeTimestamp(): string {
+  return timeMillisToHumanString3(Date.now() - 30 * 60 * 1000);
+}
+
+// Parse that instant back. A malformed value is a hard failure: falling back to "now" would silently
+// turn the policy into "skip the backlog", so both consumer families reject it at start-up.
+export function parseConsumeTimestamp(raw: string): number {
+  const m = /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$/.exec(raw ?? '');
+  if (!m) {
+    throw new Error(`consumeTimestamp is invalid, the valid format is yyyyMMddHHmmss,but received ${raw}`);
+  }
+  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]),
+    Number(m[4]), Number(m[5]), Number(m[6])).getTime();
+}
+
 export default {
   crc32, crc32Match, serverStringHash, bytes2string, string2bytesHex,
   ipAndPortToBytes, bytesToIpAndPort, createMessageId, decodeMessageId,
   currentTimeMillis, isBlank, getPid, getHostIp,
+  timeMillisToHumanString3, defaultConsumeTimestamp, parseConsumeTimestamp,
 };

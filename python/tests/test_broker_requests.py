@@ -137,6 +137,22 @@ class TestConsumerHandlers:
         c = consumer_with_state()
         assert c.get_consumer_status("OtherTopic") == {}
 
+    def test_get_consumer_status_blank_topic_reports_whole_table(self):
+        # 221's topic argument only filters when it names something: the asking
+        # side sends an empty field to mean "everything this client consumed",
+        # and a literal match on the empty string would report nothing.
+        c = consumer_with_state()
+        other = mq("OtherTopic", 3)
+        key = "%s@%s@%d" % (other.topic, other.broker_name, other.queue_id)
+        c._mq_map[key] = other
+        c._consume_offsets[key] = 7
+        assert c.get_consumer_status("") == {mq(): 42, other: 7}
+        assert c.get_consumer_status(None) == {mq(): 42, other: 7}
+        # Control: a named topic really does filter, so the case above is the
+        # no-filter rule and not a handler that ignores its argument.
+        assert c.get_consumer_status(TOPIC) == {mq(): 42}
+        assert c.get_consumer_status("Never") == {}
+
     def test_consumer_running_info(self):
         c = consumer_with_state()
         info = c.consumer_running_info()
@@ -270,6 +286,51 @@ class TestMqClientDispatch:
         r = ConsumeMessageDirectlyResult.decode(resp.body)
         assert r.consume_result == CMResult.CR_SUCCESS
 
+    def test_221_dispatch_with_a_blank_topic_reports_the_whole_table(self):
+        # The admin side asks "what has this client consumed" by leaving the topic
+        # field empty, so the blank value has to reach the consumer as no filter.
+        c = consumer_with_state()
+        other = mq("OtherTopic", 3)
+        key = "%s@%s@%d" % (other.topic, other.broker_name, other.queue_id)
+        c._mq_map[key] = other
+        c._consume_offsets[key] = 7
+        mqc = self._client_with_consumer(c)
+        for blank in ("", None):
+            cmd = fake_cmd(GET_CONSUMER_STATUS_FROM_CLIENT,
+                           {"topic": blank, "group": GROUP, "clientAddr": "1.2.3.4"})
+            resp = mqc._process_get_consumer_status(cmd, "127.0.0.1:10911")
+            assert resp is not None and resp.code == ResponseCode.SUCCESS
+            body = GetConsumerStatusBody.decode(resp.body)
+            assert sorted(body.message_queue_table.values()) == [7, 42], blank
+        # Control: a named topic really filters, so the case above is the
+        # blank-means-everything rule and not a handler ignoring the field.
+        cmd = fake_cmd(GET_CONSUMER_STATUS_FROM_CLIENT,
+                       {"topic": TOPIC, "group": GROUP, "clientAddr": "1.2.3.4"})
+        body = GetConsumerStatusBody.decode(
+            mqc._process_get_consumer_status(cmd, "127.0.0.1:10911").body)
+        assert list(body.message_queue_table.values()) == [42]
+
+    def test_307_and_309_name_the_group_nobody_here_hosts(self):
+        mqc = MQClientInstance("client@unhosted", ["127.0.0.1:9876"])
+        want = "The Consumer Group <GID_nope> not exist in this consumer"
+        for code, handler in (
+            (GET_CONSUMER_RUNNING_INFO, mqc._process_get_consumer_running_info),
+            (CONSUME_MESSAGE_DIRECTLY, mqc._process_consume_message_directly),
+        ):
+            cmd = fake_cmd(code, {"consumerGroup": "GID_nope", "clientId": "client@unhosted"})
+            resp = handler(cmd, "127.0.0.1:10911")
+            assert resp is not None and resp.code == ResponseCode.SYSTEM_ERROR
+            assert resp.remark == want
+        # Control: the same instance does answer SUCCESS for the group it hosts,
+        # so the error above is the group lookup and not a dead handler.
+        c = consumer_with_state()
+        mqc.register_consumer(c.consumer_group, c)
+        resp = mqc._process_get_consumer_running_info(
+            fake_cmd(GET_CONSUMER_RUNNING_INFO,
+                     {"consumerGroup": GROUP, "clientId": "client@unhosted"}),
+            "127.0.0.1:10911")
+        assert resp.code == ResponseCode.SUCCESS
+
     def test_220_dispatch_is_oneway_and_async(self):
         """220 is oneway (returns None), and the reset logic is dispatched to a background thread without blocking the read thread."""
         recorded = {"called": False, "event": threading.Event()}
@@ -396,12 +457,26 @@ class TestMqClientDispatch:
         mqc.rebalance_immediately()
         assert mqc.consumer_ids_changed_count == 1
 
-    def test_dispatch_unknown_group_returns_error(self):
+    def test_dispatch_unknown_group_answers_an_empty_table(self):
         mqc = MQClientInstance("client@id", ["127.0.0.1:9876"])
         cmd = fake_cmd(GET_CONSUMER_STATUS_FROM_CLIENT,
                        {"topic": TOPIC, "group": "nobody", "clientAddr": "x"})
         resp = mqc._process_get_consumer_status(cmd, "127.0.0.1:10911")
-        assert resp is not None and resp.code == ResponseCode.SYSTEM_ERROR
+        assert resp is not None and resp.code == ResponseCode.SUCCESS
+        # The body is what the asking side decodes, so a group nobody hosts must
+        # still be a well-formed (empty) table rather than an error with no body.
+        body = GetConsumerStatusBody.decode(resp.body)
+        assert body.message_queue_table == {}
+        assert body.consumer_table == {}
+
+    def test_dispatch_known_group_reports_only_its_own_offsets(self):
+        mqc = self._client_with_consumer(consumer_with_state())
+        cmd = fake_cmd(GET_CONSUMER_STATUS_FROM_CLIENT,
+                       {"topic": TOPIC, "group": GROUP, "clientAddr": "x"})
+        resp = mqc._process_get_consumer_status(cmd, "127.0.0.1:10911")
+        assert resp is not None and resp.code == ResponseCode.SUCCESS
+        body = GetConsumerStatusBody.decode(resp.body)
+        assert list(body.message_queue_table.values()) == [42]
 
 
 # ------------------------------------------------------- VIP channel address rewrite

@@ -2241,50 +2241,89 @@ impl DefaultMQPushConsumer {
 // ---------------- Offset resolution ----------------
 
 /// Free function: the pull loop only holds `Arc<Inner>` (structural trade-off 4) and cannot reach the consumer handle.
+/// The decision half of the initial-offset lookup, kept apart from the RPCs that
+/// execute it (the stored offset and the queue tail are both broker reads).
+///
+/// Two invariants hold it together:
+/// 1. the start NEVER depends on the subscription type. An earlier draft
+///    short-circuited SQL92 subscriptions to the queue tail, which silently skipped
+///    every message produced *before* the consumer started (send-first +
+///    CONSUME_FROM_FIRST_OFFSET received nothing; consumer-first only passed because
+///    the queues were empty and the tail was 0 anyway). The broker applies the SQL92
+///    filter to whatever range the pull covers, so the policy alone decides.
+/// 2. broadcasting and clustering differ ONLY in where the stored offset is read from
+///    (local file vs broker). Both fall through to this same decision when nothing is
+///    stored, so a CONSUME_FROM_TIMESTAMP or %RETRY% start can never become
+///    mode-dependent.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StartOffsetPlan {
+    Stored(i64),
+    FromZero,
+    QueueTail,
+    SearchAtConfiguredTime,
+}
+
+pub(crate) fn plan_initial_offset(stored: i64, from_where: &str, is_retry_topic: bool) -> StartOffsetPlan {
+    if stored >= 0 {
+        return StartOffsetPlan::Stored(stored);
+    }
+    if from_where == ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET {
+        // Nothing stored: the start is the literal 0 and no minOffset query is sent --
+        // minOffset is the admin-side policy (master only), so while the master is down a
+        // freshly started consumer would pull nothing at all. Starting at 0 works through
+        // a slave and the broker corrects an out-of-range start with PULL_OFFSET_MOVED.
+        return StartOffsetPlan::FromZero;
+    }
+    if from_where == ConsumeFromWhere::CONSUME_FROM_TIMESTAMP {
+        // A %RETRY% queue has no meaningful "time of the oldest retry" and every queued
+        // retry must be delivered, so it starts at the tail rather than searching
+        // backwards from a timestamp.
+        return if is_retry_topic {
+            StartOffsetPlan::QueueTail
+        } else {
+            StartOffsetPlan::SearchAtConfiguredTime
+        };
+    }
+    // Default CONSUME_FROM_LAST_OFFSET: a %RETRY% queue starts at 0 (retry messages must
+    // be fully retried) instead of skipping from the tail.
+    if is_retry_topic {
+        return StartOffsetPlan::FromZero;
+    }
+    StartOffsetPlan::QueueTail
+}
+
 async fn resolve_initial_offset(
     inner: &Inner,
     client: &MQClientInstance,
     mq: &MessageQueue,
 ) -> Result<i64> {
-    // Offset lookup follows the stored-offset contract: the initial
-    // offset NEVER depends on the subscription type. An earlier draft short-circuited
-    // SQL92 subscriptions to the max offset, which silently skipped every message
-    // produced *before* the consumer started (send-first + CONSUME_FROM_FIRST_OFFSET
-    // received nothing; consumer-first only passed because the queues were empty and
-    // the max offset was 0 anyway). A stored offset is read first and, when absent,
-    // the policy decides: 0 for FIRST_OFFSET, max for LAST_OFFSET etc. -- the broker applies the
-    // SQL92 filter to whatever range the pull covers.
     let cfg = read_cfg(inner);
     let key = mq_key(mq);
+    let mut stored = -1i64;
     if cfg.message_model == MessageModel::BROADCASTING {
-        let stored = load_local_offsets(inner);
-        if let Some(off) = stored.get(&key) {
-            return Ok(*off);
+        if let Some(off) = load_local_offsets(inner).get(&key) {
+            stored = *off;
         }
-        if cfg.consume_from_where == ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET {
-            return Ok(0);
+    } else {
+        match client
+            .query_consumer_offset(&cfg.consumer_group, mq, 5000, None, false)
+            .await
+        {
+            Ok(Some(off)) => stored = off,
+            Ok(_) => {}
+            Err(e) => rmq_debug!("query consumer offset for {mq:?} not found: {e}"),
         }
-        return client.get_max_offset(mq, 5000, None).await;
     }
-    match client
-        .query_consumer_offset(&cfg.consumer_group, mq, 5000, None, false)
-        .await
-    {
-        Ok(Some(off)) if off >= 0 => return Ok(off),
-        Ok(_) => {}
-        Err(e) => rmq_debug!("query consumer offset for {mq:?} not found: {e}"),
+
+    match plan_initial_offset(stored, &cfg.consume_from_where, NamespaceUtil::is_retry_topic(&mq.topic)) {
+        StartOffsetPlan::Stored(off) => Ok(off),
+        StartOffsetPlan::FromZero => Ok(0),
+        StartOffsetPlan::QueueTail => client.get_max_offset(mq, 5000, None).await,
+        StartOffsetPlan::SearchAtConfiguredTime => {
+            let ts = consume_timestamp_millis(&cfg.consume_timestamp)?;
+            client.search_offset_by_timestamp(mq, ts, 5000, None).await
+        }
     }
-    if cfg.consume_from_where == ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET {
-        return Ok(0);
-    }
-    if cfg.consume_from_where == ConsumeFromWhere::CONSUME_FROM_TIMESTAMP {
-        let ts = consume_timestamp_millis(&cfg.consume_timestamp)?;
-        return client.search_offset_by_timestamp(mq, ts, 5000, None).await;
-    }
-    if NamespaceUtil::is_retry_topic(&mq.topic) {
-        return Ok(0);
-    }
-    client.get_max_offset(mq, 5000, None).await
 }
 
 // ---------------- Queue revocation and offset correction ----------------
@@ -4855,7 +4894,10 @@ impl RegisteredConsumer for DefaultMQPushConsumer {
             .iter()
             .filter_map(|(k, off)| {
                 let mq = state.mq_map.get(k)?;
-                if let Some(topic) = topic {
+                // A blank topic is not a filter: the caller asked for everything
+                // this consumer holds, so an empty string must not read as "match
+                // a topic literally named empty" and report nothing.
+                if let Some(topic) = topic.filter(|t| !t.is_empty()) {
                     if mq.topic != topic {
                         return None;
                     }
@@ -5161,6 +5203,68 @@ mod tests {
             s.tags_set = expression.split("||").map(str::to_string).collect();
         }
         s
+    }
+
+    /// The plan takes NO subscription argument at all: the start offset is decided by the
+    /// policy and the queue name, never by TAG vs SQL92. A SQL92 subscription that
+    /// short-circuits to the queue tail silently drops everything produced before the
+    /// consumer came up.
+    #[test]
+    fn initial_offset_plan_never_takes_the_subscription_into_account() {
+        assert_eq!(
+            plan_initial_offset(-1, ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET, false),
+            StartOffsetPlan::FromZero
+        );
+        assert_eq!(
+            plan_initial_offset(-1, ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET, false),
+            StartOffsetPlan::QueueTail
+        );
+    }
+
+    #[test]
+    fn initial_offset_plan_stored_offset_beats_every_policy() {
+        for where_ in [
+            ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET,
+            ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET,
+            ConsumeFromWhere::CONSUME_FROM_TIMESTAMP,
+        ] {
+            assert_eq!(
+                plan_initial_offset(0, where_, false),
+                StartOffsetPlan::Stored(0),
+                "a stored 0 is a real position, not 'nothing stored'"
+            );
+            assert_eq!(
+                plan_initial_offset(42, where_, true),
+                StartOffsetPlan::Stored(42),
+                "even a %RETRY% queue resumes where it left off"
+            );
+        }
+    }
+
+    #[test]
+    fn initial_offset_plan_sends_every_retry_queue_to_zero() {
+        assert_eq!(
+            plan_initial_offset(-1, ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET, true),
+            StartOffsetPlan::FromZero,
+            "queued retries must all be delivered"
+        );
+        assert_eq!(
+            plan_initial_offset(-1, ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET, true),
+            StartOffsetPlan::FromZero
+        );
+    }
+
+    #[test]
+    fn initial_offset_plan_timestamp_searches_business_and_starts_retry_at_tail() {
+        assert_eq!(
+            plan_initial_offset(-1, ConsumeFromWhere::CONSUME_FROM_TIMESTAMP, false),
+            StartOffsetPlan::SearchAtConfiguredTime
+        );
+        assert_eq!(
+            plan_initial_offset(-1, ConsumeFromWhere::CONSUME_FROM_TIMESTAMP, true),
+            StartOffsetPlan::QueueTail,
+            "a retry queue has no meaningful 'time of the oldest retry'"
+        );
     }
 
     #[test]
@@ -7647,6 +7751,46 @@ mod tests {
             info.mq_pop_table[0].1.get("lastPullTimestamp"),
             Some(&serde_json::Value::from(1_700_000_000_789_i64))
         );
+    }
+
+    /// 221's topic argument: only a non-empty topic filters. The admin side that
+    /// asks for "everything this client has consumed" sends the field empty, so
+    /// an empty string must not read as "match a topic literally named empty".
+    #[test]
+    fn consumer_status_blank_topic_reports_the_whole_table() {
+        let consumer = DefaultMQPushConsumer::new("G").unwrap();
+        let mine = queue("T", "broker-a", 0);
+        let other = queue("Other", "broker-a", 0);
+        {
+            let mut state = lock(&consumer.inner.state);
+            state
+                .mq_map
+                .insert(mq_key(&mine), mine.clone());
+            state
+                .mq_map
+                .insert(mq_key(&other), other.clone());
+            state.consume_offsets.insert(mq_key(&mine), 42);
+            state.consume_offsets.insert(mq_key(&other), 7);
+        }
+        let keys = |t: Option<&str>| -> Vec<(String, i64)> {
+            consumer
+                .get_consumer_status(t)
+                .into_iter()
+                .map(|(mq, off)| (mq.topic, off))
+                .collect()
+        };
+        // Absent, empty and a name that matches nothing are three different asks;
+        // the first two both mean "no filter".
+        assert_eq!(keys(None), vec![("Other".to_string(), 7), ("T".to_string(), 42)]);
+        assert_eq!(
+            keys(Some("")),
+            vec![("Other".to_string(), 7), ("T".to_string(), 42)],
+            "a blank topic must not silently report nothing"
+        );
+        // Control: the named filter is real, so the blank case above is the
+        // no-filter rule and not a handler that ignores its argument.
+        assert_eq!(keys(Some("T")), vec![("T".to_string(), 42)]);
+        assert!(keys(Some("Never")).is_empty());
     }
 
     /// Shutdown must clear the stamp table: the next start() must not inherit the old instance's moments.

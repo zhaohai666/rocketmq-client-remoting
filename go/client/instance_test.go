@@ -724,7 +724,7 @@ func TestGetConsumerStatusPush(t *testing.T) {
 	broker.waitHandler(t, "221 assertions")
 }
 
-func TestGetConsumerStatusUnknownGroupIsSystemError(t *testing.T) {
+func TestGetConsumerStatusUnknownGroupAnswersAnEmptyTable(t *testing.T) {
 	broker := startMockServer(t, func(s *mockServer, req *remoting.RemotingCommand) *remoting.RemotingCommand {
 		if req.Code == remoting.ReqHeartBeat {
 			push := remoting.CreateRequestCommand(remoting.ReqGetConsumerStatusFromClient,
@@ -735,8 +735,20 @@ func TestGetConsumerStatusUnknownGroupIsSystemError(t *testing.T) {
 				s.handlerDone.Store(true)
 				return nil
 			}
-			if resp.Code != remoting.RespSystemError {
-				s.fail("unknown group must answer SYSTEM_ERROR, got code=%d", resp.Code)
+			// The asking side always decodes the body, so an unhosted group has to
+			// come back SUCCESS with an empty table. A SYSTEM_ERROR reply is dropped
+			// as a transport failure instead of reading as "nothing consumed";
+			// TestGetConsumerStatusPush is the control that a real table still
+			// reaches the wire.
+			if resp.Code != remoting.RespSuccess {
+				s.fail("unknown group must answer SUCCESS with an empty table, got code=%d remark=%q",
+					resp.Code, resp.Remark)
+			}
+			body, err := remoting.DecodeGetConsumerStatusBody(resp.Body)
+			if err != nil {
+				s.fail("221 unknown-group body decode: %v", err)
+			} else if len(body.MessageQueueTable) != 0 {
+				s.fail("unknown group must report an empty table, got %+v", body.MessageQueueTable)
 			}
 			s.handlerDone.Store(true)
 			return remoting.CreateResponseCommand(remoting.RespSuccess, "")

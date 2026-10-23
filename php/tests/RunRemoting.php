@@ -43,6 +43,7 @@ use RocketMQ\Remoting\Protocol\PopMessageRequestHeader;
 use RocketMQ\Remoting\Protocol\ProducerData;
 use RocketMQ\Remoting\Protocol\QueueData;
 use RocketMQ\Remoting\Protocol\RemotingCommand;
+use RocketMQ\Remoting\Protocol\GetConsumerStatusBody;
 use RocketMQ\Remoting\Protocol\RemotingSerializable;
 use RocketMQ\Remoting\Protocol\RequestCode;
 use RocketMQ\Remoting\Protocol\ResponseCode;
@@ -753,6 +754,12 @@ final class RunRemoting
         $v4 = RemotingSerializable::fastjsonLoads('{"s":"中文\\n\"q\""}');
         $this->checkSame("中文\n\"q\"", $v4['s'], 'fastjson CJK and escapes');
         $this->checkThrows(static fn() => RemotingSerializable::fastjsonLoads('{"a":}'), FastJsonDecodeError::class, 'invalid input throws FastJsonDecodeError');
+        // A reply can legitimately carry no bytes at all (encode(null) above also
+        // produces the empty string), and decoding it means "nothing here" — the
+        // parse only has to fail on input that is actually malformed.
+        $this->checkSame(null, RemotingSerializable::fastjsonLoads(''), 'empty input decodes to null');
+        $bodyless = GetConsumerStatusBody::decode('');
+        $this->checkSame([], $bodyless->messageQueueTable, 'a body-less reply decodes into an empty structure');
 
         // encode
         $this->checkSame('', RemotingSerializable::encode(null), 'encode(null) -> empty string');

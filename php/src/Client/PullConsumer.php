@@ -996,7 +996,7 @@ final class DefaultLitePullConsumer
         $this->rpcHook = $rpcHook;
         $this->namespace = $namespace;
         $this->messageModel = $messageModel;
-        $this->consumeTimestamp = date('YmdHis', time() - 30 * 60);
+        $this->consumeTimestamp = UtilAll::defaultConsumeTimestamp();
         $this->concurrentHeartbeatThreadPoolSize = MQClientInstance::availableProcessors();
         $this->allocateMessageQueueStrategy = new AllocateMessageQueueAveragely();
     }
@@ -1232,6 +1232,9 @@ final class DefaultLitePullConsumer
         if (!isset($this->allocateMessageQueueStrategy)) {
             throw new MQClientException('allocateMessageQueueStrategy is null');
         }
+        // The start instant is checked whatever the policy is: a malformed value must fail here
+        // rather than surface mid-consumption as a failed offset resolution on one queue.
+        $this->parseConsumeTimestamp($this->consumeTimestamp);
         if ($this->messageModel === MessageModel::CLUSTERING) {
             $this->instanceName = MixAll::changeInstanceNameToPid($this->instanceName);
         }
@@ -1535,20 +1538,24 @@ final class DefaultLitePullConsumer
             return 0;
         }
         if ($this->consumeFromWhere === ConsumeFromWhere::CONSUME_FROM_TIMESTAMP) {
+            if (NamespaceUtil::isRetryTopic($mq->topic)) {
+                // Same rule as the push consumer: a %RETRY% queue cannot be searched
+                // backwards from a timestamp, so it starts at the tail.
+                return $this->mqClient->getMaxOffset($mq);
+            }
             return $this->mqClient->searchOffsetByTimestamp($mq, $this->parseConsumeTimestamp($this->consumeTimestamp));
+        }
+        // Default CONSUME_FROM_LAST_OFFSET: a %RETRY% queue starts at 0 so every queued
+        // retry is delivered.
+        if (NamespaceUtil::isRetryTopic($mq->topic)) {
+            return 0;
         }
         return $this->mqClient->getMaxOffset($mq);
     }
 
     private function parseConsumeTimestamp(string $ts): int
     {
-        $dt = \DateTime::createFromFormat('YmdHis', $ts);
-        if ($dt === false || strlen($ts) !== 14 || (int) $dt->format('YmdHis') !== (int) $ts) {
-            throw new MQClientException(
-                "consumeTimestamp is invalid, the valid format is yyyyMMddHHmmss,but received $ts",
-            );
-        }
-        return (int) $dt->format('U') * 1000 + (int) $dt->format('v');
+        return UtilAll::parseConsumeTimestamp($ts);
     }
 
     // ---------------- rebalance (subscribe mode) ----------------

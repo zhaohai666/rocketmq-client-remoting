@@ -8,6 +8,7 @@
 #include <cstring>
 #include <ctime>
 
+#include "rocketmq/client/exception.h"
 #include "rocketmq/common/net_compat.h"
 
 #if defined(_WIN32)
@@ -94,6 +95,37 @@ std::string UtilAll::timeToHumanString(int64_t ts, const std::string& pattern) {
 
 std::string UtilAll::timeMillisToHumanString3(int64_t ts) {
     return timeToHumanString(ts, "%Y%m%d%H%M%S");
+}
+
+int64_t UtilAll::parseConsumeTimestamp(const std::string& ts) {
+    auto invalid = [&ts] {
+        return MQClientException(
+            "consumeTimestamp is invalid, the valid format is yyyyMMddHHmmss,but received " + ts);
+    };
+    if (ts.size() != 14) throw invalid();
+
+    int field[6] = {0, 0, 0, 0, 0, 0};
+    size_t pos = 0;
+    for (int i = 0; i < 6; ++i) {
+        int width = i == 0 ? 4 : 2;
+        for (int k = 0; k < width; ++k) {
+            char c = ts[pos++];
+            if (c < '0' || c > '9') throw invalid();
+            field[i] = field[i] * 10 + (c - '0');
+        }
+    }
+
+    std::tm tmv {};
+    tmv.tm_year = field[0] - 1900;
+    tmv.tm_mon = field[1] - 1;
+    tmv.tm_mday = field[2];
+    tmv.tm_hour = field[3];
+    tmv.tm_min = field[4];
+    tmv.tm_sec = field[5];
+    tmv.tm_isdst = -1;
+    std::time_t sec = std::mktime(&tmv);
+    if (sec == static_cast<std::time_t>(-1)) throw invalid();
+    return static_cast<int64_t>(sec) * 1000;
 }
 
 bool UtilAll::isBlank(const std::string& s) {

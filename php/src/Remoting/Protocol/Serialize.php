@@ -250,6 +250,12 @@ final class RemotingSerializable
      */
     public static function fastjsonLoads(string $text): mixed
     {
+        // An absent body is "nothing to decode", not a parse failure: a reply can
+        // carry a SUCCESS code with no bytes at all, and every decode() path here
+        // already reads a non-array as an empty structure.
+        if (trim($text) === '') {
+            return null;
+        }
         return (new FastJsonParser($text))->parse();
     }
 

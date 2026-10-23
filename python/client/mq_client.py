@@ -356,12 +356,12 @@ class MQClientInstance:
         header.from_ext_fields(cmd.ext_fields)
         group = header.group
         consumer = self.find_consumer(group) if group else None
-        if consumer is None:
-            return RemotingCommand.create_response_command(
-                ResponseCode.SYSTEM_ERROR, "no consumer for group=%s" % group, None)
-        status = consumer.get_consumer_status(header.topic)
+        # An unknown group is still answered SUCCESS with an empty table: the
+        # asking side always decodes the body, and an error code makes it drop
+        # the reply instead of reporting "this group consumed nothing".
+        status = dict(consumer.get_consumer_status(header.topic)) if consumer else {}
         body = GetConsumerStatusBody()
-        body.message_queue_table = dict(status)
+        body.message_queue_table = status
         resp = RemotingCommand.create_response_command(ResponseCode.SUCCESS, None, None)
         resp.body = body.encode()
         return resp
@@ -373,8 +373,11 @@ class MQClientInstance:
         group = header.consumer_group
         consumer = self.find_consumer(group) if group else None
         if consumer is None:
+            # The admin side reports which client it probed, so the reply has to
+            # name the group that is not hosted here.
             return RemotingCommand.create_response_command(
-                ResponseCode.SYSTEM_ERROR, "no consumer for group=%s" % group, None)
+                ResponseCode.SYSTEM_ERROR,
+                "The Consumer Group <%s> not exist in this consumer" % group, None)
         info = consumer.consumer_running_info()
         resp = RemotingCommand.create_response_command(ResponseCode.SUCCESS, None, None)
         resp.body = info.encode()
@@ -387,8 +390,10 @@ class MQClientInstance:
         group = header.consumer_group
         consumer = self.find_consumer(group) if group else None
         if consumer is None:
+            # Same as 307: the probe is reported per client, so name the group.
             return RemotingCommand.create_response_command(
-                ResponseCode.SYSTEM_ERROR, "no consumer for group=%s" % group, None)
+                ResponseCode.SYSTEM_ERROR,
+                "The Consumer Group <%s> not exist in this consumer" % group, None)
         if not cmd.body:
             return RemotingCommand.create_response_command(
                 ResponseCode.SYSTEM_ERROR, "empty message body", None)

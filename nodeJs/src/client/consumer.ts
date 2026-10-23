@@ -60,10 +60,12 @@ import { TopicRouteData } from '../remoting/route.ts';
 import {
   ConsumeType, MessageModel, ConsumeFromWhere,
 } from '../remoting/heartbeat.ts';
+import { GetConsumerStatusBody } from '../remoting/bodies.ts';
 import { PullSysFlag } from '../common/sysflag.ts';
 import { MessageExt, MessageQueue, Message } from '../common/message.ts';
 import { MessageConst } from '../common/messageConst.ts';
 import { MixAll } from '../common/mixAll.ts';
+import { defaultConsumeTimestamp, parseConsumeTimestamp } from '../common/utilAll.ts';
 import { FilterAPI, SubscriptionData, ExpressionType } from '../common/subscriptionData.ts';
 import { decodeMessages } from '../common/messageDecoder.ts';
 import { Validators } from '../common/validators.ts';
@@ -109,12 +111,6 @@ const INT32_MAX = 2147483647;
 const DEFAULT_CONSUMER_GROUP = 'DEFAULT_CONSUMER';
 
 export { MessageSelector };
-
-function defaultConsumeTimestamp(): string {
-  const d = new Date(Date.now() - 30 * 60 * 1000);
-  const p = (n: number, w = 2) => String(n).padStart(w, '0');
-  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
-}
 
 // ConsumeReturnType — the ORDINAL is a wire-format value: a SubAfter trace
 // record stores it as contextCode. Do not reorder.
@@ -492,7 +488,7 @@ export class DefaultMQPushConsumer {
       throw new Error('subscription is not set, call subscribe() first');
     }
     if (this.listener == null) throw new Error('message listener is not set');
-    this._parseConsumeTimestamp(this.consumeTimestamp); // hard fail on bad format
+    parseConsumeTimestamp(this.consumeTimestamp); // hard fail on bad format
     this._checkConfigRanges();
     if (this.messageModel === MessageModel.CLUSTERING) {
       // Only CLUSTERING rewrites the DEFAULT instance name, and
@@ -1113,7 +1109,7 @@ export class DefaultMQPushConsumer {
       if (MixAll.isRetryTopic(mq.getTopic())) {
         return this._getMaxOffsetForMq(mq);
       }
-      const ts = this._parseConsumeTimestamp(this.consumeTimestamp);
+      const ts = parseConsumeTimestamp(this.consumeTimestamp);
       return this._searchOffsetForMq(mq, ts);
     }
     // CONSUME_FROM_LAST_OFFSET (and the two deprecated variants).
@@ -2240,16 +2236,22 @@ export class DefaultMQPushConsumer {
       return null;
     });
     handlers.set(RequestCode.GET_CONSUMER_STATUS_FROM_CLIENT, (cmd: RemotingCommand) => {
-      if (!mine(cmd)) return null;
+      // This one answers by group exactly: the offset table is looked up per
+      // group, so a request naming another (or no) group is not this consumer's
+      // to answer. The instance replies with an empty table when nobody owns it.
       const ext = cmd.extFields || {};
+      if (String(ext['group'] || '') !== this.consumerGroup) return null;
       const topic = ext['topic'] || undefined;
       const response = RemotingCommand.createResponseCommand(ResponseCode.SUCCESS, null);
-      const status = this.getConsumerStatus(topic);
-      response.body = Buffer.from(JSON.stringify(
-        status.map((e) => ({
-          topic: e.mq.getTopic(), brokerName: e.mq.getBrokerName(),
-          queueId: e.mq.getQueueId(), offset: e.offset,
-        }))), 'utf-8');
+      // The body is a GetConsumerStatusBody OBJECT: the side that asked decodes it
+      // into that type and reads `messageQueueTable`, so a bare list of entries —
+      // or a `mq`/`offset` shape — decodes into nothing and the query silently
+      // returns empty. The keys are the rendered MessageQueue objects.
+      const body = new GetConsumerStatusBody();
+      for (const entry of this.getConsumerStatus(topic)) {
+        body.messageQueueTable.set(entry.mq, entry.offset);
+      }
+      response.body = body.encode();
       return response;
     });
     handlers.set(RequestCode.RESET_CONSUMER_CLIENT_OFFSET, (cmd: RemotingCommand) => {
@@ -2467,18 +2469,6 @@ export class DefaultMQPushConsumer {
       logger.debug('adjustThreadPool: acc=%d < decThreshold=%d (dec is a no-op upstream)',
         accTotal, Math.trunc(threshold * 0.8));
     }
-  }
-
-  private _parseConsumeTimestamp(raw: string): number {
-    if (!raw || raw.length !== 14) {
-      throw new Error(`consumeTimestamp is invalid, the valid format is yyyyMMddHHmmss,but received ${raw}`);
-    }
-    const m = /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$/.exec(raw);
-    if (!m) {
-      throw new Error(`consumeTimestamp is invalid, the valid format is yyyyMMddHHmmss,but received ${raw}`);
-    }
-    const t = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6]));
-    return t.getTime();
   }
 
   // _checkConfigRanges validates the numeric consumer config — a fixed order,

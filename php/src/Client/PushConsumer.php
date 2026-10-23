@@ -275,7 +275,7 @@ final class DefaultMQPushConsumer
         $this->messageModel = $messageModel;
         $this->concurrentHeartbeatThreadPoolSize = MQClientInstance::availableProcessors();
         $this->corePoolSize = $this->consumeThreadMin;
-        $this->consumeTimestamp = date('YmdHis', time() - 30 * 60);
+        $this->consumeTimestamp = UtilAll::defaultConsumeTimestamp();
         $this->allocateStrategy = new AllocateMessageQueueAveragely();
     }
 
@@ -524,6 +524,10 @@ final class DefaultMQPushConsumer
 
     private function checkConfigRanges(): void
     {
+        // consumeTimestamp is parsed unconditionally, not only when CONSUME_FROM_TIMESTAMP
+        // is selected: a malformed start time must fail here rather than surface as a
+        // pull error minutes later.
+        $this->consumeTimestampMillis();
         if ($this->consumeThreadMin < 1 || $this->consumeThreadMin > 1000) {
             throw new MQClientException('consumeThreadMin Out of range [1, 1000]');
         }
@@ -579,20 +583,7 @@ final class DefaultMQPushConsumer
     /** Parse consumeTimestamp (unparseable input must fail hard). */
     public function consumeTimestampMillis(): int
     {
-        $ts = $this->consumeTimestamp;
-        $dt = \DateTime::createFromFormat('YmdHis', $ts);
-        if ($dt === false || strlen($ts) !== 14) {
-            throw new MQClientException(
-                "consumeTimestamp is invalid, the valid format is yyyyMMddHHmmss,but received $ts",
-            );
-        }
-        $parsed = (int) $dt->format('YmdHis');
-        if ($parsed !== (int) $ts) {
-            throw new MQClientException(
-                "consumeTimestamp is invalid, the valid format is yyyyMMddHHmmss,but received $ts",
-            );
-        }
-        return (int) $dt->format('U') * 1000 + (int) $dt->format('v');
+        return UtilAll::parseConsumeTimestamp($this->consumeTimestamp);
     }
 
     // ---------------- Lifecycle ----------------
@@ -621,7 +612,6 @@ final class DefaultMQPushConsumer
         if ($this->messageListener === null) {
             throw new MQClientException('message listener is not set');
         }
-        $this->consumeTimestampMillis();
         if (!isset($this->allocateStrategy)) {
             throw new MQClientException('allocateMessageQueueStrategy is null');
         }
@@ -1666,43 +1656,65 @@ final class DefaultMQPushConsumer
 
     private function resolveInitialOffset(MQClientInstance $client, MessageQueue $mq): int
     {
-        // Rule for the starting offset (this client's design): the initial
-        // offset NEVER depends on the subscription type. An earlier draft short-circuited
-        // SQL92 subscriptions to the max offset, which silently skipped every message
-        // produced *before* the consumer started (send-first + CONSUME_FROM_FIRST_OFFSET
-        // received nothing; consumer-first only passed because the queues were empty and
-        // the max offset was 0 anyway). This client reads the stored offset and, when absent,
-        // uses 0 for FIRST_OFFSET / max for LAST_OFFSET etc. -- the broker applies the
-        // SQL92 filter to whatever range the pull covers.
+        // Two invariants hold this method together:
+        // 1. the start offset NEVER depends on the subscription type. An earlier draft
+        //    short-circuited SQL92 subscriptions to the max offset, which silently
+        //    skipped every message produced *before* the consumer started (send-first +
+        //    CONSUME_FROM_FIRST_OFFSET received nothing; consumer-first only passed
+        //    because the queues were empty and the max offset was 0 anyway). The broker
+        //    applies the SQL92 filter to whatever range the pull covers, so the policy
+        //    alone decides the start.
+        // 2. broadcasting and clustering differ ONLY in where the stored offset is read
+        //    from (local file vs broker). Both fall through to the same policy switch
+        //    when nothing is stored, so a CONSUME_FROM_TIMESTAMP or %RETRY% start can
+        //    never become mode-dependent.
+        $stored = -1;
         if ($this->messageModel === MessageModel::BROADCASTING) {
-            $stored = $this->loadLocalOffsets();
-            $key = self::mqKey($mq);
-            if (isset($stored[$key])) {
-                return $stored[$key];
+            $local = $this->loadLocalOffsets();
+            $value = $local[self::mqKey($mq)] ?? null;
+            if ($value !== null && $value >= 0) {
+                $stored = $value;
             }
-            if ($this->consumeFromWhere === ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET) {
-                return 0;
+        } else {
+            try {
+                $remote = $client->queryConsumerOffset($this->consumerGroup, $mq, 5000, null, false);
+                if ($remote !== null && $remote >= 0) {
+                    $stored = $remote;
+                }
+            } catch (\Throwable $e) {
+                Logger::debug("query consumer offset for $mq not found: " . $e->getMessage());
             }
-            return $client->getMaxOffset($mq);
         }
-        try {
-            $stored = $client->queryConsumerOffset($this->consumerGroup, $mq, 5000, null, false);
-            if ($stored !== null && $stored >= 0) {
-                return $stored;
-            }
-        } catch (\Throwable $e) {
-            Logger::debug("query consumer offset for $mq not found: " . $e->getMessage());
+
+        if ($stored >= 0) {
+            return $stored;
         }
+
         if ($this->consumeFromWhere === ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET) {
+            // FIRST_OFFSET with nothing stored gives 0 directly -- for both modes (the
+            // local file and the broker read share this branch) -- and no minOffset query
+            // is sent: minOffset is the admin-side policy (master only), so while the
+            // master is down a newly started consumer would pull nothing at all. Starting
+            // at 0 works through a slave, and the broker corrects an out-of-range start
+            // with PULL_OFFSET_MOVED.
             return 0;
         }
+
         if ($this->consumeFromWhere === ConsumeFromWhere::CONSUME_FROM_TIMESTAMP) {
+            if (NamespaceUtil::isRetryTopic($mq->topic)) {
+                // A %RETRY% queue has no meaningful "time of the oldest retry" and every
+                // queued retry must be delivered, so it starts at the tail instead of
+                // searching backwards from a timestamp.
+                return $client->getMaxOffset($mq);
+            }
             return $client->searchOffsetByTimestamp($mq, $this->consumeTimestampMillis());
         }
+
+        // Default CONSUME_FROM_LAST_OFFSET: a %RETRY% queue starts at 0 (retry messages
+        // must be fully retried) instead of skipping from the max offset.
         if (NamespaceUtil::isRetryTopic($mq->topic)) {
             return 0;
         }
-        // Default CONSUME_FROM_LAST_OFFSET
         return $client->getMaxOffset($mq);
     }
 

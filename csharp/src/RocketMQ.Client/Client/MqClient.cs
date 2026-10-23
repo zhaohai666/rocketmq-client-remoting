@@ -436,7 +436,7 @@ public sealed class MQClientInstance : IDisposable
         {
             if (!_facadeProcessors.TryGetValue(cmd.Code, out List<RemotingClient.RequestProcessor>? list))
             {
-                return null;
+                return UnclaimedFacadeResponse(cmd);
             }
 
             snapshot = list.ToArray();
@@ -456,6 +456,42 @@ public sealed class MQClientInstance : IDisposable
             {
                 ClientLog.Warn("facade processor for code " + cmd.Code + " failed: " + e.Message);
             }
+        }
+
+        return UnclaimedFacadeResponse(cmd);
+    }
+
+    /// <summary>
+    /// Two different tails, each one shaped for what the asking side can act
+    /// on: GET_CONSUMER_STATUS_FROM_CLIENT(221) always answers SUCCESS with a
+    /// body, because the asking side decodes it unconditionally -- an error
+    /// code makes it drop the reply instead of reading "this group consumed
+    /// nothing", and silence reads as an unreachable client. GET_CONSUMER_RUNNING_INFO(307)
+    /// and CONSUME_MESSAGE_DIRECTLY(309) answer the fixed "group is not hosted
+    /// here" error, because the initiating admin reports whichever client it
+    /// probed and only a real reply carries that. A oneway push (220) and every
+    /// other unclaimed code send no reply.
+    /// </summary>
+    private static RemotingCommand? UnclaimedFacadeResponse(RemotingCommand cmd)
+    {
+        if (cmd.Code == RequestCode.GetConsumerStatusFromClient)
+        {
+            RemotingCommand resp = RemotingCommand.CreateResponseCommand(ResponseCode.Success, null);
+            resp.Body = new GetConsumerStatusBody().Encode();
+            return resp;
+        }
+
+        if (cmd.Code == RequestCode.GetConsumerRunningInfo
+            || cmd.Code == RequestCode.ConsumeMessageDirectly)
+        {
+            string group = string.Empty;
+            if (cmd.ExtFields is not null && cmd.ExtFields.TryGetValue("consumerGroup", out string? g))
+            {
+                group = g ?? string.Empty;
+            }
+
+            return RemotingCommand.CreateResponseCommand(ResponseCode.SystemError,
+                "The Consumer Group <" + group + "> not exist in this consumer");
         }
 
         return null;

@@ -250,7 +250,7 @@ add_executable(rmq_test_producer_unregister test_producer_unregister.cpp)
 target_link_libraries(rmq_test_producer_unregister PRIVATE rocketmq::remoting)
 add_test(NAME producer_unregister COMMAND rmq_test_producer_unregister)
 
-# Push-consumer config numeric gates (checkConfig): the boundary values of thirteen ranges, out-of-range wording,
+# Push-consumer config numeric gates (checkConfig): the boundary values of thirteen ranges plus the start-timestamp format gate,
 # the min/max relative relationship and "a bad config is rejected before MQClientInstance is built" (the address points at a port nobody
 # listens on; the reported error must be the config wording not a connection failure). The real-machine side of "boundary values can actually start and consume + broker has no such group"
 # is in S5 of examples/live_flow_control.cpp.
@@ -312,6 +312,14 @@ add_test(NAME correct_tags_offset COMMAND rmq_test_correct_tags_offset)
 add_executable(rmq_test_offset_illegal_recover test_offset_illegal_recover.cpp)
 target_link_libraries(rmq_test_offset_illegal_recover PRIVATE rocketmq::remoting)
 add_test(NAME offset_illegal_recover COMMAND rmq_test_offset_illegal_recover)
+
+# Initial-offset policy table: stored offset first, then consumeFromWhere -- independent of the
+# subscription type and of which storage mode keeps the offset. Includes the %RETRY% cells (a first-time
+# retry queue replays from 0; under CONSUME_FROM_TIMESTAMP it takes the tail) and the
+# consumeTimestamp format gate that runs at startup whatever the policy is.
+add_executable(rmq_test_initial_offset_policy test_initial_offset_policy.cpp)
+target_link_libraries(rmq_test_initial_offset_policy PRIVATE rocketmq::remoting)
+add_test(NAME initial_offset_policy COMMAND rmq_test_initial_offset_policy)
 
 # 220 RESET_CONSUMER_CLIENT_OFFSET (resetOffset of MQClientInstance):
 # the two request-body shapes map/ForC (when the initiator language=JAVA the broker pushes only the map; a language=CPP SDK

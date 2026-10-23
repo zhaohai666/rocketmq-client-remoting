@@ -597,6 +597,12 @@ public sealed class DefaultMQPushConsumer
     private IAllocateMessageQueueStrategy? _allocateMessageQueueStrategy = new AllocateMessageQueueAveragely();
     private string _consumeFromWhere = RocketMQ.Remoting.Protocol.ConsumeFromWhere.ConsumeFromLastOffset;
 
+    // Start time for CONSUME_FROM_TIMESTAMP, in "yyyyMMddHHmmss". The default is
+    // boot time minus 30 minutes: an empty string would degrade the policy into
+    // "consume from right now" and silently drop the backlog.
+    private string _consumeTimestamp =
+        UtilAll.TimeMillisToHumanString3(UtilAll.CurrentTimeMillis() - 30 * 60 * 1000L);
+
     // ---- Consume thread pool (consumeThreadMin/Max) ----
     // The defaults are min=20 AND max=20 -- both sides are 20
     // (the 4.x era was min=20/max=64, which this port used early on and is
@@ -784,6 +790,16 @@ public sealed class DefaultMQPushConsumer
         get => _consumeFromWhere;
         set => _consumeFromWhere = value;
     }
+
+    /// <summary>Start time used by CONSUME_FROM_TIMESTAMP, as "yyyyMMddHHmmss".
+    /// Checked at start() and read when a queue has no stored offset.</summary>
+    public string ConsumeTimestamp
+    {
+        get => _consumeTimestamp;
+        set => _consumeTimestamp = value;
+    }
+
+    public void SetConsumeTimestamp(string ts) => _consumeTimestamp = ts;
 
     /// <summary>Convenience method: set Min and Max together.
     /// Now split into SetConsumeThreadMin/Max; this method is kept for
@@ -1271,6 +1287,10 @@ public sealed class DefaultMQPushConsumer
         {
             throw new MQClientException("popBatchNums Out of range [1, 32]");
         }
+        // consumeTimestamp is parsed unconditionally, not only when
+        // CONSUME_FROM_TIMESTAMP is selected: a malformed string must fail at
+        // start() rather than surface as a pull error minutes later.
+        DefaultLitePullConsumer.ParseConsumeTimestamp(ConsumeTimestamp);
     }
 
     // ---------------- Suspend / resume ----------------
@@ -1361,11 +1381,8 @@ public sealed class DefaultMQPushConsumer
             // MQClientInstance: a bad config must fail before instantiation,
             // otherwise background threads are started / clientId registered
             // and only then does the throw leave a half-started state.
-            // The consumeTimestamp format check is a no-op here -- this port
-            // has no configurable ConsumeTimestamp property; CONSUME_FROM_TIMESTAMP
-            // always means "30 minutes ago" (see ResolveInitialOffset), so
-            // there is no writable bad string to reject (one fewer config
-            // item, not a missing check).
+            // CheckConfigRanges also parses ConsumeTimestamp, so a malformed
+            // start time fails here rather than during the first offset lookup.
             CheckConfigRanges();
 
             // **Only CLUSTERING** swaps the default instanceName for
@@ -2377,11 +2394,11 @@ public sealed class DefaultMQPushConsumer
 
         if (!string.Equals(group, ConsumerGroup, StringComparison.Ordinal))
         {
-            // Protocol convention: a group mismatch replies SYSTEM_ERROR (the
-            // broker logs a warn)
-            return RemotingCommand.CreateResponseCommand(
-                ResponseCode.SystemError,
-                "consumerGroup not matched, expect " + ConsumerGroup + ", got " + (group ?? "<null>"));
+            // The running info is this consumer's own, so a request naming
+            // another group is not this consumer's to answer. Replying here --
+            // even with an error -- would shadow the sibling that owns that
+            // group, because the instance hands back the first answer it gets.
+            return null;
         }
 
         RemotingCommand resp = RemotingCommand.CreateResponseCommand(ResponseCode.Success, null);
@@ -2487,11 +2504,12 @@ public sealed class DefaultMQPushConsumer
 
         if (!string.Equals(group, ConsumerGroup, StringComparison.Ordinal))
         {
-            // Protocol convention: a group mismatch replies SYSTEM_ERROR (the
-            // broker logs a warn)
-            return RemotingCommand.CreateResponseCommand(
-                ResponseCode.SystemError,
-                "consumerGroup not matched, expect " + ConsumerGroup + ", got " + (group ?? "<null>"));
+            // The offset table is looked up per group, so a request naming
+            // another group is not this consumer's to answer. Reply nothing: a
+            // sibling sharing this instance owns that group, and answering here
+            // would shadow its table (the instance still answers an empty table
+            // when nobody owns the group).
+            return null;
         }
 
         var body = new GetConsumerStatusBody();
@@ -2528,9 +2546,11 @@ public sealed class DefaultMQPushConsumer
 
         if (!string.Equals(group, ConsumerGroup, StringComparison.Ordinal))
         {
-            return RemotingCommand.CreateResponseCommand(
-                ResponseCode.SystemError,
-                "consumerGroup not matched, expect " + ConsumerGroup + ", got " + (group ?? "<null>"));
+            // Running the probe would consume the message with this consumer's
+            // listener and report that as the named group's result. Stay
+            // silent: the sibling that owns the group answers, and the instance
+            // reports the group is not hosted here when nobody does.
+            return null;
         }
 
         if (cmd.Body is null || cmd.Body.Length == 0)
@@ -3202,7 +3222,7 @@ public sealed class DefaultMQPushConsumer
             {
                 try
                 {
-                    offset = ResolveInitialOffset(mq, sub);
+                    offset = ResolveInitialOffset(mq);
                 }
                 catch (Exception e)
                 {
@@ -6297,7 +6317,7 @@ public sealed class DefaultMQPushConsumer
             long off;
             try
             {
-                off = ResolveInitialOffset(mq, sub);
+                off = ResolveInitialOffset(mq);
             }
             catch (Exception e)
             {
@@ -6317,78 +6337,91 @@ public sealed class DefaultMQPushConsumer
         RebalancePullThreads();
     }
 
-    private long ResolveInitialOffset(MessageQueue mq, SubscriptionData sub)
+    /// <summary>Where a newly assigned queue starts pulling.
+    ///
+    /// Two invariants hold this method together:
+    /// <list><item>the start offset NEVER depends on the subscription type -- an
+    /// earlier draft short-circuited SQL92 to the max offset, which silently skipped
+    /// every message produced before the consumer started (send-first +
+    /// CONSUME_FROM_FIRST_OFFSET received nothing). The broker applies the SQL92
+    /// filter to whatever range the pull covers, so the policy alone decides;</item>
+    /// <item>broadcasting and clustering differ only in WHERE the stored offset is
+    /// read from (local file vs broker). Both fall through to the same policy
+    /// switch when nothing is stored, so a timestamp or %RETRY% start cannot be
+    /// mode-dependent.</item></list>
+    /// A failure of the fallback RPCs propagates: the callers skip this queue and
+    /// retry on the next rebalance, which is right -- guessing 0 here would replay
+    /// the whole queue.</summary>
+    private long ResolveInitialOffset(MessageQueue mq)
     {
         MQClientInstance c = Client();
-        if (sub.ExpressionType == ExpressionType.Sql92)
-        {
-            // SQL filtering has no offset semantics, default latest
-            return c.GetMaxOffset(mq);
-        }
 
+        long stored = -1;
         if (_messageModel == RocketMQ.Remoting.Protocol.MessageModel.Broadcasting)
         {
             // Broadcasting mode: the offset is stored only locally
             // (LocalFileOffsetStore)
-            Dictionary<string, long> stored = LoadLocalOffsets();
-            if (stored.TryGetValue(OffsetKey(mq), out long v))
+            if (LoadLocalOffsets().TryGetValue(OffsetKey(mq), out long local) && local >= 0)
             {
-                return v;
+                stored = local;
             }
-
-            if (_consumeFromWhere == RocketMQ.Remoting.Protocol.ConsumeFromWhere.ConsumeFromFirstOffset)
-            {
-                // FIRST_OFFSET with no local offset gives 0 directly
-                // (broadcasting mode reads the local offset table, the same
-                // branch); do NOT send a minOffset query -- minOffset belongs
-                // to the admin port's convention (master only), and during a
-                // master
-                // outage it would leave a newly started consumer unable to
-                // pull a single message; an out-of-bounds start is corrected
-                // by the broker's PULL_OFFSET_MOVED.
-                return 0;
-            }
-
-            return c.GetMaxOffset(mq);
         }
-
-        // Clustering mode: first query the offset committed on the broker
-        // (RemoteBrokerOffsetStore.readOffset)
-        try
+        else
         {
-            if (c.QueryConsumerOffset(ConsumerGroup, mq, out long stored, 5000, null,
-                    /*setZeroIfNotFound=*/false))
+            // Clustering mode: first query the offset committed on the broker
+            // (RemoteBrokerOffsetStore.readOffset)
+            try
             {
-                return stored;
+                if (c.QueryConsumerOffset(ConsumerGroup, mq, out long remote, 5000, null,
+                        /*setZeroIfNotFound=*/false))
+                {
+                    stored = remote;
+                }
+            }
+            catch (Exception e)
+            {
+                ClientLog.Debug("query consumer offset for " + mq + " not found: " + e.Message);
             }
         }
-        catch (Exception e)
+
+        if (stored >= 0)
         {
-            ClientLog.Debug("query consumer offset for " + mq + " not found: " + e.Message);
+            return stored;
         }
 
-        try
+        if (_consumeFromWhere == RocketMQ.Remoting.Protocol.ConsumeFromWhere.ConsumeFromFirstOffset)
         {
-            if (_consumeFromWhere == RocketMQ.Remoting.Protocol.ConsumeFromWhere.ConsumeFromFirstOffset)
-            {
-                // Same as above (the local file and broker paths are the same
-                // branch): the start is the literal 0.
-                return 0;
-            }
-
-            if (_consumeFromWhere == RocketMQ.Remoting.Protocol.ConsumeFromWhere.ConsumeFromTimestamp)
-            {
-                long ts = UtilAll.CurrentTimeMillis() - 30 * 60 * 1000L;
-                return c.SearchOffsetByTimestamp(mq, ts);
-            }
-
-            // Default CONSUME_FROM_LAST_OFFSET
-            return c.GetMaxOffset(mq);
+            // FIRST_OFFSET with nothing stored gives 0 directly, for both modes
+            // (the local file and broker reads share this branch); do NOT send a
+            // minOffset query -- minOffset belongs to the admin port's convention
+            // (master only), and during a master outage it would leave a newly
+            // started consumer unable to pull a single message; an out-of-bounds
+            // start is corrected by the broker's PULL_OFFSET_MOVED.
+            return 0;
         }
-        catch (Exception)
+
+        if (_consumeFromWhere == RocketMQ.Remoting.Protocol.ConsumeFromWhere.ConsumeFromTimestamp)
+        {
+            // A %RETRY% topic has no meaningful "time of the oldest retry", and
+            // retried messages must all be retried, so it starts at the queue tail
+            // rather than searching backwards through a timestamp.
+            if (MixAll.IsRetryTopic(mq.Topic))
+            {
+                return c.GetMaxOffset(mq);
+            }
+
+            return c.SearchOffsetByTimestamp(mq,
+                DefaultLitePullConsumer.ParseConsumeTimestamp(ConsumeTimestamp));
+        }
+
+        // Default CONSUME_FROM_LAST_OFFSET: a %RETRY% topic starts at 0 so every
+        // retry already queued is delivered; a business topic starts at the tail.
+        if (MixAll.IsRetryTopic(mq.Topic))
         {
             return 0;
         }
+
+        return c.GetMaxOffset(mq);
     }
 
     // ---------------- Heartbeat ----------------

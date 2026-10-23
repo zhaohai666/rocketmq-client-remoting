@@ -688,8 +688,7 @@ func (i *Instance) processResetOffset(request *remoting.RemotingCommand, _ strin
 	i.ackIfWanted(sink)
 }
 
-// processGetConsumerStatus (221): the consumer's consumed-offset table, or
-// SYSTEM_ERROR when no consumer covers the group.
+// processGetConsumerStatus (221): the consumer's consumed-offset table.
 func (i *Instance) processGetConsumerStatus(request *remoting.RemotingCommand, _ string, sink *remoting.ResponseSink) {
 	var header remoting.GetConsumerStatusRequestHeader
 	header.FromExtFields(request.ExtFields())
@@ -697,14 +696,14 @@ func (i *Instance) processGetConsumerStatus(request *remoting.RemotingCommand, _
 	if header.Group != nil {
 		group = *header.Group
 	}
-	consumer, ok := i.FindConsumer(group)
-	if !ok {
-		sink.Respond(remoting.CreateResponseCommand(remoting.RespSystemError, fmt.Sprintf("no consumer for group=%s", group)))
-		return
+	// An unknown group is still answered SUCCESS with an empty table: the asking
+	// side always decodes the body, and an error code makes it drop the reply
+	// instead of reporting "this group consumed nothing".
+	var table remoting.MQOffsetTable
+	if consumer, ok := i.FindConsumer(group); ok {
+		table = consumer.GetConsumerStatus(header.Topic)
 	}
-	body := &remoting.GetConsumerStatusBody{
-		MessageQueueTable: consumer.GetConsumerStatus(header.Topic),
-	}
+	body := &remoting.GetConsumerStatusBody{MessageQueueTable: table}
 	response := remoting.CreateResponseCommand(remoting.RespSuccess, "")
 	response.SetBody(body.Encode())
 	sink.Respond(response)

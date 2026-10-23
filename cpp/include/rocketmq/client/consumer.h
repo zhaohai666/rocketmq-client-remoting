@@ -66,6 +66,35 @@ constexpr int64_t kMaxPopInvisibleTime = 300000;
 // exactly this criterion (otherwise that queue goes **silent** and never consumes again, and the client reports no error).
 constexpr int64_t kPullMaxIdleTime = 120000;
 
+// Which branch a freshly assigned queue's start point comes from. The decision is split from the
+// I/O that gathers its inputs (the stored offset lives in the local file or on the broker; the tail
+// and the historic instant are RPCs) so the whole table is testable without a cluster.
+enum class StartOffsetPlan {
+    kStored,                  // use the committed offset as-is
+    kFromZero,                // replay the queue from its first message
+    kQueueTail,               // skip the backlog, start at the max offset
+    kSearchAtConfiguredTime,  // start at the configured consumeTimestamp
+};
+
+// `stored` is -1 when the group has committed nothing for this queue. The switch never looks at the
+// subscription type: a SQL92 filter is applied by the broker to whatever range the pull covers.
+inline StartOffsetPlan planInitialOffset(int64_t stored, const std::string& consumeFromWhere,
+                                        bool isRetryTopic) {
+    if (stored >= 0) return StartOffsetPlan::kStored;
+    if (consumeFromWhere == ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET) {
+        return StartOffsetPlan::kFromZero;
+    }
+    if (consumeFromWhere == ConsumeFromWhere::CONSUME_FROM_TIMESTAMP) {
+        // A retry queue is created by the first redelivery, long after the configured instant, so
+        // searching for that instant there would answer nothing; its replay starts at the tail.
+        return isRetryTopic ? StartOffsetPlan::kQueueTail
+                            : StartOffsetPlan::kSearchAtConfiguredTime;
+    }
+    // CONSUME_FROM_LAST_OFFSET (and the other variants): on first consumption a retry queue starts
+    // at 0 because redelivery must replay everything.
+    return isRetryTopic ? StartOffsetPlan::kFromZero : StartOffsetPlan::kQueueTail;
+}
+
 // Pull-loop pacing after a pause-worthy event. Two different things are called "flow control" and they
 // must not share one backoff:
 //   - the client's own ProcessQueue thresholds (cached messages over the count/size/span limits): the
@@ -206,6 +235,11 @@ public:
     }
     void setMessageModel(const std::string& model) { messageModel_ = model; }
     void setConsumeFromWhere(const std::string& where) { consumeFromWhere_ = where; }
+    // Start time for CONSUME_FROM_TIMESTAMP in "yyyyMMddHHmmss". The setter only assigns; start()'s
+    // checkConfig parses it unconditionally, so a malformed value fails at startup rather than
+    // silently degrading the policy into "from right now".
+    void setConsumeTimestamp(const std::string& ts) { consumeTimestamp_ = ts; }
+    const std::string& consumeTimestamp() const { return consumeTimestamp_; }
     // suspend/resume: suspend sets the pause flag -- the pull/pop loops postpone the next attempt by
     // 1s when they see it (the paused-round delay is 1000ms), messages already pulled are still
     // consumed and no offset rolls back; resume clears the flag and runs doRebalance() at once.
@@ -325,7 +359,8 @@ public:
     // The three following are **pure logic** (they send no request) and are public so they can be
     // tested offline -- popCkTarget is the easiest part of POP to get wrong (retry topic restoration),
     // so it needs unit tests rather than only real-broker coverage.
-    // The numeric section of checkConfig: thirteen range/size gates.
+    // The numeric section of checkConfig: fourteen gates -- thirteen range/size checks plus the
+    // start-timestamp format check.
     // **The order, the ranges and the error texts are the contract matched with callers: never change them**
     // (the texts carry no FAQUrl.suggestTodo(...) suffix). start() calls it after every null check and
     // before creating the MQClientInstance; public for the same reason as popCkTarget: positive cases (legal boundary values) cannot go through start() offline, since that really connects to a name server.
@@ -828,6 +863,10 @@ private:
     int32_t persistConsumerOffsetIntervalMillis_ = 5000;
     std::string messageModel_ = MessageModel::CLUSTERING;
     std::string consumeFromWhere_ = ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET;
+    // CONSUME_FROM_TIMESTAMP start instant ("yyyyMMddHHmmss"); the constructor seeds it with
+    // boot time minus 30 minutes so an untouched consumer still replays a backlog instead of
+    // jumping to the tail.
+    std::string consumeTimestamp_;
 
     // ---- Consumer thread pool (consumeThreadMin/Max) ----
     // The current default is min=20 **and** max=20 -- both sides are 20 (only the older generation

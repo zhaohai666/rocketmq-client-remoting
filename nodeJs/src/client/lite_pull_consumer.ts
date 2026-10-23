@@ -24,6 +24,7 @@ import { FilterAPI, SubscriptionData } from '../common/subscriptionData.ts';
 import { PullSysFlag } from '../common/sysflag.ts';
 import { RequestCode } from '../remoting/codes.ts';
 import { Validators } from '../common/validators.ts';
+import { defaultConsumeTimestamp, parseConsumeTimestamp } from '../common/utilAll.ts';
 import { getLogger } from '../logging.ts';
 
 const logger = getLogger('client.lite_pull_consumer');
@@ -87,6 +88,10 @@ export class DefaultLitePullConsumer {
   // Default CONSUME_FROM_LAST_OFFSET: a queue with no committed offset starts at
   // the broker's maxOffset.
   consumeFromWhere: string = ConsumeFromWhere.CONSUME_FROM_LAST_OFFSET;
+  // The start instant of CONSUME_FROM_TIMESTAMP, in "yyyyMMddHHmmss". The default is boot time minus
+  // 30 minutes: an empty value would fail at start(), and silently falling back to "now" would turn
+  // the policy into "skip the backlog".
+  consumeTimestamp: string = defaultConsumeTimestamp();
   // The period at which a background task compares the queue set of every
   // watched topic.
   topicMetadataCheckIntervalMillis = DEFAULT_TOPIC_METADATA_CHECK_INTERVAL_MILLIS;
@@ -109,6 +114,9 @@ export class DefaultLitePullConsumer {
   maxPageSizeInGetMetadata = 2000;
 
   setConsumeFromWhere(where: string): this { this.consumeFromWhere = where; return this; }
+  // The CONSUME_FROM_TIMESTAMP start instant ("yyyyMMddHHmmss"); the format is checked at start().
+  setConsumeTimestamp(ts: string): this { this.consumeTimestamp = ts; return this; }
+  getConsumeTimestamp(): string { return this.consumeTimestamp; }
 
   private subscription = new Map<string, SubscriptionData>();
   private assignedManual: MessageQueue[] | null = null; // assign() mode
@@ -245,6 +253,9 @@ export class DefaultLitePullConsumer {
     if (this.subscription.size === 0 && !this.assignedManual) {
       throw new Error('subscription is not set, call subscribe() or assign() first');
     }
+    // The start instant is checked whatever the policy is: a malformed value must fail here rather
+    // than surface mid-consumption as a failed offset resolution on one queue.
+    parseConsumeTimestamp(this.consumeTimestamp);
     // CLUSTERING rewrites the default instanceName, after which the clientId looks
     // like `<ip>@<instanceName>[@<unitName>][@STREAM]`. ⚠ If only the pid is used
     // as the instance name, every lite pull consumer in one process shares a
@@ -495,14 +506,21 @@ export class DefaultLitePullConsumer {
       let offset = this.pullCursor.get(key);
       if (offset === undefined) {
         const committed = await this.offsetStore!.readOffset(mq, ReadOffsetMode.READ_FROM_MEMORY_THEN_STORE);
-        // A %RETRY% topic with no committed offset starts at 0: retried
-        // messages must all be retried.
+        // A stored offset always wins; only a group that has never committed one
+        // is placed by the consumeFromWhere policy.
         if (committed >= 0) offset = committed;
-        else if (MixAll.isRetryTopic(mq.getTopic())) offset = 0;
         else if (this.consumeFromWhere === ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET) offset = 0;
-        else {
-          // CONSUME_FROM_LAST_OFFSET (the default): start from maxOffset.
-          offset = await this._maxOffsetFor(mq);
+        else if (this.consumeFromWhere === ConsumeFromWhere.CONSUME_FROM_TIMESTAMP) {
+          // The policy comes before the retry-topic rule: a retry queue is created by the first
+          // redelivery, long after the configured instant, so searching there answers nothing and
+          // its replay starts at the tail.
+          offset = MixAll.isRetryTopic(mq.getTopic())
+            ? await this._maxOffsetFor(mq)
+            : await this._searchOffsetFor(mq, parseConsumeTimestamp(this.consumeTimestamp));
+        } else {
+          // CONSUME_FROM_LAST_OFFSET (and the deprecated variants): a retry queue replays from 0
+          // because retried messages must all be retried; a business queue skips the backlog.
+          offset = MixAll.isRetryTopic(mq.getTopic()) ? 0 : await this._maxOffsetFor(mq);
         }
         if (offset < 0) continue; // unknown offset; nothing to pull from
         this.pullCursor.set(key, offset);
@@ -569,7 +587,8 @@ export class DefaultLitePullConsumer {
   // when the route or broker is unknown — the caller skips the queue this round
   // instead of seeking to a fake cursor). Management queries only accept the
   // master address.
-  private async _boundaryOffset(mq: MessageQueue, kind: 'min' | 'max'): Promise<number> {
+  private async _boundaryOffset(mq: MessageQueue, kind: 'min' | 'max' | 'search',
+    timestamp = 0): Promise<number> {
     if (!this.mqClient) return -1;
     await this.mqClient.updateTopicRouteInfoFromNameServer(mq.getTopic(), false).catch(() => {});
     const route = this.mqClient.getTopicRouteData(mq.getTopic());
@@ -579,9 +598,14 @@ export class DefaultLitePullConsumer {
       const addr = addrs['0'] != null ? addrs['0'] : Object.values(addrs)[0];
       if (addr != null && bd.brokerName === mq.getBrokerName()) {
         try {
-          return kind === 'min'
-            ? await this.mqClient.getMinOffset(addr, mq.getTopic(), mq.getQueueId())
-            : await this.mqClient.getMaxOffset(addr, mq.getTopic(), mq.getQueueId());
+          if (kind === 'min') {
+            return await this.mqClient.getMinOffset(addr, mq.getTopic(), mq.getQueueId());
+          }
+          if (kind === 'search') {
+            return await this.mqClient.searchOffsetByTimestamp(
+              addr, mq.getTopic(), mq.getQueueId(), timestamp);
+          }
+          return await this.mqClient.getMaxOffset(addr, mq.getTopic(), mq.getQueueId());
         } catch (e) { return -1; }
       }
     }
@@ -590,6 +614,10 @@ export class DefaultLitePullConsumer {
 
   private _maxOffsetFor(mq: MessageQueue): Promise<number> {
     return this._boundaryOffset(mq, 'max');
+  }
+
+  private _searchOffsetFor(mq: MessageQueue, timestamp: number): Promise<number> {
+    return this._boundaryOffset(mq, 'search', timestamp);
   }
 
   // seekToBegin: read minOffset first, then seek; seekToEnd: read maxOffset first,

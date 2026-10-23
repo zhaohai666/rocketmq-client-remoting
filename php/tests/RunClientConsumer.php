@@ -959,6 +959,47 @@ final class RunClientConsumer
             ConsumerDefaults::POP_DELAY_LEVEL, 'POP_DELAY_LEVEL 16 tiers');
         $this->checkSame(5000, ConsumerDefaults::MIN_POP_INVISIBLE_TIME, 'MIN_POP_INVISIBLE_TIME');
         $this->checkSame(300000, ConsumerDefaults::MAX_POP_INVISIBLE_TIME, 'MAX_POP_INVISIBLE_TIME');
+
+        // 221's topic argument: only a non-empty topic filters. The asking side
+        // leaves the field empty to mean "everything this client has consumed",
+        // so an empty string must not be read as a topic literally named empty.
+        $statusC = new DefaultMQPushConsumer('GID_status_unit');
+        $q1 = new MessageQueue('StatusTopic', 'b-cons', 0);
+        $q2 = new MessageQueue('OtherTopic', 'b-cons', 1);
+        $k1 = 'StatusTopicb-cons0';
+        $k2 = 'OtherTopicb-cons1';
+        $mqMapProp = new \ReflectionProperty(DefaultMQPushConsumer::class, 'mqMap');
+        $mqMapProp->setAccessible(true);
+        $mqMapProp->setValue($statusC, [$k1 => $q1, $k2 => $q2]);
+        $offProp = new \ReflectionProperty(DefaultMQPushConsumer::class, 'consumeOffsets');
+        $offProp->setAccessible(true);
+        $offProp->setValue($statusC, [$k1 => 42, $k2 => 7]);
+        $offsetsByTopic = static function (array $entries): array {
+            $byTopic = [];
+            foreach ($entries as $e) {
+                $byTopic[$e['mq']->topic] = $e['offset'];
+            }
+            ksort($byTopic);
+            return $byTopic;
+        };
+        $this->checkSame(
+            ['OtherTopic' => 7, 'StatusTopic' => 42],
+            $offsetsByTopic($statusC->getConsumerStatus(null)),
+            'no topic reports the whole consumed-offset table',
+        );
+        $this->checkSame(
+            ['OtherTopic' => 7, 'StatusTopic' => 42],
+            $offsetsByTopic($statusC->getConsumerStatus('')),
+            'a blank topic reports the whole consumed-offset table',
+        );
+        // Control: a named topic really does filter, so the blank case above is
+        // the no-filter rule and not a handler that ignores its argument.
+        $this->checkSame(
+            ['StatusTopic' => 42],
+            $offsetsByTopic($statusC->getConsumerStatus('StatusTopic')),
+            'a named topic reports only that topic',
+        );
+        $this->checkSame([], $statusC->getConsumerStatus('Never'), 'a topic nobody holds reports nothing');
     }
 
     // ================================================================ 2. Push concurrent: full batches / re-consume / partial ack / offset correction

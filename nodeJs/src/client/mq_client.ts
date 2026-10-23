@@ -23,7 +23,7 @@ import {
   ChangeInvisibleTimeRequestHeader, ChangeInvisibleTimeResponseHeader,
 } from '../remoting/headers.ts';
 import { SetMessageRequestModeRequestBody, BatchAckMessageRequestBody } from '../remoting/pop_bodies.ts';
-import { CheckClientRequestBody } from '../remoting/bodies.ts';
+import { CheckClientRequestBody, GetConsumerStatusBody } from '../remoting/bodies.ts';
 import { PopResult, processPopResponse } from './pop_api.ts';
 import {
   HeartbeatData, ProducerData, ConsumerData, ConsumeType, MessageModel, ConsumeFromWhere,
@@ -1171,7 +1171,7 @@ export class MQClient {
 
   dispatchFacadeProcessor(cmd: RemotingCommand, addr: string): RemotingCommand | null {
     const list = this._facadeProcessors.get(cmd.code);
-    if (list == null || list.length === 0) return null;
+    if (list == null || list.length === 0) return this.unclaimedFacadeResponse(cmd);
     let first: RemotingCommand | null = null;
     for (const handler of list.slice()) {
       try {
@@ -1181,7 +1181,31 @@ export class MQClient {
         logger.warning('facade processor for code %s failed: %s', cmd.code, (e as Error).message);
       }
     }
-    return first;
+    return first ?? this.unclaimedFacadeResponse(cmd);
+  }
+
+  // Two different tails, each one shaped for what the asking side can act on:
+  //   221 always answers SUCCESS with a body, because the asking side decodes it
+  //      unconditionally -- an error code makes it drop the reply instead of reading
+  //      "this group consumed nothing", and silence reads as unreachable.
+  //   307 and 309 answer the fixed "group is not hosted here" error, because the
+  //      initiating admin reports whichever client it probed; only a real reply
+  //      carries that. A oneway push (220) and every other unclaimed code send nothing.
+  private unclaimedFacadeResponse(cmd: RemotingCommand): RemotingCommand | null {
+    if (cmd.code === RequestCode.GET_CONSUMER_STATUS_FROM_CLIENT) {
+      const response = RemotingCommand.createResponseCommand(ResponseCode.SUCCESS, null);
+      response.body = new GetConsumerStatusBody().encode();
+      return response;
+    }
+    if (cmd.code === RequestCode.GET_CONSUMER_RUNNING_INFO
+        || cmd.code === RequestCode.CONSUME_MESSAGE_DIRECTLY) {
+      const ext = cmd.extFields || {};
+      const group = String(ext['consumerGroup'] != null ? ext['consumerGroup'] : '');
+      return RemotingCommand.createResponseCommand(
+        ResponseCode.SYSTEM_ERROR,
+        `The Consumer Group <${group}> not exist in this consumer`);
+    }
+    return null;
   }
 
   // How many facade processors a given code currently has (test observability: the non-overwriting landing spots under a shared instance).

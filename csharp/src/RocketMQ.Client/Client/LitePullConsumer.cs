@@ -1478,7 +1478,7 @@ public sealed class DefaultLitePullConsumer
         return outAddrs;
     }
 
-    private static long ParseConsumeTimestamp(string ts)
+    internal static long ParseConsumeTimestamp(string ts)
     {
         if (ts is { Length: 14 }
             && DateTimeOffset.TryParseExact(ts, "yyyyMMddHHmmss", CultureInfo.InvariantCulture,

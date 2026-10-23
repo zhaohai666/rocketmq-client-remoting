@@ -61,6 +61,7 @@ DefaultMQPushConsumer::DefaultMQPushConsumer(const std::string& consumerGroup) {
         throw MQClientException("consumerGroup is empty");
     }
     consumerGroup_ = consumerGroup;
+    consumeTimestamp_ = UtilAll::timeMillisToHumanString3(UtilAll::currentTimeMillis() - 30 * 60 * 1000LL);
     // Default allocation strategy AVG (the constructor argument may override it; equivalent to the setter here).
     allocateStrategy_ = std::make_shared<AllocateMessageQueueAveragely>();
 }
@@ -303,6 +304,9 @@ std::vector<std::string> DefaultMQPushConsumer::subscribedTopics() const {
 // Error texts carry no trailing FAQ-suggestion suffix
 // (the convention for every client error in this repository).
 void DefaultMQPushConsumer::checkConfigRanges() const {
+    // The timestamp is checked unconditionally, not only under CONSUME_FROM_TIMESTAMP: a malformed
+    // value has to fail at startup instead of surfacing later as a pull error on one queue.
+    UtilAll::parseConsumeTimestamp(consumeTimestamp_);
     // consumeThreadMin
     if (consumeThreadMin_ < 1 || consumeThreadMin_ > 1000) {
         throw MQClientException("consumeThreadMin Out of range [1, 1000]");
@@ -476,16 +480,14 @@ void DefaultMQPushConsumer::start() {
 
     // GET_CONSUMER_RUNNING_INFO(307):
     // admin / broker queries this consumer's running info; replies with a ConsumerRunningInfo JSON body.
-    mqClient_->remotingClient().registerProcessor(
-        RequestCode::GET_CONSUMER_RUNNING_INFO,
+    mqClient_->registerConsumerProcessor(
+        RequestCode::GET_CONSUMER_RUNNING_INFO, consumerGroup_,
         [this](const RemotingCommand& cmd, const std::string&) -> std::optional<RemotingCommand> {
             auto it = cmd.extFields.find("consumerGroup");
             const std::string group = it == cmd.extFields.end() ? std::string() : it->second;
             if (group != consumerGroup_) {
-                // Group mismatch answers SYSTEM_ERROR (the broker logs a warn; the error text is part of the matching contract)
-                return RemotingCommand::createResponseCommand(
-                    ResponseCode::SYSTEM_ERROR,
-                    "consumerGroup not matched, expect " + consumerGroup_ + ", got " + group);
+                // Not this consumer's group: stay silent so the owner of that group answers.
+                return std::nullopt;
             }
             RemotingCommand resp = RemotingCommand::createResponseCommand(
                 ResponseCode::SUCCESS, std::string());
@@ -496,12 +498,12 @@ void DefaultMQPushConsumer::start() {
     // RESET_CONSUMER_CLIENT_OFFSET(220): the broker sends it with invokeOneway, so no reply is needed.
     // The reset logic triggers rebalance (invokeSync calls such as lock/unlock/batch), which must not run
     // synchronously on the read thread (self-deadlock, see the engineering notes at the top of this file) - handed to a background thread, returns nullopt at once.
-    mqClient_->remotingClient().registerProcessor(
-        RequestCode::RESET_CONSUMER_CLIENT_OFFSET,
+    mqClient_->registerConsumerProcessor(
+        RequestCode::RESET_CONSUMER_CLIENT_OFFSET, consumerGroup_,
         [this](const RemotingCommand& cmd, const std::string&) -> std::optional<RemotingCommand> {
             auto git = cmd.extFields.find("group");
             const std::string group = git == cmd.extFields.end() ? std::string() : git->second;
-            if (group != consumerGroup_) return std::nullopt;  // oneway, no response
+            if (group != consumerGroup_) return std::nullopt;  // not this group, and oneway anyway
             std::string topic;
             auto tit = cmd.extFields.find("topic");
             if (tit != cmd.extFields.end()) topic = tit->second;
@@ -523,16 +525,15 @@ void DefaultMQPushConsumer::start() {
 
     // GET_CONSUMER_STATUS_FROM_CLIENT(221): admin queries this consumer's consumed-offset table,
     // replies with a GetConsumerStatusBody JSON body (messageQueueTable with inline object keys).
-    mqClient_->remotingClient().registerProcessor(
-        RequestCode::GET_CONSUMER_STATUS_FROM_CLIENT,
+    mqClient_->registerConsumerProcessor(
+        RequestCode::GET_CONSUMER_STATUS_FROM_CLIENT, consumerGroup_,
         [this](const RemotingCommand& cmd, const std::string&) -> std::optional<RemotingCommand> {
             auto git = cmd.extFields.find("group");
             const std::string group = git == cmd.extFields.end() ? std::string() : git->second;
             if (group != consumerGroup_) {
-                // Group mismatch answers SYSTEM_ERROR (the broker logs a warn; the error text is part of the matching contract)
-                return RemotingCommand::createResponseCommand(
-                    ResponseCode::SYSTEM_ERROR,
-                    "consumerGroup not matched, expect " + consumerGroup_ + ", got " + group);
+                // Not this consumer's group: stay silent so the owner of that group
+                // reports its table (the instance answers an empty one if nobody does).
+                return std::nullopt;
             }
             std::string topic;
             auto tit = cmd.extFields.find("topic");
@@ -548,15 +549,16 @@ void DefaultMQPushConsumer::start() {
     // CONSUME_MESSAGE_DIRECTLY(309): the broker pushes one message down and asks the client to really consume it once.
     // The listener runs synchronously on the read thread (a one-shot admin probe; a synchronous request issued from
     // inside the listener would self-deadlock, but that is the user code's responsibility).
-    mqClient_->remotingClient().registerProcessor(
-        RequestCode::CONSUME_MESSAGE_DIRECTLY,
+    mqClient_->registerConsumerProcessor(
+        RequestCode::CONSUME_MESSAGE_DIRECTLY, consumerGroup_,
         [this](const RemotingCommand& cmd, const std::string&) -> std::optional<RemotingCommand> {
             auto git = cmd.extFields.find("consumerGroup");
             const std::string group = git == cmd.extFields.end() ? std::string() : git->second;
             if (group != consumerGroup_) {
-                return RemotingCommand::createResponseCommand(
-                    ResponseCode::SYSTEM_ERROR,
-                    "consumerGroup not matched, expect " + consumerGroup_ + ", got " + group);
+                // Not this consumer's group: stay silent so the owner of that group
+                // runs the probe. Answering here would let the asking side read this
+                // consumer's listener result as if it belonged to the named group.
+                return std::nullopt;
             }
             if (cmd.body.empty()) {
                 return RemotingCommand::createResponseCommand(
@@ -735,6 +737,16 @@ void DefaultMQPushConsumer::shutdown() {
         // The wake-up callback captured this: consume threads are all joined, so remove the callback first; during what
         // remains (unregister client, close connections) a broker push of code 40 can no longer call into a half-dead thread.
         mqClient_->unregisterRebalanceWakeup(consumerGroup_);
+        // Same rule as the wake-up callback: these four handlers capture this, and a
+        // broker request landing after the consume threads are joined would otherwise
+        // call into a half-dead consumer. Only this group's entries go, so a sibling
+        // consumer sharing the instance keeps answering its own groups.
+        for (const auto& entry : {RequestCode::RESET_CONSUMER_CLIENT_OFFSET,
+                                  RequestCode::GET_CONSUMER_STATUS_FROM_CLIENT,
+                                  RequestCode::GET_CONSUMER_RUNNING_INFO,
+                                  RequestCode::CONSUME_MESSAGE_DIRECTLY}) {
+            mqClient_->unregisterConsumerProcessor(entry, consumerGroup_);
+        }
         try {
             mqClient_->unregisterClientAllBrokers(clientId_, "", consumerGroup_);
         } catch (const std::exception& e) {
@@ -3481,61 +3493,48 @@ void DefaultMQPushConsumer::resetRetryTopicAndNamespace(std::vector<MessageExt>&
 
 int64_t DefaultMQPushConsumer::resolveInitialOffset(const MessageQueue& mq) {
     MQClientInstance& c = client();
-    // Resolving the start point of a freshly assigned queue: the initial
-    // offset NEVER depends on the subscription type. An earlier draft short-circuited
-    // SQL92 subscriptions to the max offset, which silently skipped every message
-    // produced *before* the consumer started (send-first + CONSUME_FROM_FIRST_OFFSET
-    // received nothing; consumer-first only passed because the queues were empty and
-    // the max offset was 0 anyway). The rule reads the stored offset and, when absent,
-    // uses 0 for FIRST_OFFSET / max for LAST_OFFSET etc. -- the broker applies the
-    // SQL92 filter to whatever range the pull covers.
+    // Resolving the start point of a freshly assigned queue. An earlier draft short-circuited SQL92
+    // subscriptions to the max offset, which silently skipped every message produced *before* the
+    // consumer started (send-first + CONSUME_FROM_FIRST_OFFSET received nothing; consumer-first only
+    // passed because the queues were empty and the max offset was 0 anyway).
+    // Broadcasting keeps the offset in the local file, clustering in the broker's commit table; both
+    // feed the same `stored` accumulator, so one policy switch serves both modes -- including
+    // CONSUME_FROM_TIMESTAMP, which the old broadcasting early return dropped.
+    int64_t stored = -1;
     if (messageModel_ == MessageModel::BROADCASTING) {
-        // Broadcasting: the offset lives only in the local offset file
-        std::map<std::string, int64_t> stored = loadLocalOffsets();
-        auto it = stored.find(offsetKey(mq));
-        if (it != stored.end()) {
-            return it->second;
+        std::map<std::string, int64_t> local = loadLocalOffsets();
+        auto it = local.find(offsetKey(mq));
+        if (it != local.end()) stored = it->second;
+    } else {
+        try {
+            int64_t remote = 0;
+            if (c.queryConsumerOffset(consumerGroup_, mq, remote, 5000, std::string(),
+                                      /*setZeroIfNotFound=*/false)) {
+                stored = remote;
+            }
+        } catch (const std::exception& e) {
+            logger_debug("query consumer offset for " + mq.toString() + " not found: " + e.what());
         }
-        if (consumeFromWhere_ == ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET) {
-            // FIRST_OFFSET with no local offset returns 0 directly (the local-file and broker paths share
-            // this branch); the real start point is settled by the OFFSET_ILLEGAL correction using the
-            // nextBeginOffset the broker returns.
-            return 0;
-        }
-        return c.getMaxOffset(mq);
     }
-    // Clustering: first query the committed offset on the broker (remote offset store)
-    try {
-        int64_t stored = 0;
-        if (c.queryConsumerOffset(consumerGroup_, mq, stored, 5000, std::string(),
-                                  /*setZeroIfNotFound=*/false)) {
+
+    switch (planInitialOffset(stored, consumeFromWhere_, MixAll::isRetryTopic(mq.topic))) {
+        case StartOffsetPlan::kStored:
             return stored;
-        }
-    } catch (const std::exception& e) {
-        logger_debug("query consumer offset for " + mq.toString() + " not found: " + e.what());
-    }
-    try {
-        if (consumeFromWhere_ == ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET) {
-            // FIRST_OFFSET returns 0 directly, with the offset "corrected by the OFFSET_ILLEGAL process":
-            // NO minOffset query is sent. The cost of that extra call is more than latency:
-            // minOffset only accepts a master (the admin path), so while the master is down a fresh
-            // consumer would pull nothing at all - whereas a slave can start from 0 and, on overrun, the
-            // broker corrects the offset back with PULL_OFFSET_MOVED (see handleOffsetIllegal).
+        case StartOffsetPlan::kFromZero:
+            // FIRST_OFFSET with no stored offset is the literal 0 (the local-file and broker paths
+            // share this branch): NO minOffset query is sent. The cost of that extra call is more
+            // than latency -- minOffset only accepts a master (the admin path), so during a master
+            // outage a fresh consumer would pull nothing at all, whereas a slave can start from 0
+            // and, on overrun, the broker corrects the offset back with PULL_OFFSET_MOVED (see
+            // handleOffsetIllegal).
             return 0;
-        }
-        if (consumeFromWhere_ == ConsumeFromWhere::CONSUME_FROM_TIMESTAMP) {
-            int64_t ts = UtilAll::currentTimeMillis() - 30 * 60 * 1000LL;
-            return c.searchOffsetByTimestamp(mq, ts);
-        }
-        // On first consumption with no committed offset, the %RETRY% topic starts at 0
-        // (redelivery must replay everything) instead of jumping to the max offset.
-        if (MixAll::isRetryTopic(mq.topic)) {
-            return 0;
-        }
-        return c.getMaxOffset(mq);  // default CONSUME_FROM_LAST_OFFSET
-    } catch (const std::exception&) {
-        return 0;
+        case StartOffsetPlan::kQueueTail:
+            return c.getMaxOffset(mq);
+        case StartOffsetPlan::kSearchAtConfiguredTime:
+            return c.searchOffsetByTimestamp(mq,
+                                             UtilAll::parseConsumeTimestamp(consumeTimestamp_));
     }
+    return 0;
 }
 
 // ---------------------------------------------------------------- Heartbeat

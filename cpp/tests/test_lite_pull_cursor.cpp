@@ -134,6 +134,11 @@ struct PullReply {
 // Plays both the name server (answers route queries) and the broker (answers QUERY_CONSUMER_OFFSET / PULL_MESSAGE).
 class MockEndpoint {
 public:
+    // The two computed starts answer with different values: a pull that begins at 100 came from
+    // GET_MAX_OFFSET, one at 200 from SEARCH_OFFSET_BY_TIMESTAMP, one at 0 from the retry/FIRST rule.
+    static constexpr int64_t kTailOffset = 100;
+    static constexpr int64_t kSearchedOffset = 200;
+
     MockEndpoint() {
         netcompat::ensureInitialized();
         listen_ = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -258,6 +263,23 @@ public:
         return false;
     }
 
+    /// The queueOffset of the first pull request for `topic` (-1 when none arrived yet). Lets a test
+    /// read the computed **start** off the wire instead of an in-memory cursor.
+    int64_t firstPullOffset(const std::string& topic) {
+        std::lock_guard<std::mutex> lk(state_);
+        for (const PropertyMap& ext : pulls_) {
+            auto it = ext.find("topic");
+            if (it != ext.end() && it->second == topic) return extInt(ext, "queueOffset", -1);
+        }
+        return -1;
+    }
+
+    /// The `timestamp` of the first SEARCH_OFFSET_BY_TIMESTAMP request (-1 when none arrived).
+    int64_t searchOffsetTimestamp() {
+        std::lock_guard<std::mutex> lk(state_);
+        return searchTimestamps_.empty() ? -1 : searchTimestamps_.front();
+    }
+
     static int64_t extInt(const PropertyMap& ext, const std::string& key, int64_t fallback) {
         auto it = ext.find(key);
         if (it == ext.end()) return fallback;
@@ -317,6 +339,18 @@ private:
                 std::lock_guard<std::mutex> lk(state_);
                 codes_.push_back(req.code);
                 resp.code = ResponseCode::QUERY_NOT_FOUND;
+            } else if (req.code == RequestCode::GET_MAX_OFFSET) {
+                // A tail distinct from every other start, so "the pull began at 100" identifies this RPC.
+                std::lock_guard<std::mutex> lk(state_);
+                codes_.push_back(req.code);
+                resp.code = ResponseCode::SUCCESS;
+                resp.extFields["offset"] = std::to_string(kTailOffset);
+            } else if (req.code == RequestCode::SEARCH_OFFSET_BY_TIMESTAMP) {
+                std::lock_guard<std::mutex> lk(state_);
+                codes_.push_back(req.code);
+                searchTimestamps_.push_back(extInt(req.extFields, "timestamp", -1));
+                resp.code = ResponseCode::SUCCESS;
+                resp.extFields["offset"] = std::to_string(kSearchedOffset);
             } else {
                 std::lock_guard<std::mutex> lk(state_);
                 codes_.push_back(req.code);
@@ -389,6 +423,7 @@ private:
     std::vector<int32_t> pullReqCodes_;
     std::vector<int32_t> pullCodes_;
     std::vector<int32_t> codes_;
+    std::vector<int64_t> searchTimestamps_;
     std::deque<PullReply> pullScripts_;
     std::mutex gateMutex_;
     std::condition_variable gateCv_;
@@ -570,6 +605,58 @@ void testLitePullCarriesTheLiteCodeAndFlag() {
     }
 }
 
+// ---------------------------------------------------------------- 5. The computed start
+
+// A first-time %RETRY% queue must replay from 0 (replaying is the point of redelivery) while a
+// business queue under the same policy skips the backlog. Both queues belong to one consumer so the
+// two starts are read off the same wire session: 0 against the scripted tail.
+void testLastStartSkipsTheBacklogExceptOnTheRetryQueue() {
+    const std::string group = "LitePG_StartTail";
+    const std::string retry = MixAll::getRetryTopic(group);
+    MockEndpoint cluster;
+    cluster.addRoute(kTopic, routeMaster(cluster.address()));
+    cluster.addRoute(retry, routeMaster(cluster.address()));
+    auto c = std::make_unique<DefaultLitePullConsumer>(group);
+    c->setNamesrvAddr(cluster.address());
+    c->setConsumeFromWhere(ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET);
+    c->assign({queue0(), MessageQueue(retry, kBroker, 0)});
+    c->start();
+
+    expect(waitFor([&] { return cluster.firstPullOffset(kTopic) == MockEndpoint::kTailOffset; }),
+           "CONSUME_FROM_LAST on a business queue starts at the max offset");
+    expect(waitFor([&] { return cluster.firstPullOffset(retry) == 0; }),
+           "CONSUME_FROM_LAST on a retry queue replays from 0");
+    expect(!cluster.sawRequest(RequestCode::GET_MIN_OFFSET),
+           "the start never queries the floor of the queue");
+    c->shutdown();
+}
+
+// CONSUME_FROM_TIMESTAMP searches the **configured** instant; a retry queue -- created by the first
+// redelivery, long after that instant, so the search would answer nothing -- takes the tail instead.
+void testTimestampStartUsesTheConfiguredInstant() {
+    const std::string group = "LitePG_StartTimestamp";
+    const std::string retry = MixAll::getRetryTopic(group);
+    MockEndpoint cluster;
+    cluster.addRoute(kTopic, routeMaster(cluster.address()));
+    cluster.addRoute(retry, routeMaster(cluster.address()));
+    auto c = std::make_unique<DefaultLitePullConsumer>(group);
+    c->setNamesrvAddr(cluster.address());
+    c->setConsumeFromWhere(ConsumeFromWhere::CONSUME_FROM_TIMESTAMP);
+    c->setConsumeTimestamp("20230101000000");
+    c->assign({queue0(), MessageQueue(retry, kBroker, 0)});
+    c->start();
+
+    expect(waitFor([&] { return cluster.searchOffsetTimestamp() >= 0; }),
+           "the business queue resolved its start by timestamp");
+    expect(waitFor([&] { return cluster.firstPullOffset(kTopic) == MockEndpoint::kSearchedOffset; }),
+           "CONSUME_FROM_TIMESTAMP on a business queue starts at the searched offset");
+    expect(waitFor([&] { return cluster.firstPullOffset(retry) == MockEndpoint::kTailOffset; }),
+           "CONSUME_FROM_TIMESTAMP on a retry queue takes the tail");
+    expectInt(cluster.searchOffsetTimestamp(), UtilAll::parseConsumeTimestamp("20230101000000"),
+              "the search carries the configured instant, not a hardcoded one");
+    c->shutdown();
+}
+
 }  // namespace
 
 int main() {
@@ -577,6 +664,8 @@ int main() {
     testCursorAdoptsTheBrokersOffsetCorrection();
     testInFlightSeekWinsOverThePullResult();
     testLitePullCarriesTheLiteCodeAndFlag();
+    testLastStartSkipsTheBacklogExceptOnTheRetryQueue();
+    testTimestampStartUsesTheConfiguredInstant();
     std::printf("lite_pull_cursor: %d checks, %d failed\n", checks, fails);
     return fails == 0 ? 0 : 1;
 }

@@ -370,11 +370,22 @@ void MQClientInstance::shutdown() {
     if (remotingClient_) {
         // The code 40 callback captures this: it must be removed before the instance is destroyed, otherwise a reader thread could call back into a dangling object
         remotingClient_->unregisterProcessor(RequestCode::NOTIFY_CONSUMER_IDS_CHANGED);
+        // Same rule for the consumer RPC fan-out: those handlers capture a consumer.
+        for (const auto& entry : {RequestCode::RESET_CONSUMER_CLIENT_OFFSET,
+                                  RequestCode::GET_CONSUMER_STATUS_FROM_CLIENT,
+                                  RequestCode::GET_CONSUMER_RUNNING_INFO,
+                                  RequestCode::CONSUME_MESSAGE_DIRECTLY}) {
+            remotingClient_->unregisterProcessor(entry);
+        }
         remotingClient_->shutdown();
     }
     {
         std::lock_guard<std::mutex> lk(rebalanceWakeupLock_);
         rebalanceWakeups_.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lk(consumerProcessorLock_);
+        consumerProcessors_.clear();
     }
 }
 
@@ -389,6 +400,88 @@ void MQClientInstance::registerRebalanceWakeup(const std::string& group,
 void MQClientInstance::unregisterRebalanceWakeup(const std::string& group) {
     std::lock_guard<std::mutex> lk(rebalanceWakeupLock_);
     rebalanceWakeups_.erase(group);
+}
+
+// ------------------------------------------------------ 220/221/307/309 fan-out to the consumers
+
+void MQClientInstance::registerConsumerProcessor(int32_t requestCode, const std::string& group,
+                                                 RemotingClient::RequestProcessor processor) {
+    bool installSlot = false;
+    {
+        std::lock_guard<std::mutex> lk(consumerProcessorLock_);
+        auto& slot = consumerProcessors_[requestCode];
+        installSlot = slot.empty();
+        slot[group] = std::move(processor);
+    }
+    if (installSlot) {
+        remotingClient_->registerProcessor(
+            requestCode, [this, requestCode](const RemotingCommand& cmd, const std::string& addr) {
+                return dispatchConsumerProcessor(requestCode, cmd, addr);
+            });
+    }
+}
+
+void MQClientInstance::unregisterConsumerProcessor(int32_t requestCode, const std::string& group) {
+    bool removeSlot = false;
+    {
+        std::lock_guard<std::mutex> lk(consumerProcessorLock_);
+        auto it = consumerProcessors_.find(requestCode);
+        if (it == consumerProcessors_.end()) return;
+        it->second.erase(group);
+        removeSlot = it->second.empty();
+        if (removeSlot) consumerProcessors_.erase(it);
+    }
+    if (removeSlot) remotingClient_->unregisterProcessor(requestCode);
+}
+
+std::optional<RemotingCommand> MQClientInstance::dispatchConsumerProcessor(
+    int32_t requestCode, const RemotingCommand& cmd, const std::string& addr) {
+    std::vector<RemotingClient::RequestProcessor> handlers;
+    {
+        std::lock_guard<std::mutex> lk(consumerProcessorLock_);
+        auto it = consumerProcessors_.find(requestCode);
+        if (it != consumerProcessors_.end()) {
+            for (const auto& entry : it->second) handlers.push_back(entry.second);
+        }
+    }
+    for (const auto& handler : handlers) {
+        if (!handler) continue;
+        try {
+            std::optional<RemotingCommand> resp = handler(cmd, addr);
+            if (resp.has_value()) return resp;
+        } catch (const std::exception& e) {
+            // One consumer's handler failing must not hide the group's owner further
+            // down the list; the transport would otherwise answer an error code.
+            logger_warn("remoting: consumer processor for request code "
+                        + std::to_string(requestCode) + " threw: " + e.what());
+        } catch (...) {
+            logger_warn("remoting: consumer processor for request code "
+                        + std::to_string(requestCode) + " threw unknown exception");
+        }
+    }
+    // Two different tails, and each one is what the asking side can act on:
+    //   221 always answers SUCCESS with a body, because the asking side decodes it
+    //      unconditionally -- an error code makes it drop the reply instead of
+    //      reading "this group consumed nothing", and silence reads as unreachable.
+    //   307 / 309 answer the fixed "group not hosted here" error, because the admin
+    //      side reports which client it probed; only a real answer carries that.
+    // 220 is a oneway push and gets no reply at all.
+    if (requestCode == RequestCode::GET_CONSUMER_STATUS_FROM_CLIENT) {
+        GetConsumerStatusBody body;
+        RemotingCommand resp = RemotingCommand::createResponseCommand(ResponseCode::SUCCESS,
+                                                                     std::string());
+        resp.body = body.encode();
+        return resp;
+    }
+    if (requestCode == RequestCode::GET_CONSUMER_RUNNING_INFO ||
+        requestCode == RequestCode::CONSUME_MESSAGE_DIRECTLY) {
+        auto it = cmd.extFields.find("consumerGroup");
+        const std::string group = it == cmd.extFields.end() ? std::string() : it->second;
+        return RemotingCommand::createResponseCommand(
+            ResponseCode::SYSTEM_ERROR,
+            "The Consumer Group <" + group + "> not exist in this consumer");
+    }
+    return std::nullopt;
 }
 
 void MQClientInstance::rebalanceImmediately() {

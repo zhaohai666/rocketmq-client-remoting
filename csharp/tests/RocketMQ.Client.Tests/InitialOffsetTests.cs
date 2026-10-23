@@ -7,6 +7,7 @@
 // GET_MIN_OFFSET; the push leg adds one more case here (subscription mode goes through
 // Consumer.cs's ResolveInitialOffset).
 using System.Buffers.Binary;
+using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
 using RocketMQ.Client;
@@ -190,7 +191,9 @@ public class InitialOffsetTests
             if (req.Code == RequestCode.GetRouteinfoByTopic)
             {
                 string topic = req.ExtFields.TryGetValue("topic", out string? t) ? t : "";
-                if (topic != Topic)
+                // The auto-subscribed %RETRY% topic needs a route too: without it the
+                // retry queue is never assigned and the retry-start rules go untested.
+                if (topic != Topic && !topic.StartsWith(MixAll.RetryGroupTopicPrefix, StringComparison.Ordinal))
                 {
                     return Echo(req, ResponseCode.TopicNotExist, "mock: no route");
                 }
@@ -422,5 +425,145 @@ public class InitialOffsetTests
         }
 
         Assert.Empty(ep.Requests(RequestCode.GetMinOffset));
+    }
+
+    /// <summary>
+    /// The start offset never depends on the subscription type: a SQL92 selector with
+    /// CONSUME_FROM_FIRST_OFFSET must still start at the literal 0. An earlier draft
+    /// short-circuited every SQL92 subscription to GET_MAX_OFFSET, which silently
+    /// dropped the whole backlog produced before the consumer came up -- so the pin is
+    /// "offset 0 on the wire" AND "no max-offset RPC at all".
+    /// </summary>
+    [Fact]
+    public void Sql92SubscriptionStillStartsAtThePolicyOffset()
+    {
+        using var ep = OffsetEndpoint.Start();
+
+        var sql = new DefaultMQPushConsumer("CG_InitSql")
+        {
+            ConsumeFromWhere = ConsumeFromWhere.ConsumeFromFirstOffset,
+        };
+        sql.SetNamesrvAddr(ep.Addr);
+        sql.Subscribe(Topic, MessageSelector.BySql("a > 0"));
+        sql.SetMessageListener(new NullListener());
+        sql.Start();
+        try
+        {
+            Assert.True(WaitFor(() => ep.Requests(RequestCode.PullMessage).Count > 0, TimeSpan.FromSeconds(10)),
+                "a SQL92 FIRST_OFFSET consumer must really pull; request codes that arrived:"
+                + string.Join(",", ep.Codes()));
+            Assert.Equal("0", ep.Requests(RequestCode.PullMessage)[0].Ext["queueOffset"]);
+            Assert.Empty(ep.Requests(RequestCode.GetMaxOffset));
+            Assert.Empty(ep.Requests(RequestCode.GetMinOffset));
+        }
+        finally
+        {
+            sql.Shutdown();
+        }
+    }
+
+    /// <summary>CONSUME_FROM_TIMESTAMP searches at the configured time, not at an
+    /// offset computed from boot time: the start instant is what an operator sets, so a
+    /// 2020 timestamp must reach the broker as 2020.</summary>
+    [Fact]
+    public void TimestampStartUsesTheConfiguredInstant()
+    {
+        const string Configured = "20200101000000";
+        Assert.True(DateTimeOffset.TryParseExact(Configured, "yyyyMMddHHmmss",
+            CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTimeOffset parsed));
+        long expected = parsed.ToUnixTimeMilliseconds();
+
+        using var ep = OffsetEndpoint.Start();
+
+        var consumer = new DefaultMQPushConsumer("CG_InitTs")
+        {
+            ConsumeFromWhere = ConsumeFromWhere.ConsumeFromTimestamp,
+            ConsumeTimestamp = Configured,
+        };
+        consumer.SetNamesrvAddr(ep.Addr);
+        consumer.Subscribe(Topic, "*");
+        consumer.SetMessageListener(new NullListener());
+        consumer.Start();
+        try
+        {
+            Assert.True(WaitFor(() => ep.Requests(RequestCode.SearchOffsetByTimestamp).Count > 0,
+                    TimeSpan.FromSeconds(10)),
+                "the TIMESTAMP policy must send SEARCH_OFFSET_BY_TIMESTAMP; request codes that arrived:"
+                + string.Join(",", ep.Codes()));
+            WireReq search = ep.Requests(RequestCode.SearchOffsetByTimestamp)[0];
+            Assert.Equal(expected.ToString(CultureInfo.InvariantCulture), search.Ext["timestamp"]);
+            Assert.Equal(Topic, search.Ext["topic"]);
+        }
+        finally
+        {
+            consumer.Shutdown();
+        }
+    }
+
+    /// <summary>A malformed start time is rejected where it is set, before any thread or
+    /// registration exists -- not discovered later as a pull failure.</summary>
+    [Fact]
+    public void MalformedConsumeTimestampFailsAtStart()
+    {
+        using var ep = OffsetEndpoint.Start();
+
+        var consumer = new DefaultMQPushConsumer("CG_InitBadTs")
+        {
+            ConsumeFromWhere = ConsumeFromWhere.ConsumeFromTimestamp,
+        };
+        consumer.ConsumeTimestamp = "2020-01-01 00:00:00";
+        consumer.SetNamesrvAddr(ep.Addr);
+        consumer.Subscribe(Topic, "*");
+        consumer.SetMessageListener(new NullListener());
+
+        MQClientException e = Assert.Throws<MQClientException>(consumer.Start);
+        Assert.Contains("consumeTimestamp is invalid", e.Message);
+        Assert.Contains("2020-01-01 00:00:00", e.Message);
+    }
+
+    /// <summary>
+    /// A %RETRY% queue with nothing stored starts at 0 under LAST_OFFSET (every queued
+    /// retry has to be delivered) while the business queue of the same consumer still
+    /// goes to the queue tail -- and the retry start needs no max-offset RPC of its own.
+    /// The business-topic leg is the control: it proves the same code path does send
+    /// GET_MAX_OFFSET when the policy asks for the tail.
+    /// </summary>
+    [Fact]
+    public void RetryTopicStartsAtZeroWhereTheBusinessTopicStartsAtTheTail()
+    {
+        using var ep = OffsetEndpoint.Start();
+        const string Group = "CG_InitRetry";
+
+        var consumer = new DefaultMQPushConsumer(Group);
+        consumer.SetNamesrvAddr(ep.Addr);
+        consumer.Subscribe(Topic, "*");
+        consumer.SetMessageListener(new NullListener());
+        consumer.Start();
+        try
+        {
+            string retryTopic = MixAll.GetRetryTopic(Group);
+            Assert.True(WaitFor(() => ep.Requests(RequestCode.PullMessage)
+                    .Exists(r => r.Ext.TryGetValue("topic", out string? t) && t == retryTopic),
+                TimeSpan.FromSeconds(15)),
+                "the auto-subscribed retry topic must be pulled; request codes that arrived:"
+                + string.Join(",", ep.Codes()));
+
+            List<WireReq> retryPulls = ep.Requests(RequestCode.PullMessage)
+                .FindAll(r => r.Ext.TryGetValue("topic", out string? t) && t == retryTopic);
+            Assert.Equal("0", retryPulls[0].Ext["queueOffset"]);
+
+            // The control: the business topic of the same consumer does ask for the tail.
+            Assert.True(WaitFor(() => ep.Requests(RequestCode.GetMaxOffset)
+                    .Exists(r => r.Ext.TryGetValue("topic", out string? t) && t == Topic),
+                TimeSpan.FromSeconds(10)),
+                "the LAST_OFFSET business-topic start must send GET_MAX_OFFSET for that topic");
+            Assert.False(ep.Requests(RequestCode.GetMaxOffset)
+                .Exists(r => r.Ext.TryGetValue("topic", out string? t) && t == retryTopic),
+                "a retry topic with no stored offset must not be resolved by a max-offset query");
+        }
+        finally
+        {
+            consumer.Shutdown();
+        }
     }
 }

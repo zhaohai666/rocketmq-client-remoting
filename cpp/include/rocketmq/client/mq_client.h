@@ -137,6 +137,20 @@ public:
 
     void registerRebalanceWakeup(const std::string& group, std::function<void()> wakeup);
     void unregisterRebalanceWakeup(const std::string& group);
+    // Broker-initiated consumer RPCs (220/221/307/309): the remoting table holds one
+    // handler per code, so consumers must not install these themselves or a second
+    // consumer displaces the first. Each consumer registers its handler here keyed by
+    // its group; the instance owns the transport slot and asks every registered
+    // consumer in turn, returning the first reply that is not nullopt. A handler says
+    // "not my group" by returning nullopt.
+    void registerConsumerProcessor(int32_t requestCode, const std::string& group,
+                                   RemotingClient::RequestProcessor processor);
+    void unregisterConsumerProcessor(int32_t requestCode, const std::string& group);
+    // The fan-out itself: the transport slot for a code calls this, and a unit test can drive
+    // it directly (a reverse request cannot be injected over the wire from a test).
+    std::optional<RemotingCommand> dispatchConsumerProcessor(int32_t requestCode,
+                                                             const RemotingCommand& cmd,
+                                                             const std::string& addr);
     void rebalanceImmediately();
     // How many broker code-40 notifications have been received. Reverse requests can only be sent
     // by the broker and tests cannot inject one, so the counter is the only live assertion point.
@@ -470,6 +484,10 @@ private:
     // group -> consumer "wakeup" callback (removed when the consumer shuts down, to avoid a dangling this)
     std::mutex rebalanceWakeupLock_;
     std::map<std::string, std::function<void()>> rebalanceWakeups_;
+    // code -> (group -> handler). Same lifetime rule as the wakeups above: a consumer
+    // removes its own entries at shutdown, and the instance clears the whole table.
+    std::mutex consumerProcessorLock_;
+    std::map<int32_t, std::map<std::string, RemotingClient::RequestProcessor>> consumerProcessors_;
     std::atomic<size_t> consumerIdsChangedCount_{0};
 
     // ---- client configuration switches (forwarded by the facades in start()) ----

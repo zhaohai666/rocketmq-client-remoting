@@ -1383,13 +1383,10 @@ class MQClientInstance
         $header->fromExtFields($cmd->extFields);
         $group = (string) $header->group;
         $consumer = $group !== '' ? $this->findConsumer($group) : null;
-        if ($consumer === null) {
-            return RemotingCommand::createResponseCommand(
-                ResponseCode::SYSTEM_ERROR,
-                sprintf('no consumer for group=%s', $group),
-            );
-        }
-        $status = $consumer->getConsumerStatus((string) $header->topic);
+        // An unknown group is still answered SUCCESS with an empty table: the
+        // asking side always decodes the body, and an error code makes it drop
+        // the reply instead of reporting "this group consumed nothing".
+        $status = $consumer === null ? [] : $consumer->getConsumerStatus((string) $header->topic);
         $body = new GetConsumerStatusBody();
         $body->messageQueueTable = is_array($status) ? array_values($status) : [];
         $resp = RemotingCommand::createResponseCommand(ResponseCode::SUCCESS);
@@ -1405,9 +1402,11 @@ class MQClientInstance
         $group = (string) $header->consumerGroup;
         $consumer = $group !== '' ? $this->findConsumer($group) : null;
         if ($consumer === null) {
+            // The admin side reports which client it probed, so the reply has to
+            // name the group that is not hosted here.
             return RemotingCommand::createResponseCommand(
                 ResponseCode::SYSTEM_ERROR,
-                sprintf('no consumer for group=%s', $group),
+                sprintf('The Consumer Group <%s> not exist in this consumer', $group),
             );
         }
         $info = $consumer->consumerRunningInfo();
@@ -1424,9 +1423,10 @@ class MQClientInstance
         $group = (string) $header->consumerGroup;
         $consumer = $group !== '' ? $this->findConsumer($group) : null;
         if ($consumer === null) {
+            // Same as 307: the probe is reported per client, so name the group.
             return RemotingCommand::createResponseCommand(
                 ResponseCode::SYSTEM_ERROR,
-                sprintf('no consumer for group=%s', $group),
+                sprintf('The Consumer Group <%s> not exist in this consumer', $group),
             );
         }
         if ($cmd->body === null || $cmd->body === '') {
