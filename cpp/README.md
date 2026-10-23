@@ -46,15 +46,15 @@ cmake --build build -j6
 cd build && ctest --output-on-failure
 ```
 
-产出静态库 `build/librocketmq_remoting.a`（别名 `rocketmq::remoting`）、65 个测试二进制与
+产出静态库 `build/librocketmq_remoting.a`（别名 `rocketmq::remoting`）、66 个测试二进制与
 44 个 `build/examples/` 工具。本机实测：
 
 ```
-100% tests passed out of 66
-Total Test time (real) = 141.38 sec
+100% tests passed out of 67
+Total Test time (real) = 104.25 sec
 ```
 
-66 个用例 = 65 个测试二进制（4672 项断言）+ 1 个编解码互调用例（73 项断言），共 **4745 项断言**。
+67 个用例 = 66 个测试二进制（4757 项断言）+ 1 个编解码互调用例（73 项断言），共 **4830 项断言**。
 
 不依赖集群的协议层自检：
 
@@ -626,7 +626,7 @@ cpp/
 │                               hook / trace / request_reply / backpressure / validators /
 │                               result / exception
 ├── src/                        与 include 同构的实现（common / remoting / client）
-├── tests/                      65 个测试源文件 + interop_check.py = 66 个 ctest 用例
+├── tests/                      66 个测试源文件 + interop_check.py = 67 个 ctest 用例
 ├── examples/                   rmq_selfcheck / rmq_interop + 41 个真机联调工具
 └── tools/                      Windows 头文件准备与语法检查脚本
 ```

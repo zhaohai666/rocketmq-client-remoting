@@ -24,7 +24,7 @@ git clone <this repo> && cd rocketmq-client-remoting/nodeJs
 node --experimental-strip-types selfcheck.ts
 ```
 
-`selfcheck.ts` loads all **65** modules under `src/` and then runs the **31** offline smoke suites (both lists are derived from the tree, so a new file cannot slip past the check); measured **ALL GREEN** on 2026-10-22, **965** checks in total. Run a single suite with `node --experimental-strip-types test/<suite>.ts`; measured results:
+`selfcheck.ts` loads all **65** modules under `src/` and then runs the **33** offline smoke suites (both lists are derived from the tree, so a new file cannot slip past the check); measured **ALL GREEN** on 2026-10-23, **1027** checks in total. Run a single suite with `node --experimental-strip-types test/<suite>.ts`; measured results:
 
 | Suite | Measured |
 | --- | --- |
@@ -41,9 +41,11 @@ node --experimental-strip-types selfcheck.ts
 | `test/compat_contract_smoke.ts` (pinned wire-format / behavior surface) | 10 check groups passed |
 | `test/consumer_heartbeat_registration_smoke.ts` (consumer heartbeat registration) | 13 passed / 0 failed |
 | `test/consumer_smoke.ts` | 30 passed / 0 failed |
+| `test/consumer_status_reply_smoke.ts` (221 status reply + 307/309 unhosted group + 220 oneway) | 22 passed / 0 failed |
 | `test/fixes2_smoke.ts` | 40 checks passed |
 | `test/heartbeat_v2_beat_smoke.ts` | 28 passed / 0 failed |
 | `test/heartbeat_v2_smoke.ts` | 30 passed / 0 failed |
+| `test/initial_offset_policy_smoke.ts` (start position: broadcasting / TIMESTAMP / %RETRY% / SQL92) | 40 passed / 0 failed |
 | `test/lite_topic_queue_change_smoke.ts` | 25 passed / 0 failed |
 | `test/mq_client_manager_smoke.ts` | 52 passed / 0 failed |
 | `test/namespace_rpc_smoke.ts` | 7 check groups passed |
@@ -392,7 +394,7 @@ nodeJs/
 │                        # allocation/offset-store/consume-stats/tracing/back-pressure/traceparent
 ├── examples/            # live real-cluster tools (see "Live Cluster Verification")
 ├── test/                # offline smoke suites (protocol round-trip, auto-batch and retry, the backpressure gate, allocation, offsets, tracing, stats, namespace, POP, admin)
-├── selfcheck.ts         # one-shot offline check (module load + 31 smoke suites)
+├── selfcheck.ts         # one-shot offline check (module load + 33 smoke suites)
 └── package.json         # engines: node >= 22
 ```
 

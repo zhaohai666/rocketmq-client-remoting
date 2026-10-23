@@ -24,7 +24,7 @@ git clone <本仓库> && cd rocketmq-client-remoting/nodeJs
 node --experimental-strip-types selfcheck.ts
 ```
 
-`selfcheck.ts` 加载 `src/` 全部 **65** 个模块并依次跑 **31** 套离线冒烟（两份清单都由目录树推导，新增文件不会漏出自检），2026-10-22 实测 **ALL GREEN**，共 **965** 项检查。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
+`selfcheck.ts` 加载 `src/` 全部 **65** 个模块并依次跑 **33** 套离线冒烟（两份清单都由目录树推导，新增文件不会漏出自检），2026-10-23 实测 **ALL GREEN**，共 **1027** 项检查。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
 
 | 套件 | 实测 |
 | --- | --- |
@@ -41,9 +41,11 @@ node --experimental-strip-types selfcheck.ts
 | `test/compat_contract_smoke.ts`（线上格式/行为钉死面） | 10 组检查通过 |
 | `test/consumer_heartbeat_registration_smoke.ts`（消费端心跳注册） | 13 通过 / 0 失败 |
 | `test/consumer_smoke.ts` | 30 通过 / 0 失败 |
+| `test/consumer_status_reply_smoke.ts`（221 状态应答 + 307/309 未托管组 + 220 单向） | 22 通过 / 0 失败 |
 | `test/fixes2_smoke.ts` | 40 项检查通过 |
 | `test/heartbeat_v2_beat_smoke.ts` | 28 通过 / 0 失败 |
 | `test/heartbeat_v2_smoke.ts` | 30 通过 / 0 失败 |
+| `test/initial_offset_policy_smoke.ts`（初始位点：广播 / TIMESTAMP / %RETRY% / SQL92） | 40 通过 / 0 失败 |
 | `test/lite_topic_queue_change_smoke.ts` | 25 通过 / 0 失败 |
 | `test/mq_client_manager_smoke.ts` | 52 通过 / 0 失败 |
 | `test/namespace_rpc_smoke.ts` | 7 组检查通过 |
@@ -389,7 +391,7 @@ nodeJs/
 │                        # 队列分配/位点存储/消费统计/轨迹/背压/traceparent
 ├── examples/            # 真机 live 工具（见「真实集群联调」）
 ├── test/                # 离线冒烟（协议往返、攒批重试、背压闸门、分配、位点、轨迹、统计、命名空间、POP、admin）
-├── selfcheck.ts         # 一键离线自检（模块加载 + 31 套冒烟）
+├── selfcheck.ts         # 一键离线自检（模块加载 + 33 套冒烟）
 └── package.json         # engines: node >= 22
 ```
 
