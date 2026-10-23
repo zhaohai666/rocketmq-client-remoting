@@ -236,7 +236,7 @@ def test_pull_loop_stamps_before_lock_and_flow_control():
     c.subscription_data = {mq.topic: _sub()}
     del c._queue_pull_loop                      # use the real loop, not _consumer()'s empty shell
     c.pull_threshold_for_queue = 1
-    c._pending[key] = _msgs(3)                  # 3 pulled >= threshold 1 -> flow control triggers every round
+    c._pending[key] = _msgs(3)                  # 3 pulled, above threshold 1 -> flow control triggers every round
     c._offset_table[key] = 0
     try:
         th = threading.Thread(target=c._queue_pull_loop, args=(mq,), daemon=True)

@@ -85,6 +85,11 @@ PULL_MAX_IDLE_TIME = 120.0
 # after suspend(), the pull/pop loop does not exit; it just backs off this long each round before checking the gate again.
 PULL_TIME_DELAY_WHEN_SUSPEND = 1.0
 
+# Per-round backoff when the client's **own** cached-message thresholds hit (default 50ms):
+# the local buffer is full, so a short pause that lets the listener drain it is enough -- longer
+# costs throughput, shorter just spins. Distinct from the broker's FLOW_CONTROL(215) reply below.
+PULL_TIME_DELAY_WHEN_CACHE_FLOW_CONTROL = 0.05
+
 # Per-round backoff when the **broker** answers FLOW_CONTROL(215) to a pull/pop (default 20ms):
 # broker-side throttling is transient, so the retry stays short. This is deliberately distinct
 # from the pause taken when the client's own receive-buffer thresholds hit (the _flow_control_hit
@@ -94,6 +99,15 @@ PULL_TIME_DELAY_WHEN_BROKER_FLOW_CONTROL = 0.02
 # Per-round backoff for any other broker/client error on the pull/pop path (default 500ms):
 # long enough to avoid a hot retry loop, short enough to recover quickly.
 PULL_TIME_DELAY_WHEN_EXCEPTION = 0.5
+
+# A throttled consumer trips flow control on every pull round, so a per-trip warn would flood the
+# log; only every Nth trip gets one (the first, then the 1001st, ...).
+FLOW_CONTROL_WARN_EVERY_N_TRIPS = 1000
+
+
+def is_flow_control_warn_trip(triggered_times: int) -> bool:
+    """Whether the Nth (1-based) flow-control trip is one that logs a warn."""
+    return (triggered_times - 1) % FLOW_CONTROL_WARN_EVERY_N_TRIPS == 0
 
 
 def _mq_sort_key(mq: MessageQueue):
@@ -2151,7 +2165,7 @@ class DefaultMQPushConsumer:
             # Flow control: count / bytes / topic-level accumulation / concurrency span
             # pause this queue's pull when any limit is exceeded
             if self._flow_control_hit(mq, key):
-                time.sleep(0.1)
+                time.sleep(PULL_TIME_DELAY_WHEN_CACHE_FLOW_CONTROL)
                 continue
             offset = self._offset_table.get(key)
             if offset is None:
@@ -2333,7 +2347,7 @@ class DefaultMQPushConsumer:
                 return
             # Flow control: too many popped-but-unacked, back off first (pop_threshold_for_queue)
             if pq.wait_ack_count() > self.pop_threshold_for_queue:
-                time.sleep(0.05)
+                time.sleep(PULL_TIME_DELAY_WHEN_CACHE_FLOW_CONTROL)
                 continue
             began = time.time()
             try:
@@ -2669,6 +2683,10 @@ class DefaultMQPushConsumer:
     def _flow_control_hit(self, mq: MessageQueue, key: str) -> bool:
         """Whether flow control is triggered (five threshold checks; any hit pauses this queue's pull).
 
+        Every cache gate is **strictly greater than** its threshold: a buffer that has reached the
+        threshold exactly is still allowed to pull, so the thresholds are "how many may be cached",
+        not "how many stop the pull".
+
         - ``pull_threshold_for_queue``: this queue's pulled-but-unconsumed **count** (default 1000)
         - ``pull_threshold_size_for_queue``: this queue's pulled-but-unconsumed **bytes in MB** (default 100)
         - ``pull_threshold_for_topic`` / ``pull_threshold_size_for_topic``: accumulation across all queues of the same topic (-1 disables)
@@ -2686,9 +2704,9 @@ class DefaultMQPushConsumer:
             offsets = [m.queue_offset for m in dq]
             span = max(offsets) - min(offsets)
         reason = ""
-        if len(dq) >= max(1, self.pull_threshold_for_queue):
+        if len(dq) > max(1, self.pull_threshold_for_queue):
             reason = "count=%d" % len(dq)
-        elif self.pull_threshold_size_for_queue > 0 and size_mb >= self.pull_threshold_size_for_queue:
+        elif self.pull_threshold_size_for_queue > 0 and size_mb > self.pull_threshold_size_for_queue:
             reason = "size=%.1fMB" % size_mb
         elif self.consume_concurrently_max_span > 0 and span > self.consume_concurrently_max_span:
             reason = "span=%d" % span
@@ -2706,8 +2724,14 @@ class DefaultMQPushConsumer:
                     reason = "topicSize=%.1fMB" % topic_mb
         if not reason:
             return False
-        self._flow_control_triggered += 1
+        with self._lock:
+            self._flow_control_triggered += 1
+            times = self._flow_control_triggered
         logger.debug("flow control: queue %s %s, pause pull", mq, reason)
+        if is_flow_control_warn_trip(times):
+            logger.warning("flow control: queue %s %s exceeds its cache threshold, pause pull for %.0f ms"
+                           " (flowControlTimes=%d)",
+                           mq, reason, PULL_TIME_DELAY_WHEN_CACHE_FLOW_CONTROL * 1000, times)
         return True
 
     def _resolve_initial_offset(self, client: MQClientInstance,

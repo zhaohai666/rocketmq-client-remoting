@@ -53,6 +53,18 @@ public class FlowControlTests
     private static bool Hit(DefaultMQPushConsumer c, MessageQueue mq)
         => c.FlowControlHitForTest(mq, DefaultMQPushConsumer.OffsetKeyForTest(mq));
 
+    // ClientLog keeps the write handle for the whole run, and Windows validates share modes in both
+    // directions: the file must be opened shared for ReadWrite, the way `tail -f` does it.
+    private static string[] ReadAllLinesShared(string path)
+    {
+        using FileStream fs = new(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        using StreamReader sr = new(fs);
+        var lines = new List<string>();
+        string? line;
+        while ((line = sr.ReadLine()) is not null) lines.Add(line);
+        return lines.ToArray();
+    }
+
     [Fact]
     public void Defaults_OnlyTheCountGateIsLive()
     {
@@ -68,7 +80,7 @@ public class FlowControlTests
     }
 
     [Fact]
-    public void CountGate_FiresAtThreshold_AndTreatsZeroAsOne()
+    public void CountGate_FiresAboveThreshold_AndTreatsZeroAsOne()
     {
         var c = new DefaultMQPushConsumer("GID_FlowControlCountNet");
         var mq = QueueOf(Topic, 0);
@@ -76,11 +88,19 @@ public class FlowControlTests
         c.PullThresholdForQueue = 3;
         Stage(c, mq, NSized(Topic, 100, 2));
         Assert.False(Hit(c, mq));
+        // The gate is strictly greater than the threshold: a buffer that has reached 3 exactly is
+        // still allowed to pull, so the threshold reads as "how many may be cached".
         Stage(c, mq, NSized(Topic, 100, 3));
+        Assert.False(Hit(c, mq), "exactly 3 messages against a threshold of 3 must not fire (>, not >=)");
+        Assert.Equal(0L, c.FlowControlTriggered);
+        Stage(c, mq, NSized(Topic, 100, 4));
         Assert.True(Hit(c, mq));
         Assert.Equal(1L, c.FlowControlTriggered);
+        // The max(1,n) guard makes a 0 threshold behave like 1, so 1 still fits and 2 fires.
         c.PullThresholdForQueue = 0;
         Stage(c, mq, NSized(Topic, 100, 1));
+        Assert.False(Hit(c, mq), "a 0 threshold counts as 1 message, so a single message still fits");
+        Stage(c, mq, NSized(Topic, 100, 2));
         Assert.True(Hit(c, mq), "PullThresholdForQueue=0 must be counted as 1 message (the max(1,n) guard)");
     }
 
@@ -93,14 +113,138 @@ public class FlowControlTests
         c.PullThresholdSizeForQueue = 1;             // 1 MiB
         Stage(c, mq, NSized(Topic, 300, 3));         // 900 B
         Assert.False(Hit(c, mq));
-        // The unit is MiB rather than bytes: exactly 1 MiB counts as a match (>=)
+        // The unit is MiB rather than bytes, and the gate is strictly greater than the threshold:
+        // exactly 1 MiB is still inside the budget.
         Stage(c, mq, new List<MessageExt> { Sized(Topic, MiB, 0) });
-        Assert.True(Hit(c, mq), "exactly 1MiB must match (>=, not >)");
+        Assert.False(Hit(c, mq), "exactly 1MiB against a 1MiB threshold must not fire (>, not >=)");
+        Stage(c, mq, new List<MessageExt> { Sized(Topic, MiB + 1, 0) });
+        Assert.True(Hit(c, mq), "1 byte over the 1MiB threshold must fire");
         Stage(c, mq, NSized(Topic, 2 * MiB, 4));
         Assert.True(Hit(c, mq));
         // 0 = this gate is off, no matter how large the buffer is
         c.PullThresholdSizeForQueue = 0;
         Assert.False(Hit(c, mq));
+    }
+
+    [Fact]
+    public void CacheBackoff_IsFiftyMillis_AndNotTheBrokersTwenty()
+    {
+        // The client's own cache threshold parks the pull for one short re-schedule period; the
+        // broker's FLOW_CONTROL(215) reply is a different event with a different number.
+        Assert.Equal(50, DefaultMQPushConsumer.CacheFlowControlBackoffMillis);
+        Assert.NotEqual(DefaultMQPushConsumer.BrokerFlowControlBackoffMillis,
+            DefaultMQPushConsumer.CacheFlowControlBackoffMillis);
+    }
+
+    /// <summary>Warn trips counted from the log file written by the gate itself.</summary>
+    private static List<string> CaptureWarnTrips(DefaultMQPushConsumer c, MessageQueue mq, int rounds)
+    {
+        string dir = Path.Combine(Path.GetTempPath(),
+            "rmq_dotnet_fc_" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(dir);
+        string path = Path.Combine(dir, "flow.log");
+        // The capture has to see every line this window writes: the rotation limits are process-wide
+        // state, and a small limit left by another class would roll the early trips into backups that
+        // get deleted, so the warn would read as missing. Raised here, restored below.
+        long sizeBefore = ClientLog.LogFileMaxSize;
+        int indexBefore = ClientLog.LogFileMaxIndex;
+        try
+        {
+            ClientLog.SetLogFileLimits(256L * 1024 * 1024, 1);
+            ClientLog.SetLogFile(path);
+            ClientLog.SetLogLevel(LogLevel.Debug);
+            for (int i = 0; i < rounds; i++)
+            {
+                Assert.True(Hit(c, mq), $"round {i + 1} must pause the pull");
+            }
+
+            ClientLog.FlushLogFile();
+            string[] lines = ReadAllLinesShared(path);
+            return lines.Where(l => l.Contains(" WARN  [")).ToList();
+        }
+        finally
+        {
+            ClientLog.SetLogFile(string.Empty);
+            ClientLog.FlushLogFile();
+            ClientLog.SetLogLevel(LogLevel.Info);
+            ClientLog.SetLogFileLimits(sizeBefore, indexBefore);
+            try
+            {
+                Directory.Delete(dir, recursive: true);
+            }
+            catch
+            {
+                // A cleanup failure does not affect the test
+            }
+        }
+    }
+
+    [Fact]
+    public void WarnCadence_IsTheFirstTripAndEveryThousandthAfter()
+    {
+        foreach (long n in new[] { 1L, 1001L, 2001L })
+        {
+            Assert.True(DefaultMQPushConsumer.IsFlowControlWarnTrip(n), $"trip {n} must warn");
+        }
+        // Control: the trips in between stay on the debug channel only. A cadence degraded to
+        // "warn always" or "warn once and stop" is caught here, not by the boundaries above.
+        foreach (long n in new[] { 0L, 2L, 999L, 1000L, 1002L, 2000L })
+        {
+            Assert.False(DefaultMQPushConsumer.IsFlowControlWarnTrip(n), $"trip {n} must stay quiet");
+        }
+        Assert.Equal(1000, DefaultMQPushConsumer.FlowControlWarnEvery);
+
+        var c = new DefaultMQPushConsumer("GID_FlowControlWarnNet");
+        var mq = QueueOf(Topic, 0);
+        GatesOffExceptCounts(c);
+        c.PullThresholdForQueue = 1;
+        Stage(c, mq, NSized(Topic, 100, 2));
+
+        List<string> warns = CaptureWarnTrips(c, mq, 1000);
+        Assert.Equal(1000L, c.FlowControlTriggered);
+        Assert.Single(warns);
+        Assert.Contains("(flowControlTimes=1)", warns[0]);
+
+        // The 1001st trip is the next warn, and it carries the counter it fired on.
+        warns = CaptureWarnTrips(c, mq, 1);
+        Assert.Equal(1001L, c.FlowControlTriggered);
+        Assert.Single(warns);
+        Assert.Contains("(flowControlTimes=1001)", warns[0]);
+    }
+
+    [Fact]
+    public void WarnCapture_SurvivesASmallGlobalRotationLimit()
+    {
+        // The cadence above reads its warns back from the log file, and the rotation limits are
+        // process-wide state: a small limit left behind by another class rolls the early trips into
+        // backups that then get deleted, which looks exactly like "the warn never happened". The
+        // capture raises the limits for its own window and puts them back, so nothing else can
+        // break it -- and this test is the control for a capture that forgets to.
+        long sizeBefore = ClientLog.LogFileMaxSize;
+        int indexBefore = ClientLog.LogFileMaxIndex;
+        try
+        {
+            ClientLog.SetLogFileLimits(2000, 3);
+
+            var c = new DefaultMQPushConsumer("GID_FlowControlWarnLeakNet");
+            var mq = QueueOf(Topic, 0);
+            GatesOffExceptCounts(c);
+            c.PullThresholdForQueue = 1;
+            Stage(c, mq, NSized(Topic, 100, 2));
+
+            List<string> warns = CaptureWarnTrips(c, mq, 10);
+            Assert.Equal(10L, c.FlowControlTriggered);
+            Assert.Single(warns);
+            Assert.Contains("(flowControlTimes=1)", warns[0]);
+
+            // Restored, not raised-and-abandoned: the next class must find what this one found.
+            Assert.Equal(2000L, ClientLog.LogFileMaxSize);
+            Assert.Equal(3, ClientLog.LogFileMaxIndex);
+        }
+        finally
+        {
+            ClientLog.SetLogFileLimits(sizeBefore, indexBefore);
+        }
     }
 
     [Fact]

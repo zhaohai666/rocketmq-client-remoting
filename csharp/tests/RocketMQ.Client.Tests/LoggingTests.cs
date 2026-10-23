@@ -119,24 +119,40 @@ public class LoggingTests : IDisposable
     public void SizeRotation_FixedWindow_WithMaxIndexCap()
     {
         string path = Path.Combine(_dir, "rot.log");
-        ClientLog.SetLogFileLimits(2000, 3); // inject small thresholds: rotate at 2KB, at most 3 backups
-        ClientLog.SetLogFile(path);
-
-        for (int i = 0; i < 400; ++i)
+        // The limits are process-wide and the tiny values below would silently rotate (and then
+        // delete) any other test's log capture, so put back whatever this test found on entry.
+        long sizeBefore = ClientLog.LogFileMaxSize;
+        int indexBefore = ClientLog.LogFileMaxIndex;
+        try
         {
-            ClientLog.Info("rotation probe line " + i.ToString(CultureInfo.InvariantCulture)
-                + " 0123456789012345678901234567890123456789012345");
+            ClientLog.SetLogFileLimits(2000, 3); // inject small thresholds: rotate at 2KB, at most 3 backups
+            ClientLog.SetLogFile(path);
+
+            for (int i = 0; i < 400; ++i)
+            {
+                ClientLog.Info("rotation probe line " + i.ToString(CultureInfo.InvariantCulture)
+                    + " 0123456789012345678901234567890123456789012345");
+            }
+
+            ClientLog.FlushLogFile();
+            string backup1 = path + ".1";
+            Assert.True(File.Exists(backup1), "rotation did not create .1 backup");
+
+            long baseSize = new FileInfo(path).Length;
+            Assert.True(baseSize <= 2000, "base file should be capped at maxSize");
+
+            // The backup file's content should also be whole lines
+            string[] backupLines = ReadAllLinesShared(backup1);
+            Assert.All(backupLines, l => Assert.Matches(LineRegex, l));
+        }
+        finally
+        {
+            ClientLog.SetLogFileLimits(sizeBefore, indexBefore);
         }
 
-        ClientLog.FlushLogFile();
-        string backup1 = path + ".1";
-        Assert.True(File.Exists(backup1), "rotation did not create .1 backup");
-
-        long baseSize = new FileInfo(path).Length;
-        Assert.True(baseSize <= 2000, "base file should be capped at maxSize");
-
-        // The backup file's content should also be whole lines
-        string[] backupLines = ReadAllLinesShared(backup1);
-        Assert.All(backupLines, l => Assert.Matches(LineRegex, l));
+        // Reading the values back is what makes this a regression case rather than a line of code: a
+        // future edit that drops the restore leaks a 2KB window into every other class's log capture.
+        Assert.Equal(sizeBefore, ClientLog.LogFileMaxSize);
+        Assert.Equal(indexBefore, ClientLog.LogFileMaxIndex);
     }
 }

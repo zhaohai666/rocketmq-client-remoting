@@ -184,6 +184,38 @@ final class DefaultMQPushConsumer
     /** @var array<string,bool> Queues confirmed locked by broker LOCK_BATCH_MQ (orderly consumption) */
     private array $lockOk = [];
     private int $flowControlTriggered = 0;
+    /**
+     * Per-round wait after this client's OWN cache thresholds trip, in milliseconds. The local
+     * buffer is full, so a short pause that lets the listener drain it is enough; this is a
+     * different event from the broker answering FLOW_CONTROL(215) and must not share its wait.
+     */
+    public const PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL = 50;
+    /**
+     * The broker answered FLOW_CONTROL(215): it throttled this request on its own window, which
+     * says nothing about this client's cache, so the retry is sooner than for any other error.
+     */
+    public const PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL = 20;
+    /** Every other broker or client error on the pull/pop path (topic not created yet, ...). */
+    public const PULL_TIME_DELAY_MILLS_WHEN_EXCEPTION = 500;
+    /**
+     * The idle backoff for one failed request: FLOW_CONTROL(215) gets its own short pause, every
+     * other response code keeps the general error backoff. Pure and public because the two events
+     * look identical offline (both arrive as one MQBrokerException), so a mapping mistake has to be
+     * pinnable without a throttling broker.
+     */
+    public static function pullBackoffMillisForResponseCode(?int $responseCode): int
+    {
+        return $responseCode === ResponseCode::FLOW_CONTROL
+            ? self::PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL
+            : self::PULL_TIME_DELAY_MILLS_WHEN_EXCEPTION;
+    }
+    /**
+     * A throttled queue trips a cache gate on every pull round, so warning every round buries
+     * the signal in noise: only every Nth trip warns (the 1st, then the 1001st, ...).
+     */
+    public const FLOW_CONTROL_WARN_EVERY = 1000;
+    /** @var array<string,float> Due time of the cache-flow-control pause per queue (seconds, PHP adaptation of the re-scheduled pull request) */
+    private array $flowControlUntil = [];
     /** @var array<string,float> Last time a pull/pop was initiated per queue (seconds) */
     private array $lastPullTable = [];
     private bool $paused = false;
@@ -1073,7 +1105,7 @@ final class DefaultMQPushConsumer
 
     private function retireQueue(string $key, ?MessageQueue $fallbackMq, array &$retired): void
     {
-        unset($this->pending[$key], $this->idleUntil[$key], $this->suspendedUntil[$key]);
+        unset($this->pending[$key], $this->idleUntil[$key], $this->suspendedUntil[$key], $this->flowControlUntil[$key]);
         // In-flight registrations are voided together.
         unset($this->inflightMsgs[$key], $this->msgQueueInflight[$key]);
         unset($this->lockOk[$key]);
@@ -1427,6 +1459,11 @@ final class DefaultMQPushConsumer
         if (isset($this->suspendedUntil[$key]) && $now < $this->suspendedUntil[$key]) {
             return false;
         }
+        // Cache flow control still has a wait to honour: the tick model has no pull request to
+        // re-schedule, so the queue is skipped until the pause is due (PHP adaptation).
+        if (isset($this->flowControlUntil[$key]) && $now < $this->flowControlUntil[$key]) {
+            return false;
+        }
         if ($this->flowControlHit($mq, $key)) {
             return false;
         }
@@ -1484,12 +1521,12 @@ final class DefaultMQPushConsumer
         } catch (RemotingTimeoutException $e) {
             // Network timeout under short polling backs off and retries as an expected path.
             Logger::debug("pull timeout for $mq (will retry): " . $e->getMessage());
-            $this->idleUntil[$key] = microtime(true) + 0.5;
+            $this->armRequestBackoff($key, $e);
             return false;
         } catch (\Throwable $e) {
             // Broker-side non-SUCCESS codes (TOPIC_NOT_EXIST etc.): expected path, debug + backoff.
             Logger::debug("pull error for $mq: " . get_class($e) . ': ' . $e->getMessage());
-            $this->idleUntil[$key] = microtime(true) + 0.5;
+            $this->armRequestBackoff($key, $e);
             return false;
         }
 
@@ -1599,6 +1636,11 @@ final class DefaultMQPushConsumer
         return $this->corePoolSize;
     }
 
+    /**
+     * Whether the cache gates pause this queue's pull. Every gate compares **strictly greater
+     * than** its threshold, so a buffer that has reached the threshold exactly is still allowed
+     * to pull and a threshold reads as "how many may be cached".
+     */
     private function flowControlHit(MessageQueue $mq, string $key): bool
     {
         $dq = $this->pending[$key] ?? [];
@@ -1613,9 +1655,9 @@ final class DefaultMQPushConsumer
             $span = max($offsets) - min($offsets);
         }
         $reason = '';
-        if (count($dq) >= max(1, $this->pullThresholdForQueue)) {
+        if (count($dq) > max(1, $this->pullThresholdForQueue)) {
             $reason = 'count=' . count($dq);
-        } elseif ($this->pullThresholdSizeForQueue > 0 && $sizeMb >= $this->pullThresholdSizeForQueue) {
+        } elseif ($this->pullThresholdSizeForQueue > 0 && $sizeMb > $this->pullThresholdSizeForQueue) {
             $reason = sprintf('size=%.1fMB', $sizeMb);
         } elseif ($this->consumeConcurrentlyMaxSpan > 0 && $span > $this->consumeConcurrentlyMaxSpan) {
             $reason = "span=$span";
@@ -1642,14 +1684,51 @@ final class DefaultMQPushConsumer
         if ($reason === '') {
             return false;
         }
+        $this->armCacheFlowControlPause($mq, $key, $reason);
+        return true;
+    }
+
+    /**
+     * Whether the n-th (1-based) flow-control trip is one that logs a WARN: the 1st, then every
+     * FLOW_CONTROL_WARN_EVERY-th trip after it.
+     */
+    public static function isFlowControlWarnTrip(int $times): bool
+    {
+        return (($times - 1) % self::FLOW_CONTROL_WARN_EVERY) === 0;
+    }
+
+    /**
+     * Record one cache-flow-control trip: arm the per-queue pause and log it. Shared by the pull
+     * gates and the POP wait-ack gate, which is the same event -- this client's own buffer is the
+     * reason the request is not worth sending -- so both feed the same counter and the same pause.
+     */
+    private function armCacheFlowControlPause(MessageQueue $mq, string $key, string $reason): void
+    {
+        $this->flowControlUntil[$key] = microtime(true)
+            + self::PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL / 1000.0;
         $this->flowControlTriggered++;
         Logger::debug("flow control: queue $mq $reason, pause pull");
-        return true;
+        if (self::isFlowControlWarnTrip($this->flowControlTriggered)) {
+            Logger::warning(sprintf('flow control: queue %s %s exceeds its cache threshold, pause pull for %d ms (flowControlTimes=%d)',
+                $mq, $reason, self::PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL, $this->flowControlTriggered));
+        }
     }
 
     public function flowControlTriggeredCount(): int
     {
         return $this->flowControlTriggered;
+    }
+
+    /**
+     * Arm the per-queue idle backoff after a pull/pop request came back failed. There is no
+     * re-schedulable request object in this tick model, so the due time plays that part: the next
+     * round sees it in ``idleUntil`` and skips the queue until then.
+     */
+    private function armRequestBackoff(string $key, \Throwable $e): void
+    {
+        $millis = self::pullBackoffMillisForResponseCode(
+            $e instanceof MQBrokerException ? $e->responseCode : null);
+        $this->idleUntil[$key] = microtime(true) + $millis / 1000.0;
     }
 
     // ---------------- Initial offset ----------------
@@ -2821,7 +2900,13 @@ final class DefaultMQPushConsumer
         if ($sub === null) {
             return false;
         }
+        // The POP gate shares the cache-flow-control pause with the pull path: an over-due queue
+        // is skipped before the debt is even looked at, exactly like a throttled pull.
+        if (isset($this->flowControlUntil[$key]) && $now < $this->flowControlUntil[$key]) {
+            return false;
+        }
         if ($pq->waitAckCount() > $this->popThresholdForQueue) {
+            $this->armCacheFlowControlPause($mq, $key, 'waitAckCount=' . $pq->waitAckCount());
             return false;
         }
         // Idle backoff (PHP short-poll adaptation).
@@ -2846,11 +2931,11 @@ final class DefaultMQPushConsumer
             );
         } catch (RemotingTimeoutException $e) {
             Logger::debug("pop timeout for $mq (will retry): " . $e->getMessage());
-            $this->idleUntil[$key] = microtime(true) + 0.5;
+            $this->armRequestBackoff($key, $e);
             return false;
         } catch (\Throwable $e) {
             Logger::debug("pop error for $mq: " . get_class($e) . ': ' . $e->getMessage());
-            $this->idleUntil[$key] = microtime(true) + 0.5;
+            $this->armRequestBackoff($key, $e);
             return false;
         }
         // The queue was revoked by rebalance after the pop came back: this batch is **neither consumed nor

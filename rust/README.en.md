@@ -30,8 +30,8 @@ code-generation step.
 
 ```bash
 cd rust
-cargo build --all-targets                       # lib + 41 examples
-cargo test --quiet                              # 1103 passed; 0 failed; 0 ignored (~10s)
+cargo build --all-targets                       # lib + 42 examples
+cargo test --quiet                              # 1104 passed; 0 failed; 0 ignored (~10s)
 cargo clippy --all-targets --all-features -- -D warnings  # zero warnings is a hard gate
 ```
 

@@ -24,7 +24,7 @@ git clone <this repo> && cd rocketmq-client-remoting/nodeJs
 node --experimental-strip-types selfcheck.ts
 ```
 
-`selfcheck.ts` loads all **65** modules under `src/` and then runs the **35** offline smoke suites (both lists are derived from the tree, so a new file cannot slip past the check); measured **ALL GREEN** on 2026-10-23, **1071** checks in total. Run a single suite with `node --experimental-strip-types test/<suite>.ts`; measured results:
+`selfcheck.ts` loads all **65** modules under `src/` and then runs the **36** offline smoke suites (both lists are derived from the tree, so a new file cannot slip past the check); measured **ALL GREEN** on 2026-10-23, **1133** checks in total. Run a single suite with `node --experimental-strip-types test/<suite>.ts`; measured results:
 
 | Suite | Measured |
 | --- | --- |
@@ -44,6 +44,7 @@ node --experimental-strip-types selfcheck.ts
 | `test/consumer_smoke.ts` | 30 passed / 0 failed |
 | `test/consumer_status_reply_smoke.ts` (221 status reply + 307/309 unhosted group + 220 oneway) | 22 passed / 0 failed |
 | `test/fixes2_smoke.ts` | 40 checks passed |
+| `test/flow_control_smoke.ts` (cache gate 50ms, the broker's 215 gets 20ms, every other failed pull 500ms, POP queues on the same branch) | 62 checks passed |
 | `test/heartbeat_v2_beat_smoke.ts` | 28 passed / 0 failed |
 | `test/heartbeat_v2_smoke.ts` | 30 passed / 0 failed |
 | `test/initial_offset_policy_smoke.ts` (start position: broadcasting / TIMESTAMP / %RETRY% / SQL92) | 40 passed / 0 failed |
@@ -396,7 +397,7 @@ nodeJs/
 │                        # allocation/offset-store/consume-stats/tracing/back-pressure/traceparent
 ├── examples/            # live real-cluster tools (see "Live Cluster Verification")
 ├── test/                # offline smoke suites (protocol round-trip, auto-batch and retry, the backpressure gate, allocation, offsets, tracing, stats, namespace, POP, admin)
-├── selfcheck.ts         # one-shot offline check (module load + 35 smoke suites)
+├── selfcheck.ts         # one-shot offline check (module load + 36 smoke suites)
 └── package.json         # engines: node >= 22
 ```
 

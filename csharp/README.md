@@ -33,7 +33,7 @@ dotnet test tests/RocketMQ.Client.Tests
 | 命令 | 结果 |
 | --- | --- |
 | `dotnet build --no-incremental` | `0 个警告` / `0 个错误`，用时 `00:00:17.94` |
-| `dotnet test tests/RocketMQ.Client.Tests` | `已通过! - 失败: 0，通过:  1030，已跳过: 0，总计:  1030，持续时间: 4 m 34 s` |
+| `dotnet test tests/RocketMQ.Client.Tests` | `已通过! - 失败: 0，通过: 1033，已跳过: 0，总计: 1033，持续时间: 4 m 35 s` |
 
 `Directory.Build.props` 里 `TreatWarningsAsErrors=true` 全局生效，所以「构建通过」等价于「零 warning」。
 测试输出跟随系统区域设置，中文 locale 下汇总行是中文，检索时按 `总计:` 匹配。
@@ -503,7 +503,7 @@ producer.TlsOptions = new TlsOptions
   发送 / 消费 / 事务 / Forbidden / FilterMessage 钩子、ACL 签名、动态 NameServer 取址、故障规避选队列
 - ✅ 压缩：zlib / LZ4 / ZSTD；TLS：`SslStream`，test-mode 与严格校验 / mTLS
 - ✅ 客户端日志：按大小轮转、双写 stderr 与文件
-- ✅ 单元测试 1030 项；`rmq` 真机联调工具 40 条子命令（含主从、故障注入、压缩互通矩阵）
+- ✅ 单元测试 1033 项；`rmq` 真机联调工具 40 条子命令（含主从、故障注入、压缩互通矩阵）
 
 ## 客户端日志
 

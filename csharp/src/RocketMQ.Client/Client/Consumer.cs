@@ -2993,11 +2993,14 @@ public sealed class DefaultMQPushConsumer
 
     /// <summary>The pre-pull flow-control verdict -- five thresholds checked
     /// before enqueueing into the buffer, returning on the first hit in this
-    /// order (an earlier hit masks the later ones):
+    /// order (an earlier hit masks the later ones). Every cache gate compares
+    /// <b>strictly greater than</b> its threshold: a buffer that has reached it
+    /// exactly is still allowed to pull, so a threshold reads as "how many may be
+    /// cached", not "how many stop the pull".
     /// <list type="number">
-    /// <item>count &gt;= <c>PullThresholdForQueue</c> (<c>Math.max(1,n)</c>
+    /// <item>count &gt; <c>PullThresholdForQueue</c> (<c>Math.max(1,n)</c>
     /// guard: 0 also counts as 1)</item>
-    /// <item>bytes &gt;= <c>PullThresholdSizeForQueue</c>, in <b>MiB</b>
+    /// <item>bytes &gt; <c>PullThresholdSizeForQueue</c>, in <b>MiB</b>
     /// (&lt;=0 disables)</item>
     /// <item>span <b>strictly greater than</b> <c>ConsumeConcurrentlyMaxSpan</c>
     /// (max-min of queueOffset within the buffer)</item>
@@ -3065,11 +3068,11 @@ public sealed class DefaultMQPushConsumer
         }
 
         string? reason = null;
-        if (count >= Math.Max(1, _pullThresholdForQueue))
+        if (count > Math.Max(1, _pullThresholdForQueue))
         {
             reason = "count=" + count.ToString(CultureInfo.InvariantCulture);
         }
-        else if (_pullThresholdSizeForQueue > 0 && sizeMb >= _pullThresholdSizeForQueue)
+        else if (_pullThresholdSizeForQueue > 0 && sizeMb > _pullThresholdSizeForQueue)
         {
             reason = "size=" + sizeMb.ToString("F1", CultureInfo.InvariantCulture) + "MB";
         }
@@ -3091,14 +3094,30 @@ public sealed class DefaultMQPushConsumer
             return false;
         }
 
-        Interlocked.Increment(ref _flowControlTriggered);
+        long times = Interlocked.Increment(ref _flowControlTriggered);
         ClientLog.Debug("flow control: queue " + mq + " " + reason + ", pause pull");
+        if (IsFlowControlWarnTrip(times))
+        {
+            ClientLog.Warn("flow control: queue " + mq + " " + reason
+                + " exceeds its cache threshold, pause pull for " + CacheFlowControlBackoffMillis
+                + " ms (flowControlTimes=" + times.ToString(CultureInfo.InvariantCulture) + ")");
+        }
         return true;
     }
 
+    /// <summary>The number of trips between two WARN lines. A throttled queue trips a cache gate on
+    /// every pull round, so warning each round buries the signal in noise. Public for the same
+    /// reason as <c>FlowControlHitForTest</c>: the test project has no InternalsVisibleTo.</summary>
+    public const int FlowControlWarnEvery = 1000;
+
+    /// <summary>Whether the n-th (1-based) flow-control trip logs a WARN: the first, then every
+    /// <see cref="FlowControlWarnEvery"/>-th trip after it.</summary>
+    public static bool IsFlowControlWarnTrip(long times)
+        => times > 0 && (times - 1) % FlowControlWarnEvery == 0;
+
     /// <summary>Client-side cache threshold reached: pause this queue's pull
     /// for a full period before asking the broker again.</summary>
-    internal const int CacheFlowControlBackoffMillis = 100;
+    public const int CacheFlowControlBackoffMillis = 50;
 
     /// <summary>Broker-side flow control (response code 215) is a "busy right
     /// now" answer, NOT a capacity verdict on this client: retry early instead
@@ -3528,7 +3547,7 @@ public sealed class DefaultMQPushConsumer
             // (popThresholdForQueue)
             if (pq.WaitAckCount() > PopThresholdForQueue)
             {
-                Thread.Sleep(50);
+                Thread.Sleep(CacheFlowControlBackoffMillis);
                 continue;
             }
 

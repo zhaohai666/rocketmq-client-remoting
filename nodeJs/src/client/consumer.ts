@@ -74,7 +74,7 @@ import { registerRpcHooks } from '../remoting/rpc_hooks.ts';
 import { AclRPCHook } from '../remoting/acl.ts';
 import type { SocksProxyConfig } from '../remoting/socks_proxy.ts';
 import { getLogger } from '../logging.ts';
-import { RemotingTimeoutException } from '../remoting/exception.ts';
+import { MQBrokerException, RemotingTimeoutException } from '../remoting/exception.ts';
 
 const logger = getLogger('client.consumer');
 
@@ -103,7 +103,18 @@ const REBALANCE_INTERVAL = 20 * 1000;
 const REBALANCE_INTERVAL_DURING_STARTUP = 2 * 1000;
 const REBALANCE_STARTUP_WINDOW = 60 * 1000;
 const PULL_TIME_DELAY_MILLS_WHEN_FLOW_CONTROL = 50;
+// The BROKER refusing a pull because it is flow-controlling its own queues (215)
+// is a different event from this client's own cache threshold: nothing landed in
+// the local buffer and the request already round-tripped, so the queue is
+// readable again as soon as the broker's pressure drops — a shorter wait.
+export const PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL = 20;
+// Every other failed pull (a system error, a busy answer, a dead connection):
+// retrying hot adds pressure to whatever is already wrong.
+export const PULL_TIME_DELAY_MILLS_WHEN_PULL_FAILED = 500;
 const PULL_TIME_DELAY_MILLS_WHEN_EXCEPTION = 3000;
+// A throttled queue trips a cache gate on every pull round, so warning every round buries the
+// signal in noise: only every Nth trip warns (the first, then the 1001st, ...).
+const FLOW_CONTROL_WARN_EVERY = 1000;
 // PULL_TIME_DELAY_MILLS_WHEN_SUSPEND (1000ms): while suspend() is in effect the
 // pull/pop loops do not exit — they wait this long and re-check the gate.
 const PULL_TIME_DELAY_MILLS_WHEN_SUSPEND = 1000;
@@ -111,6 +122,29 @@ const INT32_MAX = 2147483647;
 const DEFAULT_CONSUMER_GROUP = 'DEFAULT_CONSUMER';
 
 export { MessageSelector };
+
+// isFlowControlWarnTrip reports whether the n-th (1-based) flow-control trip logs a WARN.
+export function isFlowControlWarnTrip(times: number): boolean {
+  return (times - 1) % FLOW_CONTROL_WARN_EVERY === 0;
+}
+
+// pullRetryDelayMillisFor maps a FAILED pull round to how long this queue's loop
+// waits before asking again:
+//   * the broker's own flow-control answer (215): the short pause — nothing landed
+//     in the local buffer and the queue is readable again as soon as the broker's
+//     pressure drops, so no rebalance and no threshold rescan;
+//   * anything else (a system error, a busy answer, a dead connection, or no code
+//     at all because the failure never reached the wire): the generic pause, since
+//     retrying hot at a sick broker adds pressure to whatever is already wrong.
+//
+// This client's OWN backlog threshold is not here: _flowControlHit stops the pull
+// before the request goes out and sleeps PULL_TIME_DELAY_MILLS_WHEN_FLOW_CONTROL,
+// so the two waits never meet.
+export function pullRetryDelayMillisFor(responseCode?: number): number {
+  return responseCode === ResponseCode.FLOW_CONTROL
+    ? PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL
+    : PULL_TIME_DELAY_MILLS_WHEN_PULL_FAILED;
+}
 
 // ConsumeReturnType — the ORDINAL is a wire-format value: a SubAfter trace
 // record stores it as contextCode. Do not reorder.
@@ -251,7 +285,7 @@ export class DefaultMQPushConsumer {
   popInvisibleTime = 60000;
   popBatchNums = 32;
   popShareQueueNum = 0;
-  popThresholdForQueue = 1000;
+  popThresholdForQueue = 96;
   // popQueueTable is the POP counterpart of processQueueTable. Only one of the
   // two is populated at a time; POP has no offset cursor, so the only state is
   // the outstanding-ACK debt per queue.
@@ -1237,7 +1271,8 @@ export class DefaultMQPushConsumer {
           logger.debug('pull long-poll timeout for %s (benign, will retry): %s', key, (e as Error).message);
         } else {
           logger.debug('pull error for %s: %s', key, (e as Error).message);
-          if (await this._sleepOrStop(500, stopFlag)) return;
+          const code = e instanceof MQBrokerException ? e.responseCode : undefined;
+          if (await this._sleepOrStop(pullRetryDelayMillisFor(code), stopFlag)) return;
         }
         continue;
       }
@@ -1350,7 +1385,11 @@ export class DefaultMQPushConsumer {
     else if (response.code === ResponseCode.PULL_NOT_FOUND) status = PullStatus.NO_NEW_MSG;
     else if (response.code === ResponseCode.PULL_OFFSET_MOVED) status = PullStatus.OFFSET_ILLEGAL;
     else if (response.code === ResponseCode.PULL_RETRY_IMMEDIATELY) status = PullStatus.NO_MATCHED_MSG;
-    else throw new Error(`pull failed: CODE ${response.code} ${response.remark || ''}`);
+    // The code rides on the exception: the loop's backoff branches on it (215 is
+    // the broker's own throttle and gets the short pause). A bare Error would
+    // leave the number only in the message text and silently disable that.
+    else throw new MQBrokerException(response.code,
+      `pull failed: CODE ${response.code} ${response.remark || ''}`, addr);
     const ext = response.extFields || {};
     const num = (k: string, d: number) => (ext[k] != null ? parseInt(ext[k], 10) : d);
     let found: MessageExt[] = [];
@@ -1406,8 +1445,10 @@ export class DefaultMQPushConsumer {
     return result;
   }
 
-  // _flowControlHit applies the ProcessQueue put/pull threshold
-  // checks. Any one of them pauses THIS queue's pulls.
+  // _flowControlHit applies the ProcessQueue put/pull threshold checks. Any one
+  // of them pauses THIS queue's pulls. Every cache gate compares STRICTLY GREATER
+  // THAN the threshold: a buffer that has reached it exactly is still allowed to
+  // pull, so a threshold reads as "how many may be cached", not "how many stop us".
   private _flowControlHit(mq: MessageQueue, pq: ProcessQueue): boolean {
     const [count, sizeMB, span] = pq.pendingStats();
     const maxCount = this.pullThresholdForQueue;
@@ -1416,8 +1457,8 @@ export class DefaultMQPushConsumer {
     const topicMaxCount = this.pullThresholdForTopic;
     const topicMaxSize = this.pullThresholdSizeForTopic;
     let reason = '';
-    if (count >= Math.max(1, maxCount)) reason = 'count';
-    else if (maxSize > 0 && sizeMB >= maxSize) reason = 'size';
+    if (count > Math.max(1, maxCount)) reason = 'count';
+    else if (maxSize > 0 && sizeMB > maxSize) reason = 'size';
     else if (maxSpan > 0 && span > maxSpan) reason = 'span';
     else if (topicMaxCount > 0 || topicMaxSize > 0) {
       const [topicCount, topicSizeMB] = this._topicPendingStats(mq.getTopic());
@@ -1427,6 +1468,11 @@ export class DefaultMQPushConsumer {
     if (!reason) return false;
     this.flowControlTriggered++;
     logger.debug('flow control: queue %s %s, pause pull', mqKey(mq), reason);
+    if (isFlowControlWarnTrip(this.flowControlTriggered)) {
+      logger.warn('flow control: queue %s %s exceeds its cache threshold, pause pull for %d ms'
+        + ' (flowControlTimes=%d)', mqKey(mq), reason, PULL_TIME_DELAY_MILLS_WHEN_FLOW_CONTROL,
+        this.flowControlTriggered);
+    }
     return true;
   }
 

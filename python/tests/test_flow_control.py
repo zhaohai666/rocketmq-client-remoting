@@ -3,17 +3,23 @@
 #   - Queue-level byte gate failing ⇒ large messages blow up the pulled-but-unconsumed pile (real-world symptom: OOM / RT spike, no exception);
 #   - Offset span gate failing ⇒ the head message keeps failing to consume while the rest piles up endlessly, and the offset span runs away;
 #   - Topic-level gate failing ⇒ multiple queues of the same topic act independently; no single queue is "over" but the instance total explodes.
-# The units have exactly one pitfall: the size threshold is **MiB**, not bytes; the span is **strictly greater** while count/bytes are **>=**.
+# The units have exactly one pitfall: the size threshold is **MiB**, not bytes. The comparison has one, too:
+# every cache gate is **strictly greater than** the threshold, so a buffer that has reached it exactly still pulls.
 #
-# This file locks the offline semantics of flow-control judgment: the hit direction and units of the five gates are pinned one by one.
+# This file locks the offline semantics of flow-control judgment: the hit direction and units of the five gates are pinned one by one,
+# plus the two stalls the gate can cause (the client's own cache threshold vs the broker's FLOW_CONTROL(215) reply).
 # For the real-machine side, "no message is lost after a gate hits", see ../verify_flow_control_live.py.
+import inspect
 import threading
 import time
 
 from client import consumer as consumer_mod
 from client.consumer import (DefaultMQPushConsumer, PopProcessQueue,
+                             FLOW_CONTROL_WARN_EVERY_N_TRIPS,
                              PULL_TIME_DELAY_WHEN_BROKER_FLOW_CONTROL,
-                             PULL_TIME_DELAY_WHEN_EXCEPTION)
+                             PULL_TIME_DELAY_WHEN_CACHE_FLOW_CONTROL,
+                             PULL_TIME_DELAY_WHEN_EXCEPTION,
+                             is_flow_control_warn_trip)
 from client.exception import MQBrokerException
 from common.message import MessageExt, MessageQueue
 from common.subscription_data import SubscriptionData
@@ -79,18 +85,24 @@ def test_defaults_only_the_count_gate_is_live():
     assert not _hit(c, mq)
 
 
-def test_count_gate_fires_at_threshold_and_treats_zero_as_one():
+def test_count_gate_fires_above_threshold_and_treats_zero_as_one():
     c = _consumer("G_fc_count")
     mq = _queue()
     _gates_off(c)
     c.pull_threshold_for_queue = 3
     _stage(c, mq, _n_sized(TOPIC, 100, 2))
     assert not _hit(c, mq)
+    # The gate is strictly greater: reaching the threshold exactly still pulls.
     _stage(c, mq, _n_sized(TOPIC, 100, 3))
+    assert not _hit(c, mq), "3 messages at threshold 3 must not hit (>, not >=)"
+    _stage(c, mq, _n_sized(TOPIC, 100, 4))
     assert _hit(c, mq)
     assert c._flow_control_triggered == 1
+    # threshold 0 is clamped to 1, which under ">" means "hit on the 2nd message" -- exactly what threshold 1 does.
     c.pull_threshold_for_queue = 0
     _stage(c, mq, _n_sized(TOPIC, 100, 1))
+    assert not _hit(c, mq), "the max(1,n) guard must agree with threshold=1: one cached message is not over it"
+    _stage(c, mq, _n_sized(TOPIC, 100, 2))
     assert _hit(c, mq), "pull_threshold_for_queue=0 must count as 1 message (the max(1,n) guard)"
 
 
@@ -101,9 +113,12 @@ def test_size_gate_is_in_mib_and_disabled_by_zero():
     c.pull_threshold_size_for_queue = 1          # 1 MiB
     _stage(c, mq, _n_sized(TOPIC, 300, 3))       # 900 B
     assert not _hit(c, mq)
-    # The unit is MiB, not bytes: exactly 1 MiB counts as a hit (>=)
+    # The unit is MiB, not bytes, and the gate is strictly greater: exactly 1 MiB does not hit.
     _stage(c, mq, [_sized(TOPIC, MIB, 0)])
-    assert _hit(c, mq), "exactly 1MiB must hit (>=, not >)"
+    assert not _hit(c, mq), "exactly 1MiB must not hit (>, not >=)"
+    # One byte over the boundary has to hit: this is what separates ">" from a sloppy "much greater".
+    _stage(c, mq, [_sized(TOPIC, MIB + 1, 0)])
+    assert _hit(c, mq), "1MiB+1B exceeds the 1MiB threshold"
     _stage(c, mq, _n_sized(TOPIC, 2 * MIB, 4))
     assert _hit(c, mq)
     # 0 = disable this gate; even a huge buffer is ignored
@@ -279,3 +294,100 @@ def test_plain_client_error_pull_loop_keeps_generic_backoff(monkeypatch):
                           MQBrokerException(ResponseCode.FLOW_CONTROL, "system busy")],
                          c, mq, key)
     assert delays == [0.5, 0.02], delays
+
+
+# ---------------- The client's own cache threshold vs the broker's 215 reply ----------------
+# Both stall the pull, for opposite reasons: the local buffer is full (wait for the listener to
+# drain it, 50ms) vs the broker is throttling (short retry, 20ms). Folding them into one delay, or
+# leaving the local one longer than the drain interval, either stalls a healthy queue or spins.
+
+def test_cache_flow_control_backoff_is_50ms_and_distinct_from_broker_215():
+    assert PULL_TIME_DELAY_WHEN_CACHE_FLOW_CONTROL == 0.05
+    assert PULL_TIME_DELAY_WHEN_BROKER_FLOW_CONTROL == 0.02
+    assert PULL_TIME_DELAY_WHEN_EXCEPTION == 0.5
+    # The pull-loop stall must actually use the constant, not a literal of its own.
+    src = inspect.getsource(DefaultMQPushConsumer._queue_pull_loop)
+    assert "PULL_TIME_DELAY_WHEN_CACHE_FLOW_CONTROL" in src
+    assert "time.sleep(0.1)" not in src
+
+
+def test_full_cache_pauses_the_pull_for_50ms_without_touching_the_broker(monkeypatch):
+    c, mq, key = _error_loop_consumer("G_fc_cache_pause")
+
+    def _setup():
+        _gates_off(c)
+        c.pull_threshold_for_queue = 1
+        _stage(c, mq, _n_sized(TOPIC, 100, 2))   # 2 messages over a threshold of 1
+
+    delays = _drive_loop(monkeypatch, "_queue_pull_loop", "pull_message", [], c, mq, key, setup=_setup)
+    assert delays == [PULL_TIME_DELAY_WHEN_CACHE_FLOW_CONTROL], delays
+    assert c._flow_control_triggered == 1
+
+
+def test_buffer_at_the_threshold_pulls_instead_of_stalling(monkeypatch):
+    # Paired control: one message exactly AT the threshold must not pause, so the loop reaches the
+    # broker and records the *error* backoff instead of the cache one.
+    c, mq, key = _error_loop_consumer("G_fc_cache_pass")
+
+    def _setup():
+        _gates_off(c)
+        c.pull_threshold_for_queue = 1
+        _stage(c, mq, _n_sized(TOPIC, 100, 1))   # 1 message at a threshold of 1
+
+    delays = _drive_loop(monkeypatch, "_queue_pull_loop", "pull_message",
+                         [RuntimeError("socket reset")], c, mq, key, setup=_setup)
+    assert delays == [PULL_TIME_DELAY_WHEN_EXCEPTION], delays
+    assert c._flow_control_triggered == 0
+
+
+# ---------------- The warn cadence ----------------
+# A throttled queue trips the gate on every pull round. Warning every round buries the message in
+# noise; warning never loses the only signal that the buffer is full. So: one warn per 1000 trips.
+
+def test_warn_cadence_is_the_first_trip_and_every_1000th_after():
+    assert FLOW_CONTROL_WARN_EVERY_N_TRIPS == 1000
+    assert is_flow_control_warn_trip(1)
+    assert is_flow_control_warn_trip(1001)
+    assert is_flow_control_warn_trip(2001)
+    assert not is_flow_control_warn_trip(2)
+    assert not is_flow_control_warn_trip(1000)
+    assert not is_flow_control_warn_trip(1002)
+
+
+def _warns(caplog):
+    return [r.getMessage() for r in caplog.records
+            if r.levelname == "WARNING" and "flow control" in r.getMessage()]
+
+
+def test_gate_warns_on_the_first_trip_and_stays_quiet_on_the_next(caplog):
+    c = _consumer("G_fc_warn_cadence")
+    mq = _queue()
+    _gates_off(c)
+    c.pull_threshold_for_queue = 1
+    _stage(c, mq, _n_sized(TOPIC, 100, 2))
+    with caplog.at_level("WARNING"):
+        assert _hit(c, mq)
+        assert len(_warns(caplog)) == 1, "the 1st trip must warn"
+        assert _hit(c, mq)
+        assert len(_warns(caplog)) == 1, "the 2nd trip must stay on the debug channel only"
+        # Jump to the boundary and warn again: this pins the modulo, not "warn once and stop".
+        c._flow_control_triggered = FLOW_CONTROL_WARN_EVERY_N_TRIPS
+        assert _hit(c, mq)
+        assert len(_warns(caplog)) == 2, "trip 1001 must warn again"
+    assert "pause pull for 50 ms" in _warns(caplog)[0]
+
+
+def test_gate_debug_records_every_trip(caplog):
+    # The debug channel keeps the per-trip detail; only the warn is rate-limited.
+    c = _consumer("G_fc_debug")
+    mq = _queue()
+    _gates_off(c)
+    c.pull_threshold_for_queue = 1
+    _stage(c, mq, _n_sized(TOPIC, 100, 2))
+    with caplog.at_level("DEBUG", logger="rocketmq.client"):
+        for _ in range(3):
+            assert _hit(c, mq)
+        debugs = [r.getMessage() for r in caplog.records
+                  if r.levelname == "DEBUG" and "flow control" in r.getMessage()]
+    assert len(debugs) == 3
+    assert c._flow_control_triggered == 3

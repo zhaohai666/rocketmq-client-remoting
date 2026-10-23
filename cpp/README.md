@@ -51,10 +51,10 @@ cd build && ctest --output-on-failure
 
 ```
 100% tests passed out of 68
-Total Test time (real) = 117.65 sec
+Total Test time (real) = 118.49 sec
 ```
 
-68 个用例 = 67 个测试二进制（4795 项断言）+ 1 个编解码互调用例（73 项断言），共 **4868 项断言**。
+68 个用例 = 67 个测试二进制（5820 项断言）+ 1 个编解码互调用例（73 项断言），共 **5893 项断言**。
 
 不依赖集群的协议层自检：
 

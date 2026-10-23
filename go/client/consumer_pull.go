@@ -170,6 +170,8 @@ func (c *DefaultMQPushConsumer) pullCursor(mq common.MessageQueue) (int64, bool)
 	return next, true
 }
 
+// The cache gates all compare **strictly greater than** the threshold: a buffer that has reached
+// the threshold exactly is still allowed to pull, so a threshold reads as "how many may be cached".
 //   - pullThresholdForQueue (1000): buffered message COUNT;
 //   - pullThresholdSizeForQueue (100 MB): buffered bytes;
 //   - consumeConcurrentlyMaxSpan (2000): the offset SPAN of the buffer, so one
@@ -188,9 +190,9 @@ func (c *DefaultMQPushConsumer) flowControlHit(mq common.MessageQueue, pq *proce
 
 	reason := ""
 	switch {
-	case int64(count) >= maxInt64(1, maxCount):
+	case int64(count) > maxInt64(1, maxCount):
 		reason = "count"
-	case maxSize > 0 && sizeMB >= float64(maxSize):
+	case maxSize > 0 && sizeMB > float64(maxSize):
 		reason = "size"
 	case maxSpan > 0 && span > maxSpan:
 		reason = "span"
@@ -207,9 +209,23 @@ func (c *DefaultMQPushConsumer) flowControlHit(mq common.MessageQueue, pq *proce
 	}
 	c.mu.Lock()
 	c.flowControlTriggered++
+	times := c.flowControlTriggered
 	c.mu.Unlock()
 	common.LogDebugf("flow control: queue %v %s, pause pull", mq, reason)
+	if isFlowControlWarnTrip(times) {
+		common.LogWarnf("flow control: queue %v %s exceeds its cache threshold, pause pull for %s (flowControlTimes=%d)",
+			mq, reason, pullTimeDelayMillsWhenFlowControl, times)
+	}
 	return true
+}
+
+// flowControlWarnEvery is the trip count between two WARN lines: a throttled queue trips a gate on
+// every pull round, so warning each round buries the signal in noise.
+const flowControlWarnEvery = 1000
+
+// isFlowControlWarnTrip reports whether the n-th (1-based) flow-control trip logs a WARN.
+func isFlowControlWarnTrip(times int64) bool {
+	return (times-1)%flowControlWarnEvery == 0
 }
 
 func (c *DefaultMQPushConsumer) topicPendingStats(topic string) (int, float64) {

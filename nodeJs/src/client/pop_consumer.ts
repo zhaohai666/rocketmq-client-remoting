@@ -33,7 +33,7 @@ import { AckMessageRequestHeader, ChangeInvisibleTimeRequestHeader, PopMessageRe
 import { MESSAGE_REQUEST_MODE_POP } from '../remoting/pop_bodies.ts';
 import { ResponseCode } from '../remoting/codes.ts';
 import { isLogicalQueueMockBrokerName } from '../remoting/static_topic.ts';
-import { RemotingTimeoutException } from '../remoting/exception.ts';
+import { MQBrokerException, RemotingTimeoutException } from '../remoting/exception.ts';
 import { ConsumeConcurrentlyContext, ConsumeConcurrentlyStatus } from './consumer_result.ts';
 import { ConsumeMessageContext } from './hook.ts';
 import { getLogger } from '../logging.ts';
@@ -94,7 +94,10 @@ export async function queuePopLoop(c: DefaultMQPushConsumer, mq: MessageQueue, s
     try {
       result = await popOnce(c, mq, sub);
     } catch (e) {
-      const code = (e as any).code;
+      // The code lives on MQBrokerException.responseCode — the field the remoting
+      // layer fills in — so reading anything else here silently disables the
+      // branch below and every throttled queue falls back to the long wait.
+      const code = e instanceof MQBrokerException ? e.responseCode : undefined;
       if (code === ResponseCode.FLOW_CONTROL) {
         // Broker-side flow control: back off briefly, do not rescan.
         if (await c._sleepOrStop(POP_DELAY_WHEN_BROKER_FLOW, stopFlag)) return;

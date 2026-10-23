@@ -795,6 +795,15 @@ pub const PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL: u64 = 50;
 pub const PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL: u64 = 20;
 /// Polling interval after `suspend()`.
 pub const PULL_TIME_DELAY_MILLS_WHEN_SUSPEND: u64 = 1000;
+/// A throttled queue trips a cache gate on every pull round, so warning every round buries the
+/// signal: only every Nth trip warns.
+pub const FLOW_CONTROL_WARN_EVERY: usize = 1000;
+
+/// Whether the n-th (1-based) flow-control trip is one that logs a warn: the 1st, then every
+/// [`FLOW_CONTROL_WARN_EVERY`]-th trip after it.
+pub fn is_flow_control_warn_trip(times: usize) -> bool {
+    times > 0 && (times - 1) % FLOW_CONTROL_WARN_EVERY == 0
+}
 
 impl Drop for Inner {
     /// Forgetting `shutdown()` must not leave loops still running (see the same-named note in the producer module header).
@@ -2694,6 +2703,9 @@ fn update_msg_acc_cnt(inner: &Inner, key: &str, msgs: &[MessageExt]) {
     }
 }
 
+/// Whether the cache gates pause this queue's pull. Every gate compares **strictly greater than**
+/// its threshold, so a buffer that has reached the threshold exactly is still allowed to pull and
+/// a threshold reads as "how many may be cached".
 fn flow_control_hit(inner: &Inner, mq: &MessageQueue, key: &str) -> bool {
     let cfg = read_cfg(inner);
     let (count, size_mb, span, topic_pending) = {
@@ -2722,10 +2734,10 @@ fn flow_control_hit(inner: &Inner, mq: &MessageQueue, key: &str) -> bool {
             .collect();
         (count, size_mb, span, topic_pending)
     };
-    let reason: Option<String> = if count >= cfg.pull_threshold_for_queue.max(1) as usize {
+    let reason: Option<String> = if count > cfg.pull_threshold_for_queue.max(1) as usize {
         Some(format!("count={count}"))
     } else if cfg.pull_threshold_size_for_queue > 0
-        && size_mb >= f64::from(cfg.pull_threshold_size_for_queue)
+        && size_mb > f64::from(cfg.pull_threshold_size_for_queue)
     {
         Some(format!("size={size_mb:.1}MB"))
     } else if cfg.consume_concurrently_max_span > 0 && span > cfg.consume_concurrently_max_span {
@@ -2755,8 +2767,14 @@ fn flow_control_hit(inner: &Inner, mq: &MessageQueue, key: &str) -> bool {
     match reason {
         None => false,
         Some(reason) => {
-            inner.flow_control_triggered.fetch_add(1, Ordering::SeqCst);
+            let times = inner.flow_control_triggered.fetch_add(1, Ordering::SeqCst) + 1;
             rmq_debug!("flow control: queue {key} {reason}, pause pull");
+            if is_flow_control_warn_trip(times) {
+                rmq_warn!(
+                    "flow control: queue {key} {reason} exceeds its cache threshold, pause pull for \
+                     {PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL} ms (flowControlTimes={times})"
+                );
+            }
             true
         }
     }
@@ -5434,6 +5452,7 @@ mod tests {
         assert_eq!(PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL, 50);
         assert_eq!(PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL, 20);
         assert_eq!(PULL_TIME_DELAY_MILLS_WHEN_SUSPEND, 1000);
+        assert_eq!(FLOW_CONTROL_WARN_EVERY, 1000);
     }
 
     /// Parameter wiring of the public send-back: errors when not started; broker name comes from the message / explicit argument.
@@ -6258,18 +6277,52 @@ mod tests {
             &mq,
             vec![sized_msg(100, 0), sized_msg(100, 1), sized_msg(100, 2)],
         );
-        assert!(flow_control_hit(&consumer.inner, &mq, &key), "count >= 3");
-        assert_eq!(triggered(), 1);
+        assert!(
+            !flow_control_hit(&consumer.inner, &mq, &key),
+            "exactly the threshold 3 is still allowed to pull (strictly greater)"
+        );
+        assert_eq!(triggered(), 0, "a round that does not trip counts nothing");
+        stage(
+            &consumer,
+            &mq,
+            vec![
+                sized_msg(100, 0),
+                sized_msg(100, 1),
+                sized_msg(100, 2),
+                sized_msg(100, 3),
+            ],
+        );
+        assert!(flow_control_hit(&consumer.inner, &mq, &key), "count 4 > 3");
+        assert_eq!(triggered(), 1, "one trip, one counted hit");
+
+        // The clamp keeps a zero threshold meaningful: it reads as one, so it trips on the
+        // second message rather than on the first.
+        only(&consumer, |c| c.pull_threshold_for_queue = 0);
+        stage(&consumer, &mq, vec![sized_msg(100, 0)]);
+        assert!(
+            !flow_control_hit(&consumer.inner, &mq, &key),
+            "a zero threshold clamps to one, so a single message still pulls"
+        );
+        stage(&consumer, &mq, vec![sized_msg(100, 0), sized_msg(100, 1)]);
+        assert!(
+            flow_control_hit(&consumer.inner, &mq, &key),
+            "a zero threshold trips on the second message, not the first"
+        );
 
         // Size: pullThresholdSizeForQueue's unit is MiB
         only(&consumer, |c| c.pull_threshold_size_for_queue = 1);
         assert!(!flow_control_hit(&consumer.inner, &mq, &key), "300B < 1MiB");
+        stage(&consumer, &mq, vec![sized_msg(1024 * 1024, 0)]);
+        assert!(
+            !flow_control_hit(&consumer.inner, &mq, &key),
+            "exactly 1 MiB is still allowed under a 1 MiB threshold (strictly greater)"
+        );
         stage(
             &consumer,
             &mq,
             vec![sized_msg(1024 * 1024, 0), sized_msg(1024 * 1024, 1)],
         );
-        assert!(flow_control_hit(&consumer.inner, &mq, &key), "2MiB >= 1MiB");
+        assert!(flow_control_hit(&consumer.inner, &mq, &key), "2MiB > 1MiB");
 
         only(&consumer, |c| c.consume_concurrently_max_span = 10);
         stage(&consumer, &mq, vec![sized_msg(1, 0), sized_msg(1, 100)]);
@@ -6316,6 +6369,48 @@ mod tests {
         let plain = DefaultMQPushConsumer::new("G").unwrap();
         stage(&plain, &mq, vec![sized_msg(1, 0)]);
         assert!(!flow_control_hit(&plain.inner, &mq, &key));
+    }
+
+    /// A throttled queue trips on every pull round, so the warn is throttled too: the 1st trip and
+    /// then every [`FLOW_CONTROL_WARN_EVERY`]-th after it. The predicate is pinned directly, and the
+    /// wiring is pinned against the counter the getter exposes -- a helper tested in isolation but
+    /// wired to a different variable would pass the pure assertions and still warn every round.
+    #[test]
+    fn flow_control_warn_cadence_is_the_first_trip_and_every_1000th_after() {
+        for n in [1usize, 1001, 2001] {
+            assert!(is_flow_control_warn_trip(n), "trip {n} must log a warn");
+        }
+        // Control: the trips in between stay on the debug channel only. A cadence degraded to
+        // "warn always" or "warn once and stop" is caught here, not by the boundaries above.
+        for n in [0usize, 2, 999, 1000, 1002, 2000] {
+            assert!(
+                !is_flow_control_warn_trip(n),
+                "trip {n} must not log a warn"
+            );
+        }
+
+        let consumer = DefaultMQPushConsumer::new("G_fc_warn_cadence").unwrap();
+        let mq = queue("T", "broker-a", 0);
+        let key = mq_key(&mq);
+        only(&consumer, |c| c.pull_threshold_for_queue = 1);
+        stage(&consumer, &mq, vec![sized_msg(100, 0), sized_msg(100, 1)]);
+        for round in 1..=1000_usize {
+            assert!(
+                flow_control_hit(&consumer.inner, &mq, &key),
+                "round {round} must pause"
+            );
+        }
+        assert_eq!(consumer.flow_control_triggered(), 1000);
+        assert!(
+            !is_flow_control_warn_trip(consumer.flow_control_triggered()),
+            "1000 rounds leave the cadence silent"
+        );
+        assert!(flow_control_hit(&consumer.inner, &mq, &key));
+        assert_eq!(consumer.flow_control_triggered(), 1001);
+        assert!(
+            is_flow_control_warn_trip(consumer.flow_control_triggered()),
+            "the 1001st round is the next warn"
+        );
     }
 
     #[test]

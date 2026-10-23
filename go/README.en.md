@@ -15,7 +15,7 @@ rebalance, pull loops and offset commits are handled by periodic goroutines insi
 - Layers: `remoting` (wire protocol + long-connection transport) → `common` (message model,
   codecs, compression, constants) → `client` (Producer / Push / Pull / LitePull / Admin /
   transaction / trace)
-- Verified against a **RocketMQ 5.5.1** cluster: 15 live tools plus 759 unit tests
+- Verified against a **RocketMQ 5.5.1** cluster: 15 live tools plus 767 unit tests
 
 ## Prerequisites
 
@@ -55,10 +55,10 @@ Measured result of `go test ./... -count=1` (all three test packages `ok`):
 
 | Package | Test functions | Time |
 | --- | --- | --- |
-| `client` | 439 | 45.5s |
-| `common` | 135 | 3.3s |
-| `remoting` | 185 | 1.5s |
-| **Total** | **759** (68 `*_test.go` files) | ~50s |
+| `client` | 447 | 45.1s |
+| `common` | 135 | 1.7s |
+| `remoting` | 185 | 1.0s |
+| **Total** | **767** (69 `*_test.go` files) | ~48s |
 
 To count them yourself: `go test ./client/ -list '.*' | grep -c '^Test'`. Concurrency
 regression on its own:
@@ -573,7 +573,7 @@ go/
 │   ├── trace.go · trace_hook.go · trace_dispatcher.go · trace_context.go
 │   ├── consumer_stats.go · stats_item.go · consumer_running_info.go · fault_strategy.go
 │   ├── consume_directly.go · jsonutil.go
-│   └── *_test.go                   68 test files, 759 test functions
+│   └── *_test.go                   69 test files, 767 test functions
 └── examples/                   17 executables (see "Live Cluster Verification")
 ```
 

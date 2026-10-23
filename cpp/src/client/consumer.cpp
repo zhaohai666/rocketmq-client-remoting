@@ -952,8 +952,10 @@ bool DefaultMQPushConsumer::pullStalled(const std::string& key) const {
 
 bool DefaultMQPushConsumer::flowControlHit(const MessageQueue& mq, const std::string& key) {
     // The five flow-control thresholds of a ProcessQueue: first the three queue-level ones (message count, bytes,
-    // offset span), then the two topic-level cumulative ones. The byte threshold is in MiB; the span is max-min of the
-    // pending queueOffsets and counts only when strictly greater.
+    // offset span), then the two topic-level cumulative ones. Every cache gate is **strictly greater
+    // than** its threshold, so a threshold reads as "how many may be cached" and a buffer that has
+    // reached it exactly still gets to pull. The byte threshold is in MiB; the span is max-min of the
+    // pending queueOffsets.
     // Other queues are walked only when topic-level thresholds are enabled, otherwise one check would scan the whole table needlessly.
     size_t count = 0;
     double sizeMb = 0.0;
@@ -998,9 +1000,9 @@ bool DefaultMQPushConsumer::flowControlHit(const MessageQueue& mq, const std::st
 
     char number[32] = {0};
     std::string reason;
-    if (count >= static_cast<size_t>(std::max(1, pullThresholdForQueue_))) {
+    if (count > static_cast<size_t>(std::max(1, pullThresholdForQueue_))) {
         reason = "count=" + std::to_string(count);
-    } else if (pullThresholdSizeForQueue_ > 0 && sizeMb >= pullThresholdSizeForQueue_) {
+    } else if (pullThresholdSizeForQueue_ > 0 && sizeMb > pullThresholdSizeForQueue_) {
         std::snprintf(number, sizeof(number), "%.1f", sizeMb);
         reason = std::string("size=") + number + "MB";
     } else if (consumeConcurrentlyMaxSpan_ > 0 && span > consumeConcurrentlyMaxSpan_) {
@@ -1013,8 +1015,14 @@ bool DefaultMQPushConsumer::flowControlHit(const MessageQueue& mq, const std::st
         reason = std::string("topicSize=") + number + "MB";
     }
     if (reason.empty()) return false;
-    flowControlTriggered_.fetch_add(1);
+    const int64_t times = flowControlTriggered_.fetch_add(1) + 1;
     logger_debug("flow control: queue " + mq.toString() + " " + reason + ", pause pull");
+    if (isFlowControlWarnTrip(times)) {
+        logger_warn("flow control: queue " + mq.toString() + " " + reason
+                    + " exceeds its cache threshold, pause pull for "
+                    + std::to_string(kPullPauseWhenClientFlowControl) + " ms (flowControlTimes="
+                    + std::to_string(times) + ")");
+    }
     return true;
 }
 
@@ -1325,7 +1333,8 @@ void DefaultMQPushConsumer::queuePopLoop(const MessageQueue& mq, uint64_t token)
         }
         // Flow control: too many popped-but-unacked messages, so hold back first (popThresholdForQueue)
         if (pq->waitAckCount() > popThresholdForQueue_) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(kPullPauseWhenClientFlowControl));
             continue;
         }
         const int64_t began = UtilAll::currentTimeMillis();

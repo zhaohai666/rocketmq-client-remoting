@@ -106,6 +106,15 @@ constexpr int32_t kPullPauseWhenBrokerFlowControl = 20;
 // Every other broker error on the pull path (topic not created yet, subscription not latest, ...).
 constexpr int32_t kPullPauseWhenPullError = 500;
 
+// A throttled queue trips a cache gate on every pull round, so warning every round buries the
+// signal in noise: only every kFlowControlWarnEvery-th trip warns (the 1st, then the 1001st, ...).
+constexpr int64_t kFlowControlWarnEvery = 1000;
+
+// Whether the n-th (1-based) flow-control trip is one that logs a WARN.
+inline bool isFlowControlWarnTrip(int64_t times) {
+    return times > 0 && (times - 1) % kFlowControlWarnEvery == 0;
+}
+
 // POP initial-offset mode (protocol parameter ConsumeInitMode)
 enum class ConsumeInitMode : int32_t { MIN = 0, MAX = 1 };
 

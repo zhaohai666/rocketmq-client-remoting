@@ -54,11 +54,11 @@ This produces the static library `build/librocketmq_remoting.a` (alias `rocketmq
 
 ```
 100% tests passed out of 68
-Total Test time (real) = 117.65 sec
+Total Test time (real) = 118.49 sec
 ```
 
-The 68 cases are the 67 test binaries (4795 assertions) plus 1 codec-interop case
-(73 assertions): **4868 assertions in total**.
+The 68 cases are the 67 test binaries (5820 assertions) plus 1 codec-interop case
+(73 assertions): **5893 assertions in total**.
 
 The protocol-layer self-check needs no cluster:
 

@@ -28,11 +28,11 @@ python3 -m venv .venv
 .venv/bin/pip install -e .                     # top-level packages: client / common / remoting
 
 .venv/bin/pip install pytest                   # needed only to run the unit tests
-.venv/bin/python -m pytest tests/ -q           # 1626 passed, 4 skipped
+.venv/bin/python -m pytest tests/ -q           # 1632 passed, 4 skipped
 .venv/bin/python selfcheck.py                  # selfcheck: 7/7 passed
 ```
 
-- `pytest` collects 1630 cases and all of them run offline — no cluster needed. The 4 skips all come
+- `pytest` collects 1636 cases and all of them run offline — no cluster needed. The 4 skips all come
   from `tests/test_protocol_alignment.py` (an optional protocol-constant cross-check, off by default).
 - `selfcheck.py` runs 7 encode/decode round-trips of the protocol itself (JSON header / binary header /
   V2 short-field header / 17-segment storage format / long-topic V2 magic / 6-segment batch format /
@@ -533,7 +533,7 @@ python/
 ├── rocketmq_logging.py     logging bridge
 ├── selfcheck.py            cluster-free protocol round trips (7 checks)
 ├── __main__.py             command entry (python -m selfcheck)
-├── tests/                  1630 offline cases (conftest.py puts python/ on sys.path)
+├── tests/                  1636 offline cases (conftest.py puts python/ on sys.path)
 ├── verify_*_live.py        live-cluster scripts (see Live Cluster Verification)
 ├── integration_live_test.py / ns_failover_repro.py / go_*_check.py  helper scripts
 ├── pyproject.toml          no runtime dependencies; requires-python >= 3.8
