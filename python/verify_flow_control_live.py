@@ -176,10 +176,14 @@ def main() -> int:
     check("S2-everything is still consumed after the span is exceeded", len(got2) == 14, "got=%d" % len(got2))
     c2.shutdown()
 
-    # ---------- S3 topic-level count gate ----------
-    # All three queue-level gates are pushed to not hit, leaving only the topic level: only cross-queue accumulation can hit it (if queues acted independently it would never hit).
+    # ---------- S3 topic-level count knob: divided into the per-queue quota ----------
+    # The queue-level count knob is set to its upper bound, so no queue could pause on its own config: only the
+    # rebalance division of the topic knob (topic threshold // queues this instance owns) can bring the count gate
+    # down to a value the slow consumer actually exceeds. Asserting the divided value plus the hit proves the
+    # division runs live and that the gate enforces the quotient rather than any cross-queue sum.
     t3 = PREFIX + "_Topic"
     prepare_topic(t3, queues=4)
+    topic_count_threshold = 8
     c3 = run_gate_case(
         "S3", producer, t3, PREFIX + "_g3",
         [Message(t3, (b"t-%d" % i)) for i in range(16)],
@@ -187,11 +191,17 @@ def main() -> int:
         thresholds={"pull_threshold_for_queue": OFF_COUNT,
                     "pull_threshold_size_for_queue": OFF_SIZE_MB,
                     "consume_concurrently_max_span": OFF_COUNT,
-                    "pull_threshold_for_topic": 4})
+                    "pull_threshold_for_topic": topic_count_threshold})
     got3 = c3.recorder.snapshot()
-    check("S3-the topic-level count gate really hits live", c3._flow_control_triggered > 0,
+    owned = len(c3._mq_map)
+    expected_per_queue = max(1, topic_count_threshold // owned) if owned else OFF_COUNT
+    check("S3-the topic knob was divided into the per-queue quota on assignment change",
+          owned > 0 and c3.pull_threshold_for_queue == expected_per_queue,
+          "owned=%d topic=%d perQueue=%d expected=%d"
+          % (owned, topic_count_threshold, c3.pull_threshold_for_queue, expected_per_queue))
+    check("S3-the divided per-queue quota really hits live", c3._flow_control_triggered > 0,
           "triggered=%d" % c3._flow_control_triggered)
-    check("S3-everything is still consumed after cross-queue accumulation", len(got3) == 16, "got=%d" % len(got3))
+    check("S3-everything is still consumed after the divided quota pauses the pull", len(got3) == 16, "got=%d" % len(got3))
     c3.shutdown()
 
     # ---------- S4 a queue that hit flow control resumes consuming after recovery ----------

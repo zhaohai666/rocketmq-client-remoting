@@ -243,8 +243,10 @@ add_executable(rmq_test_pull_expired test_pull_expired.cpp)
 target_link_libraries(rmq_test_pull_expired PRIVATE rocketmq::remoting)
 add_test(NAME pull_expired COMMAND rmq_test_pull_expired)
 
-# The five pre-pull flow-control thresholds (ProcessQueue backlog watermarks): only the message-count one is hit first in a small-message scenario; the other four
-# judge direction silently (a byte/span/topic-level gate failing => buffers pile up unbounded), so they must be pinned offline before going to a real machine.
+# The three per-queue pre-pull flow-control thresholds (ProcessQueue backlog watermarks) plus the topic-budget
+# division that feeds them: only the message-count gate is hit first in a small-message scenario; the other two
+# judge direction silently (a byte/span gate failing => buffers pile up unbounded), and a division mistake silently
+# collapses or inflates every gate at once, so all of it must be pinned offline before going to a real machine.
 add_executable(rmq_test_flow_control test_flow_control.cpp)
 target_link_libraries(rmq_test_flow_control PRIVATE rocketmq::remoting)
 add_test(NAME flow_control COMMAND rmq_test_flow_control)

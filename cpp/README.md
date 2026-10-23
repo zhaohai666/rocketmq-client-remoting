@@ -51,10 +51,10 @@ cd build && ctest --output-on-failure
 
 ```
 100% tests passed out of 68
-Total Test time (real) = 118.49 sec
+Total Test time (real) = 94.16 sec
 ```
 
-68 个用例 = 67 个测试二进制（5820 项断言）+ 1 个编解码互调用例（73 项断言），共 **5893 项断言**。
+68 个用例 = 67 个测试二进制（5868 项断言）+ 1 个编解码互调用例（73 项断言），共 **5941 项断言**。
 
 不依赖集群的协议层自检：
 
@@ -589,7 +589,7 @@ broker 侧的订阅表、位点与轨迹才落在预期的组上。
 | `rmq_live_send_header` | 发送头 `c` / `d` / `n` 三字段与自动建 topic 的队列数 | — |
 | `rmq_live_pinned_guard` | 定点发送的 topic 守卫：拒在本端、broker 无痕 | — |
 | `rmq_live_producer_unregister` | 退出时向每台 broker 注销 clientId(35) | — |
-| `rmq_live_flow_control` | 拉取前流控五个阈值命中且一条不丢 | — |
+| `rmq_live_flow_control` | 拉取前的三个单队列阈值命中（topic 预算在重平衡时按队列数拆分进它们）且一条不丢 | — |
 | `rmq_live_correct_tags_offset` | 空应答也把已提交位点推到 maxOffset | — |
 | `rmq_live_offset_illegal` | 位点被纠正时整批作废并按修正值重建 | — |
 | `rmq_live_reset_offset` | 220 重置位点：立刻落盘 + 在途批次作废 + 队列重建 | — |

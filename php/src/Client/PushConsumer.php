@@ -134,6 +134,12 @@ final class DefaultMQPushConsumer
     public int $consumeConcurrentlyMaxSpan = 2000;
     public int $pullThresholdForQueue = 1000;
     public int $pullThresholdSizeForQueue = 100;
+    /**
+     * Topic-level cache budgets, enforced by DIVISION and not by a pull-time sum: every enabled knob
+     * (-1 means off) is split over the queues this consumer owns when a rebalance changes that set,
+     * and the quotients become ``pullThresholdForQueue`` / ``pullThresholdSizeForQueue`` (see
+     * divideTopicThresholds()). The pull-time gate never reads these two fields.
+     */
     public int $pullThresholdForTopic = -1;
     public int $pullThresholdSizeForTopic = -1;
     public int $pullInterval = 0;
@@ -1184,6 +1190,9 @@ final class DefaultMQPushConsumer
 
     public function doRebalance(): void
     {
+        // The broker-side POP assignment does not rebuild the queue set here: the QUERY_ASSIGNMENT
+        // round applies it through applyPopAssignment(), which owns popQueues (through
+        // rebalancePullState()) and runs the same divide-on-change on its own changed-set check.
         if ($this->usesBrokerPopAssignment()) {
             $this->runPopAssignmentRound();
             return;
@@ -1246,7 +1255,11 @@ final class DefaultMQPushConsumer
         foreach ($newAssigned as $key => $mq) {
             $now[$key] = true;
         }
-        if ($now != $was) {
+        // A SET comparison, not a size one: losing a queue while gaining another keeps the count
+        // but changes who owns what, and every topic budget has to be re-split over the new set.
+        // The same verdict decides the log line and the division at the end of this method.
+        $changed = ($now != $was);
+        if ($changed) {
             Logger::info(sprintf(
                 'rebalance result changed, group=%s clientId=%s assigned=%d',
                 $this->consumerGroup,
@@ -1276,6 +1289,69 @@ final class DefaultMQPushConsumer
             }
         }
         $this->rebalancePullState();
+        // The topic budgets become per-queue knobs here -- AFTER the pull state for this round was
+        // rebuilt, so the division runs over the count THIS round produced (a shrink from 4 queues
+        // to 2 divides by 2, not by 4) -- and only when the assignment CHANGED: an identical round
+        // owns the same queues, so re-dividing would only overwrite a knob the user set by hand.
+        if ($changed) {
+            $this->divideTopicThresholds();
+        }
+    }
+
+    /**
+     * Split every enabled topic-level cache budget into the matching per-queue knob: this is the
+     * ONLY way a topic budget is enforced, and the pull-time gate never looks at the topic knobs or
+     * adds up the sibling queues.
+     *
+     * The divisor `n` is the number of queues this consumer owns right now, read from the live
+     * per-queue pull-state table of the current consumption mode (``mqMap`` on the classic pull
+     * path, ``popQueues`` under POP). Those tables are keyed per queue and hold every topic this
+     * consumer subscribes to, so `n` counts queues across ALL topics -- a topic-wide budget is a
+     * budget for this client as a whole, not for one of its topics.
+     *
+     * The numerator is ALWAYS the topic knob, never the current per-queue value, so repeating the
+     * division with an unchanged queue count writes the same number again (1000 over 8 queues is
+     * 125, not the 250 the previous round of 4 queues wrote). That is also why the user's own
+     * per-queue value is deliberately overwritten while a topic knob is enabled: the queue count is
+     * the only thing that can make a topic-wide budget meaningful per queue, and a getter therefore
+     * shows the divided number rather than the configured one.
+     *
+     * A quotient of 0 would mean "no message may ever be cached" and stall the queue forever, so
+     * every division is floored at 1. With nothing owned there is no divisor, so both knobs stay
+     * exactly as the user set them.
+     *
+     * Units match the gate that reads them: ``pullThresholdForTopic`` is a message count and
+     * ``pullThresholdSizeForTopic`` is in MB, the same unit ``flowControlHit`` compares the queue's
+     * buffered MB against.
+     */
+    private function divideTopicThresholds(): void
+    {
+        $owned = $this->popMode ? count($this->popQueues) : count($this->mqMap);
+        if ($owned === 0) {
+            return;
+        }
+        if ($this->pullThresholdForTopic !== -1) {
+            $to = max(1, intdiv($this->pullThresholdForTopic, $owned));
+            if ($to !== $this->pullThresholdForQueue) {
+                Logger::info(sprintf(
+                    'The pullThresholdForQueue is changed from %d to %d',
+                    $this->pullThresholdForQueue,
+                    $to,
+                ));
+                $this->pullThresholdForQueue = $to;
+            }
+        }
+        if ($this->pullThresholdSizeForTopic !== -1) {
+            $to = max(1, intdiv($this->pullThresholdSizeForTopic, $owned));
+            if ($to !== $this->pullThresholdSizeForQueue) {
+                Logger::info(sprintf(
+                    'The pullThresholdSizeForQueue is changed from %d to %d',
+                    $this->pullThresholdSizeForQueue,
+                    $to,
+                ));
+                $this->pullThresholdSizeForQueue = $to;
+            }
+        }
     }
 
     public function usesBrokerPopAssignment(): bool
@@ -1371,7 +1447,10 @@ final class DefaultMQPushConsumer
         foreach ($newAssigned as $key => $mq) {
             $now[$key] = true;
         }
-        if ($now != $was) {
+        // Same set comparison as the local rebalance: this is the round that can change which
+        // queues this client owns, so it is also the round the topic budgets are re-split in.
+        $changed = ($now != $was);
+        if ($changed) {
             Logger::info(sprintf(
                 'broker rebalanced result changed. allocateMessageQueueStrategyName=%s, group=%s, topic=%s, clientId=%s, assignmentSet=%d',
                 $this->allocateStrategy->getName(),
@@ -1382,6 +1461,12 @@ final class DefaultMQPushConsumer
             ));
         }
         $this->rebalancePullState();
+        // Under POP the pull state rebuilt above is the ``popQueues`` table, so the division that
+        // follows reads that table as its divisor -- and, like the local path, it runs on the count
+        // this round produced rather than the previous round's.
+        if ($changed) {
+            $this->divideTopicThresholds();
+        }
     }
 
     public function rebalanceImmediately(): void
@@ -1637,9 +1722,15 @@ final class DefaultMQPushConsumer
     }
 
     /**
-     * Whether the cache gates pause this queue's pull. Every gate compares **strictly greater
-     * than** its threshold, so a buffer that has reached the threshold exactly is still allowed
+     * Whether the cache gates pause **this one queue's** pull. Every gate compares its threshold
+     * **strictly greater than**, so a buffer that has reached the threshold exactly is still allowed
      * to pull and a threshold reads as "how many may be cached".
+     *
+     * There are exactly three gates, all per-queue: the message count, the buffered MB and the
+     * offset span. A topic-level budget is NOT judged here -- nothing is summed across the topic's
+     * queues at pull time -- because {@see divideTopicThresholds()} already turned that budget into
+     * this queue's share of the per-queue knob during rebalance. Sibling queues therefore never
+     * make each other pause: one queue going past its share pauses that queue alone.
      */
     private function flowControlHit(MessageQueue $mq, string $key): bool
     {
@@ -1661,25 +1752,6 @@ final class DefaultMQPushConsumer
             $reason = sprintf('size=%.1fMB', $sizeMb);
         } elseif ($this->consumeConcurrentlyMaxSpan > 0 && $span > $this->consumeConcurrentlyMaxSpan) {
             $reason = "span=$span";
-        } elseif ($this->pullThresholdForTopic > 0 || $this->pullThresholdSizeForTopic > 0) {
-            $topicPending = [];
-            foreach ($this->pending as $k => $q) {
-                $kmq = $this->mqMap[$k] ?? null;
-                if ($kmq !== null && $kmq->topic === $mq->topic) {
-                    foreach ($q as $m) {
-                        $topicPending[] = $m;
-                    }
-                }
-            }
-            if ($this->pullThresholdForTopic > 0 && count($topicPending) >= $this->pullThresholdForTopic) {
-                $reason = 'topicCount=' . count($topicPending);
-            } elseif ($this->pullThresholdSizeForTopic > 0) {
-                $topicMb = array_sum(array_map(static fn(MessageExt $m) => $m->storeSize, $topicPending))
-                    / (1024.0 * 1024.0);
-                if ($topicMb >= $this->pullThresholdSizeForTopic) {
-                    $reason = sprintf('topicSize=%.1fMB', $topicMb);
-                }
-            }
         }
         if ($reason === '') {
             return false;

@@ -675,8 +675,9 @@ public sealed class DefaultMQPushConsumer
     // The remaining four flow-control thresholds: the byte gates are in MiB
     // (&lt;=0 disables); the span is max-min of queueOffset in pending and
     // counts only when STRICTLY greater; the two topic-level ones default to
-    // -1 (disabled) and aggregate the buffered totals across ALL queues of
-    // that topic on this instance.
+    // -1 (disabled) and are NEVER compared at pull time: each enabled budget is
+    // divided over this consumer's owned queues at rebalance, and the quotient
+    // becomes the matching per-queue knob (see DivideTopicThresholds).
     private int _pullThresholdSizeForQueue = 100;
     private long _consumeConcurrentlyMaxSpan = 2000;
     private int _pullThresholdForTopic = -1;
@@ -1014,7 +1015,10 @@ public sealed class DefaultMQPushConsumer
     }
 
     // Per-queue "pulled but not consumed" threshold; pull for that queue
-    // pauses once exceeded (default 1000)
+    // pauses once exceeded (default 1000).
+    // ⚠ While a topic-level budget is enabled this value is NOT the one the
+    // user set: rebalance overwrites it with the divided quotient (see
+    // DivideTopicThresholds), so reading it back gives the divided number.
     public int PullThresholdForQueue
     {
         get => _pullThresholdForQueue;
@@ -1023,7 +1027,8 @@ public sealed class DefaultMQPushConsumer
 
     /// <summary><c>pullThresholdSizeForQueue</c> (default 100): this queue's
     /// "pulled but not consumed" byte threshold in <b>MiB</b>; &lt;=0 disables
-    /// this gate.</summary>
+    /// this gate. While <see cref="PullThresholdSizeForTopic"/> is enabled
+    /// rebalance overwrites this with the divided quotient.</summary>
     public int PullThresholdSizeForQueue
     {
         get => _pullThresholdSizeForQueue;
@@ -1041,10 +1046,13 @@ public sealed class DefaultMQPushConsumer
     }
 
     /// <summary><c>pullThresholdForTopic</c> (default -1, disabled): the
-    /// cumulative "pulled but not consumed" count across <b>all</b> queues of
-    /// the same topic on this instance. The classic implementation divides the
-    /// topic threshold by the queue count down to the queue level; this port
-    /// compares the cumulative value directly.</summary>
+    /// "pulled but not consumed" message-count budget for this instance's share
+    /// of the topic. It is enforced by DIVISION, not by adding the queues up:
+    /// every rebalance that changes the assignment divides it by the number of
+    /// queues this consumer owns (all topics together) and writes the quotient
+    /// into <see cref="PullThresholdForQueue"/> (see
+    /// <see cref="DivideTopicThresholds"/>). The pull-time gate then only ever
+    /// looks at one queue's own buffer against that per-queue number.</summary>
     public int PullThresholdForTopic
     {
         get => _pullThresholdForTopic;
@@ -1052,8 +1060,10 @@ public sealed class DefaultMQPushConsumer
     }
 
     /// <summary><c>pullThresholdSizeForTopic</c> (default -1, disabled): the
-    /// cumulative byte threshold for the same topic, in <b>MiB</b>. This gate
-    /// reads only this property and does NOT reuse the queue-level switch.</summary>
+    /// byte budget for the same topic, in <b>MiB</b>. Enforced the same way as
+    /// <see cref="PullThresholdForTopic"/> -- divided into
+    /// <see cref="PullThresholdSizeForQueue"/> at rebalance, never summed over
+    /// the queues at pull time.</summary>
     public int PullThresholdSizeForTopic
     {
         get => _pullThresholdSizeForTopic;
@@ -1197,7 +1207,9 @@ public sealed class DefaultMQPushConsumer
     /// <para>The -1 of <c>PullThresholdForTopic</c> /
     /// <c>PullThresholdSizeForTopic</c> is a "disable this gate" sentinel: it
     /// is out of range but not an error; the other fields have no such
-    /// exemption (writing -1 there is a startup error, not "unlimited").</para>
+    /// exemption (writing -1 there is a startup error, not "unlimited"). An
+    /// off budget also opts out of the rebalance division, so its per-queue
+    /// knob keeps the user's value (see <see cref="DivideTopicThresholds"/>).</para>
     /// <para>public is for offline testability only: positive cases (boundary
     /// values must be allowed) cannot run after <see cref="Start"/>, and the
     /// test project has no InternalsVisibleTo relationship with this assembly.
@@ -2991,9 +3003,9 @@ public sealed class DefaultMQPushConsumer
         }
     }
 
-    /// <summary>The pre-pull flow-control verdict -- five thresholds checked
-    /// before enqueueing into the buffer, returning on the first hit in this
-    /// order (an earlier hit masks the later ones). Every cache gate compares
+    /// <summary>The pre-pull flow-control verdict -- the three per-queue
+    /// thresholds checked before enqueueing into the buffer, returning on the
+    /// first hit in this order (an earlier hit masks the later ones). Every cache gate compares
     /// <b>strictly greater than</b> its threshold: a buffer that has reached it
     /// exactly is still allowed to pull, so a threshold reads as "how many may be
     /// cached", not "how many stop the pull".
@@ -3004,22 +3016,19 @@ public sealed class DefaultMQPushConsumer
     /// (&lt;=0 disables)</item>
     /// <item>span <b>strictly greater than</b> <c>ConsumeConcurrentlyMaxSpan</c>
     /// (max-min of queueOffset within the buffer)</item>
-    /// <item>topic cumulative count &gt;= <c>PullThresholdForTopic</c>
-    /// (across <b>all</b> queues of that topic on this instance)</item>
-    /// <item>topic cumulative bytes &gt;= <c>PullThresholdSizeForTopic</c>,
-    /// in MiB (does not reuse the second item's switch)</item>
     /// </list>
-    /// One hit only increments <see cref="FlowControlTriggered"/> by one. The
-    /// whole table is aggregated only when the topic-level gate is truly on;
-    /// otherwise every verdict would walk all queues' buffers one extra
-    /// time.</summary>
+    /// The verdict judges <b>this queue's own buffer only</b> and never reads a
+    /// sibling queue: a topic-level cache budget reaches it only through
+    /// <see cref="DivideTopicThresholds"/>, which splits the budget into the
+    /// per-queue knobs at rebalance. There is no pull-time topic aggregation
+    /// (see the classic client: <c>pullThresholdForTopic</c> is divided by the
+    /// queue count, not summed over the queues when a pull happens).
+    /// One hit only increments <see cref="FlowControlTriggered"/> by one.</summary>
     private bool FlowControlHit(MessageQueue mq, string key)
     {
         int count;
         double sizeMb;
         long span;
-        int topicCount = 0;
-        double topicSizeMb = 0.0;
         lock (_lock)
         {
             if (_pending.TryGetValue(key, out Queue<MessageExt>? q) && q.Count > 0)
@@ -3044,27 +3053,6 @@ public sealed class DefaultMQPushConsumer
                 sizeMb = 0;
                 span = 0;
             }
-
-            if (_pullThresholdForTopic > 0 || _pullThresholdSizeForTopic > 0)
-            {
-                long topicBytes = 0;
-                foreach (KeyValuePair<string, Queue<MessageExt>> kv in _pending)
-                {
-                    if (!_mqMap.TryGetValue(kv.Key, out MessageQueue? other)
-                        || other.Topic != mq.Topic)
-                    {
-                        continue;
-                    }
-
-                    foreach (MessageExt m in kv.Value)
-                    {
-                        topicCount++;
-                        topicBytes += m.StoreSize;
-                    }
-                }
-
-                topicSizeMb = topicBytes / (1024.0 * 1024.0);
-            }
         }
 
         string? reason = null;
@@ -3079,14 +3067,6 @@ public sealed class DefaultMQPushConsumer
         else if (_consumeConcurrentlyMaxSpan > 0 && span > _consumeConcurrentlyMaxSpan)
         {
             reason = "span=" + span.ToString(CultureInfo.InvariantCulture);
-        }
-        else if (_pullThresholdForTopic > 0 && topicCount >= _pullThresholdForTopic)
-        {
-            reason = "topicCount=" + topicCount.ToString(CultureInfo.InvariantCulture);
-        }
-        else if (_pullThresholdSizeForTopic > 0 && topicSizeMb >= _pullThresholdSizeForTopic)
-        {
-            reason = "topicSize=" + topicSizeMb.ToString("F1", CultureInfo.InvariantCulture) + "MB";
         }
 
         if (reason is null)
@@ -4209,10 +4189,10 @@ public sealed class DefaultMQPushConsumer
     public bool RemoveExpiredEntryIfStillHeadForTest(string key, MessageExt msg)
         => RemoveExpiredEntryIfStillHead(key, msg);
 
-    /// <summary>Preset a queue's "assigned queue" registration. The topic-level
-    /// thresholds rely on this table to aggregate sibling queues of the same
-    /// topic; not registering equals the queue having been revoked by
-    /// rebalance.</summary>
+    /// <summary>Preset a queue's "assigned queue" registration. This table is the
+    /// divisor of the topic-level budgets (see
+    /// <see cref="DivideTopicThresholds"/>); not registering a queue equals the
+    /// queue having been revoked by rebalance.</summary>
     public void SetAssignedForTest(string key, MessageQueue mq)
     {
         lock (_lock)
@@ -4234,6 +4214,18 @@ public sealed class DefaultMQPushConsumer
     /// <summary>Run one pre-pull flow-control verdict (without the network).
     /// A hit increments <see cref="FlowControlTriggered"/> by one.</summary>
     public bool FlowControlHitForTest(MessageQueue mq, string key) => FlowControlHit(mq, key);
+
+    /// <summary>Unit-test entry: divide the enabled topic-level budgets over the
+    /// queues this consumer owns right now (see
+    /// <see cref="DivideTopicThresholds"/>).</summary>
+    public void DivideTopicThresholdsForTest() => DivideTopicThresholds();
+
+    /// <summary>Unit-test entry: run one full rebalance round on the calling
+    /// thread. The real round runs on the rebalance thread, so a test that wants
+    /// "this exact round, now" needs this; it is the only way to pin the
+    /// division's two gating rules (only a changed assignment, only after the
+    /// pull state was rebuilt) without racing the 20s timer.</summary>
+    public void DoRebalanceForTest() => DoRebalance();
 
     // ---------------- postSubscriptionWhenPull / pullFromWhichNode ----------------
 
@@ -6139,6 +6131,90 @@ public sealed class DefaultMQPushConsumer
         return outList;
     }
 
+    /// <summary>Turn each enabled topic-level cache budget into a per-queue knob
+    /// for the queues this client owns right now: every budget (-1 means off) is
+    /// divided by that queue count -- ALL of this consumer's queues, across every
+    /// topic -- and the quotient is written into the matching per-queue knob.
+    /// This is the ONLY place a topic budget is enforced: the pull-time gate
+    /// never aggregates sibling queues (see <see cref="FlowControlHit"/>).
+    /// <list type="bullet">
+    /// <item>The dividend is always the topic knob, never the current per-queue
+    /// value, so repeating the division with an unchanged queue count writes the
+    /// same number again (1000 over 8 queues is 125, not 250/8 = 31).</item>
+    /// <item>The user's per-queue value is deliberately overwritten while a topic
+    /// budget is enabled: only the queue count can make a topic-wide budget
+    /// meaningful per queue, so <see cref="PullThresholdForQueue"/> reads back
+    /// the divided number.</item>
+    /// <item>Owning no queue means there is nothing to divide by: both knobs keep
+    /// the user's values (no division by zero, and a 0 quotient would mean "no
+    /// message may ever be cached").</item>
+    /// <item>The quotient is floored at 1, so a budget smaller than the queue
+    /// count still leaves a usable gate.</item>
+    /// </list>
+    /// The divisor is the live per-queue state table of the current consumption
+    /// mode -- <c>_mqMap</c> on the pull path, <c>_popQueues</c> under POP --
+    /// which is why the caller runs it AFTER the pull state of this round has
+    /// been rebuilt (<see cref="DoRebalance"/>).</summary>
+    /// <remarks>Locking: <c>_lock</c> guards the knobs and both state tables, but
+    /// <see cref="ClientLog"/> calls must stay OUTSIDE it, so the new values and
+    /// the log strings are decided in the critical section and only emitted
+    /// after releasing it.</remarks>
+    private void DivideTopicThresholds()
+    {
+        int owned;
+        int countFrom = 0;
+        int countTo = 0;
+        int sizeFrom = 0;
+        int sizeTo = 0;
+        bool countChanged = false;
+        bool sizeChanged = false;
+        lock (_lock)
+        {
+            owned = PopMode ? _popQueues.Count : _mqMap.Count;
+            if (owned > 0)
+            {
+                if (_pullThresholdForTopic != -1)
+                {
+                    int to = Math.Max(1, _pullThresholdForTopic / owned);
+                    if (to != _pullThresholdForQueue)
+                    {
+                        countFrom = _pullThresholdForQueue;
+                        countTo = to;
+                        _pullThresholdForQueue = to;
+                        countChanged = true;
+                    }
+                }
+
+                if (_pullThresholdSizeForTopic != -1)
+                {
+                    int to = Math.Max(1, _pullThresholdSizeForTopic / owned);
+                    if (to != _pullThresholdSizeForQueue)
+                    {
+                        sizeFrom = _pullThresholdSizeForQueue;
+                        sizeTo = to;
+                        _pullThresholdSizeForQueue = to;
+                        sizeChanged = true;
+                    }
+                }
+            }
+        }
+
+        // Off the lock: these two lines only report what the writes above decided.
+        if (countChanged)
+        {
+            ClientLog.Info("The pullThresholdForQueue is changed from "
+                + countFrom.ToString(CultureInfo.InvariantCulture) + " to "
+                + countTo.ToString(CultureInfo.InvariantCulture));
+        }
+
+        if (sizeChanged)
+        {
+            ClientLog.Info("The pullThresholdSizeForQueue is changed from "
+                + sizeFrom.ToString(CultureInfo.InvariantCulture) + " to "
+                + sizeTo.ToString(CultureInfo.InvariantCulture));
+        }
+    }
+
     /// <summary>
     /// Compute the assignment by rebalanceByTopic, then sync the pull thread
     /// set. ⚠ POP's queues also come from this CLIENT REBALANCE (one POP loop
@@ -6235,6 +6311,30 @@ public sealed class DefaultMQPushConsumer
         {
             assignedKeys.Add(OffsetKey(mq));
             current[OffsetKey(mq)] = mq;
+        }
+
+        // Did THIS round change the assignment? A SET comparison, not a count
+        // comparison: losing one queue while gaining another keeps the count but
+        // changes which buffers exist, and every topic budget has to be re-split
+        // over the new queue set.
+        bool changed = current.Count != prev.Count;
+        if (!changed)
+        {
+            foreach (string k in current.Keys)
+            {
+                if (!prev.ContainsKey(k))
+                {
+                    changed = true;
+                    break;
+                }
+            }
+        }
+
+        if (changed)
+        {
+            ClientLog.Info("rebalance result changed, group=" + ConsumerGroup
+                + " clientId=" + _clientId
+                + " assigned=" + assigned.Count.ToString(CultureInfo.InvariantCulture));
         }
 
         // Stall self-healing (isPullExpired): in the same pass also revoke the
@@ -6354,6 +6454,21 @@ public sealed class DefaultMQPushConsumer
         }
 
         RebalancePullThreads();
+
+        // The division over the queue count THIS round produced, so it must run
+        // AFTER RebalancePullThreads rebuilt the per-queue state table: a shrink
+        // from 4 queues to 2 then divides by 2, not by the 4 it started from.
+        // Only a round that changed the assignment re-divides, so a hand-set
+        // per-queue knob survives an unchanged round.
+        // POP needs the same rule and gets it from the same call site: in this
+        // port _popQueues is only ever grown by RebalancePullThreads (see the
+        // DoRebalance header -- the broker-side queryAssignment /
+        // MessageQueueAssignment path is NOT implemented here), so there is no
+        // second table-owning path that would need its own change-gated call.
+        if (changed)
+        {
+            DivideTopicThresholds();
+        }
     }
 
     /// <summary>Where a newly assigned queue starts pulling.

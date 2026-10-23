@@ -2004,7 +2004,8 @@ impl DefaultMQPushConsumer {
             state.assigned = assigned.clone();
         }
         let now: BTreeSet<String> = assigned.iter().map(mq_key).collect();
-        if now != was {
+        let changed = now != was;
+        if changed {
             rmq_info!(
                 "rebalance result changed, group={group} clientId={} assigned={}",
                 cfg.client_id.clone().unwrap_or_default(),
@@ -2025,7 +2026,61 @@ impl DefaultMQPushConsumer {
             }
         }
         self.rebalance_pull_threads().await;
+        // Divide the topic-level cache budgets into the per-queue knobs, but only when this round
+        // actually moved the assignment **and** only after the pull-state update above.
+        //
+        // The order is load-bearing: `rebalance_pull_threads` is the sole writer of the per-queue
+        // table the divisor is read from (it registers a queue when it builds that queue's pull loop
+        // and drops it in `retire_queue_locked`), so running the division before it would divide by
+        // the *previous* round's count -- a shrink from 4 queues to 2 must divide by 2, not by 4.
+        //
+        // The broker-side assignment path (`assigned_from_broker`, POP mode) needs no call site of
+        // its own: it only hands the queue set back into `state.assigned` and never touches
+        // `queue_owners` / `pop_queues`, so this one change-gated call already covers it.
+        if changed {
+            self.divide_topic_thresholds();
+        }
         Ok(())
+    }
+
+    /// Divide the two **topic-level** cache budgets (`pull_threshold_for_topic` /
+    /// `pull_threshold_size_for_topic`, `-1` = off) into the corresponding per-queue knobs over the
+    /// queues this consumer owns right now. This is the whole enforcement mechanism: the pull path
+    /// never aggregates a topic's queues (see [`flow_control_hit`]).
+    ///
+    /// `owned` is the live per-queue pull-state table -- [`State::queue_owners`] (POP mode:
+    /// [`State::pop_queues`]) -- which counts queues across **all** subscribed topics, not one
+    /// topic's queues: a topic-wide budget is a budget for this client as a whole.
+    ///
+    /// Two consequences are deliberate, not bugs:
+    /// - The numerator is **always the topic knob**, never the current per-queue value, so repeating
+    ///   the division with an unchanged queue count writes the same number again (idempotent -- a
+    ///   second round would otherwise divide the already-divided value).
+    /// - While a topic knob is enabled, the user's own per-queue value is **overwritten** by the
+    ///   quotient, so a config getter shows the divided number rather than what was set.
+    ///
+    /// `owned == 0` (nothing assigned yet) returns without touching either knob, so both keep the
+    /// user's values instead of dividing by zero.
+    fn divide_topic_thresholds(&self) {
+        let pop = self.config().pop_mode;
+        let owned = {
+            let state = lock(&self.inner.state);
+            if pop {
+                state.pop_queues.len()
+            } else {
+                state.queue_owners.len()
+            }
+        };
+        if owned == 0 {
+            return;
+        }
+        let mut lines = Vec::new();
+        self.update_config(|cfg| {
+            lines = apply_topic_threshold_division(cfg, owned);
+        });
+        for line in lines {
+            rmq_info!("{line}");
+        }
     }
 
     /// The mode (POP / PULL) carried by an assignment item is only **observed, never obeyed**: this consumer's consume mode is fixed
@@ -2531,7 +2586,7 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
             }
             continue;
         }
-        if flow_control_hit(&inner, &mq, &key) {
+        if flow_control_hit(&inner, &key) {
             if wait_or_stop(&mut rx, PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL).await {
                 return;
             }
@@ -2703,12 +2758,19 @@ fn update_msg_acc_cnt(inner: &Inner, key: &str, msgs: &[MessageExt]) {
     }
 }
 
-/// Whether the cache gates pause this queue's pull. Every gate compares **strictly greater than**
-/// its threshold, so a buffer that has reached the threshold exactly is still allowed to pull and
-/// a threshold reads as "how many may be cached".
-fn flow_control_hit(inner: &Inner, mq: &MessageQueue, key: &str) -> bool {
+/// Whether the cache gates pause this queue's pull.
+///
+/// The gate judges **one queue's own buffer** against exactly three per-queue gates (count / size /
+/// offset span). A topic-level budget is **not** aggregated here at all: it is divided into the
+/// per-queue knob at rebalance time
+/// ([`DefaultMQPushConsumer::divide_topic_thresholds`]), so the pull path never has to look at --
+/// or wait on a lock held for -- its sibling queues.
+///
+/// Every gate compares **strictly greater than** its threshold, so a buffer that has reached the
+/// threshold exactly is still allowed to pull and a threshold reads as "how many may be cached".
+fn flow_control_hit(inner: &Inner, key: &str) -> bool {
     let cfg = read_cfg(inner);
-    let (count, size_mb, span, topic_pending) = {
+    let (count, size_mb, span) = {
         let state = lock(&inner.state);
         let dq: &VecDeque<MessageExt> = state.pending.get(key).unwrap_or(&EMPTY_DEQUE);
         let count = dq.len();
@@ -2725,14 +2787,7 @@ fn flow_control_hit(inner: &Inner, mq: &MessageQueue, key: &str) -> bool {
             }
             max - min
         };
-        let topic_pending: Vec<(i32, i64)> = state
-            .pending
-            .iter()
-            .filter(|(k, _)| state.mq_map.get(*k).is_some_and(|m| m.topic == mq.topic))
-            .flat_map(|(_, dq)| dq.iter())
-            .map(|m| (m.store_size, m.queue_offset))
-            .collect();
-        (count, size_mb, span, topic_pending)
+        (count, size_mb, span)
     };
     let reason: Option<String> = if count > cfg.pull_threshold_for_queue.max(1) as usize {
         Some(format!("count={count}"))
@@ -2742,25 +2797,6 @@ fn flow_control_hit(inner: &Inner, mq: &MessageQueue, key: &str) -> bool {
         Some(format!("size={size_mb:.1}MB"))
     } else if cfg.consume_concurrently_max_span > 0 && span > cfg.consume_concurrently_max_span {
         Some(format!("span={span}"))
-    } else if cfg.pull_threshold_for_topic > 0 || cfg.pull_threshold_size_for_topic > 0 {
-        if cfg.pull_threshold_for_topic > 0
-            && topic_pending.len() >= cfg.pull_threshold_for_topic as usize
-        {
-            Some(format!("topicCount={}", topic_pending.len()))
-        } else if cfg.pull_threshold_size_for_topic > 0 {
-            let topic_mb = topic_pending
-                .iter()
-                .map(|(s, _)| i64::from(*s))
-                .sum::<i64>() as f64
-                / (1024.0 * 1024.0);
-            if topic_mb >= f64::from(cfg.pull_threshold_size_for_topic) {
-                Some(format!("topicSize={topic_mb:.1}MB"))
-            } else {
-                None
-            }
-        } else {
-            None
-        }
     } else {
         None
     };
@@ -2781,6 +2817,74 @@ fn flow_control_hit(inner: &Inner, mq: &MessageQueue, key: &str) -> bool {
 }
 
 static EMPTY_DEQUE: VecDeque<MessageExt> = VecDeque::new();
+
+/// Divide one enabled topic budget over `owned` queues and state the result with the literal
+/// log wording the gate documents.
+///
+/// Returns the new per-queue value plus `Some(INFO line)` **only when the value actually moved** --
+/// an unchanged quotient logs nothing, and a `-1` (off) budget never reaches this function at all.
+/// The `<old>` in the line is the per-queue value **before** the write (what the user or a previous
+/// round sees), not the topic knob.
+///
+/// The numerator is `topic_threshold`, **never** `current_queue_threshold`: that is what makes the
+/// division idempotent across rounds with the same queue count. The quotient is floored at 1 so a
+/// budget smaller than the queue count still lets every queue hold one message instead of freezing
+/// at 0 (a 0 gate would pause every pull).
+///
+/// Width: the arithmetic runs in `i64` (`owned` is a `usize` that may exceed `i32::MAX` in
+/// principle, and `i32` division would truncate first), and the result is narrowed back to the
+/// `i32` config field. Both topic knobs are validated to at most 6553500 messages / 102400 MiB and
+/// a quotient is never larger than its numerator, so the narrowing cannot wrap; `i32::MAX` clamps it
+/// anyway so a hand-built config outside the validated domain cannot produce a negative knob.
+fn divided_queue_threshold(
+    log_name: &str,
+    topic_threshold: i32,
+    current_queue_threshold: i32,
+    owned: usize,
+) -> (i32, Option<String>) {
+    let quotient = i64::from(topic_threshold) / i64::max(owned as i64, 1);
+    let quotient = quotient.clamp(1, i64::from(i32::MAX)) as i32;
+    if quotient == current_queue_threshold {
+        return (quotient, None);
+    }
+    (
+        quotient,
+        Some(format!(
+            "The {log_name} is changed from {current_queue_threshold} to {quotient}"
+        )),
+    )
+}
+
+/// The pure half of [`DefaultMQPushConsumer::divide_topic_thresholds`]: divide every **enabled**
+/// topic-level budget (`!= -1`) of `cfg` into its per-queue knob over `owned` queues, and return the
+/// INFO lines to emit (one per knob that moved, in count-then-size order).
+///
+/// `owned` must be >= 1; the caller's `owned == 0` early return is what keeps both knobs at the
+/// user's values when nothing is assigned, so this function never sees a zero divisor.
+fn apply_topic_threshold_division(cfg: &mut ConsumerConfig, owned: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    if cfg.pull_threshold_for_topic != -1 {
+        let (new, line) = divided_queue_threshold(
+            "pullThresholdForQueue",
+            cfg.pull_threshold_for_topic,
+            cfg.pull_threshold_for_queue,
+            owned,
+        );
+        cfg.pull_threshold_for_queue = new;
+        lines.extend(line);
+    }
+    if cfg.pull_threshold_size_for_topic != -1 {
+        let (new, line) = divided_queue_threshold(
+            "pullThresholdSizeForQueue",
+            cfg.pull_threshold_size_for_topic,
+            cfg.pull_threshold_size_for_queue,
+            owned,
+        );
+        cfg.pull_threshold_size_for_queue = new;
+        lines.extend(line);
+    }
+    lines
+}
 
 /// Within 60s of start-up and with no assignment at all, this shortens to 2s: the consumer may start before the topic is created
 /// (under `autoCreateTopicEnable` the topic is created by the producer's first send), and waiting out 20s would mean not consuming for a long time.
@@ -6268,7 +6372,7 @@ mod tests {
         let triggered = || consumer.inner.flow_control_triggered.load(Ordering::SeqCst);
 
         // Empty buffer: no threshold triggers
-        assert!(!flow_control_hit(&consumer.inner, &mq, &key));
+        assert!(!flow_control_hit(&consumer.inner, &key));
         assert_eq!(triggered(), 0);
 
         only(&consumer, |c| c.pull_threshold_for_queue = 3);
@@ -6278,7 +6382,7 @@ mod tests {
             vec![sized_msg(100, 0), sized_msg(100, 1), sized_msg(100, 2)],
         );
         assert!(
-            !flow_control_hit(&consumer.inner, &mq, &key),
+            !flow_control_hit(&consumer.inner, &key),
             "exactly the threshold 3 is still allowed to pull (strictly greater)"
         );
         assert_eq!(triggered(), 0, "a round that does not trip counts nothing");
@@ -6292,7 +6396,7 @@ mod tests {
                 sized_msg(100, 3),
             ],
         );
-        assert!(flow_control_hit(&consumer.inner, &mq, &key), "count 4 > 3");
+        assert!(flow_control_hit(&consumer.inner, &key), "count 4 > 3");
         assert_eq!(triggered(), 1, "one trip, one counted hit");
 
         // The clamp keeps a zero threshold meaningful: it reads as one, so it trips on the
@@ -6300,21 +6404,21 @@ mod tests {
         only(&consumer, |c| c.pull_threshold_for_queue = 0);
         stage(&consumer, &mq, vec![sized_msg(100, 0)]);
         assert!(
-            !flow_control_hit(&consumer.inner, &mq, &key),
+            !flow_control_hit(&consumer.inner, &key),
             "a zero threshold clamps to one, so a single message still pulls"
         );
         stage(&consumer, &mq, vec![sized_msg(100, 0), sized_msg(100, 1)]);
         assert!(
-            flow_control_hit(&consumer.inner, &mq, &key),
+            flow_control_hit(&consumer.inner, &key),
             "a zero threshold trips on the second message, not the first"
         );
 
         // Size: pullThresholdSizeForQueue's unit is MiB
         only(&consumer, |c| c.pull_threshold_size_for_queue = 1);
-        assert!(!flow_control_hit(&consumer.inner, &mq, &key), "300B < 1MiB");
+        assert!(!flow_control_hit(&consumer.inner, &key), "300B < 1MiB");
         stage(&consumer, &mq, vec![sized_msg(1024 * 1024, 0)]);
         assert!(
-            !flow_control_hit(&consumer.inner, &mq, &key),
+            !flow_control_hit(&consumer.inner, &key),
             "exactly 1 MiB is still allowed under a 1 MiB threshold (strictly greater)"
         );
         stage(
@@ -6322,53 +6426,99 @@ mod tests {
             &mq,
             vec![sized_msg(1024 * 1024, 0), sized_msg(1024 * 1024, 1)],
         );
-        assert!(flow_control_hit(&consumer.inner, &mq, &key), "2MiB > 1MiB");
+        assert!(flow_control_hit(&consumer.inner, &key), "2MiB > 1MiB");
 
         only(&consumer, |c| c.consume_concurrently_max_span = 10);
         stage(&consumer, &mq, vec![sized_msg(1, 0), sized_msg(1, 100)]);
         assert!(
-            flow_control_hit(&consumer.inner, &mq, &key),
+            flow_control_hit(&consumer.inner, &key),
             "span 100 > 10"
         );
         only(&consumer, |c| c.consume_concurrently_max_span = 100);
         assert!(
-            !flow_control_hit(&consumer.inner, &mq, &key),
+            !flow_control_hit(&consumer.inner, &key),
             "span 100 is not strictly greater than 100"
         );
 
-        // Topic-level counts: sum the buffer of **all** queues of the topic (not a single queue)
-        only(&consumer, |c| c.pull_threshold_for_topic = 2);
-        stage(&consumer, &mq, vec![sized_msg(1, 0)]);
-        assert!(!flow_control_hit(&consumer.inner, &mq, &key), "1 < 2");
-        stage(&consumer, &mq, vec![sized_msg(1, 0), sized_msg(1, 1)]);
-        assert!(flow_control_hit(&consumer.inner, &mq, &key), "2 >= 2");
-
-        // Topic-level size: the gate only looks at pullThresholdSizeForTopic; when the queue-level gate is
-        // off (0) the topic-level gate must still fire -- reusing the queue-level switch would silently disable it
+        // Topic-level knobs are **inert in the pull path**: they are divided into the per-queue knob
+        // at rebalance (`divide_topic_thresholds`), and the gate only ever judges this queue's own
+        // buffer. Enabling a topic budget here, where its quotient would be far below the queue-level
+        // gates, must not pause anything -- the old code summed the topic's queues at pull time.
         only(&consumer, |c| {
-            c.pull_threshold_size_for_queue = 100;
+            c.pull_threshold_for_topic = 2;
             c.pull_threshold_size_for_topic = 1;
         });
-        stage(&consumer, &mq, vec![sized_msg(1024 * 1024 / 2, 0)]);
+        stage(&consumer, &mq, vec![sized_msg(1, 0)]);
         assert!(
-            !flow_control_hit(&consumer.inner, &mq, &key),
-            "0.5MiB < 1MiB"
+            !flow_control_hit(&consumer.inner, &key),
+            "a topic budget alone does not pause the pull"
         );
         stage(&consumer, &mq, vec![sized_msg(2 * 1024 * 1024, 0)]);
-        assert!(flow_control_hit(&consumer.inner, &mq, &key), "2MiB >= 1MiB");
-        only(&consumer, |c| {
-            c.pull_threshold_size_for_queue = 0;
-            c.pull_threshold_size_for_topic = 1;
-        });
         assert!(
-            flow_control_hit(&consumer.inner, &mq, &key),
-            "the topic-level size gate must still fire when the queue-level size gate is off"
+            !flow_control_hit(&consumer.inner, &key),
+            "not even a 2MiB buffer of one queue trips a gate the topic budget never moved"
         );
 
         // Default config: topic-level thresholds are off, only the queue-level ones apply
         let plain = DefaultMQPushConsumer::new("G").unwrap();
         stage(&plain, &mq, vec![sized_msg(1, 0)]);
-        assert!(!flow_control_hit(&plain.inner, &mq, &key));
+        assert!(!flow_control_hit(&plain.inner, &key));
+    }
+
+    /// The pull gate never sums its siblings: under a 1000-message **topic** budget divided over 4
+    /// owned queues, each queue may hold its full 250-message share. An implementation that
+    /// aggregates the topic at pull time pauses all four at once (4 x 250 = 1000 >= 1000), so the
+    /// control is the 251st message: exactly one queue pauses on its **own** count reason while the
+    /// three untouched siblings keep pulling.
+    #[test]
+    fn flow_control_judges_one_queue_never_the_topic_sum() {
+        let consumer = DefaultMQPushConsumer::new("G_fc_per_queue_only").unwrap();
+        let queues = owned_queue_set("T", 4);
+        for mq in &queues {
+            stage(&consumer, mq, (0..250_i64).map(|i| sized_msg(100, i)).collect());
+        }
+        consumer.update_config(|c| {
+            c.pull_threshold_for_topic = 1000;
+            // The user's own per-queue value, deliberately large: the division replaces it.
+            c.pull_threshold_for_queue = 65535;
+            c.pull_threshold_size_for_queue = 0;
+            c.consume_concurrently_max_span = 0;
+        });
+        own_pull_queues(&consumer, &queues);
+        consumer.divide_topic_thresholds();
+        assert_eq!(
+            consumer.config().pull_threshold_for_queue, 250,
+            "1000 divided over the 4 owned queues is the gate the pull path reads"
+        );
+        for mq in &queues {
+            assert!(
+                !flow_control_hit(&consumer.inner, &mq_key(mq)),
+                "{} at its divided share 250 of the 1000 budget must keep pulling",
+                mq_key(mq)
+            );
+        }
+        assert_eq!(consumer.flow_control_triggered(), 0, "1000 buffered in total, none over budget");
+
+        // Control: one queue over its **own** share pauses, on the per-queue count reason.
+        let hot = &queues[1];
+        stage(
+            &consumer,
+            hot,
+            (0..251).map(|i| sized_msg(100, i)).collect(),
+        );
+        assert!(
+            flow_control_hit(&consumer.inner, &mq_key(hot)),
+            "251 > the divided 250 pauses that queue"
+        );
+        assert_eq!(consumer.flow_control_triggered(), 1, "only the one over-budget queue counts");
+        for mq in queues.iter().filter(|q| mq_key(q) != mq_key(hot)) {
+            assert!(
+                !flow_control_hit(&consumer.inner, &mq_key(mq)),
+                "the sibling {} at 250 must stay unpaused while {}",
+                mq_key(mq),
+                mq_key(hot)
+            );
+        }
     }
 
     /// A throttled queue trips on every pull round, so the warn is throttled too: the 1st trip and
@@ -6396,7 +6546,7 @@ mod tests {
         stage(&consumer, &mq, vec![sized_msg(100, 0), sized_msg(100, 1)]);
         for round in 1..=1000_usize {
             assert!(
-                flow_control_hit(&consumer.inner, &mq, &key),
+                flow_control_hit(&consumer.inner, &key),
                 "round {round} must pause"
             );
         }
@@ -6405,11 +6555,379 @@ mod tests {
             !is_flow_control_warn_trip(consumer.flow_control_triggered()),
             "1000 rounds leave the cadence silent"
         );
-        assert!(flow_control_hit(&consumer.inner, &mq, &key));
+        assert!(flow_control_hit(&consumer.inner, &key));
         assert_eq!(consumer.flow_control_triggered(), 1001);
         assert!(
             is_flow_control_warn_trip(consumer.flow_control_triggered()),
             "the 1001st round is the next warn"
+        );
+    }
+
+    // ---------------- topic-level budgets are divided into the per-queue knobs ----------------
+
+    /// Register queues in the **live per-queue pull-state table** exactly as
+    /// `rebalance_pull_threads` does (`queue_owners` is the PULL divisor's source table,
+    /// `pop_queues` the POP one; `mq_map` mirrors the real registration).
+    fn own_pull_queues(consumer: &DefaultMQPushConsumer, queues: &[MessageQueue]) {
+        let mut state = lock(&consumer.inner.state);
+        for (i, mq) in queues.iter().enumerate() {
+            let key = mq_key(mq);
+            state.queue_owners.insert(key.clone(), i as u64 + 1);
+            state.mq_map.insert(key, mq.clone());
+        }
+    }
+
+    /// The same, in POP mode: the queue also gets a `PopProcessQueue`, which is what the POP divisor counts.
+    fn own_pop_queues(consumer: &DefaultMQPushConsumer, queues: &[MessageQueue]) {
+        let mut state = lock(&consumer.inner.state);
+        for (i, mq) in queues.iter().enumerate() {
+            let key = mq_key(mq);
+            state.queue_owners.insert(key.clone(), i as u64 + 1);
+            state.pop_queues.insert(key.clone(), PopProcessQueue::new());
+            state.mq_map.insert(key, mq.clone());
+        }
+    }
+
+    fn owned_queue_set(topic: &str, count: usize) -> Vec<MessageQueue> {
+        (0..count as i32)
+            .map(|id| queue(topic, "broker-a", id))
+            .collect()
+    }
+
+    /// Each enabled budget divides over the owned queues and moves **only its own** knob; the
+    /// disabled one leaves its knob and its log line alone. The wording is pinned literally because
+    /// it is the operator's only signal that a per-queue number is no longer the one they set.
+    #[test]
+    fn divide_topic_thresholds_moves_only_the_knob_of_each_enabled_budget() {
+        // Count budget only (the size budget is off at -1). The defaults pin the knobs the user set:
+        // `pullThresholdForQueue` 1000, `pullThresholdSizeForQueue` 100.
+        let mut cfg = ConsumerConfig {
+            pull_threshold_for_topic: 2000,
+            ..Default::default()
+        };
+        let lines = apply_topic_threshold_division(&mut cfg, 4);
+        assert_eq!(cfg.pull_threshold_for_queue, 500, "2000 / 4");
+        assert_eq!(
+            cfg.pull_threshold_size_for_queue, 100,
+            "an off size budget must not touch the size knob"
+        );
+        assert_eq!(
+            cfg.pull_threshold_for_topic, 2000,
+            "the numerator is never consumed: the budget itself stays as the user set it"
+        );
+        assert_eq!(
+            lines,
+            vec!["The pullThresholdForQueue is changed from 1000 to 500".to_string()],
+            "exactly one line, for the knob that moved, in the documented wording"
+        );
+
+        // Size budget only (the count budget is off).
+        let mut cfg = ConsumerConfig {
+            pull_threshold_size_for_topic: 600,
+            ..Default::default()
+        };
+        let lines = apply_topic_threshold_division(&mut cfg, 4);
+        assert_eq!(cfg.pull_threshold_size_for_queue, 150, "600 / 4");
+        assert_eq!(
+            cfg.pull_threshold_for_queue, 1000,
+            "an off count budget must not touch the count knob"
+        );
+        assert_eq!(
+            lines,
+            vec!["The pullThresholdSizeForQueue is changed from 100 to 150".to_string()],
+            "no line is produced for the budget that is off"
+        );
+
+        // Both budgets: two lines, count first then size.
+        let mut cfg = ConsumerConfig {
+            pull_threshold_for_topic: 1000,
+            pull_threshold_size_for_topic: 100,
+            ..Default::default()
+        };
+        let lines = apply_topic_threshold_division(&mut cfg, 4);
+        assert_eq!((cfg.pull_threshold_for_queue, cfg.pull_threshold_size_for_queue), (250, 25));
+        assert_eq!(
+            lines,
+            vec![
+                "The pullThresholdForQueue is changed from 1000 to 250".to_string(),
+                "The pullThresholdSizeForQueue is changed from 100 to 25".to_string(),
+            ]
+        );
+
+        // Through the real method: the divisor is the live pull-state table and the getter shows the
+        // divided number -- the user's per-queue value is deliberately overwritten while a topic
+        // budget is enabled (a getter that still reported 1000 here would mean the gate reads a
+        // value nobody enforces).
+        let consumer = DefaultMQPushConsumer::new("G_divide_knob").unwrap();
+        consumer.update_config(|c| {
+            c.pull_threshold_for_queue = 1000;
+            c.pull_threshold_size_for_queue = 100;
+            c.pull_threshold_for_topic = 2000;
+            c.pull_threshold_size_for_topic = -1;
+        });
+        own_pull_queues(&consumer, &owned_queue_set("T", 3));
+        consumer.divide_topic_thresholds();
+        let cfg = consumer.config();
+        assert_eq!(cfg.pull_threshold_for_queue, 666, "2000 / 3 owned queues");
+        assert_eq!(
+            cfg.pull_threshold_size_for_queue, 100,
+            "the size budget is off, so the size knob keeps the user's 100"
+        );
+    }
+
+    /// Control for every division assertion above: with both budgets off (`-1` is the off spelling
+    /// in this port) the knobs stay exactly where the user put them even though queues are owned.
+    #[test]
+    fn divide_topic_thresholds_leaves_both_knobs_alone_when_both_budgets_are_off() {
+        let mut cfg = ConsumerConfig {
+            pull_threshold_for_queue: 77,
+            pull_threshold_size_for_queue: 9,
+            ..Default::default()
+        };
+        let lines = apply_topic_threshold_division(&mut cfg, 4);
+        assert!(lines.is_empty(), "an off budget logs nothing at all");
+        assert_eq!(
+            (cfg.pull_threshold_for_queue, cfg.pull_threshold_size_for_queue),
+            (77, 9),
+            "off budgets must not rewrite the knobs"
+        );
+
+        let consumer = DefaultMQPushConsumer::new("G_divide_off").unwrap();
+        consumer.update_config(|c| {
+            c.pull_threshold_for_queue = 77;
+            c.pull_threshold_size_for_queue = 9;
+            c.pull_threshold_for_topic = -1;
+            c.pull_threshold_size_for_topic = -1;
+        });
+        own_pull_queues(&consumer, &owned_queue_set("T", 3));
+        consumer.divide_topic_thresholds();
+        let cfg = consumer.config();
+        assert_eq!((cfg.pull_threshold_for_queue, cfg.pull_threshold_size_for_queue), (77, 9));
+    }
+
+    /// A budget smaller than the owned queue count floors at **1, never 0**: the count gate pauses a
+    /// pull as soon as the buffer is strictly greater than its (max-1-clamped) threshold, so a 0
+    /// would still throttle -- but 1 is the documented floor and keeps one message flowing.
+    #[test]
+    fn divide_topic_thresholds_floors_a_small_budget_at_one_not_zero() {
+        let mut cfg = ConsumerConfig {
+            pull_threshold_for_topic: 3,
+            pull_threshold_size_for_topic: 1,
+            ..Default::default()
+        };
+        let lines = apply_topic_threshold_division(&mut cfg, 8);
+        assert_eq!(cfg.pull_threshold_for_queue, 1, "3 / 8 = 0 must be floored to 1");
+        assert_eq!(cfg.pull_threshold_size_for_queue, 1, "1 / 8 = 0 must be floored to 1");
+        assert_eq!(
+            lines,
+            vec![
+                "The pullThresholdForQueue is changed from 1000 to 1".to_string(),
+                "The pullThresholdSizeForQueue is changed from 100 to 1".to_string(),
+            ],
+            "the floor is what the operator is told the knob became"
+        );
+
+        // The floored knob is the value the gate actually uses: one message still pulls, the second pauses.
+        let consumer = DefaultMQPushConsumer::new("G_divide_floor").unwrap();
+        consumer.update_config(|c| {
+            c.pull_threshold_for_topic = 3;
+            c.pull_threshold_size_for_topic = -1;
+            c.pull_threshold_size_for_queue = 0;
+            c.consume_concurrently_max_span = 0;
+        });
+        own_pull_queues(&consumer, &owned_queue_set("T", 8));
+        consumer.divide_topic_thresholds();
+        assert_eq!(consumer.config().pull_threshold_for_queue, 1);
+        let mq = queue("T", "broker-a", 0);
+        let key = mq_key(&mq);
+        stage(&consumer, &mq, vec![sized_msg(100, 0)]);
+        assert!(
+            !flow_control_hit(&consumer.inner, &key),
+            "the floored knob of 1 still lets one message sit in the buffer"
+        );
+        stage(&consumer, &mq, vec![sized_msg(100, 0), sized_msg(100, 1)]);
+        assert!(
+            flow_control_hit(&consumer.inner, &key),
+            "the second message is over the divided gate"
+        );
+    }
+
+    /// Owning nothing must not divide by zero: the method returns before touching either knob, so
+    /// both keep exactly the values the user set. The control is the same config with one owned
+    /// queue, where both knobs do move -- otherwise "nothing happened" could also mean "the division
+    /// is not wired up at all".
+    #[test]
+    fn divide_topic_thresholds_with_no_owned_queue_keeps_the_users_values() {
+        let consumer = DefaultMQPushConsumer::new("G_divide_zero_owned").unwrap();
+        consumer.update_config(|c| {
+            c.pull_threshold_for_queue = 1000;
+            c.pull_threshold_size_for_queue = 100;
+            c.pull_threshold_for_topic = 2000;
+            c.pull_threshold_size_for_topic = 50;
+        });
+        consumer.divide_topic_thresholds();
+        let cfg = consumer.config();
+        assert_eq!(
+            (cfg.pull_threshold_for_queue, cfg.pull_threshold_size_for_queue),
+            (1000, 100),
+            "no owned queue = no division, the user's values survive"
+        );
+
+        own_pull_queues(&consumer, &owned_queue_set("T", 1));
+        consumer.divide_topic_thresholds();
+        let cfg = consumer.config();
+        assert_eq!(
+            (cfg.pull_threshold_for_queue, cfg.pull_threshold_size_for_queue),
+            (2000, 50),
+            "control: one owned queue divides both budgets"
+        );
+    }
+
+    /// The numerator is ALWAYS the topic budget, so the division is idempotent and follows only the
+    /// queue count: 4 queues -> 1000/4 = 250, 8 queues -> 1000/8 = **125**, not 250/8 = 31.
+    #[test]
+    fn divide_topic_thresholds_is_idempotent_and_tracks_the_queue_count() {
+        let mut cfg = ConsumerConfig {
+            pull_threshold_for_topic: 1000,
+            ..Default::default()
+        };
+        assert_eq!(apply_topic_threshold_division(&mut cfg, 4).len(), 1);
+        assert_eq!(cfg.pull_threshold_for_queue, 250);
+
+        let lines = apply_topic_threshold_division(&mut cfg, 4);
+        assert_eq!(
+            cfg.pull_threshold_for_queue, 250,
+            "a second round with the same count must not divide the already-divided knob"
+        );
+        assert!(lines.is_empty(), "an unchanged quotient logs no line");
+
+        let lines = apply_topic_threshold_division(&mut cfg, 8);
+        assert_eq!(
+            cfg.pull_threshold_for_queue, 125,
+            "1000/8 = 125; 31 would mean the divisor was fed the current knob"
+        );
+        assert_eq!(
+            lines,
+            vec!["The pullThresholdForQueue is changed from 250 to 125".to_string()],
+            "<old> in the line is the knob as it stood, not the topic budget"
+        );
+
+        // Same contract through the consumer, where the count genuinely changes between rounds.
+        let consumer = DefaultMQPushConsumer::new("G_divide_tracks").unwrap();
+        consumer.update_config(|c| {
+            c.pull_threshold_for_queue = 1000;
+            c.pull_threshold_for_topic = 1000;
+            c.pull_threshold_size_for_topic = -1;
+        });
+        own_pull_queues(&consumer, &owned_queue_set("T", 4));
+        consumer.divide_topic_thresholds();
+        assert_eq!(consumer.config().pull_threshold_for_queue, 250);
+        consumer.divide_topic_thresholds();
+        assert_eq!(
+            consumer.config().pull_threshold_for_queue, 250,
+            "repeating with an unchanged owned set writes the same number"
+        );
+        own_pull_queues(&consumer, &(4..8).map(|id| queue("T", "broker-a", id)).collect::<Vec<_>>());
+        consumer.divide_topic_thresholds();
+        assert_eq!(consumer.config().pull_threshold_for_queue, 125);
+    }
+
+    /// The divisor is this consumer's **whole** load: every queue it owns, across all subscribed
+    /// topics. A per-topic divisor (here: 2 queues of `T`) would write 500 instead of 333.
+    #[test]
+    fn divide_topic_thresholds_divisor_counts_queues_across_all_topics() {
+        let consumer = DefaultMQPushConsumer::new("G_divide_all_topics").unwrap();
+        consumer.update_config(|c| {
+            c.pull_threshold_for_topic = 1000;
+            c.pull_threshold_size_for_topic = 100;
+        });
+        let mut owned = owned_queue_set("T", 2);
+        owned.push(queue("Other", "broker-b", 0));
+        own_pull_queues(&consumer, &owned);
+        consumer.divide_topic_thresholds();
+        let cfg = consumer.config();
+        assert_eq!(
+            cfg.pull_threshold_for_queue, 333,
+            "1000 / 3 owned queues (2 topics), not 1000 / 2 queues of one topic"
+        );
+        assert_eq!(
+            cfg.pull_threshold_size_for_queue, 33,
+            "the size budget divides by the same all-topic count"
+        );
+    }
+
+    /// POP mode divides over the POP per-queue table (`pop_queues`), not the PULL one. Here the two
+    /// tables deliberately disagree: 4 pull-owned queues vs 2 POP queues, so the two answers differ.
+    #[test]
+    fn divide_topic_thresholds_uses_the_pop_table_in_pop_mode() {
+        let consumer = DefaultMQPushConsumer::new("G_divide_pop").unwrap();
+        consumer.update_config(|c| {
+            c.pop_mode = true;
+            c.pull_threshold_for_queue = 1000;
+            c.pull_threshold_for_topic = 1000;
+            c.pull_threshold_size_for_topic = -1;
+        });
+        own_pull_queues(&consumer, &owned_queue_set("T", 4));
+        own_pop_queues(&consumer, &owned_queue_set("T", 2));
+        consumer.divide_topic_thresholds();
+        assert_eq!(
+            consumer.config().pull_threshold_for_queue, 500,
+            "POP divides over the 2 POP queues; 250 would mean it read the pull table"
+        );
+
+        // Control: the identical tables under PULL mode divide by the 4 pull-owned queues.
+        consumer.update_config(|c| {
+            c.pop_mode = false;
+            c.pull_threshold_for_queue = 1000;
+        });
+        consumer.divide_topic_thresholds();
+        assert_eq!(consumer.config().pull_threshold_for_queue, 250);
+    }
+
+    /// The division is **change-gated** and runs **after** the pull-state update, through the real
+    /// `do_rebalance` against the in-process fake cluster:
+    /// - an unchanged round leaves a hand-set knob alone (it does not divide every 20s tick);
+    /// - a shrinking round divides by the count the round just produced (1), which also pins the
+    ///   order: running before `rebalance_pull_threads` would still see the 2 queues it replaced.
+    #[tokio::test]
+    async fn topic_threshold_division_is_change_gated_and_runs_after_the_pull_state_update() {
+        let cluster = AssignCluster::start().await;
+        let c = pop_consumer_on_cluster("pop-divide-order", &cluster);
+        c.update_config(|cfg| {
+            cfg.pull_threshold_for_queue = 1000;
+            cfg.pull_threshold_for_topic = 1000;
+            cfg.pull_threshold_size_for_topic = -1;
+        });
+
+        // Round 1: the default script grants queues 0/1, so the table this round filled gives 1000/2.
+        c.do_rebalance().await.expect("rebalance must not error");
+        assert_eq!(
+            lock(&c.inner.state).pop_queues.len(),
+            2,
+            "the divisor source table is filled by this round's pull-state update"
+        );
+        assert_eq!(
+            c.config().pull_threshold_for_queue, 500,
+            "1000 / the 2 queues this round owns"
+        );
+
+        // Round 2: same assignment -> `changed` is false, so a hand-set knob survives.
+        c.update_config(|cfg| cfg.pull_threshold_for_queue = 12345);
+        c.do_rebalance().await.unwrap();
+        assert_eq!(
+            c.config().pull_threshold_for_queue, 12345,
+            "an unchanged assignment must not re-run the division"
+        );
+
+        // Round 3: the set shrinks 2 -> 1, so the divisor is the NEW count.
+        cluster.set(Some(AssignFixture::with_assignments(&[(
+            "broker-a", 7, "POP",
+        )])));
+        c.do_rebalance().await.unwrap();
+        assert_eq!(lock(&c.inner.state).pop_queues.len(), 1, "the shrunk table");
+        assert_eq!(
+            c.config().pull_threshold_for_queue, 1000,
+            "1000 / 1; 500 would mean the division ran before the pull-state update, on the old count of 2"
         );
     }
 

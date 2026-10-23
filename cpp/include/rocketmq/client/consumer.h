@@ -316,18 +316,22 @@ public:
     void setMaxReconsumeTimes(int32_t n) { maxReconsumeTimes_ = n; }
     void setPullIntervalMillis(int32_t t) { pullIntervalMillis_ = t; }
     // Per-queue 'pulled but unconsumed' message threshold; pulling for that queue pauses above it (pullThresholdForQueue, default 1000)
+    // When the topic count budget below is enabled this value is overwritten by its divided quotient at
+    // every assignment change, so the getter then reports the divided number, not the one set here.
     void setPullThresholdForQueue(int32_t n) { pullThresholdForQueue_ = n; }
     int32_t pullThresholdForQueue() const { return pullThresholdForQueue_; }
     // Per-queue 'pulled but unconsumed' **byte** threshold, in MiB (pullThresholdSizeForQueue, default 100; <=0 disables it)
+    // Overwritten the same way by the topic byte budget division.
     void setPullThresholdSizeForQueue(int32_t n) { pullThresholdSizeForQueue_ = n; }
     int32_t pullThresholdSizeForQueue() const { return pullThresholdSizeForQueue_; }
     // Upper bound on the queueOffset **span** of pulled-but-unconsumed messages (consumeMessageMaxSpan, default 2000; <=0 disables it).
     // Guards the case where the head message keeps failing to consume and everything behind it stretches the offset span.
     void setConsumeConcurrentlyMaxSpan(int64_t n) { consumeConcurrentlyMaxSpan_ = n; }
     int64_t consumeConcurrentlyMaxSpan() const { return consumeConcurrentlyMaxSpan_; }
-    // Topic-level cumulative thresholds (computed over **all** queues of this topic in this instance,
-    // pullThresholdForTopic / pullThresholdSizeForTopic; default -1 = disabled). This port does not
-    // apportion them by queue count; it compares the cumulative value directly.
+    // Topic-level cache budgets (pullThresholdForTopic / pullThresholdSizeForTopic; default -1 = off).
+    // They are enforced by DIVISION, never by aggregation: whenever the queue assignment of this
+    // consumer changes, each enabled budget is divided over the queues this client owns (floored at 1)
+    // and the quotient overwrites the matching per-queue knob above. Nothing is summed at pull time.
     void setPullThresholdForTopic(int32_t n) { pullThresholdForTopic_ = n; }
     int32_t pullThresholdForTopic() const { return pullThresholdForTopic_; }
     void setPullThresholdSizeForTopic(int32_t n) { pullThresholdSizeForTopic_ = n; }
@@ -646,9 +650,17 @@ public:
     size_t popOrderlyRequestCount() const;
 
     // Register 'this instance owns this queue' (the key set of ProcessQueueTable).
-    // Topic-level flow-control thresholds use it to group the sibling queues of the same topic.
+    // Its size is the divisor of the topic-budget division: the queues of this client that hold live
+    // pull state, counted across **every** subscribed topic.
     void setAssignedQueue(const std::string& key, const MessageQueue& mq);
-    // Pre-pull flow-control decision (the five ProcessQueue thresholds):
+    // Register one queue's POP pull state (the popQueues_ key set) -- the divisor POP mode divides over.
+    void setPopQueue(const std::string& key);
+    // Unit-test entry for one division round over the tables seeded above. doRebalance runs it only on a
+    // round that changed the owned set, and only after that round rebuilt the per-queue pull state.
+    void divideTopicThresholdsForTest();
+    // Pre-pull flow-control decision (the three per-queue ProcessQueue thresholds: message count, bytes
+    // in MiB, offset span; the topic budgets are not checked here -- they were divided into these
+    // per-queue numbers at rebalance):
     // returns true when any is hit and records the hit count in flowControlTriggered().
     // A wrong criterion means 'messages pile up in memory without bound / the offset span runs away', problems a
     // real broker run does not reveal quickly, so it must be pinnable offline; same reason as consumeBatch for keeping it public.
@@ -689,6 +701,10 @@ private:
     // a thread means std::terminate and the whole process goes down with it), and while the consumer is still running the loop is re-entered after 1s, so one stray exception does not turn into a silent 'no more consumption' stall.
     void runLoop(const std::string& what, const std::function<void()>& body);
     void rebalancePullThreads();
+    // Split each enabled topic-level cache budget (-1 = off) over the queues this client owns with live
+    // pull state (mqMap_, or popQueues_ under POP) into the matching per-queue knob, floored at 1.
+    // doRebalance calls it AFTER that round rebuilt the pull state, and only when the owned set changed.
+    void divideTopicThresholds();
     void rebalanceLoop();
     void queuePullLoop(const MessageQueue& mq, uint64_t token);
     // Dispatch: a single thread takes batches from each queue buffer and hands them to the listener
@@ -917,7 +933,8 @@ private:
     int32_t pullThresholdSizeForQueue_ = 100;
     // Per-queue cap of the queueOffset span of pulled-but-unconsumed messages, consumeMessageMaxSpan default 2000
     int64_t consumeConcurrentlyMaxSpan_ = 2000;
-    // Topic-level cumulative thresholds (count / MiB), default -1 = disabled
+    // Topic-level cache budgets (count / MiB), default -1 = off; each enabled one is divided over the
+    // queues this client owns into the matching per-queue knob above whenever the assignment changes.
     int32_t pullThresholdForTopic_ = -1;
     int32_t pullThresholdSizeForTopic_ = -1;
 

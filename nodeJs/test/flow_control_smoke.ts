@@ -1,4 +1,5 @@
-// Push-consumer cache flow control — offline test of the five gates and the log cadence.
+// Push-consumer cache flow control — offline test of the three per-queue gates
+// (count / size / span) and the log cadence.
 //
 // Baseline this suite pins:
 //   * every cache gate compares STRICTLY GREATER THAN its threshold, so a buffer that
@@ -8,8 +9,9 @@
 //     because a 100x error silently disables backpressure;
 //   * the span gate measures the OFFSET span (max-min), so one message that keeps failing
 //     cannot let the offset run away;
-//   * the switches: 0 disables the queue-level byte gate, -1 disables the topic-level ones,
-//     and a count threshold of 0 clamps to 1;
+//   * the switches: 0 disables the queue-level byte gate, and a count threshold of 0
+//     clamps to 1; the topic-level knobs (-1 = off) are NOT pull-time gates at all —
+//     they are divided into the per-queue knobs at rebalance (topic_threshold_smoke);
 //   * the gate measures the not-yet-dispatched remainder, and one judgment records exactly
 //     one tick even when several gates match;
 //   * the WARN fires on the 1st trip and every 1000th after, while the counter keeps
@@ -141,16 +143,31 @@ function consumer(group: string): DefaultMQPushConsumer {
   check('maxSpan 0 disables the span gate', !hit(c, queue(), [msg(0, 1), msg(1_000_000_000, 1)]));
 }
 
-// ---- topic gates -------------------------------------------------------------
+// ---- topic budgets NEVER aggregate at pull time -----------------------------
+// The old contract summed every queue of a topic on each pull judgment; the new
+// one divides the topic budget into the per-queue knob at rebalance. A pull-time
+// topic branch is exactly what must stay dead, so the sibling queues below are
+// staged well past the topic budget and the judgment must not react.
 {
   const c = gatesOff(consumer('G_nodejs_fc_topic'));
   c.pullThresholdForTopic = 2;
+  c.pullThresholdSizeForTopic = 2;
   const q0 = queue(TOPIC, 0), q1 = queue(TOPIC, 1);
-  check('one message in one queue leaves the topic total at 1', !hit(c, q0, [msg(0, 1)]));
-  c.processQueueTable.set(mqKey(q1), new ProcessQueue(false));
-  c.processQueueTable.get(mqKey(q1))!.putMessage([msg(0, 1)]);
-  check('sibling queues of the same topic accumulate', hit(c, q0, [msg(0, 1)]));
-  // Another topic must not mix in.
+  check('one message in one queue does not hit', !hit(c, q0, [msg(0, 1)]));
+  const sib = new ProcessQueue(false);
+  sib.putMessage([msg(0, 1), msg(1, 1), msg(2, 1)]);
+  c.processQueueTable.set(mqKey(q1), sib);
+  check('sibling queues of the same topic no longer add up at pull time',
+    !hit(c, q0, [msg(0, 1), msg(1, 1), msg(2, 1)]));
+  check('the removed aggregation counted nothing', c.flowControlTriggered === 0);
+  // Paired control on the SAME staged buffers: the per-queue count gate still
+  // bites on the very message set that used to trip the topic branch — the
+  // budget is now enforced only through the divided per-queue knob.
+  c.pullThresholdForQueue = 2;
+  check('the per-queue gate trips where the topic aggregation used to',
+    hit(c, q0, [msg(0, 1), msg(1, 1), msg(2, 1)]));
+  check('one judgment records one tick', c.flowControlTriggered === 1);
+  // Another topic must never mix in either way.
   const c2 = gatesOff(consumer('G_nodejs_fc_topic_other'));
   c2.pullThresholdForTopic = 2;
   c2.processQueueTable.set(mqKey(queue(OTHER_TOPIC, 0)), new ProcessQueue(false));

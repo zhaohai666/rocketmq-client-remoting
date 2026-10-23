@@ -14,7 +14,7 @@ It talks straight to the NameServer (route discovery, dynamic addressing) and to
 - One library covers the producer, the Push / Pull / LitePull consumers, the admin client,
   message tracing, ACL and TLS.
 - Every capability is verified against a real RocketMQ 5.5.1 cluster (namesrv 9876 + broker 10911);
-  offline behaviour is pinned by 1000 unit tests.
+  offline behaviour is pinned by 1043 unit tests.
 
 ## Prerequisites
 
@@ -36,7 +36,7 @@ Measured on this machine:
 | Command | Result |
 | --- | --- |
 | `dotnet build --no-incremental` | `0 Warning(s)` / `0 Error(s)`, elapsed `00:00:17.94` |
-| `dotnet test tests/RocketMQ.Client.Tests` | `Passed! - Failed:     0, Passed:  1033, Skipped:     0, Total:  1033, Duration: 4 m 35 s` |
+| `dotnet test tests/RocketMQ.Client.Tests` | `Passed! - Failed:     0, Passed:  1043, Skipped:     0, Total:  1043, Duration: 4 m 38 s` |
 
 `Directory.Build.props` turns `TreatWarningsAsErrors=true` on globally, so "builds" means "builds with
 zero warnings". The test summary line follows the machine locale — grep for `Passed!` / `Failed:` when
@@ -283,7 +283,8 @@ consumer.PopThresholdForQueue = 96;
 Common knobs: `ConsumeFromWhere = ConsumeFromWhere.ConsumeFromFirstOffset` (also
 `ConsumeFromLastOffset` / `ConsumeFromTimestamp`), `SetConsumeThreadNums(n)`, `PullBatchSize`,
 `PullThresholdForQueue` / `PullThresholdSizeForQueue` / `PullThresholdForTopic` (pre-pull flow
-control), `MaxReconsumeTimes`, `SuspendCurrentQueueTimeMillis`,
+control: three per-queue gates, each enabled topic budget divided over the owned queues on a changed
+rebalance round), `MaxReconsumeTimes`, `SuspendCurrentQueueTimeMillis`,
 `SetAllocateMessageQueueStrategy(new AllocateMessageQueueConsistentHash())`,
 `Suspend()` / `Resume()` (stop pulling without going offline), `SetEnableMsgTrace(true)`,
 `consumer.SubscribedTopics()` / `ConsumedCount` / `ClientId`.
@@ -524,7 +525,7 @@ connection.
   FilterMessage hooks, ACL signing, dynamic NameServer addressing, fault-avoiding queue selection
 - ✅ Compression: zlib / LZ4 / ZSTD; TLS: `SslStream`, test-mode plus strict verification / mTLS
 - ✅ Client logging: size-based rotation, dual output to stderr and file
-- ✅ 1033 unit tests; 40 live-cluster subcommands in `rmq` (master/slave, fault injection,
+- ✅ 1043 unit tests; 40 live-cluster subcommands in `rmq` (master/slave, fault injection,
   compression interoperability matrix)
 
 ## Client Logging
@@ -610,7 +611,7 @@ Subcommands:
 | `trace` | End-to-end message tracing (needs `traceTopicEnable=true`) |
 | `hook` | CheckForbidden / FilterMessage hooks |
 | `backpressure` | Async-send fair semaphores: message and byte gates, rejection accounting, runtime expansion |
-| `flow-control` | The five pre-pull flow-control thresholds + startup numeric gates |
+| `flow-control` | the three per-queue cache gates before pulling (topic budgets divided over the owned queues at rebalance) + startup numeric gates |
 | `async-send` | Async send core: caller never blocks, thread accounting, no cross-talk, drain on `Shutdown` |
 | `validators-live` | Name validation: local fast rejection + valid names round trip + addressing failure classification |
 | `recall` | Timed message recall (enables and restores `recallMessageEnable` itself) |
@@ -684,7 +685,7 @@ csharp/
 │       ├── BackPressure.cs  Latency.cs  ConsumeExecutor.cs
 │       ├── TopAddressing.cs        # dynamic NameServer addressing
 │       ├── ConsumerStats.cs  Validators.cs  ClientException.cs
-├── tests/RocketMQ.Client.Tests/    # xunit, 1000 tests (codec/route/logging/transport/tracing/async/flow control/offsets…)
+├── tests/RocketMQ.Client.Tests/    # xunit, 1043 tests (codec/route/logging/transport/tracing/async/flow control/offsets…)
 └── examples/RocketMQ.Examples/     # the rmq live-cluster tool (see above)
 ```
 

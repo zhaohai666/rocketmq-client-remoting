@@ -24,7 +24,7 @@ git clone <本仓库> && cd rocketmq-client-remoting/nodeJs
 node --experimental-strip-types selfcheck.ts
 ```
 
-`selfcheck.ts` 加载 `src/` 全部 **65** 个模块并依次跑 **36** 套离线冒烟（两份清单都由目录树推导，新增文件不会漏出自检），2026-10-23 实测 **ALL GREEN**，共 **1133** 项检查。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
+`selfcheck.ts` 加载 `src/` 全部 **65** 个模块并依次跑 **37** 套离线冒烟（两份清单都由目录树推导，新增文件不会漏出自检），2026-10-24 实测 **ALL GREEN**，共 **1168** 项检查。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
 
 | 套件 | 实测 |
 | --- | --- |
@@ -44,7 +44,7 @@ node --experimental-strip-types selfcheck.ts
 | `test/consumer_smoke.ts` | 30 通过 / 0 失败 |
 | `test/consumer_status_reply_smoke.ts`（221 状态应答 + 307/309 未托管组 + 220 单向） | 22 通过 / 0 失败 |
 | `test/fixes2_smoke.ts` | 40 项检查通过 |
-| `test/flow_control_smoke.ts`（缓存闸门 50ms、broker 215 的 20ms、其余拉取失败 500ms，POP 队列同一条判断） | 62 项检查通过 |
+| `test/flow_control_smoke.ts`（每队列三条闸门：只看本队列缓存、缓存闸门 50ms、broker 215 的 20ms、其余拉取失败 500ms，POP 队列同一条判断） | 65 项检查通过 |
 | `test/heartbeat_v2_beat_smoke.ts` | 28 通过 / 0 失败 |
 | `test/heartbeat_v2_smoke.ts` | 30 通过 / 0 失败 |
 | `test/initial_offset_policy_smoke.ts`（初始位点：广播 / TIMESTAMP / %RETRY% / SQL92） | 40 通过 / 0 失败 |
@@ -62,6 +62,7 @@ node --experimental-strip-types selfcheck.ts
 | `test/socks_smoke.ts`（SOCKS 代理握手 + 经代理建连） | 51 通过 / 0 失败 |
 | `test/static_topic_smoke.ts` | 29 通过 / 0 失败 |
 | `test/stats_smoke.ts` | 14 通过 / 0 失败 |
+| `test/topic_threshold_smoke.ts`（topic 预算在重平衡改变分配时除以自有队列数、把商写成每队列闸门；闸门不累计兄弟队列） | 32 项检查通过 |
 | `test/transaction_schedule_guard_smoke.ts`（事务半消息拒绝携带延迟/定时属性的消息） | 17 通过 / 0 失败 |
 | `test/vip_channel_smoke.ts`（VIP channel port-2 改写） | 36 通过 / 0 失败 |
 
@@ -394,7 +395,7 @@ nodeJs/
 │                        # 队列分配/位点存储/消费统计/轨迹/背压/traceparent
 ├── examples/            # 真机 live 工具（见「真实集群联调」）
 ├── test/                # 离线冒烟（协议往返、攒批重试、背压闸门、分配、位点、轨迹、统计、命名空间、POP、admin）
-├── selfcheck.ts         # 一键离线自检（模块加载 + 36 套冒烟）
+├── selfcheck.ts         # 一键离线自检（模块加载 + 37 套冒烟）
 └── package.json         # engines: node >= 22
 ```
 

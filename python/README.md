@@ -24,7 +24,7 @@ python3 -m venv .venv
 .venv/bin/pip install -e .                     # 顶层包：client / common / remoting
 
 .venv/bin/pip install pytest                   # 只有跑单元测试才需要它
-.venv/bin/python -m pytest tests/ -q           # 1632 passed, 4 skipped（123.4s）
+.venv/bin/python -m pytest tests/ -q           # 1638 passed, 4 skipped（123.2s）
 .venv/bin/python selfcheck.py                  # selfcheck: 7/7 passed
 ```
 
@@ -365,7 +365,7 @@ TCP 建连后、TLS 握手前完成 SOCKS CONNECT；NameServer HTTP 动态取址
 | 普通 / 顺序（selector）/ 定点 / 延迟定时 / 事务两阶段 / 批量 / 单向 / 异步（含公平信号量背压） | ✅ |
 | Request-Reply（325 发送 + 326 推回，同步与异步两种形态） | ✅ |
 | 定时消息撤回 `recall_message`（370，句柄来自 `SendResult.recall_handle`） | ✅ |
-| Push Consumer：并发 / 顺序监听、广播、流控五阈值、位点修正与重置、停摆自愈、挂起消息清扫 | ✅ |
+| Push Consumer：并发 / 顺序监听、广播、每队列三条缓存闸门（topic 预算在重平衡时摊到每队列）、位点修正与重置、停摆自愈、挂起消息清扫 | ✅ |
 | Pull Consumer：手动拉取 + 长轮询 + 手动提交位点 + 按时间戳查位点 | ✅ |
 | Lite Pull Consumer：`poll` / `assign` / `seek` / `pause` / `commit`、三张位点表、topic 队列变更监听 | ✅ |
 | POP 消费循环（`pop_mode`，含 ack / 续期 / POP 顺序） | ✅ |
@@ -435,7 +435,7 @@ TCP 建连后、TLS 握手前完成 SOCKS CONNECT；NameServer HTTP 动态取址
 | `verify_consumer_heartbeat_slave_live.py` | 消费者心跳扇出到从节点（需集群里有一台从节点） |
 | `verify_correct_tags_offset_live.py` | 空应答也把已提交位点推走（correctTagsOffset） |
 | `verify_fail_fast_live.py` | broker 真死时在途请求立刻有终态（会停一次 broker 再拉起） |
-| `verify_flow_control_live.py` | 拉取前流控的五个阈值 + 启动期数值闸门 |
+| `verify_flow_control_live.py` | 拉取前每队列三条缓存闸门（topic 预算摊到每队列）+ 启动期数值闸门 |
 | `verify_heartbeat_v2_live.py` | 心跳 V2 打到真 broker：broker 回 `IS_SUPPORT_HEART_BEAT_V2`、按组的 `group -> fingerprint` 表真的驱动 `IS_SUB_CHANGE`（V1 一轮后首个 V2 轮算变化、下一轮不算、订阅加宽又算），归一化后等价 body 的 fingerprint 与 broker 记下的相等，`withoutSub` 轻 body 不清空 broker 侧订阅集（204 仍能看到），换一个从未交过轻 body 的组则 204 什么都没有；真推消费者走 V2 链路时轻轮次确实上线、每轮被接受、tag 过滤仍然生效、组仍在册；关掉 opt-in 的同一消费者是对照——线上没有一个非零 fingerprint 或 withoutSub，消费结果一致 |
 | `verify_hook_live.py` | CheckForbidden / FilterMessage 钩子的真实拦截 |
 | `verify_interval_live.py` | 路由刷新周期与位点落盘周期按配置生效（两条不同周期对照） |

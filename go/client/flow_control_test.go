@@ -223,3 +223,113 @@ func TestFlowControlWarnUsesTheExposedTripCounter(t *testing.T) {
 		t.Errorf("after 1001 trips (getter says %d) the cadence must warn", got)
 	}
 }
+
+// fcStageQueues makes the consumer OWN len(counts) queues with live pull state and buffers
+// that many messages in each one, exactly as a pull round would.
+func fcStageQueues(c *DefaultMQPushConsumer, counts ...int) []*processQueue {
+	out := make([]*processQueue, 0, len(counts))
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i, n := range counts {
+		msgs := make([]*common.MessageExt, 0, n)
+		for j := 0; j < n; j++ {
+			msgs = append(msgs, fcMsg(int64(j), 10))
+		}
+		pq := newProcessQueue(false)
+		pq.PutMessage(msgs)
+		c.processQueueTable[fcQueue(int32(i))] = pq
+		out = append(out, pq)
+	}
+	return out
+}
+
+// fcPerQueueKnobs reads the two per-queue gates, i.e. what the pull-time gate uses.
+func fcPerQueueKnobs(c *DefaultMQPushConsumer) (count, size int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.pullThresholdForQueue, c.pullThresholdSizeForQueue
+}
+
+// Only three per-queue gates exist at pull time, and each names itself: an unpaused buffer
+// names nothing, so a reason string can never come from a branch the test did not stage.
+func TestFlowControlCacheGateReasonNamesOnlyThePerQueueGates(t *testing.T) {
+	c := fcConsumer(t, "GID_go_fc_reason")
+	c.SetPullThresholdForQueue(2)
+	c.SetPullThresholdSizeForQueue(0)
+	c.SetConsumeConcurrentlyMaxSpan(0)
+	pq := newProcessQueue(false)
+	if reason := c.cacheGateReason(pq); reason != "" {
+		t.Errorf("empty buffer reason = %q, want no gate", reason)
+	}
+	if reason := c.cacheGateReason(fcStageQueue(c, 0, 3, 10)); reason != "count" {
+		t.Errorf("over-buffered reason = %q, want the message-count gate", reason)
+	}
+
+	c.SetPullThresholdForQueue(1 << 30)
+	c.SetPullThresholdSizeForQueue(1)
+	if reason := c.cacheGateReason(fcStageQueue(c, 0, 1, mib+1)); reason != "size" {
+		t.Errorf("over-bytes buffer reason = %q, want the byte gate", reason)
+	}
+
+	c.SetPullThresholdSizeForQueue(0)
+	c.SetConsumeConcurrentlyMaxSpan(10)
+	if reason := c.cacheGateReason(fcStageQueue(c, 0, 2, 1, fcMsg(0, 1), fcMsg(99, 1))); reason != "span" {
+		t.Errorf("wide-offset buffer reason = %q, want the offset-span gate", reason)
+	}
+}
+
+// fcStageQueue buffers into the i-th owned queue, replacing its content, so one gate can be
+// tripped while the sibling queues stay empty.
+func fcStageQueue(c *DefaultMQPushConsumer, index, count, bodyBytes int, override ...*common.MessageExt) *processQueue {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	pq, ok := c.processQueueTable[fcQueue(int32(index))]
+	if !ok {
+		pq = newProcessQueue(false)
+		c.processQueueTable[fcQueue(int32(index))] = pq
+	}
+	pq.Clear()
+	msgs := override
+	if len(msgs) == 0 {
+		msgs = fcMsgs(count, bodyBytes)
+	}
+	pq.PutMessage(msgs)
+	return pq
+}
+
+// The topic budget is split over the owned queues at rebalance and the pull-time gate then
+// reads ONLY that queue's buffer. Reverting to a pull-time sum of the topic's queues reddens
+// the first leg: the four buffers together reach the topic budget exactly.
+func TestFlowControlGateNeverAddsUpTheQueuesOfATopic(t *testing.T) {
+	c := fcConsumer(t, "GID_go_fc_no_topic_sum")
+	c.SetPullThresholdForQueue(1 << 30)
+	c.SetPullThresholdForTopic(1000)
+	queues := fcStageQueues(c, 250, 250, 250, 250)
+
+	c.divideTopicThresholds()
+	if got, _ := fcPerQueueKnobs(c); got != 250 {
+		t.Fatalf("per-queue count gate = %d, want the 1000-message topic budget split over 4 queues", got)
+	}
+	// 1000 messages sit in the topic cache: each queue is exactly at its own share, and a
+	// gate that is strictly greater lets all four keep pulling.
+	for i, pq := range queues {
+		if reason := c.cacheGateReason(pq); reason != "" {
+			t.Errorf("queue %d pauses with %q at its divided share; the gate must judge this queue alone", i, reason)
+		}
+	}
+
+	// One message past the divided share pauses that queue, on the count gate: the byte and
+	// span gates are off in this fixture, so no other branch can be the reason.
+	full := fcStageQueue(c, 1, 251, 10)
+	if reason := c.cacheGateReason(full); reason != "count" {
+		t.Errorf("queue 1 at 251 messages under a 250 gate = %q, want the count gate", reason)
+	}
+	if !c.flowControlHit(fcQueue(1), full) {
+		t.Errorf("a queue over its divided share must pause")
+	}
+	for _, i := range []int{0, 2, 3} {
+		if reason := c.cacheGateReason(queues[i]); reason != "" {
+			t.Errorf("queue %d stayed at its share but pauses with %q; a full sibling must not spread", i, reason)
+		}
+	}
+}

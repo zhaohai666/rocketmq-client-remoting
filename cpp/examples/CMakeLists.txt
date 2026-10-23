@@ -124,7 +124,8 @@ target_link_libraries(rmq_live_async_send PRIVATE rocketmq::remoting)
 add_executable(rmq_live_send_header live_send_header.cpp)
 target_link_libraries(rmq_live_send_header PRIVATE rocketmq::remoting)
 
-# The five pre-pull flow-control thresholds real-machine integration: the gate really gets hit + after a hit not one message is lost (not packed into ctest)
+# The three per-queue pre-pull flow-control thresholds and the topic budget divided into them, real-machine
+# integration: the gate really gets hit + after a hit not one message is lost (not packed into ctest)
 add_executable(rmq_live_flow_control live_flow_control.cpp)
 target_link_libraries(rmq_live_flow_control PRIVATE rocketmq::remoting)
 

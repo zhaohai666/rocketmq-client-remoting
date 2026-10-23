@@ -140,6 +140,12 @@ type DefaultMQPushConsumer struct {
 	corePoolSize                  int
 	adjustThreadPoolNumsThreshold int64
 
+	// The cache gates, in two tiers. The pull-time gate reads ONLY the three
+	// per-queue values below and compares them against one queue's own buffer.
+	// The two topic budgets (-1 = off) are never enforced by summing a topic's
+	// queues: each one is divided by the owned queue count when the assignment
+	// changes and the quotient overwrites the matching per-queue value (see
+	// divideTopicThresholds).
 	consumeConcurrentlyMaxSpan int64
 	pullThresholdForQueue      int64
 	pullThresholdSizeForQueue  int64
@@ -773,28 +779,36 @@ func (c *DefaultMQPushConsumer) SetConsumeConcurrentlyMaxSpan(v int64) {
 	c.consumeConcurrentlyMaxSpan = v
 }
 
-// SetPullThresholdForQueue / Size / Topic variants.
+// SetPullThresholdForQueue sets the per-queue buffered-message gate. A topic
+// budget (SetPullThresholdForTopic) overwrites this at every assignment change.
 func (c *DefaultMQPushConsumer) SetPullThresholdForQueue(v int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.pullThresholdForQueue = v
 }
 
-// SetPullThresholdSizeForQueue sets the per-queue byte threshold (MB).
+// SetPullThresholdSizeForQueue sets the per-queue byte gate (MB). A topic byte
+// budget (SetPullThresholdSizeForTopic) overwrites this at every assignment
+// change.
 func (c *DefaultMQPushConsumer) SetPullThresholdSizeForQueue(v int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.pullThresholdSizeForQueue = v
 }
 
-// SetPullThresholdForTopic sets the per-topic count threshold (-1 = off).
+// SetPullThresholdForTopic sets the per-topic buffered-message budget (-1 = off).
+// It never gates a pull by itself: at every assignment change it is divided by
+// the number of queues this consumer owns and the quotient becomes
+// pullThresholdForQueue.
 func (c *DefaultMQPushConsumer) SetPullThresholdForTopic(v int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.pullThresholdForTopic = v
 }
 
-// SetPullThresholdSizeForTopic sets the per-topic byte threshold (-1 = off).
+// SetPullThresholdSizeForTopic sets the per-topic byte budget in MB (-1 = off).
+// Like the count variant it is divided over the owned queues at every assignment
+// change and the quotient becomes pullThresholdSizeForQueue.
 func (c *DefaultMQPushConsumer) SetPullThresholdSizeForTopic(v int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1656,8 +1670,11 @@ func (c *DefaultMQPushConsumer) checkConfigRanges() error {
 // stops receiving) or overflows the drop/flow-control arithmetic. Reporting it
 // from the broker instead is several beats too late.
 //
-// pullThresholdForTopic / pullThresholdSizeForTopic use -1 as the "unset, use
-// the per-queue thresholds" sentinel and are NOT range-checked.
+// pullThresholdForTopic / pullThresholdSizeForTopic use -1 as the "off"
+// sentinel and are NOT range-checked. When set, they are not enforced by adding
+// the queues of a topic together at pull time: each one is divided by the owned
+// queue count at rebalance and the quotient becomes the per-queue threshold
+// (see divideTopicThresholds).
 //
 // Caller must hold c.mu (Start() runs it inside its own critical section).
 func (c *DefaultMQPushConsumer) checkConfigRangesLocked() error {
@@ -1776,7 +1793,11 @@ func (c *DefaultMQPushConsumer) doRebalance() error {
 	c.assigned = assigned
 	c.mu.Unlock()
 	now := c.assignedSet()
-	if len(now) != len(was) {
+	// A SET comparison, not a size comparison: a swap that keeps the count (one
+	// queue lost and another gained) changes which buffers exist, so it is a
+	// change and the topic budgets have to be re-divided over the new queue set.
+	changed := assignmentChanged(was, now)
+	if changed {
 		common.LogInfof("rebalance result changed, group=%s clientId=%s assigned=%d",
 			c.consumerGroup, c.clientID, len(assigned))
 	}
@@ -1819,7 +1840,77 @@ func (c *DefaultMQPushConsumer) doRebalance() error {
 		}
 	}
 	c.syncPullLoops()
+	// AFTER the per-queue pull state has been rebuilt for this round, so the
+	// division uses this round's queue count and not the previous one's.
+	if changed {
+		c.divideTopicThresholds()
+	}
 	return nil
+}
+
+// assignmentChanged reports whether the queue SET differs between two rebalance
+// rounds. A size comparison is not enough: losing one queue and gaining another
+// keeps the count while changing who owns what, and every topic budget has to be
+// re-split over the new set.
+func assignmentChanged(was, now map[common.MessageQueue]struct{}) bool {
+	if len(was) != len(now) {
+		return true
+	}
+	for mq := range now {
+		if _, ok := was[mq]; !ok {
+			return true
+		}
+	}
+	return false
+}
+
+// divideTopicThresholds turns each topic-level cache budget into a per-queue one
+// for the queues this client owns right now: every enabled knob (-1 means off) is
+// divided by that queue count — ALL of this consumer's queues, across every
+// topic — and the quotient is written into the matching per-queue knob.
+//
+// The dividend is always the topic knob, never the current per-queue value, so
+// repeating the division with an unchanged queue count writes the same number
+// again. The per-queue value the user configured is deliberately overwritten: the
+// queue count is the only thing that can make a topic-wide budget meaningful per
+// queue, and the pull-time gate never looks at the topic knobs.
+//
+// The divisor is the live per-queue state table of the current consumption mode,
+// which the caller must have refreshed first: processQueueTable on the pull path,
+// popQueueTable under POP.
+func (c *DefaultMQPushConsumer) divideTopicThresholds() {
+	c.mu.Lock()
+	owned := int64(len(c.processQueueTable))
+	if c.popMode {
+		owned = int64(len(c.popQueueTable))
+	}
+	var countFrom, countTo, sizeFrom, sizeTo int64
+	countChanged, sizeChanged := false, false
+	if owned != 0 {
+		if topic := c.pullThresholdForTopic; topic != -1 {
+			if to := maxInt64(1, topic/owned); to != c.pullThresholdForQueue {
+				countFrom, countTo = c.pullThresholdForQueue, to
+				c.pullThresholdForQueue = to
+				countChanged = true
+			}
+		}
+		if topic := c.pullThresholdSizeForTopic; topic != -1 {
+			if to := maxInt64(1, topic/owned); to != c.pullThresholdSizeForQueue {
+				sizeFrom, sizeTo = c.pullThresholdSizeForQueue, to
+				c.pullThresholdSizeForQueue = to
+				sizeChanged = true
+			}
+		}
+	}
+	c.mu.Unlock()
+
+	// Off the lock: the two lines only report what the write above decided.
+	if countChanged {
+		common.LogInfof("The pullThresholdForQueue is changed from %d to %d", countFrom, countTo)
+	}
+	if sizeChanged {
+		common.LogInfof("The pullThresholdSizeForQueue is changed from %d to %d", sizeFrom, sizeTo)
+	}
 }
 
 const queryAssignmentTimeoutMillis int64 = 3000

@@ -42,7 +42,8 @@ public class FlowControlTests
     }
 
     /// <summary>Preloads a batch of messages into some queue's buffer and registers that
-    /// queue as assigned (the topic-level thresholds aggregate through this table).</summary>
+    /// queue as owned (the owned-queue table is the divisor of the topic-level budgets, see
+    /// TopicThresholdTests).</summary>
     private static void Stage(DefaultMQPushConsumer c, MessageQueue mq, List<MessageExt> msgs)
     {
         string key = DefaultMQPushConsumer.OffsetKeyForTest(mq);
@@ -269,49 +270,87 @@ public class FlowControlTests
         Assert.False(Hit(c, mq));
     }
 
+    /// <summary>The pull gate judges ONE queue's own buffer: a topic-level budget reaches it
+    /// only as the divided per-queue number (see TopicThresholdTests), never by adding the
+    /// sibling queues up. Four queues of a 1000-message topic budget therefore sit at 250
+    /// each -- 1000 messages cached for this topic on this instance -- and not one queue
+    /// pauses. Reverting to the pull-time aggregation reddens the first leg (topic total
+    /// 1000 >= 1000 stops all four).</summary>
     [Fact]
-    public void TopicCountGate_AggregatesSiblings_ButNotOtherTopics()
+    public void PullGate_NeverSumsSiblings_OnlyTheDividedSharePauses()
     {
-        var c = new DefaultMQPushConsumer("GID_FlowControlTopicCountNet");
+        var c = new DefaultMQPushConsumer("GID_FlowControlNoSumNet");
         MessageQueue q0 = QueueOf(Topic, 0);
         MessageQueue q1 = QueueOf(Topic, 1);
-        MessageQueue other = QueueOf(OtherTopic, 0);
+        MessageQueue q2 = QueueOf(Topic, 2);
+        MessageQueue q3 = QueueOf(Topic, 3);
         GatesOffExceptCounts(c);
-        c.PullThresholdForTopic = 2;
-        // a single queue with 1 message: the topic level only sees 1 message as well
-        Stage(c, q0, NSized(Topic, 1, 1));
-        Assert.False(Hit(c, q0));
-        // sibling queues of the same topic with 1 message each => 2 accumulated, and both queues must be stopped
-        Stage(c, q1, NSized(Topic, 1, 1));
-        Assert.True(Hit(c, q0));
-        Assert.True(Hit(c, q1));
-        // another topic must not be mixed in: drop this topic to 1 message and pile 5 onto the other topic
-        Stage(c, q1, new List<MessageExt>());
-        Stage(c, other, NSized(OtherTopic, 1, 5));
-        Assert.False(Hit(c, q0), "another topic's buffer must not count towards this topic's total");
+        c.PullThresholdForTopic = 1000;
+        MessageQueue[] all = { q0, q1, q2, q3 };
+        foreach (MessageQueue mq in all)
+        {
+            Stage(c, mq, NSized(Topic, 100, 250));
+        }
+
+        // The division over the 4 owned queues is what changes, not the pull-time total.
+        c.DivideTopicThresholdsForTest();
+        Assert.Equal(250, c.PullThresholdForQueue);
+        foreach (MessageQueue mq in all)
+        {
+            Assert.False(Hit(c, mq), $"{mq} sits at its own share of 250: a sibling's"
+                                     + " buffer must not pause it");
+        }
+
+        Assert.Equal(0L, c.FlowControlTriggered);
+
+        // One queue over its own share pauses, and it pauses on the COUNT reason of its own
+        // buffer -- not on a topic total; its three siblings stay unpaused.
+        Stage(c, q0, NSized(Topic, 100, 251));
+        List<string> warns = CaptureWarnTrips(c, q0, 1);
+        Assert.Equal(1L, c.FlowControlTriggered);
+        Assert.Single(warns);
+        Assert.Contains("count=251", warns[0]);
+        Assert.DoesNotContain("topicCount", warns[0]);
+        foreach (MessageQueue mq in new[] { q1, q2, q3 })
+        {
+            Assert.False(Hit(c, mq), $"{mq} is at 250 with its sibling over its share");
+        }
+
+        // A queue of ANOTHER topic is not a sibling at all: the count gate is per queue and
+        // the topic knobs are not read here.
+        MessageQueue other = QueueOf(OtherTopic, 0);
+        Stage(c, other, NSized(OtherTopic, 100, 250));
+        Assert.False(Hit(c, other));
     }
 
+    /// <summary>Same contract for the byte budget: the divided gate judges this queue's own
+    /// bytes, so a topic-wide total over the budget is still inside the limit as long as no
+    /// single queue is. With the old pull-time topic sum these two half-MiB buffers (1.2MiB
+    /// across the topic against a 1MiB budget) would both pause.</summary>
     [Fact]
-    public void TopicSizeGate_HasItsOwnSwitch_AndRunsLast()
+    public void SizeGate_JudgesOwnBytes_AndNotTheSiblingsTotal()
     {
-        var c = new DefaultMQPushConsumer("GID_FlowControlTopicSizeNet");
+        var c = new DefaultMQPushConsumer("GID_FlowControlNoSumSizeNet");
         MessageQueue q0 = QueueOf(Topic, 0);
         MessageQueue q1 = QueueOf(Topic, 1);
         GatesOffExceptCounts(c);
-        // the queue-level byte gate is **off** (0), only the topic level remains: misusing the queue-level switch as the gate makes this silently ineffective
-        c.PullThresholdSizeForTopic = 1;
+        // 2 MiB for the topic over the 2 queues this consumer owns -> 1 MiB per queue, and
+        // the queue-level switch is only ever written by the division.
+        c.PullThresholdSizeForTopic = 2;
         Stage(c, q0, new List<MessageExt> { Sized(Topic, MiB / 2, 0) });
-        Assert.False(Hit(c, q0));
-        Stage(c, q1, new List<MessageExt> { Sized(Topic, 3 * MiB / 2, 0) });
-        Assert.True(Hit(c, q0), "with the queue-level size gate off the topic-level size must still apply");
+        Stage(c, q1, new List<MessageExt> { Sized(Topic, MiB / 2, 0) });
+        c.DivideTopicThresholdsForTest();
+        Assert.Equal(1, c.PullThresholdSizeForQueue);
+
+        Assert.False(Hit(c, q0), "0.5MiB of its own is inside the 1MiB share");
+        Assert.False(Hit(c, q1), "the sibling's 0.5MiB must not be added to this queue");
+        Assert.Equal(0L, c.FlowControlTriggered);
+
+        // Now q1 really is over its own share: one decision records exactly one slot.
+        Stage(c, q1, new List<MessageExt> { Sized(Topic, 2 * MiB, 0) });
         Assert.True(Hit(c, q1));
-        // while the queue-level one is still on, the queue level matches first (decision order: count -> bytes -> span -> topic count -> topic bytes)
-        c.PullThresholdSizeForQueue = 1;
-        Stage(c, q0, new List<MessageExt> { Sized(Topic, 2 * MiB, 0) });
-        long before = c.FlowControlTriggered;
-        Assert.True(Hit(c, q0));
-        // one decision records exactly one slot, even when several gates match at once
-        Assert.Equal(before + 1, c.FlowControlTriggered);
+        Assert.Equal(1L, c.FlowControlTriggered);
+        Assert.False(Hit(c, q0));
     }
 
     [Fact]

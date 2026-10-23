@@ -18,9 +18,12 @@ declare(strict_types=1);
  *    request for that queue at all, and the request reappears the moment the pause is due. The
  *    queue with an empty buffer is the paired control: it pulls on the very same round, and a
  *    second queue keeps pulling while the first one sits in its own pause.
- * 3. A throttled queue trips on every round, so only the 1st trip and then every 1000th warns
- *    while every trip keeps its debug line; both are read from the log handler, and the modulo
- *    itself is pinned through the predicate the production code calls.
+ * 3. A throttled queue trips on every round, so only the 1st trip warns while every trip keeps its
+ *    debug line; both are read from the log handler, and the modulo itself is pinned through the
+ *    predicate the production code calls.
+ * 4. A gate judges **one queue's own buffer** and nothing else: the two topic-level budgets are not
+ *    consulted at pull time (they are split into the per-queue knobs during rebalance), so the
+ *    sibling queues of a topic never add up to a pause.
  *
  * The gates are driven by seeding the queue's cached messages and calling the gate directly, and a
  * pull round is driven one queue at a time against an instance double that records the requests it
@@ -228,6 +231,15 @@ final class RunClientFlowControl
     {
         $key = message_queue_key($mq);
         $this->setProp($c, 'pending', [$key => $messages]);
+        return (bool) $this->call($c, 'flowControlHit', [$mq, $key]);
+    }
+
+    /**
+     * Ask the gate about one queue while leaving the buffer state of every other queue untouched --
+     * the only way to tell "this queue is full" apart from "this topic is full".
+     */
+    private function gate(DefaultMQPushConsumer $c, MessageQueue $mq, string $key): bool
+    {
         return (bool) $this->call($c, 'flowControlHit', [$mq, $key]);
     }
 
@@ -748,6 +760,99 @@ final class RunClientFlowControl
         $this->checkSame(0, $c2->flowControlTriggeredCount(), 'a round that does not trip counts nothing');
     }
 
+    // ================================================================ 11. the gate never sums siblings
+
+    /**
+     * A topic budget is split over the owned queues at rebalance, so the pull-time gate reads ONLY
+     * the queue's own buffer. Four queues holding the divided share of a 1000-message budget (250
+     * each, 1000 in total across the topic) therefore all keep pulling, and one queue at 251 pauses
+     * on its own count gate while its three siblings at 250 do not.
+     *
+     * Reverting the gate to a pull-time sum of the topic's queues reddens the first leg (the four
+     * buffers reach the topic budget exactly) and the closing control leg (the same 1000 messages
+     * under a wide-open per-queue gate, which the removed `topicCount`/`topicSize` branch would pause
+     * on every one of the four queues).
+     */
+    private function testGateNeverSumsTheQueuesOfATopic(): void
+    {
+        $this->captureLogs(Logger::DEBUG);
+        try {
+            $mqMap = [];
+            $pending = [];
+            $held = [];
+            foreach ([0, 1, 2, 3] as $i) {
+                $mq = new MessageQueue('FCSiblings', 'b-fc', $i);
+                $key = message_queue_key($mq);
+                $mqMap[$key] = $mq;
+                $pending[$key] = $this->msgs(range(0, 249));
+                $held[$i] = [$mq, $key];
+            }
+
+            // The knobs exactly as the rebalance division leaves them for a 1000-message budget over
+            // four queues; both topic knobs stay set, because the gate must not read them any more.
+            $c = $this->siblingConsumer('GID-FC-NO-TOPIC-SUM', $mqMap, $pending, 250, 25);
+            $this->checkSame(1000, array_sum(array_map('count', $pending)),
+                'the topic really holds all 1000 cached messages, spread over four queues');
+
+            foreach ($held as $i => [$mq, $key]) {
+                $this->checkSame(false, $this->gate($c, $mq, $key),
+                    "queue $i at its divided share of 250 keeps pulling: the gate judges this queue alone");
+            }
+            $this->checkSame(0, $c->flowControlTriggeredCount(),
+                'the whole topic budget cached across four queues trips no gate at all');
+
+            // One queue one message past its share pauses, on its own count ...
+            $pending[$held[1][1]] = $this->msgs(range(0, 250));
+            $this->setProp($c, 'pending', $pending);
+            $this->checkSame(true, $this->gate($c, $held[1][0], $held[1][1]),
+                'a queue one message past its divided share pauses');
+            $this->check($this->lastDebugContains('count=251'),
+                'the paused queue is paused by its own 251, not by a topic total of 1001');
+
+            // ... while the three siblings still at their share keep pulling.
+            foreach ([0, 2, 3] as $i) {
+                $this->checkSame(false, $this->gate($c, $held[$i][0], $held[$i][1]),
+                    "queue $i stayed at its share, and a full sibling does not spread to it");
+            }
+            $this->checkSame(1, $c->flowControlTriggeredCount(),
+                'exactly one queue tripped, so no sibling total was ever consulted');
+
+            // Paired control: the same four 250-message buffers with the per-queue gate wide open and
+            // both topic budgets still enabled. Nothing is summed at pull time, so nothing trips --
+            // the removed aggregation branch would have paused all four queues here.
+            $open = $this->siblingConsumer(
+                'GID-FC-NO-TOPIC-SUM-OPEN', $mqMap, $pending, 100000, 0);
+            foreach ($held as $i => [$mq, $key]) {
+                $this->checkSame(false, $this->gate($open, $mq, $key),
+                    "queue $i pulls with a 1000-message topic budget and no summing ($i)");
+            }
+            $this->checkSame(0, $open->flowControlTriggeredCount(),
+                'an enabled topic knob alone cannot pause a queue that is inside its own gate');
+        } finally {
+            $this->releaseLogs();
+        }
+    }
+
+    /** A consumer owning four queues of one topic, each buffering 250 messages. */
+    private function siblingConsumer(
+        string $group,
+        array $mqMap,
+        array $pending,
+        int $countGate,
+        int $sizeGate,
+    ): DefaultMQPushConsumer {
+        $c = new DefaultMQPushConsumer($group);
+        $c->pullThresholdForTopic = 1000;
+        $c->pullThresholdSizeForTopic = 100;
+        $c->pullThresholdForQueue = $countGate;
+        $c->pullThresholdSizeForQueue = $sizeGate;
+        // The span gate is switched off so that only the message count can ever be the reason here.
+        $c->consumeConcurrentlyMaxSpan = 0;
+        $this->setProp($c, 'mqMap', $mqMap);
+        $this->setProp($c, 'pending', $pending);
+        return $c;
+    }
+
     // ================================================================ entry
 
     public function run(): int
@@ -765,6 +870,7 @@ final class RunClientFlowControl
         $this->testBrokerBackoffMapping();
         $this->testBrokerBackoffArmsThePause();
         $this->testPopGateArmsThePause();
+        $this->testGateNeverSumsTheQueuesOfATopic();
         return $this->summary();
     }
 }

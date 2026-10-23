@@ -54,11 +54,11 @@ This produces the static library `build/librocketmq_remoting.a` (alias `rocketmq
 
 ```
 100% tests passed out of 68
-Total Test time (real) = 118.49 sec
+Total Test time (real) = 94.16 sec
 ```
 
-The 68 cases are the 67 test binaries (5820 assertions) plus 1 codec-interop case
-(73 assertions): **5893 assertions in total**.
+The 68 cases are the 67 test binaries (5868 assertions) plus 1 codec-interop case
+(73 assertions): **5941 assertions in total**.
 
 The protocol-layer self-check needs no cluster:
 
@@ -554,7 +554,7 @@ arguments:
 | `rmq_live_send_header` | Send-header fields `c` / `d` / `n` and the queue count of auto-created topics | — |
 | `rmq_live_pinned_guard` | Pinned-send topic guard: rejected locally, no trace on the broker | — |
 | `rmq_live_producer_unregister` | clientId(35) unregistration on every broker at shutdown | — |
-| `rmq_live_flow_control` | All five pre-pull thresholds trigger and nothing is lost afterwards | — |
+| `rmq_live_flow_control` | The three per-queue pre-pull gates trigger (the topic budget divided into them at rebalance) and nothing is lost afterwards | — |
 | `rmq_live_correct_tags_offset` | Empty responses still advance the committed offset to maxOffset | — |
 | `rmq_live_offset_illegal` | Batch discarded and queue rebuilt at the corrected offset | — |
 | `rmq_live_reset_offset` | 220 offset reset: persisted at once, in-flight batch discarded, queue rebuilt | — |

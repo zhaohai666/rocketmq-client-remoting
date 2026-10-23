@@ -26,7 +26,7 @@ NameServer + Broker，无 proxy、无本地扩展依赖、无代码生成步骤�
 ```bash
 cd rust
 cargo build --all-targets                       # lib + 42 个 examples
-cargo test --quiet                              # 1104 passed; 0 failed; 0 ignored（~10s）
+cargo test --quiet                              # 1113 passed; 0 failed; 0 ignored（~10s）
 cargo clippy --all-targets --all-features -- -D warnings  # 零 warning 是硬门槛
 ```
 
@@ -318,7 +318,7 @@ broker 后再发消息"**（否则首批消息会因 broker 尚不认识本组�
 | `live_async_send` | 异步内核：offsetMsgId 读回原文、并发不串台、批量异步、shutdown 不等在途 |
 | `live_fail_fast` | broker 真死时在途请求毫秒级终态；⚠ 会停一次 broker 再拉起（不删 store） |
 | `live_send_header` | 发送头 c/d/n 与自动建 topic 的队列数算术 |
-| `live_flow_control` | 拉取前流控五个阈值 + 启动期数值闸门 |
+| `live_flow_control` | 拉取前每队列三条缓存闸门（topic 预算摊到每队列）+ 启动期数值闸门 |
 | `live_scheduled_intervals` | 周期任务 initialDelay / 固定速率（含位点落盘 10s 首跳） |
 | `live_subscribe` | 后置订阅立即心跳（判据：300 查询在 30s 周期前就看到本组） |
 | `live_pinned_guard` | 定点 topic 守卫：真路由不误拒、拒在本端且 broker 无痕、单向无守卫 |

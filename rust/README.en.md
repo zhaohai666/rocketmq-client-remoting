@@ -31,7 +31,7 @@ code-generation step.
 ```bash
 cd rust
 cargo build --all-targets                       # lib + 42 examples
-cargo test --quiet                              # 1104 passed; 0 failed; 0 ignored (~10s)
+cargo test --quiet                              # 1113 passed; 0 failed; 0 ignored (~10s)
 cargo clippy --all-targets --all-features -- -D warnings  # zero warnings is a hard gate
 ```
 
@@ -348,7 +348,7 @@ list extra preconditions.
 | `live_async_send` | async kernel: offsetMsgId read back verbatim, concurrency without cross-talk, batch async, shutdown does not wait for in-flight sends |
 | `live_fail_fast` | in-flight requests reach a terminal state in milliseconds when the broker truly dies; ⚠ stops the broker once then brings it back (store not deleted) |
 | `live_send_header` | send headers c/d/n and the queue-count arithmetic of auto-created topics |
-| `live_flow_control` | the five flow-control thresholds before pulling + startup numeric gates |
+| `live_flow_control` | the three per-queue cache gates before pulling (topic budgets divided into them at rebalance) + startup numeric gates |
 | `live_scheduled_intervals` | periodic tasks' initialDelay / fixed rate (incl. the offset-persistence 10s first jump) |
 | `live_subscribe` | post-start subscribe heartbeats immediately (criterion: the 300 query sees this group before the 30s cycle does) |
 | `live_pinned_guard` | pinned-topic guard: real routes are not mis-rejected, the rejection is client-side with no broker trace, oneway has no guard |

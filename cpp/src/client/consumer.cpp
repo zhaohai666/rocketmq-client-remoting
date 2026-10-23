@@ -951,17 +951,18 @@ bool DefaultMQPushConsumer::pullStalled(const std::string& key) const {
 }
 
 bool DefaultMQPushConsumer::flowControlHit(const MessageQueue& mq, const std::string& key) {
-    // The five flow-control thresholds of a ProcessQueue: first the three queue-level ones (message count, bytes,
-    // offset span), then the two topic-level cumulative ones. Every cache gate is **strictly greater
+    // The three per-queue flow-control thresholds of a ProcessQueue: this queue's message count, its
+    // bytes, its offset span. Every cache gate is **strictly greater
     // than** its threshold, so a threshold reads as "how many may be cached" and a buffer that has
     // reached it exactly still gets to pull. The byte threshold is in MiB; the span is max-min of the
     // pending queueOffsets.
-    // Other queues are walked only when topic-level thresholds are enabled, otherwise one check would scan the whole table needlessly.
+    // The two topic-level budgets are deliberately not checked here: divideTopicThresholds() split them
+    // into the per-queue numbers above when the assignment last changed, so this gate reads only its own
+    // queue's buffer and never walks the sibling queues (a divided per-queue gate is strictly stricter
+    // than summing them).
     size_t count = 0;
     double sizeMb = 0.0;
     int64_t span = 0;
-    size_t topicCount = 0;
-    double topicSizeMb = 0.0;
     {
         std::lock_guard<std::mutex> lk(lock_);
         auto it = pending_.find(key);
@@ -984,18 +985,6 @@ bool DefaultMQPushConsumer::flowControlHit(const MessageQueue& mq, const std::st
             sizeMb = static_cast<double>(bytes) / (1024.0 * 1024.0);
             span = maxOffset - minOffset;
         }
-        if (pullThresholdForTopic_ > 0 || pullThresholdSizeForTopic_ > 0) {
-            int64_t topicBytes = 0;
-            for (const auto& kv : pending_) {
-                auto mqIt = mqMap_.find(kv.first);
-                if (mqIt == mqMap_.end() || mqIt->second.topic != mq.topic) continue;
-                for (const MessageExt& m : kv.second) {
-                    ++topicCount;
-                    topicBytes += m.storeSize;
-                }
-            }
-            topicSizeMb = static_cast<double>(topicBytes) / (1024.0 * 1024.0);
-        }
     }
 
     char number[32] = {0};
@@ -1007,12 +996,6 @@ bool DefaultMQPushConsumer::flowControlHit(const MessageQueue& mq, const std::st
         reason = std::string("size=") + number + "MB";
     } else if (consumeConcurrentlyMaxSpan_ > 0 && span > consumeConcurrentlyMaxSpan_) {
         reason = "span=" + std::to_string(span);
-    } else if (pullThresholdForTopic_ > 0
-               && topicCount >= static_cast<size_t>(pullThresholdForTopic_)) {
-        reason = "topicCount=" + std::to_string(topicCount);
-    } else if (pullThresholdSizeForTopic_ > 0 && topicSizeMb >= pullThresholdSizeForTopic_) {
-        std::snprintf(number, sizeof(number), "%.1f", topicSizeMb);
-        reason = std::string("topicSize=") + number + "MB";
     }
     if (reason.empty()) return false;
     const int64_t times = flowControlTriggered_.fetch_add(1) + 1;
@@ -3199,6 +3182,13 @@ void DefaultMQPushConsumer::setAssignedQueue(const std::string& key, const Messa
     mqMap_[key] = mq;
 }
 
+void DefaultMQPushConsumer::setPopQueue(const std::string& key) {
+    std::lock_guard<std::mutex> lk(lock_);
+    if (popQueues_.find(key) == popQueues_.end()) {
+        popQueues_[key] = std::make_shared<PopProcessQueue>();
+    }
+}
+
 std::vector<MessageQueue> DefaultMQPushConsumer::assignedQueues() {
     // Return the assignment set computed by the real rebalance (what doRebalance writes into assignedQueues_).
     // Not "all queues of the subscribed topic" anymore - that was the root of duplicate consumption across group instances.
@@ -3282,7 +3272,8 @@ void DefaultMQPushConsumer::doRebalance() {
     for (const MessageQueue& mq : assigned) {
         now.insert(offsetKey(mq));
     }
-    if (now != was) {
+    const bool changed = now != was;
+    if (changed) {
         logger_info("rebalance result changed, group=" + consumerGroup_
                     + " clientId=" + clientId_ + " assigned=" + std::to_string(assigned.size()));
     }
@@ -3313,7 +3304,74 @@ void DefaultMQPushConsumer::doRebalance() {
         }
     }
     rebalancePullThreads();
+    // Split the enabled topic budgets over the queue count **this** round produced. The order matters:
+    // rebalancePullThreads() is what rebuilds the per-queue pull state (mqMap_ / popQueues_), and that
+    // table is the divisor, so dividing before it would use the previous round's queue count. Only a
+    // round that actually changed the owned set re-divides -- an unchanged round leaves a hand-set
+    // per-queue knob alone.
+    if (changed) {
+        divideTopicThresholds();
+    }
 }
+
+void DefaultMQPushConsumer::divideTopicThresholds() {
+    // The whole topic-level enforcement of the two cache budgets: a budget is split by DIVISION, never
+    // measured by aggregation, so the pre-pull gate only ever reads its own queue's buffer.
+    // The divisor is the live per-queue pull-state table of the current consumption mode -- mqMap_ on the
+    // classic pull path, popQueues_ under POP -- which counts the queues of this client across **every**
+    // subscribed topic: a topic-wide budget is a budget for this client as a whole.
+    // Two consequences are deliberate, not bugs:
+    //   * the numerator is always the topic budget, never the current per-queue knob, so repeating the
+    //     division with an unchanged queue count writes the same number again;
+    //   * while a budget is enabled, the per-queue value the user configured is overwritten on purpose,
+    //     so the getter afterwards reports the quotient.
+    int32_t owned = 0;
+    bool countChanged = false;
+    bool sizeChanged = false;
+    int32_t countFrom = 0;
+    int32_t countTo = 0;
+    int32_t sizeFrom = 0;
+    int32_t sizeTo = 0;
+    {
+        std::lock_guard<std::mutex> lk(lock_);
+        owned = static_cast<int32_t>(popMode_ ? popQueues_.size() : mqMap_.size());
+        if (owned == 0) {
+            // Nothing owned: there is nothing to divide by, and flooring the meaningless quotient at 1
+            // would silently collapse both gates. Leave both knobs exactly as the user set them.
+            return;
+        }
+        if (pullThresholdForTopic_ != -1) {
+            const int32_t to = std::max(1, pullThresholdForTopic_ / owned);
+            if (to != pullThresholdForQueue_) {
+                countFrom = pullThresholdForQueue_;
+                countTo = to;
+                pullThresholdForQueue_ = to;
+                countChanged = true;
+            }
+        }
+        if (pullThresholdSizeForTopic_ != -1) {
+            const int32_t to = std::max(1, pullThresholdSizeForTopic_ / owned);
+            if (to != pullThresholdSizeForQueue_) {
+                sizeFrom = pullThresholdSizeForQueue_;
+                sizeTo = to;
+                pullThresholdSizeForQueue_ = to;
+                sizeChanged = true;
+            }
+        }
+    }
+    // lock_ is non-recursive, so the two lines are decided inside the critical section and emitted only
+    // after releasing it; they report exactly what the writes above did.
+    if (countChanged) {
+        logger_info("The pullThresholdForQueue is changed from " + std::to_string(countFrom)
+                    + " to " + std::to_string(countTo));
+    }
+    if (sizeChanged) {
+        logger_info("The pullThresholdSizeForQueue is changed from " + std::to_string(sizeFrom)
+                    + " to " + std::to_string(sizeTo));
+    }
+}
+
+void DefaultMQPushConsumer::divideTopicThresholdsForTest() { divideTopicThresholds(); }
 
 std::vector<MessageQueue> DefaultMQPushConsumer::allQueuesOfTopic(const std::string& topic) {
     // Taken from the SUBSCRIBE side of the route (read queues + readQueueNums, no master filtering),

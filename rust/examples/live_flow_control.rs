@@ -4,7 +4,9 @@
 //! **criteria themselves**; this file locks two things on a live machine that offline tests never can:
 //! - **A** the gates **do fire on a real broker**. One wrong unit or one misread threshold field and an
 //!   offline mock buffer still "fires", while on a real machine it never fires (or always fires). This crate
-//!   once misused a queue-level switch on the `pull_threshold_size_for_topic` gate, with offline all green.
+//!   once judged a **topic-level** budget by summing the topic's queues inside the pull path; the contract
+//!   is the other way round (the budget is divided into the per-queue knob at rebalance), and only a live
+//!   machine shows which knob the pulls actually obey.
 //! - **B** after a hit **not one message may be lost**. Flow control only "pauses pulling", it is not "discard/skip": while
 //!   paused the offset must not move past unconsumed messages, and after recovery the same queue must keep consuming to
 //!   the end. An implementation written as "drop the batch / exit the loop" is invisible in a ten-second window; only counting every message exposes it.
@@ -530,7 +532,15 @@ async fn run(namesrv: &str) -> Checker {
         );
     }
 
-    // ---------------- S3 topic-level count gate (accumulated across queues) ----------------
+    // ---------------- S3 topic-level budget: divided into the per-queue knob, gate on one queue ----------------
+    // The contract this leg locks (nothing here is about summing the topic's queues):
+    //   1. at rebalance the broker-assigned queue set is counted and the topic budget divided into it
+    //      (4 messages over the 4 queues this instance owns -> `pullThresholdForQueue` becomes 1, so the
+    //      user's own per-queue value of 65535 is deliberately overwritten -- the getter shows the quotient);
+    //   2. the pull gate then judges **each queue's own buffer** against that divided number;
+    //   3. throttling still loses nothing: all 16 messages arrive.
+    // The topic must have exactly 4 queues and this must be the only instance of the group, otherwise the
+    // quotient is not 1 and the assertion below measures the fixture instead of the client.
     let topic_gates = Gates {
         count: Some(GATE_OFF),
         size: Some(GATE_OFF_SIZE_MIB),
@@ -552,20 +562,50 @@ async fn run(namesrv: &str) -> Checker {
     )
     .await
     {
+        // (1) the divided per-queue knob is what changed: 4 / 4 owned queues = 1.
+        let divided = poll_until(|| c.config().pull_threshold_for_queue == 1, 30).await;
+        ck.check(
+            "S3 the topic budget is divided into the per-queue knob at rebalance",
+            divided,
+            &format!(
+                "owned={} pullThresholdForQueue={} (want 4/owned = 1)",
+                c.assigned_queue_count(),
+                c.config().pull_threshold_for_queue
+            ),
+        );
+        // Control for "only its own knob moves": the size budget is off (-1), so the per-queue size
+        // value this case set must survive the division untouched.
+        let size_untouched = c.config().pull_threshold_size_for_queue == GATE_OFF_SIZE_MIB;
+        ck.check(
+            "S3 an off topic budget leaves its per-queue knob alone",
+            size_untouched,
+            &format!("pullThresholdSizeForQueue={}", c.config().pull_threshold_size_for_queue),
+        );
+        // Control for "the numerator is always the topic knob": dividing does not consume the budget,
+        // so repeating the division over the same queue count rewrites the same number.
+        let budget_intact = c.config().pull_threshold_for_topic == 4;
+        ck.check(
+            "S3 the topic budget keeps the configured value",
+            budget_intact,
+            &format!("pullThresholdForTopic={}", c.config().pull_threshold_for_topic),
+        );
+        // (2) the gate fires on the queue's own buffer once that buffer passes its divided share.
         let hit = poll_until(|| c.flow_control_triggered() > 0, 30).await;
-        let all = poll_until(|| sink.count() >= 16, 40).await;
         let fc = c.flow_control_triggered();
-        c.shutdown();
+        let buffered = c.buffered_message_count();
+        // (3) nothing is lost while the gate is engaged.
+        let all = poll_until(|| sink.count() >= 16, 60).await;
         ck.check(
-            "S3 the topic-level gate needs cross-queue accumulation and does fire",
+            "S3 the gate trips on one queue's own buffer over its divided share",
             hit,
-            &format!("triggered={fc}"),
+            &format!("triggered={fc} buffered_now={buffered} per_queue_limit=1"),
         );
         ck.check(
-            "S3 every queue of the throttled topic is still consumed to the end",
-            all && sink.count() == 16,
-            &format!("count={}", sink.count()),
+            "S3 every queue of the budgeted topic is still consumed to the end",
+            all && sink.count() == 16 && sink.distinct() == 16,
+            &format!("count={} distinct={}", sink.count(), sink.distinct()),
         );
+        c.shutdown();
     }
 
     // ---------------- S4 a queue that hit flow control keeps consuming after recovery ----------------

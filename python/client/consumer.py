@@ -2036,6 +2036,40 @@ class DefaultMQPushConsumer:
         with self._lock:
             return list(self._assigned)
 
+    def _divide_topic_thresholds(self) -> None:
+        """Split the two topic-level cache knobs into the per-queue knobs the pull gate reads.
+
+        The topic knobs are never summed at pull time: dividing them here turns "so many may be cached
+        for this topic" into "so many / n may be cached per queue", so each queue's own count/size gate
+        enforces the topic budget and the pull path never walks the sibling queues.
+
+        The numerator is always the topic knob, never the current per-queue value, so repeating this with
+        an unchanged queue count is idempotent. While a topic knob is enabled the per-queue value the user
+        configured is deliberately overwritten -- a getter must show the divided number afterwards.
+        """
+        with self._lock:
+            # _mq_map, not the subscription-side allocation list, is this port's authoritative
+            # "queues I own right now" view of live per-queue pull state: _rebalance_pull_threads
+            # adds an entry as it builds a queue's pull loop and pops it on revoke, so its size here is
+            # the number of queues holding pull state after this rebalance's update.
+            n = len(self._mq_map)
+        if n == 0:
+            # Nothing owned: the division would floor to the meaningless "1 per zero queues";
+            # leave both per-queue knobs exactly as the user set them.
+            return
+        if self.pull_threshold_for_topic != -1:
+            new_count = max(1, self.pull_threshold_for_topic // n)
+            if new_count != self.pull_threshold_for_queue:
+                logger.info("The pullThresholdForQueue is changed from %d to %d",
+                            self.pull_threshold_for_queue, new_count)
+            self.pull_threshold_for_queue = new_count
+        if self.pull_threshold_size_for_topic != -1:
+            new_size = max(1, self.pull_threshold_size_for_topic // n)
+            if new_size != self.pull_threshold_size_for_queue:
+                logger.info("The pullThresholdSizeForQueue is changed from %d to %d",
+                            self.pull_threshold_size_for_queue, new_size)
+            self.pull_threshold_size_for_queue = new_size
+
     def _do_rebalance(self) -> None:
         """Compute this instance's queue allocation, then sync the pull thread set.
 
@@ -2074,7 +2108,8 @@ class DefaultMQPushConsumer:
         with self._lock:
             self._assigned = assigned
         now = {self._mq_key(mq) for mq in assigned}
-        if now != was:
+        assignment_changed = now != was
+        if assignment_changed:
             logger.info("rebalance result changed, group=%s clientId=%s assigned=%d",
                         self.consumer_group, self.client_id, len(assigned))
             # An assignment change on the push side drops the fingerprints remembered per
@@ -2105,6 +2140,12 @@ class DefaultMQPushConsumer:
             with self._lock:
                 self._offset_table.setdefault(key, off)
         self._rebalance_pull_threads()
+        # The topic knobs are divided into the per-queue knobs only when this round actually changed the
+        # assignment, and only AFTER _rebalance_pull_threads has updated the per-queue pull state: the
+        # divisor is the number of queues owned, so dividing against the pre-update table would use the
+        # previous round's queue count.
+        if assignment_changed:
+            self._divide_topic_thresholds()
 
     def rebalance_immediately(self) -> None:
         """Wake this consumer's rebalance loop after the instance receives the broker's 40 notification.
@@ -2162,7 +2203,8 @@ class DefaultMQPushConsumer:
             if orderly and key not in self._lock_ok:
                 time.sleep(0.2)
                 continue
-            # Flow control: count / bytes / topic-level accumulation / concurrency span
+            # Flow control: count / bytes / concurrency span, all per queue
+            # (the topic knobs were already divided into these per-queue thresholds by the rebalance)
             # pause this queue's pull when any limit is exceeded
             if self._flow_control_hit(mq, key):
                 time.sleep(PULL_TIME_DELAY_WHEN_CACHE_FLOW_CONTROL)
@@ -2681,7 +2723,7 @@ class DefaultMQPushConsumer:
             logger.debug("change invisible time failed for %s: %s", msg.msg_id, e)
 
     def _flow_control_hit(self, mq: MessageQueue, key: str) -> bool:
-        """Whether flow control is triggered (five threshold checks; any hit pauses this queue's pull).
+        """Whether flow control is triggered (three per-queue threshold checks; any hit pauses this queue's pull).
 
         Every cache gate is **strictly greater than** its threshold: a buffer that has reached the
         threshold exactly is still allowed to pull, so the thresholds are "how many may be cached",
@@ -2689,9 +2731,12 @@ class DefaultMQPushConsumer:
 
         - ``pull_threshold_for_queue``: this queue's pulled-but-unconsumed **count** (default 1000)
         - ``pull_threshold_size_for_queue``: this queue's pulled-but-unconsumed **bytes in MB** (default 100)
-        - ``pull_threshold_for_topic`` / ``pull_threshold_size_for_topic``: accumulation across all queues of the same topic (-1 disables)
         - ``consume_concurrently_max_span``: the **span** of queueOffsets of pulled-but-unconsumed messages (default 2000,
           prevents "one message keeps failing while the rest pile up" from making the offset span run away)
+
+        The topic-level knobs are deliberately **not** checked here: nothing sums the sibling queues at
+        pull time. ``_divide_topic_thresholds`` splits each enabled topic knob into the matching per-queue
+        knob whenever the assignment changes, so the three checks above are the only enforcement point.
         """
         with self._lock:
             dq = list(self._pending.get(key, ()))
@@ -2710,18 +2755,6 @@ class DefaultMQPushConsumer:
             reason = "size=%.1fMB" % size_mb
         elif self.consume_concurrently_max_span > 0 and span > self.consume_concurrently_max_span:
             reason = "span=%d" % span
-        elif self.pull_threshold_for_topic > 0 or self.pull_threshold_size_for_topic > 0:
-            with self._lock:
-                topic_pending = [m for k, q in self._pending.items()
-                                 if k in self._mq_map and self._mq_map[k].topic == mq.topic
-                                 for m in q]
-            if (self.pull_threshold_for_topic > 0
-                    and len(topic_pending) >= self.pull_threshold_for_topic):
-                reason = "topicCount=%d" % len(topic_pending)
-            elif self.pull_threshold_size_for_topic > 0:
-                topic_mb = sum(getattr(m, "store_size", 0) for m in topic_pending) / (1024.0 * 1024.0)
-                if topic_mb >= self.pull_threshold_size_for_topic:
-                    reason = "topicSize=%.1fMB" % topic_mb
         if not reason:
             return False
         with self._lock:

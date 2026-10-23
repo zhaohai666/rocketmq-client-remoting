@@ -175,35 +175,14 @@ func (c *DefaultMQPushConsumer) pullCursor(mq common.MessageQueue) (int64, bool)
 //   - pullThresholdForQueue (1000): buffered message COUNT;
 //   - pullThresholdSizeForQueue (100 MB): buffered bytes;
 //   - consumeConcurrentlyMaxSpan (2000): the offset SPAN of the buffer, so one
-//     message that keeps failing cannot let the offset run away;
-//   - the topic-level count/size variants (-1 disables them).
+//     message that keeps failing cannot let the offset run away.
+//
+// Only these three per-queue gates run at pull time; nothing here ever sums the
+// sibling queues of a topic. The two topic-level knobs are turned into per-queue
+// ones when the assignment changes (see divideTopicThresholds), so by the time a
+// pull is judged they already describe THIS queue.
 func (c *DefaultMQPushConsumer) flowControlHit(mq common.MessageQueue, pq *processQueue) bool {
-	count, sizeMB, span := pq.PendingStats()
-
-	c.mu.Lock()
-	maxCount := c.pullThresholdForQueue
-	maxSize := c.pullThresholdSizeForQueue
-	maxSpan := c.consumeConcurrentlyMaxSpan
-	topicMaxCount := c.pullThresholdForTopic
-	topicMaxSize := c.pullThresholdSizeForTopic
-	c.mu.Unlock()
-
-	reason := ""
-	switch {
-	case int64(count) > maxInt64(1, maxCount):
-		reason = "count"
-	case maxSize > 0 && sizeMB > float64(maxSize):
-		reason = "size"
-	case maxSpan > 0 && span > maxSpan:
-		reason = "span"
-	case topicMaxCount > 0 || topicMaxSize > 0:
-		topicCount, topicSizeMB := c.topicPendingStats(mq.Topic)
-		if topicMaxCount > 0 && int64(topicCount) >= topicMaxCount {
-			reason = "topicCount"
-		} else if topicMaxSize > 0 && topicSizeMB >= float64(topicMaxSize) {
-			reason = "topicSize"
-		}
-	}
+	reason := c.cacheGateReason(pq)
 	if reason == "" {
 		return false
 	}
@@ -219,6 +198,29 @@ func (c *DefaultMQPushConsumer) flowControlHit(mq common.MessageQueue, pq *proce
 	return true
 }
 
+// cacheGateReason names the per-queue gate this queue's buffer is over, or "" when it may pull.
+// It judges ONE queue's own buffer and reads no sibling queue: a topic-level budget reaches it
+// only through the division done at rebalance (see divideTopicThresholds).
+func (c *DefaultMQPushConsumer) cacheGateReason(pq *processQueue) string {
+	count, sizeMB, span := pq.PendingStats()
+
+	c.mu.Lock()
+	maxCount := c.pullThresholdForQueue
+	maxSize := c.pullThresholdSizeForQueue
+	maxSpan := c.consumeConcurrentlyMaxSpan
+	c.mu.Unlock()
+
+	switch {
+	case int64(count) > maxInt64(1, maxCount):
+		return "count"
+	case maxSize > 0 && sizeMB > float64(maxSize):
+		return "size"
+	case maxSpan > 0 && span > maxSpan:
+		return "span"
+	}
+	return ""
+}
+
 // flowControlWarnEvery is the trip count between two WARN lines: a throttled queue trips a gate on
 // every pull round, so warning each round buries the signal in noise.
 const flowControlWarnEvery = 1000
@@ -226,24 +228,6 @@ const flowControlWarnEvery = 1000
 // isFlowControlWarnTrip reports whether the n-th (1-based) flow-control trip logs a WARN.
 func isFlowControlWarnTrip(times int64) bool {
 	return (times-1)%flowControlWarnEvery == 0
-}
-
-func (c *DefaultMQPushConsumer) topicPendingStats(topic string) (int, float64) {
-	c.mu.Lock()
-	pqs := make([]*processQueue, 0, len(c.processQueueTable))
-	for mq, pq := range c.processQueueTable {
-		if mq.Topic == topic {
-			pqs = append(pqs, pq)
-		}
-	}
-	c.mu.Unlock()
-	total, size := 0, 0.0
-	for _, pq := range pqs {
-		n, mb, _ := pq.PendingStats()
-		total += n
-		size += mb
-	}
-	return total, size
 }
 
 // ---------------------------------------------------------------- dispatch

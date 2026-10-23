@@ -237,25 +237,44 @@ public static class LiveFlowControl
         Check("S2-everything is still consumed after the span limit", all && c.Sink.Got() == 14, "got=" + c.Sink.Got());
     }
 
-      // -------------------------------------------------- S3 the topic-level count gate
+      // --------------------------- S3 the topic-level count budget: DIVIDED, not summed
     private static void S3TopicGate(DefaultMQProducer producer)
     {
         string topic = Topic("TopicCount");
         PrepareTopic(producer, topic, 4);
         Case c = StartConsumer("3", topic, 300);
+        // The two per-queue values the user set: while a topic budget is enabled the count
+        // knob is overwritten by the division, while the byte budget being off (-1) must
+        // leave the byte knob exactly as it was set.
         c.Consumer.PullThresholdForQueue = Huge;
         c.Consumer.PullThresholdSizeForQueue = HugeSizeMiB;
         c.Consumer.ConsumeConcurrentlyMaxSpan = Huge;
         c.Consumer.PullThresholdForTopic = 4;
+        c.Consumer.PullThresholdSizeForTopic = -1;
         c.Consumer.Start();
+        int sizeKnob = c.Consumer.PullThresholdSizeForQueue;
+        int countKnob = c.Consumer.PullThresholdForQueue;
         Sleep(3000);
         SendSmall(producer, topic, 16);
         bool hit = WaitUntil(() => c.Consumer.FlowControlTriggered > 0, 30000);
         bool all = WaitUntil(() => c.Sink.Got() >= 16, 40000);
         long fc = c.Consumer.FlowControlTriggered;
         c.Consumer.Shutdown();
-   Check("S3-the topic-level count gate really hits on a real machine", hit, "triggered=" + fc);
-        Check("S3-everything is still consumed after accumulating across queues", all && c.Sink.Got() == 16, "got=" + c.Sink.Got());
+        // What the topic budget changes is the **divided per-queue knob**, never a pull-time
+        // topic total: 4 messages over the queues this instance owns (the 4 topic queues plus
+        // the auto-subscribed %RETRY% queues) is at most 4 and at least 1, and it is strictly
+        // below the user's Huge value because rebalance overwrote it.
+        Check("S3-the topic budget is divided into the per-queue count knob",
+            countKnob <= 4 && countKnob >= 1,
+            "wants [1, 4], PullThresholdForQueue=" + countKnob + " (user value was " + Huge + ")");
+        Check("S3-an off topic byte budget leaves the byte knob alone",
+            sizeKnob == HugeSizeMiB, "PullThresholdSizeForQueue=" + sizeKnob);
+        // The gate trips on **one queue's own buffer** crossing that divided share.
+        Check("S3-one queue's own buffer really hits the divided gate", hit, "triggered=" + fc);
+        Check("S3-everything is still consumed after a hit (a pause is not a drop)",
+            all && c.Sink.Got() == 16, "got=" + c.Sink.Got());
+        Check("S3-nothing duplicated and nothing lost", c.Sink.Distinct() == 16,
+            "distinct=" + c.Sink.Distinct());
     }
 
     // ------------------------------------- S4 recovery after a hit (reusing S1's group and topic)

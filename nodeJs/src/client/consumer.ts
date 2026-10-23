@@ -954,6 +954,51 @@ export class DefaultMQPushConsumer {
       }
     }
     this.syncPullLoops();
+    // ORDER MATTERS: the topic-budget division runs AFTER syncPullLoops() has
+    // rebuilt the per-queue pull state for this round, so it divides by the
+    // queue count THIS round produced — a shrink from 4 queues to 2 must
+    // divide by 2, not by 4. And it runs only when the assignment actually
+    // CHANGED: an unchanged round must leave a hand-set per-queue knob alone.
+    if (changed) {
+      this._divideTopicThresholds();
+    }
+  }
+
+  // _divideTopicThresholds turns each topic-level cache budget into a
+  // per-queue one for the queues this consumer owns right now: every enabled
+  // knob (-1 means off) is divided by that queue count — ALL owned queues,
+  // across EVERY topic, not the queues of one topic — and the quotient is
+  // written into the matching per-queue knob. The divisor is the live
+  // per-queue state table of the current consumption mode: processQueueTable
+  // on the pull path, popQueueTable under POP.
+  //
+  // The dividend is ALWAYS the topic knob, never the current per-queue value,
+  // so re-running the division with an unchanged queue count writes the same
+  // number again (idempotent). The user's per-queue value is deliberately
+  // overwritten while a topic knob is enabled — reading pullThresholdForQueue
+  // afterwards shows the divided number, not what the user set.
+  //
+  // Owning no queues makes the division meaningless: both per-queue knobs
+  // keep the values the user set (no division by zero).
+  private _divideTopicThresholds(): void {
+    const owned = this.popMode ? this.popQueueTable.size : this.processQueueTable.size;
+    if (owned === 0) return;
+    if (this.pullThresholdForTopic !== -1) {
+      const newVal = Math.max(1, Math.floor(this.pullThresholdForTopic / owned));
+      if (newVal !== this.pullThresholdForQueue) {
+        logger.info('The pullThresholdForQueue is changed from %d to %d',
+          this.pullThresholdForQueue, newVal);
+      }
+      this.pullThresholdForQueue = newVal;
+    }
+    if (this.pullThresholdSizeForTopic !== -1) {
+      const newVal = Math.max(1, Math.floor(this.pullThresholdSizeForTopic / owned));
+      if (newVal !== this.pullThresholdSizeForQueue) {
+        logger.info('The pullThresholdSizeForQueue is changed from %d to %d',
+          this.pullThresholdSizeForQueue, newVal);
+      }
+      this.pullThresholdSizeForQueue = newVal;
+    }
   }
 
   // _getConsumerIdListByGroup asks the broker for the group's consumer id list:
@@ -1445,26 +1490,23 @@ export class DefaultMQPushConsumer {
     return result;
   }
 
-  // _flowControlHit applies the ProcessQueue put/pull threshold checks. Any one
-  // of them pauses THIS queue's pulls. Every cache gate compares STRICTLY GREATER
-  // THAN the threshold: a buffer that has reached it exactly is still allowed to
-  // pull, so a threshold reads as "how many may be cached", not "how many stop us".
+  // _flowControlHit applies the ProcessQueue put/pull threshold checks: ONE
+  // queue's own buffer is judged against exactly three per-queue gates
+  // (count / size / span). There is NO pull-time topic aggregation: the
+  // topic-level budgets were divided into the per-queue knobs at rebalance
+  // (see _divideTopicThresholds), so the sibling queues of a topic never add
+  // up here. Every cache gate compares STRICTLY GREATER THAN the threshold: a
+  // buffer that has reached it exactly is still allowed to pull, so a
+  // threshold reads as "how many may be cached", not "how many stop us".
   private _flowControlHit(mq: MessageQueue, pq: ProcessQueue): boolean {
     const [count, sizeMB, span] = pq.pendingStats();
     const maxCount = this.pullThresholdForQueue;
     const maxSize = this.pullThresholdSizeForQueue;
     const maxSpan = this.consumeConcurrentlyMaxSpan;
-    const topicMaxCount = this.pullThresholdForTopic;
-    const topicMaxSize = this.pullThresholdSizeForTopic;
     let reason = '';
     if (count > Math.max(1, maxCount)) reason = 'count';
     else if (maxSize > 0 && sizeMB > maxSize) reason = 'size';
     else if (maxSpan > 0 && span > maxSpan) reason = 'span';
-    else if (topicMaxCount > 0 || topicMaxSize > 0) {
-      const [topicCount, topicSizeMB] = this._topicPendingStats(mq.getTopic());
-      if (topicMaxCount > 0 && topicCount >= topicMaxCount) reason = 'topicCount';
-      else if (topicMaxSize > 0 && topicSizeMB >= topicMaxSize) reason = 'topicSize';
-    }
     if (!reason) return false;
     this.flowControlTriggered++;
     logger.debug('flow control: queue %s %s, pause pull', mqKey(mq), reason);
@@ -1474,17 +1516,6 @@ export class DefaultMQPushConsumer {
         this.flowControlTriggered);
     }
     return true;
-  }
-
-  private _topicPendingStats(topic: string): [number, number] {
-    let total = 0, size = 0.0;
-    for (const [key, pq] of this.processQueueTable) {
-      if (!key.startsWith(`${topic}@`)) continue;
-      const [n, mb] = pq.pendingStats();
-      total += n;
-      size += mb;
-    }
-    return [total, size];
   }
 
   // ---------------------------------------------------------------- dispatch

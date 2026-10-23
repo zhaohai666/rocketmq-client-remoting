@@ -226,7 +226,15 @@ int main(int argc, char** argv) {
         check("S2-all still consumed after span exceeded", all && c.sink->got() == 14, "got=" + num(c.sink->got()));
     }
 
-    // ---------------- S3 topic-level count gate (accumulated across queues) ----------------
+    // ---------------- S3 topic-level budget: divided into the per-queue knob, gate on one queue ----------------
+    // The contract this leg locks (nothing here sums a topic's queues):
+    //   1. at rebalance the queue set this instance owns is counted and the topic budget divided into it
+    //      (4 messages over the 4 owned queues -> `pullThresholdForQueue` becomes 1, so the user's own
+    //      per-queue value 65535 is overwritten on purpose -- the getter reports the quotient);
+    //   2. the pre-pull gate then judges **each queue's own buffer** against that divided number;
+    //   3. throttling still loses nothing: all 16 messages arrive.
+    // The topic must have exactly 4 queues and this must be the only instance of the group, otherwise the
+    // quotient is not 1 and the assertions below measure the fixture instead of the client.
     {
         const std::string topic = prefix + "_Topic";
         prepareTopic(producer, topic, 4);
@@ -236,17 +244,41 @@ int main(int argc, char** argv) {
         c.consumer->setConsumeConcurrentlyMaxSpan(kOffCount);
         c.consumer->setPullThresholdForTopic(4);
         c.consumer->start();
+        // (1) the divided per-queue knob is what changed: 4 / 4 owned queues = 1.
+        const bool divided = waitUntil([&] { return c.consumer->pullThresholdForQueue() == 1; }, 30000);
+        const int32_t perQueue = c.consumer->pullThresholdForQueue();
+        const int32_t topicBudget = c.consumer->pullThresholdForTopic();
+        const int32_t perQueueSize = c.consumer->pullThresholdSizeForQueue();
+        const size_t owned = c.consumer->assignedQueueKeys().size();
+        check("S3-the topic budget is divided into the per-queue knob at rebalance", divided,
+              "owned=" + num(static_cast<int32_t>(owned)) + " pullThresholdForQueue=" + num(perQueue)
+                  + " (want 4/owned = 1)");
+        // Control for "only its own knob moves": the byte budget is off (-1), so the per-queue byte value
+        // this case set must survive the division untouched.
+        check("S3-an off topic budget leaves its per-queue knob alone",
+              perQueueSize == kOffSizeMiB, "pullThresholdSizeForQueue=" + num(perQueueSize));
+        // Control for "the numerator is always the topic budget": dividing does not consume it, so a
+        // repeated round over the same queue count writes the same number.
+        check("S3-the topic budget keeps the configured value", topicBudget == 4,
+              "pullThresholdForTopic=" + num(topicBudget));
         std::this_thread::sleep_for(std::chrono::seconds(3));
         for (int i = 0; i < 16; ++i) {
             producer.send(Message(topic, bodyBytes("t-" + std::to_string(i))));
         }
+        // (2) the gate fires on a queue's own buffer once that buffer passes its divided share.
         const bool hit = waitUntil([&] { return c.consumer->flowControlTriggered() > 0; }, 30000);
-        const bool all = waitUntil([&] { return c.sink->got() >= 16; }, 40000);
         const int64_t fc = c.consumer->flowControlTriggered();
+        // (3) nothing is lost while the budget is engaged.
+        const bool all = waitUntil([&] { return c.sink->got() >= 16; }, 60000);
+        check("S3-the gate trips on one queue's own buffer over its divided share", hit,
+              "triggered=" + num(fc) + " perQueueLimit=" + num(perQueue));
+        check("S3-every queue of the budgeted topic is still consumed to the end",
+              all && c.sink->got() == 16 && c.sink->distinct() == 16,
+              "got=" + num(c.sink->got()) + " distinct=" + num(static_cast<int32_t>(c.sink->distinct())));
+        check("S3-the per-queue knob still reads the divided share after the run",
+              c.consumer->pullThresholdForQueue() == 1,
+              "pullThresholdForQueue=" + num(c.consumer->pullThresholdForQueue()));
         c.consumer->shutdown();
-        check("S3-topic-level count gate hits on live broker", hit, "triggered=" + num(fc));
-        check("S3-all still consumed after cross-queue accumulation", all && c.sink->got() == 16,
-              "got=" + num(c.sink->got()));
     }
 
     // ---------------- S4 a queue that hit flow control keeps consuming after recovery ----------------

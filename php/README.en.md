@@ -15,7 +15,7 @@ This directory is the **PHP client SDK for Apache RocketMQ's classic remoting pr
   dispatch all collapse into a **caller-driven `tick()`** invoked from your own loop
   (see the execution-model note in "Examples").
 - Verified against a real RocketMQ **5.5.1** cluster (NameServer 9876 + Broker 10911).
-- Size: `src/` 76 files / 34,799 lines; `tests/` 26 files / 22,255 lines.
+- Size: `src/` 76 files / 35,056 lines; `tests/` 29 files / 24,753 lines.
 
 ## Prerequisites
 
@@ -45,7 +45,7 @@ cd php
 # syntax check of a file after modifying it
 php -l src/Client/Producer.php
 
-# offline self-test entry: static guard + 25 suites run sequentially, no cluster needed
+# offline self-test entry: static guard + 26 suites run sequentially, no cluster needed
 php tests/run_all.php
 
 # a single suite
@@ -59,9 +59,9 @@ bash scripts/run_php_live.sh compression 127.0.0.1:9876
 `tests/run_all.php` is the **offline** suite: before running anything it performs a
 repository-wide **duplicate-class-name static guard** (PHP has no module isolation, so
 when the same FQCN is declared in two files the one autoloaded first silently wins and
-the other dies — this guard cannot be skipped), then chains **23** suites — the list is derived
+the other dies — this guard cannot be skipped), then chains **26** suites — the list is derived
 from `tests/Run*.php`, so a new suite cannot silently stay out of the check. Measured today:
-**guard CLEAN, all 4,219 assertions across the 25 suites pass**; any failure exits with a
+**guard CLEAN, all 4,293 assertions across the 26 suites pass**; any failure exits with a
 non-zero code.
 
 ## Examples
@@ -417,7 +417,7 @@ Assigning the public `$client->socksProxy` property works too; all five client f
   auto-accumulation and two-level fair backpressure) / oneway / async / transactional
   (two-phase + broker check-back) / timed messages and recall / Request-Reply
 - ✅ Consuming: Push (concurrent / orderly / broadcasting / offset persistence / start-up
-  numeric validation / pre-pull flow-control thresholds), Pull (whole-topic view and
+  numeric validation / three pre-pull cache gates per queue, topic budgets divided over the owned queues at rebalance), Pull (whole-topic view and
   this-instance share view), LitePull (incl. topic queue-set change listener),
   POP (200050 pop / 200051 ack / 200053 change-invisible-time + checkpoints),
   `ConsumeMessageDirectly`
@@ -442,7 +442,7 @@ Assigning the public `$client->socksProxy` property works too; all five client f
 - ✅ Compression: ZLIB (`gzcompress`), pure-PHP LZ4 Frame, ZSTD (CLI preferred, pure-PHP
   fallback)
 - ✅ TLS: CA verification / mTLS / SNI
-- ✅ Offline self-test: 25 suites with 4,219 assertions + the duplicate-class-name static
+- ✅ Offline self-test: 26 suites with 4,293 assertions + the duplicate-class-name static
   guard (measured all green)
 - ✅ Live-cluster verification: the 14 `examples/live_*.php` cases cover the admin surface,
   redelivery / dead-letter, pull mode, queue-change listening, POP, TLS, Request-Reply,

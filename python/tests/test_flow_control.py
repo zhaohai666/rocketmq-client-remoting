@@ -1,12 +1,13 @@
-# Why this must be locked offline: of the five gates, only the **count** one fires first in "small messages, fast pulls" scenarios;
-# the other four fail in a **silent** direction when judged wrong:
+# Why this must be locked offline: of the three per-queue gates, only the **count** one fires first in "small messages, fast pulls" scenarios;
+# the other two fail in a **silent** direction when judged wrong:
 #   - Queue-level byte gate failing ⇒ large messages blow up the pulled-but-unconsumed pile (real-world symptom: OOM / RT spike, no exception);
 #   - Offset span gate failing ⇒ the head message keeps failing to consume while the rest piles up endlessly, and the offset span runs away;
-#   - Topic-level gate failing ⇒ multiple queues of the same topic act independently; no single queue is "over" but the instance total explodes.
+#   - Topic-level division failing ⇒ the topic budget is never turned into a per-queue quota, so the instance total explodes while no single queue ever looks "over".
 # The units have exactly one pitfall: the size threshold is **MiB**, not bytes. The comparison has one, too:
 # every cache gate is **strictly greater than** the threshold, so a buffer that has reached it exactly still pulls.
 #
-# This file locks the offline semantics of flow-control judgment: the hit direction and units of the five gates are pinned one by one,
+# This file locks the offline semantics of flow-control judgment: the hit direction and units of the three per-queue
+# gates, how the two topic knobs are divided into them when the queue assignment changes,
 # plus the two stalls the gate can cause (the client's own cache threshold vs the broker's FLOW_CONTROL(215) reply).
 # For the real-machine side, "no message is lost after a gate hits", see ../verify_flow_control_live.py.
 import inspect
@@ -24,9 +25,9 @@ from client.exception import MQBrokerException
 from common.message import MessageExt, MessageQueue
 from common.subscription_data import SubscriptionData
 from remoting.protocol.codes import ResponseCode
+from remoting.protocol.heartbeat import MessageModel
 
 TOPIC = "FlowControlPyUnitTopic"
-OTHER_TOPIC = "FlowControlPyUnitOther"
 BROKER = "broker-a"
 MIB = 1024 * 1024
 
@@ -62,11 +63,19 @@ def _gates_off(c):
 
 
 def _stage(c, mq, msgs):
-    """Pre-set a queue's buffer + register it as assigned (topic-level thresholds aggregate sibling queues via _mq_map)."""
+    """Pre-set a queue's buffer + register it in _mq_map, the table of owned queues with live pull state."""
     key = c._mq_key(mq)
     c._mq_map[key] = mq
     c._pending[key] = list(msgs)
     return key
+
+
+def _own(c, count):
+    """Register ``count`` owned queues with an empty buffer: that is the queue count the topic-level division divides by."""
+    queues = [_queue(queue_id=i) for i in range(count)]
+    for mq in queues:
+        _stage(c, mq, [])
+    return queues
 
 
 def _hit(c, mq, key=None):
@@ -143,59 +152,195 @@ def test_span_gate_is_strictly_greater_and_measures_real_span():
     assert not _hit(c, mq)
 
 
-def test_topic_count_gate_aggregates_siblings_but_not_other_topics():
-    c = _consumer("G_fc_topic_count")
-    q0, q1 = _queue(queue_id=0), _queue(queue_id=1)
-    other = _queue(topic=OTHER_TOPIC)
+# ---------------- The topic knobs are DIVIDED into the per-queue knobs, never summed at pull time ----------------
+# A topic-level budget is not a pull-time gate: the consumer turns it into a per-queue quota
+# (topic knob // the number of queues it owns) whenever the assignment changes, so the three per-queue
+# checks stay the only place a queue is judged. The numerator is always the topic knob, which makes the
+# division idempotent, and it floors at 1, because 0 would freeze every queue of the instance.
+
+def test_assignment_change_divides_both_topic_knobs_into_the_per_queue_ones(caplog):
+    c = _consumer("G_fc_topic_divide")
     _gates_off(c)
-    c.pull_threshold_for_topic = 2
-    # 1 message in a single queue: the topic level also sees only 1
-    _stage(c, q0, _n_sized(TOPIC, 1, 1))
-    assert not _hit(c, q0)
-    # Sibling queues of the same topic with 1 message each => 2 cumulative, both queues must stop
-    k1 = _stage(c, q1, _n_sized(TOPIC, 1, 1))
-    assert _hit(c, q0)
-    assert _hit(c, q1, k1)
-    # Other topics must not mix in: drop this topic to 1 message and pile 5 onto the other topic
-    _stage(c, q1, [])
-    _stage(c, other, _n_sized(OTHER_TOPIC, 1, 5))
-    assert not _hit(c, q0), "another topic's buffer must not count toward this topic's cumulative total"
+    # Per-queue values the user configured; the division overwrites them on purpose.
+    c.pull_threshold_for_queue = 1000
+    c.pull_threshold_size_for_queue = 100
+    c.pull_threshold_for_topic = 1000
+    c.pull_threshold_size_for_topic = 100
+    _own(c, 4)
+    with caplog.at_level("INFO", logger="rocketmq.client"):
+        c._divide_topic_thresholds()
+    assert c.pull_threshold_for_queue == 250, "1000 messages over 4 owned queues is a 250 message quota"
+    assert c.pull_threshold_size_for_queue == 25, "100MiB over 4 owned queues is a 25MiB quota"
+    infos = [r.getMessage() for r in caplog.records if r.levelname == "INFO"]
+    assert "The pullThresholdForQueue is changed from 1000 to 250" in infos, infos
+    assert "The pullThresholdSizeForQueue is changed from 100 to 25" in infos, infos
 
 
-def test_topic_size_gate_has_its_own_switch_and_runs_last():
-    c = _consumer("G_fc_topic_size")
-    q0, q1 = _queue(queue_id=0), _queue(queue_id=1)
+def test_both_topic_knobs_off_leave_the_per_queue_knobs_untouched():
+    """The paired control of the division: -1 means "this topic knob is off", so neither per-queue knob
+    may move. Dividing unconditionally would rewrite a queue-level config the user never asked about."""
+    c = _consumer("G_fc_topic_divide_off_control")
     _gates_off(c)
-    # The queue-level byte gate is **off** (0), leaving only the topic level: misusing the queue-level switch as the gate would silently disable this
-    c.pull_threshold_size_for_topic = 1
-    _stage(c, q0, [_sized(TOPIC, MIB // 2, 0)])
-    assert not _hit(c, q0)
-    _stage(c, q1, [_sized(TOPIC, 3 * MIB // 2, 0)])
-    assert _hit(c, q0), "when the queue-level size gate is off, the topic-level size gate must still take effect"
-    assert _hit(c, q1)
-    # While the queue-level gate is still on, the queue level hits first (judgment order: count → bytes → span → topic count → topic bytes)
-    c.pull_threshold_size_for_queue = 1
-    _stage(c, q0, [_sized(TOPIC, 2 * MIB, 0)])
-    before = c._flow_control_triggered
-    assert _hit(c, q0)
-    # One judgment records only one tick, even when multiple gates hit simultaneously
-    assert c._flow_control_triggered == before + 1
+    c.pull_threshold_for_queue = 1000
+    c.pull_threshold_size_for_queue = 100
+    c.pull_threshold_for_topic = -1
+    c.pull_threshold_size_for_topic = -1
+    _own(c, 4)
+    c._divide_topic_thresholds()
+    assert (c.pull_threshold_for_queue, c.pull_threshold_size_for_queue) == (1000, 100)
+
+
+def test_topic_knob_smaller_than_the_queue_count_floors_at_one():
+    # 3 messages of topic budget across 4 queues is 0 by integer division; flooring at 1 is the only
+    # thing that keeps the queue pulling at all -- a 0 threshold stops every queue of the instance.
+    c = _consumer("G_fc_topic_divide_floor")
+    _gates_off(c)
+    c.pull_threshold_for_queue = 1000
+    c.pull_threshold_size_for_queue = 100
+    c.pull_threshold_for_topic = 3
+    c.pull_threshold_size_for_topic = 3
+    _own(c, 4)
+    c._divide_topic_thresholds()
+    assert c.pull_threshold_for_queue == 1, "3 // 4 must floor at 1, never reach 0"
+    assert c.pull_threshold_size_for_queue == 1, "3MiB // 4 must floor at 1, never reach 0"
+
+
+def test_no_owned_queue_leaves_both_knobs_as_the_user_set_them():
+    """The zero-queue guard: with nothing owned there is no divisor, so the per-queue knobs must stay put
+    instead of collapsing to the floor value."""
+    c = _consumer("G_fc_topic_divide_zero_queues")
+    _gates_off(c)
+    c.pull_threshold_for_queue = 1000
+    c.pull_threshold_size_for_queue = 100
+    c.pull_threshold_for_topic = 1000
+    c.pull_threshold_size_for_topic = 100
+    assert not c._mq_map, "this consumer owns no queue with live pull state"
+    c._divide_topic_thresholds()
+    assert (c.pull_threshold_for_queue, c.pull_threshold_size_for_queue) == (1000, 100)
+
+
+def test_division_is_idempotent_and_always_divides_the_topic_knob():
+    c = _consumer("G_fc_topic_divide_idempotent")
+    _gates_off(c)
+    c.pull_threshold_for_queue = 1000
+    c.pull_threshold_size_for_topic = -1
+    c.pull_threshold_for_topic = 1000
+    _own(c, 4)
+    c._divide_topic_thresholds()
+    assert c.pull_threshold_for_queue == 250
+    # The same assignment again: the numerator is still the topic knob, so the answer cannot drift.
+    c._divide_topic_thresholds()
+    assert c.pull_threshold_for_queue == 250, "re-dividing an unchanged assignment must not compound"
+    # A change that doubles the owned queues re-derives from the TOPIC knob (1000 // 8 = 125),
+    # not from the already divided per-queue value (250 // 8 = 31 would be the bug).
+    _own(c, 8)
+    c._divide_topic_thresholds()
+    assert c.pull_threshold_for_queue == 125, "the second change must divide the topic knob, not 250"
+
+
+def test_gate_does_not_aggregate_the_sibling_queues():
+    """The state that used to fire: 4 queues x 250 messages is exactly the 1000 message topic budget, so the
+    old pull-time sibling sum paused every one of them. Under the division contract 250 is the per-queue
+    quota and a queue at exactly its quota still pulls."""
+    c = _consumer("G_fc_no_sibling_sum")
+    _gates_off(c)
+    c.pull_threshold_for_topic = 1000
+    queues = _own(c, 4)
+    for mq in queues:
+        _stage(c, mq, _n_sized(TOPIC, 100, 250))
+    c._divide_topic_thresholds()
+    assert c.pull_threshold_for_queue == 250
+    for mq in queues:
+        assert not _hit(c, mq), "the instance-wide total must not pause a queue that is only at its own quota"
+    assert c._flow_control_triggered == 0
+
+
+def test_a_queue_over_its_divided_share_pauses_on_a_per_queue_reason_only(caplog):
+    # Paired with the case above: one message over the divided quota still pauses that queue, and the
+    # reason names only the per-queue count -- a leftover aggregation branch would say "topic".
+    c = _consumer("G_fc_no_sibling_sum_over")
+    _gates_off(c)
+    c.pull_threshold_for_topic = 1000
+    queues = _own(c, 4)
+    for mq in queues:
+        _stage(c, mq, _n_sized(TOPIC, 100, 250))
+    c._divide_topic_thresholds()
+    hot = queues[0]
+    _stage(c, hot, _n_sized(TOPIC, 100, 251))
+    with caplog.at_level("DEBUG", logger="rocketmq.client"):
+        assert _hit(c, hot), "251 over a divided quota of 250 must pause"
+    lines = [r.getMessage() for r in caplog.records
+             if r.levelname == "DEBUG" and "flow control" in r.getMessage()]
+    # The whole line, not just a substring: the reason field is exactly the per-queue count, with no
+    # cross-queue accumulation wording left in it.
+    assert lines == ["flow control: queue %s count=251, pause pull" % hot], lines
+
+
+class _RouteOnlyClient(object):
+    """Only the route view a rebalance round reads: the broadcasting path takes every queue of the topic."""
+
+    def __init__(self):
+        self.queues = []
+
+    def get_topic_subscribe_info(self, topic):
+        return list(self.queues)
+
+
+def _rebalance_consumer(group):
+    """A started consumer whose rebalance runs for real except for the network: parked pull loops, no revoke RPC."""
+    c = DefaultMQPushConsumer(group)
+    c._started = True
+    c.use_heartbeat_v2 = False
+    c.message_model = MessageModel.BROADCASTING
+    c.subscription_data = {TOPIC: SubscriptionData(topic=TOPIC, sub_string="*")}
+    c._queue_pull_loop = lambda mq: c._stop.wait(30)
+    c._on_queues_revoked = lambda revoked: None
+    client = _RouteOnlyClient()
+    c._mq_client = client
+    return c, client
+
+
+def test_rebalance_divides_only_on_a_changed_assignment_and_after_the_state_update():
+    c, client = _rebalance_consumer("G_fc_rebalance_divides")
+    try:
+        client.queues = [_queue(queue_id=i) for i in range(8)]
+        # The start offset resolution is not what is under test; pre-filling it keeps the round local.
+        for mq in client.queues:
+            c._offset_table[c._mq_key(mq)] = 0
+        c.pull_threshold_for_queue = 1000
+        c.pull_threshold_size_for_queue = 100
+        c.pull_threshold_for_topic = 1000
+        c.pull_threshold_size_for_topic = 100
+        client.queues = [_queue(queue_id=i) for i in range(4)]
+        c._do_rebalance()
+        assert (c.pull_threshold_for_queue, c.pull_threshold_size_for_queue) == (250, 25)
+        # The very same allocation again: nothing changed, so a per-queue value edited since the last
+        # round must survive -- dividing on every round would rewrite it on every rebalance cycle.
+        c.pull_threshold_for_queue = 777
+        c._do_rebalance()
+        assert c.pull_threshold_for_queue == 777, "an unchanged assignment must not re-run the division"
+        # Growing to 8 queues divides by this round's 8, not by the 4 the previous round saw: the pull
+        # state tables are only complete once the thread update has run, which is why the division is last.
+        client.queues = [_queue(queue_id=i) for i in range(8)]
+        c._do_rebalance()
+        assert c.pull_threshold_for_queue == 125, "the divisor must be the queue count after the update"
+        assert c.pull_threshold_size_for_queue == 12, "100MiB // 8 queues"
+    finally:
+        c._stop.set()
 
 
 def test_one_hit_counts_one_tick_even_when_every_gate_matches():
-    """The counter is an observability surface for "how many times flow control stopped things": even when all five gates hit at once, only one tick is added."""
+    """The counter is an observability surface for "how many times flow control stopped things": even when all
+    three per-queue gates hit at once, only one tick is added."""
     c = _consumer("G_fc_counter")
-    q0, q1 = _queue(queue_id=0), _queue(queue_id=1)
+    mq = _queue()
     _gates_off(c)
     c.pull_threshold_for_queue = 1
     c.pull_threshold_size_for_queue = 1
     c.consume_concurrently_max_span = 1
-    c.pull_threshold_for_topic = 1
-    c.pull_threshold_size_for_topic = 1
-    # A buffer of 2 messages at 2MiB each with offsets spanning to 100: all five gates hit at once
-    _stage(c, q0, [_sized(TOPIC, 2 * MIB, 0), _sized(TOPIC, 2 * MIB, 100)])
-    _stage(c, q1, [_sized(TOPIC, 2 * MIB, 0)])
-    assert _hit(c, q0)
+    # A buffer of 2 messages at 2MiB each with offsets spanning to 100: all three per-queue gates hit at once
+    _stage(c, mq, [_sized(TOPIC, 2 * MIB, 0), _sized(TOPIC, 2 * MIB, 100)])
+    assert _hit(c, mq)
     assert c._flow_control_triggered == 1
 
 

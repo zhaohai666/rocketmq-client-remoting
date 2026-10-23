@@ -28,7 +28,7 @@ python3 -m venv .venv
 .venv/bin/pip install -e .                     # top-level packages: client / common / remoting
 
 .venv/bin/pip install pytest                   # needed only to run the unit tests
-.venv/bin/python -m pytest tests/ -q           # 1632 passed, 4 skipped
+.venv/bin/python -m pytest tests/ -q           # 1638 passed, 4 skipped
 .venv/bin/python selfcheck.py                  # selfcheck: 7/7 passed
 ```
 
@@ -380,7 +380,7 @@ third-party dependencies.
 | Normal / ordered (selector) / pinned-queue / delayed / two-phase transactional / batch / oneway / async (with fair-semaphore backpressure) | ✅ |
 | Request-Reply (325 send + 326 push-back, synchronous and asynchronous) | ✅ |
 | Recalling a delayed message: `recall_message` (370, handle from `SendResult.recall_handle`) | ✅ |
-| Push consumer: concurrent / orderly listeners, broadcasting, five flow-control thresholds, offset correction and reset, stalled-loop recovery, expired-message sweep | ✅ |
+| Push consumer: concurrent / orderly listeners, broadcasting, the three per-queue cache gates (topic budgets divided over the owned queues), offset correction and reset, stalled-loop recovery, expired-message sweep | ✅ |
 | Pull consumer: manual pull + long polling + manual commit + offset lookup by timestamp | ✅ |
 | Lite pull consumer: `poll` / `assign` / `seek` / `pause` / `commit`, three offset tables (pull / consumed / committed cursors), topic queue-change listener | ✅ |
 | POP consumption loop (`pop_mode`, with ack / renew / orderly POP) | ✅ |
@@ -454,7 +454,7 @@ named `_live`. One line each on what they prove:
 | `verify_consumer_heartbeat_slave_live.py` | Consumer heartbeats fan out to slave brokers (needs a slave in the cluster) |
 | `verify_correct_tags_offset_live.py` | An empty response still advances the committed offset (correctTagsOffset) |
 | `verify_fail_fast_live.py` | In-flight requests get a terminal state immediately once the broker really dies (stops and restarts a broker) |
-| `verify_flow_control_live.py` | The five pre-pull flow-control thresholds plus the start-up numeric gates |
+| `verify_flow_control_live.py` | The three pre-pull cache gates per queue (topic budgets divided into them at rebalance) plus the start-up numeric gates |
 | `verify_heartbeat_v2_live.py` | Heartbeat V2 against a real broker: the broker answers `IS_SUPPORT_HEART_BEAT_V2`, its per-group `group -> fingerprint` table really drives `IS_SUB_CHANGE` (a V1 round followed by the first V2 round is a change, the round after it is not, and a widened subscription is a change again), a fingerprint rebuilt from an equivalent body equals the one the broker recorded (the normalization that drops subVersion / clientID is what makes that true), and a `withoutSub` round keeps the broker-side subscription set (204 still shows it) while the same light body for a group that never delivered one leaves 204 with nothing; a real push consumer driven through the V2 path proves the light rounds go out, every round is accepted, the broker-side tag filter still holds afterwards and the group stays registered; the same consumer with the opt-in off is the paired control — not one non-zero fingerprint or withoutSub body on the wire, and it consumes just the same |
 | `verify_hook_live.py` | CheckForbidden / FilterMessage hooks actually intercepting |
 | `verify_interval_live.py` | Route-refresh and offset-persist periods take effect as configured (two instances, two periods) |
