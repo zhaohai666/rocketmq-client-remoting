@@ -26,9 +26,10 @@ use crate::client::allocate_strategy::{
     AllocateMessageQueueAveragely, AllocateMessageQueueStrategy,
 };
 use crate::client::consumer::{
-    client_side_tag_filter, consume_timestamp_millis, default_consume_timestamp, mq_key,
-    mq_sort_key, plan_initial_offset, sort_mqs, MessageQueueListener, MessageSelector,
-    StartOffsetPlan, DEFAULT_INSTANCE_NAME,
+    client_side_tag_filter, consume_timestamp_millis, default_consume_timestamp, is_flow_control_warn_trip,
+    mq_key, mq_sort_key, plan_initial_offset, sort_mqs, MessageQueueListener, MessageSelector,
+    StartOffsetPlan, DEFAULT_INSTANCE_NAME, PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL,
+    PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL,
 };
 use crate::client::hook::{FilterMessageHook, FilterMessageHookList};
 use crate::client::mq_client::{
@@ -43,6 +44,7 @@ use crate::common::mix_all::MixAll;
 use crate::common::sysflag::PullSysFlag;
 use crate::common::util_all::current_time_millis;
 use crate::error::{Error, Result};
+use crate::remoting::protocol::codes::response_code;
 use crate::remoting::protocol::heartbeat::{
     ConsumeFromWhere, ConsumeType, ConsumerData, FilterAPI, HeartbeatData, MessageModel,
     SubscriptionData,
@@ -74,6 +76,18 @@ pub const MAX_POLL_BATCH_SIZE: usize = 1024;
 /// The heartbeat RPC timeout is the same as above; named here only for readability.
 const LITE_PULL_RPC_TIMEOUT_MILLIS: i64 = 5_000;
 const LITE_METADATA_FIRST_DELAY_MILLIS: u64 = 10_000;
+/// `pullThresholdForAll` = 10000: message-count budget of the **whole** local buffer, the sum
+/// over every queue.
+pub const DEFAULT_LITE_PULL_THRESHOLD_FOR_ALL: i32 = 10_000;
+/// `pullThresholdForQueue` = 1000: cached message count still allowed for **one** queue.
+pub const DEFAULT_LITE_PULL_THRESHOLD_FOR_QUEUE: i32 = 1_000;
+/// `pullThresholdSizeForQueue` = 100 (**MiB**) cached bytes still allowed for **one** queue.
+pub const DEFAULT_LITE_PULL_THRESHOLD_SIZE_FOR_QUEUE: i32 = 100;
+/// `consumeMaxSpan` = 2000: cached offset span (highest minus lowest) still allowed for **one** queue.
+pub const DEFAULT_LITE_CONSUME_MAX_SPAN: i64 = 2_000;
+/// The size gate compares whole MiB: the cached bytes are divided by this with **integer**
+/// division, so 1.5 MiB still reads as 1 MiB.
+const CACHE_SIZE_GATE_MIB: i64 = 1024 * 1024;
 
 /// The polling shape of one pull request, bundled so the shared pull kernel stays under the
 /// argument-count limit. Short polling never suspends but still sends the historic fixed
@@ -1298,6 +1312,19 @@ pub struct LitePullConsumerConfig {
     pub broker_suspend_max_time_millis: i64,
     /// `pull_interval_millis` = 50: backoff when the queue tail is empty (`max(0, ms)`).
     pub pull_interval_millis: i64,
+    /// `pullThresholdForAll` = 10000: message-count budget for the **whole** local buffer,
+    /// summed over every queue. A plain budget: no clamping, and `0` trips on the very first
+    /// cached message (a strictly-greater comparison).
+    pub pull_threshold_for_all: i32,
+    /// `pullThresholdForQueue` = 1000: messages of **one** queue still allowed to sit cached.
+    /// Never summed with its siblings; no clamping, so `0` trips on the first cached message.
+    pub pull_threshold_for_queue: i32,
+    /// `pullThresholdSizeForQueue` = 100 (**MiB**) of **one** queue's cached bytes, measured as
+    /// the stored message size (`storeSize`) the decoder records, never the body length.
+    pub pull_threshold_size_for_queue: i32,
+    /// `consumeMaxSpan` = 2000: offset span (highest cached queue offset minus lowest) of **one**
+    /// queue; an empty or single-message cache has span 0.
+    pub consume_max_span: i64,
     /// `pull_thread_nums` = 1: **this implementation is always a single pull loop**;
     /// the field is kept only for the config shape.
     pub pull_thread_nums: i32,
@@ -1342,6 +1369,10 @@ impl Default for LitePullConsumerConfig {
             consumer_timeout_millis_when_suspend: DEFAULT_CONSUMER_TIMEOUT_MILLIS_WHEN_SUSPEND,
             broker_suspend_max_time_millis: DEFAULT_BROKER_SUSPEND_MAX_TIME_MILLIS,
             pull_interval_millis: 50,
+            pull_threshold_for_all: DEFAULT_LITE_PULL_THRESHOLD_FOR_ALL,
+            pull_threshold_for_queue: DEFAULT_LITE_PULL_THRESHOLD_FOR_QUEUE,
+            pull_threshold_size_for_queue: DEFAULT_LITE_PULL_THRESHOLD_SIZE_FOR_QUEUE,
+            consume_max_span: DEFAULT_LITE_CONSUME_MAX_SPAN,
             pull_thread_nums: 1,
             topic_metadata_check_interval_millis: 30_000,
             use_heartbeat_v2: false,
@@ -1350,6 +1381,189 @@ impl Default for LitePullConsumerConfig {
             enable_concurrent_heartbeat: false,
             concurrent_heartbeat_thread_pool_size: default_concurrent_heartbeat_pool_size(),
         }
+    }
+}
+
+/// One queue's parked pull round.
+///
+/// The lite pull loop is a **single** task round-robining every assigned queue, so a refusal may
+/// not sleep inside that round: it arms a deadline for the refused queue only, and the loop drops
+/// parked queues from the round's targets instead of blocking its siblings. `delay_millis` keeps
+/// the delay that armed the park so tests and callers can assert the armed pause itself rather
+/// than measure wall clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PullPark {
+    /// The delay that armed this park (cache gate: 50 ms, broker throttle: 20 ms).
+    delay_millis: u64,
+    /// Absolute deadline (`current_time_millis` domain) before which the queue must not pull.
+    until_millis: i64,
+}
+
+/// Queue key of a cached message, in the exact `mq_key` shape the assignment tables use.
+///
+/// A buffered message carries its own coordinates (`topic` / `brokerName` / `queueId`), so the
+/// buffer can be attributed per queue without consulting the assignment: a missing broker name
+/// reads as the empty string, same as `MessageQueue`'s default.
+fn cache_key_of_message(m: &MessageExt) -> String {
+    format!(
+        "{}{}{}",
+        m.topic,
+        m.broker_name.clone().unwrap_or_default(),
+        m.queue_id
+    )
+}
+
+/// One queue's share of the local buffer, kept incrementally so a per-queue verdict never has to
+/// scan the deque.
+///
+/// `offsets` is a map (not a pair of scalars) because removal must be able to recover the new
+/// lowest/highest cached offset in O(log n): a drained batch or a pruned head can take either end
+/// with it, and the multiplicity also survives duplicate offsets from a redelivery.
+#[derive(Clone, Debug, Default)]
+struct LiteQueueCache {
+    /// Cached message count.
+    count: usize,
+    /// Cached bytes, summed over each message's stored size (`storeSize`), never the body length.
+    bytes: i64,
+    /// Cached queue offsets of this one queue: offset -> how many messages sit at it.
+    offsets: BTreeMap<i64, usize>,
+}
+
+impl LiteQueueCache {
+    fn add(&mut self, m: &MessageExt) {
+        self.count += 1;
+        self.bytes = self.bytes.saturating_add(i64::from(m.store_size));
+        *self.offsets.entry(m.queue_offset).or_default() += 1;
+    }
+
+    fn remove(&mut self, m: &MessageExt) {
+        self.count = self.count.saturating_sub(1);
+        self.bytes = self.bytes.saturating_sub(i64::from(m.store_size));
+        match self.offsets.get_mut(&m.queue_offset) {
+            Some(0) | None => {}
+            Some(n) => {
+                *n -= 1;
+                if *n == 0 {
+                    self.offsets.remove(&m.queue_offset);
+                }
+            }
+        }
+    }
+
+    /// Lowest cached queue offset (`0` for an empty cache).
+    fn min_offset(&self) -> i64 {
+        self.offsets.keys().next().copied().unwrap_or_default()
+    }
+
+    /// Highest cached queue offset (`0` for an empty cache).
+    fn max_offset(&self) -> i64 {
+        self.offsets.keys().next_back().copied().unwrap_or_default()
+    }
+
+    /// Offset span of this queue's cached messages: an empty or single-message cache has span 0.
+    fn span(&self) -> i64 {
+        self.max_offset() - self.min_offset()
+    }
+
+    /// Cached bytes in **whole** MiB (integer division), the unit `pullThresholdSizeForQueue` is
+    /// written in: 1.5 MiB reads as 1 MiB.
+    fn size_mib(&self) -> i64 {
+        self.bytes / CACHE_SIZE_GATE_MIB
+    }
+}
+
+/// The lite consumer's local buffer: one shared deque **plus** the per-queue accumulators the
+/// cache gates read.
+///
+/// Lock discipline: the two always change together and only through the methods here, under the
+/// buffer's own single lock (`LiteInner::buffer`). The state lock is never taken while this lock
+/// is held, and nothing outside these methods may touch `messages` -- that is what makes the
+/// accumulators structurally unable to drift from the deque at append, drain, seek-prune and
+/// unassign.
+#[derive(Default)]
+struct LiteBuffer {
+    /// Cached messages of every queue, in arrival order.
+    messages: VecDeque<MessageExt>,
+    /// Per-queue accumulators keyed like `LiteState::assigned` (see [`cache_key_of_message`]).
+    queues: BTreeMap<String, LiteQueueCache>,
+}
+
+impl LiteBuffer {
+    fn len(&self) -> usize {
+        self.messages.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+
+    /// This queue's cache view; an untracked (never cached, or already revoked) queue reads as
+    /// empty, which is the point: a queue no one owns cannot refuse a pull.
+    fn queue_cache(&self, key: &str) -> LiteQueueCache {
+        self.queues.get(key).cloned().unwrap_or_default()
+    }
+
+    /// Append a pulled batch (the only way messages enter the buffer).
+    fn extend(&mut self, msgs: Vec<MessageExt>) {
+        for m in msgs {
+            let key = cache_key_of_message(&m);
+            self.queues.entry(key).or_default().add(&m);
+            self.messages.push_back(m);
+        }
+    }
+
+    /// Take at most `take` messages from the head of the deque (what `poll()` hands out).
+    fn drain_prefix(&mut self, take: usize) -> Vec<MessageExt> {
+        let out: Vec<MessageExt> = self.messages.iter().take(take).cloned().collect();
+        for m in &out {
+            let key = cache_key_of_message(m);
+            if let Some(cache) = self.queues.get_mut(&key) {
+                cache.remove(m);
+                if cache.count == 0 {
+                    self.queues.remove(&key);
+                }
+            }
+        }
+        let _: Vec<MessageExt> = self.messages.drain(..out.len()).collect();
+        out
+    }
+
+    /// Drop this queue's cached messages below `offset` (what `seek()` does to the buffer).
+    fn prune_before(&mut self, mq: &MessageQueue, offset: i64) {
+        let key = mq_key(mq);
+        let old = std::mem::take(&mut self.messages);
+        let mut kept: VecDeque<MessageExt> = VecDeque::with_capacity(old.len());
+        for m in old {
+            let is_this_queue = m.topic == mq.topic
+                && m.broker_name.as_deref() == Some(mq.broker_name.as_str())
+                && m.queue_id == mq.queue_id;
+            if is_this_queue && m.queue_offset < offset {
+                if let Some(cache) = self.queues.get_mut(&key) {
+                    cache.remove(&m);
+                }
+            } else {
+                kept.push_back(m);
+            }
+        }
+        self.messages = kept;
+        if self.queues.get(&key).is_some_and(|c| c.count == 0) {
+            self.queues.remove(&key);
+        }
+    }
+
+    /// Rebuild the accumulators after the assigned queue set changed: a revoked queue loses its
+    /// counters with it (its leftovers stay deliverable to `poll()` and still count in the
+    /// aggregate, which reads the deque directly), and a newly owned queue gets exactly what the
+    /// buffer holds for it. One pass, only on a queue-set change.
+    fn resync_queues(&mut self, owned: &BTreeSet<String>) {
+        let mut fresh: BTreeMap<String, LiteQueueCache> = BTreeMap::new();
+        for m in &self.messages {
+            let key = cache_key_of_message(m);
+            if owned.contains(&key) {
+                fresh.entry(key).or_default().add(m);
+            }
+        }
+        self.queues = fresh;
     }
 }
 
@@ -1370,6 +1584,8 @@ struct LiteState {
     seek_offset: BTreeMap<String, i64>,
     next_auto_commit_deadline: i64,
     paused: BTreeSet<String>,
+    /// Per-queue pull parks armed by a cache gate or a broker throttle, keyed like `assigned`.
+    pull_parks: BTreeMap<String, PullPark>,
     last_rebalance_ts: i64,
 }
 
@@ -1387,6 +1603,7 @@ impl Default for LiteState {
             seek_offset: BTreeMap::new(),
             next_auto_commit_deadline: -1,
             paused: BTreeSet::new(),
+            pull_parks: BTreeMap::new(),
             last_rebalance_ts: 0,
         }
     }
@@ -1405,8 +1622,14 @@ struct LiteInner {
     listener: Mutex<Option<Arc<dyn MessageQueueListener>>>,
     rpc_hook: RwLock<Option<Arc<dyn RPCHook>>>,
     /// Local buffer + buffer-ready notification.
-    buffer: Mutex<VecDeque<MessageExt>>,
+    buffer: Mutex<LiteBuffer>,
     buffer_signal: Notify,
+    /// Cache-gate trips of the whole-buffer aggregate gate (see `pull_threshold_for_all`).
+    flow_control_all_triggered: AtomicUsize,
+    /// Cache-gate trips **shared** by the per-queue count gate and the per-queue size gate.
+    flow_control_queue_triggered: AtomicUsize,
+    /// Cache-gate trips of the per-queue offset-span gate.
+    flow_control_span_triggered: AtomicUsize,
     topic_listeners: Mutex<BTreeMap<String, Arc<dyn TopicMessageQueueChangeListener>>>,
     queues_for_topic: Mutex<BTreeMap<String, Vec<MessageQueue>>>,
 }
@@ -1425,8 +1648,11 @@ impl Default for LiteInner {
             strategy: RwLock::new(Arc::new(AllocateMessageQueueAveragely)),
             listener: Mutex::new(None),
             rpc_hook: RwLock::new(None),
-            buffer: Mutex::new(VecDeque::new()),
+            buffer: Mutex::new(LiteBuffer::default()),
             buffer_signal: Notify::new(),
+            flow_control_all_triggered: AtomicUsize::new(0),
+            flow_control_queue_triggered: AtomicUsize::new(0),
+            flow_control_span_triggered: AtomicUsize::new(0),
             topic_listeners: Mutex::new(BTreeMap::new()),
             queues_for_topic: Mutex::new(BTreeMap::new()),
         }
@@ -1442,6 +1668,130 @@ impl Drop for LiteInner {
         for task in lock(&self.tasks).drain(..) {
             task.abort();
         }
+    }
+}
+
+/// Which of the four cache gates refused one queue's pull round.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiteCacheGate {
+    /// Total messages cached in the whole buffer, over `pullThresholdForAll`.
+    All,
+    /// This queue's cached message count, over `pullThresholdForQueue`.
+    Count,
+    /// This queue's cached bytes (in whole MiB), over `pullThresholdSizeForQueue`.
+    Size,
+    /// This queue's cached offset span, over `consumeMaxSpan`.
+    Span,
+}
+
+/// Judge this queue's cache against the four gates, in the fixed order
+/// **aggregate → count → size → span**, and account for the refusal (one counter plus the debug
+/// and, on the shared cadence, the warn line). `None` = the queue may pull.
+///
+/// Three properties the wording of the gates depends on:
+/// * every comparison is **strictly greater**, so a queue sitting exactly on its threshold keeps
+///   pulling and a threshold reads as "how many may stay cached" (a `0` therefore trips on the
+///   first cached message rather than switching the gate off);
+/// * gates 2..4 judge **this queue only** -- a sibling over its own budget must not stop this one,
+///   which is why the accumulators are per queue and never summed;
+/// * the aggregate is read from the deque's length, so it sees every cached message of every queue
+///   (including queues this instance still holds messages for) without a scan.
+fn lite_cache_flow_control_hit(inner: &LiteInner, key: &str) -> Option<LiteCacheGate> {
+    let cfg = read_cfg(&inner.cfg);
+    // One lock of the buffer for both the aggregate and the per-queue view; the state lock is
+    // never taken while it is held.
+    let (total, cache) = {
+        let buffer = lock(&inner.buffer);
+        (buffer.len(), buffer.queue_cache(key))
+    };
+    let total_i64 = i64::try_from(total).unwrap_or(i64::MAX);
+    let count_i64 = i64::try_from(cache.count).unwrap_or(i64::MAX);
+    let gate = if total_i64 > i64::from(cfg.pull_threshold_for_all) {
+        LiteCacheGate::All
+    } else if count_i64 > i64::from(cfg.pull_threshold_for_queue) {
+        LiteCacheGate::Count
+    } else if cache.size_mib() > i64::from(cfg.pull_threshold_size_for_queue) {
+        LiteCacheGate::Size
+    } else if cache.span() > cfg.consume_max_span {
+        LiteCacheGate::Span
+    } else {
+        return None;
+    };
+    let threshold = match gate {
+        LiteCacheGate::All => i64::from(cfg.pull_threshold_for_all),
+        LiteCacheGate::Count => i64::from(cfg.pull_threshold_for_queue),
+        LiteCacheGate::Size => i64::from(cfg.pull_threshold_size_for_queue),
+        LiteCacheGate::Span => cfg.consume_max_span,
+    };
+    let counter = match gate {
+        LiteCacheGate::All => &inner.flow_control_all_triggered,
+        LiteCacheGate::Count | LiteCacheGate::Size => &inner.flow_control_queue_triggered,
+        LiteCacheGate::Span => &inner.flow_control_span_triggered,
+    };
+    let times = counter.fetch_add(1, Ordering::SeqCst) + 1;
+    let measured = match gate {
+        LiteCacheGate::All => format!("cached={total} messages over pull_threshold_for_all={threshold}"),
+        LiteCacheGate::Count => format!("count={count_i64} over pull_threshold_for_queue={threshold}"),
+        LiteCacheGate::Size => format!(
+            "size={} MiB over pull_threshold_size_for_queue={threshold}",
+            cache.size_mib()
+        ),
+        LiteCacheGate::Span => format!("span={} over consume_max_span={threshold}", cache.span()),
+    };
+    rmq_debug!(
+        "lite cache flow control: queue {key}, {measured}, minOffset={}, maxOffset={}, \
+         pause pull for {PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL} ms (flowControlTimes={times})",
+        cache.min_offset(),
+        cache.max_offset()
+    );
+    if is_flow_control_warn_trip(times) {
+        let min = cache.min_offset();
+        let max = cache.max_offset();
+        let warn = match gate {
+            LiteCacheGate::All => format!(
+                "the consume request count exceeds threshold {threshold}, so do flow control, \
+                 cached={total}, flowControlTimes={times}"
+            ),
+            LiteCacheGate::Count => format!(
+                "The cached message count exceeds the threshold {threshold}, so do flow control, \
+                 minOffset={min}, maxOffset={max}, count={count_i64}, size={} MiB, \
+                 flowControlTimes={times}",
+                cache.size_mib()
+            ),
+            LiteCacheGate::Size => format!(
+                "The cached message size exceeds the threshold {threshold} MiB, so do flow \
+                 control, minOffset={min}, maxOffset={max}, count={count_i64}, size={} MiB, \
+                 flowControlTimes={times}",
+                cache.size_mib()
+            ),
+            LiteCacheGate::Span => format!(
+                "The queue's messages, span too long, so do flow control, minOffset={min}, \
+                 maxOffset={max}, maxSpan={}, flowControlTimes={times}",
+                cache.span()
+            ),
+        };
+        rmq_warn!("lite cache flow control: queue {key}, {warn}");
+    }
+    Some(gate)
+}
+
+/// Is this failed pull a broker-side throttle (`FLOW_CONTROL(215)`)?
+///
+/// On the lite path an unmapped pull answer arrives as [`Error::Broker`] with its response code
+/// (both wire shapes are matched, exactly as the push path's pop/pull error arms do). A 215 means
+/// "slow down" and asks for the short broker delay; every other failure keeps the lite path's
+/// existing handling -- the idle-round backoff -- untouched.
+fn broker_flow_control_delay(err: &Error) -> Option<u64> {
+    match err {
+        Error::Server {
+            response_code: response_code::FLOW_CONTROL,
+            ..
+        }
+        | Error::Broker {
+            response_code: response_code::FLOW_CONTROL,
+            ..
+        } => Some(PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL),
+        _ => None,
     }
 }
 
@@ -1558,6 +1908,46 @@ impl DefaultLitePullConsumer {
     /// `max(0, ms)`.
     pub fn set_pull_interval_millis(&self, ms: i64) {
         self.update_config(|self_c| self_c.pull_interval_millis = ms);
+    }
+
+    /// `pullThresholdForAll`: the whole-buffer message-count budget over every queue.
+    /// No clamping -- a plain budget, and `0` trips on the first cached message.
+    pub fn set_pull_threshold_for_all(&self, threshold: i32) {
+        self.update_config(|c| c.pull_threshold_for_all = threshold);
+    }
+
+    pub fn pull_threshold_for_all(&self) -> i32 {
+        self.config().pull_threshold_for_all
+    }
+
+    /// `pullThresholdForQueue`: this queue's own cached message count budget; siblings never sum
+    /// into it. No clamping, so `0` trips on the first cached message.
+    pub fn set_pull_threshold_for_queue(&self, threshold: i32) {
+        self.update_config(|c| c.pull_threshold_for_queue = threshold);
+    }
+
+    pub fn pull_threshold_for_queue(&self) -> i32 {
+        self.config().pull_threshold_for_queue
+    }
+
+    /// `pullThresholdSizeForQueue`: this queue's own cached bytes budget, in **MiB** of stored
+    /// message size. No clamping, so `0` trips as soon as one whole MiB is cached.
+    pub fn set_pull_threshold_size_for_queue(&self, threshold: i32) {
+        self.update_config(|c| c.pull_threshold_size_for_queue = threshold);
+    }
+
+    pub fn pull_threshold_size_for_queue(&self) -> i32 {
+        self.config().pull_threshold_size_for_queue
+    }
+
+    /// `consumeMaxSpan`: this queue's own cached offset span (highest cached offset minus lowest).
+    /// No clamping, so `0` trips on the first span of 1.
+    pub fn set_consume_max_span(&self, span: i64) {
+        self.update_config(|c| c.consume_max_span = span);
+    }
+
+    pub fn consume_max_span(&self) -> i64 {
+        self.config().consume_max_span
     }
 
     pub fn set_consume_from_where(&self, where_: &str) {
@@ -1795,22 +2185,33 @@ impl DefaultLitePullConsumer {
     /// [`start`](Self::start) (synchronous resolution has the same semantics, just later timing,
     /// because `assign()` is not async). Queues already in `next_offset` are not overwritten.
     pub fn assign(&self, message_queues: &[MessageQueue]) {
-        let mut state = lock(&self.inner.state);
-        state.assign_mode = true;
-        let keep: BTreeSet<String> = message_queues.iter().map(mq_key).collect();
-        for key in state
-            .assigned
-            .keys()
-            .filter(|k| !keep.contains(*k))
-            .cloned()
-            .collect::<Vec<String>>()
-        {
-            state.next_offset.remove(&key);
-            state.consume_offset.remove(&key);
-        }
-        state.assigned.retain(|k, _| keep.contains(k));
-        for mq in message_queues {
-            state.assigned.insert(mq_key(mq), mq.clone());
+        let (owned, changed) = {
+            let mut state = lock(&self.inner.state);
+            state.assign_mode = true;
+            let keep: BTreeSet<String> = message_queues.iter().map(mq_key).collect();
+            let changed = state.assigned.keys().any(|k| !keep.contains(k));
+            for key in state
+                .assigned
+                .keys()
+                .filter(|k| !keep.contains(*k))
+                .cloned()
+                .collect::<Vec<String>>()
+            {
+                state.next_offset.remove(&key);
+                state.consume_offset.remove(&key);
+                // A queue this instance no longer owns parks for nobody.
+                state.pull_parks.remove(&key);
+            }
+            state.assigned.retain(|k, _| keep.contains(k));
+            for mq in message_queues {
+                state.assigned.insert(mq_key(mq), mq.clone());
+            }
+            (state.assigned.keys().cloned().collect(), changed)
+        };
+        // The queue set moved: the per-queue cache accumulators move with it (under the buffer's
+        // own lock, never while the state lock is held).
+        if changed {
+            lock(&self.inner.buffer).resync_queues(&owned);
         }
     }
 
@@ -2157,8 +2558,8 @@ impl DefaultLitePullConsumer {
         if buffer.is_empty() {
             return None;
         }
-        let take = buffer.len().min(MAX_POLL_BATCH_SIZE);
-        Some(buffer.drain(..take).collect())
+        // The deque and the per-queue accumulators move together, under this one lock.
+        Some(buffer.drain_prefix(MAX_POLL_BATCH_SIZE))
     }
 
     /// Advance the **consumed cursor** by the batch just delivered (the pull cursor does not move at all).
@@ -2202,17 +2603,7 @@ impl DefaultLitePullConsumer {
             state.consume_offset.insert(key, offset);
         }
         let mut buffer = lock(&self.inner.buffer);
-        let kept: VecDeque<MessageExt> = buffer
-            .iter()
-            .filter(|m| {
-                !(m.topic == mq.topic
-                    && m.broker_name.as_deref() == Some(mq.broker_name.as_str())
-                    && m.queue_id == mq.queue_id
-                    && m.queue_offset < offset)
-            })
-            .cloned()
-            .collect();
-        *buffer = kept;
+        buffer.prune_before(mq, offset);
     }
 
     pub async fn seek_to_begin(&self, mq: &MessageQueue) -> Result<()> {
@@ -2677,7 +3068,7 @@ impl DefaultLitePullConsumer {
             per_topic.push((topic, mq_all, allocated));
         }
 
-        let (added, changed_topics, revoked) = {
+        let (added, changed_topics, revoked, owned, queue_set_changed) = {
             let mut state = lock(&self.inner.state);
             // Snapshot the old assignment first: `state.assigned` is about to be replaced wholesale, and a borrow cannot survive that assignment.
             let old: BTreeMap<String, MessageQueue> = state.assigned.clone();
@@ -2705,8 +3096,11 @@ impl DefaultLitePullConsumer {
                     state.next_offset.remove(key);
                     state.consume_offset.remove(key);
                     state.seek_offset.remove(key);
+                    // A revoked queue parks for nobody: its deadline goes with its state.
+                    state.pull_parks.remove(key);
                 }
             }
+            let owned: BTreeSet<String> = state.assigned.keys().cloned().collect();
             let changed_topics: Vec<(String, Vec<MessageQueue>, Vec<MessageQueue>)> = if changed {
                 per_topic
                     .into_iter()
@@ -2717,8 +3111,14 @@ impl DefaultLitePullConsumer {
             } else {
                 Vec::new()
             };
-            (added, changed_topics, revoked)
+            (added, changed_topics, revoked, owned, changed)
         };
+        if queue_set_changed {
+            // The queue set moved, so the per-queue cache accumulators move with it: a revoked
+            // queue's counters go with it (a stale accumulator must never refuse a pull), and a
+            // newly owned one starts from exactly what the buffer still holds for it.
+            lock(&self.inner.buffer).resync_queues(&owned);
+        }
 
         for mq in &revoked {
             self.persist_offset(mq).await;
@@ -2745,11 +3145,18 @@ impl DefaultLitePullConsumer {
 
     /// Short-poll one batch; on a hit, filter tags → feed the buffer → advance the cursor →
     /// throttle auto-commit. Returning `true` = this round put messages into the buffer (used for the backoff decision).
+    ///
+    /// The cache gates run first, before any offset is resolved or any request is built: a refused
+    /// round sends **nothing** and parks only this queue.
     async fn pull_one(&self, mq: &MessageQueue) -> bool {
         let Ok(client) = Self::require_client(&self.inner) else {
             return false;
         };
         let key = mq_key(mq);
+        if lite_cache_flow_control_hit(&self.inner, &key).is_some() {
+            self.park_pull(&key, PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL);
+            return false;
+        }
         // Snapshot first, then await: a MutexGuard is not Send, and calling lock(...) directly in the match
         // scrutinee would make the whole future non-Send (the temporary lives until the match ends).
         let known_offset = { lock(&self.inner.state).next_offset.get(&key).copied() };
@@ -2813,6 +3220,11 @@ impl DefaultLitePullConsumer {
             Ok(result) => result,
             Err(e) => {
                 rmq_debug!("lite pull failed for {mq:?}@{offset}: {e}");
+                // A broker throttle on this path is not an error: the queue retries after the
+                // short broker delay instead of the generic failed-pull backoff.
+                if let Some(delay) = broker_flow_control_delay(&e) {
+                    self.park_pull(&key, delay);
+                }
                 return false;
             }
         };
@@ -2840,11 +3252,57 @@ impl DefaultLitePullConsumer {
         true
     }
 
+    /// Feed a pulled batch into the buffer and wake any `poll()` waiter.
+    ///
+    /// The per-queue accumulators are updated in the same lock step as the deque
+    /// ([`LiteBuffer::extend`]), which is what lets the gates judge one queue without scanning.
     fn enqueue(&self, msgs: Vec<MessageExt>) {
         let mut buffer = lock(&self.inner.buffer);
         buffer.extend(msgs);
         drop(buffer);
         self.inner.buffer_signal.notify_waiters();
+    }
+
+    /// Park **this queue's** next pull round for `delay_millis`.
+    ///
+    /// The lite loop is one task round-robining every assigned queue, so a refusal never sleeps
+    /// inside the round: it writes a per-queue deadline the round skips, which keeps a parked
+    /// queue from delaying any sibling and keeps shutdown prompt (the loop still waits through
+    /// [`wait_or_stop`], so the stop signal wins).
+    fn park_pull(&self, key: &str, delay_millis: u64) {
+        let park = PullPark {
+            delay_millis,
+            until_millis: current_time_millis() + delay_millis as i64,
+        };
+        lock(&self.inner.state).pull_parks.insert(key.to_string(), park);
+    }
+
+    /// The delay last armed for this queue's next pull round by a cache gate or the broker's
+    /// 215 answer (`None` = nothing parks it). The observation point for "was this queue
+    /// refused, and for how long", so tests never have to measure wall clock.
+    pub fn pull_park_delay_of(&self, mq: &MessageQueue) -> Option<u64> {
+        lock(&self.inner.state)
+            .pull_parks
+            .get(&mq_key(mq))
+            .map(|park| park.delay_millis)
+    }
+
+    /// Cumulative trips of the whole-buffer aggregate gate, `pullThresholdForAll`
+    /// (for real-cluster verification that flow control works).
+    pub fn flow_control_all_triggered(&self) -> usize {
+        self.inner.flow_control_all_triggered.load(Ordering::SeqCst)
+    }
+
+    /// Cumulative trips of the per-queue count gate **and** the per-queue size gate, which share
+    /// this one counter (for real-cluster verification that flow control works).
+    pub fn flow_control_queue_triggered(&self) -> usize {
+        self.inner.flow_control_queue_triggered.load(Ordering::SeqCst)
+    }
+
+    /// Cumulative trips of the per-queue offset-span gate, `consumeMaxSpan`
+    /// (for real-cluster verification that flow control works).
+    pub fn flow_control_span_triggered(&self) -> usize {
+        self.inner.flow_control_span_triggered.load(Ordering::SeqCst)
     }
 }
 
@@ -2987,6 +3445,10 @@ async fn metadata_loop_after(
 /// A single loop round-robins all assigned queues.
 /// In subscribe mode it rebalances every >1s; when a round yields no messages it backs off
 /// `pull_interval_millis`; with messages it resumes pulling after just 5ms.
+///
+/// A queue refused by a cache gate (or throttled by the broker) is **not** slept on inside the
+/// round: it is dropped from the round's targets by its own per-queue deadline, so a parked queue
+/// never delays a sibling's round, and the round's own wait never outlives the earliest park.
 async fn pull_service_loop(inner: Arc<LiteInner>, mut rx: watch::Receiver<bool>) {
     while inner.running.load(Ordering::Acquire) {
         if *rx.borrow_and_update() {
@@ -3006,10 +3468,20 @@ async fn pull_service_loop(inner: Arc<LiteInner>, mut rx: watch::Receiver<bool>)
         }
         let targets: Vec<MessageQueue> = {
             let state = lock(&inner.state);
+            // A park is observed through its own deadline, never deleted eagerly: a parked queue is
+            // simply not a target until that deadline passes, while the recorded pause stays readable.
+            let now = current_time_millis();
             state
                 .assigned
                 .values()
-                .filter(|mq| !state.paused.contains(&mq_key(mq)))
+                .filter(|mq| {
+                    let key = mq_key(mq);
+                    let parked = state
+                        .pull_parks
+                        .get(&key)
+                        .is_some_and(|park| park.until_millis > now);
+                    !state.paused.contains(&key) && !parked
+                })
                 .cloned()
                 .collect()
         };
@@ -3027,10 +3499,29 @@ async fn pull_service_loop(inner: Arc<LiteInner>, mut rx: watch::Receiver<bool>)
         } else {
             read_cfg(&inner.cfg).pull_interval_millis.max(0) as u64
         };
-        if wait_or_stop(&mut rx, backoff).await {
+        // Whichever comes first, the idle interval or the earliest park: a queue parked for 50 ms
+        // must get its round back on that schedule even when `pull_interval_millis` is much larger.
+        let wait_millis = match earliest_park_remaining_millis(&inner) {
+            Some(remaining) => backoff.min(remaining),
+            None => backoff,
+        };
+        if wait_or_stop(&mut rx, wait_millis).await {
             return;
         }
     }
+}
+
+/// Remaining time of the earliest still-active parked queue (`None` = nothing is parked).
+/// Expired parks stay recorded but no longer shorten the round's wait.
+fn earliest_park_remaining_millis(inner: &LiteInner) -> Option<u64> {
+    let now = current_time_millis();
+    let state = lock(&inner.state);
+    state
+        .pull_parks
+        .values()
+        .filter_map(|park| u64::try_from(park.until_millis - now).ok())
+        .filter(|remaining| *remaining > 0)
+        .min()
 }
 
 /// Sort-key form of `mq_key`, used to keep `BTreeMap` key order consistent with queue order.
@@ -3046,7 +3537,7 @@ mod tests {
     use crate::common::message_decoder::encode_message_ext;
     use crate::common::sysflag::PermName;
     use crate::remoting::protocol::body::GetConsumerListByGroupResponseBody;
-    use crate::remoting::protocol::codes::{request_code, response_code};
+    use crate::remoting::protocol::codes::request_code;
     use crate::remoting::protocol::route::{BrokerData, QueueData, TopicRouteData};
     use crate::remoting::protocol::RemotingCommand;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -4011,6 +4502,22 @@ mod tests {
                 .collect()
         }
 
+        /// The `queueId`s of the received pull requests, in arrival order: which physical queue
+        /// each pull targeted. A queue refused by a cache gate never shows up here.
+        fn pull_queue_ids(&self) -> Vec<i32> {
+            lock(&self.requests)
+                .iter()
+                .filter(|(code, _)| {
+                    *code == request_code::PULL_MESSAGE || *code == request_code::LITE_PULL_MESSAGE
+                })
+                .filter_map(|(_, ext)| {
+                    ext.iter()
+                        .find(|(k, _)| k == "queueId")
+                        .and_then(|(_, v)| v.parse().ok())
+                })
+                .collect()
+        }
+
         /// The `sysFlag`s of the received pull requests, in arrival order.
         fn pull_sys_flags(&self) -> Vec<i32> {
             lock(&self.requests)
@@ -4807,6 +5314,23 @@ mod tests {
         c
     }
 
+    /// The assign-mode lite start of **several** queues (see [`started_lite`]): the same FIRST_OFFSET literal-0
+    /// start, but the round-robin now has siblings, which is what the per-queue cache gates need to be judged on.
+    async fn started_lite_on(
+        instance: &str,
+        group: &str,
+        cluster: &FakePullCluster,
+        mqs: &[MessageQueue],
+    ) -> DefaultLitePullConsumer {
+        let c = DefaultLitePullConsumer::new(group).expect("the group name is legal");
+        c.set_instance_name(instance);
+        c.set_namesrv_addr(&cluster.namesrv_addr);
+        c.set_consume_from_where(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
+        c.assign(mqs);
+        c.start().await.expect("start should succeed against the fake cluster");
+        c
+    }
+
     #[tokio::test]
     async fn lite_cursor_follows_next_begin_offset_on_no_matched_msg() {
         let cluster = FakePullCluster::start().await;
@@ -5479,5 +6003,526 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert_eq!(probe.fires(), 0, "a rejected pull_async never touches the callback");
         cold.shutdown();
+    }
+
+    // ============================================================ LitePull cache flow-control gates
+    //
+    // Same offline style as the push path's gate tests: the verdict is judged on a bare inner whose
+    // buffer was staged directly, so no wall clock is ever measured; the loop-level tests observe the
+    // armed per-queue deadline (`pull_park_delay_of`) and the recorded pulls instead of any sleep.
+
+    /// A cached message of one queue carrying `store_size` stored bytes at `offset`. The body is a
+    /// single byte on purpose: the size gate reads `storeSize`, so a body-length implementation would
+    /// be caught measuring something else.
+    fn cached_msg(topic: &str, broker: &str, id: i32, offset: i64, store_size: i32) -> MessageExt {
+        let mut m = msg(topic, broker, id, offset, "x");
+        m.store_size = store_size;
+        m
+    }
+
+    /// Feed messages into the local buffer exactly the way a successful pull does: append under the
+    /// buffer's own lock, so the per-queue accumulators move together with the deque.
+    fn stage(inner: &LiteInner, msgs: Vec<MessageExt>) {
+        lock(&inner.buffer).extend(msgs);
+    }
+
+    /// This queue's live cache view (count, bytes, offsets of the messages actually in the buffer).
+    fn cache_of(inner: &LiteInner, mq: &MessageQueue) -> LiteQueueCache {
+        lock(&inner.buffer).queue_cache(&mq_key(mq))
+    }
+
+    /// Open every gate, then tighten only the one under test -- otherwise an earlier gate in the
+    /// fixed order masks the branch being pinned. The "open" value is the maximum, never `0`: a lite
+    /// threshold of 0 is a legal budget meaning "trip on the first cached message", not "off".
+    fn only_gate(inner: &LiteInner, f: impl FnOnce(&mut LitePullConsumerConfig)) {
+        let mut cfg = inner.cfg.write().unwrap_or_else(|e| e.into_inner());
+        cfg.pull_threshold_for_all = i32::MAX;
+        cfg.pull_threshold_for_queue = i32::MAX;
+        cfg.pull_threshold_size_for_queue = i32::MAX;
+        cfg.consume_max_span = i64::MAX;
+        f(&mut cfg);
+    }
+
+    /// A started consumer's inner is unreachable offline before start, so the gate tests build the
+    /// bare inner directly: no client, no background loop, just the buffer + knobs + counters.
+    fn bare_inner() -> LiteInner {
+        LiteInner::default()
+    }
+
+    /// Contract defaults, verbatim, and a knob that is never validated or clamped.
+    #[test]
+    fn lite_cache_gate_knobs_are_plain_budgets() {
+        let inner = bare_inner();
+        let cfg = read_cfg(&inner.cfg);
+        assert_eq!(cfg.pull_threshold_for_all, 10_000);
+        assert_eq!(cfg.pull_threshold_for_queue, 1_000);
+        assert_eq!(cfg.pull_threshold_size_for_queue, 100);
+        assert_eq!(cfg.consume_max_span, 2_000);
+
+        // A setter stores the value as given -- no min/max, no rounding.
+        let c = DefaultLitePullConsumer::new("LitePG_Knobs").unwrap();
+        c.set_pull_threshold_for_all(0);
+        c.set_pull_threshold_for_queue(-5);
+        c.set_pull_threshold_size_for_queue(1);
+        c.set_consume_max_span(i64::MAX);
+        assert_eq!(c.pull_threshold_for_all(), 0);
+        assert_eq!(c.pull_threshold_for_queue(), -5);
+        assert_eq!(c.pull_threshold_size_for_queue(), 1);
+        assert_eq!(c.consume_max_span(), i64::MAX);
+
+        // The literal-0 semantics: an empty cache never trips (0 is not > 0), but the very first
+        // cached message does. This is a budget, not a switch.
+        let mq = queue("T", "broker-a", 0);
+        only_gate(&c.inner, |k| k.pull_threshold_for_queue = 0);
+        assert!(
+            lite_cache_flow_control_hit(&c.inner, &mq_key(&mq)).is_none(),
+            "an empty cache is not above a 0 budget"
+        );
+        stage(&c.inner, vec![cached_msg("T", "broker-a", 0, 0, 10)]);
+        assert_eq!(
+            lite_cache_flow_control_hit(&c.inner, &mq_key(&mq)),
+            Some(LiteCacheGate::Count),
+            "the first cached message trips a 0 budget"
+        );
+    }
+
+    /// The count gate is **strictly** greater: a queue sitting exactly on `pullThresholdForQueue`
+    /// still pulls; the message over it refuses and the aggregate/sibling never move that boundary.
+    #[test]
+    fn lite_count_gate_is_strictly_greater_and_parks_its_own_queue() {
+        let inner = bare_inner();
+        let mq = queue("T", "broker-a", 0);
+        let key = mq_key(&mq);
+        only_gate(&inner, |c| c.pull_threshold_for_queue = 3);
+
+        stage(&inner, (0..3).map(|o| cached_msg("T", "broker-a", 0, o, 10)).collect());
+        assert_eq!(cache_of(&inner, &mq).count, 3);
+        assert!(
+            lite_cache_flow_control_hit(&inner, &key).is_none(),
+            "exactly the threshold 3 must still pull (control)"
+        );
+        assert_eq!(inner.flow_control_queue_triggered.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        stage(&inner, vec![cached_msg("T", "broker-a", 0, 3, 10)]);
+        assert_eq!(
+            lite_cache_flow_control_hit(&inner, &key),
+            Some(LiteCacheGate::Count),
+            "count 4 > threshold 3 refuses this queue"
+        );
+        assert_eq!(inner.flow_control_queue_triggered.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Gates 2..4 judge **this queue only**: a hot queue's backlog must not refuse a cold sibling,
+    /// and the cold sibling's budget is unaffected by how big the hot queue is.
+    #[test]
+    fn lite_gates_judge_this_queue_and_never_sum_the_siblings() {
+        let inner = bare_inner();
+        let hot = queue("T", "broker-a", 0);
+        let cold = queue("T", "broker-a", 1);
+        only_gate(&inner, |c| c.pull_threshold_for_queue = 2);
+
+        // Every cached message belongs to the hot queue; the cold one holds nothing.
+        stage(&inner, (0..3).map(|o| cached_msg("T", "broker-a", 0, o, 10)).collect());
+        assert_eq!(
+            lite_cache_flow_control_hit(&inner, &mq_key(&hot)),
+            Some(LiteCacheGate::Count),
+            "the hot queue is over its own count budget"
+        );
+        assert!(
+            lite_cache_flow_control_hit(&inner, &mq_key(&cold)).is_none(),
+            "a sibling that sums its neighbour would refuse here; the per-queue accumulator must not"
+        );
+
+        // Symmetrically for the size gate: the hot queue is huge in stored bytes, the sibling is small.
+        only_gate(&inner, |c| c.pull_threshold_size_for_queue = 1);
+        let big = 3 * 1024 * 1024i32;
+        stage(&inner, vec![cached_msg("T", "broker-a", 0, 3, big)]);
+        assert_eq!(
+            lite_cache_flow_control_hit(&inner, &mq_key(&hot)),
+            Some(LiteCacheGate::Size),
+            "the hot queue is now over the size budget too"
+        );
+        assert!(
+            lite_cache_flow_control_hit(&inner, &mq_key(&cold)).is_none(),
+            "the cold sibling feels none of the hot queue's bytes"
+        );
+    }
+
+    /// The size gate reads the **stored** message size, never the body length: a small body inside
+    /// a large store record refuses, and the mirror case (large body, tiny store record) pulls.
+    #[test]
+    fn lite_size_gate_measures_stored_size_not_body_length() {
+        let inner = bare_inner();
+        let mq = queue("T", "broker-a", 0);
+        let key = mq_key(&mq);
+        only_gate(&inner, |c| c.pull_threshold_size_for_queue = 1);
+
+        // One message whose body is a single byte but whose store record is 2 MiB: a body-length
+        // implementation would read ~1 byte and pull; the store-size gate refuses.
+        let mut fat_store = cached_msg("T", "broker-a", 0, 0, 2 * 1024 * 1024);
+        fat_store.body = Some(b"a".to_vec());
+        stage(&inner, vec![fat_store]);
+        assert_eq!(
+            lite_cache_flow_control_hit(&inner, &key),
+            Some(LiteCacheGate::Size),
+            "2 MiB of stored size over a 1 MiB budget"
+        );
+
+        // Mirror: drain the fat record, then a 3 MiB *body* inside a 10-byte store record.
+        lock(&inner.buffer).drain_prefix(1);
+        let mut thin_store = cached_msg("T", "broker-a", 0, 1, 10);
+        thin_store.body = Some(vec![b'x'; 3 * 1024 * 1024]);
+        stage(&inner, vec![thin_store]);
+        assert_eq!(cache_of(&inner, &mq).bytes, 10, "the gate sums storeSize, not body length");
+        assert!(
+            lite_cache_flow_control_hit(&inner, &key).is_none(),
+            "a huge body in a tiny store record must not refuse (control)"
+        );
+    }
+
+    /// The size gate divides stored bytes by 1 MiB using **integer division**: bytes below the
+    /// threshold-pull, exactly at `threshold` MiB pulls, and only strictly above refuses.
+    #[test]
+    fn lite_size_gate_divides_bytes_by_whole_mib() {
+        let inner = bare_inner();
+        let mq = queue("T", "broker-a", 0);
+        let key = mq_key(&mq);
+        only_gate(&inner, |c| c.pull_threshold_size_for_queue = 2);
+        let mib = 1024 * 1024i32;
+
+        // 2 MiB exactly: integer division reads 2, which is not strictly greater than 2 → pulls.
+        stage(&inner, vec![cached_msg("T", "broker-a", 0, 0, 2 * mib)]);
+        assert_eq!(cache_of(&inner, &mq).size_mib(), 2);
+        assert!(
+            lite_cache_flow_control_hit(&inner, &key).is_none(),
+            "exactly 2 MiB over a 2 MiB budget pulls (control)"
+        );
+
+        // 2 MiB + a partial MiB still reads as 2 MiB after integer division → still pulls.
+        lock(&inner.buffer).drain_prefix(1);
+        stage(&inner, vec![cached_msg("T", "broker-a", 0, 0, 2 * mib + mib / 2)]);
+        assert_eq!(cache_of(&inner, &mq).size_mib(), 2, "1.5 MiB floors to 2 MiB, not 3");
+        assert!(lite_cache_flow_control_hit(&inner, &key).is_none());
+
+        // One whole MiB more (3 MiB > 2) is the first refusal.
+        lock(&inner.buffer).drain_prefix(1);
+        stage(&inner, vec![cached_msg("T", "broker-a", 0, 0, 3 * mib)]);
+        assert_eq!(cache_of(&inner, &mq).size_mib(), 3);
+        assert_eq!(
+            lite_cache_flow_control_hit(&inner, &key),
+            Some(LiteCacheGate::Size),
+            "3 MiB > budget 2 MiB refuses"
+        );
+    }
+
+    /// The span gate is `highest - lowest` over **this queue's** cached offsets only: exactly
+    /// `consumeMaxSpan` pulls, one more refuses, and a sibling's offsets never widen this one's span.
+    #[test]
+    fn lite_span_gate_uses_this_queues_cached_offsets_only() {
+        let inner = bare_inner();
+        let q0 = queue("T", "broker-a", 0);
+        let q1 = queue("T", "broker-a", 1);
+        only_gate(&inner, |c| c.consume_max_span = 100);
+
+        // q0 spans exactly 100 (offsets 0 and 100); q1 holds a far-away offset the gate must ignore.
+        stage(&inner, vec![
+            cached_msg("T", "broker-a", 0, 0, 10),
+            cached_msg("T", "broker-a", 0, 100, 10),
+            cached_msg("T", "broker-a", 1, 5_000, 10),
+        ]);
+        assert_eq!(cache_of(&inner, &q0).span(), 100);
+        assert!(
+            lite_cache_flow_control_hit(&inner, &mq_key(&q0)).is_none(),
+            "a span of exactly the budget 100 still pulls (control)"
+        );
+
+        // One more cached message at offset 200 makes q0's span 200 > 100 → refuse; q1's lone offset
+        // stays span 0 no matter how distant it is from q0.
+        stage(&inner, vec![cached_msg("T", "broker-a", 0, 200, 10)]);
+        assert_eq!(cache_of(&inner, &q0).span(), 200);
+        assert_eq!(
+            lite_cache_flow_control_hit(&inner, &mq_key(&q0)),
+            Some(LiteCacheGate::Span),
+            "span 200 > consume_max_span 100 refuses"
+        );
+        assert_eq!(cache_of(&inner, &q1).span(), 0);
+        assert!(
+            lite_cache_flow_control_hit(&inner, &mq_key(&q1)).is_none(),
+            "a single cached offset (and a distant sibling) never widens this queue's own span"
+        );
+    }
+
+    /// The aggregate gate is its **own** budget: total cached across every queue above
+    /// `pullThresholdForAll` refuses even when no single queue's count budget is touched.
+    #[test]
+    fn lite_aggregate_gate_is_its_own_budget() {
+        let inner = bare_inner();
+        let q0 = queue("T", "broker-a", 0);
+        let q1 = queue("T", "broker-a", 1);
+        let q2 = queue("T", "broker-a", 2);
+
+        // Each queue sits under its own count budget; only the whole-buffer total is over budget.
+        only_gate(&inner, |c| {
+            c.pull_threshold_for_all = 5;
+            c.pull_threshold_for_queue = 4;
+        });
+        stage(&inner, vec![
+            cached_msg("T", "broker-a", 0, 0, 10),
+            cached_msg("T", "broker-a", 0, 1, 10),
+            cached_msg("T", "broker-a", 1, 0, 10),
+            cached_msg("T", "broker-a", 1, 1, 10),
+            cached_msg("T", "broker-a", 2, 0, 10),
+            cached_msg("T", "broker-a", 2, 1, 10),
+        ]);
+        assert_eq!(lock(&inner.buffer).len(), 6, "total cached 6 > pull_threshold_for_all 5");
+        // The split matters: 2 cached per queue is well under each queue's own count budget (4), yet
+        // the aggregate total refuses **every** queue -- proof the aggregate is a separate budget.
+        for mq in [&q0, &q1, &q2] {
+            assert_eq!(cache_of(&inner, mq).count, 2, "no single queue trips its own count gate");
+            assert_eq!(
+                lite_cache_flow_control_hit(&inner, &mq_key(mq)),
+                Some(LiteCacheGate::All),
+                "{mq:?} is refused by the aggregate even though its own count (2) is under 4"
+            );
+        }
+
+        // Control: the same per-queue count with the aggregate one notch higher pulls everywhere.
+        let inner2 = bare_inner();
+        only_gate(&inner2, |c| {
+            c.pull_threshold_for_all = 6;
+            c.pull_threshold_for_queue = 4;
+        });
+        stage(&inner2, vec![
+            cached_msg("T", "broker-a", 0, 0, 10),
+            cached_msg("T", "broker-a", 0, 1, 10),
+            cached_msg("T", "broker-a", 1, 0, 10),
+        ]);
+        assert!(
+            lite_cache_flow_control_hit(&inner2, &mq_key(&q0)).is_none(),
+            "total 3 is not strictly greater than the budget 6, and no queue is over its own count (control)"
+        );
+    }
+
+    /// Counters split by gate: aggregate → its own counter, count and size → one shared counter,
+    /// span → its own; and the warn fires on trips 1 and 1001 while trip 1000 stays debug-only, the
+    /// cadence the push and POP paths already use.
+    #[test]
+    fn lite_gate_counters_and_warn_cadence() {
+        let mq = queue("T", "broker-a", 0);
+        let key = mq_key(&mq);
+
+        // The aggregate gate feeds only the aggregate counter.
+        let inner = bare_inner();
+        only_gate(&inner, |c| c.pull_threshold_for_all = 0);
+        stage(&inner, vec![cached_msg("T", "broker-a", 0, 0, 10)]);
+        assert_eq!(lite_cache_flow_control_hit(&inner, &key), Some(LiteCacheGate::All));
+        assert_eq!(inner.flow_control_all_triggered.load(Ordering::SeqCst), 1);
+        assert_eq!(inner.flow_control_queue_triggered.load(Ordering::SeqCst), 0);
+        assert_eq!(inner.flow_control_span_triggered.load(Ordering::SeqCst), 0);
+
+        // The span gate feeds only the span counter.
+        let inner = bare_inner();
+        only_gate(&inner, |c| c.consume_max_span = 0);
+        stage(&inner, vec![
+            cached_msg("T", "broker-a", 0, 0, 10),
+            cached_msg("T", "broker-a", 0, 5, 10),
+        ]);
+        assert_eq!(lite_cache_flow_control_hit(&inner, &key), Some(LiteCacheGate::Span));
+        assert_eq!(inner.flow_control_span_triggered.load(Ordering::SeqCst), 1);
+        assert_eq!(inner.flow_control_queue_triggered.load(Ordering::SeqCst), 0);
+
+        // Count and size **share** the queue counter: one count trip then one size trip reads 2.
+        let inner = bare_inner();
+        only_gate(&inner, |c| {
+            c.pull_threshold_for_queue = 0;
+            c.pull_threshold_size_for_queue = 0;
+        });
+        stage(&inner, vec![cached_msg("T", "broker-a", 0, 0, 2 * 1024 * 1024)]);
+        // The count gate is judged before the size gate, so the first refusal is a count trip...
+        assert_eq!(lite_cache_flow_control_hit(&inner, &key), Some(LiteCacheGate::Count));
+        assert_eq!(inner.flow_control_queue_triggered.load(Ordering::SeqCst), 1);
+        // ...and once count is opened away, the very same backlog trips the size gate on the
+        // **same** counter (it becomes 2, not a fresh 1).
+        only_gate(&inner, |c| {
+            c.pull_threshold_for_queue = i32::MAX;
+            c.pull_threshold_size_for_queue = 0;
+        });
+        assert_eq!(lite_cache_flow_control_hit(&inner, &key), Some(LiteCacheGate::Size));
+        assert_eq!(inner.flow_control_queue_triggered.load(Ordering::SeqCst), 2);
+
+        // The warn cadence predicate, driven the same way the push tests drive it.
+        assert!(is_flow_control_warn_trip(1));
+        assert!(is_flow_control_warn_trip(1001));
+        assert!(is_flow_control_warn_trip(2001));
+        for silent in [0usize, 2, 999, 1000, 1002, 2000] {
+            assert!(!is_flow_control_warn_trip(silent), "trip {silent} must stay debug-only");
+        }
+        // A throttled queue trips every round, so drive the counter across the boundary itself: the
+        // first trip warns (1), trips 2..=1000 stay debug-only, and the 1001th warns again.
+        let inner = bare_inner();
+        only_gate(&inner, |c| c.pull_threshold_for_queue = 0);
+        stage(&inner, vec![cached_msg("T", "broker-a", 0, 0, 10)]);
+        let first = lite_cache_flow_control_hit(&inner, &key);
+        assert_eq!(first, Some(LiteCacheGate::Count));
+        assert!(is_flow_control_warn_trip(inner.flow_control_queue_triggered.load(Ordering::SeqCst)));
+        for round in 2..=1000 {
+            assert_eq!(
+                lite_cache_flow_control_hit(&inner, &key),
+                Some(LiteCacheGate::Count),
+                "round {round} must refuse"
+            );
+        }
+        assert_eq!(inner.flow_control_queue_triggered.load(Ordering::SeqCst), 1000);
+        assert!(
+            !is_flow_control_warn_trip(1000),
+            "the 1000th trip leaves the cadence silent"
+        );
+        assert_eq!(lite_cache_flow_control_hit(&inner, &key), Some(LiteCacheGate::Count));
+        assert_eq!(inner.flow_control_queue_triggered.load(Ordering::SeqCst), 1001);
+        assert!(is_flow_control_warn_trip(1001), "the 1001th trip is the next warn");
+    }
+
+    /// The accumulators cannot drift from the deque: append, drain (poll), seek-prune and unassign all
+    /// move count/bytes/min/max together, and a revoked queue's accumulator is gone while its leftover
+    /// messages stay deliverable and still count in the aggregate.
+    #[test]
+    fn lite_cache_accumulators_move_with_the_buffer() {
+        let inner = bare_inner();
+        let mq = queue("T", "broker-a", 0);
+        let key = mq_key(&mq);
+
+        // append
+        stage(&inner, (0..4).map(|o| cached_msg("T", "broker-a", 0, o, 100)).collect());
+        let c = cache_of(&inner, &mq);
+        assert_eq!((c.count, c.bytes, c.min_offset(), c.max_offset()), (4, 400, 0, 3));
+
+        // drain (what poll hands out) removes from the front and the counters follow
+        let drained = lock(&inner.buffer).drain_prefix(2);
+        assert_eq!(drained.len(), 2);
+        let c = cache_of(&inner, &mq);
+        assert_eq!((c.count, c.bytes, c.min_offset(), c.max_offset()), (2, 200, 2, 3));
+
+        // seek-prune drops this queue's messages below the new offset
+        lock(&inner.buffer).prune_before(&mq, 3);
+        let c = cache_of(&inner, &mq);
+        assert_eq!((c.count, c.bytes, c.min_offset(), c.max_offset()), (1, 100, 3, 3));
+
+        // unassign / revoke: the accumulator is dropped with the queue, but the leftover message
+        // stays in the deque (deliverable) and still counts in the aggregate.
+        lock(&inner.buffer).resync_queues(&BTreeSet::new());
+        assert_eq!(cache_of(&inner, &mq).count, 0, "a revoked queue owns no accumulator");
+        assert_eq!(lock(&inner.buffer).len(), 1, "its leftover message is still in the buffer");
+        // a stale accumulator must never refuse: an empty view cannot be over any positive budget
+        only_gate(&inner, |cfg| cfg.pull_threshold_for_queue = 0);
+        assert!(
+            lite_cache_flow_control_hit(&inner, &key).is_none(),
+            "a queue no one owns reads as empty and cannot refuse a pull"
+        );
+
+        // re-assign: the accumulator is rebuilt exactly from what the buffer holds for this queue
+        let owned: BTreeSet<String> = [key.clone()].into_iter().collect();
+        lock(&inner.buffer).resync_queues(&owned);
+        let c = cache_of(&inner, &mq);
+        assert_eq!((c.count, c.min_offset(), c.max_offset()), (1, 3, 3), "rebuilt from the deque");
+    }
+
+    /// End-to-end, on the real loop: a refused queue sends **no** request while its cold sibling keeps
+    /// pulling in the same round-robin, the refusal parks only the hot queue, and nothing else moves.
+    #[tokio::test]
+    async fn lite_cache_gate_refuses_without_sending_and_recovers_after_poll() {
+        let cluster = FakePullCluster::start_queues(2).await;
+        let hot = queue("T", "broker-a", 0);
+        let cold = queue("T", "broker-a", 1);
+        let c = started_lite_on("lite_gate_e2e", "LitePG_GateE2E", &cluster, &[hot.clone(), cold.clone()]).await;
+        c.set_pull_threshold_for_queue(0);
+
+        // Put a cached message only on the hot queue so its count gate is the only one that can trip.
+        stage(&c.inner, vec![cached_msg("T", "broker-a", 0, 0, 10)]);
+
+        // The hot queue parks (the recorded 50 ms pause); its cold sibling is never parked.
+        wait_until(|| c.pull_park_delay_of(&hot) == Some(50), "the hot queue parks on the count gate")
+            .await;
+        assert_eq!(c.pull_park_delay_of(&cold), None, "a cold sibling is never parked");
+
+        // While the hot queue stays over budget it sends **no** request: across a window of several
+        // refused rounds its pull count is frozen, even though the parked queue never blocks the loop.
+        let pulls_of = |id: i32| cluster.master.pull_queue_ids().iter().filter(|q| **q == id).count();
+        let hot_before = pulls_of(0);
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(pulls_of(0), hot_before, "a refused round never reaches the broker");
+        assert_eq!(c.pull_park_delay_of(&hot), Some(50), "the hot queue is still parked");
+
+        // The cold sibling keeps pulling every round in the same loop -- proof the parked queue's
+        // deadline never delays it (a single shared sleep would have stalled both).
+        wait_until(|| pulls_of(1) >= 2, "the cold sibling keeps its own rounds while a neighbour is parked")
+            .await;
+
+        // Recovery leg: drain the hot backlog through poll(); the gate opens and the queue pulls again.
+        let drained = c.poll(Some(50)).await;
+        assert!(!drained.is_empty(), "the application drains the refused queue's backlog");
+        wait_until(|| pulls_of(0) > hot_before, "the drained hot queue resumes pulling").await;
+        assert_eq!(c.buffered_message_count(), 0, "nothing of the refused batch is left buffered");
+        c.shutdown();
+    }
+
+    /// The lite path treats `FLOW_CONTROL(215)` as a short re-schedule, not an error: the queue parks
+    /// 20 ms, while a different broker failure keeps the existing failed-pull handling (no per-queue
+    /// park). Both legs in one test so the two paths cannot be conflated.
+    #[tokio::test]
+    async fn lite_broker_flow_control_parks_20ms_while_other_failures_keep_the_old_backoff() {
+        // Leg 1: 215 → the short broker delay on this queue.
+        let cluster = FakePullCluster::start().await;
+        let q = queue("T", "broker-a", 0);
+        cluster.master.script_pull(
+            response_code::FLOW_CONTROL,
+            &[("nextBeginOffset", "0"), ("minOffset", "0"), ("maxOffset", "9")],
+            None,
+            None,
+        );
+        let c = started_lite("lite_broker_fc", "LitePG_BrokerFC", &cluster, &q).await;
+        wait_until(|| c.pull_park_delay_of(&q) == Some(20), "a 215 answer parks this queue for 20 ms")
+            .await;
+        c.shutdown();
+
+        // Leg 2 (paired control): another broker failure is not a throttle -- no per-queue park armed.
+        let cluster2 = FakePullCluster::start().await;
+        let q2 = queue("T", "broker-a", 0);
+        cluster2.master.script_pull(
+            response_code::SYSTEM_BUSY,
+            &[("remark", "busy")],
+            None,
+            None,
+        );
+        let c2 = started_lite("lite_broker_busy", "LitePG_BrokerBusy", &cluster2, &q2).await;
+        wait_until(
+            || !cluster2.master.pull_queue_ids().is_empty(),
+            "the failed pull was attempted against the broker",
+        )
+        .await;
+        assert_eq!(
+            c2.pull_park_delay_of(&q2),
+            None,
+            "SYSTEM_BUSY keeps the port's existing failed-pull handling: no per-queue park"
+        );
+        c2.shutdown();
+    }
+
+    /// A queue parked on a gate must still stop promptly: shutdown flips the stop signal and the loop
+    /// escapes its park wait through `wait_or_stop` rather than idling out the deadline.
+    #[tokio::test]
+    async fn lite_cache_park_still_escapes_on_shutdown() {
+        let cluster = FakePullCluster::start().await;
+        let q = queue("T", "broker-a", 0);
+        let c = started_lite("lite_park_stop", "LitePG_ParkStop", &cluster, &q).await;
+        // Arm a long park on the queue's own deadline so a naive (sleep-to-completion) loop would linger.
+        c.park_pull(&mq_key(&q), 60_000);
+        assert_eq!(c.pull_park_delay_of(&q), Some(60_000), "a long park is armed on this queue");
+
+        let started = std::time::Instant::now();
+        c.shutdown();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "shutdown must escape the parked round promptly, not wait out the 60 s deadline"
+        );
     }
 }

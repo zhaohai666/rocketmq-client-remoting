@@ -879,6 +879,10 @@ async fn broker_offset(probe: &DefaultMQPullConsumer, mq: &MessageQueue) -> i64 
 
 /// Hand-builds a lite consumer in assign mode: commit timing is fully scenario-controlled (`auto_commit=false`),
 /// 32 messages pulled per queue at a time, starting from FIRST.
+///
+/// Every cache gate is lifted above the scenario's backlog on purpose: L11 buffers 1200 messages in one
+/// queue, and the default per-queue count threshold (1000) would stop the background pull at 1024 -- that
+/// is the gate working (L12 measures it), not a defect. L11 is about the three offset tables.
 async fn lite_off_consumer(
     ck: &mut Checker,
     fx: &Fixture,
@@ -892,6 +896,10 @@ async fn lite_off_consumer(
         instance_name: format!("{instance}-{}", fx.stamp),
         poll_timeout_millis: 1000,
         pull_batch_size: 32,
+        pull_threshold_for_all: 1200 * 32,
+        pull_threshold_for_queue: 1300,
+        pull_threshold_size_for_queue: 1024,
+        consume_max_span: 2200,
         auto_commit: false,
         consume_from_where: ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET.to_string(),
         ..Default::default()
@@ -1221,6 +1229,188 @@ async fn l11_three_offset_tables(ck: &mut Checker, fx: &Fixture, mqs: &[MessageQ
     probe.shutdown();
 }
 
+// ------------------------------------------------------------------ L12 cache gate
+
+/// A lite consumer assigned to one queue with the count threshold the caller chooses; every other gate is
+/// left wide open so only the gate under test can act.
+async fn gate_consumer(
+    ck: &mut Checker,
+    fx: &Fixture,
+    instance: &str,
+    group: &str,
+    count_threshold: i32,
+    q0: &MessageQueue,
+) -> Option<DefaultLitePullConsumer> {
+    let cfg = LitePullConsumerConfig {
+        consumer_group: group.to_string(),
+        name_server_addrs: vec![fx.namesrv.clone()],
+        instance_name: format!("{instance}-{}", fx.stamp),
+        poll_timeout_millis: 1000,
+        pull_batch_size: 32,
+        pull_threshold_for_all: 200 * 32,
+        pull_threshold_for_queue: count_threshold,
+        auto_commit: false,
+        consume_from_where: ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET.to_string(),
+        ..Default::default()
+    };
+    let o = match DefaultLitePullConsumer::with_config(cfg) {
+        Ok(o) => o,
+        Err(e) => {
+            ck.abort(&format!("L12 build {instance}"), &e.to_string());
+            return None;
+        }
+    };
+    o.assign(std::slice::from_ref(q0));
+    if let Err(e) = o.start().await {
+        ck.abort(&format!("L12 start {instance}"), &e.to_string());
+        return None;
+    }
+    Some(o)
+}
+
+/// The per-queue cached-count gate on a real broker: the background pull parks itself once this queue
+/// holds more than `pull_threshold_for_queue` messages, and releases as soon as `poll()` drains it.
+///
+/// The gate is measured, not asserted from a unit fixture: one 1-queue topic gets 200 messages, the
+/// threshold is 64 and a pull round takes 32, so the cursor must stop above the threshold and strictly
+/// below the tail. A second consumer on the **same queue** with the threshold lifted above the backlog
+/// is the paired control -- if the pull stopped for any other reason (route, switch, broker refusal) it
+/// would stop for the control too.
+async fn l12_cache_gate(ck: &mut Checker, fx: &Fixture) {
+    const N_GATE: i64 = 200;
+    const BATCH: i32 = 32;
+    const THRESHOLD: i32 = 64;
+
+    let topic = fx.topic_name("Gate");
+    if let Err(e) = fx.create_topic(&topic, 1).await {
+        ck.abort("L12 create topic (1 queue)", &e);
+        return;
+    }
+    let mut qs: Vec<MessageQueue> = Vec::new();
+    let route_deadline = Instant::now() + Duration::from_secs(20);
+    while qs.is_empty() && Instant::now() < route_deadline {
+        qs = route_queues(fx, &topic).await;
+        if qs.is_empty() {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+    ck.check(
+        "L12 prepared topic (1 queue)",
+        qs.len() == 1,
+        &format!("queues={}", qs.len()),
+    );
+    let Some(q0) = qs.first().cloned() else {
+        return;
+    };
+
+    let mut landed = 0i64;
+    let mut from = 0i64;
+    while from < N_GATE {
+        let to = (from + 50).min(N_GATE);
+        let mut chunk = Vec::new();
+        for i in from..to {
+            chunk.push(Message::new(&topic, Some(format!("gate-{i:04}").as_bytes())));
+        }
+        match fx.producer.send_batch(chunk, Some(&q0), Some(5_000)).await {
+            Ok(r) if r.status == SendStatus::SendOk => landed += to - from,
+            Ok(r) => println!("  [WARN] L12 send_batch status={:?}", r.status),
+            Err(e) => println!("  [WARN] L12 send_batch failed: {e}"),
+        }
+        from = to;
+    }
+    ck.check(
+        &format!("L12 produced all {N_GATE} successfully"),
+        landed == N_GATE,
+        &format!("landed={landed}"),
+    );
+
+    // Only the count gate is under test; the aggregate gate needs threshold*batch to stay clear of a
+    // 200-message backlog, and the size (100 MiB) and span (2000) gates cannot trip on 200 tiny messages.
+    let Some(gated) = gate_consumer(ck, fx, "litegate", &fx.group_name("gate"), THRESHOLD, &q0).await
+    else {
+        return;
+    };
+    // The gate has to be reached first: a cursor stuck *below* the threshold would prove nothing about it.
+    let reached = Instant::now() + Duration::from_secs(20);
+    while gated.pull_cursor_of(&q0) <= i64::from(THRESHOLD) && Instant::now() < reached {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let parked = gated.pull_cursor_of(&q0);
+    ck.check(
+        &format!("L12a the gate let the queue cache past its threshold ({THRESHOLD})"),
+        parked > i64::from(THRESHOLD),
+        &format!("pullCursor={parked}"),
+    );
+    ck.check(
+        "L12a the count gate recorded at least one trip",
+        gated.flow_control_queue_triggered() > 0,
+        &format!("trips={}", gated.flow_control_queue_triggered()),
+    );
+    // Nothing is consumed, so the buffer never drains: the refusal must hold, and one round of 32 at
+    // most can still be in flight when the gate trips.
+    let held = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < held {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let still = gated.pull_cursor_of(&q0);
+    ck.check(
+        &format!("L12a while the buffer is over budget the cursor holds its ground (never reaches {N_GATE})"),
+        still == parked && still < N_GATE,
+        &format!("pullCursor={still}"),
+    );
+    ck.check(
+        "L12a the refusal costs at most one more pull round",
+        still - i64::from(THRESHOLD) <= 2 * i64::from(BATCH),
+        &format!("pullCursor={still} threshold={THRESHOLD}"),
+    );
+
+    // Paired control: same topic, same queue, only the threshold is high enough to clear the backlog.
+    let Some(control) = gate_consumer(
+        ck,
+        fx,
+        "litegatectl",
+        &fx.group_name("gatectl"),
+        (N_GATE + 100) as i32,
+        &q0,
+    )
+    .await else {
+        gated.shutdown();
+        return;
+    };
+    let run = Instant::now() + Duration::from_secs(25);
+    while control.pull_cursor_of(&q0) < N_GATE && Instant::now() < run {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    ck.check(
+        &format!("L12-control the same queue pulls all {N_GATE} once the threshold clears"),
+        control.pull_cursor_of(&q0) == N_GATE,
+        &format!("pullCursor={}", control.pull_cursor_of(&q0)),
+    );
+
+    // Draining releases the gate: the rest arrives without restarting anything.
+    let mut got: Vec<MessageExt> = Vec::new();
+    let drain_deadline = Instant::now() + Duration::from_secs(60);
+    while (got.len() as i64) < N_GATE && Instant::now() < drain_deadline {
+        got.extend(gated.poll(Some(1000)).await);
+    }
+    let distinct: BTreeSet<String> = got
+        .iter()
+        .map(|m| String::from_utf8_lossy(m.get_body()).to_string())
+        .collect();
+    ck.check(
+        &format!("L12b after the buffer drains the rest arrives ({N_GATE})"),
+        got.len() as i64 == N_GATE && distinct.len() as i64 == N_GATE,
+        &format!("got={} distinct={}", got.len(), distinct.len()),
+    );
+    ck.check(
+        "L12b the cursor runs to the tail once the queue is consumed",
+        gated.pull_cursor_of(&q0) == N_GATE,
+        &format!("pullCursor={}", gated.pull_cursor_of(&q0)),
+    );
+    gated.shutdown();
+    control.shutdown();
+}
+
 // ------------------------------------------------------------------ L10 cleanup
 async fn l10_cleanup(ck: &mut Checker, fx: &Fixture) {
     let topics: Vec<String> = lock(&fx.topics).clone();
@@ -1280,6 +1470,7 @@ async fn run(namesrv: &str) -> Checker {
     l7_pause_resume(&mut ck, &fx).await;
     l8_heartbeat_and_state(&mut ck, &fx, &topic, &mqs).await;
     l11_three_offset_tables(&mut ck, &fx, &mqs).await;
+    l12_cache_gate(&mut ck, &fx).await;
     l10_cleanup(&mut ck, &fx).await;
     ck
 }

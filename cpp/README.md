@@ -51,10 +51,10 @@ cd build && ctest --output-on-failure
 
 ```
 100% tests passed out of 68
-Total Test time (real) = 117.72 sec
+Total Test time (real) = 100.25 sec
 ```
 
-68 个用例 = 67 个测试二进制（6969 项断言）+ 1 个编解码互调用例（73 项断言），共 **7042 项断言**。
+68 个用例 = 67 个测试二进制（8025 项断言）+ 1 个编解码互调用例（73 项断言），共 **8098 项断言**。
 
 不依赖集群的协议层自检：
 
@@ -291,7 +291,7 @@ pull.startHeartbeatLoop();   // 需要 broker 侧可见本组注册时打开
 
 `fetchMessageQueuesInBalance(topic)` 只返回本实例按分配策略应得的那份队列。
 
-异步拉取（Java `DefaultMQPullConsumer.pull(..., PullCallback, timeout)` 的对应物）：
+异步拉取（`DefaultMQPullConsumer::pull(..., PullCallback, timeout)`）：
 立即返回，工作线程执行同一套同步拉取内核，回调线程上 `onSuccess` / `onException`
 **恰好一次**触发；`shutdown()` 先排空在途请求：
 
@@ -305,7 +305,7 @@ public:
 pull.pullAsync(mq, "*", offset, 32, std::make_shared<MyPullCallback>(), 5000);
 ```
 
-调度服务（Java `MQPullConsumerScheduleService` 的对应物）：按 topic 注册 `PullTaskCallback`，
+调度服务（`MQPullConsumerScheduleService`）：按 topic 注册 `PullTaskCallback`，
 常驻调度线程周期性重算本实例应得份额（CLUSTERING 走 `fetchMessageQueuesInBalance`、
 BROADCASTING 走 `fetchSubscribeMessageQueues`），展开成 queue 维度拉取任务——同队列严格串行、
 不同队列在 `setPullThreadNums`（默认 20）宽的线程池上并行；服务代拉并管理位点
@@ -333,8 +333,8 @@ svc.shutdown();   // 先停调度，再排空在途 doPullTask，最后关消费
 
 下一轮延时按三通道优先级决议：`doPullTask` **返回值**（>= 0 毫秒，最高）＞
 `ctx.pullMessageLater(延时)`（一次性顺延）＞ `ctx.setPullInterval(间隔)` ＞ 状态默认
-（FOUND=0 立即；空应答 / OFFSET_ILLEGAL=`setPullTimeDelayMillisWhenException`，Java 口径 3s；
-拉取失败或回调抛异常=`setPullTaskExceptionDelayMillis`，Java 口径 1s）。
+（FOUND=0 立即；空应答 / OFFSET_ILLEGAL=`setPullTimeDelayMillisWhenException`，默认 3s；
+拉取失败或回调抛异常=`setPullTaskExceptionDelayMillis`，默认 1s）。
 
 ### 轻量拉消费者
 
@@ -490,7 +490,12 @@ producer.setTlsOptions(opts);
   异步背压 / 自动攒批 / Request-Reply / 定时消息撤回 / 消息查询
 - ✅ 消费者：`DefaultMQPushConsumer`（并发、顺序、广播、POP）、
   `DefaultMQPullConsumer`（短轮询 / 长轮询 / 位点表 / 心跳 / 异步拉取 `pullAsync`）、
-  `DefaultLitePullConsumer`（subscribe 与 assign 双模式、seek、三张位点表、队列变更监听）、
+  `DefaultLitePullConsumer`（subscribe 与 assign 双模式、seek、三张位点表、队列变更监听、
+  解析拉取位点前先过四道缓存闸门：整个缓冲条数 `setPullThresholdForAll` 10000 / 本队列条数
+  `setPullThresholdForQueue` 1000 / 本队列存储字节 `setPullThresholdSizeForQueue` 100 MiB
+  整除 / 本队列位点跨度 `setConsumeMaxSpan` 2000，都严格大于才停；命中只重排这一个队列
+  `kPullPauseWhenClientFlowControl` = 50ms，broker 的 `FLOW_CONTROL`(215) 只等
+  `kPullPauseWhenBrokerFlowControl` = 20ms）、
   `MQPullConsumerScheduleService`（按 topic 注册 `PullTaskCallback`，按本实例应得份额展开
   queue 维度拉取任务：同队列串行、三通道延时优先级、关停排空在途）
 - ✅ 队列分配策略：AVG / AVG_BY_CIRCLE / CONFIG / CONSISTENT_HASH /
@@ -580,7 +585,7 @@ broker 侧的订阅表、位点与轨迹才落在预期的组上。
 | `rmq_live_pop_mode` | SET_MESSAGE_REQUEST_MODE(401) 的真机三条腿（实测 `PASS=13 FAIL=0`）：生产 `setMessageRequestMode` 把四个值全写进 JSON body → GET_ALL_MESSAGE_REQUEST_MODE(402) 回读必须按这对 topic+group 出现 `mode=POP`、`popShareQueueNum` 是数字 4；同组改写 PULL/0 必须覆盖前一次；对照腿把同样四个值塞进 header、body 留空，broker 必须拒绝（实测 code=1，remark 说请求体解不出来）且该控制组在 402 里始终缺席——同一次回读里 body 形态的锚点条目仍然可见，缺席才真是缺席。topic 每次新建、名字带 stamp，主 broker 地址取自建 topic 的路由，回读轮询到有答案为止 | — |
 | `rmq_live_pull` | 拉消费者的队列、短轮询 / 长轮询、手动位点 | — |
 | `rmq_live_pull_heartbeat` | 拉消费者的 203 / 38 / 35 报文与 consumeType 口径 | — |
-| `rmq_live_lite_pull` | 轻量拉消费者的 subscribe / assign 双模式与 poll | — |
+| `rmq_live_lite_pull` | 轻量拉消费者的 subscribe / assign 双模式与 poll、本队列缓存条数闸门（超标只 park 这一路，排空后续读到尾部） | — |
 | `rmq_live_lite_pull_cursor` | 空应答跟随 `nextBeginOffset` 与 OFFSET_ILLEGAL 越界自愈 | — |
 | `rmq_live_lite_pull_code` | 请求码 361 与 lite 位、`litePullMessageEnable` 开关还原 | `litePullMessageEnable`（工具自开自关） |
 | `rmq_live_lite_topic_queue_change` | 队列扩缩容触发的监听回调，比对趟次现查路由 | — |

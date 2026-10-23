@@ -24,7 +24,7 @@ git clone <本仓库> && cd rocketmq-client-remoting/nodeJs
 node --experimental-strip-types selfcheck.ts
 ```
 
-`selfcheck.ts` 加载 `src/` 全部 **65** 个模块并依次跑 **37** 套离线冒烟（两份清单都由目录树推导，新增文件不会漏出自检），2026-10-24 实测 **ALL GREEN**，共 **1190** 项检查。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
+`selfcheck.ts` 加载 `src/` 全部 **65** 个模块并依次跑 **37** 套离线冒烟（两份清单都由目录树推导，新增文件不会漏出自检），2026-10-24 实测 **ALL GREEN**，共 **1222** 项检查。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
 
 | 套件 | 实测 |
 | --- | --- |
@@ -44,7 +44,7 @@ node --experimental-strip-types selfcheck.ts
 | `test/consumer_smoke.ts` | 30 通过 / 0 失败 |
 | `test/consumer_status_reply_smoke.ts`（221 状态应答 + 307/309 未托管组 + 220 单向） | 22 通过 / 0 失败 |
 | `test/fixes2_smoke.ts` | 40 项检查通过 |
-| `test/flow_control_smoke.ts`（每队列三条闸门：只看本队列缓存、缓存闸门 50ms、broker 215 的 20ms、其余拉取失败 500ms；POP 队列的待 ack 欠账闸门默认 96、严格大于才停，命中记进拉取路径同一个流控计数与告警节奏，POP 被 broker 回 215 同样只等 20ms） | 87 项检查通过 |
+| `test/flow_control_smoke.ts`（每队列三条闸门：只看本队列缓存、缓存闸门 50ms、broker 215 的 20ms、其余拉取失败 500ms；POP 队列的待 ack 欠账闸门默认 96、严格大于才停，命中记进拉取路径同一个流控计数与告警节奏，POP 被 broker 回 215 同样只等 20ms；lite 路径 `poll()` 就地拉取、无预取缓冲，所以只按队列停在 215 的 20ms、其余错误码不 park、兄弟队列不受影响，且 broker 拒绝码以带 `responseCode` 的 `MQBrokerException` 交给调用方） | 119 项检查通过 |
 | `test/heartbeat_v2_beat_smoke.ts` | 28 通过 / 0 失败 |
 | `test/heartbeat_v2_smoke.ts` | 30 通过 / 0 失败 |
 | `test/initial_offset_policy_smoke.ts`（初始位点：广播 / TIMESTAMP / %RETRY% / SQL92） | 40 通过 / 0 失败 |
@@ -315,7 +315,7 @@ producer.setSocksProxyConfig({ addr: '127.0.0.1:1080', version: 4 });           
 - ✅ 传输层：长连接惰性建连复用、同步/异步/单向、半包重组、opaque 匹配、GO_AWAY 重发一次、断连在途请求判死
 - ✅ Producer：同步 / 批量 / 单向 / 异步（公平信号量背压）/ 队列选择器 / 顺序 / 延迟与 5.x 定时 / 事务两阶段 + 回查 / Request-Reply（326 接收闭环）/ recallMessage / VIP channel（port-2）
 - ✅ PushConsumer：并发 / 顺序 / 广播、长轮询、位点持久化、流控阈值、307/220/221 应答、RETRY 还原、suspend/resume、核心线程数在线调整
-- ✅ PullConsumer / LitePullConsumer：短/长轮询、assign+seek+commitSync、自动提交、topic 队列变更监听
+- ✅ PullConsumer / LitePullConsumer：短/长轮询、assign+seek+commitSync、自动提交、topic 队列变更监听；LitePull 的 `poll()` 就地拉取、没有本地预取缓冲也没有后台拉取任务，因此每队列缓存闸门（条数 / 存储字节 / 位点跨度 / 整个缓冲条数）无对象可判——该路径的退避按队列停在 broker 的 `FLOW_CONTROL`(215)：`litePullParkMillisFor` 把 215 映射成 20ms（`PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL`）、其余错误码不 park，`setPullParkUntil` / `getPullParkUntil` 记录并读回每个队列的 park 截止时刻，兄弟队列不受影响；broker 的拒绝码以 `MQBrokerException.responseCode` 交给调用方
 - ✅ POP 消费模式：POP(200050)/ACK(200051)/CHANGE_INVISIBLE(200053)/BATCH_ACK(200151)/SET_MESSAGE_REQUEST_MODE(401)、POP_CK 双路径、欠账流控（本队列待 ack 严格大于 `popThresholdForQueue`，默认 96，命中记进拉取路径同一个流控计数）、退避表
 - ✅ Admin：topic CRUD、集群/运行时信息、订阅组、消费统计、连接查询、位点重置与读取、KV 配置、NameServer 配置（318/319）、消息查询/查看、consumeMessageDirectly
 - ✅ ACL（HMAC-SHA1 + Base64）与 RPC 钩子链（Namespace → Stream → 用户钩子）

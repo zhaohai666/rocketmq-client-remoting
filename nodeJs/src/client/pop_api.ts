@@ -14,6 +14,7 @@ import { MessageConst } from '../common/messageConst.ts';
 import { MixAll } from '../common/mixAll.ts';
 import { decodeMessages } from '../common/messageDecoder.ts';
 import { ResponseCode } from '../remoting/codes.ts';
+import { MQBrokerException } from '../remoting/exception.ts';
 import { PopMessageResponseHeader } from '../remoting/headers.ts';
 import {
   buildExtraInfo, getStartOffsetInfoMapKey, getQueueOffsetMapKey,
@@ -97,7 +98,12 @@ export function processPopResponse(
       break;
 
     default:
-      throw new Error(`POP response error, code=${responseCode} remark=${responseRemark || ''}`);
+      // The code rides on the typed exception, exactly like the pull kernel's:
+      // the POP loop branches on it to tell the broker's own throttle answer (215,
+      // short pause) from every other failure, and a bare Error would leave the
+      // number only in the text and silently disable that branch.
+      throw new MQBrokerException(responseCode,
+        `POP response error, code=${responseCode} remark=${responseRemark || ''}`);
   }
 
   result.restNum = respHeader.restNum ?? 0;

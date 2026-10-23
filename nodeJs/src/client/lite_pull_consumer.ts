@@ -22,7 +22,9 @@ import { MessageQueue, MessageExt } from '../common/message.ts';
 import { MixAll } from '../common/mixAll.ts';
 import { FilterAPI, SubscriptionData } from '../common/subscriptionData.ts';
 import { PullSysFlag } from '../common/sysflag.ts';
-import { RequestCode } from '../remoting/codes.ts';
+import { RequestCode, ResponseCode } from '../remoting/codes.ts';
+import { MQBrokerException } from '../remoting/exception.ts';
+import { PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL } from './consumer.ts';
 import { Validators } from '../common/validators.ts';
 import { defaultConsumeTimestamp, parseConsumeTimestamp } from '../common/utilAll.ts';
 import { getLogger } from '../logging.ts';
@@ -31,6 +33,9 @@ const logger = getLogger('client.lite_pull_consumer');
 
 const DEFAULT_PULL_BATCH_SIZE = 10;
 const DEFAULT_POLL_TIMEOUT_MILLIS = 5000;
+// Single queue, nothing found: the wait between two rounds of the same poll()
+// call, so an idle queue does not hot-loop against the broker.
+const IDLE_POLL_RETRY_DELAY_MILLIS = 200;
 // Default value of topicMetadataCheckIntervalMillis: the watched topic's queue
 // set is compared once every 30s.
 const DEFAULT_TOPIC_METADATA_CHECK_INTERVAL_MILLIS = 30 * 1000;
@@ -56,6 +61,22 @@ function isQueueSetEqual(
   if (oldQueues.length !== newQueues.length) return false;
   const oldSet = new Set(oldQueues.map(mqKey));
   return newQueues.every((mq) => oldSet.has(mqKey(mq)));
+}
+
+// litePullParkMillisFor maps a FAILED lite pull round to how long THIS queue is
+// parked before poll() asks it again:
+//   * the broker's own flow-control answer (215): the short pause — nothing was
+//     handed to the application and the queue is readable again as soon as the
+//     broker's pressure drops;
+//   * every other code (and a failure that never reached the wire, which carries
+//     no code at all): 0, i.e. no park — that is today's behaviour and it stays
+//     whatever the port already does for a failed lite pull.
+//
+// The park is per queue: a throttled queue is stepped over while its siblings are
+// still served, exactly like a queue the application paused.
+export function litePullParkMillisFor(responseCode?: number): number {
+  return responseCode === ResponseCode.FLOW_CONTROL
+    ? PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL : 0;
 }
 
 export class DefaultLitePullConsumer {
@@ -123,6 +144,10 @@ export class DefaultLitePullConsumer {
   private assignedAuto: MessageQueue[] = [];            // subscribe() mode
   private paused = new Set<string>();
   private pullCursor = new Map<string, number>();       // mqKey -> next pull offset
+  // mqKey -> the instant (epoch ms) until which poll() skips this queue, armed by
+  // the broker's own flow-control answer (215). Keyed exactly like the other
+  // per-queue state, and read by every round of poll().
+  private pullParkUntil = new Map<string, number>();
   // Each topic's listener plus the queue set last seen.
   // The key is the **bare** topic, consistent with this implementation's other
   // lite pull state (subscribe / route cache / rebalance) — namespaceV2 takes
@@ -489,6 +514,11 @@ export class DefaultLitePullConsumer {
   //
   // The cursor starts at the committed offset (or 0 for a %RETRY% topic) and
   // advances by nextBeginOffset after every round.
+  //
+  // A queue the broker throttled (215) is skipped until its short park expires;
+  // the round steps over it and keeps serving its siblings, and a round where
+  // NOTHING is pullable waits out the shortest remaining park rather than burning
+  // the caller's deadline on a spin.
   async poll(timeoutMillis = this.pollTimeoutMillis): Promise<MessageExt[]> {
     if (!this.started || !this.pullAPI) throw new Error('consumer not started');
     const deadline = Date.now() + Math.max(1, timeoutMillis);
@@ -498,8 +528,23 @@ export class DefaultLitePullConsumer {
     let idx = 0;
     while (Date.now() < deadline && out.length < this.pullBatchSize) {
       // Round-robin across queues so no single queue starves the rest.
-      const mq = queues[idx % queues.length];
-      idx++;
+      let pos = idx % queues.length;
+      let steppedOver = 0;
+      while (steppedOver < queues.length && this._parkMillisLeft(queues[pos]) > 0) {
+        pos = (pos + 1) % queues.length;
+        steppedOver++;
+      }
+      if (steppedOver >= queues.length) {
+        // Every queue is parked: the shortest remaining park is the soonest any
+        // answer can arrive, so waiting it out respects both the broker's pause
+        // and the caller's deadline.
+        let shortest = this._parkMillisLeft(queues[0]);
+        for (const mq of queues) shortest = Math.min(shortest, this._parkMillisLeft(mq));
+        await this._sleepPollRound(Math.min(shortest, Math.max(1, deadline - Date.now())));
+        continue;
+      }
+      idx = pos + 1;
+      const mq = queues[pos];
       const key = mqKey(mq);
       const sub = this.subscription.get(mq.getTopic());
       if (!sub) continue;
@@ -545,11 +590,18 @@ export class DefaultLitePullConsumer {
       } catch (e) {
         logger.debug('lite pull error for %s: %s', key, (e as Error).message);
         // A short poll error: fall through so the remaining queues still get
-        // their turn within the deadline.
+        // their turn within the deadline. The ONE exception is the broker's own
+        // throttle answer, which parks just this queue for the short 20ms pause —
+        // retrying it hot is exactly what the broker is asking for not to happen.
+        const parkMillis = litePullParkMillisFor(
+          e instanceof MQBrokerException ? e.responseCode : undefined);
+        if (parkMillis > 0) this.setPullParkUntil(mq, Date.now() + parkMillis);
       }
-      if (queues.length === 1 && out.length === 0) {
-        // Single queue and nothing found: don't hot-loop against the broker.
-        await new Promise<void>((r) => setTimeout(r, 200));
+      if (queues.length === 1 && out.length === 0 && this._parkMillisLeft(mq) <= 0) {
+        // Single queue and nothing found: don't hot-loop against the broker. A
+        // queue this round parked on 215 waits its own short pause above instead,
+        // so the idle guard must not swallow it.
+        await this._sleepPollRound(IDLE_POLL_RETRY_DELAY_MILLIS);
       }
     }
     return out;
@@ -654,6 +706,47 @@ export class DefaultLitePullConsumer {
 
   resume(mqs: MessageQueue[]): void {
     for (const mq of mqs) this.paused.delete(mqKey(mq));
+  }
+
+  // setPullParkUntil makes this queue's next pull wait until `untilMillis` (epoch
+  // ms) — the knob behind the broker 215 short pause, exposed so an application (or
+  // a test) can hold ONE queue back without pausing its siblings. A value not in
+  // the future is dropped, and clearing an unknown queue is a no-op.
+  setPullParkUntil(mq: MessageQueue, untilMillis: number): void {
+    const key = mqKey(mq);
+    if (!Number.isFinite(untilMillis) || untilMillis <= Date.now()) {
+      this.pullParkUntil.delete(key);
+      return;
+    }
+    this.pullParkUntil.set(key, Math.floor(untilMillis));
+  }
+
+  // getPullParkUntil reads back the instant one queue is parked until, or 0 when
+  // nothing holds it back. An already-expired park reads as 0 and is pruned here,
+  // so the map cannot drift away from the queues it can actually hold back.
+  getPullParkUntil(mq: MessageQueue): number {
+    const key = mqKey(mq);
+    const until = this.pullParkUntil.get(key);
+    if (until === undefined) return 0;
+    if (until <= Date.now()) {
+      this.pullParkUntil.delete(key);
+      return 0;
+    }
+    return until;
+  }
+
+  // Remaining park for one queue, in ms (0 when it is pullable now).
+  private _parkMillisLeft(mq: MessageQueue): number {
+    return this.getPullParkUntil(mq) - Date.now();
+  }
+
+  // _sleepPollRound is the one place a poll() round waits between two asks. It is
+  // a method so the pause a round asked for can be RECORDED instead of slept by
+  // the offline tests — the same handle the push path's _sleepOrStop gives its
+  // gate tests. A real wait can only be late, never early, so the short park keeps
+  // its lower bound.
+  private async _sleepPollRound(millis: number): Promise<void> {
+    await new Promise<void>((r) => setTimeout(r, Math.max(1, Math.floor(millis))));
   }
 
   private _activeQueues(): MessageQueue[] {

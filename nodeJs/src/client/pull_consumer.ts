@@ -24,6 +24,7 @@ import { RemotingCommand } from '../remoting/remotingCommand.ts';
 import { RemotingSerializable } from '../remoting/serialize.ts';
 import { ConsumerSendMsgBackRequestHeader } from '../remoting/headers.ts';
 import { Validators } from '../common/validators.ts';
+import { MQBrokerException } from '../remoting/exception.ts';
 import type { TopicRouteData } from '../remoting/route.ts';
 import { getLogger } from '../logging.ts';
 
@@ -497,7 +498,10 @@ export class DefaultMQPullConsumer {
     const request = RemotingCommand.createRequestCommand(RequestCode.CONSUMER_SEND_MSG_BACK, h);
     const response = await this.mqClient.remotingClient.invokeSync(this.mqClient.vipChannel(addr), request, 5000);
     if (response.code !== ResponseCode.SUCCESS) {
-      throw new Error(`sendMessageBack failed: CODE ${response.code} ${response.remark || ''}`);
+      // Same rule as the pull kernel: the broker code rides on the typed
+      // exception, so a caller can branch on it instead of parsing the text.
+      throw new MQBrokerException(response.code,
+        `sendMessageBack failed: CODE ${response.code} ${response.remark || ''}`, addr);
     }
   }
 }

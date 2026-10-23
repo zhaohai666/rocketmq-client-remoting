@@ -28,7 +28,7 @@ python3 -m venv .venv
 .venv/bin/pip install -e .                     # top-level packages: client / common / remoting
 
 .venv/bin/pip install pytest                   # needed only to run the unit tests
-.venv/bin/python -m pytest tests/ -q           # 1645 passed, 4 skipped
+.venv/bin/python -m pytest tests/ -q           # 1673 passed, 4 skipped
 .venv/bin/python selfcheck.py                  # selfcheck: 7/7 passed
 ```
 
@@ -382,7 +382,7 @@ third-party dependencies.
 | Recalling a delayed message: `recall_message` (370, handle from `SendResult.recall_handle`) | ✅ |
 | Push consumer: concurrent / orderly listeners, broadcasting, the three per-queue cache gates (topic budgets divided over the owned queues), offset correction and reset, stalled-loop recovery, expired-message sweep | ✅ |
 | Pull consumer: manual pull + long polling + manual commit + offset lookup by timestamp | ✅ |
-| Lite pull consumer: `poll` / `assign` / `seek` / `pause` / `commit`, three offset tables (pull / consumed / committed cursors), topic queue-change listener | ✅ |
+| Lite pull consumer: `poll` / `assign` / `seek` / `pause` / `commit`, three offset tables (pull / consumed / committed cursors), topic queue-change listener, and four cache gates judged before the pull offset is resolved (whole-buffer count `pull_threshold_for_all` 10000 / this queue's count `pull_threshold_for_queue` 1000 / this queue's stored bytes `pull_threshold_size_for_queue` 100 MiB with integer division / this queue's offset span `consume_max_span` 2000, each refusing only when strictly above its threshold; a refusal re-schedules just this queue 50ms later while the broker's `FLOW_CONTROL`(215) waits 20ms) | ✅ |
 | POP consumption loop (`pop_mode`, with ack / renew / orderly POP / the outstanding-ACK cache gate: this queue's debt strictly above `pop_threshold_for_queue` (default 96) pauses the round for 50ms and is counted on the pull path's client-wide flow-control total) | ✅ |
 | Queue allocation strategies: AVG / AVG_BY_CIRCLE / CONFIG / CONSISTENT_HASH / MACHINE_ROOM / MACHINE_ROOM_NEARBY | ✅ |
 | Two namespace schemes: local `namespace` prefix and server-side `namespace_v2` | ✅ |
@@ -461,7 +461,7 @@ named `_live`. One line each on what they prove:
 | `verify_latency_live.py` | Send-latency fault avoidance: isolation window, broker switch, recovery |
 | `verify_lite_pull_code_live.py` | Lite request code 361 and the broker-side lite switch (flipped at runtime and restored on exit) |
 | `verify_lite_pull_cursor_live.py` | The lite pull cursor follows `nextBeginOffset`, incl. NO_MATCHED_MSG and out-of-range self-healing |
-| `verify_lite_pull_live.py` | The whole lite-pull path: rebalance, assign+seek, allocation strategies, three offset tables |
+| `verify_lite_pull_live.py` | The whole lite-pull path: rebalance, assign+seek, allocation strategies, three offset tables, and this queue's cached-count gate (over budget parks only that queue, and the cursor runs to the tail once the buffer drains) |
 | `verify_lite_topic_queue_change_live.py` | `on_changed` fires after a topic queue scale-out/scale-in |
 | `verify_offset_illegal_live.py` | The `OFFSET_ILLEGAL` branch: drop the queue and persist the corrected offset immediately |
 | `verify_orderly_reconsume_live.py` | The orderly redelivery gate and explicit COMMIT/ROLLBACK |

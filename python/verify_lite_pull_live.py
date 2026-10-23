@@ -274,6 +274,13 @@ def s8_three_offset_tables(foreign_pool: list) -> None:
     o.client_id = "%s@%d#liteoff" % (off_group, STAMP)
     o.set_poll_timeout_millis(1000)
     o.set_pull_batch_size(32)
+    # The four cache gates would otherwise stop the background pull once this queue holds more than
+    # pull_threshold_for_queue (default 1000) messages, and 1200 > 1000 -- that is the gate working, not
+    # a defect. This scenario is about the three offset tables, so lift every gate above the 1200 backlog.
+    o.set_pull_threshold_for_all(n_big * 32)
+    o.set_pull_threshold_for_queue(n_big + 100)
+    o.set_pull_threshold_size_for_queue(1024)
+    o.set_consume_max_span(n_big + 1000)
     o.auto_commit = False            # the commit timing is entirely controlled by the scenario
     o.set_consume_from_where(ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET)
     o.assign([q0])
@@ -402,6 +409,100 @@ def s8_three_offset_tables(foreign_pool: list) -> None:
     finally:
         o.shutdown()
         probe.shutdown()
+
+
+def s9_cache_gate_bounded_pull() -> None:
+    """The cached-count gate on a real broker: the pull stops on its own while the buffer is over budget and resumes when it drains."""
+    gate_topic = "LiteGate_%d" % STAMP
+    gate_group = "LiteGatePG_%d" % STAMP
+    ctl_group = "LiteGateCtl_%d" % STAMP
+    n_gate = 200
+    batch = 32
+    queue_threshold = 64      # the gate trips once this queue caches *more* than this many messages
+
+    queues: list = []
+    landed = 0
+    prod = DefaultMQProducer("PG_PrepareGate_%d" % STAMP)
+    prod.set_namesrv_addr(NAMESRV)
+    prod.start()
+    try:
+        prod.create_topic("TBW102", gate_topic, 1)
+        route_deadline = time.time() + 20
+        while not queues and time.time() < route_deadline:
+            try:
+                queues = prod.fetch_publish_message_queues(gate_topic)
+            except Exception:  # noqa: BLE001
+                queues = []
+            if not queues:
+                time.sleep(0.5)
+        check("S9 prepare the topic (1 queue)", len(queues) == 1, "queues=%d" % len(queues))
+        if len(queues) != 1:
+            return
+        q0 = queues[0]
+        for frm in range(0, n_gate, 50):
+            chunk = [Message(gate_topic, ("gate-%04d" % i).encode())
+                     for i in range(frm, min(n_gate, frm + 50))]
+            r = prod.send(chunk, timeout_millis=5000, mq=q0)
+            if r.send_status == SendStatus.SEND_OK:
+                landed += len(chunk)
+    finally:
+        prod.shutdown()
+    check("S9 produced %d messages successfully" % n_gate, landed == n_gate, "landed=%d" % landed)
+
+    def make(group: str, name: str, threshold: int) -> DefaultLitePullConsumer:
+        c = DefaultLitePullConsumer(group)
+        c.set_namesrv_addr(NAMESRV)
+        c.instance_name = name
+        c.client_id = "%s@%d#%s" % (group, STAMP, name)
+        c.set_poll_timeout_millis(1000)
+        c.set_pull_batch_size(batch)
+        # Only the count gate is under test: the size gate (100 MiB) and the span gate (2000) cannot
+        # trip on 200 tiny messages, and the whole-buffer gate would need threshold*batch to stay clear.
+        c.set_pull_threshold_for_queue(threshold)
+        c.set_pull_threshold_for_all(n_gate * batch)
+        c.auto_commit = False
+        c.set_consume_from_where(ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET)
+        c.assign([q0])
+        c.start()
+        return c
+
+    gated = make(gate_group, "gated", queue_threshold)
+    control = make(ctl_group, "control", n_gate + 100)
+    try:
+        # The gate has to be reached first: without the pull cursor passing the threshold, "it stopped early" says nothing.
+        passed = time.time() + 20
+        while gated.pull_cursor_of(q0) <= queue_threshold and time.time() < passed:
+            time.sleep(0.2)
+        parked = gated.pull_cursor_of(q0)
+        check("S9a the gate lets the queue cache past its threshold (%d)" % queue_threshold,
+              parked > queue_threshold, "pullCursor=%d" % parked)
+
+        # Then it must refuse every further round while nothing is consumed: the cursor stays put.
+        settled = gated.pull_cursor_of(q0)
+        hold = time.time() + 5
+        while time.time() < hold:
+            time.sleep(0.5)
+        held = gated.pull_cursor_of(q0)
+        check("S9a with the buffer over budget the pull cursor stops on its own (never reaches %d)" % n_gate,
+              held == settled and held < n_gate, "pullCursor=%d" % held)
+
+        # Control: same topic, same queue, only the threshold is high enough to clear -- the pull runs to the tail.
+        run = time.time() + 20
+        while control.pull_cursor_of(q0) < n_gate and time.time() < run:
+            time.sleep(0.3)
+        check("S9-control the same queue pulls all %d once the threshold clears" % n_gate,
+              control.pull_cursor_of(q0) == n_gate, "pullCursor=%d" % control.pull_cursor_of(q0))
+
+        # Draining the buffer releases the gate: the rest arrives without restarting anything.
+        got = drain(gated, n_gate, timeout=60)
+        bodies = {bytes(m.body) for m in got}
+        check("S9b after the buffer drains the remaining messages all arrive (%d)" % n_gate,
+              len(got) == n_gate and len(bodies) == n_gate, "got=%d distinct=%d" % (len(got), len(bodies)))
+        check("S9b the pull cursor runs to the tail once the queue is consumed",
+              gated.pull_cursor_of(q0) == n_gate, "pullCursor=%d" % gated.pull_cursor_of(q0))
+    finally:
+        gated.shutdown()
+        control.shutdown()
 
 
 def main() -> int:
@@ -675,6 +776,10 @@ def main() -> int:
     # ===== S8 three offset tables =====
     print("\nS8 three offset tables: the pull cursor / the consumed cursor / the committed landing point")
     s8_three_offset_tables(assigned)
+
+    # ===== S9 the cached-count gate on a real broker =====
+    print("\nS9 the local buffer's cached-count gate: the pull parks itself and resumes after draining")
+    s9_cache_gate_bounded_pull()
 
     print("\nLitePullConsumer: PASS=%d FAIL=%d" % (PASS, FAIL))
     return 0 if FAIL == 0 else 1

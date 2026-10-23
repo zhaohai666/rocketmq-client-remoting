@@ -104,6 +104,11 @@ PULL_TIME_DELAY_WHEN_EXCEPTION = 0.5
 # log; only every Nth trip gets one (the first, then the 1001st, ...).
 FLOW_CONTROL_WARN_EVERY_N_TRIPS = 1000
 
+# One MiB. The cache size gates count a queue's cached bytes in MiB, and the comparison is done on the
+# integer division result: the threshold is a whole number of MiB, so a partially filled MiB of backlog
+# never counts as one.
+MIB = 1024 * 1024
+
 
 def is_flow_control_warn_trip(triggered_times: int) -> bool:
     """Whether the Nth (1-based) flow-control trip is one that logs a warn."""
@@ -4466,6 +4471,76 @@ class DefaultMQPullConsumer:
         client.create_topic_in_route(new_topic, queue_num, queue_num, 6)
 
 
+class _LiteQueueCache:
+    """One queue's incremental view of the LitePull consumer's shared local buffer.
+
+    The LitePull buffer is **one** global deque holding the cached messages of every assigned queue, so
+    deciding "how much of this queue is still cached" from the buffer itself would mean scanning the
+    whole buffer on every pull round of every queue. This accumulator carries only the numbers the cache
+    gates read -- this queue's cached message count, its cached bytes (the same ``storeSize`` sum the
+    buffer's entries contribute) and the lowest/highest cached queue offset of its own messages -- and
+    updates them where the buffer changes: after a pull appends, when ``poll()`` removes, when ``seek()``
+    prunes, and when the queue is revoked.
+
+    It is mutated only through the owning consumer's buffer lock, always in the same step as the deque,
+    which is what keeps it from drifting away from what the buffer really holds.
+    """
+
+    __slots__ = ("offsets", "size", "min_offset", "max_offset")
+
+    def __init__(self) -> None:
+        # This queue's cached offsets, in buffer order. Its length **is** the cached message count, so
+        # the count cannot be a second bookkeeping place to forget.
+        self.offsets: Deque[int] = deque()
+        self.size = 0
+        self.min_offset = 0
+        self.max_offset = 0
+
+    @property
+    def count(self) -> int:
+        return len(self.offsets)
+
+    @property
+    def span(self) -> int:
+        """Highest cached offset minus lowest cached offset of **this queue** (an empty or
+        single-message cache has span 0)."""
+        return self.max_offset - self.min_offset if self.count > 1 else 0
+
+    def add(self, msg: MessageExt) -> None:
+        offset = msg.queue_offset
+        self.offsets.append(offset)
+        self.size += int(getattr(msg, "store_size", 0) or 0)
+        if self.count == 1:
+            self.min_offset = self.max_offset = offset
+            return
+        if offset < self.min_offset:
+            self.min_offset = offset
+        elif offset > self.max_offset:
+            self.max_offset = offset
+
+    def remove(self, msg: MessageExt) -> None:
+        offset = msg.queue_offset
+        self.size -= int(getattr(msg, "store_size", 0) or 0)
+        if self.offsets and self.offsets[0] == offset:
+            # The normal case: both removal paths (poll drains the head, seek drops a prefix) take this
+            # queue's oldest cached message, which is the head of a per-queue FIFO.
+            self.offsets.popleft()
+        elif offset in self.offsets:
+            # Only an out-of-order buffer can land here; pay the scan for that one message rather than
+            # let the accumulator lose track of the deque.
+            self.offsets.remove(offset)
+        if not self.offsets:
+            # Nothing of this queue is cached any more: the boundaries reset, so an empty cache reads as
+            # "count 0, size 0, span 0" and never as a stale pair left behind by the drained messages.
+            self.size = 0
+            self.min_offset = self.max_offset = 0
+        elif offset == self.min_offset or offset == self.max_offset:
+            # Recompute the boundaries only when the removed message **was** one of them -- recomputing
+            # on every removal would put the scan back where this table exists to avoid it.
+            self.min_offset = min(self.offsets)
+            self.max_offset = max(self.offsets)
+
+
 class DefaultLitePullConsumer:
     """Lite pull consumer.
 
@@ -4484,6 +4559,10 @@ class DefaultLitePullConsumer:
       Independent threads are not started per queue (semantically equivalent: local buffer + poll).
     - The subscribe mode's rebalance reuses the existing ``get_consumer_id_list_by_group`` + ``AllocateMessageQueueAveragely``,
       the same allocation algorithm as push consumers; when the consumer group list cannot be queried it "keeps the current allocation", never falling back to exclusive ownership.
+    - Because that buffer is only ever drained by ``poll()``, the pull round itself carries the four cache gates of
+      ``_cache_flow_control_hit`` (whole-buffer count, this queue's count, this queue's MiB, this queue's offset span):
+      a refusal sends no request and re-schedules **that queue's** next round 50 ms later, so a slow or absent
+      application can grow the backlog but not the client's memory without bound.
     - No POP / push mode; no broker-initiated request (309/313) handling (that is the push consumer's responsibility).
     """
 
@@ -4546,6 +4625,17 @@ class DefaultLitePullConsumer:
         self.broker_suspend_max_time_millis = 20000
         self.pull_interval_millis = 50  # Backoff on empty polls at the queue tail, to avoid idle spinning hammering the broker
         self.pull_thread_nums = 1
+        # ---- Local-buffer cache thresholds (this consumer's own flow control) ----
+        # The background pull feeds one shared local buffer that only poll() drains, so an application
+        # that polls slowly -- or never -- grows that buffer without bound. Four plain budgets guard it:
+        # one over the whole buffer, three over a single queue. Every gate compares **strictly greater
+        # than** the budget, so a queue sitting exactly on its threshold still pulls, and 0 is a legal
+        # "trip on the first cached message" rather than a switch -- these are budgets, so nothing here
+        # validates or clamps them.
+        self.pull_threshold_for_all = 10000
+        self.pull_threshold_for_queue = 1000
+        self.pull_threshold_size_for_queue = 100
+        self.consume_max_span = 2000
         # The period of the background comparison of the queue sets of topics registered with register_topic_message_queue_change_listener, default 30s.
         self.topic_metadata_check_interval_millis = 30 * 1000
         # ---- Heartbeat V2 / VIP channel switches (both default false) ----
@@ -4572,6 +4662,20 @@ class DefaultLitePullConsumer:
         self._local_buffer: Deque[MessageExt] = deque()
         self._buffer_lock = threading.Lock()
         self._buffer_cond = threading.Condition(self._buffer_lock)
+        # Per-queue incremental view of that single buffer (count / bytes / offset boundaries), keyed the
+        # same way as the cursors below -- by the MessageQueue. Mutated only in the same step as the
+        # deque, under the buffer lock, so it cannot fall out of step with what is really cached.
+        self._queue_cache: Dict[MessageQueue, _LiteQueueCache] = {}
+        # When a queue's next pull round is allowed. A cache-gate refusal parks that queue for 50 ms and
+        # a broker FLOW_CONTROL(215) answer for 20 ms; parking is always **per queue**, so one hot queue
+        # never delays its siblings. Only the pull service thread writes and reads it.
+        self._pull_not_before: Dict[MessageQueue, float] = {}
+        # The three flow-control counters of this path, one per gate family, read the same way as the
+        # push path's flowControlTimes: the aggregate gate, the count and the size gate **sharing one**
+        # (both say "this queue's own cache is over its budget"), and the span gate.
+        self._flow_control_for_all_triggered = 0
+        self._flow_control_triggered = 0
+        self._flow_control_span_triggered = 0
         # Pull cursor: only means "after the last one already fetched into the local buffer", advanced by _pull_one.
         self._next_offset: Dict[MessageQueue, int] = {}
         # Consumed cursor: advances only when poll() really hands messages to the caller
@@ -4729,6 +4833,50 @@ class DefaultLitePullConsumer:
     def set_pull_interval_millis(self, ms: int) -> None:
         self.pull_interval_millis = max(0, int(ms))
 
+    def set_pull_threshold_for_all(self, n: int) -> None:
+        """Message-count budget of the **whole** local buffer, summed over every queue.
+
+        Plain budget, deliberately not clamped: the aggregate gate compares strictly greater, so 0 means
+        "trip on the first cached message" and is a legal configuration rather than "off".
+        """
+        self.pull_threshold_for_all = int(n)
+
+    def get_pull_threshold_for_all(self) -> int:
+        return self.pull_threshold_for_all
+
+    def set_pull_threshold_for_queue(self, n: int) -> None:
+        """Message count still cached for **one** queue before its pull is refused.
+
+        Compared strictly greater and judged on this queue's own cache only; not clamped, so 0 trips on
+        the first cached message.
+        """
+        self.pull_threshold_for_queue = int(n)
+
+    def get_pull_threshold_for_queue(self) -> int:
+        return self.pull_threshold_for_queue
+
+    def set_pull_threshold_size_for_queue(self, n: int) -> None:
+        """MiB still cached for **one** queue before its pull is refused.
+
+        The unit is MiB, not bytes, and the queue's cached bytes are divided by one MiB with integer
+        division before comparing. Compared strictly greater; 0 trips on the first cached message.
+        """
+        self.pull_threshold_size_for_queue = int(n)
+
+    def get_pull_threshold_size_for_queue(self) -> int:
+        return self.pull_threshold_size_for_queue
+
+    def set_consume_max_span(self, n: int) -> None:
+        """Offset span (highest cached offset minus lowest cached offset) one queue may hold.
+
+        Stops "one stuck message at the head while the rest of the queue piles up" from growing the
+        buffer's offset window forever. Compared strictly greater; 0 trips on the first cached message.
+        """
+        self.consume_max_span = int(n)
+
+    def get_consume_max_span(self) -> int:
+        return self.consume_max_span
+
     def set_topic_metadata_check_interval_millis(self, ms: int) -> None:
         # Lower bound 1s: the config itself has no lower bound, but 0/negative would make the fixed-rate scheduling throw directly;
         # here it degrades to the fastest one trip per 1s.
@@ -4799,12 +4947,13 @@ class DefaultLitePullConsumer:
         self._assign_mode = True
         queues = set(message_queues)
         # Reassigning drops the revoked queues along with their whole per-queue state
-        # (the pull cursor and consumed cursor disappear together). It does **not** touch the in-memory offset table
+        # (the pull cursor, the consumed cursor and the buffer accumulator disappear together). It does **not** touch the in-memory offset table
         # -- that cleanup hangs off the rebalance step that releases a no-longer-needed queue,
         # and assign mode does not go through rebalance, so persist does not happen here either.
         for mq in self._assigned - queues:
             self._next_offset.pop(mq, None)
             self._consume_offset.pop(mq, None)
+            self._drop_queue_cache(mq)
         self._assigned = queues
         for mq in self._assigned:
             if mq not in self._next_offset:
@@ -5013,17 +5162,50 @@ class DefaultLitePullConsumer:
                     self._last_rebalance_ts = now
                 targets = list(self._assigned)
                 got_any = False
+                # One clock per round: the "is this parked queue due yet" comparisons all read the same
+                # instant, so a queue parked by an earlier refusal is judged against a stable now.
+                round_time = time.monotonic()
                 for mq in targets:
                     if not self._running:
                         break
                     if mq in self._paused:
                         continue
+                    # A queue parked by a refusal of an earlier round -- its own cache gate, or the
+                    # broker's FLOW_CONTROL(215) answer to its pull -- is not due yet. Parking is
+                    # per queue: the sibling queues are judged and pulled in this very round.
+                    not_before = self._pull_not_before.get(mq)
+                    if not_before is not None and round_time < not_before:
+                        continue
+                    # The cache gates, judged before the pull offset is resolved: a refusal sends no
+                    # request at all and re-schedules this queue's next round 50 ms later.
+                    if self._cache_flow_control_hit(mq):
+                        self._pull_not_before[mq] = (
+                            round_time + PULL_TIME_DELAY_WHEN_CACHE_FLOW_CONTROL)
+                        continue
+                    self._pull_not_before.pop(mq, None)
                     if self._pull_one(mq):
                         got_any = True
             except Exception as e:  # noqa: BLE001
                 logger.debug("lite pull service error: %s", e)
             # Backoff: slow down on empty polls to avoid hammering the broker; when there are messages, refill the buffer as soon as possible
-            time.sleep(self.pull_interval_millis / 1000.0 if not got_any else 0.005)
+            time.sleep(self._pull_round_delay(got_any))
+
+    def _pull_round_delay(self, got_any: bool) -> float:
+        """How long this pull round waits before the next one starts.
+
+        The unchanged idle backoff (``pull_interval_millis`` when the round fetched nothing, else refill
+        as soon as possible) is the **upper bound**: a queue parked by a refusal is due sooner than that,
+        and the round has to wake up in time to honour its re-schedule -- 50 ms for a cache-gate refusal,
+        20 ms for a broker FLOW_CONTROL(215). So the wait is the shortest pending parking time, and never
+        longer than the idle backoff.
+        """
+        delay = self.pull_interval_millis / 1000.0 if not got_any else 0.005
+        now = time.monotonic()
+        for parked_until in self._pull_not_before.values():
+            remaining = parked_until - now
+            if 0 < remaining < delay:
+                delay = remaining
+        return delay
 
     def _subscription_for(self, topic: str) -> str:
         if topic in self.subscription:
@@ -5054,6 +5236,18 @@ class DefaultLitePullConsumer:
                 sys_flag, 0, sub, 0, exp_type,
                 timeout_millis=30000, max_msg_bytes=-1,
                 suspend_timeout_millis=15000)
+        except MQBrokerException as e:
+            # A broker FLOW_CONTROL(215) answer is not an error on this path: it is transient
+            # producer-side throttling, so **this queue's** next round waits the short broker delay
+            # (20 ms) instead of falling into the generic empty-round backoff. Every other broker code
+            # keeps exactly the handling it had before -- skip this round, nothing parked -- and no other
+            # response code's behavior changes.
+            logger.debug("lite pull_one failed for %s@%d: %s: %s", mq.topic, mq.queue_id,
+                         type(e).__name__, e)
+            if e.response_code == ResponseCode.FLOW_CONTROL:
+                self._pull_not_before[mq] = (
+                    time.monotonic() + PULL_TIME_DELAY_WHEN_BROKER_FLOW_CONTROL)
+            return False
         except Exception as e:  # noqa: BLE001
             logger.debug("lite pull_one failed for %s@%d: %s", mq.topic, mq.queue_id, e)
             return False
@@ -5099,9 +5293,143 @@ class DefaultLitePullConsumer:
                 kept.append(m)
         return kept
 
+    def _cache_flow_control_hit(self, mq: MessageQueue) -> bool:
+        """Whether the local buffer already holds too much for this queue to pull again.
+
+        The four checks run in this exact order, per queue, at the top of that queue's pull round -- after
+        the pause check the loop already does and **before** the pull offset is resolved, so a refusal
+        sends no request at all and the broker sees nothing:
+
+        1. aggregate: the number of messages cached in the whole buffer, summed over every queue,
+           strictly greater than ``pull_threshold_for_all`` (default 10000);
+        2. count: this queue's own cached message count, strictly greater than
+           ``pull_threshold_for_queue`` (default 1000);
+        3. size: this queue's own cached bytes divided by one MiB with **integer division**, strictly
+           greater than ``pull_threshold_size_for_queue`` (default 100);
+        4. span: the offset span of this queue's own cached messages, strictly greater than
+           ``consume_max_span`` (default 2000).
+
+        Gates 2 to 4 read **only this queue**: a sibling queue over its budget never stops this one (the
+        aggregate gate is the single deliberate exception, and it is a budget of its own). All four are
+        strictly greater, so a queue sitting exactly on its threshold still pulls, and none of the
+        thresholds is clamped -- 0 means "trip on the first cached message". The size gate sums the
+        decoder's ``storeSize`` (the physical backlog this client holds), never the body length.
+
+        A hit re-schedules **this queue's** pull round 50 ms later, counts one trip on its gate's counter
+        and logs; nothing else changes -- no offset is committed, the pull cursor does not move and the
+        messages stay in the buffer. A queue this instance no longer owns is never refused: its
+        accumulator went with the assignment, and a stale one must not stop a pull.
+        """
+        with self._buffer_cond:
+            if mq not in self._assigned:
+                return False
+            cached_total = len(self._local_buffer)
+            stat = self._queue_cache.get(mq)
+            count = stat.count if stat is not None else 0
+            size_mib = (stat.size if stat is not None else 0) // MIB
+            min_offset = stat.min_offset if stat is not None else 0
+            max_offset = stat.max_offset if stat is not None else 0
+            span = stat.span if stat is not None else 0
+        # The counters are only ever tripped by the single pull service thread of this consumer (and by
+        # the tests driving them directly), so a plain increment is enough -- no second lock, which the
+        # buffer lock below must not become.
+        if cached_total > self.pull_threshold_for_all:
+            self._flow_control_for_all_triggered += 1
+            times = self._flow_control_for_all_triggered
+            logger.debug("flow control: queue %s cached=%d exceeds pull_threshold_for_all=%d,"
+                         " pause pull for %.0f ms (flowControlTimes=%d)",
+                         mq, cached_total, self.pull_threshold_for_all,
+                         PULL_TIME_DELAY_WHEN_CACHE_FLOW_CONTROL * 1000, times)
+            if is_flow_control_warn_trip(times):
+                logger.warning("the consume request count exceeds threshold %d, so do flow control,"
+                               " cached=%d, flowControlTimes=%d",
+                               self.pull_threshold_for_all, cached_total, times)
+            return True
+        # The count gate and the size gate share one counter: both say "this queue's own cache is over
+        # its budget", which is the number an operator wants as one total.
+        if count > self.pull_threshold_for_queue:
+            self._flow_control_triggered += 1
+            times = self._flow_control_triggered
+            logger.debug("flow control: queue %s count=%d exceeds pull_threshold_for_queue=%d,"
+                         " pause pull for %.0f ms (flowControlTimes=%d)",
+                         mq, count, self.pull_threshold_for_queue,
+                         PULL_TIME_DELAY_WHEN_CACHE_FLOW_CONTROL * 1000, times)
+            if is_flow_control_warn_trip(times):
+                logger.warning("The cached message count exceeds the threshold %d, so do flow control,"
+                               " minOffset=%d, maxOffset=%d, count=%d, size=%d MiB,"
+                               " flowControlTimes=%d",
+                               self.pull_threshold_for_queue, min_offset, max_offset,
+                               count, size_mib, times)
+            return True
+        if size_mib > self.pull_threshold_size_for_queue:
+            self._flow_control_triggered += 1
+            times = self._flow_control_triggered
+            logger.debug("flow control: queue %s size=%dMiB exceeds pull_threshold_size_for_queue=%d,"
+                         " pause pull for %.0f ms (flowControlTimes=%d)",
+                         mq, size_mib, self.pull_threshold_size_for_queue,
+                         PULL_TIME_DELAY_WHEN_CACHE_FLOW_CONTROL * 1000, times)
+            if is_flow_control_warn_trip(times):
+                logger.warning("The cached message size exceeds the threshold %d MiB, so do flow control,"
+                               " minOffset=%d, maxOffset=%d, count=%d, size=%d MiB,"
+                               " flowControlTimes=%d",
+                               self.pull_threshold_size_for_queue, min_offset, max_offset,
+                               count, size_mib, times)
+            return True
+        if span > self.consume_max_span:
+            self._flow_control_span_triggered += 1
+            times = self._flow_control_span_triggered
+            logger.debug("flow control: queue %s span=%d exceeds consume_max_span=%d,"
+                         " pause pull for %.0f ms (flowControlTimes=%d)",
+                         mq, span, self.consume_max_span,
+                         PULL_TIME_DELAY_WHEN_CACHE_FLOW_CONTROL * 1000, times)
+            if is_flow_control_warn_trip(times):
+                logger.warning("The queue's messages, span too long, so do flow control,"
+                               " minOffset=%d, maxOffset=%d, maxSpan=%d,"
+                               " flowControlTimes=%d",
+                               min_offset, max_offset, span, times)
+            return True
+        return False
+
+    @staticmethod
+    def _cache_key_of(msg: MessageExt) -> MessageQueue:
+        """The queue a cached message belongs to: the same (topic, brokerName, queueId) identity
+        ``poll()`` already maps handed-out messages back by, and ``pull_message`` stamps onto every
+        decoded message. Append and removal therefore agree on one key by construction."""
+        return MessageQueue(msg.topic, msg.broker_name, msg.queue_id)
+
+    def _add_to_buffer_locked(self, msgs: List[MessageExt]) -> None:
+        """The **one** place the local buffer grows: the deque and every touched queue's accumulator move
+        in the same step, under the buffer's own lock, so the counters cannot drift from the buffer."""
+        self._local_buffer.extend(msgs)
+        for msg in msgs:
+            key = self._cache_key_of(msg)
+            stat = self._queue_cache.get(key)
+            if stat is None:
+                stat = _LiteQueueCache()
+                self._queue_cache[key] = stat
+            stat.add(msg)
+
+    def _take_from_buffer_locked(self) -> MessageExt:
+        """The **one** place the local buffer shrinks one message at a time (``poll()`` drains through
+        it): the pop and that message's queue accumulator move together, under the buffer's own lock."""
+        msg = self._local_buffer.popleft()
+        stat = self._queue_cache.get(self._cache_key_of(msg))
+        # A queue revoked earlier has no accumulator left to subtract from; its messages still leave the
+        # buffer exactly the same way (and a stale accumulator could not refuse a pull either).
+        if stat is not None:
+            stat.remove(msg)
+        return msg
+
+    def _drop_queue_cache(self, mq: MessageQueue) -> None:
+        """Forget a revoked queue's cache state: the accumulator goes with the assignment it described,
+        and so does its parking time (a queue this instance no longer owns may never be refused)."""
+        with self._buffer_cond:
+            self._queue_cache.pop(mq, None)
+            self._pull_not_before.pop(mq, None)
+
     def _enqueue(self, msgs: List[MessageExt]) -> None:
         with self._buffer_cond:
-            self._local_buffer.extend(msgs)
+            self._add_to_buffer_locked(msgs)
             self._buffer_cond.notify_all()
 
     def _maybe_auto_commit(self) -> None:
@@ -5211,12 +5539,14 @@ class DefaultLitePullConsumer:
                 self._persist_offset(mq)
                 self._next_offset.pop(mq, None)
                 # The per-queue assignment entries are dropped too: on a queue revoke this port
-                # discards the **entire per-queue state** (pull / consume / seek offsets),
+                # discards the **entire per-queue state** (pull / consume / seek offsets, and with
+                # ``_drop_queue_cache`` the buffer accumulator plus the parking time),
                 # and keeping the seek offset would let this queue silently jump back to a position the user manually
                 # pinned long ago should it return to this instance someday. That in-memory offset slot was already cleared by the persist above.
                 self._consume_offset.pop(mq, None)
                 self._offset_table.pop(mq, None)
                 self._seek_offset.pop(mq, None)
+                self._drop_queue_cache(mq)
             if self._message_queue_listener is not None:
                 try:
                     self._message_queue_listener.message_queue_changed(list(new_set), list(old))
@@ -5238,7 +5568,7 @@ class DefaultLitePullConsumer:
                 self._buffer_cond.wait(remaining)
             out: List[MessageExt] = []
             while self._local_buffer and len(out) < 1024:
-                out.append(self._local_buffer.popleft())
+                out.append(self._take_from_buffer_locked())
         held = {(q.topic, q.broker_name, q.queue_id): q for q in self._next_offset}
         advanced: Dict[MessageQueue, int] = {}
         for m in out:
@@ -5256,10 +5586,21 @@ class DefaultLitePullConsumer:
         self._next_offset[mq] = offset
         self._consume_offset[mq] = offset
         with self._buffer_cond:
-            kept = [m for m in self._local_buffer
-                    if not (m.topic == mq.topic and m.broker_name == mq.broker_name
-                            and m.queue_id == mq.queue_id and m.queue_offset < offset)]
+            kept: List[MessageExt] = []
+            pruned: List[MessageExt] = []
+            for m in self._local_buffer:
+                if (m.topic == mq.topic and m.broker_name == mq.broker_name
+                        and m.queue_id == mq.queue_id and m.queue_offset < offset):
+                    pruned.append(m)
+                else:
+                    kept.append(m)
             self._local_buffer = deque(kept)
+            # The pruning is a buffer removal like any other, so it goes through the same accumulator
+            # bookkeeping: what the gates read afterwards is what the buffer really holds after the seek.
+            for m in pruned:
+                stat = self._queue_cache.get(self._cache_key_of(m))
+                if stat is not None:
+                    stat.remove(m)
 
     def seek_to_begin(self, mq: MessageQueue) -> None:
         self.seek(mq, self._mq_client.get_min_offset(mq))

@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <deque>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -24,6 +25,7 @@
 #include <vector>
 
 #include "rocketmq/client/exception.h"
+#include "rocketmq/client/consumer.h"
 #include "rocketmq/client/lite_pull_consumer.h"
 #include "rocketmq/client/pull_consumer.h"
 #include "rocketmq/client/result.h"
@@ -657,6 +659,434 @@ void testTimestampStartUsesTheConfiguredInstant() {
     c->shutdown();
 }
 
+// ---------------------------------------------------------------- 6. LitePull cache flow control
+
+namespace {
+
+constexpr int64_t kMiB = 1024LL * 1024LL;
+
+MessageQueue queue1() { return MessageQueue(kTopic, kBroker, 1); }
+
+// Build an already-cached MessageExt for the given queue with an explicit storeSize and body.
+// storeSize is what the size gate reads; body length is deliberately independent so a body-length
+// implementation of the gate would give a different verdict (see the size-gate tests).
+MessageExt cachedMsg(int32_t qid, int64_t offset, int32_t storeSize, const std::string& body = "x") {
+    MessageExt m;
+    m.topic = kTopic;
+    m.brokerName = kBroker;
+    m.queueId = qid;
+    m.queueOffset = offset;
+    m.storeSize = storeSize;
+    m.body = body;
+    return m;
+}
+
+std::vector<MessageExt> cachedRun(int32_t qid, int64_t firstOffset, int32_t storeSize, size_t n) {
+    std::vector<MessageExt> out;
+    for (size_t i = 0; i < n; ++i) {
+        out.push_back(cachedMsg(qid, firstOffset + static_cast<int64_t>(i), storeSize));
+    }
+    return out;
+}
+
+// Turn off every gate except the one the case is measuring: the aggregate, count, size and span
+// checks run in this strict order, so a stray sibling trip would mask the branch under test. In the
+// lite path a threshold of 0 is a legal "trip on the first cached message" value, so MAX is the only
+// way to park a gate; 0 would activate it.
+constexpr int32_t kGateOff32 = std::numeric_limits<int32_t>::max();
+constexpr int64_t kGateOff64 = std::numeric_limits<int64_t>::max();
+void liteGates(DefaultLitePullConsumer& c, int32_t queue, int32_t size, int64_t span, int32_t all) {
+    c.setPullThresholdForQueue(queue);
+    c.setPullThresholdSizeForQueue(size);
+    c.setConsumeMaxSpan(span);
+    c.setPullThresholdForAll(all);
+}
+
+// Fresh consumer with a real queue assignment so the accumulator survives the pull-thread prune; not
+// started. Callers then injectCachedForTest() to stage the backlog and use the gate directly, or
+// start() to drive the wire.
+std::unique_ptr<DefaultLitePullConsumer> stagedLite(const std::string& group, MockEndpoint& cluster,
+                                                    const std::vector<MessageQueue>& queues) {
+    auto c = std::make_unique<DefaultLitePullConsumer>(group);
+    c->setNamesrvAddr(cluster.address());
+    c->setConsumeFromWhere(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
+    c->assign(queues);
+    return c;
+}
+
+// Whether any pull request reached the fake broker whose queueId ext field matches.
+bool pullForQueue(MockEndpoint& cluster, int32_t qid) {
+    const size_t n = cluster.pullReqCodeCount();
+    for (size_t i = 0; i < n; ++i) {
+        if (MockEndpoint::extInt(cluster.pullExt(i), "queueId", -1) == qid) return true;
+    }
+    return false;
+}
+
+}  // namespace
+
+// 1. Strict boundary: a queue holding exactly pullThresholdForQueue cached messages still pulls
+// (the request reaches the fake broker); one more message and the round issues **no** request and
+// the recorded pause value is 50 ms.
+void testLiteCacheCountStrictBoundary() {
+    // Positive control: exactly at threshold, the gate returns false directly...
+    {
+        MockEndpoint cluster;
+        cluster.addRoute(kTopic, routeMaster(cluster.address()));
+        auto c = stagedLite("LiteFC_CountAt", cluster, {queue0()});
+        liteGates(*c, /*queue=*/2, /*size=*/kGateOff32, /*span=*/kGateOff64, /*all=*/1000000);
+        c->injectCachedForTest(cachedRun(0, 0, /*storeSize=*/10, /*n=*/2));
+        expect(!c->cacheFlowControlHitForTest(queue0()),
+               "cached count == pullThresholdForQueue is NOT a trip (strictly greater)");
+        expectInt(c->queueFlowControlTimes(), 0, "control: no count-gate counter tick at boundary");
+        // ...and on the wire, the pull really does reach the fake broker.
+        c->start();
+        expect(waitFor([&] { return cluster.pullReqCodeCount() >= 1; }),
+               "at exactly pullThresholdForQueue the request still reaches the broker");
+        expect(c->lastLitePullPauseMillis() == 0,
+               "no pause value recorded on a passing gate");
+        c->shutdown();
+    }
+    // Positive: one more than threshold trips the gate, and the round issues NO request.
+    {
+        MockEndpoint cluster;
+        cluster.addRoute(kTopic, routeMaster(cluster.address()));
+        auto c = stagedLite("LiteFC_CountOver", cluster, {queue0()});
+        liteGates(*c, /*queue=*/2, /*size=*/kGateOff32, /*span=*/kGateOff64, /*all=*/1000000);
+        c->injectCachedForTest(cachedRun(0, 0, /*storeSize=*/10, /*n=*/3));
+        expect(c->cacheFlowControlHitForTest(queue0()),
+               "cached count == pullThresholdForQueue+1 IS a trip");
+        c->start();
+        // Wait until the pull thread has actually run the gate: the recorded pause value proves it.
+        expect(waitFor([&] { return c->lastLitePullPauseMillis() == kPullPauseWhenClientFlowControl; }),
+               "the loop parked the queue with the 50 ms cache-flow-control pause");
+        expect(cluster.pullReqCodeCount() == 0,
+               "no lite pull request was sent on the refused round");
+        expect(!cluster.sawRequest(RequestCode::LITE_PULL_MESSAGE),
+               "the broker never saw a lite pull while the queue is parked");
+        expectInt(c->queueFlowControlTimes(), c->queueFlowControlTimes(),
+                  "smoke: count-gate counter observable");
+        c->shutdown();
+    }
+}
+
+// 2. Per-queue, never summed: a hot queue over its count threshold is refused while a cold sibling
+// queue is still pulled. Symmetrically for the size gate.
+void testLiteCacheCountIsPerQueueNotSummed() {
+    MockEndpoint cluster;
+    cluster.addRoute(kTopic, routeMaster(cluster.address()));
+    auto c = stagedLite("LiteFC_PerQueueCount", cluster, {queue0(), queue1()});
+    liteGates(*c, /*queue=*/1, /*size=*/kGateOff32, /*span=*/kGateOff64, /*all=*/1000000);
+    // Hot queue0 (2 cached), cold queue1 (0 cached): the hot one trips, the sibling must still pull.
+    c->injectCachedForTest(cachedRun(0, 0, /*storeSize=*/10, /*n=*/2));
+    expect(c->cacheFlowControlHitForTest(queue0()),
+           "hot queue is refused by its own count gate");
+    expect(!c->cacheFlowControlHitForTest(queue1()),
+           "cold sibling is NOT refused by its hot sibling's backlog");
+    c->start();
+    expect(waitFor([&] { return pullForQueue(cluster, 1); }),
+           "the cold sibling's request reaches the broker while the hot one is parked");
+    // The park only delays queue0 for this whole test window; the wire never sees queue0's request.
+    expect(!pullForQueue(cluster, 0),
+           "the hot queue0 sends no request while it is parked");
+    c->shutdown();
+}
+
+void testLiteCacheSizeIsPerQueueNotSummed() {
+    MockEndpoint cluster;
+    cluster.addRoute(kTopic, routeMaster(cluster.address()));
+    auto c = stagedLite("LiteFC_PerQueueSize", cluster, {queue0(), queue1()});
+    // Only the size gate is live (count is huge, span is huge, aggregate is huge).
+    liteGates(*c, /*queue=*/kGateOff32, /*size=*/0, /*span=*/kGateOff64, /*all=*/10000000);
+    // Hot queue0 has 2 MiB of store backlog on 1 message; cold queue1 has 0 bytes on 1 message.
+    std::vector<MessageExt> hot;
+    hot.push_back(cachedMsg(0, /*offset=*/0, /*storeSize=*/static_cast<int32_t>(2 * kMiB)));
+    std::vector<MessageExt> cold;
+    cold.push_back(cachedMsg(1, /*offset=*/0, /*storeSize=*/0));
+    c->injectCachedForTest(hot);
+    c->injectCachedForTest(cold);
+    expect(c->cacheFlowControlHitForTest(queue0()),
+           "hot queue is refused by its own size gate");
+    expect(!c->cacheFlowControlHitForTest(queue1()),
+           "cold sibling is NOT refused by its hot sibling's byte backlog");
+    c->start();
+    expect(waitFor([&] { return pullForQueue(cluster, 1); }),
+           "the cold sibling still pulls while the hot queue is parked on size");
+    expect(!pullForQueue(cluster, 0),
+           "the hot queue0 sends no request while it is parked on size");
+    c->shutdown();
+}
+
+// 3. Size gate on stored size (never body length):
+//    - large storeSize + small body → refuse;
+//    - small storeSize + large body → must NOT refuse.
+void testLiteCacheSizeUsesStoreSizeNotBody() {
+    {
+        MockEndpoint cluster;
+        cluster.addRoute(kTopic, routeMaster(cluster.address()));
+        auto c = stagedLite("LiteFC_StoreSize", cluster, {queue0()});
+        liteGates(*c, /*queue=*/kGateOff32, /*size=*/0, /*span=*/kGateOff64, /*all=*/10000000);
+        // storeSize=2 MiB, body 1 byte: a body-length implementation would see 0 bytes and pull.
+        std::vector<MessageExt> bigStoreSmallBody;
+        bigStoreSmallBody.push_back(cachedMsg(0, 0, /*storeSize=*/static_cast<int32_t>(2 * kMiB),
+                                              /*body=*/"x"));
+        c->injectCachedForTest(bigStoreSmallBody);
+        expect(c->cacheFlowControlHitForTest(queue0()),
+               "size gate reads storeSize: large store + tiny body still trips");
+    }
+    {
+        MockEndpoint cluster;
+        cluster.addRoute(kTopic, routeMaster(cluster.address()));
+        auto c = stagedLite("LiteFC_BodySize", cluster, {queue0()});
+        liteGates(*c, /*queue=*/kGateOff32, /*size=*/0, /*span=*/kGateOff64, /*all=*/10000000);
+        // storeSize=1 byte, body 2 MiB: a body-length implementation would see 2 MiB and refuse, but
+        // the gate is about physical backlog -- storeSize is what counts.
+        std::vector<MessageExt> smallStoreBigBody;
+        smallStoreBigBody.push_back(cachedMsg(0, 0, /*storeSize=*/1,
+                                              /*body=*/std::string(static_cast<size_t>(2 * kMiB), 'x')));
+        c->injectCachedForTest(smallStoreBigBody);
+        expect(!c->cacheFlowControlHitForTest(queue0()),
+               "size gate ignores body length: small store + huge body does NOT trip");
+    }
+}
+
+// 4. Integer MiB division on the size gate: a backlog strictly above (threshold+1) MiB refuses, one
+// exactly at threshold MiB pulls, and a backlog whose bytes are below threshold MiB but whose count is
+// fine still pulls.
+void testLiteCacheSizeIntegerMiB() {
+    MockEndpoint cluster;
+    cluster.addRoute(kTopic, routeMaster(cluster.address()));
+    auto c = stagedLite("LiteFC_IntegerMiB", cluster, {queue0()});
+    liteGates(*c, /*queue=*/kGateOff32, /*size=*/1, /*span=*/kGateOff64, /*all=*/10000000);
+
+    // Exactly 1 MiB (== threshold): integer division 1 MiB / 1 MiB = 1; 1 > 1 is false → pulls.
+    {
+        std::vector<MessageExt> at;
+        at.push_back(cachedMsg(0, 0, static_cast<int32_t>(kMiB)));
+        c->injectCachedForTest(at);
+        expect(!c->cacheFlowControlHitForTest(queue0()),
+               "backlog exactly at threshold MiB still pulls");
+        // Drain for the next case.
+        c->poll(100);
+    }
+    // 1.5 MiB: integer division 1 (never rounds up); 1 > 1 false → still pulls.
+    {
+        std::vector<MessageExt> below;
+        below.push_back(cachedMsg(0, 0, static_cast<int32_t>(kMiB + kMiB / 2)));
+        c->injectCachedForTest(below);
+        expect(!c->cacheFlowControlHitForTest(queue0()),
+               "1.5 MiB under integer division reads as 1 MiB: not over threshold 1");
+        c->poll(100);
+    }
+    // 2 MiB (threshold+1): integer division 2 > 1 → refuses.
+    {
+        std::vector<MessageExt> over;
+        over.push_back(cachedMsg(0, 0, static_cast<int32_t>(2 * kMiB)));
+        c->injectCachedForTest(over);
+        expect(c->cacheFlowControlHitForTest(queue0()),
+               "backlog strictly above (threshold+1) MiB refuses");
+    }
+}
+
+// 5. Span gate: exactly consumeMaxSpan pulls, consumeMaxSpan + 1 refuses, and the span is measured
+// over this queue's cached offsets only.
+void testLiteCacheSpanBoundary() {
+    MockEndpoint cluster;
+    cluster.addRoute(kTopic, routeMaster(cluster.address()));
+    auto c = stagedLite("LiteFC_Span", cluster, {queue0(), queue1()});
+    liteGates(*c, /*queue=*/kGateOff32, /*size=*/kGateOff32, /*span=*/100, /*all=*/10000000);
+
+    // Queue0 exactly at maxSpan: offsets 0..100 span=100 → not > 100 → pulls.
+    {
+        std::vector<MessageExt> at;
+        at.push_back(cachedMsg(0, 0, 1));
+        at.push_back(cachedMsg(0, 100, 1));
+        c->injectCachedForTest(at);
+        expect(!c->cacheFlowControlHitForTest(queue0()),
+               "cached span == consumeMaxSpan is NOT a trip (strictly greater)");
+    }
+    // Queue0 consumeMaxSpan+1: offsets 0..101 span=101 → refuses.
+    {
+        std::vector<MessageExt> over;
+        over.push_back(cachedMsg(1, 0, 1));
+        over.push_back(cachedMsg(1, 101, 1));
+        c->injectCachedForTest(over);
+        expect(c->cacheFlowControlHitForTest(queue1()),
+               "cached span == consumeMaxSpan+1 IS a trip");
+        expectInt(c->spanFlowControlTimes(), 1, "the span gate ticks the span counter");
+    }
+    // Per-queue: queue0's span (100) does not stretch queue1's span (101) into a false trip, and
+    // queue1's span does not trip queue0 (which sits exactly at 100). Re-read queue0's verdict.
+    expect(!c->cacheFlowControlHitForTest(queue0()),
+           "span measured on this queue's cached offsets only (sibling does not inflate it)");
+}
+
+// 6. Aggregate gate: total cached across several queues strictly above pullThresholdForAll refuses
+// every queue even though no single queue trips its own count gate; the same total with a larger
+// aggregate budget pulls on every queue.
+void testLiteCacheAggregateSeparateBudget() {
+    MockEndpoint cluster;
+    cluster.addRoute(kTopic, routeMaster(cluster.address()));
+    auto c = stagedLite("LiteFC_Aggregate", cluster, {queue0(), queue1()});
+
+    // Positive: total=4 cached (>2 aggregate) but each queue has 2 (<=2 per-queue). Aggregate trips,
+    // per-queue does not. Prove the aggregate is a separate budget.
+    liteGates(*c, /*queue=*/2, /*size=*/kGateOff32, /*span=*/kGateOff64, /*all=*/2);
+    c->injectCachedForTest(cachedRun(0, 0, 10, 2));
+    c->injectCachedForTest(cachedRun(1, 0, 10, 2));
+    expect(c->cacheFlowControlHitForTest(queue0()),
+           "total cached above pullThresholdForAll refuses every queue (aggregate gate)");
+    expect(c->cacheFlowControlHitForTest(queue1()),
+           "aggregate refusal applies to the sibling queue too");
+    expectInt(c->aggregateFlowControlTimes(), 2, "aggregate gate ticks only the aggregate counter");
+    expectInt(c->queueFlowControlTimes(), 0, "aggregate trips do NOT tick the count/size counter");
+
+    // Control: bump the aggregate budget above the total, per-queue count unchanged. No trip at all.
+    c->setPullThresholdForAll(100);
+    expect(!c->cacheFlowControlHitForTest(queue0()),
+           "same backlog: with aggregate above the total and per-queue on the boundary, no trip");
+    expect(!c->cacheFlowControlHitForTest(queue1()),
+           "control: sibling queue likewise passes when aggregate is a separate larger budget");
+}
+
+// 7. Counters + cadence: one refusal per gate, and the warn fires on trips 1 and 1001 while trip
+// 1000 is debug-only -- the shared isFlowControlWarnTrip rule the push path and POP gate already use.
+void testLiteCacheCounterCadenceSharedRule() {
+    // Rule itself: trips 1, 1001, 2001 warn; trip 1000 does not. Same predicate every flow-control
+    // path in this port already shares (the push pull path and the POP wait-ack path).
+    expect(isFlowControlWarnTrip(1), "trip 1 warns (control)");
+    expect(!isFlowControlWarnTrip(1000), "trip 1000 is debug-only");
+    expect(isFlowControlWarnTrip(1001), "trip 1001 warns again");
+
+    MockEndpoint cluster;
+    cluster.addRoute(kTopic, routeMaster(cluster.address()));
+    auto c = stagedLite("LiteFC_Counter", cluster, {queue0(), queue1()});
+
+    // Count gate: drive exactly 1001 refusals and pin the counter.
+    liteGates(*c, /*queue=*/0, /*size=*/kGateOff32, /*span=*/kGateOff64, /*all=*/10000000);
+    c->injectCachedForTest(cachedRun(0, 0, 10, /*n=*/1));
+    for (int i = 0; i < 1001; ++i) {
+        expect(c->cacheFlowControlHitForTest(queue0()), "count-gate refusal fires every round");
+    }
+    expectInt(c->queueFlowControlTimes(), 1001,
+              "count gate ticks its shared counter once per refusal, cadence rule is on 1/1001");
+
+    // Size gate shares the same counter as count: reset by driving a fresh consumer.
+    MockEndpoint cluster2;
+    cluster2.addRoute(kTopic, routeMaster(cluster2.address()));
+    auto c2 = stagedLite("LiteFC_CounterSize", cluster2, {queue0()});
+    liteGates(*c2, /*queue=*/kGateOff32, /*size=*/0, /*span=*/kGateOff64, /*all=*/10000000);
+    std::vector<MessageExt> big;
+    big.push_back(cachedMsg(0, 0, static_cast<int32_t>(2 * kMiB)));
+    c2->injectCachedForTest(big);
+    expect(c2->cacheFlowControlHitForTest(queue0()), "size-gate refusal fires once");
+    expectInt(c2->queueFlowControlTimes(), 1,
+              "size gate shares the count+size counter (not a new one)");
+
+    // Aggregate + span counters are separate.
+    MockEndpoint cluster3;
+    cluster3.addRoute(kTopic, routeMaster(cluster3.address()));
+    auto c3 = stagedLite("LiteFC_CounterAgg", cluster3, {queue0()});
+    liteGates(*c3, /*queue=*/kGateOff32, /*size=*/kGateOff32, /*span=*/kGateOff64, /*all=*/0);
+    c3->injectCachedForTest(cachedRun(0, 0, 10, /*n=*/1));
+    expect(c3->cacheFlowControlHitForTest(queue0()), "aggregate gate fires (pullThresholdForAll=0)");
+    expectInt(c3->aggregateFlowControlTimes(), 1, "aggregate counter ticks independently");
+
+    MockEndpoint cluster4;
+    cluster4.addRoute(kTopic, routeMaster(cluster4.address()));
+    auto c4 = stagedLite("LiteFC_CounterSpan", cluster4, {queue0()});
+    liteGates(*c4, /*queue=*/kGateOff32, /*size=*/kGateOff32, /*span=*/0, /*all=*/10000000);
+    std::vector<MessageExt> two;
+    two.push_back(cachedMsg(0, 0, 10));
+    two.push_back(cachedMsg(0, 2000, 10));
+    c4->injectCachedForTest(two);
+    expect(c4->cacheFlowControlHitForTest(queue0()), "span gate fires");
+    expectInt(c4->spanFlowControlTimes(), 1, "span counter ticks independently");
+    expectInt(c4->queueFlowControlTimes(), 0,
+              "span trip does NOT touch the count+size counter");
+}
+
+// 8. 215 short pause: a lite pull answered FLOW_CONTROL(215) records the 20 ms pause; SYSTEM_BUSY
+// (or any other unmapped code) keeps the port's existing error handling (no pause recorded here,
+// the loop's idle backoff is unchanged).
+void testLiteBrokerFlowControlTwentyMillis() {
+    // Positive: 215 re-schedules in 20 ms.
+    {
+        MockEndpoint cluster;
+        cluster.addRoute(kTopic, routeMaster(cluster.address()));
+        cluster.scriptPull(ResponseCode::FLOW_CONTROL, pullResp(0));
+        auto c = std::make_unique<DefaultLitePullConsumer>("LiteFC_BrokerFlow215");
+        c->setNamesrvAddr(cluster.address());
+        c->setConsumeFromWhere(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
+        c->assign({queue0()});
+        c->start();
+        expect(waitFor([&] { return c->lastLitePullPauseMillis() == kPullPauseWhenBrokerFlowControl; }),
+               "FLOW_CONTROL(215) records a 20 ms pause on the lite path");
+        expectInt(DefaultMQPushConsumer::pullPauseMillisFor(ResponseCode::FLOW_CONTROL), 20,
+                  "the value is the push path's shared kPullPauseWhenBrokerFlowControl, not a new constant");
+        c->shutdown();
+    }
+    // Control: SYSTEM_BUSY (a different unmapped code) keeps the port's error handling -- the pause
+    // observer is never rewritten, and the shared mapping still resolves to the pull-error backoff.
+    {
+        MockEndpoint cluster;
+        cluster.addRoute(kTopic, routeMaster(cluster.address()));
+        cluster.scriptPull(ResponseCode::SYSTEM_BUSY, pullResp(0));
+        auto c = std::make_unique<DefaultLitePullConsumer>("LiteFC_BrokerSystemBusy");
+        c->setNamesrvAddr(cluster.address());
+        c->setConsumeFromWhere(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
+        c->assign({queue0()});
+        c->start();
+        // Wait until the pull reached the broker (so we know the answer fired).
+        expect(waitFor([&] { return cluster.pullReqCodeCount() >= 1; }),
+               "SYSTEM_BUSY pull reached the fake broker");
+        expect(c->lastLitePullPauseMillis() == 0,
+               "SYSTEM_BUSY does NOT rewrite the lite pause observer (keeps existing error backoff)");
+        expectInt(DefaultMQPushConsumer::pullPauseMillisFor(ResponseCode::SYSTEM_BUSY),
+                  kPullPauseWhenPullError,
+                  "the shared mapping still routes SYSTEM_BUSY to the pull-error pause (unchanged)");
+        c->shutdown();
+    }
+}
+
+// 9. Shutdown escape: a queue parked on a cache gate still stops promptly when the consumer shuts
+// down -- the loop's own backoff sleep is bounded, so the join finishes without waiting on the park.
+void testLiteShutdownWithParkedQueue() {
+    MockEndpoint cluster;
+    cluster.addRoute(kTopic, routeMaster(cluster.address()));
+    auto c = stagedLite("LiteFC_Shutdown", cluster, {queue0()});
+    liteGates(*c, /*queue=*/0, /*size=*/kGateOff32, /*span=*/kGateOff64, /*all=*/10000000);
+    c->injectCachedForTest(cachedRun(0, 0, 10, /*n=*/1));
+    c->start();
+    // Wait for the loop to hit the gate (an armed park / recorded pause value).
+    expect(waitFor([&] { return c->lastLitePullPauseMillis() == kPullPauseWhenClientFlowControl; }),
+           "park is armed before shutdown is attempted");
+    c->shutdown();
+    expect(!c->isRunning(), "shutdown while a queue is parked leaves the loop stopped");
+    expect(!c->isStarted(), "shutdown while a queue is parked leaves started_ cleared");
+}
+
+// Recovery (contract's deadlock guard): after the app polls the buffer dry, the next round must pull
+// again -- the refusal is only ever a park, not a permanent hold.
+void testLiteGateRecoveryAfterPollDrain() {
+    MockEndpoint cluster;
+    cluster.addRoute(kTopic, routeMaster(cluster.address()));
+    auto c = stagedLite("LiteFC_Recovery", cluster, {queue0()});
+    liteGates(*c, /*queue=*/0, /*size=*/kGateOff32, /*span=*/kGateOff64, /*all=*/10000000);
+    c->injectCachedForTest(cachedRun(0, 0, 10, /*n=*/1));
+    c->start();
+    expect(waitFor([&] { return c->lastLitePullPauseMillis() == kPullPauseWhenClientFlowControl; }),
+           "precondition: the loop parked the queue on the count gate");
+    expect(!pullForQueue(cluster, 0),
+           "control: no pull reached the broker while the queue was parked");
+    // Drain the buffer -- the accumulator goes to zero (count=0), so the next round passes the gate.
+    auto drained = c->poll(200);
+    expect(drained.size() == 1, "the drained message left the local buffer");
+    expect(waitFor([&] { return pullForQueue(cluster, 0); }),
+           "recovery: the next round pulls again once the accumulator is drained (no deadlock)");
+    c->shutdown();
+}
+
 }  // namespace
 
 int main() {
@@ -666,6 +1096,17 @@ int main() {
     testLitePullCarriesTheLiteCodeAndFlag();
     testLastStartSkipsTheBacklogExceptOnTheRetryQueue();
     testTimestampStartUsesTheConfiguredInstant();
+    testLiteCacheCountStrictBoundary();
+    testLiteCacheCountIsPerQueueNotSummed();
+    testLiteCacheSizeIsPerQueueNotSummed();
+    testLiteCacheSizeUsesStoreSizeNotBody();
+    testLiteCacheSizeIntegerMiB();
+    testLiteCacheSpanBoundary();
+    testLiteCacheAggregateSeparateBudget();
+    testLiteCacheCounterCadenceSharedRule();
+    testLiteBrokerFlowControlTwentyMillis();
+    testLiteShutdownWithParkedQueue();
+    testLiteGateRecoveryAfterPollDrain();
     std::printf("lite_pull_cursor: %d checks, %d failed\n", checks, fails);
     return fails == 0 ? 0 : 1;
 }

@@ -12,23 +12,28 @@
 # The POP path's cache gate (this queue's wait-ack debt against ``pop_threshold_for_queue``) is locked here too:
 # it compares the same way, judges only its own queue, and counts on the **same** flow-control counter as the pull
 # path, so one client-wide total and one warn cadence span both paths.
+# The LitePull path gets its own section at the bottom: four budgets over one shared local buffer (three per queue
+# plus a whole-buffer aggregate), per-queue accumulators that must stay in step with that buffer, and a single round
+# loop that walks every assigned queue -- so a parked queue must never delay its siblings.
 # For the real-machine side, "no message is lost after a gate hits", see ../verify_flow_control_live.py.
 import inspect
 import threading
 import time
 
 from client import consumer as consumer_mod
-from client.consumer import (DefaultMQPushConsumer, PopProcessQueue,
+from client.consumer import (DefaultLitePullConsumer, DefaultMQPushConsumer, PopProcessQueue,
                              FLOW_CONTROL_WARN_EVERY_N_TRIPS,
                              PULL_TIME_DELAY_WHEN_BROKER_FLOW_CONTROL,
                              PULL_TIME_DELAY_WHEN_CACHE_FLOW_CONTROL,
                              PULL_TIME_DELAY_WHEN_EXCEPTION,
                              is_flow_control_warn_trip)
+from client.consumer_result import PullResult, PullStatus
 from client.exception import MQBrokerException
 from common.message import MessageExt, MessageQueue
 from common.subscription_data import SubscriptionData
 from remoting.protocol.codes import ResponseCode
 from remoting.protocol.heartbeat import MessageModel
+from tests.test_lite_pull_consumer import _Lite
 
 TOPIC = "FlowControlPyUnitTopic"
 BROKER = "broker-a"
@@ -685,4 +690,690 @@ def test_pop_debt_at_the_threshold_pops_instead_of_stalling(monkeypatch):
                          [RuntimeError("socket reset")], c, mq, key, setup=_setup)
     assert delays == [PULL_TIME_DELAY_WHEN_EXCEPTION], delays
     assert c._flow_control_triggered == 0
+
+
+# ================================ The LitePull path: four budgets over one shared local buffer ================================
+# The LitePull consumer runs a background pull that feeds **one** global buffer drained only by poll(), so an
+# application that polls slowly -- or never -- grows that buffer without bound. Four gates refuse the pull before
+# it is issued (a whole-buffer aggregate plus this queue's count / MiB / offset span) and re-schedule **that
+# queue's** next round 50 ms later. What makes this path its own case, rather than a copy of the push gates:
+#   * the per-queue verdict comes from incremental accumulators that must stay in step with a shared container
+#     through append, poll, seek and queue revocation;
+#   * the round loop is a single thread walking every assigned queue, so parking one queue must not delay a
+#     sibling, and a refusal must keep the request away from the broker entirely;
+#   * all four budgets are plain numbers: compared strictly greater, never clamped, so 0 legally means "trip on
+#     the first cached message" rather than "this gate is off".
+# The size gate divides by whole MiB and sums the decoder's storeSize, never the body length; the span gate reads
+# only this queue's own cached offsets. Broker FLOW_CONTROL(215) on this path is a 20 ms re-schedule, not an error.
+
+LITE_TOPIC = "LiteFlowControlPyUnitTopic"
+# "This budget is out of the way": only the gate under test gets a reachable threshold.
+OUT_OF_REACH = 2 ** 31 - 1
+# One poll() hand-out is capped, which is what leaves a real partial buffer behind for the gates to keep
+# refusing: the number is the cap in poll(), and the case below pins it so the two cannot drift apart.
+POLL_BATCH_LIMIT = 1024
+
+
+def _lite_mq(queue_id=0, topic=LITE_TOPIC):
+    return MessageQueue(topic=topic, broker_name=BROKER, queue_id=queue_id)
+
+
+def _lite_msg(store_size, queue_offset, body_size=1, queue_id=0, topic=LITE_TOPIC):
+    """A message as the lite buffer sees it: the storeSize and the queueOffset the accumulators read, and a
+    body length chosen **independently** of both, so the two can never be confused by the size gate."""
+    m = MessageExt(topic=topic, body=b"y" * body_size)
+    m.broker_name = BROKER
+    m.queue_id = queue_id
+    m.queue_offset = queue_offset
+    m.store_size = store_size
+    return m
+
+
+def _lite_consumer(group, *mqs):
+    """An assigned-but-never-started LitePull consumer: no thread and no socket, and the gates read exactly
+    what the shared local buffer holds. ``assign()`` is what makes the queues owned, which is what the gates
+    judge -- the same path a live consumer takes."""
+    c = DefaultLitePullConsumer(group)
+    c.set_auto_commit(False)
+    if mqs:
+        c.assign(list(mqs))
+    return c
+
+
+def _lite_gates_off(c):
+    """Turn every budget but the one under test out of reach: an earlier gate would mask that branch."""
+    c.pull_threshold_for_all = OUT_OF_REACH
+    c.pull_threshold_for_queue = OUT_OF_REACH
+    c.pull_threshold_size_for_queue = OUT_OF_REACH
+    c.consume_max_span = OUT_OF_REACH
+
+
+def _lite_cache(c, msgs):
+    """Fill the local buffer through the real append path, so the accumulators under test are the ones the
+    production pull uses -- not a test-only fixture the buffer could drift away from."""
+    c._enqueue(msgs)
+    return c
+
+
+def _lite_with_backlog(group, msgs, queue_id=0):
+    """A consumer owning one queue that already caches ``msgs``."""
+    mq = _lite_mq(queue_id)
+    c = _lite_consumer(group, mq)
+    _lite_gates_off(c)
+    _lite_cache(c, msgs)
+    return c, mq
+
+
+def _lite_hit(c, mq):
+    return c._cache_flow_control_hit(mq)
+
+
+def _lite_warns(caplog):
+    return [r.getMessage() for r in caplog.records
+            if r.levelname == "WARNING" and "flow control" in r.getMessage()]
+
+
+def _lite_debugs(caplog):
+    return [r.getMessage() for r in caplog.records
+            if r.levelname == "DEBUG" and "flow control" in r.getMessage()]
+
+
+class _ScriptedLiteClient(object):
+    """Only what the lite round loop calls, with a record of every request and two ways to answer badly.
+
+    A script entry is either a PullResult or an exception raised "from inside the request"; once the script is
+    exhausted the queue tail answers NO_NEW_MSG, which changes nothing but the round's idle backoff. The
+    round walks the assigned queues in no particular order, so a case that needs one named queue to fail names
+    it in ``error_on_queue`` instead of relying on the script position.
+    """
+
+    def __init__(self, answers=(), error_on_queue=None):
+        self._answers = list(answers)
+        self._error_queue_id, self._error = error_on_queue if error_on_queue else (None, None)
+        self.requests = []
+
+    def pull_message(self, consumer_group, mq, queue_offset, max_msg_nums, sys_flag,
+                     commit_offset, subscription, sub_version, expression_type,
+                     timeout_millis=30000, max_msg_bytes=-1, suspend_timeout_millis=15000,
+                     addr=None, request_source=0):
+        self.requests.append((mq.queue_id, queue_offset))
+        if self._error is not None and mq.queue_id == self._error_queue_id:
+            error = self._error
+            self._error = None
+            raise error
+        if not self._answers:
+            return PullResult(PullStatus.NO_NEW_MSG, queue_offset, 0, 0, [])
+        answer = self._answers.pop(0)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+
+def _lite_round_consumer(group, mqs, answers=(), error_on_queue=None):
+    """A LitePull consumer the **real** round loop drives.
+
+    Assign mode (so the round does not rebalance) with the pull cursors pinned: nothing resolves an offset over
+    the wire except the scripted pulls, and the idle backoff is 500 ms so it can never be mistaken for the
+    50 ms cache pause.
+    """
+    c = _lite_consumer(group, *mqs)
+    for mq in mqs:
+        c._next_offset[mq] = 0
+    c.set_pull_interval_millis(500)
+    client = _ScriptedLiteClient(answers, error_on_queue)
+    c._mq_client = client
+    return c, client
+
+
+def _drive_lite_rounds(monkeypatch, c, rounds, on_round_end=None):
+    """Run ``_pull_service_loop`` for ``rounds`` rounds on a virtual clock and return the recorded pauses.
+
+    Every pause the loop takes is recorded **and paid** by advancing the virtual clock, so these cases assert
+    on the scheduled delay instead of sleeping: the loop stops once the requested number of rounds is done,
+    never on a wall-clock window.
+    """
+    sleeps = []
+    real_time = time
+
+    class _VirtualTime(object):
+        # The clock starts at exactly zero: every scheduled pause is then a difference of two small doubles, so
+        # the recorded sleeps compare to the constants bit for bit instead of drifting on a large base.
+        def __init__(self):
+            self.now = 0.0
+
+        def __getattr__(self, name):
+            return getattr(real_time, name)
+
+        def time(self):
+            return self.now
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            sleeps.append(seconds)
+            self.now += seconds
+            if len(sleeps) >= rounds:
+                c._running = False
+            elif on_round_end is not None:
+                on_round_end()
+
+    c._running = True
+    monkeypatch.setattr(consumer_mod, "time", _VirtualTime())
+    try:
+        c._pull_service_loop()
+    finally:
+        c._running = False
+    return sleeps
+
+
+# ---------------- the four knobs, their setters/getters and the strict boundaries ----------------
+
+def test_lite_knob_defaults_are_the_four_budgets():
+    c = DefaultLitePullConsumer("G_lite_knob_defaults")
+    assert c.pull_threshold_for_all == 10000
+    assert c.pull_threshold_for_queue == 1000
+    assert c.pull_threshold_size_for_queue == 100
+    assert c.consume_max_span == 2000
+    # Nothing cached at all is under every budget: the gates must not refuse the first pull of a queue.
+    mq = _lite_mq()
+    c.assign([mq])
+    assert not _lite_hit(c, mq)
+    assert (c._flow_control_for_all_triggered, c._flow_control_triggered,
+            c._flow_control_span_triggered) == (0, 0, 0)
+
+
+def test_lite_knob_setters_and_getters_round_trip_without_clamping():
+    c = DefaultLitePullConsumer("G_lite_knob_setters")
+    c.set_pull_threshold_for_all(500)
+    c.set_pull_threshold_for_queue(0)
+    c.set_pull_threshold_size_for_queue(3)
+    c.set_consume_max_span(0)
+    assert c.get_pull_threshold_for_all() == 500
+    assert c.get_pull_threshold_for_queue() == 0
+    assert c.get_pull_threshold_size_for_queue() == 3
+    assert c.get_consume_max_span() == 0
+    assert (c.pull_threshold_for_queue, c.consume_max_span) == (0, 0), \
+        "a zero budget is a legal configuration, so the setters must not clamp it to 1"
+
+
+def test_lite_count_gate_is_strictly_greater_and_zero_trips_on_the_first_message():
+    c, mq = _lite_with_backlog("G_lite_count", [_lite_msg(100, i) for i in range(2)])
+    c.pull_threshold_for_queue = 3
+    assert not _lite_hit(c, mq)
+    # Exactly AT the threshold still pulls (>, not >=).
+    _lite_cache(c, [_lite_msg(100, 2)])
+    assert not _lite_hit(c, mq), "3 cached at a threshold of 3 must not hit (>, not >=)"
+    # One more message and this round is refused.
+    _lite_cache(c, [_lite_msg(100, 3)])
+    assert _lite_hit(c, mq)
+    assert c._flow_control_triggered == 1
+    # 0 is "trip on the first cached message", not "gate off" -- the paired control is the empty cache
+    # above, which a zero budget must still let pull.
+    zero, zmq = _lite_with_backlog("G_lite_count_zero", [_lite_msg(100, 0)])
+    zero.pull_threshold_for_queue = 0
+    assert _lite_hit(zero, zmq), "pull_threshold_for_queue=0 must trip on the first cached message"
+    empty = _lite_consumer("G_lite_count_zero_control", zmq)
+    empty.pull_threshold_for_queue = 0
+    assert not _lite_hit(empty, zmq), "an empty cache is not yet over a zero budget"
+
+
+def test_lite_size_gate_measures_stored_size_not_the_body_length():
+    # A 10-byte body inside a 2 MiB store record: what the client physically holds is 2 MiB, so the gate
+    # refuses. A body-length implementation would read ~0 MiB here and let the backlog grow forever.
+    big, big_mq = _lite_with_backlog("G_lite_size_store",
+                                     [_lite_msg(2 * MIB, 0, body_size=10)])
+    big.pull_threshold_size_for_queue = 1
+    assert _lite_hit(big, big_mq), "the size gate must count storeSize, not the body"
+
+
+def test_lite_size_gate_ignores_a_large_body_in_a_small_store_record():
+    # Paired control: 1 MiB of body inside a 1 KiB store record. Counted by body length this is 2 MiB over a
+    # 1 MiB threshold and the queue would be refused; counted by storeSize it is 2 KiB, so it keeps pulling.
+    small, small_mq = _lite_with_backlog("G_lite_size_store_control",
+                                         [_lite_msg(1024, i, body_size=MIB) for i in range(2)])
+    small.pull_threshold_size_for_queue = 1
+    assert not _lite_hit(small, small_mq)
+    assert small._flow_control_triggered == 0
+
+
+def test_lite_size_gate_divides_by_whole_mib_with_integer_division():
+    for store_size, expected in ((MIB - 1, False), (MIB, False),
+                                 (MIB + 1, False), (2 * MIB, True), (2 * MIB + 1, True)):
+        c, mq = _lite_with_backlog("G_lite_size_divide", [_lite_msg(store_size, 0)])
+        c.pull_threshold_size_for_queue = 1
+        assert _lite_hit(c, mq) is expected, "%d bytes must divide to %s a 1 MiB budget" % (
+            store_size, "refuse" if expected else "pull")
+    # A partially filled MiB never counts as one: 3 x 300 KiB is 900 KiB, still 0 MiB.
+    c, mq = _lite_with_backlog("G_lite_size_divide_partial",
+                               [_lite_msg(300 * 1024, i) for i in range(3)])
+    c.pull_threshold_size_for_queue = 1
+    assert not _lite_hit(c, mq)
+
+
+def test_lite_span_gate_is_strictly_greater_and_measures_this_queue_only():
+    at, at_mq = _lite_with_backlog("G_lite_span_at",
+                                   [_lite_msg(1, 0), _lite_msg(1, 10)])
+    at.consume_max_span = 10
+    assert not _lite_hit(at, at_mq), "a span of exactly 10 at a max span of 10 still pulls (>, not >=)"
+    over, over_mq = _lite_with_backlog("G_lite_span_over",
+                                       [_lite_msg(1, 0), _lite_msg(1, 11)])
+    over.consume_max_span = 10
+    assert _lite_hit(over, over_mq)
+    assert over._flow_control_span_triggered == 1
+    assert over._flow_control_triggered == 0, "the span gate has a counter of its own"
+    # An out-of-order buffer measures the real span (max - min), not the first-last difference.
+    shuffled, shuffled_mq = _lite_with_backlog("G_lite_span_order",
+                                               [_lite_msg(1, 50), _lite_msg(1, 5), _lite_msg(1, 7)])
+    shuffled.consume_max_span = 10
+    assert _lite_hit(shuffled, shuffled_mq), "an out-of-order cache must measure span as max-min"
+    # A single cached message has span 0, so a zero budget still lets the first one through.
+    single, single_mq = _lite_with_backlog("G_lite_span_single", [_lite_msg(1, 5000)])
+    single.consume_max_span = 0
+    assert not _lite_hit(single, single_mq), "one cached message spans 0"
+    _lite_cache(single, [_lite_msg(1, 5001)])
+    assert _lite_hit(single, single_mq), "two cached messages span 1, which is over a zero budget"
+    # The span is this queue's: a sibling holding 0..1000 does not widen it.
+    hot = _lite_mq(0)
+    wild = _lite_mq(1)
+    c = _lite_consumer("G_lite_span_sibling", hot, wild)
+    _lite_gates_off(c)
+    c.consume_max_span = 10
+    _lite_cache(c, [_lite_msg(1, 0, queue_id=1), _lite_msg(1, 1000, queue_id=1),
+                    _lite_msg(1, 4, queue_id=0), _lite_msg(1, 7, queue_id=0)])
+    assert not _lite_hit(c, hot), "a sibling queue's offset window must not stop this queue"
+    assert _lite_hit(c, wild)
+
+
+def test_lite_aggregate_gate_refuses_every_queue_once_the_buffer_is_over_budget():
+    queues = [_lite_mq(i) for i in range(4)]
+    c = _lite_consumer("G_lite_all", *queues)
+    _lite_gates_off(c)
+    c.pull_threshold_for_all = 5
+    # Two messages per queue: no queue is anywhere near its own count budget, but 8 in the shared buffer
+    # are over the 5-message aggregate budget, so every queue is refused.
+    _lite_cache(c, [_lite_msg(100, j, queue_id=i) for i in range(4) for j in range(2)])
+    for mq in queues:
+        assert _lite_hit(c, mq), "the aggregate budget is instance-wide: it refuses every queue"
+    assert c._flow_control_for_all_triggered == 4
+    assert c._flow_control_triggered == 0, "the aggregate gate has a counter of its own"
+
+
+def test_lite_aggregate_budget_is_separate_from_the_per_queue_budgets():
+    queues = [_lite_mq(i) for i in range(4)]
+    # Paired control on the same buffers: raise only the aggregate budget to exactly the total and nothing is
+    # refused, which is what makes the aggregate a budget of its own rather than a re-reading of the per-queue
+    # ones. And it is strictly greater, so a total sitting ON the budget still pulls.
+    c = _lite_consumer("G_lite_all_control", *queues)
+    _lite_gates_off(c)
+    c.pull_threshold_for_all = 8
+    _lite_cache(c, [_lite_msg(100, j, queue_id=i) for i in range(4) for j in range(2)])
+    for mq in queues:
+        assert not _lite_hit(c, mq), "8 cached at an aggregate budget of 8 still pulls (>, not >=)"
+    assert c._flow_control_for_all_triggered == 0
+    # One queue over its own count budget while the total stays under the aggregate: only that queue is
+    # refused, and on the per-queue counter.
+    c2 = _lite_consumer("G_lite_all_split", *queues)
+    _lite_gates_off(c2)
+    c2.pull_threshold_for_all = 8
+    c2.pull_threshold_for_queue = 1
+    _lite_cache(c2, [_lite_msg(100, j, queue_id=0) for j in range(3)])
+    assert _lite_hit(c2, queues[0]), "3 cached over a per-queue budget of 1 must refuse that queue"
+    for mq in queues[1:]:
+        assert not _lite_hit(c2, mq)
+    assert c2._flow_control_for_all_triggered == 0
+    assert c2._flow_control_triggered == 1
+
+
+def test_lite_gates_are_judged_in_the_contract_order_with_one_trip_per_refusal():
+    # The aggregate goes first: a queue over both the aggregate and its own count budget ticks the
+    # aggregate counter only.
+    mq = _lite_mq()
+    c = _lite_consumer("G_lite_order_all", mq)
+    c.pull_threshold_for_all = 1
+    c.pull_threshold_for_queue = 0
+    _lite_cache(c, [_lite_msg(100, 0), _lite_msg(100, 1)])
+    assert _lite_hit(c, mq)
+    assert c._flow_control_for_all_triggered == 1
+    assert c._flow_control_triggered == 0
+    # Then the count, then the size, then the span: a queue over all three of the per-queue budgets ticks
+    # exactly one counter, and it is the count one.
+    c2, mq2 = _lite_with_backlog("G_lite_order_rest",
+                                 [_lite_msg(2 * MIB, 0), _lite_msg(2 * MIB, 100)])
+    c2.pull_threshold_for_queue = 1
+    c2.pull_threshold_size_for_queue = 1
+    c2.consume_max_span = 10
+    assert _lite_hit(c2, mq2)
+    assert (c2._flow_control_triggered, c2._flow_control_span_triggered) == (1, 0)
+    # With the count gate lifted the same buffer is judged by the size gate, which shares that counter.
+    c3, mq3 = _lite_with_backlog("G_lite_order_size",
+                                 [_lite_msg(2 * MIB, 0), _lite_msg(2 * MIB, 100)])
+    c3.pull_threshold_size_for_queue = 1
+    c3.consume_max_span = 10
+    assert _lite_hit(c3, mq3)
+    assert (c3._flow_control_triggered, c3._flow_control_span_triggered) == (1, 0)
+
+
+def test_lite_unassigned_and_revoked_queues_are_never_refused_by_a_stale_accumulator():
+    hot = _lite_mq(0)
+    other = _lite_mq(1)
+    c = _lite_consumer("G_lite_revoke", hot, other)
+    _lite_gates_off(c)
+    c.pull_threshold_for_queue = 0
+    _lite_cache(c, [_lite_msg(100, 0, queue_id=0)])
+    assert _lite_hit(c, hot)
+    # Reassigning takes the queue away, and its accumulator goes with the assignment it described.
+    c.assign([other])
+    assert hot not in c._queue_cache, "a revoked queue must not keep cache state behind"
+    assert _lite_hit(c, hot) is False, "a stale accumulator of a queue nobody owns must never refuse"
+    assert c._cache_flow_control_hit(_lite_mq(7)) is False
+    assert c._flow_control_triggered == 1, "only the live trip counts; the stale state adds nothing"
+
+
+# ---------------- the accumulators must not be able to drift from the shared buffer ----------------
+
+def test_lite_accumulators_stay_in_step_with_the_buffer_through_append_poll_and_seek():
+    q0 = _lite_mq(0)
+    q1 = _lite_mq(1)
+    c = _lite_consumer("G_lite_consistency", q0, q1)
+    _lite_gates_off(c)
+    _lite_cache(c, [_lite_msg(1000, 0, queue_id=0),
+                    _lite_msg(2000, 5, queue_id=1),
+                    _lite_msg(3000, 6, queue_id=1)])
+    assert (c._queue_cache[q0].count, c._queue_cache[q0].size) == (1, 1000)
+    assert (c._queue_cache[q1].count, c._queue_cache[q1].size, c._queue_cache[q1].span) == (2, 5000, 1)
+    assert sum(s.count for s in c._queue_cache.values()) == len(c._local_buffer)
+
+    # poll() hands messages out; the same step subtracts them, so the gate reads what is left.
+    handed = c.poll(timeout=0)
+    assert [m.queue_id for m in handed] == [0, 1, 1]
+    assert len(c._local_buffer) == 0
+    assert sum(s.count for s in c._queue_cache.values()) == 0
+    assert (c._queue_cache[q1].size, c._queue_cache[q1].span) == (0, 0), \
+        "an emptied queue must read as nothing cached, not as the boundaries of the drained messages"
+
+    # A partial drain leaves exactly the remainder counted.
+    _lite_cache(c, [_lite_msg(1000, off, queue_id=0) for off in (0, 4, 9)])
+    assert c._queue_cache[q0].span == 9
+    c._local_buffer.appendleft(_lite_msg(7, 99, queue_id=1))   # one message of the sibling ahead of them
+    drained = c.poll(timeout=0)
+    assert len(drained) == 4
+    assert sum(s.count for s in c._queue_cache.values()) == len(c._local_buffer) == 0
+
+    # seek() prunes the buffer, so it prunes the counters with it.
+    _lite_cache(c, [_lite_msg(1000, off, queue_id=0) for off in (0, 4, 9)])
+    c.seek(q0, 5)
+    assert c._queue_cache[q0].count == 1
+    assert (c._queue_cache[q0].min_offset, c._queue_cache[q0].max_offset) == (9, 9)
+    assert c._queue_cache[q0].size == 1000
+    assert sum(s.count for s in c._queue_cache.values()) == len(c._local_buffer) == 1
+
+
+def test_lite_gates_refuse_a_partially_polled_buffer_and_recover_once_it_is_dry():
+    # poll() hands the application at most POLL_BATCH_LIMIT messages, so a slow consumer leaves a real partial
+    # buffer behind: the gate must follow what is still cached, round after round, and stop refusing the moment
+    # the buffer is dry -- it stalls a slow application, it never deadlocks the consumer.
+    mq = _lite_mq()
+    c = _lite_consumer("G_lite_drain_recovers", mq)
+    _lite_gates_off(c)
+    c.pull_threshold_for_queue = 2
+    backlog = POLL_BATCH_LIMIT + 76
+    _lite_cache(c, [_lite_msg(100, i) for i in range(backlog)])
+    assert _lite_hit(c, mq)
+    first = c.poll(timeout=0)
+    assert len(first) == POLL_BATCH_LIMIT, "poll caps one hand-out, the rest stays cached"
+    assert len(c._local_buffer) == backlog - POLL_BATCH_LIMIT
+    assert c._queue_cache[mq].count == len(c._local_buffer)
+    assert _lite_hit(c, mq), "a partially drained queue is still over its budget, so it stays refused"
+    while c._local_buffer:                  # the application catches up: every hand-out is subtracted
+        assert _lite_hit(c, mq) is (c._queue_cache[mq].count > 2)
+        c.poll(timeout=0)
+    assert not _lite_hit(c, mq), "a drained buffer must let the queue pull again"
+
+
+# ---------------- the refusal at the top of the round: no request, and the 50 ms re-schedule ----------------
+
+def test_lite_cache_refusal_sends_no_request_and_pauses_that_queue_50ms(monkeypatch):
+    assert PULL_TIME_DELAY_WHEN_CACHE_FLOW_CONTROL == 0.05
+    mq = _lite_mq()
+    c, client = _lite_round_consumer("G_lite_round_refuse", [mq])
+    c.pull_threshold_for_queue = 1
+    _lite_cache(c, [_lite_msg(100, 0), _lite_msg(100, 1)])      # 2 cached over a budget of 1
+    sleeps = _drive_lite_rounds(monkeypatch, c, rounds=1)
+    assert sleeps == [PULL_TIME_DELAY_WHEN_CACHE_FLOW_CONTROL], sleeps
+    assert client.requests == [], "a refused round must not let a pull reach the broker"
+    assert c._flow_control_triggered == 1
+    # the pause is this queue's own re-schedule, 50 ms after the round that refused it (the virtual clock
+    # started at zero, so the deadline is the delay itself)
+    assert c._pull_not_before == {mq: PULL_TIME_DELAY_WHEN_CACHE_FLOW_CONTROL}
+    # and nothing else moved: no offset committed, the pull cursor untouched, the messages still cached
+    assert c.pull_cursor_of(mq) == 0
+    assert c.consume_cursor_of(mq) == -1
+    assert c.pending_commit_of(mq) == -1
+    assert len(c._local_buffer) == 2
+
+
+def test_lite_cache_at_the_threshold_reaches_the_broker(monkeypatch):
+    # Paired control: a cache sitting exactly ON the budget pulls, so the round reaches the scripted broker
+    # and takes the plain idle backoff instead of the cache pause.
+    mq = _lite_mq()
+    c, client = _lite_round_consumer("G_lite_round_pass", [mq])
+    c.pull_threshold_for_queue = 2
+    _lite_cache(c, [_lite_msg(100, 0), _lite_msg(100, 1)])
+    sleeps = _drive_lite_rounds(monkeypatch, c, rounds=1)
+    assert sleeps == [0.5], sleeps
+    assert client.requests == [(0, 0)], "the request must go out with the cursor it had"
+    assert c._flow_control_triggered == 0
+    assert c._pull_not_before == {}
+
+
+def test_lite_parked_queue_never_delays_a_cold_sibling(monkeypatch):
+    hot = _lite_mq(0)
+    cold = _lite_mq(1)
+    c, client = _lite_round_consumer("G_lite_round_siblings", [hot, cold])
+    c.pull_threshold_for_queue = 1
+    _lite_cache(c, [_lite_msg(100, 0, queue_id=0), _lite_msg(100, 1, queue_id=0)])
+    sleeps = _drive_lite_rounds(monkeypatch, c, rounds=2)
+    assert [qid for (qid, _) in client.requests] == [1, 1], \
+        "only the cold sibling ever reaches the broker; the hot one is refused every round"
+    assert sleeps == [PULL_TIME_DELAY_WHEN_CACHE_FLOW_CONTROL] * 2, sleeps
+    assert c._flow_control_triggered == 2, "one tick per refusal, and only for the hot queue"
+    assert cold not in c._pull_not_before
+
+
+def test_lite_gates_recover_once_the_application_polls_dry(monkeypatch):
+    mq = _lite_mq()
+    c, client = _lite_round_consumer("G_lite_round_recovery", [mq])
+    c.pull_threshold_for_queue = 1
+    _lite_cache(c, [_lite_msg(100, 0), _lite_msg(100, 1)])
+    sleeps = _drive_lite_rounds(monkeypatch, c, rounds=3,
+                               on_round_end=lambda: c.poll(timeout=0))
+    # refused, then the application drains the buffer and the queue pulls again: no deadlock.
+    assert sleeps == [PULL_TIME_DELAY_WHEN_CACHE_FLOW_CONTROL, 0.5, 0.5], sleeps
+    assert client.requests == [(0, 0), (0, 0)], client.requests
+    assert c._flow_control_triggered == 1
+
+
+def test_lite_cache_pause_and_broker_pause_reuse_the_shared_constants():
+    # The lite path must re-schedule with the port's own delays, not invent second values of its own.
+    assert PULL_TIME_DELAY_WHEN_CACHE_FLOW_CONTROL == 0.05
+    assert PULL_TIME_DELAY_WHEN_BROKER_FLOW_CONTROL == 0.02
+    loop_src = inspect.getsource(DefaultLitePullConsumer._pull_service_loop)
+    assert "PULL_TIME_DELAY_WHEN_CACHE_FLOW_CONTROL" in loop_src
+    assert "PULL_TIME_DELAY_WHEN_BROKER_FLOW_CONTROL" not in loop_src
+    pull_src = inspect.getsource(DefaultLitePullConsumer._pull_one)
+    assert "PULL_TIME_DELAY_WHEN_BROKER_FLOW_CONTROL" in pull_src
+
+
+# ---------------- a broker throttle on this path is not an error ----------------
+
+def test_lite_broker_flow_control_retries_in_20ms_other_codes_keep_the_error_backoff(monkeypatch):
+    mq = _lite_mq()
+    c, client = _lite_round_consumer(
+        "G_lite_broker_215", [mq],
+        answers=[MQBrokerException(ResponseCode.FLOW_CONTROL, "broker throttling"),
+                 MQBrokerException(ResponseCode.SYSTEM_BUSY, "busy")])
+    sleeps = _drive_lite_rounds(monkeypatch, c, rounds=2)
+    # 215 gets the short broker-side re-schedule, any other broker code keeps the lite path's own handling
+    # (the idle round backoff here): the two legs pin each other, reverting either branch turns this red.
+    assert sleeps == [PULL_TIME_DELAY_WHEN_BROKER_FLOW_CONTROL, 0.5], sleeps
+    assert len(client.requests) == 2, "a 215 parks the next round for 20 ms, it does not stop pulling"
+    assert c._flow_control_triggered == 0, "the broker's throttle is not this client's cache gate"
+
+
+def test_lite_plain_pull_error_parks_nobody_and_keeps_the_generic_backoff(monkeypatch):
+    # Control without a broker code at all: a generic failure must not pick the 20 ms branch, and it must
+    # not leave a queue parked.
+    mq = _lite_mq()
+    c, client = _lite_round_consumer("G_lite_broker_generic", [mq],
+                                     answers=[RuntimeError("socket reset")])
+    sleeps = _drive_lite_rounds(monkeypatch, c, rounds=1)
+    assert sleeps == [0.5], sleeps
+    assert c._pull_not_before == {}
+    assert client.requests == [(0, 0)]
+
+
+def test_lite_broker_flow_control_parks_only_the_answered_queue(monkeypatch):
+    hot = _lite_mq(0)
+    sibling = _lite_mq(1)
+    c, client = _lite_round_consumer(
+        "G_lite_broker_215_one_queue", [hot, sibling],
+        error_on_queue=(0, MQBrokerException(ResponseCode.FLOW_CONTROL, "broker throttling")))
+    sleeps = _drive_lite_rounds(monkeypatch, c, rounds=1)
+    assert sleeps == [PULL_TIME_DELAY_WHEN_BROKER_FLOW_CONTROL], sleeps
+    assert sorted(qid for (qid, _) in client.requests) == [0, 1], \
+        "the sibling still pulled in the very round the 215 arrived"
+    assert len(client.requests) == 2
+    assert list(c._pull_not_before) == [hot], "only the throttled queue is parked for 20 ms"
+    assert c._pull_not_before[hot] == PULL_TIME_DELAY_WHEN_BROKER_FLOW_CONTROL
+
+
+# ---------------- the three counters and the shared 1/1001 warn cadence ----------------
+
+def test_lite_gate_debug_names_the_queue_the_measurement_the_threshold_and_the_counter(caplog):
+    c, mq = _lite_with_backlog("G_lite_debug_line", [_lite_msg(100, i) for i in range(2)])
+    c.pull_threshold_for_queue = 1
+    with caplog.at_level("DEBUG", logger="rocketmq.client"):
+        assert _lite_hit(c, mq)
+    assert _lite_debugs(caplog) == [
+        "flow control: queue %s count=2 exceeds pull_threshold_for_queue=1,"
+        " pause pull for 50 ms (flowControlTimes=1)" % mq], _lite_debugs(caplog)
+
+
+def test_lite_warn_cadence_is_trip_1_and_1001_with_trip_1000_debug_only(caplog):
+    assert FLOW_CONTROL_WARN_EVERY_N_TRIPS == 1000
+    c, mq = _lite_with_backlog("G_lite_warn_cadence", [_lite_msg(100, i) for i in range(2)])
+    c.pull_threshold_for_queue = 1
+    with caplog.at_level("WARNING"):
+        assert _lite_hit(c, mq)
+        assert len(_lite_warns(caplog)) == 1, "the 1st trip must warn"
+        assert _lite_hit(c, mq)
+        assert len(_lite_warns(caplog)) == 1, "the 2nd trip must stay on the debug channel only"
+        # Jump to the boundary and warn again: this pins the modulo, not "warn once and stop".
+        c._flow_control_triggered = FLOW_CONTROL_WARN_EVERY_N_TRIPS - 1
+        assert _lite_hit(c, mq)
+        assert len(_lite_warns(caplog)) == 1, "trip 1000 must stay on the debug channel only"
+        assert _lite_hit(c, mq)
+        assert len(_lite_warns(caplog)) == 2, "trip 1001 must warn again"
+    assert c._flow_control_triggered == FLOW_CONTROL_WARN_EVERY_N_TRIPS + 1
+    first = _lite_warns(caplog)[0]
+    assert ("The cached message count exceeds the threshold 1, so do flow control, "
+            "minOffset=0, maxOffset=1, count=2, size=0 MiB, flowControlTimes=1") == first, first
+
+
+def test_lite_size_gate_warns_on_the_shared_count_counter(caplog):
+    """The count gate and the size gate share one counter, so one throttled queue is one flowControlTimes
+    total whichever of the two refused it."""
+    c, mq = _lite_with_backlog("G_lite_size_warn", [_lite_msg(2 * MIB, i) for i in range(3)])
+    c.pull_threshold_for_queue = 10
+    c.pull_threshold_size_for_queue = 1
+    with caplog.at_level("WARNING"):
+        assert _lite_hit(c, mq)
+    assert c._flow_control_triggered == 1
+    warn = _lite_warns(caplog)[0]
+    assert warn.startswith("The cached message size exceeds the threshold 1 MiB, so do flow control"), warn
+    assert "count=3, size=6 MiB, flowControlTimes=1" in warn, warn
+    # The next refusal of the same queue ticks the same counter, whatever gate refused it.
+    assert _lite_hit(c, mq)
+    assert c._flow_control_triggered == 2
+    assert len(_lite_warns(caplog)) == 1, "trip 2 stays on the debug channel"
+
+
+def test_lite_aggregate_gate_warns_on_its_own_counter(caplog):
+    queues = [_lite_mq(i) for i in range(2)]
+    c = _lite_consumer("G_lite_all_warn", *queues)
+    _lite_gates_off(c)
+    c.pull_threshold_for_all = 1
+    _lite_cache(c, [_lite_msg(100, j, queue_id=i) for i in range(2) for j in range(2)])
+    with caplog.at_level("WARNING"):
+        assert _lite_hit(c, queues[0])
+        assert _lite_hit(c, queues[1])
+        assert c._flow_control_for_all_triggered == 2
+        assert len(_lite_warns(caplog)) == 1, "trip 2 stays on the debug channel"
+        c._flow_control_for_all_triggered = FLOW_CONTROL_WARN_EVERY_N_TRIPS
+        assert _lite_hit(c, queues[0])
+    assert len(_lite_warns(caplog)) == 2, "trip 1001 must warn again"
+    assert ("the consume request count exceeds threshold 1, so do flow control,"
+            " cached=4, flowControlTimes=1") == _lite_warns(caplog)[0], _lite_warns(caplog)[0]
+
+
+def test_lite_span_gate_warns_on_its_own_counter(caplog):
+    c, mq = _lite_with_backlog("G_lite_span_warn", [_lite_msg(1, 0), _lite_msg(1, 11)])
+    c.consume_max_span = 10
+    with caplog.at_level("WARNING"):
+        assert _lite_hit(c, mq)
+        assert c._flow_control_span_triggered == 1
+        assert c._flow_control_triggered == 0, "the span gate never ticks the count/size counter"
+    assert ("The queue's messages, span too long, so do flow control,"
+            " minOffset=0, maxOffset=11, maxSpan=11, flowControlTimes=1"
+            == _lite_warns(caplog)[0]), _lite_warns(caplog)[0]
+
+
+def test_lite_three_gates_keep_three_independent_cadences(caplog):
+    """Each counter starts its own 1/1001 cadence: driving one of them to the boundary must not make another
+    gate's next warn appear or disappear."""
+    c, mq = _lite_with_backlog("G_lite_cadence_split",
+                               [_lite_msg(2 * MIB, 0), _lite_msg(2 * MIB, 11)])
+    c.pull_threshold_for_all = 0
+    c.pull_threshold_size_for_queue = 1
+    c.consume_max_span = 10
+    with caplog.at_level("WARNING"):
+        assert _lite_hit(c, mq)                    # aggregate wins
+        assert len(_lite_warns(caplog)) == 1
+        c.pull_threshold_for_all = OUT_OF_REACH
+        assert _lite_hit(c, mq)                    # now the size gate wins
+        assert len(_lite_warns(caplog)) == 2, "a different gate ticks its own first trip, so it warns"
+        c.pull_threshold_size_for_queue = OUT_OF_REACH
+        assert _lite_hit(c, mq)                    # and the span gate wins
+        assert len(_lite_warns(caplog)) == 3
+    assert (c._flow_control_for_all_triggered, c._flow_control_triggered,
+            c._flow_control_span_triggered) == (1, 1, 1)
+
+
+# ---------------- shutdown escape ----------------
+
+def test_lite_shutdown_stops_promptly_while_a_queue_is_parked_on_a_gate():
+    # A live background round parked on the aggregate gate (nothing here ever polls the buffer). Shutdown
+    # must not sit out the pause and must not leave the round loop behind.
+    store = {("broker-a", 0): ["A%d" % i for i in range(4)]}
+    c = _Lite("G_lite_shutdown", _store=store)
+    c.set_namesrv_addr("127.0.0.1:9876")
+    c.set_auto_commit(False)
+    mq = MessageQueue("T", "broker-a", 0)
+    c.assign([mq])
+    c.pull_threshold_for_all = 1
+    c.start()
+    try:
+        began = time.time()
+        while c._flow_control_for_all_triggered == 0 and time.time() - began < 10:
+            time.sleep(0.01)
+        assert c._flow_control_for_all_triggered > 0, "the queue must actually be parked on a gate"
+        assert mq in c._pull_not_before
+        stopped_in = time.time()
+        c.shutdown()
+        stopped_in = time.time() - stopped_in
+        assert stopped_in < 1.0, "a parked queue must not sit out its pause: shutdown took %.3fs" % stopped_in
+        assert not c._pull_thread.is_alive(), "the round loop must be gone after shutdown"
+    finally:
+        c.shutdown()
 

@@ -51,6 +51,36 @@ const (
 	maxPollBatchSize                            = 1024
 	DefaultLiteTopicMetadataCheckIntervalMillis = int64(30 * 1000)
 	liteMetadataFirstDelayMillis                = int64(10 * 1000)
+
+	// The four cache budgets a lite consumer guards its local buffer with. A
+	// background pull round keeps filling the buffer until the application
+	// drains it with Poll, so without these budgets a slow (or absent) poller
+	// turns the buffer into an unbounded queue.
+	//
+	// DefaultLitePullThresholdForAll is pullThresholdForAll — the message-count
+	// budget of the WHOLE buffer, summed over every queue.
+	DefaultLitePullThresholdForAll = int64(10000)
+	// DefaultLitePullThresholdForQueue is pullThresholdForQueue — messages ONE
+	// queue may still hold in the buffer.
+	DefaultLitePullThresholdForQueue = int64(1000)
+	// DefaultLitePullThresholdSizeForQueue is pullThresholdSizeForQueue — MiB
+	// ONE queue may still hold, counted as stored size (what the commitlog
+	// record costs), not body length.
+	DefaultLitePullThresholdSizeForQueue = int64(100)
+	// DefaultLiteConsumeMaxSpan is consumeMaxSpan — the queueOffset span ONE
+	// queue's cached messages may cover.
+	DefaultLiteConsumeMaxSpan = int64(2000)
+
+	// storedMiBBytes is the unit the size gate divides by. The division is an
+	// integer one, so a partial MiB never counts toward the budget.
+	storedMiBBytes = int64(1024 * 1024)
+
+	// The names the cache gates judge under, one per budget. "count" and "size"
+	// share a trip counter — both mean "this queue holds too much of the buffer".
+	liteGateAll   = "all"
+	liteGateCount = "count"
+	liteGateSize  = "size"
+	liteGateSpan  = "span"
 )
 
 type TopicMessageQueueChangeListener interface {
@@ -96,6 +126,26 @@ type DefaultLitePullConsumer struct {
 	autoCommitIntervalMillis int64
 	pullIntervalMillis       int64
 
+	// The cache budgets, all four judged per queue BEFORE a pull request is
+	// built. They are plain budgets: no clamping, and a value of 0 trips on the
+	// first cached message. pullThresholdForAll is the only one that spans every
+	// queue; the other three judge this queue alone. Guarded by mu.
+	pullThresholdForAll       int64
+	pullThresholdForQueue     int64
+	pullThresholdSizeForQueue int64
+	consumeMaxSpan            int64
+
+	// Cache-gate trip counters, one per budget shape (the count and the size
+	// gate share one because both mean "this queue holds too much"). Guarded by mu.
+	flowControlAllTriggered   int64
+	flowControlCacheTriggered int64
+	flowControlSpanTriggered  int64
+
+	// pullPause holds the per-queue re-schedule a refusal left behind, keyed by
+	// queue so a parked queue sits its own window out while its siblings keep
+	// pulling. Guarded by mu.
+	pullPause map[common.MessageQueue]litePullPause
+
 	allocateStrategy AllocateMessageQueueStrategy
 	queueListener    MessageQueueListener
 
@@ -133,6 +183,12 @@ type DefaultLitePullConsumer struct {
 	bufMu     sync.Mutex
 	buffer    []*common.MessageExt
 	bufNotify chan struct{}
+	// cacheStats is the buffer seen per queue: the same entries, counted
+	// incrementally so a per-queue verdict costs no scan of the buffer. It is
+	// only ever written by the buffer's own primitives below, under bufMu, in the
+	// same step that moves the entries — so it cannot report a backlog the buffer
+	// does not hold.
+	cacheStats map[common.MessageQueue]*liteQueueCache
 }
 
 func NewDefaultLitePullConsumer(group string) (*DefaultLitePullConsumer, error) {
@@ -153,6 +209,11 @@ func NewDefaultLitePullConsumer(group string) (*DefaultLitePullConsumer, error) 
 		autoCommit:                 true,
 		autoCommitIntervalMillis:   DefaultLiteAutoCommitIntervalMillis,
 		pullIntervalMillis:         DefaultLitePullIntervalMillis,
+		pullThresholdForAll:        DefaultLitePullThresholdForAll,
+		pullThresholdForQueue:      DefaultLitePullThresholdForQueue,
+		pullThresholdSizeForQueue:  DefaultLitePullThresholdSizeForQueue,
+		consumeMaxSpan:             DefaultLiteConsumeMaxSpan,
+		pullPause:                  map[common.MessageQueue]litePullPause{},
 		streamRequest:              true,
 		allocateStrategy:           AllocateMessageQueueAveragely{},
 		subscription:               map[string]string{},
@@ -170,6 +231,7 @@ func NewDefaultLitePullConsumer(group string) (*DefaultLitePullConsumer, error) 
 		topicMetadataCheckInterval: DefaultLiteTopicMetadataCheckIntervalMillis,
 		stopCh:                     make(chan struct{}),
 		bufNotify:                  make(chan struct{}, 1),
+		cacheStats:                 map[common.MessageQueue]*liteQueueCache{},
 	}, nil
 }
 
@@ -393,6 +455,68 @@ func (c *DefaultLitePullConsumer) SetPullIntervalMillis(ms int64) {
 	c.pullIntervalMillis = ms
 }
 
+// ---------------------------------------------------------------- cache budgets
+
+// SetPullThresholdForAll sets the message-count budget of the WHOLE local
+// buffer, summed over every queue: the aggregate gate every pull round judges
+// first. A plain budget — no clamping, so 0 means "trip on the first cached
+// message", which is a legal configuration.
+func (c *DefaultLitePullConsumer) SetPullThresholdForAll(n int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pullThresholdForAll = n
+}
+
+func (c *DefaultLitePullConsumer) PullThresholdForAll() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.pullThresholdForAll
+}
+
+// SetPullThresholdForQueue sets how many messages ONE queue may still hold in
+// the buffer. It is judged on that queue's own count and never on the sum of its
+// siblings.
+func (c *DefaultLitePullConsumer) SetPullThresholdForQueue(n int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pullThresholdForQueue = n
+}
+
+func (c *DefaultLitePullConsumer) PullThresholdForQueue() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.pullThresholdForQueue
+}
+
+// SetPullThresholdSizeForQueue sets how many MiB ONE queue may still hold,
+// measured as stored size — what the commitlog record costs the client — so a
+// few large messages weigh as much as many small ones.
+func (c *DefaultLitePullConsumer) SetPullThresholdSizeForQueue(n int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pullThresholdSizeForQueue = n
+}
+
+func (c *DefaultLitePullConsumer) PullThresholdSizeForQueue() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.pullThresholdSizeForQueue
+}
+
+// SetConsumeMaxSpan sets the queueOffset span ONE queue's cached messages may
+// cover: a runaway cursor is caught even while the count stays small.
+func (c *DefaultLitePullConsumer) SetConsumeMaxSpan(n int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.consumeMaxSpan = n
+}
+
+func (c *DefaultLitePullConsumer) ConsumeMaxSpan() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.consumeMaxSpan
+}
+
 func (c *DefaultLitePullConsumer) SetAllocateMessageQueueStrategy(s AllocateMessageQueueStrategy) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -580,20 +704,29 @@ func (c *DefaultLitePullConsumer) SetSubExpressionForAssign(topic, subExpression
 
 func (c *DefaultLitePullConsumer) Assign(mqs []common.MessageQueue) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.assignMode = true
 	keep := make(map[common.MessageQueue]struct{}, len(mqs))
 	for _, mq := range mqs {
 		keep[mq] = struct{}{}
 	}
+	var revoked []common.MessageQueue
 	for mq := range c.assigned {
 		if _, ok := keep[mq]; ok {
 			continue
 		}
 		delete(c.nextOffset, mq)
 		delete(c.consumeOffset, mq)
+		revoked = append(revoked, mq)
 	}
 	c.assigned = keep
+	c.mu.Unlock()
+
+	// A queue this consumer no longer owns must also lose its share of the
+	// backlog accounting: a leftover accumulator would keep refusing pulls for a
+	// queue that is not ours to judge.
+	for _, mq := range revoked {
+		c.dropQueueCache(mq)
+	}
 }
 
 // Assignment snapshots the assigned queues (sorted for stable callers).
@@ -854,20 +987,13 @@ func (c *DefaultLitePullConsumer) autoCommitOn() bool {
 	return c.autoCommit
 }
 
-// tryDrain takes up to maxPollBatchSize messages off the buffer.
+// tryDrain takes up to maxPollBatchSize messages off the buffer. The per-queue
+// backlog accounting retires in the same step (see drainBufferLocked), so what
+// the gates measure is what the application has not polled away yet.
 func (c *DefaultLitePullConsumer) tryDrain() []*common.MessageExt {
 	c.bufMu.Lock()
 	defer c.bufMu.Unlock()
-	if len(c.buffer) == 0 {
-		return nil
-	}
-	take := len(c.buffer)
-	if take > maxPollBatchSize {
-		take = maxPollBatchSize
-	}
-	out := append([]*common.MessageExt(nil), c.buffer[:take]...)
-	c.buffer = c.buffer[take:]
-	return out
+	return c.drainBufferLocked(maxPollBatchSize)
 }
 
 func (c *DefaultLitePullConsumer) advanceConsumeOffset(msgs []*common.MessageExt) {
@@ -880,7 +1006,7 @@ func (c *DefaultLitePullConsumer) advanceConsumeOffset(msgs []*common.MessageExt
 		}
 	}
 	for _, m := range msgs {
-		key := common.MessageQueue{Topic: m.Topic, BrokerName: m.BrokerName, QueueID: m.QueueID}
+		key := liteQueueKey(m)
 		if _, ok := held[key]; !ok {
 			continue
 		}
@@ -895,6 +1021,46 @@ func (c *DefaultLitePullConsumer) BufferedMessageCount() int {
 	c.bufMu.Lock()
 	defer c.bufMu.Unlock()
 	return len(c.buffer)
+}
+
+// FlowControlAllTriggered counts the rounds the whole-buffer budget refused
+// (live diagnostics).
+func (c *DefaultLitePullConsumer) FlowControlAllTriggered() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.flowControlAllTriggered
+}
+
+// FlowControlCacheTriggered counts the rounds one queue was over its own message
+// count OR its own stored-bytes budget: one number for the two ways a queue can
+// simply hold too much.
+func (c *DefaultLitePullConsumer) FlowControlCacheTriggered() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.flowControlCacheTriggered
+}
+
+// FlowControlSpanTriggered counts the rounds one queue's cached offset span was
+// over consumeMaxSpan.
+func (c *DefaultLitePullConsumer) FlowControlSpanTriggered() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.flowControlSpanTriggered
+}
+
+// PullPauseMillisOf reports the length of the re-schedule a queue is currently
+// sitting out (0 when it has no pause window). Cache-gate pauses are
+// pullTimeDelayMillsWhenFlowControl and a broker throttle is
+// pullTimeDelayMillsWhenBrokerFlow, so the number also says which of the two
+// parked it (tests/diagnostics).
+func (c *DefaultLitePullConsumer) PullPauseMillisOf(mq common.MessageQueue) int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	p, ok := c.pullPause[mq]
+	if !ok || common.CurrentTimeMillis() >= p.readyAt {
+		return 0
+	}
+	return p.delayMillis
 }
 
 // PullCursorOf reads the pull cursor of one queue (-1 when it has none).
@@ -938,14 +1104,10 @@ func (c *DefaultLitePullConsumer) Seek(mq common.MessageQueue, offset int64) {
 	c.consumeOffset[mq] = offset
 	c.mu.Unlock()
 	c.bufMu.Lock()
-	kept := c.buffer[:0:0]
-	for _, m := range c.buffer {
-		if m.Topic == mq.Topic && m.BrokerName == mq.BrokerName && m.QueueID == mq.QueueID && m.QueueOffset < offset {
-			continue
-		}
-		kept = append(kept, m)
-	}
-	c.buffer = kept
+	// Rewinding the cursor drops what this queue has already cached below the
+	// new offset; the accumulator is rebuilt from what the buffer keeps, so the
+	// two never part company (pruneBufferLocked is the only place that does both).
+	c.pruneBufferLocked(mq, offset)
 	c.bufMu.Unlock()
 }
 
@@ -1295,11 +1457,14 @@ func (c *DefaultLitePullConsumer) Rebalance() {
 
 	sort.Slice(revoked, func(i, j int) bool { return revoked[i].CompareTo(revoked[j]) < 0 })
 	for _, mq := range revoked {
-		// Last commit for a surrendered queue, then its table cell goes away.
+		// Last commit for a surrendered queue, then its table cell goes away —
+		// and so does its share of the backlog accounting, which no queue we no
+		// longer own may use to refuse a pull.
 		c.persistOneOffset(mq)
 		c.mu.Lock()
 		delete(c.offsetTable, mq)
 		c.mu.Unlock()
+		c.dropQueueCache(mq)
 	}
 	if len(added) > 0 {
 		c.resolveOffsetsFor(added)
@@ -1458,6 +1623,13 @@ func (c *DefaultLitePullConsumer) sendHeartbeatToAllBrokers() int {
 // liteRebalanceIntervalMillis, then one SHORT-pull round over every assigned,
 // non-paused queue. A round that pulled something follows up after 5ms; an
 // empty round backs off pullIntervalMillis.
+//
+// A queue its own cache gate (or the broker) re-scheduled sits out the rounds
+// inside its pause window while its siblings keep pulling — the pause is
+// per-queue state, never a sleep in this loop, so one throttled queue cannot
+// delay the others. The round's wait is cut short when a parked queue is due
+// sooner than the idle backoff, so a 50ms pause is not silently stretched to
+// whatever pullIntervalMillis happens to be.
 func (c *DefaultLitePullConsumer) pullServiceLoop(stop chan struct{}) {
 	for {
 		select {
@@ -1484,6 +1656,9 @@ func (c *DefaultLitePullConsumer) pullServiceLoop(stop chan struct{}) {
 			if _, ok := c.paused[mq]; ok {
 				continue
 			}
+			if c.queuePausedLocked(mq) {
+				continue
+			}
 			targets = append(targets, mq)
 		}
 		c.mu.Unlock()
@@ -1505,6 +1680,14 @@ func (c *DefaultLitePullConsumer) pullServiceLoop(stop chan struct{}) {
 		if gotAny {
 			backoff = time.Duration(liteGotAnyBackoffMillis) * time.Millisecond
 		}
+		if until, ok := c.nextPullPauseDeadline(); ok {
+			switch remaining := time.Duration(until-common.CurrentTimeMillis()) * time.Millisecond; {
+			case remaining <= 0:
+				backoff = 0
+			case remaining < backoff:
+				backoff = remaining
+			}
+		}
 		timer := time.NewTimer(backoff)
 		select {
 		case <-stop:
@@ -1523,7 +1706,14 @@ func (c *DefaultLitePullConsumer) pullIntervalValue() int64 {
 
 // pullOne runs one short-pull round for one queue. true = something entered
 // the buffer (drives the loop's backoff choice).
+//
+// The cache gates are judged first, before anything is read off the cursor: a
+// refused round builds no request at all, so the broker sees no pull, commits
+// nothing and moves nothing.
 func (c *DefaultLitePullConsumer) pullOne(mq common.MessageQueue) bool {
+	if c.flowControlHit(mq) {
+		return false
+	}
 	c.mu.Lock()
 	api := c.pullAPI
 	group := c.consumerGroup
@@ -1573,6 +1763,15 @@ func (c *DefaultLitePullConsumer) pullOne(mq common.MessageQueue) bool {
 	result, err := api.pullKernelLite(group, mq, offset, sub, sysFlag, batchSize, litePullTimeoutMillis)
 	if err != nil {
 		common.LogDebugf("lite pull failed for %v@%d: %v", mq, offset, err)
+		// The broker's own throttle (FLOW_CONTROL 215) is not a failure of the
+		// same kind as the rest: the request round-tripped, nothing landed in the
+		// buffer, and the queue is readable again as soon as the broker's pressure
+		// drops — so THIS queue waits the short broker pause. Every other answer
+		// keeps the lite path's existing handling (debug log, ride the round's
+		// wait), because retrying hot at an unhealthy broker adds pressure.
+		if isBrokerFlowControlError(err) {
+			c.schedulePullPause(mq, pullTimeDelayMillsWhenBrokerFlow)
+		}
 		return false
 	}
 	// Every response feeds processPullResult (suggest-which-broker bookkeeping),
@@ -1604,9 +1803,335 @@ func (c *DefaultLitePullConsumer) pullOne(mq common.MessageQueue) bool {
 
 func (c *DefaultLitePullConsumer) enqueue(msgs []*common.MessageExt) {
 	c.bufMu.Lock()
-	c.buffer = append(c.buffer, msgs...)
+	c.appendBufferLocked(msgs)
 	c.bufMu.Unlock()
 	c.notifyBufferLocked()
+}
+
+// ------------------------------------------------------- cached backlog accounting
+
+// liteQueueCache is ONE queue's share of the local buffer: how many of its
+// messages are still cached, how many stored bytes they cost and which offsets
+// they cover. It exists so a per-queue verdict reads three numbers instead of
+// walking the buffer, and it only ever moves inside the primitives that move the
+// buffer itself (appendBufferLocked / drainBufferLocked / pruneBufferLocked),
+// under bufMu, so it cannot drift from what is actually cached.
+type liteQueueCache struct {
+	bytes int64
+	// offsets holds this queue's cached queueOffsets in ascending order, one
+	// entry per cached message, so the count is its length and the span is
+	// first-to-last. Pull results arrive ascending, so the common update is an
+	// append; a rewound cursor (Seek) inserts in place.
+	offsets []int64
+}
+
+func (s *liteQueueCache) add(m *common.MessageExt) {
+	s.bytes += int64(m.StoreSize)
+	off := m.QueueOffset
+	n := len(s.offsets)
+	if n == 0 || off >= s.offsets[n-1] {
+		s.offsets = append(s.offsets, off)
+		return
+	}
+	i := sort.Search(n, func(j int) bool { return s.offsets[j] >= off })
+	s.offsets = append(s.offsets, 0)
+	copy(s.offsets[i+1:], s.offsets[i:])
+	s.offsets[i] = off
+}
+
+// remove retires one cached message. An offset that is not in the set means the
+// entry belongs to a queue that no longer has an accumulator (its messages
+// outlive the accounting until the application polls them away), so there is
+// nothing to retire here and the aggregate budget is the number that still sees
+// them.
+func (s *liteQueueCache) remove(m *common.MessageExt) {
+	off := m.QueueOffset
+	i := sort.Search(len(s.offsets), func(j int) bool { return s.offsets[j] >= off })
+	if i == len(s.offsets) || s.offsets[i] != off {
+		return
+	}
+	s.offsets = append(s.offsets[:i], s.offsets[i+1:]...)
+	s.bytes -= int64(m.StoreSize)
+}
+
+func (s *liteQueueCache) count() int { return len(s.offsets) }
+
+// span is the distance between the lowest and the highest cached offset; an
+// empty or single-message cache spans nothing.
+func (s *liteQueueCache) span() int64 {
+	if len(s.offsets) < 2 {
+		return 0
+	}
+	return s.offsets[len(s.offsets)-1] - s.offsets[0]
+}
+
+// liteQueueKey is the queue a cached message belongs to — the same key the
+// cursors are keyed by, so an accumulator and a cursor always name one queue.
+func liteQueueKey(m *common.MessageExt) common.MessageQueue {
+	return common.MessageQueue{Topic: m.Topic, BrokerName: m.BrokerName, QueueID: m.QueueID}
+}
+
+// cacheOfLocked returns this queue's accumulator, creating it on first use.
+// Callers hold bufMu.
+func (c *DefaultLitePullConsumer) cacheOfLocked(mq common.MessageQueue) *liteQueueCache {
+	s, ok := c.cacheStats[mq]
+	if !ok {
+		s = &liteQueueCache{}
+		c.cacheStats[mq] = s
+	}
+	return s
+}
+
+// appendBufferLocked adds the fetched messages to the buffer and to their
+// queues' accounting in the same step. Callers hold bufMu.
+func (c *DefaultLitePullConsumer) appendBufferLocked(msgs []*common.MessageExt) {
+	c.buffer = append(c.buffer, msgs...)
+	for _, m := range msgs {
+		c.cacheOfLocked(liteQueueKey(m)).add(m)
+	}
+}
+
+// drainBufferLocked hands the application up to n messages from the front of the
+// buffer and retires exactly those from their queues' accounting. Callers hold
+// bufMu.
+func (c *DefaultLitePullConsumer) drainBufferLocked(n int) []*common.MessageExt {
+	if len(c.buffer) == 0 {
+		return nil
+	}
+	take := len(c.buffer)
+	if take > n {
+		take = n
+	}
+	out := append([]*common.MessageExt(nil), c.buffer[:take]...)
+	for _, m := range out {
+		if s := c.cacheStats[liteQueueKey(m)]; s != nil {
+			s.remove(m)
+		}
+	}
+	c.buffer = c.buffer[take:]
+	return out
+}
+
+// pruneBufferLocked drops this queue's cached messages below `from` (what Seek
+// does when the cursor rewinds) and rebuilds this queue's accounting from the
+// messages the buffer keeps. The walk over the buffer is the rewind's own cost,
+// not something a pull round pays. Callers hold bufMu.
+func (c *DefaultLitePullConsumer) pruneBufferLocked(mq common.MessageQueue, from int64) {
+	kept := c.buffer[:0:0]
+	for _, m := range c.buffer {
+		if liteQueueKey(m) == mq && m.QueueOffset < from {
+			continue
+		}
+		kept = append(kept, m)
+	}
+	c.buffer = kept
+
+	rebuilt := &liteQueueCache{}
+	for _, m := range c.buffer {
+		if liteQueueKey(m) == mq {
+			rebuilt.add(m)
+		}
+	}
+	if rebuilt.count() == 0 {
+		delete(c.cacheStats, mq)
+		return
+	}
+	c.cacheStats[mq] = rebuilt
+}
+
+// dropQueueCache retires a queue this consumer no longer owns: its accounting
+// and its pending pull pause go away together. What its messages still occupy in
+// the buffer stays there for the application (and keeps weighing on the
+// whole-buffer budget, which reads the buffer itself), but no leftover count can
+// refuse a pull for a queue nobody owns.
+func (c *DefaultLitePullConsumer) dropQueueCache(mq common.MessageQueue) {
+	c.mu.Lock()
+	delete(c.pullPause, mq)
+	c.mu.Unlock()
+	c.bufMu.Lock()
+	delete(c.cacheStats, mq)
+	c.bufMu.Unlock()
+}
+
+// liteCacheStats is one judgment's measurements: this queue's own cached count,
+// stored bytes and offset range, plus everything the buffer holds.
+type liteCacheStats struct {
+	total     int
+	count     int
+	bytes     int64
+	minOffset int64
+	maxOffset int64
+	span      int64
+}
+
+// sizeMiB is the size gate's unit: whole MiB of stored size, integer division,
+// so a partial MiB does not count toward the budget.
+func (s liteCacheStats) sizeMiB() int64 { return s.bytes / storedMiBBytes }
+
+// cacheStatsOf reads this queue's share of the backlog plus the buffer's total.
+// The total IS len(buffer), so the aggregate gate can never disagree with what
+// is cached; the per-queue numbers come from the accumulator, so a verdict costs
+// no scan.
+func (c *DefaultLitePullConsumer) cacheStatsOf(mq common.MessageQueue) liteCacheStats {
+	c.bufMu.Lock()
+	defer c.bufMu.Unlock()
+	st := liteCacheStats{total: len(c.buffer)}
+	s := c.cacheStats[mq]
+	if s == nil {
+		return st
+	}
+	st.count = s.count()
+	st.bytes = s.bytes
+	if st.count > 0 {
+		st.minOffset = s.offsets[0]
+		st.maxOffset = s.offsets[st.count-1]
+		st.span = s.span()
+	}
+	return st
+}
+
+// ------------------------------------------------------------- cache-flow gates
+
+// cacheGateReason names the budget this queue is over, in the judgment's exact
+// order — the whole-buffer count, then this queue's count, its stored size and
+// its offset span — or "" when the queue may pull.
+//
+// Gates two to four read only THIS queue's accumulator, so a sibling that is over
+// its budget never stops this one; the first gate is the one budget that spans
+// every queue. All four compare strictly greater, so a queue sitting exactly on a
+// threshold keeps pulling, and none of them is switched off by a zero value: a
+// threshold of 0 trips on the first cached message.
+func (c *DefaultLitePullConsumer) cacheGateReason(mq common.MessageQueue) (string, int64, liteCacheStats) {
+	st := c.cacheStatsOf(mq)
+	c.mu.Lock()
+	all := c.pullThresholdForAll
+	count := c.pullThresholdForQueue
+	size := c.pullThresholdSizeForQueue
+	span := c.consumeMaxSpan
+	c.mu.Unlock()
+
+	switch {
+	case int64(st.total) > all:
+		return liteGateAll, all, st
+	case int64(st.count) > count:
+		return liteGateCount, count, st
+	case st.sizeMiB() > size:
+		return liteGateSize, size, st
+	case st.span > span:
+		return liteGateSpan, span, st
+	}
+	return "", 0, st
+}
+
+// flowControlHit judges this queue's cached backlog before its pull round and,
+// when it is over budget, records the trip, logs it and re-schedules THIS
+// queue's pull for pullTimeDelayMillsWhenFlowControl later. The request is not
+// built, so the broker sees no pull on a refused round; nothing is committed, the
+// cursor does not move and the messages stay in the buffer for the application to
+// poll — which is the only way the backlog can drain.
+//
+// The pause is per-queue state rather than a sleep, so a throttled queue cannot
+// delay its siblings, and the loop's own wait is what shutdown interrupts.
+func (c *DefaultLitePullConsumer) flowControlHit(mq common.MessageQueue) bool {
+	reason, threshold, st := c.cacheGateReason(mq)
+	if reason == "" {
+		return false
+	}
+	times := c.tickFlowControl(reason)
+	common.LogDebugf("lite flow control: queue %v gate=%s cached=%d count=%d size=%d MiB span=%d threshold=%d"+
+		", pause pull for %s (flowControlTimes=%d)",
+		mq, reason, st.total, st.count, st.sizeMiB(), st.span, threshold,
+		pullTimeDelayMillsWhenFlowControl, times)
+	if isFlowControlWarnTrip(times) {
+		switch reason {
+		case liteGateAll:
+			common.LogWarnf("the consume request count exceeds threshold %d, so do flow control, "+
+				"cached=%d, flowControlTimes=%d", threshold, st.total, times)
+		case liteGateCount:
+			common.LogWarnf("The cached message count exceeds the threshold %d, so do flow control, "+
+				"minOffset=%d, maxOffset=%d, count=%d, size=%d MiB, flowControlTimes=%d",
+				threshold, st.minOffset, st.maxOffset, st.count, st.sizeMiB(), times)
+		case liteGateSize:
+			common.LogWarnf("The cached message size exceeds the threshold %d MiB, so do flow control, "+
+				"minOffset=%d, maxOffset=%d, count=%d, size=%d MiB, flowControlTimes=%d",
+				threshold, st.minOffset, st.maxOffset, st.count, st.sizeMiB(), times)
+		case liteGateSpan:
+			// maxSpan is the span this queue's cache actually has, not the threshold.
+			common.LogWarnf("The queue's messages, span too long, so do flow control, "+
+				"minOffset=%d, maxOffset=%d, maxSpan=%d, flowControlTimes=%d",
+				st.minOffset, st.maxOffset, st.span, times)
+		}
+	}
+	c.schedulePullPause(mq, pullTimeDelayMillsWhenFlowControl)
+	return true
+}
+
+// tickFlowControl records one refusal on the counter of the gate that caused it
+// and returns the counter's new value: the whole-buffer gate has its own, the
+// span gate has its own, and the two "this queue holds too much" gates (count and
+// size) share one. Every refusal is exactly one tick, whatever else the round did.
+func (c *DefaultLitePullConsumer) tickFlowControl(reason string) int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch reason {
+	case liteGateAll:
+		c.flowControlAllTriggered++
+		return c.flowControlAllTriggered
+	case liteGateCount, liteGateSize:
+		c.flowControlCacheTriggered++
+		return c.flowControlCacheTriggered
+	default:
+		c.flowControlSpanTriggered++
+		return c.flowControlSpanTriggered
+	}
+}
+
+// ------------------------------------------------------------ per-queue pull pause
+
+// litePullPause is one queue's re-scheduled pull round: the instant it may pull
+// again, plus the length of the wait that produced it (the cache-gate pause or the
+// short broker one), which is what the diagnostics and the tests read.
+type litePullPause struct {
+	readyAt     int64
+	delayMillis int64
+}
+
+// schedulePullPause parks ONE queue's pull round for d. Sibling queues are not
+// touched and keep pulling every round.
+func (c *DefaultLitePullConsumer) schedulePullPause(mq common.MessageQueue, d time.Duration) {
+	delay := int64(d / time.Millisecond)
+	c.mu.Lock()
+	c.pullPause[mq] = litePullPause{readyAt: common.CurrentTimeMillis() + delay, delayMillis: delay}
+	c.mu.Unlock()
+}
+
+// queuePausedLocked reports whether this queue's round is still inside its pause
+// window, retiring the entry once the window has run out. Callers hold mu.
+func (c *DefaultLitePullConsumer) queuePausedLocked(mq common.MessageQueue) bool {
+	p, ok := c.pullPause[mq]
+	if !ok {
+		return false
+	}
+	if common.CurrentTimeMillis() >= p.readyAt {
+		delete(c.pullPause, mq)
+		return false
+	}
+	return true
+}
+
+// nextPullPauseDeadline is the soonest instant any parked queue may pull again,
+// so the round's wait never stretches a pause that was meant to be short.
+func (c *DefaultLitePullConsumer) nextPullPauseDeadline() (int64, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var soonest int64
+	found := false
+	for _, p := range c.pullPause {
+		if !found || p.readyAt < soonest {
+			soonest, found = p.readyAt, true
+		}
+	}
+	return soonest, found
 }
 
 // ---------------------------------------------------------------- small helpers

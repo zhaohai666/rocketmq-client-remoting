@@ -26,7 +26,7 @@ NameServer + Broker，无 proxy、无本地扩展依赖、无代码生成步骤�
 ```bash
 cd rust
 cargo build --all-targets                       # lib + 42 个 examples
-cargo test --quiet                              # 1115 passed; 0 failed; 0 ignored（~10s）
+cargo test --quiet                              # 1127 passed; 0 failed; 0 ignored（~10s）
 cargo clippy --all-targets --all-features -- -D warnings  # 零 warning 是硬门槛
 ```
 
@@ -252,7 +252,11 @@ ROCKETMQ_TLS_ENABLE=1 cargo run --quiet --example live_producer -- 127.0.0.1:987
 - ✅ Producer：上表九种发送形态全覆盖
 - ✅ PushConsumer：长轮询 + POP（`POP_CK` / ACK / CHANGE_INVISIBLE）、顺序、广播、
   重试 / 死信、位点持久化、拉取停摆自愈、POP 的待 ack 欠账闸门（严格大于 `pop_threshold_for_queue`，默认 96，命中记进拉取路径同一个流控计数与告警节奏）
-- ✅ PullConsumer / LitePullConsumer（含队列变更监听、三张位点表、pause / resume）
+- ✅ PullConsumer / LitePullConsumer（含队列变更监听、三张位点表、pause / resume；LitePull
+  解析拉取位点前先过四道缓存闸门——整个缓冲条数 `pull_threshold_for_all` 10000 / 本队列条数
+  `pull_threshold_for_queue` 1000 / 本队列存储字节 `pull_threshold_size_for_queue` 100 MiB
+  整除 / 本队列位点跨度 `consume_max_span` 2000，都严格大于才停；命中只重排这一个队列 50ms，
+  broker 的 `FLOW_CONTROL`(215) 只等 20ms）
 - ✅ 六个队列分配策略（AVG / AVG_BY_CIRCLE / CONFIG / CONSISTENT_HASH / MACHINE_ROOM /
   MACHINE_ROOM_NEARBY），可插拔并由真实重平衡驱动
 - ✅ Admin 全链路（topic / cluster / 消费统计 / 位点重置 / 锁队列 / 清理）
@@ -296,7 +300,7 @@ broker 后再发消息"**（否则首批消息会因 broker 尚不认识本组�
 | `live_producer` | 六条发送路径、事务两阶段+回查、撤回 recallMessage、异步内核、退出注销 35；⚠ TLS 腿需 `ROCKETMQ_TLS_ENABLE=1` |
 | `live_consumer` | 长轮询 / tag 过滤 / `%RETRY%` 重投 / `%DLQ%` 死信 / 部分 ack / POP / 广播 / 顺序死信 / 显式 COMMIT-ROLLBACK / 停摆自愈 / 307 |
 | `live_pull_consumer` | 手动 pull 不重不漏、位点调用方掌控、长轮询真的挂起 |
-| `live_lite_pull_consumer` | subscribe / assign / seek / poll / committed、auto_commit 两态、三张位点表在真机各自数出来 |
+| `live_lite_pull_consumer` | subscribe / assign / seek / poll / committed、auto_commit 两态、三张位点表在真机各自数出来、本队列缓存条数闸门（超标只 park 这一路，排空后续读到尾部）|
 | `live_lite_pull_cursor` | 拉取游标：NO_MATCHED_MSG 跟过整段 + OFFSET_ILLEGAL 越界自愈 |
 | `live_lite_pull_code` | lite 请求码 361 + lite 位；⚠ 运行时翻 broker 开关 `litePullMessageEnable`，退出前还原 |
 | `live_lite_topic_queue_change` | 队列变更监听：扩容/缩容即时回调、快照推进不重复回调 |

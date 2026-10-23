@@ -15,7 +15,7 @@ rebalance, pull loops and offset commits are handled by periodic goroutines insi
 - Layers: `remoting` (wire protocol + long-connection transport) → `common` (message model,
   codecs, compression, constants) → `client` (Producer / Push / Pull / LitePull / Admin /
   transaction / trace)
-- Verified against a **RocketMQ 5.5.1** cluster: 15 live tools plus 784 unit tests
+- Verified against a **RocketMQ 5.5.1** cluster: 15 live tools plus 806 unit tests
 
 ## Prerequisites
 
@@ -55,10 +55,10 @@ Measured result of `go test ./... -count=1` (all three test packages `ok`):
 
 | Package | Test functions | Time |
 | --- | --- | --- |
-| `client` | 464 | 45.4s |
-| `common` | 135 | 2.1s |
-| `remoting` | 185 | 1.5s |
-| **Total** | **784** (70 `*_test.go` files) | ~49s |
+| `client` | 486 | 46.5s |
+| `common` | 135 | 1.7s |
+| `remoting` | 185 | 0.7s |
+| **Total** | **806** (71 `*_test.go` files) | ~49s |
 
 To count them yourself: `go test ./client/ -list '.*' | grep -c '^Test'`. Concurrency
 regression on its own:
@@ -405,7 +405,12 @@ to get full verification.
   control before pulling, online thread-pool resize, `OFFSET_ILLEGAL` freeze and rebuild,
   graceful shutdown joins in-flight consumption), Pull (caller-held cursor, short polling, long
   polling, offset read/write, `sendMessageBack`), LitePull (background short-pull + dual
-  cursor, `Seek`, auto-commit, queue-change listener, shutdown persistence)
+  cursor, four cache gates judged before the pull offset is resolved — whole-buffer message
+  count / this queue's count / this queue's stored bytes (MiB, integer division) / this
+  queue's offset span, each refusing only when strictly above its threshold, a refusal
+  re-scheduling just this queue 50ms later while the broker's `FLOW_CONTROL`(215) waits
+  20ms,
+  `Seek`, auto-commit, queue-change listener, shutdown persistence)
 - ✅ Six queue allocation strategies: average, by-circle, consistent hash, machine room,
   nearby machine room, by configuration
 - ✅ Admin: cluster and route discovery, topic / subscription group / KV config CRUD, offset
@@ -573,7 +578,7 @@ go/
 │   ├── trace.go · trace_hook.go · trace_dispatcher.go · trace_context.go
 │   ├── consumer_stats.go · stats_item.go · consumer_running_info.go · fault_strategy.go
 │   ├── consume_directly.go · jsonutil.go
-│   └── *_test.go                   70 test files, 784 test functions
+│   └── *_test.go                   71 test files, 806 test functions
 └── examples/                   17 executables (see "Live Cluster Verification")
 ```
 

@@ -109,6 +109,21 @@ public:
     }
     void setBrokerSuspendMaxTimeMillis(int32_t ms) { brokerSuspendMaxTimeMillis_ = ms; }
     void setPullIntervalMillis(int32_t ms) { pullIntervalMillis_ = std::max(0, ms); }
+    // Lite-pull cache flow-control knobs. All four gates are judged **strictly greater** than the
+    // threshold (a queue exactly on the threshold still pulls), and every value is a plain budget:
+    // a 0 trips on the first cached message -- no validation or clamping.
+    // pullThresholdForAll: the whole-buffer (all queues summed) message-count budget.
+    void setPullThresholdForAll(int32_t n) { pullThresholdForAll_ = n; }
+    int32_t pullThresholdForAll() const { return pullThresholdForAll_; }
+    // pullThresholdForQueue: this queue's cached message count.
+    void setPullThresholdForQueue(int32_t n) { pullThresholdForQueue_ = n; }
+    int32_t pullThresholdForQueue() const { return pullThresholdForQueue_; }
+    // pullThresholdSizeForQueue: this queue's cached bytes in **integer** MiB (sum of storeSize).
+    void setPullThresholdSizeForQueue(int32_t n) { pullThresholdSizeForQueue_ = n; }
+    int32_t pullThresholdSizeForQueue() const { return pullThresholdSizeForQueue_; }
+    // consumeMaxSpan: max cached queueOffset minus min cached queueOffset, this queue only.
+    void setConsumeMaxSpan(int64_t n) { consumeMaxSpan_ = n; }
+    int64_t consumeMaxSpan() const { return consumeMaxSpan_; }
     void setMessageQueueListener(std::shared_ptr<LiteMessageQueueListener> listener) {
         messageQueueListener_ = std::move(listener);
     }
@@ -172,6 +187,28 @@ public:
     int64_t pullCursorOf(const MessageQueue& mq);
     int64_t consumeCursorOf(const MessageQueue& mq);
 
+    // ---------------- Cache flow-control observers ----------------
+    // One refusal on the aggregate gate, one on the shared count+size gate and one on the span gate
+    // ticks these three counters (mirrors the push path's flowControlTimes shape: the counters are the
+    // sole offline evidence for the "messages pile up in memory" behaviour a real broker run does not
+    // reveal quickly). Every trip also logs at debug; a warn only fires on trips 1, 1001, 2001, ...
+    // (same rule as the push path).
+    int64_t aggregateFlowControlTimes() const { return aggregateFlowControlTimes_.load(); }
+    int64_t queueFlowControlTimes() const { return queueFlowControlTimes_.load(); }
+    int64_t spanFlowControlTimes() const { return spanFlowControlTimes_.load(); }
+    // The pause the loop actually applied on its most recent cache-gate refusal or 215 answer
+    // (0 = nothing paused yet). Wall-clock sleep is measured on the pull thread, so this is the value
+    // a test asserts, matching the push path's lastPullPauseMillis.
+    int64_t lastLitePullPauseMillis() const { return lastLitePullPauseMillis_.load(); }
+
+    // Test-only entries. Offline reachability of the gate, its accumulators and its counters follows
+    // the push path's pattern (flowControlHitForTest + lastPullPauseMillis): what the pull thread
+    // decides between rounds is otherwise invisible, and a real broker run cannot pin it either.
+    bool cacheFlowControlHitForTest(const MessageQueue& mq);
+    // Stage a backlog directly into the local buffer (and its accumulators) without a pull, so a test
+    // controls the cached count / storeSize sum / offset span exactly.
+    void injectCachedForTest(const std::vector<MessageExt>& msgs);
+
     // ---------------- Queue query / control ----------------
     // All consumable queues of the topic (taken from the broker route, namespace already applied).
     std::vector<MessageQueue> fetchMessageQueues(const std::string& topic);
@@ -200,6 +237,12 @@ private:
     SubscriptionData subscriptionDataFor(const std::string& topic) const;
     bool filterTags(std::vector<MessageExt>& msgs, const SubscriptionData& subData);
     void enqueue(const std::vector<MessageExt>& msgs);
+    // Per-queue cache gate: judged at the top of the queue's pull round, before the offset is
+    // resolved. Reads the local buffer's state under bufferMutex_ (aggregate = whole-buffer size;
+    // count/size/span = this queue's accumulator), judges the four thresholds in strict order (all
+    // strictly greater) and returns true on a refusal -- which ticks one of the three counters and
+    // logs debug, plus a warn on the 1st/1001st/... trip.
+    bool cacheFlowControlHit(const MessageQueue& mq);
     void maybeAutoCommit();
     // The half shared by commit()'s three entry points: write the in-memory offset table + persistAll on demand.
     void commitOffsets(const std::map<MessageQueue, int64_t>& targets,
@@ -244,6 +287,13 @@ private:
     int32_t autoCommitIntervalMillis_ = 5000;
     int32_t pullIntervalMillis_ = 50;
 
+    // Lite-pull cache flow-control budgets. Plain numbers, never validated or clamped: a 0 is legal
+    // and trips on the first cached message (strictly-greater judgment, see cacheFlowControlHit).
+    int32_t pullThresholdForAll_ = 10000;
+    int32_t pullThresholdForQueue_ = 1000;
+    int32_t pullThresholdSizeForQueue_ = 100;
+    int64_t consumeMaxSpan_ = 2000;
+
     std::vector<std::string> nameServerAddrs_;
     std::shared_ptr<RPCHook> rpcHook_;
 
@@ -283,6 +333,34 @@ private:
     std::mutex bufferMutex_;
     std::condition_variable bufferCv_;
     std::deque<MessageExt> localBuffer_;
+
+    // Per-queue cache accumulator: what this queue currently contributes to localBuffer_. Kept in
+    // exact sync with the buffer at the four mutation sites (enqueue / poll pop / seek prune / the
+    // revoked-queue prune at the top of a pull round), all under bufferMutex_. The gate reads these
+    // numbers instead of scanning the whole deque every round, so a per-queue verdict never costs an
+    // O(buffer) walk. offsets is a multiset because two cached messages of one queue may share a
+    // queueOffset (never for the same offset twice in practice, but multiset keeps erase exact).
+    struct QueueCacheAccum {
+        int64_t count = 0;
+        int64_t sizeSum = 0;
+        std::multiset<int64_t> offsets;
+    };
+    std::map<MessageQueue, QueueCacheAccum> cacheAccums_;
+
+    // Per-queue cache-gate park deadline (steady_clock, same idiom as the push path's pause). Owned
+    // by the pull thread: only pullServiceLoop reads and writes it, so no lock guards it. A parked
+    // queue is skipped at the top of its round; a sibling queue is never delayed by it.
+    std::map<MessageQueue, std::chrono::steady_clock::time_point> parkUntil_;
+
+    // Three counters: one for the aggregate gate, one shared by the count and size gates, one for
+    // the span gate. Exposed by the observer methods above, following the push path's single
+    // flowControlTimes shape but split so each gate's refusals stay attributable.
+    std::atomic<int64_t> aggregateFlowControlTimes_{0};
+    std::atomic<int64_t> queueFlowControlTimes_{0};
+    std::atomic<int64_t> spanFlowControlTimes_{0};
+    // The pause (ms) last applied by either a cache-gate refusal (50) or a broker FLOW_CONTROL(215)
+    // answer (20). Stamped so a test asserts the recorded value, not a measured sleep.
+    std::atomic<int64_t> lastLitePullPauseMillis_{0};
 
     std::map<MessageQueue, int64_t> nextOffset_;
     std::map<MessageQueue, int64_t> consumeOffset_;

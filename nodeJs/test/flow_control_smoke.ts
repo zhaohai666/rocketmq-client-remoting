@@ -26,19 +26,44 @@
 //     wait at all for an idle long-poll timeout. The broker's answer has to reach the
 //     loop as a coded exception, or the short wait silently never applies.
 //
+// The LITE PULL legs below pin the same two rules on the path that has NO local
+// cache and NO background pull task — DefaultLitePullConsumer.poll() pulls inline
+// inside the caller's deadline and hands the messages straight back, so the only
+// structural pause it can honour is the broker's own throttle answer:
+//   * a 215 parks THAT queue for 20ms (the same exported constant the push path
+//     uses) and the queue is pulled again once the park expires, while every other
+//     code keeps today's behaviour — the idle single-queue guard, unchanged;
+//   * a parked queue never holds up its siblings inside one poll() deadline, and
+//     a round where every queue is parked waits out the SHORTEST remaining park
+//     instead of burning the caller's deadline;
+//   * the pull kernel hands the broker code to its caller on a typed exception, so
+//     both branches above can actually read it.
+// This path has no client-side cache gates, so it has no flow-control counters:
+// flowControlTimes belongs to the push and POP gates asserted above and is not
+// moved by anything below.
+//
 // Run: node --experimental-strip-types test/flow_control_smoke.ts
+import net from 'node:net';
+
 import { MessageQueue, MessageExt } from '../src/common/message.ts';
 import { ProcessQueue } from '../src/client/process_queue.ts';
 import { PopProcessQueue } from '../src/client/pop_process_queue.ts';
 import { SubscriptionData } from '../src/common/subscriptionData.ts';
 import { PullResult, PullStatus } from '../src/client/consumer_result.ts';
-import { PopResult } from '../src/client/pop_api.ts';
+import { PopResult, processPopResponse } from '../src/client/pop_api.ts';
+import { PopMessageResponseHeader } from '../src/remoting/headers.ts';
 import { queuePopLoop, POP_DELAY_WHEN_EXCEPTION, POP_DELAY_WHEN_CACHE_FLOW_CONTROL } from '../src/client/pop_consumer.ts';
 import { MQBrokerException, RemotingTimeoutException } from '../src/remoting/exception.ts';
 import {
   DefaultMQPushConsumer, isFlowControlWarnTrip, pullRetryDelayMillisFor,
   PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL, PULL_TIME_DELAY_MILLS_WHEN_PULL_FAILED,
 } from '../src/client/consumer.ts';
+import { DefaultLitePullConsumer, litePullParkMillisFor } from '../src/client/lite_pull_consumer.ts';
+import { DefaultMQPullConsumer } from '../src/client/pull_consumer.ts';
+import { RemotingCommand } from '../src/remoting/remotingCommand.ts';
+import { RequestCode, ResponseCode } from '../src/remoting/codes.ts';
+import { encodeMessageExt } from '../src/common/messageDecoder.ts';
+import { MessageConst } from '../src/common/messageConst.ts';
 import { mqKey } from '../src/client/offset_store.ts';
 
 let pass = 0, fail = 0;
@@ -502,6 +527,331 @@ async function drivePopGate(opts: {
   popHit(c, key, 1);
   check('the 1001st trip of the shared counter warns',
     c.flowControlTriggered === 1001 && isFlowControlWarnTrip(c.flowControlTriggered));
+}
+
+// ======================= the LITE PULL path (poll, no cache) =======================
+// LiteBroker plays nameserver AND broker on one real socket: it answers the route
+// with N queues and lets the test script the pull answer of each queue, so the
+// parking is pinned on wire traffic rather than on an injected kernel.
+const LITE_TOPIC = 'NodeJsLiteFlowControlTopic';
+const LITE_BROKER = 'liteFcBroker';
+// The port's existing single-queue "nothing found" guard, asserted as the CONTROL
+// value: a code that is not 215 must still land here.
+const LITE_IDLE_GUARD_MILLIS = 200;
+
+function storedLiteMessage(queueId: number, offset: number): MessageExt {
+  const msg = new MessageExt(LITE_TOPIC, Buffer.from(`lite-fc-${queueId}-${offset}`, 'utf8'), 'tagA');
+  msg.setBrokerName(LITE_BROKER);
+  msg.setQueueId(queueId);
+  msg.setQueueOffset(offset);
+  msg.setFlag(0);
+  msg.setSysFlag(0);
+  msg.setBornTimestamp(1_700_000_000_000);
+  msg.setStoreTimestamp(1_700_000_000_001);
+  msg.setBornHost('127.0.0.1');
+  msg.setStoreHost('127.0.0.1');
+  msg.putProperty(MessageConst.PROPERTY_TAGS, 'tagA');
+  return msg;
+}
+
+class LiteBroker {
+  server: net.Server;
+  port = 0;
+  queueNums: number;
+  // Every pull in arrival order: the SKIP and the ASK-AGAIN are read here, so the
+  // test needs no clock assumptions about the client.
+  pulls: Array<{ queueId: number, offset: number, at: number }> = [];
+  private script = new Map<number, { code?: number, found?: boolean, left: number }>();
+
+  constructor(queueNums: number) {
+    this.queueNums = queueNums;
+    this.server = net.createServer((s) => this.onConnection(s));
+  }
+
+  listen(): Promise<number> {
+    return new Promise((resolve) => {
+      this.server.listen(0, '127.0.0.1', () => {
+        this.port = (this.server.address() as net.AddressInfo).port;
+        resolve(this.port);
+      });
+    });
+  }
+
+  get addr() { return `127.0.0.1:${this.port}`; }
+  close() { this.server.close(); }
+
+  // throttle answers this queue's next `left` pulls with the broker code `code`.
+  throttle(queueId: number, left: number, code: number): this {
+    this.script.set(queueId, { code, left });
+    return this;
+  }
+
+  // handBack answers this queue's next `left` pulls with one stored message, so a
+  // poll() round can end on a real batch instead of on the deadline.
+  handBack(queueId: number, left: number): this {
+    this.script.set(queueId, { found: true, left });
+    return this;
+  }
+
+  pullsOf(queueId: number) { return this.pulls.filter((p) => p.queueId === queueId); }
+
+  private routeBody(): string {
+    return JSON.stringify({
+      orderTopicConf: null,
+      queueDatas: [{
+        brokerName: LITE_BROKER, readQueueNums: this.queueNums,
+        writeQueueNums: this.queueNums, perm: 6, topicSysFlag: 0,
+      }],
+      brokerDatas: [{
+        cluster: 'DefaultCluster', brokerName: LITE_BROKER,
+        brokerAddrs: { '0': this.addr }, zoneName: null, enableActingMaster: false,
+      }],
+      filterServerTable: {},
+    });
+  }
+
+  onConnection(sock: net.Socket) {
+    let buf = Buffer.alloc(0);
+    sock.on('data', (chunk) => {
+      buf = Buffer.concat([buf, chunk]);
+      for (;;) {
+        if (buf.length < 4) return;
+        const total = buf.readInt32BE(0);
+        if (total <= 0 || total > 20 * 1024 * 1024) { sock.destroy(); return; }
+        if (buf.length < 4 + total) return;
+        const frame = buf.subarray(0, 4 + total);
+        buf = buf.subarray(4 + total);
+        let req: RemotingCommand;
+        try { req = RemotingCommand.decode(frame); } catch { sock.destroy(); return; }
+        const resp = this.respond(req);
+        if (resp) sock.write(resp.encode());
+      }
+    });
+    sock.on('error', () => { /* the client hangs up on teardown */ });
+  }
+
+  respond(req: RemotingCommand): RemotingCommand | null {
+    const resp = RemotingCommand.createResponseCommand(ResponseCode.SUCCESS)!;
+    resp.opaque = req.opaque;
+    resp.serializeTypeCurrentRpc = req.serializeTypeCurrentRpc;
+    if (req.code === RequestCode.GET_ROUTEINFO_BY_TOPIC) {
+      resp.body = Buffer.from(this.routeBody(), 'utf8');
+      return resp;
+    }
+    if (req.code === RequestCode.LITE_PULL_MESSAGE || req.code === RequestCode.PULL_MESSAGE) {
+      return this.answerPull(req, resp);
+    }
+    return resp; // heartbeat / offset commit / every other code: SUCCESS
+  }
+
+  private answerPull(req: RemotingCommand, resp: RemotingCommand): RemotingCommand {
+    const ext = req.extFields || {};
+    const queueId = Number(ext['queueId'] || 0);
+    const offset = Number(ext['queueOffset'] || 0);
+    this.pulls.push({ queueId, offset, at: Date.now() });
+    const s = this.script.get(queueId);
+    const scripted = s != null && s.left > 0;
+    if (scripted) s!.left--;
+    if (scripted && s!.code !== undefined) {
+      resp.code = s!.code!;
+      resp.remark = 'the broker is flow controlling this queue';
+      return resp;
+    }
+    if (scripted && s!.found) resp.code = ResponseCode.SUCCESS;
+    else resp.code = ResponseCode.PULL_NOT_FOUND;
+    if (scripted && s!.found) resp.body = encodeMessageExt(storedLiteMessage(queueId, offset));
+    resp.addExtField('nextBeginOffset', String(offset + 1));
+    resp.addExtField('minOffset', '0');
+    resp.addExtField('maxOffset', String(offset + 10));
+    resp.addExtField('suggestWhichBrokerId', '0');
+    return resp;
+  }
+}
+
+// driveLitePoll runs the REAL poll() round loop against a LiteBroker. The waits
+// between rounds are RECORDED, never guessed, and each record also captures how
+// long the queue under probe was still parked at that instant (0 = not parked) —
+// so "the next round skipped ONLY that queue" is visible even when the sleep itself
+// is faked. `sleepForReal` keeps the wall clock honest for the wire-gap assertions.
+async function driveLitePoll(opts: {
+  group: string, queueIds: number[], script: (b: LiteBroker) => void,
+  pollMillis: number, batchSize?: number, sleepForReal?: boolean, probeQueueId?: number,
+}): Promise<{ c: DefaultLitePullConsumer, broker: LiteBroker, waits: number[], parkLeft: number[] }> {
+  const broker = new LiteBroker(opts.queueIds.length);
+  await broker.listen();
+  opts.script(broker);
+  const c = new DefaultLitePullConsumer(opts.group);
+  c.setNamesrvAddr(broker.addr);
+  const mqs = opts.queueIds.map((q) => new MessageQueue(LITE_TOPIC, LITE_BROKER, q));
+  c.assign(mqs);
+  if (opts.batchSize !== undefined) c.setPullBatchSize(opts.batchSize);
+  await c.start();
+  // Pin the cursors so the rounds under test are the only RPCs the loop makes and
+  // no offset-resolution branch can add a wait of its own.
+  for (const mq of mqs) c.seek(mq, 0);
+  const probe = mqs[(opts.queueIds.indexOf(opts.probeQueueId ?? opts.queueIds[0]) + opts.queueIds.length)
+    % opts.queueIds.length];
+  const waits: number[] = [];
+  const parkLeft: number[] = [];
+  (c as any)._sleepPollRound = async (ms: number) => {
+    waits.push(ms);
+    const until = c.getPullParkUntil(probe);
+    parkLeft.push(until === 0 ? 0 : Math.max(1, until - Date.now()));
+    if (opts.sleepForReal) await new Promise<void>((r) => setTimeout(r, ms));
+  };
+  await c.poll(opts.pollMillis);
+  await c.shutdown();
+  broker.close();
+  return { c, broker, waits, parkLeft };
+}
+
+{
+  // ---- the mapping, pinned where the value is decided ----
+  check('a lite pull the broker throttled (215) parks its queue for the same 20ms',
+    litePullParkMillisFor(ResponseCode.FLOW_CONTROL) === 20
+    && litePullParkMillisFor(215) === PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL);
+  // Paired control: every other code is NOT a park — today's behaviour stays.
+  for (const code of [1, 2, 14, 19, 24, 26, 214, 216, 1006]) {
+    check(`code ${code} parks nothing on the lite path`, litePullParkMillisFor(code) === 0);
+  }
+  check('a failure with no broker code behind it parks nothing',
+    litePullParkMillisFor(undefined) === 0);
+}
+
+{
+  // ---- 215 parks THAT queue for 20ms and the queue is pulled again after ----
+  const throttled = await driveLitePoll({
+    group: 'G_nodejs_lite_fc_park', queueIds: [0],
+    script: (b) => b.throttle(0, 1, ResponseCode.FLOW_CONTROL),
+    pollMillis: 400, sleepForReal: true,
+  });
+  const asked = throttled.broker.pullsOf(0);
+  check('the throttled queue was asked again once its park expired',
+    asked.length >= 2, `pulls=${asked.length}`);
+  const parkGap = asked.length >= 2 ? asked[1].at - asked[0].at : -1;
+  check('and it was asked again after the short 20ms broker pause, not before',
+    parkGap >= 19 && parkGap <= 150, `gap=${parkGap}ms`);
+  check('the round asked for the park itself, never for the 200ms idle guard',
+    throttled.waits[0] > 0 && throttled.waits[0] <= 20
+    && throttled.parkLeft[0] > 0 && throttled.parkLeft[0] <= 20,
+    JSON.stringify(throttled.waits) + ' / ' + JSON.stringify(throttled.parkLeft));
+  check('a throttled round moved no cursor: the queue is asked at the same offset',
+    asked[0].offset === 0 && asked[1].offset === 0,
+    asked.map((p) => p.offset).join(','));
+
+  // Paired control on the SAME driver: SYSTEM_BUSY is not a broker throttle, so the
+  // queue is not parked and today's single-queue idle guard is the only wait.
+  const busy = await driveLitePoll({
+    group: 'G_nodejs_lite_fc_busy', queueIds: [0],
+    script: (b) => b.throttle(0, 1, ResponseCode.SYSTEM_BUSY),
+    pollMillis: 400, sleepForReal: true,
+  });
+  const busyAsked = busy.broker.pullsOf(0);
+  const busyGap = busyAsked.length >= 2 ? busyAsked[1].at - busyAsked[0].at : -1;
+  check('control: SYSTEM_BUSY arms no park for the queue',
+    busy.parkLeft[0] === 0, JSON.stringify(busy.parkLeft));
+  check('control: SYSTEM_BUSY keeps today\'s 200ms single-queue idle guard',
+    busy.waits[0] === LITE_IDLE_GUARD_MILLIS, JSON.stringify(busy.waits));
+  check('control: so the retry is late, not at the 20ms throttle pace',
+    busyGap >= 150, `gap=${busyGap}ms`);
+}
+
+{
+  // ---- a parked queue never delays a sibling inside one poll() deadline ----
+  // q0 answers 215 on every pull; q1 hands one message back. With a batch size of
+  // 1 the round must end on q1's message WITHOUT taking any wait at all: a parked
+  // queue is stepped over, not waited on, as long as another queue can answer.
+  const sibling = await driveLitePoll({
+    group: 'G_nodejs_lite_fc_sibling', queueIds: [0, 1],
+    script: (b) => b.throttle(0, 99, ResponseCode.FLOW_CONTROL).handBack(1, 1),
+    pollMillis: 1000, batchSize: 1,
+  });
+  const order = sibling.broker.pulls.map((p) => p.queueId).join(',');
+  const asked0 = sibling.broker.pullsOf(0);
+  const asked1 = sibling.broker.pullsOf(1);
+  check('the throttled queue went first and the sibling was served in the same round',
+    order === '0,1' && asked1.length === 1, order);
+  check('serving the sibling cost no wait at all, park or idle guard',
+    sibling.waits.length === 0, JSON.stringify(sibling.waits));
+  const siblingGap = asked1.length === 1 && asked0.length >= 1
+    ? asked1[0].at - asked0[0].at : -1;
+  check('the sibling was not held by the parked queue\'s 20ms',
+    siblingGap >= 0 && siblingGap <= 100, `gap=${siblingGap}ms`);
+  check('and the parked queue itself was not asked a second time in that poll',
+    asked0.length === 1, `asked=${asked0.length}`);
+}
+
+{
+  // ---- the caller sees a typed broker exception, not a flattened string ----
+  const broker = new LiteBroker(1);
+  await broker.listen();
+  broker.throttle(0, 4, ResponseCode.FLOW_CONTROL);
+  const puller = new DefaultMQPullConsumer('G_nodejs_lite_fc_typed');
+  puller.setNamesrvAddr(broker.addr);
+  await puller.start();
+  const mq = new MessageQueue(LITE_TOPIC, LITE_BROKER, 0);
+
+  let thrown: any = null;
+  try { await puller.pull(mq, '*', 0, 10); } catch (e) { thrown = e; }
+  check('a non-SUCCESS pull answer surfaces as the port\'s typed broker exception',
+    thrown instanceof MQBrokerException && thrown.name === 'MQBrokerException',
+    thrown == null ? 'nothing thrown' : `${thrown.name}: ${thrown.message}`);
+  check('and it carries the response code the caller branches on',
+    thrown instanceof MQBrokerException && thrown.responseCode === ResponseCode.FLOW_CONTROL,
+    String(thrown && (thrown as any).responseCode));
+  check('while the message stays informative (code and the broker remark)',
+    thrown != null && (thrown as Error).message.includes('215')
+    && (thrown as Error).message.includes('flow controlling'), thrown && (thrown as Error).message);
+
+  // A non-215 code has to survive the same way — the text alone is not enough.
+  broker.throttle(0, 1, ResponseCode.SYSTEM_ERROR);
+  let otherCode: any = null;
+  try { await puller.pull(mq, '*', 0, 10); } catch (e) { otherCode = e; }
+  check('a SYSTEM_ERROR pull also surfaces its code, not only its text',
+    otherCode instanceof MQBrokerException && otherCode.responseCode === ResponseCode.SYSTEM_ERROR,
+    otherCode == null ? 'nothing thrown' : `${otherCode.name}/` + (otherCode as any).responseCode);
+
+  // pullAsync hands the SAME typed exception to the callback (it never re-wraps an
+  // Error), so the scheduled pull can branch on the code too.
+  broker.throttle(0, 1, ResponseCode.FLOW_CONTROL);
+  const asyncErr: any = await new Promise((resolve) => {
+    puller.pullAsync(mq, '*', 0, 10,
+      { onSuccess: () => resolve(null), onException: (e) => resolve(e) }, 3000);
+  });
+  check('pullAsync delivers the typed exception with its code to onException',
+    asyncErr instanceof MQBrokerException && asyncErr.responseCode === ResponseCode.FLOW_CONTROL,
+    asyncErr == null ? 'success instead' : String(asyncErr.name));
+  await puller.shutdown();
+
+  // The POP sibling of this rule: a broker answer reaching the POP round as a bare
+  // Error leaves its 20ms throttle branch dead code, so the response processing
+  // must throw the typed exception with the code as well.
+  let popErr: any = null;
+  try {
+    processPopResponse('broker-a', ResponseCode.FLOW_CONTROL, 'pop is flow controlling',
+      null, new PopMessageResponseHeader(), LITE_TOPIC, '', false);
+  } catch (e) { popErr = e; }
+  check('a POP answer the broker throttled keeps its code on a typed exception',
+    popErr instanceof MQBrokerException && popErr.responseCode === ResponseCode.FLOW_CONTROL,
+    popErr == null ? 'nothing thrown' : `${popErr.name}: ${popErr.message}`);
+  broker.close();
+}
+
+{
+  // The lite path has no client-side cache gate, so it must not move the counter
+  // the push and POP gates above own and assert.
+  const c = new DefaultLitePullConsumer('G_nodejs_lite_fc_no_counter');
+  check('the lite pull consumer has no flow-control counter of its own',
+    (c as any).flowControlTriggered === undefined);
+  check('and a parked queue is keyed like every other per-queue state',
+    c.getPullParkUntil(new MessageQueue(LITE_TOPIC, LITE_BROKER, 7)) === 0
+    && mqKey(new MessageQueue(LITE_TOPIC, LITE_BROKER, 7)).includes(LITE_BROKER));
+  // The park knob is cancellable the way pause() is: a past instant is dropped.
+  const mq = new MessageQueue(LITE_TOPIC, LITE_BROKER, 7);
+  c.setPullParkUntil(mq, Date.now() + PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL);
+  check('a park armed for the future holds the queue back', c.getPullParkUntil(mq) > 0);
+  c.setPullParkUntil(mq, Date.now() - 1);
+  check('an expired park arms nothing', c.getPullParkUntil(mq) === 0);
 }
 
 console.log(`\nflow control: ${pass} checks, ${fail} failed`);

@@ -24,7 +24,7 @@ python3 -m venv .venv
 .venv/bin/pip install -e .                     # 顶层包：client / common / remoting
 
 .venv/bin/pip install pytest                   # 只有跑单元测试才需要它
-.venv/bin/python -m pytest tests/ -q           # 1645 passed, 4 skipped（122.2s）
+.venv/bin/python -m pytest tests/ -q           # 1673 passed, 4 skipped（123.6s）
 .venv/bin/python selfcheck.py                  # selfcheck: 7/7 passed
 ```
 
@@ -367,7 +367,7 @@ TCP 建连后、TLS 握手前完成 SOCKS CONNECT；NameServer HTTP 动态取址
 | 定时消息撤回 `recall_message`（370，句柄来自 `SendResult.recall_handle`） | ✅ |
 | Push Consumer：并发 / 顺序监听、广播、每队列三条缓存闸门（topic 预算在重平衡时摊到每队列）、位点修正与重置、停摆自愈、挂起消息清扫 | ✅ |
 | Pull Consumer：手动拉取 + 长轮询 + 手动提交位点 + 按时间戳查位点 | ✅ |
-| Lite Pull Consumer：`poll` / `assign` / `seek` / `pause` / `commit`、三张位点表、topic 队列变更监听 | ✅ |
+| Lite Pull Consumer：`poll` / `assign` / `seek` / `pause` / `commit`、三张位点表、topic 队列变更监听、拉取前先过四道缓存闸门（整个缓冲条数 `pull_threshold_for_all` 10000 / 本队列条数 `pull_threshold_for_queue` 1000 / 本队列存储字节 `pull_threshold_size_for_queue` 100 MiB 整除 / 本队列位点跨度 `consume_max_span` 2000，都严格大于才停；命中只重排这一个队列 50ms，broker 的 `FLOW_CONTROL`(215) 只等 20ms） | ✅ |
 | POP 消费循环（`pop_mode`，含 ack / 续期 / POP 顺序 / 待 ack 欠账闸门：本队列欠账严格大于 `pop_threshold_for_queue`（默认 96）才停、命中重排 50ms 并记进拉取路径那个全局流控计数） | ✅ |
 | 队列分配策略：AVG / AVG_BY_CIRCLE / CONFIG / CONSISTENT_HASH / MACHINE_ROOM / MACHINE_ROOM_NEARBY | ✅ |
 | 命名空间两套：本地前缀 `namespace` 与服务端 `namespace_v2` | ✅ |
@@ -442,7 +442,7 @@ TCP 建连后、TLS 握手前完成 SOCKS CONNECT；NameServer HTTP 动态取址
 | `verify_latency_live.py` | 发送延迟故障规避：隔离窗口、换 broker、恢复 |
 | `verify_lite_pull_code_live.py` | lite 请求码 361 与 broker 的 lite 开关（运行时翻转并在退出前还原） |
 | `verify_lite_pull_cursor_live.py` | lite 拉取游标跟随 `nextBeginOffset`，含 NO_MATCHED_MSG 与越界自愈 |
-| `verify_lite_pull_live.py` | lite pull 全链路：rebalance、assign+seek、分配策略、三张位点表 |
+| `verify_lite_pull_live.py` | lite pull 全链路：rebalance、assign+seek、分配策略、三张位点表、本队列缓存条数闸门（超标只 park 这一路，排空后续读到尾部）|
 | `verify_lite_topic_queue_change_live.py` | topic 队列扩/缩容后 `on_changed` 被触发 |
 | `verify_offset_illegal_live.py` | `OFFSET_ILLEGAL` 纠错分支：丢队列 + 修正位点立刻落盘 |
 | `verify_orderly_reconsume_live.py` | 顺序消费的重投闸门与显式 COMMIT/ROLLBACK |

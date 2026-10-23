@@ -61,7 +61,7 @@ repository-wide **duplicate-class-name static guard** (PHP has no module isolati
 when the same FQCN is declared in two files the one autoloaded first silently wins and
 the other dies — this guard cannot be skipped), then chains **26** suites — the list is derived
 from `tests/Run*.php`, so a new suite cannot silently stay out of the check. Measured today:
-**guard CLEAN, all 4,330 assertions across the 26 suites pass**; any failure exits with a
+**guard CLEAN, all 4,554 assertions across the 26 suites pass**; any failure exits with a
 non-zero code.
 
 ## Examples
@@ -418,13 +418,18 @@ Assigning the public `$client->socksProxy` property works too; all five client f
   (two-phase + broker check-back) / timed messages and recall / Request-Reply
 - ✅ Consuming: Push (concurrent / orderly / broadcasting / offset persistence / start-up
   numeric validation / three pre-pull cache gates per queue, topic budgets divided over the owned queues at rebalance; the POP outstanding-ACK gate stops a round only when this queue's debt is strictly above `popThresholdForQueue` (default 96) and a trip lands on the pull path's one client-wide flow-control counter and warn cadence), Pull (whole-topic view and
-  this-instance share view), LitePull (incl. topic queue-set change listener),
+  this-instance share view), LitePull (incl. topic queue-set change listener, and four cache
+  gates judged before the pull offset is resolved — whole-buffer count `pullThresholdForAll`
+  10000 / this queue's count `pullThresholdForQueue` 1000 / this queue's stored bytes
+  `pullThresholdSizeForQueue` 100 MiB with integer division / this queue's offset span
+  `consumeMaxSpan` 2000, each refusing only when strictly above its threshold; a refusal
+  re-schedules just this queue 50ms later while the broker's `FLOW_CONTROL`(215) waits 20ms),
   POP (200050 pop / 200051 ack / 200053 change-invisible-time + checkpoints),
   `ConsumeMessageDirectly`
 - ✅ Queue allocation: the local strategies `AVG` / `AVG_BY_CIRCLE` / `CONFIG` /
   `CONSISTENT_HASH` / `MACHINE_ROOM` / `MACHINE_ROOM_NEARBY`, driven by rebalance; a POP
   consumer with `clientRebalance=false` switches to the **broker-side assignment
-  `QUERY_ASSIGNMENT(400)`** (aligned with the Java client): the periodic rounds hang off the
+  `QUERY_ASSIGNMENT(400)`**: the periodic rounds hang off the
   instance `tick()` and the broker's answer — not the local strategy — decides the pull
   surface; an RPC failure or a missing result set **keeps the previous assignment**, while an
   explicit empty set and `TOPIC_NOT_EXIST(17)` clear it — it never degrades to a "take all
@@ -442,7 +447,7 @@ Assigning the public `$client->socksProxy` property works too; all five client f
 - ✅ Compression: ZLIB (`gzcompress`), pure-PHP LZ4 Frame, ZSTD (CLI preferred, pure-PHP
   fallback)
 - ✅ TLS: CA verification / mTLS / SNI
-- ✅ Offline self-test: 26 suites with 4,330 assertions + the duplicate-class-name static
+- ✅ Offline self-test: 26 suites with 4,554 assertions + the duplicate-class-name static
   guard (measured all green)
 - ✅ Live-cluster verification: the 14 `examples/live_*.php` cases cover the admin surface,
   redelivery / dead-letter, pull mode, queue-change listening, POP, TLS, Request-Reply,

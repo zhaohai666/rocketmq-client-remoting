@@ -338,6 +338,13 @@ public static class LiveLitePull
         o.SetInstanceName("liteoff");
         o.SetPollTimeoutMillis(1000);
         o.SetPullBatchSize(32);
+        // Every cache gate is lifted above this scenario's backlog on purpose: S8 buffers 1200 messages in
+        // one queue and the default per-queue count budget (1000) would stop the background pull at 1024 --
+        // that is the gate working (S9 measures it), not a defect. S8 is about the three offset tables.
+        o.PullThresholdForAll = NBig * 32;
+        o.PullThresholdForQueue = NBig + 100;
+        o.PullThresholdSizeForQueue = 1024;
+        o.ConsumeMaxSpan = NBig + 1000;
         o.SetAutoCommit(false);   // commit timing is fully controlled by the scenarios
         o.SetConsumeFromWhere(ConsumeFromWhere.ConsumeFromFirstOffset);
         o.Assign(new[] { q0 });
@@ -470,6 +477,148 @@ public static class LiveLitePull
 
         o.Shutdown();
         probe.Shutdown();
+    }
+
+    /// <summary>The per-queue cached-count gate on a real broker: the background pull parks itself once this
+    /// queue holds more than <c>PullThresholdForQueue</c> messages, and releases as soon as <c>Poll()</c>
+    /// drains it.</summary>
+    /// <remarks>
+    /// Threshold 64 with 32 per round and a 200-message backlog: the cursor must stop above the threshold and
+    /// strictly below the tail. A second consumer on the <b>same queue</b> whose threshold clears the backlog
+    /// is the paired control -- if the pull stopped for any other reason (route, switch, broker refusal) it
+    /// would stop for the control too.
+    /// </remarks>
+    private static void CacheGate(string namesrv)
+    {
+        string gateTopic = "LiteGateNet_" + Stamp;
+        string gateGroup = "LiteGatePGNet_" + Stamp;
+        string ctlGroup = "LiteGateCtlNet_" + Stamp;
+        const int NGate = 200;
+        const int Batch = 32;
+        const int QueueThreshold = 64;
+
+        List<MessageQueue> queues = new();
+        int landed = 0;
+        {
+            var prep = new DefaultMQProducer("PG_PrepareGateNet_" + Stamp);
+            prep.NamesrvAddr = namesrv;
+            prep.Start();
+            try
+            {
+                prep.CreateTopic("TBW102", gateTopic, 1);
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine("!! CreateTopic(" + gateTopic + ") failed: " + e.Message);
+            }
+            long routeDeadline = NowMs() + 20000;
+            while (queues.Count == 0 && NowMs() < routeDeadline)
+            {
+                try
+                {
+                    queues = prep.FetchPublishMessageQueues(gateTopic);
+                }
+                catch
+                {
+                    queues = new List<MessageQueue>();
+                }
+                if (queues.Count == 0) Thread.Sleep(500);
+            }
+            Check("S9 prepare topic (1 queue)", queues.Count == 1, "queues=" + queues.Count);
+            if (queues.Count == 1)
+            {
+                for (int from = 0; from < NGate; from += 50)
+                {
+                    var chunk = new List<Message>();
+                    for (int i = from; i < Math.Min(NGate, from + 50); ++i)
+                    {
+                        chunk.Add(new Message(gateTopic, Encoding.UTF8.GetBytes(
+                            "gate-" + i.ToString("D4", CultureInfo.InvariantCulture))));
+                    }
+                    try
+                    {
+                        if (prep.SendBatch(chunk).SendStatus == SendStatus.SendOk)
+                        {
+                            landed += chunk.Count;
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        Console.WriteLine("   SendBatch failed: " + e.Message);
+                    }
+                }
+            }
+            prep.Shutdown();
+        }
+        Check("S9 produced " + NGate + " messages OK", landed == NGate, "landed=" + landed);
+        if (queues.Count != 1)
+        {
+            return;
+        }
+
+        MessageQueue q0 = queues[0];
+        // Only the count gate is under test: the aggregate budget is threshold*batch so it stays clear of the
+        // backlog, and 200 tiny messages cannot reach the size (100 MiB) or span (2000) gates.
+        DefaultLitePullConsumer Gate(string group, string instance, int queueThreshold)
+        {
+            var c = new DefaultLitePullConsumer(group);
+            c.SetNamesrvAddr(namesrv);
+            c.SetInstanceName(instance);
+            c.SetPollTimeoutMillis(1000);
+            c.SetPullBatchSize(Batch);
+            c.PullThresholdForAll = NGate * Batch;
+            c.PullThresholdForQueue = queueThreshold;
+            c.SetAutoCommit(false);
+            c.SetConsumeFromWhere(ConsumeFromWhere.ConsumeFromFirstOffset);
+            c.Assign(new[] { q0 });
+            c.Start();
+            return c;
+        }
+
+        var gated = Gate(gateGroup, "litegate", QueueThreshold);
+        try
+        {
+            long passed = NowMs() + 20000;
+            while (gated.PullCursorOf(q0) <= QueueThreshold && NowMs() < passed) Thread.Sleep(200);
+            long parked = gated.PullCursorOf(q0);
+            Check("S9a the gate let the queue cache past its threshold (" + QueueThreshold + ")",
+                parked > QueueThreshold, "pullCursor=" + parked);
+            Check("S9a the count gate recorded at least one trip", gated.FlowControlForQueueTriggered > 0,
+                "trips=" + gated.FlowControlForQueueTriggered);
+
+            long held = NowMs() + 5000;
+            while (NowMs() < held) Thread.Sleep(500);
+            long still = gated.PullCursorOf(q0);
+            Check("S9a with the buffer over budget the cursor holds its ground (never reaches " + NGate + ")",
+                still == parked && still < NGate, "pullCursor=" + still);
+            Check("S9a the refusal costs at most two more pull rounds",
+                still - QueueThreshold <= 2 * Batch, "pullCursor=" + still + " threshold=" + QueueThreshold);
+
+            var control = Gate(ctlGroup, "litegatectl", NGate + 100);
+            try
+            {
+                long run = NowMs() + 25000;
+                while (control.PullCursorOf(q0) < NGate && NowMs() < run) Thread.Sleep(300);
+                Check("S9-control the same queue pulls all " + NGate + " once the threshold clears",
+                    control.PullCursorOf(q0) == NGate, "pullCursor=" + control.PullCursorOf(q0));
+            }
+            finally
+            {
+                control.Shutdown();
+            }
+
+            var got = Drain(gated, NGate, 60000);
+            var bodies = BodiesOf(got);
+            Check("S9b after the buffer drains the rest arrives (" + NGate + ")",
+                got.Count == NGate && bodies.Count == NGate,
+                "got=" + got.Count + " distinct=" + bodies.Count);
+            Check("S9b the cursor runs to the tail once the queue is consumed",
+                gated.PullCursorOf(q0) == NGate, "pullCursor=" + gated.PullCursorOf(q0));
+        }
+        finally
+        {
+            gated.Shutdown();
+        }
     }
 
     public static int Run(string[] args)
@@ -950,6 +1099,11 @@ public static class LiveLitePull
         Console.WriteLine();
         Console.WriteLine("S8 three offset tables: pull cursor / consumed cursor / commit landing");
         ThreeOffsetTable(namesrv, assigned);
+
+        // ---------------- S9 the local buffer's cached-count gate ----------------
+        Console.WriteLine();
+        Console.WriteLine("S9 cached-count gate: the pull parks itself and resumes after draining");
+        CacheGate(namesrv);
 
         Console.WriteLine();
         Console.WriteLine("LitePullConsumer: PASS=" + _pass + " FAIL=" + _fail);

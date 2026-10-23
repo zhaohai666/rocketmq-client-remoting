@@ -489,12 +489,23 @@ func isTimeout(err error) bool {
 // One loop serves both the concurrent and the orderly consumer (orderly is just
 // a flag on it), so both paths get the same discrimination.
 func pullRetryDelay(err error) time.Duration {
-	if e, ok := err.(*common.Error); ok {
-		if code, has := e.ResponseCode(); has && code == remoting.RespFlowControl {
-			return pullTimeDelayMillsWhenBrokerFlow
-		}
+	if isBrokerFlowControlError(err) {
+		return pullTimeDelayMillsWhenBrokerFlow
 	}
 	return pullTimeDelayMillsWhenPullFailed
+}
+
+// isBrokerFlowControlError recognises the one failure answer that means "the
+// BROKER is throttling its own queues" (response code 215), whichever error shape
+// carried it. Pull paths share this single recognition so a 215 can never map to
+// two different waits.
+func isBrokerFlowControlError(err error) bool {
+	if e, ok := err.(*common.Error); ok {
+		if code, has := e.ResponseCode(); has && code == remoting.RespFlowControl {
+			return true
+		}
+	}
+	return false
 }
 
 func maxInt(a, b int) int {

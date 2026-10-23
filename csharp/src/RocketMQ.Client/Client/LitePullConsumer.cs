@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.Threading;
 
@@ -66,8 +67,33 @@ public sealed class DefaultLitePullConsumer
     private int _autoCommitIntervalMillis = 5000;
     private int _pullIntervalMillis = 50;
 
+    // ---- local-buffer flow control (the four budgets the pull round checks before it
+    // builds a request). Plain budgets, deliberately unvalidated and unclamped: a
+    // threshold of 0 means "trip on the first cached message", which is a legal
+    // configuration, and a negative one simply always trips.
+    private int _pullThresholdForAll = 10000;
+    private int _pullThresholdForQueue = 1000;
+    private int _pullThresholdSizeForQueue = 100;
+    private long _consumeMaxSpan = 2000;
+
     private readonly object _bufferLock = new();
     private readonly Queue<MessageExt> _localBuffer = new();
+    // One queue's slice of _localBuffer (cached count, cached stored bytes, lowest and
+    // highest cached queue offset). Only ever mutated together with the buffer, under
+    // _bufferLock, so this view cannot drift from the messages it describes.
+    private readonly Dictionary<MessageQueue, QueueCache> _queueCaches = new();
+    // Queue -> the park armed by the last refusal (a cache gate or a broker
+    // FLOW_CONTROL answer). Per queue on purpose: a parked queue is skipped for its own
+    // round only and never stalls the rest of the round.
+    private readonly Dictionary<MessageQueue, PullPause> _pullPause = new();
+    // Monotonic clock for the park deadlines: a wall-clock jump must not park a queue for
+    // hours nor let a deadline lapse early.
+    private static readonly Stopwatch MonoClock = Stopwatch.StartNew();
+    // Three refusal counters: the aggregate gate, the count+size gates (shared) and the
+    // span gate. Read through the public observers below.
+    private long _flowControlForAllTriggered;
+    private long _flowControlForQueueTriggered;
+    private long _flowControlForSpanTriggered;
     private readonly Dictionary<MessageQueue, long> _nextOffset = new();
     private readonly Dictionary<MessageQueue, long> _consumeOffset = new();
     private readonly Dictionary<MessageQueue, long> _offsetTable = new();
@@ -271,6 +297,169 @@ public sealed class DefaultLitePullConsumer
 
     public void SetPullIntervalMillis(int ms) => _pullIntervalMillis = Math.Max(0, ms);
 
+    /// <summary><c>pullThresholdForAll</c> (default 10000): the message-count budget for
+    /// the <b>whole</b> local buffer, summed over every queue this instance holds. The
+    /// gate fires only when the cached total is STRICTLY greater, so the threshold reads
+    /// as "how many may sit in the buffer". A plain budget: 0 trips on the first cached
+    /// message.</summary>
+    public int PullThresholdForAll
+    {
+        get => _pullThresholdForAll;
+        set => _pullThresholdForAll = value;
+    }
+
+    /// <summary><c>pullThresholdForQueue</c> (default 1000): the cached message count
+    /// allowed for <b>one</b> queue. Judged against this queue's own share of the buffer
+    /// and never summed with a sibling; strictly greater fires, so a queue sitting exactly
+    /// on the threshold still pulls. 0 trips on the first cached message.</summary>
+    public int PullThresholdForQueue
+    {
+        get => _pullThresholdForQueue;
+        set => _pullThresholdForQueue = value;
+    }
+
+    /// <summary><c>pullThresholdSizeForQueue</c> (default 100): the cached bytes allowed
+    /// for <b>one</b> queue, measured in <b>MiB</b>. The measure is this queue's sum of
+    /// the stored message size the decoder records (<c>storeSize</c>), never the body
+    /// length -- this budget is about the physical backlog the client holds. Divided by
+    /// 1 MiB with <b>integer</b> division, so a threshold of 1 allows anything below
+    /// 2 MiB. 0 trips as soon as a full MiB is cached.</summary>
+    public int PullThresholdSizeForQueue
+    {
+        get => _pullThresholdSizeForQueue;
+        set => _pullThresholdSizeForQueue = value;
+    }
+
+    /// <summary><c>consumeMaxSpan</c> (default 2000): the queueOffset span (highest cached
+    /// offset minus lowest cached offset) allowed for <b>one</b> queue, computed over only
+    /// this queue's cached messages. An empty or single-message cache has span 0. Strictly
+    /// greater fires; 0 trips as soon as the cached offsets differ.</summary>
+    public long ConsumeMaxSpan
+    {
+        get => _consumeMaxSpan;
+        set => _consumeMaxSpan = value;
+    }
+
+    /// <summary>Aggregate-gate refusals (the whole buffer over
+    /// <see cref="PullThresholdForAll"/>), exposed the same way the push path exposes its
+    /// flow-control count.</summary>
+    public long FlowControlForAllTriggered => Interlocked.Read(ref _flowControlForAllTriggered);
+
+    /// <summary>Refusals of the per-queue count gate and of the per-queue size gate; the
+    /// two share one counter, as they describe the same event (this queue's cached
+    /// backlog is over budget).</summary>
+    public long FlowControlForQueueTriggered => Interlocked.Read(ref _flowControlForQueueTriggered);
+
+    /// <summary>Span-gate refusals (this queue's cached offset span over
+    /// <see cref="ConsumeMaxSpan"/>).</summary>
+    public long FlowControlForSpanTriggered => Interlocked.Read(ref _flowControlForSpanTriggered);
+
+    /// <summary>Messages currently sitting in the local buffer, over every queue: the
+    /// value the aggregate gate measures, including the ones already handed to the
+    /// application but not yet polled away.</summary>
+    public int CachedMessageCount
+    {
+        get
+        {
+            lock (_bufferLock)
+            {
+                return _localBuffer.Count;
+            }
+        }
+    }
+
+    /// <summary>This queue's cached message count (0 when the buffer holds nothing of
+    /// it).</summary>
+    public int CachedMessageCountOf(MessageQueue mq)
+    {
+        lock (_bufferLock)
+        {
+            return _queueCaches.TryGetValue(mq, out QueueCache? cache) ? cache.Count : 0;
+        }
+    }
+
+    /// <summary>This queue's cached bytes, measured as the sum of the stored message
+    /// sizes (0 when the buffer holds nothing of it).</summary>
+    public long CachedBytesOf(MessageQueue mq)
+    {
+        lock (_bufferLock)
+        {
+            return _queueCaches.TryGetValue(mq, out QueueCache? cache) ? cache.SizeBytes : 0;
+        }
+    }
+
+    /// <summary>This queue's cached queueOffset span, highest minus lowest over only this
+    /// queue's cached messages (0 for an empty or single-message cache).</summary>
+    public long CachedOffsetSpanOf(MessageQueue mq)
+    {
+        lock (_bufferLock)
+        {
+            return _queueCaches.TryGetValue(mq, out QueueCache? cache) ? cache.Span : 0;
+        }
+    }
+
+    /// <summary>The park a cache-flow-control refusal arms for its queue: the same shared
+    /// constant the push path pauses with, so one value governs every cache gate.</summary>
+    public static int CacheFlowControlBackoffMillis =>
+        DefaultMQPushConsumer.CacheFlowControlBackoffMillis;
+
+    /// <summary>The park a broker FLOW_CONTROL(215) answer arms on this path (again the
+    /// push path's shared constant: a busy broker is not a capacity verdict).</summary>
+    public static int BrokerFlowControlBackoffMillis =>
+        DefaultMQPushConsumer.BrokerFlowControlBackoffMillis;
+
+    /// <summary>The warn cadence of all three paths: the first trip warns, then every
+    /// thousandth after it (one shared rule, delegated to the push path's helper).</summary>
+    public static bool IsFlowControlWarnTrip(long times) =>
+        DefaultMQPushConsumer.IsFlowControlWarnTrip(times);
+
+    /// <summary>How long a broker answer parks this queue's next round: FLOW_CONTROL(215)
+    /// parks for <see cref="BrokerFlowControlBackoffMillis"/> (20 ms) instead of the
+    /// generic failed-pull backoff; <c>-1</c> for every other code means "no per-queue
+    /// park, keep what a failed lite pull already does". Public so the decision is
+    /// pinnable offline without racing a timer.</summary>
+    public static int LitePullPauseMillisForBrokerResponse(int responseCode) =>
+        responseCode == ResponseCode.FlowControl
+            ? DefaultMQPushConsumer.BrokerFlowControlBackoffMillis
+            : NoPullPause;
+
+    /// <summary>The milliseconds left on this queue's park (0 when it is not parked): the
+    /// refusal re-schedules only this queue, so a parked queue does not delay its
+    /// siblings.</summary>
+    public long PullParkRemainingMillis(MessageQueue mq)
+    {
+        lock (_lock)
+        {
+            if (!_pullPause.TryGetValue(mq, out PullPause? pause)) return 0;
+            long left = pause.DeadlineMillis - MonoClock.ElapsedMilliseconds;
+            return left > 0 ? left : 0;
+        }
+    }
+
+    /// <summary>The length (ms) of the last park armed for this queue, or
+    /// <see cref="NoPullPause"/> when it was never parked. Sticky: the record survives the
+    /// deadline, so what a refusal scheduled is observable without racing a timer.</summary>
+    public int LastPullPauseMillis(MessageQueue mq)
+    {
+        lock (_lock)
+        {
+            return _pullPause.TryGetValue(mq, out PullPause? pause) ? pause.Millis : NoPullPause;
+        }
+    }
+
+    /// <summary>Run one pre-pull cache-gate verdict for this queue (without the network),
+    /// exactly the check the pull round makes: a hit increments its counter by one and
+    /// parks this queue for <see cref="CacheFlowControlBackoffMillis"/>.</summary>
+    public bool CacheFlowControlHitForTest(MessageQueue mq) => CacheFlowControlHit(mq);
+
+    /// <summary>Hand messages to the local buffer through the append path a pull result
+    /// uses (accumulators included), so a gate verdict can be pinned without a
+    /// broker.</summary>
+    public void AppendToLocalBufferForTest(IReadOnlyList<MessageExt> msgs) => Enqueue(msgs);
+
+    /// <summary>Nothing parked: the queue's next round runs on the loop's own cadence.</summary>
+    public const int NoPullPause = -1;
+
     public void SetMessageQueueListener(ILiteMessageQueueListener listener) => _messageQueueListener = listener;
 
     public void SetTopicMetadataCheckIntervalMillis(int ms) =>
@@ -364,6 +553,10 @@ public sealed class DefaultLitePullConsumer
                 if (set.Contains(mq)) continue;
                 _nextOffset.Remove(mq);
                 _consumeOffset.Remove(mq);
+                // A queue this instance lets go also loses its park: the deadline belongs
+                // to the pull round of that assignment, and a stale one must neither delay
+                // a re-assigned queue nor be reported for a queue nobody owns.
+                _pullPause.Remove(mq);
             }
 
             _assigned.Clear();
@@ -577,6 +770,16 @@ public sealed class DefaultLitePullConsumer
                     }
 
                     if (paused) continue;
+
+                    // A refusal parks only this queue until its own deadline; skipping just
+                    // this entry keeps the rest of the round running at full speed.
+                    if (IsParked(mq)) continue;
+
+                    // The four cache gates judge this queue before its pull offset is
+                    // resolved and before any request is built: a refused round sends
+                    // nothing.
+                    if (CacheFlowControlHit(mq)) continue;
+
                     if (PullOne(mq)) gotAny = true;
                 }
             }
@@ -586,8 +789,215 @@ public sealed class DefaultLitePullConsumer
             }
 
             int backoffMs = gotAny ? 5 : _pullIntervalMillis;
-            Thread.Sleep(backoffMs);
+            SleepInterruptibly(backoffMs);
         }
+    }
+
+    /// <summary>The round's wait, sliced so shutdown cuts it short: the loop keeps the
+    /// Thread.Sleep idiom but never sits in one uninterruptible sleep while
+    /// <see cref="Shutdown"/> waits for the thread.</summary>
+    private void SleepInterruptibly(int totalMillis)
+    {
+        int left = totalMillis;
+        while (left > 0 && _running)
+        {
+            int slice = Math.Min(10, left);
+            Thread.Sleep(slice);
+            left -= slice;
+        }
+    }
+
+    /// <summary>Whether this queue's park is still counting down.</summary>
+    private bool IsParked(MessageQueue mq)
+    {
+        lock (_lock)
+        {
+            if (!_pullPause.TryGetValue(mq, out PullPause? pause)) return false;
+            return MonoClock.ElapsedMilliseconds < pause.DeadlineMillis;
+        }
+    }
+
+    /// <summary>Re-schedule only this queue's next round: the deadline is monotonic, so a
+    /// parked queue neither stalls its siblings nor depends on the wall clock.</summary>
+    private void ParkQueue(MessageQueue mq, int millis)
+    {
+        lock (_lock)
+        {
+            _pullPause[mq] = new PullPause(MonoClock.ElapsedMilliseconds + millis, millis);
+        }
+    }
+
+    // ---------------- local-buffer flow control ----------------
+    /// <summary>The four budgets the pull round checks before it builds a request, judged
+    /// in this order (an earlier hit masks the later ones), every comparison
+    /// <b>strictly greater than</b> so a queue sitting exactly on a threshold still
+    /// pulls:</summary>
+    /// <list type="number">
+    /// <item>the whole buffer's cached count over <see cref="PullThresholdForAll"/></item>
+    /// <item>this queue's cached count over <see cref="PullThresholdForQueue"/></item>
+    /// <item>this queue's cached MiB (stored size, integer division) over
+    /// <see cref="PullThresholdSizeForQueue"/></item>
+    /// <item>this queue's cached offset span over <see cref="ConsumeMaxSpan"/></item>
+    /// </list>
+    /// Gates 2 to 4 read <b>this queue's own accumulator only</b>, so a sibling over
+    /// budget never stops this queue, and no gate ever scans the buffer. A queue this
+    /// instance no longer owns cannot refuse a pull even if its parked accumulator still
+    /// describes messages the application has not polled away. One refusal increments its
+    /// counter by exactly one and parks this queue for
+    /// <see cref="CacheFlowControlBackoffMillis"/>.</summary>
+    private bool CacheFlowControlHit(MessageQueue mq)
+    {
+        // Ownership first: a revoked queue's accumulator must never refuse a pull.
+        lock (_lock)
+        {
+            if (!_assigned.Contains(mq)) return false;
+        }
+
+        int cachedAll;
+        int count;
+        long sizeBytes;
+        long minOffset;
+        long maxOffset;
+        lock (_bufferLock)
+        {
+            cachedAll = _localBuffer.Count;
+            if (_queueCaches.TryGetValue(mq, out QueueCache? cache))
+            {
+                count = cache.Count;
+                sizeBytes = cache.SizeBytes;
+                minOffset = cache.MinOffset;
+                maxOffset = cache.MaxOffset;
+            }
+            else
+            {
+                count = 0;
+                sizeBytes = 0;
+                minOffset = 0;
+                maxOffset = 0;
+            }
+        }
+
+        // The byte budget is whole MiB, so the division is integer: 1 MiB - 1 byte of
+        // backlog is 0 MiB and stays inside a threshold of 1.
+        long sizeMiB = sizeBytes / MiB;
+        long span = maxOffset - minOffset;
+
+        if (cachedAll > _pullThresholdForAll)
+        {
+            long times = Interlocked.Increment(ref _flowControlForAllTriggered);
+            Refuse(mq, times,
+                "the consume request count exceeds threshold " + Num(_pullThresholdForAll)
+                + ", so do flow control, cached=" + Num(cachedAll)
+                + ", flowControlTimes=" + Num(times),
+                "cached=" + Num(cachedAll) + " over pullThresholdForAll="
+                + Num(_pullThresholdForAll));
+            return true;
+        }
+
+        if (count > _pullThresholdForQueue)
+        {
+            string measure = "minOffset=" + Num(minOffset) + ", maxOffset=" + Num(maxOffset)
+                             + ", count=" + Num(count) + ", size=" + Num(sizeMiB) + " MiB";
+            long times = Interlocked.Increment(ref _flowControlForQueueTriggered);
+            Refuse(mq, times,
+                "The cached message count exceeds the threshold " + Num(_pullThresholdForQueue)
+                + ", so do flow control, " + measure + ", flowControlTimes=" + Num(times),
+                "count=" + Num(count) + " over pullThresholdForQueue=" + Num(_pullThresholdForQueue));
+            return true;
+        }
+
+        if (sizeMiB > _pullThresholdSizeForQueue)
+        {
+            string measure = "minOffset=" + Num(minOffset) + ", maxOffset=" + Num(maxOffset)
+                             + ", count=" + Num(count) + ", size=" + Num(sizeMiB) + " MiB";
+            long times = Interlocked.Increment(ref _flowControlForQueueTriggered);
+            Refuse(mq, times,
+                "The cached message size exceeds the threshold " + Num(_pullThresholdSizeForQueue)
+                + " MiB, so do flow control, " + measure + ", flowControlTimes=" + Num(times),
+                "size=" + Num(sizeMiB) + " MiB over pullThresholdSizeForQueue="
+                + Num(_pullThresholdSizeForQueue));
+            return true;
+        }
+
+        if (span > _consumeMaxSpan)
+        {
+            long times = Interlocked.Increment(ref _flowControlForSpanTriggered);
+            Refuse(mq, times,
+                "The queue's messages, span too long, so do flow control, minOffset="
+                + Num(minOffset) + ", maxOffset=" + Num(maxOffset) + ", maxSpan=" + Num(span)
+                + ", flowControlTimes=" + Num(times),
+                "span=" + Num(span) + " over consumeMaxSpan=" + Num(_consumeMaxSpan));
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>Record one refusal: its counter is already advanced, so this only writes
+    /// the log lines and parks the queue. Debug always carries the queue, the measured
+    /// value, the threshold and the counter; warn follows the shared 1/1001 cadence.</summary>
+    private void Refuse(MessageQueue mq, long times, string warn, string measured)
+    {
+        ClientLog.Debug("lite cache flow control: queue " + mq + " " + measured
+            + " (flowControlTimes=" + Num(times) + "), pause pull for "
+            + Num(CacheFlowControlBackoffMillis) + " ms");
+        if (IsFlowControlWarnTrip(times))
+        {
+            ClientLog.Warn("lite cache flow control: queue " + mq + " " + warn);
+        }
+
+        ParkQueue(mq, CacheFlowControlBackoffMillis);
+    }
+
+    private static string Num(long value) => value.ToString(CultureInfo.InvariantCulture);
+
+    /// <summary>The one place the buffer and its per-queue view change together: append
+    /// after a pull found messages.</summary>
+    private void Enqueue(IReadOnlyList<MessageExt> msgs)
+    {
+        lock (_bufferLock)
+        {
+            foreach (MessageExt m in msgs)
+            {
+                _localBuffer.Enqueue(m);
+                CacheOf(QueueKeyOf(m)).Append(m);
+            }
+
+            Monitor.PulseAll(_bufferLock);
+        }
+    }
+
+    /// <summary>The one place they change together on the way out: a poll drains the
+    /// buffer head and its queue's accumulator with it.</summary>
+    private MessageExt DequeueBuffered()
+    {
+        MessageExt m = _localBuffer.Dequeue();
+        RemoveFromCache(QueueKeyOf(m), m);
+        return m;
+    }
+
+    private static MessageQueue QueueKeyOf(MessageExt m) => new(m.Topic, m.BrokerName, m.QueueId);
+
+    /// <summary>Caller holds <c>_bufferLock</c>.</summary>
+    private QueueCache CacheOf(MessageQueue key)
+    {
+        if (!_queueCaches.TryGetValue(key, out QueueCache? cache))
+        {
+            cache = new QueueCache();
+            _queueCaches[key] = cache;
+        }
+
+        return cache;
+    }
+
+    /// <summary>Caller holds <c>_bufferLock</c>. A queue's view exists exactly as long as
+    /// the buffer holds its messages: once the last one is polled away the entry goes with
+    /// it, so nothing a queue no longer owns is left behind to describe a pull.</summary>
+    private void RemoveFromCache(MessageQueue key, MessageExt m)
+    {
+        if (!_queueCaches.TryGetValue(key, out QueueCache? cache)) return;
+        cache.Remove(m);
+        if (cache.IsEmpty) _queueCaches.Remove(key);
     }
 
     private string SubscriptionFor(string topic)
@@ -646,6 +1056,23 @@ public sealed class DefaultLitePullConsumer
                 sub, subVersion, exprType, /*timeoutMillis=*/30000, /*maxMsgBytes=*/-1,
                 /*suspendTimeoutMillis=*/15000);
         }
+        catch (MQBrokerException e)
+        {
+            // A broker FLOW_CONTROL(215) on this path is a "busy right now" answer, not a
+            // capacity verdict on this client: park this one queue for the short broker
+            // pause instead of letting the round's generic backoff decide. Any other code
+            // keeps the failure handling this path already had.
+            int pauseMillis = LitePullPauseMillisForBrokerResponse(e.ResponseCode);
+            if (pauseMillis > 0)
+            {
+                ParkQueue(mq, pauseMillis);
+            }
+
+            ClientLog.Debug("lite pull_one failed for " + mq + ", code="
+                + Num(e.ResponseCode) + ", next round in "
+                + (pauseMillis > 0 ? Num(pauseMillis) + " ms" : "the regular pull interval"));
+            return false;
+        }
         catch
         {
             ClientLog.Debug("lite pull_one failed for " + mq);
@@ -701,15 +1128,6 @@ public sealed class DefaultLitePullConsumer
 
         if (subData.TagsSet.Count == 0) return;
         msgs.RemoveAll(m => !subData.TagsSet.Contains(m.Tags));
-    }
-
-    private void Enqueue(IReadOnlyList<MessageExt> msgs)
-    {
-        lock (_bufferLock)
-        {
-            foreach (MessageExt m in msgs) _localBuffer.Enqueue(m);
-            Monitor.PulseAll(_bufferLock);
-        }
     }
 
     private void MaybeAutoCommit()
@@ -904,6 +1322,9 @@ public sealed class DefaultLitePullConsumer
                     // user pinned long ago whenever this queue returns to this instance.
                     _consumeOffset.Remove(mq);
                     _seekOffset.Remove(mq);
+                    // ...and its park with it: a re-assigned queue starts on the current
+                    // assignment's own verdict, never on a deadline the old one armed.
+                    _pullPause.Remove(mq);
                 }
             }
         }
@@ -967,7 +1388,9 @@ public sealed class DefaultLitePullConsumer
             outMsgs = new List<MessageExt>();
             while (_localBuffer.Count > 0 && outMsgs.Count < 1024)
             {
-                outMsgs.Add(_localBuffer.Dequeue());
+                // Every message leaves the buffer and its queue's accumulator in the same
+                // step, so the per-queue view keeps describing exactly what is cached.
+                outMsgs.Add(DequeueBuffered());
             }
         }
 
@@ -986,17 +1409,28 @@ public sealed class DefaultLitePullConsumer
 
         lock (_bufferLock)
         {
-            var kept = new Queue<MessageExt>();
+            var kept = new List<MessageExt>();
             while (_localBuffer.Count > 0)
             {
                 MessageExt m = _localBuffer.Dequeue();
                 bool drop = m.Topic == mq.Topic && m.BrokerName == mq.BrokerName &&
                             m.QueueId == mq.QueueId && m.QueueOffset < offset;
-                if (!drop) kept.Enqueue(m);
+                if (!drop) kept.Add(m);
             }
 
+            // The pruned range is gone, so the per-queue views are rebuilt from what is
+            // left rather than patched message by message: after this point the view and
+            // the buffer agree by construction, and the seeked queue's span restarts at
+            // the offsets it really still holds.
             _localBuffer.Clear();
-            foreach (MessageExt m in kept) _localBuffer.Enqueue(m);
+            _queueCaches.Clear();
+            foreach (MessageExt m in kept)
+            {
+                _localBuffer.Enqueue(m);
+                CacheOf(QueueKeyOf(m)).Append(m);
+            }
+
+            Monitor.PulseAll(_bufferLock);
         }
     }
 
@@ -1489,5 +1923,98 @@ public sealed class DefaultLitePullConsumer
 
         throw new MQClientException(
             "consumeTimestamp is invalid, the valid format is yyyyMMddHHmmss,but received " + ts);
+    }
+
+    // ---------------- local-buffer bookkeeping ----------------
+    /// <summary>One MiB, the unit <see cref="PullThresholdSizeForQueue"/> is written
+    /// in.</summary>
+    private const long MiB = 1024 * 1024;
+
+    /// <summary>A queue's slice of the local buffer: how many of its messages are cached,
+    /// how many stored bytes they occupy and the lowest/highest cached queue offset. The
+    /// only mutators are <see cref="AppendToLocalBufferForTest"/> / the pull append, the
+    /// poll drain and the seek rebuild -- every one of them changes the buffer and this
+    /// view in the same step under <c>_bufferLock</c>, which is what keeps the two from
+    /// drifting apart.</summary>
+    private sealed class QueueCache
+    {
+        private readonly OffsetSpan _span = new();
+
+        public int Count { get; private set; }
+        public long SizeBytes { get; private set; }
+        public long MinOffset => _span.Min;
+        public long MaxOffset => _span.Max;
+        public long Span => _span.Span;
+        public bool IsEmpty => Count == 0;
+
+        public void Append(MessageExt m)
+        {
+            Count++;
+            SizeBytes += m.StoreSize;
+            _span.Add(m.QueueOffset);
+        }
+
+        public void Remove(MessageExt m)
+        {
+            Count--;
+            SizeBytes -= m.StoreSize;
+            _span.Remove();
+        }
+    }
+
+    /// <summary>The lowest and the highest cached queue offset of one queue, kept
+    /// incrementally so neither gate ever scans the buffer. The buffer is a FIFO, so a
+    /// queue's messages leave it in the order they entered it: two monotone deques (one
+    /// rising for the minimum, one falling for the maximum) drop exactly the entries that
+    /// leave the cache, which keeps min and max right for any arrival order -- including a
+    /// seek that re-pulls an overlapping window -- at the cost of one compare per append
+    /// and per removal.</summary>
+    private sealed class OffsetSpan
+    {
+        private readonly LinkedList<(long Seq, long Offset)> _min = new();
+        private readonly LinkedList<(long Seq, long Offset)> _max = new();
+        private long _nextSeq;
+        private long _leavingSeq;
+
+        public void Add(long offset)
+        {
+            long seq = _nextSeq++;
+            while (_min.Count > 0 && _min.Last!.Value.Offset >= offset) _min.RemoveLast();
+            _min.AddLast((seq, offset));
+            while (_max.Count > 0 && _max.Last!.Value.Offset <= offset) _max.RemoveLast();
+            _max.AddLast((seq, offset));
+        }
+
+        /// <summary>The oldest cached offset leaves the window (it is always the one the
+        /// FIFO hands out next); it is only still in a deque when it sits at that deque's
+        /// front, because every entry behind it entered later.</summary>
+        public void Remove()
+        {
+            long seq = _leavingSeq++;
+            if (_min.Count > 0 && _min.First!.Value.Seq == seq) _min.RemoveFirst();
+            if (_max.Count > 0 && _max.First!.Value.Seq == seq) _max.RemoveFirst();
+        }
+
+        public long Min => _min.Count > 0 ? _min.First!.Value.Offset : 0;
+        public long Max => _max.Count > 0 ? _max.First!.Value.Offset : 0;
+
+        /// <summary>0 for an empty or single-message cache, as the contract measures
+        /// span.</summary>
+        public long Span => _min.Count > 0 && _max.Count > 0 ? Max - Min : 0;
+    }
+
+    /// <summary>One queue's re-schedule: when its next round may run again, plus the
+    /// length of the pause that armed it (kept after the deadline so what a refusal
+    /// decided stays observable).</summary>
+    private sealed class PullPause
+    {
+        public PullPause(long deadlineMillis, int millis)
+        {
+            DeadlineMillis = deadlineMillis;
+            Millis = millis;
+        }
+
+        public long DeadlineMillis { get; }
+        public int Millis { get; }
     }
 }

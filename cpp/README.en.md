@@ -54,11 +54,11 @@ This produces the static library `build/librocketmq_remoting.a` (alias `rocketmq
 
 ```
 100% tests passed out of 68
-Total Test time (real) = 117.72 sec
+Total Test time (real) = 100.25 sec
 ```
 
-The 68 cases are the 67 test binaries (6969 assertions) plus 1 codec-interop case
-(73 assertions): **7042 assertions in total**.
+The 68 cases are the 67 test binaries (8025 assertions) plus 1 codec-interop case
+(73 assertions): **8098 assertions in total**.
 
 The protocol-layer self-check needs no cluster:
 
@@ -453,7 +453,13 @@ reader thread and the caller's writing thread overlap on the same SSL session).
   message query
 - ✅ Consumers: `DefaultMQPushConsumer` (concurrent, ordered, broadcasting, POP),
   `DefaultMQPullConsumer` (short and long polling, offset tables, heartbeat),
-  `DefaultLitePullConsumer` (subscribe and assign modes, seek, three offset tables, queue-change listener)
+  `DefaultLitePullConsumer` (subscribe and assign modes, seek, three offset tables, queue-change
+  listener, and four cache gates judged before the pull offset is resolved: whole-buffer count
+  `setPullThresholdForAll` 10000 / this queue's count `setPullThresholdForQueue` 1000 / this
+  queue's stored bytes `setPullThresholdSizeForQueue` 100 MiB with integer division / this
+  queue's offset span `setConsumeMaxSpan` 2000, each refusing only when strictly above its
+  threshold; a refusal re-schedules just this queue for `kPullPauseWhenClientFlowControl` = 50ms
+  while the broker's `FLOW_CONTROL`(215) waits `kPullPauseWhenBrokerFlowControl` = 20ms)
 - ✅ Queue allocation: AVG / AVG_BY_CIRCLE / CONFIG / CONSISTENT_HASH / MACHINE_ROOM /
   MACHINE_ROOM_NEARBY, replaceable on all three consumers
 - ✅ `DefaultMQAdminExt`: topic and subscription-group CRUD, consume progress, connection info,
@@ -545,7 +551,7 @@ arguments:
 | `rmq_live_pop_mode` | Three live legs of SET_MESSAGE_REQUEST_MODE(401) (measured `PASS=13 FAIL=0`): the production `setMessageRequestMode` writes all four values into the JSON body, so GET_ALL_MESSAGE_REQUEST_MODE(402) must answer an entry keyed by exactly this topic+group with `mode=POP` and `popShareQueueNum` the number 4; re-issuing PULL/0 for the same group must overwrite the first write; the paired control pushes the same four values into the header with an empty body and the broker must refuse it (measured code=1, its remark saying the request body could not be decoded) while that control group stays absent from 402 — and because a body-form anchor entry is visible in the very same read-back, that absence is a real absence. The topic is created per run with stamped names, the master broker address comes from the topic route, and every read-back polls until answered | — |
 | `rmq_live_pull` | Pull consumer queues, short and long polling, manual offsets | — |
 | `rmq_live_pull_heartbeat` | The 203 / 38 / 35 payloads and consumeType shape of the pull consumer | — |
-| `rmq_live_lite_pull` | LitePull subscribe and assign modes plus poll | — |
+| `rmq_live_lite_pull` | LitePull subscribe and assign modes plus poll, and this queue's cached-count gate (over budget parks only that queue, and the cursor runs to the tail once the buffer drains) | — |
 | `rmq_live_lite_pull_cursor` | Cursor following `nextBeginOffset` on empty responses and OFFSET_ILLEGAL self-healing | — |
 | `rmq_live_lite_pull_code` | Request code 361 with the lite flag bit, and `litePullMessageEnable` restore | `litePullMessageEnable` (tool toggles it) |
 | `rmq_live_lite_topic_queue_change` | Queue scale-out / scale-in firing the listener, route queried per comparison pass | — |

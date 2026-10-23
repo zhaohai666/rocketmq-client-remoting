@@ -11,7 +11,7 @@ NameServer（取路由、动态取址）与 Broker（收发消息、心跳、位
   zlib 走内置 `ZLibStream`，LZ4 / ZSTD 通过 P/Invoke 调系统库。
 - 一个库覆盖生产者、Push / Pull / LitePull 三种消费者、管理端、消息轨迹、ACL、TLS。
 - 能力在真实 RocketMQ 5.5.1 集群（namesrv 9876 + broker 10911）上逐条联调，
-  离线行为由 1045 项单元测试锁死。
+  离线行为由 1062 项单元测试锁死。
 
 ## 先决条件
 
@@ -33,7 +33,7 @@ dotnet test tests/RocketMQ.Client.Tests
 | 命令 | 结果 |
 | --- | --- |
 | `dotnet build --no-incremental` | `0 个警告` / `0 个错误`，用时 `00:00:17.94` |
-| `dotnet test tests/RocketMQ.Client.Tests` | `已通过! - 失败:     0，通过:  1045，已跳过:     0，总计:  1045，持续时间: 4 m 36 s` |
+| `dotnet test tests/RocketMQ.Client.Tests` | `已通过! - 失败:     0，通过:  1062，已跳过:     0，总计:  1062，持续时间: 4 m 41 s` |
 
 `Directory.Build.props` 里 `TreatWarningsAsErrors=true` 全局生效，所以「构建通过」等价于「零 warning」。
 测试输出跟随系统区域设置，中文 locale 下汇总行是中文，检索时按 `总计:` 匹配。
@@ -495,7 +495,10 @@ producer.TlsOptions = new TlsOptions
 - ✅ 消费：Push（长轮询 + POP + 顺序 + 广播 + 位点持久化 + 启动期数值校验 + 拉取前流控 +
   POP 的待 ack 欠账闸门（默认 96，严格大于才停，命中记进拉取路径同一个流控计数）+
   挂起 listener 的清扫逃生口）、Pull（带消费者心跳）、LitePull（拉取 / 已消费 / 待提交三张位点表 +
-  队列集合变更监听）
+  队列集合变更监听 + 解析拉取位点前先过四道缓存闸门：整个缓冲条数 `PullThresholdForAll` 10000 /
+  本队列条数 `PullThresholdForQueue` 1000 / 本队列存储字节 `PullThresholdSizeForQueue` 100 MiB
+  整除 / 本队列位点跨度 `ConsumeMaxSpan` 2000，都严格大于才停；命中只重排这一个队列 50ms，
+  broker 的 `FLOW_CONTROL`(215) 只等 20ms）
 - ✅ 队列分配：六种可插拔策略
 - ✅ 命名空间：本地前缀与服务端 `nsd`/`ns` 两套
 - ✅ 管理端：topic / 订阅组 / 集群与路由 / 各类统计 / 消息查询 / 位点重置 / `searchOffset` 边界语义 /
@@ -504,7 +507,7 @@ producer.TlsOptions = new TlsOptions
   发送 / 消费 / 事务 / Forbidden / FilterMessage 钩子、ACL 签名、动态 NameServer 取址、故障规避选队列
 - ✅ 压缩：zlib / LZ4 / ZSTD；TLS：`SslStream`，test-mode 与严格校验 / mTLS
 - ✅ 客户端日志：按大小轮转、双写 stderr 与文件
-- ✅ 单元测试 1045 项；`rmq` 真机联调工具 40 条子命令（含主从、故障注入、压缩互通矩阵）
+- ✅ 单元测试 1062 项；`rmq` 真机联调工具 40 条子命令（含主从、故障注入、压缩互通矩阵）
 
 ## 客户端日志
 
@@ -572,7 +575,7 @@ dotnet run --no-build --project examples/RocketMQ.Examples -- lite-queue-change 
 | `acl <namesrv> [ak] [sk]` | ACL 鉴权链路（需 broker `authenticationEnabled=true`，配 `../scripts/run_acl_live.sh`） |
 | `pull` | 主动拉取：手动拉取 / 手动位点 / 回投 |
 | `pull-heartbeat <namesrv> <master> [slave]` | 拉模式消费者心跳（主从集群：203/38 主从可见、35 注销即摘、幽灵组对照） |
-| `lite-pull` | lite-pull 全链路：subscribe / assign 双模式 + poll + 六种分配策略 + 三张位点表 |
+| `lite-pull` | lite-pull 全链路：subscribe / assign 双模式 + poll + 六种分配策略 + 三张位点表 + 本队列缓存条数闸门（超标只 park 这一路，排空后续读到尾部）|
 | `lite-pull-cursor` | 拉取游标跟随 `nextBeginOffset`、OFFSET_ILLEGAL 越界自愈 |
 | `lite-pull-code` | 请求码 361 与 `litePullMessageEnable` 开关（运行时翻开关再还原） |
 | `lite-queue-change` | topic 队列集合变更监听：1s 周期 + 真实扩容 2→4 / 缩容 4→2，证明比对趟次现查路由 |
@@ -657,7 +660,7 @@ csharp/
 │       ├── BackPressure.cs  Latency.cs  ConsumeExecutor.cs  Schedules（定时任务锚定）
 │       ├── TopAddressing.cs        # 动态 NameServer 取址
 │       ├── ConsumerStats.cs  Validators.cs  ClientException.cs
-├── tests/RocketMQ.Client.Tests/    # xunit，1045 项（编解码/路由/日志/传输/轨迹/异步/流控/位点…）
+├── tests/RocketMQ.Client.Tests/    # xunit，1062 项（编解码/路由/日志/传输/轨迹/异步/流控/位点…）
 └── examples/RocketMQ.Examples/     # rmq 真机联调工具（见上）
 ```
 

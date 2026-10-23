@@ -14,7 +14,7 @@ It talks straight to the NameServer (route discovery, dynamic addressing) and to
 - One library covers the producer, the Push / Pull / LitePull consumers, the admin client,
   message tracing, ACL and TLS.
 - Every capability is verified against a real RocketMQ 5.5.1 cluster (namesrv 9876 + broker 10911);
-  offline behaviour is pinned by 1045 unit tests.
+  offline behaviour is pinned by 1062 unit tests.
 
 ## Prerequisites
 
@@ -36,7 +36,7 @@ Measured on this machine:
 | Command | Result |
 | --- | --- |
 | `dotnet build --no-incremental` | `0 Warning(s)` / `0 Error(s)`, elapsed `00:00:17.94` |
-| `dotnet test tests/RocketMQ.Client.Tests` | `Passed! - Failed:     0, Passed:  1045, Skipped:     0, Total:  1045, Duration: 4 m 36 s` |
+| `dotnet test tests/RocketMQ.Client.Tests` | `Passed! - Failed:     0, Passed:  1062, Skipped:     0, Total:  1062, Duration: 4 m 41 s` |
 
 `Directory.Build.props` turns `TreatWarningsAsErrors=true` on globally, so "builds" means "builds with
 zero warnings". The test summary line follows the machine locale — grep for `Passed!` / `Failed:` when
@@ -516,7 +516,12 @@ connection.
   startup range validation + pre-pull flow control + POP's outstanding-ACK gate (default 96, trips
   strictly above it, counted on the pull path's same flow-control total) + escape hatch for suspended listeners),
   Pull (with consumer heartbeats), LitePull (pull / consumed / pending-commit offset tables +
-  queue-set change listener)
+  queue-set change listener + four cache gates judged before the pull offset is resolved:
+  whole-buffer count `PullThresholdForAll` 10000 / this queue's count `PullThresholdForQueue`
+  1000 / this queue's stored bytes `PullThresholdSizeForQueue` 100 MiB with integer division /
+  this queue's offset span `ConsumeMaxSpan` 2000, each refusing only when strictly above its
+  threshold; a refusal re-schedules just this queue 50ms later while the broker's
+  `FLOW_CONTROL`(215) waits 20ms)
 - ✅ Queue allocation: six pluggable strategies
 - ✅ Namespaces: local prefix and server-side `nsd` / `ns`
 - ✅ Admin: topics / subscription groups / cluster and routes / statistics / message queries /
@@ -526,7 +531,7 @@ connection.
   FilterMessage hooks, ACL signing, dynamic NameServer addressing, fault-avoiding queue selection
 - ✅ Compression: zlib / LZ4 / ZSTD; TLS: `SslStream`, test-mode plus strict verification / mTLS
 - ✅ Client logging: size-based rotation, dual output to stderr and file
-- ✅ 1045 unit tests; 40 live-cluster subcommands in `rmq` (master/slave, fault injection,
+- ✅ 1062 unit tests; 40 live-cluster subcommands in `rmq` (master/slave, fault injection,
   compression interoperability matrix)
 
 ## Client Logging
@@ -599,7 +604,7 @@ Subcommands:
 | `acl <namesrv> [ak] [sk]` | ACL path (needs `authenticationEnabled=true`, see `../scripts/run_acl_live.sh`) |
 | `pull` | Explicit pulls: manual pull / manual offsets / send-back |
 | `pull-heartbeat <namesrv> <master> [slave]` | Pull-mode consumer heartbeats on a master/slave cluster (203/38 visible on both, 35 removes on unregister, ghost-group control) |
-| `lite-pull` | Full LitePull path: subscribed and assigned modes + poll + six allocation strategies + three offset tables |
+| `lite-pull` | Full LitePull path: subscribed and assigned modes + poll + six allocation strategies + three offset tables + this queue's cached-count gate (over budget parks only that queue, and the cursor runs to the tail once the buffer drains) |
 | `lite-pull-cursor` | Cursor follows `nextBeginOffset`, self-heals past OFFSET_ILLEGAL bounds |
 | `lite-pull-code` | Request code 361 and the `litePullMessageEnable` switch (flipped at runtime and restored) |
 | `lite-queue-change` | Topic queue-set change listener: 1s period plus real scale-out 2→4 / scale-in 4→2, proving the comparison pass queries the route |
@@ -686,7 +691,7 @@ csharp/
 │       ├── BackPressure.cs  Latency.cs  ConsumeExecutor.cs
 │       ├── TopAddressing.cs        # dynamic NameServer addressing
 │       ├── ConsumerStats.cs  Validators.cs  ClientException.cs
-├── tests/RocketMQ.Client.Tests/    # xunit, 1045 tests (codec/route/logging/transport/tracing/async/flow control/offsets…)
+├── tests/RocketMQ.Client.Tests/    # xunit, 1062 tests (codec/route/logging/transport/tracing/async/flow control/offsets…)
 └── examples/RocketMQ.Examples/     # the rmq live-cluster tool (see above)
 ```
 

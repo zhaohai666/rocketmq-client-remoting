@@ -1,6 +1,6 @@
 // Pull path.
 //
-// Three rules here are easy to get wrong and expensive to debug — they are
+// Four rules here are easy to get wrong and expensive to debug — they are
 // called out again at each site:
 //
 //  1. pull() being a SHORT poll has nothing to do with the push consumer's
@@ -15,6 +15,10 @@
 //  3. Every response rewrites pullFromWhichNodeTable from suggestWhichBrokerId,
 //     and a MISSING field means master(0) — not "keep the previous value".
 //     The next round uses that id to pick master-or-slave.
+//  4. A pull answer that is not one of the four statuses throws the PORT's typed
+//     broker exception, with the response code on it. Callers branch on that code
+//     (the broker's own throttle pause vs. a generic failure); flattening it into
+//     a bare Error leaves the number only in the text and disables those branches.
 import { Buffer } from 'node:buffer';
 import type { MQClient } from './mq_client.ts';
 import { PullStatus, PullResult } from './consumer_result.ts';
@@ -30,6 +34,7 @@ import { SubscriptionData, ExpressionType } from '../common/subscriptionData.ts'
 import { FilterMessageContext, FilterMessageHook } from './hook.ts';
 import { decodeMessages } from '../common/messageDecoder.ts';
 import { getLogger } from '../logging.ts';
+import { MQBrokerException } from '../remoting/exception.ts';
 import { mqKey } from './offset_store.ts';
 
 const logger = getLogger('client.pull_api');
@@ -157,7 +162,12 @@ export class PullAPI {
     else if (response.code === ResponseCode.PULL_NOT_FOUND) status = PullStatus.NO_NEW_MSG;
     else if (response.code === ResponseCode.PULL_OFFSET_MOVED) status = PullStatus.OFFSET_ILLEGAL;
     else if (response.code === ResponseCode.PULL_RETRY_IMMEDIATELY) status = PullStatus.NO_MATCHED_MSG;
-    else throw new Error(`pull failed: CODE ${response.code} ${response.remark || ''}`);
+    // The code rides on the exception: every caller of this kernel has to tell the
+    // broker's own throttle answer (215) from a system error or a dead connection,
+    // and a bare Error would leave the number only inside the message text, which
+    // silently disables that branch. The wording stays as informative as before.
+    else throw new MQBrokerException(response.code,
+      `pull failed: CODE ${response.code} ${response.remark || ''}`, addr);
     const ext = response.extFields || {};
     const num = (k: string, d: number) => (ext[k] != null ? parseInt(ext[k], 10) : d);
     let found: MessageExt[] = [];

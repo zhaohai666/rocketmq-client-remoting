@@ -11,6 +11,7 @@
 #include "rocketmq/common/logging.h"
 #include "rocketmq/common/sysflag.h"
 #include "rocketmq/common/util_all.h"
+#include "rocketmq/remoting/protocol/codes.h"
 
 namespace rocketmq {
 
@@ -379,9 +380,39 @@ void DefaultLitePullConsumer::pullServiceLoop() {
                 snapshot = assigned_;
                 paused = paused_;
             }
+            // A revoked queue's accumulator must not refuse a later pull when the same queue is
+            // re-assigned. Prune every accumulator this round no longer owns (only the pull thread
+            // touches cacheAccums_/parkUntil_ besides the buffer-mutation sites, all under
+            // bufferMutex_).
+            {
+                std::lock_guard<std::mutex> lk(bufferMutex_);
+                for (auto it = cacheAccums_.begin(); it != cacheAccums_.end();) {
+                    if (snapshot.find(it->first) == snapshot.end()) {
+                        it = cacheAccums_.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            }
             for (const MessageQueue& mq : snapshot) {
                 if (!running_) break;
                 if (paused.find(mq) != paused.end()) continue;
+                // A queue parked by an earlier refusal (cache gate = 50ms, broker FLOW_CONTROL = 20ms)
+                // is skipped until its deadline passes; parked only this queue, siblings keep pulling,
+                // and shutdown stays prompt (the loop's bounded backoff sleep is the only wait).
+                const auto now = std::chrono::steady_clock::now();
+                auto parkIt = parkUntil_.find(mq);
+                if (parkIt != parkUntil_.end()) {
+                    if (parkIt->second > now) continue;
+                    parkUntil_.erase(parkIt);
+                }
+                if (cacheFlowControlHit(mq)) {
+                    // Refuse without touching the wire: park this queue for the client-cache pause and
+                    // record the applied value. Nothing else changes -- no offset commits, cursor holds.
+                    parkUntil_[mq] = now + std::chrono::milliseconds(kPullPauseWhenClientFlowControl);
+                    lastLitePullPauseMillis_.store(kPullPauseWhenClientFlowControl);
+                    continue;
+                }
                 if (pullOne(mq)) gotAny = true;
             }
         } catch (...) {
@@ -454,6 +485,20 @@ bool DefaultLitePullConsumer::pullOne(const MessageQueue& mq) {
                                         FilterAPI::pullSubVersionOf(subData), subData.expressionType,
                                         /*timeoutMillis=*/30000, /*maxMsgBytes=*/-1,
                                         /*suspendTimeoutMillis=*/15000);
+    } catch (const MQBrokerException& e) {
+        // MQBrokerException is a sibling of RemotingTimeoutException under std::runtime_error, so
+        // catching it before catch(...) is live code and unmapped broker codes reach the mapping.
+        // The broker's FLOW_CONTROL(215) throttle gets its own short pause via the same mapping the
+        // push path uses (no second constant); every other code keeps the port's existing handling
+        // (fall through to the loop's idle backoff).
+        if (e.getResponseCode() == ResponseCode::FLOW_CONTROL) {
+            const int32_t pauseMs = DefaultMQPushConsumer::pullPauseMillisFor(e.getResponseCode());
+            parkUntil_[mq] = std::chrono::steady_clock::now() + std::chrono::milliseconds(pauseMs);
+            lastLitePullPauseMillis_.store(pauseMs);
+        }
+        logger_debug("lite pull_one failed for " + mq.topic + "@" + std::to_string(mq.queueId)
+                     + " brokerCode=" + std::to_string(e.getResponseCode()));
+        return false;
     } catch (...) {
         logger_debug("lite pull_one failed for " + mq.topic + "@" + std::to_string(mq.queueId));
         return false;
@@ -504,8 +549,119 @@ void DefaultLitePullConsumer::enqueue(const std::vector<MessageExt>& msgs) {
     std::lock_guard<std::mutex> lk(bufferMutex_);
     for (const MessageExt& m : msgs) {
         localBuffer_.push_back(m);
+        // Buffer and accumulator mutate in one place under one lock, so the counters cannot drift.
+        const MessageQueue mq(m.topic, m.brokerName, m.queueId);
+        QueueCacheAccum& acc = cacheAccums_[mq];
+        ++acc.count;
+        acc.sizeSum += m.storeSize;
+        acc.offsets.insert(m.queueOffset);
     }
     bufferCv_.notify_all();
+}
+
+// ---------------------------------------------------------------- cache flow-control gate
+// Four per-queue thresholds, judged strictly-greater in this exact order before the pull is built:
+//   1) aggregate (whole-buffer count > pullThresholdForAll)
+//   2) count   (this queue's cached count > pullThresholdForQueue)      -- shared counter with (3)
+//   3) size    (this queue's storeSize-sum // 1MiB > pullThresholdSizeForQueue)
+//   4) span    (this queue's cached maxOffset - minOffset > consumeMaxSpan)
+// A queue sitting exactly on a threshold still pulls. Gates 2..4 judge only this queue: a hot sibling
+// never parks a cold one. The measurement (aggregate size and this queue's accumulator) happens in a
+// single short critical section under bufferMutex_ so the counters cannot drift from the buffer; the
+// judgment and the counter/log side effects run outside it.
+bool DefaultLitePullConsumer::cacheFlowControlHit(const MessageQueue& mq) {
+    int64_t cached = 0;
+    int64_t count = 0;
+    int64_t sizeMb = 0;
+    int64_t minOff = 0;
+    int64_t maxOff = 0;
+    {
+        std::lock_guard<std::mutex> lk(bufferMutex_);
+        cached = static_cast<int64_t>(localBuffer_.size());
+        auto it = cacheAccums_.find(mq);
+        if (it != cacheAccums_.end()) {
+            count = it->second.count;
+            // Integer MiB division: the gate is about physical backlog, never body length.
+            sizeMb = it->second.sizeSum / (1024LL * 1024LL);
+            if (!it->second.offsets.empty()) {
+                minOff = *it->second.offsets.begin();
+                maxOff = *it->second.offsets.rbegin();
+            }
+        }
+    }
+    const int64_t span = maxOff - minOff;
+
+    // (1) aggregate gate.
+    if (cached > static_cast<int64_t>(pullThresholdForAll_)) {
+        const int64_t times = aggregateFlowControlTimes_.fetch_add(1) + 1;
+        logger_debug("lite flow control aggregate: queue " + mq.toString()
+                     + " cached=" + std::to_string(cached)
+                     + " pullThresholdForAll=" + std::to_string(pullThresholdForAll_)
+                     + ", pause pull");
+        if (isFlowControlWarnTrip(times)) {
+            logger_warn("the consume request count exceeds threshold "
+                        + std::to_string(pullThresholdForAll_)
+                        + ", so do flow control, cached=" + std::to_string(cached)
+                        + ", flowControlTimes=" + std::to_string(times));
+        }
+        return true;
+    }
+    // (2)+(3) per-queue count and size gates share one counter.
+    if (count > static_cast<int64_t>(pullThresholdForQueue_)) {
+        const int64_t times = queueFlowControlTimes_.fetch_add(1) + 1;
+        logger_debug("lite flow control count: queue " + mq.toString() + " count="
+                     + std::to_string(count) + " pullThresholdForQueue="
+                     + std::to_string(pullThresholdForQueue_) + ", pause pull");
+        if (isFlowControlWarnTrip(times)) {
+            logger_warn("The cached message count exceeds the threshold "
+                        + std::to_string(pullThresholdForQueue_)
+                        + ", so do flow control, minOffset=" + std::to_string(minOff)
+                        + ", maxOffset=" + std::to_string(maxOff)
+                        + ", count=" + std::to_string(count)
+                        + ", size=" + std::to_string(sizeMb) + " MiB"
+                        + ", flowControlTimes=" + std::to_string(times));
+        }
+        return true;
+    }
+    if (sizeMb > static_cast<int64_t>(pullThresholdSizeForQueue_)) {
+        const int64_t times = queueFlowControlTimes_.fetch_add(1) + 1;
+        logger_debug("lite flow control size: queue " + mq.toString() + " sizeMb="
+                     + std::to_string(sizeMb) + " pullThresholdSizeForQueue="
+                     + std::to_string(pullThresholdSizeForQueue_) + ", pause pull");
+        if (isFlowControlWarnTrip(times)) {
+            logger_warn("The cached message size exceeds the threshold "
+                        + std::to_string(pullThresholdSizeForQueue_)
+                        + " MiB, so do flow control, minOffset=" + std::to_string(minOff)
+                        + ", maxOffset=" + std::to_string(maxOff)
+                        + ", count=" + std::to_string(count)
+                        + ", size=" + std::to_string(sizeMb) + " MiB"
+                        + ", flowControlTimes=" + std::to_string(times));
+        }
+        return true;
+    }
+    // (4) span gate.
+    if (span > consumeMaxSpan_) {
+        const int64_t times = spanFlowControlTimes_.fetch_add(1) + 1;
+        logger_debug("lite flow control span: queue " + mq.toString() + " span="
+                     + std::to_string(span) + " consumeMaxSpan="
+                     + std::to_string(consumeMaxSpan_) + ", pause pull");
+        if (isFlowControlWarnTrip(times)) {
+            logger_warn("The queue's messages, span too long, so do flow control, minOffset="
+                        + std::to_string(minOff) + ", maxOffset=" + std::to_string(maxOff)
+                        + ", maxSpan=" + std::to_string(span)
+                        + ", flowControlTimes=" + std::to_string(times));
+        }
+        return true;
+    }
+    return false;
+}
+
+bool DefaultLitePullConsumer::cacheFlowControlHitForTest(const MessageQueue& mq) {
+    return cacheFlowControlHit(mq);
+}
+
+void DefaultLitePullConsumer::injectCachedForTest(const std::vector<MessageExt>& msgs) {
+    enqueue(msgs);
 }
 
 void DefaultLitePullConsumer::maybeAutoCommit() {
@@ -688,6 +844,18 @@ std::vector<MessageExt> DefaultLitePullConsumer::poll(int32_t timeoutMillis) {
         }
         while (!localBuffer_.empty() && out.size() < 1024) {
             out.push_back(std::move(localBuffer_.front()));
+            // Decrement this queue's accumulator in lockstep with the pop (metadata is read from the
+            // moved-to copy since the deque's front has already been moved from).
+            const MessageExt& m = out.back();
+            const MessageQueue mq(m.topic, m.brokerName, m.queueId);
+            auto ait = cacheAccums_.find(mq);
+            if (ait != cacheAccums_.end()) {
+                --ait->second.count;
+                ait->second.sizeSum -= m.storeSize;
+                auto oit = ait->second.offsets.find(m.queueOffset);
+                if (oit != ait->second.offsets.end()) ait->second.offsets.erase(oit);
+                if (ait->second.count <= 0) cacheAccums_.erase(ait);
+            }
             localBuffer_.pop_front();
         }
     }
@@ -716,12 +884,27 @@ void DefaultLitePullConsumer::seek(const MessageQueue& mq, int64_t offset) {
     }
     std::lock_guard<std::mutex> lk(bufferMutex_);
     std::deque<MessageExt> kept;
+    // Rebuild this queue's accumulator in the same pass that prunes the buffer, so the two stay exact.
+    QueueCacheAccum replacement;
     for (MessageExt& m : localBuffer_) {
-        bool same = (m.topic == mq.topic && m.brokerName == mq.brokerName &&
-                     m.queueId == mq.queueId && m.queueOffset < offset);
-        if (!same) kept.push_back(std::move(m));
+        const bool sameQueue = (m.topic == mq.topic && m.brokerName == mq.brokerName &&
+                                m.queueId == mq.queueId);
+        bool drop = (sameQueue && m.queueOffset >= offset);
+        if (!drop) {
+            if (sameQueue) {
+                ++replacement.count;
+                replacement.sizeSum += m.storeSize;
+                replacement.offsets.insert(m.queueOffset);
+            }
+            kept.push_back(std::move(m));
+        }
     }
     localBuffer_.swap(kept);
+    if (replacement.count > 0) {
+        cacheAccums_[mq] = std::move(replacement);
+    } else {
+        cacheAccums_.erase(mq);
+    }
 }
 
 void DefaultLitePullConsumer::seekToBegin(const MessageQueue& mq) {

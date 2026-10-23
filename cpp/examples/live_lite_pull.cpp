@@ -737,6 +737,13 @@ int main(int argc, char** argv) {
             o.setInstanceName("liteoff");
             o.setPollTimeoutMillis(1000);
             o.setPullBatchSize(32);
+            // Every cache gate is lifted above this scenario's backlog on purpose: S8 buffers 1200 messages in one
+            // queue and the default per-queue count budget (1000) would stop the background pull at 1024 -- that is
+            // the gate working (S9 measures it), not a defect. S8 is about the three offset tables.
+            o.setPullThresholdForAll(nBig * 32);
+            o.setPullThresholdForQueue(nBig + 100);
+            o.setPullThresholdSizeForQueue(1024);
+            o.setConsumeMaxSpan(nBig + 1000);
             o.setAutoCommit(false);          // commit timing is fully controlled by the scenario
             o.setConsumeFromWhere(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
             o.assign({q0});
@@ -885,6 +892,129 @@ int main(int argc, char** argv) {
 
             o.shutdown();
             probe.shutdown();
+        }
+    }
+
+    // S9: the per-queue cached-count gate on a real broker. Threshold 64 with 32 messages per round and a
+    // 200-message backlog: the background pull must stop above the threshold and strictly below the tail, then
+    // release as soon as poll() drains the buffer. The paired control is a second consumer on the **same
+    // queue** whose threshold clears the backlog -- if the pull stopped for any other reason (route, switch,
+    // broker refusal) it would stop for the control too.
+    std::printf("\nS9 cached-count gate: the pull parks itself and resumes after draining\n");
+    {
+        const std::string gateTopic = "LiteGateCpp_" + stamp;
+        const std::string gateGroup = "LiteGatePGCpp_" + stamp;
+        const std::string ctlGroup = "LiteGateCtlCpp_" + stamp;
+        const int32_t nGate = 200;
+        const int32_t batch = 32;
+        const int32_t queueThreshold = 64;
+
+        std::vector<MessageQueue> qs;
+        int32_t landed = 0;
+        {
+            DefaultMQProducer prep("PG_PrepareGateCpp_" + stamp);
+            prep.setNamesrvAddr(namesrv);
+            prep.start();
+            try {
+                prep.createTopic("TBW102", gateTopic, 1);
+            } catch (const std::exception& e) {
+                std::printf("!! createTopic(%s) failed: %s\n", gateTopic.c_str(), e.what());
+            }
+            const int64_t routeDeadline = nowMs() + 20000;
+            while (qs.empty() && nowMs() < routeDeadline) {
+                try {
+                    qs = prep.fetchPublishMessageQueues(gateTopic);
+                } catch (...) {
+                }
+                if (qs.empty()) std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+            if (qs.size() == 1) {
+                for (int32_t from = 0; from < nGate; from += 50) {
+                    std::vector<Message> chunk;
+                    for (int32_t i = from; i < std::min(nGate, from + 50); ++i) {
+                        char buf[32];
+                        std::snprintf(buf, sizeof(buf), "gate-%04d", i);
+                        chunk.emplace_back(gateTopic, std::string(buf));
+                    }
+                    try {
+                        if (prep.sendBatch(chunk, qs[0]).getSendStatus() == SendStatus::SEND_OK) {
+                            landed += static_cast<int32_t>(chunk.size());
+                        }
+                    } catch (const std::exception& e) {
+                        std::printf("   sendBatch failed: %s\n", e.what());
+                    }
+                }
+            }
+            prep.shutdown();
+        }
+        check("S9 prepare the topic (1 queue)", qs.size() == 1, "queues=" + std::to_string(qs.size()));
+        check("S9 produced " + std::to_string(nGate) + " messages successfully", landed == nGate,
+              "landed=" + std::to_string(landed));
+
+        if (qs.size() == 1) {
+            const MessageQueue q0 = qs[0];
+            // Only the count gate is under test: the aggregate budget is threshold*batch so it stays clear of
+            // this backlog, and 200 tiny messages cannot reach the size (100 MiB) or span (2000) gates.
+            auto gateConsumer = [&](const std::string& group, const std::string& instance, int32_t threshold) {
+                std::unique_ptr<DefaultLitePullConsumer> c(
+                    std::make_unique<DefaultLitePullConsumer>(group));
+                c->setNamesrvAddr(namesrv);
+                c->setInstanceName(instance);
+                c->setPollTimeoutMillis(1000);
+                c->setPullBatchSize(batch);
+                c->setPullThresholdForAll(nGate * batch);
+                c->setPullThresholdForQueue(threshold);
+                c->setAutoCommit(false);
+                c->setConsumeFromWhere(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
+                c->assign({q0});
+                c->start();
+                return c;
+            };
+
+            std::unique_ptr<DefaultLitePullConsumer> gated = gateConsumer(gateGroup, "litegate", queueThreshold);
+            const int64_t reached = nowMs() + 20000;
+            while (gated->pullCursorOf(q0) <= queueThreshold && nowMs() < reached) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            }
+            const int64_t parked = gated->pullCursorOf(q0);
+            check("S9a the gate let this queue cache past its threshold (" + std::to_string(queueThreshold) + ")",
+                  parked > queueThreshold, "pullCursor=" + std::to_string(parked));
+            check("S9a the count gate recorded at least one refusal", gated->queueFlowControlTimes() > 0,
+                  "queueFlowControlTimes=" + std::to_string(gated->queueFlowControlTimes()));
+
+            const int64_t held = nowMs() + 5000;
+            while (nowMs() < held) std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            const int64_t still = gated->pullCursorOf(q0);
+            check("S9a with the buffer over budget the cursor holds its ground (never reaches "
+                      + std::to_string(nGate) + ")",
+                  still == parked && still < nGate, "pullCursor=" + std::to_string(still));
+            check("S9a the refusal costs at most two more pull rounds",
+                  still - queueThreshold <= 2 * batch,
+                  "pullCursor=" + std::to_string(still) + " threshold=" + std::to_string(queueThreshold));
+
+            {
+                std::unique_ptr<DefaultLitePullConsumer> control =
+                    gateConsumer(ctlGroup, "litegatectl", nGate + 100);
+                const int64_t run = nowMs() + 25000;
+                while (control->pullCursorOf(q0) < nGate && nowMs() < run) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                }
+                check("S9-control the same queue pulls all " + std::to_string(nGate)
+                          + " once the threshold clears",
+                      control->pullCursorOf(q0) == nGate,
+                      "pullCursor=" + std::to_string(control->pullCursorOf(q0)));
+                control->shutdown();
+            }
+
+            const std::vector<MessageExt> rest = drain(*gated, static_cast<size_t>(nGate), 60000);
+            std::set<std::string> bodies;
+            for (const MessageExt& m : rest) bodies.insert(bodyOf(m));
+            check("S9b after the buffer drains the rest arrives (" + std::to_string(nGate) + ")",
+                  rest.size() == static_cast<size_t>(nGate) && bodies.size() == static_cast<size_t>(nGate),
+                  "got=" + std::to_string(rest.size()) + " distinct=" + std::to_string(bodies.size()));
+            check("S9b the cursor runs to the tail once the queue is consumed",
+                  gated->pullCursorOf(q0) == nGate, "pullCursor=" + std::to_string(gated->pullCursorOf(q0)));
+            gated->shutdown();
         }
     }
 

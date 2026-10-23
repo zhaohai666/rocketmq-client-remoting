@@ -944,6 +944,29 @@ final class DefaultLitePullConsumer
     public int $consumerTimeoutMillisWhenSuspend = 30000;
     public int $brokerSuspendMaxTimeMillis = 20000;
     public int $pullIntervalMillis = 50;  // Backoff on empty polls at queue tail, avoiding busy loops hammering the broker
+    /**
+     * Message-count budget for the **whole** local buffer, summed over every queue: the aggregate
+     * cache gate. When the buffer holds strictly more than this many messages the application is
+     * not draining at all, so no queue is worth pulling. A plain budget, never clamped: 0 means
+     * "trip on the first cached message".
+     */
+    public int $pullThresholdForAll = 10000;
+    /**
+     * Message count still cached for **one** queue; strictly greater refuses that queue's pull.
+     * A sibling queue over its own budget never stops this one. Never clamped: 0 trips on the
+     * first cached message.
+     */
+    public int $pullThresholdForQueue = 1000;
+    /**
+     * MiB still cached for **one** queue, measured on the *stored* message size the decoder
+     * records (never the body length) and compared as an integer number of MiB. Never clamped.
+     */
+    public int $pullThresholdSizeForQueue = 100;
+    /**
+     * Offset span of **one** queue's cached messages: its highest cached queue offset minus its
+     * lowest. An empty or single-message cache has span 0 and can therefore never trip.
+     */
+    public int $consumeMaxSpan = 2000;
 
     // Runtime state
     public ?MQClientInstance $mqClient = null;
@@ -962,6 +985,29 @@ final class DefaultLitePullConsumer
     private float $nextAutoCommitDeadline = -1.0;
     /** @var array<string,bool> */
     private array $paused = [];
+    /**
+     * Per-queue cache accumulators (key = mqKey), the cache gates' O(1) view of the local buffer:
+     * how many messages of this queue the buffer holds, how many **stored** bytes, and the lowest
+     * and highest cached queue offset -- with the offset -> refcount map behind the boundaries, so
+     * a removal whose boundary offset lost its last message can re-pick the boundary without
+     * walking the buffer. Only the buffer's own primitives (``bufferAppend`` / ``bufferTake`` /
+     * ``bufferRetain``) write these, in the same step as they move the buffer itself, so an
+     * accumulator can never describe a buffer the buffer does not have; a queue that leaves the
+     * assignment loses its record together with its cached messages.
+     *
+     * @var array<string,array{count:int,bytes:int,min:int,max:int,offsets:array<int,int>}>
+     */
+    private array $queueCache = [];
+    /** @var array<string,float> Due time of one queue's own-cache pause (seconds, microtime basis; the PHP form of a pull task re-scheduled 50 ms later) */
+    private array $cacheFlowControlUntil = [];
+    /** @var array<string,float> Due time of one queue's short pause after the broker answered FLOW_CONTROL(215) */
+    private array $pullIdleUntil = [];
+    /** @var int Trips of the aggregate (whole-buffer) cache gate */
+    private int $flowControlForAllTimes = 0;
+    /** @var int Trips of the per-queue count gate and the per-queue size gate, which share one budget */
+    private int $flowControlForQueueTimes = 0;
+    /** @var int Trips of the per-queue offset-span gate */
+    private int $flowControlForSpanTimes = 0;
     private ?object $messageQueueListener = null;
     private float $lastRebalanceTs = 0.0;
     private float $nextHeartbeatAt = 0.0;
@@ -1039,6 +1085,100 @@ final class DefaultLitePullConsumer
     public function setAutoCommit(bool $auto): void
     {
         $this->autoCommit = $auto;
+    }
+
+    /**
+     * Message-count budget of the whole local buffer (aggregate cache gate). Stored as given:
+     * these are plain budgets, so 0 is a legal value that trips on the first cached message.
+     */
+    public function setPullThresholdForAll(int $n): void
+    {
+        $this->pullThresholdForAll = $n;
+    }
+
+    public function getPullThresholdForAll(): int
+    {
+        return $this->pullThresholdForAll;
+    }
+
+    /** Message-count budget of one queue's cached messages (no clamping, same rule as above). */
+    public function setPullThresholdForQueue(int $n): void
+    {
+        $this->pullThresholdForQueue = $n;
+    }
+
+    public function getPullThresholdForQueue(): int
+    {
+        return $this->pullThresholdForQueue;
+    }
+
+    /** MiB budget of one queue's cached messages, counted on the stored size (no clamping). */
+    public function setPullThresholdSizeForQueue(int $n): void
+    {
+        $this->pullThresholdSizeForQueue = $n;
+    }
+
+    public function getPullThresholdSizeForQueue(): int
+    {
+        return $this->pullThresholdSizeForQueue;
+    }
+
+    /** Offset-span budget of one queue's cached messages (no clamping). */
+    public function setConsumeMaxSpan(int $n): void
+    {
+        $this->consumeMaxSpan = $n;
+    }
+
+    public function getConsumeMaxSpan(): int
+    {
+        return $this->consumeMaxSpan;
+    }
+
+    /**
+     * Messages of this queue the local buffer still holds (handed to the application or not, both
+     * stay in the buffer until ``poll()`` takes them away). Read from the same accumulator the
+     * cache gates read, so an observation and a verdict can never disagree.
+     */
+    public function cachedMessageCountOf(MessageQueue $mq): int
+    {
+        return $this->queueCache[self::mqKey($mq)]['count'] ?? 0;
+    }
+
+    /** Stored bytes of this queue's cached messages (the size gate's numerator, before the MiB division). */
+    public function cachedByteSizeOf(MessageQueue $mq): int
+    {
+        return $this->queueCache[self::mqKey($mq)]['bytes'] ?? 0;
+    }
+
+    /** Highest minus lowest cached queue offset of this queue; 0 while it holds fewer than two messages. */
+    public function cachedOffsetSpanOf(MessageQueue $mq): int
+    {
+        $stat = $this->queueCache[self::mqKey($mq)] ?? null;
+        return $stat === null ? 0 : $stat['max'] - $stat['min'];
+    }
+
+    /** Messages cached across every queue: the aggregate gate's measurement. */
+    public function cachedMessageCount(): int
+    {
+        return count($this->localBuffer);
+    }
+
+    /** Trips of the aggregate gate; the push path's ``flowControlTriggeredCount()`` counterpart for this path. */
+    public function flowControlForAllTimes(): int
+    {
+        return $this->flowControlForAllTimes;
+    }
+
+    /** Trips of the per-queue count gate and size gate, which feed this one counter. */
+    public function flowControlForQueueTimes(): int
+    {
+        return $this->flowControlForQueueTimes;
+    }
+
+    /** Trips of the per-queue offset-span gate. */
+    public function flowControlForSpanTimes(): int
+    {
+        return $this->flowControlForSpanTimes;
     }
 
     /**
@@ -1195,6 +1335,9 @@ final class DefaultLitePullConsumer
         foreach (array_keys($this->assigned) as $key) {
             if (!isset($queues[$key])) {
                 unset($this->nextOffset[$key], $this->consumeOffset[$key]);
+                // A queue taken out of the assignment loses its cache, its accumulators and its
+                // armed pauses in one step, so nothing stale can refuse a later pull round.
+                $this->dropQueueCache($key);
             }
         }
         $this->assigned = $queues;
@@ -1447,10 +1590,25 @@ final class DefaultLitePullConsumer
      * OFFSET_ILLEGAL all advance the pull cursor to nextBeginOffset; brake: **in-flight
      * results must not overwrite just-seeked / just-removed offsets** (is the cursor still
      * the value it was when the request was sent).
+     *
+     * The queue's round starts with the cache gates: a refused round sends nothing, commits
+     * nothing and moves no cursor, it only re-schedules this queue 50 ms later.
      */
     private function pullOne(MessageQueue $mq): bool
     {
         $key = self::mqKey($mq);
+        $now = microtime(true);
+        // An armed deadline is this tick model's "pull task re-scheduled later": while it is unpaid
+        // the queue's round does not even reach the gates. A queue rebalance has already taken away
+        // is dropped here as well, so a leftover buffer state can never put a request on the wire.
+        if (!isset($this->assigned[$key])
+            || $now < (float) ($this->cacheFlowControlUntil[$key] ?? 0.0)
+            || $now < (float) ($this->pullIdleUntil[$key] ?? 0.0)) {
+            return false;
+        }
+        if ($this->cacheFlowControlHit($mq, $key)) {
+            return false;
+        }
         $offset = $this->nextOffset[$key] ?? null;
         if ($offset === null) {
             $offset = $this->resolveInitialOffset($mq);
@@ -1477,6 +1635,7 @@ final class DefaultLitePullConsumer
             );
         } catch (\Throwable $e) {
             Logger::debug("lite pull_one failed for $mq->topic@$mq->queueId: " . $e->getMessage());
+            $this->armBrokerThrottlePause($key, $e);
             return false;
         }
         $intact = ($this->nextOffset[$key] ?? null) === $offset;
@@ -1498,9 +1657,279 @@ final class DefaultLitePullConsumer
     /** @param list<MessageExt> $msgs */
     private function enqueue(array $msgs): void
     {
+        $this->bufferAppend($msgs);
+    }
+
+    // ---------------- Local cache flow control ----------------
+
+    /**
+     * The buffer and its per-queue accumulators, moved in one step: every message that lands in
+     * the buffer also lands in its queue's count / stored bytes / offset boundaries. This is the
+     * only writer of ``$localBuffer``'s tail, so a gate verdict always describes what is really
+     * cached -- the messages already handed to the application included, since they stay here
+     * until ``poll()`` takes them away.
+     *
+     * @param list<MessageExt> $msgs
+     */
+    private function bufferAppend(array $msgs): void
+    {
         foreach ($msgs as $m) {
             $this->localBuffer[] = $m;
+            $key = self::messageCacheKey($m);
+            $stat = $this->queueCache[$key] ?? ['count' => 0, 'bytes' => 0, 'min' => 0, 'max' => 0, 'offsets' => []];
+            $stat['count']++;
+            $stat['bytes'] += $m->storeSize;
+            $stat['offsets'][$m->queueOffset] = ($stat['offsets'][$m->queueOffset] ?? 0) + 1;
+            if ($stat['count'] === 1) {
+                $stat['min'] = $m->queueOffset;
+                $stat['max'] = $m->queueOffset;
+            } else {
+                $stat['min'] = min($stat['min'], $m->queueOffset);
+                $stat['max'] = max($stat['max'], $m->queueOffset);
+            }
+            $this->queueCache[$key] = $stat;
         }
+    }
+
+    /**
+     * Take at most $max messages off the head of the buffer and hand them out, subtracting exactly
+     * those messages from their queues' accumulators.
+     *
+     * @return list<MessageExt>
+     */
+    private function bufferTake(int $max): array
+    {
+        $out = [];
+        while ($this->localBuffer !== [] && count($out) < $max) {
+            $out[] = array_shift($this->localBuffer);
+        }
+        $this->bufferForget($out);
+        return $out;
+    }
+
+    /**
+     * Keep-only pass: what the predicate rejects leaves the buffer and its queue's accumulators
+     * together (``seek()`` pruning and queue revocation both come through here).
+     *
+     * @param callable(MessageExt):bool $keep
+     */
+    private function bufferRetain(callable $keep): void
+    {
+        $kept = [];
+        $dropped = [];
+        foreach ($this->localBuffer as $m) {
+            if ($keep($m)) {
+                $kept[] = $m;
+            } else {
+                $dropped[] = $m;
+            }
+        }
+        $this->localBuffer = $kept;
+        $this->bufferForget($dropped);
+    }
+
+    /**
+     * Subtract handed-over / pruned messages from their queues' accumulators. The offset
+     * boundaries only need re-picking when a removal took the **last** message of the boundary
+     * offset away, and that re-pick walks this queue's own distinct cached offsets, not the buffer
+     * and not once per message but once per removal batch -- so a round of the gates stays O(1) and
+     * never scans the buffer.
+     *
+     * @param list<MessageExt> $msgs
+     */
+    private function bufferForget(array $msgs): void
+    {
+        $boundaryGone = [];
+        foreach ($msgs as $m) {
+            $key = self::messageCacheKey($m);
+            $stat = $this->queueCache[$key] ?? null;
+            if ($stat === null || $stat['count'] === 0) {
+                // A message the cache does not own cannot drive a counter below zero.
+                continue;
+            }
+            $stat['count']--;
+            $stat['bytes'] = max(0, $stat['bytes'] - $m->storeSize);
+            $left = ($stat['offsets'][$m->queueOffset] ?? 0) - 1;
+            if ($left > 0) {
+                $stat['offsets'][$m->queueOffset] = $left;
+            } else {
+                unset($stat['offsets'][$m->queueOffset]);
+                if ($m->queueOffset === $stat['min'] || $m->queueOffset === $stat['max']) {
+                    $boundaryGone[$key] = true;
+                }
+            }
+            if ($stat['count'] === 0) {
+                // An empty cache owns no record: dropping it is what keeps the aggregate sum and
+                // the per-queue verdicts reading the same thing.
+                unset($this->queueCache[$key]);
+                continue;
+            }
+            $this->queueCache[$key] = $stat;
+        }
+        foreach (array_keys($boundaryGone) as $key) {
+            if (isset($this->queueCache[$key])) {
+                $this->refreshCacheBounds($key);
+            }
+        }
+    }
+
+    /** Re-pick one queue's lowest / highest cached offset from the offsets it still holds. */
+    private function refreshCacheBounds(string $key): void
+    {
+        $offsets = array_keys($this->queueCache[$key]['offsets'] ?? []);
+        if ($offsets === []) {
+            unset($this->queueCache[$key]);
+            return;
+        }
+        $this->queueCache[$key]['min'] = min($offsets);
+        $this->queueCache[$key]['max'] = max($offsets);
+    }
+
+    /**
+     * Drop one queue's cache with the queue: its messages leave the buffer and its accumulators
+     * and armed pauses leave with them, in the same step. Re-assigning that queue later therefore
+     * starts from an empty cache instead of from a stale record, and a queue this consumer no
+     * longer owns can never refuse a pull.
+     */
+    private function dropQueueCache(string $key): void
+    {
+        if (isset($this->queueCache[$key])) {
+            $this->bufferRetain(static fn(MessageExt $m): bool => self::messageCacheKey($m) !== $key);
+            unset($this->queueCache[$key]);
+        }
+        unset($this->cacheFlowControlUntil[$key], $this->pullIdleUntil[$key]);
+    }
+
+    /**
+     * The four cache gates, judged for **this one queue** before its round resolves a pull offset
+     * and therefore before any request leaves. The order is fixed:
+     *
+     * 1. aggregate: everything cached across every queue against ``pullThresholdForAll``;
+     * 2. count: this queue's cached message count against ``pullThresholdForQueue``;
+     * 3. size: this queue's cached **stored** bytes, as whole MiB, against ``pullThresholdSizeForQueue``;
+     * 4. span: this queue's cached offset span against ``consumeMaxSpan``.
+     *
+     * All four compare **strictly greater than**, so a queue that sits exactly on its threshold
+     * still pulls and a threshold reads as "how many may stay cached"; nothing here is clamped, so
+     * 0 trips on the first cached message. Gates 2 to 4 judge this queue alone out of the
+     * accumulators -- a sibling queue over its own budget never stops this one, and no threshold is
+     * ever summed over the queues.
+     */
+    private function cacheFlowControlHit(MessageQueue $mq, string $key): bool
+    {
+        $cached = count($this->localBuffer);
+        if ($cached > $this->pullThresholdForAll) {
+            $times = ++$this->flowControlForAllTimes;
+            $this->armCacheFlowControlPause(
+                $mq,
+                $key,
+                $times,
+                sprintf(
+                    'the consume request count exceeds threshold %d, so do flow control,'
+                        . ' cached=%d, flowControlTimes=%d',
+                    $this->pullThresholdForAll,
+                    $cached,
+                    $times,
+                ),
+            );
+            return true;
+        }
+        $stat = $this->queueCache[$key] ?? null;
+        if ($stat === null) {
+            // Nothing of this queue is cached: no per-queue gate can have anything to say.
+            return false;
+        }
+        $sizeMb = intdiv($stat['bytes'], 1024 * 1024);
+        $span = $stat['max'] - $stat['min'];
+        $measured = sprintf('minOffset=%d, maxOffset=%d, count=%d, size=%d MiB',
+            $stat['min'], $stat['max'], $stat['count'], $sizeMb);
+        if ($stat['count'] > $this->pullThresholdForQueue) {
+            $times = ++$this->flowControlForQueueTimes;
+            $this->armCacheFlowControlPause(
+                $mq,
+                $key,
+                $times,
+                sprintf(
+                    'the cached message count exceeds the threshold %d, so do flow control, %s,'
+                        . ' flowControlTimes=%d',
+                    $this->pullThresholdForQueue,
+                    $measured,
+                    $times,
+                ),
+            );
+            return true;
+        }
+        if ($sizeMb > $this->pullThresholdSizeForQueue) {
+            $times = ++$this->flowControlForQueueTimes;
+            $this->armCacheFlowControlPause(
+                $mq,
+                $key,
+                $times,
+                sprintf(
+                    'the cached message size exceeds the threshold %d MiB, so do flow control, %s,'
+                        . ' flowControlTimes=%d',
+                    $this->pullThresholdSizeForQueue,
+                    $measured,
+                    $times,
+                ),
+            );
+            return true;
+        }
+        if ($span > $this->consumeMaxSpan) {
+            $times = ++$this->flowControlForSpanTimes;
+            $this->armCacheFlowControlPause(
+                $mq,
+                $key,
+                $times,
+                sprintf(
+                    "the queue's messages, span too long, so do flow control,"
+                        . ' minOffset=%d, maxOffset=%d, maxSpan=%d, flowControlTimes=%d',
+                    $stat['min'],
+                    $stat['max'],
+                    $span,
+                    $times,
+                ),
+            );
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Record one cache-gate refusal of this queue's pull. Every gate writes the deadline through
+     * here, so a refusal is exactly one 50 ms pause on exactly this queue -- the same own-cache
+     * pause and the same once-per-1000 warn cadence the push path's gates use, shared through the
+     * push class's public constants rather than restated with a second value. Nothing else moves:
+     * no offset is committed, the cursor stays, the messages stay cached.
+     */
+    private function armCacheFlowControlPause(MessageQueue $mq, string $key, int $times, string $reason): void
+    {
+        $pauseMillis = DefaultMQPushConsumer::PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL;
+        $this->cacheFlowControlUntil[$key] = microtime(true) + $pauseMillis / 1000.0;
+        $line = sprintf('flow control: queue %s %s, pause pull for %d ms', $mq, $reason, $pauseMillis);
+        Logger::debug($line);
+        if (DefaultMQPushConsumer::isFlowControlWarnTrip($times)) {
+            Logger::warning($line);
+        }
+    }
+
+    /**
+     * A broker throttle on this path is not an error: when the pull comes back answered with
+     * FLOW_CONTROL(215) the broker held the request on its own window, which says nothing about
+     * this client's cache, so this queue's next round waits the push path's 20 ms broker pause
+     * (``PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL``, reached through the shared code-to-wait
+     * mapping) instead of hammering away on the next tick. Every other failure keeps the lite
+     * path's existing behaviour -- log it and retry on the next tick -- so no other response
+     * code's handling changes here.
+     */
+    private function armBrokerThrottlePause(string $key, \Throwable $e): void
+    {
+        $code = $e instanceof MQBrokerException ? $e->responseCode : null;
+        if ($code !== ResponseCode::FLOW_CONTROL) {
+            return;
+        }
+        $this->pullIdleUntil[$key] = microtime(true)
+            + DefaultMQPushConsumer::pullBackoffMillisForResponseCode($code) / 1000.0;
     }
 
     private function maybeAutoCommit(): void
@@ -1622,9 +2051,12 @@ final class DefaultLitePullConsumer
                 $this->persistOffsetByKey($key);
                 // Drop the AssignedMessageQueue entries together: keeping seekOffset would let
                 // this queue silently jump back to a position the user pinned manually long
-                // ago when it someday returns to this instance.
+                // ago when it someday returns to this instance. The cache goes with the queue, so
+                // a queue this consumer no longer owns keeps no accumulator, no armed pause and no
+                // buffered message behind its back.
                 unset($this->nextOffset[$key], $this->consumeOffset[$key],
                     $this->offsetTable[$key], $this->seekOffset[$key]);
+                $this->dropQueueCache($key);
             }
             if ($this->messageQueueListener !== null) {
                 try {
@@ -1664,13 +2096,10 @@ final class DefaultLitePullConsumer
             // PHP adaptation: Condition.wait -> bounded spin at 10ms granularity.
             usleep(10000);
         }
-        $out = [];
-        while ($this->localBuffer !== [] && count($out) < 1024) {
-            $out[] = array_shift($this->localBuffer);
-        }
+        $out = $this->bufferTake(1024);
         $advanced = [];
         foreach ($out as $m) {
-            $key = $m->topic . ($m->brokerName ?? '') . (string) $m->queueId;
+            $key = self::messageCacheKey($m);
             if (!isset($this->nextOffset[$key])) {
                 continue;
             }
@@ -1692,16 +2121,12 @@ final class DefaultLitePullConsumer
         $this->seekOffset[$key] = $offset;
         $this->nextOffset[$key] = $offset;
         $this->consumeOffset[$key] = $offset;
-        $kept = [];
-        foreach ($this->localBuffer as $m) {
+        $this->bufferRetain(static function (MessageExt $m) use ($mq, $offset): bool {
             $sameQueue = $m->topic === $mq->topic
                 && ($m->brokerName ?? '') === $mq->brokerName
                 && $m->queueId === $mq->queueId;
-            if (!$sameQueue || $m->queueOffset >= $offset) {
-                $kept[] = $m;
-            }
-        }
-        $this->localBuffer = $kept;
+            return !$sameQueue || $m->queueOffset >= $offset;
+        });
     }
 
     public function seekToBegin(MessageQueue $mq): void
@@ -2045,6 +2470,16 @@ final class DefaultLitePullConsumer
     private static function mqKey(MessageQueue $mq): string
     {
         return $mq->topic . $mq->brokerName . (string) $mq->queueId;
+    }
+
+    /**
+     * The same key the queue state maps use, rebuilt from a buffered message: the buffer is one
+     * global container, so a message carries its own queue's identity and that is what the cache
+     * accumulators are keyed by (``poll()`` advances the consume cursor the same way).
+     */
+    private static function messageCacheKey(MessageExt $m): string
+    {
+        return $m->topic . ($m->brokerName ?? '') . (string) $m->queueId;
     }
 }
 

@@ -31,7 +31,7 @@ code-generation step.
 ```bash
 cd rust
 cargo build --all-targets                       # lib + 42 examples
-cargo test --quiet                              # 1115 passed; 0 failed; 0 ignored (~10s)
+cargo test --quiet                              # 1127 passed; 0 failed; 0 ignored (~10s)
 cargo clippy --all-targets --all-features -- -D warnings  # zero warnings is a hard gate
 ```
 
@@ -276,7 +276,12 @@ verification); for production set it to `false` and configure the system trust c
   outstanding-ACK gate (strictly above `pop_threshold_for_queue`, default 96, a trip counted on the
   pull path's one client-wide flow-control total and warn cadence)
 - ✅ PullConsumer / LitePullConsumer (incl. queue-change listener, three offset tables,
-  pause / resume)
+  pause / resume; LitePull judges four cache gates before the pull offset is resolved —
+  whole-buffer count `pull_threshold_for_all` 10000 / this queue's count
+  `pull_threshold_for_queue` 1000 / this queue's stored bytes
+  `pull_threshold_size_for_queue` 100 MiB with integer division / this queue's offset span
+  `consume_max_span` 2000, each refusing only when strictly above its threshold; a refusal
+  re-schedules just this queue 50ms later while the broker's `FLOW_CONTROL`(215) waits 20ms)
 - ✅ Six queue allocation strategies (AVG / AVG_BY_CIRCLE / CONFIG / CONSISTENT_HASH /
   MACHINE_ROOM / MACHINE_ROOM_NEARBY), pluggable and driven by real rebalancing
 - ✅ The full Admin chain (topic / cluster / consume stats / offset reset / queue locks /
@@ -328,7 +333,7 @@ list extra preconditions.
 | `live_producer` | six send paths, transaction two-phase + check-back, recallMessage, the async kernel, shutdown unregistration 35; ⚠ the TLS leg needs `ROCKETMQ_TLS_ENABLE=1` |
 | `live_consumer` | long polling / tag filter / `%RETRY%` re-delivery / `%DLQ%` dead letters / partial ack / POP / broadcasting / ordered dead letters / explicit COMMIT-ROLLBACK / stall self-healing / 307 |
 | `live_pull_consumer` | manual pull with no loss and no duplication, offsets owned by the caller, long polling really suspends |
-| `live_lite_pull_consumer` | subscribe / assign / seek / poll / committed, both auto_commit states, the three offset tables each counted out on real hardware |
+| `live_lite_pull_consumer` | subscribe / assign / seek / poll / committed, both auto_commit states, the three offset tables each counted out on real hardware, and this queue's cached-count gate (over budget parks only that queue, and the cursor runs to the tail once the buffer drains) |
 | `live_lite_pull_cursor` | pull cursor: NO_MATCHED_MSG follows past the whole run + OFFSET_ILLEGAL out-of-range self-healing |
 | `live_lite_pull_code` | lite request code 361 + lite flag; ⚠ flips the broker switch `litePullMessageEnable` at runtime, restores it before exit |
 | `live_lite_topic_queue_change` | queue-change listener: instant scale-out/scale-in callbacks, snapshot advances without duplicate callbacks |
