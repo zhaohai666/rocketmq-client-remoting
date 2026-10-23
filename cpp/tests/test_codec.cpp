@@ -231,6 +231,61 @@ static void testBatchDefaultsWaitStoreMsgOkToTrue() {
           "batch keeps explicit WAIT=false");
 }
 
+static std::string batchRejection(const std::vector<Message>& msgs) {
+    try {
+        MessageBatch::generateFromList(msgs);
+        return "";
+    } catch (const std::exception& e) {
+        return e.what();
+    }
+}
+
+// The schedule guard covers the delay level AND the three timer spellings, on any member: a batch
+// leaves as one message with one property set, so a member's schedule would land on the envelope
+// carrying the others. Each rejection is paired with a 0 under the same name, which means "no
+// schedule" and must still pack — without it a presence-only check would pass the same asserts.
+static void testBatchRejectsEveryScheduleSpelling() {
+    const char* names[] = {MessageConst::PROPERTY_DELAY_TIME_LEVEL,
+                           MessageConst::PROPERTY_TIMER_DELAY_SEC,
+                           MessageConst::PROPERTY_TIMER_DELAY_MS,
+                           MessageConst::PROPERTY_TIMER_DELIVER_MS};
+    for (const char* name : names) {
+        Message scheduled("T_S", "a");
+        scheduled.properties[name] = "3";
+        CHECK(batchRejection({scheduled}).find("Delayed messages are not supported for batching") !=
+                  std::string::npos,
+              std::string(name) + "=3 rejects the batch");
+
+        Message tail("T_S", "b");
+        tail.properties[name] = "3";
+        CHECK(batchRejection({Message("T_S", "a"), tail}).find(
+                  "Delayed messages are not supported for batching") != std::string::npos,
+              std::string(name) + "=3 on a non-first member rejects the batch");
+
+        Message zero("T_S", "a");
+        zero.properties[name] = "0";
+        CHECK(batchRejection({zero}).empty(), std::string(name) + "=0 leaves the batch alone");
+    }
+
+    // The setters the public API exposes reach the same four properties.
+    Message viaLevel("T_S", "a");
+    viaLevel.setDelayTimeLevel(2);
+    CHECK(!batchRejection({viaLevel}).empty(), "setDelayTimeLevel rejects");
+    Message viaSec("T_S", "a");
+    viaSec.setDelayTimeSec(30);
+    CHECK(!batchRejection({viaSec}).empty(), "setDelayTimeSec rejects");
+    Message viaMs("T_S", "a");
+    viaMs.setDelayTimeMs(30000);
+    CHECK(!batchRejection({viaMs}).empty(), "setDelayTimeMs rejects");
+    Message viaDeliver("T_S", "a");
+    viaDeliver.setDeliverTimeMs(1700000000000LL);
+    CHECK(!batchRejection({viaDeliver}).empty(), "setDeliverTimeMs rejects");
+
+    // A plain batch is the control the guard must never touch.
+    CHECK(batchRejection({Message("T_S", "a"), Message("T_S", "b")}).empty(),
+          "a plain batch is still accepted");
+}
+
 static void testWaitStoreMsgOkParseBooleanContract() {
     Message msg("T_W", "x");
     CHECK(msg.isWaitStoreMsgOk(), "absent -> true");
@@ -375,6 +430,7 @@ int main() {
     testMessageCodec();
     testBatchCodec();
     testBatchDefaultsWaitStoreMsgOkToTrue();
+    testBatchRejectsEveryScheduleSpelling();
     testWaitStoreMsgOkParseBooleanContract();
     testUtilAndHash();
     testBodyCrcFieldShape();

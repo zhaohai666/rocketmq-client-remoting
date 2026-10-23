@@ -24,7 +24,7 @@ git clone <本仓库> && cd rocketmq-client-remoting/nodeJs
 node --experimental-strip-types selfcheck.ts
 ```
 
-`selfcheck.ts` 加载 `src/` 全部 **65** 个模块并依次跑 **33** 套离线冒烟（两份清单都由目录树推导，新增文件不会漏出自检），2026-10-23 实测 **ALL GREEN**，共 **1027** 项检查。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
+`selfcheck.ts` 加载 `src/` 全部 **65** 个模块并依次跑 **34** 套离线冒烟（两份清单都由目录树推导，新增文件不会漏出自检），2026-10-23 实测 **ALL GREEN**，共 **1054** 项检查。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
 
 | 套件 | 实测 |
 | --- | --- |
@@ -34,8 +34,9 @@ node --experimental-strip-types selfcheck.ts
 | `test/admin_query_smoke.ts` | 7 通过 / 0 失败 |
 | `test/admin_track_smoke.ts`（消息轨迹回查） | 18 通过 / 0 失败 |
 | `test/auth_admin_smoke.ts` | 71 通过 / 0 失败 |
-| `test/auto_batch_and_retry_smoke.ts`（自动攒批与同步重试） | 108 通过 / 0 失败 |
+| `test/auto_batch_and_retry_smoke.ts`（自动攒批与同步重试） | 112 通过 / 0 失败 |
 | `test/backpressure_smoke.ts`（异步公平信号量闸门：等待、拒绝、回滚、文案） | 119 通过 / 0 失败 |
+| `test/batch_schedule_guard_smoke.ts`（批量发送拒绝携带延迟/定时属性的成员） | 23 通过 / 0 失败 |
 | `test/body_crc_smoke.ts`（存储体 BODYCRC 掩码形式） | 18 通过 / 0 失败 |
 | `test/client_config_gaps_smoke.ts`（客户端配置旋钮） | 44 通过 / 0 失败 |
 | `test/compat_contract_smoke.ts`（线上格式/行为钉死面） | 10 组检查通过 |
@@ -391,7 +392,7 @@ nodeJs/
 │                        # 队列分配/位点存储/消费统计/轨迹/背压/traceparent
 ├── examples/            # 真机 live 工具（见「真实集群联调」）
 ├── test/                # 离线冒烟（协议往返、攒批重试、背压闸门、分配、位点、轨迹、统计、命名空间、POP、admin）
-├── selfcheck.ts         # 一键离线自检（模块加载 + 33 套冒烟）
+├── selfcheck.ts         # 一键离线自检（模块加载 + 34 套冒烟）
 └── package.json         # engines: node >= 22
 ```
 

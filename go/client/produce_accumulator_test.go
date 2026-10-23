@@ -65,6 +65,34 @@ func TestCanBatchRules(t *testing.T) {
 	if canBatch(common.NewMessage("%RETRY%g", []byte("x"))) {
 		t.Fatal("retry-topic message must not be batchable")
 	}
+	// A timer-scheduled member is the case that used to slip through: it joins a
+	// group, then the flush is refused by the batch builder instead of the message
+	// simply going out as a single send.
+	timer := map[string]func(*common.Message){
+		common.PropertyTimerDelaySec:  func(m *common.Message) { m.SetDelayTimeSec(30) },
+		common.PropertyTimerDelayMs:   func(m *common.Message) { m.SetDelayTimeMs(30000) },
+		common.PropertyTimerDeliverMs: func(m *common.Message) { m.SetDeliverTimeMs(1700000000000) },
+	}
+	for name, apply := range timer {
+		msg := common.NewMessage("T", []byte("x"))
+		apply(msg)
+		if canBatch(msg) {
+			t.Fatalf("%s message must not be batchable", name)
+		}
+		// Paired control: the same name at 0 asks for nothing, so it still batches.
+		zero := common.NewMessage("T", []byte("x"))
+		zero.PutProperty(name, "0")
+		if !canBatch(zero) {
+			t.Fatalf("%s=0 must stay batchable", name)
+		}
+	}
+	// A message already stamped with a producer group is a transaction half
+	// message; its group is what the broker locates the connection by.
+	grouped := common.NewMessage("T", []byte("x"))
+	grouped.PutProperty(common.PropertyProducerGroup, "G")
+	if canBatch(grouped) {
+		t.Fatal("message carrying a producer group must not be batchable")
+	}
 }
 
 func TestTryAddMessageByteGate(t *testing.T) {

@@ -274,6 +274,57 @@ public class CodecTests
     }
 
     [Fact]
+    public void BatchRejectsEveryScheduleSpelling()
+    {
+        // The guard covers the delay level and the three timer spellings, on any member: a batch
+        // leaves as one message with one property set, so a member's schedule would land on the
+        // envelope carrying the others. A 0 under the same name means "no schedule" and must still
+        // pack — that control is what separates this from a presence-only check.
+        string[] names =
+        {
+            MessageConst.PropertyDelayTimeLevel,
+            MessageConst.PropertyTimerDelaySec,
+            MessageConst.PropertyTimerDelayMs,
+            MessageConst.PropertyTimerDeliverMs,
+        };
+        foreach (string name in names)
+        {
+            var scheduled = new Message("T_S", Encoding.UTF8.GetBytes("a"));
+            scheduled.Properties[name] = "3";
+            ArgumentException err = Assert.Throws<ArgumentException>(
+                () => MessageBatch.GenerateFromList(new List<Message> { scheduled }));
+            Assert.Contains("Delayed messages are not supported for batching", err.Message);
+
+            var tail = new Message("T_S", Encoding.UTF8.GetBytes("b"));
+            tail.Properties[name] = "3";
+            Assert.Throws<ArgumentException>(() => MessageBatch.GenerateFromList(new List<Message>
+            {
+                new Message("T_S", Encoding.UTF8.GetBytes("a")),
+                tail,
+            }));
+
+            var zero = new Message("T_S", Encoding.UTF8.GetBytes("a"));
+            zero.Properties[name] = "0";
+            Assert.Equal(1, MessageBatch.GenerateFromList(new List<Message> { zero }).Size);
+        }
+
+        // The setters the public API exposes reach the same four properties.
+        Assert.Throws<ArgumentException>(() => MessageBatch.GenerateFromList(new List<Message>
+        {
+            new Message("T_S", Encoding.UTF8.GetBytes("a")) { DelayTimeLevel = 2 },
+        }));
+        var viaSec = new Message("T_S", Encoding.UTF8.GetBytes("a"));
+        viaSec.SetDelayTimeSec(30);
+        Assert.Throws<ArgumentException>(() => MessageBatch.GenerateFromList(new List<Message> { viaSec }));
+        var viaMs = new Message("T_S", Encoding.UTF8.GetBytes("a"));
+        viaMs.SetDelayTimeMs(30000);
+        Assert.Throws<ArgumentException>(() => MessageBatch.GenerateFromList(new List<Message> { viaMs }));
+        var viaDeliver = new Message("T_S", Encoding.UTF8.GetBytes("a"));
+        viaDeliver.SetDeliverTimeMs(1700000000000L);
+        Assert.Throws<ArgumentException>(() => MessageBatch.GenerateFromList(new List<Message> { viaDeliver }));
+    }
+
+    [Fact]
     public void WaitStoreMsgOkFollowsLegacyParseBoolean()
     {
         var msg = new Message("T_W", Encoding.UTF8.GetBytes("x"));

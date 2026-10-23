@@ -318,6 +318,24 @@ class MessageExt(Message):
             self.topic, self.msg_id, self.queue_offset, len(self.body))
 
 
+# The four properties that ask for a later delivery: a delay level, a timer in
+# seconds, a timer in milliseconds, or an absolute deliver-at timestamp.
+SCHEDULED_DELIVERY_PROPERTIES = ("DELAY", "TIMER_DELAY_SEC", "TIMER_DELAY_MS", "TIMER_DELIVER_MS")
+
+
+def scheduled_delivery_value(message: "Message") -> int:
+    """The largest value among the schedule properties; 0 means no schedule was asked for."""
+    pass
+    value = 0
+    for name in SCHEDULED_DELIVERY_PROPERTIES:
+        raw = message.properties.get(name)
+        if raw:
+            current = int(raw)
+            if current > value:
+                value = current
+    return value
+
+
 class MessageBatch(Message):
     pass
 
@@ -345,8 +363,10 @@ class MessageBatch(Message):
         message_list: List[Message] = []
         first: Optional[Message] = None
         for message in messages:
-            delay_level = message.get_delay_time_level()
-            if delay_level and int(delay_level) > 0:
+            # One batch is packed into one wire message, so a member that asks
+            # for a later delivery would put that request on the envelope
+            # carrying every other member. Refuse the whole batch instead.
+            if scheduled_delivery_value(message) > 0:
                 raise ValueError("Delayed messages are not supported for batching")
             if message.get_topic().startswith(MixAll.RETRY_GROUP_TOPIC_PREFIX):
                 raise ValueError("Retry Group is not supported for batching")

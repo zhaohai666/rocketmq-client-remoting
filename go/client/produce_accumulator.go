@@ -324,11 +324,21 @@ func splitKeysInto(target map[string]struct{}, keys string) {
 	}
 }
 
+// canBatch decides whether a message joins a group or goes out as a single
+// send. The three exclusions are the ones a packed batch cannot carry: a
+// schedule request (the delay level or any timer spelling — the batch envelope
+// holds one property set for every member), a retry topic, and a message
+// already stamped with a producer group (the transaction half-message kind).
+// Only DELAY here would admit a TIMER_* message, whose later flush is then
+// refused by GenerateFromList.
 func canBatch(msg *common.Message) bool {
-	if msg.DelayTimeLevel() > 0 {
+	if common.ScheduledDeliveryRequested(msg) {
 		return false
 	}
 	if strings.HasPrefix(msg.Topic, common.RetryGroupTopicPrefix) {
+		return false
+	}
+	if _, ok := msg.GetProperty(common.PropertyProducerGroup); ok {
 		return false
 	}
 	return true

@@ -124,13 +124,24 @@ std::string MessageExt::toString() const {
 
 Bytes MessageBatch::encode() const { return encodeMessages(messages); }
 
+namespace {
+// A batch leaves as ONE message with ONE property set, so a member that asks for a later delivery
+// would put that request on the envelope carrying every other member; the whole batch is refused
+// instead. "Later delivery" is the delay level or any of the three timer spellings, and a 0 under
+// one of them means no schedule.
+bool scheduledDeliveryRequested(const Message& msg) {
+    return msg.getDelayTimeLevel() > 0 || msg.getDelayTimeSec() > 0 || msg.getDelayTimeMs() > 0 ||
+           msg.getDeliverTimeMs() > 0;
+}
+}  // namespace
+
 MessageBatch MessageBatch::generateFromList(const std::vector<Message>& msgs) {
     if (msgs.empty()) {
         throw std::invalid_argument("messages must not be null or empty");
     }
     const Message* first = nullptr;
     for (const auto& m : msgs) {
-        if (m.getDelayTimeLevel() > 0) {
+        if (scheduledDeliveryRequested(m)) {
             throw std::invalid_argument("Delayed messages are not supported for batching");
         }
         if (m.getTopic().rfind(MixAll::RETRY_GROUP_TOPIC_PREFIX, 0) == 0) {

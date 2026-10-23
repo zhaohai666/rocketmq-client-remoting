@@ -10,7 +10,7 @@ from collections import deque
 from enum import Enum
 from typing import Callable, Dict, List, Optional, Tuple
 
-from common.message import Message, MessageBatch, MessageExt, MessageQueue
+from common.message import Message, MessageBatch, MessageExt, MessageQueue, scheduled_delivery_value
 from common.message_accessor import MessageAccessor
 from common.message_const import MessageConst
 from common.message_decoder import _compress, decode_message, decode_message_id
@@ -166,22 +166,6 @@ class _BackPressureSendCallback:
             self._size_semaphore.release(self.msg_len)
         if self.num_acquired:
             self._num_semaphore.release(1)
-
-
-_TIMER_DELAY_PROPERTIES = ("DELAY", "TIMER_DELAY_MS", "TIMER_DELAY_SEC", "TIMER_DELIVER_MS")
-
-
-def _max_delay_value(msg: Message) -> int:
-    pass
-    result = 0
-    for name in _TIMER_DELAY_PROPERTIES:
-        raw = msg.properties.get(name)
-        if raw is None:
-            continue
-        value = int(raw)
-        if value > result:
-            result = value
-    return result
 
 
 def _classify_async_failure(error: BaseException,
@@ -1608,7 +1592,7 @@ class DefaultMQProducer:
         pass
         if not self.produce_accumulator.try_add_message(msg):
             return False
-        if _max_delay_value(msg) > 0:
+        if scheduled_delivery_value(msg) > 0:
             return False
         if msg.get_topic().startswith(MixAll.RETRY_GROUP_TOPIC_PREFIX):
             return False

@@ -169,11 +169,17 @@ export class ProduceAccumulator {
     if (msg instanceof MessageBatch) return false;
     if (MixAll.isRetryTopic(msg.getTopic())) return false;
     if (MessageAccessor.isTransactionPrepared(msg)) return false;
+    // A message already stamped with a producer group is the half-message kind:
+    // the broker locates its transactional connection by group, so it cannot
+    // ride an envelope addressed by whoever else's group the batch happens to get.
+    if (msg.getProperty(MessageConst.PROPERTY_PRODUCER_GROUP) != null) return false;
     const delayLevel = msg.getDelayTimeLevel();
     if (delayLevel != null && parseInt(delayLevel, 10) > 0) return false;
-    if (msg.getProperty(MessageConst.PROPERTY_TIMER_DELAY_SEC) != null) return false;
-    if (msg.getProperty(MessageConst.PROPERTY_TIMER_DELAY_MS) != null) return false;
-    if (msg.getProperty(MessageConst.PROPERTY_TIMER_DELIVER_MS) != null) return false;
+    // Value checks, not presence: a 0 under one of these names asks for no schedule, so the
+    // message still belongs in a group.
+    for (const raw of [msg.getDelayTimeSec(), msg.getDelayTimeMs(), msg.getDeliverTimeMs()]) {
+      if (raw != null && parseInt(raw, 10) > 0) return false;
+    }
     return msg.getBody().length <= this.maxHoldSize;
   }
 

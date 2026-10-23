@@ -183,6 +183,31 @@ class TestMessageBatch:
         with pytest.raises(ValueError):
             MessageBatch.generate_from_list([msg])
 
+    def test_every_scheduling_property_rejects_the_batch(self):
+        # The batch envelope carries one set of delivery properties for all its
+        # members, so any member that asks for a later delivery — by delay level
+        # or by any of the three timer spellings — rejects the whole batch.
+        for name in ("DELAY", "TIMER_DELAY_SEC", "TIMER_DELAY_MS", "TIMER_DELIVER_MS"):
+            msg = Message(topic="T", body=b"a")
+            msg.properties[name] = "3"
+            with pytest.raises(ValueError, match="Delayed messages are not supported"):
+                MessageBatch.generate_from_list([msg])
+
+    def test_a_scheduling_property_anywhere_in_the_batch_rejects_it(self):
+        plain = Message(topic="T", body=b"a")
+        scheduled = Message(topic="T", body=b"b")
+        scheduled.properties["TIMER_DELIVER_MS"] = "1700000000000"
+        with pytest.raises(ValueError, match="Delayed messages are not supported"):
+            MessageBatch.generate_from_list([plain, scheduled])
+
+    def test_a_zero_scheduling_property_leaves_the_batch_alone(self):
+        # Control for the two cases above: the guard fires on a request to
+        # deliver later, not on the mere presence of the property.
+        for name in ("DELAY", "TIMER_DELAY_SEC", "TIMER_DELAY_MS", "TIMER_DELIVER_MS"):
+            msg = Message(topic="T", body=b"a")
+            msg.properties[name] = "0"
+            MessageBatch.generate_from_list([msg])
+
     def test_retry_topic_rejected(self):
         with pytest.raises(ValueError):
             MessageBatch.generate_from_list([Message(topic="%RETRY%GroupA", body=b"a")])

@@ -306,6 +306,16 @@ public class MessageBatch : Message
 
     public int Size => Messages.Count;
 
+    /// A batch leaves as ONE message with ONE property set, so a member that asks for a later
+    /// delivery would put that request on the envelope carrying every other member. "Later
+    /// delivery" is the delay level or any of the three timer spellings; a 0 under one of them
+    /// means no schedule.
+    private static bool ScheduledDeliveryRequested(Message msg) =>
+        msg.DelayTimeLevel > 0
+        || msg.GetDelayTimeSec() > 0
+        || msg.GetDelayTimeMs() > 0
+        || msg.GetDeliverTimeMs() > 0;
+
     public static MessageBatch GenerateFromList(List<Message> msgs)
     {
         if (msgs == null || msgs.Count == 0)
@@ -316,7 +326,7 @@ public class MessageBatch : Message
         Message first = msgs[0];
         foreach (var m in msgs)
         {
-            if (m.DelayTimeLevel > 0)
+            if (ScheduledDeliveryRequested(m))
             {
                 throw new ArgumentException("Delayed messages are not supported for batching");
             }

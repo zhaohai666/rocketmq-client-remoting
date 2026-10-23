@@ -152,7 +152,21 @@ export class MessageExt extends Message {
   toString() { return `MessageExt(topic='${this.topic}', msgId='${this.msgId}', queueOffset=${this.queueOffset}, body=${this.body.length} bytes)`; }
 }
 
+// A member asking to be delivered later — the delay level or any of the three timer
+// spellings (relative seconds, relative milliseconds, absolute deliver-at). A batch
+// leaves as ONE message with ONE property set, so such a request would land on the
+// envelope carrying every other member; the whole batch is refused instead.
+function scheduledDeliveryRequested(msg: Message): boolean {
+  const raws = [msg.getDelayTimeLevel(), msg.getDelayTimeSec(), msg.getDelayTimeMs(), msg.getDeliverTimeMs()];
+  for (const raw of raws) {
+    const value = raw ? parseInt(raw, 10) : 0;
+    if (!Number.isNaN(value) && value > 0) return true;
+  }
+  return false;
+}
+
 export class MessageBatch extends Message {
+
   messages: Message[];
   constructor(messages: Message[] | null = null) {
     super();
@@ -175,8 +189,7 @@ export class MessageBatch extends Message {
     const list: Message[] = [];
     let first: Message | null = null;
     for (const m of messages) {
-      const dl = m.getDelayTimeLevel();
-      if (dl && parseInt(dl, 10) > 0) throw new Error('Delayed messages are not supported for batching');
+      if (scheduledDeliveryRequested(m)) throw new Error('Delayed messages are not supported for batching');
       if ((m.getTopic() || '').startsWith('%RETRY%')) throw new Error('Retry Group is not supported for batching');
       if (first == null) first = m;
       else {

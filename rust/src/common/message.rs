@@ -647,6 +647,20 @@ impl fmt::Display for MessageExt {
     }
 }
 
+/// Whether a member asks to be delivered later: the delay level, or any of the three timer
+/// spellings (relative seconds, relative milliseconds, absolute deliver-at). A batch leaves as
+/// ONE message with ONE property set, so such a request would land on the envelope carrying every
+/// other member; the whole batch is refused instead.
+fn scheduled_delivery_requested(message: &Message) -> bool {
+    let delay_level = message
+        .get_delay_time_level()
+        .map_or(0, |raw| raw.trim().parse::<i64>().unwrap_or(0));
+    delay_level > 0
+        || message.get_delay_time_sec() > 0
+        || message.get_delay_time_ms() > 0
+        || message.get_deliver_time_ms() > 0
+}
+
 /// Has no serialization fields of its own: the body is produced by [`encode`](Self::encode), i.e. the concatenation of
 /// each message in the 6-field lightweight format (see [`crate::common::message_decoder`]).
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -702,9 +716,7 @@ impl MessageBatch {
         }
         let first = &messages[0];
         for message in &messages {
-            let delay_level = message.get_delay_time_level().unwrap_or("");
-            let parsed = delay_level.trim().parse::<i64>().unwrap_or(0);
-            if !delay_level.is_empty() && parsed > 0 {
+            if scheduled_delivery_requested(message) {
                 return Err(Error::client(
                     "Delayed messages are not supported for batching",
                 ));
@@ -1026,9 +1038,72 @@ mod tests {
         assert!(err.contains("messages must not be null or empty"), "{err}");
     }
 
+    /// A batch leaves as ONE message with ONE property set, so a member asking for a later
+    /// delivery would put that request on the envelope carrying every other member. The guard
+    /// covers the delay level and the three timer spellings; a 0 under the same name means "no
+    /// schedule" and must still pack, which is the control that keeps this from passing on a
+    /// presence-only check.
+    #[test]
+    fn batch_rejects_every_schedule_spelling() {
+        let names = [
+            PROPERTY_DELAY_TIME_LEVEL,
+            PROPERTY_TIMER_DELAY_SEC,
+            PROPERTY_TIMER_DELAY_MS,
+            PROPERTY_TIMER_DELIVER_MS,
+        ];
+        for name in names {
+            let mut scheduled = Message::new("T", Some(b"a"));
+            scheduled.put_property(name, "3");
+            let err = MessageBatch::generate_from_list(vec![scheduled])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("Delayed messages are not supported for batching"),
+                "{name}: {err}"
+            );
+
+            // The same value anywhere else in the batch is refused too, not only on the first.
+            let mut tail = Message::new("T", Some(b"b"));
+            tail.put_property(name, "3");
+            assert!(
+                MessageBatch::generate_from_list(vec![Message::new("T", Some(b"a")), tail]).is_err(),
+                "{name} on a non-first member"
+            );
+
+            let mut zero = Message::new("T", Some(b"a"));
+            zero.put_property(name, "0");
+            assert!(
+                MessageBatch::generate_from_list(vec![zero]).is_ok(),
+                "{name}=0 must be allowed"
+            );
+        }
+
+        // The setters the public API exposes reach the same four properties.
+        let mut via_level = Message::new("T", Some(b"a"));
+        via_level.set_delay_time_level(2);
+        assert!(MessageBatch::generate_from_list(vec![via_level]).is_err());
+        let mut via_sec = Message::new("T", Some(b"a"));
+        via_sec.set_delay_time_sec(30);
+        assert!(MessageBatch::generate_from_list(vec![via_sec]).is_err());
+        let mut via_ms = Message::new("T", Some(b"a"));
+        via_ms.set_delay_time_ms(30_000);
+        assert!(MessageBatch::generate_from_list(vec![via_ms]).is_err());
+        let mut via_deliver = Message::new("T", Some(b"a"));
+        via_deliver.set_deliver_time_ms(1_700_000_000_000);
+        assert!(MessageBatch::generate_from_list(vec![via_deliver]).is_err());
+
+        // A plain batch is the control the guard must never touch.
+        assert!(MessageBatch::generate_from_list(vec![
+            Message::new("T", Some(b"a")),
+            Message::new("T", Some(b"b")),
+        ])
+        .is_ok());
+    }
+
     #[test]
     fn batch_wait_store_msg_ok_is_propagated() {
         let mut a = Message::new("T", Some(b"a"));
+
         a.set_wait_store_msg_ok(true);
         let mut b = Message::new("T", Some(b"b"));
         b.set_wait_store_msg_ok(true);

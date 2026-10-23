@@ -271,7 +271,17 @@ async function main(): Promise<void> {
       const m = new Message('AccTopic', Buffer.from('a'));
       MessageAccessor.putProperty(m, prop, '10');
       check(`a ${prop} message keeps its own timer`, acc.isBatchable(m) === false);
+      // Paired control: 0 under the same name asks for no schedule, so the message
+      // still belongs in a group. Without it a presence-only check reads as passing.
+      const zero = new Message('AccTopic', Buffer.from('a'));
+      MessageAccessor.putProperty(zero, prop, '0');
+      check(`a ${prop}=0 message still batches`, acc.isBatchable(zero) === true);
     }
+    // A message already stamped with a producer group is the transaction half-message
+    // kind: the broker locates its connection by group, so it must stay single.
+    const grouped = new Message('AccTopic', Buffer.from('a'));
+    MessageAccessor.putProperty(grouped, MessageConst.PROPERTY_PRODUCER_GROUP, 'GID_acc');
+    check('a group-stamped message stays individually addressable', acc.isBatchable(grouped) === false);
     const prepared = new Message('AccTopic', Buffer.from('a'));
     MessageAccessor.putProperty(prepared, MessageConst.PROPERTY_TRANSACTION_PREPARED, 'true');
     check('a prepared half message stays individually addressable', acc.isBatchable(prepared) === false);

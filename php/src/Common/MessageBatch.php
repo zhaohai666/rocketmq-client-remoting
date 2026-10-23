@@ -13,6 +13,14 @@ namespace RocketMQ\Common;
  */
 final class MessageBatch extends Message
 {
+    /**
+     * The four properties that ask for a later delivery: a delay level, a timer in seconds,
+     * a timer in milliseconds, an absolute deliver-at timestamp.
+     *
+     * @var list<string>
+     */
+    private const SCHEDULED_DELIVERY_PROPERTIES = ['DELAY', 'TIMER_DELAY_SEC', 'TIMER_DELAY_MS', 'TIMER_DELIVER_MS'];
+
     /** @var Message[] */
     public array $messages = [];
 
@@ -38,9 +46,9 @@ final class MessageBatch extends Message
     /**
      * Builds a batch message from a list and validates the constraints.
      *
-     * Constraints: not empty; the same topic; the same waitStoreMsgOK; delayed messages are not allowed;
-     * retry topics are not allowed. If any entry violates them the whole batch throws
-     * InvalidArgumentException — it is not acceptable to just drop a few and send the rest.
+     * Constraints: not empty; the same topic; the same waitStoreMsgOK; no member asking for a
+     * later delivery; retry topics are not allowed. If any entry violates them the whole batch
+     * throws InvalidArgumentException — it is not acceptable to just drop a few and send the rest.
      *
      * @param list<Message> $messages
      */
@@ -53,8 +61,10 @@ final class MessageBatch extends Message
         $messageList = [];
         $first = null;
         foreach ($messages as $message) {
-            $delayLevel = $message->getDelayTimeLevel();
-            if ($delayLevel !== null && (int) $delayLevel > 0) {
+            // One batch leaves as ONE message with ONE property set, so a member's schedule
+            // would land on the envelope carrying every other member. Checking only the delay
+            // level lets a TIMER_* request through.
+            if (self::scheduledDeliveryRequested($message)) {
                 throw new \InvalidArgumentException('Delayed messages are not supported for batching');
             }
             if (str_starts_with($message->getTopic(), MixAll::RETRY_GROUP_TOPIC_PREFIX)) {
@@ -83,5 +93,24 @@ final class MessageBatch extends Message
         $batch->setWaitStoreMsgOk(self::isWaitStoreMsgOk($first));
         $batch->setBody($batch->encode());
         return $batch;
+    }
+
+    /**
+     * Whether a member asks to be delivered later: the delay level, or any of the three timer
+     * spellings. A value that is absent, empty or not a positive number means no schedule, so a
+     * literal 0 under any of these names is allowed.
+     */
+    private static function scheduledDeliveryRequested(Message $message): bool
+    {
+        foreach (self::SCHEDULED_DELIVERY_PROPERTIES as $name) {
+            $raw = $message->getProperty($name);
+            if ($raw === null || $raw === '') {
+                continue;
+            }
+            if ((int) $raw > 0) {
+                return true;
+            }
+        }
+        return false;
     }
 }

@@ -407,6 +407,41 @@ $T->checkThrows(
     'batch rejects delayed messages'
 );
 
+// The schedule guard covers the delay level AND the three timer spellings, on any member:
+// a batch leaves as one message with one property set, so a member's schedule would land
+// on the envelope carrying the others. Checking only DELAY lets a TIMER_* request through.
+// Each rejection is paired with a 0 under the same name, which means "no schedule" and must
+// pack normally — without it a presence-only check would pass the same assertions.
+$batchRejection = static function (array $messages): string {
+    try {
+        MessageBatch::generateFromList($messages);
+        return '';
+    } catch (\InvalidArgumentException $e) {
+        return $e->getMessage();
+    }
+};
+foreach (['DELAY', 'TIMER_DELAY_SEC', 'TIMER_DELAY_MS', 'TIMER_DELIVER_MS'] as $name) {
+    $scheduled = new Message('T');
+    $scheduled->putProperty($name, '3');
+    $T->check(
+        str_contains($batchRejection([$scheduled]), 'Delayed messages are not supported for batching'),
+        "batch rejects {$name}=3"
+    );
+
+    $tail = new Message('T');
+    $tail->putProperty($name, '3');
+    $T->check(
+        str_contains($batchRejection([new Message('T'), $tail]), 'Delayed messages are not supported for batching'),
+        "batch rejects {$name}=3 on a non-first member"
+    );
+
+    $zero = new Message('T');
+    $zero->putProperty($name, '0');
+    $T->checkSame('', $batchRejection([$zero]), "batch allows {$name}=0");
+}
+$plainBatch = $batchRejection([new Message('T', 'a'), new Message('T', 'b')]);
+$T->checkSame('', $plainBatch, 'a plain batch is still accepted');
+
 // zlib compression path: type bits 0 normalized to ZLIB per the legacy semantics
 $compressed = MessageDecoder::decompressBody(gzcompress('payload-data'), 0);
 $T->checkSame('payload-data', $compressed, 'normalizeCompressionType 0 -> ZLIB');

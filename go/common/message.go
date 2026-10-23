@@ -307,20 +307,43 @@ type MessageBatch struct {
 
 func (b *MessageBatch) Encode() []byte { return EncodeMessages(b.Messages) }
 
+// ScheduledDeliveryRequested reports whether a message asks to be delivered
+// later: the delay level, or any of the three timer spellings (relative
+// seconds, relative milliseconds, absolute deliver-at). A batch leaves as ONE
+// message with ONE property set, so a member's schedule would land on the
+// envelope that carries every other member — such a message is neither batched
+// nor packed: the send path falls back to a direct single send and the batch
+// builder refuses it outright.
+func ScheduledDeliveryRequested(message *Message) bool {
+	for _, name := range []string{
+		PropertyDelayTimeLevel, PropertyTimerDelaySec, PropertyTimerDelayMs, PropertyTimerDeliverMs,
+	} {
+		raw, ok := message.GetProperty(name)
+		if !ok {
+			continue
+		}
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		if v, err := strconv.ParseInt(raw, 10, 64); err == nil && v > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // GenerateFromList builds a batch from a list of messages. Constraints:
-// non-empty; same topic; same waitStoreMsgOK; no delayed messages; no retry
-// topics. Violations of any kind all map to a client Error.
+// non-empty; same topic; same waitStoreMsgOK; no member asking for a later
+// delivery; no retry topics. Violations of any kind all map to a client Error.
 func GenerateFromList(messages []*Message) (*MessageBatch, error) {
 	if len(messages) == 0 {
 		return nil, ClientError("messages must not be null or empty")
 	}
 	first := messages[0]
 	for _, message := range messages {
-		if raw, ok := message.GetDelayTimeLevel(); ok {
-			parsed, _ := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
-			if raw != "" && parsed > 0 {
-				return nil, ClientError("Delayed messages are not supported for batching")
-			}
+		if ScheduledDeliveryRequested(message) {
+			return nil, ClientError("Delayed messages are not supported for batching")
 		}
 		if strings.HasPrefix(message.Topic, RetryGroupTopicPrefix) {
 			return nil, ClientError("Retry Group is not supported for batching")

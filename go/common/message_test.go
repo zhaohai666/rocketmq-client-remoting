@@ -263,6 +263,30 @@ func TestBatchGenerateFromListRejects(t *testing.T) {
 	if _, err := GenerateFromList([]*Message{zero}); err != nil {
 		t.Fatalf("delay level 0 must be allowed: %v", err)
 	}
+
+	// Every spelling of "deliver later" rejects the batch, not just the delay
+	// level: the batch leaves as one message with one property set, so a
+	// member's schedule would land on the envelope carrying the others.
+	for _, name := range []string{
+		PropertyDelayTimeLevel, PropertyTimerDelaySec, PropertyTimerDelayMs, PropertyTimerDeliverMs,
+	} {
+		msg := NewMessage("T", []byte("a"))
+		msg.PutProperty(name, "3")
+		assertReject(t, []*Message{msg}, "Delayed messages are not supported for batching")
+
+		// Control: the guard keys on the value, not on the property's presence.
+		none := NewMessage("T", []byte("a"))
+		none.PutProperty(name, "0")
+		if _, err := GenerateFromList([]*Message{none}); err != nil {
+			t.Fatalf("%s=0 must be allowed: %v", name, err)
+		}
+	}
+
+	// The scheduled member does not have to be the first one.
+	plain := NewMessage("T", []byte("a"))
+	later := NewMessage("T", []byte("b"))
+	later.SetDeliverTimeMs(1_700_000_000_000)
+	assertReject(t, []*Message{plain, later}, "Delayed messages are not supported for batching")
 }
 
 const batchOneHex = "0000002C00000000000000000000000700000004626F64790012544147530154616741024B455953016B3102"
