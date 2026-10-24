@@ -105,8 +105,11 @@ public class LitePullFlowControlTests
             queueId.ToString(CultureInfo.InvariantCulture));
 
     /// <summary>A lite consumer aimed at the fake endpoint, with every budget but the one
-    /// under test taken out of the way.</summary>
-    private static DefaultLitePullConsumer StartedLite(string name, MockCluster cluster,
+    /// under test taken out of the way -- and deliberately NOT started. A wire case that
+    /// judges a cached backlog has to stage it before the first round runs: a round finding an
+    /// empty buffer sends its request for real, and then "this queue sent nothing" can never
+    /// read zero, however correctly the gate works afterwards.</summary>
+    private static DefaultLitePullConsumer Lite(string name, MockCluster cluster,
         params MessageQueue[] queues)
     {
         var c = new DefaultLitePullConsumer(GroupPrefix + "_" + name);
@@ -123,9 +126,25 @@ public class LitePullFlowControlTests
         c.PullThresholdSizeForQueue = int.MaxValue;
         c.ConsumeMaxSpan = long.MaxValue;
         c.Assign(queues.Length > 0 ? queues : new[] { WireQueue(0) });
+        return c;
+    }
+
+    /// <summary><see cref="Lite"/> with the round loop already running, for the cases whose
+    /// verdict comes from the broker answer rather than from a backlog staged beforehand.</summary>
+    private static DefaultLitePullConsumer StartedLite(string name, MockCluster cluster,
+        params MessageQueue[] queues)
+    {
+        DefaultLitePullConsumer c = Lite(name, cluster, queues);
         c.Start();
         return c;
     }
+
+    /// <summary>Wait until this queue's cache gate has refused it <paramref name="more" />
+    /// further times. This is the time base of the "no request left the client" assertions:
+    /// refusals only happen in the pull rounds, so a growing counter says rounds ran, and it
+    /// also lets any request that was already on the wire land before the count is read.</summary>
+    private static bool WaitRefusals(DefaultLitePullConsumer c, long from, int more) =>
+        WaitFor(() => c.FlowControlForQueueTriggered >= from + more);
 
     // The warn lines are read back from the log file the gate itself writes, with the same
     // rotation-limit care the push path's capture takes: a small limit left by another class
@@ -268,8 +287,14 @@ public class LitePullFlowControlTests
             Stage(c, Batch(mq, 1, 128, firstOffset: 3));
             Assert.True(WaitFor(() => c.LastPullPauseMillis(mq) == 50),
                 "the refusal parked this queue for 50 ms");
+            // Let the refusals run before reading the request count: the boundary round that
+            // was still allowed could otherwise land after the read and look like a refusal
+            // that sent a request.
+            Assert.True(WaitRefusals(c, c.FlowControlForQueueTriggered, 5),
+                "the queue keeps re-judging itself over the same backlog");
             int frozen = LitePulls(cluster);
-            Thread.Sleep(400);
+            Assert.True(WaitRefusals(c, c.FlowControlForQueueTriggered, 5),
+                "and five more rounds passed while it stayed parked");
             Eq(frozen, LitePulls(cluster), "a refused round sends nothing: no pull reached the broker");
             AtLeast(1, c.FlowControlForQueueTriggered, "each refused round counts exactly one");
             Eq(0, c.FlowControlForAllTriggered, "the aggregate gate never fired here");
@@ -301,20 +326,24 @@ public class LitePullFlowControlTests
         MessageQueue cold = WireQueue(1);
 
         // Count gate: four cached messages on the hot queue against a budget of 3, the cold
-        // queue holding nothing.
+        // queue holding nothing. The backlog is staged before the loop starts, so the very
+        // first round already judges it.
         using (var cluster = MockCluster.Start(1))
         {
-            DefaultLitePullConsumer c = StartedLite("PerQueueCount", cluster, hot, cold);
+            DefaultLitePullConsumer c = Lite("PerQueueCount", cluster, hot, cold);
             c.PullThresholdForQueue = 3;
             Stage(c, Batch(hot, 4, 128));
             try
             {
-                Assert.True(WaitFor(() => LitePullsOf(cluster, 1) >= 1),
+                c.Start();
+                Assert.True(WaitFor(() => c.LastPullPauseMillis(hot) == 50),
+                    "the hot queue's own backlog refused its round");
+                // The sibling's pulls are the clock: several rounds passed on it, and the hot
+                // queue reached the broker in none of them.
+                Assert.True(WaitFor(() => LitePullsOf(cluster, 1) >= 3),
                     "the cold sibling is pulled while the hot queue is refused");
-                Thread.Sleep(200);
                 Eq(0, LitePullsOf(cluster, 0),
                     "the hot queue's own backlog refused its round; a sibling's state never enters the verdict");
-                Eq(0, LitePullsOf(cluster, 0), "still none a moment later: the park is per queue");
             }
             finally
             {
@@ -326,15 +355,16 @@ public class LitePullFlowControlTests
         // while the cold queue caches three times as many messages.
         using (var cluster = MockCluster.Start(1))
         {
-            DefaultLitePullConsumer c = StartedLite("PerQueueSize", cluster, hot, cold);
+            DefaultLitePullConsumer c = Lite("PerQueueSize", cluster, hot, cold);
             c.PullThresholdSizeForQueue = 1;
             Stage(c, Batch(cold, 3, 64));
             Stage(c, new List<MessageExt> { Cached(hot, 0, 2 * MiB, bodySize: 4) });
             try
             {
-                Assert.True(WaitFor(() => LitePullsOf(cluster, 0) == 0 && c.LastPullPauseMillis(hot) == 50),
+                c.Start();
+                Assert.True(WaitFor(() => c.LastPullPauseMillis(hot) == 50),
                     "the queue that really holds the bytes was refused");
-                Assert.True(WaitFor(() => LitePullsOf(cluster, 1) >= 1),
+                Assert.True(WaitFor(() => LitePullsOf(cluster, 1) >= 3),
                     "the sibling with 3 tiny messages keeps pulling: its own 0 MiB is the measure");
                 Eq(0, LitePullsOf(cluster, 0), "and the byte-over queue sent nothing");
             }
@@ -853,11 +883,12 @@ public class LitePullFlowControlTests
     {
         using var cluster = MockCluster.Start(1);
         MessageQueue mq = WireQueue(0);
-        DefaultLitePullConsumer c = StartedLite("ShutdownEscape", cluster, mq);
+        DefaultLitePullConsumer c = Lite("ShutdownEscape", cluster, mq);
         c.PullThresholdForQueue = 1;
         Stage(c, Batch(mq, 8, 64));
         try
         {
+            c.Start();
             Assert.True(WaitFor(() => c.LastPullPauseMillis(mq) == 50),
                 "the queue is parked on the gate before shutdown");
 
@@ -886,11 +917,12 @@ public class LitePullFlowControlTests
         using var cluster = MockCluster.Start(1);
         MessageQueue hot = WireQueue(0);
         MessageQueue cold = WireQueue(1);
-        DefaultLitePullConsumer c = StartedLite("NoStall", cluster, hot, cold);
+        DefaultLitePullConsumer c = Lite("NoStall", cluster, hot, cold);
         c.PullThresholdForQueue = 1;
         Stage(c, Batch(hot, 4, 64));
         try
         {
+            c.Start();
             Assert.True(WaitFor(() => c.LastPullPauseMillis(hot) == 50), "the hot queue is parked");
             // The sibling keeps reaching the broker several times over one parked queue.
             Assert.True(WaitFor(() => LitePullsOf(cluster, 1) >= 3),
@@ -919,16 +951,18 @@ public class LitePullFlowControlTests
             ["minOffset"] = "0",
             ["maxOffset"] = "4",
         }, FoundBody(4, 0));
-        DefaultLitePullConsumer c = StartedLite("FilledByPull", cluster, mq);
+        DefaultLitePullConsumer c = Lite("FilledByPull", cluster, mq);
         c.PullThresholdForQueue = 3;
         try
         {
+            c.Start();
             Assert.True(WaitFor(() => c.CachedMessageCount == 4),
                 "the pull's own messages land in the buffer the gates measure");
             Assert.True(WaitFor(() => c.LastPullPauseMillis(mq) == 50),
                 "and the very next round is refused on that backlog");
             int frozen = LitePulls(cluster);
-            Thread.Sleep(300);
+            Assert.True(WaitRefusals(c, c.FlowControlForQueueTriggered, 5),
+                "the gate went on refusing while the application never polled");
             Eq(frozen, LitePulls(cluster), "the client stops asking even though the application never polled");
             Eq(4, c.CachedMessageCountOf(mq), "counted per queue as well as in total");
             Eq(3, c.CachedOffsetSpanOf(mq), "and the span comes from the offsets that arrived");
