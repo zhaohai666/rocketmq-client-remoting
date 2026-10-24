@@ -6,6 +6,7 @@
 //
 // No cluster, no fixed sleeps: every value is a recorded return of a pure function.
 #include <cstdint>
+#include <cstdio>
 #include <string>
 
 #include "rocketmq/client/consumer.h"

@@ -2,6 +2,7 @@
 //
 // Goal: prove this port's protocol layer round-trips byte-for-byte without depending on a real cluster.
 #include <cstdint>
+#include <exception>
 #include <iostream>
 #include <string>
 #include <vector>

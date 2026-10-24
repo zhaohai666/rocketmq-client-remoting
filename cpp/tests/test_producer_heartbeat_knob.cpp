@@ -7,6 +7,7 @@
 //
 // Everything is a recorded return value of a setter/getter pair; no thread is started, no clock read.
 #include <cstdint>
+#include <cstdio>
 #include <stdexcept>
 #include <string>
 

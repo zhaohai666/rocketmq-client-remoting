@@ -14,6 +14,7 @@
 // race. The control (no ceiling) drains the identical backlog to the end.
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <string>
 
 #include "rocketmq/client/consume_executor.h"
