@@ -24,5 +24,20 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
+      # Failure names go through ::error:: annotations, the way the cpp and rust gates do:
+      # Actions raw logs need a signed-in session, while annotations read anonymously. A local
+      # run of this suite takes about 7 minutes, so the 30-minute ceiling only fires when a
+      # test is genuinely parked instead of burning the job's whole 6 hours.
       - name: Run offline test suite
-        run: dotnet test csharp/tests/RocketMQ.Client.Tests/RocketMQ.Client.Tests.csproj -c Release
+        run: |
+          set +e
+          timeout -k 60 1800 dotnet test csharp/tests/RocketMQ.Client.Tests/RocketMQ.Client.Tests.csproj -c Release > /tmp/dotnet.log 2>&1
+          rc=$?
+          if [ "${rc}" = "124" ] || [ "${rc}" = "137" ]; then
+            echo "::error::dotnet test exceeded the 30-minute ceiling (local full run is about 7 minutes) — log tail below"
+            tail -20 /tmp/dotnet.log | while IFS= read -r line; do echo "::error::[dotnet.log tail] ${line}"; done
+          fi
+          cat /tmp/dotnet.log
+          grep -E '\[FAIL\]|^  (Failed|Error) |error CS[0-9]{4}|^Failed!' /tmp/dotnet.log \
+            | head -40 | while IFS= read -r line; do echo "::error::${line}"; done
+          exit $rc

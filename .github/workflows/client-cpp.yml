@@ -44,8 +44,18 @@ jobs:
         # debug info.
         run: cmake -S cpp -B cpp/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS=-g
 
+      # Compiler diagnostics go through ::error:: annotations for the same reason the ctest
+      # failures below do: ninja stops with a bare "subcommand failed" in a log that anonymous
+      # readers cannot open, and the offending file/line is what makes the difference.
       - name: Build
-        run: cmake --build cpp/build -j
+        run: |
+          set +e
+          cmake --build cpp/build -j > /tmp/build.log 2>&1
+          rc=$?
+          cat /tmp/build.log
+          grep -E 'FAILED:|error:|Error [0-9]+' /tmp/build.log \
+            | head -40 | while IFS= read -r line; do echo "::error::${line}"; done
+          exit $rc
 
       # client_id / send_retry / producer_async / namespace_hook were once excluded via -E for
       # sporadic hangs (2026-10-12 record: dead-address fake NS + process exit path). On
