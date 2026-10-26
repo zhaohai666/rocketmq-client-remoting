@@ -100,7 +100,11 @@ public:
 
     void setConsumeFromWhere(const std::string& where) { consumeFromWhere_ = where; }
     void setConsumeTimestamp(const std::string& ts) { consumeTimestamp_ = ts; }
+    // Messages one pull round asks for (pullBatchSize, default 10 for a lite pull -- a push consumer
+    // uses 32). The value doubles as the multiplier of the aggregate cache gate: every pending round
+    // is budgeted with a whole batch.
     void setPullBatchSize(int32_t n) { pullBatchSize_ = std::max(1, n); }
+    int32_t pullBatchSize() const { return pullBatchSize_; }
     void setPollTimeoutMillis(int32_t ms) { pollTimeoutMillis_ = std::max(0, ms); }
     void setAutoCommit(bool b) { autoCommit_ = b; }
     void setAutoCommitIntervalMillis(int32_t ms) { autoCommitIntervalMillis_ = std::max(0, ms); }
@@ -112,13 +116,15 @@ public:
     // Lite-pull cache flow-control knobs. All four gates are judged **strictly greater** than the
     // threshold (a queue exactly on the threshold still pulls), and every value is a plain budget:
     // a 0 trips on the first cached message -- no validation or clamping.
-    // pullThresholdForAll: the whole-buffer (all queues summed) message-count budget.
+    // pullThresholdForAll: the budget for the messages the PENDING PULL ROUNDS could still deliver,
+    // measured as (rounds still holding cached messages) x pullBatchSize.
     void setPullThresholdForAll(int32_t n) { pullThresholdForAll_ = n; }
     int32_t pullThresholdForAll() const { return pullThresholdForAll_; }
     // pullThresholdForQueue: this queue's cached message count.
     void setPullThresholdForQueue(int32_t n) { pullThresholdForQueue_ = n; }
     int32_t pullThresholdForQueue() const { return pullThresholdForQueue_; }
-    // pullThresholdSizeForQueue: this queue's cached bytes in **integer** MiB (sum of storeSize).
+    // pullThresholdSizeForQueue: this queue's cached message-BODY bytes in **integer** MiB (storeSize
+    // is a telemetry field and never an input here).
     void setPullThresholdSizeForQueue(int32_t n) { pullThresholdSizeForQueue_ = n; }
     int32_t pullThresholdSizeForQueue() const { return pullThresholdSizeForQueue_; }
     // consumeMaxSpan: max cached queueOffset minus min cached queueOffset, this queue only.
@@ -201,6 +207,12 @@ public:
     // a test asserts, matching the push path's lastPullPauseMillis.
     int64_t lastLitePullPauseMillis() const { return lastLitePullPauseMillis_.load(); }
 
+    // Pull rounds whose messages are still in the buffer, summed over every queue: the measurement
+    // behind the aggregate gate. A round counts while any of its messages remain.
+    int32_t pendingPullRounds();
+    // Cached message count of this queue's accumulator (0 when the queue caches nothing).
+    int32_t cachedMessageCount(const MessageQueue& mq);
+
     // Test-only entries. Offline reachability of the gate, its accumulators and its counters follows
     // the push path's pattern (flowControlHitForTest + lastPullPauseMillis): what the pull thread
     // decides between rounds is otherwise invisible, and a real broker run cannot pin it either.
@@ -237,6 +249,10 @@ private:
     SubscriptionData subscriptionDataFor(const std::string& topic) const;
     bool filterTags(std::vector<MessageExt>& msgs, const SubscriptionData& subData);
     void enqueue(const std::vector<MessageExt>& msgs);
+    // Forget everything a revoked queue left behind: its rows in the pollable buffer and its cache
+    // accumulator. Called outside stateMutex_ (it takes bufferMutex_ itself) by assign(), the
+    // rebalance round and the pull round's backstop prune.
+    void dropQueueCache(const std::vector<MessageQueue>& revokedQueues);
     // Per-queue cache gate: judged at the top of the queue's pull round, before the offset is
     // resolved. Reads the local buffer's state under bufferMutex_ (aggregate = whole-buffer size;
     // count/size/span = this queue's accumulator), judges the four thresholds in strict order (all
@@ -282,7 +298,7 @@ private:
     int32_t brokerSuspendMaxTimeMillis_ = 20000;
     int32_t consumerTimeoutMillisWhenSuspend_ = 30000;
     int32_t pollTimeoutMillis_ = 5000;
-    int32_t pullBatchSize_ = 32;
+    int32_t pullBatchSize_ = 10;
     bool autoCommit_ = true;
     int32_t autoCommitIntervalMillis_ = 5000;
     int32_t pullIntervalMillis_ = 50;
@@ -344,6 +360,12 @@ private:
         int64_t count = 0;
         int64_t sizeSum = 0;
         std::multiset<int64_t> offsets;
+        // One entry per PULL ROUND whose messages are still in the buffer, holding how many of that
+        // round's messages remain. A round is booked when its batch is appended and retires when its
+        // last message leaves, so a half-drained round still counts. The aggregate gate budgets every
+        // counted round with a whole pullBatchSize, whether the round came back full or with one
+        // message -- it projects the capacity still to be drained, not a sum of the buffer.
+        std::deque<int64_t> rounds;
     };
     std::map<MessageQueue, QueueCacheAccum> cacheAccums_;
 

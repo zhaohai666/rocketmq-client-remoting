@@ -214,6 +214,7 @@ void DefaultLitePullConsumer::setSubExpressionForAssign(const std::string& topic
 void DefaultLitePullConsumer::assign(const std::vector<MessageQueue>& messageQueues) {
     std::set<MessageQueue> queues(messageQueues.begin(), messageQueues.end());
     std::vector<MessageQueue> toResolve;
+    std::vector<MessageQueue> revokedQueues;
     {
         std::lock_guard<std::mutex> lk(stateMutex_);
         assignMode_ = true;
@@ -221,6 +222,7 @@ void DefaultLitePullConsumer::assign(const std::vector<MessageQueue>& messageQue
             if (queues.find(mq) == queues.end()) {
                 nextOffset_.erase(mq);
                 consumeOffset_.erase(mq);
+                revokedQueues.push_back(mq);
             }
         }
         assigned_ = queues;
@@ -228,6 +230,9 @@ void DefaultLitePullConsumer::assign(const std::vector<MessageQueue>& messageQue
             if (nextOffset_.find(mq) == nextOffset_.end()) toResolve.push_back(mq);
         }
     }
+    // Dropping the revoked cache runs on the caller thread, where no pull round is left to prune it:
+    // an assign() that narrows the set must not keep the revoked queue's messages pollable.
+    dropQueueCache(revokedQueues);
     // resolveInitialOffset issues an RPC, so it must never run while stateMutex_ is held.
     for (const MessageQueue& mq : toResolve) {
         int64_t offset = 0;
@@ -384,16 +389,16 @@ void DefaultLitePullConsumer::pullServiceLoop() {
             // re-assigned. Prune every accumulator this round no longer owns (only the pull thread
             // touches cacheAccums_/parkUntil_ besides the buffer-mutation sites, all under
             // bufferMutex_).
+            std::vector<MessageQueue> noLongerOwned;
             {
                 std::lock_guard<std::mutex> lk(bufferMutex_);
-                for (auto it = cacheAccums_.begin(); it != cacheAccums_.end();) {
-                    if (snapshot.find(it->first) == snapshot.end()) {
-                        it = cacheAccums_.erase(it);
-                    } else {
-                        ++it;
+                for (const auto& kv : cacheAccums_) {
+                    if (snapshot.find(kv.first) == snapshot.end()) {
+                        noLongerOwned.push_back(kv.first);
                     }
                 }
             }
+            dropQueueCache(noLongerOwned);
             for (const MessageQueue& mq : snapshot) {
                 if (!running_) break;
                 if (paused.find(mq) != paused.end()) continue;
@@ -546,42 +551,64 @@ bool DefaultLitePullConsumer::filterTags(std::vector<MessageExt>& msgs,
 }
 
 void DefaultLitePullConsumer::enqueue(const std::vector<MessageExt>& msgs) {
+    // One call is one PULL ROUND: however many queues its batch spans, each queue the round left
+    // something at gets one entry in its pending-round list, carrying how many of this round's
+    // messages landed there.
+    std::map<MessageQueue, int64_t> perQueue;
+    for (const MessageExt& m : msgs) {
+        ++perQueue[MessageQueue(m.topic, m.brokerName, m.queueId)];
+    }
     std::lock_guard<std::mutex> lk(bufferMutex_);
+    std::set<MessageQueue> booked;
     for (const MessageExt& m : msgs) {
         localBuffer_.push_back(m);
         // Buffer and accumulator mutate in one place under one lock, so the counters cannot drift.
         const MessageQueue mq(m.topic, m.brokerName, m.queueId);
         QueueCacheAccum& acc = cacheAccums_[mq];
         ++acc.count;
-        acc.sizeSum += m.storeSize;
+        // The gate's byte budget is the message BODY: storeSize is what the broker charged for the
+        // whole storage record and belongs to telemetry, not to flow control.
+        acc.sizeSum += static_cast<int64_t>(m.getBody().size());
         acc.offsets.insert(m.queueOffset);
+        if (booked.insert(mq).second) {
+            acc.rounds.push_back(perQueue[mq]);
+        }
     }
     bufferCv_.notify_all();
 }
 
 // ---------------------------------------------------------------- cache flow-control gate
 // Four per-queue thresholds, judged strictly-greater in this exact order before the pull is built:
-//   1) aggregate (whole-buffer count > pullThresholdForAll)
-//   2) count   (this queue's cached count > pullThresholdForQueue)      -- shared counter with (3)
-//   3) size    (this queue's storeSize-sum // 1MiB > pullThresholdSizeForQueue)
+//   1) aggregate (pending pull rounds x pullBatchSize > pullThresholdForAll)
+//   2) count   (this queue's cached count > pullThresholdForQueue)        -- shared counter with (3)
+//   3) size    (this queue's cached body bytes // 1MiB > pullThresholdSizeForQueue)
 //   4) span    (this queue's cached maxOffset - minOffset > consumeMaxSpan)
 // A queue sitting exactly on a threshold still pulls. Gates 2..4 judge only this queue: a hot sibling
-// never parks a cold one. The measurement (aggregate size and this queue's accumulator) happens in a
-// single short critical section under bufferMutex_ so the counters cannot drift from the buffer; the
-// judgment and the counter/log side effects run outside it.
+// never parks a cold one. The aggregate gate is a CAPACITY projection, not a sum of the buffer: every
+// round that still holds a message is budgeted with a whole pullBatchSize, whether that round came
+// back full or with a single message, because the application has not drained those rounds yet. The
+// threshold is stated in messages while this gate counts rounds, so the warn translates it back into
+// the number of rounds that fit (ceiling division).
+// The measurement (round count and this queue's accumulator) happens in a single short critical
+// section under bufferMutex_ so the counters cannot drift from the buffer; the judgment and the
+// counter/log side effects run outside it.
 bool DefaultLitePullConsumer::cacheFlowControlHit(const MessageQueue& mq) {
-    int64_t cached = 0;
+    int64_t rounds = 0;
     int64_t count = 0;
     int64_t sizeMb = 0;
     int64_t minOff = 0;
     int64_t maxOff = 0;
+    const int64_t batch = std::max(1, pullBatchSize_);
     {
         std::lock_guard<std::mutex> lk(bufferMutex_);
-        cached = static_cast<int64_t>(localBuffer_.size());
+        for (const auto& kv : cacheAccums_) {
+            rounds += static_cast<int64_t>(kv.second.rounds.size());
+        }
         auto it = cacheAccums_.find(mq);
         if (it != cacheAccums_.end()) {
             count = it->second.count;
-            // Integer MiB division: the gate is about physical backlog, never body length.
+            // Integer MiB division of the cached BODY bytes: a 1 MiB budget tolerates a 1.9 MiB
+            // buffer, because 1.9 truncated is 1 and only a whole MiB above the budget refuses.
             sizeMb = it->second.sizeSum / (1024LL * 1024LL);
             if (!it->second.offsets.empty()) {
                 minOff = *it->second.offsets.begin();
@@ -590,18 +617,23 @@ bool DefaultLitePullConsumer::cacheFlowControlHit(const MessageQueue& mq) {
         }
     }
     const int64_t span = maxOff - minOff;
+    const int64_t reserved = rounds * batch;
 
     // (1) aggregate gate.
-    if (cached > static_cast<int64_t>(pullThresholdForAll_)) {
+    if (reserved > static_cast<int64_t>(pullThresholdForAll_)) {
         const int64_t times = aggregateFlowControlTimes_.fetch_add(1) + 1;
+        const int64_t fits =
+            (static_cast<int64_t>(pullThresholdForAll_) + batch - 1) / batch;
         logger_debug("lite flow control aggregate: queue " + mq.toString()
-                     + " cached=" + std::to_string(cached)
+                     + " rounds=" + std::to_string(rounds)
+                     + " x pullBatchSize=" + std::to_string(batch)
+                     + " -> " + std::to_string(reserved)
                      + " pullThresholdForAll=" + std::to_string(pullThresholdForAll_)
                      + ", pause pull");
         if (isFlowControlWarnTrip(times)) {
             logger_warn("the consume request count exceeds threshold "
-                        + std::to_string(pullThresholdForAll_)
-                        + ", so do flow control, cached=" + std::to_string(cached)
+                        + std::to_string(fits)
+                        + ", so do flow control, consume request count=" + std::to_string(rounds)
                         + ", flowControlTimes=" + std::to_string(times));
         }
         return true;
@@ -660,8 +692,44 @@ bool DefaultLitePullConsumer::cacheFlowControlHitForTest(const MessageQueue& mq)
     return cacheFlowControlHit(mq);
 }
 
+int32_t DefaultLitePullConsumer::pendingPullRounds() {
+    std::lock_guard<std::mutex> lk(bufferMutex_);
+    int64_t rounds = 0;
+    for (const auto& kv : cacheAccums_) {
+        rounds += static_cast<int64_t>(kv.second.rounds.size());
+    }
+    return static_cast<int32_t>(rounds);
+}
+
+int32_t DefaultLitePullConsumer::cachedMessageCount(const MessageQueue& mq) {
+    std::lock_guard<std::mutex> lk(bufferMutex_);
+    auto it = cacheAccums_.find(mq);
+    return it == cacheAccums_.end() ? 0 : static_cast<int32_t>(it->second.count);
+}
+
 void DefaultLitePullConsumer::injectCachedForTest(const std::vector<MessageExt>& msgs) {
     enqueue(msgs);
+}
+
+// One pass for every revoke path (caller-thread assign(), the rebalance round, the pull round's
+// backstop): the queue's buffered rows leave the pollable buffer and its accumulator goes with them,
+// so neither the caller nor the gate can still see messages of a queue this instance no longer owns.
+void DefaultLitePullConsumer::dropQueueCache(const std::vector<MessageQueue>& revokedQueues) {
+    if (revokedQueues.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(bufferMutex_);
+    for (const MessageQueue& mq : revokedQueues) {
+        std::deque<MessageExt> kept;
+        for (MessageExt& m : localBuffer_) {
+            if (m.topic == mq.topic && m.brokerName == mq.brokerName && m.queueId == mq.queueId) {
+                continue;
+            }
+            kept.push_back(std::move(m));
+        }
+        localBuffer_.swap(kept);
+        cacheAccums_.erase(mq);
+    }
 }
 
 void DefaultLitePullConsumer::maybeAutoCommit() {
@@ -768,6 +836,18 @@ void DefaultLitePullConsumer::rebalance() {
             logger_debug("lite persist on revoke failed for " + kv.first.toString());
         }
     }
+    // A queue this consumer no longer owns keeps no cache behind its back: its buffered messages and
+    // its accumulator (so its pending rounds and its per-queue gate numbers) go with it, in the same
+    // pass that let go of the offset tables above. Leaving them would let a queue
+    // this instance handed over still refuse a later pull of its own re-assigned self on counters
+    // belonging to messages it no longer consumes. (A parked deadline is not touched here: parkUntil_
+    // belongs to the pull thread alone, and that thread prunes it for a queue it no longer owns.)
+    if (!revoked.empty()) {
+        std::vector<MessageQueue> dropped;
+        dropped.reserve(revoked.size());
+        for (const auto& kv : revoked) dropped.push_back(kv.first);
+        dropQueueCache(dropped);
+    }
     for (const MessageQueue& mq : toResolve) {
         int64_t offset = 0;
         try {
@@ -851,7 +931,15 @@ std::vector<MessageExt> DefaultLitePullConsumer::poll(int32_t timeoutMillis) {
             auto ait = cacheAccums_.find(mq);
             if (ait != cacheAccums_.end()) {
                 --ait->second.count;
-                ait->second.sizeSum -= m.storeSize;
+                ait->second.sizeSum -= static_cast<int64_t>(m.getBody().size());
+                // A queue's messages leave in round order (the buffer is drained from its head and a
+                // round's messages of one queue are contiguous in it), so taking one message away eats
+                // the front pending round; a half-drained round is still pending.
+                if (!ait->second.rounds.empty()) {
+                    if (--ait->second.rounds.front() <= 0) {
+                        ait->second.rounds.pop_front();
+                    }
+                }
                 auto oit = ait->second.offsets.find(m.queueOffset);
                 if (oit != ait->second.offsets.end()) ait->second.offsets.erase(oit);
                 if (ait->second.count <= 0) cacheAccums_.erase(ait);
@@ -884,26 +972,34 @@ void DefaultLitePullConsumer::seek(const MessageQueue& mq, int64_t offset) {
     }
     std::lock_guard<std::mutex> lk(bufferMutex_);
     std::deque<MessageExt> kept;
-    // Rebuild this queue's accumulator in the same pass that prunes the buffer, so the two stay exact.
-    QueueCacheAccum replacement;
+    // Prune the buffer and this queue's accumulator in one pass, by SUBTRACTING what leaves rather
+    // than rebuilding from what stays: a round is booked when its batch lands, and only the removal
+    // rule ("this queue's messages leave in round order, so a removal eats the front pending round")
+    // keeps the pending-round count honest. Rebuilding would collapse the surviving rounds into one.
+    auto accIt = cacheAccums_.find(mq);
     for (MessageExt& m : localBuffer_) {
         const bool sameQueue = (m.topic == mq.topic && m.brokerName == mq.brokerName &&
                                 m.queueId == mq.queueId);
-        bool drop = (sameQueue && m.queueOffset >= offset);
-        if (!drop) {
-            if (sameQueue) {
-                ++replacement.count;
-                replacement.sizeSum += m.storeSize;
-                replacement.offsets.insert(m.queueOffset);
+        const bool drop = (sameQueue && m.queueOffset >= offset);
+        if (drop) {
+            if (accIt != cacheAccums_.end()) {
+                --accIt->second.count;
+                accIt->second.sizeSum -= static_cast<int64_t>(m.getBody().size());
+                auto oit = accIt->second.offsets.find(m.queueOffset);
+                if (oit != accIt->second.offsets.end()) accIt->second.offsets.erase(oit);
+                if (!accIt->second.rounds.empty()) {
+                    if (--accIt->second.rounds.front() <= 0) {
+                        accIt->second.rounds.pop_front();
+                    }
+                }
             }
-            kept.push_back(std::move(m));
+            continue;
         }
+        kept.push_back(std::move(m));
     }
     localBuffer_.swap(kept);
-    if (replacement.count > 0) {
-        cacheAccums_[mq] = std::move(replacement);
-    } else {
-        cacheAccums_.erase(mq);
+    if (accIt != cacheAccums_.end() && accIt->second.count <= 0) {
+        cacheAccums_.erase(accIt);
     }
 }
 

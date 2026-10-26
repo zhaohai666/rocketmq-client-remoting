@@ -36,6 +36,7 @@
 #include "rocketmq/client/allocate_strategy.h"
 #include "rocketmq/client/consume_executor.h"
 #include "rocketmq/client/hook.h"
+#include "rocketmq/client/message_queue_listener.h"
 #include "rocketmq/client/mq_client.h"
 #include "rocketmq/client/result.h"
 #include "rocketmq/client/trace_dispatcher.h"
@@ -307,7 +308,14 @@ public:
     ConsumeMessageDirectlyResult consumeMessageDirectly(const MessageExt& msg,
                                                         const std::string& brokerName);
     void setMessageListener(std::shared_ptr<MessageListener> listener);
+    // Application callback invoked for the topics whose assigned queue SET changed in a rebalance
+    // round; a round where every topic kept the same set, and a stall self-heal round, invoke nothing.
+    void setMessageQueueListener(std::shared_ptr<MessageQueueListener> listener) {
+        messageQueueListener_ = std::move(listener);
+    }
     void setPullBatchSize(int32_t n) { pullBatchSize_ = n; }
+    // Messages one pull round asks for (pullBatchSize, default 32 for a push consumer).
+    int32_t pullBatchSize() const { return pullBatchSize_; }
     void setPullBatchSizeInBytes(int32_t n) { pullBatchSizeInBytes_ = n; }
     void setConsumeMessageBatchMaxSize(int32_t n) { consumeMessageBatchMaxSize_ = std::max(1, n); }
     // The dispatch layer slices batches with it.
@@ -318,17 +326,26 @@ public:
     void setSuspendCurrentQueueTimeMillis(int32_t t) { suspendCurrentQueueTimeMillis_ = t; }
     void setMaxReconsumeTimes(int32_t n) { maxReconsumeTimes_ = n; }
     void setPullIntervalMillis(int32_t t) { pullIntervalMillis_ = t; }
-    // Per-queue 'pulled but unconsumed' message threshold; pulling for that queue pauses above it (pullThresholdForQueue, default 1000)
+    // Per-queue 'messages this queue holds' count threshold; pulling for that queue pauses above it
+    // (pullThresholdForQueue, default 1000). "Holds" is the undispatched buffer plus the batches handed
+    // to the listener that have not settled. The comparison is a plain strict greater-than: the value is
+    // never floored and 0 does not switch the gate off -- checkConfigRanges() rejects an out-of-range
+    // value at start-up instead.
     // When the topic count budget below is enabled this value is overwritten by its divided quotient at
     // every assignment change, so the getter then reports the divided number, not the one set here.
     void setPullThresholdForQueue(int32_t n) { pullThresholdForQueue_ = n; }
     int32_t pullThresholdForQueue() const { return pullThresholdForQueue_; }
-    // Per-queue 'pulled but unconsumed' **byte** threshold, in MiB (pullThresholdSizeForQueue, default 100; <=0 disables it)
+    // Per-queue threshold for the **body bytes** this queue holds, in MiB (pullThresholdSizeForQueue,
+    // default 100). storeSize is a telemetry field, never the input here. The held bytes are divided
+    // into WHOLE MiB and compared with a plain strict greater-than; 0 is not an off-switch.
     // Overwritten the same way by the topic byte budget division.
     void setPullThresholdSizeForQueue(int32_t n) { pullThresholdSizeForQueue_ = n; }
     int32_t pullThresholdSizeForQueue() const { return pullThresholdSizeForQueue_; }
-    // Upper bound on the queueOffset **span** of pulled-but-unconsumed messages (consumeMessageMaxSpan, default 2000; <=0 disables it).
-    // Guards the case where the head message keeps failing to consume and everything behind it stretches the offset span.
+    // Upper bound on the queueOffset **span** of the messages a queue holds (consumeMessageMaxSpan, default
+    // 2000). Guards the case where the head message keeps failing to consume and everything behind it
+    // stretches the offset span. An orderly consumer never judges this gate -- it bounds concurrent
+    // consumption -- and the comparison is a plain strict greater-than, with no flooring and no 0
+    // off-switch.
     void setConsumeConcurrentlyMaxSpan(int64_t n) { consumeConcurrentlyMaxSpan_ = n; }
     int64_t consumeConcurrentlyMaxSpan() const { return consumeConcurrentlyMaxSpan_; }
     // Topic-level cache budgets (pullThresholdForTopic / pullThresholdSizeForTopic; default -1 = off).
@@ -660,9 +677,27 @@ public:
     void setAssignedQueue(const std::string& key, const MessageQueue& mq);
     // Register one queue's POP pull state (the popQueues_ key set) -- the divisor POP mode divides over.
     void setPopQueue(const std::string& key);
-    // Unit-test entry for one division round over the tables seeded above. doRebalance runs it only on a
-    // round that changed the owned set, and only after that round rebuilt the per-queue pull state.
-    void divideTopicThresholdsForTest();
+    // Unit-test entry for one division round over the tables seeded above. afterAssignmentChange runs
+    // it only on a round that moved a topic's queue set, and only after that round rebuilt the
+    // per-queue pull state.
+    void divideTopicThresholdsForTest() { divideTopicThresholds(); }
+    // Unit-test entries for what an assignment-change round owes: the moved-topic detector, the version
+    // restamp and the application callback all run through the same private path doRebalance uses.
+    static std::vector<std::string> movedTopicsForTest(
+        const std::map<std::string, std::set<std::string>>& before,
+        const std::map<std::string, std::set<std::string>>& after);
+    void afterAssignmentChangeForTest(const std::vector<std::string>& moved) {
+        afterAssignmentChange(moved);
+    }
+    // Unit-test entry for a whole rebalance round (the one the scheduled thread runs): drives the
+    // moved-set detection, the division and the immediate heartbeat from the real assignment path
+    // instead of from a hand-written moved list.
+    void doRebalanceForTest() { doRebalance(); }
+    // The subscription version the next heartbeat would carry for this topic.
+    int64_t subscriptionVersion(const std::string& topic) const;
+    // Pin a topic's version to a value no clock can collide with, so "the moved topic was re-stamped"
+    // and "the topic that did not move kept its version" are both read off recorded state.
+    void setSubscriptionVersionForTest(const std::string& topic, int64_t version);
     // Pre-pull flow-control decision (the three per-queue ProcessQueue thresholds: message count, bytes
     // in MiB, offset span; the topic budgets are not checked here -- they were divided into these
     // per-queue numbers at rebalance):
@@ -712,9 +747,21 @@ private:
     // a thread means std::terminate and the whole process goes down with it), and while the consumer is still running the loop is re-entered after 1s, so one stray exception does not turn into a silent 'no more consumption' stall.
     void runLoop(const std::string& what, const std::function<void()>& body);
     void rebalancePullThreads();
+    // Everything a rebalance round whose per-topic assignment SET moved owes, in this order:
+    // re-stamp the subscription version of the moved topics -> re-divide the topic budgets over the
+    // queue count this round produced -> one immediate heartbeat to every broker -> invoke the
+    // application's queue listener for the moved topics only. doRebalance calls it once per round
+    // that moved something; a round that moved nothing calls none of it.
+    void afterAssignmentChange(const std::vector<std::string>& moved);
+    // Re-stamp subVersion of the given topics only (wall-clock ms), each with its own log line.
+    void restampSubscriptionVersions(const std::vector<std::string>& moved);
+    // Invoke the application's MessageQueueListener for the moved topics only, with that topic's
+    // full route queue set and this instance's share of it.
+    void notifyQueueChanged(const std::vector<std::string>& moved);
     // Split each enabled topic-level cache budget (-1 = off) over the queues this client owns with live
     // pull state (mqMap_, or popQueues_ under POP) into the matching per-queue knob, floored at 1.
-    // doRebalance calls it AFTER that round rebuilt the pull state, and only when the owned set changed.
+    // afterAssignmentChange calls it AFTER that round rebuilt the pull state, and only when a topic
+    // actually moved.
     void divideTopicThresholds();
     void rebalanceLoop();
     void queuePullLoop(const MessageQueue& mq, uint64_t token);
@@ -979,6 +1026,8 @@ private:
     mutable std::mutex lock_;
     std::map<std::string, SubscriptionData> subscriptionData_;
     std::shared_ptr<MessageListener> messageListener_;
+    // Application callback for the topics whose assigned queue set moved (may be null).
+    std::shared_ptr<MessageQueueListener> messageQueueListener_;
     // Pull cursor (nextBeginOffset)
     std::map<std::string, int64_t> offsetTable_;
     // Committed consumer offset (what gets persisted periodically; the commitOffset after ProcessQueue.removeMessage)

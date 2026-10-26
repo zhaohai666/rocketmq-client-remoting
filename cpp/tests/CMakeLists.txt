@@ -252,6 +252,16 @@ add_executable(rmq_test_flow_control test_flow_control.cpp)
 target_link_libraries(rmq_test_flow_control PRIVATE rocketmq::remoting)
 add_test(NAME flow_control COMMAND rmq_test_flow_control)
 
+# What a rebalance round owes once a topic's queue SET moved: re-share that topic's subscription
+# version, re-divide the two topic budgets over the queue count of the round, pay one immediate
+# heartbeat (read off the wire) carrying the new version, and notify the application listener of the
+# moved topics only -- while an unchanged round and a self-heal round owe nothing at all. The classic
+# pull consumer owes the notification half. A round that restamps the whole table, beats on every
+# loop or re-tells every topic fails quietly on a real cluster, so both sides are pinned here.
+add_executable(rmq_test_rebalance_change test_rebalance_change.cpp)
+target_link_libraries(rmq_test_rebalance_change PRIVATE rocketmq::remoting)
+add_test(NAME rebalance_change COMMAND rmq_test_rebalance_change)
+
 # Shutdown unregister UNREGISTER_CLIENT(35): mock broker pins the header shape (a blank group slot is not sent online at all) and
 # the "every broker incl. slaves" fan-out (the broker-side check is group != null, invisible on a real machine).
 # The real-machine evidence is in examples/live_producer_unregister.cpp (frame capture + 204 before/after comparison).

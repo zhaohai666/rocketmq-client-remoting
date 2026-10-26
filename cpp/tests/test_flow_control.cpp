@@ -36,22 +36,27 @@ MessageQueue queueOf(const char* topic, int32_t id) {
     return MessageQueue(topic, kBroker, id);
 }
 
-MessageExt sized(const char* topic, int32_t storeSize, int64_t queueOffset) {
+MessageExt sized(const char* topic, size_t bodyBytes, int64_t queueOffset) {
     MessageExt m;
     m.topic = topic;
     m.brokerName = kBroker;
     m.queueId = 0;
     m.queueOffset = queueOffset;
-    m.storeSize = storeSize;
-    m.body = "x";
+    // storeSize is deliberately left at 0: the size gate reads the message BODY, so an implementation
+    // that read the storage record would see 0 bytes here and let every size case through. The two
+    // storeSize legs in testSizeGate pin both directions of that choice.
+    m.storeSize = 0;
+    m.body = std::string(bodyBytes, 'x');
     return m;
 }
 
-// Turn off every gate except the threshold under test: whichever hits first masks the branch.
-void gatesOffExceptCounts(DefaultMQPushConsumer& c) {
+// Park the two sibling gates so only the threshold a case measures can trip. Neither gate can be
+// switched off with 0 -- 0 is refused by checkConfig() at start-up and the gate itself compares the
+// number it was given -- so the only way to quiet a gate is a threshold no fixture reaches.
+void parkSiblingGates(DefaultMQPushConsumer& c) {
     c.setPullThresholdForQueue(std::numeric_limits<int32_t>::max());
-    c.setPullThresholdSizeForQueue(0);
-    c.setConsumeConcurrentlyMaxSpan(0);
+    c.setPullThresholdSizeForQueue(std::numeric_limits<int32_t>::max());
+    c.setConsumeConcurrentlyMaxSpan(std::numeric_limits<int64_t>::max());
     c.setPullThresholdForTopic(-1);
     c.setPullThresholdSizeForTopic(-1);
 }
@@ -73,10 +78,20 @@ void own(DefaultMQPushConsumer& c, const char* topic, int count, int32_t firstQu
     }
 }
 
-std::vector<MessageExt> nSized(const char* topic, int32_t storeSize, size_t n) {
+std::vector<MessageExt> nSized(const char* topic, size_t bodyBytes, size_t n) {
     std::vector<MessageExt> out;
     for (size_t i = 0; i < n; i++) {
-        out.push_back(sized(topic, storeSize, static_cast<int64_t>(i)));
+        out.push_back(sized(topic, bodyBytes, static_cast<int64_t>(i)));
+    }
+    return out;
+}
+
+// Same, starting at an explicit queueOffset: two sides of the held set need disjoint offsets.
+std::vector<MessageExt> nSizedFrom(const char* topic, size_t bodyBytes, int64_t firstOffset,
+                                   size_t n) {
+    std::vector<MessageExt> out;
+    for (size_t i = 0; i < n; i++) {
+        out.push_back(sized(topic, bodyBytes, firstOffset + static_cast<int64_t>(i)));
     }
     return out;
 }
@@ -152,7 +167,7 @@ void testCountGate() {
     DefaultMQPushConsumer c("GID_FlowControlCount");
     const MessageQueue mq = queueOf(kTopic, 0);
     const std::string key = DefaultMQPushConsumer::offsetKey(mq);
-    gatesOffExceptCounts(c);
+    parkSiblingGates(c);
     c.setPullThresholdForQueue(3);
     stage(c, mq, nSized(kTopic, 100, 2));
     expect(!c.flowControlHit(mq, key), "count.below");
@@ -166,40 +181,122 @@ void testCountGate() {
     expect(c.flowControlHit(mq, key), "count.over");
     expect(c.flowControlTriggered() == 1, "count.counterOnce",
            std::to_string(c.flowControlTriggered()));
-    // The max(1,n) guard makes a 0 threshold behave like 1, so 1 still fits and 2 fires.
+    // A threshold of 0 is NOT an off-switch and is NOT floored to 1 by the gate: it means "not even one
+    // message may stay held", so the first cached message pauses the queue. checkConfig() rejects the
+    // value at start-up; the gate itself compares the number it was given, so a max(1, n) floor here
+    // would go red on the first of this pair.
     c.setPullThresholdForQueue(0);
+    stage(c, mq, {});
+    expect(!c.flowControlHit(mq, key), "count.zeroWithEmptyBufferStillPulls");
     stage(c, mq, nSized(kTopic, 100, 1));
-    expect(!c.flowControlHit(mq, key), "count.zeroBehavesAsOneStillFits");
-    stage(c, mq, nSized(kTopic, 100, 2));
-    expect(c.flowControlHit(mq, key), "count.zeroBehavesAsOne");
+    expect(c.flowControlHit(mq, key), "count.zeroTripsOnTheFirstMessage");
+}
+
+// The gate's number is everything the queue still HOLDS: the pulled-but-undispatched buffer plus the
+// batches already handed to the listener and not settled yet. A batch in the listener's hands is still
+// this client's cached message, so a gate that read only the buffer would keep pulling on top of it.
+void testHeldSetIsTheBufferPlusTheBatchesInTheListenerHands() {
+    DefaultMQPushConsumer c("GID_FlowControlHeldSet");
+    const MessageQueue mq = queueOf(kTopic, 0);
+    const std::string key = DefaultMQPushConsumer::offsetKey(mq);
+    parkSiblingGates(c);
+    c.setPullThresholdForQueue(2);
+    c.setAssignedQueue(key, mq);
+    // 1 buffered + 1 in the listener's hands: the held set is 2, exactly the threshold, so it pulls.
+    // The dispatch window is ordered, so the batch in the listener's hands carries the lower offset.
+    c.setPendingMessages(key, nSizedFrom(kTopic, 100, 1, 1));
+    c.setInflightMessages(key, nSizedFrom(kTopic, 100, 0, 1));
+    expect(c.processQueueEntries(key).size() == 2, "held.unionIsWhatTheGateReads",
+           std::to_string(c.processQueueEntries(key).size()));
+    expect(!c.flowControlHit(mq, key), "held.atThresholdStillPulls");
+    // One more buffered: 2 buffered + 1 outstanding is 3 held, over the threshold. A gate that read the
+    // buffer alone would still see 2 and keep pulling.
+    c.setPendingMessages(key, nSizedFrom(kTopic, 100, 1, 2));
+    expect(c.flowControlHit(mq, key), "held.bufferPlusListenerTrips");
+    // Paired control for "the gate reads the buffer only": nothing buffered, all three messages still
+    // in the listener's hands. A buffer-only gate would see an empty queue and pull.
+    c.setPendingMessages(key, {});
+    c.setInflightMessages(key, nSizedFrom(kTopic, 100, 0, 3));
+    expect(c.flowControlHit(mq, key), "held.listenerOutstandingAloneTrips");
+    // The listener settles one batch: 2 held is exactly the threshold again, so the queue pulls.
+    c.setInflightMessages(key, nSizedFrom(kTopic, 100, 0, 2));
+    expect(!c.flowControlHit(mq, key), "held.settledBatchStopsCounting");
+    // The two sides are one set, not two sums: the same offset staged on both sides counts once, so a
+    // threshold of 1 with offset 5 on both sides must NOT read as 2 held.
+    c.setPullThresholdForQueue(1);
+    c.setPendingMessages(key, nSizedFrom(kTopic, 100, 5, 1));
+    c.setInflightMessages(key, nSizedFrom(kTopic, 100, 5, 1));
+    expect(!c.flowControlHit(mq, key), "held.overlapCountsOnce");
+    expect(c.processQueueEntries(key).size() == 1, "held.overlapViewIsOneEntry",
+           std::to_string(c.processQueueEntries(key).size()));
 }
 
 void testSizeGate() {
     DefaultMQPushConsumer c("GID_FlowControlSize");
     const MessageQueue mq = queueOf(kTopic, 0);
     const std::string key = DefaultMQPushConsumer::offsetKey(mq);
-    gatesOffExceptCounts(c);
+    parkSiblingGates(c);
     c.setPullThresholdSizeForQueue(1);           // 1 MiB
     stage(c, mq, nSized(kTopic, 300, 3));        // 900 B
     expect(!c.flowControlHit(mq, key), "size.below");
-    // The unit is MiB, not bytes, and the gate is strictly greater than the threshold: a buffer of
-    // exactly 1 MiB is still inside the budget.
+    // The unit is MiB of body, not bytes, and the gate is strictly greater than the threshold: a
+    // buffer of exactly 1 MiB is still inside the budget.
     stage(c, mq, {sized(kTopic, kMiB, 0)});
     expect(!c.flowControlHit(mq, key), "size.exactlyOneMiB");
+    // The division TRUNCATES: one byte over 1 MiB is still 1 MiB after the divide, so a 1 MiB budget
+    // tolerates 1.9 MiB. A ceiling-dividing implementation goes red on this leg.
     stage(c, mq, {sized(kTopic, kMiB + 1, 0)});
-    expect(c.flowControlHit(mq, key), "size.oneByteOver");
-    stage(c, mq, nSized(kTopic, 2 * kMiB, 4));
-    expect(c.flowControlHit(mq, key), "size.over");
-    // 0 disables this gate, however large the buffer becomes
+    expect(!c.flowControlHit(mq, key), "size.oneByteOverIsStillOneWholeMiB");
+    stage(c, mq, {sized(kTopic, static_cast<size_t>(1.9 * kMiB), 0)});
+    expect(!c.flowControlHit(mq, key), "size.justUnderTwoMiBIsStillOne");
+    // A whole MiB above the budget is a refusal.
+    stage(c, mq, {sized(kTopic, 2 * kMiB, 0)});
+    expect(c.flowControlHit(mq, key), "size.twoMiBOverOneMiBBudget");
+    // The budget sums the batches, it does not read only the first one: 3 x 1 MiB = 3 MiB.
+    stage(c, mq, nSized(kTopic, kMiB, 3));
+    expect(c.flowControlHit(mq, key), "size.sumsTheHeldBodies");
+    // 0 is not an off-switch: with the count and span gates parked, a whole MiB over a 0 MiB budget
+    // trips. (checkConfig() refuses 0 at start-up; the gate just compares.)
     c.setPullThresholdSizeForQueue(0);
-    expect(!c.flowControlHit(mq, key), "size.disabled");
+    stage(c, mq, {sized(kTopic, kMiB, 0)});
+    expect(c.flowControlHit(mq, key), "size.zeroIsNotAnOffSwitch");
+    stage(c, mq, {sized(kTopic, kMiB - 1, 0)});
+    expect(!c.flowControlHit(mq, key), "size.zeroBudgetStillToleratesUnderOneMiB");
+}
+
+// The byte budget is the message BODY, never storeSize: storeSize is what the broker charged for the
+// whole storage record (metadata and properties included) and is a telemetry field. Both directions
+// are pinned, so reading the wrong field is red whichever way a future refactor moves the fixture.
+void testSizeGateMeasuresBodyBytesNeverStoreSize() {
+    {
+        DefaultMQPushConsumer c("GID_FlowControlBodyBigStore");
+        const MessageQueue mq = queueOf(kTopic, 0);
+        const std::string key = DefaultMQPushConsumer::offsetKey(mq);
+        parkSiblingGates(c);
+        c.setPullThresholdSizeForQueue(1);
+        MessageExt decoy = sized(kTopic, /*bodyBytes=*/16, 0);
+        decoy.storeSize = static_cast<int32_t>(4 * kMiB);   // huge record, tiny body
+        stage(c, mq, {decoy});
+        expect(!c.flowControlHit(mq, key), "storeSize.largeStoreTinyBodyDoesNotTrip");
+    }
+    {
+        DefaultMQPushConsumer c("GID_FlowControlBodyOnly");
+        const MessageQueue mq = queueOf(kTopic, 0);
+        const std::string key = DefaultMQPushConsumer::offsetKey(mq);
+        parkSiblingGates(c);
+        c.setPullThresholdSizeForQueue(1);
+        MessageExt body = sized(kTopic, 2 * kMiB, 0);       // 2 MiB body, storeSize left at 0
+        body.storeSize = 0;
+        stage(c, mq, {body});
+        expect(c.flowControlHit(mq, key), "storeSize.bodyAloneTripsTheGate");
+    }
 }
 
 void testSpanGate() {
     DefaultMQPushConsumer c("GID_FlowControlSpan");
     const MessageQueue mq = queueOf(kTopic, 0);
     const std::string key = DefaultMQPushConsumer::offsetKey(mq);
-    gatesOffExceptCounts(c);
+    parkSiblingGates(c);
     c.setConsumeConcurrentlyMaxSpan(10);
     stage(c, mq, {sized(kTopic, 1, 0), sized(kTopic, 1, 100)});
     expect(c.flowControlHit(mq, key), "span.over");
@@ -209,8 +306,69 @@ void testSpanGate() {
     c.setConsumeConcurrentlyMaxSpan(10);
     stage(c, mq, {sized(kTopic, 1, 50), sized(kTopic, 1, 5), sized(kTopic, 1, 7)});
     expect(c.flowControlHit(mq, key), "span.unorderedBuffer");
+    // 0 does not switch the gate off: any queue holding two different offsets has a span above 0.
     c.setConsumeConcurrentlyMaxSpan(0);
-    expect(!c.flowControlHit(mq, key), "span.disabled");
+    stage(c, mq, {sized(kTopic, 1, 5), sized(kTopic, 1, 6)});
+    expect(c.flowControlHit(mq, key), "span.zeroIsNotAnOffSwitch");
+    // Paired control: a single held message spans 0, which is not above 0, so that queue still pulls.
+    stage(c, mq, {sized(kTopic, 1, 5)});
+    expect(!c.flowControlHit(mq, key), "span.oneMessageSpansNothing");
+}
+
+// The span knob is named consumeConcurrentlyMaxSpan because it bounds CONCURRENT consumption: an
+// orderly consumer deliberately leaves this gate alone, since orderly queues hold a backlog on
+// purpose and judging them would stall the head of the line. The same fixture, only the listener
+// mode changed, is the paired control. MessageListener's only pure virtual is the mode flag, so the
+// stub says exactly what the gate reads and nothing else.
+class ModeFlagListener : public MessageListener {
+public:
+    explicit ModeFlagListener(bool orderly) : orderly_(orderly) {}
+    bool orderly() const override { return orderly_; }
+
+private:
+    bool orderly_;
+};
+
+void testSpanGateNeverRunsForOrderlyConsumption() {
+    const MessageQueue mq = queueOf(kTopic, 0);
+    const std::string key = DefaultMQPushConsumer::offsetKey(mq);
+    DefaultMQPushConsumer o("GID_FlowControlOrderlySpan");
+    o.setMessageListener(std::make_shared<ModeFlagListener>(true));
+    DefaultMQPushConsumer cn("GID_FlowControlConcurrentSpan");
+    cn.setMessageListener(std::make_shared<ModeFlagListener>(false));
+    for (DefaultMQPushConsumer* c : {&o, &cn}) {
+        parkSiblingGates(*c);
+        c->setConsumeConcurrentlyMaxSpan(10);
+        c->setAssignedQueue(key, mq);
+        c->setPendingMessages(key, {sized(kTopic, 1, 0), sized(kTopic, 1, 5000)});
+    }
+    expect(o.processQueueEntries(key).size() == 2, "orderlySpan.fixtureIsStaged",
+           std::to_string(o.processQueueEntries(key).size()));
+    expect(!o.flowControlHit(mq, key), "orderlySpan.spanOf5000IsNotJudged");
+    expect(o.flowControlTriggered() == 0, "orderlySpan.noTickForAnOrderlyQueue",
+           std::to_string(o.flowControlTriggered()));
+    // Control: the identical backlog under a concurrent listener is a trip.
+    expect(cn.flowControlHit(mq, key), "orderlySpan.concurrentDoesJudgeIt");
+    expect(cn.flowControlTriggered() == 1, "orderlySpan.controlTicksOnce",
+           std::to_string(cn.flowControlTriggered()));
+    // An orderly queue is not exempt from the other two gates: the same queue over its count
+    // threshold pauses even with an orderly listener.
+    o.setPullThresholdForQueue(1);
+    expect(o.flowControlHit(mq, key), "orderlySpan.countGateStillJudgesOrderly");
+    // And its size gate too, so the exemption is the span branch alone.
+    o.setPullThresholdForQueue(std::numeric_limits<int32_t>::max());
+    o.setPullThresholdSizeForQueue(1);
+    o.setPendingMessages(key, {sized(kTopic, 2 * kMiB, 0)});
+    expect(o.flowControlHit(mq, key), "orderlySpan.sizeGateStillJudgesOrderly");
+}
+
+// pullBatchSize is the count a pull round asks for and, on the lite path, the multiplier of the
+// aggregate budget: a push consumer asks for 32 per round.
+void testPushPullBatchSizeDefaultsToThirtyTwo() {
+    DefaultMQPushConsumer c("GID_FlowControlBatchSizeDefault");
+    expect(c.pullBatchSize() == 32, "batchSize.pushDefaultIs32", std::to_string(c.pullBatchSize()));
+    c.setPullBatchSize(3);
+    expect(c.pullBatchSize() == 3, "batchSize.setterDoesNotClamp", std::to_string(c.pullBatchSize()));
 }
 
 // The pre-pull gate never sums the sibling queues of a topic: each queue is judged against its **own**
@@ -223,7 +381,7 @@ void testGateNeverSumsTheSiblingQueues() {
     const MessageQueue q2 = queueOf(kTopic, 2);
     const MessageQueue q3 = queueOf(kTopic, 3);
     const MessageQueue all[4] = {q0, q1, q2, q3};
-    gatesOffExceptCounts(c);
+    parkSiblingGates(c);
     c.setPullThresholdForTopic(8);               // 8 messages for the whole topic
     own(c, kTopic, 4);                           // 4 owned queues => 8 / 4 = 2 per queue
     c.divideTopicThresholdsForTest();
@@ -582,7 +740,7 @@ void testPopTripSharesThePullFlowControlCounter() {
     DefaultMQPushConsumer c("GID_PopFlowControlSharedCounter");
     const MessageQueue mq = queueOf(kTopic, 0);
     const std::string key = DefaultMQPushConsumer::offsetKey(mq);
-    gatesOffExceptCounts(c);
+    parkSiblingGates(c);
     c.setPullThresholdForQueue(1);
     c.setPopThresholdForQueue(1);
     expect(c.flowControlTriggered() == 0, "sharedCounter.freshConsumer");
@@ -702,7 +860,7 @@ void testPopTripJoinsTheWarnCadenceOfTheSharedCounter() {
     DefaultMQPushConsumer c("GID_PopFlowControlCadence");
     const MessageQueue mq = queueOf(kTopic, 0);
     const std::string key = DefaultMQPushConsumer::offsetKey(mq);
-    gatesOffExceptCounts(c);
+    parkSiblingGates(c);
     c.setPullThresholdForQueue(1);
     c.setPopThresholdForQueue(1);
     stage(c, mq, nSized(kTopic, 100, 2));
@@ -790,7 +948,7 @@ void testWarnCadence() {
     DefaultMQPushConsumer c("GID_FlowControlWarn");
     const MessageQueue mq = queueOf(kTopic, 0);
     const std::string key = DefaultMQPushConsumer::offsetKey(mq);
-    gatesOffExceptCounts(c);
+    parkSiblingGates(c);
     c.setPullThresholdForQueue(1);
     stage(c, mq, nSized(kTopic, 100, 2));
 
@@ -814,8 +972,12 @@ void testWarnCadence() {
 int main() {
     testDefaultsOnlyCountGate();
     testCountGate();
+    testHeldSetIsTheBufferPlusTheBatchesInTheListenerHands();
     testSizeGate();
+    testSizeGateMeasuresBodyBytesNeverStoreSize();
     testSpanGate();
+    testSpanGateNeverRunsForOrderlyConsumption();
+    testPushPullBatchSizeDefaultsToThirtyTwo();
     testGateNeverSumsTheSiblingQueues();
     testOneHitCountsOneTickEvenWhenEveryGateMatches();
     testTopicCountBudgetDividesIntoThePerQueueCountKnob();

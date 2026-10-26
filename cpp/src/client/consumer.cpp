@@ -951,50 +951,57 @@ bool DefaultMQPushConsumer::pullStalled(const std::string& key) const {
 }
 
 bool DefaultMQPushConsumer::flowControlHit(const MessageQueue& mq, const std::string& key) {
-    // The three per-queue flow-control thresholds of a ProcessQueue: this queue's message count, its
-    // bytes, its offset span. Every cache gate is **strictly greater
+    // The three per-queue flow-control thresholds of a ProcessQueue: everything this queue still
+    // HOLDS (the pulled-but-undispatched buffer PLUS the batches already handed to the listener that
+    // have not settled yet - a batch in the listener's hands is still this client's cached message),
+    // its body bytes, its offset span. Every cache gate is **strictly greater
     // than** its threshold, so a threshold reads as "how many may be cached" and a buffer that has
-    // reached it exactly still gets to pull. The byte threshold is in MiB; the span is max-min of the
-    // pending queueOffsets.
+    // reached it exactly still gets to pull. The byte threshold is in MiB of message **body**,
+    // divided as an INTEGER - a 1 MiB budget tolerates a 1.9 MiB buffer, because 1.9 truncated is 1
+    // and only a whole MiB over the budget is a refusal. storeSize is what the broker charged for the
+    // whole storage record (metadata included) and is a telemetry field, never a flow-control input.
+    // The span is max-min of the held queueOffsets, and an orderly consumer does not judge it at all:
+    // the span knob is named consumeConcurrentlyMaxSpan because it bounds concurrent consumption, so
+    // the orderly path leaves the buffer as wide as it likes rather than stalling head-of-line.
+    // None of the three thresholds can be switched off and none is floored here: 0 is not a legal
+    // user value (checkConfig() rejects it at start-up, together with the out-of-range upper bounds),
+    // so the gate compares the number it was given.
     // The two topic-level budgets are deliberately not checked here: divideTopicThresholds() split them
     // into the per-queue numbers above when the assignment last changed, so this gate reads only its own
     // queue's buffer and never walks the sibling queues (a divided per-queue gate is strictly stricter
     // than summing them).
+    const bool orderly = isOrderly();
     size_t count = 0;
-    double sizeMb = 0.0;
+    int64_t sizeMb = 0;
     int64_t span = 0;
     {
         std::lock_guard<std::mutex> lk(lock_);
-        auto it = pending_.find(key);
-        if (it != pending_.end()) {
-            int64_t bytes = 0;
-            int64_t minOffset = 0;
-            int64_t maxOffset = 0;
-            bool first = true;
-            for (const MessageExt& m : it->second) {
-                bytes += m.storeSize;
-                if (first) {
-                    minOffset = maxOffset = m.queueOffset;
-                    first = false;
-                } else {
-                    minOffset = std::min(minOffset, m.queueOffset);
-                    maxOffset = std::max(maxOffset, m.queueOffset);
-                }
+        const std::vector<MessageExt> held = processQueueEntriesLocked(key);
+        int64_t bytes = 0;
+        int64_t minOffset = 0;
+        int64_t maxOffset = 0;
+        bool first = true;
+        for (const MessageExt& m : held) {
+            bytes += static_cast<int64_t>(m.getBody().size());
+            if (first) {
+                minOffset = maxOffset = m.queueOffset;
+                first = false;
+            } else {
+                minOffset = std::min(minOffset, m.queueOffset);
+                maxOffset = std::max(maxOffset, m.queueOffset);
             }
-            count = it->second.size();
-            sizeMb = static_cast<double>(bytes) / (1024.0 * 1024.0);
-            span = maxOffset - minOffset;
         }
+        count = held.size();
+        sizeMb = bytes / (1024 * 1024);
+        span = maxOffset - minOffset;
     }
 
-    char number[32] = {0};
     std::string reason;
-    if (count > static_cast<size_t>(std::max(1, pullThresholdForQueue_))) {
+    if (count > static_cast<size_t>(pullThresholdForQueue_)) {
         reason = "count=" + std::to_string(count);
-    } else if (pullThresholdSizeForQueue_ > 0 && sizeMb > pullThresholdSizeForQueue_) {
-        std::snprintf(number, sizeof(number), "%.1f", sizeMb);
-        reason = std::string("size=") + number + "MB";
-    } else if (consumeConcurrentlyMaxSpan_ > 0 && span > consumeConcurrentlyMaxSpan_) {
+    } else if (sizeMb > pullThresholdSizeForQueue_) {
+        reason = "size=" + std::to_string(sizeMb) + "MB";
+    } else if (!orderly && span > consumeConcurrentlyMaxSpan_) {
         reason = "span=" + std::to_string(span);
     }
     if (reason.empty()) return false;
@@ -2207,6 +2214,19 @@ bool DefaultMQPushConsumer::consumeBatch(const std::string& key, const MessageQu
         ConsumeOrderlyStatus status;
         bool hookHasException = false;
         int64_t hookBeginMs = UtilAll::currentTimeMillis();
+        // The batch this queue is handing to the orderly listener is STILL its cached message, so it goes
+        // in the in-flight registry for the duration of the call: the dispatcher took it out of the buffer
+        // a moment ago, and without this registration the queue's cache would read empty while the listener
+        // is running. Deregistration happens as soon as the listener returns (this guard's scope ends with
+        // the call below), before any requeue-to-head or offset advance re-enters the buffer side, so the
+        // batch is on one side at a time.
+        struct OrderlyInflightGuard {
+            DefaultMQPushConsumer* self;
+            const std::string* guardKey;
+            const std::vector<MessageExt>* guardMsgs;
+            ~OrderlyInflightGuard() { self->deregisterInflight(*guardKey, *guardMsgs); }
+        } orderlyInflight{this, &key, &restored};
+        registerInflight(key, restored);
         try {
             status = orderly->consumeMessage(restored, ctx);
         } catch (const std::exception& e) {
@@ -3267,12 +3287,20 @@ void DefaultMQPushConsumer::doRebalance() {
             topics.push_back(kv.first);
         }
     }
-    std::set<std::string> was;
+    // The assignment is remembered PER TOPIC here: what a rebalance round owes its application is
+    // decided topic by topic, so a round that moved one topic's queues must not re-stamp or re-report
+    // the topics that kept theirs. `wasKeys` is the flat view of the same table, used only to tell a
+    // newly owned queue from a continuing one when resolving initial offsets.
+    std::map<std::string, std::set<std::string>> wasByTopic;
     {
         std::lock_guard<std::mutex> lk(lock_);
         for (const MessageQueue& mq : assignedQueues_) {
-            was.insert(offsetKey(mq));
+            wasByTopic[mq.topic].insert(offsetKey(mq));
         }
+    }
+    std::set<std::string> wasKeys;
+    for (const auto& kv : wasByTopic) {
+        wasKeys.insert(kv.second.begin(), kv.second.end());
     }
     std::vector<MessageQueue> assigned;
     if (messageModel_ == MessageModel::BROADCASTING) {
@@ -3320,11 +3348,12 @@ void DefaultMQPushConsumer::doRebalance() {
         std::lock_guard<std::mutex> lk(lock_);
         assignedQueues_ = assigned;
     }
-    std::set<std::string> now;
+    std::map<std::string, std::set<std::string>> nowByTopic;
     for (const MessageQueue& mq : assigned) {
-        now.insert(offsetKey(mq));
+        nowByTopic[mq.topic].insert(offsetKey(mq));
     }
-    const bool changed = now != was;
+    const std::vector<std::string> moved = movedTopicsForTest(wasByTopic, nowByTopic);
+    const bool changed = !moved.empty();
     if (changed) {
         logger_info("rebalance result changed, group=" + consumerGroup_
                     + " clientId=" + clientId_ + " assigned=" + std::to_string(assigned.size()));
@@ -3335,7 +3364,7 @@ void DefaultMQPushConsumer::doRebalance() {
     // assignment time", and lazy resolution would skip messages produced between assignment and the first pull.
     for (const MessageQueue& mq : assigned) {
         std::string key = offsetKey(mq);
-        if (was.count(key)) {
+        if (wasKeys.count(key)) {
             continue;
         }
         {
@@ -3356,13 +3385,136 @@ void DefaultMQPushConsumer::doRebalance() {
         }
     }
     rebalancePullThreads();
-    // Split the enabled topic budgets over the queue count **this** round produced. The order matters:
-    // rebalancePullThreads() is what rebuilds the per-queue pull state (mqMap_ / popQueues_), and that
-    // table is the divisor, so dividing before it would use the previous round's queue count. Only a
-    // round that actually changed the owned set re-divides -- an unchanged round leaves a hand-set
-    // per-queue knob alone.
-    if (changed) {
-        divideTopicThresholds();
+    // The round's assignment changed the queue SET of at least one topic: pay what that change owes,
+    // in the fixed order (re-stamp -> re-divide -> immediate heartbeat -> application listener).
+    // The order matters: rebalancePullThreads() above is what rebuilt the per-queue pull state
+    // (mqMap_ / popQueues_), and that table is the divisor, so dividing before it would use the
+    // previous round's queue count. An unchanged round leaves a hand-set per-queue knob alone and sends
+    // nothing extra.
+    afterAssignmentChange(moved);
+}
+
+std::vector<std::string> DefaultMQPushConsumer::movedTopicsForTest(
+    const std::map<std::string, std::set<std::string>>& before,
+    const std::map<std::string, std::set<std::string>>& after) {
+    // A topic moved when the SET of its queue keys differs -- which covers a growth, a shrink, a
+    // hand-over (same count, different broker) and a topic that appeared or disappeared altogether.
+    // Re-ordering the same set is not a move, and a topic both rounds owns identically is not named,
+    // so an application that rebuilds state per queue never hears about a queue that never changed
+    // hands.
+    std::vector<std::string> topics;
+    for (const auto& kv : before) topics.push_back(kv.first);
+    for (const auto& kv : after) topics.push_back(kv.first);
+    std::sort(topics.begin(), topics.end());
+    topics.erase(std::unique(topics.begin(), topics.end()), topics.end());
+    std::vector<std::string> moved;
+    for (const std::string& topic : topics) {
+        auto bit = before.find(topic);
+        auto ait = after.find(topic);
+        static const std::set<std::string> kEmpty;
+        const std::set<std::string>& b = bit == before.end() ? kEmpty : bit->second;
+        const std::set<std::string>& a = ait == after.end() ? kEmpty : ait->second;
+        if (a != b) moved.push_back(topic);
+    }
+    return moved;
+}
+
+void DefaultMQPushConsumer::afterAssignmentChange(const std::vector<std::string>& moved) {
+    if (moved.empty()) {
+        return;
+    }
+    restampSubscriptionVersions(moved);
+    divideTopicThresholds();
+    // The new version must reach the broker NOW rather than at the next periodic beat: the broker
+    // keys its cached filter results of this subscription by the version, so a topic whose queues just
+    // moved stays "unchanged" to the broker until this beat lands.
+    try {
+        sendHeartbeatToAllBroker();
+    } catch (const std::exception& e) {
+        logger_debug(std::string("heartbeat after rebalance change failed: ") + e.what());
+    } catch (...) {
+        logger_debug("heartbeat after rebalance change failed");
+    }
+    notifyQueueChanged(moved);
+}
+
+void DefaultMQPushConsumer::restampSubscriptionVersions(const std::vector<std::string>& moved) {
+    // Wall-clock ms, one stamp shared by the round: the version is what makes the broker re-read a
+    // subscription instead of reusing the filtered result it cached for the old generation, so a
+    // topic whose queues moved has to look new to the broker even when its filter expression did not
+    // change. Topics that did not move keep their version -- restamping everything would throw away
+    // the caching the broker does for the untouched subscriptions.
+    const int64_t newVersion = UtilAll::currentTimeMillis();
+    std::vector<std::pair<std::string, int64_t>> stamped;
+    {
+        std::lock_guard<std::mutex> lk(lock_);
+        for (const std::string& topic : moved) {
+            auto it = subscriptionData_.find(topic);
+            if (it == subscriptionData_.end()) {
+                continue;
+            }
+            stamped.emplace_back(topic, it->second.subVersion);
+            it->second.setSubVersion(newVersion);
+        }
+    }
+    // lock_ is non-recursive, so the lines are decided inside the critical section and written after
+    // releasing it.
+    for (const auto& kv : stamped) {
+        logger_info(kv.first + " rebalance changed, also update version: "
+                    + std::to_string(kv.second) + ", " + std::to_string(newVersion));
+    }
+}
+
+int64_t DefaultMQPushConsumer::subscriptionVersion(const std::string& topic) const {
+    std::lock_guard<std::mutex> lk(lock_);
+    auto it = subscriptionData_.find(topic);
+    return it == subscriptionData_.end() ? 0 : it->second.subVersion;
+}
+
+void DefaultMQPushConsumer::setSubscriptionVersionForTest(const std::string& topic,
+                                                          int64_t version) {
+    std::lock_guard<std::mutex> lk(lock_);
+    auto it = subscriptionData_.find(topic);
+    if (it != subscriptionData_.end()) {
+        it->second.setSubVersion(version);
+    }
+}
+
+void DefaultMQPushConsumer::notifyQueueChanged(const std::vector<std::string>& moved) {
+    std::shared_ptr<MessageQueueListener> listener;
+    {
+        std::lock_guard<std::mutex> lk(lock_);
+        listener = messageQueueListener_;
+    }
+    if (listener == nullptr) {
+        return;
+    }
+    std::map<std::string, std::vector<MessageQueue>> dividedByTopic;
+    {
+        std::lock_guard<std::mutex> lk(lock_);
+        for (const MessageQueue& mq : assignedQueues_) {
+            dividedByTopic[mq.topic].push_back(mq);
+        }
+    }
+    // Only the topics whose share moved are told: an unchanged topic has nothing to report, and
+    // re-reporting every subscription each round would have the application rebuild state for queues
+    // that never changed hands.
+    for (const std::string& topic : moved) {
+        std::vector<MessageQueue> all;
+        try {
+            all = allQueuesOfTopic(topic);
+        } catch (const std::exception& e) {
+            logger_debug("route for changed topic unavailable: " + std::string(e.what()));
+        } catch (...) {
+            logger_debug("route for changed topic unavailable");
+        }
+        try {
+            listener->messageQueueChanged(topic, all, dividedByTopic[topic]);
+        } catch (const std::exception& e) {
+            logger_debug("message queue listener failed for " + topic + ": " + e.what());
+        } catch (...) {
+            logger_debug("message queue listener failed for " + topic);
+        }
     }
 }
 
@@ -3422,8 +3574,6 @@ void DefaultMQPushConsumer::divideTopicThresholds() {
                     + " to " + std::to_string(sizeTo));
     }
 }
-
-void DefaultMQPushConsumer::divideTopicThresholdsForTest() { divideTopicThresholds(); }
 
 std::vector<MessageQueue> DefaultMQPushConsumer::allQueuesOfTopic(const std::string& topic) {
     // Taken from the SUBSCRIBE side of the route (read queues + readQueueNums, no master filtering),

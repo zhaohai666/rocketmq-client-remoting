@@ -1,8 +1,10 @@
 // Difference from the push consumer: **the caller pulls and manages the offsets itself**.
-// There is no background pull thread, no rebalance and no message listener; only:
+// There is no background pull thread and no offset store driving the consumer; only:
 //   fetchSubscribeMessageQueues / fetchMessageQueuesInBalance / pull / pullBlockIfNotFound /
 //   fetchConsumeOffset / updateConsumeOffset / searchOffset / maxOffset / minOffset /
 //   earliestMsgStoreTime / sendMessageBack / createTopic.
+// fetchMessageQueuesInBalance recomputes the topic's share, so it is also the point where a registered
+// queue listener learns that the share moved.
 #ifndef ROCKETMQ_CLIENT_PULL_CONSUMER_H
 #define ROCKETMQ_CLIENT_PULL_CONSUMER_H
 
@@ -18,6 +20,7 @@
 
 #include "rocketmq/client/allocate_strategy.h"
 #include "rocketmq/client/consume_executor.h"
+#include "rocketmq/client/message_queue_listener.h"
 #include "rocketmq/client/mq_client.h"
 #include "rocketmq/client/result.h"
 #include "rocketmq/common/message.h"
@@ -28,14 +31,6 @@
 #include "rocketmq/remoting/rpchook.h"
 
 namespace rocketmq {
-
-class MessageQueueListener {
-public:
-    virtual ~MessageQueueListener() = default;
-    virtual void messageQueueChanged(const std::string& topic,
-                                     const std::vector<MessageQueue>& mqAll,
-                                     const std::vector<MessageQueue>& mqDivided) = 0;
-};
 
 class DefaultMQPullConsumer {
 public:
@@ -90,7 +85,11 @@ public:
     int32_t heartbeatBrokerIntervalMillis() const { return heartbeatBrokerIntervalMillis_; }
     void setMessageModel(const std::string& model) { messageModel_ = model; }
     const std::string& messageModel() const { return messageModel_; }
+    // Queue listeners are told only when fetchMessageQueuesInBalance hands out a view whose queue set
+    // moved for that topic: a re-ordering is not a change, a same-count swap to another broker is.
+    // The topic-keyed listener wins for its own topic; the single listener is the sink for the rest.
     void setMessageQueueListener(std::shared_ptr<MessageQueueListener> listener) {
+        std::lock_guard<std::mutex> lk(assignmentNotifyMutex_);
         messageQueueListener_ = std::move(listener);
     }
     void setAllocateMessageQueueStrategy(std::shared_ptr<AllocateMessageQueueStrategy> strategy) {
@@ -105,6 +104,17 @@ public:
     void setNamespace(const std::string& ns) { namespace_ = ns; }
     void setNamespaceV2(const std::string& ns) { namespaceV2_ = ns; }
     const std::string& namespaceV2() const { return namespaceV2_; }
+
+    // Test-only: hand the consumer a topic's balanced view the way fetchMessageQueuesInBalance does
+    // after it recomputes one, and report whether the registered listeners were told.
+    bool publishAssignmentForTest(const std::string& topic, const std::vector<MessageQueue>& all,
+                                  const std::vector<MessageQueue>& divided) {
+        return notifyAssignmentChanged(topic, all, divided);
+    }
+    static bool assignmentChangedForTest(const std::vector<MessageQueue>& before,
+                                        const std::vector<MessageQueue>& after) {
+        return assignmentChanged(before, after);
+    }
 
     void setRPCHook(std::shared_ptr<RPCHook> hook) { rpcHook_ = std::move(hook); }
     void setCredentials(const std::string& accessKey, const std::string& secretKey,
@@ -191,6 +201,13 @@ private:
     void startHeartbeatLoop();
     void heartbeatLoop();
 
+    // Tell the registered listeners about a topic's balanced view, but only when its own queue set
+    // moved since the view last handed out. Returns whether they were told.
+    bool notifyAssignmentChanged(const std::string& topic, const std::vector<MessageQueue>& all,
+                                 const std::vector<MessageQueue>& divided);
+    static bool assignmentChanged(const std::vector<MessageQueue>& before,
+                                  const std::vector<MessageQueue>& after);
+
     // ---------------- pullAsync plumbing (producer-shaped) ----------------
     void createAsyncExecutors();
     // Runs fn on the callback pool; falls back to inline once the pool is gone (shutdown race),
@@ -221,8 +238,12 @@ private:
     std::vector<std::string> nameServerAddrs_;
     std::shared_ptr<RPCHook> rpcHook_;
     std::set<std::string> registerTopics_;
+    // The queue listeners and the last balanced view per topic are read while a caller recomputes an
+    // assignment, so they share one guard.
+    mutable std::mutex assignmentNotifyMutex_;
     std::map<std::string, std::shared_ptr<MessageQueueListener>> messageQueueListeners_;
     std::shared_ptr<MessageQueueListener> messageQueueListener_;
+    std::map<std::string, std::vector<MessageQueue>> lastBalancedQueues_;
     std::shared_ptr<AllocateMessageQueueStrategy> allocateStrategy_ =
         std::make_shared<AllocateMessageQueueAveragely>();
 

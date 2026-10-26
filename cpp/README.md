@@ -46,15 +46,15 @@ cmake --build build -j6
 cd build && ctest --output-on-failure
 ```
 
-产出静态库 `build/librocketmq_remoting.a`（别名 `rocketmq::remoting`）、67 个测试二进制与
+产出静态库 `build/librocketmq_remoting.a`（别名 `rocketmq::remoting`）、68 个测试二进制与
 44 个 `build/examples/` 工具。本机实测：
 
 ```
-100% tests passed out of 68
-Total Test time (real) = 100.25 sec
+100% tests passed out of 69
+Total Test time (real) = 124.59 sec
 ```
 
-68 个用例 = 67 个测试二进制（8025 项断言）+ 1 个编解码互调用例（73 项断言），共 **8098 项断言**。
+69 个用例 = 68 个测试二进制（8141 项断言）+ 1 个编解码互调用例（73 项断言），共 **8214 项断言**。
 
 不依赖集群的协议层自检：
 
@@ -260,6 +260,45 @@ consumer.setPopBatchNums(16);
 consumer.setPopThresholdForQueue(96);   // 本队列待 ack 上限，严格大于才停；命中记进拉取路径同一个流控计数
 ```
 
+拉取前的缓存闸门（三条都严格大于才停，0 不是合法值，`start()` 的数值闸门直接拒绝；闸门只看这一个
+队列自己的持有量，从不高估到 topic 级）：
+
+```cpp
+consumer.setPullThresholdForQueue(1000);              // 持有条数 = 还没分发的缓冲 ∪ 已交给监听器、还没结算的批次（按位点去重）
+consumer.setPullThresholdSizeForQueue(100);           // 持有消息体的整 MiB（累加 body 长度，不是 storeSize；1.9MiB 记作 1）
+consumer.setConsumeConcurrentlyMaxSpan(2000);         // 持有位点跨度 max-min；顺序消费不判这一条
+consumer.setPullThresholdForTopic(-1);                // topic 预算：-1 不启用，正数在重平衡时整数拆分进第一条
+consumer.setPullThresholdSizeForTopic(-1);            // 同上，拆进第二条
+```
+
+拆分按本实例当前持有 live 拉取状态的队列数（并发/普通走 `mqMap_`，POP 走 `popQueues_`，跨所有订阅
+topic），商至少 1；预算启用时它会覆盖手设的每队列值，之后的 getter 读到的是商。
+命中只把这一个队列延后 `kPullPauseWhenClientFlowControl` = 50ms 重排，broker 侧的
+`FLOW_CONTROL`(215) 只等 `kPullPauseWhenBrokerFlowControl` = 20ms；客户端流控次数与告警节奏
+（第 1、1001、2001… 次告警，其余 debug）与 POP 路径共用一个计数器。
+
+重平衡轮次里某个 topic 分到的队列**集合**变了（增长、缩减、同数量换 broker、topic 新出现或消失；
+同一集合换顺序不算）时，这一轮依次做四件事：只给变动的 topic 重打订阅版本（墙钟毫秒，日志
+`<topic> rebalance changed, also update version: <旧>, <新>`）→ 按本轮队列数把 topic 预算整数拆分进
+每队列阈值 → 立即向所有 broker 推一次心跳（broker 按版本缓存这条订阅的过滤结果，不等下一个周期）
+→ 只把变动的 topic 告诉应用的 `MessageQueueListener`。集合没变的轮次与停摆自愈轮次四件事都不做。
+
+```cpp
+#include "rocketmq/client/message_queue_listener.h"
+
+class QueueHandover : public MessageQueueListener {
+public:
+    void messageQueueChanged(const std::string& topic, const std::vector<MessageQueue>& mqAll,
+                             const std::vector<MessageQueue>& mqDivided) override {
+        // mqAll 是路由里这条 topic 的全部队列，mqDivided 是本实例应得的那一份
+    }
+};
+consumer.setMessageQueueListener(std::make_shared<QueueHandover>());
+```
+
+`DefaultMQPullConsumer` 没有后台重平衡，队列集合由调用方给出，它只欠监听器这一半：按集合相等判断
+在自己的均衡视图变化时通知同一个回调，不重打订阅版本、不额外推心跳。
+
 其他：`suspend()` / `resume()`、`setPullBatchSize` / `setPullThresholdForQueue`（拉取前流控）、
 `setAllocateMessageQueueStrategy`（六种队列分配策略）、
 `registerConsumeMessageHook` / `registerCheckForbiddenHook` / `registerFilterMessageHook`、
@@ -355,6 +394,20 @@ while (running) {
 lite.commit();
 lite.shutdown();
 ```
+
+解析拉取位点前先过四道缓存闸门（`pullBatchSize` 默认 10，四道都严格大于才停，命中只重排这一个队列；
+这四个数值在轻量拉消费者上不做启动期校验，0 合法且第一条缓存消息就会命中）：
+
+```cpp
+lite.setPullThresholdForAll(10000);       // 整个缓冲：待拉轮次 × pullBatchSize 的容量投影，跨所有队列的累加器求和
+lite.setPullThresholdForQueue(1000);      // 本队列已缓存条数
+lite.setPullThresholdSizeForQueue(100);   // 本队列已缓存消息体的整 MiB（累加 body 长度，不是 storeSize）
+lite.setConsumeMaxSpan(2000);             // 本队列缓存位点跨度 max-min
+```
+
+计数器和告警节奏：本队列条数与大小共用一个计数器，容量投影与跨度各一个，告警仍是第 1、1001、2001…
+次 warn、其余 debug。队列被收回时（`assign()` 收窄、后台重平衡、拉取轮次的兜底清理三条路径同一条
+实现），它的缓存行与待拉轮次一起离开缓冲——既不继续 `poll()` 得到，也不再替整个缓冲占容量投影。
 
 队列变更监听（后台按 `topicMetadataCheckIntervalMillis` 比对，集合真的变了才回调）：
 
@@ -491,11 +544,16 @@ producer.setTlsOptions(opts);
 - ✅ 消费者：`DefaultMQPushConsumer`（并发、顺序、广播、POP）、
   `DefaultMQPullConsumer`（短轮询 / 长轮询 / 位点表 / 心跳 / 异步拉取 `pullAsync`）、
   `DefaultLitePullConsumer`（subscribe 与 assign 双模式、seek、三张位点表、队列变更监听、
-  解析拉取位点前先过四道缓存闸门：整个缓冲条数 `setPullThresholdForAll` 10000 / 本队列条数
-  `setPullThresholdForQueue` 1000 / 本队列存储字节 `setPullThresholdSizeForQueue` 100 MiB
-  整除 / 本队列位点跨度 `setConsumeMaxSpan` 2000，都严格大于才停；命中只重排这一个队列
+  解析拉取位点前先过四道缓存闸门：整个缓冲的容量投影 `setPullThresholdForAll` 10000（待拉轮次 ×
+  `pullBatchSize`，默认 10）/ 本队列条数 `setPullThresholdForQueue` 1000 / 本队列消息体整 MiB
+  `setPullThresholdSizeForQueue` 100 / 本队列位点跨度 `setConsumeMaxSpan` 2000，都严格大于才停；
+  队列被收回时它的缓存与待拉轮次一起删除；命中只重排这一个队列
   `kPullPauseWhenClientFlowControl` = 50ms，broker 的 `FLOW_CONTROL`(215) 只等
   `kPullPauseWhenBrokerFlowControl` = 20ms）、
+  push 侧的三道缓存闸门（持有条数含已交给监听器未结算的批次、大小按消息体整 MiB、跨度顺序消费不判，
+  topic 预算在重平衡时按本轮队列数整数拆分进它们）、
+  队列集合变化的一轮（只给变动的 topic 重打订阅版本 → 拆分预算 → 立即心跳 → 只通知变动的 topic 给
+  `MessageQueueListener`；不变轮次与自愈轮次四件事都不做）、
   `MQPullConsumerScheduleService`（按 topic 注册 `PullTaskCallback`，按本实例应得份额展开
   queue 维度拉取任务：同队列串行、三通道延时优先级、关停排空在途）
 - ✅ 队列分配策略：AVG / AVG_BY_CIRCLE / CONFIG / CONSISTENT_HASH /
@@ -632,7 +690,7 @@ cpp/
 │                               hook / trace / request_reply / backpressure / validators /
 │                               result / exception
 ├── src/                        与 include 同构的实现（common / remoting / client）
-├── tests/                      67 个测试源文件 + interop_check.py = 68 个 ctest 用例
+├── tests/                      68 个测试源文件 + interop_check.py = 69 个 ctest 用例
 ├── examples/                   rmq_selfcheck / rmq_interop + 41 个真机联调工具
 └── tools/                      Windows 头文件准备与语法检查脚本
 ```

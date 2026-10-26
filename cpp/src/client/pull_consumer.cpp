@@ -84,6 +84,7 @@ void DefaultMQPullConsumer::registerMessageQueueListener(
     if (topic.empty()) return;
     registerTopics_.insert(topic);
     if (listener != nullptr) {
+        std::lock_guard<std::mutex> lk(assignmentNotifyMutex_);
         messageQueueListeners_[topic] = std::move(listener);
     }
 }
@@ -203,17 +204,26 @@ std::vector<MessageQueue> DefaultMQPullConsumer::fetchMessageQueuesInBalance(
         // pullAsync workers write the table concurrently with this read.
         std::lock_guard<std::mutex> lk(pullFromWhichNodeMutex_);
         for (const auto& kv : pullFromWhichNode_) {
-            if (kv.first.topic == realTopic) pulled.push_back(kv.first);
+            if (kv.first.topic == realTopic) {
+                pulled.push_back(MessageQueue(NamespaceUtil::withoutNamespace(kv.first.topic,
+                                                                              namespace_),
+                                              kv.first.brokerName, kv.first.queueId));
+            }
         }
     }
     std::sort(pulled.begin(), pulled.end());
 
     std::vector<MessageQueue> allocated;
     bool computed = false;
+    std::vector<MessageQueue> allOfTopic;
     std::shared_ptr<TopicRouteData> route = mqClient_->getTopicRouteData(realTopic);
     if (route != nullptr) {
         std::vector<MessageQueue> mqAll = route->getAllSubscribeMessageQueue(realTopic);
         std::sort(mqAll.begin(), mqAll.end());
+        for (const MessageQueue& mq : mqAll) {
+            allOfTopic.push_back(MessageQueue(NamespaceUtil::withoutNamespace(mq.topic, namespace_),
+                                              mq.brokerName, mq.queueId));
+        }
         if (messageModel_ == MessageModel::BROADCASTING) {
             allocated = mqAll;
             computed = true;
@@ -235,6 +245,9 @@ std::vector<MessageQueue> DefaultMQPullConsumer::fetchMessageQueuesInBalance(
     if (!computed) {
         logger_debug("fetchMessageQueuesInBalance: no route/consumer list for " + consumerGroup_
                      + "/" + topic + ", keep current assignment");
+        // The assignment could not be recomputed, so nothing moved and the listener stays quiet --
+        // unless the pull threads' own view differs from the one last handed out.
+        notifyAssignmentChanged(topic, allOfTopic, pulled);
         return pulled;
     }
 
@@ -246,7 +259,68 @@ std::vector<MessageQueue> DefaultMQPullConsumer::fetchMessageQueuesInBalance(
                          mq.queueId));
     }
     std::sort(result.begin(), result.end());
+    notifyAssignmentChanged(topic, allOfTopic, result);
     return result;
+}
+
+bool DefaultMQPullConsumer::assignmentChanged(const std::vector<MessageQueue>& before,
+                                              const std::vector<MessageQueue>& after) {
+    // A queue set, so a re-ordering of the same queues is not a change and a same-count swap to
+    // another broker is one.
+    return std::set<MessageQueue>(before.begin(), before.end())
+        != std::set<MessageQueue>(after.begin(), after.end());
+}
+
+bool DefaultMQPullConsumer::notifyAssignmentChanged(
+    const std::string& topic, const std::vector<MessageQueue>& all,
+    const std::vector<MessageQueue>& divided) {
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lk(assignmentNotifyMutex_);
+        auto it = lastBalancedQueues_.find(topic);
+        if (it == lastBalancedQueues_.end()) {
+            // The first view only reports a change when this consumer actually owns queues: an empty
+            // opening has nothing for the application to react to.
+            changed = assignmentChanged(std::vector<MessageQueue>(), divided) && !divided.empty();
+        } else {
+            changed = assignmentChanged(it->second, divided);
+        }
+        lastBalancedQueues_[topic] = divided;
+    }
+    if (!changed) {
+        return false;
+    }
+    std::shared_ptr<MessageQueueListener> perTopic;
+    std::shared_ptr<MessageQueueListener> global;
+    {
+        std::lock_guard<std::mutex> lk(assignmentNotifyMutex_);
+        auto it = messageQueueListeners_.find(topic);
+        if (it != messageQueueListeners_.end()) {
+            perTopic = it->second;
+        }
+        global = messageQueueListener_;
+    }
+    if (perTopic != nullptr) {
+        try {
+            perTopic->messageQueueChanged(topic, all, divided);
+        } catch (const std::exception& e) {
+            logger_error("message queue listener failed for " + topic + ": " + e.what());
+        } catch (...) {
+            logger_error("message queue listener failed for " + topic);
+        }
+    }
+    // The single listener is a different sink from the topic-keyed one; it is skipped only when the
+    // application handed the same object to both.
+    if (global != nullptr && global != perTopic) {
+        try {
+            global->messageQueueChanged(topic, all, divided);
+        } catch (const std::exception& e) {
+            logger_error("message queue listener failed for " + topic + ": " + e.what());
+        } catch (...) {
+            logger_error("message queue listener failed for " + topic);
+        }
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------- Pull

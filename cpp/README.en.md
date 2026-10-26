@@ -50,15 +50,15 @@ cd build && ctest --output-on-failure
 ```
 
 This produces the static library `build/librocketmq_remoting.a` (alias `rocketmq::remoting`),
-67 test binaries and 44 tools under `build/examples/`. Measured on this machine:
+68 test binaries and 44 tools under `build/examples/`. Measured on this machine:
 
 ```
-100% tests passed out of 68
-Total Test time (real) = 100.25 sec
+100% tests passed out of 69
+Total Test time (real) = 124.59 sec
 ```
 
-The 68 cases are the 67 test binaries (8025 assertions) plus 1 codec-interop case
-(73 assertions): **8098 assertions in total**.
+The 69 cases are the 68 test binaries (8141 assertions) plus 1 codec-interop case
+(73 assertions): **8214 assertions in total**.
 
 The protocol-layer self-check needs no cluster:
 
@@ -269,6 +269,52 @@ consumer.setPopBatchNums(16);
 consumer.setPopThresholdForQueue(96);   // this queue's outstanding-ACK ceiling, trips strictly above it; a trip counts on the pull path's shared flow-control total
 ```
 
+The cache gates judged before a pull (all three refuse only when strictly above their threshold;
+0 is not a legal value here -- start-up `checkConfig` rejects it -- and a gate only ever reads its own
+queue's held amount, never an aggregate over the topic):
+
+```cpp
+consumer.setPullThresholdForQueue(1000);              // held = the not-yet-dispatched buffer UNION the batches handed to the listener and not settled yet (deduplicated by queueOffset)
+consumer.setPullThresholdSizeForQueue(100);           // whole MiB of the held messages' BODY (body length summed, never storeSize; 1.9 MiB reads as 1)
+consumer.setConsumeConcurrentlyMaxSpan(2000);         // held offset span max-min; an orderly consumer does not judge this one at all
+consumer.setPullThresholdForTopic(-1);                // topic budget: -1 disables it, a positive number is divided into the first gate at rebalance
+consumer.setPullThresholdSizeForTopic(-1);            // same, divided into the second gate
+```
+
+The divisor is the number of queues this instance currently holds live pull state for (`mqMap_` on the
+classic pull path, `popQueues_` under POP, counted across every subscribed topic); the quotient is floored
+at 1. While a budget is enabled it deliberately overwrites the per-queue value the user set, so the getter
+afterwards reports the quotient. A refusal re-schedules only this queue for
+`kPullPauseWhenClientFlowControl` = 50ms, while the broker's `FLOW_CONTROL`(215) waits
+`kPullPauseWhenBrokerFlowControl` = 20ms; the client-side flow-control total and the warn cadence
+(trips 1, 1001, 2001, ... warn, everything else debug) are shared with the POP path.
+
+When a rebalance round changes the queue SET of a topic (growth, shrink, a same-count hand-over to another
+broker, a topic that appears or disappears; re-ordering the same set is not a change) that round pays four
+duties in order: restamp the subscription version of the MOVED topics only (wall-clock ms, log line
+`<topic> rebalance changed, also update version: <old>, <new>`) -> divide the topic budgets into the
+per-queue thresholds using this round's queue count -> send one immediate heartbeat to every broker (the
+broker caches this subscription's filtered result by version, so it must not wait for the next periodic
+beat) -> tell the application's `MessageQueueListener` about the moved topics only. A round where every set
+stayed the same, and a stall self-heal round, pay nothing.
+
+```cpp
+#include "rocketmq/client/message_queue_listener.h"
+
+class QueueHandover : public MessageQueueListener {
+public:
+    void messageQueueChanged(const std::string& topic, const std::vector<MessageQueue>& mqAll,
+                             const std::vector<MessageQueue>& mqDivided) override {
+        // mqAll is every queue of this topic in the route, mqDivided this instance's share of it
+    }
+};
+consumer.setMessageQueueListener(std::make_shared<QueueHandover>());
+```
+
+`DefaultMQPullConsumer` has no background rebalance -- the caller supplies the queue set, so it owes only
+the notification half: the same callback fires when its own balance view changes (compared as sets), with
+no version restamp and no extra heartbeat.
+
 Also available: `suspend()` / `resume()`, `setPullBatchSize` / `setPullThresholdForQueue`
 (pre-pull flow control), `setAllocateMessageQueueStrategy` (six queue-allocation strategies),
 `registerConsumeMessageHook` / `registerCheckForbiddenHook` / `registerFilterMessageHook`,
@@ -320,6 +366,25 @@ while (running) {
 lite.commit();
 lite.shutdown();
 ```
+
+Four cache gates are judged before the pull offset is resolved (`pullBatchSize` defaults to 10, each gate
+refuses only when strictly above its threshold, and a refusal re-schedules just this queue; these four
+numbers are not validated at start-up on the lite consumer -- 0 is legal there and trips on the first
+cached message):
+
+```cpp
+lite.setPullThresholdForAll(10000);       // whole buffer: pending pull rounds x pullBatchSize, a capacity projection summed over every queue's accumulator
+lite.setPullThresholdForQueue(1000);      // this queue's cached message count
+lite.setPullThresholdSizeForQueue(100);   // this queue's cached BODY bytes as whole MiB (body length summed, never storeSize)
+lite.setConsumeMaxSpan(2000);             // this queue's cached offset span max-min
+```
+
+The counters are split: this queue's count and size share one, the capacity projection has its own, the
+span has its own, and the warn cadence is the same rule as the push path (trips 1, 1001, 2001, ... warn,
+everything else debug). When a queue is revoked -- by a narrowing `assign()`, by the background rebalance
+round, or by the pull round's backstop prune, all three through one implementation -- its buffered rows and
+its pending rounds leave the buffer together, so a queue this instance no longer owns neither polls to the
+caller nor keeps reserving aggregate budget.
 
 Queue-change listener (compared in the background every `topicMetadataCheckIntervalMillis`;
 the callback fires only when the set actually changed):
@@ -454,12 +519,18 @@ reader thread and the caller's writing thread overlap on the same SSL session).
 - ✅ Consumers: `DefaultMQPushConsumer` (concurrent, ordered, broadcasting, POP),
   `DefaultMQPullConsumer` (short and long polling, offset tables, heartbeat),
   `DefaultLitePullConsumer` (subscribe and assign modes, seek, three offset tables, queue-change
-  listener, and four cache gates judged before the pull offset is resolved: whole-buffer count
-  `setPullThresholdForAll` 10000 / this queue's count `setPullThresholdForQueue` 1000 / this
-  queue's stored bytes `setPullThresholdSizeForQueue` 100 MiB with integer division / this
-  queue's offset span `setConsumeMaxSpan` 2000, each refusing only when strictly above its
-  threshold; a refusal re-schedules just this queue for `kPullPauseWhenClientFlowControl` = 50ms
-  while the broker's `FLOW_CONTROL`(215) waits `kPullPauseWhenBrokerFlowControl` = 20ms)
+  listener, and four cache gates judged before the pull offset is resolved: whole-buffer capacity
+  projection `setPullThresholdForAll` 10000 (pending pull rounds x `pullBatchSize`, default 10) /
+  this queue's count `setPullThresholdForQueue` 1000 / this queue's body bytes `setPullThresholdSizeForQueue`
+  100 as whole MiB / this queue's offset span `setConsumeMaxSpan` 2000, each refusing only when strictly
+  above its threshold; a revoked queue's cache and its pending rounds are deleted together; a refusal
+  re-schedules just this queue for `kPullPauseWhenClientFlowControl` = 50ms
+  while the broker's `FLOW_CONTROL`(215) waits `kPullPauseWhenBrokerFlowControl` = 20ms),
+  the push side's three cache gates (the held count includes the batches already handed to the listener,
+  the size is whole MiB of body, the span is not judged for orderly consumption, and the topic budgets are
+  divided into them by queue count at rebalance), and the assignment-change round (restamp the version of
+  the moved topics only -> divide the budgets -> one immediate heartbeat -> notify only the moved topics
+  through `MessageQueueListener`; an unchanged round and a self-heal round pay none of it)
 - ✅ Queue allocation: AVG / AVG_BY_CIRCLE / CONFIG / CONSISTENT_HASH / MACHINE_ROOM /
   MACHINE_ROOM_NEARBY, replaceable on all three consumers
 - ✅ `DefaultMQAdminExt`: topic and subscription-group CRUD, consume progress, connection info,
@@ -597,7 +668,7 @@ cpp/
 │                               admin / mq_client / allocate_strategy / hook / trace /
 │                               request_reply / backpressure / validators / result / exception
 ├── src/                        Implementations mirroring include/ (common / remoting / client)
-├── tests/                      67 test sources + interop_check.py = 68 ctest cases
+├── tests/                      68 test sources + interop_check.py = 69 ctest cases
 ├── examples/                   rmq_selfcheck / rmq_interop + 41 live-cluster tools
 └── tools/                      Windows header preparation and syntax-check scripts
 ```
