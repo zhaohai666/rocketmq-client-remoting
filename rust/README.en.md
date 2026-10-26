@@ -31,7 +31,7 @@ code-generation step.
 ```bash
 cd rust
 cargo build --all-targets                       # lib + 42 examples
-cargo test --quiet                              # 1127 passed; 0 failed; 0 ignored (~10s)
+cargo test --quiet                              # 1135 passed; 0 failed; 0 ignored (~10s)
 cargo clippy --all-targets --all-features -- -D warnings  # zero warnings is a hard gate
 ```
 
@@ -275,13 +275,32 @@ verification); for production set it to `false` and configure the system trust c
   broadcasting, retry / dead-letter, offset persistence, pull-stall self-healing, POP's
   outstanding-ACK gate (strictly above `pop_threshold_for_queue`, default 96, a trip counted on the
   pull path's one client-wide flow-control total and warn cadence)
+- ✅ PushConsumer: long polling + POP (`POP_CK` / ACK / CHANGE_INVISIBLE), ordering,
+  broadcasting, retry / dead-letter, offset persistence, pull-stall self-healing, POP's
+  outstanding-ACK gate (strictly above `pop_threshold_for_queue`, default 96, a trip counted on the
+  pull path's one client-wide flow-control total and warn cadence)
+- ✅ PushConsumer's three per-queue cache gates, judged in the fixed order count → size → span: they
+  read the queue's whole **pulled-but-unsettled** held set (the buffered rows plus the batch already
+  handed to the listener, deduplicated by `queueOffset`), the size gate divides message **body**
+  bytes by whole MiB, and the span gate is skipped for an orderly listener. All three compare
+  strictly above their threshold and the configured number is used as it stands — no floor
+  clamping, no value that switches a gate off; the legal range is owned by start-up `checkConfig`
+- ✅ PushConsumer's assignment-change settlement: a round pays only when a topic's assigned queue
+  SET actually moved (growth / shrink / a same-count hand-over to another broker / a topic appearing
+  or vanishing), and then in one order — re-stamp the subscription version of the moved topics only
+  (one wall-clock millisecond per round) with one INFO line, divide each topic cache budget by the
+  queue count alive this round, send one immediate heartbeat to every broker, and report exactly the
+  moved topics to the queue-change listener registered by `set_message_queue_listener`; a round whose
+  sets did not move pays none of the four
 - ✅ PullConsumer / LitePullConsumer (incl. queue-change listener, three offset tables,
   pause / resume; LitePull judges four cache gates before the pull offset is resolved —
-  whole-buffer count `pull_threshold_for_all` 10000 / this queue's count
-  `pull_threshold_for_queue` 1000 / this queue's stored bytes
+  the buffer's pending-round projection `pending rounds × pull_batch_size` (default 10) against
+  `pull_threshold_for_all` 10000 / this queue's count
+  `pull_threshold_for_queue` 1000 / this queue's body bytes
   `pull_threshold_size_for_queue` 100 MiB with integer division / this queue's offset span
   `consume_max_span` 2000, each refusing only when strictly above its threshold; a refusal
-  re-schedules just this queue 50ms later while the broker's `FLOW_CONTROL`(215) waits 20ms)
+  re-schedules just this queue 50ms later while the broker's `FLOW_CONTROL`(215) waits 20ms;
+  a revoked queue loses its cache and its reserved rounds together)
 - ✅ Six queue allocation strategies (AVG / AVG_BY_CIRCLE / CONFIG / CONSISTENT_HASH /
   MACHINE_ROOM / MACHINE_ROOM_NEARBY), pluggable and driven by real rebalancing
 - ✅ The full Admin chain (topic / cluster / consume stats / offset reset / queue locks /

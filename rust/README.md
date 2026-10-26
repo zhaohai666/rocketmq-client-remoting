@@ -26,7 +26,7 @@ NameServer + Broker，无 proxy、无本地扩展依赖、无代码生成步骤�
 ```bash
 cd rust
 cargo build --all-targets                       # lib + 42 个 examples
-cargo test --quiet                              # 1127 passed; 0 failed; 0 ignored（~10s）
+cargo test --quiet                              # 1135 passed; 0 failed; 0 ignored（~10s）
 cargo clippy --all-targets --all-features -- -D warnings  # 零 warning 是硬门槛
 ```
 
@@ -252,11 +252,13 @@ ROCKETMQ_TLS_ENABLE=1 cargo run --quiet --example live_producer -- 127.0.0.1:987
 - ✅ Producer：上表九种发送形态全覆盖
 - ✅ PushConsumer：长轮询 + POP（`POP_CK` / ACK / CHANGE_INVISIBLE）、顺序、广播、
   重试 / 死信、位点持久化、拉取停摆自愈、POP 的待 ack 欠账闸门（严格大于 `pop_threshold_for_queue`，默认 96，命中记进拉取路径同一个流控计数与告警节奏）
+- ✅ PushConsumer 每队列三道缓存闸门，按条数 → 字节 → 跨度固定顺序判：读的是这条队列**已拉未结**的整个持有集（缓冲里的 + 已经交给 listener 的那一批，按 `queueOffset` 去重），字节按消息 **body** 整除 MiB，跨度只对并发 listener 判；三条都是严格大于才停，配置原样生效——没有下限夹取，也没有"取某个值就关掉闸门"的出口，合法区间由启动期 `checkConfig` 守住
+- ✅ PushConsumer 的分配变化结算：只有某个 topic 的分配集合真的动了（增 / 减 / 同数量换 broker / 出现或消失）才付四件事，且按固定顺序——只给动了的 topic 重打订阅版本号（一轮一个墙钟毫秒）并打一条 INFO、把 topic 缓存预算除以本轮活着的队列数、立刻向所有 broker 发一次心跳、只把动了的 topic 报给 `set_message_queue_listener` 注册的队列变更监听；集合没动的轮次四件事一件都不付
 - ✅ PullConsumer / LitePullConsumer（含队列变更监听、三张位点表、pause / resume；LitePull
-  解析拉取位点前先过四道缓存闸门——整个缓冲条数 `pull_threshold_for_all` 10000 / 本队列条数
-  `pull_threshold_for_queue` 1000 / 本队列存储字节 `pull_threshold_size_for_queue` 100 MiB
+  解析拉取位点前先过四道缓存闸门——整个缓冲的待发轮次投影 `pending rounds × pull_batch_size`（默认 10）对 `pull_threshold_for_all` 10000 / 本队列条数
+  `pull_threshold_for_queue` 1000 / 本队列 body 字节 `pull_threshold_size_for_queue` 100 MiB
   整除 / 本队列位点跨度 `consume_max_span` 2000，都严格大于才停；命中只重排这一个队列 50ms，
-  broker 的 `FLOW_CONTROL`(215) 只等 20ms）
+  broker 的 `FLOW_CONTROL`(215) 只等 20ms；被收回的队列连缓存带轮次一起销账）
 - ✅ 六个队列分配策略（AVG / AVG_BY_CIRCLE / CONFIG / CONSISTENT_HASH / MACHINE_ROOM /
   MACHINE_ROOM_NEARBY），可插拔并由真实重平衡驱动
 - ✅ Admin 全链路（topic / cluster / 消费统计 / 位点重置 / 锁队列 / 清理）
