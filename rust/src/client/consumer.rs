@@ -247,9 +247,10 @@ impl MessageSelector {
 
 /// Queue-change listener.
 ///
-/// Only `DefaultMQPullConsumer` / `DefaultLitePullConsumer` hold this listener field,
-/// and only LitePull actually invokes the callback; the push consumer has no such seam.
-/// The seam implementation lives in [`crate::client::pull_consumer`].
+/// Held by all three consumers: the push consumer fires it from
+/// [`DefaultMQPushConsumer::after_assignment_change`] for the topics whose assigned queue SET
+/// moved, the lite-pull consumer from its rebalance step, and the classic pull consumer
+/// ([`crate::client::pull_consumer::DefaultMQPullConsumer`]) from the queue set its caller supplies.
 pub trait MessageQueueListener: Send + Sync {
     /// Called when the queue assignment changes. `mq_all` is every queue of the topic,
     /// `mq_divided` is the queues assigned to this instance.
@@ -582,11 +583,15 @@ pub(crate) fn consume_timestamp_millis(text: &str) -> Result<i64> {
 /// The numeric part of start-up configuration validation: thirteen range/size gates, where **both the order and the bounds are the criterion**
 /// (by convention no error text carries a FAQUrl suffix).
 ///
-/// Why reject in `start()` instead of clamping each field itself: these values directly decide the buffer watermark and the thread pool size,
-/// and every wrong direction is **silent** -- `pull_threshold_*=0` is clamped by `max(1,n)` at runtime into
-/// "stop after 1 message", so the queue stops pulling forever while the consumer reports no error; `pop_batch_nums>32` makes the broker answer
+/// Why reject in `start()` instead of softening each field at the gate: these values directly decide
+/// the buffer watermark and the thread pool size, and every wrong direction is **silent** -- a
+/// `pull_threshold_*=0` reaching the cache gate means "nothing may be cached", so the very first
+/// held message pauses the pull forever while the consumer reports no error;
+/// `pop_batch_nums>32` makes the broker answer
 /// `INVALID_PARAMETER` and the POP loop degenerates into error retries; huge values bypass the flow-control checks until OOM. Putting
 /// the gates at start-up means rejecting everything at once, **before any instance is created or any task started**.
+/// In other words: the legal range of every cache knob is owned here, and the gates read the
+/// configured number as it stands, with no floor and no "0 switches me off" escape.
 ///
 /// Two easy-to-get-wrong "asymmetries" must be respected, otherwise valid configurations get rejected:
 /// * for `pull_threshold_for_topic` / `pull_threshold_size_for_topic`, `-1` is the
@@ -750,6 +755,10 @@ struct Inner {
     /// takes the "wait a bounded time for it to finish the current batch" route (see the finalize task of [`DefaultMQPushConsumer::shutdown`]).
     dispatch_task: Mutex<Option<JoinHandle<()>>>,
     listener: Mutex<Option<MessageListener>>,
+    /// The application's queue-change listener, fired for the topics whose assignment SET moved.
+    ///
+    /// A change notification, not a periodic report: an unchanged round calls it zero times.
+    queue_listener: Mutex<Option<Arc<dyn MessageQueueListener>>>,
     strategy: RwLock<Arc<dyn AllocateMessageQueueStrategy>>,
     consume_hooks: ConsumeMessageHookList,
     filter_hooks: FilterMessageHookList,
@@ -798,6 +807,10 @@ pub const PULL_TIME_DELAY_MILLS_WHEN_SUSPEND: u64 = 1000;
 /// A throttled queue trips a cache gate on every pull round, so warning every round buries the
 /// signal: only every Nth trip warns.
 pub const FLOW_CONTROL_WARN_EVERY: usize = 1000;
+/// One MiB. Every cached-size gate in this client states its threshold in **whole MiB of message
+/// body**, so the comparison runs on the integer division result and a partially filled MiB of
+/// backlog never costs a unit of the budget.
+pub(crate) const CACHE_SIZE_GATE_MIB: i64 = 1024 * 1024;
 
 /// Whether the n-th (1-based) flow-control trip is one that logs a warn: the 1st, then every
 /// [`FLOW_CONTROL_WARN_EVERY`]-th trip after it.
@@ -925,6 +938,7 @@ impl DefaultMQPushConsumer {
             tasks: Mutex::new(Vec::new()),
             dispatch_task: Mutex::new(None),
             listener: Mutex::new(None),
+            queue_listener: Mutex::new(None),
             strategy: RwLock::new(Arc::new(AllocateMessageQueueAveragely)),
             consume_hooks: ConsumeMessageHookList::new(),
             filter_hooks: FilterMessageHookList::new(),
@@ -1125,6 +1139,15 @@ impl DefaultMQPushConsumer {
         lock(&self.inner.client)
             .clone()
             .ok_or_else(|| Error::client("consumer not started, call start() first"))
+    }
+
+    /// Register the application's queue-change listener.
+    ///
+    /// It hears about the topics whose assigned queue SET moved (growth, shrink, a same-count
+    /// hand-over to a different broker, a topic that appears or disappears); a round that re-pulled
+    /// the same queues calls it zero times.
+    pub fn set_message_queue_listener(&self, listener: Arc<dyn MessageQueueListener>) {
+        *lock(&self.inner.queue_listener) = Some(listener);
     }
 
     /// Register a message listener (concurrent or orderly).
@@ -1899,6 +1922,64 @@ impl DefaultMQPushConsumer {
         queues
     }
 
+    /// Everything a rebalance round whose per-topic assignment SET moved owes, in one order that
+    /// cannot drift, and only **after** [`rebalance_pull_threads`] rebuilt the per-queue pull state
+    /// (that call is the sole writer of the table the divisor is read from, so dividing earlier
+    /// would divide by the *previous* round's queue count -- a shrink from 4 queues to 2 must
+    /// divide by 2).
+    ///
+    /// 1. the moved topics' subscription version is re-stamped with one wall-clock millisecond
+    ///    stamp shared by the round;
+    /// 2. the topic cache budgets are divided over this round's queue count;
+    /// 3. one immediate heartbeat goes out to every broker, because the broker keys the filtered
+    ///    result it caches for a subscription by its version -- a moved topic must not wait for the
+    ///    next periodic beat;
+    /// 4. the application's queue-change listener hears about exactly the moved topics, each with
+    ///    that topic's full route queue set and this instance's share.
+    ///
+    /// An unchanged round pays nothing, and neither does a stall self-heal round: the listener is a
+    /// change notification, not a heartbeat.
+    async fn after_assignment_change(&self, moved: &[String]) {
+        if moved.is_empty() {
+            return;
+        }
+        for line in restamp_subscription_versions(&self.inner, moved, current_time_millis()) {
+            rmq_info!("{line}");
+        }
+        self.divide_topic_thresholds();
+        let brokers = heartbeat_once(&self.inner).await;
+        if brokers == 0 {
+            rmq_debug!("no broker reachable for the rebalance-change heartbeat");
+        }
+        self.notify_queue_changed(moved).await;
+    }
+
+    /// Fire the application's queue-change listener for the moved topics only.
+    ///
+    /// The callback signature is `(topic, mqAll, mqDivided)`: the topic's FULL queue set from the
+    /// route plus this instance's share of it, so the application can tell a rebalance from a route
+    /// change without asking again.
+    async fn notify_queue_changed(&self, moved: &[String]) {
+        let listener = lock(&self.inner.queue_listener).clone();
+        let Some(listener) = listener else {
+            return;
+        };
+        let by_topic: BTreeMap<String, Vec<MessageQueue>> = {
+            let state = lock(&self.inner.state);
+            let mut map: BTreeMap<String, Vec<MessageQueue>> = BTreeMap::new();
+            for mq in &state.assigned {
+                map.entry(mq.topic.clone()).or_default().push(mq.clone());
+            }
+            map
+        };
+        for topic in moved {
+            let mq_all = self.all_queues_of_topic(topic).await;
+            let empty: Vec<MessageQueue> = Vec::new();
+            let divided = by_topic.get(topic).unwrap_or(&empty);
+            listener.message_queue_changed(topic, &mq_all, divided);
+        }
+    }
+
     /// BROADCASTING keeps every queue for itself; CLUSTERING queries the consumer list on the broker -> sorts ->
     /// applies the allocation strategy. **When the consumer list cannot be fetched, the current assignment is kept** (never
     /// falling back to "monopolize all queues", otherwise multiple instances of one group would consume the same messages).
@@ -1906,11 +1987,8 @@ impl DefaultMQPushConsumer {
         let client = require_client(&self.inner)?;
         let group = self.consumer_group();
         let cfg = self.config();
-        let was: BTreeSet<String> = lock(&self.inner.state)
-            .assigned
-            .iter()
-            .map(mq_key)
-            .collect();
+        let was_queues: Vec<MessageQueue> = lock(&self.inner.state).assigned.clone();
+        let was: BTreeSet<String> = was_queues.iter().map(mq_key).collect();
         let topics: Vec<String> = lock(&self.inner.state)
             .subscription_data
             .iter()
@@ -2003,13 +2081,16 @@ impl DefaultMQPushConsumer {
             let mut state = lock(&self.inner.state);
             state.assigned = assigned.clone();
         }
-        let now: BTreeSet<String> = assigned.iter().map(mq_key).collect();
-        let changed = now != was;
-        if changed {
+        // The change is judged per topic on the **set of queue keys**, not on the instance total:
+        // growth, shrink, a same-count hand-over to a different broker, a topic that appears and a
+        // topic that disappears all count, while a re-ordering of the same set does not.
+        let moved = changed_topics(&queues_by_topic(&was_queues), &queues_by_topic(&assigned));
+        if !moved.is_empty() {
             rmq_info!(
-                "rebalance result changed, group={group} clientId={} assigned={}",
+                "rebalance result changed, group={group} clientId={} assigned={} topics={}",
                 cfg.client_id.clone().unwrap_or_default(),
-                assigned.len()
+                assigned.len(),
+                moved.join(",")
             );
         }
         for mq in &assigned {
@@ -2026,8 +2107,8 @@ impl DefaultMQPushConsumer {
             }
         }
         self.rebalance_pull_threads().await;
-        // Divide the topic-level cache budgets into the per-queue knobs, but only when this round
-        // actually moved the assignment **and** only after the pull-state update above.
+        // Everything the moved set owes is paid in one place, in one order that cannot drift, and
+        // only **after** the pull-state update above.
         //
         // The order is load-bearing: `rebalance_pull_threads` is the sole writer of the per-queue
         // table the divisor is read from (it registers a queue when it builds that queue's pull loop
@@ -2036,10 +2117,10 @@ impl DefaultMQPushConsumer {
         //
         // The broker-side assignment path (`assigned_from_broker`, POP mode) needs no call site of
         // its own: it only hands the queue set back into `state.assigned` and never touches
-        // `queue_owners` / `pop_queues`, so this one change-gated call already covers it.
-        if changed {
-            self.divide_topic_thresholds();
-        }
+        // `queue_owners` / `pop_queues`, so this one change-gated call already covers it. An
+        // unchanged round -- including one that only self-heals a stalled pull loop -- pays nothing,
+        // because `moved` is empty and the whole duty list is gated on it.
+        self.after_assignment_change(&moved).await;
         Ok(())
     }
 
@@ -2760,42 +2841,72 @@ fn update_msg_acc_cnt(inner: &Inner, key: &str, msgs: &[MessageExt]) {
 
 /// Whether the cache gates pause this queue's pull.
 ///
-/// The gate judges **one queue's own buffer** against exactly three per-queue gates (count / size /
-/// offset span). A topic-level budget is **not** aggregated here at all: it is divided into the
-/// per-queue knob at rebalance time
+/// The gate judges **one queue's own held set** against exactly three per-queue gates, checked in
+/// one fixed order: message **count**, then **size**, then offset **span**. A topic-level budget is
+/// **not** aggregated here at all: it is divided into the per-queue knob at rebalance time
 /// ([`DefaultMQPushConsumer::divide_topic_thresholds`]), so the pull path never has to look at --
 /// or wait on a lock held for -- its sibling queues.
 ///
-/// Every gate compares **strictly greater than** its threshold, so a buffer that has reached the
-/// threshold exactly is still allowed to pull and a threshold reads as "how many may be cached".
+/// Every gate compares **strictly greater than** its threshold, with the threshold taken exactly as
+/// it stands: no floor of 1 and no "0 switches this gate off" escape. A queue that has reached a
+/// threshold exactly is therefore still allowed to pull, so the knobs read as "how many may stay
+/// cached", not "how many stop the pull". Keeping each knob inside its legal range is
+/// [`check_config_ranges`]'s job at start-up, not this gate's.
+///
+/// What all three measure is everything this queue still **holds**: the pulled-but-undispatched
+/// buffer union the batches already handed to the listener and not yet settled
+/// ([`process_queue_entries_locked`], deduplicated by `queue_offset`). A dispatched batch has only
+/// moved, it has not left the queue -- it leaves when it settles through an ack/complete or is
+/// requeued. Because the dispatch window is ordered, the batch in the listener's hands carries the
+/// **lower** queue offsets of the two parts, so the span reads the same held set too. A gate that
+/// judged the buffer alone would under-count and keep pulling while the listener still sits on
+/// messages, which is exactly the situation these thresholds exist to stop.
+///
+/// The size term is the integer (truncating) whole MiB of the held messages' **body** bytes. The
+/// stored-record size a broker charges for the whole storage record is a telemetry number, not
+/// something this client holds in memory, and it never enters this comparison.
+///
+/// The one per-term difference is that the **span gate does not run at all for an orderly
+/// listener**: the knob is named after concurrent consumption, and an orderly queue has no
+/// run-ahead to guard against because its pull cursor only moves once the batch in the listener's
+/// hands has settled -- so the orderly path leaves its buffer wide rather than stalling
+/// head-of-line. Count and size still bind it, over the same held set.
 fn flow_control_hit(inner: &Inner, key: &str) -> bool {
     let cfg = read_cfg(inner);
-    let (count, size_mb, span) = {
+    let orderly = lock(&inner.listener)
+        .as_ref()
+        .is_some_and(MessageListener::is_orderly);
+    let (count, size_mib, span) = {
         let state = lock(&inner.state);
-        let dq: &VecDeque<MessageExt> = state.pending.get(key).unwrap_or(&EMPTY_DEQUE);
-        let count = dq.len();
-        let size_mb =
-            dq.iter().map(|m| i64::from(m.store_size)).sum::<i64>() as f64 / (1024.0 * 1024.0);
-        let span = if dq.is_empty() {
+        let held = process_queue_entries_locked(&state, key);
+        let count = held.len();
+        let body_bytes = held
+            .iter()
+            .map(|m| i64::try_from(m.get_body().len()).unwrap_or(i64::MAX))
+            .sum::<i64>();
+        let size_mib = body_bytes / CACHE_SIZE_GATE_MIB;
+        let span = if held.is_empty() {
             0
         } else {
             let mut min = i64::MAX;
             let mut max = i64::MIN;
-            for m in dq {
+            for m in &held {
                 min = min.min(m.queue_offset);
                 max = max.max(m.queue_offset);
             }
             max - min
         };
-        (count, size_mb, span)
+        (count, size_mib, span)
     };
-    let reason: Option<String> = if count > cfg.pull_threshold_for_queue.max(1) as usize {
+    // Widened to `i64` before comparing: the counts come from `usize` and the knobs are signed,
+    // and a comparison that silently rebased a negative knob onto the unsigned axis would turn a
+    // hand-built config into "this gate never trips".
+    let count = i64::try_from(count).unwrap_or(i64::MAX);
+    let reason: Option<String> = if count > i64::from(cfg.pull_threshold_for_queue) {
         Some(format!("count={count}"))
-    } else if cfg.pull_threshold_size_for_queue > 0
-        && size_mb > f64::from(cfg.pull_threshold_size_for_queue)
-    {
-        Some(format!("size={size_mb:.1}MB"))
-    } else if cfg.consume_concurrently_max_span > 0 && span > cfg.consume_concurrently_max_span {
+    } else if size_mib > i64::from(cfg.pull_threshold_size_for_queue) {
+        Some(format!("size={size_mib}MB"))
+    } else if !orderly && span > cfg.consume_concurrently_max_span {
         Some(format!("span={span}"))
     } else {
         None
@@ -2815,8 +2926,6 @@ fn flow_control_hit(inner: &Inner, key: &str) -> bool {
         }
     }
 }
-
-static EMPTY_DEQUE: VecDeque<MessageExt> = VecDeque::new();
 
 /// The POP path's cache gate: **this queue's own** popped-but-unacked debt, compared strictly
 /// greater than `pop_threshold_for_queue` (default 96).
@@ -2847,6 +2956,86 @@ fn pop_flow_control_hit(inner: &Inner, key: &str, pq: &PopProcessQueue) -> bool 
         );
     }
     true
+}
+
+/// Group a queue list as topic -> the set of queue **keys** owned there.
+///
+/// The rebalance change detection compares these per-topic sets and never a count: losing one
+/// queue and gaining another keeps the total while changing which buffers exist, so the budgets
+/// have to be re-divided over the new set and the broker has to learn about the queues this client
+/// just picked up.
+pub(crate) fn queues_by_topic(queues: &[MessageQueue]) -> BTreeMap<String, BTreeSet<String>> {
+    let mut grouped: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for mq in queues {
+        grouped
+            .entry(mq.topic.clone())
+            .or_default()
+            .insert(mq_key(mq));
+    }
+    grouped
+}
+
+/// The sorted topics whose assigned-queue SET differs between two rebalance rounds.
+///
+/// A topic that appeared or vanished entirely counts too: its queues moved. A re-ordering of the
+/// same set is **not** a move -- the identity of the owned queues is what the duties below key on,
+/// and the sort order is decided by the strategy, not by ownership.
+pub(crate) fn changed_topics(
+    before: &BTreeMap<String, BTreeSet<String>>,
+    after: &BTreeMap<String, BTreeSet<String>>,
+) -> Vec<String> {
+    before
+        .keys()
+        .chain(after.keys())
+        .cloned()
+        .collect::<BTreeSet<String>>()
+        .into_iter()
+        .filter(|topic| {
+            before.get(topic).unwrap_or(&EMPTY_KEY_SET) != after.get(topic).unwrap_or(&EMPTY_KEY_SET)
+        })
+        .collect()
+}
+
+static EMPTY_KEY_SET: BTreeSet<String> = BTreeSet::new();
+
+/// Re-share the subscription version of the topics whose assignment moved and return the INFO
+/// lines to emit (`"<topic> rebalance changed, also update version: <old>, <new>"`).
+///
+/// The version is what makes a broker re-read a subscription instead of reusing the filtered result
+/// it cached for the old generation, so a topic whose queues moved must look new to the broker even
+/// when the filter expression did not change. Topics that did not move keep their version:
+/// re-stamping the whole table would put subscriptions the broker already holds back on the wire on
+/// every changed round, and would also make a moved topic impossible to tell apart from an unmoved
+/// one in the beat that follows.
+///
+/// One wall-clock millisecond stamp is shared by the round, so two moved topics never carry two
+/// versions from the same rebalance. The subscription table holds the very values the heartbeat
+/// builder serialises, so writing here is what makes the next beat carry the fresh version.
+fn restamp_subscription_versions(
+    inner: &Inner,
+    moved: &[String],
+    new_version: i64,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if moved.is_empty() {
+        return lines;
+    }
+    let mut state = lock(&inner.state);
+    for topic in moved {
+        let Some((_, sub)) = state
+            .subscription_data
+            .iter_mut()
+            .find(|(k, _)| k == topic)
+        else {
+            continue;
+        };
+        lines.push(format!(
+            "{topic} rebalance changed, also update version: {}, {new_version}",
+            sub.sub_version
+        ));
+        sub.sub_version = new_version;
+    }
+    lines
 }
 
 /// Divide one enabled topic budget over `owned` queues and state the result with the literal
@@ -6369,8 +6558,24 @@ mod tests {
         MessageQueue::new(topic, broker, id)
     }
 
-    fn sized_msg(store_size: i32, queue_offset: i64) -> MessageExt {
+    /// A message whose cached cost is `size` bytes: the **body** is that long, and `store_size`
+    /// carries the same number so a fixture that only cares about the count cannot accidentally be
+    /// reading one field or the other.
+    fn sized_msg(size: i32, queue_offset: i64) -> MessageExt {
         let mut m = ext("T", None);
+        let body = vec![b'x'; usize::try_from(size).unwrap_or(0)];
+        m.set_body(Some(&body));
+        m.store_size = size;
+        m.queue_offset = queue_offset;
+        m
+    }
+
+    /// A message whose two size fields disagree -- the fixture the size gate needs, because a
+    /// `store_size` the broker charges for the whole storage record must never be the number that
+    /// refuses a pull.
+    fn split_size_msg(body_len: usize, store_size: i32, queue_offset: i64) -> MessageExt {
+        let mut m = ext("T", None);
+        m.set_body(Some(&vec![b'x'; body_len]));
         m.store_size = store_size;
         m.queue_offset = queue_offset;
         m
@@ -6383,12 +6588,29 @@ mod tests {
         state.pending.insert(key, msgs.into_iter().collect());
     }
 
-    /// Turn off every gate except the threshold under test, otherwise the first hit masks the branch being tested.
+    /// Put a batch into the listener's hands without settling it: exactly what the dispatch window
+    /// does between "handed over" and "ack/complete", and the part of the held set a buffer-only gate
+    /// cannot see.
+    fn stage_listener(
+        consumer: &DefaultMQPushConsumer,
+        mq: &MessageQueue,
+        msgs: Vec<MessageExt>,
+    ) {
+        let key = mq_key(mq);
+        let mut state = lock(&consumer.inner.state);
+        state.mq_map.insert(key.clone(), mq.clone());
+        state.inflight_msgs.insert(key, msgs);
+    }
+
+    /// Isolate one gate by pushing the other two thresholds to their widest legal value. There is no
+    /// "0 switches this gate off" to lean on any more: 0 is a refused configuration at start-up and
+    /// the gate compares the number it was given, so a 0 left here would trip that gate first and
+    /// mask the branch under test.
     fn only(consumer: &DefaultMQPushConsumer, f: impl FnOnce(&mut ConsumerConfig)) {
         consumer.update_config(|c| {
             c.pull_threshold_for_queue = i32::MAX;
-            c.pull_threshold_size_for_queue = 0;
-            c.consume_concurrently_max_span = 0;
+            c.pull_threshold_size_for_queue = i32::MAX;
+            c.consume_concurrently_max_span = i64::MAX;
             c.pull_threshold_for_topic = -1;
             c.pull_threshold_size_for_topic = -1;
             f(c);
@@ -6430,33 +6652,27 @@ mod tests {
         assert!(flow_control_hit(&consumer.inner, &key), "count 4 > 3");
         assert_eq!(triggered(), 1, "one trip, one counted hit");
 
-        // The clamp keeps a zero threshold meaningful: it reads as one, so it trips on the
-        // second message rather than on the first.
-        only(&consumer, |c| c.pull_threshold_for_queue = 0);
-        stage(&consumer, &mq, vec![sized_msg(100, 0)]);
-        assert!(
-            !flow_control_hit(&consumer.inner, &key),
-            "a zero threshold clamps to one, so a single message still pulls"
-        );
-        stage(&consumer, &mq, vec![sized_msg(100, 0), sized_msg(100, 1)]);
-        assert!(
-            flow_control_hit(&consumer.inner, &key),
-            "a zero threshold trips on the second message, not the first"
-        );
-
-        // Size: pullThresholdSizeForQueue's unit is MiB
+        // The size gate reads whole MiB of **body**: 300 B of body is nothing to a 1 MiB budget, and
+        // exactly 1 MiB still pulls because the refusal is strictly above it.
         only(&consumer, |c| c.pull_threshold_size_for_queue = 1);
+        stage(&consumer, &mq, vec![sized_msg(300, 0)]);
         assert!(!flow_control_hit(&consumer.inner, &key), "300B < 1MiB");
         stage(&consumer, &mq, vec![sized_msg(1024 * 1024, 0)]);
         assert!(
             !flow_control_hit(&consumer.inner, &key),
             "exactly 1 MiB is still allowed under a 1 MiB threshold (strictly greater)"
         );
+        // Integer (truncating) MiB: 1.9 MiB of body still reads as 1 MiB against a 1 MiB budget.
         stage(
             &consumer,
             &mq,
-            vec![sized_msg(1024 * 1024, 0), sized_msg(1024 * 1024, 1)],
+            vec![sized_msg(1024 * 1024, 0), sized_msg(900 * 1024, 1)],
         );
+        assert!(
+            !flow_control_hit(&consumer.inner, &key),
+            "1.9 MiB of body truncates to 1 MiB, which is not above a 1 MiB budget"
+        );
+        stage(&consumer, &mq, vec![sized_msg(1024 * 1024, 0), sized_msg(1024 * 1024, 1)]);
         assert!(flow_control_hit(&consumer.inner, &key), "2MiB > 1MiB");
 
         only(&consumer, |c| c.consume_concurrently_max_span = 10);
@@ -6496,6 +6712,225 @@ mod tests {
         assert!(!flow_control_hit(&plain.inner, &key));
     }
 
+    /// What the gate measures is what this queue still **holds**: the pulled-but-undispatched buffer
+    /// *plus* the batch already handed to the listener and not yet settled, with a message that sits
+    /// on both sides counted once.
+    ///
+    /// The discriminating shape is a thin buffer over a fat listener: 2 rows in the buffer alone pull,
+    /// and the same 2 rows with 2 unsettled listener rows pause. An implementation that judged
+    /// `pending` only never sees the dispatched half and keeps reserving while the listener still sits
+    /// on messages.
+    #[test]
+    fn flow_control_held_set_is_the_buffer_union_the_listeners_batch() {
+        let consumer = DefaultMQPushConsumer::new("G_held_set").unwrap();
+        let mq = queue("T", "broker-a", 0);
+        let key = mq_key(&mq);
+
+        only(&consumer, |c| c.pull_threshold_for_queue = 3);
+        // Buffer-only: 2 of the 3 allowed.
+        stage(&consumer, &mq, vec![sized_msg(1, 10), sized_msg(1, 11)]);
+        assert!(
+            !flow_control_hit(&consumer.inner, &key),
+            "a 2-message buffer under a 3-message gate pulls"
+        );
+
+        // The dispatch window hands the LOWER offsets to the listener and does not settle them.
+        stage_listener(
+            &consumer,
+            &mq,
+            vec![sized_msg(1, 8), sized_msg(1, 9)],
+        );
+        assert!(
+            flow_control_hit(&consumer.inner, &key),
+            "2 buffered + 2 unsettled listener rows is 4 held against a 3-message gate"
+        );
+
+        // Deduplication control: the requeued head sits on BOTH sides (the failed-redelivery path
+        // pushes it back into the buffer before the finish-time deregistration removes it from the
+        // listener batch). Counting it twice would read 4 held rows where the queue holds 3, so a
+        // gate that does not key on `queue_offset` pauses here instead of pulling.
+        stage_listener(&consumer, &mq, vec![sized_msg(1, 8), sized_msg(1, 9)]);
+        stage(&consumer, &mq, vec![sized_msg(1, 9), sized_msg(1, 10)]);
+        assert!(
+            !flow_control_hit(&consumer.inner, &key),
+            "offset 9 on both sides is one held row, not two: 8/9/10 is 3, not 4"
+        );
+
+        // Settling the listener's batch releases its rows: the same buffer pulls again, and one row
+        // more than the gate is enough to pause it.
+        lock(&consumer.inner.state).inflight_msgs.remove(&key);
+        assert!(
+            !flow_control_hit(&consumer.inner, &key),
+            "once the dispatched batch settles, only the 2-row buffer is left"
+        );
+        stage(
+            &consumer,
+            &mq,
+            vec![
+                sized_msg(1, 9),
+                sized_msg(1, 10),
+                sized_msg(1, 11),
+                sized_msg(1, 12),
+            ],
+        );
+        assert!(
+            flow_control_hit(&consumer.inner, &key),
+            "a 4-row buffer with nothing in the listener still reads as 4 held"
+        );
+    }
+
+    /// The size gate sums the held messages' **body** bytes and divides the total by whole MiB
+    /// (truncating). The stored-record size the broker charges for the whole storage record is
+    /// telemetry about the disk, not something this client keeps in memory, so it must never be the
+    /// number that refuses a pull -- and a fat stored record must not make a small buffer look heavy.
+    #[test]
+    fn flow_control_size_reads_body_bytes_never_the_stored_record() {
+        let consumer = DefaultMQPushConsumer::new("G_body_size").unwrap();
+        let mq = queue("T", "broker-a", 0);
+        let key = mq_key(&mq);
+
+        only(&consumer, |c| c.pull_threshold_size_for_queue = 1);
+
+        // A 100-byte body carrying a 4 MiB stored record: the buffer is 0 MiB of body.
+        stage(
+            &consumer,
+            &mq,
+            vec![split_size_msg(100, 4 * 1024 * 1024, 0)],
+        );
+        assert!(
+            !flow_control_hit(&consumer.inner, &key),
+            "a 4MiB stored record over a 100B body does not move a body-based gate"
+        );
+
+        // The mirror image: a 2 MiB body the broker reports as 10 stored bytes must pause.
+        stage(
+            &consumer,
+            &mq,
+            vec![split_size_msg(2 * 1024 * 1024, 10, 0)],
+        );
+        assert!(
+            flow_control_hit(&consumer.inner, &key),
+            "2MiB of body is 2MiB to a 1MiB budget whatever the stored size says"
+        );
+
+        // Accumulation happens on the body side across the held set, and it truncates: 1.9 MiB reads
+        // as 1 MiB and still pulls, while the same total plus a 300B stored-only row does not change.
+        stage(
+            &consumer,
+            &mq,
+            vec![
+                split_size_msg(1024 * 1024, 3 * 1024 * 1024, 0),
+                split_size_msg(900 * 1024, 3 * 1024 * 1024, 1),
+            ],
+        );
+        assert!(
+            !flow_control_hit(&consumer.inner, &key),
+            "1.9MiB of body truncates to 1MiB; 6MiB of stored records is ignored"
+        );
+    }
+
+    /// The span knob is named after concurrent consumption, so an **orderly** listener is never
+    /// judged by it: an orderly queue's cursor only moves once the batch in the listener's hands has
+    /// settled, which means the buffer is allowed to sit wide without a run-ahead to guard. Count and
+    /// size still bind the orderly path over the same held set.
+    #[test]
+    fn flow_control_span_gate_skips_the_orderly_listener() {
+        let consumer = DefaultMQPushConsumer::new("G_span_orderly").unwrap();
+        let mq = queue("T", "broker-a", 0);
+        let key = mq_key(&mq);
+
+        only(&consumer, |c| c.consume_concurrently_max_span = 10);
+        stage(&consumer, &mq, vec![sized_msg(1, 0), sized_msg(1, 100)]);
+        assert!(
+            flow_control_hit(&consumer.inner, &key),
+            "span 100 over a 10 span budget pauses the concurrent path"
+        );
+
+        consumer.set_message_listener_orderly(Arc::new(NoopOrderlyListener));
+        assert!(
+            !flow_control_hit(&consumer.inner, &key),
+            "the identical wide span is not judged at all for an orderly listener"
+        );
+
+        // Control: the exemption is only the span term -- an orderly queue still obeys its count gate
+        // over the same held set, so the listener is not skipped wholesale.
+        only(&consumer, |c| {
+            c.pull_threshold_for_queue = 1;
+            c.consume_concurrently_max_span = i64::MAX;
+        });
+        assert!(
+            flow_control_hit(&consumer.inner, &key),
+            "2 held rows over a 1-message count gate pause an orderly queue too"
+        );
+    }
+
+    /// Each gate compares the number it was given, strictly greater than: no floor of 1 and no
+    /// "0 or a negative number switches this gate off" escape. Keeping the knobs inside their legal ranges is the
+    /// start-up validation's job; the gate itself has no opinion about a hand-built config, and a
+    /// reader who assumes otherwise will think a 0 budget means "unlimited" where it means "cache
+    /// nothing".
+    #[test]
+    fn flow_control_thresholds_are_compared_as_configured() {
+        let consumer = DefaultMQPushConsumer::new("G_no_floor").unwrap();
+        let mq = queue("T", "broker-a", 0);
+        let key = mq_key(&mq);
+
+        // A count budget of 0 with a 1-byte body and a single offset: only the count term can be the
+        // one that refuses, and an implementation that read `max(1, threshold)` pulls here.
+        consumer.update_config(|c| {
+            c.pull_threshold_for_queue = 0;
+            c.pull_threshold_size_for_queue = i32::MAX;
+            c.consume_concurrently_max_span = i64::MAX;
+            c.pull_threshold_for_topic = -1;
+            c.pull_threshold_size_for_topic = -1;
+        });
+        stage(&consumer, &mq, vec![sized_msg(1, 0)]);
+        assert!(
+            flow_control_hit(&consumer.inner, &key),
+            "a 0-message budget holds nothing, so one cached message pauses the pull"
+        );
+        lock(&consumer.inner.state).pending.remove(&key);
+        assert!(
+            !flow_control_hit(&consumer.inner, &key),
+            "an empty queue is at 0, which is not above a 0 budget"
+        );
+
+        // The same for the size term: 1 byte of body truncates to 0 MiB, so a 0 MiB budget is not
+        // tripped by nothing -- and a whole MiB is. The count term is widened out of the way first,
+        // otherwise it refuses for the reason the previous block just proved.
+        consumer.update_config(|c| {
+            c.pull_threshold_for_queue = i32::MAX;
+            c.pull_threshold_size_for_queue = 0;
+        });
+        stage(&consumer, &mq, vec![sized_msg(1, 0)]);
+        assert!(
+            !flow_control_hit(&consumer.inner, &key),
+            "0 MiB of body is not strictly above a 0 MiB budget"
+        );
+        stage(&consumer, &mq, vec![sized_msg(1024 * 1024, 0)]);
+        assert!(
+            flow_control_hit(&consumer.inner, &key),
+            "1 MiB of body is above a 0 MiB budget"
+        );
+
+        // And the span term: two adjacent offsets are span 1, which a 0 budget refuses rather than
+        // ignores.
+        consumer.update_config(|c| {
+            c.pull_threshold_size_for_queue = i32::MAX;
+            c.consume_concurrently_max_span = 0;
+        });
+        stage(&consumer, &mq, vec![sized_msg(1, 0), sized_msg(1, 1)]);
+        assert!(
+            flow_control_hit(&consumer.inner, &key),
+            "a span budget of 0 refuses span 1 instead of switching the gate off"
+        );
+        stage(&consumer, &mq, vec![sized_msg(1, 0)]);
+        assert!(
+            !flow_control_hit(&consumer.inner, &key),
+            "a single cached row is span 0, level with the budget"
+        );
+    }
+
     /// The pull gate never sums its siblings: under a 1000-message **topic** budget divided over 4
     /// owned queues, each queue may hold its full 250-message share. An implementation that
     /// aggregates the topic at pull time pauses all four at once (4 x 250 = 1000 >= 1000), so the
@@ -6512,8 +6947,10 @@ mod tests {
             c.pull_threshold_for_topic = 1000;
             // The user's own per-queue value, deliberately large: the division replaces it.
             c.pull_threshold_for_queue = 65535;
-            c.pull_threshold_size_for_queue = 0;
-            c.consume_concurrently_max_span = 0;
+            // Isolation by width, not by 0: a 0 size/span threshold is not an off switch, it would
+            // trip first and hide the count branch this test is about.
+            c.pull_threshold_size_for_queue = i32::MAX;
+            c.consume_concurrently_max_span = i64::MAX;
         });
         own_pull_queues(&consumer, &queues);
         consumer.divide_topic_thresholds();
@@ -7025,6 +7462,117 @@ mod tests {
         });
         consumer.divide_topic_thresholds();
         assert_eq!(consumer.config().pull_threshold_for_queue, 250);
+    }
+
+    /// The moved-set judgement is per topic and keyed on the **set** of queue keys, so the four
+    /// shapes that matter all read as a move and the one shape that must stay quiet does: a
+    /// re-ordering of the queues this instance already had. A same-count hand-over to a different
+    /// broker is the case a count comparison would miss.
+    #[test]
+    fn changed_topics_names_exactly_the_sets_that_moved() {
+        let q = |topic: &str, broker: &str, id: i32| MessageQueue::new(topic, broker, id);
+        let t1 = || vec![q("T1", "broker-a", 0), q("T1", "broker-a", 1)];
+        let by_topic = |qs: &[MessageQueue]| queues_by_topic(qs);
+
+        // Same set, different arrival order: nothing moved.
+        let mut reordered = t1();
+        reordered.reverse();
+        assert!(
+            changed_topics(&by_topic(&t1()), &by_topic(&reordered)).is_empty(),
+            "the strategy's sort order is not an ownership change"
+        );
+        // Identical round: nothing moved.
+        assert!(changed_topics(&by_topic(&t1()), &by_topic(&t1())).is_empty());
+
+        // A growth and a shrink each name the topic once.
+        assert_eq!(
+            changed_topics(&by_topic(&t1()), &by_topic(&[t1(), vec![q("T1", "broker-a", 2)]].concat())),
+            vec!["T1".to_string()],
+            "one queue added"
+        );
+        assert_eq!(
+            changed_topics(&by_topic(&t1()), &by_topic(&[q("T1", "broker-a", 1)])),
+            vec!["T1".to_string()],
+            "one queue lost"
+        );
+
+        // Same count, different broker: the queues changed hands, and a count comparison would miss
+        // exactly this.
+        let hand_over = vec![q("T1", "broker-b", 0), q("T1", "broker-b", 1)];
+        assert_eq!(
+            changed_topics(&by_topic(&t1()), &by_topic(&hand_over)),
+            vec!["T1".to_string()],
+            "two queues in, two queues out, but a different broker"
+        );
+
+        // A topic that appears and one that vanishes are both moves (the empty side is the before).
+        assert_eq!(
+            changed_topics(
+                &by_topic(&[] as &[MessageQueue]),
+                &by_topic(&t1())
+            ),
+            vec!["T1".to_string()],
+            "a topic the instance had no queues for now has some"
+        );
+        assert_eq!(
+            changed_topics(&by_topic(&t1()), &by_topic(&[] as &[MessageQueue])),
+            vec!["T1".to_string()],
+            "and the reverse"
+        );
+
+        // Two topics, one moved: only that one is named, and the names come back sorted.
+        let before = {
+            let mut v = t1();
+            v.extend(vec![q("T2", "broker-a", 0)]);
+            v
+        };
+        let after = {
+            let mut v = vec![q("T1", "broker-a", 0), q("T1", "broker-a", 1)];
+            v.extend(vec![q("T2", "broker-a", 0), q("T2", "broker-a", 1)]);
+            v
+        };
+        assert_eq!(
+            changed_topics(&by_topic(&before), &by_topic(&after)),
+            vec!["T2".to_string()],
+            "T1 kept the identical two queues while T2 grew"
+        );
+    }
+
+    /// The restamp is the half that makes the broker look at the subscription again, so its scope is
+    /// the moved set and nothing else: one line per moved topic, carrying the version it replaced and
+    /// the round's single stamp.
+    #[test]
+    fn restamp_subscription_versions_rewrites_only_the_moved_topics() {
+        let consumer = DefaultMQPushConsumer::new("G_restamp").unwrap();
+        consumer.subscribe("T1", "*").unwrap();
+        consumer.subscribe("T2", "tagA").unwrap();
+        {
+            let mut state = lock(&consumer.inner.state);
+            for (_, sub) in state.subscription_data.iter_mut() {
+                sub.sub_version = 100;
+            }
+        }
+
+        let lines = restamp_subscription_versions(&consumer.inner, &["T2".to_string()], 999);
+        assert_eq!(
+            lines,
+            vec!["T2 rebalance changed, also update version: 100, 999".to_string()],
+            "one line, naming the old version then the new one"
+        );
+        assert_eq!(subscription_version(&consumer, "T2"), 999);
+        assert_eq!(
+            subscription_version(&consumer, "T1"),
+            100,
+            "a subscription whose queues did not move keeps its version -- re-stamping the whole \
+             table would put every subscription back on the wire each changed round"
+        );
+
+        // A moved topic with no subscription entry (a share that vanished with its subscribe) is
+        // skipped rather than invented, and an empty moved list writes nothing at all.
+        assert!(restamp_subscription_versions(&consumer.inner, &["T3".to_string()], 1000).is_empty());
+        assert_eq!(subscription_versions(&consumer).len(), 2, "no subscription was created");
+        assert!(restamp_subscription_versions(&consumer.inner, &[], 1000).is_empty());
+        assert_eq!(subscription_version(&consumer, "T2"), 999, "an empty list restamps nothing");
     }
 
     /// The division is **change-gated** and runs **after** the pull-state update, through the real
@@ -9930,6 +10478,10 @@ mod tests {
         /// The response code (`response_code::SUCCESS` / `SYSTEM_ERROR` / `TOPIC_NOT_EXIST`...).
         code: i32,
         body: Option<Vec<u8>>,
+        /// Some = answer **per requested topic** from this table (a topic missing from it gets an
+        /// empty set). This is what lets one round move exactly one topic's queue set, which the
+        /// whole-assignment scripts cannot express.
+        by_topic: Option<BTreeMap<String, Vec<(String, i32)>>>,
         /// true = after receiving the request, **close the connection without replying**: the client gets a transport-layer
         /// error (an Err with response_code None) and takes the "keep the previous assignment" branch.
         silent_close: bool,
@@ -9941,6 +10493,24 @@ mod tests {
             AssignFixture {
                 code: response_code::SUCCESS,
                 body: Some(assignment_body(items)),
+                by_topic: None,
+                silent_close: false,
+            }
+        }
+        /// SUCCESS plus a per-topic queue table: `(topic, broker, queueId)`. A topic the request
+        /// asks about that is absent here is answered with an empty set, so a round can shrink one
+        /// topic's share while leaving its sibling's share byte-identical.
+        fn with_topic_assignments(items: &[(&str, &str, i32)]) -> AssignFixture {
+            let mut map: BTreeMap<String, Vec<(String, i32)>> = BTreeMap::new();
+            for (topic, broker, id) in items {
+                map.entry((*topic).to_string())
+                    .or_default()
+                    .push(((*broker).to_string(), *id));
+            }
+            AssignFixture {
+                code: response_code::SUCCESS,
+                body: None,
+                by_topic: Some(map),
                 silent_close: false,
             }
         }
@@ -9948,6 +10518,7 @@ mod tests {
             AssignFixture {
                 code: response_code::SUCCESS,
                 body: None,
+                by_topic: None,
                 silent_close: false,
             }
         }
@@ -9955,6 +10526,7 @@ mod tests {
             AssignFixture {
                 code,
                 body: None,
+                by_topic: None,
                 silent_close: false,
             }
         }
@@ -9962,6 +10534,7 @@ mod tests {
             AssignFixture {
                 code: response_code::SUCCESS,
                 body: None,
+                by_topic: None,
                 silent_close: true,
             }
         }
@@ -9981,11 +10554,28 @@ mod tests {
         )
     }
 
+    /// The same body for one named topic (the per-topic script answers each 400 with this).
+    fn topic_assignment_body(topic: &str, items: &[(String, i32)]) -> Vec<u8> {
+        use crate::remoting::protocol::query_assignment_body::MessageQueueAssignment;
+        let list: Vec<MessageQueueAssignment> = items
+            .iter()
+            .map(|(broker, id)| {
+                MessageQueueAssignment::new(MessageQueueKey::new(topic, broker, *id), "POP")
+            })
+            .collect();
+        crate::remoting::protocol::query_assignment_body::QueryAssignmentResponseBody::encode(
+            Some(&list),
+        )
+    }
+
     struct AssignState {
         /// None = the default script: SUCCESS with the two POP queues 0/1 on broker-a.
         fixture: Mutex<Option<AssignFixture>>,
         /// The captured QUERY_ASSIGNMENT request bodies (the place to assert on the 400 body fields).
         bodies: Mutex<Vec<Vec<u8>>>,
+        /// The captured HEARTBEAT(34) request bodies, oldest first -- the only place a test can read
+        /// the subscription versions exactly as they went on the wire.
+        heartbeats: Mutex<Vec<Vec<u8>>>,
     }
 
     /// 1 name server (any topic gets the same route back: broker-a with 4 read queues)
@@ -10006,6 +10596,7 @@ mod tests {
             let state = Arc::new(AssignState {
                 fixture: Mutex::new(None),
                 bodies: Mutex::new(Vec::new()),
+                heartbeats: Mutex::new(Vec::new()),
             });
             let _namesrv_task = spawn_assign_namesrv(namesrv, broker_addr);
             let _broker_task = spawn_assign_broker(broker, state.clone());
@@ -10026,6 +10617,40 @@ mod tests {
                 .map(|b| {
                     crate::remoting::protocol::query_assignment_body::QueryAssignmentRequestBody::decode(b)
                         .expect("request body must be valid JSON")
+                })
+                .collect()
+        }
+
+        /// How many HEARTBEAT(34) frames reached the fake broker so far -- the observation point for
+        /// "this round did not beat" versus "this round beat once".
+        fn heartbeat_count(&self) -> usize {
+            lock(&self.state.heartbeats).len()
+        }
+
+        /// The `topic -> subVersion` map of one recorded heartbeat, in the order the beats arrived.
+        ///
+        /// Read off the wire JSON rather than the client's own table: the point of the assertion is
+        /// what the broker was *handed*, which a getter on the client cannot show.
+        fn heartbeat_versions(&self) -> Vec<BTreeMap<String, i64>> {
+            lock(&self.state.heartbeats)
+                .iter()
+                .map(|body| {
+                    let json: serde_json::Value =
+                        serde_json::from_slice(body).expect("heartbeat body must be JSON");
+                    let mut out = BTreeMap::new();
+                    for cd in json["consumerDataSet"].as_array().into_iter().flatten() {
+                        for sd in cd["subscriptionDataSet"].as_array().into_iter().flatten() {
+                            let topic = sd["topic"].as_str().unwrap_or_default().to_string();
+                            let version = match &sd["subVersion"] {
+                                serde_json::Value::String(s) => {
+                                    s.parse::<i64>().unwrap_or_default()
+                                }
+                                other => other.as_i64().unwrap_or_default(),
+                            };
+                            out.insert(topic, version);
+                        }
+                    }
+                    out
                 })
                 .collect()
         }
@@ -10110,6 +10735,14 @@ mod tests {
                 tokio::spawn(async move {
                     while let Some(frame) = read_assign_frame(&mut stream).await {
                         let Ok(request) = RemotingCommand::decode(&frame) else { return };
+                        if request.code == request_code::HEART_BEAT {
+                            state.heartbeats.lock().unwrap_or_else(|e| e.into_inner()).push(
+                                request.body().unwrap_or(&[]).to_vec(),
+                            );
+                            let mut response = assign_response_for(&request, response_code::SUCCESS);
+                            write_assign_frame(&mut stream, &mut response).await;
+                            continue;
+                        }
                         if request.code == request_code::QUERY_ASSIGNMENT {
                             state.bodies.lock().unwrap_or_else(|e| e.into_inner()).push(
                                 request.body().unwrap_or(&[]).to_vec(),
@@ -10119,7 +10752,19 @@ mod tests {
                                 Some(f) if f.silent_close => return, // no reply; tear down the connection directly
                                 Some(f) => {
                                     let mut response = assign_response_for(&request, f.code);
-                                    if let Some(body) = f.body {
+                                    let body = match &f.by_topic {
+                                        Some(map) if f.code == response_code::SUCCESS => {
+                                            let topic = crate::remoting::protocol::query_assignment_body::QueryAssignmentRequestBody::decode(
+                                                request.body().unwrap_or(&[]),
+                                            )
+                                            .map(|r| r.topic)
+                                            .unwrap_or_default();
+                                            let queues = map.get(&topic).cloned().unwrap_or_default();
+                                            Some(topic_assignment_body(&topic, &queues))
+                                        }
+                                        _ => f.body.clone(),
+                                    };
+                                    if let Some(body) = body {
                                         response.set_body(Some(body));
                                     }
                                     write_assign_frame(&mut stream, &mut response).await;
@@ -10164,8 +10809,22 @@ mod tests {
     /// Builds a consumer in the "POP mode + instance attached and pointing at the fake cluster" shape (no start call,
     /// no background loops spawned; the assignment is driven entirely by manual do_rebalance calls).
     fn pop_consumer_on_cluster(instance: &str, cluster: &AssignCluster) -> DefaultMQPushConsumer {
+        pop_consumer_on_cluster_topics(instance, cluster, &["T"])
+    }
+
+    /// The same shape over an explicit topic list, with the consumer **registered in the instance**
+    /// the way `start()` does it: the heartbeat body is built from the registry's consumer list, so
+    /// an unregistered facade has nothing to send and a test could never tell a skipped beat from a
+    /// beat that carried no subscriptions.
+    fn pop_consumer_on_cluster_topics(
+        instance: &str,
+        cluster: &AssignCluster,
+        topics: &[&str],
+    ) -> DefaultMQPushConsumer {
         let c = DefaultMQPushConsumer::new("GID_pop_assign").expect("legal group name");
-        c.subscribe("T", "*").expect("subscribe");
+        for topic in topics {
+            c.subscribe(topic, "*").expect("subscribe");
+        }
         c.set_message_listener_concurrently(Arc::new(NoopListener));
         c.update_config(|cfg| {
             cfg.pop_mode = true;
@@ -10175,11 +10834,50 @@ mod tests {
             &format!("cid-{instance}"),
             vec![cluster.namesrv_addr.clone()],
         );
+        client.register_consumer("GID_pop_assign", Arc::new(c.clone()));
         *lock(&c.inner.client) = Some(client);
         // require_client honors this flag; the background loop tasks (rebalance/heartbeat/lock/persist)
         // are spawned only by start(), so manual pacing is not disturbed here.
         c.inner.started.store(true, Ordering::Release);
         c
+    }
+
+    /// The subscription versions the heartbeat builder reads, straight off the client's own table --
+    /// the side of the pair the recorded beat is compared against.
+    fn subscription_versions(consumer: &DefaultMQPushConsumer) -> BTreeMap<String, i64> {
+        lock(&consumer.inner.state)
+            .subscription_data
+            .iter()
+            .map(|(topic, sub)| (topic.clone(), sub.sub_version))
+            .collect()
+    }
+
+    fn subscription_version(consumer: &DefaultMQPushConsumer, topic: &str) -> i64 {
+        subscription_versions(consumer)
+            .get(topic)
+            .copied()
+            .unwrap_or_else(|| panic!("{topic} has no subscription"))
+    }
+
+    /// Records every `(topic, mqAll, mqDivided)` callback the consumer fires, in order.
+    #[derive(Default)]
+    struct QueueChangeSpy {
+        calls: Mutex<Vec<(String, usize, Vec<String>)>>,
+    }
+
+    impl MessageQueueListener for QueueChangeSpy {
+        fn message_queue_changed(
+            &self,
+            topic: &str,
+            mq_all: &[MessageQueue],
+            mq_divided: &[MessageQueue],
+        ) {
+            lock(&self.calls).push((
+                topic.to_string(),
+                mq_all.len(),
+                mq_divided.iter().map(mq_key).collect(),
+            ));
+        }
     }
 
     fn sorted_keys(c: &DefaultMQPushConsumer) -> Vec<String> {
@@ -10300,6 +10998,123 @@ mod tests {
         assert_eq!(cluster.requests().len(), 2, "one 400 per topic per round");
     }
 
+    /// Everything one moved topic owes, observed through the real `do_rebalance` against the fake
+    /// cluster with **two** subscriptions, where only one topic's queue set moves: the restamp, the
+    /// division, the immediate beat and the application callback all have to name the same set and no
+    /// more, and an unchanged round has to pay none of them.
+    #[tokio::test]
+    async fn rebalance_change_pays_all_four_duties_for_the_moved_topic_only() {
+        let cluster = AssignCluster::start().await;
+        let c = pop_consumer_on_cluster_topics("rebalance-duties", &cluster, &["T1", "T2"]);
+        let spy = Arc::new(QueueChangeSpy::default());
+        c.set_message_queue_listener(spy.clone());
+        c.update_config(|cfg| {
+            cfg.pull_threshold_for_queue = 65_535;
+            cfg.pull_threshold_for_topic = 1_000;
+            cfg.pull_threshold_size_for_topic = -1;
+        });
+        cluster.set(Some(AssignFixture::with_topic_assignments(&[
+            ("T1", "broker-a", 0),
+            ("T1", "broker-a", 1),
+            ("T2", "broker-a", 0),
+        ])));
+        // POP mode never reads the route to decide its share, so warm the route cache once: without a
+        // broker address the beat has nowhere to go and the test would measure its own harness.
+        {
+            let client = lock(&c.inner.client).clone().expect("instance attached");
+            for topic in ["T1", "T2"] {
+                assert_eq!(client.get_topic_subscribe_info(topic).await.len(), 4);
+            }
+        }
+
+        // Round 1: both topics appear, so both moved.
+        let beats_before = cluster.heartbeat_count();
+        c.do_rebalance().await.unwrap();
+        assert_eq!(
+            sorted_keys(&c),
+            vec!["T1broker-a0", "T1broker-a1", "T2broker-a0"]
+        );
+        assert_eq!(
+            cluster.heartbeat_count() - beats_before,
+            1,
+            "a changed round beats every broker once, without waiting for the periodic loop"
+        );
+        assert_eq!(
+            c.config().pull_threshold_for_queue,
+            333,
+            "1000 divided over the 3 queues this round owns"
+        );
+        let calls = lock(&spy.calls).clone();
+        assert_eq!(calls.len(), 2, "both topics moved, so both are reported");
+        assert_eq!(calls[0].0, "T1");
+        assert_eq!(calls[1].0, "T2");
+        assert_eq!(
+            (calls[0].1, calls[0].2.as_slice()),
+            (4usize, &["T1broker-a0".to_string(), "T1broker-a1".to_string()][..]),
+            "one call carries the FULL route set and this instance's share of it"
+        );
+        let beat = cluster.heartbeat_versions().pop().expect("the beat was recorded");
+        let t1_v1 = beat["T1"];
+        let t2_v1 = beat["T2"];
+        assert!(t1_v1 > 0 && t2_v1 > 0, "a restamp is a wall-clock stamp: {beat:?}");
+        assert_eq!(
+            t1_v1, t2_v1,
+            "one round shares a single stamp across the topics it moved"
+        );
+
+        // Round 2: the identical grant moves nothing, so the round is silent on all four duties --
+        // the beat is not repeated, the callback does not re-report, and a hand-set per-queue knob
+        // survives because the division is not re-run.
+        c.update_config(|cfg| cfg.pull_threshold_for_queue = 12_345);
+        let beats_before = cluster.heartbeat_count();
+        c.do_rebalance().await.unwrap();
+        assert_eq!(cluster.heartbeat_count(), beats_before, "an unchanged round sends no beat");
+        assert_eq!(lock(&spy.calls).len(), 2, "an unchanged round reports nothing to the app");
+        assert_eq!(c.config().pull_threshold_for_queue, 12_345, "not re-divided");
+        assert_eq!(subscription_version(&c, "T1"), t1_v1, "an unmoved subscription keeps its version");
+        assert_eq!(subscription_version(&c, "T2"), t2_v1);
+
+        // Round 3: T2's share shrinks to nothing while T1 keeps the identical two queues. Only T2
+        // moved -- and that is what each of the four duties must show.
+        cluster.set(Some(AssignFixture::with_topic_assignments(&[
+            ("T1", "broker-a", 0),
+            ("T1", "broker-a", 1),
+        ])));
+        let beats_before = cluster.heartbeat_count();
+        c.do_rebalance().await.unwrap();
+        assert_eq!(sorted_keys(&c), vec!["T1broker-a0", "T1broker-a1"]);
+        assert_eq!(
+            cluster.heartbeat_count() - beats_before,
+            1,
+            "the beat goes out for the moved topic, immediately"
+        );
+        assert_eq!(
+            c.config().pull_threshold_for_queue,
+            500,
+            "the shrunk round divides over the 2 queues it owns now, not the 3 it had"
+        );
+        let calls = lock(&spy.calls).clone();
+        assert_eq!(calls.len(), 3, "exactly one more callback for one moved topic");
+        assert_eq!(
+            (calls[2].0.as_str(), calls[2].1, calls[2].2.as_slice()),
+            ("T2", 4, &[] as &[String]),
+            "T2 is told with its full route set and an empty share; T1 is never re-reported"
+        );
+        let versions = subscription_versions(&c);
+        assert_eq!(versions["T1"], t1_v1, "the unmoved topic's version is left alone");
+        assert!(
+            versions["T2"] > t2_v1,
+            "the moved topic carries a fresh stamp: {versions:?}"
+        );
+        let beat = cluster.heartbeat_versions().pop().expect("the second beat");
+        assert_eq!(
+            (beat["T1"], beat["T2"]),
+            (t1_v1, versions["T2"]),
+            "the beat the broker just received carries the fresh version for the moved topic and the \
+             old one for the topic that never changed hands"
+        );
+    }
+
     #[tokio::test]
     async fn pop_assignment_dedups_and_survives_mixed_modes() {
         let cluster = AssignCluster::start().await;
@@ -10322,6 +11137,7 @@ mod tests {
         cluster.set(Some(AssignFixture {
             code: response_code::SUCCESS,
             body: Some(body),
+            by_topic: None,
             silent_close: false,
         }));
 
