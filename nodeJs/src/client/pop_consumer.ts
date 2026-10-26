@@ -554,7 +554,9 @@ export function syncPopLoops(c: DefaultMQPushConsumer): void {
     void queuePopLoop(c, mq, stopFlag).catch((e) =>
       logger.error('pop loop error for %s: %s', key, (e as Error).message || e));
   }
-  c._notifyQueueChanged();
+  // The broker beat and the application's queue listener are NOT spent here: POP
+  // syncs the loops it owns, and a round that only rebuilt one does not change what
+  // the broker holds. doRebalance pays both once, for the topics whose set moved.
 }
 
 // retirePopQueue drops one queue's POP state.

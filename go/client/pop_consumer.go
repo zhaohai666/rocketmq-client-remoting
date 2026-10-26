@@ -595,8 +595,12 @@ func (c *DefaultMQPushConsumer) syncPopLoops() {
 		go c.queuePopLoop(mq, stop)
 	}
 	c.mu.Unlock()
-	c.beatAfterRebalance(changed > 0)
-	c.notifyQueueChanged()
+	if changed > 0 {
+		common.LogDebugf("pop queues synced, group=%s changed=%d", c.consumerGroup, changed)
+	}
+	// Like the pull path, this spends no broker beat of its own: the caller's
+	// afterAssignmentChange beats once the topics that moved are known, so a round
+	// that only rebuilt a loop for queues it still owns does not reach the broker.
 }
 
 // retirePopQueueLocked drops one queue's POP state. Caller must hold c.mu.

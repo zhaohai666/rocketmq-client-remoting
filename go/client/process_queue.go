@@ -104,38 +104,39 @@ func (pq *processQueue) MsgAccCnt() int64 {
 	return pq.msgAccCnt
 }
 
-// PendingStats is the flow-control triple (count, size in MB, offset span)
-// computed over the NOT-yet-dispatched entries only.
-func (pq *processQueue) PendingStats() (int, float64, int64) {
+// CacheStats is the flow-control triple the cache gates judge: the number of messages this queue
+// still HOLDS, their total BODY bytes, and the offset span -- all over the same held set.
+//
+// "Held" is everything pulled and not yet dropped from the buffer, including the batches already
+// handed to a listener: a gate that skipped those would let a wedged listener keep pulling, since
+// every held message has already left the undispatched remainder on its way to the listener.
+//
+// The fourth result tells the gate whether the span term applies at all. It does not, for ORDERLY
+// consumption: an ordered queue's pull cursor cannot run ahead while the batch in the listener's
+// hands is unsettled, so there is no run-away span to guard against and the span is never compared.
+func (pq *processQueue) CacheStats() (count int, bodyBytes int64, span int64, judgeSpan bool) {
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
-	count := 0
-	var size int64
 	var minOffset, maxOffset int64
-	first := true
 	for _, offset := range pq.order {
-		if _, inflight := pq.dispatched[offset]; inflight {
-			continue
-		}
 		msg, ok := pq.msgs[offset]
 		if !ok {
 			continue
 		}
+		bodyBytes += int64(len(msg.GetBody()))
 		count++
-		size += int64(len(msg.GetBody()))
-		if first || offset < minOffset {
+		if count == 1 || offset < minOffset {
 			minOffset = offset
 		}
-		if first || offset > maxOffset {
+		if count == 1 || offset > maxOffset {
 			maxOffset = offset
 		}
-		first = false
 	}
-	span := int64(0)
 	if count > 0 {
 		span = maxOffset - minOffset
 	}
-	return count, float64(size) / (1024.0 * 1024.0), span
+	judgeSpan = !pq.consumeOrderly
+	return
 }
 
 func (pq *processQueue) MsgCount() int {
@@ -144,9 +145,9 @@ func (pq *processQueue) MsgCount() int {
 	return len(pq.msgs)
 }
 
-// PendingCount is the number of pulled-and-not-yet-dispatched messages, i.e.
-// the retry buffer. Flow control is measured on this one so that a slow
-// listener does not look like a backlog.
+// PendingCount is the number of pulled-and-not-yet-dispatched messages, i.e. the
+// retry buffer. The cache gates do NOT read it: they judge the whole held set,
+// which is what CacheStats reports.
 func (pq *processQueue) PendingCount() int {
 	pq.mu.Lock()
 	defer pq.mu.Unlock()

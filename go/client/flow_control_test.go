@@ -1,7 +1,9 @@
 // The cache gates are the only thing that keeps a slow listener from turning into an
 // unbounded buffer, so their arithmetic is pinned here without a broker: the hit DIRECTION
-// (strictly greater, so a threshold reads as "how many may be cached"), the UNITS (MiB, not
-// bytes; offset span, not count), the per-gate switches and the WARN cadence (once per 1000
+// (strictly greater, so a threshold reads as "how many may be cached"), the UNITS (whole MiB of
+// message BODY by integer division, offset span, not count), the fact that a threshold is taken
+// literally -- no floor clamped and no "0 disables it" escape -- what the measurement COVERS
+// (everything the queue holds, dispatched batches included) and the WARN cadence (once per 1000
 // trips) are each asserted with a paired control, because every one of them fails in the
 // silent direction when judged wrong.
 //
@@ -20,6 +22,10 @@ import (
 const fcTopic = "GoFlowControlUnitTopic"
 
 const mib = 1024 * 1024
+
+// fcOff is a threshold no fixture reaches. The gates have no "disabled" value -- 0 means "cache
+// nothing" -- so a test that wants one term out of the way parks it out of reach instead.
+const fcOff = int64(1) << 40
 
 func fcQueue(id int32) common.MessageQueue {
 	return common.NewMessageQueue(fcTopic, "b1", id)
@@ -44,15 +50,17 @@ func fcMsgs(n, bodyBytes int) []*common.MessageExt {
 	return out
 }
 
-// fcConsumer is a not-started consumer with every gate off except the one under test: an
-// earlier gate would mask the branch being asserted.
+// fcConsumer is a not-started consumer with every gate parked out of reach except the one under
+// test: an earlier gate would mask the branch being asserted. There is no "0 disables this gate"
+// switch to lean on -- the gate takes the configured number as it stands -- so an off term is a
+// number no fixture reaches, and keeping the legal range is the start-up config check's job.
 func fcConsumer(t *testing.T, group string) *DefaultMQPushConsumer {
 	t.Helper()
 	c := MustNewDefaultMQPushConsumer(group)
 	c.mu.Lock()
-	c.pullThresholdForQueue = 1 << 30
-	c.pullThresholdSizeForQueue = 0
-	c.consumeConcurrentlyMaxSpan = 0
+	c.pullThresholdForQueue = fcOff
+	c.pullThresholdSizeForQueue = fcOff
+	c.consumeConcurrentlyMaxSpan = fcOff
 	c.pullThresholdForTopic = -1
 	c.pullThresholdSizeForTopic = -1
 	c.mu.Unlock()
@@ -62,7 +70,12 @@ func fcConsumer(t *testing.T, group string) *DefaultMQPushConsumer {
 // fcHit puts the messages in a fresh process queue (nothing dispatched, so the gate sees all
 // of them) and asks the gate once.
 func fcHit(c *DefaultMQPushConsumer, mq common.MessageQueue, msgs ...*common.MessageExt) bool {
-	pq := newProcessQueue(false)
+	return fcHitQueue(c, mq, newProcessQueue(false), msgs...)
+}
+
+// fcHitQueue is fcHit on a queue whose consume mode the caller chose: an orderly queue is the
+// span gate's one exception, so the same buffer can answer differently there.
+func fcHitQueue(c *DefaultMQPushConsumer, mq common.MessageQueue, pq *processQueue, msgs ...*common.MessageExt) bool {
 	pq.PutMessage(msgs)
 	return c.flowControlHit(mq, pq)
 }
@@ -114,18 +127,24 @@ func TestFlowControlCountGateIsStrictlyGreater(t *testing.T) {
 	}
 }
 
-func TestFlowControlCountGateTreatsZeroAsOne(t *testing.T) {
+func TestFlowControlCountGateTreatsZeroAsCachingNothing(t *testing.T) {
 	c := fcConsumer(t, "GID_go_fc_count_zero")
 	c.SetPullThresholdForQueue(0)
-	if fcHit(c, fcQueue(0), fcMsgs(1, 10)...) {
-		t.Errorf("threshold 0 clamps to 1, so one cached message is not over it")
+	// The gate takes the configured number as it stands: no max(1, n) quietly turns 0 into 1, so
+	// "cache nothing" means the very first held message trips it.
+	if !fcHit(c, fcQueue(0), fcMsgs(1, 10)...) {
+		t.Errorf("threshold 0 means cache nothing, so one held message must hit")
 	}
-	if !fcHit(c, fcQueue(0), fcMsgs(2, 10)...) {
-		t.Errorf("threshold 0 must clamp to 1, i.e. hit on the 2nd message")
+	if got := fcTriggered(c); got != 1 {
+		t.Errorf("flowControlTriggered = %d, want 1", got)
+	}
+	// Control: an empty queue holds nothing, which is not over a budget of 0.
+	if fcHit(c, fcQueue(0)) {
+		t.Errorf("an empty queue is not over a budget of 0")
 	}
 }
 
-func TestFlowControlSizeGateIsInMiBAndStrictlyGreater(t *testing.T) {
+func TestFlowControlSizeGateIsInWholeMiBAndStrictlyGreater(t *testing.T) {
 	c := fcConsumer(t, "GID_go_fc_size")
 	c.SetPullThresholdSizeForQueue(1)
 	if fcHit(c, fcQueue(0), fcMsgs(3, 300)...) {
@@ -135,14 +154,39 @@ func TestFlowControlSizeGateIsInMiBAndStrictlyGreater(t *testing.T) {
 	if fcHit(c, fcQueue(0), fcMsg(0, mib)) {
 		t.Errorf("exactly 1 MiB must not hit: the gate is >, not >=")
 	}
-	// ...but one byte over it is, which separates ">" from a sloppy "much greater".
-	if !fcHit(c, fcQueue(0), fcMsg(0, mib+1)) {
-		t.Errorf("1 MiB + 1 byte exceeds a 1 MiB threshold")
+	// ...and the division is INTEGER, so the MiB left over by the floor is invisible: 1 MiB + 1
+	// byte reads as 1 MiB and a 1 MiB budget tolerates it. Reverting to a float division (or to
+	// comparing bytes) reddens this leg -- it is the whole point of the "MiB" unit.
+	if fcHit(c, fcQueue(0), fcMsg(0, mib+1), fcMsg(1, 1)) {
+		t.Errorf("1 MiB + 2 bytes still floors to 1 whole MiB, which a 1 MiB budget allows")
 	}
-	// 0 disables the gate outright; a huge buffer then means nothing.
+	if !fcHit(c, fcQueue(0), fcMsg(0, 2*mib)) {
+		t.Errorf("2 whole MiB exceeds a 1 MiB threshold")
+	}
+	// No "0 disables the byte gate" switch: 0 means "cache no whole MiB", which the first full
+	// MiB trips.
 	c.SetPullThresholdSizeForQueue(0)
-	if fcHit(c, fcQueue(0), fcMsg(0, 4*mib)) {
-		t.Errorf("threshold 0 must disable the byte gate")
+	if !fcHit(c, fcQueue(0), fcMsg(0, mib)) {
+		t.Errorf("threshold 0 must trip on the first whole MiB, not disable the gate")
+	}
+}
+
+func TestFlowControlSizeGateMeasuresBodyBytesNotStoreSize(t *testing.T) {
+	c := fcConsumer(t, "GID_go_fc_size_body")
+	c.SetPullThresholdSizeForQueue(1)
+	// A record the broker stored as 4 MiB on the wire but whose body decompressed to 10 bytes is
+	// 10 bytes of client memory: the cache the threshold protects is the body, and the wire size
+	// is only a trace/telemetry field.
+	wired := fcMsg(0, 10)
+	wired.StoreSize = 4 * mib
+	if fcHit(c, fcQueue(0), wired) {
+		t.Errorf("a 10-byte body with a 4 MiB storeSize must not hit a 1 MiB gate: the gate sums bodies")
+	}
+	// Control: the same wire size carried by a real 2 MiB body does hit.
+	big := fcMsg(0, 2*mib)
+	big.StoreSize = 10
+	if !fcHit(c, fcQueue(0), big) {
+		t.Errorf("a 2 MiB body must hit a 1 MiB gate whatever its storeSize says")
 	}
 }
 
@@ -161,27 +205,84 @@ func TestFlowControlSpanGateIsStrictlyGreater(t *testing.T) {
 	if !fcHit(c, fcQueue(0), fcMsg(50, 1), fcMsg(5, 1), fcMsg(7, 1)) {
 		t.Errorf("an out-of-order buffer must measure the span as max-min")
 	}
+	// 0 is "do not run ahead at all", not "off": a two-message buffer whose offsets differ by 1
+	// already exceeds it.
 	c.SetConsumeConcurrentlyMaxSpan(0)
-	if fcHit(c, fcQueue(0), fcMsg(0, 1), fcMsg(1_000_000_000, 1)) {
-		t.Errorf("maxSpan 0 must disable the span gate")
+	if !fcHit(c, fcQueue(0), fcMsg(0, 1), fcMsg(1, 1)) {
+		t.Errorf("maxSpan 0 must trip on a span of 1")
+	}
+	// Control: one buffered message spans 0, which is not over a budget of 0.
+	if fcHit(c, fcQueue(0), fcMsg(0, 1)) {
+		t.Errorf("a single message spans 0 and must not trip a maxSpan of 0")
 	}
 }
 
-func TestFlowControlGateOrderIsCountSizeSpan(t *testing.T) {
-	c := MustNewDefaultMQPushConsumer("GID_go_fc_order")
-	c.mu.Lock()
-	c.pullThresholdForQueue = 1
-	c.pullThresholdSizeForQueue = 1
-	c.consumeConcurrentlyMaxSpan = 1
-	c.pullThresholdForTopic = -1
-	c.pullThresholdSizeForTopic = -1
-	c.mu.Unlock()
-	// All three match at once: exactly one tick per judgment, not one per matching gate.
-	if !fcHit(c, fcQueue(0), fcMsg(0, 2*mib), fcMsg(100, 2*mib)) {
-		t.Fatalf("all three gates match, so the queue must pause")
+// The span term is the ordered path's one exception, and the exception is total: it does not run
+// at all, because an ordered queue cannot pull past the batch still in the listener's hands, so
+// there is no run-ahead to guard against. The paired control is the SAME cache on the concurrent
+// path, which does trip.
+func TestFlowControlSpanGateNeverRunsForOrderlyConsumption(t *testing.T) {
+	c := fcConsumer(t, "GID_go_fc_orderly_span")
+	c.SetConsumeConcurrentlyMaxSpan(10)
+	wide := []*common.MessageExt{fcMsg(0, 1), fcMsg(10, 1), fcMsg(20, 1)}
+
+	if !fcHit(c, fcQueue(0), wide...) {
+		t.Errorf("the concurrent path must judge the span: 0..20 is over a budget of 10")
 	}
-	if got := fcTriggered(c); got != 1 {
-		t.Errorf("flowControlTriggered = %d, want 1 when several gates match at once", got)
+	fcSeedTrips(c, 0)
+	orderly := newProcessQueue(true)
+	if fcHitQueue(c, fcQueue(0), orderly, wide...) {
+		t.Errorf("the same cache must not pause an orderly queue: the span gate does not run there")
+	}
+	if got := fcTriggered(c); got != 0 {
+		t.Errorf("flowControlTriggered = %d, want 0: an orderly queue has no span term ticked", got)
+	}
+	// The exception is the span alone. Count and size still bind an ordered queue, over the same
+	// held set the concurrent path reads.
+	c.SetPullThresholdForQueue(2)
+	if !fcHitQueue(c, fcQueue(0), newProcessQueue(true), wide...) {
+		t.Errorf("3 held messages must trip a count budget of 2 on the ordered path too")
+	}
+}
+
+// The gates judge everything the queue HOLDS: taking a batch out of the buffer and handing it to
+// a listener does not shrink the cache, it only moves the message. A buffer-only reading would let
+// a wedged listener pull forever, so the dispatched batch has to stay in every term.
+func TestFlowControlJudgesTheHeldSetNotTheUndispatchedBuffer(t *testing.T) {
+	c := fcConsumer(t, "GID_go_fc_held")
+	c.SetPullThresholdForQueue(3)
+	pq := newProcessQueue(false)
+	pq.PutMessage(fcMsgs(4, 10))
+	if reason := c.cacheGateReason(pq); reason != "count" {
+		t.Fatalf("4 buffered over a budget of 3 = %q, want the count gate", reason)
+	}
+
+	// Dispatch the head: the buffer alone is now exactly at the budget, the held set is not.
+	taken := pq.TakeBatch(1)
+	if len(taken) != 1 {
+		t.Fatalf("TakeBatch handed out %d messages, want 1", len(taken))
+	}
+	if got := pq.PendingCount(); got != 3 {
+		t.Fatalf("undispatched buffer = %d, want 3: the fixture must sit exactly on the budget", got)
+	}
+	if reason := c.cacheGateReason(pq); reason != "count" {
+		t.Errorf("after dispatching one message the gate reads %q: a buffer-only count would pull again", reason)
+	}
+
+	// The same batch rolled back is still the same held set: neither term double-counts it.
+	pq.RequeueBatch(taken)
+	if got := pq.PendingCount(); got != 4 {
+		t.Fatalf("undispatched buffer after the requeue = %d, want 4", got)
+	}
+	if reason := c.cacheGateReason(pq); reason != "count" {
+		t.Errorf("after a requeue the gate reads %q, want the count gate", reason)
+	}
+
+	// The batch settles, the held set drops to the budget and the queue pulls again: the in-flight
+	// term is released with the batch, not left behind.
+	pq.CompleteBatch(taken)
+	if reason := c.cacheGateReason(pq); reason != "" {
+		t.Errorf("after the batch settled the gate reads %q, want no gate at exactly 3 held", reason)
 	}
 }
 
@@ -259,26 +360,54 @@ func fcPerQueueKnobs(c *DefaultMQPushConsumer) (count, size int64) {
 func TestFlowControlCacheGateReasonNamesOnlyThePerQueueGates(t *testing.T) {
 	c := fcConsumer(t, "GID_go_fc_reason")
 	c.SetPullThresholdForQueue(2)
-	c.SetPullThresholdSizeForQueue(0)
-	c.SetConsumeConcurrentlyMaxSpan(0)
-	pq := newProcessQueue(false)
-	if reason := c.cacheGateReason(pq); reason != "" {
+	if reason := c.cacheGateReason(newProcessQueue(false)); reason != "" {
 		t.Errorf("empty buffer reason = %q, want no gate", reason)
 	}
 	if reason := c.cacheGateReason(fcStageQueue(c, 0, 3, 10)); reason != "count" {
 		t.Errorf("over-buffered reason = %q, want the message-count gate", reason)
 	}
 
-	c.SetPullThresholdForQueue(1 << 30)
+	c.SetPullThresholdForQueue(fcOff)
 	c.SetPullThresholdSizeForQueue(1)
-	if reason := c.cacheGateReason(fcStageQueue(c, 0, 1, mib+1)); reason != "size" {
+	if reason := c.cacheGateReason(fcStageQueue(c, 0, 1, 2*mib)); reason != "size" {
 		t.Errorf("over-bytes buffer reason = %q, want the byte gate", reason)
 	}
 
-	c.SetPullThresholdSizeForQueue(0)
+	c.SetPullThresholdSizeForQueue(fcOff)
 	c.SetConsumeConcurrentlyMaxSpan(10)
 	if reason := c.cacheGateReason(fcStageQueue(c, 0, 2, 1, fcMsg(0, 1), fcMsg(99, 1))); reason != "span" {
 		t.Errorf("wide-offset buffer reason = %q, want the offset-span gate", reason)
+	}
+}
+
+// The three terms are judged in one fixed order, and a queue that is over several budgets at once
+// names only the first: the reason a log line carries is therefore the gate that would have paused
+// the pull earliest, not whichever term happens to be largest.
+func TestFlowControlGateOrderIsCountSizeSpan(t *testing.T) {
+	c := fcConsumer(t, "GID_go_fc_reason_order")
+	stage := fcStageQueue(c, 0, 2, 2*mib, fcMsg(0, 2*mib), fcMsg(100, 2*mib))
+
+	c.SetPullThresholdForQueue(1)
+	c.SetPullThresholdSizeForQueue(1)
+	c.SetConsumeConcurrentlyMaxSpan(1)
+	if reason := c.cacheGateReason(stage); reason != "count" {
+		t.Errorf("all three budgets exceeded reason = %q, want the count gate named first", reason)
+	}
+	c.SetPullThresholdForQueue(fcOff)
+	if reason := c.cacheGateReason(stage); reason != "size" {
+		t.Errorf("count out of reach, size and span exceeded reason = %q, want the byte gate", reason)
+	}
+	c.SetPullThresholdSizeForQueue(fcOff)
+	if reason := c.cacheGateReason(stage); reason != "span" {
+		t.Errorf("only the span left reason = %q, want the offset-span gate", reason)
+	}
+	// Exactly one tick per judgment, whatever the number of matching terms.
+	fcSeedTrips(c, 0)
+	if !c.flowControlHit(fcQueue(0), stage) {
+		t.Fatalf("a queue over three budgets must pause")
+	}
+	if got := fcTriggered(c); got != 1 {
+		t.Errorf("flowControlTriggered = %d, want 1 when several gates match at once", got)
 	}
 }
 

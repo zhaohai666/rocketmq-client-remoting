@@ -457,7 +457,8 @@ def s9_cache_gate_bounded_pull() -> None:
         c.set_poll_timeout_millis(1000)
         c.set_pull_batch_size(batch)
         # Only the count gate is under test: the size gate (100 MiB) and the span gate (2000) cannot
-        # trip on 200 tiny messages, and the whole-buffer gate would need threshold*batch to stay clear.
+        # trip on 200 tiny messages, and the pending-round gate reserves a whole batch for every round
+        # not polled yet, so the budget below stays far above the ~7 rounds this backlog can hold.
         c.set_pull_threshold_for_queue(threshold)
         c.set_pull_threshold_for_all(n_gate * batch)
         c.auto_commit = False

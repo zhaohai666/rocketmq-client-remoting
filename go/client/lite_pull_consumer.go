@@ -25,8 +25,11 @@ import (
 )
 
 const (
-	// DefaultLitePullBatchSize is pullBatchSize — messages per pull request.
-	DefaultLitePullBatchSize = int32(32)
+	// DefaultLitePullBatchSize is pullBatchSize — messages per pull request. The
+	// lite consumer's default is 10, not the push consumer's 32, and since the
+	// aggregate gate budgets a whole batch per pending pull round it is also the
+	// multiplier of that budget.
+	DefaultLitePullBatchSize = int32(10)
 	// DefaultLitePollTimeoutMillis is pollTimeoutMillis — how long Poll waits
 	// for the buffer to become non-empty.
 	DefaultLitePollTimeoutMillis = int64(5000)
@@ -57,23 +60,24 @@ const (
 	// drains it with Poll, so without these budgets a slow (or absent) poller
 	// turns the buffer into an unbounded queue.
 	//
-	// DefaultLitePullThresholdForAll is pullThresholdForAll — the message-count
-	// budget of the WHOLE buffer, summed over every queue.
+	// DefaultLitePullThresholdForAll is pullThresholdForAll — the budget of
+	// PULL CAPACITY still waiting to be drained: the pending pull rounds of every
+	// queue, each budgeted a whole pullBatchSize, compared against this number.
 	DefaultLitePullThresholdForAll = int64(10000)
 	// DefaultLitePullThresholdForQueue is pullThresholdForQueue — messages ONE
 	// queue may still hold in the buffer.
 	DefaultLitePullThresholdForQueue = int64(1000)
 	// DefaultLitePullThresholdSizeForQueue is pullThresholdSizeForQueue — MiB
-	// ONE queue may still hold, counted as stored size (what the commitlog
-	// record costs), not body length.
+	// ONE queue may still hold, counted as message BODY bytes (what the client
+	// keeps in memory after decoding), never the wire-side store size.
 	DefaultLitePullThresholdSizeForQueue = int64(100)
 	// DefaultLiteConsumeMaxSpan is consumeMaxSpan — the queueOffset span ONE
 	// queue's cached messages may cover.
 	DefaultLiteConsumeMaxSpan = int64(2000)
 
-	// storedMiBBytes is the unit the size gate divides by. The division is an
+	// bodyMiBBytes is the unit the size gate divides by. The division is an
 	// integer one, so a partial MiB never counts toward the budget.
-	storedMiBBytes = int64(1024 * 1024)
+	bodyMiBBytes = int64(1024 * 1024)
 
 	// The names the cache gates judge under, one per budget. "count" and "size"
 	// share a trip counter — both mean "this queue holds too much of the buffer".
@@ -410,6 +414,9 @@ func (c *DefaultLitePullConsumer) SetPollNameServerInterval(millis int64) {
 	c.pollNamesrvIntv = millis
 }
 
+// SetPullBatchSize sets how many messages one pull request asks for. The value is
+// not only the request size: the whole-buffer budget charges every pending pull
+// round this many messages, so raising it raises the aggregate's pressure.
 func (c *DefaultLitePullConsumer) SetPullBatchSize(n int32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -417,6 +424,12 @@ func (c *DefaultLitePullConsumer) SetPullBatchSize(n int32) {
 		n = 1
 	}
 	c.pullBatchSize = n
+}
+
+func (c *DefaultLitePullConsumer) PullBatchSize() int32 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.pullBatchSize
 }
 
 func (c *DefaultLitePullConsumer) SetPollTimeoutMillis(ms int64) {
@@ -457,10 +470,12 @@ func (c *DefaultLitePullConsumer) SetPullIntervalMillis(ms int64) {
 
 // ---------------------------------------------------------------- cache budgets
 
-// SetPullThresholdForAll sets the message-count budget of the WHOLE local
-// buffer, summed over every queue: the aggregate gate every pull round judges
-// first. A plain budget — no clamping, so 0 means "trip on the first cached
-// message", which is a legal configuration.
+// SetPullThresholdForAll sets the budget of PULL CAPACITY still waiting to be
+// drained: every queue's pull rounds whose messages the application has not
+// polled yet count, each round budgeted a whole pullBatchSize, and the product is
+// compared against this number. The aggregate gate every pull round judges first.
+// A plain budget — no clamping, so 0 means "trip on the first pending round",
+// which is a legal configuration.
 func (c *DefaultLitePullConsumer) SetPullThresholdForAll(n int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -489,8 +504,9 @@ func (c *DefaultLitePullConsumer) PullThresholdForQueue() int64 {
 }
 
 // SetPullThresholdSizeForQueue sets how many MiB ONE queue may still hold,
-// measured as stored size — what the commitlog record costs the client — so a
-// few large messages weigh as much as many small ones.
+// measured as the message BODY bytes — the payload the application actually gets,
+// never the wire-side store size — so a few large messages weigh as much as many
+// small ones. The gate divides by whole MiB, so a partial MiB costs nothing.
 func (c *DefaultLitePullConsumer) SetPullThresholdSizeForQueue(n int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1811,11 +1827,12 @@ func (c *DefaultLitePullConsumer) enqueue(msgs []*common.MessageExt) {
 // ------------------------------------------------------- cached backlog accounting
 
 // liteQueueCache is ONE queue's share of the local buffer: how many of its
-// messages are still cached, how many stored bytes they cost and which offsets
-// they cover. It exists so a per-queue verdict reads three numbers instead of
-// walking the buffer, and it only ever moves inside the primitives that move the
-// buffer itself (appendBufferLocked / drainBufferLocked / pruneBufferLocked),
-// under bufMu, so it cannot drift from what is actually cached.
+// messages are still cached, how many BODY bytes they cost, which offsets they
+// cover, and how many of its pull rounds are still waiting for the application.
+// It exists so a per-queue verdict reads numbers instead of walking the buffer,
+// and it only ever moves inside the primitives that move the buffer itself
+// (appendBufferLocked / drainBufferLocked / pruneBufferLocked), under bufMu, so it
+// cannot drift from what is actually cached.
 type liteQueueCache struct {
 	bytes int64
 	// offsets holds this queue's cached queueOffsets in ascending order, one
@@ -1823,10 +1840,28 @@ type liteQueueCache struct {
 	// first-to-last. Pull results arrive ascending, so the common update is an
 	// append; a rewound cursor (Seek) inserts in place.
 	offsets []int64
+	// rounds holds, per pull round of this queue, how many of its messages are STILL in the
+	// buffer, oldest round first; a round drops out as soon as its last message is polled. The
+	// aggregate gate budgets one whole batch per round still represented here rather than the
+	// messages that round happened to bring back, so it needs the round count, not the message
+	// count. This queue's own messages always leave in round order — the shared buffer is drained
+	// from its head and a rewind drops a prefix of this queue's offsets — so only the front
+	// round's remainder ever has to be tracked.
+	rounds []int
 }
 
+// beginRound records that one pull round of this queue left count messages in the buffer.
+func (s *liteQueueCache) beginRound(count int) {
+	if count > 0 {
+		s.rounds = append(s.rounds, count)
+	}
+}
+
+// pendingRounds is how many of this queue's pull rounds still hold messages in the buffer.
+func (s *liteQueueCache) pendingRounds() int { return len(s.rounds) }
+
 func (s *liteQueueCache) add(m *common.MessageExt) {
-	s.bytes += int64(m.StoreSize)
+	s.bytes += int64(len(m.GetBody()))
 	off := m.QueueOffset
 	n := len(s.offsets)
 	if n == 0 || off >= s.offsets[n-1] {
@@ -1842,16 +1877,28 @@ func (s *liteQueueCache) add(m *common.MessageExt) {
 // remove retires one cached message. An offset that is not in the set means the
 // entry belongs to a queue that no longer has an accumulator (its messages
 // outlive the accounting until the application polls them away), so there is
-// nothing to retire here and the aggregate budget is the number that still sees
-// them.
+// nothing to retire here.
 func (s *liteQueueCache) remove(m *common.MessageExt) {
+	// Whatever left the buffer belongs to the oldest round still represented here.
+	if len(s.rounds) > 0 {
+		s.rounds[0]--
+		if s.rounds[0] <= 0 {
+			s.rounds = s.rounds[1:]
+		}
+	}
 	off := m.QueueOffset
 	i := sort.Search(len(s.offsets), func(j int) bool { return s.offsets[j] >= off })
 	if i == len(s.offsets) || s.offsets[i] != off {
 		return
 	}
 	s.offsets = append(s.offsets[:i], s.offsets[i+1:]...)
-	s.bytes -= int64(m.StoreSize)
+	s.bytes -= int64(len(m.GetBody()))
+	if len(s.offsets) == 0 {
+		// Nothing of this queue is cached any more: the numbers reset, so an empty cache reads
+		// as "0 count, 0 bytes, 0 span" and never as a stale remainder.
+		s.bytes = 0
+		s.rounds = nil
+	}
 }
 
 func (s *liteQueueCache) count() int { return len(s.offsets) }
@@ -1883,11 +1930,19 @@ func (c *DefaultLitePullConsumer) cacheOfLocked(mq common.MessageQueue) *liteQue
 }
 
 // appendBufferLocked adds the fetched messages to the buffer and to their
-// queues' accounting in the same step. Callers hold bufMu.
+// queues' accounting in the same step, and books ONE pending pull round per
+// queue the round touched: the aggregate gate budgets the round, not the messages
+// that happened to come back with it. Callers hold bufMu.
 func (c *DefaultLitePullConsumer) appendBufferLocked(msgs []*common.MessageExt) {
 	c.buffer = append(c.buffer, msgs...)
+	perQueue := make(map[common.MessageQueue]int, 1)
 	for _, m := range msgs {
-		c.cacheOfLocked(liteQueueKey(m)).add(m)
+		mq := liteQueueKey(m)
+		c.cacheOfLocked(mq).add(m)
+		perQueue[mq]++
+	}
+	for mq, count := range perQueue {
+		c.cacheOfLocked(mq).beginRound(count)
 	}
 }
 
@@ -1918,8 +1973,10 @@ func (c *DefaultLitePullConsumer) drainBufferLocked(n int) []*common.MessageExt 
 // not something a pull round pays. Callers hold bufMu.
 func (c *DefaultLitePullConsumer) pruneBufferLocked(mq common.MessageQueue, from int64) {
 	kept := c.buffer[:0:0]
+	pruned := 0
 	for _, m := range c.buffer {
 		if liteQueueKey(m) == mq && m.QueueOffset < from {
+			pruned++
 			continue
 		}
 		kept = append(kept, m)
@@ -1932,6 +1989,12 @@ func (c *DefaultLitePullConsumer) pruneBufferLocked(mq common.MessageQueue, from
 			rebuilt.add(m)
 		}
 	}
+	// The pruned messages are this queue's OLDEST cached ones, so they came out of its oldest
+	// rounds: the round list is retired from the front exactly as poll() drains it, and the
+	// aggregate gate keeps counting the rounds whose messages the application can still poll.
+	if old := c.cacheStats[mq]; old != nil {
+		rebuilt.rounds = retireRounds(old.rounds, pruned)
+	}
 	if rebuilt.count() == 0 {
 		delete(c.cacheStats, mq)
 		return
@@ -1939,11 +2002,32 @@ func (c *DefaultLitePullConsumer) pruneBufferLocked(mq common.MessageQueue, from
 	c.cacheStats[mq] = rebuilt
 }
 
+// retireRounds removes the first n cached messages from the round list and returns
+// what is left: a round drops out once all of its messages are gone.
+func retireRounds(rounds []int, n int) []int {
+	out := rounds
+	for n > 0 && len(out) > 0 {
+		if out[0] > n {
+			rest := make([]int, len(out))
+			copy(rest, out)
+			rest[0] -= n
+			return rest
+		}
+		n -= out[0]
+		out = out[1:]
+	}
+	if n > 0 {
+		return nil
+	}
+	return out
+}
+
 // dropQueueCache retires a queue this consumer no longer owns: its accounting
 // and its pending pull pause go away together. What its messages still occupy in
-// the buffer stays there for the application (and keeps weighing on the
-// whole-buffer budget, which reads the buffer itself), but no leftover count can
-// refuse a pull for a queue nobody owns.
+// the buffer stays there for the application, but the pull rounds it leaves behind
+// stop weighing on the whole-buffer budget — that budget counts the rounds whose
+// messages are still waiting to be polled by a queue this client still holds — and
+// no leftover count can refuse a pull for a queue nobody owns.
 func (c *DefaultLitePullConsumer) dropQueueCache(mq common.MessageQueue) {
 	c.mu.Lock()
 	delete(c.pullPause, mq)
@@ -1953,10 +2037,15 @@ func (c *DefaultLitePullConsumer) dropQueueCache(mq common.MessageQueue) {
 	c.bufMu.Unlock()
 }
 
-// liteCacheStats is one judgment's measurements: this queue's own cached count,
-// stored bytes and offset range, plus everything the buffer holds.
+// liteCacheStats is one judgment's measurements: this queue's own cached count, body bytes and
+// offset range, plus the pull capacity the whole buffer has reserved.
 type liteCacheStats struct {
-	total     int
+	// rounds is the number of pull rounds still waiting for the application across EVERY queue,
+	// and reserved is what the aggregate gate compares: rounds x pullBatchSize. The gate budgets a
+	// round, not the messages that round happened to bring back.
+	rounds    int
+	reserved  int64
+	batch     int64
 	count     int
 	bytes     int64
 	minOffset int64
@@ -1964,18 +2053,33 @@ type liteCacheStats struct {
 	span      int64
 }
 
-// sizeMiB is the size gate's unit: whole MiB of stored size, integer division,
-// so a partial MiB does not count toward the budget.
-func (s liteCacheStats) sizeMiB() int64 { return s.bytes / storedMiBBytes }
+// sizeMiB is the size gate's unit: whole MiB of message BODY, integer division, so a partial MiB
+// does not count toward the budget.
+func (s liteCacheStats) sizeMiB() int64 { return s.bytes / bodyMiBBytes }
 
-// cacheStatsOf reads this queue's share of the backlog plus the buffer's total.
-// The total IS len(buffer), so the aggregate gate can never disagree with what
-// is cached; the per-queue numbers come from the accumulator, so a verdict costs
-// no scan.
+// roundsFitInAll is the aggregate threshold translated back into rounds: the budget is stated in
+// messages while the gate counts rounds, so the warn line says how many rounds still fit.
+func (s liteCacheStats) roundsFitInAll(all int64) int64 {
+	if s.batch <= 0 {
+		return all
+	}
+	return (all + s.batch - 1) / s.batch
+}
+
+// cacheStatsOf reads this queue's share of the backlog plus the rounds every queue still has
+// waiting. The per-queue numbers come from the accumulator, so a verdict costs no scan of the
+// buffer; the round sum walks the accumulators, one entry per owned queue.
 func (c *DefaultLitePullConsumer) cacheStatsOf(mq common.MessageQueue) liteCacheStats {
 	c.bufMu.Lock()
 	defer c.bufMu.Unlock()
-	st := liteCacheStats{total: len(c.buffer)}
+	c.mu.Lock()
+	batch := int64(c.pullBatchSize)
+	c.mu.Unlock()
+	st := liteCacheStats{batch: batch}
+	for _, s := range c.cacheStats {
+		st.rounds += s.pendingRounds()
+	}
+	st.reserved = int64(st.rounds) * batch
 	s := c.cacheStats[mq]
 	if s == nil {
 		return st
@@ -1993,8 +2097,8 @@ func (c *DefaultLitePullConsumer) cacheStatsOf(mq common.MessageQueue) liteCache
 // ------------------------------------------------------------- cache-flow gates
 
 // cacheGateReason names the budget this queue is over, in the judgment's exact
-// order — the whole-buffer count, then this queue's count, its stored size and
-// its offset span — or "" when the queue may pull.
+// order — the pull capacity reserved across every queue, then this queue's count,
+// its body size and its offset span — or "" when the queue may pull.
 //
 // Gates two to four read only THIS queue's accumulator, so a sibling that is over
 // its budget never stops this one; the first gate is the one budget that spans
@@ -2011,7 +2115,7 @@ func (c *DefaultLitePullConsumer) cacheGateReason(mq common.MessageQueue) (strin
 	c.mu.Unlock()
 
 	switch {
-	case int64(st.total) > all:
+	case st.reserved > all:
 		return liteGateAll, all, st
 	case int64(st.count) > count:
 		return liteGateCount, count, st
@@ -2038,15 +2142,18 @@ func (c *DefaultLitePullConsumer) flowControlHit(mq common.MessageQueue) bool {
 		return false
 	}
 	times := c.tickFlowControl(reason)
-	common.LogDebugf("lite flow control: queue %v gate=%s cached=%d count=%d size=%d MiB span=%d threshold=%d"+
+	common.LogDebugf("lite flow control: queue %v gate=%s pendingRounds=%d reserved=%d count=%d size=%d MiB span=%d threshold=%d"+
 		", pause pull for %s (flowControlTimes=%d)",
-		mq, reason, st.total, st.count, st.sizeMiB(), st.span, threshold,
+		mq, reason, st.rounds, st.reserved, st.count, st.sizeMiB(), st.span, threshold,
 		pullTimeDelayMillsWhenFlowControl, times)
 	if isFlowControlWarnTrip(times) {
 		switch reason {
 		case liteGateAll:
+			// The budget is stated in messages while the gate counts rounds, so the warn
+			// translates it back into the number of rounds that fit.
 			common.LogWarnf("the consume request count exceeds threshold %d, so do flow control, "+
-				"cached=%d, flowControlTimes=%d", threshold, st.total, times)
+				"consume request count=%d, flowControlTimes=%d",
+				st.roundsFitInAll(threshold), st.rounds, times)
 		case liteGateCount:
 			common.LogWarnf("The cached message count exceeds the threshold %d, so do flow control, "+
 				"minOffset=%d, maxOffset=%d, count=%d, size=%d MiB, flowControlTimes=%d",

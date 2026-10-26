@@ -60,27 +60,35 @@ export class ProcessQueue {
     return this.msgAccCnt;
   }
 
-  // PendingStats is the flow-control triple (count, size in MB, offset span)
-  // computed over the NOT-yet-dispatched entries only.
-  pendingStats(): [number, number, number] {
+  // HeldStats is the flow-control triple (count, whole MiB of message BODY, offset
+  // span) over EVERYTHING this queue still holds: the undispatched buffer plus the
+  // batches that are already in the listener's hands. A dispatched batch has only
+  // moved, it has not left the queue — it leaves when it settles (completeBatch /
+  // removeMessage) — so a gate that read the buffer alone would let a queue whose
+  // listener is wedged keep pulling, which is exactly what the cache thresholds
+  // exist to stop.
+  //
+  // The byte sum is the BODY the client keeps in memory after decoding, never the
+  // wire-side store size, and it is divided by whole MiB: a partially filled MiB
+  // costs nothing toward the budget.
+  heldStats(): [number, number, number] {
     let count = 0;
-    let size = 0;
+    let bytes = 0;
     let minOffset = 0;
     let maxOffset = 0;
     let first = true;
     for (const offset of this.order) {
-      if (this.dispatched.has(offset)) continue;
       const msg = this.msgs.get(offset);
       if (!msg) continue;
       count++;
       const body = msg.getBody();
-      size += body ? body.length : 0;
+      bytes += body ? body.length : 0;
       if (first || offset < minOffset) minOffset = offset;
       if (first || offset > maxOffset) maxOffset = offset;
       first = false;
     }
     const span = count > 0 ? maxOffset - minOffset : 0;
-    return [count, size / (1024.0 * 1024.0), span];
+    return [count, Math.floor(bytes / (1024 * 1024)), span];
   }
 
   msgCount(): number {
@@ -88,8 +96,9 @@ export class ProcessQueue {
   }
 
   // PendingCount is the number of pulled-and-not-yet-dispatched messages, i.e.
-  // the retry buffer. Flow control is measured on this one so that a slow
-  // listener does not look like a backlog.
+  // the retry buffer. It is NOT what flow control reads: a batch handed to a
+  // listener has only moved, it has not left the queue, so the gates judge
+  // heldStats() — the whole held set, listener-held batches included.
   pendingCount(): number {
     return this.msgs.size - this.dispatched.size;
   }

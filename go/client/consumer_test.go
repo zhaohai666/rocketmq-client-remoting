@@ -107,6 +107,11 @@ type consumerBroker struct {
 
 	queryAssignments   []*remoting.QueryAssignmentRequestBody
 	assignmentsByTopic map[string]*assignmentFixture
+
+	// heartbeats captures every decoded HEARTBEAT(34) body, oldest first. A test
+	// that needs to know what a beat CARRIED — the subscription version, which
+	// topics had subscriptions at all — reads this, not just the request count.
+	heartbeats []*remoting.HeartbeatData
 }
 
 func newConsumerBroker() *consumerBroker {
@@ -186,6 +191,13 @@ func (b *consumerBroker) handler() func(*mockServer, *remoting.RemotingCommand) 
 	return func(_ *mockServer, req *remoting.RemotingCommand) *remoting.RemotingCommand {
 		b.mu.Lock()
 		b.reqOrder = append(b.reqOrder, req.Code)
+		if req.Code == remoting.ReqHeartBeat {
+			// A beat the mock cannot parse is still a beat; keep the raw bytes out
+			// of the assertions and record only what decoded.
+			if hb, err := remoting.DecodeHeartbeatData(req.Body); err == nil {
+				b.heartbeats = append(b.heartbeats, hb)
+			}
+		}
 		b.mu.Unlock()
 		return b.answer(req)
 	}
@@ -517,6 +529,42 @@ func (b *consumerBroker) indexOfReq(code int32) int {
 		}
 	}
 	return -1
+}
+
+// countReq is how many requests with this code reached the broker. A rebalance
+// round that owes exactly one beat is judged on the DELTA around the call, so the
+// beats Start() and the periodic task already spent do not move the assertion.
+func (b *consumerBroker) countReq(code int32) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	n := 0
+	for _, c := range b.reqOrder {
+		if c == code {
+			n++
+		}
+	}
+	return n
+}
+
+// beatSubVersions lists, one entry per captured HEARTBEAT in arrival order, the
+// subscription version that beat carried for one topic — or -1 when it carried no
+// subscription for that topic at all.
+func (b *consumerBroker) beatSubVersions(topic string) []int64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([]int64, 0, len(b.heartbeats))
+	for _, hb := range b.heartbeats {
+		found := int64(-1)
+		for _, cd := range hb.ConsumerDataSet {
+			for _, sub := range cd.SubscriptionDataSet {
+				if sub.Topic == topic {
+					found = sub.SubVersion
+				}
+			}
+		}
+		out = append(out, found)
+	}
+	return out
 }
 
 func (b *consumerBroker) minOffsetQueries() []mqKey {

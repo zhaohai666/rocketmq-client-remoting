@@ -24,11 +24,11 @@ python3 -m venv .venv
 .venv/bin/pip install -e .                     # 顶层包：client / common / remoting
 
 .venv/bin/pip install pytest                   # 只有跑单元测试才需要它
-.venv/bin/python -m pytest tests/ -q           # 1673 passed, 4 skipped（123.6s）
+.venv/bin/python -m pytest tests/ -q           # 1688 passed, 4 skipped（123.3s）
 .venv/bin/python selfcheck.py                  # selfcheck: 7/7 passed
 ```
 
-- `pytest` 收集 1636 个用例，全部离线跑，不需要集群。其中 4 个 skip 全部来自
+- `pytest` 收集 1692 个用例，全部离线跑，不需要集群。其中 4 个 skip 全部来自
   `tests/test_protocol_alignment.py`（可选的协议常量比对守卫，默认不启用）。
 - `selfcheck.py` 是 7 项协议编解码回环自检（JSON 头 / 二进制头 / V2 短字段头 /
   17 段存储格式 / 长 topic V2 magic / 6 段批量格式 / ACL 签名注入），无需集群；
@@ -365,9 +365,9 @@ TCP 建连后、TLS 握手前完成 SOCKS CONNECT；NameServer HTTP 动态取址
 | 普通 / 顺序（selector）/ 定点 / 延迟定时 / 事务两阶段 / 批量 / 单向 / 异步（含公平信号量背压） | ✅ |
 | Request-Reply（325 发送 + 326 推回，同步与异步两种形态） | ✅ |
 | 定时消息撤回 `recall_message`（370，句柄来自 `SendResult.recall_handle`） | ✅ |
-| Push Consumer：并发 / 顺序监听、广播、每队列三条缓存闸门（topic 预算在重平衡时摊到每队列）、位点修正与重置、停摆自愈、挂起消息清扫 | ✅ |
+| Push Consumer：并发 / 顺序监听、广播、每队列三条缓存闸门（度量该队列持有的全部消息：未派发缓冲 + 已交给监听器但尚未结算的批次；条数 / 消息体字节整除 MiB / 位点跨度都严格大于才停、阈值不做下限钳制，顺序消费完全不判跨度；topic 预算在重平衡时摊到每队列）、分配集合变化的重平衡轮按序补齐（只给变动的 topic 重打订阅版本 → 摊预算 → 立刻心跳 → 只向变动的 topic 回调 `message_queue_listener`；集合未变的轮次与停摆自愈轮都不做任何事）、位点修正与重置、停摆自愈、挂起消息清扫 | ✅ |
 | Pull Consumer：手动拉取 + 长轮询 + 手动提交位点 + 按时间戳查位点 | ✅ |
-| Lite Pull Consumer：`poll` / `assign` / `seek` / `pause` / `commit`、三张位点表、topic 队列变更监听、拉取前先过四道缓存闸门（整个缓冲条数 `pull_threshold_for_all` 10000 / 本队列条数 `pull_threshold_for_queue` 1000 / 本队列存储字节 `pull_threshold_size_for_queue` 100 MiB 整除 / 本队列位点跨度 `consume_max_span` 2000，都严格大于才停；命中只重排这一个队列 50ms，broker 的 `FLOW_CONTROL`(215) 只等 20ms） | ✅ |
+| Lite Pull Consumer：`poll` / `assign` / `seek` / `pause` / `commit`、三张位点表、topic 队列变更监听、拉取前先过四道缓存闸门（尚未被 `poll` 取走的拉取轮数 × `pull_batch_size`（默认 10）对比 `pull_threshold_for_all` 10000 / 本队列条数 `pull_threshold_for_queue` 1000 / 本队列消息体字节 `pull_threshold_size_for_queue` 100 MiB 整除 / 本队列位点跨度 `consume_max_span` 2000，都严格大于才停；命中只重排这一个队列 50ms，broker 的 `FLOW_CONTROL`(215) 只等 20ms） | ✅ |
 | POP 消费循环（`pop_mode`，含 ack / 续期 / POP 顺序 / 待 ack 欠账闸门：本队列欠账严格大于 `pop_threshold_for_queue`（默认 96）才停、命中重排 50ms 并记进拉取路径那个全局流控计数） | ✅ |
 | 队列分配策略：AVG / AVG_BY_CIRCLE / CONFIG / CONSISTENT_HASH / MACHINE_ROOM / MACHINE_ROOM_NEARBY | ✅ |
 | 命名空间两套：本地前缀 `namespace` 与服务端 `namespace_v2` | ✅ |
@@ -435,7 +435,7 @@ TCP 建连后、TLS 握手前完成 SOCKS CONNECT；NameServer HTTP 动态取址
 | `verify_consumer_heartbeat_slave_live.py` | 消费者心跳扇出到从节点（需集群里有一台从节点） |
 | `verify_correct_tags_offset_live.py` | 空应答也把已提交位点推走（correctTagsOffset） |
 | `verify_fail_fast_live.py` | broker 真死时在途请求立刻有终态（会停一次 broker 再拉起） |
-| `verify_flow_control_live.py` | 拉取前每队列三条缓存闸门（topic 预算摊到每队列）+ 启动期数值闸门 |
+| `verify_flow_control_live.py` | 拉取前每队列三条缓存闸门（度量该队列持有的全部消息：未派发缓冲 + 监听器在手批次；topic 预算摊到每队列）+ 启动期数值闸门 |
 | `verify_heartbeat_v2_live.py` | 心跳 V2 打到真 broker：broker 回 `IS_SUPPORT_HEART_BEAT_V2`、按组的 `group -> fingerprint` 表真的驱动 `IS_SUB_CHANGE`（V1 一轮后首个 V2 轮算变化、下一轮不算、订阅加宽又算），归一化后等价 body 的 fingerprint 与 broker 记下的相等，`withoutSub` 轻 body 不清空 broker 侧订阅集（204 仍能看到），换一个从未交过轻 body 的组则 204 什么都没有；真推消费者走 V2 链路时轻轮次确实上线、每轮被接受、tag 过滤仍然生效、组仍在册；关掉 opt-in 的同一消费者是对照——线上没有一个非零 fingerprint 或 withoutSub，消费结果一致 |
 | `verify_hook_live.py` | CheckForbidden / FilterMessage 钩子的真实拦截 |
 | `verify_interval_live.py` | 路由刷新周期与位点落盘周期按配置生效（两条不同周期对照） |
@@ -514,7 +514,7 @@ python/
 ├── rocketmq_logging.py     日志桥接
 ├── selfcheck.py            无集群的协议编解码回环自检（7 项）
 ├── __main__.py             命令行入口（python -m selfcheck）
-├── tests/                  1636 个离线用例（conftest.py 负责把 python/ 加进 sys.path）
+├── tests/                  1692 个离线用例（conftest.py 负责把 python/ 加进 sys.path）
 ├── verify_*_live.py        真机联调脚本（见「真实集群联调」）
 ├── integration_live_test.py / ns_failover_repro.py / go_*_check.py  联调辅助脚本
 ├── pyproject.toml          零运行时依赖；requires-python >= 3.8

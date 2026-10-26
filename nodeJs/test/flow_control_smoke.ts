@@ -5,15 +5,22 @@
 //   * every cache gate compares STRICTLY GREATER THAN its threshold, so a buffer that
 //     has reached the threshold exactly is still allowed to pull. A threshold reads as
 //     "how many may be cached", not "how many stop us";
-//   * the byte gate is in MiB, not bytes — the single most expensive unit mistake here,
-//     because a 100x error silently disables backpressure;
+//   * the threshold is taken LITERALLY: no max(1, n) floor quietly turns 0 into 1 and no
+//     "0 disables this gate" escape. 0 means "cache nothing", so the first held message
+//     trips it — and keeping each knob inside its legal range is the start-up config
+//     check's job, asserted as the paired control below;
+//   * the byte gate counts WHOLE MiB (integer division) of message BODY: not bytes, not
+//     the wire-side store size, and not a fraction. A partially filled MiB costs nothing
+//     toward the budget, and a unit mistake here silently disables backpressure;
 //   * the span gate measures the OFFSET span (max-min), so one message that keeps failing
-//     cannot let the offset run away;
-//   * the switches: 0 disables the queue-level byte gate, and a count threshold of 0
-//     clamps to 1; the topic-level knobs (-1 = off) are NOT pull-time gates at all —
-//     they are divided into the per-queue knobs at rebalance (topic_threshold_smoke);
-//   * the gate measures the not-yet-dispatched remainder, and one judgment records exactly
-//     one tick even when several gates match;
+//     cannot let the offset run away, and it does not run at all for ordered consumption;
+//   * what the gates measure is everything the queue still HOLDS: the pulled-but-
+//     undispatched buffer UNION the batches already in the listener's hands and not
+//     settled yet. A buffer-only reading lets a queue whose listener is wedged pull forever;
+//   * the topic-level knobs (-1 = off) are NOT pull-time gates at all — they are divided
+//     into the per-queue knobs at rebalance (topic_threshold_smoke);
+//   * one judgment records exactly one tick even when several gates match, and the reason
+//     it reports is the first gate of the fixed order count → size → span;
 //   * the WARN fires on the 1st trip and every 1000th after, while the counter keeps
 //     counting every trip;
 //   * popThresholdForQueue defaults to 96, not to the pull-side 1000;
@@ -76,6 +83,10 @@ const TOPIC = 'NodeJsFlowControlUnitTopic';
 const OTHER_TOPIC = 'NodeJsFlowControlUnitOther';
 const MIB = 1024 * 1024;
 
+// GATE_OFF is a threshold no fixture reaches. The gates have no "disabled" value — 0 means
+// "cache nothing" — so a test that wants one term out of the way parks it out of reach instead.
+const GATE_OFF = 1 << 30;
+
 function queue(topic = TOPIC, queueId = 0): MessageQueue {
   return new MessageQueue(topic, 'broker-a', queueId);
 }
@@ -88,22 +99,36 @@ function msg(offset: number, bodyBytes: number, topic = TOPIC): MessageExt {
   return m;
 }
 
-// gatesOff leaves every gate disabled except the one under test: an earlier hit would mask
+// gatesOff parks every gate except the one under test: an earlier hit would mask
 // the branch being asserted.
 function gatesOff(c: DefaultMQPushConsumer): DefaultMQPushConsumer {
-  c.pullThresholdForQueue = 2 ** 31 - 1;
-  c.pullThresholdSizeForQueue = 0;
-  c.consumeConcurrentlyMaxSpan = 0;
+  c.pullThresholdForQueue = GATE_OFF;
+  c.pullThresholdSizeForQueue = GATE_OFF;
+  c.consumeConcurrentlyMaxSpan = GATE_OFF;
   c.pullThresholdForTopic = -1;
   c.pullThresholdSizeForTopic = -1;
   return c;
 }
 
 function hit(c: DefaultMQPushConsumer, mq: MessageQueue, msgs: MessageExt[]): boolean {
-  const pq = new ProcessQueue(false);
-  pq.putMessage(msgs);
-  c.processQueueTable.set(mqKey(mq), pq);
+  return hitQueue(c, mq, staged(new ProcessQueue(false), msgs));
+}
+
+// hitQueue judges a queue the caller built: an orderly ProcessQueue is the span gate's one
+// exception, so the same holdings can answer differently there.
+function hitQueue(c: DefaultMQPushConsumer, mq: MessageQueue, pq: ProcessQueue): boolean {
   return (c as any)._flowControlHit(mq, pq);
+}
+
+function staged(pq: ProcessQueue, msgs: MessageExt[]): ProcessQueue {
+  pq.putMessage(msgs);
+  return pq;
+}
+
+// hitReason asks the gate which term the holdings are over, without counting a trip: the
+// three checks have one fixed order and the first match is the reported reason.
+function hitReason(pq: ProcessQueue, c: DefaultMQPushConsumer): string {
+  return (c as any)._cacheGateReason(pq);
 }
 
 function consumer(group: string): DefaultMQPushConsumer {
@@ -138,11 +163,14 @@ function consumer(group: string): DefaultMQPushConsumer {
     hit(c, queue(), [msg(0, 10), msg(1, 10), msg(2, 10), msg(3, 10)]));
   check('one judgment records one tick', c.flowControlTriggered === 1);
 
-  // threshold 0 clamps to 1, which under ">" means the 2nd message trips.
+  // No max(1, n) floor quietly turns 0 into 1: the gate takes the configured number as it
+  // stands, so "cache nothing" means the very first held message trips it. Reverting to the
+  // old clamped gate reddens the first leg (a clamped 1 lets one message through).
   const z = gatesOff(consumer('G_nodejs_fc_count_zero'));
   z.pullThresholdForQueue = 0;
-  check('threshold 0 lets one cached message through', !hit(z, queue(), [msg(0, 10)]));
-  check('threshold 0 clamps to 1 and trips on the 2nd message', hit(z, queue(), [msg(0, 10), msg(1, 10)]));
+  check('threshold 0 means cache nothing, so one held message hits', hit(z, queue(), [msg(0, 10)]));
+  // Control: an empty queue holds nothing, which is not over a budget of 0.
+  check('control: an empty queue is not over a budget of 0', !hit(z, queue(), []));
 }
 
 // ---- size gate ---------------------------------------------------------------
@@ -151,11 +179,75 @@ function consumer(group: string): DefaultMQPushConsumer {
   c.pullThresholdSizeForQueue = 1;
   check('900 bytes under a 1 MiB threshold do not hit', !hit(c, queue(), [msg(0, 300), msg(1, 300), msg(2, 300)]));
   check('exactly 1 MiB does NOT hit (>, not >=)', !hit(c, queue(), [msg(0, MIB)]));
-  // One byte over the boundary has to hit: this separates ">" from a sloppy "much greater".
-  check('1 MiB + 1 byte hits', hit(c, queue(), [msg(0, MIB + 1)]));
-  check('2 MiB hits', hit(c, queue(), [msg(0, 2 * MIB)]));
-  c.pullThresholdSizeForQueue = 0;
-  check('threshold 0 disables the byte gate', !hit(c, queue(), [msg(0, 8 * MIB)]));
+  // The division is INTEGER, so the MiB left over by the floor is invisible: 1 MiB + 2 bytes
+  // reads as 1 whole MiB and a 1 MiB budget tolerates it. A float division (or a byte
+  // comparison) reddens this leg — it is the whole point of the unit being MiB.
+  check('1 MiB + 2 bytes still floors to 1 whole MiB, which a 1 MiB budget allows',
+    !hit(c, queue(), [msg(0, MIB + 1), msg(1, 1)]));
+  check('2 whole MiB exceeds a 1 MiB threshold', hit(c, queue(), [msg(0, 2 * MIB)]));
+  // 1.9 MiB of body is 1 whole MiB of budget spent: the gate never trips on a partial MiB.
+  check('1.9 MiB floors to 1 and stays inside a 1 MiB budget',
+    !hit(c, queue(), [msg(0, MIB), msg(1, Math.floor(0.9 * MIB))]));
+  // No "0 disables the byte gate" switch: 0 means "cache no whole MiB".
+  const z = gatesOff(consumer('G_nodejs_fc_size_zero'));
+  z.pullThresholdSizeForQueue = 0;
+  check('threshold 0 trips on the first whole MiB instead of disabling the gate',
+    hit(z, queue(), [msg(0, MIB)]));
+  // Control: 900 KB is 0 whole MiB, and 0 is not over a budget of 0.
+  check('control: a sub-MiB buffer is 0 whole MiB, not over a budget of 0',
+    !hit(z, queue(), [msg(0, 900 * 1024)]));
+}
+
+// ---- the size gate measures the BODY, never the wire store size --------------
+// The cache the threshold protects is what the client keeps in memory after decoding. The
+// store size is the compressed record the broker wrote to disk — a trace field, not a
+// client-side footprint.
+{
+  const c = gatesOff(consumer('G_nodejs_fc_size_body'));
+  c.pullThresholdSizeForQueue = 1;
+  const wired = msg(0, 10);
+  wired.storeSize = 4 * MIB;
+  check('a 10-byte body with a 4 MiB storeSize does not hit a 1 MiB gate',
+    !hit(c, queue(), [wired]));
+  // Control on the same fixture shape: a real 2 MiB body hits whatever its storeSize says.
+  const big = msg(0, 2 * MIB);
+  big.storeSize = 10;
+  check('a 2 MiB body hits a 1 MiB gate whatever its storeSize says', hit(c, queue(), [big]));
+}
+
+// ---- held set: buffer + what the listener has in its hands -------------------
+// Taking a batch out of the buffer and handing it to a listener does not shrink the cache, it
+// only moves the message; the message leaves the queue when it SETTLES. A gate that read the
+// buffer alone would let a wedged listener pull forever.
+{
+  const c = gatesOff(consumer('G_nodejs_fc_held'));
+  c.pullThresholdForQueue = 3;
+  const pq = staged(new ProcessQueue(false), [msg(0, 10), msg(1, 10), msg(2, 10), msg(3, 10)]);
+  check('4 buffered over a budget of 3 hits the count gate', hitReason(pq, c) === 'count=4',
+    `reason=${hitReason(pq, c)}`);
+  const taken = pq.takeBatch(1);
+  check('dispatching the head leaves 3 undispatched in the buffer',
+    taken.length === 1 && pq.pendingCount() === 3, `pending=${pq.pendingCount()}`);
+  // The heart of the rule: the buffer is exactly ON the budget now, the held set is not, and
+  // a buffer-only count would let this queue pull again.
+  check('the batch in the listener\'s hands is still held: the gate still hits',
+    hitReason(pq, c) === 'count=4', `reason=${hitReason(pq, c)}`);
+  // Rolling the batch back is the same held set: neither term double-counts it.
+  pq.requeueBatch(taken);
+  check('a requeued batch is still one held set', hitReason(pq, c) === 'count=4');
+  // Settling it releases the holdings, so the queue drops to the budget and pulls again.
+  pq.completeBatch(taken);
+  check('once the batch settles the held set is at the budget and the gate opens',
+    hitReason(pq, c) === '', `reason=${hitReason(pq, c)}`);
+  // Size and span read the same set: a dispatched 2 MiB body still weighs, and it is judged
+  // before the span.
+  const wide = gatesOff(consumer('G_nodejs_fc_held_terms'));
+  wide.pullThresholdSizeForQueue = 1;
+  wide.consumeConcurrentlyMaxSpan = 10;
+  const wq = staged(new ProcessQueue(false), [msg(0, 2 * MIB), msg(1000, 10)]);
+  wq.takeBatch(2);
+  check('a dispatched batch still weighs on the size gate',
+    hitReason(wq, wide) === 'size=2MB', `reason=${hitReason(wq, wide)}`);
 }
 
 // ---- span gate ---------------------------------------------------------------
@@ -168,8 +260,95 @@ function consumer(group: string): DefaultMQPushConsumer {
   c.consumeConcurrentlyMaxSpan = 10;
   // Out-of-order buffering must still measure max-min, not first-last.
   check('an out-of-order buffer measures max-min', hit(c, queue(), [msg(50, 1), msg(5, 1), msg(7, 1)]));
+  // 0 is "do not run ahead at all", not "off": two messages 1 offset apart already exceed it.
   c.consumeConcurrentlyMaxSpan = 0;
-  check('maxSpan 0 disables the span gate', !hit(c, queue(), [msg(0, 1), msg(1_000_000_000, 1)]));
+  check('maxSpan 0 trips on a span of 1 instead of disabling the gate',
+    hit(c, queue(), [msg(0, 1), msg(1, 1)]));
+  // Control: one buffered message spans 0, which is not over a budget of 0.
+  check('control: a single message spans 0 and does not trip a maxSpan of 0',
+    !hit(c, queue(), [msg(0, 1)]));
+}
+
+// ---- the span gate never runs for ordered consumption ------------------------
+// The exception is total: an orderly queue cannot pull past the batch still in the listener's
+// hands, so there is no run-ahead to guard against. The paired control is the SAME cache on
+// the concurrent path, which does trip.
+{
+  const c = gatesOff(consumer('G_nodejs_fc_orderly_span'));
+  c.consumeConcurrentlyMaxSpan = 10;
+  const wide = [msg(0, 1), msg(10, 1), msg(20, 1)];
+  check('the concurrent path judges the span: 0..20 is over a budget of 10',
+    hitReason(staged(new ProcessQueue(false), wide), c) === 'span=20');
+  const orderly = staged(new ProcessQueue(true), wide);
+  check('the same cache does not pause an orderly queue', !hitQueue(c, queue(), orderly));
+  check('an orderly queue has no span tick counted', c.flowControlTriggered === 0,
+    `got ${c.flowControlTriggered}`);
+  // The exception is the span alone: count and size still bind an ordered queue over the
+  // same held set.
+  c.pullThresholdForQueue = 2;
+  check('3 held messages trip a count budget of 2 on the ordered path too',
+    hitQueue(c, queue(), staged(new ProcessQueue(true), wide)));
+}
+
+// ---- the gate order is count, then size, then span ---------------------------
+// A buffer over all three budgets names the first one only, and the reason carries the
+// measured number, so an operator reading the log knows which knob to raise.
+{
+  const c = consumer('G_nodejs_fc_order');
+  c.pullThresholdForQueue = 1;
+  c.pullThresholdSizeForQueue = 1;
+  c.consumeConcurrentlyMaxSpan = 1;
+  const hot = staged(new ProcessQueue(false), [msg(0, 2 * MIB), msg(100, 2 * MIB)]);
+  check('all three budgets exceeded reports the count', hitReason(hot, c) === 'count=2',
+    `reason=${hitReason(hot, c)}`);
+  check('several matching gates still record one tick', hitQueue(c, queue(), hot));
+  check('the counter is exactly 1', c.flowControlTriggered === 1);
+  // Drop the count gate: size is next in line, and its number is the whole MiB measured.
+  c.pullThresholdForQueue = GATE_OFF;
+  check('with the count gate out of the way the size term reports', hitReason(hot, c) === 'size=4MB',
+    `reason=${hitReason(hot, c)}`);
+  c.pullThresholdSizeForQueue = GATE_OFF;
+  check('with count and size out of the way the span term reports', hitReason(hot, c) === 'span=100',
+    `reason=${hitReason(hot, c)}`);
+  c.consumeConcurrentlyMaxSpan = GATE_OFF;
+  check('nothing over any budget reports no reason', hitReason(hot, c) === '');
+}
+
+// ---- the legal ranges belong to the start-up config check --------------------
+// The gate itself never clamps and never treats 0 as "off", which is only safe because
+// start-up refuses a knob outside its range. Each of the three gates owns one range, and a
+// 0 that would mean "cache nothing" is rejected before it can reach the gate.
+{
+  const mk = (fn: (c: DefaultMQPushConsumer) => void) => {
+    const c = new DefaultMQPushConsumer('G_nodejs_fc_ranges');
+    fn(c);
+    try { (c as any)._checkConfigRanges(); return ''; } catch (e) { return (e as Error).message; }
+  };
+  check('pullThresholdForQueue 0 is refused at start-up',
+    mk((c) => { c.pullThresholdForQueue = 0; }).includes('pullThresholdForQueue Out of range [1, 65535]'),
+    mk((c) => { c.pullThresholdForQueue = 0; }));
+  check('pullThresholdForQueue above 65535 is refused at start-up',
+    mk((c) => { c.pullThresholdForQueue = 65536; }).includes('pullThresholdForQueue Out of range'));
+  check('pullThresholdSizeForQueue 0 is refused at start-up',
+    mk((c) => { c.pullThresholdSizeForQueue = 0; }).includes('pullThresholdSizeForQueue Out of range [1, 1024]'),
+    mk((c) => { c.pullThresholdSizeForQueue = 0; }));
+  check('pullThresholdSizeForQueue above 1024 MiB is refused at start-up',
+    mk((c) => { c.pullThresholdSizeForQueue = 1025; }).includes('pullThresholdSizeForQueue Out of range'));
+  check('consumeConcurrentlyMaxSpan 0 is refused at start-up',
+    mk((c) => { c.consumeConcurrentlyMaxSpan = 0; }).includes('consumeConcurrentlyMaxSpan Out of range [1, 65535]'),
+    mk((c) => { c.consumeConcurrentlyMaxSpan = 0; }));
+  // Control: the default knobs — and the two topic budgets' documented -1 — pass the check,
+  // so the range validation is not simply rejecting everything.
+  const ok = new DefaultMQPushConsumer('G_nodejs_fc_ranges_ok');
+  let err = '';
+  try { (ok as any)._checkConfigRanges(); } catch (e) { err = (e as Error).message; }
+  check('control: the shipped defaults pass the start-up range check', err === '', err);
+  const topicOff = new DefaultMQPushConsumer('G_nodejs_fc_ranges_topic_off');
+  topicOff.pullThresholdForTopic = -1;
+  topicOff.pullThresholdSizeForTopic = -1;
+  let offErr = '';
+  try { (topicOff as any)._checkConfigRanges(); } catch (e) { offErr = (e as Error).message; }
+  check('control: both topic budgets at -1 (off) pass the range check', offErr === '', offErr);
 }
 
 // ---- topic budgets NEVER aggregate at pull time -----------------------------
@@ -202,16 +381,6 @@ function consumer(group: string): DefaultMQPushConsumer {
   c2.processQueueTable.set(mqKey(queue(OTHER_TOPIC, 0)), new ProcessQueue(false));
   c2.processQueueTable.get(mqKey(queue(OTHER_TOPIC, 0)))!.putMessage([msg(0, 1), msg(1, 1), msg(2, 1)]);
   check("another topic's buffer does not count toward this topic", !hit(c2, q0, [msg(0, 1)]));
-}
-
-// ---- gate order and one tick -------------------------------------------------
-{
-  const c = consumer('G_nodejs_fc_all');
-  c.pullThresholdForQueue = 1;
-  c.pullThresholdSizeForQueue = 1;
-  c.consumeConcurrentlyMaxSpan = 1;
-  check('several matching gates still record one tick', hit(c, queue(), [msg(0, 2 * MIB), msg(100, 2 * MIB)]));
-  check('the counter is exactly 1', c.flowControlTriggered === 1);
 }
 
 // ---- warn cadence ------------------------------------------------------------

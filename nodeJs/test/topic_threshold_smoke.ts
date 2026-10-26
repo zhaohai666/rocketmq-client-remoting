@@ -334,8 +334,10 @@ function hit(c: DefaultMQPushConsumer, mq: MessageQueue, pq: ProcessQueue): bool
   // gate does not look at it any more — only the divided per-queue knobs count.
   c.pullThresholdForTopic = 1000;
   c.pullThresholdSizeForTopic = -1;
-  c.pullThresholdSizeForQueue = 0; // byte gate off: isolate the count gate
-  c.consumeConcurrentlyMaxSpan = 0; // span gate off
+  // The other two gates are parked out of reach rather than "disabled": 0 would
+  // mean "cache nothing" and every queue below would trip them.
+  c.pullThresholdSizeForQueue = 1 << 30;
+  c.consumeConcurrentlyMaxSpan = 1 << 30;
   const queues = [0, 1, 2, 3].map((id) => queue(TOPIC, id));
   for (const mq of queues) stagePQ(c, mq, 250);
   (c as any)._divideTopicThresholds(); // 1000/4 -> pullThresholdForQueue = 250
@@ -354,8 +356,10 @@ function hit(c: DefaultMQPushConsumer, mq: MessageQueue, pq: ProcessQueue): bool
   hotPq.putMessage([msg(250)]); // fresh offset: 251 in this queue alone
   check('the queue at 251 pauses', hit(c, hot, hotPq));
   const reason = debugLines.find((l) => l.startsWith('flow control: queue')) || '';
-  check('the pause reason is count, not the removed topicCount',
-    reason.includes(' count, pause pull') && !reason.includes('topicCount'), reason);
+  check('the pause reason names the count gate and the number measured',
+    reason.includes(' count=251, pause pull'), reason);
+  check('the removed topic reasons do not appear anywhere',
+    !reason.includes('topicCount') && !reason.includes('topicSize'), reason);
   const siblings = queues.slice(1).map((mq) => hit(c, mq, c.processQueueTable.get(mqKey(mq))!));
   check('the 3 siblings at 250 stay unpaused while the topic total is 1001',
     siblings.every((h) => !h), JSON.stringify(siblings));

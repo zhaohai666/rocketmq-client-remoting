@@ -124,6 +124,28 @@ def _mq_sort_key(mq: MessageQueue):
     return (mq.topic, mq.broker_name, mq.queue_id)
 
 
+def _queues_by_topic(queues: List[MessageQueue]) -> Dict[str, Set[str]]:
+    """Group a queue list as topic -> the set of ``<brokerName>-<queueId>`` identities owned there.
+
+    The rebalance compares these per-topic sets, never the totals: losing one queue and gaining
+    another keeps the count while changing who owns what.
+    """
+    grouped: Dict[str, Set[str]] = {}
+    for mq in queues:
+        grouped.setdefault(mq.topic, set()).add("%s-%d" % (mq.broker_name, mq.queue_id))
+    return grouped
+
+
+def _changed_topics(before: Dict[str, Set[str]], after: Dict[str, Set[str]]) -> List[str]:
+    """Sorted list of the topics whose assigned-queue set differs between two rebalance rounds.
+
+    A topic that appeared or vanished entirely counts too: its queues moved.
+    """
+    return sorted(topic
+                  for topic in set(before) | set(after)
+                  if before.get(topic, set()) != after.get(topic, set()))
+
+
 def _safe_hook_name(hook) -> str:
     try:
         return str(hook.hook_name())
@@ -847,6 +869,9 @@ class DefaultMQPushConsumer:
         # Subscription table topic -> SubscriptionData
         self.subscription_data: Dict[str, SubscriptionData] = {}
         self.message_listener: Optional[MessageListener] = None
+        # Change callback for the queue allocation: fired for the topics whose assigned
+        # queue SET moved, with the route's full queue set and this instance's share.
+        self.message_queue_listener: Optional[MessageQueueListener] = None
         self._mq_client: Optional[MQClientInstance] = None
         self._started = False
         self._pulling = False
@@ -859,7 +884,8 @@ class DefaultMQPushConsumer:
         # The **message bodies** of in-flight batches (key -> list, registered when a batch is taken, removed at consumption completion).
         # Corresponds to the part "dispatched to the listener but not yet acked":
         # _pending (pulled but not dispatched) union _inflight_msgs (dispatched but not settled) = the full set of queue-held messages.
-        # _clean_expired_queue's "only look at the head (minimum offset)" criterion takes the first entry of this union.
+        # _clean_expired_queue's "only look at the head (minimum offset)" criterion takes the first entry of this union, and so do
+        # the cache gates of _flow_control_hit (both consume modes register here).
         self._inflight_msgs: Dict[str, List[MessageExt]] = {}
         self._offset_table: Dict[str, int] = {}
         self._stop = threading.Event()
@@ -1210,6 +1236,10 @@ class DefaultMQPushConsumer:
 
     def set_message_listener(self, listener) -> None:
         self.message_listener = listener
+
+    def set_message_queue_listener(self, listener: Optional[MessageQueueListener]) -> None:
+        """Install the assignment-change callback (see MessageQueueListener)."""
+        self.message_queue_listener = listener
 
     def set_allocate_message_queue_strategy(self, strategy: AllocateMessageQueueStrategy) -> None:
         self.allocate_strategy = strategy
@@ -2084,7 +2114,8 @@ class DefaultMQPushConsumer:
         otherwise multiple instances in the same group would consume each other's messages.
         """
         client = self._require_client()
-        was = {self._mq_key(mq) for mq in self._assigned_queues()}
+        was_list = self._assigned_queues()
+        was = {self._mq_key(mq) for mq in was_list}
         assigned: List[MessageQueue] = []
         with self._lock:
             topics = list(self.subscription_data.keys())
@@ -2112,11 +2143,14 @@ class DefaultMQPushConsumer:
                 assigned.extend(got)
         with self._lock:
             self._assigned = assigned
-        now = {self._mq_key(mq) for mq in assigned}
-        assignment_changed = now != was
-        if assignment_changed:
-            logger.info("rebalance result changed, group=%s clientId=%s assigned=%d",
-                        self.consumer_group, self.client_id, len(assigned))
+        # The topics whose queue SET moved, so a swap that keeps the count (one queue
+        # lost, another gained) still counts: which buffers exist changed, the budgets
+        # have to be re-divided over the new set and the broker has to learn the
+        # subscriptions of the queues this client just picked up.
+        moved = _changed_topics(_queues_by_topic(was_list), _queues_by_topic(assigned))
+        if moved:
+            logger.info("rebalance result changed, group=%s clientId=%s assigned=%d topics=%s",
+                        self.consumer_group, self.client_id, len(assigned), ",".join(moved))
             # An assignment change on the push side drops the fingerprints remembered per
             # broker (the heartbeat V2 state), i.e. it forces
             # the next heartbeat round to re-deliver the subscriptions to every broker instead of
@@ -2145,12 +2179,73 @@ class DefaultMQPushConsumer:
             with self._lock:
                 self._offset_table.setdefault(key, off)
         self._rebalance_pull_threads()
-        # The topic knobs are divided into the per-queue knobs only when this round actually changed the
-        # assignment, and only AFTER _rebalance_pull_threads has updated the per-queue pull state: the
-        # divisor is the number of queues owned, so dividing against the pre-update table would use the
-        # previous round's queue count.
-        if assignment_changed:
-            self._divide_topic_thresholds()
+        # Everything the moved set owes is paid in one place, in one order that cannot
+        # drift, and only AFTER _rebalance_pull_threads rebuilt the per-queue pull state
+        # so the division uses this round's queue count.
+        self._after_assignment_change(moved)
+
+    def _after_assignment_change(self, moved: List[str]) -> None:
+        """The whole of what a rebalance round whose queue set moved does.
+
+        The topics that gained or lost a queue re-share their subscription version, the
+        topic cache budgets are divided over the queues this client now holds, every
+        broker gets the immediate heartbeat that carries the fresh versions, and last the
+        application's queue listener hears about exactly the topics that moved. A round
+        that re-pulled the same queues -- including one that only self-heals a stalled
+        pull loop -- pays nothing: the callback is a change notification, not a heartbeat.
+        """
+        if not moved:
+            return
+        self._restamp_subscription_versions(moved)
+        self._divide_topic_thresholds()
+        try:
+            self._send_heartbeat_to_all_broker()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("heartbeat after rebalance change failed: %s", e)
+        self._notify_queue_changed(moved)
+
+    def _restamp_subscription_versions(self, moved: List[str]) -> None:
+        """Re-share the subscription version of the topics whose assignment moved.
+
+        The broker treats a higher subscription version as new information -- with an SQL92
+        expression it re-registers the filter, so a stale version leaves the broker evaluating
+        what this client stopped meaning -- and waiting for the periodic round would leave that
+        stale view in place for up to ``heartbeat_interval_millis``. A topic that did not move
+        keeps its version: re-stamping the whole table would put subscriptions the broker already
+        holds back on the wire every changed round.
+        """
+        if not moved:
+            return
+        new_version = int(time.time() * 1000)
+        with self._lock:
+            for topic in moved:
+                sub = self.subscription_data.get(topic)
+                if sub is None:
+                    continue
+                logger.info("%s rebalance changed, also update version: %d, %d",
+                            topic, sub.sub_version, new_version)
+                # The subscription table holds the very objects the heartbeat builder
+                # serialises, so the beat sent next carries this version.
+                sub.sub_version = new_version
+
+    def _notify_queue_changed(self, moved: List[str]) -> None:
+        """Fire the application's queue listener for the moved topics only."""
+        if not moved:
+            return
+        listener = self.message_queue_listener
+        if listener is None:
+            return
+        with self._lock:
+            assigned = list(self._assigned)
+        by_topic: Dict[str, List[MessageQueue]] = {}
+        for mq in assigned:
+            by_topic.setdefault(mq.topic, []).append(mq)
+        for topic in moved:
+            try:
+                listener.message_queue_changed(topic, set(self._all_queues_of_topic(topic)),
+                                               set(by_topic.get(topic, [])))
+            except Exception as e:  # noqa: BLE001
+                logger.debug("message queue listener failed for %s: %s", topic, e)
 
     def rebalance_immediately(self) -> None:
         """Wake this consumer's rebalance loop after the instance receives the broker's 40 notification.
@@ -2732,35 +2827,54 @@ class DefaultMQPushConsumer:
     def _flow_control_hit(self, mq: MessageQueue, key: str) -> bool:
         """Whether flow control is triggered (three per-queue threshold checks; any hit pauses this queue's pull).
 
-        Every cache gate is **strictly greater than** its threshold: a buffer that has reached the
-        threshold exactly is still allowed to pull, so the thresholds are "how many may be cached",
-        not "how many stop the pull".
+        Every cache gate is **strictly greater than** its threshold, with the threshold taken exactly as
+        it stands: no floor of 1, no "0 means disabled" escape. A queue that has reached the threshold
+        exactly is still allowed to pull, so the thresholds are "how many may be cached", not "how many
+        stop the pull" -- and a threshold of 0 is simply "cache nothing", which the first held message
+        trips. Keeping the legal range of each knob is the job of the start-up config check, not of the
+        gate.
 
-        - ``pull_threshold_for_queue``: this queue's pulled-but-unconsumed **count** (default 1000)
-        - ``pull_threshold_size_for_queue``: this queue's pulled-but-unconsumed **bytes in MB** (default 100)
-        - ``consume_concurrently_max_span``: the **span** of queueOffsets of pulled-but-unconsumed messages (default 2000,
-          prevents "one message keeps failing while the rest pile up" from making the offset span run away)
+        What is measured is everything this queue still holds: the pulled-but-undispatched buffer **union
+        the batches already in the listener's hands but not settled yet**. A gate that read only the
+        buffer would let a queue whose listener is wedged keep pulling, because every held message has
+        already left the buffer on its way to the listener -- which is exactly the situation the cache
+        thresholds exist to stop.
 
-        The topic-level knobs are deliberately **not** checked here: nothing sums the sibling queues at
-        pull time. ``_divide_topic_thresholds`` splits each enabled topic knob into the matching per-queue
-        knob whenever the assignment changes, so the three checks above are the only enforcement point.
+        - ``pull_threshold_for_queue``: this queue's held **count** (default 1000)
+        - ``pull_threshold_size_for_queue``: this queue's held **body bytes, whole MiB** (default 100)
+        - ``consume_concurrently_max_span``: the **span** of queueOffsets over the held messages (default
+          2000, prevents "one message keeps failing while the rest pile up" from making the offset span
+          run away)
+
+        All three terms read the same held set -- a dispatched batch only moves from the buffer into the
+        listener's hands, it has not left the queue. The one per-term difference is that the **span gate
+        does not run at all for ordered consumption**: an ordered queue has no run-ahead to guard against,
+        because its pull cursor only moves once the batch in the listener's hands has settled, so the span
+        is a concurrent-consumption-only concern while count and size are judged either way.
+
+        The size is compared in **whole** MiB (floor), so a 1 MiB threshold tolerates 1.9 MiB of body:
+        partial MiB never trips a gate.
+
+        The order of the three checks is fixed (count, then size, then span) and the span check is skipped
+        entirely for ordered consumption. The topic-level knobs are deliberately **not** checked here: nothing sums
+        the sibling queues at pull time. ``_divide_topic_thresholds`` splits each enabled topic knob into
+        the matching per-queue knob whenever the assignment changes, so the three checks above are the
+        only enforcement point.
         """
         with self._lock:
-            dq = list(self._pending.get(key, ()))
-        size_mb = 0.0
+            held = self._process_queue_entries_locked(key)
+        orderly = self._is_orderly()
+        size_mib = sum(len(m.body) if m.body else 0 for m in held) // MIB
         span = 0
-        for m in dq:
-            size_mb += getattr(m, "store_size", 0)
-        size_mb /= (1024.0 * 1024.0)
-        if dq:
-            offsets = [m.queue_offset for m in dq]
+        if held:
+            offsets = [m.queue_offset or 0 for m in held]
             span = max(offsets) - min(offsets)
         reason = ""
-        if len(dq) > max(1, self.pull_threshold_for_queue):
-            reason = "count=%d" % len(dq)
-        elif self.pull_threshold_size_for_queue > 0 and size_mb > self.pull_threshold_size_for_queue:
-            reason = "size=%.1fMB" % size_mb
-        elif self.consume_concurrently_max_span > 0 and span > self.consume_concurrently_max_span:
+        if len(held) > self.pull_threshold_for_queue:
+            reason = "count=%d" % len(held)
+        elif size_mib > self.pull_threshold_size_for_queue:
+            reason = "size=%dMB" % size_mib
+        elif not orderly and span > self.consume_concurrently_max_span:
             reason = "span=%d" % span
         if not reason:
             return False
@@ -3236,7 +3350,12 @@ class DefaultMQPushConsumer:
 
     def _consume_batch(self, key: str, mq: MessageQueue, batch: List[MessageExt],
                        epoch: Optional[int] = None) -> bool:
-        """Consume one batch and handle redelivery/suspension. Returns whether the consume offset advanced.
+        """Consume one batch, keeping it attached to the queue for the whole time the listener runs.
+
+        A batch taken from the buffer is registered as "in the listener's hands" before the first hook
+        fires and deregistered only once the consume result has been fully settled, so the cache gates and
+        the timeout sweep see the queue's held messages as one set for both consume modes -- which mirrors
+        what the queue buffer itself does: a message leaves it only when its batch settles.
 
         ``epoch``: the epoch of this batch's queue buffer (see ``_queue_epoch``). When the queue is dropped while this batch
         was queuing (rebalance revoke / OFFSET_ILLEGAL correction / stall self-healing), these messages
@@ -3248,6 +3367,22 @@ class DefaultMQPushConsumer:
                            "group=%s mq=%s msgs=%d epoch=%s->%s",
                            self.consumer_group, mq, len(batch), epoch, dropped)
             return False
+        with self._lock:
+            self._inflight_msgs.setdefault(key, []).extend(batch)
+        try:
+            return self._consume_batch_held(key, mq, batch, epoch)
+        finally:
+            # Whatever the consume result was, this batch is no longer "in the listener's hands". Entries
+            # already removed by the sweep or by a re-enqueue are idempotent here.
+            with self._lock:
+                self._deregister_inflight_locked(key, batch)
+
+    def _consume_batch_held(self, key: str, mq: MessageQueue, batch: List[MessageExt],
+                            epoch: Optional[int]) -> bool:
+        """Handle one batch already registered as in-flight: dispatch to the listener and settle the result.
+
+        Returns whether the consume offset advanced.
+        """
         listener = self.message_listener
         broadcast = self.message_model == MessageModel.BROADCASTING
         self._reset_retry_topic_and_namespace(batch)
@@ -3339,20 +3474,10 @@ class DefaultMQPushConsumer:
             time.sleep(self._orderly_suspend_millis(ocontext) / 1000.0)
             return False
         # ---- Concurrent consumption ----
-        # Register in-flight messages: on the concurrent path, messages **remain in** the
-        # held messages table while held by a batch (removed only after the consume result is processed),
-        # and the timeout sweep's "head" criterion and "is this still on the queue" criterion both look at it. The orderly path is the opposite
-        # (once a batch is taken it is no longer in the pending buffer, while the sweep exits early for orderly),
-        # so only concurrent batches are registered.
-        with self._lock:
-            self._inflight_msgs.setdefault(key, []).extend(batch)
-        try:
-            return self._consume_concurrent_batch(key, mq, batch, epoch, listener, broadcast)
-        finally:
-            # After normal completion (including failed-redelivery re-enqueue and sweep removal) this batch is no longer "in the listener's hands";
-            # entries removed early by sweep/re-enqueue are idempotent here.
-            with self._lock:
-                self._deregister_inflight_locked(key, batch)
+        # The batch is already registered as "in the listener's hands" by ``_consume_batch``: the timeout
+        # sweep's "head" criterion and the settle path's "is this still on the queue" criterion both read
+        # it, and the cache gates count it while the listener runs.
+        return self._consume_concurrent_batch(key, mq, batch, epoch, listener, broadcast)
 
     def _consume_concurrent_batch(self, key: str, mq: MessageQueue, batch: List[MessageExt],
                                   epoch: Optional[int], listener, broadcast: bool) -> bool:
@@ -4477,16 +4602,17 @@ class _LiteQueueCache:
     The LitePull buffer is **one** global deque holding the cached messages of every assigned queue, so
     deciding "how much of this queue is still cached" from the buffer itself would mean scanning the
     whole buffer on every pull round of every queue. This accumulator carries only the numbers the cache
-    gates read -- this queue's cached message count, its cached bytes (the same ``storeSize`` sum the
-    buffer's entries contribute) and the lowest/highest cached queue offset of its own messages -- and
-    updates them where the buffer changes: after a pull appends, when ``poll()`` removes, when ``seek()``
-    prunes, and when the queue is revoked.
+    gates read -- this queue's cached message count, its cached bytes (the body bytes the buffer's
+    entries contribute, the same quantity the size gate measures) the lowest/highest cached queue offset
+    of its own messages, and how many pull rounds are still represented here -- and updates them where
+    the buffer changes: after a pull appends, when ``poll()`` removes, when ``seek()`` prunes, and when
+    the queue is revoked.
 
     It is mutated only through the owning consumer's buffer lock, always in the same step as the deque,
     which is what keeps it from drifting away from what the buffer really holds.
     """
 
-    __slots__ = ("offsets", "size", "min_offset", "max_offset")
+    __slots__ = ("offsets", "size", "min_offset", "max_offset", "rounds")
 
     def __init__(self) -> None:
         # This queue's cached offsets, in buffer order. Its length **is** the cached message count, so
@@ -4495,10 +4621,22 @@ class _LiteQueueCache:
         self.size = 0
         self.min_offset = 0
         self.max_offset = 0
+        # How many messages of each still-undrained pull round of this queue remain in the buffer, in
+        # round order. The aggregate gate budgets a **round** (one request can carry a whole batch), not
+        # the messages that happened to arrive, so a queue whose rounds came back half empty still
+        # reserves the full batch per round. A queue's own messages always leave in round order --
+        # ``poll()`` drains the shared buffer from its head and ``seek()`` prunes a prefix of this
+        # queue's offsets -- so tracking only the front round's remainder is enough.
+        self.rounds: Deque[int] = deque()
 
     @property
     def count(self) -> int:
         return len(self.offsets)
+
+    @property
+    def pending_rounds(self) -> int:
+        """How many pull rounds of this queue still hold messages in the buffer."""
+        return len(self.rounds)
 
     @property
     def span(self) -> int:
@@ -4506,10 +4644,15 @@ class _LiteQueueCache:
         single-message cache has span 0)."""
         return self.max_offset - self.min_offset if self.count > 1 else 0
 
+    def begin_round(self, count: int) -> None:
+        """Record that one pull round of this queue left ``count`` messages in the buffer."""
+        if count > 0:
+            self.rounds.append(count)
+
     def add(self, msg: MessageExt) -> None:
         offset = msg.queue_offset
         self.offsets.append(offset)
-        self.size += int(getattr(msg, "store_size", 0) or 0)
+        self.size += len(msg.body) if msg.body else 0
         if self.count == 1:
             self.min_offset = self.max_offset = offset
             return
@@ -4520,7 +4663,12 @@ class _LiteQueueCache:
 
     def remove(self, msg: MessageExt) -> None:
         offset = msg.queue_offset
-        self.size -= int(getattr(msg, "store_size", 0) or 0)
+        self.size -= len(msg.body) if msg.body else 0
+        if self.rounds:
+            # Whatever left the buffer belongs to the oldest round still represented here.
+            self.rounds[0] -= 1
+            if self.rounds[0] <= 0:
+                self.rounds.popleft()
         if self.offsets and self.offsets[0] == offset:
             # The normal case: both removal paths (poll drains the head, seek drops a prefix) take this
             # queue's oldest cached message, which is the head of a per-queue FIFO.
@@ -4534,6 +4682,7 @@ class _LiteQueueCache:
             # "count 0, size 0, span 0" and never as a stale pair left behind by the drained messages.
             self.size = 0
             self.min_offset = self.max_offset = 0
+            self.rounds.clear()
         elif offset == self.min_offset or offset == self.max_offset:
             # Recompute the boundaries only when the removed message **was** one of them -- recomputing
             # on every removal would put the scan back where this table exists to avoid it.
@@ -4560,7 +4709,8 @@ class DefaultLitePullConsumer:
     - The subscribe mode's rebalance reuses the existing ``get_consumer_id_list_by_group`` + ``AllocateMessageQueueAveragely``,
       the same allocation algorithm as push consumers; when the consumer group list cannot be queried it "keeps the current allocation", never falling back to exclusive ownership.
     - Because that buffer is only ever drained by ``poll()``, the pull round itself carries the four cache gates of
-      ``_cache_flow_control_hit`` (whole-buffer count, this queue's count, this queue's MiB, this queue's offset span):
+      ``_cache_flow_control_hit`` (whole-buffer pending-round capacity, this queue's count, this queue's
+      body MiB, this queue's offset span):
       a refusal sends no request and re-schedules **that queue's** next round 50 ms later, so a slow or absent
       application can grow the backlog but not the client's memory without bound.
     - No POP / push mode; no broker-initiated request (309/313) handling (that is the push consumer's responsibility).
@@ -4615,7 +4765,7 @@ class DefaultLitePullConsumer:
         # Leaving it empty would degrade CONSUME_FROM_TIMESTAMP into "consume from the current moment".
         self.consume_timestamp = time.strftime(
             "%Y%m%d%H%M%S", time.localtime(time.time() - 30 * 60))
-        self.pull_batch_size = 32
+        self.pull_batch_size = 10
         self.poll_timeout_millis = 5000
         # Route refresh interval, default 30000ms; only passed through once when start() builds the MQClientInstance.
         self.poll_name_server_interval = 30000
@@ -4628,10 +4778,11 @@ class DefaultLitePullConsumer:
         # ---- Local-buffer cache thresholds (this consumer's own flow control) ----
         # The background pull feeds one shared local buffer that only poll() drains, so an application
         # that polls slowly -- or never -- grows that buffer without bound. Four plain budgets guard it:
-        # one over the whole buffer, three over a single queue. Every gate compares **strictly greater
-        # than** the budget, so a queue sitting exactly on its threshold still pulls, and 0 is a legal
-        # "trip on the first cached message" rather than a switch -- these are budgets, so nothing here
-        # validates or clamps them.
+        # one over the pull rounds still waiting to be polled (every round budgets a whole batch, whatever
+        # it brought back), three over a single queue's cached messages -- count, **body** bytes and offset
+        # span. Every gate compares **strictly greater than** the budget, so a queue sitting exactly on its
+        # threshold still pulls, and 0 is a legal "trip on the first cached message" rather than a switch --
+        # these are budgets, so nothing here validates or clamps them.
         self.pull_threshold_for_all = 10000
         self.pull_threshold_for_queue = 1000
         self.pull_threshold_size_for_queue = 100
@@ -5300,12 +5451,15 @@ class DefaultLitePullConsumer:
         the pause check the loop already does and **before** the pull offset is resolved, so a refusal
         sends no request at all and the broker sees nothing:
 
-        1. aggregate: the number of messages cached in the whole buffer, summed over every queue,
-           strictly greater than ``pull_threshold_for_all`` (default 10000);
+        1. aggregate: the **capacity reserved by the pull rounds still waiting to be polled**, summed over
+           every queue -- that is ``pending rounds x pull_batch_size``, strictly greater than
+           ``pull_threshold_for_all`` (default 10000). It budgets a whole batch per round rather than the
+           messages that round happened to bring back, so a slow poller whose rounds came back half empty
+           is refused earlier than one that filled every batch;
         2. count: this queue's own cached message count, strictly greater than
            ``pull_threshold_for_queue`` (default 1000);
-        3. size: this queue's own cached bytes divided by one MiB with **integer division**, strictly
-           greater than ``pull_threshold_size_for_queue`` (default 100);
+        3. size: this queue's own cached **body** bytes divided by one MiB with **integer division**,
+           strictly greater than ``pull_threshold_size_for_queue`` (default 100);
         4. span: the offset span of this queue's own cached messages, strictly greater than
            ``consume_max_span`` (default 2000).
 
@@ -5313,7 +5467,8 @@ class DefaultLitePullConsumer:
         aggregate gate is the single deliberate exception, and it is a budget of its own). All four are
         strictly greater, so a queue sitting exactly on its threshold still pulls, and none of the
         thresholds is clamped -- 0 means "trip on the first cached message". The size gate sums the
-        decoder's ``storeSize`` (the physical backlog this client holds), never the body length.
+        message **body lengths**, which is what this client actually holds in memory, never the
+        broker-side ``storeSize``.
 
         A hit re-schedules **this queue's** pull round 50 ms later, counts one trip on its gate's counter
         and logs; nothing else changes -- no offset is committed, the pull cursor does not move and the
@@ -5323,7 +5478,8 @@ class DefaultLitePullConsumer:
         with self._buffer_cond:
             if mq not in self._assigned:
                 return False
-            cached_total = len(self._local_buffer)
+            pending_rounds = sum(stat.pending_rounds for stat in self._queue_cache.values())
+            reserved = pending_rounds * self.pull_batch_size
             stat = self._queue_cache.get(mq)
             count = stat.count if stat is not None else 0
             size_mib = (stat.size if stat is not None else 0) // MIB
@@ -5333,17 +5489,20 @@ class DefaultLitePullConsumer:
         # The counters are only ever tripped by the single pull service thread of this consumer (and by
         # the tests driving them directly), so a plain increment is enough -- no second lock, which the
         # buffer lock below must not become.
-        if cached_total > self.pull_threshold_for_all:
+        if reserved > self.pull_threshold_for_all:
             self._flow_control_for_all_triggered += 1
             times = self._flow_control_for_all_triggered
-            logger.debug("flow control: queue %s cached=%d exceeds pull_threshold_for_all=%d,"
-                         " pause pull for %.0f ms (flowControlTimes=%d)",
-                         mq, cached_total, self.pull_threshold_for_all,
+            logger.debug("flow control: queue %s pending rounds=%d x batch=%d exceeds "
+                         "pull_threshold_for_all=%d, pause pull for %.0f ms (flowControlTimes=%d)",
+                         mq, pending_rounds, self.pull_batch_size, self.pull_threshold_for_all,
                          PULL_TIME_DELAY_WHEN_CACHE_FLOW_CONTROL * 1000, times)
             if is_flow_control_warn_trip(times):
+                # The threshold is stated in messages while the gate counts rounds, so the warn translates
+                # it back into the number of rounds that fit: ceil(threshold / batch).
                 logger.warning("the consume request count exceeds threshold %d, so do flow control,"
-                               " cached=%d, flowControlTimes=%d",
-                               self.pull_threshold_for_all, cached_total, times)
+                               " consume request count=%d, flowControlTimes=%d",
+                               -(-self.pull_threshold_for_all // self.pull_batch_size),
+                               pending_rounds, times)
             return True
         # The count gate and the size gate share one counter: both say "this queue's own cache is over
         # its budget", which is the number an operator wants as one total.
@@ -5401,6 +5560,7 @@ class DefaultLitePullConsumer:
         """The **one** place the local buffer grows: the deque and every touched queue's accumulator move
         in the same step, under the buffer's own lock, so the counters cannot drift from the buffer."""
         self._local_buffer.extend(msgs)
+        per_queue: Dict[MessageQueue, int] = {}
         for msg in msgs:
             key = self._cache_key_of(msg)
             stat = self._queue_cache.get(key)
@@ -5408,6 +5568,11 @@ class DefaultLitePullConsumer:
                 stat = _LiteQueueCache()
                 self._queue_cache[key] = stat
             stat.add(msg)
+            per_queue[key] = per_queue.get(key, 0) + 1
+        # One pull round per touched queue: the aggregate gate budgets the round, not the messages that
+        # happened to come back with it.
+        for key, count in per_queue.items():
+            self._queue_cache[key].begin_round(count)
 
     def _take_from_buffer_locked(self) -> MessageExt:
         """The **one** place the local buffer shrinks one message at a time (``poll()`` drains through

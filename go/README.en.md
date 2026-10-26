@@ -15,7 +15,7 @@ rebalance, pull loops and offset commits are handled by periodic goroutines insi
 - Layers: `remoting` (wire protocol + long-connection transport) → `common` (message model,
   codecs, compression, constants) → `client` (Producer / Push / Pull / LitePull / Admin /
   transaction / trace)
-- Verified against a **RocketMQ 5.5.1** cluster: 15 live tools plus 806 unit tests
+- Verified against a **RocketMQ 5.5.1** cluster: 15 live tools plus 816 unit tests
 
 ## Prerequisites
 
@@ -55,10 +55,10 @@ Measured result of `go test ./... -count=1` (all three test packages `ok`):
 
 | Package | Test functions | Time |
 | --- | --- | --- |
-| `client` | 486 | 46.5s |
+| `client` | 496 | 46.2s |
 | `common` | 135 | 1.7s |
 | `remoting` | 185 | 0.7s |
-| **Total** | **806** (71 `*_test.go` files) | ~49s |
+| **Total** | **816** (72 `*_test.go` files) | ~49s |
 
 To count them yourself: `go test ./client/ -list '.*' | grep -c '^Test'`. Concurrency
 regression on its own:
@@ -405,9 +405,11 @@ to get full verification.
   control before pulling, online thread-pool resize, `OFFSET_ILLEGAL` freeze and rebuild,
   graceful shutdown joins in-flight consumption), Pull (caller-held cursor, short polling, long
   polling, offset read/write, `sendMessageBack`), LitePull (background short-pull + dual
-  cursor, four cache gates judged before the pull offset is resolved — whole-buffer message
-  count / this queue's count / this queue's stored bytes (MiB, integer division) / this
-  queue's offset span, each refusing only when strictly above its threshold, a refusal
+  cursor, `pullBatchSize` default 10, four cache gates judged before the pull offset is
+  resolved — the pull rounds still waiting to be polled × `pullBatchSize` against
+  `pullThresholdForAll` 10000 / this queue's count 1000 / this queue's message **body** bytes
+  100 MiB with integer division / this queue's offset span 2000, each refusing only when
+  strictly above its threshold, a refusal
   re-scheduling just this queue 50ms later while the broker's `FLOW_CONTROL`(215) waits
   20ms,
   `Seek`, auto-commit, queue-change listener, shutdown persistence)
@@ -530,9 +532,24 @@ already receiving before producing; to read history explicitly, call
   implementation and handles FSE + Huffman.
 - ZLIB and LZ4 encoding do compress: on the same 9600-byte payload ZLIB reaches 80 bytes and
   LZ4 103 bytes, and all three codecs round-trip consistently.
-- The POP queue set is computed by local rebalance (one POP loop + ack per queue); the client
-  does not ask the broker to assign queues.
-- `OFFSET_ILLEGAL` freeze-and-rebuild, the three per-queue pull cache gates (topic budgets divided over the owned queues at rebalance), POP's outstanding-ACK gate (strictly above `PopThresholdForQueue`, default 96, a trip counted on the pull path's one client-wide flow-control total and warn cadence), the full heartbeat
+- The POP queue set is computed by local rebalance by default (one POP loop + ack per
+  queue); `SetClientRebalance(false)` asks the broker to assign instead via
+  `QUERY_ASSIGNMENT(400)` — on a broker error or a missing answer the current assignment is
+  kept, an explicit empty set clears it, and the retry cadence follows the 20s rebalance loop.
+- A rebalance round only owes the broker something when the queues actually moved: the round
+  that gained or lost a queue re-shares that topic's subscription version, divides the topic
+  cache budgets over the new queue count, immediately sends ONE heartbeat round to every
+  broker carrying those versions, and only then fires `messageQueueChanged` — for exactly the
+  topics that moved. A round that pulled back the same queue set does none of the four, and
+  the round that only self-heals a stalled pull loop is not a change either.
+- `OFFSET_ILLEGAL` freeze-and-rebuild, the three per-queue pull cache gates (each judges
+  everything the queue still holds — the undispatched buffer plus the batches in the
+  listener's hands that are not settled yet; count / message **body** MiB by integer division
+  / offset span, all strictly greater with no floor clamped on the threshold and no "0 turns
+  it off", since checkConfig owns the legal ranges; the span gate never runs at all for
+  ordered consumption; topic budgets divided over the owned queues at rebalance), POP's
+  outstanding-ACK gate (strictly above `PopThresholdForQueue`, default 96, a trip counted on
+  the pull path's one client-wide flow-control total and warn cadence), the full heartbeat
   surface and the six allocation strategies are currently covered by unit tests and the
   in-process fake cluster only — there is no matching tool in `examples/` yet.
 
@@ -578,7 +595,7 @@ go/
 │   ├── trace.go · trace_hook.go · trace_dispatcher.go · trace_context.go
 │   ├── consumer_stats.go · stats_item.go · consumer_running_info.go · fault_strategy.go
 │   ├── consume_directly.go · jsonutil.go
-│   └── *_test.go                   71 test files, 806 test functions
+│   └── *_test.go                   72 test files, 816 test functions
 └── examples/                   17 executables (see "Live Cluster Verification")
 ```
 

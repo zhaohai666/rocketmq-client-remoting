@@ -595,3 +595,32 @@ def test_assignment_change_resets_only_this_group_and_only_when_opted_in():
 
         assert resets == ([GROUP] if expected_resets else []), \
             "an unchanged allocation must not reset, and a change must reset this group only"
+
+
+def test_assignment_change_reshares_the_subscription_version_and_notifies_at_once():
+    """A rebalance that moved queues re-shares what this client subscribes to: every subscription gets
+    a fresh wall-clock version -- the pull request carries it and the broker reads a higher one as new
+    subscription information -- and one heartbeat goes out in that same round instead of waiting for
+    the periodic one. An unchanged allocation must do neither."""
+    consumer, transport, mqc = _started_push_consumer(False)
+    consumer._rebalance_pull_threads = lambda: None
+    consumer.message_model = MessageModel.BROADCASTING
+    queues = [MessageQueue(topic=TOPIC, broker_name="broker-a", queue_id=0)]
+    mqc.get_topic_subscribe_info = lambda topic: list(queues)
+    consumer.subscription_data[TOPIC].sub_version = 1234
+    for mq in queues:
+        consumer._offset_table[consumer._mq_key(mq)] = 0
+
+    consumer._do_rebalance()
+    assert transport.bodies(BROKER_A), "an assignment change must notify the broker without waiting"
+    assert consumer.subscription_data[TOPIC].sub_version > 1234
+    sent = next(iter(transport.last(BROKER_A).consumer_data_set)).subscription_data_set
+    assert [s.sub_version for s in sent] == [consumer.subscription_data[TOPIC].sub_version], \
+        "the heartbeat must carry the version the next pull will send"
+
+    rounds = len(transport.rounds)
+    settled = consumer.subscription_data[TOPIC].sub_version
+    consumer._do_rebalance()
+    assert len(transport.rounds) == rounds, "an unchanged allocation must not notify again"
+    assert consumer.subscription_data[TOPIC].sub_version == settled, \
+        "the version moves with the assignment, not with every rebalance round"

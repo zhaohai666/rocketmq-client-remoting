@@ -185,7 +185,10 @@ class TestLifecycle:
         # the default configuration
         c = DefaultLitePullConsumer("LitePG_UT")
         assert c.auto_commit is True
-        assert c.pull_batch_size == 32
+        # The lite default is the small one: the aggregate cache gate budgets a whole batch per pending
+        # pull round, so the batch size is a multiplier of that budget, not just how much one pull takes.
+        assert c.pull_batch_size == 10
+        assert c.pull_threshold_for_all == 10000
         assert c.poll_timeout_millis == 5000
         assert c.consume_from_where == "CONSUME_FROM_LAST_OFFSET"
         assert len(c.consume_timestamp) == 14

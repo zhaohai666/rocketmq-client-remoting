@@ -2,11 +2,12 @@
 // application that never polls from turning the local buffer into an unbounded
 // queue, so this file pins them without a live cluster: the DIRECTION of all four
 // comparisons (strictly greater, so a threshold reads as "how many may still be
-// cached"), the UNITS (stored size in whole MiB, offset span, message count), the
-// SCOPE of each budget (one queue alone, except the whole-buffer one), the 50 ms
-// re-schedule that belongs to the refused queue only, the three trip counters with
-// the shared WARN cadence, and the broker's own 215 answer getting the short 20 ms
-// pause instead.
+// cached"), the UNITS (message BODY in whole MiB, offset span, message count), the
+// aggregate budget's multiplier (a pending pull round charges a whole pullBatchSize,
+// not the messages that round happened to bring back), the SCOPE of each budget
+// (one queue alone, except the whole-buffer one), the 50 ms re-schedule that
+// belongs to the refused queue only, the three trip counters with the shared WARN
+// cadence, and the broker's own 215 answer getting the short 20 ms pause instead.
 //
 // Every positive assertion sits next to the control that goes red when the rule
 // behind it is reverted; the paired leg is named in the comment above it.
@@ -36,11 +37,11 @@ func liteFCQueue(id int32) common.MessageQueue {
 	return common.MessageQueue{Topic: liteFCTopic, BrokerName: "b1", QueueID: id}
 }
 
-// liteFCMsg builds one cached message with `store` bytes of stored size (what the
-// commitlog record costs, which is what the size gate adds up) and `body` bytes of
-// body, set independently of each other so a body-length implementation is
-// tellable apart from a stored-size one.
-func liteFCMsg(queueID int32, offset int64, store int, body int) *common.MessageExt {
+// liteFCMsg builds one cached message with `body` bytes of body — what the size
+// gate adds up — and `store` bytes of stored size, the width of the wire record.
+// The two are set independently of each other so a stored-size implementation is
+// tellable apart from the body-length one it replaced.
+func liteFCMsg(queueID int32, offset int64, body, store int) *common.MessageExt {
 	m := common.NewMessageExt()
 	m.Topic = liteFCTopic
 	m.BrokerName = "b1"
@@ -51,11 +52,12 @@ func liteFCMsg(queueID int32, offset int64, store int, body int) *common.Message
 	return m
 }
 
-// liteFCMsgs builds n consecutive messages for one queue, offsets 0..n-1.
-func liteFCMsgs(queueID int32, n int, store int) []*common.MessageExt {
+// liteFCMsgs builds n consecutive messages for one queue, offsets 0..n-1, each with
+// a `body`-byte body carried by a minimal wire record. One call is one pull round.
+func liteFCMsgs(queueID int32, n, body int) []*common.MessageExt {
 	out := make([]*common.MessageExt, 0, n)
 	for i := 0; i < n; i++ {
-		out = append(out, liteFCMsg(queueID, int64(i), store, 16))
+		out = append(out, liteFCMsg(queueID, int64(i), body, 64))
 	}
 	return out
 }
@@ -75,8 +77,17 @@ func liteFCConsumer(t *testing.T, group string) *DefaultLitePullConsumer {
 
 // liteFCStage fills the local buffer through the pull path's own entry point, so
 // the per-queue backlog accounting moves exactly the way a fetched batch moves it.
+// One call is one pull round.
 func liteFCStage(c *DefaultLitePullConsumer, msgs ...*common.MessageExt) {
 	c.enqueue(msgs)
+}
+
+// liteFCDrain hands the application up to n messages from the front of the buffer,
+// the way Poll does, and returns how many left.
+func liteFCDrain(c *DefaultLitePullConsumer, n int) int {
+	c.bufMu.Lock()
+	defer c.bufMu.Unlock()
+	return len(c.drainBufferLocked(n))
 }
 
 func liteFCTrips(c *DefaultLitePullConsumer) (all, cache, span int64) {
@@ -124,7 +135,15 @@ func TestLiteFlowControlKnobsDefaultToTheSharedBudgets(t *testing.T) {
 			DefaultLitePullThresholdForAll, DefaultLitePullThresholdForQueue,
 			DefaultLitePullThresholdSizeForQueue, DefaultLiteConsumeMaxSpan)
 	}
+	// The lite request size is its own default, and the aggregate gate multiplies
+	// with it: 10, not the push consumer's 32.
+	if DefaultLitePullBatchSize != 10 {
+		t.Errorf("DefaultLitePullBatchSize = %d, want 10", DefaultLitePullBatchSize)
+	}
 	c := MustNewDefaultLitePullConsumer("GID_lite_fc_defaults")
+	if got := c.PullBatchSize(); got != DefaultLitePullBatchSize {
+		t.Errorf("a fresh consumer's PullBatchSize = %d, want %d", got, DefaultLitePullBatchSize)
+	}
 	if got := c.PullThresholdForAll(); got != DefaultLitePullThresholdForAll {
 		t.Errorf("PullThresholdForAll = %d, want %d", got, DefaultLitePullThresholdForAll)
 	}
@@ -142,6 +161,10 @@ func TestLiteFlowControlKnobsDefaultToTheSharedBudgets(t *testing.T) {
 	c.SetPullThresholdForQueue(8)
 	c.SetPullThresholdSizeForQueue(9)
 	c.SetConsumeMaxSpan(10)
+	c.SetPullBatchSize(4)
+	if got := c.PullBatchSize(); got != 4 {
+		t.Errorf("SetPullBatchSize/PullBatchSize round-tripped %d, want 4", got)
+	}
 	if got := c.PullThresholdForAll(); got != 7 {
 		t.Errorf("SetPullThresholdForAll/PullThresholdForAll round-tripped %d, want 7", got)
 	}
@@ -179,9 +202,9 @@ func TestLiteFlowControlZeroThresholdTripsOnTheFirstCachedMessage(t *testing.T) 
 	if reason, _, stats := c.cacheGateReason(liteFCQueue(0)); reason != "" || stats.count != 0 {
 		t.Errorf("an empty queue at count threshold 0 trips %q with count %d, want it to pull", reason, stats.count)
 	}
-	liteFCStage(c, liteFCMsg(0, 0, 16, 16))
+	liteFCStage(c, liteFCMsg(0, 0, 16, 64))
 	if reason, threshold, _ := c.cacheGateReason(liteFCQueue(0)); reason != liteGateCount || threshold != 0 {
-		t.Errorf("one cached message at count threshold 0 = (%q, threshold %d), want (count, 0) — no clamping",
+		t.Errorf("one cached message at count threshold 0 = (%q, threshold %d), want (count, 0) with no clamping",
 			reason, threshold)
 	}
 
@@ -198,23 +221,27 @@ func TestLiteFlowControlZeroThresholdTripsOnTheFirstCachedMessage(t *testing.T) 
 
 	sp := liteFCConsumer(t, "GID_lite_fc_zero_span")
 	sp.SetConsumeMaxSpan(0)
-	liteFCStage(sp, liteFCMsg(0, 5, 16, 16))
+	liteFCStage(sp, liteFCMsg(0, 5, 16, 64))
 	if reason, _, _ := sp.cacheGateReason(liteFCQueue(0)); reason != "" {
 		t.Errorf("a single cached message spans nothing but trips %q", reason)
 	}
-	liteFCStage(sp, liteFCMsg(0, 6, 16, 16))
+	liteFCStage(sp, liteFCMsg(0, 6, 16, 64))
 	if reason, _, _ := sp.cacheGateReason(liteFCQueue(0)); reason != liteGateSpan {
 		t.Errorf("a span of 1 at maxSpan 0 = %q, want the span gate", reason)
 	}
 
+	// The aggregate reads pending rounds, so at threshold 0 the FIRST round still
+	// waiting for the application trips it — and an empty buffer does not.
 	agg := liteFCConsumer(t, "GID_lite_fc_zero_all")
 	agg.SetPullThresholdForAll(0)
-	if reason, _, _ := agg.cacheGateReason(liteFCQueue(0)); reason != "" {
-		t.Errorf("an empty buffer at the aggregate threshold 0 trips %q", reason)
+	if reason, _, stats := agg.cacheGateReason(liteFCQueue(0)); reason != "" || stats.rounds != 0 || stats.reserved != 0 {
+		t.Errorf("an empty buffer at the aggregate threshold 0 trips %q with %+v, want it to pull", reason, stats)
 	}
 	liteFCStage(agg, liteFCMsgs(0, 1, 16)...)
-	if reason, _, _ := agg.cacheGateReason(liteFCQueue(1)); reason != liteGateAll {
-		t.Errorf("one cached message at the whole-buffer threshold 0 = %q, want the aggregate gate", reason)
+	if reason, _, stats := agg.cacheGateReason(liteFCQueue(1)); reason != liteGateAll ||
+		stats.rounds != 1 || stats.reserved != int64(agg.PullBatchSize()) {
+		t.Errorf("one pending round at the whole-buffer threshold 0 = (%q, %+v), want the aggregate gate"+
+			" on 1 round x the batch size", reason, stats)
 	}
 }
 
@@ -370,70 +397,84 @@ func TestLitePullCacheGateRefusesOneQueueAndPullsItsSibling(t *testing.T) {
 
 // ---------------------------------------------------------------- the size gate
 
-// The size budget is spent on the STORED record, not the body: a small body inside
-// a large store record must refuse the round, and the mirror case — a large body
-// inside a small store record — must not. Body and store size are set
-// independently here precisely so the two are not interchangeable.
-func TestLiteFlowControlSizeGateCountsStoredSizeNotBodyLength(t *testing.T) {
-	c := liteFCConsumer(t, "GID_lite_fc_store_size")
+// The size budget is spent on the message BODY the client keeps in memory, never on
+// the width of the wire record: a large body inside a small store record must refuse
+// the round, and the mirror case — a small body inside a large store record — must
+// not. Body and store size are set independently here precisely so the two are not
+// interchangeable.
+func TestLiteFlowControlSizeGateCountsBodyLengthNotStoredSize(t *testing.T) {
+	c := liteFCConsumer(t, "GID_lite_fc_body_size")
 	c.SetPullThresholdSizeForQueue(1)
 
-	liteFCStage(c, liteFCMsg(0, 0, 4*mib, 16))
+	liteFCStage(c, liteFCMsg(0, 0, 4*mib, 64))
 	if reason, _, stats := c.cacheGateReason(liteFCQueue(0)); reason != liteGateSize || stats.bytes != 4*mib {
-		t.Errorf("a 16-byte body in a 4 MiB store record = (%q, %d bytes), want the size gate on 4 MiB",
+		t.Errorf("a 4 MiB body carried by a 64-byte store record = (%q, %d bytes), want the size gate on 4 MiB",
 			reason, stats.bytes)
 	}
 
-	// Mirror control: 4 MiB of body carried by a 64-byte store record. A
-	// body-length implementation refuses this queue; a stored-size one keeps it
-	// pulling.
-	mirror := liteFCConsumer(t, "GID_lite_fc_body_size")
+	// Mirror control: a 16-byte body inside a 4 MiB store record. A stored-size
+	// implementation refuses this queue; the body-length one keeps it pulling.
+	mirror := liteFCConsumer(t, "GID_lite_fc_store_size")
 	mirror.SetPullThresholdSizeForQueue(1)
-	liteFCStage(mirror, liteFCMsg(0, 0, 64, 4*mib))
-	if reason, _, stats := mirror.cacheGateReason(liteFCQueue(0)); reason != "" || stats.bytes != 64 {
-		t.Errorf("a 4 MiB body in a 64-byte store record = (%q, %d bytes), want it to keep pulling",
+	liteFCStage(mirror, liteFCMsg(0, 0, 16, 4*mib))
+	if reason, _, stats := mirror.cacheGateReason(liteFCQueue(0)); reason != "" || stats.bytes != 16 {
+		t.Errorf("a 16-byte body inside a 4 MiB store record = (%q, %d bytes), want it to keep pulling",
 			reason, stats.bytes)
 	}
 }
 
-// Over the wire the budget must read what the decoder recorded on the messages
-// that actually landed in the buffer: the mock broker pads a record to its store
-// size, so a small body arrives as a large cached record and the next round is
-// refused.
-func TestLitePullSizeGateReadsTheStoredSizeOfAFetchedBatch(t *testing.T) {
+// Over the wire the budget must read the body of the messages that actually landed
+// in the buffer. The mock broker pads a record to its store size, so a small body
+// arrives as a large cached record — and must still leave the queue pulling. The
+// mirror leg then fetches a genuinely large body, which does refuse the next round.
+func TestLitePullSizeGateReadsTheBodyOfAFetchedBatch(t *testing.T) {
 	f := newClusterFixture(t, map[string]int{liteFCTopic: 1})
 	c, mqs := liteFCStaged(t, f, "GID_lite_fc_wire_size", liteFCTopic, 0)
 	mq := mqs[0]
-	batch := f.broker.add(liteFCTopic, 0, "big0", "small1")
-	batch[0].StoreSize = int32(2 * mib)
-	batch[1].StoreSize = 64
+	fat := f.broker.add(liteFCTopic, 0, "big0", "thin1", strings.Repeat("y", 2*mib), "after")
+	fat[0].StoreSize = int32(2 * mib)
 	c.SetPullBatchSize(1)
 	liteFCSetBudgets(c, liteFCOff, liteFCOff, 1, liteFCOff)
 
+	// The first round brings back the padded record: 2 MiB on the wire, 4 bytes in
+	// memory. The store width must not be the unit the gate reads.
 	requireLitePull(t, "the round that fetches the fat record", c.pullOne(mq))
-	if got := c.cacheStatsOf(mq).bytes; got != 2*mib {
-		t.Fatalf("the queue's cached stored size = %d bytes, want the 2 MiB the record cost", got)
+	if got := c.cacheStatsOf(mq).bytes; got != int64(len("big0")) {
+		t.Fatalf("the queue's cached bytes = %d, want the body length, not the %d-byte record the wire carried",
+			got, 2*mib)
 	}
-	if got := liteFCPulls(f, 0); got != 1 {
-		t.Fatalf("requests to the broker = %d, want 1", got)
+	// Control: the very next round still goes out. A stored-size implementation
+	// refuses it here.
+	requireLitePull(t, "the round after a fat record with a thin body", c.pullOne(mq))
+	if got := c.FlowControlCacheTriggered(); got != 0 {
+		t.Fatalf("FlowControlCacheTriggered = %d, want 0: the stored width of a record is not buffer pressure", got)
+	}
+
+	// Now a body that really is over the budget: the round that fetches it is
+	// allowed, the one after is refused.
+	blocked := liteFCPulls(f, 0)
+	requireLitePull(t, "the round that fetches the 2 MiB body", c.pullOne(mq))
+	if got := c.cacheStatsOf(mq).bytes; got != int64(2*mib)+int64(len("big0"))+int64(len("thin1")) {
+		t.Fatalf("the queue's cached bytes = %d, want the 2 MiB body plus the 11 bytes already held", got)
 	}
 	if c.pullOne(mq) {
-		t.Errorf("a queue holding 2 MiB under a 1 MiB budget reported progress")
+		t.Errorf("a queue holding over 2 MiB of body under a 1 MiB budget reported progress")
 	}
-	if got := liteFCPulls(f, 0); got != 1 {
-		t.Errorf("requests to the broker = %d, want the round refused before the request was built", got)
+	if got := liteFCPulls(f, 0); got != blocked+1 {
+		t.Errorf("requests to the broker = %d, want the refused round to add nothing to the %d already sent",
+			got, blocked+1)
 	}
 	if got := c.FlowControlCacheTriggered(); got != 1 {
 		t.Errorf("FlowControlCacheTriggered = %d, want 1", got)
 	}
 
-	// Control: rewind past the fat record so the buffer no longer holds it — the
+	// Control: rewind past the large body so the buffer no longer holds it — the
 	// gate is a reading of the backlog, not a latch.
-	c.Seek(mq, 1)
+	c.Seek(mq, 3)
 	if got := c.cacheStatsOf(mq).bytes; got != 0 {
-		t.Fatalf("after Seek(1) the queue still accounts %d bytes, want the pruned record gone", got)
+		t.Fatalf("after Seek(3) the queue still accounts %d bytes, want the pruned body gone", got)
 	}
-	requireLitePull(t, "the round after the fat record was pruned", c.pullOne(mq))
+	requireLitePull(t, "the round after the large body was pruned", c.pullOne(mq))
 }
 
 // The size budget divides by whole MiB: under the threshold pulls, exactly at it
@@ -506,27 +547,33 @@ func TestLiteFlowControlSpanGateIsStrictlyGreaterAndPerQueue(t *testing.T) {
 
 // ---------------------------------------------------------------- the aggregate gate
 
-// The whole-buffer budget is a separate budget, judged first: a total that leaves
-// every single queue well inside its own count budget still refuses every queue,
-// because the aggregate adds them up. Control: the same staging one message under
-// the aggregate threshold refuses nothing anywhere.
-func TestLiteFlowControlAggregateGateIsASeparateBudget(t *testing.T) {
+// The whole-buffer budget is a separate budget, judged first, and it is stated in
+// PULL CAPACITY: every pull round whose messages the application has not polled yet
+// charges a whole pullBatchSize. Three small rounds therefore reserve three batches
+// even though each came back with one message, and that is what refuses every queue
+// here — while every queue is far inside its own count budget. Control: the same
+// staging with one more message of budget refuses nothing anywhere.
+func TestLiteFlowControlAggregateGateIsPendingRoundsTimesBatchSize(t *testing.T) {
 	c := liteFCConsumer(t, "GID_lite_fc_aggregate")
+	c.SetPullBatchSize(4)
 	c.SetPullThresholdForAll(11)
 	c.SetPullThresholdForQueue(100)
 	for id := int32(0); id < 3; id++ {
-		liteFCStage(c, liteFCMsgs(id, 4, 16)...)
+		liteFCStage(c, liteFCMsgs(id, 1, 16)...)
+	}
+	if got := c.BufferedMessageCount(); got != 3 {
+		t.Fatalf("the buffer holds %d messages, want 3: the aggregate must NOT be reading them", got)
 	}
 	for id := int32(0); id < 3; id++ {
 		reason, threshold, stats := c.cacheGateReason(liteFCQueue(id))
 		if reason != liteGateAll {
-			t.Errorf("queue %d of 12 cached messages refused by %q (its own count %d of budget 100):"+
+			t.Errorf("queue %d of 3 tiny rounds refused by %q (its own count %d of budget 100):"+
 				" want the whole-buffer gate", id, reason, stats.count)
 			continue
 		}
-		if threshold != 11 || stats.total != 12 || stats.count != 4 {
-			t.Errorf("queue %d aggregate verdict reads (threshold %d, total %d, own count %d), want (11, 12, 4)",
-				id, threshold, stats.total, stats.count)
+		if threshold != 11 || stats.batch != 4 || stats.rounds != 3 || stats.reserved != 12 || stats.count != 1 {
+			t.Errorf("queue %d aggregate verdict reads (threshold %d, batch %d, rounds %d, reserved %d, own count %d),"+
+				" want (11, 4, 3, 12, 1)", id, threshold, stats.batch, stats.rounds, stats.reserved, stats.count)
 		}
 	}
 	for id := int32(0); id < 3; id++ {
@@ -541,15 +588,19 @@ func TestLiteFlowControlAggregateGateIsASeparateBudget(t *testing.T) {
 		t.Errorf("the aggregate gate ticked the per-queue counters (cache %d, span %d)", cache, span)
 	}
 
+	// Exactly three rounds of four messages fit a budget of 12: reaching it is not
+	// exceeding it, and the same staging does not refuse anywhere.
 	ok := liteFCConsumer(t, "GID_lite_fc_aggregate_control")
+	ok.SetPullBatchSize(4)
 	ok.SetPullThresholdForAll(12)
 	ok.SetPullThresholdForQueue(100)
 	for id := int32(0); id < 3; id++ {
 		liteFCStage(ok, liteFCMsgs(id, 4, 16)...)
 	}
 	for id := int32(0); id < 3; id++ {
-		if reason, _, _ := ok.cacheGateReason(liteFCQueue(id)); reason != "" {
-			t.Errorf("12 cached messages at aggregate threshold 12: queue %d refused by %q", id, reason)
+		if reason, _, stats := ok.cacheGateReason(liteFCQueue(id)); reason != "" || stats.reserved != 12 {
+			t.Errorf("12 units of reserved capacity at aggregate threshold 12: queue %d refused by %q (%+v)",
+				id, reason, stats)
 		}
 	}
 	if all, cache, span := liteFCTrips(ok); all != 0 || cache != 0 || span != 0 {
@@ -557,35 +608,101 @@ func TestLiteFlowControlAggregateGateIsASeparateBudget(t *testing.T) {
 	}
 }
 
-// The aggregate reads the buffer itself rather than the per-queue accumulators:
-// messages whose queue has gone away still weigh on it.
-func TestLiteFlowControlAggregateReadsTheBufferItself(t *testing.T) {
-	c := liteFCConsumer(t, "GID_lite_fc_aggregate_orphan")
-	c.SetPullThresholdForAll(1)
+// A round is budgeted a whole batch even when it came back with a single message,
+// and the batch knob is the multiplier: the identical buffer refuses at one setting
+// and pulls at another. Reverting the product to "count the cached messages" reddens
+// the first leg; reading a stale batch size reddens the second.
+func TestLiteFlowControlAggregateChargesAFullBatchPerPendingRound(t *testing.T) {
+	c := liteFCConsumer(t, "GID_lite_fc_aggregate_batch")
+	c.SetPullBatchSize(10)
+	c.SetPullThresholdForAll(9)
+	c.SetPullThresholdForQueue(1000)
+	liteFCStage(c, liteFCMsgs(0, 1, 16)...)
+	if reason, _, stats := c.cacheGateReason(liteFCQueue(0)); reason != liteGateAll || stats.reserved != 10 {
+		t.Errorf("one pending round of a batch of 10 = (%q, reserved %d), want the aggregate gate on 10",
+			reason, stats.reserved)
+	}
+
+	// The same single cached message with the request size asking for one: the
+	// reserved capacity follows the knob, so the round is allowed again.
+	c.SetPullBatchSize(1)
+	if reason, _, stats := c.cacheGateReason(liteFCQueue(0)); reason != "" || stats.reserved != 1 {
+		t.Errorf("the same round at batch 1 = (%q, reserved %d), want no gate and 1 unit reserved",
+			reason, stats.reserved)
+	}
+
+	// The round retires once its last message leaves the buffer: nothing waits and
+	// nothing is reserved.
+	c.SetPullBatchSize(10)
+	if drained := len(c.tryDrain()); drained != 1 {
+		t.Fatalf("tryDrain returned %d messages, want 1", drained)
+	}
+	if reason, _, stats := c.cacheGateReason(liteFCQueue(0)); reason != "" || stats.rounds != 0 || stats.reserved != 0 {
+		t.Errorf("after the round was polled away the gate reads (%q, %+v), want nothing reserved", reason, stats)
+	}
+}
+
+// Revoking a queue retires its pending rounds from the whole-buffer budget, exactly
+// as the cached pull requests of that queue leave it: the messages it left behind
+// stay pollable, but they no longer reserve capacity or refuse a round.
+func TestLiteFlowControlRevokedQueueLeavesTheAggregateBudget(t *testing.T) {
+	c := liteFCConsumer(t, "GID_lite_fc_aggregate_revoke")
+	c.SetPullBatchSize(10)
+	c.SetPullThresholdForAll(9)
 	c.SetPullThresholdForQueue(1000)
 	orphan := liteFCQueue(0)
 	liteFCStage(c, liteFCMsgs(0, 2, 16)...)
+	if !c.flowControlHit(orphan) {
+		t.Fatalf("one pending round at aggregate threshold 9 was not refused")
+	}
 	c.dropQueueCache(orphan)
 
-	if reason, _, stats := c.cacheGateReason(liteFCQueue(1)); reason != liteGateAll || stats.total != 2 {
-		t.Errorf("two messages left behind by a revoked queue read as (%q, total %d),"+
-			" want the aggregate budget to still see them", reason, stats.total)
+	if reason, _, stats := c.cacheGateReason(liteFCQueue(1)); reason != "" || stats.rounds != 0 || stats.reserved != 0 {
+		t.Errorf("a revoked queue's rounds left the sibling's aggregate reading (%q, %+v), want nothing reserved",
+			reason, stats)
 	}
 	if stats := c.cacheStatsOf(orphan); stats.count != 0 {
 		t.Errorf("the revoked queue's own accumulator survived with %d messages", stats.count)
 	}
-	// Its round is still refused — but only by the whole-buffer budget, never by
-	// the per-queue backlog it no longer has.
-	if !c.flowControlHit(orphan) {
-		t.Errorf("the orphaned messages did not weigh on the revoked queue's aggregate round")
+	if c.flowControlHit(orphan) {
+		t.Errorf("the revoked queue was still refused: its stale rounds weigh on the whole-buffer budget")
+	}
+	if got := c.BufferedMessageCount(); got != 2 {
+		t.Errorf("retiring the queue's rounds left %d messages in the buffer, want the 2 kept for the application", got)
 	}
 	if all, cache, span := liteFCTrips(c); all != 1 || cache != 0 || span != 0 {
-		t.Errorf("the revoked queue's refusal ticked (%d, %d, %d), want the aggregate counter alone",
-			all, cache, span)
+		t.Errorf("the round after the revoke ticked (%d, %d, %d), want only the refusal before it", all, cache, span)
 	}
 }
 
 // ---------------------------------------------------------------- counters and cadence
+
+// The aggregate budget is stated in messages while the gate counts rounds, so the
+// WARN line has to translate it back: how many rounds still fit is the threshold
+// divided by the request size, rounded UP (a part-round still fits inside the
+// budget). A floor division would under-report the budget the operator set.
+func TestLiteFlowControlAggregateWarnReportsTheRoundsThatStillFit(t *testing.T) {
+	rounds := liteCacheStats{batch: 10}
+	for _, tc := range []struct {
+		all  int64
+		want int64
+	}{
+		{10000, 1000},
+		{10001, 1001},
+		{9, 1},
+		{10, 1},
+		{0, 0},
+	} {
+		if got := rounds.roundsFitInAll(tc.all); got != tc.want {
+			t.Errorf("%d messages of aggregate budget at a batch of 10 reads as %d rounds, want %d",
+				tc.all, got, tc.want)
+		}
+	}
+	// A batch that never divides the budget is not a divisor the line may use.
+	if got := (liteCacheStats{batch: 0}).roundsFitInAll(5); got != 5 {
+		t.Errorf("with no request size the line reported %d rounds, want the budget itself", got)
+	}
+}
 
 // One refusal per gate ticks exactly that gate's counter and no other, and the two
 // "this queue holds too much" gates share one number.
@@ -703,7 +820,9 @@ func TestLiteFlowControlRevokedQueueLosesItsAccumulator(t *testing.T) {
 
 // Seek rewinds a cursor and prunes the queue's cached messages, so the accumulator
 // must follow the buffer — otherwise the gates would refuse on a backlog that is
-// gone, or miss one that came back below the kept offsets.
+// gone, or miss one that came back below the kept offsets. The pending rounds follow
+// too: pruning takes the queue's OLDEST messages out of its OLDEST rounds, so a
+// round only stops counting once its last message is gone.
 func TestLitePullSeekKeepsTheBacklogAccountingHonest(t *testing.T) {
 	c := liteFCConsumer(t, "GID_lite_fc_seek")
 	liteFCSetBudgets(c, liteFCOff, liteFCOff, liteFCOff, 4)
@@ -713,11 +832,19 @@ func TestLitePullSeekKeepsTheBacklogAccountingHonest(t *testing.T) {
 		t.Fatalf("offsets 0..5 at maxSpan 4 read as (%q, span %d): the span gate should already judge them",
 			reason, stats.span)
 	}
+	if got := c.cacheStatsOf(mq); got.rounds != 1 {
+		t.Fatalf("one round of 6 cached messages reads %d pending rounds, want 1", got.rounds)
+	}
 
 	c.Seek(mq, 4)
 	stats := c.cacheStatsOf(mq)
 	if stats.count != 2 || stats.minOffset != 4 || stats.maxOffset != 5 || stats.span != 1 {
 		t.Errorf("after Seek(4) the queue reads %+v, want the 2 messages spanning 4..5", stats)
+	}
+	// The 2 pruned messages came out of the round that brought all 6, and 4 of that
+	// round are still pollable: the round is not retired yet.
+	if stats.rounds != 1 {
+		t.Errorf("after Seek(4) the queue reads %d pending rounds, want 1 (4 of that round still cached)", stats.rounds)
 	}
 	if got := c.BufferedMessageCount(); got != 2 {
 		t.Errorf("the buffer holds %d messages, want the 2 the queue kept", got)
@@ -729,12 +856,15 @@ func TestLitePullSeekKeepsTheBacklogAccountingHonest(t *testing.T) {
 	// Rewinding below everything keeps the accounting untouched, and a re-fetched
 	// lower offset must extend the span rather than drive it negative.
 	c.Seek(mq, 0)
-	if got := c.cacheStatsOf(mq); got.count != 2 || got.span != 1 {
-		t.Errorf("Seek back to 0 reads %+v, want the 2 cached messages untouched", got)
+	if got := c.cacheStatsOf(mq); got.count != 2 || got.span != 1 || got.rounds != 1 {
+		t.Errorf("Seek back to 0 reads %+v, want the 2 cached messages and their round untouched", got)
 	}
-	liteFCStage(c, liteFCMsg(0, 0, 16, 16))
+	liteFCStage(c, liteFCMsg(0, 0, 16, 64))
 	if got := c.cacheStatsOf(mq); got.minOffset != 0 || got.maxOffset != 5 || got.span != 5 || got.count != 3 {
 		t.Errorf("a re-fetched lower offset reads %+v, want 3 messages spanning 0..5", got)
+	}
+	if got := c.cacheStatsOf(mq); got.rounds != 2 {
+		t.Errorf("the re-fetched message is a new round: pending rounds = %d, want 2", got.rounds)
 	}
 	if reason, _, stats := c.cacheGateReason(mq); reason != liteGateSpan {
 		t.Errorf("the span grew back to %d at maxSpan 4 but the gate read %q, want the span gate",
@@ -743,15 +873,18 @@ func TestLitePullSeekKeepsTheBacklogAccountingHonest(t *testing.T) {
 }
 
 // Polling messages away must retire them from their queue's accumulator too, or
-// the gates would keep refusing a backlog the application already took.
+// the gates would keep refusing a backlog the application already took. A round
+// retires only when its LAST message leaves, so a partially polled buffer still
+// charges the aggregate.
 func TestLitePullPollRetiresTheQueueAccounting(t *testing.T) {
 	c := liteFCConsumer(t, "GID_lite_fc_drain")
+	c.SetPullBatchSize(10)
 	c.SetPullThresholdForQueue(3)
 	liteFCStage(c, liteFCMsgs(0, 3, 16)...)
 	if reason, _, _ := c.cacheGateReason(liteFCQueue(0)); reason != "" {
 		t.Fatalf("3 messages at budget 3 = %q, want it to pull", reason)
 	}
-	liteFCStage(c, liteFCMsg(1, 0, 16, 16), liteFCMsg(0, 3, 16, 16))
+	liteFCStage(c, liteFCMsg(1, 0, 16, 64), liteFCMsg(0, 3, 16, 64))
 	if reason, _, _ := c.cacheGateReason(liteFCQueue(0)); reason != liteGateCount {
 		t.Errorf("4 messages for queue 0 = %q, want the count gate", reason)
 	}
@@ -759,19 +892,40 @@ func TestLitePullPollRetiresTheQueueAccounting(t *testing.T) {
 		t.Errorf("the sibling with 1 message refused by %q", reason)
 	}
 
-	if drained := len(c.tryDrain()); drained != 5 {
-		t.Fatalf("tryDrain returned %d messages, want all 5", drained)
+	// The first round of queue 0 is its 3 oldest buffered messages, then the
+	// sibling's single message: polling those four retires two whole rounds and
+	// leaves queue 0's second round — one message — still charged. `rounds` is the
+	// count across every queue, so it is read as the buffer's total, not per queue.
+	if drained := liteFCDrain(c, 4); drained != 4 {
+		t.Fatalf("the partial poll took %d messages, want 4", drained)
+	}
+	bufferWide := c.cacheStatsOf(liteFCQueue(1))
+	if bufferWide.rounds != 1 || bufferWide.reserved != 10 {
+		t.Errorf("the buffer-wide rounds read %+v, want the one surviving round charging a whole batch of 10",
+			bufferWide)
+	}
+	if stats := c.cacheStatsOf(liteFCQueue(0)); stats.count != 1 {
+		t.Errorf("queue 0 after the partial poll holds %d messages, want its newest round still cached", stats.count)
+	}
+	if stats := c.cacheStatsOf(liteFCQueue(1)); stats.count != 0 || stats.bytes != 0 {
+		t.Errorf("the sibling whose only message was polled reads %+v, want its own backlog retired", stats)
+	}
+
+	if drained := len(c.tryDrain()); drained != 1 {
+		t.Fatalf("the final poll took %d messages, want the 1 left", drained)
 	}
 	for _, id := range []int32{0, 1} {
-		if stats := c.cacheStatsOf(liteFCQueue(id)); stats.count != 0 || stats.bytes != 0 || stats.span != 0 {
+		if stats := c.cacheStatsOf(liteFCQueue(id)); stats.count != 0 || stats.bytes != 0 || stats.span != 0 ||
+			stats.rounds != 0 {
 			t.Errorf("queue %d still reads %+v after the buffer was polled dry", id, stats)
 		}
 	}
 	if got := c.BufferedMessageCount(); got != 0 {
 		t.Errorf("buffer length = %d after draining, want 0", got)
 	}
-	if reason, _, _ := c.cacheGateReason(liteFCQueue(0)); reason != "" {
-		t.Errorf("an emptied buffer still refuses with %q: its accumulator drifted from the buffer", reason)
+	if reason, _, stats := c.cacheGateReason(liteFCQueue(0)); reason != "" || stats.reserved != 0 {
+		t.Errorf("an emptied buffer still refuses with %q (reserved %d): its accounting drifted from the buffer",
+			reason, stats.reserved)
 	}
 }
 
@@ -922,11 +1076,11 @@ func TestLitePullCacheGateRecoversOnceTheApplicationPolls(t *testing.T) {
 			t.Fatal("Poll found nothing although the buffer held messages")
 		}
 	}
-	if stats := c.cacheStatsOf(mq); stats.count != 0 || stats.total != 0 {
-		t.Fatalf("after the drain the queue reads %+v, want an empty backlog", stats)
+	if stats := c.cacheStatsOf(mq); stats.count != 0 || stats.rounds != 0 || stats.reserved != 0 {
+		t.Fatalf("after the drain the queue reads %+v, want an empty backlog and no reserved capacity", stats)
 	}
 	if got := c.PullPauseMillisOf(mq); got != 0 {
-		t.Logf("the 50 ms window is still open (%d ms) — the round below must be hand-driven", got)
+		t.Logf("the 50 ms window is still open (%d ms) - the round below must be hand-driven", got)
 	}
 	requireLitePull(t, "the round after the drain", c.pullOne(mq))
 	if got := liteFCPulls(f, 0); got != blocked+1 {

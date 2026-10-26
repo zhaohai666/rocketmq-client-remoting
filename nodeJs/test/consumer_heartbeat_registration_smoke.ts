@@ -283,6 +283,14 @@ async function main() {
       JSON.stringify(slave.membersOf(GROUP)));
 
     // --------------------------------- 5. sendHeartbeatNow() beats every broker
+    // start() beats twice over: the registration beat and the beat that the rebalance
+    // round which just took the queues owes the brokers. The second one is
+    // fire-and-forget, so a delta read too early would count it against this call.
+    // Each round reaches every broker of the table and the master is beaten first, so
+    // equal counts mean no round is still in flight.
+    const settled = await waitFor(() => master.beatCount(GROUP) === slave.beatCount(GROUP), 3000);
+    check('every beat round start() owes reaches both the master and the slave', settled,
+      `master=${master.beatCount(GROUP)} slave=${slave.beatCount(GROUP)}`);
     const beforeMaster = master.beatCount(GROUP);
     const beforeSlave = slave.beatCount(GROUP);
     await consumer.sendHeartbeatNow();

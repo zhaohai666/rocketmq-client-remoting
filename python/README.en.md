@@ -28,11 +28,11 @@ python3 -m venv .venv
 .venv/bin/pip install -e .                     # top-level packages: client / common / remoting
 
 .venv/bin/pip install pytest                   # needed only to run the unit tests
-.venv/bin/python -m pytest tests/ -q           # 1673 passed, 4 skipped
+.venv/bin/python -m pytest tests/ -q           # 1688 passed, 4 skipped
 .venv/bin/python selfcheck.py                  # selfcheck: 7/7 passed
 ```
 
-- `pytest` collects 1636 cases and all of them run offline — no cluster needed. The 4 skips all come
+- `pytest` collects 1692 cases and all of them run offline — no cluster needed. The 4 skips all come
   from `tests/test_protocol_alignment.py` (an optional protocol-constant cross-check, off by default).
 - `selfcheck.py` runs 7 encode/decode round-trips of the protocol itself (JSON header / binary header /
   V2 short-field header / 17-segment storage format / long-topic V2 magic / 6-segment batch format /
@@ -380,9 +380,9 @@ third-party dependencies.
 | Normal / ordered (selector) / pinned-queue / delayed / two-phase transactional / batch / oneway / async (with fair-semaphore backpressure) | ✅ |
 | Request-Reply (325 send + 326 push-back, synchronous and asynchronous) | ✅ |
 | Recalling a delayed message: `recall_message` (370, handle from `SendResult.recall_handle`) | ✅ |
-| Push consumer: concurrent / orderly listeners, broadcasting, the three per-queue cache gates (topic budgets divided over the owned queues), offset correction and reset, stalled-loop recovery, expired-message sweep | ✅ |
+| Push consumer: concurrent / orderly listeners, broadcasting, the three per-queue cache gates (each judges everything the queue still holds -- the undispatched buffer plus the batches in the listener's hands that are not settled yet; count / message **body** MiB by integer division / offset span, all strictly greater with no floor clamped on the threshold, and the span gate never runs at all for ordered consumption; topic budgets divided over the owned queues at rebalance), a rebalance round whose per-topic assignment set moved pays the whole package in one order (only the moved topics re-share their subscription version, then the division, then one immediate heartbeat to every broker, then the queue listener for the moved topics only -- an unchanged round and a stalled-loop self-heal pay none of it), offset correction and reset, stalled-loop recovery, expired-message sweep | ✅ |
 | Pull consumer: manual pull + long polling + manual commit + offset lookup by timestamp | ✅ |
-| Lite pull consumer: `poll` / `assign` / `seek` / `pause` / `commit`, three offset tables (pull / consumed / committed cursors), topic queue-change listener, and four cache gates judged before the pull offset is resolved (whole-buffer count `pull_threshold_for_all` 10000 / this queue's count `pull_threshold_for_queue` 1000 / this queue's stored bytes `pull_threshold_size_for_queue` 100 MiB with integer division / this queue's offset span `consume_max_span` 2000, each refusing only when strictly above its threshold; a refusal re-schedules just this queue 50ms later while the broker's `FLOW_CONTROL`(215) waits 20ms) | ✅ |
+| Lite pull consumer: `poll` / `assign` / `seek` / `pause` / `commit`, three offset tables (pull / consumed / committed cursors), topic queue-change listener, and four cache gates judged before the pull offset is resolved (the pull rounds still waiting to be polled × `pull_batch_size` (default 10) against `pull_threshold_for_all` 10000 / this queue's count `pull_threshold_for_queue` 1000 / this queue's message **body** bytes `pull_threshold_size_for_queue` 100 MiB with integer division / this queue's offset span `consume_max_span` 2000, each refusing only when strictly above its threshold; a refusal re-schedules just this queue 50ms later while the broker's `FLOW_CONTROL`(215) waits 20ms) | ✅ |
 | POP consumption loop (`pop_mode`, with ack / renew / orderly POP / the outstanding-ACK cache gate: this queue's debt strictly above `pop_threshold_for_queue` (default 96) pauses the round for 50ms and is counted on the pull path's client-wide flow-control total) | ✅ |
 | Queue allocation strategies: AVG / AVG_BY_CIRCLE / CONFIG / CONSISTENT_HASH / MACHINE_ROOM / MACHINE_ROOM_NEARBY | ✅ |
 | Two namespace schemes: local `namespace` prefix and server-side `namespace_v2` | ✅ |
@@ -454,7 +454,7 @@ named `_live`. One line each on what they prove:
 | `verify_consumer_heartbeat_slave_live.py` | Consumer heartbeats fan out to slave brokers (needs a slave in the cluster) |
 | `verify_correct_tags_offset_live.py` | An empty response still advances the committed offset (correctTagsOffset) |
 | `verify_fail_fast_live.py` | In-flight requests get a terminal state immediately once the broker really dies (stops and restarts a broker) |
-| `verify_flow_control_live.py` | The three pre-pull cache gates per queue (topic budgets divided into them at rebalance) plus the start-up numeric gates |
+| `verify_flow_control_live.py` | The three pre-pull cache gates per queue (each judging everything the queue still holds -- the undispatched buffer plus the batches in the listener's hands; topic budgets divided into them at rebalance) plus the start-up numeric gates |
 | `verify_heartbeat_v2_live.py` | Heartbeat V2 against a real broker: the broker answers `IS_SUPPORT_HEART_BEAT_V2`, its per-group `group -> fingerprint` table really drives `IS_SUB_CHANGE` (a V1 round followed by the first V2 round is a change, the round after it is not, and a widened subscription is a change again), a fingerprint rebuilt from an equivalent body equals the one the broker recorded (the normalization that drops subVersion / clientID is what makes that true), and a `withoutSub` round keeps the broker-side subscription set (204 still shows it) while the same light body for a group that never delivered one leaves 204 with nothing; a real push consumer driven through the V2 path proves the light rounds go out, every round is accepted, the broker-side tag filter still holds afterwards and the group stays registered; the same consumer with the opt-in off is the paired control — not one non-zero fingerprint or withoutSub body on the wire, and it consumes just the same |
 | `verify_hook_live.py` | CheckForbidden / FilterMessage hooks actually intercepting |
 | `verify_interval_live.py` | Route-refresh and offset-persist periods take effect as configured (two instances, two periods) |
@@ -533,7 +533,7 @@ python/
 ├── rocketmq_logging.py     logging bridge
 ├── selfcheck.py            cluster-free protocol round trips (7 checks)
 ├── __main__.py             command entry (python -m selfcheck)
-├── tests/                  1636 offline cases (conftest.py puts python/ on sys.path)
+├── tests/                  1692 offline cases (conftest.py puts python/ on sys.path)
 ├── verify_*_live.py        live-cluster scripts (see Live Cluster Verification)
 ├── integration_live_test.py / ns_failover_repro.py / go_*_check.py  helper scripts
 ├── pyproject.toml          no runtime dependencies; requires-python >= 3.8

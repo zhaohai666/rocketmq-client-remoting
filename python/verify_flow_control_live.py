@@ -111,9 +111,11 @@ def run_gate_case(label: str, producer: DefaultMQProducer, topic: str, group: st
 def big_body(tag: int) -> bytes:
     """400KB of incompressible message body.
 
-    It must be random bytes: for a body above the compression threshold the producer first tries to compress, and an all-same-byte payload compresses down to
-    a few hundred bytes, so the broker's on-disk storeSize becomes a few hundred bytes too (the first time this verification ran, a 400KB
-    b"F"*… measured only 640B, so the size gate "never hitting" was caused by the fixture being compressible, not an implementation bug).
+    The queue-level byte gate sums the bodies this client holds, and eight of these are over the 1 MiB
+    budget it is tested against. Random bytes keep the producer's compression from shrinking the payload:
+    a send-side compressed body is decompressed on the way back in, but an all-same-byte fixture (the very
+    first run used b"F" * 400000) travels as a few hundred bytes, which makes the fixture, not the gate,
+    the reason a size gate "never hits".
     The prefix is kept so messages can be identified individually.
     """
     return b"FC%04d" % tag + os.urandom(400 * 1024 - 6)

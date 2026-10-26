@@ -1602,22 +1602,62 @@ func (c *DefaultMQPushConsumer) sendHeartbeatNow() error {
 	return nil
 }
 
-// beatAfterRebalance is the assignment-changed beat: with heartbeat V2 enabled
-// it drops every cached fingerprint (the broker must be handed the
-// subscriptions again for the queues this client just picked up) and sends one
-// immediate beat; with V2 off — the default — it is a no-op, keeping the
-// instance's 30s cadence the only beat on the plain path.
-func (c *DefaultMQPushConsumer) beatAfterRebalance(changed bool) {
-	if !changed {
-		return
-	}
+// beatAfterRebalance is the assignment-changed beat: ONE immediate heartbeat round
+// to every broker. With heartbeat V2 on it drops the cached fingerprints first, so
+// the broker is handed the subscriptions again for the queues this client just
+// picked up; with V2 off — the default — the same call is the plain beat, which is
+// why this beat is not conditioned on the mode. An unchanged round spends nothing:
+// the instance's periodic cadence stays the only beat on the plain path.
+func (c *DefaultMQPushConsumer) beatAfterRebalance() {
 	c.mu.Lock()
 	instance := c.instance
 	c.mu.Unlock()
-	if instance == nil || !instance.Config().UseHeartbeatV2 {
+	if instance == nil {
 		return
 	}
 	instance.SendHeartbeatToAllBrokerWithLockV2(true, 0)
+}
+
+// restampSubscriptionVersions re-shares the subscription version of every topic
+// whose assignment moved. The beat that follows carries it, and the heartbeat's
+// subscription equality covers the version, so a broker that had suppressed this
+// client's unchanged subscriptions now takes them again — which is what stops a
+// queue this client just picked up from being served under a stale filter.
+func (c *DefaultMQPushConsumer) restampSubscriptionVersions(topics []string) {
+	if len(topics) == 0 {
+		return
+	}
+	newVersion := common.CurrentTimeMillis()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, topic := range topics {
+		sub, ok := c.subscription[topic]
+		if !ok || sub == nil {
+			continue
+		}
+		common.LogInfof("%s rebalance changed, also update version: %d, %d", topic, sub.SubVersion, newVersion)
+		// The map holds the same pointers the instance's heartbeat builder reads, so
+		// the new version is what the next beat carries.
+		sub.SubVersion = newVersion
+	}
+}
+
+// afterAssignmentChange is the whole of what a rebalance round whose queue set
+// moved does, in one order that cannot drift: the topics that gained or lost a
+// queue re-share their subscription version, the topic cache budgets are divided
+// over the queues this client now holds, every broker gets the immediate beat that
+// carries the fresh versions, and last the user's queue listener hears about it.
+//
+// The division runs AFTER the per-queue pull state was rebuilt for this round, so
+// it uses this round's queue count and not the previous one's.
+func (c *DefaultMQPushConsumer) afterAssignmentChange(moved []string) {
+	if len(moved) == 0 {
+		return
+	}
+	c.restampSubscriptionVersions(moved)
+	c.divideTopicThresholds()
+	c.beatAfterRebalance()
+	c.notifyQueueChanged(moved)
 }
 
 // consumeTimestampMillis reads the configured value and parses it.
@@ -1793,13 +1833,14 @@ func (c *DefaultMQPushConsumer) doRebalance() error {
 	c.assigned = assigned
 	c.mu.Unlock()
 	now := c.assignedSet()
-	// A SET comparison, not a size comparison: a swap that keeps the count (one
-	// queue lost and another gained) changes which buffers exist, so it is a
-	// change and the topic budgets have to be re-divided over the new queue set.
-	changed := assignmentChanged(was, now)
-	if changed {
-		common.LogInfof("rebalance result changed, group=%s clientId=%s assigned=%d",
-			c.consumerGroup, c.clientID, len(assigned))
+	// The topics whose queue SET moved, so a swap that keeps the count (one queue
+	// lost and another gained) is still a change: which buffers exist changed, the
+	// budgets have to be re-divided over the new set and the broker has to be told
+	// about the subscriptions of the queues this client just picked up.
+	moved := changedTopics(was, now)
+	if len(moved) > 0 {
+		common.LogInfof("rebalance result changed, group=%s clientId=%s assigned=%d topics=%v",
+			c.consumerGroup, c.clientID, len(assigned), moved)
 	}
 	// Resolve the initial offset for freshly assigned queues NOW, not lazily on
 	// the first pull (see the package comment).
@@ -1841,27 +1882,56 @@ func (c *DefaultMQPushConsumer) doRebalance() error {
 	}
 	c.syncPullLoops()
 	// AFTER the per-queue pull state has been rebuilt for this round, so the
-	// division uses this round's queue count and not the previous one's.
-	if changed {
-		c.divideTopicThresholds()
-	}
+	// division inside uses this round's queue count and not the previous one's.
+	c.afterAssignmentChange(moved)
 	return nil
 }
 
-// assignmentChanged reports whether the queue SET differs between two rebalance
-// rounds. A size comparison is not enough: losing one queue and gaining another
-// keeps the count while changing who owns what, and every topic budget has to be
-// re-split over the new set.
-func assignmentChanged(was, now map[common.MessageQueue]struct{}) bool {
-	if len(was) != len(now) {
-		return true
-	}
-	for mq := range now {
-		if _, ok := was[mq]; !ok {
-			return true
+// changedTopics lists, sorted, the topics whose set of assigned queues differs
+// between two rebalance rounds. A size comparison per topic is not enough: losing
+// one queue and gaining another keeps the count while changing who owns what. A
+// topic that appeared or vanished entirely counts too, because its queues moved.
+func changedTopics(was, now map[common.MessageQueue]struct{}) []string {
+	before := queuesByTopicSet(was)
+	after := queuesByTopicSet(now)
+	var moved []string
+	for topic, nowQueues := range after {
+		if !sameQueueSet(before[topic], nowQueues) {
+			moved = append(moved, topic)
 		}
 	}
-	return false
+	for topic, wasQueues := range before {
+		if _, still := after[topic]; !still && len(wasQueues) > 0 {
+			moved = append(moved, topic)
+		}
+	}
+	sort.Strings(moved)
+	return moved
+}
+
+func queuesByTopicSet(queues map[common.MessageQueue]struct{}) map[string]map[common.MessageQueue]struct{} {
+	byTopic := map[string]map[common.MessageQueue]struct{}{}
+	for mq := range queues {
+		set, ok := byTopic[mq.Topic]
+		if !ok {
+			set = map[common.MessageQueue]struct{}{}
+			byTopic[mq.Topic] = set
+		}
+		set[mq] = struct{}{}
+	}
+	return byTopic
+}
+
+func sameQueueSet(a, b map[common.MessageQueue]struct{}) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for mq := range a {
+		if _, ok := b[mq]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // divideTopicThresholds turns each topic-level cache budget into a per-queue one
@@ -2119,7 +2189,6 @@ func (c *DefaultMQPushConsumer) syncPullLoops() {
 	}
 
 	c.mu.Lock()
-	added := 0
 	for mq := range current {
 		if _, ok := c.processQueueTable[mq]; ok {
 			continue
@@ -2138,20 +2207,16 @@ func (c *DefaultMQPushConsumer) syncPullLoops() {
 		stop := make(chan struct{})
 		c.queueStop[mq] = stop
 		go c.queuePullLoop(mq, stop)
-		added++
 	}
 	c.mu.Unlock()
 
 	if len(revoked) > 0 {
 		common.LogInfof("queues revoked, group=%s count=%d", c.consumerGroup, len(revoked))
 	}
-	// A queue assignment change also moves the V2 fingerprint cache that
-	// suppresses unchanged subscriptions, so the broker needs a fresh beat right
-	// here. This client only spends that extra beat when V2 is on and the
-	// assignment really changed, so
-	// the default heartbeat cadence stays exactly the 30s task's.
-	c.beatAfterRebalance(added+len(revoked) > 0)
-	c.notifyQueueChanged()
+	// The broker beat and the user's queue listener are NOT spent here: a round that
+	// only self-heals a stalled loop (the queue stays assigned, so the set did not
+	// move) changes nothing the broker knows about. The caller hands the change to
+	// afterAssignmentChange once it knows which topics moved.
 }
 
 // retireQueueLocked drops one queue's local state. Caller must hold c.mu.
@@ -2227,8 +2292,14 @@ func (c *DefaultMQPushConsumer) persistRevoked(revoked []revokedQueue) {
 	}
 }
 
-// notifyQueueChanged fires the messageQueueChanged callback per topic.
-func (c *DefaultMQPushConsumer) notifyQueueChanged() {
+// notifyQueueChanged fires the user's messageQueueChanged callback for the topics
+// listed, i.e. ONLY for the topics whose assignment moved. A round that re-pulled
+// the same queues tells the listener nothing new, and the callback is documented as
+// a change notification, not a heartbeat.
+func (c *DefaultMQPushConsumer) notifyQueueChanged(topics []string) {
+	if len(topics) == 0 {
+		return
+	}
 	c.mu.Lock()
 	listener := c.messageQueueListener
 	instance := c.instance
@@ -2241,8 +2312,8 @@ func (c *DefaultMQPushConsumer) notifyQueueChanged() {
 	for _, mq := range assigned {
 		byTopic[mq.Topic] = append(byTopic[mq.Topic], mq)
 	}
-	for topic, divided := range byTopic {
-		listener.MessageQueueChanged(topic, instance.GetTopicSubscribeInfo(topic), divided)
+	for _, topic := range topics {
+		listener.MessageQueueChanged(topic, instance.GetTopicSubscribeInfo(topic), byTopic[topic])
 	}
 }
 

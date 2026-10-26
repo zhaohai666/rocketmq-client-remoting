@@ -1,10 +1,15 @@
 # Why this must be locked offline: of the three per-queue gates, only the **count** one fires first in "small messages, fast pulls" scenarios;
 # the other two fail in a **silent** direction when judged wrong:
-#   - Queue-level byte gate failing ⇒ large messages blow up the pulled-but-unconsumed pile (real-world symptom: OOM / RT spike, no exception);
+#   - Queue-level byte gate failing ⇒ large messages blow up the held pile (real-world symptom: OOM / RT spike, no exception);
 #   - Offset span gate failing ⇒ the head message keeps failing to consume while the rest piles up endlessly, and the offset span runs away;
 #   - Topic-level division failing ⇒ the topic budget is never turned into a per-queue quota, so the instance total explodes while no single queue ever looks "over".
-# The units have exactly one pitfall: the size threshold is **MiB**, not bytes. The comparison has one, too:
-# every cache gate is **strictly greater than** the threshold, so a buffer that has reached it exactly still pulls.
+# The units have exactly one pitfall: the size threshold is **whole MiB of body bytes**, not bytes and not the
+# on-disk record length. The comparison has one, too: every cache gate is **strictly greater than** the
+# threshold with no clamp and no "0 disables" escape, so a queue that has reached it exactly still pulls
+# while a threshold of 0 is refused by the first held message.
+# What is measured is everything the queue still holds: the pulled-but-undispatched buffer **plus** the
+# batches already handed to the listener and not settled yet. A gate that read only the buffer would let a
+# wedged listener pull without bound.
 #
 # This file locks the offline semantics of flow-control judgment: the hit direction and units of the three per-queue
 # gates, how the two topic knobs are divided into them when the queue assignment changes,
@@ -13,8 +18,9 @@
 # it compares the same way, judges only its own queue, and counts on the **same** flow-control counter as the pull
 # path, so one client-wide total and one warn cadence span both paths.
 # The LitePull path gets its own section at the bottom: four budgets over one shared local buffer (three per queue
-# plus a whole-buffer aggregate), per-queue accumulators that must stay in step with that buffer, and a single round
-# loop that walks every assigned queue -- so a parked queue must never delay its siblings.
+# plus an aggregate that budgets every pull round still waiting to be polled), per-queue accumulators that must stay
+# in step with that buffer, and a single round loop that walks every assigned queue -- so a parked queue must never
+# delay its siblings.
 # For the real-machine side, "no message is lost after a gate hits", see ../verify_flow_control_live.py.
 import inspect
 import threading
@@ -27,7 +33,9 @@ from client.consumer import (DefaultLitePullConsumer, DefaultMQPushConsumer, Pop
                              PULL_TIME_DELAY_WHEN_CACHE_FLOW_CONTROL,
                              PULL_TIME_DELAY_WHEN_EXCEPTION,
                              is_flow_control_warn_trip)
-from client.consumer_result import PullResult, PullStatus
+from client.consumer_result import (ConsumeConcurrentlyStatus, ConsumeOrderlyStatus,
+                                    MessageListenerConcurrently, MessageListenerOrderly,
+                                    PullResult, PullStatus)
 from client.exception import MQBrokerException
 from common.message import MessageExt, MessageQueue
 from common.subscription_data import SubscriptionData
@@ -38,22 +46,28 @@ from tests.test_lite_pull_consumer import _Lite
 TOPIC = "FlowControlPyUnitTopic"
 BROKER = "broker-a"
 MIB = 1024 * 1024
+# A threshold no test under measurement can reach: with the gates compared plainly, "off" can only mean
+# "so large it never trips", never 0.
+OUT_OF_REACH = 2 ** 31 - 1
 
 
 def _queue(topic=TOPIC, queue_id=0):
     return MessageQueue(topic=topic, broker_name=BROKER, queue_id=queue_id)
 
 
-def _sized(topic, store_size, queue_offset):
-    m = MessageExt(topic=topic, body=b"x")
+def _sized(topic, body_size, queue_offset, store_size=None):
+    """A message whose **body** is ``body_size`` bytes: the cache size gate measures the body, which is
+    what this client actually holds. ``store_size`` is set to something else on purpose in the tests that
+    pin the two apart."""
+    m = MessageExt(topic=topic, body=b"x" * body_size)
     m.broker_name = BROKER
-    m.store_size = store_size
+    m.store_size = store_size if store_size is not None else body_size
     m.queue_offset = queue_offset
     return m
 
 
-def _n_sized(topic, store_size, n):
-    return [_sized(topic, store_size, i) for i in range(n)]
+def _n_sized(topic, body_size, n):
+    return [_sized(topic, body_size, i) for i in range(n)]
 
 
 def _consumer(group):
@@ -63,9 +77,9 @@ def _consumer(group):
 
 def _gates_off(c):
     """Turn off all gates except the threshold under test: an earlier hit would mask the branch under test."""
-    c.pull_threshold_for_queue = 2 ** 31 - 1
-    c.pull_threshold_size_for_queue = 0
-    c.consume_concurrently_max_span = 0
+    c.pull_threshold_for_queue = OUT_OF_REACH
+    c.pull_threshold_size_for_queue = OUT_OF_REACH
+    c.consume_concurrently_max_span = OUT_OF_REACH
     c.pull_threshold_for_topic = -1
     c.pull_threshold_size_for_topic = -1
 
@@ -102,7 +116,7 @@ def test_defaults_only_the_count_gate_is_live():
     assert not _hit(c, mq)
 
 
-def test_count_gate_fires_above_threshold_and_treats_zero_as_one():
+def test_count_gate_fires_above_threshold_with_no_floor_on_the_threshold():
     c = _consumer("G_fc_count")
     mq = _queue()
     _gates_off(c)
@@ -115,35 +129,47 @@ def test_count_gate_fires_above_threshold_and_treats_zero_as_one():
     _stage(c, mq, _n_sized(TOPIC, 100, 4))
     assert _hit(c, mq)
     assert c._flow_control_triggered == 1
-    # threshold 0 is clamped to 1, which under ">" means "hit on the 2nd message" -- exactly what threshold 1 does.
+    # Threshold 0 is the user asking for "cache nothing", so the first held message trips it: the gate takes
+    # the configured number as it stands, with no max(1, n) floor quietly turning 0 into 1.
     c.pull_threshold_for_queue = 0
+    _stage(c, mq, [])
+    assert not _hit(c, mq), "an empty queue is not yet over a zero budget"
     _stage(c, mq, _n_sized(TOPIC, 100, 1))
-    assert not _hit(c, mq), "the max(1,n) guard must agree with threshold=1: one cached message is not over it"
-    _stage(c, mq, _n_sized(TOPIC, 100, 2))
-    assert _hit(c, mq), "pull_threshold_for_queue=0 must count as 1 message (the max(1,n) guard)"
+    assert _hit(c, mq), "pull_threshold_for_queue=0 must trip on the first held message"
 
 
-def test_size_gate_is_in_mib_and_disabled_by_zero():
+def test_size_gate_divides_body_bytes_by_whole_mib_with_no_floor_and_no_off_switch():
     c = _consumer("G_fc_size")
     mq = _queue()
     _gates_off(c)
+    c.pull_threshold_for_queue = OUT_OF_REACH
     c.pull_threshold_size_for_queue = 1          # 1 MiB
-    _stage(c, mq, _n_sized(TOPIC, 300, 3))       # 900 B
+    _stage(c, mq, _n_sized(TOPIC, 300 * 1024, 3))  # 900 KiB of body across 3 messages
     assert not _hit(c, mq)
-    # The unit is MiB, not bytes, and the gate is strictly greater: exactly 1 MiB does not hit.
+    # The unit is **whole** MiB by integer division, and the gate is strictly greater: exactly 1 MiB is 1,
+    # which is not over a budget of 1.
     _stage(c, mq, [_sized(TOPIC, MIB, 0)])
     assert not _hit(c, mq), "exactly 1MiB must not hit (>, not >=)"
-    # One byte over the boundary has to hit: this is what separates ">" from a sloppy "much greater".
+    # 1 MiB + 1 byte of body still divides to 1 MiB: a partial MiB never trips this gate.
     _stage(c, mq, [_sized(TOPIC, MIB + 1, 0)])
-    assert _hit(c, mq), "1MiB+1B exceeds the 1MiB threshold"
-    _stage(c, mq, _n_sized(TOPIC, 2 * MIB, 4))
-    assert _hit(c, mq)
-    # 0 = disable this gate; even a huge buffer is ignored
+    assert not _hit(c, mq), "integer division must floor: 1MiB+1B is still 1 MiB, not over a budget of 1"
+    _stage(c, mq, [_sized(TOPIC, 2 * MIB, 0)])
+    assert _hit(c, mq), "2 MiB of body exceeds the 1MiB threshold"
+    # A huge on-disk record with a small body is not a large backlog for this client: the gate counts the
+    # body, which is the bytes it actually holds.
+    c._flow_control_triggered = 0
+    _stage(c, mq, [_sized(TOPIC, 1024, 0, store_size=8 * MIB)])
+    assert not _hit(c, mq), "storeSize is not what this client caches; the size gate must ignore it"
+    assert c._flow_control_triggered == 0
+    # 0 is not an off switch: it asks for no cached bytes, and the first whole MiB trips it.
     c.pull_threshold_size_for_queue = 0
-    assert not _hit(c, mq)
+    _stage(c, mq, [_sized(TOPIC, 2 * MIB, 0)])
+    assert _hit(c, mq), "pull_threshold_size_for_queue=0 must trip once the cache divides to 2 MiB"
+    _stage(c, mq, [_sized(TOPIC, 1024, 0)])
+    assert not _hit(c, mq), "1 KiB divides to 0 MiB, which is not over a zero budget"
 
 
-def test_span_gate_is_strictly_greater_and_measures_real_span():
+def test_span_gate_is_strictly_greater_with_no_off_switch():
     c = _consumer("G_fc_span")
     mq = _queue()
     _gates_off(c)
@@ -156,8 +182,138 @@ def test_span_gate_is_strictly_greater_and_measures_real_span():
     c.consume_concurrently_max_span = 10
     _stage(c, mq, [_sized(TOPIC, 1, 50), _sized(TOPIC, 1, 5), _sized(TOPIC, 1, 7)])
     assert _hit(c, mq), "an out-of-order buffer must measure the span as max-min, not the first-last difference"
+    # 0 does not switch the gate off: one message spans 0 and still pulls, two spanned messages do not.
     c.consume_concurrently_max_span = 0
+    _stage(c, mq, [_sized(TOPIC, 1, 5)])
+    assert not _hit(c, mq), "a single held message spans 0, which is not over a zero budget"
+    _stage(c, mq, [_sized(TOPIC, 1, 5), _sized(TOPIC, 1, 6)])
+    assert _hit(c, mq), "a span of 1 is over a zero budget; 0 means 'do not run ahead', not 'off'"
+
+
+# ---------------- The gates judge everything the queue still holds, buffer plus listener ----------------
+# A batch leaves the pull buffer the moment the dispatch thread takes it, but the queue has not finished with
+# it: the message is still cached, it is only being handed to the listener. Measuring the buffer alone lets a
+# wedged listener keep pulling -- the messages it holds have left the buffer, so the queue reads empty while
+# the application makes no progress. So count, size and span are judged over
+# **buffer + batches still in the listener's hands** together.
+# The span has one exception, and it is not a narrower scope: ordered consumption does not judge a span at
+# all, because its pull cursor cannot run ahead while a batch sits unsettled in the listener.
+# Every case below is built so the two answers differ: the buffer alone sits exactly on the budget, and the
+# batch on top of it is what crosses the line.
+
+class _ConcurrentGateProbe(MessageListenerConcurrently):
+    """Asks the cache gate while it holds the batch, records the answer, then acks the batch."""
+
+    def __init__(self, c, mq, key):
+        self._c, self._mq, self._key, self.answers = c, mq, key, []
+
+    def consume_message(self, msgs, context):
+        self.answers.append(self._c._flow_control_hit(self._mq, self._key))
+        return ConsumeConcurrentlyStatus.CONSUME_SUCCESS
+
+
+class _OrderlyGateProbe(MessageListenerOrderly):
+    """The same probe on the ordered path, where a settled batch commits and leaves the queue."""
+
+    def __init__(self, c, mq, key):
+        self._c, self._mq, self._key, self.answers = c, mq, key, []
+
+    def consume_message(self, msgs, context):
+        self.answers.append(self._c._flow_control_hit(self._mq, self._key))
+        return ConsumeOrderlyStatus.SUCCESS
+
+
+def _dispatch_head(c, key, mq, probe, n=1):
+    """Hand the first ``n`` buffered messages to ``probe`` through the real consume entry point."""
+    batch = [c._pending[key].pop(0) for _ in range(n)]
+    c._consume_batch(key, mq, batch)
+    return batch
+
+
+def test_concurrent_listener_held_messages_count_toward_the_count_gate():
+    c = _consumer("G_fc_inflight_count")
+    mq = _queue()
+    key = _stage(c, mq, _n_sized(TOPIC, 100, 4))
+    _gates_off(c)
+    c.pull_threshold_for_queue = 3
+    probe = _ConcurrentGateProbe(c, mq, key)
+    c.message_listener = probe
+    _dispatch_head(c, key, mq, probe)
+    assert probe.answers == [True], \
+        "3 buffered + 1 in the listener is 4 held, over a budget of 3; reading the buffer alone answers False"
+    # The batch settled (acked), so the queue is back to exactly its budget and pulls again: the in-flight
+    # term is released with the batch, not left behind.
     assert not _hit(c, mq)
+    assert c._inflight_msgs.get(key) is None, "a settled batch must leave the held set"
+
+
+def test_concurrent_listener_held_messages_count_toward_the_size_gate():
+    c = _consumer("G_fc_inflight_size")
+    mq = _queue()
+    key = _stage(c, mq, [_sized(TOPIC, MIB, off) for off in range(4)])
+    _gates_off(c)
+    c.pull_threshold_size_for_queue = 3
+    probe = _ConcurrentGateProbe(c, mq, key)
+    c.message_listener = probe
+    _dispatch_head(c, key, mq, probe)
+    assert probe.answers == [True], \
+        "4 MiB held (3 buffered + 1 in the listener) is over a 3 MiB budget; the buffer alone is exactly 3"
+    assert not _hit(c, mq)
+
+
+def test_concurrent_listener_held_messages_widen_the_span():
+    c = _consumer("G_fc_inflight_span")
+    mq = _queue()
+    key = _stage(c, mq, [_sized(TOPIC, 100, off) for off in (0, 10)])
+    _gates_off(c)
+    c.consume_concurrently_max_span = 5
+    probe = _ConcurrentGateProbe(c, mq, key)
+    c.message_listener = probe
+    _dispatch_head(c, key, mq, probe)
+    assert probe.answers == [True], \
+        "concurrent consumption keeps the batch attached to its offsets: the held span is still 10, over 5"
+    assert not _hit(c, mq)
+
+
+def test_ordered_listener_held_messages_count_toward_the_count_and_size_gates():
+    c = _consumer("G_fc_orderly_inflight")
+    mq = _queue()
+    key = _stage(c, mq, [_sized(TOPIC, MIB, off) for off in range(4)])
+    _gates_off(c)
+    c.pull_threshold_for_queue = 3
+    c.pull_threshold_size_for_queue = 3
+    probe = _OrderlyGateProbe(c, mq, key)
+    c.message_listener = probe
+    assert c._is_orderly(), "ordered consumption is chosen by the listener's type"
+    _dispatch_head(c, key, mq, probe)
+    assert probe.answers == [True], \
+        "ordered consumption holds its batch on the queue too: 4 held over a budget of 3 must refuse"
+    assert not _hit(c, mq)
+
+
+def test_ordered_consumption_never_judges_the_span_gate():
+    c = _consumer("G_fc_orderly_span")
+    mq = _queue()
+    # One queue's cache spans 0..20 against a max span of 15, and nothing else is over budget.
+    key = _stage(c, mq, [_sized(TOPIC, 1, off) for off in (0, 10, 20)])
+    _gates_off(c)
+    c.consume_concurrently_max_span = 15
+    c.message_listener = _ConcurrentGateProbe(c, mq, key)
+    assert _hit(c, mq), \
+        "the same cache on the concurrent path trips the span: 20 is over a budget of 15"
+    c._flow_control_triggered = 0
+    probe = _OrderlyGateProbe(c, mq, key)
+    c.message_listener = probe
+    assert c._is_orderly(), "ordered consumption is chosen by the listener's type"
+    # Ordered consumption is the span gate's one outright exception: it never runs, whatever the span is.
+    # A concurrent read of this cache answers True, so only the consume mode separates the two answers.
+    assert not _hit(c, mq), \
+        "ordered consumption skips the span term entirely -- it does not narrow its scope"
+    assert c._flow_control_triggered == 0, "no term was judged while the queue spanned over its budget"
+    # The exception is the span alone: count and size still bind an ordered queue, and they read the
+    # full held set, dispatched batch included.
+    c.pull_threshold_for_queue = 2
+    assert _hit(c, mq), "3 held still trips a count budget of 2 on the ordered path"
 
 
 # ---------------- The topic knobs are DIVIDED into the per-queue knobs, never summed at pull time ----------------
@@ -695,20 +851,22 @@ def test_pop_debt_at_the_threshold_pops_instead_of_stalling(monkeypatch):
 # ================================ The LitePull path: four budgets over one shared local buffer ================================
 # The LitePull consumer runs a background pull that feeds **one** global buffer drained only by poll(), so an
 # application that polls slowly -- or never -- grows that buffer without bound. Four gates refuse the pull before
-# it is issued (a whole-buffer aggregate plus this queue's count / MiB / offset span) and re-schedule **that
-# queue's** next round 50 ms later. What makes this path its own case, rather than a copy of the push gates:
+# it is issued (an aggregate over every pull round still waiting to be polled, plus this queue's count / MiB /
+# offset span) and re-schedule **that queue's** next round 50 ms later. What makes this path its own case, rather
+# than a copy of the push gates:
 #   * the per-queue verdict comes from incremental accumulators that must stay in step with a shared container
 #     through append, poll, seek and queue revocation;
 #   * the round loop is a single thread walking every assigned queue, so parking one queue must not delay a
 #     sibling, and a refusal must keep the request away from the broker entirely;
 #   * all four budgets are plain numbers: compared strictly greater, never clamped, so 0 legally means "trip on
 #     the first cached message" rather than "this gate is off".
-# The size gate divides by whole MiB and sums the decoder's storeSize, never the body length; the span gate reads
-# only this queue's own cached offsets. Broker FLOW_CONTROL(215) on this path is a 20 ms re-schedule, not an error.
+# The aggregate budgets a **round** (a pending request may still carry a whole batch) rather than the messages
+# that round happened to bring back, so a backlog of half-empty rounds is refused earlier than its message count
+# suggests. The size gate divides by whole MiB and sums the message **body lengths**, never the on-disk record
+# size; the span gate reads only this queue's own cached offsets. Broker FLOW_CONTROL(215) on this path is a
+# 20 ms re-schedule, not an error.
 
 LITE_TOPIC = "LiteFlowControlPyUnitTopic"
-# "This budget is out of the way": only the gate under test gets a reachable threshold.
-OUT_OF_REACH = 2 ** 31 - 1
 # One poll() hand-out is capped, which is what leaves a real partial buffer behind for the gates to keep
 # refusing: the number is the cap in poll(), and the case below pins it so the two cannot drift apart.
 POLL_BATCH_LIMIT = 1024
@@ -718,9 +876,9 @@ def _lite_mq(queue_id=0, topic=LITE_TOPIC):
     return MessageQueue(topic=topic, broker_name=BROKER, queue_id=queue_id)
 
 
-def _lite_msg(store_size, queue_offset, body_size=1, queue_id=0, topic=LITE_TOPIC):
-    """A message as the lite buffer sees it: the storeSize and the queueOffset the accumulators read, and a
-    body length chosen **independently** of both, so the two can never be confused by the size gate."""
+def _lite_msg(body_size, queue_offset, store_size=1, queue_id=0, topic=LITE_TOPIC):
+    """A message as the lite buffer sees it: the body length and the queueOffset the accumulators read, and a
+    record size chosen **independently** of both, so the two can never be confused by the size gate."""
     m = MessageExt(topic=topic, body=b"y" * body_size)
     m.broker_name = BROKER
     m.queue_id = queue_id
@@ -918,32 +1076,32 @@ def test_lite_count_gate_is_strictly_greater_and_zero_trips_on_the_first_message
     assert not _lite_hit(empty, zmq), "an empty cache is not yet over a zero budget"
 
 
-def test_lite_size_gate_measures_stored_size_not_the_body_length():
-    # A 10-byte body inside a 2 MiB store record: what the client physically holds is 2 MiB, so the gate
-    # refuses. A body-length implementation would read ~0 MiB here and let the backlog grow forever.
-    big, big_mq = _lite_with_backlog("G_lite_size_store",
-                                     [_lite_msg(2 * MIB, 0, body_size=10)])
+def test_lite_size_gate_measures_the_body_not_the_stored_record():
+    # A 2 MiB body carried in a 1 KiB store record: what this client holds is 2 MiB of bytes, so the gate
+    # refuses. A storeSize-based implementation would read ~0 MiB here and let the backlog grow forever.
+    big, big_mq = _lite_with_backlog("G_lite_size_body",
+                                    [_lite_msg(2 * MIB, 0, store_size=1024)])
     big.pull_threshold_size_for_queue = 1
-    assert _lite_hit(big, big_mq), "the size gate must count storeSize, not the body"
+    assert _lite_hit(big, big_mq), "the size gate must count the body length, not storeSize"
 
 
-def test_lite_size_gate_ignores_a_large_body_in_a_small_store_record():
-    # Paired control: 1 MiB of body inside a 1 KiB store record. Counted by body length this is 2 MiB over a
-    # 1 MiB threshold and the queue would be refused; counted by storeSize it is 2 KiB, so it keeps pulling.
-    small, small_mq = _lite_with_backlog("G_lite_size_store_control",
-                                         [_lite_msg(1024, i, body_size=MIB) for i in range(2)])
+def test_lite_size_gate_ignores_a_large_store_record_with_a_small_body():
+    # Paired control: two 2 MiB store records carrying a 1 KiB body each. Counted by storeSize that is 4 MiB over
+    # a 1 MiB threshold and the queue would be refused; counted by body length it is 2 KiB, so it keeps pulling.
+    small, small_mq = _lite_with_backlog("G_lite_size_body_control",
+                                         [_lite_msg(1024, i, store_size=2 * MIB) for i in range(2)])
     small.pull_threshold_size_for_queue = 1
     assert not _lite_hit(small, small_mq)
     assert small._flow_control_triggered == 0
 
 
 def test_lite_size_gate_divides_by_whole_mib_with_integer_division():
-    for store_size, expected in ((MIB - 1, False), (MIB, False),
-                                 (MIB + 1, False), (2 * MIB, True), (2 * MIB + 1, True)):
-        c, mq = _lite_with_backlog("G_lite_size_divide", [_lite_msg(store_size, 0)])
+    for body_size, expected in ((MIB - 1, False), (MIB, False),
+                                (MIB + 1, False), (2 * MIB, True), (2 * MIB + 1, True)):
+        c, mq = _lite_with_backlog("G_lite_size_divide", [_lite_msg(body_size, 0)])
         c.pull_threshold_size_for_queue = 1
         assert _lite_hit(c, mq) is expected, "%d bytes must divide to %s a 1 MiB budget" % (
-            store_size, "refuse" if expected else "pull")
+            body_size, "refuse" if expected else "pull")
     # A partially filled MiB never counts as one: 3 x 300 KiB is 900 KiB, still 0 MiB.
     c, mq = _lite_with_backlog("G_lite_size_divide_partial",
                                [_lite_msg(300 * 1024, i) for i in range(3)])
@@ -985,44 +1143,78 @@ def test_lite_span_gate_is_strictly_greater_and_measures_this_queue_only():
     assert _lite_hit(c, wild)
 
 
-def test_lite_aggregate_gate_refuses_every_queue_once_the_buffer_is_over_budget():
+def test_lite_aggregate_gate_budgets_every_pending_round_not_only_the_messages_that_arrived():
     queues = [_lite_mq(i) for i in range(4)]
     c = _lite_consumer("G_lite_all", *queues)
     _lite_gates_off(c)
-    c.pull_threshold_for_all = 5
-    # Two messages per queue: no queue is anywhere near its own count budget, but 8 in the shared buffer
-    # are over the 5-message aggregate budget, so every queue is refused.
-    _lite_cache(c, [_lite_msg(100, j, queue_id=i) for i in range(4) for j in range(2)])
+    c.pull_batch_size = 32
+    c.pull_threshold_for_all = 100
+    # Four rounds that came back half empty: 8 messages sit in the shared buffer, and no queue is anywhere
+    # near its own count budget -- but each pending round can still carry a whole batch of 32, so the
+    # capacity already reserved for poll() is 128. That is over a budget of 100, so every queue is refused.
+    _lite_cache(c, [_lite_msg(1, j, queue_id=i) for i in range(4) for j in range(2)])
+    assert len(c._local_buffer) == 8, "the buffer itself is well under the aggregate budget"
     for mq in queues:
         assert _lite_hit(c, mq), "the aggregate budget is instance-wide: it refuses every queue"
     assert c._flow_control_for_all_triggered == 4
     assert c._flow_control_triggered == 0, "the aggregate gate has a counter of its own"
+    assert sum(s.pending_rounds for s in c._queue_cache.values()) == 4
 
 
 def test_lite_aggregate_budget_is_separate_from_the_per_queue_budgets():
     queues = [_lite_mq(i) for i in range(4)]
-    # Paired control on the same buffers: raise only the aggregate budget to exactly the total and nothing is
-    # refused, which is what makes the aggregate a budget of its own rather than a re-reading of the per-queue
-    # ones. And it is strictly greater, so a total sitting ON the budget still pulls.
+    # Paired control on the same buffers: raise the aggregate budget to exactly the reserved capacity and
+    # nothing is refused, which is what makes the aggregate a budget of its own rather than a re-reading of
+    # the per-queue ones. And it is strictly greater, so capacity sitting ON the budget still pulls.
     c = _lite_consumer("G_lite_all_control", *queues)
     _lite_gates_off(c)
-    c.pull_threshold_for_all = 8
-    _lite_cache(c, [_lite_msg(100, j, queue_id=i) for i in range(4) for j in range(2)])
+    c.pull_batch_size = 32
+    c.pull_threshold_for_all = 128
+    _lite_cache(c, [_lite_msg(1, j, queue_id=i) for i in range(4) for j in range(2)])
     for mq in queues:
-        assert not _lite_hit(c, mq), "8 cached at an aggregate budget of 8 still pulls (>, not >=)"
+        assert not _lite_hit(c, mq), "4 rounds x 32 at an aggregate budget of 128 still pulls (>, not >=)"
     assert c._flow_control_for_all_triggered == 0
-    # One queue over its own count budget while the total stays under the aggregate: only that queue is
-    # refused, and on the per-queue counter.
+    # One queue over its own count budget while the reserved capacity stays under the aggregate: only that
+    # queue is refused, and on the per-queue counter.
     c2 = _lite_consumer("G_lite_all_split", *queues)
     _lite_gates_off(c2)
-    c2.pull_threshold_for_all = 8
+    c2.pull_batch_size = 32
+    c2.pull_threshold_for_all = 128
     c2.pull_threshold_for_queue = 1
-    _lite_cache(c2, [_lite_msg(100, j, queue_id=0) for j in range(3)])
+    _lite_cache(c2, [_lite_msg(1, j, queue_id=0) for j in range(3)])
     assert _lite_hit(c2, queues[0]), "3 cached over a per-queue budget of 1 must refuse that queue"
     for mq in queues[1:]:
         assert not _lite_hit(c2, mq)
     assert c2._flow_control_for_all_triggered == 0
     assert c2._flow_control_triggered == 1
+
+
+def test_lite_aggregate_budget_is_released_round_by_round_as_the_application_polls():
+    """A round keeps its whole batch reserved until its last message leaves the buffer: a partially polled
+    round still refuses the pull, and only a fully drained one frees its share of the budget."""
+    mq = _lite_mq()
+    c = _lite_consumer("G_lite_all_rounds", mq)
+    _lite_gates_off(c)
+    c.pull_batch_size = 4
+    c.pull_threshold_for_all = 4
+    _lite_cache(c, [_lite_msg(1, 0)])          # round 1: 1 message, reserves a batch of 4
+    _lite_cache(c, [_lite_msg(1, 1)])          # round 2: same -> 8 reserved, one over the budget of 4
+    assert c._queue_cache[mq].pending_rounds == 2
+    assert _lite_hit(c, mq), "2 pending rounds reserve 8 bytes of budget over a threshold of 4"
+    # Two messages cached, which is nothing on its own: the budget is the rounds, not the count.
+    assert c._queue_cache[mq].count == 2
+    drained = c.poll(timeout=0)
+    assert [m.queue_offset for m in drained] == [0, 1]
+    assert c._queue_cache[mq].pending_rounds == 0
+    assert not _lite_hit(c, mq), "polled rounds must stop reserving capacity"
+    # And a single round of the very same size stays inside the same budget.
+    one = _lite_consumer("G_lite_all_rounds_control", mq)
+    _lite_gates_off(one)
+    one.pull_batch_size = 4
+    one.pull_threshold_for_all = 4
+    _lite_cache(one, [_lite_msg(1, 0), _lite_msg(1, 1)])   # one round of 2 messages = exactly 4 reserved
+    assert one._queue_cache[mq].pending_rounds == 1
+    assert not _lite_hit(one, mq), "one round at exactly the aggregate budget still pulls"
 
 
 def test_lite_gates_are_judged_in_the_contract_order_with_one_trip_per_refusal():
@@ -1082,6 +1274,8 @@ def test_lite_accumulators_stay_in_step_with_the_buffer_through_append_poll_and_
                     _lite_msg(3000, 6, queue_id=1)])
     assert (c._queue_cache[q0].count, c._queue_cache[q0].size) == (1, 1000)
     assert (c._queue_cache[q1].count, c._queue_cache[q1].size, c._queue_cache[q1].span) == (2, 5000, 1)
+    # One append is one round per touched queue, whichever number of messages it brought back.
+    assert (c._queue_cache[q0].pending_rounds, c._queue_cache[q1].pending_rounds) == (1, 1)
     assert sum(s.count for s in c._queue_cache.values()) == len(c._local_buffer)
 
     # poll() hands messages out; the same step subtracts them, so the gate reads what is left.
@@ -1089,6 +1283,8 @@ def test_lite_accumulators_stay_in_step_with_the_buffer_through_append_poll_and_
     assert [m.queue_id for m in handed] == [0, 1, 1]
     assert len(c._local_buffer) == 0
     assert sum(s.count for s in c._queue_cache.values()) == 0
+    assert sum(s.pending_rounds for s in c._queue_cache.values()) == 0, \
+        "a polled-away round must stop reserving its batch"
     assert (c._queue_cache[q1].size, c._queue_cache[q1].span) == (0, 0), \
         "an emptied queue must read as nothing cached, not as the boundaries of the drained messages"
 
@@ -1099,6 +1295,7 @@ def test_lite_accumulators_stay_in_step_with_the_buffer_through_append_poll_and_
     drained = c.poll(timeout=0)
     assert len(drained) == 4
     assert sum(s.count for s in c._queue_cache.values()) == len(c._local_buffer) == 0
+    assert sum(s.pending_rounds for s in c._queue_cache.values()) == 0
 
     # seek() prunes the buffer, so it prunes the counters with it.
     _lite_cache(c, [_lite_msg(1000, off, queue_id=0) for off in (0, 4, 9)])
@@ -1106,6 +1303,8 @@ def test_lite_accumulators_stay_in_step_with_the_buffer_through_append_poll_and_
     assert c._queue_cache[q0].count == 1
     assert (c._queue_cache[q0].min_offset, c._queue_cache[q0].max_offset) == (9, 9)
     assert c._queue_cache[q0].size == 1000
+    # The pruned prefix leaves the round it belonged to: one round still holds the message that survived.
+    assert c._queue_cache[q0].pending_rounds == 1
     assert sum(s.count for s in c._queue_cache.values()) == len(c._local_buffer) == 1
 
 
@@ -1303,6 +1502,7 @@ def test_lite_aggregate_gate_warns_on_its_own_counter(caplog):
     queues = [_lite_mq(i) for i in range(2)]
     c = _lite_consumer("G_lite_all_warn", *queues)
     _lite_gates_off(c)
+    c.pull_batch_size = 8
     c.pull_threshold_for_all = 1
     _lite_cache(c, [_lite_msg(100, j, queue_id=i) for i in range(2) for j in range(2)])
     with caplog.at_level("WARNING"):
@@ -1313,8 +1513,9 @@ def test_lite_aggregate_gate_warns_on_its_own_counter(caplog):
         c._flow_control_for_all_triggered = FLOW_CONTROL_WARN_EVERY_N_TRIPS
         assert _lite_hit(c, queues[0])
     assert len(_lite_warns(caplog)) == 2, "trip 1001 must warn again"
+    # The warn translates the message budget back into rounds: ceil(1 / 8) is 1 round, and 2 are pending.
     assert ("the consume request count exceeds threshold 1, so do flow control,"
-            " cached=4, flowControlTimes=1") == _lite_warns(caplog)[0], _lite_warns(caplog)[0]
+            " consume request count=2, flowControlTimes=1") == _lite_warns(caplog)[0], _lite_warns(caplog)[0]
 
 
 def test_lite_span_gate_warns_on_its_own_counter(caplog):

@@ -170,12 +170,20 @@ func (c *DefaultMQPushConsumer) pullCursor(mq common.MessageQueue) (int64, bool)
 	return next, true
 }
 
-// The cache gates all compare **strictly greater than** the threshold: a buffer that has reached
-// the threshold exactly is still allowed to pull, so a threshold reads as "how many may be cached".
-//   - pullThresholdForQueue (1000): buffered message COUNT;
-//   - pullThresholdSizeForQueue (100 MB): buffered bytes;
-//   - consumeConcurrentlyMaxSpan (2000): the offset SPAN of the buffer, so one
-//     message that keeps failing cannot let the offset run away.
+// The cache gates all compare **strictly greater than** the threshold as it stands: no floor of 1 is
+// clamped under it and no "0 means disabled" escape is honored, so a queue that has reached the
+// threshold exactly is still allowed to pull and a threshold reads as "how many may be cached".
+// Keeping the legal range of each knob is the job of the start-up config check, not of the gate.
+//   - pullThresholdForQueue (1000): how many messages this queue HOLDS;
+//   - pullThresholdSizeForQueue (100): how many **whole MiB of message body** it holds, so a
+//     1 MiB budget tolerates 1.9 MiB and a partial MiB never trips;
+//   - consumeConcurrentlyMaxSpan (2000): the offset SPAN of the held messages, so one message that
+//     keeps failing cannot let the offset run away. This term is the ordered path's one exception: it
+//     does not run AT ALL for orderly consumption, because an ordered pull cursor cannot move past the
+//     batch still in the listener's hands, so there is no run-ahead to guard against.
+//
+// Everything the gates judge is what this queue still holds: the pulled-but-undispatched buffer plus
+// the batches already in the listener's hands and not settled yet.
 //
 // Only these three per-queue gates run at pull time; nothing here ever sums the
 // sibling queues of a topic. The two topic-level knobs are turned into per-queue
@@ -198,11 +206,12 @@ func (c *DefaultMQPushConsumer) flowControlHit(mq common.MessageQueue, pq *proce
 	return true
 }
 
-// cacheGateReason names the per-queue gate this queue's buffer is over, or "" when it may pull.
-// It judges ONE queue's own buffer and reads no sibling queue: a topic-level budget reaches it
+// cacheGateReason names the per-queue gate this queue's held messages are over, or "" when it may
+// pull. It judges ONE queue and reads no sibling queue: a topic-level budget reaches it
 // only through the division done at rebalance (see divideTopicThresholds).
 func (c *DefaultMQPushConsumer) cacheGateReason(pq *processQueue) string {
-	count, sizeMB, span := pq.PendingStats()
+	count, bodyBytes, span, judgeSpan := pq.CacheStats()
+	sizeMiB := bodyBytes / (1024 * 1024)
 
 	c.mu.Lock()
 	maxCount := c.pullThresholdForQueue
@@ -211,11 +220,11 @@ func (c *DefaultMQPushConsumer) cacheGateReason(pq *processQueue) string {
 	c.mu.Unlock()
 
 	switch {
-	case int64(count) > maxInt64(1, maxCount):
+	case int64(count) > maxCount:
 		return "count"
-	case maxSize > 0 && sizeMB > float64(maxSize):
+	case sizeMiB > maxSize:
 		return "size"
-	case maxSpan > 0 && span > maxSpan:
+	case judgeSpan && span > maxSpan:
 		return "span"
 	}
 	return ""

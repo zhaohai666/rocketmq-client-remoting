@@ -66,7 +66,7 @@ import { PullSysFlag } from '../common/sysflag.ts';
 import { MessageExt, MessageQueue, Message } from '../common/message.ts';
 import { MessageConst } from '../common/messageConst.ts';
 import { MixAll } from '../common/mixAll.ts';
-import { defaultConsumeTimestamp, parseConsumeTimestamp } from '../common/utilAll.ts';
+import { defaultConsumeTimestamp, parseConsumeTimestamp, currentTimeMillis } from '../common/utilAll.ts';
 import { FilterAPI, SubscriptionData, ExpressionType } from '../common/subscriptionData.ts';
 import { decodeMessages } from '../common/messageDecoder.ts';
 import { Validators } from '../common/validators.ts';
@@ -889,6 +889,7 @@ export class DefaultMQPushConsumer {
     if (!this.mqClient || !this.started) return;
     const client = this.mqClient;
     const was = new Set(this.assigned.map(mqKey));
+    const wasByTopic = queuesByTopicKeySet(this.assigned);
     const topics = Array.from(this.subscription.keys()).sort();
     const assigned: MessageQueue[] = [];
     for (const topic of topics) {
@@ -922,21 +923,14 @@ export class DefaultMQPushConsumer {
     }
     assigned.sort((a, b) => a.compareTo(b));
     this.assigned = assigned;
-    const now = new Set(assigned.map(mqKey));
-    let changed = now.size !== was.size;
-    if (!changed) {
-      for (const key of now) {
-        if (!was.has(key)) { changed = true; break; }
-      }
-    }
-    if (changed) {
-      logger.info('rebalance result changed, group=%s clientId=%s assigned=%d',
-        this.consumerGroup, this.clientID, assigned.length);
-      // Beat every broker the moment the allocation moves, with the
-      // cached fingerprints dropped. A rebalance that took a queue away changes
-      // what the broker must hold for this group, and waiting for the 30s beat
-      // leaves the old slice registered in the meantime.
-      void client.sendHeartbeatToAllBrokers(true);
+    // The topics whose queue SET moved, so a swap that keeps the COUNT (one queue
+    // lost, another gained) still counts: which buffers exist changed, the topic
+    // budgets have to be re-divided over the new set, and the broker has to be
+    // told about the subscriptions of the queues this client just picked up.
+    const moved = changedTopics(wasByTopic, queuesByTopicKeySet(assigned));
+    if (moved.length > 0) {
+      logger.info('rebalance result changed, group=%s clientId=%s assigned=%d topics=%s',
+        this.consumerGroup, this.clientID, assigned.length, moved.join(','));
     }
     // Resolve the initial offset for freshly assigned queues NOW, not lazily
     // on the first pull: CONSUME_FROM_LAST_OFFSET means "the newest offset as
@@ -955,13 +949,49 @@ export class DefaultMQPushConsumer {
       }
     }
     this.syncPullLoops();
-    // ORDER MATTERS: the topic-budget division runs AFTER syncPullLoops() has
-    // rebuilt the per-queue pull state for this round, so it divides by the
-    // queue count THIS round produced — a shrink from 4 queues to 2 must
-    // divide by 2, not by 4. And it runs only when the assignment actually
-    // CHANGED: an unchanged round must leave a hand-set per-queue knob alone.
-    if (changed) {
-      this._divideTopicThresholds();
+    // ORDER MATTERS, and the four steps are one package that only a moved
+    // assignment pays: the topics that gained or lost a queue re-share their
+    // subscription version, the topic cache budgets are divided over the queues
+    // this round NOW owns (a shrink from 4 queues to 2 must divide by 2, not by 4),
+    // every broker gets the immediate beat that carries those versions, and last
+    // the application's queue listener hears about the topics that moved.
+    this._afterAssignmentChange(moved);
+  }
+
+  // _afterAssignmentChange is the whole of what a rebalance round whose queue set
+  // moved does, in one order that cannot drift.
+  //
+  // The beat is NOT conditioned on the heartbeat mode: with V2 on it is the beat
+  // that drops the cached fingerprints, with V2 off — the default — the same call
+  // is the plain beat. Waiting for the 30s periodic round instead leaves the broker
+  // holding the old slice of this group's queue set in the meantime.
+  private _afterAssignmentChange(moved: string[]): void {
+    if (moved.length === 0) return;
+    this._restampSubscriptionVersions(moved);
+    this._divideTopicThresholds();
+    // The beat reads the subscription table when the call starts, so the versions
+    // stamped above are what it carries.
+    void this.mqClient!.sendHeartbeatToAllBrokers(true);
+    this._notifyQueueChanged(moved);
+  }
+
+  // _restampSubscriptionVersions re-shares the subscription version of every topic
+  // whose assignment moved. The beat that follows carries it, the heartbeat's
+  // subscription equality covers the version, and the pull request sends it too —
+  // so a broker that had suppressed this client's unchanged subscriptions now takes
+  // them again, which is what stops a freshly picked-up queue from being served
+  // under a stale filter.
+  private _restampSubscriptionVersions(topics: string[]): void {
+    if (topics.length === 0) return;
+    const newVersion = currentTimeMillis();
+    for (const topic of topics) {
+      const sub = this.subscription.get(topic);
+      if (!sub) continue;
+      logger.info('%s rebalance changed, also update version: %d, %d',
+        topic, sub.subVersion, newVersion);
+      // The map holds the same objects the heartbeat builder and every pull read,
+      // so the new version is what the next beat and the next pull carry.
+      sub.subVersion = newVersion;
     }
   }
 
@@ -1090,7 +1120,10 @@ export class DefaultMQPushConsumer {
     if (revoked.length > 0) {
       logger.info('queues revoked, group=%s count=%d', this.consumerGroup, revoked.length);
     }
-    this._notifyQueueChanged();
+    // The broker beat and the user's queue listener are NOT spent here: a round that
+    // only self-heals a stalled loop (the queue stays assigned, so the set did not
+    // move) changes nothing the broker knows about. doRebalance hands the change to
+    // _afterAssignmentChange once it knows which topics moved.
   }
 
   // _retireQueue drops one queue's local state.
@@ -1153,7 +1186,12 @@ export class DefaultMQPushConsumer {
     }
   }
 
-  private _notifyQueueChanged(): void {
+  // _notifyQueueChanged fires the application's messageQueueChanged callback for the
+  // topics listed, i.e. ONLY for the topics whose assignment moved. A round that
+  // re-pulled the same queues tells the listener nothing new, and the callback is
+  // documented as a change notification, not a heartbeat.
+  private _notifyQueueChanged(topics: string[]): void {
+    if (topics.length === 0) return;
     const listener = this.messageQueueListener;
     const client = this.mqClient;
     const assigned = [...this.assigned];
@@ -1164,9 +1202,9 @@ export class DefaultMQPushConsumer {
       list.push(mq);
       byTopic.set(mq.getTopic(), list);
     }
-    for (const [topic, divided] of byTopic) {
+    for (const topic of topics) {
       const route = client.getTopicRouteData(topic);
-      listener(topic, route ? route.getAllSubscribeMessageQueue(topic) : [], divided);
+      listener(topic, route ? route.getAllSubscribeMessageQueue(topic) : [], byTopic.get(topic) || []);
     }
   }
 
@@ -1492,22 +1530,24 @@ export class DefaultMQPushConsumer {
   }
 
   // _flowControlHit applies the ProcessQueue put/pull threshold checks: ONE
-  // queue's own buffer is judged against exactly three per-queue gates
+  // queue's own holdings are judged against exactly three per-queue gates
   // (count / size / span). There is NO pull-time topic aggregation: the
   // topic-level budgets were divided into the per-queue knobs at rebalance
   // (see _divideTopicThresholds), so the sibling queues of a topic never add
-  // up here. Every cache gate compares STRICTLY GREATER THAN the threshold: a
-  // buffer that has reached it exactly is still allowed to pull, so a
-  // threshold reads as "how many may be cached", not "how many stop us".
+  // up here. Every cache gate compares STRICTLY GREATER THAN the threshold as it
+  // stands — no floor of 1, no "0 means disabled" escape, because keeping the
+  // knob inside its legal range is _checkConfigRanges' job, not the gate's. A
+  // buffer that has reached the threshold exactly is still allowed to pull, so a
+  // threshold reads as "how many may be cached", not "how many stop us", and a
+  // threshold of 0 simply means "cache nothing".
+  //
+  // The three terms all read the SAME held set (everything the queue still holds,
+  // listener-held batches included). The one per-term difference is that the SPAN
+  // gate does not run at all for ordered consumption: an orderly queue has no
+  // run-ahead to guard against, because its pull cursor only moves once the batch
+  // in the listener's hands has settled, while count and size bind either way.
   private _flowControlHit(mq: MessageQueue, pq: ProcessQueue): boolean {
-    const [count, sizeMB, span] = pq.pendingStats();
-    const maxCount = this.pullThresholdForQueue;
-    const maxSize = this.pullThresholdSizeForQueue;
-    const maxSpan = this.consumeConcurrentlyMaxSpan;
-    let reason = '';
-    if (count > Math.max(1, maxCount)) reason = 'count';
-    else if (maxSize > 0 && sizeMB > maxSize) reason = 'size';
-    else if (maxSpan > 0 && span > maxSpan) reason = 'span';
+    const reason = this._cacheGateReason(pq);
     if (!reason) return false;
     this.flowControlTriggered++;
     logger.debug('flow control: queue %s %s, pause pull', mqKey(mq), reason);
@@ -1517,6 +1557,19 @@ export class DefaultMQPushConsumer {
         this.flowControlTriggered);
     }
     return true;
+  }
+
+  // _cacheGateReason names the gate this queue's holdings are over — "count=N",
+  // "size=NMB" or "span=N" — or '' when the queue may pull. The three checks run in
+  // one fixed order (count, then size, then span) and the first one that matches is
+  // the reason reported, so a buffer over every budget says which gate the operator
+  // has to raise. It judges ONE queue and reads no sibling queue.
+  private _cacheGateReason(pq: ProcessQueue): string {
+    const [count, sizeMiB, span] = pq.heldStats();
+    if (count > this.pullThresholdForQueue) return `count=${count}`;
+    if (sizeMiB > this.pullThresholdSizeForQueue) return `size=${sizeMiB}MB`;
+    if (!pq.consumeOrderly && span > this.consumeConcurrentlyMaxSpan) return `span=${span}`;
+    return '';
   }
 
   // _popFlowControlHit is the POP twin of _flowControlHit and it feeds the SAME
@@ -2684,4 +2737,40 @@ export function parseMqKey(key: string): [string, string, number] {
   const i2 = key.lastIndexOf('@');
   if (i1 < 0 || i2 <= i1) return ['', '', 0];
   return [key.slice(0, i1), key.slice(i1 + 1, i2), parseInt(key.slice(i2 + 1), 10) || 0];
+}
+
+// queuesByTopicKeySet groups one assignment by topic as a SET of queue keys.
+function queuesByTopicKeySet(mqs: MessageQueue[]): Map<string, Set<string>> {
+  const out = new Map<string, Set<string>>();
+  for (const mq of mqs) {
+    let set = out.get(mq.getTopic());
+    if (!set) { set = new Set<string>(); out.set(mq.getTopic(), set); }
+    set.add(mqKey(mq));
+  }
+  return out;
+}
+
+// changedTopics lists, sorted, the topics whose SET of assigned queues differs
+// between two rebalance rounds. Comparing sizes per topic is not enough: losing one
+// queue and gaining another keeps the count while changing who owns what. A topic
+// that appeared or vanished entirely counts too, because its queues moved.
+function changedTopics(before: Map<string, Set<string>>, after: Map<string, Set<string>>): string[] {
+  const moved: string[] = [];
+  for (const [topic, nowQueues] of after) {
+    const wasQueues = before.get(topic);
+    if (!wasQueues || wasQueues.size !== nowQueues.size || !isSubsetOf(wasQueues, nowQueues)) {
+      moved.push(topic);
+    }
+  }
+  for (const [topic, wasQueues] of before) {
+    if (!after.has(topic) && wasQueues.size > 0) moved.push(topic);
+  }
+  return moved.sort();
+}
+
+function isSubsetOf(a: Set<string>, b: Set<string>): boolean {
+  for (const v of a) {
+    if (!b.has(v)) return false;
+  }
+  return true;
 }
